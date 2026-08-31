@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use super::super::test_support::*;
 use super::*;
+use crate::runtime::test_support::try_poll_once;
 
 /// One whole-payload client send the way `Peer::send` runs it: the owned send
 /// under the egress deadline.
@@ -73,13 +74,12 @@ fn send_cqe_decrements_conn_inflight_and_releases_the_buffer() {
     // The keep-alive rides the slot until the awaiter collects the result;
     // once it does, the last reference goes with it.
     assert_eq!(Rc::strong_count(&alive), 2, "slot still holds the buffer");
-    let mut fut = std::pin::pin!(SendFuture {
-        send_id: 77,
-        inner: Rc::clone(&r.inner),
-    });
     assert_eq!(
-        fut.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-        Poll::Ready(16)
+        try_poll_once(SendFuture {
+            send_id: 77,
+            inner: Rc::clone(&r.inner),
+        }),
+        Some(16)
     );
     assert_eq!(Rc::strong_count(&alive), 1, "collecting the result frees the buffer");
     unsafe {

@@ -591,6 +591,33 @@ impl SchemaDescriptor {
         self.placement
     }
 
+    /// Render a PK from its raw OPK byte form, for error messages: the per-column
+    /// native values in PK-list order, comma-separated. Here rather than in a
+    /// caller because it is the inverse of the OPK encoding this module owns, and
+    /// it works for a PK wider than a `u128`.
+    pub fn format_pk_bytes(&self, pk_bytes: &[u8]) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let mut off = 0usize;
+        for &ci in self.pk_indices() {
+            let col = self.columns[ci as usize];
+            let size = col.size() as usize;
+            // Decode OPK back to native before reading the scalar: read as native
+            // LE, a signed column's flipped sign bit renders garbage.
+            let v = gnitz_wire::pk_native_key(pk_bytes, off, size, col.type_code);
+            parts.push(match col.type_code {
+                type_code::UUID => gnitz_wire::format_uuid(v),
+                type_code::U128 => format!("{v}"),
+                type_code::I64 => format!("{}", v as u64 as i64),
+                type_code::I32 => format!("{}", v as u64 as i32),
+                type_code::I16 => format!("{}", v as u64 as i16),
+                type_code::I8 => format!("{}", v as u64 as i8),
+                _ => format!("{}", v as u64),
+            });
+            off += size;
+        }
+        parts.join(", ")
+    }
+
     /// Number of non-PK ("payload") columns.
     #[inline]
     pub const fn num_payload_cols(&self) -> usize {

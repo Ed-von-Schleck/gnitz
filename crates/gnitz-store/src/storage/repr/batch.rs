@@ -1696,81 +1696,6 @@ impl Batch {
         self.downgrade();
     }
 
-    /// Append a row from RowBuilder-style value arrays.
-    ///
-    /// Every caller is a test fixture, seven of them in `gnitz-server`'s own
-    /// test modules. Those link the ordinary rlib, where a `#[cfg(test)]` item
-    /// does not exist — which is why this one cannot carry the attribute its
-    /// `pub(crate)` siblings do.
-    ///
-    /// # Safety
-    /// For STRING columns, `str_ptrs[i]` must be valid for `str_lens[i]` bytes.
-    /// The value arrays must match this batch's schema: one entry per payload
-    /// column, in schema order, of the width that column's type code implies —
-    /// a mismatch writes a row the readers decode as some other row's bytes.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn append_row_simple(
-        &mut self,
-        pk: u128,
-        weight: i64,
-        null_word: u64,
-        lo_values: &[i64],
-        hi_values: &[u64],
-        str_ptrs: &[*const u8],
-        str_lens: &[u32],
-    ) {
-        self.ensure_row_capacity();
-        self.extend_pk(pk);
-        self.extend_weight(&weight.to_le_bytes());
-        self.extend_null_bmp(&null_word.to_le_bytes());
-
-        let schema = self.schema;
-
-        for (pi, col) in schema.payload_columns() {
-            let col_size = col.size() as usize;
-            let is_null = gnitz_wire::null_word_get(null_word, pi);
-
-            if is_null {
-                self.append_payload_cell(pi, col.type_code, col_size, None, &[], None);
-            } else {
-                match col.type_code {
-                    crate::schema::type_code::STRING | crate::schema::type_code::BLOB => {
-                        let ptr = str_ptrs[pi];
-                        let slen = str_lens[pi] as usize;
-                        let bytes: &[u8] = if ptr.is_null() || slen == 0 {
-                            &[]
-                        } else {
-                            std::slice::from_raw_parts(ptr, slen)
-                        };
-                        let gs = gnitz_wire::encode_german_string(bytes, &mut self.blob);
-                        self.extend_col(pi, &gs);
-                    }
-                    crate::schema::type_code::F64 => {
-                        self.extend_col(pi, &lo_values[pi].to_le_bytes());
-                    }
-                    crate::schema::type_code::F32 => {
-                        let f64_val = f64::from_bits(lo_values[pi] as u64);
-                        let f32_val = f64_val as f32;
-                        self.extend_col(pi, &f32_val.to_le_bytes());
-                    }
-                    crate::schema::type_code::U128 | crate::schema::type_code::I128 => {
-                        let mut bytes = [0u8; 16];
-                        bytes[..8].copy_from_slice(&(lo_values[pi] as u64).to_le_bytes());
-                        bytes[8..].copy_from_slice(&hi_values[pi].to_le_bytes());
-                        self.extend_col(pi, &bytes);
-                    }
-                    _ => {
-                        let bytes = lo_values[pi].to_le_bytes();
-                        self.extend_col(pi, &bytes[..col_size]);
-                    }
-                }
-            }
-        }
-
-        self.count += 1;
-        self.downgrade();
-    }
-
     /// Reset to empty without freeing buffer allocations.
     pub fn clear(&mut self) {
         // data buffer stays allocated — capacity and offsets remain valid. The
@@ -2246,6 +2171,18 @@ impl BatchBuilder {
     /// payload column is a U64.
     pub fn put_u64(&mut self, val: u64) {
         self.put_int(val as u128);
+    }
+
+    /// Put a float for the current payload column, narrowed to that column's own
+    /// width — the same value-fits-its-column shape [`Self::put_int`] has. An F32
+    /// column stores the `as f32` narrowing, so a caller need not know the width.
+    pub fn put_float(&mut self, val: f64) {
+        let col_size = self.schema().columns[self.physical_col_idx()].size() as usize;
+        match col_size {
+            4 => self.batch.extend_col(self.curr_col, &(val as f32).to_le_bytes()),
+            _ => self.batch.extend_col(self.curr_col, &val.to_le_bytes()),
+        }
+        self.curr_col += 1;
     }
 
     /// Put raw bytes for the current STRING/BLOB payload column — the one

@@ -459,20 +459,18 @@ fn batch_region_access() {
     assert!(batch.region_slice(4).is_empty(), "no strings ⇒ empty heap");
 }
 
-/// `append_row_simple` over two nullable STRING columns: inline cells, cells
-/// that spill to the blob heap, the empty string, and a NULL whose cell must be
-/// zeroed rather than left holding the caller's pointer.
+/// `BatchBuilder` over two nullable STRING columns: inline cells, cells that
+/// spill to the blob heap, the empty string, and a NULL whose cell must be
+/// zeroed rather than left holding the previous row's bytes.
 #[test]
-fn append_row_simple_writes_string_cells_and_nulls() {
+fn batch_builder_writes_string_cells_and_nulls() {
     let schema = make_schema_cols(
         &[(type_code::U64, 0), (type_code::STRING, 1), (type_code::STRING, 1)],
         0,
     );
-    let mut batch = Batch::with_capacity(schema, 4);
 
     // (col 0, col 1). Long values (> 12 bytes) land in the blob heap, short
-    // ones stay inline in the 16-byte struct.
-    // `None` is a NULL cell.
+    // ones stay inline in the 16-byte struct. `None` is a NULL cell.
     type Row<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
     let cases: &[Row] = &[
         (Some(b"Alice"), Some(b"short")),
@@ -481,17 +479,18 @@ fn append_row_simple_writes_string_cells_and_nulls() {
         (None, Some(b"another long one for blob storage")),
     ];
 
+    let mut bb = BatchBuilder::new(schema);
     for (pk, &(a, b)) in cases.iter().enumerate() {
-        let null_word = u64::from(a.is_none()) | (u64::from(b.is_none()) << 1);
-        let ptrs = [
-            a.map_or(std::ptr::null(), |v| v.as_ptr()),
-            b.map_or(std::ptr::null(), |v| v.as_ptr()),
-        ];
-        let lens = [a.map_or(0, |v| v.len() as u32), b.map_or(0, |v| v.len() as u32)];
-        unsafe {
-            batch.append_row_simple(pk as u128, 1, null_word, &[0i64, 0], &[0u64, 0], &ptrs, &lens);
+        bb.begin_row(pk as u128, 1);
+        for cell in [a, b] {
+            match cell {
+                Some(v) => bb.put_blob(v),
+                None => bb.put_null(),
+            }
         }
+        bb.end_row();
     }
+    let batch = bb.finish();
 
     assert_eq!(batch.count, cases.len());
     for (i, &(a, b)) in cases.iter().enumerate() {
@@ -520,7 +519,7 @@ fn append_row_simple_writes_string_cells_and_nulls() {
 // approximations of PI/E.
 #[test]
 #[allow(clippy::approx_constant)]
-fn test_append_row_simple_all_types() {
+fn batch_builder_writes_every_payload_type_at_its_own_width() {
     // U64 pk, then one of each remaining type at payload index 0..=11.
     let schema = make_schema_cols(
         &[
@@ -540,37 +539,24 @@ fn test_append_row_simple_all_types() {
         ],
         0,
     );
-    let mut batch = Batch::with_capacity(schema, 1);
 
-    let n = 12;
-    let mut lo = vec![0i64; n];
-    let mut hi = vec![0u64; n];
-    let mut ptrs = vec![std::ptr::null::<u8>(); n];
-    let mut lens = vec![0u32; n];
-
-    lo[0] = 42;
-    lo[1] = -7;
-    lo[2] = 1000;
-    lo[3] = -500;
-    lo[4] = 70000;
-    lo[5] = -12345;
-    // Floats travel as f64 bit patterns (the float2longlong convention).
-    lo[6] = f64::to_bits(3.14f64) as i64;
-    lo[7] = 0x1234_5678_9ABC_DEF0u64 as i64;
-    lo[8] = -99999;
-    lo[9] = f64::to_bits(2.718281828f64) as i64;
-    let s = b"hello world!";
-    ptrs[10] = s.as_ptr();
-    lens[10] = s.len() as u32;
     // A negative 16-byte payload (a cross-sign `_join_pk` surfaced into a
     // payload slot), with bits in both halves.
     let i128_val: i128 = -0x0123_4567_89AB_CDEF_1122_3344_5566_7788;
-    lo[11] = (i128_val as u128 as u64) as i64;
-    hi[11] = ((i128_val as u128) >> 64) as u64;
 
-    unsafe {
-        batch.append_row_simple(100, 1, 0, &lo, &hi, &ptrs, &lens);
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row(100, 1);
+    for v in [42i128, -7, 1000, -500, 70000, -12345] {
+        bb.put_int(v as u128);
     }
+    bb.put_float(3.14);
+    bb.put_int(0x1234_5678_9ABC_DEF0u128);
+    bb.put_int(-99999i128 as u128);
+    bb.put_float(2.718281828);
+    bb.put_blob(b"hello world!");
+    bb.put_int(i128_val as u128);
+    bb.end_row();
+    let batch = bb.finish();
 
     assert_eq!(batch.count, 1);
     assert_eq!(batch.get_col_ptr(0, 0, 1), &[42]);
@@ -587,7 +573,7 @@ fn test_append_row_simple_all_types() {
     assert!((f64_val - 2.718281828).abs() < 1e-9, "f64: {f64_val}");
     assert_eq!(crate::test_support::read_german_string(&batch, 10, 0), b"hello world!");
     let got = i128::from_le_bytes(batch.get_col_ptr(0, 11, 16).try_into().unwrap());
-    assert_eq!(got, i128_val, "16-byte payload round-trips through the lo/hi split");
+    assert_eq!(got, i128_val, "a 16-byte payload round-trips at its full width");
 }
 
 /// Dropping a batch returns its data buffer to the thread-local pool, and a

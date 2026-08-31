@@ -1254,3 +1254,23 @@ fn reindex_pack_bench() {
         );
     }
 }
+
+/// `probe_key` keeps the whole span's entropy at both widths: a span past
+/// `NARROW_PK_MAX_BYTES` takes the xxh3 branch, where a `u128` image could not
+/// hold it, so two spans sharing a 16-byte prefix must not collapse together.
+#[test]
+fn probe_key_distinguishes_spans_past_the_narrow_width() {
+    let narrow = [7u64.to_be_bytes(), 8u64.to_be_bytes()].concat();
+    assert_eq!(narrow.len(), NARROW_PK_MAX_BYTES);
+    assert_ne!(
+        probe_key(&narrow),
+        probe_key(&[8u64.to_be_bytes(), 7u64.to_be_bytes()].concat())
+    );
+
+    let wide = |tail: u64| [&7u128.to_be_bytes()[..], &tail.to_be_bytes()[..]].concat();
+    assert_eq!(wide(3)[..16], wide(4)[..16], "the two spans share a 16-byte prefix");
+    assert_ne!(probe_key(&wide(3)), probe_key(&wide(4)));
+
+    // A narrow span right-aligns, so leading zeros are not information.
+    assert_eq!(probe_key(&[0, 0, 0, 5]), probe_key(&[5]));
+}

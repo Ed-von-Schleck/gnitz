@@ -6,9 +6,6 @@
 use super::*;
 use gnitz_store::schema::key::probe_key;
 
-#[cfg(test)]
-use super::preflight::build_check_batch_pk_bytes;
-
 // For each `(table_id, packed_cols)` we keep a set of the OPK spans known to
 // exist in that unique index. The U-SEC rule (`txn_check_unique_indices`)
 // consults it before building a broadcast: if every new span is definitely

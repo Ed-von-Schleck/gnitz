@@ -2,107 +2,78 @@ use super::*;
 use gnitz_wire::control::DecodedControl;
 use gnitz_wire::FLAG_EXCHANGE;
 
-fn make_wire(view_id: i64, source_id: i64, with_schema: bool) -> DecodedWire {
+/// One worker's exchange reply. Only the first worker of a round carries a
+/// schema; `pad` is the backfill pad bit (steady-state exchanges leave
+/// `seek_col_idx` at 0, which reads as not padded).
+fn make_wire(view_id: i64, source_id: i64, with_schema: bool, pad: bool) -> DecodedWire {
     DecodedWire {
         control: DecodedControl {
             target_id: view_id as u64,
             flags: FLAG_EXCHANGE,
             seek_pk: source_id as u128,
+            seek_col_idx: if pad { BACKFILL_PAD_BIT } else { 0 },
             ..Default::default()
         },
-        schema: if with_schema {
-            Some(SchemaDescriptor::minimal_u64())
-        } else {
-            None
-        },
+        schema: with_schema.then(SchemaDescriptor::minimal_u64),
         data_batch: None,
     }
 }
 
+/// A round completes on the last worker of its `(view, source)` and not before,
+/// carrying that round's ids; `all_pad` is the AND of the workers' pad bits, so
+/// one unpadded worker keeps the backfill going.
 #[test]
-fn partial_round_returns_none() {
-    let mut acc = ExchangeAccumulator::new(3);
-    // First two of three workers report — round must stay pending.
-    assert!(acc.process(0, make_wire(10, 0, true)).is_none());
-    assert!(acc.process(1, make_wire(10, 0, false)).is_none());
-    assert!(!acc.rounds.is_empty(), "partial round must remain in map");
+fn round_completes_on_the_last_worker_with_all_pad_anded() {
+    for (pads, want_all_pad) in [([true, true], true), ([true, false], false), ([false, false], false)] {
+        let mut acc = ExchangeAccumulator::new(2);
+        assert!(
+            acc.process(0, make_wire(7, 3, true, pads[0])).is_none(),
+            "one of two workers"
+        );
+        let relay = acc
+            .process(1, make_wire(7, 3, false, pads[1]))
+            .expect("the last worker completes the round");
+        assert_eq!((relay.view_id, relay.source_id, relay.all_pad), (7, 3, want_all_pad));
+    }
 }
 
+/// A round nobody sent a schema for is dropped rather than relayed — and dropped
+/// whole: the same `(view, source)` opens a fresh round afterwards.
 #[test]
-fn complete_round_returns_relay_with_correct_ids() {
+fn schema_less_round_is_dropped_and_the_key_reopens() {
     let mut acc = ExchangeAccumulator::new(2);
-    assert!(acc.process(0, make_wire(7, 3, true)).is_none());
-    let relay = acc
-        .process(1, make_wire(7, 3, false))
-        .expect("complete round must return PendingRelay");
-    assert_eq!(relay.view_id, 7);
-    assert_eq!(relay.source_id, 3);
-    assert_eq!(relay.payloads.len(), 2);
-    assert!(acc.rounds.is_empty(), "completed round must be removed from map");
-}
-
-#[test]
-fn schema_less_round_returns_none_and_cleans_up() {
-    let mut acc = ExchangeAccumulator::new(2);
-    assert!(acc.process(0, make_wire(5, 0, false)).is_none());
-    let result = acc.process(1, make_wire(5, 0, false));
-    assert!(result.is_none(), "schema-less round must return None");
-    assert!(acc.rounds.is_empty(), "completed schema-less round must not leak");
-}
-
-fn make_wire_pad(view_id: i64, source_id: i64, pad: bool, with_schema: bool) -> DecodedWire {
-    let mut w = make_wire(view_id, source_id, with_schema);
-    w.control.seek_col_idx = if pad { BACKFILL_PAD_BIT } else { 0 };
-    w
-}
-
-#[test]
-fn all_pad_is_and_of_worker_pad_bits() {
-    // Every worker padded ⇒ the round is the final all-pad round.
-    let mut acc = ExchangeAccumulator::new(2);
-    assert!(acc.process(0, make_wire_pad(1, 0, true, true)).is_none());
-    let relay = acc
-        .process(1, make_wire_pad(1, 0, true, false))
-        .expect("round completes");
-    assert!(relay.all_pad, "all workers padded ⇒ all_pad");
-
-    // A single non-pad worker clears all_pad (backfill must continue).
-    let mut acc = ExchangeAccumulator::new(2);
-    assert!(acc.process(0, make_wire_pad(2, 0, true, true)).is_none());
-    let relay = acc
-        .process(1, make_wire_pad(2, 0, false, false))
-        .expect("round completes");
-    assert!(!relay.all_pad, "a non-pad worker clears all_pad");
-
-    // Steady-state exchanges pass seek_col_idx == 0 ⇒ all_pad false.
-    let mut acc = ExchangeAccumulator::new(2);
-    assert!(acc.process(0, make_wire(3, 0, true)).is_none());
-    let relay = acc.process(1, make_wire(3, 0, false)).expect("round completes");
-    assert!(!relay.all_pad, "steady-state (seek_col_idx==0) ⇒ all_pad false");
-}
-
-fn make_wire_src(view_id: i64, source_id: i64, req_id: u64) -> DecodedWire {
-    let mut w = make_wire(view_id, source_id, true);
-    w.control.request_id = req_id;
-    w
-}
-
-/// A view with two sources opens one round per source: worker 0 reporting
-/// for source A and worker 1 for source B completes neither.
-#[test]
-fn accumulator_distinguishes_source_ids() {
-    let mut acc = ExchangeAccumulator::new(2);
+    assert!(acc.process(0, make_wire(5, 0, false, false)).is_none());
     assert!(
-        acc.process(0, make_wire_src(42, 100, 7)).is_none(),
-        "source 100 has heard from worker 0 only"
+        acc.process(1, make_wire(5, 0, false, false)).is_none(),
+        "a schema-less round must not relay"
     );
+    assert!(acc.process(0, make_wire(5, 0, true, false)).is_none());
     assert!(
-        acc.process(1, make_wire_src(42, 200, 8)).is_none(),
-        "source 200 has heard from worker 1 only — the rounds must not merge"
+        acc.process(1, make_wire(5, 0, false, false)).is_some(),
+        "the dropped round left nothing behind for the next one to complete against"
     );
-    let relay = acc
-        .process(1, make_wire_src(42, 100, 9))
-        .expect("source 100's round completes on its second worker");
-    assert_eq!(relay.source_id, 100);
-    assert_eq!(acc.rounds.len(), 1, "source 200's round is still open");
+}
+
+/// A view with two sources opens one round per source: worker 0 reporting for
+/// source A and worker 1 for source B completes neither.
+#[test]
+fn rounds_are_keyed_by_source_id() {
+    let mut acc = ExchangeAccumulator::new(2);
+    assert!(acc.process(0, make_wire(42, 100, true, false)).is_none());
+    assert!(
+        acc.process(1, make_wire(42, 200, true, false)).is_none(),
+        "a different source's worker must not complete source 100's round"
+    );
+    assert_eq!(
+        acc.process(1, make_wire(42, 100, false, false))
+            .expect("source 100's round completes on its second worker")
+            .source_id,
+        100
+    );
+    assert_eq!(
+        acc.process(0, make_wire(42, 200, false, false))
+            .expect("source 200's round was still open")
+            .source_id,
+        200
+    );
 }

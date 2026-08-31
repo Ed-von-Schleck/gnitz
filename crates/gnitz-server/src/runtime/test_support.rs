@@ -7,6 +7,19 @@
 
 use crate::runtime::sal::{EpochGate, SalLog, SalMessage, SalStep};
 
+/// Poll a future exactly once with a noop waker; `None` if it is still pending.
+/// For the tests that assert what a *single* poll does and then discard the
+/// future — one that is re-polled needs its own pinned handle instead.
+pub(crate) fn try_poll_once<T>(fut: impl std::future::Future<Output = T>) -> Option<T> {
+    use std::task::{Context, Poll, Waker};
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut fut = std::pin::pin!(fut);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(r) => Some(r),
+        Poll::Pending => None,
+    }
+}
+
 /// The group published at `base`, walked at the log's current epoch.
 pub(crate) fn group_at(log: SalLog, base: u64) -> SalMessage {
     match log.read_at(base, EpochGate::Walk(log.walk_epoch())) {
@@ -46,6 +59,16 @@ impl SharedRegion {
 
     pub(crate) fn ptr(&self) -> *mut u8 {
         self.ptr
+    }
+
+    /// The region's base pointer, mapped for the rest of the process. For the
+    /// fixtures that hand a raw pointer to something outliving no scope in
+    /// particular — a `W2mReceiver` or a `SalWriter`, neither of which owns what
+    /// it points at — so there is no unmap for a stale pointer to outlive.
+    pub(crate) fn leak(self) -> *mut u8 {
+        let ptr = self.ptr;
+        std::mem::forget(self);
+        ptr
     }
 }
 

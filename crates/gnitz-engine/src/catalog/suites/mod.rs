@@ -24,7 +24,7 @@ use gnitz_store::schema::type_code;
 
 use std::fs;
 
-use crate::test_support::{col_def, fk_def, nullable_def, scratch_dir, uuid_def};
+use crate::test_support::{col_def, fk_def, nullable_def, opk_pk, pk_payload_schema, scratch_dir, uuid_def};
 
 fn temp_dir(name: &str) -> String {
     scratch_dir("catalog", name)
@@ -41,14 +41,13 @@ fn u64c() -> gnitz_store::schema::SchemaColumn {
 }
 
 /// The OPK image of a three-column U64 compound PK (`pk_stride` = 24, wide).
-/// Unsigned columns encode big-endian per column, which is what the wide-PK
-/// write path stores and what the FK RESTRICT check decodes.
+/// Encoded through the production encoder, so a broken encoder fails the test
+/// rather than agreeing with a second spelling of the rule here.
 fn pk24(a: u64, b: u64, c: u64) -> [u8; 24] {
-    let mut p = [0u8; 24];
-    p[0..8].copy_from_slice(&a.to_be_bytes());
-    p[8..16].copy_from_slice(&b.to_be_bytes());
-    p[16..24].copy_from_slice(&c.to_be_bytes());
-    p
+    let schema = pk_payload_schema(&[type_code::U64; 3]);
+    opk_pk(&schema, &[a as u128, b as u128, c as u128])
+        .try_into()
+        .expect("three U64 PK columns encode to 24 bytes")
 }
 
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table

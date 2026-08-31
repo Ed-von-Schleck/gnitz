@@ -129,17 +129,6 @@ pub(super) unsafe fn pipe_pair() -> (i32, i32) {
     (fds[0], fds[1])
 }
 
-/// Poll a fresh `recv(fd)` future exactly once, returning its result:
-/// `Some(_)` if it resolved (a frame, or `None` when closed), `None` if
-/// still pending.
-pub(super) fn poll_recv_once(r: &Reactor, fd: i32) -> Option<Option<io::RecvBuf>> {
-    let mut fut = Box::pin(r.recv(fd));
-    match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-        Poll::Ready(v) => Some(v),
-        Poll::Pending => None,
-    }
-}
-
 /// Drive the reactor up to `max` non-blocking ticks, returning `true` as
 /// soon as `cond` holds after a tick (and `false` if it never does).
 pub(super) fn poll_until(r: &Reactor, max: usize, mut cond: impl FnMut() -> bool) -> bool {

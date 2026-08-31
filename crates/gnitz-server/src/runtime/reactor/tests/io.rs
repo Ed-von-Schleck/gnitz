@@ -3,6 +3,7 @@
 
 use super::super::test_support::*;
 use super::super::*;
+use crate::runtime::test_support::try_poll_once;
 
 /// Drive `wire` into a fresh connection capped at `cap` and assert it is
 /// refused: the connection reaped, and the global counter back at 0 — a refused
@@ -24,7 +25,7 @@ fn assert_refused(cap: usize, max_payload: Option<usize>, wire: &[u8], why: &str
         );
         assert_eq!(r.inbound().held(), 0, "{why}: budget must be reconciled");
         assert!(
-            poll_recv_once(&r, read_fd).unwrap().is_none(),
+            try_poll_once(r.recv(read_fd)).unwrap().is_none(),
             "{why}: recv after the close must yield None"
         );
         libc::close(write_fd); // read_fd was closed by reap

@@ -217,11 +217,20 @@ impl CatalogEngine {
         format!("cannot create unique index on '{sn}.{tn}' column '{col}': column contains duplicate values")
     }
 
-    /// Format the PK-uniqueness rejection, PG-style. `key_str` is the
-    /// already-rendered offending key. `in_batch` distinguishes two rows of one
-    /// ingest batch sharing a PK from a collision with committed data.
-    pub fn pk_violation_err(&mut self, table_id: i64, pk_indices: &[u32], key_str: &str, in_batch: bool) -> String {
-        let (sn, tn, cols) = self.qualified_col_names(table_id, pk_indices);
+    /// Format the PK-uniqueness rejection, PG-style, from the offending key's raw
+    /// OPK bytes. Taking the schema rather than a pre-rendered key plus its
+    /// `pk_indices()` is what keeps the column names and the values a caller
+    /// cannot pair from two different schemas. `in_batch` distinguishes two rows
+    /// of one ingest batch sharing a PK from a collision with committed data.
+    pub fn pk_violation_err(
+        &mut self,
+        table_id: i64,
+        schema: &SchemaDescriptor,
+        pk_bytes: &[u8],
+        in_batch: bool,
+    ) -> String {
+        let key_str = &schema.format_pk_bytes(pk_bytes);
+        let (sn, tn, cols) = self.qualified_col_names(table_id, schema.pk_indices());
         let what = if in_batch {
             format!("Batch contains multiple rows with key ({cols})=({key_str})")
         } else {

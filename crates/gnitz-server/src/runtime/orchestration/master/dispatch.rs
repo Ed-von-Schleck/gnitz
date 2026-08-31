@@ -84,7 +84,6 @@ impl MasterDispatcher {
     /// `last_ephemeral_gen` seeds `note_flush_round`'s ordering check: the
     /// boot's recovered durable generation.
     pub fn new(
-        num_workers: usize,
         worker_pids: Vec<i32>,
         catalog: *mut CatalogEngine,
         last_ephemeral_gen: u64,
@@ -92,9 +91,9 @@ impl MasterDispatcher {
         w2m: Rc<W2mReceiver>,
         m2w_efds: Vec<i32>,
     ) -> Self {
-        debug_assert_eq!(m2w_efds.len(), num_workers, "one wakeup eventfd per worker",);
+        debug_assert_eq!(m2w_efds.len(), worker_pids.len(), "one wakeup eventfd per worker");
         MasterDispatcher {
-            num_workers,
+            num_workers: worker_pids.len(),
             worker_pids: RefCell::new(worker_pids),
             sal,
             sal_writer_excl: AsyncMutex::default(),

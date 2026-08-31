@@ -1697,21 +1697,15 @@ fn index_key_spec_equals_projected_leading_span() {
     let idx_key_size = spec.key_size();
     assert_eq!(idx_key_size, 8 + 16, "I64→U64 (8) + U128 (16)");
 
-    let mut batch = Batch::with_capacity(owner, 4);
     let rows: [(u128, i64, u128); 3] = [(1, -3, 100), (2, 7, u128::MAX), (3, i64::MIN, 0)];
+    let mut bb = gnitz_store::storage::BatchBuilder::new(owner);
     for &(id, a, b) in &rows {
-        unsafe {
-            batch.append_row_simple(
-                id,
-                1,
-                0,
-                &[a, b as u64 as i64],
-                &[0, (b >> 64) as u64],
-                &[std::ptr::null(), std::ptr::null()],
-                &[0, 0],
-            );
-        }
+        bb.begin_row(id, 1);
+        bb.put_int(a as u128);
+        bb.put_int(b);
+        bb.end_row();
     }
+    let batch = bb.finish();
 
     // Reference: the projected index entry's leading idx_key_size bytes.
     let projected =

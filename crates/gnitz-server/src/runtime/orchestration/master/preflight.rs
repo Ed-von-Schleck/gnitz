@@ -65,37 +65,6 @@ impl PipelinedCheck {
 /// `(target_id, packed key columns)` — see [`PipelinedCheck::pool_slot`].
 pub(super) type PoolSlot = (i64, u64);
 
-/// Render a PK from its raw OPK byte form for error messages.
-/// Compound PKs are formatted as comma-separated per-column values in
-/// declaration order; `pk_bytes` holds all PK columns concatenated as OPK
-/// (big-endian, sign-flipped for signed), so we slice and decode each column
-/// back to native before rendering. Works for wide PKs (`pk_stride > 16`)
-/// where a `u128` cannot encode the key.
-pub(super) fn format_pk_value_bytes(pk_bytes: &[u8], schema: &SchemaDescriptor) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let mut off = 0usize;
-    for &ci in schema.pk_indices() {
-        let col = schema.columns[ci as usize];
-        let size = col.size() as usize;
-        // pk_bytes are OPK; decode each column back to native LE before reading
-        // its scalar value. Reading OPK as native LE would render garbage for
-        // signed columns (flipped sign bit) and any multi-byte unsigned column.
-        let v = gnitz_wire::pk_native_key(pk_bytes, off, size, col.type_code);
-        let s = match col.type_code {
-            gnitz_wire::type_code::U128 => format!("{v}"),
-            gnitz_wire::type_code::UUID => gnitz_wire::format_uuid(v),
-            gnitz_wire::type_code::I64 => format!("{}", v as u64 as i64),
-            gnitz_wire::type_code::I32 => format!("{}", v as u64 as i32),
-            gnitz_wire::type_code::I16 => format!("{}", v as u64 as i16),
-            gnitz_wire::type_code::I8 => format!("{}", v as u64 as i8),
-            _ => format!("{}", v as u64),
-        };
-        parts.push(s);
-        off += size;
-    }
-    parts.join(", ")
-}
-
 /// Shared scaffold for the check-batch builders: pool-reuse with a schema
 /// staleness guard, then one zero-payload row per key.
 ///
@@ -811,9 +780,8 @@ impl MasterDispatcher {
                     // Error-family PK existence, checked against the running
                     // prefix fold then committed state.
                     for (&pk, f) in &pk_fold(batch) {
-                        let key_str = || format_pk_value_bytes(pk, &schema);
                         if f.dups > 1 {
-                            return Err(disp.cat().pk_violation_err(tid, schema.pk_indices(), &key_str(), true));
+                            return Err(disp.cat().pk_violation_err(tid, &schema, pk, true));
                         }
                         if f.net <= 0 {
                             continue;
@@ -824,7 +792,7 @@ impl MasterDispatcher {
                             None => committed.contains(pk),
                         };
                         if exists {
-                            return Err(disp.cat().pk_violation_err(tid, schema.pk_indices(), &key_str(), false));
+                            return Err(disp.cat().pk_violation_err(tid, &schema, pk, false));
                         }
                     }
                 }

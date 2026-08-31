@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use super::super::test_support::*;
 use super::*;
+use crate::runtime::test_support::try_poll_once;
 
 /// Timer fires after a short deadline.
 #[test]
@@ -29,9 +30,8 @@ fn timer_fires() {
 #[test]
 fn timer_in_the_past_resolves_immediately() {
     let r = make_reactor();
-    let mut timer = std::pin::pin!(r.timer(Instant::now() - Duration::from_secs(1)));
     assert!(
-        timer.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_ready(),
+        try_poll_once(r.timer(Instant::now() - Duration::from_secs(1))).is_some(),
         "a past deadline must resolve on the first poll"
     );
     assert_eq!(r.inner.timers.len(), 0, "and submit no SQE at all");
@@ -385,9 +385,8 @@ fn a_dropped_reply_future_leaves_the_leases_slot_open() {
     assert!(r.inner.replies.is_open(req_id), "the lease still owns the slot");
 
     r.route_reply(0, req_id as u32, synthetic_decoded_wire(req_id));
-    let mut fut = Box::pin(r.await_reply(req_id));
     assert!(
-        fut.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_ready(),
+        try_poll_once(r.await_reply(req_id)).is_some(),
         "the reply must still be there for the next awaiter"
     );
 
@@ -428,10 +427,10 @@ fn a_dropped_awaiter_leaves_no_waker_in_any_wake_queue() {
 
     let (read_end, write_end) = unsafe { pipe_pair() };
     r.register_conn(read_end);
-    assert!(poll_recv_once(&r, read_end).is_none());
+    assert!(try_poll_once(r.recv(read_end)).is_none());
     assert!(
         !r.inner.conns.borrow()[&read_end].q.has_waiter(),
-        "recv queue — the future poll_recv_once built is already dropped"
+        "recv queue — the polled recv future is already dropped"
     );
     r.close_fd(read_end);
     unsafe { libc::close(write_end) };

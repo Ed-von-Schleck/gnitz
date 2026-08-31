@@ -1,9 +1,14 @@
-//! Write-path fan-out: which rows of a pushed batch go to which worker.
+//! Write-path fan-out: which rows of a pushed batch go to which worker, and the
+//! SAL group that emission builds.
+//!
+//! Routing itself is `SchemaDescriptor::worker_for_pk` — the one table-key
+//! router — so there is no second placement rule here to disagree with it; what
+//! this module adds is the TLS index pool and the group shape. The worker's
+//! SAL-replay reslice calls `with_worker_indices` too, so it is the master's by
+//! placement rather than by reach.
 //!
 //! Distinct from the exchange operator's routing (`ops::exchange`), which routes
-//! a *join/group* key over a derived schema. This one routes by the table's
-//! distribution prefix (`SchemaDescriptor::worker_for_pk`), exactly as the
-//! worker-side probe does, so a pushed row lands on the worker that owns it.
+//! a *join/group* key over a derived schema.
 
 use std::cell::RefCell;
 
@@ -135,11 +140,3 @@ pub(crate) fn with_group<R>(
         targets,
     })
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-#[path = "tests/scatter.rs"]
-mod tests;

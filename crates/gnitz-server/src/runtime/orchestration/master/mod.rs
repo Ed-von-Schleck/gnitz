@@ -5,8 +5,8 @@
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
-//! `tests/fixtures.rs` is the shared batch/schema fixture module those suites
-//! reach as `super::super::fixtures`.
+//! `tests/fixtures.rs` holds what more than one of them needs, reached as
+//! `super::super::fixtures`.
 
 pub(crate) mod exchange;
 pub(crate) mod scatter;
@@ -109,8 +109,8 @@ pub struct MasterDispatcher {
     /// (DDL between bursts) is still checked at pop time.
     check_batch_pool: RefCell<FxHashMap<preflight::PoolSlot, Vec<Batch>>>,
 
-    /// The generation the last ephemeral round stamped. Read only inside a
-    /// `debug_assert!` (`note_flush_round`); two tests pin it.
+    /// The generation the last ephemeral round stamped. Read only inside
+    /// `note_flush_round`'s `debug_assert!`, so it is a debug-build guard.
     last_ephemeral_gen: Cell<u64>,
 
     /// The last tick round allocated. **Strictly increasing**, one per emitted
@@ -431,8 +431,8 @@ pub(crate) async fn dispatch_scan_multi_fanout(
     Ok(dispatches)
 }
 
-/// Fixtures shared by the `master` submodules' unit tests, so a schema or
-/// row-builder change is made once rather than in three test modules.
+/// Fixtures shared by the `master` submodules' unit tests: the batch/schema
+/// builders and the inert dispatcher those suites construct.
 #[cfg(test)]
 #[path = "tests/fixtures.rs"]
 pub(super) mod fixtures;

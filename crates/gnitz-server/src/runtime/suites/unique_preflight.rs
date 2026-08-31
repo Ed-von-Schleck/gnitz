@@ -15,7 +15,7 @@ use crate::runtime::worker::send_unique_preflight_keys;
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::make_index_schema;
 use gnitz_store::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, KeyProducer, SpillSort};
+use gnitz_store::storage::{Batch, BatchBuilder, KeyProducer, SpillSort};
 use gnitz_wire::control::peek_control_block_ipc;
 use gnitz_wire::type_code;
 use gnitz_wire::{FLAG_CONTINUATION, FLAG_HAS_SCHEMA};
@@ -274,22 +274,26 @@ fn preflight_signed_payload_projection_roundtrip() {
         ],
         &[0],
     );
-    let mut batch = Batch::with_capacity(schema, 8);
-    // (pk, val, weight, null): two rows share val=-5 (the duplicate the
-    // pre-flight exists to catch), one NULL, one retracted row.
-    let rows: [(u128, i64, i64, u64); 6] = [
-        (1, -5, 1, 0),
-        (2, 300, 1, 0),
-        (3, -5, 1, 0),
-        (4, 0, 1, 1),  // NULL val: skipped
-        (5, 7, -1, 0), // retracted: skipped
-        (6, i64::MIN, 1, 0),
+    // (pk, val, weight): two rows share val=-5 (the duplicate the pre-flight
+    // exists to catch), one NULL, one retracted row.
+    let rows: [(u128, Option<i64>, i64); 6] = [
+        (1, Some(-5), 1),
+        (2, Some(300), 1),
+        (3, Some(-5), 1),
+        (4, None, 1),     // NULL val: skipped
+        (5, Some(7), -1), // retracted: skipped
+        (6, Some(i64::MIN), 1),
     ];
-    for &(pk, val, weight, null_word) in &rows {
-        unsafe {
-            batch.append_row_simple(pk, weight, null_word, &[val], &[0], &[std::ptr::null()], &[0]);
+    let mut bb = BatchBuilder::new(schema);
+    for &(pk, val, weight) in &rows {
+        bb.begin_row(pk, weight);
+        match val {
+            Some(v) => bb.put_int(v as u128),
+            None => bb.put_null(),
         }
+        bb.end_row();
     }
+    let batch = bb.finish();
 
     let keys = project_sorted(&batch, &schema, &[1]);
 
@@ -328,17 +332,18 @@ fn preflight_weight2_row_emits_adjacent_pair() {
         ],
         &[0],
     );
-    let mut batch = Batch::with_capacity(schema, 4);
-    let rows: [(u128, i64, i64, u64); 3] = [
-        (1, 7, 1, 0),
-        (2, 9, 2, 0), // consolidated duplicate: weight 2
-        (3, 11, 1, 0),
+    let rows: [(u128, i64, i64); 3] = [
+        (1, 7, 1),
+        (2, 9, 2), // consolidated duplicate: weight 2
+        (3, 11, 1),
     ];
-    for &(pk, val, weight, null_word) in &rows {
-        unsafe {
-            batch.append_row_simple(pk, weight, null_word, &[val], &[0], &[std::ptr::null()], &[0]);
-        }
+    let mut bb = BatchBuilder::new(schema);
+    for &(pk, val, weight) in &rows {
+        bb.begin_row(pk, weight);
+        bb.put_int(val as u128);
+        bb.end_row();
     }
+    let batch = bb.finish();
 
     let keys = project_sorted(&batch, &schema, &[1]);
     assert_eq!(
@@ -364,22 +369,15 @@ fn preflight_composite_projection_distinguishes_trailing_column() {
         ],
         &[0],
     );
-    let mut batch = Batch::with_capacity(schema, 4);
     // (pk, a, b): (10,7,1) and (11,7,2) share a=7 but differ in b → distinct.
-    let rows: [(u128, u64, u64); 2] = [(10, 7, 1), (11, 7, 2)];
-    for &(pk, a, b) in &rows {
-        unsafe {
-            batch.append_row_simple(
-                pk,
-                1,
-                0,
-                &[a as i64, b as i64],
-                &[0, 0],
-                &[std::ptr::null(), std::ptr::null()],
-                &[0, 0],
-            );
-        }
+    let mut bb = BatchBuilder::new(schema);
+    for &(pk, a, b) in &[(10u128, 7u128, 1u128), (11, 7, 2)] {
+        bb.begin_row(pk, 1);
+        bb.put_int(a);
+        bb.put_int(b);
+        bb.end_row();
     }
+    let batch = bb.finish();
     let keys = project_sorted(&batch, &schema, &[1, 2]);
     assert_eq!(keys.len(), 2);
     assert_ne!(
@@ -408,26 +406,24 @@ fn index_key_spec_skips_any_null_column() {
     );
     let cols = [1u32, 2];
     let idx_schema = make_index_schema(&cols, &owner).unwrap();
-    let mut batch = Batch::with_capacity(owner, 4);
-    // (id, a, b, null_word over payload slots): both present, a NULL, b NULL.
-    let rows: [(u128, i64, i64, u64); 3] = [
-        (1, 5, 6, 0b00), // both present → indexed
-        (2, 5, 6, 0b01), // a NULL → skipped
-        (3, 5, 6, 0b10), // b NULL → skipped
+    // (id, a, b): both present, a NULL, b NULL.
+    let rows: [(u128, Option<u128>, Option<u128>); 3] = [
+        (1, Some(5), Some(6)), // both present → indexed
+        (2, None, Some(6)),    // a NULL → skipped
+        (3, Some(5), None),    // b NULL → skipped
     ];
-    for &(id, a, b, null_word) in &rows {
-        unsafe {
-            batch.append_row_simple(
-                id,
-                1,
-                null_word,
-                &[a, b],
-                &[0, 0],
-                &[std::ptr::null(), std::ptr::null()],
-                &[0, 0],
-            );
+    let mut bb = BatchBuilder::new(owner);
+    for &(id, a, b) in &rows {
+        bb.begin_row(id, 1);
+        for cell in [a, b] {
+            match cell {
+                Some(v) => bb.put_int(v),
+                None => bb.put_null(),
+            }
         }
+        bb.end_row();
     }
+    let batch = bb.finish();
     let spec = IndexKeySpec::new(&cols, &owner, &idx_schema);
     let mb = batch.as_mem_batch();
     let mut keybuf = PkBuf::zeroed(0);
@@ -465,18 +461,12 @@ fn key_bytes_reused_buffer_zeros_tail_when_narrowing() {
     // then reclaim. col1 is arbitrary (it never lands in the narrow span).
     const COL1: u64 = 0xAABB_CCDD_EEFF_0011;
     const COL2: u64 = 0x1122_3344_5566_7788;
-    let mut batch = Batch::with_capacity(owner, 1);
-    unsafe {
-        batch.append_row_simple(
-            1,
-            1,
-            0,
-            &[COL1 as i64, COL2 as i64],
-            &[0, 0],
-            &[std::ptr::null(), std::ptr::null()],
-            &[0, 0],
-        );
-    }
+    let mut bb = BatchBuilder::new(owner);
+    bb.begin_row(1, 1);
+    bb.put_int(COL1 as u128);
+    bb.put_int(COL2 as u128);
+    bb.end_row();
+    let batch = bb.finish();
     let mb = batch.as_mem_batch();
 
     // WIDE composite span over (col1, col2): two promoted U64 columns ⇒ 16 bytes.

@@ -1,6 +1,7 @@
 use super::super::merge::mem_batch_to_unified;
 use super::*;
 use crate::schema::SchemaDescriptor;
+use crate::storage::BatchBuilder;
 use crate::test_support::{make_batch_opk, make_schema_u128_i64, make_schema_u64_i64, wide_pk_3xu64_schema};
 
 /// One row read back out of a scatter destination: the PK bytes verbatim, the
@@ -115,4 +116,49 @@ fn scatter_unified_sources_addresses_each_sources_own_columns() {
         .map(|&(i, v)| (k[i].clone(), 1, v))
         .collect();
     assert_eq!(got, want);
+}
+
+/// `route_rows_by_pk` hashes only the leading distribution prefix, so rows
+/// sharing it co-partition however the trailing columns differ — the property
+/// `Placement::Keyed { prefix_len }` exists for. Weight-0 rows are not Z-set
+/// elements and are dropped.
+#[test]
+fn route_rows_by_pk_follows_the_distribution_prefix() {
+    use crate::schema::{type_code, Placement, SchemaColumn};
+    use crate::test_support::opk_pk;
+    const NW: usize = 4;
+
+    let cols = [SchemaColumn::new(type_code::U64, 0); 2];
+    let by_prefix = SchemaDescriptor::new_with_placement(&cols, &[0, 1], Placement::Keyed { prefix_len: 1 });
+    let by_full = SchemaDescriptor::new_with_placement(&cols, &[0, 1], Placement::Keyed { prefix_len: 2 });
+
+    // One `a` group spread over many `b`s, plus a weight-0 row.
+    let mut bb = BatchBuilder::new(by_prefix);
+    for b in 0..8u128 {
+        bb.begin_row_opk(&[7, b], if b == 3 { 0 } else { 1 });
+        bb.end_row();
+    }
+    let batch = bb.finish();
+
+    let mut slots: Vec<Vec<u32>> = vec![Vec::new(); NW];
+    route_rows_by_pk(&batch.as_mem_batch(), &by_prefix, &mut slots);
+    let want = by_prefix.worker_for_pk(&opk_pk(&by_prefix, &[7, 0]), NW);
+    assert_eq!(
+        slots[want],
+        vec![0, 1, 2, 4, 5, 6, 7],
+        "one `a` group lands whole on one worker"
+    );
+    assert_eq!(
+        slots.iter().map(Vec::len).sum::<usize>(),
+        7,
+        "the weight-0 row is dropped"
+    );
+
+    // Hashing the whole PK spreads that same group instead.
+    let mut full_slots: Vec<Vec<u32>> = vec![Vec::new(); NW];
+    route_rows_by_pk(&batch.as_mem_batch(), &by_full, &mut full_slots);
+    assert!(
+        full_slots.iter().filter(|s| !s.is_empty()).count() > 1,
+        "the full-PK placement must not co-locate the group"
+    );
 }

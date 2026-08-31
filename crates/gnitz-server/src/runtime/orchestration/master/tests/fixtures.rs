@@ -1,45 +1,57 @@
-use gnitz_store::schema::key::PkBuf;
+use std::rc::Rc;
+
+use gnitz_engine::catalog::CatalogEngine;
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::Batch;
+use gnitz_store::storage::{Batch, BatchBuilder};
 use gnitz_wire::type_code;
 
-/// A single U64 PK column, no payload.
-pub(super) fn u64_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0])
-}
+use super::MasterDispatcher;
+use crate::runtime::sal::SalWriter;
+use crate::runtime::test_support::SharedRegion;
+use crate::runtime::w2m::W2mReceiver;
 
-/// PK U64 at index 0, payload U64 at index 1.
+/// PK U64 at index 0, one **nullable** payload U64 at index 1.
 pub(super) fn two_col_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 1),
-        ],
-        &[0],
-    )
+    gnitz_engine_testkit::u64_pk_schema(SchemaColumn::new(type_code::U64, 1))
 }
 
-/// Rows are `(pk, weight, null_word, payload_col1_value)`.
-pub(super) fn make_row_batch(schema: SchemaDescriptor, rows: &[(u128, i64, u64, i64)]) -> Batch {
-    let mut batch = Batch::with_capacity(schema, rows.len().max(1));
-    for &(pk, weight, null_word, payload_val) in rows {
-        let lo = [payload_val];
-        let hi = [0u64];
-        let null_ptr: *const u8 = std::ptr::null();
-        let ptrs = [null_ptr];
-        let lens = [0u32];
-        unsafe {
-            batch.append_row_simple(pk, weight, null_word, &lo, &hi, &ptrs, &lens);
+/// Rows are `(pk, weight, payload)`; `None` writes a NULL payload cell.
+pub(super) fn make_row_batch(schema: SchemaDescriptor, rows: &[(u128, i64, Option<i64>)]) -> Batch {
+    let mut bb = BatchBuilder::new(schema);
+    for &(pk, weight, val) in rows {
+        bb.begin_row(pk, weight);
+        for _ in 0..schema.num_payload_cols() {
+            match val {
+                Some(v) => bb.put_int(v as u128),
+                None => bb.put_null(),
+            }
         }
+        bb.end_row();
     }
-    batch
+    bb.finish()
 }
 
-/// Concatenate per-column OPK byte images into one compound PK.
-pub(super) fn compound_pk_bytes(parts: &[&[u8]]) -> PkBuf {
-    let mut v = Vec::new();
-    for p in parts {
-        v.extend_from_slice(p);
-    }
-    PkBuf::from_bytes(&v)
+/// An inert dispatcher for the paths that never reach a live cluster: one empty
+/// W2M ring per worker, so the wait loops always reach their no-progress arm,
+/// and `-1` eventfds, which nothing parks on. Its mappings are leaked, so
+/// nothing here has a lifetime a caller could get wrong. `catalog` may be null
+/// only where the path under test never calls `cat()`.
+pub(super) fn test_dispatcher(worker_pids: Vec<i32>, catalog: *mut CatalogEngine) -> MasterDispatcher {
+    const RING_CAP: usize = 64 * 1024;
+    const SAL_SIZE: usize = 4096;
+    let nw = worker_pids.len();
+    let rings = (0..nw)
+        .map(|_| unsafe { crate::runtime::w2m::test_ring(RING_CAP) }.leak())
+        .collect();
+    // A real SAL page: `rewind`/`checkpoint_reset` store through the base
+    // pointer, so it must not be null.
+    let sal = SharedRegion::new(SAL_SIZE).leak();
+    MasterDispatcher::new(
+        worker_pids,
+        catalog,
+        0,
+        SalWriter::new(sal, -1, SAL_SIZE as u64, nw),
+        Rc::new(W2mReceiver::new(rings)),
+        vec![-1; nw],
+    )
 }

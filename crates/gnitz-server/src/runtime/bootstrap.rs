@@ -681,7 +681,6 @@ fn run_server(
     // every base round must publish past.
     let boot_generation = unsafe { (*catalog_ptr).durable_generation() };
     let dispatcher = MasterDispatcher::new(
-        nw,
         worker_pids,
         catalog_ptr,
         boot_generation,

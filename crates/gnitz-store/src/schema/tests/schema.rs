@@ -370,3 +370,48 @@ fn schema_descriptor_conforms_to_schema_facts() {
         SchemaDescriptor::new(&scols, &pk_idx)
     });
 }
+
+// ── PK rendering ─────────────────────────────────────────────────────────
+
+/// `format_pk_bytes` decodes each column out of the OPK image at its own
+/// offset and width. The signed arms are what a native-LE read would get
+/// wrong (OPK flips the sign bit), and a compound PK wider than 16 bytes is
+/// what a `u128` key form could not carry at all.
+#[test]
+fn format_pk_bytes_renders_every_pk_column_from_its_opk_image() {
+    use crate::test_support::shared::opk_pk;
+
+    for (tc, v, want) in [
+        (type_code::I8, -5i128, "-5"),
+        (type_code::I16, -300, "-300"),
+        (type_code::I32, -70_000, "-70000"),
+        (type_code::I64, i64::MIN as i128, "-9223372036854775808"),
+        (type_code::U8, 200, "200"),
+        (type_code::U64, u64::MAX as i128, "18446744073709551615"),
+        (
+            type_code::U128,
+            u128::MAX as i128,
+            "340282366920938463463374607431768211455",
+        ),
+    ] {
+        let schema = SchemaDescriptor::new(&[SchemaColumn::new(tc, 0)], &[0]);
+        assert_eq!(
+            schema.format_pk_bytes(&opk_pk(&schema, &[v as u128])),
+            want,
+            "type {tc}"
+        );
+    }
+
+    let uuid = SchemaDescriptor::new(&[SchemaColumn::new(type_code::UUID, 0)], &[0]);
+    let v = 0x550e8400_e29b_41d4_a716_446655440000u128;
+    assert_eq!(
+        uuid.format_pk_bytes(&opk_pk(&uuid, &[v])),
+        "550e8400-e29b-41d4-a716-446655440000",
+        "a UUID renders from all 128 bits, not a truncated low word",
+    );
+
+    // 24-byte compound PK: every column read at its own offset.
+    let wide = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0); 3], &[0, 1, 2]);
+    assert!(wide.pk_stride() > 16);
+    assert_eq!(wide.format_pk_bytes(&opk_pk(&wide, &[7, 8, 9])), "7, 8, 9");
+}
