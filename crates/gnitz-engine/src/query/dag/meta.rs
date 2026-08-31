@@ -1,171 +1,13 @@
-//! Plan-free view metadata: the dependency map and the per-view circuit
-//! metadata (`ViewMeta`) consumed by callers that must never compile — the
-//! master's exchange-relay path (compiling creates rank-stamped scratch
-//! tables) and boot-time classification, which runs before any plan exists.
+//! Plan-free view metadata: the dependency map, the memoized per-view routing
+//! metadata and the placement query, for callers that must never compile — the
+//! master's exchange-relay path (compiling creates rank-stamped scratch tables)
+//! and boot-time classification, which runs before any plan exists.
 //!
-//! The one master-side compile, `DagEngine::preflight_compile`, is exempt only
-//! because it redirects the compile to a throwaway root, keeping rank 0's
-//! stamped scratch names off worker 0's real paths. Anything else the master
-//! needs still has to route through here.
+//! `DagEngine::preflight_compile` is the one master-side compile, exempt because
+//! it redirects to a throwaway root; anything else the master needs routes here.
 
 use super::*;
 use std::rc::Rc;
-
-/// How the master relay routes one source's delta into a view.
-pub enum RelayRoute {
-    /// The source feeds several distinct reindex keys: no single key
-    /// co-partitions it with the trace sides, so the round must be refused
-    /// rather than routed by a key nothing was stored under
-    /// (see `compiler::load::scatter_key_of_scan`).
-    NoSingleKey,
-    /// Pure range join (`n_eq == 0`): the matches are spread over the whole key
-    /// space, so every worker needs the full delta and trims to its owned slice
-    /// (`WorkerFilter`) before integrating.
-    Broadcast,
-    /// Scatter by `cols`, already truncated to the routing prefix. A band join
-    /// (`n_eq >= 1`) routes by the equality prefix alone, dropping the trailing
-    /// range slot, so equal eq-values co-partition both sides and the range
-    /// probe stays partition-local.
-    Scatter {
-        cols: Rc<[u32]>,
-        /// The per-slot promotion targets a `JoinPromote` scatter carries,
-        /// mirroring the trace-side reindex Map slot-for-slot. Empty under
-        /// `GroupKey`, which promotes nothing.
-        target_tcs: Rc<[u8]>,
-        mode: ops::RouteMode,
-    },
-}
-
-/// Per-view circuit metadata derived from one circuit load.
-/// Everything a plan-free caller needs; eviction is one map `remove`.
-pub struct ViewMeta {
-    /// The sink-nearest `ExchangeShard`'s shard columns — the routing key of
-    /// every source that carries no reindex key of its own — and `None` when the
-    /// circuit carries no `ExchangeShard` at all. The two states are distinct:
-    /// an ungrouped global aggregate shards on `∅`, a real exchange that funnels
-    /// every row onto `worker_for_key(V₀)`.
-    pub(super) shard_cols: Option<Rc<[u32]>>,
-    /// source table id → that source's relay route.
-    source_routes: FxHashMap<i64, RelayRoute>,
-    /// The route of everything absent from `source_routes`.
-    default_route: RelayRoute,
-    /// The circuit carries a `Join` node.
-    pub(super) has_join: bool,
-    /// The sources whose deltas must go through the join scatter: those carrying
-    /// a join/group reindex key, minus those whose native distribution already
-    /// matches it (or whose partner is replicated). Probed once per epoch on the
-    /// multi-worker dispatch path, which is why it is `Fx`-hashed.
-    pub(super) scatter_sources: FxHashSet<i64>,
-    /// `Some(n_eq)` iff the view is a non-equi (range / band) join. Read by the
-    /// worker dispatch's input-relay arm; the master relay reads the
-    /// [`RelayRoute`] this already folded it into.
-    pub(super) range_join_n_eq: Option<u8>,
-    /// The unary output `ExchangeShard` is a proven no-op (every row already on
-    /// the worker owning its distribution key) — the output IPC is elided.
-    pub(super) skips_exchange: bool,
-}
-
-impl ViewMeta {
-    /// The answer for a circuit that could not be read or is cyclic: no exchange
-    /// skip, no shard or join columns, no range join. Every metadata query then
-    /// takes its conservative branch instead of walking a graph that is not there.
-    pub(super) fn nothing_special() -> ViewMeta {
-        ViewMeta {
-            shard_cols: None,
-            source_routes: FxHashMap::default(),
-            default_route: group_key_route(None),
-            has_join: false,
-            scatter_sources: FxHashSet::default(),
-            range_join_n_eq: None,
-            skips_exchange: false,
-        }
-    }
-
-    /// How the master relay routes `source_id`'s delta into this view. The
-    /// output relay (`source_id == 0`) and any source carrying no reindex key
-    /// take the view's own shard columns.
-    pub fn relay_route(&self, source_id: i64) -> &RelayRoute {
-        self.source_routes.get(&source_id).unwrap_or(&self.default_route)
-    }
-
-    /// Fold the circuit's derived facts into the routing table the relay reads.
-    /// Takes the facts and not the circuit, so a caller that already compiled the
-    /// view hands its own over instead of loading the circuit a second time.
-    pub(super) fn from_facts(facts: compiler::CircuitFacts) -> ViewMeta {
-        let compiler::CircuitFacts {
-            keys,
-            scatter_sources,
-            shard_cols,
-            range_join_n_eq,
-            has_join,
-            skips_exchange,
-            ..
-        } = facts;
-        let shard_cols: Option<Rc<[u32]>> = shard_cols.map(Rc::from);
-        let default_route = group_key_route(shard_cols.as_ref());
-        // `range_join_n_eq` governs a JOIN relay only: a source carrying no
-        // reindex key takes the shard columns whatever the join is.
-        let source_routes = keys
-            .into_iter()
-            .map(|(tid, key)| {
-                let route = match key {
-                    None => RelayRoute::NoSingleKey,
-                    // A key with no columns is not a join key.
-                    Some(pairs) if pairs.is_empty() => group_key_route(shard_cols.as_ref()),
-                    Some(pairs) => join_route(pairs, range_join_n_eq),
-                };
-                (tid, route)
-            })
-            .collect();
-        ViewMeta {
-            shard_cols,
-            source_routes,
-            default_route,
-            has_join,
-            scatter_sources,
-            range_join_n_eq,
-            skips_exchange,
-        }
-    }
-}
-
-/// A `ViewMeta` whose relay routing names `src` as a source — the shape
-/// `evict_meta` retains on.
-#[cfg(test)]
-pub(super) fn meta_with_source(src: i64) -> ViewMeta {
-    let mut m = ViewMeta::nothing_special();
-    m.source_routes.insert(src, RelayRoute::NoSingleKey);
-    m
-}
-
-/// The view's shard columns under `GroupKey`, consistent with `op_reduce`'s
-/// output PK.
-fn group_key_route(shard_cols: Option<&Rc<[u32]>>) -> RelayRoute {
-    RelayRoute::Scatter {
-        cols: shard_cols.cloned().unwrap_or_else(|| Rc::from([])),
-        target_tcs: Rc::from([]),
-        mode: ops::RouteMode::GroupKey,
-    }
-}
-
-/// The route a source carrying a non-empty reindex key takes. `pairs` is that
-/// key, `(column, promotion target)` per slot, in trace-side reindex order.
-fn join_route(pairs: Vec<(u32, u8)>, range_join_n_eq: Option<u8>) -> RelayRoute {
-    if range_join_n_eq == Some(0) {
-        return RelayRoute::Broadcast;
-    }
-    debug_assert!(
-        range_join_n_eq.is_none_or(|n_eq| pairs.len() == n_eq as usize + 1),
-        "range-join reindex key = [eq…, range]: len must be n_eq + 1"
-    );
-    // A band join routes by the eq prefix; an equi-join by the whole key.
-    let route_len = range_join_n_eq.map_or(pairs.len(), |n_eq| n_eq as usize);
-    RelayRoute::Scatter {
-        cols: pairs[..route_len].iter().map(|&(c, _)| c).collect(),
-        target_tcs: pairs[..route_len].iter().map(|&(_, t)| t).collect(),
-        mode: ops::RouteMode::JoinPromote,
-    }
-}
 
 /// The bidirectional view-dependency index with its validity flag bundled in, so
 /// "valid but stale" is unreachable: only `get_or_rebuild` sets `valid` (after
@@ -401,21 +243,10 @@ impl DagEngine {
         }
 
         // Every source is `Keyed`. A single-source view that neither shards nor
-        // joins re-emits that source's PK region verbatim, so its rows sit on the
-        // worker owning the *source's* distribution prefix and it must address
-        // them the same way. `pk_arity == |source PK|` stands in for "the view's
-        // PK region **is** the source's", which the planner's PK placement
+        // joins re-emits that source's PK region verbatim, so it must address its
+        // rows the way the source does. `pk_arity == |source PK|` stands in for
+        // "the view's PK region **is** the source's", which the planner
         // guarantees.
-        //
-        // The `has_join` term is a backstop, not a live case: a planned join has
-        // two distinct sources (the self-join guard rejects one source feeding
-        // both inputs), so the single-source destructure below already returns.
-        // It stays because an equi-join carries no `ExchangeShard` yet
-        // repartitions its inputs through the runtime join-shard scatter, so
-        // `shard_cols` alone would not catch one.
-        //
-        // The arity test comes first: it is a map lookup, where the circuit
-        // metadata can cost a load.
         let [src] = sources else {
             return Placement::KEYED_DEFAULT;
         };
@@ -425,30 +256,25 @@ impl DagEngine {
         if pk_arity != n {
             return Placement::KEYED_DEFAULT;
         }
-        let meta = self.view_meta(registry, view_id);
-        if meta.shard_cols.is_none() && !meta.has_join {
+        // Last, because it can cost a circuit load where the tests above are map
+        // lookups. Its join term is a backstop: a planned join has two distinct
+        // sources, so the destructure above has already returned.
+        if !self.view_meta(registry, view_id).repartitions {
             placement
         } else {
             Placement::KEYED_DEFAULT
         }
     }
 
-    // ── ViewMeta (plan-free circuit metadata) ───────────────────────────
+    // ── ViewMeta (plan-free routing metadata) ───────────────────────────
 
-    /// The memoized per-view circuit metadata, computed from ONE circuit load on
-    /// first touch. Cheaper than full compilation: no optimization passes, no
-    /// code emission.
+    /// The memoized per-view routing metadata, computed on first touch. Cheaper
+    /// than full compilation: no code emission.
     pub fn view_meta(&mut self, registry: &RelationRegistry, view_id: i64) -> Rc<ViewMeta> {
         if let Some(m) = self.meta.get(&view_id) {
             return m.clone();
         }
-        // A circuit that cannot be read, is malformed, or carries an unscatterable
-        // source takes the conservative branch — the same circuits `compile_view`
-        // rejects, so no view that runs is metadata-less.
-        let facts = compiler::load_circuit(registry, view_id as u64)
-            .ok()
-            .and_then(|l| compiler::CircuitFacts::derive(&l, registry).ok());
-        let meta = Rc::new(facts.map_or_else(ViewMeta::nothing_special, ViewMeta::from_facts));
+        let meta = Rc::new(ViewMeta::for_view(registry, view_id));
         self.meta.insert(view_id, meta.clone());
         meta
     }
@@ -458,7 +284,7 @@ impl DagEngine {
     /// Over-eviction is always safe: entries are recomputed on next touch.
     pub(super) fn evict_meta(&mut self, id: i64) {
         self.meta.remove(&id);
-        self.meta.retain(|_, m| !m.source_routes.contains_key(&id));
+        self.meta.retain(|_, m| !m.routes_source(id));
     }
 }
 

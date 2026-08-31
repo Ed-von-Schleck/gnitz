@@ -1,5 +1,5 @@
 //! Circuit compiler: reads system tables, builds a DBSP circuit graph,
-//! runs annotation + optimization passes, and emits VM instructions.
+//! derives its routing metadata, and emits VM instructions.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use std::fmt;
 
 use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
@@ -21,7 +21,7 @@ use gnitz_store::storage::{ReadCursor, RecoverySource, StorageError, Table};
 mod emit;
 mod hydration;
 mod load;
-mod optimize;
+mod routing;
 
 use emit::*;
 use hydration::derive_hydration;
@@ -29,10 +29,12 @@ pub(super) use hydration::{Hydration, HydrationSeed};
 
 // Everything here is `pub(super)`: `dag` is the only module that names the
 // compiler, so a `pub(crate)` would publish it to the catalog and runtime rungs
-// too.
+// too. `RelayRoute` is the exception — the master relay in `gnitz-server`
+// matches on it, so it is re-exported through `query`.
+pub(super) use load::for_each_scan_edge;
 use load::scan_tid_through_filters;
-pub(super) use load::{for_each_scan_edge, load_circuit};
-pub(super) use optimize::CircuitFacts;
+pub use routing::RelayRoute;
+pub(super) use routing::ViewMeta;
 
 // Port numbers reach the compiler only in hand-written fixture edge lists; every
 // production read of an operand goes through [`NodeInputs`].
@@ -82,7 +84,7 @@ impl fmt::Display for CompileError {
 /// exists — no caller has to state a sortedness precondition.
 ///
 /// Opaque outside this module: everything the rest of the engine wants from a
-/// circuit is derived once into [`CircuitFacts`], so nothing else can read a
+/// circuit is derived once into [`ViewMeta`], so nothing else can read a
 /// second answer out of the graph.
 pub(super) struct LoadedCircuit {
     nodes: HashMap<i32, gnitz_wire::OpNode>,
@@ -100,6 +102,14 @@ impl LoadedCircuit {
     /// out of `nodes`' own keys.
     fn op(&self, nid: i32) -> &gnitz_wire::OpNode {
         self.nodes.get(&nid).expect("topo_sorted builds one entry per node")
+    }
+
+    /// Every operator, in topological order — the circuit's only iteration. A
+    /// walk over `nodes` would answer by the hasher's order, which differs
+    /// between the master and each worker, so which of several matches wins
+    /// would too.
+    fn ops(&self) -> impl DoubleEndedIterator<Item = (i32, &gnitz_wire::OpNode)> {
+        self.ordered.iter().map(|&nid| (nid, self.op(nid)))
     }
 
     /// `nid`'s inputs. Total over `nodes`: `topo_sorted` builds one per node.
@@ -181,8 +191,7 @@ impl NodeInputs {
 }
 
 /// Build a `LoadedCircuit` from raw nodes/edges. Test-only: the struct's fields
-/// are module-private, so the `dag` tests (which exercise `ViewMeta::from_facts`)
-/// cannot construct one directly.
+/// are module-private, so a test outside this module cannot construct one.
 #[cfg(test)]
 pub(super) fn loaded_for_test(nodes: HashMap<i32, gnitz_wire::OpNode>, edges: Vec<(i32, i32, i32)>) -> LoadedCircuit {
     load::topo_sorted(nodes, edges).expect("test circuit must be a well-formed DAG")
@@ -218,9 +227,6 @@ pub(super) fn dummy_expr_blob() -> Vec<u8> {
         .expect("a well-formed program")
         .to_blob_bytes()
 }
-
-/// source table id → join/group reindex `(column, carried promotion tc)` pairs.
-type JoinShardMap = HashMap<i64, Vec<(u32, u8)>>;
 
 /// What a compile may read out of the host: the registered relations' schemas,
 /// and the circuit system tables the circuit itself is stored in. A lookup
@@ -448,15 +454,11 @@ struct Carve<'a> {
     ancestors: HashSet<i32>,
 }
 
-/// One compile's two products: the plan the dag caches, and the plan-free facts
-/// its `ViewMeta` is folded from.
-///
-/// The facts travel and the circuit does not, so nothing outside the compiler
-/// ever holds a `LoadedCircuit` it could read a second, differently-derived
-/// answer out of.
+/// One compile's two products: the plan the dag caches, and the plan-free
+/// `ViewMeta` the master relay and the worker dispatch read.
 pub(super) struct CompiledView {
     pub output: CompileOutput,
-    pub facts: CircuitFacts,
+    pub meta: ViewMeta,
 }
 
 /// Where a view's rederived children are created, and under what policy.
@@ -470,14 +472,14 @@ pub(super) struct ViewSite<'a> {
 }
 
 /// Compile a circuit for a single view: read the circuit from the system
-/// tables, then annotate → optimize → `build_plan`.
+/// tables, derive its routing metadata, then `build_plan`.
 pub(super) fn compile_view(
     site: ViewSite<'_>,
     view_schema: &SchemaDescriptor,
     host: &dyn SchemaSource,
     bounded: bool,
 ) -> Result<CompiledView, CompileError> {
-    let loaded = load_circuit(host, site.id)?;
+    let loaded = load::load_circuit(host, site.id)?;
     if loaded.nodes.is_empty() {
         return Err(CompileError::Rejected("circuit has no nodes"));
     }
@@ -485,12 +487,11 @@ pub(super) fn compile_view(
     // into `SubPlan`, never into `CompileOutput`, and an `Exchanged` shape runs
     // `build_plan` once per side plus post — so an emit-sourced fact would need a
     // cross-sub-plan merge.
-    let facts = CircuitFacts::derive(&loaded, host)?;
+    let meta = ViewMeta::derive(&loaded, host)?;
 
     let exchanges: Vec<(i32, &[u32])> = loaded
-        .ordered
-        .iter()
-        .filter_map(|&nid| match loaded.op(nid) {
+        .ops()
+        .filter_map(|(nid, op)| match op {
             gnitz_wire::OpNode::ExchangeShard { shard_cols } => Some((nid, shard_cols.as_slice())),
             _ => None,
         })
@@ -586,6 +587,6 @@ pub(super) fn compile_view(
             source_bound: load::circuit_source_bound(&loaded),
             hydration,
         },
-        facts,
+        meta,
     })
 }

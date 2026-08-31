@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn test_invalidation() {
     let mut dag = DagEngine::new();
-    dag.meta.insert(42, Rc::new(meta::meta_with_source(7)));
+    dag.meta.insert(42, Rc::new(ViewMeta::nothing_special()));
     dag.dep.valid = true;
 
     dag.invalidate(42);
@@ -13,31 +13,17 @@ fn test_invalidation() {
     dag.invalidate_dep_map();
     assert!(!dag.dep.valid);
 
-    dag.meta.insert(99, Rc::new(meta::meta_with_source(7)));
+    dag.meta.insert(99, Rc::new(ViewMeta::nothing_special()));
     dag.invalidate_all();
     assert!(dag.meta.is_empty());
 }
 
-/// `evict_meta` must drop the metadata mentioning the id as the owning view
-/// OR as a join source of another view's map — a dropped relation can be
-/// either, and a stale entry would disagree with the live circuit
-/// (over-eviction is safe; entries are recomputed on next touch).
+/// Wiring: the production table/view-drop path routes through `evict_meta`.
 #[test]
-fn test_view_meta_eviction() {
-    let mut dag = DagEngine::new();
-    dag.meta.insert(42, Rc::new(meta::meta_with_source(7))); // 42 as the view
-    dag.meta.insert(7, Rc::new(meta::meta_with_source(42))); // 42 as a source of view 7
-    dag.evict_meta(42);
-    assert!(!dag.meta.contains_key(&42));
-    assert!(
-        !dag.meta.contains_key(&7),
-        "evict must drop views whose map mentions the id as a source"
-    );
-
-    // Wiring: the production table/view-drop path routes through evict_meta.
+fn unregister_table_evicts_the_dropped_relations_meta() {
     let mut registry = gnitz_store::relation::RelationRegistry::new(1);
     let mut dag = DagEngine::new();
-    dag.meta.insert(43, Rc::new(meta::meta_with_source(1)));
+    dag.meta.insert(43, Rc::new(ViewMeta::nothing_special()));
     dag.unregister_table(&mut registry, 43);
     assert!(!dag.meta.contains_key(&43), "unregister_table must evict");
 }

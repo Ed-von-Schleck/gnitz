@@ -1,6 +1,6 @@
 //! DagEngine: the plan cache, the memoized view metadata, and the compilation
 //! entry point. Epoch execution lives in `exec`, per-key hydration in `hydrate`,
-//! and the plan-free view metadata (dependency map + `ViewMeta`) in `meta`.
+//! and the dependency map and the plan-free metadata queries in `meta`.
 //!
 //! Which relations exist, and the stores behind them, are the `relation` rung's
 //! — a sibling, not a field. Every method here that reaches a relation takes the
@@ -14,7 +14,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::rc::Rc;
 
-use crate::query::compiler::{self, CompileOutput, SubPlan};
+use crate::query::compiler::{self, CompileOutput, SubPlan, ViewMeta};
 use crate::query::vm;
 use gnitz_store::ops;
 use gnitz_store::relation::{RelationRegistry, TableEntry};
@@ -26,8 +26,6 @@ mod hydrate;
 mod meta;
 
 use meta::DepMap;
-pub use meta::RelayRoute;
-pub(crate) use meta::ViewMeta;
 
 // ---------------------------------------------------------------------------
 // ExchangeCallback — trait for multi-worker exchange IPC
@@ -53,7 +51,7 @@ pub trait ExchangeCallback {
 pub struct DagEngine {
     cache: FxHashMap<i64, CompileOutput>,
     dep: DepMap,
-    /// Memoized plan-free per-view circuit metadata (see `meta::ViewMeta`).
+    /// Memoized plan-free per-view circuit metadata (see `compiler::ViewMeta`).
     meta: FxHashMap<i64, Rc<ViewMeta>>,
 }
 
@@ -161,7 +159,7 @@ impl DagEngine {
         // The compile already walked this circuit, so seed the memo from what it
         // derived rather than let the first metadata touch read the same three
         // system tables again.
-        self.meta.insert(view_id, Rc::new(ViewMeta::from_facts(compiled.facts)));
+        self.meta.insert(view_id, Rc::new(compiled.meta));
         self.cache.insert(view_id, compiled.output);
         Ok(true)
     }

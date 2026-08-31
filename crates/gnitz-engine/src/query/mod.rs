@@ -4,10 +4,12 @@
 //! `dag` is the de-facto facade: it owns the plan cache and the epoch
 //! evaluator, and is the single inbound target catalog + runtime reach for.
 //! `compiler` (view → circuit → VM program) and `vm` (program execution) are
-//! query-internal — only `dag` and each other name them.
+//! query-internal — only `dag` and each other call into them. `RelayRoute`, the
+//! enum the master relay matches on, is the one name that leaves.
 
 mod compiler;
 mod dag;
 mod vm;
 
-pub use dag::{DagEngine, ExchangeCallback, RelayRoute};
+pub use compiler::RelayRoute;
+pub use dag::{DagEngine, ExchangeCallback};

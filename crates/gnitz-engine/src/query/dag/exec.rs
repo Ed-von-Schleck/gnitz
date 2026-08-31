@@ -238,7 +238,7 @@ impl DagEngine {
                     exchange.do_exchange(view_id, &pre, key)
                 }
             })
-        } else if meta.scatter_sources.contains(&src_id) {
+        } else if meta.scatters(src_id) {
             // Single + join-scatter source — scatter the delta by the join-shard
             // cols before the pipeline.
             let scattered = exchange.do_exchange(view_id, &input, src_id);

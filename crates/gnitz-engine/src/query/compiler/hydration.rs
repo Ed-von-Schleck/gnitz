@@ -46,10 +46,8 @@ fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, CompileErro
 
     // 1. From the sink's input, walk back through single-input Filter/Map nodes.
     let sink = loaded
-        .ordered
-        .iter()
-        .copied()
-        .find(|&nid| matches!(loaded.op(nid), OpNode::IntegrateSink))
+        .ops()
+        .find_map(|(nid, op)| matches!(op, OpNode::IntegrateSink).then_some(nid))
         .ok_or(CompileError::Rejected("bounded view: circuit has no IntegrateSink"))?;
     let mut cur = loaded.inputs(sink).unary();
     loop {

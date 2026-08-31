@@ -53,7 +53,7 @@ fn node_id_i32(v: i64) -> Option<i32> {
 /// into a `LoadedCircuit`: the per-node column gather, the `decode_op_node`
 /// calls and the node-id `i32` reject. The edge set is then `topo_sorted`'s to
 /// validate.
-pub(in crate::query) fn load_circuit(host: &dyn SchemaSource, view_id: u64) -> Result<LoadedCircuit, CompileError> {
+pub(super) fn load_circuit(host: &dyn SchemaSource, view_id: u64) -> Result<LoadedCircuit, CompileError> {
     let unopened = || CompileError::Rejected("circuit system tables are not open");
     let open = |tid: u64| host.open_sys_cursor(tid as i64).ok_or_else(unopened);
     let mut nodes_cur = open(gnitz_wire::CIRCUIT_NODES_TAB)?;
@@ -269,7 +269,7 @@ fn compute_skip_nodes(
 }
 
 // ---------------------------------------------------------------------------
-// Annotation passes
+// Circuit queries
 // ---------------------------------------------------------------------------
 
 /// The scatter key of the source scanned at `scan_nid`: one sequence per
@@ -278,7 +278,7 @@ fn compute_skip_nodes(
 /// Which reindex is a source's join/group key is the planner's to state
 /// ([`gnitz_wire::ReindexRole`]); the engine could only guess it from graph
 /// shape. The second return says the walk found only `Auxiliary` ones — a
-/// planner call site that forgot its role, which `CircuitFacts::derive` turns
+/// planner call site that forgot its role, which `ViewMeta::derive` turns
 /// into a failed compile rather than silently-unscattered rows.
 pub(super) fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec<Vec<(u32, u8)>>, bool) {
     let mut queue = VecDeque::from([scan_nid]);
@@ -355,16 +355,10 @@ pub(super) fn scan_tid_through_filters(loaded: &LoadedCircuit, enid: i32) -> Opt
 /// the circuit carries none. A two-sided set-op emits one shard per side, and
 /// every caller wants the one whose key the output carries.
 pub(super) fn output_exchange_shard(loaded: &LoadedCircuit) -> Option<(i32, Vec<u32>)> {
-    loaded.ordered.iter().rev().find_map(|&nid| match loaded.op(nid) {
+    loaded.ops().rev().find_map(|(nid, op)| match op {
         gnitz_wire::OpNode::ExchangeShard { shard_cols } => Some((nid, shard_cols.clone())),
         _ => None,
     })
-}
-
-/// The first node in topological order for which `f` yields a value — never
-/// `nodes` order, whose hasher would decide which of several matches wins.
-fn find_in_topo_order<T>(loaded: &LoadedCircuit, f: impl Fn(&gnitz_wire::OpNode) -> Option<T>) -> Option<T> {
-    loaded.ordered.iter().find_map(|&nid| f(loaded.op(nid)))
 }
 
 /// The equality-conjunct count of a non-equi (range / band) join, read off its
@@ -373,7 +367,7 @@ fn find_in_topo_order<T>(loaded: &LoadedCircuit, f: impl Fn(&gnitz_wire::OpNode)
 /// discriminator, and the value tells the relay whether to eq-prefix-scatter
 /// (band) or broadcast (`n_eq == 0`, pure range).
 pub(super) fn circuit_range_join_n_eq(loaded: &LoadedCircuit) -> Option<u8> {
-    find_in_topo_order(loaded, |op| match op {
+    loaded.ops().find_map(|(_, op)| match op {
         gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange { n_eq, .. }) => Some(*n_eq),
         _ => None,
     })
@@ -385,7 +379,7 @@ pub(super) fn circuit_range_join_n_eq(loaded: &LoadedCircuit) -> Option<u8> {
 /// so a hand-crafted circuit with several takes the topologically first and lets
 /// the rest degrade, the same way on every worker.
 pub(super) fn circuit_source_bound(loaded: &LoadedCircuit) -> Option<(i64, gnitz_wire::ScanBound)> {
-    find_in_topo_order(loaded, |op| match op {
+    loaded.ops().find_map(|(_, op)| match op {
         gnitz_wire::OpNode::ScanDelta { source, bound: Some(b) } => Some((*source as i64, *b)),
         _ => None,
     })
