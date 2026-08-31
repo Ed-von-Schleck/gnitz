@@ -124,9 +124,9 @@ impl ColumnDef {
         self
     }
 
-    /// Mark this column a hidden key slot (see [`ColumnDef::is_hidden`]). Chains
-    /// onto [`ColumnDef::new`]; the view emitters that fabricate synthetic keys
-    /// and `place_pk_front`'s auto-prepend arm are the only builders.
+    /// Mark this column hidden (see [`ColumnDef::is_hidden`]) — a slot the planner
+    /// fabricated, which no name the user wrote may reach. Chains onto
+    /// [`ColumnDef::new`].
     pub fn hidden(mut self) -> Self {
         self.is_hidden = true;
         self

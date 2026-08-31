@@ -10,8 +10,9 @@ use crate::agg::{
     group_col_reduce_pos, AggMapping, AggSpec, GroupByLayout, GroupBySelectItem,
 };
 use crate::ast_util::{
-    aliased_def, expand_wildcard_item, for_each_agg_call, group_by_exprs, is_bare_wildcard_projection,
-    reject_computed_grouped_item, reject_ungrouped_column, scalar_projection_item, single_relation_col_name,
+    aliased_def, expand_wildcard_item, for_each_agg_call, group_by_exprs, group_by_target, is_bare_wildcard_projection,
+    reject_grouped_column_ref, reject_grouped_null_test, reject_ungrouped_column, reject_unresolved_aggregate,
+    scalar_projection_item, single_relation_col_name,
 };
 use crate::bind::{bind_single_table, bind_structural, find_unique_column, fold_null_test, LeafBinder, SingleTable};
 use crate::error::GnitzSqlError;
@@ -33,6 +34,9 @@ pub(crate) fn analyze_group_by(
     // Parse GROUP BY → group column indices.
     let mut group_col_indices: Vec<usize> = Vec::new();
     for ge in group_by_exprs(select)? {
+        // A 1-based SELECT-list position resolves to the item it names first, so
+        // both grouped front ends read `GROUP BY 1` the same way.
+        let ge = group_by_target(ge, select)?;
         // Bare or qualified (`t.g`) single-relation reference — the qualifier
         // carries no disambiguating information over the single grouped source,
         // matching HAVING and the projection (`bind_single_table`).
@@ -40,7 +44,7 @@ pub(crate) fn analyze_group_by(
             GnitzSqlError::Unsupported("GROUP BY: only simple column references supported".to_string())
         })?;
         let idx = find_unique_column(&source_schema.columns, name)?
-            .ok_or_else(|| GnitzSqlError::Bind(format!("GROUP BY column '{name}' not found")))?;
+            .ok_or_else(|| GnitzSqlError::Bind(format!("GROUP BY: column '{name}' not found")))?;
         reject_float_key(&source_schema.columns[idx], "GROUP BY")?;
         group_col_indices.push(idx);
     }
@@ -66,7 +70,10 @@ pub(crate) fn analyze_group_by(
         match &bound {
             BoundExpr::ColRef(col_idx) => {
                 if !group_col_indices.contains(col_idx) {
-                    return Err(reject_ungrouped_column(&source_schema.columns[*col_idx].name));
+                    return Err(reject_ungrouped_column(
+                        "GROUP BY SELECT",
+                        &source_schema.columns[*col_idx].name,
+                    ));
                 }
                 let name = alias.unwrap_or_else(|| source_schema.columns[*col_idx].name.clone());
                 select_items.push(GroupBySelectItem::GroupCol {
@@ -89,7 +96,14 @@ pub(crate) fn analyze_group_by(
                 )?;
                 select_items.push(GroupBySelectItem::Aggregate { agg_idx });
             }
-            _ => return Err(reject_computed_grouped_item()),
+            // The ad-hoc fold reads columns out of the reduce output by position,
+            // so an expression over them has no column to read. The view path
+            // computes one in its finalize map instead.
+            _ => {
+                return Err(GnitzSqlError::Plan(
+                    "GROUP BY SELECT: only column refs and aggregates supported".to_string(),
+                ))
+            }
         }
     }
 
@@ -197,11 +211,11 @@ fn resolve_having_mapping<'a>(
         .iter()
         .find(|m| agg_mapping_matches(m, agg_func, arg_col))
         .ok_or_else(|| {
-            GnitzSqlError::Bind(format!(
-                "HAVING: aggregate {:?}({}) could not be resolved",
+            reject_unresolved_aggregate(
+                "HAVING",
                 agg_func,
-                arg_col.map_or("*".to_string(), |c| ctx.source_schema.columns[c].name.clone()),
-            ))
+                arg_col.map_or("*", |c| ctx.source_schema.columns[c].name.as_str()),
+            )
         })
 }
 
@@ -235,9 +249,7 @@ impl Having<'_> {
             .ok_or_else(|| GnitzSqlError::Bind(format!("HAVING: column '{col_name}' not found")))?;
         // HAVING may only reference grouped columns.
         if !ctx.group_col_indices.contains(&src) {
-            return Err(GnitzSqlError::Bind(format!(
-                "HAVING: column '{col_name}' must appear in GROUP BY or an aggregate function"
-            )));
+            return Err(reject_ungrouped_column("HAVING", col_name));
         }
         let reduce_col = group_col_reduce_pos(src, ctx.out_key, ctx.source_schema, ctx.group_col_indices);
         Ok((src, reduce_col))
@@ -249,8 +261,7 @@ impl LeafBinder for Having<'_> {
         // HAVING references the grouped relation by source column name. A qualified
         // ref (`t.g`) resolves the bare name the same way — the qualifier carries no
         // disambiguating information over a single grouped relation.
-        let col_name = single_relation_col_name(e)
-            .ok_or_else(|| GnitzSqlError::Unsupported(format!("HAVING: unsupported column reference {e:?}")))?;
+        let col_name = single_relation_col_name(e).ok_or_else(|| reject_grouped_column_ref("HAVING"))?;
         let (_, reduce_col) = self.resolve_group_col(col_name)?;
         Ok(BoundExpr::ColRef(reduce_col))
     }
@@ -288,11 +299,7 @@ impl LeafBinder for Having<'_> {
                 ))
             }
             _ => {
-                let col_name = single_relation_col_name(inner).ok_or_else(|| {
-                    GnitzSqlError::Unsupported(
-                        "HAVING: IS [NOT] NULL is only supported on an aggregate or a group column".to_string(),
-                    )
-                })?;
+                let col_name = single_relation_col_name(inner).ok_or_else(|| reject_grouped_null_test("HAVING"))?;
                 let (src, reduce_col) = self.resolve_group_col(col_name)?;
                 Ok(fold_null_test(
                     self.ctx.source_schema.columns[src].is_nullable,

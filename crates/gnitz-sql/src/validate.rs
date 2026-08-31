@@ -91,6 +91,13 @@ pub(crate) fn disambiguate_index_name(base: String, taken: &std::collections::Ha
     unreachable!("u32 range exhausted")
 }
 
+/// [`reject_float_key`] for a key with no column name to report — a computed one.
+pub(crate) fn reject_float_key_of(what: &str, role: &str) -> GnitzSqlError {
+    GnitzSqlError::Unsupported(format!(
+        "{role}: {what} cannot be a key (IEEE-754 -0.0/+0.0 and NaN break key equality)"
+    ))
+}
+
 /// Reject a float column used as any hashed key — a GROUP BY grouping key, a
 /// DISTINCT/set-op row identity, or an equijoin key. All of these hash the
 /// column's raw IEEE-754 bytes, so -0.0/+0.0 and distinct-NaN bit patterns split
@@ -98,11 +105,7 @@ pub(crate) fn disambiguate_index_name(base: String, taken: &std::collections::Ha
 /// names the offending clause for the error message.
 pub(crate) fn reject_float_key(col: &ColumnDef, role: &str) -> Result<(), GnitzSqlError> {
     if col.type_code.is_float() {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "{role}: float column '{}' cannot be a key \
-             (IEEE-754 -0.0/+0.0 and NaN break key equality)",
-            col.name
-        )));
+        return Err(reject_float_key_of(&format!("float column '{}'", col.name), role));
     }
     Ok(())
 }

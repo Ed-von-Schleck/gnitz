@@ -7,8 +7,8 @@
 //! (`resolve_table_factor`), never a segment.
 
 use super::{
-    as_col, bind_and_lower, col_by_id, widen_if, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, InPair, JoinType,
-    ProjEntry, RelExpr, SetOpKind, SubqueryKind, SubqueryRef,
+    as_col, bind_and_lower, col_by_id, hircol_of, widen_if, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, InPair,
+    JoinType, ProjEntry, RelExpr, SetOpKind, SubqueryKind, SubqueryRef,
 };
 use crate::agg::{
     agg_output_nullable, agg_typing, default_agg_name, finalize_agg_bexpr, finalize_agg_null_test,
@@ -16,10 +16,10 @@ use crate::agg::{
 };
 use crate::ast_util::{
     aliased_def, body_is_grouped, classify_agg_call, classify_from, expand_wildcard_item, extract_table_name_and_alias,
-    flatten_conjuncts, for_each_agg_call, group_by_exprs, has_exists_in_subquery, has_scalar_subquery, is_agg_call,
-    is_name_preserving_wildcard_projection, peel_nested, projection_item_expr, reject_computed_grouped_item,
-    reject_ungrouped_column, reject_unsupported_fn_qualifiers, scalar_projection_item, single_relation_col_name,
-    unknown_function, FromShape,
+    flatten_conjuncts, for_each_agg_call, group_by_exprs, group_by_target, has_exists_in_subquery, has_scalar_subquery,
+    is_agg_call, is_name_preserving_wildcard_projection, peel_nested, projection_item_expr, reject_grouped_column_ref,
+    reject_grouped_null_test, reject_ungrouped_column, reject_unresolved_aggregate, reject_unsupported_fn_qualifiers,
+    scalar_projection_item, single_relation_col_name, unknown_function, FromShape,
 };
 use crate::bind::{apply_positional_aliases, cte_passthrough};
 use crate::bind::{bind_structural, find_unique_column, fold_null_test, single_relation_col_idx, Binder, LeafBinder};
@@ -28,7 +28,7 @@ use crate::hir::chain::ViewChain;
 use crate::hir::guards::join_on_and_type;
 use crate::ir::{AggFunc, BExpr, BinOp};
 use crate::validate::{
-    cte_body, non_recursive_ctes, plain_select_body, reject_duplicate_names, reject_float_key,
+    cte_body, non_recursive_ctes, plain_select_body, reject_duplicate_names, reject_float_key, reject_float_key_of,
     reject_query_envelope_body, reject_unhonored_select_clauses, validate_user_name, HonoredClauses,
 };
 use gnitz_core::{CatalogSnapshot, ColumnDef, TypeCode};
@@ -342,6 +342,12 @@ fn bind_projection<L: LeafBinder<HirRef>>(
 /// always-nullable rules `resolve_proj_col` applies on the ad-hoc path. (The
 /// nullability is a fixed constant, never inferred: inferring it from operand
 /// nullability would diverge a downstream `IS NOT NULL` const-elision.)
+///
+/// A hidden column is computed, not passed through: it has no name the user
+/// wrote, so there is nothing to inherit. Only the grouped leaf can reach one —
+/// it resolves a written composite GROUP BY key to the pre-map column holding it
+/// — since every other leaf resolves names through `find_unique_column`, which
+/// skips hidden columns.
 fn bind_proj_expr<L: LeafBinder<HirRef>>(
     expr: &Expr,
     alias: Option<String>,
@@ -351,10 +357,12 @@ fn bind_proj_expr<L: LeafBinder<HirRef>>(
     ids: &ColIdGen,
 ) -> Result<ProjEntry, GnitzSqlError> {
     let bound = bind_structural(expr, leaf)?;
-    let out_def = if let BExpr::ColRef(HirRef::Col(id)) = &bound {
-        aliased_def(&hircol_of(env, *id).def, alias)
-    } else {
-        ColumnDef::computed(alias, idx, bound.infer_type_with(&|r: &HirRef| type_of(env, r)))
+    let src_def = as_col(&bound)
+        .map(|id| &hircol_of(env, id).def)
+        .filter(|d| !d.is_hidden);
+    let out_def = match src_def {
+        Some(d) => aliased_def(d, alias),
+        None => ColumnDef::computed(alias, idx, bound.infer_type_with(&|r: &HirRef| type_of(env, r))),
     };
     Ok(ProjEntry {
         expr: bound,
@@ -363,12 +371,6 @@ fn bind_proj_expr<L: LeafBinder<HirRef>>(
             def: out_def,
         },
     })
-}
-
-/// The env `HirCol` a `ColId` names. A HIR `ColRef` always references an env
-/// column (bind mints them there), so absence is an internal compile error.
-fn hircol_of(env: &[HirCol], id: ColId) -> &HirCol {
-    col_by_id(env, id).expect("HIR ColRef references an env column")
 }
 
 /// The declared type of a leaf reference — the env column's type code, or the
@@ -863,7 +865,7 @@ fn classify_scalar_agg(e: &Expr, inner_cols: &[HirCol]) -> Result<(AggFunc, Opti
         None => None,
     };
     if let Some(id) = arg {
-        reject_min_max_unorderable(func, col_by_id(inner_cols, id).expect("agg arg in inner").def.type_code)?;
+        reject_min_max_unorderable(func, hircol_of(inner_cols, id).def.type_code)?;
     }
     Ok((func, arg))
 }
@@ -918,7 +920,7 @@ fn build_scalar_reduce(
     arg: Option<ColId>,
     inner_cols: &[HirCol],
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    let arg_def = arg.map(|id| &col_by_id(inner_cols, id).expect("agg arg in inner").def);
+    let arg_def = arg.map(|id| &hircol_of(inner_cols, id).def);
     let typing = agg_typing(func, arg_def)?;
     let arg_nullable = arg_def.map(|d| d.is_nullable).unwrap_or(false);
     let hir_agg = HirAgg::new(ids, func, arg, &typing, arg_nullable, group_cols.is_empty());
@@ -1123,11 +1125,6 @@ struct GroupAgg {
     output_nullable: bool,
 }
 
-/// Extract the `ColId` of a bound bare column reference, naming the failure.
-fn col_of(e: &HirExpr) -> Result<ColId, GnitzSqlError> {
-    as_col(e).ok_or_else(|| GnitzSqlError::Internal("expected a column reference".into()))
-}
-
 /// The AVG / nullable-SUM / Direct finalize composite over the raw reduce output
 /// — the shared rule, over this binder's column-identity leaf.
 fn finalize_agg_expr(ga: &GroupAgg) -> HirExpr {
@@ -1138,25 +1135,112 @@ fn finalize_agg_expr(ga: &GroupAgg) -> HirExpr {
     )
 }
 
-/// Resolve GROUP BY columns to `ColId`s (bare/qualified refs only). A computed
-/// group column gives a GROUP-BY-context rejection (not the leaf's JOIN-ON message).
+/// The columns a grouped query computes below its reduce: a GROUP BY key or an
+/// aggregate argument that is not already a bare column reference becomes one
+/// column of a `Project` under the `Reduce`, so the `Reduce` takes plain `ColId`s.
+/// `lower_reduce` emits that `Project` as a map in the reduce's own circuit, so it
+/// costs no second relation.
+///
+/// One column per distinct expression, keyed by its **bound** form — which is what
+/// makes `GROUP BY t.a + b` and `SELECT a + b` one expression, and folds `Nested`
+/// away so `SUM((a * b))` and `SUM(a * b)` reach one aggregate.
+struct PreMap<'a> {
+    ids: &'a ColIdGen,
+    /// The reduce input's columns: the source env, then one per materialized
+    /// expression. Every `ColId` this hands out resolves here.
+    env: Vec<HirCol>,
+    /// The materialized columns and the expressions computing them — also the
+    /// memo, since `extra[i].expr` is what `extra[i].out.id` holds.
+    extra: Vec<ProjEntry>,
+}
+
+impl<'a> PreMap<'a> {
+    fn new(ids: &'a ColIdGen, env: Vec<HirCol>) -> Self {
+        PreMap {
+            ids,
+            env,
+            extra: Vec::new(),
+        }
+    }
+
+    /// The column `e` names, materializing one on first sight.
+    fn column_for<L: LeafBinder<HirRef>>(&mut self, e: &Expr, leaf: &L) -> Result<ColId, GnitzSqlError> {
+        let bound = bind_structural(e, leaf)?;
+        if let Some(id) = find_bound(&self.extra, &bound) {
+            return Ok(id);
+        }
+        let ty = bound.infer_type_with(&|r: &HirRef| type_of(&self.env, r));
+        let out = HirCol {
+            id: self.ids.next(),
+            // Nullable because a computed value can be NULL (`a / 0`) and nothing
+            // infers otherwise — so an aggregate over one takes the null-skipping
+            // shape where the same aggregate over a NOT NULL column would not.
+            // Hidden because only the expression that minted it may reach it.
+            def: ColumnDef::new(format!("_pre{}", self.extra.len()), ty, true).hidden(),
+        };
+        let id = out.id;
+        self.env.push(out.clone());
+        self.extra.push(ProjEntry { expr: bound, out });
+        Ok(id)
+    }
+
+    /// The reduce's input: `input` when nothing was materialized, else an identity
+    /// `Project` over it carrying the materialized columns as extra items.
+    fn reduce_input(&self, input: Rc<RelExpr>) -> Rc<RelExpr> {
+        if self.extra.is_empty() {
+            return input;
+        }
+        let mut items = RelExpr::passthrough_items(input.cols());
+        items.extend(self.extra.iter().cloned());
+        RelExpr::project(input, items)
+    }
+}
+
+/// A rejection raised while binding one clause, named with it. The message already
+/// says what is wrong with the reference; only the clause is added.
+fn clause_error(clause: &str, e: GnitzSqlError) -> GnitzSqlError {
+    let prefixed = |m: String| format!("{clause}: {m}");
+    match e {
+        GnitzSqlError::Bind(m) => GnitzSqlError::Bind(prefixed(m)),
+        GnitzSqlError::Plan(m) => GnitzSqlError::Plan(prefixed(m)),
+        GnitzSqlError::Unsupported(m) => GnitzSqlError::Unsupported(prefixed(m)),
+        // Not a verdict about the written reference — a control signal or an
+        // internal break, which must reach its handler unedited.
+        other => other,
+    }
+}
+
+/// The column already holding `bound`'s value: its own when it is a bare column
+/// reference, else the pre-map column computing an equal expression. One rule for
+/// minting and for looking up, so an expression cannot resolve to one column in
+/// the reduce and another above it.
+fn find_bound(extra: &[ProjEntry], bound: &HirExpr) -> Option<ColId> {
+    as_col(bound).or_else(|| extra.iter().find(|x| &x.expr == bound).map(|x| x.out.id))
+}
+
+/// Resolve the GROUP BY list to the `ColId`s the reduce groups by: a 1-based
+/// position names its SELECT item, a bare reference is its own column, and
+/// anything computed is materialized below the reduce by `pre`.
 fn resolve_group_cols<L: LeafBinder<HirRef>>(
     select: &Select,
-    env: &[HirCol],
     leaf: &L,
+    pre: &mut PreMap<'_>,
 ) -> Result<Vec<ColId>, GnitzSqlError> {
-    let group_exprs = group_by_exprs(select)?;
     let mut cols = Vec::new();
-    for ge in group_exprs {
-        let ge = peel_nested(ge);
-        if !matches!(ge, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
-            return Err(GnitzSqlError::Unsupported(
-                "GROUP BY: only simple column references supported".into(),
-            ));
+    for ge in group_by_exprs(select)? {
+        let target = group_by_target(ge, select)?;
+        // The key binds through the FROM leaf, whose rejection names the column but
+        // not the clause it was written in.
+        let id = pre.column_for(target, leaf).map_err(|e| clause_error("GROUP BY", e))?;
+        let def = &hircol_of(&pre.env, id).def;
+        match single_relation_col_name(target) {
+            Some(_) => reject_float_key(def, "GROUP BY")?,
+            // A computed key has no name the user wrote, so describe it instead.
+            None if def.type_code.is_float() => {
+                return Err(reject_float_key_of("a float-valued expression", "GROUP BY"))
+            }
+            None => {}
         }
-        let id = col_of(&leaf.bind_column(ge)?)?;
-        let hc = col_by_id(env, id).expect("group col in env");
-        reject_float_key(&hc.def, "GROUP BY")?;
         cols.push(id);
     }
     Ok(cols)
@@ -1171,33 +1255,32 @@ fn resolve_group_cols<L: LeafBinder<HirRef>>(
 /// top-level aggregate call a second time.
 fn collect_aggs<L: LeafBinder<HirRef>>(
     expr: &Expr,
-    env: &[HirCol],
     leaf: &L,
     is_global: bool,
     aggs: &mut Vec<GroupAgg>,
-    ids: &ColIdGen,
+    pre: &mut PreMap<'_>,
 ) -> Result<Option<usize>, GnitzSqlError> {
     let mut top: Option<usize> = None;
     let is_top = for_each_agg_call(expr, &mut |f| -> Result<(), GnitzSqlError> {
         let (func, arg_expr) = classify_agg_call(f)?;
         let arg = match arg_expr {
-            Some(e) => Some(col_of(&leaf.bind_column(e)?)?),
+            Some(e) => Some(pre.column_for(e, leaf)?),
             None => None,
         };
         // MIN/MAX orderability — checked here (Unsupported) so the message and error
         // variant match the leaf binder's, ahead of `agg_typing`'s `Bind` backstop.
         if let Some(id) = arg {
-            reject_min_max_unorderable(func, col_by_id(env, id).expect("agg arg in env").def.type_code)?;
+            reject_min_max_unorderable(func, hircol_of(&pre.env, id).def.type_code)?;
         }
         top = Some(match aggs.iter().position(|a| a.agg.func == func && a.agg.arg == arg) {
             Some(idx) => idx,
             None => {
-                let arg_def = arg.map(|id| &col_by_id(env, id).expect("agg arg ColId in env").def);
+                let arg_def = arg.map(|id| &hircol_of(&pre.env, id).def);
                 let typing = agg_typing(func, arg_def)?;
                 let arg_nullable = arg_def.map(|d| d.is_nullable).unwrap_or(false);
                 let output_nullable = agg_output_nullable(&typing, arg_nullable, is_global);
                 aggs.push(GroupAgg {
-                    agg: HirAgg::new(ids, func, arg, &typing, arg_nullable, is_global),
+                    agg: HirAgg::new(pre.ids, func, arg, &typing, arg_nullable, is_global),
                     view_type: typing.view_type,
                     output_nullable,
                 });
@@ -1210,7 +1293,8 @@ fn collect_aggs<L: LeafBinder<HirRef>>(
 }
 
 /// Bind the GROUP BY / aggregate / HAVING suffix over `input` (the `Filter?(source)`
-/// tree built by the FROM binder), producing `Project(Filter_having?(Reduce(input)))`.
+/// tree built by the FROM binder), producing
+/// `Project(Filter_having?(Reduce(PreMap?(input))))`.
 fn bind_grouped_suffix<L: LeafBinder<HirRef>>(
     ids: &ColIdGen,
     select: &Select,
@@ -1219,7 +1303,8 @@ fn bind_grouped_suffix<L: LeafBinder<HirRef>>(
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let env = input.cols();
 
-    let group_cols = resolve_group_cols(select, &env, leaf)?;
+    let mut pre = PreMap::new(ids, env);
+    let group_cols = resolve_group_cols(select, leaf, &mut pre)?;
     let is_global = group_cols.is_empty();
 
     // Aggregates from the projection ∪ HAVING (deduped). `item_agg[i]` is the
@@ -1230,52 +1315,61 @@ fn bind_grouped_suffix<L: LeafBinder<HirRef>>(
     let mut item_agg: Vec<Option<usize>> = Vec::with_capacity(select.projection.len());
     for item in &select.projection {
         let idx = match projection_item_expr(item) {
-            Some(expr) => collect_aggs(expr, &env, leaf, is_global, &mut aggs, ids)?,
+            Some(expr) => collect_aggs(expr, leaf, is_global, &mut aggs, &mut pre)?,
             None => None,
         };
         item_agg.push(idx);
     }
     if let Some(having) = &select.having {
-        let _ = collect_aggs(having, &env, leaf, is_global, &mut aggs, ids)?;
+        let _ = collect_aggs(having, leaf, is_global, &mut aggs, &mut pre)?;
     }
 
     let hir_aggs: Vec<HirAgg> = aggs.iter().map(|a| a.agg.clone()).collect();
-    let reduce = RelExpr::reduce(input, group_cols.clone(), hir_aggs);
+    let reduce = RelExpr::reduce(pre.reduce_input(input), group_cols.clone(), hir_aggs);
+
+    // The pre-map's columns, extended with each aggregate's raw value and
+    // companion: everything a `ColId` in an expression over the reduce output can
+    // resolve to when it is typed.
+    let PreMap { mut env, extra, .. } = pre;
+    for a in &aggs {
+        env.push(a.agg.out.clone());
+        env.extend(a.agg.companion.iter().cloned());
+    }
+    // One leaf per clause over the same grouped relation: only the wording of a
+    // rejection differs, so only the clause does.
+    let grouped = |clause| GroupedLeaf {
+        leaf,
+        env: &env,
+        group_cols: &group_cols,
+        aggs: &aggs,
+        extra: &extra,
+        clause,
+    };
 
     // HAVING → a Filter over the raw reduce output.
     let mut rel = reduce;
     if let Some(having) = &select.having {
-        let grouped_leaf = GroupedLeaf {
-            leaf,
-            env: &env,
-            group_cols: &group_cols,
-            aggs: &aggs,
-        };
-        let hexpr = bind_structural(having, &grouped_leaf)?;
+        let hexpr = bind_structural(having, &grouped("HAVING"))?;
         rel = RelExpr::filter(rel, vec![hexpr]);
     }
 
-    // Finalize projection (strict grouped-projection validator).
     // The dup-name guard fires in `lower_reduce` over the full output column list
     // (the reduce PK region included), a strict superset of this projection.
-    let items = bind_finalize_projection(select, &env, &group_cols, &aggs, &item_agg, leaf, ids)?;
+    let items = bind_finalize_projection(select, &item_agg, ids, &grouped("GROUP BY SELECT"))?;
     Ok(RelExpr::project(rel, items))
 }
 
-/// The finalize (SELECT) projection over the raw reduce output: every item is a
-/// bare group-col reference or an aggregate call (the strict validator).
-/// `item_agg[i]` is `bind_grouped_suffix`'s pre-resolved `aggs` index for a
-/// top-level aggregate item — the aggregate call itself is never re-parsed or
-/// re-bound here.
+/// The finalize (SELECT) projection over the raw reduce output. An item whose top
+/// level is an aggregate call takes that aggregate's name and nullability, read
+/// from `item_agg[i]` rather than re-bound; every other item goes through
+/// `bind_proj_expr`, the one projection-item rule.
 fn bind_finalize_projection<L: LeafBinder<HirRef>>(
     select: &Select,
-    env: &[HirCol],
-    group_cols: &[ColId],
-    aggs: &[GroupAgg],
     item_agg: &[Option<usize>],
-    leaf: &L,
     ids: &ColIdGen,
+    grouped: &GroupedLeaf<'_, L>,
 ) -> Result<Vec<ProjEntry>, GnitzSqlError> {
+    let (env, aggs) = (grouped.env, grouped.aggs);
     let mut items = Vec::new();
     for (idx, item) in select.projection.iter().enumerate() {
         let (expr, alias) = scalar_projection_item(item, "GROUP BY")?;
@@ -1291,78 +1385,91 @@ fn bind_finalize_projection<L: LeafBinder<HirRef>>(
             });
             continue;
         }
-        let peeled = peel_nested(expr);
-        if matches!(peeled, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
-            let id = col_of(&leaf.bind_column(peeled)?)?;
-            if !group_cols.contains(&id) {
-                let name = col_by_id(env, id).map(|c| c.def.name.clone()).unwrap_or_default();
-                return Err(reject_ungrouped_column(&name));
-            }
-            let def = aliased_def(&col_by_id(env, id).expect("group col in env").def, alias);
-            items.push(ProjEntry {
-                expr: BExpr::ColRef(HirRef::Col(id)),
-                out: HirCol { id: ids.next(), def },
-            });
-            continue;
-        }
-        return Err(reject_computed_grouped_item());
+        // Everything else is an ordinary projection item over the reduce output,
+        // bound through the grouped leaf: a group column passes its def through, a
+        // composite key resolves to a hidden pre-map column and so reads as
+        // computed.
+        items.push(bind_proj_expr(expr, alias, idx, env, grouped, ids)?);
     }
     Ok(items)
 }
 
-/// The leaf for HAVING over the grouped relation: group columns resolve to their
-/// source `ColId` (enforcing GROUP BY membership), aggregate calls to their
-/// finalize composite over the raw reduce output. Resolution routes through the
-/// original FROM leaf so `ColId`s match the collected aggregates and group cols.
+/// The leaf for an expression over the grouped relation — HAVING and the finalize
+/// SELECT list alike. A GROUP BY key binds to the column holding it and an
+/// aggregate call to its finalize composite; nothing else is available.
 struct GroupedLeaf<'a, L: LeafBinder<HirRef>> {
     leaf: &'a L,
+    /// The typing table for a `ColId` an expression over the reduce output holds:
+    /// the reduce's input columns plus each aggregate's raw value and companion.
+    /// Names resolve through `leaf`, never against this list.
     env: &'a [HirCol],
     group_cols: &'a [ColId],
     aggs: &'a [GroupAgg],
+    /// The pre-map's materialized columns, so a written expression matches the
+    /// column the reduce already computes for it.
+    extra: &'a [ProjEntry],
+    /// The clause being bound — this leaf serves HAVING and the SELECT list, and
+    /// every rejection below names it.
+    clause: &'static str,
 }
 
 impl<L: LeafBinder<HirRef>> GroupedLeaf<'_, L> {
-    fn resolve_group(&self, e: &Expr) -> Result<(ColId, bool), GnitzSqlError> {
-        // HAVING references the grouped relation by source name (matching the old
-        // `Having` binder's messages), enforcing GROUP BY membership.
-        let name = single_relation_col_name(e)
-            .ok_or_else(|| GnitzSqlError::Unsupported(format!("HAVING: unsupported column reference {e:?}")))?;
-        let idx = find_unique_column(self.env.iter().map(|c| &c.def), name)?
-            .ok_or_else(|| GnitzSqlError::Bind(format!("HAVING: column '{name}' not found")))?;
-        let hc = &self.env[idx];
-        if !self.group_cols.contains(&hc.id) {
-            return Err(GnitzSqlError::Bind(format!(
-                "HAVING: column '{name}' must appear in GROUP BY or an aggregate function"
-            )));
+    /// The group-key column an expression names, if it names one. Binding through
+    /// the **body's own leaf** is what makes one rule serve both spellings: a bare
+    /// reference binds to its own column, a written key to the pre-map column
+    /// holding it, and `l.v` in a join resolves the way the body resolves it.
+    fn group_key(&self, e: &Expr) -> Option<ColId> {
+        let bound = bind_structural(e, self.leaf).ok()?;
+        find_bound(self.extra, &bound).filter(|id| self.group_cols.contains(id))
+    }
+
+    /// Why `e` is not a group key: a name the body resolves was written outside
+    /// both the grouping and an aggregate; anything the body refuses is that
+    /// refusal, re-read as this clause's.
+    fn not_a_key(&self, e: &Expr) -> GnitzSqlError {
+        match (single_relation_col_name(e), bind_structural(e, self.leaf)) {
+            (_, Err(err)) => clause_error(self.clause, err),
+            (Some(name), Ok(_)) => reject_ungrouped_column(self.clause, name),
+            (None, Ok(_)) => reject_grouped_column_ref(self.clause),
         }
-        Ok((hc.id, hc.def.is_nullable))
     }
 
     fn find_agg(&self, f: &Function) -> Result<&GroupAgg, GnitzSqlError> {
         let (func, arg_expr) = classify_agg_call(f)?;
+        // Through the pre-map, so `SUM(a * b)` here names the column the reduce
+        // already aggregates rather than a second one.
         let arg = match arg_expr {
-            Some(e) => Some(col_of(&self.leaf.bind_column(e)?)?),
+            Some(e) => Some(find_bound(self.extra, &bind_structural(e, self.leaf)?).ok_or_else(|| {
+                GnitzSqlError::Unsupported(format!("{}: unsupported aggregate argument {e:?}", self.clause))
+            })?),
             None => None,
         };
         self.aggs
             .iter()
             .find(|a| a.agg.func == func && a.agg.arg == arg)
             .ok_or_else(|| {
-                // Defensive: an aggregate reaching here was collected into the
-                // reduce first, so no SQL body resolves to `None`. Spelled
-                // exactly as the ad-hoc fold binder spells it, argument column
-                // included, so the two cannot describe one invariant two ways.
-                GnitzSqlError::Bind(format!(
-                    "HAVING: aggregate {func:?}({}) could not be resolved",
-                    arg.map_or("*", |id| hircol_of(self.env, id).def.name.as_str())
-                ))
+                reject_unresolved_aggregate(
+                    self.clause,
+                    func,
+                    arg.map_or("*", |id| hircol_of(self.env, id).def.name.as_str()),
+                )
             })
     }
 }
 
 impl<L: LeafBinder<HirRef>> LeafBinder<HirRef> for GroupedLeaf<'_, L> {
+    /// A written GROUP BY key, wherever it appears: `(a + b) * 2` binds over
+    /// `GROUP BY a + b`. With no computed key there is nothing to match, and
+    /// `bind_column` answers the bare names on its own.
+    fn bind_node(&self, e: &Expr) -> Option<HirExpr> {
+        if self.extra.is_empty() {
+            return None;
+        }
+        Some(BExpr::ColRef(HirRef::Col(self.group_key(e)?)))
+    }
+
     fn bind_column(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
-        let (id, _) = self.resolve_group(e)?;
+        let id = self.group_key(e).ok_or_else(|| self.not_a_key(e))?;
         Ok(BExpr::ColRef(HirRef::Col(id)))
     }
     fn bind_function(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
@@ -1387,15 +1494,20 @@ impl<L: LeafBinder<HirRef>> LeafBinder<HirRef> for GroupedLeaf<'_, L> {
                 ));
             }
         }
-        // A bare group-column reference; anything else (an arithmetic expression)
-        // is neither an aggregate nor a group column, and is rejected as such.
-        if single_relation_col_name(inner).is_none() {
-            return Err(GnitzSqlError::Unsupported(
-                "HAVING: IS [NOT] NULL is only supported on an aggregate or a group column".into(),
-            ));
-        }
-        let (id, nullable) = self.resolve_group(inner)?;
-        Ok(fold_null_test(nullable, HirRef::Col(id), want_null))
+        // A group key — bare or written — is the only other operand the reduce
+        // output offers. A name that is not one gets the ungrouped verdict; any
+        // other shape gets the null test's own.
+        let id = self
+            .group_key(inner)
+            .ok_or_else(|| match single_relation_col_name(inner) {
+                Some(_) => self.not_a_key(inner),
+                None => reject_grouped_null_test(self.clause),
+            })?;
+        Ok(fold_null_test(
+            hircol_of(self.env, id).def.is_nullable,
+            HirRef::Col(id),
+            want_null,
+        ))
     }
 }
 

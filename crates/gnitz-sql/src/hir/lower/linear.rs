@@ -96,6 +96,5 @@ pub(super) fn emit_linear(
 
     // The view's physical PK is the leading k columns (the source PK passed
     // through in pk_indices() order).
-    let view_pk: Vec<u32> = (0..k as u32).collect();
-    Ok((circuit, proj.out_cols.clone(), view_pk))
+    Ok((circuit, proj.out_cols.clone(), k))
 }

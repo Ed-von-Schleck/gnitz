@@ -15,7 +15,7 @@
 
 use std::cmp::Ordering;
 
-use crate::ast_util::{expr_usize_literal, single_relation_col_name};
+use crate::ast_util::{clause_position, reject_position_out_of_range, single_relation_col_name};
 use crate::bind::find_unique_column;
 use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
@@ -23,7 +23,7 @@ use crate::exec::batch::RowGather;
 use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_wire::cmp_typed_le;
-use sqlparser::ast::{Expr, OrderBy, OrderByKind, Value};
+use sqlparser::ast::{Expr, OrderBy, OrderByKind};
 
 // ---------------------------------------------------------------------------
 // One sort key over the full pre-projection schema
@@ -178,12 +178,9 @@ fn unsupported(what: &str) -> GnitzSqlError {
 
 /// Classify one ORDER BY expression as a positional index or a column reference.
 fn order_target(e: &Expr) -> Result<OrderTarget, GnitzSqlError> {
-    // Integer literal → positional, parsed by the same fallible helper as
-    // `extract_limit`/`extract_offset`.
-    if let Expr::Value(vws) = e {
-        if matches!(&vws.value, Value::Number(..)) {
-            return Ok(OrderTarget::Position(expr_usize_literal(e, "ORDER BY position")?));
-        }
+    // Integer literal → positional, by the same rule GROUP BY reads.
+    if let Some(pos) = clause_position(e, "ORDER BY position")? {
+        return Ok(OrderTarget::Position(pos));
     }
     // Bare or qualified (`t.col`) identifier → name; qualifier is ignored
     // (crate-wide single-relation convention).
@@ -242,12 +239,7 @@ fn resolve_key_col(key: &OrderKey, schema: &Schema) -> Result<usize, GnitzSqlErr
 /// The physical column index a 1-based ORDER BY position names, given the
 /// physical indices of the visible columns.
 fn resolve_position(pos: usize, visible: &[usize]) -> Result<usize, GnitzSqlError> {
-    if pos == 0 || pos > visible.len() {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "ORDER BY position {pos} is out of range (1..={})",
-            visible.len()
-        )));
-    }
+    reject_position_out_of_range(pos, visible.len(), "ORDER BY")?;
     Ok(visible[pos - 1])
 }
 

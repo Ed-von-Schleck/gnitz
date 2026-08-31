@@ -10,7 +10,17 @@ use std::sync::Arc;
 
 /// Circuit + output columns + pk-list — the pieces every view emitter returns
 /// for a pre-allocated view id; the caller wraps them into a `PlannedView`.
-pub(crate) type EmitPieces = (Circuit, Vec<ColumnDef>, Vec<u32>);
+/// How many leading output columns are the PK region. Every emitter puts the PK
+/// at the front, so the arity is the whole pk-list — `pk_col_list` spells it out
+/// at the wire boundary, and nothing in between carries the redundant vector.
+pub(crate) type PkArity = usize;
+
+/// The wire's pk-list for a [`PkArity`].
+pub(crate) fn pk_col_list(pk: PkArity) -> Vec<u32> {
+    (0..pk as u32).collect()
+}
+
+pub(crate) type EmitPieces = (Circuit, Vec<ColumnDef>, PkArity);
 
 /// Structural check of every emitted circuit's exchange topology, catching a
 /// planner regression at the emitter rather than as a `CREATE VIEW` rejection
@@ -84,12 +94,12 @@ pub(crate) fn debug_assert_exchange_topology(circuit: &Circuit) {
     }
 }
 
-/// A `Schema` from emitted pieces: the output columns plus the pk-list (the
-/// leading `k` slots, widened from the wire's `u32` indices).
-fn schema_of(cols: &[ColumnDef], pk: &[u32]) -> Arc<Schema> {
+/// A `Schema` from emitted pieces: the output columns, of which the leading
+/// [`PkArity`] are the PK region.
+pub(crate) fn schema_of(cols: &[ColumnDef], pk: PkArity) -> Arc<Schema> {
     Arc::new(Schema {
         columns: cols.to_vec(),
-        pk_cols: pk.iter().map(|&c| c as usize).collect(),
+        pk_cols: (0..pk).collect(),
     })
 }
 
@@ -142,7 +152,7 @@ impl ViewChain {
         let vid = self.mint();
         let ((circuit, cols, pk), extra) = emit(self, vid)?;
         debug_assert_exchange_topology(&circuit);
-        let schema = schema_of(&cols, &pk);
+        let schema = schema_of(&cols, pk);
         self.push_hidden(cols, pk, circuit);
         Ok((vid, schema, extra))
     }
@@ -150,7 +160,7 @@ impl ViewChain {
     /// Append a hidden segment, naming it after its owner and position. The one
     /// site that names one, and it uses `ViewName::Hidden` rather than a string
     /// because the owner's real id does not exist yet.
-    fn push_hidden(&mut self, cols: Vec<ColumnDef>, pk: Vec<u32>, circuit: Circuit) {
+    fn push_hidden(&mut self, cols: Vec<ColumnDef>, pk: PkArity, circuit: Circuit) {
         let owner = self.owner_vid();
         let idx = self.segments.len();
         self.segments.push(PlannedView {
@@ -158,7 +168,7 @@ impl ViewChain {
             sql_text: "-- hidden segment".to_string(),
             circuit,
             output_columns: cols,
-            pk_cols: pk,
+            pk_cols: pk_col_list(pk),
             // A hidden segment is never bounded — it is the unbounded
             // materialization a bounded view may not sit on — and never fed: the
             // feed belongs to the final segment, the one the client names and the

@@ -927,9 +927,10 @@ fn group_by_accepts_qualified_column() {
 // ── Grouped-projection + HAVING rejection pins ───────────────────────
 //
 // Authored against the current compiler: the exact inner `String` **and**
-// variant. The SELECT-side "column must appear" (`Plan`) and the HAVING-side one
-// (`Bind`, `"HAVING: "` prefix) are deliberately **different** strings and
-// variants — asserted separately, never sharing one literal.
+// variant. Both axes carry meaning, and they are orthogonal: the **variant**
+// names the kind of failure (`Bind` when a name resolves to nothing, `Plan` when
+// it resolves but a rule forbids it), and the **prefix** names the clause it was
+// written in (`"GROUP BY SELECT: "` / `"HAVING: "`).
 
 #[test]
 fn grouped_projection_rejections() {
@@ -943,14 +944,20 @@ fn grouped_projection_rejections() {
         &sn,
         "CREATE TABLE t (a BIGINT NOT NULL PRIMARY KEY, b BIGINT NOT NULL, v BIGINT NOT NULL)",
     );
-    // A projected expression over a group column (`a + 1`) — not a bare column
-    // ref or aggregate.
+    // A projected expression over a group column is computed above the reduce
+    // now, so it compiles. What still must fail is one reaching an *ungrouped*
+    // column.
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW ok_post_map AS SELECT a + 1 AS x FROM t GROUP BY a",
+    );
     assert_rejects_variant(
         &mut client,
         &sn,
-        "CREATE VIEW bad AS SELECT a + 1 FROM t GROUP BY a",
+        "CREATE VIEW bad AS SELECT b + 1 AS x FROM t GROUP BY a",
         "Plan",
-        "GROUP BY SELECT: only column refs and aggregates supported",
+        "GROUP BY SELECT: column 'b' must appear in GROUP BY or an aggregate function",
     );
     // A bare non-group column in the SELECT (`b` not in GROUP BY).
     assert_rejects_variant(
@@ -958,7 +965,7 @@ fn grouped_projection_rejections() {
         &sn,
         "CREATE VIEW bad AS SELECT b FROM t GROUP BY a",
         "Plan",
-        "column 'b' must appear in GROUP BY or an aggregate function",
+        "GROUP BY SELECT: column 'b' must appear in GROUP BY or an aggregate function",
     );
 }
 
@@ -974,13 +981,13 @@ fn having_rejections() {
         &sn,
         "CREATE TABLE t (a BIGINT NOT NULL PRIMARY KEY, b BIGINT NOT NULL, v BIGINT NOT NULL)",
     );
-    // HAVING references a non-group column (`b`) — a `Bind` error with the
-    // `"HAVING: "` prefix, distinct from the SELECT-side `Plan` string above.
+    // HAVING references a non-group column (`b`): the name resolves, the rule
+    // forbids it — a `Plan` verdict, told from the SELECT-side one by its prefix.
     assert_rejects_variant(
         &mut client,
         &sn,
         "CREATE VIEW bad AS SELECT a, COUNT(*) AS n FROM t GROUP BY a HAVING b > 0",
-        "Bind",
+        "Plan",
         "HAVING: column 'b' must appear in GROUP BY or an aggregate function",
     );
     // HAVING references a non-existent column.
@@ -1046,5 +1053,324 @@ fn msg_of(e: &GnitzSqlError) -> String {
     match e {
         GnitzSqlError::Unsupported(m) | GnitzSqlError::Bind(m) | GnitzSqlError::Plan(m) => m.clone(),
         other => format!("{other:?}"),
+    }
+}
+
+// ── Pre- and post-reduce maps ────────────────────────────────────────
+//
+// A grouped query may compute on the way *into* the reduce (a computed GROUP BY
+// key or aggregate argument, materialized as a hidden column of a `Project` the
+// binder inserts under the `Reduce`) and on the way *out* (an expression over
+// aggregates and group keys, written by the finalize map the reduce already
+// emits).
+
+#[test]
+fn reduce_maps_compute_correct_deltas() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, a BIGINT NOT NULL, b BIGINT NOT NULL)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW pre_arg AS SELECT k, SUM(a * b) AS s FROM t GROUP BY k",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW pre_key AS SELECT a + b AS ab, COUNT(*) AS c FROM t GROUP BY a + b",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW post AS SELECT k, SUM(a) + 1 AS s FROM t GROUP BY k",
+    );
+
+    insert_rows(
+        &mut client,
+        &sn,
+        "t",
+        &["id", "k", "a", "b"],
+        &[vec![1, 1, 2, 3], vec![2, 1, 4, 5], vec![3, 2, 10, 1]],
+    );
+    assert_eq!(
+        view_rows_weighted(&mut client, &sn, "pre_arg", &["k", "s"]),
+        at_weight_one(&[vec![1, 26], vec![2, 10]])
+    );
+    assert_eq!(
+        view_rows_weighted(&mut client, &sn, "pre_key", &["ab", "c"]),
+        at_weight_one(&[vec![5, 1], vec![9, 1], vec![11, 1]])
+    );
+    assert_eq!(
+        view_rows_weighted(&mut client, &sn, "post", &["k", "s"]),
+        at_weight_one(&[vec![1, 7], vec![2, 11]])
+    );
+
+    // An insert joins the existing a+b=5 group, so its COUNT rises rather than a
+    // second row appearing; deleting the last member removes the group entirely
+    // rather than leaving a ghost at weight 0.
+    insert_rows(&mut client, &sn, "t", &["id", "k", "a", "b"], &[vec![4, 1, 1, 4]]);
+    assert_eq!(
+        view_rows_weighted(&mut client, &sn, "pre_key", &["ab", "c"]),
+        at_weight_one(&[vec![5, 2], vec![9, 1], vec![11, 1]])
+    );
+    affected(&mut client, &sn, "DELETE FROM t WHERE id = 1");
+    affected(&mut client, &sn, "DELETE FROM t WHERE id = 4");
+    assert_eq!(
+        view_rows_weighted(&mut client, &sn, "pre_key", &["ab", "c"]),
+        at_weight_one(&[vec![9, 1], vec![11, 1]])
+    );
+    assert_eq!(
+        view_rows_weighted(&mut client, &sn, "pre_arg", &["k", "s"]),
+        at_weight_one(&[vec![1, 20], vec![2, 10]])
+    );
+}
+
+/// A SELECT item names a GROUP BY key by what it *binds to*, not by how it was
+/// written — the rule a bare group column already obeyed, extended to a composite
+/// one. The join case is what makes the two resolutions distinguishable: `v` is
+/// ambiguous unqualified, so a bare-name lookup over the merged column list would
+/// report an ambiguity where the body's own leaf resolves `l.v`.
+#[test]
+fn group_key_matches_on_the_bound_expression() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
+    );
+    for tbl in ["l", "r"] {
+        exec(
+            &mut client,
+            &sn,
+            &format!("CREATE TABLE {tbl} (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL)"),
+        );
+    }
+    // Qualification and parentheses resolve away; the key is reusable inside an
+    // aggregate and under further arithmetic; overlapping keys take the outermost.
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW qualified AS SELECT a + b AS ab, COUNT(*) AS c FROM t GROUP BY t.a + b",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW parens AS SELECT (a + b) AS ab, SUM((a * b)) AS s FROM t GROUP BY a + b",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW reused AS SELECT (a + b) * 2 AS x, SUM(a + b) AS s FROM t GROUP BY a + b",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW overlapping AS SELECT a + b AS s, (a + b) * 2 AS d, COUNT(*) AS c \
+         FROM t GROUP BY a + b, (a + b) * 2",
+    );
+    // `IS [NOT] NULL` reaches its operand through the leaf, not through the
+    // structural recursion — the one position a claim made only during recursion
+    // would miss.
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW null_test AS SELECT a + b AS ab, COUNT(*) AS c FROM t GROUP BY a + b HAVING (a + b) IS NOT NULL",
+    );
+    let j = "FROM l JOIN r ON l.k = r.k";
+    exec(
+        &mut client,
+        &sn,
+        &format!("CREATE VIEW j_expr AS SELECT l.v + 1 AS x, COUNT(*) AS c {j} GROUP BY l.v"),
+    );
+    exec(
+        &mut client,
+        &sn,
+        &format!("CREATE VIEW j_both AS SELECT l.v + r.v AS x, COUNT(*) AS c {j} GROUP BY l.v + r.v"),
+    );
+
+    insert_rows(
+        &mut client,
+        &sn,
+        "t",
+        &["id", "a", "b"],
+        &[vec![1, 2, 3], vec![2, 4, 5], vec![3, 2, 3]],
+    );
+    insert_rows(
+        &mut client,
+        &sn,
+        "l",
+        &["id", "k", "v"],
+        &[vec![1, 1, 10], vec![2, 1, 20]],
+    );
+    insert_rows(&mut client, &sn, "r", &["id", "k", "v"], &[vec![1, 1, 100]]);
+    assert_eq!(
+        view_rows_weighted(&mut client, &sn, "qualified", &["ab", "c"]),
+        at_weight_one(&[vec![5, 2], vec![9, 1]])
+    );
+    assert_eq!(
+        view_rows_weighted(&mut client, &sn, "parens", &["ab", "s"]),
+        at_weight_one(&[vec![5, 12], vec![9, 20]])
+    );
+    assert_eq!(
+        view_rows_weighted(&mut client, &sn, "reused", &["x", "s"]),
+        at_weight_one(&[vec![10, 10], vec![18, 9]])
+    );
+    assert_eq!(
+        view_rows_weighted(&mut client, &sn, "null_test", &["ab", "c"]),
+        at_weight_one(&[vec![5, 2], vec![9, 1]])
+    );
+    assert_eq!(
+        view_rows_weighted(&mut client, &sn, "overlapping", &["s", "d", "c"]),
+        at_weight_one(&[vec![5, 10, 2], vec![9, 18, 1]])
+    );
+    assert_eq!(
+        view_rows_weighted(&mut client, &sn, "j_expr", &["x", "c"]),
+        at_weight_one(&[vec![11, 1], vec![21, 1]])
+    );
+    assert_eq!(
+        view_rows_weighted(&mut client, &sn, "j_both", &["x", "c"]),
+        at_weight_one(&[vec![110, 1], vec![120, 1]])
+    );
+}
+
+/// `GROUP BY <n>` is the n-th SELECT item, as `ORDER BY <n>` is the n-th output
+/// column — not the constant `n`, which would group everything into one group.
+/// Both grouped front ends resolve it through the same helper.
+#[test]
+fn group_by_position_names_a_select_item() {
+    let srv = match ServerHandle::start_n(4) {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, a BIGINT NOT NULL, b BIGINT NOT NULL)",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW p_col AS SELECT k, COUNT(*) AS c FROM t GROUP BY 1",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW p_expr AS SELECT a + b AS ab, COUNT(*) AS c FROM t GROUP BY 1",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW p_two AS SELECT k, a AS x, COUNT(*) AS c FROM t GROUP BY 2, 1",
+    );
+
+    insert_rows(
+        &mut client,
+        &sn,
+        "t",
+        &["id", "k", "a", "b"],
+        &[vec![1, 1, 2, 3], vec![2, 1, 4, 5], vec![3, 2, 2, 7]],
+    );
+    assert_eq!(
+        view_rows_weighted(&mut client, &sn, "p_col", &["k", "c"]),
+        at_weight_one(&[vec![1, 2], vec![2, 1]])
+    );
+    // a+b is 5, 9, 9 — grouped by the expression, not by a constant (which would
+    // have produced one group of three).
+    assert_eq!(
+        view_rows_weighted(&mut client, &sn, "p_expr", &["ab", "c"]),
+        at_weight_one(&[vec![5, 1], vec![9, 2]])
+    );
+    assert_eq!(
+        view_rows_weighted(&mut client, &sn, "p_two", &["k", "x", "c"]),
+        at_weight_one(&[vec![1, 2, 1], vec![1, 4, 1], vec![2, 2, 1]])
+    );
+
+    // A position must name something that can define a group — and both compilers
+    // must say so identically.
+    for (body, msg) in [
+        (
+            "SELECT k, COUNT(*) AS c FROM t GROUP BY 0",
+            "GROUP BY position 0 is out of range (1..=2)",
+        ),
+        (
+            "SELECT k, COUNT(*) AS c FROM t GROUP BY 5",
+            "GROUP BY position 5 is out of range (1..=2)",
+        ),
+        (
+            "SELECT k, COUNT(*) AS c FROM t GROUP BY 2",
+            "GROUP BY position 2 names an aggregate, which cannot be a group key",
+        ),
+        (
+            "SELECT *, COUNT(*) AS c FROM t GROUP BY 1",
+            "GROUP BY position 1 names a wildcard, which is not a group key",
+        ),
+    ] {
+        assert_rejects_variant(
+            &mut client,
+            &sn,
+            &format!("CREATE VIEW bad AS {body}"),
+            "Unsupported",
+            msg,
+        );
+        assert_rejects_variant(&mut client, &sn, body, "Unsupported", msg);
+    }
+}
+
+/// The guards the maps must not dissolve: part of a composite key is not the key,
+/// a materialized aggregate argument is not a grouped value, and the hidden
+/// columns the pre-map and the reduce mint stay unnameable.
+#[test]
+fn reduce_map_rejections() {
+    let srv = match ServerHandle::start() {
+        Some(s) => s,
+        None => return,
+    };
+    let (mut client, sn) = make_planner(&srv);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, a BIGINT NOT NULL, \
+         b BIGINT NOT NULL, f DOUBLE NOT NULL)",
+    );
+    for (body, variant, msg) in [
+        (
+            "SELECT a + 1 AS x FROM t GROUP BY a + b",
+            "Plan",
+            "GROUP BY SELECT: column 'a' must appear in GROUP BY or an aggregate function",
+        ),
+        (
+            "SELECT a * b AS x, SUM(a * b) AS s FROM t GROUP BY k",
+            "Plan",
+            "GROUP BY SELECT: column 'a' must appear in GROUP BY or an aggregate function",
+        ),
+        (
+            "SELECT f + 1 AS x, COUNT(*) AS c FROM t GROUP BY f + 1",
+            "Unsupported",
+            "GROUP BY: a float-valued expression cannot be a key",
+        ),
+        (
+            "SELECT a + b AS ab, COUNT(*) AS c FROM t GROUP BY a + b HAVING _pre0 > 5",
+            "Bind",
+            "HAVING: column '_pre0' not found",
+        ),
+        (
+            "SELECT k, SUM(a) AS s FROM t GROUP BY k HAVING _agg > 1",
+            "Bind",
+            "HAVING: column '_agg' not found",
+        ),
+    ] {
+        assert_rejects_variant(&mut client, &sn, &format!("CREATE VIEW bad AS {body}"), variant, msg);
     }
 }

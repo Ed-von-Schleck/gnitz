@@ -100,6 +100,27 @@ fn resolving<T>(
 
 // ── CREATE VIEW ──────────────────────────────────────────────────────────────
 
+/// A grouped body that computes on the way *into* its reduce — a composite GROUP
+/// BY key or an aggregate over an expression — stays one segment. The `Project`
+/// bind inserts for it is a map inside the reduce's own circuit, not a second
+/// materialized relation: cutting it would cost a full second copy of the source,
+/// maintained and checkpointed forever, for one arithmetic expression.
+#[test]
+fn a_computed_group_key_or_aggregate_argument_adds_no_segment() {
+    let cat = catalog();
+    for body in [
+        "SELECT g, SUM(v) AS s FROM t GROUP BY g",
+        "SELECT g, SUM(v * 2) AS s FROM t GROUP BY g",
+        "SELECT g + v AS k, COUNT(*) AS n FROM t GROUP BY g + v",
+        "SELECT g + v AS k, SUM(g * v) AS s FROM t GROUP BY g + v HAVING SUM(g * v) > 3",
+        "SELECT g, SUM(v * 2) AS s FROM t WHERE v > 5 GROUP BY g",
+    ] {
+        let stmt = parse(&format!("CREATE VIEW vw AS {body}"));
+        let views = plan_view(&stmt, &cat, SN).unwrap_or_else(|e| panic!("`{body}`: {e:?}"));
+        assert_eq!(views.len(), 1, "`{body}`: one segment, no hidden materialization");
+    }
+}
+
 /// Every view shape compiles to a bundle with no server anywhere: exactly one
 /// user-named segment, and every id in every circuit still symbolic (a real
 /// relation id appears only as a `ScanDelta` source).

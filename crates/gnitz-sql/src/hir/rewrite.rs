@@ -5,8 +5,8 @@
 //! distinct ids per reference site, so even a self-join's two sides are disjoint).
 
 use super::{
-    as_col, col_by_id, ColId, ColIdGen, EqPair, HirCol, HirExpr, HirRange, HirRef, JoinClass, JoinOn, ProjEntry,
-    RelExpr, SubqueryKind, SubqueryRef,
+    as_col, col_by_id, hircol_of, ColId, ColIdGen, EqPair, HirCol, HirExpr, HirRange, HirRef, JoinClass, JoinOn,
+    ProjEntry, RelExpr, SubqueryKind, SubqueryRef,
 };
 use crate::agg::finalize_agg_bexpr;
 use crate::bind::fold_null_test;
@@ -126,7 +126,7 @@ fn classify_on(on: &[HirExpr], left_cols: &[HirCol], right_cols: &[HirCol]) -> R
                         if eq.iter().any(|p| p.left == lc && p.right == rc) {
                             continue;
                         }
-                        let tc = validate_join_key_pair(def_of(left_cols, lc), def_of(right_cols, rc))?;
+                        let tc = validate_join_key_pair(&hircol_of(left_cols, lc).def, &hircol_of(right_cols, rc).def)?;
                         eq.push(EqPair {
                             left: lc,
                             right: rc,
@@ -136,7 +136,10 @@ fn classify_on(on: &[HirExpr], left_cols: &[HirCol], right_cols: &[HirCol]) -> R
                     (_, Some((lc, rc, swapped))) if range.is_none() && binop_to_range_rel(*op).is_some() => {
                         let rel = binop_to_range_rel(*op).expect("guarded above");
                         let op = if swapped { converse_rel(rel) } else { rel };
-                        let tc = validate_range_join_key_pair(def_of(left_cols, lc), def_of(right_cols, rc))?;
+                        let tc = validate_range_join_key_pair(
+                            &hircol_of(left_cols, lc).def,
+                            &hircol_of(right_cols, rc).def,
+                        )?;
                         range = Some(HirRange {
                             left: lc,
                             right: rc,
@@ -169,11 +172,6 @@ fn cross_table(l: ColId, r: ColId, left_cols: &[HirCol], right_cols: &[HirCol]) 
     } else {
         None
     }
-}
-
-/// The def of a `ColId` within one side's cols.
-fn def_of(cols: &[HirCol], id: ColId) -> &ColumnDef {
-    &col_by_id(cols, id).expect("classified ColId in its side").def
 }
 
 /// `ir::BinOp` → the ordering `RangeRel` (the four range variants).
@@ -411,7 +409,9 @@ fn build_uncorrelated_inner(
         Some(_) => {
             let key = HirCol {
                 id: ids.next(),
-                def: ColumnDef::new("_agg", agg.out.def.type_code, true),
+                // Hidden like every other synthetic slot: the finalized value
+                // exists to be a join key, and no name reaches it.
+                def: ColumnDef::new("_agg", agg.out.def.type_code, true).hidden(),
             };
             let key_id = key.id;
             let proj = RelExpr::project(

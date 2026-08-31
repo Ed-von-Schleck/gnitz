@@ -134,7 +134,7 @@ fn run(sql: &str, schema: &Schema, batch: ZSetBatch) -> Result<Vec<(u64, Option<
             limit: Some(Expr::Value(vws)),
             ..
         }) => match &vws.value {
-            Value::Number(n, _) => n.parse::<usize>().ok(),
+            sqlparser::ast::Value::Number(n, _) => n.parse::<usize>().ok(),
             _ => None,
         },
         _ => None,

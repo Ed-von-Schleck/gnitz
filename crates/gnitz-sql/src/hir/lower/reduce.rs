@@ -23,7 +23,22 @@ use gnitz_core::{CircuitBuilder, ColumnDef, ReduceOutKey};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Lower a `Project(Filter_having?(Reduce(...)))` body's reduce to circuit pieces
+/// Whether `items` is the reduce pre-map over `input`: `input`'s own columns
+/// passed through under their own `ColId`s, then at least one computed column.
+///
+/// Identity is what tells it from a derived table's body, which is also a
+/// `Project` over a `Get` — that one mints a fresh `ColId` per output, so it never
+/// matches here and keeps being cut to a segment.
+fn is_pre_map(input: &RelExpr, items: &[ProjEntry]) -> bool {
+    let cols = input.cols();
+    items.len() > cols.len()
+        && cols
+            .iter()
+            .zip(items)
+            .all(|(c, it)| it.out.id == c.id && matches!(it.expr, BExpr::ColRef(HirRef::Col(id)) if id == c.id))
+}
+
+/// Lower a `Project(Filter_having?(Reduce(...)))` body's reduce to circuit pieces/// Lower a `Project(Filter_having?(Reduce(...)))` body's reduce to circuit pieces
 /// for `view_id`, returning the pieces plus the output `ColId` layout. `items` is
 /// the finalize projection; `having_preds` is the HAVING filter over the raw
 /// reduce output.
@@ -44,9 +59,21 @@ pub(crate) fn lower_reduce(
         unreachable!("lower_reduce receives a Reduce");
     };
 
+    // The pre-map bind inserted so the reduce could group by, or aggregate, an
+    // expression. Emitted as a map in this circuit; cutting it to its own segment
+    // would materialize a second copy of the source forever.
+    let (pre_map, reduce_input) = match input.as_ref() {
+        RelExpr::Project { input: below, items }
+            if is_pre_map(below, items) && seginput_of_get(split_filter(below).1).is_some() =>
+        {
+            (Some(items.as_slice()), below)
+        }
+        _ => (None, input),
+    };
+
     // Resolve the reduce's input: inline a base/segment `Get` (with WHERE + scan
     // bound), or cut a combine input (`Filter?(Join)`) to a hidden segment.
-    let (inner_where, inner_source) = split_filter(input);
+    let (inner_where, inner_source) = split_filter(reduce_input);
     let (source, bound, where_folded) = match seginput_of_get(inner_source) {
         Some(seg) => {
             // Base/segment Get: apply the WHERE + scan bound inline.
@@ -63,8 +90,18 @@ pub(crate) fn lower_reduce(
             (cut_segment(chain, memo, input, &live)?, None, None)
         }
     };
-    let (source_tid, source_schema) = (source.tid, Arc::clone(&source.schema));
-    let source_layout = &source.layout;
+    // The pre-map, physicalized over the source. Its output is what the reduce
+    // groups and aggregates over, so the group/argument positions, the strategy
+    // and the reduce-output layout are all resolved against it rather than the
+    // source.
+    let pre = pre_map
+        .map(|items| physical::physicalize_projection(items, &source.layout, &source.schema))
+        .transpose()?;
+    let source_tid = source.tid;
+    let (source_schema, source_layout) = match &pre {
+        Some(p) => (crate::hir::chain::schema_of(&p.out_cols, p.pk_arity), &p.layout),
+        None => (Arc::clone(&source.schema), &source.layout),
+    };
 
     let group_positions: Vec<usize> = group_cols
         .iter()
@@ -101,7 +138,20 @@ pub(crate) fn lower_reduce(
         None => inp,
     };
 
-    let reduced = emit_reduce(&mut cb, filtered, &shape);
+    // The pre-map, between the WHERE and the reduce. Only the payload slots are
+    // written — the PK region is carried verbatim, as it is on every other
+    // `map_expr` — so `filtered`'s schema is the source's and the map's output is
+    // `source_schema`.
+    let mapped = match &pre {
+        Some(p) => cb.map_expr(
+            filtered,
+            compile_projection_map(&p.items[p.pk_arity..], &source.schema)?,
+            &declared_out_cols(&p.out_cols[p.pk_arity..]),
+        ),
+        None => filtered,
+    };
+
+    let reduced = emit_reduce(&mut cb, mapped, &shape);
 
     // Each group column's physical reduce-output slot — computed once here and
     // reused by the finalize loop below (`group_reduce_pos[j]`), rather than
@@ -174,6 +224,5 @@ pub(crate) fn lower_reduce(
     let circuit = cb.build();
 
     reject_duplicate_column_names(&out_cols, "GROUP BY view")?;
-    let view_pk: Vec<u32> = (0..pk_len as u32).collect();
-    Ok(((circuit, out_cols, view_pk), out_layout))
+    Ok(((circuit, out_cols, pk_len), out_layout))
 }

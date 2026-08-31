@@ -365,7 +365,7 @@ fn build_query_segments(
         sql_text,
         circuit,
         output_columns: out_cols,
-        pk_cols,
+        pk_cols: crate::hir::chain::pk_col_list(pk_cols),
         capacity_bytes: capacity,
         delta_bytes: options.delta,
     });

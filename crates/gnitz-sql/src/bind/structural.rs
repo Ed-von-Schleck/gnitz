@@ -24,19 +24,25 @@ pub(crate) fn bind_single_table(expr: &Expr, schema: &Schema) -> Result<BoundExp
 // Shared structural expression binding
 // ---------------------------------------------------------------------------
 //
-// One `Expr → BoundExpr` recursion, parametrized by a three-method leaf. The
-// only things that differ across GnitzDB's binding contexts (WHERE/projection,
-// HAVING, JOIN residual) are the three schema-aware leaves — column reference,
-// function call, and `IS [NOT] NULL`. Everything structural (literals, the full
-// operator map, unary ops, the BETWEEN desugar, Nested unwrap) lives here once,
-// so a new operator or fold lands on every context at the same time and cannot
-// silently drift between hand-copied walks.
+// One `Expr → BoundExpr` recursion, parametrized by a leaf. The only things that
+// differ across GnitzDB's binding contexts (WHERE/projection, HAVING, JOIN
+// residual) are the schema-aware positions — column reference, function call,
+// `IS [NOT] NULL`, and a whole expression the context names. Everything
+// structural (literals, the full operator map, unary ops, the BETWEEN desugar,
+// Nested unwrap) lives here once, so a new operator or fold lands on every
+// context at the same time and cannot silently drift between hand-copied walks.
 
 /// The schema-aware leaves of `bind_structural`, generic over the leaf reference
 /// type `R` (the `ColRef`/`IsNull`/`IsNotNull` payload). `R` defaults to `usize`,
 /// which is what the two ad-hoc read-path leaves resolve to unannotated; the four
 /// view-path leaves in `hir::bind` instantiate the column-identity `HirRef`.
 pub(crate) trait LeafBinder<R = usize> {
+    /// A whole expression this leaf's context names, claimed before the recursion
+    /// descends into it — a GROUP BY key over a grouped relation. `None` recurses
+    /// as usual, so declining cannot mask the recursion's own error.
+    fn bind_node(&self, _e: &Expr) -> Option<BExpr<R>> {
+        None
+    }
     /// An `Identifier` / `CompoundIdentifier` column reference.
     fn bind_column(&self, e: &Expr) -> Result<BExpr<R>, GnitzSqlError>;
     /// A function call (aggregates, or a context-specific rejection).
@@ -69,6 +75,9 @@ pub(crate) fn unsupported_subquery(e: &Expr) -> GnitzSqlError {
 /// is a leaf method. Generic over `L` (static dispatch) so a leaf's
 /// `bind_function` can recurse via `bind_structural(arg, self)`.
 pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L) -> Result<BExpr<R>, GnitzSqlError> {
+    if let Some(claimed) = leaf.bind_node(expr) {
+        return Ok(claimed);
+    }
     match expr {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => leaf.bind_column(expr),
         // The context-independent names (the CASE desugars and the numeric scalar

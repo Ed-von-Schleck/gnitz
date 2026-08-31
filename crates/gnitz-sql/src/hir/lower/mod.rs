@@ -312,6 +312,10 @@ fn fuses_computed_projection(source: &RelExpr) -> bool {
 /// as a linear body over a synthetic `Get` on that segment. This is the
 /// scalar-decorrelation finalize: the finalize composite and the outer WHERE both
 /// run over the materialized join output.
+///
+/// The general rule it applies: an operator addresses its columns by position, so
+/// an expression it cannot take becomes a column of a `Project` wrapped around
+/// it, above or below.
 fn lower_computed_over_combine(
     chain: &mut ViewChain,
     memo: &mut CutMemo,
@@ -450,15 +454,7 @@ fn base_get(rel: &Rc<RelExpr>) -> &Rc<RelExpr> {
 /// HIR spelling of `SELECT <cols> FROM <subtree>`, shared by the segment-cut wrap
 /// (live cols) and the collision pass-through wrap (visible cols).
 fn identity_project(subtree: &Rc<RelExpr>, keep: impl Fn(&super::HirCol) -> bool) -> Rc<RelExpr> {
-    let items: Vec<ProjEntry> = subtree
-        .cols()
-        .into_iter()
-        .filter(|c| keep(c))
-        .map(|c| ProjEntry {
-            expr: BExpr::ColRef(HirRef::Col(c.id)),
-            out: c,
-        })
-        .collect();
+    let items = RelExpr::passthrough_items(subtree.cols().into_iter().filter(|c| keep(c)));
     RelExpr::project(Rc::clone(subtree), items)
 }
 

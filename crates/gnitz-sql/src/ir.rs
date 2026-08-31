@@ -22,7 +22,10 @@ pub(crate) enum AggFunc {
 /// column index into a batch schema — and the view path pins `R = HirRef`, a
 /// column identity that survives the structural rewrites. Neither needed a
 /// change to this enum.
-#[derive(Clone, Debug)]
+/// `PartialEq` is structural equality over the *bound* form — what makes "the same
+/// expression written twice" decidable after names resolve, so `t.a + b` and
+/// `a + b` are one expression. Not `Eq`, because `LitFloat` compares by `f64`.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum BExpr<R> {
     ColRef(R),
     LitInt(i64),
@@ -465,7 +468,7 @@ pub(crate) fn wide_int_error(lit: &str) -> GnitzSqlError {
     GnitzSqlError::Unsupported(format!("{WIDE_INT_UNSUPPORTED}: {lit}"))
 }
 
-#[derive(Clone, Debug, Copy)]
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub(crate) enum BinOp {
     Add,
     Sub,
@@ -546,7 +549,7 @@ impl BinOp {
     }
 }
 
-#[derive(Clone, Debug, Copy)]
+#[derive(Clone, Debug, Copy, PartialEq, Eq)]
 pub(crate) enum UnaryOp {
     Neg,
     Not,

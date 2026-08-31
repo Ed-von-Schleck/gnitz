@@ -252,18 +252,86 @@ pub(crate) fn group_by_exprs(select: &sqlparser::ast::Select) -> Result<&[sqlpar
     }
 }
 
-/// The two rejections every grouped SELECT list shares, so the ad-hoc fold path
-/// and the view path cannot word them differently.
-pub(crate) fn reject_ungrouped_column(name: &str) -> GnitzSqlError {
+/// The 1-based position a clause item names, or `None` when it is not an integer
+/// literal. ORDER BY and GROUP BY share this rule; LIMIT and OFFSET call
+/// [`expr_usize_literal`] directly, since a literal is the only form legal there.
+pub(crate) fn clause_position(e: &sqlparser::ast::Expr, what: &str) -> Result<Option<usize>, GnitzSqlError> {
+    match e {
+        sqlparser::ast::Expr::Value(v) if matches!(v.value, sqlparser::ast::Value::Number(..)) => {
+            Ok(Some(expr_usize_literal(e, what)?))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Reject a 1-based clause position outside `1..=len`. ORDER BY resolves a
+/// position into the visible output columns and GROUP BY into the SELECT list,
+/// but out of range reads the same either way, so it is worded once.
+pub(crate) fn reject_position_out_of_range(pos: usize, len: usize, what: &str) -> Result<(), GnitzSqlError> {
+    if pos == 0 || pos > len {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{what} position {pos} is out of range (1..={len})"
+        )));
+    }
+    Ok(())
+}
+
+/// A GROUP BY item, peeled of parens, with a 1-based SELECT-list position resolved
+/// to the item it names; everything else passes through. `GROUP BY 1` is the first
+/// projected expression, as in every other dialect — reading it as the constant `1`
+/// would silently group everything into one group. A position must name a scalar,
+/// aggregate-free item.
+pub(crate) fn group_by_target<'a>(
+    ge: &'a sqlparser::ast::Expr,
+    select: &'a sqlparser::ast::Select,
+) -> Result<&'a sqlparser::ast::Expr, GnitzSqlError> {
+    let ge = peel_nested(ge);
+    let Some(pos) = clause_position(ge, "GROUP BY position")? else {
+        return Ok(ge);
+    };
+    reject_position_out_of_range(pos, select.projection.len(), "GROUP BY")?;
+    let target = projection_item_expr(&select.projection[pos - 1]).ok_or_else(|| {
+        GnitzSqlError::Unsupported(format!(
+            "GROUP BY position {pos} names a wildcard, which is not a group key"
+        ))
+    })?;
+    if expr_has_aggregate(target) {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "GROUP BY position {pos} names an aggregate, which cannot be a group key"
+        )));
+    }
+    Ok(peel_nested(target))
+}
+
+/// A column written outside both the grouping and an aggregate. `clause` names
+/// where it was written (`"GROUP BY SELECT"` / `"HAVING"`) — the wording is
+/// shared so the ad-hoc fold path and the view path cannot diverge on it.
+pub(crate) fn reject_ungrouped_column(clause: &str, name: &str) -> GnitzSqlError {
     GnitzSqlError::Plan(format!(
-        "column '{name}' must appear in GROUP BY or an aggregate function"
+        "{clause}: column '{name}' must appear in GROUP BY or an aggregate function"
     ))
 }
 
-/// The grouped SELECT list admits only bare group-column references and aggregate
-/// calls; anything computed over them has no reduce-output column.
-pub(crate) fn reject_computed_grouped_item() -> GnitzSqlError {
-    GnitzSqlError::Plan("GROUP BY SELECT: only column refs and aggregates supported".to_string())
+/// `IS [NOT] NULL` over an operand the grouped relation does not offer — neither
+/// an aggregate nor a group key.
+pub(crate) fn reject_grouped_null_test(clause: &str) -> GnitzSqlError {
+    GnitzSqlError::Unsupported(format!(
+        "{clause}: IS [NOT] NULL is only supported on an aggregate or a group column"
+    ))
+}
+
+/// An expression over the grouped relation that is neither a group key nor an
+/// aggregate. The shape is named, not dumped: the parser's `Debug` is a wall of
+/// spans, and the reader wrote the SQL.
+pub(crate) fn reject_grouped_column_ref(clause: &str) -> GnitzSqlError {
+    GnitzSqlError::Unsupported(format!("{clause}: expected a group key or an aggregate"))
+}
+
+/// An aggregate a finalize leaf could not match to one the reduce computes.
+/// Defensive on both paths: an aggregate reaching a finalize leaf was collected
+/// into the reduce first, so no SQL body resolves to it.
+pub(crate) fn reject_unresolved_aggregate(clause: &str, func: AggFunc, arg: &str) -> GnitzSqlError {
+    GnitzSqlError::Bind(format!("{clause}: aggregate {func:?}({arg}) could not be resolved"))
 }
 
 /// The direct operand subexpressions of `e` — the node set the structural

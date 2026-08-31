@@ -3,6 +3,8 @@
 Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_aggregates.py -v --tb=short
 """
+from collections import Counter
+
 import pytest
 import gnitz
 import _oracle as oracle
@@ -3103,20 +3105,48 @@ class TestGlobalAggregate:
         finally:
             client.drop_schema(sn)
 
-    def test_strict_validator_rejections(self, client):
-        """Computed-over-aggregate and literal projections are rejected at plan
-        time (the strict grouped-projection validator), pinning the invariant the
-        ground derivation depends on."""
+    def test_computed_projection_keeps_the_ground_row(self, client):
+        """A global aggregate may be computed over — on the way in (`SUM(a * 2)`),
+        on the way out (`COUNT(*) + 1`), and beside a literal. The ground machinery
+        is what these could break, so each is checked over the empty source, filled,
+        and emptied again: exactly one row throughout, never a ghost."""
         sn = "gsv_" + _uid()
         client.create_schema(sn)
         try:
             client.execute_sql(
                 "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
                 schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT COUNT(*) + 1 AS c, SUM(a * 2) AS s, 'x' AS lit FROM t",
+                schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["c", "s", "lit"]
+
+            def check(ctx, row):
+                oracle.assert_view_matches(client, vid, project, Counter({row: 1}), ctx=ctx)
+
+            # SUM over an empty source is NULL, and COUNT(*) is 0 — the ground row.
+            check("empty-at-creation", (1, None, "x"))
+            client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 7)", schema_name=sn)
+            check("after-insert", (3, 24, "x"))
+            client.execute_sql("DELETE FROM t", schema_name=sn)
+            check("after-delete-all", (1, None, "x"))
+        finally:
+            client.drop_schema(sn)
+
+    def test_ungrouped_column_still_rejected(self, client):
+        """What the grouped projection still refuses: a column the grouping does
+        not determine, however it is wrapped."""
+        sn = "gsu_" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, g BIGINT NOT NULL)",
+                schema_name=sn)
             for bad in [
-                "SELECT COUNT(*) + 1 AS c FROM t",
-                "SELECT COUNT(*) AS c, 'x' AS lit FROM t",
-                "SELECT SUM(a * 2) AS s FROM t",
+                "SELECT a + 1 AS x, COUNT(*) AS c FROM t",
+                "SELECT a AS x, COUNT(*) AS c FROM t GROUP BY g",
+                "SELECT a * 2 AS x, COUNT(*) AS c FROM t GROUP BY g",
             ]:
                 with pytest.raises(Exception):
                     client.execute_sql(f"CREATE VIEW bad AS {bad}", schema_name=sn)

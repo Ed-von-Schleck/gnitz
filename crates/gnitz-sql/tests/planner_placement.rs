@@ -96,28 +96,28 @@ fn view_chain_over_replicated_source_join_keeps_every_row_multiworker() {
 
     let joined = sorted((1..=100i64).map(|id| vec![id, dim_of(id) * 10, 1]).collect());
     assert_eq!(
-        query_rows_weighted(&mut client, &sn, "SELECT * FROM jm", &["fid", "nm"]),
+        view_rows_weighted(&mut client, &sn, "jm", &["fid", "nm"]),
         joined,
         "every fact joins its replicated dim row exactly once",
     );
     assert_eq!(
-        query_rows_weighted(&mut client, &sn, "SELECT * FROM dv", &["fid", "nm"]),
+        view_rows_weighted(&mut client, &sn, "dv", &["fid", "nm"]),
         joined,
         "the linear hop over the join keeps every row",
     );
     let fids = sorted((1..=100i64).map(|id| vec![id, 1]).collect());
     assert_eq!(
-        query_rows_weighted(&mut client, &sn, "SELECT * FROM dv2", &["fid"]),
+        view_rows_weighted(&mut client, &sn, "dv2", &["fid"]),
         fids,
         "a third hop keeps every row too",
     );
     assert_eq!(
-        query_rows_weighted(&mut client, &sn, "SELECT * FROM dvd", &["fid"]),
+        view_rows_weighted(&mut client, &sn, "dvd", &["fid"]),
         fids,
         "the derived-table form of the same",
     );
     assert_eq!(
-        query_rows_weighted(&mut client, &sn, "SELECT * FROM gj", &["knm", "n"]),
+        view_rows_weighted(&mut client, &sn, "gj", &["knm", "n"]),
         at_weight_one(&sorted((1..=10i64).map(|k| vec![k * 10, 10]).collect())),
         "the exchanging GROUP BY control is unchanged",
     );
@@ -171,13 +171,13 @@ fn placement_controls_multiworker() {
     insert_all(&mut client, &sn);
 
     assert_eq!(
-        query_rows_weighted(&mut client, &sn, "SELECT * FROM rv", &["id", "nm"]),
+        view_rows_weighted(&mut client, &sn, "rv", &["id", "nm"]),
         sorted((1..=10i64).map(|id| vec![id, id * 10, 1]).collect()),
         "a fully replicated view reads back one copy",
     );
     // `UNION ALL` is a bag, and both branches survive: 100 rows from `f` plus 10
     // from `d`, kept apart by the set-op's per-branch key.
-    let bag = query_rows_weighted(&mut client, &sn, "SELECT * FROM ua", &["id"]);
+    let bag = view_rows_weighted(&mut client, &sn, "ua", &["id"]);
     assert_eq!(bag.len(), 110, "the mixed UNION ALL keeps both branches: {bag:?}");
     assert_eq!(
         sorted(bag.iter().map(|r| vec![r[0]]).collect()),
@@ -193,18 +193,18 @@ fn placement_controls_multiworker() {
     // expectation: what this control governs is that a linear view over a
     // mixed-source set-op loses nothing, not what the set-op's own weights are.
     assert_eq!(
-        query_rows_weighted(&mut client, &sn, "SELECT * FROM uav", &["id"]),
+        view_rows_weighted(&mut client, &sn, "uav", &["id"]),
         bag,
         "the linear hop over it reproduces its source row for row and weight for weight",
     );
     let pj_rows = sorted((1..=100i64).map(|id| vec![id, id * 3, 1]).collect());
     assert_eq!(
-        query_rows_weighted(&mut client, &sn, "SELECT * FROM pj", &["fid", "q"]),
+        view_rows_weighted(&mut client, &sn, "pj", &["fid", "q"]),
         pj_rows,
         "a join of two partitioned sides is complete",
     );
     assert_eq!(
-        query_rows_weighted(&mut client, &sn, "SELECT * FROM pjv", &["fid", "q"]),
+        view_rows_weighted(&mut client, &sn, "pjv", &["fid", "q"]),
         pj_rows,
         "and its linear hop stays key-placed and complete",
     );

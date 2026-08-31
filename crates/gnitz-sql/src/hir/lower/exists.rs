@@ -380,8 +380,7 @@ pub(crate) fn lower_semi_anti_view(
     }
     cb.sink(sink_input);
     let circuit = cb.build();
-    let view_pk: Vec<u32> = (0..npk as u32).collect();
-    Ok(((circuit, final_cols, view_pk), key_region_layout(npk, items)))
+    Ok(((circuit, final_cols, npk), key_region_layout(npk, items)))
 }
 
 /// Lower a decorrelated `Project(Filter?(Join{Mark}))` to circuit pieces: the
@@ -440,8 +439,7 @@ pub(crate) fn lower_mark_view(
     }
     cb.sink(out);
     let circuit = cb.build();
-    let view_pk: Vec<u32> = (0..npk as u32).collect();
-    Ok(((circuit, out_cols, view_pk), key_region_layout(npk, items)))
+    Ok(((circuit, out_cols, npk), key_region_layout(npk, items)))
 }
 
 /// Everything a mark branch emits from, shared verbatim by the matched and

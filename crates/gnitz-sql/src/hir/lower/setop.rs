@@ -133,7 +133,7 @@ fn hashed_out<'a>(
         layout.push(c.id);
     }
     reject_duplicate_column_names(&out_cols, dup_ctx)?;
-    Ok(((circuit, out_cols, vec![0]), layout))
+    Ok(((circuit, out_cols, 1), layout))
 }
 
 /// Lower both sides of a set operation, then apply the source-collision rule over

@@ -570,28 +570,28 @@ fn create_linear_views(client: &mut GnitzClient, sn: &str) {
 
 fn assert_linear_views_complete(client: &mut GnitzClient, sn: &str, when: &str) {
     assert_eq!(
-        query_rows_weighted(client, sn, "SELECT * FROM mv", &["a", "b", "v"]),
+        view_rows_weighted(client, sn, "mv", &["a", "b", "v"]),
         at_weight_one(&t_expected()),
         "mv holds every source row exactly once ({when})",
     );
     assert_eq!(
-        query_rows_weighted(client, sn, "SELECT * FROM mv_pk", &["v"]),
+        view_rows_weighted(client, sn, "mv_pk", &["v"]),
         at_weight_one(&t_projected(&[2])),
         "a projection that drops both PK columns keeps every row ({when})",
     );
     let ab = at_weight_one(&t_projected(&[0, 1]));
     assert_eq!(
-        query_rows_weighted(client, sn, "SELECT * FROM mv2", &["a", "b"]),
+        view_rows_weighted(client, sn, "mv2", &["a", "b"]),
         ab,
         "a view over the view inherits the same placement ({when})",
     );
     assert_eq!(
-        query_rows_weighted(client, sn, "SELECT * FROM mvd", &["a", "b"]),
+        view_rows_weighted(client, sn, "mvd", &["a", "b"]),
         ab,
         "the derived-table form ({when})",
     );
     assert_eq!(
-        query_rows_weighted(client, sn, "SELECT * FROM mvc", &["a", "b"]),
+        view_rows_weighted(client, sn, "mvc", &["a", "b"]),
         ab,
         "the CTE form ({when})",
     );
@@ -658,11 +658,11 @@ fn cluster_by_prefix_linear_view_keyed_reads_and_retraction_multiworker() {
         40,
         "two of the five b values per group are deleted",
     );
-    let base = query_rows_weighted(&mut client, &sn, "SELECT * FROM t", &["a", "b", "v"]);
+    let base = view_rows_weighted(&mut client, &sn, "t", &["a", "b", "v"]);
     assert_eq!(base.len(), 60, "the base keeps the surviving rows");
     assert!(base.iter().all(|r| r[3] == 1), "base weights stay 1: {base:?}");
     assert_eq!(
-        query_rows_weighted(&mut client, &sn, "SELECT * FROM mv", &["a", "b", "v"]),
+        view_rows_weighted(&mut client, &sn, "mv", &["a", "b", "v"]),
         base,
         "the retraction reaches the same view slot the insert did — row for row, weight for weight",
     );
@@ -784,7 +784,7 @@ fn cluster_by_two_col_prefix_group_by_multiworker() {
     insert_rows(&mut client, &sn, "t3", &["a", "b", "c", "v"], &rows);
 
     assert_eq!(
-        query_rows_weighted(&mut client, &sn, "SELECT * FROM v3", &["a", "b", "c", "v"]),
+        view_rows_weighted(&mut client, &sn, "v3", &["a", "b", "c", "v"]),
         at_weight_one(&rows),
         "a linear view over a k=2 prefix table keeps all 36 rows",
     );
@@ -895,7 +895,7 @@ fn linear_view_over_full_pk_distribution_multiworker() {
         );
         insert_rows(&mut client, &sn, tbl, &["a", "b", "v"], &t_expected());
         assert_eq!(
-            query_rows_weighted(&mut client, &sn, &format!("SELECT * FROM mv_{tbl}"), &["a", "b", "v"]),
+            view_rows_weighted(&mut client, &sn, &format!("mv_{tbl}"), &["a", "b", "v"]),
             at_weight_one(&t_expected()),
             "{tbl}: a full-PK-distributed source's linear view keeps every row",
         );

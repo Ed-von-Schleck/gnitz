@@ -57,7 +57,7 @@ pub(crate) fn lower_join_view(
     let pieces = emit_step(chain, memo, down, join, view_id)?;
     // The emitted pk-list is the synthetic key region; its width is the number of
     // identity-free slots the layout leads with.
-    let layout = key_region_layout(pieces.2.len(), project_items);
+    let layout = key_region_layout(pieces.2, project_items);
     Ok((pieces, layout))
 }
 
@@ -230,8 +230,7 @@ fn emit_equi(
     let sink_input = apply_projection(&mut cb, merged, &final_projection, pl + pr, k);
     cb.sink(sink_input);
     let circuit = cb.build();
-    let view_pk: Vec<u32> = (0..k as u32).collect();
-    Ok((circuit, final_cols, view_pk))
+    Ok((circuit, final_cols, k))
 }
 
 // ── Range / band emission ───────────────────────────────────────────────────────
@@ -410,8 +409,7 @@ fn emit_range(
     let sharded = cb.shard(sink_input, &pair_pk_idxs);
     cb.sink(sharded);
     let circuit = cb.build();
-    let view_pk: Vec<u32> = (0..pair_pk as u32).collect();
-    Ok((circuit, final_cols, view_pk))
+    Ok((circuit, final_cols, pair_pk))
 }
 
 // ── keep-set + shared helpers ───────────────────────────────────────────────────

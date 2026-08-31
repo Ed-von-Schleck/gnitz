@@ -182,6 +182,15 @@ pub fn query_rows_weighted(client: &mut GnitzClient, sn: &str, sql: &str, cols: 
     project_sorted(&schema, &batch, cols, true)
 }
 
+/// [`payload_rows`] with each row's Z-set weight appended — the whole-relation
+/// form of [`query_rows_weighted`], which is how a maintained view is compared:
+/// row presence alone would read a lost row and a duplicated one as the same
+/// result.
+pub fn view_rows_weighted(client: &mut GnitzClient, sn: &str, view: &str, cols: &[&str]) -> Vec<Vec<i64>> {
+    let (schema, batch) = read_view(client, sn, view);
+    project_sorted(&schema, &batch, cols, true)
+}
+
 /// The expected side of a [`query_rows_weighted`] compare when every row is
 /// present exactly once: `rows` with a trailing `1`.
 pub fn at_weight_one(rows: &[Vec<i64>]) -> Vec<Vec<i64>> {

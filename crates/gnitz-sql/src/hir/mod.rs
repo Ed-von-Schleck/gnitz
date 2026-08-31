@@ -107,6 +107,13 @@ pub(crate) fn col_by_id(cols: &[HirCol], id: ColId) -> Option<&HirCol> {
     cols.iter().find(|c| c.id == id)
 }
 
+/// The `HirCol` a `ColId` names, panicking when absent. A HIR `ColRef` always
+/// references a column of the list it is resolved against (bind mints them
+/// there), so absence is an internal compile error, not a user-facing one.
+pub(crate) fn hircol_of(cols: &[HirCol], id: ColId) -> &HirCol {
+    col_by_id(cols, id).expect("HIR ColRef references a column of its list")
+}
+
 /// The `ColId` of a bare `ColRef` leaf, else `None` (a literal, a computed
 /// expression, or an undecorrelated subquery operand).
 pub(crate) fn as_col(e: &HirExpr) -> Option<ColId> {
@@ -149,6 +156,15 @@ pub(crate) fn slot_of_expr(e: &HirExpr, layout: &[ColId]) -> Result<usize, Gnitz
 pub(crate) enum HirRef {
     Col(ColId),
     Subquery(Box<SubqueryRef>),
+}
+
+/// Two leaves are the same reference iff they name the same column. A subquery
+/// leaf never matches: a grouped body — the only place expressions are compared —
+/// rejects subqueries, and never-equal is the safe direction regardless.
+impl PartialEq for HirRef {
+    fn eq(&self, other: &Self) -> bool {
+        matches!((self, other), (HirRef::Col(a), HirRef::Col(b)) if a == b)
+    }
 }
 
 /// A bound subquery leaf, produced by bind and consumed by decorrelation. `rel`
@@ -355,16 +371,19 @@ impl HirAgg {
             arg,
             out: HirCol {
                 id: ids.next(),
+                // Hidden: a raw reduce-output column is addressed by `ColId`, never
+                // by name — the finalize composite is built for it, not looked up.
                 def: ColumnDef::new(
                     "_agg",
                     typing.ops[0].1,
                     typing.ops[0].0.raw_output_nullable(arg_nullable, is_global),
-                ),
+                )
+                .hidden(),
             },
             // The companion is COUNT_NON_NULL, whose empty render is a concrete `0`.
             companion: typing.shape.has_count_companion().then(|| HirCol {
                 id: ids.next(),
-                def: ColumnDef::new("_cnt", TypeCode::I64, false),
+                def: ColumnDef::new("_cnt", TypeCode::I64, false).hidden(),
             }),
         }
     }
@@ -520,6 +539,17 @@ impl RelExpr {
     /// A linear filter: pass-through columns (same ids, same order as `input`).
     pub(crate) fn filter(input: Rc<RelExpr>, preds: Vec<HirExpr>) -> Rc<RelExpr> {
         Rc::new(RelExpr::Filter { input, preds })
+    }
+
+    /// Projection items passing each column through to itself, keeping its
+    /// identity — the item half of `SELECT <cols>`.
+    pub(crate) fn passthrough_items(cols: impl IntoIterator<Item = HirCol>) -> Vec<ProjEntry> {
+        cols.into_iter()
+            .map(|c| ProjEntry {
+                expr: BExpr::ColRef(HirRef::Col(c.id)),
+                out: c,
+            })
+            .collect()
     }
 
     /// A projection: its output columns are the `ProjEntry.out`s (SELECT order —
@@ -732,10 +762,7 @@ impl RelExpr {
                 // each aggregate's raw value + companion columns. The physical
                 // cardinality COUNT has no logical column and is absent here.
                 let in_cols = input.cols();
-                let mut cols: Vec<HirCol> = group_cols
-                    .iter()
-                    .map(|id| col_by_id(&in_cols, *id).expect("reduce group col in input").clone())
-                    .collect();
+                let mut cols: Vec<HirCol> = group_cols.iter().map(|id| hircol_of(&in_cols, *id).clone()).collect();
                 for a in aggs {
                     cols.push(a.out.clone());
                     if let Some(c) = &a.companion {
