@@ -298,11 +298,10 @@ impl DagEngine {
                 continue;
             }
             for sub in plan.sub_plans_mut() {
-                // Null owned cursors before the fold so none holds a stale snapshot.
-                sub.vm.null_owned_cursors();
-                for idx in sub.vm.program.table_indices() {
-                    traces.push(sub.vm.program.table_mut(idx));
-                }
+                // Drop the bound cursors before the fold so none holds a stale
+                // snapshot.
+                sub.vm.reset_trace_cursors();
+                traces.extend(sub.vm.tables.iter_mut());
             }
         }
 

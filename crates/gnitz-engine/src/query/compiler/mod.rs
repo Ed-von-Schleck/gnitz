@@ -9,7 +9,7 @@ use std::fmt;
 use crate::expr::MapPlan;
 use crate::foundation::worker_ctx::{num_workers, worker_rank};
 use crate::ops::AggDescriptor;
-use crate::query::vm::{Instr, ProgramBuilder, RegisterMeta, VmHandle};
+use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
 use crate::schema::{project_schema, SchemaDescriptor};
 use crate::storage::{ReadCursor, RecoverySource, StorageError, Table};
 use gnitz_expr::{ExprValidateErr, LogicalProgram};
@@ -21,7 +21,7 @@ mod optimize;
 
 use emit::*;
 use hydration::derive_hydration;
-pub(crate) use hydration::Hydration;
+pub(crate) use hydration::{Hydration, HydrationSeed};
 use optimize::*;
 
 pub(crate) use load::{for_each_scan_edge, load_circuit};
@@ -221,7 +221,6 @@ impl SchemaSource for ExtTables {
 pub(crate) struct SubPlan {
     pub vm: Box<VmHandle>,
     pub in_reg: u16,
-    pub out_reg: u16,
     /// True iff the program can *still* emit output from an empty input epoch: it
     /// carries a global-ground `Reduce` and its ground row has not been minted
     /// yet. The empty pad round is the ONLY place the SQL-required ground row over
@@ -267,7 +266,7 @@ impl Side {
     /// combine-widened schema, which is a different width for a JOIN and would
     /// mislabel the operand batch.
     pub(super) fn exchange_schema(&self) -> SchemaDescriptor {
-        self.plan.vm.program.reg_meta[self.plan.out_reg as usize].schema
+        self.plan.vm.program.out_schema()
     }
 }
 
@@ -342,7 +341,6 @@ impl CompileOutput {
 pub(super) struct PlanBuildResult {
     vm: Box<VmHandle>,
     in_reg: u16,
-    out_reg: u16,
     source_reg_map: HashMap<i64, u16>,
     can_emit_on_empty: bool,
     // The seed register of each exchange input this plan was built with, in the
@@ -369,7 +367,6 @@ impl PlanBuildResult {
         self.scratch.defuse();
         SubPlan {
             in_reg: self.in_reg,
-            out_reg: self.out_reg,
             can_emit_on_empty: self.can_emit_on_empty,
             source_reg_map: self.source_reg_map,
             vm: self.vm,
@@ -398,7 +395,7 @@ fn finalize_side(
     loaded: &LoadedCircuit,
     ex_nid: i32,
 ) -> Result<SchemaDescriptor, CompileError> {
-    let schema = plan.vm.program.reg_meta[plan.out_reg as usize].schema;
+    let schema = plan.vm.program.out_schema();
     if let Some(gnitz_wire::OpNode::ExchangeShard { shard_cols }) = loaded.nodes.get(&ex_nid) {
         if oob_cols(shard_cols.iter().copied(), &schema) {
             return Err(CompileError::Rejected("exchange shard columns out of range"));

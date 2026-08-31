@@ -15,12 +15,9 @@ pub(crate) struct ProgramBuilder {
     instructions: Vec<Instr>,
     predicates: Vec<gnitz_expr::Evaluator>,
     maps: Vec<MapPlan>,
-    tables: Vec<UnsafeCell<Box<Table>>>,
-    reduce_plans: Vec<crate::ops::ReducePlan>,
+    tables: Vec<Table>,
+    reduce_plans: Vec<BakedReduce>,
 }
-
-// SAFETY: Same justification as Program — single-thread access.
-unsafe impl Send for ProgramBuilder {}
 
 impl ProgramBuilder {
     pub(crate) fn new() -> Self {
@@ -37,16 +34,10 @@ impl ProgramBuilder {
         self.instructions.push(instr);
     }
 
-    /// The instructions pushed so far, and the same list to write back into.
-    /// `build_plan`'s liveness pass needs both: whether a destructive instruction
-    /// may take its input depends on instructions that were not yet pushed when it
-    /// was emitted.
-    pub(crate) fn instructions(&self) -> &[Instr] {
-        &self.instructions
-    }
-
-    pub(crate) fn instructions_mut(&mut self) -> &mut [Instr] {
-        &mut self.instructions
+    /// How many instructions are emitted so far — the program offset a node's
+    /// emission ends at.
+    pub(crate) fn instr_count(&self) -> usize {
+        self.instructions.len()
     }
 
     // ── Resources ────────────────────────────────────────────────────────
@@ -65,52 +56,70 @@ impl ProgramBuilder {
         idx
     }
 
-    /// Take ownership of `table`, returning its `Instr` operand — which is also
-    /// what `RegisterMeta::trace` names, so a trace register and the instruction
-    /// writing it cannot disagree about which table they mean.
-    ///
-    /// The `u16` bound holds because each node contributes at most three tables
-    /// and `build_plan` bounds the node count well below `u16::MAX / 3`.
+    /// Take ownership of `table`, returning the index `RegisterMeta::trace` names
+    /// it by. The `u16` holds: a node contributes at most two tables, and
+    /// `build_plan` has already rejected above 32767 nodes.
     pub(crate) fn push_table(&mut self, table: Table) -> TableIdx {
         debug_assert!(self.tables.len() < u16::MAX as usize);
         let idx = TableIdx(self.tables.len() as u16);
-        self.tables.push(UnsafeCell::new(Box::new(table)));
+        self.tables.push(table);
         idx
     }
 
-    /// Store a baked reduce plan, returning its `Instr::Reduce::plan_idx`.
-    pub(crate) fn add_reduce_plan(&mut self, plan: crate::ops::ReducePlan) -> PlanIdx {
+    /// Store a baked reduce plan with the table its value index lives in,
+    /// returning its `Instr::Reduce::plan_idx`.
+    pub(crate) fn add_reduce_plan(&mut self, plan: crate::ops::ReducePlan, avi_table: Option<TableIdx>) -> PlanIdx {
+        debug_assert_eq!(
+            plan.avi.is_some(),
+            avi_table.is_some(),
+            "a value-index table exists iff the plan carries the bake that keys it",
+        );
         let idx = PlanIdx(self.reduce_plans.len() as u16);
-        self.reduce_plans.push(plan);
+        self.reduce_plans.push(BakedReduce { plan, avi_table });
         idx
     }
 
     // ── Build ────────────────────────────────────────────────────────────
 
-    /// Consume the builder into a runnable `VmHandle`.
-    pub(crate) fn build(self, reg_meta: Vec<RegisterMeta>) -> Box<VmHandle> {
+    /// Consume the builder into a runnable `VmHandle`, `out_reg` being the
+    /// register the epoch's output is extracted from.
+    pub(crate) fn build(self, reg_meta: Vec<RegisterMeta>, out_reg: u16) -> Box<VmHandle> {
         let regfile = RegisterFile::new(&reg_meta);
-        // The trace registers name their own backing tables, so the refresh list
-        // is read off the metas rather than tracked alongside them.
+        // The trace registers name their own backing tables, so the bind list is
+        // read off the metas rather than tracked alongside them.
         let trace_regs: Vec<(u16, TableIdx)> = reg_meta
             .iter()
             .enumerate()
             .filter_map(|(reg, m)| m.owned_table.map(|t| (reg as u16, t)))
             .collect();
 
+        // Destructive-register liveness, over the EMITTED instructions — so an
+        // elided node's register aliasing is seen through, not re-derived from
+        // graph edges. Forward, so the last write wins.
+        let mut last_read = vec![u32::MAX; reg_meta.len()];
+        for (pc, instr) in self.instructions.iter().enumerate() {
+            for reg in reads(instr).into_iter().flatten() {
+                last_read[reg as usize] = pc as u32;
+            }
+        }
+        // After the scan, not before: the sink can itself be an operand, and the
+        // epoch epilogue reads it after the last instruction has run.
+        last_read[out_reg as usize] = u32::MAX;
+
         let program = Program {
             instructions: self.instructions,
             reg_meta,
             predicates: self.predicates,
             maps: self.maps,
-            tables: self.tables,
             reduce_plans: self.reduce_plans,
+            last_read,
+            out_reg,
         };
 
         Box::new(VmHandle {
-            owned_cursor_handles: Vec::with_capacity(trace_regs.len()),
             program,
             regfile,
+            tables: self.tables,
             trace_regs,
         })
     }

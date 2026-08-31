@@ -6,25 +6,15 @@ use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{BatchBuilder, Layout};
 use crate::test_support::{
-    make_schema_i64pk_i64, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64, opk_pk,
-    pk_payload_schema, wide_pk_3xu64_schema,
+    make_batch_u128, make_schema_i64pk_i64, make_schema_pk_u64_payload_string, make_schema_u128_i64,
+    make_schema_u64_i64, opk_pk, pk_payload_schema, wide_pk_3xu64_schema,
 };
 
 /// Build an `Rc<Batch>` with i64-payload rows.  Tests pre-sort their
-/// inputs and have at most one row per (PK, payload), so we mark the
-/// batch as sorted+consolidated.
+/// inputs and have at most one row per (PK, payload), so the batch is
+/// certified sorted+consolidated.
 fn make_batch(rows: &[(u128, i64, i64)]) -> Rc<Batch> {
-    let schema = make_schema_u128_i64();
-    let mut b = Batch::with_capacity(schema, rows.len().max(1));
-    for &(pk, w, val) in rows {
-        b.extend_pk(pk);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
-        b.count += 1;
-    }
-    b.certify_layout(Layout::Consolidated, &schema);
-    Rc::new(b)
+    Rc::new(make_batch_u128(&make_schema_u128_i64(), rows))
 }
 
 /// PK = (col0:U64, col1:U64); payload = I64. Stored first-column-major.

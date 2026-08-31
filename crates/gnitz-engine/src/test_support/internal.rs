@@ -12,7 +12,7 @@ use proptest::prelude::*;
 
 use crate::schema::key::{compare_pk_bytes, encode_leading_opk};
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, Layout, ReadCursor};
+use crate::storage::{Batch, Layout, ReadCursor, RecoverySource, Table};
 use gnitz_wire::type_code;
 
 use super::shared::{arb_type_code, col_def, payload_slot_width, pk_i64_schema, u64_pk_schema};
@@ -162,6 +162,30 @@ pub fn make_batch_u128_raw(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)])
         b.count += 1;
     }
     b
+}
+
+/// [`make_batch_u128_raw`] plus the `Consolidated` certification. **Rows must
+/// arrive pre-sorted by (PK, payload) with no net-zero duplicates** — the
+/// certification is a claim the caller makes, and `certify_layout` only
+/// debug-verifies it.
+pub fn make_batch_u128(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> Batch {
+    let mut b = make_batch_u128_raw(schema, rows);
+    b.certify_layout(Layout::Consolidated, schema);
+    b
+}
+
+/// A rederived table under `dir` with a 1 MiB memtable budget — enough that
+/// nothing spills, for a test that just needs somewhere to put rows. A test
+/// exercising the spill path names its own budget instead.
+pub fn scratch_table(dir: &str, schema: SchemaDescriptor, table_id: u32) -> Table {
+    Table::with_memtable_budget(
+        dir,
+        schema,
+        table_id,
+        1 << 20,
+        RecoverySource::Rederive { resume_at: None },
+    )
+    .unwrap()
 }
 
 /// U128 pk + a single I64 payload column — the 16-byte-PK sibling of

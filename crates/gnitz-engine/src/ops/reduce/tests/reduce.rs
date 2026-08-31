@@ -1,12 +1,12 @@
 //! Reduce operator tests. Imports submodule items by name; helpers live in this
 //! file rather than a shared `common.rs` so the tests file stays self-contained.
 
-use std::rc::Rc;
-
 use crate::expr::PkSource;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, Layout, ReadCursor};
-use crate::test_support::{make_batch_raw, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64};
+use crate::test_support::{
+    make_batch_raw, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64, scratch_table, trace_cursor,
+};
 use gnitz_wire::{encode_german_string, read_i64_le, read_u64_le};
 
 use super::super::group_key::GroupKeyCols;
@@ -38,15 +38,9 @@ fn avi_schema(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> SchemaDescrip
     .schema
 }
 
-/// A `trace_out` cursor over one prior reduce output — the integral an epoch
-/// reads its retraction from, as `bind_trace_cursors` hands it to the operator.
-fn trace_over(batch: Batch, schema: SchemaDescriptor) -> ReadCursor {
-    ReadCursor::over_batches(&[Rc::new(batch)], schema)
-}
-
 /// A `trace_out` cursor over an empty trace — a view's first epoch.
 fn empty_trace(schema: SchemaDescriptor) -> ReadCursor {
-    trace_over(Batch::empty_with_schema(&schema), schema)
+    trace_cursor(Batch::empty_with_schema(&schema), schema)
 }
 
 /// Shim over [`super::op_reduce::op_reduce`] baking a [`ReducePlan`] per call —
@@ -95,14 +89,7 @@ impl Avi {
         // position `j` in that subset exactly as production has it.
         let bake = make_bake(in_schema, group_cols, agg_descs);
         let dir = tempfile::tempdir().unwrap();
-        let mut table = crate::storage::Table::with_memtable_budget(
-            dir.path().to_str().unwrap(),
-            bake.schema,
-            0,
-            1 << 20,
-            crate::storage::RecoverySource::Rederive { resume_at: None },
-        )
-        .unwrap();
+        let mut table = scratch_table(dir.path().to_str().unwrap(), bake.schema, 0);
         for b in history {
             op_populate_avi(b, &mut table, &bake).unwrap();
         }
@@ -393,7 +380,7 @@ fn test_reduce_sum_retraction() {
 
     // Tick 2: retract pk=2 (val=200) → SUM should go from 600 to 400
     // Need trace_out with previous aggregate
-    let mut to_ch2 = trace_over(out1, out_schema);
+    let mut to_ch2 = trace_cursor(out1, out_schema);
 
     let delta2 = {
         let mut b = Batch::with_capacity(in_schema, 1);
@@ -465,7 +452,7 @@ fn linear_sum_only_emptied_group_eliminated() {
 
     // Tick 2: retract the only row → cardinality 1 → 0. The gate suppresses the
     // +1, leaving just the −1 retraction, so the group disappears (no zombie).
-    let mut to_ch2 = trace_over(out1, out_schema);
+    let mut to_ch2 = trace_cursor(out1, out_schema);
     let out2 = reduce(&row(1, -1), &mut to_ch2);
     assert_eq!(out2.count, 1, "emptied group emits only the retraction, no +1 zombie");
     assert_eq!(out2.get_weight(0), -1, "the sole output row is the −1 retraction");
@@ -639,7 +626,7 @@ fn count_star_only_emptied_group_eliminated() {
     assert_eq!(read_i64_le(out1.col_data(1), 0), 1, "count=1");
 
     // Tick 2: retract it → count 1 → 0 → group eliminated (only the −1 retraction).
-    let mut to_ch2 = trace_over(out1, out_schema);
+    let mut to_ch2 = trace_cursor(out1, out_schema);
     let out2 = reduce(&row(1, -1), &mut to_ch2);
     assert_eq!(out2.count, 1, "COUNT(*)=0 group is eliminated, not kept as a zombie");
     assert_eq!(out2.get_weight(0), -1, "the sole output row is the −1 retraction");
@@ -773,7 +760,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
 
     // Tick 2: retract (pk1, val=5). The group survives via (pk2, NULL): count
     // drops to 1, the last non-null contributor is gone → SUM must become NULL.
-    let mut to_ch2 = trace_over(raw1, out_schema);
+    let mut to_ch2 = trace_cursor(raw1, out_schema);
     let delta2 = {
         let mut b = Batch::with_capacity(in_schema, 1);
         b.extend_pk(1u128);
@@ -877,7 +864,7 @@ fn null_min_retraction_re_emits_null() {
     );
 
     // Tick 2: (pk=2, grp=10, val=7) → MIN=7, retracts the NULL row.
-    let mut to_ch2 = trace_over(out1, out_schema);
+    let mut to_ch2 = trace_cursor(out1, out_schema);
     let delta2 = {
         let mut b = Batch::with_capacity(in_schema, 1);
         b.extend_pk(2u128);
@@ -957,7 +944,7 @@ fn null_sum_fold_stays_null() {
         "tick1 SUM NULL"
     );
 
-    let mut to_ch2 = trace_over(out1, out_schema);
+    let mut to_ch2 = trace_cursor(out1, out_schema);
     let out2 = op_reduce(
         &null_row(2),
         &mut to_ch2,
@@ -1026,7 +1013,7 @@ fn reduce_trace_seek_wide_pk() {
 
     // Tick 2: retract the val=200 row. SUM 300 → 100; reads the prior aggregate
     // out of trace_out by PK bytes.
-    let mut to_ch2 = trace_over(out1, out_schema);
+    let mut to_ch2 = trace_cursor(out1, out_schema);
     let delta2 = {
         let mut b = Batch::with_capacity(in_schema, 1);
         b.extend_pk_bytes(&pk(7, 7, 7));
@@ -1106,7 +1093,7 @@ fn reduce_trace_seek_compound_pk() {
 
     // Tick 2: insert (2,3)->50. SUM for (2,3) goes 200 → 250: retract 200,
     // insert 250. Group (1,5) is untouched.
-    let mut to_ch2 = trace_over(out1, out_schema);
+    let mut to_ch2 = trace_cursor(out1, out_schema);
     let delta2 = {
         let mut b = Batch::with_capacity(in_schema, 1);
         b.extend_pk_bytes(&pk(2, 3));
@@ -1180,7 +1167,7 @@ fn reduce_trace_seek_signed_pk() {
     assert_eq!(read_i64_le(out1.col_data(0), 0), 200);
 
     // Tick 2: insert key=-1 -> 50. SUM goes 200 → 250: retract + insert.
-    let mut to_ch2 = trace_over(out1, out_schema);
+    let mut to_ch2 = trace_cursor(out1, out_schema);
     let delta2 = {
         let mut b = Batch::with_capacity(in_schema, 1);
         b.extend_pk_opk(&in_schema, &[((-1i64) as u64) as u128]);
@@ -2291,7 +2278,7 @@ fn test_reduce_min_u64_incremental() {
     // under buggy signed compare it would flip to 1u64<<63 = i64::MIN.
     // op_reduce emits retract+new even when the value didn't change, so
     // we get 2 rows; we assert the new emitted value is the unsigned MIN.
-    let mut to_ch2 = trace_over(out1, out_schema);
+    let mut to_ch2 = trace_cursor(out1, out_schema);
 
     let delta2 = make_batch_u64pk_i64grp_u64val(&in_schema, &[(2, 1, 7, 1u64 << 63)]);
     let mut avi2 = Avi::new(&in_schema, &[1u32], &[agg], &[&delta1, &delta2]);
@@ -2350,7 +2337,7 @@ fn test_reduce_max_u64_incremental() {
 
     // Tick 2: delta adds val=u64::MAX, so the index holds both.
     // Pre-fix signed MAX would treat u64::MAX as -1, keeping MAX=10.
-    let mut to_ch2 = trace_over(out1, out_schema);
+    let mut to_ch2 = trace_cursor(out1, out_schema);
 
     let delta2 = make_batch_u64pk_i64grp_u64val(&in_schema, &[(2, 1, 7, u64::MAX)]);
     let mut avi2 = Avi::new(&in_schema, &[1u32], &[agg], &[&delta1, &delta2]);
@@ -2711,7 +2698,7 @@ fn test_reduce_group_by_pk_unsorted_with_retraction() {
     prev.extend_col(1, &1i64.to_le_bytes());
     prev.count += 1;
     prev.set_layout_unchecked(Layout::Consolidated);
-    let mut to_ch = trace_over(prev, out_schema);
+    let mut to_ch = trace_cursor(prev, out_schema);
 
     // Unsorted delta with pk=5 split across the batch. Pre-fix: emits
     // TWO `(pk=5, w=-1, SUM=100)` retractions plus split partials.
@@ -2770,7 +2757,7 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
     prev.extend_col(0, &10i64.to_le_bytes());
     prev.count += 1;
     prev.set_layout_unchecked(Layout::Consolidated);
-    let mut to_ch = trace_over(prev, out_schema);
+    let mut to_ch = trace_cursor(prev, out_schema);
 
     // Delta: retract (pk=1, val=10) — the payload holding the current MIN.
     let delta = make_batch(&in_schema, &[(1, -1, 10)]);
@@ -2880,7 +2867,7 @@ fn avi_two_groups_distinct_byte_form_keys() {
     };
 
     let mut to_ch = empty_trace(out_schema);
-    let mut avi_ch = trace_over(avi_batch, avi_schema);
+    let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
     let agg = AggDescriptor {
         col_idx: 3,
@@ -2992,8 +2979,8 @@ fn avi_retraction_returns_next_extremum() {
         b
     };
 
-    let mut to_ch = trace_over(to_batch, out_schema);
-    let mut avi_ch = trace_over(avi_batch, avi_schema);
+    let mut to_ch = trace_cursor(to_batch, out_schema);
+    let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
     let agg = AggDescriptor {
         col_idx: 2,
@@ -3089,7 +3076,7 @@ fn avi_non_power_of_two_stride_drives_cursor() {
         };
 
         let mut to_ch = empty_trace(out_schema);
-        let mut avi_ch = trace_over(avi_batch, avi_schema);
+        let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
         let agg = AggDescriptor {
             col_idx: 2,
@@ -3186,7 +3173,7 @@ fn min_tie_retract_one_copy_keeps_min() {
         b
     };
 
-    let mut to_ch = trace_over(to_batch, out_schema);
+    let mut to_ch = trace_cursor(to_batch, out_schema);
 
     let agg = AggDescriptor {
         col_idx: 2,
@@ -3356,8 +3343,8 @@ fn avi_multi_col_retraction_returns_next_extremum() {
         b
     };
 
-    let mut to_ch = trace_over(to_batch, out_schema);
-    let mut avi_ch = trace_over(avi_batch, avi_schema);
+    let mut to_ch = trace_cursor(to_batch, out_schema);
+    let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
     let agg = AggDescriptor {
         col_idx: 3,
@@ -3504,7 +3491,7 @@ fn avi_wide_two_u64_groups_match_reference() {
     };
 
     let mut to_ch = empty_trace(out_schema);
-    let mut avi_ch = trace_over(avi_batch, avi_schema);
+    let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
     let agg = AggDescriptor {
         col_idx: 3,
@@ -3599,7 +3586,7 @@ fn avi_wide_single_u128_group_distinct() {
     };
 
     let mut to_ch = empty_trace(out_schema);
-    let mut avi_ch = trace_over(avi_batch, avi_schema);
+    let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
     let agg = AggDescriptor {
         col_idx: 2,
@@ -3706,7 +3693,7 @@ fn avi_wide_mixed_signed_unsigned_key() {
     };
 
     let mut to_ch = empty_trace(out_schema);
-    let mut avi_ch = trace_over(avi_batch, avi_schema);
+    let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
     let agg = AggDescriptor {
         col_idx: 3,
@@ -3808,7 +3795,7 @@ fn avi_wide_prefix_collision_distinct_groups() {
     };
 
     let mut to_ch = empty_trace(out_schema);
-    let mut avi_ch = trace_over(avi_batch, avi_schema);
+    let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
     let agg = AggDescriptor {
         col_idx: 4,
@@ -3918,8 +3905,8 @@ fn avi_wide_retraction_returns_next_extremum() {
         b
     };
 
-    let mut to_ch = trace_over(to_batch, out_schema);
-    let mut avi_ch = trace_over(avi_batch, avi_schema);
+    let mut to_ch = trace_cursor(to_batch, out_schema);
+    let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
     let agg = AggDescriptor {
         col_idx: 3,
@@ -4014,19 +4001,11 @@ fn avi_read_extreme(
     for_max: bool,
 ) -> i64 {
     use super::avi::op_populate_avi;
-    use crate::storage::Table;
 
     // The aggregate's type is the source column's type.
     let avi_schema = avi_schema(in_schema, group_by);
     let tmp = tempfile::tempdir().unwrap();
-    let mut avi_t = Table::with_memtable_budget(
-        tmp.path().to_str().unwrap(),
-        avi_schema,
-        0,
-        1 << 20,
-        crate::storage::RecoverySource::Rederive { resume_at: None },
-    )
-    .unwrap();
+    let mut avi_t = scratch_table(tmp.path().to_str().unwrap(), avi_schema, 0);
     let agg = AggDescriptor {
         col_idx,
         agg_op: if for_max { AggFunc::Max } else { AggFunc::Min },
@@ -4375,7 +4354,7 @@ fn run_nullable_grp_min_i64(
     let to_batch = out1;
     let delta2 = build_grp_val_delta(&in_schema, delta_rows);
 
-    let mut to_ch2 = trace_over(to_batch, out_schema);
+    let mut to_ch2 = trace_cursor(to_batch, out_schema);
     let mut avi2 = Avi::new(&in_schema, &[1u32], &[agg], &[&delta1, &delta2]);
 
     let out2 = op_reduce(
@@ -4552,7 +4531,7 @@ fn min_multi_col_group_resolves_per_group() {
     let empty_out2 = Batch::empty_with_schema(&out_schema);
     let delta2 = make_batch(&delta2_rows);
 
-    let mut to_ch2 = trace_over(empty_out2, out_schema);
+    let mut to_ch2 = trace_cursor(empty_out2, out_schema);
     let mut avi2 = Avi::new(&in_schema, &[1u32, 2u32], &[agg], &[&history, &delta2]);
 
     let out2 = op_reduce(
@@ -4794,7 +4773,7 @@ fn test_reduce_max_blob_group_retraction() {
     let to_batch = out1;
     // Retraction: weight -1 on the val=30 blob_a row.
     let delta2 = make_batch_blob_grp_i64(&in_schema, &[(2, -1, blob_a, 30)]);
-    let mut to_ch2 = trace_over(to_batch, out_schema);
+    let mut to_ch2 = trace_cursor(to_batch, out_schema);
     let mut avi2 = Avi::new(&in_schema, &[1u32], &[agg], &[&history, &delta2]);
     let out2 = op_reduce(
         &delta2,
@@ -4927,7 +4906,7 @@ fn global_seed_idempotent_across_two_empty_pads() {
     assert_eq!(raw1.count, 1, "first pad seeds the ground");
 
     // Second pad: trace_out now holds the V₀ ground from the first pad.
-    let mut to_ch2 = trace_over(raw1, out_schema);
+    let mut to_ch2 = trace_cursor(raw1, out_schema);
     let raw2 = g_reduce(&g_delta(&[]), &[], &mut to_ch2, &[G_SUM, G_COUNT], true);
     assert_eq!(raw2.count, 0, "second pad must NOT re-seed (V₀ already in trace_out)");
 }
@@ -4976,7 +4955,7 @@ fn global_emptied_by_delete_emits_ground() {
     assert_eq!(read_i64_le(raw1.col_data(0), 0), 5, "SUM=5");
 
     // Retract the only row → cardinality 0.
-    let mut to_ch2 = trace_over(raw1, out_schema);
+    let mut to_ch2 = trace_cursor(raw1, out_schema);
     let raw2 = g_reduce(&g_delta(&[(1, -1, 5)]), &[], &mut to_ch2, &[G_SUM, G_COUNT], true);
 
     // Retract old computed (-1) + emit ground (+1) = 2 rows; net view = ground.
@@ -4998,7 +4977,7 @@ fn global_ground_to_computed_on_first_insert() {
     assert_eq!(ground.count, 1);
 
     // Tick 2: insert a row; trace_out holds the ground.
-    let mut to_ch2 = trace_over(ground, out_schema);
+    let mut to_ch2 = trace_cursor(ground, out_schema);
     let raw2 = g_reduce(&g_delta(&[(1, 1, 7)]), &[], &mut to_ch2, &[G_SUM, G_COUNT], true);
 
     // Retract ground (-1) + emit computed (+1) = 2 rows; net view = computed.
@@ -5020,7 +4999,7 @@ fn global_value_change_emits_no_ground() {
     assert_eq!(read_i64_le(raw1.col_data(0), 0), 5);
 
     // Change pk1's value 5 → 8 (retract old, insert new) — cardinality stays 1.
-    let mut to_ch2 = trace_over(raw1, out_schema);
+    let mut to_ch2 = trace_cursor(raw1, out_schema);
     let raw2 = g_reduce(
         &g_delta(&[(1, -1, 5), (1, 1, 8)]),
         &[],
@@ -5054,7 +5033,7 @@ fn global_mixed_count_min_emptied_emits_ground() {
     // Tick 2: retract the only row. The index has absorbed both ticks, so the
     // group's one entry nets to zero and the seek finds nothing.
     let d2 = g_delta(&[(1, -1, 5)]);
-    let mut to_ch2 = trace_over(raw1, out_schema);
+    let mut to_ch2 = trace_cursor(raw1, out_schema);
     let raw2 = g_reduce(&d2, &[&d1, &d2], &mut to_ch2, &aggs, true);
 
     assert_eq!(raw2.count, 2, "retract old + ground insert");
@@ -5086,7 +5065,7 @@ fn global_lone_min_retract_to_next_best() {
 
     // Tick 2: retract the current min (val=3) → MIN advances to 5.
     let d2 = g_delta(&[(2, -1, 3)]);
-    let mut to_ch2 = trace_over(raw1, out_schema);
+    let mut to_ch2 = trace_cursor(raw1, out_schema);
     let raw2 = g_reduce(&d2, &[&d1, &d2], &mut to_ch2, &[G_MIN], true);
     let mb = raw2.as_mem_batch();
     let pos = (0..raw2.count).find(|&i| mb.get_weight(i) == 1).expect("a +1 row");
@@ -5129,7 +5108,7 @@ fn global_lone_min_avi_empty_prefix() {
     };
 
     let g_min_avi = |delta: &Batch, to: &mut crate::storage::ReadCursor, avi: i64| {
-        let mut avi_ch = trace_over(avi_with(avi), avi_schema);
+        let mut avi_ch = trace_cursor(avi_with(avi), avi_schema);
         op_reduce(
             delta,
             to,
@@ -5155,7 +5134,7 @@ fn global_lone_min_avi_empty_prefix() {
     );
 
     // Tick 2: a retraction re-evaluates the group; the AVI post-state is 20.
-    let mut to_ch2 = trace_over(raw1, out_schema);
+    let mut to_ch2 = trace_cursor(raw1, out_schema);
     let raw2 = g_min_avi(&g_delta(&[(2, -1, 10)]), &mut to_ch2, 20);
     let mb2 = raw2.as_mem_batch();
     let p2 = (0..raw2.count).find(|&i| mb2.get_weight(i) == 1).expect("a +1 row");
@@ -5431,7 +5410,7 @@ fn combine_full_retraction_sheds_to_ground() {
     assert_eq!(read_i64_le(out1.col_data(0), 0), 5, "combined = 5");
 
     // Retract the only partial → COUNT-of-partials nets to 0.
-    let mut to_ch2 = trace_over(out1, out_schema);
+    let mut to_ch2 = trace_cursor(out1, out_schema);
     let out2 = combine_reduce(&combine_partials(&[(-1, Some(5))]), &mut to_ch2);
     assert_eq!(out2.count, 2, "retract old computed (−1) + ground insert (+1)");
     let mb = out2.as_mem_batch();
@@ -5469,14 +5448,7 @@ fn build_combined_avi(
 ) -> crate::storage::Table {
     use super::avi::op_populate_avi;
     let avi_schema = avi_schema(in_schema, group_cols);
-    let mut t = crate::storage::Table::with_memtable_budget(
-        dir.to_str().unwrap(),
-        avi_schema,
-        0,
-        1 << 20,
-        crate::storage::RecoverySource::Rederive { resume_at: None },
-    )
-    .unwrap();
+    let mut t = scratch_table(dir.to_str().unwrap(), avi_schema, 0);
     let bake = make_bake(in_schema, group_cols, agg_descs);
     for d in deltas {
         op_populate_avi(d, &mut t, &bake).unwrap();
@@ -5686,7 +5658,7 @@ fn reduce_multi_avi_linear_companion() {
 
     // Tick 2: retract a=3 (the current min). MIN→5 (index post-state), COUNT 3→2.
     let d2 = cg3_delta(&[(3, -1, 7, 3, false)]);
-    let mut to2 = trace_over(out1, out_schema);
+    let mut to2 = trace_cursor(out1, out_schema);
     let out2 = cg3_tick(tmp.path(), &[&d1, &d2], &d2, &aggs, &mut to2);
     // retract old (MIN=3,count=3 @ -1) + insert new (MIN=5,count=2 @ +1).
     let mb = out2.as_mem_batch();
@@ -5719,7 +5691,7 @@ fn reduce_multi_avi_emptied_with_companion() {
 
     // Tick 2: retract both rows → group emptied.
     let d2 = cg3_delta(&[(1, -1, 7, 5, false), (2, -1, 7, 8, false)]);
-    let mut to2 = trace_over(out1, out_schema);
+    let mut to2 = trace_cursor(out1, out_schema);
     let out2 = cg3_tick(tmp.path(), &[&d1, &d2], &d2, &aggs, &mut to2);
     assert_eq!(
         out2.count, 1,
@@ -5771,7 +5743,7 @@ fn reduce_multi_avi_retract_to_all_null() {
 
     // Tick 2: retract a=5. Group survives via the NULL row: (g, NULL, 1).
     let d2 = cg3_delta(&[(1, -1, 7, 5, false)]);
-    let mut to2 = trace_over(out1, out_schema);
+    let mut to2 = trace_cursor(out1, out_schema);
     let out2 = cg3_tick(tmp.path(), &[&d1, &d2], &d2, &aggs, &mut to2);
     let mb2 = out2.as_mem_batch();
     let ins = (0..out2.count)
@@ -5797,7 +5769,7 @@ fn reduce_multi_avi_retract_to_all_null() {
 
     // Tick 3: retract the remaining NULL row → group gone (only the −1).
     let d3 = cg3_delta(&[(2, -1, 7, 0, true)]);
-    let mut to3 = trace_over(row2, out_schema);
+    let mut to3 = trace_cursor(row2, out_schema);
     let out3 = cg3_tick(tmp.path(), &[&d1, &d2, &d3], &d3, &aggs, &mut to3);
     assert_eq!(out3.count, 1, "group now absent: only the −1 retraction");
     assert_eq!(out3.get_weight(0), -1);
@@ -6000,7 +5972,7 @@ fn reduce_multi_avi_global_emptied() {
 
     // Tick 2: retract everything → ground row (MIN=NULL, SUM=NULL, COUNT=0).
     let d2 = mk(&[(1, -1, 5, 10), (2, -1, 3, 20)]);
-    let mut to2 = trace_over(out1, out_schema);
+    let mut to2 = trace_cursor(out1, out_schema);
     let out2 = run(&[&d1, &d2], &d2, &mut to2);
     let mb = out2.as_mem_batch();
     let ins = (0..out2.count)
@@ -6104,14 +6076,7 @@ fn run_reduce_trace_epochs(
 ) -> (std::rc::Rc<Batch>, usize) {
     // A fresh tempdir per call isolates shard files, so a constant table_id is
     // collision-free.
-    let mut trace = crate::storage::Table::with_memtable_budget(
-        dir.to_str().unwrap(),
-        *out_schema,
-        0,
-        1 << 20,
-        crate::storage::RecoverySource::Rederive { resume_at: None },
-    )
-    .unwrap();
+    let mut trace = scratch_table(dir.to_str().unwrap(), *out_schema, 0);
     let mut max_sources = 0usize;
     for (i, d) in epochs.iter().enumerate() {
         // Sources the cursor for THIS epoch's probe sees: memtable runs + folded
@@ -6446,28 +6411,13 @@ fn run_minmax_epochs(
     global_ground: bool,
 ) -> Vec<std::rc::Rc<Batch>> {
     use super::avi::op_populate_avi;
-    use crate::storage::{RecoverySource, Table};
 
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_str().unwrap();
 
-    let mut trace_out = Table::with_memtable_budget(
-        dir,
-        *out_schema,
-        0,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    )
-    .unwrap();
+    let mut trace_out = scratch_table(dir, *out_schema, 0);
     let avi_schema = avi_schema(in_schema, group_by);
-    let mut avi_t = Table::with_memtable_budget(
-        dir,
-        avi_schema,
-        2,
-        1 << 20,
-        RecoverySource::Rederive { resume_at: None },
-    )
-    .unwrap();
+    let mut avi_t = scratch_table(dir, avi_schema, 2);
 
     let avi_bake = make_bake(in_schema, group_by, aggs);
     let mut states = Vec::with_capacity(epochs.len());

@@ -7,24 +7,28 @@
 
 use super::*;
 
-/// Where a bounded view's per-key replay seeds. Both variants name a register to
-/// feed and a store to feed it from; they differ only in where that store lives
-/// and, for the join, in entering the program past its own prologue.
+/// Where a bounded view's per-key replay seeds: a register to feed, a store to
+/// feed it from, and the program offset to dispatch from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Hydration {
-    /// Linear (`ScanDelta → Filter? → Map? → IntegrateSink`): seed the
-    /// `ScanDelta`'s register `in_reg` from relation `source`'s store and replay
-    /// the whole program.
-    Relation { in_reg: u16, source: i64 },
-    /// Inner equi-join: seed `in_reg` from the trace at `seed_table` and
-    /// dispatch from `start_pc`. The seed must enter mid-program because the join
-    /// key is not the source PK, so a key-restricted feed at the `ScanDelta`
-    /// register would mean scanning the whole source.
-    Join {
-        start_pc: usize,
-        in_reg: u16,
-        seed_table: crate::query::vm::TableIdx,
-    },
+pub(crate) struct Hydration {
+    /// The offset the replay enters at, past the prologue whose output the seed
+    /// replaces. `0` replays the whole program.
+    pub start_pc: usize,
+    pub in_reg: u16,
+    pub seed: HydrationSeed,
+}
+
+/// The store a [`Hydration`] seeds from — the only axis the two eligible view
+/// bodies differ on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HydrationSeed {
+    /// Linear (`ScanDelta → Filter? → Map? → IntegrateSink`): the source
+    /// relation's own store, feeding the `ScanDelta`'s register.
+    Relation(i64),
+    /// Inner equi-join: one branch's trace. The seed enters mid-program because
+    /// the join key is not the source PK, so a key-restricted feed at the
+    /// `ScanDelta` register would mean scanning the whole source.
+    Trace(crate::query::vm::TableIdx),
 }
 
 /// The graph half of a bounded view's hydration plan: which relation a linear
@@ -135,51 +139,51 @@ pub(super) fn derive_hydration(loaded: &LoadedCircuit, plan: &PlanBuildResult) -
         ))
     };
 
-    let (d_a, t_a) = match hydration_nodes(loaded)? {
-        HydrationNodes::Relation { nid, source } => {
-            let in_reg = reg_of(nid)?;
-            reject_state_writers(plan, 0)?;
-            return Ok(Hydration::Relation { in_reg, source });
+    let hydration = match hydration_nodes(loaded)? {
+        HydrationNodes::Relation { nid, source } => Hydration {
+            start_pc: 0,
+            in_reg: reg_of(nid)?,
+            seed: HydrationSeed::Relation(source),
+        },
+        HydrationNodes::Join { d_a, t_a } => {
+            // Registers and the start offset, off the emitter's own bookkeeping.
+            let seed_table = plan
+                .vm
+                .program
+                .reg_meta
+                .get(reg_of(t_a)? as usize)
+                .and_then(|m| m.owned_table)
+                .ok_or(CompileError::Rejected(
+                    "bounded view: trace register has no owned table",
+                ))?;
+            Hydration {
+                // The replay enters past the seeded node's own instructions.
+                start_pc: plan
+                    .instr_end
+                    .get(&d_a)
+                    .copied()
+                    .ok_or(CompileError::Rejected("bounded view: delta node is not in the plan"))?,
+                in_reg: reg_of(d_a)?,
+                seed: HydrationSeed::Trace(seed_table),
+            }
         }
-        HydrationNodes::Join { d_a, t_a } => (d_a, t_a),
     };
+    reject_state_writers(plan, hydration.start_pc)?;
 
-    // Registers and the start offset, off the emitter's own bookkeeping.
-    let in_reg = reg_of(d_a)?;
-    let seed_table = plan
-        .vm
-        .program
-        .reg_meta
-        .get(reg_of(t_a)? as usize)
-        .and_then(|m| m.owned_table)
-        .ok_or(CompileError::Rejected(
-            "bounded view: trace register has no owned table",
-        ))?;
-    // The replay enters past the seeded node's own instructions.
-    let start_pc = plan
-        .instr_end
-        .get(&d_a)
-        .copied()
-        .ok_or(CompileError::Rejected("bounded view: delta node is not in the plan"))?;
-    reject_state_writers(plan, start_pc)?;
-
-    Ok(Hydration::Join {
-        start_pc,
-        in_reg,
-        seed_table,
-    })
+    Ok(hydration)
 }
 
 /// Trust boundary on the program the read-only dispatch will run from `start_pc`:
 /// that dispatch suppresses `Integrate`, so any *other* state writer would make a
 /// read mutate the state it reads. None is reachable from an eligible shape, so
 /// this turns a planner that under-rejects into a loud DDL failure rather than a
-/// silently-mutating read. `writes_state` is exhaustive over `Instr`, so a new
-/// state-writing opcode cannot slip past this.
+/// silently-mutating read. `writes_state_during_replay` is exhaustive over
+/// `Instr` and lives beside the arm that does the suppressing, so a new
+/// state-writing opcode cannot slip past this and the two cannot drift.
 fn reject_state_writers(plan: &PlanBuildResult, start_pc: usize) -> Result<(), CompileError> {
     if plan.vm.program.instructions[start_pc..]
         .iter()
-        .any(|i| !matches!(i, Instr::Integrate { .. }) && crate::query::vm::writes_state(i))
+        .any(crate::query::vm::writes_state_during_replay)
     {
         return Err(CompileError::Rejected(
             "bounded view: the replayed program writes operator state",

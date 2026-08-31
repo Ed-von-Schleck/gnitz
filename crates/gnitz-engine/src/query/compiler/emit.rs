@@ -4,7 +4,7 @@
 use super::*;
 use crate::expr::PkSource;
 use crate::ops::{merge_schemas_for_join, JoinProbe, RangeProbe};
-use crate::query::vm::{consume_slots, reads_reg, Instr, TableIdx};
+use crate::query::vm::{Instr, TableIdx};
 use crate::schema::{DerivedSchema, SchemaColumn};
 
 // ---------------------------------------------------------------------------
@@ -198,20 +198,22 @@ impl EmitCtx<'_> {
     }
 
     /// Create a child table backing `trace_reg`, which becomes a trace register
-    /// (`bind_trace_cursors` opens a cursor on it each epoch).
+    /// (`bind_trace_cursors` opens a cursor on it each epoch). Returns no index:
+    /// the register is how every instruction reaches the table
+    /// ([`crate::query::vm::Program::trace_table_idx`]).
     fn add_trace_table(
         &mut self,
         child_name: &str,
         schema: SchemaDescriptor,
         trace_reg: u16,
-    ) -> Result<TableIdx, CompileError> {
+    ) -> Result<(), CompileError> {
         let idx = self.add_registerless_table(child_name, schema)?;
         self.reg_meta[trace_reg as usize] = RegisterMeta::trace(schema, idx);
-        Ok(idx)
+        Ok(())
     }
 
-    /// Create a child table that **no** register names: only the one instruction
-    /// holding the returned `TableIdx` can reach it, so nothing else in the
+    /// Create a child table that **no** register names: only the baked reduce
+    /// plan holding the returned `TableIdx` can reach it, so nothing else in the
     /// program can read or write it and no cursor is bound to it per epoch.
     fn add_registerless_table(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<TableIdx, CompileError> {
         let t = self.create_child_table(child_name, schema)?;
@@ -296,10 +298,6 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode, re
             ctx.builder.push(Instr::Negate {
                 in_reg,
                 out_reg: reg_id,
-                // Non-consuming is always correct, sometimes one clone too many;
-                // `build_plan`'s liveness pass upgrades every destructive flag
-                // once the whole instruction list exists.
-                consume: false,
             });
         }
 
@@ -314,8 +312,6 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode, re
                 in_a,
                 in_b,
                 out_reg: reg_id,
-                consume_a: false, // see `Instr::Negate` above
-                consume_b: false,
             });
         }
 
@@ -338,17 +334,15 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode, re
                 (-1, 1)
             };
             let child_name = format!("_hist_{}_{nid}", ctx.site.id);
-            let hist_table_idx = ctx.add_trace_table(&child_name, in_reg_schema, reg_id)?;
+            ctx.add_trace_table(&child_name, in_reg_schema, reg_id)?;
             let out_delta_id = ctx.push_delta_reg(in_reg_schema);
             ctx.out_reg_of.insert(nid, out_delta_id);
             ctx.builder.push(Instr::WeightClamp {
                 in_reg,
                 hist_reg: reg_id,
                 out_reg: out_delta_id,
-                hist_table_idx,
                 lo,
                 hi,
-                consume: false, // see `Instr::Negate` above
             });
         }
 
@@ -366,6 +360,13 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode, re
             let (a_reg, b_reg) = (ctx.reg_of(delta)?, ctx.reg_of(trace)?);
             let a_schema = ctx.reg_meta[a_reg as usize].schema;
             let b_schema = ctx.reg_meta[b_reg as usize].schema;
+            // `resolve_inputs` validates a Join's port arity but not the producer's
+            // kind, so a hand-built circuit can feed the trace port from a `Filter`.
+            // That register owns no table, gets no cursor from `bind_trace_cursors`,
+            // and would meet the dispatch as a mid-epoch worker panic.
+            if ctx.reg_meta[b_reg as usize].owned_table.is_none() {
+                return Err(CompileError::Rejected("join: trace port is not an integral"));
+            }
             // Both kinds produce the same output layout — only the probe differs —
             // so the schema, the register meta and the operand registers are shared.
             let probe = match kind {
@@ -399,8 +400,11 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode, re
             // Must fail the compile on a table-open error: emitting the view without
             // the Integrate would compile a view that never persists its differential
             // state, leaving its output permanently empty.
-            let table_idx = ctx.add_trace_table(&child_name, in_reg_schema, reg_id)?;
-            ctx.builder.push(Instr::Integrate { in_reg, table_idx });
+            ctx.add_trace_table(&child_name, in_reg_schema, reg_id)?;
+            ctx.builder.push(Instr::Integrate {
+                in_reg,
+                trace_reg: reg_id,
+            });
         }
 
         gnitz_wire::OpNode::ExchangeShard { .. } => {
@@ -648,7 +652,7 @@ pub(super) fn emit_reduce(
     .map_err(CompileError::Rejected)?;
     let reduce_out_schema = plan.output_schema;
 
-    let trace_table_idx = ctx.add_trace_table(&format!("_reduce_{}_{nid}", ctx.site.id), reduce_out_schema, reg_id)?;
+    ctx.add_trace_table(&format!("_reduce_{}_{nid}", ctx.site.id), reduce_out_schema, reg_id)?;
 
     let raw_delta_id = ctx.push_delta_reg(reduce_out_schema);
     ctx.out_reg_of.insert(nid, raw_delta_id);
@@ -663,19 +667,18 @@ pub(super) fn emit_reduce(
         None => None,
     };
 
-    let plan_idx = ctx.builder.add_reduce_plan(plan);
+    let plan_idx = ctx.builder.add_reduce_plan(plan, avi);
 
     ctx.builder.push(Instr::Reduce {
         in_reg: in_reg_id,
         trace_out_reg: reg_id,
         out_reg: raw_delta_id,
         plan_idx,
-        avi,
     });
 
     ctx.builder.push(Instr::Integrate {
         in_reg: raw_delta_id,
-        table_idx: trace_table_idx,
+        trace_reg: reg_id,
     });
     Ok(())
 }
@@ -762,10 +765,8 @@ pub(super) fn build_plan(
             .get(&nid)
             .expect("topo_sorted builds `ordered` out of `nodes`' own keys");
         emit_node(&mut ctx, nid, op, reg_id)?;
-        instr_end.insert(nid, ctx.builder.instructions().len());
+        instr_end.insert(nid, ctx.builder.instr_count());
     }
-
-    ctx.builder.push(Instr::Halt);
 
     // The exchange seeds come first; failing that, the plan is driven from a
     // source register. `min_by_key` rather than an arbitrary map entry so a
@@ -790,18 +791,6 @@ pub(super) fn build_plan(
         },
     }
     .ok_or(CompileError::Rejected("plan has no output register"))?;
-
-    // Destructive-register liveness: `consume_slots` names the registers an opcode
-    // could empty; this decides whether it may. Over the EMITTED instructions, so
-    // register aliasing from elided nodes is seen through rather than re-derived
-    // from graph edges. The sink is a reader no instruction spells.
-    let instrs = ctx.builder.instructions_mut();
-    for i in 0..instrs.len() {
-        let (head, tail) = instrs.split_at_mut(i + 1);
-        for (reg, consume) in consume_slots(&mut head[i]).into_iter().flatten() {
-            *consume = reg != sink_reg && !tail.iter().any(|later| reads_reg(later, reg));
-        }
-    }
 
     if let PlanTarget::ViewOutput { out_schema, .. } = target {
         let sink_schema = &ctx.reg_meta[sink_reg as usize].schema;
@@ -833,12 +822,11 @@ pub(super) fn build_plan(
         out_reg_of,
         ..
     } = ctx;
-    let vm = builder.build(reg_meta);
+    let vm = builder.build(reg_meta, sink_reg);
 
     Ok(PlanBuildResult {
         vm,
         in_reg: input_delta_reg_id,
-        out_reg: sink_reg,
         source_reg_map,
         can_emit_on_empty,
         exchange_input_regs,
@@ -967,7 +955,7 @@ mod tests {
 
         let carved = plan(&subgraph_ordered(&loaded, 1)).expect("the carve production performs");
         assert_eq!(
-            carved.out_reg,
+            carved.vm.program.out_reg,
             *carved.out_reg_of.get(&1).unwrap(),
             "a subgraph outputs the register of the node it names"
         );
@@ -1777,20 +1765,28 @@ mod tests {
     // sink the epoch extracts — a property of the emitted list, decided per input
     // register rather than per view.
 
-    /// Every `consume` verdict in program order, labelled by its slot; a `Union`
-    /// contributes both operands.
+    /// Every destructive opcode's take verdict in program order, labelled by its
+    /// slot; a `Union` contributes both operands. Read off the same `reads` table
+    /// the dispatch decides through, against the `last_read` the build produced —
+    /// so this asserts the verdict the VM will act on, not an intermediate.
     fn consume_flags(plan: &PlanBuildResult) -> Vec<(&'static str, bool)> {
-        plan.vm
-            .program
+        let program = &plan.vm.program;
+        program
             .instructions
             .iter()
-            .flat_map(|i| match i {
-                Instr::Union {
-                    consume_a, consume_b, ..
-                } => vec![("union.a", *consume_a), ("union.b", *consume_b)],
-                Instr::WeightClamp { consume, .. } => vec![("clamp", *consume)],
-                Instr::Negate { consume, .. } => vec![("negate", *consume)],
-                _ => vec![],
+            .enumerate()
+            .flat_map(|(pc, instr)| {
+                let label = match instr {
+                    Instr::Union { .. } => ["union.a", "union.b"],
+                    Instr::WeightClamp { .. } => ["clamp", ""],
+                    Instr::Negate { .. } => ["negate", ""],
+                    _ => return Vec::new(),
+                };
+                crate::query::vm::reads(instr)
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(slot, reg)| Some((label[slot], program.last_read[reg? as usize] == pc as u32)))
+                    .collect()
             })
             .collect()
     }
@@ -1885,6 +1881,45 @@ mod tests {
             vec![("negate", false), ("union.a", false), ("union.b", true)],
             "operand A is the sink and must not be taken; the Negate's own input is \
              still read by operand B, which has no later reader of its own",
+        );
+    }
+
+    /// A trace port fed by a node that is not an integral is rejected at compile
+    /// time: `resolve_inputs` checks a `Join`'s port arity, not its producer's
+    /// kind, and such a register would reach the dispatch with no cursor. The ONLY
+    /// difference between the two builds is which node feeds `PORT_TRACE`.
+    #[test]
+    fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext: ExtTables = HashMap::from([(10, two_col_schema()), (11, two_col_schema())]);
+        // Node 2 is the integral of scan 11; node 1 is that scan's own register,
+        // which carries a delta and no table.
+        let plan = |trace_src: i32| {
+            let mut nodes = HashMap::new();
+            nodes.insert(0, scan_delta(10));
+            nodes.insert(1, scan_delta(11));
+            nodes.insert(2, gnitz_wire::OpNode::IntegrateTrace);
+            nodes.insert(3, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
+            let loaded = loaded_for_test(
+                nodes,
+                vec![(1, 2, PORT_IN), (0, 3, PORT_IN_A), (trace_src, 3, PORT_TRACE)],
+            );
+            build_plan(
+                &loaded,
+                &loaded.ordered,
+                &ext,
+                test_site(dir.path().to_str().unwrap(), 1),
+                crate::schema::Placement::KEYED_DEFAULT,
+                PlanTarget::Subgraph { out: 3 },
+            )
+        };
+        assert!(plan(2).is_ok(), "an integral is a valid trace port");
+        assert!(
+            matches!(
+                plan(1),
+                Err(CompileError::Rejected("join: trace port is not an integral"))
+            ),
+            "a delta register on the trace port is a mis-built circuit, not a plan",
         );
     }
 

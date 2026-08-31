@@ -112,30 +112,28 @@ impl DagEngine {
         }
     }
 
-    /// Release the delta batches pinned in a view's compiled-plan regfiles.
-    /// The VM only clears deltas at the *start* of an epoch, so after a
-    /// backfill the last chunk's input and intermediate deltas stay resident
-    /// until the next evaluation. Called at the end of a backfill so peak
-    /// resident memory falls back to ~O(chunk) once it drains.
-    pub fn clear_view_regfile_deltas(&mut self, view_id: i64) {
+    /// Free what a view's compiled-plan register files hold — the delta batches
+    /// and the bound trace cursors. The per-epoch clear keeps both, so a finished
+    /// backfill would otherwise pin its last chunk's arenas and trace runs for the
+    /// cached plan's lifetime; peak resident memory falls back to ~O(chunk) here.
+    pub fn release_view_regfile_deltas(&mut self, view_id: i64) {
         if let Some(plan) = self.cache.get_mut(&view_id) {
             for sub in plan.sub_plans_mut() {
-                sub.vm.clear_deltas();
+                sub.vm.release_deltas();
             }
         }
     }
 
     /// Execute one sub-pipeline epoch, seeding one register per input. Takes the
-    /// sub-plan by mutable reference, to reach the VM's regfile and owned-cursor
-    /// state.
+    /// sub-plan by mutable reference, to reach the VM's regfile, tables and
+    /// cursor state.
     fn execute_sub_plan_multi(
         sub: &mut SubPlan,
         inputs: impl IntoIterator<Item = (u16, Batch)>,
     ) -> Result<Option<Batch>, StorageError> {
-        let SubPlan { vm, out_reg, .. } = sub;
-        vm.compact_owned_traces();
-        vm.bind_trace_cursors();
-        vm::execute_epoch_multi(&vm.program, &mut vm.regfile, inputs, *out_reg)
+        sub.vm.compact_owned_traces();
+        sub.vm.bind_trace_cursors();
+        vm::execute_epoch_multi(&mut sub.vm, inputs)
     }
 
     /// True ⇒ the caller must return `None`: an empty epoch this program cannot

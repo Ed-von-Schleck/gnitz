@@ -16,7 +16,7 @@
 //! product, which is what a replay over the two trace integrals computes.
 
 use super::*;
-use crate::query::compiler::{Hydration, PlanShape};
+use crate::query::compiler::{HydrationSeed, PlanShape};
 use crate::storage::PkSetGather;
 
 impl DagEngine {
@@ -72,14 +72,10 @@ impl DagEngine {
         // shard state. A linear circuit owns no trace table, so this is a no-op
         // there.
         sub.vm.bind_trace_cursors();
-        let (start_pc, in_reg) = match hydration {
-            Hydration::Relation { in_reg, .. } => (0, in_reg),
-            Hydration::Join { start_pc, in_reg, .. } => (start_pc, in_reg),
-        };
-        let seed_schema = sub.vm.program.reg_meta[in_reg as usize].schema;
+        let seed_schema = sub.vm.program.reg_meta[hydration.in_reg as usize].schema;
         // The gather opens over the range its own key list spans.
-        let mut gather = match hydration {
-            Hydration::Relation { source, .. } => {
+        let mut gather = match hydration.seed {
+            HydrationSeed::Relation(source) => {
                 let entry = self
                     .tables
                     .get(&source)
@@ -89,8 +85,8 @@ impl DagEngine {
                 // the source directly.
                 PkSetGather::open(keys, seed_schema, |s, e| entry.open_cursor_in_range(s, e))
             }
-            Hydration::Join { seed_table, .. } => {
-                let trace = sub.vm.program.table_mut(seed_table);
+            HydrationSeed::Trace(seed_table) => {
+                let trace = sub.vm.table(seed_table);
                 PkSetGather::open(keys, seed_schema, |s, e| trace.open_cursor_in_range(s, e))
             }
         };
@@ -100,16 +96,8 @@ impl DagEngine {
             // hydration starts clean and leaves nothing a later epoch can read
             // (the next epoch clears again and re-binds its trace cursors through
             // `bind_trace_cursors`).
-            let SubPlan { vm, out_reg, .. } = &mut *sub;
-            let produced = vm::execute_epoch_from(
-                &vm.program,
-                &mut vm.regfile,
-                std::iter::once((in_reg, seed)),
-                *out_reg,
-                start_pc,
-                true,
-            )
-            .map_err(|e| format!("hydrate: view {view_id} replay failed: {e}"))?;
+            let produced = vm::execute_epoch_replay(&mut sub.vm, (hydration.in_reg, seed), hydration.start_pc)
+                .map_err(|e| format!("hydrate: view {view_id} replay failed: {e}"))?;
             if let Some(b) = produced {
                 debug_assert!(
                     b.schema.same_physical_layout(&view_schema),

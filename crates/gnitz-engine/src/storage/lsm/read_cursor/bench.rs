@@ -850,8 +850,8 @@ fn read_cursor_advance_to_multi_bench() {
 
 /// Bench 3 — the slow path the fast path avoids, each arm mapped to a real caller.
 /// `fwd-single`/`fwd-pair`: the absolute-reposition drive a low-run / freshly-
-/// compacted table takes. `eq-multi`: the `key == current_pk` loser-tree rebuild
-/// (two `Vec` allocations). `bwd-single`: the bounded-backward `[0, hint)` leaf
+/// compacted table takes. `eq-multi`: the `key == current_pk` loser-tree rebuild,
+/// which reuses both buffers and allocates nothing. `bwd-single`: the bounded-backward `[0, hint)` leaf
 /// gallop — the range-join `Lt/Le, n_eq==0` reset that re-seeks to the minimum
 /// every row. A first-class guardrail: a fast-path win must not silently regress
 /// these.

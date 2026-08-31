@@ -1107,9 +1107,9 @@ impl WorkerProcess {
 
         // Steady-state ticks must keep passing a 0 pad bit (see do_exchange_wait).
         self.exchange.backfill_pad = None;
-        // Release the last chunk's pinned delta registers. This loop drives only
-        // `view_id`, so that is the one regfile it can have pinned.
-        self.cat().dag_mut().clear_view_regfile_deltas(view_id);
+        // Release the last chunk's pinned delta registers and trace cursors. This
+        // loop drives only `view_id`, so that is the one regfile it can have pinned.
+        self.cat().dag_mut().release_view_regfile_deltas(view_id);
         // `backfill_view_step` bypasses the closure driver's per-view flush, so
         // flush the view's output trace once after the final chunk. Only when it
         // produced rows (the first source of a join produces none — it just

@@ -464,10 +464,19 @@ impl Table {
 
     /// The heap-resident runs, newest tier first. No guard partitions them, so
     /// every walk takes them whole however narrow its key bound.
+    ///
+    /// The two tiers are chained rather than flat-mapped so the iterator carries
+    /// an exact lower bound: `FlatMap::size_hint` is `0`, and `from_runs` sizes
+    /// its two vectors off that — a RAM-resident trace would otherwise walk the
+    /// realloc ladder on every cursor open.
     fn mem_runs(&self) -> impl Iterator<Item = Run> + '_ {
-        self.ram_tiers()
-            .into_iter()
-            .flat_map(|set| set.runs().iter().cloned().map(Run::Mem))
+        let [memtable, ram_tier] = self.ram_tiers();
+        memtable
+            .runs()
+            .iter()
+            .chain(ram_tier.runs().iter())
+            .cloned()
+            .map(Run::Mem)
     }
 
     /// Every run this table reads through, newest tier first.
