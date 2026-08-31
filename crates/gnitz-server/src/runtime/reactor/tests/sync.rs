@@ -1,4 +1,4 @@
-//! The single-threaded async primitives: `oneshot`, `mpsc`, `AsyncMutex`,
+//! The single-threaded async primitives: `oneshot`, `chan`, `AsyncMutex`,
 //! `AsyncRwLock`, `join_all_unpin` and the cancellation shapes each must
 //! survive.
 
@@ -8,7 +8,7 @@ use super::super::test_support::*;
 use super::super::*;
 
 // ------------------------------------------------------------------
-// Primitives: oneshot / mpsc / AsyncMutex / AsyncRwLock
+// Primitives: oneshot / chan / AsyncMutex / AsyncRwLock
 // ------------------------------------------------------------------
 
 #[test]
@@ -31,17 +31,17 @@ fn oneshot_deliver_value() {
 #[test]
 fn oneshot_sender_drop_cancels() {
     let r = make_reactor();
-    let err: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
-    let err2 = Rc::clone(&err);
+    let cancelled: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
+    let cancelled2 = Rc::clone(&cancelled);
     let (tx, rx) = oneshot::channel::<i32>();
     r.spawn(async move {
         let res = rx.await;
-        err2.set(res.is_err());
+        cancelled2.set(res.is_none());
     });
     r.tick(false);
     drop(tx);
     r.block_until_idle();
-    assert!(err.get(), "dropping sender must produce Cancelled");
+    assert!(cancelled.get(), "dropping the sender must resolve the receiver to None");
 }
 
 /// Sending to a cancelled receiver is not an error and never was to any caller:
@@ -61,17 +61,17 @@ fn oneshot_send_to_dropped_receiver_is_a_noop() {
     assert!(dropped.get(), "the undeliverable value must be dropped, not leaked");
 }
 
+/// The last sender's drop is what ends the stream: `recv()` resolves to `None`,
+/// which is how the committer's and the tick loop's `run` loops shut down.
 #[test]
-fn mpsc_multi_senders() {
+fn chan_sender_drop_ends_the_stream() {
     let r = make_reactor();
     let got: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(Vec::new()));
     let got2 = Rc::clone(&got);
-    let (tx, mut rx) = mpsc::unbounded::<i32>();
-    let tx2 = tx.clone();
+    let (tx, mut rx) = chan::unbounded::<i32>();
     tx.send(10);
-    tx2.send(20);
+    tx.send(20);
     drop(tx);
-    drop(tx2);
     r.block_on(async move {
         while let Some(v) = rx.recv().await {
             got2.borrow_mut().push(v);
@@ -88,7 +88,7 @@ fn mpsc_multi_senders() {
 fn async_mutex_serializes_access() {
     let r = make_reactor();
     let order: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
-    let mutex: Rc<AsyncMutex> = Rc::new(AsyncMutex::new());
+    let mutex: Rc<AsyncMutex> = Rc::new(AsyncMutex::default());
     for i in 0u32..3 {
         let m = Rc::clone(&mutex);
         let ord = Rc::clone(&order);
@@ -111,7 +111,7 @@ fn async_rwlock_multiple_readers() {
     let r = make_reactor();
     let active: Rc<StdCell<u32>> = Rc::new(StdCell::new(0));
     let max: Rc<StdCell<u32>> = Rc::new(StdCell::new(0));
-    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::new());
+    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
     for _ in 0..4 {
         let l = Rc::clone(&lock);
         let a = Rc::clone(&active);
@@ -135,7 +135,7 @@ fn async_rwlock_multiple_readers() {
 fn async_rwlock_writer_waits_for_readers() {
     let r = make_reactor();
     let order: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
-    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::new());
+    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
     let l1 = Rc::clone(&lock);
     let o1 = Rc::clone(&order);
     r.spawn(async move {
@@ -158,14 +158,13 @@ fn async_rwlock_writer_waits_for_readers() {
     assert!(r_end_pos < w_start_pos, "writer must run after reader finishes: {o:?}");
 }
 
-/// A `LockFuture` dropped while parked (e.g. via `select2`) leaves a
-/// stale waker in `AsyncMutex::waiters`.  `release()` must not pop
-/// exactly one waker — doing so risks consuming the stale entry and
-/// leaving all live waiters permanently blocked.
+/// A `WriteFuture` dropped while parked (e.g. via `select2`) leaves a stale
+/// waker behind. The release path must wake every candidate — handing the lock
+/// to that one entry alone would block every live waiter forever.
 #[test]
 fn async_mutex_cancelled_waiter_does_not_block_remaining() {
     let r = make_reactor();
-    let mutex: Rc<AsyncMutex> = Rc::new(AsyncMutex::new());
+    let mutex: Rc<AsyncMutex> = Rc::new(AsyncMutex::default());
     let done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
 
     // Task A: holds the mutex, yields once (letting B and C park), then releases.
@@ -176,9 +175,9 @@ fn async_mutex_cancelled_waiter_does_not_block_remaining() {
     });
 
     // Task B: races lock acquisition against an immediately-ready future.
-    // `select2` polls the LockFuture first (it parks its waker inside
-    // `waiters`), then `ready()` resolves. The LockFuture is dropped,
-    // but its stale waker remains in the queue.
+    // `select2` polls the lock future first (it parks its waker), then
+    // `ready()` resolves. The lock future is dropped, but its stale waker
+    // remains in the queue.
     let m_b = Rc::clone(&mutex);
     r.spawn(async move {
         let _ = select2(m_b.lock(), std::future::ready(())).await;
@@ -203,13 +202,12 @@ fn async_mutex_cancelled_waiter_does_not_block_remaining() {
 }
 
 /// A `WriteFuture` dropped while parked leaves a stale waker in
-/// `AsyncRwLock::write_waiters`.  `release_write()` popping exactly
-/// one waker risks consuming the stale entry and leaving all remaining
-/// live write waiters permanently blocked.
+/// `write_waiters`. Handing the lock to exactly one queued waker risks
+/// picking the stale entry and leaving every live write waiter blocked.
 #[test]
 fn async_rwlock_cancelled_write_waiter_does_not_block_remaining() {
     let r = make_reactor();
-    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::new());
+    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
     let done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
 
     // Task A: holds the write lock, yields once, then releases.
@@ -245,6 +243,43 @@ fn async_rwlock_cancelled_write_waiter_does_not_block_remaining() {
     );
 }
 
+/// The stale entry a cancelled write waiter leaves behind must not divert the
+/// handoff away from a parked *reader*: a release that sees a non-empty
+/// `write_waiters` but no live writer has to fall through to the readers, or
+/// they wait for the next write cycle — on the catalog lock, the next DDL.
+#[test]
+fn async_rwlock_cancelled_write_waiter_unblocks_pending_reader() {
+    let r = make_reactor();
+    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
+    let done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
+
+    // Task A: holds the WRITE lock, yields once, then releases.
+    let l_a = Rc::clone(&lock);
+    r.spawn(async move {
+        let _g = l_a.write().await;
+        YieldOnce::new().await;
+    });
+
+    // Task B: parks a WriteFuture, then cancels it — writers_waiting drops back
+    // to 0 while the waker stays queued.
+    let l_b = Rc::clone(&lock);
+    r.spawn(async move {
+        let _ = select2(l_b.write(), std::future::ready(())).await;
+    });
+
+    // Task C: a reader parked behind A. Nothing else writes this lock again, so
+    // A's release is C's only chance to be woken.
+    let l_c = Rc::clone(&lock);
+    let d = Rc::clone(&done);
+    r.spawn(async move {
+        let _g = l_c.read().await;
+        d.set(true);
+    });
+
+    r.block_until_idle();
+    assert!(done.get(), "the reader must acquire once the write guard is released");
+}
+
 // ─────────────────────────────────────────────────────────────────
 // AsyncRwLock writer-preference: new readers blocked by a parked
 // writer.
@@ -255,7 +290,7 @@ fn async_rwlock_cancelled_write_waiter_does_not_block_remaining() {
 #[test]
 fn async_rwlock_new_readers_blocked_by_waiting_writer() {
     let r = make_reactor();
-    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::new());
+    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
     let order: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
 
     // Task A: holds read lock, yields once.
@@ -294,13 +329,12 @@ fn async_rwlock_new_readers_blocked_by_waiting_writer() {
     );
 }
 
-/// WriteFuture::Drop path 3: readers hold the lock, the dropped
-/// WriteFuture was the LAST live write waiter. Pending readers
-/// blocked by `writers_waiting > 0` must be unblocked.
+/// Readers hold the lock and the cancelled WriteFuture was the last live write
+/// waiter: the readers `writers_waiting > 0` was blocking must now enter.
 #[test]
 fn async_rwlock_last_write_waiter_cancelled_unblocks_pending_readers() {
     let r = make_reactor();
-    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::new());
+    let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
     let done: Rc<StdCell<bool>> = Rc::new(StdCell::new(false));
 
     // cancel channel: dropping the sender unblocks select2 in Task B.
@@ -336,12 +370,70 @@ fn async_rwlock_last_write_waiter_cancelled_unblocks_pending_readers() {
     }
     assert!(!done.get(), "C must be blocked while write waiter B is alive");
 
-    // Cancel B: WriteFuture::Drop path 3 must wake C.
+    // Cancel B: dropping the last live write waiter must wake C.
     drop(cancel_tx);
     for _ in 0..5 {
         r.tick(false);
     }
     assert!(done.get(), "C must unblock when the last write waiter (B) is cancelled");
+}
+
+/// The reader/writer/cancellation state space, enumerated rather than sampled:
+/// every task mix over the four shapes, for every length up to `MAX_TASKS`.
+/// Whatever the mix, every task must run to completion and the lock must end
+/// holding nothing.
+///
+/// The three counters are the whole assertion — the waiter queues legitimately
+/// retain stale wakers at rest, so an empty-queue check would be wrong.
+#[test]
+fn async_rwlock_every_task_mix_finishes_and_leaves_the_lock_idle() {
+    const SHAPES: u32 = 4;
+    const MAX_TASKS: u32 = 6;
+
+    // One reactor for every mix: each drains to an empty task slab before the
+    // next starts, and a fresh io_uring per mix exhausts RLIMIT_MEMLOCK long
+    // before the enumeration ends.
+    let r = make_reactor();
+
+    for len in 2..=MAX_TASKS {
+        for mix in 0..SHAPES.pow(len) {
+            let lock: Rc<AsyncRwLock> = Rc::new(AsyncRwLock::default());
+            let done: Rc<StdCell<usize>> = Rc::new(StdCell::new(0));
+
+            for i in 0..len {
+                let l = Rc::clone(&lock);
+                let d = Rc::clone(&done);
+                match (mix / SHAPES.pow(i)) % SHAPES {
+                    // Hold the lock across an await, so the rest must park.
+                    0 => r.spawn(async move {
+                        let _g = l.read().await;
+                        YieldOnce::new().await;
+                        d.set(d.get() + 1);
+                    }),
+                    1 => r.spawn(async move {
+                        let _g = l.write().await;
+                        YieldOnce::new().await;
+                        d.set(d.get() + 1);
+                    }),
+                    // Cancel the acquire: the loser's Drop is the whole point.
+                    2 => r.spawn(async move {
+                        let _ = select2(l.write(), std::future::ready(())).await;
+                        d.set(d.get() + 1);
+                    }),
+                    _ => r.spawn(async move {
+                        let _ = select2(l.read(), std::future::ready(())).await;
+                        d.set(d.get() + 1);
+                    }),
+                };
+            }
+
+            // `block_until_idle` panics on a lost wake; these catch a task that
+            // finished without acquiring, and a guard that leaked its state.
+            r.block_until_idle();
+            assert_eq!(done.get(), len as usize, "mix {mix} of {len}: a task never ran");
+            assert!(lock.is_quiescent(), "mix {mix} of {len}: the lock did not end idle");
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -359,12 +451,12 @@ fn join_all_unpin_empty_returns_empty_vec() {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// mpsc::try_recv: non-blocking drain used by the committer.
+// chan::try_recv: non-blocking drain used by the committer.
 // ─────────────────────────────────────────────────────────────────
 
 #[test]
-fn mpsc_try_recv_drains_queue_without_blocking() {
-    let (tx, mut rx) = mpsc::unbounded::<i32>();
+fn chan_try_recv_drains_queue_without_blocking() {
+    let (tx, mut rx) = chan::unbounded::<i32>();
     tx.send(10);
     tx.send(20);
     tx.send(30);

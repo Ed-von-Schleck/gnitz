@@ -110,7 +110,7 @@ impl Future for ReplyFuture {
 /// its ring space.
 pub(super) type ScanRoute = WakeQueue<W2mSlot>;
 
-pub(super) struct ScanSlotFuture {
+pub struct ScanSlotFuture {
     pub(super) req_id: u32,
     pub(super) inner: Rc<ReactorShared>,
 }
@@ -368,7 +368,7 @@ impl Drop for RawRecvFuture {
     }
 }
 
-// (oneshot, mpsc, AsyncMutex, AsyncRwLock, join_all, select2 live in sync.rs)
+// (oneshot, chan, AsyncMutex, AsyncRwLock, join_into, select2 live in sync.rs)
 
 #[cfg(test)]
 #[path = "tests/futures.rs"]

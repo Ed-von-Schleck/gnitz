@@ -2,7 +2,7 @@
 //!
 //! [`super::park::ParkMap`] is the one-shot half of the same job. This is the
 //! other half — accepted connections, a worker's continuation frames, inbound
-//! client frames, exchange frames and `mpsc` — each of which would otherwise
+//! client frames, exchange frames and `chan` — each of which would otherwise
 //! spell out its own queue, waker slot and end-of-stream flag.
 //!
 //! No interior mutability: every user already holds one behind a `RefCell`.
@@ -14,7 +14,7 @@ pub(super) struct WakeQueue<T> {
     queue: VecDeque<T>,
     /// The one awaiter parked on this queue. One, not a list: every user is a
     /// single consumer — one accept loop, one scan awaiter, one connection
-    /// handler, one relay task, one `mpsc::Receiver`.
+    /// handler, one relay task, one `chan::Receiver`.
     waker: Option<Waker>,
     /// No further value will be pushed, so a drained queue resolves to `None`
     /// rather than parking. Never set by the users whose stream has no end

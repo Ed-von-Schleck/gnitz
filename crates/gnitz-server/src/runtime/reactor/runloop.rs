@@ -270,8 +270,8 @@ unsafe fn waker_wake(data: *const ()) {
         let ptr = p.get();
         if ptr.is_null() {
             // Reactor torn down; the wake has nowhere to land. This is
-            // reached when `sync.rs` Drop chains (oneshot / mpsc /
-            // AsyncMutexGuard / WriteGuard) fire `waker.wake()` while
+            // reached when `sync.rs` Drop chains (oneshot / chan /
+            // WriteGuard / ReadGuard) fire `waker.wake()` while
             // the reactor is being dropped. Silent no-op.
             return;
         }

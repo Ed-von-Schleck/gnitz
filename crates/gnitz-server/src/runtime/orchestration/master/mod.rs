@@ -76,7 +76,7 @@ pub struct MasterDispatcher {
     /// skipped with no error anywhere.
     ///
     /// **Non-reentrant**: never `.await` anything that re-acquires it.
-    sal_writer_excl: Rc<AsyncMutex>,
+    sal_writer_excl: AsyncMutex,
     /// Per-worker wakeup eventfds, in worker order. Signalling is not framing:
     /// the SAL writer decides a group's shape from its own worker count, and this
     /// only tells the workers to go look.

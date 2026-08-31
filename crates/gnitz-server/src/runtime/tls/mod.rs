@@ -48,7 +48,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::runtime::reactor::io::{self, RecvBuf};
-use crate::runtime::reactor::{guard_egress_deadline, mpsc, shutdown, AsyncMutex, Reactor};
+use crate::runtime::reactor::{chan, guard_egress_deadline, shutdown, AsyncMutex, Reactor};
 
 /// Per-connection TLS state, behind `TlsShared::state`. Never borrowed
 /// across an await.
@@ -155,14 +155,14 @@ pub(crate) struct TlsShared {
     /// record-order invariant. Teardown never *acquires* it (lock-free
     /// `shutdown` aborts a parked holder instead), so it can
     /// never wedge teardown.
-    send_mutex: Rc<AsyncMutex>,
+    send_mutex: AsyncMutex,
     /// Ciphertext staging buffer reused across sends (capacity retained).
     /// One buffer serves the flusher and every sender because they all
     /// serialize under `send_mutex`; it is unowned whenever the mutex is
     /// free, and the next take clears it.
     cipher_scratch: RefCell<Vec<u8>>,
     /// Wakes the flusher task.
-    flush_tx: mpsc::Sender<()>,
+    flush_tx: chan::Sender<()>,
 }
 
 /// What every accepted TLS socket wants, set here so the accept loop needs no
@@ -201,7 +201,7 @@ impl TlsShared {
         // success it lives in the returned `TlsShared`.
         let sess = rustls::ServerConnection::new(cfg)?;
         set_socket_options(fd);
-        let (flush_tx, flush_rx) = mpsc::unbounded::<()>();
+        let (flush_tx, flush_rx) = chan::unbounded::<()>();
         let conn = Rc::new(TlsShared {
             state: RefCell::new(TlsConn::new(sess, Rc::clone(reactor.inbound()))),
             reactor,
@@ -209,7 +209,7 @@ impl TlsShared {
             // again — on the error path above it closes it and returns instead.
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
             _conn_guard: conn_guard,
-            send_mutex: Rc::new(AsyncMutex::new()),
+            send_mutex: AsyncMutex::default(),
             cipher_scratch: RefCell::new(Vec::new()),
             flush_tx,
         });
@@ -384,7 +384,7 @@ async fn read_pump(conn: Rc<TlsShared>) {
 /// its send under `send_mutex`. Teardown (`shutdown`) is lock-free: it
 /// never *acquires* the mutex, so a writer parked in a send can never
 /// wedge it.
-async fn flusher(conn: Rc<TlsShared>, mut rx: mpsc::Receiver<()>) {
+async fn flusher(conn: Rc<TlsShared>, mut rx: chan::Receiver<()>) {
     loop {
         // Extract AND ship whatever ciphertext rustls has queued: handshake
         // flights, KeyUpdate responses, alerts, a close_notify queued by

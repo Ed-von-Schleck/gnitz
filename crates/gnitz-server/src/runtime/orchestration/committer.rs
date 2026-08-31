@@ -2,7 +2,8 @@
 //!
 //! Owns the `sal.write_ingest + fdatasync + per-worker push ACK`
 //! sequence for every user-table INSERT/UPSERT. Receives commit
-//! requests via `mpsc` and batches them with a debounce timer.
+//! requests via `chan` and batches whatever is already queued behind the
+//! first — see **Batching** below; there is no debounce timer.
 //!
 //! Design notes:
 //!
@@ -26,7 +27,7 @@
 use super::executor::{Shared, TickTrigger};
 use super::guard_panic;
 use crate::runtime::master::{await_worker_acks, first_worker_error_opt, TxnFamily};
-use crate::runtime::reactor::{join_into, mpsc, oneshot, select2, Either, ReplyFuture, ReplyLease};
+use crate::runtime::reactor::{chan, join_into, oneshot, select2, Either, ReplyFuture, ReplyLease};
 use crate::runtime::sal::{GroupTargets, SalFit, SalMessageKind, ZoneMark};
 use crate::runtime::wire::DecodedWire;
 use gnitz_engine::foundation::fault::Seam;
@@ -116,7 +117,7 @@ pub struct PendingPush {
 /// For checkpoint flush rounds the lock is held across the ENTIRE round
 /// (write + ACK wait + reset; see `flush_round`), but released across the
 /// sequence's drain step so the tick loop can acquire it per tick.
-pub async fn run(mut rx: mpsc::Receiver<CommitRequest>, shared: Rc<Shared>) {
+pub async fn run(mut rx: chan::Receiver<CommitRequest>, shared: Rc<Shared>) {
     // `commit_pushes`' ACK scratch, reused across every commit to avoid a
     // per-commit Vec<ReplyFuture> + Vec<Option<DecodedWire>> pair. Sized for one
     // group's ACKs; commit_pushes grows them on the first multi-group batch and
@@ -223,7 +224,7 @@ struct PendingBatch {
 /// cost paid only by serial single-request clients, so we skip it
 /// entirely and rely on pipelined clients to enqueue fast enough that
 /// `try_recv` sees a non-empty queue.
-fn drain_ready_batch(rx: &mut mpsc::Receiver<CommitRequest>, first: CommitRequest) -> PendingBatch {
+fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitRequest) -> PendingBatch {
     let mut pushes = Vec::new();
     let mut txns: Vec<PendingTxn> = Vec::new();
     let mut barriers = Vec::new();
@@ -329,7 +330,7 @@ async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) -> Result<
 /// hangs its writer. The lock is released across the step-2 drain because the
 /// tick task re-acquires it per tick.
 async fn run_checkpoint_sequence(
-    rx: &mut mpsc::Receiver<CommitRequest>,
+    rx: &mut chan::Receiver<CommitRequest>,
     shared: &Rc<Shared>,
     batch: &mut PendingBatch,
 ) {
@@ -418,7 +419,7 @@ async fn run_checkpoint_sequence(
 /// whether the sequence's ephemeral round may run.
 async fn await_servicing<T>(
     target_rx: oneshot::Receiver<T>,
-    rx: &mut mpsc::Receiver<CommitRequest>,
+    rx: &mut chan::Receiver<CommitRequest>,
     batch: &mut PendingBatch,
     shared: &Rc<Shared>,
 ) -> Option<T> {
@@ -427,7 +428,7 @@ async fn await_servicing<T>(
     loop {
         match select2(&mut target, rx.recv()).await {
             // Target fired (drain done / quiesce acked), or the channel closed.
-            Either::A(v) => return v.ok(),
+            Either::A(v) => return v,
             Either::B(None) => return None,
             Either::B(Some(CommitRequest::Barrier {
                 kind: BarrierKind::Reclaim { forced },

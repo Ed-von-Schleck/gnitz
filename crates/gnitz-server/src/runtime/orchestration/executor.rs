@@ -34,7 +34,7 @@ use crate::runtime::master::{
 };
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{
-    mpsc, oneshot, select2, AsyncRwLock, Either, FsyncFuture, Reactor, ReadGuard, ReplyFuture, WriteGuard,
+    chan, oneshot, select2, AsyncRwLock, Either, FsyncFuture, Reactor, ReadGuard, ReplyFuture, WriteGuard,
 };
 use crate::runtime::sal::{GroupTargets, SalFit, SalMessageKind};
 use crate::runtime::wire::{self as ipc, validate_schema_match, SchemaWithVersion, BACKFILL_DECISION_CONTINUE};
@@ -102,8 +102,8 @@ pub enum TickTrigger {
 /// enters its own window while the first is still in its.
 struct TickGate {
     /// Dropped by the field glue right after `Drop::drop` lowers the depth. The
-    /// tick loop's `release.await` resolves `Err(Cancelled)` on that drop, which
-    /// is the release signal — no explicit send needed.
+    /// tick loop's `release.await` resolves `None` on that drop, which is the
+    /// release signal — no explicit send needed.
     _release: oneshot::Sender<()>,
     shared: Rc<Shared>,
 }
@@ -160,11 +160,11 @@ async fn await_barrier(shared: &Shared, kind: BarrierKind) {
 pub struct Shared {
     pub reactor: Rc<Reactor>,
     dispatcher: Rc<MasterDispatcher>,
-    committer_tx: mpsc::Sender<CommitRequest>,
+    committer_tx: chan::Sender<CommitRequest>,
     catalog_rwlock: Rc<AsyncRwLock>,
     /// Tick trigger sender; senders include the committer (auto-trigger on
     /// threshold cross) and SCAN (explicit drain).
-    pub(super) tick_tx: mpsc::Sender<TickTrigger>,
+    pub(super) tick_tx: chan::Sender<TickTrigger>,
     /// Zone-LSN allocation high-water + durability watermark, read by the
     /// committer so SCAN/SEEK handlers report the same LSN it assigns.
     pub(super) lsn_alloc: ZoneLsnAllocator,
@@ -263,7 +263,7 @@ impl Shared {
         if let Some(l) = locks.get(&tid) {
             return Rc::clone(l);
         }
-        let l = Rc::new(AsyncRwLock::new());
+        let l = Rc::new(AsyncRwLock::default());
         locks.insert(tid, Rc::clone(&l));
         l
     }
@@ -402,13 +402,13 @@ impl ServerExecutor {
         // current_lsn assignment monotonic across restarts.
         let initial_lsn = dispatcher.cat().max_table_current_lsn();
 
-        let (committer_tx, committer_rx) = mpsc::unbounded::<CommitRequest>();
-        let (tick_tx, tick_rx) = mpsc::unbounded::<TickTrigger>();
+        let (committer_tx, committer_rx) = chan::unbounded::<CommitRequest>();
+        let (tick_tx, tick_rx) = chan::unbounded::<TickTrigger>();
         let shared = Rc::new(Shared {
             reactor: Rc::clone(&reactor),
             dispatcher,
             committer_tx,
-            catalog_rwlock: Rc::new(AsyncRwLock::new()),
+            catalog_rwlock: Rc::new(AsyncRwLock::default()),
             tick_tx,
             lsn_alloc: ZoneLsnAllocator::new(initial_lsn),
             last_tick_lsn: Cell::new(initial_lsn),
@@ -724,7 +724,7 @@ async fn watchdog(shared: Rc<Shared>) {
 /// Task liveness: the outer loop body is wrapped so a failure in one
 /// trigger only fails that trigger, not the loop. SAL emission is
 /// further guarded by `guard_panic` inside `run_tick`.
-async fn tick_loop(shared: Rc<Shared>, mut rx: mpsc::Receiver<TickTrigger>) {
+async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
     let nw = shared.disp().num_workers();
     let mut fut_slots: Vec<ReplyFuture> = Vec::with_capacity(nw);
     let mut ack_slots: Vec<Option<ipc::DecodedWire>> = Vec::with_capacity(nw);
@@ -1304,7 +1304,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
         done: tx,
     }));
     match rx.await {
-        Ok(Ok(zone_lsn)) => {
+        Some(Ok(zone_lsn)) => {
             // Record the commit LSN for OCC while the table-lock guard is still
             // held (a concurrent precondition check reads it under the write guard
             // on the same lock, which excludes this one, so the bump lands before
@@ -1333,8 +1333,8 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
             )
             .await;
         }
-        Ok(Err(fault)) => send_fault(peer, target_id, client_id, &fault).await,
-        Err(_) => send_error(peer, target_id, client_id, b"committer shut down").await,
+        Some(Err(fault)) => send_fault(peer, target_id, client_id, &fault).await,
+        None => send_error(peer, target_id, client_id, b"committer shut down").await,
     }
 }
 
@@ -1521,7 +1521,7 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
         .send(CommitRequest::Txn(PendingTxn { families, done: tx }));
     // Double `?`: the outer unwraps a channel cancel, the inner a committer
     // `Err` — so the bump below is reached ONLY on a successful commit.
-    let lsn = rx.await.map_err(|_| "committer shut down")??;
+    let lsn = rx.await.ok_or("committer shut down")??;
 
     // 7. Record the commit LSN for every family tid while the table locks are
     //    still held (`_tlocks` in scope), so a later same-tid txn cannot pass its
@@ -1882,7 +1882,7 @@ async fn drain_pending_ticks(shared: &Rc<Shared>) -> Result<(), String> {
     let (tx, rx) = oneshot::channel::<Result<(), String>>();
     shared.tick_tx.send(TickTrigger::Drain { done: tx });
     // A cancelled receiver means the tick loop is gone; treat it as done.
-    if let Ok(Err(e)) = rx.await {
+    if let Some(Err(e)) = rx.await {
         return Err(e);
     }
     Ok(())

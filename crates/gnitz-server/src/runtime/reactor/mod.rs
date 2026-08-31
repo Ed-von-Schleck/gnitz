@@ -19,6 +19,9 @@
 //! - Everything that awaits the *next* of many — an accepted connection, a
 //!   scan's continuation frames, an exchange frame, a completed inbound client
 //!   frame — queues in a [`wake_queue::WakeQueue`].
+//! - Those two are the shared mechanisms; [`sync`]'s primitives park their own
+//!   wakers besides — a set per mode for the locks, an inline slot for
+//!   `oneshot`.
 //! - CQE `user_data` packs an 8-bit kind tag in the high byte and a
 //!   56-bit id in the low bits, where id is a request/op id (not an fd,
 //!   except for accept and recv, which route on the fd itself). Safe from
@@ -57,7 +60,7 @@ mod futures;
 pub mod io;
 mod park;
 mod runloop;
-pub mod sync;
+mod sync;
 #[cfg(test)]
 mod test_support;
 mod uring;
@@ -75,7 +78,7 @@ use wake_queue::WakeQueue;
 
 pub use io::RecvBuf;
 pub use sync::{
-    join_all_unpin, join_into, mpsc, oneshot, select2, AsyncMutex, AsyncRwLock, Either, ReadGuard, WriteGuard,
+    chan, join_all_unpin, join_into, oneshot, select2, AsyncMutex, AsyncRwLock, Either, ReadGuard, WriteGuard,
 };
 
 // ---------------------------------------------------------------------------
@@ -478,7 +481,11 @@ impl Reactor {
     /// `internal_req_id`. The scan-intercept path in `drain_w2m_for_worker`
     /// fires it ahead of flag-based routing so scan response frames are
     /// never decoded into `Batch` on the master side.
-    pub fn await_scan_slot(&self, req_id: u32) -> impl Future<Output = W2mSlot> {
+    ///
+    /// Concrete, not `impl Future`, so `join_all_unpin`'s `F: Unpin` binds to
+    /// the definition: behind `impl Future` a new `!Unpin` field would error at
+    /// the fan-out call site instead of here.
+    pub fn await_scan_slot(&self, req_id: u32) -> ScanSlotFuture {
         ScanSlotFuture {
             req_id,
             inner: Rc::clone(&self.inner),

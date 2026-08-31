@@ -97,7 +97,7 @@ impl MasterDispatcher {
             num_workers,
             worker_pids: RefCell::new(worker_pids),
             sal,
-            sal_writer_excl: Rc::new(AsyncMutex::new()),
+            sal_writer_excl: AsyncMutex::default(),
             m2w_efds,
             w2m,
             catalog,
@@ -128,7 +128,7 @@ impl MasterDispatcher {
     /// `AsyncMutex::lock` clones the `Rc` into its future and the guard owns one,
     /// so `disp.sal_excl().lock().await` holds no borrow of the dispatcher across
     /// the await.
-    pub(crate) fn sal_excl(&self) -> &Rc<AsyncMutex> {
+    pub(crate) fn sal_excl(&self) -> &AsyncMutex {
         &self.sal_writer_excl
     }
 

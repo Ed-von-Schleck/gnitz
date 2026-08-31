@@ -436,9 +436,9 @@ fn a_dropped_awaiter_leaves_no_waker_in_any_wake_queue() {
     r.close_fd(read_end);
     unsafe { libc::close(write_end) };
 
-    // The fifth user: an `mpsc::Receiver`, whose `RecvOne` a `select2` loser
+    // The fifth user: a `chan::Receiver`, whose `RecvOne` a `select2` loser
     // drops while parked.
-    let (tx, mut rx) = mpsc::unbounded::<u8>();
+    let (tx, mut rx) = chan::unbounded::<u8>();
     {
         let mut fut = Box::pin(rx.recv());
         assert!(fut.as_mut().poll(&mut cx).is_pending());
@@ -446,7 +446,20 @@ fn a_dropped_awaiter_leaves_no_waker_in_any_wake_queue() {
     tx.send(1);
     assert!(
         !r.inner.run_queue.borrow().is_queued(1),
-        "mpsc queue — a send after the receiver dropped must wake nobody"
+        "chan queue — a send after the receiver dropped must wake nobody"
+    );
+
+    // The sixth: a `oneshot::Receiver`, which parks its waker inline rather
+    // than in a `WakeQueue` but owes the same hygiene.
+    let (one_tx, one_rx) = oneshot::channel::<u8>();
+    {
+        let mut fut = Box::pin(one_rx);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+    }
+    one_tx.send(1);
+    assert!(
+        !r.inner.run_queue.borrow().is_queued(1),
+        "oneshot — a send after the receiver dropped must wake nobody"
     );
 }
 

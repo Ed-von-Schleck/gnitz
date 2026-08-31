@@ -1,41 +1,26 @@
-//! Async primitives for the reactor's single thread: `oneshot`, `mpsc`,
+//! Async primitives for the reactor's single thread: `oneshot`, `chan`,
 //! `AsyncMutex`, `AsyncRwLock`, `join_all_unpin` / `join_into` and `select2`.
 //!
 //! All `!Send` and `Rc<RefCell<_>>`-based on purpose: the reactor never leaves
 //! its thread, so a channel send costs no atomic and a waker registration no
 //! lock.
 
-use std::cell::{Cell, RefCell, RefMut};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-/// Push `waker` into `q` unless a waker already in the queue would wake
-/// the same task. A `LockFuture` / `ReadFuture` / `WriteFuture` that is
-/// polled N times before the lock is released would otherwise enqueue N
-/// wakers for the same task; release cycles then wake that task N times
-/// (wasted polls) and the reactor's run queue gets N duplicate entries.
-/// `will_wake` is a cheap pointer comparison on the waker vtable + data.
-fn push_unique_waker(q: &mut VecDeque<Waker>, waker: &Waker) {
-    if !q.iter().any(|existing| existing.will_wake(waker)) {
-        q.push_back(waker.clone());
-    }
-}
-
 // ---------------------------------------------------------------------------
 // oneshot
 // ---------------------------------------------------------------------------
 //
-// Single-threaded, cancellable. Used by the committer to send per-commit
-// results back to the handler that produced the push.
+// Single-threaded, cancellable: the committer's per-commit result back to the
+// handler that pushed, and the DDL window's release, which is sender-drop alone.
 
 pub mod oneshot {
     use super::*;
-
-    #[derive(Debug, PartialEq, Eq)]
-    pub struct Cancelled;
 
     struct State<T> {
         value: Option<T>,
@@ -82,74 +67,66 @@ pub mod oneshot {
     }
 
     impl<T> Future for Receiver<T> {
-        type Output = Result<T, Cancelled>;
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        /// `None` once the sender is gone without having sent — which the DDL
+        /// tick gate uses as its release signal rather than an explicit value.
+        type Output = Option<T>;
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
             let mut s = self.inner.borrow_mut();
             if let Some(v) = s.value.take() {
-                return Poll::Ready(Ok(v));
+                return Poll::Ready(Some(v));
             }
             if !s.sender_alive {
-                return Poll::Ready(Err(Cancelled));
+                return Poll::Ready(None);
             }
             s.waker = Some(cx.waker().clone());
             Poll::Pending
         }
     }
+
+    impl<T> Drop for Receiver<T> {
+        fn drop(&mut self) {
+            // Same hygiene every other parking awaiter in the reactor owes: a
+            // receiver that loses a `select2` must not leave a waker for the
+            // next `send` to fire.
+            self.inner.borrow_mut().waker = None;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// mpsc (unbounded)
+// chan (unbounded)
 // ---------------------------------------------------------------------------
 //
-// Used as the committer's request channel. Senders are cloneable; Drop
-// of the last sender returns `None` from the receiver.
+// The committer's and the tick loop's request channel. `chan`, not `spsc`:
+// many tasks send, reaching the one `Sender` through a shared `Rc<Shared>`.
+// It is that one — `Sender` is not cloneable — so its drop closes the queue and
+// the receiver's next `recv` resolves to `None`, which is how both loops exit.
 
-pub mod mpsc {
+pub mod chan {
     use super::*;
     use crate::runtime::reactor::wake_queue::WakeQueue;
 
-    struct State<T> {
-        queue: WakeQueue<T>,
-        senders: usize,
-    }
-
     pub struct Sender<T> {
-        inner: Rc<RefCell<State<T>>>,
+        inner: Rc<RefCell<WakeQueue<T>>>,
     }
     pub struct Receiver<T> {
-        inner: Rc<RefCell<State<T>>>,
+        inner: Rc<RefCell<WakeQueue<T>>>,
     }
 
     pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
-        let s = Rc::new(RefCell::new(State {
-            queue: WakeQueue::default(),
-            senders: 1,
-        }));
-        (Sender { inner: Rc::clone(&s) }, Receiver { inner: s })
-    }
-
-    impl<T> Clone for Sender<T> {
-        fn clone(&self) -> Self {
-            self.inner.borrow_mut().senders += 1;
-            Sender {
-                inner: Rc::clone(&self.inner),
-            }
-        }
+        let q = Rc::new(RefCell::new(WakeQueue::default()));
+        (Sender { inner: Rc::clone(&q) }, Receiver { inner: q })
     }
 
     impl<T> Sender<T> {
         pub fn send(&self, v: T) {
-            self.inner.borrow_mut().queue.push(v);
+            self.inner.borrow_mut().push(v);
         }
     }
 
     impl<T> Drop for Sender<T> {
         fn drop(&mut self) {
-            let mut s = self.inner.borrow_mut();
-            s.senders -= 1;
-            if s.senders == 0 {
-                s.queue.close();
-            }
+            self.inner.borrow_mut().close();
         }
     }
 
@@ -163,18 +140,18 @@ pub mod mpsc {
         /// to drain pipelined requests without paying the 1ms debounce
         /// timer when nothing more is available.
         pub fn try_recv(&mut self) -> Option<T> {
-            self.inner.borrow_mut().queue.pop()
+            self.inner.borrow_mut().pop()
         }
     }
 
     pub struct RecvOne<'a, T> {
-        inner: &'a Rc<RefCell<State<T>>>,
+        inner: &'a Rc<RefCell<WakeQueue<T>>>,
     }
 
     impl<T> Future for RecvOne<'_, T> {
         type Output = Option<T>;
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
-            self.inner.borrow_mut().queue.poll(cx)
+            self.inner.borrow_mut().poll(cx)
         }
     }
 
@@ -182,7 +159,7 @@ pub mod mpsc {
         fn drop(&mut self) {
             // Same hygiene every other `WakeQueue` awaiter owes: a `recv()` that
             // loses a `select2` must not leave a waker for the next `send` to fire.
-            self.inner.borrow_mut().queue.clear_waiter();
+            self.inner.borrow_mut().clear_waiter();
         }
     }
 }
@@ -192,68 +169,14 @@ pub mod mpsc {
 // ---------------------------------------------------------------------------
 
 /// Mutual exclusion with no payload: the guard is a drop token, and what it
-/// protects lives outside. Used where one task at a time must run a critical
-/// section that awaits inside it (SAL writer, client egress).
-pub struct AsyncMutex {
-    locked: Cell<bool>,
-    waiters: RefCell<VecDeque<Waker>>,
-}
+/// protects lives outside. Exposing no shared mode is the point — the SAL
+/// writer and the TLS send path would both compile, and both break, given one.
+#[derive(Default)]
+pub struct AsyncMutex(Rc<AsyncRwLock>);
 
 impl AsyncMutex {
-    pub fn new() -> Self {
-        AsyncMutex {
-            locked: Cell::new(false),
-            waiters: RefCell::new(VecDeque::new()),
-        }
-    }
-
-    pub fn lock(self: &Rc<Self>) -> LockFuture {
-        LockFuture { mutex: Rc::clone(self) }
-    }
-
-    fn release(&self) {
-        self.locked.set(false);
-        // Wake all waiters, not just one — same reason as `pass_baton`: a
-        // cancelled LockFuture can leave a stale waker in the queue, and
-        // popping exactly one risks handing the lock to it forever.
-        let waiters = std::mem::take(&mut *self.waiters.borrow_mut());
-        for w in waiters {
-            w.wake();
-        }
-    }
-}
-
-impl Default for AsyncMutex {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub struct LockFuture {
-    mutex: Rc<AsyncMutex>,
-}
-
-impl Future for LockFuture {
-    type Output = LockGuard;
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<LockGuard> {
-        if !self.mutex.locked.get() {
-            self.mutex.locked.set(true);
-            return Poll::Ready(LockGuard {
-                mutex: Rc::clone(&self.mutex),
-            });
-        }
-        push_unique_waker(&mut self.mutex.waiters.borrow_mut(), cx.waker());
-        Poll::Pending
-    }
-}
-
-pub struct LockGuard {
-    mutex: Rc<AsyncMutex>,
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        self.mutex.release();
+    pub fn lock(&self) -> WriteFuture {
+        self.0.write()
     }
 }
 
@@ -266,31 +189,40 @@ impl Drop for LockGuard {
 // Writer-preference blocks new readers as soon as a writer parks, so a
 // writer cannot starve behind a stream of readers.
 
+#[derive(Default)]
 struct RwLockInner {
     readers: usize,
     has_writer: bool,
+    /// Live parked `WriteFuture`s, counted off each future's own `parked` flag
+    /// and not off `write_waiters.len()`, which drops to 0 a wake before they do.
     writers_waiting: usize,
+    /// Wakers of parked futures. A cancelled future leaves its entry behind, so
+    /// these hold stale wakers at rest — never assert one empty, and never hand
+    /// the lock to a single entry out of one. [`AsyncRwLock::wake_next`] takes
+    /// the whole queue, which is what makes a stale entry harmless.
     read_waiters: VecDeque<Waker>,
     write_waiters: VecDeque<Waker>,
 }
 
+impl RwLockInner {
+    /// A reader may enter: no writer holds the lock and none is waiting, so a
+    /// stream of readers cannot starve a writer.
+    fn read_ok(&self) -> bool {
+        !self.has_writer && self.writers_waiting == 0
+    }
+
+    /// A writer may enter: nobody holds the lock in either mode.
+    fn write_ok(&self) -> bool {
+        !self.has_writer && self.readers == 0
+    }
+}
+
+#[derive(Default)]
 pub struct AsyncRwLock {
     inner: RefCell<RwLockInner>,
 }
 
 impl AsyncRwLock {
-    pub fn new() -> Self {
-        AsyncRwLock {
-            inner: RefCell::new(RwLockInner {
-                readers: 0,
-                has_writer: false,
-                writers_waiting: 0,
-                read_waiters: VecDeque::new(),
-                write_waiters: VecDeque::new(),
-            }),
-        }
-    }
-
     pub fn read(self: &Rc<Self>) -> ReadFuture {
         ReadFuture { lock: Rc::clone(self) }
     }
@@ -302,49 +234,48 @@ impl AsyncRwLock {
         }
     }
 
-    fn release_read(&self) {
-        let mut s = self.inner.borrow_mut();
-        s.readers -= 1;
-        if s.readers == 0 && s.writers_waiting > 0 {
-            wake_all(std::mem::take(&mut s.write_waiters), s);
+    /// Wake every future the current state now admits — writers first, readers
+    /// only when no writer waits. The whole queue, since it may hold stale
+    /// wakers; the first woken task to poll acquires and the rest re-park.
+    ///
+    /// Called by every transition that can admit someone: the two guard
+    /// releases and a cancelled `WriteFuture`. Miss one and its waiters park
+    /// until the next release, which for a reader behind the catalog lock means
+    /// until the next DDL.
+    fn wake_next(&self) {
+        // Scoped so the borrow cannot span the wakes: a wake re-enters the run
+        // queue and can drive a poll that borrows this state again.
+        let wakers = {
+            let mut s = self.inner.borrow_mut();
+            if s.write_ok() && s.writers_waiting > 0 {
+                std::mem::take(&mut s.write_waiters)
+            } else if s.read_ok() {
+                std::mem::take(&mut s.read_waiters)
+            } else {
+                VecDeque::new()
+            }
+        };
+        for w in wakers {
+            w.wake();
         }
     }
 
+    fn release_read(&self) {
+        self.inner.borrow_mut().readers -= 1;
+        self.wake_next();
+    }
+
     fn release_write(&self) {
-        let mut s = self.inner.borrow_mut();
-        s.has_writer = false;
-        pass_baton(s);
+        self.inner.borrow_mut().has_writer = false;
+        self.wake_next();
     }
-}
 
-/// Drop the lock-state borrow, then wake. Waking re-enters the reactor's run
-/// queue and may drive a poll that borrows this state again, so the borrow must
-/// be gone first.
-fn wake_all(wakers: VecDeque<Waker>, state: RefMut<'_, RwLockInner>) {
-    drop(state);
-    for w in wakers {
-        w.wake();
-    }
-}
-
-/// Hand the lock on to whoever is next: queued writers first (writer
-/// preference), readers only when none remain. Wakes *all* candidates rather
-/// than one — a cancelled future can leave a stale waker in the queue, and
-/// handing the baton to that one alone would block every live waiter forever.
-/// On a single-threaded executor the thundering herd is free: the first task to
-/// poll acquires and the rest re-park.
-fn pass_baton(mut state: RefMut<'_, RwLockInner>) {
-    let writers = std::mem::take(&mut state.write_waiters);
-    if !writers.is_empty() {
-        return wake_all(writers, state);
-    }
-    let readers = std::mem::take(&mut state.read_waiters);
-    wake_all(readers, state);
-}
-
-impl Default for AsyncRwLock {
-    fn default() -> Self {
-        Self::new()
+    /// True iff nothing holds or waits for the lock. The waiter queues are not
+    /// part of it — they retain stale wakers by design; see their own doc.
+    #[cfg(test)]
+    pub(super) fn is_quiescent(&self) -> bool {
+        let s = self.inner.borrow();
+        s.readers == 0 && !s.has_writer && s.writers_waiting == 0
     }
 }
 
@@ -356,13 +287,13 @@ impl Future for ReadFuture {
     type Output = ReadGuard;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ReadGuard> {
         let mut s = self.lock.inner.borrow_mut();
-        if !s.has_writer && s.writers_waiting == 0 {
+        if s.read_ok() {
             s.readers += 1;
             return Poll::Ready(ReadGuard {
                 lock: Rc::clone(&self.lock),
             });
         }
-        push_unique_waker(&mut s.read_waiters, cx.waker());
+        s.read_waiters.push_back(cx.waker().clone());
         Poll::Pending
     }
 }
@@ -379,29 +310,32 @@ impl Drop for ReadGuard {
 
 pub struct WriteFuture {
     lock: Rc<AsyncRwLock>,
+    /// Whether this future is counted in `writers_waiting`. Re-polling a parked
+    /// future must not count it twice, and `guard_egress_deadline` re-polls one
+    /// on every deadline expiry.
     parked: bool,
 }
 
 impl Future for WriteFuture {
     type Output = WriteGuard;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<WriteGuard> {
-        // `lock` is a local clone, so borrowing through it does not alias
-        // `self` — the parked bookkeeping needs no dance around the borrow.
-        let lock = Rc::clone(&self.lock);
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<WriteGuard> {
+        // Split borrow rather than an `Rc` clone: `parked` is written while
+        // `lock.inner` is borrowed, and the two fields are disjoint.
+        let Self { lock, parked } = self.get_mut();
         let mut s = lock.inner.borrow_mut();
-        if !s.has_writer && s.readers == 0 {
+        if s.write_ok() {
             s.has_writer = true;
-            if self.parked {
+            if *parked {
                 s.writers_waiting -= 1;
-                self.parked = false;
+                *parked = false;
             }
-            return Poll::Ready(WriteGuard { lock: Rc::clone(&lock) });
+            return Poll::Ready(WriteGuard { lock: Rc::clone(lock) });
         }
-        if !self.parked {
+        if !*parked {
             s.writers_waiting += 1;
-            self.parked = true;
+            *parked = true;
         }
-        push_unique_waker(&mut s.write_waiters, cx.waker());
+        s.write_waiters.push_back(cx.waker().clone());
         Poll::Pending
     }
 }
@@ -411,19 +345,8 @@ impl Drop for WriteFuture {
         if !self.parked {
             return;
         }
-        let mut s = self.lock.inner.borrow_mut();
-        s.writers_waiting -= 1;
-        if s.has_writer {
-            // Another writer holds the lock; it passes the baton on release.
-            return;
-        }
-        if s.readers == 0 {
-            pass_baton(s);
-        } else if s.writers_waiting == 0 {
-            // Readers hold the lock and this was the last live write waiter, so
-            // readers blocked by `writers_waiting > 0` can now enter.
-            wake_all(std::mem::take(&mut s.read_waiters), s);
-        }
+        self.lock.inner.borrow_mut().writers_waiting -= 1;
+        self.lock.wake_next();
     }
 }
 
@@ -441,20 +364,16 @@ impl Drop for WriteGuard {
 // join_all
 // ---------------------------------------------------------------------------
 
-/// Future driving `futs` to completion, writing values in input order
-/// into `out`. Both buffers are caller-supplied; no internal allocation
-/// happens once their capacity is large enough.
-///
-/// The caller-supplied scratch shape lets the committer/executor reuse
-/// the same `Vec<F>` and `Vec<Option<T>>` across every commit/tick,
-/// eliminating the three transient allocations that the old `join_all`
-/// performed on every call (boxed futures, option slots, result vec).
+/// Future driving `futs` to completion, writing values in input order into
+/// `out`. Both buffers are the caller's, so the committer and the executor
+/// reuse one pair across every commit and tick rather than allocating per
+/// fan-out; nothing here allocates once their capacity suffices.
 pub struct JoinInto<'a, F, T> {
-    futs: &'a mut Vec<F>,
+    futs: &'a mut [F],
     out: &'a mut Vec<Option<T>>,
 }
 
-impl<'a, F: Future<Output = T> + Unpin, T> Future for JoinInto<'a, F, T> {
+impl<F: Future<Output = T> + Unpin, T> Future for JoinInto<'_, F, T> {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = &mut *self;
@@ -484,7 +403,7 @@ impl<'a, F: Future<Output = T> + Unpin, T> Future for JoinInto<'a, F, T> {
 /// Drive every future in `futs` to completion, writing each result into
 /// the same index in `out`. `out` is cleared and resized to `futs.len()`
 /// on entry; allocation only happens when its capacity is too small.
-pub fn join_into<'a, F, T>(futs: &'a mut Vec<F>, out: &'a mut Vec<Option<T>>) -> JoinInto<'a, F, T>
+pub fn join_into<'a, F, T>(futs: &'a mut [F], out: &'a mut Vec<Option<T>>) -> JoinInto<'a, F, T>
 where
     F: Future<Output = T> + Unpin,
 {
@@ -495,9 +414,8 @@ where
 }
 
 /// Drive every future in `futs` to completion, return values in input order.
-/// Requires `F: Unpin`. Every production caller passes `ReplyFuture` /
-/// `ScanSlotFuture` (both `Unpin`); non-`Unpin` callers must `Box::pin`
-/// at the call site.
+/// Requires `F: Unpin`, so the futures can be polled in place out of one
+/// buffer; a caller whose future is not `Unpin` must `Box::pin` it.
 pub async fn join_all_unpin<F, T, I>(futs: I) -> Vec<T>
 where
     I: IntoIterator<Item = F>,
