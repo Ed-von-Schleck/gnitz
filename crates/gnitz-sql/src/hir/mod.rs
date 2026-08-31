@@ -56,6 +56,24 @@ pub(crate) fn bind_and_lower(
     lower::lower(chain, rel, view_id, bounded)
 }
 
+/// The ad-hoc read path's entry to the same core: bind a single-relation grouped
+/// body and lower it to fold pieces instead of to a circuit. One binder, two
+/// sinks — which is what makes `SELECT … GROUP BY …` and `CREATE VIEW AS
+/// SELECT … GROUP BY …` accept the same statements and compute them the same way.
+///
+/// There is no decorrelate/classify step: the ad-hoc router rejects every
+/// subquery and join shape before a body reaches here, so the bound tree is
+/// already the `Project(Filter_having?(Reduce(PreMap?(Get))))` the lowering
+/// expects.
+pub(crate) fn bind_and_lower_fold(
+    select: &sqlparser::ast::Select,
+    schema: &Arc<Schema>,
+) -> Result<lower::fold::FoldPieces, GnitzSqlError> {
+    let ids = ColIdGen::new();
+    let rel = bind::bind_adhoc_grouped(&ids, select, Arc::clone(schema))?;
+    lower::fold::lower_fold(&rel, schema)
+}
+
 /// Opaque column identity, unique within one `bind_and_lower` invocation, never
 /// renumbered. Its `u32` payload is an allocation order, not a layout position —
 /// consumers compare ids, never arithmetic on them.
@@ -121,6 +139,27 @@ pub(crate) fn as_col(e: &HirExpr) -> Option<ColId> {
         BExpr::ColRef(HirRef::Col(id)) => Some(*id),
         _ => None,
     }
+}
+
+/// Whether `items` is the reduce pre-map over `input`: `input`'s own columns
+/// passed through under their own `ColId`s, then at least one computed column.
+/// The bind inserts one so the reduce can group by, or aggregate, an expression
+/// (`GROUP BY a + b`, `SUM(a * b)`).
+///
+/// Identity is what tells it from a derived table's body, which is also a
+/// `Project` over a `Get` — that one mints a fresh `ColId` per output, so it
+/// never matches here and keeps being cut to a segment.
+///
+/// Read by both reduce lowerings — `lower::reduce`, which emits it as a MAP in
+/// the view's circuit, and `lower::fold`, which ships it as the fold sink's
+/// pre-map — so neither can disagree about what the reduce's input is.
+pub(crate) fn is_pre_map(input: &RelExpr, items: &[ProjEntry]) -> bool {
+    let cols = input.cols();
+    items.len() > cols.len()
+        && cols
+            .iter()
+            .zip(items)
+            .all(|(c, it)| it.out.id == c.id && matches!(it.expr, BExpr::ColRef(HirRef::Col(id)) if id == c.id))
 }
 
 /// The physical position of a `ColId` in a layout.

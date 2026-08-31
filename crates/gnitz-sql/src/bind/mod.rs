@@ -15,6 +15,4 @@ mod resolve;
 pub(crate) mod structural;
 
 pub(crate) use resolve::{apply_positional_aliases, cte_passthrough, find_unique_column, Binder};
-pub(crate) use structural::{
-    bind_single_table, bind_structural, fold_null_test, single_relation_col_idx, LeafBinder, SingleTable,
-};
+pub(crate) use structural::{bind_single_table, bind_structural, fold_null_test, single_relation_col_idx, LeafBinder};

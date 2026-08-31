@@ -220,9 +220,10 @@ pub(crate) fn peel_nested(e: &sqlparser::ast::Expr) -> &sqlparser::ast::Expr {
 /// level was the aggregate — the callers use it to tell "this item *is* an
 /// aggregate" from "it merely contains one".
 ///
-/// The one traversal behind both grouped front ends. They must cover the same node
-/// set: an aggregate one reaches and the other misses would bind against a
-/// reduce-output column that was never materialized.
+/// The one traversal behind the grouped bind: what it reaches is exactly what the
+/// reduce materializes, because the same walk collects the aggregates and binds
+/// the expressions over them. An aggregate a second walk reached and this one
+/// missed would bind against a reduce-output column that does not exist.
 pub(crate) fn for_each_agg_call<E>(
     e: &sqlparser::ast::Expr,
     f: &mut impl FnMut(&sqlparser::ast::Function) -> Result<(), E>,
@@ -304,8 +305,9 @@ pub(crate) fn group_by_target<'a>(
 }
 
 /// A column written outside both the grouping and an aggregate. `clause` names
-/// where it was written (`"GROUP BY SELECT"` / `"HAVING"`) — the wording is
-/// shared so the ad-hoc fold path and the view path cannot diverge on it.
+/// where it was written (`"GROUP BY SELECT"` / `"HAVING"`), which is the only
+/// thing that varies: one grouped binder raises this, so a direct SELECT and the
+/// equivalent view read the identical sentence.
 pub(crate) fn reject_ungrouped_column(clause: &str, name: &str) -> GnitzSqlError {
     GnitzSqlError::Plan(format!(
         "{clause}: column '{name}' must appear in GROUP BY or an aggregate function"
@@ -606,8 +608,8 @@ pub(crate) fn extract_table_name_and_alias(
 }
 
 /// Reject any qualifier on a function call the binder does not implement.
-/// Both aggregate-binding sites (`SingleTable::bind_function` and HAVING's
-/// `having_agg_func`) and the COALESCE/NULLIF desugar read only the argument
+/// Both aggregate-binding leaves (`SingleTable::bind_function` and the HIR
+/// `GroupedLeaf`'s) and the COALESCE/NULLIF desugar read only the argument
 /// list; every other `Function` field would otherwise be silently dropped,
 /// computing the plain call. `on` names the rejecting context ("aggregates",
 /// "COALESCE", …) in the message.

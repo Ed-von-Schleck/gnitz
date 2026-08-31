@@ -1092,6 +1092,22 @@ pub(crate) fn compile_scalar_evaluator(expr: &BoundExpr, schema: &Schema) -> Res
         .map_err(expr_unsupported)
 }
 
+/// Compile a grouped SELECT's finalize item — an expression over the reduce
+/// output — into the shared evaluator, read back one group at a time by
+/// `exec::agg_finish`.
+///
+/// The sibling of [`compile_scalar_evaluator`] without its float rejection: a
+/// SET writes its result into an existing column, where a float register has no
+/// legal destination, while a finalize result *defines* its output column and
+/// AVG's is an F64 by construction. Whether the result is a string, and so which
+/// read-back applies, the caller asks the returned evaluator
+/// (`Evaluator::result_is_str`).
+pub(crate) fn compile_finalize_evaluator(expr: &BoundExpr, schema: &Schema) -> Result<Evaluator, GnitzSqlError> {
+    compile_bound_expr_to_program(expr, &schema.columns)?
+        .resolve_scalar(schema)
+        .map_err(expr_unsupported)
+}
+
 /// A shared-evaluator rejection as a SQL-layer `Unsupported`. The wording is
 /// `ExprValidateErr`'s own `Display`, so a query rejected here and the same
 /// program rejected by the engine's circuit compiler read identically.

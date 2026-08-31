@@ -127,12 +127,10 @@ def _setup_orders(client, sn):
         ")",
         schema_name=sn,
     )
-    rows = []
-    for i in range(1, 41):
-        cat = i % 5
-        amount = (i * 7) % 100
-        note = "NULL" if i % 3 == 0 else str((i * 3) % 50)
-        rows.append(f"({i}, {cat}, {amount}, {note})")
+    rows = [
+        f"({pk}, {cat}, {amount}, {'NULL' if note is None else note})"
+        for pk, cat, amount, note in _orders_oracle()
+    ]
     client.execute_sql("INSERT INTO orders VALUES " + ",".join(rows), schema_name=sn)
 
 
@@ -213,6 +211,352 @@ def test_having_parity(client):
         _parity(client, sn, "SELECT category, MIN(note) AS mn FROM orders GROUP BY category HAVING MIN(note) > 10")
         # Global HAVING (grounds then filters).
         _parity(client, sn, "SELECT COUNT(*) AS c FROM orders HAVING COUNT(*) > 0")
+    finally:
+        _cleanup(client, sn, "orders")
+
+
+# ---------------------------------------------------------------------------
+# Computed group keys and computed finalize items
+#
+# The three shapes below used to be the whole visible difference between the two
+# grouped front ends: a view accepted each of them and a direct SELECT rejected
+# it, because the ad-hoc path ran a second, narrower binder. There is one binder
+# now, so `_parity` is the regression test — but parity alone would also hold if
+# BOTH paths were wrong, so each case is pinned against an in-Python oracle too.
+#
+# Physically these exercise the two maps a reduce can carry. A computed GROUP BY
+# key or aggregate argument is the **pre-map**, which runs on the worker between
+# the predicate and the fold (`AggReadSpec.pre_map`); an expression over the
+# aggregates is the **finalize map**, which the client runs over its combined
+# reduce output. A run at W=4 is what makes the pre-map's fused filter->map path
+# and the cross-worker combine both real.
+# ---------------------------------------------------------------------------
+
+
+def _orders_oracle():
+    """The `orders` fixture's rows as `(pk, category, amount, note)`.
+
+    The one definition: `_setup_orders` builds its INSERT from this, and the
+    oracles below compute over it, so changing the fixture cannot leave a
+    hand-written expectation quietly describing the old data.
+    """
+    return [(i, i % 5, (i * 7) % 100, None if i % 3 == 0 else (i * 3) % 50) for i in range(1, 41)]
+
+
+def _grouped_oracle(key, value):
+    """`{key(row): value(rows of that group)}` over the orders fixture."""
+    groups = {}
+    for row in _orders_oracle():
+        groups.setdefault(key(row), []).append(row)
+    return {k: value(v) for k, v in groups.items()}
+
+
+def _as_dict(rows, kname, vname):
+    return {r._asdict()[kname]: r._asdict()[vname] for r in rows}
+
+
+def test_expression_over_aggregates_parity(client):
+    """An expression whose operand is an aggregate — the post-reduce finalize map.
+
+    `SUM(amount) + 1` is the case a direct SELECT used to refuse with "GROUP BY
+    SELECT: only column refs and aggregates supported"."""
+    sn = "cf" + _uid()
+    client.create_schema(sn)
+    try:
+        _setup_orders(client, sn)
+        rows = _parity(client, sn, "SELECT category, SUM(amount) + 1 AS s FROM orders GROUP BY category")
+        assert _as_dict(rows, "category", "s") == _grouped_oracle(
+            lambda r: r[1], lambda g: sum(r[2] for r in g) + 1
+        )
+        # Two aggregates in one expression, and an aggregate under a second
+        # operator — the composite is deeper than one binary node.
+        rows = _parity(
+            client,
+            sn,
+            "SELECT category, SUM(amount) - COUNT(*) * 2 AS d FROM orders GROUP BY category",
+        )
+        assert _as_dict(rows, "category", "d") == _grouped_oracle(
+            lambda r: r[1], lambda g: sum(r[2] for r in g) - len(g) * 2
+        )
+        # An expression over AVG: the finalize composite (a divide) feeding
+        # another operator, so the divide is no longer the whole item.
+        rows = _parity(client, sn, "SELECT category, AVG(amount) * 2 AS a FROM orders GROUP BY category")
+        assert _as_dict(rows, "category", "a") == _grouped_oracle(
+            lambda r: r[1], lambda g: sum(r[2] for r in g) / len(g) * 2
+        )
+        # A group column inside an expression, mixed with an aggregate.
+        rows = _parity(
+            client,
+            sn,
+            "SELECT category, category * 100 + COUNT(*) AS mixed FROM orders GROUP BY category",
+        )
+        assert _as_dict(rows, "category", "mixed") == _grouped_oracle(
+            lambda r: r[1], lambda g: g[0][1] * 100 + len(g)
+        )
+    finally:
+        _cleanup(client, sn, "orders")
+
+
+def test_aggregate_over_expression_parity(client):
+    """An aggregate whose argument is computed — the pre-map, on the worker.
+
+    `SUM(amount * category)` is the case a direct SELECT used to refuse with
+    "aggregate on computed expression not supported"."""
+    sn = "ca" + _uid()
+    client.create_schema(sn)
+    try:
+        _setup_orders(client, sn)
+        rows = _parity(client, sn, "SELECT category, SUM(amount * category) AS s FROM orders GROUP BY category")
+        assert _as_dict(rows, "category", "s") == _grouped_oracle(
+            lambda r: r[1], lambda g: sum(r[2] * r[1] for r in g)
+        )
+        # MIN/MAX over a computed argument: the pre-map column feeds a
+        # non-linear aggregate, not just a sum.
+        rows = _parity(client, sn, "SELECT category, MAX(amount + pk) AS mx FROM orders GROUP BY category")
+        assert _as_dict(rows, "category", "mx") == _grouped_oracle(
+            lambda r: r[1], lambda g: max(r[2] + r[0] for r in g)
+        )
+        # With a WHERE, so the worker runs predicate -> pre-map -> fold and the
+        # map sees survivor ranges rather than whole chunks.
+        rows = _parity(
+            client,
+            sn,
+            "SELECT category, SUM(amount * 2) AS s FROM orders WHERE pk > 5 AND amount < 80 GROUP BY category",
+        )
+        # Filtered before grouping, so a category with no survivor is absent
+        # rather than present at 0 — which is what the fold emits.
+        kept = [r for r in _orders_oracle() if r[0] > 5 and r[2] < 80]
+        expected = {}
+        for r in kept:
+            expected[r[1]] = expected.get(r[1], 0) + r[2] * 2
+        assert _as_dict(rows, "category", "s") == expected
+    finally:
+        _cleanup(client, sn, "orders")
+
+
+def test_premap_at_the_column_limit(client):
+    """A pre-map on a source already at the schema's column limit.
+
+    The pre-map's output is the source's columns *plus* the computed ones, so a
+    maximally wide source has no room for one. That has to be a plan-time feature
+    message: the worker refuses the same width, but only as a trust boundary, and
+    reaching it would surface a server error for a legal statement.
+
+    The control matters as much as the rejection — one column narrower, the same
+    query must compile — or a gate that simply rejected every wide table would
+    pass the first half.
+    """
+    sn = "cl" + _uid()
+    client.create_schema(sn)
+    # MAX_COLUMNS is 65 and counts the PK, so 65 total leaves no room for a
+    # computed key; 64 leaves exactly one.
+    try:
+        for n_cols, should_compile in ((64, True), (65, False)):
+            name = f"w{n_cols}"
+            payload = ", ".join(f"c{i} BIGINT NOT NULL" for i in range(n_cols - 1))
+            client.execute_sql(
+                f"CREATE TABLE {name} (pk BIGINT PRIMARY KEY, {payload})", schema_name=sn
+            )
+            vals = ", ".join(str(i) for i in range(n_cols - 1))
+            client.execute_sql(f"INSERT INTO {name} VALUES (1, {vals})", schema_name=sn)
+            q = f"SELECT c0 + 1 AS k, COUNT(*) AS c FROM {name} GROUP BY c0 + 1"
+            if should_compile:
+                assert _as_dict(_rows(client, sn, q), "k", "c") == {1: 1}
+            else:
+                with pytest.raises(Exception) as ei:
+                    _rows(client, sn, q)
+                msg = str(ei.value)
+                assert "65" in msg, f"the limit must name itself, got: {msg}"
+    finally:
+        _cleanup(client, sn, "w64", "w65")
+
+
+def test_premap_over_a_source_whose_pk_is_not_first(client):
+    """A pre-map reduce over a table whose PRIMARY KEY is not column 0.
+
+    The pre-map's output schema is the source's columns with the PK columns moved
+    to the front (`place_pk_front`), so it is a *permutation* of the source
+    whenever the PK is not already leading — and a WHERE is resolved to positions
+    against the source, not against that permutation. Every other fixture here
+    declares `pk` first, which makes the permutation the identity and hides any
+    confusion between the two orders; this one does not.
+
+    A DOUBLE and a TEXT column ahead of the PK, because the symptom is a *type*
+    mismatch at the permuted slot: the predicate reads whichever column the
+    permutation moved into its position, so the wrong-typed cases fail loudly
+    while a same-width integer one would just compare the wrong column.
+    """
+    sn = "nl" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE nl (x DOUBLE NOT NULL, s TEXT NOT NULL, id BIGINT NOT NULL, v BIGINT NOT NULL,"
+            " PRIMARY KEY (id))",
+            schema_name=sn,
+        )
+        rows = [(i * 1.5, "a" if i % 2 else "b", i, i % 4) for i in range(1, 13)]
+        client.execute_sql(
+            "INSERT INTO nl VALUES " + ",".join(f"({x}, '{s}', {i}, {v})" for x, s, i, v in rows),
+            schema_name=sn,
+        )
+        # A string WHERE: the source's TEXT column sits where the permutation puts
+        # an integer, so a predicate typed against the pre-map output is rejected
+        # outright ("comparison Eq against a string needs both operands to be
+        # strings") rather than answering wrongly.
+        got = _parity(
+            client, sn, "SELECT v + 1 AS k, COUNT(*) AS c FROM nl WHERE s = 'a' GROUP BY v + 1"
+        )
+        expected = {}
+        for x, s, i, v in rows:
+            if s == "a":
+                expected[v + 1] = expected.get(v + 1, 0) + 1
+        assert _as_dict(got, "k", "c") == expected
+        # A float WHERE, which fails in the engine rather than the planner.
+        got = _parity(
+            client, sn, "SELECT v AS k, SUM(id * 2) AS s FROM nl WHERE x > 6.0 GROUP BY v"
+        )
+        expected = {}
+        for x, s, i, v in rows:
+            if x > 6.0:
+                expected[v] = expected.get(v, 0) + i * 2
+        assert _as_dict(got, "k", "s") == expected
+        # A computed aggregate argument over the same shape, so the pre-map is
+        # reached by the argument rather than by the key.
+        got = _parity(
+            client, sn, "SELECT v AS k, MAX(id * 3) AS m FROM nl WHERE s = 'b' GROUP BY v"
+        )
+        expected = {}
+        for x, s, i, v in rows:
+            if s == "b":
+                expected[v] = max(expected.get(v, 0), i * 3)
+        assert _as_dict(got, "k", "m") == expected
+    finally:
+        _cleanup(client, sn, "nl")
+
+
+def test_computed_key_over_a_replicated_source(client):
+    """A pre-map fold over a replicated table.
+
+    Replication is the trap for anything that touches reduce routing: every
+    worker holds every row, so a fold that double-counted would still return
+    plausible groups. The pre-map hands the fold a *derived* schema (source PK
+    columns plus the computed ones) rather than the source's, so this pins that
+    swapping the descriptor did not change which rows a worker folds.
+    """
+    sn = "rp" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE rt (pk BIGINT PRIMARY KEY, c BIGINT NOT NULL, a BIGINT NOT NULL) "
+            "WITH (replicated = true)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO rt VALUES " + ",".join(f"({i}, {i % 3}, {i})" for i in range(1, 13)),
+            schema_name=sn,
+        )
+        # The control: no pre-map, so a double-count would show here too.
+        rows = _parity(client, sn, "SELECT c, COUNT(*) AS n FROM rt GROUP BY c")
+        assert _as_dict(rows, "c", "n") == {0: 4, 1: 4, 2: 4}
+        rows = _parity(client, sn, "SELECT c + 1 AS k, SUM(a * 2) AS s FROM rt GROUP BY c + 1")
+        expected = {}
+        for i in range(1, 13):
+            expected[i % 3 + 1] = expected.get(i % 3 + 1, 0) + i * 2
+        assert _as_dict(rows, "k", "s") == expected
+    finally:
+        _cleanup(client, sn, "rt")
+
+
+def test_grouped_guards_survive_on_both_paths(client):
+    """The grouped rejections a direct SELECT must keep, now that it shares the
+    view's binder rather than running one of its own.
+
+    Widening a front end is where guards get dropped silently — a rejection that
+    was a literal in the narrower binder and has no counterpart in the wider one
+    simply stops firing, and the query returns a wrong answer instead of an
+    error. The float-key one is the load-bearing case: a float group key breaks
+    the byte-equal key contract (±0.0 differ byte-wise but compare equal), so
+    losing it would silently split or merge groups rather than fail.
+    """
+    sn = "gg" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE gg (pk BIGINT PRIMARY KEY, price DOUBLE NOT NULL, n BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql("INSERT INTO gg VALUES (1, 1.5, 7), (2, 2.5, 8)", schema_name=sn)
+        for q in (
+            # A float GROUP BY key, written bare and as an expression — the
+            # expression form has no column name to blame, so it is a separate
+            # rejection site.
+            "SELECT price, COUNT(*) AS c FROM gg GROUP BY price",
+            "SELECT price + 1 AS k, COUNT(*) AS c FROM gg GROUP BY price + 1",
+            # A column that is neither grouped nor aggregated, bare and inside an
+            # expression — the second only became expressible with the finalize
+            # map, so it is new surface for this guard.
+            "SELECT pk, COUNT(*) AS c FROM gg GROUP BY n",
+            "SELECT pk + 1 AS k, COUNT(*) AS c FROM gg GROUP BY n",
+            # An expression that is not the grouped one: `n * 2` is not `n + 1`,
+            # so it reads an ungrouped column however it is spelled.
+            "SELECT n * 2 AS k FROM gg GROUP BY n + 1",
+            # An aggregate over an aggregate.
+            "SELECT SUM(COUNT(pk)) AS s FROM gg GROUP BY n",
+            # HAVING over an ungrouped column.
+            "SELECT n, COUNT(*) AS c FROM gg GROUP BY n HAVING pk > 1",
+        ):
+            _reject_both(client, sn, q)
+    finally:
+        _cleanup(client, sn, "gg")
+
+
+def test_computed_group_key_parity(client):
+    """A GROUP BY over an expression — the pre-map materializing the key.
+
+    `GROUP BY category + amount` is the case a direct SELECT used to refuse with
+    "GROUP BY: only simple column references supported"."""
+    sn = "ck" + _uid()
+    client.create_schema(sn)
+    try:
+        _setup_orders(client, sn)
+        rows = _parity(
+            client,
+            sn,
+            "SELECT category + amount AS k, COUNT(*) AS c FROM orders GROUP BY category + amount",
+        )
+        assert _as_dict(rows, "k", "c") == _grouped_oracle(lambda r: r[1] + r[2], len)
+        # The written key reaches the SELECT list and HAVING by its expression,
+        # not by a name — one pre-map column serves all three positions.
+        rows = _parity(
+            client,
+            sn,
+            "SELECT amount * 2 AS k2, SUM(pk) AS s FROM orders GROUP BY amount * 2 HAVING SUM(pk) > 20",
+        )
+        assert _as_dict(rows, "k2", "s") == {
+            k: v
+            for k, v in _grouped_oracle(lambda r: r[2] * 2, lambda g: sum(r[0] for r in g)).items()
+            if v > 20
+        }
+        # A computed key and a computed aggregate argument in one reduce: both
+        # pre-map columns, deduped against the same memo.
+        rows = _parity(
+            client,
+            sn,
+            "SELECT category + 1 AS k, SUM(amount * 3) AS s FROM orders GROUP BY category + 1",
+        )
+        assert _as_dict(rows, "k", "s") == _grouped_oracle(
+            lambda r: r[1] + 1, lambda g: sum(r[2] * 3 for r in g)
+        )
+        # The same expression written as the key and as the projection is ONE
+        # column: `SELECT category + amount` binds to the pre-map column the
+        # reduce already groups by, rather than minting a second one.
+        rows = _parity(
+            client,
+            sn,
+            "SELECT category + amount AS k, category + amount AS again, COUNT(*) AS c "
+            "FROM orders GROUP BY category + amount",
+        )
+        assert all(r._asdict()["k"] == r._asdict()["again"] for r in rows)
     finally:
         _cleanup(client, sn, "orders")
 

@@ -3,16 +3,16 @@
 //! HIR `Reduce` node, and drives the shared `crate::agg` primitives — the
 //! strategy selection (`emit_reduce`), the reduce-output layout
 //! (`reduce_output_schema`, `group_col_reduce_pos`), and the spec decomposition
-//! (`push_agg_specs`) — which it shares with the ad-hoc SELECT / GROUP BY
-//! aggregate path (`dml::group_by`, `exec::agg_finish`).
+//! (`push_agg_specs`) — which it shares with `lower::fold`, the same reduce
+//! lowered to an ad-hoc read's fold sink instead of to a circuit.
 
 use super::super::physical;
-use super::super::{slot_of, ColId, HirExpr, HirRef, ProjEntry, RelExpr};
-use super::{cut_segment, emit_filter, extract_scan_bound, seginput_of_get, split_filter, CutMemo};
-use crate::agg::{
-    emit_reduce, ensure_cardinality_count, group_col_reduce_pos, push_agg_specs, reduce_output_schema, AggSpec,
-    ReduceShape,
+use super::super::{is_pre_map, ColId, HirExpr, HirRef, ProjEntry, RelExpr};
+use super::{
+    cut_segment, emit_filter, extract_scan_bound, reduce_out_layout, resolve_reduce_specs, seginput_of_get,
+    split_filter, CutMemo, ReduceSpecs,
 };
+use crate::agg::{emit_reduce, ensure_cardinality_count, group_col_reduce_pos, reduce_output_schema, ReduceShape};
 use crate::codec::project_schema::{compile_projection_map, declared_out_cols, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_filter_program;
@@ -23,22 +23,7 @@ use gnitz_core::{CircuitBuilder, ColumnDef, ReduceOutKey};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Whether `items` is the reduce pre-map over `input`: `input`'s own columns
-/// passed through under their own `ColId`s, then at least one computed column.
-///
-/// Identity is what tells it from a derived table's body, which is also a
-/// `Project` over a `Get` — that one mints a fresh `ColId` per output, so it never
-/// matches here and keeps being cut to a segment.
-fn is_pre_map(input: &RelExpr, items: &[ProjEntry]) -> bool {
-    let cols = input.cols();
-    items.len() > cols.len()
-        && cols
-            .iter()
-            .zip(items)
-            .all(|(c, it)| it.out.id == c.id && matches!(it.expr, BExpr::ColRef(HirRef::Col(id)) if id == c.id))
-}
-
-/// Lower a `Project(Filter_having?(Reduce(...)))` body's reduce to circuit pieces/// Lower a `Project(Filter_having?(Reduce(...)))` body's reduce to circuit pieces
+/// Lower a `Project(Filter_having?(Reduce(...)))` body's reduce to circuit pieces
 /// for `view_id`, returning the pieces plus the output `ColId` layout. `items` is
 /// the finalize projection; `having_preds` is the HAVING filter over the raw
 /// reduce output.
@@ -98,30 +83,25 @@ pub(crate) fn lower_reduce(
         .map(|items| physical::physicalize_projection(items, &source.layout, &source.schema))
         .transpose()?;
     let source_tid = source.tid;
-    let (source_schema, source_layout) = match &pre {
+    let (reduce_in, reduce_in_layout) = match &pre {
         Some(p) => (crate::hir::chain::schema_of(&p.out_cols, p.pk_arity), &p.layout),
         None => (Arc::clone(&source.schema), &source.layout),
     };
 
-    let group_positions: Vec<usize> = group_cols
-        .iter()
-        .map(|g| slot_of(source_layout, *g))
-        .collect::<Result<_, _>>()?;
-
-    // Decompose the aggregates into physical specs; record each agg's spec start.
-    let mut specs: Vec<AggSpec> = Vec::new();
-    let mut agg_starts: Vec<usize> = Vec::new();
-    for a in aggs {
-        agg_starts.push(specs.len());
-        let arg_pos = a.arg.map(|id| slot_of(source_layout, id)).transpose()?;
-        push_agg_specs(a.func, arg_pos, &source_schema.columns, &mut specs)?;
-    }
-    ensure_cardinality_count(&source_schema.columns, &mut specs)?;
+    let ReduceSpecs {
+        group_positions,
+        mut specs,
+        agg_starts,
+    } = resolve_reduce_specs(group_cols, aggs, reduce_in_layout, &reduce_in)?;
+    // The emission-only cardinality COUNT is the circuit's alone: it is the
+    // `should_emit` signal a stateful reduce gates group existence on, which the
+    // stateless fold has no use for.
+    ensure_cardinality_count(&reduce_in.columns, &mut specs)?;
 
     // Reduce strategy (two-phase global / replicated / sharded). A chain-minted
     // segment carries no descriptor, and is never replicated anyway.
     let source_replicated = source.desc.as_ref().is_some_and(|d| d.replicated);
-    let shape = ReduceShape::new(&source_schema, &group_positions, &specs, source_replicated);
+    let shape = ReduceShape::new(&reduce_in, &group_positions, &specs, source_replicated);
     let out_key = shape.out_key;
     let (reduce_schema, agg_col_offset) = reduce_output_schema(&shape);
     let pk_len = reduce_schema.pk_cols.len();
@@ -130,8 +110,11 @@ pub(crate) fn lower_reduce(
     let mut cb = CircuitBuilder::new(view_id, source_tid);
     let inp = cb.input_delta_bounded(bound);
     let filtered = match where_folded {
-        // Already folded above (the scan bound reads the same folded predicate).
-        Some(f) => match compile_filter_program(&f, &source_schema.columns)? {
+        // Already folded above (the scan bound reads the same folded predicate),
+        // against `source.layout` — so it types against the source, not
+        // `reduce_in`: the pre-map moves the source PK columns to the front, and a
+        // PK not already at slot 0 makes the two orders disagree.
+        Some(f) => match compile_filter_program(&f, &source.schema.columns)? {
             Some(p) => cb.filter(inp, Some(p)),
             None => inp,
         },
@@ -141,7 +124,7 @@ pub(crate) fn lower_reduce(
     // The pre-map, between the WHERE and the reduce. Only the payload slots are
     // written — the PK region is carried verbatim, as it is on every other
     // `map_expr` — so `filtered`'s schema is the source's and the map's output is
-    // `source_schema`.
+    // `reduce_in`.
     let mapped = match &pre {
         Some(p) => cb.map_expr(
             filtered,
@@ -157,23 +140,17 @@ pub(crate) fn lower_reduce(
     // reused by the finalize loop below (`group_reduce_pos[j]`), rather than
     // re-deriving the same `group_col_reduce_pos` lookup a second time per item.
     let group_reduce_pos: Vec<usize> = (0..group_cols.len())
-        .map(|j| group_col_reduce_pos(group_positions[j], out_key, &source_schema, &group_positions))
+        .map(|j| group_col_reduce_pos(group_positions[j], out_key, &reduce_in, &group_positions))
         .collect();
 
-    // Reduce output layout: `ColId` at each physical slot. Slots with no logical
-    // identity — the synthetic `_group_pk` and the trailing cardinality COUNT —
-    // stay `ColId::NONE`, which nothing can reference.
-    let mut reduce_layout: Vec<ColId> = vec![ColId::NONE; reduce_schema.columns.len()];
-    for (j, &gid) in group_cols.iter().enumerate() {
-        reduce_layout[group_reduce_pos[j]] = gid;
-    }
-    for (i, a) in aggs.iter().enumerate() {
-        let slot = agg_col_offset + agg_starts[i];
-        reduce_layout[slot] = a.out.id;
-        if let Some(c) = &a.companion {
-            reduce_layout[slot + 1] = c.id;
-        }
-    }
+    let reduce_layout = reduce_out_layout(
+        reduce_schema.columns.len(),
+        group_cols,
+        &group_reduce_pos,
+        aggs,
+        &agg_starts,
+        agg_col_offset,
+    );
 
     // HAVING filter over the raw reduce output.
     let filtered_reduced = emit_filter(&mut cb, reduced, having_preds, &reduce_layout, &reduce_schema.columns)?;

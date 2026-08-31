@@ -1009,11 +1009,15 @@ fn having_rejections() {
     );
 }
 
-/// The ad-hoc fold compiler and the view (HIR) compiler bind the same HAVING
-/// against the same grouped relation, so a rejection must read identically on
-/// both — a user cannot tell, and must not need to tell, which one answered.
-/// The two hold these verdicts as separate literals, so nothing but this pins
-/// them together.
+/// A grouped body reaches the one grouped binder from **both** surfaces, so a
+/// rejection reads identically whichever one answered — a user cannot tell, and
+/// must not need to tell, which it was.
+///
+/// The binder is shared, so the verdicts themselves are one literal each and
+/// cannot drift. What this still pins is the route *to* it: the ad-hoc path runs
+/// its own envelope and derivation gates first, and one of those growing a
+/// grouped-body case of its own would shadow the binder's message with a
+/// different one.
 #[test]
 fn having_rejections_read_identically_on_both_compilers() {
     let srv = match ServerHandle::start() {

@@ -3,11 +3,19 @@
 //! The workers return one concatenated `ZSetBatch` of per-worker partial reduce
 //! rows (pure append, never consolidated). This module combines them by
 //! group-column **value** (weight-aware / Z-set-exact), synthesizes the global
-//! ground row, finishes AVG / nullable-SUM, filters by HAVING through the shared
-//! expression evaluator (the same compiled program a grouped view's post-reduce
-//! FILTER runs), projects to SELECT order, and emits a batch carrying a hidden
-//! synthetic PK (stripped at presentation). The caller then applies the shared
-//! ORDER BY / OFFSET / LIMIT sink.
+//! ground row, and so materializes the client's own reduce output; it then runs
+//! the two operators a grouped view runs over that output — the HAVING filter
+//! and the finalize map — through the shared expression evaluator, and emits a
+//! batch carrying a hidden synthetic PK (stripped at presentation). The caller
+//! then applies the shared ORDER BY / OFFSET / LIMIT sink.
+//!
+//! **The aggregate finishing is not reimplemented here.** AVG's divide and a
+//! nullable SUM's null gate are in the finalize expressions the planner built
+//! (`agg::finalize_agg_bexpr`) — the same composites the view path's post-reduce
+//! MAP evaluates — so this module has no per-aggregate shape switch that could
+//! drift from the view's. What is genuinely client-side is the cross-worker
+//! combine below: one accumulator per physical spec, merged by the shared
+//! partial-merge rule.
 //!
 //! Partial reply layout (the batch this module consumes) is the shared
 //! SyntheticFold layout (`crate::agg::synthetic_fold_cols`):
@@ -19,12 +27,13 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use gnitz_core::{null_word_get, null_word_set, ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use gnitz_expr::Evaluator;
 use gnitz_wire::{cmp_typed_le, AggFunc as WireAggFunc};
 
-use crate::agg::{synthetic_group_col_pos, AggShape, AggSpec, GroupByLayout, GroupBySelectItem};
+use crate::agg::AggSpec;
 use crate::error::GnitzSqlError;
 use crate::exec::batch::filter_batch;
 use crate::validate::reject_duplicate_column_names;
@@ -34,11 +43,24 @@ use crate::validate::reject_duplicate_column_names;
 /// [`agg_finish`] — so what was planned and what is finished cannot describe
 /// different folds.
 pub(crate) struct FoldShape {
-    /// The shared aggregate layout (group columns, specs, mappings, SELECT
-    /// order) — identical to what the view path would compile.
-    pub(crate) layout: GroupByLayout,
+    /// The reduce input: the pre-map's output schema when there is one, else the
+    /// source's. The schema `group_positions` and `agg_specs[].col` index — what
+    /// EXPLAIN names them against.
+    pub(crate) reduce_schema: Arc<Schema>,
+    /// The group columns as **reduce-input** positions. Shipped as
+    /// `AggReadSpec.group_cols` and, being the partial layout's leading payload
+    /// slots, also what the combine groups by.
+    pub(crate) group_positions: Vec<usize>,
+    /// One accumulator per physical reduce spec, in the partial layout's agg
+    /// order.
+    pub(crate) agg_specs: Vec<AggSpec>,
+    /// The fold sink's pre-map program and the reduce-input payload columns it
+    /// writes, both empty when the reduce reads source columns directly.
+    pub(crate) pre_map: Vec<u8>,
+    pub(crate) pre_payload: Vec<(u8, bool)>,
     /// The per-worker SyntheticFold reduce-output layout: what the partial reply
-    /// decodes against, and what `having` is resolved against.
+    /// decodes against, and what `having` and every [`FinalizeItem`] resolve
+    /// against.
     pub(crate) partial_schema: Schema,
     /// The final output schema (`build_agg_out_schema`, computed at plan time
     /// so a bad shape rejects before the fold is dispatched).
@@ -46,6 +68,44 @@ pub(crate) struct FoldShape {
     /// The HAVING predicate compiled against `partial_schema` — `None` when the
     /// query has no HAVING or it folded to a statically-true constant.
     pub(crate) having: Option<Evaluator>,
+    /// The finalize projection in SELECT order, one item per visible output
+    /// column.
+    pub(crate) finalize: Vec<FinalizeItem>,
+}
+
+impl FoldShape {
+    /// `true` iff the group set is empty (an ungrouped / global scalar
+    /// aggregate): it emits one row even over an empty source, so the client
+    /// synthesizes a ground row when no worker contributed one. Derived, so no
+    /// constructor can state the impossible `{empty groups, not global}`.
+    pub(crate) fn global_ground(&self) -> bool {
+        self.group_positions.is_empty()
+    }
+}
+
+/// One finalize item: where an output column's value comes from.
+///
+/// The split is the projection's own (`ProjItem`'s pass-through/computed
+/// classification, which the view path's finalize map makes too): a bare
+/// reference to a reduce-output column of the same type is a byte move, and
+/// everything else — AVG's divide, a nullable SUM's null gate, an expression
+/// over group columns and aggregates — is one evaluated register.
+pub(crate) enum FinalizeItem {
+    /// Column `partial_ci` of the group batch, moved verbatim.
+    PassThrough { partial_ci: usize },
+    /// An expression over the group batch, evaluated a group at a time. Groups
+    /// are the *output* rows, so this is one evaluation per row emitted, not one
+    /// per row scanned.
+    ///
+    /// Boxed: an `Evaluator` carries a whole resolved program and its register
+    /// scratch, and a projection is mostly pass-throughs — inline it would make
+    /// every item pay the computed one's width.
+    Computed {
+        ev: Box<Evaluator>,
+        /// `Evaluator::result_is_str`, cached so the read-back is chosen once
+        /// per query rather than once per group.
+        is_str: bool,
+    },
 }
 
 /// One physical agg column's cross-worker combiner. The variant is selected by
@@ -57,10 +117,14 @@ enum ColAcc {
     /// COUNT_NON_NULL partials too, which accumulate identically and differ only
     /// in starting out non-NULL. `seen` is false until a partial contributes, so
     /// an uncontributed SUM (the ground row, or an all-NULL NullfillSum group)
-    /// renders NULL. `tc` is the declared partial-column type, which is what
-    /// `sum_f64` divides at: `agg_output_type(Sum, U64)` is U64, so past 2^63 a
-    /// signed read of `bits` would be negative.
-    IntSum { bits: i64, seen: bool, tc: TypeCode },
+    /// renders NULL.
+    ///
+    /// The accumulator holds the true sum mod 2^64; nothing here reads it as a
+    /// quantity. Its declared column type — `agg_output_type(Sum, U64)` is U64 —
+    /// travels on the partial schema, so the finalize expression that *does* read
+    /// it (AVG's divide) dispatches on that type and a sum past 2^63 stays
+    /// unsigned.
+    IntSum { bits: i64, seen: bool },
     /// Float SUM — Σ (w as f64)·partial. IEEE-754 addition is non-associative, so
     /// the value follows the summation order: the order each worker's access path
     /// visited rows in, and — only here — the reply order the partials arrive in.
@@ -86,17 +150,9 @@ impl ColAcc {
         match spec.op.merge_func() {
             // A count is a sum that starts out non-NULL: its partials are never
             // null, and an uncontributed group renders 0 rather than NULL.
-            WireAggFunc::SumZero => ColAcc::IntSum {
-                bits: 0,
-                seen: true,
-                tc: spec.out_type,
-            },
+            WireAggFunc::SumZero => ColAcc::IntSum { bits: 0, seen: true },
             WireAggFunc::Sum if spec.out_type.is_float() => ColAcc::FloatSum { val: 0.0, seen: false },
-            WireAggFunc::Sum => ColAcc::IntSum {
-                bits: 0,
-                seen: false,
-                tc: spec.out_type,
-            },
+            WireAggFunc::Sum => ColAcc::IntSum { bits: 0, seen: false },
             WireAggFunc::Min => ColAcc::Extreme {
                 best: None,
                 is_max: false,
@@ -114,30 +170,12 @@ impl ColAcc {
     }
 }
 
-/// Pre-resolved SELECT item (computed once per query, not per group): where the
-/// value comes from, and the output cell it lands in.
-struct OutItem {
-    src: ItemSrc,
-    /// Output column index, its dense payload slot, and its type — the output
-    /// schema is immutable, so resolving these per group would repeat one answer.
-    ci: usize,
-    pi: usize,
-    tc: TypeCode,
-}
-
-/// A group column's partial-batch column index, or the aggregate mapping index.
-enum ItemSrc {
-    Group { partial_ci: usize },
-    Agg { agg_idx: usize },
-}
-
 /// Combine, finish, and project the concatenated worker partials into the final
 /// result batch (with a hidden synthetic PK). The caller applies ORDER BY /
 /// OFFSET / LIMIT afterwards.
 pub(crate) fn agg_finish(spec: &FoldShape, partial: &ZSetBatch) -> ZSetBatch {
-    let layout = &spec.layout;
-    let n_group = layout.group_col_indices.len();
-    let n_aggs = layout.agg_specs.len();
+    let n_group = spec.group_positions.len();
+    let n_aggs = spec.agg_specs.len();
     // Partial columns: group cols at ci 1..1+n_group, agg partials at
     // 1+n_group+k (ci 0 is the hidden _group_pk PK).
 
@@ -175,7 +213,7 @@ pub(crate) fn agg_finish(spec: &FoldShape, partial: &ZSetBatch) -> ZSetBatch {
                 let g = reps.len();
                 by_key.insert(key_scratch.clone(), g);
                 reps.push(Some(row));
-                accs.extend(layout.agg_specs.iter().map(ColAcc::new));
+                accs.extend(spec.agg_specs.iter().map(ColAcc::new));
                 g
             }
         };
@@ -186,57 +224,30 @@ pub(crate) fn agg_finish(spec: &FoldShape, partial: &ZSetBatch) -> ZSetBatch {
 
     // 2. Global ground row: a global aggregate with no surviving partial emits one
     //    synthetic row (COUNT 0 / others NULL), which HAVING still filters.
-    if layout.global_ground() && reps.is_empty() {
+    if spec.global_ground() && reps.is_empty() {
         reps.push(None);
-        accs.extend(layout.agg_specs.iter().map(ColAcc::new));
+        accs.extend(spec.agg_specs.iter().map(ColAcc::new));
     }
 
-    // 3–5. Finish + HAVING + project into the output batch. Zero groups needs no
-    // guard: `filter` over a 0-row batch calls back zero times, and
-    // `emit_range(0, 0)` is a no-op.
-    let out_items: Vec<OutItem> = layout
-        .select_items
-        .iter()
-        .enumerate()
-        .map(|(si, item)| OutItem {
-            src: match item {
-                GroupBySelectItem::GroupCol { src_col, .. } => ItemSrc::Group {
-                    partial_ci: synthetic_group_col_pos(*src_col, &layout.group_col_indices),
-                },
-                GroupBySelectItem::Aggregate { agg_idx } => ItemSrc::Agg { agg_idx: *agg_idx },
-            },
-            // Output column 0 is the hidden PK, so SELECT item `si` lands at `si + 1`.
-            ci: 1 + si,
-            pi: spec.out_schema.payload_idx(1 + si),
-            tc: spec.out_schema.columns[1 + si].type_code,
-        })
-        .collect();
-    let mut out = ZSetBatch::with_capacity(&spec.out_schema, reps.len());
-    // Both arms speak in half-open group ranges, which is what
-    // `Evaluator::filter` hands back; without a HAVING every group is one range.
-    let mut emit_range = |start: usize, end: usize| {
-        for g in start..end {
-            emit_row(
-                spec,
-                partial,
-                &out_items,
-                &mut out,
-                reps[g],
-                &accs[g * n_aggs..(g + 1) * n_aggs],
-            );
-        }
-    };
+    // 3. The client's reduce output, one row per group. Materialized
+    //    unconditionally: it is what HAVING filters and what the finalize map
+    //    projects, which is the same two-operator tail a grouped view runs, and
+    //    it is bounded by the result the caller is about to sort and ship.
+    let groups = fill_group_batch(spec, partial, &reps, &accs);
+
+    // 4. HAVING. One batch, one `filter` call — so the truth rule is the engine
+    //    filter's own (`bool_bits & !null_bits`), and the region list, which
+    //    borrows the buffers and so cannot be cached, is built once. Without a
+    //    HAVING every group is one range.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
     match spec.having.as_ref() {
-        None => emit_range(0, reps.len()),
-        Some(ev) => {
-            // One batch, one `filter` call — so the truth rule is the engine
-            // filter's own (`bool_bits & !null_bits`), and the region list, which
-            // borrows the buffers and so cannot be cached, is built once.
-            let groups = fill_group_batch(spec, partial, &reps, &accs);
-            filter_batch(ev, &groups, &spec.partial_schema, emit_range);
-        }
+        None => ranges.push((0, groups.len())),
+        Some(ev) => filter_batch(ev, &groups, &spec.partial_schema, |s, e| ranges.push((s, e))),
     }
-    out
+
+    // 5. Finalize. Zero surviving groups needs no guard: the range list is then
+    //    empty and the row loop never runs.
+    project_groups(spec, &groups, &ranges)
 }
 
 /// One row per group in the partial-reply layout — the client's reduce output:
@@ -248,8 +259,8 @@ pub(crate) fn agg_finish(spec: &FoldShape, partial: &ZSetBatch) -> ZSetBatch {
 /// variant are resolved once per column rather than once per cell.
 fn fill_group_batch(spec: &FoldShape, partial: &ZSetBatch, reps: &[Option<usize>], accs: &[ColAcc]) -> ZSetBatch {
     let schema = &spec.partial_schema;
-    let n_group = spec.layout.group_col_indices.len();
-    let n_aggs = spec.layout.agg_specs.len();
+    let n_group = spec.group_positions.len();
+    let n_aggs = spec.agg_specs.len();
     let n = reps.len();
 
     let mut dst = ZSetBatch::with_capacity(schema, n);
@@ -351,7 +362,7 @@ fn combine(acc: &mut ColAcc, partial: &ZSetBatch, schema: &Schema, ci: usize, ro
         // COUNT and SUM partials are 8-byte cells (I64, or U64 whose bit
         // pattern is the true sum mod 2^64 — the same i64 accumulator the
         // engine folds).
-        ColAcc::IntSum { bits, seen, .. } => {
+        ColAcc::IntSum { bits, seen } => {
             *bits = bits.wrapping_add(w.wrapping_mul(i64::from_le_bytes(read_le8(partial, ci, row))));
             *seen = true;
         }
@@ -386,91 +397,36 @@ fn read_le8(partial: &ZSetBatch, ci: usize, row: usize) -> [u8; 8] {
     fixed_slice(partial, ci, row, 8).try_into().unwrap()
 }
 
-// ---------------------------------------------------------------------------
-// Finishing / rendering
-// ---------------------------------------------------------------------------
-
-/// Finish one aggregate to its output cell, per its mapping's shape (AVG
-/// divide, nullable-SUM null-gate, or the accumulator's own value).
-fn finish_agg(spec: &FoldShape, accs: &[ColAcc], agg_idx: usize) -> Option<u64> {
-    let m = &spec.layout.agg_mappings[agg_idx];
-    let sum = &accs[m.specs_start];
-    if !m.shape.has_count_companion() {
-        return acc_bits(sum);
-    }
-    // AVG and nullable SUM both take their null-ness from the CountNonNull
-    // companion at `specs_start + 1` rather than from the value accumulator.
-    let cnt = acc_count(&accs[m.specs_start + 1]);
-    if cnt == 0 {
-        return None;
-    }
-    match m.shape {
-        AggShape::Avg => Some((sum_f64(sum) / cnt as f64).to_bits()),
-        AggShape::NullfillSum | AggShape::Direct => acc_bits(sum),
-    }
-}
-
-/// The combined accumulator's register image, or `None` for SQL NULL — shared by
-/// the aggregate render and the group batch the HAVING filter runs over, so the
-/// two cannot drift. NULL for an uncontributed SUM / MIN / MAX (the global ground
-/// row, or an all-NULL group); counts are always concrete.
+/// The combined accumulator's register image, or `None` for SQL NULL. NULL for
+/// an uncontributed SUM / MIN / MAX (the global ground row, or an all-NULL
+/// group); counts are always concrete.
 ///
 /// Every aggregate column is a Fixed of width `wire_stride(tc)`, and both writers
 /// keep only that many low bytes, so an accumulator's bytes pass through
 /// unchanged — the value never has to be decoded to a number to be re-emitted.
 fn acc_bits(acc: &ColAcc) -> Option<u64> {
     match acc {
-        ColAcc::IntSum { bits, seen, .. } => seen.then_some(*bits as u64),
+        ColAcc::IntSum { bits, seen } => seen.then_some(*bits as u64),
         ColAcc::FloatSum { val, seen } => seen.then(|| val.to_bits()),
         // `combine` zero-fills above the winning cell's `wire_stride(tc)` bytes.
         ColAcc::Extreme { best, .. } => best.map(u64::from_le_bytes),
     }
 }
 
-/// AVG's numerator as a number. The one place an accumulator is read as a
-/// quantity rather than as bytes, so it is also the one place signedness
-/// matters: a SUM over a U64 source is typed U64, and its i64 accumulator holds
-/// the true sum mod 2^64 — read signed, a sum past 2^63 averages negative.
-fn sum_f64(acc: &ColAcc) -> f64 {
-    match acc {
-        ColAcc::IntSum { bits, tc, .. } if tc.is_signed_int() => *bits as f64,
-        ColAcc::IntSum { bits, .. } => *bits as u64 as f64,
-        ColAcc::FloatSum { val, .. } => *val,
-        ColAcc::Extreme { .. } => unreachable!("AVG's numerator is its SUM component"),
-    }
-}
-
-fn acc_count(acc: &ColAcc) -> i64 {
-    match acc {
-        ColAcc::IntSum { bits, .. } => *bits,
-        _ => unreachable!("companion CountNonNull is an integer accumulator"),
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Output schema + row emission
+// Output schema + finalize
 // ---------------------------------------------------------------------------
 
 /// The final output schema of an ad-hoc aggregate / DISTINCT SELECT: a hidden
 /// synthetic PK (like `_distinct_pk` / `_group_pk`, stripped at presentation)
-/// followed by the SELECT-order visible columns. Rejects duplicate visible
-/// names — the same gate every view compile applies — so the routing arm fails
-/// at plan time (and the executor re-raises the identical error) instead of
-/// returning a dup-named result the view path would refuse to create.
-pub(crate) fn build_agg_out_schema(layout: &GroupByLayout, source_schema: &Schema) -> Result<Schema, GnitzSqlError> {
+/// followed by the SELECT-order visible columns the binder named and typed.
+/// Rejects duplicate visible names — the same gate every view compile applies —
+/// so the routing arm fails at plan time (and the executor re-raises the
+/// identical error) instead of returning a dup-named result the view path would
+/// refuse to create.
+pub(crate) fn build_agg_out_schema(out_cols: &[ColumnDef]) -> Result<Schema, GnitzSqlError> {
     let mut cols = vec![ColumnDef::new("_agg_pk", TypeCode::U128, false).hidden()];
-    for item in &layout.select_items {
-        match item {
-            GroupBySelectItem::GroupCol { src_col, name } => {
-                let src = &source_schema.columns[*src_col];
-                cols.push(ColumnDef::new(name.clone(), src.type_code, src.is_nullable));
-            }
-            GroupBySelectItem::Aggregate { agg_idx } => {
-                let m = &layout.agg_mappings[*agg_idx];
-                cols.push(ColumnDef::new(m.output_name.clone(), m.output_type, m.output_nullable));
-            }
-        }
-    }
+    cols.extend(out_cols.iter().cloned());
     reject_duplicate_column_names(&cols, "aggregate SELECT")?;
     Schema::from_parts(cols, vec![0])
         .map_err(|e| GnitzSqlError::Unsupported(format!("ad-hoc aggregate output schema is invalid: {e}")))
@@ -495,47 +451,86 @@ fn push_group_key(dst: &mut PkColumn, partial: &ZSetBatch, rep: Option<usize>) {
     }
 }
 
-/// Project one group into `out`, keyed by the group's `_group_pk`.
-fn emit_row(
-    spec: &FoldShape,
-    partial: &ZSetBatch,
-    out_items: &[OutItem],
-    out: &mut ZSetBatch,
-    rep: Option<usize>,
-    accs: &[ColAcc],
-) {
-    push_group_key(&mut out.pks, partial, rep);
-    out.weights.push(1);
-    let mut null_word: u64 = 0;
-    for item in out_items {
-        let col = &mut out.columns[item.ci];
-        match &item.src {
-            ItemSrc::Group { partial_ci } => {
-                let rep = rep.expect("a grouped result always has a representative row");
-                if partial.is_null(&spec.partial_schema, rep, *partial_ci) {
-                    push_null_cell(col, item.tc, &mut null_word, item.pi);
-                } else {
-                    partial.columns[*partial_ci].push_row_from(rep, item.tc.wire_stride(), col);
+/// Project the surviving groups through the finalize items — the client's
+/// post-reduce MAP. Each group keeps the `_group_pk` it was combined under.
+fn project_groups(spec: &FoldShape, groups: &ZSetBatch, ranges: &[(usize, usize)]) -> ZSetBatch {
+    let n_out: usize = ranges.iter().map(|(s, e)| e - s).sum();
+    let mut out = ZSetBatch::with_capacity(&spec.out_schema, n_out);
+    // Output column 0 is the hidden PK, so finalize item `si` lands at `si + 1`:
+    // its dense payload slot and type are resolved once here, not once per group.
+    let slots: Vec<(usize, usize, TypeCode)> = (0..spec.finalize.len())
+        .map(|si| {
+            (
+                1 + si,
+                spec.out_schema.payload_idx(1 + si),
+                spec.out_schema.columns[1 + si].type_code,
+            )
+        })
+        .collect();
+
+    // One view over the whole group batch, built once: `ViewBuffers::view`
+    // rebuilds a region list per call, so one per group would pay a malloc and a
+    // PK-region rebuild per output row.
+    let mut bufs = gnitz_core::ViewBuffers::default();
+    let view = bufs.view(groups, &spec.partial_schema);
+    let mut str_buf: Vec<u8> = Vec::new();
+
+    for &(start, end) in ranges {
+        for g in start..end {
+            out.pks.push_from(&groups.pks, g);
+            out.weights.push(1);
+            let mut null_word: u64 = 0;
+            for (item, &(ci, pi, tc)) in spec.finalize.iter().zip(&slots) {
+                let col = &mut out.columns[ci];
+                match item {
+                    FinalizeItem::PassThrough { partial_ci } => {
+                        if groups.is_null(&spec.partial_schema, g, *partial_ci) {
+                            push_null_cell(col, tc, &mut null_word, pi);
+                        } else {
+                            groups.columns[*partial_ci].push_row_from(g, tc.wire_stride(), col);
+                        }
+                    }
+                    FinalizeItem::Computed { ev, is_str: true } => {
+                        str_buf.clear();
+                        if ev.eval_row_str(&view, g, &mut str_buf) {
+                            push_null_cell(col, tc, &mut null_word, pi);
+                        } else {
+                            push_str_cell(col, &str_buf);
+                        }
+                    }
+                    FinalizeItem::Computed { ev, is_str: false } => match ev.eval_row(&view, g) {
+                        None => push_null_cell(col, tc, &mut null_word, pi),
+                        Some(v) => push_fixed_bits(col, v as u64, tc.wire_stride()),
+                    },
                 }
             }
-            ItemSrc::Agg { agg_idx } => match finish_agg(spec, accs, *agg_idx) {
-                None => push_null_cell(col, item.tc, &mut null_word, item.pi),
-                Some(bits) => push_fixed_bits(col, bits, item.tc.wire_stride()),
-            },
+            out.nulls.push(null_word);
         }
     }
-    out.nulls.push(null_word);
+    out
 }
 
-/// Push the low `stride` bytes of `bits` into a Fixed aggregate column. Every
-/// aggregate column — partial or output — is a `Fixed` of width ≤ 8:
-/// `agg_output_type` routes float SUM/MIN/MAX to F64 and SUM through
-/// `register_image_type`, and preserves a ≤8-byte integer source's own width for
-/// MIN/MAX.
+/// Push the low `stride` bytes of `bits` into a Fixed output column. Every
+/// non-string finalize result is a register image: an aggregate column is a
+/// `Fixed` of width ≤ 8 (`agg_output_type` routes float SUM/MIN/MAX to F64 and
+/// SUM through `register_image_type`, and preserves a ≤8-byte integer source's
+/// own width for MIN/MAX), and a computed one is the evaluator's own register.
 fn push_fixed_bits(col: &mut ColData, bits: u64, stride: usize) {
     match col {
         ColData::Fixed(buf) => buf.extend_from_slice(&bits.to_le_bytes()[..stride]),
-        _ => unreachable!("an ad-hoc aggregate column is a Fixed of width <= 8"),
+        _ => unreachable!("a fixed-width output column is a Fixed of width <= 8"),
+    }
+}
+
+/// Push a computed string/blob result. The evaluator's arena holds raw bytes; a
+/// STRING column's are UTF-8 by construction (every string a program can produce
+/// comes from a STRING column or a literal), so the lossy conversion is a
+/// total function that never fires.
+fn push_str_cell(col: &mut ColData, bytes: &[u8]) {
+    match col {
+        ColData::Strings(v) => v.push(Some(String::from_utf8_lossy(bytes).into_owned())),
+        ColData::Bytes(v) => v.push(Some(bytes.to_vec())),
+        ColData::Fixed(_) => unreachable!("a string-valued finalize writes a String/Blob column"),
     }
 }
 

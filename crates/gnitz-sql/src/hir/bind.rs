@@ -31,7 +31,7 @@ use crate::validate::{
     cte_body, non_recursive_ctes, plain_select_body, reject_duplicate_names, reject_float_key, reject_float_key_of,
     reject_query_envelope_body, reject_unhonored_select_clauses, validate_user_name, HonoredClauses,
 };
-use gnitz_core::{CatalogSnapshot, ColumnDef, TypeCode};
+use gnitz_core::{CatalogSnapshot, ColumnDef, Schema, TypeCode};
 use sqlparser::ast::{
     BinaryOperator, Expr, Function, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, TableFactor,
 };
@@ -39,6 +39,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// Compile a query's CTEs ahead of the main body bind. A plain pass-through CTE
 /// (`SELECT * FROM t`, no WHERE/GROUP/DISTINCT) aliases to the source's real
@@ -1290,6 +1291,28 @@ fn collect_aggs<L: LeafBinder<HirRef>>(
         Ok(())
     })?;
     Ok(is_top.then_some(top).flatten())
+}
+
+/// Bind an ad-hoc single-relation grouped body to
+/// `Project(Filter_having?(Reduce(PreMap?(Get))))` — the same suffix, over the
+/// same leaf, that a grouped `CREATE VIEW` body binds. The fold lowering
+/// (`dml::group_by`) reads the result instead of running a second binder, which
+/// is what makes one written statement mean one thing on both paths.
+///
+/// The WHERE is deliberately *not* bound here: the ad-hoc read path carries it
+/// as the `ReadSpec` predicate, with its scan bound extracted, so binding it
+/// again would compile it twice. Nothing in the grouped suffix reads it.
+///
+/// `tid` is the lowering's business, not the bind's — an ad-hoc fold names its
+/// relation in the `ReadSpec` — so the `Get` is minted without one.
+pub(crate) fn bind_adhoc_grouped(
+    ids: &ColIdGen,
+    select: &Select,
+    schema: Arc<Schema>,
+) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    let source = RelExpr::get(ids, 0, schema, None);
+    let env = source.cols();
+    bind_grouped_suffix(ids, select, source, &HirSingleTable { env: &env })
 }
 
 /// Bind the GROUP BY / aggregate / HAVING suffix over `input` (the `Filter?(source)`

@@ -2,13 +2,21 @@
 //! combine-class node (plus the linear nodes around it), cutting nested
 //! combine-class subtrees to hidden segments.
 //!
-//! This module owns the three rules the whole lowering obeys, one home each, so
-//! the per-node shells (`join`/`reduce`/`setop`) carry only their own emission:
+//! [`fold`] is the one shell that emits something else: the same `Reduce`,
+//! lowered to an ad-hoc read's fold sink instead of to a circuit. Nothing else
+//! here is circuit-specific, which is what lets the two share the reduce rule
+//! below.
+//!
+//! This module owns the rules the whole lowering obeys, one home each, so the
+//! per-node shells (`join`/`reduce`/`setop`/`fold`) carry only their own emission:
 //!
 //! * the **segment-cut** rule — [`resolve_input`] / [`cut_segment`], memoized by
 //!   `Rc::as_ptr` through one compilation-wide [`CutMemo`];
 //! * the **source-collision** rule — [`resolve_collisions`], comparing *resolved*
 //!   tids and wrapping a repeat in a pass-through segment;
+//! * the **reduce-derivation** rule — [`resolve_reduce_specs`] and
+//!   [`reduce_out_layout`], the spec decomposition and output layout both reduce
+//!   shells read, so neither can address an aggregate column the other did not;
 //! * the **exchange-topology** backstop, asserted once per emitted circuit inside
 //!   `ViewChain::add_segment` and at the final emit.
 //!
@@ -22,6 +30,7 @@
 //! private items.
 
 pub(crate) mod exists;
+pub(crate) mod fold;
 pub(crate) mod join;
 mod linear;
 pub(crate) mod prims;
@@ -31,8 +40,9 @@ pub(crate) mod setop;
 use super::chain::{EmitPieces, ViewChain};
 use super::physical;
 use super::JoinType;
-use super::{ColId, HirExpr, HirRef, ProjEntry, RelExpr};
+use super::{slot_of, ColId, HirAgg, HirExpr, HirRef, ProjEntry, RelExpr};
 use crate::access::ranked_index_bounds;
+use crate::agg::{push_agg_specs, AggSpec};
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
 use gnitz_core::{ColumnDef, RelDescriptor, Schema};
@@ -40,6 +50,83 @@ use gnitz_wire::ScanBound;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
+
+/// What a HIR `Reduce` becomes physically, before either lowering picks a sink:
+/// where its group columns and aggregate arguments sit in the reduce input, and
+/// the spec decomposition over them.
+///
+/// One home because the three are interlocked. `push_agg_specs` decides how many
+/// specs an aggregate materialises — an AVG emits two — `agg_starts` records
+/// where each aggregate's block begins, and every reduce-output column position
+/// downstream is `agg_col_offset + agg_starts[i]` (with a companion at `+ 1`).
+/// Two copies of this loop that disagreed would not fail: they would silently
+/// address the wrong aggregate column.
+pub(crate) struct ReduceSpecs {
+    /// Each group column's slot in the reduce input, parallel to `group_cols`.
+    pub(crate) group_positions: Vec<usize>,
+    /// The physical specs, pre-companion — `ensure_cardinality_count` is the
+    /// circuit lowering's own addition and is not applied here.
+    pub(crate) specs: Vec<AggSpec>,
+    /// `specs` index at which aggregate `i` begins.
+    pub(crate) agg_starts: Vec<usize>,
+}
+
+/// Resolve a `Reduce`'s group columns and aggregates against its input's layout
+/// and schema — the derivation `lower::reduce` and `lower::fold` share.
+pub(crate) fn resolve_reduce_specs(
+    group_cols: &[ColId],
+    aggs: &[HirAgg],
+    layout: &[ColId],
+    schema: &Schema,
+) -> Result<ReduceSpecs, GnitzSqlError> {
+    let group_positions: Vec<usize> = group_cols
+        .iter()
+        .map(|g| slot_of(layout, *g))
+        .collect::<Result<_, _>>()?;
+    let mut specs: Vec<AggSpec> = Vec::new();
+    let mut agg_starts: Vec<usize> = Vec::with_capacity(aggs.len());
+    for a in aggs {
+        agg_starts.push(specs.len());
+        let arg_pos = a.arg.map(|id| slot_of(layout, id)).transpose()?;
+        push_agg_specs(a.func, arg_pos, &schema.columns, &mut specs)?;
+    }
+    Ok(ReduceSpecs {
+        group_positions,
+        specs,
+        agg_starts,
+    })
+}
+
+/// The reduce output's `ColId` at each of its `width` physical slots:
+/// `group_slots[j]` holds group column `j`, and aggregate `i` its raw value at
+/// `agg_col_offset + agg_starts[i]` with its `COUNT_NON_NULL` companion, when it
+/// has one, immediately after.
+///
+/// Slots with no logical identity — a synthetic key, the cardinality COUNT —
+/// stay [`ColId::NONE`], which nothing can reference. `group_slots` is the
+/// caller's because the key region differs by sink (`group_col_reduce_pos` over
+/// the circuit's chosen out-key; the fold's is always SyntheticFold).
+pub(crate) fn reduce_out_layout(
+    width: usize,
+    group_cols: &[ColId],
+    group_slots: &[usize],
+    aggs: &[HirAgg],
+    agg_starts: &[usize],
+    agg_col_offset: usize,
+) -> Vec<ColId> {
+    let mut layout = vec![ColId::NONE; width];
+    for (j, &gid) in group_cols.iter().enumerate() {
+        layout[group_slots[j]] = gid;
+    }
+    for (i, a) in aggs.iter().enumerate() {
+        let slot = agg_col_offset + agg_starts[i];
+        layout[slot] = a.out.id;
+        if let Some(c) = &a.companion {
+            layout[slot + 1] = c.id;
+        }
+    }
+    layout
+}
 
 /// A resolved combine input: its delta source, registered schema, and the `ColId`
 /// layout (physical column order) against which key / group / projection

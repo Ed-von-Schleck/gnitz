@@ -159,9 +159,9 @@ fn scan_spec_sinks_bench() {
     });
 
     // The fold sink: GROUP BY c0 (100 groups), COUNT(*) + SUM(c2).
-    let agg = AggReadSpec {
-        group_cols: vec![1],
-        aggs: vec![
+    let agg = AggReadSpec::direct(
+        vec![1],
+        vec![
             AggReadItem {
                 op: AggFunc::from_wire(AGG_COUNT).unwrap(),
                 src_col: 0,
@@ -171,7 +171,7 @@ fn scan_spec_sinks_bench() {
                 src_col: 3,
             },
         ],
-    };
+    );
     // SyntheticFold reply: `_agg_pk` U128 PK, the group column, then one partial
     // per aggregate.
     let fold_reply = SchemaDescriptor::new(

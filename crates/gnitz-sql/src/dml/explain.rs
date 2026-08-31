@@ -44,7 +44,7 @@ pub(crate) fn execute_explain(plan: ReadPlan) -> Result<SqlResult, GnitzSqlError
                 .count();
             projection_line(reply_schema.visible_columns().count(), extra)
         }
-        SinkTail::Fold { shape, is_distinct } => fold_line(shape, schema, *is_distinct),
+        SinkTail::Fold { shape, is_distinct } => fold_line(shape, *is_distinct),
     };
 
     let facts = order_limit_facts(spec);
@@ -166,16 +166,19 @@ fn projection_line(visible: usize, extra: usize) -> String {
 /// items the worker accumulates — which is why an AVG shows as its SUM +
 /// COUNT_NON_NULL pair. `ast_util::agg_func_name` gives the SQL spelling instead
 /// (it renders `CountNonNull` as `count`), so it is deliberately not used here.
-fn fold_line(shape: &FoldShape, schema: &Schema, is_distinct: bool) -> String {
+fn fold_line(shape: &FoldShape, is_distinct: bool) -> String {
+    // Named against the reduce input, not the source: with a pre-map the reduce
+    // groups and aggregates columns the source does not have, and the hidden
+    // `_preN` the pre-map minted for the written expression is the only name one
+    // of those has.
+    let schema = &shape.reduce_schema;
     let cols = shape
-        .layout
-        .group_col_indices
+        .group_positions
         .iter()
         .map(|&c| schema.columns[c].name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
     let ops = shape
-        .layout
         .agg_specs
         .iter()
         .map(|s| {
@@ -194,7 +197,7 @@ fn fold_line(shape: &FoldShape, schema: &Schema, is_distinct: bool) -> String {
 
     let mut line = if is_distinct {
         format!("fold: distinct on ({cols})")
-    } else if shape.layout.global_ground() {
+    } else if shape.global_ground() {
         format!("fold: global aggregate: {ops}")
     } else if ops.is_empty() {
         format!("fold: group by ({cols})")

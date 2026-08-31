@@ -24,7 +24,7 @@ pub const MAX_PK_SET_KEYS: usize = 65_536;
 /// Decode-side ceiling on a full encoded `ReadSpec` blob.
 pub(crate) const MAX_READ_SPEC_BYTES: usize = 2 << 20;
 
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 
 const BOUND_NONE: u8 = 0;
 const BOUND_PK_RANGE: u8 = 1;
@@ -62,12 +62,43 @@ pub struct AggReadItem {
 }
 
 /// The fold sink's aggregate spec: a per-worker hash-fold over the scanned
-/// rows. `group_cols` are source-schema indices (empty = a global aggregate;
-/// `aggs = []` = `SELECT DISTINCT` over `group_cols`).
+/// rows. `group_cols` and `aggs[].src_col` index the **reduce input** — the
+/// pre-map's output when one is present, else the source schema (empty
+/// `group_cols` = a global aggregate; `aggs = []` = `SELECT DISTINCT` over
+/// `group_cols`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AggReadSpec {
     pub group_cols: Vec<u16>,
     pub aggs: Vec<AggReadItem>,
+    /// Compiled map program over the SOURCE schema, run between the predicate
+    /// and the fold so the reduce can group by, or aggregate, an expression
+    /// (`GROUP BY a + b`, `SUM(a * b)`). Empty = no pre-map, and the reduce
+    /// input is the source schema itself.
+    ///
+    /// The same device the view path emits at the same pipeline position — a
+    /// MAP between the WHERE filter and the reduce — so a grouped SELECT and
+    /// the equivalent grouped view compute the key and the argument alike.
+    pub pre_map: Vec<u8>,
+    /// The reduce input's payload columns as `(type_code, nullable)`, in output
+    /// order: the slots `pre_map` writes. The PK region is inherited verbatim
+    /// from the source, so the worker rebuilds the reduce-input schema as the
+    /// source's PK columns followed by these. Empty iff `pre_map` is.
+    pub pre_payload: Vec<(u8, bool)>,
+}
+
+impl AggReadSpec {
+    /// A fold that reads source columns directly — the shape every grouped
+    /// SELECT has until it groups by, or aggregates, an expression. Pairs the
+    /// two pre-map halves as empty, which is the only combination the decoder
+    /// accepts for "no pre-map".
+    pub fn direct(group_cols: Vec<u16>, aggs: Vec<AggReadItem>) -> Self {
+        AggReadSpec {
+            group_cols,
+            aggs,
+            pre_map: Vec::new(),
+            pre_payload: Vec::new(),
+        }
+    }
 }
 
 /// What the worker does with the rows surviving `bound` + `predicate` —
@@ -294,7 +325,9 @@ impl ReadSpec {
             }
             + match sink {
                 ReadSink::Rows { projection, order, .. } => projection.len() + 4 * order.len(),
-                ReadSink::Fold(agg) => 2 * agg.group_cols.len() + 3 * agg.aggs.len(),
+                ReadSink::Fold(agg) => {
+                    2 * agg.group_cols.len() + 3 * agg.aggs.len() + agg.pre_map.len() + 2 * agg.pre_payload.len()
+                }
             };
         let mut w = Writer::with_capacity(cap);
         w.u8(VERSION).u8(bound.kind()).u8(sink_tag).u8(0);
@@ -347,6 +380,11 @@ impl ReadSpec {
                 for item in &agg.aggs {
                     w.u8(item.op as u8).u16(item.src_col);
                 }
+                w.u16(agg.pre_payload.len() as u16);
+                for &(tc, nullable) in &agg.pre_payload {
+                    w.u8(tc).u8(nullable as u8);
+                }
+                w.bytes32(&agg.pre_map);
             }
         }
         w.into_vec()
@@ -464,7 +502,35 @@ impl ReadSpec {
                     let src_col = r.u16()?;
                     aggs.push(AggReadItem { op, src_col });
                 }
-                ReadSink::Fold(AggReadSpec { group_cols, aggs })
+                let n_pre = r.u16()? as usize;
+                if n_pre > MAX_COLUMNS {
+                    return Err(format!("read_spec: {n_pre} pre-map columns exceeds cap {MAX_COLUMNS}"));
+                }
+                let mut pre_payload = Vec::with_capacity(n_pre);
+                for _ in 0..n_pre {
+                    let tc = r.u8()?;
+                    if !crate::is_valid_type_code(tc) {
+                        return Err(format!("read_spec: pre-map column has unknown type code {tc}"));
+                    }
+                    let nullable = r.u8()?;
+                    if nullable > 1 {
+                        return Err(format!("read_spec: pre-map column nullable flag is {nullable}"));
+                    }
+                    pre_payload.push((tc, nullable == 1));
+                }
+                let pre_map = r.bytes32()?.to_vec();
+                // The two halves describe one reduce input: a program with no
+                // declared output slots cannot be resolved against a schema, and
+                // declared slots with no program would leave every one unwritten.
+                if pre_map.is_empty() != pre_payload.is_empty() {
+                    return Err("read_spec: fold pre-map program and column declarations disagree".to_string());
+                }
+                ReadSink::Fold(AggReadSpec {
+                    group_cols,
+                    aggs,
+                    pre_map,
+                    pre_payload,
+                })
             }
             other => return Err(format!("read_spec: unknown sink tag {other}")),
         };

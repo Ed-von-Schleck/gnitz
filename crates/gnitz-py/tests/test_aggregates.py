@@ -548,9 +548,10 @@ class TestGroupBy:
             client.drop_schema(sn)
 
     def test_having_sum_times_two(self, client):
-        """HAVING SUM(amount) * 2 > 10 — the `Mul` operator the old HAVING binder
-        lacked now binds via the unified structural core. SUM appears only in
-        HAVING (materialised by collect_having_aggs)."""
+        """HAVING SUM(amount) * 2 > 10 — `Mul` in HAVING, which the grouped leaf
+        inherits from the shared structural core rather than listing itself. SUM
+        appears only in HAVING, so the aggregate collector has to materialise a
+        reduce column the SELECT list never asked for."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -603,9 +604,9 @@ class TestGroupBy:
             client.drop_schema(sn)
 
     def test_having_sum_between(self, client):
-        """HAVING SUM(amount) BETWEEN 5 AND 20 — the `BETWEEN` desugar the old
-        HAVING binder lacked, AND the collect_having_aggs lockstep: the aggregate
-        inside BETWEEN must be materialised or binding fails to resolve it."""
+        """HAVING SUM(amount) BETWEEN 5 AND 20 — the `BETWEEN` desugar in HAVING,
+        and the collector's lockstep with it: the aggregate buried inside BETWEEN
+        must be materialised, or binding cannot resolve it to a reduce column."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -2483,9 +2484,10 @@ class TestAggregateQualifierRejection:
             client.drop_schema(sn)
 
     def test_having_distinct_rejected(self, client):
-        """The second binding site: `HAVING COUNT(DISTINCT x) > 1` routes through
-        having_agg_func, not bind_function — a SELECT-list-only fix would miss it
-        and silently evaluate COUNT(x) > 1."""
+        """`HAVING COUNT(DISTINCT x) > 1`. HAVING resolves its aggregate calls
+        through the grouped leaf, not the SELECT list's own path, so a rejection
+        added only to the latter would miss this and silently evaluate
+        COUNT(x) > 1."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:

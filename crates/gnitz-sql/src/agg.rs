@@ -1,41 +1,24 @@
-//! The aggregate layout model — the shared contract between the view circuit
-//! emitter (`hir::lower::reduce`), the ad-hoc fold router (`dml::select` /
-//! `dml::group_by`), and the client finisher (`exec::agg_finish`). Owns the
-//! physical spec layout
-//! (`push_agg_specs` is the single authority for how many specs an aggregate
-//! materialises and their output types), the per-aggregate finishing metadata
-//! (`AggMapping`/`AggShape`), and the SyntheticFold reduce-output column layout
-//! (`synthetic_fold_cols`). A sibling of `ir` so `exec` keeps its documented
-//! shape (it sinks only into shared lower layers, never up into `dml` or the
-//! `hir` view compiler).
+//! The aggregate layout model — the shared contract between the two reduce
+//! lowerings (`hir::lower::reduce` for a view's circuit, `hir::lower::fold` for
+//! an ad-hoc read) and the client finisher (`exec::agg_finish`). Owns the
+//! physical spec layout (`push_agg_specs` is the single authority for how many
+//! specs an aggregate materialises and their output types), the finalize
+//! composite that renders one (`finalize_agg_bexpr`), and the SyntheticFold
+//! reduce-output column layout (`synthetic_fold_cols`). A sibling of `ir` so
+//! `exec` keeps its documented shape (it sinks only into shared lower layers,
+//! never up into `dml` or the `hir` view compiler).
 
 use crate::ast_util::agg_func_name;
 use crate::bind::fold_null_test;
 use crate::error::GnitzSqlError;
-use crate::ir::{AggFunc, BExpr, BinOp, BoundExpr};
+use crate::ir::{AggFunc, BExpr, BinOp};
 use crate::types::has_scalar_register;
-use gnitz_core::{ColumnDef, ReduceOutKey, Schema, TypeCode};
+use gnitz_core::{ColumnDef, ReduceOutKey, Schema, TypeCode, MAX_COLUMNS};
 use gnitz_wire::{AggFunc as WireAggFunc, ReduceOutSlot};
 
-/// Tracks how a user-level aggregate maps to reduce agg_specs.
-pub(crate) struct AggMapping {
-    pub(crate) specs_start: usize, // index into agg_specs
-    pub(crate) shape: AggShape,
-    pub(crate) output_name: String,
-    pub(crate) output_type: TypeCode,
-    /// Whether the output column can be NULL at runtime, computed once at
-    /// construction (`append_agg_mapping`) and read by both the SELECT
-    /// projection's output schema and the HAVING `IS [NOT] NULL` const-fold, so
-    /// the two cannot drift. Companion shapes are blanket-nullable; `Direct` is
-    /// the exact structural fact (`AggFunc::raw_output_nullable`).
-    pub(crate) output_nullable: bool,
-    pub(crate) agg_func: AggFunc,
-    pub(crate) arg_col: Option<usize>,
-}
-
 /// How an aggregate's value column is finalized — which also fixes how many
-/// physical specs `push_agg_specs` emits and how the SELECT projection / HAVING
-/// binding read the result. `Avg` and `NullfillSum` each carry a hidden
+/// physical specs `push_agg_specs` emits and what composite
+/// [`finalize_agg_bexpr`] builds over them. `Avg` and `NullfillSum` each carry a hidden
 /// COUNT_NON_NULL companion at `specs_start + 1`: their null-ness derives from
 /// `companion == 0`, never the value column's saturating `has_value` bit.
 /// `Direct` is a single spec copied straight through.
@@ -65,70 +48,6 @@ pub(crate) struct AggSpec {
     pub(crate) out_type: TypeCode,
 }
 
-/// What each SELECT item represents in a GROUP BY query (in SELECT order).
-pub(crate) enum GroupBySelectItem {
-    GroupCol { src_col: usize, name: String },
-    Aggregate { agg_idx: usize },
-}
-
-/// The validated GROUP BY / aggregate layout for a single-relation aggregate
-/// SELECT — the analysis the ad-hoc fold path (`dml::select` /
-/// `exec::agg_finish`) consumes, kept in parity with the HIR reduce lowering by
-/// construction. `agg_specs` is the **pre-companion** physical reduce
-/// layout: the view path appends its emission-only COUNT(*) cardinality
-/// companion afterwards (a `should_emit` signal), and the stateless fold does
-/// not need one.
-pub(crate) struct GroupByLayout {
-    /// Group columns as source-schema indices (empty = a global aggregate).
-    pub(crate) group_col_indices: Vec<usize>,
-    /// Physical reduce spec layout, pre-companion (AVG → `[Sum, CountNonNull]`,
-    /// nullable SUM → `NullfillSum` companion, HAVING-only aggregates appended).
-    pub(crate) agg_specs: Vec<AggSpec>,
-    /// Per-SELECT/HAVING finishing info (AVG split, NullfillSum, output type /
-    /// nullability / name), indexed by `GroupBySelectItem::Aggregate::agg_idx`.
-    pub(crate) agg_mappings: Vec<AggMapping>,
-    /// SELECT items in projection order (group columns interleaved with
-    /// aggregates) — the arrangement the output row follows.
-    pub(crate) select_items: Vec<GroupBySelectItem>,
-}
-
-impl GroupByLayout {
-    /// The degenerate layout of `SELECT DISTINCT c1, …` — a grouped fold with
-    /// zero aggregates: every projected column is a group column, in SELECT
-    /// order. `out_cols` carries the (aliased) output names, parallel to
-    /// `group_col_indices`.
-    pub(crate) fn distinct(group_col_indices: Vec<usize>, out_cols: &[ColumnDef]) -> Self {
-        let select_items = group_col_indices
-            .iter()
-            .zip(out_cols)
-            .map(|(&src_col, c)| GroupBySelectItem::GroupCol {
-                src_col,
-                name: c.name.clone(),
-            })
-            .collect();
-        GroupByLayout {
-            group_col_indices,
-            agg_specs: Vec::new(),
-            agg_mappings: Vec::new(),
-            select_items,
-        }
-    }
-
-    /// `true` iff the group set is empty (an ungrouped / global scalar
-    /// aggregate): its SUM/MIN/MAX/AVG outputs are nullable and it grounds to
-    /// a single row over an empty source. Derived, so no constructor can state
-    /// the impossible `{empty groups, not global}` combination.
-    pub(crate) fn global_ground(&self) -> bool {
-        self.group_col_indices.is_empty()
-    }
-
-    /// First aggregate column in the SyntheticFold reduce-output layout
-    /// (`[_group_pk | group cols | agg partials]`).
-    pub(crate) fn synthetic_agg_col_offset(&self) -> usize {
-        1 + self.group_col_indices.len()
-    }
-}
-
 /// Reduce-output column index for a group column `src_col`, mirroring the
 /// reduce output schema layout keyed by `out_key`:
 ///
@@ -149,19 +68,15 @@ pub(crate) fn group_col_reduce_pos(
             .position(|&pi| pi == src_col)
             .expect("PkPermutation: every group col is a source PK col"),
         ReduceOutKey::SingleNaturalCol => 0,
-        ReduceOutKey::SyntheticFold => synthetic_group_col_pos(src_col, group_col_indices),
+        // The synthetic `_group_pk` occupies slot 0, so the group columns follow
+        // it in their declared order.
+        ReduceOutKey::SyntheticFold => {
+            1 + group_col_indices
+                .iter()
+                .position(|&gi| gi == src_col)
+                .expect("SyntheticFold: every group col is in the group list")
+        }
     }
-}
-
-/// The `SyntheticFold` position of group column `src_col`: the fold's synthetic
-/// `_group_pk` occupies slot 0, so the group columns follow in their declared
-/// order. Split out because the ad-hoc finish knows its key is a synthetic fold
-/// and so has no schema to hand [`group_col_reduce_pos`].
-pub(crate) fn synthetic_group_col_pos(src_col: usize, group_col_indices: &[usize]) -> usize {
-    1 + group_col_indices
-        .iter()
-        .position(|&gi| gi == src_col)
-        .expect("SyntheticFold: every group col is in the group list")
 }
 
 /// Materialize the shared reduce-output layout ([`ReduceOutKey::output_layout`])
@@ -198,30 +113,61 @@ fn reduce_out_key_region(
 
 /// The SyntheticFold key region ([`reduce_out_key_region`]) plus one column per
 /// physical agg spec, at the spec's `out_type` — the layout the ad-hoc partial
-/// reply schema and the HAVING binder's `agg_col_offset = 1 + n_group` assume.
+/// reply schema is, and the one the fold lowering's `agg_col_offset =
+/// 1 + n_group` assumes.
 ///
-/// `exact_nullability` is the one divergence. `Some(is_global)` asks for the
-/// exact per-spec rule (`agg_raw_nullable`, matching the engine's physical
-/// reduce schema), which the view path needs; `None` declares every aggregate
-/// column nullable, which the ad-hoc partial reply schema uses. The blanket form
-/// is conservative rather than cosmetic — that schema is also what the HAVING
-/// predicate resolves against, so over-declaring nullable only forces the
-/// evaluator's null-carrying arm, never a wrong answer.
+/// Every aggregate column is declared nullable, where the view path's
+/// [`reduce_output_schema`] states each one's exact nullability. Conservative
+/// rather than cosmetic, and only safe in this direction: this schema decodes
+/// the worker partials and is what the HAVING and finalize expressions resolve
+/// against, so over-declaring forces the evaluator's null-carrying arm, while
+/// under-declaring would let it read a NULL cell's zero bytes as a real value.
 pub(crate) fn synthetic_fold_cols(
     source_schema: &Schema,
     group_col_indices: &[usize],
     agg_specs: &[AggSpec],
-    exact_nullability: Option<bool>,
 ) -> Vec<ColumnDef> {
     let (mut cols, _) = reduce_out_key_region(ReduceOutKey::SyntheticFold, source_schema, group_col_indices);
-    for spec in agg_specs {
-        let nullable = match exact_nullability {
-            Some(is_global) => agg_raw_nullable(source_schema, spec, is_global),
-            None => true,
-        };
-        cols.push(ColumnDef::new("_agg", spec.out_type, nullable));
-    }
+    cols.extend(agg_specs.iter().map(|s| ColumnDef::new("_agg", s.out_type, true)));
     cols
+}
+
+/// The one width invariant bounding a fold plan: the partial reply layout
+/// [`synthetic_fold_cols`] builds must be a legal schema. Wider (e.g. many
+/// repeated aggregates) than the column limit has no fold reply layout — a
+/// feature limit of the direct path, which a view, whose reduce output never
+/// crosses the wire as one reply, does not have.
+///
+/// Called ahead of building that schema, not after: `Schema::from_parts` applies
+/// the same column cap, so a later check could never fire and the caller would
+/// report a generic invalid-schema message instead of the limit's own.
+fn reject_wide_fold(n_group: usize, n_aggs: usize) -> Result<(), GnitzSqlError> {
+    if 1 + n_group + n_aggs > MAX_COLUMNS {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "aggregate SELECT with {} group + aggregate columns exceeds the {MAX_COLUMNS}-column fold reply limit",
+            n_group + n_aggs
+        )));
+    }
+    Ok(())
+}
+
+/// The ad-hoc fold's partial reply schema — the one home for "what the workers
+/// emit and the client decodes", built for a grouped reduce and for the
+/// degenerate `SELECT DISTINCT` fold alike.
+///
+/// The width gate is folded in rather than left to the callers, because it has
+/// to run *before* `from_parts` (which applies the same column cap and would
+/// otherwise answer first, with a generic invalid-schema message instead of the
+/// feature limit's own) — an ordering that is easy to get wrong once per call
+/// site and impossible to get wrong here.
+pub(crate) fn fold_partial_schema(
+    reduce_in: &Schema,
+    group_positions: &[usize],
+    agg_specs: &[AggSpec],
+) -> Result<Schema, GnitzSqlError> {
+    reject_wide_fold(group_positions.len(), agg_specs.len())?;
+    Schema::from_parts(synthetic_fold_cols(reduce_in, group_positions, agg_specs), vec![0])
+        .map_err(|e| GnitzSqlError::Unsupported(format!("ad-hoc aggregate reply schema is invalid: {e}")))
 }
 
 /// The raw reduce column's nullability for one physical spec, via the shared
@@ -390,28 +336,13 @@ pub(crate) fn emit_reduce(
     }
 }
 
-/// The physical source column of a bound aggregate argument: `None` for
-/// COUNT(*), the column index for a plain (possibly qualified) reference. A
-/// computed argument (`SUM(a + b)`) is rejected — the engine aggregates a
-/// physical column.
-pub(crate) fn agg_arg_col(arg: Option<&BoundExpr>) -> Result<Option<usize>, GnitzSqlError> {
-    match arg {
-        None => Ok(None),
-        Some(BoundExpr::ColRef(c)) => Ok(Some(*c)),
-        Some(_) => Err(GnitzSqlError::Unsupported(
-            "aggregate on computed expression not supported".to_string(),
-        )),
-    }
-}
-
 /// Push the engine `agg_specs` for one aggregate and return its shape (an AVG
 /// materialises two specs — SUM then COUNT_NON_NULL). The single source of
 /// truth for the spec layout — and for each spec's output column type, recorded
 /// here (the one place the AVG split lives) so the reduce schema builder never
-/// reconstructs it from the op code. Shared by the SELECT projection and the
-/// HAVING-only materialisation so the two stay in lockstep — notably the
-/// AVG-emits-two-specs invariant, on which the reduce-output column positions
-/// and `AggMapping::specs_start` both depend.
+/// reconstructs it from the op code. Both reduce lowerings call it, so the
+/// AVG-emits-two-specs invariant — on which every reduce-output column position
+/// depends — holds identically for a view's circuit and an ad-hoc fold.
 pub(crate) fn push_agg_specs(
     agg_func: AggFunc,
     arg_col: Option<usize>,
@@ -429,8 +360,9 @@ pub(crate) fn push_agg_specs(
 
 /// The default output column name for an unaliased aggregate at SELECT position
 /// `idx` — `_` + the aggregate's canonical SQL name + the position. User-visible
-/// in the view schema, so both binders must agree; derived from the one
-/// name↔aggregate table so it cannot drift from the spelling the parser accepts.
+/// — it names a column in a view's schema and in an ad-hoc result alike —
+/// and derived from the one name↔aggregate table, so it cannot drift from the
+/// spelling the parser accepts.
 pub(crate) fn default_agg_name(func: AggFunc, idx: usize) -> String {
     format!("_{}{idx}", agg_func_name(func))
 }
@@ -440,9 +372,10 @@ pub(crate) fn default_agg_name(func: AggFunc, idx: usize) -> String {
 /// slot cannot hold them — Blob has no ordering, and the engine's integer
 /// widening reads a String's prefix as LE signed i64, which orders by neither
 /// bytes nor signedness. A non-MIN/MAX aggregate passes through, so a caller can
-/// hand its function over unconditionally. One home for the ad-hoc (DML) and HIR
-/// binds, which both reject ahead of `agg_typing`'s `Bind` backstop so the message
-/// and the error variant are the same on either path.
+/// hand its function over unconditionally. One home for the two binds that reach
+/// an aggregate call — the shared `SingleTable` leaf and the HIR grouped bind —
+/// which both reject ahead of `agg_typing`'s `Bind` backstop, so the message and
+/// the error variant are the same wherever the call was written.
 pub(crate) fn reject_min_max_unorderable(func: AggFunc, ty: TypeCode) -> Result<(), GnitzSqlError> {
     if matches!(func, AggFunc::Min | AggFunc::Max) && !has_scalar_register(ty) {
         return Err(GnitzSqlError::Unsupported(format!(
@@ -454,9 +387,14 @@ pub(crate) fn reject_min_max_unorderable(func: AggFunc, ty: TypeCode) -> Result<
 }
 
 /// The finalize composite that renders one aggregate's SELECT/HAVING value from
-/// its raw reduce output column(s) — the single definition of the rule, shared by
-/// the ad-hoc DML binder (`R = usize`, a reduce-output column position) and the
-/// HIR binder (`R = HirRef`, a column identity).
+/// its raw reduce output column(s) — the single definition of the rule, and the
+/// reason neither reduce lowering nor the client finisher carries a
+/// per-aggregate shape switch of its own: the AVG divide and the nullable-SUM
+/// null gate are *in* the expression, wherever it is evaluated.
+///
+/// Generic over the leaf `R` because [`BExpr`] is: the binder builds it over
+/// `HirRef` column identities, and the lowering resolves those to positions like
+/// any other expression.
 ///
 /// * **AVG** (`companion`, `func == Avg`) — `(sum * 1.0) / cnt`. The `* 1.0`
 ///   forces float division, which an int-source SUM/COUNT would otherwise
@@ -496,8 +434,7 @@ pub(crate) fn finalize_agg_bexpr<R>(value: R, companion: Option<R>, func: AggFun
 
 /// `IS [NOT] NULL` over a finalized aggregate — the null-test sibling of
 /// [`finalize_agg_bexpr`], generic over the leaf reference `R` for the same
-/// reason (the ad-hoc path addresses reduce-output positions, the view path
-/// `ColId`s).
+/// reason.
 ///
 /// A companion-carrying aggregate (nullable SUM / AVG) tests the hidden
 /// COUNT_NON_NULL companion instead of the value column: a linear-fold SUM's
@@ -525,7 +462,7 @@ pub(crate) fn finalize_agg_null_test<R>(
 /// shape is exactly the raw reduce column's nullability, which is the shared
 /// `AggFunc::raw_output_nullable` the engine's physical reduce schema also obeys
 /// (`ops[0]` is the value spec — for AVG the SUM component, whose shape
-/// short-circuits above anyway). One home for the ad-hoc (DML) and HIR binds.
+/// short-circuits above anyway).
 pub(crate) fn agg_output_nullable(typing: &AggTyping, arg_nullable: bool, is_global: bool) -> bool {
     typing.shape.has_count_companion() || typing.ops[0].0.raw_output_nullable(arg_nullable, is_global)
 }
@@ -626,42 +563,13 @@ pub(crate) fn agg_typing(agg_func: AggFunc, arg: Option<&ColumnDef>) -> Result<A
 /// reduce is grouped or a global scalar aggregate, so the guard is simply "no
 /// COUNT(*) present yet" — linear or not. (The companion is itself a COUNT, so it
 /// never changes the linearity `emit_reduce`'s two-phase decision reads off the
-/// full spec list.) One home for the ad-hoc (DML) and HIR reduce emitters.
+/// full spec list.) The circuit lowering's alone: the cardinality COUNT is a
+/// `should_emit` signal, and the stateless ad-hoc fold emits one partial per
+/// present group without one.
 pub(crate) fn ensure_cardinality_count(cols: &[ColumnDef], agg_specs: &mut Vec<AggSpec>) -> Result<(), GnitzSqlError> {
     if !agg_specs.iter().any(|s| s.op == WireAggFunc::Count) {
         push_agg_specs(AggFunc::Count, None, cols, agg_specs)?;
     }
-    Ok(())
-}
-
-/// Push the agg_specs + `AggMapping` for one aggregate — the single
-/// construction site, shared by the SELECT projection and the HAVING-only
-/// materialisation (`collect_having_aggs`) so the reduce-output column
-/// positions and the output nullability cannot drift between the two. Reuses
-/// `push_agg_specs` (the spec-layout authority); `is_global` is whether the
-/// group set is empty (a global aggregate's ground row renders NULL).
-pub(crate) fn append_agg_mapping(
-    agg_func: AggFunc,
-    arg_col: Option<usize>,
-    output_name: String,
-    is_global: bool,
-    source_schema: &Schema,
-    agg_specs: &mut Vec<AggSpec>,
-    agg_mappings: &mut Vec<AggMapping>,
-) -> Result<(), GnitzSqlError> {
-    let start = agg_specs.len();
-    let typing = push_agg_specs(agg_func, arg_col, &source_schema.columns, agg_specs)?;
-    let arg_nullable = arg_col.map(|c| source_schema.columns[c].is_nullable).unwrap_or(false);
-    let output_nullable = agg_output_nullable(&typing, arg_nullable, is_global);
-    agg_mappings.push(AggMapping {
-        specs_start: start,
-        shape: typing.shape,
-        output_name,
-        output_type: typing.view_type,
-        output_nullable,
-        agg_func,
-        arg_col,
-    });
     Ok(())
 }
 

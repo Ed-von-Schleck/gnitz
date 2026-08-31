@@ -19,27 +19,25 @@
 //! shape without reaching a server; [`execute_select`] runs the resulting plan and
 //! `dml::explain` formats the same plan instead of dispatching it.
 
-use crate::agg::{synthetic_fold_cols, GroupByLayout};
 use crate::ast_util::{
     body_is_grouped, classify_from, extract_table_factor_name, has_exists_in_subquery, has_scalar_subquery,
     is_bare_wildcard_projection, FromShape,
 };
 use crate::bind::{cte_passthrough, Binder};
 use crate::codec::project_schema::{build_read_projection, read_reply_shape};
-use crate::dml::group_by::{analyze_group_by, bind_having_expr, resolve_set_projection, HavingCtx};
+use crate::dml::group_by::build_fold_shape;
 use crate::dml::plan::{
     bind_where, bound_and_predicate, extract_limit, extract_offset, fetch_bound, Access, ReadBudget,
 };
 use crate::error::GnitzSqlError;
-use crate::exec::agg_finish::{agg_finish, build_agg_out_schema, FoldShape};
+use crate::exec::agg_finish::{agg_finish, FoldShape};
 use crate::exec::order::{read_spec_finish, resolve_out_schema_order, resolve_read_spec_order};
-use crate::expr_lower::compile_conjuncts_evaluator;
 use crate::validate::{
     cte_select_body, non_recursive_ctes, reject_unhonored_query_clauses, reject_unhonored_select_clauses,
     HonoredClauses, HonoredQueryClauses,
 };
 use crate::SqlResult;
-use gnitz_core::{CatalogSnapshot, GnitzClient, ReduceOutKey, RelDescriptor, Schema, ZSetBatch, MAX_COLUMNS};
+use gnitz_core::{CatalogSnapshot, GnitzClient, RelDescriptor, Schema, ZSetBatch};
 use gnitz_wire::{AggReadItem, AggReadSpec, ReadSink};
 use sqlparser::ast::{LimitClause, Query, Select, SetExpr, Statement};
 use std::sync::Arc;
@@ -485,10 +483,11 @@ fn plan_fold_read(query: &Query, route: &Route<'_>) -> Result<SpecRead, GnitzSql
     // Resolved against the finished output schema at plan time, so a key naming a
     // missing column rejects before the fold is dispatched, as HAVING already does.
     let order = resolve_out_schema_order(query.order_by.as_ref(), &shape.out_schema)?;
+    // `group_cols` / `src_col` index the reduce input — the pre-map's output when
+    // the fold carries one, which is exactly what `shape` resolved them against.
     let sink = ReadSink::Fold(AggReadSpec {
-        group_cols: shape.layout.group_col_indices.iter().map(|&c| c as u16).collect(),
+        group_cols: shape.group_positions.iter().map(|&c| c as u16).collect(),
         aggs: shape
-            .layout
             .agg_specs
             .iter()
             .map(|s| AggReadItem {
@@ -496,6 +495,8 @@ fn plan_fold_read(query: &Query, route: &Route<'_>) -> Result<SpecRead, GnitzSql
                 src_col: s.col as u16,
             })
             .collect(),
+        pre_map: shape.pre_map.clone(),
+        pre_payload: shape.pre_payload.clone(),
     });
     Ok(SpecRead {
         access,
@@ -599,81 +600,5 @@ fn build_rows_shape(select: &Select, query: &Query, schema: &Schema) -> Result<R
         reply_schema,
         projection,
         order,
-    })
-}
-
-/// The physical layout and reply schemas a GROUP BY / global aggregate / HAVING /
-/// DISTINCT read folds under — a pure function of the AST and the source schema. A
-/// shape the fold cannot express (a partial reply wider than the column limit, a
-/// HAVING the shared expression compiler rejects) is a feature-named
-/// `Unsupported`; a resolver's own `Unsupported`/`Bind` propagates.
-fn build_fold_shape(select: &Select, schema: &Schema) -> Result<FoldShape, GnitzSqlError> {
-    // Resolve the physical layout (shared with the view path). DISTINCT is the
-    // degenerate grouped fold — zero aggregates over the set-op projection
-    // resolver (bare columns only, float keys rejected); GROUP BY / global
-    // aggregates use the shared `analyze_group_by`.
-    let layout = if select.distinct.is_some() {
-        let (indices, out_cols) = resolve_set_projection(&select.projection, schema, "SELECT DISTINCT")?;
-        GroupByLayout::distinct(indices, &out_cols)
-    } else {
-        analyze_group_by(select, schema)?
-    };
-    let n_group = layout.group_col_indices.len();
-
-    // The one width invariant bounding a fold plan: the partial reply layout
-    // `[_group_pk | group cols | agg partials]` must be a legal schema. Wider
-    // (e.g. many repeated aggregates) than the column limit has no fold reply
-    // layout — a feature limit of the direct path.
-    if 1 + n_group + layout.agg_specs.len() > MAX_COLUMNS {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "aggregate SELECT with {} group + aggregate columns exceeds the {MAX_COLUMNS}-column fold reply limit",
-            n_group + layout.agg_specs.len()
-        )));
-    }
-
-    // The final output schema — built at plan time so a duplicate output name
-    // rejects before any dispatch, exactly as every view compile does.
-    let out_schema = build_agg_out_schema(&layout, schema)?;
-
-    // The partial reply schema — the shared SyntheticFold reduce-output layout the
-    // worker emits (parity with the view path's reduce schema by construction).
-    // It ships with the request and decodes every reply frame. Partial agg columns
-    // are nullable: an all-NULL SUM/MIN/MAX group emits a NULL partial the client
-    // must carry.
-    let partial_schema = Schema::from_parts(
-        // Blanket-nullable: this schema decodes the worker partials and is also
-        // what the HAVING predicate resolves against, so over-declaring only
-        // forces the evaluator's null-carrying arm.
-        synthetic_fold_cols(schema, &layout.group_col_indices, &layout.agg_specs, None),
-        vec![0],
-    )
-    .map_err(|e| GnitzSqlError::Unsupported(format!("ad-hoc aggregate reply schema is invalid: {e}")))?;
-
-    // HAVING: bind against the SyntheticFold reduce layout, then compile it with
-    // the same `BoundExpr → Evaluator` pipeline a grouped view's post-reduce
-    // FILTER uses, resolved against that layout. Compiling here (rather than in
-    // the client finish) keeps every rejection pre-dispatch, and it is the same
-    // rejection either path gives: a HAVING that fails to compile here fails as a
-    // view too — including a wide literal, which `OpcodeBackend::lower` rejects with
-    // the message that names it.
-    let having = match &select.having {
-        Some(having_expr) => {
-            let ctx = HavingCtx {
-                source_schema: schema,
-                group_col_indices: &layout.group_col_indices,
-                out_key: ReduceOutKey::SyntheticFold,
-                agg_mappings: &layout.agg_mappings,
-                agg_col_offset: layout.synthetic_agg_col_offset(),
-            };
-            compile_conjuncts_evaluator(&[&bind_having_expr(having_expr, &ctx)?], &partial_schema)?
-        }
-        None => None,
-    };
-
-    Ok(FoldShape {
-        layout,
-        partial_schema,
-        out_schema,
-        having,
     })
 }

@@ -27,7 +27,7 @@ use crate::expr::{MapPlan, PkSource};
 use crate::ops::AdhocFold;
 use crate::relation::RelationRegistry;
 use crate::schema::key::{compare_pk_bytes, opk_key, PkBuf};
-use crate::schema::{ColumnLocator, SchemaDescriptor};
+use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor};
 use crate::storage::{compare_rows, Batch, PkSetGather, ReadCursor, SourceCursor};
 use gnitz_expr::{Evaluator, LogicalProgram};
 
@@ -79,14 +79,23 @@ impl RelationRegistry {
         };
 
         match &spec.sink {
-            ReadSink::Fold(agg) => Ok(run_scan_fold_sink(
-                &mut source,
-                ctx,
-                &src_schema,
-                reply_schema,
-                agg,
-                group_cap,
-            )?),
+            ReadSink::Fold(agg) => {
+                // The reduce input: the pre-map's output when the fold carries
+                // one, else the source itself. Everything downstream — the fold's
+                // column indices, its accumulator types and its derived partial
+                // layout — is resolved against this, never against `src_schema`.
+                let pre = compile_fold_pre_map(agg, &src_schema)?;
+                let reduce_in = pre.as_ref().map_or(&src_schema, |(s, _)| s);
+                Ok(run_scan_fold_sink(
+                    &mut source,
+                    ctx,
+                    reduce_in,
+                    pre.as_ref().map(|(_, p)| p),
+                    reply_schema,
+                    agg,
+                    group_cap,
+                )?)
+            }
             ReadSink::Rows {
                 projection,
                 order,
@@ -443,27 +452,90 @@ struct ScanSinkCtx<'a> {
     chunk_rows: usize,
 }
 
+/// The fold's reduce-input schema and the pre-map producing it, or `None` when
+/// the spec carries no pre-map and the source *is* the reduce input.
+///
+/// The schema is derived, not shipped: the map inherits the source PK region
+/// verbatim ([`PkSource::Inherit`]), so the reduce input is the source's PK
+/// columns followed by the payload slots the client declared. Deriving it here
+/// is what keeps the PK half unforgeable — a client cannot describe a PK region
+/// the map does not actually produce.
+fn compile_fold_pre_map(
+    agg: &AggReadSpec,
+    src_schema: &SchemaDescriptor,
+) -> Result<Option<(SchemaDescriptor, MapPlan)>, String> {
+    if agg.pre_map.is_empty() {
+        return Ok(None);
+    }
+    // Through `DerivedSchema`, the front door that *rejects* what
+    // `SchemaDescriptor::new` asserts on: `pre_payload`'s length is the client's,
+    // and an over-wide one has to be a malformed frame rather than an abort
+    // inside a `const fn`. `push_pk_of` is the same inherit-the-input's-key
+    // prologue every other derived schema uses.
+    let mut out = DerivedSchema::new();
+    let built = out.push_pk_of(src_schema).is_some()
+        && agg
+            .pre_payload
+            .iter()
+            .all(|&(tc, nullable)| out.push(SchemaColumn::new(tc, nullable as u8)).is_some());
+    if !built {
+        return Err(format!(
+            "scan_spec fold: a pre-map declaring {} payload columns over a {}-column key \
+             is not a legal reduce input",
+            agg.pre_payload.len(),
+            src_schema.pk_indices().len()
+        ));
+    }
+    let out_schema = out.finish();
+    // `compile_projection` requires the program to write every declared payload
+    // slot, so a program disagreeing with `pre_payload` is rejected here rather
+    // than folding over an unwritten column.
+    let plan = compile_projection(&agg.pre_map, src_schema, &out_schema)?;
+    Ok(Some((out_schema, plan)))
+}
+
 /// Run the fold sink over `source`: fold every surviving chunk into per-group
 /// accumulators and return the partial reduce-output rows — or `Err` when the
 /// per-worker group cap is exceeded (a resource-exhaustion abort, before any
-/// data frame is sent). A fold spec carries no projection: survivors fold
-/// directly.
+/// data frame is sent).
+///
+/// `pre_map` is the reduce's own map, applied between the predicate and the
+/// fold — the same position the view path's circuit puts it in. It is fused
+/// with the filter (`append_map_ranges` over the survivor ranges), so a chunk is
+/// never materialized twice; without one, survivors fold directly.
 fn run_scan_fold_sink(
     source: &mut SourceCursor,
     ctx: ScanSinkCtx,
-    src_schema: &SchemaDescriptor,
+    reduce_in: &SchemaDescriptor,
+    pre_map: Option<&MapPlan>,
     reply_schema: &SchemaDescriptor,
     agg: &AggReadSpec,
     group_cap: usize,
 ) -> Result<Batch, String> {
-    let mut fold = AdhocFold::new(src_schema, reply_schema, agg, group_cap)?;
+    let mut fold = AdhocFold::new(reduce_in, reply_schema, agg, group_cap)?;
     let mut ranges: Vec<(usize, usize)> = Vec::new();
+    // The plan and its destination in one Option, so no arm can fold source-schema
+    // rows into a fold built for the reduce input. One reusable mapped batch:
+    // `clear` keeps the buffers (and resets the blob), so a wide scan pays one
+    // allocation, not one per chunk.
+    let mut pre = pre_map.map(|plan| (plan, Batch::empty_with_schema(reduce_in)));
     while let Some(chunk) = source.drain_chunk(ctx.chunk_rows) {
         if chunk.count == 0 {
             continue;
         }
         survivor_ranges(ctx.predicate, &chunk, &mut ranges);
-        fold.fold_ranges(&chunk, &ranges)?;
+        match &mut pre {
+            Some((plan, dst)) => {
+                dst.clear();
+                plan.append_map_ranges(&chunk, dst, &ranges);
+                // The map already dropped the non-survivors, so every row of
+                // `dst` folds — and a chunk none survived maps to nothing.
+                if dst.count > 0 {
+                    fold.fold_ranges(dst, &[(0, dst.count)])?;
+                }
+            }
+            None => fold.fold_ranges(&chunk, &ranges)?,
+        }
     }
     Ok(fold.finish())
 }

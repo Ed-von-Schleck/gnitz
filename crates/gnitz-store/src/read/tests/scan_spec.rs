@@ -209,3 +209,82 @@ fn scan_spec_worker_declines_a_multi_key_range() {
         None
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fold pre-map — the trust boundary
+//
+// `AggReadSpec.pre_map`/`pre_payload` are the client's, and the schema they
+// describe is *derived* here rather than shipped. These pin that a frame no
+// planner would send is refused rather than aborting the worker: the derivation
+// runs through `DerivedSchema`, whose `push`/`push_pk` reject exactly what
+// `SchemaDescriptor::new` asserts on (and its asserts are release-active).
+//
+// The fused map->fold loop over real rows is covered end-to-end by the Python
+// aggregate suite, which is the only place a *valid* pre-map program exists —
+// building one here would mean reimplementing the planner's expression compiler.
+// ---------------------------------------------------------------------------
+
+/// `(id U64 PK, v I64)` — a one-column key so the derived reduce input is the PK
+/// plus whatever `pre_payload` declares.
+fn premap_src() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    )
+}
+
+fn premap_spec(pre_map: Vec<u8>, pre_payload: Vec<(u8, bool)>) -> AggReadSpec {
+    AggReadSpec {
+        group_cols: vec![1],
+        aggs: vec![],
+        pre_map,
+        pre_payload,
+    }
+}
+
+/// The rejection message, or a panic naming the shape that was accepted.
+/// `MapPlan` is not `Debug`, so the `Ok` half cannot go through `unwrap_err`.
+fn premap_err(spec: &AggReadSpec) -> String {
+    match compile_fold_pre_map(spec, &premap_src()) {
+        Err(e) => e,
+        Ok(_) => panic!("the pre-map derivation accepted a frame it must refuse"),
+    }
+}
+
+/// No program is the ordinary fold: the source *is* the reduce input, and
+/// nothing is compiled.
+#[test]
+fn fold_pre_map_is_absent_without_a_program() {
+    let spec = premap_spec(Vec::new(), Vec::new());
+    assert!(compile_fold_pre_map(&spec, &premap_src()).unwrap().is_none());
+}
+
+/// A declaration wider than one schema can hold. `MAX_COLUMNS` payload columns
+/// on top of a 1-column key is one past the limit — the case that would reach
+/// `SchemaDescriptor::new`'s release-active `assert!` and abort the worker if the
+/// derivation did not go through `DerivedSchema` first.
+#[test]
+fn fold_pre_map_refuses_an_over_wide_declaration() {
+    let wide: Vec<(u8, bool)> = (0..crate::schema::MAX_COLUMNS)
+        .map(|_| (type_code::I64, false))
+        .collect();
+    let err = premap_err(&premap_spec(vec![1, 2, 3], wide));
+    assert!(
+        err.contains("not a legal reduce input"),
+        "an over-wide pre-map must be refused by the derivation, got: {err}"
+    );
+}
+
+/// A corrupt program blob is refused by the shared map compiler, not decoded
+/// into a plan that folds over garbage.
+#[test]
+fn fold_pre_map_refuses_a_corrupt_program() {
+    let err = premap_err(&premap_spec(vec![0xff; 8], vec![(type_code::I64, false)]));
+    assert!(
+        err.contains("projection program"),
+        "a corrupt pre-map blob must be refused by the program decoder, got: {err}"
+    );
+}

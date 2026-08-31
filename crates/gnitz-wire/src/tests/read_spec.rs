@@ -1,5 +1,6 @@
 use super::*;
 use crate::range::Cut::{After, Before};
+use crate::TypeCode;
 
 /// Encode through the production entry point; the struct is a decode-side
 /// shape, so nothing but tests ever holds one to re-encode.
@@ -76,11 +77,15 @@ fn roundtrips_every_bound_against_every_sink() {
                 .enumerate()
                 .map(|(i, &op)| AggReadItem { op, src_col: i as u16 })
                 .collect(),
+            pre_map: vec![],
+            pre_payload: vec![],
         }),
         // DISTINCT: group cols, no aggs.
         ReadSink::Fold(AggReadSpec {
             group_cols: vec![1, 2, 5],
             aggs: vec![],
+            pre_map: vec![],
+            pre_payload: vec![],
         }),
         // A global aggregate: no group cols.
         ReadSink::Fold(AggReadSpec {
@@ -89,6 +94,23 @@ fn roundtrips_every_bound_against_every_sink() {
                 op: AggFunc::Min,
                 src_col: 4,
             }],
+            pre_map: vec![],
+            pre_payload: vec![],
+        }),
+        // A pre-map fold (`GROUP BY a + b`, `SUM(a * b)`): the program plus the
+        // reduce input's payload declarations, both non-empty.
+        ReadSink::Fold(AggReadSpec {
+            group_cols: vec![7],
+            aggs: vec![AggReadItem {
+                op: AggFunc::Sum,
+                src_col: 8,
+            }],
+            pre_map: vec![4, 1, 5, 9, 2, 6],
+            pre_payload: vec![
+                (TypeCode::I64 as u8, false),
+                (TypeCode::I64 as u8, true),
+                (TypeCode::F64 as u8, true),
+            ],
         }),
     ];
     for (i, bound) in bounds.iter().enumerate() {

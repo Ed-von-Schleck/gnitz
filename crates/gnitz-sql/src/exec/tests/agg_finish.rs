@@ -1,5 +1,6 @@
 use super::*;
-use crate::agg::{synthetic_fold_cols, AggMapping};
+use crate::agg::{finalize_agg_bexpr, push_agg_specs, synthetic_fold_cols};
+use crate::expr_lower::compile_finalize_evaluator;
 use crate::ir::AggFunc;
 use crate::test_support::col_def;
 use gnitz_core::PkColumn;
@@ -36,7 +37,7 @@ fn agg_specs() -> Vec<AggSpec> {
 }
 
 fn partial_schema(src: &Schema, group_cols: &[usize], specs: &[AggSpec]) -> Schema {
-    Schema::from_parts(synthetic_fold_cols(src, group_cols, specs, None), vec![0])
+    Schema::from_parts(synthetic_fold_cols(src, group_cols, specs), vec![0])
         .expect("the SyntheticFold layout is a valid client schema")
 }
 
@@ -48,11 +49,7 @@ fn le(vs: &[i64]) -> Vec<u8> {
 /// A combined COUNT accumulator, in the shape `ColAcc::new` builds for a
 /// `SumZero` merge.
 fn count_acc(n: i64) -> ColAcc {
-    ColAcc::IntSum {
-        bits: n,
-        seen: true,
-        tc: TypeCode::I64,
-    }
+    ColAcc::IntSum { bits: n, seen: true }
 }
 
 fn fixed(col: &ColData) -> &[u8] {
@@ -62,29 +59,38 @@ fn fixed(col: &ColData) -> &[u8] {
     }
 }
 
-/// The group batch the HAVING filter runs over: group columns copied from
-/// each representative partial row, aggregate partials taken from `accs` at
-/// the declared width, and one null bit per payload slot. A wrong bit here
-/// is a silently wrong HAVING verdict, not a crash.
+/// A shape with no finalize items — enough for the two `fill_group_batch`
+/// tests, which never project.
+fn fill_only_shape(src: &Schema, group_positions: Vec<usize>, agg_specs: Vec<AggSpec>) -> FoldShape {
+    let partial_schema = partial_schema(src, &group_positions, &agg_specs);
+    FoldShape {
+        reduce_schema: Arc::new(src.clone()),
+        group_positions,
+        agg_specs,
+        pre_map: Vec::new(),
+        pre_payload: Vec::new(),
+        partial_schema,
+        // `fill_group_batch` never reads the output schema; it only has to exist.
+        out_schema: Schema::from_parts(vec![col_def("_agg_pk", TypeCode::U128, false).hidden()], vec![0]).unwrap(),
+        having: None,
+        finalize: Vec::new(),
+    }
+}
+
+/// The group batch the HAVING filter and the finalize map both run over: group
+/// columns copied from each representative partial row, aggregate partials taken
+/// from `accs` at the declared width, and one null bit per payload slot. A wrong
+/// bit here is a silently wrong HAVING verdict, not a crash.
 #[test]
 fn fill_group_batch_lays_out_values_and_null_bits() {
     let src = source_schema();
-    let specs = agg_specs();
-    let partial_s = partial_schema(&src, &[1], &specs);
-    // `fill_group_batch` never reads the output schema; it only has to exist.
-    let out_s = Schema::from_parts(vec![col_def("_agg_pk", TypeCode::U128, false).hidden()], vec![0]).unwrap();
-    let layout = GroupByLayout {
-        group_col_indices: vec![1],
-        agg_specs: specs,
-        agg_mappings: vec![],
-        select_items: vec![],
-    };
+    let spec = fill_only_shape(&src, vec![1], agg_specs());
 
     // Two representative partial rows: group 0 has g = 10, group 1 has g NULL
     // (payload slot 0). The agg columns are never read from `partial`. The
     // keys are deliberately not `0, 1`, so a staging batch that stamped the
     // group ordinal instead of copying the key would not coincide.
-    let mut partial = ZSetBatch::new(&partial_s);
+    let mut partial = ZSetBatch::new(&spec.partial_schema);
     for (row, (key, g)) in [(0x77u128, 10i64), (0x33, 0)].into_iter().enumerate() {
         partial.pks.push_u128(key);
         partial.weights.push(1);
@@ -112,12 +118,6 @@ fn fill_group_batch_lays_out_values_and_null_bits() {
         count_acc(1),
     ];
 
-    let spec = FoldShape {
-        layout,
-        partial_schema: partial_s,
-        out_schema: out_s,
-        having: None,
-    };
     let got = fill_group_batch(&spec, &partial, &reps, &accs);
 
     assert_eq!(got.len(), 2);
@@ -149,22 +149,8 @@ fn fill_group_batch_lays_out_values_and_null_bits() {
 #[test]
 fn fill_group_batch_handles_the_global_ground_row() {
     let src = source_schema();
-    let specs = agg_specs();
-    let partial_s = partial_schema(&src, &[], &specs);
-    let out_s = Schema::from_parts(vec![col_def("_agg_pk", TypeCode::U128, false).hidden()], vec![0]).unwrap();
-    let layout = GroupByLayout {
-        group_col_indices: vec![],
-        agg_specs: specs,
-        agg_mappings: vec![],
-        select_items: vec![],
-    };
-    let empty = ZSetBatch::new(&partial_s);
-    let spec = FoldShape {
-        layout,
-        partial_schema: partial_s,
-        out_schema: out_s,
-        having: None,
-    };
+    let spec = fill_only_shape(&src, vec![], agg_specs());
+    let empty = ZSetBatch::new(&spec.partial_schema);
     let accs = vec![
         ColAcc::Extreme {
             best: None,
@@ -181,34 +167,40 @@ fn fill_group_batch_handles_the_global_ground_row() {
     assert_eq!(fixed(&got.columns[2]), &0i64.to_le_bytes());
 }
 
-/// The layout the fold path builds for one direct COUNT — `SELECT g,
-/// COUNT(*) … GROUP BY g` at `group_cols = [1]`, `SELECT COUNT(*)` at `[]`.
-fn count_layout(group_cols: Vec<usize>) -> GroupByLayout {
-    let grouped = !group_cols.is_empty();
-    GroupByLayout {
-        group_col_indices: group_cols,
-        agg_specs: vec![AggSpec {
-            op: WireAggFunc::Count,
-            col: 0,
-            out_type: TypeCode::I64,
-        }],
-        agg_mappings: vec![AggMapping {
-            specs_start: 0,
-            shape: AggShape::Direct,
-            output_name: "c".to_string(),
-            output_type: TypeCode::I64,
-            output_nullable: false,
-            agg_func: AggFunc::Count,
-            arg_col: None,
-        }],
-        select_items: grouped
-            .then(|| GroupBySelectItem::GroupCol {
-                src_col: 1,
-                name: "g".to_string(),
-            })
-            .into_iter()
-            .chain([GroupBySelectItem::Aggregate { agg_idx: 0 }])
-            .collect(),
+/// The shape the fold path builds for one direct COUNT — `SELECT g, COUNT(*) …
+/// GROUP BY g` at `group_positions = [1]`, `SELECT COUNT(*)` at `[]`. Both
+/// finalize items are pass-throughs: a group column, and a `Direct` aggregate
+/// whose finalize composite is its own raw column.
+fn count_shape(src: &Schema, group_positions: Vec<usize>) -> FoldShape {
+    let grouped = !group_positions.is_empty();
+    let agg_specs = vec![AggSpec {
+        op: WireAggFunc::Count,
+        col: 0,
+        out_type: TypeCode::I64,
+    }];
+    let partial_schema = partial_schema(src, &group_positions, &agg_specs);
+    // `[_group_pk | g? | COUNT]` — the aggregate trails the group columns.
+    let count_ci = 1 + group_positions.len();
+    let finalize: Vec<FinalizeItem> = grouped
+        .then_some(FinalizeItem::PassThrough { partial_ci: 1 })
+        .into_iter()
+        .chain([FinalizeItem::PassThrough { partial_ci: count_ci }])
+        .collect();
+    let out_cols: Vec<_> = grouped
+        .then(|| col_def("g", TypeCode::I64, true))
+        .into_iter()
+        .chain([col_def("c", TypeCode::I64, false)])
+        .collect();
+    FoldShape {
+        reduce_schema: Arc::new(src.clone()),
+        group_positions,
+        agg_specs,
+        pre_map: Vec::new(),
+        pre_payload: Vec::new(),
+        out_schema: build_agg_out_schema(&out_cols).unwrap(),
+        partial_schema,
+        having: None,
+        finalize,
     }
 }
 
@@ -217,15 +209,13 @@ fn count_layout(group_cols: Vec<usize>) -> GroupByLayout {
 /// descending — the emission ordinal and the group key then disagree on both
 /// order and value, and only the key is a function of the data.
 #[test]
-fn emit_row_copies_the_engine_group_key() {
+fn the_output_row_carries_the_engine_group_key() {
     let src = source_schema();
-    let layout = count_layout(vec![1]);
-    let partial_s = partial_schema(&src, &[1], &layout.agg_specs);
-    let out_s = build_agg_out_schema(&layout, &src).unwrap();
+    let spec = count_shape(&src, vec![1]);
 
     // (group key, g, this worker's COUNT partial). Worker 0 emits groups
     // 0x2222 then 0x1111; worker 1 emits the rest of 0x1111.
-    let mut partial = ZSetBatch::new(&partial_s);
+    let mut partial = ZSetBatch::new(&spec.partial_schema);
     for (key, g, n) in [(0x2222u128, 20i64, 1i64), (0x1111, 10, 2), (0x1111, 10, 3)] {
         partial.pks.push_u128(key);
         partial.weights.push(1);
@@ -234,12 +224,6 @@ fn emit_row_copies_the_engine_group_key() {
         push_fixed_bits(&mut partial.columns[2], n as u64, 8);
     }
 
-    let spec = FoldShape {
-        layout,
-        partial_schema: partial_s,
-        out_schema: out_s,
-        having: None,
-    };
     let got = agg_finish(&spec, &partial);
 
     assert_eq!(got.len(), 2);
@@ -256,85 +240,81 @@ fn emit_row_copies_the_engine_group_key() {
 /// when a worker did contribute one, so one logical row has one key either
 /// way.
 #[test]
-fn emit_row_grounds_the_global_row_at_v0() {
+fn the_global_ground_row_is_keyed_at_v0() {
     let src = source_schema();
-    let layout = count_layout(vec![]);
-    let partial_s = partial_schema(&src, &[], &layout.agg_specs);
-    let out_s = build_agg_out_schema(&layout, &src).unwrap();
-    let empty = ZSetBatch::new(&partial_s);
-    let spec = FoldShape {
-        layout,
-        partial_schema: partial_s,
-        out_schema: out_s,
-        having: None,
-    };
+    let spec = count_shape(&src, vec![]);
+    let empty = ZSetBatch::new(&spec.partial_schema);
     let got = agg_finish(&spec, &empty);
 
     assert_eq!(got.pks, PkColumn::from_u128s(16, [gnitz_wire::global_group_key()]));
     assert_eq!(fixed(&got.columns[1]), le(&[0]));
 }
 
-/// One AVG mapping over `[Sum, CountNonNull]` — the only layout `finish_agg`
-/// reads, so the rest of the query can stay empty.
-fn avg_layout() -> GroupByLayout {
-    GroupByLayout {
-        group_col_indices: vec![],
-        agg_specs: vec![],
-        agg_mappings: vec![AggMapping {
-            specs_start: 0,
-            shape: AggShape::Avg,
-            output_name: "a".to_string(),
-            output_type: TypeCode::F64,
-            output_nullable: true,
-            agg_func: AggFunc::Avg,
-            arg_col: None,
+/// A global `AVG(u)` over a `BIGINT UNSIGNED` column, built the way the planner
+/// builds one: `push_agg_specs` splits it into `[Sum, CountNonNull]`, and the
+/// finalize item is the shared composite over the two partial columns. That
+/// composite is the *only* place the division happens on this path, so these
+/// tests exercise it rather than a helper of their own.
+fn avg_shape() -> FoldShape {
+    let src = Schema {
+        columns: vec![col_def("pk", TypeCode::U64, false), col_def("u", TypeCode::U64, true)],
+        pk_cols: vec![0],
+    };
+    let mut agg_specs = Vec::new();
+    push_agg_specs(AggFunc::Avg, Some(1), &src.columns, &mut agg_specs).unwrap();
+    let partial_schema = partial_schema(&src, &[], &agg_specs);
+    // A global aggregate has no group columns, so the SUM lands at partial
+    // column 1 and its COUNT_NON_NULL companion at 2.
+    let ev = compile_finalize_evaluator(&finalize_agg_bexpr(1, Some(2), AggFunc::Avg), &partial_schema).unwrap();
+    let is_str = ev.result_is_str();
+    FoldShape {
+        reduce_schema: Arc::new(src),
+        group_positions: Vec::new(),
+        agg_specs,
+        pre_map: Vec::new(),
+        pre_payload: Vec::new(),
+        out_schema: build_agg_out_schema(&[col_def("a", TypeCode::F64, true)]).unwrap(),
+        partial_schema,
+        having: None,
+        finalize: vec![FinalizeItem::Computed {
+            ev: Box::new(ev),
+            is_str,
         }],
-        select_items: vec![],
     }
 }
 
-fn finish_avg(layout: GroupByLayout, accs: &[ColAcc]) -> Option<f64> {
-    let spec = FoldShape {
-        layout,
-        partial_schema: source_schema(),
-        out_schema: Schema::from_parts(vec![col_def("_agg_pk", TypeCode::U128, false).hidden()], vec![0]).unwrap(),
-        having: None,
-    };
-    finish_agg(&spec, accs, 0).map(f64::from_bits)
+/// Drive one worker partial `(sum bits, count)` through the whole finish and
+/// read the AVG cell back.
+fn finish_avg(sum_bits: i64, cnt: i64) -> Option<f64> {
+    let spec = avg_shape();
+    let mut partial = ZSetBatch::new(&spec.partial_schema);
+    partial.pks.push_u128(gnitz_wire::global_group_key());
+    partial.weights.push(1);
+    partial.nulls.push(0);
+    push_fixed_bits(&mut partial.columns[1], sum_bits as u64, 8);
+    push_fixed_bits(&mut partial.columns[2], cnt as u64, 8);
+
+    let got = agg_finish(&spec, &partial);
+    assert_eq!(got.len(), 1);
+    (!gnitz_core::null_word_get(got.nulls[0], 0))
+        .then(|| f64::from_bits(u64::from_le_bytes(fixed(&got.columns[1])[..8].try_into().unwrap())))
 }
 
 /// AVG divides its SUM accumulator at the accumulator's declared type. A SUM
-/// over a `BIGINT UNSIGNED` source is typed U64, so past 2^63 its i64 bit
-/// pattern only reads as the true sum unsigned.
+/// over a `BIGINT UNSIGNED` source is typed U64 on the partial schema, so past
+/// 2^63 its i64 bit pattern only reads as the true sum unsigned — and it is that
+/// declared type, not a switch in the finisher, that makes the divide unsigned.
 #[test]
 fn avg_divides_an_unsigned_sum_unsigned() {
     // One cell of 2^64 - 1: the accumulator holds -1, which is that sum only
     // when read unsigned. (2^64 - 1 has no exact f64 image; it rounds to 2^64.)
-    let unsigned = ColAcc::IntSum {
-        bits: -1,
-        seen: true,
-        tc: TypeCode::U64,
-    };
-    assert_eq!(
-        finish_avg(avg_layout(), &[unsigned, count_acc(1)]),
-        Some(1.8446744073709552e19)
-    );
-    // The same bit pattern over a signed source is genuinely -1.
-    let signed = ColAcc::IntSum {
-        bits: -1,
-        seen: true,
-        tc: TypeCode::I64,
-    };
-    assert_eq!(finish_avg(avg_layout(), &[signed, count_acc(1)]), Some(-1.0));
+    assert_eq!(finish_avg(-1, 1), Some(1.8446744073709552e19));
 }
 
 /// A zero CountNonNull companion is AVG's NULL — an empty or all-NULL group.
+/// The composite renders it by dividing by zero, so nothing has to special-case
+/// it.
 #[test]
 fn avg_nulls_on_a_zero_count_companion() {
-    let sum = ColAcc::IntSum {
-        bits: 0,
-        seen: false,
-        tc: TypeCode::I64,
-    };
-    assert_eq!(finish_avg(avg_layout(), &[sum, count_acc(0)]), None);
+    assert_eq!(finish_avg(0, 0), None);
 }
