@@ -10,7 +10,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
-use gnitz_core::{ColumnDef, DeltaCursor, Invalidate, MirrorStore, RawBlock, Schema, Shape, StoreRead, TypeCode};
+use gnitz_core::{
+    ColData, ColumnDef, DeltaCursor, Invalidate, MirrorStore, RawBlock, Schema, Shape, StoreRead, TypeCode,
+};
 use gnitz_engine_testkit::{
     assert_child_ok, in_child_test, make_batch, make_schema_u64_i64, run_test_in_child, scratch_dir, CHILD_OK,
 };
@@ -83,18 +85,27 @@ fn registered(name: &str) -> (Mirror, String) {
     (store, dir)
 }
 
-/// `pk → summed weight` for every row the copy holds, or `None` when the store
-/// does not answer for it.
+/// `(pk, payload) → summed weight` for every row the copy holds, or `None` when
+/// the store does not answer for it.
 ///
 /// **Weight-exact, because that is what correctness means here**: a row-set
 /// comparison would accept a delta applied twice, which leaves the row set
 /// identical and doubles every weight in the interval.
-fn held(store: &mut Mirror, tid: u64) -> Option<BTreeMap<u64, i64>> {
+///
+/// **Keyed by the payload as well as the PK**, which is the element identity
+/// every store path uses. Folding on the PK alone would sum two rows that differ
+/// only in payload onto one entry, and would let a payload the round-stamp strip
+/// mangled pass unnoticed — the keys and their weights would still line up.
+fn held(store: &mut Mirror, tid: u64) -> Option<BTreeMap<(u64, i64), i64>> {
     let (_, batch) = store.scan(tid).expect("a scan of a held copy")?;
+    let ColData::Fixed(vals) = &batch.columns[1] else {
+        panic!("the copy's one payload column is fixed-width")
+    };
     let mut out = BTreeMap::new();
     for row in 0..batch.weights.len() {
         let pk = u64::from_le_bytes(batch.pks.buf[row * 8..row * 8 + 8].try_into().unwrap());
-        *out.entry(pk).or_insert(0) += batch.weights[row];
+        let val = i64::from_le_bytes(vals[row * 8..row * 8 + 8].try_into().unwrap());
+        *out.entry((pk, val)).or_insert(0) += batch.weights[row];
     }
     out.retain(|_, w| *w != 0);
     Some(out)
@@ -209,7 +220,7 @@ fn the_cursor_is_the_read_gate() {
     store
         .ingest(TID, plain(&[(1, 1, 10)]), Shape::Plain, cursor(4))
         .unwrap();
-    assert_eq!(held(&mut store, TID).unwrap(), BTreeMap::from([(1, 1)]));
+    assert_eq!(held(&mut store, TID).unwrap(), BTreeMap::from([((1, 10), 1)]));
     let StoreRead::Held(rows) = store.scan_spec(TID, &spec, &view_schema()).unwrap() else {
         panic!("a copy with a cursor answers its own reads")
     };
@@ -233,7 +244,7 @@ fn an_ingest_applies_before_it_advances() {
     assert_eq!(store.cursor_of(TID), Some(cursor(5)));
     assert_eq!(
         held(&mut store, TID).unwrap(),
-        BTreeMap::from([(1, 2), (2, 1), (3, 1)]),
+        BTreeMap::from([((1, 10), 2), ((2, 20), 1), ((3, 30), 1)]),
         "the round stamp is stripped and the repeated key folds onto its own element",
     );
 }
@@ -279,7 +290,7 @@ fn a_checkpoint_covers_a_cursor_this_session_never_claimed() {
         "the unclaimed copy's position survived the checkpoint that republished it",
     );
     store.register(OTHER_TID, SCHEMA, "w", &view_schema()).unwrap();
-    assert_eq!(held(&mut store, OTHER_TID).unwrap(), BTreeMap::from([(9, 1)]));
+    assert_eq!(held(&mut store, OTHER_TID).unwrap(), BTreeMap::from([((9, 90), 1)]));
 }
 
 // ---------------------------------------------------------------------------
@@ -381,7 +392,10 @@ fn auto_checkpoint_failure_child() {
         Some(cursor(4)),
         "the cursor advanced with the delta it followed; what failed was durability",
     );
-    assert_eq!(held(&mut store, TID).unwrap(), BTreeMap::from([(1, 1), (2, 1)]));
+    assert_eq!(
+        held(&mut store, TID).unwrap(),
+        BTreeMap::from([((1, 10), 1), ((2, 20), 1)])
+    );
 
     // The seam is one-shot, so this round's own checkpoint is the real thing.
     store
@@ -389,7 +403,7 @@ fn auto_checkpoint_failure_child() {
         .expect("the next round applies");
     assert_eq!(
         held(&mut store, TID).unwrap(),
-        BTreeMap::from([(1, 1), (2, 2)]),
+        BTreeMap::from([((1, 10), 1), ((2, 20), 2)]),
         "the interval the failed checkpoint covered must not be applied a second time",
     );
     println!("{CHILD_OK}");

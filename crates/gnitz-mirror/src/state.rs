@@ -184,3 +184,7 @@ pub(crate) fn write_state(
 fn path(base_dir: &str) -> String {
     format!("{base_dir}/{STATE_FILENAME}")
 }
+
+#[cfg(test)]
+#[path = "tests/state.rs"]
+mod tests;

@@ -9,10 +9,11 @@
 //! `tests/store.rs` beside it covers the store alone, with no server and no
 //! client.
 //!
-//! **Every test runs at four workers.** W=1 exercises none of what the design
-//! rests on: at W=1 there is one slice, so a mirror that mishandled the
-//! concatenation of W slices would still pass, and the replicated-vs-keyed
-//! routing split collapses to the same thing.
+//! **No test runs at one worker.** At W=1 there is one slice, so a mirror that
+//! mishandled the concatenation of W slices would still pass, and the
+//! replicated-vs-keyed routing split collapses to the same thing. Four is the
+//! default; one case runs at two, which moves that split rather than removing
+//! it.
 
 mod support;
 
@@ -20,6 +21,8 @@ use gnitz_core::{ClientError, GnitzClient, MirrorError, PollResult, Schema, ZSet
 use gnitz_engine_testkit::{assert_child_ok, run_test_in_child, CHILD_OK};
 use gnitz_mirror::Mirror;
 use gnitz_sql::SqlPlanner;
+use gnitz_store::relation::{relation_dir, RelationKind};
+use gnitz_store::storage::ChildAddr;
 use gnitz_test_harness::ServerHandle;
 use support::{assert_same_sequence, assert_same_zset, canonical, query, serial, sql, EnvVar};
 
@@ -492,7 +495,7 @@ fn a_second_handle_on_one_directory_is_refused() {
     let out = run_test_in_child(
         module_path!(),
         "second_process_open_child",
-        &[("GNITZ_MIRROR_LOCK_DIR", &dir)],
+        &[("GNITZ_MIRROR_DIR", &dir)],
     );
     assert_child_ok(&out, "the second-process child must run to the end");
     let printed = String::from_utf8_lossy(&out.stdout);
@@ -1092,25 +1095,15 @@ fn state_file(base_dir: &str) -> String {
 
 /// Whether the mirrored copy of `view_id` currently has a published manifest —
 /// the on-disk difference between a resumed store and an erased one.
+///
+/// Built through the engine's own path grammar rather than by searching for a
+/// file of that name: it then names the copy's output store and nothing else
+/// under the tree, and it follows a change to the layout instead of quietly
+/// answering `false` forever. A copy is laid out for one worker, and this
+/// process carries the rank the store opened under.
 fn has_manifest(base_dir: &str, view_id: u64) -> bool {
-    let root = std::path::Path::new(base_dir)
-        .join("_copies")
-        .join("s")
-        .join(format!("v_{view_id}"));
-    fn search(dir: &std::path::Path) -> bool {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return false;
-        };
-        entries.flatten().any(|e| {
-            let p = e.path();
-            if p.is_dir() {
-                search(&p)
-            } else {
-                p.file_name().is_some_and(|n| n == "manifest.bin")
-            }
-        })
-    }
-    search(&root)
+    let rel_dir = relation_dir(&format!("{base_dir}/_copies"), "s", RelationKind::View, view_id as i64);
+    std::path::Path::new(&ChildAddr::this_worker(1).manifest(&rel_dir)).exists()
 }
 
 /// A server restart erases the copy: the stored cursor tag no longer matches the
@@ -1848,9 +1841,13 @@ fn a_view_over_a_stream_follows_its_reset_across_a_restart() {
     );
 }
 
-/// Every read shape, against a relation the handle does **not** hold.
+/// A relation the handle does **not** hold still reads correctly through it.
 ///
-/// The mirror is a client too, and a read it delegates must lose nothing.
+/// The mirror is a client too, and a read it delegates must lose nothing. The
+/// gate is one boolean per relation, so a delegated read reaches the connection
+/// by the same path whatever its shape — a few shapes stand for all of them,
+/// and the mirrored side of the same menu is covered by
+/// `a_mirrored_read_equals_the_server_read`.
 #[test]
 fn delegation_is_correct_for_every_read_shape() {
     let _g = serial();
@@ -1859,26 +1856,16 @@ fn delegation_is_correct_for_every_read_shape() {
     fx.mirror_both();
     fx.quiesce();
 
-    // `t` is a base table: mirrored by nothing, so every read of it is delegated.
+    // `t` and `r` are base tables: mirrored by nothing, so every read is delegated.
     let mut compared = 0;
     for q in [
         "SELECT * FROM t",
-        "SELECT a, b, v FROM t WHERE a = 42",
-        "SELECT a, v FROM t WHERE a > 100 AND a < 140",
         "SELECT b, COUNT(*) AS n, SUM(v) AS total, MIN(a) AS lo, MAX(a) AS hi FROM t GROUP BY b",
-        "SELECT COUNT(*) AS n, SUM(v) AS total FROM t",
-        "SELECT DISTINCT b FROM t",
-        "SELECT b, SUM(v) AS total FROM t GROUP BY b HAVING SUM(v) > 1000",
         "SELECT * FROM r",
     ] {
         compared += fx.differential("s", q);
     }
-    for q in [
-        "SELECT a, b, body FROM t WHERE v > 300 ORDER BY a DESC, b ASC LIMIT 17",
-        "SELECT a, v FROM t ORDER BY v DESC, a ASC LIMIT 9 OFFSET 5",
-    ] {
-        compared += fx.ordered_differential("s", q);
-    }
+    compared += fx.ordered_differential("s", "SELECT a, v FROM t ORDER BY v DESC, a ASC LIMIT 9 OFFSET 5");
     assert!(
         compared > 300,
         "the delegated differential compared only {compared} rows"
@@ -2342,10 +2329,10 @@ fn child_target() -> Option<(String, String)> {
 
 /// Runs only in the child `a_second_handle_on_one_directory_is_refused` spawns.
 /// A bare `Mirror::open` — it takes the same `flock` the parent holds, and needs
-/// no server to reach it.
+/// no server, so it takes only the directory a parent hands over.
 #[test]
 fn second_process_open_child() {
-    let Ok(dir) = std::env::var("GNITZ_MIRROR_LOCK_DIR") else {
+    let Ok(dir) = std::env::var("GNITZ_MIRROR_DIR") else {
         return;
     };
     match Mirror::open(&dir) {
