@@ -10,7 +10,7 @@ use super::*;
 /// Where a bounded view's per-key replay seeds: a register to feed, a store to
 /// feed it from, and the program offset to dispatch from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Hydration {
+pub(in crate::query) struct Hydration {
     /// The offset the replay enters at, past the prologue whose output the seed
     /// replaces. `0` replays the whole program.
     pub start_pc: usize,
@@ -21,7 +21,7 @@ pub(crate) struct Hydration {
 /// The store a [`Hydration`] seeds from — the only axis the two eligible view
 /// bodies differ on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HydrationSeed {
+pub(in crate::query) enum HydrationSeed {
     /// Linear (`ScanDelta → Filter? → Map? → IntegrateSink`): the source
     /// relation's own store, feeding the `ScanDelta`'s register.
     Relation(i64),
@@ -49,65 +49,61 @@ fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, CompileErro
         .ordered
         .iter()
         .copied()
-        .find(|nid| matches!(loaded.nodes.get(nid), Some(OpNode::IntegrateSink)))
+        .find(|&nid| matches!(loaded.op(nid), OpNode::IntegrateSink))
         .ok_or(CompileError::Rejected("bounded view: circuit has no IntegrateSink"))?;
     let mut cur = loaded.inputs(sink).unary();
     loop {
-        match loaded.nodes.get(&cur) {
-            Some(OpNode::Filter(_)) | Some(OpNode::Map(_)) => cur = loaded.inputs(cur).unary(),
+        match loaded.op(cur) {
+            OpNode::Filter(_) | OpNode::Map(_) => cur = loaded.inputs(cur).unary(),
             // The linear shape: the whole program replays over the source store,
             // seeded at this `ScanDelta`'s own register.
-            Some(OpNode::ScanDelta { source, .. }) => {
+            OpNode::ScanDelta { source, .. } => {
                 return Ok(HydrationNodes::Relation {
                     nid: cur,
                     source: *source as i64,
                 })
             }
-            Some(OpNode::Union) => break,
+            OpNode::Union => break,
             _ => return Err(CompileError::Rejected("bounded view: unsupported circuit shape")),
         }
     }
     let union = cur;
 
-    // 2. Both `Union` inputs must be `Join(DeltaTrace)`, optionally behind one
-    //    `Map` — the per-branch projection that puts each branch's output back
-    //    into canonical `[A, B]` column order. The node is in the circuit on both
-    //    branches whatever `emit_map` does with it: the AB one is an identity the
-    //    emitter elides, the BA one a real column permutation that emits.
+    // 2. Both `Union` inputs must be `Join(DeltaTrace)`, optionally behind the
+    //    per-branch `Map` that restores canonical `[A, B]` column order (an
+    //    identity the emitter elides on one branch, a real permutation on the
+    //    other — both are in the circuit either way).
     let (branch_a, branch_b) = loaded.inputs(union).binary();
-    let through_map = |mut nid: i32| -> Option<i32> {
-        if matches!(loaded.nodes.get(&nid), Some(OpNode::Map(_))) {
+    let join_of = |mut nid: i32| -> Result<i32, CompileError> {
+        if matches!(loaded.op(nid), OpNode::Map(_)) {
             nid = loaded.inputs(nid).unary();
         }
-        matches!(loaded.nodes.get(&nid), Some(OpNode::Join(JoinKind::DeltaTrace))).then_some(nid)
+        matches!(loaded.op(nid), OpNode::Join(JoinKind::DeltaTrace))
+            .then_some(nid)
+            .ok_or(CompileError::Rejected(
+                "bounded view: union input is not an inner delta/trace join",
+            ))
     };
-    let j_a = through_map(branch_a).ok_or(CompileError::Rejected(
-        "bounded view: union input is not an inner delta/trace join",
-    ))?;
-
-    // 3. Seed check, stated directly on the graph rather than through a
-    //    register-identity or schema-equality proxy: the trace `J_a` joins
-    //    against must be the integral of `J_a`'s *own* delta port. Either branch
-    //    computes the same product and each carries its own normalization map
-    //    back to canonical `[A, B]` order, so taking `J_a` needs no left/right
-    //    inference. The unchosen branch stays inert: the dispatch clears every
-    //    delta register on entry, so `D_b` is empty and `J_b` unions in nothing.
-    // Each join's trace port, checked to be an integral. Two calls, two messages,
-    // so a rejection names the branch it came from.
-    let trace_of = |j: i32, whose: &'static str| -> Result<i32, CompileError> {
+    let trace_of = |j: i32| -> Option<i32> {
         let t = loaded.inputs(j).binary().1;
-        matches!(loaded.nodes.get(&t), Some(OpNode::IntegrateTrace))
-            .then_some(t)
-            .ok_or(CompileError::Rejected(whose))
+        matches!(loaded.op(t), OpNode::IntegrateTrace).then_some(t)
     };
+    let (j_a, j_b) = (join_of(branch_a)?, join_of(branch_b)?);
+
+    // 3. Seed check, stated on the graph rather than through a register-identity
+    //    or schema-equality proxy: the trace `J_a` joins against must be the
+    //    integral of `J_a`'s *own* delta port. Either branch computes the same
+    //    product, so taking `J_a` needs no left/right inference, and the unchosen
+    //    one stays inert — the dispatch clears every delta register on entry, so
+    //    `D_b` is empty and `J_b` unions in nothing. `T_b` integrates the other
+    //    branch's delta, so the seed is the trace whose input node is `D_a`.
     let d_a = loaded.inputs(j_a).binary().0;
-    trace_of(j_a, "bounded view: the seeded join's trace port is not an integral")?;
-    // `T_b` integrates the *other* branch's delta, so the seed is the trace whose
-    // input node is `D_a` — found on the sibling join.
-    let j_b = through_map(branch_b).ok_or(CompileError::Rejected(
-        "bounded view: union input is not an inner delta/trace join",
+    trace_of(j_a).ok_or(CompileError::Rejected(
+        "bounded view: the seeded join's trace port is not an integral",
     ))?;
-    let t_a = trace_of(j_b, "bounded view: the sibling join's trace port is not an integral")?;
+    let t_a = trace_of(j_b).ok_or(CompileError::Rejected(
+        "bounded view: the sibling join's trace port is not an integral",
+    ))?;
     if loaded.inputs(t_a).unary() != d_a {
         return Err(CompileError::Rejected(
             "bounded view: the join's trace port is not the other branch's delta integral",

@@ -1,10 +1,7 @@
 use super::*;
-use gnitz_wire::{JoinKind, MapKind, OpNode, RangeRel, ReindexRole};
+use crate::query::compiler::{scan_delta, scatter_reindex, PORT_IN, PORT_IN_A, PORT_TRACE};
+use gnitz_wire::{JoinKind, OpNode, RangeRel};
 use std::collections::HashMap;
-
-const PORT_IN: i32 = gnitz_wire::PORT_IN as i32;
-const PORT_IN_A: i32 = gnitz_wire::PORT_IN_A as i32;
-const PORT_TRACE: i32 = gnitz_wire::PORT_TRACE as i32;
 
 /// A two-sided join over source 7 (reindexed on `key_cols`, so it carries a
 /// scatter key) and source 9 (no reindex at all), with an output
@@ -16,22 +13,15 @@ const PORT_TRACE: i32 = gnitz_wire::PORT_TRACE as i32;
 ///
 /// One shape covers every route: source 7 is the join relay, source 9 the
 /// keyless one, and source 0 the output relay.
-fn join_meta(kind: JoinKind, key_cols: Vec<u32>) -> ViewMeta {
-    let mut nodes: HashMap<i32, OpNode> = HashMap::new();
-    nodes.insert(0, OpNode::ScanDelta { source: 7, bound: None });
-    nodes.insert(
-        1,
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![0],
-            reindex_cols: key_cols,
-            reindex_target_tcs: vec![],
-            role: ReindexRole::ScatterKey,
-        }),
-    );
-    nodes.insert(2, OpNode::ScanDelta { source: 9, bound: None });
-    nodes.insert(3, OpNode::Join(kind));
-    nodes.insert(4, OpNode::ExchangeShard { shard_cols: vec![1] });
-    nodes.insert(5, OpNode::IntegrateSink);
+fn join_meta(kind: JoinKind, key_cols: &[u32]) -> ViewMeta {
+    let nodes: HashMap<i32, OpNode> = HashMap::from([
+        (0, scan_delta(7)),
+        (1, scatter_reindex(key_cols)),
+        (2, scan_delta(9)),
+        (3, OpNode::Join(kind)),
+        (4, OpNode::ExchangeShard { shard_cols: vec![1] }),
+        (5, OpNode::IntegrateSink),
+    ]);
     let edges = vec![
         (0, 1, PORT_IN),
         (1, 3, PORT_IN_A),
@@ -84,7 +74,7 @@ fn join_cols(route: &RelayRoute) -> Option<Vec<u32>> {
 /// one, and reading either as one broadcasts what must scatter.
 #[test]
 fn only_the_keyed_source_of_a_pure_range_join_broadcasts() {
-    let meta = join_meta(pure_range(0), vec![1]);
+    let meta = join_meta(pure_range(0), &[1]);
     assert_eq!(meta.range_join_n_eq, Some(0));
     assert!(
         matches!(meta.relay_route(7), RelayRoute::Broadcast),
@@ -109,7 +99,7 @@ fn only_the_keyed_source_of_a_pure_range_join_broadcasts() {
 /// carries no `range_join_n_eq`, routes by the whole key.
 #[test]
 fn a_band_join_routes_by_the_equality_prefix_and_an_equi_join_by_the_whole_key() {
-    let band = join_meta(pure_range(1), vec![3, 4]);
+    let band = join_meta(pure_range(1), &[3, 4]);
     assert_eq!(band.range_join_n_eq, Some(1));
     assert_eq!(
         join_cols(band.relay_route(7)),
@@ -117,7 +107,7 @@ fn a_band_join_routes_by_the_equality_prefix_and_an_equi_join_by_the_whole_key()
         "the trailing range slot must not route"
     );
 
-    let equi = join_meta(JoinKind::DeltaTrace, vec![3, 4]);
+    let equi = join_meta(JoinKind::DeltaTrace, &[3, 4]);
     assert_eq!(equi.range_join_n_eq, None);
     assert_eq!(join_cols(equi.relay_route(7)), Some(vec![3, 4]));
 }

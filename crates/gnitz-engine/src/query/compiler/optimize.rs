@@ -1,20 +1,18 @@
 //! What the compiler derives from a circuit besides its instructions:
-//! [`CircuitFacts`] — the routing, shape and scan-hint bundle the runtime reads
-//! off a view — plus the distinct elision the emitter consults and the promotion
-//! validators both of them lean on.
+//! [`CircuitFacts`] — the routing and shape bundle the runtime reads off a
+//! view.
 
 use super::*;
 use gnitz_store::schema::Placement;
 
 /// Everything the runtime needs to know about a view's circuit that is not the
-/// executable plan: its routing, its shape, and its source scan's access hint.
+/// executable plan: its routing and its shape.
 ///
-/// One struct with one producer because these are projections of one circuit, and
-/// deriving them apart let them disagree — the master derives the relay's key in
-/// its process while the worker derives the scatter set in its own. Anything
-/// order-sensitive is therefore read off `loaded.ordered` and never off `nodes`,
-/// whose iteration order differs per process.
-pub(crate) struct CircuitFacts {
+/// One producer, because the master derives the relay's key in its process while
+/// the worker derives the scatter set in its own, and deriving them apart let
+/// them disagree. Order-sensitive facts are therefore read off `loaded.ordered`,
+/// never off `nodes`, whose iteration order differs per process.
+pub(in crate::query) struct CircuitFacts {
     /// source table id → the one key the master relay may pack and route that
     /// source's delta by, or `None` when its scans feed several distinct keys:
     /// no single pack key then co-partitions with the trace sides, and the relay
@@ -37,49 +35,38 @@ pub(crate) struct CircuitFacts {
     pub has_join: bool,
     /// The output `ExchangeShard` is a proven no-op, so the output IPC is elided.
     pub skips_exchange: bool,
-    /// The `(source table id, secondary-index range)` the planner pushed onto the
-    /// primary source's `ScanDelta`.
-    pub source_bound: Option<(i64, gnitz_wire::ScanBound)>,
 }
 
 impl CircuitFacts {
-    /// Derive every fact, in the one place they are derived.
+    /// `ext_tables` supplies what the circuit alone cannot: co-partitioning and
+    /// the output-shard elision both test a shard key against a *source
+    /// relation's* distribution prefix.
     ///
-    /// `ext_tables` is what the routing half needs and the circuit alone cannot
-    /// supply: co-partitioning and the output-shard elision both test a shard key
-    /// against a *source relation's* distribution prefix.
-    ///
-    /// `Err` when a source's reindex maps carry no route key: its delta cannot be
-    /// scattered. Returned rather than carried as a field, because a field is a
-    /// verdict every consumer has to remember to read.
-    pub(crate) fn derive(loaded: &LoadedCircuit, ext_tables: &dyn SchemaSource) -> Result<CircuitFacts, CompileError> {
-        // source → the distinct sequences its scans feed. Deduping ACROSS scan
-        // nodes mirrors the within-node dedup in `scatter_key_of_scan`: two scans
-        // on one source carrying the same key must still resolve to one sequence,
-        // or the pack-key gate below would newly refuse a round that routes fine
-        // today.
+    /// `Err` when a source's reindex maps carry no route key, so its delta cannot
+    /// be scattered — returned rather than carried as a field no consumer is
+    /// obliged to read.
+    pub(in crate::query) fn derive(
+        loaded: &LoadedCircuit,
+        ext_tables: &dyn SchemaSource,
+    ) -> Result<CircuitFacts, CompileError> {
+        // source → the distinct sequences its scans feed. Deduped across scan nodes
+        // as well as within one, so two scans on a source carrying the same key
+        // resolve to one sequence rather than tripping the pack-key gate below.
         let mut seqs: HashMap<i64, Vec<Vec<(u32, u8)>>> = HashMap::new();
         for &nid in &loaded.ordered {
-            let Some(gnitz_wire::OpNode::ScanDelta { source, .. }) = loaded.nodes.get(&nid) else {
+            let gnitz_wire::OpNode::ScanDelta { source, .. } = loaded.op(nid) else {
                 continue;
             };
             let (node_seqs, orphaned) = load::scatter_key_of_scan(loaded, nid);
-            // A scan reaching reindex maps of which none is a `ScatterKey` is what
-            // a planner call site that forgot its role produces — the likelier of
-            // the two possible mistakes, and silently-unscattered rows if honoured.
-            // Deliberately not conditioned on the circuit carrying a `Join`: a
-            // GROUP BY or PK-redistribution circuit's group reindex is equally
-            // load-bearing for routing.
+            // Not conditioned on the circuit carrying a `Join`: a GROUP BY or
+            // PK-redistribution circuit's group reindex routes just as much.
             if orphaned {
                 return Err(CompileError::Rejected(
                     "a source's reindex maps carry no route key, so its delta cannot be scattered",
                 ));
             }
-            // WITHIN one scan the `ScatterKey` role filter and the
-            // identical-sequence dedup appear to hold every live circuit to one
-            // sequence, so a second one means the shape became constructible and
-            // wants a real plan, not a silent refusal. Across scan nodes it is only
-            // a tripwire, not a rule — see the pack-key projection below.
+            // Every live circuit holds one scan to one sequence, so a second means
+            // a newly-constructible shape that wants a real plan, not a refusal.
             debug_assert!(
                 node_seqs.len() <= 1,
                 "scan {nid} feeds {} distinct scatter keys; no single pack key routes it",
@@ -109,16 +96,10 @@ impl CircuitFacts {
             .collect();
 
         // The relay's pack key wants ONE sequence or a refusal, never the
-        // concatenation: with sequences `a` and `b` the delta would scatter by
-        // `pack(a ‖ b)` while each trace side is keyed by `pack(a)` or `pack(b)`,
-        // so the two would never co-partition and matches would drop silently.
-        // Refusing is the only safe answer, and it is the relay's to report.
-        //
-        // Two scans of one source carrying DIFFERENT keys is not SQL-reachable —
-        // the planner wraps a repeated tid in a pass-through segment before
-        // lowering a join — but a hand-built wire circuit can express it, and
-        // refusing is what this walk owes it. Deliberately NOT a `debug_assert`,
-        // unlike the per-scan tripwire above.
+        // concatenation: the delta would scatter by `pack(a ‖ b)` while each trace
+        // side is keyed by `pack(a)` or `pack(b)`, dropping every match silently.
+        // Not SQL-reachable, but a hand-built wire circuit can express it — hence a
+        // refusal here and not the `debug_assert` above.
         let keys = seqs
             .into_iter()
             .map(|(tid, mut s)| (tid, (s.len() == 1).then(|| s.pop().expect("len == 1"))))
@@ -137,26 +118,18 @@ impl CircuitFacts {
                 .nodes
                 .values()
                 .any(|op| matches!(op, gnitz_wire::OpNode::Join(_))),
-            source_bound: load::circuit_source_bound(loaded),
         })
     }
 }
 
-/// True iff `cols` is **exactly** `schema`'s distribution prefix —
-/// `pk_indices()[..k]` in PK order, where `k` is its `Keyed` prefix length. That
-/// means a derived operator co-partitions with the relation (the exchange router
-/// hashes the same leading `dist_stride` OPK bytes), so its network exchange can
-/// be skipped. A non-`Keyed` relation's rows are not placed by `worker_for_pk`
-/// at all, so no shard key names where they already are; a replicated *join*
-/// source still skips, through [`compute_co_partitioned`]'s replication arm.
+/// True iff `cols` is **exactly** `schema`'s distribution prefix, so a derived
+/// operator keyed by it co-partitions with the relation and its exchange can be
+/// skipped. Rows of a non-`Keyed` relation are not placed by `worker_for_pk` at
+/// all, so no shard key names where they already are.
 ///
-/// **Exact `== k`, never a super-prefix.** A super-prefix gate would let the two
-/// sides of a join skip at *different* prefix widths, hashing equal join keys to
-/// different workers so the elided exchange silently drops matches. A side whose
-/// join-key length differs from its own `k` instead exchanges and repartitions to
-/// the full key, reconverging with the other side.
-/// `cluster_by_super_prefix_join_safety_multiworker` in
-/// `gnitz-sql/tests/planner_cluster_by.rs` exercises this.
+/// Exact, never a super-prefix: a super-prefix would let the two sides of a join
+/// skip at different widths, hashing equal keys to different workers and
+/// silently dropping matches.
 fn shard_cols_match_dist_key(schema: &SchemaDescriptor, cols: &[u32]) -> bool {
     let Placement::Keyed { prefix_len } = schema.placement() else {
         return false;
@@ -166,19 +139,12 @@ fn shard_cols_match_dist_key(schema: &SchemaDescriptor, cols: &[u32]) -> bool {
 }
 
 pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: &dyn SchemaSource) -> HashSet<i64> {
-    // Replication skip, computed once for the whole join: if ANY participating
-    // source is replicated, EVERY participant skips its exchange. This deliberately
-    // does NOT widen `shard_cols_match_dist_key` (the pure prefix predicate also
-    // used by the partner-less single-source view-skip path, which must keep its
-    // exact semantics).
-    //   * a REPLICATED source always skips — its full copy is on every worker, so
-    //     its delta and trace are already present everywhere (the write broadcast
-    //     did the work the exchange would have);
-    //   * a partitioned source whose join PARTNER is replicated also skips — it
-    //     stays in its own PK partitioning and `cogroup`s against the full local
-    //     dim copy, so no exchange is needed on either side. This is the case
-    //     hash co-partitioning cannot serve: the fact need not be distributed by
-    //     the join key, so one fact can join many replicated dims.
+    // One replicated participant makes every participant skip: the replicated
+    // side already has every row on every worker, and its partner can therefore
+    // stay in its own PK partitioning and `cogroup` against the full local copy.
+    // Held here rather than inside `shard_cols_match_dist_key`, which the
+    // partner-less single-source skip path also uses and which must stay the pure
+    // prefix predicate.
     let any_replicated = join_shard_map
         .keys()
         .any(|&tid| ext_tables.schema_of(tid).is_some_and(|s| s.placement().is_replicated()));
@@ -193,22 +159,13 @@ pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: 
             continue;
         }
 
-        // A non-zero carried tc means the slot width differs from the source,
-        // so native PK partitions do not align with the T-width trace key — the
-        // source must go through the exchange even if its PK matches the key.
-        // This is the partner of `ScatterKey::new`'s own `tc == 0` gate:
-        // relaxing one alone would let a promoted side skip its exchange while
-        // its partner scatters at the wider `T`, silently dropping matches.
+        // A non-zero carried tc means the slot is wider than the source column, so
+        // native PK partitions do not align with the T-width trace key. Partner of
+        // `ScatterKey::new`'s own `tc == 0` gate: relaxing one alone would let a
+        // promoted side skip while its partner scatters at the wider `T`.
         if cols.iter().any(|&(_, tc)| tc != 0) {
             continue;
         }
-        // Co-partitioned only when the shard (= join) key is EXACTLY the
-        // source's distribution prefix in PK order (`pk_indices[..k]`). For a
-        // default full-PK table that is the whole PK; for a `CLUSTER BY prefix`
-        // table it is the leading `k` columns rows are actually hashed by. The
-        // match is EXACT (`cols.len() == k`), never a super-prefix: a
-        // super-prefix skip could route the two join sides at mismatched
-        // widths and silently drop matches (see `shard_cols_match_dist_key`).
         let col_indices: Vec<u32> = cols.iter().map(|&(c, _)| c).collect();
         if shard_cols_match_dist_key(&ext_schema, &col_indices) {
             co_partitioned.insert(tid);
@@ -217,129 +174,30 @@ pub(super) fn compute_co_partitioned(join_shard_map: &JoinShardMap, ext_tables: 
     co_partitioned
 }
 
-/// True iff the view's output `ExchangeShard` at `enid` is a no-op (every row
-/// already on the worker owning its distribution key) and the output IPC can be
-/// skipped: the shard reads a scan — through any Filter chain — whose distribution prefix
-/// (`pk_indices[..k]`) is exactly the shard key, AND the pipeline's output
-/// reproduces that shard key as its own route key.
+/// True iff a pipeline keyed by `shard_cols` re-emits rows onto the worker that
+/// already owned them, so eliding the shard also elides the output IPC.
 ///
-/// The second half is what the first does not imply. Eliding the shard also
-/// elides the output IPC (`skip_output_exchange`), so the output stays on the
-/// worker that owned the input prefix's partition — sound only if the output
-/// routes back to that same partition. That holds at the two ends of `k` and
-/// nowhere between:
-///
-/// - `k == 1`: the output key is that one column's route key, the same
-///   `widen_pk_be` value `worker_for_pk_bytes` derives from the prefix
-///   (routing is invariant under left zero-padding at `len <= 16`).
-/// - `k == |PK|`: the output re-emits the source PK verbatim.
-/// - `1 < k < |PK|`: a multi-column key streams into an Xxh3 fold whose u128 is
-///   unrelated to the prefix's, so the output lands on another worker and the
-///   addressing store loses it.
-///
-/// So a `CLUSTER BY` prefix of 2+ proper-prefix columns buys no locality for a
-/// `GROUP BY` on that prefix. Testing `k` rather than the consuming node's
-/// `ReduceOutKey` keeps this independent of which operator the shard feeds: the
-/// shard key *is* the group key (`reduce_multi` hands one column slice to both),
-/// and `ReduceOutKey` alone would be the wrong discriminator anyway — a signed or
-/// narrow single prefix column keys `SyntheticFold` and is nonetheless correct.
+/// Only at the two ends of the key width. At one column the output key hashes to
+/// the same `widen_pk_be` value the prefix does; at the full PK the output
+/// re-emits that PK verbatim. In between, a multi-column key streams into an
+/// Xxh3 fold unrelated to the prefix's, so the output lands elsewhere and the
+/// addressing store loses it — a `CLUSTER BY` prefix of 2+ proper-prefix columns
+/// therefore buys no locality for a `GROUP BY` on it.
+fn output_route_returns_to_the_input_partition(shard_cols: &[u32], schema: &SchemaDescriptor) -> bool {
+    shard_cols.len() <= 1 || shard_cols.len() == schema.pk_indices().len()
+}
+
+/// True iff the view's output `ExchangeShard` at `enid` is a no-op: it reads a
+/// scan — through any Filter chain — whose distribution prefix is exactly the
+/// shard key, and the pipeline's output routes back to that same partition.
 fn skips_output_exchange(loaded: &LoadedCircuit, enid: i32, shard_cols: &[u32], ext_tables: &dyn SchemaSource) -> bool {
     let Some(tid) = scan_tid_through_filters(loaded, enid) else {
         return false;
     };
     ext_tables.schema_of(tid).is_some_and(|schema| {
         shard_cols_match_dist_key(&schema, shard_cols)
-            && (shard_cols.len() <= 1 || shard_cols.len() == schema.pk_indices().len())
+            && output_route_returns_to_the_input_partition(shard_cols, &schema)
     })
-}
-
-// ---------------------------------------------------------------------------
-// Optimization passes
-// ---------------------------------------------------------------------------
-
-/// Distinct nodes elided because their input is already distinct. One forward
-/// pass along the topological order, maintaining the set of nodes whose output
-/// is known distinct: a Reduce or Distinct establishes it; a Filter preserves
-/// it; a Map preserves it unless it re-keys the PK (an equijoin pre-index
-/// reindex or a full-row HashRow), which invalidates upstream distinctness.
-pub(super) fn compute_skip_nodes(loaded: &LoadedCircuit) -> HashSet<i32> {
-    let mut distinct_at: HashSet<i32> = HashSet::new();
-    let mut skip = HashSet::new();
-    for &nid in &loaded.ordered {
-        // Every arm below is a unary operator, so its one input is where the
-        // property it preserves or establishes comes from.
-        let input_distinct = |nid: i32| distinct_at.contains(&loaded.inputs(nid).unary());
-        match loaded.nodes.get(&nid) {
-            Some(gnitz_wire::OpNode::Reduce { .. }) => {
-                distinct_at.insert(nid);
-            }
-            Some(gnitz_wire::OpNode::Distinct) => {
-                if input_distinct(nid) {
-                    skip.insert(nid);
-                }
-                distinct_at.insert(nid);
-            }
-            Some(gnitz_wire::OpNode::Filter(_)) => {
-                if input_distinct(nid) {
-                    distinct_at.insert(nid);
-                }
-            }
-            Some(gnitz_wire::OpNode::Map(mk)) => {
-                let re_keys = matches!(
-                    mk,
-                    gnitz_wire::MapKind::Reindex { .. } | gnitz_wire::MapKind::HashRow(..)
-                );
-                if !re_keys && input_distinct(nid) {
-                    distinct_at.insert(nid);
-                }
-            }
-            _ => {}
-        }
-    }
-    skip
-}
-
-/// True iff any carried target in `target_tcs` is invalid for its source column
-/// in `cols` under `valid`, the domain predicate of the promotion's destination.
-/// A violation means a corrupt/forged catalog; callers abort the compile cleanly
-/// rather than panic/truncate in the copy kernels. Callers must have
-/// range-checked `cols` first. A zero target carries no promotion and is always
-/// accepted. Shared body of [`key_promotion_invalid`] and
-/// [`payload_promotion_invalid`], which differ only in `valid`.
-fn promotion_invalid(
-    cols: &[u32],
-    target_tcs: &[u8],
-    schema: &SchemaDescriptor,
-    valid: impl Fn(u8, u8) -> bool,
-) -> bool {
-    cols.iter().enumerate().any(|(i, &c)| {
-        let t = target_tcs.get(i).copied().unwrap_or(0);
-        t != 0 && !valid(schema.columns[c as usize].type_code, t)
-    })
-}
-
-/// The reindex **key** domain: a carried target `t` must be exactly the
-/// promotion the planner derives for a key of this source type. Rather than
-/// re-deriving the sign/width ladder by hand (and drifting from the planner),
-/// validate against the single shared rule — `t` is a value-preserving promotion
-/// of `src` iff `join_key_common_type` maps the pair `(src, t)` back to `t`. The
-/// promotion is idempotent — promoting a source against its own carried target
-/// is a no-op — so this is exactly the planner's `carried_reindex_tc` contract
-/// read back (a `#[test]` pins the idempotency). It also screens PK-ineligible
-/// targets for free, since the function only ever yields PK-eligible types, and
-/// admits the 16-byte OPK targets the key region supports.
-pub(super) fn key_promotion_invalid(cols: &[u32], target_tcs: &[u8], schema: &SchemaDescriptor) -> bool {
-    promotion_invalid(cols, target_tcs, schema, |src, t| {
-        gnitz_wire::join_key_common_type(src, t) == Some(t)
-    })
-}
-
-/// The **payload** copy domain: the ≤8-byte fixed-int widen, which is the only
-/// promotion the copy kernel supports. Identical to the rule `check_copy_types`
-/// holds a column sink's destination to — the HashRow payload widen is that same
-/// kernel — so it is narrower than [`key_promotion_invalid`], not a mode of it.
-pub(super) fn payload_promotion_invalid(cols: &[u32], target_tcs: &[u8], schema: &SchemaDescriptor) -> bool {
-    promotion_invalid(cols, target_tcs, schema, gnitz_wire::is_widening_promotion)
 }
 
 // ---------------------------------------------------------------------------

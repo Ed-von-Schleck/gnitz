@@ -157,11 +157,11 @@ impl DagEngine {
         if !input_is_empty {
             return false;
         }
-        if !sub.can_emit_on_empty {
+        if !sub.pending_ground_row {
             sub.vm.clear_deltas();
             return true;
         }
-        sub.can_emit_on_empty = false;
+        sub.pending_ground_row = false;
         false
     }
 

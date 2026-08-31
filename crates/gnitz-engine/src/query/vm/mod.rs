@@ -344,7 +344,7 @@ impl Program {
     pub(crate) fn trace_table_idx(&self, reg: u16) -> TableIdx {
         self.reg_meta[reg as usize]
             .owned_table
-            .expect("a state-writing instruction names a register `add_trace_table` stamped")
+            .expect("a state-writing instruction names a register `push_trace_reg` allocated")
     }
 }
 

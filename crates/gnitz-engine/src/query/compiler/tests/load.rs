@@ -1,36 +1,22 @@
 use super::*;
 use gnitz_store::schema::type_code;
+use gnitz_wire::{MapKind, OpNode, ReindexRole};
 
 #[test]
-fn test_topo_sort_simple() {
-    let nodes = HashMap::from([
-        (0, scan_delta(0)),
-        (1, gnitz_wire::OpNode::Filter(None)),
-        (2, gnitz_wire::OpNode::IntegrateSink),
-    ]);
-    let loaded = loaded_for_test(nodes, vec![(0, 1, 0), (1, 2, 0)]);
-    assert_eq!(loaded.ordered, vec![0, 1, 2]);
-}
-
-#[test]
-fn test_topo_sort_cycle() {
-    let nodes = HashMap::from([
-        (0, gnitz_wire::OpNode::Filter(None)),
-        (1, gnitz_wire::OpNode::Filter(None)),
-    ]);
+fn a_cyclic_circuit_is_rejected() {
+    let nodes = HashMap::from([(0, OpNode::Filter(None)), (1, OpNode::Filter(None))]);
     assert!(matches!(
         load::topo_sorted(nodes, vec![(0, 1, 0), (1, 0, 0)]),
         Err(CompileError::Rejected("circuit graph has a cycle"))
     ));
 }
 
-// ── Items 16 & 28: load_circuit robustness (real system tables) ─────────
+// ── load_circuit against the real system tables ─────────────────────────
 
 /// The three circuit system tables `load_circuit` reads, on one tempdir.
-/// All three must be live: `load_circuit` opens a cursor over each up front
-/// and returns `None` on a null one, which would pass these assertions
-/// vacuously. Their schemas differ (6/5/7 columns), so one cannot stand in
-/// for another.
+/// All three must be live: `load_circuit` opens a cursor over each up front and
+/// fails on a null one, which would pass these assertions vacuously. Their
+/// schemas differ (6/5/7 columns), so one cannot stand in for another.
 struct CircuitTables {
     _tmp: tempfile::TempDir,
     nodes: Table,
@@ -41,10 +27,10 @@ struct CircuitTables {
 impl CircuitTables {
     const VIEW_ID: u64 = 1;
 
-    /// Match `pack_view_pk`: view_id in the high half, so its at-rest OPK
-    /// (big-endian) image leads the PK region where `load_circuit` seeks.
-    fn pk(sub: u64) -> u128 {
-        ((Self::VIEW_ID as u128) << 64) | (sub as u128)
+    /// The compound `(view_id, sub)` PK with `view_id` in the high half, so its
+    /// at-rest big-endian image leads the PK region where `load_circuit` seeks.
+    fn pk(view_id: u64, sub: u64) -> u128 {
+        ((view_id as u128) << 64) | (sub as u128)
     }
 
     fn schema(cols: &[gnitz_wire::WireSysCol]) -> SchemaDescriptor {
@@ -54,7 +40,7 @@ impl CircuitTables {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let open = |name: &str, cols: &[gnitz_wire::WireSysCol]| {
-            // The `TempDir` outlives these: each `ShardIndex` holds the path.
+            // Each `Table` owns its path, so it outlives the `TempDir` binding.
             Table::new(
                 &format!("{}/{name}", tmp.path().to_str().unwrap()),
                 Self::schema(cols),
@@ -63,14 +49,11 @@ impl CircuitTables {
             )
             .unwrap()
         };
-        let nodes = open("nodes", gnitz_wire::CIRCUIT_NODES_COLS);
-        let edges = open("edges", gnitz_wire::CIRCUIT_EDGES_COLS);
-        let cols = open("cols", gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS);
         Self {
+            nodes: open("nodes", gnitz_wire::CIRCUIT_NODES_COLS),
+            edges: open("edges", gnitz_wire::CIRCUIT_EDGES_COLS),
+            cols: open("cols", gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS),
             _tmp: tmp,
-            nodes,
-            edges,
-            cols,
         }
     }
 
@@ -90,6 +73,25 @@ impl CircuitTables {
         self
     }
 
+    /// One `CircuitNodes` row under `view_id`.
+    fn node_row(
+        bb: &mut gnitz_store::storage::BatchBuilder,
+        view_id: u64,
+        node_id: u64,
+        opcode: u64,
+        source: Option<u64>,
+    ) {
+        bb.begin_row(Self::pk(view_id, node_id), 1);
+        bb.put_u64(node_id);
+        bb.put_u64(opcode);
+        match source {
+            Some(t) => bb.put_u64(t),
+            None => bb.put_null(),
+        }
+        bb.put_null(); // expr_program
+        bb.end_row();
+    }
+
     fn load(&mut self) -> Result<LoadedCircuit, CompileError> {
         load_circuit(
             SysTableRefs {
@@ -102,106 +104,94 @@ impl CircuitTables {
     }
 }
 
+/// Every malformed-row shape must abort the WHOLE load and say which check
+/// fired: skipping a row would leave edges dangling and silently corrupt the
+/// topological order.
 #[test]
-fn test_load_circuit_aborts_on_undecodable_node() {
-    // An opcode `decode_op_node` rejects must abort the whole load, not be
-    // skipped into a partial circuit.
+fn a_malformed_row_aborts_the_load_and_names_the_check() {
+    // An opcode `decode_op_node` rejects.
+    let mut c = CircuitTables::new();
+    c.put_nodes(|bb| CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 1, 9999, None));
+    assert!(matches!(
+        c.load(),
+        Err(CompileError::Rejected("circuit node failed to decode"))
+    ));
+
+    // An edge whose dst is not a node of the circuit: honouring it would create
+    // a phantom node.
     let mut c = CircuitTables::new();
     c.put_nodes(|bb| {
-        bb.begin_row(CircuitTables::pk(1), 1);
-        bb.put_u64(1); // node_id
-        bb.put_u64(9999); // opcode — unknown → decode_op_node Err
-        bb.put_null(); // source_table
-        bb.put_null(); // expr_program
+        CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 0, gnitz_wire::OPCODE_SCAN_DELTA, Some(99));
+        CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 1, gnitz_wire::OPCODE_INTEGRATE, None);
+    })
+    .put_edges(|bb| {
+        bb.begin_row(CircuitTables::pk(CircuitTables::VIEW_ID, 0), 1);
+        bb.put_u64(7); // dst_node — no such node
+        bb.put_u64(PORT_IN as u64);
+        bb.put_u64(0); // src_node
         bb.end_row();
     });
-    assert!(c.load().is_err(), "an undecodable node must abort load_circuit");
+    assert!(matches!(
+        c.load(),
+        Err(CompileError::Rejected("edge endpoint is not a node of the circuit"))
+    ));
 }
 
+/// The load is filtered to one view's rows by the `view_id` OPK prefix, and a
+/// non-NULL expr blob that reads back empty stays present: `None` is how an
+/// absent program is spelled and would turn a Filter into `WHERE TRUE`.
+/// Rejecting the undecodable blob is the compile's job, not the load's.
 #[test]
-fn test_load_circuit_keeps_empty_expr_blob_present() {
-    // A non-NULL expr_program that reads back empty is a damaged blob. The
-    // load must hand it on as `Some`, since `None` is how an absent program
-    // is spelled and would turn this Filter into `WHERE TRUE`; rejecting the
-    // undecodable blob is the compile's job (see the corrupt-blob tests).
+fn the_load_takes_one_views_rows_and_keeps_a_damaged_blob_present() {
     let mut c = CircuitTables::new();
     c.put_nodes(|bb| {
-        bb.begin_row(CircuitTables::pk(0), 1);
-        bb.put_u64(0); // node_id
-        bb.put_u64(gnitz_wire::OPCODE_SCAN_DELTA);
-        bb.put_u64(10); // source_table
-        bb.put_null(); // expr_program
-        bb.end_row();
-        bb.begin_row(CircuitTables::pk(1), 1);
+        CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 0, gnitz_wire::OPCODE_SCAN_DELTA, Some(10));
+        bb.begin_row(CircuitTables::pk(CircuitTables::VIEW_ID, 1), 1);
         bb.put_u64(1); // node_id
         bb.put_u64(gnitz_wire::OPCODE_FILTER);
         bb.put_null(); // source_table
         bb.put_blob(&[]); // expr_program — non-NULL, zero length
         bb.end_row();
+        // A second view's nodes, which this load must not see. An undecodable
+        // opcode, so a load that ignored the prefix would fail outright.
+        CircuitTables::node_row(bb, CircuitTables::VIEW_ID + 1, 2, 9999, None);
     })
     .put_edges(|bb| {
-        bb.begin_row(CircuitTables::pk(0), 1);
+        bb.begin_row(CircuitTables::pk(CircuitTables::VIEW_ID, 0), 1);
         bb.put_u64(1); // dst_node
         bb.put_u64(PORT_IN as u64);
         bb.put_u64(0); // src_node
         bb.end_row();
     });
     let loaded = c.load().expect("a damaged blob is not a load failure");
+    assert_eq!(loaded.nodes.len(), 2, "only this view's nodes are loaded");
     assert!(
-        matches!(loaded.nodes.get(&1), Some(gnitz_wire::OpNode::Filter(Some(b))) if b.is_empty()),
+        matches!(loaded.nodes.get(&1), Some(OpNode::Filter(Some(b))) if b.is_empty()),
         "an empty blob must stay present, not collapse to a pass-all filter"
     );
 }
 
+/// Null system-table pointers must fail the load rather than yield a silently
+/// empty circuit. `DagEngine` starts with them null and only `set_sys_tables`
+/// fills them in, so a compile attempted before that is a caller error the load
+/// has to report.
 #[test]
-fn test_load_circuit_aborts_on_orphan_edge() {
-    // An edge whose dst does not exist must abort rather than create a
-    // phantom node.
-    let mut c = CircuitTables::new();
-    c.put_nodes(|bb| {
-        // node 0: ScanDelta(source 99)
-        bb.begin_row(CircuitTables::pk(0), 1);
-        bb.put_u64(0);
-        bb.put_u64(gnitz_wire::OPCODE_SCAN_DELTA);
-        bb.put_u64(99); // source_table
-        bb.put_null(); // expr_program
-        bb.end_row();
-        // node 1: IntegrateSink
-        bb.begin_row(CircuitTables::pk(1), 1);
-        bb.put_u64(1);
-        bb.put_u64(gnitz_wire::OPCODE_INTEGRATE);
-        bb.put_null(); // source_table
-        bb.put_null(); // expr_program
-        bb.end_row();
-    })
-    .put_edges(|bb| {
-        // Edge 0 → 7, but node 7 does not exist.
-        bb.begin_row(CircuitTables::pk(0), 1);
-        bb.put_u64(7); // dst_node (orphan)
-        bb.put_u64(PORT_IN as u64);
-        bb.put_u64(0); // src_node
-        bb.end_row();
-    });
-    assert!(
-        c.load().is_err(),
-        "an edge to a non-existent node must abort load_circuit"
-    );
+fn a_load_from_unopened_system_tables_fails() {
+    assert!(matches!(
+        load_circuit(SysTableRefs::null(), 0),
+        Err(CompileError::Rejected("circuit system tables are not open"))
+    ));
 }
 
-/// A reduce owns its trace-in. `reduce_node` wires `PORT_IN` only and
-/// `PORT_TRACE` is written solely by `binary_join`, but the circuit families
-/// carry no catalog precheck, so a forged bundle can land the edge here.
-/// Honouring it would make the reduce's trace-in a *delta* register with no
-/// `Integrate` behind it, and `cursor_mut!` hard-asserts on the null cursor —
-/// Every node's edge set must be exactly the port set its operator declares.
-/// One load-time check stands in for the arity test each operand read used to
-/// carry, so these four shapes must never reach emission: a `Reduce` given a
-/// forged trace edge would be handed a delta register with no `Integrate`
-/// behind it and abort a worker on the null cursor, and an input-less
-/// `ExchangeShard` has nothing to repartition.
+/// A reduce owns its trace-in: `PORT_TRACE` is written solely by a binary join,
+/// but the circuit families carry no catalog precheck, so a forged bundle can
+/// land the edge anywhere. Honouring one would hand the reduce a delta register
+/// with no `Integrate` behind it and abort a worker on the null cursor. One
+/// load-time check stands in for the arity test each operand read would
+/// otherwise carry, so every node's edge set must be exactly its operator's
+/// port set.
 #[test]
 fn port_set_violations_fail_at_load() {
-    use gnitz_wire::OpNode;
     let load = |dst: OpNode, edges: Vec<(i32, i32, i32)>| {
         let nodes = HashMap::from([(0, scan_delta(10)), (1, scan_delta(11)), (2, dst)]);
         load::topo_sorted(nodes, edges)
@@ -246,509 +236,277 @@ fn port_set_violations_fail_at_load() {
     );
 }
 
+/// A range join is discriminated by its `Join(DeltaTraceRange)` node, never by
+/// `has_join_shard && has_exchange`: that predicate is also true of every GROUP
+/// BY view (a group reindex plus an output shard), so keying on it would divert
+/// those views into the relay path and corrupt them.
 #[test]
-fn test_circuit_range_join_n_eq_discriminator() {
-    use gnitz_store::schema::ReduceOutKey;
-    use gnitz_wire::{AggFunc, JoinKind, MapKind, OpNode};
-
-    // A GROUP BY view: ScanDelta → Map(reindex) → ExchangeShard → Reduce →
-    // IntegrateSink. It has BOTH a reindex Map (has_join_shard) AND an
-    // ExchangeShard (has_exchange), so the wrong discriminator
-    // `has_join_shard && has_exchange` would (incorrectly) call it a range
-    // join. circuit_range_join_n_eq must return None — no DeltaTraceRange node.
-    let mut gb = HashMap::new();
-    gb.insert(0, scan_delta(7));
-    gb.insert(
-        1,
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![0],
-            reindex_cols: vec![1],
-            reindex_target_tcs: vec![],
-            role: gnitz_wire::ReindexRole::ScatterKey,
-        }),
+fn a_group_by_view_is_not_classified_as_a_range_join() {
+    let loaded = loaded_for_test(
+        HashMap::from([
+            (0, scan_delta(7)),
+            (1, scatter_reindex(&[1])),
+            (2, OpNode::ExchangeShard { shard_cols: vec![1] }),
+            (
+                3,
+                OpNode::Reduce {
+                    group_cols: vec![1],
+                    agg: vec![(gnitz_wire::AggFunc::Count, 0)],
+                    global_ground: false,
+                    out_key: gnitz_store::schema::ReduceOutKey::SyntheticFold,
+                },
+            ),
+            (4, OpNode::IntegrateSink),
+        ]),
+        vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN), (3, 4, PORT_IN)],
     );
-    gb.insert(2, OpNode::ExchangeShard { shard_cols: vec![1] });
-    gb.insert(
-        3,
-        OpNode::Reduce {
-            group_cols: vec![1],
-            // Only exercises range-join classification, never the reduce
-            // output schema/validation; the spec is immaterial here.
-            agg: vec![(AggFunc::Count, 0)],
-            global_ground: false,
-            out_key: ReduceOutKey::SyntheticFold,
-        },
-    );
-    gb.insert(4, OpNode::IntegrateSink);
-    let gb_edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN), (3, 4, PORT_IN)];
-    let gb_loaded = loaded_for_test(gb, gb_edges);
-    assert_eq!(
-        load::circuit_range_join_n_eq(&gb_loaded),
-        None,
-        "GROUP BY view must NOT be classified as a range join"
-    );
-
-    // A range join: a Join(DeltaTraceRange) node makes it Some, carrying n_eq.
-    let mut rj = HashMap::new();
-    rj.insert(0, scan_delta(7));
-    rj.insert(1, OpNode::IntegrateTrace);
-    rj.insert(
-        2,
-        OpNode::Join(JoinKind::DeltaTraceRange {
-            n_eq: 2,
-            rel: gnitz_wire::RangeRel::Lt,
-        }),
-    );
-    rj.insert(3, OpNode::IntegrateSink);
-    rj.insert(4, scan_delta(8));
-    let rj_edges = vec![(0, 2, PORT_IN_A), (4, 1, PORT_IN), (1, 2, PORT_TRACE), (2, 3, PORT_IN)];
-    let rj_loaded = loaded_for_test(rj, rj_edges);
-    assert_eq!(
-        load::circuit_range_join_n_eq(&rj_loaded),
-        Some(2),
-        "a Join(DeltaTraceRange) node classifies the view as a range join, carrying its n_eq"
-    );
+    assert_eq!(load::circuit_range_join_n_eq(&loaded), None);
 }
 
-#[test]
-fn test_co_partition_keys_with_worker_filter_after_map() {
-    use gnitz_wire::{MapKind, OpNode};
-    // A route-key Map followed by a WorkerFilter: the walk reaches the Map and
-    // returns its cols, then stops — a WorkerFilter is not a Filter, so it is
-    // never stepped through. What the Map *feeds* does not enter into it.
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(99));
-    nodes.insert(
-        1,
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![0],
-            reindex_cols: vec![2],
-            reindex_target_tcs: vec![],
-            role: gnitz_wire::ReindexRole::ScatterKey,
-        }),
-    );
-    nodes.insert(2, OpNode::WorkerFilter);
-    nodes.insert(3, OpNode::IntegrateTrace);
-    let edges = vec![
-        (0, 1, PORT_IN), // ScanDelta → reindex Map
-        (1, 2, PORT_IN), // Map → WorkerFilter
-        (2, 3, PORT_IN), // WorkerFilter → IntegrateTrace
-    ];
-    let loaded = loaded_for_test(nodes, edges);
-    assert_eq!(
-        load::scatter_key_of_scan(&loaded, 0).0.concat(),
-        vec![(2, 0)],
-        "WorkerFilter after the reindex Map must not change the walk result"
-    );
-}
+// ── scatter_key_of_scan: the forward (scan → reindex Map) walk ──────────
 
-/// Real pure-range-join shape (planner.rs, `n_eq == 0`): the reindex Map feeds
-/// the `Join(DeltaTraceRange)` node DIRECTLY as the delta term AND feeds a
+/// The pure-range-join shape the planner emits at `n_eq == 0`: the reindex Map
+/// feeds the `Join(DeltaTraceRange)` DIRECTLY as the delta term AND feeds a
 /// `WorkerFilter → IntegrateTrace` toward the trace term. Its key is collected
-/// once, from the flag — the fan-out is not a second contribution. This is what
-/// keeps the join-shard map non-empty for a pure range join (hence
-/// `prepare_relay`'s `is_join` / `range_n_eq` and the broadcast routing).
+/// once, from the flag — the fan-out is not a second contribution — and the
+/// `WorkerFilter` is not a `Filter`, so the walk never steps through it.
 #[test]
-fn test_co_partition_keys_range_join_feeds_join_directly() {
-    use gnitz_wire::{JoinKind, MapKind, OpNode};
-    // ScanDelta(99) ─► Map(reindex=[2]) ─┬─► Join(DeltaTraceRange)  [delta, PORT_IN_A]
-    //                                     └─► WorkerFilter ─► IntegrateTrace ─► Join  [PORT_TRACE]
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(99));
-    nodes.insert(
-        1,
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![0],
-            reindex_cols: vec![2],
-            reindex_target_tcs: vec![],
-            role: gnitz_wire::ReindexRole::ScatterKey,
-        }),
+fn the_scatter_key_is_collected_once_however_the_reindex_map_fans_out() {
+    let loaded = loaded_for_test(
+        HashMap::from([
+            (0, scan_delta(99)),
+            (1, scatter_reindex(&[2])),
+            (2, OpNode::WorkerFilter),
+            (3, OpNode::IntegrateTrace),
+            (
+                4,
+                OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange {
+                    n_eq: 0,
+                    rel: gnitz_wire::RangeRel::Le,
+                }),
+            ),
+        ]),
+        vec![
+            (0, 1, PORT_IN),
+            (1, 4, PORT_IN_A), // reindex Map → Join (delta term, DIRECT edge)
+            (1, 2, PORT_IN),   // reindex Map → WorkerFilter (toward the trace)
+            (2, 3, PORT_IN),
+            (3, 4, PORT_TRACE),
+        ],
     );
-    nodes.insert(2, OpNode::WorkerFilter);
-    nodes.insert(3, OpNode::IntegrateTrace);
-    nodes.insert(
-        4,
-        OpNode::Join(JoinKind::DeltaTraceRange {
-            n_eq: 0,
-            rel: gnitz_wire::RangeRel::Le,
-        }),
+    assert_eq!(load::scatter_key_of_scan(&loaded, 0).0, vec![vec![(2, 0)]]);
+}
+
+/// A source joined on two different keys (`t ⋈ t1 ON t.a = t1.x ⋈ t2 ON t.b =
+/// t2.y`) fans into two reindex Maps, and both sequences must be collected as
+/// SEPARATE sequences: it is the sequence count, not the column count, that
+/// decides whether one pack key can route the source at all.
+#[test]
+fn a_scan_fanning_into_two_reindex_maps_yields_two_sequences() {
+    let loaded = loaded_for_test(
+        HashMap::from([
+            (0, scan_delta(42)),
+            (1, scatter_reindex(&[2])),
+            (2, OpNode::Filter(Some(dummy_expr_blob()))),
+            (3, scatter_reindex(&[5])),
+        ]),
+        // The second reindex sits behind a Filter, which the walk steps through.
+        vec![(0, 1, PORT_IN), (0, 2, PORT_IN), (2, 3, PORT_IN)],
     );
-    let edges = vec![
-        (0, 1, PORT_IN),    // ScanDelta → reindex Map
-        (1, 4, PORT_IN_A),  // reindex Map → Join (delta term, DIRECT edge)
-        (1, 2, PORT_IN),    // reindex Map → WorkerFilter (toward the trace)
-        (2, 3, PORT_IN),    // WorkerFilter → IntegrateTrace
-        (3, 4, PORT_TRACE), // IntegrateTrace → Join (trace term)
-    ];
-    let loaded = loaded_for_test(nodes, edges);
     assert_eq!(
-        load::scatter_key_of_scan(&loaded, 0).0.concat(),
-        vec![(2, 0)],
-        "the reindex Map is reached whether it feeds the Join directly or \
-         through a WorkerFilter toward the trace"
+        load::scatter_key_of_scan(&loaded, 0).0,
+        vec![vec![(2, 0)], vec![(5, 0)]],
+        "two distinct keys stay two sequences"
     );
 }
 
+/// Within one sequence, duplicate columns are PRESERVED: an overlapping key
+/// (`a.x = b.p AND a.x = b.q`) reindexes `[x, x]`, possibly with distinct
+/// per-slot promotion targets, and the scatter packer must mirror the trace-side
+/// `ReindexPacker` slot-for-slot. Across sibling Maps carrying an IDENTICAL
+/// sequence (the not-null / null-key branches of a nullable LEFT-join key) it
+/// collapses to one, which concatenating would double.
 #[test]
-fn test_reindex_col_through_filters_trivial_and_absent() {
-    use gnitz_wire::{MapKind, OpNode};
-    let dummy_blob = dummy_expr_blob();
-    // Trivial: ScanDelta → Map(reindex) directly (no Filter).
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(7));
-    nodes.insert(
-        1,
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![0],
-            reindex_cols: vec![3],
-            reindex_target_tcs: vec![],
-            role: gnitz_wire::ReindexRole::ScatterKey,
-        }),
+fn a_key_sequence_survives_verbatim_but_identical_siblings_collapse() {
+    let overlapping = loaded_for_test(
+        HashMap::from([
+            (0, scan_delta(42)),
+            (
+                1,
+                OpNode::Map(MapKind::Reindex {
+                    keep: vec![0],
+                    reindex_cols: vec![3, 3],
+                    reindex_target_tcs: vec![0, type_code::I64],
+                    role: ReindexRole::ScatterKey,
+                }),
+            ),
+        ]),
+        vec![(0, 1, PORT_IN)],
     );
-    let loaded = loaded_for_test(nodes, vec![(0, 1, PORT_IN)]);
-    assert_eq!(load::scatter_key_of_scan(&loaded, 0).0.concat(), vec![(3, 0)]);
-
-    // Absent: ScanDelta → Map with no reindex columns.
-    let mut nodes2 = HashMap::new();
-    nodes2.insert(0, scan_delta(7));
-    nodes2.insert(
-        1,
-        OpNode::Map(MapKind::Compute {
-            program: dummy_blob,
-            out_cols: vec![],
-        }),
-    );
-    let loaded2 = loaded_for_test(nodes2, vec![(0, 1, PORT_IN)]);
-    assert!(load::scatter_key_of_scan(&loaded2, 0).0.concat().is_empty());
-}
-
-/// Multi-join: a single ScanDelta fans out through two reindex Maps on
-/// different columns. Both column IDs must be collected, not just the first.
-#[test]
-fn test_co_partition_keys_multi_join() {
-    use gnitz_wire::{MapKind, OpNode};
-    let dummy_blob = dummy_expr_blob();
-    // ScanDelta(0) ──► Map(reindex_col=2)
-    //              └──► Filter ──► Map(reindex_col=5)
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(42));
-    nodes.insert(
-        1,
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![0],
-            reindex_cols: vec![2],
-            reindex_target_tcs: vec![],
-            role: gnitz_wire::ReindexRole::ScatterKey,
-        }),
-    );
-    nodes.insert(2, OpNode::Filter(Some(dummy_blob.clone())));
-    nodes.insert(
-        3,
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![0],
-            reindex_cols: vec![5],
-            reindex_target_tcs: vec![],
-            role: gnitz_wire::ReindexRole::ScatterKey,
-        }),
-    );
-    let edges = vec![(0, 1, PORT_IN), (0, 2, PORT_IN), (2, 3, PORT_IN)];
-    let loaded = loaded_for_test(nodes, edges);
-    let mut got = load::scatter_key_of_scan(&loaded, 0).0.concat();
-    got.sort_unstable();
-    assert_eq!(got, vec![(2, 0), (5, 0)], "both reindex columns must be collected");
-}
-
-/// An overlapping key (`a.x = b.p AND a.x = b.q`) reindexes `[x, x]`, possibly
-/// with distinct per-slot promotion targets. The sequence must survive
-/// VERBATIM — duplicates and all — so the scatter packer mirrors the trace-side
-/// ReindexPacker slot-for-slot; column-level dedup would collapse it to one.
-#[test]
-fn test_co_partition_keys_overlapping_key_verbatim() {
-    use gnitz_wire::{MapKind, OpNode};
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(42));
-    nodes.insert(
-        1,
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![0],
-            reindex_cols: vec![3, 3],
-            reindex_target_tcs: vec![0, type_code::I64],
-            role: gnitz_wire::ReindexRole::ScatterKey,
-        }),
-    );
-    let loaded = loaded_for_test(nodes, vec![(0, 1, PORT_IN)]);
     assert_eq!(
-        load::scatter_key_of_scan(&loaded, 0).0.concat(),
-        vec![(3, 0), (3, type_code::I64)],
-        "overlapping key sequence must survive verbatim, not be deduplicated"
+        load::scatter_key_of_scan(&overlapping, 0).0,
+        vec![vec![(3, 0), (3, type_code::I64)]],
+        "duplicate slots and their promotion targets survive"
     );
-}
 
-/// A nullable LEFT-join key fans its source to two sibling reindex Maps (the
-/// not-null match side and the null-key bypass) carrying an IDENTICAL sequence.
-/// They must collapse to ONE copy, never be concatenated (which would double
-/// the key columns and diverge from the trace).
-#[test]
-fn test_co_partition_keys_sibling_maps_collapse() {
-    use gnitz_wire::{MapKind, OpNode};
-    let dummy_blob = dummy_expr_blob();
-    // ScanDelta(7) ──► Filter(not-null) ──► Map(reindex [2])
-    //              └──► Filter(is-null)  ──► Map(reindex [2])  (identical seq)
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(7));
-    nodes.insert(1, OpNode::Filter(Some(dummy_blob.clone())));
-    nodes.insert(
-        2,
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![0],
-            reindex_cols: vec![2],
-            reindex_target_tcs: vec![0],
-            role: gnitz_wire::ReindexRole::ScatterKey,
-        }),
+    let siblings = loaded_for_test(
+        HashMap::from([
+            (0, scan_delta(7)),
+            (1, OpNode::Filter(Some(dummy_expr_blob()))),
+            (2, scatter_reindex(&[2])),
+            (3, OpNode::Filter(Some(dummy_expr_blob()))),
+            (4, scatter_reindex(&[2])),
+        ]),
+        vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (0, 3, PORT_IN), (3, 4, PORT_IN)],
     );
-    nodes.insert(3, OpNode::Filter(Some(dummy_blob.clone())));
-    nodes.insert(
-        4,
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![0],
-            reindex_cols: vec![2],
-            reindex_target_tcs: vec![0],
-            role: gnitz_wire::ReindexRole::ScatterKey,
-        }),
-    );
-    let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (0, 3, PORT_IN), (3, 4, PORT_IN)];
-    let loaded = loaded_for_test(nodes, edges);
     assert_eq!(
-        load::scatter_key_of_scan(&loaded, 0).0.concat(),
-        vec![(2, 0)],
-        "identical sibling sequences must collapse to one, not concatenate"
+        load::scatter_key_of_scan(&siblings, 0).0,
+        vec![vec![(2, 0)]],
+        "identical sibling sequences collapse to one"
     );
 }
 
-/// Band LEFT join shape: the left scan feeds BOTH the join reindex (`[eq, range]`)
-/// AND an auxiliary `a.pk` re-key for the null-fill. Only the join reindex defines
-/// the input scatter key, and the planner says so by flagging one and not the
-/// other — concatenating both would corrupt the eq-prefix scatter.
+/// Only the join reindex defines a source's scatter key, and the planner says
+/// which one it is by flagging the role. A band LEFT join's left scan also feeds
+/// an `Auxiliary` `a.pk` re-key for the null-fill; concatenating that would
+/// corrupt the eq-prefix scatter. A scan reaching ONLY auxiliary maps is instead
+/// a planner call site that forgot its role, and is reported as orphaned.
 #[test]
-fn test_co_partition_keys_ignores_aux_rekey_in_join_view() {
-    use gnitz_wire::{JoinKind, MapKind, OpNode, RangeRel};
-    // ScanDelta(10) ──► Map(reindex [1,2]) ──► Join(DeltaTraceRange)
-    //              │                       └─► IntegrateTrace
-    //              └──► Map(reindex [0]) ──► Map(Projection) ──► Distinct   (a_all → proj_a → D)
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(10));
-    nodes.insert(
-        1,
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![0],
-            reindex_cols: vec![1, 2],
-            reindex_target_tcs: vec![],
-            role: gnitz_wire::ReindexRole::ScatterKey,
-        }),
-    );
-    nodes.insert(
-        2,
-        OpNode::Join(JoinKind::DeltaTraceRange {
-            n_eq: 1,
-            rel: RangeRel::Le,
-        }),
-    );
-    nodes.insert(3, OpNode::IntegrateTrace);
-    nodes.insert(
-        4,
+fn an_auxiliary_reindex_never_contributes_the_scatter_key() {
+    let aux_rekey = || {
         OpNode::Map(MapKind::Reindex {
             keep: vec![0],
             reindex_cols: vec![0],
             reindex_target_tcs: vec![],
-            role: gnitz_wire::ReindexRole::Auxiliary,
-        }),
-    );
-    nodes.insert(5, OpNode::Map(MapKind::Projection(vec![])));
-    nodes.insert(6, OpNode::Distinct);
-    let edges = vec![
-        (0, 1, PORT_IN),
-        (1, 2, PORT_IN_A),
-        (1, 3, PORT_IN), // join reindex → its own integral
-        (3, 2, PORT_TRACE),
-        (0, 4, PORT_IN),
-        (4, 5, PORT_IN),
-        (5, 6, PORT_IN), // aux a.pk re-key → proj → distinct
-    ];
-    let loaded = loaded_for_test(nodes, edges);
+            role: ReindexRole::Auxiliary,
+        })
+    };
+    let circuit = |join_reindex: OpNode, aux_rekey: OpNode| {
+        loaded_for_test(
+            HashMap::from([
+                (0, scan_delta(10)),
+                (1, join_reindex),
+                (
+                    2,
+                    OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange {
+                        n_eq: 1,
+                        rel: gnitz_wire::RangeRel::Le,
+                    }),
+                ),
+                (3, OpNode::IntegrateTrace),
+                (4, aux_rekey),
+                (5, OpNode::Map(MapKind::Projection(vec![]))),
+                (6, OpNode::Distinct),
+            ]),
+            vec![
+                (0, 1, PORT_IN),
+                (1, 2, PORT_IN_A),
+                (1, 3, PORT_IN), // join reindex → its own integral
+                (3, 2, PORT_TRACE),
+                (0, 4, PORT_IN),
+                (4, 5, PORT_IN),
+                (5, 6, PORT_IN), // aux a.pk re-key → proj → distinct
+            ],
+        )
+    };
     assert_eq!(
-        load::scatter_key_of_scan(&loaded, 0).0.concat(),
-        vec![(1, 0), (2, 0)],
-        "only the trace/probe-feeding reindex defines the scatter key; the a.pk re-key is ignored"
+        load::scatter_key_of_scan(&circuit(scatter_reindex(&[1, 2]), aux_rekey()), 0),
+        (vec![vec![(1, 0), (2, 0)]], false),
+        "only the trace/probe-feeding reindex defines the scatter key"
+    );
+    assert_eq!(
+        load::scatter_key_of_scan(&circuit(aux_rekey(), aux_rekey()), 0),
+        (vec![], true),
+        "a scan reaching no ScatterKey map at all is orphaned"
     );
 }
 
-// ── scan_tid_through_filters: the backward (shard → scan) Filter walk ───────
-//
-// The view exchange-skip detector's source resolution. The skip itself has no
-// observable "fired" signal at the E2E layer (exchanging is also correct), so
-// these unit tests are what pin that the walk engages exactly when it should:
-// through Filter chains, never across a re-keying Map / WorkerFilter / fan-in.
-
-/// A bare `ScanDelta → ExchangeShard` (the no-`WHERE` case) resolves to the source
-/// tid; `ScanDelta → Filter → ExchangeShard` (filtered `GROUP BY prefix`) does too,
-/// as does a chain of Filters.
+/// A `Map` that does not re-key contributes nothing to the scatter.
 #[test]
-fn test_scan_tid_through_filters_filter_chain() {
-    use gnitz_wire::OpNode;
-    let dummy_blob = dummy_expr_blob();
-    // ScanDelta(7) → ExchangeShard, no Filter: the zero-hop base case (no `WHERE`),
-    // which already co-partitioned before the walk reached through Filters.
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(7));
-    nodes.insert(1, OpNode::ExchangeShard { shard_cols: vec![0] });
-    let loaded = loaded_for_test(nodes, vec![(0, 1, PORT_IN)]);
-    assert_eq!(
-        scan_tid_through_filters(&loaded, 1),
-        Some(7),
-        "a bare scan feeding the shard resolves on the first hop (no-`WHERE` case)"
-    );
-
-    // ScanDelta(7) → Filter → ExchangeShard.
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(7));
-    nodes.insert(1, OpNode::Filter(Some(dummy_blob.clone())));
-    nodes.insert(2, OpNode::ExchangeShard { shard_cols: vec![0] });
-    let loaded = loaded_for_test(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN)]);
-    assert_eq!(
-        scan_tid_through_filters(&loaded, 2),
-        Some(7),
-        "one Filter between scan and shard is transparent to the shard key"
-    );
-
-    // ScanDelta(8) → Filter → Filter → ExchangeShard.
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(8));
-    nodes.insert(1, OpNode::Filter(Some(dummy_blob.clone())));
-    nodes.insert(2, OpNode::Filter(Some(dummy_blob)));
-    nodes.insert(3, OpNode::ExchangeShard { shard_cols: vec![0] });
-    let loaded = loaded_for_test(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN)]);
-    assert_eq!(
-        scan_tid_through_filters(&loaded, 3),
-        Some(8),
-        "a chain of Filters is transparent to the shard key"
-    );
-}
-
-/// A re-keying `Map` rewrites the PK region, so the walk must bail there — even
-/// with a Filter below it (the DISTINCT / set-op `HashRow` reindex shape).
-#[test]
-fn test_scan_tid_through_filters_stops_at_map() {
-    use gnitz_wire::{MapKind, OpNode};
-    let dummy_blob = dummy_expr_blob();
-    // ScanDelta(7) → Map(reindex) → ExchangeShard.
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(7));
-    nodes.insert(
-        1,
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![0],
-            reindex_cols: vec![2],
-            reindex_target_tcs: vec![],
-            role: gnitz_wire::ReindexRole::ScatterKey,
-        }),
-    );
-    nodes.insert(2, OpNode::ExchangeShard { shard_cols: vec![0] });
-    let loaded = loaded_for_test(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN)]);
-    assert_eq!(
-        scan_tid_through_filters(&loaded, 2),
-        None,
-        "a reindex Map re-keys the PK; the walk must bail rather than cross it"
-    );
-
-    // ScanDelta(7) → Map(reindex) → Filter → ExchangeShard: a Filter below the
-    // Map does not rescue it — the walk still reaches the Map and bails.
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(7));
-    nodes.insert(
-        1,
-        OpNode::Map(MapKind::Reindex {
-            keep: vec![0],
-            reindex_cols: vec![2],
-            reindex_target_tcs: vec![],
-            role: gnitz_wire::ReindexRole::ScatterKey,
-        }),
-    );
-    nodes.insert(2, OpNode::Filter(Some(dummy_blob)));
-    nodes.insert(3, OpNode::ExchangeShard { shard_cols: vec![0] });
-    let loaded = loaded_for_test(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN)]);
-    assert_eq!(
-        scan_tid_through_filters(&loaded, 3),
-        None,
-        "a Filter below a reindex Map does not make the Map transparent"
-    );
-}
-
-/// A `WorkerFilter` (range-join broadcast input) is a distinct OpNode variant,
-/// not a `Filter`, so it is never crossed — the same exclusion
-/// `scatter_key_of_scan` makes on the forward walk.
-#[test]
-fn test_scan_tid_through_filters_worker_filter() {
-    use gnitz_wire::OpNode;
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(7));
-    nodes.insert(1, OpNode::WorkerFilter);
-    nodes.insert(2, OpNode::ExchangeShard { shard_cols: vec![0] });
-    let loaded = loaded_for_test(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN)]);
-    assert_eq!(
-        scan_tid_through_filters(&loaded, 2),
-        None,
-        "WorkerFilter is not a Filter; the walk must bail"
-    );
-}
-
-/// A fan-in (≠ 1 incoming edge) is not a linear chain — bail. Tested at the shard
-/// itself (two scans feeding it) and one hop in (two scans feeding a Filter).
-#[test]
-fn test_scan_tid_through_filters_fan_in() {
-    use gnitz_wire::OpNode;
-    let dummy_blob = dummy_expr_blob();
-    // A Union of two scans feeds the ExchangeShard directly.
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(7));
-    nodes.insert(1, scan_delta(8));
-    nodes.insert(2, OpNode::Union);
-    nodes.insert(3, OpNode::ExchangeShard { shard_cols: vec![0] });
-    let loaded = loaded_for_test(nodes, vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B), (2, 3, PORT_IN)]);
-    assert_eq!(
-        scan_tid_through_filters(&loaded, 3),
-        None,
-        "a Union draws from two sources, so no one distribution prefix governs the shard key"
-    );
-
-    // The same fan-in one hop further in: the walk must bail at the Union, not
-    // follow the Filter it passed through into an arbitrary branch.
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(7));
-    nodes.insert(1, scan_delta(8));
-    nodes.insert(2, OpNode::Union);
-    nodes.insert(3, OpNode::Filter(Some(dummy_blob)));
-    nodes.insert(4, OpNode::ExchangeShard { shard_cols: vec![0] });
+fn a_non_reindex_map_contributes_no_scatter_key() {
     let loaded = loaded_for_test(
-        nodes,
-        vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B), (2, 3, PORT_IN), (3, 4, PORT_IN)],
+        HashMap::from([
+            (0, scan_delta(7)),
+            (
+                1,
+                OpNode::Map(MapKind::Compute {
+                    program: dummy_expr_blob(),
+                    out_cols: vec![],
+                }),
+            ),
+        ]),
+        vec![(0, 1, PORT_IN)],
     );
-    assert_eq!(
-        scan_tid_through_filters(&loaded, 4),
-        None,
-        "a Filter is transparent to the shard key, so the walk reaches the Union and bails there"
-    );
+    assert!(load::scatter_key_of_scan(&loaded, 0).0.is_empty());
 }
 
-// ── Finding 2: load_circuit must return None for null system-table pointers ──
+// ── scan_tid_through_filters: the backward (shard → scan) walk ──────────
+//
+// The view exchange-skip detector's source resolution. Exchanging is also
+// correct, so the skip has no observable "fired" signal at the E2E layer; these
+// are what pin that the walk engages exactly when it should.
 
-/// Null system-table pointers are a programming error; the engine always supplies
-/// valid handles. `load_circuit` must fail so callers get an explicit error
-/// rather than silently reading an incomplete circuit and producing wrong results.
+/// `Filter` is the only operator transparent to the shard key: it is
+/// row-selective, never re-keys the PK region and never moves a row off-worker.
+/// A re-keying `Map` rewrites the PK, and a `WorkerFilter` is a different
+/// variant altogether — neither is crossed, and a `Filter` below either does not
+/// rescue it.
 #[test]
-fn test_load_circuit_fails_for_null_system_tables() {
-    let result = load_circuit(SysTableRefs::null(), 0);
-    assert!(
-        matches!(result, Err(CompileError::Rejected("circuit load failed"))),
-        "null system-table pointers must fail the load, not yield a silently empty circuit"
+fn the_shard_walk_crosses_filters_and_nothing_else() {
+    let chain = |mids: Vec<OpNode>| {
+        let shard = mids.len() as i32 + 1;
+        let mut nodes = HashMap::from([
+            (0, scan_delta(7)),
+            (shard, OpNode::ExchangeShard { shard_cols: vec![0] }),
+        ]);
+        for (i, op) in mids.into_iter().enumerate() {
+            nodes.insert(i as i32 + 1, op);
+        }
+        let edges = (0..shard).map(|i| (i, i + 1, PORT_IN)).collect();
+        scan_tid_through_filters(&loaded_for_test(nodes, edges), shard)
+    };
+    let filter = || OpNode::Filter(Some(dummy_expr_blob()));
+    let rekey = || scatter_reindex(&[2]);
+    assert_eq!(chain(vec![]), Some(7), "a bare scan resolves on the first hop");
+    assert_eq!(chain(vec![filter()]), Some(7));
+    assert_eq!(
+        chain(vec![filter(), filter()]),
+        Some(7),
+        "a Filter chain is transparent"
+    );
+    assert_eq!(chain(vec![rekey()]), None, "a reindex Map re-keys the PK");
+    assert_eq!(
+        chain(vec![rekey(), filter()]),
+        None,
+        "a Filter below the Map does not rescue it"
+    );
+    assert_eq!(chain(vec![OpNode::WorkerFilter]), None, "WorkerFilter is not a Filter");
+}
+
+/// A fan-in draws from more than one source, so no single table's distribution
+/// prefix governs the shard key. The walk must bail at it — whether it is the
+/// shard's own input or one `Filter` further in.
+#[test]
+fn the_shard_walk_bails_at_a_fan_in() {
+    let union_then = |tail: Vec<OpNode>| {
+        let shard = tail.len() as i32 + 3;
+        let mut nodes = HashMap::from([
+            (0, scan_delta(7)),
+            (1, scan_delta(8)),
+            (2, OpNode::Union),
+            (shard, OpNode::ExchangeShard { shard_cols: vec![0] }),
+        ]);
+        for (i, op) in tail.into_iter().enumerate() {
+            nodes.insert(i as i32 + 3, op);
+        }
+        let mut edges = vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B)];
+        edges.extend((2..shard).map(|i| (i, i + 1, PORT_IN)));
+        scan_tid_through_filters(&loaded_for_test(nodes, edges), shard)
+    };
+    assert_eq!(union_then(vec![]), None, "the Union feeds the shard directly");
+    assert_eq!(
+        union_then(vec![OpNode::Filter(Some(dummy_expr_blob()))]),
+        None,
+        "a Filter is transparent, so the walk reaches the Union and bails there"
     );
 }

@@ -342,7 +342,7 @@ impl CatalogEngine {
         };
         let root = preflight_dir(&self.base_dir, schema_name, vid);
         let CatalogEngine { registry, dag, .. } = self;
-        dag.preflight_compile(registry, vid, &root).map_err(|e| e.to_string())
+        dag.preflight_compile(registry, vid, &root)
     }
 
     // -----------------------------------------------------------------------

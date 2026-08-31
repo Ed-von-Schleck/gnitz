@@ -25,14 +25,14 @@ mod optimize;
 
 use emit::*;
 use hydration::derive_hydration;
-pub(crate) use hydration::{Hydration, HydrationSeed};
-use optimize::*;
+pub(super) use hydration::{Hydration, HydrationSeed};
 
-pub(crate) use load::{for_each_scan_edge, load_circuit};
-pub(crate) use optimize::CircuitFacts;
-// Compiler-internal: `pub(crate)` on these would publish them to the whole
-// `query` layer, which reaches the compiler only through the exports above.
+// Everything here is `pub(super)`: `dag` is the only module that names the
+// compiler, so a `pub(crate)` would publish it to the catalog and runtime rungs
+// too. `SysTableRefs` alone is `pub(crate)` — `catalog::bootstrap` builds one.
 use load::scan_tid_through_filters;
+pub(super) use load::{for_each_scan_edge, load_circuit};
+pub(super) use optimize::CircuitFacts;
 
 // Port numbers reach the compiler only in hand-written fixture edge lists; every
 // production read of an operand goes through [`NodeInputs`].
@@ -49,7 +49,7 @@ pub(super) const PORT_TRACE: i32 = gnitz_wire::PORT_TRACE as i32;
 /// Rendered by `Display` into the `CREATE VIEW` error the client receives, so
 /// every variant's text is user-facing.
 #[derive(Debug)]
-pub(crate) enum CompileError {
+pub(in crate::query) enum CompileError {
     /// A compile-time guard rejected the circuit; the payload names the guard,
     /// so the rejection says *which* trust-boundary check fired instead of a
     /// bare "build failed".
@@ -84,17 +84,54 @@ impl fmt::Display for CompileError {
 /// Opaque outside this module: everything the rest of the engine wants from a
 /// circuit is derived once into [`CircuitFacts`], so nothing else can read a
 /// second answer out of the graph.
-pub(crate) struct LoadedCircuit {
+pub(super) struct LoadedCircuit {
     nodes: HashMap<i32, gnitz_wire::OpNode>,
     ordered: Vec<i32>,
     outgoing: HashMap<i32, Vec<(i32, i32)>>,
     inputs: HashMap<i32, NodeInputs>,
+    /// `Distinct` nodes the elision pass dropped. Derived by the constructor, so
+    /// it cannot disagree with the circuit and a plan built over a slice of the
+    /// circuit reads the same set as every other.
+    skip_nodes: HashSet<i32>,
 }
 
 impl LoadedCircuit {
+    /// `nid`'s operator. Total over `ordered`: `topo_sorted` builds `ordered`
+    /// out of `nodes`' own keys.
+    fn op(&self, nid: i32) -> &gnitz_wire::OpNode {
+        self.nodes.get(&nid).expect("topo_sorted builds one entry per node")
+    }
+
     /// `nid`'s inputs. Total over `nodes`: `topo_sorted` builds one per node.
     fn inputs(&self, nid: i32) -> &NodeInputs {
         self.inputs.get(&nid).expect("topo_sorted builds one entry per node")
+    }
+
+    /// `ordered`, restricted to `keep`. Every node list a plan is built over is
+    /// produced this way, so a plan always sees the circuit's own topological
+    /// order rather than whatever order the caller's set iterates in.
+    fn ordered_where(&self, keep: impl Fn(i32) -> bool) -> Vec<i32> {
+        self.ordered.iter().copied().filter(|&n| keep(n)).collect()
+    }
+
+    /// Every node reachable backwards from `start` (inclusive) — the
+    /// sub-pipeline that produces its value.
+    fn ancestors_inclusive(&self, start: i32) -> HashSet<i32> {
+        let mut set = HashSet::new();
+        let mut queue = VecDeque::from([start]);
+        while let Some(cur) = queue.pop_front() {
+            if set.insert(cur) {
+                queue.extend(self.inputs(cur).iter());
+            }
+        }
+        set
+    }
+
+    /// The sub-pipeline producing `out`'s value — the carve `compile_view`
+    /// plans each exchange side over.
+    fn subgraph_ordered(&self, out: i32) -> Vec<i32> {
+        let set = self.ancestors_inclusive(out);
+        self.ordered_where(|n| set.contains(&n))
     }
 }
 
@@ -127,7 +164,7 @@ impl NodeInputs {
     fn binary(&self) -> (i32, i32) {
         match self {
             NodeInputs::Binary { a, b } => (*a, *b),
-            _ => unreachable!("a binary operator's port set is [PORT_IN_A, PORT_TRACE]"),
+            _ => unreachable!("a binary operator is wired on both ports"),
         }
     }
 
@@ -144,10 +181,10 @@ impl NodeInputs {
 }
 
 /// Build a `LoadedCircuit` from raw nodes/edges. Test-only: the struct's fields
-/// are module-private, so the `dag` tests (which exercise `ViewMeta::from_loaded`)
+/// are module-private, so the `dag` tests (which exercise `ViewMeta::from_facts`)
 /// cannot construct one directly.
 #[cfg(test)]
-pub(crate) fn loaded_for_test(nodes: HashMap<i32, gnitz_wire::OpNode>, edges: Vec<(i32, i32, i32)>) -> LoadedCircuit {
+pub(super) fn loaded_for_test(nodes: HashMap<i32, gnitz_wire::OpNode>, edges: Vec<(i32, i32, i32)>) -> LoadedCircuit {
     load::topo_sorted(nodes, edges).expect("test circuit must be a well-formed DAG")
 }
 
@@ -155,6 +192,19 @@ pub(crate) fn loaded_for_test(nodes: HashMap<i32, gnitz_wire::OpNode>, edges: Ve
 #[cfg(test)]
 pub(super) fn scan_delta(source: u64) -> gnitz_wire::OpNode {
     gnitz_wire::OpNode::ScanDelta { source, bound: None }
+}
+
+/// A `ScatterKey` reindex on `cols` — the routing walks' only variable. The
+/// fixtures that vary `keep`, the promotion targets or the role spell the
+/// variant out instead, so the field they turn on stays visible.
+#[cfg(test)]
+pub(super) fn scatter_reindex(cols: &[u32]) -> gnitz_wire::OpNode {
+    gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
+        keep: vec![0],
+        reindex_cols: cols.to_vec(),
+        reindex_target_tcs: vec![],
+        role: gnitz_wire::ReindexRole::ScatterKey,
+    })
 }
 
 /// An empty but decodable expr-program blob for tests that need a
@@ -180,9 +230,6 @@ pub(crate) struct SysTableRefs {
     pub node_columns: *mut Table,
 }
 
-// SAFETY: same single-thread guarantee.
-unsafe impl Send for SysTableRefs {}
-
 impl SysTableRefs {
     pub(crate) fn null() -> Self {
         SysTableRefs {
@@ -194,17 +241,17 @@ impl SysTableRefs {
 }
 
 /// source table id → join/group reindex `(column, carried promotion tc)` pairs.
-pub(crate) type JoinShardMap = HashMap<i64, Vec<(u32, u8)>>;
+type JoinShardMap = HashMap<i64, Vec<(u32, u8)>>;
 
 /// The registered relations visible to a compile, as a lookup rather than a map:
 /// a compile makes under ten of these calls, where an owned `HashMap` built per
 /// compile would copy every registered relation's schema to answer them.
-pub(crate) trait SchemaSource {
+pub(super) trait SchemaSource {
     fn schema_of(&self, tid: i64) -> Option<SchemaDescriptor>;
 }
 
 /// A standalone relation set — what the compiler's own tests build.
-pub(crate) type ExtTables = HashMap<i64, SchemaDescriptor>;
+pub(super) type ExtTables = HashMap<i64, SchemaDescriptor>;
 
 impl SchemaSource for ExtTables {
     fn schema_of(&self, tid: i64) -> Option<SchemaDescriptor> {
@@ -231,29 +278,16 @@ impl SchemaSource for gnitz_store::relation::RelationRegistry {
 /// binary set-op, and (c) the post-combine phase (single- and two-exchange
 /// views). All three are structurally identical; the difference is only which
 /// part of the plan graph they cover.
-pub(crate) struct SubPlan {
+pub(super) struct SubPlan {
     pub vm: Box<VmHandle>,
     pub in_reg: u16,
-    /// True iff the program can *still* emit output from an empty input epoch: it
-    /// carries a global-ground `Reduce` and its ground row has not been minted
-    /// yet. The empty pad round is the ONLY place the SQL-required ground row over
-    /// an empty/fully-retracted source is minted (`op_reduce`'s `n == 0` branch).
-    /// Every other opcode is inert on an empty input, so an empty epoch skips the
-    /// VM machinery entirely.
-    ///
-    /// A latch, not a constant: the row is minted at most once — after the first
-    /// empty epoch `trace_out` holds V₀ either way — so every later empty tick
-    /// would pay `bind_trace_cursors`, `compact_owned_traces` and a dispatch to
-    /// perform one seek that finds the row. Clearing it makes that cost finite.
-    /// The other `global_ground` emission ("cardinality hit zero, emit the ground
-    /// in place of the shed row") needs a *non-empty* delta carrying the
-    /// retraction, so it is unaffected.
-    ///
-    /// Plan-lifetime state guarding a store fact: every path that empties a
-    /// view's stores must drop the cached plan with them
-    /// (`RelationRegistry::reset_store` → `DagEngine::invalidate`; a worker-count
-    /// relayout runs before any store opens, so no plan exists yet).
-    pub can_emit_on_empty: bool,
+    /// The program carries a global-ground `Reduce` whose ground row has not been
+    /// minted yet. An empty pad round mints it (`op_reduce`'s `n == 0` branch) and
+    /// clears this; every other opcode is inert on an empty input, so once it is
+    /// clear an empty epoch skips the VM entirely. Cleared rather than left set
+    /// because `trace_out` holds V₀ from then on either way, so every later empty
+    /// tick would dispatch a whole epoch to re-find it.
+    pub pending_ground_row: bool,
     /// Maps a source table id to the input register that receives its delta.
     /// Empty for the post-combine phase (which has no source-level routing).
     pub source_reg_map: HashMap<i64, u16>,
@@ -262,7 +296,7 @@ pub(crate) struct SubPlan {
 /// One exchanged side of a [`PlanShape::Exchanged`] plan: a sub-pipeline whose
 /// output is repartitioned (relayed through the exchange) into a post-phase
 /// seed register.
-pub(crate) struct Side {
+pub(super) struct Side {
     pub plan: SubPlan,
     /// Source table this side scans (`0` = multiple/unknown). For a two-sided
     /// set-op it keys the side's IPC rounds distinctly in the master
@@ -289,7 +323,7 @@ impl Side {
 ///   range join) or two sides (binary set-ops) each computes up to its
 ///   `ExchangeShard`, is relayed, and seeds the post-combine phase.
 ///   `sides.len() ∈ {1, 2}` — more is rejected at compile.
-pub(crate) enum PlanShape {
+pub(super) enum PlanShape {
     Single(SubPlan),
     Exchanged { sides: Vec<Side>, post: SubPlan },
 }
@@ -320,7 +354,7 @@ pub(super) enum PlanTarget<'a> {
 /// once on the memoized `ViewMeta`, which both the worker dispatch and the relay
 /// read. Producing a second copy here would be two producers of one fact — the
 /// defect one level up from a badly typed one.
-pub(crate) struct CompileOutput {
+pub(super) struct CompileOutput {
     pub shape: PlanShape,
     /// The `(source table id, secondary-index range)` the planner pushed onto the
     /// primary source's `ScanDelta`, consulted only by the two circuit backfill
@@ -355,7 +389,7 @@ pub(super) struct PlanBuildResult {
     vm: Box<VmHandle>,
     in_reg: u16,
     source_reg_map: HashMap<i64, u16>,
-    can_emit_on_empty: bool,
+    pending_ground_row: bool,
     // The seed register of each exchange input this plan was built with, in the
     // order the input list named them — so `compile_view` reads a side's seed at
     // the side's own index rather than searching for it.
@@ -380,7 +414,7 @@ impl PlanBuildResult {
         self.scratch.defuse();
         SubPlan {
             in_reg: self.in_reg,
-            can_emit_on_empty: self.can_emit_on_empty,
+            pending_ground_row: self.pending_ground_row,
             source_reg_map: self.source_reg_map,
             vm: self.vm,
         }
@@ -397,30 +431,24 @@ impl PlanBuildResult {
     }
 }
 
-/// Validate an exchange-input sub-plan and return its output schema. When the
-/// exchange node is an `ExchangeShard` (which emits no instruction, so nothing
-/// else checks it) its `shard_cols` must be in range for that schema: the shard
-/// key is read at runtime as `schema.columns[c]`, so a crafted/corrupt node is
-/// rejected here rather than aborting at the first push. On `Err`, dropping the
-/// plan removes its scratch dirs.
-fn finalize_side(
-    plan: &PlanBuildResult,
-    loaded: &LoadedCircuit,
-    ex_nid: i32,
-) -> Result<SchemaDescriptor, CompileError> {
+/// Validate an exchange-input sub-plan and return its output schema. An
+/// `ExchangeShard` emits no instruction, so nothing else checks its
+/// `shard_cols`: the shard key is read at runtime as `schema.columns[c]`, so a
+/// crafted/corrupt node is rejected here rather than aborting at the first push.
+/// On `Err`, dropping the plan removes its scratch dirs.
+fn finalize_side(plan: &PlanBuildResult, shard_cols: &[u32]) -> Result<SchemaDescriptor, CompileError> {
     let schema = plan.vm.program.out_schema();
-    if let Some(gnitz_wire::OpNode::ExchangeShard { shard_cols }) = loaded.nodes.get(&ex_nid) {
-        if oob_cols(shard_cols.iter().copied(), &schema) {
-            return Err(CompileError::Rejected("exchange shard columns out of range"));
-        }
+    if oob_cols(shard_cols.iter().copied(), &schema) {
+        return Err(CompileError::Rejected("exchange shard columns out of range"));
     }
     Ok(schema)
 }
 
-/// One exchange boundary's carve: the shard node, the node feeding it, and the
-/// ancestor set that becomes that side's own plan.
-struct Carve {
+/// One exchange boundary's carve: the shard node with its key, the node feeding
+/// it, and the ancestor set that becomes that side's own plan.
+struct Carve<'a> {
     ex_nid: i32,
+    shard_cols: &'a [u32],
     ex_in: i32,
     ancestors: HashSet<i32>,
 }
@@ -431,14 +459,14 @@ struct Carve {
 /// The facts travel and the circuit does not, so nothing outside the compiler
 /// ever holds a `LoadedCircuit` it could read a second, differently-derived
 /// answer out of.
-pub(crate) struct CompiledView {
+pub(super) struct CompiledView {
     pub output: CompileOutput,
     pub facts: CircuitFacts,
 }
 
 /// Where a view's rederived children are created, and under what policy.
 #[derive(Clone, Copy)]
-pub(crate) struct ViewSite<'a> {
+pub(super) struct ViewSite<'a> {
     pub dir: &'a str,
     pub id: u64,
     /// The policy the view's *output store* was opened under, handed down so its
@@ -451,7 +479,7 @@ pub(crate) struct ViewSite<'a> {
 ///
 /// # Safety
 /// All table handles must be valid pointers or null.
-pub(crate) unsafe fn compile_view(
+pub(super) unsafe fn compile_view(
     site: ViewSite<'_>,
     sys: SysTableRefs,
     view_schema: &SchemaDescriptor,
@@ -467,142 +495,106 @@ pub(crate) unsafe fn compile_view(
     // `build_plan` once per side plus post — so an emit-sourced fact would need a
     // cross-sub-plan merge.
     let facts = CircuitFacts::derive(&loaded, ext_tables)?;
-    let source_bound = facts.source_bound;
 
-    let annotated = move |shape: PlanShape, hydration: Option<Hydration>| CompiledView {
+    let exchanges: Vec<(i32, &[u32])> = loaded
+        .ordered
+        .iter()
+        .filter_map(|&nid| match loaded.op(nid) {
+            gnitz_wire::OpNode::ExchangeShard { shard_cols } => Some((nid, shard_cols.as_slice())),
+            _ => None,
+        })
+        .collect();
+    if exchanges.len() > 2 {
+        // No planner path emits this: set-ops are binary, GROUP BY/DISTINCT unary.
+        gnitz_warn!(
+            "compile_view: view_id={} has {} exchange nodes; unsupported",
+            site.id,
+            exchanges.len()
+        );
+        return Err(CompileError::Rejected("more than two exchange nodes"));
+    }
+    // An exchanged plan splits the circuit across a repartition, so neither
+    // hydratable shape can produce one — and a per-key replay of one would need
+    // the exchange to run too. Checked before the carve, so the post phase below
+    // is the whole plan whenever `bounded` holds.
+    if bounded && !exchanges.is_empty() {
+        return Err(CompileError::Rejected(
+            "bounded view: only a linear body and an inner equi-join are supported",
+        ));
+    }
+
+    // Each side is the ancestors of its own exchange input; everything else is
+    // the post phase, which for an exchange-free circuit is the whole plan. On
+    // any `?` below the finished `PlanBuildResult`s drop, and their ScratchGuards
+    // take every scratch directory with them.
+    let carves: Vec<Carve> = exchanges
+        .iter()
+        .map(|&(ex_nid, shard_cols)| {
+            let ex_in = loaded.inputs(ex_nid).unary();
+            Carve {
+                ex_nid,
+                shard_cols,
+                ex_in,
+                ancestors: loaded.ancestors_inclusive(ex_in),
+            }
+        })
+        .collect();
+
+    let mut side_plans: Vec<PlanBuildResult> = Vec::with_capacity(carves.len());
+    let mut exchange_inputs: Vec<(i32, SchemaDescriptor)> = Vec::with_capacity(carves.len());
+    for carve in &carves {
+        let plan = build_plan(
+            &loaded,
+            &loaded.subgraph_ordered(carve.ex_in),
+            ext_tables,
+            site,
+            view_schema.placement(),
+            PlanTarget::Subgraph { out: carve.ex_in },
+        )?;
+        exchange_inputs.push((carve.ex_nid, finalize_side(&plan, carve.shard_cols)?));
+        side_plans.push(plan);
+    }
+
+    let post_ordered =
+        loaded.ordered_where(|nid| !carves.iter().any(|c| c.ex_nid == nid || c.ancestors.contains(&nid)));
+    let post = build_plan(
+        &loaded,
+        &post_ordered,
+        ext_tables,
+        site,
+        view_schema.placement(),
+        PlanTarget::ViewOutput {
+            out_schema: view_schema,
+            seeds: &exchange_inputs,
+        },
+    )?;
+
+    // `bounded` forced `carves` empty above, so `post` is the whole plan here.
+    let hydration = bounded.then(|| derive_hydration(&loaded, &post)).transpose()?;
+    let shape = if carves.is_empty() {
+        PlanShape::Single(post.into_sub_plan())
+    } else {
+        let sides: Vec<Side> = side_plans
+            .into_iter()
+            .enumerate()
+            .map(|(i, plan)| Side {
+                source_id: plan.single_source(),
+                seed_reg: post.exchange_input_regs[i],
+                plan: plan.into_sub_plan(),
+            })
+            .collect();
+        PlanShape::Exchanged {
+            sides,
+            post: post.into_sub_plan(),
+        }
+    };
+
+    Ok(CompiledView {
         output: CompileOutput {
             shape,
-            source_bound,
+            source_bound: load::circuit_source_bound(&loaded),
             hydration,
         },
         facts,
-    };
-
-    let exchange_nids: Vec<i32> = loaded
-        .ordered
-        .iter()
-        .copied()
-        .filter(|&nid| matches!(loaded.nodes.get(&nid), Some(gnitz_wire::OpNode::ExchangeShard { .. })))
-        .collect();
-
-    // On any `?` below, the failing/finished `PlanBuildResult`s drop and their
-    // ScratchGuards remove every scratch directory the sibling plans created —
-    // a rejected compile leaks no inodes.
-    match exchange_nids.len() {
-        0 => {
-            let plan = build_plan(
-                &loaded,
-                &loaded.ordered,
-                ext_tables,
-                site,
-                view_schema.placement(),
-                PlanTarget::ViewOutput {
-                    out_schema: view_schema,
-                    seeds: &[],
-                },
-            )?;
-            // Only `PlanShape::Single` — which both eligible shapes are — can be
-            // hydrated; a bounded view compiling to any other shape is rejected
-            // in the arms below.
-            let hydration = bounded.then(|| derive_hydration(&loaded, &plan)).transpose()?;
-            Ok(annotated(PlanShape::Single(plan.into_sub_plan()), hydration))
-        }
-        // One or two exchange boundaries: carve each side out by the ancestors
-        // of its exchange input (a binary set-op's two independent
-        // HashRow→ExchangeShard sub-pipelines; the unary GROUP BY / DISTINCT /
-        // redistribution pipeline is the one-side case — its ancestors set is
-        // exactly the nodes before the exchange in topo order). Everything else
-        // (the combine + sink, reading the relayed batches) is the post phase.
-        n @ (1 | 2) => {
-            // An exchanged plan splits the circuit across a repartition, so
-            // neither eligible shape can produce one — and a per-key replay of
-            // one would need the exchange to run too.
-            if bounded {
-                return Err(CompileError::Rejected(
-                    "bounded view: only a linear body and an inner equi-join are supported",
-                ));
-            }
-            // One pass: each shard's input node and the ancestor set carved off it,
-            // resolved once rather than looked up again per side.
-            let carves: Vec<Carve> = exchange_nids
-                .iter()
-                .map(|&ex_nid| {
-                    let ex_in = loaded.inputs(ex_nid).unary();
-                    Carve {
-                        ex_nid,
-                        ex_in,
-                        ancestors: ancestors_inclusive(&loaded, ex_in),
-                    }
-                })
-                .collect();
-            let post_ordered: Vec<i32> = loaded
-                .ordered
-                .iter()
-                .copied()
-                .filter(|nid| !exchange_nids.contains(nid) && !carves.iter().any(|c| c.ancestors.contains(nid)))
-                .collect();
-
-            let mut side_plans: Vec<PlanBuildResult> = Vec::with_capacity(n);
-            let mut exchange_inputs: Vec<(i32, SchemaDescriptor)> = Vec::with_capacity(n);
-            for carve in &carves {
-                let side_ordered: Vec<i32> = loaded
-                    .ordered
-                    .iter()
-                    .copied()
-                    .filter(|n| carve.ancestors.contains(n))
-                    .collect();
-                let plan = build_plan(
-                    &loaded,
-                    &side_ordered,
-                    ext_tables,
-                    site,
-                    view_schema.placement(),
-                    PlanTarget::Subgraph { out: carve.ex_in },
-                )?;
-                let schema = finalize_side(&plan, &loaded, carve.ex_nid)?;
-                side_plans.push(plan);
-                exchange_inputs.push((carve.ex_nid, schema));
-            }
-
-            let post = build_plan(
-                &loaded,
-                &post_ordered,
-                ext_tables,
-                site,
-                view_schema.placement(),
-                PlanTarget::ViewOutput {
-                    out_schema: view_schema,
-                    seeds: &exchange_inputs,
-                },
-            )?;
-
-            let sides: Vec<Side> = side_plans
-                .into_iter()
-                .enumerate()
-                .map(|(i, plan)| Side {
-                    source_id: plan.single_source(),
-                    seed_reg: post.exchange_input_regs[i],
-                    plan: plan.into_sub_plan(),
-                })
-                .collect();
-
-            Ok(annotated(
-                PlanShape::Exchanged {
-                    sides,
-                    post: post.into_sub_plan(),
-                },
-                None,
-            ))
-        }
-        _ => {
-            // More than two exchange boundaries is not produced by any current
-            // planner path (set-ops are binary, GROUP BY/DISTINCT are unary).
-            gnitz_warn!(
-                "compile_view: view_id={} has {} exchange nodes; unsupported",
-                site.id,
-                exchange_nids.len()
-            );
-            Err(CompileError::Rejected("more than two exchange nodes"))
-        }
-    }
+    })
 }

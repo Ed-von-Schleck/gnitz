@@ -26,7 +26,7 @@ fn open_system_cursor(table: *mut Table) -> Option<ReadCursor> {
 /// Visit every `(view_id, source_table)` scan edge in the CircuitNodes store —
 /// one call per `ScanDelta` node carrying a source, the same rows `load_circuit`
 /// turns into `OpNode::ScanDelta`. Repeats are not filtered; the caller dedups.
-pub(crate) fn for_each_scan_edge(sys_nodes: *mut Table, mut f: impl FnMut(i64, i64)) {
+pub(in crate::query) fn for_each_scan_edge(sys_nodes: *mut Table, mut f: impl FnMut(i64, i64)) {
     let Some(mut cur) = open_system_cursor(sys_nodes) else {
         return;
     };
@@ -61,27 +61,27 @@ fn node_id_i32(v: i64) -> Option<i32> {
 }
 
 /// Read the three circuit system tables (filtered by the `view_id` OPK prefix)
-/// into a `LoadedCircuit`: the node-column `(kind, position)` sort, the
-/// `decode_op_node` calls and the node-id `i32` reject. The edge set is then
-/// `topo_sorted`'s to validate.
-pub(crate) fn load_circuit(sys: SysTableRefs, view_id: u64) -> Result<LoadedCircuit, CompileError> {
-    let fail = || CompileError::Rejected("circuit load failed");
-    let mut nodes_cur = open_system_cursor(sys.nodes).ok_or_else(fail)?;
-    let mut edges_cur = open_system_cursor(sys.edges).ok_or_else(fail)?;
-    let mut node_cols_cur = open_system_cursor(sys.node_columns).ok_or_else(fail)?;
+/// into a `LoadedCircuit`: the per-node column gather, the `decode_op_node`
+/// calls and the node-id `i32` reject. The edge set is then `topo_sorted`'s to
+/// validate.
+pub(in crate::query) fn load_circuit(sys: SysTableRefs, view_id: u64) -> Result<LoadedCircuit, CompileError> {
+    let unopened = || CompileError::Rejected("circuit system tables are not open");
+    let mut nodes_cur = open_system_cursor(sys.nodes).ok_or_else(unopened)?;
+    let mut edges_cur = open_system_cursor(sys.edges).ok_or_else(unopened)?;
+    let mut node_cols_cur = open_system_cursor(sys.node_columns).ok_or_else(unopened)?;
     let mut nodes: HashMap<i32, gnitz_wire::OpNode> = HashMap::new();
     let mut edges: Vec<(i32, i32, i32)> = Vec::new();
 
     // The circuit tables share a compound `(view_id, sub)` PK; the OPK image of
     // the leading unsigned view_id column is its big-endian bytes.
     let prefix = view_id.to_be_bytes();
-    // One abort flag for every malformed-row shape (an out-of-range id, a node
-    // that fails to decode): each must abort the WHOLE load — silently skipping
-    // a row leaves edges dangling, yielding an invalid topological order or
-    // silent output corruption.
-    let mut invalid = false;
+    // The first malformed row's reason, naming which check fired. Every shape
+    // here aborts the WHOLE load — silently skipping a row leaves edges dangling,
+    // yielding an invalid topological order or silent output corruption.
+    let mut invalid: Option<&'static str> = None;
 
-    // Phase 1: read CircuitNodeColumns, sorted by (kind, position) per node.
+    // Phase 1: read CircuitNodeColumns, gathered per node. `decode_op_node`
+    // orders them by `position` within a kind.
     let mut cols_by_node: HashMap<i32, Vec<gnitz_wire::CircuitNodeColumn>> = HashMap::new();
     node_cols_cur.for_each_positive_with_prefix(&prefix, |ch| match node_id_i32(ch.read_i64(CIRCNCOL_COL_NODE_ID)) {
         Some(nid) => cols_by_node
@@ -93,12 +93,12 @@ pub(crate) fn load_circuit(sys: SysTableRefs, view_id: u64) -> Result<LoadedCirc
                 value1: ch.read_i64(CIRCNCOL_COL_VALUE1) as u64,
                 value2: ch.read_i64(CIRCNCOL_COL_VALUE2) as u64,
             }),
-        None => invalid = true,
+        None => drop(invalid.get_or_insert("circuit node id out of range")),
     });
     // Phase 2: read CircuitNodes; call decode_op_node for each.
     nodes_cur.for_each_positive_with_prefix(&prefix, |ch| {
         let Some(node_id) = node_id_i32(ch.read_i64(CIRCNODES_COL_NODE_ID)) else {
-            invalid = true;
+            invalid.get_or_insert("circuit node id out of range");
             return;
         };
         let opcode = ch.read_i64(CIRCNODES_COL_OPCODE) as u64;
@@ -118,12 +118,9 @@ pub(crate) fn load_circuit(sys: SysTableRefs, view_id: u64) -> Result<LoadedCirc
             Ok(op) => {
                 nodes.insert(node_id, op);
             }
-            Err(_) => invalid = true,
+            Err(_) => drop(invalid.get_or_insert("circuit node failed to decode")),
         }
     });
-    if invalid {
-        return Err(fail());
-    }
 
     // Phase 3: read CircuitEdges. A truncating endpoint id aborts the load.
     edges_cur.for_each_positive_with_prefix(&prefix, |ch| {
@@ -132,11 +129,11 @@ pub(crate) fn load_circuit(sys: SysTableRefs, view_id: u64) -> Result<LoadedCirc
             node_id_i32(ch.read_i64(CIRCEDGES_COL_DST_NODE)),
         ) {
             (Some(src), Some(dst)) => edges.push((src, dst, ch.read_i64(CIRCEDGES_COL_DST_PORT) as i32)),
-            _ => invalid = true,
+            _ => drop(invalid.get_or_insert("circuit edge endpoint id out of range")),
         }
     });
-    if invalid {
-        return Err(fail());
+    if let Some(reason) = invalid {
+        return Err(CompileError::Rejected(reason));
     }
 
     topo_sorted(nodes, edges)
@@ -147,32 +144,60 @@ pub(crate) fn load_circuit(sys: SysTableRefs, view_id: u64) -> Result<LoadedCirc
 // ---------------------------------------------------------------------------
 
 /// Assemble the sorted circuit — the only form a `LoadedCircuit` exists in, so
-/// no caller can read `ordered` or the adjacency maps before they are populated.
+/// no caller can read `ordered`, the adjacency maps or the elision set before
+/// they are populated.
 pub(super) fn topo_sorted(
     nodes: HashMap<i32, gnitz_wire::OpNode>,
     edges: Vec<(i32, i32, i32)>,
 ) -> Result<LoadedCircuit, CompileError> {
+    let malformed = || CompileError::Rejected("node's input edges do not match its operator's ports");
     let mut outgoing: HashMap<i32, Vec<(i32, i32)>> = HashMap::new();
-    let mut incoming: HashMap<i32, Vec<(i32, i32)>> = HashMap::new();
+    // Each node's producer per port, filled straight from the edge list. Ports
+    // are 0 and 1 (`PORT_IN == PORT_IN_A`, `PORT_TRACE == PORT_IN_B`), so a port
+    // beyond the set and a duplicate one are the same rejection.
+    let mut by_port: HashMap<i32, [Option<i32>; 2]> = HashMap::new();
     for &nid in nodes.keys() {
         outgoing.entry(nid).or_default();
-        incoming.entry(nid).or_default();
+        by_port.entry(nid).or_default();
     }
 
     for &(src, dst, port) in &edges {
         // A dangling endpoint — a node that failed to decode, a partial schema
         // flush, a hand-built fixture — would strand its partner rather than fail,
         // so it is rejected before it can become a phantom adjacency entry.
-        let (Some(outs), Some(ins)) = (outgoing.get_mut(&src), incoming.get_mut(&dst)) else {
+        let (Some(outs), Some(ports)) = (outgoing.get_mut(&src), by_port.get_mut(&dst)) else {
             return Err(CompileError::Rejected("edge endpoint is not a node of the circuit"));
         };
+        match ports.get_mut(port as usize) {
+            Some(slot @ None) => *slot = Some(src),
+            _ => return Err(malformed()),
+        }
         outs.push((dst, port));
-        ins.push((src, port));
     }
 
-    let inputs = resolve_inputs(&nodes, &incoming)?;
+    // Hold every node's filled port slots to the set its operator declares, and
+    // keep them as [`NodeInputs`]. Rejecting a duplicate port, a missing one and
+    // an out-of-range one in one place is what lets the emit layer destructure an
+    // operand instead of asking whether it exists. The durable form already
+    // enforces uniqueness — the `CircuitEdges` PK is `(view_id, dst_node,
+    // dst_port)` — but a hand-built circuit does not, so the check lives here, in
+    // the only constructor.
+    let inputs: HashMap<i32, NodeInputs> = nodes
+        .iter()
+        .map(|(&nid, op)| {
+            // Matching the operator's arity against the filled slots IS the
+            // port-set equality: a missing port leaves its slot empty.
+            let resolved = match (op.ports(), by_port[&nid]) {
+                ([], [None, None]) => NodeInputs::Source,
+                ([_], [Some(src), None]) => NodeInputs::Unary(src),
+                ([_, _], [Some(a), Some(b)]) => NodeInputs::Binary { a, b },
+                _ => return Err(malformed()),
+            };
+            Ok((nid, resolved))
+        })
+        .collect::<Result<_, _>>()?;
 
-    let mut in_degree: HashMap<i32, i32> = incoming.iter().map(|(&nid, ins)| (nid, ins.len() as i32)).collect();
+    let mut in_degree: HashMap<i32, i32> = inputs.iter().map(|(&nid, i)| (nid, i.iter().count() as i32)).collect();
 
     let mut init: Vec<i32> = nodes.keys().filter(|nid| in_degree[nid] == 0).copied().collect();
     init.sort_unstable(); // deterministic order for tied sources
@@ -199,6 +224,7 @@ pub(super) fn topo_sorted(
         return Err(CompileError::Rejected("circuit graph has a cycle"));
     }
     Ok(LoadedCircuit {
+        skip_nodes: compute_skip_nodes(&nodes, &ordered, &inputs),
         nodes,
         ordered,
         outgoing,
@@ -206,74 +232,73 @@ pub(super) fn topo_sorted(
     })
 }
 
-/// Hold every node's incoming edges to the port set its operator declares, and
-/// return them as [`NodeInputs`].
-///
-/// Rejecting a duplicate port, a missing one and an out-of-range one in one place
-/// is what lets the emit layer destructure an operand instead of asking whether it
-/// exists. The durable form already enforces uniqueness — the `CircuitEdges` PK is
-/// `(view_id, dst_node, dst_port)` — but a hand-built circuit does not, so the
-/// check lives here, in the only constructor.
-fn resolve_inputs(
+/// Distinct nodes elided because their input is already distinct. One forward
+/// pass along the topological order, maintaining the set of nodes whose output
+/// is known distinct: a Reduce or Distinct establishes it; a Filter preserves
+/// it; a Map preserves it unless it re-keys the PK (an equijoin pre-index
+/// reindex or a full-row HashRow), which invalidates upstream distinctness.
+fn compute_skip_nodes(
     nodes: &HashMap<i32, gnitz_wire::OpNode>,
-    incoming: &HashMap<i32, Vec<(i32, i32)>>,
-) -> Result<HashMap<i32, NodeInputs>, CompileError> {
-    let malformed = || CompileError::Rejected("node's input edges do not match its operator's ports");
-    nodes
-        .iter()
-        .map(|(&nid, op)| {
-            // Ports are 0 and 1 (`PORT_IN == PORT_IN_A`, `PORT_TRACE == PORT_IN_B`),
-            // so a port beyond the set and a duplicate one are the same rejection.
-            let mut by_port: [Option<i32>; 2] = [None, None];
-            for &(src, port) in incoming.get(&nid).into_iter().flatten() {
-                match by_port.get_mut(port as usize) {
-                    Some(slot @ None) => *slot = Some(src),
-                    _ => return Err(malformed()),
+    ordered: &[i32],
+    inputs: &HashMap<i32, NodeInputs>,
+) -> HashSet<i32> {
+    let mut distinct_at: HashSet<i32> = HashSet::new();
+    let mut skip = HashSet::new();
+    for &nid in ordered {
+        // Every arm below is a unary operator, so its one input is where the
+        // property it preserves or establishes comes from.
+        let input_distinct = |nid: i32| distinct_at.contains(&inputs[&nid].unary());
+        match &nodes[&nid] {
+            gnitz_wire::OpNode::Reduce { .. } => {
+                distinct_at.insert(nid);
+            }
+            gnitz_wire::OpNode::Distinct => {
+                if input_distinct(nid) {
+                    skip.insert(nid);
+                }
+                distinct_at.insert(nid);
+            }
+            gnitz_wire::OpNode::Filter(_) => {
+                if input_distinct(nid) {
+                    distinct_at.insert(nid);
                 }
             }
-            // Matching the operator's arity against the filled slots IS the
-            // port-set equality: a missing port leaves its slot empty.
-            let resolved = match (op.ports(), by_port) {
-                ([], [None, None]) => NodeInputs::Source,
-                ([_], [Some(src), None]) => NodeInputs::Unary(src),
-                ([_, _], [Some(a), Some(b)]) => NodeInputs::Binary { a, b },
-                _ => return Err(malformed()),
-            };
-            Ok((nid, resolved))
-        })
-        .collect()
+            gnitz_wire::OpNode::Map(mk) => {
+                let re_keys = matches!(
+                    mk,
+                    gnitz_wire::MapKind::Reindex { .. } | gnitz_wire::MapKind::HashRow(..)
+                );
+                if !re_keys && input_distinct(nid) {
+                    distinct_at.insert(nid);
+                }
+            }
+            _ => {}
+        }
+    }
+    skip
 }
 
 // ---------------------------------------------------------------------------
 // Annotation passes
 // ---------------------------------------------------------------------------
 
-/// The scatter key of the source scanned at `scan_nid`: the reindex columns of
-/// every `ScatterKey` `Map` reachable forward through `Filter`s, and whether the
-/// walk passed an `Auxiliary` one without finding any `ScatterKey`.
+/// The scatter key of the source scanned at `scan_nid`: one sequence per
+/// `ScatterKey` reindex `Map` reachable forward through `Filter`s.
 ///
-/// The planner marks which reindex is a source's join/group key
-/// ([`gnitz_wire::ReindexRole`]) — it holds that fact at the call site, where the
-/// engine could only infer it from graph shape. A source that participates in
-/// several joins on different keys (`t JOIN t1 ON t.a = t1.x JOIN t2 ON t.b =
-/// t2.y`) fans out into several `ScatterKey` Maps and their sequences
-/// concatenate. `Filter` is walked through because the planner emits
-/// `Filter → Map(reindex)` chains for PK-redistribution views.
-///
-/// The second return is the shape a planner call site that forgot its role
-/// produces; `compile_view` rejects on it, which turns the likelier of the two
-/// possible mistakes into a failed compile instead of silently-unscattered rows.
+/// Which reindex is a source's join/group key is the planner's to state
+/// ([`gnitz_wire::ReindexRole`]); the engine could only guess it from graph
+/// shape. The second return says the walk found only `Auxiliary` ones — a
+/// planner call site that forgot its role, which `CircuitFacts::derive` turns
+/// into a failed compile rather than silently-unscattered rows.
 pub(super) fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec<Vec<(u32, u8)>>, bool) {
     let mut queue = VecDeque::from([scan_nid]);
     // `visited` bounds the walk to O(nodes): without it a Filter diamond (two
     // edge paths reaching the same Filter) would re-push and re-expand nodes.
     let mut visited = HashSet::new();
-    // Each `ScatterKey` Map contributes its full key sequence. Distinct sequences
-    // are concatenated; an identical sequence reached again (the null/not-null
-    // sibling Maps of a nullable LEFT-join key) is added once. Within a sequence,
-    // duplicate columns are PRESERVED (an overlapping key `a.x = b.p AND a.x =
-    // b.q` reindexes `[x, x]`, possibly with distinct per-slot promotion targets),
-    // so the result mirrors the trace-side ReindexPacker slot-for-slot.
+    // One entry per distinct key sequence — an identical one reached again (the
+    // null/not-null sibling Maps of a nullable LEFT-join key) is added once.
+    // Duplicate columns WITHIN a sequence are preserved, so the result mirrors the
+    // trace-side `ReindexPacker` slot-for-slot.
     let mut seqs: Vec<Vec<(u32, u8)>> = Vec::new();
     let mut saw_auxiliary = false;
     while let Some(cur) = queue.pop_front() {
@@ -284,13 +309,13 @@ pub(super) fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec
             continue;
         };
         for &(dst, _port) in outs {
-            match loaded.nodes.get(&dst) {
-                Some(gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
+            match loaded.op(dst) {
+                gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
                     reindex_cols,
                     reindex_target_tcs,
                     role,
                     ..
-                })) => {
+                }) => {
                     if *role != gnitz_wire::ReindexRole::ScatterKey {
                         saw_auxiliary = true;
                         continue;
@@ -304,7 +329,7 @@ pub(super) fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec
                         seqs.push(seq);
                     }
                 }
-                Some(gnitz_wire::OpNode::Filter(_)) => queue.push_back(dst),
+                gnitz_wire::OpNode::Filter(_) => queue.push_back(dst),
                 _ => {}
             }
         }
@@ -314,17 +339,11 @@ pub(super) fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec
 }
 
 /// Walk back from an `ExchangeShard` (`enid`) through `Filter` nodes to the
-/// source `ScanDelta`, returning its table id — or `None` on a fan-in (≠ 1
-/// incoming edge) or any non-`Filter`, non-scan node. `Filter` is the only
-/// operator transparent to the shard key: row-selective, never re-keys the PK
-/// region, never moves a row
-/// off-worker; Map/Reduce/Distinct/join change the key or its distribution, and a
-/// `WorkerFilter` (range-join broadcast input) is not a `Filter` either. The
-/// backward dual of `scatter_key_of_scan`, reading the same `loaded.incoming`
-/// adjacency as `ancestors_inclusive`. The chain is acyclic —
-/// both `compile_view` and `load_meta_circuit` reject a malformed cyclic circuit (the
-/// latter presents it as empty, so this walk is never entered on one) — and each hop
-/// has exactly one incoming edge, so it terminates without a visited guard.
+/// source `ScanDelta`, returning its table id — or `None` on a fan-in or any
+/// other node. `Filter` is the only operator transparent to the shard key: it is
+/// row-selective, never re-keys the PK region and never moves a row off-worker.
+/// Terminates without a visited guard: `topo_sorted` rejects a cycle, and each
+/// hop takes the one incoming edge.
 pub(super) fn scan_tid_through_filters(loaded: &LoadedCircuit, enid: i32) -> Option<i64> {
     let mut cur = enid;
     loop {
@@ -334,55 +353,35 @@ pub(super) fn scan_tid_through_filters(loaded: &LoadedCircuit, enid: i32) -> Opt
         let NodeInputs::Unary(src_nid) = *loaded.inputs(cur) else {
             return None;
         };
-        match loaded.nodes.get(&src_nid) {
-            Some(gnitz_wire::OpNode::ScanDelta { source: t, .. }) => return Some(*t as i64),
-            Some(gnitz_wire::OpNode::Filter(_)) => cur = src_nid,
+        match loaded.op(src_nid) {
+            gnitz_wire::OpNode::ScanDelta { source: t, .. } => return Some(*t as i64),
+            gnitz_wire::OpNode::Filter(_) => cur = src_nid,
             _ => return None,
         }
     }
 }
 
-/// The output `ExchangeShard`'s `(node id, shard columns)` — the sink-nearest
-/// one in topo order — or `None` when the circuit carries no shard at all.
-///
-/// `loaded` MUST be `topo_sort`ed. A circuit may carry several shards (a
-/// two-sided set-op emits one per side), so picking by `nodes` hash order would
-/// return an arbitrary one; every caller wants the one whose key the output
-/// carries.
+/// The sink-nearest `ExchangeShard`'s `(node id, shard columns)`, or `None` when
+/// the circuit carries none. A two-sided set-op emits one shard per side, and
+/// every caller wants the one whose key the output carries.
 pub(super) fn output_exchange_shard(loaded: &LoadedCircuit) -> Option<(i32, Vec<u32>)> {
-    loaded
-        .ordered
-        .iter()
-        .rev()
-        .find_map(|&nid| match loaded.nodes.get(&nid) {
-            Some(gnitz_wire::OpNode::ExchangeShard { shard_cols }) => Some((nid, shard_cols.clone())),
-            _ => None,
-        })
+    loaded.ordered.iter().rev().find_map(|&nid| match loaded.op(nid) {
+        gnitz_wire::OpNode::ExchangeShard { shard_cols } => Some((nid, shard_cols.clone())),
+        _ => None,
+    })
 }
 
-/// The first node in topological order for which `f` yields a value. Topological
-/// order rather than `nodes` iteration order because a `HashMap` walk is keyed by
-/// a hasher, so which of several matching nodes wins would be an implementation
-/// detail of the map rather than a property of the circuit.
+/// The first node in topological order for which `f` yields a value — never
+/// `nodes` order, whose hasher would decide which of several matches wins.
 fn find_in_topo_order<T>(loaded: &LoadedCircuit, f: impl Fn(&gnitz_wire::OpNode) -> Option<T>) -> Option<T> {
-    loaded.ordered.iter().find_map(|nid| loaded.nodes.get(nid).and_then(&f))
+    loaded.ordered.iter().find_map(|&nid| f(loaded.op(nid)))
 }
 
-/// The equality-conjunct count `n_eq` of a non-equi (range / band) join, or
-/// `None` if the loaded meta-circuit is not one — read straight off its
-/// `Join(DeltaTraceRange { n_eq, .. })` node (both bilinear terms carry the same
-/// `n_eq`, so which one the walk reaches is not observable). `Some` is the
-/// precise range-join discriminator for the dag driver
-/// branch and the input relay; the `n_eq` value tells the relay whether to
-/// eq-prefix-scatter (`n_eq ≥ 1`, band join) or broadcast (`n_eq == 0`, pure
-/// range join) without re-deriving it from the reindex key.
-///
-/// It is deliberately NOT `has_join_shard && has_exchange`: that predicate is
-/// also true for every GROUP BY / reduce / single-sided set-op view (a group
-/// reindex matches `scatter_key_of_scan`, and the view has an output
-/// `ExchangeShard`), so keying on it would divert those views into the relay
-/// path and corrupt them. Read once into `ViewMeta::range_join_n_eq`, which is
-/// what every runtime caller consults.
+/// The equality-conjunct count of a non-equi (range / band) join, read off its
+/// `Join(DeltaTraceRange)` node — both bilinear terms carry the same `n_eq`, so
+/// which one the walk reaches is not observable. `Some` is the range-join
+/// discriminator, and the value tells the relay whether to eq-prefix-scatter
+/// (band) or broadcast (`n_eq == 0`, pure range).
 pub(super) fn circuit_range_join_n_eq(loaded: &LoadedCircuit) -> Option<u8> {
     find_in_topo_order(loaded, |op| match op {
         gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange { n_eq, .. }) => Some(*n_eq),
@@ -391,12 +390,10 @@ pub(super) fn circuit_range_join_n_eq(loaded: &LoadedCircuit) -> Option<u8> {
 }
 
 /// The `(source table id, bound)` the planner pushed onto a `ScanDelta`'s
-/// backfill scan. At most ONE exists by construction — only the builder's
-/// primary source can carry a bound (`input_delta_bounded`); tagged secondary
-/// inputs never do — so the type says so. A **hint**: `None` means "full-scan",
-/// which is always correct, so a hand-crafted circuit with several bounded scans
-/// is harmless — it takes the topologically first and the rest degrade to full
-/// scans, the same way on every worker.
+/// backfill scan. At most one exists by construction — only the primary source
+/// can carry a bound. A hint: `None` means "full-scan", which is always correct,
+/// so a hand-crafted circuit with several takes the topologically first and lets
+/// the rest degrade, the same way on every worker.
 pub(super) fn circuit_source_bound(loaded: &LoadedCircuit) -> Option<(i64, gnitz_wire::ScanBound)> {
     find_in_topo_order(loaded, |op| match op {
         gnitz_wire::OpNode::ScanDelta { source, bound: Some(b) } => Some((*source as i64, *b)),

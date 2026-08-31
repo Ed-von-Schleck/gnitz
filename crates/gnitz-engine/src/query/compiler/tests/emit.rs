@@ -1,84 +1,148 @@
 use super::*;
+use crate::test_support::{make_schema_u128_i64, make_schema_u64_i64, pk_payload_schema, u64_pk_schema};
 use gnitz_store::schema::{type_code, SchemaColumn};
+
+// ── Fixtures ────────────────────────────────────────────────────────────
+
+/// The `ScanDelta(10) → mid → IntegrateSink` circuit: everything a guard test
+/// needs to isolate one crafted field on `mid`. Entered on `build_plan`'s
+/// `PlanTarget::Subgraph` path, which suppresses the sink-schema contract —
+/// what a test isolating a *mid-node* guard wants, since the mid node's output
+/// schema is exactly what it is varying.
+struct MidCircuit {
+    in_schema: SchemaDescriptor,
+    /// Homes the mid node's scratch children, and outlives every plan `build`
+    /// returns — a plan holds `Table`s under this directory.
+    tmp: tempfile::TempDir,
+}
+
+impl MidCircuit {
+    fn new(in_schema: SchemaDescriptor) -> Self {
+        MidCircuit {
+            in_schema,
+            tmp: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    fn build(&self, mid: gnitz_wire::OpNode) -> Result<PlanBuildResult, CompileError> {
+        let loaded = loaded_for_test(
+            HashMap::from([(0, scan_delta(10)), (1, mid), (2, gnitz_wire::OpNode::IntegrateSink)]),
+            vec![(0, 1, PORT_IN), (1, 2, PORT_IN)],
+        );
+        build_plan(
+            &loaded,
+            &loaded.subgraph_ordered(1),
+            &HashMap::from([(10i64, self.in_schema)]),
+            test_site(self.tmp.path().to_str().unwrap(), 1),
+            gnitz_store::schema::Placement::KEYED_DEFAULT,
+            PlanTarget::Subgraph { out: 1 },
+        )
+    }
+
+    fn compiles(&self, mid: gnitz_wire::OpNode) -> bool {
+        self.build(mid).is_ok()
+    }
+
+    /// The guard that rejected `mid`.
+    fn rejection(&self, mid: gnitz_wire::OpNode) -> String {
+        rejection(self.build(mid))
+    }
+}
+
+/// The guard that rejected a build. Naming it is what makes a guard test
+/// attributable: a bare `is_err()` also passes when an unrelated guard fires.
+fn rejection<T>(r: Result<T, CompileError>) -> String {
+    r.map(|_| "a plan").expect_err("expected a rejection").to_string()
+}
+
+/// A view site over a throwaway directory: nothing under it was ever
+/// checkpointed, so the children it opens resume nothing.
+fn test_site(dir: &str, id: u64) -> ViewSite<'_> {
+    ViewSite {
+        dir,
+        id,
+        recovery: RecoverySource::Rederive { resume_at: None },
+    }
+}
+
+// ── Union layout ────────────────────────────────────────────────────────
 
 /// `union_nullability_merge` ORs the two inputs' per-column nullability, so a
 /// null-carrying side reclassifies the output from the null-blind
 /// `FixedIntNonnull` fast comparator to the null-aware `Generic` one.
 #[test]
-fn test_union_nullability_merge_classification() {
+fn union_merges_nullability_and_reclassifies_the_comparator() {
     use gnitz_store::schema::PayloadCmpKind;
-    let pk = SchemaColumn::new(type_code::U128, 0);
-    let nonnull = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 0)], &[0]);
-    let nullable = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 1)], &[0]);
+    let nonnull = make_schema_u128_i64();
+    let nullable = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
 
-    // Non-nullable A + nullable B → nullable output column, Generic comparator.
-    let m = union_nullability_merge(&nonnull, &nullable).expect("shared layout");
-    assert_eq!(m.columns[1].nullable, 1, "OR of non-nullable and nullable = nullable");
-    assert_eq!(m.payload_cmp, PayloadCmpKind::Generic);
-
-    // Both non-nullable → stays on the FixedIntNonnull fast path (byte-identical).
-    let m2 = union_nullability_merge(&nonnull, &nonnull).expect("shared layout");
-    assert_eq!(m2.columns[1].nullable, 0);
-    assert_eq!(m2.payload_cmp, PayloadCmpKind::FixedIntNonnull);
-
-    // Nullable A + non-nullable B → Generic too (OR is symmetric).
-    let m3 = union_nullability_merge(&nullable, &nonnull).expect("shared layout");
-    assert_eq!(m3.columns[1].nullable, 1);
-    assert_eq!(m3.payload_cmp, PayloadCmpKind::Generic);
+    // Both non-nullable stays on the fast path; either side nullable forces
+    // `Generic`, and the OR is symmetric.
+    for (a, b, want_nullable) in [(nonnull, nonnull, 0u8), (nonnull, nullable, 1), (nullable, nonnull, 1)] {
+        let m = union_nullability_merge(&a, &b).expect("shared layout");
+        assert_eq!(m.columns[1].nullable, want_nullable);
+        assert_eq!(
+            m.payload_cmp,
+            if want_nullable == 1 {
+                PayloadCmpKind::Generic
+            } else {
+                PayloadCmpKind::FixedIntNonnull
+            }
+        );
+    }
 }
 
 /// `union_nullability_merge` is the Union arm's whole layout contract, and in
 /// release there is nothing else: a mismatched pair would adopt `a`'s schema
 /// and let `op_union` read `b`'s bytes through it.
 #[test]
-fn test_union_mismatched_input_layout_rejected() {
-    let one = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
-    let two = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
+fn union_of_mismatched_input_layouts_is_rejected() {
+    let one = SchemaDescriptor::minimal_u64();
+    let loaded = loaded_for_test(
+        HashMap::from([(0, scan_delta(10)), (1, scan_delta(11)), (2, gnitz_wire::OpNode::Union)]),
+        vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B)],
     );
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(10));
-    nodes.insert(1, scan_delta(11));
-    nodes.insert(2, gnitz_wire::OpNode::Union);
-    let loaded = loaded_for_test(nodes, vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B)]);
-
     // `Subgraph` so the union guard is the only one that can fire — the sink
     // contract never runs.
     let plan = |b: SchemaDescriptor| {
         build_plan(
             &loaded,
-            &subgraph_ordered(&loaded, 2),
-            &HashMap::from([(10, one), (11, b)]),
+            &loaded.subgraph_ordered(2),
+            &HashMap::from([(10i64, one), (11, b)]),
             test_site("", 1),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
             PlanTarget::Subgraph { out: 2 },
         )
     };
     assert!(plan(one).is_ok(), "a matched pair must compile");
-    match plan(two) {
-        Err(CompileError::Rejected(guard)) => {
-            assert_eq!(guard, "union: inputs do not share a physical layout")
-        }
-        other => panic!("expected a rejection, got {:?}", other.map(|_| "a plan")),
-    }
+    assert_eq!(
+        rejection(plan(make_schema_u64_i64())),
+        "union: inputs do not share a physical layout"
+    );
 }
+
+// ── Plan targets and the sink contract ──────────────────────────────────
 
 /// A `Subgraph`'s output register is the named node's, and a node list that
 /// reached the sink is rejected — production carves an exchange side out of
 /// the shard input's ancestors, so the sink is never in one.
 #[test]
-fn test_subgraph_output_is_the_named_node() {
-    let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(10));
-    nodes.insert(1, gnitz_wire::OpNode::Negate);
-    nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
-    let loaded = loaded_for_test(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN)]);
-    let ext: ExtTables = HashMap::from([(10, schema)]);
+fn a_subgraph_outputs_the_named_node_and_must_not_hold_the_sink() {
+    let loaded = loaded_for_test(
+        HashMap::from([
+            (0, scan_delta(10)),
+            (1, gnitz_wire::OpNode::Negate),
+            (2, gnitz_wire::OpNode::IntegrateSink),
+        ]),
+        vec![(0, 1, PORT_IN), (1, 2, PORT_IN)],
+    );
+    let ext: ExtTables = HashMap::from([(10i64, SchemaDescriptor::minimal_u64())]);
     let plan = |ordered: &[i32]| {
         build_plan(
             &loaded,
@@ -90,65 +154,66 @@ fn test_subgraph_output_is_the_named_node() {
         )
     };
 
-    let carved = plan(&subgraph_ordered(&loaded, 1)).expect("the carve production performs");
+    let carved = plan(&loaded.subgraph_ordered(1)).expect("the carve production performs");
     assert_eq!(
         carved.vm.program.out_reg,
         *carved.out_reg_of.get(&1).unwrap(),
         "a subgraph outputs the register of the node it names"
     );
-    assert!(
-        matches!(
-            plan(&loaded.ordered),
-            Err(CompileError::Rejected("subgraph contains the sink"))
-        ),
-        "a node list reaching the sink is a mis-carve, not a plan"
-    );
+    assert_eq!(rejection(plan(&loaded.ordered)), "subgraph contains the sink");
 }
 
 /// A sink register whose schema is not the view's output schema is rejected
 /// rather than emitted: the view store would then be written through a
-/// descriptor its rows do not match.
+/// descriptor its rows do not match. A column-count match is not enough —
+/// equal counts with mismatched types would let the client read a 16-byte
+/// string descriptor out of 8-byte integer storage.
 #[test]
-fn test_mismatched_sink_schema_rejected() {
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(10));
-    nodes.insert(1, gnitz_wire::OpNode::IntegrateSink);
-    let view_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
-    // The scan source carries an extra payload column, so the sink register
-    // reaches `build_plan` with a schema the view's does not equal.
-    let source_schema = SchemaDescriptor::new(
+fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
+    let view_schema = SchemaDescriptor::minimal_u64();
+    let string_payload = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::STRING, 0),
         ],
         &[0],
     );
-    let loaded = loaded_for_test(nodes, vec![(0, 1, PORT_IN)]);
-
-    let result = build_plan(
-        &loaded,
-        &loaded.ordered,
-        &HashMap::from([(10, source_schema)]),
-        test_site("", 1),
-        gnitz_store::schema::Placement::KEYED_DEFAULT,
-        PlanTarget::ViewOutput {
-            out_schema: &view_schema,
-            seeds: &[],
-        },
+    let loaded = loaded_for_test(
+        HashMap::from([(0, scan_delta(10)), (1, gnitz_wire::OpNode::IntegrateSink)]),
+        vec![(0, 1, PORT_IN)],
     );
-    match result {
-        Err(CompileError::Rejected(guard)) => {
-            assert_eq!(guard, "sink schema does not match view output schema")
-        }
-        other => panic!("expected a rejection, got {:?}", other.map(|_| "a plan")),
+    let against = |view_schema: &SchemaDescriptor, source: SchemaDescriptor| {
+        build_plan(
+            &loaded,
+            &loaded.ordered,
+            &HashMap::from([(10i64, source)]),
+            test_site("", 1),
+            gnitz_store::schema::Placement::KEYED_DEFAULT,
+            PlanTarget::ViewOutput {
+                out_schema: view_schema,
+                seeds: &[],
+            },
+        )
+    };
+    assert!(against(&view_schema, view_schema).is_ok(), "an equal pair compiles");
+    for source in [make_schema_u64_i64(), string_payload] {
+        assert_eq!(
+            rejection(against(&view_schema, source)),
+            "sink schema does not match view output schema",
+        );
     }
+    // Equal column counts, different types: the same guard, on the sharper input.
+    assert_eq!(
+        rejection(against(&string_payload, make_schema_u64_i64())),
+        "sink schema does not match view output schema",
+    );
 }
 
+/// A circuit producing more than `u16::MAX` registers must fail the compile
+/// rather than wrap the cast and panic in `ProgramBuilder::build`.
 #[test]
-fn test_build_plan_register_overflow_rejected() {
-    // A circuit producing > u16::MAX registers must fail the compile rather
-    // than wrap the u16 cast and panic in ProgramBuilder::build.
-    let n = u16::MAX as i32 + 1; // 65536 nodes → 65536 registers
+fn a_register_count_over_u16_max_is_rejected() {
+    let n = u16::MAX as i32 + 1;
     let mut nodes = HashMap::from([(0, scan_delta(10))]);
     let mut edges = Vec::new();
     for nid in 1..n {
@@ -157,10 +222,10 @@ fn test_build_plan_register_overflow_rejected() {
     }
     let loaded = loaded_for_test(nodes, edges);
     assert_eq!(loaded.ordered.len(), n as usize);
-    let result = build_plan(
+    let plan = build_plan(
         &loaded,
         &loaded.ordered,
-        &HashMap::new(),
+        &ExtTables::new(),
         test_site("", 1),
         gnitz_store::schema::Placement::KEYED_DEFAULT,
         PlanTarget::ViewOutput {
@@ -168,255 +233,209 @@ fn test_build_plan_register_overflow_rejected() {
             seeds: &[],
         },
     );
-    assert!(
-        result.is_err(),
-        "build_plan must fail when register count exceeds u16::MAX"
-    );
+    assert_eq!(rejection(plan), "register count exceeds u16::MAX");
 }
 
+// ── Crafted raw-field guards: reject at compile, never abort at run ─────
+//
+// Each guard is proven by construction: the ONLY difference between the two
+// builds is the crafted field, so a valid build's `Ok` and the crafted build's
+// named rejection are both attributable solely to that field.
+
 /// The planner ships the reduce output-key kind; the engine validates it
-/// against the input schema and hard-rejects (build_plan → None) any kind the
-/// schema does not warrant — the guard that turns a silent output-column
-/// scramble into a compile failure. Covers all three schema shapes × all three
-/// kinds: the three matching kinds compile, the six cross pairings reject.
+/// against the input schema and hard-rejects any kind the schema does not
+/// warrant — the guard that turns a silent output-column scramble into a
+/// compile failure. Covers all three schema shapes × all three kinds: the three
+/// matching kinds compile, the six cross pairings reject.
 #[test]
-fn reduce_out_key_validation_rejects_mismatch() {
+fn a_reduce_out_key_the_schema_does_not_warrant_is_rejected() {
     use gnitz_store::schema::ReduceOutKey;
     use gnitz_wire::{AggFunc, OpNode};
-    let compiles = |in_schema: SchemaDescriptor, group: Vec<u32>, out_key: ReduceOutKey| -> bool {
-        compiles_mid_node(
-            in_schema,
-            OpNode::Reduce {
-                group_cols: group,
-                // A linear COUNT keeps the MIN/MAX-eligibility guard out of the
-                // picture, isolating the out_key validation.
-                agg: vec![(AggFunc::Count, 0)],
-                global_ground: false,
-                out_key,
-            },
+    let reduce = |group: Vec<u32>, out_key: ReduceOutKey| OpNode::Reduce {
+        group_cols: group,
+        // A linear COUNT keeps the MIN/MAX-eligibility guard out of the picture,
+        // isolating the out_key validation.
+        agg: vec![(AggFunc::Count, 0)],
+        global_ground: false,
+        out_key,
+    };
+    let with_group_col = |tc: u8| {
+        SchemaDescriptor::new(
+            &[
+                SchemaColumn::new(type_code::U128, 0),
+                SchemaColumn::new(tc, 0),
+                SchemaColumn::new(type_code::I64, 0),
+            ],
+            &[0],
         )
     };
-
-    // (schema, group cols, the ONE kind the schema warrants, tag).
-    let eq_pk = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    );
-    let single_nat = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::U64, 0), // natural group col
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    );
-    let synthetic = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::STRING, 0), // non-natural group col
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    );
+    // (schema, group cols, the ONE kind the schema warrants).
     let cases = [
-        (eq_pk, vec![0u32], ReduceOutKey::PkPermutation, "eqpk"),
-        (single_nat, vec![1u32], ReduceOutKey::SingleNaturalCol, "single"),
-        (synthetic, vec![1u32], ReduceOutKey::SyntheticFold, "synth"),
+        (make_schema_u64_i64(), vec![0u32], ReduceOutKey::PkPermutation),
+        (with_group_col(type_code::U64), vec![1], ReduceOutKey::SingleNaturalCol),
+        (with_group_col(type_code::STRING), vec![1], ReduceOutKey::SyntheticFold),
     ];
     let all_kinds = [
         ReduceOutKey::SyntheticFold,
         ReduceOutKey::PkPermutation,
         ReduceOutKey::SingleNaturalCol,
     ];
-    for (schema, group, correct, tag) in cases {
+    for (schema, group, correct) in cases {
+        let fixture = MidCircuit::new(schema);
         for kind in all_kinds {
-            let ok = compiles(schema, group.clone(), kind);
-            assert_eq!(
-                ok,
-                kind == correct,
-                "schema {tag}: out_key {kind:?} should {} (schema warrants {correct:?})",
-                if kind == correct { "compile" } else { "reject" },
-            );
+            let mid = reduce(group.clone(), kind);
+            if kind == correct {
+                assert!(fixture.compiles(mid), "{kind:?} is the kind this schema warrants");
+            } else {
+                assert_eq!(
+                    fixture.rejection(mid),
+                    "reduce: out_key does not match input schema",
+                    "out_key {kind:?} against the schema warranting {correct:?}",
+                );
+            }
         }
     }
 }
 
 #[test]
-fn test_build_plan_wide_pk_join_accepted() {
-    // After byte-API port: wide-PK Join(DeltaTrace) must compile successfully.
-    // ScanDelta(wide) --port0--> Join(DT) <--port1-- IntegrateTrace(wide)
-    // Join(DT) --> IntegrateSink.
-    // 3 × U64 = a 24-byte PK, wide.
-    let schema = crate::test_support::pk_only_schema(&[type_code::U64; 3]);
-    let dir = tempfile::tempdir().unwrap();
-    let view_dir = dir.path().to_str().unwrap();
-
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(10));
-    nodes.insert(1, scan_delta(20));
-    nodes.insert(2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
-    nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
-    nodes.insert(4, gnitz_wire::OpNode::IntegrateTrace);
-    let edges = vec![(0, 2, PORT_IN_A), (1, 4, PORT_IN), (4, 2, PORT_TRACE), (2, 3, PORT_IN)];
-    let loaded = loaded_for_test(nodes, edges);
-    let ext: ExtTables = HashMap::from([(10, schema), (20, schema)]);
-    // The plan owns scratch dirs under `dir`, so it must drop first: build it
-    // inside the assert rather than binding it past `dir`'s scope.
-    assert!(
-        build_plan(
-            &loaded,
-            &subgraph_ordered(&loaded, 2),
-            &ext,
-            test_site(view_dir, 1),
-            gnitz_store::schema::Placement::KEYED_DEFAULT,
-            PlanTarget::Subgraph { out: 2 }
-        )
-        .is_ok(),
-        "wide-PK Join(DeltaTrace) must compile after byte-API port"
+fn reduce_column_indices_out_of_range_are_rejected() {
+    use gnitz_store::schema::ReduceOutKey;
+    use gnitz_wire::{AggFunc, OpNode};
+    let reduce = |group: Vec<u32>, agg_col: u32| OpNode::Reduce {
+        group_cols: group,
+        agg: vec![(AggFunc::Count, agg_col)],
+        global_ground: false,
+        out_key: ReduceOutKey::PkPermutation,
+    };
+    let fixture = MidCircuit::new(make_schema_u64_i64());
+    assert_eq!(
+        fixture.rejection(reduce(vec![200], 0)),
+        "reduce: group columns out of range"
+    );
+    assert_eq!(
+        fixture.rejection(reduce(vec![0], 200)),
+        "reduce: aggregate column out of range"
     );
 }
 
-// ── Item 32: sink schema type validation ────────────────────────────────
-
+/// Every aggregate that decodes its column value needs a scalar register image
+/// (`ScalarKind`) — the ≤8-byte int/float set. The SQL binder rejects the rest
+/// upstream, so this covers the low-level `CircuitBuilder` path that bypasses it.
 #[test]
-fn test_build_plan_sink_schema_type_mismatch_rejected() {
-    // ScanDelta(99) → IntegrateSink. The source schema is [U64 pk, I64];
-    // the view's declared out_schema is [U64 pk, STRING]. Same column count,
-    // different physical layout → must be rejected, else the client
-    // reads a 16-byte string descriptor out of 8-byte integer storage.
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(99));
-    nodes.insert(1, gnitz_wire::OpNode::IntegrateSink);
-    let edges = vec![(0, 1, PORT_IN)];
-    let loaded = loaded_for_test(nodes, edges);
-    let view_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::STRING, 0),
-        ],
-        &[0],
-    );
-    let in_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    );
-    let ext: ExtTables = HashMap::from([(99, in_schema)]);
-    let result = build_plan(
-        &loaded,
-        &loaded.ordered,
-        &ext,
-        test_site("", 99),
-        gnitz_store::schema::Placement::KEYED_DEFAULT,
-        PlanTarget::ViewOutput {
-            out_schema: &view_schema,
-            seeds: &[],
-        },
-    );
-    assert!(result.is_err(), "type-mismatched sink schema must be rejected");
-}
-
-// ── Item 35: corrupt Filter/Map blob aborts compilation ─────────────────
-
-#[test]
-fn test_build_plan_corrupt_filter_blob_aborts() {
-    // ScanDelta(99) → Filter(blob) → IntegrateSink. A present blob that
-    // fails to decode must abort, not silently degrade to WHERE TRUE —
-    // whether it is garbled or empty (a damaged catalog cell reads back
-    // empty, and `load_circuit` hands it on as present).
-    let in_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
-    // Hold the sink to the input schema so the sink-schema check passes; the
-    // only thing that can fail this compile is the blob.
-    let fixture = MidCircuit::new(in_schema).with_out_schema(in_schema);
-    for blob in [vec![0xFFu8; 16], Vec::new()] {
-        let what = if blob.is_empty() { "empty" } else { "garbled" };
+fn a_value_reading_aggregate_over_a_non_scalar_column_is_rejected() {
+    use gnitz_store::schema::ReduceOutKey;
+    use gnitz_wire::{AggFunc, OpNode};
+    // col 0 = U64 PK and the whole group key (⇒ PkPermutation); col 1 = the
+    // aggregate column, whose type is the only thing varying.
+    let reduce = |func| OpNode::Reduce {
+        group_cols: vec![0],
+        agg: vec![(func, 1)],
+        global_ground: false,
+        out_key: ReduceOutKey::PkPermutation,
+    };
+    for func in [AggFunc::Sum, AggFunc::SumZero, AggFunc::Min, AggFunc::Max] {
         assert!(
-            !fixture.compiles(gnitz_wire::OpNode::Filter(Some(blob))),
-            "a {what} Filter blob must abort compilation"
+            MidCircuit::new(make_schema_u64_i64()).compiles(reduce(func)),
+            "{func:?} over I64"
+        );
+        for tc in [type_code::U128, type_code::STRING] {
+            assert_eq!(
+                MidCircuit::new(u64_pk_schema(SchemaColumn::new(tc, 0))).rejection(reduce(func)),
+                "reduce: aggregate column type has no scalar register image",
+                "{func:?} over type code {tc}",
+            );
+        }
+    }
+    // COUNT never reads the value, so no type excludes it.
+    assert!(MidCircuit::new(u64_pk_schema(SchemaColumn::new(type_code::STRING, 0))).compiles(reduce(AggFunc::Count)));
+}
+
+#[test]
+fn projection_columns_out_of_range_are_rejected() {
+    use gnitz_wire::{MapKind, OpNode};
+    let fixture = MidCircuit::new(make_schema_u64_i64());
+    let rejection = |cols: Vec<u32>| fixture.rejection(OpNode::Map(MapKind::Projection(cols)));
+    assert_eq!(rejection(vec![200]), "projection map: columns out of range");
+    // A PK source: `project_schema` drops it while `copy_cols` numbers
+    // destinations densely, so the copy addresses a slot that does not exist.
+    assert!(rejection(vec![0]).starts_with("map: program/schema mismatch"));
+    // `oob_cols` bounds each index but not the list length, and duplicates are
+    // legal, so a long list overruns `project_schema`'s array. Exactly
+    // MAX_COLUMNS payload sources already overflow — the schema also carries the
+    // input's PK column, which a length-only bound misses.
+    assert_eq!(
+        rejection(vec![1; gnitz_store::schema::MAX_COLUMNS]),
+        "projection map: output exceeds MAX_COLUMNS"
+    );
+}
+
+#[test]
+fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
+    use gnitz_wire::OpNode;
+    const GUARD: &str = "null-extend: merged schema exceeds MAX_COLUMNS";
+    let extend = |n: usize| OpNode::NullExtend {
+        type_codes: vec![type_code::I64; n],
+    };
+    let narrow = MidCircuit::new(make_schema_u64_i64());
+    assert!(narrow.compiles(extend(1)), "a short type_codes list extends cleanly");
+    // MAX_COLUMNS type_codes overflow the fixed schema array on their own.
+    assert_eq!(narrow.rejection(extend(gnitz_store::schema::MAX_COLUMNS)), GUARD);
+    // A near-max-width input plus a short extension overflows the *merged* output
+    // width, which a bound on the list length alone cannot catch: 64 + 2 > 65.
+    let wide = {
+        let mut cols = [SchemaColumn::new(type_code::I64, 0); 64];
+        cols[0] = SchemaColumn::new(type_code::U64, 0);
+        SchemaDescriptor::new(&cols, &[0])
+    };
+    assert_eq!(MidCircuit::new(wide).rejection(extend(2)), GUARD);
+    // (An undecodable type code is rejected at the wire decode boundary, where
+    // the two sibling type-code lists are also validated.)
+}
+
+/// A present expression blob that fails to decode must abort the compile, not
+/// silently degrade to `WHERE TRUE` / an identity map — whether it is garbled or
+/// empty (a damaged catalog cell reads back empty, and `load_circuit` hands it
+/// on as present).
+#[test]
+fn a_corrupt_expression_blob_aborts_the_compile() {
+    use gnitz_wire::{MapKind, OpNode};
+    let fixture = MidCircuit::new(SchemaDescriptor::minimal_u64());
+    for blob in [vec![0xFFu8; 16], Vec::new()] {
+        assert!(
+            fixture
+                .rejection(OpNode::Filter(Some(blob.clone())))
+                .starts_with("filter: invalid predicate program"),
+            "a {}-byte Filter blob must abort compilation",
+            blob.len()
+        );
+        assert!(
+            fixture
+                .rejection(OpNode::Map(MapKind::Compute {
+                    program: blob.clone(),
+                    out_cols: vec![],
+                }))
+                .starts_with("map: invalid program"),
+            "a {}-byte Map blob must abort compilation",
+            blob.len()
         );
     }
 }
 
+/// The reindex arm derives its output layout from the client's key and kept-column
+/// lists, so every way those lists can overrun the fixed schema arrays has to be a
+/// named rejection rather than a panic or a truncated key.
 #[test]
-fn test_build_plan_corrupt_map_blob_aborts() {
-    // ScanDelta(99) → Map(Expression{corrupt blob}) → IntegrateSink.
-    let in_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
-    let corrupt = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Compute {
-        program: vec![0xFFu8; 16],
-        out_cols: vec![],
-    });
-    assert!(
-        !MidCircuit::new(in_schema).compiles(corrupt),
-        "corrupt Map blob must abort compilation"
-    );
-}
-
-/// A compound (len > 1) reindex Map now compiles end-to-end: the gate is
-/// lifted and `emit_node` builds a 2-slot-PK node schema, so `build_plan`
-/// returns `Some` (the sink's output schema matches the reindex output).
-#[test]
-fn test_build_plan_compound_reindex_accepted() {
-    let in_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    );
-    // The sink validates against the reindex Map's output schema (2 synthetic
-    // PK slots [U64, I64] + the two input columns).
-    let out_schema = gnitz_store::schema::key::ReindexPacker::new(&in_schema, &[0, 1], &[])
-        .unwrap()
-        .output_schema(&in_schema, &[0, 1])
-        .unwrap();
-    let map = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
-        keep: vec![0, 1],
-        reindex_cols: vec![0, 1],
-        reindex_target_tcs: vec![],
-        role: gnitz_wire::ReindexRole::ScatterKey,
-    });
-    assert!(
-        MidCircuit::new(in_schema).with_out_schema(out_schema).compiles(map),
-        "compound (len > 1) reindex must compile after the gate lift"
-    );
-}
-
-/// A reindex list longer than `MAX_PK_COLUMNS` overflows the output schema's
-/// fixed PK array; `emit_node` must fail the compile cleanly (`build_plan`
-/// returns None) rather than panic or build a truncated key.
-#[test]
-fn test_build_plan_reindex_exceeds_max_pk_columns_rejected() {
-    // 6-column source, reindex on all 6 → pk_n (6) > MAX_PK_COLUMNS (5).
-    let n_cols = gnitz_store::schema::MAX_PK_COLUMNS + 1;
-    let cols: Vec<SchemaColumn> = (0..n_cols).map(|_| SchemaColumn::new(type_code::U64, 0)).collect();
-    let in_schema = SchemaDescriptor::new(&cols, &[0]);
-    let reindex_cols: Vec<u32> = (0..n_cols as u32).collect();
-
-    let map = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
-        keep: vec![0],
-        reindex_cols,
-        reindex_target_tcs: vec![],
-        role: gnitz_wire::ReindexRole::ScatterKey,
-    });
-    assert!(
-        !MidCircuit::new(in_schema).compiles(map),
-        "reindex list > MAX_PK_COLUMNS must fail the compile"
-    );
-}
-
-/// The reindex output payload schema is derived from its kept-column list:
-/// a node keeping only a subset of the input columns compiles to the pruned
-/// `[key slots ‖ kept columns]` layout end-to-end (`build_plan` returns
-/// `Some` against a sink schema built from the same kept list).
-#[test]
-fn test_build_plan_pruned_reindex_compiles() {
-    // 3-column source; reindex on col0, keeping only col 2 as payload.
-    let in_schema = SchemaDescriptor::new(
+fn reindex_key_and_kept_column_lists_are_bounds_checked() {
+    use gnitz_wire::{MapKind, OpNode};
+    let reindex = |keep: Vec<u32>, reindex_cols: Vec<u32>| {
+        OpNode::Map(MapKind::Reindex {
+            keep,
+            reindex_cols,
+            reindex_target_tcs: vec![],
+            role: gnitz_wire::ReindexRole::ScatterKey,
+        })
+    };
+    let three = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::U32, 0),
@@ -424,87 +443,208 @@ fn test_build_plan_pruned_reindex_compiles() {
         ],
         &[0],
     );
-    let out_schema = gnitz_store::schema::key::ReindexPacker::new(&in_schema, &[0], &[])
-        .unwrap()
-        .output_schema(&in_schema, &[2])
-        .unwrap();
-    let map = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
-        keep: vec![2],
-        reindex_cols: vec![0],
-        reindex_target_tcs: vec![],
-        role: gnitz_wire::ReindexRole::ScatterKey,
-    });
-    assert!(
-        MidCircuit::new(in_schema).with_out_schema(out_schema).compiles(map),
-        "pruned reindex must compile to the derived schema"
+    // A compound key and a pruned payload both compile — neither is an identity,
+    // since a reindex overwrites every row's PK.
+    assert!(MidCircuit::new(make_schema_u64_i64()).compiles(reindex(vec![0, 1], vec![0, 1])));
+    assert!(MidCircuit::new(three).compiles(reindex(vec![2], vec![0])));
+
+    let narrow = MidCircuit::new(make_schema_u64_i64());
+    assert_eq!(
+        narrow.rejection(reindex(vec![9], vec![0])),
+        "map: reindex payload column out of range"
+    );
+    assert_eq!(
+        narrow.rejection(reindex(vec![0], vec![9])),
+        "map: reindex columns out of range"
+    );
+    // A key longer than MAX_PK_COLUMNS overflows the output schema's fixed PK array.
+    let n = gnitz_store::schema::MAX_PK_COLUMNS + 1;
+    let wide = SchemaDescriptor::new(&vec![SchemaColumn::new(type_code::U64, 0); n], &[0]);
+    assert_eq!(
+        MidCircuit::new(wide).rejection(reindex(vec![0], (0..n as u32).collect())),
+        "map: invalid reindex key"
     );
 }
 
-/// A reindex keeping an out-of-range source column is a corrupt/forged
-/// catalog; `emit_node` must fail the compile cleanly (`build_plan` returns
-/// None) rather than read a zeroed schema slot.
+/// The set-op full-row identity map: a synthetic U128 PK over the projected
+/// payload, with each slot optionally promoted to a wider fixed-int type so a
+/// cross-width pair (`I32 UNION I64`) hashes one physical layout.
 #[test]
-fn test_build_plan_reindex_keep_oob_col_rejected() {
-    // reindex on col0, keeping col 9 on a 2-column source.
-    let in_schema = SchemaDescriptor::new(
+fn a_hash_row_map_promotes_within_the_copy_kernel_domain_or_is_rejected() {
+    use gnitz_wire::{MapKind, OpNode};
+    let hash_row = |cols: Vec<u32>, tcs: Vec<u8>| OpNode::Map(MapKind::HashRow(cols, tcs, 0));
+    let fixture = MidCircuit::new(u64_pk_schema(SchemaColumn::new(type_code::U32, 0)));
+    assert!(fixture.compiles(hash_row(vec![1], vec![0])), "no promotion");
+    assert!(
+        fixture.compiles(hash_row(vec![1], vec![type_code::I64])),
+        "U32 → I64 is the ≤8-byte widen the copy kernel supports"
+    );
+    assert_eq!(
+        fixture.rejection(hash_row(vec![9], vec![0])),
+        "hash-row map: columns out of range"
+    );
+    assert_eq!(
+        fixture.rejection(hash_row(vec![1], vec![type_code::STRING])),
+        "hash-row map: invalid promotion target",
+        "a German string is not a fixed-int widen"
+    );
+}
+
+/// The range probe's preconditions are enforced at compile time, not by a
+/// `debug_assert` a release build strips. The walk slices both sides' PK
+/// regions at one equality width, so a crafted circuit whose two sides reindex
+/// to different strides — or whose `n_eq` leaves no range slot — must be
+/// rejected rather than reach the operator.
+#[test]
+fn range_join_probe_preconditions_are_rejected_at_compile_time() {
+    use gnitz_wire::{JoinKind, OpNode, RangeRel};
+    let plan = |delta_schema: SchemaDescriptor, trace_schema: SchemaDescriptor, n_eq: u8| {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = loaded_for_test(
+            HashMap::from([
+                (0, scan_delta(10)),
+                (1, scan_delta(11)),
+                (2, OpNode::IntegrateTrace),
+                (
+                    3,
+                    OpNode::Join(JoinKind::DeltaTraceRange {
+                        n_eq,
+                        rel: RangeRel::Lt,
+                    }),
+                ),
+                (4, OpNode::IntegrateSink),
+            ]),
+            vec![(0, 3, PORT_IN_A), (1, 2, PORT_IN), (2, 3, PORT_TRACE), (3, 4, PORT_IN)],
+        );
+        build_plan(
+            &loaded,
+            &loaded.subgraph_ordered(3),
+            &HashMap::from([(10i64, delta_schema), (11, trace_schema)]),
+            test_site(dir.path().to_str().unwrap(), 1),
+            gnitz_store::schema::Placement::KEYED_DEFAULT,
+            PlanTarget::Subgraph { out: 3 },
+        )
+        .map(drop)
+    };
+    // The shape the reindex packer produces: `[eq slot, range slot]` PK, then payload.
+    let band = |eq_tc: u8| pk_payload_schema(&[eq_tc, type_code::U64]);
+    let wide = band(type_code::U64); // pk_stride 16
+    let narrow = band(type_code::U32); // pk_stride 12
+    assert!(
+        plan(wide, wide, 1).is_ok(),
+        "a matched pair at the common promoted type must compile"
+    );
+    const STRIDE: &str =
+        "range join: delta and trace PK strides differ (both sides must reindex at the pair's common type)";
+    assert_eq!(rejection(plan(narrow, wide, 1)), STRIDE, "delta side narrower");
+    assert_eq!(rejection(plan(wide, narrow, 1)), STRIDE, "delta side wider");
+
+    // `leading_key_size` sums *schema*-order columns, so a PK-last column order —
+    // which the packer never emits but a crafted circuit can name — puts the whole
+    // 8-byte key inside the `n_eq = 1` prefix while the key arity is still
+    // `n_eq + 1`. That leaves no range slot.
+    let pk_last = SchemaDescriptor::new(
         &[
-            SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::I64, 0),
+            SchemaColumn::new(type_code::U32, 0),
+            SchemaColumn::new(type_code::U32, 0),
         ],
-        &[0],
+        &[1, 2],
     );
-    let map = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
-        keep: vec![9],
-        reindex_cols: vec![0],
-        reindex_target_tcs: vec![],
-        role: gnitz_wire::ReindexRole::ScatterKey,
-    });
-    assert!(
-        !MidCircuit::new(in_schema).compiles(map),
-        "an out-of-range kept column must fail the compile"
+    assert_eq!(
+        rejection(plan(pk_last, pk_last, 1)),
+        "range join: eq prefix covers the whole key"
     );
 }
 
-// ── Item 29: scratch dir cleanup on compile failure ─────────────────────
-
+/// A trace port fed by a node that is not an integral is rejected at compile
+/// time: `topo_sorted` checks a `Join`'s port arity, not its producer's kind,
+/// and such a register would reach the dispatch with no cursor. The ONLY
+/// difference between the two builds is which node feeds `PORT_TRACE`.
 #[test]
-fn test_build_plan_cleans_scratch_dirs_on_failure() {
-    // ScanDelta → IntegrateTrace → Map → IntegrateSink, with the Map
-    // projecting an out-of-bounds column so it fails the compile. The
-    // IntegrateTrace before it has already created its scratch dir under
-    // `view_dir`; `ScratchGuard`'s drop must remove it, so probing
-    // unsupported queries can't leak inodes.
-    //
-    // The failing node must come *after* a node that creates scratch,
-    // otherwise there is nothing for the cleanup to remove and the
-    // assertion below holds vacuously.
+fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let two_col = make_schema_u64_i64();
+    // Node 2 is the integral of scan 11; node 1 is that scan's own register,
+    // which carries a delta and no table.
+    let plan = |trace_src: i32| {
+        let loaded = loaded_for_test(
+            HashMap::from([
+                (0, scan_delta(10)),
+                (1, scan_delta(11)),
+                (2, gnitz_wire::OpNode::IntegrateTrace),
+                (3, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace)),
+            ]),
+            vec![(1, 2, PORT_IN), (0, 3, PORT_IN_A), (trace_src, 3, PORT_TRACE)],
+        );
+        build_plan(
+            &loaded,
+            &loaded.ordered,
+            &HashMap::from([(10i64, two_col), (11, two_col)]),
+            test_site(dir.path().to_str().unwrap(), 1),
+            gnitz_store::schema::Placement::KEYED_DEFAULT,
+            PlanTarget::Subgraph { out: 3 },
+        )
+        .map(drop)
+    };
+    assert!(plan(2).is_ok(), "an integral is a valid trace port");
+    assert_eq!(rejection(plan(1)), "join: trace port is not an integral");
+}
+
+/// A wide (24-byte, 3 × U64) PK carries through the join's byte-keyed probe.
+#[test]
+fn a_wide_pk_join_compiles() {
+    let schema = crate::test_support::pk_only_schema(&[type_code::U64; 3]);
+    let dir = tempfile::tempdir().unwrap();
+    let loaded = loaded_for_test(
+        HashMap::from([
+            (0, scan_delta(10)),
+            (1, scan_delta(20)),
+            (2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace)),
+            (3, gnitz_wire::OpNode::IntegrateSink),
+            (4, gnitz_wire::OpNode::IntegrateTrace),
+        ]),
+        vec![(0, 2, PORT_IN_A), (1, 4, PORT_IN), (4, 2, PORT_TRACE), (2, 3, PORT_IN)],
+    );
+    // The plan owns scratch dirs under `dir`, so it must drop first: build it
+    // inside the assert rather than binding it past `dir`'s scope.
+    assert!(build_plan(
+        &loaded,
+        &loaded.subgraph_ordered(2),
+        &HashMap::from([(10i64, schema), (20, schema)]),
+        test_site(dir.path().to_str().unwrap(), 1),
+        gnitz_store::schema::Placement::KEYED_DEFAULT,
+        PlanTarget::Subgraph { out: 2 }
+    )
+    .is_ok());
+}
+
+/// A failing node after one that already created scratch: `ScratchGuard`'s drop
+/// must remove the directory, so probing unsupported queries cannot leak inodes.
+/// The failing node must come *after* a scratch-creating one, otherwise there is
+/// nothing to remove and the assertion holds vacuously.
+#[test]
+fn a_failed_compile_removes_the_scratch_dirs_it_created() {
     let dir = tempfile::tempdir().unwrap();
     let view_dir = dir.path();
-
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
+    let loaded = loaded_for_test(
+        HashMap::from([
+            (0, scan_delta(10)),
+            (1, gnitz_wire::OpNode::IntegrateTrace),
+            (2, gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Projection(vec![200]))),
+            (3, gnitz_wire::OpNode::IntegrateSink),
+        ]),
+        vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN)],
     );
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(10));
-    nodes.insert(1, gnitz_wire::OpNode::IntegrateTrace);
-    nodes.insert(2, gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Projection(vec![200])));
-    nodes.insert(3, gnitz_wire::OpNode::IntegrateSink);
-    let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN)];
-    let loaded = loaded_for_test(nodes, edges);
-    let ext: ExtTables = HashMap::from([(10, schema)]);
     let result = build_plan(
         &loaded,
-        &subgraph_ordered(&loaded, 2),
-        &ext,
+        &loaded.subgraph_ordered(2),
+        &HashMap::from([(10i64, make_schema_u64_i64())]),
         test_site(view_dir.to_str().unwrap(), 1),
         gnitz_store::schema::Placement::KEYED_DEFAULT,
         PlanTarget::Subgraph { out: 2 },
     );
-    assert!(result.is_err(), "out-of-bounds projection must fail the compile");
+    assert_eq!(rejection(result), "projection map: columns out of range");
 
     let leftover: Vec<String> = std::fs::read_dir(view_dir)
         .unwrap()
@@ -519,37 +659,29 @@ fn test_build_plan_cleans_scratch_dirs_on_failure() {
 }
 
 /// `compile_view` filters the exchange nids out of the *post* phase's node
-/// list, but a side's list is `ancestors_inclusive` of its own exchange
-/// input with no such filter — so a shard upstream of another shard's input
-/// lands inside that side and reaches `emit_node`. It must reject, not
-/// panic: a panic there is a worker abort, and a worker crash takes the
-/// cluster down. No planner path emits the shape, and the planner asserts
-/// against it, but a circuit hand-built through `gnitz_core::CircuitBuilder`
-/// bypasses the planner entirely.
+/// list, but a side's list is `ancestors_inclusive` of its own exchange input
+/// with no such filter — so a shard upstream of another shard's input lands
+/// inside that side and reaches `emit_node`. It must reject, not panic: a panic
+/// there is a worker abort, and a worker crash takes the cluster down. No
+/// planner path emits the shape, but a circuit hand-built through
+/// `gnitz_core::CircuitBuilder` bypasses the planner entirely.
 #[test]
-fn chained_exchange_rejects_instead_of_panicking() {
+fn a_chained_exchange_is_rejected_instead_of_panicking() {
     let dir = tempfile::tempdir().unwrap();
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
+    let loaded = loaded_for_test(
+        HashMap::from([
+            (0, scan_delta(10)),
+            (1, gnitz_wire::OpNode::ExchangeShard { shard_cols: vec![0] }),
+            (2, gnitz_wire::OpNode::Filter(None)),
+            (3, gnitz_wire::OpNode::ExchangeShard { shard_cols: vec![0] }),
+            (4, gnitz_wire::OpNode::IntegrateSink),
+        ]),
+        vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN), (3, 4, PORT_IN)],
     );
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(10));
-    nodes.insert(1, gnitz_wire::OpNode::ExchangeShard { shard_cols: vec![0] });
-    nodes.insert(2, gnitz_wire::OpNode::Filter(None));
-    nodes.insert(3, gnitz_wire::OpNode::ExchangeShard { shard_cols: vec![0] });
-    nodes.insert(4, gnitz_wire::OpNode::IntegrateSink);
-    let edges = vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN), (3, 4, PORT_IN)];
-    let loaded = loaded_for_test(nodes, edges);
-    let ext: ExtTables = HashMap::from([(10, schema)]);
 
     // The carve `compile_view` performs for the sink-nearest shard.
     let ex_in = loaded.inputs(3).unary();
-    let set = ancestors_inclusive(&loaded, ex_in);
-    let side_ordered: Vec<i32> = loaded.ordered.iter().copied().filter(|n| set.contains(n)).collect();
+    let side_ordered = loaded.subgraph_ordered(ex_in);
     assert!(
         side_ordered.contains(&1),
         "fixture must place the upstream shard inside the side's node list, got {side_ordered:?}"
@@ -558,341 +690,32 @@ fn chained_exchange_rejects_instead_of_panicking() {
     let result = build_plan(
         &loaded,
         &side_ordered,
-        &ext,
+        &HashMap::from([(10i64, make_schema_u64_i64())]),
         test_site(dir.path().to_str().unwrap(), 1),
         gnitz_store::schema::Placement::KEYED_DEFAULT,
         PlanTarget::Subgraph { out: ex_in },
     );
-    assert!(
-        matches!(result, Err(CompileError::Rejected("chained exchange nodes"))),
-        "chained exchange must be a named rejection"
-    );
+    assert_eq!(rejection(result), "chained exchange nodes");
 }
 
-// ── helpers shared by join tests ─────────────────────────────────────
+// ── Weight-clamp presets ────────────────────────────────────────────────
 
-fn two_col_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::U64, 0),
-        ],
-        &[0],
-    )
-}
-
-// ── Part B: crafted raw-field guards reject at compile, never abort at run ──
-//
-// Each guard is proven by construction: the ONLY difference between the two
-// builds is the crafted field, so a valid build's `Some` and the crafted
-// build's `None` are both attributable solely to that field.
-
-/// The `ScanDelta(10) → mid → IntegrateSink` fixture: everything a guard test
-/// needs to isolate one crafted field on `mid`.
-struct MidCircuit {
-    in_schema: SchemaDescriptor,
-    out_schema: Option<SchemaDescriptor>,
-    /// Where the mid node's scratch children are created. `None` = a fresh
-    /// tempdir; a bad path is how a test reaches `create_child_table`'s
-    /// failure arm.
-    dir: Option<String>,
-}
-
-impl MidCircuit {
-    fn new(in_schema: SchemaDescriptor) -> Self {
-        MidCircuit {
-            in_schema,
-            out_schema: None,
-            dir: None,
-        }
-    }
-
-    /// Hold the sink to `out_schema`. Left unset, `build_plan` is entered on
-    /// its `PlanTarget::Subgraph` path, which suppresses the sink-schema
-    /// contract — what a test isolating a *mid-node* guard wants, since the mid
-    /// node's output schema is exactly what it is varying.
-    fn with_out_schema(mut self, out_schema: SchemaDescriptor) -> Self {
-        self.out_schema = Some(out_schema);
-        self
-    }
-
-    /// Home the scratch children at `dir` instead of a fresh tempdir.
-    fn with_dir(mut self, dir: &str) -> Self {
-        self.dir = Some(dir.to_owned());
-        self
-    }
-
-    fn build(&self, mid: gnitz_wire::OpNode) -> Result<PlanBuildResult, CompileError> {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = self
-            .dir
-            .clone()
-            .unwrap_or_else(|| tmp.path().to_str().unwrap().to_owned());
-        let mut nodes = HashMap::new();
-        nodes.insert(0, scan_delta(10));
-        nodes.insert(1, mid);
-        nodes.insert(2, gnitz_wire::OpNode::IntegrateSink);
-        let loaded = loaded_for_test(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN)]);
-        let ext: ExtTables = HashMap::from([(10, self.in_schema)]);
-        let (ordered, target) = match &self.out_schema {
-            Some(out_schema) => (
-                loaded.ordered.clone(),
-                PlanTarget::ViewOutput { out_schema, seeds: &[] },
-            ),
-            None => (subgraph_ordered(&loaded, 1), PlanTarget::Subgraph { out: 1 }),
-        };
-        build_plan(
-            &loaded,
-            &ordered,
-            &ext,
-            test_site(&dir, 1),
-            gnitz_store::schema::Placement::KEYED_DEFAULT,
-            target,
-        )
-    }
-
-    fn compiles(&self, mid: gnitz_wire::OpNode) -> bool {
-        self.build(mid).is_ok()
-    }
-}
-
-/// `ScanDelta(10) ⋈range IntegrateTrace(ScanDelta(11)) → IntegrateSink`,
-/// compiled against the two given source schemas. Reports whether it
-/// compiles.
-fn range_join_plan(
-    delta_schema: SchemaDescriptor,
-    trace_schema: SchemaDescriptor,
-    n_eq: u8,
-) -> Result<PlanBuildResult, CompileError> {
-    use gnitz_wire::{JoinKind, OpNode, RangeRel};
-    let dir = tempfile::tempdir().unwrap();
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(10));
-    nodes.insert(1, scan_delta(11));
-    nodes.insert(2, OpNode::IntegrateTrace);
-    nodes.insert(
-        3,
-        OpNode::Join(JoinKind::DeltaTraceRange {
-            n_eq,
-            rel: RangeRel::Lt,
-        }),
-    );
-    nodes.insert(4, OpNode::IntegrateSink);
-    let loaded = loaded_for_test(
-        nodes,
-        vec![(0, 3, PORT_IN_A), (1, 2, PORT_IN), (2, 3, PORT_TRACE), (3, 4, PORT_IN)],
-    );
-    let ext: ExtTables = HashMap::from([(10, delta_schema), (11, trace_schema)]);
-    build_plan(
-        &loaded,
-        &subgraph_ordered(&loaded, 3),
-        &ext,
-        test_site(dir.path().to_str().unwrap(), 1),
-        gnitz_store::schema::Placement::KEYED_DEFAULT,
-        PlanTarget::Subgraph { out: 3 },
-    )
-}
-
-/// The range probe's preconditions are enforced at compile time, not by a
-/// `debug_assert` a release build strips. The walk slices both sides' PK
-/// regions at one equality width, so a crafted circuit whose two sides
-/// reindex to different strides — or whose `n_eq` leaves no range slot — must
-/// be rejected rather than reach the operator.
+/// The two clamp operators differ in nothing but their preset, and the preset is
+/// what makes them different operators: `distinct` is the set-membership clamp
+/// `[-1, 1]`, `positive_part` the bag clamp that drops the negative part only.
 #[test]
-fn test_range_join_probe_preconditions_rejected() {
-    // The shape the reindex packer produces: `[eq slot, range slot]` PK, then
-    // payload.
-    let band = |eq_tc: u8| {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(eq_tc, 0),
-                SchemaColumn::new(type_code::U64, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0, 1],
-        )
-    };
-    let wide = band(type_code::U64); // pk_stride 16
-    let narrow = band(type_code::U32); // pk_stride 12
-    let rejection = |d, t, n_eq| match range_join_plan(d, t, n_eq) {
-        Err(CompileError::Rejected(guard)) => guard,
-        other => panic!("expected a rejection, got {:?}", other.map(|_| "a plan")),
-    };
-    assert!(
-        range_join_plan(wide, wide, 1).is_ok(),
-        "a matched pair at the common promoted type must compile"
-    );
-    const STRIDE: &str =
-        "range join: delta and trace PK strides differ (both sides must reindex at the pair's common type)";
-    assert_eq!(rejection(narrow, wide, 1), STRIDE, "delta side narrower than the trace");
-    assert_eq!(rejection(wide, narrow, 1), STRIDE, "delta side wider than the trace");
-
-    // `leading_key_size` sums *schema*-order columns, so a PK-last column
-    // order — which the packer never emits but a crafted circuit can name —
-    // puts the whole 8-byte key inside the `n_eq = 1` prefix while the key
-    // arity is still `n_eq + 1`. That leaves no range slot.
-    let pk_last = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::U32, 0),
-            SchemaColumn::new(type_code::U32, 0),
-        ],
-        &[1, 2],
-    );
-    assert_eq!(
-        rejection(pk_last, pk_last, 1),
-        "range join: eq prefix covers the whole key",
-        "an eq prefix leaving no range slot",
-    );
-}
-
-/// Build `ScanDelta(10) → mid → IntegrateSink` and report whether it compiles.
-fn compiles_mid_node(in_schema: SchemaDescriptor, mid: gnitz_wire::OpNode) -> bool {
-    MidCircuit::new(in_schema).compiles(mid)
-}
-
-/// The guard that rejected `ScanDelta(10) → mid → IntegrateSink`. Naming it is
-/// what makes a guard test attributable: a bare `is_err()` also passes when an
-/// unrelated guard fires, which is why these used to need a control build.
-fn mid_node_rejection(in_schema: SchemaDescriptor, mid: gnitz_wire::OpNode) -> String {
-    match MidCircuit::new(in_schema).build(mid) {
-        Err(e) => e.to_string(),
-        Ok(_) => panic!("expected a rejection, got a plan"),
-    }
-}
-
-#[test]
-fn test_reduce_group_cols_out_of_bounds_rejected() {
-    use gnitz_store::schema::ReduceOutKey;
-    use gnitz_wire::{AggFunc, OpNode};
-    let reduce = |group: Vec<u32>| OpNode::Reduce {
-        group_cols: group,
-        agg: vec![(AggFunc::Count, 0)],
-        global_ground: false,
-        out_key: ReduceOutKey::PkPermutation,
-    };
-    assert_eq!(
-        mid_node_rejection(two_col_schema(), reduce(vec![200])),
-        "reduce: group columns out of range"
-    );
-}
-
-#[test]
-fn test_reduce_agg_spec_col_out_of_bounds_rejected() {
-    use gnitz_store::schema::ReduceOutKey;
-    use gnitz_wire::{AggFunc, OpNode};
-    let reduce = |col: u32| OpNode::Reduce {
-        group_cols: vec![0],
-        agg: vec![(AggFunc::Count, col)],
-        global_ground: false,
-        out_key: ReduceOutKey::PkPermutation,
-    };
-    assert_eq!(
-        mid_node_rejection(two_col_schema(), reduce(200)),
-        "reduce: aggregate column out of range"
-    );
-}
-
-/// Every aggregate that decodes its column value needs a scalar register
-/// image (`ScalarKind`) — the ≤8-byte int/float set. The SQL binder rejects
-/// the rest upstream, so this covers the low-level `CircuitBuilder` path
-/// that bypasses it.
-#[test]
-fn test_value_reading_aggregate_over_non_encodable_column_rejected() {
-    use gnitz_store::schema::ReduceOutKey;
-    use gnitz_wire::{AggFunc, OpNode};
-    // col 0 = U64 PK and the whole group key (⇒ PkPermutation); col 1 = the
-    // aggregate column, whose type is the only thing varying.
-    let schema = |agg_tc: u8| {
-        SchemaDescriptor::new(
-            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(agg_tc, 0)],
-            &[0],
-        )
-    };
-    let reduce = |func| OpNode::Reduce {
-        group_cols: vec![0],
-        agg: vec![(func, 1)],
-        global_ground: false,
-        out_key: ReduceOutKey::PkPermutation,
-    };
-    for func in [AggFunc::Sum, AggFunc::SumZero, AggFunc::Min, AggFunc::Max] {
-        assert!(
-            compiles_mid_node(schema(type_code::I64), reduce(func)),
-            "{func:?} over I64"
-        );
-        for tc in [type_code::U128, type_code::STRING] {
-            assert_eq!(
-                mid_node_rejection(schema(tc), reduce(func)),
-                "reduce: aggregate column type has no scalar register image",
-                "{func:?} over type code {tc}",
-            );
-        }
-    }
-    // COUNT never reads the value, so no type excludes it.
-    assert!(compiles_mid_node(schema(type_code::STRING), reduce(AggFunc::Count)));
-}
-
-#[test]
-fn test_projection_col_out_of_bounds_rejected() {
-    use gnitz_wire::{MapKind, OpNode};
-    let rejection = |cols: Vec<u32>| mid_node_rejection(two_col_schema(), OpNode::Map(MapKind::Projection(cols)));
-    assert_eq!(rejection(vec![200]), "projection map: columns out of range");
-    // A PK source: `project_schema` drops it while `copy_cols`
-    // numbers destinations densely, so the copy addresses a slot that does
-    // not exist — `from_map` would index past the fixed `[_; 65]`.
-    assert!(rejection(vec![0]).starts_with("map: program/schema mismatch"));
-    // `oob_cols` bounds each index but not the list length, and duplicates
-    // are legal, so a long list overruns `project_schema`'s array.
-    // Exactly MAX_COLUMNS payload sources already overflow — the schema also
-    // carries the input's PK column, which a length-only bound misses.
-    assert_eq!(
-        rejection(vec![1; gnitz_store::schema::MAX_COLUMNS]),
-        "projection map: output exceeds MAX_COLUMNS"
-    );
-}
-
-#[test]
-fn test_null_extend_overflow_rejected() {
-    use gnitz_wire::OpNode;
-    const GUARD: &str = "null-extend: merged schema exceeds MAX_COLUMNS";
-    let extend = |n: usize| OpNode::NullExtend {
-        type_codes: vec![type_code::I64; n],
-    };
-    // A short type_codes list null-extends cleanly.
-    assert!(compiles_mid_node(two_col_schema(), extend(1)));
-    // MAX_COLUMNS type_codes overflow the fixed `[_; 65]` schema array.
-    assert_eq!(
-        mid_node_rejection(two_col_schema(), extend(gnitz_store::schema::MAX_COLUMNS)),
-        GUARD
-    );
-    // (An undecodable type code is rejected at the wire decode boundary,
-    // where the two sibling type-code lists are also validated.)
-    // A near-max-width input plus a short extension overflows the *merged*
-    // output width, which a bound on the list length alone cannot catch:
-    // 64 + 2 > 65.
-    let wide = {
-        let mut cols = [SchemaColumn::new(type_code::I64, 0); 64];
-        cols[0] = SchemaColumn::new(type_code::U64, 0);
-        SchemaDescriptor::new(&cols, &[0])
-    };
-    assert_eq!(mid_node_rejection(wide, extend(2)), GUARD);
-}
-
-/// A view site over a throwaway directory: nothing under it was ever
-/// checkpointed, so the children it opens resume nothing.
-/// The node list of a subgraph ending at `out` — the same carve
-/// `compile_view` performs for an exchange side, so a fixture cannot hand
-/// `build_plan` a list production would never produce (one holding the sink).
-fn subgraph_ordered(loaded: &LoadedCircuit, out: i32) -> Vec<i32> {
-    let set = ancestors_inclusive(loaded, out);
-    loaded.ordered.iter().copied().filter(|n| set.contains(n)).collect()
-}
-
-fn test_site(dir: &str, id: u64) -> ViewSite<'_> {
-    ViewSite {
-        dir,
-        id,
-        recovery: RecoverySource::Rederive { resume_at: None },
+fn the_two_clamp_operators_carry_their_own_presets() {
+    let fixture = MidCircuit::new(make_schema_u64_i64());
+    for (op, want) in [
+        (gnitz_wire::OpNode::Distinct, (-1i64, 1i64)),
+        (gnitz_wire::OpNode::PositivePart, (0, i64::MAX)),
+    ] {
+        let plan = fixture.build(op.clone()).expect("both clamps compile");
+        let got = plan.vm.program.instructions.iter().find_map(|i| match i {
+            Instr::WeightClamp { lo, hi, .. } => Some((*lo, *hi)),
+            _ => None,
+        });
+        assert_eq!(got, Some(want), "{op:?}");
     }
 }
 
@@ -932,23 +755,21 @@ fn consume_flags(plan: &PlanBuildResult) -> Vec<(&'static str, bool)> {
 /// a destructive `Distinct` and a non-destructive `Negate` co-reader (standing
 /// in for integrate_trace). Kahn's ascending tie-break schedules the lower id
 /// first, so the ids decide which consumer runs first. (The reader is a
-/// `Negate`, not a `Filter(None)`: a predicate-less Filter is elided by
-/// register aliasing and would no longer read the register at runtime.)
-fn make_dtor_fanout(distinct_id: i32, reader_id: i32) -> LoadedCircuit {
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(10));
-    nodes.insert(distinct_id, gnitz_wire::OpNode::Distinct);
-    nodes.insert(reader_id, gnitz_wire::OpNode::Negate);
-    let edges = vec![(0, distinct_id, PORT_IN), (0, reader_id, PORT_IN)];
-    loaded_for_test(nodes, edges)
-}
-
+/// `Negate`, not a `Filter(None)`: a predicate-less Filter is elided by register
+/// aliasing and would no longer read the register at runtime.)
 #[test]
 fn a_destructive_op_takes_its_input_only_when_it_is_the_last_reader() {
     let dir = tempfile::tempdir().unwrap();
-    let ext: ExtTables = HashMap::from([(10, two_col_schema())]);
+    let ext: ExtTables = HashMap::from([(10i64, make_schema_u64_i64())]);
     let flags = |distinct_id: i32, reader_id: i32| {
-        let loaded = make_dtor_fanout(distinct_id, reader_id);
+        let loaded = loaded_for_test(
+            HashMap::from([
+                (0, scan_delta(10)),
+                (distinct_id, gnitz_wire::OpNode::Distinct),
+                (reader_id, gnitz_wire::OpNode::Negate),
+            ]),
+            vec![(0, distinct_id, PORT_IN), (0, reader_id, PORT_IN)],
+        );
         let plan = build_plan(
             &loaded,
             &loaded.ordered,
@@ -973,193 +794,92 @@ fn a_destructive_op_takes_its_input_only_when_it_is_the_last_reader() {
 }
 
 /// The set-operation shape: two sources meet at one `Union`, neither operand has
-/// a later reader, so both sides are taken. `consume_b` carries as much as
-/// `consume_a`: one operand is empty every epoch and the other is returned whole.
+/// a later reader, so both sides are taken. And the epoch-end output extraction
+/// reads the sink register without being an instruction — so a `Union` whose
+/// operand *is* the sink must not take it, or it would emit nothing, silently,
+/// every epoch.
 #[test]
-fn a_union_of_two_unread_operands_takes_both_sides() {
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(10));
-    nodes.insert(1, scan_delta(11));
-    nodes.insert(2, gnitz_wire::OpNode::Union);
-    let loaded = loaded_for_test(nodes, vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B)]);
-    let plan = build_plan(
-        &loaded,
-        &loaded.ordered,
-        &HashMap::from([(10, two_col_schema()), (11, two_col_schema())]),
-        test_site("", 1),
-        gnitz_store::schema::Placement::KEYED_DEFAULT,
-        PlanTarget::Subgraph { out: 2 },
-    )
-    .expect("a two-source union compiles");
-    assert_eq!(consume_flags(&plan), vec![("union.a", true), ("union.b", true)]);
-}
+fn a_union_takes_each_unread_operand_but_never_the_sink_register() {
+    let two_col = make_schema_u64_i64();
+    let flags = |nodes: HashMap<i32, gnitz_wire::OpNode>, edges: Vec<(i32, i32, i32)>, out: i32| {
+        let loaded = loaded_for_test(nodes, edges);
+        let plan = build_plan(
+            &loaded,
+            &loaded.ordered,
+            &HashMap::from([(10i64, two_col), (11, two_col)]),
+            test_site("", 1),
+            gnitz_store::schema::Placement::KEYED_DEFAULT,
+            PlanTarget::Subgraph { out },
+        )
+        .expect("a union plan compiles");
+        consume_flags(&plan)
+    };
 
-/// The epoch-end output extraction reads the sink register, and it is not an
-/// instruction — so a `Union` whose operand *is* the sink would otherwise take
-/// it empty and emit nothing, silently, every epoch.
-#[test]
-fn a_union_over_the_sink_register_does_not_take_it() {
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(10));
-    nodes.insert(1, gnitz_wire::OpNode::Negate);
-    nodes.insert(2, gnitz_wire::OpNode::Union);
-    let loaded = loaded_for_test(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN_A), (0, 2, PORT_IN_B)]);
-    let plan = build_plan(
-        &loaded,
-        &loaded.ordered,
-        &HashMap::from([(10, two_col_schema())]),
-        test_site("", 1),
-        gnitz_store::schema::Placement::KEYED_DEFAULT,
-        PlanTarget::Subgraph { out: 1 },
-    )
-    .expect("a union over the plan's own output register compiles");
     assert_eq!(
-        consume_flags(&plan),
+        flags(
+            HashMap::from([(0, scan_delta(10)), (1, scan_delta(11)), (2, gnitz_wire::OpNode::Union),]),
+            vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B)],
+            2,
+        ),
+        vec![("union.a", true), ("union.b", true)],
+        "neither operand has a later reader, so both are taken"
+    );
+
+    assert_eq!(
+        flags(
+            HashMap::from([
+                (0, scan_delta(10)),
+                (1, gnitz_wire::OpNode::Negate),
+                (2, gnitz_wire::OpNode::Union),
+            ]),
+            vec![(0, 1, PORT_IN), (1, 2, PORT_IN_A), (0, 2, PORT_IN_B)],
+            1,
+        ),
         vec![("negate", false), ("union.a", false), ("union.b", true)],
         "operand A is the sink and must not be taken; the Negate's own input is \
          still read by operand B, which has no later reader of its own",
     );
 }
 
-/// A trace port fed by a node that is not an integral is rejected at compile
-/// time: `resolve_inputs` checks a `Join`'s port arity, not its producer's
-/// kind, and such a register would reach the dispatch with no cursor. The ONLY
-/// difference between the two builds is which node feeds `PORT_TRACE`.
+/// `ScanDelta → Reduce → {Distinct, Negate}`: the Distinct schedules before its
+/// co-reader, the destructive-first shape the liveness guard rejects. But a
+/// Reduce's output is already distinct, so the elision pass drops the Distinct —
+/// it aliases the Reduce's register and emits no destructive op at all.
 #[test]
-fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let ext: ExtTables = HashMap::from([(10, two_col_schema()), (11, two_col_schema())]);
-    // Node 2 is the integral of scan 11; node 1 is that scan's own register,
-    // which carries a delta and no table.
-    let plan = |trace_src: i32| {
-        let mut nodes = HashMap::new();
-        nodes.insert(0, scan_delta(10));
-        nodes.insert(1, scan_delta(11));
-        nodes.insert(2, gnitz_wire::OpNode::IntegrateTrace);
-        nodes.insert(3, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace));
-        let loaded = loaded_for_test(
-            nodes,
-            vec![(1, 2, PORT_IN), (0, 3, PORT_IN_A), (trace_src, 3, PORT_TRACE)],
-        );
-        build_plan(
-            &loaded,
-            &loaded.ordered,
-            &ext,
-            test_site(dir.path().to_str().unwrap(), 1),
-            gnitz_store::schema::Placement::KEYED_DEFAULT,
-            PlanTarget::Subgraph { out: 3 },
-        )
-    };
-    assert!(plan(2).is_ok(), "an integral is a valid trace port");
-    assert!(
-        matches!(
-            plan(1),
-            Err(CompileError::Rejected("join: trace port is not an integral"))
-        ),
-        "a delta register on the trace port is a mis-built circuit, not a plan",
-    );
-}
-
-#[test]
-fn test_destructive_fanout_skipped_distinct_not_rejected() {
+fn an_elided_distinct_does_not_trip_the_destructive_fanout_guard() {
     use gnitz_store::schema::ReduceOutKey;
-    // `ScanDelta → Reduce → {Distinct, Negate}`: the Distinct schedules before
-    // its co-reader, the destructive-first shape the guard rejects. But a
-    // Reduce's output is already distinct, so the elision pass drops the
-    // Distinct — it aliases the Reduce's register and emits no destructive op,
-    // and the guard must not reject it.
     let dir = tempfile::tempdir().unwrap();
-    let view_dir = dir.path().to_str().unwrap();
-
-    let mut nodes = HashMap::new();
-    nodes.insert(0, scan_delta(10));
-    nodes.insert(
-        1,
-        gnitz_wire::OpNode::Reduce {
-            group_cols: vec![],
-            agg: vec![(gnitz_wire::AggFunc::Count, 0)],
-            global_ground: false,
-            out_key: ReduceOutKey::SyntheticFold,
-        },
+    let loaded = loaded_for_test(
+        HashMap::from([
+            (0, scan_delta(10)),
+            (
+                1,
+                gnitz_wire::OpNode::Reduce {
+                    group_cols: vec![],
+                    agg: vec![(gnitz_wire::AggFunc::Count, 0)],
+                    global_ground: false,
+                    out_key: ReduceOutKey::SyntheticFold,
+                },
+            ),
+            (2, gnitz_wire::OpNode::Distinct),
+            (3, gnitz_wire::OpNode::Negate),
+        ]),
+        vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (1, 3, PORT_IN)],
     );
-    nodes.insert(2, gnitz_wire::OpNode::Distinct);
-    nodes.insert(3, gnitz_wire::OpNode::Negate);
-    let loaded = loaded_for_test(nodes, vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (1, 3, PORT_IN)]);
     assert!(
-        compute_skip_nodes(&loaded).contains(&2),
+        loaded.skip_nodes.contains(&2),
         "test precondition: the elision pass must drop the Reduce-fed Distinct"
     );
 
-    let ext: ExtTables = HashMap::from([(10, two_col_schema())]);
     // The plan owns scratch dirs under `dir`, so it must drop first: build it
     // inside the assert rather than binding it past `dir`'s scope.
-    assert!(
-        build_plan(
-            &loaded,
-            &loaded.ordered,
-            &ext,
-            test_site(view_dir, 1),
-            gnitz_store::schema::Placement::KEYED_DEFAULT,
-            PlanTarget::Subgraph { out: 2 }
-        )
-        .is_ok(),
-        "a skipped (optimized-out) Distinct does not run destructively; \
-         the guard must not reject it"
-    );
-}
-
-/// Every operator that creates a scratch child must fail the compile when the
-/// creation fails, never emit a plan without it: a dropped `Integrate` would
-/// compile a view that never persists its differential state, leaving its
-/// output permanently empty.
-#[test]
-fn test_build_plan_child_table_failure_rejected() {
-    let one_col = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0)], &[0]);
-    let fixture = MidCircuit::new(one_col).with_dir("/nonexistent_gnitz_test_path_xyz_abc");
-    for mid in [gnitz_wire::OpNode::Distinct, gnitz_wire::OpNode::IntegrateTrace] {
-        assert!(
-            matches!(fixture.build(mid.clone()), Err(CompileError::StorageFailed(..))),
-            "{mid:?} must fail the compile when its child table cannot be created",
-        );
-    }
-}
-
-/// The two derived map out-schemas are by construction ones `MapPlan`
-/// accepts. `HashRow` is the only site that emits a *promoting* `CopyCol`,
-/// so it is what makes `check_copy_types`' widening clause do work; the
-/// reindex case pins that `payload_copy_srcs` and
-/// `ReindexPacker::output_schema` cannot drift apart into a mixed-type copy.
-#[test]
-fn test_derived_map_schemas_satisfy_copy_types() {
-    use gnitz_expr::LogicalProgram;
-    use gnitz_store::expr::{MapPlan, PkSource};
-    let in_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::STRING, 1),
-            SchemaColumn::new(type_code::F32, 1),
-            SchemaColumn::new(type_code::U128, 1),
-            SchemaColumn::new(type_code::U32, 1),
-        ],
-        &[0],
-    );
-    // Every source column copied into a dense destination slot, the shape
-    // `create_universal_projection` builds.
-    let cols: Vec<u32> = vec![0, 1, 2, 3, 4];
-    let prog = || LogicalProgram::copy_cols(&cols);
-    let payload_cols = prog().payload_copy_srcs().unwrap().to_vec();
-    let reindexed = gnitz_store::schema::key::ReindexPacker::new(&in_schema, &[4], &[type_code::U64])
-        .unwrap()
-        .output_schema(&in_schema, &payload_cols)
-        .unwrap();
-    assert!(MapPlan::from_map(prog(), &in_schema, &reindexed, PkSource::Inherit).is_ok());
-
-    // A cross-width set-op coercion: the U32 column promoted to I64, every
-    // other column carried verbatim (target 0). The promotion is one
-    // `payload_promotion_invalid` admits, so a real HashRow can build it.
-    let tcs = vec![0, 0, 0, 0, type_code::I64];
-    let wire_cols: Vec<u32> = cols.to_vec();
-    assert!(!optimize::payload_promotion_invalid(&wire_cols, &tcs, &in_schema));
-    let hashed = hashrow_output_schema(&in_schema, &cols, &tcs).unwrap();
-    assert!(MapPlan::from_map(prog(), &in_schema, &hashed, PkSource::Inherit).is_ok());
+    assert!(build_plan(
+        &loaded,
+        &loaded.ordered,
+        &HashMap::from([(10i64, make_schema_u64_i64())]),
+        test_site(dir.path().to_str().unwrap(), 1),
+        gnitz_store::schema::Placement::KEYED_DEFAULT,
+        PlanTarget::Subgraph { out: 2 }
+    )
+    .is_ok());
 }

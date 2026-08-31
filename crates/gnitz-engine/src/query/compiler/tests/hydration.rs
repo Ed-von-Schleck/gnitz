@@ -13,33 +13,25 @@ use gnitz_wire::{JoinKind, MapKind, OpNode};
 ///                         └─────────────┴────────┴→ 7 J_ba (delta=3, trace=4)
 ///   6 → 8 map → 10 union ← 9 map ← 7;  10 → 11 filter → 12 map → 13 sink
 /// ```
-fn equi_join_circuit() -> LoadedCircuit {
-    let (nodes, edges) = equi_join_parts();
-    loaded_for_test(nodes, edges)
-}
-
-/// The same circuit's raw parts, for the tests that break one wire before
-/// building it.
-#[allow(clippy::type_complexity)]
-fn equi_join_parts() -> (HashMap<i32, OpNode>, Vec<(i32, i32, i32)>) {
-    let m = |cols: Vec<u32>| OpNode::Map(MapKind::Projection(cols));
-    let nodes = HashMap::from([
+fn equi_join(mutate: impl FnOnce(&mut HashMap<i32, OpNode>, &mut Vec<(i32, i32, i32)>)) -> LoadedCircuit {
+    let m = || OpNode::Map(MapKind::Projection(vec![0]));
+    let mut nodes = HashMap::from([
         (0, scan_delta(100)),
         (1, scan_delta(200)),
-        (2, m(vec![0])),
-        (3, m(vec![0])),
+        (2, m()),
+        (3, m()),
         (4, OpNode::IntegrateTrace),
         (5, OpNode::IntegrateTrace),
         (6, OpNode::Join(JoinKind::DeltaTrace)),
         (7, OpNode::Join(JoinKind::DeltaTrace)),
-        (8, m(vec![0])),
-        (9, m(vec![0])),
+        (8, m()),
+        (9, m()),
         (10, OpNode::Union),
         (11, OpNode::Filter(None)),
-        (12, m(vec![0])),
+        (12, m()),
         (13, OpNode::IntegrateSink),
     ]);
-    let edges = vec![
+    let mut edges = vec![
         (0, 2, PORT_IN),
         (1, 3, PORT_IN),
         (2, 4, PORT_IN),
@@ -56,7 +48,8 @@ fn equi_join_parts() -> (HashMap<i32, OpNode>, Vec<(i32, i32, i32)>) {
         (11, 12, PORT_IN),
         (12, 13, PORT_IN),
     ];
-    (nodes, edges)
+    mutate(&mut nodes, &mut edges);
+    loaded_for_test(nodes, edges)
 }
 
 /// The seed is resolved by the *cross-wiring*, not by position: `J_a`'s trace
@@ -66,10 +59,12 @@ fn equi_join_parts() -> (HashMap<i32, OpNode>, Vec<(i32, i32, i32)>) {
 /// product.
 #[test]
 fn hydration_seeds_from_the_cross_wired_trace() {
-    let lc = equi_join_circuit();
     // `d_a` is the reindex feeding `J_ab`'s delta port (node 2); `t_a` is the
     // trace that integrates *it* (node 4), which hangs off `J_ba`.
-    assert_eq!(hydration_nodes(&lc).unwrap(), HydrationNodes::Join { d_a: 2, t_a: 4 },);
+    assert_eq!(
+        hydration_nodes(&equi_join(|_, _| {})).unwrap(),
+        HydrationNodes::Join { d_a: 2, t_a: 4 }
+    );
 }
 
 /// The linear shape resolves to its source relation, through any number of
@@ -91,21 +86,21 @@ fn hydration_of_a_linear_circuit_names_its_source() {
     );
 }
 
-/// Every structural mismatch is a `Rejected`, never a silent `None`: a
+/// Every structural mismatch is a named `Rejected`, never a silent `None`: a
 /// bounded view must not reach its store with no way to hydrate it. These are
 /// the trust boundary behind the planner's own eligibility gate — no SQL
-/// reaches them, which is exactly why they are asserted here.
+/// reaches them, which is exactly why they are asserted here. The two join
+/// branches carry distinct messages, so a rejection says which one it came from.
 #[test]
 fn a_malformed_circuit_is_rejected_rather_than_guessed_at() {
-    let rejected = |lc: LoadedCircuit, what: &str| match hydration_nodes(&lc) {
-        Err(CompileError::Rejected(_)) => {}
-        other => panic!("{what}: expected Rejected, got {:?}", other.map(|h| format!("{h:?}"))),
+    let rejected = |lc: LoadedCircuit, want: &str| match hydration_nodes(&lc) {
+        Err(CompileError::Rejected(guard)) => assert_eq!(guard, want),
+        other => panic!("expected {want:?}, got {:?}", other.map(|h| format!("{h:?}"))),
     };
 
-    // No sink at all.
     rejected(
         loaded_for_test(HashMap::from([(0, scan_delta(1))]), vec![]),
-        "sinkless circuit",
+        "bounded view: circuit has no IntegrateSink",
     );
     // A shape the walk cannot replay (a Reduce under the sink).
     rejected(
@@ -125,7 +120,7 @@ fn a_malformed_circuit_is_rejected_rather_than_guessed_at() {
             ]),
             vec![(0, 1, PORT_IN), (1, 2, PORT_IN)],
         ),
-        "reduce under the sink",
+        "bounded view: unsupported circuit shape",
     );
     // A union whose inputs are not delta/trace joins.
     rejected(
@@ -138,21 +133,27 @@ fn a_malformed_circuit_is_rejected_rather_than_guessed_at() {
             ]),
             vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B), (2, 3, PORT_IN)],
         ),
-        "union of two scans",
+        "bounded view: union input is not an inner delta/trace join",
     );
 
     // The cross-wiring broken: both joins trace against the SAME integral, so
     // no trace integrates `J_a`'s own delta port.
-    let (nodes, mut edges) = equi_join_parts();
-    edges.retain(|&(s, d, p)| !(s == 4 && d == 7 && p == PORT_TRACE));
-    edges.push((5, 7, PORT_TRACE));
     rejected(
-        loaded_for_test(nodes, edges),
-        "trace port is not the other branch's delta integral",
+        equi_join(|_, edges| {
+            edges.retain(|&(s, d, p)| !(s == 4 && d == 7 && p == PORT_TRACE));
+            edges.push((5, 7, PORT_TRACE));
+        }),
+        "bounded view: the join's trace port is not the other branch's delta integral",
     );
 
-    // A join whose trace port is not an integral at all.
-    let (mut nodes, edges) = equi_join_parts();
-    nodes.insert(4, OpNode::Filter(None));
-    rejected(loaded_for_test(nodes, edges), "trace port is not an integral");
+    // A non-integral on either join's trace port, each naming its own branch.
+    for (nid, want) in [
+        (5, "bounded view: the seeded join's trace port is not an integral"),
+        (4, "bounded view: the sibling join's trace port is not an integral"),
+    ] {
+        rejected(
+            equi_join(|nodes, _| drop(nodes.insert(nid, OpNode::Filter(None)))),
+            want,
+        );
+    }
 }

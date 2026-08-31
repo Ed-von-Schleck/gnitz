@@ -222,18 +222,18 @@ impl DagEngine {
         registry: &RelationRegistry,
         view_id: i64,
         root: &str,
-    ) -> Result<(), compiler::CompileError> {
+    ) -> Result<(), String> {
         // `hook_relation_register` ran earlier in this bundle's ingest loop, so a
         // registered `+1` VIEW_TAB row is always in the registry; a miss is an
         // engine bug, surfaced as a DDL rejection rather than an unchecked compile.
         let Ok(entry) = registry.table_entry(view_id) else {
-            return Err(compiler::CompileError::Rejected("pre-flight: view is not registered"));
+            return Err("pre-flight: view is not registered".to_string());
         };
         // `map(drop)` closes the plan — and the `Table`s it holds open under
         // `root` — before the directory is removed.
         let verdict = self.compile_circuit(registry, view_id, root, entry).map(drop);
         let _ = std::fs::remove_dir_all(root);
-        verdict
+        verdict.map_err(|e| e.to_string())
     }
 
     /// Compile a view by reading system tables and calling `compiler::compile_view`.
