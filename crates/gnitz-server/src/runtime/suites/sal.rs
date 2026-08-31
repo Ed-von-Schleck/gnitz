@@ -3,7 +3,7 @@ use crate::runtime::sal::{
     atomic_load_u64, effective_max, group_header_size, EpochGate, GroupData, GroupTargets, SalLog, SalMessage,
     SalMessageKind, SalStep, SalWriter, ZoneMark, CHECKPOINT_RESERVE, MIN_SAL_BYTES, SENTINEL_SIZE,
 };
-use crate::runtime::test_support::SharedRegion;
+use crate::runtime::test_support::{group_at, SharedRegion};
 use gnitz_engine_testkit::sweep_bit_flips;
 use gnitz_wire::align8;
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
@@ -43,14 +43,6 @@ impl TestLog {
             .write_raw_slots(target, lsn, kind, ZoneMark::Plain, payloads)
             .expect("group fits");
         base
-    }
-}
-
-/// The group published at `base` at the log's own walk epoch, or a panic.
-fn group_at(log: SalLog, base: u64) -> SalMessage {
-    match log.read_at(base, EpochGate::Walk(log.walk_epoch())) {
-        SalStep::Group(msg, _) => msg,
-        _ => panic!("a group is published at offset {base}"),
     }
 }
 

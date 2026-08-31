@@ -1,7 +1,7 @@
 use super::*;
 use crate::runtime::master::scatter::{with_commit_indices, with_group};
 use crate::runtime::sal::{group_header_size, GroupTargets};
-use crate::runtime::test_support::SharedRegion;
+use crate::runtime::test_support::{group_at, SharedRegion};
 use crate::runtime::wire::WireMsg;
 use gnitz_engine_testkit::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 
@@ -504,15 +504,6 @@ fn families(targets: &[u32]) -> HashMap<i64, u64> {
 
 fn log_of(region: &SharedRegion) -> SalLog {
     unsafe { SalLog::new(region.ptr() as *const u8, SIZE) }
-}
-
-/// The group published at `base`, whatever its epoch — the fixtures below
-/// reach into one group's slots directly.
-fn group_at(log: SalLog, base: u64) -> SalMessage {
-    match log.read_at(base, EpochGate::Walk(log.walk_epoch())) {
-        SalStep::Group(msg, _) => msg,
-        _ => panic!("a group is published at offset {base}"),
-    }
 }
 
 /// Corrupt one byte of slot `w` of the group at `base`, past the control

@@ -112,7 +112,7 @@ pub struct CatalogEngine {
     /// [`CatalogEngine::close`]. Closing it releases the lock, so it is held
     /// until then: a second writer would reseed `current_lsn` from
     /// `max_lsn + 1` and mint shard names the first writer is already using.
-    dir_lock: Option<fs::File>,
+    _dir_lock: fs::File,
 
     /// Every derived lookup the catalog maintains from system-table deltas.
     pub(crate) caches: CatalogCacheSet,

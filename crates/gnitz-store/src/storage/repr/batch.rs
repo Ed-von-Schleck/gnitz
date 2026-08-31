@@ -2228,6 +2228,16 @@ impl BatchBuilder {
     /// for PK columns.
     pub fn put_int(&mut self, val: u128) {
         let col_size = self.schema().columns[self.physical_col_idx()].size() as usize;
+        debug_assert!(
+            col_size == 16 || {
+                // The bytes about to be dropped must carry no information: all
+                // zero for an unsigned value, all one for a sign-extended
+                // negative. Anything else is a value too wide for its column.
+                let dropped = val >> (col_size * 8);
+                dropped == 0 || dropped == u128::MAX >> (col_size * 8)
+            },
+            "put_int: {val:#x} does not fit the column's {col_size} bytes",
+        );
         self.batch.extend_col(self.curr_col, &val.to_le_bytes()[..col_size]);
         self.curr_col += 1;
     }

@@ -5,6 +5,16 @@
 //! uses them: a ring is a `runtime` shape, and a helper that crosses no crate
 //! boundary should not sit on one's published surface.
 
+use crate::runtime::sal::{EpochGate, SalLog, SalMessage, SalStep};
+
+/// The group published at `base`, walked at the log's current epoch.
+pub(crate) fn group_at(log: SalLog, base: u64) -> SalMessage {
+    match log.read_at(base, EpochGate::Walk(log.walk_epoch())) {
+        SalStep::Group(msg, _) => msg,
+        _ => panic!("a group is published at offset {base}"),
+    }
+}
+
 /// Anonymous `MAP_SHARED` region for IPC-shaped tests; unmapped on drop.
 /// `MAP_SHARED` so a `fork()`ed child sees the same pages (a child that
 /// `_exit`s never runs drops, so only the parent unmaps). Pages are

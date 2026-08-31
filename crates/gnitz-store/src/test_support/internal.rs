@@ -15,30 +15,25 @@ use crate::schema::{SchemaColumn, SchemaDescriptor};
 use crate::storage::{Batch, Layout, ReadCursor};
 use gnitz_wire::type_code;
 
-use super::shared::{arb_type_code, payload_slot_width, pk_i64_schema, u64_pk_schema};
+use super::shared::{arb_type_code, payload_slot_width, pk_payload_schema, u64_pk_schema};
 
 /// The canonical wide-PK test schema: a 3×U64 compound primary key
 /// (`pk_stride = 24`, wide) with a single I64 payload column.
 pub fn wide_pk_3xu64_schema() -> SchemaDescriptor {
+    pk_payload_schema(&[type_code::U64; 3])
+}
+
+/// U64 pk + two I64 payload columns — the flush/merge fixtures' shape, where a
+/// second payload column is what makes a partially-written row detectable.
+pub fn pk_u64_two_i64_schema() -> SchemaDescriptor {
     SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
             SchemaColumn::new(type_code::I64, 0),
         ],
-        &[0, 1, 2],
+        &[0],
     )
-}
-
-/// A schema with one PK column per type code in `tcs`, plus a single trailing
-/// I64 payload column — the generic PK-shape builder for the merge/sort/OPK
-/// tests, parameterized by the whole key rather than by one named shape.
-pub fn pk_payload_schema(tcs: &[u8]) -> SchemaDescriptor {
-    let mut cols: Vec<SchemaColumn> = tcs.iter().map(|&t| SchemaColumn::new(t, 0)).collect();
-    cols.push(SchemaColumn::new(type_code::I64, 0));
-    let pk: Vec<u32> = (0..tcs.len() as u32).collect();
-    SchemaDescriptor::new(&cols, &pk)
 }
 
 /// Build a consolidated wide-PK batch from native `(c0, c1, c2, weight, payload)`
@@ -147,7 +142,7 @@ pub fn read_german_string(batch: &Batch, col: usize, row: usize) -> Vec<u8> {
 /// I64 pk + I64 payload schema — the signed-PK exercise of the order-preserving
 /// key (negatives sort before positives only because the encoder sign-flips).
 pub fn make_schema_i64pk_i64() -> SchemaDescriptor {
-    pk_i64_schema(type_code::I64)
+    pk_payload_schema(&[type_code::I64])
 }
 
 /// Build a sorted, consolidated batch with an I64 PK and a single I64 payload
@@ -169,12 +164,12 @@ pub fn make_batch_i64pk(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> 
 
 /// U64 pk + a single STRING payload column.
 pub fn make_schema_pk_u64_payload_string() -> SchemaDescriptor {
-    u64_pk_schema(type_code::STRING)
+    u64_pk_schema(SchemaColumn::new(type_code::STRING, 0))
 }
 
 /// U64 pk + a single BLOB payload column.
 pub fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
-    u64_pk_schema(type_code::BLOB)
+    u64_pk_schema(SchemaColumn::new(type_code::BLOB, 0))
 }
 
 /// Build a sorted, consolidated batch for a `(U64 pk, STRING|BLOB payload)` schema

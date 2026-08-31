@@ -1,6 +1,6 @@
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::test_support::{pk_payload_schema, wide_pk_3xu64_schema};
+use crate::test_support::{pk_payload_schema, u64_pk_schema, wide_pk_3xu64_schema};
 
 // With a non-leading compound PK the payload slots are renumbered around every
 // PK position, so `payload_idx = ci - 1` does not hold. For pk_indices=[1, 2]
@@ -33,7 +33,7 @@ fn write_to_batch_narrow_pk_odd_rowcount_round_trips() {
     // U8/U16/U32 = strides 1/2/4 (the buggy non-8-aligned cases at 3 rows);
     // U64 = stride 8 (always aligned) as a control.
     for tc in [type_code::U8, type_code::U16, type_code::U32, type_code::U64] {
-        let schema = crate::test_support::pk_i64_schema(tc);
+        let schema = crate::test_support::pk_payload_schema(&[tc]);
         let stride = schema.pk_stride() as usize;
 
         let mut src = Batch::empty_with_schema(&schema);
@@ -73,16 +73,6 @@ fn write_to_batch_narrow_pk_odd_rowcount_round_trips() {
 
 // U64 PK + a *nullable* I64 payload, so a row can carry a set null bit over
 // non-zero bytes — the null-canonicalization case the trust strip protects.
-fn pk_u64_nullable_i64_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-        ],
-        &[0],
-    )
-}
-
 fn append_test_row(b: &mut Batch, pk: u128, w: i64, val: i64, null_word: u64) {
     b.extend_pk(pk);
     b.extend_weight(&w.to_le_bytes());
@@ -114,7 +104,7 @@ fn build_corrupt_batch(schema: &SchemaDescriptor) -> Batch {
 /// corrupt data is rejected by the debug consumer-side verifier.
 #[test]
 fn into_consolidated_strip_forces_real_consolidation() {
-    let schema = pk_u64_nullable_i64_schema();
+    let schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
     // `build_corrupt_batch` yields a `Raw` batch (the constructor default), so
     // `into_consolidated` runs a real sort+fold — the strip's mechanism.
     let clean = build_corrupt_batch(&schema);
@@ -362,7 +352,7 @@ fn honest_sorted_consolidated_batch_passes_verifiers() {
 // resets to `Raw`.
 #[test]
 fn layout_lifecycle_default_raise_and_lower() {
-    let schema = crate::test_support::pk_i64_schema(type_code::U64);
+    let schema = crate::test_support::pk_payload_schema(&[type_code::U64]);
     let mut b = Batch::with_capacity(schema, 4);
     assert_eq!(b.layout(), Layout::Raw, "constructor defaults Raw");
     append_test_row(&mut b, 1, 1, 10, 0);
@@ -389,7 +379,7 @@ fn layout_lifecycle_default_raise_and_lower() {
 // `Raw` needs no per-reader audit.
 #[test]
 fn empty_batch_reads_sorted_and_consolidated() {
-    let schema = crate::test_support::pk_i64_schema(type_code::U64);
+    let schema = crate::test_support::pk_payload_schema(&[type_code::U64]);
     let b = Batch::with_capacity(schema, 4);
     assert_eq!(b.count, 0);
     assert_eq!(b.layout(), Layout::Raw);

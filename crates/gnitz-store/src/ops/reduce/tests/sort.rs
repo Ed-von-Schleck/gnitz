@@ -1,43 +1,8 @@
 use super::super::super::group_key::GroupKeyCols;
 use super::{argsort_by_key, argsort_delta, argsort_pk_canonical};
 use crate::schema::key::compare_pk_bytes;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::storage::Batch;
-
-/// One batch row per supplied OPK byte vector (each must be `pk_stride` bytes),
-/// weight 1, null word 0, one zeroed I64 payload column — all the PK-sort paths
-/// need (they read only `pk_stride` + `get_pk_bytes`). Shared by the tests and
-/// the bench.
-fn build_pk_batch(schema: &SchemaDescriptor, pk_rows: &[Vec<u8>]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, pk_rows.len().max(1));
-    for pk in pk_rows {
-        b.extend_pk_bytes(pk);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &0i64.to_le_bytes());
-        b.count += 1;
-    }
-    b
-}
-
-fn schema_single_pk(pk_tc: u8) -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[SchemaColumn::new(pk_tc, 0), SchemaColumn::new(type_code::I64, 0)],
-        &[0],
-    )
-}
-
-fn schema_3xu64_pk() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0, 1, 2],
-    )
-}
+use crate::schema::{type_code, SchemaDescriptor};
+use crate::test_support::{batch_of_pk_bytes, pk_payload_schema, wide_pk_3xu64_schema};
 
 /// `argsort_pk_canonical` must reproduce the authoritative `compare_pk_bytes`
 /// order. PKs are distinct, so the (unstable) sort yields a unique order and the
@@ -47,7 +12,7 @@ fn assert_canonical_order(schema: &SchemaDescriptor, pk_rows: &[Vec<u8>]) {
     want.sort_by(|&a, &b| compare_pk_bytes(&pk_rows[a as usize], &pk_rows[b as usize]));
     let want_keys: Vec<&[u8]> = want.iter().map(|&i| pk_rows[i as usize].as_slice()).collect();
 
-    let batch = build_pk_batch(schema, pk_rows);
+    let batch = batch_of_pk_bytes(schema, pk_rows);
     let mb = batch.as_mem_batch();
     let got = argsort_pk_canonical(&mb);
     let got_keys: Vec<&[u8]> = got.iter().map(|&i| mb.get_pk_bytes(i as usize)).collect();
@@ -59,7 +24,7 @@ fn argsort_u64_arm_full_and_subwidth() {
     // stride 8 (u64 arm): high-bit / signed-OPK byte shapes must order by raw
     // unsigned byte compare (the OPK sign-flip lives in the bytes).
     assert_canonical_order(
-        &schema_single_pk(type_code::U64),
+        &pk_payload_schema(&[type_code::U64]),
         &[
             vec![0x80, 0, 0, 0, 0, 0, 0, 1],
             vec![0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfd],
@@ -70,7 +35,7 @@ fn argsort_u64_arm_full_and_subwidth() {
     );
     // stride 4 (u64 arm, sub-width): left-align into the high bytes preserves order.
     assert_canonical_order(
-        &schema_single_pk(type_code::U32),
+        &pk_payload_schema(&[type_code::U32]),
         &[
             vec![0xff, 0, 0, 1],
             vec![0, 0, 0, 9],
@@ -89,7 +54,7 @@ fn argsort_u128_arm() {
         v
     };
     assert_canonical_order(
-        &schema_single_pk(type_code::U128),
+        &pk_payload_schema(&[type_code::U128]),
         &[mk(0xff, 2), mk(0, 9), mk(0x80, 1), mk(0, 1), mk(0xff, 1)],
     );
 }
@@ -114,7 +79,7 @@ fn argsort_u128x2_arm_with_leading16_collision() {
         v
     };
     assert_canonical_order(
-        &schema_3xu64_pk(),
+        &wide_pk_3xu64_schema(),
         &[
             mk_tail(7),
             mk(0, 0, 0),
@@ -146,9 +111,9 @@ fn reduce_sort_argsort_bench() {
     let n = 1_000_000usize;
     for &stride in &[8usize, 16, 24] {
         let schema = match stride {
-            8 => schema_single_pk(type_code::U64),
-            16 => schema_single_pk(type_code::U128),
-            _ => schema_3xu64_pk(),
+            8 => pk_payload_schema(&[type_code::U64]),
+            16 => pk_payload_schema(&[type_code::U128]),
+            _ => wide_pk_3xu64_schema(),
         };
         let rows: Vec<Vec<u8>> = (0..n)
             .map(|i| {
@@ -166,7 +131,7 @@ fn reduce_sort_argsort_bench() {
                 v
             })
             .collect();
-        let batch = build_pk_batch(&schema, &rows);
+        let batch = batch_of_pk_bytes(&schema, &rows);
         let mb = batch.as_mem_batch();
 
         let t = std::time::Instant::now();
@@ -187,9 +152,9 @@ fn reduce_sort_argsort_bench() {
 fn reduce_sort_argsort_delta_bench() {
     let n = 1_000_000usize;
     // (label, schema, group cols) — the three arms.
-    let narrow = schema_single_pk(type_code::U64);
-    let wide = schema_single_pk(type_code::U128);
-    let multi = schema_3xu64_pk();
+    let narrow = pk_payload_schema(&[type_code::U64]);
+    let wide = pk_payload_schema(&[type_code::U128]);
+    let multi = wide_pk_3xu64_schema();
     for (label, schema, group_cols) in [
         ("canonical u64", &narrow, &[0u32][..]),
         ("canonical u128", &wide, &[0u32][..]),
@@ -210,7 +175,7 @@ fn reduce_sort_argsort_delta_bench() {
                 v
             })
             .collect();
-        let batch = build_pk_batch(schema, &rows);
+        let batch = batch_of_pk_bytes(schema, &rows);
         let mb = batch.as_mem_batch();
         let keyer = GroupKeyCols::new(schema, group_cols);
 

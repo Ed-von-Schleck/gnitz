@@ -82,9 +82,11 @@ pub struct Mirror {
     pub(crate) base_dir: String,
     /// `<base_dir>/_copies`, held rather than rebuilt per registration.
     pub(crate) copies_root: String,
-    /// The `flock`ed handle on `base_dir`'s lock file. Dropped last, after every
-    /// store, which is what makes the next open of this directory succeed.
-    dir_lock: Option<std::fs::File>,
+    /// The `flock`ed handle on `base_dir`'s lock file, held only to be dropped:
+    /// declared after `registry`, so field drop order releases it once every
+    /// store is gone, which is what makes the next open of this directory
+    /// succeed.
+    _dir_lock: std::fs::File,
     pub(crate) poison: Option<String>,
     applied_bytes: usize,
     checkpoint_bytes: usize,
@@ -148,7 +150,7 @@ impl Mirror {
             cursors: HashMap::new(),
             base_dir: base_dir.to_string(),
             copies_root: format!("{base_dir}/{COPIES_DIRNAME}"),
-            dir_lock: Some(dir_lock),
+            _dir_lock: dir_lock,
             poison: None,
             applied_bytes: 0,
             checkpoint_bytes: env_num("GNITZ_MIRROR_CHECKPOINT_BYTES", DEFAULT_CHECKPOINT_BYTES),
@@ -462,8 +464,8 @@ impl MirrorStore for Mirror {
 }
 
 impl Drop for Mirror {
-    /// Check point on the way out — unless the store is poisoned — then drop the
-    /// stores, then the lock, in that order.
+    /// Check point on the way out, unless the store is poisoned. The stores and
+    /// then the lock drop after this returns, in field-declaration order.
     ///
     /// A host that just drops it would otherwise lose every round since the last
     /// checkpoint. It has to be the checkpoint and not a per-store `flush()`:
@@ -484,8 +486,5 @@ impl Drop for Mirror {
             }
             self.registry.close();
         }));
-        // Last: dropping the file releases the directory lock, so the next open
-        // of this directory succeeds.
-        self.dir_lock = None;
     }
 }

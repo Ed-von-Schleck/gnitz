@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_engine_testkit::batch_of_pk_bytes;
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_wire::type_code;
 use gnitz_wire::worker_for_pk_bytes;
@@ -19,21 +20,9 @@ fn i64_payload_col() -> SchemaColumn {
     SchemaColumn::new(type_code::I64, 0)
 }
 
-fn make_batch_with_raw_pks(schema: &SchemaDescriptor, raw_pks: &[[u8; 16]]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, raw_pks.len().max(1));
-    for pk in raw_pks {
-        b.extend_pk_bytes(pk);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &0i64.to_le_bytes());
-        b.count += 1;
-    }
-    b
-}
-
 /// Every row's master-assigned worker equals its worker-side route.
 fn assert_routing_symmetry(schema: &SchemaDescriptor, raw_pks: &[[u8; 16]], label: &str) {
-    let batch = make_batch_with_raw_pks(schema, raw_pks);
+    let batch = batch_of_pk_bytes(schema, raw_pks);
     let num_workers = 4;
 
     let mut master_workers = vec![0usize; batch.count];

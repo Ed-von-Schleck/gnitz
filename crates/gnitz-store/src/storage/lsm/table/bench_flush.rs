@@ -11,22 +11,12 @@
 use super::super::batch::Batch;
 use super::super::run_set::FOLD_THRESHOLD;
 use super::{RecoverySource, Table};
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
+use crate::test_support::pk_u64_two_i64_schema;
 
 /// The view-output-store shape of `v_rev`: one hidden U64 group key + two
 /// non-null I64 aggregates, 40 B/row, `FixedIntNonnull` payload comparator —
 /// the dominant shape in the profiled flush workload.
-fn make_schema_flush() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
-}
-
 /// Append one row `(pk, payload, payload, weight)` to `b` (both I64 payload
 /// columns carry the same value so a retraction is an exact (PK,payload) match
 /// of its insert).
@@ -135,7 +125,7 @@ fn flush_cadence_amplification_bench() {
     use std::hint::black_box;
     use std::time::Instant;
 
-    let schema = make_schema_flush();
+    let schema = pk_u64_two_i64_schema();
 
     // Untimed warmup: warm the thread-local batch pool before the first config.
     {
@@ -235,7 +225,7 @@ fn compaction_amplification_bench() {
     // anything, so on its own it cannot tell a policy fix from a regression.
     let monotone = env_flag("GNITZ_BENCH_MONOTONE", false);
 
-    let schema = make_schema_flush();
+    let schema = pk_u64_two_i64_schema();
     let tmp = tempfile::tempdir().unwrap();
     let dir = bench_dir(&tmp, format!("wa_{ticks_n}_{keyspace}"));
 
@@ -320,7 +310,7 @@ fn filter_share_of_compaction() {
     let keyspace: u64 = env_num("GNITZ_BENCH_KEYSPACE", 200_000_000);
     let filter_off = env_flag("GNITZ_NO_PK_FILTER", false);
 
-    let schema = make_schema_flush();
+    let schema = pk_u64_two_i64_schema();
     let tmp = tempfile::tempdir().unwrap();
     let dir = bench_dir(&tmp, format!("fs_{ticks_n}_{}", filter_off as u8));
 

@@ -97,15 +97,16 @@ impl DerivedSchema {
         Some(())
     }
 
-    /// Append one PK column. Must precede every [`Self::push`]: the PK occupies
-    /// the leading slots.
+    /// Append one PK column, which [`Self::finish`] numbers `0..pk_len` — so a
+    /// PK column pushed after a payload one is rejected here rather than
+    /// producing a descriptor whose PK list names payload columns.
     ///
     /// Rejects everything `SchemaDescriptor::new` *asserts* (see
     /// [`SchemaDescriptor::new_with_placement`]), so a caller passing an unvetted
     /// column type gets a `None` rather than an abort inside `finish()`.
     pub fn push_pk(&mut self, col: SchemaColumn) -> Option<()> {
-        debug_assert_eq!(self.pk_len, self.n, "PK columns must precede payload columns");
-        if self.pk_len == MAX_PK_COLUMNS
+        if self.pk_len != self.n
+            || self.pk_len == MAX_PK_COLUMNS
             || self.pk_bytes + col.size() as usize > MAX_PK_BYTES
             || !gnitz_wire::is_pk_eligible(col.type_code)
             || col.nullable != 0

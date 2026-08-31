@@ -20,7 +20,7 @@ fn schema_roundtrip_catalog_preserves_pk_order() {
         engine.close();
     }
     {
-        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+        let engine = CatalogEngine::open(&dir, 1).unwrap();
         let tid = engine.get_by_name("public", "cpk_order").unwrap();
         let schema = engine.registry().get_schema_desc(tid).unwrap();
         assert_eq!(

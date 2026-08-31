@@ -360,7 +360,14 @@ impl RelationRegistry {
         if !cols.is_well_formed() {
             return Err(format!("scan_spec: malformed index column list for table {source}"));
         }
-        self.open_index_source(source, cols.as_slice(), desc, !exact)
+        // `exact`: the walk alone imposes the range. Otherwise the conjuncts ride
+        // the residual predicate and the walk may be traded away.
+        let walk = if exact {
+            super::IndexWalk::Required
+        } else {
+            super::IndexWalk::Optional
+        };
+        self.open_index_source(source, cols.as_slice(), desc, walk)
     }
 
     /// A `pk IN (…)` gather over an unbounded relation.

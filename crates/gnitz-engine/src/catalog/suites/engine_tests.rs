@@ -89,7 +89,6 @@ fn test_orphaned_metadata_recovery() {
             .unwrap();
         let _ = engine.sys_store_mut(SysFamily::Index).flush();
         engine.close();
-        drop(engine);
     }
 
     // Re-open should fail because the orphaned index references table 99999
@@ -207,7 +206,7 @@ fn test_recover_checkpoint_gen_and_topology() {
         );
         engine.close();
     }
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(
         engine.durable_generation, 2,
         "recovered checkpoint generation survives a reopen",
@@ -255,7 +254,7 @@ fn test_recovery_start_generation_bump_monotonic() {
         engine.close();
     }
     // The final durable generation survives a reopen monotonically.
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(
         engine.durable_generation, 4,
         "recovery-start + boot_checkpoint bumps recovered monotonically",
@@ -284,7 +283,7 @@ fn test_recover_ignores_sub_user_seq_id() {
         let _ = engine.sys_store_mut(SysFamily::Sequence).flush();
         engine.close();
     }
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(!engine.user_sequences.contains_key(&stray));
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -319,7 +318,6 @@ fn test_sequence_gap_recovery() {
         let _ = engine.sys_store_mut(SysFamily::Table).flush();
         let _ = engine.sys_store_mut(SysFamily::Column).flush();
         engine.close();
-        drop(engine);
     }
 
     // Re-open: sequence should recover to 251

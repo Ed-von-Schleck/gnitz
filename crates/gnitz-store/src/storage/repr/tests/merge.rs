@@ -77,7 +77,7 @@ fn test_relocate_german_string_vec_cache_hit_dedups() {
 use super::super::batch::{Batch, Layout};
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::test_support::{make_schema_u128_i64, pk_payload_schema};
+use crate::test_support::{make_schema_u128_i64, pk_payload_schema, pk_u64_two_i64_schema};
 
 /// Build an owned `Batch` from a row tuple list. Tests obtain a `MemBatch`
 /// view via `batch.as_mem_batch()`.
@@ -185,17 +185,6 @@ fn run_merge_dup_pk_bench() {
     }
 }
 
-fn make_schema_flush() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0],
-    )
-}
-
 /// Build an owned `Batch` of `n` rows for `make_schema_flush`: PK from
 /// `key_fn(i)`, weight +1, both I64 payload columns derived from the row
 /// index (payloads are irrelevant when all PKs are distinct).
@@ -227,7 +216,7 @@ fn merge_batches_skewed_bench() {
     use std::hint::black_box;
     use std::time::Instant;
 
-    let schema = make_schema_flush();
+    let schema = pk_u64_two_i64_schema();
     for (n, d, iters) in [
         (16_384usize, 16usize, 400usize),
         (65_536, 16, 100),

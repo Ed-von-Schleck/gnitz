@@ -10,6 +10,7 @@
 //! caller cannot — the hydrator, which is the catalog's *other* field.
 
 use super::*;
+use gnitz_store::read::IndexWalk;
 use gnitz_store::storage::SourceCursor;
 use gnitz_wire::{ReadSpec, WireFault};
 use rustc_hash::FxHashSet;
@@ -172,6 +173,6 @@ impl CatalogEngine {
                 registry.table_entry(source)?.open_cursor(),
             )));
         };
-        registry.open_index_source(source, bound.idx_cols.as_slice(), &bound.desc, true)
+        registry.open_index_source(source, bound.idx_cols.as_slice(), &bound.desc, IndexWalk::Optional)
     }
 }

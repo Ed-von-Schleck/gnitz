@@ -464,8 +464,7 @@ fn test_drop_table_cascades_secondary_index() {
     // Reopen: before the fix, replay_catalog would fail here because
     // the orphaned sys_indices row references tid which no longer exists.
     engine.close();
-    drop(engine);
-    let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
+    let engine2 = CatalogEngine::open(&dir, 1).unwrap();
     assert!(!engine2.caches.index_by_name.contains_key(idx_name.as_str()));
     engine2.close();
     let _ = fs::remove_dir_all(&dir);
@@ -502,8 +501,7 @@ fn test_drop_table_cascades_fk_index() {
 
     // Reopen catalog — must succeed.
     engine.close();
-    drop(engine);
-    let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
+    let engine2 = CatalogEngine::open(&dir, 1).unwrap();
     assert!(!engine2.caches.index_by_name.contains_key(fk_idx_name.as_str()));
     engine2.close();
     let _ = fs::remove_dir_all(&dir);
@@ -573,8 +571,7 @@ fn test_drop_table_cascades_multiple_indices() {
 
     // Reopen: replay must succeed without orphaned sys_indices rows
     engine.close();
-    drop(engine);
-    let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
+    let engine2 = CatalogEngine::open(&dir, 1).unwrap();
     assert!(!engine2.has_index_by_name(&name1));
     assert!(!engine2.has_index_by_name(&name2));
     engine2.close();

@@ -2,8 +2,8 @@ use super::*;
 use crate::schema::key::{compare_pk_bytes, ReindexPacker};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{
-    make_batch, make_batch_bytes, make_schema_pk_u64_payload_string, make_schema_u128_i64, make_schema_u64_i64,
-    make_wide_batch, opk_pk, wide_pk_3xu64_schema,
+    make_batch, make_batch_bytes, make_batch_i64pk, make_schema_pk_u64_payload_string, make_schema_u128_i64,
+    make_schema_u64_i64, make_wide_batch, opk_pk, pk_payload_schema, wide_pk_3xu64_schema,
 };
 use gnitz_wire::{worker_for_key, worker_for_pk_bytes};
 
@@ -115,17 +115,6 @@ fn test_relay_scatter_wide_pk_order_and_routing() {
 /// the wrong byte order would put the trailing column in the high bits and
 /// reverse column priority — but `order_cache` packs the OPK image, so it does
 /// not.
-fn make_narrow_compound_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0, 1],
-    )
-}
-
 /// Pack (c0, c1) into a u128 the way `MemBatch::get_pk` would read a
 /// 16-byte PK region: low 8 bytes = c0, high 8 bytes = c1.
 fn mk_compound_pk(c0: u64, c1: u64) -> u128 {
@@ -157,7 +146,7 @@ fn test_relay_scatter_narrow_compound_pk_order_and_routing() {
     // comparator. (1, 10) packed = (10<<64)|1, (2, 0) packed = 2; raw u128
     // `<` would order (2, 0) before (1, 10), but lexicographic order says
     // (1, 10) < (2, 0). Likewise (1, 5) < (1, 10) < (1, 15) lexicographically.
-    let schema = make_narrow_compound_schema();
+    let schema = pk_payload_schema(&[type_code::U64; 2]);
     // A 16-byte key: the cached `pack_pk_be` is the whole PK, so the comparator
     // decides on the register compare alone and never runs the byte tiebreak.
     assert!(schema.pk_stride() <= 16, "pk_stride must be 16 (narrow)");
@@ -224,22 +213,6 @@ fn make_schema_i64_i64() -> SchemaDescriptor {
     )
 }
 
-fn make_i64_batch(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
-    for &(pk, w, val) in rows {
-        // Signed PK at rest is OPK (big-endian, sign-bit flipped), so
-        // memcmp == signed order. Encode through extend_pk_opk, not the
-        // raw right-aligned `extend_pk` (which would store native bytes).
-        b.extend_pk_opk(schema, &[(pk as u64) as u128]);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
-        b.count += 1;
-    }
-    b.certify_layout(Layout::Consolidated, schema);
-    b
-}
-
 #[test]
 fn test_relay_scatter_i64_pk_signed_ordering() {
     // Native I64 PK with negative values. The multi-source merge walk
@@ -250,8 +223,8 @@ fn test_relay_scatter_i64_pk_signed_ordering() {
     let schema = make_schema_i64_i64();
     let num_workers = 4;
     // Each source sorted ascending under signed I64 order.
-    let b0 = make_i64_batch(&schema, &[(-100, 1, 10), (-1, 1, 11), (5, 1, 12)]);
-    let b1 = make_i64_batch(&schema, &[(-50, 1, 20), (0, 1, 21), (100, 1, 22)]);
+    let b0 = make_batch_i64pk(&schema, &[(-100, 1, 10), (-1, 1, 11), (5, 1, 12)]);
+    let b1 = make_batch_i64pk(&schema, &[(-50, 1, 20), (0, 1, 21), (100, 1, 22)]);
     let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
     let result = op_relay_scatter_consolidated(&sources, &[0u32], &schema, num_workers);
 
@@ -662,7 +635,7 @@ fn test_op_repartition_batches_compound_pk_routes_by_bytes() {
     // pre-fix code only branched on (single_pk && wide), falling through to
     // the group-key hash path for narrow compound PKs — which would route to
     // a different worker than the data lives on.
-    let schema = make_narrow_compound_schema();
+    let schema = pk_payload_schema(&[type_code::U64; 2]);
     let num_workers = 4;
     let b0 = make_narrow_compound_batch(
         &schema,

@@ -1,7 +1,7 @@
 use super::super::batch::{REG_PAYLOAD_START, REG_WEIGHT};
 use super::*;
 use crate::schema::{type_code, SchemaDescriptor};
-use crate::test_support::{make_batch_raw, pk_i64_schema};
+use crate::test_support::{make_batch_raw, pk_payload_schema};
 
 /// A one-row batch encoded to a WAL block, ready to have its directory forged.
 fn encoded_block(schema: &SchemaDescriptor) -> Vec<u8> {
@@ -12,7 +12,7 @@ fn encoded_block(schema: &SchemaDescriptor) -> Vec<u8> {
 /// for the row count is refused, rather than decoded against a mis-sized region.
 #[test]
 fn decode_from_wal_block_rejects_mismatched_region_sizes() {
-    let schema = pk_i64_schema(type_code::U64); // pk_stride = 8
+    let schema = pk_payload_schema(&[type_code::U64]); // pk_stride = 8
     for (region, forged) in [(REG_PK, 24u32), (REG_WEIGHT, 4)] {
         let mut buf = encoded_block(&schema);
         let size_off = gnitz_wire::wal::dir_entry_offset(region) + 4;
@@ -28,7 +28,7 @@ fn decode_from_wal_block_rejects_mismatched_region_sizes() {
 /// `verify_checksum = false`: the unverified IPC path is the one this guards.
 #[test]
 fn decode_mem_batch_rejects_blob_region_past_block() {
-    let schema = pk_i64_schema(type_code::U64);
+    let schema = pk_payload_schema(&[type_code::U64]);
     let mut buf = encoded_block(&schema);
     let entry = gnitz_wire::wal::dir_entry_offset(REG_PAYLOAD_START + schema.num_payload_cols());
     let block_end = buf.len() as u32;
@@ -43,7 +43,7 @@ fn decode_mem_batch_rejects_blob_region_past_block() {
 #[test]
 #[should_panic(expected = "no German string")]
 fn encode_range_to_wire_panics_on_nonempty_blob() {
-    let schema = pk_i64_schema(type_code::U64);
+    let schema = pk_payload_schema(&[type_code::U64]);
     let mut b = make_batch_raw(&schema, &[(1, 1, 7)]);
     // A non-empty heap on a range encode must fail loudly, not vanish.
     b.blob.push(0xAB);

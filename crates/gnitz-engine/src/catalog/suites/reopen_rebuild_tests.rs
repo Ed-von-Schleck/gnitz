@@ -122,9 +122,8 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     );
 
     engine.close();
-    drop(engine); // release locks before re-open
 
-    let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
+    let engine2 = CatalogEngine::open(&dir, 1).unwrap();
 
     // The base table must be non-empty after reopen: it came back from its
     // durable shards. Without this guard an empty base would rebuild an empty
@@ -197,9 +196,8 @@ fn index_rebuilds_across_chunk_boundary() {
     engine.create_index("public.base", &["val"], true).unwrap();
 
     engine.close();
-    drop(engine);
 
-    let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
+    let engine2 = CatalogEngine::open(&dir, 1).unwrap();
 
     let base_entry = engine2.registry().table_entry(tid).expect("base table replayed");
     assert_eq!(

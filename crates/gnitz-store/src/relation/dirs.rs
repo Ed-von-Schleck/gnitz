@@ -38,17 +38,28 @@ fn has_numeric_id(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Run `f`, and on `Err` remove `dir` — but only when `f` is what created it.
-/// One that was already there holds an existing relation's rows (a boot replay
-/// reopens one; so does a compensation restoring what a bundle dropped), and
-/// deciding that here is what stops a caller staging live shards.
+/// Stage `dir` across `f`: on `Err` remove it, on `Ok` fsync its parent — each
+/// only when `f` is what created it. One that was already there holds an
+/// existing relation's rows (a boot replay reopens one; so does a compensation
+/// restoring what a bundle dropped), and deciding that here is what stops a
+/// caller staging live shards.
+///
+/// "`f` created it" is observed, not declared: the probe runs on both sides, so
+/// a caller that creates no directory at all (a storeless relation) neither
+/// cleans up nor syncs, without having to say so.
 pub fn staged_dir<T>(dir: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     let existed = std::path::Path::new(dir).exists();
-    f().inspect_err(|_| {
-        if !existed {
-            let _ = fs::remove_dir_all(dir);
-        }
-    })
+    let out = f();
+    if existed || !std::path::Path::new(dir).exists() {
+        return out;
+    }
+    if out.is_err() {
+        let _ = fs::remove_dir_all(dir);
+    } else if let Some(parent) = dir.rsplit_once('/').map(|(p, _)| p) {
+        // A new directory entry is metadata in the parent.
+        let _ = crate::storage::fsync_dir(parent);
+    }
+    out
 }
 
 pub fn ensure_dir(path: &str) -> Result<(), String> {

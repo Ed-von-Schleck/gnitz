@@ -42,7 +42,7 @@ impl CatalogEngine {
             registry: RelationRegistry::new(num_workers),
             dag: DagEngine::new(),
             base_dir: base_dir.to_string(),
-            dir_lock: Some(dir_lock),
+            _dir_lock: dir_lock,
             caches: CatalogCacheSet::default(),
             next_schema_id: FIRST_USER_SCHEMA_ID,
             next_table_id: FIRST_USER_TABLE_ID,
@@ -294,18 +294,18 @@ impl CatalogEngine {
     }
 
     /// Flush every store this engine owns that a restart could read back — each
-    /// user table's owned handle and then the system tables — clear the DAG, and
-    /// release the data-directory lock. There is no `Drop` doing any of it, so a
-    /// caller that wants the tree on disk complete, or wants to reopen the same
-    /// directory, must call this.
+    /// user table's owned handle and then the system tables — and clear the DAG.
+    /// Consuming, so nothing can touch a closed engine; dropping one instead
+    /// releases the directory lock without flushing, which is what the
+    /// crash-semantics tests want.
     ///
     /// A fed view's delta store is skipped for the reason it is in neither
     /// checkpoint round: it is erased at open, so flushing it would write bytes
     /// the next boot deletes.
     ///
-    /// The server never does: it flushes durably per zone and exits via abort or
-    /// process teardown.
-    pub fn close(&mut self) {
+    /// The server never calls this: it flushes durably per zone and exits via
+    /// abort or process teardown.
+    pub fn close(mut self) {
         // The user relations first, through the same batched base round the
         // checkpoint takes; the system tables hold `Borrowed` handles and are
         // flushed below.
@@ -314,8 +314,6 @@ impl CatalogEngine {
         self.registry.close();
         self.dag.close();
         let _ = self.flush_all_system_tables();
-        // Last: dropping the file releases the directory lock, so the next open
-        // of this directory succeeds.
-        self.dir_lock = None;
+        // `self` drops here: the stores first, then the lock, in field order.
     }
 }

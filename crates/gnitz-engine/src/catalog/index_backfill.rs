@@ -57,13 +57,15 @@ impl CatalogEngine {
         check_dups: bool,
     ) -> Result<(), String> {
         // The relation filled here is the *index table* (`owner_id` is the
-        // indexed relation, a durable base table). It must be empty: an index
-        // that resumed from its checkpoint already holds these rows, and
-        // projecting them again would double every weight.
-        debug_assert!(
-            unsafe { &*idx_table }.estimated_rows() == 0,
-            "backfill_index into a non-empty index (owner {owner_id}): would double-count",
-        );
+        // indexed relation, a durable base table). Refused unless empty, in every
+        // build: an index that resumed from its checkpoint already holds these
+        // rows, and projecting them again would double every weight — a wrong
+        // answer no later check looks for.
+        if unsafe { &*idx_table }.estimated_rows() != 0 {
+            return Err(format!(
+                "backfill_index into a non-empty index (owner {owner_id}): would double-count"
+            ));
+        }
         // Built here, not read off a circuit: the fresh-index path runs before
         // `add_index_circuit` registers one.
         let target = IndexProjectionTarget {

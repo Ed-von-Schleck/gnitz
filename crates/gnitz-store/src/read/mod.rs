@@ -19,6 +19,7 @@ mod scan_spec;
 mod store_io;
 
 pub use scan_spec::scan_spec_worker;
+pub use store_io::IndexWalk;
 
 use crate::relation::RelationRegistry;
 use crate::storage::Batch;

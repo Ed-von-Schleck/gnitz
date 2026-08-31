@@ -317,7 +317,7 @@ impl RelationRegistry {
         // cannot diverge on the weight-consolidation subtleties. A provably-empty
         // range drains `None`; the `.filter` maps the cursor's `Some(empty)`
         // ("in-range entries, none resolved") back to this API's `None` too.
-        let mut cur = self.open_index_source(table_id, col_indices, range, false)?;
+        let mut cur = self.open_index_source(table_id, col_indices, range, IndexWalk::Required)?;
         Ok((cur.drain_chunk(usize::MAX).filter(|b| b.count > 0), src_schema))
     }
 
@@ -334,33 +334,31 @@ impl RelationRegistry {
     }
 
     /// The one index-bounded source cursor opener: the walk over `desc` on `cols`
-    /// of `source`, `SourceCursor::Empty` for a provably-empty range, and — under
-    /// `gate` — the full-scan cursor when [`Self::open_index_range`]'s cost model
-    /// declines.
-    ///
-    /// `gate` is "the caller re-imposes the range itself" (a circuit's `Filter`,
-    /// a ScanSpec residual), which is what makes degrading to a full scan a
-    /// performance choice. Ungated, a decline is surfaced instead — that caller
-    /// has nothing left to re-filter a full scan with.
+    /// of `source`, `SourceCursor::Empty` for a provably-empty range, and — for
+    /// an [`IndexWalk::Optional`] walk — the full-scan cursor when
+    /// [`Self::open_index_range`]'s cost model declines.
     pub fn open_index_source(
         &self,
         source: i64,
         cols: &[u32],
         desc: &gnitz_wire::RangeDescriptor,
-        gate: bool,
+        walk: IndexWalk,
     ) -> Result<SourceCursor, String> {
-        match self.open_index_range(source, cols, desc, gate) {
+        match self.open_index_range(source, cols, desc, walk) {
             IndexScan::Cursor(c) => Ok(SourceCursor::Bounded(c)),
             IndexScan::Empty => Ok(SourceCursor::Empty),
-            IndexScan::Decline(_) if gate => Ok(SourceCursor::Full(Box::new(self.table_entry(source)?.open_cursor()))),
+            IndexScan::Decline(_) if walk == IndexWalk::Optional => {
+                Ok(SourceCursor::Full(Box::new(self.table_entry(source)?.open_cursor())))
+            }
             IndexScan::Decline(e) => Err(e),
         }
     }
 
     /// The one place an index-bounded walk is opened: resolve the circuit, encode
     /// the range bounds, open the index cursor and measure the range — each
-    /// exactly once. `gate` additionally applies the cost model below, declining
-    /// an unselective range before the base cursor is opened.
+    /// exactly once. An [`IndexWalk::Optional`] walk additionally applies the cost
+    /// model below, declining an unselective range before the base cursor is
+    /// opened.
     ///
     /// Index cursor before base cursor: `ingest_store_and_indices` writes
     /// base-then-index non-atomically, so snapshotting the index no later than
@@ -377,13 +375,13 @@ impl RelationRegistry {
     /// arithmetic over the children's run and shard counts — rather than a
     /// cursor's `estimated_length`, so the base cursor is never opened
     /// speculatively. M also sizes the walk's per-chunk PK scratch exactly,
-    /// gated or not.
+    /// either way.
     fn open_index_range(
         &self,
         table_id: i64,
         col_indices: &[u32],
         range: &gnitz_wire::RangeDescriptor,
-        gate: bool,
+        walk: IndexWalk,
     ) -> IndexScan {
         let entry = match self.table_entry(table_id) {
             Ok(e) => e,
@@ -402,7 +400,7 @@ impl RelationRegistry {
         let end_bytes = end.as_ref().map(|e| e.pk_bytes());
         let idx = ic.table_mut().open_cursor_in_range(start.pk_bytes(), end_bytes);
         let matches = idx.count_range_raw(start.pk_bytes(), end_bytes);
-        if gate {
+        if walk == IndexWalk::Optional {
             // Only user base tables own index circuits, so a resolved index
             // implies an owned base store; a borrowed system table degrades to
             // the full scan like any other decline.
@@ -424,6 +422,18 @@ impl RelationRegistry {
     }
 }
 
+/// Whether the index walk is the only thing imposing the range.
+///
+/// `Required` — nothing else re-filters, so a walk the cost model declines is an
+/// error. `Optional` — the caller re-imposes the range itself (a circuit's
+/// `Filter`, a ScanSpec residual), so the walk is an access optimisation and a
+/// decline degrades to a full scan.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum IndexWalk {
+    Required,
+    Optional,
+}
+
 /// Use the index only when its range covers at most `1/INDEX_SCAN_RATIO` of the
 /// local base slice.
 const INDEX_SCAN_RATIO: usize = 16;
@@ -435,9 +445,10 @@ enum IndexScan {
     Cursor(Box<BoundedIndexCursor>),
     /// The range is provably empty — there is nothing to read either way.
     Empty,
-    /// No walk: no such table or index, a malformed descriptor, or — only under
-    /// `gate` — an unselective range or an unowned base store. Under `gate` the
-    /// opener answers this with a full scan; ungated it surfaces the message.
+    /// No walk: no such table or index, a malformed descriptor, or — only for an
+    /// [`IndexWalk::Optional`] walk — an unselective range or an unowned base
+    /// store. The opener answers an optional walk's decline with a full scan; a
+    /// required one's it surfaces.
     Decline(String),
 }
 

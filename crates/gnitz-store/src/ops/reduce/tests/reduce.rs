@@ -3,9 +3,10 @@
 
 use crate::expr::PkSource;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode};
-use crate::storage::{Batch, Layout, ReadCursor};
+use crate::storage::{Batch, BatchBuilder, Layout, ReadCursor};
 use crate::test_support::{
-    make_batch_raw, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64, scratch_table, trace_cursor,
+    make_batch_raw, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64, pk_payload_schema, scratch_table,
+    trace_cursor, u64_pk_schema,
 };
 use gnitz_wire::{encode_german_string, read_i64_le, read_u64_le};
 
@@ -1286,32 +1287,17 @@ fn make_schema_with_type(tc: u8) -> SchemaDescriptor {
     SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)], &[0])
 }
 
-fn make_batch_typed_i32(schema: &SchemaDescriptor, rows: &[(u64, i64, i32)]) -> Batch {
-    let n = rows.len();
-    let mut b = Batch::with_capacity(*schema, n.max(1));
-
+/// `(pk, weight, value)` rows into a `(U64 pk, one narrow-int payload)` schema.
+/// The payload is written at the column's own width by `put_int`, so one builder
+/// covers every integer type the reduce tests exercise.
+fn make_batch_typed(schema: &SchemaDescriptor, rows: &[(u64, i64, i128)]) -> Batch {
+    let mut bb = BatchBuilder::new(*schema);
     for &(pk, w, val) in rows {
-        b.extend_pk(pk as u128);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
-        b.count += 1;
+        bb.begin_row(pk as u128, w);
+        bb.put_int(val as u128);
+        bb.end_row();
     }
-    b.set_layout_unchecked(Layout::Consolidated);
-    b
-}
-
-fn make_batch_typed_i16(schema: &SchemaDescriptor, rows: &[(u64, i64, i16)]) -> Batch {
-    let n = rows.len();
-    let mut b = Batch::with_capacity(*schema, n.max(1));
-
-    for &(pk, w, val) in rows {
-        b.extend_pk(pk as u128);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
-        b.count += 1;
-    }
+    let mut b = bb.finish();
     b.set_layout_unchecked(Layout::Consolidated);
     b
 }
@@ -1333,7 +1319,7 @@ fn test_reduce_sum_i32() {
     let mut to_ch = empty_trace(out_schema);
 
     // 3 rows with I32 values, group by PK
-    let delta = make_batch_typed_i32(&in_schema, &[(1, 1, 100i32), (2, 1, 200i32), (3, 1, -50i32)]);
+    let delta = make_batch_typed(&in_schema, &[(1, 1, 100), (2, 1, 200), (3, 1, -50)]);
 
     let aggs = sum_count_aggs(1);
 
@@ -1396,7 +1382,7 @@ fn test_reduce_max_i16() {
 
     // 3 rows with I16 values, all same PK, in (PK, payload) order so the
     // consolidated flag the helper stamps is honest.
-    let delta = make_batch_typed_i16(&in_schema, &[(1, 1, -100i16), (1, 1, 50i16), (1, 1, 200i16)]);
+    let delta = make_batch_typed(&in_schema, &[(1, 1, -100), (1, 1, 50), (1, 1, 200)]);
 
     let out = op_reduce(&delta, &mut to_ch, &in_schema, &[0u32], &[agg], None, false, false);
     assert_eq!(out.count, 1);
@@ -1651,16 +1637,6 @@ fn test_argsort_delta_pk_in_group() {
 // -----------------------------------------------------------------------
 
 /// Schema: U64 pk | nullable I64.
-fn make_schema_pk_nullable_i64() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-        ],
-        &[0],
-    )
-}
-
 /// Build a 2-col batch (pk, nullable_i64). For null rows, payload bytes
 /// are zero (DirectWriter convention) and the null bit at payload pi=0 is set.
 fn build_pk_null_i64(schema: &SchemaDescriptor, rows: &[(u64, Option<i64>)]) -> Batch {
@@ -1680,7 +1656,7 @@ fn build_pk_null_i64(schema: &SchemaDescriptor, rows: &[(u64, Option<i64>)]) -> 
 
 #[test]
 fn test_group_key_null_distinct_from_zero() {
-    let schema = make_schema_pk_nullable_i64();
+    let schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
     let batch = build_pk_null_i64(&schema, &[(1, None), (2, Some(0)), (3, Some(7)), (4, None)]);
     let mb = batch.as_mem_batch();
 
@@ -1697,7 +1673,7 @@ fn test_group_key_null_distinct_from_zero() {
 
 #[test]
 fn test_compare_by_group_cols_nulls_first() {
-    let schema = make_schema_pk_nullable_i64();
+    let schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
     let batch = build_pk_null_i64(&schema, &[(1, Some(7)), (2, None), (3, None)]);
     let mb = batch.as_mem_batch();
     let descs_v = locate_cols(&schema, &[1]);
@@ -1718,7 +1694,7 @@ fn test_argsort_delta_nullable_group_col() {
     // A nullable group column is not canonical, so the key is the fold, which
     // streams a null marker: NULL is one group, distinct from the integer 0 it
     // shares its stored bytes with, and its rows must be adjacent.
-    let schema = make_schema_pk_nullable_i64();
+    let schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
     let batch = build_pk_null_i64(&schema, &[(1, Some(0)), (2, None), (3, Some(5)), (4, None)]);
     let mb = batch.as_mem_batch();
     let indices = argsort_delta(&mb, &GroupKeyCols::new(&schema, &[1]));
@@ -1750,17 +1726,6 @@ fn test_argsort_delta_nullable_group_col() {
 // -----------------------------------------------------------------------
 
 /// 2×U64 compound-PK input schema. pk_indices = [0, 1]; payload col is I64.
-fn make_compound_pk_2xu64_schema() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 0),
-        ],
-        &[0, 1],
-    )
-}
-
 /// Build a 2×U64 compound-PK batch. Rows: (pk0, pk1, weight, val).
 fn make_batch_compound_2xu64(schema: &SchemaDescriptor, rows: &[(u64, u64, i64, i64)]) -> Batch {
     let n = rows.len();
@@ -1784,7 +1749,7 @@ fn make_batch_compound_2xu64(schema: &SchemaDescriptor, rows: &[(u64, u64, i64, 
 /// must be copied verbatim from the source row, not packed from group_key.
 #[test]
 fn test_emit_reduce_row_compound_pk_bytes() {
-    let in_schema = make_compound_pk_2xu64_schema();
+    let in_schema = pk_payload_schema(&[type_code::U64; 2]);
 
     // Output schema matches what build_reduce_output_schema would produce
     // for a PkPermutation grouping on this input with a COUNT aggregate:
@@ -1831,7 +1796,7 @@ fn test_emit_reduce_row_compound_pk_bytes() {
 /// region to u128 (which would yield column 0).
 #[test]
 fn test_reduce_min_pk_col_compound_pk() {
-    let in_schema = make_compound_pk_2xu64_schema();
+    let in_schema = pk_payload_schema(&[type_code::U64; 2]);
 
     // Output: full natural compound PK + I64 agg, matching the
     // build_reduce_output_schema layout for PkPermutation.
@@ -1913,7 +1878,7 @@ fn test_reduce_min_pk_col_single_pk_u64() {
 /// fast path skips the sort and passes row order through).
 #[test]
 fn test_reduce_group_by_pk_permuted_preserves_pk_order() {
-    let in_schema = make_compound_pk_2xu64_schema();
+    let in_schema = pk_payload_schema(&[type_code::U64; 2]);
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
@@ -1976,7 +1941,7 @@ fn test_reduce_group_by_pk_permuted_preserves_pk_order() {
 /// in `pk_col_1` must compare Equal under `GROUP BY pk_col_0`.
 #[test]
 fn test_compare_by_group_cols_pk_sentinel_compound_subset() {
-    let schema = make_compound_pk_2xu64_schema();
+    let schema = pk_payload_schema(&[type_code::U64; 2]);
     let batch = make_batch_compound_2xu64(&schema, &[(10, 7, 1, 100), (10, 9, 1, 200), (20, 7, 1, 300)]);
     let mb = batch.as_mem_batch();
 
@@ -2005,7 +1970,7 @@ fn test_compare_by_group_cols_pk_sentinel_compound_subset() {
 /// (non-zero PK byte offset) must isolate pk_col_1.
 #[test]
 fn test_compare_by_group_cols_pk_sentinel_compound_pk_col_1() {
-    let schema = make_compound_pk_2xu64_schema();
+    let schema = pk_payload_schema(&[type_code::U64; 2]);
     let batch = make_batch_compound_2xu64(&schema, &[(1, 50, 1, 100), (2, 50, 1, 200), (3, 60, 1, 300)]);
     let mb = batch.as_mem_batch();
 
@@ -2055,7 +2020,7 @@ fn test_compare_by_group_cols_pk_sentinel_single_pk_bit_identical() {
 /// different groups.
 #[test]
 fn test_group_key_single_pk_col_compound_subset() {
-    let schema = make_compound_pk_2xu64_schema();
+    let schema = pk_payload_schema(&[type_code::U64; 2]);
     let batch = make_batch_compound_2xu64(&schema, &[(10, 50, 1, 0), (10, 99, 1, 0), (20, 50, 1, 0)]);
     let mb = batch.as_mem_batch();
 
@@ -2089,7 +2054,7 @@ fn test_group_key_single_pk_col_single_pk_bit_identical() {
 /// its own group; the fix collapses rows sharing pk_col_0.
 #[test]
 fn test_op_reduce_compound_pk_group_by_subset_count() {
-    let in_schema = make_compound_pk_2xu64_schema();
+    let in_schema = pk_payload_schema(&[type_code::U64; 2]);
     // GROUP BY a single U64 column → use_natural_pk via
     // SingleNaturalCol. Output: U64 pk + I64 count.
     let out_schema = SchemaDescriptor::new(
@@ -2590,7 +2555,7 @@ fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
 
 #[test]
 fn test_reduce_group_by_pk_unsorted_compound_pk_permuted() {
-    let in_schema = make_compound_pk_2xu64_schema();
+    let in_schema = pk_payload_schema(&[type_code::U64; 2]);
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
@@ -4811,19 +4776,9 @@ fn test_reduce_max_blob_group_retraction() {
 // ---------------------------------------------------------------------------
 
 /// Source for the global-aggregate tests: `[pk:U64, val:I64(nullable)]`.
-fn g_src() -> SchemaDescriptor {
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::I64, 1),
-        ],
-        &[0],
-    )
-}
-
-/// Build a delta over `g_src()` from `(pk, weight, val)` rows.
+/// Build a delta over `u64_pk_schema(SchemaColumn::new(type_code::I64, 1))` from `(pk, weight, val)` rows.
 fn g_delta(rows: &[(u64, i64, i64)]) -> Batch {
-    make_batch(&g_src(), rows)
+    make_batch(&u64_pk_schema(SchemaColumn::new(type_code::I64, 1)), rows)
 }
 
 const G_COUNT: AggDescriptor = AggDescriptor {
@@ -4852,7 +4807,7 @@ fn g_out_count_min() -> SchemaDescriptor {
     )
 }
 
-/// `op_reduce` over `g_src()` with empty group cols (the global-aggregate path).
+/// `op_reduce` over `u64_pk_schema(SchemaColumn::new(type_code::I64, 1))` with empty group cols (the global-aggregate path).
 ///
 /// `history` is the input the value index has absorbed, this delta included —
 /// empty for an all-linear aggregate set, which carries no index.
@@ -4863,7 +4818,7 @@ fn g_reduce(
     aggs: &[AggDescriptor],
     i_am_owner: bool,
 ) -> Batch {
-    let in_schema = g_src();
+    let in_schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
     let mut avi = aggs
         .iter()
         .any(|d| d.agg_op.uses_value_index())
@@ -4884,7 +4839,11 @@ fn g_reduce(
 /// Seed over an empty source emits exactly one ground row at V₀: COUNT=0, SUM=NULL.
 #[test]
 fn global_seed_over_empty_emits_one_ground_row() {
-    let out_schema = out_schema_for(&g_src(), &[], &[G_SUM, G_COUNT]);
+    let out_schema = out_schema_for(
+        &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
+        &[],
+        &[G_SUM, G_COUNT],
+    );
     let mut to_ch = empty_trace(out_schema);
 
     let raw = g_reduce(&g_delta(&[]), &[], &mut to_ch, &[G_SUM, G_COUNT], true);
@@ -4905,7 +4864,11 @@ fn global_seed_over_empty_emits_one_ground_row() {
 /// V₀ ground re-seeds nothing (no weight-2 ground is constructible).
 #[test]
 fn global_seed_idempotent_across_two_empty_pads() {
-    let out_schema = out_schema_for(&g_src(), &[], &[G_SUM, G_COUNT]);
+    let out_schema = out_schema_for(
+        &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
+        &[],
+        &[G_SUM, G_COUNT],
+    );
     let mut to_ch = empty_trace(out_schema);
     let raw1 = g_reduce(&g_delta(&[]), &[], &mut to_ch, &[G_SUM, G_COUNT], true);
     assert_eq!(raw1.count, 1, "first pad seeds the ground");
@@ -4920,7 +4883,11 @@ fn global_seed_idempotent_across_two_empty_pads() {
 /// batch (asserted on the batch itself, not a merged result).
 #[test]
 fn global_non_owner_empty_pad_emits_zero_rows() {
-    let out_schema = out_schema_for(&g_src(), &[], &[G_SUM, G_COUNT]);
+    let out_schema = out_schema_for(
+        &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
+        &[],
+        &[G_SUM, G_COUNT],
+    );
     let mut to_ch = empty_trace(out_schema);
     let raw = g_reduce(
         &g_delta(&[]),
@@ -4935,7 +4902,11 @@ fn global_non_owner_empty_pad_emits_zero_rows() {
 /// Create over a non-empty source emits one computed row and NO ground.
 #[test]
 fn global_create_over_nonempty_emits_computed_no_ground() {
-    let out_schema = out_schema_for(&g_src(), &[], &[G_SUM, G_COUNT]);
+    let out_schema = out_schema_for(
+        &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
+        &[],
+        &[G_SUM, G_COUNT],
+    );
     let mut to_ch = empty_trace(out_schema);
     let raw = g_reduce(
         &g_delta(&[(1, 1, 5), (2, 1, 10)]),
@@ -4954,7 +4925,11 @@ fn global_create_over_nonempty_emits_computed_no_ground() {
 /// ground branch supplies one NULL/zero row in its place (net = one ground row).
 #[test]
 fn global_emptied_by_delete_emits_ground() {
-    let out_schema = out_schema_for(&g_src(), &[], &[G_SUM, G_COUNT]);
+    let out_schema = out_schema_for(
+        &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
+        &[],
+        &[G_SUM, G_COUNT],
+    );
     let mut to_ch = empty_trace(out_schema);
     let raw1 = g_reduce(&g_delta(&[(1, 1, 5)]), &[], &mut to_ch, &[G_SUM, G_COUNT], true);
     assert_eq!(read_i64_le(raw1.col_data(0), 0), 5, "SUM=5");
@@ -4975,7 +4950,11 @@ fn global_emptied_by_delete_emits_ground() {
 /// the ground at V₀ is retracted and the computed row replaces it.
 #[test]
 fn global_ground_to_computed_on_first_insert() {
-    let out_schema = out_schema_for(&g_src(), &[], &[G_SUM, G_COUNT]);
+    let out_schema = out_schema_for(
+        &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
+        &[],
+        &[G_SUM, G_COUNT],
+    );
     // Tick 1: seed the ground over an empty source.
     let mut to_ch = empty_trace(out_schema);
     let ground = g_reduce(&g_delta(&[]), &[], &mut to_ch, &[G_SUM, G_COUNT], true);
@@ -4998,7 +4977,11 @@ fn global_ground_to_computed_on_first_insert() {
 /// rows and NO ground delta (the group never crosses the cardinality boundary).
 #[test]
 fn global_value_change_emits_no_ground() {
-    let out_schema = out_schema_for(&g_src(), &[], &[G_SUM, G_COUNT]);
+    let out_schema = out_schema_for(
+        &u64_pk_schema(SchemaColumn::new(type_code::I64, 1)),
+        &[],
+        &[G_SUM, G_COUNT],
+    );
     let mut to_ch = empty_trace(out_schema);
     let raw1 = g_reduce(&g_delta(&[(1, 1, 5)]), &[], &mut to_ch, &[G_SUM, G_COUNT], true);
     assert_eq!(read_i64_le(raw1.col_data(0), 0), 5);
@@ -5087,7 +5070,7 @@ fn global_lone_min_retract_to_next_best() {
 /// order — and a retraction advances to the next-best AVI post-state.
 #[test]
 fn global_lone_min_avi_empty_prefix() {
-    let in_schema = g_src();
+    let in_schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
     let out_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U128, 0),
@@ -5165,7 +5148,7 @@ fn global_lone_min_avi_empty_prefix() {
 fn sumzero_folds_like_sum_and_empty_renders_zero() {
     assert!(AggFunc::SumZero.is_linear(), "SumZero must be linear");
 
-    let schema = g_src();
+    let schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
     let desc = AggDescriptor {
         col_idx: 1,
         agg_op: AggFunc::SumZero,
@@ -5197,7 +5180,7 @@ fn sumzero_folds_like_sum_and_empty_renders_zero() {
 /// way). Regression guard for the COUNT-family-renders-NULL emitter bug.
 #[test]
 fn count_non_null_all_null_group_renders_zero_null_clear() {
-    let in_schema = g_src(); // [U64 pk, I64 payload(nullable)]
+    let in_schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1)); // [U64 pk, I64 payload(nullable)]
     let desc = AggDescriptor {
         col_idx: 1,
         agg_op: AggFunc::CountNonNull,
@@ -5205,7 +5188,7 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
     let mut acc = make_acc(&in_schema, &[0], desc);
 
     // Two rows whose payload column (payload slot 0) is NULL.
-    let mut batch = Batch::with_capacity(g_src(), 2);
+    let mut batch = Batch::with_capacity(u64_pk_schema(SchemaColumn::new(type_code::I64, 1)), 2);
     for pk in [1u128, 2u128] {
         batch.extend_pk(pk);
         batch.extend_weight(&1i64.to_le_bytes());
@@ -5254,7 +5237,7 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
 /// COUNT(*) and COUNT(col) ground columns.
 #[test]
 fn emit_global_ground_renders_count_family_zero_null_clear() {
-    let in_schema = g_src();
+    let in_schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
     // Global-aggregate output: [_group_pk:U128, count_star:I64, count_col:I64].
     let out_schema = SchemaDescriptor::new(
         &[

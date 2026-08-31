@@ -963,8 +963,7 @@ fn a_torn_checkpoint_reseeds_rather_than_corrupts() {
     fx.mirror()
         .checkpoint_mirror()
         .expect("checkpoint before the torn bump");
-    fx.mirror = None;
-    patch_state_header(&fx.base_dir(), STATE_OFF_GENERATION, |g| g + 1);
+    patch_state_header(&mut fx, STATE_OFF_GENERATION, |g| g + 1);
 
     fx.reopen();
     fx.mirror_both();
@@ -1063,8 +1062,7 @@ fn a_foreign_topology_word_reseeds() {
         has_manifest(&fx.base_dir(), tid),
         "a checkpoint must publish the copy's manifest",
     );
-    fx.mirror = None;
-    patch_state_header(&fx.base_dir(), STATE_OFF_TOPOLOGY, |_| {
+    patch_state_header(&mut fx, STATE_OFF_TOPOLOGY, |_| {
         // What a two-worker layout would have stamped. The mirror always opens
         // at one worker, so this mismatches for the same reason a state-format
         // bump would.
@@ -1146,11 +1144,12 @@ const STATE_OFF_TOPOLOGY: usize = 16;
 /// Rewrite one `u64` of the mirror's record-file header, to fabricate a durable
 /// state the handle would never write.
 ///
-/// The caller must have dropped the handle first: the directory takes one
-/// writer, which is exactly what the two tests above rely on the lock for — and
-/// the handle rewrites the whole file on the way out.
-fn patch_state_header(dir: &str, offset: usize, f: impl FnOnce(u64) -> u64) {
-    let path = state_file(dir);
+/// Drops the handle first — the directory takes one writer, and the handle
+/// rewrites the whole file on the way out — which is why this takes the fixture
+/// rather than a path.
+fn patch_state_header(fx: &mut Fixture, offset: usize, f: impl FnOnce(u64) -> u64) {
+    fx.mirror = None;
+    let path = state_file(&fx.base_dir());
     let mut bytes = std::fs::read(&path).expect("a checkpoint wrote the record file");
     let old = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
     bytes[offset..offset + 8].copy_from_slice(&f(old).to_le_bytes());

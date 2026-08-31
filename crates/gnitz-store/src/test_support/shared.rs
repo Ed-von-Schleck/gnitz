@@ -22,15 +22,20 @@ use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, Layout, RecoverySource, Table};
 use gnitz_wire::type_code;
 
-/// A single-column PK of type `tc` plus one I64 payload column — the shape
-/// almost every storage unit test wants, parameterized by PK type.
-pub fn pk_i64_schema(tc: u8) -> SchemaDescriptor {
-    SchemaDescriptor::new(&[SchemaColumn::new(tc, 0), SchemaColumn::new(type_code::I64, 0)], &[0])
+/// A schema with one PK column per type code in `tcs`, plus a single trailing
+/// I64 payload column — the generic PK-shape builder for the merge/sort/OPK
+/// tests, parameterized by the whole key rather than by one named shape.
+/// [`pk_only_schema`] is the no-payload counterpart.
+pub fn pk_payload_schema(tcs: &[u8]) -> SchemaDescriptor {
+    let mut cols: Vec<SchemaColumn> = tcs.iter().map(|&t| SchemaColumn::new(t, 0)).collect();
+    cols.push(SchemaColumn::new(type_code::I64, 0));
+    let pk: Vec<u32> = (0..tcs.len() as u32).collect();
+    SchemaDescriptor::new(&cols, &pk)
 }
 
 /// The canonical narrow test schema: U64 pk + a single I64 payload column.
 pub fn make_schema_u64_i64() -> SchemaDescriptor {
-    pk_i64_schema(type_code::U64)
+    pk_payload_schema(&[type_code::U64])
 }
 
 /// Build a batch over [`make_schema_u64_i64`]-shaped schemas from native
@@ -72,10 +77,11 @@ pub fn payload_slot_width(schema: &SchemaDescriptor) -> usize {
         .map_or(8, |(_, c)| (c.size() as usize).min(8))
 }
 
-/// A U64 PK plus one payload column of type `tc` — the reindex/promotion tests'
-/// counterpart to [`pk_i64_schema`], parameterized by payload type instead.
-pub fn u64_pk_schema(tc: u8) -> SchemaDescriptor {
-    SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)], &[0])
+/// A U64 PK plus one `payload` column — the reindex/promotion tests' counterpart
+/// to [`pk_payload_schema`], parameterized by the payload column rather than only its
+/// type, so a nullable payload needs no second builder.
+pub fn u64_pk_schema(payload: SchemaColumn) -> SchemaDescriptor {
+    SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0), payload], &[0])
 }
 
 /// Every wire `TypeCode`. The single source of truth for the schema-generating
@@ -228,6 +234,21 @@ pub fn pk_only_schema(types: &[u8]) -> SchemaDescriptor {
     SchemaDescriptor::new(&cols, &pk)
 }
 
+/// One row per supplied OPK key — weight 1, null word 0, one zeroed I64 payload
+/// column, in the order given. What the PK-sort and routing tests need, which
+/// read only `pk_stride` and `get_pk_bytes`. Each key must be `pk_stride` bytes.
+pub fn batch_of_pk_bytes(schema: &SchemaDescriptor, pks: &[impl AsRef<[u8]>]) -> Batch {
+    let mut b = Batch::with_capacity(*schema, pks.len().max(1));
+    for pk in pks {
+        b.extend_pk_bytes(pk.as_ref());
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &0i64.to_le_bytes());
+        b.count += 1;
+    }
+    b
+}
+
 /// OPK-encode native PK column values (one per PK column, in PK-list order) into
 /// the canonical order-preserving key — the exact bytes the ingest path
 /// produces. Signed columns are passed as `v as u128` (the low `size()`
@@ -282,7 +303,7 @@ pub fn scratch_table(dir: &str, schema: SchemaDescriptor, table_id: u32) -> Tabl
 /// U128 pk + a single I64 payload column — the 16-byte-PK sibling of
 /// [`make_schema_u64_i64`].
 pub fn make_schema_u128_i64() -> SchemaDescriptor {
-    pk_i64_schema(type_code::U128)
+    pk_payload_schema(&[type_code::U128])
 }
 
 /// The batch as the Z-Set it denotes: `Σ weight` per logical row identity, with

@@ -15,9 +15,8 @@ impl RelationRegistry {
     /// store is opened, so the catalog (from a TABLE_TAB / VIEW_TAB row) and a
     /// mirror (from its own record) cannot drift on any of them.
     ///
-    /// Creates `directory` and its parent when the kind owns a store, removes
-    /// again exactly what it created if the open then fails, and fsyncs the
-    /// parent when the `mkdir` was new.
+    /// Opens through [`staged_dir`], so a directory this call creates is removed
+    /// again if the open fails and has its parent fsynced if it succeeds.
     pub fn register(&mut self, spec: RelationSpec) -> Result<(), String> {
         let RelationSpec {
             id,
@@ -27,18 +26,9 @@ impl RelationRegistry {
             depth,
             budgets,
         } = spec;
-        // Only a `mkdir` this call made needs the parent fsynced, so the probe
-        // has to run before the build does.
-        let created = !std::path::Path::new(&directory).exists();
         let stores = staged_dir(&directory, || {
             self.build_relation_store(kind, &directory, id, schema, budgets)
         })?;
-        // A reopen adds no entry, and a storeless kind creates no directory.
-        if created && kind.owns_store() {
-            if let Some(parent) = directory.rsplit_once('/').map(|(p, _)| p) {
-                let _ = crate::storage::fsync_dir(parent);
-            }
-        }
         self.tables
             .insert(id, TableEntry::new(stores, schema, kind, depth, directory, budgets));
         Ok(())
@@ -61,8 +51,8 @@ impl RelationRegistry {
     /// here, so a feed cannot come back missing from a rehome or a rebuild — the
     /// same reason the capacity is stamped here.
     ///
-    /// Creates `directory` when the kind owns a store. Crash-cleanup of it is the
-    /// caller's: only the caller knows whether *this* call is what created it.
+    /// Creates `directory` when the kind owns a store; [`staged_dir`] is what
+    /// makes that creation crash-safe.
     pub(crate) fn build_relation_store(
         &self,
         kind: RelationKind,

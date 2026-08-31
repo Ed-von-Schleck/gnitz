@@ -198,7 +198,7 @@ mod checkpoint_finalize_tests {
             drop(engine);
         }
 
-        let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+        let engine = CatalogEngine::open(&dir, 1).unwrap();
         assert_eq!(
             engine.user_sequence(user_seq),
             Some(64),

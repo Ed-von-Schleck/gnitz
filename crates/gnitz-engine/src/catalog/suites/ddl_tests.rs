@@ -49,7 +49,6 @@ fn test_bootstrap() {
     let tables_before = count_records(engine.sys_store_mut(SysFamily::Table));
 
     engine.close();
-    drop(engine); // Release WAL locks before re-open
 
     // Idempotent re-open: bootstrap must not duplicate records
     let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
@@ -70,7 +69,7 @@ fn test_bootstrap() {
 #[test]
 fn bootstrap_self_description_matches_the_wire_column_lists() {
     let dir = temp_dir("bootstrap_self_description");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Every live COL_TAB row, grouped by the table it describes.
     let mut described: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
@@ -367,7 +366,6 @@ fn test_restart_long_strings() {
         let cols = vec![col_def("id", type_code::U64), col_def(long_name, type_code::STRING)];
         engine.create_table("longtest.tbl", &cols, &[0]).unwrap();
         engine.close();
-        drop(engine);
     }
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -826,9 +824,8 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     assert_stamps(&engine, "live CREATE");
 
     engine.close();
-    drop(engine); // release locks before re-open
 
-    let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
+    let engine2 = CatalogEngine::open(&dir, 1).unwrap();
     assert_stamps(&engine2, "after replay");
     engine2.close();
 

@@ -20,7 +20,7 @@ fn sblock(sd: &SchemaDescriptor, target_id: u64) -> Vec<u8> {
 
 /// The narrow frame schema every fixture here uses: `(u64 pk, u64 val)`.
 fn simple_schema() -> SchemaDescriptor {
-    u64_pk_schema(type_code::U64)
+    u64_pk_schema(SchemaColumn::new(type_code::U64, 0))
 }
 
 /// U64 pk, a U64 payload and a STRING payload.
