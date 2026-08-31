@@ -5,7 +5,48 @@
 //! uses them: a ring is a `runtime` shape, and a helper that crosses no crate
 //! boundary should not sit on one's published surface.
 
-use crate::runtime::sal::{EpochGate, SalLog, SalMessage, SalStep};
+impl crate::runtime::wire::WireMsg<'_> {
+    /// Encode into a fresh `Vec` sized by `WireMsg::size`.
+    pub(crate) fn encode_to_vec(&self) -> Vec<u8> {
+        let mut buf = vec![0u8; self.size()];
+        self.encode(&mut buf, 0);
+        buf
+    }
+}
+
+/// Reap `pid` and require a clean exit. A forked child that panics unwinds into
+/// a copy of the test harness whose main thread no longer exists, so without
+/// this the parent's own assertions are the only thing standing between a
+/// broken child and a green test.
+pub(crate) unsafe fn assert_child_exited_ok(pid: libc::pid_t) {
+    let mut status = 0i32;
+    while libc::waitpid(pid, &mut status, 0) < 0 {
+        assert_eq!(*libc::__errno_location(), libc::EINTR, "waitpid failed on child {pid}");
+    }
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "child {pid} did not exit cleanly (status {status:#x})"
+    );
+}
+
+/// Decode a continuation frame — data, no schema block — the way the master's
+/// reply-train reader does: the zero-copy decoder, fed the frame's own control
+/// block and a caller-held region-offset array. Only tests compose the two
+/// halves; production splits them because the caller needs the control block in
+/// between.
+pub(crate) fn decode_continuation<'a>(
+    bytes: &'a [u8],
+    schema: &gnitz_store::schema::SchemaDescriptor,
+    version: u16,
+    offsets: &'a mut [usize; gnitz_store::storage::MAX_BATCH_REGIONS],
+) -> Result<crate::runtime::wire::DecodedWireZeroCopy<'a>, &'static str> {
+    let ctrl = gnitz_wire::control::peek_control_block_ipc(bytes)?;
+    let hint = crate::runtime::wire::SchemaWithVersion {
+        descriptor: schema,
+        version,
+    };
+    crate::runtime::wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, Some(hint), offsets)
+}
 
 /// Poll a future exactly once with a noop waker; `None` if it is still pending.
 /// For the tests that assert what a *single* poll does and then discard the
@@ -17,14 +58,6 @@ pub(crate) fn try_poll_once<T>(fut: impl std::future::Future<Output = T>) -> Opt
     match fut.as_mut().poll(&mut cx) {
         Poll::Ready(r) => Some(r),
         Poll::Pending => None,
-    }
-}
-
-/// The group published at `base`, walked at the log's current epoch.
-pub(crate) fn group_at(log: SalLog, base: u64) -> SalMessage {
-    match log.read_at(base, EpochGate::Walk(log.walk_epoch())) {
-        SalStep::Group(msg, _) => msg,
-        _ => panic!("a group is published at offset {base}"),
     }
 }
 

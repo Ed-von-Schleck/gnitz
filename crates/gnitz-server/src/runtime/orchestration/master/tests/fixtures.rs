@@ -41,7 +41,7 @@ pub(super) fn test_dispatcher(worker_pids: Vec<i32>, catalog: *mut CatalogEngine
     const SAL_SIZE: usize = 4096;
     let nw = worker_pids.len();
     let rings = (0..nw)
-        .map(|_| unsafe { crate::runtime::w2m::test_ring(RING_CAP) }.leak())
+        .map(|_| unsafe { crate::runtime::w2m::fixtures::test_ring(RING_CAP) }.leak())
         .collect();
     // A real SAL page: `rewind`/`checkpoint_reset` store through the base
     // pointer, so it must not be null.

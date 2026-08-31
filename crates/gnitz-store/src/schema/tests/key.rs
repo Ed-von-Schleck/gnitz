@@ -1,5 +1,6 @@
 use super::*;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use crate::schema::{make_index_schema, type_code, IndexKeySpec, SchemaColumn, SchemaDescriptor};
+use crate::storage::BatchBuilder;
 use crate::test_support::pk_only_schema;
 use gnitz_wire::{read_signed_exact, read_unsigned_exact};
 
@@ -488,6 +489,150 @@ fn pkbuf_wide_differs_past_byte_16() {
     let mut set = std::collections::HashSet::new();
     set.insert(px);
     assert!(!set.contains(&py));
+}
+
+/// `PkBuf` byte order is a valid merge order: byte-lexicographic comparison of
+/// the OPK spans equals the order the worker sorts and the master's heap pops,
+/// at any width. A composite span sorts by its leading column, then trailing.
+#[test]
+fn pkbuf_byte_order_is_lexicographic() {
+    let span = |a: u64, b: u64| {
+        let mut buf = [0u8; 16];
+        buf[..8].copy_from_slice(&a.to_be_bytes());
+        buf[8..].copy_from_slice(&b.to_be_bytes());
+        PkBuf::from_bytes(&buf)
+    };
+    let mut v = vec![span(2, 0), span(1, 9), span(1, 1), span(2, 0)];
+    v.sort_unstable();
+    assert_eq!(
+        v,
+        vec![span(1, 1), span(1, 9), span(2, 0), span(2, 0)],
+        "sort is by leading column then trailing — byte-lexicographic"
+    );
+    // A narrower span sorts before a wider one sharing its prefix (memcmp over
+    // bytes[..len]).
+    assert!(PkBuf::from_bytes(&[1u8, 2]) < PkBuf::from_bytes(&[1u8, 2, 0]));
+}
+
+/// A row NULL in ANY indexed column is skipped (`key_bytes` → false) —
+/// SQL NULL-distinctness, mirroring `batch_project_index`.
+#[test]
+fn index_key_spec_skips_any_null_column() {
+    let owner = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 1), // a: nullable payload
+            SchemaColumn::new(type_code::U64, 1), // b: nullable payload
+        ],
+        &[0],
+    );
+    let cols = [1u32, 2];
+    let idx_schema = make_index_schema(&cols, &owner).unwrap();
+    // (id, a, b): both present, a NULL, b NULL.
+    let rows: [(u128, Option<u128>, Option<u128>); 3] = [
+        (1, Some(5), Some(6)), // both present → indexed
+        (2, None, Some(6)),    // a NULL → skipped
+        (3, Some(5), None),    // b NULL → skipped
+    ];
+    let mut bb = BatchBuilder::new(owner);
+    for &(id, a, b) in &rows {
+        bb.begin_row(id, 1);
+        for cell in [a, b] {
+            match cell {
+                Some(v) => bb.put_int(v),
+                None => bb.put_null(),
+            }
+        }
+        bb.end_row();
+    }
+    let batch = bb.finish();
+    let spec = IndexKeySpec::new(&cols, &owner, &idx_schema);
+    let mb = batch.as_mem_batch();
+    let mut keybuf = PkBuf::zeroed(0);
+    assert!(spec.key_bytes(&mb, 0, &mut keybuf), "both columns present ⇒ indexed");
+    assert!(
+        !spec.key_bytes(&mb, 1, &mut keybuf),
+        "NULL in the first indexed column ⇒ skipped"
+    );
+    assert!(
+        !spec.key_bytes(&mb, 2, &mut keybuf),
+        "NULL in the second indexed column ⇒ skipped"
+    );
+}
+
+/// `key_bytes` reuses the caller's `PkBuf` scratch across specs of DIFFERENT
+/// widths. When a NARROWER span (single U64 → 8 bytes) reuses a buffer that a
+/// WIDER span (composite U64,U64 → 16 bytes) just filled, the high bytes the
+/// wide write left in `bytes[8..16]` MUST be re-zeroed: `PkBuf`'s "tail past
+/// `len` is zero" invariant is what makes `padded(width)` sound and what lets
+/// the single-PK fast path widen `bytes[..len]` to a `u128`. A stale tail would
+/// silently corrupt any wider-stride read of this narrowed key.
+#[test]
+fn key_bytes_reused_buffer_zeros_tail_when_narrowing() {
+    // Owner: PK U64; two non-null U64 payload columns.
+    let owner = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U64, 0),
+        ],
+        &[0],
+    );
+    // One row whose col2 carries distinct all-nonzero high bytes, so the wide
+    // span writes nonzero bytes into the trailing 8 bytes the narrow span must
+    // then reclaim. col1 is arbitrary (it never lands in the narrow span).
+    const COL1: u64 = 0xAABB_CCDD_EEFF_0011;
+    const COL2: u64 = 0x1122_3344_5566_7788;
+    let mut bb = BatchBuilder::new(owner);
+    bb.begin_row(1, 1);
+    bb.put_int(COL1 as u128);
+    bb.put_int(COL2 as u128);
+    bb.end_row();
+    let batch = bb.finish();
+    let mb = batch.as_mem_batch();
+
+    // WIDE composite span over (col1, col2): two promoted U64 columns ⇒ 16 bytes.
+    let wide_cols = [1u32, 2];
+    let wide_idx = make_index_schema(&wide_cols, &owner).expect("wide index schema");
+    let wide = IndexKeySpec::new(&wide_cols, &owner, &wide_idx);
+    assert_eq!(wide.key_size(), 16, "two U64 index columns ⇒ 16-byte span");
+
+    // NARROW span over (col2) alone: one promoted U64 column ⇒ 8 bytes.
+    let narrow_cols = [2u32];
+    let narrow_idx = make_index_schema(&narrow_cols, &owner).expect("narrow index schema");
+    let narrow = IndexKeySpec::new(&narrow_cols, &owner, &narrow_idx);
+    assert_eq!(narrow.key_size(), 8, "single U64 index column ⇒ 8-byte span");
+
+    // ONE reused scratch buffer: wide first, then narrow.
+    let mut keybuf = PkBuf::zeroed(0);
+
+    assert!(wide.key_bytes(&mb, 0, &mut keybuf), "wide row is indexed");
+    assert_eq!(keybuf.pk_bytes().len(), 16);
+    // The wide write dirtied the trailing 8 bytes with col2's big-endian image —
+    // the precondition that gives the narrowing tail-zero step teeth.
+    assert_eq!(
+        &keybuf.pk_bytes()[8..16],
+        &COL2.to_be_bytes(),
+        "wide span packs col2 into bytes[8..16]"
+    );
+
+    assert!(narrow.key_bytes(&mb, 0, &mut keybuf), "narrow row is indexed");
+    // The narrow span is col2's 8-byte OPK, and ONLY 8 bytes are meaningful.
+    assert_eq!(keybuf.pk_bytes().len(), 8, "narrow span is one U64 ⇒ len == 8");
+    assert_eq!(
+        keybuf.pk_bytes(),
+        &COL2.to_be_bytes(),
+        "narrow span content is col2's big-endian OPK"
+    );
+    // The invariant under test: the tail the wider write left MUST be re-zeroed.
+    // The wide write above dirtied exactly `[0, 16)`, so that span is all a
+    // narrowing could leak.
+    // `padded(16)` is exactly 16 bytes, so this is also the statement that a
+    // narrow key widened to a 16-byte stride has a zero suffix.
+    assert!(
+        keybuf.padded(16)[8..].iter().all(|&b| b == 0),
+        "narrowing must re-zero every byte past len — stale wide-write tail leaked"
+    );
 }
 
 // =======================================================================

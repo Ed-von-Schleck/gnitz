@@ -96,7 +96,7 @@ impl UniqueFilter {
 
     /// Distinct spans tracked — zero once capped.
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.values.as_ref().map_or(0, |values| values.len())
     }
 }

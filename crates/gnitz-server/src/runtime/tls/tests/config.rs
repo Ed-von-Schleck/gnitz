@@ -5,6 +5,11 @@ use std::io::Write;
 fn dev_cert_mint_builds_server_config() {
     let (cfg, dev_pem) = server_crypto(None, None).expect("dev-cert mint must succeed");
     assert_eq!(cfg.alpn_protocols, vec![ALPN_GNITZ.to_vec()]);
+    // 0-RTT stays off: replayable early data would be replayable DML once an
+    // auth layer grants authority. `gnitz-core`'s transport tests assert the
+    // client-side mirror.
+    assert_eq!(cfg.max_early_data_size, 0, "0-RTT early data must be disabled");
+    assert_eq!(cfg.send_tls13_tickets, 0, "and no resumption ticket is issued");
     let pem = dev_pem.expect("mint path must return the public PEM");
     assert!(pem.contains("BEGIN CERTIFICATE"));
     assert!(
@@ -37,11 +42,6 @@ fn pem_cert_key_roundtrip_through_file_loading() {
 }
 
 #[test]
-fn bad_pem_paths_error_cleanly() {
-    assert!(server_crypto(Some(("/nonexistent/cert.pem", "/nonexistent/key.pem")), None).is_err());
-}
-
-#[test]
 fn client_ca_builds_required_mtls_config() {
     // Mint a CA cert, write its public PEM, and feed it as the client CA:
     // the dev server cert is minted, mTLS verification is enabled.
@@ -62,18 +62,7 @@ fn client_ca_builds_required_mtls_config() {
 }
 
 #[test]
-fn bad_client_ca_path_errors_cleanly() {
+fn missing_pem_paths_error_cleanly() {
+    assert!(server_crypto(Some(("/nonexistent/cert.pem", "/nonexistent/key.pem")), None).is_err());
     assert!(server_crypto(None, Some("/nonexistent/ca.pem")).is_err());
-}
-
-#[test]
-fn zero_rtt_stays_locked_off_server_side() {
-    // 0-RTT lock (server side): no ticketer is installed and
-    // send_tls13_tickets = 0, so early data must stay off. Replayable
-    // early data would be replayable DML once an auth layer grants
-    // authority. The client-side `enable_early_data == false` mirror is
-    // asserted by `client_config_leaves_zero_rtt_off` in gnitz-core's
-    // `protocol::transport::tls` tests.
-    let (cfg, _) = server_crypto(None, None).unwrap();
-    assert_eq!(cfg.max_early_data_size, 0, "0-RTT early data must be disabled");
 }

@@ -126,7 +126,7 @@ fn flag_exchange_frames_queue_without_resolving_their_tick_id() {
 ///
 /// It says nothing about ordering, and cannot: `join_all_unpin` returns results
 /// in *input* order, so `received` is sorted by construction. Ring order is
-/// tested in `runtime/suites/w2m.rs`.
+/// tested by the concurrent publish/drain suite in `w2m`'s own tests.
 #[test]
 fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
     use crate::runtime::w2m::{W2mReceiver, W2mWriter};
@@ -135,7 +135,7 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
     const N_MESSAGES: u64 = 500;
     const TIMEOUT: Duration = Duration::from_secs(30);
 
-    let region = unsafe { crate::runtime::w2m::test_ring(64 * 1024) };
+    let region = unsafe { crate::runtime::w2m::fixtures::test_ring(64 * 1024) };
     let ptr = region.ptr();
 
     let pid = unsafe { libc::fork() };
@@ -157,11 +157,16 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
     // what the child publishes.
     let lease = reactor.alloc_replies(N_MESSAGES as usize);
     let reply_futs: Vec<_> = lease.iter().map(|&i| reactor.await_reply(i)).collect();
+    // A oneshot rather than a polling watcher: a watcher that yields re-arms
+    // its own waker every poll, so the run queue never empties and the
+    // `FUTEX_WAITV` arm this test exists to stress never happens.
+    let (done_tx, done_rx) = oneshot::channel::<()>();
     {
         let received = Rc::clone(&received);
         reactor.spawn(async move {
             let replies = join_all_unpin(reply_futs).await;
             *received.borrow_mut() = replies.into_iter().map(|r| r.control.request_id).collect();
+            done_tx.send(());
         });
     }
     // One tick polls the spawned task, which walks join_all_unpin and registers
@@ -170,16 +175,8 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
 
     reactor.attach_w2m(Rc::new(W2mReceiver::new(vec![ptr])));
 
-    let received_check = Rc::clone(&received);
     let timeout = reactor.timer(Instant::now() + TIMEOUT);
-    let outcome = reactor.block_on(async move {
-        let watch = async move {
-            while received_check.borrow().is_empty() {
-                YieldOnce::new().await;
-            }
-        };
-        select2(watch, timeout).await
-    });
+    let outcome = reactor.block_on(select2(done_rx, timeout));
     if let Either::B(()) = outcome {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         panic!(
@@ -194,8 +191,7 @@ fn w2m_cross_process_stress_drains_all_messages_via_reactor() {
         "every published req_id must round-trip"
     );
 
-    let mut status: i32 = 0;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
+    unsafe { crate::runtime::test_support::assert_child_exited_ok(pid) };
 
     // AsyncCancel the in-flight FUTEX_WAITV before the storage drops.
     reactor.request_shutdown();
@@ -210,7 +206,7 @@ fn arm_waitv_refuses_while_data_is_unread() {
     use crate::runtime::w2m::{W2mReceiver, W2mWriter};
     use gnitz_wire::STATUS_OK;
 
-    let region = unsafe { crate::runtime::w2m::test_ring(64 * 1024) };
+    let region = unsafe { crate::runtime::w2m::fixtures::test_ring(64 * 1024) };
     let ptr = region.ptr();
     W2mWriter::new(ptr).send_status(0, 1u64, STATUS_OK, &[]);
 

@@ -11,12 +11,18 @@ use crate::runtime::test_support::try_poll_once;
 fn assert_refused(cap: usize, max_payload: Option<usize>, wire: &[u8], why: &str) {
     unsafe {
         let (read_fd, write_fd) = stream_pair();
-        let r = make_reactor();
+        let r = Reactor::new(
+            16,
+            Limits {
+                inbound_cap: cap,
+                ..Limits::TEST
+            },
+        )
+        .expect("reactor");
         r.register_conn(read_fd);
         if let Some(limit) = max_payload {
             r.set_max_payload_len(read_fd, limit);
         }
-        r.inbound().set_cap(cap);
         gnitz_store::foundation::posix_io::write_all_fd(write_fd, wire).expect("write");
 
         assert!(
@@ -74,11 +80,17 @@ fn inbound_frames_are_refused_at_the_header() {
 fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
     unsafe {
         let (read_fd, write_fd) = stream_pair();
-        let r = make_reactor();
+        // Exactly one 10_000-byte in-flight buffer fits.
+        let r = Reactor::new(
+            16,
+            Limits {
+                inbound_cap: 10_000,
+                ..Limits::TEST
+            },
+        )
+        .expect("reactor");
         r.register_conn(read_fd);
         r.set_max_payload_len(read_fd, 1 << 20);
-        // Exactly one 10_000-byte in-flight buffer fits.
-        r.inbound().set_cap(10_000);
 
         // Header claims 10_000 bytes but only 100 are delivered: the buffer
         // is malloc'd and counted, yet no frame completes (no MessageDone).
@@ -117,13 +129,21 @@ fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
 #[test]
 fn inbound_cap_accounting_balances_on_consume() {
     let (read_fd, write_fd) = unsafe { stream_pair() };
-    let r = Rc::new(make_reactor());
-    r.register_conn(read_fd);
-    r.set_max_payload_len(read_fd, 1 << 20);
     // Cap admits several frames; the pipeline holds ~1 at a time because
     // each frame is popped in the same tick it lands, so 10 frames/round of
     // 1_000-weight traffic (10_000 > cap) never trips.
-    r.inbound().set_cap(5_000);
+    let r = Rc::new(
+        Reactor::new(
+            16,
+            Limits {
+                inbound_cap: 5_000,
+                ..Limits::TEST
+            },
+        )
+        .expect("reactor"),
+    );
+    r.register_conn(read_fd);
+    r.set_max_payload_len(read_fd, 1 << 20);
 
     let payload = vec![0x7Eu8; 1_000]; // frame_weight = 1_000
     for _round in 0..2 {

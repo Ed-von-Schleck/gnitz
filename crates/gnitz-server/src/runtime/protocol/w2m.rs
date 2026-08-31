@@ -1060,59 +1060,12 @@ impl W2mReceiver {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test fixtures — module level, so every `runtime` descendant's tests reach them
-// ---------------------------------------------------------------------------
-
-/// A `capacity`-byte ring, mapped and initialized.
-///
-/// # Safety
-/// The caller must keep the returned region alive for as long as anything reads
-/// or writes the ring.
+/// The ring fixture, shared by `w2m`'s own suites and by the `runtime` tests
+/// that need a live ring. A child of `w2m`, so `init_region` and the cursor
+/// primitives stay private to it.
 #[cfg(test)]
-pub(crate) unsafe fn test_ring(capacity: usize) -> crate::runtime::test_support::SharedRegion {
-    let region = crate::runtime::test_support::SharedRegion::new(capacity);
-    init_region(region.ptr(), capacity as u64);
-    region
-}
-
-/// A ring holding `n_msgs` messages of `msg_sz` bytes plus `slack` spare bytes.
-/// `slack` is what the wrap and backpressure tests differ in: it decides whether
-/// one more message fits before the physical end.
-///
-/// # Safety
-/// As [`test_ring`].
-#[cfg(test)]
-pub(crate) unsafe fn make_ring(msg_sz: usize, n_msgs: usize, slack: u64) -> crate::runtime::test_support::SharedRegion {
-    let capacity = W2M_HEADER_SIZE as u64 + n_msgs as u64 * (8 + align8(msg_sz) as u64) + slack;
-    test_ring(capacity as usize)
-}
-
-/// Publish one message directly, without `W2mWriter`'s park loop. Returns the
-/// new write cursor and whether the publish SKIP-wrapped — a wrap is exactly a
-/// cursor advance longer than the message. `None` when the ring is full.
-///
-/// # Safety
-/// `base` must be a live ring from [`test_ring`], and the caller must be its
-/// sole producer.
-#[cfg(test)]
-pub(crate) unsafe fn publish(
-    base: *mut u8,
-    sz: usize,
-    internal_req_id: u32,
-    encode: impl FnOnce(&mut [u8]),
-) -> Option<(u64, bool)> {
-    let mut wc = RingCursor::producer(base);
-    let before = wc.virt;
-    let mut reservation = try_reserve(&wc, sz, internal_req_id)?;
-    encode(reservation.slot());
-    commit(&mut wc, reservation);
-    Some((wc.virt, wc.virt - before != (8 + align8(sz)) as u64))
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+#[path = "tests/w2m_fixtures.rs"]
+pub(crate) mod fixtures;
 
 #[cfg(test)]
 #[path = "tests/w2m.rs"]

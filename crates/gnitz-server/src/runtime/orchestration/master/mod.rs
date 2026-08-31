@@ -182,8 +182,6 @@ mod train;
 mod unique_filter;
 
 pub(crate) use dispatch::scan_spec_route;
-#[cfg(test)]
-pub(crate) use preflight::PreflightAccumulator;
 pub(crate) use preflight::TxnFamily;
 use train::{drain_index_scan, expect_single_frame, forward_scan_slots, parse_train_header, scan_decode_err};
 pub(crate) use unique_filter::UniqueFilter;

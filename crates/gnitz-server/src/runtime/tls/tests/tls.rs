@@ -9,6 +9,7 @@
 //! into the server session and drained through `ingest_cipher`.
 
 use super::*;
+use crate::runtime::test_support::try_poll_once;
 
 /// Handshake an in-memory client/server pair (dev-cert server config). The
 /// client verifies for real against the minted dev certificate's public
@@ -90,8 +91,13 @@ fn encrypt_frames(client: &mut rustls::ClientConnection, frames: &[&[u8]]) -> Ve
     out
 }
 
-fn frame_payloads(conn: &TlsConn) -> Vec<Vec<u8>> {
-    conn.q.queued_payloads()
+/// Every frame the conn will hand a reader, drained the way `recv()` does.
+fn frame_payloads(conn: &mut TlsConn) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    while let Some(Some(buf)) = try_poll_once(std::future::poll_fn(|cx| conn.q.poll_recv(cx))) {
+        out.push(buf.as_slice().to_vec());
+    }
+    out
 }
 
 #[test]
@@ -105,7 +111,7 @@ fn pipelined_frames_deframe_in_order() {
     let cipher = encrypt_frames(&mut client, &[&f1, &f2, &f3]);
     conn.ingest_cipher(&cipher, -1).unwrap();
 
-    assert_eq!(frame_payloads(&conn), vec![f1, f2, f3]);
+    assert_eq!(frame_payloads(&mut conn), vec![f1, f2, f3]);
 }
 
 #[test]
@@ -120,5 +126,5 @@ fn split_ciphertext_delivery_reassembles() {
     for chunk in cipher.chunks(1_313) {
         conn.ingest_cipher(chunk, -1).unwrap();
     }
-    assert_eq!(frame_payloads(&conn), vec![payload]);
+    assert_eq!(frame_payloads(&mut conn), vec![payload]);
 }

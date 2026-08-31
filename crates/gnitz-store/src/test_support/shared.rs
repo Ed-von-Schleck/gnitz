@@ -133,10 +133,16 @@ pub const CHILD_OK: &str = "the child ran every assertion";
 /// [`in_child_test`], so a normal test sweep skips it.
 ///
 /// `--exact`, so the filter cannot also pick up a sibling whose name contains
-/// this one.
-pub fn run_test_in_child(internal_test: &str, envs: &[(&str, &str)]) -> std::process::Output {
+/// this one. Pass the caller's `module_path!()` as `module`: libtest's filter
+/// path is the module path minus the crate segment, so deriving it here keeps
+/// the filter right when a test module moves.
+pub fn run_test_in_child(module: &str, internal_test: &str, envs: &[(&str, &str)]) -> std::process::Output {
+    let filter = match module.split_once("::") {
+        Some((_krate, path)) => format!("{path}::{internal_test}"),
+        None => internal_test.to_string(),
+    };
     let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-    cmd.arg("--exact").arg(internal_test).arg("--nocapture");
+    cmd.arg("--exact").arg(&filter).arg("--nocapture");
     cmd.env(CHILD_TEST_VAR, "1");
     for (k, v) in envs {
         cmd.env(k, v);

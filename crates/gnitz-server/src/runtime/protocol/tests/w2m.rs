@@ -1,5 +1,32 @@
+use super::fixtures::make_ring;
 use super::*;
-use crate::runtime::test_support::SharedRegion;
+use crate::runtime::test_support::{assert_child_exited_ok, SharedRegion};
+use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
+use gnitz_wire::STATUS_OK;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Publish one message directly, without `W2mWriter`'s park loop. Returns the
+/// new write cursor and whether the publish SKIP-wrapped — a wrap is exactly a
+/// cursor advance longer than the message. `None` when the ring is full.
+///
+/// # Safety
+/// `base` must be a live ring from [`test_ring`], and the caller must be its
+/// sole producer.
+unsafe fn publish(
+    base: *mut u8,
+    sz: usize,
+    internal_req_id: u32,
+    encode: impl FnOnce(&mut [u8]),
+) -> Option<(u64, bool)> {
+    let mut wc = RingCursor::producer(base);
+    let before = wc.virt;
+    let mut reservation = try_reserve(&wc, sz, internal_req_id)?;
+    encode(reservation.slot());
+    commit(&mut wc, reservation);
+    Some((wc.virt, wc.virt - before != (8 + align8(sz)) as u64))
+}
 
 // -- futex primitives ----------------------------------------------------
 
@@ -7,7 +34,7 @@ use crate::runtime::test_support::SharedRegion;
 /// to a different key in each process, so the child's wake would never
 /// arrive — which no in-process test can catch.
 #[test]
-fn test_cross_process_futex_on_mapshared() {
+fn a_shared_futex_wake_crosses_a_process_boundary() {
     let region = SharedRegion::new(4096);
     let atomic_ptr = region.ptr() as *mut AtomicU32;
     unsafe {
@@ -33,8 +60,7 @@ fn test_cross_process_futex_on_mapshared() {
     let final_val = unsafe { (*atomic_ptr).load(Ordering::Acquire) };
     assert_eq!(final_val, 8);
 
-    let mut status: i32 = 0;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
+    unsafe { assert_child_exited_ok(pid) };
 }
 
 /// The raw multi-word wrapper: a value mismatch fast-returns, no wake times
@@ -42,7 +68,7 @@ fn test_cross_process_futex_on_mapshared() {
 /// timeout case bounds wall-clock only from below — an upper bound would be
 /// asserting the machine is idle.
 #[test]
-fn test_futex_waitv_u32_wakes_on_any_word() {
+fn futex_waitv_wakes_on_any_word() {
     use std::time::Instant;
     let region = SharedRegion::new(4096);
     let ptr = region.ptr();
@@ -58,14 +84,14 @@ fn test_futex_waitv_u32_wakes_on_any_word() {
     assert_eq!(rc, Parked::Retry, "value mismatch must fast-return");
 
     let t = Instant::now();
-    let rc = futex_waitv_u32(&[word(w0, 0), word(w1, 0)], 200);
+    let rc = futex_waitv_u32(&[word(w0, 0), word(w1, 0)], 20);
     assert_eq!(rc, Parked::TimedOut, "no wake must time out");
-    assert!(t.elapsed().as_millis() >= 150, "timed out before the deadline");
+    assert!(t.elapsed().as_millis() >= 15, "timed out before the deadline");
 
     let pid = unsafe { libc::fork() }; // wake on the NON-FIRST word
     if pid == 0 {
         unsafe {
-            libc::usleep(50_000);
+            libc::usleep(5_000);
             (*w1).fetch_add(1, Ordering::Release);
         }
         futex_wake_u32(w1, 1, "test child");
@@ -73,10 +99,7 @@ fn test_futex_waitv_u32_wakes_on_any_word() {
     }
     let rc = futex_waitv_u32(&[word(w0, 0), word(w1, 0)], 5000);
     assert_eq!(rc, Parked::Retry, "a wake on the non-first word must not time out");
-    unsafe {
-        let mut s = 0;
-        libc::waitpid(pid, &mut s, 0);
-    }
+    unsafe { assert_child_exited_ok(pid) };
 }
 
 // -- ring layout ---------------------------------------------------------
@@ -94,7 +117,7 @@ unsafe fn consume_one(recv: &W2mReceiver) -> Option<&'static [u8]> {
 /// Round-trip: publish one message, consume it, verify contents and cursor
 /// advance.
 #[test]
-fn test_w2m_ring_round_trip() {
+fn a_published_message_round_trips_in_place() {
     unsafe {
         let region = make_ring(128, 4, 8);
         let ptr = region.ptr();
@@ -109,36 +132,20 @@ fn test_w2m_ring_round_trip() {
 
         let data = consume_one(&recv).expect("message must be visible");
         assert_eq!(data, &payload);
+        assert_eq!(
+            data.as_ptr(),
+            ptr.add(W2M_HEADER_SIZE + 8) as *const u8,
+            "the payload must be mmap-resident — decode_wire reads it in place"
+        );
         assert_eq!(recv.read_cursor(0), new_wc);
         assert!(consume_one(&recv).is_none(), "ring must now read empty");
-    }
-}
-
-/// Three back-to-back publishes decode in FIFO order.
-#[test]
-fn test_w2m_ring_multiple_messages() {
-    unsafe {
-        let region = make_ring(64, 4, 8);
-        let ptr = region.ptr();
-        let recv = W2mReceiver::new(vec![ptr]);
-
-        for tag in 0u8..3 {
-            publish(ptr, 64, 0, |slot| slot.fill(tag + 1)).expect("unexpected Full");
-        }
-
-        for tag in 0u8..3 {
-            let data = consume_one(&recv).expect("message must be visible");
-            assert_eq!(data.len(), 64);
-            assert!(data.iter().all(|&b| b == tag + 1));
-        }
-        assert!(consume_one(&recv).is_none());
     }
 }
 
 /// A SKIP-wrap with the reader still behind: room for 3 messages + 16 bytes
 /// of slack, the reader lagging by exactly one.
 #[test]
-fn test_w2m_skip_marker_strict_wrap() {
+fn a_skip_marker_wraps_strictly() {
     unsafe {
         let big_sz = 1 << 16; // 64 KiB
         let region = make_ring(big_sz, 3, 16);
@@ -171,7 +178,7 @@ fn test_w2m_skip_marker_strict_wrap() {
 /// A message that ends exactly at `capacity` publishes contiguously: the
 /// next write position is the header, with no marker needed.
 #[test]
-fn test_w2m_exact_fit_publishes_contiguously() {
+fn an_exact_fit_publishes_contiguously() {
     unsafe {
         let msg_sz = 1 << 12;
         const N: usize = 4;
@@ -193,7 +200,7 @@ fn test_w2m_exact_fit_publishes_contiguously() {
 /// With the ring exactly full and the reader at the head, the next publish
 /// is refused — backpressure, not a wrap over unread data.
 #[test]
-fn test_w2m_full_blocks_writer() {
+fn a_full_ring_blocks_the_writer() {
     unsafe {
         let msg_sz = 1 << 16; // 64 KiB
         let region = make_ring(msg_sz, 2, 8);
@@ -213,29 +220,10 @@ fn test_w2m_full_blocks_writer() {
 /// rather than reporting a full ring the caller would park on forever.
 #[test]
 #[should_panic(expected = "outside (0,")]
-fn test_w2m_oversized_publish_panics() {
+fn an_oversized_publish_panics() {
     unsafe {
         let region = make_ring(64, 4, 8);
         let _ = publish(region.ptr(), (MAX_W2M_MSG + 1) as usize, 0, |_| {});
-    }
-}
-
-/// The payload handed back points into the mmap region — zero-copy into
-/// `decode_wire`.
-#[test]
-fn test_w2m_decode_wire_zero_copy() {
-    unsafe {
-        let region = make_ring(256, 4, 8);
-        let ptr = region.ptr();
-        publish(ptr, 256, 0, |slot| slot.fill(0xCD)).expect("unexpected Full");
-
-        let recv = W2mReceiver::new(vec![ptr]);
-        let data = consume_one(&recv).expect("message must be visible");
-        assert_eq!(
-            data.as_ptr(),
-            ptr.add(W2M_HEADER_SIZE + 8) as *const u8,
-            "payload must be mmap-resident (zero copy)",
-        );
     }
 }
 
@@ -243,7 +231,7 @@ fn test_w2m_decode_wire_zero_copy() {
 /// not drained. Publish 4, consume 3, then publish 5..=9 — the sequence that
 /// let a physical-cursor predicate overwrite message #4.
 #[test]
-fn test_writer_does_not_cross_reader_after_wrap() {
+fn a_writer_never_crosses_the_reader_after_a_wrap() {
     unsafe {
         let msg_sz: usize = 64;
         let region = make_ring(msg_sz, 5, 16);
@@ -376,7 +364,7 @@ fn release_out_of_order() {
 
 /// Dropping a slot advances release_cursor and unparks a blocked writer.
 #[test]
-fn test_w2m_slot_writer_wakeup() {
+fn a_retired_slot_unparks_the_writer() {
     unsafe {
         let msg_sz = 64usize;
         // Ring holds exactly 1 message.
@@ -394,8 +382,10 @@ fn test_w2m_slot_writer_wakeup() {
             let _ = done_tx.send(());
         });
 
-        // Give the thread time to park on release_cursor.
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // The writer sets FLAG_WRITER_PARKED before it parks on release_cursor.
+        while receiver.header(0).writer_park.flags.load(Ordering::Acquire) & FLAG_WRITER_PARKED == 0 {
+            std::hint::spin_loop();
+        }
 
         let slot = receiver.try_read_slot(0).expect("slot");
         drop(slot);
@@ -413,13 +403,19 @@ fn test_w2m_slot_writer_wakeup() {
 /// before the ceiling. A narrower mask would not — which is why every caller
 /// passes its whole pending set.
 #[test]
-fn test_wait_any_woken_by_publish_on_other_ring() {
+fn wait_any_is_woken_by_a_publish_on_another_ring() {
     unsafe {
         let rings: Vec<SharedRegion> = (0..4).map(|_| make_ring(64, 4, 8)).collect();
         let receiver = W2mReceiver::new(rings.iter().map(|r| r.ptr()).collect());
         let pub_ptr = rings[3].ptr() as usize;
         let handle = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // `wait_any` sets FLAG_MASTER_SYNC on every ring in the mask before
+            // it parks, so this publishes into a parked master rather than
+            // racing one and degrading to the fast return.
+            let hdr = W2mRingHeader::from_raw(pub_ptr as *mut u8);
+            while hdr.master_park.flags.load(Ordering::Acquire) & FLAG_MASTER_SYNC == 0 {
+                std::hint::spin_loop();
+            }
             W2mWriter::new(pub_ptr as *mut u8).send_encoded(64, 0, |s| s[0] = 7);
         });
         let start = std::time::Instant::now();
@@ -436,18 +432,15 @@ fn test_wait_any_woken_by_publish_on_other_ring() {
 
 /// NEGATIVE: with no publisher, `wait_any` sleeps to the deadline.
 #[test]
-fn test_wait_any_times_out_with_no_publisher() {
+fn wait_any_times_out_with_no_publisher() {
     unsafe {
         let region = make_ring(64, 4, 8);
         let receiver = W2mReceiver::new(vec![region.ptr()]);
         let start = std::time::Instant::now();
-        let rc = receiver.wait_any(1, 200);
+        let rc = receiver.wait_any(1, 20);
         let elapsed = start.elapsed().as_millis();
         assert_eq!(rc, Parked::TimedOut, "no publisher → the park must time out");
-        assert!(
-            (150..1000).contains(&elapsed),
-            "wait_any should sleep ~200ms, slept {elapsed}ms"
-        );
+        assert!(elapsed >= 15, "wait_any must sleep to its deadline, slept {elapsed}ms");
     }
 }
 
@@ -458,7 +451,7 @@ fn wait_any_clears_its_park_flag() {
     unsafe {
         let region = make_ring(64, 4, 8);
         let receiver = W2mReceiver::new(vec![region.ptr()]);
-        receiver.wait_any(1, 50);
+        receiver.wait_any(1, 1);
         assert_eq!(
             receiver.header(0).master_park.flags.load(Ordering::Acquire) & FLAG_MASTER_SYNC,
             0,
@@ -504,7 +497,6 @@ fn publish_takes_the_master_gate() {
 #[test]
 #[ignore]
 fn w2m_publish_drain_bench() {
-    use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
     use std::hint::black_box;
     use std::time::Instant;
 
@@ -569,4 +561,102 @@ fn w2m_publish_drain_bench() {
         woke_master as f64 * 100.0 / N as f64,
         parks as f64 * 1000.0 / N as f64,
     );
+}
+
+// -- concurrent publish/drain --------------------------------------------
+
+/// One writer thread publishes `n` status frames carrying `pad` while the
+/// master drains the ring: every frame must arrive exactly once, in publish
+/// order, with its payload intact. The ring holds only `ring_frames` of them,
+/// so the run wraps it many times over.
+fn concurrent_publish_drains_in_order(case: &str, ring_frames: usize, n: u64, pad: &[u8]) {
+    let region = unsafe { make_ring(CTRL_BLOCK_SIZE_NO_BLOB + pad.len(), ring_frames, 8) };
+    let ptr = region.ptr();
+
+    let region_addr = ptr as usize;
+    let done = Arc::new(AtomicBool::new(false));
+    let done_w = Arc::clone(&done);
+    let pad_w = pad.to_vec();
+    let writer_thread = std::thread::spawn(move || {
+        let writer = W2mWriter::new(region_addr as *mut u8);
+        for req_id in 1..=n {
+            writer.send_status(0, req_id, STATUS_OK, &pad_w);
+        }
+        done_w.store(true, Ordering::Release);
+    });
+
+    let receiver = W2mReceiver::new(vec![ptr]);
+    let drain = || {
+        let mut next_expected: u64 = 1;
+        let started = Instant::now();
+        while next_expected <= n {
+            // Read `done` BEFORE the ring. Then an empty ring proves the loss:
+            // everything the writer published was already consumed. Reading it
+            // after would blame a frame the writer had not published yet.
+            let writer_done = done.load(Ordering::Acquire);
+            match receiver.try_read(0) {
+                Some(decoded) => {
+                    assert_eq!(
+                        decoded.control.request_id, next_expected,
+                        "{case}: frames arrived out of order at req_id={next_expected}"
+                    );
+                    assert_eq!(
+                        decoded.control.error_msg, pad,
+                        "{case}: payload corrupted at req_id={next_expected}"
+                    );
+                    next_expected += 1;
+                }
+                None if writer_done => panic!(
+                    "{case}: writer finished but only {}/{n} frames arrived",
+                    next_expected - 1
+                ),
+                None => {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(30),
+                        "{case}: timed out at req_id={next_expected}"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+        }
+    };
+
+    // The writer must stop touching the region before it is unmapped, and it
+    // parks when the ring fills — so on a failed drain, keep consuming until it
+    // finishes rather than unwinding straight into `join`.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(drain));
+    while !done.load(Ordering::Acquire) {
+        while receiver.try_read(0).is_some() {}
+        std::thread::yield_now();
+    }
+    writer_thread.join().expect("writer thread");
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
+fn w2m_concurrent_small_frames_arrive_in_order() {
+    concurrent_publish_drains_in_order("small frames", 8, 2_000, b"");
+}
+
+#[test]
+fn w2m_concurrent_large_frames_arrive_in_order() {
+    // A payload past the German-string inline threshold, so each frame also
+    // carries a blob region.
+    concurrent_publish_drains_in_order("large frames", 4, 500, &[b'x'; 4000]);
+}
+
+#[test]
+fn w2m_control_only_reply_has_no_backing() {
+    let region = unsafe { make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 2, 8) };
+    let ptr = region.ptr();
+
+    let writer = W2mWriter::new(ptr);
+    writer.send_status(0, 42, STATUS_OK, b"");
+
+    let receiver = W2mReceiver::new(vec![ptr]);
+    let decoded = receiver.try_read(0).expect("ACK must decode");
+    assert_eq!(decoded.control.request_id, 42);
+    assert!(decoded.data_batch.is_none(), "control-only ACK must have no data_batch");
 }

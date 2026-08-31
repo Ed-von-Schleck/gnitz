@@ -86,9 +86,4 @@ impl<T> WakeQueue<T> {
     pub(super) fn len(&self) -> usize {
         self.queue.len()
     }
-
-    #[cfg(test)]
-    pub(super) fn iter(&self) -> impl Iterator<Item = &T> {
-        self.queue.iter()
-    }
 }

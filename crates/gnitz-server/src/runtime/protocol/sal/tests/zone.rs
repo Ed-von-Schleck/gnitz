@@ -1,7 +1,7 @@
 use super::*;
 use crate::runtime::master::scatter::{with_commit_indices, with_group};
+use crate::runtime::sal::fixtures::{group_at, TestLog};
 use crate::runtime::sal::{group_header_size, GroupTargets};
-use crate::runtime::test_support::{group_at, SharedRegion};
 use crate::runtime::wire::WireMsg;
 use gnitz_engine_testkit::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 
@@ -16,74 +16,6 @@ fn committed_lsns(log: SalLog, kind: SalMessageKind, families: &HashMap<i64, u64
         v.sort_unstable();
         v
     })
-}
-
-/// A hand-built SAL: groups appended by a real `SalWriter`, so both the
-/// framing and the commit sentinels come from the production writer.
-struct Log {
-    ptr: *mut u8,
-    writer: SalWriter,
-}
-
-impl Log {
-    fn new(region: &SharedRegion, epoch: u32) -> Log {
-        let ptr = region.ptr();
-        let writer = SalWriter::new(ptr, -1, SIZE as u64, 1);
-        writer.reset(0, epoch);
-        Log { ptr, writer }
-    }
-
-    /// One ordinary group with a 64-byte slot per worker. Returns its base.
-    fn group(&self, target: u32, lsn: u64, kind: SalMessageKind, mark: ZoneMark) -> u64 {
-        let base = self.writer.cursor();
-        self.writer
-            .write_raw_slots(target, lsn, kind, mark, &[&[0u8; 64]])
-            .expect("group fits");
-        base
-    }
-
-    /// A closed zone: one group per entry of `targets`, the first opening the
-    /// zone, then the commit sentinel. Returns every base, the sentinel's last.
-    fn zone(&self, lsn: u64, targets: &[u32]) -> Vec<u64> {
-        let mut bases: Vec<u64> = targets
-            .iter()
-            .enumerate()
-            .map(|(i, &t)| {
-                let mark = if i == 0 { ZoneMark::Start } else { ZoneMark::Plain };
-                self.group(t, lsn, SalMessageKind::DdlSync, mark)
-            })
-            .collect();
-        bases.push(self.writer.cursor());
-        self.writer.write_commit_sentinel(lsn).expect("sentinel fits");
-        bases
-    }
-
-    /// The ephemeral command group the committer fires between zones: `lsn = 0`,
-    /// in no zone's span.
-    fn command(&self) -> u64 {
-        self.group(9, 0, SalMessageKind::Tick, ZoneMark::Plain)
-    }
-
-    fn log(&self) -> SalLog {
-        unsafe { SalLog::new(self.ptr as *const u8, SIZE) }
-    }
-
-    /// Flip one bit of the header at `base`.
-    fn damage_header(&self, base: u64) {
-        unsafe { *self.ptr.add(base as usize + 8) ^= 1 };
-    }
-
-    /// The state unordered mmap writeback leaves when a group's prefix and
-    /// header fall on different pages: the prefix persists, the header does not.
-    fn zero_header(&self, base: u64, slots: usize) {
-        unsafe { std::ptr::write_bytes(self.ptr.add(base as usize + 8), 0, group_header_size(slots)) };
-    }
-
-    /// The publication prefix word at `base`, as a mutable byte slice. The
-    /// mapping is shared, so a reader built from the same region sees the edit.
-    fn prefix_bytes(&mut self, base: u64) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(base as usize), 8) }
-    }
 }
 
 /// The `(lsn, target_id)` pairs a walk reads, and the offsets it reports
@@ -112,8 +44,7 @@ fn committed(log: SalLog) -> Result<Vec<u64>, String> {
 /// digested directory and the generation from the header's own epoch.
 #[test]
 fn the_whole_prefix_word_is_neutralised() {
-    let region = SharedRegion::new(SIZE);
-    let mut log = Log::new(&region, 3);
+    let mut log = TestLog::new(SIZE, 1, 3);
     log.group(11, 101, SalMessageKind::DdlSync, ZoneMark::Plain);
     let middle = log.group(22, 102, SalMessageKind::DdlSync, ZoneMark::Plain);
     log.group(33, 103, SalMessageKind::DdlSync, ZoneMark::Plain);
@@ -133,15 +64,13 @@ fn the_whole_prefix_word_is_neutralised() {
 /// single flip stop the walk before that transaction's sentinel.
 #[test]
 fn a_sentinels_prefix_is_not_single_bit_zeroable() {
-    let region = SharedRegion::new(SIZE);
-    let mut log = Log::new(&region, 1);
+    let mut log = TestLog::new(SIZE, 1, 1);
     let bases = log.zone(7, &[11]);
     let sentinel = *bases.last().unwrap();
     log.group(33, 0, SalMessageKind::Tick, ZoneMark::Plain);
     // A 4-slot empty group, whose payload is 64 — also one bit.
-    let empty4 = log.writer.cursor();
-    log.writer
-        .write_raw_slots(44, 0, SalMessageKind::Tick, ZoneMark::Plain, &[&[], &[], &[], &[]])
+    let empty4 = log
+        .try_write(44, 0, SalMessageKind::Tick, ZoneMark::Plain, &[&[], &[], &[], &[]])
         .expect("group fits");
 
     let view = log.log();
@@ -169,19 +98,16 @@ fn a_sentinels_prefix_is_not_single_bit_zeroable() {
 /// the ring wrap is an ordinary end-of-log.
 #[test]
 fn a_previous_epochs_leftover_ends_the_walk() {
-    let region = SharedRegion::new(SIZE);
-    {
-        let old = Log::new(&region, 1);
-        old.group(11, 1, SalMessageKind::DdlSync, ZoneMark::Plain);
-        old.group(22, 2, SalMessageKind::DdlSync, ZoneMark::Plain);
-        old.group(33, 3, SalMessageKind::DdlSync, ZoneMark::Plain);
-    }
+    let mut log = TestLog::new(SIZE, 1, 1);
+    log.group(11, 1, SalMessageKind::DdlSync, ZoneMark::Plain);
+    log.group(22, 2, SalMessageKind::DdlSync, ZoneMark::Plain);
+    log.group(33, 3, SalMessageKind::DdlSync, ZoneMark::Plain);
     // A shorter epoch-2 log over the same bytes: one group, so epoch 1's
     // second and third groups survive past the new frontier.
-    let new = Log::new(&region, 2);
-    new.group(44, 9, SalMessageKind::DdlSync, ZoneMark::Plain);
+    log.relayout(2);
+    log.group(44, 9, SalMessageKind::DdlSync, ZoneMark::Plain);
 
-    let view = new.log();
+    let view = log.log();
     assert_eq!(view.walk_epoch(), 2, "offset 0's header anchors the walk");
     let (groups, corrupt) = walk(view);
     assert_eq!(groups, vec![(9, 44)], "the walk ends at the epoch-1 leftover");
@@ -192,8 +118,7 @@ fn a_previous_epochs_leftover_ends_the_walk() {
 /// so no single flip there can make every later comparison fail.
 #[test]
 fn group_zeros_prefix_epoch_is_not_a_single_point_of_failure() {
-    let region = SharedRegion::new(SIZE);
-    let mut log = Log::new(&region, 5);
+    let mut log = TestLog::new(SIZE, 1, 5);
     log.group(11, 101, SalMessageKind::DdlSync, ZoneMark::Plain);
     log.group(22, 102, SalMessageKind::DdlSync, ZoneMark::Plain);
     let view = log.log();
@@ -212,16 +137,13 @@ fn group_zeros_prefix_epoch_is_not_a_single_point_of_failure() {
 /// an older leftover at a low offset.
 #[test]
 fn the_walk_epoch_survives_a_damaged_offset_zero() {
-    let region = SharedRegion::new(SIZE);
     // A previous epoch's leftover further in, left behind by a shorter later
     // pass, plus the live epoch-4 log over the front.
-    {
-        let old = Log::new(&region, 2);
-        for i in 0..8 {
-            old.group(90 + i, 1, SalMessageKind::DdlSync, ZoneMark::Plain);
-        }
+    let mut log = TestLog::new(SIZE, 1, 2);
+    for i in 0..8 {
+        log.group(90 + i, 1, SalMessageKind::DdlSync, ZoneMark::Plain);
     }
-    let log = Log::new(&region, 4);
+    log.relayout(4);
     log.group(11, 101, SalMessageKind::DdlSync, ZoneMark::Plain);
     log.group(22, 102, SalMessageKind::DdlSync, ZoneMark::Plain);
     log.group(33, 103, SalMessageKind::DdlSync, ZoneMark::Plain);
@@ -244,13 +166,11 @@ fn the_walk_epoch_survives_a_damaged_offset_zero() {
 #[test]
 fn only_a_damaged_offset_zero_takes_a_sweep() {
     // A fresh all-zero mapping: no header, zero prefix, epoch floor 0.
-    let region = SharedRegion::new(SIZE);
-    assert_eq!(Log::new(&region, 0).log().walk_epoch(), 0);
+    assert_eq!(TestLog::new(SIZE, 1, 0).log().walk_epoch(), 0);
 
     // A reset ring: `rewind` zeroes offset 0's prefix but leaves its header,
     // so the probe answers and the floor carries forward.
-    let region = SharedRegion::new(SIZE);
-    let log = Log::new(&region, 7);
+    let log = TestLog::new(SIZE, 1, 7);
     log.group(11, 1, SalMessageKind::DdlSync, ZoneMark::Plain);
     log.writer.rewind(8);
     assert_eq!(
@@ -261,8 +181,7 @@ fn only_a_damaged_offset_zero_takes_a_sweep() {
     assert_eq!(log.writer.epoch(), 8, "the next writer epoch is one above the floor");
 
     // A damaged offset 0 with a non-zero prefix is the one shape that sweeps.
-    let region = SharedRegion::new(SIZE);
-    let log = Log::new(&region, 6);
+    let log = TestLog::new(SIZE, 1, 6);
     log.group(11, 1, SalMessageKind::DdlSync, ZoneMark::Plain);
     log.group(22, 2, SalMessageKind::DdlSync, ZoneMark::Plain);
     log.damage_header(0);
@@ -277,8 +196,7 @@ fn only_a_damaged_offset_zero_takes_a_sweep() {
 /// zone is durable behind it, so the boot must fail naming the offset.
 #[test]
 fn damage_in_a_middle_zone_fails_the_boot() {
-    let region = SharedRegion::new(SIZE);
-    let log = Log::new(&region, 1);
+    let log = TestLog::new(SIZE, 1, 1);
     log.zone(1, &[11, 12]);
     let second = log.zone(2, &[21, 22]);
     log.zone(3, &[31, 32]);
@@ -296,8 +214,7 @@ fn damage_in_a_middle_zone_fails_the_boot() {
 /// applies.
 #[test]
 fn damage_in_the_last_zone_demotes_it() {
-    let region = SharedRegion::new(SIZE);
-    let log = Log::new(&region, 1);
+    let log = TestLog::new(SIZE, 1, 1);
     log.zone(1, &[11, 12]);
     let last = log.zone(2, &[21, 22]);
     log.damage_header(last[1]);
@@ -309,8 +226,7 @@ fn damage_in_the_last_zone_demotes_it() {
 /// and the committer fires one of these ticks after every push.
 #[test]
 fn damage_in_a_command_group_between_zones_costs_nothing() {
-    let region = SharedRegion::new(SIZE);
-    let log = Log::new(&region, 1);
+    let log = TestLog::new(SIZE, 1, 1);
     log.zone(1, &[11]);
     let tick = log.command();
     log.zone(2, &[21]);
@@ -328,8 +244,7 @@ fn damage_in_a_command_group_between_zones_costs_nothing() {
 /// promised to anyone.
 #[test]
 fn damage_in_an_unclosed_tail_zone_costs_nothing() {
-    let region = SharedRegion::new(SIZE);
-    let log = Log::new(&region, 1);
+    let log = TestLog::new(SIZE, 1, 1);
     log.zone(1, &[11]);
     log.group(21, 2, SalMessageKind::DdlSync, ZoneMark::Start);
     let torn = log.group(22, 2, SalMessageKind::DdlSync, ZoneMark::Plain);
@@ -345,8 +260,7 @@ fn damage_in_an_unclosed_tail_zone_costs_nothing() {
 /// refuse a boot over damage to a zone no client was ever promised.
 #[test]
 fn damage_in_zone_less_stream_batches_costs_nothing() {
-    let region = SharedRegion::new(SIZE);
-    let log = Log::new(&region, 1);
+    let log = TestLog::new(SIZE, 1, 1);
     let first = log.group(41, 7, SalMessageKind::Push, ZoneMark::Plain);
     let second = log.group(42, 8, SalMessageKind::Push, ZoneMark::Plain);
     log.zone(9, &[11]);
@@ -364,8 +278,7 @@ fn damage_in_zone_less_stream_batches_costs_nothing() {
 /// applying its siblings would half-apply an atomic unit.
 #[test]
 fn a_zone_that_lost_its_first_group_fails_the_boot() {
-    let region = SharedRegion::new(SIZE);
-    let log = Log::new(&region, 1);
+    let log = TestLog::new(SIZE, 1, 1);
     log.zone(1, &[11]);
     let second = log.zone(2, &[21, 22]);
     log.zone(3, &[31]);
@@ -379,8 +292,7 @@ fn a_zone_that_lost_its_first_group_fails_the_boot() {
 /// its sentinel was destroyed, not omitted.
 #[test]
 fn a_lost_sentinel_is_not_a_zone_that_never_closed() {
-    let region = SharedRegion::new(SIZE);
-    let log = Log::new(&region, 1);
+    let log = TestLog::new(SIZE, 1, 1);
     let first = log.zone(1, &[11]);
     log.zone(2, &[21]);
     // Destroy the first zone's sentinel.
@@ -400,16 +312,15 @@ fn a_lost_sentinel_is_not_a_zone_that_never_closed() {
 #[test]
 fn the_resync_scan_sweeps_past_zero_runs_and_leftovers() {
     for leftover in [false, true] {
-        let region = SharedRegion::new(SIZE);
+        let mut log = TestLog::new(SIZE, 1, 1);
         if leftover {
             // A previous epoch's group parked where the live log will straddle
             // it, so the scan meets an intact epoch-1 header below the frontier.
-            let old = Log::new(&region, 1);
             for _ in 0..40 {
-                old.group(90, 1, SalMessageKind::DdlSync, ZoneMark::Plain);
+                log.group(90, 1, SalMessageKind::DdlSync, ZoneMark::Plain);
             }
         }
-        let log = Log::new(&region, 4);
+        log.relayout(4);
         log.zone(1, &[11]);
         let second_start = log.group(21, 2, SalMessageKind::DdlSync, ZoneMark::Start);
         log.group(22, 2, SalMessageKind::DdlSync, ZoneMark::Plain);
@@ -429,8 +340,7 @@ fn the_resync_scan_sweeps_past_zero_runs_and_leftovers() {
 /// scan that would be terminal and throw the committed prefix away.
 #[test]
 fn a_torn_header_page_does_not_cost_the_committed_prefix() {
-    let region = SharedRegion::new(SIZE);
-    let log = Log::new(&region, 1);
+    let log = TestLog::new(SIZE, 1, 1);
     log.zone(1, &[11]);
     log.zone(2, &[21]);
     // An unclosed tail zone whose head group's header was lost.
@@ -450,8 +360,7 @@ fn a_torn_header_page_does_not_cost_the_committed_prefix() {
 /// lost in silence.
 #[test]
 fn both_passes_see_the_same_groups_past_damage() {
-    let region = SharedRegion::new(SIZE);
-    let log = Log::new(&region, 1);
+    let log = TestLog::new(SIZE, 1, 1);
     log.zone(1, &[11]);
     let tick = log.command();
     log.zone(2, &[21]);
@@ -468,59 +377,104 @@ fn both_passes_see_the_same_groups_past_damage() {
     assert_eq!(committed(view).unwrap(), vec![1, 2]);
 }
 
-/// A push zone over `NW` workers: one scatter group per entry of `targets`
-/// (the first opening the zone), then the commit sentinel. Rows are
-/// PK-partitioned, so most slots are `ctrl + schema` with no data block —
-/// exactly the shape a partitioned push leaves. Returns each group's base.
-fn push_zone(writer: &SalWriter, lsn: u64, targets: &[u32]) -> Vec<u64> {
-    let schema = make_schema_u64_i64();
-    let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
-    let req_ids: Vec<u64> = (0..NW as u64).collect();
-    let mut bases = Vec::new();
-    for (i, &t) in targets.iter().enumerate() {
-        bases.push(writer.cursor());
-        let relation = ipc::WireSchema::encoded(t as i64, schema);
-        let mark = if i == 0 { ZoneMark::Start } else { ZoneMark::Plain };
-        with_commit_indices(&batch, &schema, NW, |wi| {
-            with_group(
-                &batch,
-                wi,
-                &relation,
-                WireMsg::default(),
-                GroupTargets::All(&req_ids),
-                NW,
-                |g| writer.write_group_direct(g, lsn, SalMessageKind::Push, mark),
-            )
-            .expect("group fits")
-        });
-    }
-    writer.write_commit_sentinel(lsn).expect("sentinel fits");
-    bases
-}
-
 fn families(targets: &[u32]) -> HashMap<i64, u64> {
     targets.iter().map(|&t| (t as i64, 0u64)).collect()
 }
 
-fn log_of(region: &SharedRegion) -> SalLog {
-    unsafe { SalLog::new(region.ptr() as *const u8, SIZE) }
-}
+/// The zone-protocol shapes over the shared log fixture: a closed zone, the
+/// command groups between them, and the damage a recovery walk has to survive.
+impl TestLog {
+    /// One ordinary group with a 64-byte slot. Returns its base.
+    fn group(&self, target: u32, lsn: u64, kind: SalMessageKind, mark: ZoneMark) -> u64 {
+        self.try_write(target, lsn, kind, mark, &[&[0u8; 64]])
+            .expect("group fits")
+    }
 
-/// Corrupt one byte of slot `w` of the group at `base`, past the control
-/// block's own header so the block checksum is what catches it.
-fn damage_slot(region: &SharedRegion, base: u64, w: u32) {
-    let slot = group_at(log_of(region), base).slot(w).expect("slot carries bytes");
-    let off = (slot.as_ptr() as usize) - (region.ptr() as usize);
-    unsafe { *region.ptr().add(off + gnitz_wire::WAL_HEADER_SIZE) ^= 0xFF };
-}
+    /// A closed zone: one group per entry of `targets`, the first opening the
+    /// zone, then the commit sentinel. Returns every base, the sentinel's last.
+    fn zone(&self, lsn: u64, targets: &[u32]) -> Vec<u64> {
+        let mut bases: Vec<u64> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| {
+                let mark = if i == 0 { ZoneMark::Start } else { ZoneMark::Plain };
+                self.group(t, lsn, SalMessageKind::DdlSync, mark)
+            })
+            .collect();
+        bases.push(self.cursor());
+        self.writer.write_commit_sentinel(lsn).expect("sentinel fits");
+        bases
+    }
 
-/// The highest slot of the group at `base` that carries rows.
-fn a_slot_with_rows(region: &SharedRegion, base: u64) -> u32 {
-    let msg = group_at(log_of(region), base);
-    (0..NW as u32)
-        .rev()
-        .find(|&w| msg.slot(w).is_some())
-        .expect("some slot carries rows")
+    /// The ephemeral command group the committer fires between zones: `lsn = 0`,
+    /// in no zone's span.
+    fn command(&self) -> u64 {
+        self.group(9, 0, SalMessageKind::Tick, ZoneMark::Plain)
+    }
+
+    /// A push zone over `NW` workers: one scatter group per entry of `targets`
+    /// (the first opening the zone), then the commit sentinel. Rows are
+    /// PK-partitioned, so most slots are `ctrl + schema` with no data block —
+    /// exactly the shape a partitioned push leaves. Returns each group's base.
+    fn push_zone(&self, lsn: u64, targets: &[u32]) -> Vec<u64> {
+        let schema = make_schema_u64_i64();
+        let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
+        let req_ids: Vec<u64> = (0..NW as u64).collect();
+        let mut bases = Vec::new();
+        for (i, &t) in targets.iter().enumerate() {
+            bases.push(self.cursor());
+            let relation = ipc::WireSchema::encoded(t as i64, schema);
+            let mark = if i == 0 { ZoneMark::Start } else { ZoneMark::Plain };
+            with_commit_indices(&batch, &schema, NW, |wi| {
+                with_group(
+                    &batch,
+                    wi,
+                    &relation,
+                    WireMsg::default(),
+                    GroupTargets::All(&req_ids),
+                    NW,
+                    |g| self.writer.write_group_direct(g, lsn, SalMessageKind::Push, mark),
+                )
+                .expect("group fits")
+            });
+        }
+        self.writer.write_commit_sentinel(lsn).expect("sentinel fits");
+        bases
+    }
+
+    /// Flip one bit of the header at `base`.
+    fn damage_header(&self, base: u64) {
+        unsafe { *self.ptr().add(base as usize + 8) ^= 1 };
+    }
+
+    /// The state unordered mmap writeback leaves when a group's prefix and
+    /// header fall on different pages: the prefix persists, the header does not.
+    fn zero_header(&self, base: u64, slots: usize) {
+        unsafe { std::ptr::write_bytes(self.ptr().add(base as usize + 8), 0, group_header_size(slots)) };
+    }
+
+    /// The publication prefix word at `base`, as a mutable byte slice. The
+    /// mapping is shared, so a reader built from the same region sees the edit.
+    fn prefix_bytes(&mut self, base: u64) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr().add(base as usize), 8) }
+    }
+
+    /// Corrupt one byte of slot `w` of the group at `base`, past the control
+    /// block's own header so the block checksum is what catches it.
+    fn damage_slot(&self, base: u64, w: u32) {
+        let slot = group_at(self.log(), base).slot(w).expect("slot carries bytes");
+        let off = (slot.as_ptr() as usize) - (self.ptr() as usize);
+        unsafe { *self.ptr().add(off + gnitz_wire::WAL_HEADER_SIZE) ^= 0xFF };
+    }
+
+    /// The highest slot of the group at `base` that carries rows.
+    fn a_slot_with_rows(&self, base: u64) -> u32 {
+        let msg = group_at(self.log(), base);
+        (0..NW as u32)
+            .rev()
+            .find(|&w| msg.slot(w).is_some())
+            .expect("some slot carries rows")
+    }
 }
 
 /// A push whose rows do not reach every worker leaves the remaining slots a
@@ -529,13 +483,11 @@ fn a_slot_with_rows(region: &SharedRegion, base: u64) -> u32 {
 /// demotes its own zone.
 #[test]
 fn a_row_less_slot_is_not_a_damaged_one() {
-    let region = SharedRegion::new(SIZE);
-    let writer = SalWriter::new(region.ptr(), -1, SIZE as u64, NW);
-    writer.reset(0, 1);
-    let bases = push_zone(&writer, 5, &[TID]);
+    let log = TestLog::new(SIZE, NW, 1);
+    let bases = log.push_zone(5, &[TID]);
 
     // The fixture must actually leave a row-less slot, or it proves nothing.
-    let msg = group_at(log_of(&region), bases[0]);
+    let msg = group_at(log.log(), bases[0]);
     let row_less = (0..NW as u32)
         .filter(|&w| {
             let slot = msg.slot(w).expect("every slot is written");
@@ -545,7 +497,7 @@ fn a_row_less_slot_is_not_a_damaged_one() {
     assert!(row_less > 0, "the fixture must leave at least one slot row-less");
 
     assert_eq!(
-        committed_lsns(log_of(&region), SalMessageKind::Push, &families(&[TID])).unwrap(),
+        committed_lsns(log.log(), SalMessageKind::Push, &families(&[TID])).unwrap(),
         vec![5]
     );
 }
@@ -556,26 +508,22 @@ fn a_row_less_slot_is_not_a_damaged_one() {
 #[test]
 fn the_demotion_is_global_across_slots() {
     for damage_offset_zero in [false, true] {
-        let region = SharedRegion::new(SIZE);
-        let writer = SalWriter::new(region.ptr(), -1, SIZE as u64, NW);
-        writer.reset(0, 1);
+        let log = TestLog::new(SIZE, NW, 1);
         // A leading command group, so offset 0 is not the zone's own head and
         // can be damaged independently: with it gone there is no tail-wide slot
         // count to read, and only each group's own count is available.
-        writer
-            .write_raw_slots(9, 0, SalMessageKind::Tick, ZoneMark::Plain, &[&[0u8; 8]])
-            .expect("fits");
-        let bases = push_zone(&writer, 5, &[TID]);
+        log.command();
+        let bases = log.push_zone(5, &[TID]);
 
         // Rot the highest slot carrying rows.
-        let victim = a_slot_with_rows(&region, bases[0]);
-        damage_slot(&region, bases[0], victim);
+        let victim = log.a_slot_with_rows(bases[0]);
+        log.damage_slot(bases[0], victim);
         if damage_offset_zero {
-            unsafe { *region.ptr().add(8) ^= 1 };
+            unsafe { *log.ptr().add(8) ^= 1 };
         }
 
         assert!(
-            committed_lsns(log_of(&region), SalMessageKind::Push, &families(&[TID]))
+            committed_lsns(log.log(), SalMessageKind::Push, &families(&[TID]))
                 .unwrap()
                 .is_empty(),
             "rot in slot {victim} must demote the zone whichever slot a walk looks at \
@@ -596,21 +544,19 @@ fn the_demotion_is_global_across_slots() {
 #[test]
 fn damage_in_an_unmapped_family_does_not_demote_the_zone() {
     const STREAM_TID: u32 = TID + 1;
-    let region = SharedRegion::new(SIZE);
-    let writer = SalWriter::new(region.ptr(), -1, SIZE as u64, NW);
-    writer.reset(0, 1);
-    let bases = push_zone(&writer, 5, &[TID, STREAM_TID]);
-    damage_slot(&region, bases[1], a_slot_with_rows(&region, bases[1]));
+    let log = TestLog::new(SIZE, NW, 1);
+    let bases = log.push_zone(5, &[TID, STREAM_TID]);
+    log.damage_slot(bases[1], log.a_slot_with_rows(bases[1]));
 
     assert_eq!(
-        committed_lsns(log_of(&region), SalMessageKind::Push, &families(&[TID])).unwrap(),
+        committed_lsns(log.log(), SalMessageKind::Push, &families(&[TID])).unwrap(),
         vec![5],
         "the base push must still replay"
     );
     // The same damage in a mapped family does demote it, so the assertion above
     // is about the map and not about the fixture failing to damage anything.
     assert!(
-        committed_lsns(log_of(&region), SalMessageKind::Push, &families(&[TID, STREAM_TID]))
+        committed_lsns(log.log(), SalMessageKind::Push, &families(&[TID, STREAM_TID]))
             .unwrap()
             .is_empty()
     );
@@ -620,16 +566,14 @@ fn damage_in_an_unmapped_family_does_not_demote_the_zone() {
 /// pass 2 never applies one family's group while skipping its sibling's.
 #[test]
 fn a_torn_last_zone_is_skipped_whole() {
-    let region = SharedRegion::new(SIZE);
-    let writer = SalWriter::new(region.ptr(), -1, SIZE as u64, NW);
-    writer.reset(0, 1);
-    push_zone(&writer, 4, &[TID]);
-    let last = push_zone(&writer, 5, &[TID, TID + 1]);
+    let log = TestLog::new(SIZE, NW, 1);
+    log.push_zone(4, &[TID]);
+    let last = log.push_zone(5, &[TID, TID + 1]);
     // Rot the FIRST family of the last zone.
-    damage_slot(&region, last[0], a_slot_with_rows(&region, last[0]));
+    log.damage_slot(last[0], log.a_slot_with_rows(last[0]));
 
     assert_eq!(
-        committed_lsns(log_of(&region), SalMessageKind::Push, &families(&[TID, TID + 1])).unwrap(),
+        committed_lsns(log.log(), SalMessageKind::Push, &families(&[TID, TID + 1])).unwrap(),
         vec![4],
         "the torn zone must be dropped whole, and the durable one before it kept"
     );

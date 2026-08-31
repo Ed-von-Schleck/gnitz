@@ -446,4 +446,5 @@ async fn flusher(conn: Rc<TlsShared>, mut rx: chan::Receiver<()>) {
 }
 
 #[cfg(test)]
+#[path = "tests/tls.rs"]
 mod tests;

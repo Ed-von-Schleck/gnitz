@@ -9,10 +9,6 @@
 use super::futures::{AcceptFuture, RawRecvFuture, RecvFuture, SendAlive, SendFuture};
 use super::*;
 
-/// How long a listener whose multishot accept was cancelled on fd exhaustion
-/// waits before re-arming, giving `reap_closing_conns` a window to free some.
-const ACCEPT_REARM_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
-
 /// What [`Reactor::send_owned`] sends: an owned payload's byte range, plus the
 /// name it goes by in an eviction log line. The three implementors — a pooled
 /// buffer, a W2M ring slot, TLS ciphertext — differ only in those two answers,
@@ -82,7 +78,7 @@ pub(crate) async fn guard_egress_deadline<F: Future<Output = i32>>(
     fut: F,
 ) -> i32 {
     let mut fut = std::pin::pin!(fut);
-    let timeout = reactor.inner.client_send_timeout.get();
+    let timeout = reactor.inner.limits.client_send_timeout;
     match select2(fut.as_mut(), reactor.timer(Instant::now() + timeout)).await {
         Either::A(rc) => rc,
         Either::B(()) => {
@@ -159,7 +155,7 @@ impl Reactor {
         // both can cancel at once and each is owed a full backoff.
         let inner = Rc::clone(&self.inner);
         self.spawn(async move {
-            let deadline = Instant::now() + ACCEPT_REARM_BACKOFF;
+            let deadline = Instant::now() + inner.limits.accept_rearm_backoff;
             TimerFuture::new(deadline, Rc::clone(&inner)).await;
             arm_accept(&mut inner.ring(), listener);
         });

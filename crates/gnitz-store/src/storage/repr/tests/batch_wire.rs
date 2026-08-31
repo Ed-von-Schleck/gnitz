@@ -22,6 +22,36 @@ fn decode_from_wal_block_rejects_mismatched_region_sizes() {
     }
 }
 
+/// `COUNT` and `NUM_REGIONS` live in the 32-byte header, outside the block's
+/// own checksum, so `n -> 0` is a single-bit flip whenever `n` is a power of
+/// two. Only the exact region-size relation rejects them. A genuinely empty
+/// block is the negative control: `count == 0` with regions to match decodes.
+#[test]
+fn decode_from_wal_block_rejects_header_count_forgeries() {
+    let schema = pk_payload_schema(&[type_code::U64]);
+    let clean = make_batch_raw(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]).encode_to_wire_vec(7, true);
+    for forged in [0u32, 2, 1000] {
+        let mut buf = clean.clone();
+        gnitz_wire::write_u32_le(&mut buf, gnitz_wire::WAL_OFF_COUNT, forged);
+        assert_eq!(
+            Batch::decode_from_wal_block(&buf, &schema, true).err(),
+            Some("data WAL region size mismatch"),
+            "COUNT 3 -> {forged} must be rejected by the exact region-size relation"
+        );
+    }
+
+    let mut buf = clean.clone();
+    gnitz_wire::write_u32_le(&mut buf, gnitz_wire::WAL_OFF_NUM_REGIONS, 4);
+    assert!(
+        Batch::decode_from_wal_block(&buf, &schema, true).is_err(),
+        "a forged region count must be rejected"
+    );
+
+    let empty = Batch::empty_with_schema(&schema).encode_to_wire_vec(7, true);
+    let (decoded, _) = Batch::decode_from_wal_block(&empty, &schema, true).expect("an empty block decodes");
+    assert_eq!(decoded.count, 0);
+}
+
 /// The variable-length blob region is the one whose extent the schema cannot
 /// predict. When `[off, off + size)` overruns the block, the decoder must never
 /// reach the point of resolving strings against a heap that is not there.

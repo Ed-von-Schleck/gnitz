@@ -107,10 +107,11 @@ fn test_flush_includes_index_circuits() {
 // Driven via the `GNITZ_INJECT_INGEST_APPLY_ERROR` debug seam.
 #[test]
 fn test_ingest_apply_error_is_returned() {
-    // The full path, not the bare name: `run_test_in_child` filters with
-    // `--exact`.
-    let name = "relation::tests::ingest_apply_error_returned_internal";
-    let out = crate::test_support::run_test_in_child(name, &[("GNITZ_INJECT_INGEST_APPLY_ERROR", "store")]);
+    let out = crate::test_support::run_test_in_child(
+        module_path!(),
+        "ingest_apply_error_returned_internal",
+        &[("GNITZ_INJECT_INGEST_APPLY_ERROR", "store")],
+    );
     crate::test_support::assert_child_ok(
         &out,
         "the seam-armed child must return the error rather than swallow it",

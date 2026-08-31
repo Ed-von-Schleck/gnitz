@@ -1,17 +1,17 @@
 //! Unit tests for the CREATE UNIQUE INDEX pre-flight building blocks: the
 //! worker's sorted-span frame train (`send_unique_preflight_keys`), the
-//! per-row span projection (`IndexKeySpec::key_bytes`), and the master's
-//! per-span merge accounting (`PreflightAccumulator`). The full distributed
-//! path (fan-out, k-way merge over live W2M trains, DDL integration) is
-//! covered by the multi-worker E2E suite.
+//! per-row span projection, and the master's per-span merge accounting. The
+//! full distributed path (fan-out, k-way merge over live W2M trains, DDL
+//! integration) is covered by the multi-worker E2E suite.
 //!
 //! Every key is the OPK leading-key span (`PkBuf`) — equality-correct and
 //! byte-orderable at any width.
 
-use crate::runtime::master::PreflightAccumulator;
-use crate::runtime::w2m::{make_ring, W2mReceiver, W2mWriter};
+use crate::runtime::w2m::fixtures::make_ring;
+use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::wire::{self, unique_preflight_wire_schema, SchemaWithVersion, FLAG_SCAN_LAST};
 use crate::runtime::worker::send_unique_preflight_keys;
+use gnitz_engine_testkit::pk_only_schema;
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::make_index_schema;
 use gnitz_store::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor};
@@ -39,10 +39,10 @@ fn span_i64(v: i64) -> PkBuf {
 }
 
 /// Frame schema of a single-U128-span pre-flight reply (one U128 PK column),
-/// so the round-trip tests ship a 16-byte PK span per row.
+/// so the round-trip tests ship a 16-byte PK span per row. Index columns are
+/// all non-nullable, which is what makes it an all-PK schema.
 fn u128_frame_schema() -> SchemaDescriptor {
-    // Index columns are all non-nullable (PK region); nullable=0 throughout.
-    SchemaDescriptor::new(&[SchemaColumn::new(type_code::U128, 0)], &[0])
+    pk_only_schema(&[type_code::U128])
 }
 
 /// Build the real sorted-span producer over pre-sorted `keys` via
@@ -204,14 +204,7 @@ fn preflight_train_empty_partition_single_terminal_frame() {
 fn preflight_train_composite_wide_span_roundtrip() {
     // Two U64 index columns → a 16-byte composite leading span, plus a U64
     // source PK; the frame schema is derived exactly as both endpoints do.
-    let idx_schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-        ],
-        &[0, 1, 2],
-    );
+    let idx_schema = pk_only_schema(&[type_code::U64; 3]);
     let frame_schema = unique_preflight_wire_schema(&idx_schema, 2);
     // Spans are (a_be ++ b_be), 16 bytes. Two of them share their leading 8
     // bytes and differ only in the trailing column, so the span must carry both
@@ -351,10 +344,6 @@ fn preflight_weight2_row_emits_adjacent_pair() {
         vec![span_i64(7), span_i64(9), span_i64(9), span_i64(11)],
         "weight-2 row must emit its span twice"
     );
-
-    let mut acc = PreflightAccumulator::new(1000);
-    assert!(!offer_all(&mut acc, &keys), "the adjacent pair must flip the verdict");
-    assert!(acc.duplicate);
 }
 
 /// A composite `UNIQUE (a, b)` span packs both columns, so two rows that share
@@ -385,211 +374,8 @@ fn preflight_composite_projection_distinguishes_trailing_column() {
         "rows differing only in the trailing column are distinct"
     );
     assert_eq!(keys[0].pk_bytes().len(), 16, "composite span spans both columns");
-
-    // No duplicate: the accumulator admits both.
-    let mut acc = PreflightAccumulator::new(1000);
-    assert!(offer_all(&mut acc, &keys));
-    assert!(!acc.duplicate);
-}
-
-/// A row NULL in ANY indexed column is skipped (`key_bytes` → false) —
-/// SQL NULL-distinctness, mirroring `batch_project_index`.
-#[test]
-fn index_key_spec_skips_any_null_column() {
-    let owner = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 1), // a: nullable payload
-            SchemaColumn::new(type_code::U64, 1), // b: nullable payload
-        ],
-        &[0],
-    );
-    let cols = [1u32, 2];
-    let idx_schema = make_index_schema(&cols, &owner).unwrap();
-    // (id, a, b): both present, a NULL, b NULL.
-    let rows: [(u128, Option<u128>, Option<u128>); 3] = [
-        (1, Some(5), Some(6)), // both present → indexed
-        (2, None, Some(6)),    // a NULL → skipped
-        (3, Some(5), None),    // b NULL → skipped
-    ];
-    let mut bb = BatchBuilder::new(owner);
-    for &(id, a, b) in &rows {
-        bb.begin_row(id, 1);
-        for cell in [a, b] {
-            match cell {
-                Some(v) => bb.put_int(v),
-                None => bb.put_null(),
-            }
-        }
-        bb.end_row();
-    }
-    let batch = bb.finish();
-    let spec = IndexKeySpec::new(&cols, &owner, &idx_schema);
-    let mb = batch.as_mem_batch();
-    let mut keybuf = PkBuf::zeroed(0);
-    assert!(spec.key_bytes(&mb, 0, &mut keybuf), "both columns present ⇒ indexed");
-    assert!(
-        !spec.key_bytes(&mb, 1, &mut keybuf),
-        "NULL in the first indexed column ⇒ skipped"
-    );
-    assert!(
-        !spec.key_bytes(&mb, 2, &mut keybuf),
-        "NULL in the second indexed column ⇒ skipped"
-    );
-}
-
-/// `key_bytes` reuses the caller's `PkBuf` scratch across specs of DIFFERENT
-/// widths. When a NARROWER span (single U64 → 8 bytes) reuses a buffer that a
-/// WIDER span (composite U64,U64 → 16 bytes) just filled, the high bytes the
-/// wide write left in `bytes[8..16]` MUST be re-zeroed: `PkBuf`'s "tail past
-/// `len` is zero" invariant is what makes `padded(width)` sound and what lets
-/// the single-PK fast path widen `bytes[..len]` to a `u128`. A stale tail would
-/// silently corrupt any wider-stride read of this narrowed key.
-#[test]
-fn key_bytes_reused_buffer_zeros_tail_when_narrowing() {
-    // Owner: PK U64; two non-null U64 payload columns.
-    let owner = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-        ],
-        &[0],
-    );
-    // One row whose col2 carries distinct all-nonzero high bytes, so the wide
-    // span writes nonzero bytes into the trailing 8 bytes the narrow span must
-    // then reclaim. col1 is arbitrary (it never lands in the narrow span).
-    const COL1: u64 = 0xAABB_CCDD_EEFF_0011;
-    const COL2: u64 = 0x1122_3344_5566_7788;
-    let mut bb = BatchBuilder::new(owner);
-    bb.begin_row(1, 1);
-    bb.put_int(COL1 as u128);
-    bb.put_int(COL2 as u128);
-    bb.end_row();
-    let batch = bb.finish();
-    let mb = batch.as_mem_batch();
-
-    // WIDE composite span over (col1, col2): two promoted U64 columns ⇒ 16 bytes.
-    let wide_cols = [1u32, 2];
-    let wide_idx = make_index_schema(&wide_cols, &owner).expect("wide index schema");
-    let wide = IndexKeySpec::new(&wide_cols, &owner, &wide_idx);
-    assert_eq!(wide.key_size(), 16, "two U64 index columns ⇒ 16-byte span");
-
-    // NARROW span over (col2) alone: one promoted U64 column ⇒ 8 bytes.
-    let narrow_cols = [2u32];
-    let narrow_idx = make_index_schema(&narrow_cols, &owner).expect("narrow index schema");
-    let narrow = IndexKeySpec::new(&narrow_cols, &owner, &narrow_idx);
-    assert_eq!(narrow.key_size(), 8, "single U64 index column ⇒ 8-byte span");
-
-    // ONE reused scratch buffer: wide first, then narrow.
-    let mut keybuf = PkBuf::zeroed(0);
-
-    assert!(wide.key_bytes(&mb, 0, &mut keybuf), "wide row is indexed");
-    assert_eq!(keybuf.pk_bytes().len(), 16);
-    // The wide write dirtied the trailing 8 bytes with col2's big-endian image —
-    // the precondition that gives the narrowing tail-zero step teeth.
-    assert_eq!(
-        &keybuf.pk_bytes()[8..16],
-        &COL2.to_be_bytes(),
-        "wide span packs col2 into bytes[8..16]"
-    );
-
-    assert!(narrow.key_bytes(&mb, 0, &mut keybuf), "narrow row is indexed");
-    // The narrow span is col2's 8-byte OPK, and ONLY 8 bytes are meaningful.
-    assert_eq!(keybuf.pk_bytes().len(), 8, "narrow span is one U64 ⇒ len == 8");
-    assert_eq!(
-        keybuf.pk_bytes(),
-        &COL2.to_be_bytes(),
-        "narrow span content is col2's big-endian OPK"
-    );
-    // The invariant under test: the tail the wider write left MUST be re-zeroed.
-    // The wide write above dirtied exactly `[0, 16)`, so that span is all a
-    // narrowing could leak.
-    assert!(
-        keybuf.padded(16)[8..].iter().all(|&b| b == 0),
-        "narrowing must re-zero every byte past len — stale wide-write tail leaked"
-    );
-    // ... and `padded(16)` (which the invariant makes sound) reads that tail as
-    // zero, so this narrow key widened to a 16-byte stride has a zero suffix.
-    assert_eq!(
-        &keybuf.padded(16)[8..16],
-        &[0u8; 8],
-        "padded(16) suffix of a narrowed key must be zero"
-    );
 }
 
 // ---------------------------------------------------------------------------
 // Merge accounting: verdict + all-or-nothing seed
 // ---------------------------------------------------------------------------
-
-fn offer_all(acc: &mut PreflightAccumulator, keys: &[PkBuf]) -> bool {
-    for &k in keys {
-        if !acc.offer(k) {
-            return false;
-        }
-    }
-    true
-}
-
-/// Adjacent equal spans — within one worker's run or as two workers' equal
-/// heads, indistinguishable at this layer — flip the verdict; the verdict is
-/// monotonic thereafter.
-#[test]
-fn accumulator_adjacent_equal_is_duplicate() {
-    let mut acc = PreflightAccumulator::new(1000);
-    assert!(offer_all(&mut acc, &[span_u128(1), span_u128(2), span_u128(3)]));
-    assert!(!acc.offer(span_u128(3)), "equal to prev ⇒ duplicate");
-    assert!(!acc.offer(span_u128(4)), "verdict is monotonic");
-    assert!(acc.duplicate);
-}
-
-#[test]
-fn accumulator_distinct_keys_no_duplicate() {
-    let mut acc = PreflightAccumulator::new(1000);
-    let keys: Vec<PkBuf> = [1u128, 2, 3, 100, u128::MAX].into_iter().map(span_u128).collect();
-    assert!(offer_all(&mut acc, &keys));
-    assert!(!acc.duplicate);
-    let seed = acc.into_seed();
-    assert!(!seed.capped(), "under-cap seed must not report capped");
-    for k in &keys {
-        assert!(seed.may_contain(k.pk_bytes()), "seed under cap holds every span");
-    }
-    assert!(!seed.may_contain(span_u128(999).pk_bytes()), "and nothing else");
-}
-
-/// A duplicate found after the cap has been crossed is still detected — the
-/// verdict never depends on the seed.
-#[test]
-fn accumulator_duplicate_after_cap_crossing() {
-    let mut acc = PreflightAccumulator::new(2);
-    assert!(offer_all(
-        &mut acc,
-        &[span_u128(1), span_u128(2), span_u128(3), span_u128(4)]
-    ));
-    assert!(!acc.offer(span_u128(4)));
-    assert!(acc.duplicate);
-    assert!(acc.into_seed().capped());
-}
-
-/// `PkBuf` byte order is a valid merge order: byte-lexicographic comparison of
-/// the OPK spans equals the order the worker sorts and the master's heap pops,
-/// at any width. A composite span sorts by its leading column, then trailing.
-#[test]
-fn pkbuf_byte_order_is_lexicographic() {
-    let span = |a: u64, b: u64| {
-        let mut buf = [0u8; 16];
-        buf[..8].copy_from_slice(&a.to_be_bytes());
-        buf[8..].copy_from_slice(&b.to_be_bytes());
-        PkBuf::from_bytes(&buf)
-    };
-    let mut v = vec![span(2, 0), span(1, 9), span(1, 1), span(2, 0)];
-    v.sort_unstable();
-    assert_eq!(
-        v,
-        vec![span(1, 1), span(1, 9), span(2, 0), span(2, 0)],
-        "sort is by leading column then trailing — byte-lexicographic"
-    );
-    // A narrower span sorts before a wider one sharing its prefix (memcmp over
-    // bytes[..len]).
-    assert!(PkBuf::from_bytes(&[1u8, 2]) < PkBuf::from_bytes(&[1u8, 2, 0]));
-}

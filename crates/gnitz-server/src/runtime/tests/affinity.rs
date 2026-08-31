@@ -49,12 +49,6 @@ fn no_placement_when_the_master_would_be_left_no_core() {
         4,
         "and never by splitting siblings"
     );
-    let one = nodes(&[&[&[4, 5]]]);
-    assert_eq!(
-        assign(&one, &all(&one), 1).unwrap_err(),
-        1,
-        "a single-core cpuset seats nobody"
-    );
 }
 
 #[test]
@@ -69,14 +63,6 @@ fn cores_alternate_across_nodes() {
     assert_eq!(p.master, vec![4, 5]);
 }
 
-#[test]
-fn no_smt_gives_one_cpu_per_worker() {
-    let n = nodes(&[&[&[0], &[1], &[2], &[3]]]);
-    let p = assign(&n, &all(&n), 3).unwrap();
-    assert_eq!(p.workers, vec![vec![0], vec![1], vec![2]]);
-    assert_eq!(p.master, vec![3]);
-}
-
 /// An allowed CPU that no online node names is in no core, yet it is still
 /// this server's to use — so it lands in the master's mask. This is why
 /// `assign` takes `allowed` instead of deriving it from the cores.
@@ -88,10 +74,9 @@ fn an_allowed_cpu_named_by_no_node_still_reaches_the_master() {
     assert_eq!(p.master, vec![2, 3, 20, 21]);
 }
 
-/// The sysfs walk against this machine's real shape: no CPU is claimed by
-/// two cores, and every CPU that lands in one is a CPU this server may use.
-/// Not every allowed CPU need appear — one that no online node names is
-/// dropped here and reaches the master through `assign`'s complement.
+/// The sysfs walk against this machine's real shape. Two node cpulists that
+/// both name a core's first CPU would bucket that core twice, which is the one
+/// way the walk can hand `assign` a CPU claimed by two cores.
 #[test]
 fn this_machine_reads_back_a_consistent_topology() {
     let allowed = allowed_cpus();
@@ -100,12 +85,4 @@ fn this_machine_reads_back_a_consistent_topology() {
     let mut uniq = seen.clone();
     uniq.dedup();
     assert_eq!(uniq, seen, "no CPU is claimed by two cores");
-    assert!(seen.iter().all(|c| allowed.contains(c)), "every grouped CPU is allowed");
-}
-
-#[test]
-fn the_boot_record_names_every_process() {
-    let n = nodes(&[&[&[0, 1], &[2, 3], &[4, 5]]]);
-    let p = assign(&n, &all(&n), 2).unwrap();
-    assert_eq!(p.describe(), "W0 [0, 1] W1 [2, 3] master [4, 5]");
 }

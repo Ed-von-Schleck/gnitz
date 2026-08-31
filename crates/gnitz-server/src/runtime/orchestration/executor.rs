@@ -381,7 +381,7 @@ impl ServerExecutor {
     pub fn run(dispatcher: Rc<MasterDispatcher>, server_fd: i32, tls: Option<TlsListener>) -> i32 {
         // 256 SQEs. Not a bound on outstanding work: `IoUringRing::push` flushes
         // a full SQ rather than refusing, so this sets submit batching, not depth.
-        let reactor = match Reactor::new(256) {
+        let reactor = match Reactor::new(256, crate::runtime::reactor::Limits::from_env()) {
             Ok(r) => Rc::new(r),
             Err(e) => {
                 gnitz_error!("io_uring init failed: {e}");

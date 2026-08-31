@@ -7,22 +7,24 @@ use super::super::test_support::*;
 use super::*;
 use crate::runtime::test_support::try_poll_once;
 
-/// Timer fires after a short deadline.
+/// A timer fires no earlier than its deadline, and returns its `Timespec` to
+/// the pool either way — which is what keeps the per-egress-frame timer
+/// allocation-free after the first one. No upper bound: "fired late" is a
+/// statement about the machine, not about the reactor.
 #[test]
-fn timer_fires() {
+fn a_timer_fires_after_its_deadline_and_recycles_its_timespec() {
     let r = make_reactor();
-    let start = Instant::now();
-    let timer = r.timer(Instant::now() + Duration::from_millis(10));
-    r.block_on(timer);
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed >= Duration::from_millis(10),
-        "timer fired too early: {elapsed:?}"
-    );
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "timer fired too late: {elapsed:?}"
-    );
+    assert_eq!(r.inner.spec_pool.borrow().len(), 0);
+    for _ in 0..2 {
+        let start = Instant::now();
+        r.block_on(r.timer(start + Duration::from_millis(5)));
+        assert!(start.elapsed() >= Duration::from_millis(5), "timer fired early");
+        assert_eq!(
+            r.inner.spec_pool.borrow().len(),
+            1,
+            "the box is recycled, then reused rather than re-allocated"
+        );
+    }
 }
 
 /// A timer in the past resolves on the very first poll instead of
@@ -35,21 +37,6 @@ fn timer_in_the_past_resolves_immediately() {
         "a past deadline must resolve on the first poll"
     );
     assert_eq!(r.inner.timers.len(), 0, "and submit no SQE at all");
-}
-
-/// End-to-end with a real io_uring: submit fdatasync on a memfd,
-/// block until complete, expect rc=0.  Also asserts
-/// the fsync park map is drained afterwards (catches leaks).
-#[test]
-fn fsync_real_memfd_roundtrip() {
-    let r = make_reactor();
-    let fd = unsafe { libc::memfd_create(c"reactor_fsync_ok".as_ptr(), libc::MFD_CLOEXEC) };
-    let rc = r.block_on(r.fsync(fd));
-    unsafe {
-        libc::close(fd);
-    }
-    assert_eq!(rc, 0, "fdatasync on a fresh memfd should succeed");
-    assert_eq!(r.inner.fsyncs.len(), 0, "a resolved fsync must retire its slot");
 }
 
 /// Submitting fdatasync on an fd that is not in the process's fd
@@ -121,78 +108,6 @@ fn dropped_timer_is_cancelled_without_waking_its_waker() {
     );
 }
 
-/// The happy path returns its `Timespec` to the pool too — the carry is
-/// retired by the CQE either way, which is what keeps the per-egress-frame
-/// timer allocation-free after the first one.
-#[test]
-fn resolved_timer_returns_its_timespec_to_the_pool() {
-    let r = make_reactor();
-    assert_eq!(r.inner.spec_pool.borrow().len(), 0);
-    let timer = r.timer(Instant::now() + Duration::from_millis(5));
-    r.block_on(timer);
-    assert_eq!(r.inner.spec_pool.borrow().len(), 1, "the box must be recycled");
-
-    let timer = r.timer(Instant::now() + Duration::from_millis(5));
-    r.block_on(timer);
-    assert_eq!(r.inner.spec_pool.borrow().len(), 1, "and reused, not re-allocated");
-}
-
-#[test]
-fn await_scan_slot_resolves_immediately_when_slot_preloaded() {
-    // The bug scenario: slot arrives and is parked BEFORE the future is
-    // first polled. The first poll must return Poll::Ready, not Poll::Pending.
-    let r = make_reactor();
-    let req_id = r.alloc_scan_request_id() as u32;
-    let (slot, _recv, _region) = unsafe { make_scan_slot(req_id) };
-
-    let _lease = r.scan_lease(&[req_id]);
-    r.route_scan_slot(slot); // park before any poll
-
-    let fut = r.await_scan_slot(req_id);
-    let result = r.block_on(fut);
-    assert_eq!(
-        result.internal_req_id, req_id,
-        "first poll must return the pre-parked slot"
-    );
-
-    drop(result); // advance release_cursor before the region unmaps
-}
-
-#[test]
-fn await_scan_slot_resolves_after_route_fires_waker() {
-    // Normal path: future polled first (registers waker), then slot arrives.
-    use std::cell::Cell;
-    let r = make_reactor();
-    let req_id = r.alloc_scan_request_id() as u32;
-    let (slot, _recv, _region) = unsafe { make_scan_slot(req_id) };
-
-    let _lease = r.scan_lease(&[req_id]);
-    let delivered: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    let delivered2 = Rc::clone(&delivered);
-    let fut = r.await_scan_slot(req_id);
-    r.spawn(async move {
-        let s = fut.await;
-        assert_eq!(s.internal_req_id, req_id);
-        delivered2.set(true);
-    });
-
-    r.tick(false); // poll task → Poll::Pending, waker registered
-    assert!(
-        r.inner.scans.borrow()[&req_id].has_waiter(),
-        "waker must be registered after first poll"
-    );
-    assert!(!delivered.get(), "must not be delivered yet");
-
-    r.route_scan_slot(slot); // park + wake
-    r.tick(false); // task woken → Poll::Ready
-
-    assert!(delivered.get(), "slot must be delivered after route_scan_slot");
-}
-
-/// The per-req_id frame queue has no fixed ceiling: a worker streaming far
-/// more continuation frames than there are workers must have every one of them
-/// queued and delivered in order. Ring capacity, not a slot count, is the
-/// bound.
 #[test]
 fn scan_queue_grows_past_worker_count() {
     let r = make_reactor();
@@ -212,7 +127,7 @@ fn scan_queue_grows_past_worker_count() {
     );
 
     for i in 0..N {
-        let f = r.block_on(r.await_scan_slot(req_id));
+        let f = try_poll_once(r.await_scan_slot(req_id)).expect("a routed slot resolves on the first poll");
         let rid = gnitz_wire::control::peek_control_block_ipc(f.bytes())
             .unwrap()
             .request_id;
@@ -291,7 +206,7 @@ fn abandoned_scan_frame_is_discarded_not_parked() {
 /// writes instead of wedging in `W2mWriter::send_msg`.
 #[test]
 fn dropped_scan_lease_unblocks_streaming_writer() {
-    use crate::runtime::w2m::make_ring;
+    use crate::runtime::w2m::fixtures::make_ring;
     use crate::runtime::w2m::{W2mReceiver, W2mWriter};
     use crate::runtime::wire as ipc;
     use std::time::{Duration, Instant};
@@ -328,7 +243,7 @@ fn dropped_scan_lease_unblocks_streaming_writer() {
         } else if Instant::now() > deadline {
             panic!("writer never produced the first 2 frames");
         } else {
-            std::thread::sleep(Duration::from_millis(1));
+            receiver.wait_any(1, 5);
         }
     }
 
@@ -343,7 +258,7 @@ fn dropped_scan_lease_unblocks_streaming_writer() {
         } else if Instant::now() > deadline {
             panic!("scan lease drop failed to free the ring — writer wedged at {read}/{TOTAL}");
         } else {
-            std::thread::sleep(Duration::from_millis(1));
+            receiver.wait_any(1, 5);
         }
     }
 

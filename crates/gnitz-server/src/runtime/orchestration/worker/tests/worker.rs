@@ -1,54 +1,24 @@
 use super::*;
+use crate::runtime::test_support::decode_continuation;
 use crate::runtime::w2m::{self, W2mReceiver};
 use gnitz_engine::catalog::PUBLIC_SCHEMA_ID;
-use gnitz_engine_testkit::{col_def, CatalogTestExt};
+use gnitz_engine_testkit::{col_def, make_batch_raw, make_schema_u64_i64, u64_pk_schema, CatalogTestExt};
+use gnitz_store::schema::SchemaColumn;
 use gnitz_store::schema::SchemaDescriptor;
-
-fn test_schema() -> SchemaDescriptor {
-    use gnitz_store::schema::SchemaColumn;
-    use gnitz_wire::type_code;
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U64, 0),
-        ],
-        &[0],
-    )
-}
-
-/// A one-row batch of `schema` with the given PK and payload value.
-fn one_row_batch(schema: &SchemaDescriptor, pk: u128, v: u64) -> Batch {
-    let mut b = Batch::with_capacity(*schema, 1);
-    b.extend_pk(pk);
-    b.extend_weight(&1i64.to_le_bytes());
-    b.extend_null_bmp(&0u64.to_le_bytes());
-    b.extend_col(0, &v.to_le_bytes());
-    b.count = 1;
-    b
-}
-
-fn make_handler() -> WorkerExchangeHandler {
-    WorkerExchangeHandler {
-        deferred: Vec::<DeferredDdl>::new(),
-        deferred_replay: Vec::new(),
-        pending_relays: HashMap::new(),
-        backfill_pad: None,
-        backfill_signal: None,
-    }
-}
+use gnitz_wire::type_code;
 
 /// `buffer_pending_delta` appends into an existing entry rather than
 /// replacing it — the shape the live push path and boot SAL replay share.
 #[test]
-fn test_pending_deltas_accumulation() {
-    let schema = test_schema();
+fn pending_deltas_accumulate_per_relation() {
+    let schema = make_schema_u64_i64();
     let mut pending: HashMap<i64, Batch> = HashMap::new();
 
-    buffer_pending_delta(&mut pending, 100, one_row_batch(&schema, 1, 10));
+    buffer_pending_delta(&mut pending, 100, make_batch_raw(&schema, &[(1, 1, 10)]));
     assert_eq!(pending[&100].count, 1);
-    buffer_pending_delta(&mut pending, 100, one_row_batch(&schema, 2, 20));
+    buffer_pending_delta(&mut pending, 100, make_batch_raw(&schema, &[(2, 1, 20)]));
     assert_eq!(pending[&100].count, 2, "a second delta appends to the same table");
-    buffer_pending_delta(&mut pending, 200, one_row_batch(&schema, 3, 30));
+    buffer_pending_delta(&mut pending, 200, make_batch_raw(&schema, &[(3, 1, 30)]));
     assert_eq!(pending[&200].count, 1, "a different table gets its own entry");
 }
 
@@ -59,7 +29,7 @@ fn test_pending_deltas_accumulation() {
 /// distinct id, then read the messages back through `decode_wire` and
 /// assert the ids round-trip.
 #[test]
-fn test_send_helpers_echo_request_id() {
+fn send_helpers_echo_the_request_id() {
     use crate::runtime::wire as ipc;
     let (region, w2m_writer) = make_ring();
     let region_ptr = region.ptr();
@@ -73,7 +43,7 @@ fn test_send_helpers_echo_request_id() {
     // Pass ReplySchema::ClientAuthored: it emits no block and so consults
     // no catalog, which this test does not have (null catalog pointer).
     // The id round-trip is the assertion of interest.
-    let schema = test_schema();
+    let schema = make_schema_u64_i64();
     wp.send_response(8, None, ReplySchema::ClientAuthored(&schema), req_resp, 0, 0u128)
         .unwrap();
     wp.send_error("boom", req_err);
@@ -85,17 +55,13 @@ fn test_send_helpers_echo_request_id() {
     assert_eq!(decoded_ids, vec![req_ack, req_resp, req_err]);
 }
 
-#[test]
-fn from_wire_zero_is_primary_key() {
-    assert!(matches!(HasPkLookup::from_wire(0), HasPkLookup::PrimaryKey));
-}
-
 /// `seek_col_idx` carries `pack_pk_cols(cols)` — the packed flag (bit 63) is
 /// always set, so it is never 0 and never collides with the PK sentinel —
 /// optionally OR'd with the holder directive on bit 62, which must survive
 /// the round trip without disturbing the column list.
 #[test]
 fn from_wire_decodes_the_column_list_with_and_without_the_holder_directive() {
+    assert!(matches!(HasPkLookup::from_wire(0), HasPkLookup::PrimaryKey));
     for cols in [&[0u32][..], &[3][..], &[63][..], &[1, 4][..], &[0, 2, 5, 7][..]] {
         let packed = gnitz_wire::pack_pk_cols(cols);
         assert_ne!(packed, 0);
@@ -117,20 +83,15 @@ fn from_wire_decodes_the_column_list_with_and_without_the_holder_directive() {
 
 // -- Walk-the-matrix dispatch tests ---------------------------------------
 
-/// The one test constructor for `WorkerProcess`. Fields a test does not
-/// exercise stay null/zeroed/default; pre-seeded state (`sal_reader`,
-/// `pending_streams`, `reply_frame_budget`) is assigned after construction.
+/// The one test constructor for `WorkerProcess`, through the production one so
+/// a new field cannot be missed here. A zeroed `SalReader` is a null log: only
+/// the SAL-drain tests read one, and they assign a real reader afterwards. The
+/// budget is pinned rather than read from the environment, so a shell that
+/// exports `GNITZ_REPLY_FRAME_BUDGET` does not reshape these frames.
 fn make_test_worker(catalog: *mut CatalogEngine, writer: W2mWriter) -> WorkerProcess {
-    WorkerProcess {
-        master_pid: 0,
-        catalog,
-        sal_reader: unsafe { std::mem::zeroed() },
-        w2m_writer: writer,
-        exchange: make_handler(),
-        pending_deltas: HashMap::new(),
-        pending_streams: VecDeque::new(),
-        reply_frame_budget: ipc::FRAME_CAP,
-    }
+    let mut wp = WorkerProcess::new(0, catalog, unsafe { std::mem::zeroed() }, writer, HashMap::new());
+    wp.reply_frame_budget = ipc::FRAME_CAP;
+    wp
 }
 
 /// One SAL group as the matrix tests hand it to `dispatch`: a kind, a
@@ -160,7 +121,7 @@ fn make_worker_for_matrix() -> WorkerProcess {
 /// not run inline. Cited bug: an inline tick eval re-enters `view_id`
 /// with a different source and produces schema-mismatched relays.
 #[test]
-fn test_dispatch_matrix_tick_defers_inside_exchange() {
+fn tick_defers_inside_exchange() {
     let mut wp = make_worker_for_matrix();
     let ctx = DispatchContext::InEval { relay_wait: (100, 5) };
     assert!(wp.exchange.deferred_replay.is_empty());
@@ -186,7 +147,7 @@ fn test_dispatch_matrix_tick_defers_inside_exchange() {
 /// real `T`: the client would advance its cursor over rounds it never
 /// received. It shares the tick's FIFO, so the replay order is SAL order.
 #[test]
-fn test_dispatch_matrix_delta_read_defers_inside_exchange_with_its_whole_request() {
+fn delta_read_defers_inside_exchange_with_its_whole_request() {
     let mut wp = make_worker_for_matrix();
     let ctx = DispatchContext::InEval { relay_wait: (100, 5) };
     let frame = Box::leak(
@@ -262,9 +223,9 @@ fn encode_data_frame(target_id: u64, schema: &SchemaDescriptor, batch: &Batch) -
 /// matches `want_key` returns `RelayMatched(batch)`; a non-matching
 /// pair is parked in `pending_relays`.
 #[test]
-fn test_dispatch_matrix_exchange_relay_inside_exchange() {
+fn exchange_relay_inside_exchange() {
     let mut wp = make_worker_for_matrix();
-    let schema = test_schema();
+    let schema = make_schema_u64_i64();
     let want_key = (100, 0);
     let ctx = DispatchContext::InEval { relay_wait: want_key };
 
@@ -291,7 +252,7 @@ fn test_dispatch_matrix_exchange_relay_inside_exchange() {
 /// while the worker is blocked in `do_exchange_wait`. The dispatcher
 /// warns and continues; no observable state change.
 #[test]
-fn test_dispatch_matrix_exchange_relay_top_level_warns_and_continues() {
+fn exchange_relay_top_level_warns_and_continues() {
     let mut wp = make_worker_for_matrix();
     let empty: &'static [u8] = &[];
     assert!(wp
@@ -314,12 +275,12 @@ fn test_dispatch_matrix_exchange_relay_top_level_warns_and_continues() {
 /// matches exhaustively on `(ctx, kind)` — so what needs a test is the
 /// defer decision itself.)
 #[test]
-fn test_dispatch_matrix_ddl_sync_defers_inside_exchange() {
+fn ddl_sync_defers_inside_exchange() {
     let mut wp = make_worker_for_matrix();
-    let schema = test_schema();
+    let schema = make_schema_u64_i64();
     let ctx = DispatchContext::InEval { relay_wait: (0, 0) };
 
-    let frame = encode_data_frame(42, &schema, &one_row_batch(&schema, 1, 10));
+    let frame = encode_data_frame(42, &schema, &make_batch_raw(&schema, &[(1, 1, 10)]));
     assert!(wp
         .dispatch(ctx, &sal_msg(SalMessageKind::DdlSync, 42, 0), Some(frame))
         .is_none());
@@ -345,20 +306,16 @@ fn test_dispatch_matrix_ddl_sync_defers_inside_exchange() {
 /// 3. `SalReader::rewind` moves to cursor 0 in the next epoch, which is
 ///    exactly where the master writes after its own reset.
 #[test]
-fn test_next_sal_message_epoch_gating() {
-    use crate::runtime::sal::{SalReader, SalWriter, ZoneMark};
+fn next_sal_message_gates_on_the_epoch() {
+    use crate::runtime::sal::fixtures::TestLog;
+    use crate::runtime::sal::SalReader;
 
     const SAL_SIZE: usize = 1 << 20;
-    let sal_region = crate::runtime::test_support::SharedRegion::new(SAL_SIZE);
-    let sal_ptr = sal_region.ptr();
-
     // Single worker; each group puts a one-byte payload at slot 0.
-    let writer = SalWriter::new(sal_ptr, -1, SAL_SIZE as u64, 1);
+    let sal = TestLog::new(SAL_SIZE, 1, 1);
     let write = |target, lsn, kind, epoch| {
-        writer.reset(writer.cursor(), epoch);
-        writer
-            .write_raw_slots(target, lsn, kind, ZoneMark::Plain, &[&[0u8; 1]])
-            .expect("group fits");
+        sal.seek(sal.cursor(), epoch);
+        sal.write(target, lsn, kind, &[&[0u8; 1]]);
     };
 
     write(42, 100, SalMessageKind::Push, 1);
@@ -367,7 +324,7 @@ fn test_next_sal_message_epoch_gating() {
     write(44, 102, SalMessageKind::Push, 2);
 
     let mut wp = make_test_worker(std::ptr::null_mut(), unsafe { std::mem::zeroed() });
-    wp.sal_reader = unsafe { SalReader::new(sal_ptr as *const u8, 0, SAL_SIZE, -1, 1) };
+    wp.sal_reader = unsafe { SalReader::new(sal.ptr() as *const u8, 0, SAL_SIZE, -1, 1) };
 
     let next = |wp: &mut WorkerProcess| wp.next_sal_message().map(|m| (m.kind, m.target_id));
     assert_eq!(next(&mut wp), Some((SalMessageKind::Push, 42)));
@@ -380,10 +337,8 @@ fn test_next_sal_message_epoch_gating() {
 
     // After the rewind the reader is at cursor 0 in epoch 2, where the master
     // writes its first post-checkpoint group.
-    writer.reset(0, 2);
-    writer
-        .write_raw_slots(77, 103, SalMessageKind::Push, ZoneMark::Plain, &[&[0u8; 1]])
-        .expect("group fits");
+    sal.seek(0, 2);
+    sal.write(77, 103, SalMessageKind::Push, &[&[0u8; 1]]);
     wp.sal_reader.rewind();
     assert_eq!(next(&mut wp), Some((SalMessageKind::Push, 77)));
 }
@@ -393,7 +348,7 @@ fn test_next_sal_message_epoch_gating() {
 /// A production-sized ring and its writer. The mmap reservation is
 /// lazily populated, so the 1 GiB backing costs address space, not RAM.
 fn make_ring() -> (crate::runtime::test_support::SharedRegion, W2mWriter) {
-    let region = unsafe { w2m::test_ring(w2m::W2M_REGION_SIZE) };
+    let region = unsafe { w2m::fixtures::test_ring(w2m::W2M_REGION_SIZE) };
     let writer = W2mWriter::new(region.ptr());
     (region, writer)
 }
@@ -401,56 +356,13 @@ fn make_ring() -> (crate::runtime::test_support::SharedRegion, W2mWriter) {
 /// A U64 PK with a stride-4 payload column: the shape whose wire block pads
 /// between regions, so its size is monotone in the row count but not affine.
 fn padded_schema() -> SchemaDescriptor {
-    use gnitz_store::schema::SchemaColumn;
-    use gnitz_wire::type_code;
-    SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::U32, 0),
-        ],
-        &[0],
-    )
+    u64_pk_schema(SchemaColumn::new(type_code::U32, 0))
 }
 
-fn make_padded_batch(n: usize) -> Batch {
-    let schema = padded_schema();
-    let mut b = Batch::with_capacity(schema, n.max(1));
-    for i in 0..n {
-        b.extend_pk(i as u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &(i as u32).to_le_bytes());
-        b.count += 1;
-    }
-    b
-}
-
+/// `n` rows of `schema`, PK and payload both counting from 0.
 fn make_n_row_batch(schema: SchemaDescriptor, n: usize) -> Batch {
-    let mut b = Batch::with_capacity(schema, n.max(1));
-    for i in 0..n {
-        b.extend_pk(i as u128);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &(i as u64).to_le_bytes());
-        b.count += 1;
-    }
-    b
-}
-
-/// Decode a continuation frame (data, no schema block) against `schema`, the
-/// way the master's reply-train reader does: the zero-copy decoder, fed the
-/// frame's own control block and a caller-held region-offset array.
-fn decode_continuation<'a>(
-    bytes: &'a [u8],
-    schema: &gnitz_store::schema::SchemaDescriptor,
-    offsets: &'a mut [usize; gnitz_store::storage::MAX_BATCH_REGIONS],
-) -> Result<ipc::DecodedWireZeroCopy<'a>, &'static str> {
-    let ctrl = gnitz_wire::control::peek_control_block_ipc(bytes)?;
-    let hint = ipc::SchemaWithVersion {
-        descriptor: schema,
-        version: 0,
-    };
-    ipc::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, Some(hint), offsets)
+    let rows: Vec<(u64, i64, i64)> = (0..n as u64).map(|i| (i, 1, i as i64)).collect();
+    make_batch_raw(&schema, &rows)
 }
 
 /// Row `row`'s PK widened from its OPK bytes — `Batch::get_pk` for a
@@ -478,45 +390,14 @@ fn range_size(batch: &Batch, count: usize, prebuilt: Option<&[u8]>) -> usize {
     .size()
 }
 
-/// The property `emit_chunk`'s search rests on: a chunk's wire size is
-/// `base + wire_byte_size_range(n)` for every `n >= 1`, and that function is
-/// monotone non-decreasing in `n`. Affine only when every region stride is a
-/// multiple of 8 — the padded schema below is exactly where it is not, and
-/// where inverting a linear model overshoots the budget.
-///
-/// A zero-row chunk carries no data block at all (`has_data()` is false), so
-/// `base` is that message and the identity starts at one row.
-#[test]
-fn test_chunk_wire_size_is_monotone_and_exactly_measured() {
-    for (label, batch) in [
-        ("8-aligned", make_n_row_batch(test_schema(), 32)),
-        ("padded", make_padded_batch(32)),
-    ] {
-        let block = gnitz_engine::catalog::encode_schema_block(&batch.schema, 1);
-        let base = range_size(&batch, 0, Some(block.as_slice()));
-
-        let mut prev = 0;
-        for n in 1..=32usize {
-            let size = batch.wire_byte_size_range(n);
-            assert!(size >= prev, "{label}: wire size fell from {n} rows back");
-            prev = size;
-            assert_eq!(
-                range_size(&batch, n, Some(block.as_slice())),
-                base + size,
-                "{label}: {n}-row chunk"
-            );
-        }
-    }
-}
-
 /// Every non-terminal frame of a train fills its budget to within one row:
 /// one more row would exceed it. Both an 8-aligned and a padded schema, since
 /// a chunk sized by inverting a linear model overshoots on the padded one.
 #[test]
-fn test_train_frames_fill_the_budget_to_within_one_row() {
+fn train_frames_fill_the_budget_to_within_one_row() {
     for (label, batch) in [
-        ("8-aligned", make_n_row_batch(test_schema(), 40)),
-        ("padded", make_padded_batch(40)),
+        ("8-aligned", make_n_row_batch(make_schema_u64_i64(), 40)),
+        ("padded", make_n_row_batch(padded_schema(), 40)),
     ] {
         let block = Rc::new(gnitz_engine::catalog::encode_schema_block(&batch.schema, 1));
         let per_row = batch.wire_byte_size_range(2) - batch.wire_byte_size_range(1);
@@ -563,166 +444,56 @@ fn test_train_frames_fill_the_budget_to_within_one_row() {
 
 /// First (and only) PendingScan chunk — next_row == 0, so the prebuilt schema
 /// block must appear in the frame and decode_wire_ipc must succeed without a hint.
+/// `force_fifo` is the whole difference between a splittable reply emitting
+/// inline and the same reply queueing through `pending_streams` — which is what
+/// puts a multi-scan's relations on the ring in request order. Either way its
+/// lone chunk is byte-shaped the same.
 #[test]
-fn test_pending_scan_first_chunk_includes_schema() {
-    let schema = test_schema();
-    let batch = make_n_row_batch(schema, 10);
-    let schema_block = Rc::new(gnitz_engine::catalog::encode_schema_block(&schema, 1));
+fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
+    let schema = make_schema_u64_i64();
+    for force_fifo in [false, true] {
+        let (region, writer) = make_ring();
+        let ptr = region.ptr();
+        let mut wp = make_test_worker(std::ptr::null_mut(), writer);
 
-    let (region, writer) = make_ring();
-    let ptr = region.ptr();
-    let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.pending_streams.push_back(PendingScan {
-        batch: Rc::new(batch),
-        request_id: 7,
-        client_id: 42,
-        target_id: 1,
-        prebuilt_schema: Some(schema_block),
-        server_version: 0,
-        kind: PendingScanKind::Chunked { next_row: 0 },
-    });
+        wp.send_scan_response(
+            1,
+            Rc::new(make_n_row_batch(schema, 5)),
+            ReplySchema::ClientAuthored(&schema),
+            3,
+            0,
+            0,
+            force_fifo,
+        )
+        .expect("a small batch must not error");
 
-    wp.emit_pending_scan_chunk();
-    assert!(
-        wp.pending_streams.is_empty(),
-        "10 rows fit in one chunk; the train must pop off the queue"
-    );
+        if force_fifo {
+            assert_eq!(wp.pending_streams.len(), 1, "force_fifo must enqueue, not emit");
+            assert!(
+                matches!(
+                    wp.pending_streams.front().map(|p| &p.kind),
+                    Some(PendingScanKind::Chunked { .. })
+                ),
+                "a splittable reply queues as the Chunked variant"
+            );
+            wp.emit_pending_scan_chunk();
+        }
+        assert!(wp.pending_streams.is_empty(), "the queue ends empty either way");
 
-    let data = consume_one(ptr);
-    let decoded = ipc::decode_wire_ipc(&data).expect("first chunk must decode without schema hint");
-    assert!(decoded.schema.is_some(), "first chunk must carry schema block");
-    let b = decoded.data_batch.expect("first chunk must carry data");
-    assert_eq!(b.count, 10);
-    for i in 0..10usize {
-        assert_eq!(b.get_pk(i), i as u128);
+        let data = consume_one(ptr);
+        let ctrl = gnitz_wire::control::peek_control_block_ipc(&data).expect("peek_control_block");
+        assert_eq!(ctrl.status, STATUS_OK);
+        assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0);
+        assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
+
+        let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
+        let decoded = decode_continuation(&data, &schema, 0, &mut offsets).expect("decode with schema hint");
+        let b = decoded.data_batch.as_ref().expect("data block");
+        assert_eq!(b.count, 5);
+        for i in 0..5usize {
+            assert_eq!(mem_pk(b, i), i as u128);
+        }
     }
-    assert_ne!(
-        decoded.control.flags & FLAG_SCAN_LAST,
-        0,
-        "FLAG_SCAN_LAST must be set on the only chunk"
-    );
-    assert_ne!(
-        decoded.control.flags & FLAG_CONTINUATION,
-        0,
-        "FLAG_CONTINUATION must always be set on worker scan frames"
-    );
-}
-
-/// Continuation chunk — next_row > 0, prebuilt_schema == None. The frame carries
-/// no schema block: it fails to decode standalone, and against a schema hint
-/// it yields only the remaining rows (rows [5, 10)).
-#[test]
-fn test_pending_scan_continuation_chunk_excludes_schema() {
-    let schema = test_schema();
-    let batch = make_n_row_batch(schema, 10);
-
-    let (region, writer) = make_ring();
-    let ptr = region.ptr();
-    let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.pending_streams.push_back(PendingScan {
-        batch: Rc::new(batch),
-        request_id: 9,
-        client_id: 0,
-        target_id: 1,
-        prebuilt_schema: None,
-        server_version: 0,
-        kind: PendingScanKind::Chunked { next_row: 5 },
-    });
-
-    wp.emit_pending_scan_chunk();
-    assert!(wp.pending_streams.is_empty(), "remaining 5 rows fit in one chunk");
-
-    let data = consume_one(ptr);
-    assert!(
-        ipc::decode_wire_ipc(&data).is_err(),
-        "continuation frame without schema must fail decode_wire_ipc"
-    );
-    let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-    let decoded =
-        decode_continuation(&data, &schema, &mut offsets).expect("continuation decodes against a schema hint");
-    let b = decoded.data_batch.as_ref().expect("continuation chunk must carry data");
-    assert_eq!(b.count, 5);
-    for i in 0..5usize {
-        assert_eq!(mem_pk(b, i), (i + 5) as u128);
-    }
-    assert_ne!(
-        decoded.control.flags & FLAG_SCAN_LAST,
-        0,
-        "FLAG_SCAN_LAST must be set on the last chunk"
-    );
-    assert_ne!(decoded.control.flags & FLAG_CONTINUATION, 0);
-}
-
-/// send_scan_response with schema=None (avoids catalog) emits a single ring
-/// message with FLAG_CONTINUATION | FLAG_SCAN_LAST for a small batch,
-/// and leaves the stream queue empty.
-#[test]
-fn test_send_scan_response_single_frame() {
-    let schema = test_schema();
-    let batch = make_n_row_batch(schema, 5);
-
-    let (region, writer) = make_ring();
-    let ptr = region.ptr();
-    let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-
-    let err = wp.send_scan_response(1, Rc::new(batch), ReplySchema::ClientAuthored(&schema), 3, 0, 0, false);
-    assert!(err.is_ok(), "a small batch must not error");
-    assert!(
-        wp.pending_streams.is_empty(),
-        "batch fits in one frame; send_scan_response must not enqueue a train"
-    );
-
-    let data = consume_one(ptr);
-    let ctrl = gnitz_wire::control::peek_control_block_ipc(&data).expect("peek_control_block");
-    assert_eq!(ctrl.status, STATUS_OK);
-    assert_ne!(
-        ctrl.flags & FLAG_SCAN_LAST,
-        0,
-        "single-frame response must set FLAG_SCAN_LAST"
-    );
-    assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
-
-    let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-    let decoded = decode_continuation(&data, &schema, &mut offsets).expect("decode with schema hint");
-    let b = decoded.data_batch.as_ref().expect("data block");
-    assert_eq!(b.count, 5);
-    for i in 0..5usize {
-        assert_eq!(mem_pk(b, i), i as u128);
-    }
-}
-
-/// FLAG_SCAN_FIFO_REPLY (force_fifo=true) routes even an immediate-emit-
-/// eligible splittable reply through `pending_streams`, so a multi-scan's
-/// relations reach the ring in request order. Without the flag the identical
-/// reply emits inline (test_send_scan_response_single_frame). Its lone chunk
-/// is byte-shaped exactly like the single-frame path.
-#[test]
-fn test_force_fifo_queues_splittable_single_frame() {
-    let schema = test_schema();
-    let batch = make_n_row_batch(schema, 5);
-    let (region, writer) = make_ring();
-    let ptr = region.ptr();
-    let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-
-    wp.send_scan_response(1, Rc::new(batch), ReplySchema::ClientAuthored(&schema), 3, 0, 0, true)
-        .unwrap();
-    assert_eq!(wp.pending_streams.len(), 1, "force_fifo must enqueue, not emit");
-    assert!(
-        matches!(
-            wp.pending_streams.front().map(|p| &p.kind),
-            Some(PendingScanKind::Chunked { .. })
-        ),
-        "a splittable reply queues as the Chunked variant"
-    );
-    assert!(walk_frames(ptr).is_empty(), "nothing is emitted at enqueue time");
-
-    wp.emit_pending_scan_chunk();
-    assert!(wp.pending_streams.is_empty(), "a one-chunk train pops after one emit");
-    let frames = walk_frames(ptr);
-    assert_eq!(frames.len(), 1);
-    let ctrl = gnitz_wire::control::peek_control_block_ipc(&frames[0].1).unwrap();
-    assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0);
-    assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
 }
 
 /// A blob-bearing (STRING/TEXT) reply must FIFO too: under force_fifo it
@@ -731,10 +502,8 @@ fn test_force_fifo_queues_splittable_single_frame() {
 /// FLAG_CONTINUATION | FLAG_SCAN_LAST, then pops. This is the mainline case a
 /// TEXT dimension table hits.
 #[test]
-fn test_force_fifo_queues_whole_blob_single_frame() {
-    use gnitz_wire::type_code;
-
-    let dir = worker_temp_dir("force_fifo_text");
+fn force_fifo_queues_a_whole_blob_reply() {
+    let dir = gnitz_engine_testkit::scratch_dir("worker", "force_fifo_text");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("s", type_code::STRING)];
     let tid = gnitz_engine::catalog::FIRST_USER_TABLE_ID;
@@ -749,7 +518,7 @@ fn test_force_fifo_queues_whole_blob_single_frame() {
     let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
 
     // One all-zero TEXT row (empty inline string), well under MAX_W2M_MSG.
-    let batch = zero_batch(schema, 1);
+    let batch = Batch::zeroed(schema, 1);
     wp.send_scan_response(tid as u64, Rc::new(batch), ReplySchema::Table(&schema), 5, 0, 0, true)
         .unwrap();
     assert_eq!(wp.pending_streams.len(), 1);
@@ -776,29 +545,6 @@ fn test_force_fifo_queues_whole_blob_single_frame() {
     assert_eq!(decoded.data_batch.map(|b| b.count).unwrap_or(0), 1);
 
     engine.close();
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The one predicate that decides whether a reply can be split across
-/// frames. A narrow fixed-width column does not stop it — only a German
-/// string does, whose heap cannot be cut at a row boundary.
-#[test]
-fn test_only_a_german_string_blocks_chunking() {
-    use gnitz_store::schema::SchemaColumn;
-    use gnitz_wire::type_code;
-    let with_string = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::STRING, 0),
-        ],
-        &[0],
-    );
-    assert!(with_string.has_german_string());
-    assert!(!test_schema().has_german_string());
-    assert!(
-        !padded_schema().has_german_string(),
-        "a stride-4 column must not block chunking"
-    );
 }
 
 // -- stream_batch_response / pending_streams FIFO tests --------------------
@@ -816,19 +562,12 @@ fn walk_frames(ptr: *mut u8) -> Vec<(u32, Vec<u8>)> {
 
 /// A batch of `count` decodable all-zero rows — used to cross a wire-size
 /// limit without writing that many real bytes.
-fn zero_batch(schema: SchemaDescriptor, count: usize) -> Batch {
-    Batch::zeroed(schema, count)
-}
-
 /// Two queued trains drain strictly FIFO: every frame of train A
 /// (multi-chunk, terminal FLAG_SCAN_LAST) precedes train B's, and B's
 /// first chunk carries B's own schema block.
 #[test]
-fn test_pending_streams_fifo_two_trains() {
-    use gnitz_store::schema::SchemaColumn;
-    use gnitz_wire::type_code;
-
-    let schema_a = test_schema();
+fn pending_streams_drain_two_trains_fifo() {
+    let schema_a = make_schema_u64_i64();
     // B's schema has 3 columns so its frames are distinguishable from A's.
     let schema_b = SchemaDescriptor::new(
         &[
@@ -909,8 +648,12 @@ fn test_pending_streams_fifo_two_trains() {
                 assert_eq!(s.num_columns(), ncols, "the block is this train's schema");
                 rows += decoded.data_batch.map(|b| b.count).unwrap_or(0);
             } else {
+                assert!(
+                    ipc::decode_wire_ipc(bytes).is_err(),
+                    "a continuation carries no schema block, so it cannot decode standalone"
+                );
                 let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-                let decoded = decode_continuation(bytes, schema, &mut offsets)
+                let decoded = decode_continuation(bytes, schema, 0, &mut offsets)
                     .expect("continuation decodes against the schema hint");
                 rows += decoded.data_batch.map(|b| b.count).unwrap_or(0);
             }
@@ -924,8 +667,8 @@ fn test_pending_streams_fifo_two_trains() {
 /// consumers forward these slots verbatim, so the single-frame wire shape
 /// must not change. Covers both the non-empty and the empty-result paths.
 #[test]
-fn test_stream_batch_response_single_frame_byte_identical() {
-    let schema = test_schema();
+fn a_fitting_stream_batch_is_byte_identical_to_send_response() {
+    let schema = make_schema_u64_i64();
     let batch = make_n_row_batch(schema, 5);
 
     let (region_ref, writer_ref) = make_ring();
@@ -972,10 +715,10 @@ fn test_stream_batch_response_single_frame_byte_identical() {
 /// An oversized splittable result enqueues a train instead of emitting a
 /// frame past `ipc::FRAME_CAP`; nothing is emitted until drain_sal.
 #[test]
-fn test_stream_batch_response_oversized_enqueues_train() {
-    let schema = test_schema(); // 32 B/row on the wire
+fn an_oversized_stream_batch_enqueues_a_train() {
+    let schema = make_schema_u64_i64(); // 32 B/row on the wire
     let rows = (ipc::FRAME_CAP / 32) + 4096;
-    let batch = zero_batch(schema, rows);
+    let batch = Batch::zeroed(schema, rows);
 
     let (region, writer) = make_ring();
     let ptr = region.ptr();
@@ -996,17 +739,11 @@ fn test_stream_batch_response_oversized_enqueues_train() {
     );
 }
 
-fn worker_temp_dir(name: &str) -> String {
-    gnitz_engine_testkit::scratch_dir("worker", name)
-}
-
 /// An oversized blob-bearing (STRING) result returns the clean error — the
 /// variable-width streaming chunker is an explicit non-goal.
 #[test]
-fn test_stream_batch_response_oversized_string_errors() {
-    use gnitz_wire::type_code;
-
-    let dir = worker_temp_dir("string_oversized");
+fn an_oversized_string_batch_cannot_be_chunked() {
+    let dir = gnitz_engine_testkit::scratch_dir("worker", "string_oversized");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("s", type_code::STRING)];
     let tid = gnitz_engine::catalog::FIRST_USER_TABLE_ID;
@@ -1018,7 +755,7 @@ fn test_stream_batch_response_oversized_string_errors() {
 
     // 40 B/row (8 pk + 8 weight + 8 null + 16 string struct), empty blob.
     let rows = (ipc::FRAME_CAP / 40) + 4096;
-    let batch = zero_batch(schema, rows);
+    let batch = Batch::zeroed(schema, rows);
 
     let (_region, writer) = make_ring();
     let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
@@ -1032,7 +769,6 @@ fn test_stream_batch_response_oversized_string_errors() {
     assert!(wp.pending_streams.is_empty(), "a blob-bearing result never enqueues");
 
     engine.close();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A projected (gather) reply schema must ride a ONE-OFF wire block: the
@@ -1040,10 +776,8 @@ fn test_stream_batch_response_oversized_string_errors() {
 /// projected rows with the base table's stride) nor store it (a later
 /// table reply would be decoded with the projected stride).
 #[test]
-fn test_stream_batch_response_projected_schema_one_off_block() {
-    use gnitz_wire::type_code;
-
-    let dir = worker_temp_dir("projected_one_off");
+fn a_projected_stream_batch_carries_a_one_off_block() {
+    let dir = gnitz_engine_testkit::scratch_dir("worker", "projected_one_off");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![
         col_def("id", type_code::U64),
@@ -1063,7 +797,7 @@ fn test_stream_batch_response_projected_schema_one_off_block() {
     let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
 
     // Fitting projected reply: one frame carrying the projected schema.
-    let small = zero_batch(projected, 2);
+    let small = Batch::zeroed(projected, 2);
     assert!(wp
         .stream_batch_response(tid as u64, Some(small), ReplySchema::OneOff(&projected), 5, 0, 0)
         .is_ok());
@@ -1077,7 +811,7 @@ fn test_stream_batch_response_projected_schema_one_off_block() {
 
     // Oversized projected reply: the queued train holds the one-off block.
     let rows = (ipc::FRAME_CAP / 32) + 4096;
-    let big = zero_batch(projected, rows);
+    let big = Batch::zeroed(projected, rows);
     assert!(wp
         .stream_batch_response(tid as u64, Some(big), ReplySchema::OneOff(&projected), 6, 0, 0)
         .is_ok());
@@ -1101,5 +835,4 @@ fn test_stream_batch_response_projected_schema_one_off_block() {
     );
 
     engine.close();
-    let _ = std::fs::remove_dir_all(&dir);
 }

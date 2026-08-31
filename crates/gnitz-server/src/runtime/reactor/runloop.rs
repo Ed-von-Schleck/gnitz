@@ -16,39 +16,6 @@ impl Reactor {
         key
     }
 
-    /// Drive `fut` to completion. Single-threaded, blocking. Spawns the
-    /// future as a task internally and returns its output via a shared cell.
-    #[cfg(test)]
-    pub(super) fn block_on<F, T>(&self, fut: F) -> T
-    where
-        F: Future<Output = T> + 'static,
-        T: 'static,
-    {
-        let out: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
-        let out_capture = Rc::clone(&out);
-        let root_key = self.spawn(async move {
-            let v = fut.await;
-            *out_capture.borrow_mut() = Some(v);
-        });
-
-        // Drive the reactor until the root task completes. The `tasks`
-        // map removes the entry on completion, so `contains_key(root_key)`
-        // returning false is the termination signal.
-        loop {
-            self.tick(true);
-            if !self.inner.tasks.borrow().contains_key(&root_key) {
-                break;
-            }
-        }
-
-        // SAFETY: spawn ran the future to completion, so Some.
-        let v = out
-            .borrow_mut()
-            .take()
-            .expect("block_on root task did not produce output");
-        v
-    }
-
     /// Single iteration of the event loop:
     ///   1. drain CQEs and every W2M ring (waking reply / timeout / fsync wakers)
     ///   2. poll all tasks in the run queue (each polled at most once)

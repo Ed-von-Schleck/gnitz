@@ -489,7 +489,11 @@ fn a_second_handle_on_one_directory_is_refused() {
     let dir = fx.base_dir();
     fx.mirror = None;
     let held = Mirror::open(&dir).expect("the directory is free again");
-    let out = run_test_in_child("second_process_open_child", &[("GNITZ_MIRROR_LOCK_DIR", &dir)]);
+    let out = run_test_in_child(
+        module_path!(),
+        "second_process_open_child",
+        &[("GNITZ_MIRROR_LOCK_DIR", &dir)],
+    );
     assert_child_ok(&out, "the second-process child must run to the end");
     let printed = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -2322,7 +2326,7 @@ fn run_child(name: &str, server: &ServerHandle, dir: &tempfile::TempDir, envs: &
         ("GNITZ_MIRROR_DIR", dir.path().to_str().unwrap()),
     ];
     all.extend_from_slice(envs);
-    let out = run_test_in_child(name, &all);
+    let out = run_test_in_child(module_path!(), name, &all);
     assert_child_ok(&out, what);
     String::from_utf8_lossy(&out.stdout).into_owned()
 }

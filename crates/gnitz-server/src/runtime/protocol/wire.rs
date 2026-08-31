@@ -224,14 +224,6 @@ impl<'a> WireMsg<'a> {
         self.encode_impl(out, offset, false)
     }
 
-    /// Encode into a fresh `Vec` sized by [`size`](WireMsg::size).
-    #[cfg(test)]
-    pub(crate) fn encode_to_vec(&self) -> Vec<u8> {
-        let mut buf = vec![0u8; self.size()];
-        self.encode(&mut buf, 0);
-        buf
-    }
-
     fn encode_impl(&self, out: &mut [u8], offset: usize, checksum: bool) -> usize {
         let has_data = self.has_data();
 
@@ -545,3 +537,7 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
         data_batch,
     })
 }
+
+#[cfg(test)]
+#[path = "tests/wire.rs"]
+mod tests;

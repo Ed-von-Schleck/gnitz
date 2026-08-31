@@ -1,10 +1,10 @@
 use super::*;
 
 /// In a forked child, because lowering the soft limit is process-wide and
-/// would break every concurrently running test. In the parent the limit is
-/// already above 1024, so `raise_fd_limit` early-returns and asserts nothing.
+/// would break every concurrently running test: the child lowers it to 64 and
+/// exits non-zero unless `raise_fd_limit` pushed it back to 1024.
 #[test]
-fn test_raise_fd_limit() {
+fn the_fd_limit_is_raised_to_the_requested_soft_ceiling() {
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
     if pid == 0 {
@@ -17,7 +17,5 @@ fn test_raise_fd_limit() {
         let raised = rl.rlim_cur >= 1024.min(rl.rlim_max);
         unsafe { libc::_exit(i32::from(lowered != 0 || !raised)) };
     }
-    let mut status = 0;
-    unsafe { libc::waitpid(pid, &mut status, 0) };
-    assert_eq!(libc::WEXITSTATUS(status), 0, "soft limit not raised from 64 to 1024");
+    unsafe { crate::runtime::test_support::assert_child_exited_ok(pid) };
 }

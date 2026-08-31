@@ -1247,45 +1247,12 @@ impl SalWriter {
         self.rewind(self.epoch.get() + 1);
     }
 
-    /// Place the cursor and epoch by hand. `sal_epoch_fence` lays two groups at
-    /// consecutive offsets under *different* epochs to prove each group's epoch
-    /// is read from its own header — a shape no `rewind` can produce.
-    #[cfg(test)]
-    pub fn reset(&self, cursor: u64, epoch: u32) {
-        self.write_cursor.set(cursor);
-        self.epoch.set(epoch);
-    }
-
-    #[cfg(test)]
-    pub fn cursor(&self) -> u64 {
-        self.write_cursor.get()
-    }
-
     pub fn epoch(&self) -> u32 {
         self.epoch.get()
     }
 
     pub fn sal_fd(&self) -> i32 {
         self.fd
-    }
-
-    /// Write one group whose slots are the raw `payloads` (test helper), through
-    /// the production `begin` / `for_each_slot` / `finish` so the writer's own
-    /// cursor advances with it.
-    #[cfg(test)]
-    pub(crate) fn write_raw_slots(
-        &self,
-        target_id: u32,
-        lsn: u64,
-        kind: SalMessageKind,
-        mark: ZoneMark,
-        payloads: &[&[u8]],
-    ) -> Result<(), SalFit> {
-        let sizes: Vec<u32> = payloads.iter().map(|p| p.len() as u32).collect();
-        let group = self.begin(target_id, lsn, kind, mark, &sizes)?;
-        unsafe { group.for_each_slot(|w, slot| slot.copy_from_slice(payloads[w])) };
-        self.finish(group);
-        Ok(())
     }
 }
 
@@ -1367,3 +1334,13 @@ impl SalReader {
         m2w::eventfd_wait(self.m2w_efd, timeout_ms)
     }
 }
+
+/// The SAL fixture, shared by `sal`'s own suites and by the `runtime` tests
+/// that need a real log to drain or to corrupt.
+#[cfg(test)]
+#[path = "tests/fixtures.rs"]
+pub(crate) mod fixtures;
+
+#[cfg(test)]
+#[path = "tests/sal.rs"]
+mod tests;

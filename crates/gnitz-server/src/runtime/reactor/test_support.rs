@@ -4,10 +4,62 @@
 //! attached to `conn`, `io` or `futures` reaches the same fixtures without any
 //! of them becoming crate API.
 
+pub(super) use super::runloop::make_waker;
 use super::*;
 
+/// The two drivers every reactor suite runs on. An inherent impl here rather
+/// than in `runloop`/`mod`, so the production files carry no test-only method.
+impl Reactor {
+    /// Drive `fut` to completion. Single-threaded, blocking. Spawns the
+    /// future as a task internally and returns its output via a shared cell.
+    pub(super) fn block_on<F, T>(&self, fut: F) -> T
+    where
+        F: Future<Output = T> + 'static,
+        T: 'static,
+    {
+        let out: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
+        let out_capture = Rc::clone(&out);
+        let root_key = self.spawn(async move {
+            let v = fut.await;
+            *out_capture.borrow_mut() = Some(v);
+        });
+
+        // Drive the reactor until the root task completes. The `tasks`
+        // map removes the entry on completion, so `contains_key(root_key)`
+        // returning false is the termination signal.
+        loop {
+            self.tick(true);
+            if !self.inner.tasks.borrow().contains_key(&root_key) {
+                break;
+            }
+        }
+
+        // SAFETY: spawn ran the future to completion, so Some.
+        let v = out
+            .borrow_mut()
+            .take()
+            .expect("block_on root task did not produce output");
+        v
+    }
+
+    /// Bounded: the tests that use this are the ones guarding against lost
+    /// wakes and lock deadlocks, and an unbounded loop would turn each of those
+    /// regressions into a wedged test run rather than a failure. Ticks
+    /// non-blocking, so a task waiting only on another task still progresses.
+    pub(super) fn block_until_idle(&self) {
+        const MAX_TICKS: usize = 10_000;
+        for _ in 0..MAX_TICKS {
+            if self.inner.tasks.borrow().is_empty() {
+                return;
+            }
+            self.tick(false);
+        }
+        panic!("reactor: {MAX_TICKS} ticks without reaching idle — lost wake or deadlock");
+    }
+}
+
 pub(super) fn make_reactor() -> Reactor {
-    Reactor::new(16).expect("reactor")
+    Reactor::new(16, Limits::TEST).expect("reactor")
 }
 
 /// Drive `dispatch_cqe` with a synthetic completion tagged `kind`/`id`,
@@ -147,22 +199,6 @@ pub(super) fn fake_listener() -> i32 {
     fd
 }
 
-/// Build a minimal W2M ring and write one scan slot with `req_id`.
-/// The returned `W2mReceiver` owns the `InFlightState` that the slot's Drop
-/// references — it must be kept alive until after the slot is dropped.
-/// The returned `SharedRegion` unmaps the ring on drop.
-pub(super) unsafe fn make_scan_slot(
-    req_id: u32,
-) -> (
-    crate::runtime::w2m::W2mSlot,
-    crate::runtime::w2m::W2mReceiver,
-    crate::runtime::test_support::SharedRegion,
-) {
-    let (receiver, region) = make_scan_ring(req_id, 1);
-    let slot = receiver.try_read_slot(0).expect("scan slot");
-    (slot, receiver, region)
-}
-
 /// Build a W2M ring carrying `n` scan frames, all tagged with
 /// `internal_req_id` but with distinct wire request_ids (100, 101, …) so the
 /// caller can verify arrival order. The returned `W2mReceiver` owns the
@@ -179,7 +215,7 @@ pub(super) unsafe fn make_scan_ring(
     use crate::runtime::w2m::{W2mReceiver, W2mWriter};
     use crate::runtime::wire as ipc;
 
-    let region = crate::runtime::w2m::test_ring(64 * 1024);
+    let region = crate::runtime::w2m::fixtures::test_ring(64 * 1024);
     let ptr = region.ptr();
 
     let writer = W2mWriter::new(ptr);

@@ -68,13 +68,6 @@ impl InboundBudget {
         self.held.get()
     }
 
-    /// Test-only: lower the ceiling so cap-trip paths can be exercised
-    /// without allocating gigabytes.
-    #[cfg(test)]
-    pub(super) fn set_cap(&self, cap: usize) {
-        self.cap.set(cap);
-    }
-
     /// Charge and allocate one inbound frame payload buffer. Charges
     /// `frame_weight(plen)` at header-parse time, *before* any payload byte
     /// arrives, so a declared-but-dribbled frame can never accumulate
@@ -319,12 +312,6 @@ impl RecvQueue {
     #[cfg(test)]
     pub(super) fn queued(&self) -> usize {
         self.frames.len()
-    }
-
-    /// The payloads of every completed-but-undelivered frame, in order.
-    #[cfg(test)]
-    pub(crate) fn queued_payloads(&self) -> Vec<Vec<u8>> {
-        self.frames.iter().map(|b| b.as_slice().to_vec()).collect()
     }
 
     #[cfg(test)]

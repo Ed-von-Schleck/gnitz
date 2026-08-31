@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use super::super::test_support::*;
 use super::*;
-use crate::runtime::test_support::try_poll_once;
 
 /// One whole-payload client send the way `Peer::send` runs it: the owned send
 /// under the egress deadline.
@@ -27,33 +26,7 @@ async fn guarded_send(r: &Reactor, fd: i32, payload: Vec<u8>) -> i32 {
 // ─────────────────────────────────────────────────────────────────
 
 #[test]
-fn send_cqe_parks_rc_and_wakes_waker() {
-    let r = make_reactor();
-    r.inner.sends.open(55, None);
-    let mut fut = std::pin::pin!(SendFuture {
-        send_id: 55,
-        inner: Rc::clone(&r.inner),
-    });
-    let waker = make_waker(11);
-    let mut cx = Context::from_waker(&waker);
-    assert!(fut.as_mut().poll(&mut cx).is_pending());
-
-    cqe(&r, KIND_SEND, 55, 1234);
-
-    assert!(
-        r.inner.run_queue.borrow().is_queued(11),
-        "KIND_SEND must wake the send future"
-    );
-    assert_eq!(
-        fut.as_mut().poll(&mut cx),
-        Poll::Ready(1234),
-        "KIND_SEND must deliver the CQE rc verbatim"
-    );
-    assert_eq!(r.inner.sends.len(), 0, "a resolved send must retire its slot");
-}
-
-#[test]
-fn send_cqe_decrements_conn_inflight_and_releases_the_buffer() {
+fn send_cqe_wakes_its_waker_and_settles_the_conn() {
     let r = make_reactor();
     let alive: SendAlive = Rc::new(gnitz_store::storage::batch_pool::PooledSendBuf(vec![0u8; 16]));
     let (fd, write_end) = unsafe { pipe_pair() };
@@ -64,24 +37,35 @@ fn send_cqe_decrements_conn_inflight_and_releases_the_buffer() {
         .insert(fd, Box::new(io::Conn::new(Rc::clone(&r.inner.inbound))));
     r.inner.conns.borrow_mut().get_mut(&fd).unwrap().send_inflight = 1;
 
+    let mut fut = std::pin::pin!(SendFuture {
+        send_id: 77,
+        inner: Rc::clone(&r.inner),
+    });
+    let waker = make_waker(11);
+    let mut cx = Context::from_waker(&waker);
+    assert!(fut.as_mut().poll(&mut cx).is_pending());
+
     cqe(&r, KIND_SEND, 77, 16);
 
-    let inflight = r.inner.conns.borrow().get(&fd).unwrap().send_inflight;
+    assert!(
+        r.inner.run_queue.borrow().is_queued(11),
+        "KIND_SEND must wake the send future"
+    );
     assert_eq!(
-        inflight, 0,
+        r.inner.conns.borrow().get(&fd).unwrap().send_inflight,
+        0,
         "KIND_SEND must decrement conn.send_inflight (gates close_fd)"
     );
     // The keep-alive rides the slot until the awaiter collects the result;
     // once it does, the last reference goes with it.
     assert_eq!(Rc::strong_count(&alive), 2, "slot still holds the buffer");
     assert_eq!(
-        try_poll_once(SendFuture {
-            send_id: 77,
-            inner: Rc::clone(&r.inner),
-        }),
-        Some(16)
+        fut.as_mut().poll(&mut cx),
+        Poll::Ready(16),
+        "KIND_SEND must deliver the CQE rc verbatim"
     );
     assert_eq!(Rc::strong_count(&alive), 1, "collecting the result frees the buffer");
+    assert_eq!(r.inner.sends.len(), 0, "a resolved send must retire its slot");
     unsafe {
         libc::close(fd);
         libc::close(write_end);
@@ -172,9 +156,11 @@ fn send_buffer_loops_until_full_payload_sent_over_socketpair() {
 
         let r2 = Rc::clone(&r);
         let sent = r.block_on(async move { guarded_send(&r2, sender, payload).await });
-        let received = drain_t.join().expect("drain thread");
-
+        // Close before joining: on the truncated send this test exists to
+        // catch, the drain's blocking `read` would otherwise never return and
+        // the whole binary would hang instead of failing.
         libc::close(sender);
+        let received = drain_t.join().expect("drain thread");
         assert_eq!(
             sent as usize, payload_len,
             "send_buffer must loop on partial CQEs until the full \
@@ -196,10 +182,9 @@ fn send_buffer_loops_until_full_payload_sent_over_socketpair() {
 /// shutting the fd down and surfacing a negative rc.
 #[test]
 fn send_buffer_evicts_a_client_that_never_drains() {
-    const TIMEOUT: Duration = Duration::from_millis(100);
+    const TIMEOUT: Duration = Limits::TEST.client_send_timeout;
     unsafe {
         let (r, sender, receiver) = egress_pair(Some(4 * 1024));
-        r.set_client_send_timeout(TIMEOUT);
 
         // Far larger than both buffers, and nothing ever reads the other
         // end — the send stalls partway and only the deadline can end it.
@@ -460,7 +445,7 @@ fn both_listeners_rearm_after_an_fd_exhaustion_backoff() {
         "each cancelled listener gets its own backoff task"
     );
 
-    let deadline = Instant::now() + ACCEPT_REARM_BACKOFF + Duration::from_secs(5);
+    let deadline = Instant::now() + Limits::TEST.accept_rearm_backoff + Duration::from_secs(5);
     while !r.inner.tasks.borrow().is_empty() && Instant::now() < deadline {
         r.tick(true);
     }
@@ -471,17 +456,5 @@ fn both_listeners_rearm_after_an_fd_exhaustion_backoff() {
     unsafe {
         libc::close(a);
         libc::close(b);
-    }
-}
-
-#[test]
-fn test_shutdown_tolerates_enotconn() {
-    // An unconnected socket → shutdown fails with ENOTCONN; the wrapper
-    // swallows it, since evicting an already-gone peer is not an error.
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-    assert!(fd >= 0, "socket() failed");
-    shutdown(fd);
-    unsafe {
-        libc::close(fd);
     }
 }

@@ -75,8 +75,6 @@ pub(crate) use conn::{guard_egress_deadline, shutdown, SendPayload};
 use futures::{ExchangeFuture, ScanRoute, ScanSlotFuture, SendCarry, TimerFuture};
 pub(crate) use futures::{FsyncFuture, PeerToken, ReplyFuture, ScanLease};
 use park::ParkMap;
-#[cfg(test)]
-use runloop::make_waker;
 use runloop::{RunQueue, REACTOR_RUN_QUEUE};
 use wake_queue::WakeQueue;
 
@@ -84,6 +82,42 @@ pub use io::RecvBuf;
 pub use sync::{
     chan, join_all_unpin, join_into, oneshot, select2, AsyncMutex, AsyncRwLock, Either, ReadGuard, WriteGuard,
 };
+
+/// The ceilings and deadlines a reactor is built with, fixed for its life.
+/// Startup resolves them from the environment; a test that has to wait one out
+/// picks its own instead, which is why they are arguments rather than globals.
+#[derive(Clone, Copy)]
+pub(crate) struct Limits {
+    /// Ceiling on in-flight inbound frame payload bytes, across every
+    /// connection.
+    pub inbound_cap: usize,
+    /// Per-frame client-egress deadline; a send making no progress for this
+    /// long evicts the client.
+    pub client_send_timeout: std::time::Duration,
+    /// How long a listener whose multishot accept was cancelled on fd
+    /// exhaustion waits before re-arming, giving `reap_closing_conns` a window
+    /// to free some.
+    pub accept_rearm_backoff: std::time::Duration,
+}
+
+impl Limits {
+    /// The server's, resolved from the environment.
+    pub(crate) fn from_env() -> Limits {
+        Limits {
+            inbound_cap: io::resolve_inbound_cap(),
+            client_send_timeout: conn::resolve_client_send_timeout(),
+            accept_rearm_backoff: std::time::Duration::from_millis(50),
+        }
+    }
+
+    /// Prompt deadlines, so the tests that wait one out cost milliseconds.
+    #[cfg(test)]
+    pub(crate) const TEST: Limits = Limits {
+        inbound_cap: usize::MAX,
+        client_send_timeout: std::time::Duration::from_millis(10),
+        accept_rearm_backoff: std::time::Duration::from_millis(2),
+    };
+}
 
 // ---------------------------------------------------------------------------
 // CQE user_data encoding (high 8 bits = kind, low 56 bits = id)
@@ -196,13 +230,10 @@ struct ReactorShared {
     /// accounting. Boxed so the inline hdr buffer address survives HashMap
     /// resizes — io_uring SQEs capture the pointer.
     conns: RefCell<FxHashMap<i32, Box<io::Conn>>>,
-    /// The OOM guard shared by every connection; its ceiling is resolved once
-    /// at startup by [`io::resolve_inbound_cap`]. See [`io::InboundBudget`].
+    /// The OOM guard shared by every connection. See [`io::InboundBudget`].
     inbound: Rc<io::InboundBudget>,
-    /// Per-frame client-egress deadline, resolved once by
-    /// [`conn::resolve_client_send_timeout`]. Per-reactor rather than global so
-    /// a test can shorten its own without reaching another's.
-    client_send_timeout: Cell<std::time::Duration>,
+    /// The deadlines and ceilings this reactor was built with.
+    limits: Limits,
     /// Accepted `(conn_fd, listener_fd)` pairs the kernel has delivered but the
     /// accept loop has not claimed. The listener fd rides the multishot-accept
     /// SQE's udata `id` field, so the accept loop can route AF_UNIX vs TLS
@@ -337,7 +368,7 @@ fn probe_futex_waitv_support() {
 }
 
 impl Reactor {
-    pub fn new(ring_capacity: u32) -> std::io::Result<Self> {
+    pub fn new(ring_capacity: u32, limits: Limits) -> std::io::Result<Self> {
         probe_futex_waitv_support();
         let ring = IoUringRing::new(ring_capacity)?;
         let inner = Rc::new(ReactorShared {
@@ -356,8 +387,8 @@ impl Reactor {
             next_request_id: Cell::new(1),
             next_op_id: Cell::new(1),
             conns: RefCell::new(FxHashMap::default()),
-            inbound: Rc::new(io::InboundBudget::new(io::resolve_inbound_cap())),
-            client_send_timeout: Cell::new(conn::resolve_client_send_timeout()),
+            inbound: Rc::new(io::InboundBudget::new(limits.inbound_cap)),
+            limits,
             accepts: RefCell::new(WakeQueue::default()),
             sends: ParkMap::default(),
             raw_recvs: ParkMap::default(),
@@ -597,22 +628,6 @@ impl Reactor {
 
     /// Drive the reactor until the task slab is empty.
     ///
-    /// Bounded: the tests that use this are the ones guarding against lost
-    /// wakes and lock deadlocks, and an unbounded loop would turn each of those
-    /// regressions into a wedged test run rather than a failure. Ticks
-    /// non-blocking, so a task waiting only on another task still progresses.
-    #[cfg(test)]
-    fn block_until_idle(&self) {
-        const MAX_TICKS: usize = 10_000;
-        for _ in 0..MAX_TICKS {
-            if self.inner.tasks.borrow().is_empty() {
-                return;
-            }
-            self.tick(false);
-        }
-        panic!("reactor: {MAX_TICKS} ticks without reaching idle — lost wake or deadlock");
-    }
-
     /// Drain every unread W2M slot for worker `w` and route each reply:
     /// scan frames are intercepted raw; everything else — data, exchange,
     /// control-only — funnels through one owned decode into `route_reply`,
@@ -683,13 +698,6 @@ impl Reactor {
     /// every `RecvBuf` it charges.
     pub(crate) fn inbound(&self) -> &Rc<io::InboundBudget> {
         &self.inner.inbound
-    }
-
-    /// Shorten this reactor's client-egress deadline, for a test that has to
-    /// wait one out.
-    #[cfg(test)]
-    fn set_client_send_timeout(&self, d: std::time::Duration) {
-        self.inner.client_send_timeout.set(d);
     }
 }
 

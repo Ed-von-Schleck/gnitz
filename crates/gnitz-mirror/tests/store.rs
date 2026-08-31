@@ -296,6 +296,7 @@ fn a_failed_copy_teardown_leaves_no_cursor() {
         return; // the seam folds away in a release build
     }
     let out = run_test_in_child(
+        module_path!(),
         "failed_copy_teardown_child",
         &[("GNITZ_INJECT_MIRROR_BOOTSTRAP_ERROR", "1")],
     );
@@ -351,6 +352,7 @@ fn an_auto_checkpoint_failure_leaves_the_cursor_advanced() {
         return; // the seam folds away in a release build
     }
     let out = run_test_in_child(
+        module_path!(),
         "auto_checkpoint_failure_child",
         &[
             ("GNITZ_INJECT_MIRROR_CHECKPOINT_ERROR", "1"),

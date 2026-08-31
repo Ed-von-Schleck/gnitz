@@ -38,7 +38,7 @@ impl DrainFixture {
             // through the ring on drop, and a still-parked slot is exactly what a
             // failing assert leaves behind. Never unmapping is what makes the
             // fixture's teardown order irrelevant instead of load-bearing.
-            let ptr = unsafe { crate::runtime::w2m::make_ring(DRAIN_MSG_SZ, DRAIN_RING_MSGS, 16) }.leak();
+            let ptr = unsafe { crate::runtime::w2m::fixtures::make_ring(DRAIN_MSG_SZ, DRAIN_RING_MSGS, 16) }.leak();
             writers.push(W2mWriter::new(ptr));
             ring_ptrs.push(ptr);
         }
@@ -46,7 +46,8 @@ impl DrainFixture {
         // Pinned for the same reason: a parked slot points into it.
         std::mem::forget(Rc::clone(&receiver));
 
-        let reactor = Rc::new(crate::runtime::reactor::Reactor::new(16).expect("reactor"));
+        let reactor =
+            Rc::new(crate::runtime::reactor::Reactor::new(16, crate::runtime::reactor::Limits::TEST).expect("reactor"));
         let scan = ScanDispatch::alloc(&reactor, n_workers, Fanout::Broadcast);
         let (peer_sock, partner) = std::os::unix::net::UnixStream::pair().expect("socketpair");
         drop(partner);
