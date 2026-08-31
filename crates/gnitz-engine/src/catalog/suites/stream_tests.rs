@@ -15,9 +15,9 @@ fn stream_flag_registers_storeless_with_no_directory() {
     let sid = create_flagged_table(&mut engine, "s", &cols, &[0], stream_flags());
     let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
 
-    let entry = engine.dag.tables.get(&sid).expect("stream registered");
+    let entry = engine.registry().table_entry(sid).expect("stream registered");
     assert_eq!(entry.kind, RelationKind::Stream);
-    assert!(entry.handle.is_detached(), "a stream holds no store");
+    assert!(entry.is_storeless(), "a stream holds no store");
     assert!(
         !std::path::Path::new(&entry.directory).exists(),
         "a stream gets no directory: {}",
@@ -25,13 +25,13 @@ fn stream_flag_registers_storeless_with_no_directory() {
     );
     // Its reads are empty rather than erroring, and its LSN never advances.
     assert_eq!(entry.full_scan().count, 0);
-    assert_eq!(entry.handle.current_lsn(), 0);
+    assert_eq!(entry.current_lsn(), 0);
 
     // The same word with the bit clear is still an ordinary base table with a
     // directory, so the assertions above are about the flag and not the fixture.
-    let base = engine.dag.tables.get(&tid).expect("table registered");
+    let base = engine.registry().table_entry(tid).expect("table registered");
     assert_eq!(base.kind, RelationKind::BaseTable);
-    assert!(!base.handle.is_detached());
+    assert!(!base.is_storeless());
     assert!(std::path::Path::new(&base.directory).exists());
 
     fs::remove_dir_all(&dir).ok();
@@ -48,7 +48,7 @@ fn a_stream_is_absent_from_the_recovery_dedup_map() {
     let sid = create_flagged_table(&mut engine, "s", &cols, &[0], stream_flags());
     let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
 
-    let map = engine.user_flushed_lsns();
+    let map = engine.registry().user_flushed_lsns();
     assert!(
         !map.contains_key(&sid),
         "a stream must not enter the map at all, not even at 0"
@@ -114,7 +114,9 @@ fn the_drive_set_excludes_a_stream() {
     let over_stream = register_identity_view(&mut engine, sid, "v_s", &cols);
     let over_table = register_identity_view(&mut engine, tid, "v_t", &cols);
 
-    let driven = engine.dag.base_tables_reachable_from(vec![over_stream, over_table]);
+    let driven = engine
+        .dag
+        .base_tables_reachable_from(&engine.registry, vec![over_stream, over_table]);
     assert!(driven.contains(&tid), "a base table feeding a view is driven");
     assert!(!driven.contains(&sid), "a stream must never be driven");
 
@@ -147,10 +149,7 @@ fn stream_fed_views_are_invalid_at_boot() {
     // generation — a completed checkpoint.
     engine.record_topology(1).unwrap();
     let g = engine.bump_checkpoint_generation().unwrap();
-    for vid in [direct, downstream, over_table] {
-        let store: &mut crate::storage::Table = engine.dag.tables.get(&vid).unwrap().handle.as_owned_mut().unwrap();
-        crate::storage::flush_barrier([store], crate::storage::FlushRound::Ephemeral(g)).unwrap();
-    }
+    engine.registry_mut().flush_ephemeral_outputs(g).unwrap();
 
     engine.compute_invalid_views();
     assert!(engine.view_is_invalid(direct), "a direct stream source invalidates");

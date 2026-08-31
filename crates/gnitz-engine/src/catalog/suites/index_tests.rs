@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::{make_index_schema, IndexKeySpec, MAX_PK_BYTES};
+use gnitz_store::schema::{make_index_schema, IndexKeySpec, MAX_PK_BYTES};
 
 // ── test_index_creation_and_backfill ────────────────────────────────────
 
@@ -12,7 +12,7 @@ fn test_index_creation_and_backfill() {
     let tid = engine.create_table("public.tfanout", &cols, &[0]).unwrap();
 
     // Ingest 5 rows
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     for i in 0..5u64 {
         bb.begin_row(i as u128, 1);
@@ -21,7 +21,7 @@ fn test_index_creation_and_backfill() {
     }
     let batch = bb.finish();
     engine.ingest_to_family(tid, &batch).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Create index
     let _idx_id = engine.create_index("public.tfanout", &["val"], false).unwrap();
@@ -44,7 +44,7 @@ fn test_index_live_fanout() {
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.tfanout", &cols, &[0]).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // Ingest 5 rows
     let mut bb = BatchBuilder::new(schema);
@@ -54,7 +54,7 @@ fn test_index_live_fanout() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Create index — should backfill 5 rows
     engine.create_index("public.tfanout", &["val"], false).unwrap();
@@ -65,10 +65,10 @@ fn test_index_live_fanout() {
     bb2.put_u64(777);
     bb2.end_row();
     engine.ingest_to_family(tid, &bb2.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Verify index has 6 entries via DagEngine's index circuit
-    let entry = engine.dag.tables.get_mut(&tid).unwrap();
+    let entry = engine.registry().table_entry(tid).unwrap();
     assert_eq!(entry.index_circuits.len(), 1, "Expected 1 index circuit");
     let idx_table = entry.index_circuits[0].table_mut();
     let idx_count = count_records(idx_table);
@@ -91,9 +91,9 @@ fn test_system_table_flush_compacts_l0() {
             .sys_store_mut(SysFamily::Index)
             .ingest_borrowed_batch(&idx_tab_batch(i, 0, 0, &format!("idx{i}"), false, 1))
             .unwrap();
-        engine.dag_mut().flush(IDX_TAB_ID).unwrap();
+        engine.registry_mut().flush(IDX_TAB_ID).unwrap();
     }
-    let shards = engine.sys_store_mut(SysFamily::Index).all_shard_arcs().len();
+    let (shards, _) = engine.sys_store_mut(SysFamily::Index).pk_filter_census();
     assert!(
         (shards as i64) < flushes / 2,
         "system catalog L0 must be compacted: {shards} shards after {flushes} flushes"
@@ -135,7 +135,7 @@ fn test_unique_index_failure_no_broadcast_poisoning() {
         "idx_broadcast_poison",
         &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
     );
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // Two rows sharing val=42.
     let mut bb = BatchBuilder::new(schema);
@@ -146,7 +146,7 @@ fn test_unique_index_failure_no_broadcast_poisoning() {
     bb.put_u64(42);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Clear broadcasts accumulated by table/column creation + ingest.
     let _ = engine.drain_pending_broadcasts();
@@ -188,7 +188,7 @@ fn test_seek_by_index_found() {
         &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
     );
     engine.create_index("public.t", &["val"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(10u128, 1);
@@ -201,10 +201,10 @@ fn test_seek_by_index_found() {
     bb.put_u64(300);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Seek by index: val=200 → should find PK=20
-    let result = engine.seek_by_index(tid, &[1], &[200u128]).unwrap().0;
+    let result = engine.registry_mut().seek_by_index(tid, &[1], &[200u128]).unwrap().0;
     assert!(result.is_some());
     let row = result.unwrap();
     assert_eq!(row.count, 1);
@@ -221,17 +221,17 @@ fn test_seek_by_index_not_found() {
         &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
     );
     engine.create_index("public.t", &["val"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(42);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Seek by index: val=999 → should return None
-    let result = engine.seek_by_index(tid, &[1], &[999u128]).unwrap().0;
+    let result = engine.registry_mut().seek_by_index(tid, &[1], &[999u128]).unwrap().0;
     assert!(result.is_none());
 
     engine.close();
@@ -247,7 +247,7 @@ fn test_seek_by_index_negative_i64() {
         &[col_def("id", type_code::U64), col_def("score", type_code::I64)],
     );
     engine.create_index("public.t", &["score"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
@@ -263,20 +263,28 @@ fn test_seek_by_index_negative_i64() {
     bb.put_u64(10);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // The seek key is the value's native bit pattern (2's complement); the index
     // stores it order-preserving (signed I64 OPK) and the seek re-encodes
     // identically, so an equality lookup finds it regardless of sign.
-    let result = engine.seek_by_index(tid, &[1], &[(-1i64) as u64 as u128]).unwrap().0;
+    let result = engine
+        .registry_mut()
+        .seek_by_index(tid, &[1], &[(-1i64) as u64 as u128])
+        .unwrap()
+        .0;
     assert!(result.is_some(), "index must find row with score=-1");
     assert_eq!(result.unwrap().get_pk(0), 2);
 
-    let result2 = engine.seek_by_index(tid, &[1], &[(-5i64) as u64 as u128]).unwrap().0;
+    let result2 = engine
+        .registry_mut()
+        .seek_by_index(tid, &[1], &[(-5i64) as u64 as u128])
+        .unwrap()
+        .0;
     assert!(result2.is_some(), "index must find row with score=-5");
     assert_eq!(result2.unwrap().get_pk(0), 1);
 
-    let result3 = engine.seek_by_index(tid, &[1], &[10u128]).unwrap().0;
+    let result3 = engine.registry_mut().seek_by_index(tid, &[1], &[10u128]).unwrap().0;
     assert!(result3.is_some(), "index must still find positive values");
     assert_eq!(result3.unwrap().get_pk(0), 4);
 
@@ -293,33 +301,41 @@ fn test_seek_by_index_negative_i32() {
         &[col_def("id", type_code::U64), col_def("score", type_code::I32)],
     );
     engine.create_index("public.t", &["score"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
-    bb.put_u32((-1i32) as u32);
+    bb.put_int(-1i32 as u128);
     bb.end_row();
     bb.begin_row(2u128, 1);
-    bb.put_u32((-100i32) as u32);
+    bb.put_int(-100i32 as u128);
     bb.end_row();
     bb.begin_row(3u128, 1);
-    bb.put_u32(42u32);
+    bb.put_int(42);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // The seek key is the I32 value's zero-extended native bit pattern; projection
     // and seek both sign-extend it from I32 into the promoted signed I64 index
     // column, so the equality lookup matches.
-    let result = engine.seek_by_index(tid, &[1], &[(-1i32) as u32 as u128]).unwrap().0;
+    let result = engine
+        .registry_mut()
+        .seek_by_index(tid, &[1], &[(-1i32) as u32 as u128])
+        .unwrap()
+        .0;
     assert!(result.is_some(), "index must find row with score=-1");
     assert_eq!(result.unwrap().get_pk(0), 1);
 
-    let result2 = engine.seek_by_index(tid, &[1], &[(-100i32) as u32 as u128]).unwrap().0;
+    let result2 = engine
+        .registry_mut()
+        .seek_by_index(tid, &[1], &[(-100i32) as u32 as u128])
+        .unwrap()
+        .0;
     assert!(result2.is_some(), "index must find row with score=-100");
     assert_eq!(result2.unwrap().get_pk(0), 2);
 
-    let result3 = engine.seek_by_index(tid, &[1], &[42u128]).unwrap().0;
+    let result3 = engine.registry_mut().seek_by_index(tid, &[1], &[42u128]).unwrap().0;
     assert!(result3.is_some(), "index must still find positive values");
     assert_eq!(result3.unwrap().get_pk(0), 3);
 
@@ -336,23 +352,23 @@ fn test_seek_by_index_u8_column() {
         &[col_def("id", type_code::U64), col_def("tag", type_code::U8)],
     );
     engine.create_index("public.t", &["tag"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(10u128, 1);
-    bb.put_u8(42);
+    bb.put_int(42);
     bb.end_row();
     bb.begin_row(20u128, 1);
-    bb.put_u8(99);
+    bb.put_int(99);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
-    let result = engine.seek_by_index(tid, &[1], &[42u128]).unwrap().0;
+    let result = engine.registry_mut().seek_by_index(tid, &[1], &[42u128]).unwrap().0;
     assert!(result.is_some(), "U8 index lookup must find the row");
     assert_eq!(result.unwrap().get_pk(0), 10);
 
-    let result2 = engine.seek_by_index(tid, &[1], &[99u128]).unwrap().0;
+    let result2 = engine.registry_mut().seek_by_index(tid, &[1], &[99u128]).unwrap().0;
     assert!(result2.is_some());
     assert_eq!(result2.unwrap().get_pk(0), 20);
 
@@ -367,19 +383,19 @@ fn test_seek_by_index_u16_column() {
         &[col_def("id", type_code::U64), col_def("port", type_code::U16)],
     );
     engine.create_index("public.t", &["port"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
-    bb.put_u16(8080);
+    bb.put_int(8080);
     bb.end_row();
     bb.begin_row(2u128, 1);
-    bb.put_u16(443);
+    bb.put_int(443);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
-    let result = engine.seek_by_index(tid, &[1], &[443u128]).unwrap().0;
+    let result = engine.registry_mut().seek_by_index(tid, &[1], &[443u128]).unwrap().0;
     assert!(result.is_some(), "U16 index lookup must find the row");
     assert_eq!(result.unwrap().get_pk(0), 2);
 
@@ -396,16 +412,16 @@ fn test_drop_table_cleans_up_indices() {
     let tid = engine.create_table("public.idx_tbl", &cols, &[0]).unwrap();
     engine.create_index("public.idx_tbl", &["val"], true).unwrap();
 
-    assert!(engine.dag.tables.contains_key(&tid));
-    assert_eq!(engine.dag.tables.get(&tid).unwrap().index_circuits.len(), 1);
+    assert!(engine.registry().has_id(tid));
+    assert_eq!(engine.registry().table_entry(tid).unwrap().index_circuits.len(), 1);
 
     // Drop index then table
     let idx_name = make_secondary_index_name("public", "idx_tbl", "val");
     engine.drop_index(&idx_name).unwrap();
-    assert_eq!(engine.dag.tables.get(&tid).unwrap().index_circuits.len(), 0);
+    assert_eq!(engine.registry().table_entry(tid).unwrap().index_circuits.len(), 0);
 
     engine.drop_table("public.idx_tbl").unwrap();
-    assert!(!engine.dag.tables.contains_key(&tid));
+    assert!(!engine.registry().has_id(tid));
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -438,7 +454,7 @@ fn test_drop_table_cascades_secondary_index() {
         !engine.caches.index_by_name.contains_key(idx_name.as_str()),
         "in-memory index registry must forget the index"
     );
-    assert!(!engine.dag.tables.contains_key(&tid));
+    assert!(!engine.registry().has_id(tid));
     assert_eq!(
         count_records(engine.sys_store_mut(SysFamily::Index)),
         idx_records_before - 1,
@@ -531,7 +547,7 @@ fn test_drop_table_cascades_multiple_indices() {
     // Drop the table — cascade must retract both indices
     engine.drop_table("public.t").unwrap();
 
-    assert!(!engine.dag.tables.contains_key(&tid), "table DAG entry must be gone");
+    assert!(!engine.registry().has_id(tid), "table DAG entry must be gone");
     assert!(
         !engine.has_index_by_name(&name1),
         "idx1 must be removed from the caches"
@@ -588,7 +604,7 @@ fn test_compound_pk_secondary_index_seek() {
     ];
     let tid = engine.create_table("public.cpk_t", &cols, &[0, 1]).unwrap();
     engine.create_index("public.cpk_t", &["val"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     assert_eq!(schema.pk_stride(), 8, "compound (U32,U32) PK stride should be 8");
 
     let mut b = Batch::with_capacity(schema, 4);
@@ -609,19 +625,19 @@ fn test_compound_pk_secondary_index_seek() {
         b.count += 1;
     }
     engine.ingest_to_family(tid, &b).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // val=100 → exactly one match
-    let r = engine.seek_by_index(tid, &[2], &[100u128]).unwrap().0;
+    let r = engine.registry_mut().seek_by_index(tid, &[2], &[100u128]).unwrap().0;
     assert!(r.is_some(), "val=100 should find a row");
     assert_eq!(r.unwrap().count, 1);
 
     // val=300 → one match (a=10, b=2)
-    let r = engine.seek_by_index(tid, &[2], &[300u128]).unwrap().0;
+    let r = engine.registry_mut().seek_by_index(tid, &[2], &[300u128]).unwrap().0;
     assert!(r.is_some(), "val=300 should find a row");
 
     // val=999 → miss
-    let r = engine.seek_by_index(tid, &[2], &[999u128]).unwrap().0;
+    let r = engine.registry_mut().seek_by_index(tid, &[2], &[999u128]).unwrap().0;
     assert!(r.is_none(), "val=999 should miss");
 
     engine.close();
@@ -640,7 +656,7 @@ fn test_compound_pk_secondary_index_retract() {
     ];
     let tid = engine.create_table("public.cpk_r", &cols, &[0, 1]).unwrap();
     engine.create_index("public.cpk_r", &["val"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut b = Batch::with_capacity(schema, 2);
     b.extend_pk_opk(&schema, &[7, 3]);
@@ -649,9 +665,14 @@ fn test_compound_pk_secondary_index_retract() {
     b.extend_col(0, &500u64.to_le_bytes());
     b.count += 1;
     engine.ingest_to_family(tid, &b).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
-    assert!(engine.seek_by_index(tid, &[2], &[500u128]).unwrap().0.is_some());
+    assert!(engine
+        .registry_mut()
+        .seek_by_index(tid, &[2], &[500u128])
+        .unwrap()
+        .0
+        .is_some());
 
     // Retract the same row.
     let mut r = Batch::with_capacity(schema, 1);
@@ -661,10 +682,15 @@ fn test_compound_pk_secondary_index_retract() {
     r.extend_col(0, &500u64.to_le_bytes());
     r.count += 1;
     engine.ingest_to_family(tid, &r).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     assert!(
-        engine.seek_by_index(tid, &[2], &[500u128]).unwrap().0.is_none(),
+        engine
+            .registry_mut()
+            .seek_by_index(tid, &[2], &[500u128])
+            .unwrap()
+            .0
+            .is_none(),
         "after retraction the indexed value must not resolve to a row"
     );
 
@@ -681,7 +707,7 @@ fn test_create_unique_index_duplicate_rolls_back_cleanly() {
         "unique_idx_rollback",
         &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
     );
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // Seed duplicate values on `val` so a unique index over it cannot be built.
     let mut bb = BatchBuilder::new(schema);
@@ -692,7 +718,7 @@ fn test_create_unique_index_duplicate_rolls_back_cleanly() {
     bb.put_u64(42);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     let idx_name = make_secondary_index_name("public", "t", "val");
     let idx_records_before = count_records(engine.sys_store_mut(SysFamily::Index));
@@ -710,9 +736,9 @@ fn test_create_unique_index_duplicate_rolls_back_cleanly() {
     );
     assert!(
         !engine
-            .dag
-            .tables
-            .get(&tid)
+            .registry()
+            .table_entry(tid)
+            .ok()
             .unwrap()
             .index_circuits
             .iter()
@@ -751,6 +777,7 @@ fn test_seek_by_index_orphan_entry_terminates() {
 
     // Locate the index circuit on `val` (col_idx 1) and grab its schema.
     let idx_schema = engine
+        .registry()
         .index_circuit_for_cols(tid, &[1])
         .expect("index circuit on col 1")
         .index_schema;
@@ -771,6 +798,7 @@ fn test_seek_by_index_orphan_entry_terminates() {
     b.count += 1;
 
     let idx_table = engine
+        .registry()
         .index_circuit_for_cols(tid, &[1])
         .expect("index circuit on col 1")
         .table_mut();
@@ -779,7 +807,7 @@ fn test_seek_by_index_orphan_entry_terminates() {
 
     // The indexed value resolves to an orphan whose source row is missing.
     // Must return None and, crucially, must not hang.
-    let r = engine.seek_by_index(tid, &[1], &[777u128]).unwrap().0;
+    let r = engine.registry_mut().seek_by_index(tid, &[1], &[777u128]).unwrap().0;
     assert!(r.is_none(), "orphan index entry must resolve to no source row");
 
     engine.close();
@@ -858,9 +886,15 @@ use std::path::Path;
 
 /// Uniqueness of the index circuit on `col`, or `None` if no circuit exists.
 fn circuit_unique(engine: &CatalogEngine, tid: i64, col: u32) -> Option<bool> {
-    let n = engine.index_circuits(tid).len();
+    let n = engine.registry().index_circuits(tid).len();
     (0..n)
-        .filter_map(|i| engine.get_index_circuit_info(tid, i))
+        .filter_map(|i| {
+            engine
+                .registry()
+                .index_circuits(tid)
+                .get(i)
+                .map(|ic| (ic.col_indices, ic.is_unique))
+        })
         .find(|(c, _)| c.as_slice() == [col])
         .map(|(_, u)| u)
 }
@@ -923,7 +957,7 @@ fn test_unique_index_over_fk_column_distinct_data_promotes() {
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     // Seed DISTINCT refc values (ingest_to_family bypasses FK validation).
-    let schema = engine.get_schema_desc(child_tid).unwrap();
+    let schema = engine.registry().get_schema_desc(child_tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(10);
@@ -932,7 +966,7 @@ fn test_unique_index_over_fk_column_distinct_data_promotes() {
     bb.put_u64(20);
     bb.end_row();
     engine.ingest_to_family(child_tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(child_tid).unwrap();
+    engine.registry_mut().flush(child_tid).unwrap();
 
     engine.create_index("public.child", &["refc"], true).unwrap();
     assert_eq!(circuit_unique(&engine, child_tid, 1), Some(true));
@@ -959,7 +993,7 @@ fn test_unique_index_over_fk_column_duplicate_data_rejected() {
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     // Seed DUPLICATE refc values.
-    let schema = engine.get_schema_desc(child_tid).unwrap();
+    let schema = engine.registry().get_schema_desc(child_tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(42);
@@ -968,7 +1002,7 @@ fn test_unique_index_over_fk_column_duplicate_data_rejected() {
     bb.put_u64(42);
     bb.end_row();
     engine.ingest_to_family(child_tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(child_tid).unwrap();
+    engine.registry_mut().flush(child_tid).unwrap();
 
     let before = count_records(engine.sys_store_mut(SysFamily::Index));
     let r = engine.create_index("public.child", &["refc"], true);
@@ -1078,7 +1112,7 @@ fn test_failed_create_index_leaves_no_directory() {
         "failed_create_index_dir",
         &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
     );
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(9);
@@ -1087,7 +1121,7 @@ fn test_failed_create_index_leaves_no_directory() {
     bb.put_u64(9);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     let tbl_dir = format!("{dir}/public/t_{tid}");
     assert!(engine.create_index("public.t", &["val"], true).is_err());
@@ -1176,7 +1210,7 @@ fn test_unique_index_duplicate_across_chunks_rejected() {
         "unique_idx_dup_cross_chunk",
         &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
     );
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // The only duplicate pair is val=42 at pk 0 and pk 9 — first and last
     // chunk at chunk_rows = 3.
@@ -1187,9 +1221,9 @@ fn test_unique_index_duplicate_across_chunks_rejected() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
-    engine.ddl_scan_chunk_rows = 3;
+    engine.registry_mut().set_ddl_scan_chunk_rows(3);
     let before = count_records(engine.sys_store_mut(SysFamily::Index));
     let r = engine.create_index("public.t", &["val"], true);
     assert!(r.is_err(), "cross-chunk duplicate must fail the unique backfill");
@@ -1209,7 +1243,7 @@ fn test_unique_index_duplicate_within_chunk_rejected() {
         "unique_idx_dup_within_chunk",
         &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
     );
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // Duplicate pair at pk 0 and pk 1 — both inside the first chunk of 4.
     let mut bb = BatchBuilder::new(schema);
@@ -1219,9 +1253,9 @@ fn test_unique_index_duplicate_within_chunk_rejected() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
-    engine.ddl_scan_chunk_rows = 4;
+    engine.registry_mut().set_ddl_scan_chunk_rows(4);
     assert!(
         engine.create_index("public.t", &["val"], true).is_err(),
         "within-chunk duplicate must still fail the unique backfill"
@@ -1239,7 +1273,7 @@ fn test_unique_index_chunked_backfill_distinct_succeeds() {
         "unique_idx_chunked_ok",
         &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
     );
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     for i in 0..10u64 {
@@ -1248,12 +1282,12 @@ fn test_unique_index_chunked_backfill_distinct_succeeds() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
-    engine.ddl_scan_chunk_rows = 3;
+    engine.registry_mut().set_ddl_scan_chunk_rows(3);
     engine.create_index("public.t", &["val"], true).unwrap();
 
-    let entry = engine.dag.tables.get_mut(&tid).unwrap();
+    let entry = engine.registry().table_entry(tid).unwrap();
     assert_eq!(entry.index_circuits.len(), 1);
     assert_eq!(
         count_records(entry.index_circuits[0].table_mut()),
@@ -1284,7 +1318,7 @@ fn test_promote_unique_duplicate_across_chunks_rejected() {
 
     // Duplicate refc=42 at pk 0 and pk 9; distinct in between (ingest_to_family
     // bypasses FK validation).
-    let schema = engine.get_schema_desc(child_tid).unwrap();
+    let schema = engine.registry().get_schema_desc(child_tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     for i in 0..10u64 {
         bb.begin_row(i as u128, 1);
@@ -1292,9 +1326,9 @@ fn test_promote_unique_duplicate_across_chunks_rejected() {
         bb.end_row();
     }
     engine.ingest_to_family(child_tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(child_tid).unwrap();
+    engine.registry_mut().flush(child_tid).unwrap();
 
-    engine.ddl_scan_chunk_rows = 3;
+    engine.registry_mut().set_ddl_scan_chunk_rows(3);
     assert!(
         engine.create_index("public.child", &["refc"], true).is_err(),
         "cross-chunk duplicate must fail the promotion scan"
@@ -1322,7 +1356,7 @@ fn test_composite_index_full_key_seek() {
         ],
     );
     engine.create_index("public.t", &["a", "b"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(10u128, 1);
@@ -1338,16 +1372,24 @@ fn test_composite_index_full_key_seek() {
     bb.put_u64(100);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Full-key seek (a=1, b=200) → PK 20 only. cols a=1, b=2.
-    let r = engine.seek_by_index(tid, &[1, 2], &[1u128, 200u128]).unwrap().0;
+    let r = engine
+        .registry_mut()
+        .seek_by_index(tid, &[1, 2], &[1u128, 200u128])
+        .unwrap()
+        .0;
     let r = r.expect("full-key composite seek must find a row");
     assert_eq!(r.count, 1);
     assert_eq!(r.get_pk(0), 20);
 
     // A full key that matches no row → None.
-    let none = engine.seek_by_index(tid, &[1, 2], &[1u128, 999u128]).unwrap().0;
+    let none = engine
+        .registry_mut()
+        .seek_by_index(tid, &[1, 2], &[1u128, 999u128])
+        .unwrap()
+        .0;
     assert!(none.is_none());
 
     engine.close();
@@ -1365,7 +1407,7 @@ fn test_composite_index_leading_prefix_seek() {
         ],
     );
     engine.create_index("public.t", &["a", "b"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(10u128, 1);
@@ -1381,11 +1423,11 @@ fn test_composite_index_leading_prefix_seek() {
     bb.put_u64(100);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Leading-prefix seek over (a, b) supplying only a=1 (K=1 < N=2) must match
     // every row with a=1 (PKs 10 and 20), regardless of b.
-    let r = engine.seek_by_index(tid, &[1, 2], &[1u128]).unwrap().0;
+    let r = engine.registry_mut().seek_by_index(tid, &[1, 2], &[1u128]).unwrap().0;
     let r = r.expect("leading-prefix seek must find rows");
     let mut pks: Vec<u128> = (0..r.count).map(|i| r.get_pk(i)).collect();
     pks.sort();
@@ -1409,26 +1451,27 @@ fn test_composite_index_signed_unsigned_u128_mix() {
         ],
     );
     engine.create_index("public.t", &["a", "b", "c"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     // (a=-5, b=7, c=2^70+3)
     let big: u128 = (1u128 << 70) | 3;
     bb.begin_row(1u128, 1);
-    bb.put_u32((-5i32) as u32);
+    bb.put_int(-5i32 as u128);
     bb.put_u64(7);
-    bb.put_u128(big);
+    bb.put_int(big);
     bb.end_row();
     bb.begin_row(2u128, 1);
-    bb.put_u32(9u32);
+    bb.put_int(9);
     bb.put_u64(7);
-    bb.put_u128(big);
+    bb.put_int(big);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // i32(-5) is its zero-extended u32 bit pattern as the native key.
     let r = engine
+        .registry_mut()
         .seek_by_index(tid, &[1, 2, 3], &[(-5i32) as u32 as u128, 7u128, big])
         .unwrap()
         .0;
@@ -1453,7 +1496,7 @@ fn test_composite_index_null_in_any_key_skipped() {
         ],
     );
     engine.create_index("public.t", &["a", "b"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(10u128, 1);
@@ -1465,10 +1508,10 @@ fn test_composite_index_null_in_any_key_skipped() {
     bb.put_u64(200);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Leading-prefix seek a=1 must find only PK 20 (PK 10 has NULL b → not indexed).
-    let r = engine.seek_by_index(tid, &[1, 2], &[1u128]).unwrap().0;
+    let r = engine.registry_mut().seek_by_index(tid, &[1, 2], &[1u128]).unwrap().0;
     let r = r.expect("seek must find the non-null row");
     assert_eq!(r.count, 1);
     assert_eq!(r.get_pk(0), 20);
@@ -1492,18 +1535,18 @@ fn test_composite_index_drop_exact_list() {
     engine.create_index("public.t", &["a"], false).unwrap();
     engine.create_index("public.t", &["a", "b"], false).unwrap();
 
-    assert!(engine.index_circuit_for_cols(tid, &[1]).is_some());
-    assert!(engine.index_circuit_for_cols(tid, &[1, 2]).is_some());
+    assert!(engine.registry().index_circuit_for_cols(tid, &[1]).is_some());
+    assert!(engine.registry().index_circuit_for_cols(tid, &[1, 2]).is_some());
 
     // Drop the composite by its generated name (cols joined by '_').
     engine.drop_index("public__t__idx_a_b").unwrap();
 
     assert!(
-        engine.index_circuit_for_cols(tid, &[1]).is_some(),
+        engine.registry().index_circuit_for_cols(tid, &[1]).is_some(),
         "single-column (a) index must survive"
     );
     assert!(
-        engine.index_circuit_for_cols(tid, &[1, 2]).is_none(),
+        engine.registry().index_circuit_for_cols(tid, &[1, 2]).is_none(),
         "composite (a, b) circuit must be removed"
     );
 
@@ -1530,11 +1573,12 @@ fn test_composite_unique_index_registers_unique_circuit() {
         .expect("composite UNIQUE (a, b) must be created");
 
     let ic = engine
+        .registry()
         .index_circuit_for_cols(tid, &[1, 2])
         .expect("composite circuit must resolve on its whole column list");
     assert!(ic.is_unique, "(a, b) was created UNIQUE");
     assert!(
-        engine.index_circuit_for_cols(tid, &[1]).is_none(),
+        engine.registry().index_circuit_for_cols(tid, &[1]).is_none(),
         "a composite circuit must not answer a single-column lookup"
     );
 
@@ -1544,7 +1588,7 @@ fn test_composite_unique_index_registers_unique_circuit() {
 
 #[test]
 fn test_make_index_schema_composite_layout() {
-    use crate::schema::{type_code as tc, SchemaColumn, SchemaDescriptor};
+    use gnitz_store::schema::{type_code as tc, SchemaColumn, SchemaDescriptor};
     // Source: PK = (id: U64); payload a: U32, b: U128.
     let src = SchemaDescriptor::new(
         &[
@@ -1567,7 +1611,7 @@ fn test_make_index_schema_composite_layout() {
 
 #[test]
 fn test_make_index_schema_over_limit_errs_not_panics() {
-    use crate::schema::{type_code as tc, SchemaColumn, SchemaDescriptor};
+    use gnitz_store::schema::{type_code as tc, SchemaColumn, SchemaDescriptor};
     // Source with a 2-column PK (id0, id1). A 4-column index → arity 4 + 2 = 6 >
     // MAX_PK_COLUMNS (5): must return Err, never abort via SchemaDescriptor::new.
     let src = SchemaDescriptor::new(
@@ -1593,7 +1637,7 @@ fn test_seek_prefix_matches_projection() {
     // (batch_project_index) must produce byte-identical leading-key bytes for the
     // same native values — that equality is what makes every composite seek find
     // the projected entry.
-    use crate::schema::{type_code as tc, IndexKeySpec, SchemaColumn, SchemaDescriptor};
+    use gnitz_store::schema::{type_code as tc, IndexKeySpec, SchemaColumn, SchemaDescriptor};
     let src = SchemaDescriptor::new(
         &[
             SchemaColumn::new(tc::U64, 0),
@@ -1607,12 +1651,16 @@ fn test_seek_prefix_matches_projection() {
     // Project one row (id=1, a=-5, b=42) and read back its leading-key bytes.
     let mut bb = BatchBuilder::new(src);
     bb.begin_row(1u128, 1);
-    bb.put_u32((-5i32) as u32);
+    bb.put_int(-5i32 as u128);
     bb.put_u64(42);
     bb.end_row();
     let projected = {
         let b = bb.finish();
-        crate::storage::batch_project_index(&b, &crate::schema::IndexKeySpec::new(&[1, 2], &src, &idx), &idx)
+        gnitz_store::storage::batch_project_index(
+            &b,
+            &gnitz_store::schema::IndexKeySpec::new(&[1, 2], &src, &idx),
+            &idx,
+        )
     };
     assert_eq!(projected.count, 1);
 
@@ -1621,7 +1669,7 @@ fn test_seek_prefix_matches_projection() {
 
     let spec = IndexKeySpec::new(&[1, 2], &src, &idx);
     let opk = spec.seek_prefix(&[(-5i32) as u32 as u128, 42u128]);
-    assert_eq!(opk.len as usize, key_size);
+    assert_eq!(opk.pk_bytes().len(), key_size);
     assert_eq!(
         opk.pk_bytes(),
         proj_key,
@@ -1635,8 +1683,8 @@ fn test_seek_prefix_matches_projection() {
 /// signed / unsigned / U128 column mix.
 #[test]
 fn index_key_spec_equals_projected_leading_span() {
-    use crate::schema::key::PkBuf;
-    use crate::schema::{type_code as tc, IndexKeySpec, SchemaColumn, SchemaDescriptor};
+    use gnitz_store::schema::key::PkBuf;
+    use gnitz_store::schema::{type_code as tc, IndexKeySpec, SchemaColumn, SchemaDescriptor};
     // Owner: PK id U64; a I64 (signed payload), b U128 (payload).
     let owner = SchemaDescriptor::new(
         &[
@@ -1671,7 +1719,7 @@ fn index_key_spec_equals_projected_leading_span() {
 
     // Reference: the projected index entry's leading idx_key_size bytes.
     let projected =
-        crate::storage::batch_project_index(&batch, &IndexKeySpec::new(&cols, &owner, &idx_schema), &idx_schema);
+        gnitz_store::storage::batch_project_index(&batch, &IndexKeySpec::new(&cols, &owner, &idx_schema), &idx_schema);
     assert_eq!(projected.count, rows.len());
 
     let mb = batch.as_mem_batch();
@@ -1702,18 +1750,11 @@ fn native_u128_at(v: i64, sz: usize) -> u128 {
 fn project_leading_span(src: SchemaDescriptor, idx: &SchemaDescriptor, native: u128) -> Vec<u8> {
     let mut bb = BatchBuilder::new(src);
     bb.begin_row(1u128, 1);
-    match src.columns[1].size() {
-        1 => bb.put_u8(native as u8),
-        2 => bb.put_u16(native as u16),
-        4 => bb.put_u32(native as u32),
-        8 => bb.put_u64(native as u64),
-        16 => bb.put_u128(native),
-        sz => unreachable!("unexpected column width {sz}"),
-    }
+    bb.put_int(native);
     bb.end_row();
     let projected = {
         let b = bb.finish();
-        crate::storage::batch_project_index(&b, &crate::schema::IndexKeySpec::new(&[1], &src, idx), idx)
+        gnitz_store::storage::batch_project_index(&b, &gnitz_store::schema::IndexKeySpec::new(&[1], &src, idx), idx)
     };
     let key_size = idx.columns[0].size() as usize;
     projected.get_pk_bytes(0)[..key_size].to_vec()
@@ -1727,7 +1768,7 @@ fn signed_index_width_ladder_promotes_to_i64_and_orders() {
     // negatives below non-negatives, the invariant a future range / ordered
     // index scan relies on. Fails under the old U64 promotion (negatives sorted
     // AFTER non-negatives); passes now.
-    use crate::schema::{type_code as tc, SchemaColumn, SchemaDescriptor};
+    use gnitz_store::schema::{type_code as tc, SchemaColumn, SchemaDescriptor};
     for &(t, sz) in &[(tc::I8, 1usize), (tc::I16, 2), (tc::I32, 4), (tc::I64, 8)] {
         let src = SchemaDescriptor::new(&[SchemaColumn::new(tc::U64, 0), SchemaColumn::new(t, 0)], &[0]);
         let idx = make_index_schema(&[1], &src).unwrap();
@@ -1771,9 +1812,9 @@ fn write_span_reference(
     owner: &SchemaDescriptor,
     spec: &IndexKeySpec,
     cols: &[u32],
-    mb: &crate::storage::MemBatch<'_>,
+    mb: &gnitz_store::storage::MemBatch<'_>,
     row: usize,
-) -> Option<crate::schema::key::PkBuf> {
+) -> Option<gnitz_store::schema::key::PkBuf> {
     let mut natives = Vec::with_capacity(cols.len());
     for &c in cols {
         let loc = owner.locate(c as usize);
@@ -1807,7 +1848,7 @@ fn write_span_matches_the_oracle_on_compound_null_and_entry_shapes() {
         .enumerate()
     {
         bb.begin_row_opk(&[a as u128, v as u64 as u128], 1);
-        bb.put_i32(-(i as i32));
+        bb.put_int(-(i as i32) as u128);
         bb.end_row();
     }
     // A NULL in the *trailing* indexed column: the leading column's bytes are
@@ -1853,7 +1894,7 @@ fn write_span_matches_seek_prefix_across_type_ladder() {
     // byte-equal `index_opk_prefix` (seek side) for the same value, at every
     // type — the equality a partial application of the signed-encoding change
     // would break (and which keeps `WHERE col = v` seeks correct).
-    use crate::schema::{type_code as tc, SchemaColumn, SchemaDescriptor};
+    use gnitz_store::schema::{type_code as tc, SchemaColumn, SchemaDescriptor};
     let cases: &[(u8, usize, &[i64])] = &[
         (tc::I8, 1, &[-128, -1, 0, 1, 127]),
         (tc::I16, 2, &[-32768, -1, 0, 1, 32767]),
@@ -1882,7 +1923,7 @@ fn write_span_matches_seek_prefix_across_type_ladder() {
         for &v in values {
             let native = native_u128_at(v, sz);
             let write_span = project_leading_span(src, &idx, native);
-            let seek = crate::schema::key::index_opk_prefix(native, t, idx_type);
+            let seek = gnitz_store::schema::key::index_opk_prefix(native, t, idx_type);
             assert_eq!(
                 &write_span[..],
                 seek.padded(idx_size),
@@ -1910,7 +1951,7 @@ fn composite_index_signed_leading_unsigned_tiebreak_orders() {
     // Index on (signed i32, unsigned u64): the leading signed column orders
     // numerically (negatives below non-negatives) and the unsigned column breaks
     // ties. Asserts the full composite span sorts in tuple-numeric order.
-    use crate::schema::{type_code as tc, SchemaColumn, SchemaDescriptor};
+    use gnitz_store::schema::{type_code as tc, SchemaColumn, SchemaDescriptor};
     let src = SchemaDescriptor::new(
         &[
             SchemaColumn::new(tc::U64, 0),
@@ -1927,12 +1968,16 @@ fn composite_index_signed_leading_unsigned_tiebreak_orders() {
     for (i, &(a, b)) in rows.iter().enumerate() {
         let mut bb = BatchBuilder::new(src);
         bb.begin_row((i as u128) + 1, 1);
-        bb.put_u32(a as u32);
+        bb.put_int(a as u128);
         bb.put_u64(b);
         bb.end_row();
         let projected = {
             let b = bb.finish();
-            crate::storage::batch_project_index(&b, &crate::schema::IndexKeySpec::new(&[1, 2], &src, &idx), &idx)
+            gnitz_store::storage::batch_project_index(
+                &b,
+                &gnitz_store::schema::IndexKeySpec::new(&[1, 2], &src, &idx),
+                &idx,
+            )
         };
         spans.push(projected.get_pk_bytes(0)[..key_size].to_vec());
     }
@@ -1964,7 +2009,7 @@ const OPEN_ABOVE: Cut = Cut::type_edges(TypeCode::U64).unwrap().1;
 /// Collect the positive-weight source PKs returned by a range scan, sorted.
 fn range_pks(engine: &mut CatalogEngine, tid: i64, cols: &[u32], eq: &[u128], start: Cut, end: Cut) -> Vec<u128> {
     let desc = RangeDescriptor::new(eq, start, end);
-    let r = engine.seek_by_index_range(tid, cols, &desc).unwrap().0;
+    let r = engine.registry_mut().seek_by_index_range(tid, cols, &desc).unwrap().0;
     let mut pks: Vec<u128> = match r {
         Some(b) => (0..b.count)
             .filter(|&i| b.get_weight(i) > 0)
@@ -1983,7 +2028,7 @@ fn test_seek_by_index_range_unsigned_pure_range() {
         &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // x ∈ {0,10,20,30} at PKs {1,2,3,4}.
     let mut bb = BatchBuilder::new(schema);
@@ -1993,7 +2038,7 @@ fn test_seek_by_index_range_unsigned_pure_range() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     let c = &[1u32];
     // x > 10  → {20,30} = PKs {3,4}
@@ -2026,17 +2071,17 @@ fn test_seek_by_index_range_signed_between() {
         &[col_def("id", type_code::U64), col_def("x", type_code::I32)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // x ∈ {-10,-5,0,5,10} at PKs {1..5}. The cff7c58 payoff: OPK(-5) < OPK(5).
     let mut bb = BatchBuilder::new(schema);
     for (pk, x) in [(1u128, -10i32), (2, -5), (3, 0), (4, 5), (5, 10)] {
         bb.begin_row(pk, 1);
-        bb.put_u32(x as u32);
+        bb.put_int(x as u128);
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     let pk = |v: i32| (v as u32) as u128;
     let c = &[1u32];
@@ -2073,7 +2118,7 @@ fn test_seek_by_index_range_composite_eq_prefix() {
         ],
     );
     engine.create_index("public.t", &["a", "b"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // (a,b): three a==7 rows, one a==8 row (must never enter the a==7 scan).
     let mut bb = BatchBuilder::new(schema);
@@ -2084,7 +2129,7 @@ fn test_seek_by_index_range_composite_eq_prefix() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     let c = &[1u32, 2u32]; // index (a, b)
                            // a = 7 AND b < 50 → {(7,10),(7,49)} = PKs {1,2}; (8,0) is absent (the end
@@ -2111,7 +2156,7 @@ fn test_seek_by_index_range_open_ended() {
         &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     for (pk, x) in [(1u128, 1u64), (2, 2), (3, 3), (4, 4)] {
@@ -2120,7 +2165,7 @@ fn test_seek_by_index_range_open_ended() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     let c = &[1u32];
     // x > 2 (unbounded above) → {3,4}
@@ -2144,7 +2189,7 @@ fn test_seek_by_index_range_exclusive_lower_large_dup_group() {
         &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // A large x==10 duplicate group (distinct source PKs, including u64::MAX whose
     // OPK source-PK suffix is all-0xFF), plus two strictly-greater rows.
@@ -2161,7 +2206,7 @@ fn test_seek_by_index_range_exclusive_lower_large_dup_group() {
     bb.put_u64(30);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     let c = &[1u32];
     // x > 10: After(10) cuts past the whole duplicate group — including the
@@ -2187,7 +2232,7 @@ fn test_seek_by_index_range_retraction() {
         &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     for (pk, x) in [(1u128, 5u64), (2, 15), (3, 25)] {
@@ -2196,17 +2241,17 @@ fn test_seek_by_index_range_retraction() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Retract PK 2 (x=15) → net weight 0; it must vanish from the range scan
     // (no ghost entry) at both the index and the source resolve.
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     let mut rb = BatchBuilder::new(schema);
     rb.begin_row(2, -1);
     rb.put_u64(15);
     rb.end_row();
     engine.ingest_to_family(tid, &rb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     let c = &[1u32];
     // x > 0 → {5,25} = PKs {1,3}; PK 2 (retracted x=15) absent.
@@ -2223,7 +2268,7 @@ fn test_seek_by_index_range_null_excluded() {
         &[col_def("id", type_code::U64), nullable_def("x", type_code::I64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // PK 2 has x = NULL — absent from the index, so excluded from every range.
     let mut bb = BatchBuilder::new(schema);
@@ -2237,7 +2282,7 @@ fn test_seek_by_index_range_null_excluded() {
     bb.put_u64(15);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     let c = &[1u32];
     // The I64 type-edge cuts (the range column is I64 here, not U64).
@@ -2261,7 +2306,9 @@ fn test_seek_by_index_range_no_range_column_errs() {
 
     // n_eq == arity → no range column; the pub method must self-guard with Err,
     // never panic indexing past the column list.
-    let r = engine.seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[10], After(0), OPEN_ABOVE));
+    let r = engine
+        .registry_mut()
+        .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[10], After(0), OPEN_ABOVE));
     assert!(r.is_err(), "n_eq == index arity must be rejected");
     assert!(r.err().unwrap().contains("no range column"));
 
@@ -2279,7 +2326,7 @@ fn test_seek_by_index_range_exclusive_lower_type_max() {
         &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     for (pk, x) in [(1u128, 10u64), (2, 20), (3, u64::MAX), (4, u64::MAX)] {
@@ -2288,7 +2335,7 @@ fn test_seek_by_index_range_exclusive_lower_type_max() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     let c = &[1u32];
     let max = u64::MAX as u128;
@@ -2314,7 +2361,7 @@ fn test_seek_by_index_range_inclusive_upper_type_max() {
         &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     for (pk, x) in [(1u128, 10u64), (2, 20), (3, u64::MAX)] {
@@ -2323,7 +2370,7 @@ fn test_seek_by_index_range_inclusive_upper_type_max() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     let c = &[1u32];
     // x <= u64::MAX → every indexed row, the MAX row included.
@@ -2350,7 +2397,7 @@ fn test_seek_by_index_range_carry_ripples_into_eq_prefix() {
         ],
     );
     engine.create_index("public.t", &["a", "b"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     for (pk, a, b) in [(1u128, 7u64, u64::MAX), (2, 8, 0u64)] {
@@ -2360,7 +2407,7 @@ fn test_seek_by_index_range_carry_ripples_into_eq_prefix() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     let c = &[1u32, 2u32]; // index (a, b)
     let max = u64::MAX as u128;
@@ -2420,7 +2467,7 @@ fn test_seek_by_index_range_multi_group_sorted_with_retraction() {
         &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // x=10 at PKs {5,2,8}, x=20 at PKs {3,7,1} — two duplicate groups.
     let mut bb = BatchBuilder::new(schema);
@@ -2430,10 +2477,11 @@ fn test_seek_by_index_range_multi_group_sorted_with_retraction() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // x ∈ [10, 20] → all six rows, each at weight 1.
     let r = engine
+        .registry_mut()
         .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[], Before(10), After(20)))
         .unwrap()
         .0;
@@ -2443,15 +2491,16 @@ fn test_seek_by_index_range_multi_group_sorted_with_retraction() {
     );
 
     // Retract PK 5 (x=10) → net weight 0; it must vanish from the scan.
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     let mut rb = BatchBuilder::new(schema);
     rb.begin_row(5, -1);
     rb.put_u64(10);
     rb.end_row();
     engine.ingest_to_family(tid, &rb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     let r = engine
+        .registry_mut()
         .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[], Before(10), After(20)))
         .unwrap()
         .0;
@@ -2481,7 +2530,7 @@ fn test_seek_by_index_prefix_multi_group_sorted() {
         ],
     );
     engine.create_index("public.t", &["a", "b"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // a=7: b=100 at PKs {5,2}, b=200 at PKs {8,1}. a=8 at PK 99 (must not match).
     let mut bb = BatchBuilder::new(schema);
@@ -2498,10 +2547,11 @@ fn test_seek_by_index_prefix_multi_group_sorted() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Prefix seek a=7 → PKs {1,2,5,8}, all with a=7; PK 99 (a=8) absent.
     let r = engine
+        .registry_mut()
         .seek_by_index(tid, &[1, 2], &[7u128])
         .unwrap()
         .0
@@ -2533,7 +2583,7 @@ fn test_seek_by_index_range_empty_interval_short_circuits() {
         &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // Values {10, 30}; the half-open interval for 15 < x < 25 is non-empty but
     // contains no indexed value.
@@ -2544,9 +2594,10 @@ fn test_seek_by_index_range_empty_interval_short_circuits() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     let r = engine
+        .registry_mut()
         .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[], After(15), Before(25)))
         .unwrap()
         .0;
@@ -2575,9 +2626,9 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     // owned `Table`, the shape an index owner takes in production. The leading
     // PK column is distinct per row: the base flush orders the shard by the wide
     // PK, which the resolve's binary-search seek relies on.
-    use crate::query::{RelationKind, StoreHandle};
-    use crate::schema::SchemaDescriptor;
-    use crate::storage::{RecoverySource, Table};
+    use gnitz_store::relation::RelationKind;
+    use gnitz_store::schema::SchemaDescriptor;
+    use gnitz_store::storage::{RecoverySource, Table};
 
     let dir = temp_dir("catalog_range_wide_pk");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -2601,19 +2652,21 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     }
     // Rows were appended out of PK order; the batch is `Raw` (the constructor
     // default), so the ingest's `into_consolidated` sorts the shard.
-    let idx_batch = crate::storage::batch_project_index(
+    let idx_batch = gnitz_store::storage::batch_project_index(
         &bb,
-        &crate::schema::IndexKeySpec::new(&[3], &schema, &idx_schema),
+        &gnitz_store::schema::IndexKeySpec::new(&[3], &schema, &idx_schema),
         &idx_schema,
     );
 
-    let mut base = Table::new(
-        &format!("{dir}/base"),
-        schema,
-        tid as u32,
-        RecoverySource::Rederive { resume_at: None },
-    )
-    .unwrap();
+    let mut base = Box::new(
+        Table::new(
+            &format!("{dir}/base"),
+            schema,
+            tid as u32,
+            RecoverySource::Rederive { resume_at: None },
+        )
+        .unwrap(),
+    );
     let mut idx = Table::new(
         &format!("{dir}/idx"),
         idx_schema,
@@ -2626,26 +2679,19 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     idx.ingest_owned_batch(idx_batch).unwrap();
     idx.flush().unwrap();
 
-    engine.dag.register_table(
-        tid,
-        crate::query::TableEntry::new(
-            crate::query::RelationStores {
-                handle: StoreHandle::Owned(std::cell::UnsafeCell::new(Box::new(base))),
-                delta: None,
-            },
-            schema,
-            RelationKind::BaseTable,
-            0,
-            dir.clone(),
-            crate::query::ViewBudgets::default(),
-        ),
-    );
+    // SAFETY: `base` is dropped at the end of this function, after `engine.close()`.
+    unsafe {
+        engine
+            .registry_mut()
+            .register_borrowed(tid, &mut base, schema, RelationKind::BaseTable, dir.clone());
+    }
     engine
-        .dag
+        .registry_mut()
         .add_index_circuit(tid, &[3], tid + 1, Box::new(idx), idx_schema, false);
 
     // x ∈ [10, 30] → all three wide-PK rows, resolved by their full 24-byte key.
     let r = engine
+        .registry_mut()
         .seek_by_index_range(tid, &[3], &RangeDescriptor::new(&[], Before(10), After(30)))
         .unwrap()
         .0
@@ -2678,7 +2724,7 @@ fn test_seek_by_index_full_arity_nonunique_group_ascending() {
         &[col_def("id", type_code::U64), col_def("x", type_code::U64)],
     );
     engine.create_index("public.t", &["x"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // x=50 at PKs {9,3,6} (inserted scrambled); x=60 at PK 1 (must not match).
     let mut bb = BatchBuilder::new(schema);
@@ -2688,9 +2734,10 @@ fn test_seek_by_index_full_arity_nonunique_group_ascending() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     let r = engine
+        .registry_mut()
         .seek_by_index(tid, &[1], &[50u128])
         .unwrap()
         .0
@@ -2746,7 +2793,7 @@ fn test_seek_by_index_composite_prefix_null_gate() {
         ],
     );
     engine.create_index("public.t", &["a", "b"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     // (1, 5, NULL)
@@ -2760,9 +2807,9 @@ fn test_seek_by_index_composite_prefix_null_gate() {
     bb.put_u64(9);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
-    let r = engine.seek_by_index(tid, &[1, 2], &[5u128]).unwrap().0;
+    let r = engine.registry_mut().seek_by_index(tid, &[1, 2], &[5u128]).unwrap().0;
     assert_eq!(
         result_ab_quads(r),
         vec![(1, 5, 9, 1)],
@@ -2783,7 +2830,7 @@ fn test_seek_by_index_multi_value_regression() {
         &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
     );
     engine.create_index("public.t", &["val"], false).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     for (pk, val) in [(1u128, 10u64), (2, 20), (3, 30)] {
@@ -2792,13 +2839,14 @@ fn test_seek_by_index_multi_value_regression() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
-    let r = engine.seek_by_index(tid, &[1], &[20u128]).unwrap().0;
+    let r = engine.registry_mut().seek_by_index(tid, &[1], &[20u128]).unwrap().0;
     assert_eq!(result_triples(r), vec![(2, 20, 1)]);
 
     // val ∈ [10, 20]
     let rr = engine
+        .registry_mut()
         .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[], Before(10), After(20)))
         .unwrap()
         .0;

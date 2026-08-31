@@ -5,12 +5,12 @@
 //! What stays here is the translation between a [`SchemaDescriptor`] (+ the
 //! [`ColumnDef`]s that name it) and the codec's neutral per-column facts.
 //!
-//! The decode half is `crate::schema::decode_schema_block`, one module down:
+//! The decode half is `gnitz_store::schema::decode_schema_block`, one module down:
 //! `ColumnDef` lives above `schema` in the layering, so these encoders cannot
 //! join it there without forking the column projection.
 
 use super::{CatalogEngine, ColumnDef, SchemaWireEntry};
-use crate::schema::SchemaDescriptor;
+use gnitz_store::schema::SchemaDescriptor;
 use gnitz_wire::schema_block::SchemaBlockCol;
 use std::rc::Rc;
 

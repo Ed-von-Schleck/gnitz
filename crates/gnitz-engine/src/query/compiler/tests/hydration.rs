@@ -118,7 +118,7 @@ fn a_malformed_circuit_is_rejected_rather_than_guessed_at() {
                         group_cols: vec![0],
                         agg: vec![(gnitz_wire::AggFunc::Count, 0)],
                         global_ground: false,
-                        out_key: crate::schema::ReduceOutKey::SyntheticFold,
+                        out_key: gnitz_store::schema::ReduceOutKey::SyntheticFold,
                     },
                 ),
                 (2, OpNode::IntegrateSink),

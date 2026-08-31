@@ -61,7 +61,7 @@ fn register_filtered_view(engine: &mut CatalogEngine, base_tid: i64, name: &str,
 /// Names of the entries directly under `public`'s schema directory — where the
 /// pre-flight's throwaway root lives.
 fn schema_entries(dir: &str) -> Vec<String> {
-    let mut names = crate::storage::subdir_names(&format!("{dir}/public"));
+    let mut names = gnitz_store::storage::subdir_names(&format!("{dir}/public"));
     names.sort();
     names
 }
@@ -102,7 +102,7 @@ fn test_preflight_compile_verdict_and_no_residue() {
         .expect_err("an unusable compile directory must fail the pre-flight");
     // `create_dir_all` hits a plain file where a directory belongs (ENOTDIR);
     // the errno must reach the client's string, not flatten to "io error".
-    let want = crate::storage::StorageError::Io(libc::ENOTDIR).to_string();
+    let want = gnitz_store::storage::StorageError::Io(libc::ENOTDIR).to_string();
     assert!(
         io_msg.contains("child table create failed") && io_msg.contains(&want),
         "the rejection must name the failing step and its errno, got: {io_msg}"
@@ -193,7 +193,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     let base_cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
     let old_vid = register_filtered_view(&mut engine, base_tid, "vw", &pred_lt_blob(1, 100));
-    let old_dir = engine.dag.tables.get(&old_vid).unwrap().directory.clone();
+    let old_dir = engine.registry().table_entry(old_vid).unwrap().directory.clone();
 
     // The handler discards stale queue entries before the bundle it is about to
     // apply; the setup above is not part of that bundle.
@@ -209,18 +209,15 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     push_view_tab_row(&mut bb, -1, old_vid, "vw", "SELECT id, v FROM base", 0);
     push_view_tab_row(&mut bb, 1, new_vid, "vw", "SELECT id, v FROM base", 0);
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
-    let new_dir = engine.dag.tables.get(&new_vid).unwrap().directory.clone();
-    assert!(
-        !engine.dag.tables.contains_key(&old_vid),
-        "the bundle retires the incumbent"
-    );
+    let new_dir = engine.registry().table_entry(new_vid).unwrap().directory.clone();
+    assert!(!engine.registry().has_id(old_vid), "the bundle retires the incumbent");
 
     // The pre-flight rejects the replacement's circuit — the bundle fails after
     // VIEW_TAB was applied, exactly where the handler compensates.
     engine.compensate_stage_a(None).unwrap();
 
     assert!(
-        engine.dag.tables.contains_key(&old_vid),
+        engine.registry().has_id(old_vid),
         "the incumbent must be registered again"
     );
     assert!(
@@ -228,7 +225,7 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
         "the incumbent's data directory must survive: {old_dir}"
     );
     assert!(
-        !engine.dag.tables.contains_key(&new_vid),
+        !engine.registry().has_id(new_vid),
         "the replacement must be unregistered"
     );
     assert!(

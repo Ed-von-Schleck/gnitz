@@ -1,6 +1,6 @@
 use super::super::fixtures::compound_pk_bytes;
 use super::*;
-use gnitz_engine::schema::SchemaColumn;
+use gnitz_store::schema::SchemaColumn;
 use gnitz_wire::type_code;
 
 #[test]

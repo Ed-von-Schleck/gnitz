@@ -14,8 +14,8 @@ use std::cmp::Ordering;
 use rustc_hash::FxHashSet;
 
 use super::*;
-use crate::schema::make_index_schema;
-use crate::storage::{compare_rows, compare_rows_except, StoredRow};
+use gnitz_store::schema::make_index_schema;
+use gnitz_store::storage::{compare_rows, compare_rows_except, StoredRow};
 use gnitz_wire::{
     COLTAB_PAY_COL_IDX, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID,
     COLTAB_PAY_OWNER_KIND, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME, TABTAB_PAY_NAME,
@@ -106,9 +106,9 @@ impl CatalogEngine {
             self_pk_type
         } else {
             let entry = self
-                .dag
-                .tables
-                .get(&col.fk_table_id)
+                .registry
+                .table_entry(col.fk_table_id)
+                .ok()
                 .ok_or_else(|| format!("FK references unknown table_id {}", col.fk_table_id))?;
             // Not covered by the PK/UNIQUE tests below, which read only the schema:
             // a stream and a view both have a PK that looks exactly like a base
@@ -233,10 +233,10 @@ impl CatalogEngine {
             };
             let schema = family.schema();
             for j in 0..batch.count {
-                if batch.get_pk(j) == sig.pk
-                    && batch.get_weight(j) < 0
-                    && compare_rows(&schema, &sr.run, sr.row, batch, j) != Ordering::Equal
-                {
+                if batch.get_pk(j) == sig.pk && batch.get_weight(j) < 0 && {
+                    let (src, ri) = sr.source();
+                    compare_rows(&schema, src, ri, batch, j) != Ordering::Equal
+                } {
                     return Err(format!(
                         "catalog changed concurrently: the retracted {noun} differs from the current one"
                     ));
@@ -276,10 +276,10 @@ impl CatalogEngine {
             if sig.is_pair() {
                 let lb = live.as_ref().expect("a pair's -1 CAS already required a live row");
                 for j in 0..batch.count {
-                    if batch.get_pk(j) == sig.pk
-                        && batch.get_weight(j) > 0
-                        && compare_rows_except(&schema, &lb.run, lb.row, batch, j, 1 << TABTAB_PAY_NAME)
-                            != Ordering::Equal
+                    if batch.get_pk(j) == sig.pk && batch.get_weight(j) > 0 && {
+                        let (src, ri) = lb.source();
+                        compare_rows_except(&schema, src, ri, batch, j, 1 << TABTAB_PAY_NAME)
+                    } != Ordering::Equal
                     {
                         return Err("a system-catalog rewrite pair may only change the name".into());
                     }
@@ -339,9 +339,9 @@ impl CatalogEngine {
             // the owner registers later in this bundle. A `+1` append is valid;
             // a `-1` has no live row to retract.
             let Some((is_base, owner_schema)) = self
-                .dag
-                .tables
-                .get(&owner_id)
+                .registry
+                .table_entry(owner_id)
+                .ok()
                 .map(|e| (e.kind.is_base_table(), e.schema))
             else {
                 if sig.neg.is_some() {
@@ -496,7 +496,8 @@ impl CatalogEngine {
             let Some(sr) = store.live_row_at(key.pk_bytes()).1 else {
                 continue;
             };
-            let (row_owner, row_cols, is_uniq) = read_idx_tab_row(&sr.run, sr.row);
+            let (src, ri) = sr.source();
+            let (row_owner, row_cols, is_uniq) = read_idx_tab_row(src, ri);
             if row_owner == owner_id && row_cols.as_slice() == cols {
                 f(idx_id, is_uniq);
             }
@@ -515,7 +516,7 @@ impl CatalogEngine {
         &self,
         vid: i64,
         name: &str,
-        budgets: crate::query::ViewBudgets,
+        budgets: gnitz_store::relation::ViewBudgets,
         source_ids: &[i64],
     ) -> Result<(), String> {
         // A hidden chain segment is an internal relation the planner mints, never
@@ -542,7 +543,9 @@ impl CatalogEngine {
         // nothing to recompute from. `ScanDelta` is the only external-source
         // opcode, so `source_ids` covers every circuit's every source.
         for &src in source_ids {
-            let Some(e) = self.dag.tables.get(&src) else { continue };
+            let Some(e) = self.registry.entry(src) else {
+                continue;
+            };
             if e.capacity_bytes.is_some() {
                 return Err(format!(
                     "view '{name}' (vid={vid}) reads relation {src}, which is a \
@@ -574,7 +577,7 @@ impl CatalogEngine {
         &self,
         owner_id: i64,
         cols: &PkColList,
-    ) -> Result<&crate::query::TableEntry, String> {
+    ) -> Result<&gnitz_store::relation::TableEntry, String> {
         if !cols.is_well_formed() {
             return Err(format!(
                 "Index: column list count {} out of range 1..={}",
@@ -583,9 +586,9 @@ impl CatalogEngine {
             ));
         }
         let entry = self
-            .dag
-            .tables
-            .get(&owner_id)
+            .registry
+            .table_entry(owner_id)
+            .ok()
             .ok_or_else(|| format!("Index: owner table {owner_id} not found"))?;
         if !entry.kind.is_base_table() {
             return Err(format!(
@@ -691,13 +694,13 @@ impl CatalogEngine {
             let id = batch.get_pk(i) as i64;
 
             // The relation-id ceiling is enforced here — the one place an id
-            // ENTERS the `dag.tables` namespace before any mutation. Guarding
+            // ENTERS the registry namespace before any mutation. Guarding
             // `allocate_table_id` alone would not cover it: the register hooks
             // take the id straight off the ingested row and `raise_id_counter`
             // it, and the id is caller-chosen (a client may preset
             // `circuit.view_id`), so a crafted CREATE VIEW could otherwise
             // register a durable view at or above the ceiling. TABLE_TAB /
-            // VIEW_TAB are the only families whose PK is a `dag.tables` id.
+            // VIEW_TAB are the only families whose PK is a the registry id.
             let ceiling = sys_tables::RELATION_ID_CEILING;
             if id >= ceiling {
                 return Err(format!(
@@ -885,7 +888,7 @@ impl CatalogEngine {
             // to validate. The drop is allowed when uniqueness is structurally
             // preserved: the column is the lone PK, or another unique secondary
             // index survives the drop.
-            let is_lone_pk = self.dag.tables.get(&owner_id).is_some_and(|e| {
+            let is_lone_pk = self.registry.entry(owner_id).is_some_and(|e| {
                 let pk = e.schema.pk_indices();
                 pk.len() == 1 && pk[0] as usize == src_col
             });

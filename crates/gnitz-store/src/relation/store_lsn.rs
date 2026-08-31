@@ -1,0 +1,194 @@
+//! Per-worker store lifecycle across the fork — detach, re-home, child-dir
+//! reclamation, invalid-view reset — and the flushed-LSN bookkeeping that
+//! recovery and the DDL zone allocator read.
+
+use super::{RelationKind, RelationRegistry, StoreHandle, FIRST_USER_TABLE_ID};
+use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr};
+
+impl RelationRegistry {
+    // -- Store management (for multi-worker fork) -----------------------------
+
+    /// Detach every user relation's store (master after fork), so master and
+    /// worker 0 do not both hold a live `Table` on `w0of{W}`: two processes
+    /// writing one directory is the hazard `naming.rs` exists to prevent. System
+    /// tables keep their `Borrowed` handles, so the filter is the handle.
+    pub fn detach_user_stores(&mut self) {
+        self.owns_stores = false;
+        for entry in self.tables.values_mut() {
+            if !matches!(entry.handle, StoreHandle::Borrowed(_)) {
+                entry.handle = StoreHandle::Detached;
+            }
+            // A fed view's delta store goes too. The pre-fork master builds one at
+            // `ChildAddr::Delta { rank: 0 }` during boot replay, and worker 0 homes
+            // its own there — so leaving it would have two processes holding a live
+            // `Table` on one directory, which is what this whole function prevents.
+            entry.delta = None;
+        }
+    }
+
+    /// Panic unless this is the pre-fork master. Both boot passes below reach
+    /// across the whole cluster — one reclaims every relation's retired children,
+    /// the other peeks every launched rank's manifest — which only that one
+    /// process may do: the workers do not exist yet and the post-fork master owns
+    /// no store to speak for them.
+    pub fn assert_pre_fork(&self, who: &str) {
+        assert!(
+            !crate::foundation::worker_ctx::is_worker() && self.owns_stores,
+            "{who} must run pre-fork on the master, which still owns its stores",
+        );
+    }
+
+    /// Re-open every store this worker inherited on someone else's child.
+    ///
+    /// The pre-fork master builds every relation at rank 0 and every worker
+    /// inherits those handles; since all workers share the data directory,
+    /// leaving them there would have every worker flush the same shard files.
+    /// The inherited handle is empty — the master ingests no user data — so
+    /// re-opening loses nothing: this rank's checkpointed shards load from its
+    /// own child and the FLAG_PUSH replay adds the SAL tail.
+    ///
+    /// A handle already homed here is left alone rather than special-cased by
+    /// rank: that covers worker 0's inherited child and the live CREATE path,
+    /// which builds at the worker's own rank to begin with. Re-opening one would
+    /// briefly put two live `Table`s on one directory.
+    pub fn rehome_stores(&mut self) -> Result<(), String> {
+        let home = ChildAddr::this_worker(self.num_workers);
+        let tids: Vec<i64> = self
+            .tables
+            .iter()
+            .filter(|(_, e)| {
+                e.handle
+                    .as_owned()
+                    .is_some_and(|t| t.directory() != home.dir(&e.directory))
+            })
+            .map(|(&tid, _)| tid)
+            .collect();
+        for tid in tids {
+            self.rebuild_relation_store(tid, "rehome store")?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild `tid`'s store handle from its registered `(directory, schema,
+    /// kind)` and install it. `build_relation_store` opens this worker's own
+    /// child, so the rebuilt handle is homed wherever the caller now runs. The
+    /// caller does whatever on-disk preparation its case needs first.
+    ///
+    /// Both stores are rebuilt, and both are installed: a fed view whose delta
+    /// store did not come back here would still carry its `delta_bytes` in the
+    /// catalog and have no delta store on any worker, on every boot, with no error
+    /// anywhere.
+    pub(crate) fn rebuild_relation_store(&mut self, tid: i64, what: &str) -> Result<(), String> {
+        let (dir, schema, kind, budgets) = {
+            let e = self
+                .tables
+                .get(&tid)
+                .ok_or_else(|| format!("{what}: relation {tid} not registered"))?;
+            (e.directory.clone(), e.schema, e.kind, e.budgets())
+        };
+        let stores = self
+            .build_relation_store(kind, &dir, tid, schema, budgets)
+            .map_err(|e| format!("{what} tid={tid}: {e}"))?;
+        let entry = self.tables.get_mut(&tid).expect("entry read above");
+        entry.handle = stores.handle;
+        entry.delta = stores.delta;
+        Ok(())
+    }
+
+    /// Reclaim every live relation's child directories that this boot's worker
+    /// count no longer owns — the on-disk counterpart of `rehome_stores`, which
+    /// then opens what this leaves behind. Runs after the boot relayout, so what
+    /// it deletes is a set the relayout has already consumed.
+    ///
+    /// Unconditional rather than triggered on "the launched count changed": a
+    /// boot that dies between this sweep and `record_topology` leaves the
+    /// recorded count unchanged, so such a trigger would skip the repair on the
+    /// retry. It is idempotent, so running it every boot converges instead.
+    pub fn reconcile_child_dirs(&self) {
+        self.assert_pre_fork("reconcile_child_dirs");
+        for entry in self.tables.values() {
+            // System tables are `Borrowed` single `Table`s with no children.
+            if matches!(entry.handle, StoreHandle::Borrowed(_)) {
+                continue;
+            }
+            // A storeless relation's `directory` names a path that was never created;
+            // `reclaim_retired_children` reads it as having no children and returns.
+            reclaim_retired_children(&entry.directory, self.num_workers);
+        }
+    }
+
+    /// Reset a relation's store and per-worker operator scratch to an empty,
+    /// well-formed state — recovery step-4, run per worker on its own store
+    /// before an invalid view is rebuilt. The caller drops the cached plan.
+    ///
+    /// Unlinks this worker's child manifest first, so the empty rebuild below (a
+    /// `Rederive` open) peeks `None` and *erases* the stale
+    /// generation-`g` shards rather than reloading them — without which a
+    /// transitively-invalid view whose own manifests are still at `g` would reload
+    /// them. Then rebuilds the handle empty via `build_relation_store` and
+    /// removes this worker's scratch operator dirs.
+    pub fn reset_store(&mut self, vid: i64) -> Result<(), String> {
+        let dir = self
+            .tables
+            .get(&vid)
+            .ok_or_else(|| format!("reset_store: relation {vid} not registered"))?
+            .directory
+            .clone();
+
+        let rank = crate::foundation::worker_ctx::worker_rank();
+        let _ = std::fs::remove_file(ChildAddr::this_worker(self.num_workers).manifest(&dir));
+
+        // Rebuild empty. `Table::new` erases the stale shards (manifest now
+        // absent → `Rederive` peek `None`).
+        self.rebuild_relation_store(vid, "reset view output")?;
+
+        // Remove this worker's per-view operator scratch dirs (rank-stamped).
+        // Through `remove_child` so a crash mid-removal cannot leave a manifest
+        // behind whose shards are gone — `remove_dir_all` deletes in readdir order.
+        for name in subdir_names(&dir) {
+            if matches!(ChildAddr::parse(&name), Some(ChildAddr::Scratch { rank: r, .. }) if r == rank) {
+                remove_child(&format!("{dir}/{name}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every registered relation's `(table id, kind, current_lsn)` — the one walk
+    /// behind both the recovery dedup maps and the zone-allocator floor. A system
+    /// family's registry handle is a `Borrowed` re-export of its `sys_stores`
+    /// box, so this reads the same counter its own store would report.
+    fn all_store_lsns(&self) -> impl Iterator<Item = (i64, RelationKind, u64)> + '_ {
+        self.tables
+            .iter()
+            .map(|(&tid, entry)| (tid, entry.kind, entry.handle.current_lsn()))
+    }
+
+    /// The system families' `table id → max flushed LSN`: the dedup filter for the
+    /// master's pre-fork SAL walk. The id band excludes 0, which is "no target".
+    pub fn system_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
+        self.all_store_lsns()
+            .filter(|&(tid, _, _)| (1..FIRST_USER_TABLE_ID).contains(&tid))
+            .map(|(tid, _, lsn)| (tid, lsn))
+            .collect()
+    }
+
+    /// The user relations' `table id → max flushed LSN`: the dedup filter for a
+    /// worker's post-fork SAL walk. A storeless relation is absent rather than
+    /// present at 0 — there is nothing to recover into.
+    pub fn user_flushed_lsns(&self) -> std::collections::HashMap<i64, u64> {
+        self.all_store_lsns()
+            .filter(|&(tid, kind, _)| tid >= FIRST_USER_TABLE_ID && kind.owns_store())
+            .map(|(tid, _, lsn)| (tid, lsn))
+            .collect()
+    }
+
+    /// Maximum `current_lsn` across all tables — system and user. The
+    /// executor seeds its zone-LSN allocator from this at boot and passes it
+    /// as the reservation floor per DDL, so every allocated zone LSN is
+    /// strictly greater than each table's current counter: no recovery
+    /// watermark a checkpoint persisted can cover a committed-but-unflushed
+    /// zone, and a failed zone's pinned LSN is never reused.
+    pub fn max_table_current_lsn(&self) -> u64 {
+        self.all_store_lsns().map(|(_, _, lsn)| lsn).max().unwrap_or(0)
+    }
+}

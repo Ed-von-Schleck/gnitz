@@ -7,8 +7,8 @@
 //! output-slot coverage.
 
 use super::*;
-use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::storage::Batch;
+use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_store::storage::Batch;
 use gnitz_wire::{Cut, OrderKey, RangeDescriptor, ReadBound, ReadSpec};
 
 /// The `(id U64 PK | val I64)` schema both bases below use.
@@ -31,7 +31,7 @@ fn weighted_fixture(name: &str, rows: impl Iterator<Item = (u64, i64, i64)>) -> 
 
     let vid = register_identity_view(&mut engine, tid, "v_weighted", &cols);
 
-    let mut bb = BatchBuilder::new(engine.get_schema_desc(vid).unwrap());
+    let mut bb = BatchBuilder::new(engine.registry().get_schema_desc(vid).unwrap());
     for (id, val, w) in rows {
         bb.begin_row(id as u128, w);
         bb.put_u64(val as u64);
@@ -61,7 +61,7 @@ fn identity_spec(bound: ReadBound, order: Vec<OrderKey>, limit_k: u64) -> ReadSp
 }
 
 fn run(engine: &mut CatalogEngine, tid: i64, spec: &ReadSpec) -> Vec<(u128, i64, i64)> {
-    let reply_schema = engine.get_schema_desc(tid).unwrap();
+    let reply_schema = engine.registry().get_schema_desc(tid).unwrap();
     let keeper = engine.scan_spec_family(tid, spec, &reply_schema, 0).unwrap();
     triples(&keeper)
 }
@@ -120,7 +120,7 @@ fn pk_set_gathers_named_keys() {
 #[test]
 fn pk_set_over_a_system_table_keeps_every_key() {
     let (mut e, tid, _dir) = table_fixture("ss_pkset_sys", &id_val_cols());
-    let sys_schema = e.get_schema_desc(TABLE_TAB_ID).unwrap();
+    let sys_schema = e.registry().get_schema_desc(TABLE_TAB_ID).unwrap();
     let spec = identity_spec(ReadBound::PkSet(vec![tid as u128]), vec![], 0);
     let keeper = e.scan_spec_family(TABLE_TAB_ID, &spec, &sys_schema, 0).unwrap();
     assert_eq!(
@@ -141,7 +141,7 @@ fn pk_set_over_a_system_table_keeps_every_key() {
 fn pk_set_rejects_keys_colliding_after_truncation() {
     let (mut e, tid) = fixture("ss_pkset_trunc", 10, |i| i as i64);
     let spec = identity_spec(ReadBound::PkSet(vec![5, 5 + (1u128 << 64)]), vec![], 0);
-    let reply_schema = e.get_schema_desc(tid).unwrap();
+    let reply_schema = e.registry().get_schema_desc(tid).unwrap();
     let Err(err) = e.scan_spec_family(tid, &spec, &reply_schema, 0) else {
         panic!("colliding PkSet keys must be rejected, not gathered twice");
     };
@@ -160,11 +160,11 @@ fn keyed_reads_over_a_replicated_table_find_every_key() {
     let cols = id_val_cols();
     let tid = create_flagged_table(&mut e, "rep", &cols, &[0], replicated_flags());
     assert!(
-        e.get_schema_desc(tid).unwrap().placement().is_replicated(),
+        e.registry().get_schema_desc(tid).unwrap().placement().is_replicated(),
         "REPLICATED must stamp a replicated placement"
     );
 
-    let schema = e.get_schema_desc(tid).unwrap();
+    let schema = e.registry().get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     for id in 0..N {
         bb.begin_row(id, 1);
@@ -191,9 +191,12 @@ fn keyed_reads_over_a_replicated_table_find_every_key() {
 
     // The FK dereference gather and the `pk IN (…)` set gather.
     let pks: Vec<_> = (0..N)
-        .map(|id| crate::schema::key::opk_key(&schema, &id.to_le_bytes()))
+        .map(|id| gnitz_store::schema::key::opk_key(&schema, &id.to_le_bytes()))
         .collect();
-    let (gathered, _) = e.gather_family_bytes(tid, pks.iter().map(|p| p.pk_bytes()), 1).unwrap();
+    let (gathered, _) = e
+        .registry_mut()
+        .gather_family_bytes(tid, pks.iter().map(|p| p.pk_bytes()), 1)
+        .unwrap();
     assert_eq!(gathered.count, N as usize, "every parent key must dereference");
 
     let mut got = run(
@@ -220,7 +223,7 @@ fn keyed_reads_over_a_view_return_the_whole_pk_group() {
     let rows = [(7u64, 50i64, 1i64), (7, 100, 1), (7, 200, 1), (7, 300, 1), (9, 900, 1)];
     let (mut e, vid) = weighted_fixture("ss_view_group", rows.into_iter());
     // Retract (7, 50) in a second ingest: it folds to net zero at read time.
-    let mut bb = BatchBuilder::new(e.get_schema_desc(vid).unwrap());
+    let mut bb = BatchBuilder::new(e.registry().get_schema_desc(vid).unwrap());
     bb.begin_row(7, -1);
     bb.put_u64(50);
     bb.end_row();
@@ -287,7 +290,7 @@ fn pk_set_drains_a_group_larger_than_the_chunk_budget() {
             .map(|i| (1u64, i as i64, 1i64))
             .chain(std::iter::once((2u64, 99i64, 1i64))),
     );
-    e.ddl_scan_chunk_rows = 4;
+    e.registry_mut().set_ddl_scan_chunk_rows(4);
     let got = run(&mut e, vid, &identity_spec(ReadBound::PkSet(vec![1, 2]), vec![], 0));
     let want: Vec<_> = (0..10i64)
         .map(|v| (1u128, v, 1i64))
@@ -314,7 +317,7 @@ fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
     ];
     // CLUSTER BY a: distribution prefix = the first of the two PK columns.
     let tid = create_flagged_table(&mut e, "clus", &cols, &[0, 1], clustered_flags(1));
-    let schema = e.get_schema_desc(tid).unwrap();
+    let schema = e.registry().get_schema_desc(tid).unwrap();
     assert_eq!(schema.dist_stride(), 8, "CLUSTER BY one U64 column ⇒ an 8-byte prefix");
 
     let mut bb = BatchBuilder::new(schema);
@@ -351,7 +354,7 @@ fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
     // which shares the distribution prefix and so routes to one worker.
     let confined = RangeDescriptor::new(&[2], Cut::Before(0), Cut::After(u64::MAX as u128));
     assert!(
-        scan_spec_worker(&schema, &confined, 4).is_some(),
+        gnitz_store::read::scan_spec_worker(&schema, &confined, 4).is_some(),
         "the fixture's confined range must be the routed shape"
     );
     assert_eq!(
@@ -363,7 +366,7 @@ fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
     // `1 <= a < 3` spans two `a` groups, so it is not confinable and stays a
     // broadcast.
     let spanning = RangeDescriptor::new(&[], Cut::Before(1), Cut::Before(3));
-    assert!(scan_spec_worker(&schema, &spanning, 4).is_none());
+    assert!(gnitz_store::read::scan_spec_worker(&schema, &spanning, 4).is_none());
     let mut want: Vec<(u64, u64, i64)> = Vec::new();
     for a in 1..3 {
         for b in 0..NB {
@@ -402,7 +405,7 @@ fn order_key_column_out_of_range_is_rejected() {
         }],
         0,
     );
-    let reply_schema = e.get_schema_desc(tid).unwrap();
+    let reply_schema = e.registry().get_schema_desc(tid).unwrap();
     assert!(e.scan_spec_family(tid, &spec, &reply_schema, 0).is_err());
 }
 
@@ -475,7 +478,7 @@ fn huge_limit_does_not_truncate_the_early_stop() {
     // wrong answer at a trust boundary.
     let (mut e, tid) = fixture("ss_huge_limit", 40, |i| i as i64);
     // Five chunks, so a wrapped window cuts the scan after the first one.
-    e.ddl_scan_chunk_rows = 8;
+    e.registry_mut().set_ddl_scan_chunk_rows(8);
     for limit_k in [1u64 << 63, u64::MAX] {
         let mut got = run(&mut e, tid, &identity_spec(ReadBound::None, vec![], limit_k));
         got.sort();
@@ -500,7 +503,7 @@ fn proj_fixture(
     put_row: impl FnMut(&mut BatchBuilder, u64),
 ) -> (CatalogEngine, i64) {
     let (mut engine, tid) = ingest_fixture(name, cols, n, 1, put_row);
-    engine.ddl_scan_chunk_rows = chunk_rows;
+    engine.registry_mut().set_ddl_scan_chunk_rows(chunk_rows);
     (engine, tid)
 }
 
@@ -519,7 +522,7 @@ fn gather_of_64_payload_columns_covers_every_slot() {
     });
     // Identity-order gather of every payload column: src col k+1 → out slot k.
     let copies: Vec<(u32, u32)> = (0..P as u32).map(|k| (k + 1, k)).collect();
-    let reply = e.get_schema_desc(tid).unwrap();
+    let reply = e.registry().get_schema_desc(tid).unwrap();
     let spec = rows_spec(vec![], proj_blob(&copies), vec![], 0);
     let got = e.scan_spec_family(tid, &spec, &reply, 0).unwrap();
     assert_eq!(got.count, 40);
@@ -728,9 +731,9 @@ fn projection_missing_an_output_slot_errs() {
 #[test]
 fn gather_top_k_keeps_boundary_row_whole() {
     let (mut e, tid) = weighted_fixture("ss_gather_topk", (0..40u64).map(|id| (id, id as i64, 3i64)));
-    e.ddl_scan_chunk_rows = 8;
+    e.registry_mut().set_ddl_scan_chunk_rows(8);
     // Reply: id U64 PK | val I64 — a gather of the single payload column.
-    let reply = e.get_schema_desc(tid).unwrap();
+    let reply = e.registry().get_schema_desc(tid).unwrap();
     let order = vec![OrderKey {
         col: 1,
         desc: false,
@@ -757,7 +760,7 @@ fn gather_limit_cuts_the_range_list_mid_chunk() {
     let (mut e, tid) = proj_fixture("ss_gather_earlystop", &cols, 500, 256, |bb, id| {
         bb.put_u64(id % 2);
     });
-    let reply = e.get_schema_desc(tid).unwrap();
+    let reply = e.registry().get_schema_desc(tid).unwrap();
     let spec = rows_spec(pred_lt_blob(1, 1), proj_blob(&[(1, 0)]), vec![], 5);
     let got = e.scan_spec_family(tid, &spec, &reply, 0).unwrap();
     let total: i64 = (0..got.count).map(|r| got.get_weight(r)).sum();
@@ -773,10 +776,10 @@ fn gather_limit_cuts_the_range_list_mid_chunk() {
 fn reply_pk_stride_mismatch_errs() {
     let (mut e, tid) = fixture("ss_stride", 4, |i| i as i64);
     // A reply schema with a narrower (U32) PK than the source's U64.
-    let bad = crate::schema::SchemaDescriptor::new(
+    let bad = gnitz_store::schema::SchemaDescriptor::new(
         &[
-            crate::schema::SchemaColumn::new(type_code::U32, 0),
-            crate::schema::SchemaColumn::new(type_code::I64, 0),
+            gnitz_store::schema::SchemaColumn::new(type_code::U32, 0),
+            gnitz_store::schema::SchemaColumn::new(type_code::I64, 0),
         ],
         &[0],
     );

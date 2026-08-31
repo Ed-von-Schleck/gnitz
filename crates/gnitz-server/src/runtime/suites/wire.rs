@@ -3,9 +3,9 @@ use crate::runtime::wire::{
     DecodedWireZeroCopy, SchemaWithVersion, WireData, WireMsg,
 };
 use gnitz_engine::catalog::encode_schema_block;
-use gnitz_engine::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
-use gnitz_engine::storage::{Batch, Layout, MAX_BATCH_REGIONS};
 use gnitz_engine_testkit::{make_batch, make_batch_raw, u64_pk_schema};
+use gnitz_store::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
+use gnitz_store::storage::{Batch, Layout, MAX_BATCH_REGIONS};
 use gnitz_wire::control::peek_control_block_ipc;
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
 use gnitz_wire::type_code;

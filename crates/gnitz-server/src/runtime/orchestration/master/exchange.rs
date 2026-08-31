@@ -15,8 +15,8 @@ use rustc_hash::FxHashMap;
 
 use crate::runtime::w2m::worker_mask;
 use crate::runtime::wire::{DecodedWire, BACKFILL_PAD_BIT};
-use gnitz_engine::schema::SchemaDescriptor;
-use gnitz_engine::storage::Batch;
+use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::storage::Batch;
 use gnitz_wire::MAX_WORKERS;
 
 /// Per-view accumulator for `FLAG_EXCHANGE` replies, keyed by

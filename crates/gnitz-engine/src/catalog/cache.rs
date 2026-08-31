@@ -280,7 +280,7 @@ impl CatalogEngine {
     }
 
     /// A TABLE_TAB delta relocks every relation it names: the lock rule reads
-    /// `dag.tables[tid].kind`, which the register/teardown hooks just changed.
+    /// `the registry[tid].kind`, which the register/teardown hooks just changed.
     pub(crate) fn relock_from_table_delta(&mut self, batch: &Batch) {
         let mut tids = Vec::with_capacity(batch.count);
         for i in 0..batch.count {
@@ -299,7 +299,7 @@ impl CatalogEngine {
             }
             let fk_table_id = batch.read_payload_u64(i, COLTAB_PAY_FK_TABLE_ID) as i64;
             tids.push(batch.read_payload_u64(i, COLTAB_PAY_OWNER_ID) as i64);
-            if self.dag.tables.contains_key(&fk_table_id) {
+            if self.registry.has_id(fk_table_id) {
                 tids.push(fk_table_id);
             }
         }
@@ -324,7 +324,11 @@ impl CatalogEngine {
         // Every base table needs the lock: its writes run `enforce_unique_pk`
         // against the store, and only a base table can own a unique secondary
         // index. Views and system tables need it only as an FK endpoint.
-        let is_base_table = self.dag.tables.get(&tid).is_some_and(|e| e.kind.is_base_table());
+        let is_base_table = self
+            .registry
+            .table_entry(tid)
+            .ok()
+            .is_some_and(|e| e.kind.is_base_table());
 
         let needs = fk_child_count > 0 || fk_parent_count > 0 || is_base_table;
         if needs {

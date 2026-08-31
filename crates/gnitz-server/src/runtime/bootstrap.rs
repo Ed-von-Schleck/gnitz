@@ -12,8 +12,8 @@
 use std::collections::{HashMap, HashSet};
 
 use gnitz_engine::catalog::CatalogEngine;
-use gnitz_engine::foundation::fault::Seam;
-use gnitz_engine::foundation::posix_io;
+use gnitz_store::foundation::fault::Seam;
+use gnitz_store::foundation::posix_io;
 
 use crate::runtime::affinity;
 use crate::runtime::executor::ServerExecutor;
@@ -25,7 +25,7 @@ use crate::runtime::tls::{setup_tls_listener, TlsCli};
 use crate::runtime::w2m::{self, W2mReceiver, W2mWriter};
 use crate::runtime::wire as ipc;
 use crate::runtime::worker::{buffer_pending_delta, WorkerProcess};
-use gnitz_engine::storage::Batch;
+use gnitz_store::storage::Batch;
 
 /// One boot-progress line, raw and untagged, on stderr — the master's own, or
 /// `<data_dir>/worker_N.log` in a forked child.
@@ -54,7 +54,7 @@ fn recover_system_tables_from_sal(
     catalog: &mut CatalogEngine,
 ) -> Result<(u32, Option<u32>), String> {
     let log = unsafe { SalLog::new(sal_ptr, sal_mmap_size()) };
-    let family_lsns = catalog.system_flushed_lsns();
+    let family_lsns = catalog.registry().system_flushed_lsns();
 
     // Derived once, before either pass: on a boot whose offset-0 header is
     // damaged this costs a full-ring sweep, and both passes must anchor on the
@@ -127,8 +127,9 @@ fn inject_recovery_panic(stage: &str) {
 /// sweep drains exactly these — same function, so the swept set equals the
 /// buffered set by construction (no leak, no gap).
 fn swept_base_tables(catalog: &mut CatalogEngine) -> Vec<i64> {
-    let view_ids = catalog.dag().view_ids();
-    catalog.dag_mut().base_tables_reachable_from(view_ids)
+    let view_ids = catalog.registry().view_ids();
+    let (dag, registry) = catalog.dag_and_registry_mut();
+    dag.base_tables_reachable_from(registry, view_ids)
 }
 
 /// Per-worker post-fork user-table replay for `rank` of `num_workers`. The apply
@@ -157,7 +158,7 @@ fn recover_from_sal(
     walk_epoch: u32,
     catalog: &mut CatalogEngine,
 ) -> Result<HashMap<i64, Batch>, String> {
-    let family_lsns = catalog.user_flushed_lsns();
+    let family_lsns = catalog.registry().user_flushed_lsns();
 
     let buffered_bases: HashSet<i64> = swept_base_tables(catalog).into_iter().collect();
 
@@ -177,6 +178,7 @@ fn recover_from_sal(
         // `replicated` bit the branch below reads. `SchemaDescriptor` is `Copy`, so
         // this holds no borrow on `catalog` across the `&mut` ingest.
         let schema = catalog
+            .registry()
             .get_schema_desc(tid)
             .ok_or_else(|| format!("SAL replay: no schema for table_id={tid} (lsn={})", msg.lsn))?;
         // Broadcast, not sliced: every slot holds the whole copy, so a second slot
@@ -236,12 +238,15 @@ fn recover_from_sal(
             // the SAL is rewound, so the replayed data's only durable copy survives.
             // A swallowed error here would let the rewind orphan the un-applied
             // committed data.
-            let effective = catalog.ingest_returning_effective(tid, owned).map_err(|e| {
-                format!(
-                    "SAL replay apply failed (table_id={}, lsn={}): {e}",
-                    msg.target_id, msg.lsn
-                )
-            })?;
+            let effective = catalog
+                .registry_mut()
+                .ingest_returning_effective(tid, owned)
+                .map_err(|e| {
+                    format!(
+                        "SAL replay apply failed (table_id={}, lsn={}): {e}",
+                        msg.target_id, msg.lsn
+                    )
+                })?;
             // Buffer the effective delta for the sweep; viewless bases discard it
             // (nothing to drive).
             if buffered_bases.contains(&tid) {
@@ -293,7 +298,7 @@ fn worker_boot_recovery(
     // bump is what lets it publish: it is durable pre-fork, so nothing on disk
     // resumes across it.
     debug_assert!(
-        catalog.durable_generation() > catalog.resume_generation(),
+        catalog.durable_generation() > catalog.registry().resume_generation(),
         "boot base flush without the recovery-start generation bump ahead of it",
     );
     catalog
@@ -414,8 +419,8 @@ fn run_worker_child(
     // plan compiled during boot must see this process's real (rank,
     // num_workers) and its index tables must home into the per-rank subdir.
     // Single owner of the rank — no longer set in WorkerProcess::new.
-    gnitz_engine::foundation::worker_ctx::set_worker_identity(w as u32, num_workers);
-    gnitz_engine::foundation::worker_ctx::set_worker_role();
+    gnitz_store::foundation::worker_ctx::set_worker_identity(w as u32, num_workers);
+    gnitz_store::foundation::worker_ctx::set_worker_role();
 
     // Redirect stdout/stderr to worker log file
     {
@@ -438,7 +443,7 @@ fn run_worker_child(
 
     // Re-tag logging as this worker before any boot work, so every line the
     // recovery below emits carries `W{w}` rather than the inherited master tag.
-    gnitz_engine::foundation::log::init(log_level, format!("W{w}").as_bytes());
+    gnitz_store::foundation::log::init(log_level, format!("W{w}").as_bytes());
 
     // Pin after the log re-tag, so a failed pin is recorded in this worker's own
     // `worker_N.log` rather than the master's stdout, and before every
@@ -485,6 +490,7 @@ fn run_worker_child(
     // Either failure rides the startup ACK, which fails boot before the master
     // rewinds the SAL.
     let (pending_deltas, boot_err): (HashMap<i64, Batch>, Option<String>) = match catalog
+        .registry_mut()
         .rehome_stores()
         .map_err(|e| format!("rehome stores failed: {e}"))
         .and_then(|()| worker_boot_recovery(catalog, ipc.sal_ptr as *const u8, w as u32, num_workers, walk_epoch))
@@ -497,7 +503,7 @@ fn run_worker_child(
         }
     };
 
-    catalog.invalidate_all_plans();
+    catalog.dag_mut().invalidate_all();
 
     boot_log(&format!(
         "Worker {} (pid {}) of {}\n",
@@ -524,7 +530,7 @@ fn run_server(
     // Latch the Master role before any catalog work: the pre-fork replay hooks
     // in CatalogEngine::open must see Master so they skip the index backfill
     // their forked children rebuild slice-local.
-    gnitz_engine::foundation::worker_ctx::set_master_role();
+    gnitz_store::foundation::worker_ctx::set_master_role();
 
     // Raise fd limit (child directories + shard files)
     raise_fd_limit(65536);
@@ -584,15 +590,15 @@ fn run_server(
         // Reclaim table/view/index directories whose DROP committed but whose
         // deferred deletion was lost to a crash before the next checkpoint.
         // Runs only now that both shard replay and SAL replay have populated
-        // dag.tables, so a SAL-committed-but-unflushed CREATE is not mistaken
+        // the registry, so a SAL-committed-but-unflushed CREATE is not mistaken
         // for an orphan.
         catalog.gc_orphan_directories();
 
         // Drop the child directories this boot's worker count no longer owns.
-        // Must run after SAL replay (so `dag.tables` is complete and dropped
+        // Must run after SAL replay (so the registry is complete and dropped
         // subtrees are already gone) and before the fork, since each worker's
         // `rehome_stores` then opens what this leaves behind.
-        catalog.reconcile_child_dirs();
+        catalog.registry().reconcile_child_dirs();
     }
 
     // --- Boot invalid-view verdict + recovery-start generation bump ---
@@ -686,7 +692,7 @@ fn run_server(
     // Before the workers get anywhere: each is re-homing the very stores this
     // process inherited handles to, and two live `Table`s on one directory is the
     // hazard. Only constructors ran between the fork and here.
-    dispatcher.cat().detach_user_stores();
+    dispatcher.cat().registry_mut().detach_user_stores();
     let dispatcher_rc = std::rc::Rc::new(dispatcher);
 
     // Wait for all workers to complete recovery and signal readiness

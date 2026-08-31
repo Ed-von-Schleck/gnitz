@@ -94,13 +94,13 @@ fn gc_reclaims_orphan_table_dir() {
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
 
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(10);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
     let live_dir = format!("{dir}/public/t_{tid}");
     assert!(Path::new(&live_dir).exists());
 
@@ -191,13 +191,13 @@ fn gc_leaves_live_entities_untouched() {
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
 
     let t1 = engine.create_table("public.flushed", &cols, &[0]).unwrap();
-    let schema = engine.get_schema_desc(t1).unwrap();
+    let schema = engine.registry().get_schema_desc(t1).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(7);
     bb.end_row();
     engine.ingest_to_family(t1, &bb.finish()).unwrap();
-    engine.dag_mut().flush(t1).unwrap();
+    engine.registry_mut().flush(t1).unwrap();
     let i1 = engine.create_index("public.flushed", &["val"], false).unwrap();
 
     let t2 = engine.create_table("public.empty", &cols, &[0]).unwrap();
@@ -364,14 +364,14 @@ fn replicated_table_with_a_shard(engine: &mut CatalogEngine, flush: bool) -> (i6
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let rt = create_flagged_table(engine, "rt", &cols, &[0], replicated_flags());
 
-    let rel_dir = engine.dag.tables[&rt].directory.clone();
-    let mut bb = BatchBuilder::new(engine.get_schema_desc(rt).unwrap());
+    let rel_dir = engine.registry().table_entry(rt).unwrap().directory.clone();
+    let mut bb = BatchBuilder::new(engine.registry().get_schema_desc(rt).unwrap());
     bb.begin_row(1u128, 1);
-    bb.put_i64(7);
+    bb.put_int(7);
     bb.end_row();
     engine.ingest_to_family(rt, &bb.finish()).unwrap();
     if flush {
-        engine.dag_mut().flush(rt).unwrap();
+        engine.registry_mut().flush(rt).unwrap();
     }
     (rt, rel_dir)
 }
@@ -407,8 +407,8 @@ fn child_manifest(rel: &str, k: u32, of: u32) -> String {
 /// process at rank 0, so a test that needs a *complete* `w{k}of{n}` set — the
 /// state a real cluster's checkpoint leaves behind — has to write the other
 /// ranks itself.
-fn open_child(rel: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64) -> crate::storage::Table {
-    crate::storage::Table::new(&child_path(rel, k, of), schema, tid as u32, RecoverySource::SalReplay).unwrap()
+fn open_child(rel: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64) -> gnitz_store::storage::Table {
+    gnitz_store::storage::Table::new(&child_path(rel, k, of), schema, tid as u32, RecoverySource::SalReplay).unwrap()
 }
 
 /// The subset of `rows` that `worker_for_pk` places on worker `k` of `of` — the
@@ -417,7 +417,7 @@ fn rows_for_worker(schema: &SchemaDescriptor, rows: &[(u128, i64)], of: u32, k: 
     rows.iter()
         .copied()
         .filter(|&(pk, _)| {
-            let opk = crate::schema::key::opk_key(schema, &pk.to_le_bytes());
+            let opk = gnitz_store::schema::key::opk_key(schema, &pk.to_le_bytes());
             schema.worker_for_pk(opk.pk_bytes(), of as usize) == k as usize
         })
         .collect()
@@ -429,7 +429,7 @@ fn expected_placement(schema: &SchemaDescriptor, rows: &[(u128, i64)], of: u32) 
     let mut want: Vec<(u32, u128, i64)> = rows
         .iter()
         .map(|&(pk, _)| {
-            let opk = crate::schema::key::opk_key(schema, &pk.to_le_bytes());
+            let opk = gnitz_store::schema::key::opk_key(schema, &pk.to_le_bytes());
             (schema.worker_for_pk(opk.pk_bytes(), of as usize) as u32, pk, 1)
         })
         .collect();
@@ -438,12 +438,12 @@ fn expected_placement(schema: &SchemaDescriptor, rows: &[(u128, i64)], of: u32) 
 }
 
 /// Ingest `rows` into one already-open child and publish it.
-fn fill_child(t: &mut crate::storage::Table, schema: SchemaDescriptor, rows: &[(u128, i64)]) {
+fn fill_child(t: &mut gnitz_store::storage::Table, schema: SchemaDescriptor, rows: &[(u128, i64)]) {
     if !rows.is_empty() {
         let mut bb = BatchBuilder::new(schema);
         for &(pk, x) in rows {
             bb.begin_row(pk, 1);
-            bb.put_i64(x);
+            bb.put_int(x as u128);
             bb.end_row();
         }
         t.ingest_borrowed_batch(&bb.finish()).unwrap();
@@ -471,7 +471,7 @@ fn set_rows(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64) -> Vec<(u32,
 /// that count is discarded first, so the result is the set and nothing else.
 fn seed_child_set(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64, rows: &[(u128, i64)]) {
     for k in 0..of {
-        crate::storage::remove_child(&child_path(rel, k, of));
+        gnitz_store::storage::remove_child(&child_path(rel, k, of));
         let mut t = open_child(rel, k, of, schema, tid);
         fill_child(&mut t, schema, &rows_for_worker(&schema, rows, of, k));
     }
@@ -483,7 +483,7 @@ fn retired_children_are_reclaimed() {
     let mut engine = CatalogEngine::open(&dir, 3).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.dag.tables[&tid].directory.clone();
+    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
 
     // A set laid out for another count, a rank above the launched count, and a
     // scratch dir from a rank that no longer exists.
@@ -495,7 +495,7 @@ fn retired_children_are_reclaimed() {
     // Not a child at all: an index dir must be left alone.
     fabricate_dir(&format!("{rel}/idx_7"), "marker");
 
-    engine.reconcile_child_dirs();
+    engine.registry().reconcile_child_dirs();
 
     assert!(
         Path::new(&child_path(&rel, 0, 3)).exists(),
@@ -523,7 +523,7 @@ fn replicated_table_is_relinked_at_a_new_worker_count() {
     let dir = temp_dir("repartition_replicated");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let (rt, rel) = replicated_table_with_a_shard(&mut engine, true);
-    let schema = engine.get_schema_desc(rt).unwrap();
+    let schema = engine.registry().get_schema_desc(rt).unwrap();
     let source_files = file_names(&child_path(&rel, 0, 1));
     assert!(source_files.contains(&"manifest.bin".to_string()));
     engine.close();
@@ -563,8 +563,8 @@ fn keyed_table_round_trips_across_worker_counts() {
 
         let mut engine = CatalogEngine::open(&dir, w_old).unwrap();
         let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-        let rel = engine.dag.tables[&tid].directory.clone();
-        let schema = engine.get_schema_desc(tid).unwrap();
+        let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
+        let schema = engine.registry().get_schema_desc(tid).unwrap();
         engine.close();
 
         let rows: Vec<(u128, i64)> = (0..N).map(|id| (id, id as i64 * 10)).collect();
@@ -600,8 +600,8 @@ fn repartition_handles_a_relation_with_empty_children() {
     let mut engine = CatalogEngine::open(&dir, 3).unwrap();
     // CLUSTER BY (a): every row shares `a = 1`, so all of them hash alike.
     let tid = create_flagged_table(&mut engine, "cb", &cols, &[0, 1], clustered_flags(1));
-    let rel = engine.dag.tables[&tid].directory.clone();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     engine.close();
 
     // `opk_key` reads the packed native value in PK-list order, so PK column 0
@@ -624,12 +624,12 @@ fn repartition_handles_a_relation_with_empty_children() {
     assert_eq!(got.len(), 20, "every row survives a relayout off a skewed set");
     // The relayout is a second shard writer, and it writes *base* shards — the
     // one kind that is point-probed, so its output must carry a PK filter.
-    let relaid: Vec<_> = (0..2)
-        .flat_map(|k| open_child(&rel, k, 2, schema, tid).all_shard_arcs())
+    let census: Vec<(usize, usize)> = (0..2)
+        .map(|k| open_child(&rel, k, 2, schema, tid).pk_filter_census())
         .collect();
-    assert!(!relaid.is_empty(), "the relayout wrote shards");
+    assert!(census.iter().any(|&(n, _)| n > 0), "the relayout wrote shards");
     assert!(
-        relaid.iter().all(|s| s.has_shard_filter()),
+        census.iter().all(|&(n, filtered)| filtered == n),
         "a relayout writes probed base shards",
     );
     assert!(got.iter().all(|&(_, _, w)| w == 1), "no row may double");
@@ -650,8 +650,8 @@ fn two_complete_sets_resolve_by_layout_sequence() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.dag.tables[&tid].directory.clone();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     engine.close();
 
     // A 2-set holding the current content, relayed to a 4-set — which the
@@ -697,8 +697,8 @@ fn a_partial_target_is_cleared_rather_than_merged() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.dag.tables[&tid].directory.clone();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     engine.close();
 
     let rows: Vec<(u128, i64)> = (0..40u128).map(|id| (id, id as i64)).collect();
@@ -727,8 +727,8 @@ fn a_torn_set_at_the_launched_count_is_not_a_relayout() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 3).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.dag.tables[&tid].directory.clone();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     engine.close();
 
     let rows: Vec<(u128, i64)> = (0..60u128).map(|id| (id, id as i64)).collect();
@@ -756,7 +756,7 @@ fn repartition_refuses_an_unreadable_child_grammar() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.dag.tables[&tid].directory.clone();
+    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
     engine.close();
 
     fabricate_dir(&format!("{rel}/part_7"), "manifest.bin");
@@ -775,8 +775,8 @@ fn repartition_refuses_a_torn_set_at_a_foreign_count() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 4).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.dag.tables[&tid].directory.clone();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     engine.close();
 
     seed_child_set(
@@ -809,7 +809,7 @@ fn expected_replication(rows: &[(u128, i64)], of: u32) -> Vec<(u32, u128, i64)> 
 /// would leave each replica holding a slice.
 fn seed_replicated_set(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64, rows: &[(u128, i64)]) {
     for k in 0..of {
-        crate::storage::remove_child(&child_path(rel, k, of));
+        gnitz_store::storage::remove_child(&child_path(rel, k, of));
         let mut t = open_child(rel, k, of, schema, tid);
         fill_child(&mut t, schema, rows);
     }
@@ -827,8 +827,8 @@ fn a_replicated_set_relays_from_one_surviving_rank() {
         let mut engine = CatalogEngine::open(&dir, 3).unwrap();
         let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
         let rt = create_flagged_table(&mut engine, "rt", &cols, &[0], replicated_flags());
-        let rel = engine.dag.tables[&rt].directory.clone();
-        let schema = engine.get_schema_desc(rt).unwrap();
+        let rel = engine.registry().table_entry(rt).unwrap().directory.clone();
+        let schema = engine.registry().get_schema_desc(rt).unwrap();
         engine.close();
 
         let rows: Vec<(u128, i64)> = (0..30u128).map(|id| (id, id as i64)).collect();
@@ -863,8 +863,8 @@ fn a_partial_target_at_the_launched_count_is_not_current() {
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let rt = create_flagged_table(&mut engine, "rt", &cols, &[0], replicated_flags());
-    let rel = engine.dag.tables[&rt].directory.clone();
-    let schema = engine.get_schema_desc(rt).unwrap();
+    let rel = engine.registry().table_entry(rt).unwrap().directory.clone();
+    let schema = engine.registry().get_schema_desc(rt).unwrap();
     engine.close();
 
     // A 2-set relayed to 4, so the 4-set carries layout sequence 1.
@@ -879,7 +879,7 @@ fn a_partial_target_at_the_launched_count_is_not_current() {
     // Tear two ranks out of it and put a fresh 2-set (sequence 0) back beside
     // it: the torn 4-set now outranks the complete 2-set on sequence alone.
     for k in 2..4 {
-        crate::storage::remove_child(&child_path(&rel, k, 4));
+        gnitz_store::storage::remove_child(&child_path(&rel, k, 4));
     }
     seed_replicated_set(&rel, 2, schema, rt, &rows);
 
@@ -905,8 +905,8 @@ fn a_relayout_registers_its_shards_at_the_terminal_level() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.dag.tables[&tid].directory.clone();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     engine.close();
 
     let rows: Vec<(u128, i64)> = (0..400u128).map(|id| (id, id as i64)).collect();
@@ -916,7 +916,7 @@ fn a_relayout_registers_its_shards_at_the_terminal_level() {
     assert_eq!(set_rows(&rel, 2, schema, tid), expected_placement(&schema, &rows, 2));
     for k in 0..2 {
         let t = open_child(&rel, k, 2, schema, tid);
-        let shards = t.all_shard_arcs().len();
+        let (shards, _) = t.pk_filter_census();
         assert!(shards > 0, "child {k} holds no shard");
         // Levels are 0-based in memory, so the relayout's output is the last:
         // nothing in L0 or L1, one terminal guard per shard.
@@ -934,8 +934,8 @@ fn repartition_is_not_run_on_an_unchanged_restart() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.dag.tables[&tid].directory.clone();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     engine.close();
 
     seed_child_set(

@@ -1,21 +1,32 @@
 //! The store: what a host opens, and the `MirrorStore` surface a client drives
 //! it through.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Schema, Shape, StoreRead, ZSetBatch};
-use gnitz_engine::catalog::CatalogEngine;
-use gnitz_engine::foundation::env::env_num;
-use gnitz_engine::foundation::fault::Seam;
-use gnitz_engine::foundation::worker_ctx;
-use gnitz_engine::schema::SchemaDescriptor;
+use gnitz_store::foundation::env::env_num;
+use gnitz_store::foundation::fault::Seam;
+use gnitz_store::foundation::worker_ctx;
+use gnitz_store::relation::{ensure_dir, is_table_dir_name, lock_data_dir, RelationRegistry};
+use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::storage::subdir_names;
 
-use crate::cursors::{read_cursors, write_cursors};
+use crate::state::{read_state, write_state, MirrorRecord};
 
 /// Applied delta bytes after which an apply drives a checkpoint of its own.
 /// `GNITZ_MIRROR_CHECKPOINT_BYTES` overrides it.
 const DEFAULT_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
+
+/// `<base_dir>/_copies` — the root every mirrored relation's directory sits
+/// under, so `<base_dir>` itself holds exactly three entries this crate wrote:
+/// `LOCK`, `mirror_state` and this. That is what lets [`Mirror::open`]'s sweep
+/// enumerate a directory the mirror provably created, where the server's boot
+/// sweep refuses to enumerate an arbitrary host-chosen root.
+///
+/// A user schema literally named `_copies` collides with nothing: schema
+/// directories sit *inside* this root, so it would be `_copies/_copies/v_<id>`.
+const COPIES_DIRNAME: &str = "_copies";
 
 /// `GNITZ_INJECT_MIRROR_CHECKPOINT_ERROR`: fail the next checkpoint once, before
 /// it has changed anything durable. Debug-only. It is the only way to reach
@@ -36,8 +47,8 @@ pub(crate) struct Shapes {
     /// `pk_stride` right for a view whose physical PK is a synthetic hidden
     /// column.
     pub(crate) schema: Arc<Schema>,
-    /// The local store's own descriptor, read back from the local catalog — so
-    /// it is by construction the one the store was created with.
+    /// The local store's own descriptor, read back from the registry — so it is
+    /// by construction the one the store was created with.
     pub(crate) view_desc: SchemaDescriptor,
     /// The derived delta-store shape, from the same builder the server derives
     /// its own with.
@@ -46,33 +57,46 @@ pub(crate) struct Shapes {
 
 /// A maintained local copy of one or more views.
 ///
-/// One store holds many: the engine is a registry of relations, so each lives
-/// under its own server id in one local catalog, one data directory, one lock
-/// and one checkpoint. Each carries its own cursor and is advanced
-/// independently.
+/// One store holds many: the registry holds relations, so each lives under its
+/// own server id in one data directory, under one lock and one checkpoint. Each
+/// carries its own cursor and is advanced independently.
 pub struct Mirror {
-    pub(crate) engine: CatalogEngine,
+    /// The relations this store holds and the stores behind them — the engine's
+    /// L4 rung and **nothing above it**. No compiler, no VM, no catalog: a copy
+    /// is fed by direct ingest of drained deltas and never by evaluating a
+    /// circuit, so the whole DBSP layer is unreachable from here and, after the
+    /// crate split, unlinked.
+    pub(crate) registry: RelationRegistry,
     /// Per relation, what its registration fixed. Dropped only by
-    /// `Invalidate::Registration`, alongside the catalog rows.
+    /// `Invalidate::Registration`, alongside the record.
     pub(crate) shapes: HashMap<u64, Shapes>,
+    /// What `mirror_state` holds for each relation: its qualified name and its
+    /// schema block, verbatim. Written only by [`Mirror::enter`] and
+    /// [`Mirror::retract`], which write the registry in the same breath.
+    pub(crate) records: HashMap<u64, MirrorRecord>,
     /// Where each copy's feed got to, and by its presence that the copy is valid
     /// — the store half of the readability gate. It outlives one session's
-    /// registrations on purpose: a checkpoint republishes every copy in the local
-    /// catalog, so the cursors beside them must cover the same set.
+    /// registrations on purpose: a checkpoint republishes every copy the
+    /// registry holds, so the cursors beside them must cover the same set.
     pub(crate) cursors: HashMap<u64, DeltaCursor>,
     pub(crate) base_dir: String,
+    /// `<base_dir>/_copies`, held rather than rebuilt per registration.
+    pub(crate) copies_root: String,
+    /// The `flock`ed handle on `base_dir`'s lock file. Dropped last, after every
+    /// store, which is what makes the next open of this directory succeed.
+    dir_lock: Option<std::fs::File>,
     pub(crate) poison: Option<String>,
     applied_bytes: usize,
     checkpoint_bytes: usize,
 }
 
-// SAFETY: no handle into the engine can escape. `Mirror`'s whole public surface
-// is `open` plus `impl MirrorStore`, whose signatures are `gnitz-core` types and
-// primitives — so every `Rc` the engine mints is reached only from inside it and
-// a move carries them all together. `Mirror` is `!Sync` (the engine's
-// `UnsafeCell`s and raw pointers make it so), so the graph is reached by one
-// thread at a time. What orders the non-atomic refcounts across a handover is
-// whichever edge the host holds the client behind, and there are three: a
+// SAFETY: no handle into the registry can escape. `Mirror`'s whole public
+// surface is `open` plus `impl MirrorStore`, whose signatures are `gnitz-core`
+// types and primitives — so every `Rc` the store mints is reached only from
+// inside it and a move carries them all together. `Mirror` is `!Sync` (the
+// store's `UnsafeCell`s and raw pointers make it so), so the graph is reached by
+// one thread at a time. What orders the non-atomic refcounts across a handover
+// is whichever edge the host holds the client behind, and there are three: a
 // blocking host holds the client by value, so the move itself is the edge; the
 // Python host's client never moves — it sits at a fixed address in the Python
 // heap — and the edge is pyo3's borrow flag, an `AcqRel` compare-exchange on
@@ -80,10 +104,10 @@ pub struct Mirror {
 // reaches the same store from `spawn_blocking` threads, where its own lock is
 // the edge.
 //
-// Nothing under the engine is thread-affine: process-wide atomics, an `flock`
+// Nothing under the store is thread-affine: process-wide atomics, an `flock`
 // held as an open file description, an `io_uring` built per call. The
 // `thread_local!`s are scratch pools that hold nothing between calls, bar a
-// compaction-statistics counter a moved engine splits across two copies, which
+// compaction-statistics counter a moved store splits across two copies, which
 // only an `#[ignore]`d amplification bench reads.
 unsafe impl Send for Mirror {}
 
@@ -94,36 +118,127 @@ impl Mirror {
     /// held — by another process, or by another store in this one.
     pub fn open(base_dir: &str) -> Result<Self, MirrorError> {
         // Assert Standalone rather than set it. `set_worker_role` would invert
-        // the local index backfill, the index home directory and `store_lsn`'s
-        // own assertion; and a store opened inside a forked worker would home
-        // its stores at `w{k}of1`, which the next boot sweep deletes as unowned.
+        // the index home directory and `store_lsn`'s own assertion; and a store
+        // opened inside a forked worker would home its stores at `w{k}of1`,
+        // which the next boot sweep deletes as unowned.
         if !worker_ctx::is_standalone() {
             return Err(MirrorError::Engine(
                 "a mirror cannot be opened in a process that has taken a server role".to_string(),
             ));
         }
-        let mut engine = CatalogEngine::open(base_dir, 1)?;
+        // The directory before the lock: `lock_data_dir` opens `<base_dir>/LOCK`
+        // with `create(true)`, which fails if the directory is absent.
+        ensure_dir(base_dir)?;
+        let dir_lock = lock_data_dir(base_dir)?;
 
-        // The stores are already open, so the cursor read takes the whole verdict
-        // they took: the same generation, the same topology word, and — per view —
-        // whether that store actually came back. A cursor naming a copy that is
-        // not there is dropped, which makes its view bootstrap.
-        // `record_topology(1)` follows so the next open has one to compare.
-        let mut cursors = read_cursors(base_dir, engine.resume_generation(), engine.topology_matches());
-        cursors.retain(|&vid, _| engine.store_resumed(vid as i64));
-        engine
-            .record_topology(1)
-            .map_err(|e| MirrorError::Engine(format!("topology record failed: {e}")))?;
+        let mut registry = RelationRegistry::new(1);
+        // The mirror always runs at one worker, so the topology word is a
+        // constant of the process and is stamped once, here. That leaves the
+        // *generation* as the only fence, which is the one thing `mirror_state`
+        // carries — and on the arm below where there is no state to carry, the
+        // sweep at the end of this function has removed every copy directory, so
+        // there is no manifest left for any generation to match.
+        registry.set_recorded_topology(registry.launched_topology_word());
+        let state = read_state(base_dir, registry.launched_topology_word());
 
-        Ok(Mirror {
-            engine,
+        let mut mirror = Mirror {
+            registry,
             shapes: HashMap::new(),
-            cursors,
+            records: HashMap::new(),
+            cursors: HashMap::new(),
             base_dir: base_dir.to_string(),
+            copies_root: format!("{base_dir}/{COPIES_DIRNAME}"),
+            dir_lock: Some(dir_lock),
             poison: None,
             applied_bytes: 0,
             checkpoint_bytes: env_num("GNITZ_MIRROR_CHECKPOINT_BYTES", DEFAULT_CHECKPOINT_BYTES),
-        })
+        };
+        // An unreadable, foreign-topology or absent file leaves the generation at
+        // 0 with no record, so nothing is entered, the sweep reclaims the whole
+        // tree and every view bootstraps.
+        if let Some(state) = state {
+            mirror.registry.set_resume_generation(state.generation);
+            // Every record's store opens here, before any `mirror_view` supplies
+            // a schema — which is why the record carries the schema block.
+            // A checkpoint raises the fence for the whole store but flushes only
+            // what the registry holds, so a copy left unregistered across one
+            // would keep a manifest at the old generation and be erased at the
+            // next open.
+            for (tid, rec) in state.records {
+                let desc = crate::register::descriptor_of_block(&rec.block)?;
+                mirror.enter(tid, rec, desc)?;
+            }
+            // A cursor naming a copy that did not come back is dropped, which
+            // makes its view bootstrap.
+            let mut cursors = state.cursors;
+            cursors.retain(|&tid, _| mirror.registry.store_resumed(tid as i64));
+            mirror.cursors = cursors;
+        }
+        mirror.reclaim_unnamed_copies();
+        Ok(mirror)
+    }
+
+    /// Enter one relation: open its copy under [`Self::copies_root`] and record
+    /// it. Together with [`Self::retract`] the only writer of either map, which
+    /// is what keeps their key sets equal without either consulting the other.
+    ///
+    /// `desc` is what `rec.block` decodes to; the caller already holds it, so the
+    /// block is decoded once per entry rather than once here and once there.
+    pub(crate) fn enter(&mut self, tid: u64, rec: MirrorRecord, desc: SchemaDescriptor) -> Result<(), MirrorError> {
+        self.registry.register(crate::register::spec_for(
+            &self.copies_root,
+            tid,
+            &rec.schema_name,
+            desc,
+        ))?;
+        self.records.insert(tid, rec);
+        Ok(())
+    }
+
+    /// Drop one relation's registration, its record and its directory. A `tid`
+    /// the store does not hold is `Ok(())` by construction.
+    ///
+    /// The directory goes now rather than at the next checkpoint: no worker here
+    /// can still be applying a create this drop races, so the server's gate is
+    /// vacuous. One level above `remove_child`, whose manifest-first unlink is a
+    /// no-op here — the caller has already reset the store, which unlinked the
+    /// manifest, so a failed removal leaves nothing resumable behind.
+    pub(crate) fn retract(&mut self, tid: u64) {
+        self.records.remove(&tid);
+        let dir = self.registry.table_directory(tid as i64).map(str::to_string);
+        self.registry.unregister(tid as i64);
+        if let Some(dir) = dir {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Reclaim every directory under [`Self::copies_root`] that no entered
+    /// relation owns.
+    ///
+    /// Both gates are the server's boot sweep's — a shape test on the directory
+    /// name, and membership in the set of paths the registry actually opened —
+    /// kept for its reasons even though this root is one the mirror created. The
+    /// live set comes from the registry rather than from re-parsing an id back
+    /// out of the name, so it cannot drift from what [`relation_dir`] wrote.
+    ///
+    /// Before anything has been entered that is *every* directory under the
+    /// root, and that is load-bearing rather than hygienic: the generation
+    /// counter restarts at 0 after a lost `mirror_state`, so a manifest left
+    /// behind at some later generation would be reachable again once the counter
+    /// climbed back past it, and a store resumed that way is old shards read
+    /// under a new schema.
+    fn reclaim_unnamed_copies(&self) {
+        let live: HashSet<&str> = self.registry.directories().collect();
+        for schema_name in subdir_names(&self.copies_root) {
+            let schema_dir = format!("{}/{schema_name}", self.copies_root);
+            for name in subdir_names(&schema_dir) {
+                let full = format!("{schema_dir}/{name}");
+                if live.contains(full.as_str()) || !is_table_dir_name(&name) {
+                    continue;
+                }
+                let _ = std::fs::remove_dir_all(&full);
+            }
+        }
     }
 
     /// Whether a read of `tid` is answered off this store: a copy the
@@ -163,7 +278,7 @@ impl Mirror {
     /// faults, and only where the panic unwinds: this crate built in release
     /// inherits the workspace's `panic = "abort"`, which cannot be set per
     /// package. `Drop` skips its checkpoint when poisoned, so an unguarded panic
-    /// would let it publish torn state at a fresh generation with a cursor file
+    /// would let it publish torn state at a fresh generation with a state file
     /// blessing it. A `thread::panicking()` check in `Drop` would not do: pyo3
     /// catches the panic at the `#[pymethods]` boundary, so the later drop
     /// happens on a thread that is not panicking.
@@ -198,28 +313,37 @@ impl Mirror {
         Ok(())
     }
 
-    /// Make every copy and its cursor durable — the committer's sequence minus
-    /// the steps that only exist for a SAL: raise the generation fence, flush the
-    /// copies to it, record the cursors at the generation the flush reports. The
-    /// round publishes even for a copy that absorbed nothing, which is what keeps
-    /// "resumed at `gen`" and "never checkpointed" distinguishable.
+    /// Make every copy and the record of where its feed got to durable: raise
+    /// the generation fence, flush the copies to it, then write `mirror_state`
+    /// naming that generation. The round publishes even for a copy that absorbed
+    /// nothing, which keeps "resumed at `gen`" and "never checkpointed"
+    /// distinguishable.
+    ///
+    /// **The order is load-bearing.** The copies must be durable at `g` before
+    /// the file names `g`, so a crash anywhere leaves the file naming an older
+    /// generation than the manifests carry and every view bootstraps. The
+    /// reverse would resume copies the file cannot vouch for.
     ///
     /// **A failed checkpoint is reported, not poisoned** — the one `Err` here
     /// that is not fatal. The flush writes shards and publishes manifests;
     /// neither mutates what a store holds, so every copy is intact in the RAM
-    /// tier and retrying is sound. What it leaves durably is a generation ahead
-    /// of the manifests beside a cursor file at the last good one, which a reopen
-    /// reads as bootstrap.
+    /// tier and retrying is sound.
     fn checkpoint_inner(&mut self) -> Result<(), MirrorError> {
         // Before the bump, so the injected failure is the one that changed
         // nothing durably — the retryable case this method's doc promises.
         if CHECKPOINT_ERROR.take_once() {
             return Err(MirrorError::Engine("injected checkpoint failure".to_string()));
         }
-        self.engine.bump_checkpoint_generation()?;
-        let generation = self.engine.flush_ephemeral_round()?;
-        let cursors: Vec<(u64, DeltaCursor)> = self.cursors.iter().map(|(&view_id, &c)| (view_id, c)).collect();
-        write_cursors(&self.base_dir, generation, &cursors)?;
+        let generation = self.registry.resume_generation() + 1;
+        self.registry.set_resume_generation(generation);
+        self.registry.flush_ephemeral_outputs(generation)?;
+        write_state(
+            &self.base_dir,
+            generation,
+            self.registry.launched_topology_word(),
+            &self.records,
+            &self.cursors,
+        )?;
         self.applied_bytes = 0;
         Ok(())
     }
@@ -238,17 +362,18 @@ impl Mirror {
         if level == Invalidate::Cursor {
             return Ok(());
         }
-        if !self.engine.has_id(tid as i64) {
+        if !self.registry.has_id(tid as i64) {
             self.shapes.remove(&tid);
+            self.retract(tid);
             return Ok(());
         }
 
-        // The erase unlinks this worker's child manifest, so the rebuilt store's
+        // The reset unlinks this worker's child manifest, so the rebuilt store's
         // `Rederive` open peeks `None` and *erases* the stale shards rather than
         // reloading them, then rebuilds the handle empty. It is exactly the state
         // transition a bootstrap needs, and it compiles nothing.
-        self.engine
-            .reset_view_output_for_rebuild(tid as i64)
+        self.registry
+            .reset_store(tid as i64)
             .map_err(|e| self.poison(format!("erasing the copy of {tid} failed: {e}")))?;
         if level == Invalidate::Copy {
             if BOOTSTRAP_ERROR.take_once() {
@@ -258,11 +383,7 @@ impl Mirror {
         }
 
         self.shapes.remove(&tid);
-        self.engine.retract_relation_registration(tid as i64)?;
-        // No worker here can still be applying the create this drop races, so the
-        // gate the server needs is vacuous and the directory goes now.
-        self.engine.defer_pending_dir_deletions();
-        self.engine.drain_checkpoint_gated_deletions();
+        self.retract(tid);
         Ok(())
     }
 }
@@ -279,20 +400,9 @@ impl MirrorStore for Mirror {
         &self.base_dir
     }
 
-    fn schema_id(&mut self, schema_name: &str) -> Option<u64> {
-        self.engine.schema_id(schema_name).map(|id| id as u64)
-    }
-
-    fn register(
-        &mut self,
-        tid: u64,
-        schema_id: u64,
-        schema_name: &str,
-        name: &str,
-        schema: &Schema,
-    ) -> Result<Vec<u64>, MirrorError> {
+    fn register(&mut self, tid: u64, schema_name: &str, name: &str, schema: &Schema) -> Result<Vec<u64>, MirrorError> {
         self.touching("registering a view", |m| {
-            m.register_inner(tid, schema_id, schema_name, name, schema)
+            m.register_inner(tid, schema_name, name, schema)
         })
     }
 
@@ -309,7 +419,7 @@ impl MirrorStore for Mirror {
     /// An auto-checkpoint failure is **not** a poisoning, and it reaches the
     /// caller with the cursor already advanced: the store stays usable and the
     /// next poll continues from there. Any other failure poisons — the apply is a
-    /// loop, one engine ingest per block, and a failure at block *k* leaves
+    /// loop, one store ingest per block, and a failure at block *k* leaves
     /// `0..k` applied with no way to roll back.
     fn ingest(&mut self, tid: u64, blocks: Vec<RawBlock>, shape: Shape, next: DeltaCursor) -> Result<(), MirrorError> {
         self.touching("applying a delta", |m| {
@@ -352,27 +462,30 @@ impl MirrorStore for Mirror {
 }
 
 impl Drop for Mirror {
-    /// Check point on the way out — unless the store is poisoned.
+    /// Check point on the way out — unless the store is poisoned — then drop the
+    /// stores, then the lock, in that order.
     ///
     /// A host that just drops it would otherwise lose every round since the last
-    /// checkpoint. It has to be the whole sequence and not `CatalogEngine::close`
-    /// alone: `close` flushes each store on the **Base** round, where a
-    /// `Rederive` store folds to RAM and publishes nothing, so `close` by itself
-    /// would discard exactly what this is meant to save.
+    /// checkpoint. It has to be the checkpoint and not a per-store `flush()`:
+    /// that is a **Base** round, on which a `Rederive` store — which every copy
+    /// is — folds to RAM and publishes no manifest, so it would be pure waste
+    /// after a checkpoint and actively wrong before one.
     ///
-    /// A poisoned store skips both: poisoning means a copy may be torn, and
-    /// checkpointing a torn copy would publish the tear. That leaves the last
-    /// checkpoint standing, which the next open resumes from.
+    /// A poisoned store skips the checkpoint: poisoning means a copy may be
+    /// torn, and checkpointing a torn copy would publish the tear. That leaves
+    /// the last checkpoint standing, which the next open resumes from.
     fn drop(&mut self) {
-        if self.poison.is_some() {
-            return;
-        }
         // Swallowed, and the panic case with it: a `Drop` that panics while the
         // thread is already unwinding ends the process, which is the one outcome
         // this whole design exists to keep off a host.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = self.checkpoint_inner();
-            self.engine.close();
+            if self.poison.is_none() {
+                let _ = self.checkpoint_inner();
+            }
+            self.registry.close();
         }));
+        // Last: dropping the file releases the directory lock, so the next open
+        // of this directory succeeds.
+        self.dir_lock = None;
     }
 }

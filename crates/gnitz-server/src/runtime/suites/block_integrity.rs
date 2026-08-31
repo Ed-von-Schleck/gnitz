@@ -3,11 +3,12 @@
 //! control block, whose own checksum this file exercises.
 
 use crate::runtime::sal::GroupTargets;
+use crate::runtime::test_support::SharedRegion;
 use crate::runtime::wire::{WireData, WireMsg};
-use gnitz_engine::schema::decode_schema_block;
-use gnitz_engine::schema::SchemaDescriptor;
-use gnitz_engine::storage::Batch;
-use gnitz_engine_testkit::{make_batch, make_schema_u64_i64, sweep_bit_flips, SharedRegion};
+use gnitz_engine_testkit::{make_batch, make_schema_u64_i64, sweep_bit_flips};
+use gnitz_store::schema::decode_schema_block;
+use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::storage::Batch;
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
 use gnitz_wire::control::{peek_control_block, peek_control_block_ipc};
 use gnitz_wire::STATUS_OK;
@@ -23,7 +24,7 @@ fn data_block(rows: &[(u64, i64, i64)]) -> (SchemaDescriptor, Vec<u8>) {
 
 /// A checksummed schema WAL block for a 4-column schema.
 fn schema_block_4col() -> Vec<u8> {
-    use gnitz_engine::schema::SchemaColumn;
+    use gnitz_store::schema::SchemaColumn;
     use gnitz_wire::type_code;
     let cols = [
         SchemaColumn::new(type_code::U64, 0),

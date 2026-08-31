@@ -331,7 +331,14 @@ also exposed as Python bindings) plans and drives queries, and ships them
 over `gnitz-wire`; the **engine** executes them as a multi-process server and
 never links the planner. `gnitz-mirror` is the sole crate on both sides, and
 links no planner either; `gnitz-py` links it, so the Python extension carries the
-engine too.
+Z-set store too — but not the DBSP layer.
+
+The engine is two crates, and the split is what makes "a client links no
+compiler, no VM and no catalog" a fact of the crate graph rather than a
+convention: **`gnitz-store`** is the Z-set store, the operators, the relation
+registry and the `ReadSpec` executor; **`gnitz-engine`** is the circuit compiler,
+the bytecode VM, epoch execution and the system-table catalog, and depends on it.
+A host holding a mirrored view links `gnitz-store` alone.
 
 ### Workspace crates
 
@@ -343,28 +350,40 @@ engine too.
 | `gnitz-sql` | SQL front end: parser, binder, query planner | `core`, `expr`, `wire` |
 | `gnitz-tokio` | The Rust async client: a `Connection` future over tokio's reactor, and the `AsyncClient` handle | `core` |
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `expr`, `mirror`, `sql`, `wire` |
-| `gnitz-engine` | The single-node database as a library: Z-set store, DBSP operators, circuit compiler, catalog | `wire`, `expr` |
-| `gnitz-server` | The multi-process server binary — the `runtime` rung and nothing else | `engine`, `wire`, `expr` |
-| `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides, and a leaf | `core`, `engine`, `wire` |
-| `gnitz-engine-testkit` | Dev-only: `gnitz-engine`'s test helpers, compiled as a library so `gnitz-server`'s tests reach them | `engine`, `wire` |
+| `gnitz-store` | The Z-set store: columnar batches, the LSM, the DBSP operators, the relation registry, the `ReadSpec` executor | `wire`, `expr` |
+| `gnitz-engine` | The DBSP layer over it: circuit compiler, bytecode VM, epoch execution, system-table catalog | `store`, `wire`, `expr` |
+| `gnitz-server` | The multi-process server binary — the `runtime` rung and nothing else | `engine`, `store`, `wire`, `expr` |
+| `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides, and a leaf. Drives `gnitz-store` directly and links no DBSP layer | `core`, `store`, `wire` |
+| `gnitz-engine-testkit` | Dev-only: `gnitz-store`'s and `gnitz-engine`'s test helpers, compiled as a library so `gnitz-server`'s tests reach them | `engine`, `store`, `wire` |
 | `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests | — |
 
-### The engine (`gnitz-engine`)
+### The engine (`gnitz-store` + `gnitz-engine`)
 
 Strictly layered — every module depends only on those beneath it (and all of them
-on `foundation`):
+on `foundation`). The crate seam sits between `query` and `read`:
 
 ```
-runtime (L7)   → catalog, query, ops, storage, schema    orchestration · protocol · reactor
+runtime (L7)   → catalog, query, read, ops, storage, schema   orchestration · protocol · reactor
                  — lives in `gnitz-server`, and is the only rung that does
-catalog        → query, ops, storage, schema
-query (L5)     → ops, expr, storage, schema               compiler · vm · dag
-ops            → expr, storage, schema                    join · reduce · exchange · …
+catalog        → query, read, relation, ops, storage, schema
+query (L5)     → read, relation, ops, expr, storage, schema   compiler · vm · dag
+  ── the crate seam: everything above is `gnitz-engine`, below is `gnitz-store` ──
+read           → relation, ops, expr, storage, schema         ReadSpec executor · store read verbs
+relation (L4)  → storage, schema                              registry · store handles · ingest
+ops            → expr, storage, schema                        join · reduce · exchange · …
 expr           → storage, schema
-storage        → schema                                   repr (L2) · lsm (L3)
+storage        → schema                                       repr (L2) · lsm (L3)
 schema         → foundation
 foundation (L0)  — independent leaves; depends on nothing
 ```
+
+`read` sits *above* `ops` and so above `relation`, but below the seam: it hangs
+its entry points off `RelationRegistry` as `impl` blocks, and the one thing it
+needs from the DBSP layer — recomputing a capacity-bounded view's skeleton row
+— is injected as the `SkeletonHydrator` trait, which a host that maintains no
+circuit passes `None` for. The crate graph is what stops that host linking a
+compiler. Every rung below the seam is in one crate, so the ladder among them is
+pinned by a source-text test over a declared table rather than by the graph.
 
 Each subsystem's `mod.rs` header states its own surface, its internal split, and
 what is deliberately closed off. Read that rather than a summary here.
@@ -375,11 +394,12 @@ an up-edge into the engine's own `expr` module. Read `expr` in the ladder above 
 the engine-local expression layer only.
 
 A relation is stored as one `Table` per worker. Test scaffolding lives in
-`test_support` / `test_rng` and per-module `tests/`. `test_support` is split by
-reach: `shared` is compiled a second time as `gnitz-engine-testkit` and so sees
-only the engine's public API, `internal` is this crate's own. A helper goes in
-`internal` unless `gnitz-server` needs it — putting an engine-only helper in
-`shared` forces whatever it touches to become published API.
+`test_support` / `test_rng` and per-module `tests/`. Each of the two crates has
+its own `test_support`, split by reach: `shared` is compiled again elsewhere —
+as half of `gnitz-engine-testkit`, and `gnitz-store`'s also inside `gnitz-engine`
+— so it sees only that crate's public API, where `internal` is that crate's own.
+A helper goes in `internal` unless another crate needs it; putting a local helper
+in `shared` forces whatever it touches to become published API.
 
 A module's unit tests live in `<dir>/tests/<module>.rs`, attached back with
 `#[cfg(test)] #[path]` so they stay that module's own `tests` child and keep
@@ -682,9 +702,9 @@ in-process loop. For that, the engine carries `#[ignore]`d timing tests that
 print throughput and must be run in `--release`:
 
 ```bash
-cd crates && cargo test -p gnitz-engine --release <name>_bench \
+cd crates && cargo test -p gnitz-store --release <name>_bench \
     -- --ignored --nocapture --test-threads=1
-# reactor/IPC benchmarks live in the server crate: -p gnitz-server
+# catalog/compiler benchmarks: -p gnitz-engine; reactor/IPC: -p gnitz-server
 ```
 
 Add one alongside the others: name the test `*_bench`, mark it `#[ignore]`,

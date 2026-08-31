@@ -1,5 +1,4 @@
 use super::*;
-use crate::foundation::env::env_num;
 use gnitz_wire::sys_rows::{write_schema_tab_row, SchemaTabRow};
 use gnitz_wire::SEQTAB_COL_VALUE;
 
@@ -39,10 +38,9 @@ impl CatalogEngine {
         // Check if this is a fresh database (no table records yet)
         let is_new = !sys_stores[SysFamily::Table.index()].open_cursor().valid;
 
-        let dag = DagEngine::new();
-
         let mut engine = CatalogEngine {
-            dag,
+            registry: RelationRegistry::new(num_workers),
+            dag: DagEngine::new(),
             base_dir: base_dir.to_string(),
             dir_lock: Some(dir_lock),
             caches: CatalogCacheSet::default(),
@@ -50,28 +48,13 @@ impl CatalogEngine {
             next_table_id: FIRST_USER_TABLE_ID,
             next_index_id: FIRST_USER_INDEX_ID,
             user_sequences: std::collections::HashMap::new(),
-            num_workers,
-            owns_stores: true,
             durable_generation: 0,
-            resume_generation: 0,
-            recorded_topology: 0,
             invalid_views: rustc_hash::FxHashSet::default(),
             sys_stores,
             pending_broadcasts: Vec::new(),
             pending_dir_deletions: Vec::new(),
             checkpoint_gated_deletions: Vec::new(),
             ctx: ApplyContext::new(),
-            // Rows per chunk for the chunked DDL scans (view + index backfill).
-            // `GNITZ_DDL_SCAN_CHUNK_ROWS` overrides the default — chiefly so
-            // multi-worker E2E tests can shrink it to force many chunked backfill
-            // rounds (lockstep padding, SAL reclaim) over small tables. A 0 or
-            // unparseable value falls back to the default: a zero chunk size
-            // drains nothing, so a backfill would never make progress.
-            ddl_scan_chunk_rows: env_num("GNITZ_DDL_SCAN_CHUNK_ROWS", crate::catalog::DDL_SCAN_CHUNK_ROWS),
-            // Per-worker distinct-group cap for the ad-hoc aggregate fold.
-            // `GNITZ_ADHOC_GROUP_CAP` overrides it (E2E can shrink it to force
-            // the cap error).
-            adhoc_group_cap: env_num("GNITZ_ADHOC_GROUP_CAP", super::ADHOC_GROUP_CAP),
         };
 
         if is_new {
@@ -85,7 +68,8 @@ impl CatalogEngine {
         // (through `CatalogEngine::recovery_source`). `recovery_start_generation_bump`
         // leaves this where it is, so a clean restart resumes from the last
         // completed checkpoint.
-        engine.set_resume_generation(engine.durable_generation);
+        let g = engine.durable_generation;
+        engine.registry_mut().set_resume_generation(g);
 
         // Register system table families
         engine.register_system_table_families();
@@ -182,7 +166,7 @@ impl CatalogEngine {
                     // `observe_user_sequence` ignores, so they never leak into
                     // `user_sequences`.
                     SEQ_ID_CHECKPOINT_GEN => self.durable_generation = self.durable_generation.max(val as u64),
-                    SEQ_ID_TOPOLOGY => self.recorded_topology = val as u64,
+                    SEQ_ID_TOPOLOGY => self.registry.set_recorded_topology(val as u64),
                     // User-table SERIAL sequence (seq_id == table_id ≥
                     // FIRST_USER_TABLE_ID). Store the high-water; next id =
                     // high_water + 1. `observe_user_sequence` ignores a stray
@@ -197,7 +181,7 @@ impl CatalogEngine {
 
     // -- Register system table families ------------------------------------
 
-    /// Enter each system family in the DAG registry as a `Borrowed` handle on
+    /// Enter each system family in the relation registry as a `Borrowed` handle on
     /// its `sys_stores` box, so every store path resolves a system table through
     /// the same registry lookup as a user relation. Their name/id caches are not
     /// seeded here: `replay_catalog` (next) replays SCHEMA_TAB and TABLE_TAB
@@ -209,20 +193,13 @@ impl CatalogEngine {
         let base_dir = self.base_dir.clone();
         for (family, store) in SysFamily::ALL.into_iter().zip(self.sys_stores.iter_mut()) {
             let dir = sys_family_dir(&base_dir, family.name());
-            self.dag.register_table(
-                family.id(),
-                crate::query::TableEntry::new(
-                    RelationStores {
-                        handle: StoreHandle::Borrowed(&mut **store),
-                        delta: None,
-                    },
-                    family.schema(),
-                    RelationKind::SystemCatalog,
-                    0,
-                    dir,
-                    crate::query::ViewBudgets::default(),
-                ),
-            );
+            // SAFETY: each family's `Table` is boxed in `sys_stores`, whose heap
+            // address is stable across engine moves, and `close` drops the
+            // registry before those boxes.
+            unsafe {
+                self.registry
+                    .register_borrowed(family.id(), store, family.schema(), RelationKind::SystemCatalog, dir);
+            }
         }
     }
 
@@ -276,7 +253,7 @@ impl CatalogEngine {
         // builds at most one io_uring. System tables are `SalReplay`, so each
         // folds memtable + L0 into a durable shard and re-stamps its manifest.
         let tables = self.sys_stores.iter_mut().map(|b| &mut **b);
-        crate::storage::flush_barrier(tables, crate::storage::FlushRound::Base)
+        gnitz_store::storage::flush_barrier(tables, gnitz_store::storage::FlushRound::Base)
             .map_err(|e| format!("boot flush of the system catalog failed: {e:?}"))
     }
 
@@ -286,8 +263,9 @@ impl CatalogEngine {
     /// commit per table, where the batched set joins one. It trades peak dirty
     /// page cache and a table id in the error message for that.
     pub fn flush_base_round(&mut self) -> Result<(), String> {
-        let tables = self.dag.collect_base_flush_tables();
-        crate::storage::flush_barrier(tables, crate::storage::FlushRound::Base).map_err(|e| format!("base flush: {e}"))
+        let tables = self.registry.collect_base_flush_tables();
+        gnitz_store::storage::flush_barrier(tables, gnitz_store::storage::FlushRound::Base)
+            .map_err(|e| format!("base flush: {e}"))
     }
 
     /// The ephemeral checkpoint round: force-persist every view's operator-trace
@@ -297,23 +275,21 @@ impl CatalogEngine {
     /// Two global passes — traces first, then outputs — so that any output at
     /// generation `G` implies that view's own traces are already durable at `G`.
     /// That holds only for a **compiled** view: the collector reads the plan
-    /// cache, and nothing here compiles one to widen it — a mirror registers its
-    /// views with no circuit rows and runs this same round. An output store
-    /// stamped with no trace beside it is what `compute_invalid_views` rejects at
-    /// the next boot. Batching each pass into one barrier also beats per-view
+    /// cache, and nothing here compiles one to widen it. An output store stamped
+    /// with no trace beside it is what `compute_invalid_views` rejects at the
+    /// next boot — which is also the shape a mirror's copies have, since a mirror
+    /// runs the output half alone and owns no traces. Batching each pass into one barrier also beats per-view
     /// interleaving.
     ///
     /// The caller latches the generation first: the server off the `FlushEph`
     /// message, an embedder through [`Self::bump_checkpoint_generation`].
     pub fn flush_ephemeral_round(&mut self) -> Result<u64, String> {
-        let generation = self.resume_generation();
-        let (traces, outputs) = self.dag.collect_ephemeral_flush_tables();
-        let pass = |tables: Vec<&mut Table>, what: &str| {
-            crate::storage::flush_barrier(tables, crate::storage::FlushRound::Ephemeral(generation))
-                .map_err(|e| format!("ephemeral {what} flush: {e}"))
-        };
-        pass(traces, "trace")?;
-        pass(outputs, "output")?;
+        let generation = self.registry.resume_generation();
+        let CatalogEngine { registry, dag, .. } = self;
+        let traces = dag.collect_ephemeral_trace_tables(registry);
+        gnitz_store::storage::flush_barrier(traces, gnitz_store::storage::FlushRound::Ephemeral(generation))
+            .map_err(|e| format!("ephemeral trace flush: {e}"))?;
+        registry.flush_ephemeral_outputs(generation)?;
         Ok(generation)
     }
 
@@ -330,14 +306,12 @@ impl CatalogEngine {
     /// The server never does: it flushes durably per zone and exits via abort or
     /// process teardown.
     pub fn close(&mut self) {
-        // Flush all user tables before clearing DagEngine. System tables hold
-        // Borrowed handles and are flushed below.
-        for entry in self.dag.tables.values_mut() {
-            if let StoreHandle::Owned(cell) = &mut entry.handle {
-                let _ = cell.get_mut().flush();
-            }
-        }
-        // tables.clear() in dag.close() drops the owned `Box<Table>` automatically.
+        // The user relations first, through the same batched base round the
+        // checkpoint takes; the system tables hold `Borrowed` handles and are
+        // flushed below.
+        let _ = self.flush_base_round();
+        // `RelationRegistry::close` drops each owned `Box<Table>` automatically.
+        self.registry.close();
         self.dag.close();
         let _ = self.flush_all_system_tables();
         // Last: dropping the file releases the directory lock, so the next open

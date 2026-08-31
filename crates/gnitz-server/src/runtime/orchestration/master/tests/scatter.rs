@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_engine::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_wire::type_code;
 use gnitz_wire::worker_for_pk_bytes;
 

@@ -81,32 +81,6 @@ impl CatalogEngine {
         self.submit_local(family, batch)
     }
 
-    /// Drop `relation_id` from a catalog this process owns alone — [`Self::ddl_sync`]
-    /// in reverse, for the mirror. A production DROP arrives as a wire delta the
-    /// executor prechecks and broadcasts, and never comes through here.
-    ///
-    /// Builds only the relation's own row: its `-1` fires `hook_relation_register`,
-    /// whose cascade retracts the columns, indices and circuit rows and queues the
-    /// directory. Retracting a child here too would leave it at net `-1`, where the
-    /// next registration's `+1` sums to zero. The cascade's broadcast queue has no
-    /// worker to reach, so it is discarded rather than left to grow.
-    pub fn retract_relation_registration(&mut self, relation_id: i64) -> Result<(), String> {
-        let family = match self.table_entry(relation_id)?.kind {
-            RelationKind::View => SysFamily::View,
-            RelationKind::BaseTable | RelationKind::Stream => SysFamily::Table,
-            RelationKind::SystemCatalog => {
-                return Err(format!("table_id {relation_id} is a system table"));
-            }
-        };
-        let schema = family.schema();
-        let batch = retract_pk_list(self.sys_store(family), &schema, vec![relation_id as u128]);
-        if batch.count > 0 {
-            self.ddl_sync(family.id(), batch)?;
-        }
-        self.drain_pending_broadcasts();
-        Ok(())
-    }
-
     // -- System table accessors ------------------------------------------------
 
     /// This family's owned store.
@@ -158,7 +132,7 @@ impl CatalogEngine {
 
     /// Ingest a batch into any relation, system or user: a system family goes
     /// through [`Self::submit`] (precheck → ingest → hooks → broadcast-queue), a
-    /// user table through `DagEngine::ingest_by_ref` (PK enforcement, store,
+    /// user table through `RelationRegistry::ingest_by_ref` (PK enforcement, store,
     /// index projection). The `&Batch` entry serves callers that hold a borrow;
     /// an emitter with an owned batch calls `submit` directly to skip the clone.
     pub fn ingest_to_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
@@ -166,7 +140,7 @@ impl CatalogEngine {
             let family = SysFamily::from_id(table_id).ok_or_else(|| format!("Unknown system family {table_id}"))?;
             self.submit(family, batch.clone())
         } else {
-            self.dag
+            self.registry
                 .ingest_by_ref(table_id, batch)
                 .map_err(|e| format!("ingest failed for table_id={table_id}: {e}"))
         }
@@ -193,28 +167,6 @@ impl CatalogEngine {
     /// bypasses `ingest_to_family` entirely, so the queue stays empty there.
     pub fn drain_pending_broadcasts(&mut self) -> Vec<(SysFamily, Batch)> {
         std::mem::take(&mut self.pending_broadcasts)
-    }
-
-    /// Run `f`, and on `Err` remove `dir` — but only if `f` is what created it.
-    /// One that was already there holds an existing entity's rows (a boot replay
-    /// reopens one; so does compensation restoring what the bundle dropped), and
-    /// deciding that here is what stops a caller staging live shards.
-    ///
-    /// The stage is a local, not an entry in `pending_dir_deletions`, so that
-    /// queue keeps one meaning — directories of *dropped* entities, which a
-    /// rollback must therefore keep. A queue holding both could not be drained
-    /// or discarded as a whole.
-    pub(super) fn with_staged_dir<T>(
-        &mut self,
-        dir: &str,
-        f: impl FnOnce(&mut Self) -> Result<T, String>,
-    ) -> Result<T, String> {
-        let existed = std::path::Path::new(dir).exists();
-        f(self).inspect_err(|_| {
-            if !existed {
-                Self::remove_queued_dirs(vec![dir.to_string()]);
-            }
-        })
     }
 
     /// Physically remove a batch of queued directory paths. An existence guard
@@ -292,16 +244,16 @@ impl CatalogEngine {
     /// path scan cannot reach because the schema is gone from `schema_by_id`.
     ///
     /// Must run only after BOTH shard replay (`replay_catalog`) and SAL replay
-    /// (`recover_system_tables_from_sal`) have populated `dag.tables`; otherwise a
+    /// (`recover_system_tables_from_sal`) have populated the registry; otherwise a
     /// table whose CREATE committed to the SAL but was not yet flushed would be
-    /// absent from `dag.tables` and its live directory wrongly deleted.
+    /// absent from the registry and its live directory wrongly deleted.
     ///
     /// Sound only because `cancel_gated_deletion` filters `pending_dir_deletions`
     /// too: otherwise the drain could remove a recreated same-name schema whose
     /// live path SAL replay left in the queue.
     pub fn gc_orphan_directories(&mut self) {
         // Full on-disk path of every live table/view (user + system).
-        let live_tables: rustc_hash::FxHashSet<&str> = self.dag.tables.values().map(|e| e.directory.as_str()).collect();
+        let live_tables: rustc_hash::FxHashSet<&str> = self.registry.directories().collect();
 
         // Full on-disk path of every live index: `<owner_dir>/idx_<idx_id>`.
         // Named from each circuit's `index_id` — the id the directory was
@@ -311,7 +263,7 @@ impl CatalogEngine {
         // and its directory survive under the first registrant's id, so a cache
         // read would find no live entry and remove a live index tree.
         let mut live_indices: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
-        for entry in self.dag.tables.values() {
+        for (_, entry) in self.registry.entries() {
             for ic in &entry.index_circuits {
                 live_indices.insert(index_dir(&entry.directory, ic.index_id));
             }
@@ -389,7 +341,8 @@ impl CatalogEngine {
             return Err(format!("pre-flight: view {vid} is not registered"));
         };
         let root = preflight_dir(&self.base_dir, schema_name, vid);
-        self.dag.preflight_compile(vid, &root).map_err(|e| e.to_string())
+        let CatalogEngine { registry, dag, .. } = self;
+        dag.preflight_compile(registry, vid, &root).map_err(|e| e.to_string())
     }
 
     // -----------------------------------------------------------------------
@@ -478,7 +431,7 @@ impl CatalogEngine {
         undo_create.append(&mut undo_drop);
 
         // Replay each with negated weight through the no-broadcast path.
-        // fire_hooks still fires so caches, dag.tables, and pending_dir_deletions
+        // fire_hooks still fires so caches, the registry, and pending_dir_deletions
         // are updated. The rollback gate in `submit` ensures any cascade that
         // calls back into `submit` also bypasses broadcasts.
         let result = self.with_rollback_compensation(|s| -> Result<(), String> {

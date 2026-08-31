@@ -3,7 +3,8 @@ use crate::runtime::sal::{
     atomic_load_u64, effective_max, group_header_size, EpochGate, GroupData, GroupTargets, SalLog, SalMessage,
     SalMessageKind, SalStep, SalWriter, ZoneMark, CHECKPOINT_RESERVE, MIN_SAL_BYTES, SENTINEL_SIZE,
 };
-use gnitz_engine_testkit::{sweep_bit_flips, SharedRegion};
+use crate::runtime::test_support::SharedRegion;
+use gnitz_engine_testkit::sweep_bit_flips;
 use gnitz_wire::align8;
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
 use gnitz_wire::MAX_WORKERS;
@@ -696,8 +697,8 @@ fn group_footprint_direct_equals_emitted_bytes() {
 fn a_narrow_fixed_width_schema_scatters_in_one_copy() {
     use crate::runtime::master::scatter::{with_commit_indices, with_group};
     use crate::runtime::wire::{WireData, WireMsg, WireSchema};
-    use gnitz_engine::schema::{SchemaColumn, SchemaDescriptor};
-    use gnitz_engine::storage::Batch;
+    use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
+    use gnitz_store::storage::Batch;
     use gnitz_wire::type_code;
 
     let schema = SchemaDescriptor::new(

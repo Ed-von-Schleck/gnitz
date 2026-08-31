@@ -26,8 +26,8 @@ use std::sync::Arc;
 
 use gnitz_core::protocol::decode_wal_block;
 use gnitz_core::{MirrorError, Schema, ZSetBatch};
-use gnitz_engine::schema::SchemaDescriptor;
-use gnitz_engine::storage::Batch;
+use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::storage::Batch;
 
 use crate::handle::{Mirror, Shapes};
 use crate::register::descriptor_of;
@@ -44,7 +44,7 @@ impl Mirror {
     /// Every row of the copy, in the schema its registration resolved.
     pub(crate) fn scan_inner(&mut self, table_id: u64) -> Result<(Arc<Schema>, ZSetBatch), MirrorError> {
         let schema = Arc::clone(&self.shapes(table_id)?.schema);
-        let (batch, desc) = self.engine.scan_family(table_id as i64)?;
+        let (batch, desc) = self.registry.scan_family(table_id as i64, None)?;
         let rows = reply_batch(&batch, &desc, table_id, &schema)?;
         Ok((schema, rows))
     }
@@ -53,9 +53,12 @@ impl Mirror {
     /// through the same encode the worker runs.
     ///
     /// The tick cut it takes is the master's, which only a `Delta` bound reads;
-    /// `0` is passed, and a `Delta` bound never reaches it — registration writes
-    /// `delta_bytes = 0`, and a `Delta` bound is refused against a relation whose
-    /// feed is absent at every round.
+    /// `0` is passed, and a `Delta` bound never reaches it — a copy is registered
+    /// with no delta budget, and a `Delta` bound is refused against a relation
+    /// whose feed is absent at every round.
+    ///
+    /// The hydrator is `None`, which the compiler can see: no copy holds a
+    /// skeleton row, because none is registered with a capacity budget.
     pub(crate) fn scan_spec_inner(
         &mut self,
         table_id: u64,
@@ -66,8 +69,8 @@ impl Mirror {
             gnitz_wire::ReadSpec::decode(spec).map_err(|e| MirrorError::Engine(format!("mirror: read spec: {e}")))?;
         let reply_desc = descriptor_of(reply_schema)?;
         let keeper = self
-            .engine
-            .scan_spec_family(table_id as i64, &spec, &reply_desc, 0)
+            .registry
+            .scan_spec_family(table_id as i64, &spec, &reply_desc, 0, None)
             .map_err(|f| MirrorError::Engine(f.text))?;
         if keeper.count == 0 {
             return Ok(None);

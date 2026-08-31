@@ -5,7 +5,7 @@
 //! that, plus every fallback that degrades a bound to a full scan.
 
 use super::*;
-use crate::storage::SourceCursor;
+use gnitz_store::storage::SourceCursor;
 use gnitz_wire::{Cut, PkColList, RangeDescriptor, ScanBound};
 
 const NBASE: u64 = 200;
@@ -47,7 +47,7 @@ fn fixture_with(name: &str, bound: Option<ScanBound>, val_of: impl Fn(u64) -> u6
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
 
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     for i in 0..NBASE {
         bb.begin_row(i as u128, 1);
@@ -105,7 +105,7 @@ fn drain_all(cur: &mut SourceCursor, chunk: usize) -> Vec<(u128, i64)> {
 /// The full-scan drain of `source`, as the reference every bounded drain is
 /// compared against.
 fn full_drain(engine: &mut CatalogEngine, source: i64) -> Vec<(u128, i64)> {
-    let mut cur = SourceCursor::Full(Box::new(engine.open_store_cursor(source).unwrap()));
+    let mut cur = SourceCursor::Full(Box::new(engine.registry().open_store_cursor(source).unwrap()));
     drain_all(&mut cur, 64)
 }
 
@@ -177,7 +177,7 @@ fn bounded_drain_is_chunk_size_invariant_and_ascending() {
 #[test]
 fn absent_pk_mid_chunk_does_not_truncate_the_gather() {
     let (mut engine, tid, vid) = fixture("srccur_midchunk", Some(val_bound(Cut::Before(500), Cut::Before(600))));
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     // An id in the middle of the range, so its index entry is still collected
     // while its base row is gone and ids above it are still to come in the same
     // chunk.
@@ -189,19 +189,18 @@ fn absent_pk_mid_chunk_does_not_truncate_the_gather() {
     bb.end_row();
     let retraction = bb.finish();
     engine
-        .dag
-        .tables
-        .get(&tid)
+        .registry()
+        .table_entry(tid)
+        .ok()
         .unwrap()
-        .handle
         .ingest_borrowed_batch(&retraction)
         .unwrap();
 
     // The premise this pins: the store now holds no live row at the victim's key,
     // which is what makes the gather's per-PK probe copy nothing in the middle of
     // the chunk.
-    let victim_key = crate::schema::key::opk_key(&schema, &(victim as u128).to_le_bytes());
-    let probe_entry = engine.dag.tables.get(&tid).unwrap();
+    let victim_key = gnitz_store::schema::key::opk_key(&schema, &(victim as u128).to_le_bytes());
+    let probe_entry = engine.registry().table_entry(tid).unwrap();
     let mut probe = probe_entry.open_cursor();
     assert!(
         !probe.advance_to_exact_live(victim_key.pk_bytes()),
@@ -284,7 +283,7 @@ fn bounded_and_full_agree_with_a_retracted_row_single_source() {
     let (mut engine, tid, vid) = fixture("srccur_retract", Some(val_bound(Cut::Before(500), Cut::Before(600))));
     // Retract id=55 (val=550), inside the range. No flush: one memtable run, so
     // the cursor is single-source and takes the verbatim-copy drain path.
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(55u128, -1);
     bb.put_u64(550);
@@ -312,7 +311,7 @@ fn updated_indexed_column_emits_the_row_once() {
     // Range covers val ∈ [500, 600): ids 50..60 plus whatever moves in.
     let (mut engine, tid, vid) = fixture("srccur_update", Some(val_bound(Cut::Before(500), Cut::Before(600))));
     // Move id=10 from val=100 to val=555 (into the range): retract + insert.
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(10u128, -1);
     bb.put_u64(100);
@@ -337,7 +336,7 @@ fn updated_indexed_column_emits_the_row_once() {
 fn range_spanning_old_and_new_indexed_value_emits_once() {
     // val ∈ [500, 600) after moving id=51 from 510 → 590 — both inside the range.
     let (mut engine, tid, vid) = fixture("srccur_span", Some(val_bound(Cut::Before(500), Cut::Before(600))));
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(51u128, -1);
     bb.put_u64(510);
@@ -382,7 +381,7 @@ fn orphaned_index_entry_yields_empty_not_exhaustion() {
     // Clone a live in-range entry's key (val=550 ⇒ id=55) and swap its source-PK
     // suffix to an id no base row carries. The index schema is all-PK, zero
     // payload, so the key IS the row.
-    let entry = engine.dag.tables.get(&tid).unwrap();
+    let entry = engine.registry().table_entry(tid).unwrap();
     let ic = &entry.index_circuits[0];
     let idx_schema = ic.index_schema;
     let src_pk_stride = entry.schema.pk_stride() as usize;

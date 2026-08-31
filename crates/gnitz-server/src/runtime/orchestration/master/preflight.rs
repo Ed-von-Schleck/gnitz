@@ -15,7 +15,7 @@ use super::*;
 
 use super::unique_filter::{UniqueFilter, UNIQUE_FILTER_CAP};
 use gnitz_engine::catalog::FkEdge;
-use gnitz_engine::storage::MemBatch;
+use gnitz_store::storage::MemBatch;
 
 // ---------------------------------------------------------------------------
 // Pipelined validation checks
@@ -252,7 +252,7 @@ impl PreflightKeyStream {
             version: 0,
         });
         let bytes = slot.bytes();
-        let mut offsets = [0usize; gnitz_engine::storage::MAX_BATCH_REGIONS];
+        let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
         let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, schema_hint, &mut offsets)
             .map_err(|e| scan_decode_err(self.w, e).text)?;
         if let Some(mb) = zc.data_batch.as_ref() {
@@ -590,7 +590,7 @@ impl<'a> TxnBundle<'a> {
         let mut schemas = FxHashMap::default();
         let mut overlays = FxHashMap::default();
         for &tid in &order {
-            schemas.insert(tid, disp.cat().schema_or_err(tid, "txn bundle")?);
+            schemas.insert(tid, disp.cat().registry().schema_or_err(tid, "txn bundle")?);
             if !reads_overlay(disp, tid) {
                 continue;
             }
@@ -690,7 +690,7 @@ struct UniquePlan<'a> {
 fn enc_key(schema: &SchemaDescriptor, v: u128, src_type: u8) -> PkBuf {
     let key_col = schema.pk_indices()[0] as usize;
     let idx_key_type = schema.columns[key_col].type_code;
-    gnitz_engine::schema::key::index_opk_prefix(v, src_type, idx_key_type).widened(schema.pk_stride() as usize)
+    gnitz_store::schema::key::index_opk_prefix(v, src_type, idx_key_type).widened(schema.pk_stride() as usize)
 }
 
 impl MasterDispatcher {
@@ -858,7 +858,10 @@ impl MasterDispatcher {
         let mut checks: Vec<PipelinedCheck> = Vec::new();
         for &tid in &b.order {
             let cat = disp.cat();
-            let (n_circuits, has_unique) = (cat.index_circuits(tid).len(), cat.has_any_unique_index(tid));
+            let (n_circuits, has_unique) = (
+                cat.registry().index_circuits(tid).len(),
+                cat.registry().has_any_unique_index(tid),
+            );
             if !has_unique {
                 continue;
             }
@@ -874,7 +877,7 @@ impl MasterDispatcher {
                 // span-encode plan baked at registration. Copied out so the
                 // catalog borrow ends before the `&mut` dispatcher calls below.
                 let (col_indices, idx_schema, spec) = {
-                    let ic = &disp.cat().index_circuits(tid)[ci];
+                    let ic = &disp.cat().registry().index_circuits(tid)[ci];
                     if ic.unique_cols().is_none() {
                         continue;
                     }
@@ -950,7 +953,7 @@ impl MasterDispatcher {
                 // always present.
                 let Ok(i) = plan
                     .by_span
-                    .binary_search_by(|(s, _)| gnitz_engine::schema::key::compare_pk_bytes(s.pk_bytes(), span))
+                    .binary_search_by(|(s, _)| gnitz_store::schema::key::compare_pk_bytes(s.pk_bytes(), span))
                 else {
                     continue;
                 };
@@ -1076,7 +1079,7 @@ impl MasterDispatcher {
             // PK fast-path only when the referenced column *is* the parent's lone
             // PK; otherwise probe the parent's UNIQUE index by broadcast, since
             // index entries are distributed independently of the PK.
-            let parent_schema = disp.cat().schema_or_err(parent_tid, "fk parent")?;
+            let parent_schema = disp.cat().registry().schema_or_err(parent_tid, "fk parent")?;
             let ppk = parent_schema.pk_indices();
             let src_type = loc.type_code();
             let (probe_schema, col_hint, broadcast) = if ppk.len() == 1 && ppk[0] as usize == parent_col {
@@ -1084,6 +1087,7 @@ impl MasterDispatcher {
             } else {
                 let idx_schema = disp
                     .cat()
+                    .registry()
                     .index_circuit_for_cols(parent_tid, &[parent_col as u32])
                     .map(|ic| ic.index_schema)
                     .ok_or_else(|| format!("FK check: no unique index on parent {parent_tid} col {parent_col}"))?;
@@ -1153,6 +1157,7 @@ impl MasterDispatcher {
             }
             let idx_schema = disp
                 .cat()
+                .registry()
                 .index_circuit_for_cols(child_tid, &[fk_col as u32])
                 .map(|ic| ic.index_schema)
                 .ok_or_else(|| format!("FK RESTRICT: no index on child {child_tid} col {fk_col}"))?;
@@ -1370,7 +1375,7 @@ impl MasterDispatcher {
     ) -> Result<UniqueFilter, String> {
         let (idx_schema, packed) = {
             let cat = self.cat();
-            let owner_schema = match cat.get_schema_desc(owner_id) {
+            let owner_schema = match cat.registry().get_schema_desc(owner_id) {
                 Some(s) => s,
                 None => return Ok(UniqueFilter::new()),
             };
@@ -1390,7 +1395,7 @@ impl MasterDispatcher {
             // build, so the frame schema agrees by construction. `packed` is
             // the column list the worker resolves the seek by.
             (
-                gnitz_engine::schema::make_index_schema(col_indices, &owner_schema)?,
+                gnitz_store::schema::make_index_schema(col_indices, &owner_schema)?,
                 gnitz_wire::pack_pk_cols(col_indices),
             )
         };
@@ -1567,13 +1572,13 @@ impl MasterDispatcher {
         // so a globally sorted input yields per-worker-sorted sublists.
         pks.sort_unstable();
 
-        let parent_schema = disp.cat().schema_or_err(target_id, "gather")?;
+        let parent_schema = disp.cat().registry().schema_or_err(target_id, "gather")?;
         // The exact constructor the worker uses for its reply schema, so a
         // matching reply validates by construction. A PK `ref_col` would be
         // skipped and leave the reply payload-less; the sole caller branches on
         // `is_pk_col` and reaches this only on the payload arm.
         debug_assert!(!parent_schema.is_pk_col(ref_col as usize));
-        let expected = gnitz_engine::schema::project_schema(&parent_schema, &[ref_col as u32])
+        let expected = gnitz_store::schema::project_schema(&parent_schema, &[ref_col as u32])
             .expect("a one-column projection fits MAX_COLUMNS");
         let parent = wire::WireSchema::encoded(target_id, parent_schema);
 

@@ -30,8 +30,8 @@ use crate::runtime::master::{await_worker_acks, first_worker_error_opt, TxnFamil
 use crate::runtime::reactor::{chan, join_into, oneshot, select2, Either, ReplyFuture, ReplyLease};
 use crate::runtime::sal::{GroupTargets, SalFit, SalMessageKind, ZoneMark};
 use crate::runtime::wire::DecodedWire;
-use gnitz_engine::foundation::fault::Seam;
-use gnitz_engine::storage::Batch;
+use gnitz_store::foundation::fault::Seam;
+use gnitz_store::storage::Batch;
 use gnitz_wire::{WireConflictMode, WireFault};
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
@@ -589,7 +589,7 @@ async fn commit_pushes(
                 let placeholder = guard_panic("commit_fallback_schema", || {
                     Ok(Batch::empty_with_schema(&shared.disp().schema_desc_for(tid)))
                 })
-                .unwrap_or_else(|_| Batch::empty_with_schema(&gnitz_engine::schema::SchemaDescriptor::minimal_u64()));
+                .unwrap_or_else(|_| Batch::empty_with_schema(&gnitz_store::schema::SchemaDescriptor::minimal_u64()));
                 (placeholder, Some(WireFault::from(panic_msg)))
             }
         };

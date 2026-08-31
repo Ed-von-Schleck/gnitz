@@ -17,8 +17,12 @@
 //!
 //! Everything a *host* contracts for — freshness, what can be mirrored, the read
 //! ceiling, the cost — is stated in `gnitz_core::mirror`, because that is where a
-//! host meets it. What lives here is the store: the local catalog, the copies,
-//! their feed positions, and the durability around them.
+//! host meets it. What lives here is the store: the relation registry, the
+//! copies, their feed positions, and the durability around them.
+//!
+//! It drives the engine's **relation rung** directly — the Z-set store and the
+//! `ReadSpec` executor — and links neither the circuit compiler, the DBSP VM,
+//! epoch execution nor the system-table catalog.
 //!
 //! The store is `Send` and `!Sync`, so a [`gnitz_core::GnitzClient`] holding one
 //! is `Send` and is not `Sync`; the argument is beside the `unsafe impl` in
@@ -29,9 +33,9 @@
 //! fresh file description, which `flock` treats as a conflict.
 
 mod apply;
-mod cursors;
 mod handle;
 mod reads;
 mod register;
+mod state;
 
 pub use handle::Mirror;

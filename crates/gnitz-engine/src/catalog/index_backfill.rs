@@ -3,8 +3,8 @@
 //! the worker's boot rebuild), the UNIQUE promote, and FK auto-index creation.
 
 use super::*;
-use crate::schema::key::PkBuf;
-use crate::schema::make_index_schema;
+use gnitz_store::schema::key::PkBuf;
+use gnitz_store::schema::make_index_schema;
 
 impl CatalogEngine {
     /// Locally retract an index registration whose +1 was applied but never
@@ -36,12 +36,12 @@ impl CatalogEngine {
         index_id: i64,
         idx_schema: SchemaDescriptor,
     ) -> Result<Table, String> {
-        let table_dir = if crate::foundation::worker_ctx::is_worker() {
-            ChildAddr::this_worker(self.num_workers).dir(idx_dir)
+        let table_dir = if gnitz_store::foundation::worker_ctx::is_worker() {
+            ChildAddr::this_worker(self.registry.num_workers()).dir(idx_dir)
         } else {
             idx_dir.to_string()
         };
-        Table::new(&table_dir, idx_schema, index_id as u32, self.rederive_source())
+        Table::new(&table_dir, idx_schema, index_id as u32, self.registry.rederive_source())
             .map_err(|e| format!("Failed to create index table {index_id}: error {e}"))
     }
 
@@ -68,7 +68,7 @@ impl CatalogEngine {
         // `add_index_circuit` registers one.
         let target = IndexProjectionTarget {
             cols: PkColList::from_slice(col_indices),
-            spec: crate::schema::IndexKeySpec::new(col_indices, owner_schema, idx_schema),
+            spec: gnitz_store::schema::IndexKeySpec::new(col_indices, owner_schema, idx_schema),
             idx_schema: *idx_schema,
             table: Some(idx_table),
         };
@@ -96,21 +96,20 @@ impl CatalogEngine {
     /// at the parent dir — unit-testable without touching the global role.
     pub fn backfill_all_indexes(&mut self) -> Result<usize, String> {
         // Snapshot the worklist first: each owner's rebuild mutably borrows
-        // self.dag (`replace_index_table`), so no borrow of `dag.tables` may be
+        // self.dag (`replace_index_table`), so no borrow of the registry may be
         // held across the loop. Only base tables carry index circuits, so
         // views/system tables contribute nothing.
         struct IndexWork {
             cols: PkColList,
             index_id: i64,
             idx_schema: SchemaDescriptor,
-            key_spec: crate::schema::IndexKeySpec,
+            key_spec: gnitz_store::schema::IndexKeySpec,
         }
         let worklist: Vec<(i64, String, Vec<IndexWork>)> = self
-            .dag
-            .tables
-            .iter()
+            .registry
+            .entries()
             .filter(|(_, entry)| !entry.index_circuits.is_empty())
-            .map(|(&owner_id, entry)| {
+            .map(|(owner_id, entry)| {
                 let works = entry
                     .index_circuits
                     .iter()
@@ -136,7 +135,7 @@ impl CatalogEngine {
                     .map_err(|e| format!("index table re-create failed (owner {owner_id}): {e}"))?;
                 let resumed = table.resumed_from_checkpoint();
                 let ptr = self
-                    .dag
+                    .registry
                     .replace_index_table(owner_id, w.cols.as_slice(), Box::new(table))
                     .ok_or_else(|| format!("index circuit vanished during rebuild (owner {owner_id})"))?;
                 if !resumed {
@@ -184,19 +183,19 @@ impl CatalogEngine {
         if targets.is_empty() {
             return Ok(());
         }
-        let chunk_rows = self.ddl_scan_chunk_rows;
+        let chunk_rows = self.registry.ddl_scan_chunk_rows();
         let mut seen: Vec<rustc_hash::FxHashSet<PkBuf>> = if check_dups {
             targets.iter().map(|_| rustc_hash::FxHashSet::default()).collect()
         } else {
             Vec::new()
         };
 
-        let Some(mut handle) = self.open_store_cursor(owner_id) else {
+        let Some(mut handle) = self.registry.open_store_cursor(owner_id) else {
             return Ok(());
         };
         while let Some(chunk) = handle.drain_chunk(chunk_rows) {
             for (ti, t) in targets.iter().enumerate() {
-                let projected = crate::storage::batch_project_index(&chunk, &t.spec, &t.idx_schema);
+                let projected = gnitz_store::storage::batch_project_index(&chunk, &t.spec, &t.idx_schema);
                 if projected.count == 0 {
                     continue;
                 }
@@ -235,13 +234,13 @@ impl CatalogEngine {
             let idx_schema = make_index_schema(col_indices, owner_schema)?;
             let target = IndexProjectionTarget {
                 cols: PkColList::from_slice(col_indices),
-                spec: crate::schema::IndexKeySpec::new(col_indices, owner_schema, &idx_schema),
+                spec: gnitz_store::schema::IndexKeySpec::new(col_indices, owner_schema, &idx_schema),
                 idx_schema,
                 table: None,
             };
             self.stream_index_projection(owner_id, &[target], true)?;
         }
-        self.dag.set_index_circuit_uniqueness(owner_id, col_indices, true);
+        self.registry.set_index_circuit_uniqueness(owner_id, col_indices, true);
         Ok(())
     }
 
@@ -252,7 +251,7 @@ impl CatalogEngine {
         // COL_TAB read so the miss costs nothing. The registered schema is where
         // the PK list lives: `register_relation` builds it from the same
         // `TABLE_TAB.pk_col_idx` the row persisted.
-        let Some(owner_schema) = self.dag.tables.get(&table_id).map(|e| e.schema) else {
+        let Some(owner_schema) = self.registry.entry(table_id).map(|e| e.schema) else {
             return Ok(());
         };
         let pk_cols = owner_schema.pk_indices();
@@ -307,7 +306,7 @@ impl CatalogEngine {
 /// the promote path).
 struct IndexProjectionTarget {
     cols: PkColList,
-    spec: crate::schema::IndexKeySpec,
+    spec: gnitz_store::schema::IndexKeySpec,
     idx_schema: SchemaDescriptor,
     table: Option<*mut Table>,
 }

@@ -1,8 +1,8 @@
 //! Epoch execution: the two entry points and the opcode dispatch loop.
 
 use super::*;
-use crate::ops;
-use crate::storage::{Batch, ReadCursor};
+use gnitz_store::ops;
+use gnitz_store::storage::{Batch, ReadCursor};
 
 // ---------------------------------------------------------------------------
 // Execution
@@ -17,8 +17,8 @@ use crate::storage::{Batch, ReadCursor};
 fn log_tick_ingest_err(
     op: &str,
     table_idx: TableIdx,
-    r: Result<(), crate::storage::StorageError>,
-) -> Result<(), crate::storage::StorageError> {
+    r: Result<(), gnitz_store::storage::StorageError>,
+) -> Result<(), gnitz_store::storage::StorageError> {
     r.inspect_err(|e| {
         gnitz_error!(
             "vm: {} ingest failed (table_idx={}): {} — tick state diverged \
@@ -36,7 +36,7 @@ fn log_tick_ingest_err(
 pub(crate) fn execute_epoch_multi(
     vm: &mut VmHandle,
     inputs: impl IntoIterator<Item = (u16, Batch)>,
-) -> Result<Option<Batch>, crate::storage::StorageError> {
+) -> Result<Option<Batch>, gnitz_store::storage::StorageError> {
     seed_inputs(vm, inputs);
     dispatch(vm, 0, IntegrateMode::Write)
 }
@@ -51,7 +51,7 @@ pub(crate) fn execute_epoch_replay(
     vm: &mut VmHandle,
     seed: (u16, Batch),
     start_pc: usize,
-) -> Result<Option<Batch>, crate::storage::StorageError> {
+) -> Result<Option<Batch>, gnitz_store::storage::StorageError> {
     seed_inputs(vm, std::iter::once(seed));
     dispatch(vm, start_pc, IntegrateMode::Skip)
 }
@@ -107,7 +107,7 @@ fn dispatch(
     vm: &mut VmHandle,
     start_pc: usize,
     integrate: IntegrateMode,
-) -> Result<Option<Batch>, crate::storage::StorageError> {
+) -> Result<Option<Batch>, gnitz_store::storage::StorageError> {
     // Destructured because the three are disjoint fields: that is what lets an
     // operator hold a batch and a cursor (or a table) at once, with no interior
     // mutability and no raw pointer.

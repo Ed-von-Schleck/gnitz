@@ -4,15 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+gnitz-store = { path = "../gnitz-store" }
 gnitz-wire  = { path = "../gnitz-wire" }
 gnitz-expr  = { path = "../gnitz-expr" }
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
-xorf = { version = "0.13", default-features = false, features = ["binary-fuse"] }
-libc = "0.2"
-io-uring = "0.7"
 rustc-hash = "2"
 
 [dev-dependencies]
+libc = "0.2"
 tempfile = "3"
 proptest = "1"
 

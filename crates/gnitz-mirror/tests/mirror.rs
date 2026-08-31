@@ -944,29 +944,27 @@ fn a_torn_checkpoint_reseeds_rather_than_corrupts() {
     // Case 1 — the copies moved on and were published; the cursor file did not.
     // Snapshot the file, apply more rounds, checkpoint again, restore the old
     // file: that is exactly a crash between the ephemeral round and the write.
-    let cursor_path = cursor_file(&fx.base_dir());
-    let stale = std::fs::read(&cursor_path).expect("a checkpoint writes the cursor file");
+    let state_path = state_file(&fx.base_dir());
+    let stale = std::fs::read(&state_path).expect("a checkpoint writes the record file");
     churn(&mut fx.direct, 91, 180);
     fx.quiesce();
     fx.mirror().checkpoint_mirror().expect("second checkpoint");
     fx.mirror = None;
-    std::fs::write(&cursor_path, &stale).unwrap();
+    std::fs::write(&state_path, &stale).unwrap();
 
     fx.reopen();
     fx.mirror_both();
     fx.quiesce();
     fx.differential("s", "SELECT * FROM v_keyed");
 
-    // Case 2 — the generation is durably ahead of every output manifest, so each
-    // copy erases at open. The bump is the same one the checkpoint's step 0
-    // makes; leaving out the flush round is the crash.
+    // Case 2 — the generation the record file names is ahead of every output
+    // manifest, so each copy erases at open. That is the checkpoint's own
+    // generation bump with the flush round left out, which is the crash.
     fx.mirror()
         .checkpoint_mirror()
         .expect("checkpoint before the torn bump");
     fx.mirror = None;
-    with_engine(&fx.base_dir(), |e| {
-        e.bump_checkpoint_generation().expect("durably advance the generation");
-    });
+    patch_state_header(&fx.base_dir(), STATE_OFF_GENERATION, |g| g + 1);
 
     fx.reopen();
     fx.mirror_both();
@@ -995,8 +993,8 @@ fn an_applied_delta_drives_its_own_checkpoint() {
         "an apply past the threshold must publish the copy's manifest with no explicit checkpoint",
     );
     assert!(
-        std::path::Path::new(&cursor_file(&fx.base_dir())).exists(),
-        "the same checkpoint must write the cursor file",
+        std::path::Path::new(&state_file(&fx.base_dir())).exists(),
+        "the same checkpoint must write the record file",
     );
     fx.differential("s", "SELECT * FROM v_keyed");
 }
@@ -1066,9 +1064,11 @@ fn a_foreign_topology_word_reseeds() {
         "a checkpoint must publish the copy's manifest",
     );
     fx.mirror = None;
-    with_engine(&fx.base_dir(), |e| {
-        e.record_topology(2).expect("record a foreign topology");
-        e.flush_all_system_tables().expect("make it durable");
+    patch_state_header(&fx.base_dir(), STATE_OFF_TOPOLOGY, |_| {
+        // What a two-worker layout would have stamped. The mirror always opens
+        // at one worker, so this mismatches for the same reason a state-format
+        // bump would.
+        gnitz_store::relation::RelationRegistry::new(2).launched_topology_word()
     });
 
     fx.reopen();
@@ -1083,15 +1083,18 @@ fn a_foreign_topology_word_reseeds() {
     fx.differential("s", "SELECT * FROM v_repl");
 }
 
-/// The cursor file the crate writes beside the copies.
-fn cursor_file(base_dir: &str) -> String {
-    format!("{base_dir}/mirror_cursors")
+/// The record file the crate writes beside the copies.
+fn state_file(base_dir: &str) -> String {
+    format!("{base_dir}/mirror_state")
 }
 
 /// Whether the mirrored copy of `view_id` currently has a published manifest —
 /// the on-disk difference between a resumed store and an erased one.
 fn has_manifest(base_dir: &str, view_id: u64) -> bool {
-    let root = std::path::Path::new(base_dir).join("s").join(format!("v_{view_id}"));
+    let root = std::path::Path::new(base_dir)
+        .join("_copies")
+        .join("s")
+        .join(format!("v_{view_id}"));
     fn search(dir: &std::path::Path) -> bool {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return false;
@@ -1133,15 +1136,25 @@ fn a_server_restart_reseeds_the_copy() {
     fx.differential("s", "SELECT * FROM v_repl");
 }
 
-/// Reach into the mirror's own data directory through a bare engine, to
-/// fabricate a durable state the handle would never write.
+/// Byte offsets of the two `mirror_state` header words the tests below
+/// fabricate. The crate owns the layout; these two are what a torn checkpoint
+/// and a foreign topology are *expressible as*, so a layout change that moved
+/// them would fail these tests rather than silently stop testing anything.
+const STATE_OFF_GENERATION: usize = 8;
+const STATE_OFF_TOPOLOGY: usize = 16;
+
+/// Rewrite one `u64` of the mirror's record-file header, to fabricate a durable
+/// state the handle would never write.
 ///
 /// The caller must have dropped the handle first: the directory takes one
-/// writer, which is exactly what the two tests above rely on the lock for.
-fn with_engine(dir: &str, f: impl FnOnce(&mut gnitz_engine::catalog::CatalogEngine)) {
-    let mut engine = gnitz_engine::catalog::CatalogEngine::open(dir, 1).expect("the directory is free");
-    f(&mut engine);
-    engine.close();
+/// writer, which is exactly what the two tests above rely on the lock for — and
+/// the handle rewrites the whole file on the way out.
+fn patch_state_header(dir: &str, offset: usize, f: impl FnOnce(u64) -> u64) {
+    let path = state_file(dir);
+    let mut bytes = std::fs::read(&path).expect("a checkpoint wrote the record file");
+    let old = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    bytes[offset..offset + 8].copy_from_slice(&f(old).to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -2178,14 +2191,14 @@ fn a_cursor_less_poll_re_resolves_rather_than_bootstrapping_in_place() {
     fx.differential("s", "SELECT * FROM v_keyed");
 }
 
-/// A second view of a schema the store already knows issues no `SCHEMA_TAB`
-/// scan.
+/// Mirroring a view costs one RESOLVE and one bootstrap read, and nothing else
+/// — no `SCHEMA_TAB` scan, first sighting of a schema or not.
 ///
-/// The round-trip assertion that keeps the store's own schema lookup from being
-/// quietly bypassed: only a first sighting pays that scan, and a client that
-/// asked the server every time would pay one per registration and per reseed.
+/// The store mints no ids, so it needs no schema id, so no registration reaches
+/// upstream for one. The assertion is on both views, not just the second: a
+/// first-sighting scan would show up on the first alone.
 #[test]
-fn a_second_view_of_a_known_schema_costs_no_schema_scan() {
+fn mirroring_a_view_costs_one_resolve_and_one_bootstrap() {
     let _g = serial();
     let mut fx = Fixture::start();
     churn(&mut fx.direct, 1, 20);
@@ -2198,11 +2211,11 @@ fn a_second_view_of_a_known_schema_costs_no_schema_scan() {
     fx.mirror().mirror_view("s", "v_repl").expect("the second view");
     let second = fx.mirror().requests_sent() - before - first;
 
+    assert_eq!(second, 2, "one RESOLVE and one bootstrap read");
     assert_eq!(
-        second, 2,
-        "a second view of a known schema costs one RESOLVE and one bootstrap read",
+        first, 2,
+        "and the first sighting of a schema costs no more than the second"
     );
-    assert_eq!(first, second + 1, "and the first pays exactly one SCHEMA_TAB scan more",);
 }
 
 /// A poisoned store refuses a mirrored read rather than answering it, an unheld
@@ -2324,15 +2337,15 @@ fn child_target() -> Option<(String, String)> {
     ))
 }
 
-/// Runs only in the child `a_second_handle_on_one_directory_is_refused` spawns. It opens the
-/// engine rather than a `Mirror` because that is where the lock is taken, and
-/// because it needs no server to reach it.
+/// Runs only in the child `a_second_handle_on_one_directory_is_refused` spawns.
+/// A bare `Mirror::open` — it takes the same `flock` the parent holds, and needs
+/// no server to reach it.
 #[test]
 fn second_process_open_child() {
     let Ok(dir) = std::env::var("GNITZ_MIRROR_LOCK_DIR") else {
         return;
     };
-    match gnitz_engine::catalog::CatalogEngine::open(&dir, 1) {
+    match Mirror::open(&dir) {
         Ok(_) => println!("second open unexpectedly succeeded"),
         Err(e) => println!("{e}"),
     }

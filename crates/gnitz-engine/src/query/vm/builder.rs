@@ -8,8 +8,8 @@
 //! numbered twice.
 
 use super::*;
-use crate::expr::MapPlan;
-use crate::storage::Table;
+use gnitz_store::expr::MapPlan;
+use gnitz_store::storage::Table;
 
 pub(crate) struct ProgramBuilder {
     instructions: Vec<Instr>,
@@ -68,7 +68,11 @@ impl ProgramBuilder {
 
     /// Store a baked reduce plan with the table its value index lives in,
     /// returning its `Instr::Reduce::plan_idx`.
-    pub(crate) fn add_reduce_plan(&mut self, plan: crate::ops::ReducePlan, avi_table: Option<TableIdx>) -> PlanIdx {
+    pub(crate) fn add_reduce_plan(
+        &mut self,
+        plan: gnitz_store::ops::ReducePlan,
+        avi_table: Option<TableIdx>,
+    ) -> PlanIdx {
         debug_assert_eq!(
             plan.avi.is_some(),
             avi_table.is_some(),

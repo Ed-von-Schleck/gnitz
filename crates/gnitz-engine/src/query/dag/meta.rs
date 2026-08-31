@@ -326,88 +326,39 @@ impl DagEngine {
     /// preceded by a drain: it backfills from the stream's empty store and starts
     /// accumulating from its own registration. Whether a row pushed just before the
     /// CREATE lands in it therefore depends on whether its tick had already fired.
-    pub fn base_tables_reachable_from(&mut self, seeds: Vec<i64>) -> Vec<i64> {
+    pub fn base_tables_reachable_from(&mut self, registry: &RelationRegistry, seeds: Vec<i64>) -> Vec<i64> {
         let mut bases: Vec<i64> = self
             .source_closure(seeds)
             .into_iter()
-            .filter(|s| self.tables.get(s).is_some_and(|e| e.kind.is_base_table()))
+            .filter(|&s| registry.relation_kind(s).is_some_and(|k| k.is_base_table()))
             .collect();
         bases.sort_unstable();
         bases
-    }
-
-    /// A registered relation's wire class, or `None` for an unknown id — the
-    /// shape a `FLAG_RESOLVE` descriptor reports. `RelClass` is `Copy`, so the
-    /// `tables` borrow ends with the call.
-    pub fn relation_class(&self, id: i64) -> Option<gnitz_wire::RelClass> {
-        self.tables.get(&id).map(|e| e.class())
-    }
-
-    /// A registered relation's kind, or `None` for an unknown id. `RelationKind`
-    /// is `Copy`, so the `tables` borrow ends with the call — callers may await
-    /// on the result.
-    pub fn relation_kind(&self, id: i64) -> Option<RelationKind> {
-        self.tables.get(&id).map(|e| e.kind)
-    }
-
-    /// True iff `id`'s output is a full copy on every worker — read off the
-    /// [`Placement`] stamped on its schema at registration. The one spelling of the
-    /// replication probe, so the write broadcast, the read single-sourcing, and the
-    /// store shape all read one answer.
-    ///
-    /// Any **gather** of a replicated relation must therefore single-source it,
-    /// taking one worker's copy instead of N identical ones — both the scan
-    /// dispatch and the exchange relay read this for that. SEEK already unicasts
-    /// to one worker, so it needs no check.
-    pub fn relation_is_replicated(&self, id: i64) -> bool {
-        self.tables
-            .get(&id)
-            .is_some_and(|e| e.schema.placement().is_replicated())
-    }
-
-    /// True iff at least one registered view carries a delta feed. The master's
-    /// idle-poll bookkeeping — the forward-closure walk and the last-round map —
-    /// is skipped outright when this is false, which is every server that does not
-    /// use the feature. A walk of the registry rather than a maintained counter:
-    /// it runs once per emitted tick group, against a relation count in the tens,
-    /// beside a SAL write and an eventfd.
-    pub fn any_delta_feed(&self) -> bool {
-        self.tables.values().any(|e| e.delta_bytes.is_some())
-    }
-
-    /// True iff `id` is a relation carrying a delta feed. Answered off the
-    /// registry, so it is the same answer on the post-fork master — which holds no
-    /// store — as on a worker.
-    pub fn relation_has_delta_feed(&self, id: i64) -> bool {
-        self.tables.get(&id).is_some_and(|e| e.delta_bytes.is_some())
-    }
-
-    /// Every registered view id.
-    pub fn view_ids(&self) -> Vec<i64> {
-        self.tables
-            .iter()
-            .filter(|(_, e)| e.kind.is_view())
-            .map(|(&id, _)| id)
-            .collect()
     }
 
     /// Where a view's rows live and how far above the bases it sits — the two
     /// values `TableEntry` stamps, both folded from its `sources`' own stamped
     /// entries, so the scheduling key is derived here rather than a second time
     /// at the registering caller.
-    pub(crate) fn view_placement(&mut self, view_id: i64, sources: &[i64], pk_arity: usize) -> (Placement, i32) {
+    pub(crate) fn view_placement(
+        &mut self,
+        registry: &RelationRegistry,
+        view_id: i64,
+        sources: &[i64],
+        pk_arity: usize,
+    ) -> (Placement, i32) {
         let depth = sources
             .iter()
-            .filter_map(|id| self.tables.get(id))
+            .filter_map(|&id| registry.entry(id))
             .map(|e| e.depth + 1)
             .max()
             .unwrap_or(0);
-        (self.source_placement(view_id, sources, pk_arity), depth)
+        (self.source_placement(registry, view_id, sources, pk_arity), depth)
     }
 
     /// Where a view's rows live, folded from its `sources`' **stamped**
     /// placements. `pk_arity` is the view's own declared PK column count (it is
-    /// not registered yet, so the arity cannot be read back off `self.tables`).
+    /// not registered yet, so the arity cannot be read back off the registry).
     ///
     /// Reading the sources' stamped placement rather than re-deriving "has a
     /// replicated source" from the direct sources is what makes the property
@@ -419,14 +370,20 @@ impl DagEngine {
     /// direction is always safe (a replicated store holds every row; the read
     /// gathers all workers) and it avoids a second, subtler predicate for "does
     /// this exchange actually run at runtime".
-    fn source_placement(&mut self, view_id: i64, sources: &[i64], pk_arity: usize) -> Placement {
+    fn source_placement(
+        &mut self,
+        registry: &RelationRegistry,
+        view_id: i64,
+        sources: &[i64],
+        pk_arity: usize,
+    ) -> Placement {
         // An unregistered source cannot be proven replicated or local, so it reads
         // as the keyed default — the same answer the pre-fold `replicated` probe
         // gave for a missing entry. A sourceless view computes nothing from
         // anywhere and keeps that default too.
-        let placement_of = |t: &i64| {
-            self.tables
-                .get(t)
+        let placement_of = |&t: &i64| {
+            registry
+                .entry(t)
                 .map_or(Placement::KEYED_DEFAULT, |e| e.schema.placement())
         };
         if sources.is_empty() {
@@ -462,15 +419,13 @@ impl DagEngine {
         let [src] = sources else {
             return Placement::KEYED_DEFAULT;
         };
-        // One lookup for both facts, which also ends `placement_of`'s borrow of
-        // `self` before `view_meta` needs it mutably.
-        let (placement, n) = self.tables.get(src).map_or((Placement::KEYED_DEFAULT, 0), |e| {
-            (e.schema.placement(), e.schema.pk_indices().len())
-        });
+        let (placement, n) = registry
+            .get_schema_desc(*src)
+            .map_or((Placement::KEYED_DEFAULT, 0), |s| (s.placement(), s.pk_indices().len()));
         if pk_arity != n {
             return Placement::KEYED_DEFAULT;
         }
-        let meta = self.view_meta(view_id);
+        let meta = self.view_meta(registry, view_id);
         if meta.shard_cols.is_none() && !meta.has_join {
             placement
         } else {
@@ -490,7 +445,7 @@ impl DagEngine {
 
     /// The memoized per-view circuit metadata, computed from ONE
     /// `load_meta_circuit` pass on first touch.
-    pub fn view_meta(&mut self, view_id: i64) -> Rc<ViewMeta> {
+    pub fn view_meta(&mut self, registry: &RelationRegistry, view_id: i64) -> Rc<ViewMeta> {
         if let Some(m) = self.meta.get(&view_id) {
             return m.clone();
         }
@@ -499,7 +454,7 @@ impl DagEngine {
         // rejects, so no view that runs is metadata-less.
         let facts = self
             .load_meta_circuit(view_id)
-            .and_then(|l| compiler::CircuitFacts::derive(&l, &self.tables).ok());
+            .and_then(|l| compiler::CircuitFacts::derive(&l, registry).ok());
         let meta = Rc::new(facts.map_or_else(ViewMeta::nothing_special, ViewMeta::from_facts));
         self.meta.insert(view_id, meta.clone());
         meta

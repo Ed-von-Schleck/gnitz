@@ -4,7 +4,7 @@
 //! packed_cols)` filters (the preflight seed path shares the types).
 
 use super::*;
-use gnitz_engine::schema::key::probe_key;
+use gnitz_store::schema::key::probe_key;
 
 #[cfg(test)]
 use super::preflight::build_check_batch_pk_bytes;
@@ -145,7 +145,7 @@ pub(super) struct UniqueIndexDesc {
 /// the walk neither starts nor continues past the row that caps it.
 pub(super) fn extract_into_filter(
     filter: &mut UniqueFilter,
-    batch: &gnitz_engine::storage::MemBatch<'_>,
+    batch: &gnitz_store::storage::MemBatch<'_>,
     spec: &IndexKeySpec,
 ) {
     if filter.capped() {
@@ -182,6 +182,7 @@ impl MasterDispatcher {
     /// promotion/demotion flips it without rebuilding the spec.
     fn unique_index_descriptors(&self, table_id: i64) -> Vec<UniqueIndexDesc> {
         self.cat()
+            .registry()
             .index_circuits(table_id)
             .iter()
             .filter(|ic| ic.is_unique)

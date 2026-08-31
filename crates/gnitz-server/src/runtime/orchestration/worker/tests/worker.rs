@@ -1,11 +1,11 @@
 use super::*;
 use crate::runtime::w2m::{self, W2mReceiver};
 use gnitz_engine::catalog::PUBLIC_SCHEMA_ID;
-use gnitz_engine::schema::SchemaDescriptor;
 use gnitz_engine_testkit::{col_def, CatalogTestExt};
+use gnitz_store::schema::SchemaDescriptor;
 
 fn test_schema() -> SchemaDescriptor {
-    use gnitz_engine::schema::SchemaColumn;
+    use gnitz_store::schema::SchemaColumn;
     use gnitz_wire::type_code;
     SchemaDescriptor::new(
         &[
@@ -349,7 +349,7 @@ fn test_next_sal_message_epoch_gating() {
     use crate::runtime::sal::{SalReader, SalWriter, ZoneMark};
 
     const SAL_SIZE: usize = 1 << 20;
-    let sal_region = gnitz_engine_testkit::SharedRegion::new(SAL_SIZE);
+    let sal_region = crate::runtime::test_support::SharedRegion::new(SAL_SIZE);
     let sal_ptr = sal_region.ptr();
 
     // Single worker; each group puts a one-byte payload at slot 0.
@@ -392,7 +392,7 @@ fn test_next_sal_message_epoch_gating() {
 
 /// A production-sized ring and its writer. The mmap reservation is
 /// lazily populated, so the 1 GiB backing costs address space, not RAM.
-fn make_ring() -> (gnitz_engine_testkit::SharedRegion, W2mWriter) {
+fn make_ring() -> (crate::runtime::test_support::SharedRegion, W2mWriter) {
     let region = unsafe { w2m::test_ring(w2m::W2M_REGION_SIZE) };
     let writer = W2mWriter::new(region.ptr());
     (region, writer)
@@ -401,7 +401,7 @@ fn make_ring() -> (gnitz_engine_testkit::SharedRegion, W2mWriter) {
 /// A U64 PK with a stride-4 payload column: the shape whose wire block pads
 /// between regions, so its size is monotone in the row count but not affine.
 fn padded_schema() -> SchemaDescriptor {
-    use gnitz_engine::schema::SchemaColumn;
+    use gnitz_store::schema::SchemaColumn;
     use gnitz_wire::type_code;
     SchemaDescriptor::new(
         &[
@@ -442,8 +442,8 @@ fn make_n_row_batch(schema: SchemaDescriptor, n: usize) -> Batch {
 /// frame's own control block and a caller-held region-offset array.
 fn decode_continuation<'a>(
     bytes: &'a [u8],
-    schema: &gnitz_engine::schema::SchemaDescriptor,
-    offsets: &'a mut [usize; gnitz_engine::storage::MAX_BATCH_REGIONS],
+    schema: &gnitz_store::schema::SchemaDescriptor,
+    offsets: &'a mut [usize; gnitz_store::storage::MAX_BATCH_REGIONS],
 ) -> Result<ipc::DecodedWireZeroCopy<'a>, &'static str> {
     let ctrl = gnitz_wire::control::peek_control_block_ipc(bytes)?;
     let hint = ipc::SchemaWithVersion {
@@ -455,7 +455,7 @@ fn decode_continuation<'a>(
 
 /// Row `row`'s PK widened from its OPK bytes — `Batch::get_pk` for a
 /// borrowed `MemBatch`.
-fn mem_pk(b: &gnitz_engine::storage::MemBatch<'_>, row: usize) -> u128 {
+fn mem_pk(b: &gnitz_store::storage::MemBatch<'_>, row: usize) -> u128 {
     gnitz_wire::widen_pk_be(b.get_pk_bytes(row), b.pk_stride as usize)
 }
 
@@ -637,7 +637,7 @@ fn test_pending_scan_continuation_chunk_excludes_schema() {
         ipc::decode_wire_ipc(&data).is_err(),
         "continuation frame without schema must fail decode_wire_ipc"
     );
-    let mut offsets = [0usize; gnitz_engine::storage::MAX_BATCH_REGIONS];
+    let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
     let decoded =
         decode_continuation(&data, &schema, &mut offsets).expect("continuation decodes against a schema hint");
     let b = decoded.data_batch.as_ref().expect("continuation chunk must carry data");
@@ -682,7 +682,7 @@ fn test_send_scan_response_single_frame() {
     );
     assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
 
-    let mut offsets = [0usize; gnitz_engine::storage::MAX_BATCH_REGIONS];
+    let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
     let decoded = decode_continuation(&data, &schema, &mut offsets).expect("decode with schema hint");
     let b = decoded.data_batch.as_ref().expect("data block");
     assert_eq!(b.count, 5);
@@ -741,7 +741,7 @@ fn test_force_fifo_queues_whole_blob_single_frame() {
     engine
         .register_table(tid, PUBLIC_SCHEMA_ID, "tfifo", &cols, &[0])
         .unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     assert!(schema.has_german_string(), "a STRING schema carries a German string");
 
     let (region, writer) = make_ring();
@@ -784,7 +784,7 @@ fn test_force_fifo_queues_whole_blob_single_frame() {
 /// string does, whose heap cannot be cut at a row boundary.
 #[test]
 fn test_only_a_german_string_blocks_chunking() {
-    use gnitz_engine::schema::SchemaColumn;
+    use gnitz_store::schema::SchemaColumn;
     use gnitz_wire::type_code;
     let with_string = SchemaDescriptor::new(
         &[
@@ -825,7 +825,7 @@ fn zero_batch(schema: SchemaDescriptor, count: usize) -> Batch {
 /// first chunk carries B's own schema block.
 #[test]
 fn test_pending_streams_fifo_two_trains() {
-    use gnitz_engine::schema::SchemaColumn;
+    use gnitz_store::schema::SchemaColumn;
     use gnitz_wire::type_code;
 
     let schema_a = test_schema();
@@ -909,7 +909,7 @@ fn test_pending_streams_fifo_two_trains() {
                 assert_eq!(s.num_columns(), ncols, "the block is this train's schema");
                 rows += decoded.data_batch.map(|b| b.count).unwrap_or(0);
             } else {
-                let mut offsets = [0usize; gnitz_engine::storage::MAX_BATCH_REGIONS];
+                let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
                 let decoded = decode_continuation(bytes, schema, &mut offsets)
                     .expect("continuation decodes against the schema hint");
                 rows += decoded.data_batch.map(|b| b.count).unwrap_or(0);
@@ -1013,7 +1013,7 @@ fn test_stream_batch_response_oversized_string_errors() {
     engine
         .register_table(tid, PUBLIC_SCHEMA_ID, "tstr", &cols, &[0])
         .unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     assert!(schema.has_german_string());
 
     // 40 B/row (8 pk + 8 weight + 8 null + 16 string struct), empty blob.
@@ -1054,8 +1054,8 @@ fn test_stream_batch_response_projected_schema_one_off_block() {
     engine
         .register_table(tid, PUBLIC_SCHEMA_ID, "tproj", &cols, &[0])
         .unwrap();
-    let table_schema = engine.get_schema_desc(tid).unwrap();
-    let projected = gnitz_engine::schema::project_schema(&table_schema, &[1]).unwrap();
+    let table_schema = engine.registry().get_schema_desc(tid).unwrap();
+    let projected = gnitz_store::schema::project_schema(&table_schema, &[1]).unwrap();
     assert_ne!(projected.num_columns(), table_schema.num_columns());
 
     let (region, writer) = make_ring();

@@ -4,9 +4,9 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-use crate::expr::MapPlan;
-use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, ReadCursor, Table};
+use gnitz_store::expr::MapPlan;
+use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::storage::{Batch, ReadCursor, Table};
 
 mod builder;
 mod exec;
@@ -87,7 +87,7 @@ pub(crate) enum Instr {
         delta_reg: u16,
         trace_reg: u16,
         out_reg: u16,
-        probe: crate::ops::JoinProbe,
+        probe: gnitz_store::ops::JoinProbe,
     },
     WorkerFilter {
         in_reg: u16,
@@ -306,7 +306,7 @@ impl RegisterMeta {
 /// value index lives in. Paired at construction, so the dispatch never reconciles
 /// "the plan carries a bake" against "the instruction names a table".
 pub(crate) struct BakedReduce {
-    pub plan: crate::ops::ReducePlan,
+    pub plan: gnitz_store::ops::ReducePlan,
     pub avi_table: Option<TableIdx>,
 }
 

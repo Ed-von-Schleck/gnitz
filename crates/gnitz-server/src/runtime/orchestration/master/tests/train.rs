@@ -8,7 +8,7 @@ use super::*;
 // signal for a phantom-continuation regression.
 
 struct DrainFixture {
-    rings: Vec<gnitz_engine_testkit::SharedRegion>,
+    rings: Vec<crate::runtime::test_support::SharedRegion>,
     reactor: Rc<crate::runtime::reactor::Reactor>,
     /// A `Peer` over a socketpair end whose partner is already closed, for
     /// the drains that take one. It holds an owning `Rc<Reactor>`, so the

@@ -17,34 +17,35 @@
 
 use super::*;
 use crate::query::compiler::{HydrationSeed, PlanShape};
-use crate::storage::PkSetGather;
+use gnitz_store::read::SkeletonHydrator;
+use gnitz_store::storage::PkSetGather;
 
-impl DagEngine {
-    /// Recompute the output rows of the capacity-bounded view `view_id` for
-    /// `keys` — the flat concatenation of the OPK images, ascending — whose
-    /// per-key coarse weights are `coarse`. One consolidated batch in the view's
-    /// own schema.
-    ///
-    /// `keys` is taken by value because the gather below owns its key list; the
-    /// caller built the buffer for this call and has no further use for it.
-    ///
-    /// `chunk_rows` bounds the seed batch only; `JoinDT`'s cogroup accepts
-    /// multi-key deltas, so the chunking costs nothing but peak memory.
-    pub(crate) fn hydrate_keys(
+/// Recompute the output rows of the capacity-bounded view `view_id` for `keys`
+/// — the flat concatenation of the OPK images, ascending — whose per-key coarse
+/// weights are `coarse`. One consolidated batch in the view's own schema.
+///
+/// `keys` is taken by value because the gather below owns its key list; the
+/// caller built the buffer for this call and has no further use for it.
+///
+/// `chunk_rows` bounds the seed batch only; `JoinDT`'s cogroup accepts
+/// multi-key deltas, so the chunking costs nothing but peak memory.
+impl SkeletonHydrator for DagEngine {
+    fn hydrate_keys(
         &mut self,
+        registry: &RelationRegistry,
         view_id: i64,
         keys: Vec<u8>,
         coarse: &[i64],
         chunk_rows: usize,
     ) -> Result<Batch, String> {
-        let Some(view_schema) = self.tables.get(&view_id).map(|e| e.schema) else {
+        let Some(view_schema) = registry.get_schema_desc(view_id) else {
             return Err(format!("hydrate: view {view_id} is not a registered relation"));
         };
         // The plan cache is lazy and is dropped on every rebuild, so a read
         // arriving before the view's first tick would otherwise find nothing.
         // `Ok(false)` is that same registry lookup, which the check above already
         // passed, so only a real compile failure leaves here.
-        let compiled = self.ensure_compiled(view_id)?;
+        let compiled = self.ensure_compiled(registry, view_id)?;
         debug_assert!(compiled, "ensure_compiled false for a registered view");
         let hydration = self.cache[&view_id]
             .hydration
@@ -76,10 +77,9 @@ impl DagEngine {
         // The gather opens over the range its own key list spans.
         let mut gather = match hydration.seed {
             HydrationSeed::Relation(source) => {
-                let entry = self
-                    .tables
-                    .get(&source)
-                    .ok_or_else(|| format!("hydrate: view {view_id} source {source} is unregistered"))?;
+                let entry = registry
+                    .table_entry(source)
+                    .map_err(|_| format!("hydrate: view {view_id} source {source} is unregistered"))?;
                 // A linear view's physical PK is the leading source-PK columns,
                 // byte-identical to the source PK, so the store's own keys index
                 // the source directly.
@@ -128,7 +128,7 @@ fn debug_assert_hydration_matches(out: &Batch, keys: &[u8], coarse: &[i64]) {
     if !cfg!(debug_assertions) {
         return;
     }
-    use crate::schema::key::compare_pk_bytes;
+    use gnitz_store::schema::key::compare_pk_bytes;
     let stride = keys.len() / coarse.len();
     let mut ki = 0;
     let mut i = 0;

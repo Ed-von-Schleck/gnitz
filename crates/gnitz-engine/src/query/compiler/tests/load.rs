@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::type_code;
+use gnitz_store::schema::type_code;
 
 #[test]
 fn test_topo_sort_simple() {
@@ -48,7 +48,7 @@ impl CircuitTables {
     }
 
     fn schema(cols: &[gnitz_wire::WireSysCol]) -> SchemaDescriptor {
-        crate::schema::from_wire_cols(cols, gnitz_wire::CIRCUIT_FAMILY_PK)
+        gnitz_store::schema::from_wire_cols(cols, gnitz_wire::CIRCUIT_FAMILY_PK)
     }
 
     fn new() -> Self {
@@ -74,18 +74,18 @@ impl CircuitTables {
         }
     }
 
-    fn fill(tab: &mut Table, cols: &[gnitz_wire::WireSysCol], f: impl FnOnce(&mut crate::storage::BatchBuilder)) {
-        let mut bb = crate::storage::BatchBuilder::new(Self::schema(cols));
+    fn fill(tab: &mut Table, cols: &[gnitz_wire::WireSysCol], f: impl FnOnce(&mut gnitz_store::storage::BatchBuilder)) {
+        let mut bb = gnitz_store::storage::BatchBuilder::new(Self::schema(cols));
         f(&mut bb);
         tab.ingest_owned_batch(bb.finish()).unwrap();
     }
 
-    fn put_nodes(&mut self, f: impl FnOnce(&mut crate::storage::BatchBuilder)) -> &mut Self {
+    fn put_nodes(&mut self, f: impl FnOnce(&mut gnitz_store::storage::BatchBuilder)) -> &mut Self {
         Self::fill(&mut self.nodes, gnitz_wire::CIRCUIT_NODES_COLS, f);
         self
     }
 
-    fn put_edges(&mut self, f: impl FnOnce(&mut crate::storage::BatchBuilder)) -> &mut Self {
+    fn put_edges(&mut self, f: impl FnOnce(&mut gnitz_store::storage::BatchBuilder)) -> &mut Self {
         Self::fill(&mut self.edges, gnitz_wire::CIRCUIT_EDGES_COLS, f);
         self
     }
@@ -230,7 +230,7 @@ fn port_set_violations_fail_at_load() {
                 group_cols: vec![0],
                 agg: vec![(gnitz_wire::AggFunc::Count, 1)],
                 global_ground: false,
-                out_key: crate::schema::ReduceOutKey::PkPermutation,
+                out_key: gnitz_store::schema::ReduceOutKey::PkPermutation,
             },
             vec![(0, 2, PORT_IN), (1, 2, PORT_TRACE)],
         ),
@@ -248,7 +248,7 @@ fn port_set_violations_fail_at_load() {
 
 #[test]
 fn test_circuit_range_join_n_eq_discriminator() {
-    use crate::schema::ReduceOutKey;
+    use gnitz_store::schema::ReduceOutKey;
     use gnitz_wire::{AggFunc, JoinKind, MapKind, OpNode};
 
     // A GROUP BY view: ScanDelta → Map(reindex) → ExchangeShard → Reduce →

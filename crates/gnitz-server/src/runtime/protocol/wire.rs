@@ -2,8 +2,8 @@
 
 use std::rc::Rc;
 
-use gnitz_engine::schema::{decode_schema_block, SchemaDescriptor};
-use gnitz_engine::storage::{Batch, Layout, MemBatch, MAX_BATCH_REGIONS};
+use gnitz_store::schema::{decode_schema_block, SchemaDescriptor};
+use gnitz_store::storage::{Batch, Layout, MemBatch, MAX_BATCH_REGIONS};
 use gnitz_wire::control::{peek_control_block, peek_control_block_ipc, DecodedControl};
 use gnitz_wire::{wire_flags_get_schema_version, FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
 
@@ -159,7 +159,7 @@ impl<'a> WireData<'a> {
             WireData::Whole(b) => b.map(|b| b.wire_byte_size()).unwrap_or(0),
             WireData::Range { batch, count, .. } => batch.wire_byte_size_range(count),
             WireData::Scattered { indices, schema, .. } => {
-                gnitz_engine::storage::wire_block_size(schema, indices.len(), 0)
+                gnitz_store::storage::wire_block_size(schema, indices.len(), 0)
             }
         }
     }
@@ -532,7 +532,7 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
     let data_batch = match dblock {
         Some(dblock) => {
             let eff_schema = schema.as_ref().ok_or("no schema for data block")?;
-            Some(gnitz_engine::storage::decode_mem_batch_from_wal_block(
+            Some(gnitz_store::storage::decode_mem_batch_from_wal_block(
                 dblock, eff_schema, offsets,
             )?)
         }

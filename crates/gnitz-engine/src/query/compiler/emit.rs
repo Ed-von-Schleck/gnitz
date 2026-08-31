@@ -2,10 +2,10 @@
 //! constructors, and `build_plan` (one plan, pre or post exchange).
 
 use super::*;
-use crate::expr::PkSource;
-use crate::ops::{merge_schemas_for_join, JoinProbe, RangeProbe};
 use crate::query::vm::{Instr, TableIdx};
-use crate::schema::{DerivedSchema, SchemaColumn};
+use gnitz_store::expr::PkSource;
+use gnitz_store::ops::{merge_schemas_for_join, JoinProbe, RangeProbe};
+use gnitz_store::schema::{DerivedSchema, SchemaColumn};
 
 // ---------------------------------------------------------------------------
 // Derived operator-output schemas
@@ -30,7 +30,7 @@ fn hashrow_output_schema(
     target_tcs: &[u8],
 ) -> Option<SchemaDescriptor> {
     let mut b = DerivedSchema::new();
-    b.push_pk(SchemaColumn::new(crate::schema::type_code::U128, 0))?;
+    b.push_pk(SchemaColumn::new(gnitz_store::schema::type_code::U128, 0))?;
     for (j, &c) in proj_cols.iter().enumerate() {
         let src = in_schema.columns[c as usize];
         let tgt = target_tcs.get(j).copied().unwrap_or(0);
@@ -143,7 +143,7 @@ impl Drop for ScratchGuard {
             // by the next open, and `remove_dir_all` deletes in readdir order — so
             // a crash mid-removal could leave that manifest pointing at shards
             // that are already gone.
-            crate::storage::remove_child(d);
+            gnitz_store::storage::remove_child(d);
         }
     }
 }
@@ -161,7 +161,7 @@ pub(super) struct EmitCtx<'a> {
     /// every worker: the `WorkerFilter` arm emits nothing (the trim would drop
     /// rows this worker legitimately owns a copy of), and `emit_reduce` makes
     /// every worker the owner of the global-aggregate seed.
-    pub placement: crate::schema::Placement,
+    pub placement: gnitz_store::schema::Placement,
     /// Nodes the optimizer elided. A pure function of `loaded` — derived here
     /// rather than threaded in, so no caller can hand a build a skip set that
     /// disagrees with its circuit.
@@ -181,11 +181,11 @@ pub(super) struct EmitCtx<'a> {
 }
 
 impl EmitCtx<'_> {
-    /// Create a child table in a [`crate::storage::ChildAddr::Scratch`]
+    /// Create a child table in a [`gnitz_store::storage::ChildAddr::Scratch`]
     /// subdirectory of the view's directory, tracked by the scratch guard (so a
     /// later compile failure removes it).
     fn create_child_table(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<Table, CompileError> {
-        let child_dir = crate::storage::ChildAddr::Scratch {
+        let child_dir = gnitz_store::storage::ChildAddr::Scratch {
             child: child_name,
             rank: worker_rank(),
         }
@@ -512,7 +512,7 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, reg_id: u16, mk: &gnitz_wire::MapKind) 
             // schema reads the promoters the per-row pack writes through, so the
             // reindexed `_join_pk` and the delta scatter co-partition by
             // construction. Same packer the exchange scatter builds from `ViewMeta`.
-            let packer = crate::schema::key::ReindexPacker::new(&in_reg_schema, reindex_cols, reindex_target_tcs)
+            let packer = gnitz_store::schema::key::ReindexPacker::new(&in_reg_schema, reindex_cols, reindex_target_tcs)
                 .ok_or(CompileError::Rejected("map: invalid reindex key"))?;
             let node_schema = packer
                 .output_schema(&in_reg_schema, keep)
@@ -594,7 +594,7 @@ pub(super) fn emit_reduce(
     group_cols: &[u32],
     agg: &[(gnitz_wire::AggFunc, u32)],
     global_ground: bool,
-    out_key: crate::schema::ReduceOutKey,
+    out_key: gnitz_store::schema::ReduceOutKey,
 ) -> Result<(), CompileError> {
     let loaded = ctx.loaded;
     let in_reg_id = ctx.unary_in(nid)?;
@@ -641,7 +641,7 @@ pub(super) fn emit_reduce(
     // SQL binder — which the low-level CircuitBuilder path bypasses — is not the
     // only thing that must reject an unaggregatable column type. `ReducePlan::new`
     // owns both, so a bad circuit fails the compile instead of aborting a worker.
-    let plan = crate::ops::ReducePlan::new(
+    let plan = gnitz_store::ops::ReducePlan::new(
         &in_reg_schema,
         group_cols,
         &agg_descs,
@@ -692,7 +692,7 @@ pub(super) fn build_plan(
     ordered: &[i32],
     ext_tables: &dyn SchemaSource,
     site: super::ViewSite<'_>,
-    placement: crate::schema::Placement,
+    placement: gnitz_store::schema::Placement,
     target: PlanTarget,
 ) -> Result<PlanBuildResult, CompileError> {
     let exchange_inputs: &[(i32, SchemaDescriptor)] = match target {

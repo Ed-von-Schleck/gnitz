@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_engine_testkit::SharedRegion;
+use crate::runtime::test_support::SharedRegion;
 
 // -- futex primitives ----------------------------------------------------
 

@@ -1,41 +1,25 @@
-//! Registering a mirrored view in the local catalog — the worker's own
-//! registration path.
+//! Registering a mirrored view in the local registry.
 //!
-//! The store must hold the relation under the **server's** `table_id`: the SQL
-//! layer resolves a name to a server-assigned id and the read seam is
-//! `scan_spec(table_id, …)`. A local `CatalogEngine` allocates its own ids from
-//! `FIRST_USER_TABLE_ID`, so the store needs a way to own an id it did not
-//! allocate — and that is exactly a worker's situation. A worker never allocates
-//! either: the master does, and every worker learns relations through
-//! `ddl_sync`, whose `table_id` argument is the *system-table family*, so the
-//! user relation's own id travels inside the rows where nothing constrains it to
-//! a locally-allocated value.
+//! The store holds each relation under the **server's** `table_id` — the read
+//! seam is `scan_spec(table_id, …)` — and allocates no id of its own, so there
+//! is nothing for a server-assigned one to collide with.
 //!
-//! No `IDX_TAB` row is ever written: only a base table may own an index, and the
-//! registration guard refuses a view owner wherever it arrives. So the store
-//! holds no index and can never be handed the `IndexRange { exact: true }` bound
-//! whose conjunct-stripping contract would make a missing index a correctness
-//! fault rather than a slowdown.
-//!
-//! Nor are any circuit rows written, and that is what keeps the compile path
-//! unreachable: the copy is fed by direct ingest of drained deltas and never by
-//! evaluating a circuit, and `capacity_bytes = 0` means no store here ever holds
-//! a skeleton row, so nothing can ask it to hydrate.
+//! **No copy holds a skeleton row and none owns an index**, structurally:
+//! [`spec_for`] carries neither a capacity budget nor an index. That is what
+//! keeps the DBSP layer unreachable, and what stops an `IndexRange { exact:
+//! true }` bound from ever meeting a store with no index to answer it.
 
 use std::sync::Arc;
 
-use gnitz_core::{qualified_name, Invalidate, MirrorError, Schema};
-use gnitz_engine::catalog::SysFamily;
-use gnitz_engine::schema::{make_delta_schema, SchemaDescriptor};
-use gnitz_engine::storage::BatchBuilder;
-use gnitz_wire::sys_rows::{write_col_tab_row, write_schema_tab_row, write_view_tab_row};
-use gnitz_wire::sys_rows::{SchemaTabRow, ViewTabRow};
-use gnitz_wire::OWNER_KIND_VIEW;
+use gnitz_core::{Invalidate, MirrorError, Schema};
+use gnitz_store::relation::{relation_dir, RelationKind, RelationSpec, ViewBudgets};
+use gnitz_store::schema::{make_delta_schema, SchemaDescriptor};
 
 use crate::handle::{Mirror, Shapes};
+use crate::state::MirrorRecord;
 
 impl Mirror {
-    /// Reconcile the local catalog against `tid`'s upstream layout and leave the
+    /// Reconcile the local registry against `tid`'s upstream layout and leave the
     /// shapes the copy is read and written under. Returns the ids retracted.
     ///
     /// Keyed by **id**, not by name: the id is what the copy is stored under and
@@ -47,39 +31,51 @@ impl Mirror {
     pub(crate) fn register_inner(
         &mut self,
         tid: u64,
-        schema_id: u64,
         schema_name: &str,
         name: &str,
         schema: &Schema,
     ) -> Result<Vec<u64>, MirrorError> {
-        let want_desc = descriptor_of(schema)?;
+        let block = gnitz_core::protocol::codec::encode_schema_block(schema, 0);
+        let want_desc = descriptor_of_block(&block)?;
         let mut retracted = Vec::new();
 
         if !self
-            .engine
+            .registry
             .get_schema_desc(tid as i64)
             .is_some_and(|desc| desc == want_desc)
         {
-            // Retract whatever the local catalog holds at this id, and — the
+            // Retract whatever the registry holds at this id, and — the
             // dropped-and-recreated case — whatever it holds under this name at
-            // some other id. Then register fresh. Each goes down the whole
-            // ladder, so the cursor drop is inherited rather than restated.
+            // some other id. Each goes down the whole ladder, so the cursor drop
+            // is inherited rather than restated. The scan is linear over a map
+            // whose size is the number of views one host mirrors, once per
+            // `mirror_view`.
             let renamed = self
-                .engine
-                .entity_id_by_qname(&qualified_name(schema_name, name))
-                .map(|t| t as u64)
-                .filter(|&t| t != tid);
+                .records
+                .iter()
+                .find(|(&t, r)| t != tid && r.schema_name == schema_name && r.name == name)
+                .map(|(&t, _)| t);
             for old in std::iter::once(tid).chain(renamed) {
-                if !self.engine.has_id(old as i64) {
+                if !self.registry.has_id(old as i64) {
                     continue;
                 }
                 self.invalidate_inner(old, Invalidate::Registration)?;
                 retracted.push(old);
             }
-            self.register_locally(schema_name, name, tid, schema_id, schema)?;
+            self.enter(
+                tid,
+                MirrorRecord {
+                    schema_name: schema_name.to_string(),
+                    name: name.to_string(),
+                    block,
+                },
+                want_desc,
+            )?;
         }
 
-        let view_desc = self.engine.schema_or_err(tid as i64, "mirror registration")?;
+        // Either the registry already held `want_desc` or `enter` just registered
+        // it, so it is the stamped shape on both arms.
+        let view_desc = want_desc;
         let delta_desc = make_delta_schema(&view_desc).ok_or_else(|| {
             MirrorError::Engine(format!(
                 "view '{schema_name}.{name}' cannot carry a delta feed: the stamped shape \
@@ -96,87 +92,39 @@ impl Mirror {
         );
         Ok(retracted)
     }
+}
 
-    /// Write the catalog rows a mirrored view needs, in registration order.
-    fn register_locally(
-        &mut self,
-        schema_name: &str,
-        name: &str,
-        tid: u64,
-        schema_id: u64,
-        schema: &Schema,
-    ) -> Result<(), MirrorError> {
-        // One SCHEMA_TAB row per schema, not per view: the row is shared by every
-        // view mirrored out of it, and the local catalog runs no PK-uniqueness
-        // enforcement on a system family, so a second `+1` would stack a weight
-        // rather than be absorbed — and the retraction of one view would then
-        // leave the others' schema row behind at the wrong weight. `public` is
-        // already there from the local bootstrap.
-        let mut schema_b = BatchBuilder::new(SysFamily::Schema.schema());
-        if self.engine.schema_id(schema_name).is_none() {
-            write_schema_tab_row(
-                &mut schema_b,
-                &SchemaTabRow {
-                    schema_id,
-                    name: schema_name,
-                },
-                1,
-            );
-        }
-
-        // Through `ColumnDef::col_tab_row`, the same mapping the upstream client
-        // registers a view's columns with — including `is_hidden`, which a view's
-        // synthetic PK carries and whose loss would leave the local schema a
-        // column narrower than the store it keys.
-        let mut col_b = BatchBuilder::new(SysFamily::Column.schema());
-        for (ci, cd) in schema.columns.iter().enumerate() {
-            write_col_tab_row(&mut col_b, &cd.col_tab_row(tid, OWNER_KIND_VIEW, ci), 1)?;
-        }
-
-        let pk_cols: Vec<u32> = schema.pk_indices().iter().map(|&i| i as u32).collect();
-        let mut view_b = BatchBuilder::new(SysFamily::View.schema());
-        write_view_tab_row(
-            &mut view_b,
-            &ViewTabRow {
-                view_id: tid,
-                schema_id,
-                name,
-                // Nothing local re-plans the view; the definition lives upstream.
-                sql_definition: "",
-                pk_col_idx: gnitz_wire::pack_pk_cols(&pk_cols),
-                // The copy holds no skeleton rows, so nothing can ask it to
-                // hydrate — which is what keeps the compile path unreachable.
-                capacity_bytes: 0,
-                // The store maintains no feed of its own.
-                delta_bytes: 0,
-            },
-            1,
-        );
-
-        // Ascending topo priority, and the order is a correctness requirement: the
-        // relation register hook reads its columns back through `sys_columns`
-        // storage rather than the cache, so a VIEW_TAB row applied before the
-        // COL_TAB rows registers a view whose schema build finds no columns.
-        // Nothing sorts for this caller — it calls `ddl_sync` directly.
-        let families = [
-            (SysFamily::Schema, schema_b.finish()),
-            (SysFamily::Column, col_b.finish()),
-            (SysFamily::View, view_b.finish()),
-        ];
-        for (family, batch) in families {
-            if batch.count > 0 {
-                self.engine.ddl_sync(family.id(), batch)?;
-            }
-        }
-        Ok(())
+/// The registration one copy is opened under.
+///
+/// **The kind stays `View`, and changing it breaks persistence.** That is what
+/// maps to `RecoverySource::Rederive`, and a rederived store folds to RAM and
+/// publishes no manifest on a `Base` round — so the ephemeral round is the only
+/// one that publishes a copy, and it is the only round a mirror runs. A copy
+/// relabelled as a held relation would silently stop being persisted.
+pub(crate) fn spec_for(copies_root: &str, tid: u64, schema_name: &str, schema: SchemaDescriptor) -> RelationSpec {
+    RelationSpec {
+        id: tid as i64,
+        kind: RelationKind::View,
+        schema,
+        directory: relation_dir(copies_root, schema_name, RelationKind::View, tid as i64),
+        // A copy scans nothing, so it is at the bottom of no chain. Depth only
+        // orders a backfill, which a mirror never runs.
+        depth: 0,
+        // No skeleton row is ever written, so nothing can ask this store to
+        // hydrate; and the store maintains no feed of its own.
+        budgets: ViewBudgets::default(),
     }
 }
 
-/// The engine descriptor a client `Schema` denotes, through the shared wire
-/// codec in both directions — so neither end is a second spelling of the block's
-/// rules.
-pub(crate) fn descriptor_of(schema: &Schema) -> Result<SchemaDescriptor, MirrorError> {
-    let block = gnitz_core::protocol::codec::encode_schema_block(schema, 0);
-    gnitz_engine::schema::decode_schema_block(&block, false)
+/// The engine descriptor a wire schema block denotes, through the shared codec —
+/// so neither end is a second spelling of the block's rules.
+pub(crate) fn descriptor_of_block(block: &[u8]) -> Result<SchemaDescriptor, MirrorError> {
+    gnitz_store::schema::decode_schema_block(block, false)
         .map_err(|e| MirrorError::Engine(format!("mirror: schema block: {e}")))
+}
+
+/// [`descriptor_of_block`] over a client `Schema`, through the same encoder the
+/// registration records.
+pub(crate) fn descriptor_of(schema: &Schema) -> Result<SchemaDescriptor, MirrorError> {
+    descriptor_of_block(&gnitz_core::protocol::codec::encode_schema_block(schema, 0))
 }

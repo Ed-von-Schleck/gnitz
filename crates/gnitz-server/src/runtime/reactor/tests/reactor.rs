@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use gnitz_engine::schema::SchemaDescriptor;
+use gnitz_store::schema::SchemaDescriptor;
 
 use super::test_support::*;
 use super::*;

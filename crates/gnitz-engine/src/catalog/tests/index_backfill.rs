@@ -2,7 +2,7 @@
 //! each projected batch.
 
 use super::*;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use gnitz_store::schema::{type_code, SchemaColumn, SchemaDescriptor};
 
 /// Build a projected-index batch whose PK region is each supplied span
 /// (here the whole index PK; the dedup keys on the leading `key_size`).

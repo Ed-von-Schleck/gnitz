@@ -8,6 +8,7 @@ members = [
     "gnitz-tokio",
     "gnitz-py",
     "gnitz-engine",
+    "gnitz-store",
     "gnitz-mirror",
     "gnitz-server",
     "gnitz-engine-testkit",
@@ -21,12 +22,12 @@ members = [
 panic = "abort"
 # Fat LTO so hot paths inline across crate/module boundaries — e.g. the
 # `repr::scatter` kernels calling `DirectWriter` in a sibling module, and the
-# operator layer calling into storage. Since `runtime` moved to `gnitz-server`
-# it also spans the engine/server seam, where what it buys is per-request and
-# per-frame, not per-row: the row kernels run inside the engine, driven by one
-# call per batch. What crosses is batch/send-buffer drop glue and the catalog
-# and DAG accessors, so trimming this costs a call per frame and per request,
-# not per row.
+# operator layer calling into storage. Those all live inside `gnitz-store`; what
+# LTO adds on top is the store/engine and engine/server seams, where it buys
+# per-request and per-frame work, not per-row: the row kernels run below both
+# seams, driven by one call per batch. What crosses is batch/send-buffer drop
+# glue and the catalog and DAG accessors, so trimming this costs a call per
+# frame and per request, not per row.
 lto = true
 
 [profile.release-checked]
@@ -54,7 +55,7 @@ panic = "unwind"
 # `overflow-checks` are independent of `opt-level` and stay on.
 #
 # It does not reach across the crate boundary: `ColumnLocator` and `MorselOut`
-# are called per row from gnitz-engine, which is still opt-level 0, so those
+# are called per row from gnitz-store, which is still opt-level 0, so those
 # methods keep their `#[inline(always)]`.
 [profile.dev.package.gnitz-expr]
 opt-level = 1

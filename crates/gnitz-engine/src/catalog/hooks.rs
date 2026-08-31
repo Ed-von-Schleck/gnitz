@@ -1,13 +1,8 @@
 use super::*;
 
-use crate::foundation::fault::Seam;
-use crate::schema::make_index_schema;
+use gnitz_store::schema::make_index_schema;
 use gnitz_wire::{SCHEMATAB_PAY_NAME, SEQTAB_PAY_VALUE};
 use rustc_hash::FxHashMap;
-
-/// `GNITZ_INJECT_TABLE_CREATE_DELAY_MS`: stall a user table's create between its
-/// directory and its child subdir, so a concurrent DROP races it.
-static TABLE_CREATE_DELAY: Seam = Seam::new("GNITZ_INJECT_TABLE_CREATE_DELAY_MS");
 
 /// What `register_relation` needs to build and register one relation: the
 /// values decoded off its TABLE_TAB / VIEW_TAB row, plus the placement and
@@ -22,7 +17,7 @@ struct RelationRegistration {
     depth: i32,
     /// The `WITH (…)` byte budgets; both `None` for a base table and for a plain
     /// view.
-    budgets: crate::query::ViewBudgets,
+    budgets: gnitz_store::relation::ViewBudgets,
 }
 
 impl CatalogEngine {
@@ -149,119 +144,6 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Build this process's store for a top-level relation: one `Table` under
-    /// `w{rank}of{num_workers}`. Recovery is derived from `kind`, so a relation
-    /// cannot be (e.g.) ephemeral but SAL-replayed. Only user relations are built
-    /// here — system catalog tables are plain single `Table`s built at bootstrap.
-    ///
-    /// The child is homed at THIS process's own worker rank, so a live CREATE on
-    /// each worker post-fork builds a distinct dir directly. The post-fork master
-    /// owns no store at all: it registers the relation `Detached` so it and
-    /// worker 0 do not both hold a live `Table` on `w0of{W}`. Both storeless cases
-    /// are decided here rather than at the callers, so a new caller cannot build a
-    /// `Table` for one of them.
-    ///
-    /// A fed view's **delta store** is opened here too, and returned with the
-    /// relation's own: every path that opens a relation's store comes through
-    /// here, so a feed cannot come back missing from a rehome or a rebuild — the
-    /// same reason the capacity is stamped here.
-    ///
-    /// Creates `directory` when the kind owns a store. Crash-cleanup of it is the
-    /// caller's: only the caller knows whether *this* call is what created it.
-    pub(crate) fn build_relation_store(
-        &self,
-        kind: RelationKind,
-        directory: &str,
-        id: i64,
-        schema: SchemaDescriptor,
-        budgets: crate::query::ViewBudgets,
-    ) -> Result<RelationStores, String> {
-        // Above every early return below, so it runs on **every** process: the
-        // post-fork master opens no user store at all, and a limit first noticed
-        // on a worker would be a fatal abort taken after the client was told the
-        // CREATE succeeded.
-        let delta = budgets
-            .delta_bytes
-            .map(|budget| {
-                crate::schema::make_delta_schema(&schema)
-                    .map(|delta_schema| (budget, delta_schema))
-                    .ok_or_else(|| format!("view {id} has too many columns to carry a delta feed"))
-            })
-            .transpose()?;
-
-        // Above `ensure_dir`: a storeless kind owns no store in any process, so no
-        // directory is created for one.
-        let recovery = match kind {
-            RelationKind::Stream => {
-                return Ok(RelationStores {
-                    handle: StoreHandle::Detached,
-                    delta: None,
-                })
-            }
-            // A view's output store and its operator traces resume from the
-            // manifest the ephemeral checkpoint round stamped, or are rebuilt.
-            RelationKind::View => self.rederive_source(),
-            RelationKind::SystemCatalog | RelationKind::BaseTable => RecoverySource::SalReplay,
-        };
-        ensure_dir(directory)?;
-        if !self.owns_stores {
-            return Ok(RelationStores {
-                handle: StoreHandle::Detached,
-                delta: None,
-            });
-        }
-
-        // Widen the window where the table dir exists but its child subdir does
-        // not, so a concurrent master remove_dir_all (DROP) deterministically
-        // races this create. User tables only.
-        if kind.is_base_table() {
-            if let Some(ms) = TABLE_CREATE_DELAY.count() {
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-            }
-        }
-
-        let child = ChildAddr::this_worker(self.num_workers);
-        let mut table = Table::new(&child.dir(directory), schema, id as u32, recovery)
-            .map_err(|e| format!("Failed to open relation {id}: error {e} (dir={directory})"))?;
-        // Every store this worker opens for a relation comes through here, so a
-        // bounded view cannot come back unbounded from a rehome or a rebuild.
-        table.set_capacity(budgets.capacity_bytes);
-        Ok(RelationStores {
-            handle: StoreHandle::Owned(std::cell::UnsafeCell::new(Box::new(table))),
-            delta: delta
-                .map(|(budget, s)| Self::build_delta_store(directory, id, s, budget))
-                .transpose()?,
-        })
-    }
-
-    /// This worker's delta store for a fed view, under `delta_w{rank}` of the
-    /// view's own directory.
-    ///
-    /// Erased at open — `Rederive { resume_at: None }` — deliberately: no delta
-    /// expresses what a boot does to a view over a stream or to an invalidated
-    /// view, and a restart mints a fresh boot nonce, so every cursor a client
-    /// holds stops matching and it re-reads at `after_tick = 0`.
-    fn build_delta_store(
-        directory: &str,
-        id: i64,
-        delta_schema: SchemaDescriptor,
-        budget: u64,
-    ) -> Result<Box<DeltaFeed>, String> {
-        let child = ChildAddr::delta_for_this_worker();
-        let mut table = Table::new(
-            &child.dir(directory),
-            delta_schema,
-            id as u32,
-            RecoverySource::Rederive { resume_at: None },
-        )
-        .map_err(|e| format!("Failed to open delta store of view {id}: error {e} (dir={directory})"))?;
-        table.set_delta_budget(budget);
-        Ok(Box::new(DeltaFeed {
-            schema: delta_schema,
-            handle: StoreHandle::Owned(std::cell::UnsafeCell::new(Box::new(table))),
-        }))
-    }
-
     /// Build a relation's store and enter it in the registry — the `+1` half of
     /// [`hook_relation_register`](Self::hook_relation_register), over the values
     /// its per-family builder decoded.
@@ -288,28 +170,24 @@ impl CatalogEngine {
             directory,
             name,
             id,
-            self.num_workers
+            self.registry.num_workers()
         );
         // Bound to this open because it needs the previous child set, which the
         // open would shadow and `reconcile_child_dirs` then deletes. Views are
         // exempt: a worker-count change invalidates every one, so
         // `rebuild_invalid_views` refills them from base.
         if self.ctx.mode() == ApplyMode::Replay && kind.is_base_table() {
-            crate::storage::repartition_relation(&directory, &schema, id as u32, self.num_workers)?;
+            gnitz_store::storage::repartition_relation(&directory, &schema, id as u32, self.registry.num_workers())?;
         }
-        let is_new_dir = !std::path::Path::new(&directory).exists();
-        let handle = self.with_staged_dir(&directory, |s| {
-            s.build_relation_store(kind, &directory, id, schema, budgets)
-        })?;
-        // Only a `mkdir` this call made needs the schema dir fsynced; a reopen
-        // adds no entry, and a storeless kind creates no directory at all.
-        if is_new_dir && kind.owns_store() {
-            let _ = fsync_dir(&schema_dir(&self.base_dir, &schema_name));
-        }
-        self.dag.register_table(
+        // `register` owns the staged-directory reclaim and the parent fsync.
+        self.registry.register(RelationSpec {
             id,
-            crate::query::TableEntry::new(handle, schema, kind, depth, directory, budgets),
-        );
+            kind,
+            schema,
+            directory,
+            depth,
+            budgets,
+        })?;
         raise_id_counter(&mut self.next_table_id, id);
         Ok(())
     }
@@ -323,11 +201,12 @@ impl CatalogEngine {
     /// `apply_index_caches` / `invalidate_col_names` bumps would otherwise
     /// `or_insert` them straight back.
     fn drop_relation(&mut self, id: i64, cascade: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
-        let Some(directory) = self.dag.tables.get(&id).map(|e| e.directory.clone()) else {
+        let Some(directory) = self.registry.entry(id).map(|e| e.directory.clone()) else {
             return Ok(());
         };
         cascade(self)?;
-        self.dag.unregister_table(id);
+        let CatalogEngine { registry, dag, .. } = self;
+        dag.unregister_table(registry, id);
         self.pending_dir_deletions.push(directory);
         self.caches.purge_schema_version(id);
         Ok(())
@@ -355,7 +234,7 @@ impl CatalogEngine {
                 // finds the id already registered. Skip to avoid double-register.
                 // A `+1` whose net folds to dead (a create cancelled within its
                 // own bundle) registers nothing.
-                if !net_live || self.dag.tables.contains_key(&id) {
+                if !net_live || self.registry.has_id(id) {
                     continue;
                 }
                 let reg = if family == SysFamily::Table {
@@ -424,7 +303,7 @@ impl CatalogEngine {
             pk,
             placement,
             depth: 0,
-            budgets: crate::query::ViewBudgets::default(),
+            budgets: gnitz_store::relation::ViewBudgets::default(),
         })
     }
 
@@ -444,7 +323,8 @@ impl CatalogEngine {
         // Stamping the fold is what makes placement transitive:
         // `relation_row_order` registers this view after its sources, so a view
         // over it reads the answer back off one value.
-        let (placement, depth) = self.dag.view_placement(vid, &source_ids, pk.as_slice().len());
+        let CatalogEngine { registry, dag, .. } = self;
+        let (placement, depth) = dag.view_placement(registry, vid, &source_ids, pk.as_slice().len());
         Ok(RelationRegistration {
             kind: RelationKind::View,
             id: vid,
@@ -520,9 +400,9 @@ impl CatalogEngine {
     /// `ddl_sync` and SAL-replay paths — which bypass precheck entirely — act on
     /// exactly what the master admitted.
     pub(super) fn is_trailing_col_append(&self, owner_id: i64, col_idx: u64) -> bool {
-        self.dag
-            .tables
-            .get(&owner_id)
+        self.registry
+            .table_entry(owner_id)
+            .ok()
             .is_some_and(|e| col_idx as usize == e.schema.num_columns())
     }
 
@@ -550,9 +430,9 @@ impl CatalogEngine {
                 continue;
             }
             let Some(cur) = self
-                .dag
-                .tables
-                .get(&owner)
+                .registry
+                .table_entry(owner)
+                .ok()
                 .filter(|e| e.kind.is_base_table())
                 .map(|e| e.schema)
             else {
@@ -567,7 +447,8 @@ impl CatalogEngine {
             let rebuilt = build_schema_from_col_defs(&col_defs, cur.pk_indices(), cur.placement())
                 .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
             if rebuilt != cur {
-                self.dag.swap_table_schema(owner, rebuilt)?;
+                let CatalogEngine { registry, dag, .. } = self;
+                dag.swap_table_schema(registry, owner, rebuilt)?;
             }
         }
         Ok(())
@@ -649,20 +530,23 @@ impl CatalogEngine {
         let cols = *cols;
 
         // A failed CREATE INDEX must leave nothing on disk: the stage removes
-        // `idx_dir` recursively, child subdirs included.
-        self.with_staged_dir(&idx_dir, |s| {
-            let mut idx_table_box = Box::new(s.new_index_table(&idx_dir, idx_id, idx_schema)?);
+        // `idx_dir` recursively, child subdirs included. The stage is a local,
+        // not an entry in `pending_dir_deletions`, so that queue keeps one
+        // meaning — directories of *dropped* entities, which a rollback must
+        // therefore keep.
+        staged_dir(&idx_dir, || {
+            let mut idx_table_box = Box::new(self.new_index_table(&idx_dir, idx_id, idx_schema)?);
             let idx_table_ptr = &mut *idx_table_box as *mut Table;
             // The master never populates its index copies (they stay permanently
             // empty; distributed HAS_PK/seek probes union the workers' slice-local
             // copies). Workers and standalone backfill from their local base slice
             // — unless the table just resumed from a checkpointed manifest, which
             // already holds those rows.
-            if !s.ctx.in_rollback()
-                && !crate::foundation::worker_ctx::is_master()
+            if !self.ctx.in_rollback()
+                && !gnitz_store::foundation::worker_ctx::is_master()
                 && !idx_table_box.resumed_from_checkpoint()
             {
-                s.backfill_index(
+                self.backfill_index(
                     owner_id,
                     &owner_schema,
                     cols.as_slice(),
@@ -671,10 +555,10 @@ impl CatalogEngine {
                     // Re-checked on a first apply only, exactly as in
                     // `promote_index_to_unique`: replayed and compensated data
                     // passed its check when originally written.
-                    is_unique && s.ctx.mode() == ApplyMode::Live,
+                    is_unique && self.ctx.mode() == ApplyMode::Live,
                 )?;
             }
-            s.dag
+            self.registry
                 .add_index_circuit(owner_id, cols.as_slice(), idx_id, idx_table_box, idx_schema, is_unique);
             Ok(())
         })
@@ -692,7 +576,8 @@ impl CatalogEngine {
         if let Some(remains_unique) = remains {
             // Another index (e.g. the FK auto-index) still covers this column
             // list. Demote the circuit rather than destroying it.
-            self.dag.set_index_circuit_uniqueness(owner_id, cols, remains_unique);
+            self.registry
+                .set_index_circuit_uniqueness(owner_id, cols, remains_unique);
             return;
         }
         // No index remains on the column list — drop the circuit. The directory
@@ -700,12 +585,12 @@ impl CatalogEngine {
         // index promoted an incumbent circuit, the real directory on disk carries
         // the first registrant's id.
         let creating = self
-            .dag
-            .tables
-            .get(&owner_id)
+            .registry
+            .table_entry(owner_id)
+            .ok()
             .and_then(|e| e.index_circuit_on(cols).map(|ic| (e.directory.clone(), ic.index_id)));
         if let Some((owner_dir, creating_idx_id)) = creating {
-            self.dag.remove_index_circuit(owner_id, cols);
+            self.registry.remove_index_circuit(owner_id, cols);
             self.pending_dir_deletions.push(index_dir(&owner_dir, creating_idx_id));
         }
     }

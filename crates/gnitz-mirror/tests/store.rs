@@ -11,12 +11,12 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
 use gnitz_core::{ColumnDef, DeltaCursor, Invalidate, MirrorStore, RawBlock, Schema, Shape, StoreRead, TypeCode};
-use gnitz_engine::schema::make_delta_schema;
-use gnitz_engine::storage::Batch;
 use gnitz_engine_testkit::{
     assert_child_ok, in_child_test, make_batch, make_schema_u64_i64, run_test_in_child, scratch_dir, CHILD_OK,
 };
 use gnitz_mirror::Mirror;
+use gnitz_store::schema::make_delta_schema;
+use gnitz_store::storage::Batch;
 
 /// Every test in this binary takes this lock: `cargo test` runs a target's tests
 /// as threads of one process, and a store open touches process-wide state — the
@@ -31,7 +31,6 @@ fn serial() -> MutexGuard<'static, ()> {
 const SCHEMA: &str = "s";
 const TID: u64 = gnitz_wire::FIRST_USER_TABLE_ID;
 const OTHER_TID: u64 = gnitz_wire::FIRST_USER_TABLE_ID + 1;
-const SID: u64 = gnitz_wire::FIRST_USER_SCHEMA_ID;
 
 /// The client-side shape every copy here is registered under: a `U64` PK and one
 /// `I64` payload — the same layout [`make_schema_u64_i64`] describes on the
@@ -78,7 +77,7 @@ fn registered(name: &str) -> (Mirror, String) {
     let dir = scratch_dir("mirror_store", name);
     let mut store = Mirror::open(&dir).expect("a fresh store opens");
     let retracted = store
-        .register(TID, SID, SCHEMA, "v", &view_schema())
+        .register(TID, SCHEMA, "v", &view_schema())
         .expect("a first registration");
     assert!(retracted.is_empty(), "a first registration retracts nothing");
     (store, dir)
@@ -116,13 +115,8 @@ fn a_registration_stands_and_a_moved_name_retracts_the_incumbent() {
     let _g = serial();
     let (mut store, _dir) = registered("registration");
 
-    assert_eq!(
-        store.schema_id(SCHEMA),
-        Some(SID),
-        "the schema row the registration wrote is what a later one reads back",
-    );
     let again = store
-        .register(TID, SID, SCHEMA, "v", &view_schema())
+        .register(TID, SCHEMA, "v", &view_schema())
         .expect("a second registration");
     assert!(
         again.is_empty(),
@@ -133,7 +127,7 @@ fn a_registration_stands_and_a_moved_name_retracts_the_incumbent() {
         .ingest(TID, plain(&[(1, 1, 10)]), Shape::Plain, cursor(4))
         .unwrap();
     let moved = store
-        .register(OTHER_TID, SID, SCHEMA, "v", &view_schema())
+        .register(OTHER_TID, SCHEMA, "v", &view_schema())
         .expect("the name moves to a fresh id");
     assert_eq!(moved, vec![TID], "the incumbent under that name is reported retracted");
     assert_eq!(
@@ -190,7 +184,7 @@ fn the_invalidate_ladder_stops_where_it_is_asked() {
         .invalidate(TID, Invalidate::Registration)
         .expect("an id the catalog does not hold tears down to Ok");
     store
-        .register(TID, SID, SCHEMA, "v", &view_schema())
+        .register(TID, SCHEMA, "v", &view_schema())
         .expect("the id can be registered again");
 }
 
@@ -257,8 +251,8 @@ fn a_checkpoint_covers_a_cursor_this_session_never_claimed() {
     let dir = scratch_dir("mirror_store", "unclaimed");
     {
         let mut store = Mirror::open(&dir).expect("a fresh store");
-        store.register(TID, SID, SCHEMA, "v", &view_schema()).unwrap();
-        store.register(OTHER_TID, SID, SCHEMA, "w", &view_schema()).unwrap();
+        store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
+        store.register(OTHER_TID, SCHEMA, "w", &view_schema()).unwrap();
         store
             .ingest(TID, plain(&[(1, 1, 10)]), Shape::Plain, cursor(4))
             .unwrap();
@@ -274,7 +268,7 @@ fn a_checkpoint_covers_a_cursor_this_session_never_claimed() {
             store.cursor_of(TID).is_some() && store.cursor_of(OTHER_TID).is_some(),
             "both positions came back",
         );
-        store.register(TID, SID, SCHEMA, "v", &view_schema()).unwrap();
+        store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
         store.checkpoint().unwrap();
     }
 
@@ -284,7 +278,7 @@ fn a_checkpoint_covers_a_cursor_this_session_never_claimed() {
         Some(cursor(4)),
         "the unclaimed copy's position survived the checkpoint that republished it",
     );
-    store.register(OTHER_TID, SID, SCHEMA, "w", &view_schema()).unwrap();
+    store.register(OTHER_TID, SCHEMA, "w", &view_schema()).unwrap();
     assert_eq!(held(&mut store, OTHER_TID).unwrap(), BTreeMap::from([(9, 1)]));
 }
 
@@ -317,7 +311,7 @@ fn failed_copy_teardown_child() {
     let dir = scratch_dir("mirror_store", "failed_copy_teardown");
     {
         let mut store = Mirror::open(&dir).expect("a fresh store");
-        store.register(TID, SID, SCHEMA, "v", &view_schema()).unwrap();
+        store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
         store
             .ingest(TID, plain(&[(1, 1, 10)]), Shape::Plain, cursor(4))
             .unwrap();
@@ -374,7 +368,7 @@ fn auto_checkpoint_failure_child() {
     }
     let dir = scratch_dir("mirror_store", "auto_checkpoint_failure");
     let mut store = Mirror::open(&dir).expect("a fresh store");
-    store.register(TID, SID, SCHEMA, "v", &view_schema()).unwrap();
+    store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
 
     store
         .ingest(TID, plain(&[(1, 1, 10), (2, 1, 20)]), Shape::Plain, cursor(4))

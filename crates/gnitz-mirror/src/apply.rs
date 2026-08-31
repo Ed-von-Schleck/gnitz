@@ -1,8 +1,8 @@
 //! Applying a delta to a copy.
 
 use gnitz_core::{MirrorError, RawBlock, Shape};
-use gnitz_engine::foundation::fault::Seam;
-use gnitz_engine::storage::Batch;
+use gnitz_store::foundation::fault::Seam;
+use gnitz_store::storage::Batch;
 
 use crate::handle::Mirror;
 
@@ -55,7 +55,7 @@ impl Mirror {
             if batch.count == 0 {
                 continue;
             }
-            self.engine
+            self.registry
                 .ingest_returning_effective(table_id as i64, batch)
                 .map_err(|e| self.poison(format!("applying a delta to {table_id} failed: {e}")))?;
         }

@@ -17,7 +17,7 @@ use std::rc::Rc;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use gnitz_engine::catalog::CatalogEngine;
-use gnitz_engine::schema::{IndexKeySpec, SchemaDescriptor};
+use gnitz_store::schema::{IndexKeySpec, SchemaDescriptor};
 use gnitz_wire::{payload_native_key, pk_native_key};
 use gnitz_wire::{PkColList, SpecBytes};
 
@@ -30,10 +30,10 @@ use crate::runtime::wire::{
     BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP, FLAG_SCAN_LAST,
 };
 use exchange::PendingRelay;
-use gnitz_engine::ops::{op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode};
 use gnitz_engine::query::RelayRoute;
-use gnitz_engine::schema::key::PkBuf;
-use gnitz_engine::storage::Batch;
+use gnitz_store::ops::{op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode};
+use gnitz_store::schema::key::PkBuf;
+use gnitz_store::storage::Batch;
 use gnitz_wire::control::peek_control_block_ipc;
 use gnitz_wire::{
     wire_flags_set_conflict_mode, WireConflictMode, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_HAS_DATA, FLAG_HAS_SCHEMA,
@@ -262,7 +262,7 @@ pub(crate) enum Fanout {
 /// The single owner of the replicated→single-source routing policy for
 /// `dispatch_scan_fanout` callers.
 pub(crate) fn replicated_unicast(disp: &MasterDispatcher, target_id: i64) -> Fanout {
-    if disp.cat().dag().relation_is_replicated(target_id) {
+    if disp.cat().registry().relation_is_replicated(target_id) {
         Fanout::One(0)
     } else {
         Fanout::Broadcast

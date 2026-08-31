@@ -1,10 +1,10 @@
 //! Dispatch-loop tests: one epoch of a hand-built program per opcode path.
 
 use super::*;
-use crate::ops::AggDescriptor;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, Layout, StorageError};
 use crate::test_support::{make_batch_u128, make_schema_u128_i64, opk_pk, scratch_table, zset_of};
+use gnitz_store::ops::AggDescriptor;
+use gnitz_store::schema::{type_code, SchemaColumn, SchemaDescriptor};
+use gnitz_store::storage::{Batch, Layout, StorageError};
 use gnitz_wire::AggFunc;
 
 // ── Test helpers ─────────────────────────────────────────────────────────
@@ -17,7 +17,7 @@ fn execute_epoch(vm: &mut VmHandle, input: Batch, input_reg: u16) -> Result<Opti
 
 /// A table under `dir` backing a trace register; the caller hands it to
 /// `ProgramBuilder::push_table`, which owns it from then on.
-fn owned_table(dir: &std::path::Path, name: &str, schema: SchemaDescriptor) -> crate::storage::Table {
+fn owned_table(dir: &std::path::Path, name: &str, schema: SchemaDescriptor) -> gnitz_store::storage::Table {
     scratch_table(dir.join(name).to_str().unwrap(), schema, 0)
 }
 
@@ -33,7 +33,7 @@ fn push_reduce(
     in_schema: SchemaDescriptor,
 ) {
     let out_key = in_schema.reduce_out_key(gcols);
-    let plan = crate::ops::ReducePlan::new(&in_schema, gcols, aggs, out_key, false, false).unwrap();
+    let plan = gnitz_store::ops::ReducePlan::new(&in_schema, gcols, aggs, out_key, false, false).unwrap();
     let plan_idx = b.add_reduce_plan(plan, None);
     b.push(Instr::Reduce {
         in_reg,
@@ -47,7 +47,7 @@ fn push_reduce(
 /// the multi-column tests need. The one-payload shape is
 /// [`make_schema_u128_i64`].
 fn make_schema(col_types: &[u8]) -> SchemaDescriptor {
-    let mut columns = [SchemaColumn::EMPTY; crate::schema::MAX_COLUMNS];
+    let mut columns = [SchemaColumn::EMPTY; gnitz_store::schema::MAX_COLUMNS];
     columns[0] = SchemaColumn::new(type_code::U128, 0);
     for (i, &tc) in col_types.iter().enumerate() {
         columns[i + 1] = SchemaColumn::new(tc, 0);
@@ -359,11 +359,11 @@ fn test_map_operator() {
 
     let mut builder = ProgramBuilder::new();
     let map_idx = builder.push_map(
-        crate::expr::MapPlan::from_map(
+        gnitz_store::expr::MapPlan::from_map(
             gnitz_expr::LogicalProgram::copy_cols(&[2]),
             &in_schema,
             &out_schema,
-            crate::expr::PkSource::Inherit,
+            gnitz_store::expr::PkSource::Inherit,
         )
         .unwrap(),
     );
@@ -451,7 +451,7 @@ fn test_join_delta_trace() {
     builder.push_table(table);
     // reg 0 = left delta, reg 1 = right trace, reg 2 = output
     builder.push(Instr::JoinDT {
-        probe: crate::ops::JoinProbe::Equi,
+        probe: gnitz_store::ops::JoinProbe::Equi,
         delta_reg: 0,
         trace_reg: 1,
         out_reg: 2,

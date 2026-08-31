@@ -12,10 +12,10 @@ use crate::runtime::master::PreflightAccumulator;
 use crate::runtime::w2m::{make_ring, W2mReceiver, W2mWriter};
 use crate::runtime::wire::{self, unique_preflight_wire_schema, SchemaWithVersion, FLAG_SCAN_LAST};
 use crate::runtime::worker::send_unique_preflight_keys;
-use gnitz_engine::schema::key::PkBuf;
-use gnitz_engine::schema::make_index_schema;
-use gnitz_engine::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor};
-use gnitz_engine::storage::{Batch, KeyProducer, SpillSort};
+use gnitz_store::schema::key::PkBuf;
+use gnitz_store::schema::make_index_schema;
+use gnitz_store::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor};
+use gnitz_store::storage::{Batch, KeyProducer, SpillSort};
 use gnitz_wire::control::peek_control_block_ipc;
 use gnitz_wire::type_code;
 use gnitz_wire::{FLAG_CONTINUATION, FLAG_HAS_SCHEMA};
@@ -112,7 +112,7 @@ fn drain_train(receiver: &W2mReceiver, expected_req_id: u64) -> Vec<PkBuf> {
             descriptor: s,
             version: *v,
         });
-        let mut offsets = [0usize; gnitz_engine::storage::MAX_BATCH_REGIONS];
+        let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
         let zc =
             wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl, hint, &mut offsets).expect("frame decodes");
         if saved_schema.is_none() {

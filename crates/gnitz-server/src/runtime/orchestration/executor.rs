@@ -18,12 +18,12 @@ use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use gnitz_engine::storage::batch_pool::PooledSendBuf;
+use gnitz_store::storage::batch_pool::PooledSendBuf;
 use rustc_hash::FxHashMap;
 
 use super::guard_panic;
 use crate::runtime::tls::{TlsListener, TlsShared};
-use gnitz_engine::foundation::fault::Seam;
+use gnitz_store::foundation::fault::Seam;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
@@ -42,9 +42,9 @@ use gnitz_engine::catalog::{
     family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates, CatalogEngine, SysFamily, FIRST_USER_TABLE_ID,
     SEQ_TAB_ID,
 };
-use gnitz_engine::query::RelationKind;
-use gnitz_engine::schema::SchemaDescriptor;
-use gnitz_engine::storage::Batch;
+use gnitz_store::relation::RelationKind;
+use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::storage::Batch;
 use gnitz_wire::{WireFault, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH};
 
 const TICK_COALESCE_ROWS: usize = 10_000;
@@ -253,7 +253,7 @@ impl Shared {
     /// relation. The block is stable for the lifetime of the table schema — it is
     /// invalidated alongside col_names whenever DDL modifies the table.
     fn get_schema_wire_block(&self, target_id: i64) -> Option<(Rc<Vec<u8>>, u16)> {
-        let schema = self.cat().get_schema_desc(target_id)?;
+        let schema = self.cat().registry().get_schema_desc(target_id)?;
         let e = self.cat_mut().schema_wire_entry(target_id, &schema);
         Some((e.block, e.version))
     }
@@ -348,7 +348,11 @@ impl Shared {
     fn drain_live_tick_rows_into(&self, out: &mut Vec<i64>) {
         out.clear();
         let mut rows = self.tick_rows.borrow_mut();
-        out.extend(rows.drain().map(|(tid, _)| tid).filter(|&tid| self.cat().has_id(tid)));
+        out.extend(
+            rows.drain()
+                .map(|(tid, _)| tid)
+                .filter(|&tid| self.cat().registry().has_id(tid)),
+        );
     }
 
     /// Put `tids` back after a tick failed to emit them, so their deltas are
@@ -400,7 +404,7 @@ impl ServerExecutor {
         // Seed the zone-LSN allocator above every table's current_lsn so each
         // new zone LSN is strictly greater, keeping `ingest_to_family`'s direct
         // current_lsn assignment monotonic across restarts.
-        let initial_lsn = dispatcher.cat().max_table_current_lsn();
+        let initial_lsn = dispatcher.cat().registry().max_table_current_lsn();
 
         let (committer_tx, committer_rx) = chan::unbounded::<CommitRequest>();
         let (tick_tx, tick_rx) = chan::unbounded::<TickTrigger>();
@@ -517,7 +521,7 @@ async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
 fn tls_hello_timeout() -> std::time::Duration {
     static T: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
-        std::time::Duration::from_millis(gnitz_engine::foundation::env::env_num(
+        std::time::Duration::from_millis(gnitz_store::foundation::env::env_num(
             "GNITZ_TLS_HELLO_TIMEOUT_MS",
             15_000,
         ))
@@ -1169,6 +1173,7 @@ fn decode_push_frame(
         Some(
             shared
                 .cat()
+                .registry()
                 .get_schema_desc(target_id)
                 .ok_or(PushReject::SchemaMismatch)?,
         )
@@ -1228,7 +1233,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
             // Refused rather than skipped when the descriptor is missing: the
             // writability gate above proves it is not, and a validation that
             // silently passes when its expectation is absent is the wrong default.
-            let Some(expected) = shared.cat().get_schema_desc(target_id) else {
+            let Some(expected) = shared.cat().registry().get_schema_desc(target_id) else {
                 send_error(peer, target_id, client_id, b"push: target relation has no schema").await;
                 return;
             };
@@ -1449,12 +1454,13 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
         // `target_kind` above already proved the relation exists.
         let catalog_schema = shared
             .cat()
+            .registry()
             .get_schema_desc(tid)
             .ok_or_else(|| format!("table {tid} not found"))?;
         // The schema block is always present; validate it against the catalog
         // per family (a concurrent DDL between buffer time and commit surfaces as
         // a clean error the application re-runs).
-        let wire_schema = gnitz_engine::schema::decode_schema_block(fam.schema_block, false)
+        let wire_schema = gnitz_store::schema::decode_schema_block(fam.schema_block, false)
             .map_err(|e| format!("TXN family {tid} schema decode error: {e}"))?;
         validate_schema_match(&wire_schema, &catalog_schema)?;
         let batch = decode_client_batch(fam.wal_block, &catalog_schema)
@@ -1612,7 +1618,7 @@ enum Access {
 /// reach the engine directly. Every caller addresses a relation by id and owns its
 /// own reply path.
 fn target_kind(shared: &Shared, target_id: i64, access: Access) -> Result<RelationKind, String> {
-    let Some(kind) = shared.cat().dag().relation_kind(target_id) else {
+    let Some(kind) = shared.cat().registry().relation_kind(target_id) else {
         return Err(format!("table {target_id} not found"));
     };
     match access {
@@ -1673,7 +1679,10 @@ async fn handle_seek_by_index(
         // Bind the result before testing it: an `if let Err(_)` scrutinee would
         // hold the `&mut CatalogEngine` temporary across the await below.
         let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
-        let admitted = shared.cat().validate_index_cols(target_id, &cols, "seek_by_index");
+        let admitted = shared
+            .cat()
+            .registry()
+            .validate_index_cols(target_id, &cols, "seek_by_index");
         if let Err(msg) = admitted {
             send_error(peer, target_id, client_id, msg.as_bytes()).await;
             return;
@@ -1683,6 +1692,7 @@ async fn handle_seek_by_index(
         // across the await below.
         if shared
             .cat()
+            .registry()
             .index_circuit_for_cols(target_id, cols.as_slice())
             .is_none()
         {
@@ -1725,10 +1735,10 @@ async fn handle_seek_by_index(
 /// `Err` is the one hard failure a resolve has: an unusable request blob, or a
 /// schema that does not exist.
 ///
-/// The `dag.relation_kind` lookup is the gate that makes the id safe to
+/// The `registry.relation_kind` lookup is the gate that makes the id safe to
 /// describe: `read_column_defs` seeks `pack_column_id(owner_id, 0)`, whose range
 /// check would abort the master on an out-of-range owner, and only ids
-/// `allocate_table_id` issued reach `dag.tables`. Returning the kind is what
+/// `allocate_table_id` issued reach the registry. Returning the kind is what
 /// lets the caller consume that proof instead of re-asserting it.
 fn resolve_request_target(
     shared: &Rc<Shared>,
@@ -1765,7 +1775,7 @@ fn resolve_request_target(
     // so the two maps are not maintained on one liveness rule.
     Ok(shared
         .cat()
-        .dag()
+        .registry()
         .relation_kind(candidate)
         .map(|kind| (candidate, kind)))
 }
@@ -1799,7 +1809,7 @@ fn build_resolve_reply(
     // re-plan an aggregate over a view on a second authority. A misreport either way
     // is a silent W-fold overcount: a replicated relation read as non-replicated has
     // every worker holding a full copy *and* its partials summed.
-    let replicated = kind.is_ingestion_point() && shared.cat().dag().relation_is_replicated(tid);
+    let replicated = kind.is_ingestion_point() && shared.cat().registry().relation_is_replicated(tid);
 
     let defs = shared.cat_mut().read_column_defs(tid);
     let fks: Vec<gnitz_wire::RelFk> = defs
@@ -1814,6 +1824,7 @@ fn build_resolve_reply(
         .collect();
     let indexes: Vec<gnitz_wire::RelIndex> = shared
         .cat()
+        .registry()
         .index_circuits(tid)
         .iter()
         .map(|ic| gnitz_wire::RelIndex {
@@ -1823,7 +1834,7 @@ fn build_resolve_reply(
         .collect();
     let class = shared
         .cat()
-        .dag()
+        .registry()
         .relation_class(tid)
         .expect("registered: the kind probe above already answered for this tid");
     let blob = gnitz_wire::RelDescriptorBlob {
@@ -1831,7 +1842,7 @@ fn build_resolve_reply(
         replicated,
         // Answered off the registry's own `delta_bytes`, so a subscriber discovers
         // the capability here instead of probing for it with a read that errors.
-        delta: shared.cat().dag().relation_has_delta_feed(tid),
+        delta: shared.cat().registry().relation_has_delta_feed(tid),
         fks,
         indexes,
     }
@@ -1922,7 +1933,12 @@ async fn drain_pending_ticks(shared: &Rc<Shared>) -> Result<(), String> {
 /// catalog read lock; the whole call is synchronous, so `source_closure`'s `&mut`
 /// rebuild crosses no await.
 fn read_is_fresh(shared: &Rc<Shared>, target: i64) -> bool {
-    if !shared.cat().dag().relation_kind(target).is_some_and(|k| k.is_view()) {
+    if !shared
+        .cat()
+        .registry()
+        .relation_kind(target)
+        .is_some_and(|k| k.is_view())
+    {
         return true;
     }
     let ticked = shared.last_tick_lsn.get();
@@ -2165,7 +2181,7 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
     // to reach the worker, which is the only place that refusal is worded.
     if let Some(after) = delta_cursor.filter(|&n| n > 0) {
         let disp = shared.disp();
-        if shared.cat().dag().relation_has_delta_feed(target_id) && after >= disp.last_delta_round(target_id) {
+        if shared.cat().registry().relation_has_delta_feed(target_id) && after >= disp.last_delta_round(target_id) {
             let seek_pk = delta_terminal_seek_pk(disp, target_id, disp.last_tick_round());
             let frame = make_terminal_scan_frame(target_id, client_id, seek_pk);
             peer.send_or_close(frame).await;
@@ -2490,7 +2506,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         // bundle BEFORE reserving the zone LSN or mutating the catalog, so a
         // violation needs no rollback — it just surfaces to the client. This runs
         // before the ingest loop, so for a table created in the same bundle the owner
-        // is not yet in `dag.tables` and `validate_unique_index_create`
+        // is not yet in the registry and `validate_unique_index_create`
         // short-circuits to an empty filter (sound: the new table is empty, and
         // hook_index_register's own owner-check still succeeds later in the loop). The
         // IDX_TAB row layout (and the IDXTAB_PAY_* payload indices) is fixed by
@@ -2520,7 +2536,9 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         // `max_table_current_lsn` — the zone must dominate EVERY family's counter
         // (see `ZoneLsnAllocator::reserve` for why a drifted counter would dedup-drop
         // the zone on recovery).
-        let zone_lsn = shared.lsn_alloc.reserve(shared.cat().max_table_current_lsn());
+        let zone_lsn = shared
+            .lsn_alloc
+            .reserve(shared.cat().registry().max_table_current_lsn());
         let zone_lsn_nz = NonZeroU64::new(zone_lsn).expect("zone LSN allocator starts above 0");
         shared.cat_mut().open_ddl_zone(zone_lsn_nz);
 
@@ -2579,7 +2597,8 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
             let cat = shared.cat_mut();
             for (family, fbatch) in ordered {
                 if view_create && !drained_sources && family.topo_priority() >= view_prio {
-                    for src in cat.dag_mut().base_tables_reachable_from(new_view_ids.clone()) {
+                    let (dag, reg) = cat.dag_and_registry_mut();
+                    for src in dag.base_tables_reachable_from(reg, new_view_ids.clone()) {
                         shared.disp().drain_tick_blocking(src)?;
                     }
                     drained_sources = true;
@@ -2700,7 +2719,7 @@ fn encode_response_buffer(msg: ipc::WireMsg<'_>) -> PooledSendBuf {
     const PFX: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES;
     let sz = msg.size();
     let total = PFX + sz;
-    let mut inner = gnitz_engine::storage::batch_pool::acquire_buf();
+    let mut inner = gnitz_store::storage::batch_pool::acquire_buf();
     inner.reserve(total.max(8192));
     // SAFETY: `encode_ipc` writes every byte [0, sz). The frame length prefix is
     // written immediately below. wal::encode zeros inter-region padding (Step 1),
@@ -2905,7 +2924,7 @@ async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64, count: i6
         // both its rejections would name a push.
         if !shared
             .cat()
-            .dag()
+            .registry()
             .relation_kind(seq_id)
             .is_some_and(|k| k.is_base_table())
         {

@@ -63,28 +63,13 @@ pub trait MirrorStore: Send {
     /// when it refuses.
     fn base_dir(&self) -> &str;
 
-    /// The id the local catalog already holds for `schema_name`, if any. It keeps
-    /// the `SCHEMA_TAB` scan [`Self::register`] would otherwise need an id from
-    /// off every `mirror_view` and every reseed but the first sighting.
-    fn schema_id(&mut self, schema_name: &str) -> Option<u64>;
-
-    /// Register `tid` under `schema`, retracting whatever the local catalog held
-    /// at that id or under that qualified name; returns the ids retracted.
+    /// Register `tid` under `schema`, retracting whatever the store held at that
+    /// id or under that qualified name; returns the ids retracted.
     ///
-    /// `schema_id` is the id for `schema_name`: what [`Self::schema_id`]
-    /// answered, or the server's when it answered `None`. A `SCHEMA_TAB` row is
-    /// written only when the store holds none — one row per schema, shared by
-    /// every view mirrored out of it. Never a locally-minted id: the local
-    /// counter would mint one the server had already given to a *different*
-    /// schema whose view the client mirrors next.
-    fn register(
-        &mut self,
-        tid: u64,
-        schema_id: u64,
-        schema_name: &str,
-        name: &str,
-        schema: &Schema,
-    ) -> Result<Vec<u64>, MirrorError>;
+    /// The qualified name is what the store records the copy under, and the only
+    /// thing it needs beyond the id: the store mints no ids of its own, so there
+    /// is no `SCHEMA_TAB` id for a schema to be entered under.
+    fn register(&mut self, tid: u64, schema_name: &str, name: &str, schema: &Schema) -> Result<Vec<u64>, MirrorError>;
 
     /// Tear `tid` down to `level`. See [`Invalidate`] — this is the *only* way a
     /// copy, a cursor or a registration is ever dropped. Idempotent, and a `tid`
@@ -395,16 +380,7 @@ impl GnitzClient {
 
         let tid = rel.tid;
         let schema = Arc::clone(&rel.schema);
-        // The schema id is the one field a resolve reply does not carry. Only a
-        // first sighting pays the SCHEMA_TAB scan every DDL path takes.
-        let schema_id = match self.mirror_state()?.store.schema_id(schema_name) {
-            Some(id) => id,
-            None => self.lookup_schema_id(schema_name)?,
-        };
-        let retracted = self
-            .mirror_state()?
-            .store
-            .register(tid, schema_id, schema_name, name, &schema)?;
+        let retracted = self.mirror_state()?.store.register(tid, schema_name, name, &schema)?;
 
         let entry = MirroredView {
             schema_name: schema_name.to_string(),

@@ -17,13 +17,14 @@ use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{
     self as ipc, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT, FLAG_SCAN_LAST,
 };
-use gnitz_engine::catalog::{CatalogEngine, IngestError, FIRST_USER_TABLE_ID};
-use gnitz_engine::foundation::fault::Seam;
+use gnitz_engine::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use gnitz_engine::query::{DagEngine, ExchangeCallback};
-use gnitz_engine::schema::key::PkBuf;
-use gnitz_engine::schema::SchemaDescriptor;
-use gnitz_engine::storage::Batch;
-use gnitz_engine::storage::BlobCacheGuard;
+use gnitz_store::foundation::fault::Seam;
+use gnitz_store::relation::{IngestError, RelationRegistry};
+use gnitz_store::schema::key::PkBuf;
+use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::storage::Batch;
+use gnitz_store::storage::BlobCacheGuard;
 use gnitz_wire::{FLAG_CONTINUATION, FLAG_EXCHANGE, STATUS_OK};
 
 // ---------------------------------------------------------------------------
@@ -372,7 +373,7 @@ impl WorkerProcess {
             },
             pending_deltas,
             pending_streams: VecDeque::new(),
-            reply_frame_budget: gnitz_engine::foundation::env::env_num("GNITZ_REPLY_FRAME_BUDGET", ipc::FRAME_CAP)
+            reply_frame_budget: gnitz_store::foundation::env::env_num("GNITZ_REPLY_FRAME_BUDGET", ipc::FRAME_CAP)
                 .min(ipc::FRAME_CAP),
         }
     }
@@ -487,7 +488,7 @@ impl WorkerProcess {
         // it — and so a later CREATE INDEX in this process gates its resume on
         // the same value.
         if msg.kind == SalMessageKind::FlushEph {
-            self.cat().set_resume_generation(msg.lsn);
+            self.cat().registry_mut().set_resume_generation(msg.lsn);
         }
         Some(msg)
     }
@@ -787,7 +788,7 @@ impl WorkerProcess {
                         // Raw reborrow: `self.cat()` would borrow all of self and
                         // conflict with the `pending_deltas` field borrow.
                         let cat = unsafe { &*self.catalog };
-                        self.pending_deltas.retain(|tid, _| cat.has_id(*tid));
+                        self.pending_deltas.retain(|tid, _| cat.registry().has_id(*tid));
                         gnitz_debug!("ddl_sync tid={}", target_id);
                     }
                 }
@@ -805,7 +806,7 @@ impl WorkerProcess {
             SalMessageKind::HasPk => {
                 let lookup = HasPkLookup::from_wire(seek_col_idx);
                 if let HasPkLookup::SecondaryIndex { cols, .. } = &lookup {
-                    self.cat().validate_index_cols(target_id, cols, "has_pk")?;
+                    self.cat().registry().validate_index_cols(target_id, cols, "has_pk")?;
                 }
                 self.handle_has_pk(target_id, batch, lookup, request_id, client_id, seek_pk)
             }
@@ -826,11 +827,16 @@ impl WorkerProcess {
                 let (result, schema) = match batch.as_ref() {
                     Some(b) => {
                         let keys = (0..b.count).map(|i| b.get_pk_bytes(i));
-                        self.cat().gather_family_bytes(target_id, keys, ref_col)?
+                        self.cat()
+                            .registry_mut()
+                            .gather_family_bytes(target_id, keys, ref_col)?
                     }
                     // A worker with an empty sublist still replies — the master
                     // joins one reply per worker.
-                    None => self.cat().gather_family_bytes(target_id, std::iter::empty(), ref_col)?,
+                    None => self
+                        .cat()
+                        .registry_mut()
+                        .gather_family_bytes(target_id, std::iter::empty(), ref_col)?,
                 };
                 // The projected reply schema is synthetic — never the
                 // table's cached block.
@@ -862,10 +868,15 @@ impl WorkerProcess {
 
             SalMessageKind::SeekByIndex => {
                 let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
-                self.cat().validate_index_cols(target_id, &cols, "seek_by_index")?;
+                self.cat()
+                    .registry()
+                    .validate_index_cols(target_id, &cols, "seek_by_index")?;
                 // A prefix seek supplies fewer values than the index's arity.
                 let keys = gnitz_wire::unpack_index_key_slots(seek_pk, &seek_pk_extra, cols.as_slice().len())?;
-                let (result, schema) = self.cat().seek_by_index(target_id, cols.as_slice(), keys.as_slice())?;
+                let (result, schema) =
+                    self.cat()
+                        .registry_mut()
+                        .seek_by_index(target_id, cols.as_slice(), keys.as_slice())?;
                 self.stream_batch_response(
                     target_id as u64,
                     result,
@@ -925,7 +936,9 @@ impl WorkerProcess {
                 // k-way merge. An error here surfaces as the terminal fault frame
                 // the master's merge expects (send_error in run_via_dispatch_inner).
                 let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
-                self.cat().validate_index_cols(target_id, &cols, "unique pre-flight")?;
+                self.cat()
+                    .registry()
+                    .validate_index_cols(target_id, &cols, "unique pre-flight")?;
                 self.handle_unique_preflight(target_id, cols.as_slice(), request_id)?;
                 Ok(())
             }
@@ -959,7 +972,7 @@ impl WorkerProcess {
         // the durable SAL. Restart + SAL replay re-applies the batch — its zone
         // stays above the flushed-shard watermark — where a fault reply would
         // neither apply nor replay it and the next checkpoint would orphan it.
-        let effective = match self.cat().ingest_returning_effective(target_id, batch) {
+        let effective = match self.cat().registry_mut().ingest_returning_effective(target_id, batch) {
             Ok(b) => b,
             Err(IngestError::Rejected(msg)) => return Err(msg),
             Err(IngestError::Storage(e)) => gnitz_fatal_abort!(
@@ -981,10 +994,10 @@ impl WorkerProcess {
         let delta = if let Some(d) = self.pending_deltas.remove(&target_id) {
             d
         } else {
-            if !self.cat().has_id(target_id) {
+            if !self.cat().registry().has_id(target_id) {
                 return Ok(());
             }
-            let schema = self.cat().schema_or_err(target_id, "tick")?;
+            let schema = self.cat().registry().schema_or_err(target_id, "tick")?;
             Batch::empty_with_schema(&schema)
         };
         self.evaluate_dag(target_id, delta, round, request_id);
@@ -1018,7 +1031,7 @@ impl WorkerProcess {
         let (spec_bytes, reply_block) =
             gnitz_wire::unpack_scan_spec_extra(seek_pk_extra).map_err(|e| format!("scan_spec: {e}"))?;
         let spec = gnitz_wire::ReadSpec::decode(spec_bytes.0).map_err(|e| format!("scan_spec: {e}"))?;
-        let reply_schema = gnitz_engine::schema::decode_schema_block(reply_block, true)
+        let reply_schema = gnitz_store::schema::decode_schema_block(reply_block, true)
             .map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
         let keeper = self
             .cat()
@@ -1078,14 +1091,15 @@ impl WorkerProcess {
         // join resets once (on its first source) and the remaining sources fill
         // the just-reset store.
         if self.cat().view_is_invalid(view_id) {
-            self.cat().reset_view_output_for_rebuild(view_id)?;
+            let (dag, registry) = self.cat().dag_and_registry_mut();
+            dag.reset_view_for_rebuild(registry, view_id)?;
             self.cat().clear_invalid_view(view_id);
         }
-        let chunk_rows = self.cat().ddl_scan_chunk_rows();
+        let chunk_rows = self.cat().registry().ddl_scan_chunk_rows();
         // Needed to synthesize empty pad chunks. An unregistered source is a
         // fail-stop: DDL_SYNC applies in SAL order, so a worker that cannot see
         // the source has diverged from the catalog.
-        let schema = self.cat().schema_or_err(source_tid, "backfill")?;
+        let schema = self.cat().registry().schema_or_err(source_tid, "backfill")?;
         let mut handle = self.cat().open_source_cursor(view_id, source_tid)?;
         let mut produced_any = false;
 
@@ -1122,7 +1136,7 @@ impl WorkerProcess {
             // A spill fault leaves the view store unbounded, so the process
             // cannot continue. The master's watchdog turns the dead worker into a
             // cluster abort, and restart re-derives the view.
-            if let Err(e) = self.cat().dag_mut().flush(view_id) {
+            if let Err(e) = self.cat().registry_mut().flush(view_id) {
                 gnitz_fatal_abort!(
                     "worker: view store flush failed (view_id={}): {} — view state \
                      cannot be bounded; aborting for restart+re-derive",
@@ -1140,12 +1154,19 @@ impl WorkerProcess {
     /// whether the view produced rows. The worker analogue of `evaluate_dag`
     /// but for a single view rather than the source's whole closure.
     fn backfill_view_step(&mut self, view_id: i64, source_id: i64, delta: Batch, request_id: u64) -> bool {
-        let dag = self.cat().dag_mut() as *mut DagEngine;
+        let (dag, reg) = self.cat().dag_and_registry_mut();
+        let (dag, reg) = (dag as *mut DagEngine, reg as *mut RelationRegistry);
         let mut ctx = WorkerExchangeCtx {
             worker: self,
             tick_request_id: request_id,
         };
-        let produced = unsafe { &mut *dag }.backfill_view_step_multi_worker(view_id, source_id, delta, &mut ctx);
+        let produced = unsafe { &mut *dag }.backfill_view_step_multi_worker(
+            unsafe { &mut *reg },
+            view_id,
+            source_id,
+            delta,
+            &mut ctx,
+        );
         // Apply DDL_SYNC messages deferred during exchange waits (mirrors
         // `evaluate_dag`).
         self.dispatch_deferred();
@@ -1212,15 +1233,15 @@ impl WorkerProcess {
         if UNIQUE_PREFLIGHT_ERROR.armed() {
             return Err("injected unique pre-flight fault".to_string());
         }
-        let schema = self.cat().schema_or_err(owner_id, "unique pre-flight")?;
+        let schema = self.cat().registry().schema_or_err(owner_id, "unique pre-flight")?;
         // The index circuit is not registered until this pre-flight succeeds, so
         // build its schema from the owner schema + column list — identical inputs
         // to the master's own build, so the reply frame layout agrees by
         // construction. `make_index_schema` also bounds-checks the columns (a
         // protocol-level mismatch rather than a user error) and yields the
         // promoted per-column types/sizes for the span.
-        let idx_schema = gnitz_engine::schema::make_index_schema(col_indices, &schema)?;
-        let spec = gnitz_engine::schema::IndexKeySpec::new(col_indices, &schema, &idx_schema);
+        let idx_schema = gnitz_store::schema::make_index_schema(col_indices, &schema)?;
+        let spec = gnitz_store::schema::IndexKeySpec::new(col_indices, &schema, &idx_schema);
         let frame_schema = crate::runtime::wire::unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
         // The spill file is an anonymous inode on the owner table's own data
@@ -1228,18 +1249,19 @@ impl WorkerProcess {
         let stride = spec.key_size();
         let dir = self
             .cat()
+            .registry()
             .table_directory(owner_id)
             .ok_or_else(|| format!("unique pre-flight: no directory for table {owner_id}"))?
             .to_string();
-        let chunk_rows = self.cat().ddl_scan_chunk_rows();
+        let chunk_rows = self.cat().registry().ddl_scan_chunk_rows();
 
         // Stream the partition chunk-wise, projecting each row to its span and
         // feeding it to the external sort. Peak RAM is the spill budget, not the
         // partition. `key_bytes` keeps the single column→span definition shared
         // with the filter warmup and the master merge.
-        let mut sorter = gnitz_engine::storage::SpillSort::new(&dir, stride, unique_preflight_spill_bytes());
+        let mut sorter = gnitz_store::storage::SpillSort::new(&dir, stride, unique_preflight_spill_bytes());
         let mut keybuf = PkBuf::zeroed(0);
-        if let Some(mut handle) = self.cat().open_store_cursor(owner_id) {
+        if let Some(mut handle) = self.cat().registry().open_store_cursor(owner_id) {
             while let Some(chunk) = handle.drain_chunk(chunk_rows) {
                 let mb = chunk.as_mem_batch();
                 for row in 0..chunk.count {
@@ -1293,6 +1315,7 @@ impl WorkerProcess {
                 // the index table and its schema.
                 let ic = self
                     .cat()
+                    .registry()
                     .index_circuit_for_cols(target_id, cols.as_slice())
                     .ok_or_else(|| format!("No index on columns {:?} for table {}", cols.as_slice(), target_id))?;
                 // The check target is the unique INDEX table, whose schema is
@@ -1328,8 +1351,8 @@ impl WorkerProcess {
                 (result, schema, true)
             }
             HasPkLookup::PrimaryKey => {
-                let schema = self.cat().schema_or_err(target_id, "has_pk")?;
-                let store = self.cat().get_store_handle(target_id);
+                let schema = self.cat().registry().schema_or_err(target_id, "has_pk")?;
+                let store = self.cat().registry().entry(target_id).and_then(|e| e.owned_store());
                 // Route on verbatim OPK bytes for every PK width: feeding `get_pk`
                 // (OPK-widened) to `has_pk(u128)` would re-OPK-encode it, a double
                 // sign-flip that misses signed PKs.
@@ -1379,12 +1402,19 @@ impl WorkerProcess {
     /// stay routable. `tick_round` is the round that group carried, which stamps
     /// every fed view's captured delta.
     fn evaluate_dag(&mut self, source_id: i64, delta: Batch, tick_round: u64, request_id: u64) {
-        let dag = self.cat().dag_mut() as *mut DagEngine;
+        let (dag, reg) = self.cat().dag_and_registry_mut();
+        let (dag, reg) = (dag as *mut DagEngine, reg as *mut RelationRegistry);
         let mut ctx = WorkerExchangeCtx {
             worker: self,
             tick_request_id: request_id,
         };
-        let res = unsafe { &mut *dag }.evaluate_dag_multi_worker(source_id, delta, tick_round, &mut ctx);
+        let res = unsafe { &mut *dag }.evaluate_dag_multi_worker(
+            unsafe { &mut *reg },
+            source_id,
+            delta,
+            tick_round,
+            &mut ctx,
+        );
         // Apply DDL_SYNC messages deferred during exchange waits.
         self.dispatch_deferred();
         // The whole tick path funnels through the call above, so this is the one
@@ -1419,7 +1449,7 @@ impl WorkerProcess {
     /// A graceful stop already ran a full sequence, so the base cut has not
     /// advanced and only the flush runs — which is what lets it still resume.
     fn shutdown(&mut self) -> ! {
-        if self.cat().dag_mut().base_advanced_since_publish() {
+        if self.cat().registry_mut().base_advanced_since_publish() {
             self.unlink_derived_manifests();
         }
         let _ = self.handle_flush_all();
@@ -1429,8 +1459,9 @@ impl WorkerProcess {
     /// Unlink the manifest of every store the ephemeral round persists, so the
     /// next open peeks `None` and erases those shards instead of resuming them.
     fn unlink_derived_manifests(&mut self) {
-        let (traces, outputs) = self.cat().dag_mut().collect_ephemeral_flush_tables();
-        for t in traces.into_iter().chain(outputs) {
+        let (dag, registry) = self.cat().dag_and_registry_mut();
+        let traces = dag.collect_ephemeral_trace_tables(registry);
+        for t in traces.into_iter().chain(registry.collect_ephemeral_output_tables()) {
             t.unlink_manifest();
         }
     }
@@ -1465,7 +1496,7 @@ const UNIQUE_PREFLIGHT_KEYS_PER_FRAME: usize = 1 << 20;
 /// with small tables; any value is safe now that `InFlightState` grows with the
 /// parked depth (see [`UNIQUE_PREFLIGHT_KEYS_PER_FRAME`]).
 fn unique_preflight_keys_per_frame() -> usize {
-    gnitz_engine::foundation::env::env_num("GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME", UNIQUE_PREFLIGHT_KEYS_PER_FRAME)
+    gnitz_store::foundation::env::env_num("GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME", UNIQUE_PREFLIGHT_KEYS_PER_FRAME)
 }
 
 /// Default in-RAM key-byte budget before the pre-flight sort spills a run (128 MiB).
@@ -1477,7 +1508,7 @@ const UNIQUE_PREFLIGHT_SPILL_BYTES: usize = 128 * 1024 * 1024;
 /// worker RAM during the pre-flight is roughly this budget plus the sort index
 /// and one reorder buffer — bounded regardless of partition size.
 fn unique_preflight_spill_bytes() -> usize {
-    gnitz_engine::foundation::env::env_num("GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES", UNIQUE_PREFLIGHT_SPILL_BYTES)
+    gnitz_store::foundation::env::env_num("GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES", UNIQUE_PREFLIGHT_SPILL_BYTES)
 }
 
 #[cfg(test)]

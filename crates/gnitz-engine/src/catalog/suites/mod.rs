@@ -20,7 +20,7 @@ mod wide_pk_validation;
 
 use super::sys_tables::*;
 use super::*;
-use crate::schema::type_code;
+use gnitz_store::schema::type_code;
 
 use std::fs;
 
@@ -36,8 +36,8 @@ const UUID_A: u128 = 0x0000_0000_0000_AAAA_0000_0000_0000_BBBB;
 
 /// A non-nullable U64 schema column — the building block of the compound-PK
 /// fixtures below.
-fn u64c() -> crate::schema::SchemaColumn {
-    crate::schema::SchemaColumn::new(type_code::U64, 0)
+fn u64c() -> gnitz_store::schema::SchemaColumn {
+    gnitz_store::schema::SchemaColumn::new(type_code::U64, 0)
 }
 
 /// The OPK image of a three-column U64 compound PK (`pk_stride` = 24, wide).
@@ -147,7 +147,7 @@ fn ingest_fixture(
     mut put_row: impl FnMut(&mut BatchBuilder, u64),
 ) -> (CatalogEngine, i64) {
     let (mut engine, tid, _dir) = table_fixture(name, cols);
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
     for round in 0..rounds {
         let mut bb = BatchBuilder::new(schema);
         let mut id = round;

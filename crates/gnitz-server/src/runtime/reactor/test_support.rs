@@ -167,7 +167,7 @@ pub(super) unsafe fn make_scan_slot(
 ) -> (
     crate::runtime::w2m::W2mSlot,
     crate::runtime::w2m::W2mReceiver,
-    gnitz_engine_testkit::SharedRegion,
+    crate::runtime::test_support::SharedRegion,
 ) {
     let (receiver, region) = make_scan_ring(req_id, 1);
     let slot = receiver.try_read_slot(0).expect("scan slot");
@@ -183,7 +183,10 @@ pub(super) unsafe fn make_scan_slot(
 pub(super) unsafe fn make_scan_ring(
     internal_req_id: u32,
     n: usize,
-) -> (crate::runtime::w2m::W2mReceiver, gnitz_engine_testkit::SharedRegion) {
+) -> (
+    crate::runtime::w2m::W2mReceiver,
+    crate::runtime::test_support::SharedRegion,
+) {
     use crate::runtime::w2m::{W2mReceiver, W2mWriter};
     use crate::runtime::wire as ipc;
 

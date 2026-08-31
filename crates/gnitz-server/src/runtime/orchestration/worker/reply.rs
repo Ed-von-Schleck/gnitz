@@ -525,7 +525,7 @@ pub(crate) fn send_unique_preflight_keys(
     frame_schema: &SchemaDescriptor,
     request_id: u64,
     keys_per_frame: usize,
-    keys: &mut gnitz_engine::storage::KeyProducer,
+    keys: &mut gnitz_store::storage::KeyProducer,
 ) {
     debug_assert!(keys_per_frame > 0, "keys_per_frame must be positive");
     let schema_block = gnitz_engine::catalog::encode_schema_block(frame_schema, target_id as u32);

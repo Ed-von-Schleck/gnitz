@@ -1,6 +1,6 @@
-use gnitz_engine::schema::key::PkBuf;
-use gnitz_engine::schema::{SchemaColumn, SchemaDescriptor};
-use gnitz_engine::storage::Batch;
+use gnitz_store::schema::key::PkBuf;
+use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_store::storage::Batch;
 use gnitz_wire::type_code;
 
 /// A single U64 PK column, no payload.

@@ -1,6 +1,6 @@
 use super::super::fixtures::{compound_pk_bytes, make_row_batch, two_col_schema, u64_schema};
 use super::*;
-use gnitz_engine::schema::SchemaColumn;
+use gnitz_store::schema::SchemaColumn;
 use gnitz_wire::type_code;
 
 /// OPK leading-key span of a single U64 value — the form `key_bytes`
@@ -13,7 +13,7 @@ fn span_u64(v: u64) -> PkBuf {
 /// Span-extraction spec for a unique index on `cols` of `schema`, promoted
 /// via `make_index_schema` exactly as production circuit registration does.
 fn test_spec(cols: &[u32], schema: &SchemaDescriptor) -> IndexKeySpec {
-    let idx_schema = gnitz_engine::schema::make_index_schema(cols, schema).unwrap();
+    let idx_schema = gnitz_store::schema::make_index_schema(cols, schema).unwrap();
     IndexKeySpec::new(cols, schema, &idx_schema)
 }
 

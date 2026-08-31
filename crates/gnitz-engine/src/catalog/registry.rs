@@ -90,10 +90,6 @@ impl CatalogEngine {
 
     // -- Registry query methods -----------------------------------------------
 
-    pub fn has_id(&self, table_id: i64) -> bool {
-        self.dag.tables.contains_key(&table_id)
-    }
-
     /// The id this catalog holds for schema `name`, or `None` when it holds no
     /// such schema.
     pub fn schema_id(&self, name: &str) -> Option<i64> {
@@ -139,7 +135,7 @@ impl CatalogEngine {
     /// Panics on reaching `RELATION_ID_CEILING` rather than issuing an id at or
     /// above it. Reaching it needs 2^31 durable CREATEs, so this is a tripwire,
     /// not a live limit — and it is the *secondary* guard: `precheck_family`
-    /// rejects a ceiling id at the point one enters `dag.tables`, which covers the
+    /// rejects a ceiling id at the point one enters the registry, which covers the
     /// caller-chosen ids the register hooks `raise_id_counter` from and which
     /// never pass through here.
     pub fn allocate_table_id(&mut self) -> Result<i64, StorageError> {
@@ -281,7 +277,7 @@ impl CatalogEngine {
         self.advance_sequence(SEQ_ID_CHECKPOINT_GEN, new as i64)
             .map_err(|e| format!("sys_sequences ingest (checkpoint generation) failed: {e}"))?;
         self.durable_generation = new;
-        self.set_resume_generation(new);
+        self.registry.set_resume_generation(new);
         // The row must be shard-durable before the SAL reset that follows
         // discards the memtable copy: resetting the SAL on a swallowed failure
         // destroys the only durable copy, so the caller must not proceed to it.
@@ -311,32 +307,6 @@ impl CatalogEngine {
         self.flush_all_system_tables()
     }
 
-    /// The one writer of the resume generation. `pub` because a worker latches it
-    /// off the `FLAG_FLUSH_EPH` round header from outside the crate.
-    pub fn set_resume_generation(&mut self, g: u64) {
-        self.resume_generation = g;
-    }
-
-    /// True when this boot's `(worker count, STATE_FORMAT)` is the one the
-    /// persisted derived state was written under. Half of every resume verdict:
-    /// a change on either axis invalidates every rederived relation regardless
-    /// of what generation its manifest carries.
-    pub fn topology_matches(&self) -> bool {
-        self.recorded_topology == crate::storage::topology_word(self.num_workers)
-    }
-
-    /// The recovery policy for a rederived relation — a view's output store and
-    /// operator traces, a secondary index: resume from a manifest at this
-    /// engine's resume generation, and only while the topology it was written
-    /// under still holds. The one constructor of a generation-bearing
-    /// `RecoverySource`, so no consumer can sample a generation of its own at a
-    /// second moment.
-    pub(crate) fn rederive_source(&self) -> RecoverySource {
-        RecoverySource::Rederive {
-            resume_at: self.topology_matches().then_some(self.resume_generation),
-        }
-    }
-
     /// Build the `sys_sequences` delta that moves one sequence to `new_val`: a
     /// `-1` copy of whatever row is live at `seq_id` (nothing, on first use)
     /// followed by the `+1` insert. Retracting the *live* row rather than a
@@ -363,12 +333,12 @@ impl CatalogEngine {
     /// server's caller (`boot_checkpoint`) bumps the checkpoint generation right
     /// after, and that flush carries this row to the same shard.
     pub fn record_topology(&mut self, worker_count: u32) -> Result<(), StorageError> {
-        let value = crate::storage::topology_word(worker_count);
-        if self.recorded_topology == value {
+        let value = gnitz_store::storage::topology_word(worker_count);
+        if self.registry.recorded_topology() == value {
             return Ok(());
         }
         self.advance_sequence(SEQ_ID_TOPOLOGY, value as i64)?;
-        self.recorded_topology = value;
+        self.registry.set_recorded_topology(value);
         Ok(())
     }
 }

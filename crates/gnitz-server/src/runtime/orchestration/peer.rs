@@ -20,7 +20,7 @@ use std::rc::Rc;
 use crate::runtime::reactor::{guard_egress_deadline, PeerToken, Reactor, RecvBuf, SendPayload};
 use crate::runtime::tls::TlsShared;
 use crate::runtime::w2m::W2mSlot;
-use gnitz_engine::storage::batch_pool::PooledSendBuf;
+use gnitz_store::storage::batch_pool::PooledSendBuf;
 
 /// Transport-neutral handle to one client connection. Owned by the
 /// connection task; handlers borrow it to send replies.
@@ -105,7 +105,7 @@ impl Peer {
     /// `send_buffer` path (per-connection, so the extra copy is off any hot path).
     pub async fn send_hello_ack(&self, published_lsn: u64) -> i32 {
         let ack = gnitz_wire::encode_hello_ack(gnitz_wire::MAX_FRAME_PAYLOAD_SERVER as u32, published_lsn);
-        let mut buf = gnitz_engine::storage::batch_pool::acquire_buf();
+        let mut buf = gnitz_store::storage::batch_pool::acquire_buf();
         buf.extend_from_slice(&ack);
         self.send_buffer(PooledSendBuf(buf)).await
     }

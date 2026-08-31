@@ -8,7 +8,7 @@ fn test_uuid_pk_create_and_drop() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let tid = engine.create_table("public.uuid_tab", &[uuid_def("id")], &[0]).unwrap();
-    let s = engine.get_schema_desc(tid).unwrap();
+    let s = engine.registry().get_schema_desc(tid).unwrap();
     assert_eq!(s.columns[0].type_code, type_code::UUID);
 
     engine.drop_table("public.uuid_tab").unwrap();
@@ -25,16 +25,16 @@ fn test_uuid_non_pk_column() {
 
     let cols = vec![col_def("id", type_code::U64), uuid_def("uid")];
     let tid = engine.create_table("public.uuid_payload", &cols, &[0]).unwrap();
-    let s = engine.get_schema_desc(tid).unwrap();
+    let s = engine.registry().get_schema_desc(tid).unwrap();
     assert_eq!(s.columns[1].type_code, type_code::UUID);
 
     // Ingest a row with a UUID payload column
     let mut bb = BatchBuilder::new(s);
     bb.begin_row(1u128, 1);
-    bb.put_u128(UUID_A);
+    bb.put_int(UUID_A);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     engine.drop_table("public.uuid_payload").unwrap();
     engine.close();
@@ -50,14 +50,14 @@ fn test_uuid_secondary_index() {
 
     let cols = vec![col_def("id", type_code::U64), uuid_def("uid")];
     let tid = engine.create_table("public.uuid_idxtab", &cols, &[0]).unwrap();
-    let s = engine.get_schema_desc(tid).unwrap();
+    let s = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(s);
     bb.begin_row(1u128, 1);
-    bb.put_u128(UUID_A);
+    bb.put_int(UUID_A);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     engine.create_index("public.uuid_idxtab", &["uid"], false).unwrap();
     assert!(engine.has_index_by_name("public__uuid_idxtab__idx_uid"));

@@ -37,3 +37,5 @@ pub(crate) use tls::TlsCli;
 
 #[cfg(test)]
 mod suites;
+#[cfg(test)]
+mod test_support;

@@ -6,10 +6,10 @@
 //! enforcement over a wide PK runs distributed and is covered end-to-end.
 
 use super::*;
-use crate::query::{RelationKind, StoreHandle};
-use crate::schema::make_index_schema;
-use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, RecoverySource, Table};
+use gnitz_store::relation::RelationKind;
+use gnitz_store::schema::make_index_schema;
+use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::storage::{Batch, RecoverySource, Table};
 
 /// `pk_stride` = 24 (wide): three U64 PK columns + one U64 payload `val`.
 fn wide_unique_schema() -> SchemaDescriptor {
@@ -63,9 +63,9 @@ fn setup_wide_unique(
     .unwrap();
 
     let bb = wide_val_batch(&schema, base_rows);
-    let idx_batch = crate::storage::batch_project_index(
+    let idx_batch = gnitz_store::storage::batch_project_index(
         &bb,
-        &crate::schema::IndexKeySpec::new(&[3], &schema, &idx_schema),
+        &gnitz_store::schema::IndexKeySpec::new(&[3], &schema, &idx_schema),
         &idx_schema,
     );
     base.ingest_owned_batch(bb).unwrap();
@@ -73,22 +73,15 @@ fn setup_wide_unique(
     idx.ingest_owned_batch(idx_batch).unwrap();
     idx.flush().unwrap();
 
-    engine.dag.register_table(
-        tid,
-        crate::query::TableEntry::new(
-            crate::query::RelationStores {
-                handle: StoreHandle::Borrowed(&mut *base as *mut Table),
-                delta: None,
-            },
-            schema,
-            RelationKind::BaseTable,
-            0,
-            dir.to_string(),
-            crate::query::ViewBudgets::default(),
-        ),
-    );
+    // SAFETY: the fixture owns the box and returns it, so the store outlives
+    // the engine it is registered in.
+    unsafe {
+        engine
+            .registry_mut()
+            .register_borrowed(tid, &mut base, schema, RelationKind::BaseTable, dir.to_string());
+    }
     engine
-        .dag
+        .registry_mut()
         .add_index_circuit(tid, &[3], tid + 1, Box::new(idx), idx_schema, true);
     base
 }
@@ -106,17 +99,18 @@ fn index_circuit_for_col_finds_index_and_uniqueness() {
 
     // The indexed column resolves to its circuit, carrying the uniqueness flag.
     let ic = engine
+        .registry()
         .index_circuit_for_cols(tid, &[3])
         .expect("indexed column must resolve");
     assert!(ic.is_unique, "col 3 was created UNIQUE");
     // An unindexed column resolves to nothing …
     assert!(
-        engine.index_circuit_for_cols(tid, &[0]).is_none(),
+        engine.registry().index_circuit_for_cols(tid, &[0]).is_none(),
         "unindexed column has no circuit"
     );
     // … and so does an unknown table.
     assert!(
-        engine.index_circuit_for_cols(tid + 9999, &[3]).is_none(),
+        engine.registry().index_circuit_for_cols(tid + 9999, &[3]).is_none(),
         "unknown table has no circuit"
     );
 
@@ -145,23 +139,23 @@ fn wide_pk_seek_family_bytes_resolves_non_pk_col() {
     .unwrap();
     pbase.ingest_owned_batch(pb).unwrap();
     pbase.flush().unwrap();
-    engine.dag.register_table(
-        parent_tid,
-        crate::query::TableEntry::new(
-            crate::query::RelationStores {
-                handle: StoreHandle::Borrowed(&mut pbase as *mut Table),
-                delta: None,
-            },
+    // SAFETY: the fixture owns the box and returns it, so the store outlives
+    // the engine it is registered in.
+    unsafe {
+        engine.registry_mut().register_borrowed(
+            parent_tid,
+            &mut pbase,
             parent_schema,
             RelationKind::BaseTable,
-            0,
             dir.clone(),
-            crate::query::ViewBudgets::default(),
-        ),
-    );
+        );
+    }
 
     // seek_family_bytes must resolve the committed parent row by full PK bytes.
-    let seen = engine.seek_family_bytes(parent_tid, &parent_pk).unwrap();
+    let seen = engine
+        .registry_mut()
+        .seek_family_bytes(parent_tid, &parent_pk, None)
+        .unwrap();
     assert!(
         seen.is_some(),
         "seek_family_bytes must find the live wide-PK parent row"
@@ -191,7 +185,7 @@ fn seek_family_bytes_matches_seek_family_narrow() {
     // Plain narrow U64-PK table created through the normal path.
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     for i in 1..=3u64 {
@@ -200,7 +194,7 @@ fn seek_family_bytes_matches_seek_family_narrow() {
         bb.end_row();
     }
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Retract key 2 so it is present-but-dead.
     let mut del = BatchBuilder::new(schema);
@@ -208,7 +202,7 @@ fn seek_family_bytes_matches_seek_family_narrow() {
     del.put_u64(20);
     del.end_row();
     engine.ingest_to_family(tid, &del.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Present (1, 3), retracted (2), and absent (99) must agree across forms.
     for key in [1u64, 2, 3, 99] {
@@ -216,7 +210,7 @@ fn seek_family_bytes_matches_seek_family_narrow() {
         // that is big-endian. seek_family takes the native u128 and OPK-encodes.
         let bytes = key.to_be_bytes();
         let via_u128 = engine.seek_family(tid, key as u128, &[]).unwrap().0;
-        let via_bytes = engine.seek_family_bytes(tid, &bytes).unwrap();
+        let via_bytes = engine.registry_mut().seek_family_bytes(tid, &bytes, None).unwrap();
         assert_eq!(
             via_u128.is_some(),
             via_bytes.is_some(),

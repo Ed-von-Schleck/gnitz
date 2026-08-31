@@ -12,7 +12,7 @@ fn test_enforce_unique_pk() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     let make_row = |pk: u64, val: u64, w: i64| -> Batch {
         let mut bb = BatchBuilder::new(schema);
@@ -22,7 +22,7 @@ fn test_enforce_unique_pk() {
         bb.finish()
     };
     let live = |engine: &mut CatalogEngine| -> usize {
-        engine.dag_mut().flush(tid).unwrap();
+        engine.registry_mut().flush(tid).unwrap();
         engine.scan_family(tid).unwrap().0.count
     };
 
@@ -190,15 +190,15 @@ fn test_user_sequence_durable_roundtrip() {
 #[test]
 fn test_recover_checkpoint_gen_and_topology() {
     let dir = temp_dir("recover_ckpt_records");
-    let expected_topology = crate::storage::topology_word(4);
+    let expected_topology = gnitz_store::storage::topology_word(4);
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         assert_eq!(engine.durable_generation, 0, "fresh DB starts at generation 0");
-        assert_eq!(engine.recorded_topology, 0, "fresh DB has no topology row");
+        assert_eq!(engine.registry().recorded_topology(), 0, "fresh DB has no topology row");
         // Boot order: the topology row is written first and its durability
         // rides the following gen bump's system-table flush.
         engine.record_topology(4).unwrap();
-        assert_eq!(engine.recorded_topology, expected_topology);
+        assert_eq!(engine.registry().recorded_topology(), expected_topology);
         assert_eq!(engine.bump_checkpoint_generation().unwrap(), 1);
         assert_eq!(
             engine.bump_checkpoint_generation().unwrap(),
@@ -213,7 +213,8 @@ fn test_recover_checkpoint_gen_and_topology() {
         "recovered checkpoint generation survives a reopen",
     );
     assert_eq!(
-        engine.recorded_topology, expected_topology,
+        engine.registry().recorded_topology(),
+        expected_topology,
         "recovered topology (worker_count << 32 | STATE_FORMAT) survives a reopen",
     );
     engine.close();
@@ -340,7 +341,7 @@ fn test_ingest_scan_seek_family() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // Ingest via CatalogEngine (user table path)
     let mut bb = BatchBuilder::new(schema);
@@ -354,7 +355,7 @@ fn test_ingest_scan_seek_family() {
     bb.put_u64(300);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Scan
     let scan_batch = engine.scan_family(tid).unwrap().0;
@@ -414,7 +415,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // Insert row with PK=1, val=100
     let mut bb = BatchBuilder::new(schema);
@@ -422,7 +423,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     bb.put_u64(100);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Insert row with PK=1 again, val=200 (should retract old + insert new)
     let mut bb = BatchBuilder::new(schema);
@@ -430,7 +431,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     bb.put_u64(200);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Scan — should have exactly 1 row with val=200
     let scan = engine.scan_family(tid).unwrap().0;
@@ -486,17 +487,35 @@ fn test_ddl_sync_zone_lsn_tracking() {
     // Zone 5: create a schema. SCHEMA_TAB pinned to lsn=5.
     engine.ctx.open_ddl_zone(zone(5));
     engine.create_schema("z").unwrap();
-    assert_eq!(engine.get_max_flushed_lsn(SCHEMA_TAB_ID), 5);
+    assert_eq!(
+        engine
+            .registry()
+            .table_entry(SCHEMA_TAB_ID)
+            .map_or(0, |e| e.current_lsn()),
+        5
+    );
 
     // Zone 7: create a table. TABLE_TAB and COL_TAB pinned to lsn=7;
     // SCHEMA_TAB stays at 5 (untouched in this zone).
     engine.ctx.open_ddl_zone(zone(7));
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("z.t", &cols, &[0]).unwrap();
-    assert_eq!(engine.get_max_flushed_lsn(TABLE_TAB_ID), 7);
-    assert_eq!(engine.get_max_flushed_lsn(COL_TAB_ID), 7);
     assert_eq!(
-        engine.get_max_flushed_lsn(SCHEMA_TAB_ID),
+        engine
+            .registry()
+            .table_entry(TABLE_TAB_ID)
+            .map_or(0, |e| e.current_lsn()),
+        7
+    );
+    assert_eq!(
+        engine.registry().table_entry(COL_TAB_ID).map_or(0, |e| e.current_lsn()),
+        7
+    );
+    assert_eq!(
+        engine
+            .registry()
+            .table_entry(SCHEMA_TAB_ID)
+            .map_or(0, |e| e.current_lsn()),
         5,
         "SCHEMA_TAB stays at the most recent zone that touched it"
     );
@@ -504,22 +523,31 @@ fn test_ddl_sync_zone_lsn_tracking() {
     // Zone 9: another table. TABLE_TAB and COL_TAB advance to lsn=9.
     engine.ctx.open_ddl_zone(zone(9));
     let tid2 = engine.create_table("z.t2", &cols, &[0]).unwrap();
-    assert_eq!(engine.get_max_flushed_lsn(TABLE_TAB_ID), 9);
-    assert_eq!(engine.get_max_flushed_lsn(COL_TAB_ID), 9);
+    assert_eq!(
+        engine
+            .registry()
+            .table_entry(TABLE_TAB_ID)
+            .map_or(0, |e| e.current_lsn()),
+        9
+    );
+    assert_eq!(
+        engine.registry().table_entry(COL_TAB_ID).map_or(0, |e| e.current_lsn()),
+        9
+    );
 
     // system_flushed_lsns covers every system table, and only those.
-    let map = engine.system_flushed_lsns();
+    let map = engine.registry().system_flushed_lsns();
     assert_eq!(map.get(&SCHEMA_TAB_ID), Some(&5));
     assert_eq!(map.get(&TABLE_TAB_ID), Some(&9));
     assert_eq!(map.get(&COL_TAB_ID), Some(&9));
     assert!(map.keys().all(|&t| t < FIRST_USER_TABLE_ID));
     // and the user half is the complement: both created tables, no system family.
-    let users = engine.user_flushed_lsns();
+    let users = engine.registry().user_flushed_lsns();
     assert!(users.contains_key(&tid) && users.contains_key(&tid2));
     assert!(users.keys().all(|&t| t >= FIRST_USER_TABLE_ID));
 
     // max_table_current_lsn is at least the highest zone LSN observed.
-    assert!(engine.max_table_current_lsn() >= 9);
+    assert!(engine.registry().max_table_current_lsn() >= 9);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -536,15 +564,15 @@ fn test_store_detach() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    assert!(engine.owns_stores);
+    assert!(engine.registry().owns_stores());
 
-    engine.detach_user_stores();
-    assert!(!engine.owns_stores);
-    let entry = engine.dag.tables.get(&tid).unwrap();
-    assert!(entry.handle.is_detached());
+    engine.registry_mut().detach_user_stores();
+    assert!(!engine.registry().owns_stores());
+    let entry = engine.registry().table_entry(tid).unwrap();
+    assert!(entry.is_storeless());
     assert!(!entry.open_cursor().valid, "a detached store reads empty");
-    assert_eq!(entry.handle.current_lsn(), 0);
-    engine.invalidate_all_plans();
+    assert_eq!(entry.current_lsn(), 0);
+    engine.dag_mut().invalidate_all();
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -563,7 +591,7 @@ fn test_fk_index_metadata_queries() {
     // Create child table with FK to parent
     let child_cols = vec![
         col_def("id", type_code::U64),
-        fk_def("parent_id", crate::schema::type_code::U64, tid, 0),
+        fk_def("parent_id", gnitz_store::schema::type_code::U64, tid, 0),
     ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
@@ -575,12 +603,12 @@ fn test_fk_index_metadata_queries() {
     // Create an explicit index
     let _iid = engine.create_index("public.parent", &["val"], false).unwrap();
 
-    assert!(!engine.index_circuits(tid).is_empty());
-    let (ic_cols, _is_unique) = engine.get_index_circuit_info(tid, 0).unwrap();
+    assert!(!engine.registry().index_circuits(tid).is_empty());
+    let ic_cols = engine.registry().index_circuits(tid)[0].col_indices;
     assert_eq!(ic_cols.as_slice(), [1]); // val is column 1
 
     // The index circuit resolves, so its store is reachable.
-    assert!(engine.index_circuit_for_cols(tid, &[1]).is_some());
+    assert!(engine.registry().index_circuit_for_cols(tid, &[1]).is_some());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -763,7 +791,10 @@ fn test_circuit_table_surface_introspectable() {
     // extend_pk(pk) = pk.to_be_bytes(), the OPK image (view_id_BE ++ sub_BE).
     let pk_be = pk.to_be_bytes();
     let pk_bytes = &pk_be[..16];
-    let found = engine.seek_family_bytes(CIRCUIT_NODES_TAB_ID, pk_bytes).unwrap();
+    let found = engine
+        .registry_mut()
+        .seek_family_bytes(CIRCUIT_NODES_TAB_ID, pk_bytes, None)
+        .unwrap();
     assert!(found.is_some(), "seek_family_bytes must find CircuitNodes row by PK");
     let found = found.unwrap();
     assert_eq!(found.count, 1, "seek_family_bytes must return exactly one row");

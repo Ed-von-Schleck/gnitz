@@ -28,8 +28,8 @@ fn assert_no_relation_residue(engine: &mut CatalogEngine, family: SysFamily, id:
         "entity_by_id holds the rejected {noun} {id}"
     );
     assert!(
-        !engine.dag.tables.contains_key(&id),
-        "dag.tables holds the rejected {noun} {id}"
+        !engine.registry().has_id(id),
+        "the registry holds the rejected {noun} {id}"
     );
     assert_eq!(
         count_records(engine.sys_store_mut(family)),
@@ -132,8 +132,8 @@ fn test_table_tab_dup_name_leaves_clean_state() {
         "entity_by_qname must still point to the original table after rejected duplicate"
     );
     assert!(
-        !engine.dag.tables.contains_key(&new_tid),
-        "new_tid must not appear in dag.tables"
+        !engine.registry().has_id(new_tid),
+        "new_tid must not appear in the registry"
     );
     assert_eq!(
         count_records(engine.sys_store_mut(SysFamily::Table)),
@@ -210,7 +210,7 @@ fn test_view_tab_too_many_cols_rejected() {
 
     let vid = engine.allocate_table_id().unwrap();
     // MAX_COLUMNS + 1 contiguous column records (col 0 is a valid U64 PK).
-    for i in 0..(crate::schema::MAX_COLUMNS as i64 + 1) {
+    for i in 0..(gnitz_store::schema::MAX_COLUMNS as i64 + 1) {
         write_col_at_index(&mut engine, vid, i, &col_def(&format!("c{i}"), type_code::U64)).unwrap();
     }
     let batch = build_view_tab_row(vid, "wideview", "");
@@ -280,7 +280,7 @@ fn test_idx_tab_view_owner_rejected() {
         .unwrap();
     let batch = build_view_tab_row(vid, "vowner", "");
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
-    assert!(engine.dag.tables.contains_key(&vid), "view registered");
+    assert!(engine.registry().has_id(vid), "view registered");
 
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Index));
     let idx_id = engine.allocate_index_id().unwrap();
@@ -303,7 +303,13 @@ fn test_idx_tab_view_owner_rejected() {
         "sys_indices must have no orphaned row"
     );
     assert!(
-        engine.dag.tables.get(&vid).unwrap().index_circuits.is_empty(),
+        engine
+            .registry()
+            .table_entry(vid)
+            .ok()
+            .unwrap()
+            .index_circuits
+            .is_empty(),
         "the view must not gain an index circuit"
     );
 
@@ -371,7 +377,7 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.leaktest", &cols, &[0]).unwrap();
-    let schema = engine.get_schema_desc(tid).unwrap();
+    let schema = engine.registry().get_schema_desc(tid).unwrap();
 
     // Ingest two rows that share the same 'val' — unique index backfill must fail.
     let mut bb = BatchBuilder::new(schema);
@@ -382,7 +388,7 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
     bb.put_u64(42u64);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.dag_mut().flush(tid).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // Capture the expected index directory before create_index allocates the id.
     let expected_idx_id = engine.next_index_id;
@@ -403,9 +409,9 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
     );
     assert!(
         engine
-            .dag
-            .tables
-            .get(&tid)
+            .registry()
+            .table_entry(tid)
+            .ok()
             .map(|e| e.index_circuits.is_empty())
             .unwrap_or(true),
         "no index circuit must be registered after failed CREATE INDEX"
@@ -545,14 +551,14 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
 // ---------------------------------------------------------------------------
 
 /// The durable relation-id ceiling is enforced at `precheck_family` — the point
-/// an id ENTERS the `dag.tables` namespace, BEFORE any mutation.
+/// an id ENTERS the registry namespace, BEFORE any mutation.
 ///
 /// Guarding `allocate_table_id` alone would not cover it: the register hooks take
 /// the id straight off the ingested row and `raise_id_counter` it, and that id is
 /// caller-chosen (a client may preset `circuit.view_id`). The ceiling is a
 /// conservative tripwire held safely short of the u32 physical contract every id
 /// narrows to (see `RELATION_ID_CEILING`). Both families whose PK is a
-/// `dag.tables` id must reject it. (Index ids are a disjoint namespace.)
+/// the registry id must reject it. (Index ids are a disjoint namespace.)
 #[test]
 fn precheck_rejects_relation_id_at_or_above_ceiling() {
     let dir = temp_dir("relation_id_ceiling_reject");
@@ -702,7 +708,7 @@ fn ddl_txn_hook_failure_negates_applied_not_enqueued() {
         "drained COL_TAB rows must net to zero (negated exactly once)"
     );
     assert!(
-        !engine.dag.tables.contains_key(&new_tid),
+        !engine.registry().has_id(new_tid),
         "no registered table survives the rollback"
     );
 
@@ -736,8 +742,8 @@ fn two_creates_of_one_name_in_one_batch_rejected() {
         .expect_err("two rows claiming public.twins must be rejected");
     assert!(err.contains("already exists"), "{err}");
 
-    assert!(!engine.dag.tables.contains_key(&a));
-    assert!(!engine.dag.tables.contains_key(&b));
+    assert!(!engine.registry().has_id(a));
+    assert!(!engine.registry().has_id(b));
     assert_eq!(
         count_records(engine.sys_store_mut(SysFamily::Table)),
         init_rows,
@@ -824,7 +830,7 @@ fn precheck_rejected_create_index_writes_no_ghost() {
 fn compensating_a_drop_keeps_the_restored_relation_directory() {
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let (mut engine, tid, dir) = table_fixture("compensate_drop_keeps_dir", &cols);
-    let reldir = engine.dag.tables.get(&tid).unwrap().directory.clone();
+    let reldir = engine.registry().table_entry(tid).unwrap().directory.clone();
     // The fixture's own CREATE is a committed DDL; only the bundle below is the
     // one being compensated.
     engine.drain_pending_broadcasts();
@@ -838,10 +844,7 @@ fn compensating_a_drop_keeps_the_restored_relation_directory() {
     );
     engine.precheck_family(SysFamily::Table, &drop_batch).unwrap();
     engine.apply_and_enqueue_family(SysFamily::Table, drop_batch).unwrap();
-    assert!(
-        !engine.dag.tables.contains_key(&tid),
-        "the drop must unregister the table"
-    );
+    assert!(!engine.registry().has_id(tid), "the drop must unregister the table");
     assert!(
         std::path::Path::new(&reldir).is_dir(),
         "a drop only queues the directory, it does not remove it"
@@ -895,10 +898,7 @@ fn zero_weight_catalog_row_rejected() {
         Some(tid),
         "the live relation must still resolve by name"
     );
-    assert!(
-        engine.dag.tables.contains_key(&tid),
-        "the relation must stay registered"
-    );
+    assert!(engine.registry().has_id(tid), "the relation must stay registered");
     assert!(
         engine.caches.schema_by_name.contains_key("public"),
         "the live schema must still resolve by name"

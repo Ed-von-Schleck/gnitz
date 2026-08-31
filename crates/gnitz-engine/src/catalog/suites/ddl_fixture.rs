@@ -99,10 +99,10 @@ impl CatalogEngine {
             .unwrap_or_default();
         let (views, tables): (Vec<i64>, Vec<i64>) = members
             .into_iter()
-            .partition(|id| self.dag.tables.get(id).is_some_and(|e| e.kind.is_view()));
+            .partition(|id| self.registry().entry(*id).is_some_and(|e| e.kind.is_view()));
         for vid in views {
             // Clears the plan caches only — the view stays registered, so the
-            // drop cascade's `dag.tables` guard still resolves it.
+            // drop cascade's the registry guard still resolves it.
             self.dag.invalidate(vid);
             self.submit_retraction(SysFamily::View, vid as u128)?;
         }
@@ -208,7 +208,7 @@ impl CatalogEngine {
             .ok_or_else(|| format!("View does not exist: {qualified}"))?;
 
         // Clears the plan caches only — the view stays registered, so the
-        // cascade's `dag.tables` guard still resolves it.
+        // cascade's the registry guard still resolves it.
         self.dag.invalidate(vid);
 
         // Retract only the VIEW_TAB row. Its -1 fires hook_relation_register, which

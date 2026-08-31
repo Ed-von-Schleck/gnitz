@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::{type_code, SchemaColumn};
+use gnitz_store::schema::{type_code, SchemaColumn};
 
 /// 3-column compound PK `(U32, U64, U64)` + one payload, so the columns have
 /// distinct widths and a prefix stride is unambiguous.
@@ -119,7 +119,7 @@ fn test_compute_co_partitioned_replicated() {
         SchemaColumn::new(type_code::I64, 0),
     ];
     let base = || SchemaDescriptor::new(&COLS, &[0]);
-    let replicated = SchemaDescriptor::new_with_placement(&COLS, &[0], crate::schema::Placement::Replicated);
+    let replicated = SchemaDescriptor::new_with_placement(&COLS, &[0], gnitz_store::schema::Placement::Replicated);
     let join_on_payload = || {
         let mut m = HashMap::new();
         m.insert(7i64, vec![(1u32, 0u8)]); // dim  shards on payload col 1

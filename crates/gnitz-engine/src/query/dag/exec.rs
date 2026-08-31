@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::query::compiler::PlanShape;
+use gnitz_store::storage::StorageError;
 use std::collections::BTreeMap;
 
 /// The DAG traversal's work queue: `(depth, view_id, source_id) → batch`.
@@ -19,8 +20,14 @@ impl DagEngine {
     /// view of any shape (arm 1), where the identity relay does run because the
     /// shape is still `Exchanged` but every worker already holds every source in
     /// full.
-    fn execute_epoch(&mut self, view_id: i64, input: Batch, source_id: i64) -> Result<Option<Batch>, String> {
-        self.run_view_epoch(view_id, input, source_id, |pre, _| pre)
+    fn execute_epoch(
+        &mut self,
+        registry: &RelationRegistry,
+        view_id: i64,
+        input: Batch,
+        source_id: i64,
+    ) -> Result<Option<Batch>, String> {
+        self.run_view_epoch(registry, view_id, input, source_id, |pre, _| pre)
     }
 
     /// Execute one view epoch through its compiled shape.
@@ -48,12 +55,13 @@ impl DagEngine {
     /// weight-merged input.
     fn run_view_epoch(
         &mut self,
+        registry: &RelationRegistry,
         view_id: i64,
         input: Batch,
         src_id: i64,
         mut relay: impl FnMut(Batch, i64) -> Batch,
     ) -> Result<Option<Batch>, String> {
-        if !self.ensure_compiled(view_id)? {
+        if !self.ensure_compiled(registry, view_id)? {
             gnitz_warn!("dag: run_view_epoch — no plan for view_id={}", view_id);
             return Ok(None);
         }
@@ -213,12 +221,13 @@ impl DagEngine {
     /// 6. Single — one-phase execute.
     fn execute_multi_worker_step<E: ExchangeCallback>(
         &mut self,
+        registry: &RelationRegistry,
         view_id: i64,
         input: Batch,
         src_id: i64,
         exchange: &mut E,
     ) -> Result<Option<Batch>, String> {
-        if !self.ensure_compiled(view_id)? {
+        if !self.ensure_compiled(registry, view_id)? {
             gnitz_warn!("dag: execute_multi_worker_step — no plan for view_id={}", view_id);
             return Ok(None);
         }
@@ -228,15 +237,15 @@ impl DagEngine {
         // result locally and the worker-0 scan reads it whole. Every worker
         // evaluates this identically, so they skip the same exchange rounds and the
         // collective barrier stays balanced.
-        if self.relation_is_replicated(view_id) {
-            return self.execute_epoch(view_id, input, src_id);
+        if registry.relation_is_replicated(view_id) {
+            return self.execute_epoch(registry, view_id, input, src_id);
         }
 
         // Routing comes off the one memoized `ViewMeta` the master relay also
         // reads; the plan supplies only its executable shape. Taken before the
         // plan borrow so the `&mut self` memo lookup and the `&self` cache read
         // do not overlap.
-        let meta = self.view_meta(view_id);
+        let meta = self.view_meta(registry, view_id);
         let plan = self.cache.get(&view_id).unwrap();
         let is_range_join = meta.range_join_n_eq.is_some();
         let sides = match &plan.shape {
@@ -249,11 +258,13 @@ impl DagEngine {
         if is_range_join {
             // Arm 2 — relay the input delta first, then the exchanged pipeline.
             let bc = exchange.do_exchange(view_id, &input, src_id);
-            self.run_view_epoch(view_id, bc, src_id, |pre, key| exchange.do_exchange(view_id, &pre, key))
+            self.run_view_epoch(registry, view_id, bc, src_id, |pre, key| {
+                exchange.do_exchange(view_id, &pre, key)
+            })
         } else if sides > 0 {
             // Arms 3 + 4 — the exchanged pipeline; the relay elides the IPC when
             // the unary output shuffle is a proven no-op.
-            self.run_view_epoch(view_id, input, src_id, |pre, key| {
+            self.run_view_epoch(registry, view_id, input, src_id, |pre, key| {
                 if skip_output_exchange {
                     pre
                 } else {
@@ -263,10 +274,10 @@ impl DagEngine {
         } else if join_scatter {
             // Arm 5 — scatter the delta by the join-shard cols before the pipeline.
             let exchanged = exchange.do_exchange(view_id, &input, src_id);
-            self.execute_epoch(view_id, exchanged, src_id)
+            self.execute_epoch(registry, view_id, exchanged, src_id)
         } else {
             // Arm 6 — single-phase execute.
-            self.execute_epoch(view_id, input, src_id)
+            self.execute_epoch(registry, view_id, input, src_id)
         }
     }
 
@@ -283,12 +294,13 @@ impl DagEngine {
     /// fan downstream — just run its step and ingest.
     pub fn backfill_view_step_multi_worker<E: ExchangeCallback>(
         &mut self,
+        registry: &mut RelationRegistry,
         view_id: i64,
         source_id: i64,
         delta: Batch,
         exchange: &mut E,
     ) -> Result<bool, String> {
-        if !self.tables.contains_key(&view_id) {
+        if !registry.has_id(view_id) {
             return Ok(false);
         }
         // A backfilled view must be ephemeral: a durable one loads its shards
@@ -298,13 +310,14 @@ impl DagEngine {
         // `invalid_views` holds only view ids, and a backfill on a stream is
         // rejected before this.
         debug_assert!(
-            self.tables.get(&view_id).is_none_or(|e| e.kind.is_view()),
+            registry.relation_kind(view_id).is_none_or(|k| k.is_view()),
             "distributed backfill into durable relation {view_id}: \
              would double-count loaded shards",
         );
-        match self.execute_multi_worker_step(view_id, delta, source_id, exchange)? {
+        match self.execute_multi_worker_step(registry, view_id, delta, source_id, exchange)? {
             Some(out) if out.count > 0 => {
-                self.ingest_returning_effective(view_id, out)
+                registry
+                    .ingest_returning_effective(view_id, out)
                     .map_err(|e| e.to_string())?;
                 Ok(true)
             }
@@ -327,6 +340,7 @@ impl DagEngine {
     /// delta, and is what makes "give me what changed since N" answerable.
     pub fn evaluate_dag_multi_worker<E: ExchangeCallback>(
         &mut self,
+        registry: &mut RelationRegistry,
         source_id: i64,
         delta: Batch,
         tick_round: u64,
@@ -337,7 +351,7 @@ impl DagEngine {
             return Ok(());
         };
 
-        let mut pending = self.build_pending(view_ids, source_id, delta);
+        let mut pending = Self::build_pending(registry, view_ids, source_id, delta);
         let mut dirty_views: FxHashSet<i64> = FxHashSet::default();
         let mut popped_depth = i32::MIN;
 
@@ -353,33 +367,35 @@ impl DagEngine {
             popped_depth = depth;
 
             // The table may have been dropped between queueing and now.
-            if !self.tables.contains_key(&view_id) {
+            if !registry.has_id(view_id) {
                 continue;
             }
 
             let out_delta = self
-                .execute_multi_worker_step(view_id, input, src_id, exchange)?
+                .execute_multi_worker_step(registry, view_id, input, src_id, exchange)?
                 .filter(|b| b.count > 0);
 
             if let Some(out) = out_delta.as_ref() {
                 dirty_views.insert(view_id);
-                self.ingest_view_delta(view_id, out, tick_round)
+                registry
+                    .ingest_view_delta(view_id, out, tick_round)
                     .map_err(|e| format!("view store ingest failed (view_id={view_id}): {e}"))?;
             }
 
             // Fan the output onto each dependent edge. Both borrows are shared
             // and disjoint from each other; `map_or` yields an empty slice for a
             // terminal view, which `queue_dependents` no-ops on.
-            let src_schema = self.tables[&view_id].schema;
+            let src_schema = registry.table_entry(view_id).expect("checked above").schema;
             let dep_view_ids = self.dep.forward.get(&view_id).map_or(&[][..], Vec::as_slice);
-            Self::queue_dependents(&mut pending, &self.tables, dep_view_ids, view_id, src_schema, out_delta);
+            Self::queue_dependents(&mut pending, registry, dep_view_ids, view_id, src_schema, out_delta);
         }
 
         // A failure here is a RAM-tier spill fault: the view store can no longer
         // be bounded, and continuing would grow memory unchecked under a
         // sustained fault.
         for vid in dirty_views {
-            self.flush(vid)
+            registry
+                .flush(vid)
                 .map_err(|e| format!("view store flush failed (view_id={vid}): {e}"))?;
         }
         Ok(())
@@ -387,14 +403,14 @@ impl DagEngine {
 
     /// Seed the pending queue from `source_id`'s direct dependents. The last live
     /// one takes ownership of `delta`; the rest get clones.
-    fn build_pending(&self, view_ids: &[i64], source_id: i64, delta: Batch) -> Pending {
+    fn build_pending(registry: &RelationRegistry, view_ids: &[i64], source_id: i64, delta: Batch) -> Pending {
         let mut pending = Pending::new();
-        let Some(last_idx) = view_ids.iter().rposition(|&vid| self.tables.contains_key(&vid)) else {
+        let Some(last_idx) = view_ids.iter().rposition(|&vid| registry.has_id(vid)) else {
             return pending;
         };
         let mut delta = Some(delta);
         for (i, &vid) in view_ids.iter().enumerate() {
-            let Some(depth) = self.tables.get(&vid).map(|e| e.depth) else {
+            let Some(depth) = registry.entry(vid).map(|e| e.depth) else {
                 continue;
             };
             let batch = if i == last_idx {
@@ -419,13 +435,13 @@ impl DagEngine {
     /// the operand with it would trip the vm seed guard.
     fn queue_dependents(
         pending: &mut Pending,
-        tables: &FxHashMap<i64, TableEntry>,
+        registry: &RelationRegistry,
         dep_view_ids: &[i64],
         view_id: i64,
         src_schema: SchemaDescriptor,
         mut delta: Option<Batch>,
     ) {
-        let depth_of = |dep_id: i64| tables.get(&dep_id).map(|e| e.depth);
+        let depth_of = |dep_id: i64| registry.entry(dep_id).map(|e| e.depth);
         // A dependent already holding rows takes a merge; one holding an empty
         // placeholder takes a fill, because `op_union` against an empty operand
         // clones the other one whole — the copy this split exists to avoid.

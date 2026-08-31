@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::runtime::w2m::{worker_mask, BitIter};
-use gnitz_engine::foundation::fault::Seam;
+use gnitz_store::foundation::fault::Seam;
 
 /// Route a ScanSpec read, as the [`Fanout`] every fan-out helper speaks.
 ///
@@ -32,14 +32,14 @@ pub(crate) fn scan_spec_route(disp: &MasterDispatcher, target_id: i64, spec: Spe
 /// after the fork, so its own handles cannot speak for the workers'.
 fn confined_worker(disp: &MasterDispatcher, target_id: i64, spec: SpecBytes<'_>) -> Option<usize> {
     let cat = disp.cat();
-    let schema = cat.get_schema_desc(target_id)?;
+    let schema = cat.registry().get_schema_desc(target_id)?;
     // For anything but `Keyed` no key names an owner, so nothing can be routed
     // against a placement the write path scatters differently.
     if !schema.placement().is_key_routed() {
         return None;
     }
     let desc = gnitz_wire::peek_pk_range(spec)?;
-    gnitz_engine::catalog::scan_spec_worker(&schema, &desc, disp.num_workers)
+    gnitz_store::read::scan_spec_worker(&schema, &desc, disp.num_workers)
 }
 
 /// Ceiling on the synchronous `W2mReceiver::wait_any` park in the collect loop
@@ -592,14 +592,15 @@ impl MasterDispatcher {
         // that cannot hit, and such a view needs no rule anyway: one whose
         // sources are all replicated is itself stamped replicated and computes
         // locally without ever reaching an exchange.
-        let n_src = if source_id > 0 && cat.dag().relation_is_replicated(source_id) {
+        let n_src = if source_id > 0 && cat.registry().relation_is_replicated(source_id) {
             1
         } else {
             payloads.len()
         };
         let sources: Vec<Option<&Batch>> = payloads[..n_src].iter().map(|o| o.as_ref()).collect();
 
-        let meta = cat.dag_mut().view_meta(view_id);
+        let (dag, registry) = cat.dag_and_registry_mut();
+        let meta = dag.view_meta(registry, view_id);
         let dest = match meta.relay_route(source_id) {
             RelayRoute::NoSingleKey => {
                 return Err(format!(
@@ -750,13 +751,13 @@ impl MasterDispatcher {
         seek_pk_extra: &[u8],
     ) -> Result<W2mSlot, String> {
         let num_workers = self.num_workers;
-        let schema = self.cat().schema_or_err(target_id, "seek")?;
+        let schema = self.cat().registry().schema_or_err(target_id, "seek")?;
         // Decode the wire pair to the OPK bytes (width-universal), then route off
         // the distribution prefix via the shared `worker_for_pk`. A Seek
         // always carries the full PK and the prefix ⊆ the PK, so a full-PK seek
         // pins exactly one worker — no broadcast clause. Hashing the native value
         // instead of the OPK bytes would misroute signed and compound PKs.
-        let opk = gnitz_engine::schema::key::seek_opk_bytes(&schema, pk, seek_pk_extra)
+        let opk = gnitz_store::schema::key::seek_opk_bytes(&schema, pk, seek_pk_extra)
             .map_err(|e| format!("seek: table {target_id}: {e}"))?;
         let worker = schema.worker_for_pk(opk.pk_bytes(), num_workers);
         let (mut slots, _scan) = dispatch_scan_fanout(self, reactor, Fanout::One(worker), |targets| {
@@ -1107,13 +1108,13 @@ impl MasterDispatcher {
     /// gate answer "nothing changed" over a round whose rows are already in flight.
     fn record_delta_round(&self, tid: i64, round: u64) {
         let cat = self.cat();
-        if !cat.dag().any_delta_feed() {
+        if !cat.registry().any_delta_feed() {
             return;
         }
         let reached = cat.dag_mut().dependent_closure(vec![tid]);
         let mut map = self.last_delta_round.borrow_mut();
         for vid in reached {
-            if cat.dag().relation_has_delta_feed(vid) {
+            if cat.registry().relation_has_delta_feed(vid) {
                 map.insert(vid, round);
             }
         }
@@ -1367,6 +1368,7 @@ impl MasterDispatcher {
     /// has no schema (committer should only see tables that validated).
     pub fn schema_desc_for(&self, target_id: i64) -> SchemaDescriptor {
         self.cat()
+            .registry()
             .get_schema_desc(target_id)
             .unwrap_or_else(|| panic!("master: no schema for target_id={target_id}"))
     }

@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use io_uring::types::FutexWaitV;
 
 use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg};
-use gnitz_engine::foundation::posix_io;
+use gnitz_store::foundation::posix_io;
 use gnitz_wire::align8;
 
 // ---------------------------------------------------------------------------
@@ -1070,8 +1070,8 @@ impl W2mReceiver {
 /// The caller must keep the returned region alive for as long as anything reads
 /// or writes the ring.
 #[cfg(test)]
-pub(crate) unsafe fn test_ring(capacity: usize) -> gnitz_engine_testkit::SharedRegion {
-    let region = gnitz_engine_testkit::SharedRegion::new(capacity);
+pub(crate) unsafe fn test_ring(capacity: usize) -> crate::runtime::test_support::SharedRegion {
+    let region = crate::runtime::test_support::SharedRegion::new(capacity);
     init_region(region.ptr(), capacity as u64);
     region
 }
@@ -1083,7 +1083,7 @@ pub(crate) unsafe fn test_ring(capacity: usize) -> gnitz_engine_testkit::SharedR
 /// # Safety
 /// As [`test_ring`].
 #[cfg(test)]
-pub(crate) unsafe fn make_ring(msg_sz: usize, n_msgs: usize, slack: u64) -> gnitz_engine_testkit::SharedRegion {
+pub(crate) unsafe fn make_ring(msg_sz: usize, n_msgs: usize, slack: u64) -> crate::runtime::test_support::SharedRegion {
     let capacity = W2M_HEADER_SIZE as u64 + n_msgs as u64 * (8 + align8(msg_sz) as u64) + slack;
     test_ring(capacity as usize)
 }

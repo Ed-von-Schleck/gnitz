@@ -1,12 +1,12 @@
 use super::*;
-use crate::schema::{type_code, SchemaColumn};
+use gnitz_store::schema::{type_code, SchemaColumn};
 
 /// `union_nullability_merge` ORs the two inputs' per-column nullability, so a
 /// null-carrying side reclassifies the output from the null-blind
 /// `FixedIntNonnull` fast comparator to the null-aware `Generic` one.
 #[test]
 fn test_union_nullability_merge_classification() {
-    use crate::schema::PayloadCmpKind;
+    use gnitz_store::schema::PayloadCmpKind;
     let pk = SchemaColumn::new(type_code::U128, 0);
     let nonnull = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 0)], &[0]);
     let nullable = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 1)], &[0]);
@@ -54,7 +54,7 @@ fn test_union_mismatched_input_layout_rejected() {
             &subgraph_ordered(&loaded, 2),
             &HashMap::from([(10, one), (11, b)]),
             test_site("", 1),
-            crate::schema::Placement::KEYED_DEFAULT,
+            gnitz_store::schema::Placement::KEYED_DEFAULT,
             PlanTarget::Subgraph { out: 2 },
         )
     };
@@ -85,7 +85,7 @@ fn test_subgraph_output_is_the_named_node() {
             ordered,
             &ext,
             test_site("", 1),
-            crate::schema::Placement::KEYED_DEFAULT,
+            gnitz_store::schema::Placement::KEYED_DEFAULT,
             PlanTarget::Subgraph { out: 1 },
         )
     };
@@ -130,7 +130,7 @@ fn test_mismatched_sink_schema_rejected() {
         &loaded.ordered,
         &HashMap::from([(10, source_schema)]),
         test_site("", 1),
-        crate::schema::Placement::KEYED_DEFAULT,
+        gnitz_store::schema::Placement::KEYED_DEFAULT,
         PlanTarget::ViewOutput {
             out_schema: &view_schema,
             seeds: &[],
@@ -162,7 +162,7 @@ fn test_build_plan_register_overflow_rejected() {
         &loaded.ordered,
         &HashMap::new(),
         test_site("", 1),
-        crate::schema::Placement::KEYED_DEFAULT,
+        gnitz_store::schema::Placement::KEYED_DEFAULT,
         PlanTarget::ViewOutput {
             out_schema: &SchemaDescriptor::minimal_u64(),
             seeds: &[],
@@ -181,7 +181,7 @@ fn test_build_plan_register_overflow_rejected() {
 /// kinds: the three matching kinds compile, the six cross pairings reject.
 #[test]
 fn reduce_out_key_validation_rejects_mismatch() {
-    use crate::schema::ReduceOutKey;
+    use gnitz_store::schema::ReduceOutKey;
     use gnitz_wire::{AggFunc, OpNode};
     let compiles = |in_schema: SchemaDescriptor, group: Vec<u32>, out_key: ReduceOutKey| -> bool {
         compiles_mid_node(
@@ -271,7 +271,7 @@ fn test_build_plan_wide_pk_join_accepted() {
             &subgraph_ordered(&loaded, 2),
             &ext,
             test_site(view_dir, 1),
-            crate::schema::Placement::KEYED_DEFAULT,
+            gnitz_store::schema::Placement::KEYED_DEFAULT,
             PlanTarget::Subgraph { out: 2 }
         )
         .is_ok(),
@@ -312,7 +312,7 @@ fn test_build_plan_sink_schema_type_mismatch_rejected() {
         &loaded.ordered,
         &ext,
         test_site("", 99),
-        crate::schema::Placement::KEYED_DEFAULT,
+        gnitz_store::schema::Placement::KEYED_DEFAULT,
         PlanTarget::ViewOutput {
             out_schema: &view_schema,
             seeds: &[],
@@ -370,7 +370,7 @@ fn test_build_plan_compound_reindex_accepted() {
     );
     // The sink validates against the reindex Map's output schema (2 synthetic
     // PK slots [U64, I64] + the two input columns).
-    let out_schema = crate::schema::key::ReindexPacker::new(&in_schema, &[0, 1], &[])
+    let out_schema = gnitz_store::schema::key::ReindexPacker::new(&in_schema, &[0, 1], &[])
         .unwrap()
         .output_schema(&in_schema, &[0, 1])
         .unwrap();
@@ -392,7 +392,7 @@ fn test_build_plan_compound_reindex_accepted() {
 #[test]
 fn test_build_plan_reindex_exceeds_max_pk_columns_rejected() {
     // 6-column source, reindex on all 6 → pk_n (6) > MAX_PK_COLUMNS (5).
-    let n_cols = crate::schema::MAX_PK_COLUMNS + 1;
+    let n_cols = gnitz_store::schema::MAX_PK_COLUMNS + 1;
     let cols: Vec<SchemaColumn> = (0..n_cols).map(|_| SchemaColumn::new(type_code::U64, 0)).collect();
     let in_schema = SchemaDescriptor::new(&cols, &[0]);
     let reindex_cols: Vec<u32> = (0..n_cols as u32).collect();
@@ -424,7 +424,7 @@ fn test_build_plan_pruned_reindex_compiles() {
         ],
         &[0],
     );
-    let out_schema = crate::schema::key::ReindexPacker::new(&in_schema, &[0], &[])
+    let out_schema = gnitz_store::schema::key::ReindexPacker::new(&in_schema, &[0], &[])
         .unwrap()
         .output_schema(&in_schema, &[2])
         .unwrap();
@@ -501,7 +501,7 @@ fn test_build_plan_cleans_scratch_dirs_on_failure() {
         &subgraph_ordered(&loaded, 2),
         &ext,
         test_site(view_dir.to_str().unwrap(), 1),
-        crate::schema::Placement::KEYED_DEFAULT,
+        gnitz_store::schema::Placement::KEYED_DEFAULT,
         PlanTarget::Subgraph { out: 2 },
     );
     assert!(result.is_err(), "out-of-bounds projection must fail the compile");
@@ -560,7 +560,7 @@ fn chained_exchange_rejects_instead_of_panicking() {
         &side_ordered,
         &ext,
         test_site(dir.path().to_str().unwrap(), 1),
-        crate::schema::Placement::KEYED_DEFAULT,
+        gnitz_store::schema::Placement::KEYED_DEFAULT,
         PlanTarget::Subgraph { out: ex_in },
     );
     assert!(
@@ -646,7 +646,7 @@ impl MidCircuit {
             &ordered,
             &ext,
             test_site(&dir, 1),
-            crate::schema::Placement::KEYED_DEFAULT,
+            gnitz_store::schema::Placement::KEYED_DEFAULT,
             target,
         )
     }
@@ -688,7 +688,7 @@ fn range_join_plan(
         &subgraph_ordered(&loaded, 3),
         &ext,
         test_site(dir.path().to_str().unwrap(), 1),
-        crate::schema::Placement::KEYED_DEFAULT,
+        gnitz_store::schema::Placement::KEYED_DEFAULT,
         PlanTarget::Subgraph { out: 3 },
     )
 }
@@ -763,7 +763,7 @@ fn mid_node_rejection(in_schema: SchemaDescriptor, mid: gnitz_wire::OpNode) -> S
 
 #[test]
 fn test_reduce_group_cols_out_of_bounds_rejected() {
-    use crate::schema::ReduceOutKey;
+    use gnitz_store::schema::ReduceOutKey;
     use gnitz_wire::{AggFunc, OpNode};
     let reduce = |group: Vec<u32>| OpNode::Reduce {
         group_cols: group,
@@ -779,7 +779,7 @@ fn test_reduce_group_cols_out_of_bounds_rejected() {
 
 #[test]
 fn test_reduce_agg_spec_col_out_of_bounds_rejected() {
-    use crate::schema::ReduceOutKey;
+    use gnitz_store::schema::ReduceOutKey;
     use gnitz_wire::{AggFunc, OpNode};
     let reduce = |col: u32| OpNode::Reduce {
         group_cols: vec![0],
@@ -799,7 +799,7 @@ fn test_reduce_agg_spec_col_out_of_bounds_rejected() {
 /// that bypasses it.
 #[test]
 fn test_value_reading_aggregate_over_non_encodable_column_rejected() {
-    use crate::schema::ReduceOutKey;
+    use gnitz_store::schema::ReduceOutKey;
     use gnitz_wire::{AggFunc, OpNode};
     // col 0 = U64 PK and the whole group key (⇒ PkPermutation); col 1 = the
     // aggregate column, whose type is the only thing varying.
@@ -846,7 +846,7 @@ fn test_projection_col_out_of_bounds_rejected() {
     // Exactly MAX_COLUMNS payload sources already overflow — the schema also
     // carries the input's PK column, which a length-only bound misses.
     assert_eq!(
-        rejection(vec![1; crate::schema::MAX_COLUMNS]),
+        rejection(vec![1; gnitz_store::schema::MAX_COLUMNS]),
         "projection map: output exceeds MAX_COLUMNS"
     );
 }
@@ -862,7 +862,7 @@ fn test_null_extend_overflow_rejected() {
     assert!(compiles_mid_node(two_col_schema(), extend(1)));
     // MAX_COLUMNS type_codes overflow the fixed `[_; 65]` schema array.
     assert_eq!(
-        mid_node_rejection(two_col_schema(), extend(crate::schema::MAX_COLUMNS)),
+        mid_node_rejection(two_col_schema(), extend(gnitz_store::schema::MAX_COLUMNS)),
         GUARD
     );
     // (An undecodable type code is rejected at the wire decode boundary,
@@ -954,7 +954,7 @@ fn a_destructive_op_takes_its_input_only_when_it_is_the_last_reader() {
             &loaded.ordered,
             &ext,
             test_site(dir.path().to_str().unwrap(), 1),
-            crate::schema::Placement::KEYED_DEFAULT,
+            gnitz_store::schema::Placement::KEYED_DEFAULT,
             PlanTarget::Subgraph { out: distinct_id },
         )
         .expect("both orderings compile");
@@ -987,7 +987,7 @@ fn a_union_of_two_unread_operands_takes_both_sides() {
         &loaded.ordered,
         &HashMap::from([(10, two_col_schema()), (11, two_col_schema())]),
         test_site("", 1),
-        crate::schema::Placement::KEYED_DEFAULT,
+        gnitz_store::schema::Placement::KEYED_DEFAULT,
         PlanTarget::Subgraph { out: 2 },
     )
     .expect("a two-source union compiles");
@@ -1009,7 +1009,7 @@ fn a_union_over_the_sink_register_does_not_take_it() {
         &loaded.ordered,
         &HashMap::from([(10, two_col_schema())]),
         test_site("", 1),
-        crate::schema::Placement::KEYED_DEFAULT,
+        gnitz_store::schema::Placement::KEYED_DEFAULT,
         PlanTarget::Subgraph { out: 1 },
     )
     .expect("a union over the plan's own output register compiles");
@@ -1046,7 +1046,7 @@ fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
             &loaded.ordered,
             &ext,
             test_site(dir.path().to_str().unwrap(), 1),
-            crate::schema::Placement::KEYED_DEFAULT,
+            gnitz_store::schema::Placement::KEYED_DEFAULT,
             PlanTarget::Subgraph { out: 3 },
         )
     };
@@ -1062,7 +1062,7 @@ fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
 
 #[test]
 fn test_destructive_fanout_skipped_distinct_not_rejected() {
-    use crate::schema::ReduceOutKey;
+    use gnitz_store::schema::ReduceOutKey;
     // `ScanDelta → Reduce → {Distinct, Negate}`: the Distinct schedules before
     // its co-reader, the destructive-first shape the guard rejects. But a
     // Reduce's output is already distinct, so the elision pass drops the
@@ -1099,7 +1099,7 @@ fn test_destructive_fanout_skipped_distinct_not_rejected() {
             &loaded.ordered,
             &ext,
             test_site(view_dir, 1),
-            crate::schema::Placement::KEYED_DEFAULT,
+            gnitz_store::schema::Placement::KEYED_DEFAULT,
             PlanTarget::Subgraph { out: 2 }
         )
         .is_ok(),
@@ -1131,8 +1131,8 @@ fn test_build_plan_child_table_failure_rejected() {
 /// `ReindexPacker::output_schema` cannot drift apart into a mixed-type copy.
 #[test]
 fn test_derived_map_schemas_satisfy_copy_types() {
-    use crate::expr::{MapPlan, PkSource};
     use gnitz_expr::LogicalProgram;
+    use gnitz_store::expr::{MapPlan, PkSource};
     let in_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
@@ -1148,7 +1148,7 @@ fn test_derived_map_schemas_satisfy_copy_types() {
     let cols: Vec<u32> = vec![0, 1, 2, 3, 4];
     let prog = || LogicalProgram::copy_cols(&cols);
     let payload_cols = prog().payload_copy_srcs().unwrap().to_vec();
-    let reindexed = crate::schema::key::ReindexPacker::new(&in_schema, &[4], &[type_code::U64])
+    let reindexed = gnitz_store::schema::key::ReindexPacker::new(&in_schema, &[4], &[type_code::U64])
         .unwrap()
         .output_schema(&in_schema, &payload_cols)
         .unwrap();

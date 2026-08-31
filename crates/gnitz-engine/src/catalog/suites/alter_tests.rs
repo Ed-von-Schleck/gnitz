@@ -79,10 +79,7 @@ fn rename_fires_no_cascade_and_leaves_dir_untouched() {
     engine.ingest_to_family(TABLE_TAB_ID, &pair).unwrap();
 
     // The registration survives; no directory is queued or removed.
-    assert!(
-        engine.dag.tables.contains_key(&tid),
-        "rename must not unregister the table"
-    );
+    assert!(engine.registry().has_id(tid), "rename must not unregister the table");
     assert!(Path::new(&table_path).exists(), "rename must not delete the table dir");
     assert!(
         engine.pending_dir_deletions.is_empty(),
@@ -112,13 +109,13 @@ fn rename_then_reopen_resolves_flushed_data() {
         let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
         tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
         // Flush a row so only the on-disk (id-only) path can serve it after reopen.
-        let schema = engine.get_schema_desc(tid).unwrap();
+        let schema = engine.registry().get_schema_desc(tid).unwrap();
         let mut bb = BatchBuilder::new(schema);
         bb.begin_row(7u128, 1);
         bb.put_u64(70);
         bb.end_row();
         engine.ingest_to_family(tid, &bb.finish()).unwrap();
-        engine.dag_mut().flush(tid).unwrap();
+        engine.registry_mut().flush(tid).unwrap();
 
         let pair = table_rename_pair(&engine, tid, "renamed");
         engine.ingest_to_family(TABLE_TAB_ID, &pair).unwrap();
@@ -251,11 +248,7 @@ fn system_range_mutations_rejected() {
 
     // Nothing was torn down or aliased on the way to the reject.
     for family in SysFamily::ALL {
-        assert!(
-            engine.dag.tables.contains_key(&family.id()),
-            "{} unregistered",
-            family.name()
-        );
+        assert!(engine.registry().has_id(family.id()), "{} unregistered", family.name());
     }
     assert!(engine.pending_dir_deletions.is_empty());
     assert_eq!(
@@ -447,7 +440,7 @@ fn insert_first_rename_pair_lands_the_new_name() {
         "entity_by_id must carry the new name"
     );
     assert!(
-        engine.dag.tables.contains_key(&tid),
+        engine.registry().has_id(tid),
         "a rename must not unregister the table, whatever the row order"
     );
     assert!(

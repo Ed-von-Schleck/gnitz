@@ -13,16 +13,44 @@ impl CatalogEngine {
     // accessor, and each one is where the next field behind it stops being
     // reachable.
 
-    /// The relation DAG: registered tables, views and their compiled circuits.
+    /// The relation DAG: compiled circuits, the dependency map and the memoized
+    /// per-view metadata.
     pub fn dag(&self) -> &DagEngine {
         &self.dag
     }
 
-    /// [`Self::dag`] for the callers that register, flush or re-order relations.
-    /// The caches this engine maintains index into the DAG by id, so mutations
-    /// here must leave the id set alone unless they go through a hook.
+    /// [`Self::dag`] for the callers that flush or re-order relations. The caches
+    /// this engine maintains index into the registry by id, so mutations here
+    /// must leave the id set alone unless they go through a hook.
     pub fn dag_mut(&mut self) -> &mut DagEngine {
         &mut self.dag
+    }
+
+    /// Which relations exist, and the stores behind them. There are no thin
+    /// delegators beside it: a `CatalogEngine::relation_kind` would hide the rung
+    /// its answer came from, and every call site has to be rewritten either way.
+    pub fn registry(&self) -> &RelationRegistry {
+        &self.registry
+    }
+
+    /// [`Self::registry`] for the callers that register, ingest into or flush a
+    /// relation.
+    pub fn registry_mut(&mut self) -> &mut RelationRegistry {
+        &mut self.registry
+    }
+
+    /// Both halves at once, proven disjoint here rather than asserted at each
+    /// caller. The epoch entries need it: they read the plan cache while
+    /// ingesting into the registry.
+    ///
+    /// **A caller that outlives the borrow — the server launders this pair
+    /// through raw pointers, so its dispatch loop can serve pushes and reads
+    /// while an epoch is parked — owes one thing: no relation may be registered
+    /// or unregistered for the duration.** A `DdlSync` arriving mid-wait is
+    /// queued and replayed after the epoch returns, which is what keeps the
+    /// registry's map from rehashing under a live reference into it.
+    pub fn dag_and_registry_mut(&mut self) -> (&mut DagEngine, &mut RelationRegistry) {
+        (&mut self.dag, &mut self.registry)
     }
 
     /// Enter the DDL zone at `lsn`: every store LSN written until
@@ -45,20 +73,9 @@ impl CatalogEngine {
         self.durable_generation
     }
 
-    /// The generation a manifest must carry to be resumed from. Equal to
-    /// [`Self::durable_generation`] except across the recovery-start bump.
-    pub fn resume_generation(&self) -> u64 {
-        self.resume_generation
-    }
-
     /// The data directory this engine's relations live under.
     pub fn base_dir(&self) -> &str {
         &self.base_dir
-    }
-
-    /// Rows per `drain_chunk` call on every chunked scan this engine drives.
-    pub fn ddl_scan_chunk_rows(&self) -> usize {
-        self.ddl_scan_chunk_rows
     }
 
     /// The high-water mark of user SERIAL sequence `seq_id` (== the table id) —
@@ -93,56 +110,6 @@ impl CatalogEngine {
             .get(&table_id)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
-    }
-
-    /// All index circuits on a table (empty when none) — the one-pass
-    /// accessor for consumers that walk every circuit (e.g. the master's
-    /// unique-filter descriptors).
-    pub fn index_circuits(&self, table_id: i64) -> &[crate::query::IndexCircuitEntry] {
-        self.dag
-            .tables
-            .get(&table_id)
-            .map(|e| e.index_circuits.as_slice())
-            .unwrap_or(&[])
-    }
-
-    /// Get index circuit info at index: (col_indices, is_unique). Production
-    /// consumers go through `index_circuits` / `index_circuit_for_cols`; only
-    /// the catalog tests enumerate raw circuit info.
-    #[cfg(test)]
-    pub(crate) fn get_index_circuit_info(&self, table_id: i64, idx: usize) -> Option<(PkColList, bool)> {
-        let entry = self.dag.tables.get(&table_id)?;
-        let ic = entry.index_circuits.get(idx)?;
-        Some((ic.col_indices, ic.is_unique))
-    }
-
-    /// Reject a column list that is malformed or names a column outside
-    /// `table_id`'s schema. The one admission test for every frame carrying a
-    /// `pack_pk_cols` word: the master applies it as an early client-facing
-    /// reject, the worker as its trust boundary, and both render the same error.
-    pub fn validate_index_cols(&self, table_id: i64, cols: &PkColList, op: &str) -> Result<(), String> {
-        let in_range = |s: &SchemaDescriptor| {
-            cols.is_well_formed() && cols.as_slice().iter().all(|&c| (c as usize) < s.num_columns())
-        };
-        match self.get_schema_desc(table_id) {
-            Some(s) if in_range(&s) => Ok(()),
-            _ => Err(format!("{op}: invalid column list for table {table_id}")),
-        }
-    }
-
-    /// The secondary index circuit on `cols` of `table_id`, if one exists. The
-    /// SEEK_BY_INDEX handler matches the `Option` once — `None` answers
-    /// STATUS_NO_INDEX (so the SQL planner falls back to a scan or a CREATE INDEX
-    /// hint without a prior catalog probe), `Some` broadcasts the seek.
-    pub fn index_circuit_for_cols(&self, table_id: i64, cols: &[u32]) -> Option<&crate::query::IndexCircuitEntry> {
-        self.dag.tables.get(&table_id)?.index_circuit_on(cols)
-    }
-
-    /// True if the table has at least one unique secondary index circuit.
-    /// Used to decide whether distributed unique-index validation is needed.
-    /// Non-unique circuits (e.g. FK indices) do not count.
-    pub fn has_any_unique_index(&self, table_id: i64) -> bool {
-        self.index_circuits(table_id).iter().any(|ic| ic.is_unique)
     }
 
     /// Return the cached schema wire entry (block, version) for
@@ -186,7 +153,7 @@ impl CatalogEngine {
     pub fn has_row_constraints(&self, table_id: i64) -> bool {
         !self.fk_constraints_of(table_id).is_empty()
             || !self.fk_children_of(table_id).is_empty()
-            || self.has_any_unique_index(table_id)
+            || self.registry.has_any_unique_index(table_id)
     }
 
     /// Does validating a write of `mode` to `table_id` read committed state?
@@ -196,51 +163,6 @@ impl CatalogEngine {
     /// does can be invalidated by a concurrent write to the same table.
     pub fn push_reads_committed_state(&self, table_id: i64, mode: gnitz_wire::WireConflictMode) -> bool {
         self.has_row_constraints(table_id) || matches!(mode, gnitz_wire::WireConflictMode::Error)
-    }
-
-    // -- Store handle accessors -----------------------------------------------
-
-    /// A user relation's own store, or `None` if the relation is absent,
-    /// detached, or a `Borrowed` system table.
-    pub fn get_store_handle(&self, table_id: i64) -> Option<&Table> {
-        self.dag.tables.get(&table_id).and_then(|e| e.handle.as_owned())
-    }
-
-    /// Whether `tid`'s store came back from a checkpoint manifest at this open,
-    /// rather than being erased or created empty. `false` for a relation this
-    /// process holds no owned store for.
-    pub fn store_resumed(&self, tid: i64) -> bool {
-        self.dag
-            .tables
-            .get(&tid)
-            .and_then(|e| e.handle.as_owned())
-            .is_some_and(|t| t.resumed_from_checkpoint())
-    }
-
-    /// The registry entry for `table_id`, or the shared "Unknown table_id"
-    /// error every hard-resolving store path reports.
-    pub(crate) fn table_entry(&self, table_id: i64) -> Result<&crate::query::TableEntry, String> {
-        self.dag
-            .tables
-            .get(&table_id)
-            .ok_or_else(|| format!("Unknown table_id {table_id}"))
-    }
-
-    /// Get schema descriptor for a table. Registry-uniform: system tables are
-    /// pre-registered before any caller can run, and an unknown id in the
-    /// system range (the 8-10 gap) resolves to a graceful `None` instead of a
-    /// panic.
-    pub fn get_schema_desc(&self, table_id: i64) -> Option<SchemaDescriptor> {
-        self.dag.tables.get(&table_id).map(|e| e.schema)
-    }
-
-    /// The on-disk directory of a user table (`{base_dir}/{schema}/{name}_{tid}`),
-    /// the parent of its child store subdirs (`ChildAddr`). Guaranteed to exist on
-    /// the data filesystem once the table is created, so it anchors an
-    /// `O_TMPFILE` spill (e.g. the CREATE UNIQUE INDEX pre-flight external sort)
-    /// onto the same disk as the table's data. `None` for an unknown table.
-    pub fn table_directory(&self, table_id: i64) -> Option<&str> {
-        self.dag.tables.get(&table_id).map(|e| e.directory.as_str())
     }
 
     // -- FK constraint queries ---------------------------------------------
@@ -323,14 +245,5 @@ impl CatalogEngine {
         let (sn, tn) = self.qualified_name_or_unknown(parent_tid);
         let (csn, ctn) = self.qualified_name_or_unknown(child_tid);
         format!("Foreign Key violation: cannot {verb} '{sn}.{tn}', row still referenced by '{csn}.{ctn}'")
-    }
-
-    /// `table_id`'s schema, or the one "the catalog has no schema for a table a
-    /// live request names" error. Every caller is a fail-stop — reaching it
-    /// means the catalog diverged from the request that named the table — so
-    /// `op` labels which path observed the divergence.
-    pub fn schema_or_err(&self, table_id: i64, op: &str) -> Result<SchemaDescriptor, String> {
-        self.get_schema_desc(table_id)
-            .ok_or_else(|| format!("{op}: no schema for table {table_id}"))
     }
 }

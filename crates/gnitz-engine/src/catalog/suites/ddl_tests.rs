@@ -131,13 +131,13 @@ fn test_ddl() {
     // Table creation
     let cols = vec![col_def("id", type_code::U64), col_def("name", type_code::STRING)];
     let tid = engine.create_table("sales.orders", &cols, &[0]).unwrap();
-    assert!(engine.has_id(tid));
+    assert!(engine.registry().has_id(tid));
     assert_eq!(count_records(engine.sys_store_mut(SysFamily::Table)), init_tables + 1);
     assert_eq!(count_records(engine.sys_store_mut(SysFamily::Column)), init_cols + 2);
 
     // Drop table (retractions)
     engine.drop_table("sales.orders").unwrap();
-    assert!(!engine.has_id(tid));
+    assert!(!engine.registry().has_id(tid));
     assert_eq!(count_records(engine.sys_store_mut(SysFamily::Table)), init_tables);
     assert_eq!(count_records(engine.sys_store_mut(SysFamily::Column)), init_cols);
 
@@ -231,7 +231,7 @@ fn test_edge_cases() {
             &[0],
         )
         .unwrap();
-    let s15 = engine.get_schema_desc(tid15).unwrap();
+    let s15 = engine.registry().get_schema_desc(tid15).unwrap();
     assert_eq!(s15.columns[0].type_code, type_code::U128);
     engine.drop_table("public.u128t").unwrap();
 
@@ -339,7 +339,7 @@ fn test_restart_full() {
         assert!(engine.get_by_name("trash", "items").is_none());
         // Schema layout rebuilt correctly
         let tid = engine.get_by_name("marketing", "products").unwrap();
-        let schema = engine.get_schema_desc(tid).unwrap();
+        let schema = engine.registry().get_schema_desc(tid).unwrap();
         assert_eq!(schema.num_columns(), 2);
         // Sequence recovery: new table should get higher ID
         let new_tid = engine.create_table("marketing.other", &cols, &[0]).unwrap();
@@ -398,10 +398,10 @@ fn test_edge_cases_extended() {
 
     // #20. has_id / get_schema for valid and invalid IDs
     let tid = engine.create_table("public.reg_test", &cols, &[0]).unwrap();
-    assert!(engine.has_id(tid));
-    assert!(engine.get_schema_desc(tid).is_some());
-    assert!(!engine.has_id(999999));
-    assert!(engine.get_schema_desc(999999).is_none());
+    assert!(engine.registry().has_id(tid));
+    assert!(engine.registry().get_schema_desc(tid).is_some());
+    assert!(!engine.registry().has_id(999999));
+    assert!(engine.registry().get_schema_desc(999999).is_none());
     engine.drop_table("public.reg_test").unwrap();
 
     // #26. Creating a user table in _system schema should fail
@@ -501,10 +501,10 @@ fn test_pk_list_round_trips_into_registered_schema() {
     // Single-column PK, and a recreate under a different PK column: the
     // reconstructed schema reflects the new list, not the old one.
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    assert_eq!(engine.get_schema_desc(tid).unwrap().pk_indices(), &[0]);
+    assert_eq!(engine.registry().get_schema_desc(tid).unwrap().pk_indices(), &[0]);
     engine.drop_table("public.t").unwrap();
     let tid2 = engine.create_table("public.t", &cols, &[1]).unwrap();
-    assert_eq!(engine.get_schema_desc(tid2).unwrap().pk_indices(), &[1]);
+    assert_eq!(engine.registry().get_schema_desc(tid2).unwrap().pk_indices(), &[1]);
 
     // Compound PK lists round-trip in full.
     let wide: Vec<_> = (0..8).map(|i| col_def(&format!("c{i}"), type_code::U64)).collect();
@@ -515,7 +515,7 @@ fn test_pk_list_round_trips_into_registered_schema() {
         let name = format!("public.w{n}");
         let tid = engine.create_table(&name, &wide, &pk_cols).unwrap();
         assert_eq!(
-            engine.get_schema_desc(tid).unwrap().pk_indices(),
+            engine.registry().get_schema_desc(tid).unwrap().pk_indices(),
             pk_cols.as_slice(),
             "compound PK list must round-trip in full (input={pk_cols:?})"
         );
@@ -550,9 +550,8 @@ fn test_drop_view_removes_directory() {
 
     // The register hook created the physical view directory on disk.
     let view_dir = engine
-        .dag
-        .tables
-        .get(&vid)
+        .registry()
+        .table_entry(vid)
         .expect("view registered in dag")
         .directory
         .clone();
@@ -810,7 +809,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
 
     // (replicated, depth) for a registered relation.
     let stamp = |e: &CatalogEngine, id: i64| {
-        let t = e.dag.tables.get(&id).expect("registered");
+        let t = e.registry().table_entry(id).expect("registered");
         (t.schema.placement().is_replicated(), t.depth)
     };
     let assert_stamps = |e: &CatalogEngine, when: &str| {

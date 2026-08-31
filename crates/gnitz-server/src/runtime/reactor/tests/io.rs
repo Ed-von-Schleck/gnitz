@@ -16,7 +16,7 @@ fn assert_refused(cap: usize, max_payload: Option<usize>, wire: &[u8], why: &str
             r.set_max_payload_len(read_fd, limit);
         }
         r.inbound().set_cap(cap);
-        gnitz_engine::foundation::posix_io::write_all_fd(write_fd, wire).expect("write");
+        gnitz_store::foundation::posix_io::write_all_fd(write_fd, wire).expect("write");
 
         assert!(
             poll_until(&r, 20_000, || !r.inner.conns.borrow().contains_key(&read_fd)),
@@ -84,7 +84,7 @@ fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
         let mut hdr_and_part = Vec::new();
         hdr_and_part.extend_from_slice(&10_000u32.to_le_bytes());
         hdr_and_part.extend_from_slice(&[0x11u8; 100]);
-        gnitz_engine::foundation::posix_io::write_all_fd(write_fd, &hdr_and_part).expect("write");
+        gnitz_store::foundation::posix_io::write_all_fd(write_fd, &hdr_and_part).expect("write");
 
         let counted = poll_until(&r, 10_000, || r.inbound().held() == 10_000);
         assert!(counted, "in-flight buffer was not accounted");
@@ -97,7 +97,7 @@ fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
         let (read_fd2, write_fd2) = stream_pair();
         r.register_conn(read_fd2);
         r.set_max_payload_len(read_fd2, 1 << 20);
-        gnitz_engine::foundation::posix_io::write_all_fd(write_fd2, &framed(&[0x22u8; 100])).expect("write");
+        gnitz_store::foundation::posix_io::write_all_fd(write_fd2, &framed(&[0x22u8; 100])).expect("write");
 
         let refused = poll_until(&r, 10_000, || !r.inner.conns.borrow().contains_key(&read_fd2));
         assert!(refused, "over-cap second connection was not closed");
@@ -130,7 +130,7 @@ fn inbound_cap_accounting_balances_on_consume() {
         for _ in 0..10 {
             wire.extend_from_slice(&framed(&payload));
         }
-        gnitz_engine::foundation::posix_io::write_all_fd(write_fd, &wire).expect("write");
+        gnitz_store::foundation::posix_io::write_all_fd(write_fd, &wire).expect("write");
         let r2 = Rc::clone(&r);
         r.block_on(async move {
             for _ in 0..10 {

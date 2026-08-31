@@ -1,6 +1,6 @@
 mod worker_liveness_tests {
     use super::super::*;
-    use gnitz_engine_testkit::SharedRegion;
+    use crate::runtime::test_support::SharedRegion;
 
     const RING_CAP: usize = 64 * 1024;
 
@@ -137,9 +137,9 @@ mod worker_liveness_tests {
 mod checkpoint_finalize_tests {
     use super::super::*;
     use crate::runtime::sal::SalWriter;
+    use crate::runtime::test_support::SharedRegion;
     use crate::runtime::w2m::W2mReceiver;
     use gnitz_engine::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_TAB_ID};
-    use gnitz_engine_testkit::SharedRegion;
 
     const SAL_SIZE: usize = 4096;
 

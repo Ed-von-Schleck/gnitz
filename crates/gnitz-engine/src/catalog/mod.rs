@@ -1,6 +1,6 @@
 //! Catalog engine: the entity registry, the system tables and their bootstrap,
-//! DDL application, hook processing, and catalog recovery — all wrapped around
-//! `DagEngine`.
+//! DDL application, hook processing, and catalog recovery — over the two
+//! siblings `CatalogEngine` holds, `RelationRegistry` and `DagEngine`.
 //!
 //! # Hook model
 //!
@@ -35,13 +35,11 @@ mod index_backfill;
 mod metadata;
 mod precheck;
 mod registry;
-mod scan_spec;
 mod schema_block;
-mod store_io;
-mod store_lsn;
 mod sys_tables;
 mod types;
 mod utils;
+mod view_state;
 mod write_path;
 
 #[cfg(test)]
@@ -50,9 +48,10 @@ mod suites;
 use std::fs;
 use std::rc::Rc;
 
-use crate::query::{DagEngine, DeltaFeed, RelationKind, RelationStores, StoreHandle};
-use crate::schema::{Placement, SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, ReadCursor, RecoverySource, StorageError, Table};
+use crate::query::DagEngine;
+use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec};
+use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
+use gnitz_store::storage::{Batch, ReadCursor, RecoverySource, StorageError, Table};
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 // The DDL_TXN driver's bundle decoders: it resolves each family once, carries
@@ -63,9 +62,6 @@ pub use types::{ColumnDef, FkEdge};
 // The reply path's cached schema wire block, and the encoders that fill it.
 pub use cache::SchemaWireEntry;
 pub use schema_block::{encode_named_schema_block, encode_schema_block, encode_schema_block_ipc};
-pub use store_io::IngestError;
-// The master's ScanSpec confinement test.
-pub use scan_spec::scan_spec_worker;
 
 // Import everything from sys_tables for internal use.
 use registry::build_schema_from_col_defs;
@@ -81,30 +77,34 @@ pub(in crate::catalog) use gnitz_wire::FK_INDEX_INFIX;
 pub(in crate::catalog) use registry::raise_id_counter;
 // The child-directory grammar and the directory primitives are storage's; the
 // catalog only consumes them.
-pub(in crate::catalog) use crate::storage::{
-    fsync_dir, peek_header, reclaim_retired_children, remove_child, state_child_manifests, subdir_names, ChildAddr,
+pub(in crate::catalog) use gnitz_store::storage::{
+    fsync_dir, peek_header, state_child_manifests, subdir_names, ChildAddr,
 };
 #[cfg(test)]
 pub(in crate::catalog) use utils::cursor_read_string;
 pub(in crate::catalog) use utils::{
-    cursor_read_u64, ensure_dir, index_dir, is_table_dir_name, lock_data_dir, make_fk_index_name, preflight_dir,
-    relation_dir, retract_key_range, retract_pk_list, schema_dir, sys_catalog_dir, sys_family_dir, sys_opk,
+    cursor_read_u64, index_dir, make_fk_index_name, preflight_dir, retract_key_range, retract_pk_list, schema_dir,
+    sys_catalog_dir, sys_family_dir, sys_opk,
+};
+// The relation rung's directory primitives; the catalog only consumes them.
+pub(in crate::catalog) use gnitz_store::relation::{
+    ensure_dir, is_table_dir_name, lock_data_dir, relation_dir, staged_dir,
 };
 // `BatchBuilder` holds no catalog state and lives in `storage`; re-export it
 // for the catalog's row builders.
-pub(crate) use crate::storage::BatchBuilder;
+pub(crate) use gnitz_store::storage::BatchBuilder;
 
 // ---------------------------------------------------------------------------
 // CatalogEngine
 // ---------------------------------------------------------------------------
 
-/// Default rows per `drain_chunk` call on a chunked scan. Bounds peak scan
-/// memory at O(chunk × row_width).
-pub(crate) const DDL_SCAN_CHUNK_ROWS: usize = 65_536;
-
-/// The catalog engine wraps DagEngine and manages the entity registry,
-/// system tables, DDL operations, and hook processing.
+/// The catalog engine wraps the relation registry and the DAG engine and
+/// manages the system tables, DDL operations, and hook processing.
 pub struct CatalogEngine {
+    /// Which relations exist, and the stores behind them. A **sibling** of
+    /// [`DagEngine`], not a field of it: a mirror drives one with no compiler
+    /// and no VM at all, which is what the split exists for.
+    pub(crate) registry: RelationRegistry,
     pub(crate) dag: DagEngine,
     pub(crate) base_dir: String,
 
@@ -129,33 +129,10 @@ pub struct CatalogEngine {
     /// cannot re-derive.
     pub(crate) user_sequences: std::collections::HashMap<i64, i64>,
 
-    /// The launched worker count. Threaded in from `run_server` rather than read
-    /// off `worker_ctx`, which is 1 in the master process (`set_worker_identity`
-    /// runs only post-fork): a store built from the ambient value would be named
-    /// `w0of1` while the boot repartition wrote `w0of{W}…`, and the child-dir
-    /// sweep would delete it as unowned.
-    pub(crate) num_workers: u32,
-    /// True while this process owns its relations' stores. The post-fork master
-    /// detaches every user relation and stays inert, so anything reading local
-    /// base data must check this first.
-    pub(crate) owns_stores: bool,
-
     /// The checkpoint generation durably recorded in `SEQ_ID_CHECKPOINT_GEN` —
     /// what the next `advance_sequence` must retract, and the floor the next
     /// bump raises. Recovered at boot (0 on a fresh DB).
     pub(crate) durable_generation: u64,
-    /// The generation a manifest must carry to be resumed from. Equal to
-    /// `durable_generation` except across `recovery_start_generation_bump`,
-    /// which pushes that one to `G+1` while what a boot may resume from stays
-    /// the recovered `G`. Written only by `set_resume_generation`, and reaches a
-    /// `Table::new` only through `rederive_source`, so every rederived relation
-    /// opens against one value.
-    pub(crate) resume_generation: u64,
-    /// The topology row last recorded: `(worker_count as u64) << 32 | STATE_FORMAT`.
-    /// Recovered from `SEQ_ID_TOPOLOGY` at boot (0 on a fresh DB). `topology_matches`
-    /// compares it against the launched worker count + `STATE_FORMAT` to decide
-    /// whether persisted view state is reloadable.
-    pub(crate) recorded_topology: u64,
     /// View ids whose checkpointed state — output stores and operator traces
     /// alike — was rejected at boot (generation mismatch, topology change, or a
     /// transitively-invalid source view) and must
@@ -210,22 +187,4 @@ pub struct CatalogEngine {
     // The applier's current execution context: the apply mode and the DDL-zone
     // LSN. See `ApplyContext`.
     pub(crate) ctx: ApplyContext,
-
-    /// Rows per `drain_chunk` call on every chunked scan the engine drives:
-    /// index and view backfill, the bounded-view hydration merge, the ad-hoc
-    /// `ReadSpec` scan. Defaults to [`DDL_SCAN_CHUNK_ROWS`], overridden by
-    /// `GNITZ_DDL_SCAN_CHUNK_ROWS`. A field rather than a parameter because the
-    /// backfills are invoked from hooks, which tests can only reach through
-    /// `submit` — they shrink this instead to exercise chunk boundaries.
-    pub(crate) ddl_scan_chunk_rows: usize,
-
-    /// Per-worker distinct-group cap for the ad-hoc aggregate fold
-    /// (`GNITZ_ADHOC_GROUP_CAP` override, default `ADHOC_GROUP_CAP`). Beyond it
-    /// the fold aborts the request with a CREATE-VIEW suggestion — a stated
-    /// resource-exhaustion posture, never silent degradation. Per-worker, so it
-    /// never fires when the global group count ≤ cap.
-    pub(crate) adhoc_group_cap: usize,
 }
-
-/// Default value of [`CatalogEngine::adhoc_group_cap`].
-pub(crate) const ADHOC_GROUP_CAP: usize = 65_536;

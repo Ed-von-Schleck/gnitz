@@ -5,8 +5,8 @@
 //! Pure data and stateless codecs — no state, no CatalogEngine dependency.
 
 use super::ColumnDef;
-use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, BatchBuilder};
+use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::storage::{Batch, BatchBuilder};
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow};
 
 use gnitz_expr::RowSource;
@@ -45,16 +45,11 @@ pub(super) const FIRST_USER_INDEX_ID: i64 = 1;
 
 /// The durable relation-id tripwire in this crate's `i64` id width; the value and
 /// its rationale live on [`gnitz_wire::RELATION_ID_CEILING`].
-/// `allocate_table_id` and `precheck_family` (the point an id enters `dag.tables`)
+/// `allocate_table_id` and `precheck_family` (the point an id enters the registry)
 /// reject any id at or above it.
 pub(super) const RELATION_ID_CEILING: i64 = gnitz_wire::RELATION_ID_CEILING as i64;
 
 pub(super) const SYS_CATALOG_DIRNAME: &str = "_system_catalog";
-
-/// The `flock`ed file that makes a data directory single-writer. A plain file in
-/// `base_dir`, never a schema directory, so the boot orphan sweep (which scans
-/// registered schema names) never reaches it.
-pub(super) const DIR_LOCK_FILENAME: &str = "LOCK";
 
 pub(super) const SCHEMA_TAB_ID: i64 = gnitz_wire::SCHEMA_TAB as i64;
 pub(super) const TABLE_TAB_ID: i64 = gnitz_wire::TABLE_TAB as i64;
@@ -120,7 +115,7 @@ pub(super) fn validate_pk_against_cols(col_defs: &[ColumnDef], pk_cols: &[u32]) 
         gnitz_wire::PkRule::Duplicate { .. } => "Primary Key has duplicate column".to_string(),
         gnitz_wire::PkRule::StrideOutOfRange { stride } => format!(
             "Primary Key total stride must be 1..={} bytes, got {stride}",
-            crate::schema::MAX_PK_BYTES
+            gnitz_store::schema::MAX_PK_BYTES
         ),
         other => other.to_string(),
     })
@@ -141,11 +136,11 @@ pub(super) fn check_col_defs(col_defs: &[ColumnDef]) -> Result<(), String> {
     // Reachable from a plain view as well as a wide CREATE TABLE: a compound-PK
     // plain projection prepends the k source PK columns, so `SELECT *` over a wide
     // compound-PK table can cross MAX_COLUMNS.
-    if col_defs.len() > crate::schema::MAX_COLUMNS {
+    if col_defs.len() > gnitz_store::schema::MAX_COLUMNS {
         return Err(format!(
             "has {} columns (max {})",
             col_defs.len(),
-            crate::schema::MAX_COLUMNS
+            gnitz_store::schema::MAX_COLUMNS
         ));
     }
     if let Some(cd) = col_defs.iter().find(|cd| !gnitz_wire::is_valid_type_code(cd.type_code)) {
@@ -162,7 +157,7 @@ pub(super) fn check_col_defs(col_defs: &[ColumnDef]) -> Result<(), String> {
 /// COL_TAB-before-TABLE/VIEW ordering contract), then [`check_col_defs`], then
 /// [`validate_pk_cols`].
 pub(super) fn validate_relation_defs(
-    kind: crate::query::RelationKind,
+    kind: gnitz_store::relation::RelationKind,
     id: i64,
     name: &str,
     col_defs: &[ColumnDef],
@@ -208,12 +203,12 @@ pub(super) fn read_table_tab_row<S: RowSource>(src: &S, row: usize) -> (i64, Str
 pub(super) fn read_view_tab_row<S: RowSource>(
     src: &S,
     row: usize,
-) -> (i64, String, PkColList, crate::query::ViewBudgets) {
+) -> (i64, String, PkColList, gnitz_store::relation::ViewBudgets) {
     (
         sys_u64(src, row, VIEWTAB_PAY_SCHEMA_ID) as i64,
         sys_string(src, row, VIEWTAB_PAY_NAME),
         unpack_pk_cols(sys_u64(src, row, VIEWTAB_PAY_PK_COL_IDX)),
-        crate::query::ViewBudgets {
+        gnitz_store::relation::ViewBudgets {
             capacity_bytes: Some(sys_u64(src, row, VIEWTAB_PAY_CAPACITY)).filter(|&b| b != 0),
             delta_bytes: Some(sys_u64(src, row, VIEWTAB_PAY_DELTA)).filter(|&b| b != 0),
         },
@@ -471,7 +466,7 @@ pub(super) fn idx_tab_batch(
 // Schema derivation from the shared wire column slices
 // ---------------------------------------------------------------------------
 
-use crate::schema::from_wire_cols;
+use gnitz_store::schema::from_wire_cols;
 
 // Pre-computed schema statics, one per family, indexed by `SysFamily`
 // discriminant — initialised at compile time, never reconstructed. `from_wire_cols`

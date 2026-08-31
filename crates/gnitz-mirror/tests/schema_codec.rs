@@ -8,9 +8,9 @@
 //! here, not a hypothetical one.
 
 use gnitz_engine::catalog::encode_named_schema_block;
-use gnitz_engine::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
-use gnitz_engine::storage::Batch;
 use gnitz_engine_testkit::{arb_type_code, named_col_defs};
+use gnitz_store::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
+use gnitz_store::storage::Batch;
 use gnitz_wire::{is_pk_eligible, type_code, MAX_PK_COLUMNS};
 use proptest::collection::vec;
 use proptest::prelude::*;

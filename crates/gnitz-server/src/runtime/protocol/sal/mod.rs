@@ -206,7 +206,7 @@ impl<'a> DirectGroup<'a> {
 /// published. The epoch is not a seed: it sits in the hashed span, so verifying a
 /// header also authenticates the generation it claims.
 fn group_digest(base: u64, hdr: &[u8]) -> u64 {
-    gnitz_engine::foundation::xxh::digest_with_hole(&base.to_le_bytes(), hdr, OFF_DIGEST)
+    gnitz_store::foundation::xxh::digest_with_hole(&base.to_le_bytes(), hdr, OFF_DIGEST)
 }
 
 const SAL_MMAP_SIZE: usize = 1 << 30;
@@ -299,7 +299,7 @@ pub fn sal_mmap_size() -> usize {
     use std::sync::OnceLock;
     static SIZE: OnceLock<usize> = OnceLock::new();
     *SIZE.get_or_init(|| {
-        gnitz_engine::foundation::env::env_num("GNITZ_SAL_BYTES", SAL_MMAP_SIZE).clamp(MIN_SAL_BYTES, SAL_MMAP_SIZE)
+        gnitz_store::foundation::env::env_num("GNITZ_SAL_BYTES", SAL_MMAP_SIZE).clamp(MIN_SAL_BYTES, SAL_MMAP_SIZE)
     })
 }
 
@@ -970,7 +970,7 @@ impl SalWriter {
     /// the rewind.
     pub fn new(ptr: *mut u8, fd: i32, mmap_size: u64, num_workers: usize) -> Self {
         let checkpoint_threshold =
-            gnitz_engine::foundation::env::env_num("GNITZ_CHECKPOINT_BYTES", (mmap_size * 3) >> 2);
+            gnitz_store::foundation::env::env_num("GNITZ_CHECKPOINT_BYTES", (mmap_size * 3) >> 2);
         SalWriter {
             ptr,
             fd,

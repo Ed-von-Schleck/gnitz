@@ -30,9 +30,9 @@ const INBOUND_CAP_CEIL: usize = 4usize << 30; // 4 GiB
 /// above. A fraction of the *actual* budget scales with the deployment where a
 /// flat constant would OOM a mid-size box yet never trip in a small container.
 pub(super) fn resolve_inbound_cap() -> usize {
-    let host = gnitz_engine::foundation::host::available_memory_bytes();
+    let host = gnitz_store::foundation::host::available_memory_bytes();
     let default = (host / 4).clamp(INBOUND_CAP_FLOOR, INBOUND_CAP_CEIL);
-    gnitz_engine::foundation::env::env_num("GNITZ_INBOUND_MEM_BYTES", default).max(INBOUND_CAP_FLOOR)
+    gnitz_store::foundation::env::env_num("GNITZ_INBOUND_MEM_BYTES", default).max(INBOUND_CAP_FLOOR)
 }
 
 /// Accounted memory weight of one inbound payload buffer of `len` bytes.

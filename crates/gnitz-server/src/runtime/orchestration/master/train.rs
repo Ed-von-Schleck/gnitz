@@ -89,7 +89,7 @@ pub(super) async fn drain_index_scan(
     reactor: &crate::runtime::reactor::Reactor,
     what: &str,
     expected: &SchemaDescriptor,
-    mut on_batch: impl FnMut(&gnitz_engine::storage::MemBatch<'_>, usize) -> Result<(), WorkerFault>,
+    mut on_batch: impl FnMut(&gnitz_store::storage::MemBatch<'_>, usize) -> Result<(), WorkerFault>,
 ) -> Result<(), WorkerFault> {
     for (i, mut slot) in slots.into_iter().enumerate() {
         let (w, req_id) = scan.reply(i);
@@ -102,7 +102,7 @@ pub(super) async fn drain_index_scan(
                 descriptor: s,
                 version: *v,
             });
-            let mut offsets = [0usize; gnitz_engine::storage::MAX_BATCH_REGIONS];
+            let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
             let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl, schema_hint, &mut offsets)
                 .map_err(|e| scan_decode_err(w, e))?;
             if saved_schema.is_none() {
@@ -205,7 +205,7 @@ pub(super) async fn forward_scan_slots(
     }
     // Every train is one frame, so the heads in worker order ARE the whole
     // reply, in exactly the order the per-worker drain would have produced.
-    let mut buf = gnitz_engine::storage::batch_pool::acquire_buf();
+    let mut buf = gnitz_store::storage::batch_pool::acquire_buf();
     buf.reserve(total);
     for (i, slot) in slots.iter().enumerate() {
         if heads[i].observable {
@@ -217,7 +217,7 @@ pub(super) async fn forward_scan_slots(
     // worker's W2M ring.
     drop(slots);
     Ok(peer
-        .send_buffer(gnitz_engine::storage::batch_pool::PooledSendBuf(buf))
+        .send_buffer(gnitz_store::storage::batch_pool::PooledSendBuf(buf))
         .await
         >= 0)
 }

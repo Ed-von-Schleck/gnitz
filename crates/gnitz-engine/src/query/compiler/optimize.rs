@@ -4,7 +4,7 @@
 //! validators both of them lean on.
 
 use super::*;
-use crate::schema::Placement;
+use gnitz_store::schema::Placement;
 
 /// Everything the runtime needs to know about a view's circuit that is not the
 /// executable plan: its routing, its shape, and its source scan's access hint.

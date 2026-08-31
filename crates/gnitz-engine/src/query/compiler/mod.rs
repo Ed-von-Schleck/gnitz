@@ -10,13 +10,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use rustc_hash::FxHashSet;
 use std::fmt;
 
-use crate::expr::MapPlan;
-use crate::foundation::worker_ctx::{num_workers, worker_rank};
-use crate::ops::AggDescriptor;
 use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
-use crate::schema::{project_schema, SchemaDescriptor};
-use crate::storage::{ReadCursor, RecoverySource, StorageError, Table};
 use gnitz_expr::{ExprValidateErr, LogicalProgram};
+use gnitz_store::expr::MapPlan;
+use gnitz_store::foundation::worker_ctx::{num_workers, worker_rank};
+use gnitz_store::ops::AggDescriptor;
+use gnitz_store::schema::{project_schema, SchemaDescriptor};
+use gnitz_store::storage::{ReadCursor, RecoverySource, StorageError, Table};
 
 mod emit;
 mod hydration;
@@ -212,6 +212,15 @@ impl SchemaSource for ExtTables {
     }
 }
 
+/// The registry answers the compiler's schema lookups in place. The impl sits
+/// here, beside the trait, and not on the `relation` rung: `relation` is below
+/// `query`, so an impl over there would have to name the trait upward.
+impl SchemaSource for gnitz_store::relation::RelationRegistry {
+    fn schema_of(&self, tid: i64) -> Option<SchemaDescriptor> {
+        self.get_schema_desc(tid)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CompileOutput — typed compilation result
 // ---------------------------------------------------------------------------
@@ -242,7 +251,7 @@ pub(crate) struct SubPlan {
     ///
     /// Plan-lifetime state guarding a store fact: every path that empties a
     /// view's stores must drop the cached plan with them
-    /// (`reset_view_output_for_rebuild` → `DagEngine::invalidate`; a worker-count
+    /// (`RelationRegistry::reset_store` → `DagEngine::invalidate`; a worker-count
     /// relayout runs before any store opens, so no plan exists yet).
     pub can_emit_on_empty: bool,
     /// Maps a source table id to the input register that receives its delta.

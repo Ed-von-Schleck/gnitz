@@ -9,7 +9,7 @@ use super::*;
 /// One whole-payload client send the way `Peer::send` runs it: the owned send
 /// under the egress deadline.
 async fn guarded_send(r: &Reactor, fd: i32, payload: Vec<u8>) -> i32 {
-    let buf = Rc::new(gnitz_engine::storage::batch_pool::PooledSendBuf(payload));
+    let buf = Rc::new(gnitz_store::storage::batch_pool::PooledSendBuf(payload));
     let what = buf.what();
     guard_egress_deadline(r, fd, what, r.send_owned(fd, buf)).await
 }
@@ -54,7 +54,7 @@ fn send_cqe_parks_rc_and_wakes_waker() {
 #[test]
 fn send_cqe_decrements_conn_inflight_and_releases_the_buffer() {
     let r = make_reactor();
-    let alive: SendAlive = Rc::new(gnitz_engine::storage::batch_pool::PooledSendBuf(vec![0u8; 16]));
+    let alive: SendAlive = Rc::new(gnitz_store::storage::batch_pool::PooledSendBuf(vec![0u8; 16]));
     let (fd, write_end) = unsafe { pipe_pair() };
     r.inner.sends.open(77, Some((fd, Rc::clone(&alive))));
     r.inner
@@ -94,7 +94,7 @@ fn send_cqe_decrements_conn_inflight_and_releases_the_buffer() {
 #[test]
 fn dropped_send_future_keeps_buffer_alive_until_its_cqe() {
     let r = make_reactor();
-    let alive: SendAlive = Rc::new(gnitz_engine::storage::batch_pool::PooledSendBuf(vec![0xAB_u8; 64]));
+    let alive: SendAlive = Rc::new(gnitz_store::storage::batch_pool::PooledSendBuf(vec![0xAB_u8; 64]));
     r.inner.sends.open(88, Some((i32::MAX, Rc::clone(&alive))));
     drop(SendFuture {
         send_id: 88,
@@ -241,7 +241,7 @@ fn send_buffer_evicts_a_client_that_never_drains() {
 #[test]
 #[ignore]
 fn fanout_coalesced_egress_bench() {
-    use gnitz_engine::storage::batch_pool::{acquire_buf, PooledSendBuf};
+    use gnitz_store::storage::batch_pool::{acquire_buf, PooledSendBuf};
     use std::hint::black_box;
 
     const ITERS: usize = 3000;

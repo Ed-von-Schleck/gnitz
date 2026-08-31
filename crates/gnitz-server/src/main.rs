@@ -8,7 +8,7 @@ compile_error!("GnitzDB requires a little-endian target; the wire format is LE-o
 // Above `mod runtime;`: `#[macro_use]` reaches only code that follows the item,
 // and the 73 `gnitz_warn!`-family invocations under `runtime/` are unqualified.
 #[macro_use]
-extern crate gnitz_engine;
+extern crate gnitz_store;
 
 // Before `mod runtime;` for the same reason: `gnitz_fatal_abort!` is invoked
 // unqualified throughout it.
@@ -69,10 +69,10 @@ Environment:
 
 fn parse_level(s: &str) -> u32 {
     match s.to_ascii_lowercase().as_str() {
-        "quiet" | "0" => gnitz_engine::foundation::log::QUIET,
-        "normal" | "1" => gnitz_engine::foundation::log::NORMAL,
-        "verbose" | "debug" | "2" => gnitz_engine::foundation::log::DEBUG,
-        _ => gnitz_engine::foundation::log::QUIET,
+        "quiet" | "0" => gnitz_store::foundation::log::QUIET,
+        "normal" | "1" => gnitz_store::foundation::log::NORMAL,
+        "verbose" | "debug" | "2" => gnitz_store::foundation::log::DEBUG,
+        _ => gnitz_store::foundation::log::QUIET,
     }
 }
 
@@ -96,7 +96,7 @@ fn parse_workers(val: &str) -> Result<u32, String> {
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    let mut level = gnitz_engine::foundation::log::QUIET;
+    let mut level = gnitz_store::foundation::log::QUIET;
     if let Ok(env_level) = env::var("GNITZ_LOG_LEVEL") {
         level = parse_level(&env_level);
     }
@@ -202,7 +202,7 @@ fn main() {
         }
     };
 
-    gnitz_engine::foundation::log::init(level, b"M");
+    gnitz_store::foundation::log::init(level, b"M");
     let rc = runtime::server_main(&data_dir, &socket_path, num_workers, level, tls_cli);
     process::exit(rc);
 }
