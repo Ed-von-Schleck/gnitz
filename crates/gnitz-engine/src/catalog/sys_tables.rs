@@ -500,7 +500,7 @@ use gnitz_store::schema::from_wire_cols;
 // Pre-computed schema statics, one per family, indexed by `SysFamily`
 // discriminant — initialised at compile time, never reconstructed. `from_wire_cols`
 // places every family `Replicated`, so a reader single-sources one copy instead of
-// gathering N (`DagEngine::relation_is_replicated`).
+// gathering N (`RelationRegistry::relation_is_replicated`).
 static SCHEMAS: [SchemaDescriptor; SysFamily::COUNT] = {
     let w = gnitz_wire::SYS_FAMILIES;
     let mut arr = [from_wire_cols(w[0].cols, w[0].pk_cols); SysFamily::COUNT];
@@ -528,20 +528,6 @@ pub(super) fn pack_column_id(owner_id: i64, col_idx: i64) -> u64 {
 /// drop cascade cannot disagree on the upper bound.
 pub(super) fn column_id_band(owner_id: i64) -> (u64, u64) {
     (pack_column_id(owner_id, 0), pack_column_id(owner_id + 1, 0))
-}
-
-/// Pack a circuit compound PK `(view_id, sub)` into the `u128` whose
-/// `extend_pk` (big-endian) at-rest image is OPK column order: `view_id_BE`
-/// (bytes 0..8) then `sub_BE` (bytes 8..16), so a view_id prefix seek lands on
-/// the leading bytes. Pinned by `pack_view_pk_at_rest_is_view_id_leading_opk`.
-/// `sub` is the per-view secondary (node_id or an edge/node-column field pack).
-///
-/// Test-only: production circuit rows arrive pre-packed from the client, which
-/// reaches the same at-rest image through a different encoder (see
-/// `create_view_chain`).
-#[cfg(test)]
-pub(super) fn pack_view_pk(view_id: i64, sub: u64) -> u128 {
-    ((view_id as u64 as u128) << 64) | (sub as u128)
 }
 
 // ---------------------------------------------------------------------------

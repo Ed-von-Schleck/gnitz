@@ -12,7 +12,7 @@ mod builder;
 mod exec;
 
 pub(crate) use builder::ProgramBuilder;
-pub(crate) use exec::{execute_epoch_multi, execute_epoch_replay};
+pub(crate) use exec::{execute_epoch_multi, Replay};
 
 // ---------------------------------------------------------------------------
 // Instruction set
@@ -200,6 +200,10 @@ pub(crate) struct VmHandle {
     /// registers instead of the whole register file — whose stride is a
     /// `RegisterMeta`, i.e. a whole `SchemaDescriptor`.
     trace_regs: Vec<(u16, TableIdx)>,
+    /// The program carries a global-ground `Reduce` this worker owns whose ground
+    /// row has not been minted yet — the one reason an empty epoch is worth
+    /// dispatching.
+    pub(super) pending_ground_row: bool,
 }
 
 // SAFETY: a VmHandle is only accessed from the single worker thread that owns
@@ -217,18 +221,17 @@ impl VmHandle {
     /// no background compactor. The epoch path's job, not a read's: a compaction
     /// mutates shard state. An `Err` leaves the shard index unchanged, so a
     /// cursor opened afterwards still sees a consistent snapshot.
-    pub(super) fn compact_owned_traces(&mut self) {
+    fn compact_owned_traces(&mut self) {
         let VmHandle { tables, trace_regs, .. } = self;
         for &(_reg, idx) in trace_regs.iter() {
             let _ = tables[idx.at()].compact_if_needed();
         }
     }
 
-    /// Open a fresh cursor on every trace register's backing table; must run
-    /// before each epoch, which reads them without a fallback. Eager rather than
-    /// per-instruction, so an operator sees `z⁻¹(I(X))` — the integral before this
-    /// tick's delta — by construction.
-    pub(super) fn bind_trace_cursors(&mut self) {
+    /// Open a fresh cursor on every trace register's backing table. Eager rather
+    /// than per-instruction, so an operator sees `z⁻¹(I(X))` — the integral
+    /// before this tick's delta — by construction.
+    fn bind_trace_cursors(&mut self) {
         gnitz_debug!("vm: bind_trace_cursors, {} trace regs", self.trace_regs.len());
         let VmHandle {
             regfile,
@@ -245,12 +248,6 @@ impl VmHandle {
         }
     }
 
-    /// Clear the register file's delta batches (a disjoint-field borrow of the
-    /// program's reg_meta and the regfile, packaged for external callers).
-    pub(super) fn clear_deltas(&mut self) {
-        self.regfile.clear_deltas(&self.program.reg_meta);
-    }
-
     /// Drop every bound cursor. Before a checkpoint fold that is tidiness — a
     /// held cursor owns `Rc` clones of what it reads, so a fold leaves it stale,
     /// not dangling — and after a backfill it is those clones, whole RAM-tier
@@ -259,15 +256,11 @@ impl VmHandle {
         self.regfile.cursors.fill_with(|| None);
     }
 
-    /// Free what the register file holds — every delta batch's buffers, every
-    /// cursor with the runs it pins — for the end of a backfill, whose last chunk
-    /// would otherwise stay resident for the cached plan's lifetime.
-    /// [`Self::clear_deltas`] is the per-epoch form and keeps the arenas.
-    pub(super) fn release_deltas(&mut self) {
-        let VmHandle { program, regfile, .. } = self;
-        for batch in regfile.delta_batches(&program.reg_meta) {
-            drop(batch.take());
-        }
+    /// Free what the register file holds — every batch's buffer, every cursor with
+    /// the runs it pins. For the end of a backfill, whose last chunk would
+    /// otherwise stay resident for the cached plan's lifetime.
+    pub(super) fn release(&mut self) {
+        self.regfile.release();
         self.reset_trace_cursors();
     }
 }
@@ -376,28 +369,19 @@ impl RegisterFile {
         }
     }
 
-    /// Every delta register's batch — the one place the delta/trace split is
-    /// spelled, so no walk can disagree about which registers it may empty.
-    fn delta_batches<'a>(&'a mut self, metas: &'a [RegisterMeta]) -> impl Iterator<Item = &'a mut Batch> {
-        self.batches
-            .iter_mut()
-            .zip(metas)
-            .filter_map(|(batch, meta)| meta.owned_table.is_none().then_some(batch))
-    }
-
-    /// Clear delta batches without touching cursors. Keeps each batch's buffer
-    /// allocations: the next epoch either seeds the register or writes it whole.
-    pub(super) fn clear_deltas(&mut self, metas: &[RegisterMeta]) {
-        for batch in self.delta_batches(metas) {
+    /// Clear every register's batch, keeping its buffer: the next epoch either
+    /// seeds the register or writes it whole. A trace register is reached through
+    /// its cursor, so its batch is already empty (`test_join_delta_trace`).
+    pub(super) fn clear(&mut self) {
+        for batch in &mut self.batches {
             batch.clear();
         }
     }
+
+    /// [`Self::clear`], releasing the buffers too.
+    pub(super) fn release(&mut self) {
+        for batch in &mut self.batches {
+            drop(batch.take());
+        }
+    }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-#[path = "tests/vm.rs"]
-mod tests;

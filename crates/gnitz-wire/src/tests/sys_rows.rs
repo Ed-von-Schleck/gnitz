@@ -15,7 +15,7 @@ use crate::{
 /// row back as a sequence rather than through either side's batch type.
 #[derive(Default, PartialEq, Eq, Debug)]
 struct Recorder {
-    pk: u128,
+    pk: Vec<u128>,
     weight: i64,
     vals: Vec<Val>,
     closed: bool,
@@ -30,8 +30,8 @@ enum Val {
 }
 
 impl SysRowSink for Recorder {
-    fn begin_row(&mut self, pk: u128, weight: i64) {
-        self.pk = pk;
+    fn begin_row(&mut self, pk: &[u128], weight: i64) {
+        self.pk = pk.to_vec();
         self.weight = weight;
     }
     fn put_u64(&mut self, v: u64) {
@@ -69,7 +69,7 @@ impl Recorder {
 fn assert_col_tab_slots(r: &ColTabRow, weight: i64) {
     let mut rec = Recorder::default();
     write_col_tab_row(&mut rec, r, weight).unwrap();
-    assert_eq!(rec.pk, pack_col_id(r.owner_id, r.col_idx).unwrap() as u128);
+    assert_eq!(rec.pk, [pack_col_id(r.owner_id, r.col_idx).unwrap() as u128]);
     assert_eq!(rec.weight, weight);
     let v = rec.row(COL_TAB_COLS, 1);
     assert_eq!(v[COLTAB_PAY_OWNER_ID], Val::U64(r.owner_id));
@@ -127,7 +127,7 @@ fn values_land_in_their_named_payload_slots() {
         },
         1,
     );
-    assert_eq!(r.pk, 100);
+    assert_eq!(r.pk, [100]);
     let v = r.row(IDX_TAB_COLS, 1);
     assert_eq!(v[IDXTAB_PAY_OWNER_ID], Val::U64(16));
     assert_eq!(v[IDXTAB_PAY_SOURCE_COLS], Val::U64(9));
@@ -148,7 +148,7 @@ fn values_land_in_their_named_payload_slots() {
         },
         1,
     );
-    assert_eq!(r.pk, 16);
+    assert_eq!(r.pk, [16]);
     let v = r.row(TABLE_TAB_COLS, 1);
     assert_eq!(v[TABTAB_PAY_SCHEMA_ID], Val::U64(3));
     assert_eq!(v[TABTAB_PAY_NAME], Val::Str("t".into()));
@@ -169,7 +169,7 @@ fn values_land_in_their_named_payload_slots() {
         },
         1,
     );
-    assert_eq!(r.pk, 20);
+    assert_eq!(r.pk, [20]);
     let v = r.row(VIEW_TAB_COLS, 1);
     assert_eq!(v[VIEWTAB_PAY_SCHEMA_ID], Val::U64(4));
     assert_eq!(v[VIEWTAB_PAY_NAME], Val::Str("v".into()));
@@ -187,7 +187,7 @@ fn values_land_in_their_named_payload_slots() {
         },
         1,
     );
-    assert_eq!(r.pk, 3);
+    assert_eq!(r.pk, [3]);
     assert_eq!(r.row(SCHEMA_TAB_COLS, 1)[0], Val::Str("public".into()));
 
     // The circuit families. `view_id` must occupy the LOW u128 half of the
@@ -207,7 +207,7 @@ fn values_land_in_their_named_payload_slots() {
         1,
     )
     .unwrap();
-    assert_eq!(r.pk, 7 | (5u128 << 64));
+    assert_eq!(r.pk, [7, 5]);
     let v = r.row(CIRCUIT_NODES_COLS, 2); // compound PK: two key columns
     assert_eq!(v[CIRCNODES_PAY_NODE_ID], Val::U64(5));
     assert_eq!(v[CIRCNODES_PAY_OPCODE], Val::U64(9));
@@ -245,7 +245,7 @@ fn values_land_in_their_named_payload_slots() {
         1,
     )
     .unwrap();
-    assert_eq!(r.pk, 7 | (((5u128 << 8) | 1) << 64));
+    assert_eq!(r.pk, [7, (5 << 8) | 1]);
     let v = r.row(CIRCUIT_EDGES_COLS, 2);
     assert_eq!(v[CIRCEDGES_PAY_DST_NODE], Val::U64(5));
     assert_eq!(v[CIRCEDGES_PAY_DST_PORT], Val::U64(1));
@@ -265,7 +265,7 @@ fn values_land_in_their_named_payload_slots() {
         1,
     )
     .unwrap();
-    assert_eq!(r.pk, 7 | (((5u128 << 24) | (3u128 << 16) | 2u128) << 64));
+    assert_eq!(r.pk, [7, (5 << 24) | (3 << 16) | 2]);
     let v = r.row(CIRCUIT_NODE_COLUMNS_COLS, 2);
     assert_eq!(v[CIRCNCOL_PAY_NODE_ID], Val::U64(5));
     assert_eq!(v[CIRCNCOL_PAY_KIND], Val::U64(3));
@@ -275,7 +275,7 @@ fn values_land_in_their_named_payload_slots() {
 }
 
 /// A `sub` field that overflows its bit range would alias another row's
-/// record, so `circuit_pk` refuses and the writer emits nothing.
+/// record, so `circuit_sub` refuses and the writer emits nothing.
 #[test]
 fn a_circuit_sub_field_that_would_alias_another_record_is_rejected() {
     let mut r = Recorder::default();

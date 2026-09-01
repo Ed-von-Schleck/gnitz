@@ -24,13 +24,19 @@ fn write_bounded_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid
     if let Some(b) = &bound {
         let mut bb = BatchBuilder::new(SysFamily::CircuitNodeColumns.schema());
         for (i, &c) in b.idx_cols.as_slice().iter().enumerate() {
-            bb.begin_row(pack_view_pk(vid, i as u64), 1);
-            bb.put_u64(0); // node_id
-            bb.put_u64(gnitz_wire::NODE_COL_KIND_SCAN_BOUND);
-            bb.put_u64(i as u64); // position — the list's order
-            bb.put_u64(c as u64); // value1 — the column index
-            bb.put_u64(0);
-            bb.end_row();
+            gnitz_wire::sys_rows::write_circuit_node_column_row(
+                &mut bb,
+                &gnitz_wire::sys_rows::CircuitNodeColumnRow {
+                    view_id: vid as u64,
+                    node_id: 0,
+                    kind: gnitz_wire::NODE_COL_KIND_SCAN_BOUND,
+                    position: i as u64, // the list's order
+                    value1: c as u64,   // the column index
+                    value2: 0,
+                },
+                1,
+            )
+            .unwrap();
         }
         engine
             .ingest_to_family(CIRCUIT_NODE_COLUMNS_TAB_ID, &bb.finish())

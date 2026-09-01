@@ -110,6 +110,10 @@ impl ProgramBuilder {
         // epoch epilogue reads it after the last instruction has run.
         last_read[out_reg as usize] = u32::MAX;
 
+        // Read off the baked plans rather than accumulated during emission, so
+        // `ReducePlan::new` stays the single home of the conjunction.
+        let pending_ground_row = self.reduce_plans.iter().any(|b| b.plan.seeds_ground);
+
         let program = Program {
             instructions: self.instructions,
             reg_meta,
@@ -125,6 +129,7 @@ impl ProgramBuilder {
             regfile,
             tables: self.tables,
             trace_regs,
+            pending_ground_row,
         })
     }
 }

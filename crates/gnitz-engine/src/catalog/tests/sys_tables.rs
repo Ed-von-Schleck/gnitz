@@ -41,21 +41,29 @@ fn circuit_tables_have_compound_view_id_sub_pk() {
     }
 }
 
+/// A circuit row's at-rest PK region is `view_id_BE ‖ sub_BE`, so the per-view
+/// prefix seek `load_circuit` runs lands on the leading bytes. Written through
+/// the production row codec and read back as literal bytes — the one place the
+/// engine's half of the key layout is spelled twice on purpose.
 #[test]
-fn pack_view_pk_at_rest_is_view_id_leading_opk() {
-    // The at-rest OPK image (extend_pk → big-endian) is view_id_BE then
-    // sub_BE, so a view_id prefix seek lands on the leading bytes.
-    let pk = pack_view_pk(0x1122, 0xAABB);
-    let at_rest = pk.to_be_bytes();
+fn a_circuit_rows_at_rest_pk_leads_with_the_view_id() {
+    let mut bb = BatchBuilder::new(SysFamily::CircuitNodes.schema());
+    gnitz_wire::sys_rows::write_circuit_node_row(
+        &mut bb,
+        &gnitz_wire::sys_rows::CircuitNodeRow {
+            view_id: 0x1122,
+            node_id: 0xAABB,
+            opcode: 0,
+            source_table: None,
+            expr_program: None,
+        },
+        1,
+    )
+    .unwrap();
+    let batch = bb.finish();
     assert_eq!(
-        u64::from_be_bytes(at_rest[0..8].try_into().unwrap()),
-        0x1122,
-        "view_id (PK col 0) must lead the at-rest OPK region",
-    );
-    assert_eq!(
-        u64::from_be_bytes(at_rest[8..16].try_into().unwrap()),
-        0xAABB,
-        "sub (PK col 1) follows view_id",
+        batch.get_pk_bytes(0),
+        [0, 0, 0, 0, 0, 0, 0x11, 0x22, 0, 0, 0, 0, 0, 0, 0xAA, 0xBB],
     );
 }
 

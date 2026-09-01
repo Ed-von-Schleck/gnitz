@@ -207,9 +207,6 @@ pub(super) struct EmitCtx<'a> {
     pub reg_meta: Vec<RegisterMeta>,
     pub source_reg_map: FxHashMap<i64, u16>,
     pub sink_reg_id: Option<u16>,
-    /// Set by `emit_reduce` for a global-ground aggregate — the one operator that
-    /// produces output from an empty input epoch. See `SubPlan::pending_ground_row`.
-    pub pending_ground_row: bool,
     pub scratch: ScratchGuard,
 }
 
@@ -616,7 +613,6 @@ fn emit_reduce(
         return Err(CompileError::Rejected("reduce: group columns out of range"));
     }
     debug_assert!(!agg.is_empty(), "decode_op_node rejects a spec-less REDUCE");
-    ctx.pending_ground_row |= global_ground;
     if oob_cols(agg.iter().map(|&(_, c)| c), &in_reg_schema) {
         return Err(CompileError::Rejected("reduce: aggregate column out of range"));
     }
@@ -739,7 +735,6 @@ pub(super) fn build_plan(
         reg_meta,
         source_reg_map: FxHashMap::default(),
         sink_reg_id: None,
-        pending_ground_row: false,
         scratch: ScratchGuard::new(),
     };
 
@@ -803,7 +798,6 @@ pub(super) fn build_plan(
         builder,
         reg_meta,
         source_reg_map,
-        pending_ground_row,
         scratch,
         out_reg_of,
         ..
@@ -814,7 +808,6 @@ pub(super) fn build_plan(
         vm,
         in_reg: input_delta_reg_id,
         source_reg_map,
-        pending_ground_row,
         exchange_input_regs,
         scratch,
         instr_end,

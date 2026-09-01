@@ -822,7 +822,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
         (r_producer, "rv"),
         (p_producer, "pv"),
     ] {
-        push_view_tab_row(&mut bb, 1, vid, name, "SELECT id, x FROM src", 0);
+        push_view_tab_row(&mut bb, 1, vid, name, "SELECT id, x FROM src", 0, 0);
     }
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
 
@@ -878,13 +878,13 @@ fn a_view_declaring_both_capacity_and_delta_is_rejected() {
     ];
     let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
 
-    let err = try_register_identity_view_with(&mut engine, tid, "both", &cols, 4 << 20, 4 << 20)
+    let err = try_register_identity_view(&mut engine, tid, "both", &cols, 4 << 20, 4 << 20)
         .expect_err("the pair must be refused");
     assert!(err.contains("capacity") && err.contains("delta"), "got: {err}");
 
     // Either alone is accepted, so the rejection is about the pair.
-    try_register_identity_view_with(&mut engine, tid, "bounded", &cols, 4 << 20, 0).expect("capacity alone");
-    try_register_identity_view_with(&mut engine, tid, "fed", &cols, 0, 4 << 20).expect("delta alone");
+    try_register_identity_view(&mut engine, tid, "bounded", &cols, 4 << 20, 0).expect("capacity alone");
+    try_register_identity_view(&mut engine, tid, "fed", &cols, 0, 4 << 20).expect("delta alone");
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -903,12 +903,12 @@ fn a_view_at_the_column_limit_cannot_carry_a_feed() {
         .collect();
     let tid = create_flagged_table(&mut engine, "wide", &cols, &[0], 0);
 
-    let err = try_register_identity_view_with(&mut engine, tid, "fed_wide", &cols, 0, 4 << 20)
+    let err = try_register_identity_view(&mut engine, tid, "fed_wide", &cols, 0, 4 << 20)
         .expect_err("the stamp is a 66th column");
     assert!(err.contains("delta feed"), "got: {err}");
 
     // The same view without a feed is fine, so the rejection is about the stamp.
-    try_register_identity_view_with(&mut engine, tid, "plain_wide", &cols, 0, 0).expect("unfed wide view");
+    try_register_identity_view(&mut engine, tid, "plain_wide", &cols, 0, 0).expect("unfed wide view");
 
     std::fs::remove_dir_all(&dir).ok();
 }

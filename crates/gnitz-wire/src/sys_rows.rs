@@ -18,7 +18,10 @@ use crate::pack_col_id;
 /// null word, its row count) does it; a builder that writes eagerly implements
 /// it as a no-op.
 pub trait SysRowSink {
-    fn begin_row(&mut self, pk: u128, weight: i64);
+    /// Begin a row keyed by `pk`: the family's PK columns in PK-list order, each
+    /// as its native value widened to `u128`. The sink packs them into its own
+    /// layout — big-endian OPK in the engine, little-endian on the wire.
+    fn begin_row(&mut self, pk: &[u128], weight: i64);
     fn put_u64(&mut self, v: u64);
     fn put_string(&mut self, s: &str);
     /// A variable-length column that is not UTF-8 (the circuit families' encoded
@@ -41,7 +44,7 @@ pub struct SchemaTabRow<'a> {
 }
 
 pub fn write_schema_tab_row(sink: &mut impl SysRowSink, r: &SchemaTabRow, weight: i64) {
-    sink.begin_row(r.schema_id as u128, weight);
+    sink.begin_row(&[r.schema_id as u128], weight);
     sink.put_string(r.name);
     sink.end_row();
 }
@@ -73,7 +76,7 @@ pub struct ColTabRow<'a> {
 /// column's record; each side decides whether that is an error to propagate or
 /// a corruption to abort on.
 pub fn write_col_tab_row(sink: &mut impl SysRowSink, r: &ColTabRow, weight: i64) -> Result<(), String> {
-    sink.begin_row(pack_col_id(r.owner_id, r.col_idx)? as u128, weight);
+    sink.begin_row(&[pack_col_id(r.owner_id, r.col_idx)? as u128], weight);
     sink.put_u64(r.owner_id);
     sink.put_u64(r.owner_kind);
     sink.put_u64(r.col_idx);
@@ -103,7 +106,7 @@ pub struct TableTabRow<'a> {
 }
 
 pub fn write_table_tab_row(sink: &mut impl SysRowSink, r: &TableTabRow, weight: i64) {
-    sink.begin_row(r.table_id as u128, weight);
+    sink.begin_row(&[r.table_id as u128], weight);
     sink.put_u64(r.schema_id);
     sink.put_string(r.name);
     sink.put_u64(r.pk_col_idx);
@@ -130,7 +133,7 @@ pub struct ViewTabRow<'a> {
 }
 
 pub fn write_view_tab_row(sink: &mut impl SysRowSink, r: &ViewTabRow, weight: i64) {
-    sink.begin_row(r.view_id as u128, weight);
+    sink.begin_row(&[r.view_id as u128], weight);
     sink.put_u64(r.schema_id);
     sink.put_string(r.name);
     sink.put_string(r.sql_definition);
@@ -158,7 +161,7 @@ pub struct IdxTabRow<'a> {
 }
 
 pub fn write_idx_tab_row(sink: &mut impl SysRowSink, r: &IdxTabRow, weight: i64) {
-    sink.begin_row(r.index_id as u128, weight);
+    sink.begin_row(&[r.index_id as u128], weight);
     sink.put_u64(r.owner_id);
     sink.put_u64(r.source_col_idx);
     sink.put_string(r.name);
@@ -170,16 +173,15 @@ pub fn write_idx_tab_row(sink: &mut impl SysRowSink, r: &IdxTabRow, weight: i64)
 // The circuit families (CIRCUIT_NODES / CIRCUIT_EDGES / CIRCUIT_NODE_COLUMNS)
 // ---------------------------------------------------------------------------
 
-/// The compound `(view_id, sub)` key of every circuit family, with `sub` packed
-/// from the per-family fields (widest first). **view_id takes the LOW u128 half**:
-/// the PK region OPK-encodes each 8-byte column independently, low bytes first, so
-/// that is what puts view_id in the leading at-rest bytes the engine's per-view
-/// prefix seek reads. Packing `(view_id << 64) | sub` instead puts `sub` there and
-/// breaks every view load.
+/// The second PK column of every circuit family: the per-family fields packed
+/// into one u64, widest first. The first column is always `view_id`, which is
+/// what the engine's per-view prefix seek reads.
 ///
 /// `Err` when a field overflows the width it was given: it would alias another
 /// row's record, so the writer emits nothing rather than a colliding key.
-fn circuit_pk(view_id: u64, fields: &[(&str, u64, u32)]) -> Result<u128, String> {
+fn circuit_sub(fields: &[(&str, u64, u32)]) -> Result<u64, String> {
+    // Packed in a u128 so a single 64-bit field's `<< 64` is a shift, not an
+    // overflow. Every family's widths sum to 64, so the result always narrows.
     let mut sub: u128 = 0;
     for &(name, value, bits) in fields {
         if bits < 64 && value >= 1 << bits {
@@ -187,7 +189,11 @@ fn circuit_pk(view_id: u64, fields: &[(&str, u64, u32)]) -> Result<u128, String>
         }
         sub = (sub << bits) | value as u128;
     }
-    Ok((view_id as u128) | (sub << 64))
+    debug_assert!(
+        sub <= u64::MAX as u128,
+        "a circuit family's sub fields must pack into 64 bits"
+    );
+    Ok(sub as u64)
 }
 
 /// One `CircuitNodes` row: node `node_id` of view `view_id`.
@@ -202,7 +208,8 @@ pub struct CircuitNodeRow<'a> {
 }
 
 pub fn write_circuit_node_row(sink: &mut impl SysRowSink, r: &CircuitNodeRow, weight: i64) -> Result<(), String> {
-    sink.begin_row(circuit_pk(r.view_id, &[("node_id", r.node_id, 64)])?, weight);
+    let sub = circuit_sub(&[("node_id", r.node_id, 64)])?;
+    sink.begin_row(&[r.view_id as u128, sub as u128], weight);
     sink.put_u64(r.node_id);
     sink.put_u64(r.opcode);
     // Both nullable columns still take their payload slot when absent.
@@ -228,8 +235,8 @@ pub struct CircuitEdgeRow {
 }
 
 pub fn write_circuit_edge_row(sink: &mut impl SysRowSink, r: &CircuitEdgeRow, weight: i64) -> Result<(), String> {
-    let pk = circuit_pk(r.view_id, &[("dst_node", r.dst_node, 40), ("dst_port", r.dst_port, 8)])?;
-    sink.begin_row(pk, weight);
+    let sub = circuit_sub(&[("dst_node", r.dst_node, 40), ("dst_port", r.dst_port, 8)])?;
+    sink.begin_row(&[r.view_id as u128, sub as u128], weight);
     sink.put_u64(r.dst_node);
     sink.put_u64(r.dst_port);
     sink.put_u64(r.src_node);
@@ -252,15 +259,12 @@ pub fn write_circuit_node_column_row(
     r: &CircuitNodeColumnRow,
     weight: i64,
 ) -> Result<(), String> {
-    let pk = circuit_pk(
-        r.view_id,
-        &[
-            ("node_id", r.node_id, 40),
-            ("kind", r.kind, 8),
-            ("position", r.position, 16),
-        ],
-    )?;
-    sink.begin_row(pk, weight);
+    let sub = circuit_sub(&[
+        ("node_id", r.node_id, 40),
+        ("kind", r.kind, 8),
+        ("position", r.position, 16),
+    ])?;
+    sink.begin_row(&[r.view_id as u128, sub as u128], weight);
     sink.put_u64(r.node_id);
     sink.put_u64(r.kind);
     sink.put_u64(r.position);

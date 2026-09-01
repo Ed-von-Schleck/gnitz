@@ -1492,6 +1492,21 @@ impl Batch {
 
     /// Clone all buffers into a new independent Batch (2 allocations).
     pub fn clone_batch(&self) -> Self {
+        // Rebuilt rather than copied through two pooled arenas holding zero bytes.
+        if self.holds_nothing() {
+            return Batch {
+                data: Vec::new(),
+                blob: Vec::new(),
+                offsets: [0usize; MAX_BATCH_REGIONS],
+                strides: self.strides,
+                num_regions: self.num_regions,
+                capacity: 0,
+                count: 0,
+                layout: self.layout,
+                schema: self.schema,
+                blob_id: self.blob_id,
+            };
+        }
         // Only clone the actually-used portion of data (count-based, not capacity-based).
         let nr = self.num_regions as usize;
         let (packed_offsets, packed_size) = compute_offsets(&self.strides, nr, self.count);
@@ -1696,8 +1711,20 @@ impl Batch {
         self.downgrade();
     }
 
+    /// No rows and no string heap — so this batch already *is* its own cleared
+    /// and its own copied form, and `clear`/`clone_batch` can hand back what
+    /// they were given. Both keep `blob_id`: `shares_blob_with` also requires
+    /// equal blob lengths, so a kept id can only ever match another empty heap.
+    #[inline]
+    fn holds_nothing(&self) -> bool {
+        self.count == 0 && self.blob.is_empty()
+    }
+
     /// Reset to empty without freeing buffer allocations.
     pub fn clear(&mut self) {
+        if self.holds_nothing() {
+            return;
+        }
         // data buffer stays allocated — capacity and offsets remain valid. The
         // rows just dropped are the one way live batch bytes get re-exposed
         // without passing through `acquire_arena` or `reserve_rows`, so poison
@@ -2086,8 +2113,8 @@ pub struct BatchBuilder {
 /// The engine half of the shared catalog row codecs: the sink
 /// `gnitz_wire::sys_rows` writes a system-table row into.
 impl gnitz_wire::sys_rows::SysRowSink for BatchBuilder {
-    fn begin_row(&mut self, pk: u128, weight: i64) {
-        BatchBuilder::begin_row(self, pk, weight);
+    fn begin_row(&mut self, pk: &[u128], weight: i64) {
+        BatchBuilder::begin_row_opk(self, pk, weight);
     }
     fn put_u64(&mut self, v: u64) {
         BatchBuilder::put_u64(self, v);

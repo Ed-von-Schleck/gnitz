@@ -123,27 +123,18 @@ pub(crate) fn try_extract_pk_in<'e>(expr: &'e BoundExpr, schema: &Schema) -> Opt
 /// must be the last. `None` for any looser descriptor — a point covering only a
 /// PK *prefix* names a key group, not a key, and admits more than one row.
 ///
-/// Packs each value natively little-endian at the column's `pk_byte_offset` in
-/// `wire_stride` width, so a mixed-width compound PK lands correctly (the offset
-/// is the running sum in PK-list order). Equality keys and range cuts both pack
-/// through `FixedInt::pack`, so the tuple is byte-identical whichever conjunct
-/// spelling produced the point.
+/// Equality keys and range cuts both pack through `FixedInt::pack`, so the tuple
+/// is byte-identical whichever conjunct spelling produced the point.
 pub(crate) fn pk_point_tuple(desc: &RangeDescriptor, schema: &Schema) -> Option<PkTuple> {
     if !desc.pins_all(schema.pk_count()) {
         return None;
     }
-    let mut tuple = PkTuple::new(schema.pk_stride() as u8);
     let vals = desc
         .eq_vals()
         .iter()
         .copied()
         .chain(std::iter::once(desc.start.value()));
-    for (&col_idx, val) in schema.pk_indices().iter().zip(vals) {
-        let off = schema.pk_byte_offset(col_idx);
-        let w = schema.columns[col_idx].type_code.wire_stride();
-        tuple.buf[off..off + w].copy_from_slice(&val.to_le_bytes()[..w]);
-    }
-    Some(tuple)
+    Some(PkTuple::from_columns(schema, vals))
 }
 
 /// An **exact-or-superset** PK range for `where_expr` plus the residual bound

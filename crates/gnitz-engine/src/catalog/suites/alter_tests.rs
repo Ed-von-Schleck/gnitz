@@ -226,8 +226,8 @@ fn system_range_mutations_rejected() {
     };
     let view_rename = {
         let mut bb = BatchBuilder::new(SysFamily::View.schema());
-        push_view_tab_row(&mut bb, -1, IDX_TAB_ID, "a", "", 0);
-        push_view_tab_row(&mut bb, 1, IDX_TAB_ID, "b", "", 0);
+        push_view_tab_row(&mut bb, -1, IDX_TAB_ID, "a", "", 0, 0);
+        push_view_tab_row(&mut bb, 1, IDX_TAB_ID, "b", "", 0, 0);
         bb.finish()
     };
     // A bare `+1` on VIEW_TAB at a system TABLE_TAB id: VIEW_TAB holds no live

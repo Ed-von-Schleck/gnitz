@@ -24,31 +24,10 @@ use gnitz_store::schema::type_code;
 
 use std::fs;
 
-use crate::test_support::{col_def, fk_def, nullable_def, opk_pk, pk_payload_schema, scratch_dir, uuid_def};
-
-fn temp_dir(name: &str) -> String {
-    scratch_dir("catalog", name)
-}
-
-// An arbitrary fixed 128-bit value for UUID columns; the bit pattern is
-// irrelevant, only that it round-trips through a U128/UUID column.
-const UUID_A: u128 = 0x0000_0000_0000_AAAA_0000_0000_0000_BBBB;
-
-/// A non-nullable U64 schema column — the building block of the compound-PK
-/// fixtures below.
-fn u64c() -> gnitz_store::schema::SchemaColumn {
-    gnitz_store::schema::SchemaColumn::new(type_code::U64, 0)
-}
-
-/// The OPK image of a three-column U64 compound PK (`pk_stride` = 24, wide).
-/// Encoded through the production encoder, so a broken encoder fails the test
-/// rather than agreeing with a second spelling of the rule here.
-fn pk24(a: u64, b: u64, c: u64) -> [u8; 24] {
-    let schema = pk_payload_schema(&[type_code::U64; 3]);
-    opk_pk(&schema, &[a as u128, b as u128, c as u128])
-        .try_into()
-        .expect("three U64 PK columns encode to 24 bytes")
-}
+use crate::test_support::{
+    col_def, fk_def, nullable_def, opk_pk, pk_payload_schema, push_view_tab_row, register_identity_view, scratch_dir,
+    sum_weights, try_register_identity_view, uuid_def, write_circuit_chain, write_identity_circuit,
+};
 
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table
 /// (system families included) must hold none. A `-1` that retracts a row nothing
@@ -73,6 +52,38 @@ fn count_records(mut c: ReadCursor) -> usize {
         c.advance();
     }
     count
+}
+
+/// A single-row unbounded-VIEW_TAB batch for tests that register a view via the
+/// raw system-table path.
+fn build_view_tab_row(vid: i64, view_name: &str, sql: &str) -> Batch {
+    let mut bb = BatchBuilder::new(SysFamily::View.schema());
+    push_view_tab_row(&mut bb, 1, vid, view_name, sql, 0, 0);
+    bb.finish()
+}
+
+fn temp_dir(name: &str) -> String {
+    scratch_dir("catalog", name)
+}
+
+// An arbitrary fixed 128-bit value for UUID columns; the bit pattern is
+// irrelevant, only that it round-trips through a U128/UUID column.
+const UUID_A: u128 = 0x0000_0000_0000_AAAA_0000_0000_0000_BBBB;
+
+/// A non-nullable U64 schema column — the building block of the compound-PK
+/// fixtures below.
+fn u64c() -> gnitz_store::schema::SchemaColumn {
+    gnitz_store::schema::SchemaColumn::new(type_code::U64, 0)
+}
+
+/// The OPK image of a three-column U64 compound PK (`pk_stride` = 24, wide).
+/// Encoded through the production encoder, so a broken encoder fails the test
+/// rather than agreeing with a second spelling of the rule here.
+fn pk24(a: u64, b: u64, c: u64) -> [u8; 24] {
+    let schema = pk_payload_schema(&[type_code::U64; 3]);
+    opk_pk(&schema, &[a as u128, b as u128, c as u128])
+        .try_into()
+        .expect("three U64 PK columns encode to 24 bytes")
 }
 
 /// A `col < lit` predicate blob over a fixed-int column — the program shape a
@@ -218,132 +229,6 @@ fn stream_flags() -> u64 {
         ..Default::default()
     }
     .pack()
-}
-
-/// One circuit node for `write_circuit_chain`: opcode, source table, and the
-/// optional expr/param blob.
-type CircuitNode<'a> = (u64, Option<i64>, Option<&'a [u8]>);
-
-/// Write `vid`'s circuit through the applied-delta path: one node per entry of
-/// `nodes`, chained `i → i+1` on `PORT_IN`. The payload column layout follows
-/// `gnitz_wire::CIRCUIT_NODES_COLS` / `CIRCUIT_EDGES_COLS`; the compound PK
-/// `(view_id, sub)` is packed by `pack_view_pk`.
-fn write_circuit_chain(engine: &mut CatalogEngine, vid: i64, nodes: &[CircuitNode<'_>]) {
-    let mut bb = BatchBuilder::new(SysFamily::CircuitNodes.schema());
-    for (i, &(opcode, source, blob)) in nodes.iter().enumerate() {
-        bb.begin_row(pack_view_pk(vid, i as u64), 1);
-        bb.put_u64(i as u64); // node_id
-        bb.put_u64(opcode);
-        match source {
-            Some(t) => bb.put_u64(t as u64),
-            None => bb.put_null(),
-        }
-        match blob {
-            Some(b) => bb.put_blob(b),
-            None => bb.put_null(),
-        }
-        bb.end_row();
-    }
-    engine.ingest_to_family(CIRCUIT_NODES_TAB_ID, &bb.finish()).unwrap();
-
-    let mut bb = BatchBuilder::new(SysFamily::CircuitEdges.schema());
-    for src in 0..nodes.len().saturating_sub(1) as u64 {
-        bb.begin_row(pack_view_pk(vid, src), 1);
-        bb.put_u64(src + 1); // dst_node
-        bb.put_u64(gnitz_wire::PORT_IN); // dst_port
-        bb.put_u64(src); // src_node
-        bb.end_row();
-    }
-    engine.ingest_to_family(CIRCUIT_EDGES_TAB_ID, &bb.finish()).unwrap();
-}
-
-/// The minimal identity circuit `ScanDelta(base) → Integrate`. `scan_blob` is
-/// the scan node's optional expr/param blob — a bounded-scan fixture ships its
-/// `RangeDescriptor` there.
-fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, scan_blob: Option<&[u8]>) {
-    write_circuit_chain(
-        engine,
-        vid,
-        &[
-            (gnitz_wire::OPCODE_SCAN_DELTA, Some(base_tid), scan_blob),
-            (gnitz_wire::OPCODE_INTEGRATE, None, None),
-        ],
-    );
-}
-
-/// Append one raw VIEW_TAB row at `weight`. `sql` is stored verbatim. The bare
-/// `0` pk_col_idx decodes back to a single-column PK `[0]`. A `-1` reproduces
-/// exactly what a `+1` wrote, which is what the retraction CAS compares.
-fn push_view_tab_row(bb: &mut BatchBuilder, weight: i64, vid: i64, view_name: &str, sql: &str, capacity_bytes: u64) {
-    push_view_tab_row_with(bb, weight, vid, view_name, sql, capacity_bytes, 0);
-}
-
-/// [`push_view_tab_row`] with both `WITH (…)` budgets, for the tests that assert
-/// on a delta feed or on the two being refused together.
-fn push_view_tab_row_with(
-    bb: &mut BatchBuilder,
-    weight: i64,
-    vid: i64,
-    view_name: &str,
-    sql: &str,
-    capacity_bytes: u64,
-    delta_bytes: u64,
-) {
-    bb.begin_row(vid as u128, weight);
-    bb.put_u64(PUBLIC_SCHEMA_ID as u64);
-    bb.put_string(view_name);
-    bb.put_string(sql);
-    bb.put_u64(0); // pk_col_idx
-    bb.put_u64(capacity_bytes); // 0 = unbounded
-    bb.put_u64(delta_bytes); // 0 = no delta feed
-    bb.end_row();
-}
-
-/// A single-row unbounded-VIEW_TAB batch for tests that register a view via the
-/// raw system-table path. A test that needs a capacity calls `push_view_tab_row`.
-fn build_view_tab_row(vid: i64, view_name: &str, sql: &str) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, 1, vid, view_name, sql, 0);
-    bb.finish()
-}
-
-/// Register an identity view over `base_tid` through the raw system-table path,
-/// returning its vid. The circuit and column records precede the VIEW_TAB row —
-/// the order `hook_relation_register` needs to resolve the view's sources and schema.
-/// `capacity_bytes` of `0` is unbounded. Returns the registration's own error so a
-/// test can assert on a rejected one.
-fn try_register_identity_view(
-    engine: &mut CatalogEngine,
-    base_tid: i64,
-    name: &str,
-    cols: &[ColumnDef],
-    capacity_bytes: u64,
-) -> Result<i64, String> {
-    try_register_identity_view_with(engine, base_tid, name, cols, capacity_bytes, 0)
-}
-
-/// [`try_register_identity_view`] carrying both `WITH (…)` budgets — for the
-/// rules that turn on a delta feed, and on the pair.
-fn try_register_identity_view_with(
-    engine: &mut CatalogEngine,
-    base_tid: i64,
-    name: &str,
-    cols: &[ColumnDef],
-    capacity_bytes: u64,
-    delta_bytes: u64,
-) -> Result<i64, String> {
-    let vid = engine.allocate_table_id().unwrap();
-    write_identity_circuit(engine, vid, base_tid, None);
-    engine.write_column_records(vid, OWNER_KIND_VIEW, cols).unwrap();
-    let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row_with(&mut bb, 1, vid, name, "", capacity_bytes, delta_bytes);
-    engine.ingest_to_family(VIEW_TAB_ID, &bb.finish())?;
-    Ok(vid)
-}
-
-/// [`try_register_identity_view`] for an unbounded view that must succeed.
-fn register_identity_view(engine: &mut CatalogEngine, base_tid: i64, name: &str, cols: &[ColumnDef]) -> i64 {
-    try_register_identity_view(engine, base_tid, name, cols, 0).unwrap()
 }
 
 /// A COL_TAB rewrite pair on column `col_idx` of `owner_id`: `mutate` produces

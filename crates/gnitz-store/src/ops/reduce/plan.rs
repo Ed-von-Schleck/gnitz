@@ -60,8 +60,10 @@ pub struct ReducePlan {
     // ── Derived (single home: `new`) ────────────────────────────────────────
     /// This worker mints the global-aggregate ground row's seed — the
     /// conjunction of `global_ground` and per-worker V₀ ownership, so
-    /// "owns V₀ but is not a ground reduce" is unrepresentable.
-    pub(super) seeds_ground: bool,
+    /// "owns V₀ but is not a ground reduce" is unrepresentable. Public because
+    /// the VM reads it off the finished plan pool to decide whether an empty
+    /// epoch can produce anything at all.
+    pub seeds_ground: bool,
     /// What the emitted row is keyed by, and — for `PkPermutation`, the one kind
     /// selected by "the group set *is* the PK" — that the input PK region is
     /// itself the group key.

@@ -14,7 +14,9 @@ use std::rc::Rc;
 /// repopulating both maps), and only `invalidate` clears it.
 #[derive(Default)]
 pub(super) struct DepMap {
-    pub forward: FxHashMap<i64, Vec<i64>>, // source_table_id → [view_ids]
+    /// source_table_id → [view_ids]. An entry exists only because an edge was
+    /// pushed into it, so a present entry is never empty.
+    pub forward: FxHashMap<i64, Vec<i64>>,
     pub reverse: FxHashMap<i64, Vec<i64>>, // view_id → [source_table_ids]
     pub valid: bool,
 }
@@ -110,6 +112,13 @@ impl DagEngine {
     pub fn dependent_closure(&mut self, registry: &RelationRegistry, seeds: Vec<i64>) -> FxHashSet<i64> {
         self.get_dep_map(registry);
         DepMap::closure(&self.dep.forward, seeds)
+    }
+
+    /// Whether any view scans `id` directly — one step of
+    /// [`Self::dependent_closure`], and the one spelling of the test, so no
+    /// caller has to know that a `forward` entry is never empty.
+    pub fn has_dependents(&mut self, registry: &RelationRegistry, id: i64) -> bool {
+        self.get_dep_map(registry).contains_key(&id)
     }
 
     /// The distinct ids of `view_ids` in dependency order (Kahn's algorithm over

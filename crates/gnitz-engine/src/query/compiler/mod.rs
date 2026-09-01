@@ -282,28 +282,15 @@ impl SchemaSource for gnitz_store::relation::RelationRegistry {
 pub(super) struct SubPlan {
     pub vm: Box<VmHandle>,
     pub in_reg: u16,
-    /// The program carries a global-ground `Reduce` whose ground row has not been
-    /// minted yet. An empty pad round mints it (`op_reduce`'s `n == 0` branch) and
-    /// clears this; every other opcode is inert on an empty input, so once it is
-    /// clear an empty epoch skips the VM entirely. Cleared rather than left set
-    /// because `trace_out` holds V₀ from then on either way, so every later empty
-    /// tick would dispatch a whole epoch to re-find it.
-    pub pending_ground_row: bool,
     /// Maps a source table id to the input register that receives its delta.
     /// Empty for the post-combine phase (which has no source-level routing).
     pub source_reg_map: FxHashMap<i64, u16>,
 }
 
-/// One exchanged side of a [`PlanShape::Exchanged`] plan: a sub-pipeline whose
-/// output is repartitioned (relayed through the exchange) into a post-phase
-/// seed register.
+/// One exchanged side of a [`Sides`] plan: a sub-pipeline whose output is
+/// repartitioned (relayed through the exchange) into a post-phase seed register.
 pub(super) struct Side {
     pub plan: SubPlan,
-    /// Source table this side scans (`0` = multiple/unknown). For a two-sided
-    /// set-op it keys the side's IPC rounds distinctly in the master
-    /// accumulator and routes each delta to the side(s) scanning its source;
-    /// a unary side takes every delta regardless.
-    pub source_id: i64,
     /// Register in the post VM seeded with this side's relayed batch.
     pub seed_reg: u16,
 }
@@ -318,15 +305,32 @@ impl Side {
     }
 }
 
-/// The phase structure of a compiled view.
-/// * `Single`: the whole plan is one sub-pipeline (no repartition).
-/// * `Exchanged`: one side (GROUP BY / SELECT DISTINCT / PK redistribution /
-///   range join) or two sides (binary set-ops) each computes up to its
-///   `ExchangeShard`, is relayed, and seeds the post-combine phase.
-///   `sides.len() ∈ {1, 2}` — more is rejected at compile.
-pub(super) enum PlanShape {
-    Single(SubPlan),
-    Exchanged { sides: Vec<Side>, post: SubPlan },
+/// What a compiled view repartitions through: one sub-pipeline per
+/// `ExchangeShard` in its circuit, each computing up to that shard, relayed, and
+/// seeding the post-combine phase. More than two is rejected at compile.
+pub(super) enum Sides {
+    /// No `ExchangeShard`: the whole plan is its post phase.
+    Unexchanged,
+    /// GROUP BY / SELECT DISTINCT / PK redistribution / range join, taking every
+    /// delta.
+    Unary(Side),
+    /// A binary set-op, each side paired with the one source it scans: a side
+    /// takes the delta iff that source is the delta's, so `a UNION a` runs both.
+    Pair([(i64, Side); 2]),
+}
+
+impl Sides {
+    /// Every side's sub-plan, in side order.
+    fn plans_mut(&mut self) -> impl Iterator<Item = &mut SubPlan> {
+        let (unary, pair) = match self {
+            Sides::Unexchanged => (None, None),
+            Sides::Unary(side) => (Some(&mut side.plan), None),
+            Sides::Pair(pair) => (None, Some(pair)),
+        };
+        unary
+            .into_iter()
+            .chain(pair.into_iter().flatten().map(|(_, side)| &mut side.plan))
+    }
 }
 
 /// What one `build_plan` call is producing — and with it whether the sink-schema
@@ -356,7 +360,11 @@ pub(super) enum PlanTarget<'a> {
 /// read. Producing a second copy here would be two producers of one fact — the
 /// defect one level up from a badly typed one.
 pub(super) struct CompileOutput {
-    pub shape: PlanShape,
+    /// What the circuit repartitions through, ahead of `post`.
+    pub sides: Sides,
+    /// The combine phase every side's relayed batch seeds — and, for a circuit
+    /// with no `ExchangeShard`, the whole plan.
+    pub post: SubPlan,
     /// The `(source table id, secondary-index range)` the planner pushed onto the
     /// primary source's `ScanDelta`, consulted only by the two circuit backfill
     /// drivers (a steady-state delta never opens the source cursor). A **physical
@@ -371,14 +379,10 @@ pub(super) struct CompileOutput {
 }
 
 impl CompileOutput {
-    /// Every sub-plan of the shape, for whole-plan sweeps (regfile clears,
+    /// Every sub-plan of the view, for whole-plan sweeps (regfile clears,
     /// checkpoint table collection).
     pub(super) fn sub_plans_mut(&mut self) -> impl Iterator<Item = &mut SubPlan> {
-        let (sides, single, post) = match &mut self.shape {
-            PlanShape::Single(sub) => (&mut [][..], Some(sub), None),
-            PlanShape::Exchanged { sides, post } => (&mut sides[..], None, Some(post)),
-        };
-        sides.iter_mut().map(|s| &mut s.plan).chain(single).chain(post)
+        self.sides.plans_mut().chain(std::iter::once(&mut self.post))
     }
 }
 
@@ -390,7 +394,6 @@ pub(super) struct PlanBuildResult {
     vm: Box<VmHandle>,
     in_reg: u16,
     source_reg_map: FxHashMap<i64, u16>,
-    pending_ground_row: bool,
     // The seed register of each exchange input this plan was built with, in the
     // order the input list named them — so `compile_view` reads a side's seed at
     // the side's own index rather than searching for it.
@@ -415,19 +418,18 @@ impl PlanBuildResult {
         self.scratch.defuse();
         SubPlan {
             in_reg: self.in_reg,
-            pending_ground_row: self.pending_ground_row,
             source_reg_map: self.source_reg_map,
             vm: self.vm,
         }
     }
 
-    /// The single source table this plan scans (empty/ambiguous → 0), used as
-    /// the exchange `source_id` so each side's IPC rounds key distinctly.
-    fn single_source(&self) -> i64 {
-        if self.source_reg_map.len() == 1 {
-            *self.source_reg_map.keys().next().unwrap()
-        } else {
-            0
+    /// The one source table this plan scans, or `None` where it scans none or
+    /// several. A set-op side's exchange key, so each side's IPC rounds key
+    /// distinctly.
+    fn single_source(&self) -> Option<i64> {
+        match self.source_reg_map.len() {
+            1 => self.source_reg_map.keys().next().copied(),
+            _ => None,
         }
     }
 }
@@ -469,6 +471,43 @@ pub(super) struct ViewSite<'a> {
     /// The policy the view's *output store* was opened under, handed down so its
     /// operator traces cannot end up looking for a different manifest generation.
     pub recovery: RecoverySource,
+}
+
+/// Assemble a compiled view's exchange sides, seeding each from `seed_regs` at
+/// its own index. Every refusal precedes the first `into_sub_plan()` — that is
+/// what still leaves the `Err` its `ScratchGuard`s to run.
+fn build_sides(mut plans: Vec<PlanBuildResult>, seed_regs: &[u16]) -> Result<Sides, CompileError> {
+    let side = |plan: PlanBuildResult, i: usize| Side {
+        seed_reg: seed_regs[i],
+        plan: plan.into_sub_plan(),
+    };
+    match plans.len() {
+        0 => Ok(Sides::Unexchanged),
+        1 => Ok(Sides::Unary(side(plans.pop().expect("one side"), 0))),
+        // A side scanning no single source matches no delta at all. Only the raw
+        // `CircuitBuilder` wire path can build one; three or more sides are
+        // already refused above.
+        _ => {
+            let Some(keys) = plans
+                .iter()
+                .map(PlanBuildResult::single_source)
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Err(CompileError::Rejected(
+                    "a two-sided plan has a side scanning no single source, so no delta can reach it",
+                ));
+            };
+            let mut keyed = plans
+                .into_iter()
+                .zip(keys)
+                .enumerate()
+                .map(|(i, (plan, key))| (key, side(plan, i)));
+            Ok(Sides::Pair([
+                keyed.next().expect("two sides"),
+                keyed.next().expect("two sides"),
+            ]))
+        }
+    }
 }
 
 /// Compile a circuit for a single view: read the circuit from the system
@@ -561,29 +600,23 @@ pub(super) fn compile_view(
         },
     )?;
 
+    // A delta is routed to the side scanning its source, so a post-phase scan
+    // reaches nothing: its rows are dropped (two-sided) or seeded to the wrong
+    // register (unary). Only the raw `CircuitBuilder` wire path can build one.
+    if !carves.is_empty() && !post.source_reg_map.is_empty() {
+        return Err(CompileError::Rejected(
+            "an exchanged plan scans a relation outside every exchange side",
+        ));
+    }
+
     // `bounded` forced `carves` empty above, so `post` is the whole plan here.
     let hydration = bounded.then(|| derive_hydration(&loaded, &post)).transpose()?;
-    let shape = if carves.is_empty() {
-        PlanShape::Single(post.into_sub_plan())
-    } else {
-        let sides: Vec<Side> = side_plans
-            .into_iter()
-            .enumerate()
-            .map(|(i, plan)| Side {
-                source_id: plan.single_source(),
-                seed_reg: post.exchange_input_regs[i],
-                plan: plan.into_sub_plan(),
-            })
-            .collect();
-        PlanShape::Exchanged {
-            sides,
-            post: post.into_sub_plan(),
-        }
-    };
+    let sides = build_sides(side_plans, &post.exchange_input_regs)?;
 
     Ok(CompiledView {
         output: CompileOutput {
-            shape,
+            sides,
+            post: post.into_sub_plan(),
             source_bound: load::circuit_source_bound(&loaded),
             hydration,
         },

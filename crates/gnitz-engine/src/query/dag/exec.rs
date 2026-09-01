@@ -2,436 +2,383 @@
 //! compiled shape runs through, and the DAG evaluation driver.
 
 use super::*;
-use crate::query::compiler::PlanShape;
+use crate::query::compiler::{Side, Sides};
 use gnitz_store::storage::StorageError;
-use std::collections::BTreeMap;
 
-/// The DAG traversal's work queue: `(depth, view_id, source_id) → batch`.
-/// Ordered by depth, so `pop_first` is the shallowest pending edge; keyed by the
-/// edge, so merge-on-collision is one `get_mut`.
-type Pending = BTreeMap<(i32, i64, i64), Batch>;
+/// One edge of a tick's schedule: `producer`'s output feeds `view`, and `depth`
+/// is `view`'s stamped registration depth. Field order is the sort order, so
+/// sorting a schedule puts every producer before the steps it feeds.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct Step {
+    depth: i32,
+    view: i64,
+    producer: i64,
+}
+
+/// What a side's relay rounds are keyed by, so a view's two sides cannot collide
+/// in the master's accumulator. Its own type because the other `i64` in reach is
+/// a table id, and the two are not interchangeable.
+#[derive(Clone, Copy)]
+struct RelayKey(i64);
+
+impl RelayKey {
+    /// The key a view with a single side relays under: its own shard columns.
+    const OWN_SHARD: RelayKey = RelayKey(0);
+}
+
+/// The exchange transport of one view's epoch, with the view it relays for and
+/// the elide verdict bound once so a round takes only its batch and key.
+struct Relay<'a> {
+    exchange: &'a mut dyn ExchangeCallback,
+    view_id: i64,
+    /// This view's shuffle is a proven no-op, so a round hands its batch back.
+    elide: bool,
+}
+
+impl Relay<'_> {
+    /// One repartition round. Run even for an empty batch, so the collective
+    /// rounds stay balanced across workers.
+    fn round(&mut self, batch: Batch, key: RelayKey) -> Batch {
+        match self.elide {
+            true => batch,
+            false => self.exchange.do_exchange(self.view_id, &batch, key.0),
+        }
+    }
+}
 
 impl DagEngine {
     // ── Epoch execution ─────────────────────────────────────────────────
 
-    /// [`Self::run_view_epoch`] with the identity relay: no exchange IPC, because
-    /// either the shape has no relay to run or the view is replicated and every
-    /// worker already holds every source in full.
-    fn execute_epoch(
-        &mut self,
-        registry: &RelationRegistry,
-        view_id: i64,
-        input: Batch,
-        source_id: i64,
-    ) -> Result<Option<Batch>, String> {
-        self.run_view_epoch(registry, view_id, input, source_id, |pre, _| pre)
-    }
-
-    /// Execute one view epoch through its compiled shape.
-    ///
-    /// * `Single`: one sub-pipeline, run directly.
-    /// * `Exchanged`: route the delta to the side(s) scanning its source, run
-    ///   each side, hand its output through `relay`, consolidate, and seed the
-    ///   post combine with every side's batch.
-    ///
-    /// `relay(pre, key)` is the repartition step: an exchanged view passes the
-    /// exchange IPC (`key` is the side's round key — a two-sided set-op keys by
-    /// the side's source so the two rounds don't collide in the master
-    /// accumulator; a unary side keys 0), a replicated view passes identity
-    /// (every worker holds every source in full, so there is nothing to
-    /// repartition). A side that takes the delta always runs its
-    /// relay — even on an empty pre output — so collective exchange rounds stay
-    /// balanced across workers; an inactive side (no delta this epoch) skips its
-    /// VM pass, its relay, and its consolidate, and seeds an empty placeholder
-    /// (`a_needs`/`b_needs` derive only from the plan sources and `src_id`,
-    /// both identical on every worker, so all workers skip the same side).
-    ///
-    /// The consolidate is mandatory before the post phase: the relay
-    /// concatenates rows from all workers (and a HashRow reindex scrambles PK
-    /// order), and the post phase's distinct/join operators assume sorted,
-    /// weight-merged input.
+    /// Run one view's epoch: compile it if it is not cached, route the delta
+    /// through the exchange where the view's routing metadata says it must, then
+    /// execute the compiled plan. `None` when a phase produced nothing.
     fn run_view_epoch(
         &mut self,
         registry: &RelationRegistry,
         view_id: i64,
         input: Batch,
         src_id: i64,
-        mut relay: impl FnMut(Batch, i64) -> Batch,
+        exchange: &mut dyn ExchangeCallback,
     ) -> Result<Option<Batch>, String> {
         if !self.ensure_compiled(registry, view_id)? {
             gnitz_warn!("dag: run_view_epoch — no plan for view_id={}", view_id);
             return Ok(None);
         }
-        let plan = self.cache.get_mut(&view_id).unwrap();
-        match &mut plan.shape {
-            PlanShape::Single(sub) => Self::execute_sub_plan(sub, input, src_id).map_err(|e| e.to_string()),
-            PlanShape::Exchanged { sides, post } => {
-                // A unary side takes every delta; a set-op side takes it iff it
-                // scans the delta's source (`a UNION a` — both sides scan one
-                // relation — clones so each side gets it).
-                let unary = sides.len() == 1;
-                // Nothing takes the delta: every seed comes up empty and the rows
-                // are dropped. The epoch still runs — the post phase can still
-                // mint the global-ground row — so this line is the only trace.
-                if !unary && !sides.iter().any(|s| s.source_id == src_id) {
-                    gnitz_warn!(
-                        "dag: view {} — delta source {} matches no side; rows dropped",
-                        view_id,
-                        src_id
-                    );
-                    debug_assert!(false, "view {view_id}: delta source {src_id} matches no side");
-                }
-                let mut remaining = sides.iter().filter(|s| unary || s.source_id == src_id).count();
-                let mut input = Some(input);
-                let mut seeds: Vec<(u16, Batch)> = Vec::with_capacity(sides.len());
-                for side in sides.iter_mut() {
-                    let schema = side.exchange_schema();
-                    let takes = unary || side.source_id == src_id;
-                    let consolidated = if takes {
-                        remaining -= 1;
-                        let delta = if remaining == 0 {
-                            input.take().unwrap()
-                        } else {
-                            input.as_ref().unwrap().clone_batch()
-                        };
-                        // `exchange_schema()` IS the side's out-register schema,
-                        // which the VM stamps on what it returns, so the wire
-                        // encode already sees the side's pre-exchange schema
-                        // (never the view's combine-widened final one).
-                        let pre = Self::execute_sub_plan(&mut side.plan, delta, src_id)
-                            .map_err(|e| e.to_string())?
-                            .unwrap_or_else(|| Batch::empty_with_schema(&schema));
-                        let relay_key = if unary { 0 } else { side.source_id };
-                        relay(pre, relay_key).into_consolidated(&schema)
-                    } else {
-                        Batch::empty_with_schema(&schema)
-                    };
-                    seeds.push((side.seed_reg, consolidated));
-                }
-                // A pad round whose every side produced nothing.
-                if Self::latch_empty_epoch(post, seeds.iter().all(|(_, b)| b.count == 0)) {
-                    return Ok(None);
-                }
-                Self::execute_sub_plan_multi(post, seeds).map_err(|e| e.to_string())
-            }
-        }
-    }
-
-    /// Free what a view's compiled-plan register files hold — the delta batches
-    /// and the bound trace cursors. The per-epoch clear keeps both, so a finished
-    /// backfill would otherwise pin its last chunk's arenas and trace runs for the
-    /// cached plan's lifetime; peak resident memory falls back to ~O(chunk) here.
-    pub fn release_view_regfile_deltas(&mut self, view_id: i64) {
-        if let Some(plan) = self.cache.get_mut(&view_id) {
-            for sub in plan.sub_plans_mut() {
-                sub.vm.release_deltas();
-            }
-        }
-    }
-
-    /// Execute one sub-pipeline epoch, seeding one register per input. Takes the
-    /// sub-plan by mutable reference, to reach the VM's regfile, tables and
-    /// cursor state.
-    fn execute_sub_plan_multi(
-        sub: &mut SubPlan,
-        inputs: impl IntoIterator<Item = (u16, Batch)>,
-    ) -> Result<Option<Batch>, StorageError> {
-        sub.vm.compact_owned_traces();
-        sub.vm.bind_trace_cursors();
-        vm::execute_epoch_multi(&mut sub.vm, inputs)
-    }
-
-    /// True ⇒ the caller must return `None`: an empty epoch this program cannot
-    /// emit from. Skips the whole VM pass — cursor refresh, compaction checks,
-    /// dispatch — for the empty placeholders multi-worker lockstep fans to every
-    /// dependent edge every tick; the `clear_deltas` releases the previous real
-    /// epoch's batches, which the skipped epoch-start clear would have.
-    ///
-    /// The latch is cleared BEFORE the program runs: a global-ground reduce mints
-    /// its V₀ row at most once, and after this pass `trace_out` holds it whether
-    /// this epoch wrote it or a previous one did.
-    fn latch_empty_epoch(sub: &mut SubPlan, input_is_empty: bool) -> bool {
-        if !input_is_empty {
-            return false;
-        }
-        if !sub.pending_ground_row {
-            sub.vm.clear_deltas();
-            return true;
-        }
-        sub.pending_ground_row = false;
-        false
-    }
-
-    /// Single-input sub-pipeline epoch. `source_id > 0` selects the input
-    /// register from the sub-plan's `source_reg_map`; pass `0` when the
-    /// sub-plan has a single unambiguous input.
-    fn execute_sub_plan(sub: &mut SubPlan, input: Batch, source_id: i64) -> Result<Option<Batch>, StorageError> {
-        if Self::latch_empty_epoch(sub, input.count == 0) {
-            return Ok(None);
-        }
-        let in_reg = if source_id > 0 {
-            sub.source_reg_map.get(&source_id).copied().unwrap_or(sub.in_reg)
-        } else {
-            sub.in_reg
-        };
-        Self::execute_sub_plan_multi(sub, std::iter::once((in_reg, input)))
-    }
-
-    // ── Multi-worker dispatch ───────────────────────────────────────────
-
-    /// Run one multi-worker DAG step: ensure the view's circuit is compiled,
-    /// then dispatch on the compiled shape + routing annotations and run the
-    /// view's epoch, returning the output delta (`None` when a phase produced
-    /// nothing). Each arm below states its own precondition; the two orderings
-    /// that are not free are that a replicated view is intercepted before
-    /// anything reads the shape, and that the range-join test precedes the shape
-    /// match — a range join is `Exchanged` too, but relays its *input* as well
-    /// and never elides its output exchange.
-    fn execute_multi_worker_step<E: ExchangeCallback>(
-        &mut self,
-        registry: &RelationRegistry,
-        view_id: i64,
-        input: Batch,
-        src_id: i64,
-        exchange: &mut E,
-    ) -> Result<Option<Batch>, String> {
-        if !self.ensure_compiled(registry, view_id)? {
-            gnitz_warn!("dag: execute_multi_worker_step — no plan for view_id={}", view_id);
-            return Ok(None);
-        }
-
-        // A view stamped replicated holds every source in full and receives
-        // the full (broadcast) delta on every worker, so it computes its entire
-        // result locally and the worker-0 scan reads it whole. Every worker
-        // evaluates this identically, so they skip the same exchange rounds and the
-        // collective barrier stays balanced.
-        if registry.relation_is_replicated(view_id) {
-            return self.execute_epoch(registry, view_id, input, src_id);
-        }
-
         // Routing comes off the one memoized `ViewMeta` the master relay also
         // reads; the plan supplies only its executable shape. Taken before the
-        // plan borrow so the `&mut self` memo lookup and the `&self` cache read
-        // do not overlap.
-        let meta = self.view_meta(registry, view_id);
-        let plan = self.cache.get(&view_id).unwrap();
-        let is_range_join = meta.range_join_n_eq.is_some();
-        let exchanged = match &plan.shape {
-            PlanShape::Exchanged { sides, .. } => Some(sides.len()),
-            PlanShape::Single(_) => None,
+        // plan borrow, so the memo lookup and the cache read do not overlap.
+        let meta = (!registry.relation_is_replicated(view_id)).then(|| self.view_meta(registry, view_id));
+        let input = match meta.as_ref().is_some_and(|m| m.scatters(src_id)) {
+            true => exchange.do_exchange(view_id, &input, src_id),
+            false => input,
         };
+        let plan = self.cache.get_mut(&view_id).expect("ensure_compiled inserted it");
+        let elide = match meta.as_ref() {
+            // A replicated view holds every source in full: nothing to repartition.
+            None => true,
+            // A lone side's rows already sit on the worker that owns them; a
+            // set-op pair's two sides must still meet on one worker.
+            Some(m) => m.skips_exchange && matches!(plan.sides, Sides::Unary(_)),
+        };
+        let mut relay = Relay {
+            exchange,
+            view_id,
+            elide,
+        };
+        Self::run_plan(&mut plan.sides, &mut plan.post, input, src_id, &mut relay).map_err(|e| e.to_string())
+    }
 
-        if is_range_join {
-            // Range join — relay the input delta first, then the exchanged pipeline.
-            let bc = exchange.do_exchange(view_id, &input, src_id);
-            self.run_view_epoch(registry, view_id, bc, src_id, |pre, key| {
-                exchange.do_exchange(view_id, &pre, key)
-            })
-        } else if let Some(n_sides) = exchanged {
-            // Exchanged — the relay elides the IPC when the unary output shuffle
-            // is a proven no-op.
-            let skip_output_exchange = n_sides == 1 && meta.skips_exchange;
-            self.run_view_epoch(registry, view_id, input, src_id, |pre, key| {
-                if skip_output_exchange {
-                    pre
-                } else {
-                    exchange.do_exchange(view_id, &pre, key)
-                }
-            })
-        } else if meta.scatters(src_id) {
-            // Single + join-scatter source — scatter the delta by the join-shard
-            // cols before the pipeline.
-            let scattered = exchange.do_exchange(view_id, &input, src_id);
-            self.execute_epoch(registry, view_id, scattered, src_id)
-        } else {
-            // Single — one-phase execute.
-            self.execute_epoch(registry, view_id, input, src_id)
+    /// Seed every phase of a compiled plan and run its post combine.
+    ///
+    /// Which sides are active derives from the plan and `src_id`, both
+    /// worker-identical — so the collective relay rounds stay balanced.
+    fn run_plan(
+        sides: &mut Sides,
+        post: &mut SubPlan,
+        input: Batch,
+        src_id: i64,
+        relay: &mut Relay<'_>,
+    ) -> Result<Option<Batch>, StorageError> {
+        // Each arm hands `execute_epoch_multi` a fixed-size array: the seed count
+        // is the side count, known here, so no arm heap-allocates to carry it.
+        match sides {
+            Sides::Unexchanged => {
+                let seed = sub_seed(post, input, src_id);
+                vm::execute_epoch_multi(&mut post.vm, [seed])
+            }
+            Sides::Unary(side) => {
+                let seed = Self::run_side(side, Some(input), src_id, RelayKey::OWN_SHARD, relay)?;
+                vm::execute_epoch_multi(&mut post.vm, [seed])
+            }
+            Sides::Pair([(key_a, a), (key_b, b)]) => {
+                // A side takes the delta iff it scans the delta's source, so
+                // `a UNION a` runs both. The last taker is handed the batch and
+                // the other a copy.
+                let (da, db) = match (*key_a == src_id, *key_b == src_id) {
+                    (true, true) => (Some(input.clone_batch()), Some(input)),
+                    (true, false) => (Some(input), None),
+                    (false, true) => (None, Some(input)),
+                    (false, false) => (None, None),
+                };
+                let seeds = [
+                    Self::run_side(a, da, src_id, RelayKey(*key_a), relay)?,
+                    Self::run_side(b, db, src_id, RelayKey(*key_b), relay)?,
+                ];
+                vm::execute_epoch_multi(&mut post.vm, seeds)
+            }
         }
     }
 
-    /// Drive ONE view's epoch for a distributed-backfill chunk and ingest its
-    /// output into the view's family. Returns true iff the view produced rows
-    /// (the caller flushes the view once after the final chunk).
+    /// One side's seed for the post phase, `None` where the delta does not reach
+    /// it.
     ///
-    /// This is the **view-scoped** analogue of `evaluate_dag_multi_worker`,
-    /// which drives `source_id`'s *whole* dependent closure. A live CREATE VIEW
-    /// must drive only the new view: the source already has populated existing
-    /// dependents that a closure re-drive would double-count. Boot has no such
-    /// dependents (every view starts empty), so it keeps the closure driver.
-    /// The new view has no dependents of its own yet, so there is nothing to
-    /// fan downstream — just run its step and ingest.
-    pub fn backfill_view_step_multi_worker<E: ExchangeCallback>(
-        &mut self,
-        registry: &mut RelationRegistry,
-        view_id: i64,
-        source_id: i64,
-        delta: Batch,
-        exchange: &mut E,
-    ) -> Result<bool, String> {
-        if !registry.has_id(view_id) {
-            return Ok(false);
-        }
-        // A backfilled view must be ephemeral: a durable one loads its shards
-        // from its manifest at open, which would double-count against the deltas
-        // ingested below. Narrower than "not `SalReplay`": a stream owns no store
-        // at all and would have passed that test, and cannot reach here either —
-        // `invalid_views` holds only view ids, and a backfill on a stream is
-        // rejected before this.
-        debug_assert!(
-            registry.relation_kind(view_id).is_none_or(|k| k.is_view()),
-            "distributed backfill into durable relation {view_id}: \
-             would double-count loaded shards",
-        );
-        match self.execute_multi_worker_step(registry, view_id, delta, source_id, exchange)? {
-            Some(out) if out.count > 0 => {
-                registry
-                    .ingest_returning_effective(view_id, out)
-                    .map_err(|e| e.to_string())?;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
+    /// The consolidate is mandatory: the relay concatenates rows from every
+    /// worker (and a HashRow reindex scrambles PK order), and the post phase's
+    /// distinct/join operators assume sorted, weight-merged input.
+    fn run_side(
+        side: &mut Side,
+        delta: Option<Batch>,
+        src_id: i64,
+        key: RelayKey,
+        relay: &mut Relay<'_>,
+    ) -> Result<(u16, Batch), StorageError> {
+        // `exchange_schema()` IS the side's out-register schema, which the VM
+        // stamps on what it returns — so the wire encode sees the side's
+        // pre-exchange schema, never the view's combine-widened final one.
+        let schema = side.exchange_schema();
+        let Some(delta) = delta else {
+            return Ok((side.seed_reg, Batch::empty_with_schema(&schema)));
+        };
+        let seed = sub_seed(&side.plan, delta, src_id);
+        let pre =
+            vm::execute_epoch_multi(&mut side.plan.vm, [seed])?.unwrap_or_else(|| Batch::empty_with_schema(&schema));
+        Ok((side.seed_reg, relay.round(pre, key).into_consolidated(&schema)))
     }
 
     // ── DAG traversal driver ────────────────────────────────────────────
 
-    /// Multi-worker DAG evaluation with exchange IPC. Seeds the pending queue
-    /// from `source_id`'s direct dependents, then repeatedly pops the shallowest
-    /// pending edge, runs its view's multi-worker step, ingests the output, and
-    /// fans that output — or, for a view that produced nothing, an empty
-    /// placeholder so collective exchange rounds stay in lockstep across workers
-    /// — onto each downstream edge, until the queue drains. Every modified view's
-    /// output store is flushed exactly once after the DAG settles.
+    /// One [`Step`] per dependency edge out of `source_id`'s forward closure, in
+    /// execution order. A pure function of the dep map and the stamped depths,
+    /// both worker-identical — which is what keeps the workers in lockstep.
+    fn tick_schedule(&mut self, registry: &RelationRegistry, source_id: i64) -> Vec<Step> {
+        // A push into a table no view scans is the common case, and reaches
+        // nothing.
+        if !self.has_dependents(registry, source_id) {
+            return Vec::new();
+        }
+        let mut producers = self.dependent_closure(registry, vec![source_id]);
+        producers.insert(source_id);
+        let mut schedule: Vec<Step> = Vec::new();
+        for producer in producers {
+            for &view in self.dep.forward.get(&producer).into_iter().flatten() {
+                // The dep map is built from `CircuitNodes`, which can still name a
+                // relation the registry no longer holds.
+                if let Some(entry) = registry.entry(view) {
+                    schedule.push(Step {
+                        depth: entry.depth,
+                        view,
+                        producer,
+                    });
+                }
+            }
+        }
+        schedule.sort_unstable();
+        schedule
+    }
+
+    /// Run `view_id`'s epoch over `input` and ingest whatever it produced into
+    /// the view's family. `round` stamps a fed view's captured delta; `None` is a
+    /// backfill, whose rows never enter a delta store.
+    fn run_and_ingest(
+        &mut self,
+        registry: &mut RelationRegistry,
+        view_id: i64,
+        src_id: i64,
+        input: Batch,
+        round: Option<u64>,
+        exchange: &mut dyn ExchangeCallback,
+    ) -> Result<Option<Batch>, String> {
+        let produced = self
+            .run_view_epoch(registry, view_id, input, src_id, exchange)?
+            .filter(|b| b.count > 0);
+        if let Some(out) = produced.as_ref() {
+            registry
+                .ingest_view_delta(view_id, out, round)
+                .map_err(|e| format!("view store ingest failed (view_id={view_id}): {e}"))?;
+        }
+        Ok(produced)
+    }
+
+    /// Run `schedule` to completion, seeded with `seed_producer`'s output, and
+    /// return the views that produced rows.
+    fn drive(
+        &mut self,
+        registry: &mut RelationRegistry,
+        schedule: &[Step],
+        seed_producer: i64,
+        seed: Batch,
+        round: u64,
+        exchange: &mut dyn ExchangeCallback,
+    ) -> Result<FxHashSet<i64>, String> {
+        // Which steps each producer feeds, in schedule order — so the group's
+        // last entry is the last consumer of that producer's output.
+        let mut feeds: FxHashMap<i64, Vec<usize>> = FxHashMap::default();
+        for (i, step) in schedule.iter().enumerate() {
+            feeds.entry(step.producer).or_default().push(i);
+        }
+        let mut inputs: Vec<Option<Batch>> = (0..schedule.len()).map(|_| None).collect();
+        let mut dirty: FxHashSet<i64> = FxHashSet::default();
+
+        let seeded = feeds.get(&seed_producer).map_or(&[][..], Vec::as_slice);
+        Self::fan_out(&mut inputs, seeded, seed);
+
+        for (i, step) in schedule.iter().enumerate() {
+            // No input means the producer never ran — a relation the registry no
+            // longer holds — so this edge carries nothing.
+            let Some(input) = inputs[i].take() else { continue };
+            let produced = self.run_and_ingest(registry, step.view, step.producer, input, Some(round), exchange)?;
+            if produced.is_some() {
+                dirty.insert(step.view);
+            }
+            let Some(fed) = feeds.get(&step.view) else { continue };
+            // A view that produced nothing still fans an empty batch, so an
+            // exchange-dependent consumer runs and collective rounds stay in
+            // lockstep.
+            let out = produced.unwrap_or_else(|| {
+                let entry = registry.entry(step.view).expect("the schedule names registered views");
+                Batch::empty_with_schema(&entry.schema)
+            });
+            Self::fan_out(&mut inputs, fed, out);
+        }
+        Ok(dirty)
+    }
+
+    /// Hand `delta` to each of the steps a producer feeds, in schedule order. The
+    /// last of them is handed the batch itself and the rest a copy, so at most
+    /// two copies of a delta are live at once.
+    fn fan_out(inputs: &mut [Option<Batch>], fed: &[usize], delta: Batch) {
+        let Some((&last, rest)) = fed.split_last() else {
+            return;
+        };
+        for &i in rest {
+            Self::deposit(&mut inputs[i], delta.clone_batch());
+        }
+        Self::deposit(&mut inputs[last], delta);
+    }
+
+    /// Put `delta` into one step's input slot: a fill when the slot holds no rows,
+    /// a union otherwise. An empty slot takes the fill rather than the union
+    /// because `op_union` against an empty operand clones the other one whole.
+    fn deposit(slot: &mut Option<Batch>, delta: Batch) {
+        match slot.take().filter(|b| b.count > 0) {
+            Some(held) => {
+                // The held batch's schema, not the incoming one: it selects
+                // `payload_cmp` and is what the union's result is certified under.
+                let schema = held.schema;
+                *slot = Some(ops::op_union(held, &delta, &schema));
+            }
+            None => *slot = Some(delta),
+        }
+    }
+
+    /// Flush one modified view's output store. A failure here is a RAM-tier spill
+    /// fault: the view store can no longer be bounded, and continuing would grow
+    /// memory unchecked under a sustained fault.
+    fn flush_view(registry: &mut RelationRegistry, view_id: i64) -> Result<(), String> {
+        registry
+            .flush(view_id)
+            .map_err(|e| format!("view store flush failed (view_id={view_id}): {e}"))
+    }
+
+    /// Run every edge `source_id` reaches, then flush every modified view's
+    /// output store exactly once.
     ///
-    /// `tick_round` is the strictly-increasing round the master allocated for the
-    /// tick group that drove this evaluation. It stamps every fed view's captured
-    /// delta, and is what makes "give me what changed since N" answerable.
-    pub fn evaluate_dag_multi_worker<E: ExchangeCallback>(
+    /// `tick_round` is the master-allocated round this evaluation runs under. It
+    /// stamps every fed view's captured delta — what makes "give me what changed
+    /// since N" answerable.
+    pub fn evaluate_dag(
         &mut self,
         registry: &mut RelationRegistry,
         source_id: i64,
         delta: Batch,
         tick_round: u64,
-        exchange: &mut E,
+        exchange: &mut dyn ExchangeCallback,
     ) -> Result<(), String> {
-        self.get_dep_map(registry);
-        let Some(view_ids) = self.dep.forward.get(&source_id).filter(|v| !v.is_empty()) else {
+        let schedule = self.tick_schedule(registry, source_id);
+        if schedule.is_empty() {
             return Ok(());
-        };
-
-        let mut pending = Pending::new();
-        Self::queue_dependents(&mut pending, registry, view_ids, source_id, delta.schema, Some(delta));
-        let mut dirty_views: FxHashSet<i64> = FxHashSet::default();
-        let mut popped_depth = i32::MIN;
-
-        while let Some(((depth, view_id, src_id), input)) = pending.pop_first() {
-            // Registration stamps `depth = max(source depth) + 1`, so depth
-            // strictly increases along every edge: a producer at depth d fans only
-            // onto depth > d, and no edge can re-enter a depth already popped.
-            // That is what makes ordering by depth alone a valid schedule.
-            debug_assert!(
-                depth >= popped_depth,
-                "pending popped depth {depth} after {popped_depth}"
-            );
-            popped_depth = depth;
-
-            // The table may have been dropped between queueing and now.
-            if !registry.has_id(view_id) {
-                continue;
-            }
-
-            let out_delta = self
-                .execute_multi_worker_step(registry, view_id, input, src_id, exchange)?
-                .filter(|b| b.count > 0);
-
-            if let Some(out) = out_delta.as_ref() {
-                dirty_views.insert(view_id);
-                registry
-                    .ingest_view_delta(view_id, out, tick_round)
-                    .map_err(|e| format!("view store ingest failed (view_id={view_id}): {e}"))?;
-            }
-
-            // Fan the output onto each dependent edge. Both borrows are shared
-            // and disjoint from each other; `map_or` yields an empty slice for a
-            // terminal view, which `queue_dependents` no-ops on.
-            let src_schema = registry.table_entry(view_id).expect("checked above").schema;
-            let dep_view_ids = self.dep.forward.get(&view_id).map_or(&[][..], Vec::as_slice);
-            Self::queue_dependents(&mut pending, registry, dep_view_ids, view_id, src_schema, out_delta);
         }
-
-        // A failure here is a RAM-tier spill fault: the view store can no longer
-        // be bounded, and continuing would grow memory unchecked under a
-        // sustained fault.
-        for vid in dirty_views {
-            registry
-                .flush(vid)
-                .map_err(|e| format!("view store flush failed (view_id={vid}): {e}"))?;
+        let dirty = self.drive(registry, &schedule, source_id, delta, tick_round, exchange)?;
+        for vid in dirty {
+            Self::flush_view(registry, vid)?;
         }
         Ok(())
     }
 
-    /// Queue `producer_id`'s output onto each dependent's pending edge. Also the
-    /// seed: against an empty queue every dependent takes the fill pass below, so
-    /// the traversal's first step is this call with the tick's source as producer.
+    /// Drive ONE view's epoch for a distributed-backfill chunk and ingest its
+    /// output into the view's family. Returns true iff the chunk produced rows.
     ///
-    /// `delta` is the producer's output, or `None` when it fired with none —
-    /// empty placeholders are still queued so exchange-dependent views run and
-    /// collective rounds stay in lockstep.
-    ///
-    /// Every queued batch is labelled with `src_schema` — the PRODUCER's output
-    /// schema, never the consumer's. A JOIN consumer's combine-widened final
-    /// schema is a different width than the operand batch on this edge; tagging
-    /// the operand with it would trip the vm seed guard.
-    fn queue_dependents(
-        pending: &mut Pending,
-        registry: &RelationRegistry,
-        dep_view_ids: &[i64],
-        producer_id: i64,
-        src_schema: SchemaDescriptor,
-        mut delta: Option<Batch>,
-    ) {
-        let depth_of = |dep_id: i64| registry.entry(dep_id).map(|e| e.depth);
-        // A dependent already holding rows takes a merge; one holding an empty
-        // placeholder takes a fill, because `op_union` against an empty operand
-        // clones the other one whole — the copy this split exists to avoid.
-        let takes_fill = |pending: &Pending, dep_id: i64, depth: i32| {
-            pending.get(&(depth, dep_id, producer_id)).is_none_or(|b| b.count == 0)
-        };
+    /// **View-scoped**, where [`Self::evaluate_dag`] drives the whole closure: a
+    /// live CREATE VIEW must not re-drive the source's existing dependents, which
+    /// are already populated. Boot has none, so it keeps the closure driver.
+    pub fn backfill_chunk(
+        &mut self,
+        registry: &mut RelationRegistry,
+        view_id: i64,
+        source_id: i64,
+        delta: Batch,
+        exchange: &mut dyn ExchangeCallback,
+    ) -> Result<bool, String> {
+        if !registry.has_id(view_id) {
+            return Ok(false);
+        }
+        // Durable would double-count: such a relation loads its shards from its
+        // manifest at open. Here as well as in the ingest verb, which a chunk
+        // producing no rows never reaches.
+        debug_assert!(
+            registry.relation_kind(view_id).is_none_or(|k| k.is_view()),
+            "distributed backfill into durable relation {view_id}: \
+             would double-count loaded shards",
+        );
+        let produced = self.run_and_ingest(registry, view_id, source_id, delta, None, exchange)?;
+        Ok(produced.is_some())
+    }
 
-        // Merges first, so the fill pass below can MOVE the producer's batch into
-        // the last dependent that needs one instead of cloning it for every one.
-        if let Some(d) = delta.as_ref() {
-            for &dep_id in dep_view_ids {
-                let Some(depth) = depth_of(dep_id) else { continue };
-                let Some(slot) = pending.get_mut(&(depth, dep_id, producer_id)) else {
-                    continue;
-                };
-                if slot.count == 0 {
-                    continue;
-                }
-                let existing = slot.take();
-                let schema = existing.schema;
-                *slot = ops::op_union(existing, d, &schema);
+    /// End `view_id`'s backfill, `produced` being whether any chunk produced rows.
+    ///
+    /// Releases the last chunk's pinned registers and trace cursors, then flushes
+    /// the view's output store — which [`Self::backfill_chunk`] leaves to this
+    /// call rather than paying per chunk.
+    pub fn finish_backfill(
+        &mut self,
+        registry: &mut RelationRegistry,
+        view_id: i64,
+        produced: bool,
+    ) -> Result<(), String> {
+        if let Some(plan) = self.cache.get_mut(&view_id) {
+            for sub in plan.sub_plans_mut() {
+                sub.vm.release();
             }
         }
-
-        let Some(last_fill) = dep_view_ids
-            .iter()
-            .rposition(|&dep_id| depth_of(dep_id).is_some_and(|d| takes_fill(pending, dep_id, d)))
-        else {
-            return;
-        };
-        for (i, &dep_id) in dep_view_ids.iter().enumerate() {
-            let Some(depth) = depth_of(dep_id) else { continue };
-            if !takes_fill(pending, dep_id, depth) {
-                continue;
-            }
-            let batch = match delta.as_ref() {
-                None => Batch::empty_with_schema(&src_schema),
-                Some(_) if i == last_fill => delta.take().expect("moved at most once"),
-                Some(d) => d.clone_batch(),
-            };
-            pending.insert((depth, dep_id, producer_id), batch);
+        match produced {
+            true => Self::flush_view(registry, view_id),
+            false => Ok(()),
         }
     }
 }
+
+/// The `(register, batch)` that seeds a sub-pipeline with `source_id`'s delta:
+/// the register that source routes to, or the plan's single input where it
+/// routes no source of that id.
+fn sub_seed(sub: &SubPlan, input: Batch, source_id: i64) -> (u16, Batch) {
+    let in_reg = sub.source_reg_map.get(&source_id).copied().unwrap_or(sub.in_reg);
+    (in_reg, input)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "tests/exec.rs"]
+mod tests;

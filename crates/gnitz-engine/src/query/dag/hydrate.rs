@@ -16,7 +16,7 @@
 //! product, which is what a replay over the two trace integrals computes.
 
 use super::*;
-use crate::query::compiler::{HydrationSeed, PlanShape};
+use crate::query::compiler::{HydrationSeed, Sides};
 use gnitz_store::read::SkeletonHydrator;
 use gnitz_store::storage::PkSetGather;
 
@@ -66,13 +66,10 @@ impl SkeletonHydrator for DagEngine {
         // `Rc`, so both borrows of the registry end here and the VM is free to
         // run below.
         let plan = self.cache.get_mut(&view_id).expect("ensure_compiled inserted the plan");
-        let PlanShape::Single(sub) = &mut plan.shape else {
+        if !matches!(plan.sides, Sides::Unexchanged) {
             return Err(format!("hydrate: view {view_id} is not a single-phase plan"));
-        };
-        // Cursors only — no `compact_owned_traces`, because a read must not mutate
-        // shard state. A linear circuit owns no trace table, so this is a no-op
-        // there.
-        sub.vm.bind_trace_cursors();
+        }
+        let sub = &mut plan.post;
         let seed_schema = sub.vm.program.reg_meta[hydration.in_reg as usize].schema;
         // The gather opens over the range its own key list spans.
         let mut gather = match hydration.seed {
@@ -90,13 +87,10 @@ impl SkeletonHydrator for DagEngine {
                 PkSetGather::open(keys, seed_schema, |s, e| trace.open_cursor_in_range(s, e))
             }
         };
+        let mut replay = vm::Replay::start(&mut sub.vm, hydration.start_pc);
         while let Some(seed) = gather.next_chunk(chunk_rows) {
-            // Reusing the cached `VmHandle`'s own register file is safe in both
-            // directions: the dispatch clears every delta register on entry, so
-            // hydration starts clean and leaves nothing a later epoch can read
-            // (the next epoch clears again and re-binds its trace cursors through
-            // `bind_trace_cursors`).
-            let produced = vm::execute_epoch_replay(&mut sub.vm, (hydration.in_reg, seed), hydration.start_pc)
+            let produced = replay
+                .chunk((hydration.in_reg, seed))
                 .map_err(|e| format!("hydrate: view {view_id} replay failed: {e}"))?;
             if let Some(b) = produced {
                 debug_assert!(

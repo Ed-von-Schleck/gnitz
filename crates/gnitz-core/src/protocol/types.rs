@@ -556,6 +556,21 @@ impl PkTuple {
         t
     }
 
+    /// Build a tuple from the PK columns' native values in PK-list order: each
+    /// little-endian in its own `wire_stride`, at the running byte offset. The
+    /// one spelling of the wire PK region's layout, which the engine re-encodes
+    /// to the at-rest big-endian OPK on ingest.
+    pub fn from_columns(schema: &Schema, natives: impl IntoIterator<Item = u128>) -> Self {
+        let mut t = Self::new(schema.pk_stride() as u8);
+        let mut off = 0;
+        for ((w, _), v) in schema.pk_col_codes().zip(natives) {
+            t.buf[off..off + w].copy_from_slice(&v.to_le_bytes()[..w]);
+            off += w;
+        }
+        debug_assert_eq!(off, schema.pk_stride(), "from_columns: one value per PK column");
+        t
+    }
+
     /// Build a tuple from a u128 with the full 16-byte narrow stride, without
     /// a schema lookup — for a caller holding a key value but not the schema.
     /// The server reads only the column's actual stride; the high padding bytes
@@ -1044,8 +1059,8 @@ pub struct BatchAppender<'a> {
 /// because this builder writes the null word eagerly in `add_row` and needs no
 /// per-row close.
 impl gnitz_wire::sys_rows::SysRowSink for BatchAppender<'_> {
-    fn begin_row(&mut self, pk: u128, weight: i64) {
-        self.add_row(pk, weight);
+    fn begin_row(&mut self, pk: &[u128], weight: i64) {
+        self.add_row_cols(pk, weight);
     }
     fn put_u64(&mut self, v: u64) {
         self.u64_val(v);
@@ -1074,28 +1089,42 @@ impl<'a> BatchAppender<'a> {
         }
     }
 
-    /// Start a new row with the given primary key and weight.
+    /// Start a new row with the given single-column primary key and weight.
     pub fn add_row(&mut self, pk: u128, weight: i64) -> &mut Self {
+        self.open_row(weight);
+        self.batch.pks.push_u128(pk);
+        self
+    }
+
+    /// [`Self::add_row`] for a **compound** PK: `natives` are the PK columns'
+    /// native values in PK-list order.
+    pub fn add_row_cols(&mut self, natives: &[u128], weight: i64) -> &mut Self {
+        self.open_row(weight);
+        let pk = PkTuple::from_columns(self.schema, natives.iter().copied());
+        self.batch.pks.push_tuple(&pk);
+        self
+    }
+
+    /// The per-row bookkeeping both row starters owe, minus the key itself.
+    fn open_row(&mut self, weight: i64) {
         // Each row must receive exactly `num_payload_cols()` payload pushes before
-        // the next `add_row`. Symmetric counterpart to `col_index`'s over-push
+        // the next row starts. Symmetric counterpart to `col_index`'s over-push
         // assert; an under-pushed row otherwise desyncs the column vectors and
         // only surfaces later as an un-attributed `ZSetBatch::validate` length
         // error. `debug_assert` (not `assert`): `validate` already rejects the bad
         // batch totally and safely, so this is a diagnostic, not a safety guard.
-        // `row_active` exempts the first `add_row` without assuming the batch started
+        // `row_active` exempts the first row without assuming the batch started
         // empty.
         debug_assert!(
             !self.row_active || self.cursor == self.schema.num_payload_cols(),
-            "BatchAppender::add_row: previous row got {} of {} payload columns",
+            "BatchAppender: previous row got {} of {} payload columns",
             self.cursor,
             self.schema.num_payload_cols(),
         );
-        self.batch.pks.push_u128(pk);
         self.batch.weights.push(weight);
         self.batch.nulls.push(0);
         self.cursor = 0;
         self.row_active = true;
-        self
     }
 
     /// Append one fixed-width cell to the next column: `bytes` is the column's

@@ -21,26 +21,28 @@ fn owned_table(dir: &std::path::Path, name: &str, schema: SchemaDescriptor) -> g
     scratch_table(dir.join(name).to_str().unwrap(), schema, 0)
 }
 
-/// A reduce with no value index — the shape every test reduce uses. `out_key` is
-/// the one kind a given (schema, group cols) admits, so it is derived, not passed.
+/// A reduce with no value index, over the register convention every test reduce
+/// shares: 0 = input delta, 1 = output trace, 2 = raw delta out. `out_key` is the
+/// one kind a given (schema, group cols) admits, so it is derived, not passed.
 fn push_reduce(
     b: &mut ProgramBuilder,
-    in_reg: u16,
-    trace_out_reg: u16,
-    out_reg: u16,
     aggs: &[AggDescriptor],
     gcols: &[u32],
     in_schema: SchemaDescriptor,
-) {
+    global_ground: bool,
+    i_am_owner: bool,
+) -> SchemaDescriptor {
     let out_key = in_schema.reduce_out_key(gcols);
-    let plan = gnitz_store::ops::ReducePlan::new(&in_schema, gcols, aggs, out_key, false, false).unwrap();
+    let plan = gnitz_store::ops::ReducePlan::new(&in_schema, gcols, aggs, out_key, global_ground, i_am_owner).unwrap();
+    let out_schema = plan.output_schema;
     let plan_idx = b.add_reduce_plan(plan, None);
     b.push(Instr::Reduce {
-        in_reg,
-        trace_out_reg,
-        out_reg,
+        in_reg: 0,
+        trace_out_reg: 1,
+        out_reg: 2,
         plan_idx,
     });
+    out_schema
 }
 
 /// A U128 PK plus `col_types` as payload columns — the 2- and 3-payload shapes
@@ -412,7 +414,6 @@ fn test_distinct_multi_tick() {
     let mut vm = builder.build(reg_meta, 2);
 
     // Tick 1: insert pk=1 with weight +3 → distinct output should be +1
-    vm.bind_trace_cursors();
     let r1 = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, 3, 42)]), 0)
         .unwrap()
         .unwrap();
@@ -420,13 +421,11 @@ fn test_distinct_multi_tick() {
 
     // Tick 2: delta w=-1, integral before tick = +3, after = +2 (still positive).
     // No boundary crossing → output should be empty.
-    vm.bind_trace_cursors();
     let r2 = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, -1, 42)]), 0);
     assert!(r2.unwrap().is_none(), "no boundary crossing: output should be empty");
 
     // Tick 3: delta w=-2, integral before tick = +2, after = 0 (non-positive).
     // Positive→non-positive boundary crossed → retraction: output pk=1 w=-1.
-    vm.bind_trace_cursors();
     let r3 = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, -2, 42)]), 0)
         .unwrap()
         .unwrap();
@@ -463,10 +462,14 @@ fn test_join_delta_trace() {
         RegisterMeta::delta(join_schema),
     ];
     let mut vm = builder.build(reg_meta, 2);
-    vm.bind_trace_cursors();
 
     let input = make_batch_u128(&left_schema, &[(10, 2, 50)]);
     let result = execute_epoch(&mut vm, input, 0).unwrap().unwrap();
+    assert_eq!(
+        vm.regfile.batches[1].count, 0,
+        "a trace is reached through its cursor, never its register's batch — which is what \
+         lets the per-epoch clear run over every register blind",
+    );
 
     // 1 delta row × 3 trace rows, each at the weight product 2 × 1, and each
     // carrying the left payload before the right.
@@ -511,8 +514,7 @@ fn test_reduce_groups_by_a_payload_column() {
 
     let mut builder = ProgramBuilder::new();
     builder.push_table(trace_out_table);
-    // reg 0 = input delta, reg 1 = trace_out, reg 2 = raw_delta output
-    push_reduce(&mut builder, 0, 1, 2, &agg_descs, &group_cols, in_schema);
+    push_reduce(&mut builder, &agg_descs, &group_cols, in_schema, false, false);
     builder.push(Instr::Integrate {
         in_reg: 2,
         trace_reg: 1,
@@ -527,7 +529,6 @@ fn test_reduce_groups_by_a_payload_column() {
 
     // Both rows in group=1, values 10 and 20.
     let input = make_batch_2col(in_schema, &[(1, 1, 1, 10), (2, 1, 1, 20)]);
-    vm.bind_trace_cursors();
     let r1 = execute_epoch(&mut vm, input, 0).unwrap().unwrap();
 
     assert_eq!(r1.count, 1, "one group → one output row");
@@ -560,8 +561,7 @@ fn test_reduce_multi_agg() {
 
     let mut builder = ProgramBuilder::new();
     builder.push_table(trace_out_table);
-    // reg 0 = input delta, reg 1 = trace_out, reg 2 = output
-    push_reduce(&mut builder, 0, 1, 2, &agg_descs, &group_cols, in_schema);
+    push_reduce(&mut builder, &agg_descs, &group_cols, in_schema, false, false);
     builder.push(Instr::Integrate {
         in_reg: 2,
         trace_reg: 1,
@@ -576,7 +576,6 @@ fn test_reduce_multi_agg() {
 
     // Three rows all with pk=1, vals 10, 20, 30.
     let input = make_batch_u128(&in_schema, &[(1, 1, 10), (1, 1, 20), (1, 1, 30)]);
-    vm.bind_trace_cursors();
     let result = execute_epoch(&mut vm, input, 0).unwrap().unwrap();
 
     assert_eq!(result.count, 1, "multi-agg should produce 1 group");
@@ -584,4 +583,106 @@ fn test_reduce_multi_agg() {
     let sum_val = i64::from_le_bytes(result.col_data(1)[0..8].try_into().unwrap());
     assert_eq!(count_val, 3, "COUNT should be 3");
     assert_eq!(sum_val, 60, "SUM should be 60");
+}
+
+// ── The empty-epoch skip ─────────────────────────────────────────────────
+
+/// A global-ground reduce this worker owns mints its V₀ row on ONE empty epoch;
+/// after that `trace_out` holds it, so every later empty epoch skips the pass.
+#[test]
+fn an_empty_epoch_mints_the_ground_row_once() {
+    let in_schema = make_schema_u128_i64();
+    let aggs = [AggDescriptor {
+        col_idx: 1,
+        agg_op: AggFunc::Count,
+    }];
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = ProgramBuilder::new();
+    let out_schema = push_reduce(&mut builder, &aggs, &[], in_schema, true, true);
+    builder.push_table(owned_table(dir.path(), "ground_tr", out_schema));
+    builder.push(Instr::Integrate {
+        in_reg: 2,
+        trace_reg: 1,
+    });
+    let reg_meta = vec![
+        RegisterMeta::delta(in_schema),
+        RegisterMeta::trace(out_schema, TableIdx(0)),
+        RegisterMeta::delta(out_schema),
+    ];
+    let mut vm = builder.build(reg_meta, 2);
+    assert!(
+        vm.pending_ground_row,
+        "the latch is derived from the finished reduce-plan pool",
+    );
+
+    let first = execute_epoch(&mut vm, Batch::empty_with_schema(&in_schema), 0)
+        .unwrap()
+        .expect("the ground row");
+    assert_eq!(first.count, 1);
+    assert!(!vm.pending_ground_row, "cleared before the pass, not after it");
+    assert!(
+        execute_epoch(&mut vm, Batch::empty_with_schema(&in_schema), 0)
+            .unwrap()
+            .is_none(),
+        "a second empty epoch has nothing left to mint",
+    );
+}
+
+/// The latch is `global_ground && i_am_owner`, not `global_ground`: the workers
+/// that do not own V₀ have nothing to mint, so an empty epoch must not dispatch
+/// on them either.
+#[test]
+fn a_ground_reduce_this_worker_does_not_own_leaves_the_latch_clear() {
+    let in_schema = make_schema_u128_i64();
+    let aggs = [AggDescriptor {
+        col_idx: 1,
+        agg_op: AggFunc::Count,
+    }];
+    let dir = tempfile::tempdir().unwrap();
+    let mut builder = ProgramBuilder::new();
+    let out_schema = push_reduce(&mut builder, &aggs, &[], in_schema, true, false);
+    builder.push_table(owned_table(dir.path(), "unowned_tr", out_schema));
+    let reg_meta = vec![
+        RegisterMeta::delta(in_schema),
+        RegisterMeta::trace(out_schema, TableIdx(0)),
+        RegisterMeta::delta(out_schema),
+    ];
+    let mut vm = builder.build(reg_meta, 2);
+    assert!(!vm.pending_ground_row);
+    assert!(execute_epoch(&mut vm, Batch::empty_with_schema(&in_schema), 0)
+        .unwrap()
+        .is_none());
+}
+
+/// Without a ground row an empty epoch produces nothing and runs no dispatch —
+/// but it still clears the previous epoch's registers, which is the one thing
+/// the skipped prologue would otherwise have done.
+#[test]
+fn an_empty_epoch_skips_the_pass_and_still_clears_the_registers() {
+    let schema = make_schema_u128_i64();
+    let mut builder = ProgramBuilder::new();
+    // Passes every row through at one worker, and reads its input by reference —
+    // so the input register still holds rows when the epoch ends.
+    builder.push(Instr::WorkerFilter {
+        in_reg: 0,
+        out_reg: 1,
+        worker_id: 0,
+        num_workers: 1,
+    });
+    let mut vm = builder.build(vec![RegisterMeta::delta(schema); 2], 1);
+    assert!(!vm.pending_ground_row);
+
+    let out = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, 1, 10)]), 0)
+        .unwrap()
+        .expect("one row through");
+    assert_eq!(out.count, 1);
+    assert_eq!(vm.regfile.batches[0].count, 1, "the input register still holds it");
+
+    assert!(execute_epoch(&mut vm, Batch::empty_with_schema(&schema), 0)
+        .unwrap()
+        .is_none());
+    assert!(
+        vm.regfile.batches.iter().all(|b| b.count == 0),
+        "the skipped epoch still released the previous one's batches",
+    );
 }

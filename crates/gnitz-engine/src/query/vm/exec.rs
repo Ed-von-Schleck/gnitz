@@ -2,7 +2,7 @@
 
 use super::*;
 use gnitz_store::ops;
-use gnitz_store::storage::{Batch, ReadCursor};
+use gnitz_store::storage::{Batch, ReadCursor, StorageError};
 
 // ---------------------------------------------------------------------------
 // Execution
@@ -14,11 +14,7 @@ use gnitz_store::storage::{Batch, ReadCursor};
 /// error is returned so the process that owns the recovery decision makes it —
 /// for a server, restart + SAL replay. This only logs; every call site applies
 /// `?` to what it hands back.
-fn log_tick_ingest_err(
-    op: &str,
-    table_idx: TableIdx,
-    r: Result<(), gnitz_store::storage::StorageError>,
-) -> Result<(), gnitz_store::storage::StorageError> {
+fn log_tick_ingest_err(op: &str, table_idx: TableIdx, r: Result<(), StorageError>) -> Result<(), StorageError> {
     r.inspect_err(|e| {
         gnitz_error!(
             "vm: {} ingest failed (table_idx={}): {} — tick state diverged \
@@ -33,27 +29,48 @@ fn log_tick_ingest_err(
 /// Execute one epoch over `inputs`, one `(register, batch)` per seeded input —
 /// two for a set-op post phase, one everywhere else. Returns the output
 /// register's batch, or `None` when the epoch produced nothing.
+///
+/// Seeds, compacts and binds its own cursors, so a caller hands over batches and
+/// gets a delta back with no prologue of its own to order.
 pub(crate) fn execute_epoch_multi(
     vm: &mut VmHandle,
     inputs: impl IntoIterator<Item = (u16, Batch)>,
-) -> Result<Option<Batch>, gnitz_store::storage::StorageError> {
-    seed_inputs(vm, inputs);
+) -> Result<Option<Batch>, StorageError> {
+    let all_empty = seed_inputs(vm, inputs);
+    // A global-ground reduce mints its V₀ row on one empty epoch; every other
+    // opcode is inert on empty input. Cleared before the run, because `trace_out`
+    // holds V₀ afterwards either way.
+    if all_empty && !std::mem::take(&mut vm.pending_ground_row) {
+        return Ok(None);
+    }
+    vm.compact_owned_traces();
+    vm.bind_trace_cursors();
     dispatch(vm, 0, IntegrateMode::Write)
 }
 
-/// A capacity-bounded view's per-key hydration replay: seed one register out of
-/// a store and dispatch from `start_pc`, past the prologue that seed replaces.
-///
-/// Read-only-ness is not this function's to enforce — `reject_state_writers`
-/// rejects a plan carrying any state writer but `Integrate`, which
-/// [`IntegrateMode::Skip`] then handles.
-pub(crate) fn execute_epoch_replay(
-    vm: &mut VmHandle,
-    seed: (u16, Batch),
+/// One capacity-bounded view's hydration pass. [`Replay::start`] binds the trace
+/// cursors once, so "bound exactly once for the pass" is a property of the type
+/// rather than of the caller's statement order.
+pub(crate) struct Replay<'a> {
+    vm: &'a mut VmHandle,
     start_pc: usize,
-) -> Result<Option<Batch>, gnitz_store::storage::StorageError> {
-    seed_inputs(vm, std::iter::once(seed));
-    dispatch(vm, start_pc, IntegrateMode::Skip)
+}
+
+impl<'a> Replay<'a> {
+    /// Cursors only — no `compact_owned_traces`, because a read must not mutate
+    /// shard state.
+    pub(crate) fn start(vm: &'a mut VmHandle, start_pc: usize) -> Self {
+        vm.bind_trace_cursors();
+        Replay { vm, start_pc }
+    }
+
+    /// Seed one register out of a store and dispatch from `start_pc`, past the
+    /// prologue that seed replaces. Read-only-ness is `reject_state_writers`'s to
+    /// enforce; the one writer it admits is handled by [`IntegrateMode::Skip`].
+    pub(crate) fn chunk(&mut self, seed: (u16, Batch)) -> Result<Option<Batch>, StorageError> {
+        seed_inputs(self.vm, std::iter::once(seed));
+        dispatch(self.vm, self.start_pc, IntegrateMode::Skip)
+    }
 }
 
 /// Whether the dispatch runs `Instr::Integrate`. A hydration replay skips it: it
@@ -65,13 +82,15 @@ enum IntegrateMode {
     Skip,
 }
 
-/// Clear the delta registers and move each seed into its own. Split from
-/// [`dispatch`] so only these lines are generic over the seed iterator, not the
-/// whole loop below — which uses nothing generic and has two instantiations.
-fn seed_inputs(vm: &mut VmHandle, inputs: impl IntoIterator<Item = (u16, Batch)>) {
-    vm.clear_deltas();
+/// Clear the registers and move each seed into its own, reporting whether every
+/// seed was empty. Split from [`dispatch`] so only these lines are generic over
+/// the seed iterator, not the whole loop below.
+fn seed_inputs(vm: &mut VmHandle, inputs: impl IntoIterator<Item = (u16, Batch)>) -> bool {
+    vm.regfile.clear();
 
+    let mut all_empty = true;
     for (input_reg, input_batch) in inputs {
+        all_empty &= input_batch.count == 0;
         // Rows under the wrong layout would scramble every downstream read
         // silently. An empty batch has none, and legitimately carries a foreign
         // schema (a dep_map view with no matching rows), so it is exempt.
@@ -84,30 +103,25 @@ fn seed_inputs(vm: &mut VmHandle, inputs: impl IntoIterator<Item = (u16, Batch)>
         }
         vm.regfile.batches[input_reg as usize] = input_batch;
     }
+    all_empty
 }
 
 /// The batch of register `reg`, taken in place when instruction `pc` is its last
-/// reader — or when it is empty, where the `empty_like` placeholder `take` leaves
-/// is indistinguishable and a clone would pop two pooled arenas to copy nothing.
+/// reader and copied otherwise.
 ///
 /// `#[inline]`: it returns a 1 KiB `Batch` by value, so a call would cost an
 /// extra sret move at every site.
 #[inline]
 fn take_or_clone(batches: &mut [Batch], last_read: &[u32], reg: u16, pc: usize) -> Batch {
     let batch = &mut batches[reg as usize];
-    if batch.count == 0 || last_read[reg as usize] == pc as u32 {
-        batch.take()
-    } else {
-        batch.clone_batch()
+    match last_read[reg as usize] == pc as u32 {
+        true => batch.take(),
+        false => batch.clone_batch(),
     }
 }
 
 /// Run the instruction stream from `start_pc` and extract the output register.
-fn dispatch(
-    vm: &mut VmHandle,
-    start_pc: usize,
-    integrate: IntegrateMode,
-) -> Result<Option<Batch>, gnitz_store::storage::StorageError> {
+fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Result<Option<Batch>, StorageError> {
     // Destructured because the three are disjoint fields: that is what lets an
     // operator hold a batch and a cursor (or a table) at once, with no interior
     // mutability and no raw pointer.
@@ -288,7 +302,7 @@ fn dispatch(
     // Extract the output, labelled with the output register's own schema. An
     // operator's identity path can hand an input batch straight back (see
     // `op_union`), so the label on it may be an operand's; downstream — the
-    // exchange wire, `prepare_relay`, `queue_dependents` — cannot re-derive it.
+    // exchange wire, `prepare_relay`, the dag driver's fan-out — cannot re-derive it.
     let out = &mut batches[program.out_reg as usize];
     Ok((out.count > 0).then(|| {
         let mut batch = out.take();
@@ -306,15 +320,14 @@ fn dispatch(
     }))
 }
 
-/// The cursor bound to trace register `reg`. `bind_trace_cursors` opens one on
-/// every register `reg_meta` gives an owned table, and `build_plan` rejects a
-/// circuit whose trace port names a register without one — so a missing cursor
-/// here is a VM bug, not a state a circuit can reach.
+/// The cursor bound to trace register `reg`. Every path into [`dispatch`] binds
+/// first, and `build_plan` rejects a trace port naming a register with no owned
+/// table — so a missing cursor is a VM bug, not a state a circuit can reach.
 #[inline]
 fn bound_cursor(cursors: &mut [Option<Box<ReadCursor>>], reg: u16) -> &mut ReadCursor {
     cursors[reg as usize]
         .as_deref_mut()
-        .expect("bind_trace_cursors must run before dispatch")
+        .expect("every dispatch binds its trace cursors first")
 }
 
 #[cfg(test)]

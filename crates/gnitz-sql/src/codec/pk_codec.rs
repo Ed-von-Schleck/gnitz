@@ -252,10 +252,10 @@ pub(crate) fn extract_pk_value_mapped(
     slot_of: &[Option<usize>],
     schema: &Schema,
 ) -> Result<PkTuple, GnitzSqlError> {
-    let stride = schema.pk_stride() as u8;
-    let mut tuple = PkTuple::new(stride);
-    let mut off = 0usize;
-    for &pi in schema.pk_indices() {
+    // `PK_LIST_MAX_COLS < MAX_PK_COLUMNS`, so every validated PK fits without a
+    // per-row allocation; `PkTuple::from_columns` owns the byte layout.
+    let mut natives = [0u128; gnitz_wire::MAX_PK_COLUMNS];
+    for (slot, &pi) in natives.iter_mut().zip(schema.pk_indices()) {
         let pk_expr = slot_of
             .get(pi)
             .copied()
@@ -267,14 +267,9 @@ pub(crate) fn extract_pk_value_mapped(
                     schema.columns[pi].name
                 ))
             })?;
-        let tc = schema.columns[pi].type_code;
-        let v = parse_one_pk_literal(pk_expr, tc, &schema.columns[pi].name)?;
-        let w = tc.wire_stride();
-        tuple.buf[off..off + w].copy_from_slice(&v.to_le_bytes()[..w]);
-        off += w;
+        *slot = parse_one_pk_literal(pk_expr, schema.columns[pi].type_code, &schema.columns[pi].name)?;
     }
-    debug_assert_eq!(off, stride as usize);
-    Ok(tuple)
+    Ok(PkTuple::from_columns(schema, natives))
 }
 
 pub(crate) fn is_null_expr(expr: &Expr) -> bool {

@@ -98,7 +98,7 @@ impl DagEngine {
         table_id: i64,
         schema: SchemaDescriptor,
     ) -> Result<(), String> {
-        if self.get_dep_map(registry).get(&table_id).is_some_and(|v| !v.is_empty()) {
+        if self.has_dependents(registry, table_id) {
             return Err(format!(
                 "swap_table_schema: table {table_id} has dependent views;                  RESTRICT should have rejected the ALTER"
             ));

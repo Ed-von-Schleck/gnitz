@@ -715,8 +715,8 @@ fn test_dep_map_drops_a_retired_views_edges() {
     write_identity_circuit(&mut engine, v2, tid, None);
     engine.write_column_records(v2, OWNER_KIND_VIEW, &cols).unwrap();
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, -1, v1, "v1", "", 0);
-    push_view_tab_row(&mut bb, 1, v2, "v1", "", 0);
+    push_view_tab_row(&mut bb, -1, v1, "v1", "", 0, 0);
+    push_view_tab_row(&mut bb, 1, v2, "v1", "", 0, 0);
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
     assert_eq!(
         engine.dag.get_dep_map(&engine.registry).get(&tid),
@@ -766,32 +766,20 @@ fn test_circuit_table_surface_introspectable() {
     let dir = temp_dir("circuit_surface");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    // Inject a row directly into CIRCUIT_NODES so the store is non-empty.
-    // Compound-PK layout: (view_id U64, sub U64) primary key, then payload
-    // node_id U64, opcode U64, source_table U64?, expr_program BLOB?.
-    let schema = SysFamily::CircuitNodes.schema();
-    let mut bb = BatchBuilder::new(schema);
-    let pk = pack_view_pk(0, 42); // view_id=0, sub=node_id=42
-    bb.begin_row(pk, 1);
-    bb.put_u64(42); // node_id
-    bb.put_u64(11); // opcode
-    bb.put_null(); // source_table (NULL)
-    bb.put_null(); // expr_program (NULL)
-    bb.end_row();
-    engine.ingest_to_family(CIRCUIT_NODES_TAB_ID, &bb.finish()).unwrap();
+    // Inject a row directly into CIRCUIT_NODES so the store is non-empty: view 7,
+    // with a single node, through the shared row codec.
+    write_circuit_chain(&mut engine, 7, &[(11, None, None)]);
 
     // The new schema is SQL-introspectable — `SELECT * FROM CircuitNodes`
     // must return what we just inserted (full-scan path, used by SQL planner).
     let scan = engine.scan_family(CIRCUIT_NODES_TAB_ID).unwrap().0;
     assert_eq!(scan.count, 1, "scan_family must expose CircuitNodes rows");
 
-    // Compound PK: seek by the 16-byte at-rest PK region. begin_row writes
-    // extend_pk(pk) = pk.to_be_bytes(), the OPK image (view_id_BE ++ sub_BE).
-    let pk_be = pk.to_be_bytes();
-    let pk_bytes = &pk_be[..16];
+    // Compound PK: seek by the 16-byte at-rest `(view_id, node_id)` OPK region.
+    let pk_bytes = opk_pk(&SysFamily::CircuitNodes.schema(), &[7, 0]);
     let found = engine
         .registry_mut()
-        .seek_family_bytes(CIRCUIT_NODES_TAB_ID, pk_bytes, None)
+        .seek_family_bytes(CIRCUIT_NODES_TAB_ID, &pk_bytes, None)
         .unwrap();
     assert!(found.is_some(), "seek_family_bytes must find CircuitNodes row by PK");
     let found = found.unwrap();

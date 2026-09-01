@@ -232,6 +232,12 @@ fn a_scan_whose_reindex_maps_are_all_auxiliary_is_rejected() {
 ///   ScanDelta(9) ─────────────────────────→ Join(kind)
 ///                                           → ExchangeShard([1]) → IntegrateSink
 fn join_meta(kind: JoinKind, key_cols: &[u32]) -> ViewMeta {
+    join_meta_in(kind, key_cols, ExtTables::default())
+}
+
+/// [`join_meta`] against a host that knows the sources' schemas, so
+/// co-partitioning is decidable.
+fn join_meta_in(kind: JoinKind, key_cols: &[u32], ext: ExtTables) -> ViewMeta {
     let nodes: HashMap<i32, OpNode> = HashMap::from([
         (0, scan_delta(7)),
         (1, scatter_reindex(key_cols)),
@@ -247,7 +253,7 @@ fn join_meta(kind: JoinKind, key_cols: &[u32]) -> ViewMeta {
         (3, 4, PORT_IN),
         (4, 5, PORT_IN),
     ];
-    ViewMeta::derive(&loaded_for_test(nodes, edges), &ExtTables::default()).expect("fixture routes")
+    ViewMeta::derive(&loaded_for_test(nodes, edges), &ext).expect("fixture routes")
 }
 
 fn pure_range(n_eq: u8) -> JoinKind {
@@ -291,7 +297,6 @@ fn join_cols(route: &RelayRoute) -> Option<Vec<u32>> {
 #[test]
 fn only_the_keyed_source_of_a_pure_range_join_broadcasts() {
     let meta = join_meta(pure_range(0), &[1]);
-    assert_eq!(meta.range_join_n_eq, Some(0));
     assert!(
         matches!(meta.relay_route(7), RelayRoute::Broadcast),
         "the keyed input relay of a pure-range join must broadcast"
@@ -316,7 +321,6 @@ fn only_the_keyed_source_of_a_pure_range_join_broadcasts() {
 #[test]
 fn a_band_join_routes_by_the_equality_prefix_and_an_equi_join_by_the_whole_key() {
     let band = join_meta(pure_range(1), &[3, 4]);
-    assert_eq!(band.range_join_n_eq, Some(1));
     assert_eq!(
         join_cols(band.relay_route(7)),
         Some(vec![3]),
@@ -324,8 +328,20 @@ fn a_band_join_routes_by_the_equality_prefix_and_an_equi_join_by_the_whole_key()
     );
 
     let equi = join_meta(JoinKind::DeltaTrace, &[3, 4]);
-    assert_eq!(equi.range_join_n_eq, None);
     assert_eq!(join_cols(equi.relay_route(7)), Some(vec![3, 4]));
+}
+
+/// A range join relays its keyed source even where that source's distribution IS
+/// the join key: its matches spread over the whole key space, so co-partitioning
+/// places none of them. The equi-join over the same fixture is the control.
+#[test]
+fn a_range_join_relays_a_co_partitioned_source_that_an_equi_join_would_skip() {
+    let keyed_by_pk = |kind| {
+        let ext: ExtTables = HashMap::from([(7i64, make_schema_u64_i64())]);
+        join_meta_in(kind, &[0], ext).scatters(7)
+    };
+    assert!(!keyed_by_pk(JoinKind::DeltaTrace), "the equi join skips the relay");
+    assert!(keyed_by_pk(pure_range(0)), "the range join must relay anyway");
 }
 
 /// A circuit that could not be read routes everything by `∅` — every row to

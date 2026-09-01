@@ -85,7 +85,7 @@ fn bounded_view_over_a_stream_is_rejected() {
     let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
 
     let register_bounded = |engine: &mut CatalogEngine, src: i64, name: &str| {
-        try_register_identity_view(engine, src, name, &cols, 4 << 20)
+        try_register_identity_view(engine, src, name, &cols, 4 << 20, 0)
     };
 
     let err = register_bounded(&mut engine, sid, "bounded_over_stream").expect_err("must be rejected");

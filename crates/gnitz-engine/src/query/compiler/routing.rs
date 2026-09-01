@@ -54,10 +54,6 @@ pub struct ViewMeta {
     /// The route of everything absent from `source_routes`, including the output
     /// relay (`source_id == 0`): the view's own shard columns under `GroupKey`.
     default_route: RelayRoute,
-    /// `Some(n_eq)` iff the view is a non-equi (range / band) join. Read by the
-    /// worker dispatch's input-relay arm; the master relay reads the
-    /// [`RelayRoute`] this is already folded into.
-    pub(in crate::query) range_join_n_eq: Option<u8>,
     /// The sink-nearest `ExchangeShard` is a proven no-op: every row it would
     /// move already sits on the worker owning its distribution key. Not itself a
     /// statement that the circuit is one-sided — the worker dispatch conjoins
@@ -78,7 +74,6 @@ impl ViewMeta {
         ViewMeta {
             source_routes: FxHashMap::default(),
             default_route: group_key_route(None),
-            range_join_n_eq: None,
             skips_exchange: false,
             repartitions: false,
         }
@@ -140,7 +135,14 @@ impl ViewMeta {
             .iter()
             .map(|(&tid, s)| (tid, s.iter().flatten().copied().collect()))
             .collect();
-        let co_partitioned = compute_co_partitioned(&concatenated, host);
+        let range_join_n_eq = load::circuit_range_join_n_eq(loaded);
+        // A range join's matches spread over the whole key space, so no source
+        // distribution places them: nothing co-partitions, and every source
+        // relays.
+        let co_partitioned = match range_join_n_eq {
+            Some(_) => HashSet::new(),
+            None => compute_co_partitioned(&concatenated, host),
+        };
 
         let shard = load::output_exchange_shard(loaded);
         let skips_exchange = shard
@@ -149,8 +151,6 @@ impl ViewMeta {
         let shard_cols: Option<Rc<[u32]>> = shard.map(|(_, cols)| Rc::from(cols));
         let repartitions =
             shard_cols.is_some() || loaded.ops().any(|(_, op)| matches!(op, gnitz_wire::OpNode::Join(_)));
-        let range_join_n_eq = load::circuit_range_join_n_eq(loaded);
-
         let source_routes = seqs
             .into_iter()
             .map(|(tid, s)| {
@@ -173,7 +173,6 @@ impl ViewMeta {
         Ok(ViewMeta {
             source_routes,
             default_route: group_key_route(shard_cols),
-            range_join_n_eq,
             skips_exchange,
             repartitions,
         })

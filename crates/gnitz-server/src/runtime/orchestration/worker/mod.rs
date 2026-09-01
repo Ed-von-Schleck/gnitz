@@ -1076,7 +1076,7 @@ impl WorkerProcess {
     /// A view that runs NO exchange has no barrier: no relay arrives, the slot
     /// stays `None`, and the worker self-terminates on local drain exhaustion.
     ///
-    /// **View-scoped.** Drives ONLY `view_id` (`backfill_view_step`), never the
+    /// **View-scoped.** Drives ONLY `view_id` (`backfill_chunk`), never the
     /// source's whole dependent closure: the source may already have populated
     /// dependents (live CREATE VIEW over a source with prior views; recovery
     /// step-4 rebuild next to resumed siblings) that a closure re-drive would
@@ -1111,7 +1111,7 @@ impl WorkerProcess {
             let pad = drained.is_none();
             let chunk = drained.unwrap_or_else(|| Batch::empty_with_schema(&schema));
             self.exchange.backfill_pad = Some(pad);
-            produced_any |= self.backfill_view_step(view_id, source_tid, chunk, request_id);
+            produced_any |= self.backfill_chunk(view_id, source_tid, chunk, request_id);
             // do_exchange_wait applied any inline CHECKPOINT per relay and folded
             // it into Continue; the slot now holds the chunk's stop/continue
             // verdict, or `None` if this chunk issued no exchange (a non-barrier
@@ -1125,25 +1125,15 @@ impl WorkerProcess {
 
         // Steady-state ticks must keep passing a 0 pad bit (see do_exchange_wait).
         self.exchange.backfill_pad = None;
-        // Release the last chunk's pinned delta registers and trace cursors. This
-        // loop drives only `view_id`, so that is the one regfile it can have pinned.
-        self.cat().dag_mut().release_view_regfile_deltas(view_id);
-        // `backfill_view_step` bypasses the closure driver's per-view flush, so
-        // flush the view's output trace once after the final chunk. Only when it
-        // produced rows (the first source of a join produces none — it just
-        // fills its trace).
-        if produced_any {
-            // A spill fault leaves the view store unbounded, so the process
-            // cannot continue. The master's watchdog turns the dead worker into a
-            // cluster abort, and restart re-derives the view.
-            if let Err(e) = self.cat().registry_mut().flush(view_id) {
-                gnitz_fatal_abort!(
-                    "worker: view store flush failed (view_id={}): {} — view state \
-                     cannot be bounded; aborting for restart+re-derive",
-                    view_id,
-                    e,
-                );
-            }
+        // `produced_any` is false for a join's first source, which only fills its
+        // trace. A spill fault leaves the view store unbounded, so the process
+        // cannot continue; the watchdog turns this into a cluster abort.
+        let (dag, registry) = self.cat().dag_and_registry_mut();
+        if let Err(e) = dag.finish_backfill(registry, view_id, produced_any) {
+            gnitz_fatal_abort!(
+                "worker: {} — view state cannot be bounded; aborting for restart+re-derive",
+                e,
+            );
         }
         Ok(())
     }
@@ -1153,20 +1143,14 @@ impl WorkerProcess {
     /// round runs across the worker barrier) and ingest the output. Returns
     /// whether the view produced rows. The worker analogue of `evaluate_dag`
     /// but for a single view rather than the source's whole closure.
-    fn backfill_view_step(&mut self, view_id: i64, source_id: i64, delta: Batch, request_id: u64) -> bool {
+    fn backfill_chunk(&mut self, view_id: i64, source_id: i64, delta: Batch, request_id: u64) -> bool {
         let (dag, reg) = self.cat().dag_and_registry_mut();
         let (dag, reg) = (dag as *mut DagEngine, reg as *mut RelationRegistry);
         let mut ctx = WorkerExchangeCtx {
             worker: self,
             tick_request_id: request_id,
         };
-        let produced = unsafe { &mut *dag }.backfill_view_step_multi_worker(
-            unsafe { &mut *reg },
-            view_id,
-            source_id,
-            delta,
-            &mut ctx,
-        );
+        let produced = unsafe { &mut *dag }.backfill_chunk(unsafe { &mut *reg }, view_id, source_id, delta, &mut ctx);
         // Apply DDL_SYNC messages deferred during exchange waits (mirrors
         // `evaluate_dag`).
         self.dispatch_deferred();
@@ -1408,13 +1392,7 @@ impl WorkerProcess {
             worker: self,
             tick_request_id: request_id,
         };
-        let res = unsafe { &mut *dag }.evaluate_dag_multi_worker(
-            unsafe { &mut *reg },
-            source_id,
-            delta,
-            tick_round,
-            &mut ctx,
-        );
+        let res = unsafe { &mut *dag }.evaluate_dag(unsafe { &mut *reg }, source_id, delta, tick_round, &mut ctx);
         // Apply DDL_SYNC messages deferred during exchange waits.
         self.dispatch_deferred();
         // The whole tick path funnels through the call above, so this is the one

@@ -22,18 +22,6 @@ use super::*;
 /// Rows in every fixture that does not need a specific size.
 const N: i64 = 7;
 
-/// Net weight summed over every (PK, payload) the cursor yields. Row *counts*
-/// would hide a double-materialisation: rebuilding the same rows twice leaves
-/// the row set identical and only the weights doubled.
-fn sum_weights(mut c: ReadCursor) -> i64 {
-    let mut sum = 0;
-    while c.valid {
-        sum += c.current_weight;
-        c.advance();
-    }
-    sum
-}
-
 /// A `(id, val)` table named `name`, holding `N` rows at `val = id * 10`.
 /// Returns its id and the column defs, which every caller needs again.
 fn seed_base(engine: &mut CatalogEngine, name: &str) -> (i64, Vec<ColumnDef>) {

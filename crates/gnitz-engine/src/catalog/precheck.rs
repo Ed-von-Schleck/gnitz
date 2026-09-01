@@ -409,12 +409,7 @@ impl CatalogEngine {
     /// shape. Defense-in-depth; the friendly client-side reject is in
     /// `plan/alter.rs`.
     fn reject_if_dependent_views(&mut self, owner_id: i64, op: &str) -> Result<(), String> {
-        if self
-            .dag
-            .get_dep_map(&self.registry)
-            .get(&owner_id)
-            .is_some_and(|v| !v.is_empty())
-        {
+        if self.dag.has_dependents(&self.registry, owner_id) {
             return Err(format!(
                 "cannot {op} on table {owner_id}: it has dependent views (drop them first)"
             ));

@@ -27,12 +27,6 @@ struct CircuitTables {
 impl CircuitTables {
     const VIEW_ID: u64 = 1;
 
-    /// The compound `(view_id, sub)` PK with `view_id` in the high half, so its
-    /// at-rest big-endian image leads the PK region where `load_circuit` seeks.
-    fn pk(view_id: u64, sub: u64) -> u128 {
-        ((view_id as u128) << 64) | (sub as u128)
-    }
-
     fn schema(cols: &[gnitz_wire::WireSysCol]) -> SchemaDescriptor {
         gnitz_store::schema::from_wire_cols(cols, gnitz_wire::CIRCUIT_FAMILY_PK)
     }
@@ -73,7 +67,8 @@ impl CircuitTables {
         self
     }
 
-    /// One `CircuitNodes` row under `view_id`.
+    /// One `CircuitNodes` row under `view_id`, through the shared row codec — so
+    /// a fixture cannot disagree with what the client lays down.
     fn node_row(
         bb: &mut gnitz_store::storage::BatchBuilder,
         view_id: u64,
@@ -81,15 +76,45 @@ impl CircuitTables {
         opcode: u64,
         source: Option<u64>,
     ) {
-        bb.begin_row(Self::pk(view_id, node_id), 1);
-        bb.put_u64(node_id);
-        bb.put_u64(opcode);
-        match source {
-            Some(t) => bb.put_u64(t),
-            None => bb.put_null(),
-        }
-        bb.put_null(); // expr_program
-        bb.end_row();
+        Self::node_row_with_blob(bb, view_id, node_id, opcode, source, None);
+    }
+
+    /// [`Self::node_row`] carrying an expr/param blob.
+    fn node_row_with_blob(
+        bb: &mut gnitz_store::storage::BatchBuilder,
+        view_id: u64,
+        node_id: u64,
+        opcode: u64,
+        source: Option<u64>,
+        expr_program: Option<&[u8]>,
+    ) {
+        gnitz_wire::sys_rows::write_circuit_node_row(
+            bb,
+            &gnitz_wire::sys_rows::CircuitNodeRow {
+                view_id,
+                node_id,
+                opcode,
+                source_table: source,
+                expr_program,
+            },
+            1,
+        )
+        .unwrap();
+    }
+
+    /// One `CircuitEdges` row under `view_id`: `src_node → (dst_node, PORT_IN)`.
+    fn edge_row(bb: &mut gnitz_store::storage::BatchBuilder, view_id: u64, src_node: u64, dst_node: u64) {
+        gnitz_wire::sys_rows::write_circuit_edge_row(
+            bb,
+            &gnitz_wire::sys_rows::CircuitEdgeRow {
+                view_id,
+                dst_node,
+                dst_port: PORT_IN as u64,
+                src_node,
+            },
+            1,
+        )
+        .unwrap();
     }
 
     fn load(&mut self) -> Result<LoadedCircuit, CompileError> {
@@ -135,11 +160,8 @@ fn a_malformed_row_aborts_the_load_and_names_the_check() {
         CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 1, gnitz_wire::OPCODE_INTEGRATE, None);
     })
     .put_edges(|bb| {
-        bb.begin_row(CircuitTables::pk(CircuitTables::VIEW_ID, 0), 1);
-        bb.put_u64(7); // dst_node — no such node
-        bb.put_u64(PORT_IN as u64);
-        bb.put_u64(0); // src_node
-        bb.end_row();
+        // dst_node 7 — no such node.
+        CircuitTables::edge_row(bb, CircuitTables::VIEW_ID, 0, 7);
     });
     assert!(matches!(
         c.load(),
@@ -156,22 +178,21 @@ fn the_load_takes_one_views_rows_and_keeps_a_damaged_blob_present() {
     let mut c = CircuitTables::new();
     c.put_nodes(|bb| {
         CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 0, gnitz_wire::OPCODE_SCAN_DELTA, Some(10));
-        bb.begin_row(CircuitTables::pk(CircuitTables::VIEW_ID, 1), 1);
-        bb.put_u64(1); // node_id
-        bb.put_u64(gnitz_wire::OPCODE_FILTER);
-        bb.put_null(); // source_table
-        bb.put_blob(&[]); // expr_program — non-NULL, zero length
-        bb.end_row();
+        // expr_program non-NULL, zero length.
+        CircuitTables::node_row_with_blob(
+            bb,
+            CircuitTables::VIEW_ID,
+            1,
+            gnitz_wire::OPCODE_FILTER,
+            None,
+            Some(&[]),
+        );
         // A second view's nodes, which this load must not see. An undecodable
         // opcode, so a load that ignored the prefix would fail outright.
         CircuitTables::node_row(bb, CircuitTables::VIEW_ID + 1, 2, 9999, None);
     })
     .put_edges(|bb| {
-        bb.begin_row(CircuitTables::pk(CircuitTables::VIEW_ID, 0), 1);
-        bb.put_u64(1); // dst_node
-        bb.put_u64(PORT_IN as u64);
-        bb.put_u64(0); // src_node
-        bb.end_row();
+        CircuitTables::edge_row(bb, CircuitTables::VIEW_ID, 0, 1);
     });
     let loaded = c.load().expect("a damaged blob is not a load failure");
     assert_eq!(loaded.nodes.len(), 2, "only this view's nodes are loaded");

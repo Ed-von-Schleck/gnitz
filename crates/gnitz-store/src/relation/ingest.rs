@@ -64,8 +64,11 @@ impl RelationRegistry {
         Ok(effective)
     }
 
-    /// Ingest a view's tick output into its own store and — when the view carries
-    /// a feed — a copy stamped with `tick_round` into its delta store.
+    /// Ingest a view's epoch output into its own store and — when the view carries
+    /// a feed — a copy stamped with `round` into its delta store.
+    ///
+    /// `round` is `None` for a **backfill**, whose rows never enter the delta
+    /// store: a bootstrap read of the same view already carries them.
     ///
     /// One entry lookup for both stores, as [`Self::ingest_store_and_indices`]
     /// already does for a relation and its index circuits. This is the only moment
@@ -76,7 +79,7 @@ impl RelationRegistry {
     /// the same batch on the same worker, so every batch this store absorbs on the
     /// tick path is captured byte-identically.
     ///
-    /// **A replicated view stamps on worker 0 alone.** `execute_multi_worker_step`
+    /// **A replicated view stamps on worker 0 alone.** `run_view_epoch`
     /// short-circuits one: every worker holds every source in full and computes
     /// the entire result locally, so `out_delta` is the full global delta on all
     /// W. A delta read of such a view is routed by `replicated_unicast` to worker
@@ -96,7 +99,7 @@ impl RelationRegistry {
     /// preserves sortedness and distinctness), so the stamp is copied by value
     /// into a store that moves rather than re-folds it, and it carries the folded
     /// row count rather than the raw one.
-    pub fn ingest_view_delta(&mut self, view_id: i64, batch: &Batch, tick_round: u64) -> Result<(), StorageError> {
+    pub fn ingest_view_delta(&mut self, view_id: i64, batch: &Batch, round: Option<u64>) -> Result<(), StorageError> {
         let Some(entry) = self.tables.get_mut(&view_id) else {
             gnitz_warn!("relation: ingest_view_delta — view_id={} not registered", view_id);
             return Ok(());
@@ -109,22 +112,23 @@ impl RelationRegistry {
         if batch.count == 0 {
             return Ok(());
         }
-        // Only a fed view that stamps on this worker pays the up-front fold; every
-        // other view hands the batch straight to the store ingest it always did.
-        // `delta.is_some()` leads, so a view with no feed — every view on a server
-        // not using the feature — reads no placement and loads no worker rank.
-        let stamps_here = entry.delta.is_some()
-            && (!entry.schema.placement().is_replicated() || crate::foundation::worker_ctx::worker_rank() == 0);
-        let folded = stamps_here
-            .then(|| Batch::consolidate_if_needed(batch, &entry.schema))
-            .flatten();
+        // The round this batch is captured under, or `None` for no capture — the
+        // one decision both the fold and the stamp read. `round` leads, so a
+        // backfill and every unfed view read no placement and no worker rank.
+        let capture: Option<u64> = round.filter(|_| {
+            entry.delta.is_some()
+                && (!entry.schema.placement().is_replicated() || crate::foundation::worker_ctx::worker_rank() == 0)
+        });
+        // Only a captured batch pays the up-front fold; every other view hands the
+        // batch straight to the store ingest it always did.
+        let folded = capture.and_then(|_| Batch::consolidate_if_needed(batch, &entry.schema));
         let batch = folded.as_ref().unwrap_or(batch);
         Self::ingest_store_and_indices(view_id, entry, batch)?;
 
-        let Some(feed) = entry.delta.as_ref().filter(|_| stamps_here) else {
+        let Some((feed, round)) = entry.delta.as_ref().zip(capture) else {
             return Ok(());
         };
-        let stamped = batch.stamped_with_pk_prefix(&entry.schema, &feed.schema, tick_round);
+        let stamped = batch.stamped_with_pk_prefix(&entry.schema, &feed.schema, round);
         if let Err(e) = feed.handle.ingest_owned_batch(stamped) {
             // Logged, not fatal, because **this round is not lost**. The batch is
             // moved into the memtable before anything fallible runs, and the only
@@ -144,7 +148,7 @@ impl RelationRegistry {
                 "relation: delta-store spill failed (view_id={}, round={}): {} — the round is \
                  held in RAM and retried on the next tick; the feed is intact",
                 view_id,
-                tick_round,
+                round,
                 e,
             );
         }

@@ -857,7 +857,7 @@ fn a_null_cell_round_trips_as_null() {
 
 #[test]
 #[cfg(debug_assertions)]
-#[should_panic(expected = "BatchAppender::add_row: previous row got")]
+#[should_panic(expected = "BatchAppender: previous row got")]
 fn add_row_under_push_trips_tripwire() {
     let schema = nullable_str_blob_schema(); // 2 payload columns
     let mut batch = ZSetBatch::new(&schema);
