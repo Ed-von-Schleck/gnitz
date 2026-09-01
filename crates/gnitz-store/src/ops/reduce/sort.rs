@@ -26,18 +26,13 @@ pub(super) fn compare_by_group_cols<A: RowSource, B: RowSource>(
     for loc in descs {
         // NULLs sort before non-NULLs (NULLS FIRST), so all NULLs on a column are
         // adjacent and form a single group. A non-nullable column never has the
-        // bit set, so the gate is harmless there; a PK column has no bit at all.
-        if let ColumnLocator::Payload { slot, .. } = *loc {
-            let pi = slot as usize;
-            match (
-                gnitz_wire::null_word_get(a_null_word, pi),
-                gnitz_wire::null_word_get(b_null_word, pi),
-            ) {
-                (true, true) => continue,
-                (true, false) => return Ordering::Less,
-                (false, true) => return Ordering::Greater,
-                (false, false) => {}
-            }
+        // bit set, so the gate is harmless there; a PK column answers `false` on
+        // both sides and falls through to the value compare.
+        match (loc.is_null_word(a_null_word), loc.is_null_word(b_null_word)) {
+            (true, true) => continue,
+            (true, false) => return Ordering::Less,
+            (false, true) => return Ordering::Greater,
+            (false, false) => {}
         }
         // Addressing and order rule both come off the locator: a PK column
         // compares its own OPK byte window, not the whole PK region — the latter

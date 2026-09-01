@@ -67,9 +67,10 @@ const COMPACT_RUN_LEN: usize = 16;
 /// passed per call, so the region cannot be left unwritten between two
 /// statements and no caller can pair a plan with the wrong stamp.
 pub enum PkSource {
-    /// Copy the input PK region verbatim. Requires equal PK strides, which the
-    /// circuit compiler rejects a violation of and the ad-hoc reply guard
-    /// checks.
+    /// Copy the input PK region verbatim. Requires equal PK strides, which a
+    /// compiled circuit gets by construction (every `Inherit` node derives its
+    /// output schema from the input's own PK region); the one enforcement point
+    /// is the ad-hoc rows-sink guard over a client-supplied reply schema.
     Inherit,
     /// Pack the reindex columns' OPK bytes contiguously into the output PK — the
     /// `_join_pk` of an equijoin / GROUP BY repartition. The output stride

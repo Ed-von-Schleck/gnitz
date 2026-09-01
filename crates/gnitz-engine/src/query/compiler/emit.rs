@@ -567,11 +567,6 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, mk: &gnitz_wire::MapKind) -> Result<u16
     if matches!(pk_source, PkSource::Inherit) && copies_input_verbatim(&prog, &in_reg_schema, &node_schema) {
         return Ok(in_reg);
     }
-    // A `PkSource::Inherit` map copies the input PK region verbatim, so the two
-    // strides must agree.
-    if matches!(pk_source, PkSource::Inherit) && node_schema.pk_stride() != in_reg_schema.pk_stride() {
-        return Err(CompileError::Rejected("map: output PK stride differs from the input's"));
-    }
     // For the projection arms the output schema is derived from a client column
     // list rather than supplied, and `project_schema` drops PK sources while
     // `copy_cols` numbers destinations densely — so a PK index leaves a copy
