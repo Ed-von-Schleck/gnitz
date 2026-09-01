@@ -28,7 +28,7 @@ pub struct PkSetGather {
 /// key — or `None` for an empty list. `stride` is the schema's `pk_stride`. A
 /// list spread across the whole key space degenerates to the whole store, which
 /// is the case a whole-store open was right for anyway.
-pub(crate) fn key_list_range(keys: &[u8], stride: usize) -> Option<(&[u8], &[u8])> {
+fn key_list_range(keys: &[u8], stride: usize) -> Option<(&[u8], &[u8])> {
     let first = keys.chunks_exact(stride).next()?;
     Some((first, &keys[keys.len() - stride..]))
 }
@@ -53,7 +53,7 @@ impl PkSetGather {
 
     /// `keys` is the flat concatenation of the OPK images, each exactly
     /// `src_schema.pk_stride()` bytes, in ascending order.
-    pub fn new(cursor: ReadCursor, keys: Vec<u8>, src_schema: SchemaDescriptor) -> Self {
+    fn new(cursor: ReadCursor, keys: Vec<u8>, src_schema: SchemaDescriptor) -> Self {
         let stride = src_schema.pk_stride() as usize;
         debug_assert!(
             stride > 0 && keys.len().is_multiple_of(stride),
@@ -74,11 +74,20 @@ impl PkSetGather {
         }
     }
 
-    /// Consume the gather and hand back the key list it walked — the same buffer
-    /// `new` was given. By value, not by reference: a borrow would keep the
-    /// cursor's merge tree alive across whatever the caller does with the keys.
-    pub fn into_keys(self) -> Vec<u8> {
-        self.keys
+    /// Whether the range this gather opened over holds a skeleton shard — see
+    /// [`ReadCursor::any_skeleton`]. A caller that cannot read a skeleton row
+    /// asks here rather than of the store, so a key list that misses every
+    /// skeleton shard still walks.
+    pub fn any_skeleton(&self) -> bool {
+        self.cursor.any_skeleton()
+    }
+
+    /// Consume the gather and hand back the cursor it opened and the key list it
+    /// walks — the same buffer `open` was given. By value, so a caller wanting
+    /// only the keys drops the cursor's merge tree here rather than holding it
+    /// alive across whatever it does with them.
+    pub fn into_parts(self) -> (ReadCursor, Vec<u8>) {
+        (self.cursor, self.keys)
     }
 
     /// The next non-empty chunk of source rows, or `None` once the key list is

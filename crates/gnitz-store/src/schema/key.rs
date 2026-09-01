@@ -723,6 +723,20 @@ impl IndexKeySpec {
             .map(|(loc, col)| (loc.type_code(), *col));
         encode_leading_opk(cols, natives)
     }
+
+    /// The half-open OPK key range `[start, end)` for `range` over this index's
+    /// key space, each key exactly `stride` bytes (leading span plus source-PK
+    /// suffix) — [`eq_prefix_range_keys`] with [`Self::seek_prefix`] as its
+    /// group-prefix encoder, which is the same baked spec `write_span` projects
+    /// entries with, so cut and entry are byte-identical by construction.
+    ///
+    /// `Ok(None)` = provably empty; `Err` = the descriptor pins every indexed
+    /// column with no range column left.
+    pub fn range_keys(&self, stride: usize, range: &RangeDescriptor) -> Result<Option<(PkBuf, Option<PkBuf>)>, String> {
+        eq_prefix_range_keys(range, self.n as usize, stride, "index range", |natives| {
+            self.seek_prefix(natives)
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -834,7 +848,7 @@ pub(crate) fn range_keys_from_cuts(
 /// paths surface and a backfill bound merely degrades on. Guarding here also
 /// keeps `prefix_len < stride` strict, so the pad always extends the group key.
 /// `what` names the key space in that message.
-pub(crate) fn eq_prefix_range_keys(
+fn eq_prefix_range_keys(
     range: &RangeDescriptor,
     arity: usize,
     stride: usize,
@@ -865,7 +879,7 @@ pub(crate) fn eq_prefix_range_keys(
 /// `start < end`, so the decrement cannot borrow out. `end == None` means the end
 /// cut carried out and the range runs to the table end, whose last key is
 /// all-`0xFF`.
-pub(crate) fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: usize) -> bool {
+fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: usize) -> bool {
     let last = match end {
         Some(e) => {
             let mut l = *e;
@@ -875,6 +889,54 @@ pub(crate) fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: us
         None => PkBuf::max(start.len as usize),
     };
     start.pk_bytes()[..prefix] == last.pk_bytes()[..prefix]
+}
+
+/// The half-open OPK key range `[start, end)` for `range` over `schema`'s PK —
+/// the base-PK sibling of [`IndexKeySpec::range_keys`], contributing only the
+/// PK-column group-prefix encoder to the shared [`eq_prefix_range_keys`].
+/// `Ok(None)` = provably empty; `Err` = the descriptor pins every PK column with
+/// no range column left.
+pub(crate) fn pk_range_keys(
+    schema: &SchemaDescriptor,
+    range: &RangeDescriptor,
+) -> Result<Option<(PkBuf, Option<PkBuf>)>, String> {
+    eq_prefix_range_keys(
+        range,
+        schema.pk_indices().len(),
+        schema.pk_stride() as usize,
+        "pk range",
+        |natives| {
+            // Source and target column are the same here (no index promotion),
+            // so the shared encoder's promote step is its identity arm. The
+            // trailing PK columns stay raw-zero — the minimum OPK for any type,
+            // so `group(v)` IS `pad(group(v))`.
+            let cols = schema
+                .pk_columns()
+                .take(natives.len())
+                .map(|(_, col)| (col.type_code, *col));
+            encode_leading_opk(cols, natives)
+        },
+    )
+}
+
+impl SchemaDescriptor {
+    /// The one worker every row matching `range` can live on — the master's
+    /// confinement test, which turns a broadcast into a unicast. `None` whenever
+    /// nothing proves one: a placement under which no key names an owner at all,
+    /// a range spanning workers, a provably-empty range, or a forged descriptor
+    /// (left for the reader's own trust boundary).
+    ///
+    /// An owner is a hash of `key[..dist_stride]` and so not monotone in key
+    /// order, so the range is confined iff every key in it shares that prefix —
+    /// which [`range_shares_prefix`] decides from its first and last keys alone.
+    pub fn confined_worker(&self, range: &RangeDescriptor, num_workers: usize) -> Option<usize> {
+        if !self.placement().is_key_routed() {
+            return None;
+        }
+        let (start, end) = pk_range_keys(self, range).ok().flatten()?;
+        range_shares_prefix(&start, end.as_ref(), self.dist_stride() as usize)
+            .then(|| self.worker_for_pk(start.pk_bytes(), num_workers))
+    }
 }
 
 // ---------------------------------------------------------------------------

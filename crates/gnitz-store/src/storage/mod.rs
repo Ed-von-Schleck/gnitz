@@ -82,7 +82,6 @@ pub use lsm::index_gather::{BoundedIndexCursor, SourceCursor};
 pub use lsm::manifest::peek_header;
 pub use lsm::manifest::topology_word;
 pub(crate) use lsm::read_cursor::empty as empty_cursor;
-pub(crate) use lsm::read_cursor::key_list_range;
 pub use lsm::read_cursor::{PkSetGather, ReadCursor};
 pub use lsm::repartition::repartition_relation;
 pub use lsm::run::StoredRow;

@@ -129,7 +129,7 @@ impl ReadCursor {
         // A skeleton row's payload columns do not exist on disk; the appender
         // would copy `ZERO_CELL` for each and relocate a zero-length blob for
         // each German string, producing a row that is not the view's. Its key
-        // has to be hydrated instead (`materialize_bounded_store`).
+        // has to be hydrated instead (`materialize_hydrated`).
         debug_assert!(
             !self.current_is_skeleton(),
             "copy_current_row_into on a skeleton row: hydrate the key instead",

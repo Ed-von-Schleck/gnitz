@@ -114,9 +114,10 @@ fn pk_set_gathers_named_keys() {
     assert_eq!(got, vec![(2u128, 200, 1), (5u128, 500, 1), (7u128, 700, 1)]);
 }
 
-/// A system table's store is one `Table` holding every key, which
-/// the cursor reads whole — so the gather's ownership filter must keep every key
-/// there. Routing the key to its owning worker instead would answer zero rows.
+/// A system table is not key-routed, so no key names an owner and the master
+/// must broadcast rather than unicast: its store is one `Table` holding every
+/// key, and routing the key to the worker its hash names would answer zero rows.
+/// Every worker then walks every key of the list.
 #[test]
 fn pk_set_over_a_system_table_keeps_every_key() {
     let (mut e, tid, _dir) = table_fixture("ss_pkset_sys", &id_val_cols());
@@ -133,10 +134,8 @@ fn pk_set_over_a_system_table_keeps_every_key() {
 /// Two distinct wire keys can share one OPK image — `opk_key` truncates to
 /// `pk_stride`, so `5` and `5 + 2^64` are the same U64 PK. The decoder's
 /// schema-free view cannot see that; the gather's post-sort scan must, or the
-/// duplicate key re-walks the same PK group and emits it twice. The reject must
-/// not depend on which worker owns the key, so it runs before the gather's
-/// ownership filter — a fixture whose store owns everything cannot show that, so
-/// the assertion is on the error alone.
+/// duplicate key re-walks the same PK group and emits it twice. Every worker
+/// walks the whole list, so the verdict is the same wherever the frame lands.
 #[test]
 fn pk_set_rejects_keys_colliding_after_truncation() {
     let (mut e, tid) = fixture("ss_pkset_trunc", 10, |i| i as i64);
@@ -149,9 +148,10 @@ fn pk_set_rejects_keys_colliding_after_truncation() {
 }
 
 /// A REPLICATED base table holds a full copy of the dataset in this worker's own
-/// store, its rows not keyed by `worker_for_pk` at all. Every keyed read must
-/// resolve through that store rather than through the key's owning worker, which
-/// for most keys is some other worker and would silently answer zero rows.
+/// store, its rows not keyed by `worker_for_pk` at all, so no keyed read may be
+/// routed at the master: the key's hash names some other worker for most keys,
+/// which would silently answer zero rows. Every keyed read resolves through the
+/// local store instead.
 #[test]
 fn keyed_reads_over_a_replicated_table_find_every_key() {
     const N: u128 = 20;
@@ -354,7 +354,7 @@ fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
     // which shares the distribution prefix and so routes to one worker.
     let confined = RangeDescriptor::new(&[2], Cut::Before(0), Cut::After(u64::MAX as u128));
     assert!(
-        gnitz_store::read::scan_spec_worker(&schema, &confined, 4).is_some(),
+        schema.confined_worker(&confined, 4).is_some(),
         "the fixture's confined range must be the routed shape"
     );
     assert_eq!(
@@ -366,7 +366,7 @@ fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
     // `1 <= a < 3` spans two `a` groups, so it is not confinable and stays a
     // broadcast.
     let spanning = RangeDescriptor::new(&[], Cut::Before(1), Cut::Before(3));
-    assert!(gnitz_store::read::scan_spec_worker(&schema, &spanning, 4).is_none());
+    assert!(schema.confined_worker(&spanning, 4).is_none());
     let mut want: Vec<(u64, u64, i64)> = Vec::new();
     for a in 1..3 {
         for b in 0..NB {

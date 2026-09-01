@@ -1,213 +1,231 @@
 use super::*;
-use crate::schema::Placement;
+use crate::relation::{RelationKind, RelationSpec, ViewBudgets};
 use crate::schema::{type_code, SchemaColumn};
-use crate::test_support::{opk_pk, pk_only_schema};
-use gnitz_wire::Cut::{After, Before};
+use crate::storage::BatchBuilder;
+use gnitz_wire::Cut;
 
-fn opk_u64(v: u64) -> Vec<u8> {
-    v.to_be_bytes().to_vec() // U64 OPK is plain big-endian
+// ── The executor — `scan_spec_family` over a registry built in-crate ────────
+//
+// `hydrator: None`, as `gnitz-mirror` calls it: nothing here holds a skeleton
+// row. These drive the sink reduction, which needs no expression compiler; the
+// projection and predicate paths are covered where one exists.
+
+/// The relation every executor test below reads.
+const TID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
+
+/// `(id U64 PK | val I64)`, `val == id`.
+fn id_val_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    )
 }
 
-/// `pk >= 5` → `[OPK(5), +∞)`. The single-column mainline: no equality pins,
-/// `prefix_len == pk_stride`, an unbounded upper edge.
-#[test]
-fn pk_range_ge_unbounded_above() {
-    let s = pk_only_schema(&[type_code::U64]);
-    let d = RangeDescriptor::new(&[], Before(5), After(u64::MAX as u128));
-    let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
-    assert_eq!(start.pk_bytes(), opk_u64(5));
-    assert!(end.is_none(), "unbounded above → end None");
-}
-
-/// `pk > 5` → `[OPK(6), +∞)` — the degenerate no-pad `succ` on the whole key.
-#[test]
-fn pk_range_gt_increments_whole_key() {
-    let s = pk_only_schema(&[type_code::U64]);
-    let d = RangeDescriptor::new(&[], After(5), After(u64::MAX as u128));
-    let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
-    assert_eq!(start.pk_bytes(), opk_u64(6));
-    assert!(end.is_none());
-}
-
-/// `pk < 10` → `[OPK(0), OPK(10))`.
-#[test]
-fn pk_range_lt() {
-    let s = pk_only_schema(&[type_code::U64]);
-    let d = RangeDescriptor::new(&[], Before(0), Before(10));
-    let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
-    assert_eq!(start.pk_bytes(), opk_u64(0));
-    assert_eq!(end.unwrap().pk_bytes(), opk_u64(10));
-}
-
-/// Full-PK point lookup `pk = 5` → `[OPK(5), OPK(6))` (degenerate cuts).
-#[test]
-fn pk_range_point_lookup() {
-    let s = pk_only_schema(&[type_code::U64]);
-    let d = RangeDescriptor::new(&[], Before(5), After(5));
-    let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
-    assert_eq!(start.pk_bytes(), opk_u64(5));
-    assert_eq!(end.unwrap().pk_bytes(), opk_u64(6));
-}
-
-/// An inverted interval (`pk > 10 AND pk < 3`) drains to zero rows.
-#[test]
-fn pk_range_inverted_is_empty() {
-    let s = pk_only_schema(&[type_code::U64]);
-    let d = RangeDescriptor::new(&[], After(10), Before(3));
-    assert_eq!(pk_range_keys(&s, &d).unwrap(), None);
-}
-
-/// A signed PK: `pk > -1` seeks to `OPK(0)` (sign-flip order); `After(i64::MAX)`
-/// overflows `succ` → unbounded above.
-#[test]
-fn pk_range_signed_i64() {
-    let s = pk_only_schema(&[type_code::I64]);
-    let neg1 = (-1i64 as u64) as u128;
-    let d = RangeDescriptor::new(&[], After(neg1), After((i64::MAX as u64) as u128));
-    let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
-    assert_eq!(start, opk_key(&s, &0i64.to_le_bytes()));
-    assert!(end.is_none());
-}
-
-/// Compound PK `(a, b)` with `a = 5 AND b > 3`: the range column is `b`, so
-/// `start` seeks past `(5, 3)` and stays within the `a == 5` group.
-#[test]
-fn pk_range_compound_prefix_eq() {
-    let s = pk_only_schema(&[type_code::U64, type_code::U64]);
-    let d = RangeDescriptor::new(&[5], After(3), After(u64::MAX as u128));
-    let (start, end) = pk_range_keys(&s, &d).unwrap().unwrap();
-    // start = OPK(5,4) — the prefix `(5,3)` incremented on b.
-    let s54 = opk_key(&s, &{
-        let mut v = Vec::new();
-        v.extend_from_slice(&5u64.to_le_bytes());
-        v.extend_from_slice(&4u64.to_le_bytes());
-        v
-    });
-    assert_eq!(start, s54);
-    // end = the successor of `(5, MAX)` — carries into `a`, i.e. OPK(6, 0).
-    let s60 = opk_key(&s, &{
-        let mut v = Vec::new();
-        v.extend_from_slice(&6u64.to_le_bytes());
-        v.extend_from_slice(&0u64.to_le_bytes());
-        v
-    });
-    assert_eq!(end.unwrap(), s60);
-}
-
-/// `n_eq` at the PK arity leaves no range column — a trust-boundary reject.
-#[test]
-fn pk_range_no_range_column_errs() {
-    let s = pk_only_schema(&[type_code::U64]);
-    let d = RangeDescriptor::new(&[5], Before(0), After(0));
-    assert!(pk_range_keys(&s, &d).is_err());
-}
-
-// ── scan_spec_worker — the master's confinement test ─────────────────────
-
-/// Worker count the confinement tests route against.
-const NW: usize = 4;
-
-/// A full point is confined to the worker of its own PK bytes, at every PK
-/// shape — single, wide, and compound (where the point pins the leading
-/// columns through `eq_vals` and points at the last).
-#[test]
-fn scan_spec_worker_confines_a_full_point() {
-    let u64s = pk_only_schema(&[type_code::U64]);
-    assert_eq!(
-        scan_spec_worker(&u64s, &RangeDescriptor::new(&[], Before(42), After(42)), NW),
-        Some(u64s.worker_for_pk(&opk_pk(&u64s, &[42]), NW))
-    );
-
-    let u128s = pk_only_schema(&[type_code::U128]);
-    let wide = (1u128 << 100) | 7;
-    assert_eq!(
-        scan_spec_worker(&u128s, &RangeDescriptor::new(&[], Before(wide), After(wide)), NW),
-        Some(u128s.worker_for_pk(&opk_pk(&u128s, &[wide]), NW))
-    );
-
-    let comp = pk_only_schema(&[type_code::U32, type_code::U64]);
-    assert_eq!(
-        scan_spec_worker(&comp, &RangeDescriptor::new(&[9], Before(4), After(4)), NW),
-        Some(comp.worker_for_pk(&opk_pk(&comp, &[9, 4]), NW))
-    );
-}
-
-/// With a `Keyed { prefix_len: 1 }` placement every row sharing the leading
-/// column lands on one worker, so pinning it and ranging the trailing column
-/// is confined — to the same worker full points on `(a, b)` reach. At the
-/// full-PK default the same bound spans workers.
-#[test]
-fn scan_spec_worker_follows_the_distribution_prefix() {
-    let cols = [
-        SchemaColumn::new(type_code::U64, 0),
-        SchemaColumn::new(type_code::U64, 0),
-    ];
-    let prefix = SchemaDescriptor::new_with_placement(&cols, &[0, 1], Placement::Keyed { prefix_len: 1 });
-    // `a = 7 AND b > 3` — a whole trailing-column range inside one `a` group.
-    let ranged = RangeDescriptor::new(&[7], After(3), After(u64::MAX as u128));
-    let want = prefix.worker_for_pk(&opk_pk(&prefix, &[7, 0]), NW);
-    assert_eq!(scan_spec_worker(&prefix, &ranged, NW), Some(want));
-    for b in [4u128, u64::MAX as u128] {
-        assert_eq!(
-            scan_spec_worker(&prefix, &RangeDescriptor::new(&[7], Before(b), After(b)), NW),
-            Some(want),
-            "a full point on (7, {b}) shares the group's worker"
-        );
+/// A registry holding `TID` with `n` rows of `val == id`, each at `weight`.
+///
+/// A **view**, whose store runs no `enforce_unique_pk`, so a weight above 1 is
+/// admitted verbatim — the window below is a summed *weight*, which few rows at
+/// a large weight reach far more cheaply than many rows.
+fn rows_fixture(name: &str, n: u64, weight: i64) -> RelationRegistry {
+    let schema = id_val_schema();
+    let mut registry = RelationRegistry::new(1);
+    registry
+        .register(RelationSpec {
+            id: TID,
+            kind: RelationKind::View,
+            schema,
+            directory: crate::test_support::scratch_dir("read", name),
+            depth: 0,
+            budgets: ViewBudgets {
+                capacity_bytes: None,
+                delta_bytes: None,
+            },
+        })
+        .unwrap();
+    let mut bb = BatchBuilder::new(schema);
+    for id in 0..n {
+        bb.begin_row(id as u128, weight);
+        bb.put_u64(id);
+        bb.end_row();
     }
-
-    let full = SchemaDescriptor::new_with_placement(&cols, &[0, 1], Placement::Keyed { prefix_len: 2 });
-    assert_eq!(
-        scan_spec_worker(&full, &ranged, NW),
-        None,
-        "hashing the whole PK spreads one `a` group across workers"
-    );
+    registry.ingest_returning_effective(TID, bb.finish()).unwrap();
+    registry
 }
 
-/// A maximal-value point carries out of `succ`, so its range has no `end` —
-/// the all-`0xFF` last key must still confine it rather than broadcast. The
-/// signed maximum's OPK is all-`0xFF` too (sign-flip).
-#[test]
-fn scan_spec_worker_confines_a_maximal_point() {
-    for tc in [type_code::U64, type_code::I64] {
-        let s = pk_only_schema(&[tc]);
-        let max = if tc == type_code::U64 {
-            u64::MAX as u128
-        } else {
-            i64::MAX as u128
-        };
-        let d = RangeDescriptor::new(&[], Before(max), After(max));
-        assert!(
-            pk_range_keys(&s, &d).unwrap().unwrap().1.is_none(),
-            "After(max) carries out"
-        );
-        assert_eq!(
-            scan_spec_worker(&s, &d, NW),
-            Some(s.worker_for_pk(&opk_pk(&s, &[max]), NW))
-        );
+/// An identity rows spec: no predicate, no projection, so the reply schema is
+/// the source schema.
+fn rows_spec(order: Vec<OrderKey>, limit_k: u64) -> ReadSpec {
+    ReadSpec {
+        bound: ReadBound::None,
+        predicate: Vec::new(),
+        sink: ReadSink::Rows {
+            projection: Vec::new(),
+            order,
+            limit_k,
+        },
     }
 }
 
-/// A range wider than one worker's key span is not confinable: owners are a
-/// hash of the key, not monotone in key order, so only a whole-range prefix
-/// match proves confinement. A provably-empty range is not confinable
-/// either — the worker answers it (a fold sink still owes its ground row).
+/// `ORDER BY val DESC`.
+fn val_desc() -> Vec<OrderKey> {
+    vec![OrderKey {
+        col: 1,
+        desc: true,
+        nulls_first: false,
+    }]
+}
+
+/// `(id, weight)` pairs of a reply batch, in reply order.
+fn ids(b: &Batch) -> Vec<(u128, i64)> {
+    (0..b.count).map(|i| (b.get_pk(i), b.get_weight(i))).collect()
+}
+
+fn run(registry: &mut RelationRegistry, spec: &ReadSpec) -> Result<Batch, WireFault> {
+    let schema = id_val_schema();
+    registry.scan_spec_family(TID, spec, &schema, 0, None)
+}
+
+/// The reply is trimmed to the window, not to the mid-scan residency cap: five
+/// weight-1 rows against `LIMIT 3` sit in the band the mid-scan trim skips, so
+/// only the terminal trim can shed them, and it must.
 #[test]
-fn scan_spec_worker_declines_a_multi_key_range() {
-    let s = pk_only_schema(&[type_code::U64]);
+fn top_k_trims_to_the_window_before_replying() {
+    let mut r = rows_fixture("topk_band", 5, 1);
+    let got = run(&mut r, &rows_spec(val_desc(), 3)).unwrap();
+    assert_eq!(ids(&got), vec![(4u128, 1), (3, 1), (2, 1)], "the three largest, DESC");
+}
+
+/// No window is too large for the top-k sink. The window counts summed *weight*,
+/// so five rows at weight 100_000 overshoot a 65_537-row window and the trim
+/// sheds all but the one row that already covers it — where a sink that gave up
+/// past some window size would ship all five unsorted.
+#[test]
+fn top_k_runs_at_an_arbitrarily_large_window() {
+    let mut r = rows_fixture("topk_past_cap", 5, 100_000);
+    let got = run(&mut r, &rows_spec(val_desc(), 65_537)).unwrap();
     assert_eq!(
-        scan_spec_worker(&s, &RangeDescriptor::new(&[], Before(0), After(1000)), NW),
-        None
+        ids(&got),
+        vec![(4u128, 100_000)],
+        "the one comparator-smallest row already covers the window"
     );
-    assert_eq!(
-        scan_spec_worker(&s, &RangeDescriptor::new(&[], After(1000), Before(0)), NW),
-        None,
-        "an inverted range is provably empty"
+}
+
+/// `limit_k = u64::MAX` saturates to an `i64::MAX` window, whose residency cap
+/// must saturate too: an unsaturated `2 * window` is a multiply overflow, and a
+/// debug build panics on one. Nothing reaches either threshold, so all five ship.
+#[test]
+fn a_maximal_limit_k_neither_overflows_nor_trims() {
+    let mut r = rows_fixture("topk_max_limit", 5, 100_000);
+    let got = run(&mut r, &rows_spec(val_desc(), u64::MAX)).unwrap();
+    assert_eq!(got.count, 5);
+}
+
+/// A malformed ORDER BY key is rejected before the cursor is opened, so the walk
+/// the bound names never runs and the message names the offending column.
+#[test]
+fn an_out_of_range_order_key_is_rejected() {
+    let mut r = rows_fixture("order_oob", 4, 1);
+    let order = vec![OrderKey {
+        col: 99,
+        desc: false,
+        nulls_first: false,
+    }];
+    let Err(err) = run(&mut r, &rows_spec(order, 0)) else {
+        panic!("an out-of-range order key must be rejected");
+    };
+    assert!(err.text.contains("order key column 99"), "{err}");
+}
+
+/// A packed column word naming a column the table has not got is a corrupt
+/// frame, and is rejected on both walk kinds. An `exact == false` walk is the
+/// one a residual predicate could cover for, so it is the one where degrading to
+/// a full scan would answer the corrupt frame instead of refusing it.
+#[test]
+fn an_out_of_range_index_column_is_rejected_even_when_inexact() {
+    let mut r = rows_fixture("index_oob", 4, 1);
+    let spec = ReadSpec {
+        bound: ReadBound::IndexRange {
+            idx_cols: gnitz_wire::pack_pk_cols(&[99]),
+            exact: false,
+            desc: RangeDescriptor::new(&[], Cut::Before(0), Cut::After(u64::MAX as u128)),
+        },
+        ..rows_spec(Vec::new(), 0)
+    };
+    let Err(err) = run(&mut r, &spec) else {
+        panic!("an out-of-range index column must be rejected");
+    };
+    assert!(err.text.contains("invalid column list"), "{err}");
+}
+
+/// A bounded view whose sweep has dehydrated everything on disk, plus fresh rows
+/// still in the RAM tier. `hydrator: None` is the point: a walk that meets a
+/// skeleton row here can only fail, so a read that succeeds proves it met none.
+fn dehydrated_fixture(name: &str, on_disk: std::ops::Range<u64>, in_ram: std::ops::Range<u64>) -> RelationRegistry {
+    let schema = id_val_schema();
+    let mut registry = RelationRegistry::new(1);
+    registry
+        .register(RelationSpec {
+            id: TID,
+            kind: RelationKind::View,
+            schema,
+            directory: crate::test_support::scratch_dir("read", name),
+            depth: 0,
+            budgets: ViewBudgets {
+                capacity_bytes: Some(1),
+                delta_bytes: None,
+            },
+        })
+        .unwrap();
+    ingest(&mut registry, on_disk);
+    registry.flush_ephemeral_outputs(1).unwrap();
+    assert!(
+        registry.table_entry(TID).unwrap().needs_hydration(),
+        "premise: the capacity sweep must have dehydrated the flushed shard",
     );
-    // Unbounded above from a non-maximal start: the last key is 0xFF…FF.
-    assert_eq!(
-        scan_spec_worker(&s, &RangeDescriptor::new(&[], Before(5), After(u64::MAX as u128)), NW),
-        None
-    );
+    ingest(&mut registry, in_ram);
+    registry
+}
+
+fn ingest(registry: &mut RelationRegistry, ids: std::ops::Range<u64>) {
+    let mut bb = BatchBuilder::new(id_val_schema());
+    for id in ids {
+        bb.begin_row(id as u128, 1);
+        bb.put_u64(id);
+        bb.end_row();
+    }
+    registry.ingest_returning_effective(TID, bb.finish()).unwrap();
+}
+
+fn pk_range(lo: u64, hi: u64) -> ReadSpec {
+    ReadSpec {
+        bound: ReadBound::PkRange(RangeDescriptor::new(
+            &[],
+            Cut::Before(lo as u128),
+            Cut::After(hi as u128),
+        )),
+        ..rows_spec(Vec::new(), 0)
+    }
+}
+
+/// Whether a read hydrates is the **opened cursor's** question, not the store's:
+/// a range that no skeleton shard's key band overlaps streams, even though the
+/// store as a whole holds skeleton rows. The control read below meets one and
+/// has nothing to recompute it with, which is what makes the first read's
+/// success pruning rather than an empty store.
+#[test]
+fn a_bound_that_prunes_every_skeleton_shard_streams() {
+    let mut r = dehydrated_fixture("skeleton_prune", 0..5, 100..105);
+
+    let got = run(&mut r, &pk_range(100, 104)).unwrap();
+    assert_eq!(ids(&got), (100..105).map(|i| (i as u128, 1)).collect::<Vec<_>>());
+
+    let Err(err) = run(&mut r, &pk_range(0, 4)) else {
+        panic!("a range over the dehydrated band must reach the hydrator");
+    };
+    assert!(err.text.contains("skeleton rows"), "{err}");
 }
 
 // ---------------------------------------------------------------------------

@@ -18,28 +18,19 @@ pub(crate) fn scan_spec_route(disp: &MasterDispatcher, target_id: i64, spec: Spe
     }
 }
 
-/// The one worker that can answer this read, or `None` when nothing proves one —
-/// a relation whose rows are not key-placed, a non-`PkRange` bound, a forged
-/// descriptor (left for the worker to reject at the trust boundary), or a range
-/// spanning workers. Takes the already-unpacked `ReadSpec`, not the whole
-/// `seek_pk_extra` blob: `handle_scan_spec` unpacks it once for the gate and the
-/// routing both. An `IndexRange` bound is never confined: a secondary index
-/// is one unpartitioned table per worker, so nothing derives its owner from the
-/// key.
+/// The one worker that can answer this read, or `None` for a non-`PkRange` bound
+/// and for whatever `SchemaDescriptor::confined_worker` declines. An
+/// `IndexRange` is never confined — a secondary index is one unpartitioned table
+/// per worker, so nothing derives its owner from the key.
 ///
-/// Only a key-routed relation names an owner, and the catalog — not the master's
-/// own stores — answers whether a relation is: the master holds no store at all
-/// after the fork, so its own handles cannot speak for the workers'.
+/// Takes the already-unpacked `ReadSpec` (`handle_scan_spec` unpacks the blob
+/// once, for the gate and the routing both), and the schema from the catalog:
+/// the master holds no store after the fork, so its own handles cannot speak for
+/// the workers'.
 fn confined_worker(disp: &MasterDispatcher, target_id: i64, spec: SpecBytes<'_>) -> Option<usize> {
-    let cat = disp.cat();
-    let schema = cat.registry().get_schema_desc(target_id)?;
-    // For anything but `Keyed` no key names an owner, so nothing can be routed
-    // against a placement the write path scatters differently.
-    if !schema.placement().is_key_routed() {
-        return None;
-    }
+    let schema = disp.cat().registry().get_schema_desc(target_id)?;
     let desc = gnitz_wire::peek_pk_range(spec)?;
-    gnitz_store::read::scan_spec_worker(&schema, &desc, disp.num_workers)
+    schema.confined_worker(&desc, disp.num_workers)
 }
 
 /// Ceiling on the synchronous `W2mReceiver::wait_any` park in the collect loop

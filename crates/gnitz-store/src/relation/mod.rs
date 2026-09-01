@@ -246,6 +246,14 @@ impl TableEntry {
         self.delta.as_deref()
     }
 
+    /// [`Self::delta_feed`] as a `Result` — the one message for "this process
+    /// holds no delta store", so the ad-hoc read's two lookups (the source
+    /// schema and the cursor) cannot render it two ways.
+    pub(crate) fn delta_feed_or_err(&self, id: i64) -> Result<&DeltaFeed, String> {
+        self.delta_feed()
+            .ok_or_else(|| format!("scan_spec: this process holds no delta store for relation {id}"))
+    }
+
     /// The `Table` this process owns outright for this relation, if any.
     pub fn owned_store(&self) -> Option<&Table> {
         self.handle.as_owned()

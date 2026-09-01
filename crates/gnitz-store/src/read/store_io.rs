@@ -1,23 +1,15 @@
 //! Read I/O on relation families — whole-relation scan, point and range seek
 //! (including secondary-index lookup), the batched FK parent probe, and the
-//! index-bounded cursor opener. Every one is a direct cursor walk except a
-//! capacity-bounded view's, which goes through
-//! [`RelationRegistry::materialize_bounded_store`].
+//! index-bounded cursor opener. Every one is a direct cursor walk except one
+//! that meets a capacity-bounded view's skeleton row, which goes through
+//! [`RelationRegistry::materialize_hydrated`].
 
 use std::rc::Rc;
 
 use super::SkeletonHydrator;
-use crate::relation::{IndexCircuitEntry, RelationRegistry, TableEntry};
+use crate::relation::RelationRegistry;
 use crate::schema::{project_schema, SchemaDescriptor};
 use crate::storage::{Batch, BoundedIndexCursor, ReadCursor, SourceCursor};
-
-/// What part of a capacity-bounded view's store one read wants. `Keys` carries
-/// the flat concatenation of the OPK images, ascending.
-pub(crate) enum BoundedRead<'a> {
-    All,
-    Range(&'a [u8], Option<&'a [u8]>),
-    Keys(&'a [u8]),
-}
 
 impl RelationRegistry {
     /// Scan all positive-weight rows from a relation. One registry lookup serves
@@ -31,42 +23,45 @@ impl RelationRegistry {
         hydrator: Option<&mut dyn SkeletonHydrator>,
     ) -> Result<(Rc<Batch>, SchemaDescriptor), String> {
         let entry = self.table_entry(table_id)?;
+        // Asked of the store, not of a cursor: the non-hydrating answer is
+        // `full_scan`'s cached `Rc` snapshot, and opening a cursor to ask
+        // whether this walk meets a skeleton row would defeat that cache.
         if entry.needs_hydration() {
             let schema = entry.schema;
+            let cursor = entry.open_cursor();
             // The hydrated scan is not cached: `full_scan`'s snapshot is
             // invalidated on every ingest, so under live churn it would hold at
             // most one scan and cost a full hydrated copy of the store to do so.
             return Ok((
-                Rc::new(self.materialize_bounded_store(table_id, BoundedRead::All, hydrator)?),
+                Rc::new(self.materialize_hydrated(table_id, cursor, None, hydrator)?),
                 schema,
             ));
         }
         Ok((entry.full_scan(), entry.schema))
     }
 
-    /// Every live row of a capacity-bounded view's store over `read`, with each
-    /// skeleton key recomputed. One consolidated batch in the view's own schema.
+    /// Every live row `cursor` walks, with each skeleton key recomputed — one
+    /// consolidated batch in the walk's own schema. `keys` names the ascending
+    /// OPK key list to visit group by group; `None` sweeps the cursor to its own
+    /// bound, which the open already cut.
     ///
-    /// Walks the store cursor once, copying each hydrated row verbatim and pushing
-    /// each skeleton `(PK, coarse weight)` onto a key list, then hydrates that list
-    /// and merges the two. Both halves are ascending and disjoint by PK — a key is
-    /// skeleton or it is not, and the read cursor's coarsening emits a mixed PK
-    /// group as exactly one skeleton row — so the merge is exact and no sort is
-    /// needed.
+    /// Walks the cursor once, copying each hydrated row verbatim and pushing each
+    /// skeleton `(PK, coarse weight)` onto a key list, then hydrates that list and
+    /// merges the two. Both halves are ascending and disjoint by PK, so the merge
+    /// is exact and no sort is needed.
     ///
-    /// The walk is row-at-a-time on purpose: `drain_chunk` / `materialize` go
-    /// through `slice_to_owned_batch_with`, which force-NULLs every absent column,
-    /// dereferences every German-string cell, and certifies the result against
-    /// the view schema's NOT NULL bits — none of which a skeleton shard can
-    /// survive.
-    pub(crate) fn materialize_bounded_store(
+    /// Row-at-a-time on purpose: `drain_chunk` goes through
+    /// `slice_to_owned_batch_with`, which dereferences every German-string cell
+    /// and certifies the view schema's NOT NULL bits — neither of which a
+    /// skeleton shard can survive.
+    pub(crate) fn materialize_hydrated(
         &mut self,
         view_id: i64,
-        read: BoundedRead<'_>,
+        mut cursor: ReadCursor,
+        keys: Option<&[u8]>,
         hydrator: Option<&mut dyn SkeletonHydrator>,
     ) -> Result<Batch, String> {
-        let entry = self.table_entry(view_id)?;
-        let schema = entry.schema;
+        let schema = cursor.schema;
         let stride = schema.pk_stride() as usize;
         // Flat OPK images, ascending — every walk below visits keys in that
         // order, so the list is sorted by construction.
@@ -74,30 +69,14 @@ impl RelationRegistry {
         let mut coarse: Vec<i64> = Vec::new();
 
         // A bounded view's terminal partition is the finest in the tree, and this
-        // is the read that meets it, so every bounded arm opens over its own range
-        // and yields that walk's own upper row bound — each `out` growth below
-        // re-copies every live byte into a fresh arena.
-        let (mut cursor, cap) = match read {
+        // is the read that meets it, so the pre-size is this walk's own upper row
+        // bound — each `out` growth below re-copies every live byte into a fresh
+        // arena.
+        let cap = match keys {
             // For a key list the bound is the key count, which a view's synthetic
             // PK can exceed — one key names a whole group there.
-            BoundedRead::Keys(keys) => match crate::storage::key_list_range(keys, stride) {
-                Some((lo, hi)) => (entry.open_cursor_in_range(lo, Some(hi)), keys.len() / stride),
-                // No key to gather, so nothing to open over: falling through to
-                // the whole store would build a merge tree over every shard and
-                // then walk it zero times.
-                None => (crate::storage::empty_cursor(schema), 0),
-            },
-            BoundedRead::Range(start, end) => {
-                let mut cursor = entry.open_cursor_in_range(start, end);
-                cursor.seek_range_bytes(start, end);
-                let cap = cursor.estimated_length();
-                (cursor, cap)
-            }
-            BoundedRead::All => {
-                let cursor = entry.open_cursor();
-                let cap = cursor.estimated_length();
-                (cursor, cap)
-            }
+            Some(k) => k.len() / stride,
+            None => cursor.estimated_length(),
         };
         let mut out = Batch::with_capacity(schema, cap);
 
@@ -115,17 +94,16 @@ impl RelationRegistry {
                 c.copy_current_row_into(&mut out, c.current_weight);
             }
         };
-        match read {
-            // A listed key set walks group by group; a whole store or a range is
-            // one sweep from wherever the open above left the cursor.
-            BoundedRead::Keys(keys) => {
-                for key in keys.chunks_exact(stride) {
+        match keys {
+            // A listed key set walks group by group; anything else is one sweep
+            // from wherever the open left the cursor.
+            Some(k) => {
+                for key in k.chunks_exact(stride) {
                     cursor.seek_pk_group(key);
                     cursor.for_each_pk_group_row(key, &mut visit);
                 }
             }
-            // To the cursor's own bound — the open above already restricted it.
-            BoundedRead::All | BoundedRead::Range(..) => cursor.for_each_row_while(|_| true, &mut visit),
+            None => cursor.for_each_row_while(|_| true, &mut visit),
         }
         // Not borrowck (a `ReadCursor` owns its runs by `Rc`): an early free, so
         // the merge tree is gone before `hydrate_keys` allocates its replay.
@@ -145,9 +123,8 @@ impl RelationRegistry {
         // the `drop(cursor)` above.
         let hydrated = match hydrator {
             Some(h) => h.hydrate_keys(&*self, view_id, skeleton_keys, &coarse, chunk_rows)?,
-            // Unreachable: reaching here means a store holds a skeleton shard,
-            // which requires a capacity budget, which no host passing `None`
-            // ever sets.
+            // Unreachable: reaching here means a walk met a skeleton row, which
+            // requires a capacity budget, which no host passing `None` ever sets.
             None => {
                 return Err(format!(
                     "relation {view_id} holds skeleton rows but this process maintains no circuit"
@@ -184,8 +161,10 @@ impl RelationRegistry {
         Ok((self.seek_family_bytes(table_id, opk.pk_bytes(), hydrator)?, schema))
     }
 
-    /// Byte-keyed [`seek_family`] — the primitive both spellings resolve to, for
-    /// callers that already hold the OPK bytes.
+    /// Byte-keyed [`Self::seek_family`] — the primitive both spellings resolve
+    /// to, for callers that already hold the OPK bytes. The skeleton test is the
+    /// opened cursor's, so a point lookup that misses every skeleton shard reads
+    /// without hydrating.
     pub fn seek_family_bytes(
         &mut self,
         table_id: i64,
@@ -193,28 +172,15 @@ impl RelationRegistry {
         hydrator: Option<&mut dyn SkeletonHydrator>,
     ) -> Result<Option<Batch>, String> {
         let entry = self.table_entry(table_id)?;
-        if entry.needs_hydration() {
-            // One key is a one-element key list, so the hydrating read is the same
-            // walk every other one takes — it just hydrates at most one key rather
-            // than the store.
-            let b = self.materialize_bounded_store(table_id, BoundedRead::Keys(pk), hydrator)?;
-            return Ok((b.count > 0).then_some(b));
-        }
-        Ok(Self::seek_entry_bytes(entry, pk))
-    }
-
-    /// The seek+materialise primitive: open a cursor over this worker's store and
-    /// copy every live row of `pk`'s group. Correct at any PK width. A base
-    /// table's PK is unique (`enforce_unique_pk` on ingest) so this emits one row;
-    /// a view output store enforces nothing, and a synthetic view key
-    /// (`_join_pk`) names one row per row the join produced for it — walking the
-    /// group is what makes a seek answer the same rows a point-range read of that
-    /// key does.
-    fn seek_entry_bytes(entry: &TableEntry, pk: &[u8]) -> Option<Batch> {
         let mut cursor = entry.open_cursor_in_range(pk, Some(pk));
-        let mut batch = Batch::empty_with_schema(&entry.schema);
-        cursor.copy_live_pk_group_into(pk, &mut batch);
-        (batch.count > 0).then_some(batch)
+        if !cursor.any_skeleton() {
+            return Ok(live_pk_group(&mut cursor, pk));
+        }
+        // One key is a one-element key list, so the hydrating read is the same
+        // walk every other one takes — it just hydrates at most one key rather
+        // than the store.
+        let b = self.materialize_hydrated(table_id, cursor, Some(pk), hydrator)?;
+        Ok((b.count > 0).then_some(b))
     }
 
     /// Batched point lookup for the FK parent probe. Seek each PK in `pks`
@@ -293,8 +259,8 @@ impl RelationRegistry {
     /// `range.eq_vals().len()` columns are equality-pinned, and the next index
     /// column is bounded by the descriptor's half-open cut interval
     /// `[start, end)`. The cut → byte-key mapping and its correctness argument
-    /// live on [`index_range_keys`]; the walk is then uniform — seek to `start`,
-    /// advance while `key < end`. SQL bound semantics (inclusivity,
+    /// live on [`crate::schema::IndexKeySpec::range_keys`]; the walk is then
+    /// uniform — seek to `start`, advance while `key < end`. SQL bound semantics (inclusivity,
     /// unboundedness, out-of-range saturation) are resolved to cuts in the
     /// planner; none of them reach this layer.
     ///
@@ -387,7 +353,7 @@ impl RelationRegistry {
         let Some(ic) = entry.index_circuit_on(col_indices) else {
             return IndexScan::Decline(format!("No index on cols {col_indices:?} for table {table_id}"));
         };
-        let (start, end) = match index_range_keys(ic, range) {
+        let (start, end) = match ic.key_spec.range_keys(ic.index_schema.pk_stride() as usize, range) {
             Ok(Some(keys)) => keys,
             Ok(None) => return IndexScan::Empty,
             // Malformed: `n_eq` pins every column with no range column left.
@@ -448,31 +414,14 @@ enum IndexScan {
     Decline(String),
 }
 
-/// The half-open OPK key range `[start, end)` for `range` over `ic`'s index, each
-/// key exactly `ic.index_schema.pk_stride()` bytes — [`eq_prefix_range_keys`]
-/// with the index-specific group-prefix encoder.
-///
-/// The prefix is encoded through the circuit's baked spec, the same path the
-/// write side uses (`write_span` / `batch_project_index`), so the two are
-/// byte-identical by construction.
-///
-/// Correctness rests on the OPK ordering invariant: the index PK region is
-/// `[promoted leading-key OPK ‖ source-PK OPK]` and memcmp order on those bytes
-/// equals typed order (signed and composite included). For any `prefix_len`-byte
-/// group key `p`, every full key `k` with `k[..prefix_len] == p` satisfies
-/// `pad(p) ≤ k < pad(succ(p))`, so a cut key includes or excludes whole duplicate
-/// groups with no per-row inclusivity test.
-fn index_range_keys(
-    ic: &IndexCircuitEntry,
-    range: &gnitz_wire::RangeDescriptor,
-) -> Result<Option<(crate::schema::key::PkBuf, Option<crate::schema::key::PkBuf>)>, String> {
-    crate::schema::key::eq_prefix_range_keys(
-        range,
-        ic.col_indices.as_slice().len(),
-        ic.index_schema.pk_stride() as usize, // leading + source PK
-        "index range",
-        |natives| ic.key_spec.seek_prefix(natives),
-    )
+/// Every live row of `pk`'s **group** off a cursor opened over it. A *group*,
+/// because a base table's PK is unique but a synthetic view key (`_join_pk`)
+/// names one row per row the join produced for it — walking it is what makes a
+/// seek answer the same rows a point-range read of that key does.
+fn live_pk_group(cursor: &mut ReadCursor, pk: &[u8]) -> Option<Batch> {
+    let mut batch = Batch::empty_with_schema(&cursor.schema);
+    cursor.copy_live_pk_group_into(pk, &mut batch);
+    (batch.count > 0).then_some(batch)
 }
 
 /// Projecting sibling of `ReadCursor::copy_current_row_into`: append the cursor's

@@ -103,7 +103,7 @@ impl SkeletonHydrator for DagEngine {
 
         // Drops the seed cursor's merge tree before the consolidate below
         // allocates a second full arena.
-        let keys = gather.into_keys();
+        let (_, keys) = gather.into_parts();
         let out = out.into_consolidated(&view_schema);
         debug_assert_hydration_matches(&out, &keys, coarse);
         Ok(out)

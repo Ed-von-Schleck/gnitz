@@ -23,7 +23,6 @@ mod gather;
 mod output;
 
 use super::run::Run;
-pub(crate) use gather::key_list_range;
 pub use gather::PkSetGather;
 use gnitz_expr::RowSource;
 
@@ -89,6 +88,14 @@ impl ReadCursor {
     /// could go stale against the store the cursor came from.
     pub(crate) fn schema(&self) -> &SchemaDescriptor {
         &self.schema
+    }
+
+    /// True when a run this walk merges is a skeleton shard, so a consumer that
+    /// cannot read a skeleton row must hydrate first. Per-run over the runs the
+    /// open selected — a strict subset of the store-level
+    /// [`Table::has_skeleton_rows`](super::table::Table::has_skeleton_rows).
+    pub fn any_skeleton(&self) -> bool {
+        self.any_skeleton
     }
 
     /// A cursor over already-materialized batches, skipping empty ones — what a
