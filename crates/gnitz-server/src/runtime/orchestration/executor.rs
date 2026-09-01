@@ -2376,8 +2376,21 @@ async fn handle_system_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, ta
 /// against it — the master's OWN registered layout, so a client cannot dictate
 /// how its bytes are read. `SysFamily::from_id` rejects a bogus family tid.
 /// Used by the DDL_TXN bundle decode.
+///
+/// This is the sole client → family boundary, so it is where the
+/// [`SysFamily::client_writable`] allowlist belongs: `PUSH_TXN` rejects a tid
+/// below `FIRST_USER_TABLE_ID`, plain `PUSH` is refused because a
+/// `SystemCatalog` relation is no ingestion point, and `ddl_sync` carries
+/// master-broadcast rows. The engine's own sequence writes reach `submit`
+/// through `ingest_to_family` and never cross this decoder.
 fn decode_sys_family(tid: i64, slice: &[u8]) -> Result<(SysFamily, Batch), String> {
     let family = SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?;
+    if !family.client_writable() {
+        return Err(format!(
+            "family {tid} ({}) is not writable from the wire",
+            family.name()
+        ));
+    }
     let batch = decode_client_batch(slice, &family.schema()).map_err(|e| format!("family {tid} decode error: {e}"))?;
     Ok((family, batch))
 }
@@ -2483,6 +2496,13 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
     // epochs rather than behind one.
     let zone_lsn = with_ddl_window(shared, || async move {
         let catalog_write = shared.catalog_rwlock.write().await;
+
+        // The cross-family guards, before anything is reserved or applied: a
+        // rejection here returns from this closure having written nothing, so it
+        // needs no compensation. Placing it after the ingest loop instead would
+        // make a check that needs no applied state indistinguishable from a
+        // post-apply failure.
+        shared.cat().precheck_bundle(&families, &new_view_ids)?;
 
         if view_create {
             // Lock-held committer barrier: a push could have committed between the

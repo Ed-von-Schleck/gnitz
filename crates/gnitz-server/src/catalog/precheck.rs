@@ -11,7 +11,7 @@
 
 use std::cmp::Ordering;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::*;
 use gnitz_store::schema::make_index_schema;
@@ -72,7 +72,116 @@ fn reject_non_canonical(name: &str, noun: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A column record's payload must agree with its packed PK on which column of
+/// which owner it is, and on the owner's kind. Nothing else anchors those three
+/// fields, and they are what the FK cache and every client read back.
+fn check_col_ident(batch: &Batch, row: usize, expect_kind: i64) -> Result<(), String> {
+    let (owner_id, col_idx) = gnitz_wire::unpack_col_id(batch.get_pk(row) as u64);
+    let ident = read_col_tab_ident(batch, row);
+    if ident.owner_id != owner_id as i64 || ident.col_idx != col_idx {
+        return Err(format!(
+            "column record claims ({}, {}) but its packed id says (owner {owner_id}, column {col_idx})",
+            ident.owner_id, ident.col_idx
+        ));
+    }
+    if ident.owner_kind != expect_kind {
+        return Err(format!(
+            "column record of owner {owner_id} declares owner_kind {}, which is not what that relation is",
+            ident.owner_kind
+        ));
+    }
+    Ok(())
+}
+
+/// A circuit `+1` may only name a view this same transaction creates. One under
+/// a foreign `view_id` either makes `has_dependents` of its `source_table`
+/// permanently true, blocking `DROP TABLE` forever, or injects nodes into a
+/// *running* view's circuit that `load_circuit` picks up at its next load.
+/// `create_view_chain` is the one legitimate producer and always targets fresh
+/// vids; every retraction goes through `submit_cascade`, which skips this as it
+/// skips the arms.
+fn check_circuit_view_ids(batch: &Batch, new_view_ids: &[i64]) -> Result<(), String> {
+    for i in (0..batch.len()).filter(|&i| batch.get_weight(i) > 0) {
+        let (view_id, _sub) = unpack_circuit_pk(batch.get_pk(i));
+        if !new_view_ids.contains(&view_id) {
+            return Err(format!(
+                "circuit row names view {view_id}, which this transaction does not create"
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl CatalogEngine {
+    /// The cross-family rules of one `DDL_TXN` bundle: what no family's own arm
+    /// can see, because each is prechecked against a catalog the bundle's other
+    /// families have not reached yet. Run before the first family is applied, so
+    /// a rejection has written nothing and needs no compensation.
+    pub(crate) fn precheck_bundle(
+        &self,
+        families: &[Option<Batch>; SysFamily::COUNT],
+        new_view_ids: &[i64],
+    ) -> Result<(), String> {
+        if let Some(cols) = families[SysFamily::Column.index()].as_ref() {
+            self.check_column_owners(cols, families)?;
+        }
+        for family in [
+            SysFamily::CircuitNodes,
+            SysFamily::CircuitEdges,
+            SysFamily::CircuitNodeColumns,
+        ] {
+            if let Some(b) = families[family.index()].as_ref() {
+                check_circuit_view_ids(b, new_view_ids)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every column record must name an owner this bundle creates or the registry
+    /// already holds, and agree with it on identity and kind. A row on a phantom
+    /// owner is **unretractable** — the only COL_TAB retractor is the owner's own
+    /// drop cascade, which returns early on an unregistered id — and
+    /// `apply_fk_constraints` builds a permanent `FkEdge` from its payload. The
+    /// kind clause matters on its own: that field alone decides a row declares an
+    /// FK, so a view's columns claiming `OWNER_KIND_TABLE` plant an unvalidated edge.
+    fn check_column_owners(&self, cols: &Batch, families: &[Option<Batch>; SysFamily::COUNT]) -> Result<(), String> {
+        // The owners the bundle registers itself, by the kind its block implies.
+        let mut created: FxHashMap<i64, i64> = FxHashMap::default();
+        for (family, kind) in [(SysFamily::Table, OWNER_KIND_TABLE), (SysFamily::View, OWNER_KIND_VIEW)] {
+            let Some(b) = families[family.index()].as_ref() else {
+                continue;
+            };
+            for i in (0..b.len()).filter(|&i| b.get_weight(i) > 0) {
+                created.insert(b.get_pk(i) as i64, kind);
+            }
+        }
+        for i in (0..cols.len()).filter(|&i| cols.get_weight(i) > 0) {
+            let owner_id = gnitz_wire::unpack_col_id(cols.get_pk(i) as u64).0 as i64;
+            // What the catalog already says the owner is, else what this
+            // transaction is making it.
+            let owner_kind = self
+                .registry
+                .table_entry(owner_id)
+                .ok()
+                .map(|e| {
+                    if e.kind.is_view() {
+                        OWNER_KIND_VIEW
+                    } else {
+                        OWNER_KIND_TABLE
+                    }
+                })
+                .or_else(|| created.get(&owner_id).copied())
+                .ok_or_else(|| {
+                    format!(
+                        "column record names owner {owner_id}, which this transaction \
+                         does not create and the catalog does not hold"
+                    )
+                })?;
+            check_col_ident(cols, i, owner_kind)?;
+        }
+        Ok(())
+    }
+
     /// Check every FK-carrying column of a relation about to be registered.
     /// `pk` must already have passed `validate_relation_defs`, which is what
     /// makes `pk[0]` an in-bounds, PK-eligible column index.
@@ -652,6 +761,11 @@ impl CatalogEngine {
             reject_system_id(&sig, SysFamily::Schema, FIRST_USER_SCHEMA_ID)?;
             self.check_cas_and_net(SysFamily::Schema, batch, &sig)?;
         }
+        // Two `+1` rows under one name both pass the cache check below and both
+        // apply: `schema_by_name` keeps the second, leaving the first id live and
+        // unreachable, and dropping the reachable one deletes the orphan's
+        // directory (the deletion is queued by name).
+        let mut claimed: FxHashSet<String> = FxHashSet::default();
         for i in 0..batch.len() {
             if batch.get_weight(i) > 0 {
                 let name = batch.read_payload_string(i, SCHEMATAB_PAY_NAME);
@@ -663,6 +777,9 @@ impl CatalogEngine {
                 reject_non_canonical(&name, "schema")?;
                 if self.has_schema(&name) {
                     return Err(format!("Schema already exists: {name}"));
+                }
+                if let Some(dup) = claimed.replace(name) {
+                    return Err(format!("Schema already exists: {dup}"));
                 }
             } else {
                 let n = self.schema_member_count(batch.get_pk(i) as i64);

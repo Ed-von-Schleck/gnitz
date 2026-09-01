@@ -12,10 +12,11 @@ use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow};
 
 use gnitz_expr::RowSource;
 use gnitz_wire::{
-    COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL,
-    COLTAB_PAY_NAME, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
-    TABTAB_PAY_FLAGS, TABTAB_PAY_NAME, TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY,
-    VIEWTAB_PAY_DELTA, VIEWTAB_PAY_NAME, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID,
+    COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE,
+    COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND, COLTAB_PAY_TYPE_CODE,
+    IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_NAME,
+    TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_NAME,
+    VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID,
 };
 
 // ---------------------------------------------------------------------------
@@ -27,9 +28,6 @@ pub(crate) const PUBLIC_SCHEMA_ID: i64 = 2;
 pub(super) const FIRST_USER_SCHEMA_ID: i64 = gnitz_wire::FIRST_USER_SCHEMA_ID as i64;
 
 pub(super) const OWNER_KIND_TABLE: i64 = gnitz_wire::OWNER_KIND_TABLE as i64;
-// Production code never writes view column records directly (they arrive via
-// the wire path); only the catalog tests do.
-#[cfg(test)]
 pub(super) const OWNER_KIND_VIEW: i64 = gnitz_wire::OWNER_KIND_VIEW as i64;
 
 pub(super) const SEQ_ID_SCHEMAS: i64 = 1;
@@ -261,8 +259,7 @@ fn sys_string<S: RowSource>(src: &S, row: usize, pi: usize) -> String {
 
 /// Decode IDX_TAB `row`: `(owner_id, source_cols, is_unique)`. `source_cols`
 /// carries `pack_pk_cols(&col_indices)` (a single-column index is the
-/// 1-element degenerate case). The name column is deliberately not decoded —
-/// no caller of this reads it, and it would be a wasted allocation.
+/// 1-element degenerate case).
 pub(super) fn read_idx_tab_row<S: RowSource>(src: &S, row: usize) -> (i64, PkColList, bool) {
     (
         sys_u64(src, row, IDXTAB_PAY_OWNER_ID) as i64,
@@ -281,6 +278,44 @@ pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> ColumnDef {
         fk_col_idx: sys_u64(src, row, COLTAB_PAY_FK_COL_IDX) as u32,
         is_serial: sys_u64(src, row, COLTAB_PAY_IS_SERIAL) != 0,
         is_hidden: sys_u64(src, row, COLTAB_PAY_IS_HIDDEN) != 0,
+    }
+}
+
+/// What a COL_TAB row claims about its own identity: the `(owner, column)` its
+/// payload names, and the FK target it declares. Separate from
+/// [`read_col_tab_row`] so the cache appliers and the bundle guard never pay
+/// that decoder's `name` allocation.
+pub(super) struct ColTabIdent {
+    pub(super) owner_id: i64,
+    pub(super) owner_kind: i64,
+    pub(super) col_idx: u64,
+    pub(super) fk_table_id: i64,
+    pub(super) fk_col_idx: u32,
+}
+
+impl ColTabIdent {
+    /// Does this row declare a foreign key? An FK constrains a *base table's*
+    /// column; a view's COL_TAB rows are clones of the projected source defs,
+    /// so they carry the source's `fk_table_id` without being a constraint
+    /// themselves — reading one as a child would put a view id in a base
+    /// table's lock set and fail every parent DELETE on the view's missing FK
+    /// index.
+    pub(super) fn declares_fk(&self) -> bool {
+        self.fk_table_id != 0 && self.owner_kind == OWNER_KIND_TABLE
+    }
+}
+
+/// Decode COL_TAB `row`'s identity fields. A struct rather than a 5-tuple:
+/// `(owner_id, owner_kind, col_idx, fk_table_id)` are four adjacent integers
+/// and `(col_idx, fk_col_idx)` index two different column spaces, so a
+/// transposed field would type-check.
+pub(super) fn read_col_tab_ident<S: RowSource>(src: &S, row: usize) -> ColTabIdent {
+    ColTabIdent {
+        owner_id: sys_u64(src, row, COLTAB_PAY_OWNER_ID) as i64,
+        owner_kind: sys_u64(src, row, COLTAB_PAY_OWNER_KIND) as i64,
+        col_idx: sys_u64(src, row, COLTAB_PAY_COL_IDX),
+        fk_table_id: sys_u64(src, row, COLTAB_PAY_FK_TABLE_ID) as i64,
+        fk_col_idx: sys_u64(src, row, COLTAB_PAY_FK_COL_IDX) as u32,
     }
 }
 
@@ -523,6 +558,12 @@ pub(super) fn pack_column_id(owner_id: i64, col_idx: i64) -> u64 {
     gnitz_wire::pack_col_id(owner_id as u64, col_idx as u64).expect("catalog col-id packing out of range")
 }
 
+/// The `(view_id, sub)` halves of a circuit family's compound PK, which
+/// [`sys_opk`](super::sys_opk) lays down as `(view_id << 64) | sub`.
+pub(super) fn unpack_circuit_pk(pk: u128) -> (i64, u64) {
+    ((pk >> 64) as i64, pk as u64)
+}
+
 /// The half-open COL_TAB key band `[pack(owner, 0), pack(owner + 1, 0))` holding
 /// exactly `owner_id`'s column records — stated once so the read scan and the
 /// drop cascade cannot disagree on the upper bound.
@@ -626,6 +667,24 @@ impl SysFamily {
     #[inline]
     pub(crate) fn topo_priority(self) -> u8 {
         TOPO_PRIORITY[self.index()]
+    }
+
+    /// May a client-pushed `DDL_TXN` bundle carry a block for this family?
+    /// `false` for Sequence alone: boot feeds its rows straight into the id
+    /// counters and the resume verdict, where a forged value aborts every
+    /// subsequent start. Every legitimate sequence write is engine-built.
+    pub(crate) fn client_writable(self) -> bool {
+        match self {
+            SysFamily::Sequence => false,
+            SysFamily::Schema
+            | SysFamily::Table
+            | SysFamily::View
+            | SysFamily::Column
+            | SysFamily::Index
+            | SysFamily::CircuitNodes
+            | SysFamily::CircuitEdges
+            | SysFamily::CircuitNodeColumns => true,
+        }
     }
 
     /// What one of this family's rows is called in a guard message.

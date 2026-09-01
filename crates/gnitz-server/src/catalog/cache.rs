@@ -1,8 +1,5 @@
 use super::*;
-use gnitz_wire::{
-    COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND,
-    IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, SCHEMATAB_PAY_NAME, TABTAB_PAY_NAME, TABTAB_PAY_SCHEMA_ID,
-};
+use gnitz_wire::{IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, SCHEMATAB_PAY_NAME, TABTAB_PAY_NAME, TABTAB_PAY_SCHEMA_ID};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
 
@@ -72,16 +69,6 @@ fn remove_where<K: Eq + std::hash::Hash, V>(map: &mut FxHashMap<K, Vec<V>>, key:
             e.remove();
         }
     }
-}
-
-/// Does COL_TAB row `i` declare a foreign key? An FK constrains a *base
-/// table's* column; a view's `COL_TAB` rows are clones of the projected source
-/// defs, so they carry the source's `fk_table_id` without being a constraint
-/// themselves — reading one as a child would put a view id in a base table's
-/// lock set and fail every parent DELETE on the view's missing FK index.
-fn coltab_row_declares_fk(batch: &Batch, i: usize) -> bool {
-    batch.read_payload_u64(i, COLTAB_PAY_FK_TABLE_ID) != 0
-        && batch.read_payload_u64(i, COLTAB_PAY_OWNER_KIND) as i64 == OWNER_KIND_TABLE
 }
 
 impl CatalogCacheSet {
@@ -210,7 +197,7 @@ impl CatalogEngine {
     pub(in crate::catalog) fn apply_col_names_invalidate(&mut self, batch: &Batch) {
         let mut last: Option<i64> = None;
         for i in 0..batch.len() {
-            let owner_id = batch.read_payload_u64(i, COLTAB_PAY_OWNER_ID) as i64;
+            let owner_id = read_col_tab_ident(batch, i).owner_id;
             if last != Some(owner_id) {
                 self.caches.invalidate_col_names(owner_id);
                 last = Some(owner_id);
@@ -248,17 +235,18 @@ impl CatalogEngine {
     /// and at boot replay the batch is the full sys_columns scan, so decoding
     /// it once matters.
     ///
-    /// Only base-table rows carry a constraint (`coltab_row_declares_fk`).
+    /// Only base-table rows carry a constraint (`ColTabIdent::declares_fk`).
     pub(in crate::catalog) fn apply_fk_constraints(&mut self, batch: &Batch) {
         for i in 0..batch.len() {
-            if !coltab_row_declares_fk(batch, i) {
+            let ident = read_col_tab_ident(batch, i);
+            if !ident.declares_fk() {
                 continue;
             }
             let edge = FkEdge {
-                child_tid: batch.read_payload_u64(i, COLTAB_PAY_OWNER_ID) as i64,
-                fk_col: batch.read_payload_u64(i, COLTAB_PAY_COL_IDX) as usize,
-                parent_tid: batch.read_payload_u64(i, COLTAB_PAY_FK_TABLE_ID) as i64,
-                parent_col: batch.read_payload_u64(i, COLTAB_PAY_FK_COL_IDX) as usize,
+                child_tid: ident.owner_id,
+                fk_col: ident.col_idx as usize,
+                parent_tid: ident.fk_table_id,
+                parent_col: ident.fk_col_idx as usize,
             };
             // One edge per (child, child column), whichever end it is indexed by.
             let same = |e: &FkEdge| e.child_tid == edge.child_tid && e.fk_col == edge.fk_col;
@@ -294,13 +282,13 @@ impl CatalogEngine {
     pub(in crate::catalog) fn relock_from_column_delta(&mut self, batch: &Batch) {
         let mut tids = Vec::with_capacity(batch.len() * 2);
         for i in 0..batch.len() {
-            if !coltab_row_declares_fk(batch, i) {
+            let ident = read_col_tab_ident(batch, i);
+            if !ident.declares_fk() {
                 continue;
             }
-            let fk_table_id = batch.read_payload_u64(i, COLTAB_PAY_FK_TABLE_ID) as i64;
-            tids.push(batch.read_payload_u64(i, COLTAB_PAY_OWNER_ID) as i64);
-            if self.registry.has_id(fk_table_id) {
-                tids.push(fk_table_id);
+            tids.push(ident.owner_id);
+            if self.registry.has_id(ident.fk_table_id) {
+                tids.push(ident.fk_table_id);
             }
         }
         self.relock_all(tids);

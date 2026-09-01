@@ -8,14 +8,14 @@
 //! enforced at the master's trust boundary, and these tests drive that boundary
 //! directly with hand-built bundles.
 
-use gnitz_core::connection::{COL_TAB, IDX_TAB, SCHEMA_TAB, TABLE_TAB};
+use gnitz_core::connection::{COL_TAB, IDX_TAB, SCHEMA_TAB, SEQ_TAB, TABLE_TAB};
 use gnitz_core::protocol::{BatchAppender, ColumnDef, TypeCode, ZSetBatch};
 use gnitz_core::types::sys_schema;
 use gnitz_core::{GnitzClient, Session, TableProps};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::sys_rows::{
-    write_col_tab_row, write_idx_tab_row, write_schema_tab_row, write_table_tab_row, IdxTabRow, SchemaTabRow,
-    TableTabRow,
+    write_circuit_node_row, write_col_tab_row, write_idx_tab_row, write_schema_tab_row, write_table_tab_row,
+    CircuitNodeRow, IdxTabRow, SchemaTabRow, TableTabRow,
 };
 
 /// One SCHEMA_TAB batch registering `(schema_id, name)`.
@@ -47,6 +47,13 @@ fn table_row(table_id: u64, schema_id: u64, name: &str) -> ZSetBatch {
 
 /// The COL_TAB batch for a `(id U64 PK, v I64)` table owned by `owner_id`.
 fn two_columns(owner_id: u64) -> ZSetBatch {
+    two_columns_as(owner_id, gnitz_wire::OWNER_KIND_TABLE)
+}
+
+/// The COL_TAB batch for a `(id U64 PK, v I64)` relation owned by `owner_id`,
+/// with a chosen `owner_kind` — the field that decides whether a row declares an
+/// FK, so it may not disagree with what the owner actually is.
+fn two_columns_as(owner_id: u64, owner_kind: u64) -> ZSetBatch {
     let s = sys_schema(COL_TAB);
     let mut b = ZSetBatch::new(s);
     let mut a = BatchAppender::new(&mut b, s);
@@ -57,9 +64,27 @@ fn two_columns(owner_id: u64) -> ZSetBatch {
     .iter()
     .enumerate()
     {
-        write_col_tab_row(&mut a, &cd.col_tab_row(owner_id, gnitz_wire::OWNER_KIND_TABLE, i), 1).unwrap();
+        write_col_tab_row(&mut a, &cd.col_tab_row(owner_id, owner_kind, i), 1).unwrap();
     }
     b
+}
+
+/// A `(schema, table)` under a fresh schema, through the ordinary client path.
+fn a_table(client: &mut GnitzClient, schema: &str) -> u64 {
+    client.create_schema(schema).unwrap();
+    client
+        .create_table(
+            schema,
+            "t",
+            &[
+                ColumnDef::new("id", TypeCode::U64, false),
+                ColumnDef::new("v", TypeCode::I64, false),
+            ],
+            &[0],
+            TableProps::default(),
+            &[],
+        )
+        .unwrap()
 }
 
 fn session(srv: &ServerHandle) -> Session {
@@ -346,4 +371,111 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
         .expect("the replacement bundle applies");
     assert_ne!(vids[0], first, "the replacement takes a fresh id");
     assert_eq!(client.resolve("mixed", "v").unwrap().unwrap().tid, vids[0]);
+}
+
+/// `_sequences` carries the durable object-id high-waters, the checkpoint
+/// generation and the recorded topology. Boot feeds them straight into the id
+/// counters, where a forged value trips the allocator's ceiling assertion on
+/// every subsequent start — unrecoverable. So the family is not writable from
+/// the wire at all.
+#[test]
+fn a_sequence_block_is_refused_from_the_wire() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let mut s = session(&srv);
+    let seq = sys_schema(SEQ_TAB);
+    let mut b = ZSetBatch::new(seq);
+    BatchAppender::new(&mut b, seq).add_row(2, 1).u64_val(1 << 40);
+    let err = format!("{:?}", s.push_ddl_txn(&[(SEQ_TAB, b)]).unwrap_err());
+    assert!(err.contains("not writable from the wire"), "{err}");
+}
+
+/// A COL_TAB row on an owner nothing registers is unretractable — the only
+/// COL_TAB retractor is the owner's own drop cascade, which returns early on an
+/// unregistered id — and `apply_fk_constraints` would build a permanent FK edge
+/// from its payload.
+#[test]
+fn a_column_block_whose_owner_is_never_registered_is_refused() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let mut s = session(&srv);
+    let tid = s.alloc_table_id().unwrap();
+    let err = format!("{:?}", s.push_ddl_txn(&[(COL_TAB, two_columns(tid))]).unwrap_err());
+    assert!(err.contains("does not create and the catalog does not hold"), "{err}");
+}
+
+/// `owner_kind` alone decides whether a COL_TAB row declares a foreign key, so a
+/// row claiming a kind its owner does not have plants an edge no arm validates.
+#[test]
+fn a_column_row_whose_owner_kind_contradicts_its_owner_is_refused() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
+    let tid = a_table(&mut client, "kindclash");
+
+    let mut s = session(&srv);
+    let err = format!(
+        "{:?}",
+        s.push_ddl_txn(&[(COL_TAB, two_columns_as(tid, gnitz_wire::OWNER_KIND_VIEW))])
+            .unwrap_err()
+    );
+    assert!(err.contains("declares owner_kind"), "{err}");
+}
+
+/// A circuit `+1` under a foreign `view_id` either makes `has_dependents` of its
+/// source permanently true, blocking `DROP TABLE` forever, or injects nodes into
+/// a running view's circuit that the next `load_circuit` picks up.
+#[test]
+fn a_circuit_row_naming_a_view_the_bundle_does_not_create_is_refused() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
+    let tid = a_table(&mut client, "phantomview");
+
+    let mut s = session(&srv);
+    let phantom = s.alloc_table_id().unwrap();
+    let nodes = sys_schema(gnitz_wire::CIRCUIT_NODES_TAB);
+    let mut b = ZSetBatch::new(nodes);
+    write_circuit_node_row(
+        &mut BatchAppender::new(&mut b, nodes),
+        &CircuitNodeRow {
+            view_id: phantom,
+            node_id: 0,
+            opcode: gnitz_wire::OPCODE_SCAN_DELTA,
+            source_table: Some(tid),
+            expr_program: None,
+        },
+        1,
+    )
+    .unwrap();
+    let err = format!(
+        "{:?}",
+        s.push_ddl_txn(&[(gnitz_wire::CIRCUIT_NODES_TAB, b)]).unwrap_err()
+    );
+    assert!(err.contains("does not create"), "{err}");
+
+    // The table it named is still droppable, which is the whole point.
+    client.drop_table("phantomview", "t").unwrap();
+}
+
+/// Two `+1` rows under one schema name both pass the cache check and both apply:
+/// `schema_by_name` keeps the second, leaving the first id live and unreachable,
+/// and dropping the reachable one deletes the orphan's directory.
+#[test]
+fn two_schema_rows_sharing_a_name_in_one_bundle_are_refused() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let mut s = session(&srv);
+    let (a, b) = (s.alloc_schema_id().unwrap(), s.alloc_schema_id().unwrap());
+    let sc = sys_schema(SCHEMA_TAB);
+    let mut batch = ZSetBatch::new(sc);
+    let mut app = BatchAppender::new(&mut batch, sc);
+    for id in [a, b] {
+        write_schema_tab_row(
+            &mut app,
+            &SchemaTabRow {
+                schema_id: id,
+                name: "twice",
+            },
+            1,
+        );
+    }
+    let err = format!("{:?}", s.push_ddl_txn(&[(SCHEMA_TAB, batch)]).unwrap_err());
+    assert!(err.contains("Schema already exists"), "{err}");
+    assert!(s.push_ddl_txn(&[(SCHEMA_TAB, schema_row(a, "twice"))]).is_ok());
 }
