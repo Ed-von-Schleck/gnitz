@@ -20,7 +20,6 @@ pub struct Message {
     /// hint-only continuation frame it is `None` — the caller supplied the
     /// schema out of band.
     pub schema: Option<std::sync::Arc<Schema>>,
-    pub data_batch: Option<ZSetBatch>,
     pub error_text: Option<String>, // Some(_) when status == STATUS_ERROR
     /// The control block's arbitrary-length BLOB cell. On a RESOLVE reply it
     /// carries the relation-descriptor blob (`gnitz_wire::RelDescriptorBlob`);
@@ -293,7 +292,10 @@ pub fn send_control(
 /// block), the hint is used to decode the data block; a version mismatch is a
 /// hard protocol error. Pass `None` for the initial frame or when no cache
 /// entry exists.
-pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result<Message, ProtocolError> {
+pub fn parse_response(
+    buf: &[u8],
+    schema_hint: Option<(&Schema, u16)>,
+) -> Result<(Message, Option<ZSetBatch>), ProtocolError> {
     let parsed = parse_response_frame(buf, schema_hint)?;
     let data_batch = match parsed.data_block {
         Some(range) => {
@@ -307,16 +309,10 @@ pub fn parse_response(buf: &[u8], schema_hint: Option<(&Schema, u16)>) -> Result
         }
         None => None,
     };
-    Ok(Message {
-        data_batch,
-        ..parsed.message
-    })
+    Ok((parsed.message, data_batch))
 }
 
 /// A parsed reply frame whose data block has been located but not decoded.
-///
-/// `message.data_batch` is always `None` here: locating the block is all this
-/// does, and decoding it is what [`parse_response`] adds.
 pub(crate) struct ParsedFrame {
     pub(crate) message: Message,
     /// Where the data block sits in the frame buffer, or `None` when the frame
@@ -392,7 +388,6 @@ pub(crate) fn parse_response_frame(
             flags: ctrl_header.flags,
             seek_pk: ctrl_header.seek_pk,
             schema: wire_schema.map(std::sync::Arc::new),
-            data_batch: None,
             error_text,
             seek_pk_extra,
         },

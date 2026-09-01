@@ -9,6 +9,13 @@ pub enum ClientError {
     /// `STATUS_ERROR` the server returned, or a client-side validation the
     /// request never got past.
     ServerError(String),
+    /// The session is closed and accepts no further work: a driver aborted it
+    /// after a transport or protocol failure, or the request never reached the
+    /// wire because the connection was already gone.
+    Closed,
+    /// A mirror verb on a client or handle that never attached a store. The
+    /// message names no method — each binding spells the attach differently.
+    NoMirrorStore,
     SchemaMismatch, // STATUS_SCHEMA_MISMATCH: server rejected schema-less PUSH
     /// STATUS_TXN_CONFLICT: a user-table TXN failed its OCC precondition — a table
     /// it read was written since its basis. `fresh_basis` is the server's current
@@ -77,6 +84,10 @@ impl fmt::Display for ClientError {
         match self {
             ClientError::Protocol(e) => write!(f, "protocol error: {e}"),
             ClientError::ServerError(s) => write!(f, "server error: {s}"),
+            ClientError::Closed => write!(f, "connection closed"),
+            ClientError::NoMirrorStore => {
+                write!(f, "this client mirrors nothing; attach a store before mirroring a view")
+            }
             ClientError::SchemaMismatch => write!(f, "schema version mismatch"),
             ClientError::TxnConflict { fresh_basis } => {
                 write!(f, "transaction conflict (fresh basis {fresh_basis}); retry")

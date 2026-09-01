@@ -321,8 +321,8 @@ mod spine_tests {
         assert_eq!(s.interest(), Interest::NONE);
         // The next call reports the connection closed instead of submitting.
         let r = s.scan(5);
-        assert!(matches!(r, Err(ClientError::ServerError(ref m)) if m == "connection closed"));
-        assert!(matches!(s.submit(Request::scan(1)), Err(ClientError::ServerError(_))));
+        assert!(matches!(r, Err(ClientError::Closed)));
+        assert!(matches!(s.submit(Request::scan(1)), Err(ClientError::Closed)));
         assert!(s.step(Interest::READ).unwrap().is_empty());
     }
 
@@ -357,7 +357,7 @@ mod spine_tests {
         assert_eq!(s.interest(), Interest::BOTH);
         s.close();
         assert_eq!(s.interest(), Interest::NONE);
-        assert!(matches!(s.submit(Request::scan(3)), Err(ClientError::ServerError(ref m)) if m == "connection closed"));
+        assert!(matches!(s.submit(Request::scan(3)), Err(ClientError::Closed)));
         assert!(s.step(Interest::BOTH).unwrap().is_empty());
     }
 

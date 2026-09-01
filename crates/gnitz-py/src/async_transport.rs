@@ -302,6 +302,6 @@ impl PyAsyncTransport {
     }
 
     fn close(&mut self, py: Python<'_>) {
-        self.shutdown(py, ClientError::ServerError("connection closed".into()));
+        self.shutdown(py, ClientError::Closed);
     }
 }

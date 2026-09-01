@@ -294,7 +294,7 @@ fn wire_version_mismatch_hello_gets_status_error() {
     let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION as u16 + 1);
     t.send_framed(&payload).unwrap();
     let buf = t.recv_framed().unwrap();
-    let msg = parse_response(&buf, None).unwrap();
+    let (msg, _) = parse_response(&buf, None).unwrap();
     assert_eq!(msg.status, STATUS_ERROR);
     let text = msg.error_text.unwrap_or_default();
     assert!(
@@ -364,7 +364,7 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
         // Now read everything: n ACKs, then the scan train.
         for _ in 0..n_pushes {
             let buf = t.recv_framed().unwrap();
-            let ack = parse_response(&buf, None).unwrap();
+            let (ack, _) = parse_response(&buf, None).unwrap();
             assert_eq!(ack.status, 0, "push ACK must be OK");
         }
         let mut rows = 0usize;
@@ -372,13 +372,13 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
         loop {
             let buf = t.recv_framed().unwrap();
             let hint = schema_seen.as_ref().map(|(s, v)| (s.as_ref(), *v));
-            let msg = parse_response(&buf, hint).unwrap();
+            let (msg, data) = parse_response(&buf, hint).unwrap();
             assert_eq!(msg.status, 0, "scan frame must be OK");
             let flags = msg.flags;
             if let Some(s) = msg.schema {
                 schema_seen = Some((s, gnitz_core::wire_flags_get_schema_version(flags)));
             }
-            if let Some(b) = msg.data_batch {
+            if let Some(b) = data {
                 rows += b.len();
             }
             if flags & FLAG_CONTINUATION == 0 {

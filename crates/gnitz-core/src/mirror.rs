@@ -320,18 +320,9 @@ impl MirrorState {
 // calls through `MirrorStore` — which is also what makes it exist once for the
 // blocking, async and Python clients alike.
 
-/// The refusal every mirror verb gives on a client that never attached a store.
-///
-/// It names no method: each binding spells the attach differently, and a message
-/// naming the Rust one would send a Python host looking for a call it does not
-/// have.
-fn no_store() -> ClientError {
-    ClientError::ServerError("this client mirrors nothing; attach a store before mirroring a view".to_string())
-}
-
 impl GnitzClient {
     fn mirror_state(&mut self) -> Result<&mut MirrorState, ClientError> {
-        self.mirror.as_deref_mut().ok_or_else(no_store)
+        self.mirror.as_deref_mut().ok_or(ClientError::NoMirrorStore)
     }
 
     /// The `(schema, name)` `tid` is registered under, for a re-resolve.
@@ -655,7 +646,7 @@ impl GnitzClient {
     /// be cleared without discarding a working connection.
     pub fn close_mirror(&mut self) -> Result<(), ClientError> {
         let Some(mut m) = self.mirror.take() else {
-            return Err(no_store());
+            return Err(ClientError::NoMirrorStore);
         };
         // Checkpointing a store that may be torn would publish the tear.
         let store = &mut m.store;

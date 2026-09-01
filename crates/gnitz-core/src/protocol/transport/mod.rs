@@ -597,6 +597,10 @@ impl FrameReader {
 
 /// Slices per `flush` chunk: Linux's `UIO_MAXIOV`. std clamps to `IOV_MAX`
 /// itself, so this bounds the local slice array rather than the syscall.
+///
+/// Divided by a frame's non-empty segment count it is the **writev quantum**:
+/// 512 pipelined frames for a control-only verb, 341 for a warm push, 256 for a
+/// cold one. A driver's own request-channel depth does not enter it.
 const IOV_MAX_CHUNK: usize = 1024;
 
 /// One queue entry: a frame with its own length prefix.
@@ -751,7 +755,7 @@ pub fn hello_handshake(t: &mut ClientTransport) -> Result<u64, ProtocolError> {
 
     // Not an ACK — the server sent a STATUS_ERROR control block. Surface
     // the embedded error.
-    let msg = super::message::parse_response(&buf, None)?;
+    let (msg, _) = super::message::parse_response(&buf, None)?;
     let err = msg.error_text.unwrap_or_else(|| "HELLO rejected".into());
     Err(ProtocolError::DecodeError(err))
 }

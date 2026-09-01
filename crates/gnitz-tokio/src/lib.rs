@@ -13,13 +13,12 @@
 //! **Mirroring is served by owning a blocking client that mirrors**, so the
 //! reconciliation state machine and every ordering rule its correctness rests on
 //! exist once and this crate runs that code instead of a second copy of it.
-//! Driving the feed on the async connection instead is not a smaller change:
-//! `Op` has no `ScanSpec` variant, so a delta read cannot be expressed on it at
-//! all, and adding one would buy the right to rewrite the state machine as async
-//! beside the blocking one. The crate still links no engine — it takes an opened
-//! store, exactly as the blocking client does.
+//! Driving the feed here instead would mean rewriting that state machine as
+//! async: it interleaves round trips with blocking store calls, and the cursor
+//! protocol under `delta_poll_raw` is `gnitz-core`-private. The crate still
+//! links no engine: it takes an opened store, as the blocking client does.
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::os::fd::OwnedFd;
@@ -30,7 +29,6 @@ use std::task::{Context, Poll};
 use gnitz_core::{
     qualified_name, ClientError, DeltaCursor, GnitzClient, Interest, LocalScanReply, MirrorStore, PkTuple, PollOutcome,
     RelDescriptor, RelTarget, Reply, Request, ScanReply, Schema, Session, SlotId, WireConflictMode, ZSetBatch,
-    MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
 };
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
 use tokio::sync::{mpsc, oneshot};
@@ -39,37 +37,23 @@ use tokio::sync::{mpsc, oneshot};
 /// this only keeps a burst from round-tripping through the scheduler.
 const REQUEST_CHANNEL_DEPTH: usize = 256;
 
-fn closed() -> ClientError {
-    ClientError::ServerError("connection closed".into())
-}
+/// One request's encode step, deferred because `Request<'_>` borrows and the
+/// borrow ends at `submit`, while the session lives in the driver task. Named
+/// because `clippy::type_complexity` refuses it inline.
+type Encode = Box<dyn FnOnce(&mut Session) -> Result<SlotId, ClientError> + Send>;
 
-/// One request as it crosses the channel — owned, because `Request<'_>`
-/// borrows and the borrow ends at `submit`.
-enum Op {
-    Push {
-        tid: u64,
-        schema: Arc<Schema>,
-        batch: ZSetBatch,
-    },
-    Scan(u64),
-    Seek(u64, PkTuple),
-    ScanMany(Vec<u64>),
-    /// The canonical `"schema.name"`.
-    Resolve(String),
-}
-
+/// One request as it crosses the channel.
 struct Submission {
-    op: Op,
+    encode: Encode,
     reply: oneshot::Sender<Result<Reply, ClientError>>,
 }
 
-/// A channel sender and a client id, plus the second client a copy lives inside
-/// once one is attached: `Send + Sync + Clone`. Every method takes `&self`, so
-/// sharing one is a clone.
+/// A channel sender, plus the second client a copy lives inside once one is
+/// attached: `Send + Sync + Clone`. Every method takes `&self`, so sharing one
+/// is a clone.
 #[derive(Clone)]
 pub struct AsyncClient {
     tx: mpsc::Sender<Submission>,
-    client_id: u64,
     /// What [`AsyncClient::attach_mirror`] connects the feed's own client to.
     target: Arc<str>,
     /// The blocking client the copy lives inside, once a host attaches a store.
@@ -81,8 +65,8 @@ pub struct AsyncClient {
 // The handle is shared by cloning, so this is what it promises; the mirror field
 // is the one thing that could take it away silently.
 const _: fn() = || {
-    fn assert_send_sync_clone<T: Send + Sync + Clone>() {}
-    assert_send_sync_clone::<AsyncClient>();
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<AsyncClient>();
 };
 
 /// The mirror slot, recovering a poisoned lock: what it guards is a client whose
@@ -100,11 +84,6 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
         .map_err(|e| ClientError::ServerError(format!("mirror task failed: {e}")))
 }
 
-/// The refusal every mirror verb gives on a handle that never attached a store.
-fn no_mirror() -> ClientError {
-    ClientError::ServerError("this handle mirrors nothing; attach a store before mirroring a view".to_string())
-}
-
 /// Connect to `target` and hand back the handle paired with the driver that
 /// serves it. Nothing reaches the connection until the [`Connection`] is
 /// polled.
@@ -112,13 +91,12 @@ fn no_mirror() -> ClientError {
 /// The TCP connect and TLS handshake block — a dual-stack `tls://` host can
 /// spend tens of seconds in them — so they run on `spawn_blocking`.
 pub async fn connect(target: &str) -> Result<(AsyncClient, Connection), ClientError> {
-    let handle_target: Arc<str> = Arc::from(target);
-    let target = target.to_string();
-    let session = tokio::task::spawn_blocking(move || Session::connect(&target))
+    let target: Arc<str> = Arc::from(target);
+    let connect_to = Arc::clone(&target);
+    let session = tokio::task::spawn_blocking(move || Session::connect(&connect_to))
         .await
         .map_err(|e| ClientError::ServerError(format!("connect task failed: {e}")))?
         .map(|(session, _published_lsn)| session)?;
-    let client_id = session.client_id;
     // A `dup`, so the reactor deregisters a descriptor whose life it owns
     // rather than a number the session may already have closed and the kernel
     // handed out again.
@@ -127,85 +105,94 @@ pub async fn connect(target: &str) -> Result<(AsyncClient, Connection), ClientEr
     Ok((
         AsyncClient {
             tx,
-            client_id,
-            target: handle_target,
+            target,
             mirror: Arc::new(Mutex::new(None)),
         },
         Connection {
             session,
             fd,
             rx,
-            pending: HashMap::new(),
+            pending: VecDeque::new(),
         },
     ))
 }
 
 impl AsyncClient {
-    /// This connection's client id, minted from the same generator the blocking
-    /// client uses, so a process holding both cannot mint one twice.
-    pub fn client_id(&self) -> u64 {
-        self.client_id
-    }
-
-    async fn call(&self, op: Op) -> Result<Reply, ClientError> {
+    /// Hand one request's encode step to the driver and wait for its reply.
+    async fn call(
+        &self,
+        encode: impl FnOnce(&mut Session) -> Result<SlotId, ClientError> + Send + 'static,
+    ) -> Result<Reply, ClientError> {
         let (reply, rx) = oneshot::channel();
-        // A full channel suspends here: `Connection` drains only while under
-        // `MAX_IN_FLIGHT`, so back-pressure is a wait, never the cap's error.
-        self.tx.send(Submission { op, reply }).await.map_err(|_| closed())?;
-        rx.await.map_err(|_| closed())?
+        // A full channel suspends here: `Connection` drains only below
+        // `Session::at_capacity`, so back-pressure is a wait, never its error.
+        self.tx
+            .send(Submission {
+                encode: Box::new(encode),
+                reply,
+            })
+            .await
+            .map_err(|_| ClientError::Closed)?;
+        rx.await.map_err(|_| ClientError::Closed)?
     }
 
     /// Push a batch and resolve to its ingest LSN.
+    ///
+    /// A [`ClientError::SchemaMismatch`] is not retried here as the blocking
+    /// client retries it: a re-submit would reorder the push behind everything
+    /// sent since, and the spine already evicted the stale cache entry.
     pub async fn push(&self, tid: u64, schema: Arc<Schema>, batch: ZSetBatch) -> Result<u64, ClientError> {
-        match self.call(Op::Push { tid, schema, batch }).await? {
-            Reply::Lsn(lsn) => Ok(lsn),
-            _ => unreachable!("a push completes as Reply::Lsn"),
-        }
+        self.call(move |s| {
+            s.submit(Request::Push {
+                target_id: tid,
+                schema: &schema,
+                batch: &batch,
+                mode: WireConflictMode::Update,
+            })
+        })
+        .await
+        .map(|r| r.into_lsn())
     }
 
     pub async fn scan(&self, tid: u64) -> Result<ScanReply, ClientError> {
-        self.read(Op::Scan(tid)).await
+        self.call(move |s| s.submit(Request::scan(tid)))
+            .await
+            .map(|r| r.into_scan())
     }
 
     pub async fn seek(&self, tid: u64, pk: PkTuple) -> Result<ScanReply, ClientError> {
-        self.read(Op::Seek(tid, pk)).await
-    }
-
-    async fn read(&self, op: Op) -> Result<ScanReply, ClientError> {
-        match self.call(op).await? {
-            Reply::Scan(r) => Ok(r),
-            _ => unreachable!("a correlated read completes as Reply::Scan"),
-        }
+        self.call(move |s| s.submit(Request::seek(tid, &pk)))
+            .await
+            .map(|r| r.into_scan())
     }
 
     /// Snapshot N relations at one server-side SAL cut, in request order.
     pub async fn scan_many(&self, tids: &[u64]) -> Result<Vec<ScanReply>, ClientError> {
-        match self.call(Op::ScanMany(tids.to_vec())).await? {
-            Reply::Multi(r) => Ok(r),
-            _ => unreachable!("a scan_multi completes as Reply::Multi"),
-        }
+        let tids = tids.to_vec();
+        self.call(move |s| s.submit(Request::ScanMulti(&tids)))
+            .await
+            .map(|r| r.into_multi())
     }
 
     /// Describe one relation. Always a round trip — an async handle has no
     /// statement bracket to scope a catalog snapshot to. On the surface because
     /// every other verb takes a `tid` and nothing else here can produce one.
     pub async fn resolve(&self, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
-        match self.call(Op::Resolve(qualified_name(schema_name, name))).await? {
-            Reply::Resolve(d) => {
-                Ok(d.map(|(tid, schema, blob)| Arc::new(RelDescriptor::from_resolve(tid, schema, blob))))
-            }
-            _ => unreachable!("a resolve completes as Reply::Resolve"),
-        }
+        let qname = qualified_name(schema_name, name);
+        self.call(move |s| s.submit(Request::Resolve(RelTarget::Name(&qname))))
+            .await
+            .map(|r| {
+                r.into_resolve()
+                    .map(|(tid, schema, blob)| Arc::new(RelDescriptor::from_resolve(tid, schema, blob)))
+            })
     }
 
     // ── Mirroring ──────────────────────────────────────────────────────────
     //
-    // Every method here is `async` through one `spawn_blocking`, the metadata
-    // accessors included: the lock is held across a whole poll, so a synchronous
-    // `mirrors(tid)` would block a reactor thread for that poll's duration. Two
-    // costs a host takes on: a mirroring handle holds a second connection — the
-    // feed's, taking a second server-side client slot — and every mirror call
-    // occupies a blocking-pool thread.
+    // The verbs hop to a blocking-pool thread: the lock is held across a whole
+    // poll, so waiting for it would stall a reactor thread that long. The
+    // accessors hop only when the slot is contended. A mirroring handle also
+    // holds a second connection — the feed's — and so a second server-side slot.
 
     /// Read a local copy of one or more views through `store`.
     ///
@@ -241,11 +228,12 @@ impl AsyncClient {
     /// **A mirroring host must call it**: otherwise the last clone's `Drop` runs
     /// the store's own — an fsync unbounded in the copy's size — on whatever
     /// thread happens to drop it, which in a reactor task is a reactor thread.
-    /// The lock is released before that fsync, so a close stalls no other clone.
     pub async fn close_mirror(&self) -> Result<(), ClientError> {
         let slot = Arc::clone(&self.mirror);
         blocking(move || {
-            let mut taken = lock(&slot).take().ok_or_else(no_mirror)?;
+            // Taken out in one statement, so the guard drops before the fsync
+            // below and a close stalls no other clone.
+            let mut taken = lock(&slot).take().ok_or(ClientError::NoMirrorStore)?;
             taken.close_mirror()
         })
         .await?
@@ -278,24 +266,29 @@ impl AsyncClient {
         self.on_mirror(GnitzClient::checkpoint_mirror).await
     }
 
-    /// Whether a read of `table_id` is answered off the copy.
+    /// Whether a read of `table_id` is answered off the copy. `false` on a
+    /// handle that mirrors nothing.
     pub async fn mirrors(&self, table_id: u64) -> Result<bool, ClientError> {
-        self.on_mirror(move |c| Ok(c.mirrors(table_id))).await
+        self.on_mirror_or(false, move |c| c.mirrors(table_id)).await
     }
 
-    /// The round a local read of `table_id` answers at.
+    /// The round a local read of `table_id` answers at. `None` on a handle that
+    /// mirrors nothing.
     pub async fn cursor_of(&self, table_id: u64) -> Result<Option<DeltaCursor>, ClientError> {
-        self.on_mirror(move |c| Ok(c.cursor_of(table_id))).await
+        self.on_mirror_or(None, move |c| c.cursor_of(table_id)).await
     }
 
-    /// Every registration the copy holds.
+    /// Every registration the copy holds. Empty on a handle that mirrors
+    /// nothing.
     pub async fn mirrored_ids(&self) -> Result<Vec<u64>, ClientError> {
-        self.on_mirror(|c| Ok(c.mirrored_ids())).await
+        self.on_mirror_or(Vec::new(), |c| c.mirrored_ids()).await
     }
 
-    /// The message that poisoned the copy, if any.
+    /// The message that poisoned the copy, if any. `None` on a handle that
+    /// mirrors nothing.
     pub async fn mirror_poisoned(&self) -> Result<Option<String>, ClientError> {
-        self.on_mirror(|c| Ok(c.mirror_poisoned().map(str::to_string))).await
+        self.on_mirror_or(None, |c| c.mirror_poisoned().map(str::to_string))
+            .await
     }
 
     /// Run `f` on the installed client, under the lock, on a blocking thread.
@@ -306,9 +299,24 @@ impl AsyncClient {
         let slot = Arc::clone(&self.mirror);
         blocking(move || {
             let mut held = lock(&slot);
-            f(held.as_mut().ok_or_else(no_mirror)?)
+            f(held.as_mut().ok_or(ClientError::NoMirrorStore)?)
         })
         .await?
+    }
+
+    /// Ask the installed client, or answer as a store-less `GnitzClient` does.
+    /// Uncontended it answers on the caller's thread — an O(1) map read against
+    /// a ~30 µs hop; a contended slot means a poll holds the lock, so it hops.
+    async fn on_mirror_or<T: Send + 'static>(
+        &self,
+        none: T,
+        f: impl FnOnce(&GnitzClient) -> T + Send + 'static,
+    ) -> Result<T, ClientError> {
+        if let Ok(held) = self.mirror.try_lock() {
+            return Ok(held.as_ref().map_or(none, f));
+        }
+        let slot = Arc::clone(&self.mirror);
+        blocking(move || lock(&slot).as_ref().map_or(none, f)).await
     }
 
     /// [`Self::scan`], answered off the copy when it holds `tid`.
@@ -321,15 +329,14 @@ impl AsyncClient {
     /// can wait behind an in-flight poll, because which relations the copy holds
     /// is itself store state.
     ///
-    /// [`Self::seek`] and [`Self::scan_many`] stay wire-only: they take raw ids
-    /// and a copy holds views alone.
+    /// [`Self::seek`] and [`Self::scan_many`] stay wire-only: no caller has
+    /// needed a local-first form of either.
     pub async fn scan_local_first(&self, tid: u64) -> Result<LocalScanReply, ClientError> {
-        // A contended slot means an installed store, so it takes the hop rather
-        // than delegating on a lock it could not read. The guard drops at the end
-        // of this statement, which is what keeps the blocking hop below from
-        // waiting on a lock this task holds.
-        let unattached = matches!(self.mirror.try_lock().as_deref(), Ok(None));
-        if !unattached {
+        // A slot we cannot read means an installed store — a poisoned lock
+        // included, which `lock` below recovers. The guard drops with this
+        // statement, so the hop does not wait on a lock this task holds.
+        let attached = !matches!(self.mirror.try_lock().as_deref(), Ok(None));
+        if attached {
             let slot = Arc::clone(&self.mirror);
             let local = blocking(move || match lock(&slot).as_mut() {
                 Some(c) => c.scan_local(tid),
@@ -356,17 +363,19 @@ pub struct Connection {
     session: Session,
     fd: AsyncFd<OwnedFd>,
     rx: mpsc::Receiver<Submission>,
-    pending: HashMap<SlotId, oneshot::Sender<Result<Reply, ClientError>>>,
+    /// Registered slots in submit order. A queue, not a map: the spine holds one
+    /// accumulator — the head slot's — and registers a slot only after every
+    /// fallible step has passed, so completion is strictly FIFO.
+    pending: VecDeque<(SlotId, oneshot::Sender<Result<Reply, ClientError>>)>,
 }
 
 impl Connection {
-    /// Encode every submission the channel holds; `true` when the last handle
-    /// is gone. At either cap the channel is left unpolled, which is what turns
-    /// them into back-pressure on `AsyncClient::call` rather than the error
-    /// `submit` would raise. Queued bytes always arm `write`, so the next step
-    /// brings the loop back round.
+    /// Encode every submission the channel holds; `true` when the last handle is
+    /// gone. At either of `submit`'s caps the channel is left unpolled — that is
+    /// what makes them back-pressure rather than the error `submit` raises — and
+    /// queued bytes arm `write`, so the next step brings the loop back round.
     fn drain_channel(&mut self, cx: &mut Context<'_>) -> bool {
-        while self.pending.len() < MAX_IN_FLIGHT && self.session.queued_bytes() < MAX_QUEUED_BYTES {
+        while !self.session.at_capacity() {
             match self.rx.poll_recv(cx) {
                 Poll::Ready(Some(sub)) => self.submit(sub),
                 Poll::Ready(None) => return true,
@@ -376,26 +385,12 @@ impl Connection {
         false
     }
 
-    /// Encode one submission and register its slot. A request the spine refuses
-    /// fails that one future and reaches no wire.
+    /// Run one submission's encode step and register its slot. A request the
+    /// spine refuses fails that one future and reaches no wire.
     fn submit(&mut self, sub: Submission) {
-        let Submission { op, reply } = sub;
-        let registered = match &op {
-            Op::Push { tid, schema, batch } => self.session.submit(Request::Push {
-                target_id: *tid,
-                schema,
-                batch,
-                mode: WireConflictMode::Update,
-            }),
-            Op::Scan(tid) => self.session.submit(Request::scan(*tid)),
-            Op::Seek(tid, pk) => self.session.submit(Request::seek(*tid, pk)),
-            Op::ScanMany(tids) => self.session.submit(Request::ScanMulti(tids)),
-            Op::Resolve(qname) => self.session.submit(Request::Resolve(RelTarget::Name(qname))),
-        };
-        match registered {
-            Ok(id) => {
-                self.pending.insert(id, reply);
-            }
+        let Submission { encode, reply } = sub;
+        match encode(&mut self.session) {
+            Ok(id) => self.pending.push_back((id, reply)),
             Err(e) => {
                 let _ = reply.send(Err(e));
             }
@@ -405,11 +400,19 @@ impl Connection {
     /// Abandon every pending slot with `cause`, then hand it back as this
     /// driver's own result. `ClientError` is not `Clone`, so each slot gets a
     /// rendering of it.
+    ///
+    /// The channel is closed and drained with them: a submission buffered here,
+    /// or sent after this, has no driver left to answer it and never reached the
+    /// wire.
     fn abort(&mut self, cause: ClientError) -> ClientError {
         self.session.close();
         let text = cause.to_string();
-        for (_, reply) in self.pending.drain() {
+        for (_, reply) in self.pending.drain(..) {
             let _ = reply.send(Err(ClientError::ServerError(text.clone())));
+        }
+        self.rx.close();
+        while let Ok(sub) = self.rx.try_recv() {
+            let _ = sub.reply.send(Err(ClientError::Closed));
         }
         cause
     }
@@ -421,18 +424,10 @@ type Guards<'a> = (
     Option<AsyncFdReadyGuard<'a, OwnedFd>>,
 );
 
-/// Give a direction's readiness back, but only if the step `consumed` it.
-/// `AsyncFd` is edge-triggered, so clearing one the step did not exhaust waits
-/// for an edge that never comes.
-fn give_back(guard: Option<AsyncFdReadyGuard<'_, OwnedFd>>, consumed: bool) {
-    if let (Some(mut g), true) = (guard, consumed) {
-        g.clear_ready();
-    }
-}
-
 /// Poll only the directions `want` names; one that did not fire registers its
 /// waker and stays `None`. Stepping a direction that did not fire would cost a
-/// syscall per wakeup to discover it was not ready.
+/// syscall per wakeup to discover it was not ready. Free rather than a `&self`
+/// method, so the guards borrow `fd` alone and `step` can take `&mut session`.
 fn poll_ready<'a>(fd: &'a AsyncFd<OwnedFd>, want: Interest, cx: &mut Context<'_>) -> io::Result<Guards<'a>> {
     Ok((
         if want.read {
@@ -452,8 +447,7 @@ fn fired(
     polled: Poll<io::Result<AsyncFdReadyGuard<'_, OwnedFd>>>,
 ) -> io::Result<Option<AsyncFdReadyGuard<'_, OwnedFd>>> {
     match polled {
-        Poll::Ready(Ok(g)) => Ok(Some(g)),
-        Poll::Ready(Err(e)) => Err(e),
+        Poll::Ready(r) => r.map(Some),
         Poll::Pending => Ok(None),
     }
 }
@@ -490,19 +484,26 @@ impl Future for Connection {
             }
 
             let stepped = this.session.step(ready);
-            // A step drains the read source and flushes last, so bytes still
-            // queued after one are exactly what the fd refused.
-            give_back(read, true);
-            give_back(write, this.session.interest().write);
+            // `AsyncFd` is edge-triggered: giving back readiness the step did
+            // not spend waits for an edge that never comes. A read is always
+            // spent — `step` reads until the source is drained — and a write is
+            // spent exactly when the fd left bytes queued.
+            let write_spent = this.session.interest().write;
+            if let Some(mut g) = read {
+                g.clear_ready();
+            }
+            if let (Some(mut g), true) = (write, write_spent) {
+                g.clear_ready();
+            }
 
             match stepped {
                 Ok(done) => {
                     for (id, result) in done {
+                        let (want, reply) = this.pending.pop_front().expect("a completion for an unregistered slot");
+                        assert_eq!(want, id, "the spine completes slots in submit order");
                         // A slot whose receiver is gone — its verb's future was
                         // dropped — resolves to nothing.
-                        if let Some(reply) = this.pending.remove(&id) {
-                            let _ = reply.send(result);
-                        }
+                        let _ = reply.send(result);
                     }
                 }
                 // The byte stream's framing is no longer trustworthy.

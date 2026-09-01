@@ -162,10 +162,6 @@ fn check_response(msg: Message) -> Result<Message, ClientError> {
     Ok(msg)
 }
 
-fn closed_error() -> ClientError {
-    ClientError::ServerError("connection closed".into())
-}
-
 /// Which relation a RESOLVE request describes. The wire carries an id field and
 /// a name blob and lets the name win, but exactly one is ever meaningful — this
 /// says which, so no caller has to encode that as a `0` / `""` sentinel pair.
@@ -318,8 +314,9 @@ pub struct ReplyTrain {
 
 impl ReplyTrain {
     /// The train as one relation's read result: its schema, its rows, and the
-    /// terminal watermark as a plain LSN.
-    fn into_scan(self) -> ScanReply {
+    /// terminal watermark as a plain LSN. Distinct from [`Reply::into_scan`],
+    /// which projects an already-built one out of the enum.
+    fn into_scan_reply(self) -> ScanReply {
         (self.schema, self.data, self.terminal.seek_pk as u64)
     }
 }
@@ -344,6 +341,76 @@ pub enum Reply {
     /// frame buffer: `scan_spec_raw`, and the mirror's copy-free ingest. It
     /// carries no schema — the server sends no block back for a SCAN_SPEC.
     Raw { blocks: Vec<RawBlock>, terminal: Message },
+}
+
+impl Reply {
+    /// The variant's name, for [`wrong_shape`]. Not `Debug`: `Reply::Scan`
+    /// reaches a whole `ZSetBatch`.
+    fn kind(&self) -> &'static str {
+        match self {
+            Reply::Scan(_) => "Scan",
+            Reply::Multi(_) => "Multi",
+            Reply::Lsn(_) => "Lsn",
+            Reply::Resolve(_) => "Resolve",
+            Reply::Train(_) => "Train",
+            Reply::Raw { .. } => "Raw",
+        }
+    }
+
+    // `#[inline]` on all four: a `Reply` is past every by-value register class,
+    // so out of line each would memcpy its narrowed value through a return slot.
+
+    /// A PUSH ACK's ingest LSN.
+    #[inline]
+    #[track_caller]
+    pub fn into_lsn(self) -> u64 {
+        match self {
+            Reply::Lsn(lsn) => lsn,
+            other => wrong_shape(other.kind(), "Lsn"),
+        }
+    }
+
+    /// One relation's read result: SCAN, SEEK, SEEK_BY_INDEX.
+    #[inline]
+    #[track_caller]
+    pub fn into_scan(self) -> ScanReply {
+        match self {
+            Reply::Scan(r) => r,
+            other => wrong_shape(other.kind(), "Scan"),
+        }
+    }
+
+    /// A `scan_multi`'s N per-relation results, in request order.
+    #[inline]
+    #[track_caller]
+    pub fn into_multi(self) -> Vec<ScanReply> {
+        match self {
+            Reply::Multi(r) => r,
+            other => wrong_shape(other.kind(), "Multi"),
+        }
+    }
+
+    /// A RESOLVE's `(live tid, schema, descriptor)`, or `None` when no such
+    /// relation exists. The triple, not a `RelDescriptor`: that lives above
+    /// this module.
+    #[inline]
+    #[track_caller]
+    pub fn into_resolve(self) -> Option<(u64, Arc<Schema>, RelDescriptorBlob)> {
+        match self {
+            Reply::Resolve(d) => d,
+            other => wrong_shape(other.kind(), "Resolve"),
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn wrong_shape(got: &'static str, want: &'static str) -> ! {
+    panic!(
+        "the spine resolves a reply against the request that opened its slot; \
+         wanted Reply::{want}, got Reply::{got}"
+    )
 }
 
 pub type Completions = Vec<(SlotId, Result<Reply, ClientError>)>;
@@ -507,14 +574,14 @@ impl Session {
     /// ends here, because encoding is what `submit` does.
     pub fn submit(&mut self, req: Request<'_>) -> Result<SlotId, ClientError> {
         if self.closed {
-            return Err(closed_error());
+            return Err(ClientError::Closed);
         }
         if self.pending.len() >= MAX_IN_FLIGHT {
             return Err(ClientError::ServerError(format!(
                 "connection has {MAX_IN_FLIGHT} requests in flight"
             )));
         }
-        let queued = self.transport.queued_bytes();
+        let queued = self.queued_bytes();
         if queued >= MAX_QUEUED_BYTES {
             return Err(ClientError::ServerError(format!(
                 "connection has {queued} unwritten bytes queued, at the {MAX_QUEUED_BYTES}-byte cap"
@@ -641,6 +708,14 @@ impl Session {
         self.transport.queued_bytes()
     }
 
+    /// Either of the caps [`Self::submit`] refuses on — in-flight slots or
+    /// queued bytes — reached. A driver that can wait leaves the request where
+    /// it is, which is what turns a cap into back-pressure rather than an error.
+    /// Each cap implies its own interest bit, so gating on it loses no wakeup.
+    pub fn at_capacity(&self) -> bool {
+        self.pending.len() >= MAX_IN_FLIGHT || self.queued_bytes() >= MAX_QUEUED_BYTES
+    }
+
     /// `READ` while any slot is outstanding; `WRITE` while bytes remain queued
     /// or rustls has ciphertext to ship.
     pub fn interest(&self) -> Interest {
@@ -692,11 +767,12 @@ impl Session {
         };
         let hint = hint_owned.as_ref().map(|(s, v)| (s.as_ref(), *v));
 
-        let (msg, block) = if matches!(shape, ReplyShape::Raw) {
+        let (msg, block, decoded) = if matches!(shape, ReplyShape::Raw) {
             let parsed = parse_response_frame(&buf, hint)?;
-            (parsed.message, parsed.data_block)
+            (parsed.message, parsed.data_block, None)
         } else {
-            (parse_response(&buf, hint)?, None)
+            let (msg, batch) = parse_response(&buf, hint)?;
+            (msg, None, batch)
         };
         let mut msg = match check_response(msg) {
             Ok(m) => m,
@@ -727,7 +803,6 @@ impl Session {
         }
 
         let schema = msg.schema.take();
-        let data_batch = msg.data_batch.take();
         let terminal = msg;
         let acc = &mut self.accum;
         acc.schema = acc.schema.take().or(schema);
@@ -737,7 +812,7 @@ impl Session {
                 block: range,
             });
         }
-        if let Some(batch) = data_batch {
+        if let Some(batch) = decoded {
             match acc.data.as_mut() {
                 Some(a) => a.extend_from_owned(batch),
                 None => acc.data = Some(batch),
@@ -754,7 +829,7 @@ impl Session {
             data: acc.data.take(),
         };
         let reply = match shape {
-            ReplyShape::Scan => Ok(Reply::Scan(train.into_scan())),
+            ReplyShape::Scan => Ok(Reply::Scan(train.into_scan_reply())),
             ReplyShape::PushAck => Ok(Reply::Lsn(train.terminal.seek_pk as u64)),
             ReplyShape::Resolve => self.resolve_reply(train).map(Reply::Resolve),
             ReplyShape::Train => Ok(Reply::Train(train)),
@@ -763,7 +838,7 @@ impl Session {
                 terminal: train.terminal,
             }),
             ReplyShape::Multi(n) => {
-                self.accum.replies.push(train.into_scan());
+                self.accum.replies.push(train.into_scan_reply());
                 if self.accum.replies.len() < n {
                     return Ok(());
                 }
@@ -822,7 +897,7 @@ impl Session {
     /// hook's cost (a GIL acquisition, for the Python binding).
     fn park(&mut self, interest: Interest) -> Result<Interest, ClientError> {
         if interest.is_empty() {
-            return Err(closed_error());
+            return Err(ClientError::Closed);
         }
         loop {
             match poll_fd(self.transport.as_raw_fd(), interest.poll_events(), None, false) {
@@ -847,10 +922,7 @@ impl Session {
 
     /// `round_trip` narrowed to a single relation's read result.
     fn round_trip_scan(&mut self, req: Request<'_>) -> ScanResult {
-        match self.round_trip(req)? {
-            Reply::Scan(r) => Ok(r),
-            _ => unreachable!("a correlated read completes as Reply::Scan"),
-        }
+        self.round_trip(req).map(|r| r.into_scan())
     }
 
     /// An id allocation: one uncorrelated control frame, and the answer rides
@@ -917,10 +989,7 @@ impl Session {
             Err(ClientError::SchemaMismatch) => self.round_trip(push())?,
             other => other?,
         };
-        match reply {
-            Reply::Lsn(lsn) => Ok(lsn),
-            _ => unreachable!("a push completes as Reply::Lsn"),
-        }
+        Ok(reply.into_lsn())
     }
 
     /// Send an atomic DDL transaction: a bundle of system-table family batches
@@ -1008,10 +1077,7 @@ impl Session {
     /// runs) before the frame is sent; other shape/tid errors surface from the
     /// server as `ClientError::ServerError`.
     pub fn scan_multi(&mut self, tids: &[u64]) -> MultiScanResult {
-        match self.round_trip(Request::ScanMulti(tids))? {
-            Reply::Multi(replies) => Ok(replies),
-            _ => unreachable!("a scan_multi completes as Reply::Multi"),
-        }
+        self.round_trip(Request::ScanMulti(tids)).map(|r| r.into_multi())
     }
 
     pub fn seek(&mut self, target_id: u64, pk: &PkTuple) -> ScanResult {
@@ -1050,10 +1116,7 @@ impl Session {
         &mut self,
         target: RelTarget<'_>,
     ) -> Result<Option<(u64, Arc<Schema>, RelDescriptorBlob)>, ClientError> {
-        match self.round_trip(Request::Resolve(target))? {
-            Reply::Resolve(d) => Ok(d),
-            _ => unreachable!("a resolve completes as Reply::Resolve"),
-        }
+        self.round_trip(Request::Resolve(target)).map(|r| r.into_resolve())
     }
 
     /// The RESOLVE request frame for `target`. The one place the wire's "name

@@ -1898,10 +1898,6 @@ impl GnitzClient {
     /// Resolve `schema_name` (already canonicalized) to its SCHEMA_TAB id. A
     /// missing row — or an entirely empty SCHEMA_TAB — is the one
     /// schema-qualified "not found" error every DDL/resolve path reports.
-    ///
-    /// A resolve reply carries everything about a relation but the id of the
-    /// schema it lives in, so the mirror's registration — which writes catalog
-    /// rows of its own — comes through here too rather than deriving its own.
     pub(crate) fn lookup_schema_id(&mut self, schema_name: &str) -> Result<u64, ClientError> {
         let batch = checked_sys_rows(SCHEMA_TAB, self.session.scan(SCHEMA_TAB)?)?;
         match &batch {

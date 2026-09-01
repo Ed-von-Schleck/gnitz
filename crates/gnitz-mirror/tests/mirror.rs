@@ -2021,8 +2021,11 @@ fn attaching_a_store_is_once_and_a_mirror_verb_needs_one() {
     let mut fx = Fixture::start();
 
     let mut plain = GnitzClient::connect(fx.server.sock_path()).unwrap();
-    let e = plain.mirror_view("s", "v_keyed").unwrap_err().to_string();
-    assert!(e.contains("mirrors nothing"), "a client with no store says so: {e}");
+    let e = plain.mirror_view("s", "v_keyed").unwrap_err();
+    assert!(
+        matches!(e, ClientError::NoMirrorStore),
+        "a client with no store says so: {e}"
+    );
 
     let held = fx.base_dir();
     let second_dir = tempfile::tempdir().unwrap();

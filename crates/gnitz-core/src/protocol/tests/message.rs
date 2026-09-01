@@ -160,11 +160,11 @@ fn test_message_roundtrip_empty() {
     let empty_batch = ZSetBatch::new(&schema);
     let (mut a, mut b) = make_transport_pair();
     send_push(&mut a, &schema, &empty_batch);
-    let msg = parse_response(&b.recv_framed().unwrap(), None).unwrap();
+    let (msg, data) = parse_response(&b.recv_framed().unwrap(), None).unwrap();
 
     // Schema was sent, data was not (empty batch)
     assert!(msg.schema.is_some());
-    assert!(msg.data_batch.is_none());
+    assert!(data.is_none());
 }
 
 #[test]
@@ -208,9 +208,9 @@ fn test_message_roundtrip_data() {
 
     let (mut a, mut b) = make_transport_pair();
     send_push(&mut a, &schema, &batch);
-    let msg = parse_response(&b.recv_framed().unwrap(), None).unwrap();
+    let (_, data) = parse_response(&b.recv_framed().unwrap(), None).unwrap();
 
-    let data = msg.data_batch.unwrap();
+    let data = data.unwrap();
     assert_eq!(data.pks.to_vec_u128(), pks);
     assert_eq!(data.weights, weights);
 
@@ -265,9 +265,9 @@ fn test_message_roundtrip_strings() {
 
     let (mut a, mut b) = make_transport_pair();
     send_push(&mut a, &schema, &batch);
-    let msg = parse_response(&b.recv_framed().unwrap(), None).unwrap();
+    let (_, data) = parse_response(&b.recv_framed().unwrap(), None).unwrap();
 
-    let data = msg.data_batch.unwrap();
+    let data = data.unwrap();
     assert_eq!(data.nulls, nulls);
 
     match &data.columns[1] {
@@ -285,9 +285,9 @@ fn test_message_no_schema_no_data() {
     // Control-only message (scan/alloc style)
     let (mut a, mut b) = make_transport_pair();
     send_control(&mut a, 0, 0, FLAG_PUSH, 0, 0, &[]).unwrap();
-    let msg = parse_response(&b.recv_framed().unwrap(), None).unwrap();
+    let (msg, data) = parse_response(&b.recv_framed().unwrap(), None).unwrap();
     assert!(msg.schema.is_none());
-    assert!(msg.data_batch.is_none());
+    assert!(data.is_none());
 }
 
 /// The control scalars a reply is read for must survive the socket.
@@ -305,7 +305,7 @@ fn test_message_recv_control_fields() {
         &[],
     )
     .unwrap();
-    let msg = parse_response(&b.recv_framed().unwrap(), None).unwrap();
+    let (msg, _) = parse_response(&b.recv_framed().unwrap(), None).unwrap();
     assert_eq!(msg.target_id, 0xDEAD_BEEF_1234_5678);
     assert_eq!(msg.seek_pk, seek_pk);
 }
@@ -320,7 +320,7 @@ fn test_message_error_response() {
     };
     let encoded = encode_control_block(&err_hdr, "something broke", &[]);
     a.send_framed(&encoded).unwrap();
-    let msg = parse_response(&b.recv_framed().unwrap(), None).unwrap();
+    let (msg, _) = parse_response(&b.recv_framed().unwrap(), None).unwrap();
     assert_eq!(msg.status, STATUS_ERROR);
     assert!(msg.error_text.is_some());
 }
@@ -332,11 +332,11 @@ fn test_encode_parse_control_only() {
     let seek_pk = 42u128 | (99u128 << 64);
     let payload =
         encode_message_parts(0xDEAD, 0xBEEF, FLAG_PUSH, &PkTuple::from_u128_narrow(seek_pk), 7, None).to_vec();
-    let msg = parse_response(&payload, None).unwrap();
+    let (msg, data) = parse_response(&payload, None).unwrap();
     assert_eq!(msg.target_id, 0xDEAD);
     assert_eq!(msg.seek_pk, seek_pk);
     assert!(msg.schema.is_none());
-    assert!(msg.data_batch.is_none());
+    assert!(data.is_none());
 }
 
 #[test]
@@ -361,10 +361,10 @@ fn test_encode_parse_with_data() {
     };
 
     let payload = encode_message_parts(42, 1, 0, &PkTuple::EMPTY, 0, Some((&schema, &batch))).to_vec();
-    let msg = parse_response(&payload, None).unwrap();
+    let (msg, data) = parse_response(&payload, None).unwrap();
     assert_eq!(msg.target_id, 42);
     assert!(msg.schema.is_some());
-    let data = msg.data_batch.unwrap();
+    let data = data.unwrap();
     assert_eq!(data.pks.to_vec_u128(), vec![1u128, 2u128, 3u128]);
     assert_eq!(data.weights, vec![1, 1, 1]);
 }
@@ -378,10 +378,10 @@ fn test_encode_parse_empty_batch() {
     let empty = ZSetBatch::new(&schema);
 
     let payload = encode_message_parts(10, 1, 0, &PkTuple::EMPTY, 0, Some((&schema, &empty))).to_vec();
-    let msg = parse_response(&payload, None).unwrap();
+    let (msg, data) = parse_response(&payload, None).unwrap();
     // Schema sent, but no data (empty batch)
     assert!(msg.schema.is_some());
-    assert!(msg.data_batch.is_none());
+    assert!(data.is_none());
 }
 
 /// A wide (stride 24) PK seek must split inside `encode_message_parts`: low
@@ -431,12 +431,12 @@ fn hint_only_frame_returns_data_schema_none() {
     a.send_framed_iov(&parts.segments()).unwrap();
 
     // Parse with a matching hint (same schema, version 1).
-    let msg = parse_response(&b.recv_framed().unwrap(), Some((&schema, 1))).unwrap();
+    let (msg, data) = parse_response(&b.recv_framed().unwrap(), Some((&schema, 1))).unwrap();
 
     // The hint was not physically in the frame.
     assert!(msg.schema.is_none(), "schema must be None for hint-only frame");
     // Data must still decode correctly.
-    let data = msg.data_batch.expect("data_batch must be Some");
+    let data = data.expect("the frame's data block must decode against the hint");
     assert_eq!(data.pks.to_vec_u128(), vec![1u128]);
     assert_eq!(data.weights, vec![1i64]);
 }

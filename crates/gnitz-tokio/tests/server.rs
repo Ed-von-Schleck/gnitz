@@ -208,6 +208,9 @@ fn one_writev_per_burst() {
         return;
     };
     let (_c, tid, _s, _sn) = table(srv.sock_path());
+    // Every push here is cold — the child connects fresh and never resolves — so
+    // 4 iovecs each, under the 256-frame cold-push writev quantum. A larger `n`,
+    // or a warm-cache or control-only burst, legitimately moves the count.
     let n = 200usize;
     let Some(counts) = strace_test(
         "syscall_count_child",

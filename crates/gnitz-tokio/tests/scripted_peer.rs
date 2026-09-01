@@ -150,3 +150,68 @@ fn dropping_every_handle_ends_the_connection() {
         "a quiesced connection with no handle left completes cleanly"
     );
 }
+
+/// The four mirror accessors are total: a handle that never attached answers as
+/// a store-less `GnitzClient` does rather than refusing.
+#[test]
+fn an_unattached_handle_answers_every_mirror_accessor() {
+    let (path, accepted) = scripted_peer();
+    let rt = Runtime::new().unwrap();
+    let (client, _conn) = rt
+        .block_on(gnitz_tokio::connect(path.0.to_str().unwrap()))
+        .expect("connect");
+    let _peer = accepted.join().unwrap();
+
+    rt.block_on(async {
+        assert!(
+            !client.mirrors(7).await.unwrap(),
+            "a handle with no store mirrors nothing"
+        );
+        assert!(
+            client.cursor_of(7).await.unwrap().is_none(),
+            "no copy means no round to report"
+        );
+        assert!(
+            client.mirrored_ids().await.unwrap().is_empty(),
+            "no copy means no registrations"
+        );
+        assert!(
+            client.mirror_poisoned().await.unwrap().is_none(),
+            "no copy means nothing poisoned"
+        );
+    });
+}
+
+/// `abort` must resolve a waiter whose request never reached the wire. The
+/// `Connection` is kept alive past its own completion — what a `select!` on
+/// `&mut conn` leaves — so nothing drops the channel receiver on its behalf.
+#[test]
+fn a_verb_submitted_after_the_connection_died_still_resolves() {
+    let (path, accepted) = scripted_peer();
+    let rt = Runtime::new().unwrap();
+    let (client, mut conn) = rt
+        .block_on(gnitz_tokio::connect(path.0.to_str().unwrap()))
+        .expect("connect");
+    // The peer's half closes, so the driver's first step reads EOF and aborts.
+    drop(accepted.join().unwrap());
+
+    let outstanding = rt.spawn({
+        let c = client.clone();
+        async move { c.scan(1).await }
+    });
+    let driven = rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), &mut conn).await });
+    assert!(
+        driven.expect("the driver reaches its failure").is_err(),
+        "the driver reports the peer's death"
+    );
+    assert!(
+        rt.block_on(outstanding).unwrap().is_err(),
+        "the outstanding verb resolves"
+    );
+
+    let late = rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), client.scan(2)).await });
+    match late {
+        Ok(r) => assert!(r.is_err(), "a verb submitted onto a dead connection must fail"),
+        Err(_) => panic!("a verb submitted after the driver aborted must resolve, not hang"),
+    }
+}

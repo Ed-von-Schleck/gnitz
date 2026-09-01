@@ -191,7 +191,7 @@ fn abandoned_slot_does_not_desync_and_close_abandons_every_slot() {
     assert_eq!(s.interest(), Interest::NONE);
     assert!(matches!(
         s.submit(Request::scan(tid)),
-        Err(gnitz_core::ClientError::ServerError(ref m)) if m == "connection closed"
+        Err(gnitz_core::ClientError::Closed)
     ));
 }
 
@@ -308,8 +308,5 @@ fn blocking_client_survives_server_restart_with_a_closed_verdict() {
     let t0 = std::time::Instant::now();
     assert!(client.scan(tid).is_err());
     assert!(t0.elapsed() < Duration::from_secs(5));
-    assert!(matches!(
-        client.scan(tid),
-        Err(gnitz_core::ClientError::ServerError(ref m)) if m == "connection closed"
-    ));
+    assert!(matches!(client.scan(tid), Err(gnitz_core::ClientError::Closed)));
 }
