@@ -7,11 +7,10 @@ members = [
     "gnitz-sql",
     "gnitz-tokio",
     "gnitz-py",
-    "gnitz-engine",
     "gnitz-store",
     "gnitz-mirror",
     "gnitz-server",
-    "gnitz-engine-testkit",
+    "gnitz-store-testkit",
     "gnitz-test-harness",
 ]
 

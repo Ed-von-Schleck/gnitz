@@ -462,7 +462,7 @@ pub(super) struct ShardIndex {
 impl ShardIndex {
     /// The tree's shape as counts: L0 shards, then each level's guards. What a
     /// test asserts a placement against, where `tree_report` is for reading —
-    /// outside the `cfg(test)` block above because `gnitz-engine`'s tests
+    /// outside the `cfg(test)` block above because `gnitz-server`'s tests
     /// reach it through [`Table::level_shape`], across the crate seam.
     pub(crate) fn level_shape(&self) -> (usize, Vec<usize>) {
         (self.l0.len(), self.levels.iter().map(|l| l.guards.len()).collect())

@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use gnitz_engine::catalog::CatalogEngine;
+use crate::catalog::CatalogEngine;
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder};
 use gnitz_wire::type_code;
@@ -12,7 +12,7 @@ use crate::runtime::w2m::W2mReceiver;
 
 /// PK U64 at index 0, one **nullable** payload U64 at index 1.
 pub(super) fn two_col_schema() -> SchemaDescriptor {
-    gnitz_engine_testkit::u64_pk_schema(SchemaColumn::new(type_code::U64, 1))
+    crate::test_support::u64_pk_schema(SchemaColumn::new(type_code::U64, 1))
 }
 
 /// Rows are `(pk, weight, payload)`; `None` writes a NULL payload cell.

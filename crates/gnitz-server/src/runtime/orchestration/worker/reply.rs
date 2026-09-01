@@ -74,7 +74,7 @@ impl WorkerProcess {
             // table's version does not describe it — reporting the table's would
             // let a version-suppression path drop a block the reader still needs.
             ReplySchema::OneOff(s) => {
-                let block = Rc::new(gnitz_engine::catalog::encode_schema_block(s, tid_key as u32));
+                let block = Rc::new(crate::catalog::encode_schema_block(s, tid_key as u32));
                 (Some(block), 0, s.has_german_string())
             }
             ReplySchema::Table(s) => {
@@ -528,7 +528,7 @@ pub(crate) fn send_unique_preflight_keys(
     keys: &mut gnitz_store::storage::KeyProducer,
 ) {
     debug_assert!(keys_per_frame > 0, "keys_per_frame must be positive");
-    let schema_block = gnitz_engine::catalog::encode_schema_block(frame_schema, target_id as u32);
+    let schema_block = crate::catalog::encode_schema_block(frame_schema, target_id as u32);
 
     // Reusable chunk batch: filled, encoded, and cleared per frame, sized up
     // front to exactly one frame's fill.

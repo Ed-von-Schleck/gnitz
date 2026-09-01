@@ -4,8 +4,9 @@
 //! This is the half a **client** links. A host holding a mirrored view drives
 //! `relation` and `read` directly and links neither the circuit compiler, the
 //! DBSP VM, epoch execution nor the system-table catalog — all of which live in
-//! `gnitz-engine`, which depends on this crate. The seam is the crate graph, not
-//! a comment: nothing here can name anything there.
+//! `gnitz-server`, the binary that depends on this crate. The seam is the crate
+//! graph, not a comment: nothing here can name anything there, and nothing links
+//! what is there.
 //!
 //! The seven public module roots below are the API, in the order of the layer
 //! ladder they form — each depends only on those beneath it, and all of them on
@@ -39,7 +40,7 @@ pub mod relation;
 pub mod schema;
 pub mod storage;
 
-// Public only because the seam needs it: `gnitz-engine`'s compiler and VM name
+// Public only because the seam needs it: `gnitz-server`'s compiler and VM name
 // `MapPlan` and its siblings, and `read` is on this side of the crate boundary
 // while they are not. A consumer that needs the expression *language* names
 // `gnitz-expr`, the crate.
@@ -53,10 +54,9 @@ mod test_rng;
 #[path = "tests/rungs.rs"]
 mod rung_tests;
 
-// `test_support::shared` is compiled here, as the whole of one half of
-// `gnitz-engine-testkit`, and again inside `gnitz-engine` — all from one source,
-// which spells every path `gnitz_store::`. This alias is what makes those paths
-// resolve in this crate.
+// `test_support::shared` is compiled here, as the whole of `gnitz-store-testkit`,
+// and again inside `gnitz-server` — all from one source, which spells every path
+// `gnitz_store::`. This alias is what makes those paths resolve in this crate.
 #[cfg(test)]
 extern crate self as gnitz_store;
 #[cfg(test)]

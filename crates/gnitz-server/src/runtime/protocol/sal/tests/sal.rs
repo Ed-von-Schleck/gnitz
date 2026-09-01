@@ -5,7 +5,7 @@ use super::{
 };
 use crate::runtime::m2w::{self, Wake};
 use crate::runtime::test_support::assert_child_exited_ok;
-use gnitz_engine_testkit::{make_batch_raw, sweep_bit_flips};
+use crate::test_support::{make_batch_raw, sweep_bit_flips};
 use gnitz_wire::align8;
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
 use gnitz_wire::MAX_WORKERS;
@@ -525,12 +525,12 @@ fn a_deferred_group_is_invisible_until_the_scope_publishes() {
 fn group_footprint_direct_equals_emitted_bytes() {
     use crate::runtime::sal::DirectGroup;
     use crate::runtime::wire::{WireData, WireMsg};
-    use gnitz_engine_testkit::{make_batch, make_schema_u64_i64};
+    use crate::test_support::{make_batch, make_schema_u64_i64};
 
     let nw = 4;
     let schema = make_schema_u64_i64();
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-    let block = gnitz_engine::catalog::encode_schema_block(&schema, 16);
+    let block = crate::catalog::encode_schema_block(&schema, 16);
 
     let log = TestLog::new(1 << 20, nw, 1);
 
@@ -763,7 +763,7 @@ fn the_live_path_parks_on_a_leftover_whose_prefix_epoch_was_raised() {
 #[test]
 fn the_live_path_aborts_on_a_damaged_header() {
     let name = "the_live_path_aborts_on_a_damaged_header_internal";
-    let out = gnitz_engine_testkit::run_test_in_child(module_path!(), name, &[]);
+    let out = crate::test_support::run_test_in_child(module_path!(), name, &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
@@ -782,7 +782,7 @@ fn the_live_path_aborts_on_a_damaged_header() {
 #[test]
 fn the_live_path_aborts_on_a_damaged_header_internal() {
     use crate::runtime::sal::SalReader;
-    if !gnitz_engine_testkit::in_child_test() {
+    if !crate::test_support::in_child_test() {
         return;
     }
     let log = TestLog::new(1 << 20, 1, 1);

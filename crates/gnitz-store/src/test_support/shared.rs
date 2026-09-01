@@ -1,9 +1,9 @@
-//! The store-level test helpers `gnitz-server`'s and `gnitz-engine`'s tests
+//! The store-level test helpers `gnitz-server`'s and `gnitz-mirror`'s tests
 //! share with this crate's own.
 //!
 //! **This file is compiled three times, from one source** — as a `cfg(test)`
-//! module here, as one of `gnitz-engine-testkit`'s two modules (which is how
-//! `gnitz-server`'s tests reach it), and through a `#[path]` in `gnitz-engine`'s
+//! module here, as the whole of `gnitz-store-testkit` (which is how
+//! `gnitz-mirror`'s tests reach it), and through a `#[path]` in `gnitz-server`'s
 //! own `test_support`. A copy per crate would be three independent Z-set batch
 //! builders free to drift on the one thing that fails with no error and no
 //! assertion — a batch whose layout claim or weights do not match what the
@@ -225,10 +225,10 @@ pub fn row_key(batch: &Batch, schema: &SchemaDescriptor, row: usize) -> RowKey {
     (batch.get_pk_bytes(row).to_vec(), vals)
 }
 
-// ── Helpers `gnitz-engine`'s own tests share ──────────────────────────────
+// ── Helpers `gnitz-server`'s own tests share ──────────────────────────────
 //
 // Here rather than in `internal` because their callers straddle the crate seam:
-// the VM and compiler tests over in `gnitz-engine` drive the same fixtures the
+// the VM and compiler tests over in `gnitz-server` drive the same fixtures the
 // storage tests here do.
 
 /// An all-PK schema: one column per type code in `types`, every column a PK

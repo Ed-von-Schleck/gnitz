@@ -1,9 +1,9 @@
+use crate::catalog::encode_schema_block;
 use crate::runtime::test_support::decode_continuation;
 use crate::runtime::wire::{
     decode_wire, decode_wire_ipc, peek_frame_control, validate_schema_match, WireData, WireMsg,
 };
-use gnitz_engine::catalog::encode_schema_block;
-use gnitz_engine_testkit::{make_batch, make_batch_raw, u64_pk_schema};
+use crate::test_support::{make_batch, make_batch_raw, u64_pk_schema};
 use gnitz_store::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, MAX_BATCH_REGIONS};
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
@@ -108,7 +108,7 @@ fn schema_roundtrip_wire_preserves_pk_order() {
     ];
     for &(cols, pk_indices) in cases {
         let original = SchemaDescriptor::new(cols, pk_indices);
-        let block = gnitz_engine::catalog::encode_schema_block(&original, 0);
+        let block = crate::catalog::encode_schema_block(&original, 0);
         let decoded = decode_schema_block(&block, true).unwrap();
         assert!(
             original == decoded,

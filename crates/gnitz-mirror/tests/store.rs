@@ -13,12 +13,12 @@ use std::sync::{Mutex, MutexGuard};
 use gnitz_core::{
     ColData, ColumnDef, DeltaCursor, Invalidate, MirrorStore, RawBlock, Schema, Shape, StoreRead, TypeCode,
 };
-use gnitz_engine_testkit::{
-    assert_child_ok, in_child_test, make_batch, make_schema_u64_i64, run_test_in_child, scratch_dir, CHILD_OK,
-};
 use gnitz_mirror::Mirror;
 use gnitz_store::schema::make_delta_schema;
 use gnitz_store::storage::Batch;
+use gnitz_store_testkit::{
+    assert_child_ok, in_child_test, make_batch, make_schema_u64_i64, run_test_in_child, scratch_dir, CHILD_OK,
+};
 
 /// Every test in this binary takes this lock: `cargo test` runs a target's tests
 /// as threads of one process, and a store open touches process-wide state — the

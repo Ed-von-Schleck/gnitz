@@ -4,7 +4,7 @@
 
 use crate::runtime::sal::GroupTargets;
 use crate::runtime::wire::{WireData, WireMsg};
-use gnitz_engine_testkit::{make_batch, make_schema_u64_i64, sweep_bit_flips};
+use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_store::schema::decode_schema_block;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
@@ -24,7 +24,7 @@ fn schema_block_4col() -> Vec<u8> {
         SchemaColumn::new(type_code::F64, 1),
     ];
     let schema = SchemaDescriptor::new(&cols, &[0]);
-    gnitz_engine::catalog::encode_schema_block(&schema, 7)
+    crate::catalog::encode_schema_block(&schema, 7)
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +139,7 @@ fn every_single_bit_flip_in_the_control_block_body_is_rejected() {
     // `write_group_direct` writes one into a SAL slot.
     let schema = make_schema_u64_i64();
     let batch = make_batch(&schema, &[(1, 1, 10)]);
-    let block = gnitz_engine::catalog::encode_schema_block(&schema, 7);
+    let block = crate::catalog::encode_schema_block(&schema, 7);
     let mut buf = WireMsg {
         target_id: 7,
         request_id: 0x1234_5678_9ABC_DEF0,

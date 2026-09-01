@@ -37,7 +37,7 @@ pub trait RowSource {
     /// evaluator's [`crate::Evaluator::filter`], the engine's N-way merge — so
     /// that a caller can never drive a view past its own end with a count it
     /// carried alongside. `#[inline(always)]` on every implementor: the per-row
-    /// and per-morsel callers live in gnitz-engine, at opt-level 0.
+    /// and per-morsel callers live in gnitz-server, at opt-level 0.
     fn row_count(&self) -> usize;
 }
 

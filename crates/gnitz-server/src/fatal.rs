@@ -1,10 +1,13 @@
 //! The fail-stop primitive and its macro.
 //!
-//! This lives in the server and not in `gnitz-engine` because the policy it
-//! encodes — end the process and let the watchdog restart it — is the server's
-//! contract, not the library's. A host that links the engine has no watchdog,
-//! so every fallible path below `runtime` returns its error and the decision to
-//! end the process is taken here, at the call sites that own the recovery.
+//! Reachable from `runtime` and from nothing below it. What enforces that is
+//! the declaration order in the crate root: this module is `#[macro_use]`d
+//! *after* `catalog` and `query`, and the attribute reaches only code that
+//! follows it, so `gnitz_fatal_abort!` is not in scope there. Every fallible
+//! path in those two rungs returns its error, and the decision to end the
+//! process is taken at the `runtime` call sites that own the recovery.
+//! `tests/rungs.rs` asserts the outcome, so a reorder of the crate root cannot
+//! silently un-make it.
 
 /// Terminate the process with exit code 134 (= 128 + SIGABRT) without running
 /// atexit handlers, TLS destructors or a stdio flush. Called by

@@ -49,7 +49,7 @@ impl WorkerProcess {
         // Unchecksummed: this frame goes out on the W2M ring, which the master
         // reads back through `decode_wire_ipc` — it verifies nothing, so an
         // XXH3 over the block would be computed and never read.
-        let schema_block = gnitz_engine::catalog::encode_schema_block_ipc(&schema, view_id as u32);
+        let schema_block = crate::catalog::encode_schema_block_ipc(&schema, view_id as u32);
         let msg = ipc::WireMsg {
             target_id: view_id as u64,
             flags: FLAG_EXCHANGE,

@@ -26,6 +26,10 @@ use crate::runtime::tls::{TlsListener, TlsShared};
 use gnitz_store::foundation::fault::Seam;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::catalog::{
+    family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates, CatalogEngine, SysFamily, FIRST_USER_TABLE_ID,
+    SEQ_TAB_ID,
+};
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
@@ -38,10 +42,6 @@ use crate::runtime::reactor::{
 };
 use crate::runtime::sal::{GroupTargets, SalFit, SalMessageKind};
 use crate::runtime::wire::{self as ipc, validate_schema_match, SchemaWithVersion, BACKFILL_DECISION_CONTINUE};
-use gnitz_engine::catalog::{
-    family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates, CatalogEngine, SysFamily, FIRST_USER_TABLE_ID,
-    SEQ_TAB_ID,
-};
 use gnitz_store::relation::RelationKind;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;

@@ -8,11 +8,11 @@
 //! of this module: they reach this subsystem's surface, not any one module's
 //! private items.
 
-// This module is the `runtime` rung, and this crate is nothing else: `main.rs`
-// parses argv and calls `server_main`. Everything below is therefore reachable
-// only from within this binary — `pub` on an item here publishes nothing, and
-// the visibility that carries meaning is the one on the engine side of the
-// seam, where `gnitz-engine` is a library.
+// This module is the `runtime` rung, the topmost of the crate's three: `main.rs`
+// parses argv and calls `server_main`. Nothing links this crate, so `pub` on an
+// item here publishes nothing outside the binary; the visibility that carries
+// meaning is `pub(in crate::catalog)` / `pub(in crate::query)` on the two rungs
+// below, which is what keeps a rung's internals out of the rung above it.
 //
 // The submodules are private `mod`, so cross-submodule refs resolve through
 // `crate::runtime::X::…` / `super::X::…` — descendants can name a private

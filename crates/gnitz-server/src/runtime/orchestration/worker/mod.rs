@@ -11,14 +11,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
+use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
+use crate::query::{DagEngine, ExchangeCallback};
 use crate::runtime::m2w::Wake;
 use crate::runtime::sal::{SalMessage, SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{
     self as ipc, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT, FLAG_SCAN_LAST,
 };
-use gnitz_engine::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
-use gnitz_engine::query::{DagEngine, ExchangeCallback};
 use gnitz_store::foundation::fault::Seam;
 use gnitz_store::relation::{IngestError, RelationRegistry};
 use gnitz_store::schema::key::PkBuf;

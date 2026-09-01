@@ -77,7 +77,7 @@ pub fn blob_extent(blob_len: usize, heap_offset: u64, length: usize) -> Option<s
 ///
 /// `#[inline(always)]`, not `#[inline]`: cross-crate inlining needs the
 /// attribute, and a plain hint is not honoured at opt-level 0 — where
-/// `german_string_content` is already a real call on gnitz-engine's per-row
+/// `german_string_content` is already a real call on gnitz-server's per-row
 /// comparator, so an unannotated callee would add a second call layer.
 #[inline(always)]
 pub fn german_string_inline(cell: &[u8]) -> Option<&[u8]> {

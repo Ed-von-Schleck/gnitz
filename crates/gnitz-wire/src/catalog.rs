@@ -633,7 +633,7 @@ pub const MAX_PK_BYTES: usize = MAX_PK_COLUMNS * 16;
 //                        counts are reserved for tests / malformed payloads)
 //        bits [4+7i..) : i-th column index, 7 bits each
 //
-// Both client (gnitz-core) and engine (gnitz-engine catalog) MUST share this
+// Both client (gnitz-core) and engine (gnitz-server catalog) MUST share this
 // encoder/decoder so they cannot drift on the encoding.
 // ---------------------------------------------------------------------------
 
@@ -916,7 +916,7 @@ impl PkKeyVals {
 
 // ---------------------------------------------------------------------------
 // TABLE_TAB.flags layout — the single source of truth shared by the gnitz-core
-// writer and the gnitz-engine reader, so the bit packing cannot drift.
+// writer and the gnitz-server reader, so the bit packing cannot drift.
 //
 //   bit 0        replicated (TABLE_FLAG_REPLICATED) — full copy on every worker
 //   bit 1        stream (TABLE_FLAG_STREAM) — storeless append-only ingestion point

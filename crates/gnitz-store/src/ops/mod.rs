@@ -9,7 +9,7 @@
 //!   - `cogroup` / `group_key` — the shared grouping and key machinery
 //!
 //! Every operator kernel is `pub`, because the VM that dispatches to them is in
-//! `gnitz-engine` — one crate up. What stays `pub(crate)` is the machinery no
+//! `gnitz-server` — one crate up. What stays `pub(crate)` is the machinery no
 //! instruction names: `cogroup`, `group_key`, and the `AdhocFold` the read rung
 //! drives.
 //!

@@ -3,7 +3,7 @@
 //! A PK region at rest holds **order-preserving big-endian** bytes: for every
 //! pair of encoded keys `memcmp(a, b)` equals the typed lexicographic
 //! comparison of the PK columns. Both the client write path (`gnitz-core`) and
-//! the server read path (`gnitz-engine`) encode/decode through these functions,
+//! the server read path (`gnitz-server`) encode/decode through these functions,
 //! so the primitive lives here in `gnitz-wire`, the crate both depend on.
 //!
 //! All PK columns are fixed-width integer scalars (floats/strings/blobs are

@@ -2,7 +2,7 @@
 //! row, and the canonical `u128` keys derived from it.
 //!
 //! Every method here is `#[inline(always)]`: the per-row callers live in
-//! gnitz-engine, which builds at opt-level 0 in dev, where only the
+//! gnitz-server, which builds at opt-level 0 in dev, where only the
 //! always-inline pass runs.
 
 use std::cmp::Ordering;

@@ -68,7 +68,7 @@ impl WireSchema {
     pub(crate) fn encoded(tid: i64, descriptor: SchemaDescriptor) -> Self {
         WireSchema {
             tid,
-            block: Rc::new(gnitz_engine::catalog::encode_schema_block(&descriptor, tid as u32)),
+            block: Rc::new(crate::catalog::encode_schema_block(&descriptor, tid as u32)),
             descriptor,
         }
     }
@@ -76,7 +76,7 @@ impl WireSchema {
     /// `tid`'s catalog entry: the cached *named* block, built from `descriptor`
     /// by the one call below and reused until DDL invalidates it.
     pub(crate) fn from_catalog(
-        cat: &mut gnitz_engine::catalog::CatalogEngine,
+        cat: &mut crate::catalog::CatalogEngine,
         tid: i64,
         descriptor: SchemaDescriptor,
     ) -> Self {

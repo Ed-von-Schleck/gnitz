@@ -16,11 +16,12 @@ use std::rc::Rc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use gnitz_engine::catalog::CatalogEngine;
+use crate::catalog::CatalogEngine;
 use gnitz_store::schema::{IndexKeySpec, SchemaDescriptor};
 use gnitz_wire::{payload_native_key, pk_native_key};
 use gnitz_wire::{PkColList, SpecBytes};
 
+use crate::query::RelayRoute;
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{AsyncMutex, ScanLease};
 use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalFit, SalMessageKind, SalWriter, ZoneMark};
@@ -30,7 +31,6 @@ use crate::runtime::wire::{
     BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP, FLAG_SCAN_LAST,
 };
 use exchange::PendingRelay;
-use gnitz_engine::query::RelayRoute;
 use gnitz_store::ops::{op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode};
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::storage::Batch;

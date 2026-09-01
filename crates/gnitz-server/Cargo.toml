@@ -8,7 +8,6 @@ name = "gnitz-server"
 path = "src/main.rs"
 
 [dependencies]
-gnitz-engine = { path = "../gnitz-engine" }
 gnitz-store  = { path = "../gnitz-store" }
 gnitz-wire   = { path = "../gnitz-wire" }
 gnitz-expr   = { path = "../gnitz-expr" }
@@ -22,7 +21,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [dev-dependencies]
-gnitz-engine-testkit = { path = "../gnitz-engine-testkit" }
+# Dev-only, and deliberately not a real dependency: the schema-codec suite
+# asserts the catalog's block encoder against the *client's*, which is the one
+# thing on the far side of the wire this crate must agree with byte for byte.
+gnitz-core = { path = "../gnitz-core" }
+proptest = "1"
 tempfile = "3"
 
 [lints.rust]

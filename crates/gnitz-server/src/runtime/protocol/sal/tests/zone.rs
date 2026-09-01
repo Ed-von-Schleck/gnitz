@@ -3,7 +3,7 @@ use crate::runtime::master::scatter::{with_commit_indices, with_group};
 use crate::runtime::sal::fixtures::{group_at, TestLog};
 use crate::runtime::sal::{group_header_size, GroupTargets};
 use crate::runtime::wire::WireMsg;
-use gnitz_engine_testkit::{make_batch, make_schema_u64_i64, sweep_bit_flips};
+use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 
 const SIZE: usize = 1 << 20;
 const NW: usize = 4;

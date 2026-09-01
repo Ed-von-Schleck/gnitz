@@ -18,11 +18,11 @@
 mod support;
 
 use gnitz_core::{ClientError, GnitzClient, MirrorError, PollResult, Schema, ZSetBatch};
-use gnitz_engine_testkit::{assert_child_ok, run_test_in_child, CHILD_OK};
 use gnitz_mirror::Mirror;
 use gnitz_sql::SqlPlanner;
 use gnitz_store::relation::{relation_dir, RelationKind};
 use gnitz_store::storage::ChildAddr;
+use gnitz_store_testkit::{assert_child_ok, run_test_in_child, CHILD_OK};
 use gnitz_test_harness::ServerHandle;
 use support::{assert_same_sequence, assert_same_zset, canonical, query, serial, sql, EnvVar};
 

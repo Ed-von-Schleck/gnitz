@@ -6,7 +6,7 @@
 //! symbols, but they are what put `read` above `ops`.
 //!
 //! Nothing here reaches a `CatalogEngine` or a `DagEngine`: those are in
-//! `gnitz-engine`, which depends on this crate, so the direction is the crate
+//! `gnitz-server`, which depends on this crate, so the direction is the crate
 //! graph's. Recomputing a capacity-bounded view's skeleton row does need the
 //! view's compiled program, and that one edge is injected as
 //! [`SkeletonHydrator`] rather than reached — a host that maintains no circuit

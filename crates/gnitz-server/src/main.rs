@@ -1,3 +1,21 @@
+//! GnitzDB's server binary: the DBSP layer — the circuit compiler, the bytecode
+//! VM, epoch execution and the system-table catalog — plus the process model,
+//! wire protocol and reactor that drive it.
+//!
+//! The Z-set store beneath it — the columnar batch representation, the LSM, the
+//! operators, the relation registry and the `ReadSpec` executor — is
+//! `gnitz-store`, a separate crate this one depends on. That split is what makes
+//! "a client links no compiler, no VM and no catalog" a fact of the crate graph
+//! rather than a convention: a host holding a mirrored view links `gnitz-store`
+//! alone, and nothing in this crate is linkable at all.
+//!
+//! The three module roots below are the layer ladder: `runtime` over `catalog`
+//! over `query` over everything `gnitz-store` publishes. The submodules under
+//! each root are private; what a root re-exports is what it publishes to the
+//! rungs above it, scoped `pub(in crate::<root>)` when it publishes to none.
+//! There is no crate-root re-export façade: a type's rung is part of what its
+//! path says.
+//!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
@@ -5,13 +23,21 @@
 #[cfg(not(target_endian = "little"))]
 compile_error!("GnitzDB requires a little-endian target; the wire format is LE-only.");
 
-// Above `mod runtime;`: `#[macro_use]` reaches only code that follows the item,
-// and the 73 `gnitz_warn!`-family invocations under `runtime/` are unqualified.
+// FIRST, and before any module: `#[macro_use]` reaches only code that follows
+// it, and it is what puts `gnitz_warn!` and its siblings — defined in
+// `gnitz-store` — into textual scope for the rest of this crate.
 #[macro_use]
 extern crate gnitz_store;
 
-// Before `mod runtime;` for the same reason: `gnitz_fatal_abort!` is invoked
-// unqualified throughout it.
+// Declared *above* `#[macro_use] mod fatal;`, and that ordering is the whole
+// enforcement: `gnitz_fatal_abort!` is not in scope for anything before it, so
+// nothing under `catalog/` or `query/` can end the calling process. Every
+// fallible path there returns its error instead. `tests/rungs.rs` asserts it.
+mod catalog;
+mod query;
+
+// Before `mod runtime;`: `#[macro_use]` reaches only code that follows the
+// item, and `gnitz_fatal_abort!` is invoked unqualified throughout it.
 #[macro_use]
 mod fatal;
 
@@ -206,6 +232,15 @@ fn main() {
     let rc = runtime::server_main(&data_dir, &socket_path, num_workers, level, tls_cli);
     process::exit(rc);
 }
+
+#[cfg(test)]
+mod test_support;
+
+/// Tests no single module owns: the rung guard over `catalog/`, `query/` and
+/// `runtime/`.
+#[cfg(test)]
+#[path = "tests/rungs.rs"]
+mod rung_tests;
 
 #[cfg(test)]
 #[path = "tests/main.rs"]

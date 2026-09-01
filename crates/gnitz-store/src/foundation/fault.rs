@@ -10,7 +10,7 @@
 //!
 //! Which build decides is *this* crate's: the `cfg!(debug_assertions)` below is
 //! evaluated in `gnitz-store`'s compilation unit, while most `Seam` declarations
-//! live in `gnitz-server` and `gnitz-engine`. The three profiles agree in this
+//! live in `gnitz-server`. The three profiles agree in this
 //! workspace, so a debug server arms its seams — but a profile that optimized
 //! only the store would disarm every one of them, with no diagnostic.
 

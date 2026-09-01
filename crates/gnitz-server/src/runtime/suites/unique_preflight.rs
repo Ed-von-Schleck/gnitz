@@ -11,7 +11,7 @@ use crate::runtime::w2m::fixtures::make_ring;
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
 use crate::runtime::wire::{self, unique_preflight_wire_schema, SchemaWithVersion, FLAG_SCAN_LAST};
 use crate::runtime::worker::send_unique_preflight_keys;
-use gnitz_engine_testkit::pk_only_schema;
+use crate::test_support::pk_only_schema;
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::make_index_schema;
 use gnitz_store::schema::{IndexKeySpec, SchemaColumn, SchemaDescriptor};

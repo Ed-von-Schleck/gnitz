@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_engine_testkit::{make_batch_raw, make_schema_u64_i64};
+use crate::test_support::{make_batch_raw, make_schema_u64_i64};
 
 /// A batch whose rows carry `weights`, one distinct PK each.
 fn weighted(weights: &[i64]) -> Batch {

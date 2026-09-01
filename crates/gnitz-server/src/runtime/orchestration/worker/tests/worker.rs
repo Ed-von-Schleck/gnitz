@@ -1,8 +1,8 @@
 use super::*;
+use crate::catalog::PUBLIC_SCHEMA_ID;
 use crate::runtime::test_support::decode_continuation;
 use crate::runtime::w2m::{self, W2mReceiver};
-use gnitz_engine::catalog::PUBLIC_SCHEMA_ID;
-use gnitz_engine_testkit::{col_def, make_batch_raw, make_schema_u64_i64, u64_pk_schema, CatalogTestExt};
+use crate::test_support::{col_def, make_batch_raw, make_schema_u64_i64, u64_pk_schema};
 use gnitz_store::schema::SchemaColumn;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_wire::type_code;
@@ -196,7 +196,7 @@ fn delta_read_defers_inside_exchange_with_its_whole_request() {
 fn encode_relay_frame(target_id: u64, source_id: u128, schema: &SchemaDescriptor) -> &'static [u8] {
     // No data batch — a header-only relay. `seek_pk` echoes the source_id the
     // waiter matches on; `seek_col_idx` 0 is BACKFILL_DECISION_CONTINUE.
-    let block = gnitz_engine::catalog::encode_schema_block(schema, target_id as u32);
+    let block = crate::catalog::encode_schema_block(schema, target_id as u32);
     let msg = ipc::WireMsg {
         target_id,
         seek_pk: source_id,
@@ -209,7 +209,7 @@ fn encode_relay_frame(target_id: u64, source_id: u128, schema: &SchemaDescriptor
 /// Encode a wire frame carrying `batch` under `schema`. Leaked to `'static`
 /// for `dispatch`, which takes its payload from the SAL mapping.
 fn encode_data_frame(target_id: u64, schema: &SchemaDescriptor, batch: &Batch) -> &'static [u8] {
-    let block = gnitz_engine::catalog::encode_schema_block(schema, target_id as u32);
+    let block = crate::catalog::encode_schema_block(schema, target_id as u32);
     let msg = ipc::WireMsg {
         target_id,
         schema_block: Some(&block),
@@ -399,7 +399,7 @@ fn train_frames_fill_the_budget_to_within_one_row() {
         ("8-aligned", make_n_row_batch(make_schema_u64_i64(), 40)),
         ("padded", make_n_row_batch(padded_schema(), 40)),
     ] {
-        let block = Rc::new(gnitz_engine::catalog::encode_schema_block(&batch.schema, 1));
+        let block = Rc::new(crate::catalog::encode_schema_block(&batch.schema, 1));
         let per_row = batch.wire_byte_size_range(2) - batch.wire_byte_size_range(1);
         // Room for four rows beside the schema block on the first frame.
         let budget = range_size(&batch, 4, Some(block.as_slice()));
@@ -503,10 +503,10 @@ fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
 /// TEXT dimension table hits.
 #[test]
 fn force_fifo_queues_a_whole_blob_reply() {
-    let dir = gnitz_engine_testkit::scratch_dir("worker", "force_fifo_text");
+    let dir = crate::test_support::scratch_dir("worker", "force_fifo_text");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("s", type_code::STRING)];
-    let tid = gnitz_engine::catalog::FIRST_USER_TABLE_ID;
+    let tid = crate::catalog::FIRST_USER_TABLE_ID;
     engine
         .register_table(tid, PUBLIC_SCHEMA_ID, "tfifo", &cols, &[0])
         .unwrap();
@@ -579,8 +579,8 @@ fn pending_streams_drain_two_trains_fifo() {
     );
     let batch_a = make_n_row_batch(schema_a, 10);
     let batch_b = make_n_row_batch(schema_b, 5);
-    let block_a = Rc::new(gnitz_engine::catalog::encode_schema_block(&schema_a, 1));
-    let block_b = Rc::new(gnitz_engine::catalog::encode_schema_block(&schema_b, 2));
+    let block_a = Rc::new(crate::catalog::encode_schema_block(&schema_a, 1));
+    let block_b = Rc::new(crate::catalog::encode_schema_block(&schema_b, 2));
 
     // Budget: exactly the first chunk's size at 4 rows (A's schema block
     // included), so train A's 10 rows span at least two frames.
@@ -743,10 +743,10 @@ fn an_oversized_stream_batch_enqueues_a_train() {
 /// variable-width streaming chunker is an explicit non-goal.
 #[test]
 fn an_oversized_string_batch_cannot_be_chunked() {
-    let dir = gnitz_engine_testkit::scratch_dir("worker", "string_oversized");
+    let dir = crate::test_support::scratch_dir("worker", "string_oversized");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("s", type_code::STRING)];
-    let tid = gnitz_engine::catalog::FIRST_USER_TABLE_ID;
+    let tid = crate::catalog::FIRST_USER_TABLE_ID;
     engine
         .register_table(tid, PUBLIC_SCHEMA_ID, "tstr", &cols, &[0])
         .unwrap();
@@ -777,14 +777,14 @@ fn an_oversized_string_batch_cannot_be_chunked() {
 /// table reply would be decoded with the projected stride).
 #[test]
 fn a_projected_stream_batch_carries_a_one_off_block() {
-    let dir = gnitz_engine_testkit::scratch_dir("worker", "projected_one_off");
+    let dir = crate::test_support::scratch_dir("worker", "projected_one_off");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![
         col_def("id", type_code::U64),
         col_def("a", type_code::U64),
         col_def("b", type_code::U64),
     ];
-    let tid = gnitz_engine::catalog::FIRST_USER_TABLE_ID;
+    let tid = crate::catalog::FIRST_USER_TABLE_ID;
     engine
         .register_table(tid, PUBLIC_SCHEMA_ID, "tproj", &cols, &[0])
         .unwrap();
@@ -816,7 +816,7 @@ fn a_projected_stream_batch_carries_a_one_off_block() {
         .stream_batch_response(tid as u64, Some(big), ReplySchema::OneOff(&projected), 6, 0, 0)
         .is_ok());
     assert_eq!(wp.pending_streams.len(), 1);
-    let expected_block = gnitz_engine::catalog::encode_schema_block(&projected, tid as u32);
+    let expected_block = crate::catalog::encode_schema_block(&projected, tid as u32);
     let ps = wp.pending_streams.front().unwrap();
     assert!(
         matches!(ps.kind, PendingScanKind::Chunked { .. }),

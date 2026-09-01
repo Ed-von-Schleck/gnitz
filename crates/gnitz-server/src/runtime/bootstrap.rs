@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use gnitz_engine::catalog::CatalogEngine;
+use crate::catalog::CatalogEngine;
 use gnitz_store::foundation::fault::Seam;
 use gnitz_store::foundation::posix_io;
 

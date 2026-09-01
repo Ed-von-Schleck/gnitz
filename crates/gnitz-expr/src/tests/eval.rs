@@ -22,7 +22,7 @@ fn passes(ev: &Evaluator, mb: &TestView, row: usize) -> bool {
 /// The map-side surface an engine consumer reads a resolved program through:
 /// which columns are copied verbatim, which are written out of the register
 /// file, and which output slots admit NULL. Every one of these is read by
-/// `gnitz-engine`'s columnar map, so a wrong answer here is a wrong output
+/// `gnitz-server`'s columnar map, so a wrong answer here is a wrong output
 /// column there — but none of them is visible through the three drive methods
 /// the rest of this file exercises.
 #[test]

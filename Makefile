@@ -47,8 +47,8 @@ help: ## Show this help
 test: server ## Run all Rust workspace tests incl. gnitz-sql/gnitz-core integration (gnitz-py excluded — pyo3 extension can't link a test harness)
 	cd crates && cargo test --workspace --exclude gnitz-py --features gnitz-sql/integration --features gnitz-core/integration --features gnitz-tokio/integration $(T)
 
-rust-engine-test: ## Run only the gnitz-store + gnitz-engine + gnitz-server tests (faster inner loop)
-	cd crates && cargo test -p gnitz-store -p gnitz-engine -p gnitz-server $(T)
+rust-engine-test: ## Run only the gnitz-store + gnitz-server tests (faster inner loop)
+	cd crates && cargo test -p gnitz-store -p gnitz-server $(T)
 
 fmt: ## Format the whole workspace
 	cd crates && cargo fmt --all

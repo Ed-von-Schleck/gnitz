@@ -1,5 +1,5 @@
 use super::super::fixtures::test_dispatcher;
-use gnitz_engine::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_TAB_ID};
+use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_TAB_ID};
 use gnitz_store::foundation::posix_io::retry_eintr;
 
 /// Fork a child that exits immediately and block until it is a zombie *without*

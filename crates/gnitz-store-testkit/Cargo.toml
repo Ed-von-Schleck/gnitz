@@ -1,0 +1,18 @@
+[package]
+name = "gnitz-store-testkit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gnitz-store  = { path = "../gnitz-store" }
+gnitz-wire   = { path = "../gnitz-wire" }
+# A normal dependency, not a dev one: the shared file this crate compiles builds
+# its strategies with it, and `arb_type_code` returns `impl Strategy` in a
+# published signature.
+proptest = "1"
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

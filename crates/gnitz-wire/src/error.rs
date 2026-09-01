@@ -1,7 +1,7 @@
 //! Error type for the low-level WAL-block codec (`wal`).
 //!
 //! The codec is the one framer both the client (`gnitz-core`) and the engine
-//! (`gnitz-engine`) run, so its error type lives here rather than in either
+//! (`gnitz-server`) run, so its error type lives here rather than in either
 //! side's private error enum. The `Display` wording matches the engine's
 //! `StorageError` (whose framer variants this replaces) so log lines and
 //! substring asserts read identically across the split.

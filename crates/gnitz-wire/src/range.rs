@@ -3,7 +3,7 @@
 // a `ReadSpec` PK / index bound, the circuit `ScanBound`, and the engine's
 // bounded index walks all carry one.
 //
-// Both client (gnitz-core) and engine (gnitz-engine) MUST share this
+// Both client (gnitz-core) and engine (gnitz-server) MUST share this
 // encoder/decoder so they cannot drift on the encoding — the same rule
 // `pack_pk_cols`/`unpack_pk_cols` follow for the column list the descriptor
 // travels with.

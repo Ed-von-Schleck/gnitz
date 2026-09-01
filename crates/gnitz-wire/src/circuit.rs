@@ -1,5 +1,5 @@
 //! Circuit-layer wire definitions: operator opcodes, ports, aggregate IDs, and
-//! the typed `OpNode` representation shared between gnitz-core and gnitz-engine.
+//! the typed `OpNode` representation shared between gnitz-core and gnitz-server.
 
 // ---------------------------------------------------------------------------
 // Circuit opcodes
@@ -97,7 +97,7 @@ pub const AGG_COUNT_NON_NULL: u64 = 5;
 pub const AGG_SUM_ZERO: u64 = 6;
 
 // ---------------------------------------------------------------------------
-// Typed circuit-node representation (shared between gnitz-core and gnitz-engine)
+// Typed circuit-node representation (shared between gnitz-core and gnitz-server)
 // ---------------------------------------------------------------------------
 
 wire_enum! {

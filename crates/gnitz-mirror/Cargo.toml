@@ -9,11 +9,7 @@ gnitz-store  = { path = "../gnitz-store" }
 gnitz-wire   = { path = "../gnitz-wire" }
 
 [dev-dependencies]
-# Dev-only, and deliberately not a real dependency: the schema-codec test asserts
-# the client's block encoder against the *server's* catalog encoder, which is the
-# one thing on the far side of the crate seam this crate must agree with.
-gnitz-engine = { path = "../gnitz-engine" }
-gnitz-engine-testkit = { path = "../gnitz-engine-testkit" }
+gnitz-store-testkit = { path = "../gnitz-store-testkit" }
 gnitz-sql = { path = "../gnitz-sql" }
 gnitz-test-harness = { path = "../gnitz-test-harness" }
 libc = "0.2"

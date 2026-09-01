@@ -8,7 +8,7 @@
 //! re-applies an interval the copies already hold: the row set stays identical
 //! and every weight in it doubles.
 
-use gnitz_engine_testkit::scratch_dir;
+use gnitz_store_testkit::scratch_dir;
 
 use super::*;
 
@@ -82,7 +82,7 @@ fn a_flip_in_a_fence_word_or_a_length_is_refused() {
     // Magic, topology and count in the header; then the record's block, schema
     // and name lengths.
     for span in [0..4, 16..32, HEADER_LEN + 28..HEADER_LEN + RECORD_PREFIX_LEN] {
-        gnitz_engine_testkit::sweep_bit_flips(&mut buf, span, |byte, bit, damaged| {
+        gnitz_store_testkit::sweep_bit_flips(&mut buf, span, |byte, bit, damaged| {
             assert!(
                 reread(&dir, damaged).is_none(),
                 "a flip of bit {bit} in byte {byte} was read back as a usable state",

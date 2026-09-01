@@ -14,7 +14,7 @@
 use super::*;
 
 use super::unique_filter::{UniqueFilter, UNIQUE_FILTER_CAP};
-use gnitz_engine::catalog::FkEdge;
+use crate::catalog::FkEdge;
 use gnitz_store::storage::MemBatch;
 
 // ---------------------------------------------------------------------------

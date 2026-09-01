@@ -489,7 +489,7 @@ impl Batch {
     /// every page of what is routinely a 256 MiB arena.
     ///
     /// Every caller is a test. It carries no `#[cfg(test)]` because the test
-    /// helpers also compile inside `gnitz-engine` and as `gnitz-engine-testkit`,
+    /// helpers also compile inside `gnitz-server` and as `gnitz-store-testkit`,
     /// ordinary dependent crates, which see only what this library publishes.
     pub fn zeroed(schema: SchemaDescriptor, rows: usize) -> Self {
         let (strides, nr) = strides_from_schema(&schema);
