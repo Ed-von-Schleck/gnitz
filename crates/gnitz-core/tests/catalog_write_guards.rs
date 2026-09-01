@@ -69,6 +69,28 @@ fn two_columns_as(owner_id: u64, owner_kind: u64) -> ZSetBatch {
     b
 }
 
+/// One IDX_TAB batch of `(index_id, weight)` rows, all naming `owner_id`'s
+/// column 1.
+fn index_rows(owner_id: u64, rows: &[(u64, i64)]) -> ZSetBatch {
+    let s = sys_schema(IDX_TAB);
+    let mut b = ZSetBatch::new(s);
+    let mut a = BatchAppender::new(&mut b, s);
+    for &(index_id, weight) in rows {
+        write_idx_tab_row(
+            &mut a,
+            &IdxTabRow {
+                index_id,
+                owner_id,
+                source_col_idx: gnitz_wire::pack_pk_cols(&[1]),
+                name: "ix",
+                is_unique: 0,
+            },
+            weight,
+        );
+    }
+    b
+}
+
 /// A `(schema, table)` under a fresh schema, through the ordinary client path.
 fn a_table(client: &mut GnitzClient, schema: &str) -> u64 {
     client.create_schema(schema).unwrap();
@@ -478,4 +500,90 @@ fn two_schema_rows_sharing_a_name_in_one_bundle_are_refused() {
     let err = format!("{:?}", s.push_ddl_txn(&[(SCHEMA_TAB, batch)]).unwrap_err());
     assert!(err.contains("Schema already exists"), "{err}");
     assert!(s.push_ddl_txn(&[(SCHEMA_TAB, schema_row(a, "twice"))]).is_ok());
+}
+
+/// The per-PK shape rules, each on a family whose declared facts make it the one
+/// that fires. None of these is expressible by any legitimate emitter.
+#[test]
+fn the_per_pk_shape_rules_reject_what_no_emitter_writes() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
+    let tid = a_table(&mut client, "shapes");
+    let mut s = session(&srv);
+
+    // A row above ±1: `retract_pk_list` emits a hard `-1`, so a row left at 2 is
+    // under-retracted and becomes a permanent live ghost.
+    let sid = s.alloc_schema_id().unwrap();
+    let sc = sys_schema(SCHEMA_TAB);
+    let mut heavy = ZSetBatch::new(sc);
+    write_schema_tab_row(
+        &mut BatchAppender::new(&mut heavy, sc),
+        &SchemaTabRow {
+            schema_id: sid,
+            name: "heavy",
+        },
+        2,
+    );
+    let err = format!("{:?}", s.push_ddl_txn(&[(SCHEMA_TAB, heavy)]).unwrap_err());
+    assert!(err.contains("at weight 2"), "{err}");
+
+    // Neither SCHEMA_TAB nor IDX_TAB has a rename surface, so neither admits a
+    // rewrite pair on one PK.
+    let mut pair = ZSetBatch::new(sc);
+    let mut app = BatchAppender::new(&mut pair, sc);
+    for w in [-1, 1] {
+        write_schema_tab_row(
+            &mut app,
+            &SchemaTabRow {
+                schema_id: sid,
+                name: "p",
+            },
+            w,
+        );
+    }
+    let err = format!("{:?}", s.push_ddl_txn(&[(SCHEMA_TAB, pair)]).unwrap_err());
+    assert!(err.contains("more than one row for schema"), "{err}");
+
+    let iid = s.alloc_index_id().unwrap();
+    let err = format!(
+        "{:?}",
+        s.push_ddl_txn(&[(IDX_TAB, index_rows(tid, &[(iid, -1), (iid, 1)]))])
+            .unwrap_err()
+    );
+    assert!(err.contains("more than one row for index"), "{err}");
+
+    // TABLE_TAB does admit a pair, so its rule is one row per *sign*.
+    let dup = s.alloc_table_id().unwrap();
+    let tt = sys_schema(TABLE_TAB);
+    let mut twice = ZSetBatch::new(tt);
+    let mut app = BatchAppender::new(&mut twice, tt);
+    for name in ["one", "two"] {
+        write_table_tab_row(
+            &mut app,
+            &TableTabRow {
+                table_id: dup,
+                schema_id: 2,
+                name,
+                pk_col_idx: gnitz_wire::pack_pk_cols(&[0]),
+                flags: TableProps::default().pack(),
+            },
+            1,
+        );
+    }
+    let err = format!(
+        "{:?}",
+        s.push_ddl_txn(&[(COL_TAB, two_columns(dup)), (TABLE_TAB, twice)])
+            .unwrap_err()
+    );
+    assert!(err.contains("more than one row for table"), "{err}");
+
+    // `hook_index_register` raises the index-id counter off the ingested row, on
+    // the live path and again on boot replay, and the index allocator carries no
+    // assertion — so a crafted id durably poisons the counter.
+    let err = format!(
+        "{:?}",
+        s.push_ddl_txn(&[(IDX_TAB, index_rows(tid, &[(gnitz_wire::RELATION_ID_CEILING, 1)]))])
+            .unwrap_err()
+    );
+    assert!(err.contains("id ceiling"), "{err}");
 }

@@ -557,8 +557,9 @@ fn test_drop_schema_id_colliding_with_dependent_table_id_ok() {
 /// the id straight off the ingested row and `raise_id_counter` it, and that id is
 /// caller-chosen (a client may preset `circuit.view_id`). The ceiling is a
 /// conservative tripwire held safely short of the u32 physical contract every id
-/// narrows to (see `RELATION_ID_CEILING`). Both families whose PK is a
-/// the registry id must reject it. (Index ids are a disjoint namespace.)
+/// narrows to (see `RELATION_ID_CEILING`). Both families whose PK is a registry
+/// id must reject it. (Index ids are a disjoint namespace that borrows the same
+/// bound for want of one of its own.)
 #[test]
 fn precheck_rejects_relation_id_at_or_above_ceiling() {
     let dir = temp_dir("relation_id_ceiling_reject");
@@ -572,19 +573,13 @@ fn precheck_rejects_relation_id_at_or_above_ceiling() {
         let err = engine
             .precheck_family(SysFamily::Table, &table_batch)
             .expect_err(&format!("TABLE_TAB id at/above the ceiling must be rejected ({label})"));
-        assert!(
-            err.contains("relation-id ceiling"),
-            "error must name the cause, got: {err}"
-        );
+        assert!(err.contains("id ceiling"), "error must name the cause, got: {err}");
 
         let view_batch = build_view_tab_row(tid, "bandedview", "SELECT 1");
         let err = engine
             .precheck_family(SysFamily::View, &view_batch)
             .expect_err(&format!("VIEW_TAB id at/above the ceiling must be rejected ({label})"));
-        assert!(
-            err.contains("relation-id ceiling"),
-            "error must name the cause, got: {err}"
-        );
+        assert!(err.contains("id ceiling"), "error must name the cause, got: {err}");
     }
 
     // A ceiling, not a blanket ban: an ordinary durable id below it still passes
@@ -595,7 +590,7 @@ fn precheck_rejects_relation_id_at_or_above_ceiling() {
         .err()
         .unwrap_or_default();
     assert!(
-        !err.contains("relation-id ceiling"),
+        !err.contains("id ceiling"),
         "an id below the ceiling must not trip the ceiling guard, got: {err}"
     );
 }

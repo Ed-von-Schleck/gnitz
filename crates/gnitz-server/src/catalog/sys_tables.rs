@@ -669,6 +669,57 @@ impl SysFamily {
         TOPO_PRIORITY[self.index()]
     }
 
+    /// The lowest id a client may write in this family's id space; everything
+    /// below is bootstrap-owned. Column's floor is on the *packed* word, since
+    /// that is what its PK is. `None` where the PK is no id space at all.
+    pub(super) fn first_user_id(self) -> Option<i64> {
+        match self {
+            SysFamily::Schema => Some(FIRST_USER_SCHEMA_ID),
+            SysFamily::Table | SysFamily::View => Some(FIRST_USER_TABLE_ID),
+            SysFamily::Column => Some(pack_column_id(FIRST_USER_TABLE_ID, 0) as i64),
+            SysFamily::Index => Some(FIRST_USER_INDEX_ID),
+            SysFamily::Sequence => Some(FIRST_USER_TABLE_ID),
+            SysFamily::CircuitNodes | SysFamily::CircuitEdges | SysFamily::CircuitNodeColumns => None,
+        }
+    }
+
+    /// The exclusive upper bound on an id a client may write. Index shares the
+    /// relation ceiling although its ids are a separate space: it needs *a*
+    /// bound, because `hook_index_register` raises the index-id counter off the
+    /// ingested row and `allocate_index_ids` carries no assertion — and a second
+    /// near-duplicate constant would only invite the two to drift.
+    pub(super) fn id_ceiling(self) -> Option<i64> {
+        match self {
+            SysFamily::Table | SysFamily::View | SysFamily::Index => Some(RELATION_ID_CEILING),
+            SysFamily::Schema
+            | SysFamily::Column
+            | SysFamily::Sequence
+            | SysFamily::CircuitNodes
+            | SysFamily::CircuitEdges
+            | SysFamily::CircuitNodeColumns => None,
+        }
+    }
+
+    /// The payload columns a rewrite pair (`-1` + `+1` on one PK) may change, as
+    /// a payload-index bit mask; `None` where no emitter produces a pair —
+    /// there is no schema-rename or index-rename surface.
+    pub(super) fn pair_change_mask(self) -> Option<u64> {
+        match self {
+            // TABLE_TAB and VIEW_TAB agree on the name slot (asserted in
+            // gnitz-wire), so one constant serves both.
+            SysFamily::Table | SysFamily::View => Some(1 << TABTAB_PAY_NAME),
+            SysFamily::Column => {
+                Some((1 << COLTAB_PAY_NAME) | (1 << COLTAB_PAY_IS_HIDDEN) | (1 << COLTAB_PAY_IS_NULLABLE))
+            }
+            SysFamily::Sequence => Some(1 << gnitz_wire::SEQTAB_PAY_VALUE),
+            SysFamily::Schema
+            | SysFamily::Index
+            | SysFamily::CircuitNodes
+            | SysFamily::CircuitEdges
+            | SysFamily::CircuitNodeColumns => None,
+        }
+    }
+
     /// May a client-pushed `DDL_TXN` bundle carry a block for this family?
     /// `false` for Sequence alone: boot feeds its rows straight into the id
     /// counters and the resume verdict, where a forged value aborts every
@@ -685,6 +736,16 @@ impl SysFamily {
             | SysFamily::CircuitEdges
             | SysFamily::CircuitNodeColumns => true,
         }
+    }
+
+    /// Is this family's PK the identity of at most one live row — the premise
+    /// the retraction CAS and the per-PK net bound rest on? False for the
+    /// circuit families, whose `(view_id, sub)` addresses a node of a circuit.
+    pub(super) fn pk_is_live_row_identity(self) -> bool {
+        !matches!(
+            self,
+            SysFamily::CircuitNodes | SysFamily::CircuitEdges | SysFamily::CircuitNodeColumns
+        )
     }
 
     /// What one of this family's rows is called in a guard message.

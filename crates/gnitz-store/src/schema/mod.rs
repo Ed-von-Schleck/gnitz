@@ -670,6 +670,16 @@ impl SchemaDescriptor {
         self.pk_indices().iter().any(|&p| p as usize == ci)
     }
 
+    /// True iff column `ci` is this schema's *only* PK column — the shape an
+    /// FK target must have for the parent probe to read the referenced value
+    /// straight out of the packed PK region. Same widen-don't-narrow contract as
+    /// [`Self::is_pk_col`].
+    #[inline]
+    pub fn is_lone_pk_col(&self, ci: usize) -> bool {
+        let pk = self.pk_indices();
+        pk.len() == 1 && pk[0] as usize == ci
+    }
+
     /// Inverse of `payload_idx`: dense payload slot → logical column index.
     /// Caller must ensure `pi < num_payload_cols()`.
     #[inline]

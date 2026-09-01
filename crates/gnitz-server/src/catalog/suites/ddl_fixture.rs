@@ -139,23 +139,17 @@ impl CatalogEngine {
         pk_cols: &[u32],
     ) -> Result<i64, String> {
         let (schema_name, table_name) = parse_qualified_name(qualified_name, "public");
-        validate_user_identifier(schema_name)?;
-        validate_user_identifier(table_name)?;
-
-        if !self.has_schema(schema_name) {
-            return Err("Schema does not exist".into());
-        }
-        let qualified = format!("{schema_name}.{table_name}");
-        if self.caches.entity_by_qname.contains_key(&qualified) {
-            return Err("Table already exists".into());
-        }
         let raw_pk_cols = pack_pk_cols(pk_cols);
-        let pk = unpack_pk_cols(raw_pk_cols);
 
+        // Only what `submit` cannot derive for itself: the schema id, and an id
+        // for the new table. Every rule this shape must satisfy is the
+        // production precheck's, a few lines below — restating one here would
+        // let a test asserting that rejection pass against this copy while the
+        // production arm was broken.
+        let sid = self
+            .schema_id(schema_name)
+            .ok_or_else(|| format!("Schema does not exist: {schema_name}"))?;
         let tid = self.allocate_table_id().unwrap();
-        validate_relation_defs(RelationKind::BaseTable, tid, table_name, col_defs, &pk)?;
-        let sid = self.schema_id(schema_name).expect("the schema exists");
-        self.validate_fk_columns(tid, col_defs, pk.as_slice())?;
 
         // This in-process test shortcut always builds a keyed, full-PK-distributed
         // tables (`replicated = false`, `k = 0` = default). REPLICATED and CLUSTER BY
@@ -277,9 +271,6 @@ impl CatalogEngine {
     }
 
     pub(in crate::catalog) fn drop_index(&mut self, index_name: &str) -> Result<(), String> {
-        if index_name.contains(FK_INDEX_INFIX) {
-            return Err("Forbidden: cannot drop internal FK index".into());
-        }
         let idx_id = *self
             .caches
             .index_by_name

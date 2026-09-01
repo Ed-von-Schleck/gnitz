@@ -1039,9 +1039,8 @@ impl MasterDispatcher {
             // PK; otherwise probe the parent's UNIQUE index by broadcast, since
             // index entries are distributed independently of the PK.
             let parent_schema = disp.cat().registry().schema_or_err(parent_tid, "fk parent")?;
-            let ppk = parent_schema.pk_indices();
             let src_type = loc.type_code();
-            let (probe_schema, col_hint, broadcast) = if ppk.len() == 1 && ppk[0] as usize == parent_col {
+            let (probe_schema, col_hint, broadcast) = if parent_schema.is_lone_pk_col(parent_col) {
                 (parent_schema, 0u64, false)
             } else {
                 let idx_schema = disp

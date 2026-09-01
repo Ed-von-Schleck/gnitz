@@ -34,64 +34,71 @@ pub(in crate::catalog) fn build_schema_from_col_defs(
 impl CatalogEngine {
     // -- Read column definitions from sys_columns --------------------------
 
-    /// Scan sys_columns for every positive-weight column record owned by
-    /// `owner_id`, in column-index order. When `check_contiguity` is set the
-    /// column indices (lower 9 bits of the packed PK) must run 0,1,2,… with no
-    /// gap or duplicate — a gap would silently mismap columns in
-    /// `build_schema_from_col_defs`, so the create-precheck path rejects it.
-    /// The non-checking form is infallible by construction.
-    pub(in crate::catalog) fn scan_column_defs(
-        &self,
-        owner_id: i64,
-        check_contiguity: bool,
-    ) -> Result<Vec<ColumnDef>, String> {
+    /// Open a cursor over `owner_id`'s COL_TAB key band, positioned at its first
+    /// row. sys_columns has a single U64 PK, so OPK == big-endian; the range
+    /// clamp exhausts the cursor at the band's end, so neither walk below needs a
+    /// bound test.
+    fn open_column_band(&self, owner_id: i64) -> ReadCursor {
         let (start_pk, end_pk) = column_id_band(owner_id);
-        // sys_columns has a single U64 PK; OPK == big-endian. The range clamp
-        // exhausts the cursor at `end_pk`, so the walk needs no bound test.
         let (start, end) = (start_pk.to_be_bytes(), end_pk.to_be_bytes());
         let mut cursor = self
             .sys_store(SysFamily::Column)
             .open_cursor_in_range(&start, Some(&end));
         cursor.seek_range_bytes(&start, Some(&end));
+        cursor
+    }
 
+    /// Scan sys_columns for every positive-weight column record owned by
+    /// `owner_id`, in column-index order. Infallible by construction — the
+    /// column indices it maps positionally are checked by
+    /// [`Self::check_column_contiguity`], which the create precheck runs over the
+    /// same band.
+    pub(in crate::catalog) fn scan_column_defs(&self, owner_id: i64) -> Vec<ColumnDef> {
+        let mut cursor = self.open_column_band(owner_id);
         let mut defs = Vec::new();
-        let mut expected: i64 = 0;
-        // The contiguity verdict is captured rather than returned from the walk:
-        // the band is one owner's columns, bounded by `MAX_COLUMNS`, so running
-        // it to completion after the first mismatch costs a bounded remainder.
-        let mut broken: Option<String> = None;
         cursor.for_each_positive(|c| {
-            let pk = c.current_key_narrow() as u64;
-            if check_contiguity {
-                let actual = gnitz_wire::unpack_col_id(pk).1 as i64;
-                if actual != expected && broken.is_none() {
-                    broken = Some(format!(
-                        "entity (owner_id={owner_id}): column records are non-contiguous; \
-                         expected index {expected}, got {actual}"
-                    ));
-                }
-                expected += 1;
-            }
             let (src, row) = c.current_row_source();
             defs.push(read_col_tab_row(src, row));
         });
+        defs
+    }
+
+    /// The column indices (lower 9 bits of the packed PK) of `owner_id`'s live
+    /// column records must run 0,1,2,… with no gap or duplicate: a gap would
+    /// silently mismap columns in `build_schema_from_col_defs`, which maps them
+    /// positionally. Reads the key alone — no payload decode.
+    pub(in crate::catalog) fn check_column_contiguity(&self, owner_id: i64) -> Result<(), String> {
+        let mut cursor = self.open_column_band(owner_id);
+        let mut expected: i64 = 0;
+        // The verdict is captured rather than returned from the walk: the band is
+        // one owner's columns, bounded by `MAX_COLUMNS`, so running it to
+        // completion after the first mismatch costs a bounded remainder.
+        let mut broken: Option<String> = None;
+        cursor.for_each_positive(|c| {
+            let actual = gnitz_wire::unpack_col_id(c.current_key_narrow() as u64).1 as i64;
+            if actual != expected && broken.is_none() {
+                broken = Some(format!(
+                    "entity (owner_id={owner_id}): column records are non-contiguous; \
+                     expected index {expected}, got {actual}"
+                ));
+            }
+            expected += 1;
+        });
         match broken {
             Some(e) => Err(e),
-            None => Ok(defs),
+            None => Ok(()),
         }
     }
 
     /// Column definitions for `owner_id`, cached until the next COL_TAB delta
     /// (`invalidate_col_names` fires on every path — live, replay, ddl_sync,
     /// rollback). Returns an `Rc` snapshot: callers routinely touch the catalog
-    /// while holding it, so a borrow would not do. Uses the infallible
-    /// non-checking scan — the contiguity-checking form stays a direct storage
-    /// scan at its precheck call sites.
+    /// while holding it, so a borrow would not do.
     pub(crate) fn read_column_defs(&mut self, owner_id: i64) -> Rc<Vec<ColumnDef>> {
         if let Some(defs) = self.caches.col_defs.get(&owner_id) {
             return defs.clone();
         }
-        let defs = Rc::new(self.scan_column_defs(owner_id, false).unwrap());
+        let defs = Rc::new(self.scan_column_defs(owner_id));
         self.caches.col_defs.insert(owner_id, defs.clone());
         defs
     }

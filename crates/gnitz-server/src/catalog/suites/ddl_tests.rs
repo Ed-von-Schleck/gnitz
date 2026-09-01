@@ -423,9 +423,11 @@ fn test_edge_cases_extended() {
     assert!(engine.registry().get_schema_desc(999999).is_none());
     engine.drop_table("public.reg_test").unwrap();
 
-    // #26. Creating a user table in _system schema should fail
-    // (_system identifier starts with '_' → rejected by validate_user_identifier)
-    assert!(engine.create_table("_system.new_tbl", &cols, &[0]).is_err());
+    // #26. A relation in a schema the catalog does not hold is rejected. The
+    // `_system` schema itself is not: the engine's name rule is
+    // `reject_unstorable_name`, deliberately weaker than the client's
+    // leading-`_` identifier policy, so a raw bundle may name one.
+    assert!(engine.create_table("nosuchschema.new_tbl", &cols, &[0]).is_err());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

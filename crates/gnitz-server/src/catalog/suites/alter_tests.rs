@@ -357,15 +357,17 @@ fn column_rename_on_non_base_owner_rejected() {
     assert!(err.contains("not a user base table"), "view owner: {err}");
 
     // A system table's own COL_TAB self-description row, read back from what
-    // bootstrap wrote so the `-1` cannot drift from it.
-    let sys_col = engine.scan_column_defs(IDX_TAB_ID, true).unwrap().swap_remove(0);
+    // bootstrap wrote so the `-1` cannot drift from it. A system owner packs a
+    // COL_TAB PK below the family's first user id, so the id-space floor is what
+    // catches this one, before the owner is ever resolved.
+    let sys_col = engine.scan_column_defs(IDX_TAB_ID).swap_remove(0);
     let err = engine
         .precheck_family(
             SysFamily::Column,
             &col_alter_pair(IDX_TAB_ID, OWNER_KIND_TABLE, 0, &sys_col, rename_to("renamed")),
         )
         .unwrap_err();
-    assert!(err.contains("not a user base table"), "system owner: {err}");
+    assert!(err.contains("cannot ALTER a system column"), "system owner: {err}");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
