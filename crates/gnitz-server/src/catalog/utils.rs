@@ -94,12 +94,7 @@ pub(in crate::catalog) fn retract_key_range(
     // Sized off the positioned walk's own upper bound, so the appends never
     // re-grow (each growth re-copies every live byte).
     let mut batch = Batch::with_capacity(*schema, cursor.estimated_length());
-    while cursor.valid {
-        if cursor.current_weight > 0 {
-            cursor.copy_current_row_into(&mut batch, -1);
-        }
-        cursor.advance();
-    }
+    cursor.for_each_positive(|c| c.copy_current_row_into(&mut batch, -1));
     batch
 }
 

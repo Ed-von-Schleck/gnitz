@@ -81,7 +81,7 @@ impl IndexCircuitEntry {
     }
 
     /// [`Self::open_cursor`] over `[start, end]` only.
-    pub fn open_cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> crate::storage::ReadCursor {
+    pub(crate) fn open_cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> crate::storage::ReadCursor {
         self.handle.open_cursor_in_range(&self.index_schema, start, end)
     }
 
@@ -272,7 +272,7 @@ impl TableEntry {
     /// silent `Table` at the wire boundary. A bounded view is its own wire class:
     /// the client's leaf rule refuses to bind one inside a view body, and
     /// `ALTER VIEW … AS` refuses to retarget it.
-    pub fn class(&self) -> gnitz_wire::RelClass {
+    pub(crate) fn class(&self) -> gnitz_wire::RelClass {
         use gnitz_wire::RelClass;
         match self.kind {
             RelationKind::Stream => RelClass::Stream,
@@ -333,11 +333,6 @@ impl TableEntry {
     /// it; ordinary ingestion goes through the registry.
     pub fn ingest_borrowed_batch(&self, batch: &Batch) -> Result<(), StorageError> {
         self.handle.ingest_borrowed_batch(batch)
-    }
-
-    /// [`Self::ingest_borrowed_batch`] for an owned batch.
-    pub fn ingest_owned_batch(&self, batch: Batch) -> Result<(), StorageError> {
-        self.handle.ingest_owned_batch(batch)
     }
 }
 

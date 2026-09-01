@@ -78,7 +78,7 @@ impl PkSetGather {
     /// [`ReadCursor::any_skeleton`]. A caller that cannot read a skeleton row
     /// asks here rather than of the store, so a key list that misses every
     /// skeleton shard still walks.
-    pub fn any_skeleton(&self) -> bool {
+    pub(crate) fn any_skeleton(&self) -> bool {
         self.cursor.any_skeleton()
     }
 

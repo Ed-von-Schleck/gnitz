@@ -159,7 +159,7 @@ impl WorkerProcess {
         client_id: u64,
         seek_pk: u128,
     ) -> Result<(), gnitz_wire::WireFault> {
-        let Some(batch) = result.filter(|b| b.count > 0) else {
+        let Some(batch) = result.filter(|b| !b.is_empty()) else {
             return self.send_response(target_id, None, schema, request_id, client_id, seek_pk);
         };
         let (prebuilt_rc, server_version, blobbed) = self.reply_schema_block(target_id as i64, schema);
@@ -258,7 +258,7 @@ impl WorkerProcess {
             &batch,
             client_id,
             0,
-            batch.count,
+            batch.len(),
             prebuilt_rc.as_deref().map(Vec::as_slice),
             server_version,
             true,
@@ -423,7 +423,7 @@ impl WorkerProcess {
             None
         };
 
-        let remaining = batch.count - next_row;
+        let remaining = batch.len() - next_row;
         // A chunk costs `base` — the control block, plus the schema block on the
         // first chunk, sized with a zero-row range that carries no data block at
         // all — plus its data block, which is `wire_byte_size_range(n)`.
@@ -455,7 +455,7 @@ impl WorkerProcess {
         // one would stall the train — except over a zero-row batch, which the
         // multi-scan FIFO path can queue and which still owes one terminal frame.
         let max_rows = lo.max(1).min(remaining);
-        let has_more = next_row + max_rows < batch.count;
+        let has_more = next_row + max_rows < batch.len();
         self.w2m_writer.send_msg(
             request_id,
             &Self::chunk_msg(
@@ -539,14 +539,10 @@ pub(crate) fn send_unique_preflight_keys(
         let n = keys.remaining().min(keys_per_frame);
         for _ in 0..n {
             let k = keys.next().expect("producer lends `remaining` spans");
-            chunk.ensure_row_capacity();
-            // The span is already OPK; write the raw bytes into the PK region
+            // The span is already OPK; the raw bytes go into the PK region
             // (len == pk_stride). The master reads them back verbatim via
             // `mb.get_pk_bytes(row)` → `PkBuf` — the wire is byte-transparent.
-            chunk.extend_pk_bytes(k);
-            chunk.extend_weight(&1i64.to_le_bytes());
-            chunk.extend_null_bmp(&0u64.to_le_bytes());
-            chunk.count += 1;
+            chunk.push_key_row(k, 1);
         }
         let is_last = keys.remaining() == 0;
         // Schema block only on the first frame; continuations decode against
@@ -558,7 +554,7 @@ pub(crate) fn send_unique_preflight_keys(
             data: WireData::Range {
                 batch: &chunk,
                 start_row: 0,
-                count: chunk.count,
+                count: chunk.len(),
             },
             schema_block: is_first.then_some(schema_block.as_slice()),
             ..Default::default()

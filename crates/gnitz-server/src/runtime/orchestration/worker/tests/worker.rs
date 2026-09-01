@@ -5,6 +5,7 @@ use crate::runtime::w2m::{self, W2mReceiver};
 use crate::test_support::{col_def, make_batch_raw, make_schema_u64_i64, u64_pk_schema};
 use gnitz_store::schema::SchemaColumn;
 use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::storage::BatchBuilder;
 use gnitz_wire::type_code;
 
 /// `buffer_pending_delta` appends into an existing entry rather than
@@ -15,11 +16,11 @@ fn pending_deltas_accumulate_per_relation() {
     let mut pending: HashMap<i64, Batch> = HashMap::new();
 
     buffer_pending_delta(&mut pending, 100, make_batch_raw(&schema, &[(1, 1, 10)]));
-    assert_eq!(pending[&100].count, 1);
+    assert_eq!(pending[&100].len(), 1);
     buffer_pending_delta(&mut pending, 100, make_batch_raw(&schema, &[(2, 1, 20)]));
-    assert_eq!(pending[&100].count, 2, "a second delta appends to the same table");
+    assert_eq!(pending[&100].len(), 2, "a second delta appends to the same table");
     buffer_pending_delta(&mut pending, 200, make_batch_raw(&schema, &[(3, 1, 30)]));
-    assert_eq!(pending[&200].count, 1, "a different table gets its own entry");
+    assert_eq!(pending[&200].len(), 1, "a different table gets its own entry");
 }
 
 /// Stage 0 wire-protocol contract: every reply helper (`send_ack`,
@@ -361,8 +362,17 @@ fn padded_schema() -> SchemaDescriptor {
 
 /// `n` rows of `schema`, PK and payload both counting from 0.
 fn make_n_row_batch(schema: SchemaDescriptor, n: usize) -> Batch {
-    let rows: Vec<(u64, i64, i64)> = (0..n as u64).map(|i| (i, 1, i as i64)).collect();
-    make_batch_raw(&schema, &rows)
+    let mut b = BatchBuilder::new(schema);
+    for i in 0..n as u128 {
+        b.begin_row(i, 1);
+        // Every payload column carries the row index: `make_batch_raw` fills
+        // only slot 0, which leaves a wider schema's later columns unwritten.
+        for _ in 0..schema.num_payload_cols() {
+            b.put_int(i);
+        }
+        b.end_row();
+    }
+    b.finish()
 }
 
 /// Row `row`'s PK widened from its OPK bytes — `Batch::get_pk` for a
@@ -489,7 +499,7 @@ fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
         let decoded = decode_continuation(&data, &schema, 0, &mut offsets).expect("decode with schema hint");
         let b = decoded.data_batch.as_ref().expect("data block");
-        assert_eq!(b.count, 5);
+        assert_eq!(b.len(), 5);
         for i in 0..5usize {
             assert_eq!(mem_pk(b, i), i as u128);
         }
@@ -542,7 +552,7 @@ fn force_fifo_queues_a_whole_blob_reply() {
     // Decodes via the blob-capable path; the first frame carries the schema block.
     let decoded = ipc::decode_wire_ipc(&frames[0].1).expect("the blob frame decodes standalone");
     assert!(decoded.schema.is_some(), "the frame carries the schema block");
-    assert_eq!(decoded.data_batch.map(|b| b.count).unwrap_or(0), 1);
+    assert_eq!(decoded.data_batch.map(|b| b.len()).unwrap_or(0), 1);
 
     engine.close();
 }
@@ -646,7 +656,7 @@ fn pending_streams_drain_two_trains_fifo() {
                 let decoded = ipc::decode_wire_ipc(bytes).expect("first chunk must decode standalone");
                 let s = decoded.schema.expect("first chunk carries a schema block");
                 assert_eq!(s.num_columns(), ncols, "the block is this train's schema");
-                rows += decoded.data_batch.map(|b| b.count).unwrap_or(0);
+                rows += decoded.data_batch.map(|b| b.len()).unwrap_or(0);
             } else {
                 assert!(
                     ipc::decode_wire_ipc(bytes).is_err(),
@@ -655,7 +665,7 @@ fn pending_streams_drain_two_trains_fifo() {
                 let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
                 let decoded = decode_continuation(bytes, schema, 0, &mut offsets)
                     .expect("continuation decodes against the schema hint");
-                rows += decoded.data_batch.map(|b| b.count).unwrap_or(0);
+                rows += decoded.data_batch.map(|b| b.len()).unwrap_or(0);
             }
         }
         assert_eq!(rows, total_rows, "the train's chunks cover all rows exactly once");

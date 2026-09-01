@@ -130,7 +130,7 @@ pub fn try_set_nocow(fd: i32) {
 }
 
 /// Size of the file behind `fd` (fstat), in bytes.
-pub fn fd_size(fd: c_int) -> std::io::Result<usize> {
+pub(crate) fn fd_size(fd: c_int) -> std::io::Result<usize> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut st) } < 0 {
         return Err(std::io::Error::last_os_error());

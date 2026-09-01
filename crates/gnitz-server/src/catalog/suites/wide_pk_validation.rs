@@ -9,7 +9,7 @@ use super::*;
 use gnitz_store::relation::RelationKind;
 use gnitz_store::schema::make_index_schema;
 use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::storage::{Batch, RecoverySource, Table};
+use gnitz_store::storage::{BatchBuilder, RecoverySource, Table};
 
 /// `pk_stride` = 24 (wide): three U64 PK columns + one U64 payload `val`.
 fn wide_unique_schema() -> SchemaDescriptor {
@@ -18,15 +18,13 @@ fn wide_unique_schema() -> SchemaDescriptor {
 
 /// Build a batch for `wide_unique_schema`: rows of (pk, val, weight).
 fn wide_val_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], u64, i64)]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut b = BatchBuilder::new(*schema);
     for &(pk, val, w) in rows {
-        b.extend_pk_bytes(&pk);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
-        b.count += 1;
+        b.begin_row_bytes(&pk, w);
+        b.put_int(val as u128);
+        b.end_row();
     }
-    b
+    b.finish()
 }
 
 /// Register a wide-PK table on `engine.dag` with a UNIQUE secondary index on

@@ -78,9 +78,7 @@ pub(in crate::catalog) use gnitz_wire::FK_INDEX_INFIX;
 pub(in crate::catalog) use registry::raise_id_counter;
 // The child-directory grammar and the directory primitives are storage's; the
 // catalog only consumes them.
-pub(in crate::catalog) use gnitz_store::storage::{
-    fsync_dir, peek_header, state_child_manifests, subdir_names, ChildAddr,
-};
+pub(in crate::catalog) use gnitz_store::storage::{children_at_generation, fsync_dir, subdir_names, ChildAddr};
 #[cfg(test)]
 pub(in crate::catalog) use utils::cursor_read_string;
 pub(in crate::catalog) use utils::{

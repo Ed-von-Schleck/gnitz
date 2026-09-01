@@ -13,7 +13,8 @@
 //! `foundation`. The submodules under each root are private; what a root
 //! re-exports is what it publishes, plus the eight submodules named as modules
 //! (`foundation::{posix_io, log, worker_ctx, env, fault, xxh}`, `schema::key`
-//! and `storage::batch_pool`).
+//! and `storage::batch_pool`). An item is `pub` because another crate names it;
+//! everything else is `pub(crate)`.
 //!
 //! There is no crate-root re-export façade: a type's rung is part of what its
 //! path says. The only names at the root are the four `gnitz_*!` logging
@@ -53,6 +54,11 @@ mod test_rng;
 #[cfg(test)]
 #[path = "tests/rungs.rs"]
 mod rung_tests;
+
+/// Tests no single module owns: the guard that no other crate writes a row count.
+#[cfg(test)]
+#[path = "tests/row_count.rs"]
+mod row_count_tests;
 
 // `test_support::shared` is compiled here, as the whole of `gnitz-store-testkit`,
 // and again inside `gnitz-server` — all from one source, which spells every path

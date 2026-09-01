@@ -852,7 +852,7 @@ impl MasterDispatcher {
                 )
                 .into());
             }
-            let a = acc.get_or_insert_with(|| Batch::with_capacity(expected, mb.count));
+            let a = acc.get_or_insert_with(|| Batch::with_capacity(expected, mb.len()));
             a.append_mem_batch(mb);
             Ok(())
         })
@@ -985,7 +985,7 @@ impl MasterDispatcher {
             GroupTargets::AllSilent,
         )?;
         self.signal_all();
-        gnitz_debug!("broadcast_ddl tid={} rows={} lsn={}", target_id, batch.count, lsn);
+        gnitz_debug!("broadcast_ddl tid={} rows={} lsn={}", target_id, batch.len(), lsn);
         Ok(())
     }
 
@@ -1245,7 +1245,7 @@ impl MasterDispatcher {
         req_ids: &[u64],
         mark: ZoneMark,
     ) -> Result<(), SalFit> {
-        self.arm_injected_tick_emit_error(target_id, batch.count);
+        self.arm_injected_tick_emit_error(target_id, batch.len());
         let relation = self.wire_schema(target_id);
         let nw = self.num_workers;
         // Identical scatter for both routings; only the per-worker index fill

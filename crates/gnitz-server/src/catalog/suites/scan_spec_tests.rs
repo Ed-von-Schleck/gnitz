@@ -43,7 +43,7 @@ fn weighted_fixture(name: &str, rows: impl Iterator<Item = (u64, i64, i64)>) -> 
 
 /// Extract `(id, val, weight)` triples from a `(id U64 PK | val I64)` reply batch.
 fn triples(b: &Batch) -> Vec<(u128, i64, i64)> {
-    (0..b.count)
+    (0..b.len())
         .map(|i| {
             let val = i64::from_le_bytes(b.get_col_ptr(i, 0, 8).try_into().unwrap());
             (b.get_pk(i), val, b.get_weight(i))
@@ -125,7 +125,7 @@ fn pk_set_over_a_system_table_keeps_every_key() {
     let spec = identity_spec(ReadBound::PkSet(vec![tid as u128]), vec![], 0);
     let keeper = e.scan_spec_family(TABLE_TAB_ID, &spec, &sys_schema, 0).unwrap();
     assert_eq!(
-        (0..keeper.count).map(|i| keeper.get_pk(i)).collect::<Vec<_>>(),
+        (0..keeper.len()).map(|i| keeper.get_pk(i)).collect::<Vec<_>>(),
         vec![tid as u128],
         "the created table's TABLE_TAB row must come back"
     );
@@ -197,7 +197,7 @@ fn keyed_reads_over_a_replicated_table_find_every_key() {
         .registry_mut()
         .gather_family_bytes(tid, pks.iter().map(|p| p.pk_bytes()), 1)
         .unwrap();
-    assert_eq!(gathered.count, N as usize, "every parent key must dereference");
+    assert_eq!(gathered.len(), N as usize, "every parent key must dereference");
 
     let mut got = run(
         &mut e,
@@ -332,7 +332,7 @@ fn pk_range_over_a_clustered_table_routes_when_confined_and_spans_when_not() {
 
     // `(a, b, val)` triples of a reply batch, decoded off the 16-byte OPK PK.
     let decode = |batch: &Batch| -> Vec<(u64, u64, i64)> {
-        let mut out: Vec<_> = (0..batch.count)
+        let mut out: Vec<_> = (0..batch.len())
             .map(|i| {
                 let pk = batch.get_pk_bytes(i);
                 (
@@ -525,8 +525,8 @@ fn gather_of_64_payload_columns_covers_every_slot() {
     let reply = e.registry().get_schema_desc(tid).unwrap();
     let spec = rows_spec(vec![], proj_blob(&copies), vec![], 0);
     let got = e.scan_spec_family(tid, &spec, &reply, 0).unwrap();
-    assert_eq!(got.count, 40);
-    for r in 0..got.count {
+    assert_eq!(got.len(), 40);
+    for r in 0..got.len() {
         let id = got.get_pk(r) as u64;
         for k in 0..P {
             assert_eq!(got.read_payload_u64(r, k), id * 100 + k as u64, "row {r} slot {k}");
@@ -555,8 +555,8 @@ fn all_pk_sourced_projection_zeroes_null_words_across_chunks() {
     );
     let spec = rows_spec(vec![], proj_blob(&[(0, 0)]), vec![], 0);
     let got = e.scan_spec_family(tid, &spec, &reply, 0).unwrap();
-    assert_eq!(got.count, 300, "10 chunks of 32 rows minus the short tail");
-    for r in 0..got.count {
+    assert_eq!(got.len(), 300, "10 chunks of 32 rows minus the short tail");
+    for r in 0..got.len() {
         assert_eq!(
             got.get_null_word(r),
             0,
@@ -606,10 +606,10 @@ fn permuted_gather_with_string_and_nullable_across_chunks() {
     );
     let spec = rows_spec(vec![], proj_blob(&[(2, 0), (0, 1), (1, 2)]), vec![], 0);
     let got = e.scan_spec_family(tid, &spec, &reply, 0).unwrap();
-    assert_eq!(got.count as u64, N);
+    assert_eq!(got.len() as u64, N);
 
     // Decoded rows: (pk, s, pk_copy, Option<nv>).
-    let mut decoded: Vec<(u128, String, u64, Option<i64>)> = (0..got.count)
+    let mut decoded: Vec<(u128, String, u64, Option<i64>)> = (0..got.len())
         .map(|r| {
             let nv = match gnitz_wire::null_word_get(got.get_null_word(r), 2) {
                 true => None,
@@ -685,7 +685,7 @@ fn compute_projection_writes_at_keeper_tail_across_chunks() {
     let spec = rows_spec(pred_lt_blob(2, 1000), projection, vec![], 0);
     let got = e.scan_spec_family(tid, &spec, &reply, 0).unwrap();
 
-    let mut decoded: Vec<(u128, Option<i64>, i64)> = (0..got.count)
+    let mut decoded: Vec<(u128, Option<i64>, i64)> = (0..got.len())
         .map(|r| {
             let doubled = match gnitz_wire::null_word_get(got.get_null_word(r), 0) {
                 true => None,
@@ -763,12 +763,12 @@ fn gather_limit_cuts_the_range_list_mid_chunk() {
     let reply = e.registry().get_schema_desc(tid).unwrap();
     let spec = rows_spec(pred_lt_blob(1, 1), proj_blob(&[(1, 0)]), vec![], 5);
     let got = e.scan_spec_family(tid, &spec, &reply, 0).unwrap();
-    let total: i64 = (0..got.count).map(|r| got.get_weight(r)).sum();
+    let total: i64 = (0..got.len()).map(|r| got.get_weight(r)).sum();
     assert!(total >= 5, "early-stop must cover the window weight, got {total}");
     assert!(
-        got.count <= 6,
+        got.len() <= 6,
         "the range-list cut must not gather the whole chunk's survivors, got {}",
-        got.count
+        got.len()
     );
 }
 

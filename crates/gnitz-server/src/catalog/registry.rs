@@ -56,25 +56,29 @@ impl CatalogEngine {
 
         let mut defs = Vec::new();
         let mut expected: i64 = 0;
-        while cursor.valid {
-            if cursor.current_weight > 0 {
-                let pk = cursor.current_key_narrow() as u64;
-                if check_contiguity {
-                    let actual = gnitz_wire::unpack_col_id(pk).1 as i64;
-                    if actual != expected {
-                        return Err(format!(
-                            "entity (owner_id={owner_id}): column records are non-contiguous; \
-                             expected index {expected}, got {actual}"
-                        ));
-                    }
-                    expected += 1;
+        // The contiguity verdict is captured rather than returned from the walk:
+        // the band is one owner's columns, bounded by `MAX_COLUMNS`, so running
+        // it to completion after the first mismatch costs a bounded remainder.
+        let mut broken: Option<String> = None;
+        cursor.for_each_positive(|c| {
+            let pk = c.current_key_narrow() as u64;
+            if check_contiguity {
+                let actual = gnitz_wire::unpack_col_id(pk).1 as i64;
+                if actual != expected && broken.is_none() {
+                    broken = Some(format!(
+                        "entity (owner_id={owner_id}): column records are non-contiguous; \
+                         expected index {expected}, got {actual}"
+                    ));
                 }
-                let (src, row) = cursor.current_row_source();
-                defs.push(read_col_tab_row(src, row));
+                expected += 1;
             }
-            cursor.advance();
+            let (src, row) = c.current_row_source();
+            defs.push(read_col_tab_row(src, row));
+        });
+        match broken {
+            Some(e) => Err(e),
+            None => Ok(defs),
         }
-        Ok(defs)
     }
 
     /// Column definitions for `owner_id`, cached until the next COL_TAB delta
@@ -328,7 +332,7 @@ impl CatalogEngine {
         bb.put_u64(new_val as u64);
         bb.end_row();
         let insert = bb.finish();
-        batch.append_batch(&insert, 0, insert.count);
+        batch.append_batch(&insert, 0, insert.len());
         batch
     }
 

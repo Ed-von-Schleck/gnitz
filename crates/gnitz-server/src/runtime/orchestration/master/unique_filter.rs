@@ -149,7 +149,7 @@ pub(super) fn extract_into_filter(
         return;
     }
     let mut keybuf = PkBuf::zeroed(0);
-    for row in 0..batch.count {
+    for row in 0..batch.len() {
         if batch.get_weight(row) <= 0 {
             continue;
         }

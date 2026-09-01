@@ -19,7 +19,7 @@ fn check_batch_marks_only_the_nullable_payload_columns() {
     let schema = SchemaDescriptor::new(&cols, &[0]);
 
     let batch = build_check_batch(&schema, &[42u128], type_code::U64, None);
-    assert_eq!(batch.count, 1);
+    assert_eq!(batch.len(), 1);
 
     let null_word = u64::from_le_bytes(batch.null_bmp_data()[0..8].try_into().unwrap());
     assert_eq!(null_word, 0b010, "only the nullable payload column may be marked null");

@@ -232,7 +232,7 @@ impl CatalogEngine {
                 ));
             };
             let schema = family.schema();
-            for j in 0..batch.count {
+            for j in 0..batch.len() {
                 if batch.get_pk(j) == sig.pk && batch.get_weight(j) < 0 && {
                     let (src, ri) = sr.source();
                     compare_rows(&schema, src, ri, batch, j) != Ordering::Equal
@@ -275,7 +275,7 @@ impl CatalogEngine {
 
             if sig.is_pair() {
                 let lb = live.as_ref().expect("a pair's -1 CAS already required a live row");
-                for j in 0..batch.count {
+                for j in 0..batch.len() {
                     if batch.get_pk(j) == sig.pk && batch.get_weight(j) > 0 && {
                         let (src, ri) = lb.source();
                         compare_rows_except(&schema, src, ri, batch, j, 1 << TABTAB_PAY_NAME)
@@ -614,7 +614,7 @@ impl CatalogEngine {
         // A zero-weight row is not a Z-set element: `pk_signatures` skips it, so it
         // would reach the appliers carrying neither the CAS nor the net bound, and
         // every `weight > 0` dispatch below treats it as a retraction.
-        if (0..batch.count).any(|i| batch.get_weight(i) == 0) {
+        if (0..batch.len()).any(|i| batch.get_weight(i) == 0) {
             return Err("catalog delta carries a zero-weight row".into());
         }
         match family {
@@ -652,7 +652,7 @@ impl CatalogEngine {
             reject_system_id(&sig, SysFamily::Schema, FIRST_USER_SCHEMA_ID)?;
             self.check_cas_and_net(SysFamily::Schema, batch, &sig)?;
         }
-        for i in 0..batch.count {
+        for i in 0..batch.len() {
             if batch.get_weight(i) > 0 {
                 let name = batch.read_payload_string(i, SCHEMATAB_PAY_NAME);
                 // The full identifier rule, leading-`_` included: a schema name is
@@ -687,7 +687,7 @@ impl CatalogEngine {
         let net_dead = self.precheck_relation_signatures(family, batch)?;
         let mut claimed: FxHashSet<String> = FxHashSet::default();
 
-        for i in 0..batch.count {
+        for i in 0..batch.len() {
             if batch.get_weight(i) <= 0 {
                 continue;
             }
@@ -811,7 +811,7 @@ impl CatalogEngine {
         // the persisted-cache check and the second overwrites the first in
         // `index_by_name`, leaving one index live and unreachable.
         let mut claimed: FxHashSet<String> = FxHashSet::default();
-        for i in 0..batch.count {
+        for i in 0..batch.len() {
             if batch.get_weight(i) <= 0 {
                 continue;
             }
@@ -846,7 +846,7 @@ impl CatalogEngine {
         for sig in pk_signatures(batch) {
             self.check_cas_and_net(SysFamily::Index, batch, &sig)?;
         }
-        let mut drop_ids: Vec<i64> = (0..batch.count)
+        let mut drop_ids: Vec<i64> = (0..batch.len())
             .filter(|&i| batch.get_weight(i) < 0)
             .map(|i| batch.get_pk(i) as i64)
             .collect();
@@ -860,7 +860,7 @@ impl CatalogEngine {
         // every `-1` must content-equal it across all payload columns, `name` and
         // `source_cols` included. So the batch row is byte-identical to what a
         // probe would return, and reading it here costs no cursor.
-        for i in (0..batch.count).filter(|&i| batch.get_weight(i) < 0) {
+        for i in (0..batch.len()).filter(|&i| batch.get_weight(i) < 0) {
             let (owner_id, cols, _) = read_idx_tab_row(batch, i);
             let name = batch.read_payload_string(i, IDXTAB_PAY_NAME);
             // An internal `__fk_` index backs the RESTRICT seek; dropping one

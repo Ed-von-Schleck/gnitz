@@ -741,3 +741,29 @@ fn layout_wire_flags_round_trip() {
         assert_eq!(Layout::from_wire_flags(l.to_wire_flags()), l, "{l:?}");
     }
 }
+
+// A long string (len > 12) whose blob offset lands past the empty arena reads
+// back empty, not aborts. Reachable only via corrupt wire input, so no row
+// appender can build it — hence the region-by-region write.
+#[test]
+fn read_payload_string_out_of_bounds_offset_returns_empty() {
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::STRING, 0),
+        ],
+        &[0],
+    );
+    let mut batch = Batch::with_capacity(schema, 1);
+    batch.extend_pk(1);
+    batch.extend_weight(&1i64.to_le_bytes());
+    batch.extend_null_bmp(&0u64.to_le_bytes());
+    let mut st = [0u8; 16];
+    st[0..4].copy_from_slice(&100u32.to_le_bytes()); // len 100 (> 12 → reads blob)
+    st[8..16].copy_from_slice(&0u64.to_le_bytes()); // offset 0 into empty blob
+    batch.extend_col(0, &st);
+    batch.count += 1;
+
+    // payload_col 0 is the STRING column; the corrupt offset must decode to "".
+    assert_eq!(batch.read_payload_string(0, 0), String::new());
+}

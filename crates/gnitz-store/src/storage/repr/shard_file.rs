@@ -348,7 +348,7 @@ fn build_shard_filter_from_pk_region(pk_bytes: &[u8], stride: usize) -> Option<B
 /// registered-unsynced shard in one batched io_uring submission, then fsyncs the
 /// table directory the renames landed in.
 #[derive(Clone, Copy, Default)]
-pub struct ShardWriteOpts {
+pub(crate) struct ShardWriteOpts {
     pub pack_ints: bool,
     pub skeleton: bool,
     pub skip_pk_filter: bool,
@@ -358,13 +358,13 @@ impl ShardWriteOpts {
     /// The compaction write policy: FoR-packed integer payload regions. The
     /// differential-test oracles reuse it so they cannot drift from the
     /// production write; compaction itself overrides `skip_pk_filter` per call.
-    pub const COMPACTION: Self = ShardWriteOpts {
+    pub(crate) const COMPACTION: Self = ShardWriteOpts {
         pack_ints: true,
         skeleton: false,
         skip_pk_filter: false,
     };
     /// A dehydrated guard's write: payload-free, so nothing to pack.
-    pub const SKELETON: Self = ShardWriteOpts {
+    pub(crate) const SKELETON: Self = ShardWriteOpts {
         pack_ints: false,
         skeleton: true,
         skip_pk_filter: false,

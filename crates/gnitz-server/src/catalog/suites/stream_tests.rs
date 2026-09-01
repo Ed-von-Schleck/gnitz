@@ -24,7 +24,7 @@ fn stream_flag_registers_storeless_with_no_directory() {
         entry.directory
     );
     // Its reads are empty rather than erroring, and its LSN never advances.
-    assert_eq!(entry.full_scan().count, 0);
+    assert_eq!(entry.full_scan().len(), 0);
     assert_eq!(entry.current_lsn(), 0);
 
     // The same word with the bit clear is still an ordinary base table with a

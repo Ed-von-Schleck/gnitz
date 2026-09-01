@@ -232,7 +232,7 @@ fn backfill_all_indexes_rebuilds_exactly_once() {
                 .unwrap()
                 .0;
             let row = hit.unwrap_or_else(|| panic!("val {} must resolve by index", i * 10));
-            assert_eq!(row.count, 1, "one source row per distinct val");
+            assert_eq!(row.len(), 1, "one source row per distinct val");
             assert_eq!(row.get_pk(0), i as u128, "val {} must resolve to PK {}", i * 10, i);
         }
         assert_eq!(

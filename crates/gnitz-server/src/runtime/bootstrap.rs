@@ -76,7 +76,7 @@ fn recover_system_tables_from_sal(
             )
         })?;
         let batch = match decoded.data_batch {
-            Some(b) if b.count > 0 => b,
+            Some(b) if !b.is_empty() => b,
             _ => continue,
         };
         // `ddl_sync`, not `ingest_to_family`: these rows are master-validated by
@@ -202,7 +202,7 @@ fn recover_from_sal(
                 )
             })?;
             let mut batch = match decoded.data_batch {
-                Some(b) if b.count > 0 => b,
+                Some(b) if !b.is_empty() => b,
                 _ => continue,
             };
             // The one place an old-width batch enters the engine. A pre-ALTER
@@ -231,7 +231,7 @@ fn recover_from_sal(
             } else {
                 batch
             };
-            if owned.count == 0 {
+            if owned.is_empty() {
                 continue;
             }
             // The error rides the startup ACK: the master fails boot BEFORE zeroing

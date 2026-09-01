@@ -12,10 +12,10 @@ use proptest::prelude::*;
 
 use crate::schema::key::compare_pk_bytes;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, Layout, ReadCursor};
+use crate::storage::{Batch, BatchBuilder, Layout, ReadCursor};
 use gnitz_wire::type_code;
 
-use super::shared::{arb_type_code, payload_slot_width, pk_payload_schema, u64_pk_schema};
+use super::shared::{arb_type_code, pk_payload_schema, u64_pk_schema};
 
 /// The canonical wide-PK test schema: a 3×U64 compound primary key
 /// (`pk_stride = 24`, wide) with a single I64 payload column.
@@ -76,22 +76,18 @@ pub fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i
 /// which is what keeps a new PK width from growing another near-identical
 /// builder. [`opk_pk`] produces the bytes from native column values.
 pub fn make_batch_opk(schema: &SchemaDescriptor, rows: &[(&[u8], i64, i64)]) -> Batch {
-    let mut b = Batch::empty_with_schema(schema);
-    b.reserve_rows(rows.len().max(1));
-    let width = payload_slot_width(schema);
+    let mut b = BatchBuilder::new(*schema);
     for &(pk, w, val) in rows {
         assert_eq!(
             pk.len(),
             schema.pk_stride() as usize,
             "PK bytes must be exactly one stride wide"
         );
-        b.extend_pk_bytes(pk);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes()[..width]);
-        b.count += 1;
+        b.begin_row_bytes(pk, w);
+        b.put_int(val as u128);
+        b.end_row();
     }
-    b
+    b.finish()
 }
 
 /// A [`ReadCursor`] over one in-memory batch: the integral an operator reads
@@ -100,17 +96,10 @@ pub fn trace_cursor(batch: Batch, schema: SchemaDescriptor) -> ReadCursor {
     ReadCursor::over_batches(&[std::rc::Rc::new(batch)], schema)
 }
 
-/// Build a one-row `Batch` from OPK-encoded `pk` bytes (see [`opk_pk`]), DBSP
-/// weight `w`, and a single non-null I64 payload `val` at payload slot 0 — the
-/// row shape wide-PK storage/dag tests ingest one at a time.
+/// [`make_batch_opk`] for the single row wide-PK storage/dag tests ingest one
+/// at a time.
 pub fn wide_row(schema: &SchemaDescriptor, pk: &[u8], w: i64, val: i64) -> Batch {
-    let mut b = Batch::with_capacity(*schema, 1);
-    b.extend_pk_bytes(pk);
-    b.extend_weight(&w.to_le_bytes());
-    b.extend_null_bmp(&0u64.to_le_bytes());
-    b.extend_col(0, &val.to_le_bytes());
-    b.count += 1;
-    b
+    make_batch_opk(schema, &[(pk, w, val)])
 }
 
 /// Read row `i`'s PK out of a raw `stride`-wide OPK region as its native
@@ -229,4 +218,29 @@ pub fn bench_time_each<S>(iters: usize, mut setup: impl FnMut() -> S, mut body: 
         }
     }
     total
+}
+
+/// Every `.rs` file under `dir`, recursively. `enter` decides whether a
+/// sub-directory is descended into; `dir` itself is always read, and an
+/// unreadable one is a panic — a source-text guard that silently walked nothing
+/// would pass for the wrong reason.
+pub fn rs_files_under(
+    dir: &std::path::Path,
+    enter: impl Fn(&std::path::Path) -> bool + Copy,
+) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        panic!("a source walk must be able to read {}", dir.display());
+    };
+    let mut out = Vec::new();
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if enter(&p) {
+                out.extend(rs_files_under(&p, enter));
+            }
+        } else if p.extension().is_some_and(|x| x == "rs") {
+            out.push(p);
+        }
+    }
+    out
 }

@@ -200,7 +200,7 @@ impl DagEngine {
     ) -> Result<Option<Batch>, String> {
         let produced = self
             .run_view_epoch(registry, view_id, input, src_id, exchange)?
-            .filter(|b| b.count > 0);
+            .filter(|b| !b.is_empty());
         if let Some(out) = produced.as_ref() {
             registry
                 .ingest_view_delta(view_id, out, round)
@@ -270,7 +270,7 @@ impl DagEngine {
     /// a union otherwise. An empty slot takes the fill rather than the union
     /// because `op_union` against an empty operand clones the other one whole.
     fn deposit(slot: &mut Option<Batch>, delta: Batch) {
-        match slot.take().filter(|b| b.count > 0) {
+        match slot.take().filter(|b| !b.is_empty()) {
             Some(held) => {
                 // The held batch's schema, not the incoming one: it selects
                 // `payload_cmp` and is what the union's result is certified under.

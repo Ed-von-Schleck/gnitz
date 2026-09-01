@@ -839,7 +839,8 @@ fn compensating_a_drop_keeps_the_restored_relation_directory() {
     let schema = SysFamily::Table.schema();
     let drop_batch = retract_pk_list(engine.sys_store(SysFamily::Table), &schema, vec![tid as u128]);
     assert_eq!(
-        drop_batch.count, 1,
+        drop_batch.len(),
+        1,
         "the fixture table must have one live TABLE_TAB row"
     );
     engine.precheck_family(SysFamily::Table, &drop_batch).unwrap();

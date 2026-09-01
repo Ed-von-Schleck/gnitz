@@ -475,7 +475,7 @@ impl PkBuf {
     /// so no key of that width sorts above it. The upper bound an open-ended
     /// range takes, where a short key would sort *below* every full key sharing
     /// its prefix.
-    pub fn max(len: usize) -> Self {
+    pub(crate) fn max(len: usize) -> Self {
         debug_assert!(len <= MAX_PK_BYTES);
         let mut k = PkBuf {
             bytes: [0u8; MAX_PK_BYTES],
@@ -732,7 +732,11 @@ impl IndexKeySpec {
     ///
     /// `Ok(None)` = provably empty; `Err` = the descriptor pins every indexed
     /// column with no range column left.
-    pub fn range_keys(&self, stride: usize, range: &RangeDescriptor) -> Result<Option<(PkBuf, Option<PkBuf>)>, String> {
+    pub(crate) fn range_keys(
+        &self,
+        stride: usize,
+        range: &RangeDescriptor,
+    ) -> Result<Option<(PkBuf, Option<PkBuf>)>, String> {
         eq_prefix_range_keys(range, self.n as usize, stride, "index range", |natives| {
             self.seek_prefix(natives)
         })

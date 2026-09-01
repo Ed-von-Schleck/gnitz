@@ -86,14 +86,14 @@ fn fan_out_reaches_every_consumer_and_a_second_round_merges() {
     let mut inputs: Vec<Option<Batch>> = (0..3).map(|_| None).collect();
 
     DagEngine::fan_out(&mut inputs, &[0, 2], make_batch(&schema, &[(1, 1, 10)]));
-    assert_eq!(inputs[0].as_ref().map(|b| b.count), Some(1));
+    assert_eq!(inputs[0].as_ref().map(|b| b.len()), Some(1));
     assert!(inputs[1].is_none(), "a step this producer does not feed stays empty");
-    assert_eq!(inputs[2].as_ref().map(|b| b.count), Some(1));
+    assert_eq!(inputs[2].as_ref().map(|b| b.len()), Some(1));
 
     // Second round: both slots already hold rows, so both take the union.
     DagEngine::fan_out(&mut inputs, &[0, 2], make_batch(&schema, &[(2, 1, 20)]));
-    assert_eq!(inputs[0].as_ref().map(|b| b.count), Some(2), "merged, not overwritten");
-    assert_eq!(inputs[2].as_ref().map(|b| b.count), Some(2));
+    assert_eq!(inputs[0].as_ref().map(|b| b.len()), Some(2), "merged, not overwritten");
+    assert_eq!(inputs[2].as_ref().map(|b| b.len()), Some(2));
 }
 
 /// An empty round still deposits a batch — that is what keeps a downstream
@@ -106,13 +106,13 @@ fn an_empty_round_fills_rather_than_merges() {
 
     DagEngine::fan_out(&mut inputs, &[0], Batch::empty_with_schema(&schema));
     assert_eq!(
-        inputs[0].as_ref().map(|b| b.count),
+        inputs[0].as_ref().map(|b| b.len()),
         Some(0),
         "the placeholder is queued"
     );
 
     DagEngine::fan_out(&mut inputs, &[0], make_batch(&schema, &[(1, 1, 10)]));
-    assert_eq!(inputs[0].as_ref().map(|b| b.count), Some(1));
+    assert_eq!(inputs[0].as_ref().map(|b| b.len()), Some(1));
 }
 
 // ── The drivers ─────────────────────────────────────────────────────────────

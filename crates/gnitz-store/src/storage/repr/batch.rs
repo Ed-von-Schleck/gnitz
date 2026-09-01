@@ -365,6 +365,9 @@ impl Layout {
 /// U128, wider for compound PKs.
 ///
 /// **2 heap allocations**: `data` and `blob`.
+///
+/// A row is appended through [`BatchBuilder`], [`Batch::push_key_row`] or
+/// [`Batch::push_zero_filled_row`]; the region writers and `count` are internal.
 pub struct Batch {
     data: Vec<u8>,
     pub blob: Vec<u8>,
@@ -377,7 +380,10 @@ pub struct Batch {
     /// side never re-derives it from the payload column count.
     pub(in crate::storage) num_regions: u8,
     capacity: u32,
-    pub count: usize,
+    /// Live row count. In-crate code reads and advances it directly; outside,
+    /// [`Batch::len`] reads it and the row appenders are the only writers, so
+    /// no counted row can exist without every region written for it.
+    pub(crate) count: usize,
     /// Cached row-layout claim (private; mutated only through the layout API).
     /// Fresh batches default to `Raw` — a forgotten raise degrades to a safe
     /// re-fold, never a lie.
@@ -424,7 +430,7 @@ impl Batch {
     /// Zero-allocation empty batch with this batch's exact shape (strides,
     /// region count, schema) — honest for schema-less join-shaped batches too.
     /// The empty return / swap-placeholder constructor.
-    pub fn empty_like(&self) -> Self {
+    pub(crate) fn empty_like(&self) -> Self {
         Self::empty_from(self.strides, self.num_regions, self.schema)
     }
 
@@ -576,13 +582,23 @@ impl Batch {
 
     // ── Read accessors ──────────────────────────────────────────────────
 
+    /// Live row count.
     #[inline]
-    pub fn pk_data(&self) -> &[u8] {
+    pub fn len(&self) -> usize {
+        self.count
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    #[inline]
+    pub(crate) fn pk_data(&self) -> &[u8] {
         let off = self.offsets[REG_PK];
         &self.data[off..off + self.count * self.strides[REG_PK] as usize]
     }
     #[inline]
-    pub fn weight_data(&self) -> &[u8] {
+    pub(crate) fn weight_data(&self) -> &[u8] {
         let off = self.offsets[REG_WEIGHT];
         &self.data[off..off + self.count * 8]
     }
@@ -598,7 +614,7 @@ impl Batch {
         &self.data[off..off + self.count * self.strides[r] as usize]
     }
     #[inline]
-    pub fn num_payload_cols(&self) -> usize {
+    pub(crate) fn num_payload_cols(&self) -> usize {
         self.num_regions as usize - REG_PAYLOAD_START
     }
     /// Byte width of the PK region (8 for U64 PK, 16 for U128/wide-narrow,
@@ -611,25 +627,25 @@ impl Batch {
     // ── Mutable slice accessors ─────────────────────────────────────────
 
     #[inline]
-    pub fn pk_data_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn pk_data_mut(&mut self) -> &mut [u8] {
         let off = self.offsets[REG_PK];
         let end = off + self.count * self.strides[REG_PK] as usize;
         &mut self.data[off..end]
     }
     #[inline]
-    pub fn weight_data_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn weight_data_mut(&mut self) -> &mut [u8] {
         let off = self.offsets[REG_WEIGHT];
         let end = off + self.count * 8;
         &mut self.data[off..end]
     }
     #[inline]
-    pub fn null_bmp_data_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn null_bmp_data_mut(&mut self) -> &mut [u8] {
         let off = self.offsets[REG_NULL_BMP];
         let end = off + self.count * 8;
         &mut self.data[off..end]
     }
     #[inline]
-    pub fn col_data_mut(&mut self, pi: usize) -> &mut [u8] {
+    pub(crate) fn col_data_mut(&mut self, pi: usize) -> &mut [u8] {
         let r = REG_PAYLOAD_START + pi;
         let off = self.offsets[r];
         let end = off + self.count * self.strides[r] as usize;
@@ -647,7 +663,7 @@ impl Batch {
     /// precedes any payload region, so the split is a plain `split_at_mut` at the
     /// column's offset; `blob` is a field beside `data` and splits off with it.
     #[inline]
-    pub fn col_null_and_blob_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
+    pub(crate) fn col_null_and_blob_mut(&mut self, pi: usize) -> (&mut [u8], &mut [u8], &mut Vec<u8>) {
         let n_off = self.offsets[REG_NULL_BMP];
         let n_end = n_off + self.count * 8;
         let r = REG_PAYLOAD_START + pi;
@@ -716,7 +732,7 @@ impl Batch {
     /// Summed weight of rows `[start, end)`, read straight off the contiguous
     /// weight region so the fold vectorizes (rather than a `get_weight` per row).
     #[inline]
-    pub fn sum_weights(&self, start: usize, end: usize) -> i64 {
+    pub(crate) fn sum_weights(&self, start: usize, end: usize) -> i64 {
         self.weight_data()[start * 8..end * 8]
             .chunks_exact(8)
             .map(|w| i64::from_le_bytes(w.try_into().unwrap()))
@@ -738,7 +754,7 @@ impl Batch {
     }
     /// Overwrite `row`'s null-bitmap word (bit N = payload slot N is NULL).
     #[inline]
-    pub fn set_null_word(&mut self, row: usize, word: u64) {
+    pub(crate) fn set_null_word(&mut self, row: usize, word: u64) {
         let off = self.offsets[REG_NULL_BMP] + row * 8;
         self.data[off..off + 8].copy_from_slice(&word.to_le_bytes());
     }
@@ -752,14 +768,13 @@ impl Batch {
 
     /// Ensure the data buffer has room for at least one more row.
     #[inline]
-    pub fn ensure_row_capacity(&mut self) {
+    pub(crate) fn ensure_row_capacity(&mut self) {
         self.reserve_rows(1);
     }
 
     /// Ensure the data buffer has room for at least `n` more rows beyond `count`.
-    /// `#[inline]` for the already-has-room test: without it both this and
-    /// [`Self::ensure_row_capacity`] are out-of-line calls through the GOT in any
-    /// build without cross-crate LTO, once per row appended from another crate.
+    /// `#[inline]` for the already-has-room test, which is the whole call on
+    /// every append but the growing one.
     #[inline]
     pub fn reserve_rows(&mut self, n: usize) {
         if self.count + n <= self.capacity as usize {
@@ -847,15 +862,15 @@ impl Batch {
     }
 
     #[inline]
-    pub fn extend_weight(&mut self, d: &[u8]) {
+    pub(crate) fn extend_weight(&mut self, d: &[u8]) {
         self.extend_region(REG_WEIGHT, d);
     }
     #[inline]
-    pub fn extend_null_bmp(&mut self, d: &[u8]) {
+    pub(crate) fn extend_null_bmp(&mut self, d: &[u8]) {
         self.extend_region(REG_NULL_BMP, d);
     }
     #[inline]
-    pub fn extend_col(&mut self, pi: usize, d: &[u8]) {
+    pub(crate) fn extend_col(&mut self, pi: usize, d: &[u8]) {
         self.extend_region(REG_PAYLOAD_START + pi, d);
     }
 
@@ -867,7 +882,7 @@ impl Batch {
     /// `extend_pk_opk` / `extend_pk_bytes`; the assert below holds every call
     /// site to that.
     #[inline]
-    pub fn extend_pk(&mut self, pk: u128) {
+    pub(crate) fn extend_pk(&mut self, pk: u128) {
         debug_assert!(
             !self.schema.pk_columns().any(|(_, c)| c.is_signed()),
             "extend_pk writes an unflipped right-aligned big-endian key: a PK with a signed column \
@@ -878,7 +893,7 @@ impl Batch {
     }
 
     #[inline]
-    pub fn extend_pk_bytes(&mut self, bytes: &[u8]) {
+    pub(crate) fn extend_pk_bytes(&mut self, bytes: &[u8]) {
         assert_eq!(
             bytes.len(),
             self.strides[REG_PK] as usize,
@@ -889,21 +904,28 @@ impl Batch {
 
     /// Append one whole row of a **payload-free** schema — an index entry, whose
     /// columns are all PK, so its key is the entire row.
-    ///
-    /// Every fixed region and `count` advance together here. Written out at the
-    /// call site instead, a dropped `extend_null_bmp` leaves that region's cursor
-    /// one row behind `count` for the rest of the batch, with no error: the null
-    /// words simply read as whatever the uninitialised arena held.
     #[inline]
-    pub(crate) fn push_key_row(&mut self, pk: &[u8], weight: i64) {
+    pub fn push_key_row(&mut self, pk: &[u8], weight: i64) {
         debug_assert_eq!(
             self.num_payload_cols(),
             0,
-            "push_key_row writes no payload region; use the per-column extends",
+            "push_key_row is the payload-free schema; use push_zero_filled_row or BatchBuilder",
         );
+        self.push_zero_filled_row(pk, weight, 0);
+    }
+
+    /// Append one row whose payload carries no value: the PK region from `pk`
+    /// (exactly `pk_stride` OPK bytes), `weight`, `null_word`, then every payload
+    /// column zero-filled. The payload-free case is [`Self::push_key_row`].
+    #[inline]
+    pub fn push_zero_filled_row(&mut self, pk: &[u8], weight: i64, null_word: u64) {
         self.extend_pk_bytes(pk);
         self.extend_weight(&weight.to_le_bytes());
-        self.extend_null_bmp(&0u64.to_le_bytes());
+        self.extend_null_bmp(&null_word.to_le_bytes());
+        for pi in 0..self.num_payload_cols() {
+            let width = self.strides[REG_PAYLOAD_START + pi] as usize;
+            self.fill_col_zero(pi, width);
+        }
         self.count += 1;
     }
 
@@ -922,7 +944,7 @@ impl Batch {
 
     /// Fill `nbytes` of zeros at the current row position in a payload column.
     #[inline]
-    pub fn fill_col_zero(&mut self, pi: usize, nbytes: usize) {
+    pub(crate) fn fill_col_zero(&mut self, pi: usize, nbytes: usize) {
         let r = REG_PAYLOAD_START + pi;
         if self.count >= self.capacity as usize {
             self.ensure_row_capacity();
@@ -1193,7 +1215,7 @@ impl Batch {
 
     /// Reset to no layout claim. Every order/fold-destroying mutator calls this.
     #[inline]
-    pub fn downgrade(&mut self) {
+    pub(crate) fn downgrade(&mut self) {
         self.layout = Layout::Raw;
     }
 
@@ -1558,7 +1580,7 @@ impl Batch {
     ///
     /// `key` must be exactly `pk_stride` OPK bytes — identical width to the
     /// stored regions it is compared against.
-    pub fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
+    pub(crate) fn find_lower_bound_bytes(&self, key: &[u8]) -> usize {
         let stride = self.pk_stride() as usize;
         let cp = self.pk_col_ptr();
         unsafe { super::columnar::seek_lower_bound(self.count, stride, cp, key) }
@@ -1569,7 +1591,7 @@ impl Batch {
     /// IS the hint, never worse than `find_lower_bound_bytes`. Used by the
     /// sorted-stream co-group merge, whose probe keys ascend, so the boundary
     /// only moves forward. `key` must be exactly `pk_stride` OPK bytes.
-    pub fn advance_to(&self, key: &[u8], hint: usize) -> usize {
+    pub(crate) fn advance_to(&self, key: &[u8], hint: usize) -> usize {
         let stride = self.pk_stride() as usize;
         let cp = self.pk_col_ptr();
         unsafe { super::columnar::seek_advance_to(self.count, stride, cp, key, hint) }
@@ -1616,7 +1638,7 @@ impl Batch {
     /// Call [`Self::share_blob_from`] first to skip per-cell string relocation
     /// (see `append_ranges_inner`); it is a pure optimization, correct either
     /// way.
-    pub fn append_ranges(&mut self, src: &Batch, ranges: &[(usize, usize)]) {
+    pub(crate) fn append_ranges(&mut self, src: &Batch, ranges: &[(usize, usize)]) {
         self.append_session(range_rows(ranges))
             .push_ranges(&src.as_mem_batch(), ranges);
     }
@@ -1645,7 +1667,7 @@ impl Batch {
     /// order*, which is what lets it inherit `src`'s layout tag; an overlap would
     /// repeat a row and break the distinctness half of a `Consolidated` claim. The
     /// blob arm is [`should_relocate_blob`](Self::should_relocate_blob)'s call.
-    pub fn from_ranges(src: &Batch, ranges: &[(usize, usize)], schema: &SchemaDescriptor) -> Batch {
+    pub(crate) fn from_ranges(src: &Batch, ranges: &[(usize, usize)], schema: &SchemaDescriptor) -> Batch {
         debug_assert!(
             ranges.windows(2).all(|w| w[0].1 <= w[1].0),
             "from_ranges: ranges must be disjoint and ascending",
@@ -1761,7 +1783,7 @@ impl Batch {
     /// what makes relocation the canonicalizing gate for W2M frames, the one
     /// German-string ingress that skips `validate_string_heap_extents`.
     #[inline]
-    pub fn shares_blob_with(&self, src: &MemBatch<'_>) -> bool {
+    pub(crate) fn shares_blob_with(&self, src: &MemBatch<'_>) -> bool {
         debug_assert!(
             self.blob_id != 0,
             "shares_blob_with: a Batch must never carry the wire blob_id 0"
@@ -1772,7 +1794,7 @@ impl Batch {
     /// Copy blob content from `src` and record that this batch shares `src`'s
     /// blob identity, so a subsequent `append_ranges`/`append_batch` from `src`
     /// copies German-string structs verbatim instead of relocating each cell.
-    pub fn share_blob_from(&mut self, src: &Batch) {
+    pub(crate) fn share_blob_from(&mut self, src: &Batch) {
         // Reuse the pooled destination buffer rather than dropping it for a
         // fresh exact-sized clone (an allocation per call). The blob bytes are
         // identical, so the shared blob_id and every German-string offset stay
@@ -1783,7 +1805,7 @@ impl Batch {
     }
 
     /// Number of regions in the standard layout (including blob).
-    pub fn num_regions_total(&self) -> usize {
+    pub(crate) fn num_regions_total(&self) -> usize {
         self.num_regions as usize + 1
     }
 
@@ -1791,7 +1813,7 @@ impl Batch {
     /// region, the whole heap for the trailing blob — for callers that frame the
     /// batch into a byte buffer (`batch_wire`'s wire encoders) or hand it to the
     /// shard writer. The region copy stays bounds-checked, no raw pointers.
-    pub fn region_slice(&self, idx: usize) -> &[u8] {
+    pub(crate) fn region_slice(&self, idx: usize) -> &[u8] {
         let blob_idx = self.num_regions as usize;
         if idx < blob_idx {
             let off = self.offsets[idx];
@@ -1816,7 +1838,7 @@ impl Batch {
     /// All regions as bounds-checked byte slices in canonical order (pk, weight,
     /// null, payload…, blob) — the safe region view the shard writer consumes.
     /// Mapping [`Batch::region_slice`] over every region, blob included.
-    pub fn regions(&self) -> Vec<&[u8]> {
+    pub(crate) fn regions(&self) -> Vec<&[u8]> {
         (0..self.num_regions_total()).map(|i| self.region_slice(i)).collect()
     }
 
@@ -1970,7 +1992,7 @@ impl Batch {
     /// let cs = Batch::consolidate_if_needed(delta, schema);
     /// let c: &Batch = cs.as_ref().unwrap_or(delta);
     /// ```
-    pub fn consolidate_if_needed(batch: &Batch, schema: &SchemaDescriptor) -> Option<Batch> {
+    pub(crate) fn consolidate_if_needed(batch: &Batch, schema: &SchemaDescriptor) -> Option<Batch> {
         (!batch.consolidated_verified(schema)).then(|| Self::consolidate_into_new(batch, schema))
     }
 
@@ -2031,7 +2053,7 @@ impl RowSource for Batch {
     }
     #[inline(always)]
     fn row_count(&self) -> usize {
-        self.count
+        Batch::len(self)
     }
 }
 
@@ -2164,6 +2186,15 @@ impl BatchBuilder {
         self.begin_row_tail(weight);
     }
 
+    /// [`Self::begin_row`] for a PK already in its at-rest OPK image: `pk` is
+    /// written verbatim and must be exactly `pk_stride` bytes. For a caller
+    /// holding native column values, [`Self::begin_row_opk`] encodes them.
+    pub fn begin_row_bytes(&mut self, pk: &[u8], weight: i64) {
+        self.batch.ensure_row_capacity();
+        self.batch.extend_pk_bytes(pk);
+        self.begin_row_tail(weight);
+    }
+
     fn begin_row_tail(&mut self, weight: i64) {
         self.batch.extend_weight(&weight.to_le_bytes());
         self.curr_null_word = 0;
@@ -2203,7 +2234,8 @@ impl BatchBuilder {
     /// Put a float for the current payload column, narrowed to that column's own
     /// width — the same value-fits-its-column shape [`Self::put_int`] has. An F32
     /// column stores the `as f32` narrowing, so a caller need not know the width.
-    pub fn put_float(&mut self, val: f64) {
+    #[cfg(test)]
+    pub(crate) fn put_float(&mut self, val: f64) {
         let col_size = self.schema().columns[self.physical_col_idx()].size() as usize;
         match col_size {
             4 => self.batch.extend_col(self.curr_col, &(val as f32).to_le_bytes()),
@@ -2214,7 +2246,7 @@ impl BatchBuilder {
 
     /// Put raw bytes for the current STRING/BLOB payload column — the one
     /// German-string encode site; `read_german_bytes` is the read-back twin.
-    pub fn put_blob(&mut self, b: &[u8]) {
+    pub(crate) fn put_blob(&mut self, b: &[u8]) {
         let st = gnitz_wire::encode_german_string(b, &mut self.batch.blob);
         self.batch.extend_col(self.curr_col, &st);
         self.curr_col += 1;

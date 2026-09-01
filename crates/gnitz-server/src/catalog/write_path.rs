@@ -152,7 +152,7 @@ impl CatalogEngine {
     /// no-op cascades don't accumulate unread entries.
     pub(crate) fn apply_and_enqueue_family(&mut self, family: SysFamily, mut batch: Batch) -> Result<(), String> {
         self.apply_local(family, &mut batch, self.ctx.ddl_zone_lsn())?;
-        if batch.count > 0 {
+        if !batch.is_empty() {
             self.pending_broadcasts.push((family, batch));
         }
         Ok(())
@@ -405,7 +405,7 @@ impl CatalogEngine {
             // applied — so no PK reaches here with a zero-weight row alone.
             let net: FxHashMap<u128, i64> = pk_signatures(&batch).iter().map(|s| (s.pk, s.sum)).collect();
             let (created, dropped): (Vec<u32>, Vec<u32>) =
-                (0..batch.count as u32).partition(|&i| net[&batch.get_pk(i as usize)] >= 0);
+                (0..batch.len() as u32).partition(|&i| net[&batch.get_pk(i as usize)] >= 0);
             if dropped.is_empty() {
                 undo_create.push((family, batch));
             } else if created.is_empty() {

@@ -1218,7 +1218,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
     // guard drops first: the reply is a socket write, and this lock is
     // writer-preferring.
     let batch = match decoded.data_batch {
-        Some(b) if b.count > 0 => b,
+        Some(b) if !b.is_empty() => b,
         _ => {
             drop(_cat);
             send_ok_response(shared, peer, target_id, None, client_id, 0, client_version).await;
@@ -1465,7 +1465,7 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
         validate_schema_match(&wire_schema, &catalog_schema)?;
         let batch = decode_client_batch(fam.wal_block, &catalog_schema)
             .map_err(|e| format!("TXN family {tid} decode error: {e}"))?;
-        if batch.count == 0 {
+        if batch.is_empty() {
             return Err(format!("TXN: empty batch for table {tid}").into());
         }
         let mode = gnitz_wire::WireConflictMode::from_wire(fam.mode)
@@ -1590,7 +1590,7 @@ fn reject_not_null_bits(b: &Batch, schema: &SchemaDescriptor) -> Result<(), &'st
     // so a per-row branch would only add work.
     let mb = b.as_mem_batch();
     let mut acc = 0u64;
-    for row in 0..b.count {
+    for row in 0..b.len() {
         acc |= mb.get_null_word(row);
     }
     if acc & not_null != 0 {
@@ -2356,7 +2356,7 @@ async fn handle_system_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, ta
     let _g = shared.catalog_rwlock.read().await;
     match guard_panic("scan", || shared.cat_mut().scan_family(target_id)) {
         Ok((b, _)) => {
-            let batch_ref = if b.count > 0 { Some(b) } else { None };
+            let batch_ref = if !b.is_empty() { Some(b) } else { None };
             send_ok_response(
                 shared,
                 peer,
@@ -2583,7 +2583,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         // which is what lets one DROP SCHEMA bundle carry
         // `[VIEW_TAB, TABLE_TAB, SCHEMA_TAB]`. A mixed-sign bundle (an ALTER
         // VIEW's retract-then-register) keeps the creation order.
-        if ordered.iter().all(|(_, b)| (0..b.count).all(|i| b.get_weight(i) < 0)) {
+        if ordered.iter().all(|(_, b)| (0..b.len()).all(|i| b.get_weight(i) < 0)) {
             ordered.sort_by_key(|(f, _)| std::cmp::Reverse(f.topo_priority()));
         } else {
             ordered.sort_by_key(|(f, _)| f.topo_priority());
@@ -2818,7 +2818,7 @@ fn stream_push_error(target_id: i64, batch: &Batch, mode: gnitz_wire::WireConfli
         return None;
     }
     // Located again only to name it in the message.
-    let i = (0..batch.count)
+    let i = (0..batch.len())
         .find(|&i| batch.get_weight(i) <= 0)
         .expect("just found one");
     Some(format!(

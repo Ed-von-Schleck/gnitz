@@ -41,7 +41,7 @@ impl CatalogEngine {
     pub(super) fn submit_retraction(&mut self, family: SysFamily, pk: u128) -> Result<(), String> {
         let schema = family.schema();
         let batch = retract_pk_list(self.sys_store(family), &schema, vec![pk]);
-        if batch.count == 0 {
+        if batch.is_empty() {
             return Err("Entity does not exist in catalog".into());
         }
         self.submit(family, batch)

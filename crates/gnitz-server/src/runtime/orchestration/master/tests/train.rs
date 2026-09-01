@@ -219,7 +219,7 @@ fn drain_index_scan_merges_chunked_and_single_frame_trains() {
         &schema,
         |mb, frame_len| {
             assert!(frame_len > 0, "sink receives the raw frame byte length");
-            for i in 0..mb.count {
+            for i in 0..mb.len() {
                 rows.push((
                     gnitz_wire::widen_pk_be(mb.get_pk_bytes(i), mb.pk_stride as usize),
                     mb.get_weight(i),

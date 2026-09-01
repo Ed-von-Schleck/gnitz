@@ -231,13 +231,13 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
     let mut row_count: usize = 0;
     match first {
         CommitRequest::Push(p) => {
-            row_count = p.batch.count;
+            row_count = p.batch.len();
             pushes.push(p);
         }
         // A transaction is one indivisible entry — its whole family set rides
         // this batch; its row count is the sum of every family's rows.
         CommitRequest::Txn(txn) => {
-            row_count = txn.families.iter().map(|f| f.batch.count).sum();
+            row_count = txn.families.iter().map(|f| f.batch.len()).sum();
             txns.push(txn);
         }
         CommitRequest::Barrier { kind, done } => barriers.push((kind, done)),
@@ -245,11 +245,11 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
     while row_count < MAX_PENDING_ROWS {
         match rx.try_recv() {
             Some(CommitRequest::Push(p)) => {
-                row_count += p.batch.count;
+                row_count += p.batch.len();
                 pushes.push(p);
             }
             Some(CommitRequest::Txn(txn)) => {
-                row_count += txn.families.iter().map(|f| f.batch.count).sum::<usize>();
+                row_count += txn.families.iter().map(|f| f.batch.len()).sum::<usize>();
                 txns.push(txn);
             }
             Some(CommitRequest::Barrier { kind, done }) => {
@@ -561,7 +561,7 @@ async fn commit_pushes(
             batches.push(p.batch);
             dones.push(p.done);
         }
-        let total_rows: usize = batches.iter().map(|b| b.count).sum();
+        let total_rows: usize = batches.iter().map(|b| b.len()).sum();
 
         // Single-push: take ownership of the client's batch (no merge).
         // Multi-push: pop a pooled merged batch (or alloc fresh) and
@@ -579,7 +579,7 @@ async fn commit_pushes(
             };
             m.clear();
             for pb in batches.iter() {
-                m.append_batch(pb, 0, pb.count);
+                m.append_batch(pb, 0, pb.len());
             }
             Ok(m)
         });
@@ -786,7 +786,7 @@ async fn commit_pushes(
             let mut tr = shared.tick_rows.borrow_mut();
             for g in &groups {
                 if g.write_err.is_none() {
-                    *tr.entry(g.tid).or_insert(0) += g.merged.count;
+                    *tr.entry(g.tid).or_insert(0) += g.merged.len();
                 }
             }
         }

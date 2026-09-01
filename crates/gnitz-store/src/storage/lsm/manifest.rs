@@ -131,12 +131,12 @@ impl ManifestEntryRaw {
 
 /// Header metadata serialized alongside the entries.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct ManifestHeader {
+pub(crate) struct ManifestHeader {
     pub compact_seq: u64,
     /// The checkpoint generation the ephemeral round published at. Read by the
     /// conditional reload (`Rederive`) and the boot resume verdict.
     /// A base publish stamps 0; nothing reads it back from a base table.
-    pub checkpoint_gen: u64,
+    pub(crate) checkpoint_gen: u64,
     /// The layout sequence of the `w{k}of{n}` child set this manifest belongs
     /// to. `Table::new` loads it and every publish re-stamps it, so it survives
     /// checkpoints; the boot relayout stamps a target set one above its
@@ -382,8 +382,16 @@ pub(crate) fn tmp_path(dir: &str) -> String {
 ///
 /// The digest spans the entries, so no header-only peek can skip reading them,
 /// but decoding them is another matter — this stops at [`verify`].
-pub fn peek_header(path: &std::ffi::CStr) -> Result<Option<ManifestHeader>, StorageError> {
+pub(crate) fn peek_header(path: &std::ffi::CStr) -> Result<Option<ManifestHeader>, StorageError> {
     Ok(read_bytes(path)?.and_then(|buf| Some(verify(&buf).ok()?.0)))
+}
+
+/// Whether the manifest at `manifest_path` carries `generation`. `Ok(false)` for
+/// absent, damaged, or a different generation. A failed read stays `Err`: it is
+/// not evidence of staleness.
+pub(crate) fn at_generation(manifest_path: &str, generation: u64) -> Result<bool, StorageError> {
+    let c = super::super::cstr(manifest_path.to_string())?;
+    Ok(peek_header(&c)?.is_some_and(|h| h.checkpoint_gen == generation))
 }
 
 /// Stage `entries` as `dir`'s manifest and rename it into place, durable at

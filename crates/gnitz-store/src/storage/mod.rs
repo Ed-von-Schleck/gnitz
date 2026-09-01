@@ -1,15 +1,15 @@
 //! Storage subsystem: WAL, shards, run sets, merge, cursors, and tables.
 //!
 //! Engine code imports from `crate::storage::{Type, fn}`. What a consumer can
-//! *name* is what the re-exports below spell `pub use`; a `pub(crate) use` is
-//! the storage facade for this crate's own rungs and nothing more. The
-//! submodules stay private, so a `pub` item inside one is still dead-code
-//! checked — only the two lists below and `batch_pool` escape that.
+//! *name* is what the two lists below spell `pub use`, plus `batch_pool`; a
+//! `pub(crate) use` is the storage facade for this crate's own rungs and nothing
+//! more. The submodules stay private, so a `pub` item inside one is still
+//! dead-code checked.
 //!
-//! Naming is not the whole surface: a type returned by a published signature is
-//! reachable without being nameable, so a `pub(crate)` re-export can still be
-//! API in practice — treat a change to one such type's methods as a breaking
-//! change.
+//! Naming is not the whole surface: a type reached through a published signature
+//! or variant is reachable without being nameable, so a `pub(crate)` re-export
+//! can still be API in practice — treat a change to one such type's methods as a
+//! breaking change.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
@@ -73,13 +73,13 @@ pub use columnar::compare_rows_except;
 // rule across two import paths, visibly — `ops/reduce/sort.rs` and
 // `read/scan_spec.rs` each imported from both in adjacent lines.
 pub(crate) use lsm::child_dir::reclaim_retired_children;
-pub use lsm::child_dir::{fsync_dir, state_child_manifests};
+pub use lsm::child_dir::{children_at_generation, fsync_dir};
 pub use lsm::child_dir::{remove_child, ChildAddr};
 // A directory sweep is the one child-dir primitive a `gnitz-store` consumer runs
 // itself: the mirror reclaims the copies its own record file no longer names.
 pub use lsm::child_dir::subdir_names;
-pub use lsm::index_gather::{BoundedIndexCursor, SourceCursor};
-pub use lsm::manifest::peek_header;
+pub(crate) use lsm::index_gather::BoundedIndexCursor;
+pub use lsm::index_gather::SourceCursor;
 pub use lsm::manifest::topology_word;
 pub(crate) use lsm::read_cursor::empty as empty_cursor;
 pub use lsm::read_cursor::{PkSetGather, ReadCursor};

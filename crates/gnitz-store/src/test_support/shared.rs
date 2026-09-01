@@ -19,7 +19,7 @@
 use proptest::prelude::*;
 
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, Layout, RecoverySource, Table};
+use gnitz_store::storage::{Batch, BatchBuilder, Layout, RecoverySource, Table};
 use gnitz_wire::type_code;
 
 /// A schema with one PK column per type code in `tcs`, plus a single trailing
@@ -54,27 +54,13 @@ pub fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch 
 /// honestly `Raw`, for tests whose rows are unsorted or that exercise the
 /// sort/fold paths themselves.
 pub fn make_batch_raw(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
-    let width = payload_slot_width(schema);
+    let mut b = BatchBuilder::new(*schema);
     for &(pk, w, val) in rows {
-        b.extend_pk(pk as u128);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes()[..width]);
-        b.count += 1;
+        b.begin_row(pk as u128, w);
+        b.put_int(val as u128);
+        b.end_row();
     }
-    b
-}
-
-/// How many of an `i64` payload's little-endian bytes belong in payload slot 0.
-/// `extend_col` writes `d.len()` bytes at `row * col_size`, so an over-wide
-/// write into a sub-64-bit column spills into the next row — this is what lets
-/// the one builder serve every fixed-int payload width.
-pub fn payload_slot_width(schema: &SchemaDescriptor) -> usize {
-    schema
-        .payload_columns()
-        .next()
-        .map_or(8, |(_, c)| (c.size() as usize).min(8))
+    b.finish()
 }
 
 /// A U64 PK plus one `payload` column — the reindex/promotion tests' counterpart
@@ -246,11 +232,7 @@ pub fn pk_only_schema(types: &[u8]) -> SchemaDescriptor {
 pub fn batch_of_pk_bytes(schema: &SchemaDescriptor, pks: &[impl AsRef<[u8]>]) -> Batch {
     let mut b = Batch::with_capacity(*schema, pks.len().max(1));
     for pk in pks {
-        b.extend_pk_bytes(pk.as_ref());
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &0i64.to_le_bytes());
-        b.count += 1;
+        b.push_zero_filled_row(pk.as_ref(), 1, 0);
     }
     b
 }
@@ -271,15 +253,13 @@ pub fn opk_pk(schema: &SchemaDescriptor, vals: &[u128]) -> Vec<u8> {
 /// [`make_batch_raw`] over [`make_schema_u128_i64`]-shaped schemas — native
 /// u128 PKs, rows left `Raw` in the order given.
 pub fn make_batch_u128_raw(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut b = BatchBuilder::new(*schema);
     for &(pk, w, val) in rows {
-        b.extend_pk(pk);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
-        b.count += 1;
+        b.begin_row(pk, w);
+        b.put_int(val as u128);
+        b.end_row();
     }
-    b
+    b.finish()
 }
 
 /// [`make_batch_u128_raw`] plus the `Consolidated` certification. **Rows must
@@ -318,7 +298,7 @@ pub fn make_schema_u128_i64() -> SchemaDescriptor {
 /// be compared.
 pub fn zset_of(batch: &Batch, schema: &SchemaDescriptor) -> std::collections::HashMap<RowKey, i64> {
     let mut z: std::collections::HashMap<RowKey, i64> = std::collections::HashMap::new();
-    for row in 0..batch.count {
+    for row in 0..batch.len() {
         *z.entry(row_key(batch, schema, row)).or_insert(0) += batch.get_weight(row);
     }
     z.retain(|_, w| *w != 0);

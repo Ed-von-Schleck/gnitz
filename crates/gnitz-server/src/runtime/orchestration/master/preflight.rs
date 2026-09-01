@@ -74,7 +74,7 @@ pub(super) type PoolSlot = (i64, u64);
 /// panic on column writes. When `pooled.schema != Some(schema)`, the
 /// pooled allocation is dropped and a fresh batch is allocated instead.
 ///
-/// `push_pk` writes the per-row PK region (the only step that differs between
+/// `pk_of` yields the row's OPK key bytes (the only step that differs between
 /// the `u128` and byte-span key forms). Keys arrive as an iterator so a caller
 /// that already holds them in a map or a tuple list need not materialize a
 /// second vector to probe them.
@@ -82,7 +82,7 @@ fn build_check_batch_with<K>(
     schema: &SchemaDescriptor,
     keys: impl ExactSizeIterator<Item = K>,
     pooled: Option<Batch>,
-    mut push_pk: impl FnMut(&mut Batch, &K),
+    mut pk_of: impl FnMut(&K) -> PkBuf,
 ) -> Batch {
     let n = keys.len();
     let mut batch = match pooled {
@@ -96,14 +96,7 @@ fn build_check_batch_with<K>(
     };
     let null_word: u64 = gnitz_expr::SchemaFacts::nullable_payload_slots(schema);
     for key in keys {
-        batch.ensure_row_capacity();
-        push_pk(&mut batch, &key);
-        batch.extend_weight(&1i64.to_le_bytes());
-        batch.extend_null_bmp(&null_word.to_le_bytes());
-        for (c, col) in schema.payload_columns() {
-            batch.fill_col_zero(c, col.size() as usize);
-        }
-        batch.count += 1;
+        batch.push_zero_filled_row(pk_of(&key).pk_bytes(), 1, null_word);
     }
     batch
 }
@@ -127,21 +120,19 @@ pub(super) fn build_check_batch(
     // zero — only the leading column is prefix-matched for the existence check.
     // Narrow and wide composites share this layout (the suffix width differs,
     // the leading does not), so there is no narrow/wide split.
-    build_check_batch_with(schema, keys.iter(), pooled, |b, &&k| {
-        b.extend_pk_bytes(enc_key(schema, k, src_type).pk_bytes());
-    })
+    build_check_batch_with(schema, keys.iter(), pooled, |&&k| enc_key(schema, k, src_type))
 }
 
 /// Build a check batch from `keys`, OPK byte spans already in the target
 /// schema's key layout — the distinct PKs the preflight aggregation collected,
-/// or a unique index's leading-key spans. Writes each span verbatim into the PK
+/// or a unique index's leading-key spans. Each span lands verbatim in the PK
 /// region, so unlike `build_check_batch` no column-0 re-encoding is applied.
 pub(super) fn build_check_batch_pk_bytes<'k>(
     schema: &SchemaDescriptor,
     keys: impl ExactSizeIterator<Item = &'k [u8]>,
     pooled: Option<Batch>,
 ) -> Batch {
-    build_check_batch_with(schema, keys, pooled, |b, k| b.extend_pk_bytes(k))
+    build_check_batch_with(schema, keys, pooled, |k| PkBuf::from_bytes(k))
 }
 
 /// Return `batch` to `disp.check_batch_pool[target_id]` and cap the pool depth.
@@ -231,7 +222,7 @@ impl PreflightKeyStream {
             // held; record where, then let the view go.
             self.pk_off = pk.as_ptr() as usize - bytes.as_ptr() as usize;
             self.pk_stride = mb.pk_stride as usize;
-            self.count = mb.count;
+            self.count = mb.len();
         }
         drop(zc); // borrows `bytes`
         self.slot = Some(slot);
@@ -455,7 +446,7 @@ impl FkProbePlan {
 /// table's families in frame order it yields the post-transaction fold; applied
 /// over a prefix of them it yields the state an Error family is checked against.
 fn fold_family<'a>(overlay: &mut Overlay<'a>, fi: usize, b: &'a Batch) {
-    for row in 0..b.count {
+    for row in 0..b.len() {
         let w = b.get_weight(row);
         if w == 0 {
             continue;
@@ -486,8 +477,8 @@ struct PkFold {
 /// Error-mode PK rule, which counts a PK's insertions within one family — what
 /// the last-op-wins whole-bundle `Overlay` cannot express.
 fn pk_fold(batch: &Batch) -> FxHashMap<&[u8], PkFold> {
-    let mut fold: FxHashMap<&[u8], PkFold> = FxHashMap::with_capacity_and_hasher(batch.count, Default::default());
-    for i in 0..batch.count {
+    let mut fold: FxHashMap<&[u8], PkFold> = FxHashMap::with_capacity_and_hasher(batch.len(), Default::default());
+    for i in 0..batch.len() {
         let w = batch.get_weight(i);
         if w == 0 {
             continue;
@@ -564,7 +555,7 @@ impl<'a> TxnBundle<'a> {
             if !reads_overlay(disp, tid) {
                 continue;
             }
-            let rows = by_tid[&tid].iter().map(|&fi| families[fi].batch.count).sum();
+            let rows = by_tid[&tid].iter().map(|&fi| families[fi].batch.len()).sum();
             let mut overlay = Overlay::with_capacity_and_hasher(rows, Default::default());
             for &fi in &by_tid[&tid] {
                 fold_family(&mut overlay, fi, &families[fi].batch);
@@ -742,7 +733,7 @@ impl MasterDispatcher {
             } else {
                 let mut candidate: FxHashSet<&[u8]> = FxHashSet::default();
                 for fam in b.families_of(tid).filter(|f| matches!(f.mode, WireConflictMode::Error)) {
-                    for row in 0..fam.batch.count {
+                    for row in 0..fam.batch.len() {
                         if fam.batch.get_weight(row) > 0 {
                             candidate.insert(fam.batch.get_pk_bytes(row));
                         }
@@ -1206,7 +1197,7 @@ impl MasterDispatcher {
             let Some(rows) = rows? else { continue };
             let child_loc = b.schema(plan.edge.child_tid).locate(plan.edge.fk_col);
             let child_overlay = b.overlay(plan.edge.child_tid);
-            for j in 0..rows.count {
+            for j in 0..rows.len() {
                 let still_refs = match child_overlay.get(rows.get_pk_bytes(j)) {
                     None => true, // untouched committed child still references v
                     Some(FoldOp::Deleted) => false,
@@ -1491,7 +1482,7 @@ impl MasterDispatcher {
             for w in 0..nw {
                 let decoded = &decoded_vec[check_idx * nw + w];
                 if let Some(ref batch) = decoded.data_batch {
-                    for j in 0..batch.count {
+                    for j in 0..batch.len() {
                         if batch.get_weight(j) == 1 {
                             results[check_idx].insert(PkBuf::from_bytes(batch.get_pk_bytes(j)));
                         }
@@ -1579,7 +1570,7 @@ impl MasterDispatcher {
             // once per frame rather than once per row. `ColumnLocator`'s own
             // readers cannot: each re-resolves the window through `get_col_ptr`.
             let col_data = b.col_data(slot, size);
-            for j in 0..b.count {
+            for j in 0..b.len() {
                 if !gnitz_wire::null_word_get(b.get_null_word(j), slot) {
                     out.insert(
                         PkBuf::from_bytes(b.get_pk_bytes(j)),

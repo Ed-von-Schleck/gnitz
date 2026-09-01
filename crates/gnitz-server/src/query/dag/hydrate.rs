@@ -97,7 +97,7 @@ impl SkeletonHydrator for DagEngine {
                     b.schema.same_physical_layout(&view_schema),
                     "hydration produced a batch that is not in the view's schema",
                 );
-                out.append_batch(&b, 0, b.count);
+                out.append_batch(&b, 0, b.len());
             }
         }
 
@@ -129,7 +129,7 @@ fn debug_assert_hydration_matches(out: &Batch, keys: &[u8], coarse: &[i64]) {
     let stride = keys.len() / coarse.len();
     let mut ki = 0;
     let mut i = 0;
-    while i < out.count {
+    while i < out.len() {
         let pk = out.get_pk_bytes(i);
         // Every skeleton key carries a strictly positive coarse weight, so a key
         // the replay produced nothing for is a bug — as is a key it produced rows
@@ -143,7 +143,7 @@ fn debug_assert_hydration_matches(out: &Batch, keys: &[u8], coarse: &[i64]) {
             "hydration produced rows for a PK no skeleton row named",
         );
         let mut sum = 0i64;
-        while i < out.count && out.get_pk_bytes(i) == pk {
+        while i < out.len() && out.get_pk_bytes(i) == pk {
             sum += out.get_weight(i);
             i += 1;
         }

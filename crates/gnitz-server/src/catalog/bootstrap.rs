@@ -150,31 +150,28 @@ impl CatalogEngine {
 
     fn recover_sequences(&mut self) {
         let mut cursor = self.sys_store(SysFamily::Sequence).open_cursor();
-        while cursor.valid {
-            if cursor.current_weight > 0 {
-                let seq_id = cursor.current_key_narrow() as u64 as i64;
-                let val = cursor_read_u64(&cursor, SEQTAB_COL_VALUE) as i64;
-                match seq_id {
-                    SEQ_ID_SCHEMAS => raise_id_counter(&mut self.next_schema_id, val),
-                    SEQ_ID_TABLES => raise_id_counter(&mut self.next_table_id, val),
-                    SEQ_ID_INDICES => raise_id_counter(&mut self.next_index_id, val),
-                    // Checkpoint generation is monotonic; a mid-checkpoint crash
-                    // may leave two rows, so take the max. Topology is a single
-                    // latest-wins value. Both fall in the 4..16 gap
-                    // `observe_user_sequence` ignores, so they never leak into
-                    // `user_sequences`.
-                    SEQ_ID_CHECKPOINT_GEN => self.durable_generation = self.durable_generation.max(val as u64),
-                    SEQ_ID_TOPOLOGY => self.registry.set_recorded_topology(val as u64),
-                    // User-table SERIAL sequence (seq_id == table_id ≥
-                    // FIRST_USER_TABLE_ID). Store the high-water; next id =
-                    // high_water + 1. `observe_user_sequence` ignores a stray
-                    // catalog-range seq_id in the empty 4..16 gap, so it is never
-                    // misclassified as a user sequence.
-                    other => self.observe_user_sequence(other, val),
-                }
+        cursor.for_each_positive(|c| {
+            let seq_id = c.current_key_narrow() as u64 as i64;
+            let val = cursor_read_u64(c, SEQTAB_COL_VALUE) as i64;
+            match seq_id {
+                SEQ_ID_SCHEMAS => raise_id_counter(&mut self.next_schema_id, val),
+                SEQ_ID_TABLES => raise_id_counter(&mut self.next_table_id, val),
+                SEQ_ID_INDICES => raise_id_counter(&mut self.next_index_id, val),
+                // Checkpoint generation is monotonic; a mid-checkpoint crash
+                // may leave two rows, so take the max. Topology is a single
+                // latest-wins value. Both fall in the 4..16 gap
+                // `observe_user_sequence` ignores, so they never leak into
+                // `user_sequences`.
+                SEQ_ID_CHECKPOINT_GEN => self.durable_generation = self.durable_generation.max(val as u64),
+                SEQ_ID_TOPOLOGY => self.registry.set_recorded_topology(val as u64),
+                // User-table SERIAL sequence (seq_id == table_id ≥
+                // FIRST_USER_TABLE_ID). Store the high-water; next id =
+                // high_water + 1. `observe_user_sequence` ignores a stray
+                // catalog-range seq_id in the empty 4..16 gap, so it is never
+                // misclassified as a user sequence.
+                other => self.observe_user_sequence(other, val),
             }
-            cursor.advance();
-        }
+        });
     }
 
     // -- Register system table families ------------------------------------
@@ -221,7 +218,7 @@ impl CatalogEngine {
 
     fn replay_system_table(&mut self, family: SysFamily) -> Result<(), String> {
         let arc = self.sys_store_mut(family).full_scan();
-        if arc.count > 0 {
+        if !arc.is_empty() {
             self.fire_hooks(family, &arc)?;
         }
         Ok(())

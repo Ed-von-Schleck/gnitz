@@ -306,25 +306,36 @@ impl Drop for BlobCacheGuard {
 /// `schema.payload_columns()` and pass the column size explicitly.
 #[derive(Clone)]
 pub struct MemBatch<'a> {
-    pub data: &'a [u8],
+    pub(crate) data: &'a [u8],
     /// Borrowed, not owned: `usize` × `MAX_BATCH_REGIONS` is ~½ KiB, and this
     /// view exists to be derived per range, per chunk and per operator call.
     /// `Batch` already holds the array inline, so `as_mem_batch` lends it; the
     /// one view with no owning `Batch` (a borrowed wire frame) has its decoder's
     /// caller hold the array beside the view.
-    pub offsets: &'a [usize; super::batch::MAX_BATCH_REGIONS],
+    pub(crate) offsets: &'a [usize; super::batch::MAX_BATCH_REGIONS],
     pub pk_stride: u8, // byte width of the PK region per row
-    pub blob: &'a [u8],
-    pub count: usize,
+    pub(crate) blob: &'a [u8],
+    /// Row count of the view. Read from outside through [`MemBatch::len`].
+    pub(crate) count: usize,
     /// The source [`Batch::blob_id`], carried so an appending destination can
     /// recognize its *own* blob and copy German-string structs verbatim instead
     /// of relocating each cell (see `Batch::append_ranges_inner`). A borrowed
     /// wire view has no such identity and uses `0`, which no live batch ever has
     /// (the counter starts at 1).
-    pub blob_id: u64,
+    pub(crate) blob_id: u64,
 }
 
 impl<'a> MemBatch<'a> {
+    /// Row count of the view.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.count
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     /// PK region as a contiguous slice (`count * pk_stride` bytes).
     #[inline]
     pub fn pk(&self) -> &'a [u8] {
@@ -334,14 +345,14 @@ impl<'a> MemBatch<'a> {
 
     /// Weight region as a contiguous slice (`count * 8` bytes).
     #[inline]
-    pub fn weight(&self) -> &'a [u8] {
+    pub(crate) fn weight(&self) -> &'a [u8] {
         let off = self.offsets[super::batch::REG_WEIGHT];
         &self.data[off..off + self.count * 8]
     }
 
     /// Null bitmap region as a contiguous slice (`count * 8` bytes).
     #[inline(always)]
-    pub fn null_bmp(&self) -> &'a [u8] {
+    pub(crate) fn null_bmp(&self) -> &'a [u8] {
         let off = self.offsets[super::batch::REG_NULL_BMP];
         &self.data[off..off + self.count * 8]
     }
@@ -369,7 +380,7 @@ impl<'a> MemBatch<'a> {
         read_u64_le(self.data, self.offsets[super::batch::REG_NULL_BMP] + row * 8)
     }
     #[inline(always)]
-    pub fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &'a [u8] {
+    pub(crate) fn get_col_ptr(&self, row: usize, payload_col: usize, col_size: usize) -> &'a [u8] {
         let off = self.offsets[super::batch::REG_PAYLOAD_START + payload_col] + row * col_size;
         &self.data[off..off + col_size]
     }
@@ -406,7 +417,7 @@ impl<'a> RowSource for MemBatch<'a> {
     }
     #[inline(always)]
     fn row_count(&self) -> usize {
-        self.count
+        MemBatch::len(self)
     }
 }
 

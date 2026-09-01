@@ -61,7 +61,7 @@ pub struct ReadCursor {
     /// `Empty`/`Single`.
     tree: LoserTree,
     mode: SourceMode,
-    pub schema: SchemaDescriptor,
+    pub(crate) schema: SchemaDescriptor,
     /// At least one source is a capacity-bounded view's skeleton shard, so the
     /// merge runs with payload coarsening on (see [`merge::merge_less`]). Derived
     /// once at open — the source set never changes — and it is the whole cost
@@ -71,7 +71,7 @@ pub struct ReadCursor {
     // Current row state
     pub valid: bool,
     pub current_weight: i64,
-    pub current_null_word: u64,
+    pub(crate) current_null_word: u64,
     current_entry_idx: usize,
     current_row: usize,
 }
@@ -94,7 +94,7 @@ impl ReadCursor {
     /// cannot read a skeleton row must hydrate first. Per-run over the runs the
     /// open selected — a strict subset of the store-level
     /// [`Table::has_skeleton_rows`](super::table::Table::has_skeleton_rows).
-    pub fn any_skeleton(&self) -> bool {
+    pub(crate) fn any_skeleton(&self) -> bool {
         self.any_skeleton
     }
 
@@ -213,7 +213,8 @@ impl ReadCursor {
 
     /// Reset every source to its first row, positioning the cursor at the first
     /// row in storage order — by row index, so no key has to be spelled.
-    pub fn rewind(&mut self) {
+    #[cfg(test)]
+    pub(crate) fn rewind(&mut self) {
         for state in self.states.iter_mut() {
             state.position = 0;
         }
@@ -241,7 +242,7 @@ impl ReadCursor {
     /// the speedup. `key` must be exactly `pk_stride` OPK bytes.
     ///
     /// This is the seek to reach for by default; `seek_bytes` is never cheaper.
-    pub fn advance_to(&mut self, key: &[u8]) {
+    pub(crate) fn advance_to(&mut self, key: &[u8]) {
         // The in-place gallop needs a strictly greater key: at `key == current_pk`
         // the lower bound can be a row already consumed (an earlier payload at the
         // same PK), which a forward gallop cannot reach. `valid` is tested first so
@@ -388,7 +389,7 @@ impl ReadCursor {
     /// must gate on `valid` first — this reads the current row's bytes, which is
     /// undefined on an unpositioned cursor.
     #[inline]
-    pub fn current_pk_eq(&self, key_bytes: &[u8]) -> bool {
+    pub(crate) fn current_pk_eq(&self, key_bytes: &[u8]) -> bool {
         pk_bytes_eq(self.current_pk_bytes(), key_bytes)
     }
 
@@ -485,7 +486,7 @@ impl ReadCursor {
     /// Storage-order comparison of the current row's PK against an OPK `key`.
     /// Correct at every PK width. Callers must gate on `valid` first.
     #[inline]
-    pub fn current_pk_cmp_bytes(&self, key: &[u8]) -> Ordering {
+    pub(crate) fn current_pk_cmp_bytes(&self, key: &[u8]) -> Ordering {
         compare_pk_ordering(self.current_pk_bytes(), key)
     }
 
@@ -509,18 +510,28 @@ impl ReadCursor {
     /// `f(&*self)` at each (the callback reads the committed `current_*` row
     /// state; it must not re-enter the cursor). The seek/advance/walk loop the
     /// system-table readers (circuit load, view-row retraction) share.
-    pub fn for_each_positive_with_prefix<F: FnMut(&ReadCursor)>(&mut self, prefix: &[u8], mut f: F) {
+    pub fn for_each_positive_with_prefix<F: FnMut(&ReadCursor)>(&mut self, prefix: &[u8], f: F) {
         if !self.seek_first_positive_with_prefix(prefix) {
             return;
         }
-        self.for_each_row_while(
-            |pk| pk.starts_with(prefix),
-            |c| {
-                if c.current_weight > 0 {
-                    f(c);
-                }
-            },
-        );
+        self.for_each_positive_while(|pk| pk.starts_with(prefix), f);
+    }
+
+    /// [`Self::for_each_row_while`] with the weight gate applied — the one place
+    /// the two positive-row walks below spell `current_weight > 0`.
+    fn for_each_positive_while<C: Fn(&[u8]) -> bool, F: FnMut(&ReadCursor)>(&mut self, cont: C, mut f: F) {
+        self.for_each_row_while(cont, |c| {
+            if c.current_weight > 0 {
+                f(c);
+            }
+        });
+    }
+
+    /// Every positive-weight row from HERE to the end of the cursor's window.
+    /// The prefix form narrows within the window; this takes the whole of it,
+    /// which for a cursor positioned over a range is that range.
+    pub fn for_each_positive<F: FnMut(&ReadCursor)>(&mut self, f: F) {
+        self.for_each_positive_while(|_| true, f);
     }
 
     /// Walk forward from the current position (no seek) to the next row whose PK
@@ -661,7 +672,7 @@ impl ReadCursor {
     /// Every source of one cursor is a run of the same `Table` and shares that
     /// schema's stride, which is what makes one `start`/`end` pair valid across all
     /// of them.
-    pub fn count_range_raw(&self, start: &[u8], end: Option<&[u8]>) -> usize {
+    pub(crate) fn count_range_raw(&self, start: &[u8], end: Option<&[u8]>) -> usize {
         debug_assert_eq!(start.len(), self.schema.pk_stride() as usize);
         debug_assert!(end.is_none_or(|e| e.len() == self.schema.pk_stride() as usize));
         self.sources

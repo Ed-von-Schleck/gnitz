@@ -5,10 +5,10 @@ use crate::runtime::wire::{
 };
 use crate::test_support::{make_batch, make_batch_raw, u64_pk_schema};
 use gnitz_store::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, MAX_BATCH_REGIONS};
+use gnitz_store::storage::{Batch, BatchBuilder, MAX_BATCH_REGIONS};
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
+use gnitz_wire::try_decode_german_string;
 use gnitz_wire::type_code;
-use gnitz_wire::{encode_german_string, try_decode_german_string};
 use gnitz_wire::{wire_flags_set_schema_version, FLAG_CONTINUATION, STATUS_ERROR, STATUS_OK};
 
 /// The anonymous schema block a frame for `sd` under `target_id` carries — what
@@ -82,7 +82,7 @@ fn encode_decode_roundtrip_with_data() {
     assert!(decoded.schema.is_some());
     assert!(decoded.data_batch.is_some());
     let db = decoded.data_batch.as_ref().unwrap();
-    assert_eq!(db.count, 1);
+    assert_eq!(db.len(), 1);
     let pk = db.get_pk(0) as u64;
     assert_eq!(pk, 100);
     let val = u64::from_le_bytes(db.col_data(0)[0..8].try_into().unwrap());
@@ -120,24 +120,19 @@ fn schema_roundtrip_wire_preserves_pk_order() {
 #[test]
 fn encode_decode_string_column() {
     let sd = string_schema();
-    let mut batch = Batch::with_capacity(sd, 2);
+    let mut bb = BatchBuilder::new(sd);
 
-    batch.extend_pk(1u128);
-    batch.extend_weight(&1i64.to_le_bytes());
-    batch.extend_null_bmp(&0u64.to_le_bytes());
-    batch.extend_col(0, &42u64.to_le_bytes());
-    let st1 = encode_german_string(b"hello", &mut batch.blob);
-    batch.extend_col(1, &st1);
-    batch.count += 1;
+    bb.begin_row(1u128, 1);
+    bb.put_int(42);
+    bb.put_string("hello");
+    bb.end_row();
 
-    batch.extend_pk(2u128);
-    batch.extend_weight(&1i64.to_le_bytes());
-    batch.extend_null_bmp(&0u64.to_le_bytes());
-    batch.extend_col(0, &99u64.to_le_bytes());
-    let long_str = b"this is a long string that exceeds twelve bytes";
-    let st2 = encode_german_string(long_str, &mut batch.blob);
-    batch.extend_col(1, &st2);
-    batch.count += 1;
+    bb.begin_row(2u128, 1);
+    bb.put_int(99);
+    let long_str = "this is a long string that exceeds twelve bytes";
+    bb.put_string(long_str);
+    bb.end_row();
+    let batch = bb.finish();
 
     let blk = sblock(&sd, 10);
     let wire = WireMsg {
@@ -149,7 +144,7 @@ fn encode_decode_string_column() {
     .encode_to_vec();
     let decoded = decode_wire(&wire).unwrap();
     let db = decoded.data_batch.as_ref().unwrap();
-    assert_eq!(db.count, 2);
+    assert_eq!(db.len(), 2);
 
     let mut s1 = [0u8; 16];
     s1.copy_from_slice(&db.col_data(1)[0..16]);
@@ -159,7 +154,7 @@ fn encode_decode_string_column() {
     let mut s2 = [0u8; 16];
     s2.copy_from_slice(&db.col_data(1)[16..32]);
     let str2 = try_decode_german_string(&s2, &db.blob).unwrap();
-    assert_eq!(str2, long_str);
+    assert_eq!(str2, long_str.as_bytes());
 }
 
 fn every_frame_shape() -> Vec<Vec<u8>> {
@@ -374,7 +369,7 @@ fn encode_range_roundtrip() {
     // distinct per row, so a range applied to one region and not another shows up.
     let decoded = decode_wire_ipc(&buf).expect("decode_wire_ipc");
     let b = decoded.data_batch.expect("data_batch");
-    assert_eq!(b.count, 3);
+    assert_eq!(b.len(), 3);
     for i in 0..3usize {
         let src = i + 2;
         assert_eq!(b.get_pk(i), src as u128, "row {i} pk");
@@ -430,7 +425,7 @@ fn continuation_frame_decoded_with_schema_hint() {
     let mut offsets = [0usize; MAX_BATCH_REGIONS];
     let decoded = decode_continuation(&buf, &sd, server_version, &mut offsets).expect("decode with schema hint");
     let b = decoded.data_batch.as_ref().expect("data_batch");
-    assert_eq!(b.count, 4);
+    assert_eq!(b.len(), 4);
     for i in 0..4usize {
         assert_eq!(
             gnitz_wire::widen_pk_be(b.get_pk_bytes(i), b.pk_stride as usize),
@@ -553,15 +548,14 @@ fn scattered_roundtrips_over_a_padded_schema() {
     );
     let blk = sblock(&sd, 3);
 
-    let mut batch = Batch::with_capacity(sd, 8);
+    let mut bb = BatchBuilder::new(sd);
     for i in 0..8u32 {
-        batch.extend_pk(i as u128);
-        batch.extend_weight(&((i as i64) + 1).to_le_bytes());
-        batch.extend_null_bmp(&0u64.to_le_bytes());
-        batch.extend_col(0, &(i as i32 * 10).to_le_bytes());
-        batch.extend_col(1, &(i as i16 * 3).to_le_bytes());
-        batch.count += 1;
+        bb.begin_row(i as u128, (i as i64) + 1);
+        bb.put_int(i as i32 as u128 * 10);
+        bb.put_int(i as i16 as u128 * 3);
+        bb.end_row();
     }
+    let batch = bb.finish();
 
     for count in [1usize, 3, 7] {
         let indices: Vec<u32> = (0..count as u32).map(|i| i * 2 % 8).collect();
@@ -581,7 +575,7 @@ fn scattered_roundtrips_over_a_padded_schema() {
 
         let decoded = decode_wire(&buf).expect("a scattered block decodes");
         let got = decoded.data_batch.expect("it carries rows");
-        assert_eq!(got.count, count);
+        assert_eq!(got.len(), count);
         for (j, &src) in indices.iter().enumerate() {
             assert_eq!(got.get_pk(j), src as u128, "{count} rows: pk {j}");
             assert_eq!(got.get_weight(j), src as i64 + 1, "{count} rows: weight {j}");

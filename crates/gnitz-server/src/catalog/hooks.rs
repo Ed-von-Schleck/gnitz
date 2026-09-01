@@ -87,15 +87,15 @@ impl CatalogEngine {
     /// unmap the *new* view's qualified name.
     fn canonicalize_for_hooks(batch: &Batch, family: SysFamily) -> Option<Batch> {
         // `false < true`, so "sorted by (weight > 0)" *is* "retractions first".
-        if (0..batch.count).is_sorted_by_key(|i| batch.get_weight(i) > 0) {
+        if (0..batch.len()).is_sorted_by_key(|i| batch.get_weight(i) > 0) {
             return None;
         }
         // Total, because `precheck_family` rejects a delta carrying a zero weight.
-        let mut idx: Vec<u32> = (0..batch.count)
+        let mut idx: Vec<u32> = (0..batch.len())
             .filter(|&i| batch.get_weight(i) < 0)
             .map(|i| i as u32)
             .collect();
-        idx.extend((0..batch.count).filter(|&i| batch.get_weight(i) > 0).map(|i| i as u32));
+        idx.extend((0..batch.len()).filter(|&i| batch.get_weight(i) > 0).map(|i| i as u32));
         Some(Batch::from_indexed_rows(&batch.as_mem_batch(), &idx, &family.schema()))
     }
 
@@ -105,7 +105,7 @@ impl CatalogEngine {
     /// the object-id hooks instead, so they are skipped — the guard is defensive
     /// since `advance_sequence` bypasses `submit` and never reaches here.
     fn hook_sequence_register(&mut self, batch: &Batch) {
-        for i in 0..batch.count {
+        for i in 0..batch.len() {
             if batch.get_weight(i) <= 0 {
                 continue;
             }
@@ -118,7 +118,7 @@ impl CatalogEngine {
     // -- Hook handlers ---------------------------------------------------------
 
     fn hook_schema_dir(&mut self, batch: &Batch) -> Result<(), String> {
-        for i in 0..batch.count {
+        for i in 0..batch.len() {
             let weight = batch.get_weight(i);
             let name = batch.read_payload_string(i, SCHEMATAB_PAY_NAME);
             let path = schema_dir(&self.base_dir, &name);
@@ -266,7 +266,7 @@ impl CatalogEngine {
     /// A table's registration reads no other relation, so TABLE_TAB keeps row
     /// order.
     fn relation_row_order(&mut self, family: SysFamily, batch: &Batch) -> Vec<usize> {
-        let mut rows: Vec<usize> = (0..batch.count).collect();
+        let mut rows: Vec<usize> = (0..batch.len()).collect();
         if family != SysFamily::View {
             return rows;
         }
@@ -367,7 +367,7 @@ impl CatalogEngine {
         let ids: Vec<u128> = ids.iter().map(|&id| id as u128).collect();
         let schema = SysFamily::Index.schema();
         let batch = retract_pk_list(self.sys_store(SysFamily::Index), &schema, ids);
-        if batch.count > 0 {
+        if !batch.is_empty() {
             self.submit_cascade(SysFamily::Index, batch)?;
         }
         Ok(())
@@ -384,7 +384,7 @@ impl CatalogEngine {
             start.pk_bytes(),
             end.pk_bytes(),
         );
-        if batch.count > 0 {
+        if !batch.is_empty() {
             self.submit_cascade(SysFamily::Column, batch)?;
         }
         Ok(())
@@ -465,7 +465,7 @@ impl CatalogEngine {
             let start = sys_opk(&schema, vid as u64 as u128);
             let end = sys_opk(&schema, vid as u64 as u128 + 1);
             let batch = retract_key_range(self.sys_store(family), &schema, start.pk_bytes(), end.pk_bytes());
-            if batch.count > 0 {
+            if !batch.is_empty() {
                 self.submit_cascade(family, batch)?;
             }
         }
@@ -477,7 +477,7 @@ impl CatalogEngine {
     /// name-indexed caches from `IDXTAB_PAY_NAME`, so neither half below reads
     /// that string.
     fn hook_index_register(&mut self, batch: &Batch) -> Result<(), String> {
-        for i in 0..batch.count {
+        for i in 0..batch.len() {
             let idx_id = batch.get_pk(i) as i64;
             let (owner_id, cols, is_unique) = read_idx_tab_row(batch, i);
             if batch.get_weight(i) > 0 {

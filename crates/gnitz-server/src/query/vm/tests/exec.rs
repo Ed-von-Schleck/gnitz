@@ -4,7 +4,7 @@ use super::*;
 use crate::test_support::{make_batch_u128, make_schema_u128_i64, opk_pk, scratch_table, zset_of};
 use gnitz_store::ops::AggDescriptor;
 use gnitz_store::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, Layout, StorageError};
+use gnitz_store::storage::{Batch, BatchBuilder, Layout, StorageError};
 use gnitz_wire::AggFunc;
 
 // ── Test helpers ─────────────────────────────────────────────────────────
@@ -60,15 +60,14 @@ fn make_schema(col_types: &[u8]) -> SchemaDescriptor {
 
 /// A consolidated batch with two I64 payload columns from `(pk, w, c0, c1)`.
 fn make_batch_2col(schema: SchemaDescriptor, rows: &[(u128, i64, i64, i64)]) -> Batch {
-    let mut b = Batch::with_capacity(schema, rows.len().max(1));
+    let mut bb = BatchBuilder::new(schema);
     for &(pk, w, c0, c1) in rows {
-        b.extend_pk(pk);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &c0.to_le_bytes());
-        b.extend_col(1, &c1.to_le_bytes());
-        b.count += 1;
+        bb.begin_row(pk, w);
+        bb.put_int(c0 as u128);
+        bb.put_int(c1 as u128);
+        bb.end_row();
     }
+    let mut b = bb.finish();
     b.certify_layout(Layout::Consolidated, &schema);
     b
 }
@@ -76,7 +75,7 @@ fn make_batch_2col(schema: SchemaDescriptor, rows: &[(u128, i64, i64, i64)]) -> 
 /// Rows as `(pk, weight, col0_i64)`, in emission order — the tests that assert
 /// an order deliberately read through this rather than through `zset_of`.
 fn extract_rows(b: &Batch) -> Vec<(u64, i64, i64)> {
-    (0..b.count)
+    (0..b.len())
         .map(|i| {
             let c0 = i64::from_le_bytes(b.col_data(0)[i * 8..(i + 1) * 8].try_into().unwrap());
             (b.get_pk(i) as u64, b.get_weight(i), c0)
@@ -165,7 +164,7 @@ fn test_union_operator() {
         .unwrap()
         .unwrap();
 
-    assert_eq!(result.count, 3);
+    assert_eq!(result.len(), 3);
 }
 
 /// `0 + B = B`: with an empty left operand the VM hands the right one
@@ -205,12 +204,11 @@ fn test_union_runs_under_the_merged_output_schema() {
     let mut left = make_batch_u128(&schema_a, &[(1, 1, -3)]);
     left.certify_layout(Layout::Sorted, &schema_a);
 
-    let mut right = Batch::with_capacity(schema_b, 1);
-    right.extend_pk(1u128);
-    right.extend_weight(&1i64.to_le_bytes());
-    right.extend_null_bmp(&1u64.to_le_bytes());
-    right.fill_col_zero(0, 8);
-    right.count += 1;
+    let mut rb = BatchBuilder::new(schema_b);
+    rb.begin_row(1u128, 1);
+    rb.put_null();
+    rb.end_row();
+    let mut right = rb.finish();
     right.certify_layout(Layout::Sorted, &schema_b);
 
     let mut builder = ProgramBuilder::new();
@@ -229,7 +227,7 @@ fn test_union_runs_under_the_merged_output_schema() {
         .unwrap()
         .unwrap();
 
-    assert_eq!(result.count, 2, "Z-Set + keeps both rows");
+    assert_eq!(result.len(), 2, "Z-Set + keeps both rows");
     assert!(
         gnitz_wire::null_word_get(result.get_null_word(0), 0),
         "the merged schema's null-aware comparator sorts NULL below -3; the left \
@@ -245,7 +243,7 @@ fn test_union_runs_under_the_merged_output_schema() {
 fn test_union_identity_path_output_carries_out_register_schema() {
     let (schema_a, schema_b, merged) = union_nullability_schemas();
 
-    // in_b is never seeded, so `op_union` takes the b.count == 0 identity
+    // in_b is never seeded, so `op_union` takes the b.is_empty() identity
     // path and hands `batch_a` straight back with `schema_a` still on it.
     let left = make_batch_u128(&schema_a, &[(1, 1, -3)]);
 
@@ -262,7 +260,7 @@ fn test_union_identity_path_output_carries_out_register_schema() {
     ];
     let mut vm = builder.build(reg_meta, 1);
     let result = execute_epoch_multi(&mut vm, [(0u16, left)]).unwrap().unwrap();
-    assert_eq!(result.count, 1);
+    assert_eq!(result.len(), 1);
     assert_eq!(
         result.schema, merged,
         "a batch leaving the VM carries its output register's schema, not the operand's",
@@ -344,7 +342,7 @@ fn test_delta_isolation_across_ticks() {
     let r1 = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, 1, 10)]), 0)
         .unwrap()
         .unwrap();
-    assert_eq!(r1.count, 1);
+    assert_eq!(r1.len(), 1);
 
     let r2 = execute_epoch(&mut vm, make_batch_u128(&schema, &[(2, 1, 20), (3, 1, 30)]), 0)
         .unwrap()
@@ -466,7 +464,8 @@ fn test_join_delta_trace() {
     let input = make_batch_u128(&left_schema, &[(10, 2, 50)]);
     let result = execute_epoch(&mut vm, input, 0).unwrap().unwrap();
     assert_eq!(
-        vm.regfile.batches[1].count, 0,
+        vm.regfile.batches[1].len(),
+        0,
         "a trace is reached through its cursor, never its register's batch — which is what \
          lets the per-epoch clear run over every register blind",
     );
@@ -531,7 +530,7 @@ fn test_reduce_groups_by_a_payload_column() {
     let input = make_batch_2col(in_schema, &[(1, 1, 1, 10), (2, 1, 1, 20)]);
     let r1 = execute_epoch(&mut vm, input, 0).unwrap().unwrap();
 
-    assert_eq!(r1.count, 1, "one group → one output row");
+    assert_eq!(r1.len(), 1, "one group → one output row");
     let sum_val = i64::from_le_bytes(r1.col_data(1)[0..8].try_into().unwrap());
     assert_eq!(sum_val, 30, "SUM(10+20) must be 30");
 }
@@ -578,7 +577,7 @@ fn test_reduce_multi_agg() {
     let input = make_batch_u128(&in_schema, &[(1, 1, 10), (1, 1, 20), (1, 1, 30)]);
     let result = execute_epoch(&mut vm, input, 0).unwrap().unwrap();
 
-    assert_eq!(result.count, 1, "multi-agg should produce 1 group");
+    assert_eq!(result.len(), 1, "multi-agg should produce 1 group");
     let count_val = i64::from_le_bytes(result.col_data(0)[0..8].try_into().unwrap());
     let sum_val = i64::from_le_bytes(result.col_data(1)[0..8].try_into().unwrap());
     assert_eq!(count_val, 3, "COUNT should be 3");
@@ -618,7 +617,7 @@ fn an_empty_epoch_mints_the_ground_row_once() {
     let first = execute_epoch(&mut vm, Batch::empty_with_schema(&in_schema), 0)
         .unwrap()
         .expect("the ground row");
-    assert_eq!(first.count, 1);
+    assert_eq!(first.len(), 1);
     assert!(!vm.pending_ground_row, "cleared before the pass, not after it");
     assert!(
         execute_epoch(&mut vm, Batch::empty_with_schema(&in_schema), 0)
@@ -675,14 +674,14 @@ fn an_empty_epoch_skips_the_pass_and_still_clears_the_registers() {
     let out = execute_epoch(&mut vm, make_batch_u128(&schema, &[(1, 1, 10)]), 0)
         .unwrap()
         .expect("one row through");
-    assert_eq!(out.count, 1);
-    assert_eq!(vm.regfile.batches[0].count, 1, "the input register still holds it");
+    assert_eq!(out.len(), 1);
+    assert_eq!(vm.regfile.batches[0].len(), 1, "the input register still holds it");
 
     assert!(execute_epoch(&mut vm, Batch::empty_with_schema(&schema), 0)
         .unwrap()
         .is_none());
     assert!(
-        vm.regfile.batches.iter().all(|b| b.count == 0),
+        vm.regfile.batches.iter().all(|b| b.is_empty()),
         "the skipped epoch still released the previous one's batches",
     );
 }

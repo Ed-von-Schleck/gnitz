@@ -234,10 +234,7 @@ impl Table {
             RecoverySource::Rederive { resume_at } => {
                 let resumes = match resume_at {
                     None => false,
-                    Some(want) => {
-                        let cpath = super::super::cstr(super::manifest::path(dir))?;
-                        super::manifest::peek_header(&cpath)?.is_some_and(|h| h.checkpoint_gen == want)
-                    }
+                    Some(want) => super::manifest::at_generation(&super::manifest::path(dir), want)?,
                 };
                 if !resumes {
                     shard_index.gc_orphans();
@@ -292,14 +289,14 @@ impl Table {
     }
 
     /// The directory this store's shards live in — the child it is homed at.
-    pub fn directory(&self) -> &str {
+    pub(crate) fn directory(&self) -> &str {
         &self.directory
     }
 
     /// Bound this store's registered shard bytes — the sweep itself lives on the
     /// shard index, which owns every quantity it touches. Called once, by
     /// `build_relation_store`, so a store is bounded from birth.
-    pub fn set_capacity(&mut self, capacity_bytes: Option<u64>) {
+    pub(crate) fn set_capacity(&mut self, capacity_bytes: Option<u64>) {
         self.shard_index.set_capacity(capacity_bytes);
     }
 
@@ -308,7 +305,7 @@ impl Table {
     /// unlinking every compaction's superseded inputs at once because it
     /// publishes no manifest. Called once, by `build_relation_store`, exactly as
     /// [`Self::set_capacity`] is.
-    pub fn set_delta_budget(&mut self, budget: u64) {
+    pub(crate) fn set_delta_budget(&mut self, budget: u64) {
         self.shard_index.set_delta_budget(budget);
     }
 
@@ -316,13 +313,13 @@ impl Table {
     /// read at `after_tick > dropped_through` asks only for rounds above it, and
     /// no such round was ever dropped; a read at or below it is refused with
     /// `STATUS_DELTA_EXPIRED`. `0` for every store that has dropped nothing.
-    pub fn dropped_through(&self) -> u64 {
+    pub(crate) fn dropped_through(&self) -> u64 {
         self.shard_index.dropped_through()
     }
 
     /// Whether a read of this store can meet a skeleton row it has to hydrate.
     /// See [`ShardIndex::has_skeleton_shard`].
-    pub fn has_skeleton_rows(&self) -> bool {
+    pub(crate) fn has_skeleton_rows(&self) -> bool {
         self.shard_index.has_skeleton_shard()
     }
 
@@ -379,7 +376,7 @@ impl Table {
     /// `self.schema` as the runs' input schema, so it must precede the
     /// reassignment. `cached_full_scan` was materialized under the old column
     /// set, so it is dropped either way.
-    pub fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
+    pub(crate) fn swap_schema(&mut self, schema: SchemaDescriptor) -> Result<(), StorageError> {
         let staged = self.shard_index.reopen_all(&schema)?;
         self.memtable.widen_runs(&self.schema, &schema);
         self.ram_tier.widen_runs(&self.schema, &schema);

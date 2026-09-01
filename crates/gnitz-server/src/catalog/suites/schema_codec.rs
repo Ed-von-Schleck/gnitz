@@ -220,8 +220,8 @@ fn ddl_txn_roundtrip_client_to_server() {
                 .expect("bundle family id must be a system family")
                 .schema();
             let (batch, _) = Batch::decode_from_wal_block(slice, &schema, false).expect("decode family batch");
-            assert_eq!(batch.count, exp_batch.len(), "row count tid {got_tid}");
-            for i in 0..batch.count {
+            assert_eq!(batch.len(), exp_batch.len(), "row count tid {got_tid}");
+            for i in 0..batch.len() {
                 assert_eq!(
                     batch.get_weight(i),
                     exp_batch.weights[i],

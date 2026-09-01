@@ -123,7 +123,7 @@ impl CatalogEngine {
     /// Maintain `schema_by_name` and `schema_by_id` from one pass over a
     /// SCHEMA_TAB delta — the two caches share their lifecycle and key data.
     pub(in crate::catalog) fn apply_schema_caches(&mut self, batch: &Batch) {
-        for i in 0..batch.count {
+        for i in 0..batch.len() {
             let weight = batch.get_weight(i);
             let sid = batch.get_pk(i) as i64;
             let name = batch.read_payload_string(i, SCHEMATAB_PAY_NAME);
@@ -147,7 +147,7 @@ impl CatalogEngine {
     /// TABLE_TAB or VIEW_TAB delta (the two families share the leading
     /// `(schema_id, name)` payload prefix).
     pub(in crate::catalog) fn apply_entity_caches(&mut self, batch: &Batch) {
-        for i in 0..batch.count {
+        for i in 0..batch.len() {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
 
@@ -186,7 +186,7 @@ impl CatalogEngine {
     /// drops once it empties, so `schema_member_count` returns 0 exactly when
     /// no member remains.
     pub(in crate::catalog) fn apply_schema_members(&mut self, batch: &Batch) {
-        for i in 0..batch.count {
+        for i in 0..batch.len() {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
             let sid = batch.read_payload_u64(i, TABTAB_PAY_SCHEMA_ID) as i64;
@@ -209,7 +209,7 @@ impl CatalogEngine {
     /// interleaved batch just invalidates an owner more than once.
     pub(in crate::catalog) fn apply_col_names_invalidate(&mut self, batch: &Batch) {
         let mut last: Option<i64> = None;
-        for i in 0..batch.count {
+        for i in 0..batch.len() {
             let owner_id = batch.read_payload_u64(i, COLTAB_PAY_OWNER_ID) as i64;
             if last != Some(owner_id) {
                 self.caches.invalidate_col_names(owner_id);
@@ -221,7 +221,7 @@ impl CatalogEngine {
     /// Maintain `index_by_name` and `indices_by_owner` from one pass over an
     /// IDX_TAB delta — both key off the same row and share their lifecycle.
     pub(in crate::catalog) fn apply_index_caches(&mut self, batch: &Batch) {
-        for i in 0..batch.count {
+        for i in 0..batch.len() {
             let weight = batch.get_weight(i);
             let idx_id = batch.get_pk(i) as i64;
             let owner_id = batch.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64;
@@ -250,7 +250,7 @@ impl CatalogEngine {
     ///
     /// Only base-table rows carry a constraint (`coltab_row_declares_fk`).
     pub(in crate::catalog) fn apply_fk_constraints(&mut self, batch: &Batch) {
-        for i in 0..batch.count {
+        for i in 0..batch.len() {
             if !coltab_row_declares_fk(batch, i) {
                 continue;
             }
@@ -282,8 +282,8 @@ impl CatalogEngine {
     /// A TABLE_TAB delta relocks every relation it names: the lock rule reads
     /// `the registry[tid].kind`, which the register/teardown hooks just changed.
     pub(in crate::catalog) fn relock_from_table_delta(&mut self, batch: &Batch) {
-        let mut tids = Vec::with_capacity(batch.count);
-        for i in 0..batch.count {
+        let mut tids = Vec::with_capacity(batch.len());
+        for i in 0..batch.len() {
             tids.push(batch.get_pk(i) as i64);
         }
         self.relock_all(tids);
@@ -292,8 +292,8 @@ impl CatalogEngine {
     /// An FK-carrying COL_TAB delta relocks both ends of each edge it declares:
     /// the lock set of either end names the other.
     pub(in crate::catalog) fn relock_from_column_delta(&mut self, batch: &Batch) {
-        let mut tids = Vec::with_capacity(batch.count * 2);
-        for i in 0..batch.count {
+        let mut tids = Vec::with_capacity(batch.len() * 2);
+        for i in 0..batch.len() {
             if !coltab_row_declares_fk(batch, i) {
                 continue;
             }

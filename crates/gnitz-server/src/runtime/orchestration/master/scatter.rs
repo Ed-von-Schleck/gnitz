@@ -36,7 +36,7 @@ fn fill_scatter(batch: &Batch, schema: &SchemaDescriptor, num_workers: usize, ou
 fn fill_broadcast(batch: &Batch, num_workers: usize, out: &mut Vec<Vec<u32>>) {
     let mb = batch.as_mem_batch();
     let slots = gnitz_store::ops::reset_slots(out, num_workers);
-    for i in 0..batch.count {
+    for i in 0..batch.len() {
         if mb.get_weight(i) == 0 {
             continue;
         }

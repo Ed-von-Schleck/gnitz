@@ -165,7 +165,7 @@ fn test_unique_index_failure_no_broadcast_poisoning() {
     let broadcasts = engine.drain_pending_broadcasts();
     for (family, batch) in &broadcasts {
         if *family == SysFamily::Index {
-            for i in 0..batch.count {
+            for i in 0..batch.len() {
                 assert!(
                     batch.get_weight(i) >= 0,
                     "no negative-weight IDX_TAB broadcast may be enqueued on rollback"
@@ -206,7 +206,7 @@ fn test_seek_by_index_found() {
     let result = engine.registry_mut().seek_by_index(tid, &[1], &[200u128]).unwrap().0;
     assert!(result.is_some());
     let row = result.unwrap();
-    assert_eq!(row.count, 1);
+    assert_eq!(row.len(), 1);
     assert_eq!(row.get_pk(0), 20);
 
     engine.close();
@@ -603,7 +603,7 @@ fn test_compound_pk_secondary_index_seek() {
     let schema = engine.registry().get_schema_desc(tid).unwrap();
     assert_eq!(schema.pk_stride(), 8, "compound (U32,U32) PK stride should be 8");
 
-    let mut b = Batch::with_capacity(schema, 4);
+    let mut bb = BatchBuilder::new(schema);
     let rows: &[(u32, u32, u64)] = &[
         (10, 1, 100),
         (20, 1, 200),
@@ -611,22 +611,21 @@ fn test_compound_pk_secondary_index_seek() {
         (40, 1, 200), // same val as row 1, different PK
     ];
     for &(a, bcol, val) in rows {
-        // `extend_pk_bytes` takes the OPK image verbatim, so a compound PK must
-        // be built through `extend_pk_opk` — a native-LE concatenation is not the
+        // `begin_row_bytes` takes the OPK image verbatim, so a compound PK must
+        // be built through `begin_row_opk` — a native-LE concatenation is not the
         // at-rest form and would ingest a PK region the engine forbids.
-        b.extend_pk_opk(&schema, &[a as u128, bcol as u128]);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(0, &val.to_le_bytes());
-        b.count += 1;
+        bb.begin_row_opk(&[a as u128, bcol as u128], 1);
+        bb.put_int(val as u128);
+        bb.end_row();
     }
+    let b = bb.finish();
     engine.ingest_to_family(tid, &b).unwrap();
     engine.registry_mut().flush(tid).unwrap();
 
     // val=100 → exactly one match
     let r = engine.registry_mut().seek_by_index(tid, &[2], &[100u128]).unwrap().0;
     assert!(r.is_some(), "val=100 should find a row");
-    assert_eq!(r.unwrap().count, 1);
+    assert_eq!(r.unwrap().len(), 1);
 
     // val=300 → one match (a=10, b=2)
     let r = engine.registry_mut().seek_by_index(tid, &[2], &[300u128]).unwrap().0;
@@ -654,12 +653,11 @@ fn test_compound_pk_secondary_index_retract() {
     engine.create_index("public.cpk_r", &["val"], false).unwrap();
     let schema = engine.registry().get_schema_desc(tid).unwrap();
 
-    let mut b = Batch::with_capacity(schema, 2);
-    b.extend_pk_opk(&schema, &[7, 3]);
-    b.extend_weight(&1i64.to_le_bytes());
-    b.extend_null_bmp(&0u64.to_le_bytes());
-    b.extend_col(0, &500u64.to_le_bytes());
-    b.count += 1;
+    let mut bb = BatchBuilder::new(schema);
+    bb.begin_row_opk(&[7, 3], 1);
+    bb.put_int(500);
+    bb.end_row();
+    let b = bb.finish();
     engine.ingest_to_family(tid, &b).unwrap();
     engine.registry_mut().flush(tid).unwrap();
 
@@ -671,12 +669,11 @@ fn test_compound_pk_secondary_index_retract() {
         .is_some());
 
     // Retract the same row.
-    let mut r = Batch::with_capacity(schema, 1);
-    r.extend_pk_opk(&schema, &[7, 3]);
-    r.extend_weight(&(-1i64).to_le_bytes());
-    r.extend_null_bmp(&0u64.to_le_bytes());
-    r.extend_col(0, &500u64.to_le_bytes());
-    r.count += 1;
+    let mut rb = BatchBuilder::new(schema);
+    rb.begin_row_opk(&[7, 3], -1);
+    rb.put_int(500);
+    rb.end_row();
+    let r = rb.finish();
     engine.ingest_to_family(tid, &r).unwrap();
     engine.registry_mut().flush(tid).unwrap();
 
@@ -788,10 +785,7 @@ fn test_seek_by_index_orphan_entry_terminates() {
     pk[idx_key_size..idx_key_size + 8].copy_from_slice(&12345u64.to_le_bytes());
 
     let mut b = Batch::with_capacity(idx_schema, 1);
-    b.extend_pk_bytes(&pk);
-    b.extend_weight(&1i64.to_le_bytes());
-    b.extend_null_bmp(&0u64.to_le_bytes());
-    b.count += 1;
+    b.push_key_row(&pk, 1);
 
     engine
         .registry()
@@ -1377,7 +1371,7 @@ fn test_composite_index_full_key_seek() {
         .unwrap()
         .0;
     let r = r.expect("full-key composite seek must find a row");
-    assert_eq!(r.count, 1);
+    assert_eq!(r.len(), 1);
     assert_eq!(r.get_pk(0), 20);
 
     // A full key that matches no row → None.
@@ -1425,7 +1419,7 @@ fn test_composite_index_leading_prefix_seek() {
     // every row with a=1 (PKs 10 and 20), regardless of b.
     let r = engine.registry_mut().seek_by_index(tid, &[1, 2], &[1u128]).unwrap().0;
     let r = r.expect("leading-prefix seek must find rows");
-    let mut pks: Vec<u128> = (0..r.count).map(|i| r.get_pk(i)).collect();
+    let mut pks: Vec<u128> = (0..r.len()).map(|i| r.get_pk(i)).collect();
     pks.sort();
     assert_eq!(pks, vec![10, 20]);
 
@@ -1472,7 +1466,7 @@ fn test_composite_index_signed_unsigned_u128_mix() {
         .unwrap()
         .0;
     let r = r.expect("mixed-width composite seek must find the row");
-    assert_eq!(r.count, 1);
+    assert_eq!(r.len(), 1);
     assert_eq!(r.get_pk(0), 1);
 
     engine.close();
@@ -1509,7 +1503,7 @@ fn test_composite_index_null_in_any_key_skipped() {
     // Leading-prefix seek a=1 must find only PK 20 (PK 10 has NULL b → not indexed).
     let r = engine.registry_mut().seek_by_index(tid, &[1, 2], &[1u128]).unwrap().0;
     let r = r.expect("seek must find the non-null row");
-    assert_eq!(r.count, 1);
+    assert_eq!(r.len(), 1);
     assert_eq!(r.get_pk(0), 20);
 
     engine.close();
@@ -1658,7 +1652,7 @@ fn test_seek_prefix_matches_projection() {
             &idx,
         )
     };
-    assert_eq!(projected.count, 1);
+    assert_eq!(projected.len(), 1);
 
     let key_size = idx.leading_key_size(2);
     let proj_key = &projected.get_pk_bytes(0)[..key_size];
@@ -1710,11 +1704,11 @@ fn index_key_spec_equals_projected_leading_span() {
     // Reference: the projected index entry's leading idx_key_size bytes.
     let projected =
         gnitz_store::storage::batch_project_index(&batch, &IndexKeySpec::new(&cols, &owner, &idx_schema), &idx_schema);
-    assert_eq!(projected.count, rows.len());
+    assert_eq!(projected.len(), rows.len());
 
     let mb = batch.as_mem_batch();
     let mut keybuf = PkBuf::zeroed(0);
-    for row in 0..batch.count {
+    for row in 0..batch.len() {
         assert!(spec.key_bytes(&mb, row, &mut keybuf));
         assert_eq!(
             keybuf.pk_bytes(),
@@ -1847,14 +1841,14 @@ fn write_span_matches_the_oracle_on_compound_null_and_entry_shapes() {
     bb.put_null();
     bb.end_row();
     let b = bb.finish();
-    let null_row = b.count - 1;
+    let null_row = b.len() - 1;
 
     let mb = b.as_mem_batch();
     let stride = src.pk_stride() as usize;
     // The width `IndexKeySpec::split_entry` splits a stored entry at: the index
     // stride is exactly span + source PK, so the two halves are the whole entry.
     assert_eq!(idx.pk_stride() as usize, spec.key_size() + stride);
-    for row in 0..b.count {
+    for row in 0..b.len() {
         let mut got = [0u8; MAX_PK_BYTES];
         let g = spec.write_span(&mb, row, &mut got);
         let want = write_span_reference(&src, &spec, &cols, &mb, row);
@@ -2001,7 +1995,7 @@ fn range_pks(engine: &mut CatalogEngine, tid: i64, cols: &[u32], eq: &[u128], st
     let desc = RangeDescriptor::new(eq, start, end);
     let r = engine.registry_mut().seek_by_index_range(tid, cols, &desc).unwrap().0;
     let mut pks: Vec<u128> = match r {
-        Some(b) => (0..b.count)
+        Some(b) => (0..b.len())
             .filter(|&i| b.get_weight(i) > 0)
             .map(|i| b.get_pk(i))
             .collect(),
@@ -2431,7 +2425,7 @@ fn result_triples(r: Option<Batch>) -> Vec<(u128, u64, i64)> {
     let mut out: Vec<(u128, u64, i64)> = match r {
         Some(b) => {
             let col = b.col_data(0);
-            (0..b.count)
+            (0..b.len())
                 .filter(|&i| b.get_weight(i) > 0)
                 .map(|i| {
                     let v = u64::from_le_bytes(col[i * 8..i * 8 + 8].try_into().unwrap());
@@ -2546,14 +2540,14 @@ fn test_seek_by_index_prefix_multi_group_sorted() {
         .unwrap()
         .0
         .expect("prefix seek must find the a=7 rows");
-    let mut pks: Vec<u128> = (0..r.count)
+    let mut pks: Vec<u128> = (0..r.len())
         .filter(|&i| r.get_weight(i) > 0)
         .map(|i| r.get_pk(i))
         .collect();
     pks.sort();
     assert_eq!(pks, vec![1, 2, 5, 8]);
     assert!(
-        (0..r.count).all(|i| r.get_weight(i) == 1),
+        (0..r.len()).all(|i| r.get_weight(i) == 1),
         "every matched row is at weight 1"
     );
 
@@ -2632,14 +2626,13 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     // indexed values 10/20/30 chosen so the index emission order (by x) differs
     // from the source-PK sort order.
     let rows: [([u8; 24], u64); 3] = [(pk24(3, 0, 1), 10), (pk24(1, 0, 5), 20), (pk24(2, 0, 9), 30)];
-    let mut bb = Batch::with_capacity(schema, rows.len());
+    let mut builder = BatchBuilder::new(schema);
     for &(pk, x) in &rows {
-        bb.extend_pk_bytes(&pk);
-        bb.extend_weight(&1i64.to_le_bytes());
-        bb.extend_null_bmp(&0u64.to_le_bytes());
-        bb.extend_col(0, &x.to_le_bytes());
-        bb.count += 1;
+        builder.begin_row_bytes(&pk, 1);
+        builder.put_int(x as u128);
+        builder.end_row();
     }
+    let bb = builder.finish();
     // Rows were appended out of PK order; the batch is `Raw` (the constructor
     // default), so the ingest's `into_consolidated` sorts the shard.
     let idx_batch = gnitz_store::storage::batch_project_index(
@@ -2686,7 +2679,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
         .unwrap()
         .0
         .expect("wide-PK range scan must resolve all three rows");
-    let mut got: Vec<([u8; 24], u64)> = (0..r.count)
+    let mut got: Vec<([u8; 24], u64)> = (0..r.len())
         .filter(|&i| r.get_weight(i) > 0)
         .map(|i| {
             let pk: [u8; 24] = r.get_pk_bytes(i).try_into().unwrap();
@@ -2734,13 +2727,13 @@ fn test_seek_by_index_full_arity_nonunique_group_ascending() {
         .expect("full-arity equality seek must find the x=50 group");
     // Read PKs in *result-batch order* (no re-sort): the gather emits in
     // ascending source-PK storage order regardless of insertion order.
-    let pks_in_order: Vec<u128> = (0..r.count).map(|i| r.get_pk(i)).collect();
+    let pks_in_order: Vec<u128> = (0..r.len()).map(|i| r.get_pk(i)).collect();
     assert_eq!(
         pks_in_order,
         vec![3, 6, 9],
         "every duplicate-group member returned, in ascending source-PK order"
     );
-    assert!((0..r.count).all(|i| r.get_weight(i) == 1));
+    assert!((0..r.len()).all(|i| r.get_weight(i) == 1));
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -2750,7 +2743,7 @@ fn test_seek_by_index_full_arity_nonunique_group_ascending() {
 /// row, sorted — the composite-index reference form.
 fn result_ab_quads(r: Option<Batch>) -> Vec<(u128, u64, u64, i64)> {
     let mut out: Vec<(u128, u64, u64, i64)> = match r {
-        Some(b) => (0..b.count)
+        Some(b) => (0..b.len())
             .filter(|&i| b.get_weight(i) > 0)
             .map(|i| {
                 (

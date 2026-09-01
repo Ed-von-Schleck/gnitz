@@ -11,11 +11,7 @@ fn idx_batch(spans: &[[u8; 24]]) -> Batch {
     let schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0); 3], &[0, 1, 2]);
     let mut b = Batch::with_capacity(schema, spans.len().max(1));
     for s in spans {
-        b.ensure_row_capacity();
-        b.extend_pk_bytes(s);
-        b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
-        b.count += 1;
+        b.push_key_row(s, 1);
     }
     b
 }

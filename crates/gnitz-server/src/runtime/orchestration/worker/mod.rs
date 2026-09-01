@@ -277,7 +277,7 @@ static UNIQUE_PREFLIGHT_ERROR: Seam = Seam::new("GNITZ_INJECT_UNIQUE_PREFLIGHT_E
 /// so the recovery tick sweep drains exactly what a live tick would.
 pub(crate) fn buffer_pending_delta(pending: &mut HashMap<i64, Batch>, tid: i64, delta: Batch) {
     if let Some(existing) = pending.get_mut(&tid) {
-        existing.append_batch(&delta, 0, delta.count);
+        existing.append_batch(&delta, 0, delta.len());
     } else {
         pending.insert(tid, delta);
     }
@@ -326,7 +326,7 @@ fn filter_by_pk_bytes(
     schema: SchemaDescriptor,
     mut resolve: impl FnMut(&[u8], &mut PkBuf) -> Resolved,
 ) -> Batch {
-    let n = batch.map_or(0, |b| b.count);
+    let n = batch.map_or(0, |b| b.len());
     let mut result = Batch::with_capacity(schema, n);
     if let Some(b) = batch {
         let mut blob_cache = BlobCacheGuard::acquire(&schema, n);
@@ -773,7 +773,7 @@ impl WorkerProcess {
 
             SalMessageKind::DdlSync => {
                 if let Some(batch) = batch {
-                    if batch.count > 0 {
+                    if !batch.is_empty() {
                         self.cat().ddl_sync(target_id, batch)?;
                         // Drop hooks queue the entity's directory, but the master
                         // (which shares this on-disk tree) physically removes it
@@ -826,7 +826,7 @@ impl WorkerProcess {
                 // matches no stored row.
                 let (result, schema) = match batch.as_ref() {
                     Some(b) => {
-                        let keys = (0..b.count).map(|i| b.get_pk_bytes(i));
+                        let keys = (0..b.len()).map(|i| b.get_pk_bytes(i));
                         self.cat()
                             .registry_mut()
                             .gather_family_bytes(target_id, keys, ref_col)?
@@ -852,7 +852,7 @@ impl WorkerProcess {
 
             SalMessageKind::Push => {
                 if let Some(batch) = batch {
-                    if batch.count > 0 {
+                    if !batch.is_empty() {
                         self.handle_push(target_id, batch)?;
                     }
                 }
@@ -955,10 +955,10 @@ impl WorkerProcess {
         // Master pre-partitions Push rows in `scatter::with_group`,
         // so every slot already contains only this worker's rows. A second
         // partition-hash filter here would be pure overhead.
-        if batch.count == 0 {
+        if batch.is_empty() {
             return Ok(());
         }
-        let row_count = batch.count;
+        let row_count = batch.len();
         if target_id < FIRST_USER_TABLE_ID {
             // Master never sends Push for system tables; system-table
             // changes arrive via DdlSync → ddl_sync. Reaching here
@@ -1042,7 +1042,7 @@ impl WorkerProcess {
         // binary the E2E suite runs.
         debug_assert!(
             !matches!(spec.bound, gnitz_wire::ReadBound::Delta { after_tick } if after_tick > 0)
-                || (0..keeper.count).all(|r| {
+                || (0..keeper.len()).all(|r| {
                     let pk = keeper.get_pk_bytes(r);
                     pk.len() >= 8 && u64::from_be_bytes(pk[..8].try_into().unwrap()) <= seek_pk as u64
                 }),
@@ -1248,7 +1248,7 @@ impl WorkerProcess {
         if let Some(mut handle) = self.cat().registry().open_store_cursor(owner_id) {
             while let Some(chunk) = handle.drain_chunk(chunk_rows) {
                 let mb = chunk.as_mem_batch();
-                for row in 0..chunk.count {
+                for row in 0..chunk.len() {
                     let w = chunk.get_weight(row);
                     if w <= 0 {
                         continue;

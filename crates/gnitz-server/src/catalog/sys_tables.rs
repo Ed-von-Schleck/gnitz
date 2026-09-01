@@ -289,7 +289,7 @@ pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> ColumnDef {
 /// well-formed. The DDL driver pre-flights each one before the bundle is made
 /// durable; `packed` is the same word the unique-filter map is keyed by.
 pub(crate) fn idx_tab_unique_creates(batch: &Batch) -> Vec<(i64, u64, PkColList)> {
-    (0..batch.count)
+    (0..batch.len())
         .filter(|&i| batch.get_weight(i) > 0)
         .filter_map(|i| {
             let (owner_id, cols, is_unique) = read_idx_tab_row(batch, i);
@@ -303,7 +303,7 @@ pub(crate) fn idx_tab_unique_creates(batch: &Batch) -> Vec<(i64, u64, PkColList)
 /// — its negative-weight rows. The DDL driver clears each pair's unique filter
 /// once the drop is durable.
 pub(crate) fn idx_tab_drops(batch: &Batch) -> Vec<(i64, u64)> {
-    (0..batch.count)
+    (0..batch.len())
         .filter(|&i| batch.get_weight(i) < 0)
         .map(|i| {
             (
@@ -357,7 +357,7 @@ impl PkSignature {
 pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
     let mut sigs: Vec<PkSignature> = Vec::new();
     let mut by_pk: rustc_hash::FxHashMap<u128, usize> = rustc_hash::FxHashMap::default();
-    for i in 0..batch.count {
+    for i in 0..batch.len() {
         let pk = batch.get_pk(i);
         let w = batch.get_weight(i);
         if w == 0 {

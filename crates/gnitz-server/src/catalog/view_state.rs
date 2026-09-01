@@ -69,7 +69,7 @@ impl CatalogEngine {
     /// phase 2 propagates invalidity to any view scanning an invalid source,
     /// walking the views in dependency order so one pass reaches the whole cascade.
     ///
-    /// Which children carry that state is [`state_child_manifests`].
+    /// Which children carry that state is [`children_at_generation`]'s to say.
     /// Reading the operator scratch alongside the output stores is what rejects an
     /// output store one generation ahead of the integral beneath it — the ephemeral
     /// round stamps every output store but only a *compiled* view's traces.
@@ -96,11 +96,6 @@ impl CatalogEngine {
         // An unpeekable manifest reads as a mismatch, which is the verdict a child
         // whose manifest a previous open erased must get: its siblings may still
         // be at `g`.
-        let at_g = |m: String| match std::ffi::CString::new(m) {
-            Ok(c) => matches!(peek_header(&c), Ok(Some(h)) if h.checkpoint_gen == g),
-            Err(_) => false,
-        };
-
         let mut invalid: FxHashSet<i64> = FxHashSet::default();
         for &vid in &view_ids {
             let stream_fed = self
@@ -116,7 +111,7 @@ impl CatalogEngine {
                 .registry
                 .table_directory(vid)
                 .expect("vid taken from the registry's own view list");
-            if !state_child_manifests(dir, launched_workers).into_iter().all(at_g) {
+            if !children_at_generation(dir, launched_workers, g) {
                 invalid.insert(vid);
             }
         }

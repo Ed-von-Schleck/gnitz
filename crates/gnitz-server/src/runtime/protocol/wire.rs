@@ -141,7 +141,7 @@ impl<'a> WireData<'a> {
     /// Rows this payload carries; `0` means the slot or frame is dataless.
     pub(crate) fn row_count(&self) -> usize {
         match *self {
-            WireData::Whole(b) => b.map(|b| b.count).unwrap_or(0),
+            WireData::Whole(b) => b.map(|b| b.len()).unwrap_or(0),
             WireData::Range { count, .. } => count,
             WireData::Scattered { indices, .. } => indices.len(),
         }
@@ -391,7 +391,7 @@ pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, &'static str> {
     let data_batch = match zc.data_batch {
         Some(mb) => {
             let sch = schema.as_ref().ok_or("FLAG_HAS_DATA set but no schema")?;
-            let mut owned = Batch::with_capacity(*sch, mb.count);
+            let mut owned = Batch::with_capacity(*sch, mb.len());
             owned.append_mem_batch(&mb);
             // The wire flags are ground truth. `append_mem_batch` leaves `owned`
             // `Raw`; raise it to the frame's claim, debug-verifying the data.

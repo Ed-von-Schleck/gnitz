@@ -100,7 +100,7 @@ fn val_bound(start: Cut, end: Cut) -> ScanBound {
 fn drain_all(cur: &mut SourceCursor, chunk: usize) -> Vec<(u128, i64)> {
     let mut out = Vec::new();
     while let Some(b) = cur.drain_chunk(chunk) {
-        for i in 0..b.count {
+        for i in 0..b.len() {
             out.push((b.get_pk(i), b.get_weight(i)));
         }
     }
@@ -159,10 +159,10 @@ fn bounded_drain_is_chunk_size_invariant_and_ascending() {
         assert!(matches!(cur, SourceCursor::Bounded(_)), "chunk {chunk}");
         let mut got = Vec::new();
         while let Some(b) = cur.drain_chunk(chunk) {
-            for i in 1..b.count {
+            for i in 1..b.len() {
                 assert!(b.get_pk(i - 1) < b.get_pk(i), "chunk {chunk}: rows out of PK order");
             }
-            for i in 0..b.count {
+            for i in 0..b.len() {
                 got.push((b.get_pk(i), b.get_weight(i)));
             }
         }
@@ -411,10 +411,7 @@ fn orphaned_index_entry_yields_empty_not_exhaustion() {
     orphan_key[idx_key_size..idx_key_size + src_pk_stride].copy_from_slice(&9999u64.to_be_bytes()[8 - src_pk_stride..]);
 
     let mut ob = Batch::with_capacity(idx_schema, 1);
-    ob.extend_pk_bytes(&orphan_key);
-    ob.extend_weight(&1i64.to_le_bytes());
-    ob.extend_null_bmp(&0u64.to_le_bytes());
-    ob.count += 1;
+    ob.push_key_row(&orphan_key, 1);
     ic.ingest_owned_batch(ob).unwrap();
 
     // Chunk of 1 puts the orphan in a chunk of its own: were its `None` to escape,

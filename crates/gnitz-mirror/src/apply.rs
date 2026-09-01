@@ -52,7 +52,7 @@ impl Mirror {
                 Shape::Plain => batch,
                 Shape::Stamped => batch.stripped_of_pk_prefix(&in_desc, &view_desc),
             };
-            if batch.count == 0 {
+            if batch.is_empty() {
                 continue;
             }
             self.registry

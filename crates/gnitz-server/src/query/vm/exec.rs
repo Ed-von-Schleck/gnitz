@@ -90,11 +90,11 @@ fn seed_inputs(vm: &mut VmHandle, inputs: impl IntoIterator<Item = (u16, Batch)>
 
     let mut all_empty = true;
     for (input_reg, input_batch) in inputs {
-        all_empty &= input_batch.count == 0;
+        all_empty &= input_batch.is_empty();
         // Rows under the wrong layout would scramble every downstream read
         // silently. An empty batch has none, and legitimately carries a foreign
         // schema (a dep_map view with no matching rows), so it is exempt.
-        if input_batch.count > 0 {
+        if !input_batch.is_empty() {
             assert_eq!(
                 input_batch.schema.num_columns(),
                 vm.program.reg_meta[input_reg as usize].schema.num_columns(),
@@ -179,7 +179,7 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
                     let mut batch = take_or_clone(batches, last_read, *in_a, pc);
                     batch.map_weights(|w| w.wrapping_mul(2));
                     batch
-                } else if batches[*in_a as usize].count == 0 {
+                } else if batches[*in_a as usize].is_empty() {
                     // `0 + B = B`. Here rather than in `op_union`, which can only
                     // clone B; taking an operand is the VM's decision. The mirror
                     // needs no arm — `op_union` hands `batch_a`, already taken,
@@ -255,7 +255,7 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
                 if integrate == IntegrateMode::Skip {
                     continue;
                 }
-                gnitz_debug!("vm: INTEGRATE in_count={}", batches[*in_reg as usize].count);
+                gnitz_debug!("vm: INTEGRATE in_count={}", batches[*in_reg as usize].len());
                 let trace_table = program.trace_table_idx(*trace_reg);
                 let res = tables[trace_table.at()].ingest_borrowed_batch(&batches[*in_reg as usize]);
                 log_tick_ingest_err("integrate", trace_table, res)?;
@@ -286,7 +286,7 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
 
                 gnitz_debug!(
                     "vm: REDUCE in_count={} avi={} aggs={}",
-                    batches[*in_reg as usize].count,
+                    batches[*in_reg as usize].len(),
                     avi_cursor.is_some(),
                     baked.plan.acc_template.len()
                 );
@@ -304,7 +304,7 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
     // `op_union`), so the label on it may be an operand's; downstream — the
     // exchange wire, `prepare_relay`, the dag driver's fan-out — cannot re-derive it.
     let out = &mut batches[program.out_reg as usize];
-    Ok((out.count > 0).then(|| {
+    Ok((!out.is_empty()).then(|| {
         let mut batch = out.take();
         let want = program.out_schema();
         // Only a narrower nullability may legitimately arrive here. A different

@@ -23,7 +23,7 @@ fn test_enforce_unique_pk() {
     };
     let live = |engine: &mut CatalogEngine| -> usize {
         engine.registry_mut().flush(tid).unwrap();
-        engine.scan_family(tid).unwrap().0.count
+        engine.scan_family(tid).unwrap().0.len()
     };
 
     // ST1: insert a new PK.
@@ -115,7 +115,7 @@ fn test_reserve_user_sequence_seed_and_contiguous() {
     let (base1, delta1, _) = engine.reserve_user_sequence(seq_id, 64);
     assert_eq!(base1, 1);
     assert_eq!(engine.user_sequences.get(&seq_id).copied(), Some(64));
-    assert_eq!(delta1.count, 1, "first use inserts, retracts nothing");
+    assert_eq!(delta1.len(), 1, "first use inserts, retracts nothing");
     assert_eq!(delta1.get_weight(0), 1);
     engine.ingest_to_family(SEQ_TAB_ID, &delta1).unwrap();
 
@@ -125,7 +125,7 @@ fn test_reserve_user_sequence_seed_and_contiguous() {
     let (base2, delta2, _) = engine.reserve_user_sequence(seq_id, 64);
     assert_eq!(base2, 65);
     assert_eq!(engine.user_sequences.get(&seq_id).copied(), Some(128));
-    assert_eq!(delta2.count, 2);
+    assert_eq!(delta2.len(), 2);
     assert_eq!(delta2.get_weight(0), -1);
     assert_eq!(
         delta2.read_payload_u64(0, 0),
@@ -357,13 +357,13 @@ fn test_ingest_scan_seek_family() {
 
     // Scan
     let scan_batch = engine.scan_family(tid).unwrap().0;
-    assert_eq!(scan_batch.count, 3);
+    assert_eq!(scan_batch.len(), 3);
 
     // Seek existing
     let found = engine.seek_family(tid, 2u128, &[]).unwrap().0;
     assert!(found.is_some());
     let row = found.unwrap();
-    assert_eq!(row.count, 1);
+    assert_eq!(row.len(), 1);
     assert_eq!(row.get_pk(0), 2);
 
     // Seek missing
@@ -395,7 +395,7 @@ fn seek_family_resolves_system_table_row() {
         found.is_some(),
         "seek_family must resolve the TABLE_TAB row for the created table",
     );
-    assert_eq!(found.unwrap().count, 1);
+    assert_eq!(found.unwrap().len(), 1);
 
     // A missing system-table key returns None — not an error, not a panic.
     let missing = engine.seek_family(TABLE_TAB_ID, 9_999_999u128, &[]).unwrap().0;
@@ -433,7 +433,7 @@ fn test_ingest_pk_enforced_through_the_store() {
 
     // Scan — should have exactly 1 row with val=200
     let scan = engine.scan_family(tid).unwrap().0;
-    assert_eq!(scan.count, 1);
+    assert_eq!(scan.len(), 1);
     assert_eq!(scan.get_pk(0), 1);
     assert_eq!(scan.read_payload_u64(0, 0), 200, "the later write must win the PK");
 
@@ -773,7 +773,7 @@ fn test_circuit_table_surface_introspectable() {
     // The new schema is SQL-introspectable — `SELECT * FROM CircuitNodes`
     // must return what we just inserted (full-scan path, used by SQL planner).
     let scan = engine.scan_family(CIRCUIT_NODES_TAB_ID).unwrap().0;
-    assert_eq!(scan.count, 1, "scan_family must expose CircuitNodes rows");
+    assert_eq!(scan.len(), 1, "scan_family must expose CircuitNodes rows");
 
     // Compound PK: seek by the 16-byte at-rest `(view_id, node_id)` OPK region.
     let pk_bytes = opk_pk(&SysFamily::CircuitNodes.schema(), &[7, 0]);
@@ -783,37 +783,8 @@ fn test_circuit_table_surface_introspectable() {
         .unwrap();
     assert!(found.is_some(), "seek_family_bytes must find CircuitNodes row by PK");
     let found = found.unwrap();
-    assert_eq!(found.count, 1, "seek_family_bytes must return exactly one row");
+    assert_eq!(found.len(), 1, "seek_family_bytes must return exactly one row");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn test_read_payload_string_out_of_bounds_offset_returns_empty() {
-    // A batch whose STRING struct is a long string (len > 12) with a blob
-    // offset past the (empty) arena must read back empty, not abort:
-    // Batch::read_payload_string disposes of the decoder's None via
-    // unwrap_or_default. Reachable only via corrupt wire input — a correct
-    // client never emits an out-of-bounds offset.
-
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::STRING, 0),
-        ],
-        &[0],
-    );
-    let mut batch = Batch::with_capacity(schema, 1);
-    batch.extend_pk(1);
-    batch.extend_weight(&1i64.to_le_bytes());
-    batch.extend_null_bmp(&0u64.to_le_bytes());
-    let mut st = [0u8; 16];
-    st[0..4].copy_from_slice(&100u32.to_le_bytes()); // len 100 (> 12 → reads blob)
-    st[8..16].copy_from_slice(&0u64.to_le_bytes()); // offset 0 into empty blob
-    batch.extend_col(0, &st);
-    batch.count += 1;
-
-    // payload_col 0 is the STRING column; the corrupt offset must decode to "".
-    assert_eq!(batch.read_payload_string(0, 0), String::new());
 }

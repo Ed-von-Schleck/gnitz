@@ -57,7 +57,7 @@ impl Batch {
     /// Write this batch as a shard file directly to disk. `opts` carries the
     /// durability / flags / FoR packing policy (see
     /// [`shard_file::ShardWriteOpts`]).
-    pub fn write_as_shard(
+    pub(crate) fn write_as_shard(
         &self,
         path: &CStr,
         schema: &SchemaDescriptor,

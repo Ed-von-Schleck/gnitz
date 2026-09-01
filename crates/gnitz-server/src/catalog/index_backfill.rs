@@ -198,7 +198,7 @@ impl CatalogEngine {
         while let Some(chunk) = handle.drain_chunk(chunk_rows) {
             for (ti, t) in targets.iter().enumerate() {
                 let projected = gnitz_store::storage::batch_project_index(&chunk, &t.spec, &t.idx_schema);
-                if projected.count == 0 {
+                if projected.is_empty() {
                     continue;
                 }
                 // The duplicate check applies to the full composite leading span.
@@ -330,7 +330,7 @@ struct IndexProjectionTarget {
 /// `backfill_index` (fresh unique index) and `promote_index_to_unique`
 /// (UNIQUE folded into an existing circuit) so both gate on the same predicate.
 fn projected_chunk_has_dup_keys(projected: &Batch, key_size: usize, seen: &mut rustc_hash::FxHashSet<PkBuf>) -> bool {
-    for row in 0..projected.count {
+    for row in 0..projected.len() {
         let weight = projected.get_weight(row);
         if weight <= 0 {
             continue;

@@ -113,7 +113,7 @@ pub(super) async fn drain_index_scan(
                 }
             }
             if let Some(ref mb) = zc.data_batch {
-                if mb.count > 0 {
+                if !mb.is_empty() {
                     on_batch(mb, frame_len)?;
                 }
             }

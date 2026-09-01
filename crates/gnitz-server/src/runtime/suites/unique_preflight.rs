@@ -124,7 +124,7 @@ fn drain_train(receiver: &W2mReceiver, expected_req_id: u64) -> Vec<PkBuf> {
             saved_schema = Some((s, server_version));
         }
         if let Some(ref mb) = zc.data_batch {
-            for i in 0..mb.count {
+            for i in 0..mb.len() {
                 keys.push(PkBuf::from_bytes(mb.get_pk_bytes(i)));
             }
         }
@@ -237,7 +237,7 @@ fn project_sorted(batch: &Batch, owner: &SchemaDescriptor, cols: &[u32]) -> Vec<
     let mb = batch.as_mem_batch();
     let mut keys: Vec<PkBuf> = Vec::new();
     let mut keybuf = PkBuf::zeroed(0);
-    for row in 0..batch.count {
+    for row in 0..batch.len() {
         let w = batch.get_weight(row);
         if w <= 0 {
             continue;

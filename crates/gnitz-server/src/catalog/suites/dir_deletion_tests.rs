@@ -223,7 +223,7 @@ fn gc_leaves_live_entities_untouched() {
     }
     assert!(engine.pending_dir_deletions.is_empty());
     assert_eq!(
-        engine.scan_family(t1).unwrap().0.count,
+        engine.scan_family(t1).unwrap().0.len(),
         1,
         "flushed table must still read back after the sweep"
     );
@@ -457,7 +457,7 @@ fn set_rows(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64) -> Vec<(u32,
     for k in 0..of {
         let t = open_child(rel, k, of, schema, tid);
         let batch = t.open_cursor().materialize();
-        for i in 0..batch.count {
+        for i in 0..batch.len() {
             v.push((k, batch.get_pk(i), batch.get_weight(i)));
         }
     }
@@ -609,7 +609,12 @@ fn repartition_handles_a_relation_with_empty_children() {
     let rows: Vec<(u128, i64)> = (0..20u128).map(|b| (1u128 | (b << 64), b as i64)).collect();
     seed_child_set(&rel, 3, schema, tid, &rows);
     let occupied = (0..3)
-        .filter(|&k| open_child(&rel, k, 3, schema, tid).open_cursor().materialize().count > 0)
+        .filter(|&k| {
+            !open_child(&rel, k, 3, schema, tid)
+                .open_cursor()
+                .materialize()
+                .is_empty()
+        })
         .count();
     assert_eq!(occupied, 1, "a shared distribution prefix puts every row on one worker");
     for k in 0..3 {
@@ -675,7 +680,7 @@ fn two_complete_sets_resolve_by_layout_sequence() {
     for k in 0..3 {
         let t = open_child(&rel, k, 3, schema, tid);
         let batch = t.open_cursor().materialize();
-        for i in 0..batch.count {
+        for i in 0..batch.len() {
             assert!(
                 batch.read_payload_u64(i, 0) >= 1000,
                 "the stale 2-set won: row {} carries the old payload",

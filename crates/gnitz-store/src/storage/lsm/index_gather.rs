@@ -33,6 +33,8 @@ use crate::storage::spill::sort_indices;
 /// That the base snapshot is taken *after* the index snapshot is the safe order
 /// for the non-atomic base-then-index write path: an entry the index cursor
 /// yields had its base row written earlier still, so no row can go missing.
+// `pub`, but `storage/mod.rs` re-exports it `pub(crate)`: reachable as
+// `SourceCursor::Bounded`'s field type, nameable only in this crate.
 pub struct BoundedIndexCursor {
     idx: ReadCursor,
     src: ReadCursor,
@@ -54,7 +56,7 @@ impl BoundedIndexCursor {
     /// `key_size()`, the leading-key byte length where each entry's source-PK OPK
     /// suffix starts. `pk_capacity` pre-sizes the per-chunk PK scratch in keys
     /// (pass the measured range size capped at the chunk size, or 0 to grow).
-    pub fn new(
+    pub(crate) fn new(
         mut idx: ReadCursor,
         src: ReadCursor,
         start: PkBuf,
@@ -158,7 +160,7 @@ impl SourceCursor {
     ///
     /// `max_rows` bounds every variant exactly except `PkSet`, which tests it
     /// before each key and then drains that key's whole group, so it can
-    /// overshoot to `max_rows - 1 + |largest group|`. Callers read `chunk.count`.
+    /// overshoot to `max_rows - 1 + |largest group|`. Callers read `chunk.len()`.
     pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
         match self {
             SourceCursor::Full(c) => c.drain_chunk(max_rows),

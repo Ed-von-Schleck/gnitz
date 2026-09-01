@@ -72,7 +72,7 @@ impl Mirror {
             .registry
             .scan_spec_family(table_id as i64, &spec, &reply_desc, 0, None)
             .map_err(|f| MirrorError::Engine(f.text))?;
-        if keeper.count == 0 {
+        if keeper.is_empty() {
             return Ok(None);
         }
         Ok(Some(reply_batch(&keeper, &reply_desc, table_id, reply_schema)?))

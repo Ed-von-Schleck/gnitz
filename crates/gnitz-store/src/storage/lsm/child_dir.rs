@@ -142,7 +142,7 @@ pub(super) fn cluster_children(num_workers: u32) -> impl Iterator<Item = ChildAd
 /// child is in no checkpoint round (it is erased at open), and an `Index` child
 /// cannot appear here at all — `CREATE INDEX` is gated on a base table, and only
 /// views reach the resume verdict.
-pub fn state_child_manifests(rel_dir: &str, num_workers: u32) -> Vec<String> {
+pub(crate) fn state_child_manifests(rel_dir: &str, num_workers: u32) -> Vec<String> {
     let scratch = subdir_names(rel_dir);
     let scratch = scratch
         .iter()
@@ -152,6 +152,16 @@ pub fn state_child_manifests(rel_dir: &str, num_workers: u32) -> Vec<String> {
         .map(|c| c.manifest(rel_dir))
         .chain(scratch)
         .collect()
+}
+
+/// Whether every state child of `rel_dir` carries a manifest at `generation`.
+/// A failed read answers `false`, which is safe here because the verdict's only
+/// consequence is a rebuild — `manifest::at_generation` keeps the `Err` for
+/// `Table::new`, whose consequence is erasing shards.
+pub fn children_at_generation(rel_dir: &str, num_workers: u32, generation: u64) -> bool {
+    state_child_manifests(rel_dir, num_workers)
+        .iter()
+        .all(|m| manifest::at_generation(m, generation).unwrap_or(false))
 }
 
 /// Immediate sub-directory names of `path`. Empty if `path` is missing or
