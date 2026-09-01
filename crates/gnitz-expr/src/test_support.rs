@@ -9,7 +9,9 @@
 
 use gnitz_wire::type_code as tc;
 
-use crate::{BatchView, ColumnLocator, Evaluator, LogicalInstr, LogicalProgram, Reg, RowSource, SchemaFacts, Sink};
+use crate::{
+    BatchView, ColumnLocator, Evaluator, ExprResults, LogicalInstr, LogicalProgram, Reg, RowSource, SchemaFacts, Sink,
+};
 
 /// A [`BatchView`] over owned buffers, laid out region-wise like the physical
 /// batch: one packed OPK PK region, one null-bitmap word per row, and one
@@ -366,11 +368,34 @@ pub fn map_prog(
         .expect("test map must validate")
 }
 
+/// One row's scalar result. The production surface drives whole batches — every
+/// consumer wants a column of results — so the single-row arity lives here,
+/// where the tests that assert on one row want it.
+pub fn row_value(ev: &Evaluator, mb: &dyn BatchView, row: usize) -> Option<i64> {
+    match ev.eval_all(mb) {
+        ExprResults::Scalar(vals) => vals[row],
+        ExprResults::Str { .. } => panic!("row_value over a string-valued program; use row_str"),
+    }
+}
+
+/// One row's string result as `(bytes, is_null)`.
+pub fn row_str(ev: &Evaluator, mb: &dyn BatchView, row: usize) -> (Vec<u8>, bool) {
+    match ev.eval_all(mb) {
+        ExprResults::Str { bytes, spans } => match spans[row] {
+            Some((o, l)) => (bytes[o..o + l].to_vec(), false),
+            None => (Vec::new(), true),
+        },
+        ExprResults::Scalar(_) => panic!("row_str over a scalar program; use row_value"),
+    }
+}
+
 /// Run `ev` as a filter and report a per-row verdict — the shape almost every
-/// filter test wants, since `filter` reports runs rather than rows.
+/// filter test wants, since `filter_ranges` reports runs rather than rows.
 pub fn passing_rows(ev: &Evaluator, mb: &TestView) -> Vec<bool> {
     let mut passed = vec![false; mb.row_count()];
-    ev.filter(mb, |s, e| passed[s..e].fill(true));
+    for (s, e) in passing_ranges(ev, mb) {
+        passed[s..e].fill(true);
+    }
     passed
 }
 
@@ -378,15 +403,15 @@ pub fn passing_rows(ev: &Evaluator, mb: &TestView) -> Vec<bool> {
 /// stitching itself rather than which rows pass.
 pub fn passing_ranges(ev: &Evaluator, mb: &TestView) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
-    ev.filter(mb, |s, e| ranges.push((s, e)));
+    ev.filter_ranges(mb, &mut ranges);
     ranges
 }
 
 /// Resolve one program twice: once as classification decides, once forced onto
-/// the nullable arm. The forced side is a faithful baseline — `ensure_capacity`
-/// re-reads `prog.no_nulls` on every drive and sizes the null buffers from it,
-/// and the bit_only / bool_pack masks are computed independently of the arm —
-/// so it really runs the kernels the fast side skips.
+/// the nullable arm through `Evaluator::force_nullable_arm`, which rebuilds the
+/// scratch for the arm it moves to. The forced side is a faithful baseline — the
+/// bit_only / bool_pack masks are computed independently of the arm — so it
+/// really runs the kernels the fast side skips.
 ///
 /// The point is differential testing of programs that, after classification, can
 /// no longer reach the nullable arm by construction. `label` names the subject in
@@ -395,7 +420,7 @@ pub fn both_arms(label: &str, build: impl Fn() -> Evaluator) -> (Evaluator, Eval
     let fast = build();
     assert!(fast.prog.no_nulls, "{label}: the fast side must resolve no_nulls");
     let mut nullable = build();
-    nullable.prog.no_nulls = false;
+    nullable.force_nullable_arm();
     (fast, nullable)
 }
 

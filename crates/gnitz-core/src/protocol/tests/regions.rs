@@ -1,7 +1,19 @@
 use super::*;
 use crate::protocol::types::{ColumnDef, TypeCode};
 use crate::protocol::wal_block::{decode_wal_block_verified, encode_wal_block};
-use gnitz_expr::{CmpOp, IntArithOp, LogicalInstr, LogicalProgram, Reg, RowSource, SchemaFacts, StrOp};
+use gnitz_expr::{
+    BatchView, CmpOp, Evaluator, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Reg, RowSource, SchemaFacts,
+    StrOp,
+};
+
+/// One row's scalar result. `Evaluator` drives whole batches, and these tests
+/// assert a row at a time.
+fn row_value(ev: &Evaluator, mb: &dyn BatchView, row: usize) -> Option<i64> {
+    match ev.eval_all(mb) {
+        ExprResults::Scalar(vals) => vals[row],
+        ExprResults::Str { .. } => panic!("row_value over a string-valued program"),
+    }
+}
 
 // ── Fixture A: permuted, non-contiguous compound PK ──────────────────────
 //
@@ -214,7 +226,7 @@ fn the_shared_evaluator_reads_a_client_batch() {
     .expect("program resolves against the client schema");
 
     for row in 0..3 {
-        let v = ev.eval_row(&view, row).expect("row {row} must not be null");
+        let v = row_value(&ev, &view, row).expect("row {row} must not be null");
         assert_eq!(v, PK3[row] + C1[row] as i64, "row {row}");
         // The program names only non-nullable slots, so `no_nulls` is on.
     }
@@ -247,9 +259,9 @@ fn nullable_payload_null_bits_reach_the_evaluator() {
     .resolve_scalar(&schema)
     .expect("program resolves against the client schema");
 
-    assert_eq!(ev.eval_row(&view, 0), Some(PK3[0] + C2[0]));
-    assert!(ev.eval_row(&view, 1).is_none(), "row 1 nulls the nullable column");
-    assert_eq!(ev.eval_row(&view, 2), Some(PK3[2] + C2[2]));
+    assert_eq!(row_value(&ev, &view, 0), Some(PK3[0] + C2[0]));
+    assert!(row_value(&ev, &view, 1).is_none(), "row 1 nulls the nullable column");
+    assert_eq!(row_value(&ev, &view, 2), Some(PK3[2] + C2[2]));
 }
 
 #[test]
@@ -279,7 +291,7 @@ fn filter_over_the_region_path() {
     .expect("predicate resolves against the client schema");
 
     let mut ranges: Vec<(usize, usize)> = Vec::new();
-    ev.filter(&view, |s, e| ranges.push((s, e)));
+    ev.filter_ranges(&view, &mut ranges);
     assert_eq!(ranges, vec![(0, 1)]);
 }
 
@@ -309,9 +321,9 @@ fn string_columns_compare_through_the_shared_blob_heap() {
     // bytes (and come out equal, not less-than).
     for row in 0..2 {
         let want = (C4[row].as_bytes() < C5[row]) as i64;
-        assert_eq!(ev.eval_row(&view, row), Some(want), "row {row}");
+        assert_eq!(row_value(&ev, &view, row), Some(want), "row {row}");
     }
-    assert!(ev.eval_row(&view, 2).is_none(), "row 2 nulls both string columns");
+    assert!(row_value(&ev, &view, 2).is_none(), "row 2 nulls both string columns");
 }
 
 #[test]

@@ -876,15 +876,6 @@ impl ZSetBatch {
         self.pks.is_empty()
     }
 
-    /// Whether column `ci` is SQL NULL at `row`: a PK column is never NULL;
-    /// a payload column reads its bit from the null bitmap — the single NULL
-    /// source across every `ColData` variant (a `Fixed` NULL is zero-filled
-    /// filler with no per-value sentinel).
-    #[inline]
-    pub fn is_null(&self, schema: &Schema, row: usize, ci: usize) -> bool {
-        !schema.is_pk_col(ci) && null_word_get(self.nulls[row], schema.payload_idx(ci))
-    }
-
     /// Indices of the live rows — those with positive weight. A `ZSetBatch`
     /// row with weight ≤ 0 is a retraction/ghost, not a present element, so a
     /// catalog scan over a batch iterates only its live rows.

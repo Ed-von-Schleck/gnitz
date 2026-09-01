@@ -9,14 +9,14 @@ use gnitz_wire::type_code;
 use crate::batch::MORSEL;
 use crate::test_support::{
     both_arms, filter_prog, is_not_null_op, is_null_op, make_int_view, make_n_col_view, map_prog, passing_ranges,
-    passing_rows, push_payload_cols, scalar_prog, schema_pk_ints, schema_pk_strings, set_row_pk, FilterShape,
-    TestSchema, TestView,
+    passing_rows, push_payload_cols, row_value, scalar_prog, schema_pk_ints, schema_pk_strings, set_row_pk,
+    FilterShape, TestSchema, TestView,
 };
-use crate::{CmpOp, Evaluator, LogicalInstr, StrOp};
+use crate::{CmpOp, Evaluator, ExprResults, IntArithOp, LogicalInstr, StrOp};
 
 /// True iff `ev`'s predicate passes for `row`.
 fn passes(ev: &Evaluator, mb: &TestView, row: usize) -> bool {
-    ev.eval_row(mb, row).is_some_and(|val| val != 0)
+    row_value(ev, mb, row).is_some_and(|val| val != 0)
 }
 
 /// The map-side surface an engine consumer reads a resolved program through:
@@ -76,9 +76,8 @@ fn a_resolved_map_reports_its_copies_emits_and_nullable_slots() {
     assert!(projection.scalar_emits().is_empty() && projection.str_emits().is_empty());
 }
 
-/// `filter_ranges` is what every range-driven consumer uses instead of
-/// `filter`'s callback, and `[(0, n)]` is the agreed spelling of "no predicate".
-/// It must also clear the caller's buffer, which is reused across chunks.
+/// `[(0, n)]` is the agreed spelling of "no predicate", and `filter_ranges`
+/// must clear the caller's buffer, which is reused across chunks.
 #[test]
 fn filter_ranges_collects_into_a_reused_buffer() {
     let schema = schema_pk_ints(1, true);
@@ -112,7 +111,7 @@ fn filter_ranges_collects_into_a_reused_buffer() {
 /// The batch filter and the m=1 row read are two drives of one program and must
 /// agree row for row.
 #[test]
-fn filter_agrees_with_eval_row() {
+fn filter_agrees_with_the_row_read() {
     let schema = schema_pk_ints(1, true);
     // Pass iff col[1] > 15.
     let instrs = vec![
@@ -129,8 +128,7 @@ fn filter_agrees_with_eval_row() {
     let rows: &[(u64, u64, &[i64])] = &[(1, 0, &[5]), (2, 0, &[15]), (3, 0, &[25]), (4, 0, &[0])];
     let mb = make_int_view(&schema, rows);
 
-    let mut passing = vec![false; rows.len()];
-    ev.filter(&mb, |start, end| passing[start..end].fill(true));
+    let passing = passing_rows(&ev, &mb);
 
     for (i, &(_, _, vals)) in rows.iter().enumerate() {
         assert_eq!(passing[i], passes(&ev, &mb, i), "row {i}: val={}", vals[0]);
@@ -167,10 +165,7 @@ fn a_fused_string_compare_never_passes_a_null_row() {
 
     // Drive the (multi-morsel) batch path through the filter and compare to
     // the m=1 read.
-    let mut passing = vec![false; n];
-    kind.filter(&mb, |start, end| {
-        passing[start..end].fill(true);
-    });
+    let passing = passing_rows(&kind, &mb);
     for (row, &batch_pass) in passing.iter().enumerate() {
         let row_pass = passes(&kind, &mb, row);
         assert_eq!(batch_pass, row_pass, "row {row}: batch={batch_pass} per-row={row_pass}",);
@@ -228,11 +223,9 @@ fn filter_range_case(schema: TestSchema) {
     let all = make_n_col_view(&schema, n, |_, _| 1, |_, _| false);
     assert_eq!(passing_ranges(&ev, &all), vec![(0, n)]);
 
-    // An all-fail batch calls back zero times.
+    // An all-fail batch reports zero runs.
     let none = make_n_col_view(&schema, n, |_, _| 0, |_, _| false);
-    let mut count = 0;
-    ev.filter(&none, |_, _| count += 1);
-    assert_eq!(count, 0);
+    assert_eq!(passing_ranges(&ev, &none), vec![]);
 
     // A run ending exactly on a 64-bit word boundary, with the next word all
     // zero: the run has to be closed at the boundary by the empty word itself,
@@ -371,10 +364,7 @@ fn bit_only_not_3vl_truth_table() {
             LogicalInstr::BoolNot { a: Reg(2) }, // r3 = NOT r2
         ];
         let kind = filter_prog(&schema, instrs, Reg(3), vec![]);
-        let mut passed = false;
-        kind.filter(&mb, |_, _| {
-            passed = true;
-        });
+        let passed = !passing_ranges(&kind, &mb).is_empty();
         // NOT TRUE=FALSE, NOT FALSE=TRUE, NOT NULL=NULL (filter fails on NULL)
         let expected = matches!(src_truthy, Some(false));
         assert_eq!(
@@ -399,10 +389,7 @@ fn classifier_filter_result_reg_non_bool_falls_back() {
     let rows: &[(i64, bool)] = &[(1, false), (0, false), (0, true), (-5, false)];
     let mb = make_n_col_view(&schema, rows.len(), |row, _| rows[row].0, |row, _| rows[row].1);
 
-    let mut passed = vec![false; 4];
-    kind.filter(&mb, |s, e| {
-        passed[s..e].fill(true);
-    });
+    let passed = passing_rows(&kind, &mb);
     // val=1 → pass, val=0 → fail, null → fail, val=-5 → pass.
     assert_eq!(
         passed,
@@ -620,9 +607,9 @@ fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
 fn is_null_arms_agree() {
     let schema = schema_pk_ints(3, true);
     for (name, (instrs, result_reg)) in null_test_shapes() {
-        // One evaluator per arm for the whole sweep: `ensure_capacity` never
-        // shrinks, so reusing them across row counts is also how the engine
-        // drives an evaluator.
+        // One evaluator per arm for the whole sweep: the register file is sized
+        // once at construction and the filter bitmap never shrinks, so reusing
+        // them across row counts is also how the engine drives an evaluator.
         let (fast, nullable) = both_arms(name, || filter_prog(&schema, instrs.clone(), result_reg, vec![]));
 
         for &n in &ARM_SWEEP_ROWS {
@@ -1016,7 +1003,7 @@ fn or_does_not_take_a_null_row_stored_value_as_definite_true() {
     );
 }
 
-/// A 3-conjunct chain read through `eval_row`, which reports the null bit
+/// A 3-conjunct chain read back per row, which reports the null bit
 /// directly where `filter` cannot: it consumes `bool_bits & !null_bits`, so a
 /// cleared bool already forces the verdict and NULL is indistinguishable from
 /// FALSE there. A filter-resolved program really is driven this way — `passes`
@@ -1026,7 +1013,7 @@ fn or_does_not_take_a_null_row_stored_value_as_definite_true() {
 /// `TRUE AND NULL AND TRUE` is NULL, and a definite-FALSE chain is FALSE rather
 /// than the previous drive's NULL carried forward in the scratch.
 #[test]
-fn and_chain_null_and_false_through_eval_row() {
+fn and_chain_null_and_false_per_row() {
     let schema = schema_pk_ints(3, true);
     // Row 0: col1 = 1 (true), col2 NULL holding 5, col3 = 1 (true)
     //        → acc = TRUE AND NULL = NULL, terminal = NULL AND TRUE = NULL.
@@ -1070,9 +1057,9 @@ fn and_chain_null_and_false_through_eval_row() {
     ];
     let ev = filter_prog(&schema, instrs, Reg(8), vec![]);
 
-    assert_eq!(ev.eval_row(&mb, 0), None, "TRUE AND NULL AND TRUE is NULL");
+    assert_eq!(row_value(&ev, &mb, 0), None, "TRUE AND NULL AND TRUE is NULL");
     assert_eq!(
-        ev.eval_row(&mb, 1),
+        row_value(&ev, &mb, 1),
         Some(0),
         "a definite-FALSE chain is FALSE, not the previous drive's NULL"
     );
@@ -1235,7 +1222,79 @@ fn bool_and_or_cover_the_whole_three_valued_table() {
         for (row, &(a, b)) in cells.iter().enumerate() {
             let (want_val, want_null) = reference(a, b);
             let want = (!want_null).then_some(i64::from(want_val));
-            assert_eq!(ev.eval_row(&mb, row), want, "{name}: {a:?}, {b:?}");
+            assert_eq!(row_value(&ev, &mb, row), want, "{name}: {a:?}, {b:?}");
         }
+    }
+}
+
+/// `eval_all` returns the arm its program's result class fixes, and its string
+/// arm addresses one shared arena — so the per-morsel span arithmetic has to
+/// stay in step with the rows across a morsel boundary. The scalar arm reads
+/// back through the same `result_value` the single-row form does, so only its
+/// length and the class dispatch are at stake here.
+#[test]
+fn eval_all_reports_one_result_per_row_in_its_own_class() {
+    let schema = schema_pk_ints(2, true);
+    let n = MORSEL + 7;
+    let mb = make_n_col_view(
+        &schema,
+        n,
+        |row, col| ((row * 7 + col) % 5) as i64,
+        |row, _| row.is_multiple_of(11),
+    );
+    // A divide, so a zero divisor makes NULLs the operands' own nullability
+    // does not.
+    let div = scalar_prog(
+        &schema,
+        vec![
+            LogicalInstr::LoadColInt { col: 1 },
+            LogicalInstr::LoadColInt { col: 2 },
+            LogicalInstr::IntArith {
+                op: IntArithOp::Div,
+                a: Reg(0),
+                b: Reg(1),
+            },
+        ],
+        Reg(2),
+        vec![],
+    );
+    let ExprResults::Scalar(vals) = div.eval_all(&mb) else {
+        panic!("a scalar program must evaluate to the scalar arm");
+    };
+    assert_eq!(vals, (0..n).map(|i| row_value(&div, &mb, i)).collect::<Vec<_>>());
+
+    let str_schema = schema_pk_strings(1, true);
+    let mut sv = TestView::new(n, str_schema.pk_stride());
+    push_payload_cols(&mut sv, &str_schema);
+    for row in 0..n {
+        set_row_pk(&mut sv, &str_schema, row, row as u64 + 1);
+        if row.is_multiple_of(9) {
+            sv.set_null(row, 0);
+        } else {
+            // Alternating either side of the 12-byte inline boundary, so both
+            // cell forms cross the morsel boundary.
+            sv.set_string(row, 0, format!("r{row}-{}", "x".repeat(row % 20)).as_bytes());
+        }
+    }
+    let upper = scalar_prog(
+        &str_schema,
+        vec![
+            LogicalInstr::LoadColStr { col: 1 },
+            LogicalInstr::StrCase { a: Reg(0), upper: true },
+        ],
+        Reg(1),
+        vec![],
+    );
+    let ExprResults::Str { bytes, spans } = upper.eval_all(&sv) else {
+        panic!("a string program must evaluate to the string arm");
+    };
+    assert_eq!(spans.len(), n);
+    for (row, span) in spans.iter().enumerate() {
+        let want = (!row.is_multiple_of(9)).then(|| format!("R{row}-{}", "X".repeat(row % 20)));
+        assert_eq!(
+            span.map(|(o, l)| String::from_utf8(bytes[o..o + l].to_vec()).unwrap()),
+            want,
+            "row {row}",
+        );
     }
 }

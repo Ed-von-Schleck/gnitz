@@ -549,3 +549,126 @@ fn resolve_order_by_rejects_clickhouse_duckdb_extensions() {
         Err(GnitzSqlError::Unsupported(_))
     ));
 }
+
+/// The worker's ORDER BY comparator and this sink's are two *decodes* of one
+/// order — OPK through [`ColumnLocator`] there, native LE through `SortKey`
+/// here — and a disagreement drops a row the final LIMIT window wanted, since
+/// the worker's top-k discards before the client sees it. Its own function lives
+/// in gnitz-store, which this crate does not link, so what runs here is the
+/// per-key rule it is built out of.
+#[test]
+fn both_order_by_comparators_agree_on_every_pair() {
+    use gnitz_expr::RowSource;
+
+    /// One key of the worker-side comparator, over a locator and a view.
+    fn engine_cmp_key(
+        view: &gnitz_core::ZSetBatchView<'_>,
+        loc: &ColumnLocator,
+        desc: bool,
+        nulls_first: bool,
+        ra: usize,
+        rb: usize,
+    ) -> Ordering {
+        match (
+            loc.is_null_word(view.get_null_word(ra)),
+            loc.is_null_word(view.get_null_word(rb)),
+        ) {
+            (true, true) => return Ordering::Equal,
+            // NULL placement is absolute: `nulls_first` decides it, `desc` does
+            // not flip it.
+            (true, false) => return if nulls_first { Ordering::Less } else { Ordering::Greater },
+            (false, true) => return if nulls_first { Ordering::Greater } else { Ordering::Less },
+            (false, false) => {}
+        }
+        let ord = loc.cmp_non_null(view, ra, view, rb);
+        if desc {
+            ord.reverse()
+        } else {
+            ord
+        }
+    }
+
+    // One column of each shape the two decodes can differ on: a U64 PK, a signed
+    // narrow PK column, a U64 payload past 2^63 (which a bit-reinterpreting
+    // decode sorts first), a nullable signed payload, and a string.
+    let schema = Schema {
+        columns: vec![
+            col_def("pk_u", TypeCode::U64, false),
+            col_def("pk_i", TypeCode::I16, false),
+            col_def("u", TypeCode::U64, true),
+            col_def("i", TypeCode::I32, true),
+            col_def("s", TypeCode::String, true),
+        ],
+        pk_cols: vec![0, 1],
+    };
+    // Repeats, ties, both NULL polarities, and values straddling every sign
+    // boundary the two decodes would disagree on if either were wrong.
+    type Row = (u64, i16, Option<u64>, Option<i32>, Option<&'static str>);
+    let rows: &[Row] = &[
+        (0, 0, Some(0), Some(0), Some("")),
+        (1, -1, Some(u64::MAX), Some(-1), Some("a")),
+        (1, 1, Some(1 << 63), Some(i32::MIN), Some("ab")),
+        (u64::MAX, i16::MIN, None, Some(i32::MAX), None),
+        (
+            7,
+            i16::MAX,
+            Some(9),
+            None,
+            Some("a longer value past the inline boundary"),
+        ),
+        (
+            7,
+            i16::MAX,
+            Some(9),
+            None,
+            Some("a longer value past the inline boundary"),
+        ),
+        (2, 3, Some(u64::MAX - 1), Some(5), Some("A")),
+    ];
+    let mut batch = ZSetBatch::new(&schema);
+    for &(pk_u, pk_i, u, i, s) in rows {
+        let mut pk = [0u8; 10];
+        pk[..8].copy_from_slice(&pk_u.to_le_bytes());
+        pk[8..].copy_from_slice(&pk_i.to_le_bytes());
+        batch.pks.push_bytes(&pk);
+        batch.weights.push(1);
+        let mut null_word = 0u64;
+        for (slot, is_null) in [u.is_none(), i.is_none(), s.is_none()].into_iter().enumerate() {
+            if is_null {
+                null_word |= 1 << slot;
+            }
+        }
+        batch.nulls.push(null_word);
+        if let ColData::Fixed(buf) = &mut batch.columns[2] {
+            buf.extend_from_slice(&u.unwrap_or(0).to_le_bytes());
+        }
+        if let ColData::Fixed(buf) = &mut batch.columns[3] {
+            buf.extend_from_slice(&i.unwrap_or(0).to_le_bytes());
+        }
+        if let ColData::Strings(v) = &mut batch.columns[4] {
+            v.push(s.map(str::to_string));
+        }
+    }
+    batch.validate(&schema).expect("the fixture batch must be well-formed");
+
+    let mut bufs = gnitz_core::ViewBuffers::default();
+    let view = bufs.view(&batch, &schema);
+    let n = rows.len();
+    for ci in 0..schema.columns.len() {
+        let loc = SchemaFacts::locate(&schema, ci);
+        for asc in [true, false] {
+            for nulls_first in [true, false] {
+                let key = SortKey::new(&schema, ci, asc, nulls_first);
+                for ra in 0..n {
+                    for rb in 0..n {
+                        assert_eq!(
+                            cmp_key(&batch, &key, ra, rb),
+                            engine_cmp_key(&view, &loc, !asc, nulls_first, ra, rb),
+                            "column {ci}, asc={asc}, nulls_first={nulls_first}, rows {ra}/{rb}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

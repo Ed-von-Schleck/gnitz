@@ -10,7 +10,7 @@
 //! resolved form are named `gnitz_expr::` at each call site rather than
 //! re-exported here.
 
-use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram, MorselOut};
+use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram};
 
 use crate::foundation::xxh::RowHasher;
 use crate::schema::key::{NarrowPkOpk, ReindexPacker};
@@ -349,8 +349,7 @@ impl NullPerm {
 pub struct MapPlan {
     /// The resolved program: the copy list, the two emit lists and the per-row
     /// kernel all read through it. Kept even for a pure projection, whose
-    /// register file is a handful of empty `Vec`s that `ensure_capacity` never
-    /// grows.
+    /// register file is empty — it has no registers to size.
     ev: Evaluator,
     null_perm: NullPerm,
     /// Where the output PK region comes from.
@@ -359,33 +358,6 @@ pub struct MapPlan {
     /// plan-time half.
     string_moves: StringMoves,
     out_schema: SchemaDescriptor,
-}
-
-/// The NULL half of an emit, shared by the scalar (`stride` 8) and string
-/// (`stride` 16) loops: a NULL row's value slot reads as zero, and its bit is set
-/// in the output bitmap.
-///
-/// A sparse bit-scan, not a per-row branch that would de-vectorize the value
-/// store. The two bitmaps are transposed — register-major in the register file,
-/// row-major in the output — so the merge is a scatter, and its read-modify-write
-/// is what composes with `null_perm`'s earlier write and with any other emit.
-#[inline]
-fn emit_null_rows(
-    out: &MorselOut<'_>,
-    reg: usize,
-    win: &mut [u8],
-    nb: &mut [u8],
-    row0: usize,
-    out_payload: usize,
-    stride: usize,
-) {
-    out.for_each_null_row(reg, |i| {
-        win[i * stride..(i + 1) * stride].fill(0);
-        let off = (row0 + i) * 8;
-        let mut merged = gnitz_wire::read_u64_le(nb, off);
-        gnitz_wire::null_word_set(&mut merged, out_payload, true);
-        gnitz_wire::write_u64_le(nb, off, merged);
-    });
 }
 
 /// Set every row's PK to a hash of its full payload content. Identical row
@@ -689,22 +661,21 @@ impl MapPlan {
                     debug_assert_eq!(win.len(), out.reg_bytes(reg).len(), "scalar emit stride is not 8");
                     win.copy_from_slice(out.reg_bytes(reg));
 
-                    emit_null_rows(out, reg, win, nb, row0, out_payload, 8);
+                    out.write_null_rows(reg, win, nb, row0, out_payload);
                 }
 
                 // String emits. Two passes like the scalar path rather than a
                 // per-row nullness branch, because `MorselOut` exposes nullness
-                // only through `for_each_null_row` — and under `no_nulls` there
-                // is no `null_bits` to index at all.
+                // only through `write_null_rows` — and under `no_nulls` there
+                // is no `null_bits` to index at all. Both passes live on
+                // `MorselOut`, so the per-row loops run at gnitz-expr's
+                // opt-level rather than this crate's.
                 for &(reg, out_payload) in self.ev.str_emits() {
                     let (reg, out_payload) = (reg as usize, out_payload as usize);
                     let (col, nb, blob) = output.col_null_and_blob_mut(out_payload);
                     let win = &mut col[row0 * 16..(row0 + m) * 16];
-                    for i in 0..m {
-                        let cell = gnitz_wire::encode_german_string(out.str_bytes(reg, i), blob);
-                        win[i * 16..i * 16 + 16].copy_from_slice(&cell);
-                    }
-                    emit_null_rows(out, reg, win, nb, row0, out_payload, 16);
+                    out.write_str_cells(reg, win, blob);
+                    out.write_null_rows(reg, win, nb, row0, out_payload);
                 }
             });
         }

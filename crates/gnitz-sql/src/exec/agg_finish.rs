@@ -29,13 +29,12 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gnitz_core::{null_word_get, null_word_set, ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
-use gnitz_expr::Evaluator;
+use gnitz_core::{null_word_set, ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch, ZSetBatchView};
+use gnitz_expr::{ColumnLocator, Evaluator, ExprResults, SchemaFacts};
 use gnitz_wire::{cmp_typed_le, AggFunc as WireAggFunc};
 
 use crate::agg::AggSpec;
 use crate::error::GnitzSqlError;
-use crate::exec::batch::filter_batch;
 use crate::validate::reject_duplicate_column_names;
 
 /// The fold sink's whole shape, built once at plan time
@@ -93,19 +92,10 @@ impl FoldShape {
 pub(crate) enum FinalizeItem {
     /// Column `partial_ci` of the group batch, moved verbatim.
     PassThrough { partial_ci: usize },
-    /// An expression over the group batch, evaluated a group at a time. Groups
-    /// are the *output* rows, so this is one evaluation per row emitted, not one
-    /// per row scanned.
-    ///
-    /// Boxed: an `Evaluator` carries a whole resolved program and its register
-    /// scratch, and a projection is mostly pass-throughs — inline it would make
-    /// every item pay the computed one's width.
-    Computed {
-        ev: Box<Evaluator>,
-        /// `Evaluator::result_is_str`, cached so the read-back is chosen once
-        /// per query rather than once per group.
-        is_str: bool,
-    },
+    /// An expression over the group batch, of whichever class it resolved to.
+    /// Boxed because a projection is mostly pass-throughs, which inline would
+    /// each pay a computed item's width.
+    Computed { ev: Box<Evaluator> },
 }
 
 /// One physical agg column's cross-worker combiner. The variant is selected by
@@ -186,6 +176,11 @@ pub(crate) fn agg_finish(spec: &FoldShape, partial: &ZSetBatch) -> ZSetBatch {
     //    one growth stream, mirroring the engine fold. The key is built into
     //    one reused scratch buffer; an owned copy is allocated only for a
     //    genuinely new group (each group recurs on up to W workers).
+    // One locator per partial column, resolved here rather than per (row ×
+    // column): it carries both the NULL bit's position and the Fixed stride.
+    let locs: Vec<ColumnLocator> = (0..1 + n_group + n_aggs)
+        .map(|ci| SchemaFacts::locate(&spec.partial_schema, ci))
+        .collect();
     let mut by_key: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut reps: Vec<Option<usize>> = Vec::new();
     let mut accs: Vec<ColAcc> = Vec::new();
@@ -195,7 +190,7 @@ pub(crate) fn agg_finish(spec: &FoldShape, partial: &ZSetBatch) -> ZSetBatch {
         if w <= 0 {
             continue;
         }
-        group_key(partial, &spec.partial_schema, n_group, row, &mut key_scratch);
+        group_key(partial, &locs[1..1 + n_group], row, &mut key_scratch);
         let g = match by_key.get(key_scratch.as_slice()) {
             Some(&g) => {
                 // Equal group values imply an equal engine `_group_pk`. Checked
@@ -217,8 +212,12 @@ pub(crate) fn agg_finish(spec: &FoldShape, partial: &ZSetBatch) -> ZSetBatch {
                 g
             }
         };
-        for (k, acc) in accs[g * n_aggs..(g + 1) * n_aggs].iter_mut().enumerate() {
-            combine(acc, partial, &spec.partial_schema, 1 + n_group + k, row, w);
+        for (k, (acc, loc)) in accs[g * n_aggs..(g + 1) * n_aggs]
+            .iter_mut()
+            .zip(&locs[1 + n_group..])
+            .enumerate()
+        {
+            combine(acc, partial, loc, 1 + n_group + k, row, w);
         }
     }
 
@@ -235,19 +234,23 @@ pub(crate) fn agg_finish(spec: &FoldShape, partial: &ZSetBatch) -> ZSetBatch {
     //    it is bounded by the result the caller is about to sort and ship.
     let groups = fill_group_batch(spec, partial, &reps, &accs);
 
-    // 4. HAVING. One batch, one `filter` call — so the truth rule is the engine
-    //    filter's own (`bool_bits & !null_bits`), and the region list, which
-    //    borrows the buffers and so cannot be cached, is built once. Without a
-    //    HAVING every group is one range.
+    // 4. HAVING, then 5. finalize — both over **one** view: `ViewBuffers::view`
+    //    rebuilds a region list per call, each a whole-batch OPK re-encode plus a
+    //    fresh materialisation of every German-string column.
+    let mut bufs = gnitz_core::ViewBuffers::default();
+    let view = bufs.view(&groups, &spec.partial_schema);
+
+    // One batch, one drive — so the truth rule is the engine filter's own
+    // (`bool_bits & !null_bits`). Without a HAVING every group is one range.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     match spec.having.as_ref() {
         None => ranges.push((0, groups.len())),
-        Some(ev) => filter_batch(ev, &groups, &spec.partial_schema, |s, e| ranges.push((s, e))),
+        Some(ev) => ev.filter_ranges(&view, &mut ranges),
     }
 
-    // 5. Finalize. Zero surviving groups needs no guard: the range list is then
-    //    empty and the row loop never runs.
-    project_groups(spec, &groups, &ranges)
+    // Zero surviving groups needs no guard: the range list is then empty and the
+    // row loop never runs.
+    project_groups(spec, &view, &ranges)
 }
 
 /// One row per group in the partial-reply layout — the client's reduce output:
@@ -284,9 +287,10 @@ fn fill_group_batch(spec: &FoldShape, partial: &ZSetBatch, reps: &[Option<usize>
             // A group column keeps its source type, so the move goes through the
             // exhaustive `push_row_from` — a new `ColData` variant then has to be
             // handled there rather than panicking at runtime.
+            let loc = SchemaFacts::locate(schema, ci);
             for (g, &rep) in reps.iter().enumerate() {
                 let rep = rep.expect("a grouped result always has a representative row");
-                if null_word_get(partial.nulls[rep], pi) {
+                if loc.is_null_word(partial.nulls[rep]) {
                     push_null_cell(&mut columns[ci], tc, &mut nulls[g], pi);
                 } else {
                     partial.columns[ci].push_row_from(rep, w, &mut columns[ci]);
@@ -330,11 +334,14 @@ fn push_null_cell(col: &mut ColData, tc: TypeCode, word: &mut u64, pi: usize) {
 /// (cleared first): per group column a null marker byte, then the
 /// length-prefixed value image. Collision-free (the length prefix keeps
 /// adjacent columns from aliasing) and allocation-free per row.
-fn group_key(partial: &ZSetBatch, schema: &Schema, n_group: usize, row: usize, key: &mut Vec<u8>) {
+///
+/// `cols` is the group columns' locators in layout order, so `cols[g]` addresses
+/// column `1 + g`; a `Fixed` cell's stride is that locator's own size.
+fn group_key(partial: &ZSetBatch, cols: &[ColumnLocator], row: usize, key: &mut Vec<u8>) {
     key.clear();
-    for g in 0..n_group {
-        let ci = 1 + g;
-        if partial.is_null(schema, row, ci) {
+    let null_word = partial.nulls[row];
+    for (g, loc) in cols.iter().enumerate() {
+        if loc.is_null_word(null_word) {
             key.push(0);
             continue;
         }
@@ -343,9 +350,9 @@ fn group_key(partial: &ZSetBatch, schema: &Schema, n_group: usize, row: usize, k
             key.extend_from_slice(&(b.len() as u32).to_le_bytes());
             key.extend_from_slice(b);
         };
-        match &partial.columns[ci] {
+        match &partial.columns[1 + g] {
             ColData::Fixed(buf) => {
-                let s = schema.columns[ci].type_code.wire_stride();
+                let s = loc.size();
                 put(&buf[row * s..(row + 1) * s]);
             }
             ColData::Strings(v) => put(v[row].as_deref().unwrap_or("").as_bytes()),
@@ -354,8 +361,8 @@ fn group_key(partial: &ZSetBatch, schema: &Schema, n_group: usize, row: usize, k
     }
 }
 
-fn combine(acc: &mut ColAcc, partial: &ZSetBatch, schema: &Schema, ci: usize, row: usize, w: i64) {
-    if partial.is_null(schema, row, ci) {
+fn combine(acc: &mut ColAcc, partial: &ZSetBatch, loc: &ColumnLocator, ci: usize, row: usize, w: i64) {
+    if loc.is_null_word(partial.nulls[row]) {
         return; // NULL partials skip (COUNT/COUNT_NON_NULL partials are never null)
     }
     match acc {
@@ -451,56 +458,79 @@ fn push_group_key(dst: &mut PkColumn, partial: &ZSetBatch, rep: Option<usize>) {
     }
 }
 
+/// One finalize item resolved against the group batch: its output coordinates,
+/// and — for the computed arms — every group's value, driven before the row
+/// loop, where a per-row drive would pay `eval_batch`'s prologue per group.
+/// The row loop is infallible, so nothing observable moves with the drive.
+struct Finalized {
+    /// Output column index, dense payload slot, and declared type.
+    ci: usize,
+    pi: usize,
+    tc: TypeCode,
+    values: FinalValues,
+}
+
+enum FinalValues {
+    /// Column `partial_ci` of the group batch, with the locator its NULL bit is
+    /// read through.
+    PassThrough {
+        partial_ci: usize,
+        loc: ColumnLocator,
+    },
+    Computed(ExprResults),
+}
+
 /// Project the surviving groups through the finalize items — the client's
 /// post-reduce MAP. Each group keeps the `_group_pk` it was combined under.
-fn project_groups(spec: &FoldShape, groups: &ZSetBatch, ranges: &[(usize, usize)]) -> ZSetBatch {
+///
+/// `view` is the caller's one view of the group batch; the batch itself is
+/// reached back through it, so no second region list is built here.
+fn project_groups(spec: &FoldShape, view: &ZSetBatchView<'_>, ranges: &[(usize, usize)]) -> ZSetBatch {
+    let groups = view.batch();
     let n_out: usize = ranges.iter().map(|(s, e)| e - s).sum();
     let mut out = ZSetBatch::with_capacity(&spec.out_schema, n_out);
     // Output column 0 is the hidden PK, so finalize item `si` lands at `si + 1`:
     // its dense payload slot and type are resolved once here, not once per group.
-    let slots: Vec<(usize, usize, TypeCode)> = (0..spec.finalize.len())
-        .map(|si| {
-            (
-                1 + si,
-                spec.out_schema.payload_idx(1 + si),
-                spec.out_schema.columns[1 + si].type_code,
-            )
+    let items: Vec<Finalized> = spec
+        .finalize
+        .iter()
+        .enumerate()
+        .map(|(si, item)| Finalized {
+            ci: 1 + si,
+            pi: spec.out_schema.payload_idx(1 + si),
+            tc: spec.out_schema.columns[1 + si].type_code,
+            values: match item {
+                FinalizeItem::PassThrough { partial_ci } => FinalValues::PassThrough {
+                    partial_ci: *partial_ci,
+                    loc: SchemaFacts::locate(&spec.partial_schema, *partial_ci),
+                },
+                FinalizeItem::Computed { ev } => FinalValues::Computed(ev.eval_all(view)),
+            },
         })
         .collect();
-
-    // One view over the whole group batch, built once: `ViewBuffers::view`
-    // rebuilds a region list per call, so one per group would pay a malloc and a
-    // PK-region rebuild per output row.
-    let mut bufs = gnitz_core::ViewBuffers::default();
-    let view = bufs.view(groups, &spec.partial_schema);
-    let mut str_buf: Vec<u8> = Vec::new();
 
     for &(start, end) in ranges {
         for g in start..end {
             out.pks.push_from(&groups.pks, g);
             out.weights.push(1);
             let mut null_word: u64 = 0;
-            for (item, &(ci, pi, tc)) in spec.finalize.iter().zip(&slots) {
-                let col = &mut out.columns[ci];
-                match item {
-                    FinalizeItem::PassThrough { partial_ci } => {
-                        if groups.is_null(&spec.partial_schema, g, *partial_ci) {
-                            push_null_cell(col, tc, &mut null_word, pi);
+            for item in &items {
+                let col = &mut out.columns[item.ci];
+                match &item.values {
+                    FinalValues::PassThrough { partial_ci, loc } => {
+                        if loc.is_null_word(groups.nulls[g]) {
+                            push_null_cell(col, item.tc, &mut null_word, item.pi);
                         } else {
-                            groups.columns[*partial_ci].push_row_from(g, tc.wire_stride(), col);
+                            groups.columns[*partial_ci].push_row_from(g, item.tc.wire_stride(), col);
                         }
                     }
-                    FinalizeItem::Computed { ev, is_str: true } => {
-                        str_buf.clear();
-                        if ev.eval_row_str(&view, g, &mut str_buf) {
-                            push_null_cell(col, tc, &mut null_word, pi);
-                        } else {
-                            push_str_cell(col, &str_buf);
-                        }
-                    }
-                    FinalizeItem::Computed { ev, is_str: false } => match ev.eval_row(&view, g) {
-                        None => push_null_cell(col, tc, &mut null_word, pi),
-                        Some(v) => push_fixed_bits(col, v as u64, tc.wire_stride()),
+                    FinalValues::Computed(ExprResults::Scalar(vals)) => match vals[g] {
+                        None => push_null_cell(col, item.tc, &mut null_word, item.pi),
+                        Some(v) => push_fixed_bits(col, v as u64, item.tc.wire_stride()),
+                    },
+                    FinalValues::Computed(ExprResults::Str { bytes, spans }) => match spans[g] {
+                        None => push_null_cell(col, item.tc, &mut null_word, item.pi),
+                        Some((o, l)) => push_str_cell(col, &bytes[o..o + l]),
                     },
                 }
             }

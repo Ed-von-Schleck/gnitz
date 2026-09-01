@@ -1,5 +1,4 @@
 use crate::error::GnitzSqlError;
-use crate::exec::batch::filter_batch;
 use crate::expr_lower::compile_conjuncts_evaluator;
 use crate::ir::BoundExpr;
 use gnitz_core::{Schema, ZSetBatch};
@@ -16,7 +15,7 @@ use gnitz_core::{Schema, ZSetBatch};
 /// **Folding is sound.** Per-conjunct short-circuiting excluded a row whose
 /// conjunct was NULL; the chain agrees, because `BoolAnd`'s nullable arm yields
 /// definite-false when either side is definite-false and NULL otherwise, and
-/// `Evaluator::filter` keeps `bool_bits & !null_bits` — so both (NULL, TRUE) and
+/// `Evaluator::filter_ranges` keeps `bool_bits & !null_bits` — so both (NULL, TRUE) and
 /// (NULL, FALSE) exclude.
 ///
 /// `schema` is the schema the *rows* carry, which is what the conjuncts must be
@@ -47,10 +46,20 @@ pub(crate) fn matching_indices(
     let Some(ev) = compile_conjuncts_evaluator(preds, schema)? else {
         return Ok((0..n).collect());
     };
-    let mut matched = Vec::with_capacity(n);
+    // One view over the whole batch: `ViewBuffers::view` rebuilds a region list
+    // per call, so a per-row view would be a malloc plus a PK-region rebuild per
+    // row. The row count comes from the view, so the drive cannot run past the
+    // batch's end.
+    let mut bufs = gnitz_core::ViewBuffers::default();
+    let view = bufs.view(batch, schema);
+    let mut ranges = Vec::new();
+    ev.filter_ranges(&view, &mut ranges);
     // Ranges arrive in increasing order with `end` EXCLUSIVE, so `matched` keeps
     // the sorted-index contract its callers rely on.
-    filter_batch(&ev, batch, schema, |start, end| matched.extend(start..end));
+    let mut matched = Vec::with_capacity(n);
+    for (start, end) in ranges {
+        matched.extend(start..end);
+    }
     Ok(matched)
 }
 

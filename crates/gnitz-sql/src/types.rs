@@ -63,21 +63,10 @@ pub(crate) fn serial_underlying(dt: &DataType) -> Option<TypeCode> {
 
 /// Integer column types — signed/unsigned at every width, including the 128-bit
 /// pair. Used for FK compatibility (an integer child column widens to an integer
-/// parent) and the numeric-aggregate check.
+/// parent) and the numeric-aggregate check. `gnitz_wire` owns the partition, and
+/// its own drift matrix holds this set against every other type predicate.
 pub(crate) fn is_integer_type(tc: TypeCode) -> bool {
-    matches!(
-        tc,
-        TypeCode::I8
-            | TypeCode::I16
-            | TypeCode::I32
-            | TypeCode::I64
-            | TypeCode::U8
-            | TypeCode::U16
-            | TypeCode::U32
-            | TypeCode::U64
-            | TypeCode::U128
-            | TypeCode::I128
-    )
+    gnitz_wire::is_int(tc as u8)
 }
 
 /// Whether a value of this type fits the expression VM's 8-byte *scalar*

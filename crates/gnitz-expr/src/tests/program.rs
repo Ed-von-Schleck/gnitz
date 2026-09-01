@@ -11,8 +11,8 @@ use std::num::NonZeroU8;
 use super::{analyze, ColKind, FloatUnaryOp, IntUnaryOp, ProgramFacts};
 use crate::batch::{decode_f64, encode_f64};
 use crate::test_support::{
-    filter_prog, is_not_null_op, is_null_op, make_int_view, make_string_view, scalar_prog, scalar_prog_with_sinks,
-    schema_pk_ints, schema_pk_strings, TestSchema, TestView,
+    filter_prog, is_not_null_op, is_null_op, make_int_view, make_string_view, row_value, scalar_prog,
+    scalar_prog_with_sinks, schema_pk_ints, schema_pk_strings, TestSchema, TestView,
 };
 use crate::{
     CmpOp, ConstIdx, Evaluator, ExprValidateErr, FloatArithOp, Instr, IntArithOp, LogicalInstr, LogicalProgram, Reg,
@@ -45,7 +45,7 @@ fn eval_with_emit(ev: &Evaluator, mb: &TestView, row: usize) -> (Option<i64>, u6
             }
         }
     });
-    (ev.eval_row(mb, row), emit_null_mask, emit_vals)
+    (row_value(ev, mb, row), emit_null_mask, emit_vals)
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn int_add_and_negate() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, Reg(2), vec![]);
-    let val = prog.eval_row(&mb, 0).expect("not NULL");
+    let val = row_value(&prog, &mb, 0).expect("not NULL");
     assert_eq!(val, 13);
 
     // NEG: -10
@@ -76,7 +76,7 @@ fn int_add_and_negate() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, Reg(1), vec![]);
-    let val = prog.eval_row(&mb, 0).expect("not NULL");
+    let val = row_value(&prog, &mb, 0).expect("not NULL");
     assert_eq!(val, -10);
 }
 
@@ -99,7 +99,7 @@ fn float_add() {
         },
     ];
     let prog = scalar_prog(&schema, instrs, Reg(2), vec![]);
-    let val = prog.eval_row(&mb, 0).expect("not NULL");
+    let val = row_value(&prog, &mb, 0).expect("not NULL");
     let result = decode_f64(val);
     assert!((result - 5.14).abs() < 1e-10);
 }
@@ -115,14 +115,14 @@ fn load_const_carries_a_full_width_i64() {
         val: ((1i64) << 32) | (2i64 & 0xFFFF_FFFF),
     }];
     let prog = scalar_prog(&schema, instrs, Reg(0), vec![]);
-    let val = prog.eval_row(&mb, 0).expect("not NULL");
+    let val = row_value(&prog, &mb, 0).expect("not NULL");
     assert_eq!(val, (1i64 << 32) | 2);
 
     // Test negative constant: -1 (the wire low/high split is reconstructed by
     // `from_wire`; the typed instruction carries the full i64 value directly).
     let instrs = vec![LogicalInstr::LoadConst { val: -1 }];
     let prog = scalar_prog(&schema, instrs, Reg(0), vec![]);
-    let val = prog.eval_row(&mb, 0).expect("not NULL");
+    let val = row_value(&prog, &mb, 0).expect("not NULL");
     assert_eq!(val, -1);
 }
 
@@ -136,7 +136,7 @@ fn int_to_float_widens_the_register() {
         LogicalInstr::IntToFloat { a: Reg(0) },
     ];
     let prog = scalar_prog(&schema, instrs, Reg(1), vec![]);
-    let val = prog.eval_row(&mb, 0).expect("not NULL");
+    let val = row_value(&prog, &mb, 0).expect("not NULL");
     assert_eq!(decode_f64(val), 42.0);
 }
 
@@ -154,9 +154,7 @@ fn a_u64_column_selects_the_unsigned_arm_of_div_mod_and_the_float_cast() {
     // u64::MAX is -1 as i64, so every signed reading below is a different number.
     let mb = make_int_view(&schema, &[(1, 0, &[u64::MAX as i64])]);
     let run = |instrs: Vec<LogicalInstr>, result: u16| {
-        scalar_prog(&schema, instrs, Reg(result), vec![])
-            .eval_row(&mb, 0)
-            .expect("not NULL")
+        row_value(&scalar_prog(&schema, instrs, Reg(result), vec![]), &mb, 0).expect("not NULL")
     };
     let load = LogicalInstr::LoadColInt { col: 1 };
     let two = LogicalInstr::LoadConst { val: 2 };
@@ -347,7 +345,7 @@ fn a_column_index_resolves_to_the_pk_or_to_its_dense_payload_slot() {
             };
             assert_eq!(got_slot, want_slot, "pk_index={pk_index} col {ci}: wrong slot");
             assert_eq!(
-                prog.eval_row(&mb, 0),
+                row_value(&prog, &mb, 0),
                 Some(want_val),
                 "pk_index={pk_index} col {ci}: wrong value"
             );
@@ -426,17 +424,17 @@ fn load_null_else_branch_eval() {
 
     // cond truthy → 42.
     let batch = make_int_view(&schema, &[(1, 0, &[5])]);
-    let v = prog.eval_row(&batch, 0).expect("not NULL");
+    let v = row_value(&prog, &batch, 0).expect("not NULL");
     assert_eq!(v, 42);
 
     // cond false → else NULL.
     let batch = make_int_view(&schema, &[(1, 0, &[0])]);
-    let n = prog.eval_row(&batch, 0).is_none();
+    let n = row_value(&prog, &batch, 0).is_none();
     assert!(n, "false cond → else NULL");
 
     // cond NULL → else NULL.
     let batch = make_int_view(&schema, &[(1, 1, &[9])]);
-    let n = prog.eval_row(&batch, 0).is_none();
+    let n = row_value(&prog, &batch, 0).is_none();
     assert!(n, "NULL cond → else NULL");
 }
 
@@ -540,22 +538,24 @@ fn select_classification_of_cond_and_result() {
         },
     ];
     let ProgramFacts {
-        bit_only, bool_input, ..
+        bit_only, bool_pack, ..
     } = analyze(&instrs, &[], &schema, Some(Reg(5)), true);
     // The same program must also be a legal filter.
     filter_prog(&schema, instrs, Reg(5), vec![]);
-    assert_ne!(bool_input & (1 << 0), 0, "cond is read as a bool_input");
-    assert_ne!(bool_input & (1 << 3), 0, "select result feeds BOOL_AND as bool_input");
+    // Neither r0 nor r3 is bool-produced, so neither can be bit_only and their
+    // `bool_pack` bits can only come from the bool_input half.
+    assert_ne!(bool_pack & (1 << 0), 0, "cond is read as a bool_input");
+    assert_ne!(bool_pack & (1 << 3), 0, "select result feeds BOOL_AND as bool_input");
     assert_eq!(bit_only & (1 << 3), 0, "select dst is a value register, never bit_only");
 }
 
 /// SELECT blends branch values, so its destination is a `WriteAs::Value`. As a
 /// `WriteAs::Bool` it would be `bit_only` here — read by nobody, and
-/// `is_filter = false` keeps `result_reg` out of `bool_input` — and `eval_row`
+/// `is_filter = false` keeps `result_reg` out of `bool_input` — and the read-back
 /// would return the packed truth bit instead of the branch value.
 #[test]
 fn a_select_result_reads_back_as_a_value() {
-    // The nullable column load turns `no_nulls` off; `eval_row` consults
+    // The nullable column load turns `no_nulls` off; the read-back consults
     // `bit_only` only on the nullable arm.
     let schema = schema_pk_ints(1, true);
     let mb = make_int_view(&schema, &[(1, 0, &[1])]);
@@ -571,7 +571,7 @@ fn a_select_result_reads_back_as_a_value() {
     ];
     let prog = scalar_prog(&schema, instrs, Reg(3), vec![]);
     assert!(!prog.prog.no_nulls, "the nullable load keeps this off the no_nulls arm");
-    let val = prog.eval_row(&mb, 0).expect("not NULL");
+    let val = row_value(&prog, &mb, 0).expect("not NULL");
     assert_eq!(val, 5, "SELECT returns the chosen branch value, not a truth bit");
 }
 
@@ -602,15 +602,15 @@ fn nested_selects_evaluate_inside_out() {
     // payload cols: c1, c2, v1=10, v2=20, v3=30.
     // c1 truthy → v1.
     let batch = make_int_view(&schema, &[(1, 0, &[1, 1, 10, 20, 30])]);
-    let v = prog.eval_row(&batch, 0).expect("not NULL");
+    let v = row_value(&prog, &batch, 0).expect("not NULL");
     assert_eq!(v, 10, "c1 truthy → v1");
     // c1 false, c2 truthy → v2.
     let batch = make_int_view(&schema, &[(1, 0, &[0, 1, 10, 20, 30])]);
-    let v = prog.eval_row(&batch, 0).expect("not NULL");
+    let v = row_value(&prog, &batch, 0).expect("not NULL");
     assert_eq!(v, 20, "c1 false, c2 truthy → v2");
     // both false → v3.
     let batch = make_int_view(&schema, &[(1, 0, &[0, 0, 10, 20, 30])]);
-    let v = prog.eval_row(&batch, 0).expect("not NULL");
+    let v = row_value(&prog, &batch, 0).expect("not NULL");
     assert_eq!(v, 30, "both false → else v3");
 }
 
@@ -1117,7 +1117,7 @@ fn int_in_set_membership_over_every_pool_shape() {
         for &(v, want) in values {
             let mb = make_int_view(&schema, &[(1, 0, &[v])]);
             assert_eq!(
-                prog.eval_row(&mb, 0),
+                row_value(&prog, &mb, 0),
                 Some(want),
                 "tc={col_tc} pool_len={} value={v}",
                 pool.len()
@@ -1126,7 +1126,7 @@ fn int_in_set_membership_over_every_pool_shape() {
         // col1 is payload slot 0, so bit 0 of the null word is its NULL.
         let mb = make_int_view(&schema, &[(1, 0b1, &[0])]);
         assert!(
-            prog.eval_row(&mb, 0).is_none(),
+            row_value(&prog, &mb, 0).is_none(),
             "tc={col_tc}: a NULL operand must produce a NULL membership result"
         );
     }
@@ -1155,7 +1155,7 @@ fn not_in_set_excludes_a_null_operand() {
     for (null_word, val, want) in [(0b1, 0, None), (0, 9, Some(1)), (0, 2, Some(0))] {
         let mb = make_int_view(&schema, &[(1, null_word, &[val])]);
         assert_eq!(
-            prog.eval_row(&mb, 0),
+            row_value(&prog, &mb, 0),
             want,
             "NOT IN over {val} (null_word {null_word:#b})"
         );
@@ -1172,10 +1172,10 @@ fn an_unsorted_in_set_pool_is_sorted_at_resolve() {
     // past the first probe's `42 > 7` left turn).
     for v in [-1i64, 3, 7, 42] {
         let mb = make_int_view(&schema, &[(1, 0, &[v])]);
-        assert_eq!(prog.eval_row(&mb, 0), Some(1), "value {v} must be found");
+        assert_eq!(row_value(&prog, &mb, 0), Some(1), "value {v} must be found");
     }
     let mb = make_int_view(&schema, &[(1, 0, &[8])]);
-    assert_eq!(prog.eval_row(&mb, 0), Some(0));
+    assert_eq!(row_value(&prog, &mb, 0), Some(0));
 }
 
 #[test]
@@ -1206,7 +1206,7 @@ fn classifier_pure_conjunction_filter() {
     let schema = schema_pk_ints(2, true);
     let instrs = conjunction_over_two_cols();
     let ProgramFacts {
-        bit_only, bool_input, ..
+        bit_only, bool_pack, ..
     } = analyze(&instrs, &[], &schema, Some(Reg(5)), true);
     // The same program must also be a legal filter.
     filter_prog(&schema, instrs, Reg(5), vec![]);
@@ -1220,8 +1220,9 @@ fn classifier_pure_conjunction_filter() {
         "expected r2/r4/r5 bit_only; got mask {bit_only:#010b}"
     );
     // r2 and r4 are read by BOOL_AND; r5 (result_reg) is force-marked a bool
-    // input so the filter's nullable word merge always finds it packed.
-    assert_eq!(bool_input, (1 << 2) | (1 << 4) | (1 << 5));
+    // input so the filter's nullable word merge always finds it packed. Every
+    // bit_only register is packed too, and here the two halves coincide.
+    assert_eq!(bool_pack, (1 << 2) | (1 << 4) | (1 << 5));
 }
 
 // ---------------------------------------------------------------------------
@@ -1615,7 +1616,7 @@ fn a_string_op_cannot_read_the_register_it_writes() {
 /// sink-only program has no register to collide over.
 #[test]
 fn a_sink_only_program_names_no_registers() {
-    assert!(LogicalProgram::copy_cols(&[0, 1, 2]).payload_copy_srcs().is_some());
+    assert_eq!(LogicalProgram::copy_cols(&[0, 1, 2]).sequential_copy_base(), Some(0));
 }
 
 /// A register sink's destination must hold what the source register's class
@@ -1774,7 +1775,7 @@ fn two_like_opcodes_over_one_pool_index_get_a_matcher_each() {
     // ILIKE one is read off the same row through `reg_values`. Captured rather
     // than asserted inside the callback, which a non-firing morsel loop would
     // let pass vacuously.
-    assert_eq!(ev.eval_row(&view, 0), Some(0));
+    assert_eq!(row_value(&ev, &view, 0), Some(0));
     let mut ci_verdicts: Vec<i64> = Vec::new();
     ev.eval_morsels(&view, 0, 1, |_, out| ci_verdicts.push(out.reg_values(2)[0]));
     assert_eq!(ci_verdicts, [1]);

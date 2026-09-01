@@ -258,6 +258,24 @@ pub enum FloatArithOp {
     Div,
 }
 
+/// [`IntArithOp`] as resolution leaves it. `signed` sits on the two operators
+/// that read it rather than on the enclosing instruction, where Add/Sub/Mul
+/// would have to be given a value it means nothing for.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ResolvedIntOp {
+    Add,
+    Sub,
+    Mul,
+    /// A zero divisor yields NULL.
+    Div {
+        signed: bool,
+    },
+    /// A zero divisor yields NULL.
+    Mod {
+        signed: bool,
+    },
+}
+
 /// German-string comparison operator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StrOp {
@@ -307,22 +325,18 @@ pub enum Sink {
 }
 
 impl Sink {
-    /// The register this sink stores, and how it consumes it — the sink half of
-    /// [`operands`], so every walk over a program reads a sink's operand off one
-    /// table rather than spelling the match again.
-    ///
-    /// A sink stores a register's **value**, never its truth bit: that is what
-    /// keeps an emitted boolean out of `bit_only`, where its producer would skip
-    /// the unpack and the map would ship the previous morsel's lane.
-    fn reads(self) -> Option<(Reg, ReadAs)> {
+    /// The register this sink stores — the sink half of [`operands`], so every
+    /// walk over a program reads a sink's operand off one table rather than
+    /// spelling the match again.
+    fn reg(self) -> Option<Reg> {
         match self {
             Sink::Col(_) => None,
-            Sink::Reg(r) => Some((r, ReadAs::Value)),
+            Sink::Reg(r) => Some(r),
         }
     }
 
     /// The input column this sink copies verbatim, with what the copy requires
-    /// of it. The column half of [`Self::reads`].
+    /// of it. The column half of [`Self::reg`].
     fn on_col(self) -> Option<(u32, ColKind)> {
         match self {
             // The copy is columnar and bypasses the register file, so any source
@@ -561,36 +575,13 @@ pub(crate) enum Instr {
         off: u8,
         fi: FixedInt,
     },
-    LoadConst {
-        dst: u16,
-        val: i64,
-    },
-    IntAdd {
-        dst: u16,
-        a: u16,
-        b: u16,
-    },
-    IntSub {
+    /// [`IntArithOp`] with the resolve-time signedness verdict folded into the
+    /// two operators that read one.
+    IntArith {
+        op: ResolvedIntOp,
         dst: u16,
         a: u16,
         b: u16,
-    },
-    IntMul {
-        dst: u16,
-        a: u16,
-        b: u16,
-    },
-    IntDiv {
-        dst: u16,
-        a: u16,
-        b: u16,
-        signed: bool,
-    },
-    IntMod {
-        dst: u16,
-        a: u16,
-        b: u16,
-        signed: bool,
     },
     Cmp {
         op: CmpOp,
@@ -605,22 +596,8 @@ pub(crate) enum Instr {
         a: u16,
         b: u16,
     },
-    FloatAdd {
-        dst: u16,
-        a: u16,
-        b: u16,
-    },
-    FloatSub {
-        dst: u16,
-        a: u16,
-        b: u16,
-    },
-    FloatMul {
-        dst: u16,
-        a: u16,
-        b: u16,
-    },
-    FloatDiv {
+    FloatArith {
+        op: FloatArithOp,
         dst: u16,
         a: u16,
         b: u16,
@@ -682,15 +659,13 @@ pub(crate) enum Instr {
     LoadNull {
         dst: u16,
     },
-    BoolAnd {
+    /// Three-valued AND, or OR when `is_or` — one kernel, the operator carried
+    /// as data, as [`LogicalInstr::BoolBinary`] carries it.
+    BoolBinary {
         dst: u16,
         a: u16,
         b: u16,
-    },
-    BoolOr {
-        dst: u16,
-        a: u16,
-        b: u16,
+        is_or: bool,
     },
     BoolNot {
         dst: u16,
@@ -731,13 +706,6 @@ pub(crate) enum Instr {
         dst: u16,
         pi: u8,
         buf: u32,
-    },
-    /// The const's span in `ResolvedProgram::const_arena`, baked at resolve —
-    /// the const index is known there, so no span table survives to eval.
-    LoadConstStr {
-        dst: u16,
-        off: u32,
-        len: u32,
     },
     LoadNullStr {
         dst: u16,
@@ -1034,18 +1002,28 @@ const SINK_REG: u32 = 1;
 // ---------------------------------------------------------------------------
 
 /// Which resolver a program came through — one variant per entry point in
-/// `eval.rs`, so no caller passes a bare classification.
+/// `eval.rs`, with the output schema on the one role that writes output slots.
 ///
-/// Resolution reads exactly one bit of it: only a **filter** forces
-/// `result_reg` into `bool_input`, because `Evaluator::filter`'s nullable arm
-/// consumes the verdict as a packed bit whatever opcode produced it. The map /
-/// scalar split is carried by `out_schema` instead, which is `Some` for exactly
-/// one of them.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Role {
+/// Resolution reads one further bit of it: only a **filter** forces `result_reg`
+/// into `bool_input`, because
+/// [`Evaluator::filter_ranges`](crate::Evaluator::filter_ranges)'s nullable arm
+/// consumes the verdict as a packed bit whatever opcode produced it.
+#[derive(Clone, Copy)]
+pub(crate) enum Role<'a> {
     Filter,
-    Map,
+    Map(&'a dyn SchemaFacts),
     Scalar,
+}
+
+impl<'a> Role<'a> {
+    /// The schema a map writes its sinks into — `None` for the two roles that
+    /// write none, and so resolve no copy destination widths.
+    fn out_schema(self) -> Option<&'a dyn SchemaFacts> {
+        match self {
+            Role::Map(os) => Some(os),
+            Role::Filter | Role::Scalar => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1144,7 +1122,7 @@ impl LogicalProgram {
         }
         // A sink's source register is bounded but not ordered: sinks run after
         // every instruction, so any of them is readable.
-        for (reg, _) in sinks.iter().filter_map(|s| s.reads()) {
+        for reg in sinks.iter().filter_map(|s| s.reg()) {
             if !reg.written_before(instrs.len()) {
                 return Err(E::RegOutOfRange {
                     reg: reg.0,
@@ -1428,55 +1406,32 @@ impl LogicalProgram {
         })
     }
 
-    /// If the program computes nothing and every sink is a column copy, return
-    /// the copies' source columns — the payload copy list a caller derives a
-    /// MAP's output payload schema from. `None` once any register is computed:
-    /// a program with instructions writes at least one sink from a register,
-    /// which no column list can describe.
-    pub fn payload_copy_srcs(&self) -> Option<Vec<u32>> {
+    /// If the program computes nothing and its sinks are one contiguous block of
+    /// column copies `src = [base, base+1, …]`, return `Some(base)`: the leading
+    /// columns the program skips (the PK region a finalize / identity MAP
+    /// inherits verbatim rather than copying). Otherwise `None`.
+    pub fn sequential_copy_base(&self) -> Option<usize> {
         if !self.instrs.is_empty() {
             return None;
         }
+        let Sink::Col(base) = *self.sinks.first()? else {
+            return None;
+        };
         self.sinks
             .iter()
-            .map(|s| match *s {
-                Sink::Col(src_col) => Some(src_col),
-                Sink::Reg(_) => None,
-            })
-            .collect()
+            .enumerate()
+            .all(|(i, s)| matches!(*s, Sink::Col(c) if c == base + i as u32))
+            .then_some(base as usize)
     }
 
-    /// If the copy list is one contiguous block `src = [base, base+1, …]`,
-    /// return `Some(base)`: the count of leading columns the program skips (the
-    /// PK region a finalize / identity MAP inherits verbatim rather than
-    /// copying). Otherwise `None`.
-    pub fn sequential_copy_base(&self) -> Option<usize> {
-        let srcs = self.payload_copy_srcs()?;
-        let &base = srcs.first()?;
-        let ok = srcs.iter().enumerate().all(|(i, &s)| s == base + i as u32);
-        ok.then_some(base as usize)
-    }
-
-    /// Lower to the resolved form, then run the two one-shot analyses over the
-    /// resolved instruction stream — nullability and register roles — for the
-    /// given [`Role`] ([`Role::Filter`] keeps `result_reg` eligible for
-    /// bit_only). Consuming: a `Vec<LogicalInstr>` cannot be mutated in place into
-    /// a `Vec<Instr>`. Preserves the per-register U64 signed→unsigned tracking.
+    /// Lower to the resolved form under one [`Role`], running the one-shot
+    /// analysis (nullability, register roles, U64 tracking) over the instruction
+    /// stream. [`Role::Map`]'s output schema fixes each copy's destination width
+    /// here, where `check_copy_types` has just approved the widening.
     ///
-    /// `out_schema` is the map's output schema, `None` for the roles that write
-    /// no output slots. It fixes each copy's destination width here, where
-    /// `check_copy_types` has just approved the widening — so the legality of a
-    /// widening and the width it writes at are one fact.
-    ///
-    /// Every "decoded once" below — LIKE matchers, trim sets, const cells, the
-    /// `INT_IN_SET` pools — means **once per compile**, not once per program run
-    /// and never per row.
-    pub(crate) fn resolve_program(
-        self,
-        schema: &dyn SchemaFacts,
-        out_schema: Option<&dyn SchemaFacts>,
-        role: Role,
-    ) -> ResolvedProgram {
+    /// Every "decoded once" below means **once per compile**, never per row.
+    pub(crate) fn resolve_program(self, schema: &dyn SchemaFacts, role: Role<'_>) -> ResolvedProgram {
+        let out_schema = role.out_schema();
         use gnitz_wire::type_code;
         use Instr as I;
         use LogicalInstr as L;
@@ -1520,6 +1475,11 @@ impl LogicalProgram {
         let mut cell_slots: Vec<Option<u32>> = vec![None; self.const_strings.len()];
         let mut copies: Vec<(ColumnLocator, u32, u8)> = Vec::new();
         let mut emits: Vec<(u16, u32)> = Vec::new();
+        // Off the instruction stream for the reason `copies` is: a constant
+        // register names no computation, and each stream entry would cost the
+        // per-morsel dispatch a no-op arm.
+        let mut const_regs: Vec<(u16, i64)> = Vec::new();
+        let mut const_str_regs: Vec<(u16, u32, u32)> = Vec::new();
         // Filled by `batch::str_col_slot`, in buffer-slot order.
         let mut str_cols: Vec<u8> = Vec::new();
         // Resolution is 1:1 on every instruction and carries each register
@@ -1528,10 +1488,16 @@ impl LogicalProgram {
         // no register a mask covers.
         let ProgramFacts {
             bit_only,
-            bool_input,
+            bool_pack,
             no_nulls,
             reg_u64,
-        } = analyze(&self.instrs, &self.sinks, schema, self.result_reg, role == Role::Filter);
+        } = analyze(
+            &self.instrs,
+            &self.sinks,
+            schema,
+            self.result_reg,
+            matches!(role, Role::Filter),
+        );
         // Answered once per register by `analyze`, off each opcode's `U64Rule`,
         // so no arm below restates the rule.
         let is_u64 = |r: u16| (reg_u64 >> r) & 1 != 0;
@@ -1563,8 +1529,9 @@ impl LogicalProgram {
         for (i, li) in self.instrs.into_iter().enumerate() {
             // A register is the index of the instruction that writes it.
             let dst = i as u16;
-            // One logical instruction, one resolved instruction.
-            instrs.push(match li {
+            // One logical instruction, one resolved instruction — bar the two
+            // constant loads, which leave the stream for their own tables.
+            let resolved = match li {
                 L::LoadColInt { col } => {
                     let loc = schema.locate(col as usize);
                     // Total on a validated program: `validate` runs
@@ -1596,42 +1563,34 @@ impl LogicalProgram {
                         other => unreachable!("validated LoadColFloat names F32/F64, got {other}"),
                     }
                 }
-                L::LoadConst { val } => I::LoadConst { dst, val },
-                // The 1:N expansion the resolve boundary exists for: only the
-                // two dividing kernels carry a `signed` flag, so the collapsed
-                // logical operator lands on five distinct resolved opcodes and
-                // no kernel gains an inner match.
+                L::LoadConst { val } => {
+                    const_regs.push((dst, val));
+                    continue;
+                }
+                // The one thing resolution adds to the operator: which of the
+                // two dividing kernels runs unsigned, off the per-register U64
+                // tracking.
                 L::IntArith {
                     op,
                     a: Reg(a),
                     b: Reg(b),
-                } => match op {
-                    IntArithOp::Add => I::IntAdd { dst, a, b },
-                    IntArithOp::Sub => I::IntSub { dst, a, b },
-                    IntArithOp::Mul => I::IntMul { dst, a, b },
-                    IntArithOp::Div => I::IntDiv {
-                        dst,
-                        a,
-                        b,
-                        signed: !is_u64(dst),
+                } => I::IntArith {
+                    op: match op {
+                        IntArithOp::Add => ResolvedIntOp::Add,
+                        IntArithOp::Sub => ResolvedIntOp::Sub,
+                        IntArithOp::Mul => ResolvedIntOp::Mul,
+                        IntArithOp::Div => ResolvedIntOp::Div { signed: !is_u64(dst) },
+                        IntArithOp::Mod => ResolvedIntOp::Mod { signed: !is_u64(dst) },
                     },
-                    IntArithOp::Mod => I::IntMod {
-                        dst,
-                        a,
-                        b,
-                        signed: !is_u64(dst),
-                    },
+                    dst,
+                    a,
+                    b,
                 },
                 L::FloatArith {
                     op,
                     a: Reg(a),
                     b: Reg(b),
-                } => match op {
-                    FloatArithOp::Add => I::FloatAdd { dst, a, b },
-                    FloatArithOp::Sub => I::FloatSub { dst, a, b },
-                    FloatArithOp::Mul => I::FloatMul { dst, a, b },
-                    FloatArithOp::Div => I::FloatDiv { dst, a, b },
-                },
+                } => I::FloatArith { op, dst, a, b },
                 L::Cmp {
                     op,
                     a: Reg(a),
@@ -1689,10 +1648,7 @@ impl LogicalProgram {
                     a: Reg(a),
                     b: Reg(b),
                     is_or,
-                } => match is_or {
-                    true => I::BoolOr { dst, a, b },
-                    false => I::BoolAnd { dst, a, b },
-                },
+                } => I::BoolBinary { dst, a, b, is_or },
                 L::BoolNot { a: Reg(a) } => I::BoolNot { dst, a },
                 L::IsNull { col, invert } => I::IsNull {
                     dst,
@@ -1778,7 +1734,8 @@ impl LogicalProgram {
                         const_arena.extend_from_slice(bytes);
                         span
                     });
-                    I::LoadConstStr { dst, off, len }
+                    const_str_regs.push((dst, off, len));
+                    continue;
                 }
                 L::LoadNullStr => I::LoadNullStr { dst },
                 L::StrSelect {
@@ -1854,7 +1811,8 @@ impl LogicalProgram {
                 L::FloatToStr { a: Reg(a) } => I::FloatToStr { dst, a },
                 L::StrToInt { a: Reg(a), fi } => I::StrToInt { dst, a, fi },
                 L::StrToFloat { a: Reg(a) } => I::StrToFloat { dst, a },
-            });
+            };
+            instrs.push(resolved);
         }
         // Stable-partition by register class, so each writer reads a slice
         // instead of re-testing per entry. Safe because each sink names its own
@@ -1870,8 +1828,10 @@ impl LogicalProgram {
             no_nulls,
             nullable_slots,
             bit_only_mask: bit_only,
-            bool_pack_mask: bit_only | bool_input,
+            bool_pack_mask: bool_pack,
             instrs,
+            const_regs,
+            const_str_regs,
             num_regs,
             result_reg: self.result_reg.map_or(0, |r| r.0 as u32),
             const_cells,
@@ -1879,41 +1839,33 @@ impl LogicalProgram {
             trim_sets,
             like_matchers,
             const_arena,
-            str_class,
+            // One past the highest string register, or 0 for a program with
+            // none: lanes are register-major, so nothing above it is addressed.
+            str_lanes: MAX_REGS as u32 - str_class.leading_zeros(),
             str_cols,
             result_is_str: self.result_reg.is_some_and(|r| (str_class >> r.0) & 1 != 0),
         }
     }
 
-    /// Validate as a filter predicate: the schema pass plus the two rules only a
-    /// filter has.
-    ///
-    /// A filter reads `result_reg` out of `regs`/`bool_bits`, so it must own one
-    /// ([`Self::validate_result_reg`]) and that one must not be a string
-    /// register — a string `result_reg` would filter rows on recycled scratch.
-    /// The string rule is the filter's alone: `resolve_scalar` *wants* a
-    /// string-valued result, and reads it through `eval_row_str`.
-    pub(crate) fn validate_predicate(&self, schema: &dyn SchemaFacts) -> Result<(), ExprValidateErr> {
-        self.validate_result_reg(schema)?;
-        let r = self
-            .result_reg
-            .expect("validate_result_reg rejects a program without one");
-        if (self.str_class >> r.0) & 1 != 0 {
-            return Err(ExprValidateErr::RegClassMismatch { reg: r.0 });
+    /// [`Self::validate`] plus the extra rules the [`Role`] fixes: a filter and a
+    /// scalar read their result back out of a register and must own one, and a
+    /// filter's must not be a string register — it consumes the result as a
+    /// packed truth bit, where `resolve_scalar` *wants* a string and reads it
+    /// through `eval_row_str`.
+    pub(crate) fn validate_for(&self, schema: &dyn SchemaFacts, role: Role<'_>) -> Result<(), ExprValidateErr> {
+        self.validate(schema, role.out_schema())?;
+        match role {
+            Role::Map(_) => Ok(()),
+            Role::Filter | Role::Scalar => {
+                let Some(r) = self.result_reg else {
+                    return Err(ExprValidateErr::ResultRegRequired);
+                };
+                if matches!(role, Role::Filter) && (self.str_class >> r.0) & 1 != 0 {
+                    return Err(ExprValidateErr::RegClassMismatch { reg: r.0 });
+                }
+                Ok(())
+            }
         }
-        Ok(())
-    }
-
-    /// [`Self::validate`] plus the rule the filter and scalar roles share: a
-    /// program whose result is read back out of a register must own one.
-    /// `validate` cannot apply it — a map has no result register by
-    /// construction, and writes its sinks instead.
-    pub(crate) fn validate_result_reg(&self, schema: &dyn SchemaFacts) -> Result<(), ExprValidateErr> {
-        self.validate(schema, None)?;
-        if self.result_reg.is_none() {
-            return Err(ExprValidateErr::ResultRegRequired);
-        }
-        Ok(())
     }
 
     /// Hold every column and sink to the schema the program will run against,
@@ -2157,16 +2109,20 @@ fn operands(li: &LogicalInstr) -> Operands {
         // own.
         L::IntArith { op, a, b } => {
             let ops = writes(WVal(FromOperands)).reading(a, RVal).reading(b, RVal);
+            // Spelled out rather than left to a `_` arm: a new operator that
+            // *can* produce NULL would otherwise default to `makes_null: false`,
+            // `analyze` would set `no_nulls`, and the evaluator would skip null
+            // tracking — a wrong answer in release with no compile error.
             match op {
                 IntArithOp::Div | IntArithOp::Mod => ops.may_null(),
-                _ => ops,
+                IntArithOp::Add | IntArithOp::Sub | IntArithOp::Mul => ops,
             }
         }
         L::FloatArith { op, a, b } => {
             let ops = writes(WVal(Fixed(false))).reading(a, RVal).reading(b, RVal);
             match op {
                 FloatArithOp::Div => ops.may_null(),
-                _ => ops,
+                FloatArithOp::Add | FloatArithOp::Sub | FloatArithOp::Mul => ops,
             }
         }
         // Null-*skipping*, unlike the arithmetic above: a NULL operand yields
@@ -2409,11 +2365,18 @@ pub(crate) struct ResolvedProgram {
     /// A map's computed columns, as `(source register, output payload slot)`,
     /// with the scalar-register entries first and the string-register ones from
     /// [`Self::str_emit_start`] on. The class a consumer needs is not stored
-    /// beside them: the partition point is read off [`Self::str_class`], the one
-    /// record of a register's class.
+    /// beside them: it is the partition, whose point is [`Self::str_emit_start`].
     pub(crate) emits: Vec<(u16, u32)>,
     /// Where [`Self::emits`]' string half starts.
     str_emit_start: usize,
+    /// The scalar constant registers, as `(destination, value)`. Off the
+    /// instruction stream for the reason [`Self::copies`] is, and installed once
+    /// per evaluator: a register's one writer is the instruction at its own
+    /// index, so a constant lane is written before any morsel runs.
+    pub(crate) const_regs: Vec<(u16, i64)>,
+    /// The string constant registers, as `(destination, `[`Self::const_arena`]
+    /// `offset, length)` — the same treatment, over the lane array.
+    pub(crate) const_str_regs: Vec<(u16, u32, u32)>,
     pub(crate) num_regs: u32,
     /// The register holding the filter verdict, or the scalar result. A map has
     /// none and this reads 0, which nothing consults: a map's result leaves
@@ -2452,10 +2415,11 @@ pub(crate) struct ResolvedProgram {
     /// the buffer-slot order `batch::str_col_slot` assigned. A drive resolves one
     /// column region per entry.
     pub(crate) str_cols: Vec<u8>,
-    /// [`LogicalProgram::str_class`], carried over rather than re-derived: it is
-    /// the one record behind [`Self::str_lanes`] and where [`Self::emits`]
-    /// splits.
-    str_class: u64,
+    /// How many string register lanes the scratch must hold: one past the
+    /// highest string register, 0 for a program with none. Lanes are
+    /// register-major, so sizing by [`Self::num_regs`] would reserve 4 KiB per
+    /// register for lanes nothing can read.
+    pub(crate) str_lanes: u32,
     /// True iff [`Self::result_reg`] holds a string. Decided at resolve, where
     /// the logical program still says whether there *is* a result register: a
     /// map has none, so this is false for one without a second test of what the
@@ -2498,19 +2462,10 @@ impl ResolvedProgram {
         (self.bool_pack_mask >> reg) & 1 != 0
     }
 
-    /// How many string register lanes the scratch must hold: one past the
-    /// highest string register, or 0 for a program with none. Lanes are
-    /// register-major and addressed as `str_views[reg * MORSEL + row]`, so
-    /// nothing above the highest string register is ever touched — sizing by
-    /// `num_regs` would reserve 4 KiB per register for lanes that cannot be read.
-    pub(crate) fn str_lanes(&self) -> u32 {
-        MAX_REGS as u32 - self.str_class.leading_zeros()
-    }
-
     /// True iff the result must be read through
     /// [`crate::Evaluator::eval_row_str`], not `eval_row`. Only a scalar can
-    /// answer true: a map has no result register, and `validate_predicate`
-    /// rejects a string-valued filter.
+    /// answer true: a map has no result register, and [`Role::Filter`]'s extra
+    /// rule in `validate_for` rejects a string-valued filter.
     pub(crate) fn result_is_str(&self) -> bool {
         self.result_is_str
     }
@@ -2531,9 +2486,10 @@ struct ProgramFacts {
     /// Bit `r` set iff `r` is only consumed by boolean ops, so its producer can
     /// skip the i64 unpack into `regs[r]`.
     bit_only: u64,
-    /// Bit `r` set iff a boolean consumer reads `r`, so its producer must
-    /// populate `bool_bits[r]`.
-    bool_input: u64,
+    /// Bit `r` set iff `r`'s producer must write `bool_bits[r]` — a boolean
+    /// consumer reads it, or it is bit_only and the filter reads the packed bit
+    /// directly. The union, because that is the only form read back.
+    bool_pack: u64,
     /// True iff no instruction can produce a NULL against the schema, so the
     /// evaluator skips null-bit tracking entirely.
     no_nulls: bool,
@@ -2572,7 +2528,8 @@ fn analyze(
             WriteAs::Bool => bool_produced |= 1u64 << i,
             // In stream order, which is what `U64Rule::FromOperands` needs: a
             // destination's U64-ness is a function of registers earlier
-            // instructions wrote.
+            // instructions wrote. The read classification below needs no order,
+            // which is what lets both live in one walk.
             WriteAs::Value(rule) => reg_u64 |= (u64_verdict(rule, &ops, schema, reg_u64) as u64) << i,
             WriteAs::Str => {}
         }
@@ -2580,17 +2537,20 @@ fn analyze(
             && !ops.cols.iter().flatten().any(|&(col, kind)| {
                 kind.carries_null_to_register() && !schema.is_pk_col(col as usize) && schema.col_nullable(col as usize)
             });
-    }
-    // Every register the program reads, instruction operands and sinks alike —
-    // one classification over both, so a sink's read cannot be left out of it.
-    let instr_reads = instrs.iter().flat_map(|li| operands(li).reads).flatten();
-    for (reg, read) in instr_reads.chain(sinks.iter().filter_map(|s| s.reads())) {
-        let bit = 1u64 << reg.0;
-        if read == ReadAs::Bool {
-            bool_input |= bit;
-        } else {
-            non_bool_read |= bit;
+        for &(reg, read) in ops.reads.iter().flatten() {
+            let bit = 1u64 << reg.0;
+            if read == ReadAs::Bool {
+                bool_input |= bit;
+            } else {
+                non_bool_read |= bit;
+            }
         }
+    }
+    // A sink stores a register's **value**, never its truth bit: that is what
+    // keeps an emitted boolean out of `bit_only`, where its producer would skip
+    // the unpack and the map would ship the previous morsel's lane.
+    for reg in sinks.iter().filter_map(|s| s.reg()) {
+        non_bool_read |= 1u64 << reg.0;
     }
     // A filter's `result_reg` is forced to be a bool input: the filter's
     // nullable arm consumes the result as packed bits, so its producer must
@@ -2598,9 +2558,10 @@ fn analyze(
     if let (true, Some(r)) = (is_filter, result_reg) {
         bool_input |= 1u64 << r.0;
     }
+    let bit_only = bool_produced & !non_bool_read;
     ProgramFacts {
-        bit_only: bool_produced & !non_bool_read,
-        bool_input,
+        bit_only,
+        bool_pack: bit_only | bool_input,
         no_nulls,
         reg_u64,
     }

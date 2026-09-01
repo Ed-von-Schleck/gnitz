@@ -50,25 +50,6 @@ impl RowGather {
     }
 }
 
-/// Run a compiled predicate over a whole `ZSetBatch`, calling `emit_range` with
-/// each surviving half-open row range (`end` exclusive), in increasing order.
-///
-/// The one way a client filters a batch. It owns the two rules a call site would
-/// otherwise restate: the row count comes from the batch itself, so the view can
-/// never read out of bounds; and the batch is evaluated in one go, because
-/// `ViewBuffers::view` rebuilds a region list per call and a per-row view would
-/// pay a malloc plus a PK-region rebuild for every row.
-pub(crate) fn filter_batch(
-    ev: &gnitz_expr::Evaluator,
-    batch: &ZSetBatch,
-    schema: &Schema,
-    emit_range: impl FnMut(usize, usize),
-) {
-    let mut bufs = gnitz_core::ViewBuffers::default();
-    let view = bufs.view(batch, schema);
-    ev.filter(&view, emit_range);
-}
-
 /// A resolved projection: the output schema and, per output column, its source
 /// column index. `None` is the passthrough — a wildcard, or a named projection
 /// that reproduces the source schema exactly — where the source batch IS the

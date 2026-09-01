@@ -9,7 +9,8 @@ use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::codec::pk_codec::{extract_pk_value_mapped, is_null_expr};
 use crate::dml::mutate::{
-    build_merged_row, classify_set_rhs, eval_set_program, merge_payload_plan, resolve_set_target, SetProgram,
+    bind_set_program, build_merged_row, classify_set_rhs, eval_set_value, merge_payload_plan, resolve_set_target,
+    SetProgram, SetValues,
 };
 use crate::dml::overlay::effective_rows;
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
@@ -463,12 +464,6 @@ fn client_side_merge_do_update(
     batch: &ZSetBatch,
     assignments: &[(usize, BoundUpdateExpr)],
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    // Pre-index assignments by column for O(cols) lookup per row.
-    let mut asn_by_col: Vec<Option<&BoundUpdateExpr>> = vec![None; schema.columns.len()];
-    for (ci, rhs) in assignments {
-        asn_by_col[*ci] = Some(rhs);
-    }
-
     let keys: Vec<PkTuple> = (0..batch.pks.len()).map(|i| batch.pks.get_tuple(i)).collect();
     // The effective existing rows — a row the transaction buffered is both the
     // merge's carry source AND the `Existing` scope's evaluation base, so
@@ -487,6 +482,21 @@ fn client_side_merge_do_update(
     let mut bufs_existing = ViewBuffers::default();
     let excluded_view = bufs_excluded.view(batch, schema);
     let existing_view = bufs_existing.view(&rows, schema);
+    // Each RHS is bound to its own scope's view here, which drives every
+    // computed one over that whole batch once; the row loop below then reads a
+    // buffer instead of paying a single-row drive's prologue per conflict.
+    let bound: Vec<SetValues<'_>> = assignments
+        .iter()
+        .map(|(_, rhs)| match rhs {
+            BoundUpdateExpr::Existing(p) => bind_set_program(p, &existing_view),
+            BoundUpdateExpr::Excluded(p) => bind_set_program(p, &excluded_view),
+        })
+        .collect();
+    // Pre-index assignments by column for O(cols) lookup per row.
+    let mut asn_by_col: Vec<Option<(&BoundUpdateExpr, &SetValues<'_>)>> = vec![None; schema.columns.len()];
+    for ((ci, rhs), v) in assignments.iter().zip(&bound) {
+        asn_by_col[*ci] = Some((rhs, v));
+    }
     let payload = merge_payload_plan(schema);
 
     for (i, pk) in keys.iter().enumerate() {
@@ -506,9 +516,9 @@ fn client_side_merge_do_update(
                 // The stored row is `row` of the resolved batch; the incoming row
                 // is row `i` of the VALUES batch.
                 build_merged_row(batch, i, &rows, row, &payload, &mut out, |ci| {
-                    asn_by_col[ci].map(|rhs| match rhs {
-                        BoundUpdateExpr::Existing(p) => eval_set_program(p, &existing_view, row),
-                        BoundUpdateExpr::Excluded(p) => eval_set_program(p, &excluded_view, i),
+                    asn_by_col[ci].map(|(rhs, v)| match rhs {
+                        BoundUpdateExpr::Existing(_) => eval_set_value(v, &existing_view, row),
+                        BoundUpdateExpr::Excluded(_) => eval_set_value(v, &excluded_view, i),
                     })
                 })?;
             }

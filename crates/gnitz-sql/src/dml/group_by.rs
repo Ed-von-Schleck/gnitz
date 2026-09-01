@@ -88,11 +88,8 @@ fn finalize_item(expr: &BoundExpr, def: &ColumnDef, partial: &Schema) -> Result<
             return Ok(FinalizeItem::PassThrough { partial_ci: *ci });
         }
     }
-    let ev = compile_finalize_evaluator(expr, partial)?;
-    let is_str = ev.result_is_str();
     Ok(FinalizeItem::Computed {
-        ev: Box::new(ev),
-        is_str,
+        ev: Box::new(compile_finalize_evaluator(expr, partial)?),
     })
 }
 

@@ -6,27 +6,29 @@ use super::*;
 /// Free fn and method are checked together — they are two spellings of one rule.
 #[test]
 fn type_predicates_partition_the_type_table() {
-    // (type, fixed_int, signed_int, float, german_string, wide_int, pk_eligible)
-    let table: &[(TypeCode, bool, bool, bool, bool, bool, bool)] = &[
-        (TypeCode::U8, true, false, false, false, false, true),
-        (TypeCode::I8, true, true, false, false, false, true),
-        (TypeCode::U16, true, false, false, false, false, true),
-        (TypeCode::I16, true, true, false, false, false, true),
-        (TypeCode::U32, true, false, false, false, false, true),
-        (TypeCode::I32, true, true, false, false, false, true),
-        (TypeCode::F32, false, false, true, false, false, false),
-        (TypeCode::U64, true, false, false, false, false, true),
-        (TypeCode::I64, true, true, false, false, false, true),
-        (TypeCode::F64, false, false, true, false, false, false),
-        (TypeCode::String, false, false, false, true, false, false),
-        (TypeCode::U128, false, false, false, false, true, true),
-        (TypeCode::UUID, false, false, false, false, true, true),
-        (TypeCode::Blob, false, false, false, true, false, false),
-        (TypeCode::I128, false, true, false, false, true, true),
+    /// `(type, fixed_int, signed_int, int, float, german_string, wide_int,
+    /// pk_eligible)` — one row per `TypeCode`, one column per predicate.
+    type Row = (TypeCode, bool, bool, bool, bool, bool, bool, bool);
+    let table: &[Row] = &[
+        (TypeCode::U8, true, false, true, false, false, false, true),
+        (TypeCode::I8, true, true, true, false, false, false, true),
+        (TypeCode::U16, true, false, true, false, false, false, true),
+        (TypeCode::I16, true, true, true, false, false, false, true),
+        (TypeCode::U32, true, false, true, false, false, false, true),
+        (TypeCode::I32, true, true, true, false, false, false, true),
+        (TypeCode::F32, false, false, false, true, false, false, false),
+        (TypeCode::U64, true, false, true, false, false, false, true),
+        (TypeCode::I64, true, true, true, false, false, false, true),
+        (TypeCode::F64, false, false, false, true, false, false, false),
+        (TypeCode::String, false, false, false, false, true, false, false),
+        (TypeCode::U128, false, false, true, false, false, true, true),
+        (TypeCode::UUID, false, false, false, false, false, true, true),
+        (TypeCode::Blob, false, false, false, false, true, false, false),
+        (TypeCode::I128, false, true, true, false, false, true, true),
     ];
     assert_eq!(table.len(), TypeCode::ALL.len(), "a TypeCode variant is unclassified");
 
-    for &(tc, fixed, signed, float, german, wide, pk) in table {
+    for &(tc, fixed, signed, int, float, german, wide, pk) in table {
         let raw = tc as u8;
         assert!(is_valid_type_code(raw), "{tc:?} must decode");
         assert_eq!(is_fixed_int(raw), fixed, "is_fixed_int({tc:?})");
@@ -37,6 +39,7 @@ fn type_predicates_partition_the_type_table() {
         );
         assert_eq!(is_signed_int(raw), signed, "is_signed_int({tc:?})");
         assert_eq!(tc.is_signed_int(), signed, "TypeCode::is_signed_int({tc:?})");
+        assert_eq!(is_int(raw), int, "is_int({tc:?})");
         assert_eq!(is_float(raw), float, "is_float({tc:?})");
         assert_eq!(tc.is_float(), float, "TypeCode::is_float({tc:?})");
         assert_eq!(is_german_string(raw), german, "is_german_string({tc:?})");
@@ -52,7 +55,7 @@ fn type_predicates_partition_the_type_table() {
     let known: Vec<u8> = table.iter().map(|r| r.0 as u8).collect();
     for raw in (0u8..=u8::MAX).filter(|r| !known.contains(r)) {
         assert!(!is_valid_type_code(raw), "code {raw} must not decode");
-        assert!(!is_fixed_int(raw) && !is_signed_int(raw), "code {raw}");
+        assert!(!is_fixed_int(raw) && !is_signed_int(raw) && !is_int(raw), "code {raw}");
         assert!(!is_float(raw) && !is_german_string(raw), "code {raw}");
         assert!(!is_wide_int(raw) && !is_pk_eligible(raw), "code {raw}");
     }

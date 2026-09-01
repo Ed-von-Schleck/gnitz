@@ -1,7 +1,8 @@
 //! [`Evaluator`] — a resolved program plus the register file it runs in, and the
-//! three ways to drive it: [`Evaluator::filter`] over a whole batch,
-//! [`Evaluator::eval_row`] over one row, [`Evaluator::eval_morsels`] a morsel at
-//! a time with the raw registers exposed through [`MorselOut`].
+//! ways to drive it: one private morsel loop ([`Evaluator::drive`]) under one
+//! read-back per result class — a filter's ranges, an [`ExprResults`], or the
+//! raw registers through [`MorselOut`]. There is no single-row arity; a caller
+//! that wants one row drives its batch and indexes the result.
 //!
 //! The evaluator owns its register file so that no caller can size the scratch
 //! for one nullability arm and then read the other: a `no_nulls` register read
@@ -11,9 +12,22 @@
 
 use std::cell::RefCell;
 
-use crate::batch::{eval_batch, scan_filter_bits, with_str_bufs, EvalScratch, MorselOut, MORSEL};
+use crate::batch::{eval_batch, scan_filter_bits, with_str_bufs, EvalScratch, MorselOut, StrBufs, MORSEL};
 use crate::program::Role;
 use crate::{BatchView, ColumnLocator, ExprValidateErr, LogicalProgram, ResolvedProgram, SchemaFacts};
+
+/// One program's result for every row of a batch, in the shape its result
+/// register's class fixes. A consumer reads the class off the value it was
+/// handed, so it never asks the program and never carries the answer alongside.
+pub enum ExprResults {
+    Scalar(Vec<Option<i64>>),
+    /// Every row's bytes concatenated, addressed by `(offset, length)`; `None`
+    /// for SQL NULL, which contributes no bytes.
+    Str {
+        bytes: Vec<u8>,
+        spans: Vec<Option<(usize, usize)>>,
+    },
+}
 
 /// A resolved expression program together with the register file it evaluates
 /// into: the runnable form the [`LogicalProgram`] constructors below produce,
@@ -40,15 +54,15 @@ pub struct Evaluator {
 /// makes "this program was checked against the schema it runs on" a property of
 /// the type rather than a convention every consuming crate has to remember.
 ///
-/// The three differ in which rules apply, which is also what fixes the [`Role`]
-/// each one resolves under — so no caller passes a bare classification.
+/// The three differ only in the [`Role`] they name, which fixes both the extra
+/// rules and the resolution.
 impl LogicalProgram {
     /// A filter predicate: checked against the schema it reads, and required to
-    /// own a result register. Resolved with `result_reg` eligible for the
-    /// bit_only path, which [`Evaluator::filter`] reads as packed bits.
+    /// own a non-string result register. Resolved with `result_reg` eligible for
+    /// the bit_only path, which [`Evaluator::filter_ranges`] reads as packed
+    /// bits.
     pub fn resolve_filter(self, schema: &dyn SchemaFacts) -> Result<Evaluator, ExprValidateErr> {
-        self.validate_predicate(schema)?;
-        Ok(self.into_evaluator(schema, None, Role::Filter))
+        self.into_evaluator(schema, Role::Filter)
     }
 
     /// A map: checked against both the schema it reads and the one it writes,
@@ -58,99 +72,72 @@ impl LogicalProgram {
         in_schema: &dyn SchemaFacts,
         out_schema: &dyn SchemaFacts,
     ) -> Result<Evaluator, ExprValidateErr> {
-        self.validate(in_schema, Some(out_schema))?;
-        Ok(self.into_evaluator(in_schema, Some(out_schema), Role::Map))
+        self.into_evaluator(in_schema, Role::Map(out_schema))
     }
 
-    /// A scalar expression evaluated row at a time through
-    /// [`Evaluator::eval_row`] — a DML SET right-hand side. Same checks as a map
-    /// minus the output plan, plus the filter's rule that the program must own a
-    /// result register: both row readers below read one back.
+    /// A scalar expression read back through [`Evaluator::eval_all`] — a DML SET
+    /// right-hand side. Same checks as a map minus the output plan, plus the
+    /// filter's rule that the program must own a result register, which is what
+    /// the result is read out of.
     ///
     /// `result_reg` is not marked as a filter's, so it is excluded from
     /// `bool_input` and a bare non-boolean result has no `bool_bits` bit — which
     /// is why a predicate must go through [`Self::resolve_filter`] instead. A
     /// boolean-valued RHS (`SET flag = a AND b`) still reads back correctly:
-    /// `bool_pack_mask` covers every bit_only register, so `row0_value` finds
+    /// `bool_pack_mask` covers every bit_only register, so the read-back finds
     /// the packed bit.
     pub fn resolve_scalar(self, schema: &dyn SchemaFacts) -> Result<Evaluator, ExprValidateErr> {
-        self.validate_result_reg(schema)?;
-        Ok(self.into_evaluator(schema, None, Role::Scalar))
+        self.into_evaluator(schema, Role::Scalar)
     }
 
-    /// `out_schema` is `Some` only for a map; the other two roles write no
-    /// output slots and so resolve no copy destination widths.
-    fn into_evaluator(self, schema: &dyn SchemaFacts, out_schema: Option<&dyn SchemaFacts>, role: Role) -> Evaluator {
-        let prog = self.resolve_program(schema, out_schema, role);
+    fn into_evaluator(self, schema: &dyn SchemaFacts, role: Role<'_>) -> Result<Evaluator, ExprValidateErr> {
+        self.validate_for(schema, role)?;
+        let prog = self.resolve_program(schema, role);
         let scratch = RefCell::new(EvalScratch::new(&prog));
-        Evaluator { prog, scratch }
+        Ok(Evaluator { prog, scratch })
     }
 }
 
 impl Evaluator {
-    /// Evaluate over a single row: the result's value, or `None` for SQL NULL.
+    /// The one morsel-chunking loop, behind every drive method below: evaluate
+    /// `start..start + n` a morsel at a time, calling `per_morsel(scratch, bufs,
+    /// rel_start, m)` after each — `rel_start` is the offset from `start`.
     ///
-    /// `Option` rather than a `(value, is_null)` pair, so a NULL row has no
-    /// value half for a caller to read past the flag — and no normalization
-    /// rule is needed to give that half a defined value.
-    pub fn eval_row<B: BatchView>(&self, mb: &B, row: usize) -> Option<i64> {
-        debug_assert!(row < mb.row_count(), "eval_row row {row} is past the batch's end");
-        debug_assert!(
-            !self.prog.result_is_str(),
-            "string-valued program read through eval_row; use eval_row_str"
-        );
-        let scratch = &mut *self.scratch.borrow_mut();
-        scratch.ensure_capacity(&self.prog, 1);
-        with_str_bufs(&self.prog, mb, |bufs| eval_batch(&self.prog, mb, bufs, row, 1, scratch));
-        scratch.row0_value(&self.prog)
-    }
-
-    /// Run as a filter over all of `mb`'s rows, invoking `append_range` once per
-    /// maximal contiguous run of passing rows. The bitmap stays inside the
-    /// scratch — no per-call `Vec<u64>` allocation.
-    ///
-    /// The row count comes from the view, so no caller can drive it past the
-    /// batch's end. Bound once here rather than in the morsel loop: `filter` is
-    /// monomorphized in the calling crate at opt-level 0, where only the
-    /// always-inline pass runs.
-    pub fn filter<B: BatchView>(&self, mb: &B, mut append_range: impl FnMut(usize, usize)) {
-        let n = mb.row_count();
-        let scratch = &mut *self.scratch.borrow_mut();
-        scratch.ensure_capacity(&self.prog, n);
-        with_str_bufs(&self.prog, mb, |bufs| {
-            for morsel_start in (0..n).step_by(MORSEL) {
-                let m = MORSEL.min(n - morsel_start);
-                eval_batch(&self.prog, mb, bufs, morsel_start, m, scratch);
-                scratch.write_filter_words(&self.prog, morsel_start, m);
-            }
-        });
-        scan_filter_bits(scratch.filter_words(n), n, &mut append_range);
-    }
-
-    /// Drive `n` rows starting at `start`, one morsel at a time, calling
-    /// `f(rel_start, out)` per morsel — `rel_start` is the offset from `start`
-    /// and `out` reads the morsel's results (and its row count) out of the
-    /// register file. One closure call per *morsel*, not per row.
-    ///
-    /// One of the two morsel-chunking loops; [`Self::filter`] has the other,
-    /// which packs a bitmap instead of handing the registers out.
-    pub fn eval_morsels<B: BatchView>(&self, mb: &B, start: usize, n: usize, mut f: impl FnMut(usize, &MorselOut<'_>)) {
+    /// The scratch is dereferenced once and the string column regions resolved
+    /// once, rather than per morsel: at opt-level=0 each `&mut scratch` through
+    /// the `RefCell` guard is an out-of-line `RefMut::deref_mut` call.
+    fn drive(
+        &self,
+        mb: &dyn BatchView,
+        start: usize,
+        n: usize,
+        mut per_morsel: impl FnMut(&mut EvalScratch, StrBufs<'_>, usize, usize),
+    ) {
         debug_assert!(
             start + n <= mb.row_count(),
-            "eval_morsels window {start}..{} is past the batch's end",
+            "drive window {start}..{} is past the batch's end",
             start + n,
         );
-        // Dereferenced once, as in `filter`: at opt-level=0 every `&mut scratch`
-        // through the guard is an out-of-line `RefMut::deref_mut` call.
         let scratch = &mut *self.scratch.borrow_mut();
-        // No filter bitmap on this path — `filter` is the only writer of one.
-        scratch.ensure_capacity(&self.prog, 0);
         with_str_bufs(&self.prog, mb, |bufs| {
             for rel_start in (0..n).step_by(MORSEL) {
                 let m = MORSEL.min(n - rel_start);
                 eval_batch(&self.prog, mb, bufs, start + rel_start, m, scratch);
-                f(rel_start, &scratch.morsel_out(bufs, m));
+                per_morsel(scratch, bufs, rel_start, m);
             }
+        });
+    }
+
+    /// Drive `n` rows starting at `start`, one morsel at a time, calling
+    /// `f(rel_start, out)` per morsel, where `out` reads the morsel's results
+    /// out of the register file. One closure call per *morsel*, not per row.
+    ///
+    /// `f` stays an `impl FnMut` where the batch is a `&dyn`: a `&mut dyn FnMut`
+    /// would force the `MorselOut` to materialise and stop the emit lists
+    /// hoisting out of the morsel loop.
+    pub fn eval_morsels(&self, mb: &dyn BatchView, start: usize, n: usize, mut f: impl FnMut(usize, &MorselOut<'_>)) {
+        self.drive(mb, start, n, |scratch, bufs, rel_start, m| {
+            f(rel_start, &scratch.morsel_out(bufs, m))
         });
     }
 
@@ -186,48 +173,64 @@ impl Evaluator {
         self.prog.nullable_slots
     }
 
-    /// The surviving row ranges of `mb`, collected into `out` (cleared first) —
-    /// what every range-driven consumer reads instead of driving
-    /// [`Self::filter`]'s callback, which cannot carry a `?` out or be cut
-    /// against a `LIMIT` window. `out` is caller-owned so it can be reused
-    /// across chunks; `[(0, n)]` is the agreed spelling of "no predicate".
-    pub fn filter_ranges<B: BatchView>(&self, mb: &B, out: &mut Vec<(usize, usize)>) {
+    /// Run as a filter over all of `mb`'s rows, collecting each maximal
+    /// contiguous run of passing rows into `out` (cleared first, and reusable
+    /// across chunks). The bitmap stays inside the scratch. `[(0, n)]` is the
+    /// agreed spelling of "no predicate".
+    pub fn filter_ranges(&self, mb: &dyn BatchView, out: &mut Vec<(usize, usize)>) {
         out.clear();
-        self.filter(mb, |start, end| out.push((start, end)));
+        let n = mb.row_count();
+        self.scratch.borrow_mut().ensure_filter_words(n);
+        self.drive(mb, 0, n, |scratch, _, morsel_start, m| {
+            scratch.write_filter_words(&self.prog, morsel_start, m)
+        });
+        scan_filter_bits(self.scratch.borrow().filter_words(n), n, out);
     }
 
-    /// Whether the result register holds a string, i.e. whether the result must
-    /// be read through [`Self::eval_row_str`] rather than [`Self::eval_row`].
-    /// Resolution knows the answer, so a caller never has to carry it alongside.
+    /// Evaluate every row of `mb` in one morsel-at-a-time pass, where
+    /// `row_count()` single-row drives would each pay `eval_batch`'s
+    /// straight-line prologue for one row.
+    pub fn eval_all(&self, mb: &dyn BatchView) -> ExprResults {
+        let n = mb.row_count();
+        if !self.prog.result_is_str() {
+            let mut vals = Vec::with_capacity(n);
+            self.drive(mb, 0, n, |scratch, _, _, m| {
+                scratch.append_result_values(&self.prog, m, &mut vals)
+            });
+            return ExprResults::Scalar(vals);
+        }
+        let r = self.prog.result_reg as usize;
+        let (mut bytes, mut spans) = (Vec::new(), Vec::with_capacity(n));
+        self.drive(mb, 0, n, |scratch, bufs, _, m| {
+            let out = scratch.morsel_out(bufs, m);
+            // Copy every row, then blank the NULL ones — the two-pass shape every
+            // emit uses, since a per-row nullness branch would need a `null_bits`
+            // that the `no_nulls` arm does not allocate.
+            let first = spans.len();
+            for i in 0..m {
+                let b = out.str_bytes(r, i);
+                spans.push(Some((bytes.len(), b.len())));
+                bytes.extend_from_slice(b);
+            }
+            out.for_each_null_row(r, |i| spans[first + i] = None);
+        });
+        ExprResults::Str { bytes, spans }
+    }
+
+    /// Whether the result register holds a string, i.e. which arm
+    /// [`Self::eval_all`] will hand back. Resolution knows the answer, so a
+    /// caller deciding what a program may be assigned to never re-derives it.
     pub fn result_is_str(&self) -> bool {
         self.prog.result_is_str()
     }
 
-    /// Evaluate over a single row, append the string result's bytes to `out`, and
-    /// return **true iff the row is NULL** — the opposite polarity from
-    /// [`Self::eval_row`]'s `Option`, stated here because the two readers sit on
-    /// one type. `Option` would have to wrap the append rather than the value,
-    /// and a name advertising the flag would hide it.
-    ///
-    /// The bytes are copied rather than borrowed because the arena lives behind
-    /// the evaluator's `RefCell`: a borrowed return would have to hand back a
-    /// live `RefMut` guard with it. The caller supplies the buffer so a DML row
-    /// loop reuses one allocation across rows.
-    #[must_use]
-    pub fn eval_row_str<B: BatchView>(&self, mb: &B, row: usize, out: &mut Vec<u8>) -> bool {
-        debug_assert!(row < mb.row_count(), "eval_row_str row {row} is past the batch's end");
-        debug_assert!(
-            self.prog.result_is_str(),
-            "scalar program read through eval_row_str; use eval_row"
-        );
-        let scratch = &mut *self.scratch.borrow_mut();
-        scratch.ensure_capacity(&self.prog, 1);
-        let r = self.prog.result_reg as usize;
-        with_str_bufs(&self.prog, mb, |bufs| {
-            eval_batch(&self.prog, mb, bufs, row, 1, scratch);
-            out.extend_from_slice(scratch.morsel_out(bufs, 1).str_bytes(r, 0));
-        });
-        scratch.row0_is_null(r)
+    /// Move this evaluator onto the nullable arm, rebuilding the scratch — which
+    /// [`EvalScratch::new`] sizes for one arm, so flipping the flag alone would
+    /// leave the null buffers unallocated. Behind `test_support::both_arms`.
+    #[cfg(test)]
+    pub(crate) fn force_nullable_arm(&mut self) {
+        self.prog.no_nulls = false;
+        *self.scratch.get_mut() = EvalScratch::new(&self.prog);
     }
 }
 

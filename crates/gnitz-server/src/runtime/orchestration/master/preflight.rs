@@ -15,6 +15,7 @@ use super::*;
 
 use super::unique_filter::{UniqueFilter, UNIQUE_FILTER_CAP};
 use crate::catalog::FkEdge;
+use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_store::storage::MemBatch;
 
 // ---------------------------------------------------------------------------
@@ -1032,10 +1033,9 @@ impl MasterDispatcher {
             let mut values: Vec<u128> = Vec::new();
             for (_pk, fam, row) in b.surviving(tid) {
                 let mb = b.mem(fam);
-                if loc.is_null(mb, row as usize) {
+                let Some(v) = loc.native_key_opt(mb, row as usize) else {
                     continue;
-                }
-                let v = loc.native_key(mb, row as usize);
+                };
                 if seen.insert(v) {
                     values.push(v);
                 }
@@ -1212,7 +1212,7 @@ impl MasterDispatcher {
                     Some(FoldOp::Deleted) => false,
                     Some(FoldOp::Inserted(cf, cr)) => {
                         let smb = b.mem(*cf);
-                        !child_loc.is_null(smb, *cr as usize) && child_loc.native_key(smb, *cr as usize) == v
+                        child_loc.native_key_opt(smb, *cr as usize) == Some(v)
                     }
                 };
                 if still_refs {
@@ -1283,7 +1283,7 @@ impl MasterDispatcher {
             let surviving_val: Option<u128> = match op {
                 FoldOp::Inserted(f, r) => {
                     let mb = b.mem(*f);
-                    (!loc.is_null(mb, *r as usize)).then(|| loc.native_key(mb, *r as usize))
+                    loc.native_key_opt(mb, *r as usize)
                 }
                 FoldOp::Deleted => None,
             };
@@ -1563,21 +1563,27 @@ impl MasterDispatcher {
         .await
         .map_err(|f| f.text)?;
 
-        // The reply projects `ref_col` to payload column 0; read its type and
-        // width off the parent schema once.
-        let col = parent_schema.columns[ref_col as usize];
-        let (col_type, col_size) = (col.type_code, col.size() as usize);
+        // The reply's one payload column, resolved off the schema the frames are
+        // guarded against rather than off the parent's — the projection is what
+        // decides which slot and width the rows carry. It is not column 0:
+        // `project_schema` keeps the PK region ahead of it.
+        let projected = SchemaFacts::payload_col_idx(&expected, 0);
+        let ColumnLocator::Payload { slot, size, type_code } = expected.locate(projected) else {
+            unreachable!("a gather projects one payload column")
+        };
+        let (slot, size) = (slot as usize, size as usize);
 
         let mut out: FxHashMap<PkBuf, u128> = FxHashMap::default();
         drain_index_scan(slots, &scan, reactor, "gather", &expected, |b, _| {
             // The column slice is invariant across a frame's rows; derive it
-            // once per frame rather than once per row.
-            let col_data = b.col_data(0, col_size);
+            // once per frame rather than once per row. `ColumnLocator`'s own
+            // readers cannot: each re-resolves the window through `get_col_ptr`.
+            let col_data = b.col_data(slot, size);
             for j in 0..b.count {
-                if !gnitz_wire::null_word_get(b.get_null_word(j), 0) {
+                if !gnitz_wire::null_word_get(b.get_null_word(j), slot) {
                     out.insert(
                         PkBuf::from_bytes(b.get_pk_bytes(j)),
-                        payload_native_key(col_data, j * col_size, col_size, col_type),
+                        payload_native_key(col_data, j * size, size, type_code),
                     );
                 }
             }

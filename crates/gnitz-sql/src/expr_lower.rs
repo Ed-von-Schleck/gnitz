@@ -1041,7 +1041,7 @@ pub(crate) fn compile_wire_conjuncts(exprs: &[&BoundExpr], cols: &[ColumnDef]) -
 /// or a statically-true one — and the caller keeps every row.
 ///
 /// Picks `resolve_filter`, so a bare non-boolean predicate (`HAVING COUNT(*)`)
-/// still gets the `bool_bits` bit [`Evaluator::filter`] reads.
+/// still gets the `bool_bits` bit [`Evaluator::filter_ranges`] reads.
 pub(crate) fn compile_conjuncts_evaluator(
     preds: &[&BoundExpr],
     schema: &Schema,

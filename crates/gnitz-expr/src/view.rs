@@ -34,10 +34,10 @@ pub trait RowSource {
     /// The variable-length string/blob heap the German-string cells point into.
     fn blob(&self) -> &[u8];
     /// Rows in this source. The bound every whole-source walk reads — the
-    /// evaluator's [`crate::Evaluator::filter`], the engine's N-way merge — so
-    /// that a caller can never drive a view past its own end with a count it
+    /// evaluator's [`crate::Evaluator::filter_ranges`], the engine's N-way merge
+    /// — so that a caller can never drive a view past its own end with a count it
     /// carried alongside. `#[inline(always)]` on every implementor: the per-row
-    /// and per-morsel callers live in gnitz-server, at opt-level 0.
+    /// and per-morsel callers live in gnitz-store, at opt-level 0.
     fn row_count(&self) -> usize;
 }
 

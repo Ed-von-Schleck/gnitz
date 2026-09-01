@@ -15,6 +15,11 @@ pub const SHORT_STRING_THRESHOLD: usize = 12;
 ///   [4..8]  prefix — first min(4, len) bytes, zero-padded
 ///   [8..16] if len ≤ 12: suffix bytes [4..len], zero-padded
 ///           if len > 12: blob arena offset (u64 LE)
+///
+/// `#[inline]` on this body, not only on the wrapper below: this is the whole
+/// ~1.5 KB of the family, so annotating the 145-byte wrapper alone leaves a real
+/// call into an opt-0 body per emitted and per relocated cell.
+#[inline]
 pub(crate) fn encode_german_string_cell(s: &[u8], heap_off: usize) -> ([u8; 16], &[u8]) {
     let len = s.len();
     // The 4-byte length field caps a string at u32::MAX bytes. Silently
@@ -44,6 +49,7 @@ pub(crate) fn encode_german_string_cell(s: &[u8], heap_off: usize) -> ([u8; 16],
 
 /// [`encode_german_string_cell`] against a growable arena: the spill, if any,
 /// is appended to `blob`.
+#[inline]
 pub fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
     let (st, spill) = encode_german_string_cell(s, blob.len());
     blob.extend_from_slice(spill);

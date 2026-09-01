@@ -1,8 +1,8 @@
 //! UPDATE and DELETE: plan the WHERE once through the shared access-path ladder
 //! (`dml::plan`), read the matching rows (UPDATE) or just their keys (DELETE)
 //! back from the server, then write the SET batch or the retraction. The SET-list
-//! helpers (`classify_set_rhs`, `eval_set_program`, `resolve_set_target`) are
-//! also reused by INSERT's `ON CONFLICT DO UPDATE`.
+//! helpers (`classify_set_rhs`, `bind_set_program`, `eval_set_value`,
+//! `resolve_set_target`) are also reused by INSERT's `ON CONFLICT DO UPDATE`.
 
 use crate::ast_util::{extract_name, extract_table_factor_name};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
@@ -23,7 +23,7 @@ use gnitz_core::{
     retraction_batch, ColData, ColumnDef, GnitzClient, Schema, TypeCode, ViewBuffers, WireConflictMode, ZSetBatch,
     ZSetBatchView,
 };
-use gnitz_expr::Evaluator;
+use gnitz_expr::{Evaluator, ExprResults};
 use gnitz_wire::ReadSink;
 use sqlparser::ast::{Assignment, AssignmentTarget, FromTable};
 
@@ -48,10 +48,8 @@ pub(crate) enum SetProgram {
     Const(ColumnValue),
     /// A bare reference to a `TypeCode::String` column, read verbatim.
     StrCol(usize),
-    /// A computed value. Which read-back applies is the evaluator's own
-    /// `result_is_str`, not a second arm here. Boxed so a `SetProgram` stays
-    /// small enough to sit in a `Vec` beside the other arms (`Evaluator` owns a
-    /// resolved program plus its register file).
+    /// A computed value, of whichever class the program resolved to. Boxed so a
+    /// `SetProgram` stays small enough to sit in a `Vec` beside the other arms.
     Expr(Box<Evaluator>),
 }
 
@@ -60,7 +58,7 @@ pub(crate) enum SetProgram {
 /// SET`, including the latter's `EXCLUDED.<col>` short-circuit, so a string
 /// EXCLUDED assignment classifies the same way a bare one does.
 ///
-/// The target check is what makes [`eval_set_program`] infallible. Without it a
+/// The target check is what makes [`eval_set_value`] infallible. Without it a
 /// kind mismatch (`SET int_col = 'abc'`) would surface only from
 /// `append_column_value`, i.e. only once a row matched — so a zero-match WHERE
 /// would report 0 rows updated instead of rejecting.
@@ -110,41 +108,54 @@ pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema)
     Ok(p)
 }
 
-/// Read one SET RHS for `row` of the batch `view` presents. Infallible: every
-/// *kind* rejection happened at [`classify_set_rhs`]. A computed value's range
-/// is the one verdict that cannot be reached until the value exists, so it is
-/// taken where the value is written (`append_column_value`).
-pub(crate) fn eval_set_program(p: &SetProgram, view: &ZSetBatchView<'_>, row: usize) -> ColumnValue {
+/// A SET right-hand side bound to the batch it will be read against: the
+/// computed arm is driven over the whole batch when this is built, where a
+/// per-row drive would pay `eval_batch`'s prologue for one row.
+pub(crate) enum SetValues<'a> {
+    Const(&'a ColumnValue),
+    /// A `TypeCode::String` column of the bound batch, read verbatim.
+    StrCol(usize),
+    Computed(ExprResults),
+}
+
+/// Bind `p` to `view`, driving its computed arm over every row up front.
+pub(crate) fn bind_set_program<'a>(p: &'a SetProgram, view: &ZSetBatchView<'_>) -> SetValues<'a> {
     match p {
-        SetProgram::Const(cv) => cv.clone(),
-        SetProgram::StrCol(c) => match &view.batch().columns[*c] {
-            ColData::Strings(v) => match &v[row] {
+        SetProgram::Const(cv) => SetValues::Const(cv),
+        SetProgram::StrCol(c) => SetValues::StrCol(*c),
+        SetProgram::Expr(ev) => SetValues::Computed(ev.eval_all(view)),
+    }
+}
+
+/// Read one SET RHS for `row` of the batch `v` was bound against. Infallible:
+/// every *kind* rejection happened at [`classify_set_rhs`]. A computed value's
+/// range is the one verdict that cannot be reached until the value exists, so it
+/// is taken where the value is written (`append_column_value`).
+pub(crate) fn eval_set_value(v: &SetValues<'_>, view: &ZSetBatchView<'_>, row: usize) -> ColumnValue {
+    match v {
+        SetValues::Const(cv) => (*cv).clone(),
+        SetValues::StrCol(c) => match &view.batch().columns[*c] {
+            ColData::Strings(vals) => match &vals[row] {
                 Some(s) => ColumnValue::Str(s.clone()),
                 None => ColumnValue::Null,
             },
             other => unreachable!("classify_set_rhs gates StrCol on TypeCode::String, got {other:?}"),
         },
-        SetProgram::Expr(ev) if ev.result_is_str() => {
-            // The evaluator's arena sits behind a `RefCell`, so it lends no
-            // bytes; the row is read into a buffer that then *becomes* the
-            // `String`, so the value is allocated once and never copied.
-            let mut buf = Vec::new();
-            if ev.eval_row_str(view, row, &mut buf) {
-                return ColumnValue::Null;
-            }
+        // A `match` rather than `map_or`: this module builds at opt-level 0,
+        // where `map_or` plus a constructor-as-closure is two out-of-line calls
+        // moving a ~24-byte enum, and the match is free.
+        SetValues::Computed(ExprResults::Scalar(vals)) => match vals[row] {
+            None => ColumnValue::Null,
+            Some(x) => ColumnValue::Int(x as i128),
+        },
+        SetValues::Computed(ExprResults::Str { bytes, spans }) => match spans[row] {
+            None => ColumnValue::Null,
             // Valid UTF-8 by construction: this path runs over the client-side
             // `ZSetBatchView`, whose strings were UTF-8-validated at the wire
             // decode boundary, and every string function preserves validity —
             // ASCII case fold, character-unit substring, ASCII trim set, and
             // concatenation of valid inputs.
-            String::from_utf8(buf).map_or(ColumnValue::Null, ColumnValue::Str)
-        }
-        // A `match` rather than `map_or`: this module builds at opt-level 0,
-        // where `map_or` plus a constructor-as-closure is two out-of-line calls
-        // moving a ~24-byte enum, and the match is free.
-        SetProgram::Expr(ev) => match ev.eval_row(view, row) {
-            None => ColumnValue::Null,
-            Some(v) => ColumnValue::Int(v as i128),
+            Some((o, l)) => String::from_utf8(bytes[o..o + l].to_vec()).map_or(ColumnValue::Null, ColumnValue::Str),
         },
     }
 }
@@ -255,21 +266,25 @@ fn write_set_rows(
     schema: &Schema,
     dst: &mut ZSetBatch,
 ) -> Result<(), GnitzSqlError> {
-    // Pre-index assignments by column for O(1) lookup per payload column
-    // (closes the prior O(cols²) per-row `assignments.iter().find`).
-    let mut asn_by_col: Vec<Option<&SetProgram>> = vec![None; schema.columns.len()];
-    for (ci, p) in assignments {
-        asn_by_col[*ci] = Some(p);
-    }
     // One view over `current` for the whole loop — `ViewBuffers::view` rebuilds
     // its region list per call, so a per-row view would be a malloc plus a
     // PK-region rebuild per row.
     let mut bufs = ViewBuffers::default();
     let view = bufs.view(current, schema);
+    // Bound before the row loop, which then only reads a buffer — leaving
+    // `build_merged_row` and `append_column_value` row-major, so the order their
+    // errors are raised in is unchanged.
+    let bound: Vec<SetValues<'_>> = assignments.iter().map(|(_, p)| bind_set_program(p, &view)).collect();
+    // Pre-index assignments by column for O(1) lookup per payload column
+    // (closes the prior O(cols²) per-row `assignments.iter().find`).
+    let mut asn_by_col: Vec<Option<&SetValues<'_>>> = vec![None; schema.columns.len()];
+    for ((ci, _), v) in assignments.iter().zip(&bound) {
+        asn_by_col[*ci] = Some(v);
+    }
     let payload = merge_payload_plan(schema);
     for row_idx in 0..current.len() {
         build_merged_row(current, row_idx, current, row_idx, &payload, dst, |ci| {
-            asn_by_col[ci].map(|p| eval_set_program(p, &view, row_idx))
+            asn_by_col[ci].map(|v| eval_set_value(v, &view, row_idx))
         })?;
     }
     Ok(())

@@ -125,17 +125,19 @@ fn str_const_filter_bench() {
             // Also the warm-up, and outside the driven region — so both channels
             // are still built and compared even when only one is driven.
             let count = |f: &Evaluator| {
-                let mut hits = 0usize;
-                f.filter(&mb, |s, e| hits += e - s);
-                hits
+                let mut ranges = Vec::new();
+                f.filter_ranges(&mb, &mut ranges);
+                ranges.iter().map(|&(s, e)| e - s).sum::<usize>()
             };
             let hits = count(&fused);
             assert_eq!(hits, count(&regs), "{domain}/{name}: the channels disagree");
 
             let run = |f: &Evaluator| {
+                let mut ranges = Vec::new();
                 let mut h = 0usize;
                 for _ in 0..passes {
-                    f.filter(&mb, |s, e| h += e - s);
+                    f.filter_ranges(&mb, &mut ranges);
+                    h += ranges.len();
                 }
                 std::hint::black_box(h);
             };
@@ -243,18 +245,19 @@ fn filter_kernel_bench() {
     let lit_view = make_n_col_view(&lit_schema, n, |row, _| (row % 1000) as i64, |_, _| false);
     let mut lit_instrs = vec![LogicalInstr::LoadColInt { col: 1 }];
     let mut acc_reg = None;
-    for (i, (op, val)) in [
+    for (op, val) in [
         (CmpOp::Gt, 1i64),
         (CmpOp::Lt, 999),
         (CmpOp::Ne, 5),
         (CmpOp::Ne, 7),
         (CmpOp::Ne, 9),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let (k, c) = (1 + 2 * i as u16, 2 + 2 * i as u16);
+    ] {
+        // A register IS the index of the instruction that writes it, and the
+        // `BoolBinary` pushes make that index no function of the loop counter —
+        // so each one is read off the stream immediately before its push.
+        let k = lit_instrs.len() as u16;
         lit_instrs.push(LogicalInstr::LoadConst { val });
+        let c = lit_instrs.len() as u16;
         lit_instrs.push(LogicalInstr::Cmp {
             op,
             a: Reg(0),
@@ -263,7 +266,7 @@ fn filter_kernel_bench() {
         acc_reg = Some(match acc_reg {
             None => c,
             Some(prev) => {
-                let d = 11 + i as u16;
+                let d = lit_instrs.len() as u16;
                 lit_instrs.push(LogicalInstr::BoolBinary {
                     is_or: false,
                     a: Reg(prev),
@@ -278,6 +281,7 @@ fn filter_kernel_bench() {
 
     let mut hits = 0usize;
     let mut n_selected = 0usize;
+    let mut ranges = Vec::new();
     for (name, ev, view) in [
         ("pk", &pk_filter, &pk_view),
         ("nullable", &nn_filter, &nn_view),
@@ -288,7 +292,8 @@ fn filter_kernel_bench() {
         }
         n_selected += 1;
         for _ in 0..passes {
-            ev.filter(view, |s, e| hits += e - s);
+            ev.filter_ranges(view, &mut ranges);
+            hits += ranges.len();
         }
     }
     println!(
@@ -360,7 +365,10 @@ fn is_null_bench_schema() -> TestSchema {
 /// Moving to the fast arm is cheaper on every shape here, at
 /// `-C target-cpu=x86-64-v3` (what `crates/.cargo/config.toml` ships): −3.0 %
 /// retired instructions on `map`, −5.9 % on `bare`, −11.1 % on `one_and`, and
-/// −13.8 % to −14.5 % across the four 4-conjunct chains. What separates the
+/// −13.8 % to −14.5 % across the four 4-conjunct chains. Those figures came off
+/// **one build**: the direction and the rank order reproduce, the magnitudes run
+/// 10–40 % smaller on a fresh one, so re-measure before trading on a number.
+/// What separates the
 /// chain shapes from each other is only their NULL arrangement, and it barely
 /// separates them at all — the arms run the same kernels over the same word
 /// count. The compares read NOT NULL columns, which are outside
@@ -424,9 +432,11 @@ fn is_null_arm_bench() {
         let hits = passed.iter().filter(|&&p| p).count();
 
         let run = |ev: &Evaluator| {
+            let mut ranges = Vec::new();
             let mut h = 0usize;
             for _ in 0..passes {
-                ev.filter(*view, |s, e| h += e - s);
+                ev.filter_ranges(*view, &mut ranges);
+                h += ranges.len();
             }
             std::hint::black_box(h);
         };

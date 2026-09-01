@@ -322,9 +322,9 @@ fn set_int_column_from_float_expression_rejects() {
     assert!(classify_set_rhs(&cmp, 1, &schema).is_ok());
 }
 
-/// A computed *string* RHS is read back through `eval_row_str`: `eval_row`
-/// would return an i64 — the 16-byte descriptor's prefix as a garbage
-/// integer. The resolved program carries which one applies.
+/// A computed *string* RHS reads back as a string: as a scalar it would return
+/// an i64 — the 16-byte descriptor's prefix as a garbage integer — so the class
+/// rides the evaluated result, and nothing downstream re-asks it.
 #[test]
 fn a_computed_string_rhs_routes_to_the_string_arm_and_evaluates() {
     let schema = two_col(TypeCode::String);
@@ -346,7 +346,7 @@ fn a_computed_string_rhs_routes_to_the_string_arm_and_evaluates() {
     }
     let mut bufs = ViewBuffers::default();
     let view = bufs.view(&batch, &schema);
-    match eval_set_program(&p, &view, 0) {
+    match eval_set_value(&bind_set_program(&p, &view), &view, 0) {
         ColumnValue::Str(s) => assert_eq!(s, "HELLO"),
         _ => panic!("expected a string value"),
     }

@@ -2,7 +2,7 @@
 //! row, and the canonical `u128` keys derived from it.
 //!
 //! Every method here is `#[inline(always)]`: the per-row callers live in
-//! gnitz-server, which builds at opt-level 0 in dev, where only the
+//! gnitz-store, which builds at opt-level 0 in dev, where only the
 //! always-inline pass runs.
 
 use std::cmp::Ordering;
@@ -204,8 +204,9 @@ impl ColumnLocator {
     }
 
     /// Canonical native u128 key for the value in `row` (sign-aware; the form
-    /// `has_pk` and the index seeks compare on). Callers must `is_null`-gate a
-    /// nullable payload column first; a PK column is never null.
+    /// `has_pk` and the index seeks compare on). A NULL payload cell has no key,
+    /// so a caller over a nullable column reads through [`Self::native_key_opt`];
+    /// a PK column is never null.
     #[inline(always)]
     pub fn native_key(&self, mb: &impl RowSource, row: usize) -> u128 {
         match *self {
@@ -221,6 +222,13 @@ impl ColumnLocator {
                 type_code,
             ),
         }
+    }
+
+    /// [`Self::native_key`] with its NULL gate folded in: `None` for a NULL
+    /// payload cell, and always `Some` for a PK column, which cannot be null.
+    #[inline(always)]
+    pub fn native_key_opt(&self, mb: &impl RowSource, row: usize) -> Option<u128> {
+        (!self.is_null(mb, row)).then(|| self.native_key(mb, row))
     }
 
     /// Canonical sign-aware *routing* key for the value in `row` — the form

@@ -14,8 +14,8 @@ use super::{
 };
 use crate::program::{FloatUnaryOp, IntUnaryOp};
 use crate::test_support::{
-    filter_prog, make_int_view, make_n_col_view, make_string_view, passing_rows, push_payload_cols, scalar_prog,
-    schema_pk_ints, schema_pk_strings, set_row_pk, TestSchema, TestView,
+    filter_prog, make_int_view, make_n_col_view, make_string_view, passing_rows, push_payload_cols, row_str, row_value,
+    scalar_prog, schema_pk_ints, schema_pk_strings, set_row_pk, TestSchema, TestView,
 };
 use crate::{CmpOp, Evaluator, LogicalInstr, ResolvedProgram, RowSource, StrOp};
 
@@ -50,7 +50,6 @@ fn arithmetic_reads_a_pk_operand_and_propagates_a_null_one() {
     ];
     let prog = resolved(&schema, instrs, Reg(2));
     let mut scratch = EvalScratch::new(&prog);
-    scratch.ensure_capacity(&prog, 3);
     drive(&prog, &mb, 0, 3, &mut scratch);
 
     assert_eq!(&scratch.regs[2 * MORSEL..2 * MORSEL + 2], &[11, 22]);
@@ -109,7 +108,6 @@ fn select_boundary_sweep() {
         let mut scratch = EvalScratch::new(&prog);
         for morsel_start in (0..n).step_by(MORSEL) {
             let m = MORSEL.min(n - morsel_start);
-            scratch.ensure_capacity(&prog, m);
             drive(&prog, &mb, morsel_start, m, &mut scratch);
             let r = 3usize; // result_reg
             for i in 0..m {
@@ -161,7 +159,6 @@ fn select_no_nulls_fast_arm() {
         |_, _| false,
     );
     let mut scratch = EvalScratch::new(&prog);
-    scratch.ensure_capacity(&prog, n);
     drive(&prog, &mb, 0, n, &mut scratch);
     for row in 0..n {
         let expected = if row % 2 == 1 {
@@ -220,7 +217,6 @@ fn bit_only_demotion_when_bool_feeds_arithmetic() {
     );
 
     let mut scratch = EvalScratch::new(&prog);
-    scratch.ensure_capacity(&prog, 1);
     drive(&prog, &mb, 0, 1, &mut scratch);
     // r5 lives in regs as 0/1; r7 = r5 + 0 = 1.
     assert_eq!(
@@ -232,16 +228,16 @@ fn bit_only_demotion_when_bool_feeds_arithmetic() {
 }
 
 /// A `NOT NULL` load *clears* its destination's null words rather than skipping
-/// the write, so a word left behind by a previous drive can never surface as a
-/// phantom NULL. Run one scratch through two programs writing the same register
-/// — a nullable load that sets bits, then a `NOT NULL` load on the nullable arm
-/// — and assert the second leaves none. This is the test that fails if the clear
-/// is ever turned into a skip.
+/// the write, so a word left behind by an earlier morsel can never surface as a
+/// phantom NULL. This is the test that fails if the clear is ever turned into a
+/// skip.
 ///
-/// At the `eval_batch` level because an `Evaluator` owns its scratch privately:
-/// no caller-facing drive can point two programs at one register file.
+/// At the `eval_batch` level because an `Evaluator` owns its scratch privately,
+/// and the null words are dirtied by writing them directly: a scratch is sized
+/// and seeded for exactly one program, so no drive can leave another program's
+/// bits in this one's register file.
 #[test]
-fn not_null_load_clears_a_previous_programs_null_bits() {
+fn not_null_load_clears_stale_null_bits() {
     let schema = TestSchema::new(
         &[(type_code::U64, false), (type_code::I64, true), (type_code::I64, false)],
         &[0],
@@ -250,22 +246,14 @@ fn not_null_load_clears_a_previous_programs_null_bits() {
     let words = m / 64;
     let mb = make_n_col_view(&schema, m, |row, _| row as i64, |row, col| col == 0 && row % 2 == 0);
 
-    let nullable_load = resolved(&schema, vec![LogicalInstr::LoadColInt { col: 1 }], Reg(0));
     // The `NOT NULL` load classifies onto the fast arm on its own; forced onto
     // the nullable one it runs the kernel whose write is the subject here.
     let mut not_null_load = resolved(&schema, vec![LogicalInstr::LoadColInt { col: 2 }], Reg(0));
     assert!(not_null_load.no_nulls, "a NOT NULL load must classify as no_nulls");
     not_null_load.no_nulls = false;
 
-    let mut scratch = EvalScratch::new(&nullable_load);
-    scratch.ensure_capacity(&nullable_load, 0);
-    drive(&nullable_load, &mb, 0, m, &mut scratch);
-    assert!(
-        scratch.null_bits[0..words].iter().any(|&w| w != 0),
-        "the nullable load must leave null bits behind for the next program to inherit",
-    );
-
-    scratch.ensure_capacity(&not_null_load, 0);
+    let mut scratch = EvalScratch::new(&not_null_load);
+    scratch.null_bits[0..words].fill(u64::MAX);
     drive(&not_null_load, &mb, 0, m, &mut scratch);
     assert!(
         scratch.null_bits[0..words].iter().all(|&w| w == 0),
@@ -330,7 +318,6 @@ fn int_loads_cover_every_width_and_both_pk_signednesses() {
         .collect();
     let prog = resolved(&schema, instrs, Reg(0));
     let mut scratch = EvalScratch::new(&prog);
-    scratch.ensure_capacity(&prog, ROWS);
     drive(&prog, &mb, 0, ROWS, &mut scratch);
 
     for (ci, col_expected) in expected.iter().enumerate() {
@@ -364,7 +351,6 @@ fn run_unary_rows(payload_tc: u8, vals: &[i64], nulls: &[bool], mk: impl Fn(Reg)
     let instrs = vec![LogicalInstr::LoadColInt { col: 1 }, mk(Reg(0))];
     let prog = resolved(&schema, instrs, Reg(1));
     let mut scratch = EvalScratch::new(&prog);
-    scratch.ensure_capacity(&prog, n);
     drive(&prog, &view, 0, n, &mut scratch);
     (0..n)
         .map(|i| {
@@ -403,7 +389,6 @@ fn run_binary_rows(
     ];
     let prog = resolved(&schema, instrs, Reg(2));
     let mut scratch = EvalScratch::new(&prog);
-    scratch.ensure_capacity(&prog, n);
     drive(&prog, &view, 0, n, &mut scratch);
     (0..n)
         .map(|i| {
@@ -589,7 +574,7 @@ fn division_nulls_the_row_on_a_zero_or_null_divisor() {
     let b_null = [false, false, true];
 
     // Only the null flag is asserted on rows 1 and 2: a NULL row's value half is
-    // deliberately undefined, which is why `eval_row` hands back an `Option`.
+    // deliberately undefined, which is why a result is read back as an `Option`.
     let quot = run_binary_rows(type_code::I64, &a, &b, &no, &b_null, |a, b| LogicalInstr::IntArith {
         op: IntArithOp::Div,
         a,
@@ -793,14 +778,7 @@ fn run_str_rows(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(Reg) -> Vec<LogicalI
 /// text→number parses.
 fn run_str_to_scalar(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(Reg) -> Vec<LogicalInstr>) -> Vec<Option<i64>> {
     let (ev, view) = str_prog(vals, nulls, vec![], mk);
-    (0..vals.len()).map(|i| ev.eval_row(&view, i)).collect()
-}
-
-/// One row's string result as `(bytes, is_null)`.
-fn row_str(ev: &Evaluator, view: &TestView, i: usize) -> (Vec<u8>, bool) {
-    let mut out = Vec::new();
-    let is_null = ev.eval_row_str(view, i, &mut out);
-    (out, is_null)
+    (0..vals.len()).map(|i| row_value(&ev, &view, i)).collect()
 }
 
 /// A program past `MAX_STR_COL_BUFS` distinct string columns. The first
@@ -1092,7 +1070,7 @@ fn trim_strips_the_selected_ends_only() {
     }
 }
 
-/// LIKE over both cell classes and a NULL row. `eval_row` normalizes a NULL row
+/// LIKE over both cell classes and a NULL row. A NULL row normalizes
 /// whatever the matcher answered on its stored bytes — `'%'` matches anything —
 /// so it reports `(0, true)` like every other producer.
 #[test]
@@ -1108,7 +1086,7 @@ fn like_over_inline_and_heap_cells_with_a_null_row() {
                 ci,
             }]
         });
-        (0..vals.len()).map(|i| ev.eval_row(&view, i)).collect::<Vec<_>>()
+        (0..vals.len()).map(|i| row_value(&ev, &view, i)).collect::<Vec<_>>()
     };
     let null_row = None;
     assert_eq!(run("abc", false), [Some(1), Some(0), Some(0), null_row]);
@@ -1278,7 +1256,10 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
                 let want = gnitz_wire::compare_german_strings(&cells[i], &blob, &cells[j], &blob);
                 let want = [want.is_eq() as i64, want.is_lt() as i64, want.is_le() as i64];
                 for (channel, evs) in [("StrCmp", &regs), ("StrColCol", &col_col), ("StrColConst", &col_const)] {
-                    let got: Vec<i64> = evs.iter().map(|ev| ev.eval_row(&view, 0).expect("not NULL")).collect();
+                    let got: Vec<i64> = evs
+                        .iter()
+                        .map(|ev| row_value(ev, &view, 0).expect("not NULL"))
+                        .collect();
                     assert_eq!(got, want, "nullable={nullable} {channel}: {a:?} vs {b:?}");
                 }
             }
@@ -1530,7 +1511,7 @@ fn text_to_u64_seeds_the_unsigned_tracking() {
             Reg(3),
             vec![],
         );
-        ev.eval_row(&view, 0)
+        row_value(&ev, &view, 0)
     };
     assert_eq!(cmp(FixedInt::U64), Some(1), "u64::MAX > 5 under unsigned order");
     // The same text does not fit I64 at all, so the parse itself NULLs the row —
@@ -1676,7 +1657,7 @@ fn payload_loads_agree_with_the_wire_le_decoder() {
 
         let ev = scalar_prog(&schema, vec![LogicalInstr::LoadColInt { col: 1 }], Reg(0), vec![]);
         for row in 0..vals.len() {
-            let got = ev.eval_row(&view, row).expect("a non-nullable column is never null");
+            let got = row_value(&ev, &view, row).expect("a non-nullable column is never null");
             let want = fi.decode_le_i64(view.get_col_ptr(row, 0, fi.width()));
             assert_eq!(
                 got, want,
@@ -1717,7 +1698,7 @@ fn pk_loads_agree_with_the_wire_opk_decoder() {
 
         let ev = scalar_prog(&schema, vec![LogicalInstr::LoadColInt { col: 0 }], Reg(0), vec![]);
         for row in 0..vals.len() {
-            let got = ev.eval_row(&view, row).expect("a PK column is never null");
+            let got = row_value(&ev, &view, row).expect("a PK column is never null");
             let want = gnitz_wire::decode_opk_i64(&view.get_pk_bytes(row)[..fi.width()], fi);
             assert_eq!(got, want, "type {tc}, row {row}: LoadPk disagrees with decode_opk_i64");
         }

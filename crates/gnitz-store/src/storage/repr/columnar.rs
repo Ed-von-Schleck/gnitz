@@ -20,9 +20,10 @@ use gnitz_wire::{cmp_col_window, null_word_get, read_unsigned_exact};
 /// exactly the one method the evaluator has no use for.
 ///
 /// It cannot be folded into `BatchView` in the other direction: `MappedShard`,
-/// `RowRef` and `CursorSource` can address a cell but have no contiguous
-/// `rows * col_size` region to hand out (a shard column may be a scalar
-/// constant), so the split is at the per-row/region seam, not at this one. The
+/// and the `Run` that may wrap one, can address a cell but have no contiguous
+/// `rows * col_size` region to hand out — a shard column may be stored as one
+/// constant element, or be absent from the file entirely — so the split is at
+/// the per-row/region seam, not at this one. The
 /// N-way merge's per-source walk bound is `RowSource::row_count`, one level
 /// down: every row source is a whole batch, weight-bearing or not.
 pub(crate) trait ColumnarSource: RowSource {
@@ -86,9 +87,9 @@ fn compare_rows_impl<const SKIP: bool, A: RowSource, B: RowSource>(
     let null_word_b = src_b.get_null_word(row_b);
     // Both blob arenas are loop-invariant, and only the German-string arm of
     // `cmp_col_window` reads them. For a `MemBatch` that is a field load, but a
-    // `MappedShard`/`CursorSource`/`RowRef` resolves the mmap behind two calls —
-    // which this would otherwise pay twice per payload column per comparison, on
-    // the hottest comparator in the merge path.
+    // `MappedShard` (and the `Run` wrapping one) resolves the mmap behind two
+    // calls — which this would otherwise pay twice per payload column per
+    // comparison, on the hottest comparator in the merge path.
     let (blob_a, blob_b) = (src_a.blob(), src_b.blob());
 
     for (payload_col, col) in schema.payload_columns() {

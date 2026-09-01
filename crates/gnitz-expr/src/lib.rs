@@ -37,15 +37,16 @@
 //!
 //! > A non-generic item is codegen'd in this crate's rlib, at opt-level 1. A
 //! > generic one is re-instantiated in the *consuming* crate, at that crate's
-//! > opt-level — 0 for gnitz-server in dev.
+//! > opt-level — 0 for gnitz-store and gnitz-server in dev.
 //!
 //! So moving a body out of a generic function into a non-generic one *improves*
-//! the debug build, and the reverse costs. `nm` on the debug server is what
-//! shows which: a generic body appears there as a local (`t`) symbol, once per
-//! consuming crate. Anything reached from another crate per row is annotated
+//! the debug build, and the reverse costs. `nm` on the rlibs is what shows
+//! which: a generic body appears as a local (`t`) symbol in each consuming
+//! crate's. The drive methods on [`Evaluator`] take `&dyn BatchView` for that
+//! reason, so only [`Evaluator::eval_morsels`]' callback is still monomorphized
+//! in its caller. Anything reached from another crate per row is annotated
 //! `#[inline(always)]` regardless, since its caller is an opt-0 codegen unit:
-//! [`ColumnLocator`]'s methods, [`MorselOut`]'s, `RowSource::row_count`, and the
-//! generic drive methods' own preamble.
+//! [`ColumnLocator`]'s methods and [`MorselOut`]'s, and `RowSource::row_count`.
 //!
 //! Judge an inlining or kernel change on retired instructions
 //! (`perf stat -e instructions:u`), never on wall-clock: timings on the

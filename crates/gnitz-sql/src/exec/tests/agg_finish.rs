@@ -266,7 +266,7 @@ fn avg_shape() -> FoldShape {
     // A global aggregate has no group columns, so the SUM lands at partial
     // column 1 and its COUNT_NON_NULL companion at 2.
     let ev = compile_finalize_evaluator(&finalize_agg_bexpr(1, Some(2), AggFunc::Avg), &partial_schema).unwrap();
-    let is_str = ev.result_is_str();
+    assert!(!ev.result_is_str(), "AVG finalizes to a scalar");
     FoldShape {
         reduce_schema: Arc::new(src),
         group_positions: Vec::new(),
@@ -276,10 +276,7 @@ fn avg_shape() -> FoldShape {
         out_schema: build_agg_out_schema(&[col_def("a", TypeCode::F64, true)]).unwrap(),
         partial_schema,
         having: None,
-        finalize: vec![FinalizeItem::Computed {
-            ev: Box::new(ev),
-            is_str,
-        }],
+        finalize: vec![FinalizeItem::Computed { ev: Box::new(ev) }],
     }
 }
 

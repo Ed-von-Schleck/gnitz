@@ -326,8 +326,9 @@ impl MappedShard {
                 let off = offsets[REG_PAYLOAD_START + pi];
                 let dst = &mut data[off..off + row_count * 16];
                 for (i, cell) in dst.chunks_exact_mut(16).enumerate() {
-                    // Read through `get_col_ptr` so the Raw/Constant/Packed region
-                    // forms are handled the same way the bulk fill handles them.
+                    // Read through `get_col_ptr` so every `PayloadRegion` form —
+                    // `Direct` (per-row or constant-stride), `Packed`, `Absent` —
+                    // is handled the same way the bulk fill handles them.
                     let src = self.get_col_ptr(start + i, pi, 16);
                     cell.copy_from_slice(&relocate_german_string_vec(src, src_blob, &mut out, guard.get_mut()));
                 }
@@ -350,10 +351,11 @@ impl MappedShard {
         batch
     }
 
-    /// Derive a `UnifiedSource` view over this shard: each `ScalarRegion` becomes
-    /// a `(base, stride)` `ColPtr` into the shard's mmap, with `Constant` regions
-    /// mapped to `stride == 0` so `base.add(ri * stride) == base` reads the same
-    /// bytes for every row. Pure pointer arithmetic — no allocation, no scan. The
+    /// Derive a `UnifiedSource` view over this shard: each fixed-width region
+    /// becomes a `(base, stride)` `ColPtr` into the shard's mmap, carrying the
+    /// [`RegionView`](super::RegionView)'s own stride — so a constant region's
+    /// `stride == 0` makes `base.add(ri * stride) == base` read the same bytes
+    /// for every row. Pure pointer arithmetic — no allocation, no scan. The
     /// returned `ColPtr`s alias the mapped memory, so the caller must keep `self`
     /// alive for as long as the view is read.
     ///
@@ -401,8 +403,10 @@ impl MappedShard {
 }
 
 /// `MappedShard` is a [`RowSource`] but deliberately **not** a `BatchView`: a
-/// shard column may be a `ScalarRegion::Constant`, which has a cell address but
-/// no `rows * col_size` region to hand out.
+/// shard column may be a constant region (a `RegionView` whose `stride` is 0) or
+/// [`PayloadRegion::Absent`](super::PayloadRegion::Absent), which reads a shared
+/// 16-byte cell — each has a cell address but no `rows * col_size` region to
+/// hand out.
 impl gnitz_expr::RowSource for MappedShard {
     #[inline(always)]
     fn get_pk_bytes(&self, row: usize) -> &[u8] {

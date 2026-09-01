@@ -179,6 +179,12 @@ fn is_null_reads_the_addressed_slot_bit() {
     assert!(!slot2.is_null(&v, 0));
     assert!(!slot0.is_null(&v, 1), "a set bit at slot 2 must not read as slot 0");
     assert!(!pk.is_null(&v, 1), "PK columns are never null");
+
+    // `native_key_opt` is that gate and `native_key` in one: no key for a NULL
+    // payload cell, and never `None` on a PK column.
+    assert_eq!(slot2.native_key_opt(&v, 1), None);
+    assert_eq!(slot2.native_key_opt(&v, 0), Some(slot2.native_key(&v, 0)));
+    assert_eq!(pk.native_key_opt(&v, 1), Some(pk.native_key(&v, 1)));
 }
 
 /// `order_bits`' integer half against an independent oracle: the OPK promotion

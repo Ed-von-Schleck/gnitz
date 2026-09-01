@@ -194,7 +194,7 @@ pub struct ZSetBatchView<'a> {
     pk_stride: usize,
     /// Cached rather than re-derived: `ZSetBatch::len` divides the PK buffer
     /// length by a runtime stride, and `row_count` is read once per morsel and
-    /// once per `eval_row` — which the DML row loop drives with `m = 1` per row.
+    /// once per drive — and a client drives one view over a whole batch.
     rows: usize,
 }
 
