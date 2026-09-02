@@ -1684,7 +1684,7 @@ async fn handle_seek_by_index(
             .registry()
             .validate_index_cols(target_id, &cols, "seek_by_index");
         if let Err(msg) = admitted {
-            send_error(peer, target_id, client_id, msg.as_bytes()).await;
+            send_error(peer, target_id, client_id, msg.to_string().as_bytes()).await;
             return;
         }
         // Single catalog scan (exact list match) answers "is there an index for

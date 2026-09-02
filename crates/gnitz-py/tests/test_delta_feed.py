@@ -539,7 +539,7 @@ def test_a_four_column_pk_view_carries_a_feed(client):
 
 
 def test_a_feed_survives_a_restart_on_every_worker(own_server):
-    """`rehome_stores` rebuilds every relation's store on every worker at boot, so
+    """`rehome` rebuilds every relation's store on every worker at boot, so
     a `delta_bytes` that did not reach `rebuild_relation_store` would leave a
     catalog that says "fed" and no delta store anywhere — which every other test
     reports only as "no rows". The keys span all four partitions.

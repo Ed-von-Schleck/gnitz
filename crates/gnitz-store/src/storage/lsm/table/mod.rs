@@ -1,8 +1,8 @@
 //! Unified Table: two RAM-tier [`RunSet`]s over a `ShardIndex`.
 //!
 //! Ingest lands in the `memtable` run set and folds into the `ram_tier` once it
-//! passes its byte budget; the RAM tier spills to a shard past
-//! [`INMEM_CEILING`], and the checkpoint barrier folds it into one durable shard
+//! passes its byte budget; the RAM tier spills to a shard past its own
+//! ([`RamBudgets`]), and the checkpoint barrier folds it into one durable shard
 //! — on the base round for `SalReplay` tables, on the ephemeral round for
 //! `Rederive` ones.
 
@@ -26,36 +26,28 @@ use super::shard_reader::MappedShard;
 use crate::schema::key::{pk_bytes_eq, pk_in_range, probe_key};
 use crate::schema::SchemaDescriptor;
 
-/// Hard per-`Table` (= per relation per worker) heap ceiling for the **RAM
-/// tier**. A flush that would exceed it folds first; if the folded net state
-/// still exceeds it, the tier spills to a shard file.
-///
-/// It bounds that one tier, not the table's heap: the memtable's own bytes,
-/// `fold_to_single`'s 2× transient, a run a failed `persist_l0_run` left in
-/// place, and `cached_full_scan`'s whole materialized relation all sit outside
-/// it. The aggregate un-spilled RAM across the cluster is bounded by the
-/// un-checkpointed SAL tail: every ingested byte flows through the fsynced SAL,
-/// and a spill frees the RAM.
-///
-/// Swept at the **production** checkpoint cadence (`GNITZ_SAL_BYTES` at its 1 GiB
-/// default, threshold 75% of it), 4M rows, W=4, btrfs: at 4 MiB a worker's single
-/// store wrote 98.7 MB of RAM-tier spill per 4M rows (~25 B/row); at 32 MiB that
-/// spill is gone, for +45 MB of cluster RSS.
-///
-/// Spilling past the ceiling stays the intended safety valve; 32 MiB is where
-/// ordinary ingest stops reaching it, not a promise that nothing will.
-const INMEM_CEILING: usize = 32 * 1024 * 1024;
+/// The two RAM budgets of one `Table`. `Default` is what `Table::new` opens with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RamBudgets {
+    /// Ingest runs fold into the RAM tier once they pass this. The default,
+    /// 192 KiB, and 768 KiB are indistinguishable in total stall (btrfs, W=4, 4
+    /// views, 200k rows, ×3: 545/543/540 ms against 544/563/550 ms).
+    pub memtable_bytes: usize,
+    /// The RAM tier spills to a shard past this. It bounds that one tier, not
+    /// the table's heap. At the production checkpoint cadence (4M rows, W=4,
+    /// btrfs) a 4 MiB ceiling wrote 98.7 MB of spill per 4M rows and the default
+    /// 32 MiB none, for +45 MB of cluster RSS; shrinking it is how a test
+    /// reaches the disk regime on small data.
+    pub ram_tier_bytes: usize,
+}
 
-/// [`INMEM_CEILING`] with its `GNITZ_RAM_TIER_BYTES` override applied, read once
-/// per process rather than per store — `Table::new` runs for every system table,
-/// every user relation, and every view's per-node scratch. Shrinking it is how an
-/// E2E test reaches the disk regime (spills, compaction, the capacity sweep) on
-/// small data. Being process-wide is why a Rust unit test shrinks `ram_tier`'s
-/// own budget instead: those units share one process and must not fight over a
-/// global.
-fn inmem_ceiling() -> usize {
-    static CEILING: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CEILING.get_or_init(|| crate::foundation::env::env_num("GNITZ_RAM_TIER_BYTES", INMEM_CEILING))
+impl Default for RamBudgets {
+    fn default() -> Self {
+        RamBudgets {
+            memtable_bytes: 192 << 10,
+            ram_tier_bytes: 32 << 20,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -144,9 +136,9 @@ pub struct Table {
     /// Ingest runs, folded into `ram_tier` once they pass its byte budget.
     memtable: RunSet,
     /// Flushed runs held in heap instead of on disk. Populated for **every**
-    /// table on ingest overflow (`flush_to_ram`), bounded by `INMEM_CEILING`
-    /// (spill). The checkpoint barrier folds this tier into one durable shard
-    /// for `SalReplay` tables.
+    /// table on ingest overflow (`flush_to_ram`), bounded by
+    /// `RamBudgets::ram_tier_bytes` (spill). The checkpoint barrier folds this
+    /// tier into one durable shard for `SalReplay` tables.
     ram_tier: RunSet,
     shard_index: ShardIndex,
     schema: SchemaDescriptor,
@@ -197,21 +189,25 @@ mod bench_ingest;
 mod bench_unique_pk;
 
 impl Table {
-    /// Create a new table. The `RecoverySource` decides what the open does with
-    /// whatever is already on disk.
+    /// [`Self::with_budgets`] at [`RamBudgets::default`].
     pub fn new(
         dir: &str,
         schema: SchemaDescriptor,
         table_id: u32,
         recovery_source: RecoverySource,
     ) -> Result<Self, StorageError> {
-        /// Memtable byte budget of every store this opens — every system table,
-        /// every user relation, every view's operator scratch. Measured on btrfs,
-        /// W=4, 4 views, 200k rows, interleaved ×3: this and 768 KiB are
-        /// indistinguishable in total stall (545/543/540 ms against 544/563/550
-        /// ms), so the smaller value stands.
-        const MEMTABLE_BUDGET: usize = 192 << 10;
+        Self::with_budgets(dir, schema, table_id, recovery_source, RamBudgets::default())
+    }
 
+    /// Create a new table. The `RecoverySource` decides what the open does with
+    /// whatever is already on disk; `ram` sizes its two RAM tiers.
+    pub fn with_budgets(
+        dir: &str,
+        schema: SchemaDescriptor,
+        table_id: u32,
+        recovery_source: RecoverySource,
+        ram: RamBudgets,
+    ) -> Result<Self, StorageError> {
         // The directory is created before either arm decides anything, so an
         // unusable one fails here — a client-visible rejection on the master's
         // CREATE VIEW pre-flight, where a first-flush failure would instead be a
@@ -245,8 +241,8 @@ impl Table {
         };
 
         let mut table = Table {
-            memtable: RunSet::new(MEMTABLE_BUDGET),
-            ram_tier: RunSet::new(inmem_ceiling()),
+            memtable: RunSet::new(ram.memtable_bytes),
+            ram_tier: RunSet::new(ram.ram_tier_bytes),
             shard_index,
             schema,
             table_id,
@@ -269,22 +265,6 @@ impl Table {
             table.layout_seq = header.map_or(0, |h| h.layout_seq);
         }
 
-        Ok(table)
-    }
-
-    /// [`Table::new`] with an explicit memtable byte budget, for the tests that
-    /// drive spill pressure by shrinking it. A constructor rather than a field
-    /// poke because most of those tests live outside `lsm`, where `memtable` is
-    /// not visible.
-    pub fn with_memtable_budget(
-        dir: &str,
-        schema: SchemaDescriptor,
-        table_id: u32,
-        budget: usize,
-        recovery_source: RecoverySource,
-    ) -> Result<Self, StorageError> {
-        let mut table = Self::new(dir, schema, table_id, recovery_source)?;
-        table.memtable.set_budget(budget);
         Ok(table)
     }
 

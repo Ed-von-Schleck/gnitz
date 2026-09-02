@@ -59,3 +59,65 @@ impl fmt::Display for StorageError {
         }
     }
 }
+
+/// Why a store verb did not do what it was asked. The three variants differ in
+/// what the caller may do next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreError {
+    /// Nothing was applied and no state diverged: the message is the whole
+    /// answer to whoever asked, whether the fault is the frame's, the caller's
+    /// own state, or an internal one (a replay that fails, a walk that meets a
+    /// skeleton row with no hydrator).
+    Rejected(String),
+    /// The store failed to read or write. Committed data may not have reached it,
+    /// which leaves this process diverged from whatever durable log carried it.
+    Storage { context: String, err: StorageError },
+    /// A delta cursor below the round this worker has already dropped. The text
+    /// is the refusal as the reader phrases it; the variant is what a wire reply
+    /// branches on.
+    DeltaExpired(String),
+}
+
+impl StoreError {
+    pub fn rejected(message: impl Into<String>) -> Self {
+        StoreError::Rejected(message.into())
+    }
+
+    pub fn storage(context: impl Into<String>, err: StorageError) -> Self {
+        StoreError::Storage {
+            context: context.into(),
+            err,
+        }
+    }
+
+    /// Prefix a `Storage` context with what the caller was doing; the other
+    /// variants are the callee's whole answer and pass through unchanged.
+    pub fn in_context(self, what: &str) -> Self {
+        match self {
+            StoreError::Storage { context, err } => StoreError::Storage {
+                context: format!("{what}: {context}"),
+                err,
+            },
+            other => other,
+        }
+    }
+}
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StoreError::Rejected(m) | StoreError::DeltaExpired(m) => f.write_str(m),
+            StoreError::Storage { context, err } => write!(f, "{context}: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for StoreError {}
+
+/// The server's and the mirror's error plumbing is string-typed; this is what
+/// keeps `?` working at every one of their call sites.
+impl From<StoreError> for String {
+    fn from(e: StoreError) -> String {
+        e.to_string()
+    }
+}

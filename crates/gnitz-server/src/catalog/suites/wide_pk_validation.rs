@@ -2,14 +2,13 @@
 //! (`pk_stride > 16`). A wide PK is always compound (e.g. three U64 columns =
 //! 24 bytes). These tests seed the DAG tables and index circuits directly so a
 //! wide PK can be written with byte-level control, and drive
-//! `index_circuit_for_cols` / `seek_family_bytes` on the wide path. Unique-index
+//! `index_circuit_for_cols` / the byte-keyed `seek_family` on the wide path. Unique-index
 //! enforcement over a wide PK runs distributed and is covered end-to-end.
 
 use super::*;
 use gnitz_store::relation::RelationKind;
-use gnitz_store::schema::make_index_schema;
 use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::storage::{BatchBuilder, RecoverySource, Table};
+use gnitz_store::storage::{batch_project_index, BatchBuilder, RecoverySource, Table};
 
 /// `pk_stride` = 24 (wide): three U64 PK columns + one U64 payload `val`.
 fn wide_unique_schema() -> SchemaDescriptor {
@@ -29,39 +28,17 @@ fn wide_val_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], u64, i64)]) -> B
 
 /// Register a wide-PK table owning a UNIQUE secondary index on col 3, seeded
 /// with `base_rows` in both stores. Bypasses `create_table`'s stride gate and
-/// `ingest_to_family`, so it does not exercise the enforcement path.
+/// `ingest_to_family`, so it does not exercise the enforcement path. The index
+/// lands at `<dir>/idx_<tid+1>/w0of1`, a sibling of the hand-placed base.
 fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows: &[([u8; 24], u64, i64)]) {
     let schema = wide_unique_schema();
-    let idx_schema = make_index_schema(&[3], &schema).unwrap();
-
-    let mut base = Box::new(
-        Table::new(
-            &format!("{dir}/base"),
-            schema,
-            tid as u32,
-            RecoverySource::Rederive { resume_at: None },
-        )
-        .unwrap(),
-    );
-    let mut idx = Table::new(
-        &format!("{dir}/idx"),
-        idx_schema,
-        tid as u32 + 1,
+    let base = Table::new(
+        &format!("{dir}/base"),
+        schema,
+        tid as u32,
         RecoverySource::Rederive { resume_at: None },
     )
     .unwrap();
-
-    let bb = wide_val_batch(&schema, base_rows);
-    let idx_batch = gnitz_store::storage::batch_project_index(
-        &bb,
-        &gnitz_store::schema::IndexKeySpec::new(&[3], &schema, &idx_schema),
-        &idx_schema,
-    );
-    base.ingest_owned_batch(bb).unwrap();
-    base.flush().unwrap();
-    idx.ingest_owned_batch(idx_batch).unwrap();
-    idx.flush().unwrap();
-
     engine.registry_mut().register_owned(
         RelationSpec {
             id: tid,
@@ -71,11 +48,19 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows:
             depth: 0,
             budgets: ViewBudgets::default(),
         },
-        base,
+        Box::new(base),
     );
-    engine
-        .registry_mut()
-        .add_index_circuit(tid, &[3], tid + 1, Box::new(idx), idx_schema, true);
+    engine.registry_mut().add_index(tid, tid + 1, &[3], true).unwrap();
+
+    // The index batch is projected through the circuit's own plan; the base
+    // store takes the rows through the white-box door that skips projection.
+    let bb = wide_val_batch(&schema, base_rows);
+    let registry = engine.registry();
+    let ic = registry.index_circuit_for_cols(tid, &[3]).unwrap();
+    ic.ingest_owned_batch(batch_project_index(&bb, &ic.key_spec, &ic.index_schema))
+        .unwrap();
+    registry.table_entry(tid).unwrap().ingest_borrowed_batch(&bb).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 }
 
 // ── index_circuit_for_col existence + uniqueness lookup ────────────────
@@ -111,13 +96,13 @@ fn index_circuit_for_col_finds_index_and_uniqueness() {
 }
 
 #[test]
-fn wide_pk_seek_family_bytes_resolves_non_pk_col() {
+fn wide_pk_seek_family_resolves_non_pk_col() {
     let dir = temp_dir("wide_fk_nonpk");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     // Parent: wide PK (cols 0..3) + non-PK column `email` (col 3). This is the
-    // only test that resolves a genuinely wide (24-byte) PK via
-    // `seek_family_bytes` and reads back a committed non-PK column value.
+    // only test that resolves a genuinely wide (24-byte) PK via the byte-keyed
+    // `seek_family` and reads back a committed non-PK column value.
     let parent_tid = engine.next_table_id;
     let parent_schema = wide_unique_schema(); // [u64;4], pk [0,1,2], col 3 = email
     let parent_pk = pk24(100, 200, 300);
@@ -145,15 +130,9 @@ fn wide_pk_seek_family_bytes_resolves_non_pk_col() {
         pbase,
     );
 
-    // seek_family_bytes must resolve the committed parent row by full PK bytes.
-    let seen = engine
-        .registry_mut()
-        .seek_family_bytes(parent_tid, &parent_pk, None)
-        .unwrap();
-    assert!(
-        seen.is_some(),
-        "seek_family_bytes must find the live wide-PK parent row"
-    );
+    // The byte-keyed seek must resolve the committed parent row by full PK bytes.
+    let seen = engine.registry_mut().seek_family(parent_tid, &parent_pk, None).unwrap();
+    assert!(seen.is_some(), "seek_family must find the live wide-PK parent row");
     assert_eq!(
         read_u64_col(&seen.unwrap(), 0),
         555,
@@ -169,10 +148,10 @@ fn read_u64_col(batch: &Batch, payload_idx: usize) -> u64 {
     u64::from_le_bytes(d[0..8].try_into().unwrap())
 }
 
-// ── seek_family_bytes primitive agreement (narrow PK) ──────────────────
+// ── byte-keyed seek agreement with the wire-pair seek (narrow PK) ───────
 
 #[test]
-fn seek_family_bytes_matches_seek_family_narrow() {
+fn byte_seek_matches_wire_pair_seek_narrow() {
     let dir = temp_dir("seek_bytes_narrow");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
@@ -200,11 +179,12 @@ fn seek_family_bytes_matches_seek_family_narrow() {
 
     // Present (1, 3), retracted (2), and absent (99) must agree across forms.
     for key in [1u64, 2, 3, 99] {
-        // seek_family_bytes takes the at-rest OPK bytes; for an unsigned U64 PK
-        // that is big-endian. seek_family takes the native u128 and OPK-encodes.
+        // The registry's seek takes the at-rest OPK bytes; for an unsigned U64
+        // PK that is big-endian. The catalog's takes the native u128 and
+        // OPK-encodes.
         let bytes = key.to_be_bytes();
         let via_u128 = engine.seek_family(tid, key as u128, &[]).unwrap().0;
-        let via_bytes = engine.registry_mut().seek_family_bytes(tid, &bytes, None).unwrap();
+        let via_bytes = engine.registry_mut().seek_family(tid, &bytes, None).unwrap();
         assert_eq!(
             via_u128.is_some(),
             via_bytes.is_some(),

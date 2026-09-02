@@ -20,21 +20,28 @@ impl CatalogEngine {
     /// the hydrator.
     pub(crate) fn scan_family(&mut self, table_id: i64) -> Result<(Rc<Batch>, SchemaDescriptor), String> {
         let (dag, registry) = self.dag_and_registry_mut();
-        registry.scan_family(table_id, Some(dag))
+        registry.scan_family(table_id, Some(dag)).map_err(String::from)
     }
 
-    /// [`RelationRegistry::seek_family`], hydrating.
+    /// Point lookup by the wire seek pair, hydrating: the pair decoded to OPK
+    /// bytes, then [`RelationRegistry::seek_family`]. The schema comes back with
+    /// a miss too — its STATUS_OK reply block needs it.
     pub(crate) fn seek_family(
         &mut self,
         table_id: i64,
         seek_pk: u128,
         seek_pk_extra: &[u8],
     ) -> Result<(Option<Batch>, SchemaDescriptor), String> {
+        let schema = self.registry.table_entry(table_id)?.schema;
+        let opk = gnitz_store::schema::key::seek_opk_bytes(&schema, seek_pk, seek_pk_extra)
+            .map_err(|e| format!("seek: table {table_id}: {e}"))?;
         let (dag, registry) = self.dag_and_registry_mut();
-        registry.seek_family(table_id, seek_pk, seek_pk_extra, Some(dag))
+        Ok((registry.seek_family(table_id, opk.pk_bytes(), Some(dag))?, schema))
     }
 
-    /// [`RelationRegistry::scan_spec_family`], hydrating.
+    /// [`RelationRegistry::scan_spec_family`], hydrating. The one site where a
+    /// store error becomes a wire fault: an expired delta cursor keeps its own
+    /// status, everything else is `STATUS_ERROR`.
     pub(crate) fn scan_spec_family(
         &mut self,
         target_id: i64,
@@ -43,7 +50,15 @@ impl CatalogEngine {
         cut_tick: u64,
     ) -> Result<Batch, WireFault> {
         let (dag, registry) = self.dag_and_registry_mut();
-        registry.scan_spec_family(target_id, spec, reply_schema, cut_tick, Some(dag))
+        registry
+            .scan_spec_family(target_id, spec, reply_schema, cut_tick, Some(dag))
+            .map_err(|e| match e {
+                StoreError::DeltaExpired(text) => WireFault {
+                    status: gnitz_wire::STATUS_DELTA_EXPIRED,
+                    text,
+                },
+                other => WireFault::from(other.to_string()),
+            })
     }
 
     /// Compute the set of view ids whose checkpointed state — output stores and
@@ -175,6 +190,8 @@ impl CatalogEngine {
                 registry.table_entry(source)?.open_cursor(),
             )));
         };
-        registry.open_index_source(source, bound.idx_cols.as_slice(), &bound.desc, IndexWalk::Optional)
+        registry
+            .open_index_source(source, bound.idx_cols.as_slice(), &bound.desc, IndexWalk::Optional)
+            .map_err(String::from)
     }
 }

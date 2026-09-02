@@ -65,7 +65,7 @@ enum StepKind {
 }
 
 /// `AdhocFold` holds `groups × aggregates` of these, with `groups` bounded by
-/// `ADHOC_GROUP_CAP`.
+/// the registry's `adhoc_group_cap`.
 const _: () = assert!(std::mem::size_of::<Accumulator>() <= 24);
 
 impl Accumulator {

@@ -11,9 +11,9 @@
 //! The seven public module roots below are the API, in the order of the layer
 //! ladder they form — each depends only on those beneath it, and all of them on
 //! `foundation`. The submodules under each root are private; what a root
-//! re-exports is what it publishes, plus the eight submodules named as modules
-//! (`foundation::{posix_io, log, worker_ctx, env, fault, xxh}`, `schema::key`
-//! and `storage::batch_pool`). An item is `pub` because another crate names it;
+//! re-exports is what it publishes, plus the seven submodules named as modules
+//! (`foundation::{posix_io, log, env, fault, xxh}`, `schema::key` and
+//! `storage::batch_pool`). An item is `pub` because another crate names it;
 //! everything else is `pub(crate)`.
 //!
 //! There is no crate-root re-export façade: a type's rung is part of what its

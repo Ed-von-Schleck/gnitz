@@ -1,7 +1,7 @@
 use super::*;
-use crate::relation::{RelationKind, RelationSpec, ViewBudgets};
+use crate::relation::{RelationKind, RelationSpec, StoreConfig, ViewBudgets};
 use crate::schema::{type_code, SchemaColumn};
-use crate::storage::BatchBuilder;
+use crate::storage::{BatchBuilder, Slot, StoreError};
 use gnitz_wire::Cut;
 
 // ── The executor — `scan_spec_family` over a registry built in-crate ────────
@@ -31,7 +31,7 @@ fn id_val_schema() -> SchemaDescriptor {
 /// a large weight reach far more cheaply than many rows.
 fn rows_fixture(name: &str, n: u64, weight: i64) -> RelationRegistry {
     let schema = id_val_schema();
-    let mut registry = RelationRegistry::new(1);
+    let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
     registry
         .register(RelationSpec {
             id: TID,
@@ -83,7 +83,7 @@ fn ids(b: &Batch) -> Vec<(u128, i64)> {
     (0..b.count).map(|i| (b.get_pk(i), b.get_weight(i))).collect()
 }
 
-fn run(registry: &mut RelationRegistry, spec: &ReadSpec) -> Result<Batch, WireFault> {
+fn run(registry: &mut RelationRegistry, spec: &ReadSpec) -> Result<Batch, StoreError> {
     let schema = id_val_schema();
     registry.scan_spec_family(TID, spec, &schema, 0, None)
 }
@@ -136,7 +136,7 @@ fn an_out_of_range_order_key_is_rejected() {
     let Err(err) = run(&mut r, &rows_spec(order, 0)) else {
         panic!("an out-of-range order key must be rejected");
     };
-    assert!(err.text.contains("order key column 99"), "{err}");
+    assert!(err.to_string().contains("order key column 99"), "{err}");
 }
 
 /// A packed column word naming a column the table has not got is a corrupt
@@ -157,7 +157,7 @@ fn an_out_of_range_index_column_is_rejected_even_when_inexact() {
     let Err(err) = run(&mut r, &spec) else {
         panic!("an out-of-range index column must be rejected");
     };
-    assert!(err.text.contains("invalid column list"), "{err}");
+    assert!(err.to_string().contains("invalid column list"), "{err}");
 }
 
 /// A bounded view whose sweep has dehydrated everything on disk, plus fresh rows
@@ -165,7 +165,7 @@ fn an_out_of_range_index_column_is_rejected_even_when_inexact() {
 /// skeleton row here can only fail, so a read that succeeds proves it met none.
 fn dehydrated_fixture(name: &str, on_disk: std::ops::Range<u64>, in_ram: std::ops::Range<u64>) -> RelationRegistry {
     let schema = id_val_schema();
-    let mut registry = RelationRegistry::new(1);
+    let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
     registry
         .register(RelationSpec {
             id: TID,
@@ -225,7 +225,7 @@ fn a_bound_that_prunes_every_skeleton_shard_streams() {
     let Err(err) = run(&mut r, &pk_range(0, 4)) else {
         panic!("a range over the dehydrated band must reach the hydrator");
     };
-    assert!(err.text.contains("skeleton rows"), "{err}");
+    assert!(err.to_string().contains("skeleton rows"), "{err}");
 }
 
 // ---------------------------------------------------------------------------
@@ -267,7 +267,7 @@ fn premap_spec(pre_map: Vec<u8>, pre_payload: Vec<(u8, bool)>) -> AggReadSpec {
 /// `MapPlan` is not `Debug`, so the `Ok` half cannot go through `unwrap_err`.
 fn premap_err(spec: &AggReadSpec) -> String {
     match compile_fold_pre_map(spec, &premap_src()) {
-        Err(e) => e,
+        Err(e) => e.to_string(),
         Ok(_) => panic!("the pre-map derivation accepted a frame it must refuse"),
     }
 }

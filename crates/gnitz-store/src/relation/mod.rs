@@ -22,7 +22,7 @@ use rustc_hash::FxHashMap;
 
 use crate::schema::SchemaDescriptor;
 
-use crate::storage::{Batch, ChildAddr, RecoverySource, StorageError, Table};
+use crate::storage::{Batch, ChildAddr, RamBudgets, RecoverySource, Slot, StorageError, StoreError, Table};
 use gnitz_wire::PkColList;
 
 mod build;
@@ -32,12 +32,7 @@ mod store_handle;
 mod store_lsn;
 
 pub use dirs::{ensure_dir, is_table_dir_name, lock_data_dir, relation_dir, staged_dir};
-pub use ingest::IngestError;
 pub(crate) use store_handle::StoreHandle;
-
-/// Default rows per `drain_chunk` call on a chunked scan. Bounds peak scan
-/// memory at O(chunk × row_width).
-pub const SCAN_CHUNK_ROWS: usize = 65_536;
 
 // ---------------------------------------------------------------------------
 // Index circuit entry
@@ -84,6 +79,18 @@ impl IndexCircuitEntry {
     /// push; a detached circuit absorbs nothing.
     pub fn ingest_owned_batch(&self, batch: Batch) -> Result<(), StorageError> {
         self.handle.ingest_owned_batch(batch)
+    }
+
+    /// Whether this process's store of the index came back from a checkpoint
+    /// manifest at its open — the open this process made, or the one it
+    /// inherited through the fork; `false` for a detached circuit.
+    pub fn resumed_from_checkpoint(&self) -> bool {
+        self.handle.as_owned().is_some_and(Table::resumed_from_checkpoint)
+    }
+
+    /// Rows this process's store estimates it holds; `0` for a detached circuit.
+    pub fn estimated_rows(&self) -> usize {
+        self.handle.as_owned().map_or(0, Table::estimated_rows)
     }
 }
 
@@ -274,9 +281,12 @@ impl TableEntry {
     /// [`Self::delta_feed`] as a `Result` — the one message for "this process
     /// holds no delta store", so the ad-hoc read's two lookups (the source
     /// schema and the cursor) cannot render it two ways.
-    pub(crate) fn delta_feed_or_err(&self, id: i64) -> Result<&DeltaFeed, String> {
-        self.delta_feed()
-            .ok_or_else(|| format!("scan_spec: this process holds no delta store for relation {id}"))
+    pub(crate) fn delta_feed_or_err(&self, id: i64) -> Result<&DeltaFeed, StoreError> {
+        self.delta_feed().ok_or_else(|| {
+            StoreError::rejected(format!(
+                "scan_spec: this process holds no delta store for relation {id}"
+            ))
+        })
     }
 
     /// The `Table` this process holds for this relation, if any. `None` for a
@@ -382,45 +392,75 @@ pub struct RelationSpec {
 // RelationRegistry
 // ---------------------------------------------------------------------------
 
+/// Everything a registry is tuned by. `Default` is the production value of every
+/// field; the server overrides fields from its environment before constructing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StoreConfig {
+    pub ram: RamBudgets,
+    /// Rows per `drain_chunk` on every chunked scan this process drives; bounds
+    /// peak scan memory at O(chunk × row_width). Never zero.
+    pub scan_chunk_rows: usize,
+    /// Per-worker distinct-group cap for the ad-hoc aggregate fold; bounds the
+    /// accumulator matrix at `cap × aggregates × size_of::<Accumulator>()`.
+    pub adhoc_group_cap: usize,
+}
+
+impl Default for StoreConfig {
+    fn default() -> Self {
+        StoreConfig {
+            ram: RamBudgets::default(),
+            scan_chunk_rows: 65_536,
+            adhoc_group_cap: 65_536,
+        }
+    }
+}
+
 /// Which relations this process holds, and the stores behind them.
+///
+/// **Thread contract.** `!Send + !Sync` by auto-trait: every store holds its
+/// runs behind `Rc`. Nothing beneath a registry is thread-affine (a test-only
+/// statistics counter aside), so a host may move one to another thread while it
+/// has exclusive access to it and no `Rc`-bearing value it handed out — an
+/// `Rc<Batch>` scan, a `ReadCursor`, `SourceCursor` or `PkSetGather` — is alive
+/// outside it: those refcounts are non-atomic.
 pub struct RelationRegistry {
     pub(crate) tables: FxHashMap<i64, TableEntry>,
-    /// Launched worker count. Threaded in rather than read off `worker_ctx`,
-    /// which is 1 in the master pre-fork: a store built from the ambient value
-    /// is named `w0of1` while the boot repartition wrote `w0of{W}`, and the
-    /// child-dir sweep then deletes it as unowned.
-    pub(crate) num_workers: u32,
+    /// Which worker this process is, of how many: what names the `w{k}of{n}`
+    /// child every store of this process opens. The pre-fork master is
+    /// `(0, W)`, so it opens the child worker 0 will inherit; a worker becomes
+    /// its own slot through [`Self::rehome`].
+    pub(crate) slot: Slot,
+    pub(crate) config: StoreConfig,
     /// True while this process owns its relations' stores. The post-fork master
     /// detaches every user relation; anything reading local base data checks
     /// this first.
     pub(crate) owns_stores: bool,
+    /// Set by `rehome`, never cleared. "Pre-fork" is `owns_stores && !rehomed`:
+    /// the post-fork master detached, every worker rehomed, and only the
+    /// pre-fork master and a standalone process have done neither.
+    pub(crate) rehomed: bool,
     /// The generation a manifest must carry to be resumed from.
     pub(crate) resume_generation: u64,
     /// `worker_count << 32 | STATE_FORMAT` as last recorded.
     pub(crate) recorded_topology: u64,
-    /// Rows per `drain_chunk` on every chunked scan this process drives; bounds
-    /// peak scan memory at O(chunk × row_width). At least 1, clamped by its one
-    /// writer [`Self::set_scan_chunk_rows`], so no reader re-checks.
-    pub(crate) scan_chunk_rows: usize,
 }
 
 impl RelationRegistry {
-    /// An empty registry plus the chunk knob read from the environment. The one
-    /// constructor: `CatalogEngine::open` calls it with the launched worker
-    /// count, `Mirror::open` with 1.
-    pub fn new(num_workers: u32) -> Self {
+    /// An empty registry at `slot`, tuned by `config`. The one constructor:
+    /// `CatalogEngine::open` calls it with `(0, launched worker count)` and the
+    /// server's environment overrides, `Mirror::open` with [`Slot::SOLO`].
+    /// `config.scan_chunk_rows` is clamped to at least one row.
+    pub fn new(slot: Slot, config: StoreConfig) -> Self {
         let mut registry = RelationRegistry {
             tables: FxHashMap::default(),
-            num_workers,
+            slot,
+            config,
             owns_stores: true,
+            rehomed: false,
             resume_generation: 0,
             recorded_topology: 0,
-            scan_chunk_rows: SCAN_CHUNK_ROWS,
         };
-        registry.set_scan_chunk_rows(crate::foundation::env::env_num(
-            "GNITZ_SCAN_CHUNK_ROWS",
-            SCAN_CHUNK_ROWS,
-        ));
+        registry.set_scan_chunk_rows(config.scan_chunk_rows);
         registry
     }
 
@@ -453,25 +493,71 @@ impl RelationRegistry {
         self.tables.remove(&table_id);
     }
 
-    pub fn add_index_circuit(
-        &mut self,
-        table_id: i64,
-        col_indices: &[u32],
-        index_id: i64,
-        index_table: Box<Table>,
-        index_schema: SchemaDescriptor,
-        is_unique: bool,
-    ) {
-        if let Some(entry) = self.tables.get_mut(&table_id) {
-            entry.index_circuits.push(IndexCircuitEntry {
-                col_indices: PkColList::from_slice(col_indices),
+    /// Enter a secondary index on `owner` over `cols` and open this process's
+    /// store for it under `<owner dir>/idx_<index_id>/w{rank}of{n}`. The index
+    /// directory is created on every process, so the post-fork master — which
+    /// registers `Detached` — still owns the path a later DROP removes.
+    pub fn add_index(&mut self, owner: i64, index_id: i64, cols: &[u32], is_unique: bool) -> Result<(), StoreError> {
+        let (owner_schema, owner_dir) = {
+            let e = self.table_entry(owner)?;
+            if e.index_circuit_on(cols).is_some() {
+                return Err(StoreError::rejected(format!(
+                    "table {owner} already carries an index on {cols:?}"
+                )));
+            }
+            (e.schema, e.directory.clone())
+        };
+        let index_schema = crate::schema::make_index_schema(cols, &owner_schema).map_err(StoreError::rejected)?;
+        let idx_dir = ChildAddr::Index { id: index_id }.dir(&owner_dir);
+        ensure_dir(&idx_dir)?;
+        let handle = match self.owns_stores {
+            false => StoreHandle::Detached,
+            true => StoreHandle::owned(Self::open_index_table(
+                self.slot,
+                self.rederive_source(),
+                self.config.ram,
+                &idx_dir,
                 index_id,
-                handle: StoreHandle::owned(index_table),
                 index_schema,
-                key_spec: crate::schema::IndexKeySpec::new(col_indices, &entry.schema, &index_schema),
+            )?),
+        };
+        let key_spec = crate::schema::IndexKeySpec::new(cols, &owner_schema, &index_schema);
+        self.tables
+            .get_mut(&owner)
+            .expect("resolved above")
+            .index_circuits
+            .push(IndexCircuitEntry {
+                col_indices: PkColList::from_slice(cols),
+                index_id,
+                handle,
+                index_schema,
+                key_spec,
                 is_unique,
             });
-        }
+        Ok(())
+    }
+
+    /// This process's store of one index: at `slot`'s child of `idx_dir`, under
+    /// the given rederive policy and RAM budgets. An associated function so a
+    /// caller holding `&mut` into `tables` can open without a second borrow of
+    /// `self`.
+    fn open_index_table(
+        slot: Slot,
+        recovery: RecoverySource,
+        ram: RamBudgets,
+        idx_dir: &str,
+        index_id: i64,
+        schema: SchemaDescriptor,
+    ) -> Result<Box<Table>, StoreError> {
+        Table::with_budgets(
+            &ChildAddr::worker(slot).dir(idx_dir),
+            schema,
+            index_id as u32,
+            recovery,
+            ram,
+        )
+        .map(Box::new)
+        .map_err(|e| StoreError::storage(format!("open index {index_id} (dir={idx_dir})"), e))
     }
 
     pub fn remove_index_circuit(&mut self, table_id: i64, col_indices: &[u32]) {
@@ -481,18 +567,6 @@ impl RelationRegistry {
                 .index_circuits
                 .retain(|ic| ic.col_indices.as_slice() != col_indices);
         }
-    }
-
-    /// Replace the index circuit's owned Table (worker-boot re-home to the rank
-    /// subdir): drop the fork-inherited parent-dir table and install `t`.
-    /// Returns the new table pointer for the backfill; `None` if no circuit on
-    /// `col_indices` matches. Dropping the old `Box` closes the inherited table.
-    /// Sound: consumers resolve the circuit (and open their cursors) per
-    /// request, and the swap runs before the worker serves anything.
-    pub fn replace_index_table(&mut self, table_id: i64, col_indices: &[u32], t: Box<Table>) -> Option<*mut Table> {
-        let ic = self.tables.get_mut(&table_id)?.index_circuit_on_mut(col_indices)?;
-        ic.handle = StoreHandle::owned(t);
-        ic.handle.owned_mut().map(|t| t as *mut Table)
     }
 
     /// Set the uniqueness flag of the index circuit on `col_indices` in place
@@ -523,7 +597,7 @@ impl RelationRegistry {
     /// Updates the registry copy (`TableEntry.schema`) and pushes the same value
     /// down into the owned `Table` (memtable, RAM tier, shard index), plus
     /// dropping `Table::cached_full_scan`.
-    pub fn swap_table_schema(&mut self, table_id: i64, schema: SchemaDescriptor) -> Result<(), String> {
+    pub fn swap_table_schema(&mut self, table_id: i64, schema: SchemaDescriptor) -> Result<(), StoreError> {
         let entry = self
             .tables
             .get_mut(&table_id)
@@ -531,16 +605,16 @@ impl RelationRegistry {
         // Checked, not asserted: what a stale `key_spec` produces is a silently
         // wrong index projection, which release codegen would not guard at all.
         if !schema.is_trailing_append_of(&entry.schema) {
-            return Err(format!(
+            return Err(StoreError::rejected(format!(
                 "ALTER on table {table_id}: the new descriptor is not a trailing append, \
                  which every index circuit's baked key_spec requires"
-            ));
+            )));
         }
         // A worker reaches its `Table`; the post-fork master has none.
         if let Some(store) = entry.handle.owned_mut() {
             store
                 .swap_schema(schema)
-                .map_err(|e| format!("ALTER on table {table_id}: reopening shards failed: {e}"))?;
+                .map_err(|e| StoreError::storage(format!("ALTER on table {table_id}: reopening shards"), e))?;
         }
         entry.schema = schema;
         Ok(())
@@ -557,24 +631,34 @@ impl RelationRegistry {
         self.tables.contains_key(&table_id)
     }
 
+    pub fn slot(&self) -> Slot {
+        self.slot
+    }
+
+    pub fn config(&self) -> StoreConfig {
+        self.config
+    }
+
+    /// `slot().of`; kept because the server reads the count, never the rank, at
+    /// over a dozen sites.
     pub fn num_workers(&self) -> u32 {
-        self.num_workers
+        self.slot.of
     }
 
     pub fn owns_stores(&self) -> bool {
         self.owns_stores
     }
 
-    /// See [`RelationRegistry::scan_chunk_rows`](Self#structfield.scan_chunk_rows).
+    /// See [`StoreConfig::scan_chunk_rows`].
     pub fn scan_chunk_rows(&self) -> usize {
-        self.scan_chunk_rows
+        self.config.scan_chunk_rows
     }
 
     /// Set the chunk size, clamped to at least one row — a zero chunk drains
     /// nothing. Per registry rather than process-wide: the tests that shrink it
     /// do so per engine, and `cargo test` runs them on threads of one process.
     pub fn set_scan_chunk_rows(&mut self, rows: usize) {
-        self.scan_chunk_rows = rows.max(1);
+        self.config.scan_chunk_rows = rows.max(1);
     }
 
     /// The registry entry for `table_id`, or `None` for an unknown id — the
@@ -592,9 +676,9 @@ impl RelationRegistry {
 
     /// [`Self::entry`] plus the one "not registered" sentence — spelled the same
     /// by the mutating paths, so which verb asked cannot change what a client reads.
-    pub fn table_entry(&self, table_id: i64) -> Result<&TableEntry, String> {
+    pub fn table_entry(&self, table_id: i64) -> Result<&TableEntry, StoreError> {
         self.entry(table_id)
-            .ok_or_else(|| format!("relation {table_id} is not registered"))
+            .ok_or_else(|| StoreError::rejected(format!("relation {table_id} is not registered")))
     }
 
     /// A registered relation's kind, or `None` for an unknown id. `RelationKind`
@@ -672,14 +756,16 @@ impl RelationRegistry {
     /// `table_id`'s schema. The one admission test for every frame carrying a
     /// `pack_pk_cols` word: the master applies it as an early client-facing
     /// reject, the worker as its trust boundary, and both render the same error.
-    pub fn validate_index_cols(&self, table_id: i64, cols: &PkColList, op: &str) -> Result<(), String> {
+    pub fn validate_index_cols(&self, table_id: i64, cols: &PkColList, op: &str) -> Result<(), StoreError> {
         match self.entry(table_id) {
             Some(e)
                 if cols.is_well_formed() && cols.as_slice().iter().all(|&c| (c as usize) < e.schema.num_columns()) =>
             {
                 Ok(())
             }
-            _ => Err(format!("{op}: invalid column list for table {table_id}")),
+            _ => Err(StoreError::rejected(format!(
+                "{op}: invalid column list for table {table_id}"
+            ))),
         }
     }
 
@@ -729,7 +815,7 @@ impl RelationRegistry {
     /// `worker_count << 32 | STATE_FORMAT` for the count this process launched
     /// with — what a persisted record of derived state must carry to be honoured.
     pub fn launched_topology_word(&self) -> u64 {
-        crate::storage::topology_word(self.num_workers)
+        crate::storage::topology_word(self.slot.of)
     }
 
     /// The generation a manifest must carry to be resumed from.

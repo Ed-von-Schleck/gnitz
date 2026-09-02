@@ -21,7 +21,7 @@ use gnitz_core::{ClientError, GnitzClient, MirrorError, PollResult, Schema, ZSet
 use gnitz_mirror::Mirror;
 use gnitz_sql::SqlPlanner;
 use gnitz_store::relation::{relation_dir, RelationKind};
-use gnitz_store::storage::ChildAddr;
+use gnitz_store::storage::{ChildAddr, Slot};
 use gnitz_store_testkit::{assert_child_ok, run_test_in_child, CHILD_OK};
 use gnitz_test_harness::ServerHandle;
 use support::{assert_same_sequence, assert_same_zset, canonical, query, serial, sql, EnvVar};
@@ -1073,7 +1073,7 @@ fn a_foreign_topology_word_reseeds() {
         // What a two-worker layout would have stamped. The mirror always opens
         // at one worker, so this mismatches for the same reason a state-format
         // bump would.
-        gnitz_store::relation::RelationRegistry::new(2).launched_topology_word()
+        gnitz_store::storage::topology_word(2)
     });
 
     fx.reopen();
@@ -1099,11 +1099,11 @@ fn state_file(base_dir: &str) -> String {
 /// Built through the engine's own path grammar rather than by searching for a
 /// file of that name: it then names the copy's output store and nothing else
 /// under the tree, and it follows a change to the layout instead of quietly
-/// answering `false` forever. A copy is laid out for one worker, and this
-/// process carries the rank the store opened under.
+/// answering `false` forever. A copy is laid out for one worker, at the solo
+/// slot every mirror opens under.
 fn has_manifest(base_dir: &str, view_id: u64) -> bool {
     let rel_dir = relation_dir(&format!("{base_dir}/_copies"), "s", RelationKind::View, view_id as i64);
-    std::path::Path::new(&ChildAddr::this_worker(1).manifest(&rel_dir)).exists()
+    std::path::Path::new(&ChildAddr::worker(Slot::SOLO).manifest(&rel_dir)).exists()
 }
 
 /// A server restart erases the copy: the stored cursor tag no longer matches the
@@ -1945,7 +1945,7 @@ fn resident_footprint_bench() {
             "resident_footprint_child",
             &server,
             &dir,
-            &[("GNITZ_RAM_TIER_BYTES", "262144")],
+            &[("GNITZ_MIRROR_RAM_TIER_BYTES", "262144")],
             "the footprint child must run to the end",
         )
     );

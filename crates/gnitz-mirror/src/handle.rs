@@ -7,16 +7,21 @@ use std::sync::Arc;
 use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Schema, Shape, StoreRead, ZSetBatch};
 use gnitz_store::foundation::env::env_num;
 use gnitz_store::foundation::fault::Seam;
-use gnitz_store::foundation::worker_ctx;
-use gnitz_store::relation::{ensure_dir, is_table_dir_name, lock_data_dir, RelationRegistry};
+use gnitz_store::relation::{ensure_dir, is_table_dir_name, lock_data_dir, RelationRegistry, StoreConfig};
 use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::storage::subdir_names;
+use gnitz_store::storage::{subdir_names, RamBudgets, Slot, StoreError};
 
 use crate::state::{read_state, write_state, MirrorRecord};
 
 /// Applied delta bytes after which an apply drives a checkpoint of its own.
 /// `GNITZ_MIRROR_CHECKPOINT_BYTES` overrides it.
 const DEFAULT_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
+
+/// A store error as the host sees it. `gnitz-core` does not depend on
+/// `gnitz-store`, so this cannot be a `From` impl.
+pub(crate) fn engine(e: StoreError) -> MirrorError {
+    MirrorError::Engine(e.to_string())
+}
 
 /// `<base_dir>/_copies` — the root every mirrored relation's directory sits
 /// under, so `<base_dir>` itself holds exactly three entries this crate wrote:
@@ -95,7 +100,10 @@ pub struct Mirror {
 // SAFETY: no handle into the registry can escape. `Mirror`'s whole public
 // surface is `open` plus `impl MirrorStore`, whose signatures are `gnitz-core`
 // types and primitives — so every `Rc` the store mints is reached only from
-// inside it and a move carries them all together. `Mirror` is `!Sync` (the
+// inside it and a move carries them all together. That is condition (2) of the
+// registry's thread contract (`RelationRegistry`'s doc in `gnitz-store`), which
+// also states that nothing beneath it is thread-affine; condition (1),
+// exclusive access for the move, is the host's. `Mirror` is `!Sync` (the
 // store's `UnsafeCell`s and raw pointers make it so), so the graph is reached by
 // one thread at a time. What orders the non-atomic refcounts across a handover
 // is whichever edge the host holds the client behind, and there are three: a
@@ -105,35 +113,30 @@ pub struct Mirror {
 // entry to every `&mut self` method and a `Release` store on exit; `gnitz-tokio`
 // reaches the same store from `spawn_blocking` threads, where its own lock is
 // the edge.
-//
-// Nothing under the store is thread-affine: process-wide atomics, an `flock`
-// held as an open file description, an `io_uring` built per call. The
-// `thread_local!`s are scratch pools that hold nothing between calls, bar a
-// compaction-statistics counter a moved store splits across two copies, which
-// only an `#[ignore]`d amplification bench reads.
 unsafe impl Send for Mirror {}
 
 impl Mirror {
     /// Open (or create) a store at `base_dir`.
     ///
-    /// Fails if the process has taken a server role, or if `base_dir` is already
-    /// held — by another process, or by another store in this one.
+    /// Fails if `base_dir` is already held — by another process, or by another
+    /// store in this one. The store homes at `w0of1` whatever process it runs
+    /// in, under a directory it locks itself.
     pub fn open(base_dir: &str) -> Result<Self, MirrorError> {
-        // Assert Standalone rather than set it. `set_worker_role` would invert
-        // the index home directory and `store_lsn`'s own assertion; and a store
-        // opened inside a forked worker would home its stores at `w{k}of1`,
-        // which the next boot sweep deletes as unowned.
-        if !worker_ctx::is_standalone() {
-            return Err(MirrorError::Engine(
-                "a mirror cannot be opened in a process that has taken a server role".to_string(),
-            ));
-        }
         // The directory before the lock: `lock_data_dir` opens `<base_dir>/LOCK`
         // with `create(true)`, which fails if the directory is absent.
-        ensure_dir(base_dir)?;
-        let dir_lock = lock_data_dir(base_dir)?;
+        ensure_dir(base_dir).map_err(engine)?;
+        let dir_lock = lock_data_dir(base_dir).map_err(engine)?;
 
-        let mut registry = RelationRegistry::new(1);
+        // The mirror's own knobs, read by this entry point and not by a store
+        // constructor: it honours none of the server's tuning variables.
+        let config = StoreConfig {
+            ram: RamBudgets {
+                ram_tier_bytes: env_num("GNITZ_MIRROR_RAM_TIER_BYTES", RamBudgets::default().ram_tier_bytes),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut registry = RelationRegistry::new(Slot::SOLO, config);
         // The mirror always runs at one worker, so the topology word is a
         // constant of the process and is stamped once, here. That leaves the
         // *generation* as the only fence, which is the one thing `mirror_state`
@@ -187,12 +190,14 @@ impl Mirror {
     /// `desc` is what `rec.block` decodes to; the caller already holds it, so the
     /// block is decoded once per entry rather than once here and once there.
     pub(crate) fn enter(&mut self, tid: u64, rec: MirrorRecord, desc: SchemaDescriptor) -> Result<(), MirrorError> {
-        self.registry.register(crate::register::spec_for(
-            &self.copies_root,
-            tid,
-            &rec.schema_name,
-            desc,
-        ))?;
+        self.registry
+            .register(crate::register::spec_for(
+                &self.copies_root,
+                tid,
+                &rec.schema_name,
+                desc,
+            ))
+            .map_err(engine)?;
         self.records.insert(tid, rec);
         Ok(())
     }
@@ -338,7 +343,7 @@ impl Mirror {
         }
         let generation = self.registry.resume_generation() + 1;
         self.registry.set_resume_generation(generation);
-        self.registry.flush_ephemeral_outputs(generation)?;
+        self.registry.flush_ephemeral_outputs(generation).map_err(engine)?;
         write_state(
             &self.base_dir,
             generation,

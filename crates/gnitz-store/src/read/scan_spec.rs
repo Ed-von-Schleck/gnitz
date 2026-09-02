@@ -21,17 +21,17 @@
 
 use std::cmp::Ordering;
 
-use gnitz_wire::{AggReadSpec, Cut, OrderKey, RangeDescriptor, ReadBound, ReadSink, ReadSpec, WireFault};
+use gnitz_wire::{AggReadSpec, Cut, OrderKey, RangeDescriptor, ReadBound, ReadSink, ReadSpec};
 
 use std::rc::Rc;
 
 use super::SkeletonHydrator;
 use crate::expr::{MapPlan, PkSource};
-use crate::ops::{adhoc_group_cap, AdhocFold};
+use crate::ops::AdhocFold;
 use crate::relation::RelationRegistry;
 use crate::schema::key::{compare_pk_bytes, opk_key, pack_pk_be, pk_range_keys};
 use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor};
-use crate::storage::{compare_rows, Batch, PkSetGather, ReadCursor, SourceCursor};
+use crate::storage::{compare_rows, Batch, PkSetGather, ReadCursor, SourceCursor, StoreError};
 use gnitz_expr::{Evaluator, LogicalProgram};
 
 impl RelationRegistry {
@@ -47,7 +47,7 @@ impl RelationRegistry {
     /// not got, an index an `exact` bound needs and cannot find — every one a
     /// corrupt/stale frame, surfaced as a `STATUS_ERROR` reply — the fold's
     /// per-worker group cap (a resource-exhaustion abort), or a delta cursor
-    /// below this worker's retention floor, which carries `STATUS_DELTA_EXPIRED`.
+    /// below this worker's retention floor, which is [`StoreError::DeltaExpired`].
     ///
     /// `cut_tick` is the last tick round the master had emitted when it wrote
     /// this read's group, and bounds an incremental delta read above. Every other
@@ -59,7 +59,7 @@ impl RelationRegistry {
         reply_schema: &SchemaDescriptor,
         cut_tick: u64,
         hydrator: Option<&mut dyn SkeletonHydrator>,
-    ) -> Result<Batch, WireFault> {
+    ) -> Result<Batch, StoreError> {
         let src_schema = self.scan_spec_source_schema(target_id, &spec.bound)?;
 
         // Compile the predicate once per request, exactly as the circuit
@@ -70,7 +70,7 @@ impl RelationRegistry {
         };
         let ctx = ScanSinkCtx {
             predicate: predicate.as_ref(),
-            chunk_rows: self.scan_chunk_rows,
+            chunk_rows: self.config.scan_chunk_rows,
         };
 
         // Each arm resolves its sink whole, then opens. The open is spelled
@@ -84,9 +84,9 @@ impl RelationRegistry {
                 // layout — is resolved against this, never against `src_schema`.
                 let pre = compile_fold_pre_map(agg, &src_schema)?;
                 let reduce_in = pre.as_ref().map_or(&src_schema, |(s, _)| s);
-                let fold = AdhocFold::new(reduce_in, reply_schema, agg, adhoc_group_cap())?;
+                let fold = AdhocFold::new(reduce_in, reply_schema, agg, self.config.adhoc_group_cap)?;
                 let mut source = self.open_scan_spec_cursor(target_id, &spec.bound, &src_schema, cut_tick, hydrator)?;
-                Ok(run_scan_fold_sink(&mut source, ctx, pre.as_ref(), fold)?)
+                run_scan_fold_sink(&mut source, ctx, pre.as_ref(), fold)
             }
             ReadSink::Rows {
                 projection,
@@ -117,16 +117,16 @@ impl RelationRegistry {
     /// A `Delta` bound against a relation with no feed is refused at **every**
     /// `after_tick`, zero included: the reply would otherwise promise a
     /// continuation the server cannot serve.
-    fn scan_spec_source_schema(&self, target: i64, bound: &ReadBound) -> Result<SchemaDescriptor, String> {
+    fn scan_spec_source_schema(&self, target: i64, bound: &ReadBound) -> Result<SchemaDescriptor, StoreError> {
         let entry = self.table_entry(target)?;
         let ReadBound::Delta { after_tick } = bound else {
             return Ok(entry.schema);
         };
         if entry.budgets.delta_bytes.is_none() {
-            return Err(format!(
+            return Err(StoreError::rejected(format!(
                 "scan_spec: relation {target} carries no delta feed; \
                  create the view WITH (delta = '<size>') to subscribe to it"
-            ));
+            )));
         }
         if *after_tick == 0 {
             return Ok(entry.schema);
@@ -147,7 +147,7 @@ impl RelationRegistry {
         src_schema: &SchemaDescriptor,
         cut_tick: u64,
         hydrator: Option<&mut dyn SkeletonHydrator>,
-    ) -> Result<SourceCursor, WireFault> {
+    ) -> Result<SourceCursor, StoreError> {
         let (cursor, keys) = match bound {
             // The delta bootstrap arm reads the view's own store, which is what
             // `scan_spec_source_schema` already told the caller.
@@ -174,7 +174,7 @@ impl RelationRegistry {
             // Only base tables own index circuits, so an index bound names a base
             // table, which never holds a skeleton row.
             ReadBound::IndexRange { idx_cols, exact, desc } => {
-                return Ok(self.open_index_bound_cursor(source, *idx_cols, *exact, desc)?)
+                return self.open_index_bound_cursor(source, *idx_cols, *exact, desc)
             }
             // `capacity` and `delta` are refused together, so a fed view never
             // holds a skeleton row either.
@@ -201,17 +201,14 @@ impl RelationRegistry {
     /// covers `(after_tick, cut]`, so a dropped row is inside it iff
     /// `dropped_through > after_tick` — a cursor sitting *at* the floor is served
     /// in full rather than being told to re-read at 0 forever.
-    fn open_delta_cursor(&self, source: i64, after_tick: u64, cut_tick: u64) -> Result<SourceCursor, WireFault> {
+    fn open_delta_cursor(&self, source: i64, after_tick: u64, cut_tick: u64) -> Result<SourceCursor, StoreError> {
         let feed = self.table_entry(source)?.delta_feed_or_err(source)?;
         let dropped_through = feed.dropped_through();
         if after_tick < dropped_through {
-            return Err(WireFault {
-                status: gnitz_wire::STATUS_DELTA_EXPIRED,
-                text: format!(
-                    "delta cursor {after_tick} of relation {source} is below the \
-                     retained floor {dropped_through}; re-read at 0"
-                ),
-            });
+            return Err(StoreError::DeltaExpired(format!(
+                "delta cursor {after_tick} of relation {source} is below the \
+                 retained floor {dropped_through}; re-read at 0"
+            )));
         }
         let desc = RangeDescriptor::new(&[], Cut::After(after_tick as u128), Cut::After(cut_tick as u128));
         Ok(
@@ -238,7 +235,7 @@ impl RelationRegistry {
         idx_cols: u64,
         exact: bool,
         desc: &RangeDescriptor,
-    ) -> Result<SourceCursor, String> {
+    ) -> Result<SourceCursor, StoreError> {
         let cols = gnitz_wire::unpack_pk_cols(idx_cols);
         self.validate_index_cols(source, &cols, "scan_spec")?;
         // `exact`: the walk alone imposes the range. Otherwise the conjuncts ride
@@ -261,8 +258,8 @@ fn range_cursor(
     schema: &SchemaDescriptor,
     desc: &RangeDescriptor,
     open: impl FnOnce(&[u8], Option<&[u8]>) -> ReadCursor,
-) -> Result<Option<ReadCursor>, String> {
-    let Some((start, end_key)) = pk_range_keys(schema, desc)? else {
+) -> Result<Option<ReadCursor>, StoreError> {
+    let Some((start, end_key)) = pk_range_keys(schema, desc).map_err(StoreError::rejected)? else {
         return Ok(None);
     };
     let end = end_key.as_ref().map(|e| e.pk_bytes());
@@ -281,13 +278,13 @@ fn range_cursor(
 /// may share an OPK image (`opk_key` truncates to `pk_stride`, so `5` and
 /// `5 + 2^64` are the same U64 PK — left in, the pair would emit its row twice).
 /// Both are hard rejects; release builds must not clamp.
-fn pk_set_opk_keys(source: i64, keys: &[u128], src_schema: &SchemaDescriptor) -> Result<Vec<u8>, String> {
+fn pk_set_opk_keys(source: i64, keys: &[u128], src_schema: &SchemaDescriptor) -> Result<Vec<u8>, StoreError> {
     let stride = src_schema.pk_stride() as usize;
     if stride > gnitz_wire::NARROW_PK_MAX_BYTES {
-        return Err(format!(
+        return Err(StoreError::rejected(format!(
             "scan_spec: PkSet gather requires a PK of at most {} bytes (table {source})",
             gnitz_wire::NARROW_PK_MAX_BYTES
-        ));
+        )));
     }
     // The whole packed key fits `pack_pk_be`'s left-aligned `u128` sort key
     // exactly — one allocation, and a register compare in both the sort and the
@@ -300,10 +297,10 @@ fn pk_set_opk_keys(source: i64, keys: &[u128], src_schema: &SchemaDescriptor) ->
     // Adjacent after the sort. Tested against the list rather than against what
     // was gathered, so every worker answers the same way.
     if let Some(w) = opk_keys.windows(2).find(|w| w[0] == w[1]) {
-        return Err(format!(
+        return Err(StoreError::rejected(format!(
             "scan_spec: PkSet duplicate key {:?} (table {source})",
             &w[0].to_be_bytes()[..stride]
-        ));
+        )));
     }
     let mut flat = Vec::with_capacity(opk_keys.len() * stride);
     for k in &opk_keys {
@@ -321,19 +318,21 @@ fn resolve_rows_projection(
     blob: &[u8],
     src_schema: &SchemaDescriptor,
     reply_schema: &SchemaDescriptor,
-) -> Result<Option<MapPlan>, String> {
+) -> Result<Option<MapPlan>, StoreError> {
     if blob.is_empty() {
         return match reply_schema.same_physical_layout(src_schema) {
             true => Ok(None),
-            false => Err("scan_spec: identity rows reply schema differs from the source".to_string()),
+            false => Err(StoreError::rejected(
+                "scan_spec: identity rows reply schema differs from the source",
+            )),
         };
     }
     if reply_schema.pk_stride() != src_schema.pk_stride() {
-        return Err(format!(
+        return Err(StoreError::rejected(format!(
             "scan_spec: reply pk_stride {} != source pk_stride {}",
             reply_schema.pk_stride(),
             src_schema.pk_stride()
-        ));
+        )));
     }
     compile_projection(blob, src_schema, reply_schema).map(Some)
 }
@@ -364,7 +363,7 @@ struct ScanSinkCtx<'a> {
 fn compile_fold_pre_map(
     agg: &AggReadSpec,
     src_schema: &SchemaDescriptor,
-) -> Result<Option<(SchemaDescriptor, MapPlan)>, String> {
+) -> Result<Option<(SchemaDescriptor, MapPlan)>, StoreError> {
     if agg.pre_map.is_empty() {
         return Ok(None);
     }
@@ -380,12 +379,12 @@ fn compile_fold_pre_map(
             .iter()
             .all(|&(tc, nullable)| out.push(SchemaColumn::new(tc, nullable as u8)).is_some());
     if !built {
-        return Err(format!(
+        return Err(StoreError::rejected(format!(
             "scan_spec fold: a pre-map declaring {} payload columns over a {}-column key \
              is not a legal reduce input",
             agg.pre_payload.len(),
             src_schema.pk_indices().len()
-        ));
+        )));
     }
     let out_schema = out.finish();
     // `compile_projection` requires the program to write every declared payload
@@ -408,7 +407,7 @@ fn run_scan_fold_sink(
     ctx: ScanSinkCtx,
     pre: Option<&(SchemaDescriptor, MapPlan)>,
     mut fold: AdhocFold,
-) -> Result<Batch, String> {
+) -> Result<Batch, StoreError> {
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     // The plan and its destination in one Option, so no arm can fold source-schema
     // rows into a fold built for the reduce input. One reusable mapped batch:
@@ -602,7 +601,7 @@ struct OrderLocator {
 /// `OrderKey.col` is a raw client `u16` reaching `reply_schema.locate`, whose
 /// bound is a release-active `assert!` — so a forged one is caught here, ahead
 /// of the open.
-fn resolve_order_locs(order: &[OrderKey], reply_schema: &SchemaDescriptor) -> Result<Vec<OrderLocator>, String> {
+fn resolve_order_locs(order: &[OrderKey], reply_schema: &SchemaDescriptor) -> Result<Vec<OrderLocator>, StoreError> {
     order
         .iter()
         .map(|k| match (k.col as usize) < reply_schema.num_columns() {
@@ -611,11 +610,11 @@ fn resolve_order_locs(order: &[OrderKey], reply_schema: &SchemaDescriptor) -> Re
                 desc: k.desc,
                 nulls_first: k.nulls_first,
             }),
-            false => Err(format!(
+            false => Err(StoreError::rejected(format!(
                 "scan_spec: order key column {} out of range ({} cols)",
                 k.col,
                 reply_schema.num_columns()
-            )),
+            ))),
         })
         .collect()
 }
@@ -672,10 +671,10 @@ fn scan_spec_cmp(order_locs: &[OrderLocator], batch: &Batch, ra: usize, rb: usiz
 /// Decode + validate a client predicate blob against `schema`, then build its
 /// predicate `Evaluator` — the same path the circuit compiler runs. Any failure
 /// is a corrupt frame (the client pre-compiled the identical program at plan time).
-fn compile_predicate(blob: &[u8], schema: &SchemaDescriptor) -> Result<Evaluator, String> {
+fn compile_predicate(blob: &[u8], schema: &SchemaDescriptor) -> Result<Evaluator, StoreError> {
     LogicalProgram::from_blob(blob, "scan_spec predicate")
         .and_then(|p| p.resolve_filter(schema))
-        .map_err(|e| format!("scan_spec: invalid predicate program: {e}"))
+        .map_err(|e| StoreError::rejected(format!("scan_spec: invalid predicate program: {e}")))
 }
 
 /// Decode + validate a client projection (MAP) blob and build its [`MapPlan`] —
@@ -687,10 +686,10 @@ fn compile_projection(
     blob: &[u8],
     in_schema: &SchemaDescriptor,
     out_schema: &SchemaDescriptor,
-) -> Result<MapPlan, String> {
+) -> Result<MapPlan, StoreError> {
     LogicalProgram::from_map_blob(blob, "scan_spec projection")
         .and_then(|p| MapPlan::from_map(p, in_schema, out_schema, PkSource::Inherit))
-        .map_err(|e| format!("scan_spec: invalid projection program: {e}"))
+        .map_err(|e| StoreError::rejected(format!("scan_spec: invalid projection program: {e}")))
 }
 
 #[cfg(test)]

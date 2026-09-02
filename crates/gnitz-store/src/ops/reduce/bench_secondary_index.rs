@@ -23,7 +23,7 @@ use super::agg::AggDescriptor;
 use super::avi::{avi_batch, op_populate_avi, AviBake};
 use super::plan::ReducePlan;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
-use crate::storage::{Batch, RecoverySource, Table};
+use crate::storage::{Batch, RamBudgets, RecoverySource, Table};
 use crate::test_support::{bench_time, bench_time_each};
 use gnitz_wire::AggFunc;
 
@@ -125,12 +125,15 @@ fn secondary_index_bench_avi_decomposition() {
         ITERS,
         || {
             id += 1;
-            Table::with_memtable_budget(
+            Table::with_budgets(
                 tmp.path().to_str().unwrap(),
                 avi_schema,
                 id,
-                memtable_budget(),
                 RecoverySource::Rederive { resume_at: None },
+                RamBudgets {
+                    memtable_bytes: memtable_budget(),
+                    ..Default::default()
+                },
             )
             .unwrap()
         },

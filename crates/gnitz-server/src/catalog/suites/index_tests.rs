@@ -2304,7 +2304,7 @@ fn test_seek_by_index_range_no_range_column_errs() {
         .registry_mut()
         .seek_by_index_range(tid, &[1], &RangeDescriptor::new(&[10], After(0), OPEN_ABOVE));
     assert!(r.is_err(), "n_eq == index arity must be rejected");
-    assert!(r.err().unwrap().contains("no range column"));
+    assert!(r.err().unwrap().to_string().contains("no range column"));
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -2617,12 +2617,13 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     //
     // Wide PKs are DDL-rejected for base tables, so this builds the DAG table and
     // index circuit directly (as `wide_pk_validation.rs` does). The base is an
-    // owned `Table`, the shape an index owner takes in production. The leading
-    // PK column is distinct per row: the base flush orders the shard by the wide
-    // PK, which the resolve's binary-search seek relies on.
+    // owned `Table`, the shape an index owner takes in production; the index
+    // lands at `<dir>/idx_<tid+1>/w0of1`, a sibling of it. The leading PK column
+    // is distinct per row: the base flush orders the shard by the wide PK, which
+    // the resolve's binary-search seek relies on.
     use gnitz_store::relation::RelationKind;
     use gnitz_store::schema::SchemaDescriptor;
-    use gnitz_store::storage::{RecoverySource, Table};
+    use gnitz_store::storage::{batch_project_index, RecoverySource, Table};
 
     let dir = temp_dir("catalog_range_wide_pk");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -2630,7 +2631,6 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
 
     // pk_stride = 24: three U64 PK columns + one U64 payload `x` (source col 3).
     let schema = SchemaDescriptor::new(&[u64c(), u64c(), u64c(), u64c()], &[0, 1, 2]);
-    let idx_schema = make_index_schema(&[3], &schema).unwrap();
 
     // (pk, x): distinct leading column, distinct trailing column (past byte 16);
     // indexed values 10/20/30 chosen so the index emission order (by x) differs
@@ -2645,33 +2645,14 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     let bb = builder.finish();
     // Rows were appended out of PK order; the batch is `Raw` (the constructor
     // default), so the ingest's `into_consolidated` sorts the shard.
-    let idx_batch = gnitz_store::storage::batch_project_index(
-        &bb,
-        &gnitz_store::schema::IndexKeySpec::new(&[3], &schema, &idx_schema),
-        &idx_schema,
-    );
 
-    let mut base = Box::new(
-        Table::new(
-            &format!("{dir}/base"),
-            schema,
-            tid as u32,
-            RecoverySource::Rederive { resume_at: None },
-        )
-        .unwrap(),
-    );
-    let mut idx = Table::new(
-        &format!("{dir}/idx"),
-        idx_schema,
-        tid as u32 + 1,
+    let base = Table::new(
+        &format!("{dir}/base"),
+        schema,
+        tid as u32,
         RecoverySource::Rederive { resume_at: None },
     )
     .unwrap();
-    base.ingest_owned_batch(bb).unwrap();
-    base.flush().unwrap();
-    idx.ingest_owned_batch(idx_batch).unwrap();
-    idx.flush().unwrap();
-
     engine.registry_mut().register_owned(
         RelationSpec {
             id: tid,
@@ -2681,11 +2662,17 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
             depth: 0,
             budgets: ViewBudgets::default(),
         },
-        base,
+        Box::new(base),
     );
-    engine
-        .registry_mut()
-        .add_index_circuit(tid, &[3], tid + 1, Box::new(idx), idx_schema, false);
+    engine.registry_mut().add_index(tid, tid + 1, &[3], false).unwrap();
+    // The index batch is projected through the circuit's own plan; the base
+    // store takes the rows through the white-box door that skips projection.
+    let registry = engine.registry();
+    let ic = registry.index_circuit_for_cols(tid, &[3]).unwrap();
+    ic.ingest_owned_batch(batch_project_index(&bb, &ic.key_spec, &ic.index_schema))
+        .unwrap();
+    registry.table_entry(tid).unwrap().ingest_borrowed_batch(&bb).unwrap();
+    engine.registry_mut().flush(tid).unwrap();
 
     // x ∈ [10, 30] → all three wide-PK rows, resolved by their full 24-byte key.
     let r = engine

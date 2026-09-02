@@ -3,7 +3,7 @@
 //! recovery and the DDL zone allocator read.
 
 use super::{RelationKind, RelationRegistry, RelationStores, StoreHandle};
-use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr};
+use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr, Slot, StoreError};
 
 impl RelationRegistry {
     // -- Store management (for multi-worker fork) -----------------------------
@@ -38,26 +38,21 @@ impl RelationRegistry {
     /// no store to speak for them.
     pub fn assert_pre_fork(&self, who: &str) {
         assert!(
-            !crate::foundation::worker_ctx::is_worker() && self.owns_stores,
+            self.owns_stores && !self.rehomed,
             "{who} must run pre-fork on the master, which still owns its stores",
         );
     }
 
-    /// Re-open every store this worker inherited on someone else's child.
-    ///
-    /// The pre-fork master builds every relation at rank 0 and every worker
-    /// inherits those handles; since all workers share the data directory,
-    /// leaving them there would have every worker flush the same shard files.
-    /// The inherited handle is empty — the master ingests no user data — so
-    /// re-opening loses nothing: this rank's checkpointed shards load from its
-    /// own child and the FLAG_PUSH replay adds the SAL tail.
-    ///
-    /// A handle already homed here is left alone rather than special-cased by
-    /// rank: that covers worker 0's inherited child and the live CREATE path,
-    /// which builds at the worker's own rank to begin with. Re-opening one would
-    /// briefly put two live `Table`s on one directory.
-    pub fn rehome_stores(&mut self) -> Result<(), String> {
-        let home = ChildAddr::this_worker(self.num_workers);
+    /// Become `slot`: re-open every relation and index store this process
+    /// inherited on another rank's child at `slot`'s own. A store already homed
+    /// there is kept — re-opening it would put two live `Table`s on one
+    /// directory — and so is every system family, which is never at a child.
+    /// Once per process, post-fork, before any other registry verb.
+    pub fn rehome(&mut self, slot: Slot) -> Result<(), StoreError> {
+        assert!(!self.rehomed, "rehome runs once per process");
+        self.slot = slot;
+        self.rehomed = true;
+        let home = ChildAddr::worker(slot);
         let tids: Vec<i64> = self
             .tables
             .iter()
@@ -74,6 +69,27 @@ impl RelationRegistry {
         for tid in tids {
             self.rebuild_relation_store(tid, "rehome store")?;
         }
+        let (recovery, ram) = (self.rederive_source(), self.config.ram);
+        for entry in self.tables.values_mut() {
+            if entry.kind == RelationKind::SystemCatalog {
+                continue;
+            }
+            let owner_dir = entry.directory.clone();
+            for ic in &mut entry.index_circuits {
+                let idx_dir = ChildAddr::Index { id: ic.index_id }.dir(&owner_dir);
+                if ic.handle.as_owned().is_none_or(|t| t.directory() == home.dir(&idx_dir)) {
+                    continue;
+                }
+                ic.handle = StoreHandle::owned(Self::open_index_table(
+                    slot,
+                    recovery,
+                    ram,
+                    &idx_dir,
+                    ic.index_id,
+                    ic.index_schema,
+                )?);
+            }
+        }
         Ok(())
     }
 
@@ -86,24 +102,24 @@ impl RelationRegistry {
     /// store did not come back here would still carry its `delta_bytes` in the
     /// catalog and have no delta store on any worker, on every boot, with no error
     /// anywhere.
-    pub(crate) fn rebuild_relation_store(&mut self, tid: i64, what: &str) -> Result<(), String> {
+    pub(crate) fn rebuild_relation_store(&mut self, tid: i64, what: &str) -> Result<(), StoreError> {
         let (dir, schema, kind, budgets) = {
             let e = self
                 .tables
                 .get(&tid)
-                .ok_or_else(|| format!("{what}: relation {tid} is not registered"))?;
+                .ok_or_else(|| StoreError::rejected(format!("{what}: relation {tid} is not registered")))?;
             (e.directory.clone(), e.schema, e.kind, e.budgets)
         };
         let stores = self
             .build_relation_store(kind, &dir, tid, schema, budgets)
-            .map_err(|e| format!("{what} tid={tid}: {e}"))?;
+            .map_err(|e| e.in_context(&format!("{what} tid={tid}")))?;
         self.tables.get_mut(&tid).expect("entry read above").set_stores(stores);
         Ok(())
     }
 
     /// Reclaim every live relation's child directories that this boot's worker
-    /// count no longer owns — the on-disk counterpart of `rehome_stores`, which
-    /// then opens what this leaves behind. Runs after the boot relayout, so what
+    /// count no longer owns — the on-disk counterpart of `rehome`, which then
+    /// opens what this leaves behind. Runs after the boot relayout, so what
     /// it deletes is a set the relayout has already consumed.
     ///
     /// Unconditional rather than triggered on "the launched count changed": a
@@ -119,7 +135,7 @@ impl RelationRegistry {
             }
             // A storeless relation's `directory` names a path that was never created;
             // `reclaim_retired_children` reads it as having no children and returns.
-            reclaim_retired_children(&entry.directory, self.num_workers);
+            reclaim_retired_children(&entry.directory, self.slot.of);
         }
     }
 
@@ -133,16 +149,16 @@ impl RelationRegistry {
     /// transitively-invalid view whose own manifests are still at `g` would reload
     /// them. Then rebuilds the handle empty via `build_relation_store` and
     /// removes this worker's scratch operator dirs.
-    pub fn reset_store(&mut self, vid: i64) -> Result<(), String> {
+    pub fn reset_store(&mut self, vid: i64) -> Result<(), StoreError> {
         let dir = self
             .tables
             .get(&vid)
-            .ok_or_else(|| format!("reset_store: relation {vid} is not registered"))?
+            .ok_or_else(|| StoreError::rejected(format!("reset_store: relation {vid} is not registered")))?
             .directory
             .clone();
 
-        let rank = crate::foundation::worker_ctx::worker_rank();
-        let _ = std::fs::remove_file(ChildAddr::this_worker(self.num_workers).manifest(&dir));
+        let rank = self.slot.rank;
+        let _ = std::fs::remove_file(ChildAddr::worker(self.slot).manifest(&dir));
 
         // Rebuild empty. `Table::new` erases the stale shards (manifest now
         // absent → `Rederive` peek `None`).

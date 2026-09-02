@@ -44,23 +44,38 @@ pub enum ChildAddr<'a> {
     Index { id: i64 },
 }
 
+/// Which worker this process is, of how many: the one input that decides which
+/// `w{k}of{n}` child every store of this process opens.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Slot {
+    pub rank: u32,
+    pub of: u32,
+}
+
+impl Slot {
+    /// A one-worker process: the mirror, and every unit test.
+    pub const SOLO: Slot = Slot { rank: 0, of: 1 };
+
+    /// Panics on `rank >= of` or `of == 0`: a slot outside its own layout names a
+    /// child the boot sweep deletes as unowned.
+    pub fn new(rank: u32, of: u32) -> Slot {
+        assert!(of >= 1 && rank < of, "slot {rank} of {of}");
+        Slot { rank, of }
+    }
+}
+
 impl<'a> ChildAddr<'a> {
-    /// This worker's store of a relation laid out for `of` workers. The master
-    /// is rank 0 pre-fork, so it opens the child worker 0 will inherit.
-    pub fn this_worker(of: u32) -> Self {
+    /// `slot`'s store of a relation laid out for `slot.of` workers.
+    pub fn worker(slot: Slot) -> Self {
         ChildAddr::Worker {
-            rank: crate::foundation::worker_ctx::worker_rank(),
-            of,
+            rank: slot.rank,
+            of: slot.of,
         }
     }
 
-    /// This worker's delta store of a fed view. Beside [`Self::this_worker`] so
-    /// "which rank am I" is answered inside the grammar module for every child
-    /// kind, rather than once here and once at each caller.
-    pub(crate) fn delta_for_this_worker() -> Self {
-        ChildAddr::Delta {
-            rank: crate::foundation::worker_ctx::worker_rank(),
-        }
+    /// `slot`'s delta store of a fed view.
+    pub(crate) fn delta(slot: Slot) -> Self {
+        ChildAddr::Delta { rank: slot.rank }
     }
 
     /// The directory name, relative to the relation's directory.

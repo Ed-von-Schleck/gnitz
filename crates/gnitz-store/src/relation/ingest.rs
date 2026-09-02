@@ -2,29 +2,7 @@
 //! application, index projection, and the flush / checkpoint table collection.
 
 use super::{RelationKind, RelationRegistry, TableEntry};
-use crate::storage::{Batch, StorageError, Table};
-
-/// Why an ingest did not happen. The two variants differ in what a caller may
-/// do next: `Rejected` means nothing was applied and the request is at fault, so
-/// answering the caller with the message is the whole response; `Storage` means
-/// committed data did not reach the store, which leaves this process's state
-/// diverged from whatever durable log carried the batch.
-#[derive(Debug)]
-pub enum IngestError {
-    /// The target or the batch was refused before anything was applied.
-    Rejected(String),
-    /// The store failed to absorb the batch.
-    Storage(StorageError),
-}
-
-impl std::fmt::Display for IngestError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IngestError::Rejected(m) => write!(f, "{m}"),
-            IngestError::Storage(e) => write!(f, "{e}"),
-        }
-    }
-}
+use crate::storage::{Batch, StorageError, StoreError, Table};
 
 /// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`: report `Err(Io)` from the
 /// matching ingest below, which has already run — so what fires is the error
@@ -90,6 +68,7 @@ impl RelationRegistry {
         round: Option<u64>,
         needed: bool,
     ) -> Result<Option<Batch>, StorageError> {
+        let rank = self.slot.rank;
         let Some(entry) = self.tables.get_mut(&view_id) else {
             gnitz_warn!("relation: ingest_view_delta — relation {} is not registered", view_id);
             return Ok(None);
@@ -105,10 +84,8 @@ impl RelationRegistry {
         // The round this batch is captured under, or `None` for no capture — the
         // one decision both the fold and the stamp read. `round` leads, so a
         // backfill and every unfed view read no placement and no worker rank.
-        let capture: Option<u64> = round.filter(|_| {
-            entry.delta.is_some()
-                && (!entry.schema.placement().is_replicated() || crate::foundation::worker_ctx::worker_rank() == 0)
-        });
+        let capture: Option<u64> =
+            round.filter(|_| entry.delta.is_some() && (!entry.schema.placement().is_replicated() || rank == 0));
         // Only a captured batch pays the up-front fold; every other view hands the
         // batch straight to the store ingest it always did.
         let folded = capture.and_then(|_| Batch::consolidate_if_needed(&batch, &entry.schema));
@@ -185,19 +162,19 @@ impl RelationRegistry {
     /// need to see. System families are not supported (the catalog's
     /// `ingest_to_family` routes those through the precheck/hooks path).
     ///
-    /// `IngestError::Rejected` means nothing was applied and the request is at
-    /// fault; `IngestError::Storage` means committed data did not reach the
+    /// `StoreError::Rejected` means nothing was applied and the request is at
+    /// fault; `StoreError::Storage` means committed data did not reach the
     /// store.
     pub fn ingest_returning_effective(
         &mut self,
         table_id: i64,
         batch: Batch,
         needed: bool,
-    ) -> Result<Option<Batch>, IngestError> {
+    ) -> Result<Option<Batch>, StoreError> {
         let entry = match self.tables.get_mut(&table_id) {
             Some(e) => e,
             None => {
-                return Err(IngestError::Rejected(format!(
+                return Err(StoreError::rejected(format!(
                     "ingest failed: relation {table_id} is not registered"
                 )))
             }
@@ -205,8 +182,8 @@ impl RelationRegistry {
         // The registered kind, not an id band: `TableEntry.kind` is the fact this
         // crate owns, and every production caller is already gated on the band.
         if entry.kind == RelationKind::SystemCatalog {
-            return Err(IngestError::Rejected(
-                "ingest_returning_effective not supported for system tables".to_string(),
+            return Err(StoreError::rejected(
+                "ingest_returning_effective not supported for system tables",
             ));
         }
         // Width guard, ahead of `enforce_unique_pk`. A worker parked mid-epoch
@@ -219,14 +196,15 @@ impl RelationRegistry {
         // extra column and ACK the push as success.
         let want = entry.schema.num_payload_cols();
         if batch.num_payload_cols() != want {
-            return Err(IngestError::Rejected(format!(
+            return Err(StoreError::rejected(format!(
                 "push for table_id={table_id} carries {} payload columns, table schema has {}",
                 batch.num_payload_cols(),
                 want
             )));
         }
 
-        Self::apply(table_id, entry, batch, needed).map_err(IngestError::Storage)
+        Self::apply(table_id, entry, batch, needed)
+            .map_err(|e| StoreError::storage(format!("ingest into relation {table_id}"), e))
     }
 
     /// Ingest `source` into this relation's store, then project and ingest one
@@ -362,9 +340,9 @@ impl RelationRegistry {
     /// barrier. The second half of an ephemeral checkpoint round wherever one
     /// runs — behind a circuit layer that flushed its traces first, or in a
     /// mirror, which owns no traces to flush.
-    pub fn flush_ephemeral_outputs(&mut self, generation: u64) -> Result<(), String> {
+    pub fn flush_ephemeral_outputs(&mut self, generation: u64) -> Result<(), StoreError> {
         let round = crate::storage::FlushRound::Ephemeral(generation);
         crate::storage::flush_barrier(self.collect_ephemeral_output_tables(), round)
-            .map_err(|e| format!("ephemeral output flush: {e}"))
+            .map_err(|e| StoreError::storage("ephemeral output flush", e))
     }
 }

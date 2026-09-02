@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_store::foundation::env::env_num;
 use gnitz_wire::sys_rows::{write_schema_tab_row, SchemaTabRow};
 use gnitz_wire::SEQTAB_COL_VALUE;
 
@@ -6,9 +7,29 @@ impl CatalogEngine {
     // -- Open engine (main entry point) ------------------------------------
 
     /// Opens or creates a GnitzDB instance at `base_dir`, laid out for
-    /// `num_workers` workers — passed in rather than read off `worker_ctx`, for
-    /// the reason on [`CatalogEngine::num_workers`].
+    /// `num_workers` workers, as a standalone process — neither the master nor a
+    /// forked worker, which is what every unit test is.
+    #[cfg(test)]
     pub(crate) fn open(base_dir: &str, num_workers: u32) -> Result<Self, String> {
+        Self::open_as(base_dir, num_workers, false)
+    }
+
+    /// [`Self::open`] as the master process: its index copies stay empty.
+    pub(crate) fn open_master(base_dir: &str, num_workers: u32) -> Result<Self, String> {
+        Self::open_as(base_dir, num_workers, true)
+    }
+
+    /// The forked child becomes worker `slot`: its index hook backfills from
+    /// here on, and every inherited store is re-homed at its own child. Once per
+    /// child, before any other catalog work.
+    pub(crate) fn become_worker(&mut self, slot: Slot) -> Result<(), String> {
+        self.is_master = false;
+        self.registry
+            .rehome(slot)
+            .map_err(|e| format!("rehome stores failed: {e}"))
+    }
+
+    fn open_as(base_dir: &str, num_workers: u32, is_master: bool) -> Result<Self, String> {
         ensure_dir(base_dir)?;
 
         // Before any store opens: two writers on one directory mint identical
@@ -17,15 +38,30 @@ impl CatalogEngine {
 
         ensure_dir(&sys_catalog_dir(base_dir))?;
 
+        // Every store this process opens — the system tables here, every
+        // relation and index through the registry, every view's operator scratch
+        // through the compiler — is tuned by this one value, read from the
+        // environment once. `env_num` refuses a zero and an unparseable value.
+        let defaults = StoreConfig::default();
+        let config = StoreConfig {
+            ram: RamBudgets {
+                ram_tier_bytes: env_num("GNITZ_RAM_TIER_BYTES", defaults.ram.ram_tier_bytes),
+                ..defaults.ram
+            },
+            scan_chunk_rows: env_num("GNITZ_SCAN_CHUNK_ROWS", defaults.scan_chunk_rows),
+            adhoc_group_cap: env_num("GNITZ_ADHOC_GROUP_CAP", defaults.adhoc_group_cap),
+        };
+
         // Create system tables (one `Table` each; durability derived from the
         // kind they are later registered under).
         let mut stores: Vec<Table> = Vec::with_capacity(SysFamily::COUNT);
         for family in SysFamily::ALL {
-            let table = Table::new(
+            let table = Table::with_budgets(
                 &sys_family_dir(base_dir, family.name()),
                 family.schema(),
                 family.id() as u32,
                 RecoverySource::SalReplay,
+                config.ram,
             )
             .map_err(|e| format!("Failed to create system table '{}': error {}", family.name(), e))?;
             stores.push(table);
@@ -35,11 +71,12 @@ impl CatalogEngine {
         let is_new = !stores[SysFamily::Table.index()].open_cursor().valid;
 
         let mut engine = CatalogEngine {
-            registry: RelationRegistry::new(num_workers),
+            registry: RelationRegistry::new(Slot::new(0, num_workers), config),
             dag: DagEngine::new(),
             base_dir: base_dir.to_string(),
             _dir_lock: dir_lock,
             caches: CatalogCacheSet::default(),
+            is_master,
             next_schema_id: FIRST_USER_SCHEMA_ID,
             next_table_id: FIRST_USER_TABLE_ID,
             next_index_id: FIRST_USER_INDEX_ID,

@@ -107,7 +107,7 @@ impl DagEngine {
                 "swap_table_schema: table {table_id} has dependent views;                  RESTRICT should have rejected the ALTER"
             ));
         }
-        registry.swap_table_schema(table_id, schema)
+        registry.swap_table_schema(table_id, schema).map_err(String::from)
     }
 
     // ── Cache management ────────────────────────────────────────────────
@@ -201,6 +201,8 @@ impl DagEngine {
             recovery: entry
                 .owned_store()
                 .map_or(RecoverySource::Rederive { resume_at: None }, Table::recovery_source),
+            slot: registry.slot(),
+            ram: registry.config().ram,
         };
         // The compiler layer sees only the circuit system tables, never `VIEW_TAB`,
         // so it cannot derive whether the view is capacity-bounded.
@@ -218,10 +220,9 @@ impl DagEngine {
     /// view's own. The plan is dropped here, so the `Table`s it holds open under
     /// `root` are closed before this returns.
     ///
-    /// The verdict is worker-independent: `root` overrides the one path component
-    /// worker context contributes, and no rejection reads anything else it
-    /// reaches — those are operands and offsets of instructions nothing here
-    /// executes.
+    /// The verdict is worker-independent: it compiles under the master's slot,
+    /// `root` overrides the one path component the slot contributes, and no
+    /// rejection reads it.
     pub(crate) fn preflight_compile(
         &self,
         registry: &RelationRegistry,

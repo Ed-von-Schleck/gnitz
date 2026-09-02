@@ -388,7 +388,7 @@ fn test_ingest_scan_seek_family() {
 
 /// After the FLAG_SEEK collapse there is no system-table fast path: a
 /// `table_id < FIRST_USER_TABLE_ID` seek flows through the same
-/// `seek_family → seek_opk_bytes → seek_family_bytes` chain as user tables,
+/// `seek_family → seek_opk_bytes → RelationRegistry::seek_family` chain as user tables,
 /// resolving its schema through the registry entry. `create_table` writes a TABLE_TAB
 /// row keyed by the new table-id — a single narrow U64 PK, stride 8 — so seeking
 /// TABLE_TAB by that id drives the empty-`extra` narrow path end to end.
@@ -795,11 +795,11 @@ fn test_circuit_table_surface_introspectable() {
     let pk_bytes = opk_pk(&SysFamily::CircuitNodes.schema(), &[7, 0]);
     let found = engine
         .registry_mut()
-        .seek_family_bytes(CIRCUIT_NODES_TAB_ID, &pk_bytes, None)
+        .seek_family(CIRCUIT_NODES_TAB_ID, &pk_bytes, None)
         .unwrap();
-    assert!(found.is_some(), "seek_family_bytes must find CircuitNodes row by PK");
+    assert!(found.is_some(), "seek_family must find CircuitNodes row by PK");
     let found = found.unwrap();
-    assert_eq!(found.len(), 1, "seek_family_bytes must return exactly one row");
+    assert_eq!(found.len(), 1, "seek_family must return exactly one row");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

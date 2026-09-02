@@ -9,7 +9,7 @@ use std::rc::Rc;
 use super::SkeletonHydrator;
 use crate::relation::RelationRegistry;
 use crate::schema::{project_schema, SchemaDescriptor};
-use crate::storage::{Batch, BoundedIndexCursor, ReadCursor, SourceCursor};
+use crate::storage::{Batch, BoundedIndexCursor, ReadCursor, SourceCursor, StoreError};
 
 impl RelationRegistry {
     /// Scan all positive-weight rows from a relation. One registry lookup serves
@@ -20,7 +20,7 @@ impl RelationRegistry {
         &self,
         table_id: i64,
         hydrator: Option<&mut dyn SkeletonHydrator>,
-    ) -> Result<(Rc<Batch>, SchemaDescriptor), String> {
+    ) -> Result<(Rc<Batch>, SchemaDescriptor), StoreError> {
         let entry = self.table_entry(table_id)?;
         // Asked of the store, not of a cursor: the non-hydrating answer is
         // `full_scan`'s cached `Rc` snapshot, and opening a cursor to ask
@@ -59,7 +59,7 @@ impl RelationRegistry {
         mut cursor: ReadCursor,
         keys: Option<&[u8]>,
         hydrator: Option<&mut dyn SkeletonHydrator>,
-    ) -> Result<Batch, String> {
+    ) -> Result<Batch, StoreError> {
         let schema = cursor.schema;
         let stride = schema.pk_stride() as usize;
         // Flat OPK images, ascending — every walk below visits keys in that
@@ -116,15 +116,14 @@ impl RelationRegistry {
         if coarse.is_empty() {
             return Ok(out);
         }
-        let chunk_rows = self.scan_chunk_rows;
         let hydrated = match hydrator {
-            Some(h) => h.hydrate_keys(self, view_id, skeleton_keys, &coarse, chunk_rows)?,
+            Some(h) => h.hydrate_keys(self, view_id, skeleton_keys, &coarse)?,
             // Unreachable: reaching here means a walk met a skeleton row, which
             // requires a capacity budget, which no host passing `None` ever sets.
             None => {
-                return Err(format!(
+                return Err(StoreError::rejected(format!(
                     "relation {view_id} holds skeleton rows but this process maintains no circuit"
-                ))
+                )))
             }
         };
         // The fully-dehydrated store is what the feature exists for, and
@@ -140,33 +139,15 @@ impl RelationRegistry {
         Ok(merged)
     }
 
-    /// Point lookup by the wire seek pair. Decodes `(seek_pk, seek_pk_extra)` to
-    /// the OPK key at any PK width via `seek_opk_bytes`, then seeks.
-    /// Returns the hit (if any) plus the table's schema descriptor — a miss
-    /// still needs the schema for its STATUS_OK reply block.
+    /// Point lookup by OPK bytes: every live row of `pk`'s group, or `None` for
+    /// a miss. The skeleton test is the opened cursor's, so a point lookup that
+    /// misses every skeleton shard reads without hydrating.
     pub fn seek_family(
-        &self,
-        table_id: i64,
-        seek_pk: u128,
-        seek_pk_extra: &[u8],
-        hydrator: Option<&mut dyn SkeletonHydrator>,
-    ) -> Result<(Option<Batch>, SchemaDescriptor), String> {
-        let entry = self.table_entry(table_id)?;
-        let schema = entry.schema;
-        let opk = crate::schema::key::seek_opk_bytes(&schema, seek_pk, seek_pk_extra)?;
-        Ok((self.seek_family_bytes(table_id, opk.pk_bytes(), hydrator)?, schema))
-    }
-
-    /// Byte-keyed [`Self::seek_family`] — the primitive both spellings resolve
-    /// to, for callers that already hold the OPK bytes. The skeleton test is the
-    /// opened cursor's, so a point lookup that misses every skeleton shard reads
-    /// without hydrating.
-    pub fn seek_family_bytes(
         &self,
         table_id: i64,
         pk: &[u8],
         hydrator: Option<&mut dyn SkeletonHydrator>,
-    ) -> Result<Option<Batch>, String> {
+    ) -> Result<Option<Batch>, StoreError> {
         let entry = self.table_entry(table_id)?;
         let mut cursor = entry.open_cursor_in_range(pk, Some(pk));
         if !cursor.any_skeleton() {
@@ -198,7 +179,7 @@ impl RelationRegistry {
         table_id: i64,
         pks: impl ExactSizeIterator<Item = &'k [u8]>,
         ref_col: u8,
-    ) -> Result<(Batch, SchemaDescriptor), String> {
+    ) -> Result<(Batch, SchemaDescriptor), StoreError> {
         let entry = self.table_entry(table_id)?;
         let schema = entry.schema;
         let result_schema =
@@ -243,10 +224,10 @@ impl RelationRegistry {
         table_id: i64,
         col_indices: &[u32],
         natives: &[u128],
-    ) -> Result<(Option<Batch>, SchemaDescriptor), String> {
+    ) -> Result<(Option<Batch>, SchemaDescriptor), StoreError> {
         let (&last, eq) = natives
             .split_last()
-            .ok_or_else(|| "seek_by_index: no key values supplied".to_string())?;
+            .ok_or_else(|| StoreError::rejected("seek_by_index: no key values supplied"))?;
         let range = gnitz_wire::RangeDescriptor::point(eq, last);
         self.seek_by_index_range(table_id, col_indices, &range)
     }
@@ -268,7 +249,7 @@ impl RelationRegistry {
         table_id: i64,
         col_indices: &[u32],
         range: &gnitz_wire::RangeDescriptor,
-    ) -> Result<(Option<Batch>, SchemaDescriptor), String> {
+    ) -> Result<(Option<Batch>, SchemaDescriptor), StoreError> {
         let src_schema = self.table_entry(table_id)?.schema;
         // The wire seek IS one unchunked drain of the bounded cursor — the same
         // walk/gather the backfill scan drives chunk-wise, so the two paths
@@ -301,7 +282,7 @@ impl RelationRegistry {
         cols: &[u32],
         desc: &gnitz_wire::RangeDescriptor,
         walk: IndexWalk,
-    ) -> Result<SourceCursor, String> {
+    ) -> Result<SourceCursor, StoreError> {
         match self.open_index_range(source, cols, desc, walk) {
             IndexScan::Cursor(c) => Ok(SourceCursor::Bounded(c)),
             IndexScan::Empty => Ok(SourceCursor::Empty),
@@ -347,13 +328,15 @@ impl RelationRegistry {
         };
         // The index was dropped since the plan compiled.
         let Some(ic) = entry.index_circuit_on(col_indices) else {
-            return IndexScan::Decline(format!("No index on cols {col_indices:?} for table {table_id}"));
+            return IndexScan::Decline(StoreError::rejected(format!(
+                "No index on cols {col_indices:?} for table {table_id}"
+            )));
         };
         let (start, end) = match ic.key_spec.range_keys(ic.index_schema.pk_stride() as usize, range) {
             Ok(Some(keys)) => keys,
             Ok(None) => return IndexScan::Empty,
             // Malformed: `n_eq` pins every column with no range column left.
-            Err(e) => return IndexScan::Decline(e),
+            Err(e) => return IndexScan::Decline(StoreError::rejected(e)),
         };
         let end_bytes = end.as_ref().map(|e| e.pk_bytes());
         let idx = ic.open_cursor_in_range(start.pk_bytes(), end_bytes);
@@ -363,10 +346,12 @@ impl RelationRegistry {
             // implies a base store unless this process detached it (the post-fork
             // master), which degrades to the full scan like any other decline.
             let Some(store) = entry.owned_store() else {
-                return IndexScan::Decline("index owner holds no local base store".into());
+                return IndexScan::Decline(StoreError::rejected("index owner holds no local base store"));
             };
             if matches > store.estimated_rows() / INDEX_SCAN_RATIO {
-                return IndexScan::Decline("index range is not selective enough to pay for the walk".into());
+                return IndexScan::Decline(StoreError::rejected(
+                    "index range is not selective enough to pay for the walk",
+                ));
             }
         }
         IndexScan::Cursor(Box::new(BoundedIndexCursor::new(
@@ -375,7 +360,7 @@ impl RelationRegistry {
             start,
             end,
             ic.key_spec,
-            matches.min(self.scan_chunk_rows),
+            matches.min(self.config.scan_chunk_rows),
         )))
     }
 }
@@ -407,7 +392,7 @@ enum IndexScan {
     /// [`IndexWalk::Optional`] walk — an unselective range or an unowned base
     /// store. The opener answers an optional walk's decline with a full scan; a
     /// required one's it surfaces.
-    Decline(String),
+    Decline(StoreError),
 }
 
 /// Every live row of `pk`'s **group** off a cursor opened over it. A *group*,

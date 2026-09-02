@@ -1,10 +1,10 @@
-//! Secondary-index construction: opening an index table, the chunked base-table
-//! scan that projects into it, its two entry points (a fresh CREATE INDEX and
-//! the worker's boot rebuild), the UNIQUE promote, and FK auto-index creation.
+//! Secondary-index construction: the chunked base-table scan that projects into
+//! an index circuit's store, its two entry points (a fresh CREATE INDEX and the
+//! worker's boot rebuild), the UNIQUE promote, and FK auto-index creation. The
+//! store itself is the registry's — opened by `add_index`, rehomed by `rehome`.
 
 use super::*;
 use gnitz_store::schema::key::PkBuf;
-use gnitz_store::schema::make_index_schema;
 
 impl CatalogEngine {
     /// Locally retract an index registration whose +1 was applied but never
@@ -22,169 +22,73 @@ impl CatalogEngine {
         })
     }
 
-    /// Open this process's copy of a secondary-index table under `idx_dir` — the
-    /// one recipe for the live CREATE INDEX hook and the worker-boot rebuild, so
-    /// the two cannot diverge on where it is homed or on its resume gate.
-    ///
-    /// A forked worker homes at its own `w{rank}of{n}` child, like every other
-    /// relation store. The master and standalone home at `idx_dir` itself: the
-    /// master's copy stays permanently empty, and homing it at `w0of{n}` would
-    /// put it on the directory worker 0's inherited handle already holds.
-    pub(in crate::catalog) fn new_index_table(
-        &self,
-        idx_dir: &str,
-        index_id: i64,
-        idx_schema: SchemaDescriptor,
-    ) -> Result<Table, String> {
-        let table_dir = if gnitz_store::foundation::worker_ctx::is_worker() {
-            ChildAddr::this_worker(self.registry.num_workers()).dir(idx_dir)
-        } else {
-            idx_dir.to_string()
-        };
-        Table::new(&table_dir, idx_schema, index_id as u32, self.registry.rederive_source())
-            .map_err(|e| format!("Failed to create index table {index_id}: error {e}"))
-    }
-
     // -- Index backfill (scan source, project into index table) ------------
 
+    /// Fill the circuit on `cols` of `owner_id` from the owner's local slice.
+    /// The circuit is already entered — the projection ingests through it.
     pub(in crate::catalog) fn backfill_index(
         &mut self,
         owner_id: i64,
-        owner_schema: &SchemaDescriptor,
-        col_indices: &[u32],
-        idx_table: *mut Table,
-        idx_schema: &SchemaDescriptor,
-        check_dups: bool,
+        cols: &[u32],
+        pass: IndexPass,
     ) -> Result<(), String> {
-        // The relation filled here is the *index table* (`owner_id` is the
+        // The relation filled here is the *index store* (`owner_id` is the
         // indexed relation, a durable base table). Refused unless empty, in every
         // build: an index that resumed from its checkpoint already holds these
         // rows, and projecting them again would double every weight — a wrong
-        // answer no later check looks for.
-        if unsafe { &*idx_table }.estimated_rows() != 0 {
+        // answer no later check looks for. `estimated_rows` counts the memtable,
+        // so a store the hook just filled reads non-empty with no flush.
+        let held = self
+            .registry
+            .index_circuit_for_cols(owner_id, cols)
+            .ok_or_else(|| format!("backfill_index: no circuit on {cols:?} of {owner_id}"))?
+            .estimated_rows();
+        if held != 0 {
             return Err(format!(
                 "backfill_index into a non-empty index (owner {owner_id}): would double-count"
             ));
         }
-        // Built here, not read off a circuit: the fresh-index path runs before
-        // `add_index_circuit` registers one.
-        let target = IndexProjectionTarget {
-            cols: PkColList::from_slice(col_indices),
-            spec: gnitz_store::schema::IndexKeySpec::new(col_indices, owner_schema, idx_schema),
-            idx_schema: *idx_schema,
-            table: Some(idx_table),
-        };
-        self.stream_index_projection(owner_id, &[target], check_dups)
+        self.stream_index_projection(owner_id, &[PkColList::from_slice(cols)], pass)
     }
 
-    /// Worker-boot index rebuild: re-open every registered index circuit's Table
-    /// at this worker's own child (replacing the fork-inherited parent-dir one)
-    /// and, for each that did NOT resume from its checkpoint, backfill it from
-    /// the trimmed/rehomed base slice — one scan per owner table, each chunk
-    /// projected into the index tables that need filling. Must run after
-    /// trim/rehome and BEFORE SAL replay —
-    /// replay projects the unflushed committed tail into the index exactly once
-    /// through `ingest_store_and_indices`, so a rebuild *after* replay would
-    /// double-count every replayed row. Boot data was validated at original
-    /// write time and a slice-local check cannot see a duplicate that
-    /// legitimately straddles two workers' slices, so the rebuild skips the dup
-    /// check entirely. Fail-fast: an error aborts worker boot via the startup
-    /// ACK.
-    ///
-    /// Returns how many indexes were rebuilt rather than resumed — 0 on a clean
-    /// restart at the same topology.
-    ///
-    /// In a Standalone process this is a legal idempotent re-create-and-rebuild
-    /// at the parent dir — unit-testable without touching the global role.
+    /// Worker-boot index rebuild: fill every index store that neither resumed
+    /// from its checkpoint nor holds rows, from the rehomed base slice. Runs
+    /// BEFORE SAL replay, which projects the committed tail into the index once
+    /// more. Returns how many were filled — 0 on a clean restart at the same
+    /// topology, and 0 again on a repeat call, since a filled store is skipped.
     pub(crate) fn backfill_all_indexes(&mut self) -> Result<usize, String> {
-        // Snapshot the worklist first: each owner's rebuild mutably borrows
-        // self.dag (`replace_index_table`), so no borrow of the registry may be
-        // held across the loop. Only base tables carry index circuits, so
-        // views/system tables contribute nothing.
-        struct IndexWork {
-            cols: PkColList,
-            index_id: i64,
-            idx_schema: SchemaDescriptor,
-            key_spec: gnitz_store::schema::IndexKeySpec,
-        }
-        let worklist: Vec<(i64, String, Vec<IndexWork>)> = self
+        // Snapshotted: the projection mutably borrows `self`.
+        let worklist: Vec<(i64, Vec<PkColList>)> = self
             .registry
             .entries()
-            .filter(|(_, entry)| !entry.index_circuits.is_empty())
             .map(|(owner_id, entry)| {
-                let works = entry
+                let targets: Vec<PkColList> = entry
                     .index_circuits
                     .iter()
-                    .map(|ic| IndexWork {
-                        cols: ic.col_indices,
-                        index_id: ic.index_id,
-                        idx_schema: ic.index_schema,
-                        key_spec: ic.key_spec,
-                    })
+                    .filter(|ic| !ic.resumed_from_checkpoint() && ic.estimated_rows() == 0)
+                    .map(|ic| ic.col_indices)
                     .collect();
-                (owner_id, entry.directory.clone(), works)
+                (owner_id, targets)
             })
+            .filter(|(_, targets)| !targets.is_empty())
             .collect();
 
         let mut rebuilt = 0usize;
-        for (owner_id, owner_dir, works) in worklist {
-            // Re-create and install every index table before opening the scan;
-            // one base-slice scan then feeds the ones that must be re-derived.
-            let mut targets: Vec<IndexProjectionTarget> = Vec::new();
-            for w in &works {
-                let table = self
-                    .new_index_table(&index_dir(&owner_dir, w.index_id), w.index_id, w.idx_schema)
-                    .map_err(|e| format!("index table re-create failed (owner {owner_id}): {e}"))?;
-                let resumed = table.resumed_from_checkpoint();
-                let ptr = self
-                    .registry
-                    .replace_index_table(owner_id, w.cols.as_slice(), Box::new(table))
-                    .ok_or_else(|| format!("index circuit vanished during rebuild (owner {owner_id})"))?;
-                if !resumed {
-                    targets.push(IndexProjectionTarget {
-                        cols: w.cols,
-                        spec: w.key_spec,
-                        idx_schema: w.idx_schema,
-                        table: Some(ptr),
-                    });
-                }
-            }
+        for (owner_id, targets) in worklist {
             rebuilt += targets.len();
-            self.stream_index_projection(owner_id, &targets, false)?;
+            self.stream_index_projection(owner_id, &targets, IndexPass::Fill)?;
         }
         Ok(rebuilt)
     }
 
-    /// Shared streaming pass for `backfill_index`, `promote_index_to_unique`,
-    /// and the boot rebuild (`backfill_all_indexes`): scan `owner_id`
-    /// chunk-wise, project each chunk into every target's index layout, reject
-    /// duplicate keys when `check_dups`, and ingest each projected chunk into
-    /// the target's table when one is supplied. Peak memory is
-    /// O(chunk × row_width) plus, when checking, the per-target cross-chunk
-    /// `seen` set (one `PkBuf` per scanned key).
-    ///
-    /// `check_dups` is a caller policy (hoisted out of this function): the live
-    /// CREATE-INDEX/promote paths pass `is_unique && mode == Live` / `true`; the
-    /// worker/standalone boot rebuild passes `false`. A boot-replayed IDX_TAB
-    /// `+1` was validated at original write time and every later INSERT went
-    /// through the unique filter, so skipping the check at boot cannot admit a
-    /// duplicate; it only avoids carrying a `seen` set over every row. A slice-local
-    /// rebuild also cannot false-positive (a global duplicate may legitimately
-    /// straddle two workers' slices), so the boot skip is doubly justified. The
-    /// ingest is unconditional — it IS the ephemeral index rebuild/backfill.
-    ///
-    /// On a duplicate found mid-stream the partially-ingested index table is
-    /// discarded whole: it is ephemeral, registered nowhere, and
-    /// `hook_index_register`'s staged directory is removed as this error unwinds.
-    fn stream_index_projection(
-        &mut self,
-        owner_id: i64,
-        targets: &[IndexProjectionTarget],
-        check_dups: bool,
-    ) -> Result<(), String> {
+    /// One chunked scan of `owner_id`, each chunk projected into every target
+    /// circuit's index layout and handled as `pass` says. Peak memory is
+    /// O(chunk × row_width) plus, when checking, one `PkBuf` per scanned key.
+    fn stream_index_projection(&mut self, owner_id: i64, targets: &[PkColList], pass: IndexPass) -> Result<(), String> {
         if targets.is_empty() {
             return Ok(());
         }
+        let check_dups = pass != IndexPass::Fill;
         let chunk_rows = self.registry.scan_chunk_rows();
         let mut seen: Vec<rustc_hash::FxHashSet<PkBuf>> = if check_dups {
             targets.iter().map(|_| rustc_hash::FxHashSet::default()).collect()
@@ -196,18 +100,21 @@ impl CatalogEngine {
             return Ok(());
         };
         while let Some(chunk) = handle.drain_chunk(chunk_rows) {
-            for (ti, t) in targets.iter().enumerate() {
-                let projected = gnitz_store::storage::batch_project_index(&chunk, &t.spec, &t.idx_schema);
+            for (ti, cols) in targets.iter().enumerate() {
+                let ic = self
+                    .registry
+                    .index_circuit_for_cols(owner_id, cols.as_slice())
+                    .ok_or_else(|| format!("index circuit on {:?} of {owner_id} vanished", cols.as_slice()))?;
+                let projected = gnitz_store::storage::batch_project_index(&chunk, &ic.key_spec, &ic.index_schema);
                 if projected.is_empty() {
                     continue;
                 }
                 // The duplicate check applies to the full composite leading span.
-                if check_dups && projected_chunk_has_dup_keys(&projected, t.spec.key_size(), &mut seen[ti]) {
-                    return Err(self.unique_create_dup_err(owner_id, t.cols.as_slice()));
+                if check_dups && projected_chunk_has_dup_keys(&projected, ic.key_spec.key_size(), &mut seen[ti]) {
+                    return Err(self.unique_create_dup_err(owner_id, cols.as_slice()));
                 }
-                if let Some(table) = t.table {
-                    unsafe { &mut *table }
-                        .ingest_owned_batch(projected)
+                if pass != IndexPass::VerifyUnique {
+                    ic.ingest_owned_batch(projected)
                         .map_err(|e| format!("index backfill: ingest failed (owner {owner_id}): {e}"))?;
                 }
             }
@@ -219,8 +126,8 @@ impl CatalogEngine {
     /// the committed base rows contain no duplicate keys. Used when a UNIQUE index
     /// registers over a column that already has a circuit (an FK auto-index, or a
     /// prior non-unique index): the per-column dedup keeps one circuit, so the
-    /// uniqueness is folded into the incumbent — no second index table is built
-    /// (`make_index_schema` does not depend on `is_unique`; uniqueness is the flag
+    /// uniqueness is folded into the incumbent — no second index store is built
+    /// (the index schema does not depend on `is_unique`; uniqueness is the flag
     /// plus the duplicate check, not a different storage layout). Empty base table
     /// → pure flag flip. The verification scan runs on a first apply only: replayed
     /// and compensated data passed its duplicate check when originally written,
@@ -229,18 +136,10 @@ impl CatalogEngine {
     pub(in crate::catalog) fn promote_index_to_unique(
         &mut self,
         owner_id: i64,
-        owner_schema: &SchemaDescriptor,
         col_indices: &[u32],
     ) -> Result<(), String> {
         if self.ctx.mode() == ApplyMode::Live {
-            let idx_schema = make_index_schema(col_indices, owner_schema)?;
-            let target = IndexProjectionTarget {
-                cols: PkColList::from_slice(col_indices),
-                spec: gnitz_store::schema::IndexKeySpec::new(col_indices, owner_schema, &idx_schema),
-                idx_schema,
-                table: None,
-            };
-            self.stream_index_projection(owner_id, &[target], true)?;
+            self.stream_index_projection(owner_id, &[PkColList::from_slice(col_indices)], IndexPass::VerifyUnique)?;
         }
         self.registry.set_index_circuit_uniqueness(owner_id, col_indices, true);
         Ok(())
@@ -305,16 +204,19 @@ impl CatalogEngine {
     }
 }
 
-/// One index target of a `stream_index_projection` pass: the source column
-/// list (for the duplicate-violation message), the span encode plan, the
-/// index layout to project into, and — for the backfill/rebuild callers —
-/// the index table each projected chunk is ingested into (`None` = check-only,
-/// the promote path).
-struct IndexProjectionTarget {
-    cols: PkColList,
-    spec: gnitz_store::schema::IndexKeySpec,
-    idx_schema: SchemaDescriptor,
-    table: Option<*mut Table>,
+/// What one `stream_index_projection` pass does with each projected chunk. The
+/// boot rebuild only fills: its rows passed the unique check when first
+/// written, and a slice-local check cannot see a duplicate straddling two
+/// workers' slices.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::catalog) enum IndexPass {
+    /// Ingest through the circuit.
+    Fill,
+    /// Ingest, refusing a duplicate leading key — a live CREATE UNIQUE INDEX.
+    FillUnique,
+    /// Refuse a duplicate leading key and ingest nothing — a UNIQUE promotion
+    /// of an already-filled circuit.
+    VerifyUnique,
 }
 
 /// True if a positive-weight row in a projected index chunk shares its leading

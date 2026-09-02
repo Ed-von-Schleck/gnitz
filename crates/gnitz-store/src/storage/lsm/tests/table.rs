@@ -21,9 +21,17 @@ fn make_batch(rows: &[(u64, i64, i64)]) -> Batch {
     make_batch_raw(&make_schema_u64_i64(), rows)
 }
 
-/// `Table::with_memtable_budget(...)` with the per-test boilerplate folded away.
+/// A memtable budget of `bytes` at the default RAM-tier ceiling.
+fn memtable(bytes: usize) -> RamBudgets {
+    RamBudgets {
+        memtable_bytes: bytes,
+        ..Default::default()
+    }
+}
+
+/// `Table::with_budgets(...)` with the per-test boilerplate folded away.
 fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, id: u32, budget: usize, rs: RecoverySource) -> Table {
-    Table::with_memtable_budget(dir.to_str().unwrap(), schema, id, budget, rs).unwrap()
+    Table::with_budgets(dir.to_str().unwrap(), schema, id, rs, memtable(budget)).unwrap()
 }
 
 /// Compaction output rather than flat spill? The `_L` level segment separates
@@ -674,7 +682,7 @@ fn nondurable_run_count_stays_bounded() {
     }
 }
 
-/// A flush past `INMEM_CEILING` (shrunk via the test seam) spills the
+/// A flush past the RAM-tier ceiling (shrunk via the test seam) spills the
 /// folded run to a `shard_{tid}_{lsn}` file, drains heap, and keeps rows
 /// readable.
 #[test]
@@ -1407,12 +1415,12 @@ fn rederive_checkpointed_rebuilds_on_a_damaged_manifest() {
         (tdir, manifest)
     };
     let reopen = |tdir: &std::path::Path| {
-        Table::with_memtable_budget(
+        Table::with_budgets(
             tdir.to_str().unwrap(),
             schema,
             table_id,
-            96,
             RecoverySource::Rederive { resume_at: Some(7) },
+            memtable(96),
         )
     };
 

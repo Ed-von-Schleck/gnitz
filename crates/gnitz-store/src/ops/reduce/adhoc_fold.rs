@@ -33,19 +33,7 @@ use super::plan::ReducePlan;
 use super::sort::compare_by_group_cols;
 use crate::schema::key::NarrowPkOpk;
 use crate::schema::{ReduceOutKey, SchemaDescriptor};
-use crate::storage::Batch;
-
-/// Default per-worker distinct-group cap for the ad-hoc aggregate fold. Bounds
-/// the accumulator matrix at `cap × aggregates × size_of::<Accumulator>()`.
-const ADHOC_GROUP_CAP: usize = 65_536;
-
-/// [`ADHOC_GROUP_CAP`] with its `GNITZ_ADHOC_GROUP_CAP` override, read once per
-/// process. Beside the fold it bounds rather than on the registry: the read
-/// rung's one `AdhocFold::new` call is its whole reader set.
-pub(crate) fn adhoc_group_cap() -> usize {
-    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| crate::foundation::env::env_num("GNITZ_ADHOC_GROUP_CAP", ADHOC_GROUP_CAP))
-}
+use crate::storage::{Batch, StoreError};
 
 /// The request-scoped fold state. `pub(crate)` so `read::scan_spec` can drive
 /// it; every reduce building block it composes is reached at `pub(super)` from
@@ -87,14 +75,16 @@ impl AdhocFold {
         reply_schema: &SchemaDescriptor,
         agg: &AggReadSpec,
         group_cap: usize,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, StoreError> {
         let n_cols = src_schema.num_columns();
 
         let mut group_cols = Vec::with_capacity(agg.group_cols.len());
         for &c in &agg.group_cols {
             let c = c as usize;
             if c >= n_cols {
-                return Err(format!("scan_spec fold: group column {c} out of range ({n_cols} cols)"));
+                return Err(StoreError::rejected(format!(
+                    "scan_spec fold: group column {c} out of range ({n_cols} cols)"
+                )));
             }
             group_cols.push(c as u32);
         }
@@ -103,7 +93,9 @@ impl AdhocFold {
         for item in &agg.aggs {
             let c = item.src_col as usize;
             if c >= n_cols {
-                return Err(format!("scan_spec fold: agg column {c} out of range ({n_cols} cols)"));
+                return Err(StoreError::rejected(format!(
+                    "scan_spec fold: agg column {c} out of range ({n_cols} cols)"
+                )));
             }
             agg_descs.push(AggDescriptor {
                 col_idx: c as u32,
@@ -125,9 +117,11 @@ impl AdhocFold {
             false, // global_ground — the client synthesizes the empty-input ground row
             false, // i_am_owner
         )
-        .map_err(str::to_string)?;
+        .map_err(StoreError::rejected)?;
         if !reply_schema.same_physical_layout(&plan.output_schema) {
-            return Err("scan_spec fold: reply schema does not match the derived fold layout".to_string());
+            return Err(StoreError::rejected(
+                "scan_spec fold: reply schema does not match the derived fold layout",
+            ));
         }
 
         Ok(AdhocFold {
@@ -148,7 +142,7 @@ impl AdhocFold {
     /// The whole list rather than one range: a fragmented survivor list would
     /// otherwise repay the per-call setup — the state destructure, the keyer and
     /// the two batch views — once per range instead of once per chunk.
-    pub(crate) fn fold_ranges(&mut self, chunk: &Batch, ranges: &[(usize, usize)]) -> Result<(), String> {
+    pub(crate) fn fold_ranges(&mut self, chunk: &Batch, ranges: &[(usize, usize)]) -> Result<(), StoreError> {
         let Self {
             plan,
             rep_rows,
@@ -218,10 +212,10 @@ impl AdhocFold {
                             // degradation.
                             let ord = rep_rows.count;
                             if ord >= *group_cap {
-                                return Err(format!(
+                                return Err(StoreError::rejected(format!(
                                     "GROUP BY exceeds {group_cap} distinct groups for ad-hoc execution; \
                                      CREATE VIEW to maintain this aggregation incrementally"
-                                ));
+                                )));
                             }
                             rep_rows.append_batch(chunk, row, row + 1);
                             new_accs(accs);

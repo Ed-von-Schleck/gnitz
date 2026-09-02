@@ -1,6 +1,10 @@
 use super::*;
 use crate::storage::RecoverySource;
 
+fn solo_registry() -> RelationRegistry {
+    RelationRegistry::new(Slot::SOLO, StoreConfig::default())
+}
+
 /// A scratch directory for one test. `scratch_dir` removes it on entry, so
 /// nothing here cleans up on exit: the dirs are small, carry no SAL, and
 /// surviving a run is what makes a failure investigable.
@@ -14,19 +18,22 @@ fn make_test_table(name: &str) -> Box<Table> {
     Box::new(Table::new(&dir, schema, 99, RecoverySource::Rederive { resume_at: None }).unwrap())
 }
 
-/// Enter `id` over an already-opened table the registry then owns.
+/// Enter `id` over an already-opened table the registry then owns. `directory`
+/// is what an `add_index` on it creates `idx_<id>` under; every other caller
+/// passes an empty one.
 fn register_entry(
     registry: &mut RelationRegistry,
     id: i64,
     table: Box<Table>,
     schema: SchemaDescriptor,
     kind: RelationKind,
+    directory: String,
 ) {
     let spec = RelationSpec {
         id,
         kind,
         schema,
-        directory: String::new(),
+        directory,
         depth: 0,
         budgets: ViewBudgets::default(),
     };
@@ -35,10 +42,10 @@ fn register_entry(
 
 #[test]
 fn test_register_unregister_table() {
-    let mut registry = RelationRegistry::new(1);
+    let mut registry = solo_registry();
     let schema = SchemaDescriptor::minimal_u64();
     let tbl = make_test_table("reg_unreg");
-    register_entry(&mut registry, 100, tbl, schema, RelationKind::BaseTable);
+    register_entry(&mut registry, 100, tbl, schema, RelationKind::BaseTable, String::new());
     assert!(registry.has_id(100));
 
     registry.unregister(100);
@@ -47,7 +54,7 @@ fn test_register_unregister_table() {
 
 #[test]
 fn test_add_remove_index_circuit() {
-    let mut registry = RelationRegistry::new(1);
+    let mut registry = solo_registry();
     // A real 3-column owner schema: registration precomputes the circuit's
     // `key_spec` from it, which locates indexed column 2.
     let schema = SchemaDescriptor::new(
@@ -55,9 +62,9 @@ fn test_add_remove_index_circuit() {
         &[0],
     );
     let tbl = make_test_table("idx_parent");
-    register_entry(&mut registry, 50, tbl, schema, RelationKind::BaseTable);
-    let idx_tbl = make_test_table("idx_child");
-    registry.add_index_circuit(50, &[2], 999, idx_tbl, schema, false);
+    let owner_dir = relation_test_dir("idx_parent_owner");
+    register_entry(&mut registry, 50, tbl, schema, RelationKind::BaseTable, owner_dir);
+    registry.add_index(50, 999, &[2], false).unwrap();
     assert_eq!(registry.index_circuits(50).len(), 1);
 
     registry.remove_index_circuit(50, &[2]);
@@ -65,9 +72,11 @@ fn test_add_remove_index_circuit() {
     registry.close();
 }
 
+/// An index store is rederived, so a base round only folds it to RAM; the
+/// ephemeral round is what force-persists it, index circuits included.
 #[test]
-fn test_flush_includes_index_circuits() {
-    let mut registry = RelationRegistry::new(1);
+fn ephemeral_flush_includes_index_circuits() {
+    let mut registry = solo_registry();
     // A real 2-column owner schema: registration precomputes the circuit's
     // `key_spec` from it, which locates indexed column 1.
     let parent_schema = SchemaDescriptor::new(
@@ -75,32 +84,40 @@ fn test_flush_includes_index_circuits() {
         &[0],
     );
     let tbl = make_test_table("flush_ic_parent");
-    register_entry(&mut registry, 70, tbl, parent_schema, RelationKind::BaseTable);
-
-    // Durable index table: flush writes shard_*.db only if called.
-    let idx_schema = SchemaDescriptor::minimal_u64();
-    let idx_dir = relation_test_dir("flush_ic_idx");
-    let idx_tbl = Box::new(Table::new(&idx_dir, idx_schema, 1, RecoverySource::SalReplay).unwrap());
-    registry.add_index_circuit(70, &[1], 999, idx_tbl, idx_schema, false);
+    let owner_dir = relation_test_dir("flush_ic_owner");
+    register_entry(
+        &mut registry,
+        70,
+        tbl,
+        parent_schema,
+        RelationKind::BaseTable,
+        owner_dir.clone(),
+    );
+    registry.add_index(70, 999, &[1], false).unwrap();
 
     // Put one row in the index table's memtable.
     {
-        let entry = registry.table_entry(70).unwrap();
-        let mut batch = Batch::with_capacity(idx_schema, 1);
+        let ic = registry.index_circuit_for_cols(70, &[1]).unwrap();
+        let mut batch = Batch::with_capacity(ic.index_schema, 1);
         batch.extend_pk(1u128);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());
         batch.count += 1;
-        entry.index_circuits[0].ingest_owned_batch(batch).unwrap();
+        ic.ingest_owned_batch(batch).unwrap();
     }
 
-    registry.flush(70).unwrap();
-    let shard_count = std::fs::read_dir(&idx_dir)
+    registry.flush_ephemeral_outputs(1).unwrap();
+    let idx_dir = ChildAddr::Index { id: 999 }.dir(&owner_dir);
+    let store_dir = ChildAddr::worker(Slot::SOLO).dir(&idx_dir);
+    let shard_count = std::fs::read_dir(&store_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_str().unwrap_or("").starts_with("shard_"))
         .count();
-    assert!(shard_count > 0, "index circuit shard must be written by flush");
+    assert!(
+        shard_count > 0,
+        "the ephemeral round must publish the index circuit's shard"
+    );
 
     registry.close();
 }
@@ -111,7 +128,7 @@ fn test_flush_includes_index_circuits() {
 /// folds them to nothing and the feed is the only place they survive.
 #[test]
 fn a_fed_view_retains_each_round_at_its_own_weight() {
-    let mut registry = RelationRegistry::new(1);
+    let mut registry = solo_registry();
     let schema = SchemaDescriptor::minimal_u64();
     let vid = gnitz_wire::FIRST_USER_TABLE_ID as i64;
     registry
@@ -192,13 +209,13 @@ fn ingest_apply_error_returned_internal() {
     if !crate::test_support::in_child_test() {
         return;
     }
-    let mut registry = RelationRegistry::new(1);
+    let mut registry = solo_registry();
     let schema = SchemaDescriptor::minimal_u64();
     let dir = relation_test_dir("seam_abort");
     let tbl = Box::new(Table::new(&dir, schema, 99, RecoverySource::Rederive { resume_at: None }).unwrap());
     // A user id: the public ingest entry rejects the system band outright.
     let tid = gnitz_wire::FIRST_USER_TABLE_ID as i64;
-    register_entry(&mut registry, tid, tbl, schema, RelationKind::View);
+    register_entry(&mut registry, tid, tbl, schema, RelationKind::View, String::new());
     let mut batch = Batch::with_capacity(schema, 1);
     batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());
@@ -207,7 +224,10 @@ fn ingest_apply_error_returned_internal() {
     assert!(
         matches!(
             registry.ingest_returning_effective(tid, batch, false),
-            Err(IngestError::Storage(crate::storage::StorageError::Io(_)))
+            Err(StoreError::Storage {
+                err: crate::storage::StorageError::Io(_),
+                ..
+            })
         ),
         "ingest_store_and_indices must return the storage error when the seam is armed",
     );

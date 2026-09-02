@@ -21,7 +21,7 @@ mod store_io;
 pub use store_io::IndexWalk;
 
 use crate::relation::RelationRegistry;
-use crate::storage::Batch;
+use crate::storage::{Batch, StoreError};
 
 /// Recompute the payload of `keys` from the view's own maintained state — the
 /// source store for a linear body, the two `integrate_trace` tables for an
@@ -37,6 +37,5 @@ pub trait SkeletonHydrator {
         view_id: i64,
         keys: Vec<u8>,
         coarse: &[i64],
-        chunk_rows: usize,
-    ) -> Result<Batch, String>;
+    ) -> Result<Batch, StoreError>;
 }

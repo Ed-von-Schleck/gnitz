@@ -33,6 +33,7 @@
 
 use std::os::fd::{AsRawFd, OwnedFd};
 
+use super::error::StoreError;
 use super::repr::heap::{HeapNode, LoserTree};
 use crate::foundation::posix_io;
 use crate::foundation::posix_io::{Advice, Mmap};
@@ -106,7 +107,7 @@ impl SpillSort {
     /// Append one `stride`-byte record; spill a sorted run once the buffer
     /// reaches the byte budget. Duplicates are preserved at full multiplicity;
     /// copies split across runs are still merged adjacently by `finish`.
-    pub fn push(&mut self, record: &[u8]) -> Result<(), String> {
+    pub fn push(&mut self, record: &[u8]) -> Result<(), StoreError> {
         debug_assert_eq!(record.len(), self.stride);
         self.flat.extend_from_slice(record);
         if self.flat.len() >= self.budget {
@@ -116,10 +117,14 @@ impl SpillSort {
     }
 
     /// Lazily open the anonymous spill file in `dir`, returning its raw fd.
-    fn ensure_spill_fd(&mut self) -> Result<i32, String> {
+    fn ensure_spill_fd(&mut self) -> Result<i32, StoreError> {
         if self.spill.is_none() {
-            let fd = posix_io::open_tmpfile(&self.dir)
-                .map_err(|e| format!("external sort: cannot create spill file in {}: {e}", self.dir))?;
+            let fd = posix_io::open_tmpfile(&self.dir).map_err(|e| {
+                StoreError::storage(
+                    format!("external sort: cannot create spill file in {}", self.dir),
+                    e.into(),
+                )
+            })?;
             self.spill = Some(fd);
         }
         Ok(self.spill.as_ref().unwrap().as_raw_fd())
@@ -127,7 +132,7 @@ impl SpillSort {
 
     /// Sort the accumulated buffer and append it to the spill file as one run.
     /// No-op on an empty buffer, so a run in `runs` always has `>= 1` record.
-    fn spill_run(&mut self) -> Result<(), String> {
+    fn spill_run(&mut self) -> Result<(), StoreError> {
         let n = self.flat.len() / self.stride;
         if n == 0 {
             return Ok(());
@@ -143,7 +148,8 @@ impl SpillSort {
         // `write_all_fd` fully writes or returns an error, so a short/ENOSPC
         // write becomes an `Err` here and the sort aborts before the merge —
         // a truncated (misaligned) run can never reach it.
-        posix_io::write_all_fd(fd, &self.scratch).map_err(|e| format!("external sort: spill write failed: {e}"))?;
+        posix_io::write_all_fd(fd, &self.scratch)
+            .map_err(|e| StoreError::storage("external sort: spill write failed", e.into()))?;
         self.runs.push(n);
         self.flat.clear();
         Ok(())
@@ -153,7 +159,7 @@ impl SpillSort {
     /// path (nothing spilled) it sorts the in-RAM buffer; otherwise it spills
     /// the final partial run, `mmap`s the spill file, and primes the k-way
     /// merge. The last fallible I/O happens here — the producer is infallible.
-    pub fn finish(mut self) -> Result<KeyProducer, String> {
+    pub fn finish(mut self) -> Result<KeyProducer, StoreError> {
         if self.runs.is_empty() {
             let mut idx = Vec::new();
             sort_indices(&self.flat, self.stride, &mut idx);
@@ -171,7 +177,7 @@ impl SpillSort {
         let total: usize = self.runs.iter().sum();
         let fd = self.spill.as_ref().expect("spill fd after >= 1 run").as_raw_fd();
         let map = Mmap::from_fd(fd, total * stride, Advice::Sequential)
-            .map_err(|e| format!("external sort: mmap spill file failed: {e}"))?;
+            .map_err(|e| StoreError::storage("external sort: mmap spill file failed", e.into()))?;
 
         // Per-run geometry: byte offset of each run's first record and its
         // record count. Runs are non-empty, so every source primes at row 0.

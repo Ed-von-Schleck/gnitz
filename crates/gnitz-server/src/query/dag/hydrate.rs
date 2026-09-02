@@ -18,7 +18,7 @@
 use super::*;
 use crate::query::compiler::{HydrationSeed, Sides};
 use gnitz_store::read::SkeletonHydrator;
-use gnitz_store::storage::PkSetGather;
+use gnitz_store::storage::{PkSetGather, StoreError};
 
 /// Recompute the output rows of the capacity-bounded view `view_id` for `keys`
 /// — the flat concatenation of the OPK images, ascending — whose per-key coarse
@@ -27,8 +27,9 @@ use gnitz_store::storage::PkSetGather;
 /// `keys` is taken by value because the gather below owns its key list; the
 /// caller built the buffer for this call and has no further use for it.
 ///
-/// `chunk_rows` bounds the seed batch only; `JoinDT`'s cogroup accepts
-/// multi-key deltas, so the chunking costs nothing but peak memory.
+/// The registry's `scan_chunk_rows` bounds the seed batch only; `JoinDT`'s
+/// cogroup accepts multi-key deltas, so the chunking costs nothing but peak
+/// memory.
 impl SkeletonHydrator for DagEngine {
     fn hydrate_keys(
         &mut self,
@@ -36,20 +37,21 @@ impl SkeletonHydrator for DagEngine {
         view_id: i64,
         keys: Vec<u8>,
         coarse: &[i64],
-        chunk_rows: usize,
-    ) -> Result<Batch, String> {
+    ) -> Result<Batch, StoreError> {
         let Some(view_schema) = registry.get_schema_desc(view_id) else {
-            return Err(format!("hydrate: view {view_id} is not a registered relation"));
+            return Err(StoreError::rejected(format!(
+                "hydrate: view {view_id} is not a registered relation"
+            )));
         };
         // The plan cache is lazy and is dropped on every rebuild, so a read
         // arriving before the view's first tick would otherwise find nothing.
         // `Ok(false)` is that same registry lookup, which the check above already
         // passed, so only a real compile failure leaves here.
-        let compiled = self.ensure_compiled(registry, view_id)?;
+        let compiled = self.ensure_compiled(registry, view_id).map_err(StoreError::rejected)?;
         debug_assert!(compiled, "ensure_compiled false for a registered view");
-        let hydration = self.cache[&view_id]
-            .hydration
-            .ok_or_else(|| format!("hydrate: view {view_id} was not compiled as capacity-bounded"))?;
+        let hydration = self.cache[&view_id].hydration.ok_or_else(|| {
+            StoreError::rejected(format!("hydrate: view {view_id} was not compiled as capacity-bounded"))
+        })?;
 
         let mut out = Batch::empty_with_schema(&view_schema);
         if keys.is_empty() {
@@ -67,16 +69,18 @@ impl SkeletonHydrator for DagEngine {
         // run below.
         let plan = self.cache.get_mut(&view_id).expect("ensure_compiled inserted the plan");
         if !matches!(plan.sides, Sides::Unexchanged) {
-            return Err(format!("hydrate: view {view_id} is not a single-phase plan"));
+            return Err(StoreError::rejected(format!(
+                "hydrate: view {view_id} is not a single-phase plan"
+            )));
         }
         let sub = &mut plan.post;
         let seed_schema = sub.vm.program.reg_meta[hydration.in_reg as usize].schema;
         // The gather opens over the range its own key list spans.
         let mut gather = match hydration.seed {
             HydrationSeed::Relation(source) => {
-                let entry = registry
-                    .table_entry(source)
-                    .map_err(|_| format!("hydrate: view {view_id} source {source} is unregistered"))?;
+                let entry = registry.table_entry(source).map_err(|_| {
+                    StoreError::rejected(format!("hydrate: view {view_id} source {source} is unregistered"))
+                })?;
                 // A linear view's physical PK is the leading source-PK columns,
                 // byte-identical to the source PK, so the store's own keys index
                 // the source directly.
@@ -88,10 +92,10 @@ impl SkeletonHydrator for DagEngine {
             }
         };
         let mut replay = vm::Replay::start(&mut sub.vm, hydration.start_pc);
-        while let Some(seed) = gather.next_chunk(chunk_rows) {
+        while let Some(seed) = gather.next_chunk(registry.scan_chunk_rows()) {
             let produced = replay
                 .chunk((hydration.in_reg, seed))
-                .map_err(|e| format!("hydrate: view {view_id} replay failed: {e}"))?;
+                .map_err(|e| StoreError::rejected(format!("hydrate: view {view_id} replay failed: {e}")))?;
             if let Some(b) = produced {
                 debug_assert!(
                     b.schema.same_physical_layout(&view_schema),

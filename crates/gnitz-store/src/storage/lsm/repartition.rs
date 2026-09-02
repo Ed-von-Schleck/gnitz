@@ -17,7 +17,7 @@ use std::ffi::{CStr, CString};
 
 use super::batch::Batch;
 use super::child_dir::{link_child, remove_child, ChildAddr};
-use super::error::StorageError;
+use super::error::{StorageError, StoreError};
 use super::flush_barrier::LazyRing;
 use super::manifest::{self, ManifestEntryRaw, ManifestHeader};
 use super::read_cursor::{self, ReadCursor};
@@ -107,7 +107,7 @@ enum Layout {
 /// `Err` names a directory in no child grammar: a relation whose layout this
 /// build cannot read must refuse to boot rather than come up empty with its rows
 /// still on disk and unreferenced.
-fn classify(rel_dir: &str, launched: u32, replicated: bool) -> Result<Layout, String> {
+fn classify(rel_dir: &str, launched: u32, replicated: bool) -> Result<Layout, StoreError> {
     let names = super::child_dir::subdir_names(rel_dir);
     let mut workers: Vec<(u32, u32)> = Vec::new();
     for name in &names {
@@ -117,11 +117,11 @@ fn classify(rel_dir: &str, launched: u32, replicated: bool) -> Result<Layout, St
             Some(ChildAddr::Worker { rank, of }) => workers.push((rank, of)),
             Some(_) => {}
             None => {
-                return Err(format!(
+                return Err(StoreError::rejected(format!(
                     "{rel_dir}/{name} is in no child-directory grammar this build knows; \
                      it may hold rows written by an incompatible layout. Refusing to boot — \
                      delete the relation directory deliberately if the data is expendable."
-                ))
+                )))
             }
         }
     }
@@ -138,9 +138,10 @@ fn classify(rel_dir: &str, launched: u32, replicated: bool) -> Result<Layout, St
     workers.sort_unstable();
     let mut sets: HashMap<u32, SetSurvey> = HashMap::new();
     for &(rank, of) in &workers {
-        let cpath = super::cstr(ChildAddr::Worker { rank, of }.manifest(rel_dir)).map_err(|e| e.to_string())?;
-        let Some((entries, header)) = manifest::read_file(&cpath)
-            .map_err(|e| format!("repartition {rel_dir}: unreadable manifest in w{rank}of{of}: error {e}"))?
+        let context = || format!("repartition {rel_dir}: manifest of w{rank}of{of}");
+        let cpath = super::cstr(ChildAddr::Worker { rank, of }.manifest(rel_dir))
+            .map_err(|e| StoreError::storage(context(), e))?;
+        let Some((entries, header)) = manifest::read_file(&cpath).map_err(|e| StoreError::storage(context(), e))?
         else {
             continue;
         };
@@ -204,15 +205,15 @@ pub fn repartition_relation(
     schema: &SchemaDescriptor,
     table_id: u32,
     launched: u32,
-) -> Result<(), String> {
+) -> Result<(), StoreError> {
     let replicated = schema.placement().is_replicated();
     let source = match classify(rel_dir, launched, replicated)? {
         Layout::Current => return Ok(()),
         Layout::Unplaceable(counts) => {
-            return Err(format!(
+            return Err(StoreError::rejected(format!(
                 "{rel_dir} holds checkpointed children laid out for {counts:?} worker(s) but no complete \
                  set at any of them; launching {launched}, its rows cannot be placed. Refusing to boot."
-            ))
+            )))
         }
         Layout::Relay(source) => source,
     };
@@ -239,13 +240,13 @@ pub fn repartition_relation(
     } else {
         rewrite_targets(rel_dir, schema, table_id, &source, launched, seq)
     };
-    result.map_err(|e| format!("repartition {rel_dir} to {launched} worker(s): error {e}"))?;
+    let context = || format!("repartition {rel_dir} to {launched} worker(s)");
+    result.map_err(|e| StoreError::storage(context(), e))?;
 
     // Makes the target children's directory entries durable — nothing else
     // does, and the source unlinks below are. A swallowed failure here is the
     // whole relation, so it propagates.
-    super::child_dir::fsync_dir(rel_dir)
-        .map_err(|e| format!("repartition {rel_dir}: fsync of the relation directory failed: error {e}"))?;
+    super::child_dir::fsync_dir(rel_dir).map_err(|e| StoreError::storage(context(), e))?;
 
     // Only now that every target child carries a durable manifest.
     remove_set(rel_dir, source.of);

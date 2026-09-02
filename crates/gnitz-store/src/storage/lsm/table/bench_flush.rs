@@ -9,7 +9,7 @@
 
 use super::super::batch::Batch;
 use super::super::run_set::FOLD_THRESHOLD;
-use super::{RecoverySource, Table};
+use super::{RamBudgets, RecoverySource, Table};
 use crate::schema::SchemaDescriptor;
 use crate::test_support::pk_u64_two_i64_schema;
 
@@ -96,6 +96,17 @@ enum Gen {
 /// filesystem when `GNITZ_BENCH_DIR` names one, because shard bytes are what
 /// they count and a tmpfs prices them differently. `tmp` owns the fallback root
 /// and so must outlive the returned path.
+/// The default budgets with `GNITZ_RAM_TIER_BYTES` applied: these benches
+/// measure RAM-tier fold and compaction behaviour, so the tier is what a run
+/// shrinks to reach the disk regime.
+fn bench_budgets() -> RamBudgets {
+    let defaults = RamBudgets::default();
+    RamBudgets {
+        ram_tier_bytes: crate::foundation::env::env_num("GNITZ_RAM_TIER_BYTES", defaults.ram_tier_bytes),
+        ..defaults
+    }
+}
+
 fn bench_dir(tmp: &tempfile::TempDir, name: String) -> std::path::PathBuf {
     let root = std::env::var("GNITZ_BENCH_DIR").unwrap_or_else(|_| tmp.path().to_str().unwrap().to_string());
     let dir = std::path::Path::new(&root).join(name);
@@ -134,11 +145,12 @@ fn flush_cadence_amplification_bench() {
     // Untimed warmup: warm the thread-local batch pool before the first config.
     {
         let dir = tempfile::tempdir().unwrap();
-        let mut table = Table::new(
+        let mut table = Table::with_budgets(
             dir.path().join("warmup").to_str().unwrap(),
             schema,
             1,
             RecoverySource::Rederive { resume_at: None },
+            bench_budgets(),
         )
         .unwrap();
         for batch in gen_distinct(&schema, 4, 50) {
@@ -166,11 +178,12 @@ fn flush_cadence_amplification_bench() {
         let ingested: usize = ticks.iter().map(|b| b.count).sum();
 
         let dir = tempfile::tempdir().unwrap();
-        let mut table = Table::new(
+        let mut table = Table::with_budgets(
             dir.path().join(label).to_str().unwrap(),
             schema,
             100 + id as u32,
             RecoverySource::Rederive { resume_at: None },
+            bench_budgets(),
         )
         .unwrap();
 
@@ -242,11 +255,12 @@ fn compaction_amplification_bench() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = bench_dir(&tmp, format!("wa_{ticks_n}_{keyspace}"));
 
-    let mut table = Table::new(
+    let mut table = Table::with_budgets(
         dir.to_str().unwrap(),
         schema,
         7,
         RecoverySource::Rederive { resume_at: None },
+        bench_budgets(),
     )
     .unwrap();
 
@@ -327,7 +341,14 @@ fn filter_share_of_compaction() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = bench_dir(&tmp, format!("fs_{ticks_n}_{}", filter_off as u8));
 
-    let mut table = Table::new(dir.to_str().unwrap(), schema, 9, RecoverySource::SalReplay).unwrap();
+    let mut table = Table::with_budgets(
+        dir.to_str().unwrap(),
+        schema,
+        9,
+        RecoverySource::SalReplay,
+        bench_budgets(),
+    )
+    .unwrap();
     // The off arm. Force-off only: every store that skips by policy is
     // `Rederive` and never carries a base-table workload, so forcing a filter
     // *on* would measure nothing.

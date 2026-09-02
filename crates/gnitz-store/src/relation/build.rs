@@ -17,7 +17,7 @@ impl RelationRegistry {
     ///
     /// Opens through [`staged_dir`], so a directory this call creates is removed
     /// again if the open fails and has its parent fsynced if it succeeds.
-    pub fn register(&mut self, spec: RelationSpec) -> Result<(), String> {
+    pub fn register(&mut self, spec: RelationSpec) -> Result<(), StoreError> {
         let stores = staged_dir(&spec.directory, || {
             self.build_relation_store(spec.kind, &spec.directory, spec.id, spec.schema, spec.budgets)
         })?;
@@ -26,7 +26,7 @@ impl RelationRegistry {
     }
 
     /// Build this process's store for a top-level relation: one `Table` under
-    /// `w{rank}of{num_workers}`. Only user relations are built here — system
+    /// this slot's `w{rank}of{n}` child. Only user relations are built here — system
     /// catalog tables are plain single `Table`s built at bootstrap.
     ///
     /// The `match kind` below is the one place a per-kind property is derived,
@@ -54,7 +54,7 @@ impl RelationRegistry {
         id: i64,
         schema: SchemaDescriptor,
         budgets: ViewBudgets,
-    ) -> Result<RelationStores, String> {
+    ) -> Result<RelationStores, StoreError> {
         // Above every early return below, so it runs on **every** process: the
         // post-fork master opens no user store at all, and a limit first noticed
         // on a worker would be a fatal abort taken after the client was told the
@@ -64,7 +64,9 @@ impl RelationRegistry {
             .map(|budget| {
                 crate::schema::make_delta_schema(&schema)
                     .map(|delta_schema| (budget, delta_schema))
-                    .ok_or_else(|| format!("view {id} has too many columns to carry a delta feed"))
+                    .ok_or_else(|| {
+                        StoreError::rejected(format!("view {id} has too many columns to carry a delta feed"))
+                    })
             })
             .transpose()?;
 
@@ -91,16 +93,16 @@ impl RelationRegistry {
             }
         }
 
-        let child = ChildAddr::this_worker(self.num_workers);
-        let mut table = Table::new(&child.dir(directory), schema, id as u32, recovery)
-            .map_err(|e| format!("Failed to open relation {id}: error {e} (dir={directory})"))?;
+        let child = ChildAddr::worker(self.slot);
+        let mut table = Table::with_budgets(&child.dir(directory), schema, id as u32, recovery, self.config.ram)
+            .map_err(|e| StoreError::storage(format!("open relation {id} (dir={directory})"), e))?;
         // Every store this worker opens for a relation comes through here, so a
         // bounded view cannot come back unbounded from a rehome or a rebuild.
         table.set_capacity(budgets.capacity_bytes);
         Ok(RelationStores {
             handle: StoreHandle::owned(Box::new(table)),
             delta: delta
-                .map(|(budget, s)| Self::build_delta_store(directory, id, s, budget))
+                .map(|(budget, s)| Self::build_delta_store(self.slot, self.config.ram, directory, id, s, budget))
                 .transpose()?,
         })
     }
@@ -113,19 +115,22 @@ impl RelationRegistry {
     /// view, and a restart mints a fresh boot nonce, so every cursor a client
     /// holds stops matching and it re-reads at `after_tick = 0`.
     fn build_delta_store(
+        slot: Slot,
+        ram: RamBudgets,
         directory: &str,
         id: i64,
         delta_schema: SchemaDescriptor,
         budget: u64,
-    ) -> Result<Box<DeltaFeed>, String> {
-        let child = ChildAddr::delta_for_this_worker();
-        let mut table = Table::new(
+    ) -> Result<Box<DeltaFeed>, StoreError> {
+        let child = ChildAddr::delta(slot);
+        let mut table = Table::with_budgets(
             &child.dir(directory),
             delta_schema,
             id as u32,
             RecoverySource::Rederive { resume_at: None },
+            ram,
         )
-        .map_err(|e| format!("Failed to open delta store of view {id}: error {e} (dir={directory})"))?;
+        .map_err(|e| StoreError::storage(format!("open delta store of view {id} (dir={directory})"), e))?;
         table.set_delta_budget(budget);
         Ok(Box::new(DeltaFeed {
             schema: delta_schema,

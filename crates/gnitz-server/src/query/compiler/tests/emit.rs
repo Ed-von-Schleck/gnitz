@@ -62,6 +62,8 @@ fn test_site(dir: &str, id: u64) -> ViewSite<'_> {
         dir,
         id,
         recovery: RecoverySource::Rederive { resume_at: None },
+        slot: Slot::SOLO,
+        ram: RamBudgets::default(),
     }
 }
 

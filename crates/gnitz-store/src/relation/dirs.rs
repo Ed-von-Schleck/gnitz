@@ -9,6 +9,7 @@
 use std::fs;
 
 use super::RelationKind;
+use crate::storage::StoreError;
 
 /// `<base_dir>/LOCK` — the file whose `flock` makes a data directory
 /// single-writer.
@@ -50,7 +51,7 @@ fn has_numeric_id(s: &str) -> bool {
 /// "`f` created it" is observed, not declared: the probe runs on both sides, so
 /// a caller that creates no directory at all (a storeless relation) neither
 /// cleans up nor syncs, without having to say so.
-pub fn staged_dir<T>(dir: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+pub fn staged_dir<T, E>(dir: &str, f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
     let existed = std::path::Path::new(dir).exists();
     let out = f();
     if existed || !std::path::Path::new(dir).exists() {
@@ -65,11 +66,11 @@ pub fn staged_dir<T>(dir: &str, f: impl FnOnce() -> Result<T, String>) -> Result
     out
 }
 
-pub fn ensure_dir(path: &str) -> Result<(), String> {
+pub fn ensure_dir(path: &str) -> Result<(), StoreError> {
     // `create_dir_all` already succeeds on an existing directory; the only
     // `AlreadyExists` it reports is a non-directory blocking the path, which is
     // a genuine failure.
-    fs::create_dir_all(path).map_err(|e| format!("Failed to create directory '{path}': {e}"))
+    fs::create_dir_all(path).map_err(|e| StoreError::storage(format!("create directory '{path}'"), e.into()))
 }
 
 fn lock_file_path(base_dir: &str) -> String {
@@ -102,7 +103,7 @@ const DIR_LOCK_RETRY_EVERY: std::time::Duration = std::time::Duration::from_mill
 ///
 /// The returned file must outlive every store under `base_dir`: closing it
 /// releases the lock.
-pub fn lock_data_dir(base_dir: &str) -> Result<fs::File, String> {
+pub fn lock_data_dir(base_dir: &str) -> Result<fs::File, StoreError> {
     let path = lock_file_path(base_dir);
     let file = fs::OpenOptions::new()
         .read(true)
@@ -110,7 +111,7 @@ pub fn lock_data_dir(base_dir: &str) -> Result<fs::File, String> {
         .create(true)
         .truncate(false)
         .open(&path)
-        .map_err(|e| format!("Failed to open data-directory lock '{path}': {e}"))?;
+        .map_err(|e| StoreError::storage(format!("open data-directory lock '{path}'"), e.into()))?;
     let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
     let deadline = std::time::Instant::now() + DIR_LOCK_RETRY_FOR;
     loop {
@@ -119,10 +120,15 @@ pub fn lock_data_dir(base_dir: &str) -> Result<fs::File, String> {
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
-            return Err(format!("Failed to lock data directory '{base_dir}': {err}"));
+            return Err(StoreError::storage(
+                format!("lock data directory '{base_dir}'"),
+                err.into(),
+            ));
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("data directory '{base_dir}' is already held"));
+            return Err(StoreError::rejected(format!(
+                "data directory '{base_dir}' is already held"
+            )));
         }
         std::thread::sleep(DIR_LOCK_RETRY_EVERY);
     }

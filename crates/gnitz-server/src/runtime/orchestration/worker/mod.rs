@@ -20,11 +20,12 @@ use crate::runtime::wire::{
     self as ipc, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT, FLAG_SCAN_LAST,
 };
 use gnitz_store::foundation::fault::Seam;
-use gnitz_store::relation::{IngestError, RelationRegistry};
+use gnitz_store::relation::RelationRegistry;
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 use gnitz_store::storage::BlobCacheGuard;
+use gnitz_store::storage::StoreError;
 use gnitz_wire::{FLAG_CONTINUATION, FLAG_EXCHANGE, STATUS_OK};
 
 // ---------------------------------------------------------------------------
@@ -978,8 +979,10 @@ impl WorkerProcess {
             .ingest_returning_effective(target_id, batch, true)
         {
             Ok(b) => b.expect("asked for the effective batch"),
-            Err(IngestError::Rejected(msg)) => return Err(msg),
-            Err(IngestError::Storage(e)) => gnitz_fatal_abort!(
+            // An ingest never produces `DeltaExpired`; the or-pattern is what
+            // keeps the match total without a third arm.
+            Err(StoreError::Rejected(msg) | StoreError::DeltaExpired(msg)) => return Err(msg),
+            Err(e @ StoreError::Storage { .. }) => gnitz_fatal_abort!(
                 "worker: push apply failed (table_id={}): {} — committed data not \
                  applied, state diverged from durable SAL; aborting for restart+replay",
                 target_id,

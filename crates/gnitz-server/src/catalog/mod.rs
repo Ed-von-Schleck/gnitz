@@ -49,9 +49,11 @@ use std::fs;
 use std::rc::Rc;
 
 use crate::query::DagEngine;
-use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, ViewBudgets};
+use gnitz_store::relation::{
+    IndexCircuitEntry, RelationKind, RelationRegistry, RelationSpec, StoreConfig, ViewBudgets,
+};
 use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, ReadCursor, RecoverySource, StorageError, Table};
+use gnitz_store::storage::{Batch, RamBudgets, ReadCursor, RecoverySource, Slot, StorageError, StoreError, Table};
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 // The DDL_TXN driver's bundle decoders: it resolves each family once, carries
@@ -74,6 +76,7 @@ use sys_tables::*;
 pub(in crate::catalog) use apply_context::{ApplyContext, ApplyMode};
 pub(in crate::catalog) use cache::{CatalogCacheSet, SchemaWireEntry};
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
+pub(in crate::catalog) use index_backfill::IndexPass;
 pub(in crate::catalog) use registry::raise_id_counter;
 // The child-directory grammar and the directory primitives are storage's; the
 // catalog only consumes them.
@@ -115,6 +118,11 @@ pub(crate) struct CatalogEngine {
 
     /// Every derived lookup the catalog maintains from system-table deltas.
     pub(in crate::catalog) caches: CatalogCacheSet,
+
+    /// True in the master process, whose index copies stay permanently empty:
+    /// its index hook skips the backfill the workers run slice-local. Set by
+    /// `open_master`, cleared by `become_worker`.
+    pub(in crate::catalog) is_master: bool,
 
     // --- Sequence counters ---
     pub(in crate::catalog) next_schema_id: i64,

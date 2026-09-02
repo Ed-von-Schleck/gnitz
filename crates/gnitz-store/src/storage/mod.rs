@@ -45,10 +45,10 @@ pub use batch::Batch;
 pub use batch::MAX_BATCH_REGIONS;
 pub(crate) use batch::{range_rows, write_to_batch};
 pub use batch_wire::decode_mem_batch_from_wal_block;
-pub use error::StorageError;
+pub use error::{StorageError, StoreError};
 pub use lsm::flush_barrier::{flush_barrier, FlushRound};
 pub(crate) use lsm::table::enforce_unique_pk;
-pub use lsm::table::{RecoverySource, Table};
+pub use lsm::table::{RamBudgets, RecoverySource, Table};
 pub use merge::MemBatch;
 pub use scatter::batch_project_index;
 pub use scatter::route_rows_by_pk;
@@ -74,7 +74,7 @@ pub use columnar::compare_rows_except;
 // `read/scan_spec.rs` each imported from both in adjacent lines.
 pub(crate) use lsm::child_dir::reclaim_retired_children;
 pub use lsm::child_dir::{children_at_generation, fsync_dir};
-pub use lsm::child_dir::{remove_child, ChildAddr};
+pub use lsm::child_dir::{remove_child, ChildAddr, Slot};
 // A directory sweep is the one child-dir primitive a `gnitz-store` consumer runs
 // itself: the mirror reclaims the copies its own record file no longer names.
 pub use lsm::child_dir::subdir_names;

@@ -147,7 +147,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
 }
 
 // ── index_rebuilds_across_chunk_boundary ─────────────────────────────────
-// Boot backfills stream the source in SCAN_CHUNK_ROWS-sized chunks. The
+// Boot backfills stream the source in `scan_chunk_rows`-sized chunks. The
 // chunk size cannot be shrunk before open() (the backfill runs during shard
 // replay, before any test code can touch the engine), so exercise the real
 // boundary with a base table one chunk plus a remainder wide. The secondary
@@ -159,7 +159,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
 
 #[test]
 fn index_rebuilds_across_chunk_boundary() {
-    let n: usize = gnitz_store::relation::SCAN_CHUNK_ROWS + 3;
+    let n: usize = gnitz_store::relation::StoreConfig::default().scan_chunk_rows + 3;
     let dir = temp_dir("reopen_rebuild_chunked");
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -207,15 +207,8 @@ fn index_rebuilds_across_chunk_boundary() {
 }
 
 // ── backfill_all_indexes_rebuilds_exactly_once ──────────────────────────
-// `backfill_all_indexes` is the worker-boot rebuild: it re-creates each index
-// Table (at this process's `index_dir` — the parent dir in a Standalone
-// unit test) and repopulates it from the base slice. Assert it is a *replace*
-// (single materialisation, never additive/doubled) and idempotent across
-// repeated calls, and that every key still resolves to its source PK afterward.
-//
-// This exercises the Standalone role path directly, without a fork: no unit
-// test sets a process role, so `index_dir` targets the parent dir and the
-// call is a legal idempotent re-create-and-rebuild.
+// The boot rebuild leaves a filled store alone: repeated calls never double a
+// weight, and every key still resolves to its source PK.
 #[test]
 fn backfill_all_indexes_rebuilds_exactly_once() {
     let dir = temp_dir("backfill_all_indexes_once");
@@ -244,7 +237,7 @@ fn backfill_all_indexes_rebuilds_exactly_once() {
 
     assert_index_intact(&mut engine);
 
-    // Replace-and-rebuild: swaps in a fresh Table, not additive onto the old.
+    // The hook's fill is in the store, so the rebuild has nothing to add.
     engine.backfill_all_indexes().unwrap();
     assert_index_intact(&mut engine);
 
@@ -265,15 +258,15 @@ fn backfill_all_indexes_rebuilds_exactly_once() {
 // `Table::resumed_from_checkpoint`).
 
 /// `base_with_index`, plus the state a completed checkpoint leaves behind:
-/// the recorded topology and generation the resume gate compares against, and
-/// the index published through an ephemeral round stamped at that generation.
-/// Returns `(table id, generation)`.
-fn checkpointed_table_with_index(dir: &str) -> (i64, u64) {
+/// the recorded topology — at `recorded_workers` workers — and generation the
+/// resume gate compares against, and the index published through an ephemeral
+/// round stamped at that generation. Returns `(table id, generation)`.
+fn checkpointed_table_with_index(dir: &str, recorded_workers: u32) -> (i64, u64) {
     let mut engine = CatalogEngine::open(dir, 1).unwrap();
     let tid = base_with_index(&mut engine);
 
     // The two halves of the verdict, written the way a boot writes them.
-    engine.record_topology(1).unwrap();
+    engine.record_topology(recorded_workers).unwrap();
     let g = engine.bump_checkpoint_generation().unwrap();
 
     // The index is the only rederived store this table owns, so the ephemeral
@@ -293,7 +286,7 @@ fn checkpointed_table_with_index(dir: &str) -> (i64, u64) {
 #[test]
 fn index_rebuild_is_skipped_after_resume() {
     let dir = temp_dir("index_resume_skips_rebuild");
-    let (tid, g) = checkpointed_table_with_index(&dir);
+    let (tid, g) = checkpointed_table_with_index(&dir, 1);
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(
@@ -317,34 +310,37 @@ fn index_rebuild_is_skipped_after_resume() {
 }
 
 // ── index_rebuild_forced_by_topology_change ─────────────────────────────
-// The other half of the verdict. A `STATE_FORMAT` bump — the project's lever for
-// "every rederived relation must be rebuilt" — changes the topology word at an
-// unchanged worker count, which no other path exercises. The generation still
-// matches the manifest, so a gate that read it alone would silently resume.
+// The other half of the verdict: the checkpoint recorded four workers and this
+// boot launches one, so the generation still matches the manifest but the
+// topology does not, and the hook's open erases the store and backfills it.
 #[test]
 fn index_rebuild_forced_by_topology_change() {
     let dir = temp_dir("index_resume_topology_change");
-    let (tid, _g) = checkpointed_table_with_index(&dir);
+    let (tid, _g) = checkpointed_table_with_index(&dir, 4);
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    // Simulate the format bump: the recorded word no longer matches this boot's.
-    engine
-        .registry_mut()
-        .set_recorded_topology(gnitz_store::storage::topology_word(1) + 1);
     assert_eq!(
         engine.registry().rederive_source(),
         RecoverySource::Rederive { resume_at: None },
         "a foreign topology must refuse every manifest"
     );
-    assert_eq!(
-        engine.backfill_all_indexes().unwrap(),
-        1,
-        "a topology change must rebuild the index despite a matching generation"
+    assert!(
+        !engine
+            .registry()
+            .index_circuit_for_cols(tid, &[1])
+            .unwrap()
+            .resumed_from_checkpoint(),
+        "a topology change must erase the index despite a matching generation"
     );
     assert_eq!(
         index_weight(&mut engine, tid),
         N,
-        "the rebuild replaces the erased state, never adds to it"
+        "the hook's backfill replaces the erased state, never adds to it"
+    );
+    assert_eq!(
+        engine.backfill_all_indexes().unwrap(),
+        0,
+        "the hook already filled the store, so the boot rebuild has nothing to do"
     );
 
     engine.close();

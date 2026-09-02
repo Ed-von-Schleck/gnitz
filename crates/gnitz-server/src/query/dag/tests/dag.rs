@@ -21,7 +21,10 @@ fn test_invalidation() {
 /// Wiring: the production table/view-drop path routes through `evict_meta`.
 #[test]
 fn unregister_table_evicts_the_dropped_relations_meta() {
-    let mut registry = gnitz_store::relation::RelationRegistry::new(1);
+    let mut registry = gnitz_store::relation::RelationRegistry::new(
+        gnitz_store::storage::Slot::SOLO,
+        gnitz_store::relation::StoreConfig::default(),
+    );
     let mut dag = DagEngine::new();
     dag.meta.insert(43, Rc::new(ViewMeta::nothing_special()));
     dag.unregister_table(&mut registry, 43);
@@ -30,7 +33,10 @@ fn unregister_table_evicts_the_dropped_relations_meta() {
 
 #[test]
 fn test_dep_map_empty() {
-    let registry = gnitz_store::relation::RelationRegistry::new(1);
+    let registry = gnitz_store::relation::RelationRegistry::new(
+        gnitz_store::storage::Slot::SOLO,
+        gnitz_store::relation::StoreConfig::default(),
+    );
     let mut dag = DagEngine::new();
     dag.get_dep_map(&registry);
     assert!(dag.dep.forward.is_empty());
@@ -56,7 +62,10 @@ fn dag_with_deps(edges: &[(i64, i64)]) -> DagEngine {
 #[test]
 fn test_source_closure_walks_sources_transitively() {
     // chain 1 → 2 → 3, diamond 10 → {11,12} → 13, disconnected pair 20 → 21.
-    let registry = gnitz_store::relation::RelationRegistry::new(1);
+    let registry = gnitz_store::relation::RelationRegistry::new(
+        gnitz_store::storage::Slot::SOLO,
+        gnitz_store::relation::StoreConfig::default(),
+    );
     let mut dag = dag_with_deps(&[(1, 2), (2, 3), (10, 11), (10, 12), (11, 13), (12, 13), (20, 21)]);
 
     assert!(dag.source_closure(&registry, vec![]).is_empty());

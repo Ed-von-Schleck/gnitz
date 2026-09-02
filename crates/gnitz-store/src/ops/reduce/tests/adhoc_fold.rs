@@ -185,7 +185,7 @@ fn fold_group_cap_aborts() {
     let mut fold = AdhocFold::new(&src, &reply, &spec, 2).unwrap();
     let b = build(&[(1, 1, 1, Some(0)), (2, 1, 2, Some(0)), (3, 1, 3, Some(0))]);
     let err = fold.fold_ranges(&b, &[(0, b.count)]).unwrap_err();
-    assert!(err.contains("CREATE VIEW"), "{err}");
+    assert!(err.to_string().contains("CREATE VIEW"), "{err}");
 }
 
 /// A structurally valid reply schema that is not the derived SyntheticFold
@@ -234,7 +234,7 @@ fn fold_rejects_aggregates_with_no_encoding() {
         let Err(err) = AdhocFold::new(&src, &reply, &spec, 1000) else {
             panic!("{op:#x} over column {col} must be rejected");
         };
-        assert!(err.contains("no scalar register image"), "{err}");
+        assert!(err.to_string().contains("no scalar register image"), "{err}");
     }
     // COUNT reads no value, so the same columns are countable.
     for col in [1u16, 2] {

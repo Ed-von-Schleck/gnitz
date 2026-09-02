@@ -13,10 +13,9 @@ use std::fmt;
 use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
 use gnitz_expr::{ExprValidateErr, LogicalProgram};
 use gnitz_store::expr::MapPlan;
-use gnitz_store::foundation::worker_ctx::{num_workers, worker_rank};
 use gnitz_store::ops::AggDescriptor;
 use gnitz_store::schema::{project_schema, SchemaDescriptor};
-use gnitz_store::storage::{ReadCursor, RecoverySource, StorageError, Table};
+use gnitz_store::storage::{RamBudgets, ReadCursor, RecoverySource, Slot, StorageError, Table};
 
 mod emit;
 mod hydration;
@@ -471,6 +470,11 @@ pub(super) struct ViewSite<'a> {
     /// The policy the view's *output store* was opened under, handed down so its
     /// operator traces cannot end up looking for a different manifest generation.
     pub(in crate::query) recovery: RecoverySource,
+    /// Which worker compiles: names the scratch children's rank and is baked
+    /// into every `WorkerFilter` and the global-aggregate owner test.
+    pub(in crate::query) slot: Slot,
+    /// What every scratch child opens with.
+    pub(in crate::query) ram: RamBudgets,
 }
 
 /// Assemble a compiled view's exchange sides, seeding each from `seed_regs` at

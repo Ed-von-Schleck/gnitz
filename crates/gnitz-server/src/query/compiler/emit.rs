@@ -217,14 +217,20 @@ impl EmitCtx<'_> {
     fn create_child_table(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<Table, CompileError> {
         let child_dir = gnitz_store::storage::ChildAddr::Scratch {
             child: child_name,
-            rank: worker_rank(),
+            rank: self.site.slot.rank,
         }
         .dir(self.site.dir);
         // Track the path before creating so cleanup also removes a partially
-        // created directory if Table::new fails.
+        // created directory if the open fails.
         self.scratch.track(child_dir.clone());
-        Table::new(&child_dir, schema, self.site.id as u32, self.site.recovery)
-            .map_err(|e| CompileError::StorageFailed("child table create failed", e))
+        Table::with_budgets(
+            &child_dir,
+            schema,
+            self.site.id as u32,
+            self.site.recovery,
+            self.site.ram,
+        )
+        .map_err(|e| CompileError::StorageFailed("child table create failed", e))
     }
 
     /// Allocate a trace register and the child table backing it
@@ -435,20 +441,21 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
 
         gnitz_wire::OpNode::WorkerFilter => {
             // Drops the rows this worker does not own before they reach
-            // `integrate_trace`, by the compile-time `(worker_rank, num_workers)`.
+            // `integrate_trace`, by the compile-time slot.
             let in_reg = ctx.unary_in(nid)?;
+            let slot = ctx.site.slot;
             // A replicated view runs correct-local over the full broadcast, and at
             // one worker every partition is owned here — the filter is the identity
             // either way, and executing it would clone the whole delta each epoch.
-            if ctx.placement.is_replicated() || num_workers() <= 1 {
+            if ctx.placement.is_replicated() || slot.of <= 1 {
                 return Ok(in_reg);
             }
             let out_reg = ctx.push_delta_reg(ctx.reg_meta[in_reg as usize].schema);
             ctx.builder.push(Instr::WorkerFilter {
                 in_reg,
                 out_reg,
-                worker_id: worker_rank(),
-                num_workers: num_workers(),
+                worker_id: slot.rank,
+                num_workers: slot.of,
             });
             Ok(out_reg)
         }
@@ -632,9 +639,10 @@ fn emit_reduce(
         loaded.op(loaded.inputs(nid).unary()),
         gnitz_wire::OpNode::ExchangeShard { .. }
     );
+    let slot = ctx.site.slot;
     let i_am_owner = ctx.placement.is_replicated()
         || unsharded
-        || worker_rank() as usize == gnitz_wire::worker_for_key(gnitz_wire::global_group_key(), num_workers() as usize);
+        || slot.rank as usize == gnitz_wire::worker_for_key(gnitz_wire::global_group_key(), slot.of as usize);
 
     // `oob_cols` above bounds each column index but not the list lengths, and the
     // SQL binder — which the low-level CircuitBuilder path bypasses — is not the

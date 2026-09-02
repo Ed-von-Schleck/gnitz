@@ -29,7 +29,7 @@ use gnitz_core::{MirrorError, Schema, ZSetBatch};
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 
-use crate::handle::{Mirror, Shapes};
+use crate::handle::{engine, Mirror, Shapes};
 use crate::register::descriptor_of;
 
 impl Mirror {
@@ -44,7 +44,7 @@ impl Mirror {
     /// Every row of the copy, in the schema its registration resolved.
     pub(crate) fn scan_inner(&mut self, table_id: u64) -> Result<(Arc<Schema>, ZSetBatch), MirrorError> {
         let schema = Arc::clone(&self.shapes(table_id)?.schema);
-        let (batch, desc) = self.registry.scan_family(table_id as i64, None)?;
+        let (batch, desc) = self.registry.scan_family(table_id as i64, None).map_err(engine)?;
         let rows = reply_batch(&batch, &desc, table_id, &schema)?;
         Ok((schema, rows))
     }
@@ -71,7 +71,7 @@ impl Mirror {
         let keeper = self
             .registry
             .scan_spec_family(table_id as i64, &spec, &reply_desc, 0, None)
-            .map_err(|f| MirrorError::Engine(f.text))?;
+            .map_err(engine)?;
         if keeper.is_empty() {
             return Ok(None);
         }

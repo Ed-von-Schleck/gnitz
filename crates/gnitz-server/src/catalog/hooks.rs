@@ -1,6 +1,5 @@
 use super::*;
 
-use gnitz_store::schema::make_index_schema;
 use gnitz_wire::{SCHEMATAB_PAY_NAME, SEQTAB_PAY_VALUE};
 use rustc_hash::FxHashMap;
 
@@ -507,11 +506,12 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// Build an index table for a `+1` IDX_TAB row, fill it, and enter its
-    /// circuit — the `+1` half of [`Self::hook_index_register`].
+    /// Enter an index circuit for a `+1` IDX_TAB row — which opens this
+    /// process's store — and fill it: the `+1` half of
+    /// [`Self::hook_index_register`].
     ///
     /// One circuit per column list (dedup by ordered list). An incumbent circuit
-    /// means no second table is built, but a UNIQUE newcomer over a non-unique
+    /// means no second store is opened, but a UNIQUE newcomer over a non-unique
     /// incumbent promotes it. Promotion is order-independent — the circuit is
     /// unique iff ANY index on the column list is unique — so replay reconstructs
     /// an identical result whatever order the index ids arrive in.
@@ -526,20 +526,15 @@ impl CatalogEngine {
         // `validate_index_registration`). Resolve the owner entry once for
         // everything below.
         let entry = self.validate_index_registration(owner_id, cols)?;
-        let owner_schema = entry.schema;
         let owner_dir = entry.directory.clone();
 
         if let Some(was_unique) = entry.index_circuit_on(cols.as_slice()).map(|ic| ic.is_unique) {
             if is_unique && !was_unique {
-                self.promote_index_to_unique(owner_id, &owner_schema, cols.as_slice())?;
+                self.promote_index_to_unique(owner_id, cols.as_slice())?;
             }
             return Ok(());
         }
 
-        // make_index_schema bounds-checks and promotes every column (defence in
-        // depth at the catalog trust boundary; a crafted wire row could name an
-        // out-of-range or ineligible column).
-        let idx_schema = make_index_schema(cols.as_slice(), &owner_schema)?;
         let idx_dir = index_dir(&owner_dir, idx_id);
         let cols = *cols;
 
@@ -547,33 +542,37 @@ impl CatalogEngine {
         // `idx_dir` recursively, child subdirs included. The stage is a local,
         // not an entry in `pending_dir_deletions`, so that queue keeps one
         // meaning — directories of *dropped* entities, which a rollback must
-        // therefore keep.
+        // therefore keep. `add_index` bounds-checks and promotes every column
+        // (defence in depth at the catalog trust boundary; a crafted wire row
+        // could name an out-of-range or ineligible column).
         staged_dir(&idx_dir, || {
-            let mut idx_table_box = Box::new(self.new_index_table(&idx_dir, idx_id, idx_schema)?);
-            let idx_table_ptr = &mut *idx_table_box as *mut Table;
+            self.registry.add_index(owner_id, idx_id, cols.as_slice(), is_unique)?;
+            let resumed = self
+                .registry
+                .index_circuit_for_cols(owner_id, cols.as_slice())
+                .is_some_and(IndexCircuitEntry::resumed_from_checkpoint);
             // The master never populates its index copies (they stay permanently
             // empty; distributed HAS_PK/seek probes union the workers' slice-local
             // copies). Workers and standalone backfill from their local base slice
-            // — unless the table just resumed from a checkpointed manifest, which
+            // — unless the store resumed from a checkpointed manifest, which
             // already holds those rows.
-            if !self.ctx.in_rollback()
-                && !gnitz_store::foundation::worker_ctx::is_master()
-                && !idx_table_box.resumed_from_checkpoint()
-            {
-                self.backfill_index(
-                    owner_id,
-                    &owner_schema,
-                    cols.as_slice(),
-                    idx_table_ptr,
-                    &idx_schema,
-                    // Re-checked on a first apply only, exactly as in
-                    // `promote_index_to_unique`: replayed and compensated data
-                    // passed its check when originally written.
-                    is_unique && self.ctx.mode() == ApplyMode::Live,
-                )?;
+            if !self.ctx.in_rollback() && !self.is_master && !resumed {
+                // Re-checked on a first apply only, exactly as in
+                // `promote_index_to_unique`: replayed and compensated data
+                // passed its check when originally written.
+                let pass = if is_unique && self.ctx.mode() == ApplyMode::Live {
+                    IndexPass::FillUnique
+                } else {
+                    IndexPass::Fill
+                };
+                if let Err(e) = self.backfill_index(owner_id, cols.as_slice(), pass) {
+                    // The circuit was entered before the backfill so the
+                    // projection could ingest through it; a failed CREATE INDEX
+                    // leaves no circuit.
+                    self.registry.remove_index_circuit(owner_id, cols.as_slice());
+                    return Err(e);
+                }
             }
-            self.registry
-                .add_index_circuit(owner_id, cols.as_slice(), idx_id, idx_table_box, idx_schema, is_unique);
             Ok(())
         })
     }

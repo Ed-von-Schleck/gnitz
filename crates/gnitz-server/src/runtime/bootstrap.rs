@@ -402,14 +402,6 @@ fn run_worker_child(
         unsafe { libc::_exit(0) };
     }
 
-    // Latch this worker's rank/count (and its Worker role) before ANY catalog
-    // work below (trim, rehome, index rebuild, SAL replay, view backfill): every
-    // plan compiled during boot must see this process's real (rank,
-    // num_workers) and its index tables must home into the per-rank subdir.
-    // Single owner of the rank — no longer set in WorkerProcess::new.
-    gnitz_store::foundation::worker_ctx::set_worker_identity(w as u32, num_workers);
-    gnitz_store::foundation::worker_ctx::set_worker_role();
-
     // Redirect stdout/stderr to worker log file
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -463,11 +455,9 @@ fn run_worker_child(
     };
     let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w]);
 
-    // Re-home every inherited store from the pre-fork master's `w0of{W}` to THIS
-    // worker's own `w{w}of{W}` dir before any flush — all workers share the data
-    // directory, so a fixed rank 0 would collide. The inherited store is empty;
-    // this rank's checkpointed shards under `w{w}of{W}` load on open and Push
-    // replay adds the SAL tail.
+    // Become worker `(w, W)` before any flush: every inherited store re-homes
+    // from the pre-fork master's `w0of{W}` to this worker's own child, and every
+    // plan compiled from here on is baked with this slot.
     //
     // Then recover: rebuild indexes, replay the SAL tail (buffering effective base
     // deltas), boot-flush the replayed rows durable. The buffered deltas seed
@@ -478,9 +468,7 @@ fn run_worker_child(
     // Either failure rides the startup ACK, which fails boot before the master
     // rewinds the SAL.
     let (pending_deltas, boot_err): (HashMap<i64, Batch>, Option<String>) = match catalog
-        .registry_mut()
-        .rehome_stores()
-        .map_err(|e| format!("rehome stores failed: {e}"))
+        .become_worker(gnitz_store::storage::Slot::new(w as u32, num_workers))
         .and_then(|()| worker_boot_recovery(catalog, ipc.sal_ptr as *const u8, w as u32, num_workers, walk_epoch))
     {
         Ok(pd) => (pd, None),
@@ -515,11 +503,6 @@ fn run_server(
     log_level: u32,
     tls_cli: Option<TlsCli>,
 ) -> Result<i32, String> {
-    // Latch the Master role before any catalog work: the pre-fork replay hooks
-    // in CatalogEngine::open must see Master so they skip the index backfill
-    // their forked children rebuild slice-local.
-    gnitz_store::foundation::worker_ctx::set_master_role();
-
     // Raise fd limit (child directories + shard files)
     raise_fd_limit(65536);
 
@@ -543,7 +526,10 @@ fn run_server(
 
     gnitz_info!("Opening database at {}", data_dir);
 
-    let mut catalog = CatalogEngine::open(data_dir, num_workers).map_err(|e| format!("failed to open catalog: {e}"))?;
+    // As the master: the pre-fork replay hooks skip the index backfill their
+    // forked children run slice-local.
+    let mut catalog =
+        CatalogEngine::open_master(data_dir, num_workers).map_err(|e| format!("failed to open catalog: {e}"))?;
 
     boot_log(&format!("Starting {num_workers} workers\n"));
     boot_log(&format!(
@@ -585,7 +571,7 @@ fn run_server(
         // Drop the child directories this boot's worker count no longer owns.
         // Must run after SAL replay (so the registry is complete and dropped
         // subtrees are already gone) and before the fork, since each worker's
-        // `rehome_stores` then opens what this leaves behind.
+        // `rehome` then opens what this leaves behind.
         catalog.registry().reconcile_child_dirs();
     }
 
