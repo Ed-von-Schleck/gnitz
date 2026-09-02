@@ -369,7 +369,7 @@ fn a_computed_string_rhs_routes_to_the_string_arm_and_evaluates() {
     let schema = two_col(TypeCode::String);
     let upper = BoundExpr::StrCall {
         f: crate::ir::StrFunc::Upper,
-        arg: Box::new(BoundExpr::ColRef(1)),
+        args: vec![BoundExpr::ColRef(1)],
     };
     let p = classify_set_rhs(&upper, 1, &schema).expect("compiles");
     assert!(matches!(&p, SetProgram::Expr(ev) if ev.result_is_str()));

@@ -341,3 +341,139 @@ class TestU64Preservation:
             assert got == [1]
         finally:
             _cleanup(client, sn, "v2", "v", "t")
+
+
+# ---------------------------------------------------------------------------
+# Null tests over computed values: COALESCE over an expression, IFNULL/NVL, IF,
+# IS [NOT] DISTINCT FROM, and IS NULL over a computed operand
+# ---------------------------------------------------------------------------
+
+
+class TestNullTests:
+    def test_null_tests_over_computed_values(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT, b BIGINT, s TEXT)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT id, "
+                "COALESCE(a + b, a, -1) AS c, IFNULL(a * 2, 0) AS i, NVL(s, 'none') AS n, "
+                "IF(a < b, 'lt', 'ge') AS g, "
+                "a IS DISTINCT FROM b AS d, a IS NOT DISTINCT FROM b AS nd, "
+                "UPPER(s) IS NULL AS un, (a + 1) IS NOT NULL AS pn "
+                "FROM t",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 1, 2, 'x'), (2, 5, NULL, NULL), (3, NULL, NULL, 'y'), (4, 3, 3, NULL)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            rows = {r["id"]: r for r in _dicts(client, vid)}
+            assert (rows[1]["c"], rows[2]["c"], rows[3]["c"], rows[4]["c"]) == (3, 5, -1, 6)
+            assert (rows[1]["i"], rows[3]["i"]) == (2, 0)
+            assert (rows[1]["n"], rows[2]["n"]) == ("x", "none")
+            # IF over a NULL comparison takes the else branch, as CASE does.
+            assert (rows[1]["g"], rows[2]["g"], rows[4]["g"]) == ("lt", "ge", "ge")
+            assert [rows[i]["d"] for i in (1, 2, 3, 4)] == [1, 1, 0, 0]
+            assert [rows[i]["nd"] for i in (1, 2, 3, 4)] == [0, 0, 1, 1]
+            assert [rows[i]["un"] for i in (1, 2, 3, 4)] == [0, 1, 0, 1]
+            assert [rows[i]["pn"] for i in (1, 2, 3, 4)] == [1, 1, 0, 1]
+        finally:
+            _cleanup(client, sn)
+
+    def test_null_test_over_a_computed_operand_filters(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT, b BIGINT)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT id FROM t WHERE (a + b) IS NULL AND a IS DISTINCT FROM 0",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 1, NULL), (2, 1, 2), (3, 0, NULL), (4, NULL, NULL)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            assert sorted(r["id"] for r in _dicts(client, vid)) == [1, 4]
+            client.execute_sql("UPDATE t SET b = 5 WHERE id = 1", schema_name=sn)
+            assert sorted(r["id"] for r in _dicts(client, vid)) == [4]
+        finally:
+            _cleanup(client, sn)
+
+
+    def test_null_tests_over_subquery_operands(self, client):
+        """IS DISTINCT FROM and COALESCE over a scalar subquery bind the
+        subquery once; a never-NULL COUNT folds its test and a nullable MAX
+        tests the decorrelated value, before and after a retraction."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, x BIGINT)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.id, "
+                "(SELECT COUNT(*) FROM b WHERE b.k = a.k) IS DISTINCT FROM 1 AS c, "
+                "(SELECT MAX(v) FROM b WHERE b.k = a.k) IS DISTINCT FROM a.x AS m, "
+                "COALESCE((SELECT MAX(v) FROM b WHERE b.k = a.k), -1) AS mx "
+                "FROM a",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO a VALUES (1, 10, 5), (2, 20, NULL), (3, 30, 7)", schema_name=sn)
+            client.execute_sql(
+                "INSERT INTO b VALUES (1, 10, 5), (2, 20, NULL), (3, 30, 1), (4, 30, 2)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            rows = {r["id"]: r for r in _dicts(client, vid)}
+            assert len(rows) == 3, rows
+            assert [rows[i]["c"] for i in (1, 2, 3)] == [0, 0, 1]
+            # MAX 5 vs x 5, MAX NULL vs x NULL, MAX 2 vs x 7.
+            assert [rows[i]["m"] for i in (1, 2, 3)] == [0, 0, 1]
+            assert [rows[i]["mx"] for i in (1, 2, 3)] == [5, -1, 2]
+            client.execute_sql("DELETE FROM b WHERE id = 4", schema_name=sn)
+            rows = {r["id"]: r for r in _dicts(client, vid)}
+            assert len(rows) == 3 and (rows[3]["m"], rows[3]["mx"]) == (1, 1)
+        finally:
+            _cleanup(client, sn)
+
+    def test_null_tests_over_aggregates_in_having(self, client):
+        """IS DISTINCT FROM over an aggregate in HAVING and COALESCE over one in
+        the projection take the aggregate's value and its null test from one
+        bind; a NULL SUM is distinct from any value and coalesces."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a, COALESCE(SUM(b), -1) AS s FROM t "
+                "GROUP BY a HAVING SUM(b) IS DISTINCT FROM 5",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 1, NULL), (2, 1, NULL), (3, 2, 5), (4, 2, NULL), (5, 3, 2), (6, 3, 3)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            assert sorted((r["a"], r["s"]) for r in _dicts(client, vid)) == [(1, -1)]
+            client.execute_sql("UPDATE t SET b = 4 WHERE pk = 6", schema_name=sn)
+            assert sorted((r["a"], r["s"]) for r in _dicts(client, vid)) == [(1, -1), (3, 6)]
+        finally:
+            _cleanup(client, sn)
+

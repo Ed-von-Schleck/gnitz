@@ -143,8 +143,13 @@ fn infer_type_covers_remaining_arms() {
     assert_eq!(not.infer_type(&s.columns), TypeCode::I64);
 
     // IS [NOT] NULL are boolean I64.
-    assert_eq!(BoundExpr::IsNull(1).infer_type(&s.columns), TypeCode::I64);
-    assert_eq!(BoundExpr::IsNotNull(1).infer_type(&s.columns), TypeCode::I64);
+    for want_null in [true, false] {
+        let t = BoundExpr::NullTest {
+            inner: Box::new(BoundExpr::ColRef(1)),
+            want_null,
+        };
+        assert_eq!(t.infer_type(&s.columns), TypeCode::I64);
+    }
 
     // AggCall: AVG is always F64; MIN/MAX inherit the argument type
     // (U64 here) and fall back to I64 with no argument; every other
@@ -199,4 +204,85 @@ fn infer_type_covers_remaining_arms() {
         .infer_type(&s.columns),
         TypeCode::I64
     );
+}
+
+/// The numeric functions' result types: the rounding family and ABS keep the
+/// argument's register image, the transcendentals lift to F64, and SIGN is a
+/// signed integer over any integer argument and a float over a float one.
+#[test]
+fn num_func_result_types() {
+    for f in [
+        NumFunc::Unary(FloatUnaryOp::Abs),
+        NumFunc::Unary(FloatUnaryOp::Floor),
+        NumFunc::Unary(FloatUnaryOp::Ceil),
+        NumFunc::Unary(FloatUnaryOp::Trunc),
+        NumFunc::Round(2),
+    ] {
+        assert_eq!(f.result_type(TypeCode::U64), TypeCode::U64, "{f:?}");
+        assert_eq!(f.result_type(TypeCode::I32), TypeCode::I64, "{f:?}");
+        assert_eq!(f.result_type(TypeCode::F32), TypeCode::F64, "{f:?}");
+    }
+    assert_eq!(NumFunc::Round(-1).result_type(TypeCode::I64), TypeCode::F64);
+    for f in [
+        NumFunc::Unary(FloatUnaryOp::Sqrt),
+        NumFunc::Unary(FloatUnaryOp::Ln),
+        NumFunc::Unary(FloatUnaryOp::Log10),
+        NumFunc::Unary(FloatUnaryOp::Exp),
+    ] {
+        assert_eq!(f.result_type(TypeCode::I64), TypeCode::F64, "{f:?}");
+        assert_eq!(f.result_type(TypeCode::F64), TypeCode::F64, "{f:?}");
+    }
+    assert_eq!(
+        NumFunc::Unary(FloatUnaryOp::Sign).result_type(TypeCode::U64),
+        TypeCode::I64
+    );
+    assert_eq!(
+        NumFunc::Unary(FloatUnaryOp::Sign).result_type(TypeCode::I8),
+        TypeCode::I64
+    );
+    assert_eq!(
+        NumFunc::Unary(FloatUnaryOp::Sign).result_type(TypeCode::F32),
+        TypeCode::F64
+    );
+    // POWER is float over any operands.
+    let s = schema(&[TypeCode::U64, TypeCode::I64]);
+    let pow = BoundExpr::BinOp(
+        Box::new(BoundExpr::ColRef(1)),
+        BinOp::Pow,
+        Box::new(BoundExpr::LitInt(2)),
+    );
+    assert_eq!(pow.infer_type(&s.columns), TypeCode::F64);
+}
+
+/// Every string function's result type and signature agree with its node's
+/// arity: the measures and STRPOS are integers, everything else a string.
+#[test]
+fn str_func_result_types_and_signatures() {
+    use crate::ir::{StrArg, StrFunc};
+    for f in [StrFunc::LenBytes, StrFunc::LenChars, StrFunc::Pos] {
+        assert_eq!(f.result_type(), TypeCode::I64, "{f:?}");
+    }
+    for f in [
+        StrFunc::Upper,
+        StrFunc::Lower,
+        StrFunc::Reverse,
+        StrFunc::Left,
+        StrFunc::Right,
+        StrFunc::Replace,
+        StrFunc::Lpad,
+        StrFunc::Rpad,
+        StrFunc::SplitPart,
+    ] {
+        assert_eq!(f.result_type(), TypeCode::String, "{f:?}");
+    }
+    assert_eq!(StrFunc::Left.signature(), &[StrArg::Str, StrArg::Int]);
+    assert_eq!(
+        StrFunc::Lpad.signature(),
+        &[StrArg::Str, StrArg::Int, StrArg::StrOr(" ")]
+    );
+    assert_eq!(StrFunc::SplitPart.signature(), &[StrArg::Str, StrArg::Str, StrArg::Int]);
+    // The first argument of every string function is the string it acts on.
+    for f in [StrFunc::Pos, StrFunc::Replace, StrFunc::Reverse] {
+        assert_eq!(f.signature()[0], StrArg::Str);
+    }
 }

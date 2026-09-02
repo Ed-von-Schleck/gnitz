@@ -5,8 +5,9 @@
 //! (`RelExpr` → DBSP circuit) and calls into this one for every filter, map and
 //! projection expression it emits.
 
+use crate::bind::structural::str_func_name;
 use crate::error::GnitzSqlError;
-use crate::ir::{BinOp, BoundExpr, NumFunc, StrFunc, TrimMode, UnaryOp};
+use crate::ir::{BinOp, BoundExpr, NumFunc, StrArg, StrFunc, TrimMode, UnaryOp};
 use crate::types::int_cast_target;
 use gnitz_core::{ColumnDef, Schema, TypeCode};
 use gnitz_expr::{
@@ -56,10 +57,7 @@ fn str_cmp_reduction(op: BinOp, can_swap: bool) -> Option<(StrOp, bool, bool)> {
 }
 
 /// True iff `expr` can be one side of a fused [`try_compile_string_cmp`] pair:
-/// a string literal, or a column carrying the 16-byte German-string layout. The
-/// operand half of that function's shape test, written once — `in_list` reads it
-/// to decide which operand it must *not* hoist out of its fold, and would drift
-/// against a second spelling.
+/// a string literal, or a column carrying the 16-byte German-string layout.
 fn fuses_string_cmp(expr: &BoundExpr, cols: &[ColumnDef]) -> bool {
     match expr {
         BoundExpr::LitStr(_) => true,
@@ -200,14 +198,7 @@ impl OpcodeBackend<'_> {
             BoundExpr::LitNull => Ok(self.lit_null()),
             BoundExpr::BinOp(l, op, r) => self.binop(l, *op, r),
             BoundExpr::UnaryOp(op, inner) => self.unop(*op, inner),
-            BoundExpr::IsNull(c) => Ok((
-                self.eb.emit(L::IsNull { col: *c as u32, invert: /* invert = */ false }),
-                ExprKind::Int,
-            )),
-            BoundExpr::IsNotNull(c) => Ok((
-                self.eb.emit(L::IsNull { col: *c as u32, invert: /* invert = */ true }),
-                ExprKind::Int,
-            )),
+            BoundExpr::NullTest { inner, want_null } => self.null_test(inner, *want_null),
             BoundExpr::AggCall { .. } => Err(GnitzSqlError::Unsupported(
                 "aggregate function not allowed in expression context".to_string(),
             )),
@@ -216,12 +207,27 @@ impl OpcodeBackend<'_> {
             BoundExpr::Func { f, arg } => self.func(*f, arg),
             BoundExpr::MinMaxN { is_max, args } => self.min_max_n(*is_max, args),
             BoundExpr::Cast { expr, to } => self.cast(expr, *to),
-            BoundExpr::StrCall { f, arg } => self.str_call(*f, arg),
+            BoundExpr::StrCall { f, args } => self.str_call(*f, args),
             BoundExpr::Substr { s, start, len } => self.substr(s, start, len.as_deref()),
             BoundExpr::TrimCall { s, mode, set } => self.trim_call(s, *mode, set),
             BoundExpr::Like { s, pattern, escape, ci } => self.like(s, pattern, *escape, *ci),
             BoundExpr::ConcatN { args } => self.concat_n(args),
         }
+    }
+
+    /// `IS [NOT] NULL`. A column reads the batch bitmap directly — no load —
+    /// while every other operand is computed and its register's null lane
+    /// tested.
+    fn null_test(&mut self, inner: &BoundExpr, want_null: bool) -> Result<(Reg, ExprKind), GnitzSqlError> {
+        let invert = !want_null;
+        let reg = match inner {
+            BoundExpr::ColRef(c) => self.eb.emit(L::IsNull { col: *c as u32, invert }),
+            _ => {
+                let (a, _) = self.lower(inner)?;
+                self.eb.emit(L::IsNullReg { a, invert })
+            }
+        };
+        Ok((reg, ExprKind::Int))
     }
 
     /// Lower `expr` into a scalar register, reporting whether it holds an f64.
@@ -288,67 +294,83 @@ impl OpcodeBackend<'_> {
         }
     }
 
-    /// A SUBSTRING window bound. A float bound is a typed error rather than a
-    /// silent truncation — the opcode reads the register as an integer.
-    fn lower_window_bound(&mut self, e: &BoundExpr, what: &str) -> Result<Reg, GnitzSqlError> {
+    /// An integer operand — a window bound, a count, a field index. A float is a
+    /// typed error rather than a silent truncation: the opcode reads the
+    /// register as an integer. `what` names the position the error reports.
+    fn int_operand(&mut self, e: &BoundExpr, what: impl FnOnce() -> String) -> Result<Reg, GnitzSqlError> {
         match self.lower_num(e)? {
             (r, false) => Ok(r),
             (_, true) => Err(GnitzSqlError::Unsupported(format!(
-                "SUBSTRING: {what} must be an integer expression"
+                "{} must be an integer expression",
+                what()
             ))),
         }
     }
 
     fn func(&mut self, f: NumFunc, arg: &BoundExpr) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        if let NumFunc::Round(n) = f {
-            return self.round(n, arg);
-        }
-        let (r, is_float) = self.lower_num(arg)?;
-        if !is_float {
-            // Every transform is the identity on an integer register, and ABS of
-            // an unsigned one likewise — the value is non-negative by definition.
-            let needs_abs = f == NumFunc::Abs && arg.infer_type(self.cols).is_signed_int();
-            return Ok((
-                if needs_abs {
-                    self.eb.emit(L::IntUnary {
-                        op: IntUnaryOp::Abs,
-                        a: r,
-                    })
-                } else {
-                    r
-                },
-                ExprKind::Int,
-            ));
-        }
-        let reg = match f {
-            NumFunc::Abs => self.eb.emit(L::FloatUnary {
-                op: FloatUnaryOp::Abs,
-                a: r,
-            }),
-            NumFunc::Floor => self.eb.emit(L::FloatUnary {
-                op: FloatUnaryOp::Floor,
-                a: r,
-            }),
-            NumFunc::Ceil => self.eb.emit(L::FloatUnary {
-                op: FloatUnaryOp::Ceil,
-                a: r,
-            }),
-            NumFunc::Trunc => self.eb.emit(L::FloatUnary {
-                op: FloatUnaryOp::Trunc,
-                a: r,
-            }),
-            NumFunc::Round(_) => unreachable!("routed to `round` above"),
+        let op = match f {
+            NumFunc::Round(n) => return self.round(n, arg),
+            NumFunc::Unary(op) => op,
         };
-        Ok((reg, ExprKind::Float))
+        let (r, is_float) = self.lower_num(arg)?;
+        let arg_ty = arg.infer_type(self.cols);
+        if !is_float && f.result_type(arg_ty) != TypeCode::F64 {
+            // The integer domain: the rounding family is the identity, ABS of an
+            // unsigned register likewise (the value is non-negative by
+            // definition), and only NEG, signed ABS and SIGN compute.
+            let int_op = match op {
+                FloatUnaryOp::Neg => Some(IntUnaryOp::Neg),
+                FloatUnaryOp::Abs if arg_ty.is_signed_int() => Some(IntUnaryOp::Abs),
+                FloatUnaryOp::Sign => Some(IntUnaryOp::Sign),
+                _ => None,
+            };
+            let reg = int_op.map_or(r, |op| self.eb.emit(L::IntUnary { op, a: r }));
+            return Ok((reg, ExprKind::Int));
+        }
+        let a = if is_float {
+            r
+        } else {
+            self.eb.emit(L::IntToFloat { a: r })
+        };
+        Ok((self.eb.emit(L::FloatUnary { op, a }), ExprKind::Float))
     }
 
-    fn str_call(&mut self, f: StrFunc, arg: &BoundExpr) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        let a = self.str_operand(arg, /* coerce_numeric = */ false)?;
-        let reg = match f {
-            StrFunc::Upper => self.eb.emit(L::StrCase { a, upper: /* upper = */ true }),
-            StrFunc::Lower => self.eb.emit(L::StrCase { a, upper: /* upper = */ false }),
-            StrFunc::LenChars => self.eb.emit(L::StrLen { a, chars: /* chars = */ true }),
-            StrFunc::LenBytes => self.eb.emit(L::StrLen { a, chars: /* chars = */ false }),
+    fn str_call(&mut self, f: StrFunc, args: &[BoundExpr]) -> Result<(Reg, ExprKind), GnitzSqlError> {
+        let mut regs = Vec::with_capacity(args.len());
+        for (k, (kind, a)) in f.signature().iter().zip(args).enumerate() {
+            regs.push(match kind {
+                StrArg::Str | StrArg::StrOr(_) => self.str_operand(a, /* coerce_numeric = */ false)?,
+                StrArg::Int => self.int_operand(a, || format!("{}: argument {}", str_func_name(f), k + 1))?,
+            });
+        }
+        let instr = match (f, regs.as_slice()) {
+            (StrFunc::Upper, &[a]) => L::StrCase { a, upper: true },
+            (StrFunc::Lower, &[a]) => L::StrCase { a, upper: false },
+            (StrFunc::LenChars, &[a]) => L::StrLen { a, chars: true },
+            (StrFunc::LenBytes, &[a]) => L::StrLen { a, chars: false },
+            (StrFunc::Reverse, &[a]) => L::StrReverse { a },
+            (StrFunc::Left, &[src, n_reg]) => L::StrSide { src, n_reg, left: true },
+            (StrFunc::Right, &[src, n_reg]) => L::StrSide {
+                src,
+                n_reg,
+                left: false,
+            },
+            (StrFunc::Pos, &[hay, needle]) => L::StrPos { hay, needle },
+            (StrFunc::Replace, &[s, from, to]) => L::StrReplace { s, from, to },
+            (StrFunc::Lpad, &[s, n_reg, fill]) => L::StrPad {
+                s,
+                n_reg,
+                fill,
+                left: true,
+            },
+            (StrFunc::Rpad, &[s, n_reg, fill]) => L::StrPad {
+                s,
+                n_reg,
+                fill,
+                left: false,
+            },
+            (StrFunc::SplitPart, &[s, delim, n_reg]) => L::StrSplitPart { s, delim, n_reg },
+            _ => unreachable!("the binder sizes a string call's arguments by its signature"),
         };
         // Class taken from the one result-type statement, not restated here.
         let kind = if f.result_type() == TypeCode::String {
@@ -356,7 +378,7 @@ impl OpcodeBackend<'_> {
         } else {
             ExprKind::Int
         };
-        Ok((reg, kind))
+        Ok((self.eb.emit(instr), kind))
     }
 
     fn substr(
@@ -366,8 +388,10 @@ impl OpcodeBackend<'_> {
         len: Option<&BoundExpr>,
     ) -> Result<(Reg, ExprKind), GnitzSqlError> {
         let src = self.str_operand(s, false)?;
-        let start_reg = self.lower_window_bound(start, "start")?;
-        let len_reg = len.map(|l| self.lower_window_bound(l, "length")).transpose()?;
+        let start_reg = self.int_operand(start, || "SUBSTRING: start".into())?;
+        let len_reg = len
+            .map(|l| self.int_operand(l, || "SUBSTRING: length".into()))
+            .transpose()?;
         Ok((
             self.eb.emit(L::StrSubstr {
                 src,
@@ -439,15 +463,6 @@ impl OpcodeBackend<'_> {
             return Ok((r, ExprKind::num(is_float)));
         }
         let mut v = self.lower_as(arg, true)?;
-        if n == 0 {
-            return Ok((
-                self.eb.emit(L::FloatUnary {
-                    op: FloatUnaryOp::Round,
-                    a: v,
-                }),
-                ExprKind::Float,
-            ));
-        }
         let scale = self.eb.emit(L::LoadConst {
             val: 10f64.powi(n.unsigned_abs() as i32).to_bits() as i64,
         });
@@ -753,18 +768,11 @@ impl OpcodeBackend<'_> {
                 gnitz_expr::MAX_REGS,
             )));
         }
-        // A fusable operand stays unhoisted: its per-item compare reads the
-        // column through the 16-byte cell and short-circuits on the 4-byte
-        // prefix, which a string register cannot. Every other operand — an
-        // integer or float column, an expression — costs a whole column load per
-        // item unhoisted.
-        let hoisted = match fuses_string_cmp(inner, self.cols) {
-            true => None,
-            false => Some(self.lower(inner)?),
-        };
-        let (mut acc, _) = self.in_term(inner, hoisted, &items[0])?;
+        // Each term lowers the operand again; the builder folds the identical
+        // instructions, so a non-fused operand is loaded once for the whole list.
+        let (mut acc, _) = self.binop(inner, BinOp::Eq, &items[0])?;
         for it in &items[1..] {
-            let (r, _) = self.in_term(inner, hoisted, it)?;
+            let (r, _) = self.binop(inner, BinOp::Eq, it)?;
             acc = self.eb.emit(L::BoolBinary {
                 a: acc,
                 b: r,
@@ -772,24 +780,6 @@ impl OpcodeBackend<'_> {
             });
         }
         Ok((acc, ExprKind::Int))
-    }
-
-    /// One `inner = item` term of an IN fold: against the already-lowered
-    /// operand when there is one, else through [`Self::binop`] so the fused
-    /// column comparison still gets its shot at the pair.
-    fn in_term(
-        &mut self,
-        inner: &BoundExpr,
-        hoisted: Option<(Reg, ExprKind)>,
-        item: &BoundExpr,
-    ) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        match hoisted {
-            Some(l) => {
-                let r = self.lower(item)?;
-                self.binop_lowered(BinOp::Eq, l, r)
-            }
-            None => self.binop(inner, BinOp::Eq, item),
-        }
     }
 
     fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<(Reg, ExprKind), GnitzSqlError> {
@@ -853,7 +843,8 @@ impl OpcodeBackend<'_> {
             return self.str_binop(op, (l, l_kind), (r, r_kind));
         }
         let (l_float, r_float) = (l_kind == ExprKind::Float, r_kind == ExprKind::Float);
-        let is_float = l_float || r_float;
+        // POWER has no integer form: both operands lift.
+        let is_float = l_float || r_float || matches!(op, BinOp::Pow);
 
         // Cast int operand to float if mixed
         if is_float && !l_float {
@@ -891,7 +882,7 @@ impl OpcodeBackend<'_> {
             // Handled above, before the operands were lowered.
             BinOp::And | BinOp::Or | BinOp::Concat => unreachable!(),
             // Every arithmetic operator returned above.
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => unreachable!(),
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow => unreachable!(),
         }
     }
 
@@ -931,22 +922,12 @@ impl OpcodeBackend<'_> {
     }
 
     fn unop(&mut self, op: UnaryOp, inner: &BoundExpr) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        let (a, a_float) = self.lower_num(inner)?;
         match op {
-            UnaryOp::Neg => {
-                if a_float {
-                    Ok((
-                        self.eb.emit(L::FloatUnary {
-                            op: FloatUnaryOp::Neg,
-                            a,
-                        }),
-                        ExprKind::Float,
-                    ))
-                } else {
-                    Ok((self.eb.emit(L::IntUnary { op: IntUnaryOp::Neg, a }), ExprKind::Int))
-                }
+            UnaryOp::Neg => self.func(NumFunc::Unary(FloatUnaryOp::Neg), inner),
+            UnaryOp::Not => {
+                let (a, _) = self.lower_num(inner)?;
+                Ok((self.eb.emit(L::BoolNot { a }), ExprKind::Int))
             }
-            UnaryOp::Not => Ok((self.eb.emit(L::BoolNot { a }), ExprKind::Int)),
         }
     }
 }

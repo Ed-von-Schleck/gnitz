@@ -14,8 +14,8 @@ allocation or companion-spec injection changes: for each N in a range spanning
 the limit, `CREATE VIEW` either errors or returns the correct rows — it never
 succeeds and returns zero. Each range below spans the limit measured today, so
 each sweep contains both outcomes and neither can pass vacuously. No test pins
-the limit itself: the HAVING ladder costs 4 registers per conjunct, which is a
-register-allocator detail, not a contract.
+the limit itself: what a conjunct costs is a register-allocator detail, not a
+contract.
 """
 
 import pytest
@@ -23,6 +23,12 @@ import gnitz
 from _uid import uid as _uid
 
 
+
+
+def _cat_is_one_ladder(n: int) -> str:
+    """`n` conjuncts, each true exactly for `cat = 1` and none sharing an
+    instruction the builder could fold: `cat * k < k + 1` over distinct odd `k`."""
+    return " AND ".join(f"cat * {2 * i + 1} < {2 * i + 2}" for i in range(n))
 
 
 def _cap_error(exc) -> bool:
@@ -133,9 +139,8 @@ def test_having_conjunct_sweep(client, caps):
     _sweep(
         client,
         caps,
-        range(14, 21),
-        lambda n: "SELECT cat FROM hg GROUP BY cat HAVING "
-        + " AND ".join(["cat = 1"] * n),
+        range(10, 16),
+        lambda n: "SELECT cat FROM hg GROUP BY cat HAVING " + _cat_is_one_ladder(n),
         expected_rows=1,
     )
 
@@ -154,11 +159,12 @@ def test_in_list_sweep(client, caps):
 
 
 def test_computed_projection_sweep(client, caps):
-    """N computed projection items in a view."""
+    """N computed projection items in a view: one shared column load, then a
+    constant and an add apiece."""
     _sweep(
         client,
         caps,
-        range(19, 25),
+        range(29, 35),
         lambda n: "SELECT pk, " + ", ".join(f"a+{i} AS c{i}" for i in range(n)) + " FROM t",
         expected_rows=3,
     )
@@ -222,7 +228,7 @@ def test_ungrouped_wide_aggregate_sweep(client, caps):
 def test_adhoc_over_cap_projection_names_the_limit(client, caps):
     """The ad-hoc read path formats the same validator error: the limit itself,
     not the internal enum variant that carries it."""
-    sql = "SELECT pk, " + ", ".join(f"a+{i} AS c{i}" for i in range(22)) + " FROM t"
+    sql = "SELECT pk, " + ", ".join(f"a+{i} AS c{i}" for i in range(34)) + " FROM t"
     with pytest.raises(Exception) as e:
         client.execute_sql(sql, schema_name=caps)
     assert "registers" in str(e.value), f"got: {e.value}"
@@ -232,7 +238,7 @@ def test_adhoc_over_cap_projection_names_the_limit(client, caps):
 def test_uncompilable_hidden_segment_leaves_nothing(client, caps):
     """A chain whose *hidden* segment is the uncompilable one. The bundle is
     atomic, so neither the hidden segment nor the named view survives."""
-    pred = " AND ".join(["cat = 1"] * 20)
+    pred = _cat_is_one_ladder(20)
     with pytest.raises(Exception) as e:
         client.execute_sql(
             f"CREATE VIEW vh AS WITH g AS (SELECT cat FROM hg GROUP BY cat HAVING {pred}) "
@@ -259,7 +265,7 @@ def test_alter_view_rejection_keeps_the_old_view(client, caps):
     vid = client.resolve_table(caps, "va")[0]
     assert len(list(client.scan(vid))) == 2
 
-    pred = " AND ".join(["cat = 1"] * 20)
+    pred = _cat_is_one_ladder(20)
     with pytest.raises(Exception) as e:
         client.execute_sql(
             f"ALTER VIEW va AS SELECT cat FROM hg GROUP BY cat HAVING {pred}",
@@ -298,7 +304,7 @@ def test_rejected_ddl_leaves_no_directory(own_server):
         schema_dir = os.path.join(own_server.data_dir, "resid")
         before = sorted(os.listdir(schema_dir))
 
-        pred = " AND ".join(["cat = 1"] * 20)
+        pred = _cat_is_one_ladder(20)
         for i in range(3):
             with pytest.raises(Exception):
                 conn.execute_sql(

@@ -9,6 +9,7 @@ cap, now reachable from DML).
 
 import pytest
 import gnitz
+from _caps import first_rejected
 from _uid import uid as _uid
 
 U64_HIGH = 2**63 + 5  # crosses the signed boundary: negative as an i64
@@ -255,9 +256,9 @@ def test_do_update_with_null_into_not_null_column_errors(client, schema_name):
 
 
 def test_residual_register_cap(client, schema_name):
-    """The planner's expression builder never reuses a register, so an AND chain of k equality
-    conjuncts costs 4k - 1 registers (16 fit, 17 do not) and a string IN of N
-    items costs 2N - 1 (32 fit, 33 do not). The rejection names the limit."""
+    """A residual past the register cap is rejected naming the limit, and every
+    shorter one is served. The builder folds identical instructions, so the
+    conjuncts share nothing: `v * k < k + 1` over distinct odd `k`."""
     sn = schema_name
     _table(
         client,
@@ -266,22 +267,15 @@ def test_residual_register_cap(client, schema_name):
         [("(1, 0, 'a')")],
     )
 
-    def conjuncts(k):
-        return " AND ".join(f"v = {i}" for i in range(k))
+    def update(k):
+        conjuncts = " AND ".join(f"v * {2 * i + 1} < {2 * i + 2}" for i in range(k))
+        res = client.execute_sql(f"UPDATE t SET v = 1 WHERE {conjuncts}", schema_name=sn)
+        assert res[0]["count"] == 1, f"k={k}: the row satisfies every conjunct"
 
-    # 16 conjuncts = 63 registers — still servable.
-    res = client.execute_sql(
-        f"UPDATE t SET v = 1 WHERE {conjuncts(16)}", schema_name=sn
-    )
-    assert res[0]["count"] == 0
+    first_rejected(update, range(1, 64))
 
-    # 17 = 67 registers — rejected, with the limit in the message.
-    with pytest.raises(gnitz.GnitzError) as e:
-        client.execute_sql(f"UPDATE t SET v = 1 WHERE {conjuncts(17)}", schema_name=sn)
-    assert "64" in str(e.value), f"the message must name the limit: {e.value}"
-
-    # A 33-item string IN is 65 registers.
-    items = ", ".join(f"'x{i}'" for i in range(33))
-    with pytest.raises(gnitz.GnitzError) as e:
+    def delete_in(n):
+        items = ", ".join(f"'x{i}'" for i in range(n))
         client.execute_sql(f"DELETE FROM t WHERE s IN ({items})", schema_name=sn)
-    assert "64" in str(e.value), f"the message must name the limit: {e.value}"
+
+    first_rejected(delete_in, range(1, 64))

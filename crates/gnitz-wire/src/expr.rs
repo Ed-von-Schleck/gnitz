@@ -179,6 +179,57 @@ wire_enum! {
         StrLike = 76,
         /// ASCII-case-insensitive LIKE, same operand shape.
         StrIlike = 77,
+        /// `[op, a, 0]` — `IS [NOT] NULL` over a register of either class,
+        /// reading only its null lane; 0/1 into a scalar register, never NULL.
+        /// `IsNull` / `IsNotNull` read the batch bitmap without a load, and
+        /// alone serve a column no load opcode admits (U128, BLOB).
+        IsNullReg = 78,
+        IsNotNullReg = 79,
+        /// `[op, a, 0]` — the float unaries past the rounding family: each is
+        /// the operand's IEEE result (`SQRT(-1)` is NaN, `LN(0)` is -inf), so
+        /// none produces a NULL of its own.
+        FloatSqrt = 80,
+        FloatLn = 81,
+        FloatLog10 = 82,
+        FloatExp = 83,
+        /// `[op, a, 0]` — SIGN: -1 / 0 / 1 in the operand's own domain. The
+        /// integer form reads its source signed or unsigned per the
+        /// resolve-time U64 tracking (an unsigned value is never negative);
+        /// the float form spells NaN's sign as NaN.
+        FloatSign = 84,
+        IntSign = 85,
+        /// `[ExprOp::FloatPow, a, b]` — `POWER(a, b)` over two float registers,
+        /// IEEE `powf`.
+        FloatPow = 86,
+        /// `[op, src, n]` — LEFT / RIGHT: the first (last) `n` characters of
+        /// the string register `src`; a negative `n` drops that many from the
+        /// other end instead, as PostgreSQL reads it. A sub-view of the source;
+        /// never NULL of its own.
+        StrLeft = 87,
+        StrRight = 88,
+        /// `[ExprOp::StrPos, hay, needle]` — the 1-based *character* index of
+        /// the first occurrence of `needle` in `hay` into a scalar register, 0
+        /// when absent, 1 for an empty needle.
+        StrPos = 89,
+        /// `[ExprOp::StrReverse, a, 0]` — the characters in reverse order, a
+        /// fresh arena copy.
+        StrReverse = 90,
+        /// `[ExprOp::StrReplace, s, from | (to << 16)]` — every non-overlapping
+        /// occurrence of `from` in `s` replaced by `to`, left to right. An empty
+        /// `from` leaves `s` unchanged. A result past `u32::MAX` bytes is NULL,
+        /// `ExprOp::StrConcat`'s rule.
+        StrReplace = 91,
+        /// `[op, s, n | (fill << 16)]` — LPAD / RPAD: `s` padded on the left
+        /// (right) with `fill` repeated to `n` *characters*; a longer `s` is
+        /// truncated to its first `n` characters, `n <= 0` is the empty string,
+        /// an empty `fill` pads nothing. A result past `u32::MAX` bytes is NULL.
+        StrLpad = 92,
+        StrRpad = 93,
+        /// `[ExprOp::StrSplitPart, s, delim | (n << 16)]` — the `n`-th field of
+        /// `s` split on `delim`, 1-based, from the right when negative; empty
+        /// past the last field, NULL for `n = 0`, and the whole string for field
+        /// ±1 of an empty `delim`. A sub-view of the source.
+        StrSplitPart = 94,
     }
 }
 

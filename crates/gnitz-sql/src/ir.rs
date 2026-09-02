@@ -3,6 +3,7 @@ use gnitz_core::{ColumnDef, TypeCode};
 
 /// TRIM's mode is a wire operand, so the wire crate owns its definition; the IR
 /// carries it verbatim.
+pub(crate) use gnitz_expr::FloatUnaryOp;
 pub(crate) use gnitz_wire::TrimMode;
 
 #[derive(Clone, Debug, Copy, PartialEq)]
@@ -15,13 +16,10 @@ pub(crate) enum AggFunc {
     Avg,
 }
 
-/// The bound-expression IR, generic over its leaf reference type `R`. The three
-/// leaf positions (`ColRef`, `IsNull`, `IsNotNull`) carry an `R`; every other
-/// variant is structural and leaf-agnostic. Two instantiations are live: the
-/// ad-hoc read path pins `R = usize` (the [`BoundExpr`] alias) — a resolved
-/// column index into a batch schema — and the view path pins `R = HirRef`, a
-/// column identity that survives the structural rewrites. Neither needed a
-/// change to this enum.
+/// The bound-expression IR, generic over its leaf reference type `R`, which only
+/// `ColRef` carries. The ad-hoc read path pins `R = usize` (the [`BoundExpr`]
+/// alias), a resolved column index into a batch schema; the view path pins
+/// `R = HirRef`, a column identity that survives the structural rewrites.
 /// `PartialEq` is structural equality over the *bound* form — what makes "the same
 /// expression written twice" decidable after names resolve, so `t.a + b` and
 /// `a + b` are one expression. Not `Eq`, because `LitFloat` compares by `f64`.
@@ -47,8 +45,13 @@ pub(crate) enum BExpr<R> {
     LitNull,
     BinOp(Box<BExpr<R>>, BinOp, Box<BExpr<R>>),
     UnaryOp(UnaryOp, Box<BExpr<R>>),
-    IsNull(R),
-    IsNotNull(R),
+    /// `inner IS NULL` (`IS NOT NULL` when `want_null` is false). One node for
+    /// every operand: a bare nullable column lowers to the column-bitmap opcode,
+    /// anything else to a null test over the register it computes into.
+    NullTest {
+        inner: Box<BExpr<R>>,
+        want_null: bool,
+    },
     AggCall {
         func: AggFunc,
         arg: Option<Box<BExpr<R>>>,
@@ -85,7 +88,7 @@ pub(crate) enum BExpr<R> {
     },
     StrCall {
         f: StrFunc,
-        arg: Box<BExpr<R>>,
+        args: Vec<BExpr<R>>,
     },
     /// `SUBSTRING(s FROM start [FOR len])` / `SUBSTR(s, start[, len])`. The
     /// bounds are arbitrary integer expressions, evaluated per row.
@@ -120,13 +123,43 @@ pub(crate) enum BExpr<R> {
     },
 }
 
-/// The unary string transforms and measures.
+/// The string functions: transforms, measures and the multi-argument
+/// producers, one node shape for all of them. The argument list's length and
+/// classes are [`StrFunc::signature`]'s, established by the binder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StrFunc {
     Upper,
     Lower,
     LenBytes,
     LenChars,
+    Reverse,
+    Left,
+    Right,
+    /// `STRPOS(hay, needle)` and `POSITION(needle IN hay)`: 1-based character
+    /// index, 0 when absent.
+    Pos,
+    Replace,
+    Lpad,
+    Rpad,
+    SplitPart,
+}
+
+/// The class of one string-function argument. A trailing `StrOr` slot may be
+/// omitted from the call and then takes its default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StrArg {
+    Str,
+    Int,
+    StrOr(&'static str),
+}
+
+impl StrArg {
+    pub(crate) fn default(self) -> Option<&'static str> {
+        match self {
+            StrArg::StrOr(d) => Some(d),
+            StrArg::Str | StrArg::Int => None,
+        }
+    }
 }
 
 impl StrFunc {
@@ -135,22 +168,68 @@ impl StrFunc {
     /// — so a declared STRING column and a scalar register cannot disagree.
     pub(crate) fn result_type(self) -> TypeCode {
         match self {
-            StrFunc::Upper | StrFunc::Lower => TypeCode::String,
-            StrFunc::LenBytes | StrFunc::LenChars => TypeCode::I64,
+            StrFunc::LenBytes | StrFunc::LenChars | StrFunc::Pos => TypeCode::I64,
+            StrFunc::Upper
+            | StrFunc::Lower
+            | StrFunc::Reverse
+            | StrFunc::Left
+            | StrFunc::Right
+            | StrFunc::Replace
+            | StrFunc::Lpad
+            | StrFunc::Rpad
+            | StrFunc::SplitPart => TypeCode::String,
+        }
+    }
+
+    /// The argument classes in call order — the one statement of each
+    /// function's arity, which the binder sizes the list by and lowering reads
+    /// the operands through.
+    pub(crate) fn signature(self) -> &'static [StrArg] {
+        use StrArg::{Int, Str};
+        match self {
+            StrFunc::Upper | StrFunc::Lower | StrFunc::LenBytes | StrFunc::LenChars | StrFunc::Reverse => &[Str],
+            StrFunc::Left | StrFunc::Right => &[Str, Int],
+            StrFunc::Pos => &[Str, Str],
+            StrFunc::Replace => &[Str, Str, Str],
+            StrFunc::Lpad | StrFunc::Rpad => &[Str, Int, StrArg::StrOr(" ")],
+            StrFunc::SplitPart => &[Str, Str, Int],
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NumFunc {
-    Abs,
-    Floor,
-    Ceil,
-    Trunc,
-    /// `ROUND(x, n)`, with `ROUND(x)` as `Round(0)`. The scale rides the node so
+    /// A float unary kernel, which over an integer register is the identity for
+    /// the rounding family, an integer kernel for ABS, NEG and SIGN, and a lift
+    /// to F64 for the transcendentals — the split [`NumFunc::result_type`]
+    /// states and lowering follows.
+    Unary(FloatUnaryOp),
+    /// `ROUND(x, n)` — `ROUND(x)` is `Unary(Round)`. The scale rides the node so
     /// lowering, which knows the argument's type, can fold the integer case
     /// instead of the binder committing to float arithmetic it cannot type.
     Round(i8),
+}
+
+impl NumFunc {
+    /// What this function produces over an argument of type `arg`. Read both by
+    /// `infer_type_with`, to type the column a view declares, and by lowering,
+    /// to class the register it writes — so the two cannot disagree.
+    pub(crate) fn result_type(self, arg: TypeCode) -> TypeCode {
+        use FloatUnaryOp as F;
+        match self {
+            // The transcendentals and a negative scale always lift to float.
+            NumFunc::Unary(F::Sqrt | F::Ln | F::Log10 | F::Exp) => TypeCode::F64,
+            NumFunc::Round(n) if n < 0 => TypeCode::F64,
+            // SIGN's -1/0/1 is signed whatever integer it reads.
+            NumFunc::Unary(F::Sign) if arg.is_float() => TypeCode::F64,
+            NumFunc::Unary(F::Sign) => TypeCode::I64,
+            // The identity or an integer kernel over an integer register, the
+            // IEEE result over a float one: the argument's own register image.
+            NumFunc::Unary(F::Neg | F::Abs | F::Floor | F::Ceil | F::Round | F::Trunc) | NumFunc::Round(_) => {
+                arg.register_image()
+            }
+        }
+    }
 }
 
 /// The runtime bound-expression IR: [`BExpr`] with its leaf reference resolved to
@@ -184,8 +263,8 @@ impl<R> BExpr<R> {
     /// Infer the result type, parameterized over how a leaf reference is typed.
     /// `ColRef` is the only leaf-typed arm — it consults `leaf_ty`; every other
     /// arm is structural (literals fix a type, comparisons/tests are `I64`,
-    /// arithmetic/CASE fold via `unify_blend_type`). `IsNull`/`IsNotNull`/`InList`
-    /// are boolean and never consult `leaf_ty`. The runtime `usize` entry point
+    /// arithmetic/CASE fold via `unify_blend_type`). `NullTest`/`InList` are
+    /// boolean and never consult `leaf_ty`. The runtime `usize` entry point
     /// is [`BExpr::infer_type`].
     pub(crate) fn infer_type_with<F: Fn(&R) -> TypeCode>(&self, leaf_ty: &F) -> TypeCode {
         match self {
@@ -206,6 +285,7 @@ impl<R> BExpr<R> {
                     o if o.as_cmp().is_some() => TypeCode::I64,
                     BinOp::And | BinOp::Or => TypeCode::I64,
                     BinOp::Concat => TypeCode::String,
+                    BinOp::Pow => TypeCode::F64,
                     // Arithmetic preserves U64 (and floats), mirroring the engine's
                     // `reg_u64`: a materialized `u64 + u64` column must stay
                     // U64 so a downstream compare re-seeds the unsigned variant.
@@ -214,7 +294,7 @@ impl<R> BExpr<R> {
             }
             BExpr::UnaryOp(UnaryOp::Neg, inner) => inner.infer_type_with(leaf_ty),
             BExpr::UnaryOp(UnaryOp::Not, _) => TypeCode::I64,
-            BExpr::IsNull(_) | BExpr::IsNotNull(_) => TypeCode::I64,
+            BExpr::NullTest { .. } => TypeCode::I64,
             BExpr::AggCall { func, arg } => match func {
                 AggFunc::Avg => TypeCode::F64,
                 AggFunc::Min | AggFunc::Max => {
@@ -230,13 +310,7 @@ impl<R> BExpr<R> {
             // The membership and pattern tests are booleans, like the comparison
             // `BinOp` arm.
             BExpr::InList { .. } | BExpr::Like { .. } => TypeCode::I64,
-            // Every transform is the identity on an integer register and its own
-            // IEEE result on a float one — i.e. the argument's register image.
-            // Only a negative ROUND scale forces the f64 lift on an integer.
-            BExpr::Func { f, arg } => match f {
-                NumFunc::Round(n) if *n < 0 => TypeCode::F64,
-                _ => arg.infer_type_with(leaf_ty).register_image(),
-            },
+            BExpr::Func { f, arg } => f.result_type(arg.infer_type_with(leaf_ty)),
             // Seeded with `unify_blend_type`'s neutral element, so a one-argument
             // list types as its own register image and an empty one as I64.
             BExpr::MinMaxN { args, .. } => args
@@ -274,34 +348,22 @@ impl<R> BExpr<R> {
     }
 }
 
-/// A leaf-bearing position handed to [`BExpr::try_rebuild`]'s callback: a bare
-/// column reference, or a null test over one (`true` = `IS NULL`). These are the
-/// only three arms that carry an `R`, so they are the only ones a rebuild has to
-/// decide anything about.
-enum Leaf<'a, R> {
-    Col(&'a R),
-    NullTest(&'a R, bool),
-}
-
 impl<R> BExpr<R> {
-    /// Rebuild the expression structurally, handing each leaf-bearing position to
-    /// `leaf`. The one **rebuilding** walk: every other arm just recurses, so a
-    /// new `BExpr` variant is added here once rather than to each caller below.
-    /// (`for_each_ref` is the read-only twin, and `infer_type_with` the typing
-    /// one; a new variant fails to compile in all three.)
-    ///
-    /// `leaf` returns a whole `BExpr<S>`, not a reference, which is what lets the
-    /// two instantiations differ in kind — one keeps a leaf a leaf, the other
-    /// expands it into an arbitrary sub-expression.
-    fn try_rebuild<S, E>(&self, leaf: &impl Fn(Leaf<'_, R>) -> Result<BExpr<S>, E>) -> Result<BExpr<S>, E> {
+    /// Rebuild the expression structurally, replacing each `ColRef` by whatever
+    /// `leaf` returns for it — another leaf, or a whole sub-expression. The one
+    /// rebuilding walk (`for_each_ref` reads, `infer_type_with` types), so a new
+    /// variant is added in three places and fails to compile until it is.
+    pub(crate) fn try_rebuild<S, E>(&self, leaf: &impl Fn(&R) -> Result<BExpr<S>, E>) -> Result<BExpr<S>, E> {
         let go = |e: &BExpr<R>| e.try_rebuild(leaf);
         let boxed = |e: &BExpr<R>| go(e).map(Box::new);
         let opt = |e: Option<&BExpr<R>>| e.map(boxed).transpose();
         let all = |es: &[BExpr<R>]| es.iter().map(go).collect::<Result<Vec<_>, E>>();
         Ok(match self {
-            BExpr::ColRef(r) => leaf(Leaf::Col(r))?,
-            BExpr::IsNull(r) => leaf(Leaf::NullTest(r, true))?,
-            BExpr::IsNotNull(r) => leaf(Leaf::NullTest(r, false))?,
+            BExpr::ColRef(r) => leaf(r)?,
+            BExpr::NullTest { inner, want_null } => BExpr::NullTest {
+                inner: boxed(inner)?,
+                want_null: *want_null,
+            },
             BExpr::LitInt(v) => BExpr::LitInt(*v),
             BExpr::LitFloat(v) => BExpr::LitFloat(*v),
             BExpr::LitStr(s) => BExpr::LitStr(s.clone()),
@@ -336,9 +398,9 @@ impl<R> BExpr<R> {
                 inner: boxed(inner)?,
                 items: all(items)?,
             },
-            BExpr::StrCall { f, arg } => BExpr::StrCall {
+            BExpr::StrCall { f, args } => BExpr::StrCall {
                 f: *f,
-                arg: boxed(arg)?,
+                args: all(args)?,
             },
             BExpr::Substr { s, start, len } => BExpr::Substr {
                 s: boxed(s)?,
@@ -360,40 +422,12 @@ impl<R> BExpr<R> {
         })
     }
 
-    /// Rebuild with every leaf reference mapped through `f`; each leaf stays a
-    /// leaf. `hir::physical::resolve_refs` (`ColId → usize`) is its instantiation.
-    pub(crate) fn try_map_refs<S, E>(&self, f: &impl Fn(&R) -> Result<S, E>) -> Result<BExpr<S>, E> {
-        self.try_rebuild(&|l| {
-            Ok(match l {
-                Leaf::Col(r) => BExpr::ColRef(f(r)?),
-                Leaf::NullTest(r, true) => BExpr::IsNull(f(r)?),
-                Leaf::NullTest(r, false) => BExpr::IsNotNull(f(r)?),
-            })
-        })
-    }
-
-    /// Rebuild, expanding each leaf-bearing position into an arbitrary
-    /// sub-expression: `on_col` replaces a `ColRef(r)`, `on_null` replaces an
-    /// `IsNull(r)` / `IsNotNull(r)` (its `bool` is `want_null`). The leaf-to-
-    /// *expression* substitution walk — distinct from [`Self::try_map_refs`],
-    /// which keeps each leaf a leaf; the HIR's subquery decorrelation and
-    /// mark-constant folding are its two instantiations.
-    pub(crate) fn try_expand_leaves<E>(
-        &self,
-        on_col: &impl Fn(&R) -> Result<BExpr<R>, E>,
-        on_null: &impl Fn(&R, bool) -> Result<BExpr<R>, E>,
-    ) -> Result<BExpr<R>, E> {
-        self.try_rebuild(&|l| match l {
-            Leaf::Col(r) => on_col(r),
-            Leaf::NullTest(r, want_null) => on_null(r, want_null),
-        })
-    }
-
-    /// Visit every leaf reference (the `ColRef` / `IsNull` / `IsNotNull`
-    /// positions), depth-first. The one reference-collection walk.
+    /// Visit every leaf reference (the `ColRef` positions), depth-first. The
+    /// one reference-collection walk.
     pub(crate) fn for_each_ref(&self, f: &mut impl FnMut(&R)) {
         match self {
-            BExpr::ColRef(r) | BExpr::IsNull(r) | BExpr::IsNotNull(r) => f(r),
+            BExpr::ColRef(r) => f(r),
+            BExpr::NullTest { inner, .. } => inner.for_each_ref(f),
             BExpr::LitInt(_) | BExpr::LitFloat(_) | BExpr::LitStr(_) | BExpr::LitWide(_) | BExpr::LitNull => {}
             BExpr::BinOp(l, _, r) => {
                 l.for_each_ref(f);
@@ -423,7 +457,7 @@ impl<R> BExpr<R> {
                     i.for_each_ref(f);
                 }
             }
-            BExpr::StrCall { arg, .. } => arg.for_each_ref(f),
+            BExpr::StrCall { args, .. } => args.iter().for_each(|a| a.for_each_ref(f)),
             BExpr::Substr { s, start, len } => {
                 s.for_each_ref(f);
                 start.for_each_ref(f);
@@ -485,6 +519,9 @@ pub(crate) enum BinOp {
     Or,
     /// SQL `||`. NULL-propagating, unlike `CONCAT`.
     Concat,
+    /// `POWER(a, b)`: always float, whatever the operands. No operator
+    /// spelling — the generic dialect reads `^` as XOR.
+    Pow,
 }
 
 impl BinOp {
@@ -529,6 +566,7 @@ impl BinOp {
             BinOp::Sub => Some(FloatArithOp::Sub),
             BinOp::Mul => Some(FloatArithOp::Mul),
             BinOp::Div => Some(FloatArithOp::Div),
+            BinOp::Pow => Some(FloatArithOp::Pow),
             _ => None,
         }
     }

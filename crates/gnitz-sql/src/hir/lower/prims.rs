@@ -32,12 +32,9 @@ pub(crate) fn multi_null_filter_prog(
     let cols: Vec<usize> = cols.iter().copied().filter(|&c| coldefs[c].is_nullable).collect();
     assert!(!cols.is_empty(), "a NULL-key gate over keys none of which is nullable");
 
-    let leaf = |c: usize| {
-        if want_null {
-            BoundExpr::IsNull(c)
-        } else {
-            BoundExpr::IsNotNull(c)
-        }
+    let leaf = |c: usize| BoundExpr::NullTest {
+        inner: Box::new(BoundExpr::ColRef(c)),
+        want_null,
     };
     let op = if want_null { BinOp::Or } else { BinOp::And };
     let mut expr = leaf(cols[0]);

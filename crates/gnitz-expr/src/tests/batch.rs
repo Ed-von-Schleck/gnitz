@@ -745,33 +745,69 @@ fn float_minmax2_uses_total_cmp_order() {
 // String registers
 // ---------------------------------------------------------------------------
 
-/// The program under test over one nullable STRING column (payload slot 0,
-/// column 1), with the view to drive it over. `mk` builds the instructions given
-/// the loaded source register; the last one's `dst` is the result.
+/// [`mixed_prog`] over one nullable STRING column (payload slot 0, column 1)
+/// with per-row nulls; `mk` gets its loaded register.
 fn str_prog(
     vals: &[&[u8]],
     nulls: &[bool],
     consts: Vec<Vec<u8>>,
     mk: impl Fn(Reg) -> Vec<LogicalInstr>,
 ) -> (Evaluator, TestView) {
-    let schema = schema_pk_strings(1, true);
-    let rows: Vec<&[&[u8]]> = vals.iter().map(std::slice::from_ref).collect();
-    let mut view = make_string_view(&schema, &rows);
+    let (ev, mut view) = mixed_prog(&[vals], &[], consts, |r| mk(r[0]));
     for (row, &is_null) in nulls.iter().enumerate() {
         if is_null {
             view.set_null(row, 0);
         }
     }
-    let mut instrs = vec![LogicalInstr::LoadColStr { col: 1 }];
-    instrs.extend(mk(Reg(0)));
+    (ev, view)
+}
+
+/// A program over `strs.len()` nullable string columns followed by
+/// `ints.len()` nullable I64 columns, each given as its column of values; `mk`
+/// gets the loaded registers in that order and its last instruction is the
+/// result.
+fn mixed_prog(
+    strs: &[&[&[u8]]],
+    ints: &[&[i64]],
+    consts: Vec<Vec<u8>>,
+    mk: impl Fn(&[Reg]) -> Vec<LogicalInstr>,
+) -> (Evaluator, TestView) {
+    let rows = strs.first().map_or_else(|| ints[0].len(), |c| c.len());
+    let mut cols = vec![(type_code::U64, false)];
+    cols.extend(strs.iter().map(|_| (type_code::STRING, true)));
+    cols.extend(ints.iter().map(|_| (type_code::I64, true)));
+    let schema = TestSchema::new(&cols, &[0]);
+    let mut view = TestView::new(rows, schema.pk_stride());
+    push_payload_cols(&mut view, &schema);
+    for row in 0..rows {
+        set_row_pk(&mut view, &schema, row, row as u64 + 1);
+        for (pi, col) in strs.iter().enumerate() {
+            view.set_string(row, pi, col[row]);
+        }
+        for (k, col) in ints.iter().enumerate() {
+            view.set_payload(row, strs.len() + k, &col[row].to_le_bytes());
+        }
+    }
+    let mut instrs: Vec<LogicalInstr> = (0..strs.len())
+        .map(|k| LogicalInstr::LoadColStr { col: k as u32 + 1 })
+        .collect();
+    instrs.extend((0..ints.len()).map(|k| LogicalInstr::LoadColInt {
+        col: (strs.len() + k) as u32 + 1,
+    }));
+    let regs: Vec<Reg> = (0..instrs.len()).map(|i| Reg(i as u16)).collect();
+    instrs.extend(mk(&regs));
     let result = Reg(instrs.len() as u16 - 1);
     (scalar_prog(&schema, instrs, result, consts), view)
 }
 
-/// Read a *string* register back per row.
+/// Every row's *string* register, read back.
+fn str_rows(ev: &Evaluator, view: &TestView, n: usize) -> Vec<(Vec<u8>, bool)> {
+    (0..n).map(|i| row_str(ev, view, i)).collect()
+}
+
 fn run_str_rows(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(Reg) -> Vec<LogicalInstr>) -> Vec<(Vec<u8>, bool)> {
     let (ev, view) = str_prog(vals, nulls, vec![], mk);
-    (0..vals.len()).map(|i| row_str(&ev, &view, i)).collect()
+    str_rows(&ev, &view, vals.len())
 }
 
 /// The same, but reading a *scalar* register — LENGTH, LIKE, the compares, the
@@ -981,8 +1017,8 @@ fn substring_window_matches_postgres_and_is_total() {
     assert_eq!(one(b"abcdefghijklmnop", 14, Some(2)).0, b"no");
 }
 
-/// `StrSubstr` widens its `start` and `len` registers through `widen_reg`, whose
-/// arm is chosen by the register's U64 tracking. Every other substring test
+/// `StrSubstr` reads its `start` and `len` through `IntReg`, whose arm is chosen
+/// by the register's U64 tracking. Every other substring test
 /// drives the bounds from `LoadConst`, which is always signed-tracked, so the
 /// unsigned arm is only reachable from a `U64` column — `SUBSTRING(s FROM ucol)`.
 #[test]
@@ -1702,5 +1738,320 @@ fn pk_loads_agree_with_the_wire_opk_decoder() {
             let want = gnitz_wire::decode_opk_i64(&view.get_pk_bytes(row)[..fi.width()], fi);
             assert_eq!(got, want, "type {tc}, row {row}: LoadPk disagrees with decode_opk_i64");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The register null test
+// ---------------------------------------------------------------------------
+
+/// `IS [NOT] NULL` over a register reads its null lane whatever class the
+/// register is, and its own result is never NULL.
+#[test]
+fn is_null_reg_reads_the_null_lane_of_either_class() {
+    for invert in [false, true] {
+        let got = run_unary_rows(type_code::I64, &[5, 0], &[false, true], |a| LogicalInstr::IsNullReg {
+            a,
+            invert,
+        });
+        let want = |is_null: bool| ((is_null ^ invert) as i64, false);
+        assert_eq!(got, [want(false), want(true)], "invert = {invert}");
+        let got = run_str_to_scalar(&[b"abc", b""], &[false, true], |a| {
+            vec![LogicalInstr::IsNullReg { a, invert }]
+        });
+        assert_eq!(
+            got,
+            [Some((invert) as i64), Some((!invert) as i64)],
+            "string operand, invert = {invert}"
+        );
+    }
+}
+
+/// On the `no_nulls` arm no lane exists and nothing is NULL: the answer is the
+/// constant, read off the value lane the kernel filled.
+#[test]
+fn is_null_reg_on_the_no_nulls_arm_is_the_constant() {
+    let schema = TestSchema::new(&[(type_code::U64, false), (type_code::I64, false)], &[0]);
+    let view = make_n_col_view(&schema, 3, |row, _| row as i64, |_, _| false);
+    for invert in [false, true] {
+        let prog = resolved(
+            &schema,
+            vec![
+                LogicalInstr::LoadColInt { col: 1 },
+                LogicalInstr::IsNullReg { a: Reg(0), invert },
+            ],
+            Reg(1),
+        );
+        assert!(prog.no_nulls);
+        let mut scratch = EvalScratch::new(&prog);
+        drive(&prog, &view, 0, 3, &mut scratch);
+        assert_eq!(&scratch.regs[MORSEL..MORSEL + 3], &[invert as i64; 3]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SIGN, the transcendentals and POWER
+// ---------------------------------------------------------------------------
+
+/// SIGN over an unsigned register reads it as never negative — the `signed`
+/// flag the resolve-time tracking sets — and over a float keeps the domain.
+#[test]
+fn sign_reads_its_operand_signedness_and_keeps_the_float_domain() {
+    let signed = run_unary_rows(type_code::I64, &[-5, 0, 7, i64::MIN], &[false; 4], |a| {
+        LogicalInstr::IntUnary {
+            op: IntUnaryOp::Sign,
+            a,
+        }
+    });
+    assert_eq!(signed, [(-1, false), (0, false), (1, false), (-1, false)]);
+    let unsigned = run_unary_rows(type_code::U64, &[u64::MAX as i64, 0], &[false; 2], |a| {
+        LogicalInstr::IntUnary {
+            op: IntUnaryOp::Sign,
+            a,
+        }
+    });
+    assert_eq!(unsigned, [(1, false), (0, false)]);
+    let vals: Vec<i64> = [-2.5, 0.0, -0.0, 3.0, f64::NAN]
+        .iter()
+        .map(|&f| encode_f64(f))
+        .collect();
+    let got = run_unary_rows(type_code::I64, &vals, &[false; 5], |a| LogicalInstr::FloatUnary {
+        op: FloatUnaryOp::Sign,
+        a,
+    });
+    let got: Vec<f64> = got.iter().map(|&(v, _)| decode_f64(v)).collect();
+    assert_eq!(&got[..4], &[-1.0, 0.0, 0.0, 1.0]);
+    assert!(got[4].is_nan(), "SIGN(NaN) is NaN, not a sign");
+}
+
+/// Every transcendental is its operand's IEEE result — a domain error is NaN
+/// or an infinity, never a NULL, which is what keeps them off the null-making
+/// list.
+#[test]
+fn transcendentals_and_power_are_the_ieee_result() {
+    let f = |op: FloatUnaryOp, x: f64| -> (f64, bool) {
+        let [(v, null)] = run_unary_rows(type_code::I64, &[encode_f64(x)], &[false], |a| {
+            LogicalInstr::FloatUnary { op, a }
+        })[..] else {
+            unreachable!()
+        };
+        (decode_f64(v), null)
+    };
+    assert_eq!(f(FloatUnaryOp::Sqrt, 4.0), (2.0, false));
+    assert!(f(FloatUnaryOp::Sqrt, -1.0).0.is_nan());
+    assert_eq!(f(FloatUnaryOp::Ln, 0.0), (f64::NEG_INFINITY, false));
+    assert_eq!(f(FloatUnaryOp::Ln, std::f64::consts::E), (1.0, false));
+    assert_eq!(f(FloatUnaryOp::Log10, 1000.0), (3.0, false));
+    assert_eq!(f(FloatUnaryOp::Exp, 0.0), (1.0, false));
+    let got = run_binary_rows(
+        type_code::I64,
+        &[encode_f64(2.0), encode_f64(0.0)],
+        &[encode_f64(10.0), encode_f64(-1.0)],
+        &[false; 2],
+        &[false; 2],
+        |a, b| LogicalInstr::FloatArith {
+            op: FloatArithOp::Pow,
+            a,
+            b,
+        },
+    );
+    assert_eq!(decode_f64(got[0].0), 1024.0);
+    assert_eq!(decode_f64(got[1].0), f64::INFINITY);
+    assert!(!got[1].1, "0 ^ -1 is an infinity, not NULL");
+}
+
+// ---------------------------------------------------------------------------
+// The multi-operand string producers
+// ---------------------------------------------------------------------------
+
+/// LEFT/RIGHT count characters, a negative count drops from the other end,
+/// and an oversized one is the whole string.
+#[test]
+fn left_and_right_count_characters_from_either_end() {
+    let s: &[&[u8]] = &["héllo".as_bytes(); 5];
+    let n: &[i64] = &[2, -1, 10, 0, -10];
+    let run = |left: bool| {
+        let (ev, view) = mixed_prog(&[s], &[n], vec![], |r| {
+            vec![LogicalInstr::StrSide {
+                src: r[0],
+                n_reg: r[1],
+                left,
+            }]
+        });
+        str_rows(&ev, &view, 5).into_iter().map(|(v, _)| v).collect::<Vec<_>>()
+    };
+    let want = |ss: [&str; 5]| ss.iter().map(|x| x.as_bytes().to_vec()).collect::<Vec<_>>();
+    assert_eq!(run(true), want(["hé", "héll", "héllo", "", ""]));
+    assert_eq!(run(false), want(["lo", "éllo", "héllo", "", ""]));
+}
+
+/// STRPOS is a 1-based *character* index, 0 when absent, 1 for an empty needle.
+#[test]
+fn strpos_is_a_character_index() {
+    let hay: &[&[u8]] = &["héllo".as_bytes(); 4];
+    let needle: &[&[u8]] = &[b"l", b"", b"z", "éll".as_bytes()];
+    let (ev, view) = mixed_prog(&[hay, needle], &[], vec![], |r| {
+        vec![LogicalInstr::StrPos {
+            hay: r[0],
+            needle: r[1],
+        }]
+    });
+    let got: Vec<Option<i64>> = (0..4).map(|i| row_value(&ev, &view, i)).collect();
+    assert_eq!(got, [Some(3), Some(1), Some(0), Some(2)]);
+}
+
+/// REVERSE reverses characters, so a multibyte sequence stays intact.
+#[test]
+fn reverse_reverses_characters_not_bytes() {
+    let got = run_str_rows(&["héllo".as_bytes(), b"", b"a"], &[false; 3], |a| {
+        vec![LogicalInstr::StrReverse { a }]
+    });
+    assert_eq!(got[0].0, "olléh".as_bytes());
+    assert_eq!(got[1].0, b"");
+    assert_eq!(got[2].0, b"a");
+}
+
+/// REPLACE rewrites every non-overlapping occurrence left to right; an empty
+/// or absent pattern passes the subject through unchanged.
+#[test]
+fn replace_rewrites_every_occurrence_left_to_right() {
+    let s: &[&[u8]] = &[b"aXbXc", b"abc", b"aaa", b"abc", b"XX"];
+    let from: &[&[u8]] = &[b"X", b"", b"aa", b"z", b"X"];
+    let to: &[&[u8]] = &[b"--", b"z", b"b", b"q", b""];
+    let (ev, view) = mixed_prog(&[s, from, to], &[], vec![], |r| {
+        vec![LogicalInstr::StrReplace {
+            s: r[0],
+            from: r[1],
+            to: r[2],
+        }]
+    });
+    let got: Vec<Vec<u8>> = str_rows(&ev, &view, 5).into_iter().map(|(v, _)| v).collect();
+    assert_eq!(
+        got,
+        [
+            b"a--b--c".to_vec(),
+            b"abc".into(),
+            b"ba".into(),
+            b"abc".into(),
+            b"".into()
+        ]
+    );
+}
+
+/// The subject and the replacement may both live in the arena the kernel is
+/// growing: the views are re-resolved across every push.
+#[test]
+fn replace_over_arena_operands_rewrites_correctly() {
+    let s: &[&[u8]] = &[b"axbxc"];
+    let from: &[&[u8]] = &[b"X"];
+    let to: &[&[u8]] = &[b"yy"];
+    let (ev, view) = mixed_prog(&[s, from, to], &[], vec![], |r| {
+        vec![
+            LogicalInstr::StrCase { a: r[0], upper: true },
+            LogicalInstr::StrCase { a: r[2], upper: true },
+            LogicalInstr::StrReplace {
+                s: Reg(3),
+                from: r[1],
+                to: Reg(4),
+            },
+        ]
+    });
+    assert_eq!(row_str(&ev, &view, 0).0, b"AYYBYYC");
+}
+
+/// LPAD/RPAD measure in characters, cycle the fill, truncate a longer subject
+/// to its first `n` characters, and pad nothing for an empty fill.
+#[test]
+fn pad_measures_characters_and_truncates_a_long_subject() {
+    let s: &[&[u8]] = &["hé".as_bytes(), "hé".as_bytes(), b"hello", b"a", b"a", b"a"];
+    let n: &[i64] = &[5, 5, 3, 0, 3, -2];
+    let fill: &[&[u8]] = &[b"xy", "éx".as_bytes(), b"x", b"x", b"", b"x"];
+    let run = |left: bool| {
+        let (ev, view) = mixed_prog(&[s, fill], &[n], vec![], |r| {
+            vec![LogicalInstr::StrPad {
+                s: r[0],
+                n_reg: r[2],
+                fill: r[1],
+                left,
+            }]
+        });
+        str_rows(&ev, &view, 6).into_iter().map(|(v, _)| v).collect::<Vec<_>>()
+    };
+    let want = |ss: [&str; 6]| ss.iter().map(|x| x.as_bytes().to_vec()).collect::<Vec<_>>();
+    assert_eq!(run(true), want(["xyxhé", "éxéhé", "hel", "", "a", ""]));
+    assert_eq!(run(false), want(["héxyx", "hééxé", "hel", "", "a", ""]));
+}
+
+/// SPLIT_PART indexes fields from either end, is empty past the last field,
+/// treats an empty delimiter as one field, and is NULL for field zero.
+#[test]
+fn split_part_indexes_fields_from_either_end_and_nulls_on_zero() {
+    let s: &[&[u8]] = &[b"a,b,c".as_slice(); 8];
+    let d: &[&[u8]] = &[b",", b",", b",", b",", b",", b"", b"", b","];
+    let n: &[i64] = &[2, -1, 5, -5, 1, 1, 2, 0];
+    let (ev, view) = mixed_prog(&[s, d], &[n], vec![], |r| {
+        vec![LogicalInstr::StrSplitPart {
+            s: r[0],
+            delim: r[1],
+            n_reg: r[2],
+        }]
+    });
+    let got = str_rows(&ev, &view, 8);
+    let want: Vec<(Vec<u8>, bool)> = [
+        (b"b".to_vec(), false),
+        (b"c".to_vec(), false),
+        (b"".to_vec(), false),
+        (b"".to_vec(), false),
+        (b"a".to_vec(), false),
+        (b"a,b,c".to_vec(), false),
+        (b"".to_vec(), false),
+        (b"".to_vec(), true),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(got, want);
+}
+
+/// A NULL operand of any class makes the producer's row NULL — the shared
+/// propagation over the mixed operand list.
+#[test]
+fn string_producers_propagate_a_null_operand_of_either_class() {
+    let s: &[&[u8]] = &[b"abc", b"abc"];
+    let n: &[i64] = &[1, 1];
+    let (ev, mut view) = mixed_prog(&[s], &[n], vec![], |r| {
+        vec![LogicalInstr::StrSide {
+            src: r[0],
+            n_reg: r[1],
+            left: true,
+        }]
+    });
+    view.set_null(0, 0);
+    view.set_null(1, 1);
+    assert!(row_str(&ev, &view, 0).1, "NULL subject");
+    assert!(row_str(&ev, &view, 1).1, "NULL count");
+}
+
+/// A scalar program's result register is read as a value, so a word-level
+/// boolean producer (`NOT`, the register null test) must unpack into it even
+/// though nothing else reads the register.
+#[test]
+fn a_word_level_boolean_scalar_result_is_unpacked() {
+    let got = run_unary_rows(type_code::I64, &[5, 0, 3], &[false, false, true], |a| {
+        LogicalInstr::BoolNot { a }
+    });
+    assert_eq!(got, [(0, false), (1, false), (0, true)]);
+}
+
+/// `IS [NOT] NULL` over a PK column, which is never NULL, resolves to the
+/// constant the kernel fills for a NOT NULL payload slot.
+#[test]
+fn is_null_over_a_pk_column_is_the_constant() {
+    let schema = schema_pk_ints(1, true);
+    let view = make_n_col_view(&schema, 3, |row, _| row as i64, |_, _| false);
+    for invert in [false, true] {
+        let prog = resolved(&schema, vec![LogicalInstr::IsNull { col: 0, invert }], Reg(0));
+        let mut scratch = EvalScratch::new(&prog);
+        drive(&prog, &view, 0, 3, &mut scratch);
+        assert_eq!(&scratch.regs[..3], &[invert as i64; 3]);
     }
 }

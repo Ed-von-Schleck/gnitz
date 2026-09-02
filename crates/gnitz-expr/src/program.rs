@@ -147,8 +147,6 @@ enum ColKind {
     AnyCol,
     /// PK or payload, one of the eight `FixedInt` codes.
     FixedIntCol,
-    /// Payload only, any type — the null-bitmap readers touch nothing else.
-    AnyPayload,
     /// Payload only, IEEE-754.
     FloatPayload,
     /// Payload only, the 16-byte German-string layout.
@@ -162,7 +160,7 @@ impl ColKind {
     /// cannot keep the old sentence.
     fn type_test(self) -> Option<ColTypeTest> {
         match self {
-            Self::AnyCol | Self::AnyPayload => None,
+            Self::AnyCol => None,
             Self::FixedIntCol => Some((gnitz_wire::is_fixed_int, "a fixed-width integer column")),
             Self::FloatPayload => Some((gnitz_wire::is_float, "a floating-point column")),
             Self::StringPayload => Some((gnitz_wire::is_german_string, "a string or blob column")),
@@ -171,7 +169,7 @@ impl ColKind {
 
     /// True iff a PK column is unusable here.
     fn payload_only(self) -> bool {
-        matches!(self, Self::AnyPayload | Self::FloatPayload | Self::StringPayload)
+        matches!(self, Self::FloatPayload | Self::StringPayload)
     }
 
     /// True iff the kernel decodes this column into a register, so the register
@@ -223,15 +221,23 @@ pub enum FloatUnaryOp {
     Ceil,
     Round,
     Trunc,
+    Sqrt,
+    Ln,
+    Log10,
+    Exp,
+    /// -1.0 / 0.0 / 1.0, and NaN for NaN.
+    Sign,
 }
 
-/// Pure integer unary transform: same width in, same width out (both are
-/// `wrapping_*`, so `-i64::MIN` and `ABS(i64::MIN)` are `i64::MIN`), and the
-/// operand's U64 tracking carries to the result.
+/// Pure integer unary transform: same width in, same width out. `Neg` and `Abs`
+/// are `wrapping_*`, so `-i64::MIN` and `ABS(i64::MIN)` are `i64::MIN`, and
+/// the operand's U64 tracking carries to their result; `Sign` is -1 / 0 / 1,
+/// always signed, and reads an unsigned operand as never negative.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IntUnaryOp {
     Neg,
     Abs,
+    Sign,
 }
 
 /// Integer arithmetic operator. Parallel to [`FloatArithOp`] rather than shared
@@ -248,7 +254,8 @@ pub enum IntArithOp {
     Mod,
 }
 
-/// IEEE-754 arithmetic operator — [`IntArithOp`]'s float twin, minus `Mod`.
+/// IEEE-754 arithmetic operator — [`IntArithOp`]'s float twin, minus `Mod`,
+/// plus `Pow`, which has no integer form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FloatArithOp {
     Add,
@@ -256,6 +263,8 @@ pub enum FloatArithOp {
     Mul,
     /// A zero divisor yields NULL.
     Div,
+    /// `powf`: the IEEE result, never NULL.
+    Pow,
 }
 
 /// [`IntArithOp`] as resolution leaves it. `signed` sits on the two operators
@@ -443,6 +452,13 @@ pub enum LogicalInstr {
         col: u32,
         invert: bool,
     },
+    /// `IS NULL` (`IS NOT NULL` when `invert`) over a register's null lane. The
+    /// operand may be of either class — only its null bit is read — which is
+    /// what lets a computed value of any type be null-tested.
+    IsNullReg {
+        a: Reg,
+        invert: bool,
+    },
     StrColConst {
         op: StrOp,
         col: u32,
@@ -538,6 +554,46 @@ pub enum LogicalInstr {
     StrToFloat {
         a: Reg,
     },
+    /// LEFT (`left`) / RIGHT: `n_reg` characters from one end, a negative count
+    /// dropping that many from the other. A sub-view; never NULL of its own.
+    StrSide {
+        src: Reg,
+        n_reg: Reg,
+        left: bool,
+    },
+    /// 1-based character index of `needle` in `hay` into a *scalar* register:
+    /// 0 when absent, 1 for an empty needle.
+    StrPos {
+        hay: Reg,
+        needle: Reg,
+    },
+    /// The characters in reverse order, a fresh arena copy.
+    StrReverse {
+        a: Reg,
+    },
+    /// Every non-overlapping `from` in `s` replaced by `to`; an empty `from`
+    /// leaves `s` unchanged. NULL past `u32::MAX` bytes, CONCAT's rule.
+    StrReplace {
+        s: Reg,
+        from: Reg,
+        to: Reg,
+    },
+    /// LPAD (`left`) / RPAD to `n_reg` characters with `fill` repeated; a longer
+    /// `s` truncates, `n <= 0` is empty, an empty `fill` pads nothing. NULL past
+    /// `u32::MAX` bytes.
+    StrPad {
+        s: Reg,
+        n_reg: Reg,
+        fill: Reg,
+        left: bool,
+    },
+    /// The `n_reg`-th field of `s` split on `delim` (from the right when
+    /// negative), empty past the last field; `n = 0` is NULL. A sub-view.
+    StrSplitPart {
+        s: Reg,
+        delim: Reg,
+        n_reg: Reg,
+    },
 }
 // ---------------------------------------------------------------------------
 // Instr — the resolved/evaluable form (physical payload/PK indices)
@@ -612,10 +668,12 @@ pub(crate) enum Instr {
         dst: u16,
         a: u16,
     },
+    /// `signed` is the resolve-time U64 tracking of `a`; only `Sign` reads it.
     IntUnary {
         op: IntUnaryOp,
         dst: u16,
         a: u16,
+        signed: bool,
     },
     /// `fi` is the fixed-int target `decode_triple` narrowed the wire type code
     /// to, so the kernel's bounds lookup is total.
@@ -676,6 +734,11 @@ pub(crate) enum Instr {
         pi: u8,
         invert: bool,
     },
+    IsNullReg {
+        dst: u16,
+        a: u16,
+        invert: bool,
+    },
     /// A German-string column against a constant. The constant is encoded at
     /// `resolve` into `ResolvedProgram.const_cells`; `cell_idx` indexes that
     /// vector, not the const pool.
@@ -732,16 +795,11 @@ pub(crate) enum Instr {
         a: u16,
         upper: bool,
     },
-    /// `start_signed`/`len_signed` carry the resolve-time U64 tracking, as
-    /// `IntCast.src_signed` does: the window is computed in i128, and widening a
-    /// U64-tracked register as signed would make a large start negative.
     StrSubstr {
         dst: u16,
         src: u16,
-        start_reg: u16,
-        len_reg: Option<u16>,
-        start_signed: bool,
-        len_signed: bool,
+        start: IntReg,
+        len: Option<IntReg>,
     },
     /// `set_idx` indexes `ResolvedProgram::trim_sets` — the 256-bit membership
     /// table decoded once at resolve — not the const pool.
@@ -784,6 +842,49 @@ pub(crate) enum Instr {
         dst: u16,
         a: u16,
     },
+    StrSide {
+        dst: u16,
+        src: u16,
+        n: IntReg,
+        left: bool,
+    },
+    StrPos {
+        dst: u16,
+        hay: u16,
+        needle: u16,
+    },
+    StrReverse {
+        dst: u16,
+        a: u16,
+    },
+    StrReplace {
+        dst: u16,
+        s: u16,
+        from: u16,
+        to: u16,
+    },
+    StrPad {
+        dst: u16,
+        s: u16,
+        n: IntReg,
+        fill: u16,
+        left: bool,
+    },
+    StrSplitPart {
+        dst: u16,
+        s: u16,
+        delim: u16,
+        n: IntReg,
+    },
+}
+
+/// A scalar register read as a count or a bound. It widens to `i128` per the
+/// register's resolve-time U64 tracking, so a large unsigned value never reads
+/// as negative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IntReg {
+    pub(crate) reg: u16,
+    pub(crate) signed: bool,
 }
 
 impl LogicalInstr {
@@ -824,6 +925,7 @@ impl LogicalInstr {
                     FloatArithOp::Sub => ExprOp::FloatSub,
                     FloatArithOp::Mul => ExprOp::FloatMul,
                     FloatArithOp::Div => ExprOp::FloatDiv,
+                    FloatArithOp::Pow => ExprOp::FloatPow,
                 },
                 a,
                 b,
@@ -861,6 +963,11 @@ impl LogicalInstr {
                     FloatUnaryOp::Ceil => ExprOp::FloatCeil,
                     FloatUnaryOp::Round => ExprOp::FloatRound,
                     FloatUnaryOp::Trunc => ExprOp::FloatTrunc,
+                    FloatUnaryOp::Sqrt => ExprOp::FloatSqrt,
+                    FloatUnaryOp::Ln => ExprOp::FloatLn,
+                    FloatUnaryOp::Log10 => ExprOp::FloatLog10,
+                    FloatUnaryOp::Exp => ExprOp::FloatExp,
+                    FloatUnaryOp::Sign => ExprOp::FloatSign,
                 },
                 a,
             ),
@@ -868,6 +975,7 @@ impl LogicalInstr {
                 match op {
                     IntUnaryOp::Neg => ExprOp::IntNeg,
                     IntUnaryOp::Abs => ExprOp::IntAbs,
+                    IntUnaryOp::Sign => ExprOp::IntSign,
                 },
                 a,
             ),
@@ -892,6 +1000,14 @@ impl LogicalInstr {
             L::BoolBinary { a, b, is_or } => bin(if is_or { ExprOp::BoolOr } else { ExprOp::BoolAnd }, a, b),
             L::BoolNot { a } => un(ExprOp::BoolNot, a),
             L::IsNull { col: c, invert } => col(if invert { ExprOp::IsNotNull } else { ExprOp::IsNull }, c),
+            L::IsNullReg { a, invert } => un(
+                if invert {
+                    ExprOp::IsNotNullReg
+                } else {
+                    ExprOp::IsNullReg
+                },
+                a,
+            ),
             L::StrColConst { op, col: c, const_idx } => [
                 match op {
                     StrOp::Eq => ExprOp::StrColEqConst,
@@ -977,6 +1093,26 @@ impl LogicalInstr {
             L::FloatToStr { a } => un(ExprOp::FloatToStr, a),
             L::StrToInt { a, fi } => [ExprOp::StrToInt.as_wire(), a.0 as u32, fi.type_code() as u32],
             L::StrToFloat { a } => un(ExprOp::StrToFloat, a),
+            L::StrSide { src, n_reg, left } => bin(if left { ExprOp::StrLeft } else { ExprOp::StrRight }, src, n_reg),
+            L::StrPos { hay, needle } => bin(ExprOp::StrPos, hay, needle),
+            L::StrReverse { a } => un(ExprOp::StrReverse, a),
+            // The three-register producers pack their trailing pair into a2, the
+            // SELECT / SUBSTR shape.
+            L::StrReplace { s, from, to } => [
+                ExprOp::StrReplace.as_wire(),
+                s.0 as u32,
+                gnitz_wire::pack_operand_pair(from.0 as u32, to.0 as u32),
+            ],
+            L::StrPad { s, n_reg, fill, left } => [
+                if left { ExprOp::StrLpad } else { ExprOp::StrRpad }.as_wire(),
+                s.0 as u32,
+                gnitz_wire::pack_operand_pair(n_reg.0 as u32, fill.0 as u32),
+            ],
+            L::StrSplitPart { s, delim, n_reg } => [
+                ExprOp::StrSplitPart.as_wire(),
+                s.0 as u32,
+                gnitz_wire::pack_operand_pair(delim.0 as u32, n_reg.0 as u32),
+            ],
         }
     }
 }
@@ -1112,7 +1248,7 @@ impl LogicalProgram {
                 // An operand's class must be the one the opcode reads: no string
                 // opcode reading a scalar register, no scalar opcode reading a
                 // string one.
-                if ((str_class >> reg.0) & 1 != 0) != read.wants_str() {
+                if read != ReadAs::NullBit && ((str_class >> reg.0) & 1 != 0) != read.wants_str() {
                     return Err(E::RegClassMismatch { reg: reg.0 });
                 }
             }
@@ -1312,6 +1448,8 @@ impl LogicalProgram {
                 col: t[1],
                 invert: true,
             },
+            ExprOp::IsNullReg => L::IsNullReg { a, invert: false },
+            ExprOp::IsNotNullReg => L::IsNullReg { a, invert: true },
             ExprOp::IntToFloat => L::IntToFloat { a },
             ExprOp::IntAbs => iu(IntUnaryOp::Abs),
             ExprOp::FloatAbs => fu(FloatUnaryOp::Abs),
@@ -1319,6 +1457,13 @@ impl LogicalProgram {
             ExprOp::FloatCeil => fu(FloatUnaryOp::Ceil),
             ExprOp::FloatRound => fu(FloatUnaryOp::Round),
             ExprOp::FloatTrunc => fu(FloatUnaryOp::Trunc),
+            ExprOp::FloatSqrt => fu(FloatUnaryOp::Sqrt),
+            ExprOp::FloatLn => fu(FloatUnaryOp::Ln),
+            ExprOp::FloatLog10 => fu(FloatUnaryOp::Log10),
+            ExprOp::FloatExp => fu(FloatUnaryOp::Exp),
+            ExprOp::FloatSign => fu(FloatUnaryOp::Sign),
+            ExprOp::IntSign => iu(IntUnaryOp::Sign),
+            ExprOp::FloatPow => fa(FloatArithOp::Pow),
             ExprOp::FloatToF32 => L::FloatToF32 { a },
             // `cast_target` sees the full u32: a forged high-bit word must be
             // rejected, not silently truncated into a valid type code.
@@ -1403,6 +1548,43 @@ impl LogicalProgram {
                 fi: cast_target(t[2])?,
             },
             ExprOp::StrToFloat => L::StrToFloat { a },
+            ExprOp::StrLeft => L::StrSide {
+                src: a,
+                n_reg: b,
+                left: true,
+            },
+            ExprOp::StrRight => L::StrSide {
+                src: a,
+                n_reg: b,
+                left: false,
+            },
+            ExprOp::StrPos => L::StrPos { hay: a, needle: b },
+            ExprOp::StrReverse => L::StrReverse { a },
+            ExprOp::StrReplace => {
+                let (from, to) = gnitz_wire::unpack_operand_pair(t[2]);
+                L::StrReplace {
+                    s: a,
+                    from: Reg(from),
+                    to: Reg(to),
+                }
+            }
+            ExprOp::StrLpad | ExprOp::StrRpad => {
+                let (n_reg, fill) = gnitz_wire::unpack_operand_pair(t[2]);
+                L::StrPad {
+                    s: a,
+                    n_reg: Reg(n_reg),
+                    fill: Reg(fill),
+                    left: op == ExprOp::StrLpad,
+                }
+            }
+            ExprOp::StrSplitPart => {
+                let (delim, n_reg) = gnitz_wire::unpack_operand_pair(t[2]);
+                L::StrSplitPart {
+                    s: a,
+                    delim: Reg(delim),
+                    n_reg: Reg(n_reg),
+                }
+            }
         })
     }
 
@@ -1501,6 +1683,10 @@ impl LogicalProgram {
         // Answered once per register by `analyze`, off each opcode's `U64Rule`,
         // so no arm below restates the rule.
         let is_u64 = |r: u16| (reg_u64 >> r) & 1 != 0;
+        let int_reg = |r: Reg| IntReg {
+            reg: r.0,
+            signed: !is_u64(r.0),
+        };
         // Off the schema alone, so a column-reading opcode gets the NOT NULL
         // collapse without wiring anything of its own. A PK column has no
         // payload slot and so contributes no bit, which is the same rule that
@@ -1607,7 +1793,12 @@ impl LogicalProgram {
                     b: Reg(b),
                 } => I::FCmp { op, dst, a, b },
                 L::FloatUnary { op, a: Reg(a) } => I::FloatUnary { op, dst, a },
-                L::IntUnary { op, a: Reg(a) } => I::IntUnary { op, dst, a },
+                L::IntUnary { op, a: Reg(a) } => I::IntUnary {
+                    op,
+                    dst,
+                    a,
+                    signed: !is_u64(a),
+                },
                 L::FloatToF32 { a: Reg(a) } => I::FloatToF32 { dst, a },
                 // Total on a validated program, the `LoadColInt` shape above:
                 L::FloatToInt { a: Reg(a), fi } => I::FloatToInt { dst, a, fi },
@@ -1650,11 +1841,16 @@ impl LogicalProgram {
                     is_or,
                 } => I::BoolBinary { dst, a, b, is_or },
                 L::BoolNot { a: Reg(a) } => I::BoolNot { dst, a },
-                L::IsNull { col, invert } => I::IsNull {
-                    dst,
-                    pi: payload_slot(col as usize),
-                    invert,
+                // A PK column is never NULL, so its test is the constant the
+                // kernel would fill for a NOT NULL payload slot.
+                L::IsNull { col, invert } => match schema.locate(col as usize) {
+                    ColumnLocator::Pk { .. } => {
+                        const_regs.push((dst, invert as i64));
+                        continue;
+                    }
+                    ColumnLocator::Payload { slot, .. } => I::IsNull { dst, pi: slot, invert },
                 },
+                L::IsNullReg { a: Reg(a), invert } => I::IsNullReg { dst, a, invert },
                 L::StrColConst {
                     op,
                     col,
@@ -1752,15 +1948,13 @@ impl LogicalProgram {
                 L::StrCase { a: Reg(a), upper } => I::StrCase { dst, a, upper },
                 L::StrSubstr {
                     src: Reg(src),
-                    start_reg: Reg(start_reg),
+                    start_reg,
                     len_reg,
                 } => I::StrSubstr {
                     dst,
                     src,
-                    start_reg,
-                    len_reg: len_reg.map(|r| r.0),
-                    start_signed: !is_u64(start_reg),
-                    len_signed: len_reg.is_none_or(|l| !is_u64(l.0)),
+                    start: int_reg(start_reg),
+                    len: len_reg.map(int_reg),
                 },
                 L::StrTrim {
                     a: Reg(a),
@@ -1811,6 +2005,48 @@ impl LogicalProgram {
                 L::FloatToStr { a: Reg(a) } => I::FloatToStr { dst, a },
                 L::StrToInt { a: Reg(a), fi } => I::StrToInt { dst, a, fi },
                 L::StrToFloat { a: Reg(a) } => I::StrToFloat { dst, a },
+                L::StrSide {
+                    src: Reg(src),
+                    n_reg,
+                    left,
+                } => I::StrSide {
+                    dst,
+                    src,
+                    n: int_reg(n_reg),
+                    left,
+                },
+                L::StrPos {
+                    hay: Reg(hay),
+                    needle: Reg(needle),
+                } => I::StrPos { dst, hay, needle },
+                L::StrReverse { a: Reg(a) } => I::StrReverse { dst, a },
+                L::StrReplace {
+                    s: Reg(s),
+                    from: Reg(from),
+                    to: Reg(to),
+                } => I::StrReplace { dst, s, from, to },
+                L::StrPad {
+                    s: Reg(s),
+                    n_reg,
+                    fill: Reg(fill),
+                    left,
+                } => I::StrPad {
+                    dst,
+                    s,
+                    n: int_reg(n_reg),
+                    fill,
+                    left,
+                },
+                L::StrSplitPart {
+                    s: Reg(s),
+                    delim: Reg(delim),
+                    n_reg,
+                } => I::StrSplitPart {
+                    dst,
+                    s,
+                    delim,
+                    n: int_reg(n_reg),
+                },
             };
             instrs.push(resolved);
         }
@@ -1955,6 +2191,10 @@ enum ReadAs {
     /// what lets a producer whose every reader is a `Bool` skip the unpack
     /// (`bit_only`).
     Bool,
+    /// The register's null lane alone, out of `null_bits`: neither its value
+    /// nor its truth bit, so the operand's class is not constrained and its
+    /// producer need not unpack.
+    NullBit,
 }
 
 /// What an opcode writes into its destination register. String and scalar
@@ -2122,7 +2362,7 @@ fn operands(li: &LogicalInstr) -> Operands {
             let ops = writes(WVal(Fixed(false))).reading(a, RVal).reading(b, RVal);
             match op {
                 FloatArithOp::Div => ops.may_null(),
-                FloatArithOp::Add | FloatArithOp::Sub | FloatArithOp::Mul => ops,
+                FloatArithOp::Add | FloatArithOp::Sub | FloatArithOp::Mul | FloatArithOp::Pow => ops,
             }
         }
         // Null-*skipping*, unlike the arithmetic above: a NULL operand yields
@@ -2133,7 +2373,12 @@ fn operands(li: &LogicalInstr) -> Operands {
         L::Cmp { op: _, a, b } | L::FCmp { op: _, a, b } => writes(WBool).reading(a, RVal).reading(b, RVal),
         L::BoolBinary { a, b, is_or: _ } => writes(WBool).reading(a, RBool).reading(b, RBool),
         L::BoolNot { a } => writes(WBool).reading(a, RBool),
-        L::IntUnary { op: _, a } => writes(WVal(FromOperands)).reading(a, RVal),
+        // SIGN's -1/0/1 is signed whatever its operand was; the wrapping pair
+        // keeps the operand's width and tracking.
+        L::IntUnary { op, a } => match op {
+            IntUnaryOp::Sign => writes(WVal(Fixed(false))).reading(a, RVal),
+            IntUnaryOp::Neg | IntUnaryOp::Abs => writes(WVal(FromOperands)).reading(a, RVal),
+        },
         L::FloatUnary { op: _, a } | L::IntToFloat { a } => writes(WVal(Fixed(false))).reading(a, RVal),
         // The three narrowing casts yield NULL on an out-of-range value.
         L::FloatToF32 { a } => writes(WVal(Fixed(false))).reading(a, RVal).may_null(),
@@ -2162,9 +2407,10 @@ fn operands(li: &LogicalInstr) -> Operands {
         // integer column would make it slice an 8-byte stride from a narrower
         // region.
         L::LoadColFloat { col } => writes(WVal(Fixed(false))).on_col(col, ColKind::FloatPayload),
-        // The null-bitmap readers decode no value, so `AnyPayload` admits U128 and
-        // STRING, and their boolean is definite over a NULL row.
-        L::IsNull { col, invert: _ } => writes(WBool).on_col(col, ColKind::AnyPayload),
+        // The null-bitmap reader decodes no value, so any column will do — U128
+        // and STRING included — and its boolean is definite over a NULL row.
+        L::IsNull { col, invert: _ } => writes(WBool).on_col(col, ColKind::AnyCol),
+        L::IsNullReg { a, invert: _ } => writes(WBool).reading(a, ReadAs::NullBit),
         // The German-string compares read 16-byte cells; a narrower column
         // would make `col_data(pi, 16)` over-read its region. The verdict is a
         // bool, but a NULL operand makes it NULL, so the null bit flows.
@@ -2223,6 +2469,33 @@ fn operands(li: &LogicalInstr) -> Operands {
                 ops
             }
         }
+        // The window producers are total: every count clamps into the string.
+        L::StrSide { src, n_reg, left: _ } => writes(WStr).reading(src, RStr).reading(n_reg, RVal),
+        L::StrReverse { a } => writes(WStr).reading(a, RStr),
+        // A character index is bounded by the byte length, so never U64.
+        L::StrPos { hay, needle } => writes(WVal(Fixed(false))).reading(hay, RStr).reading(needle, RStr),
+        // The two arena producers share CONCAT's overflow NULL; SPLIT_PART's is
+        // the zero field index.
+        L::StrReplace { s, from, to } => writes(WStr)
+            .reading(s, RStr)
+            .reading(from, RStr)
+            .reading(to, RStr)
+            .may_null(),
+        L::StrPad {
+            s,
+            n_reg,
+            fill,
+            left: _,
+        } => writes(WStr)
+            .reading(s, RStr)
+            .reading(n_reg, RVal)
+            .reading(fill, RStr)
+            .may_null(),
+        L::StrSplitPart { s, delim, n_reg } => writes(WStr)
+            .reading(s, RStr)
+            .reading(delim, RStr)
+            .reading(n_reg, RVal)
+            .may_null(),
     }
 }
 
@@ -2539,10 +2812,11 @@ fn analyze(
             });
         for &(reg, read) in ops.reads.iter().flatten() {
             let bit = 1u64 << reg.0;
-            if read == ReadAs::Bool {
-                bool_input |= bit;
-            } else {
-                non_bool_read |= bit;
+            match read {
+                ReadAs::Bool => bool_input |= bit,
+                // A null-lane read needs neither the value nor the truth bit.
+                ReadAs::NullBit => {}
+                ReadAs::Value | ReadAs::Str => non_bool_read |= bit,
             }
         }
     }
@@ -2554,9 +2828,14 @@ fn analyze(
     }
     // A filter's `result_reg` is forced to be a bool input: the filter's
     // nullable arm consumes the result as packed bits, so its producer must
-    // populate `bool_bits` whatever opcode it is.
-    if let (true, Some(r)) = (is_filter, result_reg) {
-        bool_input |= 1u64 << r.0;
+    // populate `bool_bits` whatever opcode it is. A scalar's is read as a value
+    // (`reg_values`), so a boolean producer there must unpack into the lane.
+    if let Some(r) = result_reg {
+        if is_filter {
+            bool_input |= 1u64 << r.0;
+        } else {
+            non_bool_read |= 1u64 << r.0;
+        }
     }
     let bit_only = bool_produced & !non_bool_read;
     ProgramFacts {

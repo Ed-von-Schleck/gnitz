@@ -314,14 +314,6 @@ pub(crate) fn reject_ungrouped_column(clause: &str, name: &str) -> GnitzSqlError
     ))
 }
 
-/// `IS [NOT] NULL` over an operand the grouped relation does not offer — neither
-/// an aggregate nor a group key.
-pub(crate) fn reject_grouped_null_test(clause: &str) -> GnitzSqlError {
-    GnitzSqlError::Unsupported(format!(
-        "{clause}: IS [NOT] NULL is only supported on an aggregate or a group column"
-    ))
-}
-
 /// An expression over the grouped relation that is neither a group key nor an
 /// aggregate. The shape is named, not dumped: the parser's `Debug` is a wall of
 /// spans, and the reader wrote the SQL.
@@ -353,6 +345,8 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
             vec![expr]
         }
         Expr::Between { expr, low, high, .. } => vec![expr, low, high],
+        Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => vec![a, b],
+        Expr::Position { expr, r#in } => vec![expr, r#in],
         // CEIL/FLOOR/CAST reach the binder as their own AST nodes rather than as
         // function calls, so their operand needs naming here explicitly.
         Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } | Expr::Cast { expr, .. } => vec![expr],

@@ -585,3 +585,164 @@ class TestRejections:
         )
         client.execute_sql("INSERT INTO t VALUES (1, 'abc', 1)", schema_name=sn)
         _rejects(client, sn, "UPDATE t SET k = UPPER(s)", "cannot assign")
+
+
+# ---------------------------------------------------------------------------
+# LEFT / RIGHT / STRPOS / POSITION / REVERSE / REPLACE / LPAD / RPAD / SPLIT_PART
+# ---------------------------------------------------------------------------
+
+
+class TestLibrary:
+    def test_every_function_over_a_nullable_multibyte_column(self, client, schema_name):
+        sn = schema_name
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT, n BIGINT)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT id, "
+            "LEFT(s, n) AS l, RIGHT(s, n) AS r, LEFT(s, -1) AS ln, "
+            "STRPOS(s, 'l') AS sp, POSITION('é' IN s) AS po, "
+            "REVERSE(s) AS rv, REPLACE(s, 'l', '--') AS rp, "
+            "LPAD(s, 8, 'xy') AS lp, RPAD(s, 8) AS rpd, LPAD(s, 3) AS trunc, "
+            "SPLIT_PART(s, 'l', 2) AS f2, SPLIT_PART(s, 'l', -1) AS fl, SPLIT_PART(s, 'l', n) AS fn "
+            "FROM t",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO t VALUES (1, 'héllo', 2), (2, 'a-long-value-past-twelve', 0), (3, NULL, 1), (4, 'x', NULL)",
+            schema_name=sn,
+        )
+        vid = client.resolve_table(sn, "v")[0]
+        rows = _by_id(client, vid)
+
+        r1 = rows[1]
+        assert (r1["l"], r1["r"], r1["ln"]) == ("hé", "lo", "héll")
+        assert (r1["sp"], r1["po"]) == (3, 2)
+        assert r1["rv"] == "olléh"
+        assert r1["rp"] == "hé----o"
+        assert (r1["lp"], r1["rpd"], r1["trunc"]) == ("xyxhéllo", "héllo   ", "hél")
+        assert (r1["f2"], r1["fl"], r1["fn"]) == ("", "o", "")
+        r2 = rows[2]
+        assert (r2["l"], r2["r"]) == ("", "")
+        assert r2["lp"] == "a-long-v" and r2["trunc"] == "a-l"
+        assert r2["fl"] == "ve"
+        assert r2["fn"] is None, "SPLIT_PART with field 0 is NULL"
+        # NULL in, NULL out through every function.
+        for c in ("l", "r", "ln", "sp", "po", "rv", "rp", "lp", "rpd", "trunc", "f2", "fl", "fn"):
+            assert rows[3][c] is None, c
+        # A NULL count propagates too, whichever position it sits in.
+        assert rows[4]["l"] is None and rows[4]["fn"] is None and rows[4]["rv"] == "x"
+
+    def test_update_and_delete_cancel_the_computed_row(self, client, schema_name):
+        sn = schema_name
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL, k BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT id, REVERSE(s) AS rv, REPLACE(s, '-', '') AS rp, "
+            "LPAD(s, 30, '.') AS lp, SPLIT_PART(s, '-', k) AS sp FROM t",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO t VALUES (1, 'a-long-value-past-twelve', 2), (2, 'abc', 1)",
+            schema_name=sn,
+        )
+        vid = client.resolve_table(sn, "v")[0]
+        rows = _by_id(client, vid)
+        assert rows[1]["rp"] == "alongvaluepasttwelve" and rows[1]["sp"] == "long"
+        assert rows[2]["lp"] == "." * 27 + "abc"
+        client.execute_sql("UPDATE t SET k = 3 WHERE id = 1", schema_name=sn)
+        rows = _by_id(client, vid)
+        assert len(rows) == 2, "the pre-update row must have cancelled, not accumulated"
+        assert rows[1]["sp"] == "value" and rows[1]["rv"] == "evlewt-tsap-eulav-gnol-a"
+        client.execute_sql("UPDATE t SET s = 'xy' WHERE id = 2", schema_name=sn)
+        rows = _by_id(client, vid)
+        assert len(rows) == 2 and rows[2]["rv"] == "yx"
+        client.execute_sql("DELETE FROM t", schema_name=sn)
+        assert _dicts(client, vid) == []
+
+    def test_computed_operands_chain_through_the_arena(self, client, schema_name):
+        sn = schema_name
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT id, "
+            "REPLACE(UPPER(s), 'X', LOWER('YY')) AS a, "
+            "LEFT(REVERSE(s), LENGTH(s) - 1) AS b, "
+            "STRPOS(CONCAT(s, s), RIGHT(s, 1)) AS c "
+            "FROM t",
+            schema_name=sn,
+        )
+        client.execute_sql("INSERT INTO t VALUES (1, 'axbx'), (2, 'q')", schema_name=sn)
+        vid = client.resolve_table(sn, "v")[0]
+        rows = _by_id(client, vid)
+        assert rows[1]["a"] == "AyyByy" and rows[1]["b"] == "xbx" and rows[1]["c"] == 2
+        assert rows[2]["a"] == "Q" and rows[2]["b"] == "" and rows[2]["c"] == 1
+
+    def test_integer_positions_reject_a_float_and_arity_is_checked(self, client, schema_name):
+        sn = schema_name
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL, f DOUBLE NOT NULL)",
+            schema_name=sn,
+        )
+        _rejects(client, sn, "CREATE VIEW b1 AS SELECT id, LEFT(s, f) AS x FROM t", "must be an integer")
+        _rejects(client, sn, "CREATE VIEW b2 AS SELECT id, REPLACE(s, 'a') AS x FROM t", "exactly three arguments")
+        _rejects(client, sn, "CREATE VIEW b3 AS SELECT id, LPAD(s) AS x FROM t", "two or three arguments")
+        _rejects(client, sn, "CREATE VIEW b4 AS SELECT id, STRPOS(s, f) AS x FROM t", "string")
+
+
+    def test_edge_arguments_follow_postgresql(self, client, schema_name):
+        """A negative RIGHT count drops from the left, an empty REPLACE pattern
+        and an empty pad fill leave the subject alone, a non-positive pad width
+        is the empty string, and an empty SPLIT_PART delimiter makes the whole
+        string field one."""
+        sn = schema_name
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT id, "
+            "RIGHT(s, -1) AS rn, REPLACE(s, '', 'z') AS re, LPAD(s, 8, '') AS lpe, "
+            "RPAD(s, 0) AS rz, LPAD(s, -3) AS ln, "
+            "SPLIT_PART(s, '', 1) AS s1, SPLIT_PART(s, '', 2) AS s2 "
+            "FROM t",
+            schema_name=sn,
+        )
+        client.execute_sql("INSERT INTO t VALUES (1, 'héllo'), (2, '')", schema_name=sn)
+        vid = client.resolve_table(sn, "v")[0]
+        rows = _by_id(client, vid)
+        r1 = rows[1]
+        assert (r1["rn"], r1["re"], r1["lpe"]) == ("éllo", "héllo", "héllo")
+        assert (r1["rz"], r1["ln"]) == ("", "")
+        assert (r1["s1"], r1["s2"]) == ("héllo", "")
+        r2 = rows[2]
+        assert all(r2[c] == "" for c in ("rn", "re", "lpe", "rz", "ln", "s1", "s2")), r2
+
+    def test_a_function_as_a_group_key(self, client, schema_name):
+        """A written group key over a new function groups by its value, and a
+        retraction moves the count rather than leaving a stale group behind."""
+        sn = schema_name
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT LEFT(s, 1) AS k, COUNT(*) AS c FROM t GROUP BY LEFT(s, 1)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO t VALUES (1, 'apple'), (2, 'avocado'), (3, 'banana'), (4, 'éclair')",
+            schema_name=sn,
+        )
+        vid = client.resolve_table(sn, "v")[0]
+        assert sorted((r["k"], r["c"]) for r in _dicts(client, vid)) == [("a", 2), ("b", 1), ("é", 1)]
+        client.execute_sql("UPDATE t SET s = 'blueberry' WHERE id = 2", schema_name=sn)
+        assert sorted((r["k"], r["c"]) for r in _dicts(client, vid)) == [("a", 1), ("b", 2), ("é", 1)]
+        client.execute_sql("DELETE FROM t WHERE id = 4", schema_name=sn)
+        assert sorted((r["k"], r["c"]) for r in _dicts(client, vid)) == [("a", 1), ("b", 2)]
+

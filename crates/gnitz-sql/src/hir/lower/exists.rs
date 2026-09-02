@@ -485,20 +485,14 @@ impl MarkBranch<'_> {
 }
 
 /// Substitute `ColRef(Col(mark_id))` with `LitInt(val)` throughout an expression —
-/// the mark column's per-branch constant. (The mark is non-nullable `0/1`, so it
-/// never appears under `IS [NOT] NULL`; every other leaf passes through.)
+/// the mark column's per-branch constant; every other leaf passes through.
 fn subst_mark_lit(e: &HirExpr, mark_id: ColId, val: i64) -> HirExpr {
-    match e.try_expand_leaves::<std::convert::Infallible>(
-        &|r| {
-            Ok(match r {
-                HirRef::Col(id) if *id == mark_id => BExpr::LitInt(val),
-                _ => BExpr::ColRef(r.clone()),
-            })
-        },
-        // The mark is non-nullable `0/1`, so the substitution never has to fold a
-        // null test — every leaf's `IS [NOT] NULL` passes through unchanged.
-        &|r, want_null| Ok(crate::bind::fold_null_test(true, r.clone(), want_null)),
-    ) {
+    match e.try_rebuild::<HirRef, std::convert::Infallible>(&|r| {
+        Ok(match r {
+            HirRef::Col(id) if *id == mark_id => BExpr::LitInt(val),
+            _ => BExpr::ColRef(r.clone()),
+        })
+    }) {
         Ok(out) => out,
         Err(never) => match never {},
     }

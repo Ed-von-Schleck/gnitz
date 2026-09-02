@@ -1,5 +1,5 @@
-//! Where a character begins, for the two kernels that need it: SUBSTRING's
-//! window and LIKE's `_`.
+//! Where a character begins, for every kernel that counts, windows or reorders
+//! characters.
 //!
 //! A leaf below both — it reads no register file, no scratch and no program, so
 //! `like.rs` need not import out of the kernel file it is otherwise independent
@@ -12,10 +12,30 @@
 /// boundaries; on arbitrary bytes it stays total and panic-free, which is what a
 /// byte-transparent engine needs.
 fn char_starts(s: &[u8]) -> impl Iterator<Item = usize> + '_ {
-    s.iter()
-        .enumerate()
-        .filter(|(_, &b)| (b & 0xC0) != 0x80)
-        .map(|(k, _)| k)
+    s.iter().enumerate().filter(|(_, &b)| is_char_start(b)).map(|(k, _)| k)
+}
+
+/// Whether `b` begins a character — the one test [`char_starts`] filters by.
+fn is_char_start(b: u8) -> bool {
+    (b & 0xC0) != 0x80
+}
+
+/// Reverse the characters of `s` in place: the bytes are reversed whole, which
+/// leaves each character as its continuation bytes followed by its start byte,
+/// and then each such group is reversed back. Total on any bytes, as the
+/// definition above is.
+pub(crate) fn reverse_chars(s: &mut [u8]) {
+    s.reverse();
+    let mut i = 0;
+    while i < s.len() {
+        let mut j = i;
+        while j < s.len() && !is_char_start(s[j]) {
+            j += 1;
+        }
+        let end = (j + 1).min(s.len());
+        s[i..end].reverse();
+        i = end;
+    }
 }
 
 /// Characters as the engine counts them — on valid UTF-8, the codepoint count.

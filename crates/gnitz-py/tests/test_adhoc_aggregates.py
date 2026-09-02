@@ -17,6 +17,7 @@ Run with GNITZ_WORKERS=4 (the fold is per-worker; the client merges partials):
 import random
 
 import pytest
+from _caps import first_rejected
 from _uid import uid as _uid
 
 
@@ -698,29 +699,20 @@ def test_having_rejections(client, hg):
     # HAVING, on both paths.
     assert _parity(client, hg, "SELECT cat FROM hg GROUP BY cat HAVING 'a' = 'b'") == []
 
-    # The 64-register cap. The planner's expression builder never reuses a register, so an equality
-    # conjunct over a plain group column costs 3 (load_col + load_const + cmp)
-    # and each AND one more: k conjuncts need 4k - 1, so 16 fit in 64 and 17 do
-    # not. A string IN costs 2N - 1 (one str_col_eq_const per item, whose column
-    # and const-pool indices are immediates, plus N-1 BoolOr): 32 fit, 33 do not.
-    #
-    # Only the direct path is asserted. CREATE VIEW ships the same over-cap
-    # program to the engine, which rejects it — but the DDL still succeeds and
-    # the view is silently empty, a separate defect not fixed here.
-    def _cap_rejection(query):
-        with pytest.raises(Exception) as ei:
-            _rows(client, hg, query)
-        msg = str(ei.value)
-        assert "64" in msg, f"the register-cap message must name the limit, got: {msg}"
-
-    conj = lambda k: " AND ".join(["cat = 1"] * k)
-    _cap_rejection(f"SELECT cat FROM hg GROUP BY cat HAVING {conj(17)}")
-    got = _parity(client, hg, f"SELECT cat FROM hg GROUP BY cat HAVING {conj(16)}")
-    assert _keys(got, "cat") == [1], got
+    # The 64-register cap, located rather than pinned. The builder folds
+    # identical instructions, so the conjuncts share nothing: `cat * k < k + 1`
+    # over distinct odd `k` is true exactly for `cat = 1`. Only the direct path
+    # is asserted: CREATE VIEW ships the same over-cap program to the engine,
+    # which rejects it, but the DDL still succeeds and the view is silently empty.
+    conj = lambda k: " AND ".join(f"cat * {2 * i + 1} < {2 * i + 2}" for i in range(k))
+    having = lambda k: f"SELECT cat FROM hg GROUP BY cat HAVING {conj(k)}"
+    k = first_rejected(lambda k: _rows(client, hg, having(k)), range(1, 64))
+    assert _keys(_parity(client, hg, having(k - 1)), "cat") == [1]
 
     in_list = lambda n: ", ".join(f"'v{i}'" for i in range(n))
-    _cap_rejection(f"SELECT s FROM hg GROUP BY s HAVING s IN ({in_list(33)})")
-    assert _parity(client, hg, f"SELECT s FROM hg GROUP BY s HAVING s IN ({in_list(32)})") == []
+    having_in = lambda n: f"SELECT s FROM hg GROUP BY s HAVING s IN ({in_list(n)})"
+    n = first_rejected(lambda n: _rows(client, hg, having_in(n)), range(1, 64))
+    assert _parity(client, hg, having_in(n - 1)) == []
 
 
 # ---------------------------------------------------------------------------

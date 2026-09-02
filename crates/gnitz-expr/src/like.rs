@@ -169,7 +169,7 @@ impl LikeMatcher {
             LikeKind::Exact(l) => lit_eq(h, l, ci),
             LikeKind::Prefix(l) => h.len() >= l.len() && lit_eq(&h[..l.len()], l, ci),
             LikeKind::Suffix(l) => h.len() >= l.len() && lit_eq(&h[h.len() - l.len()..], l, ci),
-            LikeKind::Contains(l) => contains(h, l, ci),
+            LikeKind::Contains(l) => find(h, l, ci).is_some(),
             LikeKind::Generic(toks) => generic_match(toks, h, ci),
         }
     }
@@ -186,25 +186,40 @@ fn lit_eq(a: &[u8], b: &[u8], ci: bool) -> bool {
     }
 }
 
-/// Skip-scan on the needle's first byte, then a window compare. An empty needle
-/// matches everything.
-fn contains(h: &[u8], needle: &[u8], ci: bool) -> bool {
+/// The byte offset of the first occurrence of `needle` in `h`, `Some(0)` for an
+/// empty needle: a skip-scan on the needle's first byte, then a window compare,
+/// ASCII-case-insensitively under `ci`. LIKE's `%x%` shape reads it as a
+/// verdict; STRPOS, REPLACE and SPLIT_PART read the offset.
+pub(crate) fn find(h: &[u8], needle: &[u8], ci: bool) -> Option<usize> {
     let Some(&first) = needle.first() else {
-        return true;
+        return Some(0);
     };
     // How many start positions fit; `None` when the needle is longer than `h`.
-    let Some(starts) = h.len().checked_sub(needle.len() - 1) else {
-        return false;
-    };
+    let starts = h.len().checked_sub(needle.len() - 1)?;
     // `Lit` bytes are lowercased at compile, so `first` is already the folded
     // form and only its uppercase twin needs testing under `ci`.
     let upper = first.to_ascii_uppercase();
-    for (i, &b) in h[..starts].iter().enumerate() {
-        if (b == first || (ci && b == upper)) && lit_eq(&h[i..i + needle.len()], needle, ci) {
-            return true;
-        }
-    }
-    false
+    h[..starts]
+        .iter()
+        .enumerate()
+        .find(|&(i, &b)| (b == first || (ci && b == upper)) && lit_eq(&h[i..i + needle.len()], needle, ci))
+        .map(|(i, _)| i)
+}
+
+/// The `(start, end)` byte span of each field of `s` split on the non-empty
+/// `d`, left to right — one field, `s` whole, when `d` never occurs.
+pub(crate) fn fields<'a>(s: &'a [u8], d: &'a [u8]) -> impl Iterator<Item = (usize, usize)> + 'a {
+    debug_assert!(!d.is_empty(), "an empty delimiter splits nothing");
+    let mut next = Some(0usize);
+    std::iter::from_fn(move || {
+        let start = next?;
+        let end = match find(&s[start..], d, false) {
+            Some(k) => start + k,
+            None => s.len(),
+        };
+        next = (end < s.len()).then(|| end + d.len());
+        Some((start, end))
+    })
 }
 
 /// The single-anchor iterative glob: `ti` walks tokens, `hi` walks haystack

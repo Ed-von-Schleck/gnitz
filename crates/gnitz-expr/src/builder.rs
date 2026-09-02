@@ -22,8 +22,13 @@ impl ExprBuilder {
         Self::default()
     }
 
-    /// Append `instr` and return the register it writes — its own index.
+    /// The register holding `instr`'s value: the one an identical instruction
+    /// already writes, else a fresh one — its own index. Every instruction is a
+    /// pure function of its operands, so identical ones share a register.
     pub fn emit(&mut self, instr: LogicalInstr) -> Reg {
+        if let Some(i) = self.instrs.iter().position(|e| *e == instr) {
+            return Reg(i as u16);
+        }
         let reg = Reg(self.instrs.len() as u16);
         self.instrs.push(instr);
         reg
@@ -35,11 +40,13 @@ impl ExprBuilder {
         self.sinks.push(sink);
     }
 
-    /// Push a raw byte string into the const pool and return its index. The pool
-    /// is byte-transparent: german-string cells and packed i64 sets share it,
-    /// each interpreted by the opcode that indexes it. Every call pushes a fresh
-    /// entry — no cross-call dedup.
+    /// The const-pool index of `bytes`, shared with an earlier equal entry. The
+    /// pool is byte-transparent — german-string cells and packed i64 sets share
+    /// it, each read by the opcode that indexes it.
     fn add_const_bytes(&mut self, bytes: Vec<u8>) -> ConstIdx {
+        if let Some(i) = self.const_strings.iter().position(|c| *c == bytes) {
+            return ConstIdx(i as u32);
+        }
         let idx = ConstIdx(self.const_strings.len() as u32);
         self.const_strings.push(bytes);
         idx

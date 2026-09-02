@@ -1796,22 +1796,35 @@ class TestHavingIsNullCompleteness:
         finally:
             client.drop_schema(sn)
 
-    def test_having_null_test_on_expression_rejected(self, client):
-        """IS [NOT] NULL in HAVING is only for an aggregate or a group column; an
-        arithmetic expression is rejected (not silently treated as a column)."""
+    def test_having_null_test_on_expression_tests_its_value(self, client):
+        """IS [NOT] NULL in HAVING over an expression of aggregates and group
+        columns is a null test over the computed value; a name the grouped
+        relation does not offer is still the ungrouped-column rejection."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
             client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT)",
                 schema_name=sn,
             )
-            with pytest.raises(gnitz.GnitzError, match="aggregate or a group column"):
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a, COUNT(*) AS c FROM t GROUP BY a HAVING (a + SUM(b)) IS NULL",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO t VALUES (1, 1, NULL), (2, 1, NULL), (3, 2, 5), (4, 2, NULL)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            assert sorted((r["a"], r["c"]) for r in client.scan(vid).mappings()) == [(1, 2)]
+            # A non-NULL b in group 1 makes its SUM, and so the expression, non-NULL.
+            client.execute_sql("INSERT INTO t VALUES (5, 1, 3)", schema_name=sn)
+            assert list(client.scan(vid).mappings()) == []
+            with pytest.raises(gnitz.GnitzError, match="GROUP BY"):
                 client.execute_sql(
-                    "CREATE VIEW v AS SELECT a FROM t GROUP BY a HAVING (a + b) IS NULL",
+                    "CREATE VIEW w AS SELECT a FROM t GROUP BY a HAVING b IS NULL",
                     schema_name=sn,
                 )
-            client.execute_sql("DROP TABLE t", schema_name=sn)
         finally:
             client.drop_schema(sn)
 

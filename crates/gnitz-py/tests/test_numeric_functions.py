@@ -9,6 +9,8 @@ Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_numeric_functions.py -v --tb=short
 """
 
+import math
+
 import pytest
 import gnitz
 from _uid import uid as _uid
@@ -642,3 +644,99 @@ class TestOtherSurfaces:
         # The high row's cast is NULL, so its predicate is NULL and it survives.
         client.execute_sql("DELETE FROM t WHERE CAST(u AS SMALLINT) = 5", schema_name=sn)
         assert sorted(r["id"] for r in _dicts(client, tid)) == [2]
+
+
+# ---------------------------------------------------------------------------
+# SQRT / LN / LOG / EXP / SIGN / POWER
+# ---------------------------------------------------------------------------
+
+
+class TestTranscendental:
+    def test_every_function_over_nullable_columns(self, client, schema_name):
+        sn = schema_name
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, i BIGINT, f DOUBLE)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT id, "
+            "SQRT(f) AS sq, SQRT(i) AS sqi, LN(f) AS ln, LOG(f) AS lg, EXP(i) AS ex, "
+            "SIGN(i) AS si, SIGN(f) AS sf, POWER(i, 2) AS p, POW(f, 0.5) AS ph "
+            "FROM t",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO t VALUES (1, -4, 100.0), (2, 0, 0.0), (3, 9, -1.0), (4, NULL, NULL)",
+            schema_name=sn,
+        )
+        vid = client.resolve_table(sn, "v")[0]
+        rows = {r["id"]: r for r in _dicts(client, vid)}
+
+        assert rows[1]["sq"] == pytest.approx(10.0)
+        assert rows[3]["sqi"] == pytest.approx(3.0)
+        assert rows[1]["ln"] == pytest.approx(math.log(100.0))
+        assert rows[1]["lg"] == pytest.approx(2.0)
+        assert rows[2]["ex"] == pytest.approx(1.0)
+        assert rows[3]["ex"] == pytest.approx(math.exp(9))
+        assert (rows[1]["si"], rows[2]["si"], rows[3]["si"]) == (-1, 0, 1)
+        assert (rows[1]["sf"], rows[2]["sf"], rows[3]["sf"]) == (1.0, 0.0, -1.0)
+        assert rows[1]["p"] == pytest.approx(16.0) and rows[3]["p"] == pytest.approx(81.0)
+        assert rows[1]["ph"] == pytest.approx(10.0)
+        # A domain error is the IEEE value, never NULL: SQRT(-1) is NaN, LN(0) is -inf.
+        assert math.isnan(rows[3]["sq"])
+        assert rows[2]["ln"] == -math.inf and rows[2]["lg"] == -math.inf
+        assert math.isnan(rows[3]["ln"])
+        for c in ("sq", "sqi", "ln", "lg", "ex", "si", "sf", "p", "ph"):
+            assert rows[4][c] is None, c
+
+    def test_update_and_delete_cancel_the_computed_row(self, client, schema_name):
+        """A retraction re-derives every value; the old row only vanishes if
+        the derivation is bit-stable, and a NaN in the payload must cancel too."""
+        sn = schema_name
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, f DOUBLE NOT NULL, k BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT id, SQRT(f) AS sq, POWER(f, 3) AS p, SIGN(k) AS s FROM t",
+            schema_name=sn,
+        )
+        client.execute_sql("INSERT INTO t VALUES (1, -2.0, -5), (2, 2.25, 7)", schema_name=sn)
+        vid = client.resolve_table(sn, "v")[0]
+        rows = {r["id"]: r for r in _dicts(client, vid)}
+        assert len(rows) == 2 and math.isnan(rows[1]["sq"]) and rows[2]["sq"] == 1.5
+        client.execute_sql("UPDATE t SET k = 0 WHERE id = 1", schema_name=sn)
+        rows = {r["id"]: r for r in _dicts(client, vid)}
+        assert len(rows) == 2, "the pre-update row must have cancelled, not accumulated"
+        assert rows[1]["s"] == 0 and math.isnan(rows[1]["sq"])
+        client.execute_sql("DELETE FROM t", schema_name=sn)
+        assert _dicts(client, vid) == []
+
+    def test_arity_and_domain_errors_reject_at_create_time(self, client, schema_name):
+        sn = schema_name
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, i BIGINT NOT NULL, s TEXT NOT NULL)",
+            schema_name=sn,
+        )
+        _rejects(client, sn, "CREATE VIEW b1 AS SELECT id, SQRT(s) AS x FROM t", "string")
+        _rejects(client, sn, "CREATE VIEW b2 AS SELECT id, POWER(i) AS x FROM t", "exactly two arguments")
+        _rejects(client, sn, "CREATE VIEW b3 AS SELECT id, LOG(i, 2) AS x FROM t", "exactly one argument")
+
+
+    def test_sign_over_an_unsigned_column_is_never_negative(self, client, schema_name):
+        """An unsigned operand is read as never negative, so SIGN is 0 or 1 even
+        for a value whose top bit is set — which a signed read would call -1."""
+        sn = schema_name
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, u BIGINT UNSIGNED NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql("CREATE VIEW v AS SELECT id, SIGN(u) AS s FROM t", schema_name=sn)
+        client.execute_sql(
+            "INSERT INTO t VALUES (1, 0), (2, 7), (3, 18446744073709551615)",
+            schema_name=sn,
+        )
+        vid = client.resolve_table(sn, "v")[0]
+        rows = {r["id"]: r["s"] for r in _dicts(client, vid)}
+        assert rows == {1: 0, 2: 1, 3: 1}
+

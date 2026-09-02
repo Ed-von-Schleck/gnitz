@@ -10,16 +10,16 @@ use super::{
     as_col, bind_and_lower, col_by_id, hircol_of, widen_if, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, InPair,
     JoinType, ProjEntry, RelExpr, SetOpKind, SubqueryKind, SubqueryRef,
 };
-use crate::agg::{agg_output_nullable, agg_typing, default_agg_name, finalize_agg_bexpr, finalize_agg_null_test};
+use crate::agg::{agg_output_nullable, agg_typing, default_agg_name, finalize_agg_bexpr};
 use crate::ast_util::{
     aliased_def, body_is_grouped, classify_agg_call, classify_from, expand_wildcard_item, extract_table_name_and_alias,
     flatten_conjuncts, for_each_agg_call, group_by_exprs, group_by_target, has_exists_in_subquery, has_scalar_subquery,
-    is_agg_call, peel_nested, projection_item_expr, reject_grouped_column_ref, reject_grouped_null_test,
-    reject_ungrouped_column, reject_unresolved_aggregate, reject_unsupported_fn_qualifiers, scalar_projection_item,
-    single_relation_col_name, unknown_function, FromShape,
+    is_agg_call, peel_nested, projection_item_expr, reject_grouped_column_ref, reject_ungrouped_column,
+    reject_unresolved_aggregate, reject_unsupported_fn_qualifiers, scalar_projection_item, single_relation_col_name,
+    unknown_function, FromShape,
 };
 use crate::bind::{apply_positional_aliases, cte_passthrough};
-use crate::bind::{bind_structural, find_unique_column, fold_null_test, single_relation_col_idx, Binder, LeafBinder};
+use crate::bind::{bind_structural, find_unique_column, single_relation_col_idx, Binder, LeafBinder};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::chain::ViewChain;
 use crate::hir::guards::join_on_and_type;
@@ -389,9 +389,17 @@ impl LeafBinder<HirRef> for HirSingleTable<'_> {
             "aggregate function not allowed in expression context".to_string(),
         ))
     }
-    fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<HirExpr, GnitzSqlError> {
-        let c = self.resolve(inner)?;
-        Ok(fold_null_test(c.def.is_nullable, HirRef::Col(c.id), want_null))
+    fn is_nullable(&self, r: &HirRef) -> bool {
+        hir_ref_nullable(self.env, r)
+    }
+}
+
+/// Whether a leaf reference over `env` can be NULL: a column by its definition,
+/// a subquery by its shape (an EXISTS/IN test or a COUNT never is).
+fn hir_ref_nullable(env: &[HirCol], r: &HirRef) -> bool {
+    match r {
+        HirRef::Col(id) => hircol_of(env, *id).def.is_nullable,
+        HirRef::Subquery(s) => !s.never_null(),
     }
 }
 
@@ -404,25 +412,6 @@ impl LeafBinder<HirRef> for HirSingleTable<'_> {
 // `HirRef::Subquery` leaf where the walk meets it, reaching the snapshot and the
 // binder through a `RefCell` (the `LeafBinder` methods take `&self`). Decorrelation
 // (`hir::rewrite`) consumes the leaves.
-
-/// Whether an expression node is itself a subquery of any kind (an opaque leaf to
-/// the structural walk) — the `SubqueryLeaf` uses it to route an `IS [NOT] NULL`
-/// over a subquery operand to the subquery bind rather than to a column resolve.
-fn is_subquery_expr(e: &Expr) -> bool {
-    matches!(
-        e,
-        Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::Subquery(_) | Expr::AnyOp { .. } | Expr::AllOp { .. }
-    )
-}
-
-/// Whether a bound subquery's value is provably never NULL — an EXISTS/IN test
-/// (`0/1`) or a COUNT. Derived from the leaf rather than carried alongside it, so
-/// [`SubqueryRef::never_null`] stays the one home of the rule: only a bare
-/// subquery leaf can be never-NULL, since every composite shape
-/// (`bind_quantifier_sub`'s 3VL wrapper) is a comparison over a nullable operand.
-fn value_never_null(value: &HirExpr) -> bool {
-    matches!(value, BExpr::ColRef(HirRef::Subquery(s)) if s.never_null())
-}
 
 /// Everything a subquery bind resolves against: the catalog snapshot, the mutable
 /// binder, and the outer scope it correlates to. Behind one `RefCell` on the leaf,
@@ -438,8 +427,8 @@ struct SubCtx<'a, 'b, 'c> {
 }
 
 /// The outer single-table leaf extended with subquery handling: it binds an
-/// EXISTS/IN/scalar/ANY/ALL node — and a subquery operand of `IS [NOT] NULL` — in
-/// place, delegating every other decision to the inner `HirSingleTable`.
+/// EXISTS/IN/scalar/ANY/ALL node in place, delegating every other decision to
+/// the inner `HirSingleTable`.
 struct SubqueryLeaf<'a, 'b, 'c> {
     inner: HirSingleTable<'c>,
     ctx: RefCell<SubCtx<'a, 'b, 'c>>,
@@ -458,23 +447,8 @@ impl LeafBinder<HirRef> for SubqueryLeaf<'_, '_, '_> {
     fn bind_function(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
         self.inner.bind_function(f)
     }
-    fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<HirExpr, GnitzSqlError> {
-        if !is_subquery_expr(inner) {
-            return self.inner.bind_null_test(inner, want_null);
-        }
-        let value = self.bind_sub(inner)?;
-        if value_never_null(&value) {
-            // COUNT / EXISTS / IN — never NULL, so the test folds to a constant.
-            return Ok(BExpr::LitInt(i64::from(!want_null)));
-        }
-        // A nullable scalar: fold over the subquery leaf; decorrelation rewrites the
-        // IS [NOT] NULL over the substituted value column.
-        match value {
-            BExpr::ColRef(r) => Ok(fold_null_test(true, r, want_null)),
-            _ => Err(GnitzSqlError::Unsupported(
-                "IS [NOT] NULL over this subquery form is not supported".into(),
-            )),
-        }
+    fn is_nullable(&self, r: &HirRef) -> bool {
+        self.inner.is_nullable(r)
     }
     fn bind_subquery(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
         self.bind_sub(e)
@@ -788,10 +762,13 @@ fn bind_quantifier_sub(
         // ANY over ∅ = FALSE, ALL over ∅ = TRUE — the LEFT join sets m = NULL for
         // an empty group, so the explicit null test makes the edge a definite
         // constant (exact under negation).
-        if is_any {
-            BExpr::BinOp(Box::new(fold_null_test(true, m_leaf, false)), BinOp::And, Box::new(cmp))
-        } else {
-            BExpr::BinOp(Box::new(fold_null_test(true, m_leaf, true)), BinOp::Or, Box::new(cmp))
+        {
+            let m_test = BExpr::NullTest {
+                inner: Box::new(BExpr::ColRef(m_leaf)),
+                want_null: !is_any,
+            };
+            let op = if is_any { BinOp::And } else { BinOp::Or };
+            BExpr::BinOp(Box::new(m_test), op, Box::new(cmp))
         }
     } else if is_any {
         cmp
@@ -1071,9 +1048,11 @@ impl LeafBinder<HirRef> for JoinLeaf<'_> {
             "JOIN ON: aggregate functions are not allowed".into(),
         ))
     }
-    fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<HirExpr, GnitzSqlError> {
-        let id = self.col_id(inner)?;
-        Ok(fold_null_test(self.scope.is_nullable(id), HirRef::Col(id), want_null))
+    fn is_nullable(&self, r: &HirRef) -> bool {
+        match r {
+            HirRef::Col(id) => self.scope.is_nullable(*id),
+            HirRef::Subquery(s) => !s.never_null(),
+        }
     }
     fn bind_subquery(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
         Err(match self.nested_subquery_msg {
@@ -1469,32 +1448,8 @@ impl<L: LeafBinder<HirRef>> LeafBinder<HirRef> for GroupedLeaf<'_, L> {
         reject_unsupported_fn_qualifiers(f, "aggregates")?;
         Err(unknown_function(f))
     }
-    fn bind_null_test(&self, inner: &Expr, want_null: bool) -> Result<HirExpr, GnitzSqlError> {
-        if let Expr::Function(f) = inner {
-            if is_agg_call(f) {
-                let ga = self.find_agg(f)?;
-                return Ok(finalize_agg_null_test(
-                    HirRef::Col(ga.agg.out.id),
-                    ga.agg.companion.as_ref().map(|c| HirRef::Col(c.id)),
-                    ga.output_nullable,
-                    want_null,
-                ));
-            }
-        }
-        // A group key — bare or written — is the only other operand the reduce
-        // output offers. A name that is not one gets the ungrouped verdict; any
-        // other shape gets the null test's own.
-        let id = self
-            .group_key(inner)
-            .ok_or_else(|| match single_relation_col_name(inner) {
-                Some(_) => self.not_a_key(inner),
-                None => reject_grouped_null_test(self.clause),
-            })?;
-        Ok(fold_null_test(
-            hircol_of(self.env, id).def.is_nullable,
-            HirRef::Col(id),
-            want_null,
-        ))
+    fn is_nullable(&self, r: &HirRef) -> bool {
+        hir_ref_nullable(self.env, r)
     }
 }
 

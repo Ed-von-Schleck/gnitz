@@ -9,7 +9,6 @@ use super::{
     ProjEntry, RelExpr, SubqueryKind, SubqueryRef,
 };
 use crate::agg::finalize_agg_bexpr;
-use crate::bind::fold_null_test;
 use crate::error::GnitzSqlError;
 use crate::hir::guards::{converse_rel, validate_join_key_pair, validate_range_join_key_pair};
 use crate::hir::JoinType;
@@ -448,7 +447,13 @@ fn scalar_value(s: &SubqueryRef, null_filled: bool) -> Result<HirExpr, GnitzSqlE
         // COUNT is Direct (`v == ColRef(agg.out)`); after the LEFT join it is
         // nullable, so `CASE WHEN it IS NOT NULL THEN it ELSE 0`.
         Ok(BExpr::Case {
-            branches: vec![(BExpr::IsNotNull(HirRef::Col(agg.out.id)), v)],
+            branches: vec![(
+                BExpr::NullTest {
+                    inner: Box::new(BExpr::ColRef(HirRef::Col(agg.out.id))),
+                    want_null: false,
+                },
+                v,
+            )],
             else_: Some(Box::new(BExpr::LitInt(0))),
         })
     } else {
@@ -515,48 +520,14 @@ fn corr_on(s: &SubqueryRef) -> Vec<HirExpr> {
     on
 }
 
-/// Replace every `HirRef::Subquery` leaf with its substituted value: a `ColRef`
-/// leaf substitutes the value expression; an `IS [NOT] NULL` over a subquery leaf
-/// substitutes the value's null test (`null_subst`). A `Col` leaf passes through.
+/// Replace every `HirRef::Subquery` leaf with its substituted value; a `Col` leaf
+/// passes through.
 fn substitute(e: &HirExpr, subst: &HashMap<*const RelExpr, HirExpr>) -> Result<HirExpr, GnitzSqlError> {
-    e.try_expand_leaves(
-        &|r| match r {
-            HirRef::Subquery(s) => subst
-                .get(&Rc::as_ptr(&s.rel))
-                .cloned()
-                .ok_or_else(|| GnitzSqlError::Internal("subquery leaf without a substitution".into())),
-            HirRef::Col(_) => Ok(BExpr::ColRef(r.clone())),
-        },
-        &|r, want_null| match r {
-            HirRef::Subquery(s) => null_subst(s, want_null),
-            HirRef::Col(_) => Ok(fold_null_test(true, r.clone(), want_null)),
-        },
-    )
-}
-
-/// The null test of a scalar subquery's value (only a non-COUNT scalar reaches
-/// here — bind folds a never-NULL subquery under `IS [NOT] NULL` to a constant).
-fn null_subst(s: &SubqueryRef, want_null: bool) -> Result<HirExpr, GnitzSqlError> {
-    let agg = s.scalar_agg()?;
-    match &agg.companion {
-        // Direct shape: the value is the raw aggregate column.
-        None => Ok(fold_null_test(true, HirRef::Col(agg.out.id), want_null)),
-        // Companion shape (AVG / nullable SUM): NULL ⟺ `out IS NULL OR companion = 0`.
-        Some(c) => {
-            let is_null = BExpr::BinOp(
-                Box::new(BExpr::IsNull(HirRef::Col(agg.out.id))),
-                BinOp::Or,
-                Box::new(BExpr::BinOp(
-                    Box::new(BExpr::ColRef(HirRef::Col(c.id))),
-                    BinOp::Eq,
-                    Box::new(BExpr::LitInt(0)),
-                )),
-            );
-            Ok(if want_null {
-                is_null
-            } else {
-                BExpr::UnaryOp(UnaryOp::Not, Box::new(is_null))
-            })
-        }
-    }
+    e.try_rebuild(&|r| match r {
+        HirRef::Subquery(s) => subst
+            .get(&Rc::as_ptr(&s.rel))
+            .cloned()
+            .ok_or_else(|| GnitzSqlError::Internal("subquery leaf without a substitution".into())),
+        HirRef::Col(_) => Ok(BExpr::ColRef(r.clone())),
+    })
 }

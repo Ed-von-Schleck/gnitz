@@ -9,8 +9,9 @@
 use std::cmp::Ordering;
 use std::fmt::{self, Write as _};
 
-use crate::chars::{char_count, char_offset};
-use crate::program::{FloatUnaryOp, IntUnaryOp, ResolvedIntOp};
+use crate::chars::{char_count, char_offset, reverse_chars};
+use crate::like::{fields, find};
+use crate::program::{FloatUnaryOp, IntReg, IntUnaryOp, ResolvedIntOp};
 use crate::{BatchView, CmpOp, FloatArithOp, Instr, ResolvedProgram, StrOp};
 use gnitz_wire::{
     compare_german_strings, german_string_heap, german_string_inline, null_word_get, read_u64_le, FixedInt,
@@ -477,7 +478,9 @@ impl Morsel<'_> {
 /// Propagate binary null: dst_null = a_null | b_null (word-at-a-time).
 ///
 /// `#[inline]` for [`maybe_pack_bool_bits`]' reason: once per instruction per
-/// morsel, and a no-op on the `no_nulls` arm.
+/// morsel, and a no-op on the `no_nulls` arm. Kept apart from [`null_or_all`]:
+/// spelled through it, the `int_div` and `select` shapes of `expr_kernel_bench`
+/// each retire 1.3 % more instructions.
 #[inline]
 fn null_or2(s: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: u16, b: u16) {
     if mo.no_nulls() {
@@ -490,21 +493,21 @@ fn null_or2(s: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: u16, b: u16) {
     }
 }
 
-/// Ternary counterpart: dst_null = a_null | b_null | c_null. SUBSTRING's three
-/// operands need it in one pass — chaining [`null_or2`] would make `dst` its own
-/// source and trip [`split_windows`]' disjointness precondition.
-///
-/// No `no_nulls` arm: `null_bits` is unallocated there, so the split below
-/// panics rather than dropping a null bit.
-fn null_or3(s: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: u16, b: u16, c: u16) {
-    debug_assert!(
-        !mo.no_nulls(),
-        "null_or3 under no_nulls: its caller must set `makes_null`"
-    );
+/// Propagate null over any sequence of source registers: dst_null = OR of
+/// theirs (word-at-a-time). Plain indexing rather than a split: four words per
+/// morsel, so the bounds checks cost nothing that matters, and a source may
+/// even be `dst` itself.
+#[inline]
+fn null_or_all(s: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, srcs: impl Iterator<Item = u16> + Clone) {
+    if mo.no_nulls() {
+        return;
+    }
     let words = mo.m.div_ceil(64);
-    let ([na, nb, nc], nd) = s.null_split([a, b, c], dst, words);
     for w in 0..words {
-        nd[w] = na[w] | nb[w] | nc[w];
+        let acc = srcs
+            .clone()
+            .fold(0u64, |acc, r| acc | s.null_bits[r as usize * NULL_WORDS_PER_REG + w]);
+        s.null_bits[dst as usize * NULL_WORDS_PER_REG + w] = acc;
     }
 }
 
@@ -578,6 +581,24 @@ fn eval_is_null(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, pi: u8, in
         scratch.reg_mut(dst, mo.m).fill(invert as i64);
     }
     maybe_pack_bool_bits(scratch, mo, dst);
+}
+
+/// `IS [NOT] NULL` over register `a`'s null lane, a definite boolean. Under
+/// `no_nulls` there is no lane and nothing is NULL, so it is the constant
+/// `invert`; otherwise the lane *is* the packed boolean (the `BoolNot` shape).
+fn eval_is_null_reg(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: u16, invert: bool) {
+    if mo.no_nulls() {
+        scratch.reg_mut(dst, mo.m).fill(invert as i64);
+        return;
+    }
+    let flip = if invert { u64::MAX } else { 0 };
+    let base_a = a as usize * NULL_WORDS_PER_REG;
+    let base_d = dst as usize * NULL_WORDS_PER_REG;
+    for w in 0..mo.m.div_ceil(64) {
+        scratch.bool_bits[base_d + w] = scratch.null_bits[base_a + w] ^ flip;
+        scratch.null_bits[base_d + w] = 0;
+    }
+    maybe_unpack_bool_to_regs(scratch, mo, dst);
 }
 
 /// Shared BOOL_AND / BOOL_OR word-level 3VL kernel (nullable arm).
@@ -906,13 +927,17 @@ fn in_trim_set(set: &[u64; 4], b: u8) -> bool {
     (set[(b >> 6) as usize] >> (b & 63)) & 1 != 0
 }
 
-/// Widen a register to the i128 the SUBSTRING window is computed in. Each
-/// operand's magnitude is ≤ 2^64, so the sum of two cannot overflow.
-fn widen_reg(v: i64, signed: bool) -> i128 {
-    if signed {
-        v as i128
-    } else {
-        v as u64 as i128
+impl IntReg {
+    /// Row `i` of the register, widened. Each operand's magnitude is ≤ 2^64, so
+    /// the sum of two cannot overflow.
+    #[inline]
+    fn read(self, regs: &[i64], i: usize) -> i128 {
+        let v = regs[self.reg as usize * MORSEL + i];
+        if self.signed {
+            v as i128
+        } else {
+            v as u64 as i128
+        }
     }
 }
 
@@ -1047,6 +1072,9 @@ fn set_null_reg(s: &mut EvalScratch, mo: &Morsel<'_>, dst: u16) {
 /// gets the arena, the batch blob, and the source view, and returns the result
 /// view — it may grow the arena (a fresh copy) or narrow the source in place (a
 /// sub-view). The operand's null bit is the only NULL either way.
+///
+/// Kept apart from [`str_kernel`]: through it, the `str_upper` bench shape
+/// retires 1.1 % more instructions for a fail mask the closure never sets.
 fn str_to_str(
     scratch: &mut EvalScratch,
     mo: &Morsel<'_>,
@@ -1163,20 +1191,18 @@ fn num_to_str(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: u16, f: i
     null_copy1(scratch, mo, dst, a);
 }
 
-/// The register-channel string compare — the [`eval_str_cmp`] shape, over views
-/// instead of column cells.
-///
-/// More robust than that one, not less: content comes through
-/// `german_string_inline`, so pad bytes past `len` are never read, where
-/// [`eval_str_cmp`]'s prefix fast path is valid only for a canonical cell.
-fn eval_str_reg_cmp(
+/// Combine every row of string registers `a` and `b` into scalar register
+/// `dst`. `f` is total — the operands' null bits are the only NULL — and runs
+/// over NULL rows too, on whatever views they carry, keeping the loop
+/// branch-free: the compares, and STRPOS.
+fn str2_to_scalar(
     scratch: &mut EvalScratch,
     mo: &Morsel<'_>,
     bufs: StrBufs<'_>,
     dst: u16,
     a: u16,
     b: u16,
-    pred: impl Fn(Ordering) -> bool,
+    f: impl Fn(&[u8], &[u8]) -> i64,
 ) {
     let (base_a, base_b, base_d) = (a as usize * MORSEL, b as usize * MORSEL, dst as usize * MORSEL);
     {
@@ -1193,11 +1219,49 @@ fn eval_str_reg_cmp(
         for (i, r) in rd.iter_mut().enumerate() {
             let va = view_bytes(sa[i], str_arena, bufs);
             let vb = view_bytes(sb[i], str_arena, bufs);
-            *r = pred(va.cmp(vb)) as i64;
+            *r = f(va, vb);
         }
     }
     null_or2(scratch, mo, dst, a, b);
     maybe_pack_bool_bits(scratch, mo, dst);
+}
+
+/// Produce every row of string register `dst` from `S` string and `I` integer
+/// operands. `f` returns the result view — a sub-view of an operand, or a fresh
+/// arena copy — or `None` for a NULL of the kernel's own.
+fn str_kernel<const S: usize, const I: usize>(
+    scratch: &mut EvalScratch,
+    mo: &Morsel<'_>,
+    bufs: StrBufs<'_>,
+    dst: u16,
+    strs: [u16; S],
+    ints: [IntReg; I],
+    f: impl Fn(&mut Vec<u8>, StrBufs<'_>, [StrView; S], [i128; I]) -> Option<StrView>,
+) {
+    let m = mo.m;
+    let mut bad = [0u8; MORSEL];
+    {
+        let EvalScratch {
+            regs,
+            str_views,
+            str_arena,
+            ..
+        } = &mut *scratch;
+        let (srcs, vd) = split_windows(str_views, MORSEL, strs.map(usize::from), dst as usize, m);
+        for (i, r) in vd.iter_mut().enumerate() {
+            let views = srcs.map(|w| w[i]);
+            let nums = ints.map(|r| r.read(regs, i));
+            *r = match f(str_arena, bufs, views, nums) {
+                Some(v) => v,
+                None => {
+                    bad[i] = 1;
+                    StrView::default()
+                }
+            };
+        }
+    }
+    null_or_all(scratch, mo, dst, strs.iter().copied().chain(ints.iter().map(|r| r.reg)));
+    merge_fail_mask(scratch, mo, dst, &bad);
 }
 
 /// `SELECT`'s value blend under a per-row take mask, over either lane array:
@@ -1239,31 +1303,21 @@ fn eval_str_select(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, cond: u
     blend_by_mask(&mut scratch.str_views, [a, b], dst, &take_a, m);
 }
 
-/// Which registers `StrSubstr` addresses, and how each scalar bound is read.
-/// Grouped so the kernel takes one operand record rather than six positional
-/// arguments.
-struct SubstrOperands {
-    dst: u16,
-    src: u16,
-    start_reg: u16,
-    len_reg: Option<u16>,
-    start_signed: bool,
-    len_signed: bool,
-}
-
 /// SUBSTRING: a sub-view of the source, the bytes never copied.
-fn eval_str_substr(scratch: &mut EvalScratch, mo: &Morsel<'_>, bufs: StrBufs<'_>, op: SubstrOperands) {
-    let SubstrOperands {
-        dst: d,
-        src: si,
-        start_reg: sr,
-        len_reg,
-        start_signed,
-        len_signed,
-    } = op;
+///
+/// Kept apart from [`str_kernel`], whose `<1, 2>` case this is: through it,
+/// the `str_substr` bench shape retires 19.6 % more instructions.
+fn eval_str_substr(
+    scratch: &mut EvalScratch,
+    mo: &Morsel<'_>,
+    bufs: StrBufs<'_>,
+    d: u16,
+    si: u16,
+    start: IntReg,
+    len: Option<IntReg>,
+) {
     let m = mo.m;
-    let (base_s, base_start, base_d) = (si as usize * MORSEL, sr as usize * MORSEL, d as usize * MORSEL);
-    let base_len = len_reg.map(|l| l as usize * MORSEL);
+    let (base_s, base_d) = (si as usize * MORSEL, d as usize * MORSEL);
     let mut bad = [0u8; MORSEL];
     {
         let EvalScratch {
@@ -1275,27 +1329,20 @@ fn eval_str_substr(scratch: &mut EvalScratch, mo: &Morsel<'_>, bufs: StrBufs<'_>
         for i in 0..m {
             let v = str_views[base_s + i];
             let (s, base_off) = view_bytes_at(v, str_arena, bufs);
-            // The clamp order is what makes this total. Widen to i128 per the
-            // register's signed flag and never compute in i64/u64; clamp each
-            // endpoint to `[1, n1]` before narrowing to a byte scan. `n1` is one
-            // past the ceiling because the window is half-open — clamping to the
-            // ceiling itself would make `SUBSTRING('abc' FROM -1)` yield `'ab'`.
-            //
-            // The ceiling is the *byte* length, which merely bounds the character
-            // count; counting characters first would cost a full pass over every
-            // row. A window landing in the gap between the two resolves to the
-            // string's end in `char_offset` below, which is the same answer.
-            let start = widen_reg(regs[base_start + i], start_signed);
-            let n1 = s.len() as i128 + 1;
-            let (lo, hi) = match base_len {
-                Some(bl) => {
-                    let len = widen_reg(regs[bl + i], len_signed);
+            // Positions are 1-based and the window half-open, so both endpoints
+            // clamp to `[1, past_end]`. The byte length only bounds the character
+            // count; `char_offset` settles a window landing in the gap.
+            let past_end = s.len() as i128 + 1;
+            let lo = start.read(regs, i);
+            let hi = match len {
+                Some(l) => {
+                    let len = l.read(regs, i);
                     bad[i] = (len < 0) as u8;
-                    (start, start + len)
+                    lo + len
                 }
-                None => (start, n1),
+                None => past_end,
             };
-            let (lo, hi) = (lo.clamp(1, n1), hi.clamp(1, n1));
+            let (lo, hi) = (lo.clamp(1, past_end), hi.clamp(1, past_end));
             // One comparison covering a zero length, a start past the end, and a
             // window entirely below 1.
             str_views[base_d + i] = if lo >= hi {
@@ -1316,12 +1363,12 @@ fn eval_str_substr(scratch: &mut EvalScratch, mo: &Morsel<'_>, bufs: StrBufs<'_>
     }
     // The fail flag is a negative length, so the no-FOR form has none — matching
     // its `Operands` entry, which leaves `makes_null` unset.
-    match len_reg {
+    match len {
         Some(l) => {
-            null_or3(scratch, mo, d, si, sr, l);
+            null_or_all(scratch, mo, d, [si, start.reg, l.reg].into_iter());
             merge_fail_mask(scratch, mo, d, &bad);
         }
-        None => null_or2(scratch, mo, d, si, sr),
+        None => null_or2(scratch, mo, d, si, start.reg),
     }
 }
 
@@ -1772,9 +1819,11 @@ pub(crate) fn eval_batch(
                 ResolvedIntOp::Div { signed } => int_divmod::<false>(scratch, &mo, dst, a, b, signed),
                 ResolvedIntOp::Mod { signed } => int_divmod::<true>(scratch, &mo, dst, a, b, signed),
             },
-            Instr::IntUnary { op, dst, a } => match op {
+            Instr::IntUnary { op, dst, a, signed } => match op {
                 IntUnaryOp::Neg => un_op(scratch, &mo, dst, a, |x| x.wrapping_neg()),
                 IntUnaryOp::Abs => un_op(scratch, &mo, dst, a, |x| x.wrapping_abs()),
+                IntUnaryOp::Sign if signed => un_op(scratch, &mo, dst, a, |x| x.signum()),
+                IntUnaryOp::Sign => un_op(scratch, &mo, dst, a, |x| (x != 0) as i64),
             },
             Instr::FloatUnary { op, dst, a } => match op {
                 FloatUnaryOp::Neg => un_op(scratch, &mo, dst, a, |x| encode_f64(-decode_f64(x))),
@@ -1783,6 +1832,15 @@ pub(crate) fn eval_batch(
                 FloatUnaryOp::Ceil => un_op(scratch, &mo, dst, a, |x| encode_f64(decode_f64(x).ceil())),
                 FloatUnaryOp::Round => un_op(scratch, &mo, dst, a, |x| encode_f64(decode_f64(x).round_ties_even())),
                 FloatUnaryOp::Trunc => un_op(scratch, &mo, dst, a, |x| encode_f64(decode_f64(x).trunc())),
+                FloatUnaryOp::Sqrt => un_op(scratch, &mo, dst, a, |x| encode_f64(decode_f64(x).sqrt())),
+                FloatUnaryOp::Ln => un_op(scratch, &mo, dst, a, |x| encode_f64(decode_f64(x).ln())),
+                FloatUnaryOp::Log10 => un_op(scratch, &mo, dst, a, |x| encode_f64(decode_f64(x).log10())),
+                FloatUnaryOp::Exp => un_op(scratch, &mo, dst, a, |x| encode_f64(decode_f64(x).exp())),
+                // `partial_cmp` against zero: -0.0 and +0.0 are `Equal`, NaN is
+                // `None` and stays NaN, as PostgreSQL spells it.
+                FloatUnaryOp::Sign => un_op(scratch, &mo, dst, a, |x| {
+                    encode_f64(decode_f64(x).partial_cmp(&0.0).map_or(f64::NAN, |o| o as i32 as f64))
+                }),
             },
             // A finite source whose rounded result is not finite overflowed f32's
             // range. Testing the ROUNDED value (not `|x| > f32::MAX`) keeps the
@@ -1876,6 +1934,9 @@ pub(crate) fn eval_batch(
                 FloatArithOp::Mul => bin_op(scratch, &mo, dst, a, b, |x, y| {
                     encode_f64(decode_f64(x) * decode_f64(y))
                 }),
+                FloatArithOp::Pow => bin_op(scratch, &mo, dst, a, b, |x, y| {
+                    encode_f64(decode_f64(x).powf(decode_f64(y)))
+                }),
                 FloatArithOp::Div => div_like(scratch, &mo, dst, a, b, |x, y| {
                     let (fa, fb) = (decode_f64(x), decode_f64(y));
                     let is_zero = fb == 0.0;
@@ -1958,6 +2019,7 @@ pub(crate) fn eval_batch(
             // IS NULL / IS NOT NULL
             // ----------------------------------------------------------------
             Instr::IsNull { dst, pi, invert } => eval_is_null(scratch, &mo, dst, pi, invert),
+            Instr::IsNullReg { dst, a, invert } => eval_is_null_reg(scratch, &mo, dst, a, invert),
 
             // ----------------------------------------------------------------
             // Type cast. `signed: false` reinterprets the register as u64 first
@@ -2072,9 +2134,13 @@ pub(crate) fn eval_batch(
             // The operator branch stays outside the row loop, as `str_cmp` does
             // for the `EXPR_STR_COL_*` family.
             Instr::StrCmp { op, dst, a, b } => match op {
-                StrOp::Eq => eval_str_reg_cmp(scratch, &mo, bufs, dst, a, b, |o| o == Ordering::Equal),
-                StrOp::Lt => eval_str_reg_cmp(scratch, &mo, bufs, dst, a, b, |o| o == Ordering::Less),
-                StrOp::Le => eval_str_reg_cmp(scratch, &mo, bufs, dst, a, b, |o| o != Ordering::Greater),
+                StrOp::Eq => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| (x == y) as i64),
+                StrOp::Lt => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| {
+                    (x.cmp(y) == Ordering::Less) as i64
+                }),
+                StrOp::Le => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| {
+                    (x.cmp(y) != Ordering::Greater) as i64
+                }),
             },
 
             // Unswitched on `chars`, so each measure is its own monomorphised loop.
@@ -2104,26 +2170,7 @@ pub(crate) fn eval_batch(
                 });
             }
 
-            Instr::StrSubstr {
-                dst,
-                src,
-                start_reg,
-                len_reg,
-                start_signed,
-                len_signed,
-            } => eval_str_substr(
-                scratch,
-                &mo,
-                bufs,
-                SubstrOperands {
-                    dst,
-                    src,
-                    start_reg,
-                    len_reg,
-                    start_signed,
-                    len_signed,
-                },
-            ),
+            Instr::StrSubstr { dst, src, start, len } => eval_str_substr(scratch, &mo, bufs, dst, src, start, len),
 
             // A sub-view of the source: the bytes are not copied, only the
             // offset and length narrowed.
@@ -2188,6 +2235,168 @@ pub(crate) fn eval_batch(
                         .map(encode_f64)
                 });
             }
+            Instr::StrPos { dst, hay, needle } => {
+                str2_to_scalar(scratch, &mo, bufs, dst, hay, needle, |h, n| match find(h, n, false) {
+                    Some(off) => char_count(&h[..off]) as i64 + 1,
+                    None => 0,
+                })
+            }
+            Instr::StrSide { dst, src, n, left } => {
+                str_kernel(scratch, &mo, bufs, dst, [src], [n], |arena, bufs, [v], [n]| {
+                    let (s, base) = view_bytes_at(v, arena, bufs);
+                    // Clamped to one past the byte length, so it fits a `usize`.
+                    let n_abs = n.unsigned_abs().min(s.len() as u128 + 1) as usize;
+                    // A non-negative LEFT and a negative RIGHT count from the start.
+                    let counts_from_start = (n >= 0) == left;
+                    let cut = char_offset(
+                        s,
+                        0,
+                        if counts_from_start {
+                            n_abs
+                        } else {
+                            char_count(s).saturating_sub(n_abs)
+                        },
+                    );
+                    Some(if left {
+                        StrView::at(v.src, base, cut)
+                    } else {
+                        StrView::at(v.src, base + cut, s.len() - cut)
+                    })
+                })
+            }
+            Instr::StrReverse { dst, a } => str_to_str(scratch, &mo, bufs, dst, a, |arena, bufs, v| {
+                let (o, l) = arena_push_view(arena, bufs, v);
+                reverse_chars(&mut arena[o..o + l]);
+                StrView::arena(o, l)
+            }),
+            Instr::StrReplace { dst, s, from, to } => {
+                str_kernel(
+                    scratch,
+                    &mo,
+                    bufs,
+                    dst,
+                    [s, from, to],
+                    [],
+                    |arena, bufs, [vs, vf, vt], []| {
+                        let (s, from, to) = (
+                            view_bytes(vs, arena, bufs),
+                            view_bytes(vf, arena, bufs),
+                            view_bytes(vt, arena, bufs),
+                        );
+                        if from.is_empty() {
+                            return Some(vs);
+                        }
+                        let hits = fields(s, from).count() - 1;
+                        if hits == 0 {
+                            return Some(vs);
+                        }
+                        let total = (s.len() + hits * to.len()) as u128 - (hits * from.len()) as u128;
+                        if total > u32::MAX as u128 {
+                            return None;
+                        }
+                        // The operands may live in the arena being grown, so the
+                        // result's span is reserved first and the arena split
+                        // around it: the operands are read out of the prefix
+                        // while the result is written into the tail.
+                        let (out, total) = (arena.len(), total as usize);
+                        arena.resize(out + total, 0);
+                        let (prefix, res) = arena.split_at_mut(out);
+                        let prefix: &[u8] = prefix;
+                        let (s, from, to) = (
+                            view_bytes(vs, prefix, bufs),
+                            view_bytes(vf, prefix, bufs),
+                            view_bytes(vt, prefix, bufs),
+                        );
+                        let mut w = 0;
+                        for (k, (lo, hi)) in fields(s, from).enumerate() {
+                            if k > 0 {
+                                res[w..w + to.len()].copy_from_slice(to);
+                                w += to.len();
+                            }
+                            res[w..w + hi - lo].copy_from_slice(&s[lo..hi]);
+                            w += hi - lo;
+                        }
+                        debug_assert_eq!(w, total);
+                        Some(StrView::arena(out, total))
+                    },
+                )
+            }
+            Instr::StrPad { dst, s, n, fill, left } => {
+                str_kernel(scratch, &mo, bufs, dst, [s, fill], [n], |arena, bufs, [vs, vf], [n]| {
+                    let (s, base) = view_bytes_at(vs, arena, bufs);
+                    if n <= 0 {
+                        return Some(StrView::default());
+                    }
+                    let s_chars = char_count(s);
+                    // A width at or below the subject's own length truncates —
+                    // the LEFT of `n` characters, a sub-view.
+                    if n <= s_chars as i128 {
+                        return Some(StrView::at(vs.src, base, char_offset(s, 0, n as usize)));
+                    }
+                    let (fill, fill_base) = view_bytes_at(vf, arena, bufs);
+                    let fill_chars = char_count(fill);
+                    if fill_chars == 0 {
+                        return Some(vs);
+                    }
+                    // A pad character is at least one byte, so a count past the
+                    // byte ceiling is already NULL — and what remains fits a `usize`.
+                    let pad_chars = match usize::try_from(n - s_chars as i128) {
+                        Ok(c) if c <= u32::MAX as usize => c,
+                        _ => return None,
+                    };
+                    let (whole, rem) = (pad_chars / fill_chars, pad_chars % fill_chars);
+                    let rem_bytes = char_offset(fill, 0, rem);
+                    let total = s.len() as u128 + (whole * fill.len()) as u128 + rem_bytes as u128;
+                    if total > u32::MAX as u128 {
+                        return None;
+                    }
+                    let (s_len, fill_len) = (s.len(), fill.len());
+                    let out = arena.len();
+                    let push_pad = |arena: &mut Vec<u8>| {
+                        for _ in 0..whole {
+                            arena_push_span(arena, bufs, vf.src, fill_base, fill_len);
+                        }
+                        arena_push_span(arena, bufs, vf.src, fill_base, rem_bytes);
+                    };
+                    if left {
+                        push_pad(arena);
+                        arena_push_span(arena, bufs, vs.src, base, s_len);
+                    } else {
+                        arena_push_span(arena, bufs, vs.src, base, s_len);
+                        push_pad(arena);
+                    }
+                    Some(StrView::arena(out, total as usize))
+                })
+            }
+            Instr::StrSplitPart { dst, s, delim, n } => str_kernel(
+                scratch,
+                &mo,
+                bufs,
+                dst,
+                [s, delim],
+                [n],
+                |arena, bufs, [vs, vd], [n]| {
+                    if n == 0 {
+                        return None;
+                    }
+                    let (s, base) = view_bytes_at(vs, arena, bufs);
+                    let d = view_bytes(vd, arena, bufs);
+                    if d.is_empty() {
+                        return Some(if n == 1 || n == -1 { vs } else { StrView::default() });
+                    }
+                    // The 0-based field index: a negative `n` counts back from
+                    // the field total. Off either end is the empty string.
+                    let idx = if n > 0 {
+                        usize::try_from(n - 1).ok()
+                    } else {
+                        usize::try_from(-n)
+                            .ok()
+                            .and_then(|k| fields(s, d).count().checked_sub(k))
+                    };
+                    let field = idx.and_then(|i| fields(s, d).nth(i));
+                    Some(field.map_or(StrView::default(), |(lo, hi)| StrView::at(vs.src, base + lo, hi - lo)))
+                },
+            ),
         }
     }
 }

@@ -54,9 +54,7 @@ fn bind_literal_accepts_in_range_integer() {
 }
 
 /// A null test on a PK column never survives binding: a PK column is always
-/// non-nullable, so [`fold_null_test`] const-folds it to a literal. That is
-/// what keeps `IS [NOT] NULL` safe on a PK for the compiled evaluator, whose
-/// `IsNull`/`IsNotNull` opcodes are payload-only and would reject a PK operand.
+/// non-nullable, so `null_test` settles it as a literal.
 #[test]
 fn null_test_on_pk_column_folds_to_a_literal() {
     let schema = schema_with_val(TypeCode::I64); // pk is NOT NULL
@@ -107,18 +105,24 @@ fn test_compound_identifier_null_test_binds() {
         bind_single_table(&parse_expr_sql("t.c IS NOT NULL"), &nn).unwrap(),
         BoundExpr::LitInt(1)
     ));
-    // Nullable column: binds to the IsNull / IsNotNull opcode at the column index.
+    // Nullable column: a null test over the column reference.
     let nullable = Schema {
         columns: vec![col("pk", TypeCode::U64), ColumnDef::new("c", TypeCode::I64, true)],
         pk_cols: vec![0],
     };
     assert!(matches!(
         bind_single_table(&parse_expr_sql("t.c IS NULL"), &nullable).unwrap(),
-        BoundExpr::IsNull(1)
+        BoundExpr::NullTest {
+            inner: _,
+            want_null: true
+        }
     ));
     assert!(matches!(
         bind_single_table(&parse_expr_sql("t.c IS NOT NULL"), &nullable).unwrap(),
-        BoundExpr::IsNotNull(1)
+        BoundExpr::NullTest {
+            inner: _,
+            want_null: false
+        }
     ));
 }
 
@@ -298,11 +302,17 @@ fn test_bind_coalesce_base_cases() {
         bind_single_table(&parse_expr_sql("COALESCE(NULL, c)"), &s).unwrap(),
         BoundExpr::ColRef(1)
     ));
-    // COALESCE(c, 0) → Case{[(IsNotNull(c), c)], else: 0}.
+    // COALESCE(c, 0) → Case{[(c IS NOT NULL, c)], else: 0}.
     match bind_single_table(&parse_expr_sql("COALESCE(c, 0)"), &s).unwrap() {
         BoundExpr::Case { branches, else_ } => {
             assert_eq!(branches.len(), 1);
-            assert!(matches!(branches[0].0, BoundExpr::IsNotNull(1)));
+            assert!(matches!(
+                branches[0].0,
+                BoundExpr::NullTest {
+                    inner: _,
+                    want_null: false
+                }
+            ));
             assert!(matches!(branches[0].1, BoundExpr::ColRef(1)));
             assert!(matches!(else_.as_deref(), Some(BoundExpr::LitInt(0))));
         }
@@ -329,13 +339,25 @@ fn test_bind_coalesce_nested_three_arg() {
     };
     match bind_single_table(&parse_expr_sql("COALESCE(a, b, 0)"), &s).unwrap() {
         BoundExpr::Case { branches, else_ } => {
-            assert!(matches!(branches[0].0, BoundExpr::IsNotNull(1)));
+            assert!(matches!(
+                branches[0].0,
+                BoundExpr::NullTest {
+                    inner: _,
+                    want_null: false
+                }
+            ));
             match else_.as_deref() {
                 Some(BoundExpr::Case {
                     branches: inner,
                     else_: inner_else,
                 }) => {
-                    assert!(matches!(inner[0].0, BoundExpr::IsNotNull(2)));
+                    assert!(matches!(
+                        inner[0].0,
+                        BoundExpr::NullTest {
+                            inner: _,
+                            want_null: false
+                        }
+                    ));
                     assert!(matches!(inner_else.as_deref(), Some(BoundExpr::LitInt(0))));
                 }
                 other => panic!("expected nested Case, got {other:?}"),
@@ -345,16 +367,28 @@ fn test_bind_coalesce_nested_three_arg() {
     }
 }
 
-/// A computed COALESCE operand (`c + 1`) reaches `bind_null_test`, which
-/// resolves a *column*, so it errors "expected a column reference" rather than
-/// mis-binding.
+/// A computed COALESCE operand (`c + 1`) is null-tested over its own value: the
+/// leaf declines it and the condition is a `NullTest` over the `BinOp`.
 #[test]
-fn test_bind_coalesce_computed_operand_rejected() {
+fn test_bind_coalesce_computed_operand_tests_its_value() {
     let s = nullable_schema(TypeCode::I64);
-    assert_unsupported(
-        bind_single_table(&parse_expr_sql("COALESCE(c + 1, 0)"), &s),
-        "expected a column reference",
-    );
+    match bind_single_table(&parse_expr_sql("COALESCE(c + 1, 0)"), &s).unwrap() {
+        BoundExpr::Case { branches, else_ } => {
+            assert_eq!(branches.len(), 1);
+            match &branches[0].0 {
+                BoundExpr::NullTest {
+                    inner,
+                    want_null: false,
+                } => {
+                    assert!(matches!(**inner, BoundExpr::BinOp(_, BinOp::Add, _)));
+                }
+                other => panic!("expected NullTest over the sum, got {other:?}"),
+            }
+            assert!(matches!(branches[0].1, BoundExpr::BinOp(_, BinOp::Add, _)));
+            assert!(matches!(else_.as_deref(), Some(BoundExpr::LitInt(0))));
+        }
+        other => panic!("expected Case, got {other:?}"),
+    }
 }
 
 /// `NULLIF(a, b)` → `CASE WHEN a = b THEN NULL ELSE a END`; wrong arity errors.
@@ -405,6 +439,32 @@ fn bind_num(src: &str) -> Result<BoundExpr, GnitzSqlError> {
     bind_single_table(&parse_expr_sql(src), &schema_with_val(TypeCode::I64))
 }
 
+/// The transcendental names and SIGN reach the unary node; POWER and POW are
+/// the `Pow` operator.
+#[test]
+fn transcendental_names_bind_to_their_function() {
+    for (src, want) in [
+        ("SQRT(c)", NumFunc::Unary(FloatUnaryOp::Sqrt)),
+        ("ln(c)", NumFunc::Unary(FloatUnaryOp::Ln)),
+        ("LOG(c)", NumFunc::Unary(FloatUnaryOp::Log10)),
+        ("EXP(c)", NumFunc::Unary(FloatUnaryOp::Exp)),
+        ("SIGN(c)", NumFunc::Unary(FloatUnaryOp::Sign)),
+    ] {
+        match bind_num(src).unwrap() {
+            BoundExpr::Func { f, .. } => assert_eq!(f, want, "{src}"),
+            other => panic!("{src}: expected Func, got {other:?}"),
+        }
+    }
+    for src in ["POWER(c, 2)", "pow(c, 2)"] {
+        assert!(
+            matches!(bind_num(src).unwrap(), BoundExpr::BinOp(_, BinOp::Pow, _)),
+            "{src}"
+        );
+    }
+    assert_unsupported(bind_num("POWER(c)"), "exactly two arguments");
+    assert_unsupported(bind_num("LOG(c, 2)"), "exactly one argument");
+}
+
 fn assert_bind_err(r: Result<BoundExpr, GnitzSqlError>, want_substr: &str) {
     match r.unwrap_err() {
         GnitzSqlError::Bind(msg) => assert!(
@@ -421,13 +481,14 @@ fn assert_bind_err(r: Result<BoundExpr, GnitzSqlError>, want_substr: &str) {
 #[test]
 fn unary_numeric_functions_bind_to_their_numfunc() {
     for (src, want) in [
-        ("ABS(c)", NumFunc::Abs),
-        ("abs(c)", NumFunc::Abs),
-        ("CEIL(c)", NumFunc::Ceil),
-        ("CEILING(c)", NumFunc::Ceil),
-        ("FLOOR(c)", NumFunc::Floor),
-        ("TRUNC(c)", NumFunc::Trunc),
-        ("ROUND(c)", NumFunc::Round(0)),
+        ("ABS(c)", NumFunc::Unary(FloatUnaryOp::Abs)),
+        ("abs(c)", NumFunc::Unary(FloatUnaryOp::Abs)),
+        ("CEIL(c)", NumFunc::Unary(FloatUnaryOp::Ceil)),
+        ("CEILING(c)", NumFunc::Unary(FloatUnaryOp::Ceil)),
+        ("FLOOR(c)", NumFunc::Unary(FloatUnaryOp::Floor)),
+        ("TRUNC(c)", NumFunc::Unary(FloatUnaryOp::Trunc)),
+        ("ROUND(c)", NumFunc::Unary(FloatUnaryOp::Round)),
+        ("ROUND(c, 2)", NumFunc::Round(2)),
     ] {
         match bind_num(src).unwrap() {
             BoundExpr::Func { f, arg } => {
@@ -501,8 +562,8 @@ fn greatest_least_bind_n_ary_with_computed_args() {
 }
 
 /// The `NULL` literal is an ordinary value, not a GREATEST/LEAST special
-/// case: it binds wherever a literal does. `IS [NOT] NULL` still needs a
-/// column, so it keeps rejecting one.
+/// case: it binds wherever a literal does — under `IS NULL` too, as a null
+/// test over the literal's value.
 #[test]
 fn null_literal_binds_wherever_a_literal_does() {
     for src in [
@@ -519,7 +580,10 @@ fn null_literal_binds_wherever_a_literal_does() {
     assert!(matches!(bind_num("NULL").unwrap(), BoundExpr::LitNull));
     // COALESCE folds a leading NULL away rather than making it the result.
     assert!(matches!(bind_num("COALESCE(NULL, c)").unwrap(), BoundExpr::ColRef(1)));
-    assert!(bind_num("NULL IS NULL").is_err());
+    // A NULL literal's null test is settled at bind time, as a literal's is.
+    assert!(matches!(bind_num("NULL IS NULL").unwrap(), BoundExpr::LitInt(1)));
+    assert!(matches!(bind_num("NULL IS NOT NULL").unwrap(), BoundExpr::LitInt(0)));
+    assert!(matches!(bind_num("1 IS NULL").unwrap(), BoundExpr::LitInt(0)));
 }
 
 /// All four cast kinds mean the same thing here — a failed cast is a NULL,
@@ -588,7 +652,10 @@ fn scalar_functions_wrap_an_aggregate_argument() {
         );
     }
     match bind_single_table(&parse_expr_sql("ABS(SUM(c))"), &s).unwrap() {
-        BoundExpr::Func { f: NumFunc::Abs, arg } => {
+        BoundExpr::Func {
+            f: NumFunc::Unary(FloatUnaryOp::Abs),
+            arg,
+        } => {
             assert!(matches!(*arg, BoundExpr::AggCall { func: AggFunc::Sum, .. }))
         }
         other => panic!("expected Func(Abs, AggCall), got {other:?}"),
@@ -689,15 +756,166 @@ fn string_function_names_bind_to_their_measure_and_transform() {
         ("CHAR_LENGTH(c)", StrFunc::LenChars),
         ("character_length(c)", StrFunc::LenChars),
         ("OCTET_LENGTH(c)", StrFunc::LenBytes),
+        ("REVERSE(c)", StrFunc::Reverse),
+        ("LEFT(c, 2)", StrFunc::Left),
+        ("right(c, 2)", StrFunc::Right),
+        ("STRPOS(c, 'x')", StrFunc::Pos),
+        ("REPLACE(c, 'a', 'b')", StrFunc::Replace),
+        ("LPAD(c, 5)", StrFunc::Lpad),
+        ("RPAD(c, 5, 'ab')", StrFunc::Rpad),
+        ("SPLIT_PART(c, ',', 2)", StrFunc::SplitPart),
     ] {
         match bind_str(src).unwrap() {
-            BExpr::StrCall { f, .. } => assert_eq!(f, want, "{src}"),
+            BExpr::StrCall { f, args } => {
+                assert_eq!(f, want, "{src}");
+                assert_eq!(args.len(), f.signature().len(), "{src}: sized by the signature");
+            }
             other => panic!("{src}: expected StrCall, got {other:?}"),
         }
     }
     for src in ["UPPER()", "UPPER(c, c)", "LENGTH()"] {
         assert_unsupported(bind_str(src), "exactly one argument");
     }
+    assert_unsupported(bind_str("LEFT(c)"), "exactly two arguments");
+    assert_unsupported(bind_str("REPLACE(c, 'a')"), "exactly three arguments");
+    assert_unsupported(bind_str("LPAD(c)"), "two or three arguments");
+    assert_unsupported(bind_str("RPAD(c, 1, 'x', 'y')"), "two or three arguments");
+}
+
+/// Every string function's spelling reads back out of the name table, and
+/// re-binds to the same function — the two directions of one map.
+#[test]
+fn every_string_function_has_a_spelling_that_binds_back() {
+    for f in [
+        StrFunc::Upper,
+        StrFunc::Lower,
+        StrFunc::LenBytes,
+        StrFunc::LenChars,
+        StrFunc::Reverse,
+        StrFunc::Left,
+        StrFunc::Right,
+        StrFunc::Pos,
+        StrFunc::Replace,
+        StrFunc::Lpad,
+        StrFunc::Rpad,
+        StrFunc::SplitPart,
+    ] {
+        let name = str_func_name(f);
+        let args = ["c", "c, 1", "c, c", "c, 'a', 'b'", "c, 1, 'x'", "c, ',', 1"]
+            .into_iter()
+            .find(|a| a.split(',').count() == f.signature().len() && (f != StrFunc::Pos || *a == "c, c"))
+            .unwrap();
+        let src = format!("{name}({args})");
+        match bind_str(&src).unwrap() {
+            BExpr::StrCall { f: bound, .. } => assert_eq!(bound, f, "{src}"),
+            other => panic!("{src}: expected StrCall, got {other:?}"),
+        }
+    }
+}
+
+/// `LPAD`/`RPAD` without a fill carry one space as their third argument, so
+/// the node always holds the full signature.
+#[test]
+fn pad_without_a_fill_defaults_to_one_space() {
+    match bind_str("LPAD(c, 5)").unwrap() {
+        BExpr::StrCall { args, .. } => assert_eq!(args[2], BoundExpr::LitStr(" ".into())),
+        other => panic!("expected StrCall, got {other:?}"),
+    }
+}
+
+/// `POSITION(needle IN hay)` is `STRPOS(hay, needle)`: the same node with the
+/// arguments swapped into call order.
+#[test]
+fn position_binds_as_strpos_with_swapped_arguments() {
+    match bind_str("POSITION('x' IN c)").unwrap() {
+        BExpr::StrCall { f: StrFunc::Pos, args } => {
+            assert!(matches!(args[0], BoundExpr::ColRef(1)));
+            assert_eq!(args[1], BoundExpr::LitStr("x".into()));
+        }
+        other => panic!("expected STRPOS, got {other:?}"),
+    }
+}
+
+/// `IF(c, a, b)` is a one-branch CASE; `IFNULL`/`NVL` are two-argument COALESCE.
+#[test]
+fn if_ifnull_and_nvl_desugar_onto_case_and_coalesce() {
+    let s = nullable_schema(TypeCode::I64);
+    match bind_single_table(&parse_expr_sql("IF(c > 1, 10, 20)"), &s).unwrap() {
+        BoundExpr::Case { branches, else_ } => {
+            assert_eq!(branches.len(), 1);
+            assert!(matches!(branches[0].0, BoundExpr::BinOp(_, BinOp::Gt, _)));
+            assert!(matches!(branches[0].1, BoundExpr::LitInt(10)));
+            assert!(matches!(else_.as_deref(), Some(BoundExpr::LitInt(20))));
+        }
+        other => panic!("expected Case, got {other:?}"),
+    }
+    for src in ["IFNULL(c, 0)", "NVL(c, 0)"] {
+        let coalesce = bind_single_table(&parse_expr_sql("COALESCE(c, 0)"), &s).unwrap();
+        assert_eq!(bind_single_table(&parse_expr_sql(src), &s).unwrap(), coalesce, "{src}");
+    }
+    assert_unsupported(
+        bind_single_table(&parse_expr_sql("IFNULL(c, 0, 1)"), &s),
+        "exactly two arguments",
+    );
+    assert_unsupported(
+        bind_single_table(&parse_expr_sql("IF(c, 1)"), &s),
+        "exactly three arguments",
+    );
+}
+
+/// `a IS [NOT] DISTINCT FROM b` is one definite CASE for both polarities: with
+/// a NULL on either side the null flags are compared with the same operator
+/// as the values. A never-null operand folds its null test to a constant, as
+/// any null test does, and two never-null operands are the plain comparison.
+#[test]
+fn is_distinct_from_desugars_to_a_definite_case() {
+    let s = nullable_schema(TypeCode::I64);
+    for (src, op) in [
+        ("c IS DISTINCT FROM pk", BinOp::Ne),
+        ("c IS NOT DISTINCT FROM pk", BinOp::Eq),
+    ] {
+        match bind_single_table(&parse_expr_sql(src), &s).unwrap() {
+            BoundExpr::Case { branches, else_ } => {
+                assert_eq!(branches.len(), 1, "{src}");
+                // `c IS NULL` over the nullable column is a real test; `pk IS
+                // NULL` over the never-null PK folds to 0.
+                let (cond, then) = &branches[0];
+                assert!(
+                    matches!(cond, BoundExpr::BinOp(a, BinOp::Or, b)
+                        if matches!(**a, BoundExpr::NullTest { want_null: true, .. }) && matches!(**b, BoundExpr::LitInt(0))),
+                    "{src}: {cond:?}"
+                );
+                assert!(matches!(then, BoundExpr::BinOp(_, o, _) if *o == op), "{src}: {then:?}");
+                assert!(
+                    matches!(else_.as_deref(), Some(BoundExpr::BinOp(_, o, _)) if *o == op),
+                    "{src}"
+                );
+            }
+            other => panic!("{src}: expected Case, got {other:?}"),
+        }
+    }
+    assert!(matches!(
+        bind_single_table(&parse_expr_sql("pk IS DISTINCT FROM 1"), &s).unwrap(),
+        BoundExpr::BinOp(_, BinOp::Ne, _)
+    ));
+}
+
+/// `IS NULL` over anything but a column is a null test over the value.
+#[test]
+fn null_test_over_a_computed_operand_tests_its_value() {
+    let s = nullable_schema(TypeCode::I64);
+    match bind_single_table(&parse_expr_sql("(c + 1) IS NOT NULL"), &s).unwrap() {
+        BoundExpr::NullTest {
+            inner,
+            want_null: false,
+        } => {
+            assert!(matches!(*inner, BoundExpr::BinOp(_, BinOp::Add, _)));
+        }
+        other => panic!("expected NullTest, got {other:?}"),
+    }
+    // A name that does not resolve is still that error, not a null test over
+    // nothing.
+    assert!(bind_single_table(&parse_expr_sql("nope IS NULL"), &s).is_err());
 }
 
 /// The full TRIM syntax matrix collapses to `(mode, set)`. The keyword form

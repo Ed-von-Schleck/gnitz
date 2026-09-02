@@ -9,7 +9,6 @@
 //! never up into `dml` or the `hir` view compiler).
 
 use crate::ast_util::agg_func_name;
-use crate::bind::fold_null_test;
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr, BinOp};
 use crate::types::has_scalar_register;
@@ -366,6 +365,9 @@ pub(crate) fn default_agg_name(func: AggFunc, idx: usize) -> String {
 ///   hits zero (div-by-zero → NULL). Type-preserving — unlike AVG, SUM keeps its
 ///   own output type, since the divide dispatches on the SUM column's type.
 /// * **Direct** (no companion) — the value column itself, raw null bit included.
+///
+/// So a null test over the composite is exact in every shape, which is what
+/// lets the binder treat an aggregate like any other computed operand.
 pub(crate) fn finalize_agg_bexpr<R>(value: R, companion: Option<R>, func: AggFunc) -> BExpr<R> {
     let value = BExpr::ColRef(value);
     let Some(cnt) = companion else {
@@ -389,30 +391,6 @@ pub(crate) fn finalize_agg_bexpr<R>(value: R, companion: Option<R>, func: AggFun
             Box::new(BExpr::BinOp(Box::new(cnt), BinOp::Ne, Box::new(BExpr::LitInt(0)))),
         )
     }
-}
-
-/// `IS [NOT] NULL` over a finalized aggregate — the null-test sibling of
-/// [`finalize_agg_bexpr`], generic over the leaf reference `R` for the same
-/// reason.
-///
-/// A companion-carrying aggregate (nullable SUM / AVG) tests the hidden
-/// COUNT_NON_NULL companion instead of the value column: a linear-fold SUM's
-/// saturating has_value bit stays set once its last non-null contributor
-/// retracts, so the value column would report 0 where NULL is correct, and AVG
-/// has no single raw column at all. Everything else routes through
-/// [`fold_null_test`] with its authoritative nullability, so a never-null shape
-/// const-folds away.
-pub(crate) fn finalize_agg_null_test<R>(
-    value: R,
-    companion: Option<R>,
-    output_nullable: bool,
-    want_null: bool,
-) -> BExpr<R> {
-    let Some(cnt) = companion else {
-        return fold_null_test(output_nullable, value, want_null);
-    };
-    let bop = if want_null { BinOp::Eq } else { BinOp::Ne };
-    BExpr::BinOp(Box::new(BExpr::ColRef(cnt)), bop, Box::new(BExpr::LitInt(0)))
 }
 
 /// Whether an aggregate's **finalize** output is nullable. AVG's and nullable-SUM's

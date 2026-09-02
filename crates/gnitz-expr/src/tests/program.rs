@@ -785,7 +785,6 @@ fn validate_rejects_a_pk_column_for_a_payload_only_opcode() {
     // Each payload-only opcode that routes a PK column to the pi=255 sentinel.
     let cases: &[(&[u32], Vec<Vec<u8>>)] = &[
         (&[2, 0, 0], vec![]),               // LOAD_COL_FLOAT col0
-        (&[30, 0, 0], vec![]),              // IS_NULL col0
         (&[40, 0, 0], vec![b"x".to_vec()]), // STR_COL_EQ_CONST col0
         (&[43, 0, 1], vec![]),              // STR_COL_EQ_COL col_a=0
     ];
@@ -1795,6 +1794,39 @@ fn string_nullability_classification() {
         scalar_prog(&schema, instrs, result, vec![]).prog.no_nulls
     };
     assert!(no_nulls(vec![LogicalInstr::StrCase { a: Reg(0), upper: true }]));
+    // The window and reorder producers are total; REPLACE and the pads share
+    // CONCAT's overflow NULL, and SPLIT_PART has its zero field index.
+    assert!(no_nulls(vec![LogicalInstr::StrReverse { a: Reg(0) }]));
+    assert!(no_nulls(vec![
+        LogicalInstr::LoadConst { val: 1 },
+        LogicalInstr::StrSide {
+            src: Reg(0),
+            n_reg: Reg(1),
+            left: true
+        }
+    ]));
+    assert!(!no_nulls(vec![LogicalInstr::StrReplace {
+        s: Reg(0),
+        from: Reg(0),
+        to: Reg(0)
+    }]));
+    assert!(!no_nulls(vec![
+        LogicalInstr::LoadConst { val: 1 },
+        LogicalInstr::StrPad {
+            s: Reg(0),
+            n_reg: Reg(1),
+            fill: Reg(0),
+            left: false
+        }
+    ]));
+    assert!(!no_nulls(vec![
+        LogicalInstr::LoadConst { val: 1 },
+        LogicalInstr::StrSplitPart {
+            s: Reg(0),
+            delim: Reg(0),
+            n_reg: Reg(1)
+        }
+    ]));
     assert!(!no_nulls(vec![LogicalInstr::StrToInt {
         a: Reg(0),
         fi: FixedInt::I64
@@ -1832,7 +1864,7 @@ fn string_nullability_classification() {
 /// carries no per-variant data, so there is no index bookkeeping to keep dense;
 /// `mem::discriminant` does the counting.
 impl LogicalInstr {
-    pub(crate) const VARIANT_COUNT: usize = 38;
+    pub(crate) const VARIANT_COUNT: usize = 45;
 
     /// Exhaustive by construction — the compile error on a new variant is the
     /// whole point, so this must never gain a `_` arm.
@@ -1860,6 +1892,7 @@ impl LogicalInstr {
             | L::BoolBinary { .. }
             | L::BoolNot { .. }
             | L::IsNull { .. }
+            | L::IsNullReg { .. }
             | L::StrColConst { .. }
             | L::StrColCol { .. }
             | L::IntInSet { .. }
@@ -1877,7 +1910,13 @@ impl LogicalInstr {
             | L::IntToStr { .. }
             | L::FloatToStr { .. }
             | L::StrToInt { .. }
-            | L::StrToFloat { .. } => {}
+            | L::StrToFloat { .. }
+            | L::StrSide { .. }
+            | L::StrPos { .. }
+            | L::StrReverse { .. }
+            | L::StrReplace { .. }
+            | L::StrPad { .. }
+            | L::StrSplitPart { .. } => {}
         }
     }
 }
@@ -2060,7 +2099,7 @@ fn every_variant() -> Vec<LogicalInstr> {
             b: Reg(114),
         });
     }
-    for op in [IntUnaryOp::Neg, IntUnaryOp::Abs] {
+    for op in [IntUnaryOp::Neg, IntUnaryOp::Abs, IntUnaryOp::Sign] {
         v.push(L::IntUnary { op, a: Reg(116) });
     }
     for op in [
@@ -2070,9 +2109,19 @@ fn every_variant() -> Vec<LogicalInstr> {
         FloatUnaryOp::Ceil,
         FloatUnaryOp::Round,
         FloatUnaryOp::Trunc,
+        FloatUnaryOp::Sqrt,
+        FloatUnaryOp::Ln,
+        FloatUnaryOp::Log10,
+        FloatUnaryOp::Exp,
+        FloatUnaryOp::Sign,
     ] {
         v.push(L::FloatUnary { op, a: Reg(118) });
     }
+    v.push(L::FloatArith {
+        op: FloatArithOp::Pow,
+        a: Reg(119),
+        b: Reg(120),
+    });
     for is_max in [true, false] {
         v.push(L::IntMinMax2 {
             a: Reg(120),
@@ -2091,6 +2140,37 @@ fn every_variant() -> Vec<LogicalInstr> {
     for upper in [true, false] {
         v.push(L::StrCase { a: Reg(128), upper });
     }
+    for invert in [false, true] {
+        v.push(L::IsNullReg { a: Reg(129), invert });
+    }
+    for left in [true, false] {
+        v.push(L::StrSide {
+            src: Reg(132),
+            n_reg: Reg(133),
+            left,
+        });
+        v.push(L::StrPad {
+            s: Reg(134),
+            n_reg: Reg(135),
+            fill: Reg(136),
+            left,
+        });
+    }
+    v.push(L::StrPos {
+        hay: Reg(137),
+        needle: Reg(138),
+    });
+    v.push(L::StrReverse { a: Reg(139) });
+    v.push(L::StrReplace {
+        s: Reg(140),
+        from: Reg(141),
+        to: Reg(142),
+    });
+    v.push(L::StrSplitPart {
+        s: Reg(143),
+        delim: Reg(144),
+        n_reg: Reg(145),
+    });
     for skip_null in [false, true] {
         v.push(L::StrConcat {
             a: Reg(130),
