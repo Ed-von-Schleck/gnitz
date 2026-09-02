@@ -234,13 +234,14 @@ fn drop_column(
             "ALTER TABLE DROP COLUMN CASCADE is not supported (gnitz has no cascadable dependent objects)".to_string(),
         ));
     }
-    // sqlparser collapses `DROP a, b` into one op with a multi-name vec.
-    if column_names.len() != 1 {
-        return Err(GnitzSqlError::Unsupported(
-            "ALTER TABLE DROP COLUMN supports exactly one column per statement".to_string(),
-        ));
-    }
-    let col_name = &column_names[0].value;
+    // `GenericDialect` parses exactly one column here.
+    let [col] = column_names else {
+        return Err(GnitzSqlError::Internal(format!(
+            "DROP COLUMN parsed {} column names",
+            column_names.len()
+        )));
+    };
+    let col_name = &col.value;
     let source_name = extract_name(source, "ALTER TABLE")?;
     let Some((tid, schema)) =
         resolve_alter_base_table_with_schema(client, schema_name, &source_name, tbl_if_exists, "DROP COLUMN")?
@@ -340,13 +341,13 @@ fn add_constraint(
     reject_unhonored_unique_fields(u, "ADD CONSTRAINT")?;
 
     let source_name = extract_name(source, "ALTER TABLE")?;
-    if !alter_base_table_exists(client, schema_name, &source_name, if_exists, "ADD CONSTRAINT")? {
-        return Ok(altered("constraint", source_name));
-    }
-
     // `u.name` (the CONSTRAINT name) becomes the created index's name; `None`
     // auto-generates one (`create_index_core` via default_index_name).
     let explicit_name = u.name.as_ref().map(|n| n.value.clone());
+    if !alter_base_table_exists(client, schema_name, &source_name, if_exists, "ADD CONSTRAINT")? {
+        return Ok(altered("constraint", explicit_name.unwrap_or_default()));
+    }
+
     super::table::create_index_core(
         client,
         schema_name,

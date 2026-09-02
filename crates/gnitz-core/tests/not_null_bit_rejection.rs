@@ -42,9 +42,7 @@ fn hostile_push(session: &mut Session, tid: u64, schema: &Schema, batch: &ZSetBa
 
 #[test]
 fn a_null_bit_on_a_not_null_column_is_rejected_at_the_client_boundary() {
-    let Some(srv) = ServerHandle::start_n(4) else {
-        return;
-    };
+    let srv = ServerHandle::start_n(4);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let sn = unique_schema("nnb");
     client.create_schema(&sn).unwrap();

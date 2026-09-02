@@ -22,11 +22,14 @@ fn try_push(func: AggFunc, arg_col: Option<usize>) -> Result<AggShape, GnitzSqlE
 
 #[test]
 fn push_agg_specs_rejects_unevaluatable_arg_types() {
-    assert!(matches!(try_push(AggFunc::Sum, Some(2)), Err(GnitzSqlError::Bind(_)))); // SUM(blob)
-    assert!(matches!(try_push(AggFunc::Avg, Some(3)), Err(GnitzSqlError::Bind(_)))); // AVG(uuid)
-    assert!(matches!(try_push(AggFunc::Min, Some(4)), Err(GnitzSqlError::Bind(_)))); // MIN(str)
-    assert!(matches!(try_push(AggFunc::Max, Some(2)), Err(GnitzSqlError::Bind(_))));
-    // MAX(blob)
+    for (func, ci) in [
+        (AggFunc::Sum, 2), // SUM(blob)
+        (AggFunc::Avg, 3), // AVG(uuid)
+        (AggFunc::Min, 4), // MIN(str)
+        (AggFunc::Max, 2), // MAX(blob)
+    ] {
+        assert!(matches!(try_push(func, Some(ci)), Err(GnitzSqlError::Unsupported(_))));
+    }
 }
 
 #[test]

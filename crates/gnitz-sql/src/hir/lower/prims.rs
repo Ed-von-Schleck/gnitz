@@ -26,25 +26,11 @@ pub(crate) fn multi_null_filter_prog(
     coldefs: &[ColumnDef],
     want_null: bool,
 ) -> Result<gnitz_expr::LogicalProgram, GnitzSqlError> {
-    // Caller invariant: cols is non-empty (at least one join key column) AND at
-    // least one entry is nullable (the outer guard in the join lowering
-    // ensures both). Guard here so future callers fail loudly rather than
-    // panicking at cols[0].
-    if cols.is_empty() {
-        return Err(GnitzSqlError::Plan(
-            "multi_null_filter_prog: column list cannot be empty".into(),
-        ));
-    }
-    // Only nullable columns can ever satisfy IsNull or fail IsNotNull, so drop the
-    // NOT NULL columns to elide tautological (want_null=false) / contradictory
-    // (want_null=true) filter instructions. The caller (the join lowering)
-    // only reaches this with ≥ 1 nullable key column, so `nullable` is non-empty on
-    // every real path; the `is_empty` fallback to the unfiltered `cols` still
-    // degrades correctly should that ever change — with every key NOT NULL,
-    // `c IS NOT NULL` is a tautology (keep all rows) and `c IS NULL` a contradiction
-    // (drop all), exactly right when no key can be NULL.
-    let nullable: Vec<usize> = cols.iter().copied().filter(|&c| coldefs[c].is_nullable).collect();
-    let cols = if nullable.is_empty() { cols } else { &nullable[..] };
+    // Only a nullable column can satisfy IsNull or fail IsNotNull, so the NOT
+    // NULL keys contribute no instruction. Every caller checks that at least
+    // one key is nullable before building the gate.
+    let cols: Vec<usize> = cols.iter().copied().filter(|&c| coldefs[c].is_nullable).collect();
+    assert!(!cols.is_empty(), "a NULL-key gate over keys none of which is nullable");
 
     let leaf = |c: usize| {
         if want_null {

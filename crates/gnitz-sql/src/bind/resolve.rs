@@ -85,7 +85,7 @@ impl<'a> Binder<'a> {
 
     /// Bind in view-body mode: every relation this binder resolves becomes a
     /// source of a new view, so the leaf rule in [`Self::resolve`] applies. Set by
-    /// `dispatch::execute_statement` for CREATE VIEW / ALTER VIEW.
+    /// `plan_view` for CREATE VIEW / ALTER VIEW.
     pub(crate) fn for_view_body(mut self) -> Self {
         self.view_body = true;
         self

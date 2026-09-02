@@ -200,7 +200,8 @@ pub(crate) fn non_key_eligible_error(name: &str, tc: TypeCode, role: &str) -> Gn
 
 /// Reject a circuit whose widest intermediate batch exceeds the engine's
 /// column limit, before the server's hard schema-build assertion. `what` names
-/// the view kind and stage ("JOIN view output", "EXISTS view intermediate", …).
+/// the view kind and stage ("EXISTS view intermediate", …); a segment's output
+/// width is checked by its schema build instead.
 pub(crate) fn reject_column_overflow(what: &str, cols: usize) -> Result<(), GnitzSqlError> {
     if cols > gnitz_core::MAX_COLUMNS {
         return Err(GnitzSqlError::Unsupported(format!(
@@ -1245,8 +1246,6 @@ pub(crate) fn reject_unhonored_alter_table_clauses(
         on_cluster,
         table_type,
     } = alter;
-    // DROP COLUMN's `column_names: Vec<Ident>` already collapses `DROP a, b` into one
-    // operation, so this rejects only genuinely separate comma-joined operations.
     reject_if(operations.len() != 1, context, "more than one operation per statement")?;
     reject_if(*only, context, "ONLY")?;
     reject_if(location.is_some(), context, "SET LOCATION")?;

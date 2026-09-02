@@ -11,7 +11,7 @@
 use gnitz_core::connection::{COL_TAB, IDX_TAB, SCHEMA_TAB, SEQ_TAB, TABLE_TAB};
 use gnitz_core::protocol::{BatchAppender, ColumnDef, TypeCode, ZSetBatch};
 use gnitz_core::types::sys_schema;
-use gnitz_core::{GnitzClient, Session, TableProps};
+use gnitz_core::{CircuitBuilder, GnitzClient, PlannedView, Session, TableProps};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::sys_rows::{
     write_circuit_node_row, write_col_tab_row, write_idx_tab_row, write_schema_tab_row, write_table_tab_row,
@@ -118,7 +118,7 @@ fn session(srv: &ServerHandle) -> Session {
 /// `..` and `/` never reach `create_dir_all`.
 #[test]
 fn a_schema_name_that_is_not_an_identifier_is_refused() {
-    let Some(srv) = ServerHandle::start() else { return };
+    let srv = ServerHandle::start();
     let mut s = session(&srv);
     for name in ["..", "../escape", "a/b", "with space", ""] {
         let sid = s.alloc_schema_id().unwrap();
@@ -138,7 +138,7 @@ fn a_schema_name_that_is_not_an_identifier_is_refused() {
 /// register a relation no lookup finds.
 #[test]
 fn a_non_canonical_name_is_refused_for_every_family() {
-    let Some(srv) = ServerHandle::start() else { return };
+    let srv = ServerHandle::start();
     let mut s = session(&srv);
 
     let sid = s.alloc_schema_id().unwrap();
@@ -169,7 +169,7 @@ fn a_non_canonical_name_is_refused_for_every_family() {
 /// would read the first block alone while both were applied.
 #[test]
 fn a_bundle_with_two_blocks_for_one_family_is_refused() {
-    let Some(srv) = ServerHandle::start() else { return };
+    let srv = ServerHandle::start();
     let mut s = session(&srv);
     let sid = s.alloc_schema_id().unwrap();
     s.push_ddl_txn(&[(SCHEMA_TAB, schema_row(sid, "dupfam"))]).unwrap();
@@ -192,7 +192,7 @@ fn a_bundle_with_two_blocks_for_one_family_is_refused() {
 /// unreachable by name.
 #[test]
 fn two_indexes_under_one_name_in_one_bundle_are_refused() {
-    let Some(srv) = ServerHandle::start() else { return };
+    let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     client.create_schema("dupidx").unwrap();
     let cols = [
@@ -233,7 +233,7 @@ fn two_indexes_under_one_name_in_one_bundle_are_refused() {
 /// bundle and still commits whole.
 #[test]
 fn a_three_family_create_table_bundle_still_commits() {
-    let Some(srv) = ServerHandle::start() else { return };
+    let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     client.create_schema("ok").unwrap();
     let cols = [
@@ -264,7 +264,7 @@ fn a_three_family_create_table_bundle_still_commits() {
 /// precheck — may set it.
 #[test]
 fn a_wire_supplied_internal_index_flag_is_refused() {
-    let Some(srv) = ServerHandle::start() else { return };
+    let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     client.create_schema("infix").unwrap();
     let cols = [
@@ -303,7 +303,7 @@ fn a_wire_supplied_internal_index_flag_is_refused() {
 /// nothing.
 #[test]
 fn a_wire_supplied_owner_view_id_must_name_a_real_view() {
-    let Some(srv) = ServerHandle::start() else { return };
+    let srv = ServerHandle::start();
     let mut s = session(&srv);
     let sid = s.alloc_schema_id().unwrap();
     s.push_ddl_txn(&[(SCHEMA_TAB, schema_row(sid, "owned"))]).unwrap();
@@ -333,7 +333,7 @@ fn a_wire_supplied_owner_view_id_must_name_a_real_view() {
 /// member-count guard rejects it. `DROP SCHEMA` is exactly that bundle.
 #[test]
 fn drop_schema_retires_a_view_its_table_and_the_schema_in_one_bundle() {
-    let Some(srv) = ServerHandle::start() else { return };
+    let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     client.create_schema("teardown").unwrap();
     let cols = [
@@ -360,7 +360,7 @@ fn drop_schema_retires_a_view_its_table_and_the_schema_in_one_bundle() {
 /// in the right slot is the failure a "the push succeeded" assertion misses.
 #[test]
 fn a_rename_stores_the_new_name_for_a_table_and_for_a_view() {
-    let Some(srv) = ServerHandle::start() else { return };
+    let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     client.create_schema("ren").unwrap();
     let cols = [
@@ -397,7 +397,7 @@ fn a_rename_stores_the_new_name_for_a_table_and_for_a_view() {
 /// which only applies if COL_TAB and the circuit families land first.
 #[test]
 fn an_alter_view_bundle_still_applies_in_creation_order() {
-    let Some(srv) = ServerHandle::start() else { return };
+    let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     client.create_schema("mixed").unwrap();
     let cols = [
@@ -438,7 +438,7 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
 /// the wire at all.
 #[test]
 fn a_sequence_block_is_refused_from_the_wire() {
-    let Some(srv) = ServerHandle::start() else { return };
+    let srv = ServerHandle::start();
     let mut s = session(&srv);
     let seq = sys_schema(SEQ_TAB);
     let mut b = ZSetBatch::new(seq);
@@ -453,7 +453,7 @@ fn a_sequence_block_is_refused_from_the_wire() {
 /// from its payload.
 #[test]
 fn a_column_block_whose_owner_is_never_registered_is_refused() {
-    let Some(srv) = ServerHandle::start() else { return };
+    let srv = ServerHandle::start();
     let mut s = session(&srv);
     let tid = s.alloc_table_id().unwrap();
     let err = format!("{:?}", s.push_ddl_txn(&[(COL_TAB, two_columns(tid))]).unwrap_err());
@@ -464,7 +464,7 @@ fn a_column_block_whose_owner_is_never_registered_is_refused() {
 /// row claiming a kind its owner does not have plants an edge no arm validates.
 #[test]
 fn a_column_row_whose_owner_kind_contradicts_its_owner_is_refused() {
-    let Some(srv) = ServerHandle::start() else { return };
+    let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let tid = a_table(&mut client, "kindclash");
 
@@ -482,7 +482,7 @@ fn a_column_row_whose_owner_kind_contradicts_its_owner_is_refused() {
 /// a running view's circuit that the next `load_circuit` picks up.
 #[test]
 fn a_circuit_row_naming_a_view_the_bundle_does_not_create_is_refused() {
-    let Some(srv) = ServerHandle::start() else { return };
+    let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let tid = a_table(&mut client, "phantomview");
 
@@ -517,7 +517,7 @@ fn a_circuit_row_naming_a_view_the_bundle_does_not_create_is_refused() {
 /// and dropping the reachable one deletes the orphan's directory.
 #[test]
 fn two_schema_rows_sharing_a_name_in_one_bundle_are_refused() {
-    let Some(srv) = ServerHandle::start() else { return };
+    let srv = ServerHandle::start();
     let mut s = session(&srv);
     let (a, b) = (s.alloc_schema_id().unwrap(), s.alloc_schema_id().unwrap());
     let sc = sys_schema(SCHEMA_TAB);
@@ -542,7 +542,7 @@ fn two_schema_rows_sharing_a_name_in_one_bundle_are_refused() {
 /// that fires. None of these is expressible by any legitimate emitter.
 #[test]
 fn the_per_pk_shape_rules_reject_what_no_emitter_writes() {
-    let Some(srv) = ServerHandle::start() else { return };
+    let srv = ServerHandle::start();
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let tid = a_table(&mut client, "shapes");
     let mut s = session(&srv);
@@ -622,4 +622,43 @@ fn the_per_pk_shape_rules_reject_what_no_emitter_writes() {
             .unwrap_err()
     );
     assert!(err.contains("id ceiling"), "{err}");
+}
+
+/// `create_view_chain` with a `replaces` refuses to rebuild a capacity-bounded
+/// or delta-fed view: the replacement carries no `WITH` clause, so the rebuild
+/// would silently drop it.
+#[test]
+fn a_bounded_or_fed_view_cannot_be_retargeted() {
+    let srv = ServerHandle::start();
+    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
+    let tid = a_table(&mut client, "retarget");
+    let view = |capacity_bytes, delta_bytes| {
+        let mut cb = CircuitBuilder::new(tid);
+        let scan = cb.input_delta();
+        cb.sink(scan);
+        PlannedView {
+            seg: 0,
+            circuit: cb.build(),
+            output_columns: vec![
+                ColumnDef::new("id", TypeCode::U64, false),
+                ColumnDef::new("v", TypeCode::I64, false),
+            ],
+            pk_cols: vec![0],
+            capacity_bytes,
+            delta_bytes,
+        }
+    };
+    client
+        .create_view_chain("retarget", "b", vec![view(Some(1 << 20), None)], None)
+        .unwrap();
+    client
+        .create_view_chain("retarget", "f", vec![view(None, Some(1 << 20))], None)
+        .unwrap();
+    for (name, needle) in [("b", "capacity-bounded"), ("f", "delta feed")] {
+        let err = client
+            .create_view_chain("retarget", name, vec![view(None, None)], Some(name))
+            .expect_err("retargeting must be refused")
+            .to_string();
+        assert!(err.contains(needle), "got: {err}");
+    }
 }

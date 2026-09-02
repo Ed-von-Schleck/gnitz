@@ -22,7 +22,7 @@ mod test_support;
 mod types;
 mod validate;
 
-pub use dml::{plan_read, ReadKind, ReadPlan};
+pub use dml::{explain_lines, plan_read, ReadKind, ReadPlan};
 pub use error::GnitzSqlError;
 pub use hir::{plan_view, PlannedChain};
 // The planning entry points take a `sqlparser::ast::Statement`, so a caller must

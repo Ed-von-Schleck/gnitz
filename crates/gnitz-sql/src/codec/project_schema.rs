@@ -214,3 +214,7 @@ pub(crate) fn read_reply_shape(
         compile_projection_map(&items[k..], source_schema)?.to_blob_bytes(),
     ))
 }
+
+#[cfg(test)]
+#[path = "tests/project_schema.rs"]
+mod tests;

@@ -163,7 +163,6 @@ fn emit_equi(
     let pr = keep_r.len();
     let pruned_left = kept_coldefs(left_schema, &keep_l);
     let pruned_right = kept_coldefs(right_schema, &keep_r);
-    crate::validate::reject_column_overflow("JOIN view output", k + pl + pr)?;
 
     let mut cb = CircuitBuilder::new(0);
     let input_a_raw = cb.input_delta_tagged(left_in.tid);

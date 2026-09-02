@@ -258,10 +258,10 @@ impl CatalogEngine {
     /// The rows of a relation delta in the order the register hook must process
     /// them: retractions first, then the live rows in dependency order.
     /// Registering a view reads its sources' stamped `Placement` and `depth`, and
-    /// neither order the hook is handed is dependency order — boot replay walks
-    /// VIEW_TAB in PK order, in which a chain's user-named view sorts *before*
-    /// the hidden segments it scans (its id is minted before the body is bound).
-    /// Without this a view is replicated before a restart and partitioned after.
+    /// nothing about the order the hook is handed — a wire bundle's row order, or
+    /// boot replay's walk of VIEW_TAB in PK order — puts a view after the views
+    /// it scans. Without this a view is replicated before a restart and
+    /// partitioned after.
     /// A table's registration reads no other relation, so TABLE_TAB keeps row
     /// order.
     fn relation_row_order(&mut self, family: SysFamily, batch: &Batch) -> Vec<usize> {

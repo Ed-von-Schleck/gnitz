@@ -1,6 +1,45 @@
 use super::*;
-use crate::test_support::{batch_2col, col_def, two_col};
+use crate::test_support::{batch_2col, col_def, parse_stmt, two_col};
 use gnitz_core::TypeCode;
+use sqlparser::ast::Statement;
+
+/// The SET list of an UPDATE, as parsed.
+fn assignments(sql: &str) -> Vec<Assignment> {
+    match parse_stmt(sql) {
+        Statement::Update(u) => u.assignments,
+        other => panic!("not an UPDATE: {other}"),
+    }
+}
+
+/// One `seen` list serves every assignment of a statement, so the second
+/// assignment to a column is caught by name whichever clause it sits in.
+#[test]
+fn a_column_assigned_twice_is_rejected() {
+    let schema = two_col(TypeCode::I64);
+    let mut seen = Vec::new();
+    let [first, second] = assignments("UPDATE t SET val = 1, val = 2").try_into().unwrap();
+    assert_eq!(resolve_set_target(&first, &schema, &mut seen, "UPDATE SET").unwrap(), 1);
+    match resolve_set_target(&second, &schema, &mut seen, "UPDATE SET") {
+        Err(GnitzSqlError::Bind(m)) => assert!(m.contains("multiple assignments to column 'val'"), "{m}"),
+        other => panic!("expected Bind, got {other:?}"),
+    }
+}
+
+/// A constant is range-checked against the column's width before any row is
+/// read; one that fits classifies as a constant.
+#[test]
+fn a_constant_set_value_is_range_checked_at_bind() {
+    let schema = two_col(TypeCode::U8);
+    match classify_set_rhs(&BoundExpr::LitInt(300), 1, &schema) {
+        Err(GnitzSqlError::Bind(m)) => assert!(m.contains("out of range"), "{m}"),
+        Err(other) => panic!("expected Bind, got {other:?}"),
+        Ok(_) => panic!("300 must not fit a U8 column"),
+    }
+    assert!(matches!(
+        classify_set_rhs(&BoundExpr::LitInt(255), 1, &schema),
+        Ok(SetProgram::Const(ColumnValue::Int(255)))
+    ));
+}
 
 /// Compile a SET list the way the RMW closure does — against the schema the
 /// rows carry. A test whose RHS does not compile is a bug in the test.

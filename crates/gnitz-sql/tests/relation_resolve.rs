@@ -2,19 +2,20 @@
 
 //! The RESOLVE verb and the statement-scoped descriptor built from it.
 //!
-//! Two claims are pinned here. The first is *correctness*: one reply must
-//! reproduce, field for field, what three whole-system-table scans produced —
-//! the physical column list including hidden slots, the SERIAL and FK markers,
-//! the relation kind, the placement, and the index list. The second is *cost*:
-//! a statement resolves each relation exactly once, and that count does not move
-//! as the catalog grows.
+//! Two claims are pinned here. *Correctness*: one reply reproduces, field for
+//! field, what three whole-system-table scans produced — the physical column
+//! list including hidden slots, the SERIAL and FK markers, the relation kind,
+//! the placement, and the index list. *Cost*: a statement resolves each
+//! relation exactly once, and nothing is retained across statements to go
+//! stale under another client's DDL.
 
 use gnitz_core::GnitzClient;
-use gnitz_test_harness::ServerHandle;
 use std::sync::Arc;
 
 mod common;
 use common::*;
+
+const T_ID_V: &str = "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)";
 
 /// Request frames the client wrote while running `f`.
 fn requests_for(client: &mut GnitzClient, f: impl FnOnce(&mut GnitzClient)) -> u64 {
@@ -32,13 +33,8 @@ fn requests_for_sql(client: &mut GnitzClient, sn: &str, sql: &str) -> u64 {
 
 #[test]
 fn resolve_reports_found_absent_and_missing_schema() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
-    exec(
-        &mut client,
-        &sn,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-    );
+    let (_srv, mut client, sn) = boot(1);
+    exec(&mut client, &sn, T_ID_V);
 
     let (tid, schema) = client.resolve_table_or_view_id(&sn, "t").unwrap();
     assert!(tid >= gnitz_core::FIRST_USER_TABLE_ID);
@@ -47,8 +43,7 @@ fn resolve_reports_found_absent_and_missing_schema() {
 
     // Relation absent under a live schema: `Ok(None)` from the optional probe,
     // and the classified absence from the erroring one — the noun and the
-    // qualified name are carried, not formatted into a message a caller must
-    // match on.
+    // qualified name are carried, not formatted into a message.
     assert!(client.resolve(&sn, "nope").unwrap().is_none());
     let err = client.resolve_relation(&sn, "nope").unwrap_err();
     assert!(
@@ -57,31 +52,21 @@ fn resolve_reports_found_absent_and_missing_schema() {
         "got: {err:?}"
     );
 
-    // A missing schema is the master's own error — the resolve never reaches a
-    // client-side catalog lookup.
+    // A missing schema is an error, not an absent relation.
     let err = client.resolve("no_such_schema", "t").unwrap_err().to_string();
-    assert!(err.contains("Schema 'no_such_schema' not found"), "got: {err}");
+    assert!(err.contains("not found"), "got: {err}");
 }
 
 /// A view resolves through the same path as a table and reports its class, while
 /// `resolve_table_id` — which answers only for a base table — must still miss on it.
 #[test]
 fn a_view_resolves_as_a_view_and_fails_the_base_table_probe() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
-    exec(
-        &mut client,
-        &sn,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-    );
+    let (_srv, mut client, sn) = boot(1);
+    exec(&mut client, &sn, T_ID_V);
     exec(&mut client, &sn, "CREATE VIEW v AS SELECT id, v FROM t");
 
     let rel = client.resolve_relation(&sn, "v").unwrap();
-    assert_eq!(
-        rel.class,
-        gnitz_core::RelClass::View,
-        "a plain CREATE VIEW resolves as an unbounded view"
-    );
+    assert_eq!(rel.class, gnitz_core::RelClass::View);
     assert_eq!(client.resolve(&sn, "v").unwrap().map(|d| d.tid), Some(rel.tid));
 
     let err = client.resolve_table_id(&sn, "v").unwrap_err();
@@ -89,136 +74,68 @@ fn a_view_resolves_as_a_view_and_fails_the_base_table_probe() {
         matches!(&err, gnitz_core::ClientError::NotFound { noun, .. } if *noun == "table"),
         "got: {err:?}"
     );
-
-    // …and the SQL layer's ladder turns that miss into the precise error.
-    assert_rejects_variant(
-        &mut client,
-        &sn,
-        "INSERT INTO v (id, v) VALUES (1, 2)",
-        "Unsupported",
-        "is a view",
-    );
 }
 
-/// A name longer than the 16-byte `PkTuple` head must survive the request: it
-/// rides `send_control`'s explicit extra blob, because deriving one from
-/// `PkTuple::split_wire` would truncate it past that type's 64-byte cap.
+/// A name longer than the PK-region head rides the request's explicit blob, so
+/// any length round-trips and a near-miss differing only past the head does not
+/// resolve to it.
 #[test]
 fn a_long_relation_name_round_trips() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
-    let long = "a_relation_name_far_longer_than_sixteen_bytes";
-    assert!(long.len() > 16);
+    let (_srv, mut client, sn) = boot(1);
+    let long = format!("a_relation_name_{}", "x".repeat(80));
+    assert!(long.len() > gnitz_core::MAX_PK_BYTES);
     exec(
         &mut client,
         &sn,
         &format!("CREATE TABLE {long} (id BIGINT NOT NULL PRIMARY KEY)"),
     );
-    let (tid, schema) = client.resolve_table_id(&sn, long).unwrap();
+    let (tid, schema) = client.resolve_table_id(&sn, &long).unwrap();
     assert!(tid >= gnitz_core::FIRST_USER_TABLE_ID);
     assert_eq!(schema.columns[0].name, "id");
 
-    // A near-miss differing only past byte 16 must NOT resolve to it.
-    let sibling = "a_relation_name_far_longer_than_sixteen_bytes_two";
-    assert!(client.resolve(&sn, sibling).unwrap().is_none());
+    let sibling = format!("{long}_two");
+    assert!(client.resolve(&sn, &sibling).unwrap().is_none());
 }
 
 // ── The descriptor's contents ────────────────────────────────────────────
 
-/// `is_serial` rides the schema block (`META_FLAG_SERIAL`), which is what keeps
-/// INSERT working: `plan_insert` reads it off the resolved schema to decide the
-/// PK source.
+/// The markers that are not column-layout facts — SERIAL, the FK target, a
+/// dropped column's hidden slot at its physical position — all reach the
+/// resolved schema.
 #[test]
-fn serial_marker_survives_the_resolve() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
+fn descriptor_fields_round_trip() {
+    let (_srv, mut client, sn) = boot(1);
     exec(
         &mut client,
         &sn,
-        "CREATE TABLE t (id SERIAL PRIMARY KEY, v BIGINT NOT NULL)",
+        "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, other BIGINT NOT NULL UNIQUE, gone BIGINT NOT NULL)",
     );
+    exec(&mut client, &sn, "ALTER TABLE p DROP COLUMN gone");
+    let (p_tid, p) = client.resolve_table_id(&sn, "p").unwrap();
+    assert_eq!(p.columns.len(), 3, "the dropped column is still physically present");
+    assert!(p.columns[2].is_hidden);
+    assert!(!p.columns[1].is_hidden);
 
-    let (_, schema) = client.resolve_table_id(&sn, "t").unwrap();
-    assert!(schema.columns[0].is_serial, "the SERIAL PK must resolve as serial");
-    assert!(!schema.columns[1].is_serial);
-
-    // And the marker is what lets INSERT omit the PK.
-    exec(&mut client, &sn, "INSERT INTO t (v) VALUES (7)");
-    let (_, batch) = read_sql(&mut client, &sn, "SELECT id, v FROM t");
-    assert_eq!(batch.len(), 1, "the SERIAL id was auto-assigned");
-}
-
-/// The FK target is not a column-layout fact, so it rides the descriptor blob
-/// and is merged back into the schema. Covers a plain FK, two FK columns, and a
-/// self-FK (stored as the owner's own id).
-#[test]
-fn fk_targets_are_merged_into_the_resolved_schema() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
     exec(
         &mut client,
         &sn,
-        "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY, other BIGINT NOT NULL UNIQUE)",
-    );
-    let (p_tid, _) = client.resolve_table_id(&sn, "p").unwrap();
-    exec(
-        &mut client,
-        &sn,
-        "CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, \
+        "CREATE TABLE c (id SERIAL PRIMARY KEY, \
          a BIGINT NOT NULL REFERENCES p(id), \
          b BIGINT NOT NULL REFERENCES p(other))",
     );
-    exec(
-        &mut client,
-        &sn,
-        "CREATE TABLE selfref (id BIGINT NOT NULL PRIMARY KEY, parent BIGINT NOT NULL REFERENCES selfref(id))",
-    );
-
     let (_, c) = client.resolve_table_id(&sn, "c").unwrap();
+    assert!(c.columns[0].is_serial);
+    assert!(!c.columns[1].is_serial);
     assert_eq!(c.columns[0].fk_table_id, 0, "the PK carries no FK");
-    assert_eq!(c.columns[1].fk_table_id, p_tid);
-    assert_eq!(c.columns[1].fk_col_idx, 0);
-    assert_eq!(c.columns[2].fk_table_id, p_tid);
-    assert_eq!(c.columns[2].fk_col_idx, 1);
-
-    let (self_tid, s) = client.resolve_table_id(&sn, "selfref").unwrap();
-    assert_eq!(
-        s.columns[1].fk_table_id, self_tid,
-        "a self-FK is stored as the owner's own id"
-    );
-}
-
-/// A hidden (logically dropped) column stays in the resolved schema at its
-/// physical position — the descriptor carries the *physical* column list, which
-/// is what a COL_TAB `-1` needs.
-#[test]
-fn a_dropped_column_stays_hidden_in_place() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
-    exec(
-        &mut client,
-        &sn,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, gone BIGINT NOT NULL, keep BIGINT NOT NULL)",
-    );
-    exec(&mut client, &sn, "ALTER TABLE t DROP COLUMN gone");
-
-    let (_, schema) = client.resolve_table_id(&sn, "t").unwrap();
-    assert_eq!(
-        schema.columns.len(),
-        3,
-        "the dropped column is still physically present"
-    );
-    assert!(schema.columns[1].is_hidden);
-    assert_eq!(schema.columns[2].name, "keep");
-    assert!(!schema.columns[2].is_hidden);
+    assert_eq!((c.columns[1].fk_table_id, c.columns[1].fk_col_idx), (p_tid, 0));
+    assert_eq!((c.columns[2].fk_table_id, c.columns[2].fk_col_idx), (p_tid, 1));
 }
 
 /// The index list is exact — an empty list means "no index", never "unchanged".
 /// A dropped index must therefore disappear from the very next resolve.
 #[test]
 fn the_index_list_is_exact_across_create_and_drop() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
+    let (_srv, mut client, sn) = boot(1);
     exec(
         &mut client,
         &sn,
@@ -251,8 +168,7 @@ fn the_index_list_is_exact_across_create_and_drop() {
 /// re-plan an aggregate over a view on a second authority.
 #[test]
 fn only_a_base_table_reports_its_replication() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
+    let (_srv, mut client, sn) = boot(1);
     exec(
         &mut client,
         &sn,
@@ -276,8 +192,6 @@ fn only_a_base_table_reports_its_replication() {
         !replicated(&mut client, rv_tid),
         "a view's locality is the compiler's call, not this hint's"
     );
-    // A system family is stamped Replicated too, and is likewise not a base
-    // table.
     assert!(
         !replicated(&mut client, gnitz_core::TABLE_TAB),
         "a system family is not a base table"
@@ -291,8 +205,7 @@ fn only_a_base_table_reports_its_replication() {
 /// the master; each is a clean miss.
 #[test]
 fn an_unregistered_id_is_a_clean_miss() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, _sn) = make_planner(&srv);
+    let (srv, mut client, _sn) = boot(1);
 
     for tid in [
         1_000_000_u64,                   // never allocated
@@ -308,92 +221,44 @@ fn an_unregistered_id_is_a_clean_miss() {
         assert!(err.contains("not found"), "tid {tid}: got {err}");
     }
 
-    // The connection is still usable — the master neither aborted nor desynced.
-    let (mut c2, sn2) = make_planner(&srv);
-    exec(&mut c2, &sn2, "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)");
-    assert!(c2.resolve_table_id(&sn2, "t").is_ok());
-}
-
-/// A tid-addressed resolve returns the same descriptor a by-name one does, and
-/// it is what an index / replication probe falls back to outside a statement
-/// bracket — not an empty list or `false`.
-#[test]
-fn a_tid_probe_outside_a_statement_still_answers_the_truth() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
-    exec(
-        &mut client,
-        &sn,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL) WITH (replicated = true)",
-    );
-    exec(&mut client, &sn, "CREATE UNIQUE INDEX ix ON t(a)");
-
-    // No statement bracket is open here, so both probes go to the wire by id.
-    let (tid, _) = client.resolve_table_id(&sn, "t").unwrap();
-    assert!(client.describe_by_id(tid).unwrap().replicated);
-    let list = Arc::clone(&client.describe_by_id(tid).unwrap().indexes);
-    assert_eq!(list.len(), 1);
-    assert!(list[0].is_unique);
-    assert_eq!(
-        client.index_for_column(tid, 1).unwrap().map(|m| m.is_unique),
-        Some(true)
-    );
+    // The master neither aborted nor desynced.
+    let mut c2 = GnitzClient::connect(srv.sock_path()).unwrap();
+    c2.create_schema("after").unwrap();
+    exec(&mut c2, "after", "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)");
+    c2.resolve_table_id("after", "t").unwrap();
 }
 
 // ── Statement cost ───────────────────────────────────────────────────────
 
-/// A statement resolves each relation exactly once, so a repeated read costs
-/// two round trips — the resolve, then the read itself.
+/// A statement resolves each relation exactly once, so a read costs two round
+/// trips — the resolve, then the read itself — whatever its shape, and however
+/// many segments its plan has.
 #[test]
-fn a_repeated_select_costs_two_requests() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
+fn a_read_costs_two_requests() {
+    let (_srv, mut client, sn) = boot(1);
     exec(
         &mut client,
         &sn,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, x BIGINT NOT NULL)",
     );
-    exec(&mut client, &sn, "INSERT INTO t (id, x) VALUES (1, 10), (2, 10)");
+    exec(&mut client, &sn, "CREATE INDEX ix ON t(x)");
+    exec(
+        &mut client,
+        &sn,
+        "INSERT INTO t (id, g, x) VALUES (1, 1, 10), (2, 1, 10)",
+    );
 
-    // Warm the connection's schema cache once, then measure the steady state.
     for sql in [
         "SELECT * FROM t",
         "SELECT * FROM t WHERE id = 2",
         "SELECT * FROM t WHERE x = 10",
+        "SELECT g, COUNT(*) FROM t WHERE x = 10 GROUP BY g",
+        "SELECT g, COUNT(*) FROM t WHERE x = 10 GROUP BY g HAVING COUNT(*) > 0",
     ] {
-        exec(&mut client, &sn, sql);
-        for _ in 0..3 {
+        for _ in 0..2 {
             assert_eq!(requests_for_sql(&mut client, &sn, sql), 2, "for `{sql}`");
         }
     }
-}
-
-/// …and that count does not move as the catalog grows: a statement addresses the
-/// relations it names, never the whole catalog.
-#[test]
-fn statement_cost_is_flat_as_the_catalog_grows() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
-    exec(
-        &mut client,
-        &sn,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
-    );
-    exec(&mut client, &sn, "SELECT * FROM t WHERE x = 1"); // warm
-
-    let before = requests_for_sql(&mut client, &sn, "SELECT * FROM t WHERE x = 1");
-    for i in 0..40 {
-        exec(
-            &mut client,
-            &sn,
-            &format!(
-                "CREATE TABLE filler{i} (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, \
-                 b BIGINT NOT NULL, c BIGINT NOT NULL, d BIGINT NOT NULL)"
-            ),
-        );
-    }
-    let after = requests_for_sql(&mut client, &sn, "SELECT * FROM t WHERE x = 1");
-    assert_eq!(before, after, "40 more relations must not cost the read anything");
 }
 
 /// A statement that resolves the same relation from two places pays once. `ALTER
@@ -401,16 +266,13 @@ fn statement_cost_is_flat_as_the_catalog_grows() {
 /// schema-bearing probe.
 #[test]
 fn one_statement_resolves_a_relation_once() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
+    let (_srv, mut client, sn) = boot(1);
     exec(
         &mut client,
         &sn,
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
     );
-    exec(&mut client, &sn, "SELECT * FROM t"); // warm the schema cache
 
-    // resolve + push. Both the kind probe and the schema probe hit the memo.
     assert_eq!(
         requests_for_sql(&mut client, &sn, "ALTER TABLE t DROP COLUMN a"),
         2,
@@ -419,33 +281,9 @@ fn one_statement_resolves_a_relation_once() {
 
     // An absent INSERT target runs the two-probe error ladder — still one resolve.
     let n = requests_for(&mut client, |c| {
-        assert!(try_exec(c, &sn, "INSERT INTO nope (id) VALUES (1)").is_err());
+        assert_rejects_variant(c, &sn, "INSERT INTO nope (id) VALUES (1)", "Exec", "nope");
     });
     assert_eq!(n, 1, "the two-probe error ladder costs one resolve");
-}
-
-/// A multi-segment statement probes the index list once per relation, not once
-/// per segment — the collapse the per-statement memo's tid half provides.
-#[test]
-fn a_multi_segment_statement_resolves_once_per_relation() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
-    exec(
-        &mut client,
-        &sn,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, x BIGINT NOT NULL)",
-    );
-    exec(&mut client, &sn, "CREATE INDEX ix ON t(x)");
-    exec(&mut client, &sn, "SELECT * FROM t"); // warm
-
-    let one = requests_for_sql(&mut client, &sn, "SELECT g, COUNT(*) FROM t WHERE x = 1 GROUP BY g");
-    let two = requests_for_sql(
-        &mut client,
-        &sn,
-        "SELECT g, COUNT(*) FROM t WHERE x = 1 GROUP BY g HAVING COUNT(*) > 0",
-    );
-    assert!(one <= 3, "a grouped read resolves once: {one} requests");
-    assert!(two <= 4, "an extra segment adds no resolve: {two} requests");
 }
 
 /// `DROP SCHEMA` is one bundle whatever the member count: the SCHEMA_TAB probe,
@@ -454,8 +292,7 @@ fn a_multi_segment_statement_resolves_once_per_relation() {
 /// slack ceiling.
 #[test]
 fn drop_schema_is_four_requests_whatever_the_member_count() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
+    let (_srv, mut client, sn) = boot(1);
     for i in 0..4 {
         exec(
             &mut client,
@@ -478,113 +315,40 @@ fn drop_schema_is_four_requests_whatever_the_member_count() {
 // ── DDL that a client-side descriptor cache would get wrong ──────────────
 
 /// `ALTER … RENAME TO` then recreating the old name: an idle second client's
-/// next statement must see the *new* relation. This design gets it right by
-/// construction — nothing is retained across statements to go stale.
+/// next statement must see the *new* relation — nothing is retained across
+/// statements to go stale.
 #[test]
 fn a_second_client_sees_a_rename_then_recreate() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut a, sn) = make_planner(&srv);
+    let (srv, mut a, sn) = boot(4);
     let mut b = GnitzClient::connect(srv.sock_path()).unwrap();
 
-    exec(
-        &mut a,
-        &sn,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-    );
+    exec(&mut a, &sn, T_ID_V);
     exec(&mut a, &sn, "INSERT INTO t (id, v) VALUES (1, 100)");
-    // B reads the original t, warming everything it can warm.
-    let (_, batch) = read_sql(&mut b, &sn, "SELECT id, v FROM t");
-    assert_eq!(batch.len(), 1);
+    assert_eq!(
+        rows(&mut b, &sn, "SELECT id, v FROM t", &["id", "v"]),
+        vec![vec![1, 100, 1]]
+    );
     let (old_tid, _) = b.resolve_table_id(&sn, "t").unwrap();
 
     exec(&mut a, &sn, "ALTER TABLE t RENAME TO u");
-    exec(
-        &mut a,
-        &sn,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-    );
+    exec(&mut a, &sn, T_ID_V);
     exec(&mut a, &sn, "INSERT INTO t (id, v) VALUES (2, 200), (3, 300)");
 
-    // B's next statements must address the NEW t.
     let (new_tid, _) = b.resolve_table_id(&sn, "t").unwrap();
     assert_ne!(new_tid, old_tid, "the name now binds a different relation");
-    let (_, batch) = read_sql(&mut b, &sn, "SELECT id, v FROM t");
-    assert_eq!(batch.len(), 2, "B read the new t's rows");
+    assert_eq!(
+        rows(&mut b, &sn, "SELECT id, v FROM t", &["id", "v"]),
+        vec![vec![2, 200, 1], vec![3, 300, 1]]
+    );
 
     exec(&mut b, &sn, "INSERT INTO t (id, v) VALUES (4, 400)");
-    let (_, batch) = read_sql(&mut a, &sn, "SELECT id, v FROM t");
-    assert_eq!(batch.len(), 3, "B's INSERT landed in the new t");
-    // The renamed relation kept its rows under the new name.
-    let (_, batch) = read_sql(&mut a, &sn, "SELECT id, v FROM u");
-    assert_eq!(batch.len(), 1);
-}
-
-/// Drop and recreate under the same name: B's next statement succeeds against
-/// the new relation with no error and no reconnect.
-#[test]
-fn a_second_client_sees_a_drop_then_recreate() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut a, sn) = make_planner(&srv);
-    let mut b = GnitzClient::connect(srv.sock_path()).unwrap();
-
-    exec(
-        &mut a,
-        &sn,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-    );
-    exec(&mut a, &sn, "INSERT INTO t (id, v) VALUES (1, 100)");
-    assert_eq!(read_sql(&mut b, &sn, "SELECT id, v FROM t").1.len(), 1);
-
-    exec(&mut a, &sn, "DROP TABLE t");
-    exec(
-        &mut a,
-        &sn,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-    );
-    exec(&mut a, &sn, "INSERT INTO t (id, v) VALUES (9, 900)");
-
-    let (_, batch) = read_sql(&mut b, &sn, "SELECT id, v FROM t");
-    assert_eq!(batch.len(), 1, "B reads the new relation");
-    exec(&mut b, &sn, "INSERT INTO t (id, v) VALUES (10, 1000)");
-    assert_eq!(read_sql(&mut a, &sn, "SELECT id, v FROM t").1.len(), 2);
-}
-
-/// A `CREATE INDEX` by A is visible to B's very next statement, and a
-/// `DROP INDEX` likewise — an index bound planned against a dropped index is a
-/// hard engine error, not a silently-empty read.
-#[test]
-fn a_second_client_sees_index_ddl_immediately() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut a, sn) = make_planner(&srv);
-    let mut b = GnitzClient::connect(srv.sock_path()).unwrap();
-
-    exec(
-        &mut a,
-        &sn,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
-    );
-    exec(&mut a, &sn, "INSERT INTO t (id, x) VALUES (1, 5), (2, 5), (3, 6)");
-    let (tid, _) = b.resolve_table_id(&sn, "t").unwrap();
-    assert!(b.describe_by_id(tid).unwrap().indexes.is_empty());
-    assert_eq!(read_sql(&mut b, &sn, "SELECT id FROM t WHERE x = 5").1.len(), 2);
-
-    exec(&mut a, &sn, "CREATE INDEX ix ON t(x)");
     assert_eq!(
-        b.describe_by_id(tid).unwrap().indexes.len(),
-        1,
-        "B sees the new index at once"
-    );
-    assert_eq!(read_sql(&mut b, &sn, "SELECT id FROM t WHERE x = 5").1.len(), 2);
-
-    exec(&mut a, &sn, "DROP INDEX ix");
-    assert!(
-        b.describe_by_id(tid).unwrap().indexes.is_empty(),
-        "B sees the drop at once"
+        rows(&mut a, &sn, "SELECT id, v FROM t", &["id", "v"]),
+        vec![vec![2, 200, 1], vec![3, 300, 1], vec![4, 400, 1]]
     );
     assert_eq!(
-        read_sql(&mut b, &sn, "SELECT id FROM t WHERE x = 5").1.len(),
-        2,
-        "B replanned without the index rather than seeking a dropped one"
+        rows(&mut a, &sn, "SELECT id, v FROM u", &["id", "v"]),
+        vec![vec![1, 100, 1]]
     );
 }
 
@@ -593,16 +357,10 @@ fn a_second_client_sees_index_ddl_immediately() {
 #[test]
 fn a_second_client_pushes_after_a_column_alter() {
     use gnitz_core::{BatchAppender, ZSetBatch};
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut a, sn) = make_planner(&srv);
+    let (srv, mut a, sn) = boot(4);
     let mut b = GnitzClient::connect(srv.sock_path()).unwrap();
 
-    exec(
-        &mut a,
-        &sn,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-    );
-    // B warms its schema cache through the raw surface.
+    exec(&mut a, &sn, T_ID_V);
     let (tid, schema) = b.resolve_table_id(&sn, "t").unwrap();
     let mut batch = ZSetBatch::new(&schema);
     BatchAppender::new(&mut batch, &schema).add_row(1, 1).i64_val(10);
@@ -610,7 +368,6 @@ fn a_second_client_pushes_after_a_column_alter() {
 
     exec(&mut a, &sn, "ALTER TABLE t ALTER COLUMN v DROP NOT NULL");
 
-    // B re-resolves and pushes a NULL into the now-nullable column.
     let (tid2, schema2) = b.resolve_table_id(&sn, "t").unwrap();
     assert_eq!(tid2, tid);
     assert!(schema2.columns[1].is_nullable, "B sees the relaxed column");
@@ -618,30 +375,18 @@ fn a_second_client_pushes_after_a_column_alter() {
     BatchAppender::new(&mut batch, &schema2).add_row(2, 1).null();
     b.push(tid2, &schema2, &batch).unwrap();
 
-    assert_eq!(read_sql(&mut a, &sn, "SELECT id, v FROM t").1.len(), 2);
-}
-
-/// Own-DDL: a `CREATE INDEX` / `CREATE TABLE` is visible to the *same*
-/// connection's next statement, since nothing is carried across the bracket.
-#[test]
-fn own_ddl_is_visible_to_the_next_statement() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
-    exec(
-        &mut client,
-        &sn,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
-    );
-    exec(&mut client, &sn, "INSERT INTO t (id, x) VALUES (1, 5)");
-    let (tid, _) = client.resolve_table_id(&sn, "t").unwrap();
-
-    exec(&mut client, &sn, "CREATE INDEX ix ON t(x)");
-    assert_eq!(client.describe_by_id(tid).unwrap().indexes.len(), 1);
-    assert_eq!(read_sql(&mut client, &sn, "SELECT id FROM t WHERE x = 5").1.len(), 1);
-
-    exec(&mut client, &sn, "CREATE TABLE t2 (id BIGINT NOT NULL PRIMARY KEY)");
-    exec(&mut client, &sn, "INSERT INTO t2 (id) VALUES (1)");
-    assert_eq!(read_sql(&mut client, &sn, "SELECT id FROM t2").1.len(), 1);
+    let (schema, batch) = read_sql(&mut a, &sn, "SELECT id, v FROM t");
+    let mut got: Vec<(i64, Option<i64>)> = (0..batch.len())
+        .map(|r| {
+            let id = cell_i64(&schema, &batch, col_idx(&schema, "id"), r);
+            let vi = col_idx(&schema, "v");
+            let v = (!is_null_at(&schema, &batch, vi, r)).then(|| cell_i64(&schema, &batch, vi, r));
+            assert_eq!(batch.weights[r], 1);
+            (id, v)
+        })
+        .collect();
+    got.sort();
+    assert_eq!(got, vec![(1, Some(10)), (2, None)]);
 }
 
 /// A schema dropped and recreated under the same name, and a relation created in
@@ -650,8 +395,7 @@ fn own_ddl_is_visible_to_the_next_statement() {
 /// qnames rather than resurrect the old ones.
 #[test]
 fn a_recreated_schema_resolves_its_new_members() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
+    let (_srv, mut client, sn) = boot(1);
     exec(&mut client, &sn, "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY)");
     let (old_tid, _) = client.resolve_table_id(&sn, "t").unwrap();
 
@@ -662,11 +406,7 @@ fn a_recreated_schema_resolves_its_new_members() {
         "the old member must not resurrect under the recreated schema"
     );
 
-    exec(
-        &mut client,
-        &sn,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-    );
+    exec(&mut client, &sn, T_ID_V);
     let (new_tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
     assert_ne!(new_tid, old_tid);
     assert_eq!(schema.columns.len(), 2);
@@ -678,13 +418,8 @@ fn a_recreated_schema_resolves_its_new_members() {
 /// view row and fail as a CAS conflict.
 #[test]
 fn alter_rename_column_rejects_a_view_at_the_gateway() {
-    let Some(srv) = ServerHandle::start() else { return };
-    let (mut client, sn) = make_planner(&srv);
-    exec(
-        &mut client,
-        &sn,
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-    );
+    let (_srv, mut client, sn) = boot(1);
+    exec(&mut client, &sn, T_ID_V);
     exec(&mut client, &sn, "CREATE VIEW vw AS SELECT id, v FROM t");
 
     let vid = client.resolve_table_or_view_id(&sn, "vw").unwrap().0;

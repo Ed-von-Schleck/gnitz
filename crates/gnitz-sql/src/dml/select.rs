@@ -72,9 +72,6 @@ pub(super) struct Target {
     pub(super) name: String,
     pub(super) tid: u64,
     pub(super) schema: Arc<Schema>,
-    /// `None` is a chain-minted segment id, which never reaches here: a derived
-    /// table in FROM is rejected as a derivation before any resolution.
-    ///
     /// `None` only for a chain-minted id, which an ad-hoc read never names: a
     /// derived table or non-pass-through CTE is rejected as a derivation first.
     pub(super) desc: Option<Arc<RelDescriptor>>,

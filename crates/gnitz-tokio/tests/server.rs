@@ -84,9 +84,7 @@ fn cpu_time() -> Duration {
 /// returns `Ready` where it should park spins here.
 #[test]
 fn an_idle_connection_consumes_no_cpu() {
-    let Some(srv) = ServerHandle::start_with_env(1, &[]) else {
-        return;
-    };
+    let srv = ServerHandle::start_with_env(1, &[]);
     let (_blocking, tid, schema, _sn) = table(srv.sock_path());
     let rt = Runtime::new().unwrap();
     let (client, conn) = rt.block_on(gnitz_tokio::connect(srv.sock_path())).expect("connect");
@@ -112,9 +110,7 @@ fn an_idle_connection_consumes_no_cpu() {
 /// driver serves one connection for all of them.
 #[test]
 fn cloned_handles_across_tasks_each_get_their_own_result() {
-    let Some(srv) = ServerHandle::start_with_env(4, &[]) else {
-        return;
-    };
+    let srv = ServerHandle::start_with_env(4, &[]);
     let (mut blocking, tid, schema, sn) = table(srv.sock_path());
     let rt = Runtime::new().unwrap();
     let (client, conn) = rt.block_on(gnitz_tokio::connect(srv.sock_path())).expect("connect");
@@ -204,9 +200,7 @@ fn syscall_count_child() {
 /// driver drains the whole channel before it steps.
 #[test]
 fn one_writev_per_burst() {
-    let Some(srv) = ServerHandle::start_with_env(1, &[]) else {
-        return;
-    };
+    let srv = ServerHandle::start_with_env(1, &[]);
     let (_c, tid, _s, _sn) = table(srv.sock_path());
     // Every push here is cold — the child connects fresh and never resolves — so
     // 4 iovecs each, under the 256-frame cold-push writev quantum. A larger `n`,
@@ -279,9 +273,7 @@ fn weights(batch: &Option<ZSetBatch>) -> std::collections::BTreeMap<u64, i64> {
 /// off the copy, and what two clones doing the same thing at once leave behind.
 #[test]
 fn an_async_handle_mirrors_through_a_blocking_client() {
-    let Some(srv) = ServerHandle::start_with_env(4, &[]) else {
-        return;
-    };
+    let srv = ServerHandle::start_with_env(4, &[]);
     let (mut blocking, tid, schema, sn) = table(srv.sock_path());
     let vid = fed_view(&mut blocking, &sn, tid);
     blocking.push(tid, &schema, &rows(0, 50)).unwrap();

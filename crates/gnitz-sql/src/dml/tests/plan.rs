@@ -48,6 +48,10 @@ fn the_ladder_maps_each_where_shape_to_its_bound() {
         // arithmetic WHERE has no `col OP literal` conjunct at all.
         (Some("v = 7"), "IndexRange", 1, 0),
         (Some("id + v = 7"), "None", 1, 0),
+        // A non-integral literal pins no key, and a top-level OR pins nothing
+        // at all: both stay a predicate over the whole table.
+        (Some("id = 3.5"), "None", 1, 0),
+        (Some("v = 5 OR id = 1"), "None", 1, 0),
     ] {
         let bound_where = sql.map(|s| bind_where(s, &schema));
         let plan = plan_of(bound_where.as_ref(), &schema, idx, ReadBudget::OneRequest);

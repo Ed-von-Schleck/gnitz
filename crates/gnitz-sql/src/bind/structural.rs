@@ -1,9 +1,8 @@
 use super::resolve::find_unique_column;
-use crate::agg::reject_min_max_unorderable;
 use crate::ast_util::{classify_agg_call, function_positional_args, single_fn_name, single_relation_col_name};
 use crate::codec::pk_codec::{extract_sql_literal, SqlLiteral};
 use crate::error::GnitzSqlError;
-use crate::ir::{AggFunc, BExpr, BinOp, BoundExpr, NumFunc, StrFunc, TrimMode, UnaryOp};
+use crate::ir::{BExpr, BinOp, BoundExpr, NumFunc, StrFunc, TrimMode, UnaryOp};
 use crate::types::{is_cast_target, sql_type_to_typecode};
 use gnitz_core::{ColumnDef, Schema};
 use sqlparser::ast::{
@@ -741,15 +740,10 @@ impl LeafBinder for SingleTable<'_> {
     }
     fn bind_function(&self, func: &Function) -> Result<BoundExpr, GnitzSqlError> {
         // Shape dispatch (COUNT(*) vs COUNT(x), arity) is leaf-independent — one
-        // home in `classify_agg_call`; this leaf only binds the argument and
-        // guards MIN/MAX orderability, once the argument's type is in hand.
+        // home in `classify_agg_call`; this leaf only binds the argument. Its
+        // type is checked where the aggregate is typed (`agg_typing`).
         let (agg_func, arg) = classify_agg_call(func)?;
         let bound = arg.map(|e| bind_structural(e, self)).transpose()?;
-        if matches!(agg_func, AggFunc::Min | AggFunc::Max) {
-            if let Some(b) = &bound {
-                reject_min_max_unorderable(agg_func, b.infer_type(&self.schema.columns))?;
-            }
-        }
         Ok(BoundExpr::AggCall {
             func: agg_func,
             arg: bound.map(Box::new),

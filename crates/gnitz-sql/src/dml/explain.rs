@@ -8,14 +8,19 @@
 use crate::access::pk_point_tuple;
 use crate::dml::plan::Access;
 use crate::dml::select::{ReadCase, ReadPlan, SinkTail, SpecRead, Target};
-use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::FoldShape;
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_wire::{AggFunc, ReadBound};
 
-/// Describe `plan` without running it.
-pub(crate) fn execute_explain(plan: ReadPlan) -> Result<SqlResult, GnitzSqlError> {
+/// Describe `plan` without running it: the EXPLAIN reply.
+pub(crate) fn execute_explain(plan: &ReadPlan) -> SqlResult {
+    plan_rows(&explain_lines(plan))
+}
+
+/// The five lines EXPLAIN renders for `plan`: what is read, the access path,
+/// where the predicate runs, the sink's shape, and the ORDER BY / LIMIT tail.
+pub fn explain_lines(plan: &ReadPlan) -> Vec<String> {
     let target = &plan.target;
     let schema = &*target.schema;
 
@@ -23,13 +28,13 @@ pub(crate) fn execute_explain(plan: ReadPlan) -> Result<SqlResult, GnitzSqlError
     // request kind than any other full scan. It projects nothing and orders by
     // nothing, so the reply is the source's own visible width.
     let ReadCase::Spec(spec) = &plan.case else {
-        return Ok(plan_rows(&[
+        return vec![
             read_line(target),
             "access: full scan (unprojected)".to_string(),
             "predicate: none".to_string(),
             projection_line(schema.visible_columns().count(), 0),
             "order/limit: none".to_string(),
-        ]));
+        ];
     };
 
     // Line 4 is the sink's own shape: what the fold accumulates, or how wide the
@@ -48,7 +53,7 @@ pub(crate) fn execute_explain(plan: ReadPlan) -> Result<SqlResult, GnitzSqlError
     };
 
     let facts = order_limit_facts(spec);
-    Ok(plan_rows(&[
+    vec![
         read_line(target),
         format!("access: {}", access_line(&spec.access, schema)),
         format!(
@@ -65,7 +70,7 @@ pub(crate) fn execute_explain(plan: ReadPlan) -> Result<SqlResult, GnitzSqlError
         } else {
             format!("order/limit: {}", facts.join(", "))
         },
-    ]))
+    ]
 }
 
 /// Where the ORDER BY / LIMIT / OFFSET work happens. Only the rows sink pushes

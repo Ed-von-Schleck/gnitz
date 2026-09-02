@@ -128,23 +128,19 @@ fn concurrent_pushes_and_scans(target: &str) {
 
 #[test]
 fn concurrent_pushes_and_scans_unix() {
-    let Some(srv) = ServerHandle::start_with_env(4, &[]) else {
-        return;
-    };
+    let srv = ServerHandle::start_with_env(4, &[]);
     concurrent_pushes_and_scans(srv.sock_path());
 }
 
 #[test]
 fn concurrent_pushes_and_scans_tls() {
-    let Some(srv) = ServerHandle::start_tls(4) else { return };
+    let srv = ServerHandle::start_tls(4);
     concurrent_pushes_and_scans(&srv.tls_target());
 }
 
 #[test]
 fn cap_raises_and_every_slot_below_it_completes() {
-    let Some(srv) = ServerHandle::start_with_env(4, &[]) else {
-        return;
-    };
+    let srv = ServerHandle::start_with_env(4, &[]);
     let (_blocking, tid, _schema) = table(srv.sock_path());
     let (mut s, _) = Session::connect(srv.sock_path()).unwrap();
     let mut ids = Vec::new();
@@ -165,9 +161,7 @@ fn cap_raises_and_every_slot_below_it_completes() {
 
 #[test]
 fn abandoned_slot_does_not_desync_and_close_abandons_every_slot() {
-    let Some(srv) = ServerHandle::start_with_env(4, &[]) else {
-        return;
-    };
+    let srv = ServerHandle::start_with_env(4, &[]);
     let (_blocking, tid, schema) = table(srv.sock_path());
     let (mut s, _) = Session::connect(srv.sock_path()).unwrap();
     let batch = rows(0, 10);
@@ -282,16 +276,14 @@ fn count_syscalls(target: &str, tid: u64) {
 
 #[test]
 fn three_syscalls_per_push_unix() {
-    let Some(srv) = ServerHandle::start_with_env(1, &[]) else {
-        return;
-    };
+    let srv = ServerHandle::start_with_env(1, &[]);
     let (_c, tid, _s) = table(srv.sock_path());
     count_syscalls(srv.sock_path(), tid);
 }
 
 #[test]
 fn three_syscalls_per_push_tls() {
-    let Some(srv) = ServerHandle::start_tls(1) else { return };
+    let srv = ServerHandle::start_tls(1);
     let (_c, tid, _s) = table(&srv.tls_target());
     count_syscalls(&srv.tls_target(), tid);
 }
@@ -300,9 +292,7 @@ fn three_syscalls_per_push_tls() {
 fn blocking_client_survives_server_restart_with_a_closed_verdict() {
     // A dead peer produces readability; the step that follows reads the EOF
     // and the blocking client reports the connection closed thereafter.
-    let Some(mut srv) = ServerHandle::start_with_env(1, &[]) else {
-        return;
-    };
+    let mut srv = ServerHandle::start_with_env(1, &[]);
     let (mut client, tid, _schema) = table(srv.sock_path());
     srv.restart();
     let t0 = std::time::Instant::now();

@@ -798,6 +798,9 @@ pub fn validate_dist_prefix(pk: &[u32], cols: &[u32]) -> Result<usize, String> {
             cols.len()
         ));
     }
+    if let Some(c) = cols.iter().find(|c| !pk.contains(c)) {
+        return Err(format!("CLUSTER BY column {c} is not a PRIMARY KEY column"));
+    }
     if cols != &pk[..cols.len()] {
         return Err("CLUSTER BY columns must be a leading prefix of the PRIMARY KEY, \
                     in PK order; reorder the PK so the distribution column(s) lead"

@@ -45,11 +45,11 @@ impl ServerHandle {
         self.paths.sock_path.to_str().expect("tmpdir path is not UTF-8")
     }
 
-    pub fn start() -> Option<Self> {
+    pub fn start() -> Self {
         Self::start_n(1)
     }
 
-    pub fn start_n(workers: usize) -> Option<Self> {
+    pub fn start_n(workers: usize) -> Self {
         Self::start_with_env(workers, &[])
     }
 
@@ -58,7 +58,7 @@ impl ServerHandle {
     /// needs a server-side seam — e.g. `GNITZ_CLIENT_SEND_TIMEOUT_MS` — cannot
     /// race a sibling test through the process-global env under parallel
     /// `cargo test`.
-    pub fn start_with_env(workers: usize, extra_env: &[(&str, &str)]) -> Option<Self> {
+    pub fn start_with_env(workers: usize, extra_env: &[(&str, &str)]) -> Self {
         Self::start_inner(workers, extra_env, None, false)
     }
 
@@ -67,18 +67,18 @@ impl ServerHandle {
     /// constructors stay TLS-free so the ~270 AF_UNIX-only tests don't pay
     /// per-boot cert minting + a TCP bind for zero coverage. Resolve the
     /// bound address with [`Self::tls_target`].
-    pub fn start_tls(workers: usize) -> Option<Self> {
+    pub fn start_tls(workers: usize) -> Self {
         Self::start_tls_with_env(workers, &[])
     }
 
     /// [`Self::start_tls`] with extra server-side environment variables.
-    pub fn start_tls_with_env(workers: usize, extra_env: &[(&str, &str)]) -> Option<Self> {
+    pub fn start_tls_with_env(workers: usize, extra_env: &[(&str, &str)]) -> Self {
         Self::start_inner(workers, extra_env, Some("127.0.0.1:0"), false)
     }
 
     /// [`Self::start_tls`] on the IPv6 loopback (`[::1]:0`) — exercises
     /// bracketed-target parsing and the dev cert's `::1` IP SAN.
-    pub fn start_tls_v6(workers: usize) -> Option<Self> {
+    pub fn start_tls_v6(workers: usize) -> Self {
         Self::start_inner(workers, &[], Some("[::1]:0"), false)
     }
 
@@ -86,12 +86,12 @@ impl ServerHandle {
     /// CA-signed leaf are minted, the server boots with
     /// `--tls-client-ca=<ca.pem>`, and [`Self::mtls_target`] presents the
     /// leaf. Ephemeral loopback port.
-    pub fn start_mtls(workers: usize) -> Option<Self> {
+    pub fn start_mtls(workers: usize) -> Self {
         Self::start_mtls_with_env(workers, &[])
     }
 
     /// [`Self::start_mtls`] with extra server-side environment variables.
-    pub fn start_mtls_with_env(workers: usize, extra_env: &[(&str, &str)]) -> Option<Self> {
+    pub fn start_mtls_with_env(workers: usize, extra_env: &[(&str, &str)]) -> Self {
         Self::start_inner(workers, extra_env, Some("127.0.0.1:0"), true)
     }
 
@@ -99,37 +99,33 @@ impl ServerHandle {
     /// the ready handle on success or the early-exit stderr tail on failure.
     /// For tests that assert on a boot *refusal* (the non-loopback bind guard)
     /// or that need custom TLS flags — an explicit listen address,
-    /// `--tls-max-conns=N`, `--allow-unauthenticated`. `None` if the server
-    /// binary is absent.
-    pub fn try_start_tls(workers: usize, tls_args: &[&str]) -> Option<Result<Self, String>> {
-        let scaffold = boot_scaffold()?;
+    /// `--tls-max-conns=N`, `--allow-unauthenticated`.
+    pub fn try_start_tls(workers: usize, tls_args: &[&str]) -> Result<Self, String> {
+        let scaffold = boot_scaffold();
         let owned: Vec<String> = tls_args.iter().map(|s| s.to_string()).collect();
         let has_listen = owned.iter().any(|a| a.starts_with("--tls-listen="));
-        Some(match spawn_and_wait_ready(&scaffold.paths, workers, &[], &owned) {
-            Ok(process) => Ok(Self::assemble(process, scaffold, workers, has_listen, None, None)),
-            // On the failure path `scaffold` (with its tmpdir) drops here, cleaning up.
-            Err(msg) => Err(msg),
-        })
+        // On the failure path `scaffold` (with its tmpdir) drops here, cleaning up.
+        let process = spawn_and_wait_ready(&scaffold.paths, workers, &[], &owned)?;
+        Ok(Self::assemble(process, scaffold, workers, has_listen, None, None))
     }
 
     /// Spawn a server with a raw TLS argv and wait for it to EXIT during boot
     /// — for asserting a boot *abort* (e.g. the non-loopback bind refusal).
     /// Returns `(exited_zero, stderr_tail)`; panics if the server does NOT
-    /// exit within the startup budget (an unexpected successful boot). `None`
-    /// if the server binary is absent.
+    /// exit within the startup budget (an unexpected successful boot).
     ///
     /// This does NOT use the readiness probe: the server binds+listens the
     /// AF_UNIX socket BEFORE `setup_tls_listener` runs, so a probe connect
     /// can succeed in the window before a refusal aborts — waiting on the
     /// process itself is race-free.
-    pub fn boot_expecting_exit(workers: usize, tls_args: &[&str]) -> Option<(bool, String)> {
-        let scaffold = boot_scaffold()?;
+    pub fn boot_expecting_exit(workers: usize, tls_args: &[&str]) -> (bool, String) {
+        let scaffold = boot_scaffold();
         let owned: Vec<String> = tls_args.iter().map(|s| s.to_string()).collect();
         let mut proc = configure_command(&scaffold.paths, workers, &[], &owned)
             .spawn()
             .expect("failed to spawn server");
         match poll_with_backoff(|| proc.try_wait().ok().flatten()) {
-            Some(status) => Some((status.success(), read_stderr_tail(&scaffold.paths.stderr_path))),
+            Some(status) => (status.success(), read_stderr_tail(&scaffold.paths.stderr_path)),
             None => {
                 proc.kill().ok();
                 proc.wait().ok();
@@ -141,8 +137,8 @@ impl ServerHandle {
         }
     }
 
-    fn start_inner(workers: usize, extra_env: &[(&str, &str)], tls_listen: Option<&str>, mtls: bool) -> Option<Self> {
-        let scaffold = boot_scaffold()?;
+    fn start_inner(workers: usize, extra_env: &[(&str, &str)], tls_listen: Option<&str>, mtls: bool) -> Self {
+        let scaffold = boot_scaffold();
 
         // Build the TLS argv. mTLS additionally mints a client CA + a
         // CA-signed leaf into the tmpdir and enables `--tls-client-ca`.
@@ -167,14 +163,7 @@ impl ServerHandle {
             }
         };
 
-        Some(Self::assemble(
-            process,
-            scaffold,
-            workers,
-            tls_listen.is_some(),
-            mtls_client,
-            client_ca,
-        ))
+        Self::assemble(process, scaffold, workers, tls_listen.is_some(), mtls_client, client_ca)
     }
 
     /// Assemble a handle from a spawned child and its [`BootScaffold`] (taking
@@ -312,15 +301,17 @@ struct BootScaffold {
     tmpdir: TempDir,
 }
 
-/// Resolve the server binary (`None` when absent, so tests skip) and mint a
-/// fresh tmpdir with the standard data/socket/stderr layout — the single
-/// source of the spawn preamble every `ServerHandle` entry point shares.
-fn boot_scaffold() -> Option<BootScaffold> {
+/// Resolve the server binary and mint a fresh tmpdir with the standard
+/// data/socket/stderr layout — the single source of the spawn preamble every
+/// `ServerHandle` entry point shares. A missing binary is a panic, never a
+/// skip: a suite that silently passes without a server tests nothing.
+fn boot_scaffold() -> BootScaffold {
     let bin = env::var("GNITZ_SERVER_BIN")
         .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../gnitz-server").to_string());
-    if !PathBuf::from(&bin).is_file() {
-        return None;
-    }
+    assert!(
+        PathBuf::from(&bin).is_file(),
+        "no server binary at {bin}: `make server` builds one (`make test` does it for you)"
+    );
     let tmpdir = tempfile::Builder::new()
         .prefix("gnitz_test_")
         .tempdir()
@@ -328,7 +319,7 @@ fn boot_scaffold() -> Option<BootScaffold> {
     let data_dir = tmpdir.path().join("data");
     let sock_path = tmpdir.path().join("gnitz.sock");
     let stderr_path = tmpdir.path().join("server_stderr.log");
-    Some(BootScaffold {
+    BootScaffold {
         paths: BootPaths {
             bin,
             data_dir,
@@ -336,7 +327,7 @@ fn boot_scaffold() -> Option<BootScaffold> {
             stderr_path,
         },
         tmpdir,
-    })
+    }
 }
 
 /// Mint a self-signed client CA and a leaf certificate signed by it, writing

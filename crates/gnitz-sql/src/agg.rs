@@ -345,25 +345,6 @@ pub(crate) fn default_agg_name(func: AggFunc, idx: usize) -> String {
     format!("_{}{idx}", agg_func_name(func))
 }
 
-/// Reject a MIN/MAX over an argument type the operator cannot order. MIN/MAX
-/// have no correct accumulator path for wide (U128/UUID/I128) types — the i64
-/// slot cannot hold them — Blob has no ordering, and the engine's integer
-/// widening reads a String's prefix as LE signed i64, which orders by neither
-/// bytes nor signedness. A non-MIN/MAX aggregate passes through, so a caller can
-/// hand its function over unconditionally. One home for the two binds that reach
-/// an aggregate call — the shared `SingleTable` leaf and the HIR grouped bind —
-/// which both reject ahead of `agg_typing`'s `Bind` backstop, so the message and
-/// the error variant are the same wherever the call was written.
-pub(crate) fn reject_min_max_unorderable(func: AggFunc, ty: TypeCode) -> Result<(), GnitzSqlError> {
-    if matches!(func, AggFunc::Min | AggFunc::Max) && !has_scalar_register(ty) {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "{}: not supported on {ty:?} columns",
-            agg_func_name(func).to_ascii_uppercase()
-        )));
-    }
-    Ok(())
-}
-
 /// The finalize composite that renders one aggregate's SELECT/HAVING value from
 /// its raw reduce output column(s) — the single definition of the rule, and the
 /// reason neither reduce lowering nor the client finisher carries a
@@ -464,29 +445,27 @@ pub(crate) struct AggTyping {
 /// projection) does not have to materialize a physical spec list at fabricated
 /// column positions to read them back.
 pub(crate) fn agg_typing(agg_func: AggFunc, arg: Option<&ColumnDef>) -> Result<AggTyping, GnitzSqlError> {
-    // Every aggregate except COUNT(*) needs a column argument, which the arms
-    // below unwrap. Validating here — the single source of truth for spec
-    // layout — covers both the SELECT-list and HAVING callers, so neither needs
-    // its own wildcard guard and a future caller cannot reintroduce the panic.
+    // `classify_agg_call` admits a wildcard only for COUNT(*).
     if !matches!(agg_func, AggFunc::Count) && arg.is_none() {
-        return Err(GnitzSqlError::Plan(format!(
-            "{agg_func:?} requires an argument column; only COUNT(*) accepts a wildcard"
+        return Err(GnitzSqlError::Internal(format!(
+            "{agg_func:?} reached agg_typing without an argument column"
         )));
     }
-    // Reject argument column types the engine cannot evaluate: every value-reading
-    // aggregate needs its argument in a scalar register, which excludes the wide
-    // integer-ish types and the german-string pair alike. Single validated gate for
-    // both the SELECT-list and HAVING callers; the leaf binder's MIN/MAX check runs
-    // earlier only to raise `Unsupported` rather than `Bind`.
+    // Every value-reading aggregate needs its argument in a scalar register,
+    // which excludes the wide integer-ish types and the german-string pair
+    // alike: MIN/MAX have no accumulator for them and SUM/AVG cannot add them.
+    // The one gate for every surface that binds an aggregate call.
     if let Some(c) = arg {
         let needs_value = match agg_func {
             AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => true,
             AggFunc::Count | AggFunc::CountNonNull => false,
         };
         if needs_value && !has_scalar_register(c.type_code) {
-            return Err(GnitzSqlError::Bind(format!(
-                "{agg_func:?} is not supported on column type {:?} ('{}')",
-                c.type_code, c.name,
+            return Err(GnitzSqlError::Unsupported(format!(
+                "{}: not supported on {:?} column '{}'",
+                agg_func_name(agg_func).to_ascii_uppercase(),
+                c.type_code,
+                c.name,
             )));
         }
     }

@@ -137,3 +137,13 @@ fn self_fk_against_compound_pk_rejected() {
     let err = resolve_fk_target_inline(&cols, &[0, 1], "tree", &[], 2).unwrap_err();
     assert!(matches!(err, GnitzSqlError::Bind(_)), "got: {err:?}");
 }
+
+#[test]
+fn duplicate_column_names_are_rejected_case_insensitively() {
+    reject_duplicate_names(["a", "b"].into_iter(), "table definition").unwrap();
+    let e = reject_duplicate_names(["a", "B", "A"].into_iter(), "table definition").unwrap_err();
+    assert!(
+        matches!(&e, GnitzSqlError::Plan(m) if m.contains("duplicate column name 'A'")),
+        "{e:?}"
+    );
+}

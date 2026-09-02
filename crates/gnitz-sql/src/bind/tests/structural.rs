@@ -1,4 +1,5 @@
 use super::*;
+use crate::ir::AggFunc;
 use crate::test_support::parse_expr_sql;
 use gnitz_core::{ColumnDef, Schema, TypeCode};
 
@@ -87,51 +88,6 @@ fn test_bind_between_desugars_to_comparison_tree() {
             assert!(matches!(*inner, BoundExpr::BinOp(_, BinOp::And, _)))
         }
         other => panic!("expected Not(And(..)), got {other:?}"),
-    }
-}
-
-#[test]
-fn test_binder_rejects_min_max_unsupported_types() {
-    for &tc in &[
-        TypeCode::U128,
-        TypeCode::UUID,
-        TypeCode::Blob,
-        TypeCode::String,
-        TypeCode::I128,
-    ] {
-        let schema = schema_with_val(tc);
-        for fname in &["MIN", "MAX"] {
-            let expr = parse_expr_sql(&format!("{fname}(c)"));
-            let r = bind_single_table(&expr, &schema);
-            assert_unsupported(r, fname);
-        }
-    }
-}
-
-#[test]
-fn test_binder_accepts_min_max_orderable_types() {
-    // Types the operator can compare correctly:
-    // narrow unsigned + zero-extend, signed, U64 (with the unsigned fix),
-    // and floats.
-    let accepted = [
-        TypeCode::U8,
-        TypeCode::U16,
-        TypeCode::U32,
-        TypeCode::U64,
-        TypeCode::I8,
-        TypeCode::I16,
-        TypeCode::I32,
-        TypeCode::I64,
-        TypeCode::F32,
-        TypeCode::F64,
-    ];
-    for &tc in &accepted {
-        let schema = schema_with_val(tc);
-        for fname in &["MIN", "MAX"] {
-            let expr = parse_expr_sql(&format!("{fname}(c)"));
-            let r = bind_single_table(&expr, &schema);
-            assert!(r.is_ok(), "expected {}({:?}) to bind, got {:?}", fname, tc, r.err());
-        }
     }
 }
 

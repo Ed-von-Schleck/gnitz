@@ -10,10 +10,7 @@ use super::{
     as_col, bind_and_lower, col_by_id, hircol_of, widen_if, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, InPair,
     JoinType, ProjEntry, RelExpr, SetOpKind, SubqueryKind, SubqueryRef,
 };
-use crate::agg::{
-    agg_output_nullable, agg_typing, default_agg_name, finalize_agg_bexpr, finalize_agg_null_test,
-    reject_min_max_unorderable,
-};
+use crate::agg::{agg_output_nullable, agg_typing, default_agg_name, finalize_agg_bexpr, finalize_agg_null_test};
 use crate::ast_util::{
     aliased_def, body_is_grouped, classify_agg_call, classify_from, expand_wildcard_item, extract_table_name_and_alias,
     flatten_conjuncts, for_each_agg_call, group_by_exprs, group_by_target, has_exists_in_subquery, has_scalar_subquery,
@@ -144,8 +141,8 @@ fn resolve_table_factor(
             ));
         };
         // The alias is a user-visible name, so it is held to the general
-        // user-identifier rule (a leading `_` is reserved for the `__h…`
-        // hidden-view namespace) even though an inline derived subtree never
+        // user-identifier rule (a leading `_` is reserved for the `_seg…`
+        // hidden-segment namespace) even though an inline derived subtree never
         // enters the binder's alias cache.
         validate_user_name(&alias.name.value)?;
         let ctx = format!("derived table '{}'", alias.name.value);
@@ -842,9 +839,6 @@ fn classify_scalar_agg(e: &Expr, inner_cols: &[HirCol]) -> Result<(AggFunc, Opti
         )?),
         None => None,
     };
-    if let Some(id) = arg {
-        reject_min_max_unorderable(func, hircol_of(inner_cols, id).def.type_code)?;
-    }
     Ok((func, arg))
 }
 
@@ -1015,9 +1009,7 @@ impl JoinScope {
             let cols = self.rel_cols(span);
             if let Some(idx) = find_unique_column(cols.iter().map(|c| &c.def), name)? {
                 if found.is_some() {
-                    return Err(GnitzSqlError::Bind(format!(
-                        "ambiguous column '{name}' — qualify with table alias"
-                    )));
+                    return Err(GnitzSqlError::Bind(format!("column reference '{name}' is ambiguous")));
                 }
                 found = Some(cols[idx].id);
             }
@@ -1245,11 +1237,6 @@ fn collect_aggs<L: LeafBinder<HirRef>>(
             Some(e) => Some(pre.column_for(e, leaf)?),
             None => None,
         };
-        // MIN/MAX orderability — checked here (Unsupported) so the message and error
-        // variant match the leaf binder's, ahead of `agg_typing`'s `Bind` backstop.
-        if let Some(id) = arg {
-            reject_min_max_unorderable(func, hircol_of(&pre.env, id).def.type_code)?;
-        }
         top = Some(match aggs.iter().position(|a| a.agg.func == func && a.agg.arg == arg) {
             Some(idx) => idx,
             None => {

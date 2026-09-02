@@ -63,10 +63,7 @@ fn start_server() -> ServerHandle {
 /// own — the harness sets it on the server process alone, so a seam one test
 /// needs cannot race a sibling through the process env.
 fn start_server_with(workers: usize, env: &[(&str, &str)]) -> ServerHandle {
-    ServerHandle::start_with_env(workers, env).expect(
-        "no server binary: `make server` builds one and copies it to <repo>/gnitz-server, \
-         which is where the harness looks (`make test` does it for you)",
-    )
+    ServerHandle::start_with_env(workers, env)
 }
 
 impl Fixture {

@@ -67,8 +67,7 @@ impl Circuit {
     pub fn dependencies(&self) -> Vec<TableId> {
         // A view's dependency set is 1–4 entries; a linear `Vec::contains` dedup
         // is alloc-free and beats a HashSet at this n (same small-n convention as
-        // `Schema::validate_pk_cols`). Iterating `nodes` in BTreeMap key order
-        // preserves the first-wins ordering of the prior HashSet-insert filter.
+        // `Schema::validate_pk_cols`).
         let mut deps: Vec<TableId> = Vec::new();
         for op in self.nodes.values() {
             if let OpNode::ScanDelta { source, .. } = op {

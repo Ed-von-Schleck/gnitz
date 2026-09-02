@@ -15,6 +15,26 @@ fn validate_user_name_rejects_reserved_and_malformed() {
     assert!(validate_user_name("my_view2").is_ok());
 }
 
+/// Only the plain `EXPLAIN <statement>` is honored; every option asks for a
+/// rendering the output shape does not have, and is named in the rejection.
+#[test]
+fn explain_rejected_clause_matrix() {
+    assert!(reject_unhonored_explain_clauses(&parse_stmt("EXPLAIN SELECT v FROM t"), "EXPLAIN").is_ok());
+    for (sql, clause) in [
+        ("EXPLAIN ANALYZE SELECT v FROM t", "ANALYZE"),
+        ("EXPLAIN VERBOSE SELECT v FROM t", "VERBOSE"),
+        ("EXPLAIN QUERY PLAN SELECT v FROM t", "QUERY PLAN"),
+        ("EXPLAIN ESTIMATE SELECT v FROM t", "ESTIMATE"),
+        ("EXPLAIN FORMAT JSON SELECT v FROM t", "FORMAT"),
+        ("EXPLAIN (FORMAT JSON) SELECT v FROM t", "the parenthesized option list"),
+    ] {
+        match reject_unhonored_explain_clauses(&parse_stmt(sql), "EXPLAIN") {
+            Err(GnitzSqlError::Unsupported(m)) => assert!(m.contains(clause), "`{sql}`: {m}"),
+            other => panic!("`{sql}`: expected Unsupported naming {clause}, got {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn transaction_control_rejected_clause_matrix() {
     // BEGIN / START TRANSACTION: bare forms are honored; transaction modes,

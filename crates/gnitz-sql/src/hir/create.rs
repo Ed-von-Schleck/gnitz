@@ -322,6 +322,7 @@ fn build_query_segments(
     // hidden ones were checked inside `add_segment`; this is the other of the two
     // paths every emitted circuit reaches.
     debug_assert_exchange_topology(&circuit);
+    crate::hir::chain::schema_of(&out_cols, pk_cols, "view output")?;
     chain.segments.push(PlannedView {
         // The user-named view is always the chain's slot 0.
         seg: 0,
@@ -333,3 +334,7 @@ fn build_query_segments(
     });
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tests/create.rs"]
+mod tests;

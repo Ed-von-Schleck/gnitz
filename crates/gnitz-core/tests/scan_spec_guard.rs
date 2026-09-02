@@ -13,9 +13,7 @@ fn scan_spec_at_a_system_tid_is_rejected_and_the_connection_survives() {
     // W = 4: the guard itself is worker-count independent, but four workers is
     // the shape in which the behaviour it prevents — four concatenated copies of
     // `_tables`, each at STATUS_OK — would occur.
-    let Some(srv) = ServerHandle::start_n(4) else {
-        return;
-    };
+    let srv = ServerHandle::start_n(4);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
 
     let spec = ReadSpec::encode_parts(&ReadBound::None, &[], &ReadSink::all_rows());

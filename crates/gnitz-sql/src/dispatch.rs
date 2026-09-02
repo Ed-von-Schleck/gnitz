@@ -117,7 +117,7 @@ pub(crate) fn execute_statement(
             let plan = plan_resolving(client, GnitzClient::resolve_local_first, schema_name, |cat| {
                 crate::plan_read(stmt, cat, schema_name)
             })?;
-            return dml::execute_explain(plan);
+            return Ok(dml::execute_explain(&plan));
         }
         _ => {}
     }
@@ -197,8 +197,6 @@ pub(crate) fn execute_statement(
             })?;
             crate::hir::execute_alter_view(client, schema_name, views)
         }
-        _ => Err(GnitzSqlError::Unsupported(format!(
-            "unsupported SQL statement: {stmt:?}"
-        ))),
+        _ => Err(GnitzSqlError::Unsupported(format!("unsupported SQL statement: {stmt}"))),
     }
 }

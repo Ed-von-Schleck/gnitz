@@ -146,7 +146,7 @@ fn with_watchdog(secs: u64, f: impl FnOnce() + Send + 'static) {
 
 #[test]
 fn insecure_connect_hello_and_alloc_roundtrip() {
-    let Some(srv) = ServerHandle::start_tls(4) else { return };
+    let srv = ServerHandle::start_tls(4);
     let mut client = GnitzClient::connect(&srv.tls_target()).expect("tls connect");
     let id1 = client.alloc_table_id().unwrap();
     let id2 = client.alloc_table_id().unwrap();
@@ -157,7 +157,7 @@ fn insecure_connect_hello_and_alloc_roundtrip() {
 
 #[test]
 fn ca_pin_connects_and_bad_verifications_fail() {
-    let Some(srv) = ServerHandle::start_tls(1) else { return };
+    let srv = ServerHandle::start_tls(1);
 
     // ?ca=dev cert: full verification against the minted self-signed cert.
     let mut pinned = GnitzClient::connect(&srv.tls_ca_target()).expect("ca-pinned connect");
@@ -172,9 +172,7 @@ fn ca_pin_connects_and_bad_verifications_fail() {
     );
 
     // Wrong CA: a *different* server's dev cert must not verify this one.
-    let Some(other) = ServerHandle::start_tls(1) else {
-        return;
-    };
+    let other = ServerHandle::start_tls(1);
     let endpoint = srv.tls_ca_target();
     let (host_port, _) = endpoint.split_once('?').unwrap();
     let other_ca = other.tls_ca_target();
@@ -225,7 +223,7 @@ fn ca_pin_connects_and_bad_verifications_fail() {
 
 #[test]
 fn push_scan_roundtrip_over_tls() {
-    let Some(srv) = ServerHandle::start_tls(4) else { return };
+    let srv = ServerHandle::start_tls(4);
     let (mut client, _sn, tid, schema) = client_with_table(&srv.tls_target());
 
     client.push(tid, &schema, &make_batch(&schema, 0, 1_000)).unwrap();
@@ -252,7 +250,7 @@ fn push_scan_roundtrip_over_tls() {
 
 #[test]
 fn big_push_and_multiframe_scan() {
-    let Some(srv) = ServerHandle::start_tls(4) else { return };
+    let srv = ServerHandle::start_tls(4);
     let (mut client, _sn, tid, schema) = client_with_table(&srv.tls_target());
 
     // ~16 MB in one push frame (700k rows × 24 B payload)...
@@ -268,7 +266,7 @@ fn big_push_and_multiframe_scan() {
 
 #[test]
 fn unix_and_tls_clients_share_a_table() {
-    let Some(srv) = ServerHandle::start_tls(4) else { return };
+    let srv = ServerHandle::start_tls(4);
     let (mut tls_client, sn, tid, schema) = client_with_table(&srv.tls_target());
     let mut unix_client = GnitzClient::connect(srv.sock_path()).unwrap();
 
@@ -289,7 +287,7 @@ fn unix_and_tls_clients_share_a_table() {
 
 #[test]
 fn wire_version_mismatch_hello_gets_status_error() {
-    let Some(srv) = ServerHandle::start_tls(1) else { return };
+    let srv = ServerHandle::start_tls(1);
     let mut t = ClientTransport::connect(&srv.tls_target()).unwrap();
     let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION as u16 + 1);
     t.send_framed(&payload).unwrap();
@@ -309,9 +307,7 @@ fn wire_version_mismatch_hello_gets_status_error() {
 
 #[test]
 fn restart_same_port_fails_fast_then_reconnects() {
-    let Some(mut srv) = ServerHandle::start_tls(1) else {
-        return;
-    };
+    let mut srv = ServerHandle::start_tls(1);
     let target = srv.tls_target();
     let (mut client, _sn, tid, _schema) = client_with_table(&target);
 
@@ -336,7 +332,7 @@ fn restart_same_port_fails_fast_then_reconnects() {
 
 #[test]
 fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
-    let Some(srv) = ServerHandle::start_tls(4) else { return };
+    let srv = ServerHandle::start_tls(4);
     let target = srv.tls_target();
     with_watchdog(120, move || {
         let (_setup, _sn, tid, schema) = client_with_table(&target);
@@ -393,9 +389,7 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
 
 #[test]
 fn ipv6_loopback_connect_and_ca_verify() {
-    let Some(srv) = ServerHandle::start_tls_v6(1) else {
-        return;
-    };
+    let srv = ServerHandle::start_tls_v6(1);
     let target = srv.tls_target();
     assert!(target.starts_with("tls://[::1]:"), "v6 endpoint expected, got {target}");
     let mut client = GnitzClient::connect(&target).expect("tls over [::1]");
@@ -414,9 +408,7 @@ fn inbound_cap_breach_closes_stalled_connection() {
     // train (never reads) and then pipelines a cap-breaching push burst.
     // Default send deadline (30 s) stays out of the way — the recv-side
     // cap breach is what must close the connection.
-    let Some(srv) = ServerHandle::start_tls_with_env(4, &[("GNITZ_INBOUND_MEM_BYTES", "67108864")]) else {
-        return;
-    };
+    let srv = ServerHandle::start_tls_with_env(4, &[("GNITZ_INBOUND_MEM_BYTES", "67108864")]);
     let target = srv.tls_target();
     with_watchdog(120, move || {
         let (mut setup, _sn, tid, schema) = client_with_table(&target);
@@ -475,9 +467,7 @@ fn stalled_scan_client_is_evicted_by_send_deadline() {
     // deterministically: every send_buffer reply is a bounded control /
     // schema frame that the kernel socket buffer absorbs without parking
     // the send.)
-    let Some(srv) = ServerHandle::start_tls_with_env(4, &[("GNITZ_CLIENT_SEND_TIMEOUT_MS", "1500")]) else {
-        return;
-    };
+    let srv = ServerHandle::start_tls_with_env(4, &[("GNITZ_CLIENT_SEND_TIMEOUT_MS", "1500")]);
     let target = srv.tls_target();
     with_watchdog(120, move || {
         let (mut setup, _sn, tid, schema) = client_with_table(&target);
@@ -507,7 +497,7 @@ fn stalled_scan_client_is_evicted_by_send_deadline() {
 
 #[test]
 fn mtls_roundtrip_push_and_scan() {
-    let Some(srv) = ServerHandle::start_mtls(4) else { return };
+    let srv = ServerHandle::start_mtls(4);
     // `mtls_target()` presents the CA-signed client leaf + verifies the dev
     // server cert. A required-mTLS server accepts it, so the full data path
     // works end to end.
@@ -525,7 +515,7 @@ fn mtls_roundtrip_push_and_scan() {
 
 #[test]
 fn mtls_server_rejects_client_without_cert() {
-    let Some(srv) = ServerHandle::start_mtls(1) else { return };
+    let srv = ServerHandle::start_mtls(1);
     // `tls_ca_target()` verifies the server but presents NO client cert. The
     // rejection may surface at the TLS handshake or at the first framed
     // exchange (a TLS 1.3 client finishes 0.5-RTT before the server validates
@@ -541,10 +531,8 @@ fn mtls_server_rejects_client_without_cert() {
 
 #[test]
 fn mtls_server_rejects_untrusted_client_cert() {
-    let Some(srv) = ServerHandle::start_mtls(1) else { return };
-    let Some(other) = ServerHandle::start_mtls(1) else {
-        return;
-    };
+    let srv = ServerHandle::start_mtls(1);
+    let other = ServerHandle::start_mtls(1);
     // Present `other`'s leaf (signed by other's CA) against `srv`, which trusts
     // only its OWN client CA. Reuse the existing wrong-CA target-splicing
     // pattern: srv's endpoint + srv's dev cert (?ca=) + other's leaf.
@@ -571,9 +559,7 @@ fn non_loopback_bind_refused_without_client_auth() {
     // `boot_expecting_exit` waits for the process to exit (the AF_UNIX socket
     // is already listening when the refusal fires, so a readiness probe would
     // race it).
-    let Some((exited_zero, stderr)) = ServerHandle::boot_expecting_exit(1, &["--tls-listen=0.0.0.0:0"]) else {
-        return;
-    };
+    let (exited_zero, stderr) = ServerHandle::boot_expecting_exit(1, &["--tls-listen=0.0.0.0:0"]);
     assert!(
         !exited_zero,
         "a non-loopback bind without client auth must exit non-zero"
@@ -585,7 +571,6 @@ fn non_loopback_bind_refused_without_client_auth() {
 
     // The escape hatch permits the very same bind (server boots and stays up).
     let booted = ServerHandle::try_start_tls(1, &["--tls-listen=0.0.0.0:0", "--allow-unauthenticated"])
-        .expect("server binary present")
         .expect("--allow-unauthenticated must permit a non-loopback bind");
     drop(booted); // clean shutdown
 }
@@ -594,10 +579,8 @@ fn non_loopback_bind_refused_without_client_auth() {
 
 #[test]
 fn global_connection_cap_closes_excess() {
-    let Some(result) = ServerHandle::try_start_tls(1, &["--tls-listen=127.0.0.1:0", "--tls-max-conns=2"]) else {
-        return;
-    };
-    let srv = result.expect("a server with --tls-max-conns must boot");
+    let srv = ServerHandle::try_start_tls(1, &["--tls-listen=127.0.0.1:0", "--tls-max-conns=2"])
+        .expect("a server with --tls-max-conns must boot");
     let target = srv.tls_target();
 
     // Hold two connections — each completes HELLO, so each counts against the
@@ -634,9 +617,7 @@ fn first_frame_deadline_reaps_silent_connections() {
     use std::io::Read;
     use std::net::TcpStream;
 
-    let Some(srv) = ServerHandle::start_tls_with_env(4, &[("GNITZ_TLS_HELLO_TIMEOUT_MS", "500")]) else {
-        return;
-    };
+    let srv = ServerHandle::start_tls_with_env(4, &[("GNITZ_TLS_HELLO_TIMEOUT_MS", "500")]);
     // Raw loopback IP:PORT (strip the `tls://` scheme and `?insecure`).
     let addr = {
         let t = srv.tls_target();

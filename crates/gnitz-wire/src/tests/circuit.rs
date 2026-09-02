@@ -383,3 +383,39 @@ fn malformed_scan_bound_degrades_to_none() {
         );
     }
 }
+
+/// The reduce output key: a group set that is a permutation of the source PK
+/// keys on it; a single NOT NULL natural-key column keys on itself; anything
+/// else — a nullable or signed column, a partial or wider set — folds into a
+/// synthetic key.
+#[test]
+#[allow(clippy::type_complexity)]
+fn for_group_cols_picks_the_output_key() {
+    use ReduceOutKey::*;
+    let (u64, u128, uuid, i64) = (
+        crate::TypeCode::U64 as u8,
+        crate::TypeCode::U128 as u8,
+        crate::TypeCode::UUID as u8,
+        crate::TypeCode::I64 as u8,
+    );
+    // (pk, group, (type code, nullable), key)
+    let rows: &[(&[u32], &[u32], (u8, bool), ReduceOutKey)] = &[
+        (&[0], &[1], (u64, true), SyntheticFold),
+        (&[0], &[1], (u64, false), SingleNaturalCol),
+        (&[0], &[1], (uuid, false), SingleNaturalCol),
+        (&[0], &[1], (u128, false), SingleNaturalCol),
+        (&[0], &[1], (i64, false), SyntheticFold),
+        (&[0], &[0], (i64, false), PkPermutation),
+        (&[0, 1], &[1, 0], (i64, false), PkPermutation),
+        (&[0, 1], &[0], (u64, false), SingleNaturalCol),
+        (&[0, 1], &[0, 1, 2], (u64, false), SyntheticFold),
+        (&[0, 1], &[1, 2], (u64, false), SyntheticFold),
+    ];
+    for (pk, group, col, want) in rows {
+        assert_eq!(
+            ReduceOutKey::for_group_cols(pk, group, |_| *col),
+            *want,
+            "{pk:?} {group:?} {col:?}"
+        );
+    }
+}

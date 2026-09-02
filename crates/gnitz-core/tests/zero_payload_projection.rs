@@ -79,9 +79,7 @@ fn keys_only_sink() -> ReadSink {
 /// blob heap, and the integer the predicate reads.
 #[test]
 fn a_pk_only_reply_returns_exactly_the_matching_keys() {
-    let Some(srv) = ServerHandle::start_n(4) else {
-        return;
-    };
+    let srv = ServerHandle::start_n(4);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let sn = unique_schema("zpp");
     client.create_schema(&sn).unwrap();
@@ -128,9 +126,7 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
 /// `pk_byte_offset` is the same running sum and the region is byte-identical.
 #[test]
 fn a_permuted_compound_pk_round_trips_verbatim() {
-    let Some(srv) = ServerHandle::start_n(4) else {
-        return;
-    };
+    let srv = ServerHandle::start_n(4);
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     let sn = unique_schema("zpp");
     client.create_schema(&sn).unwrap();
