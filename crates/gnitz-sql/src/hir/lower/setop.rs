@@ -130,7 +130,7 @@ fn hashed_out<'a>(
         out_cols.push(c.def.clone());
         layout.push(c.id);
     }
-    reject_duplicate_column_names(&out_cols, dup_ctx)?;
+    reject_duplicate_column_names(out_cols.iter(), dup_ctx)?;
     Ok(((circuit, out_cols, 1), layout))
 }
 

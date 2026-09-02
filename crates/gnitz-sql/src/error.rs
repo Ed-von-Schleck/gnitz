@@ -92,3 +92,18 @@ impl From<sqlparser::parser::ParserError> for GnitzSqlError {
         GnitzSqlError::Parse(e)
     }
 }
+
+/// The crate's one spelling of an "unhonored clause" rejection: every surface
+/// that turns a parsed-but-unimplemented clause away renders it through this.
+pub(crate) fn unsupported_clause(context: &str, clause: &str) -> GnitzSqlError {
+    GnitzSqlError::Unsupported(format!("{context}: {clause} is not supported"))
+}
+
+/// [`unsupported_clause`] when `present`. A run of these reads as the table of
+/// clauses a statement does not honor, short-circuiting on the first present one.
+pub(crate) fn reject_if(present: bool, context: &str, clause: &str) -> Result<(), GnitzSqlError> {
+    if present {
+        return Err(unsupported_clause(context, clause));
+    }
+    Ok(())
+}

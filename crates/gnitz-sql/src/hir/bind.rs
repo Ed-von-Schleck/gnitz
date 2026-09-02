@@ -17,19 +17,20 @@ use crate::agg::{
 use crate::ast_util::{
     aliased_def, body_is_grouped, classify_agg_call, classify_from, expand_wildcard_item, extract_table_name_and_alias,
     flatten_conjuncts, for_each_agg_call, group_by_exprs, group_by_target, has_exists_in_subquery, has_scalar_subquery,
-    is_agg_call, is_name_preserving_wildcard_projection, peel_nested, projection_item_expr, reject_grouped_column_ref,
-    reject_grouped_null_test, reject_ungrouped_column, reject_unresolved_aggregate, reject_unsupported_fn_qualifiers,
-    scalar_projection_item, single_relation_col_name, unknown_function, FromShape,
+    is_agg_call, peel_nested, projection_item_expr, reject_grouped_column_ref, reject_grouped_null_test,
+    reject_ungrouped_column, reject_unresolved_aggregate, reject_unsupported_fn_qualifiers, scalar_projection_item,
+    single_relation_col_name, unknown_function, FromShape,
 };
 use crate::bind::{apply_positional_aliases, cte_passthrough};
 use crate::bind::{bind_structural, find_unique_column, fold_null_test, single_relation_col_idx, Binder, LeafBinder};
-use crate::error::GnitzSqlError;
+use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::chain::ViewChain;
 use crate::hir::guards::join_on_and_type;
 use crate::ir::{AggFunc, BExpr, BinOp};
 use crate::validate::{
-    cte_body, non_recursive_ctes, plain_select_body, reject_duplicate_names, reject_float_key, reject_float_key_of,
-    reject_query_envelope_body, reject_unhonored_select_clauses, validate_user_name, HonoredClauses,
+    cte_body, non_recursive_ctes, plain_select_body, reject_duplicate_projection_names, reject_float_key,
+    reject_float_key_of, reject_query_envelope_body, reject_unhonored_select_clauses, validate_user_name,
+    HonoredClauses,
 };
 use gnitz_core::{CatalogSnapshot, ColumnDef, Schema, TypeCode};
 use sqlparser::ast::{
@@ -147,15 +148,9 @@ fn resolve_table_factor(
         // enters the binder's alias cache.
         validate_user_name(&alias.name.value)?;
         let ctx = format!("derived table '{}'", alias.name.value);
-        if *lateral {
-            return Err(GnitzSqlError::Unsupported(format!("{ctx}: LATERAL is not supported")));
-        }
+        reject_if(*lateral, &ctx, "LATERAL")?;
         // Silently dropping TABLESAMPLE would return all rows — a wrong result.
-        if sample.is_some() {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "{ctx}: TABLESAMPLE is not supported"
-            )));
-        }
+        reject_if(sample.is_some(), &ctx, "TABLESAMPLE")?;
         let body = reject_query_envelope_body(subquery, &ctx)?;
         let subtree = bind_body(cat, binder, ids, body)?;
         let mut cols = subtree.cols();
@@ -268,27 +263,8 @@ fn bind_body_suffix<L: LeafBinder<HirRef>>(
         return bind_grouped_suffix(ids, select, rel, leaf);
     }
     let items = bind_projection(&select.projection, env, leaf, ids, ctx)?;
-    reject_dup_proj_names(&items, &select.projection, ctx)?;
+    reject_duplicate_projection_names(&select.projection, items.iter().map(|e| &e.out.def), ctx)?;
     Ok(RelExpr::project(rel, items))
-}
-
-/// Reject duplicate output names in a bound projection — one home for the guard
-/// the bind sites otherwise repeat verbatim. A projection that names nothing of
-/// its own (`*`, `* EXCEPT/EXCLUDE`) is skipped: its names are the source's, so
-/// a duplicate there is the source's and rides through positionally.
-fn reject_dup_proj_names(items: &[ProjEntry], projection: &[SelectItem], ctx: &str) -> Result<(), GnitzSqlError> {
-    if is_name_preserving_wildcard_projection(projection) {
-        return Ok(());
-    }
-    // Hidden slots are skipped, exactly as `reject_duplicate_column_names` does:
-    // they are excluded from name resolution, so they cannot bind ambiguously.
-    reject_duplicate_names(
-        items
-            .iter()
-            .filter(|e| !e.out.def.is_hidden)
-            .map(|e| e.out.def.name.as_str()),
-        ctx,
-    )
 }
 
 /// Expand a bare `*` item over `cols` (honoring `EXCEPT`/`EXCLUDE`/`RENAME`,

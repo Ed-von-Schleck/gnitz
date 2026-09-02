@@ -199,6 +199,6 @@ pub(crate) fn lower_reduce(
     cb.sink(mapped);
     let circuit = cb.build();
 
-    reject_duplicate_column_names(&out_cols, "GROUP BY view")?;
+    reject_duplicate_column_names(out_cols.iter(), "GROUP BY view")?;
     Ok(((circuit, out_cols, pk_len), out_layout))
 }

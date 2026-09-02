@@ -151,6 +151,40 @@ class TestJoins:
         finally:
             _cleanup(client, sn, tables=["t1", "t2"], views=["v"])
 
+    def test_global_join_is_the_plain_join(self, client):
+        """ClickHouse `GLOBAL JOIN` names the whole-relation evaluation a DBSP
+        join already does, so it is accepted and yields the plain join's rows."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE t2 (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v_plain AS SELECT t1.id, t2.val FROM t1 JOIN t2 ON t1.fk = t2.id",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v_global AS SELECT t1.id, t2.val FROM t1 GLOBAL JOIN t2 ON t1.fk = t2.id",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO t2 VALUES (10, 100), (20, 200)", schema_name=sn)
+            client.execute_sql("INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 99)", schema_name=sn)
+
+            def rows(view):
+                vid = client.resolve_table(sn, view)[0]
+                return sorted((r["id"], r["val"]) for r in _scan_dicts(client, vid))
+
+            assert rows("v_plain") == [(1, 100), (2, 200)]
+            assert rows("v_global") == rows("v_plain")
+        finally:
+            _cleanup(client, sn, tables=["t1", "t2"], views=["v_plain", "v_global"])
+
     def test_inner_join_left_delete_retraction(self, client):
         """Deleting a left-side row retracts its matched rows from the view."""
         sn = "s" + _uid()

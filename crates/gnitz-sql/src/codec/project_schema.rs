@@ -6,14 +6,12 @@
 //! `hir::physical::physicalize_projection`; `build_read_projection` is the ad-hoc
 //! read path's variant (PK hidden-prepended, user column order preserved).
 
-use crate::ast_util::{
-    aliased_def, expand_wildcard_item, is_name_preserving_wildcard_projection, scalar_projection_item,
-};
+use crate::ast_util::{aliased_def, expand_wildcard_item, scalar_projection_item};
 use crate::bind::bind_single_table;
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_bound_expr;
 use crate::ir::BoundExpr;
-use crate::validate::reject_duplicate_column_names;
+use crate::validate::reject_duplicate_projection_names;
 use gnitz_core::{ColumnDef, Schema};
 use gnitz_expr::{ExprBuilder, LogicalProgram, Sink};
 use sqlparser::ast::SelectItem;
@@ -184,12 +182,8 @@ pub(crate) fn build_read_projection(
     }
 
     // Before the hidden PK prepend below, which may reuse a name the projection
-    // already carries. A projection that names nothing of its own (`*`,
-    // `* EXCEPT/EXCLUDE`) is skipped on the same rule the view compilers use: its
-    // names are the source's, so a duplicate there rides through positionally.
-    if !is_name_preserving_wildcard_projection(projection) {
-        reject_duplicate_column_names(&out_cols, "SELECT projection")?;
-    }
+    // already carries.
+    reject_duplicate_projection_names(projection, out_cols.iter(), "SELECT projection")?;
 
     // The full source PK, hidden-prepended to slots `0..k`.
     for (target, &pk) in source_schema.pk_indices().iter().enumerate() {

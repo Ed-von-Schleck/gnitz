@@ -1,4 +1,4 @@
-use crate::error::GnitzSqlError;
+use crate::error::{reject_if, GnitzSqlError};
 use crate::ir::AggFunc;
 use gnitz_core::ColumnDef;
 use sqlparser::ast::{ExcludeSelectItem, RenameSelectItem, SelectItem, WildcardAdditionalOptions};
@@ -565,29 +565,12 @@ pub(crate) fn extract_table_factor_name(
             "{context}: only simple table references supported"
         )));
     };
-    let reject = |clause: &str| {
-        Err(GnitzSqlError::Unsupported(format!(
-            "{context}: {clause} is not supported"
-        )))
-    };
-    if args.is_some() {
-        return reject("a table function in FROM");
-    }
-    if version.is_some() {
-        return reject("time travel (AS OF / AT)");
-    }
-    if *with_ordinality {
-        return reject("WITH ORDINALITY");
-    }
-    if !partitions.is_empty() {
-        return reject("PARTITION selection");
-    }
-    if json_path.is_some() {
-        return reject("a JSON path on a table");
-    }
-    if sample.is_some() {
-        return reject("TABLESAMPLE");
-    }
+    reject_if(args.is_some(), context, "a table function in FROM")?;
+    reject_if(version.is_some(), context, "time travel (AS OF / AT)")?;
+    reject_if(*with_ordinality, context, "WITH ORDINALITY")?;
+    reject_if(!partitions.is_empty(), context, "PARTITION selection")?;
+    reject_if(json_path.is_some(), context, "a JSON path on a table")?;
+    reject_if(sample.is_some(), context, "TABLESAMPLE")?;
     extract_name(name, context)
 }
 
@@ -613,28 +596,45 @@ pub(crate) fn extract_table_name_and_alias(
 /// list; every other `Function` field would otherwise be silently dropped,
 /// computing the plain call. `on` names the rejecting context ("aggregates",
 /// "COALESCE", …) in the message.
+///
+/// Exhaustive destructure (no `..`): a future `sqlparser` `Function` field stops
+/// the build until it is classified consumed / inert / rejected.
 pub(crate) fn reject_unsupported_fn_qualifiers(func: &sqlparser::ast::Function, on: &str) -> Result<(), GnitzSqlError> {
     use sqlparser::ast::{DuplicateTreatment, FunctionArguments};
+    let sqlparser::ast::Function {
+        // Consumed: the name dispatches the call, the argument list is bound.
+        name: _,
+        args,
+        // Inert: ODBC's `{fn NAME(args)}` spells `NAME(args)`, round-trips
+        // through `Display`, and changes no result.
+        uses_odbc_syntax: _,
+        // Rejected below.
+        parameters,
+        filter,
+        null_treatment,
+        over,
+        within_group,
+    } = func;
     // Colon form ("{what}: not supported …") sidesteps subject-verb number
     // agreement and matches the binder's existing message style
     // (e.g. "{name}: not supported on {:?} columns").
     let unsupported = |what: &str| Err(GnitzSqlError::Unsupported(format!("{what}: not supported on {on}")));
-    if func.filter.is_some() {
+    if filter.is_some() {
         return unsupported("FILTER (WHERE …)");
     }
-    if func.over.is_some() {
+    if over.is_some() {
         return unsupported("window functions (OVER)");
     }
-    if !func.within_group.is_empty() {
+    if !within_group.is_empty() {
         return unsupported("WITHIN GROUP (ORDER BY …)");
     }
-    if func.null_treatment.is_some() {
+    if null_treatment.is_some() {
         return unsupported("IGNORE/RESPECT NULLS");
     }
-    if !matches!(func.parameters, FunctionArguments::None) {
+    if !matches!(parameters, FunctionArguments::None) {
         return unsupported("parametric (ClickHouse) calls");
     }
-    if let FunctionArguments::List(list) = &func.args {
+    if let FunctionArguments::List(list) = args {
         if matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct)) {
             return unsupported("DISTINCT");
         }
@@ -693,16 +693,16 @@ pub(crate) fn index_column_ident<'a>(
     c: &'a sqlparser::ast::IndexColumn,
     context: &str,
 ) -> Result<&'a str, GnitzSqlError> {
-    if c.operator_class.is_some() {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "{context}: an operator class on an index column is not supported"
-        )));
-    }
-    if c.column.options.asc.is_some() || c.column.options.nulls_first.is_some() || c.column.with_fill.is_some() {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "{context}: per-column ordering (ASC/DESC, NULLS FIRST/LAST, WITH FILL) is not supported"
-        )));
-    }
+    reject_if(
+        c.operator_class.is_some(),
+        context,
+        "an operator class on an index column",
+    )?;
+    reject_if(
+        c.column.options.asc.is_some() || c.column.options.nulls_first.is_some() || c.column.with_fill.is_some(),
+        context,
+        "per-column ordering (ASC/DESC, NULLS FIRST/LAST, WITH FILL)",
+    )?;
     simple_ident_expr(&c.column.expr, context)
 }
 
@@ -773,16 +773,8 @@ impl<'a> WildcardRewrite<'a> {
         };
         // gnitz honors neither a computed value substitution (REPLACE) nor a
         // name-pattern filter (ILIKE); reject rather than silently expand `*`.
-        if o.opt_replace.is_some() {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "{context}: SELECT * REPLACE is not supported"
-            )));
-        }
-        if o.opt_ilike.is_some() {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "{context}: SELECT * ILIKE is not supported"
-            )));
-        }
+        reject_if(o.opt_replace.is_some(), context, "SELECT * REPLACE")?;
+        reject_if(o.opt_ilike.is_some(), context, "SELECT * ILIKE")?;
         // EXCEPT and EXCLUDE are synonyms (ClickHouse/BigQuery vs Snowflake) —
         // union both into one drop-set.
         let mut drop = Vec::new();

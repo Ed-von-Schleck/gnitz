@@ -434,7 +434,7 @@ fn acc_bits(acc: &ColAcc) -> Option<u64> {
 pub(crate) fn build_agg_out_schema(out_cols: &[ColumnDef]) -> Result<Schema, GnitzSqlError> {
     let mut cols = vec![ColumnDef::new("_agg_pk", TypeCode::U128, false).hidden()];
     cols.extend(out_cols.iter().cloned());
-    reject_duplicate_column_names(&cols, "aggregate SELECT")?;
+    reject_duplicate_column_names(cols.iter(), "aggregate SELECT")?;
     Schema::from_parts(cols, vec![0])
         .map_err(|e| GnitzSqlError::Unsupported(format!("ad-hoc aggregate output schema is invalid: {e}")))
 }

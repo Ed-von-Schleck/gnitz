@@ -1,20 +1,6 @@
 use super::*;
-use crate::test_support::{bind_where, col_def, idx_metas_flagged, pk_schema, two_col};
+use crate::test_support::{bind_where, col_def, idx_metas_flagged, parse_query, pk_schema, two_col};
 use gnitz_core::TypeCode;
-
-fn parse_query_sql(src: &str) -> sqlparser::ast::Query {
-    use sqlparser::dialect::GenericDialect;
-    use sqlparser::parser::Parser;
-    match Parser::parse_sql(&GenericDialect {}, src)
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap()
-    {
-        sqlparser::ast::Statement::Query(q) => *q,
-        _ => panic!("not a query"),
-    }
-}
 
 /// The plan for `where_expr` against `lists` (the table's indexes).
 fn plan_of<'e>(
@@ -219,15 +205,15 @@ fn an_unpinned_pk_range_yields_to_a_full_unique_point() {
 
 #[test]
 fn extract_limit_offset_literals_and_errors() {
-    let q = parse_query_sql("SELECT * FROM t LIMIT 3 OFFSET 2");
+    let q = parse_query("SELECT * FROM t LIMIT 3 OFFSET 2");
     assert_eq!(extract_limit(&q).unwrap(), Some(3));
     assert_eq!(extract_offset(&q).unwrap(), 2);
     // MySQL `LIMIT off, lim`.
-    let q = parse_query_sql("SELECT * FROM t LIMIT 2, 3");
+    let q = parse_query("SELECT * FROM t LIMIT 2, 3");
     assert_eq!(extract_limit(&q).unwrap(), Some(3));
     assert_eq!(extract_offset(&q).unwrap(), 2);
     // Absent → None / 0.
-    let q = parse_query_sql("SELECT * FROM t");
+    let q = parse_query("SELECT * FROM t");
     assert_eq!(extract_limit(&q).unwrap(), None);
     assert_eq!(extract_offset(&q).unwrap(), 0);
     // A non-integer-literal errors instead of silently degrading.
@@ -237,7 +223,7 @@ fn extract_limit_offset_literals_and_errors() {
         "SELECT * FROM t LIMIT -1",
     ] {
         assert!(
-            matches!(extract_limit(&parse_query_sql(sql)), Err(GnitzSqlError::Unsupported(_))),
+            matches!(extract_limit(&parse_query(sql)), Err(GnitzSqlError::Unsupported(_))),
             "{sql} must error"
         );
     }
@@ -246,10 +232,7 @@ fn extract_limit_offset_literals_and_errors() {
         "SELECT * FROM t LIMIT 1 OFFSET 'x'",
     ] {
         assert!(
-            matches!(
-                extract_offset(&parse_query_sql(sql)),
-                Err(GnitzSqlError::Unsupported(_))
-            ),
+            matches!(extract_offset(&parse_query(sql)), Err(GnitzSqlError::Unsupported(_))),
             "{sql} must error"
         );
     }

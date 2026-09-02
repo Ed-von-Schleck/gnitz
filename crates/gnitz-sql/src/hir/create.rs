@@ -5,7 +5,7 @@
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{debug_assert_exchange_topology, ViewChain};
-use crate::validate::{reject_unhonored_query_clauses, validate_user_name, HonoredQueryClauses};
+use crate::validate::{alter_view_parts, reject_unhonored_query_clauses, validate_user_name, HonoredQueryClauses};
 use crate::SqlResult;
 use gnitz_core::{CatalogSnapshot, GnitzClient, PlannedView, RelClass};
 use sqlparser::ast::{CreateTableOptions, ObjectName, Query, Statement, Value, ValueWithSpan};
@@ -127,7 +127,10 @@ pub fn plan_view(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> 
     let mut binder = Binder::new(schema_name).for_view_body();
     match stmt {
         Statement::CreateView(cv) => plan_create_view(cat, cv, &mut binder),
-        Statement::AlterView { name, query, .. } => plan_alter_view(cat, schema_name, name, query, &mut binder),
+        Statement::AlterView { .. } => {
+            let (name, query) = alter_view_parts(stmt, "ALTER VIEW")?;
+            plan_alter_view(cat, schema_name, name, query, &mut binder)
+        }
         _ => Err(GnitzSqlError::Unsupported(
             "plan_view describes a CREATE VIEW or an ALTER VIEW … AS; this statement is neither".to_string(),
         )),
@@ -150,18 +153,7 @@ fn plan_create_view(
     let view_name = crate::ast_util::extract_name(&cv.name, "CREATE VIEW")?;
     validate_user_name(&view_name)?;
 
-    // The CREATE VIEW envelope honors only `WITH` (compiled by the CTE phase in
-    // `build_query_segments`); every other tail clause (ORDER BY, LIMIT/OFFSET, FETCH, FOR
-    // UPDATE/SHARE, FOR XML/JSON, SETTINGS, FORMAT) has no incremental-view semantics and would
-    // otherwise be silently dropped.
-    reject_unhonored_query_clauses(
-        query,
-        HonoredQueryClauses {
-            with: true,
-            ..HonoredQueryClauses::NONE
-        },
-        "CREATE VIEW",
-    )?;
+    reject_unhonored_query_clauses(query, HonoredQueryClauses::VIEW_BODY, "CREATE VIEW")?;
 
     let options = decode_view_options(&cv.options)?;
 
@@ -193,15 +185,7 @@ fn plan_alter_view(
     // Resolve the old vid; reject `ALTER VIEW <table>` and a missing relation.
     let old_vid = resolve_view_id(cat, schema_name, &view_name)?;
 
-    // Same envelope rules as CREATE VIEW (only `WITH` honored).
-    reject_unhonored_query_clauses(
-        query,
-        HonoredQueryClauses {
-            with: true,
-            ..HonoredQueryClauses::NONE
-        },
-        "ALTER VIEW",
-    )?;
+    reject_unhonored_query_clauses(query, HonoredQueryClauses::VIEW_BODY, "ALTER VIEW")?;
 
     let mut chain = ViewChain::new();
     build_query_segments(cat, query, binder, &mut chain, ViewOptions::default())?;

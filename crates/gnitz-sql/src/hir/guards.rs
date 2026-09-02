@@ -18,7 +18,14 @@ use sqlparser::ast::{Expr, JoinConstraint, JoinOperator};
 /// sqlparser 0.56 spells the bare/`OUTER` forms as separate variants
 /// (`Left`/`LeftOuter`, `Right`/`RightOuter`); FULL has only `FullOuter`.
 pub(crate) fn join_on_and_type(join: &sqlparser::ast::Join) -> Result<(&Expr, JoinType), GnitzSqlError> {
-    match &join.join_operator {
+    let sqlparser::ast::Join {
+        relation: _, // resolved by the caller as the step's right input
+        // Inert: ClickHouse's `GLOBAL` asks for evaluation against the whole
+        // right relation, which a DBSP bilinear join already does.
+        global: _,
+        join_operator,
+    } = join;
+    match join_operator {
         JoinOperator::Inner(JoinConstraint::On(e)) | JoinOperator::Join(JoinConstraint::On(e)) => {
             Ok((e, JoinType::Inner))
         }

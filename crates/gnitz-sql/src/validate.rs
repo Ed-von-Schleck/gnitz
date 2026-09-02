@@ -1,8 +1,26 @@
-//! DDL/view validation helpers: duplicate-column-name rejection, user index-name
-//! rules, float-key rejection, and the auto-generated index-name format. Shared
-//! by `ddl` and every view builder.
+//! The planner's message layer over `gnitz-wire`'s rules — wire decides, these
+//! name the offending column — plus the shared projection-schema rules and the
+//! clause guards.
+//!
+//! **The guard contract**, which `ast_util::reject_unsupported_fn_qualifiers`
+//! also carries: destructure the node without `..`, classifying every field
+//! consumed / inert / rejected, so an upstream field addition is E0027 rather
+//! than a clause silently dropped; then a table of `reject_if` calls
+//! (`error::unsupported_clause`), naming the first present clause.
+//!
+//! A guard takes a variant's payload struct where sqlparser gives it one
+//! (`Statement::CreateTable(CreateTable)`) and `&Statement` otherwise. In the
+//! `&Statement` case it **returns what the caller consumes** (`drop_parts`,
+//! `alter_view_parts`), which is what stops a second, extracting `..` match
+//! elsewhere from dropping the next upstream field — a hole the guard exists to
+//! close. Matches that only route keep `..`. The exception is `Explain`, whose
+//! `statement` is unwrapped in `plan_read` on a path shared with a bare
+//! `Statement::Query`, so that match stays regardless.
+//!
+//! What a *surface* consumes is passed in — `HonoredClauses`,
+//! `HonoredQueryClauses`.
 
-use crate::error::GnitzSqlError;
+use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
 use gnitz_core::{ColumnDef, Schema, TypeCode};
 
 /// The column def of a *computed* projection item, from the expression's
@@ -28,8 +46,25 @@ pub(crate) fn computed_column(alias: Option<String>, idx: usize, nominal: TypeCo
 /// Hidden key slots are skipped — they are excluded from name resolution, so
 /// they cannot bind ambiguously. `context` names the DDL surface for the error
 /// message (e.g. "CREATE VIEW projection", "join view").
-pub(crate) fn reject_duplicate_column_names(cols: &[ColumnDef], context: &str) -> Result<(), GnitzSqlError> {
-    reject_duplicate_names(cols.iter().filter(|c| !c.is_hidden).map(|c| c.name.as_str()), context)
+pub(crate) fn reject_duplicate_column_names<'a>(
+    cols: impl Iterator<Item = &'a ColumnDef>,
+    context: &str,
+) -> Result<(), GnitzSqlError> {
+    reject_duplicate_names(cols.filter(|c| !c.is_hidden).map(|c| c.name.as_str()), context)
+}
+
+/// [`reject_duplicate_column_names`] over what a SELECT projection produces. A
+/// projection naming nothing of its own (`*`, `* EXCEPT/EXCLUDE`) is exempt: a
+/// duplicate among the source's own names rides through positionally.
+pub(crate) fn reject_duplicate_projection_names<'a>(
+    projection: &[sqlparser::ast::SelectItem],
+    cols: impl Iterator<Item = &'a ColumnDef>,
+    context: &str,
+) -> Result<(), GnitzSqlError> {
+    if crate::ast_util::is_name_preserving_wildcard_projection(projection) {
+        return Ok(());
+    }
+    reject_duplicate_column_names(cols, context)
 }
 
 /// Raw-name form of [`reject_duplicate_column_names`], for surfaces that have
@@ -135,17 +170,25 @@ pub(crate) fn reject_float_keys(source_schema: &Schema, indices: &[usize]) -> Re
     Ok(())
 }
 
-/// Reject a column that cannot be an index key column, naming it. The verdict is
-/// `gnitz_wire::index_key_type`'s — the authoritative rule, which
-/// `index_key_types` raises as a bare type code. Both index-creating surfaces
-/// (CREATE INDEX and inline UNIQUE) run this first, so neither can report an
-/// ineligible column without saying which one. `role` names the clause.
-pub(crate) fn reject_unindexable_columns(names: &[&str], types: &[TypeCode], role: &str) -> Result<(), GnitzSqlError> {
+/// Reject an index key the engine could not build — the whole gate both
+/// index-creating surfaces (CREATE INDEX and inline UNIQUE) run. Per-column
+/// eligibility first, so an ineligible column is named rather than reaching
+/// `index_key_types` (the engine's own rule, over the indexed columns *plus the
+/// source PK*), whose verdict is a bare type code.
+pub(crate) fn reject_unbuildable_index_key(
+    names: &[&str],
+    types: &[TypeCode],
+    src_pk_count: usize,
+    src_pk_stride: usize,
+    role: &str,
+) -> Result<(), GnitzSqlError> {
     for (name, &tc) in names.iter().zip(types) {
         if gnitz_wire::index_key_type(tc as u8).is_err() {
             return Err(non_key_eligible_error(name, tc, role));
         }
     }
+    let raw: Vec<u8> = types.iter().map(|&tc| tc as u8).collect();
+    gnitz_wire::index_key_types(&raw, src_pk_count, src_pk_stride).map_err(GnitzSqlError::Unsupported)?;
     Ok(())
 }
 
@@ -159,24 +202,6 @@ pub(crate) fn non_key_eligible_error(name: &str, tc: TypeCode, role: &str) -> Gn
          ({role} must be a fixed-width integer, U128, or UUID column; \
          String, Blob, and float columns cannot be a {role} key)"
     ))
-}
-
-/// The single spelling of an "unhonored clause" rejection. `reject_unhonored_select_clauses`,
-/// `reject_unhonored_query_clauses`, and the `Cte`-envelope reject all funnel through this, so the
-/// `"{context}: {clause} is not supported"` grammar cannot drift per site.
-fn unsupported_clause(context: &str, clause: &str) -> GnitzSqlError {
-    GnitzSqlError::Unsupported(format!("{context}: {clause} is not supported"))
-}
-
-/// Reject `clause` when `present`. The clause guards below are a *table* of
-/// "which clauses does this statement not honor" — written as a run of these so
-/// the table reads as one, and so each entry keeps the short-circuit that makes
-/// the first present clause the one named.
-fn reject_if(present: bool, context: &str, clause: &str) -> Result<(), GnitzSqlError> {
-    if present {
-        return Err(unsupported_clause(context, clause));
-    }
-    Ok(())
 }
 
 /// Reject a circuit whose widest intermediate batch exceeds the engine's
@@ -335,6 +360,14 @@ impl HonoredQueryClauses {
     /// except direct SELECT.
     pub(crate) const NONE: Self = HonoredQueryClauses {
         with: false,
+        ordering_sink: false,
+    };
+
+    /// A view body, shared by CREATE VIEW and `ALTER VIEW … AS`: `WITH` is
+    /// compiled by the CTE phase, and no other tail clause has incremental-view
+    /// semantics.
+    pub(crate) const VIEW_BODY: Self = HonoredQueryClauses {
+        with: true,
         ordering_sink: false,
     };
 }
@@ -617,20 +650,23 @@ pub(crate) fn reject_unhonored_delete_clauses(
     Ok(())
 }
 
-/// Reject every `DROP` clause `execute_drop` does not consume. It reads `object_type` and `names`;
-/// `cascade`/`restrict` (dependent-object policy), `purge` (Hive data deletion), `temporary`
-/// (MySQL DROP TEMPORARY), and `table` (MySQL `DROP INDEX i ON t` — the ON target) all parse under
-/// `GenericDialect` and would otherwise be silently dropped. `if_exists` drops *loudly* (a missing
+/// The `(object_type, names)` `execute_drop` acts on, once every `DROP` clause it
+/// does not consume is rejected: `cascade`/`restrict` (dependent-object policy),
+/// `purge` (Hive data deletion), `temporary` (MySQL DROP TEMPORARY), and `table`
+/// (MySQL `DROP INDEX i ON t` — the ON target) all parse under `GenericDialect`
+/// and would otherwise be silently dropped. `if_exists` drops *loudly* (a missing
 /// object still errors), so it is not rejected; implement it later.
 ///
-/// Exhaustive destructure (no `..`): a future `sqlparser` field stops the build.
-pub(crate) fn reject_unhonored_drop_clauses(
-    stmt: &sqlparser::ast::Statement,
+/// The crate's only `Drop` destructure (no `..`): returning the consumed fields is
+/// what keeps it the only one, so a future `sqlparser` field cannot be dropped by
+/// an extracting match elsewhere.
+pub(crate) fn drop_parts<'a>(
+    stmt: &'a sqlparser::ast::Statement,
     context: &str,
-) -> Result<(), GnitzSqlError> {
+) -> Result<(&'a sqlparser::ast::ObjectType, &'a [sqlparser::ast::ObjectName]), GnitzSqlError> {
     let sqlparser::ast::Statement::Drop {
-        object_type: _,
-        names: _,
+        object_type,
+        names,
         if_exists: _, // loud on drop; implement later
         cascade,
         restrict,
@@ -646,7 +682,7 @@ pub(crate) fn reject_unhonored_drop_clauses(
     reject_if(*purge, context, "PURGE")?;
     reject_if(*temporary, context, "TEMPORARY")?;
     reject_if(table.is_some(), context, "ON <table> (MySQL DROP INDEX target)")?;
-    Ok(())
+    Ok((object_type, names))
 }
 
 /// Reject every `EXPLAIN` option `execute_explain` does not honor. EXPLAIN
@@ -1223,18 +1259,31 @@ pub(crate) fn reject_unhonored_alter_table_clauses(
     Ok(())
 }
 
-/// Reject an `ALTER VIEW … AS` with output column aliases (`ALTER VIEW v (a,b) AS`)
-/// or `WITH` options — gnitz derives the view's output schema from the query, so
-/// either would silently produce a different view. sqlparser's `AlterView` has no
+/// The `(name, query)` an `ALTER VIEW … AS` is planned from, once the clauses
+/// gnitz cannot honor are rejected: output column aliases
+/// (`ALTER VIEW v (a,b) AS`) and `WITH` options would each silently produce a
+/// view whose schema is not the query's. sqlparser's `AlterView` has no
 /// `if_exists`, so `ALTER VIEW IF EXISTS` never parses.
-pub(crate) fn reject_unhonored_alter_view_clauses(
-    columns: &[sqlparser::ast::Ident],
-    with_options: &[sqlparser::ast::SqlOption],
+///
+/// The crate's only `AlterView` destructure (no `..`): returning the consumed
+/// fields is what keeps it the only one, so a future `sqlparser` field cannot be
+/// dropped by an extracting match elsewhere.
+pub(crate) fn alter_view_parts<'a>(
+    stmt: &'a sqlparser::ast::Statement,
     context: &str,
-) -> Result<(), GnitzSqlError> {
+) -> Result<(&'a sqlparser::ast::ObjectName, &'a sqlparser::ast::Query), GnitzSqlError> {
+    let sqlparser::ast::Statement::AlterView {
+        name,
+        query,
+        columns,
+        with_options,
+    } = stmt
+    else {
+        return Err(GnitzSqlError::Bind("not an ALTER VIEW statement".to_string()));
+    };
     reject_if(!columns.is_empty(), context, "output column aliases")?;
     reject_if(!with_options.is_empty(), context, "WITH options")?;
-    Ok(())
+    Ok((name, query))
 }
 
 #[cfg(test)]

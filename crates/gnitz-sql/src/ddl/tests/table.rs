@@ -3,8 +3,7 @@ use super::*;
 /// The `table_options` of a parsed `CREATE TABLE`, so the option tests below
 /// exercise the same AST shape `execute_create_table` receives.
 fn table_options_of(sql: &str) -> CreateTableOptions {
-    let stmts = sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, sql).expect("parses");
-    match stmts.into_iter().next().expect("one statement") {
+    match crate::test_support::parse_stmt(sql) {
         sqlparser::ast::Statement::CreateTable(c) => c.table_options,
         other => panic!("not a CREATE TABLE: {other}"),
     }

@@ -620,7 +620,13 @@ fn extract_insert_parts(insert: &Insert) -> Result<InsertParts<'_>, GnitzSqlErro
 
 fn extract_values_rows(query: &Query) -> Result<&[Parens<Vec<Expr>>], GnitzSqlError> {
     match query.body.as_ref() {
-        SetExpr::Values(Values { rows, .. }) => Ok(rows),
+        // Inert MySQL spellings of `VALUES (…)`: `VALUES ROW(…)` and `VALUE (…)`
+        // parse to the same `rows`, so the row inserted is identical.
+        SetExpr::Values(Values {
+            rows,
+            explicit_row: _,
+            value_keyword: _,
+        }) => Ok(rows),
         _ => Err(GnitzSqlError::Unsupported(
             "INSERT only supports VALUES (not INSERT INTO ... SELECT)".to_string(),
         )),

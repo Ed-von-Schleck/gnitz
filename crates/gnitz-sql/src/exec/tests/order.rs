@@ -1,10 +1,8 @@
 use super::*;
 use crate::exec::batch::{project, resolve_projection};
-use crate::test_support::col_def;
+use crate::test_support::{col_def, parse_query};
 use gnitz_core::null_word_get;
-use sqlparser::ast::{Query, SelectItem, SetExpr, Statement};
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
+use sqlparser::ast::{SelectItem, SetExpr};
 
 // The per-type window comparison itself (`cmp_typed_le`) is pinned by
 // gnitz-wire's own tests; the tests here cover the sink built on it.
@@ -78,14 +76,6 @@ fn push_kv(b: &mut ZSetBatch, pk: u64, v: Option<i64>, s: Option<&str>, weight: 
     }
     if let ColData::Strings(vs) = &mut b.columns[2] {
         vs.push(Some(s.unwrap_or("").to_string()));
-    }
-}
-
-fn parse_query(sql: &str) -> Query {
-    let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
-    match stmts.into_iter().next().unwrap() {
-        Statement::Query(q) => *q,
-        _ => panic!("not a query"),
     }
 }
 

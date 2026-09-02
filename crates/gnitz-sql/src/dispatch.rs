@@ -5,11 +5,10 @@
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
 use crate::validate::{
-    reject_unhonored_alter_table_clauses, reject_unhonored_alter_view_clauses, reject_unhonored_commit_clauses,
+    drop_parts, reject_unhonored_alter_table_clauses, reject_unhonored_commit_clauses,
     reject_unhonored_create_index_clauses, reject_unhonored_create_table_clauses, reject_unhonored_create_view_clauses,
-    reject_unhonored_delete_clauses, reject_unhonored_drop_clauses, reject_unhonored_explain_clauses,
-    reject_unhonored_insert_clauses, reject_unhonored_rollback_clauses, reject_unhonored_start_transaction_clauses,
-    reject_unhonored_update_clauses,
+    reject_unhonored_delete_clauses, reject_unhonored_explain_clauses, reject_unhonored_insert_clauses,
+    reject_unhonored_rollback_clauses, reject_unhonored_start_transaction_clauses, reject_unhonored_update_clauses,
 };
 use crate::SqlResult;
 use crate::{ddl, dml};
@@ -159,8 +158,8 @@ pub(crate) fn execute_statement(
             reject_unhonored_create_table_clauses(create, "CREATE TABLE")?;
             ddl::execute_create_table(client, schema_name, create)
         }
-        Statement::Drop { object_type, names, .. } => {
-            reject_unhonored_drop_clauses(stmt, "DROP")?;
+        Statement::Drop { .. } => {
+            let (object_type, names) = drop_parts(stmt, "DROP")?;
             ddl::execute_drop(client, schema_name, object_type, names)
         }
         Statement::CreateView(cv) => {
@@ -199,10 +198,9 @@ pub(crate) fn execute_statement(
             }
             ddl::execute_alter_table(client, schema_name, a, &mut binder)
         }
-        Statement::AlterView {
-            columns, with_options, ..
-        } => {
-            reject_unhonored_alter_view_clauses(columns, with_options, "ALTER VIEW")?;
+        Statement::AlterView { .. } => {
+            // The clause reject rides in `plan_view`'s narrowing, which is the
+            // one place `AlterView` is destructured.
             let views = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {
                 crate::plan_view(stmt, cat, schema_name)
             })?;

@@ -1,11 +1,8 @@
-use crate::ast_util::{
-    aliased_def, expand_wildcard_item, is_bare_wildcard_projection, is_name_preserving_wildcard_projection,
-    scalar_projection_item,
-};
+use crate::ast_util::{aliased_def, expand_wildcard_item, is_bare_wildcard_projection, scalar_projection_item};
 use crate::bind::bind_single_table;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use crate::validate::reject_duplicate_column_names;
+use crate::validate::reject_duplicate_projection_names;
 use gnitz_core::{null_word_get, null_word_set, ColData, Schema, ZSetBatch};
 use sqlparser::ast::SelectItem;
 
@@ -96,11 +93,7 @@ pub(crate) fn resolve_projection(projection: &[SelectItem], schema: &Schema) -> 
         }
     }
 
-    // Skipped for a projection that names nothing of its own, as the view
-    // compilers skip it: those names are the source's.
-    if !is_name_preserving_wildcard_projection(projection) {
-        reject_duplicate_column_names(&out_defs, "RETURNING")?;
-    }
+    reject_duplicate_projection_names(projection, out_defs.iter(), "RETURNING")?;
 
     // Identity fast-path: every source column projected once, in source order,
     // under its own name. Checked before allocating new_schema — on the common

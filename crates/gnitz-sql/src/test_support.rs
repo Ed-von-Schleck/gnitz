@@ -130,6 +130,26 @@ pub(crate) fn parse_expr_sql(src: &str) -> Expr {
         .unwrap()
 }
 
+/// The first statement of `sql`, parsed via `GenericDialect` — the same dialect
+/// the planner parses with, so a test sees the AST shape the planner receives.
+pub(crate) fn parse_stmt(sql: &str) -> sqlparser::ast::Statement {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+    Parser::parse_sql(&GenericDialect {}, sql)
+        .expect("parses")
+        .into_iter()
+        .next()
+        .expect("one statement")
+}
+
+/// [`parse_stmt`] narrowed to the `Query` it must be.
+pub(crate) fn parse_query(sql: &str) -> sqlparser::ast::Query {
+    match parse_stmt(sql) {
+        sqlparser::ast::Statement::Query(q) => *q,
+        other => panic!("not a query: {other}"),
+    }
+}
+
 /// Non-unique `IndexMeta` list from raw column-index lists.
 pub(crate) fn idx_metas(col_lists: &[&[u32]]) -> Vec<gnitz_core::IndexMeta> {
     let flagged: Vec<(&[u32], bool)> = col_lists.iter().map(|cols| (*cols, false)).collect();
