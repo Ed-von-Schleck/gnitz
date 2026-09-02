@@ -86,7 +86,8 @@ pub(crate) fn bind_ctes(
 }
 
 /// Bind one query body — a single SELECT (linear / join / grouped / DISTINCT) or
-/// a set operation whose sides bind recursively.
+/// a set operation whose sides bind recursively. A parenthesized side is a whole
+/// `Query`, whose envelope is rejected before its body binds.
 pub(crate) fn bind_body(
     cat: &CatalogSnapshot,
     binder: &mut Binder<'_>,
@@ -101,7 +102,7 @@ pub(crate) fn bind_body(
             left,
             right,
         } => bind_set_op(cat, binder, ids, *op, *set_quantifier, left, right),
-        SetExpr::Query(q) => bind_body(cat, binder, ids, q.body.as_ref()),
+        SetExpr::Query(q) => bind_body(cat, binder, ids, reject_query_envelope_body(q, "parenthesized query")?),
         _ => Err(GnitzSqlError::Unsupported(
             "CREATE VIEW only supports SELECT and set operations".to_string(),
         )),

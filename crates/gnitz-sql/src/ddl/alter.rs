@@ -6,11 +6,10 @@
 
 use crate::ast_util::extract_name;
 use crate::bind::{find_unique_column, Binder};
-use crate::error::GnitzSqlError;
+use crate::error::{reject_if, GnitzSqlError};
 use crate::types::{serial_underlying, sql_type_to_typecode};
 use crate::validate::{
-    reject_unhonored_column_options, reject_unhonored_unique_fields, validate_user_index_name, validate_user_name,
-    ColumnOptionSite,
+    reject_unhonored_column_options, reject_unhonored_unique_fields, validate_user_name, ColumnOptionSite,
 };
 use crate::SqlResult;
 use gnitz_core::{GnitzClient, RelClass};
@@ -26,8 +25,8 @@ pub(crate) fn execute_alter_table(
     alter: &AlterTable,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    // Exactly one operation per statement (the multi-op comma form is rejected in
-    // `dispatch` before we get here).
+    // Exactly one operation per statement (the multi-op comma form is rejected by
+    // `reject_unhonored_alter_table_clauses` before we get here).
     match &alter.operations[0] {
         AlterTableOperation::RenameTable { table_name } => {
             // `RENAME TO` and (some dialects') `RENAME AS` both mean rename-to.
@@ -47,15 +46,10 @@ pub(crate) fn execute_alter_table(
             &old_column_name.value,
             &new_column_name.value,
         ),
-        AlterTableOperation::AddConstraint { constraint, not_valid } => add_constraint(
-            client,
-            schema_name,
-            &alter.name,
-            alter.if_exists,
-            constraint,
-            *not_valid,
-            binder,
-        ),
+        AlterTableOperation::AddConstraint { constraint, not_valid } => {
+            reject_if(*not_valid, "ALTER TABLE ADD CONSTRAINT", "NOT VALID")?;
+            add_constraint(client, schema_name, &alter.name, alter.if_exists, constraint, binder)
+        }
         AlterTableOperation::DropConstraint {
             if_exists,
             name,
@@ -69,10 +63,11 @@ pub(crate) fn execute_alter_table(
             *if_exists,
         ),
         AlterTableOperation::DropColumn {
+            // Inert: `DROP c` and `DROP COLUMN c` mean the same thing.
+            has_column_keyword: _,
             column_names,
             if_exists: col_if_exists,
             drop_behavior,
-            ..
         } => drop_column(
             client,
             schema_name,
@@ -88,15 +83,15 @@ pub(crate) fn execute_alter_table(
             if_not_exists,
             column_def,
             column_position,
-        } => add_column(
-            client,
-            schema_name,
-            &alter.name,
-            alter.if_exists,
-            *if_not_exists,
-            column_def,
-            column_position.as_ref(),
-        ),
+        } => {
+            reject_if(*if_not_exists, "ALTER TABLE ADD COLUMN", "IF NOT EXISTS")?;
+            reject_if(
+                column_position.is_some(),
+                "ALTER TABLE ADD COLUMN",
+                "FIRST/AFTER (a column is always appended last)",
+            )?;
+            add_column(client, schema_name, &alter.name, alter.if_exists, column_def)
+        }
         // Destructured per-variant so a newly supported operation is an additive
         // arm split, and with no plan path in any message.
         AlterTableOperation::AlterColumn { column_name, op } => {
@@ -183,30 +178,17 @@ fn rename_column(
 /// the dependent-view RESTRICT and the trailing-position, `MAX_COLUMNS` and
 /// field-shape checks are enforced engine-side.
 ///
-/// Everything that would need a value for the existing rows, a second catalog
-/// object, or a physical move is rejected: NOT NULL (it would need a full-table
-/// validation scan), SERIAL, the options `execute_create_table` already rejects
-/// (DEFAULT, CHECK, GENERATED, IDENTITY, COLLATE, …), inline PRIMARY KEY /
-/// UNIQUE / REFERENCES, and the MySQL FIRST/AFTER placement.
+/// Everything that would need a value for the existing rows or a second catalog
+/// object is rejected: NOT NULL (it would need a full-table validation scan),
+/// SERIAL, the options `execute_create_table` already rejects (DEFAULT, CHECK,
+/// GENERATED, IDENTITY, COLLATE, …), and inline PRIMARY KEY / UNIQUE / REFERENCES.
 fn add_column(
     client: &mut GnitzClient,
     schema_name: &str,
     source: &ObjectName,
     tbl_if_exists: bool,
-    if_not_exists: bool,
     column_def: &sqlparser::ast::ColumnDef,
-    column_position: Option<&sqlparser::ast::MySQLColumnPosition>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    if if_not_exists {
-        return Err(GnitzSqlError::Unsupported(
-            "ALTER TABLE ADD COLUMN IF NOT EXISTS is not supported".to_string(),
-        ));
-    }
-    if column_position.is_some() {
-        return Err(GnitzSqlError::Unsupported(
-            "ALTER TABLE ADD COLUMN … FIRST/AFTER is not supported (a column is always appended last)".to_string(),
-        ));
-    }
     reject_unhonored_column_options(column_def, "ADD COLUMN", ColumnOptionSite::AddColumn)?;
     // A SERIAL column's generator is seeded from the table's live rows, which an
     // append has none of; named here so it does not fall out as "unsupported type".
@@ -338,22 +320,15 @@ fn drop_not_null(
 
 /// `ALTER TABLE <t> ADD CONSTRAINT [n] UNIQUE (cols)` — maps to the CREATE UNIQUE
 /// INDEX path, returning `IndexCreated { index_id }` (uniform create surface).
-/// Only a `UNIQUE` constraint is honored; `NOT VALID` and every other constraint
-/// kind are rejected.
+/// Only a `UNIQUE` constraint is honored; every other constraint kind is rejected.
 fn add_constraint(
     client: &mut GnitzClient,
     schema_name: &str,
     source: &ObjectName,
     if_exists: bool,
     constraint: &TableConstraint,
-    not_valid: bool,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    if not_valid {
-        return Err(GnitzSqlError::Unsupported(
-            "ADD CONSTRAINT ... NOT VALID is not supported".to_string(),
-        ));
-    }
     let TableConstraint::Unique(u) = constraint else {
         return Err(GnitzSqlError::Unsupported(
             "ADD CONSTRAINT: only UNIQUE constraints are supported".to_string(),
@@ -394,7 +369,7 @@ fn drop_constraint(
     name: &str,
     constraint_if_exists: bool,
 ) -> Result<SqlResult, GnitzSqlError> {
-    validate_user_index_name(name)?;
+    validate_user_name(name)?;
     let source_name = extract_name(source, "ALTER TABLE")?;
     if !alter_base_table_exists(client, schema_name, &source_name, tbl_if_exists, "DROP CONSTRAINT")? {
         return Ok(altered("constraint", name.to_string()));

@@ -765,3 +765,39 @@ fn test_set_op_distinct_join_free_circuit_shape() {
         );
     }
 }
+
+#[test]
+fn test_parenthesized_side_envelope_rejected() {
+    // A parenthesized set-op side is a whole `Query`; its envelope (LIMIT, ORDER BY,
+    // a nested WITH) has no circuit operator and must reject, never be dropped.
+    let Some(srv) = ServerHandle::start() else { return };
+    let (mut c, sn) = make_planner(&srv);
+    exec(&mut c, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT NOT NULL)");
+    // Control: an envelope-free parenthesized side compiles (same-table UNION is
+    // accepted, as `test_same_table_union_distinct_accepted_and_correct` pins).
+    exec(
+        &mut c,
+        &sn,
+        "CREATE VIEW ok AS (SELECT a FROM t WHERE a > 0) UNION SELECT a FROM t",
+    );
+    for (sql, clause) in [
+        (
+            "CREATE VIEW v AS (SELECT a FROM t LIMIT 1) UNION SELECT a FROM t",
+            "LIMIT/OFFSET",
+        ),
+        (
+            "CREATE VIEW v AS SELECT a FROM t UNION (SELECT a FROM t ORDER BY a)",
+            "ORDER BY",
+        ),
+        (
+            "CREATE VIEW v AS (WITH c AS (SELECT a FROM t) SELECT a FROM c) UNION SELECT a FROM t",
+            "WITH (CTE)",
+        ),
+    ] {
+        assert_rejects_variant(&mut c, &sn, sql, "Unsupported", clause);
+        assert!(
+            c.resolve_table_or_view_id(&sn, "v").is_err(),
+            "`{sql}` must register nothing"
+        );
+    }
+}

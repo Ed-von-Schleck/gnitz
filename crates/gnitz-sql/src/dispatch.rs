@@ -187,15 +187,6 @@ pub(crate) fn execute_statement(
         }
         Statement::AlterTable(a) => {
             reject_unhonored_alter_table_clauses(a, "ALTER TABLE")?;
-            // Exactly one operation per statement; a comma-separated multi-op ALTER
-            // is rejected (each op has distinct commit/validation needs, and DROP
-            // COLUMN's `column_names: Vec<Ident>` already collapses `DROP a, b` into
-            // one operation — so this only rejects genuinely separate operations).
-            if a.operations.len() != 1 {
-                return Err(GnitzSqlError::Unsupported(
-                    "ALTER TABLE with multiple comma-separated operations is not supported".to_string(),
-                ));
-            }
             ddl::execute_alter_table(client, schema_name, a, &mut binder)
         }
         Statement::AlterView { .. } => {

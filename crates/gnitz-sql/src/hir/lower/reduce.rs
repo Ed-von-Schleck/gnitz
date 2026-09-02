@@ -83,7 +83,14 @@ pub(crate) fn lower_reduce(
         .transpose()?;
     let source_tid = source.tid;
     let (reduce_in, reduce_in_layout) = match &pre {
-        Some(p) => (crate::hir::chain::schema_of(&p.out_cols, p.pk_arity), &p.layout),
+        Some(p) => (
+            crate::hir::chain::schema_of(
+                &p.out_cols,
+                p.pk_arity,
+                "GROUP BY over a computed key or aggregate argument",
+            )?,
+            &p.layout,
+        ),
         None => (Arc::clone(&source.schema), &source.layout),
     };
 
@@ -102,7 +109,7 @@ pub(crate) fn lower_reduce(
     let source_replicated = source.desc.as_ref().is_some_and(|d| d.replicated);
     let shape = ReduceShape::new(&reduce_in, &group_positions, &specs, source_replicated);
     let out_key = shape.out_key;
-    let (reduce_schema, agg_col_offset) = reduce_output_schema(&shape);
+    let (reduce_schema, agg_col_offset) = reduce_output_schema(&shape)?;
     let pk_len = reduce_schema.pk_cols.len();
 
     // Circuit: input delta + optional WHERE.

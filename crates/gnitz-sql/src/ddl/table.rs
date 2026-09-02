@@ -8,7 +8,7 @@ use crate::types::{int_domain_fits, is_integer_type, serial_underlying, sql_type
 use crate::validate::{
     canonical_user_name, default_index_name, disambiguate_index_name, non_key_eligible_error, reject_duplicate_names,
     reject_unbuildable_index_key, reject_unhonored_column_options, reject_unhonored_table_constraints,
-    validate_user_index_name, validate_user_name, ColumnOptionSite,
+    validate_user_name, ColumnOptionSite,
 };
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, InlineUniqueIndex, TableProps, TypeCode};
@@ -418,7 +418,7 @@ pub(crate) fn execute_create_table(
             }
             let constraint_name = name_ident.as_ref().map(|n| n.value.clone());
             if let Some(ref name) = constraint_name {
-                validate_user_index_name(name)?;
+                validate_user_name(name)?;
             }
             unique_cols.push((col_indices, constraint_name));
         }
@@ -602,7 +602,7 @@ pub(crate) fn execute_drop(
                 // Mirror CREATE INDEX's name rule: a clearer planner-side
                 // error, one fewer round-trip — the engine's own internal-index
                 // drop refusal stays the backstop.
-                validate_user_index_name(&name)?;
+                validate_user_name(&name)?;
                 // Plain DROP INDEX drops loudly (like DROP TABLE/VIEW); only
                 // ALTER TABLE ... DROP CONSTRAINT IF EXISTS passes `true`.
                 client.drop_index_by_name(&name, false)?;
@@ -657,7 +657,7 @@ pub(crate) fn create_index_core(
     // `DROP INDEX`/`DROP CONSTRAINT <name>` resolves it. Validate it before
     // anything else: a malformed name would persist and be undroppable.
     if let Some(ref name) = explicit_name {
-        validate_user_index_name(name)?;
+        validate_user_name(name)?;
     }
 
     if columns.is_empty() {

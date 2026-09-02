@@ -133,7 +133,7 @@ pub(crate) fn resolve_set_projection(
     if is_bare_wildcard_projection(projection) {
         let (indices, cols): (Vec<usize>, Vec<ColumnDef>) =
             source_schema.visible_columns().map(|(i, c)| (i, c.clone())).unzip();
-        reject_float_keys(source_schema, &indices)?;
+        reject_float_keys(indices.iter().map(|&i| &source_schema.columns[i]), context)?;
         return Ok((indices, cols));
     }
     let mut indices: Vec<usize> = Vec::new();
@@ -163,6 +163,6 @@ pub(crate) fn resolve_set_projection(
     // Single chokepoint: every projected column lands in `indices`, so one pass
     // here rejects a float row-identity key regardless of which SELECT-item arm
     // produced it (a new arm is covered automatically).
-    reject_float_keys(source_schema, &indices)?;
+    reject_float_keys(indices.iter().map(|&i| &source_schema.columns[i]), context)?;
     Ok((indices, out_cols))
 }

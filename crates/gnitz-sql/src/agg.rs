@@ -13,7 +13,7 @@ use crate::bind::fold_null_test;
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr, BinOp};
 use crate::types::has_scalar_register;
-use gnitz_core::{ColumnDef, ReduceOutKey, Schema, TypeCode, MAX_COLUMNS};
+use gnitz_core::{ColumnDef, ReduceOutKey, Schema, TypeCode};
 use gnitz_wire::{AggFunc as WireAggFunc, ReduceOutSlot};
 
 /// How an aggregate's value column is finalized — which also fixes how many
@@ -132,42 +132,16 @@ pub(crate) fn synthetic_fold_cols(
     cols
 }
 
-/// The one width invariant bounding a fold plan: the partial reply layout
-/// [`synthetic_fold_cols`] builds must be a legal schema. Wider (e.g. many
-/// repeated aggregates) than the column limit has no fold reply layout — a
-/// feature limit of the direct path, which a view, whose reduce output never
-/// crosses the wire as one reply, does not have.
-///
-/// Called ahead of building that schema, not after: `Schema::from_parts` applies
-/// the same column cap, so a later check could never fire and the caller would
-/// report a generic invalid-schema message instead of the limit's own.
-fn reject_wide_fold(n_group: usize, n_aggs: usize) -> Result<(), GnitzSqlError> {
-    if 1 + n_group + n_aggs > MAX_COLUMNS {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "aggregate SELECT with {} group + aggregate columns exceeds the {MAX_COLUMNS}-column fold reply limit",
-            n_group + n_aggs
-        )));
-    }
-    Ok(())
-}
-
 /// The ad-hoc fold's partial reply schema — the one home for "what the workers
 /// emit and the client decodes", built for a grouped reduce and for the
 /// degenerate `SELECT DISTINCT` fold alike.
-///
-/// The width gate is folded in rather than left to the callers, because it has
-/// to run *before* `from_parts` (which applies the same column cap and would
-/// otherwise answer first, with a generic invalid-schema message instead of the
-/// feature limit's own) — an ordering that is easy to get wrong once per call
-/// site and impossible to get wrong here.
 pub(crate) fn fold_partial_schema(
     reduce_in: &Schema,
     group_positions: &[usize],
     agg_specs: &[AggSpec],
 ) -> Result<Schema, GnitzSqlError> {
-    reject_wide_fold(group_positions.len(), agg_specs.len())?;
     Schema::from_parts(synthetic_fold_cols(reduce_in, group_positions, agg_specs), vec![0])
-        .map_err(|e| GnitzSqlError::Unsupported(format!("ad-hoc aggregate reply schema is invalid: {e}")))
+        .map_err(|e| GnitzSqlError::Unsupported(format!("aggregate SELECT partial-reply layout: {e}")))
 }
 
 /// The raw reduce column's nullability for one physical spec, via the shared
@@ -227,8 +201,10 @@ impl<'a> ReduceShape<'a> {
 /// by construction rather than by mirroring. The aggregate columns trail it at
 /// the output type `push_agg_specs` computed per spec (float SUM/MIN/MAX → F64,
 /// MIN/MAX preserve the source type, SUM/COUNT* → I64). One home for the view
-/// path and the HIR reduce shell.
-pub(crate) fn reduce_output_schema(sh: &ReduceShape<'_>) -> (Schema, usize) {
+/// path and the HIR reduce shell. The width is gated here, at the planner, so an
+/// over-wide reduce output (many aggregates the finalize projection narrows again)
+/// is a feature-limit error rather than the engine's trust-boundary rejection.
+pub(crate) fn reduce_output_schema(sh: &ReduceShape<'_>) -> Result<(Schema, usize), GnitzSqlError> {
     let (source_schema, agg_specs) = (sh.source_schema, sh.specs);
     let is_global = sh.global_ground();
     let (mut columns, pk_cols) = reduce_out_key_region(sh.out_key, source_schema, sh.group_cols);
@@ -238,7 +214,9 @@ pub(crate) fn reduce_output_schema(sh: &ReduceShape<'_>) -> (Schema, usize) {
             .map(|s| ColumnDef::new("_agg", s.out_type, agg_raw_nullable(source_schema, s, is_global))),
     );
     let agg_col_offset = columns.len() - agg_specs.len();
-    (Schema { columns, pk_cols }, agg_col_offset)
+    let schema = Schema::from_parts(columns, pk_cols)
+        .map_err(|e| GnitzSqlError::Unsupported(format!("GROUP BY output: {e}")))?;
+    Ok((schema, agg_col_offset))
 }
 
 /// Emit the reduce operator(s) for a group set — the two-phase / replicated /

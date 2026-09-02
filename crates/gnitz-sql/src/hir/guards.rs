@@ -6,7 +6,7 @@
 
 use super::JoinType;
 use crate::error::GnitzSqlError;
-use crate::validate::reject_float_key;
+use crate::validate::reject_float_keys;
 use gnitz_core::{ColumnDef, RangeRel, TypeCode};
 use sqlparser::ast::{Expr, JoinConstraint, JoinOperator};
 
@@ -163,9 +163,7 @@ pub(crate) fn reject_pure_range_threshold_tc(
 /// a cross-sign pair whose unsigned side is 128-bit (`U128`/`UUID`) stays
 /// rejected — its faithful common type is a signed-256 type that does not exist.
 pub(crate) fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCode, GnitzSqlError> {
-    for col in [left, right] {
-        reject_float_key(col, "JOIN ON")?;
-    }
+    reject_float_keys([left, right], "JOIN ON")?;
     // STRING/BLOB reindex to a 16-byte XXH3 content hash; U128/UUID reindex to the
     // 16-byte native value. Both collapse to the U128 output type, so
     // `join_key_common_type` cannot tell them apart — but a content hash never

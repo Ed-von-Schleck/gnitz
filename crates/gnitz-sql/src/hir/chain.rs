@@ -95,12 +95,14 @@ pub(crate) fn debug_assert_exchange_topology(circuit: &Circuit) {
 }
 
 /// A `Schema` from emitted pieces: the output columns, of which the leading
-/// [`PkArity`] are the PK region.
-pub(crate) fn schema_of(cols: &[ColumnDef], pk: PkArity) -> Arc<Schema> {
-    Arc::new(Schema {
-        columns: cols.to_vec(),
-        pk_cols: (0..pk).collect(),
-    })
+/// [`PkArity`] are the PK region. Runs the shared admissibility rules
+/// (`Schema::from_parts`) here, where `what` names the stage, instead of leaving
+/// them to the DDL gateway — whose verdict is identical but names only a segment
+/// index, and which the ad-hoc fold's pre-map never reaches.
+pub(crate) fn schema_of(cols: &[ColumnDef], pk: PkArity, what: &str) -> Result<Arc<Schema>, GnitzSqlError> {
+    Schema::from_parts(cols.to_vec(), (0..pk).collect())
+        .map(Arc::new)
+        .map_err(|e| GnitzSqlError::Unsupported(format!("{what}: {e}")))
 }
 
 /// The in-flight CREATE VIEW bundle: the hidden segments compiled so far plus
@@ -147,7 +149,7 @@ impl ViewChain {
         let seg = self.mint();
         let ((circuit, cols, pk), extra) = emit(self)?;
         debug_assert_exchange_topology(&circuit);
-        let schema = schema_of(&cols, pk);
+        let schema = schema_of(&cols, pk, "view segment output")?;
         self.push_hidden(seg, cols, pk, circuit);
         Ok((segment_id(seg as u64), schema, extra))
     }

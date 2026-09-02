@@ -22,7 +22,7 @@ use crate::agg::{fold_partial_schema, group_col_reduce_pos, AggSpec};
 use crate::codec::project_schema::{compile_projection_map, declared_out_cols};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
-use gnitz_core::{ColumnDef, ReduceOutKey, Schema, MAX_COLUMNS};
+use gnitz_core::{ColumnDef, ReduceOutKey, Schema};
 use std::sync::Arc;
 
 /// Everything an ad-hoc grouped read needs, in layout terms: what the workers
@@ -98,21 +98,16 @@ pub(crate) fn lower_fold(rel: &RelExpr, source_schema: &Arc<Schema>) -> Result<F
         .map(|its| physical::physicalize_projection(its, &base_layout, source_schema))
         .transpose()?;
     let (reduce_schema, reduce_layout) = match &pre {
-        Some(p) => (schema_of(&p.out_cols, p.pk_arity), &p.layout),
+        Some(p) => (
+            schema_of(
+                &p.out_cols,
+                p.pk_arity,
+                "GROUP BY over a computed key or aggregate argument",
+            )?,
+            &p.layout,
+        ),
         None => (Arc::clone(source_schema), &base_layout),
     };
-    // A pre-map is the source's columns *plus* the computed ones, so a source
-    // already near the limit can push the reduce input past it. Gated here, where
-    // the shape is chosen, so it reads as the feature limit it is; the worker
-    // rejects the same width too, but only as a trust boundary on a frame no
-    // planner should have sent.
-    if reduce_schema.columns.len() > MAX_COLUMNS {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "GROUP BY over a computed key or aggregate argument needs {} columns, \
-             which exceeds the {MAX_COLUMNS}-column limit",
-            reduce_schema.columns.len()
-        )));
-    }
 
     let ReduceSpecs {
         group_positions,

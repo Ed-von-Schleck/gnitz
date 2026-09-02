@@ -289,7 +289,7 @@ fn unsupported_alter_operations_rejected() {
         &mut c,
         &sn,
         "ALTER TABLE t RENAME COLUMN a TO a2, RENAME COLUMN b TO b2",
-        "multiple",
+        "more than one operation",
     );
     // ONLY.
     reject_contains(&mut c, &sn, "ALTER TABLE ONLY t RENAME TO t2", "ONLY");

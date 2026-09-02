@@ -21,7 +21,7 @@
 //! `HonoredQueryClauses`.
 
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
-use gnitz_core::{ColumnDef, Schema, TypeCode};
+use gnitz_core::{ColumnDef, TypeCode};
 
 /// The column def of a *computed* projection item, from the expression's
 /// nominal type. One home for the three rules every computed column obeys, so
@@ -85,11 +85,12 @@ pub(crate) fn reject_duplicate_names<'a>(
     Ok(())
 }
 
-/// Validate a user-supplied table/view/schema name: reject the empty string,
-/// a leading `_` (reserved for the engine's own internal relation and index
-/// names), and any character outside `[A-Za-z0-9_]`. CREATE
+/// Validate a user-supplied table/view/schema/index/constraint name: reject the
+/// empty string, a leading `_` (reserved for the engine's own internal relation
+/// and index names), and any character outside `[A-Za-z0-9_]`. CREATE
 /// TABLE/VIEW and DROP TABLE/VIEW all funnel through it right after
-/// `extract_name`.
+/// `extract_name`, as do CREATE/DROP INDEX and the UNIQUE constraint names that
+/// become index names.
 ///
 /// This is *policy*: the leading-`_` reservation is what makes the engine's own
 /// internal names (`gnitz_core::segment_name`, `make_fk_index_name`)
@@ -97,14 +98,6 @@ pub(crate) fn reject_duplicate_names<'a>(
 /// those rows.
 pub(crate) fn validate_user_name(name: &str) -> Result<(), GnitzSqlError> {
     gnitz_core::validate_user_identifier(name).map_err(GnitzSqlError::Plan)
-}
-
-/// Validate a user-supplied name destined to become an index name — a CREATE
-/// INDEX name or a UNIQUE/constraint name that maps to a secondary index. The
-/// rules are exactly the general identifier rules; the alias exists so the
-/// index surfaces name what they are validating.
-pub(crate) fn validate_user_index_name(name: &str) -> Result<(), GnitzSqlError> {
-    validate_user_name(name)
 }
 
 /// [`validate_user_name`] returning the canonical stored form. The one fold a
@@ -161,13 +154,14 @@ pub(crate) fn reject_float_key(col: &ColumnDef, role: &str) -> Result<(), GnitzS
     Ok(())
 }
 
-/// Reject any float column among `indices` as a row-identity key. See
-/// [`reject_float_key`] for why floats break set/DISTINCT membership.
-pub(crate) fn reject_float_keys(source_schema: &Schema, indices: &[usize]) -> Result<(), GnitzSqlError> {
-    for &ci in indices {
-        reject_float_key(&source_schema.columns[ci], "SELECT DISTINCT / set operation")?;
-    }
-    Ok(())
+/// [`reject_float_key`] over every column of one hashed row identity — a
+/// DISTINCT/set-op row, a join-key pair — so a caller assembling the key from
+/// several columns has one call, not a loop.
+pub(crate) fn reject_float_keys<'a>(
+    cols: impl IntoIterator<Item = &'a ColumnDef>,
+    role: &str,
+) -> Result<(), GnitzSqlError> {
+    cols.into_iter().try_for_each(|c| reject_float_key(c, role))
 }
 
 /// Reject an index key the engine could not build — the whole gate both
@@ -381,7 +375,8 @@ impl HonoredQueryClauses {
 /// This is the crate's single exhaustive `Query` destructure (no `..`): a future `sqlparser`
 /// field stops the build here until it is classified, converting a silent-drop-on-upgrade into a
 /// compile error. Every narrowing site funnels through it (direct SELECT and the INSERT source
-/// directly, the sub-query sites via [`plain_select_body`]), so no per-site list can drift.
+/// directly, the sub-query sites via [`plain_select_body`], the parenthesized set-op side in
+/// `hir::bind::bind_body` via [`reject_query_envelope_body`]), so no per-site list can drift.
 pub(crate) fn reject_unhonored_query_clauses(
     query: &sqlparser::ast::Query,
     honored: HonoredQueryClauses,
@@ -675,7 +670,7 @@ pub(crate) fn drop_parts<'a>(
         table,
     } = stmt
     else {
-        return Err(GnitzSqlError::Bind("not a DROP statement".to_string()));
+        return Err(GnitzSqlError::Internal("not a DROP statement".to_string()));
     };
     reject_if(*cascade, context, "CASCADE")?;
     reject_if(*restrict, context, "RESTRICT")?;
@@ -709,7 +704,7 @@ pub(crate) fn reject_unhonored_explain_clauses(
         options,
     } = stmt
     else {
-        return Err(GnitzSqlError::Bind("not an EXPLAIN statement".to_string()));
+        return Err(GnitzSqlError::Internal("not an EXPLAIN statement".to_string()));
     };
     reject_if(*analyze, context, "ANALYZE")?;
     reject_if(*verbose, context, "VERBOSE")?;
@@ -747,7 +742,7 @@ pub(crate) fn reject_unhonored_start_transaction_clauses(
         has_end_keyword: _,
     } = stmt
     else {
-        return Err(GnitzSqlError::Bind("not a START TRANSACTION statement".to_string()));
+        return Err(GnitzSqlError::Internal("not a START TRANSACTION statement".to_string()));
     };
     reject_if(
         !modes.is_empty(),
@@ -776,7 +771,7 @@ pub(crate) fn reject_unhonored_commit_clauses(
         modifier,
     } = stmt
     else {
-        return Err(GnitzSqlError::Bind("not a COMMIT statement".to_string()));
+        return Err(GnitzSqlError::Internal("not a COMMIT statement".to_string()));
     };
     reject_if(*chain, context, "AND CHAIN")?;
     reject_if(modifier.is_some(), context, "a COMMIT modifier (TRY / CATCH)")?;
@@ -793,7 +788,7 @@ pub(crate) fn reject_unhonored_rollback_clauses(
     context: &str,
 ) -> Result<(), GnitzSqlError> {
     let sqlparser::ast::Statement::Rollback { chain, savepoint } = stmt else {
-        return Err(GnitzSqlError::Bind("not a ROLLBACK statement".to_string()));
+        return Err(GnitzSqlError::Internal("not a ROLLBACK statement".to_string()));
     };
     reject_if(*chain, context, "AND CHAIN")?;
     reject_if(savepoint.is_some(), context, "TO SAVEPOINT")?;
@@ -1027,6 +1022,15 @@ fn reject_unhonored_fk_fields(fk: &sqlparser::ast::ForeignKeyConstraint, context
         "FOREIGN KEY ON DELETE/ON UPDATE action",
     )?;
     reject_if(match_kind.is_some(), context, "FOREIGN KEY MATCH")?;
+    reject_constraint_characteristics(characteristics, context)
+}
+
+/// Constraint characteristics (`DEFERRABLE …`) are semantics gnitz does not
+/// implement; every constraint kind that can carry them rejects them here.
+fn reject_constraint_characteristics(
+    characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>,
+    context: &str,
+) -> Result<(), GnitzSqlError> {
     reject_if(
         characteristics.is_some(),
         context,
@@ -1119,11 +1123,7 @@ fn reject_index_constraint_extras(
     context: &str,
 ) -> Result<(), GnitzSqlError> {
     reject_index_type_and_options(index_type, index_options, context)?;
-    reject_if(
-        characteristics.is_some(),
-        context,
-        "constraint characteristics (DEFERRABLE …)",
-    )
+    reject_constraint_characteristics(characteristics, context)
 }
 
 /// Which site is walking a column definition, and so which constraint-bearing
@@ -1150,10 +1150,7 @@ pub(crate) fn reject_unhonored_column_options(
 ) -> Result<(), GnitzSqlError> {
     use sqlparser::ast::ColumnOption as O;
     // Consumed at CREATE TABLE, unhonored at ADD COLUMN.
-    let honored = |clause: &str| match site {
-        ColumnOptionSite::CreateTable => Ok(()),
-        ColumnOptionSite::AddColumn => Err(unsupported_clause(context, clause)),
-    };
+    let honored = |clause: &str| reject_if(site == ColumnOptionSite::AddColumn, context, clause);
     for opt in &col.options {
         match &opt.option {
             // A new column over existing rows is nullable either way, so bare
@@ -1228,17 +1225,17 @@ pub(crate) fn reject_unhonored_table_constraints(
 /// Reject every `ALTER TABLE` envelope clause gnitz does not honor: `ONLY`
 /// (silently scopes out partition children), a Hive `SET LOCATION`, `ON CLUSTER`,
 /// and a non-`None` `table_type` (Iceberg/Dynamic — a different storage engine).
-/// The single operation (comma-count enforced by the caller) is dispatched in
-/// `ddl::alter`. Exhaustive destructure (no `..`): a future sqlparser field
-/// stops the build until it is classified.
+/// The single operation — this guard enforces exactly one per statement — is
+/// dispatched in `ddl::alter`. Exhaustive destructure (no `..`): a future
+/// sqlparser field stops the build until it is classified.
 pub(crate) fn reject_unhonored_alter_table_clauses(
     alter: &sqlparser::ast::AlterTable,
     context: &str,
 ) -> Result<(), GnitzSqlError> {
     let sqlparser::ast::AlterTable {
-        // Consumed by the dispatcher.
+        // Consumed by the dispatcher, one per statement.
         name: _,
-        operations: _,
+        operations,
         if_exists: _,
         // Inert: the statement-terminator token.
         end_token: _,
@@ -1248,6 +1245,9 @@ pub(crate) fn reject_unhonored_alter_table_clauses(
         on_cluster,
         table_type,
     } = alter;
+    // DROP COLUMN's `column_names: Vec<Ident>` already collapses `DROP a, b` into one
+    // operation, so this rejects only genuinely separate comma-joined operations.
+    reject_if(operations.len() != 1, context, "more than one operation per statement")?;
     reject_if(*only, context, "ONLY")?;
     reject_if(location.is_some(), context, "SET LOCATION")?;
     reject_if(on_cluster.is_some(), context, "ON CLUSTER")?;
@@ -1279,7 +1279,7 @@ pub(crate) fn alter_view_parts<'a>(
         with_options,
     } = stmt
     else {
-        return Err(GnitzSqlError::Bind("not an ALTER VIEW statement".to_string()));
+        return Err(GnitzSqlError::Internal("not an ALTER VIEW statement".to_string()));
     };
     reject_if(!columns.is_empty(), context, "output column aliases")?;
     reject_if(!with_options.is_empty(), context, "WITH options")?;

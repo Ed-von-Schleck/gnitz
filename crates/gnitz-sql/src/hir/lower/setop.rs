@@ -13,7 +13,7 @@ use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::physical;
 use crate::ir::{BExpr, BoundExpr};
-use crate::validate::{reject_duplicate_column_names, reject_float_key};
+use crate::validate::{reject_duplicate_column_names, reject_float_keys};
 use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, TypeCode};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -36,9 +36,7 @@ pub(crate) fn lower_setop(
     };
 
     // A float set-identity column breaks content-hash equality (IEEE-754).
-    for c in out {
-        reject_float_key(&c.out.def, "set operation")?;
-    }
+    reject_float_keys(out.iter().map(|c| &c.out.def), "set operation")?;
 
     // Promotion targets, stamped per pair by `RelExpr::set_op`.
     let left_tt: Vec<u8> = out.iter().map(|c| c.left_target).collect();
@@ -99,9 +97,7 @@ pub(crate) fn lower_distinct(
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     let side_cols = input.cols();
     // A float set-identity column breaks content-hash equality (IEEE-754).
-    for c in &side_cols {
-        reject_float_key(&c.def, "SELECT DISTINCT")?;
-    }
+    reject_float_keys(side_cols.iter().map(|c| &c.def), "SELECT DISTINCT")?;
     let side_ids: Vec<ColId> = side_cols.iter().map(|c| c.id).collect();
     let mut cb = CircuitBuilder::new(0);
     let (seg, kind) = resolve_set_input(chain, memo, input, &side_ids)?;

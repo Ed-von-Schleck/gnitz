@@ -297,7 +297,10 @@ impl Schema {
     /// round-trip through the codec.
     pub fn validate_parts(pk_cols: &[u32], columns: &[ColumnDef]) -> Result<(), String> {
         if columns.len() > MAX_COLUMNS {
-            return Err("column count exceeds MAX_COLUMNS".into());
+            return Err(format!(
+                "column count {} exceeds MAX_COLUMNS ({MAX_COLUMNS})",
+                columns.len()
+            ));
         }
         gnitz_wire::validate_pk_indices(pk_cols, columns.len()).map_err(|r| r.to_string())?;
         gnitz_wire::validate_pk_column_types(pk_cols, |c| {

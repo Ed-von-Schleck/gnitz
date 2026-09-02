@@ -51,7 +51,7 @@ fn validate_parts_enforces_full_rule_set() {
         .collect();
     assert_eq!(
         Schema::validate_parts(&[0], &wide).unwrap_err(),
-        "column count exceeds MAX_COLUMNS"
+        format!("column count {} exceeds MAX_COLUMNS ({MAX_COLUMNS})", MAX_COLUMNS + 1)
     );
     assert!(Schema::validate_parts(&[0], &wide[..MAX_COLUMNS]).is_ok());
 }
