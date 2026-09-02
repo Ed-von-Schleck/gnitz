@@ -2,7 +2,7 @@
 //! reclamation, invalid-view reset — and the flushed-LSN bookkeeping that
 //! recovery and the DDL zone allocator read.
 
-use super::{RelationKind, RelationRegistry, StoreHandle};
+use super::{RelationKind, RelationRegistry, RelationStores, StoreHandle};
 use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr};
 
 impl RelationRegistry {
@@ -10,19 +10,19 @@ impl RelationRegistry {
 
     /// Detach every user relation's store (master after fork), so master and
     /// worker 0 do not both hold a live `Table` on `w0of{W}`: two processes
-    /// writing one directory is the hazard `naming.rs` exists to prevent. System
-    /// tables keep their `Borrowed` handles, so the filter is the handle.
+    /// writing one directory is the hazard `naming.rs` exists to prevent. The
+    /// system families are single-partition and are the catalog the master goes
+    /// on serving from, so they are excluded — by kind, which is what says so.
     pub fn detach_user_stores(&mut self) {
         self.owns_stores = false;
         for entry in self.tables.values_mut() {
-            if !matches!(entry.handle, StoreHandle::Borrowed(_)) {
-                entry.handle = StoreHandle::Detached;
+            if entry.kind == RelationKind::SystemCatalog {
+                continue;
             }
-            // A fed view's delta store goes too. The pre-fork master builds one at
-            // `ChildAddr::Delta { rank: 0 }` during boot replay, and worker 0 homes
-            // its own there — so leaving it would have two processes holding a live
-            // `Table` on one directory, which is what this whole function prevents.
-            entry.delta = None;
+            // The delta store goes with it: the pre-fork master builds one at
+            // `Delta { rank: 0 }` and worker 0 homes its own there, so keeping it
+            // would put two live `Table`s on one directory.
+            entry.set_stores(RelationStores::detached());
             // And every index circuit, which the master would otherwise keep live
             // and permanently empty — it reads only their metadata.
             for ic in &mut entry.index_circuits {
@@ -62,9 +62,12 @@ impl RelationRegistry {
             .tables
             .iter()
             .filter(|(_, e)| {
-                e.handle
-                    .as_owned()
-                    .is_some_and(|t| t.directory() != home.dir(&e.directory))
+                // A system family is single-partition — its store is flat, never
+                // at a `w{k}of{n}` child — so the address test would match it.
+                e.kind != RelationKind::SystemCatalog
+                    && e.handle
+                        .as_owned()
+                        .is_some_and(|t| t.directory() != home.dir(&e.directory))
             })
             .map(|(&tid, _)| tid)
             .collect();
@@ -88,15 +91,13 @@ impl RelationRegistry {
             let e = self
                 .tables
                 .get(&tid)
-                .ok_or_else(|| format!("{what}: relation {tid} not registered"))?;
+                .ok_or_else(|| format!("{what}: relation {tid} is not registered"))?;
             (e.directory.clone(), e.schema, e.kind, e.budgets)
         };
         let stores = self
             .build_relation_store(kind, &dir, tid, schema, budgets)
             .map_err(|e| format!("{what} tid={tid}: {e}"))?;
-        let entry = self.tables.get_mut(&tid).expect("entry read above");
-        entry.handle = stores.handle;
-        entry.delta = stores.delta;
+        self.tables.get_mut(&tid).expect("entry read above").set_stores(stores);
         Ok(())
     }
 
@@ -112,8 +113,8 @@ impl RelationRegistry {
     pub fn reconcile_child_dirs(&self) {
         self.assert_pre_fork("reconcile_child_dirs");
         for entry in self.tables.values() {
-            // System tables are `Borrowed` single `Table`s with no children.
-            if matches!(entry.handle, StoreHandle::Borrowed(_)) {
+            // System tables are single-partition `Table`s with no children.
+            if entry.kind == RelationKind::SystemCatalog {
                 continue;
             }
             // A storeless relation's `directory` names a path that was never created;
@@ -136,7 +137,7 @@ impl RelationRegistry {
         let dir = self
             .tables
             .get(&vid)
-            .ok_or_else(|| format!("reset_store: relation {vid} not registered"))?
+            .ok_or_else(|| format!("reset_store: relation {vid} is not registered"))?
             .directory
             .clone();
 
@@ -159,9 +160,9 @@ impl RelationRegistry {
     }
 
     /// Every registered relation's `(table id, kind, current_lsn)` — the one walk
-    /// behind both the recovery dedup maps and the zone-allocator floor. A system
-    /// family's registry handle is a `Borrowed` re-export of its `sys_stores`
-    /// box, so this reads the same counter its own store would report.
+    /// behind both the recovery dedup maps and the zone-allocator floor. The
+    /// registry owns a system family's store exactly as it owns a user
+    /// relation's, so one walk covers both bands.
     fn all_store_lsns(&self) -> impl Iterator<Item = (i64, RelationKind, u64)> + '_ {
         self.tables
             .iter()

@@ -1,4 +1,5 @@
-//! Relation directory naming and the data-directory lock.
+//! Relation directory naming, crash-safe staging of a directory a create makes,
+//! and the data-directory lock.
 //!
 //! Every directory a relation registration itself names is *built* and *parsed
 //! back* here, so the creation path and the orphan sweeps can never disagree on
@@ -33,7 +34,9 @@ pub fn is_table_dir_name(name: &str) -> bool {
     name.rsplit_once('_').is_some_and(|(_, id)| has_numeric_id(id))
 }
 
-/// A directory-name id component: non-empty and all ASCII digits.
+/// A directory-name id component: non-empty and all ASCII digits. Storage's
+/// `child_dir::parse_id` is the stricter twin one level down — it also bounds the
+/// magnitude, which this must not, being the gate on an orphan `remove_dir_all`.
 fn has_numeric_id(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }

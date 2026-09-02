@@ -13,12 +13,11 @@ use crate::storage::{Batch, BoundedIndexCursor, ReadCursor, SourceCursor};
 
 impl RelationRegistry {
     /// Scan all positive-weight rows from a relation. One registry lookup serves
-    /// every id — a system family's `Borrowed` handle preserves `full_scan`'s
-    /// `Rc` snapshot cache, so the CIRCUIT_* tables are SQL-introspectable like
-    /// any other relation. Returns the scan plus the schema descriptor, which the
-    /// entry already holds, so the reply path never re-resolves it.
+    /// every id — a system family is an ordinary entry, so the CIRCUIT_* tables
+    /// are SQL-introspectable like any other relation. Returns the scan plus the
+    /// schema descriptor the entry already holds, so the reply never re-resolves it.
     pub fn scan_family(
-        &mut self,
+        &self,
         table_id: i64,
         hydrator: Option<&mut dyn SkeletonHydrator>,
     ) -> Result<(Rc<Batch>, SchemaDescriptor), String> {
@@ -55,7 +54,7 @@ impl RelationRegistry {
     /// and certifies the view schema's NOT NULL bits — neither of which a
     /// skeleton shard can survive.
     pub(crate) fn materialize_hydrated(
-        &mut self,
+        &self,
         view_id: i64,
         mut cursor: ReadCursor,
         keys: Option<&[u8]>,
@@ -117,12 +116,9 @@ impl RelationRegistry {
         if coarse.is_empty() {
             return Ok(out);
         }
-        let chunk_rows = self.ddl_scan_chunk_rows.max(1);
-        // `&*self` is a shared reborrow of the receiver while `h` is borrowed
-        // from the caller, so the two do not alias; the cursor borrow ended at
-        // the `drop(cursor)` above.
+        let chunk_rows = self.scan_chunk_rows;
         let hydrated = match hydrator {
-            Some(h) => h.hydrate_keys(&*self, view_id, skeleton_keys, &coarse, chunk_rows)?,
+            Some(h) => h.hydrate_keys(self, view_id, skeleton_keys, &coarse, chunk_rows)?,
             // Unreachable: reaching here means a walk met a skeleton row, which
             // requires a capacity budget, which no host passing `None` ever sets.
             None => {
@@ -149,7 +145,7 @@ impl RelationRegistry {
     /// Returns the hit (if any) plus the table's schema descriptor — a miss
     /// still needs the schema for its STATUS_OK reply block.
     pub fn seek_family(
-        &mut self,
+        &self,
         table_id: i64,
         seek_pk: u128,
         seek_pk_extra: &[u8],
@@ -166,7 +162,7 @@ impl RelationRegistry {
     /// opened cursor's, so a point lookup that misses every skeleton shard reads
     /// without hydrating.
     pub fn seek_family_bytes(
-        &mut self,
+        &self,
         table_id: i64,
         pk: &[u8],
         hydrator: Option<&mut dyn SkeletonHydrator>,
@@ -198,7 +194,7 @@ impl RelationRegistry {
     /// would overwrite the first rather than join it. The seek and `pk IN (…)`
     /// readers, whose consumers take whole groups, walk instead.
     pub fn gather_family_bytes<'k>(
-        &mut self,
+        &self,
         table_id: i64,
         pks: impl ExactSizeIterator<Item = &'k [u8]>,
         ref_col: u8,
@@ -243,7 +239,7 @@ impl RelationRegistry {
     /// columns are nullable. (The gather's full-arity entry filter re-applies
     /// that gate; see `BoundedIndexCursor::drain_chunk`.)
     pub fn seek_by_index(
-        &mut self,
+        &self,
         table_id: i64,
         col_indices: &[u32],
         natives: &[u128],
@@ -268,7 +264,7 @@ impl RelationRegistry {
     /// worker and merges (the index shadows this worker's own base slice, so a
     /// range's matches scatter across workers).
     pub fn seek_by_index_range(
-        &mut self,
+        &self,
         table_id: i64,
         col_indices: &[u32],
         range: &gnitz_wire::RangeDescriptor,
@@ -364,8 +360,8 @@ impl RelationRegistry {
         let matches = idx.count_range_raw(start.pk_bytes(), end_bytes);
         if walk == IndexWalk::Optional {
             // Only user base tables own index circuits, so a resolved index
-            // implies an owned base store; a borrowed system table degrades to
-            // the full scan like any other decline.
+            // implies a base store unless this process detached it (the post-fork
+            // master), which degrades to the full scan like any other decline.
             let Some(store) = entry.owned_store() else {
                 return IndexScan::Decline("index owner holds no local base store".into());
             };
@@ -379,7 +375,7 @@ impl RelationRegistry {
             start,
             end,
             ic.key_spec,
-            matches.min(self.ddl_scan_chunk_rows),
+            matches.min(self.scan_chunk_rows),
         )))
     }
 }

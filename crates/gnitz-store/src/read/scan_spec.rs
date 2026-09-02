@@ -27,7 +27,7 @@ use std::rc::Rc;
 
 use super::SkeletonHydrator;
 use crate::expr::{MapPlan, PkSource};
-use crate::ops::AdhocFold;
+use crate::ops::{adhoc_group_cap, AdhocFold};
 use crate::relation::RelationRegistry;
 use crate::schema::key::{compare_pk_bytes, opk_key, pack_pk_be, pk_range_keys};
 use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor};
@@ -53,7 +53,7 @@ impl RelationRegistry {
     /// this read's group, and bounds an incremental delta read above. Every other
     /// bound ignores it.
     pub fn scan_spec_family(
-        &mut self,
+        &self,
         target_id: i64,
         spec: &ReadSpec,
         reply_schema: &SchemaDescriptor,
@@ -70,9 +70,8 @@ impl RelationRegistry {
         };
         let ctx = ScanSinkCtx {
             predicate: predicate.as_ref(),
-            chunk_rows: self.ddl_scan_chunk_rows.max(1),
+            chunk_rows: self.scan_chunk_rows,
         };
-        let group_cap = self.adhoc_group_cap;
 
         // Each arm resolves its sink whole, then opens. The open is spelled
         // twice rather than hoisted above the match: hoisting it is what would
@@ -85,7 +84,7 @@ impl RelationRegistry {
                 // layout — is resolved against this, never against `src_schema`.
                 let pre = compile_fold_pre_map(agg, &src_schema)?;
                 let reduce_in = pre.as_ref().map_or(&src_schema, |(s, _)| s);
-                let fold = AdhocFold::new(reduce_in, reply_schema, agg, group_cap)?;
+                let fold = AdhocFold::new(reduce_in, reply_schema, agg, adhoc_group_cap())?;
                 let mut source = self.open_scan_spec_cursor(target_id, &spec.bound, &src_schema, cut_tick, hydrator)?;
                 Ok(run_scan_fold_sink(&mut source, ctx, pre.as_ref(), fold)?)
             }
@@ -118,7 +117,7 @@ impl RelationRegistry {
     /// A `Delta` bound against a relation with no feed is refused at **every**
     /// `after_tick`, zero included: the reply would otherwise promise a
     /// continuation the server cannot serve.
-    fn scan_spec_source_schema(&mut self, target: i64, bound: &ReadBound) -> Result<SchemaDescriptor, String> {
+    fn scan_spec_source_schema(&self, target: i64, bound: &ReadBound) -> Result<SchemaDescriptor, String> {
         let entry = self.table_entry(target)?;
         let ReadBound::Delta { after_tick } = bound else {
             return Ok(entry.schema);
@@ -142,7 +141,7 @@ impl RelationRegistry {
     /// hydrated whole first, so no sink below ever sees one — at the cost of this
     /// module's streaming property for that read.
     fn open_scan_spec_cursor(
-        &mut self,
+        &self,
         source: i64,
         bound: &ReadBound,
         src_schema: &SchemaDescriptor,
@@ -202,7 +201,7 @@ impl RelationRegistry {
     /// covers `(after_tick, cut]`, so a dropped row is inside it iff
     /// `dropped_through > after_tick` — a cursor sitting *at* the floor is served
     /// in full rather than being told to re-read at 0 forever.
-    fn open_delta_cursor(&mut self, source: i64, after_tick: u64, cut_tick: u64) -> Result<SourceCursor, WireFault> {
+    fn open_delta_cursor(&self, source: i64, after_tick: u64, cut_tick: u64) -> Result<SourceCursor, WireFault> {
         let feed = self.table_entry(source)?.delta_feed_or_err(source)?;
         let dropped_through = feed.dropped_through();
         if after_tick < dropped_through {
@@ -234,7 +233,7 @@ impl RelationRegistry {
     /// other frame carrying one takes — on both walk kinds, since a column the
     /// table has not got is a corrupt frame either way.
     fn open_index_bound_cursor(
-        &mut self,
+        &self,
         source: i64,
         idx_cols: u64,
         exact: bool,

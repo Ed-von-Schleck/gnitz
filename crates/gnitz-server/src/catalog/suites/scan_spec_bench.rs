@@ -12,7 +12,7 @@
 //! `INGEST_ROUNDS` PK-interleaved rounds so the cursor is a genuine N-way merge
 //! over that many sorted runs (a single round would bulk-drain one source and
 //! skip the merge walk entirely), and chunking is the production
-//! `ddl_scan_chunk_rows`.
+//! `scan_chunk_rows`.
 //!
 //! Each sink is measured at **both survivor-run lengths**, which is the axis
 //! that actually decides this path. `c0 = id % SEL_MOD` is PK-correlated, so
@@ -153,7 +153,7 @@ fn scan_spec_sinks_bench() {
     // walked are one chunk; rating it over the 100 returned rows would report a
     // meaningless ~0.01 M/s.
     let spec = rows_spec(contiguous.clone(), gather3.clone(), vec![], 100);
-    let chunk = e.registry().ddl_scan_chunk_rows() as u64;
+    let chunk = e.registry().scan_chunk_rows() as u64;
     cell("rows, LIMIT 100 (early stop, 1 chunk)", chunk, || {
         e.scan_spec_family(tid, &spec, &reply3, 0).unwrap()
     });

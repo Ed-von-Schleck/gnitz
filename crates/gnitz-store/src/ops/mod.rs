@@ -36,5 +36,5 @@ pub use exchange::{
 pub use join::{merge_schemas_for_join, op_join_delta_trace, JoinProbe, RangeProbe};
 pub use linear::op_union;
 pub use linear::{op_filter, op_negate};
-pub(crate) use reduce::AdhocFold;
+pub(crate) use reduce::{adhoc_group_cap, AdhocFold};
 pub use reduce::{op_populate_avi, op_reduce, AggDescriptor, ReducePlan};

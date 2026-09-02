@@ -972,8 +972,12 @@ impl WorkerProcess {
         // the durable SAL. Restart + SAL replay re-applies the batch — its zone
         // stays above the flushed-shard watermark — where a fault reply would
         // neither apply nor replay it and the next checkpoint would orphan it.
-        let effective = match self.cat().registry_mut().ingest_returning_effective(target_id, batch) {
-            Ok(b) => b,
+        let effective = match self
+            .cat()
+            .registry_mut()
+            .ingest_returning_effective(target_id, batch, true)
+        {
+            Ok(b) => b.expect("asked for the effective batch"),
             Err(IngestError::Rejected(msg)) => return Err(msg),
             Err(IngestError::Storage(e)) => gnitz_fatal_abort!(
                 "worker: push apply failed (table_id={}): {} — committed data not \
@@ -997,7 +1001,7 @@ impl WorkerProcess {
             if !self.cat().registry().has_id(target_id) {
                 return Ok(());
             }
-            let schema = self.cat().registry().schema_or_err(target_id, "tick")?;
+            let schema = self.cat().registry().table_entry(target_id)?.schema;
             Batch::empty_with_schema(&schema)
         };
         self.evaluate_dag(target_id, delta, round, request_id);
@@ -1095,11 +1099,11 @@ impl WorkerProcess {
             dag.reset_view_for_rebuild(registry, view_id)?;
             self.cat().clear_invalid_view(view_id);
         }
-        let chunk_rows = self.cat().registry().ddl_scan_chunk_rows();
+        let chunk_rows = self.cat().registry().scan_chunk_rows();
         // Needed to synthesize empty pad chunks. An unregistered source is a
         // fail-stop: DDL_SYNC applies in SAL order, so a worker that cannot see
         // the source has diverged from the catalog.
-        let schema = self.cat().registry().schema_or_err(source_tid, "backfill")?;
+        let schema = self.cat().registry().table_entry(source_tid)?.schema;
         let mut handle = self.cat().open_source_cursor(view_id, source_tid)?;
         let mut produced_any = false;
 
@@ -1217,7 +1221,10 @@ impl WorkerProcess {
         if UNIQUE_PREFLIGHT_ERROR.armed() {
             return Err("injected unique pre-flight fault".to_string());
         }
-        let schema = self.cat().registry().schema_or_err(owner_id, "unique pre-flight")?;
+        // One resolve for all three — the cursor owns its sources by `Rc`, so it
+        // outlives the entry borrow and pins the snapshot the DDL section froze.
+        let e = self.cat().registry().table_entry(owner_id)?;
+        let (schema, dir, mut handle) = (e.schema, e.directory.clone(), e.open_cursor());
         // The index circuit is not registered until this pre-flight succeeds, so
         // build its schema from the owner schema + column list — identical inputs
         // to the master's own build, so the reply frame layout agrees by
@@ -1228,41 +1235,33 @@ impl WorkerProcess {
         let spec = gnitz_store::schema::IndexKeySpec::new(col_indices, &schema, &idx_schema);
         let frame_schema = crate::runtime::wire::unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
-        // The spill file is an anonymous inode on the owner table's own data
-        // disk, so it never leaks and shares the table's filesystem.
         let stride = spec.key_size();
-        let dir = self
-            .cat()
-            .registry()
-            .table_directory(owner_id)
-            .ok_or_else(|| format!("unique pre-flight: no directory for table {owner_id}"))?
-            .to_string();
-        let chunk_rows = self.cat().registry().ddl_scan_chunk_rows();
+        let chunk_rows = self.cat().registry().scan_chunk_rows();
 
         // Stream the partition chunk-wise, projecting each row to its span and
         // feeding it to the external sort. Peak RAM is the spill budget, not the
         // partition. `key_bytes` keeps the single column→span definition shared
-        // with the filter warmup and the master merge.
+        // with the filter warmup and the master merge. The spill file is an
+        // anonymous inode on the owner table's own data disk, so it never leaks
+        // and shares the table's filesystem.
         let mut sorter = gnitz_store::storage::SpillSort::new(&dir, stride, unique_preflight_spill_bytes());
         let mut keybuf = PkBuf::zeroed(0);
-        if let Some(mut handle) = self.cat().registry().open_store_cursor(owner_id) {
-            while let Some(chunk) = handle.drain_chunk(chunk_rows) {
-                let mb = chunk.as_mem_batch();
-                for row in 0..chunk.len() {
-                    let w = chunk.get_weight(row);
-                    if w <= 0 {
-                        continue;
-                    }
-                    if !spec.key_bytes(&mb, row, &mut keybuf) {
-                        continue;
-                    }
+        while let Some(chunk) = handle.drain_chunk(chunk_rows) {
+            let mb = chunk.as_mem_batch();
+            for row in 0..chunk.len() {
+                let w = chunk.get_weight(row);
+                if w <= 0 {
+                    continue;
+                }
+                if !spec.key_bytes(&mb, row, &mut keybuf) {
+                    continue;
+                }
+                sorter.push(keybuf.pk_bytes())?;
+                // Chunks are consolidated: weight ≥ 2 is the same row w
+                // times; one extra copy suffices to put an adjacent equal
+                // pair in the sorted stream for the master's merge.
+                if w > 1 {
                     sorter.push(keybuf.pk_bytes())?;
-                    // Chunks are consolidated: weight ≥ 2 is the same row w
-                    // times; one extra copy suffices to put an adjacent equal
-                    // pair in the sorted stream for the master's merge.
-                    if w > 1 {
-                        sorter.push(keybuf.pk_bytes())?;
-                    }
                 }
             }
         }
@@ -1335,7 +1334,7 @@ impl WorkerProcess {
                 (result, schema, true)
             }
             HasPkLookup::PrimaryKey => {
-                let schema = self.cat().registry().schema_or_err(target_id, "has_pk")?;
+                let schema = self.cat().registry().table_entry(target_id)?.schema;
                 let store = self.cat().registry().entry(target_id).and_then(|e| e.owned_store());
                 // Route on verbatim OPK bytes for every PK width: feeding `get_pk`
                 // (OPK-widened) to `has_pk(u128)` would re-OPK-encode it, a double

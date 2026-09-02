@@ -51,7 +51,7 @@ fn rows_fixture(name: &str, n: u64, weight: i64) -> RelationRegistry {
         bb.put_u64(id);
         bb.end_row();
     }
-    registry.ingest_returning_effective(TID, bb.finish()).unwrap();
+    registry.ingest_returning_effective(TID, bb.finish(), false).unwrap();
     registry
 }
 
@@ -196,7 +196,7 @@ fn ingest(registry: &mut RelationRegistry, ids: std::ops::Range<u64>) {
         bb.put_u64(id);
         bb.end_row();
     }
-    registry.ingest_returning_effective(TID, bb.finish()).unwrap();
+    registry.ingest_returning_effective(TID, bb.finish(), false).unwrap();
 }
 
 fn pk_range(lo: u64, hi: u64) -> ReadSpec {

@@ -417,8 +417,7 @@ impl CatalogEngine {
     /// exactly what the master admitted.
     pub(super) fn is_trailing_col_append(&self, owner_id: i64, col_idx: u64) -> bool {
         self.registry
-            .table_entry(owner_id)
-            .ok()
+            .entry(owner_id)
             .is_some_and(|e| col_idx as usize == e.schema.num_columns())
     }
 
@@ -447,8 +446,7 @@ impl CatalogEngine {
             }
             let Some(cur) = self
                 .registry
-                .table_entry(owner)
-                .ok()
+                .entry(owner)
                 .filter(|e| e.kind.is_base_table())
                 .map(|e| e.schema)
             else {
@@ -602,8 +600,7 @@ impl CatalogEngine {
         // the first registrant's id.
         let creating = self
             .registry
-            .table_entry(owner_id)
-            .ok()
+            .entry(owner_id)
             .and_then(|e| e.index_circuit_on(cols).map(|ic| (e.directory.clone(), ic.index_id)));
         if let Some((owner_dir, creating_idx_id)) = creating {
             self.registry.remove_index_circuit(owner_id, cols);

@@ -1200,7 +1200,7 @@ fn test_drop_unique_index_on_non_pk_fk_target_blocked() {
 //
 // The unique-index backfill scans the owner chunk-wise (drain_chunk); a
 // duplicate pair split across chunks is only visible through the `seen` set
-// carried across chunks. Shrink `ddl_scan_chunk_rows` so a handful of rows
+// carried across chunks. Shrink `scan_chunk_rows` so a handful of rows
 // spans several chunks, and place the duplicate pair at the PK extremes
 // (the scan is in PK merge order).
 
@@ -1223,7 +1223,7 @@ fn test_unique_index_duplicate_across_chunks_rejected() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.registry_mut().flush(tid).unwrap();
 
-    engine.registry_mut().set_ddl_scan_chunk_rows(3);
+    engine.registry_mut().set_scan_chunk_rows(3);
     let before = count_records(engine.sys_store_mut(SysFamily::Index).open_cursor());
     let r = engine.create_index("public.t", &["val"], true);
     assert!(r.is_err(), "cross-chunk duplicate must fail the unique backfill");
@@ -1255,7 +1255,7 @@ fn test_unique_index_duplicate_within_chunk_rejected() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.registry_mut().flush(tid).unwrap();
 
-    engine.registry_mut().set_ddl_scan_chunk_rows(4);
+    engine.registry_mut().set_scan_chunk_rows(4);
     assert!(
         engine.create_index("public.t", &["val"], true).is_err(),
         "within-chunk duplicate must still fail the unique backfill"
@@ -1284,7 +1284,7 @@ fn test_unique_index_chunked_backfill_distinct_succeeds() {
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
     engine.registry_mut().flush(tid).unwrap();
 
-    engine.registry_mut().set_ddl_scan_chunk_rows(3);
+    engine.registry_mut().set_scan_chunk_rows(3);
     engine.create_index("public.t", &["val"], true).unwrap();
 
     let entry = engine.registry().table_entry(tid).unwrap();
@@ -1328,7 +1328,7 @@ fn test_promote_unique_duplicate_across_chunks_rejected() {
     engine.ingest_to_family(child_tid, &bb.finish()).unwrap();
     engine.registry_mut().flush(child_tid).unwrap();
 
-    engine.registry_mut().set_ddl_scan_chunk_rows(3);
+    engine.registry_mut().set_scan_chunk_rows(3);
     assert!(
         engine.create_index("public.child", &["refc"], true).is_err(),
         "cross-chunk duplicate must fail the promotion scan"
@@ -2672,12 +2672,17 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
     idx.ingest_owned_batch(idx_batch).unwrap();
     idx.flush().unwrap();
 
-    // SAFETY: `base` is dropped at the end of this function, after `engine.close()`.
-    unsafe {
-        engine
-            .registry_mut()
-            .register_borrowed(tid, &mut base, schema, RelationKind::BaseTable, dir.clone());
-    }
+    engine.registry_mut().register_owned(
+        RelationSpec {
+            id: tid,
+            kind: RelationKind::BaseTable,
+            schema,
+            directory: dir.clone(),
+            depth: 0,
+            budgets: ViewBudgets::default(),
+        },
+        base,
+    );
     engine
         .registry_mut()
         .add_index_circuit(tid, &[3], tid + 1, Box::new(idx), idx_schema, false);

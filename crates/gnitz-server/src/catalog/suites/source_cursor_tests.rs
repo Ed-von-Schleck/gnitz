@@ -474,7 +474,7 @@ fn inverted_range_is_empty_not_err() {
     engine.close();
 }
 
-/// An unregistered source is an `Err`, matching the `schema_or_err`
+/// An unregistered source is an `Err`, matching the schema resolve
 /// `handle_backfill` runs one line earlier — which is why nothing downstream
 /// ever sees this case.
 #[test]

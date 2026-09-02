@@ -257,7 +257,12 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
                 }
                 gnitz_debug!("vm: INTEGRATE in_count={}", batches[*in_reg as usize].len());
                 let trace_table = program.trace_table_idx(*trace_reg);
-                let res = tables[trace_table.at()].ingest_borrowed_batch(&batches[*in_reg as usize]);
+                // Not `take_or_clone`: for a `Raw` register its clone arm would cost
+                // a clone plus the trace's own consolidate, where moving costs one.
+                let res = match last_read[*in_reg as usize] == pc as u32 {
+                    true => tables[trace_table.at()].ingest_owned_batch(batches[*in_reg as usize].take()),
+                    false => tables[trace_table.at()].ingest_borrowed_batch(&batches[*in_reg as usize]),
+                };
                 log_tick_ingest_err("integrate", trace_table, res)?;
             }
 

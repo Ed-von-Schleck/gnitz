@@ -9,10 +9,11 @@
 //! reference as a parameter.
 //!
 //! Two hosts drive one registry: `CatalogEngine` (from a TABLE_TAB / VIEW_TAB
-//! row) and `gnitz-mirror` (from its own record file). Both enter a relation
-//! through [`RelationRegistry::register`], so neither can drift on the child
-//! address, the recovery source, the capacity stamp or whether a delta store is
-//! opened.
+//! row) and `gnitz-mirror` (from its own record file).
+//!
+//! A user relation enters through [`RelationRegistry::register`], the one site
+//! deciding its child address, recovery source, capacity stamp and delta store;
+//! the system families through [`RelationRegistry::register_owned`].
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover.
@@ -21,9 +22,6 @@ use rustc_hash::FxHashMap;
 
 use crate::schema::SchemaDescriptor;
 
-/// The id at or above which every relation is a user relation. `gnitz-wire`
-/// declares it; the signed form is what a registry id is.
-pub(crate) const FIRST_USER_TABLE_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
 use crate::storage::{Batch, ChildAddr, RecoverySource, StorageError, Table};
 use gnitz_wire::PkColList;
 
@@ -39,10 +37,7 @@ pub(crate) use store_handle::StoreHandle;
 
 /// Default rows per `drain_chunk` call on a chunked scan. Bounds peak scan
 /// memory at O(chunk × row_width).
-pub const DDL_SCAN_CHUNK_ROWS: usize = 65_536;
-
-/// Default per-worker distinct-group cap for the ad-hoc aggregate fold.
-pub(crate) const ADHOC_GROUP_CAP: usize = 65_536;
+pub const SCAN_CHUNK_ROWS: usize = 65_536;
 
 // ---------------------------------------------------------------------------
 // Index circuit entry
@@ -65,8 +60,8 @@ pub struct IndexCircuitEntry {
     pub index_schema: SchemaDescriptor,
     /// Full-arity span-encode plan, precomputed at registration so the per-push
     /// consumers do no per-call spec rebuild. It survives every column ALTER of
-    /// the owner — the `debug_assert!` in
-    /// [`RelationRegistry::swap_table_schema`] is the tripwire on that.
+    /// the owner — [`RelationRegistry::swap_table_schema`] rejects any descriptor
+    /// that would not leave it valid.
     /// Deliberately does NOT bake in `is_unique` (live promotion/demotion via
     /// `set_index_circuit_uniqueness`); consumers filter on the live flag.
     pub key_spec: crate::schema::IndexKeySpec,
@@ -200,6 +195,25 @@ pub(crate) struct RelationStores {
     pub delta: Option<Box<DeltaFeed>>,
 }
 
+impl RelationStores {
+    /// One owned `Table` and no feed — what a caller that opened its own store
+    /// hands [`RelationRegistry::register_owned`].
+    pub(crate) fn owned(store: Box<Table>) -> Self {
+        RelationStores {
+            handle: StoreHandle::owned(store),
+            delta: None,
+        }
+    }
+
+    /// No stores at all: a stream, or a user relation on the post-fork master.
+    pub(crate) fn detached() -> Self {
+        RelationStores {
+            handle: StoreHandle::Detached,
+            delta: None,
+        }
+    }
+}
+
 pub struct TableEntry {
     pub(crate) handle: StoreHandle,
     /// The delta store, when this process holds one — `None` on the post-fork
@@ -210,6 +224,9 @@ pub struct TableEntry {
     pub schema: SchemaDescriptor,
     pub kind: RelationKind,
     pub depth: i32,
+    /// This relation's on-disk directory, parent of its `ChildAddr` subdirs. It
+    /// exists once the relation is created, so it anchors an `O_TMPFILE` spill
+    /// onto the same disk as the relation's data.
     pub directory: String,
     pub index_circuits: Vec<IndexCircuitEntry>,
     /// The budgets this relation was registered with: what a rehome or a rebuild
@@ -241,6 +258,14 @@ impl TableEntry {
         }
     }
 
+    /// Install both stores at once. The only writer of either field after
+    /// construction, so nothing can replace one and leave the other — which for a
+    /// fed view is a `delta_bytes` in the catalog with no delta store anywhere.
+    pub(crate) fn set_stores(&mut self, stores: RelationStores) {
+        self.handle = stores.handle;
+        self.delta = stores.delta;
+    }
+
     /// This relation's delta feed, when this process holds one.
     pub(crate) fn delta_feed(&self) -> Option<&DeltaFeed> {
         self.delta.as_deref()
@@ -254,17 +279,17 @@ impl TableEntry {
             .ok_or_else(|| format!("scan_spec: this process holds no delta store for relation {id}"))
     }
 
-    /// The `Table` this process owns outright for this relation, if any.
+    /// The `Table` this process holds for this relation, if any. `None` for a
+    /// stream, which holds one nowhere, and on the post-fork master, which
+    /// detached every user relation.
     pub fn owned_store(&self) -> Option<&Table> {
         self.handle.as_owned()
     }
 
-    /// True when this process holds no store for this relation at all — a
-    /// stream, which holds none anywhere, or the post-fork master, which
-    /// detached every user relation. A `Borrowed` system table is not one: its
-    /// store is reachable, just owned elsewhere.
-    pub fn is_storeless(&self) -> bool {
-        self.handle.is_detached()
+    /// [`Self::owned_store`] as `&mut`, statically checked — the route a caller
+    /// holding the entry mutably takes to mutate its store in place.
+    pub fn owned_store_mut(&mut self) -> Option<&mut Table> {
+        self.handle.owned_mut()
     }
 
     /// What the client is told this relation is. Lives beside the two fields that
@@ -272,7 +297,7 @@ impl TableEntry {
     /// silent `Table` at the wire boundary. A bounded view is its own wire class:
     /// the client's leaf rule refuses to bind one inside a view body, and
     /// `ALTER VIEW … AS` refuses to retarget it.
-    pub(crate) fn class(&self) -> gnitz_wire::RelClass {
+    pub fn class(&self) -> gnitz_wire::RelClass {
         use gnitz_wire::RelClass;
         match self.kind {
             RelationKind::Stream => RelClass::Stream,
@@ -323,14 +348,9 @@ impl TableEntry {
             .find(|ic| ic.col_indices.as_slice() == cols)
     }
 
-    /// The store's LSN counter — see [`StoreHandle::current_lsn`].
-    pub fn current_lsn(&self) -> u64 {
-        self.handle.current_lsn()
-    }
-
     /// Durable ingest of a borrowed `Batch` into this relation's own store,
-    /// bypassing index projection. The delta-stamp and the checkpoint paths take
-    /// it; ordinary ingestion goes through the registry.
+    /// bypassing index projection. A white-box door for a test that must desync
+    /// the two — ordinary ingestion goes through the registry, which writes both.
     pub fn ingest_borrowed_batch(&self, batch: &Batch) -> Result<(), StorageError> {
         self.handle.ingest_borrowed_batch(batch)
     }
@@ -378,69 +398,54 @@ pub struct RelationRegistry {
     pub(crate) resume_generation: u64,
     /// `worker_count << 32 | STATE_FORMAT` as last recorded.
     pub(crate) recorded_topology: u64,
-    /// Rows per `drain_chunk` on a chunked scan; bounds peak scan memory at
-    /// O(chunk × row_width). `GNITZ_DDL_SCAN_CHUNK_ROWS` overrides.
-    pub(crate) ddl_scan_chunk_rows: usize,
-    /// Per-worker distinct-group cap for the ad-hoc aggregate fold.
-    /// `GNITZ_ADHOC_GROUP_CAP` overrides.
-    pub(crate) adhoc_group_cap: usize,
+    /// Rows per `drain_chunk` on every chunked scan this process drives; bounds
+    /// peak scan memory at O(chunk × row_width). At least 1, clamped by its one
+    /// writer [`Self::set_scan_chunk_rows`], so no reader re-checks.
+    pub(crate) scan_chunk_rows: usize,
 }
 
 impl RelationRegistry {
-    /// An empty registry plus the two chunk/cap knobs read from the environment.
-    /// The one constructor: `CatalogEngine::open` calls it with the launched
-    /// worker count, `Mirror::open` with 1.
+    /// An empty registry plus the chunk knob read from the environment. The one
+    /// constructor: `CatalogEngine::open` calls it with the launched worker
+    /// count, `Mirror::open` with 1.
     pub fn new(num_workers: u32) -> Self {
-        use crate::foundation::env::env_num;
-        RelationRegistry {
+        let mut registry = RelationRegistry {
             tables: FxHashMap::default(),
             num_workers,
             owns_stores: true,
             resume_generation: 0,
             recorded_topology: 0,
-            // Rows per chunk for the chunked DDL scans (view + index backfill).
-            // `GNITZ_DDL_SCAN_CHUNK_ROWS` overrides the default — chiefly so
-            // multi-worker E2E tests can shrink it to force many chunked backfill
-            // rounds (lockstep padding, SAL reclaim) over small tables. A 0 or
-            // unparseable value falls back to the default: a zero chunk size
-            // drains nothing, so a backfill would never make progress.
-            ddl_scan_chunk_rows: env_num("GNITZ_DDL_SCAN_CHUNK_ROWS", DDL_SCAN_CHUNK_ROWS),
-            adhoc_group_cap: env_num("GNITZ_ADHOC_GROUP_CAP", ADHOC_GROUP_CAP),
-        }
+            scan_chunk_rows: SCAN_CHUNK_ROWS,
+        };
+        registry.set_scan_chunk_rows(crate::foundation::env::env_num(
+            "GNITZ_SCAN_CHUNK_ROWS",
+            SCAN_CHUNK_ROWS,
+        ));
+        registry
     }
 
     // ── Table registry ──────────────────────────────────────────────────
 
-    /// Enter a relation over a `Table` the caller keeps owning — the system
-    /// families, whose stores the catalog holds in its own array. At depth 0
-    /// with no budgets and no index circuit.
-    ///
-    /// # Safety
-    ///
-    /// `store` must outlive the registration — the handle keeps a raw pointer,
-    /// so the reference's lifetime is erased here.
-    pub unsafe fn register_borrowed(
-        &mut self,
-        id: i64,
-        store: &mut Table,
-        schema: SchemaDescriptor,
-        kind: RelationKind,
-        directory: String,
-    ) {
-        self.tables.insert(
+    /// Enter a relation over a `Table` the caller already opened, taking ownership
+    /// — the system families, built at bootstrap before there is a registry to
+    /// build them through.
+    pub fn register_owned(&mut self, spec: RelationSpec, store: Box<Table>) {
+        self.enter(spec, RelationStores::owned(store));
+    }
+
+    /// Record `spec` against `stores`. The one insert, so the two entry points
+    /// above cannot come to record a registration differently.
+    fn enter(&mut self, spec: RelationSpec, stores: RelationStores) {
+        let RelationSpec {
             id,
-            TableEntry::new(
-                RelationStores {
-                    handle: StoreHandle::Borrowed(store),
-                    delta: None,
-                },
-                schema,
-                kind,
-                0,
-                directory,
-                ViewBudgets::default(),
-            ),
-        );
+            kind,
+            schema,
+            directory,
+            depth,
+            budgets,
+        } = spec;
+        self.tables
+            .insert(id, TableEntry::new(stores, schema, kind, depth, directory, budgets));
     }
 
     /// Drop `table_id`'s entry, and with it its owned `Box<Table>` and fds.
@@ -487,7 +492,7 @@ impl RelationRegistry {
     pub fn replace_index_table(&mut self, table_id: i64, col_indices: &[u32], t: Box<Table>) -> Option<*mut Table> {
         let ic = self.tables.get_mut(&table_id)?.index_circuit_on_mut(col_indices)?;
         ic.handle = StoreHandle::owned(t);
-        ic.handle.as_owned_mut().map(|t| t as *mut Table)
+        ic.handle.owned_mut().map(|t| t as *mut Table)
     }
 
     /// Set the uniqueness flag of the index circuit on `col_indices` in place
@@ -523,20 +528,16 @@ impl RelationRegistry {
             .tables
             .get_mut(&table_id)
             .expect("swap_table_schema: table must be registered");
-        // Tripwire on `IndexCircuitEntry.key_spec`, baked at index registration
-        // and never rebuilt: only a trailing append leaves every existing OPK
-        // offset and payload slot where it was. PK membership is compared because
-        // it moves payload slots too.
-        debug_assert!(
-            schema.pk_indices() == entry.schema.pk_indices()
-                && schema.num_columns() >= entry.schema.num_columns()
-                && (0..entry.schema.num_columns())
-                    .all(|i| schema.columns[i].type_code == entry.schema.columns[i].type_code),
-            "swap_table_schema: table {table_id}'s new descriptor is not a trailing append; \
-             every index circuit's baked key_spec is now stale",
-        );
+        // Checked, not asserted: what a stale `key_spec` produces is a silently
+        // wrong index projection, which release codegen would not guard at all.
+        if !schema.is_trailing_append_of(&entry.schema) {
+            return Err(format!(
+                "ALTER on table {table_id}: the new descriptor is not a trailing append, \
+                 which every index circuit's baked key_spec requires"
+            ));
+        }
         // A worker reaches its `Table`; the post-fork master has none.
-        if let Some(store) = entry.handle.as_owned_mut() {
+        if let Some(store) = entry.handle.owned_mut() {
             store
                 .swap_schema(schema)
                 .map_err(|e| format!("ALTER on table {table_id}: reopening shards failed: {e}"))?;
@@ -564,17 +565,16 @@ impl RelationRegistry {
         self.owns_stores
     }
 
-    /// Rows per `drain_chunk` call on every chunked scan this process drives.
-    pub fn ddl_scan_chunk_rows(&self) -> usize {
-        self.ddl_scan_chunk_rows
+    /// See [`RelationRegistry::scan_chunk_rows`](Self#structfield.scan_chunk_rows).
+    pub fn scan_chunk_rows(&self) -> usize {
+        self.scan_chunk_rows
     }
 
-    /// Override the chunk size after construction. The backfills are invoked
-    /// from catalog hooks, which a test can only reach through `submit`, so
-    /// shrinking this is how a test exercises chunk boundaries over a small
-    /// table without the environment variable a whole process would share.
-    pub fn set_ddl_scan_chunk_rows(&mut self, rows: usize) {
-        self.ddl_scan_chunk_rows = rows;
+    /// Set the chunk size, clamped to at least one row — a zero chunk drains
+    /// nothing. Per registry rather than process-wide: the tests that shrink it
+    /// do so per engine, and `cargo test` runs them on threads of one process.
+    pub fn set_scan_chunk_rows(&mut self, rows: usize) {
+        self.scan_chunk_rows = rows.max(1);
     }
 
     /// The registry entry for `table_id`, or `None` for an unknown id — the
@@ -584,18 +584,17 @@ impl RelationRegistry {
         self.tables.get(&table_id)
     }
 
-    /// [`Self::entry`] plus the shared "Unknown table_id" error every
-    /// hard-resolving store path reports.
-    pub fn table_entry(&self, table_id: i64) -> Result<&TableEntry, String> {
-        self.entry(table_id)
-            .ok_or_else(|| format!("Unknown table_id {table_id}"))
+    /// [`Self::entry`] as `&mut` — what a caller mutating one relation's store
+    /// in place takes, so the mutation is checked rather than contracted.
+    pub fn entry_mut(&mut self, table_id: i64) -> Option<&mut TableEntry> {
+        self.tables.get_mut(&table_id)
     }
 
-    /// A registered relation's wire class, or `None` for an unknown id — the
-    /// shape a `FLAG_RESOLVE` descriptor reports. `RelClass` is `Copy`, so the
-    /// `tables` borrow ends with the call.
-    pub fn relation_class(&self, id: i64) -> Option<gnitz_wire::RelClass> {
-        self.entry(id).map(|e| e.class())
+    /// [`Self::entry`] plus the one "not registered" sentence — spelled the same
+    /// by the mutating paths, so which verb asked cannot change what a client reads.
+    pub fn table_entry(&self, table_id: i64) -> Result<&TableEntry, String> {
+        self.entry(table_id)
+            .ok_or_else(|| format!("relation {table_id} is not registered"))
     }
 
     /// A registered relation's kind, or `None` for an unknown id. `RelationKind`
@@ -621,9 +620,9 @@ impl RelationRegistry {
     /// True iff at least one registered view carries a delta feed. The master's
     /// idle-poll bookkeeping — the forward-closure walk and the last-round map —
     /// is skipped outright when this is false, which is every server that does not
-    /// use the feature. A walk of the registry rather than a maintained counter:
-    /// it runs once per emitted tick group, against a relation count in the tens,
-    /// beside a SAL write and an eventfd.
+    /// use the feature. A walk rather than a maintained counter: `.any()`
+    /// short-circuits, so the full walk runs only when no feed exists, once per
+    /// emitted tick group, beside a SAL write and an eventfd.
     pub fn any_delta_feed(&self) -> bool {
         self.tables.values().any(|e| e.budgets.delta_bytes.is_some())
     }
@@ -674,11 +673,12 @@ impl RelationRegistry {
     /// `pack_pk_cols` word: the master applies it as an early client-facing
     /// reject, the worker as its trust boundary, and both render the same error.
     pub fn validate_index_cols(&self, table_id: i64, cols: &PkColList, op: &str) -> Result<(), String> {
-        let in_range = |s: &SchemaDescriptor| {
-            cols.is_well_formed() && cols.as_slice().iter().all(|&c| (c as usize) < s.num_columns())
-        };
-        match self.get_schema_desc(table_id) {
-            Some(s) if in_range(&s) => Ok(()),
+        match self.entry(table_id) {
+            Some(e)
+                if cols.is_well_formed() && cols.as_slice().iter().all(|&c| (c as usize) < e.schema.num_columns()) =>
+            {
+                Ok(())
+            }
             _ => Err(format!("{op}: invalid column list for table {table_id}")),
         }
     }
@@ -700,31 +700,8 @@ impl RelationRegistry {
         self.entry(table_id).map(|e| e.schema)
     }
 
-    /// `table_id`'s schema, or the one "the catalog has no schema for a table a
-    /// live request names" error. Every caller is a fail-stop — reaching it
-    /// means the catalog diverged from the request that named the table — so
-    /// `op` labels which path observed the divergence.
-    pub fn schema_or_err(&self, table_id: i64, op: &str) -> Result<SchemaDescriptor, String> {
-        self.get_schema_desc(table_id)
-            .ok_or_else(|| format!("{op}: no schema for table {table_id}"))
-    }
-
-    /// The on-disk directory of a user table (`{base_dir}/{schema}/{name}_{tid}`),
-    /// the parent of its child store subdirs (`ChildAddr`). Guaranteed to exist on
-    /// the data filesystem once the table is created, so it anchors an
-    /// `O_TMPFILE` spill (e.g. the CREATE UNIQUE INDEX pre-flight external sort)
-    /// onto the same disk as the table's data. `None` for an unknown table.
-    pub fn table_directory(&self, table_id: i64) -> Option<&str> {
-        self.entry(table_id).map(|e| e.directory.as_str())
-    }
-
-    /// Every registered relation's directory, in no defined order.
-    pub fn directories(&self) -> impl Iterator<Item = &str> + '_ {
-        self.tables.values().map(|e| e.directory.as_str())
-    }
-
-    /// Every registered relation's `(directory, index circuits)`, in no defined
-    /// order — what the boot orphan sweep names its live index directories from.
+    /// Every registered relation's `(id, entry)`, in no defined order — what the
+    /// boot orphan sweep names its live table and index directories from.
     pub fn entries(&self) -> impl Iterator<Item = (i64, &TableEntry)> + '_ {
         self.tables.iter().map(|(&id, e)| (id, e))
     }
@@ -765,7 +742,7 @@ impl RelationRegistry {
     /// a change on either axis invalidates every rederived relation regardless
     /// of what generation its manifest carries.
     pub fn topology_matches(&self) -> bool {
-        self.recorded_topology == crate::storage::topology_word(self.num_workers)
+        self.recorded_topology == self.launched_topology_word()
     }
 
     /// The recovery policy for a rederived relation — a view's output store and

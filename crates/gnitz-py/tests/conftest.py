@@ -428,11 +428,11 @@ def adhoc_group_cap_server(seamed_server):
 @pytest.fixture
 def tiny_ddl_chunk_server(seamed_server):
     """Server whose chunked scans drain in 3-row chunks, so a small table already
-    spans many chunk boundaries: `GNITZ_DDL_SCAN_CHUNK_ROWS` sizes index and view
+    spans many chunk boundaries: `GNITZ_SCAN_CHUNK_ROWS` sizes index and view
     backfill, the bounded-view hydration merge, and the ad-hoc `ReadSpec` scan
     alike. At the 65 536-row default a test table is one chunk and pins nothing
     about chunk boundaries."""
-    return seamed_server({"GNITZ_DDL_SCAN_CHUNK_ROWS": "3"})
+    return seamed_server({"GNITZ_SCAN_CHUNK_ROWS": "3"})
 
 
 @pytest.fixture

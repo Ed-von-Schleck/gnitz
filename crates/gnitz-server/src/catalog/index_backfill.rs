@@ -185,7 +185,7 @@ impl CatalogEngine {
         if targets.is_empty() {
             return Ok(());
         }
-        let chunk_rows = self.registry.ddl_scan_chunk_rows();
+        let chunk_rows = self.registry.scan_chunk_rows();
         let mut seen: Vec<rustc_hash::FxHashSet<PkBuf>> = if check_dups {
             targets.iter().map(|_| rustc_hash::FxHashSet::default()).collect()
         } else {

@@ -187,30 +187,32 @@ impl DagEngine {
     }
 
     /// Run `view_id`'s epoch over `input` and ingest whatever it produced into
-    /// the view's family. `round` stamps a fed view's captured delta; `None` is a
-    /// backfill, whose rows never enter a delta store.
+    /// the view's family.
+    ///
+    /// Returns whether it produced rows, and the output itself only when `emit`
+    /// says a later step reads it — the store moves the batch otherwise, saving
+    /// the whole copy for a leaf view and for every backfill chunk. Never cloned
+    /// here: the store hands back what it borrowed.
     fn run_and_ingest(
         &mut self,
         registry: &mut RelationRegistry,
         view_id: i64,
         src_id: i64,
         input: Batch,
-        round: Option<u64>,
+        emit: Emit,
         exchange: &mut dyn ExchangeCallback,
-    ) -> Result<Option<Batch>, String> {
+    ) -> Result<(bool, Option<Batch>), String> {
         let produced = self
             .run_view_epoch(registry, view_id, input, src_id, exchange)?
             .filter(|b| !b.is_empty());
-        if let Some(out) = produced.as_ref() {
-            registry
-                .ingest_view_delta(view_id, out, round)
-                .map_err(|e| format!("view store ingest failed (view_id={view_id}): {e}"))?;
-        }
-        Ok(produced)
+        let Some(out) = produced else { return Ok((false, None)) };
+        let echo = registry
+            .ingest_view_delta(view_id, out, emit.round(), emit.fans_out())
+            .map_err(|e| format!("view store ingest failed (view_id={view_id}): {e}"))?;
+        Ok((true, echo))
     }
 
-    /// Run `schedule` to completion, seeded with `seed_producer`'s output, and
-    /// return the views that produced rows.
+    /// Run `schedule` to completion, seeded with `seed_producer`'s output.
     fn drive(
         &mut self,
         registry: &mut RelationRegistry,
@@ -219,7 +221,7 @@ impl DagEngine {
         seed: Batch,
         round: u64,
         exchange: &mut dyn ExchangeCallback,
-    ) -> Result<FxHashSet<i64>, String> {
+    ) -> Result<(), String> {
         // Which steps each producer feeds, in schedule order — so the group's
         // last entry is the last consumer of that producer's output.
         let mut feeds: FxHashMap<i64, Vec<usize>> = FxHashMap::default();
@@ -227,8 +229,6 @@ impl DagEngine {
             feeds.entry(step.producer).or_default().push(i);
         }
         let mut inputs: Vec<Option<Batch>> = (0..schedule.len()).map(|_| None).collect();
-        let mut dirty: FxHashSet<i64> = FxHashSet::default();
-
         let seeded = feeds.get(&seed_producer).map_or(&[][..], Vec::as_slice);
         Self::fan_out(&mut inputs, seeded, seed);
 
@@ -236,21 +236,22 @@ impl DagEngine {
             // No input means the producer never ran — a relation the registry no
             // longer holds — so this edge carries nothing.
             let Some(input) = inputs[i].take() else { continue };
-            let produced = self.run_and_ingest(registry, step.view, step.producer, input, Some(round), exchange)?;
-            if produced.is_some() {
-                dirty.insert(step.view);
-            }
+            let emit = Emit::Tick {
+                round,
+                fans_out: feeds.contains_key(&step.view),
+            };
+            let (_, echo) = self.run_and_ingest(registry, step.view, step.producer, input, emit, exchange)?;
             let Some(fed) = feeds.get(&step.view) else { continue };
             // A view that produced nothing still fans an empty batch, so an
             // exchange-dependent consumer runs and collective rounds stay in
             // lockstep.
-            let out = produced.unwrap_or_else(|| {
+            let out = echo.unwrap_or_else(|| {
                 let entry = registry.entry(step.view).expect("the schedule names registered views");
                 Batch::empty_with_schema(&entry.schema)
             });
             Self::fan_out(&mut inputs, fed, out);
         }
-        Ok(dirty)
+        Ok(())
     }
 
     /// Hand `delta` to each of the steps a producer feeds, in schedule order. The
@@ -281,17 +282,11 @@ impl DagEngine {
         }
     }
 
-    /// Flush one modified view's output store. A failure here is a RAM-tier spill
-    /// fault: the view store can no longer be bounded, and continuing would grow
-    /// memory unchecked under a sustained fault.
-    fn flush_view(registry: &mut RelationRegistry, view_id: i64) -> Result<(), String> {
-        registry
-            .flush(view_id)
-            .map_err(|e| format!("view store flush failed (view_id={view_id}): {e}"))
-    }
-
-    /// Run every edge `source_id` reaches, then flush every modified view's
-    /// output store exactly once.
+    /// Run every edge `source_id` reaches.
+    ///
+    /// No flush. A delta is queryable out of the memtable the moment it is
+    /// ingested, and the memtable's own budget bounds the tier below it; draining
+    /// every tick only made that tier re-merge its whole window once per tick.
     ///
     /// `tick_round` is the master-allocated round this evaluation runs under. It
     /// stamps every fed view's captured delta — what makes "give me what changed
@@ -308,11 +303,7 @@ impl DagEngine {
         if schedule.is_empty() {
             return Ok(());
         }
-        let dirty = self.drive(registry, &schedule, source_id, delta, tick_round, exchange)?;
-        for vid in dirty {
-            Self::flush_view(registry, vid)?;
-        }
-        Ok(())
+        self.drive(registry, &schedule, source_id, delta, tick_round, exchange)
     }
 
     /// Drive ONE view's epoch for a distributed-backfill chunk and ingest its
@@ -340,15 +331,15 @@ impl DagEngine {
             "distributed backfill into durable relation {view_id}: \
              would double-count loaded shards",
         );
-        let produced = self.run_and_ingest(registry, view_id, source_id, delta, None, exchange)?;
-        Ok(produced.is_some())
+        let (produced, _) = self.run_and_ingest(registry, view_id, source_id, delta, Emit::Backfill, exchange)?;
+        Ok(produced)
     }
 
     /// End `view_id`'s backfill, `produced` being whether any chunk produced rows.
     ///
-    /// Releases the last chunk's pinned registers and trace cursors, then flushes
-    /// the view's output store — which [`Self::backfill_chunk`] leaves to this
-    /// call rather than paying per chunk.
+    /// Releases the last chunk's pinned registers and trace cursors, then folds
+    /// the view's memtable into its RAM tier once — so the view's first reads open
+    /// over fewer sources, at one fold per backfill rather than one per chunk.
     pub(crate) fn finish_backfill(
         &mut self,
         registry: &mut RelationRegistry,
@@ -361,9 +352,38 @@ impl DagEngine {
             }
         }
         match produced {
-            true => Self::flush_view(registry, view_id),
+            true => registry
+                .flush(view_id)
+                .map_err(|e| format!("view store flush failed (view_id={view_id}): {e}")),
             false => Ok(()),
         }
+    }
+}
+
+/// Why one view epoch is running, and what its output is still wanted for.
+/// One value rather than two flags, so the combinations that do not exist — a
+/// backfill stamping a round, a tick without one — cannot be spelled.
+#[derive(Clone, Copy)]
+enum Emit {
+    /// A tick step at `round`, whose output a later step reads when `fans_out`.
+    Tick { round: u64, fans_out: bool },
+    /// A backfill chunk: its rows never enter a delta store, and no other step
+    /// of this drive reads them.
+    Backfill,
+}
+
+impl Emit {
+    /// The round a fed view's captured delta is stamped with; `None` keeps a
+    /// backfill's rows out of the delta store, which a bootstrap read carries.
+    fn round(self) -> Option<u64> {
+        match self {
+            Emit::Tick { round, .. } => Some(round),
+            Emit::Backfill => None,
+        }
+    }
+
+    fn fans_out(self) -> bool {
+        matches!(self, Emit::Tick { fans_out: true, .. })
     }
 }
 

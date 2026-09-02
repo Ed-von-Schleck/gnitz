@@ -107,10 +107,11 @@ impl CatalogEngine {
                 invalid.insert(vid);
                 continue;
             }
-            let dir = self
+            let dir = &self
                 .registry
-                .table_directory(vid)
-                .expect("vid taken from the registry's own view list");
+                .entry(vid)
+                .expect("vid taken from the registry's own view list")
+                .directory;
             if !children_at_generation(dir, launched_workers, g) {
                 invalid.insert(vid);
             }

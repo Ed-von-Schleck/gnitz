@@ -21,7 +21,7 @@ mod bench_secondary_index;
 #[path = "tests/reduce.rs"]
 mod tests;
 
-pub(crate) use adhoc_fold::AdhocFold;
+pub(crate) use adhoc_fold::{adhoc_group_cap, AdhocFold};
 pub use agg::AggDescriptor;
 pub use avi::op_populate_avi;
 pub use op_reduce::op_reduce;

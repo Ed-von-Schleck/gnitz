@@ -147,7 +147,7 @@ impl DagEngine {
         if self.cache.contains_key(&view_id) {
             return Ok(true);
         }
-        let Ok(entry) = registry.table_entry(view_id) else {
+        let Some(entry) = registry.entry(view_id) else {
             return Ok(false);
         };
         let compiled = self
@@ -231,9 +231,7 @@ impl DagEngine {
         // `hook_relation_register` ran earlier in this bundle's ingest loop, so a
         // registered `+1` VIEW_TAB row is always in the registry; a miss is an
         // engine bug, surfaced as a DDL rejection rather than an unchecked compile.
-        let Ok(entry) = registry.table_entry(view_id) else {
-            return Err("pre-flight: view is not registered".to_string());
-        };
+        let entry = registry.table_entry(view_id).map_err(|e| format!("pre-flight: {e}"))?;
         // `map(drop)` closes the plan — and the `Table`s it holds open under
         // `root` — before the caller removes the directory.
         self.compile_circuit(registry, view_id, root, entry)

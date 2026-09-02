@@ -17,7 +17,7 @@ fn stream_flag_registers_storeless_with_no_directory() {
 
     let entry = engine.registry().table_entry(sid).expect("stream registered");
     assert_eq!(entry.kind, RelationKind::Stream);
-    assert!(entry.is_storeless(), "a stream holds no store");
+    assert!(entry.owned_store().is_none(), "a stream holds no store");
     assert!(
         !std::path::Path::new(&entry.directory).exists(),
         "a stream gets no directory: {}",
@@ -25,13 +25,13 @@ fn stream_flag_registers_storeless_with_no_directory() {
     );
     // Its reads are empty rather than erroring, and its LSN never advances.
     assert_eq!(entry.full_scan().len(), 0);
-    assert_eq!(entry.current_lsn(), 0);
+    assert_eq!(entry.owned_store().map_or(0, Table::current_lsn), 0);
 
     // The same word with the bit clear is still an ordinary base table with a
     // directory, so the assertions above are about the flag and not the fixture.
     let base = engine.registry().table_entry(tid).expect("table registered");
     assert_eq!(base.kind, RelationKind::BaseTable);
-    assert!(!base.is_storeless());
+    assert!(base.owned_store().is_some());
     assert!(std::path::Path::new(&base.directory).exists());
 
     fs::remove_dir_all(&dir).ok();

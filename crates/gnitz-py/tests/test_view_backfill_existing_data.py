@@ -500,7 +500,7 @@ def test_vbf_nested_live_then_restart(own_server):
 
 
 def test_vbf_chunked_backfill_long_strings(tiny_ddl_chunk_server):
-    """The backfill streams the source in `ddl_scan_chunk_rows`-sized chunks, so
+    """The backfill streams the source in `scan_chunk_rows`-sized chunks, so
     a view over a populated table must equal it row-for-row whatever the chunk
     size. Strings above the inline threshold are what make the chunking visible:
     each chunk relocates its payload into a fresh blob arena, so a value that

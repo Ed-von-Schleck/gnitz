@@ -1,7 +1,7 @@
 """Chunked distributed view backfill (boot path).
 
 A distributed CREATE-VIEW backfill streams each worker's source partition
-through the incremental plan one `ddl_scan_chunk_rows` chunk at a time, issuing
+through the incremental plan one `scan_chunk_rows` chunk at a time, issuing
 one exchange round per chunk per exchanging view across the cross-worker
 barrier. Because partitions are unequal, a worker that has drained its partition
 keeps issuing empty *pad* rounds to stay in lockstep until the master — ANDing a
@@ -12,7 +12,7 @@ These tests drive the **boot rebuild** path (`rebuild_invalid_views` →
 populated tables, crash-restart the server (the un-checkpointed view fails the
 resume verdict and is rebuilt over the recovered base data), and assert the
 rebuilt view is exact. They
-run with a shrunk `GNITZ_DDL_SCAN_CHUNK_ROWS` so even small tables span many
+run with a shrunk `GNITZ_SCAN_CHUNK_ROWS` so even small tables span many
 chunked rounds — exercising lockstep padding, the pad-bit termination, and (with
 the reclaim seam) the per-round SAL checkpoint/reset.
 
@@ -30,7 +30,7 @@ from _serverproc import NUM_WORKERS, is_debug_build
 _WORKERS = max(2, NUM_WORKERS)
 # Tiny chunk so a handful of rows per worker still produces many chunked rounds
 # (unequal partitions => lockstep padding) over a small table.
-_CHUNK_ENV = {"GNITZ_DDL_SCAN_CHUNK_ROWS": "3"}
+_CHUNK_ENV = {"GNITZ_SCAN_CHUNK_ROWS": "3"}
 
 
 def test_groupby_backfill_chunked_across_restart(own_server):

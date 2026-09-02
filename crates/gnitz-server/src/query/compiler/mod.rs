@@ -256,7 +256,7 @@ impl SchemaSource for ExtTables {
 }
 
 /// The registry answers both lookups in place: the system families are entered
-/// in it as `Borrowed` handles, so a circuit read is the same entry lookup a
+/// in it like any other relation, so a circuit read is the same entry lookup a
 /// user relation's schema is. The impl sits beside the trait because `relation`
 /// is below `query` and could only name the trait upward.
 impl SchemaSource for gnitz_store::relation::RelationRegistry {

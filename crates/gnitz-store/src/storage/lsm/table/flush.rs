@@ -21,9 +21,8 @@ impl Table {
     /// **base** round, so a `Rederive` table only folds into the RAM tier; a
     /// `SalReplay` table folds memtable + L0 into one shard, syncs it and the
     /// staged manifest, renames the manifest into place, fsyncs the directory,
-    /// and drains its deferred compaction cleanup. Used by manual FLUSH and by
-    /// the post-backfill fold, neither of which reaches the worker's checkpoint
-    /// round.
+    /// and drains its deferred compaction cleanup. Its one production caller is
+    /// the post-backfill fold, which does not reach the checkpoint round.
     pub fn flush(&mut self) -> Result<(), StorageError> {
         super::super::flush_barrier::flush_barrier([&mut *self], FlushRound::Base)
     }

@@ -56,7 +56,8 @@ impl Mirror {
                 continue;
             }
             self.registry
-                .ingest_returning_effective(table_id as i64, batch)
+                .ingest_returning_effective(table_id as i64, batch, false)
+                .map(drop)
                 .map_err(|e| self.poison(format!("applying a delta to {table_id} failed: {e}")))?;
         }
         self.note_applied(applied);

@@ -35,6 +35,18 @@ use crate::schema::key::NarrowPkOpk;
 use crate::schema::{ReduceOutKey, SchemaDescriptor};
 use crate::storage::Batch;
 
+/// Default per-worker distinct-group cap for the ad-hoc aggregate fold. Bounds
+/// the accumulator matrix at `cap × aggregates × size_of::<Accumulator>()`.
+const ADHOC_GROUP_CAP: usize = 65_536;
+
+/// [`ADHOC_GROUP_CAP`] with its `GNITZ_ADHOC_GROUP_CAP` override, read once per
+/// process. Beside the fold it bounds rather than on the registry: the read
+/// rung's one `AdhocFold::new` call is its whole reader set.
+pub(crate) fn adhoc_group_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| crate::foundation::env::env_num("GNITZ_ADHOC_GROUP_CAP", ADHOC_GROUP_CAP))
+}
+
 /// The request-scoped fold state. `pub(crate)` so `read::scan_spec` can drive
 /// it; every reduce building block it composes is reached at `pub(super)` from
 /// this descendant of `ops::reduce`.

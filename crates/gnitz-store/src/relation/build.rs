@@ -18,19 +18,10 @@ impl RelationRegistry {
     /// Opens through [`staged_dir`], so a directory this call creates is removed
     /// again if the open fails and has its parent fsynced if it succeeds.
     pub fn register(&mut self, spec: RelationSpec) -> Result<(), String> {
-        let RelationSpec {
-            id,
-            kind,
-            schema,
-            directory,
-            depth,
-            budgets,
-        } = spec;
-        let stores = staged_dir(&directory, || {
-            self.build_relation_store(kind, &directory, id, schema, budgets)
+        let stores = staged_dir(&spec.directory, || {
+            self.build_relation_store(spec.kind, &spec.directory, spec.id, spec.schema, spec.budgets)
         })?;
-        self.tables
-            .insert(id, TableEntry::new(stores, schema, kind, depth, directory, budgets));
+        self.enter(spec, stores);
         Ok(())
     }
 
@@ -80,12 +71,7 @@ impl RelationRegistry {
         // Above `ensure_dir`: a storeless kind owns no store in any process, so no
         // directory is created for one.
         let recovery = match kind {
-            RelationKind::Stream => {
-                return Ok(RelationStores {
-                    handle: StoreHandle::Detached,
-                    delta: None,
-                })
-            }
+            RelationKind::Stream => return Ok(RelationStores::detached()),
             // A view's output store and its operator traces resume from the
             // manifest the ephemeral checkpoint round stamped, or are rebuilt.
             RelationKind::View => self.rederive_source(),
@@ -93,10 +79,7 @@ impl RelationRegistry {
         };
         ensure_dir(directory)?;
         if !self.owns_stores {
-            return Ok(RelationStores {
-                handle: StoreHandle::Detached,
-                delta: None,
-            });
+            return Ok(RelationStores::detached());
         }
 
         // Widen the window where the table dir exists but its child subdir does

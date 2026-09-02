@@ -83,13 +83,19 @@ impl CatalogEngine {
 
     // -- System table accessors ------------------------------------------------
 
-    /// This family's owned store.
+    /// This family's store, from the registry that owns it.
     pub(in crate::catalog) fn sys_store(&self, family: SysFamily) -> &Table {
-        &self.sys_stores[family.index()]
+        self.registry
+            .entry(family.id())
+            .and_then(|e| e.owned_store())
+            .expect("every system family is registered at open")
     }
 
     pub(in crate::catalog) fn sys_store_mut(&mut self, family: SysFamily) -> &mut Table {
-        &mut self.sys_stores[family.index()]
+        self.registry
+            .entry_mut(family.id())
+            .and_then(|e| e.owned_store_mut())
+            .expect("every system family is registered at open")
     }
 
     /// Apply one delta to its family's storage and fire the reaction hooks —
@@ -137,7 +143,7 @@ impl CatalogEngine {
             self.submit(family, batch.clone())
         } else {
             self.registry
-                .ingest_returning_effective(table_id, batch.clone_batch())
+                .ingest_returning_effective(table_id, batch.clone_batch(), false)
                 .map(drop)
                 .map_err(|e| format!("ingest failed for table_id={table_id}: {e}"))
         }
@@ -249,21 +255,19 @@ impl CatalogEngine {
     /// too: otherwise the drain could remove a recreated same-name schema whose
     /// live path SAL replay left in the queue.
     pub(crate) fn gc_orphan_directories(&mut self) {
-        // Full on-disk path of every live table/view (user + system).
-        let live_tables: rustc_hash::FxHashSet<&str> = self.registry.directories().collect();
-
-        // Full on-disk path of every live index: `<owner_dir>/idx_<idx_id>`.
-        // Named from each circuit's `index_id` — the id the directory was
-        // created under — and not from `caches.indices_by_owner`, which holds
-        // every IDX_TAB id. The two diverge when a second index registers on a
-        // column list already covered and the first is then dropped: the circuit
-        // and its directory survive under the first registrant's id, so a cache
-        // read would find no live entry and remove a live index tree.
+        // Every live relation directory, and every live index directory under one.
+        // An index directory carries its circuit's `index_id`: a promoted circuit
+        // outlives the IDX_TAB row that named it, and this sweep must not delete it.
+        let mut live_tables: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
         let mut live_indices: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
         for (_, entry) in self.registry.entries() {
-            for ic in &entry.index_circuits {
-                live_indices.insert(index_dir(&entry.directory, ic.index_id));
-            }
+            live_tables.insert(entry.directory.as_str());
+            live_indices.extend(
+                entry
+                    .index_circuits
+                    .iter()
+                    .map(|ic| index_dir(&entry.directory, ic.index_id)),
+            );
         }
 
         // Scan only schemas the catalog knows about. We never enumerate

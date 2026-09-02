@@ -599,8 +599,8 @@ const TOPO_PRIORITY: [u8; SysFamily::COUNT] = [
 /// at the applier's mutation API in place of a bare `i64`, so the `fire_hooks`
 /// dispatch is an exhaustive `match` a newly-added family cannot silently skip.
 /// Convert to/from `i64` only at the storage edge. The discriminant indexes
-/// `gnitz_wire::SYS_FAMILIES`, `TOPO_PRIORITY`, `SCHEMAS`, and
-/// `CatalogEngine::sys_stores`.
+/// `gnitz_wire::SYS_FAMILIES`, `TOPO_PRIORITY` and `SCHEMAS`; the family's store
+/// is reached by [`SysFamily::id`] through the relation registry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SysFamily {
     Schema,

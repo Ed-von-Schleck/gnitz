@@ -551,7 +551,7 @@ impl<'a> TxnBundle<'a> {
         let mut schemas = FxHashMap::default();
         let mut overlays = FxHashMap::default();
         for &tid in &order {
-            schemas.insert(tid, disp.cat().registry().schema_or_err(tid, "txn bundle")?);
+            schemas.insert(tid, disp.cat().registry().table_entry(tid)?.schema);
             if !reads_overlay(disp, tid) {
                 continue;
             }
@@ -1038,7 +1038,7 @@ impl MasterDispatcher {
             // PK fast-path only when the referenced column *is* the parent's lone
             // PK; otherwise probe the parent's UNIQUE index by broadcast, since
             // index entries are distributed independently of the PK.
-            let parent_schema = disp.cat().registry().schema_or_err(parent_tid, "fk parent")?;
+            let parent_schema = disp.cat().registry().table_entry(parent_tid)?.schema;
             let src_type = loc.type_code();
             let (probe_schema, col_hint, broadcast) = if parent_schema.is_lone_pk_col(parent_col) {
                 (parent_schema, 0u64, false)
@@ -1530,7 +1530,7 @@ impl MasterDispatcher {
         // so a globally sorted input yields per-worker-sorted sublists.
         pks.sort_unstable();
 
-        let parent_schema = disp.cat().registry().schema_or_err(target_id, "gather")?;
+        let parent_schema = disp.cat().registry().table_entry(target_id)?.schema;
         // The exact constructor the worker uses for its reply schema, so a
         // matching reply validates by construction. A PK `ref_col` would be
         // skipped and leave the reply payload-less; the sole caller branches on

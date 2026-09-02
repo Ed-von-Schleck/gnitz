@@ -84,9 +84,8 @@ fn delta_ingest_bench() {
         let t1 = Instant::now();
         for b in batches {
             table.ingest_owned_batch(b).unwrap();
-            // The per-tick flush cadence the worker runs: a delta is not applied
-            // until it is queryable, and for a Rederive table that is
-            // flush_prepare -> flush_to_ram.
+            // Drain per tick, so this measures the RAM-tier fold rather than the
+            // memtable absorbing the whole run. Not what the worker does.
             table.flush().unwrap();
         }
         let ingest_ns = t1.elapsed().as_nanos() as f64;

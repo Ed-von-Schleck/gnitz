@@ -1,7 +1,7 @@
 //! The ingestion pipeline: unique-PK enforcement, store + secondary-index
 //! application, index projection, and the flush / checkpoint table collection.
 
-use super::{RelationRegistry, TableEntry, FIRST_USER_TABLE_ID};
+use super::{RelationKind, RelationRegistry, TableEntry};
 use crate::storage::{Batch, StorageError, Table};
 
 /// Why an ingest did not happen. The two variants differ in what a caller may
@@ -26,13 +26,12 @@ impl std::fmt::Display for IngestError {
     }
 }
 
-/// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`: substitute `Err(Io)` for the
-/// matching ingest below, so the fail-stop abort fires without a real disk
-/// fault. No one-shot latch — the process aborts on first fire. Placing the seam
-/// on the ingest path keeps `storage` seam-free and fires exactly on the
-/// push-apply/replay path (VM integration bypasses it), so a seam-armed server
-/// still boots cleanly on a pushless data dir and fails only on the first INSERT
-/// apply.
+/// `GNITZ_INJECT_INGEST_APPLY_ERROR=store|index`: report `Err(Io)` from the
+/// matching ingest below, which has already run — so what fires is the error
+/// *handling*, not a rolled-back write.
+///
+/// On the push-apply/replay path only (VM integration bypasses it), so a
+/// seam-armed server still boots on a pushless data dir.
 static INGEST_APPLY_ERROR: crate::foundation::fault::Seam =
     crate::foundation::fault::Seam::new("GNITZ_INJECT_INGEST_APPLY_ERROR");
 
@@ -52,57 +51,48 @@ impl RelationRegistry {
     /// Enforce this relation's PK rule, apply the result to its store and index
     /// projections, and hand back the effective batch — what applying a batch to
     /// a relation means.
-    fn apply(table_id: i64, entry: &mut TableEntry, batch: Batch) -> Result<Batch, StorageError> {
+    fn apply(table_id: i64, entry: &mut TableEntry, batch: Batch, needed: bool) -> Result<Option<Batch>, StorageError> {
         let effective = if entry.kind.is_base_table() {
             entry.handle.enforce_unique_pk(&entry.schema, batch)
         } else {
             batch
         };
-        if effective.count > 0 {
-            Self::ingest_store_and_indices(table_id, entry, &effective)?;
+        if effective.count == 0 {
+            return Ok(needed.then_some(effective));
         }
-        Ok(effective)
+        Self::ingest_store_and_indices(table_id, entry, effective, needed)
     }
 
     /// Ingest a view's epoch output into its own store and — when the view carries
-    /// a feed — a copy stamped with `round` into its delta store.
+    /// a feed — a copy stamped with `round` into its delta store. `round` is
+    /// `None` for a backfill, whose rows a bootstrap read already carries.
     ///
-    /// `round` is `None` for a **backfill**, whose rows never enter the delta
-    /// store: a bootstrap read of the same view already carries them.
+    /// Captured here because this is the last moment the delta exists as a batch:
+    /// the store's fold drops net-zero (PK, payload) rows, so an insert and its
+    /// later retraction annihilate and no reader could recover either.
     ///
-    /// One entry lookup for both stores, as [`Self::ingest_store_and_indices`]
-    /// already does for a relation and its index circuits. This is the only moment
-    /// a view's delta exists as an addressable object: the store ingest below
-    /// consolidates it into the memtable, whose fold drops net-zero (PK, payload)
-    /// rows, so an insert in one round and its retraction in the next annihilate
-    /// and no later reader could recover either. The capture and the ingest are
-    /// the same batch on the same worker, so every batch this store absorbs on the
-    /// tick path is captured byte-identically.
+    /// **A replicated view stamps on worker 0 alone**: every worker computes the
+    /// whole result and a delta read of one is routed to worker 0, so the other
+    /// W−1 delta stores would be written every tick and read never.
     ///
-    /// **A replicated view stamps on worker 0 alone.** `run_view_epoch`
-    /// short-circuits one: every worker holds every source in full and computes
-    /// the entire result locally, so `out_delta` is the full global delta on all
-    /// W. A delta read of such a view is routed by `replicated_unicast` to worker
-    /// 0, so the other W−1 delta stores would be written every tick and read
-    /// never. Writer and reader take "which worker holds this feed" from the same
-    /// replicated-placement fact, so they cannot come to different answers — and
-    /// if they ever did, a broadcast gather over W identical stores would hand
-    /// back every row W times, which no row-set comparison would show.
+    /// **A captured batch is consolidated once, here.** The stamp inherits its
+    /// source's layout claim, so otherwise the delta store would re-sort what the
+    /// output store just folded, and would carry the raw row count.
     ///
-    /// **A fed view consolidates once, here, and both stores take the result.**
-    /// The two ingests would otherwise sort and fold the same rows independently:
-    /// `ingest_borrowed_batch` consolidates into the memtable's owned copy, and
-    /// the stamp inherits its source's layout claim — which is `Raw` for every
-    /// operator but the single-source exchange arm, `reduce` included — so
-    /// `ingest_owned_batch` would re-sort it. Consolidating first makes the
-    /// inherited `Consolidated` claim true (prepending one constant to every key
-    /// preserves sortedness and distinctness), so the stamp is copied by value
-    /// into a store that moves rather than re-folds it, and it carries the folded
-    /// row count rather than the raw one.
-    pub fn ingest_view_delta(&mut self, view_id: i64, batch: &Batch, round: Option<u64>) -> Result<(), StorageError> {
+    /// The batch is **moved** into the output store unless `needed` — which is why
+    /// the stamp is taken first, and why it is handed back rather than cloned: the
+    /// store consolidates a borrowed `Raw` batch instead of copying it, so a
+    /// caller-side clone would be pure addition.
+    pub fn ingest_view_delta(
+        &mut self,
+        view_id: i64,
+        batch: Batch,
+        round: Option<u64>,
+        needed: bool,
+    ) -> Result<Option<Batch>, StorageError> {
         let Some(entry) = self.tables.get_mut(&view_id) else {
-            gnitz_warn!("relation: ingest_view_delta — view_id={} not registered", view_id);
-            return Ok(());
+            gnitz_warn!("relation: ingest_view_delta — relation {} is not registered", view_id);
+            return Ok(None);
         };
         debug_assert!(
             entry.kind.is_view(),
@@ -110,7 +100,7 @@ impl RelationRegistry {
              a base table would silently skip enforce_unique_pk here",
         );
         if batch.count == 0 {
-            return Ok(());
+            return Ok(needed.then_some(batch));
         }
         // The round this batch is captured under, or `None` for no capture — the
         // one decision both the fold and the stamp read. `round` leads, so a
@@ -121,14 +111,49 @@ impl RelationRegistry {
         });
         // Only a captured batch pays the up-front fold; every other view hands the
         // batch straight to the store ingest it always did.
-        let folded = capture.and_then(|_| Batch::consolidate_if_needed(batch, &entry.schema));
-        let batch = folded.as_ref().unwrap_or(batch);
-        Self::ingest_store_and_indices(view_id, entry, batch)?;
+        let folded = capture.and_then(|_| Batch::consolidate_if_needed(&batch, &entry.schema));
+        let src = folded.as_ref().unwrap_or(&batch);
+        // Stamped before the store ingest moves the batch out from under it.
+        let pending = entry
+            .delta
+            .as_ref()
+            .zip(capture)
+            .map(|(feed, r)| (feed, src.stamped_with_pk_prefix(&entry.schema, &feed.schema, r), r));
 
-        let Some((feed, round)) = entry.delta.as_ref().zip(capture) else {
-            return Ok(());
+        debug_assert!(
+            entry.index_circuits.is_empty(),
+            "a view owns no index circuits, so only its own store is written here",
+        );
+        // The fold, when one ran, is the copy the feed already paid for — so the
+        // store takes it by value either way and the caller keeps the original.
+        let (res, echo) = match (folded, needed) {
+            (Some(f), false) => (entry.handle.ingest_owned_batch(f), None),
+            (Some(f), true) => (entry.handle.ingest_owned_batch(f), Some(batch)),
+            (None, false) => (entry.handle.ingest_owned_batch(batch), None),
+            (None, true) => (entry.handle.ingest_borrowed_batch(&batch), Some(batch)),
         };
-        let stamped = batch.stamped_with_pk_prefix(&entry.schema, &feed.schema, round);
+        inject_ingest_apply_error("store", res).inspect_err(|e| {
+            gnitz_error!(
+                "relation: view output store ingest failed (view_id={}): {} — committed data \
+                 not applied, state diverged from durable SAL",
+                view_id,
+                e,
+            );
+        })?;
+
+        // A **bounded** view drains per epoch. Its capacity sweep runs off a
+        // spill and budgets itself to one push-down per spill, so the spill
+        // cadence is the sweep's granularity: draining only on the memtable's own
+        // budget leaves so few, so large shards that the first sweep dehydrates
+        // the whole view. No other view needs it — nothing else reads a spill
+        // cadence, and a delta feed's budget hangs off the spill it takes anyway.
+        if entry.budgets.capacity_bytes.is_some() {
+            entry.handle.flush()?;
+        }
+
+        let Some((feed, stamped, round)) = pending else {
+            return Ok(echo);
+        };
         if let Err(e) = feed.handle.ingest_owned_batch(stamped) {
             // Logged, not fatal, because **this round is not lost**. The batch is
             // moved into the memtable before anything fallible runs, and the only
@@ -152,7 +177,7 @@ impl RelationRegistry {
                 e,
             );
         }
-        Ok(())
+        Ok(echo)
     }
 
     /// Ingest a user-relation batch into its store + index projections and
@@ -163,20 +188,27 @@ impl RelationRegistry {
     /// `IngestError::Rejected` means nothing was applied and the request is at
     /// fault; `IngestError::Storage` means committed data did not reach the
     /// store.
-    pub fn ingest_returning_effective(&mut self, table_id: i64, batch: Batch) -> Result<Batch, IngestError> {
-        if table_id < FIRST_USER_TABLE_ID {
-            return Err(IngestError::Rejected(
-                "ingest_returning_effective not supported for system tables".to_string(),
-            ));
-        }
+    pub fn ingest_returning_effective(
+        &mut self,
+        table_id: i64,
+        batch: Batch,
+        needed: bool,
+    ) -> Result<Option<Batch>, IngestError> {
         let entry = match self.tables.get_mut(&table_id) {
             Some(e) => e,
             None => {
                 return Err(IngestError::Rejected(format!(
-                    "ingest failed for table_id={table_id}: not registered"
+                    "ingest failed: relation {table_id} is not registered"
                 )))
             }
         };
+        // The registered kind, not an id band: `TableEntry.kind` is the fact this
+        // crate owns, and every production caller is already gated on the band.
+        if entry.kind == RelationKind::SystemCatalog {
+            return Err(IngestError::Rejected(
+                "ingest_returning_effective not supported for system tables".to_string(),
+            ));
+        }
         // Width guard, ahead of `enforce_unique_pk`. A worker parked mid-epoch
         // stashes an incoming `DdlSync` and replays it at the next top-level
         // drain while still serving pushes inline, so its `TableEntry.schema` can
@@ -194,7 +226,7 @@ impl RelationRegistry {
             )));
         }
 
-        Self::apply(table_id, entry, batch).map_err(IngestError::Storage)
+        Self::apply(table_id, entry, batch, needed).map_err(IngestError::Storage)
     }
 
     /// Ingest `source` into this relation's store, then project and ingest one
@@ -208,18 +240,14 @@ impl RelationRegistry {
     /// a watchdog aborts on it and lets restart + SAL replay re-apply the batch
     /// (its WAL zone stays above the flushed-shard watermark, so it *will* be
     /// replayed); one that does not, poisons its handle.
-    fn ingest_store_and_indices(table_id: i64, entry: &TableEntry, source: &Batch) -> Result<(), StorageError> {
-        inject_ingest_apply_error("store", entry.handle.ingest_borrowed_batch(source)).inspect_err(|e| {
-            gnitz_error!(
-                "relation: base-table ingest failed (table_id={}): {} — committed data \
-                 not applied, state diverged from durable SAL",
-                table_id,
-                e,
-            );
-        })?;
-
+    fn ingest_store_and_indices(
+        table_id: i64,
+        entry: &TableEntry,
+        source: Batch,
+        needed: bool,
+    ) -> Result<Option<Batch>, StorageError> {
         for ic in entry.index_circuits.iter() {
-            let idx_batch = crate::storage::batch_project_index(source, &ic.key_spec, &ic.index_schema);
+            let idx_batch = crate::storage::batch_project_index(&source, &ic.key_spec, &ic.index_schema);
             if idx_batch.count > 0 {
                 let index_id = ic.index_id;
                 inject_ingest_apply_error("index", ic.ingest_owned_batch(idx_batch)).inspect_err(|e| {
@@ -233,14 +261,28 @@ impl RelationRegistry {
                 })?;
             }
         }
-        Ok(())
+        // Last, so a caller that does not want the batch back lets the store move
+        // it instead of copying it.
+        let (res, effective) = match needed {
+            false => (entry.handle.ingest_owned_batch(source), None),
+            true => (entry.handle.ingest_borrowed_batch(&source), Some(source)),
+        };
+        inject_ingest_apply_error("store", res).inspect_err(|e| {
+            gnitz_error!(
+                "relation: store ingest failed (table_id={}): {} — committed data \
+                 not applied, state diverged from durable SAL",
+                table_id,
+                e,
+            );
+        })?;
+        Ok(effective)
     }
 
     // ── Flush / checkpoint collection ───────────────────────────────────
 
-    /// Flush a table's WAL through the store handle and every index circuit.
-    /// An unregistered `table_id` is a caller bug (debug_assert), a no-op in
-    /// release; `Err` is always a storage fault.
+    /// Flush a relation's store and every index circuit on it. Its one production
+    /// caller ends a backfill, so it always names a view, which owns no circuit —
+    /// only tests reach the loop. Unregistered is a caller bug; `Err` is storage.
     pub fn flush(&mut self, table_id: i64) -> Result<(), StorageError> {
         let Some(entry) = self.tables.get_mut(&table_id) else {
             debug_assert!(false, "flush of unregistered table_id {table_id}");
@@ -253,16 +295,14 @@ impl RelationRegistry {
         Ok(())
     }
 
-    /// Every store this process **owns and checkpoints**: each relation's `Owned`
-    /// handle plus its index-circuit tables. `Borrowed` and `Detached` handles
-    /// drop out — that is what keeps workers from barrier-flushing their inherited
-    /// `_sys` copies.
+    /// Every **user** store this process owns and checkpoints: each relation's
+    /// own `Table` plus its index-circuit tables. Excluding the system families
+    /// by kind is what stops a forked worker flushing its inherited `_sys` copy.
     ///
-    /// A fed view's delta store is `Owned` and is deliberately **not** here, which
-    /// is what puts it in neither checkpoint round: it publishes no manifest and is
-    /// erased at open, so there is nothing a restart could resume it from. That is
-    /// also what makes its shard unlinking immediate rather than deferred to the
-    /// post-publish drain this set feeds (`ShardIndex::evict_by_drop`).
+    /// A fed view's delta store is deliberately **not** here, which is what puts
+    /// it in neither checkpoint round: it publishes no manifest and is erased at
+    /// open, so nothing could resume it. That is also what makes its shard
+    /// unlinking immediate rather than deferred to the drain this set feeds.
     ///
     /// Both checkpoint rounds start from this one set and let `Table` decide:
     /// the base round is handed it whole (`flush_prepare` publishes the durable
@@ -271,18 +311,30 @@ impl RelationRegistry {
     /// touch" from the relation kind, so the two cannot drift apart.
     ///
     /// A `Vec` of `&mut Table` rather than a keyed lookup: an owned trace table is
-    /// not in `self.tables` at all. `StoreHandle::as_owned_mut` hands a `&mut` out
-    /// of an `UnsafeCell`, so it owns the disjointness argument, not the borrow
-    /// checker.
+    /// not in `self.tables` at all.
     pub fn collect_base_flush_tables(&mut self) -> Vec<&mut Table> {
         let mut out: Vec<&mut Table> = Vec::new();
         for entry in self.tables.values_mut() {
-            if let Some(t) = entry.handle.as_owned_mut() {
+            if entry.kind == RelationKind::SystemCatalog {
+                continue;
+            }
+            if let Some(t) = entry.handle.owned_mut() {
                 out.push(t);
             }
-            out.extend(entry.index_circuits.iter().filter_map(|ic| ic.handle.as_owned_mut()));
+            out.extend(entry.index_circuits.iter_mut().filter_map(|ic| ic.handle.owned_mut()));
         }
         out
+    }
+
+    /// The system families' stores, all borrowed at once — what one flush barrier
+    /// needs and a one-at-a-time accessor cannot hand out. The complement of
+    /// [`Self::collect_base_flush_tables`], on the same kind test.
+    pub fn collect_system_flush_tables(&mut self) -> Vec<&mut Table> {
+        self.tables
+            .values_mut()
+            .filter(|e| e.kind == RelationKind::SystemCatalog)
+            .filter_map(TableEntry::owned_store_mut)
+            .collect()
     }
 
     /// True when a base round would publish a cut newer than the last one.

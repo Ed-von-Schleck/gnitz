@@ -290,7 +290,7 @@ fn pk_set_drains_a_group_larger_than_the_chunk_budget() {
             .map(|i| (1u64, i as i64, 1i64))
             .chain(std::iter::once((2u64, 99i64, 1i64))),
     );
-    e.registry_mut().set_ddl_scan_chunk_rows(4);
+    e.registry_mut().set_scan_chunk_rows(4);
     let got = run(&mut e, vid, &identity_spec(ReadBound::PkSet(vec![1, 2]), vec![], 0));
     let want: Vec<_> = (0..10i64)
         .map(|v| (1u128, v, 1i64))
@@ -478,7 +478,7 @@ fn huge_limit_does_not_truncate_the_early_stop() {
     // wrong answer at a trust boundary.
     let (mut e, tid) = fixture("ss_huge_limit", 40, |i| i as i64);
     // Five chunks, so a wrapped window cuts the scan after the first one.
-    e.registry_mut().set_ddl_scan_chunk_rows(8);
+    e.registry_mut().set_scan_chunk_rows(8);
     for limit_k in [1u64 << 63, u64::MAX] {
         let mut got = run(&mut e, tid, &identity_spec(ReadBound::None, vec![], limit_k));
         got.sort();
@@ -503,7 +503,7 @@ fn proj_fixture(
     put_row: impl FnMut(&mut BatchBuilder, u64),
 ) -> (CatalogEngine, i64) {
     let (mut engine, tid) = ingest_fixture(name, cols, n, 1, put_row);
-    engine.registry_mut().set_ddl_scan_chunk_rows(chunk_rows);
+    engine.registry_mut().set_scan_chunk_rows(chunk_rows);
     (engine, tid)
 }
 
@@ -731,7 +731,7 @@ fn projection_missing_an_output_slot_errs() {
 #[test]
 fn gather_top_k_keeps_boundary_row_whole() {
     let (mut e, tid) = weighted_fixture("ss_gather_topk", (0..40u64).map(|id| (id, id as i64, 3i64)));
-    e.registry_mut().set_ddl_scan_chunk_rows(8);
+    e.registry_mut().set_scan_chunk_rows(8);
     // Reply: id U64 PK | val I64 — a gather of the single payload column.
     let reply = e.registry().get_schema_desc(tid).unwrap();
     let order = vec![OrderKey {

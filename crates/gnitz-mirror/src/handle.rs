@@ -207,7 +207,7 @@ impl Mirror {
     /// manifest, so a failed removal leaves nothing resumable behind.
     pub(crate) fn retract(&mut self, tid: u64) {
         self.records.remove(&tid);
-        let dir = self.registry.table_directory(tid as i64).map(str::to_string);
+        let dir = self.registry.entry(tid as i64).map(|e| e.directory.clone());
         self.registry.unregister(tid as i64);
         if let Some(dir) = dir {
             let _ = std::fs::remove_dir_all(&dir);
@@ -230,7 +230,7 @@ impl Mirror {
     /// climbed back past it, and a store resumed that way is old shards read
     /// under a new schema.
     fn reclaim_unnamed_copies(&self) {
-        let live: HashSet<&str> = self.registry.directories().collect();
+        let live: HashSet<&str> = self.registry.entries().map(|(_, e)| e.directory.as_str()).collect();
         for schema_name in subdir_names(&self.copies_root) {
             let schema_dir = format!("{}/{schema_name}", self.copies_root);
             for name in subdir_names(&schema_dir) {

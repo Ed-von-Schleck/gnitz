@@ -147,7 +147,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
 }
 
 // ── index_rebuilds_across_chunk_boundary ─────────────────────────────────
-// Boot backfills stream the source in DDL_SCAN_CHUNK_ROWS-sized chunks. The
+// Boot backfills stream the source in SCAN_CHUNK_ROWS-sized chunks. The
 // chunk size cannot be shrunk before open() (the backfill runs during shard
 // replay, before any test code can touch the engine), so exercise the real
 // boundary with a base table one chunk plus a remainder wide. The secondary
@@ -159,7 +159,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
 
 #[test]
 fn index_rebuilds_across_chunk_boundary() {
-    let n: usize = gnitz_store::relation::DDL_SCAN_CHUNK_ROWS + 3;
+    let n: usize = gnitz_store::relation::SCAN_CHUNK_ROWS + 3;
     let dir = temp_dir("reopen_rebuild_chunked");
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();

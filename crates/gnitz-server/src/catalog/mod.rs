@@ -49,7 +49,7 @@ use std::fs;
 use std::rc::Rc;
 
 use crate::query::DagEngine;
-use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec};
+use gnitz_store::relation::{RelationKind, RelationRegistry, RelationSpec, ViewBudgets};
 use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, ReadCursor, RecoverySource, StorageError, Table};
 
@@ -140,13 +140,6 @@ pub(crate) struct CatalogEngine {
     /// the master's boot rebuild sweep and the per-worker output reset. Empty on
     /// a clean same-topology restart (every view resumes).
     pub(in crate::catalog) invalid_views: rustc_hash::FxHashSet<i64>,
-
-    // --- System tables (owned, one `Table` each, durable) ---
-    //
-    // One store per family, indexed by `SysFamily` discriminant (parallel to
-    // `SYS_FAMILIES`). The `Box` keeps each table's heap address stable, so the
-    // `Borrowed(*mut Table)` DAG registrations survive engine moves.
-    pub(in crate::catalog) sys_stores: [Box<Table>; SysFamily::COUNT],
 
     // --- Pending broadcasts (ordered innermost → outermost) ---
     //

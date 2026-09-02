@@ -229,8 +229,7 @@ impl CatalogEngine {
         } else {
             let entry = self
                 .registry
-                .table_entry(col.fk_table_id)
-                .ok()
+                .entry(col.fk_table_id)
                 .ok_or_else(|| format!("FK references unknown table_id {}", col.fk_table_id))?;
             // Not covered by the PK/UNIQUE tests below, which read only the schema:
             // a stream and a view both have a PK that looks exactly like a base
@@ -380,8 +379,7 @@ impl CatalogEngine {
 
             let Some((is_base, owner_schema)) = self
                 .registry
-                .table_entry(owner_id)
-                .ok()
+                .entry(owner_id)
                 .map(|e| (e.kind.is_base_table(), e.schema))
             else {
                 if sig.neg.is_some() {
@@ -602,8 +600,7 @@ impl CatalogEngine {
         }
         let entry = self
             .registry
-            .table_entry(owner_id)
-            .ok()
+            .entry(owner_id)
             .ok_or_else(|| format!("Index: owner table {owner_id} not found"))?;
         if !entry.kind.is_base_table() {
             return Err(format!(
@@ -683,8 +680,7 @@ impl CatalogEngine {
             // transaction is making it.
             let owner_kind = self
                 .registry
-                .table_entry(owner_id)
-                .ok()
+                .entry(owner_id)
                 .map(|e| {
                     if e.kind.is_view() {
                         OWNER_KIND_VIEW

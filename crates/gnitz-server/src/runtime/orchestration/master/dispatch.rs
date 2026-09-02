@@ -742,7 +742,7 @@ impl MasterDispatcher {
         seek_pk_extra: &[u8],
     ) -> Result<W2mSlot, String> {
         let num_workers = self.num_workers;
-        let schema = self.cat().registry().schema_or_err(target_id, "seek")?;
+        let schema = self.cat().registry().table_entry(target_id)?.schema;
         // Decode the wire pair to the OPK bytes (width-universal), then route off
         // the distribution prefix via the shared `worker_for_pk`. A Seek
         // always carries the full PK and the prefix ⊆ the PK, so a full-PK seek

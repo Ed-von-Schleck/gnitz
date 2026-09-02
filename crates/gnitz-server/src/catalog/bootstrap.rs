@@ -19,7 +19,7 @@ impl CatalogEngine {
 
         // Create system tables (one `Table` each; durability derived from the
         // kind they are later registered under).
-        let mut stores = Vec::with_capacity(SysFamily::COUNT);
+        let mut stores: Vec<Table> = Vec::with_capacity(SysFamily::COUNT);
         for family in SysFamily::ALL {
             let table = Table::new(
                 &sys_family_dir(base_dir, family.name()),
@@ -27,16 +27,12 @@ impl CatalogEngine {
                 family.id() as u32,
                 RecoverySource::SalReplay,
             )
-            .map(Box::new)
             .map_err(|e| format!("Failed to create system table '{}': error {}", family.name(), e))?;
             stores.push(table);
         }
-        let sys_stores: [Box<Table>; SysFamily::COUNT] = stores
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("one store per family"));
 
         // Check if this is a fresh database (no table records yet)
-        let is_new = !sys_stores[SysFamily::Table.index()].open_cursor().valid;
+        let is_new = !stores[SysFamily::Table.index()].open_cursor().valid;
 
         let mut engine = CatalogEngine {
             registry: RelationRegistry::new(num_workers),
@@ -50,12 +46,15 @@ impl CatalogEngine {
             user_sequences: std::collections::HashMap::new(),
             durable_generation: 0,
             invalid_views: rustc_hash::FxHashSet::default(),
-            sys_stores,
             pending_broadcasts: Vec::new(),
             pending_dir_deletions: Vec::new(),
             checkpoint_gated_deletions: Vec::new(),
             ctx: ApplyContext::new(),
         };
+
+        // Ahead of every path below, all of which reach a store through
+        // `sys_store`, which resolves through the registry.
+        engine.register_system_table_families(stores);
 
         if is_new {
             engine.bootstrap_system_tables()?;
@@ -70,10 +69,6 @@ impl CatalogEngine {
         // completed checkpoint.
         let g = engine.durable_generation;
         engine.registry_mut().set_resume_generation(g);
-
-        // Register system table families — including the three circuit families,
-        // which is what makes the compiler's circuit reads a registry lookup.
-        engine.register_system_table_families();
 
         // Phase 2: Replay catalog through hooks
         engine.replay_catalog()?;
@@ -176,25 +171,21 @@ impl CatalogEngine {
 
     // -- Register system table families ------------------------------------
 
-    /// Enter each system family in the relation registry as a `Borrowed` handle on
-    /// its `sys_stores` box, so every store path resolves a system table through
-    /// the same registry lookup as a user relation. Their name/id caches are not
-    /// seeded here: `replay_catalog` (next) replays SCHEMA_TAB and TABLE_TAB
-    /// through the appliers, which fill them from the persisted rows. The
-    /// registration itself must precede that replay — `hook_relation_register`
-    /// skips an already-registered id, which is what keeps a system family from
-    /// being re-registered as a user relation.
-    fn register_system_table_families(&mut self) {
+    /// Hand each system family's store to the registry, which owns it from here
+    /// on — so a system table resolves like any user relation, and the later
+    /// `replay_catalog` skips its id instead of re-entering it as a user one.
+    fn register_system_table_families(&mut self, stores: Vec<Table>) {
         let base_dir = self.base_dir.clone();
-        for (family, store) in SysFamily::ALL.into_iter().zip(self.sys_stores.iter_mut()) {
-            let dir = sys_family_dir(&base_dir, family.name());
-            // SAFETY: each family's `Table` is boxed in `sys_stores`, whose heap
-            // address is stable across engine moves, and `close` drops the
-            // registry before those boxes.
-            unsafe {
-                self.registry
-                    .register_borrowed(family.id(), store, family.schema(), RelationKind::SystemCatalog, dir);
-            }
+        for (family, store) in SysFamily::ALL.into_iter().zip(stores) {
+            let spec = RelationSpec {
+                id: family.id(),
+                kind: RelationKind::SystemCatalog,
+                schema: family.schema(),
+                directory: sys_family_dir(&base_dir, family.name()),
+                depth: 0,
+                budgets: ViewBudgets::default(),
+            };
+            self.registry.register_owned(spec, Box::new(store));
         }
     }
 
@@ -235,9 +226,7 @@ impl CatalogEngine {
         // family's manifest, data and directory syncs into three submissions and
         // builds at most one io_uring. System tables are `SalReplay`, so each
         // folds memtable + L0 into a durable shard and re-stamps its manifest.
-        let tables = self.sys_stores.iter_mut().map(|b| &mut **b);
-        gnitz_store::storage::flush_barrier(tables, gnitz_store::storage::FlushRound::Base)
-            .map_err(|e| format!("boot flush of the system catalog failed: {e:?}"))
+        base_round(self.registry.collect_system_flush_tables(), "system catalog flush")
     }
 
     /// The base round over every store this process owns, in **one** barrier —
@@ -246,9 +235,7 @@ impl CatalogEngine {
     /// commit per table, where the batched set joins one. It trades peak dirty
     /// page cache and a table id in the error message for that.
     pub(crate) fn flush_base_round(&mut self) -> Result<(), String> {
-        let tables = self.registry.collect_base_flush_tables();
-        gnitz_store::storage::flush_barrier(tables, gnitz_store::storage::FlushRound::Base)
-            .map_err(|e| format!("base flush: {e}"))
+        base_round(self.registry.collect_base_flush_tables(), "base flush")
     }
 
     /// The ephemeral checkpoint round: force-persist every view's operator-trace
@@ -277,7 +264,7 @@ impl CatalogEngine {
     }
 
     /// Flush every store this engine owns that a restart could read back — each
-    /// user table's owned handle and then the system tables — and clear the DAG.
+    /// user table's own store and then the system tables — and clear the DAG.
     /// Consuming, so nothing can touch a closed engine; dropping one instead
     /// releases the directory lock without flushing, which is what the
     /// crash-semantics tests want.
@@ -290,14 +277,20 @@ impl CatalogEngine {
     /// abort or process teardown.
     #[cfg(test)]
     pub(crate) fn close(mut self) {
-        // The user relations first, through the same batched base round the
-        // checkpoint takes; the system tables hold `Borrowed` handles and are
-        // flushed below.
+        // Both rounds run before `registry.close()` drops the stores they flush;
+        // with no SAL under a unit test this close is their only durability.
         let _ = self.flush_base_round();
-        // `RelationRegistry::close` drops each owned `Box<Table>` automatically.
+        let _ = self.flush_all_system_tables();
         self.registry.close();
         self.dag.close();
-        let _ = self.flush_all_system_tables();
         // `self` drops here: the stores first, then the lock, in field order.
     }
+}
+
+/// One `Base` barrier over `tables`, labelled `what`. Both base rounds above go
+/// through it, so neither can flush a user store under a different round than
+/// the system catalog gets.
+fn base_round<'a>(tables: impl IntoIterator<Item = &'a mut Table>, what: &str) -> Result<(), String> {
+    gnitz_store::storage::flush_barrier(tables, gnitz_store::storage::FlushRound::Base)
+        .map_err(|e| format!("{what}: {e}"))
 }

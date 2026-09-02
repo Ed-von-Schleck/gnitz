@@ -499,7 +499,7 @@ fn test_ddl_sync_zone_lsn_tracking() {
         engine
             .registry()
             .table_entry(SCHEMA_TAB_ID)
-            .map_or(0, |e| e.current_lsn()),
+            .map_or(0, |e| e.owned_store().map_or(0, Table::current_lsn)),
         5
     );
 
@@ -512,18 +512,21 @@ fn test_ddl_sync_zone_lsn_tracking() {
         engine
             .registry()
             .table_entry(TABLE_TAB_ID)
-            .map_or(0, |e| e.current_lsn()),
+            .map_or(0, |e| e.owned_store().map_or(0, Table::current_lsn)),
         7
     );
     assert_eq!(
-        engine.registry().table_entry(COL_TAB_ID).map_or(0, |e| e.current_lsn()),
+        engine
+            .registry()
+            .table_entry(COL_TAB_ID)
+            .map_or(0, |e| e.owned_store().map_or(0, Table::current_lsn)),
         7
     );
     assert_eq!(
         engine
             .registry()
             .table_entry(SCHEMA_TAB_ID)
-            .map_or(0, |e| e.current_lsn()),
+            .map_or(0, |e| e.owned_store().map_or(0, Table::current_lsn)),
         5,
         "SCHEMA_TAB stays at the most recent zone that touched it"
     );
@@ -535,11 +538,14 @@ fn test_ddl_sync_zone_lsn_tracking() {
         engine
             .registry()
             .table_entry(TABLE_TAB_ID)
-            .map_or(0, |e| e.current_lsn()),
+            .map_or(0, |e| e.owned_store().map_or(0, Table::current_lsn)),
         9
     );
     assert_eq!(
-        engine.registry().table_entry(COL_TAB_ID).map_or(0, |e| e.current_lsn()),
+        engine
+            .registry()
+            .table_entry(COL_TAB_ID)
+            .map_or(0, |e| e.owned_store().map_or(0, Table::current_lsn)),
         9
     );
 
@@ -577,9 +583,9 @@ fn test_store_detach() {
     engine.registry_mut().detach_user_stores();
     assert!(!engine.registry().owns_stores());
     let entry = engine.registry().table_entry(tid).unwrap();
-    assert!(entry.is_storeless());
+    assert!(entry.owned_store().is_none());
     assert!(!entry.open_cursor().valid, "a detached store reads empty");
-    assert_eq!(entry.current_lsn(), 0);
+    assert_eq!(entry.owned_store().map_or(0, Table::current_lsn), 0);
     engine.dag_mut().invalidate_all();
 
     engine.close();

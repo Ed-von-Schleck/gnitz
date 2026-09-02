@@ -240,13 +240,14 @@ fn recover_from_sal(
             // committed data.
             let effective = catalog
                 .registry_mut()
-                .ingest_returning_effective(tid, owned)
+                .ingest_returning_effective(tid, owned, true)
                 .map_err(|e| {
                     format!(
                         "SAL replay apply failed (table_id={}, lsn={}): {e}",
                         msg.target_id, msg.lsn
                     )
-                })?;
+                })?
+                .expect("asked for the effective batch");
             // Buffer the effective delta for the sweep; viewless bases discard it
             // (nothing to drive).
             if buffered_bases.contains(&tid) {
@@ -641,8 +642,8 @@ fn run_server(
 
     // The catalog becomes a raw pointer only here, immediately above the fork:
     // `run_worker_child` and `MasterDispatcher` are what need one, and everything
-    // above took `&mut`. `Borrowed(*mut Table)` handles point into `sys_stores`'
-    // boxed `Table`s, whose addresses this move does not disturb.
+    // above took `&mut`. Every store it holds is behind a `Box` the registry
+    // owns, so the move disturbs no address.
     let catalog_ptr = Box::into_raw(Box::new(catalog));
 
     // --- Fork workers ---

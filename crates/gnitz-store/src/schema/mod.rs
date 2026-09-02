@@ -514,6 +514,15 @@ impl SchemaDescriptor {
         &self.pk_indices[..self.pk_count as usize]
     }
 
+    /// True when `self` is `prev` with zero or more columns appended — every
+    /// column `prev` had keeping its position, `type_code` and PK membership.
+    /// What leaves a baked span-encode plan's offsets and payload slots valid.
+    pub fn is_trailing_append_of(&self, prev: &SchemaDescriptor) -> bool {
+        self.pk_indices() == prev.pk_indices()
+            && self.num_columns() >= prev.num_columns()
+            && (0..prev.num_columns()).all(|i| self.columns[i].type_code == prev.columns[i].type_code)
+    }
+
     /// Same column count, PK indices, and per-column `type_code`.
     ///
     /// Deliberately ignores per-column `nullable` (and `size`/`is_signed`, which

@@ -342,11 +342,7 @@ impl CatalogEngine {
         // Every base table needs the lock: its writes run `enforce_unique_pk`
         // against the store, and only a base table can own a unique secondary
         // index. Views and system tables need it only as an FK endpoint.
-        let is_base_table = self
-            .registry
-            .table_entry(tid)
-            .ok()
-            .is_some_and(|e| e.kind.is_base_table());
+        let is_base_table = self.registry.entry(tid).is_some_and(|e| e.kind.is_base_table());
 
         let needs = fk_child_count > 0 || fk_parent_count > 0 || is_base_table;
         if needs {

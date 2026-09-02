@@ -1731,20 +1731,18 @@ async fn handle_seek_by_index(
     }
 }
 
-/// The relation a RESOLVE names, with its kind — or `None` when it names none.
-/// `Err` is the one hard failure a resolve has: an unusable request blob, or a
-/// schema that does not exist.
+/// The relation a RESOLVE names, with its kind and its wire class — or `None`
+/// when it names none. `Err` is the one hard failure a resolve has: an unusable
+/// request blob, or a schema that does not exist.
 ///
-/// The `registry.relation_kind` lookup is the gate that makes the id safe to
-/// describe: `read_column_defs` seeks `pack_column_id(owner_id, 0)`, whose range
-/// check would abort the master on an out-of-range owner, and only ids
-/// `allocate_table_id` issued reach the registry. Returning the kind is what
-/// lets the caller consume that proof instead of re-asserting it.
+/// The registry lookup is the gate that makes the id safe to describe:
+/// `read_column_defs` would abort the master on an out-of-range owner. Kind and
+/// class come back off it, so the caller consumes that proof instead of re-resolving.
 fn resolve_request_target(
     shared: &Rc<Shared>,
     target_id: i64,
     name_blob: &[u8],
-) -> Result<Option<(i64, RelationKind)>, String> {
+) -> Result<Option<(i64, RelationKind, gnitz_wire::RelClass)>, String> {
     // By-id: the tid is the client's, unvalidated until the gate below. By-name:
     // the blob is the canonical `"schema_name.relation_name"`, which is exactly
     // the `entity_by_qname` key.
@@ -1776,8 +1774,8 @@ fn resolve_request_target(
     Ok(shared
         .cat()
         .registry()
-        .relation_kind(candidate)
-        .map(|kind| (candidate, kind)))
+        .entry(candidate)
+        .map(|e| (candidate, e.kind, e.class())))
 }
 
 /// Build the RESOLVE reply: the schema block plus the [`gnitz_wire::RelDescriptorBlob`]
@@ -1790,7 +1788,7 @@ fn build_resolve_reply(
     target_id: i64,
     name_blob: &[u8],
 ) -> Result<PooledSendBuf, String> {
-    let Some((tid, kind)) = resolve_request_target(shared, target_id, name_blob)? else {
+    let Some((tid, kind, class)) = resolve_request_target(shared, target_id, name_blob)? else {
         // Relation absent is a successful answer, not an error: the client owes a
         // different wording per entry point ("Table …", "Table or view …",
         // `Ok(None)`), so it renders it itself. An empty descriptor blob says so,
@@ -1832,11 +1830,6 @@ fn build_resolve_reply(
             is_unique: ic.is_unique,
         })
         .collect();
-    let class = shared
-        .cat()
-        .registry()
-        .relation_class(tid)
-        .expect("registered: the kind probe above already answered for this tid");
     let blob = gnitz_wire::RelDescriptorBlob {
         class,
         replicated,

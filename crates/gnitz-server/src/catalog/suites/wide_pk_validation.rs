@@ -27,19 +27,10 @@ fn wide_val_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], u64, i64)]) -> B
     b.finish()
 }
 
-/// Register a wide-PK table on `engine.dag` with a UNIQUE secondary index on
-/// the `val` column (source col 3), seeded with `base_rows` in both the base
-/// table and the projected index. Bypasses `create_table` (stride gate) and
-/// `ingest_to_family`, seeding the base and index tables directly so it can
-/// attach a unique secondary index over an explicit wide PK with byte-level
-/// control; it does not exercise the enforcement path. The dag borrows the base
-/// table; the caller must keep the returned Box alive for the engine's use.
-fn setup_wide_unique(
-    engine: &mut CatalogEngine,
-    tid: i64,
-    dir: &str,
-    base_rows: &[([u8; 24], u64, i64)],
-) -> Box<Table> {
+/// Register a wide-PK table owning a UNIQUE secondary index on col 3, seeded
+/// with `base_rows` in both stores. Bypasses `create_table`'s stride gate and
+/// `ingest_to_family`, so it does not exercise the enforcement path.
+fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows: &[([u8; 24], u64, i64)]) {
     let schema = wide_unique_schema();
     let idx_schema = make_index_schema(&[3], &schema).unwrap();
 
@@ -71,17 +62,20 @@ fn setup_wide_unique(
     idx.ingest_owned_batch(idx_batch).unwrap();
     idx.flush().unwrap();
 
-    // SAFETY: the fixture owns the box and returns it, so the store outlives
-    // the engine it is registered in.
-    unsafe {
-        engine
-            .registry_mut()
-            .register_borrowed(tid, &mut base, schema, RelationKind::BaseTable, dir.to_string());
-    }
+    engine.registry_mut().register_owned(
+        RelationSpec {
+            id: tid,
+            kind: RelationKind::BaseTable,
+            schema,
+            directory: dir.to_string(),
+            depth: 0,
+            budgets: ViewBudgets::default(),
+        },
+        base,
+    );
     engine
         .registry_mut()
         .add_index_circuit(tid, &[3], tid + 1, Box::new(idx), idx_schema, true);
-    base
 }
 
 // ── index_circuit_for_col existence + uniqueness lookup ────────────────
@@ -93,7 +87,7 @@ fn index_circuit_for_col_finds_index_and_uniqueness() {
     let tid = engine.next_table_id;
 
     // setup_wide_unique installs a UNIQUE secondary index on source col 3.
-    let _base = setup_wide_unique(&mut engine, tid, &dir, &[(pk24(1, 1, 1), 42, 1)]);
+    setup_wide_unique(&mut engine, tid, &dir, &[(pk24(1, 1, 1), 42, 1)]);
 
     // The indexed column resolves to its circuit, carrying the uniqueness flag.
     let ic = engine
@@ -128,26 +122,28 @@ fn wide_pk_seek_family_bytes_resolves_non_pk_col() {
     let parent_schema = wide_unique_schema(); // [u64;4], pk [0,1,2], col 3 = email
     let parent_pk = pk24(100, 200, 300);
     let pb = wide_val_batch(&parent_schema, &[(parent_pk, 555, 1)]);
-    let mut pbase = Table::new(
-        &format!("{dir}/p_base"),
-        parent_schema,
-        parent_tid as u32,
-        RecoverySource::Rederive { resume_at: None },
-    )
-    .unwrap();
+    let mut pbase = Box::new(
+        Table::new(
+            &format!("{dir}/p_base"),
+            parent_schema,
+            parent_tid as u32,
+            RecoverySource::Rederive { resume_at: None },
+        )
+        .unwrap(),
+    );
     pbase.ingest_owned_batch(pb).unwrap();
     pbase.flush().unwrap();
-    // SAFETY: the fixture owns the box and returns it, so the store outlives
-    // the engine it is registered in.
-    unsafe {
-        engine.registry_mut().register_borrowed(
-            parent_tid,
-            &mut pbase,
-            parent_schema,
-            RelationKind::BaseTable,
-            dir.clone(),
-        );
-    }
+    engine.registry_mut().register_owned(
+        RelationSpec {
+            id: parent_tid,
+            kind: RelationKind::BaseTable,
+            schema: parent_schema,
+            directory: dir.clone(),
+            depth: 0,
+            budgets: ViewBudgets::default(),
+        },
+        pbase,
+    );
 
     // seek_family_bytes must resolve the committed parent row by full PK bytes.
     let seen = engine

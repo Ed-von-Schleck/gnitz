@@ -1,7 +1,6 @@
-//! End-to-end microbenchmark for the RAM-tier per-tick flush policy: the
-//! composition of `fold_memtable_into_l0` (memtable consolidation), the RAM
-//! tier's own fold at `FOLD_THRESHOLD` (window re-merge + re-materialize) and
-//! the ceiling spill in `flush_to_ram`, driven at the production thresholds.
+//! End-to-end microbenchmark for the RAM-tier drain path at production
+//! thresholds: `fold_memtable_into_l0`, the tier's own fold at `FOLD_THRESHOLD`
+//! (window re-merge + re-materialize) and the ceiling spill in `flush_to_ram`.
 //!
 //! This is the bench a compaction-policy change must move, and the one whose
 //! `perf` profile must reproduce the e2e worker hot-symbol shape. As a child
@@ -113,11 +112,15 @@ fn start_compaction_sweep() -> crate::test_rng::Rng {
     crate::test_rng::Rng::new(0x5EED_1234)
 }
 
-/// The per-tick flush-policy cost at production thresholds. See the module doc.
+/// The drain-cadence cost at production thresholds. See the module doc.
+///
+/// `GNITZ_BENCH_FLUSH=0` drops the per-tick `flush()` and lets the memtable
+/// drain on its own budget — the two arms price one cadence against the other.
 ///
 /// ```text
-/// cargo test -p gnitz-store --release flush_cadence_amplification_bench \
-///     -- --ignored --nocapture --test-threads=1
+/// for f in 1 0; do GNITZ_BENCH_FLUSH=$f \
+///   cargo test -p gnitz-store --release flush_cadence_amplification_bench \
+///     -- --ignored --nocapture --test-threads=1; done
 /// ```
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
@@ -125,6 +128,7 @@ fn flush_cadence_amplification_bench() {
     use std::hint::black_box;
     use std::time::Instant;
 
+    let per_tick_flush = crate::foundation::env::env_flag("GNITZ_BENCH_FLUSH", true);
     let schema = pk_u64_two_i64_schema();
 
     // Untimed warmup: warm the thread-local batch pool before the first config.
@@ -139,7 +143,9 @@ fn flush_cadence_amplification_bench() {
         .unwrap();
         for batch in gen_distinct(&schema, 4, 50) {
             table.ingest_owned_batch(batch).unwrap();
-            table.flush().unwrap();
+            if per_tick_flush {
+                table.flush().unwrap();
+            }
         }
     }
 
@@ -171,17 +177,20 @@ fn flush_cadence_amplification_bench() {
         let mut merged_out: usize = 0;
         let t = Instant::now();
         for batch in ticks {
-            // Sampled before the fold; +1 accounts for the incoming fold's run.
             let runs_before = table.ram_tier.len();
             table.ingest_owned_batch(batch).unwrap();
-            table.flush().unwrap(); // Rederive → flush_prepare → flush_to_ram
-            if runs_before + 1 >= FOLD_THRESHOLD {
+            if per_tick_flush {
+                table.flush().unwrap(); // Rederive → flush_prepare → flush_to_ram
+            }
+            // Only a fold shrinks the set, and it re-materializes the whole window
+            // — so the post-fold row count is what that merge wrote.
+            if table.ram_tier.len() < runs_before {
                 merged_out += table.ram_tier.row_count();
             }
         }
         let secs = t.elapsed().as_secs_f64();
 
-        assert!(merged_out > 0, "{label}: compaction never fired");
+        assert!(merged_out > 0 || !per_tick_flush, "{label}: compaction never fired");
         assert!(
             table.ram_tier.len() <= FOLD_THRESHOLD,
             "{label}: RAM-tier run bound violated",
@@ -190,8 +199,12 @@ fn flush_cadence_amplification_bench() {
 
         let rps = ingested as f64 / secs;
         let amp = merged_out as f64 / ingested as f64;
+        let arm = match per_tick_flush {
+            true => "per-tick-flush",
+            false => "memtable-budget",
+        };
         println!(
-            "flush_cadence/{label}: {ingested} rows / {ticks_n} ticks in {secs:.3}s = {rps:.0} ingest-rows/s  merged-out {merged_out} rows  amp {amp:.1}x"
+            "flush_cadence/{label} [{arm}]: {ingested} rows / {ticks_n} ticks in {secs:.3}s = {rps:.0} ingest-rows/s  merged-out {merged_out} rows  amp {amp:.1}x"
         );
     }
 }
