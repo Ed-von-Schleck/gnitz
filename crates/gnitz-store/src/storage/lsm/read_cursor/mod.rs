@@ -422,7 +422,14 @@ impl ReadCursor {
     /// two sorted sides from the cursor's position, which the caller has put at
     /// or past the group, in place of a seek per row.
     pub(crate) fn for_each_mem_row_weight<F: FnMut(usize, i64)>(&mut self, mb: &MemBatch, range: Range<usize>, f: F) {
-        with_payload_cmp!(self.schema, Self::for_each_mem_row_weight_with::<_, _>, self, mb, range, f);
+        with_payload_cmp!(
+            self.schema,
+            Self::for_each_mem_row_weight_with::<_, _>,
+            self,
+            mb,
+            range,
+            f
+        );
     }
 
     #[inline]
