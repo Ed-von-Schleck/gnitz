@@ -615,7 +615,7 @@ pub const MAX_PK_BYTES: usize = MAX_PK_COLUMNS * 16;
 //   * Packed list (flag bit set):
 //        bit 63        : PK_LIST_PACKED_FLAG
 //        bit 62        : reserved — HAS_PK_WANT_HOLDER, when the word is a
-//                        FLAG_HAS_PK `seek_col_idx` rather than a catalog cell
+//                        a `HasPk` `seek_col_idx` rather than a catalog cell
 //        bits [0..4)   : decoded count (1..=PK_LIST_MAX_COLS valid; larger
 //                        counts are reserved for tests / malformed payloads)
 //        bits [4+7i..) : i-th column index, 7 bits each
@@ -673,7 +673,7 @@ const _: () = assert!(
 
 pub const PK_LIST_PACKED_FLAG: u64 = 1 << 63;
 
-/// Directive bit riding the FLAG_HAS_PK `seek_col_idx` word next to the packed
+/// Directive bit riding a `HasPk` group's `seek_col_idx` word next to the packed
 /// column list: the worker's secondary-index arm answers each matched probe with
 /// the **stored** index entry key `[span ‖ holder PK]` instead of echoing the
 /// probe key, so the caller learns which committed row holds the span without a

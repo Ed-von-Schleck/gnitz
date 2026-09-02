@@ -228,7 +228,7 @@ class ServerProc:
     def stop_graceful(self, timeout=30):
         """SIGTERM the *master only* (not the process group), so its shutdown
         watcher can drive a final checkpoint (which needs live workers to ACK
-        the flush) before broadcasting FLAG_SHUTDOWN and exiting. Returns the
+        the flush) before broadcasting Shutdown and exiting. Returns the
         master's exit code; raises on hang."""
         assert self.proc is not None, "no running server"
         try:

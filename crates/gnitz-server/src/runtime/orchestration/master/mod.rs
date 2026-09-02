@@ -2,11 +2,8 @@
 //! via the shared append-only log (SAL) and collects responses via per-worker
 //! W2M regions. Eventfds provide cross-process signaling.
 //!
-//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
-//! they cover, so each stays that module's own `tests` child and reaches its
-//! private items.
-//! `tests/fixtures.rs` holds what more than one of them needs, reached as
-//! `super::super::fixtures`.
+//! `tests/fixtures.rs` holds what more than one submodule's tests need, reached
+//! as `super::super::fixtures`.
 
 pub(crate) mod exchange;
 pub(crate) mod scatter;
@@ -24,7 +21,9 @@ use gnitz_wire::{PkColList, SpecBytes};
 use crate::query::RelayRoute;
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{AsyncMutex, ScanLease};
-use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalFit, SalMessageKind, SalWriter, ZoneMark};
+use crate::runtime::sal::{
+    DeferredPublication, DirectGroup, GroupData, GroupTargets, SalFit, SalMessageKind, SalWriter,
+};
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::wire::{
     self, unique_preflight_wire_schema, DecodedWire, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_CONTINUE,
@@ -72,7 +71,6 @@ pub(crate) enum RelayDest {
 // ---------------------------------------------------------------------------
 
 pub struct MasterDispatcher {
-    num_workers: usize,
     worker_pids: RefCell<Vec<i32>>,
     sal: SalWriter,
     /// SAL-writer exclusivity, guarding `sal` above. The rule, not a roster of
@@ -356,7 +354,7 @@ pub(crate) async fn dispatch_scan_fanout<F>(
 where
     F: FnOnce(GroupTargets<'_>) -> Result<(), WorkerFault>,
 {
-    let scan = ScanDispatch::alloc(reactor, disp.num_workers, unicast);
+    let scan = ScanDispatch::alloc(reactor, disp.num_workers(), unicast);
 
     {
         let _guard = disp.sal_excl().lock().await;
@@ -394,7 +392,7 @@ pub(crate) async fn dispatch_scan_multi_fanout(
     client_id: u64,
     relations: &[(i64, Fanout, u16)],
 ) -> Result<Vec<ScanDispatch>, WorkerFault> {
-    let nw = disp.num_workers;
+    let nw = disp.num_workers();
     // Allocate ids + register every relation's lease BEFORE the lock (no await
     // between here and the write).
     let dispatches: Vec<ScanDispatch> = relations
@@ -410,19 +408,16 @@ pub(crate) async fn dispatch_scan_multi_fanout(
         let _guard = disp.sal_excl().lock().await;
         for (&(tid, _unicast, eff_ver), d) in relations.iter().zip(&dispatches) {
             let wire_flags = gnitz_wire::wire_flags_set_schema_version(0, eff_ver) | gnitz_wire::FLAG_SCAN_FIFO_REPLY;
-            disp.write_group(
-                wire::WireMsg {
+            disp.write_group(&DirectGroup {
+                template: wire::WireMsg {
                     target_id: tid as u64,
                     client_id,
                     flags: wire_flags,
                     ..Default::default()
                 },
-                GroupData::NONE,
-                0,
-                SalMessageKind::Scan,
-                ZoneMark::Plain,
-                d.targets(),
-            )?;
+                targets: d.targets(),
+                ..DirectGroup::new(SalMessageKind::Scan)
+            })?;
         }
         disp.signal_all();
     }

@@ -3,17 +3,13 @@
 //! Owns one store per user relation — this worker's slice of it. Receives requests from
 //! the master via the SAL (shared append-only log), sends responses via a
 //! per-worker W2M shared region.
-//!
-//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
-//! they cover, so each stays that module's own `tests` child and reaches its
-//! private items.
 
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::query::{DagEngine, ExchangeCallback};
-use crate::runtime::m2w::Wake;
+use crate::runtime::m2w::{self, Wake};
 use crate::runtime::sal::{SalMessage, SalMessageKind, SalReader};
 use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{
@@ -75,12 +71,8 @@ struct DeferredDdl {
 /// A SAL message deferred out of a *blocking* evaluation poll (an exchange
 /// wait), replayed at the next top-level drain in SAL arrival order.
 ///
-/// Both variants decode EAGERLY at defer time: `Flush` runs inline in `InEval`
-/// and resets the SAL, so no raw wire pointer may be stashed across the wait —
-/// the discipline `DeferredDdl` already follows by storing a decoded `Batch`.
-/// Eager is also why the replay dispatches on the entry rather than re-entering
-/// `run_via_dispatch_inner`, which takes the raw `&'static [u8]` mapping and
-/// decodes it itself.
+/// Owned fields only, no `&'static [u8]` into the mapping: `Flush` runs inline
+/// in `InEval` and resets the SAL under a stashed pointer.
 ///
 /// **One queue for both**, drained in insertion order, which is SAL order: a tick
 /// deferred before a read is replayed before it. `deferred: Vec<DeferredDdl>`
@@ -213,6 +205,9 @@ pub struct WorkerProcess {
     catalog: *mut CatalogEngine,
     sal_reader: SalReader,
     w2m_writer: W2mWriter,
+    /// The eventfd the master signals to end this worker's park; `-1` in unit
+    /// tests, which never park.
+    m2w_efd: i32,
     exchange: WorkerExchangeHandler,
     pending_deltas: HashMap<i64, Batch>,
     /// FIFO queue of in-progress chunked reply trains. Two clients can run two
@@ -351,6 +346,7 @@ impl WorkerProcess {
         catalog: *mut CatalogEngine,
         sal_reader: SalReader,
         w2m_writer: W2mWriter,
+        m2w_efd: i32,
         // Effective base-table deltas buffered during SAL replay (the
         // un-checkpointed tail of every base feeding ≥1 view). The master's
         // post-reset recovery tick sweep drains these into the views via
@@ -365,6 +361,7 @@ impl WorkerProcess {
             catalog,
             sal_reader,
             w2m_writer,
+            m2w_efd,
             exchange: WorkerExchangeHandler {
                 deferred: Vec::new(),
                 deferred_replay: Vec::new(),
@@ -401,7 +398,7 @@ impl WorkerProcess {
             // queued state drives the next drain_sal to emit the next chunk
             // immediately.
             if self.pending_streams.is_empty() {
-                match self.sal_reader.wait(1000) {
+                match m2w::eventfd_wait(self.m2w_efd, 1000) {
                     Wake::Signalled => {}
                     Wake::Idle if self.master_is_gone() => self.shutdown(),
                     Wake::Idle | Wake::Failed => continue,
@@ -422,8 +419,7 @@ impl WorkerProcess {
         if !self.pending_streams.is_empty() {
             self.emit_pending_scan_chunk();
         }
-        while let Some(msg) = self.next_sal_message() {
-            let wire = self.sal_reader.my_slot(&msg);
+        while let Some((msg, wire)) = self.next_sal_message() {
             // Only an exchange wait can match a relay; the top-level dispatcher
             // classifies ExchangeRelay as a protocol bug and returns nothing.
             let matched = self.dispatch(DispatchContext::TopLevel, &msg, wire);
@@ -474,15 +470,16 @@ impl WorkerProcess {
         }
     }
 
-    /// The next SAL group to dispatch. The single SAL-read choke point — both
-    /// the top-level loop and the inside-exchange-wait loop funnel through here.
+    /// The next SAL group to dispatch, with this worker's slot of it. The single
+    /// SAL-read choke point — both the top-level loop and the inside-exchange-wait
+    /// loop funnel through here.
     ///
-    /// The group header's `lsn` joins the tuple rather than being latched into the
-    /// catalog the way `FlushEph`'s generation is: that latch is correct for
-    /// a generation that governs the whole round, and wrong for a tick round one
-    /// deferred message must carry to its replay.
-    fn next_sal_message(&mut self) -> Option<SalMessage> {
-        let msg = self.sal_reader.next()?;
+    /// The group header's `lsn` stays on the message rather than being latched
+    /// into the catalog the way `FlushEph`'s generation is: that latch is correct
+    /// for a generation that governs the whole round, and wrong for a tick round
+    /// one deferred message must carry to its replay.
+    fn next_sal_message(&mut self) -> Option<(SalMessage, &'static [u8])> {
+        let (msg, wire) = self.sal_reader.next()?;
         // The ephemeral flush round carries the checkpoint generation in the
         // group header's `lsn` field. Latch it before dispatch so
         // `manifest_header` stamps every view manifest this round publishes with
@@ -491,7 +488,7 @@ impl WorkerProcess {
         if msg.kind == SalMessageKind::FlushEph {
             self.cat().registry_mut().set_resume_generation(msg.lsn);
         }
-        Some(msg)
+        Some((msg, wire))
     }
 
     /// The single source of truth for the inline-vs-defer matrix. Match
@@ -538,86 +535,51 @@ impl WorkerProcess {
     ///   drive the inline DAG with the wrong sharding columns. Mismatched
     ///   relays are parked in `pending_relays` and picked up by the next
     ///   nested wait that asks for the right pair.
-    fn dispatch(&mut self, ctx: DispatchContext, msg: &SalMessage, wire: Option<&'static [u8]>) -> Option<Batch> {
-        // A slot exists but not ours — not for us. No slot for anyone — a
-        // control-only group (the commit sentinel, a checkpoint round), which
-        // every worker acts on.
-        if wire.is_none() && msg.slots() > 0 {
-            return None;
-        }
-        let (kind, target_id, group_lsn) = (msg.kind, msg.target_id as i64, msg.lsn);
+    fn dispatch(&mut self, ctx: DispatchContext, msg: &SalMessage, wire: &'static [u8]) -> Option<Batch> {
+        let target_id = msg.target_id as i64;
+        // Fail-stop: a dropped group diverges this worker from the master.
+        let mut decoded = match ipc::decode_wire(wire) {
+            Ok(d) => d,
+            Err(e) => self.fatal_shutdown(&format!("failed to decode {:?} for tid={target_id}: {e}", msg.kind)),
+        };
 
-        match (ctx, kind) {
+        match (ctx, msg.kind) {
             // ── Tick (maintenance): inline at top-level; defer inside an
             //    in-flight evaluation — an inline tick would re-enter the DAG
             //    with a different source and emit schema-mismatched relays.
-            (DispatchContext::TopLevel, SalMessageKind::Tick) => {
-                self.run_via_dispatch_inner(kind, target_id, group_lsn, wire)
-            }
+            (DispatchContext::TopLevel, SalMessageKind::Tick) => self.run_via_dispatch_inner(msg, decoded),
             (DispatchContext::InEval { .. }, SalMessageKind::Tick) => {
-                // Only the request id is needed; peek the control block instead of
-                // decoding the whole frame. The round comes off the group header,
-                // so the replay stamps the round that produced this delta rather
-                // than whatever the counter reaches by then.
-                let req_id = wire
-                    .and_then(|d| ipc::peek_control_block(d).ok())
-                    .map(|c| c.request_id)
-                    .unwrap_or(0);
+                // The round comes off the group header, so the replay stamps the
+                // round that produced this delta rather than whatever the counter
+                // reaches by then.
                 self.exchange.deferred_replay.push(Deferred::Tick {
                     target_id,
-                    round: group_lsn,
-                    req_id,
+                    round: msg.lsn,
+                    req_id: decoded.control.request_id,
                 });
                 None
             }
 
             // ── Delta ScanSpec: inline at top-level; defer inside an in-flight
             //    evaluation, where the answer would span a half-ingested round.
-            (DispatchContext::TopLevel, SalMessageKind::ScanSpec { delta: true }) => {
-                self.run_via_dispatch_inner(kind, target_id, group_lsn, wire)
-            }
-            (DispatchContext::InEval { .. }, SalMessageKind::ScanSpec { delta: true }) => {
-                let Some(data) = wire else {
-                    // Unicast-shaped, so the `wire.is_none()` guard above already
-                    // filtered a slot that is not ours.
-                    unreachable!("a delta read with no payload (filtered by dispatch's None guard)")
-                };
-                match ipc::decode_wire(data) {
-                    Ok(mut decoded) => self.exchange.deferred_replay.push(Deferred::DeltaRead {
-                        target_id,
-                        request_id: decoded.control.request_id,
-                        client_id: decoded.control.client_id,
-                        seek_pk: decoded.control.seek_pk,
-                        seek_pk_extra: std::mem::take(&mut decoded.control.seek_pk_extra),
-                    }),
-                    // Dropping it would leave the client waiting forever on a
-                    // request the master has already leased ids for.
-                    Err(e) => self.fatal_shutdown(&format!(
-                        "failed to decode deferred delta read for tid={target_id}: {e}"
-                    )),
-                }
+            (DispatchContext::TopLevel, SalMessageKind::DeltaScanSpec) => self.run_via_dispatch_inner(msg, decoded),
+            (DispatchContext::InEval { .. }, SalMessageKind::DeltaScanSpec) => {
+                self.exchange.deferred_replay.push(Deferred::DeltaRead {
+                    target_id,
+                    request_id: decoded.control.request_id,
+                    client_id: decoded.control.client_id,
+                    seek_pk: decoded.control.seek_pk,
+                    seek_pk_extra: std::mem::take(&mut decoded.control.seek_pk_extra),
+                });
                 None
             }
 
             // ── DdlSync (catalog mutation): apply at top-level; defer inside —
             //    an inline catalog mutation races in-flight DAG eval.
-            (DispatchContext::TopLevel, SalMessageKind::DdlSync) => {
-                self.run_via_dispatch_inner(kind, target_id, group_lsn, wire)
-            }
+            (DispatchContext::TopLevel, SalMessageKind::DdlSync) => self.run_via_dispatch_inner(msg, decoded),
             (DispatchContext::InEval { .. }, SalMessageKind::DdlSync) => {
-                if let Some(data) = wire {
-                    match ipc::decode_wire(data) {
-                        Ok(decoded) => {
-                            if let Some(batch) = decoded.data_batch {
-                                self.exchange.deferred.push(DeferredDdl { target_id, batch });
-                            }
-                        }
-                        Err(e) => {
-                            // A dropped DDL permanently diverges this worker's
-                            // catalog from the master — silently wrong results.
-                            self.fatal_shutdown(&format!("failed to decode deferred DDL for tid={target_id}: {e}"))
-                        }
-                    }
+                if let Some(batch) = decoded.data_batch {
+                    self.exchange.deferred.push(DeferredDdl { target_id, batch });
                 }
                 None
             }
@@ -630,22 +592,7 @@ impl WorkerProcess {
             }
             (DispatchContext::InEval { relay_wait }, SalMessageKind::ExchangeRelay) => {
                 // source_id is echoed back via seek_pk; the backfill round
-                // decision rides in seek_col_idx. A decode failure here (WAL-block
-                // checksum mismatch / truncation) must NOT silently default to
-                // source_id=0 + an empty batch: a unary exchange's want_key has
-                // source_id=0, so the defaulted relay would match, unblock the
-                // wait, and drop the whole partition's exchanged data — silent
-                // wrong results. Fail-stop, honoring the checksum decode_wire just
-                // verified.
-                let Some(data) = wire else {
-                    // ExchangeRelay is unicast, so the wire==None guard at the
-                    // top of `dispatch` already filtered a missing payload.
-                    unreachable!("ExchangeRelay with no payload (filtered by dispatch's None guard)")
-                };
-                let decoded = match ipc::decode_wire(data) {
-                    Ok(decoded) => decoded,
-                    Err(e) => self.fatal_shutdown(&format!("failed to decode ExchangeRelay for tid={target_id}: {e}")),
-                };
+                // decision rides in seek_col_idx.
                 let relay_source_id = decoded.control.seek_pk as i64;
                 let relay_decision = decoded.control.seek_col_idx;
                 // Header-only relay: the master stamps a schema block onto every
@@ -674,6 +621,10 @@ impl WorkerProcess {
                 None
             }
 
+            // The sentinel is slotless, and the reader yields only groups with a
+            // slot for this worker.
+            (_, SalMessageKind::ZoneCommit) => unreachable!("a ZoneCommit group has no slot to dispatch"),
+
             // ── All others: identical inline behavior in both contexts ─
             (_, SalMessageKind::Shutdown)
             | (_, SalMessageKind::Flush)
@@ -685,74 +636,44 @@ impl WorkerProcess {
             | (_, SalMessageKind::Push)
             | (_, SalMessageKind::SeekByIndex)
             | (_, SalMessageKind::Seek)
-            | (_, SalMessageKind::ScanSpec { delta: false })
-            | (_, SalMessageKind::Scan) => self.run_via_dispatch_inner(kind, target_id, group_lsn, wire),
+            | (_, SalMessageKind::ScanSpec)
+            | (_, SalMessageKind::Scan) => self.run_via_dispatch_inner(msg, decoded),
         }
     }
 
-    /// Decode (with the context-appropriate schema cache policy) and dispatch
-    /// through `dispatch_inner`. A failure is sent on the W2M ring with the
-    /// inbound request_id so the master reactor can route it back to the original
-    /// caller, carrying whatever status the fault names — this is the one place a
-    /// worker's reply status is chosen, so a typed refusal needs no path of its
-    /// own to reach the wire.
-    fn run_via_dispatch_inner(
-        &mut self,
-        kind: SalMessageKind,
-        target_id: i64,
-        group_lsn: u64,
-        wire: Option<&'static [u8]>,
-    ) -> Option<Batch> {
-        // A frame that fails to decode is fail-stop, not a silent no-op: the
-        // dropped message would diverge this worker from the master (the same
-        // reasoning the deferred-DdlSync and ExchangeRelay decode paths use), and
-        // a dropped Push would be ACKed as a successful ingest.
-        let decoded = match wire {
-            None => None,
-            Some(data) => match ipc::decode_wire(data) {
-                Ok(d) => Some(d),
-                Err(e) => self.fatal_shutdown(&format!("failed to decode {kind:?} for tid={target_id}: {e}")),
-            },
-        };
-        let request_id = decoded.as_ref().map(|d| d.control.request_id).unwrap_or(0);
-        if let Err(fault) = self.dispatch_inner(kind, target_id, group_lsn, decoded, request_id) {
+    /// `dispatch_inner`, with a failure sent back on the inbound request id —
+    /// the one place a worker's reply status is chosen.
+    fn run_via_dispatch_inner(&mut self, msg: &SalMessage, decoded: ipc::DecodedWire) -> Option<Batch> {
+        let request_id = decoded.control.request_id;
+        if let Err(fault) = self.dispatch_inner(msg, decoded) {
             self.send_fault(&fault, request_id);
-            if kind == SalMessageKind::DdlSync {
+            if msg.kind == SalMessageKind::DdlSync {
                 // DDL application failure on trusted master→worker IPC means
                 // memory corruption or an engine bug; continuing would leave
                 // this worker with a permanently stale catalog.
-                self.fatal_shutdown(&format!("DdlSync application failed for tid={target_id}: {fault}"));
+                self.fatal_shutdown(&format!(
+                    "DdlSync application failed for tid={}: {fault}",
+                    msg.target_id
+                ));
             }
         }
         None
     }
 
-    fn dispatch_inner(
-        &mut self,
-        kind: SalMessageKind,
-        target_id: i64,
-        group_lsn: u64,
-        mut decoded: Option<ipc::DecodedWire>,
-        request_id: u64,
-    ) -> Result<(), gnitz_wire::WireFault> {
-        // Extract control fields before consuming decoded
-        let seek_pk = decoded.as_ref().map(|d| d.control.seek_pk).unwrap_or(0);
-        let seek_col_idx = decoded.as_ref().map(|d| d.control.seek_col_idx).unwrap_or(0);
-        let client_id = decoded.as_ref().map(|d| d.control.client_id).unwrap_or(0);
-        let ctrl_wire_flags = decoded.as_ref().map(|d| d.control.flags).unwrap_or(0);
+    fn dispatch_inner(&mut self, msg: &SalMessage, mut decoded: ipc::DecodedWire) -> Result<(), gnitz_wire::WireFault> {
+        let target_id = msg.target_id as i64;
+        let request_id = decoded.control.request_id;
+        let seek_pk = decoded.control.seek_pk;
+        let seek_col_idx = decoded.control.seek_col_idx;
+        let client_id = decoded.control.client_id;
+        let ctrl_wire_flags = decoded.control.flags;
         let client_version = gnitz_wire::wire_flags_get_schema_version(ctrl_wire_flags);
         // Wide-PK seek key tail (bytes 16..stride); empty for narrow PKs. Taken
-        // (not cloned) — nothing reads the control block after this point — and
-        // extracted before `decoded` is consumed by the `data_batch` take below.
-        let seek_pk_extra: Vec<u8> = decoded
-            .as_mut()
-            .map(|d| std::mem::take(&mut d.control.seek_pk_extra))
-            .unwrap_or_default();
+        // (not cloned) — nothing reads the control block after this point.
+        let seek_pk_extra: Vec<u8> = std::mem::take(&mut decoded.control.seek_pk_extra);
+        let batch = decoded.data_batch;
 
-        // Extract batch (consumes decoded)
-        let batch = decoded.and_then(|d| d.data_batch);
-
-        match kind {
+        match msg.kind {
             SalMessageKind::Shutdown => self.shutdown(),
 
             SalMessageKind::Flush => {
@@ -862,7 +783,7 @@ impl WorkerProcess {
             }
 
             SalMessageKind::Tick => {
-                self.handle_tick(target_id, group_lsn, request_id)?;
+                self.handle_tick(target_id, msg.lsn, request_id)?;
                 self.send_ack(target_id as u64, request_id);
                 Ok(())
             }
@@ -925,7 +846,7 @@ impl WorkerProcess {
                 )
             }
 
-            SalMessageKind::ScanSpec { .. } => {
+            SalMessageKind::ScanSpec | SalMessageKind::DeltaScanSpec => {
                 self.answer_scan_spec(target_id, request_id, client_id, seek_pk, &seek_pk_extra)
             }
 
@@ -935,7 +856,7 @@ impl WorkerProcess {
                 // the column list in `seek_col_idx` (packed via pack_pk_cols),
                 // sort them, and stream the sorted spans back for the master's
                 // k-way merge. An error here surfaces as the terminal fault frame
-                // the master's merge expects (send_error in run_via_dispatch_inner).
+                // the master's merge expects (send_fault in run_via_dispatch_inner).
                 let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
                 self.cat()
                     .registry()
@@ -945,8 +866,10 @@ impl WorkerProcess {
             }
 
             // `dispatch` consumes ExchangeRelay itself in both contexts and
-            // never routes it here.
-            SalMessageKind::ExchangeRelay => unreachable!("ExchangeRelay never reaches dispatch_inner"),
+            // never routes it here; the sentinel never reaches `dispatch` at all.
+            SalMessageKind::ExchangeRelay | SalMessageKind::ZoneCommit => {
+                unreachable!("{:?} never reaches dispatch_inner", msg.kind)
+            }
         }
     }
 

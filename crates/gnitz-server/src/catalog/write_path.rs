@@ -166,7 +166,7 @@ impl CatalogEngine {
 
     /// Drain the pending-broadcast queue. Master calls this once per
     /// top-level DDL and forwards each entry to `broadcast_ddl`. Workers
-    /// receive system-table changes via FLAG_DDL_SYNC → `ddl_sync`, which
+    /// receive system-table changes via `DdlSync` → `ddl_sync`, which
     /// bypasses `ingest_to_family` entirely, so the queue stays empty there.
     pub(crate) fn drain_pending_broadcasts(&mut self) -> Vec<(SysFamily, Batch)> {
         std::mem::take(&mut self.pending_broadcasts)
@@ -205,7 +205,7 @@ impl CatalogEngine {
     }
 
     /// Physically remove every checkpoint-gated directory. SAFE only at a
-    /// checkpoint boundary, after the per-worker FLAG_FLUSH ACKs prove all
+    /// checkpoint boundary, after the per-worker `Flush` ACKs prove all
     /// workers consumed past the DROP that queued each entry.
     pub(crate) fn drain_checkpoint_gated_deletions(&mut self) {
         Self::remove_queued_dirs(std::mem::take(&mut self.checkpoint_gated_deletions));

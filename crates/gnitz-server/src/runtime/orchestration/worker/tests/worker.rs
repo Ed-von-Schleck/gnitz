@@ -89,21 +89,30 @@ fn from_wire_decodes_the_column_list_with_and_without_the_holder_directive() {
 /// budget is pinned rather than read from the environment, so a shell that
 /// exports `GNITZ_REPLY_FRAME_BUDGET` does not reshape these frames.
 fn make_test_worker(catalog: *mut CatalogEngine, writer: W2mWriter) -> WorkerProcess {
-    let mut wp = WorkerProcess::new(0, catalog, unsafe { std::mem::zeroed() }, writer, HashMap::new());
+    let mut wp = WorkerProcess::new(0, catalog, unsafe { std::mem::zeroed() }, writer, -1, HashMap::new());
     wp.reply_frame_budget = ipc::FRAME_CAP;
     wp
 }
 
 /// One SAL group as the matrix tests hand it to `dispatch`: a kind, a
-/// target and a round. `slots` stays 0, so the "not for us" guard never
-/// fires and every arm is reached.
+/// target and a round. The slot bytes travel beside it, so the message itself
+/// carries no payload.
 fn sal_msg(kind: SalMessageKind, target_id: u32, lsn: u64) -> SalMessage {
     SalMessage {
-        kind,
-        target_id,
         lsn,
-        ..Default::default()
+        kind,
+        zone_start: false,
+        target_id,
+        base: 0,
+        payload: &[],
+        dir: &[],
     }
+}
+
+/// A bare control block, as every command verb's slot carries. Leaked to
+/// `'static` for `dispatch`.
+fn control_only_frame() -> &'static [u8] {
+    Box::leak(ipc::WireMsg::default().encode_to_vec().into_boxed_slice())
 }
 
 /// Build a worker that's safe for `dispatch` calls whose behavior
@@ -125,7 +134,9 @@ fn tick_defers_inside_exchange() {
     let mut wp = make_worker_for_matrix();
     let ctx = DispatchContext::InEval { relay_wait: (100, 5) };
     assert!(wp.exchange.deferred_replay.is_empty());
-    assert!(wp.dispatch(ctx, &sal_msg(SalMessageKind::Tick, 999, 7), None).is_none());
+    assert!(wp
+        .dispatch(ctx, &sal_msg(SalMessageKind::Tick, 999, 7), control_only_frame())
+        .is_none());
     assert_eq!(wp.exchange.deferred_replay.len(), 1);
     assert!(
         matches!(
@@ -162,13 +173,11 @@ fn delta_read_defers_inside_exchange_with_its_whole_request() {
         .into_boxed_slice(),
     );
     // A tick first, so the shared FIFO's insertion order is observable.
-    assert!(wp.dispatch(ctx, &sal_msg(SalMessageKind::Tick, 999, 3), None).is_none());
     assert!(wp
-        .dispatch(
-            ctx,
-            &sal_msg(SalMessageKind::ScanSpec { delta: true }, 77, 0),
-            Some(frame)
-        )
+        .dispatch(ctx, &sal_msg(SalMessageKind::Tick, 999, 3), control_only_frame())
+        .is_none());
+    assert!(wp
+        .dispatch(ctx, &sal_msg(SalMessageKind::DeltaScanSpec, 77, 0), frame)
         .is_none());
     assert_eq!(wp.exchange.deferred_replay.len(), 2, "one queue, in SAL order");
     assert!(matches!(wp.exchange.deferred_replay[0], Deferred::Tick { .. }));
@@ -189,10 +198,8 @@ fn delta_read_defers_inside_exchange_with_its_whole_request() {
 
 /// Encode a header-only ExchangeRelay wire frame (schema, no data batch)
 /// whose control block echoes `source_id` via `seek_pk`, as the master's
-/// `emit_relay_with_decision` does. Leaked to `'static` for `dispatch`.
-/// A DECODABLE frame is now required — a corrupt/undecodable relay fail-stops
-/// the worker (mirrors the DdlSync decode arm) rather than defaulting to an
-/// empty batch, so tests can no longer feed `&[]`.
+/// `emit_relay_with_decision` does. Leaked to `'static` for `dispatch`, which
+/// fail-stops on a frame that does not decode.
 fn encode_relay_frame(target_id: u64, source_id: u128, schema: &SchemaDescriptor) -> &'static [u8] {
     // No data batch — a header-only relay. `seek_pk` echoes the source_id the
     // waiter matches on; `seek_col_idx` 0 is BACKFILL_DECISION_CONTINUE.
@@ -232,7 +239,7 @@ fn exchange_relay_inside_exchange() {
     // Mismatched view (target_id=200 ≠ want 100): parked under (200, 0).
     let frame = encode_relay_frame(200, 0, &schema);
     assert!(wp
-        .dispatch(ctx, &sal_msg(SalMessageKind::ExchangeRelay, 200, 0), Some(frame))
+        .dispatch(ctx, &sal_msg(SalMessageKind::ExchangeRelay, 200, 0), frame)
         .is_none());
     assert!(
         wp.exchange.pending_relays.contains_key(&(200, 0)),
@@ -242,7 +249,7 @@ fn exchange_relay_inside_exchange() {
     // Matching key (target_id=100, source_id=0 == want_key): returns the batch.
     let frame = encode_relay_frame(100, 0, &schema);
     assert!(
-        wp.dispatch(ctx, &sal_msg(SalMessageKind::ExchangeRelay, 100, 0), Some(frame))
+        wp.dispatch(ctx, &sal_msg(SalMessageKind::ExchangeRelay, 100, 0), frame)
             .is_some(),
         "a key-matching relay must short-circuit out of dispatch with its batch"
     );
@@ -254,12 +261,12 @@ fn exchange_relay_inside_exchange() {
 #[test]
 fn exchange_relay_top_level_warns_and_continues() {
     let mut wp = make_worker_for_matrix();
-    let empty: &'static [u8] = &[];
+    let frame = encode_relay_frame(100, 0, &make_schema_u64_i64());
     assert!(wp
         .dispatch(
             DispatchContext::TopLevel,
             &sal_msg(SalMessageKind::ExchangeRelay, 100, 0),
-            Some(empty)
+            frame
         )
         .is_none());
     assert!(
@@ -282,7 +289,7 @@ fn ddl_sync_defers_inside_exchange() {
 
     let frame = encode_data_frame(42, &schema, &make_batch_raw(&schema, &[(1, 1, 10)]));
     assert!(wp
-        .dispatch(ctx, &sal_msg(SalMessageKind::DdlSync, 42, 0), Some(frame))
+        .dispatch(ctx, &sal_msg(SalMessageKind::DdlSync, 42, 0), frame)
         .is_none());
     assert_eq!(
         wp.exchange.deferred.len(),
@@ -324,9 +331,9 @@ fn next_sal_message_gates_on_the_epoch() {
     write(44, 102, SalMessageKind::Push, 2);
 
     let mut wp = make_test_worker(std::ptr::null_mut(), unsafe { std::mem::zeroed() });
-    wp.sal_reader = unsafe { SalReader::new(sal.ptr() as *const u8, 0, SAL_SIZE, -1, 0) };
+    wp.sal_reader = unsafe { SalReader::new(sal.ptr() as *const u8, 0, SAL_SIZE, 0) };
 
-    let next = |wp: &mut WorkerProcess| wp.next_sal_message().map(|m| (m.kind, m.target_id));
+    let next = |wp: &mut WorkerProcess| wp.next_sal_message().map(|(m, _)| (m.kind, m.target_id));
     assert_eq!(next(&mut wp), Some((SalMessageKind::Push, 42)));
     assert_eq!(next(&mut wp), Some((SalMessageKind::DdlSync, 43)));
 

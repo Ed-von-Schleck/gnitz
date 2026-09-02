@@ -207,7 +207,7 @@ def test_views_track_base_under_sustained_ingest_with_scans(checkpoint_server):
 #
 # Before the fix, fan_out_seek_async, fan_out_scan_async, and
 # execute_pipeline_async did not hold sal_writer_excl while writing their SAL
-# group.  A request arriving in the FLAG_FLUSH ACK-wait window wrote with the
+# group.  A request arriving in the Flush ACK-wait window wrote with the
 # old epoch; workers skipped it; the operation hung forever.
 #
 # Each test below uses two connections in separate threads: a pusher that
@@ -220,7 +220,7 @@ def test_seek_during_checkpoints(checkpoint_server):
     """SEEK (single_worker_async) must not hang when checkpoints fire concurrently.
 
     Regression: fan_out_seek_async wrote its SAL group without holding
-    sal_writer_excl.  A SEEK arriving in the FLAG_FLUSH ACK-wait window used
+    sal_writer_excl.  A SEEK arriving in the Flush ACK-wait window used
     the old epoch; workers skipped it; the seek hung forever.
     """
     with gnitz.connect(checkpoint_server) as pusher, \

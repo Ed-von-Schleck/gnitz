@@ -1,7 +1,7 @@
 //! The SAL **zone protocol**: the atomic unit recovery commits, both directions.
 //!
-//! A zone's byte span runs from a [`ZoneMark::Start`] group to the
-//! [`ZoneMark::Commit`] sentinel [`SalWriter::write_commit_sentinel`] closes it
+//! A zone's byte span runs from its zone-start group to the
+//! [`SalMessageKind::ZoneCommit`] sentinel [`SalWriter::close_zone`] closes it
 //! with, and its groups apply all-or-nothing. A whole CREATE is one zone — its N
 //! families ride one `FLAG_DDL_TXN` bundle under a single zone LSN — so all of
 //! COL_TAB and TABLE_TAB replay, or none of it.
@@ -10,33 +10,24 @@
 //! [`CommittedTail`]. Neither knows what a group *means*: the master (pre-fork,
 //! system families) and each worker (post-fork, user families) vary only which
 //! groups are theirs, and what they do with the bytes.
-//!
-//! A child of `sal` rather than a peer, so the walk reads the mmap through
-//! [`SalLog`]'s `read_at` / `valid_headers_from` without either becoming part of
-//! the format module's surface.
 
 use std::collections::{HashMap, HashSet};
 
-use super::{EpochGate, SalFit, SalLog, SalMessage, SalMessageKind, SalStep, SalWriter, ZoneMark};
+use super::{EpochGate, SalFit, SalLog, SalMessage, SalMessageKind, SalStep, SalWriter, PREFIX_BYTES};
 use crate::runtime::wire as ipc;
 
 impl SalWriter {
-    /// Write an empty commit sentinel for an atomic zone: a slotless `DdlSync`
-    /// group marked [`ZoneMark::Commit`]. Recovery reads it as "this LSN is
-    /// closed" — without it, every group at this LSN is skipped — and every
-    /// worker no-ops on it, since its DdlSync arm takes a group with no batch.
-    pub fn write_commit_sentinel(&self, lsn: u64) -> Result<(), SalFit> {
-        let group = self.begin(0, lsn, SalMessageKind::DdlSync, ZoneMark::Commit, &[])?;
-        self.finish(group);
-        Ok(())
+    /// Close the open zone with its slotless commit sentinel, which recovery
+    /// reads as "this LSN is closed". `Ok(false)` when no zone is open; a refused
+    /// sentinel leaves it open.
+    pub(crate) fn close_zone(&self) -> Result<bool, SalFit> {
+        let Some(lsn) = self.zone.get() else {
+            return Ok(false);
+        };
+        self.write_slots(0, lsn, SalMessageKind::ZoneCommit, false, &[], |_, _| {})?;
+        self.zone.set(None);
+        Ok(true)
     }
-}
-
-/// One step of the recovery walk: a group that was published at an offset, or an
-/// offset whose bytes were published but do not verify.
-enum WalkStep {
-    Group(SalMessage),
-    Corrupt(u64),
 }
 
 impl SalLog {
@@ -48,31 +39,27 @@ impl SalLog {
     /// Both passes walk identically, so they cannot disagree about where the log
     /// ends. Successive resyncs examine disjoint increasing ranges, so a walk sweeps
     /// the mapping at most once in total.
-    ///
-    /// No worker id reaches the walk's control flow: group headers are
-    /// slot-independent, so every reader yields the same steps.
-    fn walk(&self, epoch: u32) -> impl Iterator<Item = WalkStep> + '_ {
+    fn walk(&self, epoch: u32) -> impl Iterator<Item = SalStep> + '_ {
         self.walk_from(0, epoch)
     }
 
     /// [`Self::walk`] from an arbitrary offset — for a re-walk of a span a first
     /// pass already reached a verdict on.
-    fn walk_from(&self, start: u64, epoch: u32) -> impl Iterator<Item = WalkStep> + '_ {
+    fn walk_from(&self, start: u64, epoch: u32) -> impl Iterator<Item = SalStep> + '_ {
         let mut offset: u64 = start;
-        std::iter::from_fn(move || match self.read_at(offset, EpochGate::Walk(epoch)) {
-            SalStep::Group(msg, next) => {
-                offset = next;
-                Some(WalkStep::Group(msg))
+        std::iter::from_fn(move || {
+            let step = self.read_at(offset, EpochGate::Walk(epoch));
+            match step {
+                SalStep::Group(_, next) => offset = next,
+                SalStep::Corrupt(at) => {
+                    offset = self
+                        .valid_headers_from(at + PREFIX_BYTES as u64)
+                        .find(|&(_, e)| e == epoch)
+                        .map_or(self.mmap_size as u64, |(base, _)| base);
+                }
+                SalStep::Absent => return None,
             }
-            SalStep::Corrupt => {
-                let corrupt_at = offset;
-                offset = self
-                    .valid_headers_from(offset + 8)
-                    .find(|&(_, e)| e == epoch)
-                    .map_or(self.mmap_size, |(base, _)| base);
-                Some(WalkStep::Corrupt(corrupt_at))
-            }
-            SalStep::Absent => None,
+            Some(step)
         })
     }
 }
@@ -83,7 +70,7 @@ impl SalLog {
 #[derive(Clone, Copy, Default)]
 struct Zone {
     lsn: u64,
-    /// The [`ZoneMark::Start`] group's offset — the start of the zone's span.
+    /// The zone-start group's offset — the start of the zone's span.
     start: u64,
     /// The commit sentinel's offset — the span's exclusive end. Zero until the
     /// zone closes.
@@ -106,8 +93,6 @@ pub(crate) struct CommittedTail<'a> {
     /// absent from the map has no store to recover into.
     family_lsns: &'a HashMap<i64, u64>,
     committed: HashSet<u64>,
-    /// The group at offset 0's slot count, recorded by pass 1's first step.
-    first_group_slots: Option<u32>,
 }
 
 impl<'a> CommittedTail<'a> {
@@ -124,16 +109,9 @@ impl<'a> CommittedTail<'a> {
             kind,
             family_lsns,
             committed: HashSet::new(),
-            first_group_slots: None,
         };
-        (tail.committed, tail.first_group_slots) = tail.collect_committed_lsns()?;
+        tail.committed = tail.collect_committed_lsns()?;
         Ok(tail)
-    }
-
-    /// The width the boot that wrote this tail sliced it at — the slot count of
-    /// the group at offset 0, `None` when nothing valid sits there.
-    pub(crate) fn first_group_slots(&self) -> Option<u32> {
-        self.first_group_slots
     }
 
     /// Whether this walk applies `msg`. The kind test comes first and is not a
@@ -157,16 +135,15 @@ impl<'a> CommittedTail<'a> {
         self.log.walk(self.epoch).filter_map(move |step| {
             // Pass 1 already reached its verdict on every corrupt offset: it either
             // failed the boot or established that nothing committed lies there.
-            let WalkStep::Group(msg) = step else { return None };
+            let SalStep::Group(msg, _) = step else { return None };
             let keep = self.committed.contains(&msg.lsn) && self.applies(&msg);
             keep.then_some(msg)
         })
     }
 
-    /// Pass 1: the LSNs whose zone is both closed and intact, and the slot count
-    /// of the group at offset 0 (`None` when nothing valid sits there).
+    /// Pass 1: the LSNs whose zone is both closed and intact.
     ///
-    /// A zone's byte span runs from its [`ZoneMark::Start`] group to its commit
+    /// A zone's byte span runs from its zone-start group to its commit
     /// sentinel, and nothing else lives in it — a zone is written with no
     /// suspension point inside it, so no other writer can place a group there.
     /// Damage costs that zone a group, and the verdict follows from where it sits:
@@ -183,29 +160,24 @@ impl<'a> CommittedTail<'a> {
     /// zone open lost its zone's *first* group, and a zone with a group after it but
     /// no sentinel lost its *sentinel* (an unclosed zone can only be the last thing
     /// in the log).
-    fn collect_committed_lsns(&self) -> Result<(HashSet<u64>, Option<u32>), String> {
+    fn collect_committed_lsns(&self) -> Result<HashSet<u64>, String> {
         let mut committed: HashSet<u64> = HashSet::new();
         let mut open: Option<Zone> = None;
         let mut last_closed: Option<Zone> = None;
-        let mut first_group_slots: Option<u32> = None;
 
         for step in self.log.walk(self.epoch) {
             let msg = match step {
-                WalkStep::Corrupt(off) => {
+                SalStep::Corrupt(off) => {
                     if let Some(z) = open.as_mut() {
                         z.damage.get_or_insert(off);
                     }
                     continue;
                 }
-                WalkStep::Group(msg) => msg,
+                SalStep::Group(msg, _) => msg,
+                SalStep::Absent => unreachable!("the walk stops at the end of the log"),
             };
-            // The walk starts at offset 0 and only advances, so this fires on the
-            // first group or not at all.
-            if msg.base == 0 {
-                first_group_slots = Some(msg.slots());
-            }
             let mine = open.as_ref().is_some_and(|z| z.lsn == msg.lsn);
-            if msg.mark == ZoneMark::Commit {
+            if msg.kind == SalMessageKind::ZoneCommit {
                 // A damaged zone that did close is fatal once a *later* sentinel
                 // proves a committed zone is durable behind it; the log's last one
                 // is only demoted. Derived here rather than carried, so the message
@@ -247,7 +219,7 @@ impl<'a> CommittedTail<'a> {
                     ));
                 }
             }
-            if msg.mark == ZoneMark::Start {
+            if msg.zone_start {
                 open = Some(Zone {
                     lsn: msg.lsn,
                     start: msg.base,
@@ -261,7 +233,7 @@ impl<'a> CommittedTail<'a> {
                 committed.remove(&zone.lsn);
             }
         }
-        Ok((committed, first_group_slots))
+        Ok(committed)
     }
 
     /// Whether every block of `zone` that [`groups`](Self::groups) would yield
@@ -280,7 +252,7 @@ impl<'a> CommittedTail<'a> {
     /// block, which is correctly a no-op on replay.
     fn zone_blocks_decode(&self, zone: &Zone) -> bool {
         for step in self.log.walk_from(zone.start, self.epoch) {
-            let WalkStep::Group(msg) = step else {
+            let SalStep::Group(msg, _) = step else {
                 debug_assert!(false, "an intact zone span walks with no resync");
                 return false;
             };
@@ -312,8 +284,7 @@ impl<'a> CommittedTail<'a> {
 // shapes are what recovery classifies, and the payloads are opaque (no family
 // map), so the zone rules are isolated from block decoding. Below them, the same
 // predicate over real wire slots, where "validate" means the block decodes and
-// not that it carries rows. The end-to-end crash path is covered in
-// `crates/gnitz-py/tests/test_crash_recovery.py`.
+// not that it carries rows.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

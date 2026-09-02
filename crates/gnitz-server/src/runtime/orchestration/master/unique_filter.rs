@@ -290,17 +290,14 @@ impl MasterDispatcher {
         // mid-scan cancellation) the lease drop discards every undrained
         // frame at the ring boundary.
         let (slots, scan) = dispatch_scan_fanout(disp, reactor, unicast, |targets| {
-            disp.write_group(
-                wire::WireMsg {
+            disp.write_group(&DirectGroup {
+                template: wire::WireMsg {
                     target_id: table_id as u64,
                     ..Default::default()
                 },
-                GroupData::NONE,
-                0,
-                SalMessageKind::Scan,
-                ZoneMark::Plain,
                 targets,
-            )
+                ..DirectGroup::new(SalMessageKind::Scan)
+            })
         })
         .await
         .map_err(|f| f.text)?;

@@ -30,7 +30,7 @@ pub(crate) fn scan_spec_route(disp: &MasterDispatcher, target_id: i64, spec: Spe
 fn confined_worker(disp: &MasterDispatcher, target_id: i64, spec: SpecBytes<'_>) -> Option<usize> {
     let schema = disp.cat().registry().get_schema_desc(target_id)?;
     let desc = gnitz_wire::peek_pk_range(spec)?;
-    schema.confined_worker(&desc, disp.num_workers)
+    schema.confined_worker(&desc, disp.num_workers())
 }
 
 /// Ceiling on the synchronous `W2mReceiver::wait_any` park in the collect loop
@@ -83,8 +83,12 @@ impl MasterDispatcher {
         m2w_efds: Vec<i32>,
     ) -> Self {
         debug_assert_eq!(m2w_efds.len(), worker_pids.len(), "one wakeup eventfd per worker");
+        debug_assert_eq!(
+            sal.num_workers(),
+            worker_pids.len(),
+            "the SAL's slot count is the worker count"
+        );
         MasterDispatcher {
-            num_workers: worker_pids.len(),
             worker_pids: RefCell::new(worker_pids),
             sal,
             sal_writer_excl: AsyncMutex::default(),
@@ -146,74 +150,35 @@ impl MasterDispatcher {
     // -----------------------------------------------------------------------
 
     /// Write one SAL group and nothing else — no signal, no ack collection.
-    /// The one group writer: `template` is every slot's shared header, `data`
-    /// and `targets` are what varies per slot.
-    pub(super) fn write_group(
-        &self,
-        template: wire::WireMsg<'_>,
-        data: GroupData<'_>,
-        lsn: u64,
-        kind: SalMessageKind,
-        mark: ZoneMark,
-        targets: GroupTargets<'_>,
-    ) -> Result<(), WorkerFault> {
-        self.sal
-            .write_group_direct(
-                &DirectGroup {
-                    template,
-                    data,
-                    targets,
-                },
-                lsn,
-                kind,
-                mark,
-            )
-            .map_err(|fit| fit.refusal(&format!("{kind:?} group")))
+    /// The one group writer; a refusal is the client-facing `SAL full` fault.
+    pub(super) fn write_group(&self, g: &DirectGroup) -> Result<(), WorkerFault> {
+        self.sal.write(g).map_err(|fit| fit.refusal(g.kind))
     }
 
-    /// Write one group whose rows are PK-partitioned across the workers: each
-    /// worker's slot carries only the rows it stores — the scatter sibling of a
-    /// `GroupData::Same` broadcast.
+    /// Write `base` with its rows PK-partitioned across the workers: each
+    /// worker's slot carries only the rows of `batch` it stores — the scatter
+    /// sibling of a `GroupData::Same` broadcast. `base.template` is framed by
+    /// `relation`; its `data` is replaced.
     pub(super) fn write_scatter_group(
         &self,
         batch: &Batch,
         relation: &wire::WireSchema,
-        kind: SalMessageKind,
-        seek_col_idx: u64,
-        targets: GroupTargets<'_>,
+        base: DirectGroup<'_>,
     ) -> Result<(), WorkerFault> {
-        let nw = self.num_workers;
-        let template = wire::WireMsg {
-            seek_col_idx,
-            ..Default::default()
-        };
         // No reentrancy: the closure has no `.await`, so the SCATTER_INDICES
         // borrow is released before the next caller needs it.
-        with_worker_indices(batch, relation.descriptor(), nw, |worker_indices| {
-            with_group(batch, worker_indices, relation, template, targets, nw, |g| {
-                self.sal.write_group_direct(g, 0, kind, ZoneMark::Plain)
-            })
+        with_worker_indices(batch, relation.descriptor(), self.num_workers(), |worker_indices| {
+            with_group(batch, worker_indices, relation, base, |g| self.sal.write(g))
         })
-        .map_err(|fit| fit.refusal(&format!("{kind:?} scatter group")))
+        .map_err(|fit| fit.refusal(base.kind))
     }
 
-    // --- Deferred publication (see `SalWriter::defer_publication`) ---------
-    //
-    // A zone's groups are laid out invisibly and published together, so a
-    // family that runs out of space can be taken back. The caller must hold
-    // `sal_writer_excl` and must not suspend between these calls.
-
-    pub(crate) fn defer_publication(&self) {
-        self.sal.defer_publication();
-    }
-    pub(crate) fn savepoint(&self) -> crate::runtime::sal::Savepoint {
-        self.sal.savepoint()
-    }
-    pub(crate) fn roll_back(&self, sp: crate::runtime::sal::Savepoint) {
-        self.sal.roll_back(sp);
-    }
-    pub(crate) fn publish_pending(&self) {
-        self.sal.publish_pending();
+    /// Open a deferred-publication scope (see `SalWriter::defer_publication`):
+    /// a zone's groups are laid out invisibly and published together when the
+    /// guard drops, so a family that runs out of space can be taken back. The
+    /// caller must hold `sal_writer_excl` and must not suspend inside the scope.
+    pub(crate) fn defer_publication(&self) -> DeferredPublication<'_> {
+        self.sal.defer_publication()
     }
 
     /// Wake every worker: they see the SAL entry through the mapping's Acquire
@@ -262,7 +227,7 @@ impl MasterDispatcher {
     }
 
     pub(crate) fn num_workers(&self) -> usize {
-        self.num_workers
+        self.sal.num_workers()
     }
 
     /// Collect ACKs from all workers, relaying exchange messages inline by
@@ -282,7 +247,7 @@ impl MasterDispatcher {
     ///
     /// `ctx` names the phase in a worker-fault or dead-worker error.
     fn collect_acks_and_relay(&self, checkpoint_allowed: bool, ctx: &str) -> Result<(), String> {
-        let nw = self.num_workers;
+        let nw = self.num_workers();
         // One bit per worker still owing its ACK.
         let mut pending_mask: u64 = worker_mask(nw);
         let mut acc = super::exchange::ExchangeAccumulator::new(nw);
@@ -371,10 +336,9 @@ impl MasterDispatcher {
     /// is the only lever there is. An idle server past neither line pays
     /// nothing.
     fn checkpoint_before_backfill(&self) -> Result<(), String> {
-        // More *used* than the margin — the opposite sense to `relay_fit_raw`,
-        // which asks for that much *free*. `needs_checkpoint()` is not implied by
-        // it: `GNITZ_CHECKPOINT_BYTES` is unclamped and may sit below the margin.
-        if self.sal.used_bytes() > self.sal.reclaim_margin() as u64 || self.sal.needs_checkpoint() {
+        // `needs_checkpoint()` is not implied by the margin test:
+        // `GNITZ_CHECKPOINT_BYTES` is unclamped and may sit below the margin.
+        if self.sal.past_reclaim_margin() || self.sal.needs_checkpoint() {
             self.reclaim_base()?;
         }
         Ok(())
@@ -475,17 +439,11 @@ impl MasterDispatcher {
         &ARMED
     }
 
-    /// Whether a relay of `need` bytes may be written, ignoring the `relay_loop`
-    /// test seam: it must fit, and the SAL must still be above the reclaim
-    /// margin — so a reclaim lands on a relay with room to spare rather than on
-    /// one that has run out. Asking for the larger of the two answers both, and
-    /// [`SalFit::Terminal`] survives the fold because the margin is strictly
-    /// under the capacity.
-    ///
-    /// The raw form is what the boot backfill relay and the watchdog's reclaim
-    /// timer need: the seam would spuriously fail an in-progress backfill.
+    /// [`SalWriter::fit_relay`], ignoring the `relay_loop` test seam — what the
+    /// boot backfill relay and the watchdog's reclaim timer need: the seam would
+    /// spuriously fail an in-progress backfill.
     pub(crate) fn relay_fit_raw(&self, need: usize) -> SalFit {
-        self.sal.fit(need.max(self.sal.reclaim_margin()))
+        self.sal.fit_relay(need)
     }
 
     /// Build the SAL group an exchange relay writes and hand it to `f`. Sizing
@@ -512,7 +470,7 @@ impl MasterDispatcher {
         let group = |data| DirectGroup {
             template,
             data,
-            targets: GroupTargets::AllSilent,
+            ..DirectGroup::new(SalMessageKind::ExchangeRelay)
         };
         match dest {
             RelayDest::Broadcast(b) => f(&group(GroupData::Same(wire::WireData::Whole(Some(&**b))))),
@@ -605,9 +563,9 @@ impl MasterDispatcher {
                 // the re-sorting repartition. The scatter
                 // (`op_relay_scatter_consolidated_mode`) debug-verifies each.
                 RelayDest::PerWorker(if sources.iter().flatten().all(|b| b.is_consolidated()) {
-                    op_relay_scatter_consolidated_mode(&sources, cols, target_tcs, &schema, self.num_workers, *mode)
+                    op_relay_scatter_consolidated_mode(&sources, cols, target_tcs, &schema, self.num_workers(), *mode)
                 } else {
-                    op_repartition_batches_mode(&sources, cols, target_tcs, &schema, self.num_workers, *mode)
+                    op_repartition_batches_mode(&sources, cols, target_tcs, &schema, self.num_workers(), *mode)
                 })
             }
         };
@@ -621,7 +579,7 @@ impl MasterDispatcher {
         // hand, so the fit check under the lock is a comparison rather than a
         // sizing pass.
         let footprint = self.with_relay_group(&view, source_id, &dest, BACKFILL_DECISION_CONTINUE, |g| {
-            self.sal.group_footprint_direct(g)
+            self.sal.footprint(g)
         });
 
         Ok(RelayPrepared {
@@ -647,10 +605,8 @@ impl MasterDispatcher {
     /// passes CONTINUE, which is 0.
     pub(crate) fn emit_relay_with_decision(&self, prep: &RelayPrepared, decision: u64) -> Result<(), String> {
         self.with_relay_group(&prep.view, prep.source_id, &prep.dest, decision, |g| {
-            self.sal
-                .write_group_direct(g, 0, SalMessageKind::ExchangeRelay, ZoneMark::Plain)
-        })
-        .map_err(|fit| fit.refusal("exchange relay").text)?;
+            self.sal.write(g).map_err(|fit| fit.refusal(g.kind).text)
+        })?;
         self.signal_all();
         Ok(())
     }
@@ -677,17 +633,13 @@ impl MasterDispatcher {
         // Dataless, but it still carries a schema block: that block is what
         // stamps `Batch.schema` on the worker side.
         let source = wire::WireSchema::encoded(source_id, self.schema_desc_for(source_id));
-        self.write_group(
-            source.frame(wire::WireMsg {
+        self.write_group(&DirectGroup {
+            template: source.frame(wire::WireMsg {
                 seek_pk: view_id as u128,
                 ..Default::default()
             }),
-            GroupData::NONE,
-            0,
-            SalMessageKind::Backfill,
-            ZoneMark::Plain,
-            GroupTargets::AllSilent,
-        )
+            ..DirectGroup::new(SalMessageKind::Backfill)
+        })
         .map_err(|f| f.text)?;
         self.signal_all();
         self.collect_acks_and_relay(true, "backfill relay")
@@ -741,7 +693,7 @@ impl MasterDispatcher {
         pk: u128,
         seek_pk_extra: &[u8],
     ) -> Result<W2mSlot, String> {
-        let num_workers = self.num_workers;
+        let num_workers = self.num_workers();
         let schema = self.cat().registry().table_entry(target_id)?.schema;
         // Decode the wire pair to the OPK bytes (width-universal), then route off
         // the distribution prefix via the shared `worker_for_pk`. A Seek
@@ -752,19 +704,16 @@ impl MasterDispatcher {
             .map_err(|e| format!("seek: table {target_id}: {e}"))?;
         let worker = schema.worker_for_pk(opk.pk_bytes(), num_workers);
         let (mut slots, _scan) = dispatch_scan_fanout(self, reactor, Fanout::One(worker), |targets| {
-            self.write_group(
-                wire::WireMsg {
+            self.write_group(&DirectGroup {
+                template: wire::WireMsg {
                     target_id: target_id as u64,
                     seek_pk: pk,
                     seek_pk_extra,
                     ..Default::default()
                 },
-                GroupData::NONE,
-                0,
-                SalMessageKind::Seek,
-                ZoneMark::Plain,
                 targets,
-            )
+                ..DirectGroup::new(SalMessageKind::Seek)
+            })
         })
         .await
         .map_err(|f| f.text)?;
@@ -816,20 +765,17 @@ impl MasterDispatcher {
             // group carries: the worker's `seek_by_index` arm resolves its
             // own from its own catalog.
             expected = Some(self.schema_desc_for(target_id));
-            self.write_group(
-                wire::WireMsg {
+            self.write_group(&DirectGroup {
+                template: wire::WireMsg {
                     target_id: target_id as u64,
                     seek_pk,
                     seek_col_idx,
                     seek_pk_extra,
                     ..Default::default()
                 },
-                GroupData::NONE,
-                0,
-                SalMessageKind::SeekByIndex,
-                ZoneMark::Plain,
                 targets,
-            )
+                ..DirectGroup::new(SalMessageKind::SeekByIndex)
+            })
         })
         .await
         .map_err(|f| f.text)?;
@@ -925,8 +871,8 @@ impl MasterDispatcher {
         let (slots, scan) = dispatch_scan_fanout(self, reactor, unicast, |targets| {
             let round = self.last_tick_round();
             sampled = round;
-            self.write_group(
-                wire::WireMsg {
+            self.write_group(&DirectGroup {
+                template: wire::WireMsg {
                     target_id: target_id as u64,
                     client_id,
                     flags: wire_flags,
@@ -934,12 +880,9 @@ impl MasterDispatcher {
                     seek_pk_extra,
                     ..Default::default()
                 },
-                GroupData::NONE,
-                0,
-                kind,
-                ZoneMark::Plain,
                 targets,
-            )
+                ..DirectGroup::new(kind)
+            })
         })
         .await?;
         let ok = forward_scan_slots(reactor, peer, slots, &scan).await?;
@@ -970,35 +913,35 @@ impl MasterDispatcher {
         forward_scan_slots(reactor, peer, slots, scan).await
     }
 
-    /// Broadcast a DDL batch to every worker. `lsn` is the caller's zone
-    /// LSN — one LSN across all broadcasts of a DDL so recovery can group
-    /// them as an atomic zone. `zone_start` marks this as the zone's first group,
-    /// which is what gives the zone a byte span recovery can attribute damage to.
-    pub fn broadcast_ddl(&self, target_id: i64, batch: &Batch, lsn: u64, zone_start: bool) -> Result<(), WorkerFault> {
+    /// Broadcast a DDL batch to every worker inside the zone at `lsn` — one LSN
+    /// across all broadcasts of a DDL so recovery can group them as an atomic
+    /// zone. The writer marks the first one it admits as the zone's start, which
+    /// is what gives the zone a byte span recovery can attribute damage to.
+    pub fn broadcast_ddl(&self, target_id: i64, batch: &Batch, lsn: u64) -> Result<(), WorkerFault> {
         let relation = self.wire_schema(target_id);
-        self.write_group(
-            relation.frame(wire::WireMsg::default()),
-            GroupData::Same(wire::WireData::Whole(Some(batch))),
+        self.write_group(&DirectGroup {
+            template: relation.frame(wire::WireMsg::default()),
+            data: GroupData::Same(wire::WireData::Whole(Some(batch))),
             lsn,
-            SalMessageKind::DdlSync,
-            if zone_start { ZoneMark::Start } else { ZoneMark::Plain },
-            GroupTargets::AllSilent,
-        )?;
+            zoned: true,
+            ..DirectGroup::new(SalMessageKind::DdlSync)
+        })?;
         self.signal_all();
         gnitz_debug!("broadcast_ddl tid={} rows={} lsn={}", target_id, batch.len(), lsn);
         Ok(())
     }
 
-    /// Close an atomic zone at `lsn`: write the empty commit sentinel
-    /// and signal workers. All preceding groups at this LSN belong to
-    /// the zone; recovery applies them only when this sentinel reaches
-    /// disk before the crash.
-    pub fn commit_zone(&self, lsn: u64) -> Result<(), WorkerFault> {
-        self.sal
-            .write_commit_sentinel(lsn)
-            .map_err(|fit| fit.refusal("commit sentinel"))?;
+    /// Close the open atomic zone with its commit sentinel and signal the
+    /// workers; `Ok(false)` when no zone is open, and only the wake goes out.
+    /// All preceding groups at the zone's LSN belong to it; recovery applies
+    /// them only when the sentinel reaches disk before the crash.
+    pub fn commit_zone(&self) -> Result<bool, WorkerFault> {
+        let closed = self
+            .sal
+            .close_zone()
+            .map_err(|fit| fit.refusal(SalMessageKind::ZoneCommit))?;
         self.signal_all();
-        Ok(())
+        Ok(closed)
     }
 
     // -----------------------------------------------------------------------
@@ -1077,17 +1020,15 @@ impl MasterDispatcher {
         if self.take_injected_tick_emit_error(tid) {
             return Err(format!("injected tick emit error (tid={tid})").into());
         }
-        self.write_group(
-            wire::WireMsg {
+        self.write_group(&DirectGroup {
+            template: wire::WireMsg {
                 target_id: tid as u64,
                 ..Default::default()
             },
-            GroupData::NONE,
-            round,
-            SalMessageKind::Tick,
-            ZoneMark::Plain,
+            lsn: round,
             targets,
-        )
+            ..DirectGroup::new(SalMessageKind::Tick)
+        })
     }
 
     /// Raise the last-reached round of every fed view in `tid`'s **forward**
@@ -1174,7 +1115,7 @@ impl MasterDispatcher {
         // alive") and silently misses one worker's death while others run, so it
         // would go blind the moment a SIGCHLD/signalfd reaper or SA_NOCLDWAIT is
         // ever added. It also names the exact dead worker for the error/log.
-        for w in 0..self.num_workers {
+        for w in 0..self.num_workers() {
             let pid = self.worker_pids.borrow()[w];
             if pid <= 0 {
                 continue;
@@ -1207,16 +1148,9 @@ impl MasterDispatcher {
     /// worker processes.
     pub fn shutdown_workers(&self) {
         // No schema block: the worker's `Shutdown` arm takes no arguments.
-        let _ = self.write_group(
-            wire::WireMsg::default(),
-            GroupData::NONE,
-            0,
-            SalMessageKind::Shutdown,
-            ZoneMark::Plain,
-            GroupTargets::AllSilent,
-        );
+        let _ = self.write_group(&DirectGroup::new(SalMessageKind::Shutdown));
         self.signal_all();
-        for w in 0..self.num_workers {
+        for w in 0..self.num_workers() {
             let pid = self.worker_pids.borrow()[w];
             if pid > 0 {
                 let mut status: i32 = 0;
@@ -1233,6 +1167,8 @@ impl MasterDispatcher {
     /// Lay one push batch out as a SAL group at the caller's `lsn`, with a
     /// per-worker request id. Called from the committer task, which signals,
     /// closes the zone, and awaits fsync + the per-worker ACKs itself.
+    /// `recoverable` puts the group inside the zone the sentinel and fdatasync
+    /// close; a stream's rows ride outside it.
     ///
     /// `Err` carries the SAL's own verdict: the committer turns `Transient` into
     /// a forced checkpoint, and rolls the transaction's earlier families back.
@@ -1243,32 +1179,29 @@ impl MasterDispatcher {
         batch: &Batch,
         mode: WireConflictMode,
         req_ids: &[u64],
-        mark: ZoneMark,
+        recoverable: bool,
     ) -> Result<(), SalFit> {
         self.arm_injected_tick_emit_error(target_id, batch.len());
         let relation = self.wire_schema(target_id);
-        let nw = self.num_workers;
         // Identical scatter for both routings; only the per-worker index fill
         // differs (full broadcast vs PK-partitioned). One `with_group` call site
         // keeps the atomic-zone framing, LSN, ACK accounting, and the committer's
         // single `fdatasync` shared between them.
-        let template = wire::WireMsg {
-            flags: wire_flags_set_conflict_mode(0, mode),
-            ..Default::default()
+        let base = DirectGroup {
+            template: wire::WireMsg {
+                flags: wire_flags_set_conflict_mode(0, mode),
+                ..Default::default()
+            },
+            targets: GroupTargets::All(req_ids),
+            lsn,
+            zoned: recoverable,
+            ..DirectGroup::new(SalMessageKind::Push)
         };
         // A replicated relation broadcasts: the whole batch lands in every
         // worker's ingest + SAL slot, so each worker durably logs the full table
         // and enforces uniqueness against its identical full copy.
-        with_commit_indices(batch, relation.descriptor(), nw, |worker_indices| {
-            with_group(
-                batch,
-                worker_indices,
-                &relation,
-                template,
-                GroupTargets::All(req_ids),
-                nw,
-                |g| self.sal.write_group_direct(g, lsn, SalMessageKind::Push, mark),
-            )
+        with_commit_indices(batch, relation.descriptor(), self.num_workers(), |worker_indices| {
+            with_group(batch, worker_indices, &relation, base, |g| self.sal.write(g))
         })
     }
 
@@ -1288,14 +1221,11 @@ impl MasterDispatcher {
         targets: GroupTargets<'_>,
     ) -> Result<(), WorkerFault> {
         self.note_flush_round(lsn, kind);
-        self.write_group(
-            wire::WireMsg::default(),
-            GroupData::NONE,
+        self.write_group(&DirectGroup {
             lsn,
-            kind,
-            ZoneMark::Plain,
             targets,
-        )
+            ..DirectGroup::new(kind)
+        })
     }
 
     /// Post-ACK checkpoint cleanup: flush system tables before resetting

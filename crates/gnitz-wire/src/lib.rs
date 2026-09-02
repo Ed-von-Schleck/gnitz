@@ -31,6 +31,7 @@ compile_error!("GnitzDB requires a little-endian target; the wire format is LE-o
 /// (`wire_name`), and its `ALL` is a fixed-size array — the shape `gnitz-py`
 /// builds its `TypeCode` IntEnum from — where this macro emits a slice. Moving
 /// it would rewrite call sites in three other crates to buy nothing.
+#[macro_export]
 macro_rules! wire_enum {
     (
         $(#[$meta:meta])*

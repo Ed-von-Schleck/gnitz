@@ -137,7 +137,7 @@ fn single_bit_header_sweep_changes_nothing_observable() {
 #[test]
 fn every_single_bit_flip_in_the_control_block_body_is_rejected() {
     // A full checksummed frame — control + schema + data — as
-    // `write_group_direct` writes one into a SAL slot.
+    // `SalWriter::write` writes one into a SAL slot.
     let schema = make_schema_u64_i64();
     let batch = make_batch(&schema, &[(1, 1, 10)]);
     let block = crate::catalog::encode_schema_block(&schema, 7);
@@ -204,8 +204,8 @@ fn the_control_blocks_size_field_is_exact() {
 #[test]
 fn the_push_fast_paths_slots_carry_a_verifiable_control_block() {
     use crate::runtime::master::scatter::{with_commit_indices, with_group};
-    use crate::runtime::sal::fixtures::TestLog;
-    use crate::runtime::sal::{EpochGate, SalMessageKind, SalStep, ZoneMark};
+    use crate::runtime::sal::fixtures::{group_at, TestLog};
+    use crate::runtime::sal::{DirectGroup, SalMessageKind};
 
     let nw = 2usize;
     let sal = TestLog::new(1 << 20, nw, 1);
@@ -215,22 +215,16 @@ fn the_push_fast_paths_slots_carry_a_verifiable_control_block() {
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
     let relation = crate::runtime::wire::WireSchema::encoded(16, schema);
     let req_ids: Vec<u64> = (0..nw as u64).collect();
+    let base = DirectGroup {
+        targets: GroupTargets::All(&req_ids),
+        lsn: 5,
+        ..DirectGroup::new(SalMessageKind::Push)
+    };
     with_commit_indices(&batch, &schema, nw, |wi| {
-        with_group(
-            &batch,
-            wi,
-            &relation,
-            WireMsg::default(),
-            GroupTargets::All(&req_ids),
-            nw,
-            |g| writer.write_group_direct(g, 5, SalMessageKind::Push, ZoneMark::Plain),
-        )
-        .expect("group fits")
+        with_group(&batch, wi, &relation, base, |g| writer.write(g)).expect("group fits")
     });
 
-    let SalStep::Group(msg, _) = sal.log().read_at(0, EpochGate::Walk(1)) else {
-        panic!("the push group is published at offset 0");
-    };
+    let msg = group_at(sal.log(), 0);
     let slot = msg.slot(0).expect("slot 0 carries bytes");
     crate::runtime::wire::decode_wire(slot).expect("the fast path's slot must verify");
 

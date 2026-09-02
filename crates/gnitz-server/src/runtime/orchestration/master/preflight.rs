@@ -1378,18 +1378,15 @@ impl MasterDispatcher {
         let (slots, scan) = dispatch_scan_fanout(self, reactor, unicast, |targets| {
             // The worker's `UniquePreflight` arm resolves the owner's schema
             // from its own catalog.
-            self.write_group(
-                wire::WireMsg {
+            self.write_group(&DirectGroup {
+                template: wire::WireMsg {
                     target_id: owner_id as u64,
                     seek_col_idx: packed,
                     ..Default::default()
                 },
-                GroupData::NONE,
-                0,
-                SalMessageKind::UniquePreflight,
-                ZoneMark::Plain,
                 targets,
-            )
+                ..DirectGroup::new(SalMessageKind::UniquePreflight)
+            })
         })
         .await
         .map_err(|f| f.text)?;
@@ -1433,30 +1430,20 @@ impl MasterDispatcher {
             let rids = reactor.alloc_replies(num_checks * nw);
             for (idx, check) in checks.iter().enumerate() {
                 let req_slice = &rids[idx * nw..(idx + 1) * nw];
+                let g = DirectGroup {
+                    template: check.schema.frame(wire::WireMsg {
+                        seek_col_idx: check.col_hint,
+                        ..Default::default()
+                    }),
+                    data: GroupData::Same(wire::WireData::Whole(Some(&check.batch))),
+                    targets: GroupTargets::All(req_slice),
+                    ..DirectGroup::new(SalMessageKind::HasPk)
+                };
                 match check.route {
-                    CheckRoute::Broadcast => disp
-                        .write_group(
-                            check.schema.frame(wire::WireMsg {
-                                seek_col_idx: check.col_hint,
-                                ..Default::default()
-                            }),
-                            GroupData::Same(wire::WireData::Whole(Some(&check.batch))),
-                            0,
-                            SalMessageKind::HasPk,
-                            ZoneMark::Plain,
-                            GroupTargets::All(req_slice),
-                        )
-                        .map_err(|f| f.text)?,
-                    CheckRoute::ScatterByPk => disp
-                        .write_scatter_group(
-                            &check.batch,
-                            &check.schema,
-                            SalMessageKind::HasPk,
-                            check.col_hint,
-                            GroupTargets::All(req_slice),
-                        )
-                        .map_err(|f| f.text)?,
+                    CheckRoute::Broadcast => disp.write_group(&g),
+                    CheckRoute::ScatterByPk => disp.write_scatter_group(&check.batch, &check.schema, g),
                 }
+                .map_err(|f| f.text)?;
             }
             disp.signal_all();
             (nw, rids)
@@ -1545,7 +1532,18 @@ impl MasterDispatcher {
         let (slots, scan) = dispatch_scan_fanout(disp, reactor, Fanout::Broadcast, |targets| {
             let pooled = disp.pool_pop_batch((target_id, 0));
             let batch = build_check_batch_pk_bytes(&parent_schema, pks.iter().map(|p| p.pk_bytes()), pooled);
-            disp.write_scatter_group(&batch, &parent, SalMessageKind::Gather, ref_col as u64, targets)?;
+            disp.write_scatter_group(
+                &batch,
+                &parent,
+                DirectGroup {
+                    template: wire::WireMsg {
+                        seek_col_idx: ref_col as u64,
+                        ..Default::default()
+                    },
+                    targets,
+                    ..DirectGroup::new(SalMessageKind::Gather)
+                },
+            )?;
             // The scatter batch is fully consumed by the synchronous
             // scatter above; return it to the pool.
             recycle_check_batch(disp, (target_id, 0), batch);

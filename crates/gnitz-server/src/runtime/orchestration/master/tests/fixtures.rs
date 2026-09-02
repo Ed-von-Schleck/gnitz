@@ -50,7 +50,7 @@ pub(super) fn test_dispatcher(worker_pids: Vec<i32>, catalog: *mut CatalogEngine
         worker_pids,
         catalog,
         0,
-        SalWriter::new(sal, -1, SAL_SIZE as u64, nw),
+        SalWriter::new(sal, -1, SAL_SIZE, nw),
         Rc::new(W2mReceiver::new(rings)),
         vec![-1; nw],
     )

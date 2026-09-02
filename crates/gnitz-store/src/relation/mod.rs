@@ -796,7 +796,7 @@ impl RelationRegistry {
 
     /// The one writer of `resume_generation`, and the one writer of
     /// `recorded_topology`. Kept apart because their callers set them at
-    /// different moments: the worker latches a generation off a `FLAG_FLUSH_EPH`
+    /// different moments: the worker latches a generation off a `FlushEph`
     /// header with no topology in hand, and `record_topology` writes a
     /// `_sequences` row the registry knows nothing about.
     pub fn set_resume_generation(&mut self, g: u64) {

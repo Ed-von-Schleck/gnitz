@@ -436,6 +436,7 @@ The knobs a session usually reaches for. This is not the full set — every
 | `GNITZ_CPU_AFFINITY` | Pin master and workers to CPUs (default on); `0` when servers share a host |
 | `GNITZ_SERVER_BIN` | Override server binary (e.g. aim E2E at the release build) |
 | `GNITZ_CHECKPOINT_BYTES` | SAL checkpoint threshold |
+| `GNITZ_SAL_BYTES` | SAL mapping size; floor 16 MiB. Keep it constant across restarts of one data dir: recovery walks only the mapped bytes, so shrinking it after a crash skips committed groups past the new bound |
 | `GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES` | CREATE UNIQUE INDEX pre-flight in-RAM sort budget before spilling to disk |
 | `GNITZ_CLIENT_SEND_TIMEOUT_MS` | Per-frame deadline on ring-slot client egress before a stalled client is evicted |
 | `GNITZ_RAM_TIER_BYTES` | Per-store RAM-tier ceiling before it spills to a shard; shrink it to reach the disk regime on small data |

@@ -60,11 +60,8 @@ fn decode_group_slot(msg: &SalMessage, data: &[u8]) -> Result<ipc::DecodedWire, 
 /// because their zone never closed.
 ///
 /// Returns the walk's epoch — the floor the next writer epoch and the workers'
-/// initial `expected_epoch` are taken from — and the width the tail was written at.
-fn recover_system_tables_from_sal(
-    sal_ptr: *const u8,
-    catalog: &mut CatalogEngine,
-) -> Result<(u32, Option<u32>), String> {
+/// initial `expected_epoch` are taken from.
+fn recover_system_tables_from_sal(sal_ptr: *const u8, catalog: &mut CatalogEngine) -> Result<u32, String> {
     let log = unsafe { SalLog::new(sal_ptr, sal_mmap_size()) };
     let family_lsns = catalog.registry().system_flushed_lsns();
 
@@ -98,7 +95,7 @@ fn recover_system_tables_from_sal(
     if replayed > 0 {
         boot_log(&format!("SAL system table recovery: replayed {replayed} entries\n"));
     }
-    Ok((epoch, tail.first_group_slots()))
+    Ok(epoch)
 }
 
 /// `GNITZ_INJECT_RECOVERY_PANIC=<stage>`: panic when recovery reaches the named
@@ -163,11 +160,19 @@ fn recover_from_sal(
 
     let mut pending: HashMap<i64, Batch> = HashMap::new();
     let mut replayed: u32 = 0;
+    // Groups re-cut for the launched topology, and the width the last of them
+    // was written at — the boot record's re-slice marker.
+    let mut resliced: u32 = 0;
+    let mut written_slots: u32 = 0;
     for msg in tail.groups() {
         // Each group's own slot count, off the header in hand and inside its
         // digest. A tail-wide probe reads one header for all of them, and a torn
         // one picks the wrong mode — losing every slot above `rank`.
         let reslice = msg.slots() != num_workers;
+        if reslice {
+            resliced += 1;
+            written_slots = msg.slots();
+        }
         let tid = msg.target_id as i64;
         // The catalog's schema, not the wire's: only the catalog stamps the
         // `replicated` bit the branch below reads. `SchemaDescriptor` is `Copy`, so
@@ -245,7 +250,12 @@ fn recover_from_sal(
     }
 
     if replayed > 0 {
-        boot_log(&format!("SAL recovery: replayed {replayed} blocks\n"));
+        let mut line = format!("SAL replay: replayed {replayed} group(s)");
+        if resliced > 0 {
+            line += &format!(", {resliced} re-sliced from a {written_slots}-worker tail");
+        }
+        line += "\n";
+        boot_log(&line);
     }
     Ok(pending)
 }
@@ -393,7 +403,7 @@ fn run_worker_child(
     placement: Option<&affinity::Placement>,
 ) -> ! {
     // Die immediately if the master exits for any reason. The `getppid` probe a
-    // worker runs after a timed-out `SalReader::wait` is a belt-and-suspenders
+    // worker runs after a timed-out eventfd park is a belt-and-suspenders
     // fallback; this closes the ~30s polling gap.
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
     // Re-check: parent may have died in the fork→prctl window.
@@ -443,15 +453,7 @@ fn run_worker_child(
 
     let catalog = unsafe { &mut *catalog_ptr };
 
-    let sal_reader = unsafe {
-        SalReader::new(
-            ipc.sal_ptr as *const u8,
-            w as u32,
-            sal_mmap_size(),
-            ipc.m2w_efds[w],
-            walk_epoch,
-        )
-    };
+    let sal_reader = unsafe { SalReader::new(ipc.sal_ptr as *const u8, w as u32, sal_mmap_size(), walk_epoch) };
     let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w]);
 
     // Become worker `(w, W)` before any flush: every inherited store re-homes
@@ -487,7 +489,14 @@ fn run_worker_child(
         num_workers
     ));
 
-    let mut worker = WorkerProcess::new(master_pid, catalog_ptr, sal_reader, w2m_writer, pending_deltas);
+    let mut worker = WorkerProcess::new(
+        master_pid,
+        catalog_ptr,
+        sal_reader,
+        w2m_writer,
+        ipc.m2w_efds[w],
+        pending_deltas,
+    );
     let rc = worker.run(boot_err);
 
     unsafe {
@@ -543,7 +552,7 @@ fn run_server(
     //
     // The recovered walk epoch is this boot's floor, so a previous boot's
     // leftover always carries a strictly lower one than anything written now.
-    let (walk_epoch, tail_slots) = recover_system_tables_from_sal(ipc.sal_ptr as *const u8, &mut catalog)?;
+    let walk_epoch = recover_system_tables_from_sal(ipc.sal_ptr as *const u8, &mut catalog)?;
     {
         // Abort before forking workers and long before the SAL reset: the
         // replayed DDL lives only in master memory until this flush makes it
@@ -590,15 +599,6 @@ fn run_server(
         inject_recovery_panic("genbump");
     }
 
-    // Name the replay path the workers will take, so the boot record shows
-    // whether the tail was re-sliced. Pre-fork, so this still reaches the
-    // master's own log (the children redirect fd 2 to their own).
-    if let Some(written) = tail_slots.filter(|&n| n != num_workers) {
-        boot_log(&format!(
-            "SAL tail written by {written} workers, launching {num_workers}\n"
-        ));
-    }
-
     // Log fd assignments
     boot_log(&format!("SAL fd={}\n", ipc.sal_fd));
     for w in 0..nw {
@@ -641,7 +641,7 @@ fn run_server(
         m2w_efds,
     } = ipc;
 
-    let sal_writer = SalWriter::new(sal_ptr, sal_fd, sal_mmap_size() as u64, nw);
+    let sal_writer = SalWriter::new(sal_ptr, sal_fd, sal_mmap_size(), nw);
     let w2m_receiver = std::rc::Rc::new(W2mReceiver::new(w2m_ptrs));
 
     // `recovery_start_generation_bump` has already run, so this is the floor

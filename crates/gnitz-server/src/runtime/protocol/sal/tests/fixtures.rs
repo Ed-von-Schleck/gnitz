@@ -1,7 +1,7 @@
 //! The SAL fixture: a log over its own shared region, written by the
 //! production writer, plus the reader every assertion goes through.
 //!
-//! A child of `sal`, so it reaches `begin`/`finish` and the cursor directly and
+//! A child of `sal`, so it reaches `write_slots` and the cursor directly and
 //! no test-only writer path has to exist in production. `pub(crate)` because
 //! the worker drain and the block-integrity suite need a real SAL too.
 
@@ -14,7 +14,6 @@ pub(crate) struct TestLog {
     region: SharedRegion,
     pub(crate) writer: SalWriter,
     pub(crate) size: usize,
-    workers: usize,
 }
 
 impl TestLog {
@@ -22,22 +21,9 @@ impl TestLog {
     /// cursor 0 in `epoch`.
     pub(crate) fn new(size: usize, workers: usize, epoch: u32) -> TestLog {
         let region = SharedRegion::new(size);
-        let writer = SalWriter::new(region.ptr(), -1, size as u64, workers);
+        let writer = SalWriter::new(region.ptr(), -1, size, workers);
         writer.epoch.set(epoch);
-        TestLog {
-            region,
-            writer,
-            size,
-            workers,
-        }
-    }
-
-    /// Start a fresh writer at cursor 0 in `epoch` over the same bytes — the
-    /// leftover shape, where a shorter later pass leaves an earlier epoch's
-    /// groups standing past its own frontier.
-    pub(crate) fn relayout(&mut self, epoch: u32) {
-        self.writer = SalWriter::new(self.region.ptr(), -1, self.size as u64, self.workers);
-        self.writer.epoch.set(epoch);
+        TestLog { region, writer, size }
     }
 
     pub(crate) fn ptr(&self) -> *mut u8 {
@@ -53,8 +39,9 @@ impl TestLog {
     }
 
     /// Place the cursor and epoch by hand — the shapes no `rewind` produces:
-    /// two groups at consecutive offsets under different epochs, or a cursor
-    /// parked just under a cap.
+    /// two groups at consecutive offsets under different epochs, a cursor
+    /// parked just under a cap, or a shorter later epoch laid over an earlier
+    /// one's groups so they stand past its frontier.
     pub(crate) fn seek(&self, cursor: u64, epoch: u32) {
         self.writer.write_cursor.set(cursor);
         self.writer.epoch.set(epoch);
@@ -62,25 +49,38 @@ impl TestLog {
 
     /// Append one group whose slots are `payloads` verbatim; returns its base.
     pub(crate) fn write(&self, target: u32, lsn: u64, kind: SalMessageKind, payloads: &[&[u8]]) -> u64 {
-        self.try_write(target, lsn, kind, ZoneMark::Plain, payloads)
-            .expect("group fits")
+        self.try_write(target, lsn, kind, false, payloads).expect("group fits")
     }
 
-    /// Same, reporting the writer's verdict — for the tests about refusal.
+    /// Same, with the zone-start byte spelled by the caller and the writer's
+    /// verdict reported — below the zone-state layer, so a shape the production
+    /// writer never lays down (a start with no commit, a sentinel with no zone
+    /// open) can be.
     pub(crate) fn try_write(
         &self,
         target: u32,
         lsn: u64,
         kind: SalMessageKind,
-        mark: ZoneMark,
+        zone_start: bool,
         payloads: &[&[u8]],
     ) -> Result<u64, SalFit> {
         let base = self.cursor();
         let sizes: Vec<u32> = payloads.iter().map(|p| p.len() as u32).collect();
-        let group = self.writer.begin(target, lsn, kind, mark, &sizes)?;
-        unsafe { group.for_each_slot(|w, slot| slot.copy_from_slice(payloads[w])) };
-        self.writer.finish(group);
+        self.writer
+            .write_slots(target, lsn, kind, zone_start, &sizes, |w, slot| {
+                slot.copy_from_slice(payloads[w])
+            })?;
         Ok(base)
+    }
+
+    /// A raw commit sentinel at `lsn`, whatever zone state the writer holds.
+    /// Returns its base.
+    pub(crate) fn sentinel(&self, lsn: u64) -> u64 {
+        let base = self.cursor();
+        self.writer
+            .write_slots(0, lsn, SalMessageKind::ZoneCommit, false, &[], |_, _| {})
+            .expect("sentinel fits");
+        base
     }
 }
 

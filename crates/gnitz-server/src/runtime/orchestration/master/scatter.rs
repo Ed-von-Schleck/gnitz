@@ -15,8 +15,8 @@ use std::cell::RefCell;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 
-use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets};
-use crate::runtime::wire::{WireData, WireMsg, WireSchema};
+use crate::runtime::sal::{DirectGroup, GroupData};
+use crate::runtime::wire::{WireData, WireSchema};
 
 // Reuse the index scratch across calls so a steady-state push allocates nothing
 // for its routing table.
@@ -87,8 +87,9 @@ where
 }
 
 /// Build the [`DirectGroup`] a scatter emission of `batch` under
-/// `worker_indices` produces, and hand it to `f`. Here rather than on the log
-/// writer, beside the two index fills it must be paired with.
+/// `worker_indices` produces, and hand it to `f`: `base` with its template
+/// framed by `relation` and one slot per entry of `worker_indices`. Here rather
+/// than on the log writer, beside the two index fills it must be paired with.
 ///
 /// A schema with no German-string column scatters straight into the destination
 /// slot ([`WireData::Scattered`]), skipping the intermediate `Batch`. One with a
@@ -100,9 +101,7 @@ pub(crate) fn with_group<R>(
     batch: &Batch,
     worker_indices: &[Vec<u32>],
     relation: &WireSchema,
-    template: WireMsg<'_>,
-    targets: GroupTargets<'_>,
-    num_workers: usize,
+    base: DirectGroup<'_>,
     f: impl FnOnce(&DirectGroup) -> R,
 ) -> R {
     let schema = relation.descriptor();
@@ -112,7 +111,6 @@ pub(crate) fn with_group<R>(
     let sub_batches: Vec<Batch> = if schema.has_german_string() {
         worker_indices
             .iter()
-            .take(num_workers)
             .map(|indices| {
                 if indices.is_empty() {
                     Batch::empty_with_schema(schema)
@@ -127,7 +125,6 @@ pub(crate) fn with_group<R>(
     let worker_data: Vec<WireData> = if sub_batches.is_empty() {
         worker_indices
             .iter()
-            .take(num_workers)
             .map(|indices| WireData::Scattered { batch, indices, schema })
             .collect()
     } else {
@@ -135,8 +132,8 @@ pub(crate) fn with_group<R>(
     };
 
     f(&DirectGroup {
-        template: relation.frame(template),
+        template: relation.frame(base.template),
         data: GroupData::PerWorker(&worker_data),
-        targets,
+        ..base
     })
 }

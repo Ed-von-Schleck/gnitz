@@ -1,7 +1,8 @@
 use super::fixtures::{group_and_next, group_at, TestLog};
 use super::{
-    atomic_load_u64, effective_max, group_header_size, EpochGate, GroupData, GroupTargets, SalMessageKind, SalStep,
-    ZoneMark, CHECKPOINT_RESERVE, MIN_SAL_BYTES, SENTINEL_SIZE,
+    effective_max, group_digest, group_header_size, group_total_size, pack_prefix, DirectGroup, EpochGate, GroupData,
+    SalMessageKind, SalStep, CHECKPOINT_RESERVE, MIN_SAL_BYTES, OFF_DIGEST, OFF_KIND, OFF_ZONE_START, PREFIX_BYTES,
+    SENTINEL_SIZE,
 };
 use crate::runtime::m2w::{self, Wake};
 use crate::runtime::test_support::assert_child_exited_ok;
@@ -9,6 +10,12 @@ use crate::test_support::{make_batch_raw, sweep_bit_flips};
 use gnitz_wire::align8;
 use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
 use gnitz_wire::MAX_WORKERS;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The publication prefix word at offset 0.
+fn prefix_word(log: &TestLog) -> u64 {
+    unsafe { AtomicU64::from_ptr(log.ptr().cast()).load(Ordering::Acquire) }
+}
 
 #[test]
 fn sal_round_trip() {
@@ -59,8 +66,7 @@ fn sal_full_error() {
     let log = TestLog::new(SENTINEL_SIZE + CHECKPOINT_RESERVE + payload, 1, 1);
     let buf = vec![0xFF; payload];
     assert!(
-        log.try_write(0, 0, SalMessageKind::Scan, ZoneMark::Plain, &[&buf])
-            .is_err(),
+        log.try_write(0, 0, SalMessageKind::Scan, false, &[&buf]).is_err(),
         "a group overrunning the ordinary cap must be refused"
     );
 }
@@ -113,7 +119,7 @@ fn a_group_hides_the_slots_of_a_wider_group_at_the_same_offset() {
 fn a_group_wider_than_max_workers_is_a_logic_fault() {
     let log = TestLog::new(1 << 20, 1, 1);
     let payloads = vec![&[][..]; MAX_WORKERS + 1];
-    let _ = log.try_write(0, 0, SalMessageKind::Scan, ZoneMark::Plain, &payloads);
+    let _ = log.try_write(0, 0, SalMessageKind::Scan, false, &payloads);
 }
 
 /// The worst-case footprint of a terminal group: a `MAX_WORKERS` broadcast whose
@@ -121,14 +127,17 @@ fn a_group_wider_than_max_workers_is_a_logic_fault() {
 /// `shutdown_workers` and `write_checkpoint_group` — carry neither a schema block
 /// nor data.
 fn worst_case_terminal_group() -> usize {
-    8 + group_header_size(MAX_WORKERS) + MAX_WORKERS * align8(CTRL_BLOCK_SIZE_NO_BLOB)
+    group_total_size(
+        group_header_size(MAX_WORKERS),
+        std::iter::repeat_n(CTRL_BLOCK_SIZE_NO_BLOB as u32, MAX_WORKERS),
+    )
 }
 
 #[test]
 fn effective_max_reserves_by_kind() {
     let mmap = 1usize << 30;
     assert_eq!(
-        effective_max(SalMessageKind::Scan, ZoneMark::Plain, mmap),
+        effective_max(SalMessageKind::Scan, mmap),
         mmap - SENTINEL_SIZE - CHECKPOINT_RESERVE
     );
     for terminal in [
@@ -137,13 +146,13 @@ fn effective_max_reserves_by_kind() {
         SalMessageKind::Shutdown,
     ] {
         assert_eq!(
-            effective_max(terminal, ZoneMark::Plain, mmap),
+            effective_max(terminal, mmap),
             mmap - SENTINEL_SIZE,
             "a terminal group may spend the checkpoint reserve"
         );
     }
     assert_eq!(
-        effective_max(SalMessageKind::DdlSync, ZoneMark::Commit, mmap),
+        effective_max(SalMessageKind::ZoneCommit, mmap),
         mmap - CHECKPOINT_RESERVE,
         "a sentinel may spend the sentinel headroom but not the reserve"
     );
@@ -167,7 +176,7 @@ fn checkpoint_reserve_holds_two_terminal_groups() {
 fn ordinary_cap_at_the_sal_floor_still_admits_a_group() {
     // The floor is the smallest configurable mapping; the reserve must leave the
     // overwhelming majority of it to ordinary groups.
-    let cap = effective_max(SalMessageKind::Scan, ZoneMark::Plain, MIN_SAL_BYTES);
+    let cap = effective_max(SalMessageKind::Scan, MIN_SAL_BYTES);
     assert!(
         cap > MIN_SAL_BYTES - MIN_SAL_BYTES / 64,
         "the reserve must not eat the SAL floor: cap {cap} of {MIN_SAL_BYTES}"
@@ -180,23 +189,20 @@ fn terminal_and_sentinel_fit_where_an_ordinary_group_does_not() {
     // full-width checkpoint round and a zone-closing sentinel.
     let size = MIN_SAL_BYTES;
     let log = TestLog::new(size, 1, 1);
-    let cursor = effective_max(SalMessageKind::Scan, ZoneMark::Plain, size) as u64 - 8;
+    let cursor = effective_max(SalMessageKind::Scan, size) as u64 - PREFIX_BYTES as u64;
 
     log.seek(cursor, 1);
     assert!(
-        log.try_write(0, 0, SalMessageKind::Scan, ZoneMark::Plain, &[&[]])
-            .is_err(),
+        log.try_write(0, 0, SalMessageKind::Scan, false, &[&[]]).is_err(),
         "an ordinary group must be refused once the cursor passes the ordinary cap"
     );
 
     log.seek(cursor, 1);
-    log.writer
-        .write_commit_sentinel(0)
-        .expect("the zone-closing sentinel must still fit");
+    log.sentinel(0);
 
     log.seek(cursor, 1);
     let flush_slots = vec![&[0u8; CTRL_BLOCK_SIZE_NO_BLOB][..]; MAX_WORKERS];
-    log.try_write(0, 0, SalMessageKind::Flush, ZoneMark::Plain, &flush_slots)
+    log.try_write(0, 0, SalMessageKind::Flush, false, &flush_slots)
         .expect("a MAX_WORKERS checkpoint round must still fit");
 }
 
@@ -218,40 +224,40 @@ fn sal_epoch_fence() {
     assert!(matches!(view.read_at(second, EpochGate::Walk(5)), SalStep::Absent));
 }
 
-/// Two groups at lsn=K, the writer's own sentinel at lsn=K, then a group at
-/// lsn=K+1: on read-back the sentinel must be the only one marked
-/// [`ZoneMark::Commit`]. Framing only; the zone rule is `sal::zone`'s.
+/// Two groups at lsn=K, a sentinel at lsn=K, then a group at lsn=K+1: on
+/// read-back the sentinel must be the only [`SalMessageKind::ZoneCommit`].
+/// Framing only; the zone rule is `sal::zone`'s.
 #[test]
 fn commit_sentinel_round_trip() {
     let log = TestLog::new(1 << 20, 1, 1);
     let buf = vec![0xAAu8; 32];
     log.write(100, 7, SalMessageKind::Scan, &[&buf, &buf]);
     log.write(101, 7, SalMessageKind::Scan, &[&buf, &buf]);
-    log.writer.write_commit_sentinel(7).unwrap();
+    log.sentinel(7);
     log.write(102, 8, SalMessageKind::Scan, &[&buf, &buf]);
 
     let view = log.log();
     let mut cursor = 0u64;
     let mut seen = Vec::new();
     while let SalStep::Group(msg, next) = view.read_at(cursor, EpochGate::Walk(1)) {
-        seen.push((msg.lsn, msg.kind, msg.mark == ZoneMark::Commit));
+        seen.push((msg.lsn, msg.kind));
         cursor = next;
     }
     assert_eq!(
         seen,
         vec![
-            (7, SalMessageKind::Scan, false),
-            (7, SalMessageKind::Scan, false),
-            (7, SalMessageKind::DdlSync, true),
-            (8, SalMessageKind::Scan, false),
+            (7, SalMessageKind::Scan),
+            (7, SalMessageKind::Scan),
+            (7, SalMessageKind::ZoneCommit),
+            (8, SalMessageKind::Scan),
         ]
     );
 }
 
 /// A zone as the committer writes one: two broadcast groups and a closing
 /// sentinel at a single LSN. From *every* worker's slot all three read back that
-/// LSN, the caller's own kind survives, and only the sentinel is marked
-/// [`ZoneMark::Commit`] and carries no payload.
+/// LSN, the caller's own kind survives, only the first is marked as the zone's
+/// start, and only the sentinel is a `ZoneCommit` and carries no payload.
 #[test]
 fn zone_two_groups_one_sentinel() {
     let log = TestLog::new(1 << 20, 1, 1);
@@ -260,26 +266,23 @@ fn zone_two_groups_one_sentinel() {
 
     let buf_a = vec![0xC0u8; 64];
     let a: Vec<&[u8]> = (0..nw).map(|_| buf_a.as_slice()).collect();
-    let b1 = log.cursor();
-    log.try_write(200, zone_lsn, SalMessageKind::Push, ZoneMark::Start, &a)
+    let b1 = log
+        .try_write(200, zone_lsn, SalMessageKind::Push, true, &a)
         .expect("group fits");
 
     let buf_b = vec![0x7Au8; 96];
     let b: Vec<&[u8]> = (0..nw).map(|_| buf_b.as_slice()).collect();
     let b2 = log.write(201, zone_lsn, SalMessageKind::Push, &b);
 
-    let b3 = log.cursor();
-    log.writer.write_commit_sentinel(zone_lsn).unwrap();
+    let b3 = log.sentinel(zone_lsn);
 
     let view = log.log();
     let (m1, m2, m3) = (group_at(view, b1), group_at(view, b2), group_at(view, b3));
     assert_eq!((m1.lsn, m2.lsn, m3.lsn), (zone_lsn, zone_lsn, zone_lsn));
     assert_eq!((m1.target_id, m2.target_id), (200, 201));
     assert_eq!((m1.kind, m2.kind), (SalMessageKind::Push, SalMessageKind::Push));
-    assert_eq!(
-        (m1.mark, m2.mark, m3.mark),
-        (ZoneMark::Start, ZoneMark::Plain, ZoneMark::Commit)
-    );
+    assert_eq!((m1.zone_start, m2.zone_start, m3.zone_start), (true, false, false));
+    assert_eq!(m3.kind, SalMessageKind::ZoneCommit);
     for w in 0..nw {
         assert!(m1.slot(w).is_some(), "first group has data for worker {w}");
         assert!(m2.slot(w).is_some(), "second group has data for worker {w}");
@@ -300,7 +303,7 @@ fn sal_cross_process_checkpoint() {
 
     let pid = unsafe { libc::fork() };
     if pid == 0 {
-        log.try_write(0, 10, SalMessageKind::Scan, ZoneMark::Plain, &[&buf])
+        log.try_write(0, 10, SalMessageKind::Scan, false, &[&buf])
             .expect("group fits");
         m2w::eventfd_signal(efd);
 
@@ -312,7 +315,7 @@ fn sal_cross_process_checkpoint() {
 
         unsafe { std::ptr::write_bytes(log.ptr(), 0, log.size) };
         log.seek(0, 2);
-        log.try_write(0, 20, SalMessageKind::Scan, ZoneMark::Plain, &[&buf2])
+        log.try_write(0, 20, SalMessageKind::Scan, false, &[&buf2])
             .expect("group fits");
         m2w::eventfd_signal(efd);
         unsafe { libc::_exit(0) };
@@ -364,26 +367,22 @@ fn sal_prefix_packing_boundaries() {
     let log = TestLog::new(2 << 20, 1, u32::MAX);
 
     log.write(0, 0, SalMessageKind::Scan, &[&[]]);
-    let word = unsafe { atomic_load_u64(log.ptr()) };
-    assert_eq!((word >> 32) as u32, u32::MAX);
-    assert_eq!((word & 0xFFFF_FFFF) as usize, group_header_size(1));
+    assert_eq!(prefix_word(&log), pack_prefix(u32::MAX, group_header_size(1)));
     let (_, next) = group_and_next(log.log(), 0, u32::MAX);
-    assert_eq!(next, (8 + group_header_size(1)) as u64);
+    assert_eq!(next, (PREFIX_BYTES + group_header_size(1)) as u64);
     assert_eq!(next, log.cursor());
 
     // A payload past 2^20, epoch 1: the low half of the prefix word is the one
     // that would truncate. Only the first group's bytes need clearing — the one
     // written over them is strictly larger.
-    unsafe { std::ptr::write_bytes(log.ptr(), 0, 8 + group_header_size(1)) };
+    unsafe { std::ptr::write_bytes(log.ptr(), 0, PREFIX_BYTES + group_header_size(1)) };
     log.seek(0, 1);
     let big = vec![0xEEu8; 1 << 20];
     log.write(0, 0, SalMessageKind::Scan, &[&big]);
     let expected_payload = group_header_size(1) + (1 << 20); // already 8-aligned
-    let word = unsafe { atomic_load_u64(log.ptr()) };
-    assert_eq!((word >> 32) as u32, 1);
-    assert_eq!((word & 0xFFFF_FFFF) as usize, expected_payload);
+    assert_eq!(prefix_word(&log), pack_prefix(1, expected_payload));
     let (msg, next) = group_and_next(log.log(), 0, 1);
-    assert_eq!(next, (8 + expected_payload) as u64);
+    assert_eq!(next, (PREFIX_BYTES + expected_payload) as u64);
     assert_eq!(msg.slot(0).expect("data slot").len(), 1 << 20);
 }
 
@@ -422,7 +421,7 @@ fn the_derived_stride_equals_the_writers_payload_size_at_every_width() {
     let log = TestLog::new(128 << 10, 1, 1);
     // Every iteration writes at offset 0, so only the widest group's bytes can be
     // left over from the one before it.
-    let widest = 8 + group_header_size(MAX_WORKERS) + MAX_WORKERS * align8(100);
+    let widest = PREFIX_BYTES + group_header_size(MAX_WORKERS) + MAX_WORKERS * align8(100);
     let buf = vec![0x33u8; 100];
     for &slots in &[1usize, 2, 3, 4, MAX_WORKERS] {
         unsafe { std::ptr::write_bytes(log.ptr(), 0, widest) };
@@ -436,16 +435,18 @@ fn the_derived_stride_equals_the_writers_payload_size_at_every_width() {
 
         let (msg, next) = group_and_next(log.log(), 0, 1);
         assert_eq!(msg.slots() as usize, slots);
-        let payload_size = (unsafe { atomic_load_u64(log.ptr()) } & 0xFFFF_FFFF) as usize;
+        let expected = group_header_size(slots) + payloads.iter().filter(|p| !p.is_empty()).count() * align8(100);
+        assert_eq!(
+            prefix_word(&log),
+            pack_prefix(1, expected),
+            "group_header_size disagrees at {slots} slots"
+        );
         assert_eq!(
             next as usize,
-            8 + payload_size,
+            PREFIX_BYTES + expected,
             "the derived stride must equal the prefix's payload_size at {slots} slots"
         );
         assert_eq!(next, log.cursor(), "and the writer's own cursor advance");
-
-        let expected = group_header_size(slots) + payloads.iter().filter(|p| !p.is_empty()).count() * align8(100);
-        assert_eq!(payload_size, expected, "group_header_size disagrees at {slots} slots");
     }
 }
 
@@ -470,18 +471,17 @@ fn a_rolled_back_transaction_publishes_nothing() {
     log.write(1, 1, SalMessageKind::Push, &[&[0u8; 64]]);
     let before_cursor = log.cursor();
 
-    log.writer.defer_publication();
-    let savepoint = log.writer.savepoint();
+    let scope = log.writer.defer_publication();
+    let savepoint = scope.savepoint();
     let zone_start = log.cursor();
-    log.try_write(2, 2, SalMessageKind::Push, ZoneMark::Start, &[&buf])
+    log.try_write(2, 2, SalMessageKind::Push, true, &[&buf])
         .expect("the first family fits");
     assert!(
-        log.try_write(3, 2, SalMessageKind::Push, ZoneMark::Plain, &[&buf])
-            .is_err(),
+        log.try_write(3, 2, SalMessageKind::Push, false, &[&buf]).is_err(),
         "the second family must not fit"
     );
-    log.writer.roll_back(savepoint);
-    log.writer.publish_pending();
+    scope.roll_back(savepoint);
+    drop(scope);
 
     assert_eq!(log.cursor(), before_cursor, "the cursor is restored");
     assert!(
@@ -497,35 +497,34 @@ fn a_rolled_back_transaction_publishes_nothing() {
 #[test]
 fn a_deferred_group_is_invisible_until_the_scope_publishes() {
     let log = TestLog::new(1 << 20, 1, 1);
-    log.writer.defer_publication();
-    log.try_write(1, 1, SalMessageKind::Push, ZoneMark::Start, &[&[0u8; 32]])
+    let scope = log.writer.defer_publication();
+    log.try_write(1, 1, SalMessageKind::Push, true, &[&[0u8; 32]])
         .expect("group fits");
     let second = log.cursor();
-    log.try_write(2, 1, SalMessageKind::Push, ZoneMark::Plain, &[&[0u8; 32]])
+    log.try_write(2, 1, SalMessageKind::Push, false, &[&[0u8; 32]])
         .expect("group fits");
 
     assert!(matches!(log.log().read_at(0, EpochGate::Live(1)), SalStep::Absent));
     assert!(matches!(log.log().read_at(second, EpochGate::Live(1)), SalStep::Absent));
 
-    log.writer.publish_pending();
+    drop(scope);
     assert_eq!(group_at(log.log(), 0).target_id, 1);
     assert_eq!(group_at(log.log(), second).target_id, 2);
 }
 
 // ---------------------------------------------------------------------------
-// group_footprint_direct exactness: the exchange relay sizes its group before
-// taking the SAL lock and writes it after.
+// Footprint exactness: the exchange relay sizes its group before taking the SAL
+// lock and writes it after.
 // ---------------------------------------------------------------------------
 
-/// `group_footprint_direct` must equal what `write_group_direct` consumes: a
-/// prediction below the truth turns a reclaim-and-retry into a fatal refusal on
-/// a relay no worker can go without.
+/// `footprint` must equal what `write` consumes: a prediction below the truth
+/// turns a reclaim-and-retry into a fatal refusal on a relay no worker can go
+/// without.
 ///
 /// Both an empty slot and a populated one are covered: a dataless slot still
 /// carries the group's schema block, so only the data block distinguishes them.
 #[test]
-fn group_footprint_direct_equals_emitted_bytes() {
-    use crate::runtime::sal::DirectGroup;
+fn footprint_equals_emitted_bytes() {
     use crate::runtime::wire::{WireData, WireMsg};
     use crate::test_support::{make_batch, make_schema_u64_i64};
 
@@ -552,18 +551,16 @@ fn group_footprint_direct_equals_emitted_bytes() {
             ..Default::default()
         },
         data: GroupData::PerWorker(&worker_data),
-        targets: GroupTargets::AllSilent,
+        ..DirectGroup::new(SalMessageKind::ExchangeRelay)
     };
 
-    let predicted = log.writer.group_footprint_direct(&group);
+    let predicted = log.writer.footprint(&group);
     let before = log.cursor();
-    log.writer
-        .write_group_direct(&group, 0, SalMessageKind::ExchangeRelay, ZoneMark::Plain)
-        .expect("group fits");
+    log.writer.write(&group).expect("group fits");
     assert_eq!(
         (log.cursor() - before) as usize,
         predicted,
-        "group_footprint_direct must equal emitted bytes"
+        "footprint must equal emitted bytes"
     );
 }
 
@@ -574,7 +571,7 @@ fn group_footprint_direct_equals_emitted_bytes() {
 #[test]
 fn a_narrow_fixed_width_schema_scatters_in_one_copy() {
     use crate::runtime::master::scatter::{with_commit_indices, with_group};
-    use crate::runtime::wire::{WireData, WireMsg, WireSchema};
+    use crate::runtime::wire::{WireData, WireSchema};
     use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
     use gnitz_wire::type_code;
 
@@ -588,27 +585,18 @@ fn a_narrow_fixed_width_schema_scatters_in_one_copy() {
     let batch = make_batch_raw(&schema, &[(0, 1, 0), (1, 1, 1), (2, 1, 2)]);
 
     let relation = WireSchema::encoded(16, schema);
-    let nw = 4;
-    with_commit_indices(&batch, &schema, nw, |wi| {
-        with_group(
-            &batch,
-            wi,
-            &relation,
-            WireMsg::default(),
-            GroupTargets::AllSilent,
-            nw,
-            |g| {
-                let crate::runtime::sal::GroupData::PerWorker(slots) = g.data else {
-                    panic!("a scatter group carries per-worker slots");
-                };
-                for (w, slot) in slots.iter().enumerate() {
-                    assert!(
-                        matches!(slot, WireData::Scattered { .. }),
-                        "slot {w} must scatter straight into the SAL slot"
-                    );
-                }
-            },
-        )
+    with_commit_indices(&batch, &schema, 4, |wi| {
+        with_group(&batch, wi, &relation, DirectGroup::new(SalMessageKind::Push), |g| {
+            let GroupData::PerWorker(slots) = g.data else {
+                panic!("a scatter group carries per-worker slots");
+            };
+            for (w, slot) in slots.iter().enumerate() {
+                assert!(
+                    matches!(slot, WireData::Scattered { .. }),
+                    "slot {w} must scatter straight into the SAL slot"
+                );
+            }
+        })
     });
 }
 
@@ -618,8 +606,8 @@ fn a_narrow_fixed_width_schema_scatters_in_one_copy() {
 // decision, so the digest is what stands between a damaged log and a wrong one.
 // ---------------------------------------------------------------------------
 
-/// `lsn`, `flags`, `target_id`, `slot_count`, the epoch word and every directory
-/// entry live inside the digested span; the digest field itself is excluded from
+/// `lsn`, the kind and zone-start bytes, `target_id`, `slot_count`, the epoch
+/// word and every directory entry live inside the digested span; the digest field itself is excluded from
 /// it but is what the verdict compares against. One bit anywhere in the header
 /// must therefore fail the read.
 #[test]
@@ -632,10 +620,10 @@ fn every_single_bit_flip_in_a_group_header_is_rejected() {
     let hdr_len = group_header_size(3);
     assert!(matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Group(..)));
 
-    let hdr = unsafe { std::slice::from_raw_parts_mut(log.ptr().add(8), hdr_len) };
+    let hdr = unsafe { std::slice::from_raw_parts_mut(log.ptr().add(PREFIX_BYTES), hdr_len) };
     sweep_bit_flips(hdr, 0..hdr_len, |byte, bit, _| {
         assert!(
-            matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Corrupt),
+            matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Corrupt(0)),
             "header byte {byte} bit {bit} must fail the digest"
         );
     });
@@ -656,11 +644,12 @@ fn a_header_only_verifies_at_the_offset_it_was_published_at() {
     // Group B's whole header over group A's — same epoch, same shape, a
     // different address.
     unsafe {
-        let b_hdr: Vec<u8> = std::slice::from_raw_parts(log.ptr().add(second as usize + 8), hdr_len).to_vec();
-        std::ptr::copy_nonoverlapping(b_hdr.as_ptr(), log.ptr().add(8), hdr_len);
+        let b_hdr: Vec<u8> =
+            std::slice::from_raw_parts(log.ptr().add(second as usize + PREFIX_BYTES), hdr_len).to_vec();
+        std::ptr::copy_nonoverlapping(b_hdr.as_ptr(), log.ptr().add(PREFIX_BYTES), hdr_len);
     }
     assert!(
-        matches!(log.log().read_at(0, EpochGate::Walk(1)), SalStep::Corrupt),
+        matches!(log.log().read_at(0, EpochGate::Walk(1)), SalStep::Corrupt(0)),
         "a header published elsewhere must not verify here"
     );
 }
@@ -679,58 +668,83 @@ fn a_probe_never_reads_past_the_end_of_the_mapping() {
     // (a) The fixed part does not fit: `slot_count` would be read 16 bytes past
     // the mapping.
     assert!(
-        matches!(view.read_at((size - 8) as u64, EpochGate::Walk(1)), SalStep::Corrupt),
+        matches!(
+            view.read_at((size - PREFIX_BYTES) as u64, EpochGate::Walk(1)),
+            SalStep::Corrupt(_)
+        ),
         "a candidate 8 bytes from the end must be rejected before the slot-count read"
     );
 
     // (b) The fixed part fits but a MAX_WORKERS directory does not.
-    let base = size - 8 - group_header_size(0);
-    let hdr = unsafe { std::slice::from_raw_parts_mut(log.ptr().add(base + 8), group_header_size(0)) };
+    let base = size - PREFIX_BYTES - group_header_size(0);
+    let hdr = unsafe { std::slice::from_raw_parts_mut(log.ptr().add(base + PREFIX_BYTES), group_header_size(0)) };
     gnitz_wire::write_u32_le(hdr, 16, MAX_WORKERS as u32);
     assert!(
-        matches!(view.read_at(base as u64, EpochGate::Walk(1)), SalStep::Corrupt),
+        matches!(view.read_at(base as u64, EpochGate::Walk(1)), SalStep::Corrupt(_)),
         "a MAX_WORKERS directory that overruns the mapping must be rejected before the digest read"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Group kinds: the flag word round-trips, and the delta modifier survives it.
+// Group kinds: the ordinal byte round-trips, and one this build does not know
+// is corruption rather than a guess.
 // ---------------------------------------------------------------------------
 
-/// Every kind and framing a writer can name reads back as itself. This is what
-/// a priority-ordered flag table could not give: a `ScanSpec { delta: true }`
-/// group carries both the spec bit and the modifier, and the two must not
-/// collapse into a plain `ScanSpec`.
+/// Re-stamp the digest of the group at offset 0 over its edited header, so the
+/// decode below the digest is what a read exercises.
+fn restamp_header(log: &TestLog, edit: impl FnOnce(&mut [u8])) {
+    let hdr = unsafe { std::slice::from_raw_parts_mut(log.ptr().add(PREFIX_BYTES), group_header_size(1)) };
+    edit(hdr);
+    let digest = group_digest(0, hdr);
+    gnitz_wire::write_u64_le(hdr, OFF_DIGEST, digest);
+}
+
+/// Every kind a writer can name reads back as itself, under both zone-start
+/// values.
 #[test]
-fn every_kind_and_framing_round_trips_through_the_flag_word() {
+fn every_kind_round_trips_through_the_header() {
     let log = TestLog::new(1 << 20, 1, 1);
-    let kinds = [
-        SalMessageKind::Shutdown,
-        SalMessageKind::Flush,
-        SalMessageKind::FlushEph,
-        SalMessageKind::DdlSync,
-        SalMessageKind::ExchangeRelay,
-        SalMessageKind::Backfill,
-        SalMessageKind::HasPk,
-        SalMessageKind::Gather,
-        SalMessageKind::UniquePreflight,
-        SalMessageKind::Push,
-        SalMessageKind::Tick,
-        SalMessageKind::SeekByIndex,
-        SalMessageKind::Seek,
-        SalMessageKind::ScanSpec { delta: false },
-        SalMessageKind::ScanSpec { delta: true },
-        SalMessageKind::Scan,
-    ];
-    for mark in [ZoneMark::Plain, ZoneMark::Start, ZoneMark::Commit] {
-        for kind in kinds {
+    for zone_start in [false, true] {
+        for &kind in SalMessageKind::ALL {
             log.seek(0, 1);
-            log.try_write(0, 0, kind, mark, &[&[0u8; 8]]).expect("group fits");
+            log.try_write(0, 0, kind, zone_start, &[&[0u8; 8]]).expect("group fits");
             let msg = group_at(log.log(), 0);
-            assert_eq!(msg.kind, kind, "kind {kind:?} under {mark:?}");
-            assert_eq!(msg.mark, mark, "{kind:?} under {mark:?}");
+            assert_eq!(msg.kind, kind, "kind {kind:?} (zone_start={zone_start})");
+            assert_eq!(msg.zone_start, zone_start, "{kind:?}");
         }
     }
+}
+
+/// A digest-valid header whose kind ordinal or zone-start byte names nothing
+/// this build knows reads back `Corrupt`: it was written by another layout, and
+/// guessing is not an option. The re-stamp is proven live by a known ordinal
+/// first, so a `Corrupt` below cannot be the digest's verdict.
+#[test]
+fn an_unknown_ordinal_in_a_verified_header_is_corrupt() {
+    let log = TestLog::new(1 << 20, 1, 1);
+    log.write(0, 0, SalMessageKind::Scan, &[&[0u8; 8]]);
+    let view = log.log();
+
+    restamp_header(&log, |hdr| hdr[OFF_KIND] = SalMessageKind::Tick.as_wire());
+    assert_eq!(group_at(view, 0).kind, SalMessageKind::Tick, "the re-stamp verifies");
+
+    let unknown = (0..=u8::MAX)
+        .find(|&b| SalMessageKind::from_wire(b).is_none())
+        .expect("fewer than 256 kinds");
+    restamp_header(&log, |hdr| hdr[OFF_KIND] = unknown);
+    assert!(
+        matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Corrupt(0)),
+        "an unknown kind ordinal must read as corruption"
+    );
+
+    restamp_header(&log, |hdr| {
+        hdr[OFF_KIND] = SalMessageKind::Scan.as_wire();
+        hdr[OFF_ZONE_START] = 2;
+    });
+    assert!(
+        matches!(view.read_at(0, EpochGate::Walk(1)), SalStep::Corrupt(0)),
+        "a zone-start byte outside {{0, 1}} must read as corruption"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -752,7 +766,7 @@ fn the_live_path_parks_on_a_leftover_whose_prefix_epoch_was_raised() {
         let word = log.ptr() as *mut u64;
         *word = (*word & 0xFFFF_FFFF) | (2u64 << 32);
     }
-    let reader = unsafe { SalReader::new(log.ptr() as *const u8, 0, log.size, -1, 1) };
+    let reader = unsafe { SalReader::new(log.ptr() as *const u8, 0, log.size, 1) };
     assert!(
         reader.next().is_none(),
         "a previous epoch's group must park, whatever its prefix claims"
@@ -789,11 +803,11 @@ fn the_live_path_aborts_on_a_damaged_header_internal() {
     let log = TestLog::new(1 << 20, 1, 1);
     log.write(7, 11, SalMessageKind::Scan, &[&[0u8; 32]]);
     // A sanity read before the damage, so the abort below is the damage.
-    let reader = unsafe { SalReader::new(log.ptr() as *const u8, 0, log.size, -1, 0) };
+    let reader = unsafe { SalReader::new(log.ptr() as *const u8, 0, log.size, 0) };
     assert!(reader.next().is_some());
-    unsafe { *log.ptr().add(8) ^= 1 };
+    unsafe { *log.ptr().add(PREFIX_BYTES) ^= 1 };
 
-    let reader = unsafe { SalReader::new(log.ptr() as *const u8, 0, log.size, -1, 0) };
+    let reader = unsafe { SalReader::new(log.ptr() as *const u8, 0, log.size, 0) };
     let _ = reader.next();
     unreachable!("a damaged header on the live path must fail-stop, not park");
 }

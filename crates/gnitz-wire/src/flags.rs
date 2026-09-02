@@ -5,61 +5,22 @@
 // Wire protocol flags
 // ---------------------------------------------------------------------------
 
-/// Bits 0-15: the range this crate and the engine's SAL group header
-/// **co-allocate**. Nothing is copied between the two words — a client's flags
-/// reach `ClientVerb::from_flags` and no further, and the group header's word
-/// never leaves the engine's `sal` module. One table reserves the range so
-/// neither allocator can pick a bit the other took.
-///
-/// Bits 16+ are wire-level fields (conflict mode, schema version) encoded by the
-/// sender and decoded by the receiver.
-///
-/// Exported so the engine can assert its own group-header flags — which live in
-/// a `u32` above this block — stay clear of it.
-pub const SAL_FLAGS_MASK: u64 = 0x0000_FFFF;
+// Bits 0-15 hold the request verbs and the W2M exchange flag; bits 16-39 are
+// wire-level fields (conflict mode, schema version) encoded by the sender and
+// decoded by the receiver; bits 48+ are booleans.
 
-pub const FLAG_SHUTDOWN: u64 = 4;
-pub const FLAG_DDL_SYNC: u64 = 8;
 pub const FLAG_EXCHANGE: u64 = 16;
 /// Marks a frame as a data push, on both the client→master and master→SAL/
 /// worker legs. Client push frames carry it so push-vs-scan routing never
 /// depends on data presence: an empty batch (a legitimate empty Z-set delta)
 /// is ACKed as a no-op push (LSN 0) instead of being mistaken for a scan.
 pub const FLAG_PUSH: u64 = 32;
-pub const FLAG_HAS_PK: u64 = 64;
 pub const FLAG_SEEK: u64 = 128;
 pub const FLAG_SEEK_BY_INDEX: u64 = 256;
 /// SCAN_SPEC request flag. The client→master leg of a parameterized bounded
-/// read (`ReadSpec`). Unlike the high request bits (RESOLVE, DDL_TXN, …) this
-/// bit is co-allocated with the engine's group-header block (bits 0-15,
-/// `SAL_FLAGS_MASK`), which the engine's own `ScanSpec` kind takes.
+/// read (`ReadSpec`).
 pub const FLAG_SCAN_SPEC: u64 = 1 << 10;
 
-// ---------------------------------------------------------------------------
-// Engine-internal SAL group-header flags that nonetheless live in the shared
-// 0-15 block.
-//
-// The engine never sends these to a client. They are reserved here only because
-// two crates allocating one bit range needs one table, or the second allocator
-// has to read the first's source to find a gap. The *bit* is reserved here —
-// covered by the disjointness guard below — while the engine keeps the meaning.
-//
-// Bits 16+ of the group header are a different word from the wire `u64` (the
-// header's flags field is `u32`, and the packed wire fields at bits 16-39 never
-// reach it), so the engine's flags above bit 15 are its own namespace and are
-// not reserved here.
-// ---------------------------------------------------------------------------
-
-/// Relay leg of a distributed exchange (bit 9).
-pub const FLAG_EXCHANGE_RELAY: u64 = 1 << 9;
-/// Initial full-source scan feeding a newly created view (bit 11).
-pub const FLAG_BACKFILL: u64 = 1 << 11;
-/// Drive one view-maintenance tick (bit 12).
-pub const FLAG_TICK: u64 = 1 << 12;
-/// Base round of a checkpoint: flush base and system tables (bit 14).
-pub const FLAG_FLUSH: u64 = 1 << 14;
-/// Closing commit sentinel of an atomic write zone (bit 15).
-pub const FLAG_TXN_COMMIT: u64 = 1 << 15;
 pub const FLAG_HAS_SCHEMA: u64 = 1 << 48;
 pub const FLAG_HAS_DATA: u64 = 1 << 49;
 /// Set on every per-worker scan response frame. Absent on the terminal
@@ -72,27 +33,19 @@ pub const FLAG_CONTINUATION: u64 = 1 << 52;
 /// placement, foreign keys, secondary indexes). Addressed by qualified name
 /// (`target_id = 0`, the name in the control block's BLOB cell) or by id (empty
 /// blob, `target_id` = the relation).
-///
-/// Client-only, so it sits above the co-allocated block (bits 0-15) and the
-/// bit-16–39 packed fields rather than in the request-flag run at 4..256 — where
-/// it would consume a bit of a range the engine also allocates from.
 pub const FLAG_RESOLVE: u64 = 1 << 54;
 
 /// ALLOCATE_SERIAL_RANGE request flag. The client→master leg of a user-table
-/// SERIAL sequence range reservation. Like the other high request bits it rides
-/// above the co-allocated block (bits 0-15) and the bit-16–39 packed fields. The request carries
-/// `target_id = table_id` (the sequence key) and the range `count` in
-/// `seek_col_idx`; this high bit is never written to the SAL group header.
+/// SERIAL sequence range reservation. The request carries `target_id = table_id`
+/// (the sequence key) and the range `count` in `seek_col_idx`.
 pub const FLAG_ALLOCATE_SERIAL_RANGE: u64 = 1 << 56;
 
 /// DDL_TXN request flag. The client→master frame carrying an atomic bundle of
 /// system-table family batches for one catalog write (CREATE/DROP of
 /// table/view/index/schema, CREATE SCHEMA/INDEX). Purely a wire-level decode
 /// hint: it is consumed at `handle_message` routing and is NEVER written to the
-/// SAL — each family is broadcast under its own `FLAG_DDL_SYNC` group and the
-/// zone's commit sentinel is unrelated engine state — so it takes a high
-/// client-only bit, above the co-allocated block at bits 0-15 and the bit-16–39
-/// packed fields. Disjoint from every other flag by the compile-time guard below.
+/// SAL — each family is broadcast as its own `DdlSync` group and the zone's
+/// commit sentinel is unrelated engine state.
 pub const FLAG_DDL_TXN: u64 = 1 << 57;
 
 /// ID-allocation request flags (client→master, answered master-locally,
@@ -105,8 +58,8 @@ pub const FLAG_ALLOCATE_INDEX_ID: u64 = 1 << 60;
 /// **user-table** family batches for one durable write zone (the client-facing
 /// analogue of `FLAG_DDL_TXN`, which is exclusive to system families). Purely a
 /// wire-level decode hint consumed at `handle_message` routing; it is NEVER
-/// written to the SAL — each family is emitted under its own `FLAG_PUSH` group
-/// inside one zone closed by the engine-internal `FLAG_TXN_COMMIT` sentinel.
+/// written to the SAL — each family is emitted as its own `Push` group inside
+/// one zone closed by the engine-internal commit sentinel.
 pub const FLAG_PUSH_TXN: u64 = 1 << 61;
 
 /// SCAN_MULTI request flag. Client→master frame naming N relations to snapshot
@@ -185,36 +138,16 @@ const WIRE_SCHEMA_VERSION_SHIFT: u32 = 24;
 const WIRE_SCHEMA_VERSION_MASK: u64 = 0xFFFF_u64 << WIRE_SCHEMA_VERSION_SHIFT;
 
 // Compile-time guard over the whole `u64`: no two flags may share a bit, and no
-// flag may land in the wire-level packed fields.
-//
-// The sweep runs in two passes because the 0-15 block and the 48+ block are
-// allocated by different rules, but both accumulate into one mask, so a
-// collision anywhere fails the build. The 0-15 pass covers the engine-owned
-// group-header bits too — that is the whole reason they are declared here.
+// flag may land in the wire-level packed fields. One sweep over every flag
+// declared here, seeded with the two packed-field masks.
 const _: () = {
-    let packed = WIRE_CONFLICT_MODE_MASK | WIRE_SCHEMA_VERSION_MASK;
-    assert!(SAL_FLAGS_MASK & packed == 0);
     assert!(WIRE_CONFLICT_MODE_MASK & WIRE_SCHEMA_VERSION_MASK == 0);
-
-    // Bits 0-15: the range co-allocated by the client request flags and the
-    // engine's group-header flags.
-    let sal_block = [
-        FLAG_SHUTDOWN,
-        FLAG_DDL_SYNC,
+    let flags = [
         FLAG_EXCHANGE,
         FLAG_PUSH,
-        FLAG_HAS_PK,
         FLAG_SEEK,
         FLAG_SEEK_BY_INDEX,
-        FLAG_EXCHANGE_RELAY,
         FLAG_SCAN_SPEC,
-        FLAG_BACKFILL,
-        FLAG_TICK,
-        FLAG_FLUSH,
-        FLAG_TXN_COMMIT,
-    ];
-    // Bits 48+: booleans that never enter a SAL group header.
-    let high_flags = [
         FLAG_HAS_SCHEMA,
         FLAG_HAS_DATA,
         FLAG_BATCH_SORTED,
@@ -222,6 +155,7 @@ const _: () = {
         FLAG_CONTINUATION,
         FLAG_SCAN_LAST,
         FLAG_RESOLVE,
+        FLAG_SCAN_FIFO_REPLY,
         FLAG_ALLOCATE_SERIAL_RANGE,
         FLAG_DDL_TXN,
         FLAG_ALLOCATE_TABLE_ID,
@@ -229,25 +163,13 @@ const _: () = {
         FLAG_ALLOCATE_INDEX_ID,
         FLAG_PUSH_TXN,
         FLAG_SCAN_MULTI,
-        FLAG_SCAN_FIFO_REPLY,
     ];
 
-    let mut acc = 0u64;
+    let mut acc = WIRE_CONFLICT_MODE_MASK | WIRE_SCHEMA_VERSION_MASK;
     let mut i = 0;
-    while i < sal_block.len() {
-        assert!(
-            sal_block[i] & SAL_FLAGS_MASK == sal_block[i],
-            "SAL-block flag outside bits 0-15"
-        );
-        assert!(sal_block[i] & acc == 0, "wire flag bit collision");
-        acc |= sal_block[i];
-        i += 1;
-    }
-    acc = SAL_FLAGS_MASK | packed;
-    i = 0;
-    while i < high_flags.len() {
-        assert!(high_flags[i] & acc == 0, "wire flag bit collision");
-        acc |= high_flags[i];
+    while i < flags.len() {
+        assert!(flags[i] & acc == 0, "wire flag bit collision");
+        acc |= flags[i];
         i += 1;
     }
 };

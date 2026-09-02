@@ -646,7 +646,7 @@ def test_unique_reinsert_after_restart(own_server):
     """A unique value held at boot, then deleted post-restart, must be
     re-insertable (bugs 1 and 4). Pre-fix, non-owning workers keep the value's
     stale +1 forever in their full boot index copy; the DELETE nets it to 0 only
-    on the owning worker, so the re-INSERT's FLAG_HAS_PK union hits a stale
+    on the owning worker, so the re-INSERT's HasPk union hits a stale
     worker and is falsely rejected as a unique violation."""
     sock_path = own_server.sock_path
     # ---- Phase 1: table with a UNIQUE column, one holder of u=5. ------

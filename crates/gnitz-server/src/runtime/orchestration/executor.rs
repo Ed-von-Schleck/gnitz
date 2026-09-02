@@ -2117,7 +2117,7 @@ async fn finish_scan_fanout(
 /// reach the same bytes.
 ///
 /// 1. It takes no drain ([`ReadFreshness::AsOfLastTick`]).
-/// 2. Its group is a `ScanSpec { delta: true }`, which is what makes the worker
+/// 2. Its group is a `DeltaScanSpec`, which is what makes the worker
 ///    defer it out of an in-flight evaluation.
 /// 3. Its terminal frame reports `(cursor tag, T)` instead of the last-committed
 ///    LSN, and an up-to-date poll is answered here, master-locally.
@@ -2180,8 +2180,10 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
     // each of which would carry its own copy of the spec blob under the exclusive
     // SAL mutex.
     let unicast = scan_spec_route(shared.disp(), target_id, spec);
-    let kind = SalMessageKind::ScanSpec {
-        delta: delta_cursor.is_some(),
+    let kind = if delta_cursor.is_some() {
+        SalMessageKind::DeltaScanSpec
+    } else {
+        SalMessageKind::ScanSpec
     };
     let result = shared
         .disp()
@@ -2846,22 +2848,19 @@ fn stream_push_error(target_id: i64, batch: &Batch, mode: gnitz_wire::WireConfli
 /// so abort.
 fn emit_zone_to_sal(shared: &Shared, op: &'static str, drained: &[(SysFamily, Batch)], zone_lsn: u64) -> FsyncFuture {
     let disp = shared.disp();
-    // Nothing below is visible until `publish_pending`, so a refused group leaves
-    // no half-written zone behind. The block is synchronous throughout, which is
-    // what the deferred scope requires.
-    disp.defer_publication();
+    // Nothing inside the scope is visible until it ends, so a refused group
+    // leaves no half-written zone behind. The block is synchronous throughout,
+    // which is what the deferred scope requires.
+    let scope = disp.defer_publication();
     let emitted = guard_panic(op, || {
-        // The first family opens the zone; a failure here aborts the loop, so no
-        // later family can become the first one recovery sees.
         // The wire carries the family as its tid; this is the one place the
         // typed family narrows.
-        for (i, (family, bat)) in drained.iter().enumerate() {
-            disp.broadcast_ddl(family.id(), bat, zone_lsn, i == 0)
-                .map_err(|f| f.text)?;
+        for (family, bat) in drained {
+            disp.broadcast_ddl(family.id(), bat, zone_lsn).map_err(|f| f.text)?;
         }
         Ok(())
     });
-    disp.publish_pending();
+    drop(scope);
     if let Err(e) = emitted {
         gnitz_fatal_abort!("{} broadcast failed after in-memory catalog mutation: {}", op, e);
     }
@@ -2874,15 +2873,12 @@ fn emit_zone_to_sal(shared: &Shared, op: &'static str, drained: &[(SysFamily, Ba
         // takes no argument and cannot violate an invariant.
         unsafe { libc::abort() };
     }
-    // An empty zone has no groups for recovery to gate, so its sentinel records
-    // nothing. Skipping it also makes "every sentinel follows an ordinary group"
-    // true by construction, which is what keeps a run of sentinels from reaching
-    // the checkpoint reserve. `apply_and_enqueue_family` drops empty batches, so a
-    // DDL bundle whose families all net to empty arrives here with `drained` empty.
-    if !drained.is_empty() {
-        if let Err(e) = disp.commit_zone(zone_lsn) {
-            gnitz_fatal_abort!("{} commit sentinel failed after its zone was published: {}", op, e);
-        }
+    // An empty bundle (`apply_and_enqueue_family` drops empty batches) opened no
+    // zone, so this closes nothing and only wakes the workers: every sentinel
+    // follows an ordinary group by construction, which is what keeps a run of
+    // sentinels from reaching the checkpoint reserve.
+    if let Err(e) = disp.commit_zone() {
+        gnitz_fatal_abort!("{} commit sentinel failed after its zone was published: {}", op, e);
     }
     shared.reactor.fsync(shared.disp().sal_fd())
 }

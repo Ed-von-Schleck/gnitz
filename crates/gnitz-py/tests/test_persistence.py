@@ -5,6 +5,7 @@ a full server restart (crash-only shutdown via SIGKILL).
 Ports compile_graph_test.py::test_persistence_and_recovery.
 """
 
+import os
 import pytest
 import gnitz
 from _serverproc import NUM_WORKERS as _NUM_WORKERS, is_debug_build
@@ -1838,12 +1839,17 @@ def test_replicated_join_survives_worker_count_change(own_server):
 
 
 def _assert_reslice_ran(srv):
-    """The changed-count replay marker in the current boot's output. Proves the
-    boot took the re-slicing path rather than the same-count one."""
-    text = srv.log_text()
-    assert "SAL tail written by" in text, (
+    """The changed-count replay marker in the current boot's worker logs. Proves
+    at least one rank took the re-slicing path rather than the same-count one.
+    Worker-side because the replay runs after the child redirected fd 2 to its
+    own log, so the master log never sees it."""
+    texts = []
+    for w in range(srv.workers):
+        with open(os.path.join(srv.data_dir, f"worker_{w}.log")) as f:
+            texts.append(f.read())
+    assert any("re-sliced from" in t for t in texts), (
         f"restart at a changed worker count must replay every written slot; "
-        f"boot output was:\n{text}"
+        f"worker logs were:\n" + "\n".join(texts)
     )
 
 
