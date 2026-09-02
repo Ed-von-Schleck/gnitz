@@ -16,6 +16,14 @@ pub enum ClientError {
     /// A mirror verb on a client or handle that never attached a store. The
     /// message names no method — each binding spells the attach differently.
     NoMirrorStore,
+    /// A relation, index or schema the catalog does not hold, by whatever
+    /// `name` the lookup used — a qualified name, a bare index name, or a tid.
+    /// Its own variant so a binding raises a catchable class for it rather than
+    /// matching the prose, which is what every consumer did before.
+    NotFound {
+        noun: &'static str,
+        name: String,
+    },
     SchemaMismatch, // STATUS_SCHEMA_MISMATCH: server rejected schema-less PUSH
     /// STATUS_TXN_CONFLICT: a user-table TXN failed its OCC precondition — a table
     /// it read was written since its basis. `fresh_basis` is the server's current
@@ -79,6 +87,16 @@ impl From<std::io::Error> for ClientError {
     }
 }
 
+/// `gnitz-wire`'s validators report a failure as a bare `String`, so every call
+/// into them would otherwise spell the same `ServerError` wrap. A site that adds
+/// context still builds the variant by hand — the `From` covers only the
+/// verbatim pass-through.
+impl From<String> for ClientError {
+    fn from(e: String) -> Self {
+        ClientError::ServerError(e)
+    }
+}
+
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -88,6 +106,7 @@ impl fmt::Display for ClientError {
             ClientError::NoMirrorStore => {
                 write!(f, "this client mirrors nothing; attach a store before mirroring a view")
             }
+            ClientError::NotFound { noun, name } => write!(f, "{noun} '{name}' not found"),
             ClientError::SchemaMismatch => write!(f, "schema version mismatch"),
             ClientError::TxnConflict { fresh_basis } => {
                 write!(f, "transaction conflict (fresh basis {fresh_basis}); retry")

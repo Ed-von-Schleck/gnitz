@@ -212,7 +212,7 @@ impl CatalogEngine {
 
     #[cfg(test)]
     pub(in crate::catalog) fn get_by_name(&self, schema_name: &str, table_name: &str) -> Option<i64> {
-        self.entity_id_by_qname(&format!("{schema_name}.{table_name}"))
+        self.entity_id_by_qname(&gnitz_wire::qualified_key(schema_name, table_name))
     }
 
     #[cfg(test)]

@@ -4,6 +4,8 @@
 //! The SET-list binding and evaluation reuse `mutate`'s shared helpers so a
 //! `DO UPDATE SET` assignment behaves exactly like an `UPDATE ... SET`.
 
+use std::sync::Arc;
+
 use crate::ast_util::{extract_name, object_name_ident};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
@@ -418,7 +420,7 @@ fn expr_contains_excluded(expr: &Expr) -> bool {
 fn client_side_filter_do_nothing(
     client: &mut GnitzClient,
     tid: u64,
-    schema: &Schema,
+    schema: &Arc<Schema>,
     batch: &ZSetBatch,
 ) -> Result<ZSetBatch, GnitzSqlError> {
     let keys: Vec<PkTuple> = (0..batch.pks.len()).map(|i| batch.pks.get_tuple(i)).collect();
@@ -460,7 +462,7 @@ fn client_side_filter_do_nothing(
 fn client_side_merge_do_update(
     client: &mut GnitzClient,
     tid: u64,
-    schema: &Schema,
+    schema: &Arc<Schema>,
     batch: &ZSetBatch,
     assignments: &[(usize, BoundUpdateExpr)],
 ) -> Result<ZSetBatch, GnitzSqlError> {

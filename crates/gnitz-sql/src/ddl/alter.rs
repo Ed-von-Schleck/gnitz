@@ -165,10 +165,15 @@ fn rename_column(
     new_col: &str,
 ) -> Result<SqlResult, GnitzSqlError> {
     let source_name = extract_name(source, "ALTER TABLE")?;
-    if !alter_base_table_exists(client, schema_name, &source_name, if_exists, "RENAME COLUMN")? {
+    let Some((tid, schema)) =
+        resolve_alter_base_table_with_schema(client, schema_name, &source_name, if_exists, "RENAME COLUMN")?
+    else {
         return Ok(altered("column", new_col.to_string()));
-    }
-    client.alter_rename_column(schema_name, &source_name, old_col, new_col)?;
+    };
+    let Some(col_idx) = find_unique_column(&schema.columns, old_col)? else {
+        return Err(missing("column", schema_name, old_col));
+    };
+    client.alter_rename_column(tid, col_idx, new_col)?;
     Ok(altered("column", new_col.to_string()))
 }
 
@@ -380,8 +385,7 @@ fn add_constraint(
 }
 
 /// `ALTER TABLE <t> DROP CONSTRAINT [IF EXISTS] <n>` — maps to the DROP INDEX
-/// path (drop the index named `n`). Rejects a `__fk_`-infixed name up front so
-/// `DROP CONSTRAINT __fk_…` fails cleanly client-side.
+/// path (drop the index named `n`).
 fn drop_constraint(
     client: &mut GnitzClient,
     schema_name: &str,

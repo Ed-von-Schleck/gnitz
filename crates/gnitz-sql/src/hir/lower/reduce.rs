@@ -24,7 +24,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Lower a `Project(Filter_having?(Reduce(...)))` body's reduce to circuit pieces
-/// for `view_id`, returning the pieces plus the output `ColId` layout. `items` is
+/// returning the pieces plus the output `ColId` layout. `items` is
 /// the finalize projection; `having_preds` is the HAVING filter over the raw
 /// reduce output.
 pub(crate) fn lower_reduce(
@@ -33,7 +33,6 @@ pub(crate) fn lower_reduce(
     items: &[ProjEntry],
     having_preds: &[HirExpr],
     reduce: &RelExpr,
-    view_id: u64,
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     let RelExpr::Reduce {
         input,
@@ -107,7 +106,7 @@ pub(crate) fn lower_reduce(
     let pk_len = reduce_schema.pk_cols.len();
 
     // Circuit: input delta + optional WHERE.
-    let mut cb = CircuitBuilder::new(view_id, source_tid);
+    let mut cb = CircuitBuilder::new(source_tid);
     let inp = cb.input_delta_bounded(bound);
     let filtered = match where_folded {
         // Already folded above (the scan bound reads the same folded predicate),

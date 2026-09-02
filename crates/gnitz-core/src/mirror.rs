@@ -40,7 +40,7 @@ use std::sync::Arc;
 use crate::client::{delta_reply_schema, qualified_name, DeltaCursor, GnitzClient, RelDescriptor};
 use crate::connection::RawBlock;
 use crate::error::ClientError;
-use crate::protocol::{Schema, ZSetBatch};
+use crate::protocol::{ReplySchema, Schema, ZSetBatch};
 use gnitz_wire::RelClass;
 
 // ---------------------------------------------------------------------------
@@ -263,10 +263,10 @@ pub(crate) struct MirroredView {
     /// included, which keeps `pk_stride` right for a view whose physical PK is a
     /// synthetic hidden column.
     pub(crate) desc: Arc<RelDescriptor>,
-    /// The client-side shape a poll's *request* carries. `Arc` because a poll
-    /// hands it to the wire verb by clone, and a deep one would allocate per
-    /// column on every poll, including the empty ones.
-    pub(crate) delta_reply_schema: Arc<Schema>,
+    /// The shape a poll's *request* carries, prepared once: it is fixed for the
+    /// registration's life, so a poll clones one `Arc` instead of deep-cloning a
+    /// schema and re-encoding its block.
+    pub(crate) delta_reply: Arc<ReplySchema>,
 }
 
 /// Everything a mirroring client holds beyond a plain one.
@@ -377,7 +377,7 @@ impl GnitzClient {
             schema_name: schema_name.to_string(),
             name: name.to_string(),
             desc: rel,
-            delta_reply_schema: Arc::new(delta_reply_schema(&schema)?),
+            delta_reply: Arc::new(ReplySchema::new(Arc::new(delta_reply_schema(&schema)?), tid)),
         };
         let m = self.mirror_state()?;
         for old in retracted {
@@ -405,7 +405,7 @@ impl GnitzClient {
     /// Apply `(prev, T]` to the copy, recovering from the three ways the feed
     /// can stop continuing.
     fn advance(&mut self, tid: u64, prev: DeltaCursor) -> Result<(u64, PollResult), ClientError> {
-        let reply_schema = Arc::clone(&self.mirrored_view(tid)?.delta_reply_schema);
+        let reply_schema = Arc::clone(&self.mirrored_view(tid)?.delta_reply);
         match self.delta_poll_raw(tid, prev, &reply_schema) {
             Ok((blocks, next)) => {
                 self.mirror_state()?.store.ingest(tid, blocks, Shape::Stamped, next)?;
@@ -465,7 +465,7 @@ impl GnitzClient {
         // Everything between here and the ingest below is a copy that does not
         // exist, and the missing cursor is what says so.
         self.mirror_state()?.store.invalidate(tid, Invalidate::Copy)?;
-        let view_schema = Arc::clone(&self.mirrored_view(tid)?.desc.schema);
+        let view_schema = ReplySchema::new(Arc::clone(&self.mirrored_view(tid)?.desc.schema), tid);
         let (blocks, cursor) = self.delta_bootstrap_raw(tid, &view_schema)?;
         self.mirror_state()?.store.ingest(tid, blocks, Shape::Plain, cursor)?;
         Ok((tid, PollResult::Reseeded))
@@ -532,8 +532,8 @@ impl GnitzClient {
         // server's do, or a later resolve of the local catalog would miss — so
         // the name takes the same validate-then-fold every catalog gateway
         // applies, not a bare fold of its own.
-        let schema_name = gnitz_wire::canonical_identifier(schema_name).map_err(ClientError::ServerError)?;
-        let name = gnitz_wire::canonical_identifier(name).map_err(ClientError::ServerError)?;
+        let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
+        let name = gnitz_wire::canonical_identifier(name)?;
 
         let tid = self.reconcile_registration(&schema_name, &name)?;
         // The line above is the resolve, which is what makes a direct bootstrap
@@ -551,10 +551,13 @@ impl GnitzClient {
     /// The host's word for the bottom of [`Invalidate`]'s ladder — a host says
     /// "stop mirroring this", not "tear it down to its registration".
     pub fn forget_view(&mut self, table_id: u64) -> Result<(), ClientError> {
-        self.mirror_state()?
-            .store
-            .invalidate(table_id, Invalidate::Registration)?;
-        self.mirror_state()?.drop_view(table_id);
+        // The client-side entry goes first, as in `invalidate_own_copy`: it is
+        // the read gate `resolve_local_first` consults. Unconditional, unlike
+        // that one, because a reopened store holds copies this client has not
+        // registered — and forgetting one is exactly the call that erases it.
+        let m = self.mirror_state()?;
+        m.drop_view(table_id);
+        m.store.invalidate(table_id, Invalidate::Registration)?;
         Ok(())
     }
 

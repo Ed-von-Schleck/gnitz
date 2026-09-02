@@ -584,7 +584,7 @@ class TestFkSelfReferenceSQL:
         """A view's columns are clones of the projected source defs, so a
         projected FK column would carry the source's `fk_table_id`. Registering
         that as a constraint makes the view an FK child of the parent — and a
-        view has no `__fk_` index, so every parent delete then fails on a missing
+        view gets no FK auto-index, so every parent delete then fails on a missing
         one. The same view over a self-FK table would make the table its own
         second, spurious child.
         """
@@ -614,7 +614,7 @@ class TestFkSelfReferenceSQL:
 
     def test_self_fk_column_referencing_itself_rejected(self, client):
         """A column that references the very column it is: a tautology, and its
-        auto `__fk_` index would be skipped as a PK column, leaving parent
+        FK auto-index would be skipped as a PK column, leaving parent
         deletes unvalidatable."""
         sn = "s" + _uid()
         client.create_schema(sn)

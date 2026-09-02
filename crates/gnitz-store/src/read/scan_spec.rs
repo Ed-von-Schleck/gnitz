@@ -278,20 +278,21 @@ fn range_cursor(
 /// order.
 ///
 /// Two trust-boundary rejections land here because the decoder has no schema:
-/// the PK must be a single column, and no two wire keys may share an OPK image
-/// (`opk_key` truncates to `pk_stride`, so `5` and `5 + 2^64` are the same U64
-/// PK — left in, the pair would emit its row twice). Both are hard rejects;
-/// release builds must not clamp.
+/// the packed key must fit the wire's 16-byte scalar form, and no two wire keys
+/// may share an OPK image (`opk_key` truncates to `pk_stride`, so `5` and
+/// `5 + 2^64` are the same U64 PK — left in, the pair would emit its row twice).
+/// Both are hard rejects; release builds must not clamp.
 fn pk_set_opk_keys(source: i64, keys: &[u128], src_schema: &SchemaDescriptor) -> Result<Vec<u8>, String> {
-    if src_schema.pk_indices().len() != 1 {
+    let stride = src_schema.pk_stride() as usize;
+    if stride > gnitz_wire::NARROW_PK_MAX_BYTES {
         return Err(format!(
-            "scan_spec: PkSet gather requires a single-column PK (table {source})"
+            "scan_spec: PkSet gather requires a PK of at most {} bytes (table {source})",
+            gnitz_wire::NARROW_PK_MAX_BYTES
         ));
     }
-    let stride = src_schema.pk_stride() as usize;
-    // The single PK column is at most 16 bytes, so each image fits `pack_pk_be`'s
-    // left-aligned `u128` sort key exactly — one allocation, and a register
-    // compare in both the sort and the duplicate scan.
+    // The whole packed key fits `pack_pk_be`'s left-aligned `u128` sort key
+    // exactly — one allocation, and a register compare in both the sort and the
+    // duplicate scan.
     let mut opk_keys: Vec<u128> = keys
         .iter()
         .map(|&k| pack_pk_be(opk_key(src_schema, &k.to_le_bytes()).pk_bytes()))

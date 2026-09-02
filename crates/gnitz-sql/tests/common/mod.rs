@@ -80,6 +80,26 @@ pub fn read_view(client: &mut GnitzClient, sn: &str, view: &str) -> (Schema, ZSe
     read_sql(client, sn, &format!("SELECT * FROM {}", view))
 }
 
+/// The vids of every live VIEW_TAB row naming `owner_vid` as its owner — the
+/// internal chain segments that view owns.
+///
+/// Read off the ownership column, which is what the engine's drop cascade keys
+/// on; nothing here assumes anything about how the ids were allocated.
+pub fn segment_vids_of(client: &mut GnitzClient, owner_vid: u64) -> Vec<u64> {
+    let (_, batch, _) = client.scan(gnitz_wire::VIEW_TAB).expect("scan VIEW_TAB");
+    let Some(b) = batch else { return Vec::new() };
+    (0..b.len())
+        .filter(|&i| b.weights[i] > 0)
+        .filter(|&i| {
+            let ColData::Fixed(bytes) = &b.columns[gnitz_wire::VIEWTAB_COL_OWNER_VIEW_ID] else {
+                panic!("owner_view_id is a fixed-width column");
+            };
+            u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap()) == owner_vid
+        })
+        .map(|i| b.pks.get(i) as u64)
+        .collect()
+}
+
 /// User-visible column names, lowercased — the read path hidden-prepends the
 /// source PK (and grouped shapes a synthetic key), so a result's client-facing
 /// schema is the visible subset.

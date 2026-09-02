@@ -1,5 +1,6 @@
 use super::codec::{encode_schema_block, schema_from_block};
 use super::error::ProtocolError;
+use super::regions::ViewBuffers;
 use super::transport::ClientTransport;
 use super::types::{PkTuple, Schema, ZSetBatch};
 use super::wal_block::{decode_wal_block, encode_wal_block};
@@ -8,6 +9,34 @@ use super::{
     wire_flags_get_schema_version, Header, WireConflictMode, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_ERROR, STATUS_OK,
 };
 use crate::types::sys_schema;
+use gnitz_wire::txn_frame::WalBlock;
+
+/// One batch's region list, held for as long as the frame encoder needs it. A
+/// transaction frame is sized from every family's regions before any is written,
+/// so all of them are live at once.
+struct Regioned<'a> {
+    table_id: u32,
+    entry_count: u32,
+    regions: Vec<&'a [u8]>,
+}
+
+impl<'a> Regioned<'a> {
+    fn new(table_id: u64, batch: &ZSetBatch, regions: Vec<&'a [u8]>) -> Self {
+        Regioned {
+            table_id: table_id as u32,
+            entry_count: batch.len() as u32,
+            regions,
+        }
+    }
+
+    fn wal(&self) -> WalBlock<'_> {
+        WalBlock {
+            table_id: self.table_id,
+            entry_count: self.entry_count,
+            regions: &self.regions,
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct Message {
@@ -196,17 +225,23 @@ pub fn encode_push_txn(
     families: &[(u64, &Schema, &ZSetBatch, WireConflictMode)],
     preconditions: &[(u64, u64)],
 ) -> Vec<u8> {
-    let blocks: Vec<(u8, Vec<u8>, Vec<u8>)> = families
-        .iter()
-        .map(|(tid, schema, batch, mode)| {
+    // One `ViewBuffers` per family, because every family's regions are live at
+    // once: the frame is sized from all of them and then each batch is framed
+    // straight into it, so a batch is copied once instead of once into a
+    // per-family block and again into the frame.
+    let mut bufs: Vec<ViewBuffers> = (0..families.len()).map(|_| ViewBuffers::default()).collect();
+    let parts: Vec<(u8, Vec<u8>, Regioned<'_>)> = bufs
+        .iter_mut()
+        .zip(families)
+        .map(|(b, (tid, schema, batch, mode))| {
             (
                 mode.as_wire(),
                 encode_schema_block(schema, *tid as u32),
-                encode_wal_block(schema, *tid as u32, batch),
+                Regioned::new(*tid, batch, b.regions(batch, schema)),
             )
         })
         .collect();
-    let refs: Vec<(u8, &[u8], &[u8])> = blocks.iter().map(|(m, s, d)| (*m, &s[..], &d[..])).collect();
+    let refs: Vec<(u8, &[u8], WalBlock<'_>)> = parts.iter().map(|(m, sb, r)| (*m, &sb[..], r.wal())).collect();
     gnitz_wire::txn_frame::encode_push_txn(client_id, &refs, preconditions)
 }
 
@@ -228,11 +263,13 @@ pub fn encode_scan_multi(client_id: u64, relations: &[(u64, u16)]) -> Vec<u8> {
 /// encoded against is that id's, derived here through [`sys_schema`], so a
 /// caller cannot pair one family's id with another's shape.
 pub fn encode_ddl_txn(client_id: u64, families: &[(u64, ZSetBatch)]) -> Vec<u8> {
-    let blocks: Vec<Vec<u8>> = families
-        .iter()
-        .map(|(tid, batch)| encode_wal_block(sys_schema(*tid), *tid as u32, batch))
+    let mut bufs: Vec<ViewBuffers> = (0..families.len()).map(|_| ViewBuffers::default()).collect();
+    let regioned: Vec<Regioned<'_>> = bufs
+        .iter_mut()
+        .zip(families)
+        .map(|(b, (tid, batch))| Regioned::new(*tid, batch, b.regions(batch, sys_schema(*tid))))
         .collect();
-    let refs: Vec<&[u8]> = blocks.iter().map(|b| &b[..]).collect();
+    let refs: Vec<WalBlock<'_>> = regioned.iter().map(Regioned::wal).collect();
     gnitz_wire::txn_frame::encode_ddl_txn(client_id, &refs)
 }
 

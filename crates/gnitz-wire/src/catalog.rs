@@ -118,22 +118,25 @@ pub(crate) const VIEW_TAB_COLS: &[WireSysCol] = &[
     col("view_id", TypeCode::U64, false),
     col("schema_id", TypeCode::U64, false),
     col("name", TypeCode::String, false),
-    col("sql_definition", TypeCode::String, false),
     // Packed view-PK column list (`pack_pk_cols`). A bare `0` (flag bit clear)
     // decodes as the single-column PK `[0]`.
     col("pk_col_idx", TypeCode::U64, false),
     // `CREATE VIEW … WITH (capacity = …)`, in bytes; `0` is unbounded. Presence
     // of a capacity *is* the bounded classification — a second flag word could
-    // only ever disagree with it. Not re-derivable from `sql_definition`: the
-    // engine reads this at boot from the replayed rows and never links the SQL
-    // parser.
+    // only ever disagree with it. The engine reads it at boot from the replayed
+    // rows; nothing else records it.
     col("capacity_bytes", TypeCode::U64, false),
     // `CREATE VIEW … WITH (delta = …)`, in bytes; `0` is no feed. Presence of a
     // budget *is* the fed classification, exactly as `capacity_bytes` above.
     // Orthogonal to it: the two are refused together, but by a rule, not by the
-    // encoding. Not re-derivable from `sql_definition` — the engine reads this at
-    // boot from the replayed rows and never links the SQL parser.
+    // encoding. The engine reads it at boot from the replayed rows; nothing else
+    // records it.
     col("delta_bytes", TypeCode::U64, false),
+    // The user view this row is an internal chain segment of; `0` is a user
+    // view. A column rather than a name prefix, because the precheck can
+    // validate it against a forger. Appended, not inserted: the static assert
+    // below pins `name` to the same slot in TABLE_TAB and VIEW_TAB.
+    col("owner_view_id", TypeCode::U64, false),
 ];
 
 pub(crate) const COL_TAB_COLS: &[WireSysCol] = &[
@@ -163,7 +166,11 @@ pub(crate) const IDX_TAB_COLS: &[WireSysCol] = &[
     // multi-column indexes alike); decoded via `unpack_pk_cols`.
     col("source_col_idx", TypeCode::U64, false),
     col("name", TypeCode::String, false),
-    col("is_unique", TypeCode::U64, false),
+    // See `IndexProps::pack` for the bit layout. One word rather than a bool
+    // column per property: the family is scanned whole by `DROP INDEX` and the
+    // planner's name/column probe, so a second `U64` would widen every row for
+    // one bit.
+    col("flags", TypeCode::U64, false),
 ];
 
 /// The reply **schema block**'s column shape. Not a system table — it is the
@@ -242,16 +249,16 @@ pub const TABTAB_PAY_FLAGS: usize = pay_index_in(TABLE_TAB_COLS, "flags");
 
 pub const VIEWTAB_COL_SCHEMA_ID: usize = col_index_in(VIEW_TAB_COLS, "schema_id");
 pub const VIEWTAB_COL_NAME: usize = col_index_in(VIEW_TAB_COLS, "name");
-pub const VIEWTAB_COL_SQL: usize = col_index_in(VIEW_TAB_COLS, "sql_definition");
 pub const VIEWTAB_COL_PK_COL_IDX: usize = col_index_in(VIEW_TAB_COLS, "pk_col_idx");
 pub const VIEWTAB_COL_CAPACITY: usize = col_index_in(VIEW_TAB_COLS, "capacity_bytes");
 pub const VIEWTAB_COL_DELTA: usize = col_index_in(VIEW_TAB_COLS, "delta_bytes");
 pub const VIEWTAB_PAY_SCHEMA_ID: usize = pay_index_in(VIEW_TAB_COLS, "schema_id");
 pub const VIEWTAB_PAY_NAME: usize = pay_index_in(VIEW_TAB_COLS, "name");
-pub const VIEWTAB_PAY_SQL: usize = pay_index_in(VIEW_TAB_COLS, "sql_definition");
 pub const VIEWTAB_PAY_PK_COL_IDX: usize = pay_index_in(VIEW_TAB_COLS, "pk_col_idx");
 pub const VIEWTAB_PAY_CAPACITY: usize = pay_index_in(VIEW_TAB_COLS, "capacity_bytes");
 pub const VIEWTAB_PAY_DELTA: usize = pay_index_in(VIEW_TAB_COLS, "delta_bytes");
+pub const VIEWTAB_COL_OWNER_VIEW_ID: usize = col_index_in(VIEW_TAB_COLS, "owner_view_id");
+pub const VIEWTAB_PAY_OWNER_VIEW_ID: usize = pay_index_in(VIEW_TAB_COLS, "owner_view_id");
 
 /// One code path decodes TABLE_TAB and VIEW_TAB on both sides — the engine's
 /// `apply_entity_caches`, the client's `schema_members` — reading
@@ -307,11 +314,11 @@ pub const CIRCNCOL_PAY_VALUE2: usize = pay_index_in_keyed(CIRCUIT_NODE_COLUMNS_C
 pub const IDXTAB_COL_OWNER_ID: usize = col_index_in(IDX_TAB_COLS, "owner_id");
 pub const IDXTAB_COL_SOURCE_COLS: usize = col_index_in(IDX_TAB_COLS, "source_col_idx");
 pub const IDXTAB_COL_NAME: usize = col_index_in(IDX_TAB_COLS, "name");
-pub const IDXTAB_COL_IS_UNIQUE: usize = col_index_in(IDX_TAB_COLS, "is_unique");
+pub const IDXTAB_COL_FLAGS: usize = col_index_in(IDX_TAB_COLS, "flags");
 pub const IDXTAB_PAY_OWNER_ID: usize = pay_index_in(IDX_TAB_COLS, "owner_id");
 pub const IDXTAB_PAY_SOURCE_COLS: usize = pay_index_in(IDX_TAB_COLS, "source_col_idx");
 pub const IDXTAB_PAY_NAME: usize = pay_index_in(IDX_TAB_COLS, "name");
-pub const IDXTAB_PAY_IS_UNIQUE: usize = pay_index_in(IDX_TAB_COLS, "is_unique");
+pub const IDXTAB_PAY_FLAGS: usize = pay_index_in(IDX_TAB_COLS, "flags");
 
 pub const SEQTAB_COL_VALUE: usize = col_index_in(SEQ_TAB_COLS, "next_val");
 pub const SEQTAB_PAY_VALUE: usize = pay_index_in(SEQ_TAB_COLS, "next_val");
@@ -493,16 +500,6 @@ pub const fn unpack_col_id(packed: u64) -> (u64, u64) {
 // Identifier validation (shared between the SQL planner and the engine)
 // ---------------------------------------------------------------------------
 
-/// Infix marking an index as an internal FK-backing index. User identifiers may
-/// not contain it — such a name would be undroppable (`drop_index` rejects it).
-pub const FK_INDEX_INFIX: &str = "__fk_";
-
-/// Prefix of every synthesized hidden view segment (`__h{owner_vid}_{idx}`).
-/// Ownership is name-encoded, so the planner that mints these names, the drop
-/// cascade that matches them, and the engine's catalog checks all read it here.
-/// Unambiguous because `validate_user_identifier` rejects a leading `_`.
-pub const HIDDEN_VIEW_PREFIX: &str = "__h";
-
 /// The character set every stored catalog name is drawn from. Public because the
 /// engine applies the same charset at its own trust boundary without taking the
 /// rest of [`validate_user_identifier`]'s client-side policy.
@@ -510,32 +507,8 @@ pub fn is_valid_ident_char(ch: u8) -> bool {
     ch.is_ascii_alphanumeric() || ch == b'_'
 }
 
-/// Reject a name carrying the reserved [`FK_INDEX_INFIX`].
-///
-/// The rule binds every name an index name is interpolated from
-/// (`{schema}__{table}__idx_{cols}`), not just the index names typed at the
-/// CREATE INDEX surface: `drop_index` identifies an internal FK index by plain
-/// substring, so a table or column carrying `__fk_` yields an index no one can
-/// drop. Matched against the **canonical (lowercase) form**, because the client
-/// canonicalizes at store time — a mixed-case `x__FK_y` would otherwise pass
-/// here yet be stored as the reserved `x__fk_y`.
-///
-/// Split from [`validate_user_identifier`] because a *column* name is bound by
-/// this rule alone: the leading-`_` reservation guards relation names (the
-/// hidden view prefix), and a user column may legitimately start with `_`.
-pub fn reject_reserved_infix(name: &str) -> Result<(), String> {
-    if name.to_ascii_lowercase().contains(FK_INDEX_INFIX) {
-        return Err(format!(
-            "Names cannot contain the reserved '{FK_INDEX_INFIX}' infix: {name}"
-        ));
-    }
-    Ok(())
-}
-
-/// Reject empty names, names starting with `_` (reserved for the system prefix),
-/// names with characters outside `[A-Za-z0-9_]`, and — via
-/// [`reject_reserved_infix`] — names carrying [`FK_INDEX_INFIX`]. The rule for a
-/// relation or index name; a column name takes the infix half only.
+/// Reject empty names, names starting with `_` (reserved for the engine's own
+/// internal relation and index names) and names outside `[A-Za-z0-9_]`.
 pub fn validate_user_identifier(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Identifier cannot be empty".into());
@@ -550,7 +523,7 @@ pub fn validate_user_identifier(name: &str) -> Result<(), String> {
             return Err(format!("Identifier contains invalid characters: {name}"));
         }
     }
-    reject_reserved_infix(name)
+    Ok(())
 }
 
 /// [`validate_user_identifier`], then the canonical stored form: an ASCII
@@ -563,6 +536,20 @@ pub fn validate_user_identifier(name: &str) -> Result<(), String> {
 pub fn canonical_identifier(name: &str) -> Result<String, String> {
     validate_user_identifier(name)?;
     Ok(name.to_ascii_lowercase())
+}
+
+/// The canonical `"schema.relation"` key, from names **already canonical**.
+///
+/// It must not fold: a mixed-case name that slipped past the engine's
+/// `reject_non_canonical` would then key the cache while mismatching the store,
+/// turning a loud rejection into silent divergence. `.` is outside
+/// [`is_valid_ident_char`], so no pair can produce another pair's key.
+pub fn qualified_key(schema_name: &str, name: &str) -> String {
+    let mut q = String::with_capacity(schema_name.len() + 1 + name.len());
+    q.push_str(schema_name);
+    q.push('.');
+    q.push_str(name);
+    q
 }
 
 /// One column of a view's delta-feed reply schema. The variant carries the
@@ -943,6 +930,44 @@ const TABLE_FLAG_DIST_SHIFT: u32 = 8;
 /// explicit prefix is `1..=PK_LIST_MAX_COLS`, well within the byte; the full
 /// byte is deliberate headroom.
 const TABLE_FLAG_DIST_MASK: u64 = 0xFF;
+
+/// `IDX_TAB.flags` bit 0: the index enforces uniqueness.
+const INDEX_FLAG_UNIQUE: u64 = 1 << 0;
+/// `IDX_TAB.flags` bit 1: the index is engine-internal — created by the FK
+/// auto-index hook, not by any user statement, and undroppable through
+/// `DROP INDEX`.
+const INDEX_FLAG_INTERNAL: u64 = 1 << 1;
+
+/// The logical content of `IDX_TAB.flags`. A struct rather than two bools
+/// passed positionally, because a transposed call would silently make a user
+/// index undroppable.
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub struct IndexProps {
+    pub is_unique: bool,
+    /// Engine-internal: the FK auto-index. **A client may never set this** — the
+    /// catalog precheck rejects a `+1` carrying it, because an index flagged
+    /// internal is one `DROP INDEX` refuses, so one frame would otherwise
+    /// permanently deny a name in the index namespace.
+    pub is_internal: bool,
+}
+
+impl IndexProps {
+    /// Pack the persisted `IDX_TAB.flags` u64. Inverse of [`Self::from_flags`].
+    #[inline]
+    pub fn pack(self) -> u64 {
+        (if self.is_unique { INDEX_FLAG_UNIQUE } else { 0 }) | (if self.is_internal { INDEX_FLAG_INTERNAL } else { 0 })
+    }
+
+    /// Decode a persisted `IDX_TAB.flags` u64. Reserved bits are ignored, so a
+    /// word a later version widened still decodes the fields defined here.
+    #[inline]
+    pub fn from_flags(flags: u64) -> IndexProps {
+        IndexProps {
+            is_unique: flags & INDEX_FLAG_UNIQUE != 0,
+            is_internal: flags & INDEX_FLAG_INTERNAL != 0,
+        }
+    }
+}
 
 /// The logical content of `TABLE_TAB.flags` — equivalently, the non-column
 /// properties of a `CREATE TABLE`. A struct rather than positional arguments

@@ -88,7 +88,17 @@ fn test_system_table_flush_compacts_l0() {
     for i in 0..flushes {
         engine
             .sys_store_mut(SysFamily::Index)
-            .ingest_borrowed_batch(&idx_tab_batch(i, 0, 0, &format!("idx{i}"), false, 1))
+            .ingest_borrowed_batch(&idx_tab_batch(
+                i,
+                0,
+                0,
+                &format!("idx{i}"),
+                gnitz_wire::IndexProps {
+                    is_unique: false,
+                    is_internal: false,
+                },
+                1,
+            ))
             .unwrap();
         engine.registry_mut().flush(IDX_TAB_ID).unwrap();
     }
@@ -481,17 +491,17 @@ fn test_drop_table_cascades_fk_index() {
         col_def("pk", type_code::U64),
         fk_def("parent_ref", type_code::U64, parent_tid, 0),
     ];
-    engine.create_table("public.child", &child_cols, &[0]).unwrap();
+    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
-    let fk_idx_name = make_fk_index_name("public", "child", "parent_ref");
+    let fk_idx_name = make_fk_index_name(child_tid, 1);
     assert!(
         engine.caches.index_by_name.contains_key(fk_idx_name.as_str()),
         "FK index must be auto-created with the child table"
     );
 
-    // drop_index refuses to drop __fk_ indices, so drop_table is the only
+    // drop_index refuses to drop an internal index, so drop_table is the only
     // valid path for this cleanup. Before the fix: the on_index_delta
-    // hook's __fk_ guard blocked drop_table from cascading.
+    // hook's internal-index guard blocked drop_table from cascading.
     engine.drop_table("public.child").unwrap();
     assert!(
         !engine.caches.index_by_name.contains_key(fk_idx_name.as_str()),
@@ -1029,7 +1039,7 @@ fn test_drop_unique_index_on_fk_column_demotes() {
     assert_eq!(circuit_unique(&engine, child_tid, 1), Some(true));
 
     let user_idx = make_secondary_index_name("public", "child", "refc");
-    let fk_idx = make_fk_index_name("public", "child", "refc");
+    let fk_idx = make_fk_index_name(child_tid, 1);
     engine.drop_index(&user_idx).unwrap();
 
     // Circuit remains (col 1 still indexed) but is no longer unique; the FK

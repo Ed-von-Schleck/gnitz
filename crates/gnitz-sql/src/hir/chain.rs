@@ -5,7 +5,7 @@
 //! structural backstop every emitted circuit passes through.
 
 use crate::error::GnitzSqlError;
-use gnitz_core::{segment_id, Circuit, ColumnDef, PlannedView, Schema, ViewName};
+use gnitz_core::{segment_id, Circuit, ColumnDef, PlannedView, Schema};
 use std::sync::Arc;
 
 /// Circuit + output columns + pk-list — the pieces every view emitter returns
@@ -112,7 +112,7 @@ pub(crate) fn schema_of(cols: &[ColumnDef], pk: PkArity) -> Arc<Schema> {
 /// ones at commit. Compiling a body therefore reaches no server and repeats
 /// exactly, which the resolve loop needs to re-run a pass.
 pub(crate) struct ViewChain {
-    next_seg: u64,
+    next_seg: u32,
     pub(crate) segments: Vec<PlannedView>,
 }
 
@@ -125,47 +125,39 @@ impl ViewChain {
         }
     }
 
-    /// The next chain-local symbolic id.
-    fn mint(&mut self) -> u64 {
-        let v = segment_id(self.next_seg);
+    /// The next free chain-local slot.
+    fn mint(&mut self) -> u32 {
+        let k = self.next_seg;
         self.next_seg += 1;
-        v
+        k
     }
 
-    /// The final view's symbolic id — chain-local slot 0.
-    pub(crate) fn owner_vid(&self) -> u64 {
-        segment_id(0)
-    }
-
-    /// Mint one hidden segment: take its view id, run `emit` with it (the emitter
-    /// may push its own upstream segments first — it gets `self` back), and push
-    /// the emitted pieces. Returns the segment's `(view id, schema)` plus whatever
-    /// `emit` returned alongside its pieces.
+    /// Mint one hidden segment: take its chain-local slot, run `emit` (the
+    /// emitter may push its own upstream segments first — it gets `self` back),
+    /// and push the emitted pieces. Returns the segment's `(symbolic view id,
+    /// schema)` plus whatever `emit` returned alongside its pieces.
     ///
-    /// The mint order is the invariant this owns: the id exists before the circuit
-    /// is built, so a downstream circuit can reference it, and segments land on the
-    /// chain in dependency order.
+    /// The mint order is the invariant this owns: the slot is taken before the
+    /// circuit is built, so a downstream circuit can reference this segment, and
+    /// segments land on the chain in dependency order.
     pub(crate) fn add_segment<T>(
         &mut self,
-        emit: impl FnOnce(&mut ViewChain, u64) -> Result<(EmitPieces, T), GnitzSqlError>,
+        emit: impl FnOnce(&mut ViewChain) -> Result<(EmitPieces, T), GnitzSqlError>,
     ) -> Result<(u64, Arc<Schema>, T), GnitzSqlError> {
-        let vid = self.mint();
-        let ((circuit, cols, pk), extra) = emit(self, vid)?;
+        let seg = self.mint();
+        let ((circuit, cols, pk), extra) = emit(self)?;
         debug_assert_exchange_topology(&circuit);
         let schema = schema_of(&cols, pk);
-        self.push_hidden(cols, pk, circuit);
-        Ok((vid, schema, extra))
+        self.push_hidden(seg, cols, pk, circuit);
+        Ok((segment_id(seg as u64), schema, extra))
     }
 
-    /// Append a hidden segment, naming it after its owner and position. The one
-    /// site that names one, and it uses `ViewName::Hidden` rather than a string
-    /// because the owner's real id does not exist yet.
-    fn push_hidden(&mut self, cols: Vec<ColumnDef>, pk: PkArity, circuit: Circuit) {
-        let owner = self.owner_vid();
-        let idx = self.segments.len();
+    /// Append an internal segment. It carries no name: `create_view_chain` names
+    /// every non-final element of a bundle from its own allocated id, and records
+    /// the user view as its owner in a column.
+    fn push_hidden(&mut self, seg: u32, cols: Vec<ColumnDef>, pk: PkArity, circuit: Circuit) {
         self.segments.push(PlannedView {
-            name: ViewName::Hidden { owner, idx },
-            sql_text: "-- hidden segment".to_string(),
+            seg,
             circuit,
             output_columns: cols,
             pk_cols: pk_col_list(pk),

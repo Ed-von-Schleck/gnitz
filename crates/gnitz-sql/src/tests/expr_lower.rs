@@ -1274,9 +1274,12 @@ fn a_computed_string_projection_declares_a_string_column() {
     };
     let nominal = e.infer_type(&schema.columns);
     assert_eq!(nominal, TypeCode::String);
-    let def = ColumnDef::computed(None, 0, nominal);
+    let def = crate::validate::computed_column(None, 0, nominal);
     assert_eq!(def.type_code, TypeCode::String);
     assert!(def.is_nullable);
     // A numeric expression still takes its register image.
-    assert_eq!(ColumnDef::computed(None, 0, TypeCode::F32).type_code, TypeCode::F64);
+    assert_eq!(
+        crate::validate::computed_column(None, 0, TypeCode::F32).type_code,
+        TypeCode::F64
+    );
 }

@@ -93,24 +93,23 @@ fn capacity_is_not_a_reserved_word() {
     );
 }
 
-/// `hir::execute_create_view` stores `format!("{cv}")` as the view's
-/// `sql_definition`, and `CreateView`'s `Display` re-emits the `WITH (...)`
-/// clause — so the definition round-trips the capacity, and re-creating from it
-/// yields a bounded view again.
+/// `CreateView`'s `Display` re-emits the `WITH (...)` clause, so a statement
+/// rendered back from its own AST re-creates a bounded view — the property any
+/// tool that round-trips a definition through text depends on.
 #[test]
-fn the_stored_definition_round_trips_the_with_clause() {
+fn a_rendered_definition_round_trips_the_with_clause() {
     let Some(srv) = ServerHandle::start() else { return };
     let (mut client, sn) = make_planner(&srv);
     make_tables(&mut client, &sn);
     let sql = "CREATE VIEW b WITH (capacity = '2 MB') AS SELECT id, v FROM t WHERE v > 1";
     exec(&mut client, &sn, sql);
 
-    // The exact text the planner stores.
+    // The statement rendered back from its own AST.
     let stmt = &sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, sql).unwrap()[0];
     let stored = format!("{stmt}");
     assert!(
         stored.to_lowercase().contains("capacity"),
-        "the rendered definition must carry the WITH clause: {stored}",
+        "the rendered statement must carry the WITH clause: {stored}",
     );
 
     // Re-creating from it yields a bounded view: the leaf rule refuses anything
@@ -263,4 +262,49 @@ fn alter_view_cannot_retarget_a_bounded_view_but_rename_preserves_it() {
         "Unsupported",
         "capacity-bounded",
     );
+}
+
+/// The same two refusals through the *client* surface, which a host reaches
+/// without the SQL layer: `create_view_chain` with a `replaces` reads the same
+/// two descriptor fields the SQL guard does, so neither kind of view can be
+/// silently rebuilt without its `WITH` clause.
+#[test]
+fn the_client_refuses_to_retarget_a_bounded_or_fed_view() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let (mut client, sn) = make_planner(&srv);
+    make_tables(&mut client, &sn);
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW b WITH (capacity = '1 MB') AS SELECT id, v FROM t",
+    );
+    exec(
+        &mut client,
+        &sn,
+        "CREATE VIEW f WITH (delta = '1 MB') AS SELECT id, v FROM t",
+    );
+
+    let (t_tid, t_schema) = client.resolve_table_id(&sn, "t").unwrap();
+    for (name, needle) in [("b", "capacity-bounded"), ("f", "delta feed")] {
+        let mut cb = gnitz_core::CircuitBuilder::new(t_tid);
+        let scan = cb.input_delta();
+        cb.sink(scan);
+        let err = client
+            .create_view_chain(
+                &sn,
+                name,
+                vec![gnitz_core::PlannedView {
+                    seg: 0,
+                    circuit: cb.build(),
+                    output_columns: t_schema.columns.clone(),
+                    pk_cols: vec![0],
+                    capacity_bytes: None,
+                    delta_bytes: None,
+                }],
+                Some(name),
+            )
+            .expect_err("retargeting must be refused")
+            .to_string();
+        assert!(err.contains(needle), "got: {err}");
+    }
 }

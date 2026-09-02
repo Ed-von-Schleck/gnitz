@@ -340,8 +340,10 @@ pub(super) struct SpecRead {
 
 /// What the client does with the reply.
 pub(super) enum SinkTail {
-    /// Decode against `reply_schema` and window.
-    Rows { reply_schema: Schema },
+    /// Decode against `reply_schema` and window. `Arc` because `fetch_bound`
+    /// may chunk one read into several requests, and each would otherwise
+    /// deep-clone the schema onto its pending slot.
+    Rows { reply_schema: Arc<Schema> },
     /// Finish the partial fold, then window.
     Fold {
         shape: Box<FoldShape>,
@@ -471,7 +473,7 @@ fn plan_rows_read(query: &Query, route: &Route<'_>) -> Result<SpecRead, GnitzSql
         offset: route.offset,
         limit: route.limit,
         tail: SinkTail::Rows {
-            reply_schema: shape.reply_schema,
+            reply_schema: Arc::new(shape.reply_schema),
         },
     })
 }
@@ -545,10 +547,10 @@ pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result
     let (out_schema, batch) = match tail {
         SinkTail::Rows { reply_schema } => {
             if limit == Some(0) {
-                return Ok(empty_rows(reply_schema));
+                return Ok(empty_rows(Arc::unwrap_or_clone(reply_schema)));
             }
             let batch = fetch_bound(client, tid, &access, &sink, &reply_schema)?;
-            (reply_schema, batch)
+            (Arc::unwrap_or_clone(reply_schema), batch)
         }
         SinkTail::Fold { shape, .. } => {
             if limit == Some(0) {

@@ -77,7 +77,6 @@ fn emit_exists_circuit(
     source: &Rc<RelExpr>,
     left_prefilter: &[HirExpr],
     items: &[ProjEntry],
-    view_id: u64,
 ) -> Result<ExistsCircuit, GnitzSqlError> {
     let RelExpr::Join {
         left, right, kind, on, ..
@@ -131,7 +130,7 @@ fn emit_exists_circuit(
 
     // Tagged delta per side with its local / inner-local WHERE fused as a prefilter
     // (before the join terms) — through the shared `emit_filter` home.
-    let mut cb = CircuitBuilder::new(view_id, 0);
+    let mut cb = CircuitBuilder::new(0);
     let a_delta = cb.input_delta_tagged(left_in.tid);
     let a_local = emit_filter(
         &mut cb,
@@ -358,7 +357,6 @@ pub(crate) fn lower_semi_anti_view(
     items: &[ProjEntry],
     fpreds: &[HirExpr],
     source: &Rc<RelExpr>,
-    view_id: u64,
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     let ExistsCircuit {
         mut cb,
@@ -367,7 +365,7 @@ pub(crate) fn lower_semi_anti_view(
         shard,
         left_in,
         ..
-    } = emit_exists_circuit(chain, memo, source, fpreds, items, view_id)?;
+    } = emit_exists_circuit(chain, memo, source, fpreds, items)?;
 
     let npk = out_pk_cols.len();
     let a_n = left_in.schema.columns.len();
@@ -392,7 +390,6 @@ pub(crate) fn lower_mark_view(
     items: &[ProjEntry],
     fpreds: &[HirExpr],
     source: &Rc<RelExpr>,
-    view_id: u64,
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     let mark_id = {
         let RelExpr::Join { mark, .. } = source.as_ref() else {
@@ -408,7 +405,7 @@ pub(crate) fn lower_mark_view(
         out_pk_cols,
         shard,
         left_in,
-    } = emit_exists_circuit(chain, memo, source, &[], items, view_id)?;
+    } = emit_exists_circuit(chain, memo, source, &[], items)?;
     let unmatched = unmatched.expect("mark core returns an unmatched branch");
 
     let npk = out_pk_cols.len();

@@ -69,13 +69,13 @@ fn test_fk_drop_protections() {
         col_def("cid", type_code::U64),
         fk_def("pid_fk", type_code::U64, parent_tid, 0),
     ];
-    engine.create_table("public.child", &child_cols, &[0]).unwrap();
+    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
     // Cannot drop parent (referenced by child)
     assert!(engine.drop_table("public.parent").is_err());
 
     // Cannot drop auto-generated FK index
-    let idx_name = make_fk_index_name("public", "child", "pid_fk");
+    let idx_name = make_fk_index_name(child_tid, 1);
     assert!(engine.drop_index(&idx_name).is_err());
 
     // Drop child first, then parent succeeds
@@ -279,7 +279,7 @@ fn test_fk_multiple_children_same_parent() {
 // ── test_fk_auto_index_skips_non_leading_pk_column ───────────────────
 // The auto-index skip reads the owner's FULL PK column list: on a compound PK an
 // FK sitting at a non-leading PK position is already stored in the PK region and
-// must mint no `__fk_` index, while an FK on a non-PK column of the same table
+// must mint no auto-index, while an FK on a non-PK column of the same table
 // must still get one. A skip that consulted only the first PK column would mint
 // a redundant, undroppable index (`precheck_index_family` refuses to drop an
 // internal FK index).
@@ -296,20 +296,20 @@ fn test_fk_auto_index_skips_non_leading_pk_column() {
 
     // PK = (a, pid_fk): the FK is PK column 1, not 0. `plain_fk` is not a PK column.
     let child_cols = vec![col_def("a", type_code::U64), fk_col("pid_fk"), fk_col("plain_fk")];
-    engine.create_table("public.child", &child_cols, &[0, 1]).unwrap();
+    let child_tid = engine.create_table("public.child", &child_cols, &[0, 1]).unwrap();
 
     assert!(
         !engine
             .caches
             .index_by_name
-            .contains_key(&make_fk_index_name("public", "child", "pid_fk")),
+            .contains_key(&make_fk_index_name(child_tid, 1)),
         "an FK at a non-leading PK position is covered by the PK region — no auto-index",
     );
     assert!(
         engine
             .caches
             .index_by_name
-            .contains_key(&make_fk_index_name("public", "child", "plain_fk")),
+            .contains_key(&make_fk_index_name(child_tid, 2)),
         "an FK on a non-PK column must still get its auto-index",
     );
 

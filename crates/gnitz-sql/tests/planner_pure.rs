@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use gnitz_core::{
     is_segment_id, CatalogSnapshot, ColumnDef, IndexMeta, PkColList, RelClass, RelDescriptor, Schema, TypeCode,
-    ViewName,
 };
 use gnitz_sql::sqlparser::ast::Statement;
 use gnitz_sql::sqlparser::dialect::GenericDialect;
@@ -117,13 +116,14 @@ fn a_computed_group_key_or_aggregate_argument_adds_no_segment() {
     ] {
         let stmt = parse(&format!("CREATE VIEW vw AS {body}"));
         let views = plan_view(&stmt, &cat, SN).unwrap_or_else(|e| panic!("`{body}`: {e:?}"));
-        assert_eq!(views.len(), 1, "`{body}`: one segment, no hidden materialization");
+        assert_eq!(views.views.len(), 1, "`{body}`: one segment, no hidden materialization");
     }
 }
 
-/// Every view shape compiles to a bundle with no server anywhere: exactly one
-/// user-named segment, and every id in every circuit still symbolic (a real
-/// relation id appears only as a `ScanDelta` source).
+/// Every view shape compiles to a bundle with no server anywhere: the
+/// user-named view at chain-local slot 0 and last, distinct slots throughout,
+/// and every id in every circuit still symbolic (a real relation id appears only
+/// as a `ScanDelta` source).
 #[test]
 fn every_view_shape_compiles_with_no_server() {
     let cat = catalog();
@@ -147,19 +147,17 @@ fn every_view_shape_compiles_with_no_server() {
         let stmt = parse(&format!("CREATE VIEW vw AS {body}"));
         let views = plan_view(&stmt, &cat, SN).unwrap_or_else(|e| panic!("`{body}`: {e:?}"));
 
-        let named = views.iter().filter(|pv| matches!(pv.name, ViewName::Named(_))).count();
-        assert_eq!(named, 1, "`{body}`: exactly one user-named segment");
-        for pv in &views {
-            assert!(
-                is_segment_id(pv.circuit.view_id),
-                "`{body}`: a planned segment's own id must be symbolic"
-            );
-            if let ViewName::Hidden { owner, .. } = pv.name {
-                assert!(
-                    is_segment_id(owner),
-                    "`{body}`: a hidden segment's owner must be symbolic"
-                );
-            }
+        assert_eq!(views.name, "vw", "`{body}`: the bundle carries one user-facing name");
+        let mut slots: Vec<u32> = views.views.iter().map(|pv| pv.seg).collect();
+        slots.sort_unstable();
+        let distinct = slots.windows(2).all(|w| w[0] != w[1]);
+        assert!(distinct, "`{body}`: chain-local slots must be distinct: {slots:?}");
+        assert_eq!(
+            views.views.last().map(|pv| pv.seg),
+            Some(0),
+            "`{body}`: the user-named view is the chain's slot 0 and last"
+        );
+        for pv in &views.views {
             for dep in pv.circuit.dependencies() {
                 assert!(
                     dep == 16 || dep == 17 || is_segment_id(dep),
@@ -180,7 +178,7 @@ fn alter_view_plans_and_rejects_self_reference() {
 
     let ok = parse("ALTER VIEW vw AS SELECT id, v FROM t");
     let views = plan_view(&ok, &cat, SN).expect("a retarget over another relation plans");
-    assert!(matches!(views.last().map(|pv| &pv.name), Some(ViewName::Named(n)) if n == "vw"));
+    assert_eq!(views.name, "vw");
 
     let looping = parse("ALTER VIEW vw AS SELECT id, v FROM vw");
     assert!(matches!(
@@ -191,8 +189,8 @@ fn alter_view_plans_and_rejects_self_reference() {
 
 /// A view body naming N relations, planned by the resolve loop one name at a
 /// time, emits byte-identical `CircuitRows` to the same body planned in one pass
-/// against a pre-populated snapshot: the re-runs produce no drift in ids, hidden
-/// segment names or node order.
+/// against a pre-populated snapshot: the re-runs produce no drift in ids,
+/// chain-local slots or node order.
 #[test]
 fn re_running_a_pass_emits_the_same_circuit() {
     let cat = catalog();
@@ -207,9 +205,10 @@ fn re_running_a_pass_emits_the_same_circuit() {
         assert_eq!(asked.len(), 2, "`{body}`: one resolve per named relation");
 
         let single = plan_view(&stmt, &cat, SN).unwrap();
-        assert_eq!(looped.len(), single.len(), "`{body}`: segment count");
-        for (a, b) in looped.into_iter().zip(single) {
-            assert_eq!(a.name, b.name, "`{body}`: segment name");
+        assert_eq!(looped.name, single.name, "`{body}`: view name");
+        assert_eq!(looped.views.len(), single.views.len(), "`{body}`: segment count");
+        for (a, b) in looped.views.into_iter().zip(single.views) {
+            assert_eq!(a.seg, b.seg, "`{body}`: chain-local slot");
             assert_eq!(a.circuit, b.circuit, "`{body}`: circuit");
         }
     }
@@ -341,7 +340,7 @@ fn the_loop_resolves_only_what_the_planner_asks_for() {
 
     // So is a reserved-prefix name: the funnel guard runs before the snapshot is
     // probed at all.
-    let stmt = parse("SELECT id FROM __h1_0");
+    let stmt = parse("SELECT id FROM _seg4096");
     let (plan, asked) = resolving(&cat, |c| plan_read(&stmt, c, SN).map(|_| ()));
     assert!(matches!(plan, Err(GnitzSqlError::Plan(_))), "got {plan:?}");
     assert!(asked.is_empty(), "a reserved-prefix name costs no resolve");

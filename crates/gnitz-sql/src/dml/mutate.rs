@@ -4,6 +4,8 @@
 //! helpers (`classify_set_rhs`, `bind_set_program`, `eval_set_value`,
 //! `resolve_set_target`) are also reused by INSERT's `ON CONFLICT DO UPDATE`.
 
+use std::sync::Arc;
+
 use crate::ast_util::{extract_name, extract_table_factor_name};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_column_value, check_not_null, set_target_admits, ColumnValue};
@@ -326,13 +328,13 @@ fn resolve_where_matches(
     schema: &Schema,
     plan: &AccessPlan<'_>,
     sink: &ReadSink,
-    reply_schema: &Schema,
+    reply_schema: &Arc<Schema>,
 ) -> Result<ZSetBatch, GnitzSqlError> {
     let mut committed = fetch_bound(client, tid, &plan.access, sink, reply_schema)?;
     // In autocommit there is no buffer to overlay, and `buffered_scope`'s gather
     // can be megabytes of `PkTuple` for a large `pk IN (…)` — so ask only when a
     // transaction is open, which is the condition its doc already states.
-    if client.txn_buffer().is_none() {
+    if !client.txn_active() {
         return Ok(committed);
     }
     let (keys, preds) = plan.buffered_scope(schema);
@@ -447,6 +449,7 @@ pub(crate) fn execute_delete(
     let where_expr = bind_where(schema, del.selection.as_ref())?;
     let plan = bound_and_predicate(schema, where_expr.as_ref(), ReadBudget::MayChunk, &target.indexes)?;
     let (reply_schema, sink) = pk_only_reply(schema)?;
+    let reply_schema = Arc::new(reply_schema);
 
     // Resolve the target PKs and build the retraction batch under the RMW driver
     // (autocommit: one-precondition TXN frame with bounded retry; in a

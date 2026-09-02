@@ -4,6 +4,7 @@ use crate::expr_lower::compile_finalize_evaluator;
 use crate::ir::AggFunc;
 use crate::test_support::col_def;
 use gnitz_core::PkColumn;
+use std::sync::Arc;
 
 /// `(pk U64 | g I64 nullable | sm I16 nullable)` — one nullable group column
 /// and a narrow aggregate source, so the fill exercises a NULL group value
@@ -69,7 +70,7 @@ fn fill_only_shape(src: &Schema, group_positions: Vec<usize>, agg_specs: Vec<Agg
         agg_specs,
         pre_map: Vec::new(),
         pre_payload: Vec::new(),
-        partial_schema,
+        partial_schema: Arc::new(partial_schema),
         // `fill_group_batch` never reads the output schema; it only has to exist.
         out_schema: Schema::from_parts(vec![col_def("_agg_pk", TypeCode::U128, false).hidden()], vec![0]).unwrap(),
         having: None,
@@ -198,7 +199,7 @@ fn count_shape(src: &Schema, group_positions: Vec<usize>) -> FoldShape {
         pre_map: Vec::new(),
         pre_payload: Vec::new(),
         out_schema: build_agg_out_schema(&out_cols).unwrap(),
-        partial_schema,
+        partial_schema: Arc::new(partial_schema),
         having: None,
         finalize,
     }
@@ -274,7 +275,7 @@ fn avg_shape() -> FoldShape {
         pre_map: Vec::new(),
         pre_payload: Vec::new(),
         out_schema: build_agg_out_schema(&[col_def("a", TypeCode::F64, true)]).unwrap(),
-        partial_schema,
+        partial_schema: Arc::new(partial_schema),
         having: None,
         finalize: vec![FinalizeItem::Computed { ev: Box::new(ev) }],
     }

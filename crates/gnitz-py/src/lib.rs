@@ -52,6 +52,11 @@ pyo3::create_exception!(_native, GnitzSalFullError, GnitzError);
 // `except GnitzError` still catches it while a host that wants to release the
 // store and start over can name it. `close_mirror()` is that recovery.
 pyo3::create_exception!(_native, GnitzMirrorPoisonedError, GnitzError);
+// A named relation, index or schema the catalog does not hold. A subtype of
+// GnitzError like the classes above, so `except GnitzError` still catches it
+// while a caller that branches on absence can name it instead of matching the
+// message prose.
+pyo3::create_exception!(_native, GnitzNotFoundError, GnitzError);
 
 /// Wrap any `Display` error as a `GnitzError` PyErr. For the handful of
 /// failures that carry no retryability verdict (handshake, waker setup).
@@ -88,6 +93,7 @@ pub(crate) fn client_err(e: ClientError) -> PyErr {
         },
         ClientError::DeltaExpired => GnitzDeltaExpiredError::new_err(e.to_string()),
         ClientError::SalFull(_) => GnitzSalFullError::new_err(e.to_string()),
+        ClientError::NotFound { .. } => GnitzNotFoundError::new_err(e.to_string()),
         // The arm, and not a pre-call check on the client, is what raises the
         // poison class: refusing *every* method up front would take the
         // connection's own reads down with the copy, where only a read that would
@@ -202,6 +208,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "GnitzMirrorPoisonedError",
         m.py().get_type::<GnitzMirrorPoisonedError>(),
     )?;
+    m.add("GnitzNotFoundError", m.py().get_type::<GnitzNotFoundError>())?;
     // System-table IDs — single-sourced from gnitz_wire (delegating codec, not
     // a re-typed copy), as is the column-type table behind `type_codes()`.
     // Only the ids something addresses a relation by are exported.

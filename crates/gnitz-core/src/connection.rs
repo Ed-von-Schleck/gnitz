@@ -23,9 +23,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::error::ClientError;
-use crate::protocol::codec::encode_schema_block;
 use crate::protocol::message::{encode_message_noschema_parts, encode_message_parts, MessageParts};
 use crate::protocol::transport::{poll_fd, Next};
+use crate::protocol::ReplySchema;
 use crate::protocol::{
     encode_control_frame, encode_ddl_txn, encode_push_txn, encode_scan_multi, hello_handshake, parse_response,
     parse_response_frame, wire_flags_get_schema_version, wire_flags_set_conflict_mode, wire_flags_set_schema_version,
@@ -101,8 +101,9 @@ pub type MultiScanResult = Result<Vec<ScanReply>, ClientError>;
 /// Generate a session-unique client ID.
 ///
 /// Combines PID (top 32 bits) with a per-process monotonic sequence (bottom 32 bits).
-/// This guarantees uniqueness across all connections from the same process, and makes
-/// cross-process collisions practically impossible even with PID reuse.
+/// The sequence is a wrapping `AtomicU32`, so ids are unique across the first
+/// 2^32 connections a process opens and repeat only after it wraps; the PID half
+/// makes cross-process collisions practically impossible even with PID reuse.
 fn new_client_id() -> u64 {
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed) as u64;
@@ -265,7 +266,7 @@ pub enum Request<'a> {
     ScanSpec {
         target_id: u64,
         spec: &'a [u8],
-        reply_schema: &'a Schema,
+        reply_schema: &'a ReplySchema,
         raw: bool,
     },
     /// SCAN_MULTI: N trains in request order, each decoded under its own
@@ -611,7 +612,7 @@ impl Session {
                 // In-process, so a convenience and never a trust boundary; the
                 // server checks the same things. Here so no driver has to
                 // remember to.
-                batch.validate(schema).map_err(ClientError::ServerError)?;
+                batch.validate(schema)?;
                 // FLAG_PUSH marks the frame as a push independent of data
                 // presence, so an empty batch (a legitimate empty Z-set delta)
                 // is ACKed as a no-op push instead of being mistaken for a scan.
@@ -649,13 +650,12 @@ impl Session {
             } => {
                 // The reply schema rides the request blob (the master forwards it
                 // verbatim) and stays with the slot as the decode hint.
-                let block = encode_schema_block(reply_schema, target_id as u32);
-                let extra = gnitz_wire::pack_scan_spec_extra(spec, &block);
+                let extra = gnitz_wire::pack_scan_spec_extra(spec, reply_schema.block());
                 let ctrl = encode_control_frame(target_id, client_id, FLAG_SCAN_SPEC, 0, 0, &extra);
                 (
                     control_parts(ctrl),
                     SlotKind::ScanSpec {
-                        reply_schema: Arc::new(reply_schema.clone()),
+                        reply_schema: reply_schema.schema(),
                         raw,
                     },
                 )
@@ -1004,9 +1004,7 @@ impl Session {
     /// its own catalog.
     pub fn push_ddl_txn(&mut self, families: &[(u64, ZSetBatch)]) -> Result<u64, ClientError> {
         for (tid, batch) in families {
-            batch
-                .validate(crate::types::sys_schema(*tid))
-                .map_err(ClientError::ServerError)?;
+            batch.validate(crate::types::sys_schema(*tid))?;
         }
         let payload = encode_ddl_txn(self.client_id, families);
         self.send_txn_frame(payload)
@@ -1053,7 +1051,7 @@ impl Session {
         preconditions: &[(u64, u64)],
     ) -> Result<u64, ClientError> {
         for (_, schema, batch, _) in families {
-            batch.validate(schema).map_err(ClientError::ServerError)?;
+            batch.validate(schema)?;
         }
         let payload = encode_push_txn(self.client_id, families, preconditions);
         self.send_txn_frame(payload)
@@ -1141,7 +1139,7 @@ impl Session {
     ) -> Result<Option<(u64, Arc<Schema>, RelDescriptorBlob)>, ClientError> {
         let msg = train.terminal;
         let ncols = train.schema.as_ref().map_or(0, |s| s.columns.len());
-        let Some(desc) = RelDescriptorBlob::decode(&msg.seek_pk_extra, ncols).map_err(ClientError::ServerError)? else {
+        let Some(desc) = RelDescriptorBlob::decode(&msg.seek_pk_extra, ncols)? else {
             return Ok(None);
         };
         let mut schema = train
@@ -1170,7 +1168,7 @@ impl Session {
         &mut self,
         target_id: u64,
         spec: &[u8],
-        reply_schema: &Schema,
+        reply_schema: &ReplySchema,
     ) -> Result<(Vec<RawBlock>, u128), ClientError> {
         match self.round_trip(Request::ScanSpec {
             target_id,
@@ -1198,7 +1196,7 @@ impl Session {
         &mut self,
         target_id: u64,
         spec: &[u8],
-        reply_schema: &Schema,
+        reply_schema: &ReplySchema,
     ) -> Result<(Option<ZSetBatch>, u128), ClientError> {
         let train = self.round_trip_train(Request::ScanSpec {
             target_id,
@@ -1223,7 +1221,7 @@ impl Session {
     /// consumes, permanently shifting every later read on this connection by
     /// one frame.
     fn encode_scan_multi_frame(&self, tids: &[u64]) -> Result<Vec<u8>, ClientError> {
-        gnitz_wire::validate_scan_multi_tids(tids).map_err(ClientError::ServerError)?;
+        gnitz_wire::validate_scan_multi_tids(tids)?;
         let relations: Vec<(u64, u16)> = tids.iter().map(|&tid| (tid, self.cached_schema_version(tid))).collect();
         Ok(encode_scan_multi(self.client_id, &relations))
     }

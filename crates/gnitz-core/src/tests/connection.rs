@@ -492,12 +492,13 @@ mod spine_tests {
     fn raw_scan_spec_keeps_blocks_undecoded_and_off_the_cache() {
         let (mut s, peer) = pair();
         let sa = schema_a();
+        let reply_schema = crate::protocol::ReplySchema::new(std::sync::Arc::new(sa.clone()), 9);
         let spec = [1u8, 2, 3];
         let slot = s
             .submit(Request::ScanSpec {
                 target_id: 9,
                 spec: &spec,
-                reply_schema: &sa,
+                reply_schema: &reply_schema,
                 raw: true,
             })
             .unwrap();

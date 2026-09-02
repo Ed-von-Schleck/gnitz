@@ -113,7 +113,7 @@ fn self_fk_omitted_column_list_defaults_to_the_lone_pk() {
 fn self_fk_column_referencing_itself_rejected() {
     let cols = tree_cols();
     // `id BIGINT PRIMARY KEY REFERENCES tree(id)` — a tautology, and its
-    // child column would be a PK column, which the auto `__fk_` index skips.
+    // child column would be a PK column, which the FK auto-index skips.
     let err = resolve_fk_target_inline(&cols, &[0], "tree", &[ident("id")], 0).unwrap_err();
     match err {
         GnitzSqlError::Bind(m) => assert!(m.contains("must not be the referenced column itself"), "got: {m}"),

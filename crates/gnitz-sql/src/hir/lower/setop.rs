@@ -23,7 +23,6 @@ pub(crate) fn lower_setop(
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     setop: &RelExpr,
-    view_id: u64,
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     let RelExpr::SetOp {
         op,
@@ -49,7 +48,7 @@ pub(crate) fn lower_setop(
     // a distinct branch id; every deduplicating op uses branch 0.
     let right_branch_id = matches!((op, all), (SetOpKind::Union, true)) as u8;
 
-    let mut cb = CircuitBuilder::new(view_id, 0);
+    let mut cb = CircuitBuilder::new(0);
     let side_ids: [Vec<ColId>; 2] = [
         out.iter().map(|c| c.left).collect(),
         out.iter().map(|c| c.right).collect(),
@@ -97,7 +96,6 @@ pub(crate) fn lower_distinct(
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     input: &Rc<RelExpr>,
-    view_id: u64,
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     let side_cols = input.cols();
     // A float set-identity column breaks content-hash equality (IEEE-754).
@@ -105,7 +103,7 @@ pub(crate) fn lower_distinct(
         reject_float_key(&c.def, "SELECT DISTINCT")?;
     }
     let side_ids: Vec<ColId> = side_cols.iter().map(|c| c.id).collect();
-    let mut cb = CircuitBuilder::new(view_id, 0);
+    let mut cb = CircuitBuilder::new(0);
     let (seg, kind) = resolve_set_input(chain, memo, input, &side_ids)?;
     let (node, slots) = emit_side(&mut cb, &seg, &kind, &side_ids)?;
     let sharded = hash_shard_side(&mut cb, node, &slots, &[], 0);

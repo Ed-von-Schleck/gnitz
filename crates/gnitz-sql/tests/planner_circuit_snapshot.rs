@@ -62,7 +62,7 @@ fn dump_for(client: &mut GnitzClient, sn: &str, label: &str, view: &str, bases: 
 /// changing structure. `swapped` builds the B-branch first; the logical wiring
 /// (`union(a_branch, b_branch)`, a on `PORT_IN_A`) is identical either way.
 fn build_union(swapped: bool) -> gnitz_core::CircuitRows {
-    let mut cb = CircuitBuilder::new(999, 100);
+    let mut cb = CircuitBuilder::new(100);
     let (a_branch, b_branch) = if !swapped {
         let a = cb.input_delta(); // primary source 100
         let ma = cb.map(a, &[0]);

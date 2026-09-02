@@ -202,7 +202,7 @@ fn ddl_txn_roundtrip_client_to_server() {
             .u64_val(owner)
             .u64_val(gnitz_wire::pack_pk_cols(&[1]))
             .str_val("idx_t_b")
-            .u64_val(1);
+            .u64_val(1); // flags: unique, not internal
         b
     };
 
@@ -309,10 +309,10 @@ fn ddl_txn_roundtrip_client_to_server() {
             .add_row(vid as u128, 1)
             .u64_val(3)
             .str_val("v")
-            .str_val("")
             .u64_val(0) // pk_col_idx
             .u64_val(0) // capacity_bytes
-            .u64_val(0); // delta_bytes
+            .u64_val(0) // delta_bytes
+            .u64_val(0); // owner_view_id
         b
     };
     verify(

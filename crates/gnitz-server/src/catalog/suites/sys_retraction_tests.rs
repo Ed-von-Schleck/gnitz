@@ -10,7 +10,7 @@
 //! `ddl_tests` / `dir_deletion_tests`.
 
 use super::*;
-use gnitz_wire::{IDXTAB_COL_IS_UNIQUE, IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS};
+use gnitz_wire::{IDXTAB_COL_FLAGS, IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS};
 use std::path::Path;
 
 /// A one-row SCHEMA_TAB batch (the family's only payload column is the name).
@@ -30,7 +30,7 @@ struct IdxRow {
     owner_id: i64,
     source_cols: u64,
     name: String,
-    is_unique: bool,
+    props: gnitz_wire::IndexProps,
 }
 
 fn live_index_row(engine: &CatalogEngine, idx_id: i64) -> IdxRow {
@@ -44,14 +44,14 @@ fn live_index_row(engine: &CatalogEngine, idx_id: i64) -> IdxRow {
         owner_id: cursor_read_u64(&c, IDXTAB_COL_OWNER_ID) as i64,
         source_cols: cursor_read_u64(&c, IDXTAB_COL_SOURCE_COLS),
         name: cursor_read_string(&c, IDXTAB_COL_NAME),
-        is_unique: cursor_read_u64(&c, IDXTAB_COL_IS_UNIQUE) != 0,
+        props: gnitz_wire::IndexProps::from_flags(cursor_read_u64(&c, IDXTAB_COL_FLAGS)),
     }
 }
 
 /// A one-row IDX_TAB batch at `weight` reproducing `row` — what a client's
 /// read-then-push drop helper builds.
 fn idx_row_batch(idx_id: i64, weight: i64, row: &IdxRow) -> Batch {
-    idx_tab_batch(idx_id, row.owner_id, row.source_cols, &row.name, row.is_unique, weight)
+    idx_tab_batch(idx_id, row.owner_id, row.source_cols, &row.name, row.props, weight)
 }
 
 /// Every stored weight under `idx_id` in IDX_TAB: empty once a `(+1, -1)` pair

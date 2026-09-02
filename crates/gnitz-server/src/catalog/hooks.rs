@@ -41,14 +41,14 @@ impl CatalogEngine {
                 self.hook_schema_dir(batch)?;
             }
             SysFamily::Table => {
-                self.apply_entity_caches(batch);
+                self.apply_entity_caches(family, batch);
                 self.apply_schema_members(batch);
                 self.hook_relation_register(family, batch)?;
                 self.relock_from_table_delta(batch);
                 self.hook_cascade_fk(batch)?;
             }
             SysFamily::View => {
-                self.apply_entity_caches(batch);
+                self.apply_entity_caches(family, batch);
                 self.apply_schema_members(batch);
                 self.hook_relation_register(family, batch)?;
             }
@@ -310,12 +310,12 @@ impl CatalogEngine {
     /// synthetic hash column for join/set-op/distinct views, or the source PK
     /// passed through (0..k) for a plain projection over a compound-PK table.
     fn view_registration(&mut self, batch: &Batch, i: usize, vid: i64) -> Result<RelationRegistration, String> {
-        let (schema_id, name, pk, budgets) = read_view_tab_row(batch, i);
+        let (schema_id, name, pk, budgets, owner_view_id) = read_view_tab_row(batch, i);
         // The circuit's `circuit_nodes` are persisted before this VIEW_TAB row,
         // so `get_source_ids` resolves here. Re-check for the paths that skip the
         // precheck (boot replay, worker `ddl_sync`).
         let source_ids = self.dag.get_source_ids(&self.registry, vid);
-        self.validate_view_options(vid, &name, budgets, &source_ids)?;
+        self.validate_view_options(vid, &name, budgets, owner_view_id, &source_ids)?;
         // Stamping the fold is what makes placement transitive:
         // `relation_row_order` registers this view after its sources, so a view
         // over it reads the answer back off one value.
@@ -340,11 +340,15 @@ impl CatalogEngine {
     /// reaches the WAL, so the cascade never has to ask whether the drop is
     /// allowed.
     ///
-    /// Under compensation ONLY the index cascade runs: the column and circuit
-    /// rows are in compensation's own drained set, so cascading them too would
-    /// retract each twice → a net `-1` ghost. FK auto-indices are the dual —
-    /// `submit_local` never enqueues them, so this cascade is their sole
-    /// retractor.
+    /// A dropped view also retracts the internal chain segments it owns — the
+    /// client neither names nor knows them, so this is their sole retractor.
+    /// Terminates because segments are flat: every one names the user view as
+    /// its owner, so a segment owns none.
+    ///
+    /// Under compensation ONLY the index cascade runs: the column, circuit and
+    /// segment rows are in compensation's own drained set, so cascading them too
+    /// would retract each twice → a net `-1` ghost. FK auto-indices are the dual
+    /// — `submit_local` never enqueues them, so this cascade is theirs too.
     fn cascade_relation_children(&mut self, family: SysFamily, id: i64) -> Result<(), String> {
         if family == SysFamily::Table {
             self.cascade_retract_indices(id)?;
@@ -354,8 +358,24 @@ impl CatalogEngine {
         }
         if family == SysFamily::View {
             self.cascade_retract_circuit(id)?;
+            self.cascade_retract_segments(id)?;
         }
         self.cascade_retract_columns(id)
+    }
+
+    fn cascade_retract_segments(&mut self, owner_id: i64) -> Result<(), String> {
+        // Copied out: the submit below re-enters `apply_entity_caches`, which
+        // removes from this very list.
+        let Some(ids) = self.caches.segments_by_owner.get(&owner_id) else {
+            return Ok(());
+        };
+        let ids: Vec<u128> = ids.iter().map(|&id| id as u128).collect();
+        let schema = SysFamily::View.schema();
+        let batch = retract_pk_list(self.sys_store(SysFamily::View), &schema, ids);
+        if !batch.is_empty() {
+            self.submit_cascade(SysFamily::View, batch)?;
+        }
+        Ok(())
     }
 
     fn cascade_retract_indices(&mut self, owner_id: i64) -> Result<(), String> {
@@ -479,9 +499,9 @@ impl CatalogEngine {
     fn hook_index_register(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.len() {
             let idx_id = batch.get_pk(i) as i64;
-            let (owner_id, cols, is_unique) = read_idx_tab_row(batch, i);
+            let (owner_id, cols, props) = read_idx_tab_row(batch, i);
             if batch.get_weight(i) > 0 {
-                self.register_index(idx_id, owner_id, &cols, is_unique)?;
+                self.register_index(idx_id, owner_id, &cols, props.is_unique)?;
             } else {
                 self.unregister_index(owner_id, cols.as_slice());
             }

@@ -66,7 +66,7 @@ pub(crate) fn build_fold_shape(select: &Select, schema: &Arc<Schema>) -> Result<
         pre_map: pieces.pre_map,
         pre_payload: pieces.pre_payload,
         out_schema: build_agg_out_schema(&out_cols)?,
-        partial_schema: pieces.partial_schema,
+        partial_schema: Arc::new(pieces.partial_schema),
         having,
         finalize,
     })
@@ -110,7 +110,7 @@ fn distinct_fold_shape(select: &Select, schema: &Arc<Schema>) -> Result<FoldShap
         agg_specs: Vec::new(),
         pre_map: Vec::new(),
         pre_payload: Vec::new(),
-        partial_schema,
+        partial_schema: Arc::new(partial_schema),
         out_schema: build_agg_out_schema(&out_cols)?,
         having: None,
     })

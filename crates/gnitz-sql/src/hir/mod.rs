@@ -23,8 +23,8 @@ mod lower;
 mod physical;
 mod rewrite;
 
-pub use create::plan_view;
 pub(crate) use create::{execute_alter_view, execute_create_view};
+pub use create::{plan_view, PlannedChain};
 
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
@@ -36,8 +36,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 /// The one shared compiler core: bind a query body to `RelExpr`, decorrelate its
-/// subqueries, classify join predicates, and lower to circuit pieces for the
-/// pre-allocated `view_id`. Every body reaches it — the top-level view body
+/// subqueries, classify join predicates, and lower to circuit pieces. Every
+/// body reaches it — the top-level view body
 /// and each CTE body (inside its own `chain.add_segment`) — so the CTE phase and
 /// the top path share one pipeline; only the CTE phase threads `chain` ahead of
 /// it (to compile CTE segments before the body binds against their aliases).
@@ -46,14 +46,13 @@ pub(crate) fn bind_and_lower(
     binder: &mut Binder<'_>,
     chain: &mut ViewChain,
     body: &SetExpr,
-    view_id: u64,
     bounded: bool,
 ) -> Result<EmitPieces, GnitzSqlError> {
     let ids = ColIdGen::new();
     let rel = bind::bind_body(cat, binder, &ids, body)?;
     let rel = rewrite::decorrelate(rel, &ids)?;
     let rel = rewrite::classify(rel)?;
-    lower::lower(chain, rel, view_id, bounded)
+    lower::lower(chain, rel, bounded)
 }
 
 /// The ad-hoc read path's entry to the same core: bind a single-relation grouped

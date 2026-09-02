@@ -185,7 +185,7 @@ fn test_view_tab_no_cols_leaves_clean_state() {
 
     let vid = engine.allocate_table_id().unwrap();
     // No column records for vid.
-    let batch = build_view_tab_row(vid, "badview", "");
+    let batch = build_view_tab_row(vid, "badview");
     let result = engine.ingest_to_family(VIEW_TAB_ID, &batch);
     assert!(result.is_err(), "expected error for VIEW_TAB with no column records");
 
@@ -213,7 +213,7 @@ fn test_view_tab_too_many_cols_rejected() {
     for i in 0..(gnitz_store::schema::MAX_COLUMNS as i64 + 1) {
         write_col_at_index(&mut engine, vid, i, &col_def(&format!("c{i}"), type_code::U64)).unwrap();
     }
-    let batch = build_view_tab_row(vid, "wideview", "");
+    let batch = build_view_tab_row(vid, "wideview");
     let err = engine
         .ingest_to_family(VIEW_TAB_ID, &batch)
         .expect_err("expected error for over-wide view");
@@ -239,7 +239,17 @@ fn test_idx_tab_bad_owner_leaves_clean_state() {
 
     let nonexistent_owner = engine.allocate_table_id().unwrap();
     let idx_id = engine.allocate_index_id().unwrap();
-    let batch = idx_tab_batch(idx_id, nonexistent_owner, 0, "bad_owner_idx", false, 1);
+    let batch = idx_tab_batch(
+        idx_id,
+        nonexistent_owner,
+        0,
+        "bad_owner_idx",
+        gnitz_wire::IndexProps {
+            is_unique: false,
+            is_internal: false,
+        },
+        1,
+    );
     let result = engine.ingest_to_family(IDX_TAB_ID, &batch);
     assert!(result.is_err(), "expected error for IDX_TAB with non-existent owner");
 
@@ -278,13 +288,23 @@ fn test_idx_tab_view_owner_rejected() {
     engine
         .write_column_records(vid, OWNER_KIND_VIEW, &[col_def("id", type_code::U64)])
         .unwrap();
-    let batch = build_view_tab_row(vid, "vowner", "");
+    let batch = build_view_tab_row(vid, "vowner");
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
     assert!(engine.registry().has_id(vid), "view registered");
 
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Index).open_cursor());
     let idx_id = engine.allocate_index_id().unwrap();
-    let batch = idx_tab_batch(idx_id, vid, 0, "idx_on_view", false, 1);
+    let batch = idx_tab_batch(
+        idx_id,
+        vid,
+        0,
+        "idx_on_view",
+        gnitz_wire::IndexProps {
+            is_unique: false,
+            is_internal: false,
+        },
+        1,
+    );
     let err = engine
         .ingest_to_family(IDX_TAB_ID, &batch)
         .expect_err("IDX_TAB row naming a view owner must be rejected");
@@ -337,7 +357,17 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
     let orig_name = "public__idxtest__idx_val";
     let new_idx_id = engine.allocate_index_id().unwrap();
     // Same name, different col (ts at index 2) — bypasses create_index dup check.
-    let batch = idx_tab_batch(new_idx_id, tid, 2, orig_name, false, 1);
+    let batch = idx_tab_batch(
+        new_idx_id,
+        tid,
+        2,
+        orig_name,
+        gnitz_wire::IndexProps {
+            is_unique: false,
+            is_internal: false,
+        },
+        1,
+    );
     let result = engine.ingest_to_family(IDX_TAB_ID, &batch);
     assert!(
         result.is_err(),
@@ -439,7 +469,17 @@ fn test_next_index_id_advances_on_index_register() {
     // Register an index with an idx_id far ahead of the current counter,
     // simulating a worker receiving a broadcast for a master-allocated ID.
     let large_idx_id = engine.next_index_id + 500;
-    let batch = idx_tab_batch(large_idx_id, tid, 1, "public__seqsync__idx_val_sync", false, 1);
+    let batch = idx_tab_batch(
+        large_idx_id,
+        tid,
+        1,
+        "public__seqsync__idx_val_sync",
+        gnitz_wire::IndexProps {
+            is_unique: false,
+            is_internal: false,
+        },
+        1,
+    );
     engine.ingest_to_family(IDX_TAB_ID, &batch).unwrap();
 
     // next_index_id must now be > large_idx_id so that a local
@@ -575,7 +615,7 @@ fn precheck_rejects_relation_id_at_or_above_ceiling() {
             .expect_err(&format!("TABLE_TAB id at/above the ceiling must be rejected ({label})"));
         assert!(err.contains("id ceiling"), "error must name the cause, got: {err}");
 
-        let view_batch = build_view_tab_row(tid, "bandedview", "SELECT 1");
+        let view_batch = build_view_tab_row(tid, "bandedview");
         let err = engine
             .precheck_family(SysFamily::View, &view_batch)
             .expect_err(&format!("VIEW_TAB id at/above the ceiling must be rejected ({label})"));

@@ -4,7 +4,7 @@ use super::*;
 fn validate_user_name_rejects_reserved_and_malformed() {
     // Leading `_` is reserved (system prefix + synthesized `__h…` views).
     assert!(matches!(validate_user_name("_hidden"), Err(GnitzSqlError::Plan(_))));
-    assert!(matches!(validate_user_name("__h5_0"), Err(GnitzSqlError::Plan(_))));
+    assert!(matches!(validate_user_name("_seg4096"), Err(GnitzSqlError::Plan(_))));
     // Empty and illegal characters.
     assert!(matches!(validate_user_name(""), Err(GnitzSqlError::Plan(_))));
     assert!(matches!(validate_user_name("bad-name"), Err(GnitzSqlError::Plan(_))));

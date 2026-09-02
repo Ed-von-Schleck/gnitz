@@ -60,7 +60,7 @@ pub(crate) struct FoldShape {
     /// The per-worker SyntheticFold reduce-output layout: what the partial reply
     /// decodes against, and what `having` and every [`FinalizeItem`] resolve
     /// against.
-    pub(crate) partial_schema: Schema,
+    pub(crate) partial_schema: Arc<Schema>,
     /// The final output schema (`build_agg_out_schema`, computed at plan time
     /// so a bad shape rejects before the fold is dispatched).
     pub(crate) out_schema: Schema,
@@ -179,7 +179,7 @@ pub(crate) fn agg_finish(spec: &FoldShape, partial: &ZSetBatch) -> ZSetBatch {
     // One locator per partial column, resolved here rather than per (row ×
     // column): it carries both the NULL bit's position and the Fixed stride.
     let locs: Vec<ColumnLocator> = (0..1 + n_group + n_aggs)
-        .map(|ci| SchemaFacts::locate(&spec.partial_schema, ci))
+        .map(|ci| SchemaFacts::locate(spec.partial_schema.as_ref(), ci))
         .collect();
     let mut by_key: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut reps: Vec<Option<usize>> = Vec::new();
@@ -261,7 +261,7 @@ pub(crate) fn agg_finish(spec: &FoldShape, partial: &ZSetBatch) -> ZSetBatch {
 /// Filled a column at a time, so the destination column and its `ColData`
 /// variant are resolved once per column rather than once per cell.
 fn fill_group_batch(spec: &FoldShape, partial: &ZSetBatch, reps: &[Option<usize>], accs: &[ColAcc]) -> ZSetBatch {
-    let schema = &spec.partial_schema;
+    let schema = spec.partial_schema.as_ref();
     let n_group = spec.group_positions.len();
     let n_aggs = spec.agg_specs.len();
     let n = reps.len();
@@ -502,7 +502,7 @@ fn project_groups(spec: &FoldShape, view: &ZSetBatchView<'_>, ranges: &[(usize, 
             values: match item {
                 FinalizeItem::PassThrough { partial_ci } => FinalValues::PassThrough {
                     partial_ci: *partial_ci,
-                    loc: SchemaFacts::locate(&spec.partial_schema, *partial_ci),
+                    loc: SchemaFacts::locate(spec.partial_schema.as_ref(), *partial_ci),
                 },
                 FinalizeItem::Computed { ev } => FinalValues::Computed(ev.eval_all(view)),
             },

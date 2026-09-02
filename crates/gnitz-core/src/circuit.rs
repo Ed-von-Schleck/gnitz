@@ -13,7 +13,6 @@ pub type TableId = u64;
 /// In-memory circuit graph: typed `OpNode` per node + (dst,port) → src edges.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Circuit {
-    pub view_id: u64,
     pub nodes: std::collections::BTreeMap<NodeId, OpNode>,
     pub edges: std::collections::BTreeMap<(NodeId, Port), NodeId>,
 }
@@ -81,13 +80,11 @@ impl Circuit {
         deps
     }
 
-    /// Rewrite `view_id` and every `ScanDelta.source` through `map`. Nothing
-    /// downstream catches a segment id that survives: the engine's id-ceiling
-    /// rejection covers only TABLE_TAB and VIEW_TAB PKs, so a phantom source
-    /// would commit as a durable dependency edge on a relation that does not
-    /// exist.
+    /// Rewrite every `ScanDelta.source` through `map`. Nothing downstream
+    /// catches a segment id that survives: the engine's id-ceiling rejection
+    /// covers only TABLE_TAB and VIEW_TAB PKs, so a phantom source would commit
+    /// as a durable dependency edge on a relation that does not exist.
     pub fn resolve_seg_ids(&mut self, map: &HashMap<u64, u64>) -> Result<(), ClientError> {
-        self.view_id = substitute_seg_id(self.view_id, map)?;
         for op in self.nodes.values_mut() {
             if let OpNode::ScanDelta { source, .. } = op {
                 *source = substitute_seg_id(*source, map)?;
@@ -122,7 +119,6 @@ impl Circuit {
 /// not threaded through each call; `input_delta_tagged` names its own source.
 #[derive(Clone)]
 pub struct CircuitBuilder {
-    view_id: u64,
     primary_source_id: u64,
     next_node_id: u64,
     nodes: std::collections::BTreeMap<NodeId, OpNode>,
@@ -130,9 +126,8 @@ pub struct CircuitBuilder {
 }
 
 impl CircuitBuilder {
-    pub fn new(view_id: u64, primary_source_id: u64) -> Self {
+    pub fn new(primary_source_id: u64) -> Self {
         CircuitBuilder {
-            view_id,
             primary_source_id,
             next_node_id: 1,
             nodes: std::collections::BTreeMap::new(),
@@ -449,7 +444,6 @@ impl CircuitBuilder {
     /// Finalises the circuit.
     pub fn build(self) -> Circuit {
         Circuit {
-            view_id: self.view_id,
             nodes: self.nodes,
             edges: self.edges,
         }

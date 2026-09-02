@@ -130,16 +130,16 @@ pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, source_tid: 
 }
 
 /// Append one raw VIEW_TAB row at `weight`, with both `WITH (…)` budgets in
-/// bytes (`0` = off). The bare `0` pk_col_idx decodes back to a single-column
-/// PK `[0]`.
+/// bytes (`0` = off) and `owner_view_id` (`0` = a user view). The bare `0`
+/// pk_col_idx decodes back to a single-column PK `[0]`.
 pub fn push_view_tab_row(
     bb: &mut BatchBuilder,
     weight: i64,
     vid: i64,
     view_name: &str,
-    sql: &str,
     capacity_bytes: u64,
     delta_bytes: u64,
+    owner_view_id: i64,
 ) {
     write_view_tab_row(
         bb,
@@ -147,10 +147,10 @@ pub fn push_view_tab_row(
             view_id: vid as u64,
             schema_id: PUBLIC_SCHEMA_ID as u64,
             name: view_name,
-            sql_definition: sql,
             pk_col_idx: 0,
             capacity_bytes,
             delta_bytes,
+            owner_view_id: owner_view_id as u64,
         },
         weight,
     );
@@ -173,7 +173,7 @@ pub fn try_register_identity_view(
         .write_column_records(vid, gnitz_wire::OWNER_KIND_VIEW as i64, cols)
         .unwrap();
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, 1, vid, name, "", capacity_bytes, delta_bytes);
+    push_view_tab_row(&mut bb, 1, vid, name, capacity_bytes, delta_bytes, 0);
     engine.ingest_to_family(SysFamily::View.id(), &bb.finish())?;
     Ok(vid)
 }

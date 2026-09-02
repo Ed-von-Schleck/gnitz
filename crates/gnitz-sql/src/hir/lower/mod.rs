@@ -241,19 +241,13 @@ pub(crate) fn seginput_of_get(rel: &RelExpr) -> Option<SegInput> {
     })
 }
 
-/// Lower a bound + classified `RelExpr` tree to circuit pieces for the
-/// pre-allocated `view_id`.
-pub(crate) fn lower(
-    chain: &mut ViewChain,
-    rel: Rc<RelExpr>,
-    view_id: u64,
-    bounded: bool,
-) -> Result<EmitPieces, GnitzSqlError> {
+/// Lower a bound + classified `RelExpr` tree to circuit pieces.
+pub(crate) fn lower(chain: &mut ViewChain, rel: Rc<RelExpr>, bounded: bool) -> Result<EmitPieces, GnitzSqlError> {
     if bounded {
         reject_ineligible_capacity_body(&rel)?;
     }
     let mut memo = CutMemo::new();
-    let (pieces, _layout) = lower_body(chain, &mut memo, &rel, view_id)?;
+    let (pieces, _layout) = lower_body(chain, &mut memo, &rel)?;
     Ok(pieces)
 }
 
@@ -330,7 +324,6 @@ fn lower_body(
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     rel: &Rc<RelExpr>,
-    view_id: u64,
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     match rel.as_ref() {
         RelExpr::Project { input, items } => {
@@ -342,32 +335,32 @@ fn lower_body(
                 // projection are lowered as a linear body over it (the
                 // scalar-decorrelation finalize shape).
                 _ if projection_is_computed(items) && !fuses_computed_projection(source) => {
-                    lower_computed_over_combine(chain, memo, items, fpreds, source, view_id)
+                    lower_computed_over_combine(chain, memo, items, fpreds, source)
                 }
                 RelExpr::Get { .. } => {
                     let src = seginput_of_get(source).expect("Get arm resolves to a SegInput");
-                    lower_linear(&src, fpreds, items, view_id)
+                    lower_linear(&src, fpreds, items)
                 }
                 RelExpr::Join {
                     kind: JoinType::Semi | JoinType::Anti,
                     ..
-                } => exists::lower_semi_anti_view(chain, memo, items, fpreds, source, view_id),
+                } => exists::lower_semi_anti_view(chain, memo, items, fpreds, source),
                 RelExpr::Join {
                     kind: JoinType::Mark, ..
-                } => exists::lower_mark_view(chain, memo, items, fpreds, source, view_id),
-                RelExpr::Join { .. } => join::lower_join_view(chain, memo, items, fpreds, source, view_id),
-                RelExpr::Reduce { .. } => reduce::lower_reduce(chain, memo, items, fpreds, source, view_id),
+                } => exists::lower_mark_view(chain, memo, items, fpreds, source),
+                RelExpr::Join { .. } => join::lower_join_view(chain, memo, items, fpreds, source),
+                RelExpr::Reduce { .. } => reduce::lower_reduce(chain, memo, items, fpreds, source),
                 // A derived table (a projection, DISTINCT, or set operation) is not a
                 // delta source the linear path can read in place, so it cuts even for
                 // a bare-column projection.
                 RelExpr::Project { .. } | RelExpr::Distinct { .. } | RelExpr::SetOp { .. } => {
-                    lower_computed_over_combine(chain, memo, items, fpreds, source, view_id)
+                    lower_computed_over_combine(chain, memo, items, fpreds, source)
                 }
                 _ => Err(unsupported_body()),
             }
         }
-        RelExpr::Distinct { input } => setop::lower_distinct(chain, memo, input, view_id),
-        RelExpr::SetOp { .. } => setop::lower_setop(chain, memo, rel, view_id),
+        RelExpr::Distinct { input } => setop::lower_distinct(chain, memo, input),
+        RelExpr::SetOp { .. } => setop::lower_setop(chain, memo, rel),
         _ => Err(unsupported_body()),
     }
 }
@@ -409,12 +402,11 @@ fn lower_computed_over_combine(
     items: &[ProjEntry],
     where_preds: &[HirExpr],
     source: &Rc<RelExpr>,
-    view_id: u64,
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     let mut live: HashSet<ColId> = HashSet::new();
     collect_live_cols(items.iter().map(|i| &i.expr).chain(where_preds), &mut live);
     let seg = cut_segment(chain, memo, source, &live)?;
-    lower_linear(&seg, where_preds, items, view_id)
+    lower_linear(&seg, where_preds, items)
 }
 
 /// A body shape the driver has no arm for. Every shape bind can produce is
@@ -457,7 +449,7 @@ pub(crate) fn cut_segment(
         return Ok(cached.clone());
     }
     let body = as_body(subtree, live);
-    let (seg_vid, seg_schema, layout) = chain.add_segment(|chain, vid| lower_body(chain, memo, &body, vid))?;
+    let (seg_vid, seg_schema, layout) = chain.add_segment(|chain| lower_body(chain, memo, &body))?;
     let seg = SegInput {
         tid: seg_vid,
         schema: seg_schema,
@@ -562,7 +554,7 @@ fn wrap_passthrough_segment(chain: &mut ViewChain, get: &Rc<RelExpr>) -> Result<
         unreachable!("identity_project builds a Project");
     };
     let src = seginput_of_get(get).expect("pass-through wrapper receives a Get");
-    let (wrap_vid, wrap_schema, layout) = chain.add_segment(|_chain, vid| lower_linear(&src, &[], items, vid))?;
+    let (wrap_vid, wrap_schema, layout) = chain.add_segment(|_chain| lower_linear(&src, &[], items))?;
     Ok(SegInput {
         tid: wrap_vid,
         schema: wrap_schema,
@@ -590,12 +582,11 @@ fn lower_linear(
     src: &SegInput,
     filter_preds: &[HirExpr],
     proj_items: &[ProjEntry],
-    view_id: u64,
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     let folded = physical::fold_preds(filter_preds, &src.layout)?;
     let bound = extract_scan_bound(&folded, src);
     let proj = physical::physicalize_projection(proj_items, &src.layout, &src.schema)?;
-    let pieces = linear::emit_linear(view_id, src, bound, folded, &proj)?;
+    let pieces = linear::emit_linear(src, bound, folded, &proj)?;
     Ok((pieces, proj.layout))
 }
 

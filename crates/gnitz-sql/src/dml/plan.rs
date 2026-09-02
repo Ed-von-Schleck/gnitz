@@ -6,6 +6,8 @@
 //! and recognition itself lives in the `access` leaf. `select` and `mutate` sink
 //! into this module; it never references either.
 
+use std::sync::Arc;
+
 use crate::access::{
     pk_point_tuple, ranked_index_bounds, try_extract_pk_in, try_extract_pk_range, IndexRangeCandidate,
 };
@@ -282,7 +284,7 @@ pub(crate) fn fetch_bound(
     table_id: u64,
     access: &Access,
     sink: &ReadSink,
-    reply_schema: &Schema,
+    reply_schema: &Arc<Schema>,
 ) -> Result<ZSetBatch, GnitzSqlError> {
     let mut out: Option<ZSetBatch> = None;
     // The client stays an argument rather than a capture, so the borrow of

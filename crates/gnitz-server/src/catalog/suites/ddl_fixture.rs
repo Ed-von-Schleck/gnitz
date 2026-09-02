@@ -251,7 +251,17 @@ impl CatalogEngine {
         // would leave a permanent net −1 ghost (sys_indices runs no
         // `enforce_unique_pk`). Only an apply failure needs the undo.
         let packed_cols = gnitz_wire::pack_pk_cols(&col_indices);
-        let batch = idx_tab_batch(index_id, owner_id, packed_cols, &index_name, is_unique, 1);
+        let batch = idx_tab_batch(
+            index_id,
+            owner_id,
+            packed_cols,
+            &index_name,
+            gnitz_wire::IndexProps {
+                is_unique,
+                is_internal: false,
+            },
+            1,
+        );
         self.precheck_family(SysFamily::Index, &batch)?;
         if let Err(e) = self.apply_and_enqueue_family(SysFamily::Index, batch) {
             // The +1 failed in hook_index_register *before* it was enqueued
@@ -259,7 +269,17 @@ impl CatalogEngine {
             // Route the undo through submit_local: it fires the cache-reversal
             // hooks but does NOT enqueue the −1. Broadcasting the −1 would
             // deliver a phantom retraction to workers that never saw the +1.
-            let undo = idx_tab_batch(index_id, owner_id, packed_cols, &index_name, is_unique, -1);
+            let undo = idx_tab_batch(
+                index_id,
+                owner_id,
+                packed_cols,
+                &index_name,
+                gnitz_wire::IndexProps {
+                    is_unique,
+                    is_internal: false,
+                },
+                -1,
+            );
             self.rollback_index_registration(undo, index_id).unwrap();
             // The index directory is already gone: the hook staged it before
             // `Table::new`, and `with_staged_dir` reclaims a stage whose

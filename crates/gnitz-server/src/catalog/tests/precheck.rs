@@ -20,15 +20,16 @@ fn an_unstorable_name_is_rejected_and_a_leading_underscore_is_not() {
         ("a.b", "invalid characters"),
         ("a/b", "invalid characters"),
         ("MixedCase", "not canonical"),
-        ("t__fk_b", "reserved"),
     ] {
         let err = reject_unstorable_name(name, "table").expect_err("{name} must be refused");
         assert!(err.contains(fragment), "name {name:?} gave: {err}");
     }
     // The engine's rule is deliberately weaker than the client's identifier
-    // policy: it must accept the hidden view segments the planner mints.
+    // policy: it must accept the internal names the planner and the FK hook
+    // mint, all of which lead with `_`.
     reject_unstorable_name("_foo", "table").unwrap();
-    reject_unstorable_name("__h16_0", "view").unwrap();
+    reject_unstorable_name("_seg4096", "view").unwrap();
+    reject_unstorable_name("_fk_16_1", "index").unwrap();
 }
 
 #[test]
@@ -67,7 +68,7 @@ fn idx_batch(rows: &[(i64, i64)]) -> Batch {
                 owner_id: 16,
                 source_col_idx: gnitz_wire::pack_pk_cols(&[1]),
                 name: "ix",
-                is_unique: 0,
+                flags: 0,
             },
             weight,
         );

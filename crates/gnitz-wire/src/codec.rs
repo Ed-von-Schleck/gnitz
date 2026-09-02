@@ -48,6 +48,26 @@ impl Writer {
         self.u32(bytes.len() as u32).raw(bytes)
     }
 
+    /// Extend by `n` zero bytes and hand back the slice covering them, for a
+    /// section a codec fills in place rather than building elsewhere and copying.
+    ///
+    /// One `memset`, not `Vec::resize`: that is a per-element write loop, which
+    /// LLVM turns into a memset only from `-O1` up — and this runs over whole
+    /// frame bodies on the client's push path, which the E2E suite exercises at
+    /// `opt-level=0`.
+    pub(crate) fn reserve(&mut self, n: usize) -> &mut [u8] {
+        let at = self.0.len();
+        self.0.reserve(n);
+        // SAFETY: `reserve` guarantees `n` bytes of spare capacity past `at`, and
+        // they are zeroed before `set_len` publishes them, so no uninitialized
+        // byte is ever observable.
+        unsafe {
+            std::ptr::write_bytes(self.0.as_mut_ptr().add(at), 0, n);
+            self.0.set_len(at + n);
+        }
+        &mut self.0[at..]
+    }
+
     pub(crate) fn into_vec(self) -> Vec<u8> {
         self.0
     }

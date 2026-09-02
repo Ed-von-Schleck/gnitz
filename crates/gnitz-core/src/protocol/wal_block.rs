@@ -68,6 +68,10 @@ fn read_64bit_region<T: Copy>(
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Frame the batch's §6 region list ([`ViewBuffers::regions`]) into a WAL block.
+///
+/// For a lone block. A transaction frame instead hands `gnitz-wire` the region
+/// lists and lets it frame each block into the frame itself, which is one copy
+/// rather than two.
 pub(crate) fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
     let mut bufs = ViewBuffers::default();
     let regions = bufs.regions(batch, schema);

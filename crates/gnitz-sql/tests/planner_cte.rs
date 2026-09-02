@@ -272,7 +272,7 @@ fn reserved_prefix_cte_and_derived_alias_rejected() {
     let e_derived = try_exec(
         &mut client,
         &sn,
-        "CREATE VIEW v2 AS SELECT x FROM (SELECT id AS x FROM t) AS __h0_0",
+        "CREATE VIEW v2 AS SELECT x FROM (SELECT id AS x FROM t) AS _seg4096",
     )
     .unwrap_err();
     assert!(

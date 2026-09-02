@@ -104,7 +104,9 @@ fn rename_column_collision_and_missing_rejected() {
         "CREATE TABLE t (id BIGINT PRIMARY KEY, a BIGINT, b BIGINT)",
     );
     reject_contains(&mut c, &sn, "ALTER TABLE t RENAME COLUMN a TO b", "already exists");
-    reject_contains(&mut c, &sn, "ALTER TABLE t RENAME COLUMN nope TO z", "not found");
+    // The unknown-column message is now `find_unique_column`'s, shared with
+    // DROP COLUMN and DROP NOT NULL, rather than a fourth spelling.
+    reject_contains(&mut c, &sn, "ALTER TABLE t RENAME COLUMN nope TO z", "does not exist");
 }
 
 #[test]
@@ -196,8 +198,6 @@ fn add_constraint_rejections() {
     );
     // A non-UNIQUE constraint (CHECK) is rejected.
     reject_contains(&mut c, &sn, "ALTER TABLE t ADD CONSTRAINT c CHECK (v > 0)", "UNIQUE");
-    // A __fk_-infixed DROP CONSTRAINT name is rejected client-side.
-    reject_contains(&mut c, &sn, "ALTER TABLE t DROP CONSTRAINT some__fk_thing", "__fk_");
 }
 
 // ── ALTER VIEW ... AS ───────────────────────────────────────────────────────

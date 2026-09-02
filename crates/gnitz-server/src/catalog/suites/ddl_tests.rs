@@ -566,7 +566,7 @@ fn test_drop_view_removes_directory() {
     let view_cols = vec![col_def("id", type_code::U64)];
     engine.write_column_records(vid, OWNER_KIND_VIEW, &view_cols).unwrap();
 
-    let batch = build_view_tab_row(vid, "myview", "SELECT id FROM base");
+    let batch = build_view_tab_row(vid, "myview");
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
 
     // The register hook created the physical view directory on disk.
@@ -625,7 +625,7 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
     write_identity_circuit(&mut engine, vid, base_tid, None);
     engine.write_column_records(vid, OWNER_KIND_VIEW, &view_cols).unwrap();
 
-    let batch = build_view_tab_row(vid, "depview", "SELECT id FROM base");
+    let batch = build_view_tab_row(vid, "depview");
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
 
     assert!(
@@ -824,7 +824,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
         (r_producer, "rv"),
         (p_producer, "pv"),
     ] {
-        push_view_tab_row(&mut bb, 1, vid, name, "SELECT id, x FROM src", 0, 0);
+        push_view_tab_row(&mut bb, 1, vid, name, 0, 0, 0);
     }
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
 

@@ -53,7 +53,7 @@ fn register_filtered_view(engine: &mut CatalogEngine, base_tid: i64, name: &str,
     let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
     engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
     engine
-        .ingest_to_family(VIEW_TAB_ID, &build_view_tab_row(vid, name, "SELECT id, v FROM base"))
+        .ingest_to_family(VIEW_TAB_ID, &build_view_tab_row(vid, name))
         .unwrap();
     vid
 }
@@ -157,7 +157,7 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
 
     // Reusing the live name without retiring the incumbent is still a collision.
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, 1, new_vid, "vw", "SELECT id, v FROM base", 0, 0);
+    push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);
     let collide = bb.finish();
     assert!(
         engine.precheck_family(SysFamily::View, &collide).is_err(),
@@ -168,8 +168,8 @@ fn test_precheck_admits_a_bundle_that_retires_the_name_it_reuses() {
     // is admitted. The `-1` reproduces the live row's full payload, which the
     // the retraction CAS requires.
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, -1, old_vid, "vw", "SELECT id, v FROM base", 0, 0);
-    push_view_tab_row(&mut bb, 1, new_vid, "vw", "SELECT id, v FROM base", 0, 0);
+    push_view_tab_row(&mut bb, -1, old_vid, "vw", 0, 0, 0);
+    push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);
     let replace = bb.finish();
     engine
         .precheck_family(SysFamily::View, &replace)
@@ -206,8 +206,8 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
     engine.write_column_records(new_vid, OWNER_KIND_VIEW, &cols).unwrap();
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, -1, old_vid, "vw", "SELECT id, v FROM base", 0, 0);
-    push_view_tab_row(&mut bb, 1, new_vid, "vw", "SELECT id, v FROM base", 0, 0);
+    push_view_tab_row(&mut bb, -1, old_vid, "vw", 0, 0, 0);
+    push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
     let new_dir = engine.registry().table_entry(new_vid).unwrap().directory.clone();
     assert!(!engine.registry().has_id(old_vid), "the bundle retires the incumbent");

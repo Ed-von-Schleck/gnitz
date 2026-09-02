@@ -105,16 +105,16 @@ class TestIndexDdl:
                 schema_name=sn,
             )
             assert results[0]["type"] == "IndexCreated"
-            # is_unique flag should be 1 in IdxTab
+            # The unique bit (bit 0 of IdxTab's packed `flags`) should be set.
             from gnitz._native import IDX_TAB
             batch_obj = client.scan(IDX_TAB)
             assert batch_obj.schema is not None
             tid, _ = client.resolve_table(sn, "t")
-            uniques = [u for w, o, u in zip(batch_obj.weights,
-                                            batch_obj.scalars("owner_id"),
-                                            batch_obj.scalars("is_unique"))
-                       if w > 0 and o == tid]
-            assert uniques and uniques[0] == 1
+            flags = [f for w, o, f in zip(batch_obj.weights,
+                                          batch_obj.scalars("owner_id"),
+                                          batch_obj.scalars("flags"))
+                     if w > 0 and o == tid]
+            assert flags and flags[0] & 1
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_val"],

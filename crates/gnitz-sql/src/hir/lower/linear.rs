@@ -14,14 +14,13 @@ use crate::ir::BoundExpr;
 use gnitz_core::CircuitBuilder;
 use gnitz_wire::ScanBound;
 
-/// Emit a linear segment's circuit for `view_id` from its resolved physical
+/// Emit a linear segment's circuit from its resolved physical
 /// inputs. Returns `(circuit, output_columns, pk_cols)`; the view's physical PK is
 /// the leading `k = proj.pk_arity` source-PK columns (`pk_cols == 0..k`).
 ///
 /// The emitted circuit carries no exchange: a filter/map neither re-keys nor
 /// redistributes its source, so every row stays on the worker that produced it.
 pub(super) fn emit_linear(
-    view_id: u64,
     src: &SegInput,
     bound: Option<ScanBound>,
     filter: Option<BoundExpr>,
@@ -49,7 +48,7 @@ pub(super) fn emit_linear(
         ProjItem::PassThrough { src_col } => source_schema.is_pk_col(*src_col),
     });
 
-    let mut cb = CircuitBuilder::new(view_id, src.tid);
+    let mut cb = CircuitBuilder::new(src.tid);
     // The `Filter` below is emitted verbatim whether or not a bound rode in: the
     // bound narrows the backfill scan, never the predicate.
     let inp = cb.input_delta_bounded(bound);

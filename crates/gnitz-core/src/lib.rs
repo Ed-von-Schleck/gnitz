@@ -27,8 +27,8 @@ pub use circuit::{
     ReduceOutKey, ReindexRole,
 };
 pub use client::{
-    delta_reply_schema, hidden_view_name, qualified_name, retraction_batch, CatalogSnapshot, DeltaCursor, GnitzClient,
-    IndexMeta, InlineUniqueIndex, PlannedView, RelDescriptor, TxnBuffer, ViewName, MAX_CHAIN_SEGMENTS,
+    delta_reply_schema, qualified_name, retraction_batch, segment_name, CatalogSnapshot, DeltaCursor, GnitzClient,
+    IndexMeta, InlineUniqueIndex, PlannedView, RelDescriptor, TxnBuffer, TxnReads, MAX_CHAIN_SEGMENTS,
 };
 pub use connection::{
     Completions, Interest, LocalScanReply, ParkHook, RawBlock, RelTarget, Reply, ReplyTrain, Request, ScanReply,

@@ -5,6 +5,25 @@
 use crate::error::GnitzSqlError;
 use gnitz_core::{ColumnDef, Schema, TypeCode};
 
+/// The column def of a *computed* projection item, from the expression's
+/// nominal type. One home for the three rules every computed column obeys, so
+/// the ad-hoc and CREATE VIEW binders (which each build their own projection
+/// schema) cannot drift:
+/// - `_expr{idx}` when the item has no alias;
+/// - always nullable — an expression over a NOT NULL column can still be NULL
+///   (division by zero, an unmatched CASE);
+/// - typed by the register image the engine's register sink stores whole, not
+///   the nominal type: `-f32col` computes in f64, so declaring the column `F32`
+///   would ship the low half of the double. STRING maps to itself, which
+///   `register_image` already accounts for.
+pub(crate) fn computed_column(alias: Option<String>, idx: usize, nominal: TypeCode) -> ColumnDef {
+    ColumnDef::new(
+        alias.unwrap_or_else(|| format!("_expr{idx}")),
+        nominal.register_image(),
+        true,
+    )
+}
+
 /// Reject an output column list that names the same *visible* column twice.
 /// Hidden key slots are skipped — they are excluded from name resolution, so
 /// they cannot bind ambiguously. `context` names the DDL surface for the error
@@ -32,26 +51,23 @@ pub(crate) fn reject_duplicate_names<'a>(
 }
 
 /// Validate a user-supplied table/view/schema name: reject the empty string,
-/// a leading `_` (reserved for the system prefix and for synthesized hidden
-/// views, `__h{vid}_{i}`), and any character outside `[A-Za-z0-9_]`. CREATE
+/// a leading `_` (reserved for the engine's own internal relation and index
+/// names), and any character outside `[A-Za-z0-9_]`. CREATE
 /// TABLE/VIEW and DROP TABLE/VIEW all funnel through it right after
 /// `extract_name`.
 ///
-/// This is *policy*: the leading-`_` reservation keeps hidden segments
-/// distinguishable from user views, and the engine cannot enforce it — it must
-/// accept the `__h…` rows the client writes. Its precheck covers only the
-/// invariants that protect it, so a name it tolerates but no SQL surface will
-/// produce is the expected outcome.
+/// This is *policy*: the leading-`_` reservation is what makes the engine's own
+/// internal names (`gnitz_core::segment_name`, `make_fk_index_name`)
+/// unspellable here, and the engine cannot enforce it — it must accept exactly
+/// those rows.
 pub(crate) fn validate_user_name(name: &str) -> Result<(), GnitzSqlError> {
     gnitz_core::validate_user_identifier(name).map_err(GnitzSqlError::Plan)
 }
 
 /// Validate a user-supplied name destined to become an index name — a CREATE
 /// INDEX name or a UNIQUE/constraint name that maps to a secondary index. The
-/// rules are exactly the general identifier rules: `validate_user_identifier`
-/// already rejects the reserved `__fk_` infix, because an index name is
-/// interpolated from table and column names and so the contract has to hold for
-/// all of them, not just for the names typed at this surface.
+/// rules are exactly the general identifier rules; the alias exists so the
+/// index surfaces name what they are validating.
 pub(crate) fn validate_user_index_name(name: &str) -> Result<(), GnitzSqlError> {
     validate_user_name(name)
 }

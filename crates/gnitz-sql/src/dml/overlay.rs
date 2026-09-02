@@ -23,6 +23,8 @@
 //! `HashMap::new()` does not allocate, and its callers short-circuit on an empty
 //! map before touching a row.
 
+use std::sync::Arc;
+
 use crate::dml::plan::{fetch_bound, AccessPlan};
 use crate::error::GnitzSqlError;
 use crate::exec::batch::RowGather;
@@ -52,7 +54,7 @@ pub(super) type Net<'a> = HashMap<PkTuple, Buffered<'a>>;
 pub(crate) fn effective_rows(
     client: &mut GnitzClient,
     tid: u64,
-    schema: &Schema,
+    schema: &Arc<Schema>,
     keys: &[PkTuple],
 ) -> Result<(ZSetBatch, HashMap<PkTuple, usize>), GnitzSqlError> {
     let gather = RowGather::new(schema);
@@ -90,16 +92,18 @@ pub(crate) fn effective_rows(
 
 /// The committed rows for `keys`. A single-column PK has a `PkSet` wire form, so
 /// the whole set is one gather (chunked by `fetch_bound` past the per-gather
-/// cap). A compound PK has none, so it falls back to a seek per key — the shape
-/// `ON CONFLICT` reaches only through a bare `DO NOTHING`, since a conflict
-/// target is already rejected on a compound-PK table.
+/// cap). Only a PK too wide for the wire's 16-byte scalar key has none, and
+/// falls back to a seek per key.
 fn fetch_committed(
     client: &mut GnitzClient,
     tid: u64,
-    schema: &Schema,
+    schema: &Arc<Schema>,
     keys: &[PkTuple],
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    if schema.pk_count() == 1 {
+    // `PkSet` ships each key as the 16 raw LE bytes `split_wire` hands out, and
+    // `opk_key` encodes a packed key of any arity — so the wire's scalar width,
+    // not the PK's column count, is what bounds the batched form.
+    if schema.pk_stride() <= gnitz_wire::NARROW_PK_MAX_BYTES {
         // No WHERE behind it, so nothing is residual and no predicate ships: the
         // gather is the whole selection. ON CONFLICT needs the committed rows for
         // a key set it already holds, so it takes this bound directly rather than
@@ -126,16 +130,16 @@ fn fetch_committed(
 /// transaction touched.
 ///
 /// **Empty in autocommit**, and in any transaction that has not written `tid`.
-pub(crate) fn buffered_net<'a>(client: &'a GnitzClient, tid: u64, keys: Option<&[PkTuple]>) -> Net<'a> {
-    let Some(buf) = client.txn_buffer() else {
+pub(crate) fn buffered_net<'a>(client: &'a mut GnitzClient, tid: u64, keys: Option<&[PkTuple]>) -> Net<'a> {
+    let Some(buf) = client.txn_reads(tid) else {
         return Net::new();
     };
     match keys {
         Some(keys) => keys
             .iter()
-            .filter_map(|pk| buf.last_op(tid, pk).map(|(b, r)| (*pk, op_of(b, r))))
+            .filter_map(|pk| buf.last_op(pk).map(|(b, r)| (*pk, op_of(b, r))))
             .collect(),
-        None => buf.last_ops(tid).map(|(pk, b, r)| (pk, op_of(b, r))).collect(),
+        None => buf.last_ops().map(|(pk, b, r)| (pk, op_of(b, r))).collect(),
     }
 }
 

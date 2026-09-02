@@ -66,6 +66,34 @@ fn prologue(client_id: u64, flags: u64, count: usize, body_hint: usize) -> Write
     w
 }
 
+/// One WAL block a transaction frame carries, as the region list it is framed
+/// from rather than as bytes.
+///
+/// The frame encoders below size the whole frame from these and then write each
+/// block **into** it, so a batch is copied once — into the frame — instead of
+/// once into a per-block `Vec` and again into the frame. At the 64 MB frame cap
+/// that second copy is milliseconds, on a path every autocommit `UPDATE` /
+/// `DELETE` runs and an OCC retry re-runs.
+pub struct WalBlock<'a> {
+    pub table_id: u32,
+    pub entry_count: u32,
+    pub regions: &'a [&'a [u8]],
+}
+
+impl WalBlock<'_> {
+    /// The framed size — what the frame reserves for this block.
+    pub fn size(&self) -> usize {
+        crate::wal::block_size_of(self.regions)
+    }
+
+    /// Frame this block into `dst`, which must be exactly [`Self::size`] bytes.
+    /// `checksum = true`: client frames always carry a body checksum.
+    fn write(&self, dst: &mut [u8]) {
+        crate::wal::encode(dst, 0, self.table_id, self.entry_count, self.regions, true)
+            .expect("WAL encode: the frame reserved block_size_of bytes");
+    }
+}
+
 /// Encode an atomic **DDL transaction** frame (`FLAG_DDL_TXN`), without the
 /// 4-byte frame header. Every system-table write — a `CREATE`'s N family
 /// batches, a `DROP`/`CREATE INDEX`/`CREATE SCHEMA`'s single batch — rides one
@@ -75,15 +103,16 @@ fn prologue(client_id: u64, flags: u64, count: usize, body_hint: usize) -> Write
 /// Each block embeds its own `table_id` and total size, so the server walks the
 /// list by header alone with no schema in hand and defers schema resolution to
 /// its catalog.
-pub fn encode_ddl_txn(client_id: u64, blocks: &[&[u8]]) -> Vec<u8> {
+pub fn encode_ddl_txn(client_id: u64, blocks: &[WalBlock<'_>]) -> Vec<u8> {
     let mut w = prologue(
         client_id,
         FLAG_DDL_TXN,
         blocks.len(),
-        blocks.iter().map(|b| b.len()).sum(),
+        blocks.iter().map(|b| b.size()).sum(),
     );
     for b in blocks {
-        w.raw(b);
+        let n = b.size();
+        b.write(w.reserve(n));
     }
     w.into_vec()
 }
@@ -100,8 +129,12 @@ pub fn encode_ddl_txn(client_id: u64, blocks: &[&[u8]]) -> Vec<u8> {
 /// A `preconditions` entry `(tid, basis)` asserts "no commit has written `tid`
 /// with a zone LSN greater than `basis`". The section is always emitted: an
 /// empty slice still writes its zero count.
-pub fn encode_push_txn(client_id: u64, families: &[(u8, &[u8], &[u8])], preconditions: &[(u64, u64)]) -> Vec<u8> {
-    let body: usize = families.iter().map(|(_, s, d)| 1 + s.len() + d.len()).sum();
+pub fn encode_push_txn(
+    client_id: u64,
+    families: &[(u8, &[u8], WalBlock<'_>)],
+    preconditions: &[(u64, u64)],
+) -> Vec<u8> {
+    let body: usize = families.iter().map(|(_, s, d)| 1 + s.len() + d.size()).sum();
     let mut w = prologue(
         client_id,
         FLAG_PUSH_TXN,
@@ -109,7 +142,9 @@ pub fn encode_push_txn(client_id: u64, families: &[(u8, &[u8], &[u8])], precondi
         body + 4 + preconditions.len() * PRECONDITION_BYTES,
     );
     for (mode, schema_block, wal_block) in families {
-        w.u8(*mode).raw(schema_block).raw(wal_block);
+        w.u8(*mode).raw(schema_block);
+        let n = wal_block.size();
+        wal_block.write(w.reserve(n));
     }
     w.u32(preconditions.len() as u32);
     for (tid, basis) in preconditions {

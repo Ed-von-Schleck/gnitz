@@ -44,7 +44,7 @@ impl ProjItem {
 /// column, so an aliased or qualified PK column is still found by the
 /// PK-placement scan and a qualified non-PK column is not needlessly
 /// recomputed. Any other expression becomes a `Computed` column built by
-/// [`ColumnDef::computed`]. `Wildcard` is expanded by the caller and rejected
+/// [`crate::validate::computed_column`]. `Wildcard` is expanded by the caller and rejected
 /// here.
 fn resolve_proj_col(
     item: &SelectItem,
@@ -55,7 +55,7 @@ fn resolve_proj_col(
     let bound = bind_single_table(expr, source_schema)?;
     // A (possibly aliased / qualified / parenthesized) bare column reference is a
     // pass-through; an alias only renames the output column. Anything else is a
-    // computed column, built by `ColumnDef::computed` from its `infer_type`.
+    // computed column, built by `computed_column` from its `infer_type`.
     if let BoundExpr::ColRef(ci) = bound {
         let col = aliased_def(&source_schema.columns[ci], alias);
         Ok((ProjItem::PassThrough { src_col: ci }, col))
@@ -63,7 +63,7 @@ fn resolve_proj_col(
         let nominal = bound.infer_type(&source_schema.columns);
         Ok((
             ProjItem::Computed { bound_expr: bound },
-            ColumnDef::computed(alias, idx, nominal),
+            crate::validate::computed_column(alias, idx, nominal),
         ))
     }
 }

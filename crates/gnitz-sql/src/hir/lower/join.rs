@@ -39,7 +39,7 @@ impl Demand<'_> {
     }
 }
 
-/// Lower a `Project(Filter?(Join))` tree's join to circuit pieces for `view_id`,
+/// Lower a `Project(Filter?(Join))` tree's join to circuit pieces,
 /// plus the output `ColId` layout: `[k hidden `_join_pk` / `_pair_pk` slots]`
 /// followed by the projected payload in item order.
 pub(crate) fn lower_join_view(
@@ -48,13 +48,12 @@ pub(crate) fn lower_join_view(
     project_items: &[ProjEntry],
     where_preds: &[HirExpr],
     join: &RelExpr,
-    view_id: u64,
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     let down = Demand {
         items: project_items,
         where_preds,
     };
-    let pieces = emit_step(chain, memo, down, join, view_id)?;
+    let pieces = emit_step(chain, memo, down, join)?;
     // The emitted pk-list is the synthetic key region; its width is the number of
     // identity-free slots the layout leads with.
     let layout = key_region_layout(pieces.2, project_items);
@@ -67,7 +66,6 @@ fn emit_step(
     memo: &mut CutMemo,
     down: Demand<'_>,
     join: &RelExpr,
-    view_id: u64,
 ) -> Result<EmitPieces, GnitzSqlError> {
     let RelExpr::Join {
         left, right, kind, on, ..
@@ -99,9 +97,9 @@ fn emit_step(
     let [left_in, right_in] = inputs;
 
     if class.range.is_some() {
-        emit_range(down, class, *kind, &left_in, &right_in, view_id)
+        emit_range(down, class, *kind, &left_in, &right_in)
     } else {
-        emit_equi(down, class, *kind, &left_in, &right_in, view_id)
+        emit_equi(down, class, *kind, &left_in, &right_in)
     }
 }
 
@@ -141,7 +139,6 @@ fn emit_equi(
     kind: JoinType,
     left_in: &SegInput,
     right_in: &SegInput,
-    view_id: u64,
 ) -> Result<EmitPieces, GnitzSqlError> {
     let left_schema = &left_in.schema;
     let right_schema = &right_in.schema;
@@ -168,7 +165,7 @@ fn emit_equi(
     let pruned_right = kept_coldefs(right_schema, &keep_r);
     crate::validate::reject_column_overflow("JOIN view output", k + pl + pr)?;
 
-    let mut cb = CircuitBuilder::new(view_id, 0);
+    let mut cb = CircuitBuilder::new(0);
     let input_a_raw = cb.input_delta_tagged(left_in.tid);
     let input_b_raw = cb.input_delta_tagged(right_in.tid);
 
@@ -241,7 +238,6 @@ fn emit_range(
     kind: JoinType,
     left_in: &SegInput,
     right_in: &SegInput,
-    view_id: u64,
 ) -> Result<EmitPieces, GnitzSqlError> {
     let eq: &[EqPair] = &class.eq;
     let range: &HirRange = class.range.as_ref().expect("emit_range receives a range class");
@@ -263,7 +259,7 @@ fn emit_range(
         reject_pure_range_outer(kind, range.tc)?;
     }
 
-    let mut cb = CircuitBuilder::new(view_id, 0);
+    let mut cb = CircuitBuilder::new(0);
     let input_a_raw = cb.input_delta_tagged(left_in.tid);
     let input_b_raw = cb.input_delta_tagged(right_in.tid);
 

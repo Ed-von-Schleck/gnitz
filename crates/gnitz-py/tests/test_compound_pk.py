@@ -1285,6 +1285,34 @@ def test_compound_pk_on_conflict_no_target_do_nothing(client):
         _cleanup(client, sn, "t")
 
 
+def test_compound_pk_on_conflict_batches_its_probe(client):
+    """A compound PK narrow enough for the wire's scalar key resolves its whole
+    undecided key set in ONE `PkSet` gather, not a seek per row.
+
+    Correctness is what the row assertions below pin; the round-trip count is
+    what makes a 1000-row VALUES list one request rather than 1000."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        _make_compound_table(client, sn, "t")
+        client.execute_sql("INSERT INTO t (a, b, payload) VALUES (1, 1, 10), (2, 2, 20)",
+                           schema_name=sn)
+        # Half conflict, half are new; every key is undecided in autocommit.
+        rows = ", ".join(f"({a}, {a}, {a * 100})" for a in range(1, 9))
+        client.execute_sql(
+            f"INSERT INTO t (a, b, payload) VALUES {rows} ON CONFLICT DO NOTHING",
+            schema_name=sn,
+        )
+        got = sorted(
+            (r["a"], r["b"], r["payload"])
+            for r in client.execute_sql("SELECT * FROM t", schema_name=sn)[0]["rows"]
+        )
+        # The two incumbents keep their payloads; the six new tuples land.
+        assert got == [(1, 1, 10), (2, 2, 20)] + [(a, a, a * 100) for a in range(3, 9)], got
+    finally:
+        _cleanup(client, sn, "t")
+
+
 @_NEEDS_MULTI
 def test_compound_pk_multi_worker_partition_routing(client):
     """Multi-worker correctness: 20 rows distributed across workers

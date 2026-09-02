@@ -7,10 +7,10 @@
 //! `ddl_sync`, `submit_cascade`, Stage-A compensation, the FK auto-index's
 //! `submit_local`, `bootstrap_ingest` and `advance_sequence` — all but one
 //! because their rows were validated when first written. The exception is the FK
-//! auto-index, safe by construction and unable to pass anyway: its own `__fk_`
-//! name is one [`reject_unstorable_name`] rejects. So this file holds the
-//! precheck arms *and* the registration guards `hooks.rs` re-runs on those
-//! paths.
+//! auto-index, safe by construction and unable to pass anyway: it sets the
+//! internal flag bit, which [`precheck_index_family`] rejects on any client
+//! `+1`. So this file holds the precheck arms *and* the registration guards
+//! `hooks.rs` re-runs on those paths.
 
 use std::cmp::Ordering;
 
@@ -19,12 +19,11 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::*;
 use gnitz_store::schema::make_index_schema;
 use gnitz_store::storage::{compare_rows, compare_rows_except};
-use gnitz_wire::{COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_NAME, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME};
+use gnitz_wire::{COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME};
 
 /// The name rules a relation or index row must satisfy to be *stored*: non-empty
-/// `[A-Za-z0-9_]` (a name is interpolated into index names), already canonical
-/// (every cache key here is compared byte-wise against the client's folded form),
-/// and free of the reserved `__fk_` infix.
+/// `[A-Za-z0-9_]` and already canonical (every cache key here is compared
+/// byte-wise against the client's folded form).
 ///
 /// Deliberately **not** `validate_user_identifier`, whose leading-`_` reservation
 /// is client-side *policy*: the engine must accept the `__h…` segment rows the
@@ -38,8 +37,7 @@ fn reject_unstorable_name(name: &str, noun: &str) -> Result<(), String> {
     if !name.bytes().all(gnitz_wire::is_valid_ident_char) {
         return Err(format!("{noun} name contains invalid characters: {name}"));
     }
-    reject_non_canonical(name, noun)?;
-    gnitz_wire::reject_reserved_infix(name)
+    reject_non_canonical(name, noun)
 }
 
 /// Reject a name that is not already ASCII-lowercase. Every cache key and
@@ -301,7 +299,7 @@ impl CatalogEngine {
             .schema_by_id
             .get(&sid)
             .ok_or_else(|| format!("Schema with ID {sid} does not exist"))?;
-        let qualified = format!("{schema_name}.{name}");
+        let qualified = gnitz_wire::qualified_key(schema_name, name);
         if let Some(&existing) = self.caches.entity_by_qname.get(&qualified) {
             if existing != self_id && !net_dead.contains(&existing) {
                 return Err(format!("Table or view already exists: {qualified}"));
@@ -417,11 +415,6 @@ impl CatalogEngine {
                     if null_new != null_old && !(null_old == 0 && null_new == 1) {
                         return Err("a column-ALTER may only set is_nullable 0→1 (DROP NOT NULL)".into());
                     }
-                    // The renamed-to name is client-supplied and reaches
-                    // `make_fk_index_name` the next time an FK index is minted
-                    // over this column, so it takes the infix rule too.
-                    gnitz_wire::reject_reserved_infix(&batch.read_payload_string(pj, COLTAB_PAY_NAME))?;
-
                     let is_drop = (hid_old == 0 && hid_new == 1) || (null_old == 0 && null_new == 1);
                     if is_drop {
                         if owner_schema.is_pk_col(col_idx as usize) {
@@ -496,12 +489,6 @@ impl CatalogEngine {
         let mut prospective = (*self.read_column_defs(owner_id)).clone();
         prospective.push(appended.clone());
         check_col_defs(&prospective).map_err(|e| format!("cannot ADD COLUMN on table {owner_id}: {e}"))?;
-        // `make_fk_index_name` interpolates a column name into an index name, so
-        // a reserved infix here would yield an index the drop guard refuses to
-        // drop. Not part of `check_col_defs`, which also runs for views (where
-        // `SELECT a AS x__fk_y` is legal) and on boot replay, where a
-        // pre-existing name would make the database un-openable.
-        gnitz_wire::reject_reserved_infix(&appended.name)?;
         // A new column over existing rows is unconditionally nullable, carries
         // no SERIAL/FK, and is visible.
         if !appended.is_nullable {
@@ -513,28 +500,47 @@ impl CatalogEngine {
         check_col_ident(batch, pj, OWNER_KIND_TABLE)
     }
 
+    /// A `+1` VIEW_TAB row's `owner_view_id` must name `0` (a user view), a view
+    /// this bundle creates, or one the registry holds — the drop cascade keys on
+    /// it, so a forged owner would point a cascade at nothing. Precheck-only:
+    /// the paths that skip it replay rows this already accepted.
+    fn validate_view_owner(&self, vid: i64, name: &str, owner_view_id: i64, batch: &Batch) -> Result<(), String> {
+        if owner_view_id == 0 {
+            return Ok(());
+        }
+        if owner_view_id == vid {
+            return Err(format!("view '{name}' (vid={vid}) declares itself its own owner"));
+        }
+        let in_bundle = (0..batch.len()).any(|j| batch.get_weight(j) > 0 && batch.get_pk(j) as i64 == owner_view_id);
+        if in_bundle || self.registry.has_id(owner_view_id) {
+            return Ok(());
+        }
+        Err(format!(
+            "view '{name}' (vid={vid}) names owner_view_id={owner_view_id}, which no relation holds"
+        ))
+    }
+
     /// The shared VIEW_TAB registration guards: what a `WITH (…)` option may be
     /// declared on, and what a bounded view may read. `source_ids` is the view's
     /// resolved `ScanDelta` sources.
     ///
     /// Run from the precheck, and again from `view_registration` for the paths
-    /// that skip it (boot replay, worker `ddl_sync`). A within-bundle hidden
-    /// segment is unresolvable at precheck time and never carries a `WITH`
-    /// option, which is what keeps the second run meaningful.
+    /// that skip it (boot replay, worker `ddl_sync`). A within-bundle internal
+    /// segment never carries a `WITH` option, which is what keeps the second run
+    /// meaningful.
     pub(in crate::catalog) fn validate_view_options(
         &self,
         vid: i64,
         name: &str,
         budgets: gnitz_store::relation::ViewBudgets,
+        owner_view_id: i64,
         source_ids: &[i64],
     ) -> Result<(), String> {
-        // A hidden chain segment is an internal relation the planner mints, never
+        // An internal chain segment is a relation the planner mints, never
         // something an option clause may name.
-        if (budgets.capacity_bytes.is_some() || budgets.delta_bytes.is_some())
-            && name.starts_with(gnitz_wire::HIDDEN_VIEW_PREFIX)
-        {
+        if (budgets.capacity_bytes.is_some() || budgets.delta_bytes.is_some()) && owner_view_id != 0 {
             return Err(format!(
-                "catalog invariant violated: hidden segment '{name}' (vid={vid}) carries a WITH option."
+                "catalog invariant violated: internal segment '{name}' (vid={vid}) carries a WITH option."
             ));
         }
         // A bounded view's `Delta(0)` cannot be a function of the tick round, and
@@ -765,27 +771,20 @@ impl CatalogEngine {
                 let (sid, name, pk, kind, _placement) = read_table_tab_row(batch, i, id)?;
                 (sid, name, pk, kind)
             } else {
-                let (sid, name, pk, budgets) = read_view_tab_row(batch, i);
+                let (sid, name, pk, budgets, owner_view_id) = read_view_tab_row(batch, i);
                 // `topo_priority` applies CircuitNodes (2) before View (6) in a
                 // creating bundle, so the view's sources resolve here; an
                 // all-negative bundle sorts descending but carries no `+1` VIEW_TAB
                 // row to validate.
                 let source_ids = self.dag.get_source_ids(&self.registry, id);
-                self.validate_view_options(id, &name, budgets, &source_ids)?;
+                self.validate_view_options(id, &name, budgets, owner_view_id, &source_ids)?;
+                self.validate_view_owner(id, &name, owner_view_id, batch)?;
                 (sid, name, pk, RelationKind::View)
             };
             validate_relation_defs(kind, id, &name, &col_defs, &pk)?;
             reject_unstorable_name(&name, family.row_noun())?;
 
             if is_table {
-                // `make_fk_index_name` interpolates a column name into an index
-                // name, so a column carrying the reserved infix would yield an
-                // index the drop guard refuses to drop. Base-table-scoped: a
-                // view's column names are never interpolated, and a legal
-                // `SELECT a AS x__fk_y` must keep working.
-                for cd in col_defs.iter() {
-                    gnitz_wire::reject_reserved_infix(&cd.name)?;
-                }
                 // A stream push must stay a pure append: SERIAL would draw from a
                 // durable sequence and an FK would probe a parent store, putting a
                 // catalog write or a store read on every one.
@@ -861,9 +860,16 @@ impl CatalogEngine {
         let mut claimed: FxHashSet<String> = FxHashSet::default();
         let noun = SysFamily::Index.row_noun();
         for i in (0..batch.len()).filter(|&i| batch.get_weight(i) > 0) {
-            let (owner_id, cols, _is_unique) = read_idx_tab_row(batch, i);
+            let (owner_id, cols, props) = read_idx_tab_row(batch, i);
             let index_name = batch.read_payload_string(i, IDXTAB_PAY_NAME);
             reject_unstorable_name(&index_name, noun)?;
+            // Only `submit_local` — the FK auto-index, which bypasses this
+            // precheck — may set the internal bit: the drop guard below refuses
+            // to drop one, so a client could otherwise deny an index name
+            // permanently from one frame.
+            if props.is_internal {
+                return Err(format!("index '{index_name}' claims the engine-internal flag"));
+            }
             let entry = self.validate_index_registration(owner_id, &cols)?;
 
             // Bounds, per-column eligibility (STRING/BLOB/float), and
@@ -894,12 +900,11 @@ impl CatalogEngine {
         drop_ids.sort_unstable();
 
         for i in (0..batch.len()).filter(|&i| batch.get_weight(i) < 0) {
-            let (owner_id, cols, _) = read_idx_tab_row(batch, i);
-            let name = batch.read_payload_string(i, IDXTAB_PAY_NAME);
-            // An internal `__fk_` index backs the RESTRICT seek; dropping one
-            // would silently disarm FK enforcement. Keyed on the raw `-1` rows,
-            // not on net-dead: a rewrite pair must not slip past it.
-            if name.contains(FK_INDEX_INFIX) {
+            let (owner_id, cols, props) = read_idx_tab_row(batch, i);
+            // An internal index backs the FK RESTRICT seek; dropping one would
+            // silently disarm FK enforcement. Keyed on the raw `-1` rows, not on
+            // net-dead: a rewrite pair must not slip past it.
+            if props.is_internal {
                 return Err("Integrity violation: cannot drop an internal FK index".into());
             }
             // FK backing is single-column: a composite index never satisfies a

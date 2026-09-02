@@ -14,9 +14,9 @@ use gnitz_expr::RowSource;
 use gnitz_wire::{
     COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE,
     COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND, COLTAB_PAY_TYPE_CODE,
-    IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_NAME,
+    IDXTAB_PAY_FLAGS, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_NAME,
     TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_NAME,
-    VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID,
+    VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID,
 };
 
 // ---------------------------------------------------------------------------
@@ -223,14 +223,14 @@ pub(super) fn read_table_tab_row<S: RowSource>(
     ))
 }
 
-/// Decode VIEW_TAB `row`: `(schema_id, name, pk_list, budgets)`. The pk_list is
-/// the view's persisted leading-k column list; a bare `0` decodes back to `[0]`.
-/// The two budget words carry `0` for "no clause", decoded to `None` here so no
-/// caller repeats the sentinel.
+/// Decode VIEW_TAB `row`: `(schema_id, name, pk_list, budgets, owner_view_id)`.
+/// A bare `0` pk_list decodes back to `[0]`; a `0` budget word decodes to `None`
+/// here so no caller repeats the sentinel. `owner_view_id` is `0` for a user
+/// view.
 pub(super) fn read_view_tab_row<S: RowSource>(
     src: &S,
     row: usize,
-) -> (i64, String, PkColList, gnitz_store::relation::ViewBudgets) {
+) -> (i64, String, PkColList, gnitz_store::relation::ViewBudgets, i64) {
     (
         sys_u64(src, row, VIEWTAB_PAY_SCHEMA_ID) as i64,
         sys_string(src, row, VIEWTAB_PAY_NAME),
@@ -239,6 +239,7 @@ pub(super) fn read_view_tab_row<S: RowSource>(
             capacity_bytes: Some(sys_u64(src, row, VIEWTAB_PAY_CAPACITY)).filter(|&b| b != 0),
             delta_bytes: Some(sys_u64(src, row, VIEWTAB_PAY_DELTA)).filter(|&b| b != 0),
         },
+        sys_u64(src, row, VIEWTAB_PAY_OWNER_VIEW_ID) as i64,
     )
 }
 
@@ -257,14 +258,14 @@ fn sys_string<S: RowSource>(src: &S, row: usize, pi: usize) -> String {
     String::from_utf8(gnitz_wire::german_string_content(cell, src.blob()).to_vec()).unwrap_or_default()
 }
 
-/// Decode IDX_TAB `row`: `(owner_id, source_cols, is_unique)`. `source_cols`
+/// Decode IDX_TAB `row`: `(owner_id, source_cols, props)`. `source_cols`
 /// carries `pack_pk_cols(&col_indices)` (a single-column index is the
 /// 1-element degenerate case).
-pub(super) fn read_idx_tab_row<S: RowSource>(src: &S, row: usize) -> (i64, PkColList, bool) {
+pub(super) fn read_idx_tab_row<S: RowSource>(src: &S, row: usize) -> (i64, PkColList, gnitz_wire::IndexProps) {
     (
         sys_u64(src, row, IDXTAB_PAY_OWNER_ID) as i64,
         unpack_pk_cols(sys_u64(src, row, IDXTAB_PAY_SOURCE_COLS)),
-        sys_u64(src, row, IDXTAB_PAY_IS_UNIQUE) != 0,
+        gnitz_wire::IndexProps::from_flags(sys_u64(src, row, IDXTAB_PAY_FLAGS)),
     )
 }
 
@@ -327,9 +328,9 @@ pub(crate) fn idx_tab_unique_creates(batch: &Batch) -> Vec<(i64, u64, PkColList)
     (0..batch.len())
         .filter(|&i| batch.get_weight(i) > 0)
         .filter_map(|i| {
-            let (owner_id, cols, is_unique) = read_idx_tab_row(batch, i);
+            let (owner_id, cols, props) = read_idx_tab_row(batch, i);
             let packed = batch.read_payload_u64(i, IDXTAB_PAY_SOURCE_COLS);
-            (is_unique && cols.is_well_formed()).then_some((owner_id, packed, cols))
+            (props.is_unique && cols.is_well_formed()).then_some((owner_id, packed, cols))
         })
         .collect()
 }
@@ -508,7 +509,7 @@ pub(super) fn idx_tab_batch(
     owner_id: i64,
     packed_cols: u64,
     name: &str,
-    is_unique: bool,
+    props: gnitz_wire::IndexProps,
     weight: i64,
 ) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::Index.schema());
@@ -519,7 +520,7 @@ pub(super) fn idx_tab_batch(
             owner_id: owner_id as u64,
             source_col_idx: packed_cols,
             name,
-            is_unique: is_unique as u64,
+            flags: props.pack(),
         },
         weight,
     );

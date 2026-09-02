@@ -240,16 +240,16 @@ fn one_writev_per_burst() {
 /// planner, so the circuit is a `ScanDelta` into a predicate-less `Filter` into
 /// the sink the compiler takes as the plan's output register.
 fn fed_view(client: &mut GnitzClient, sn: &str, tid: u64) -> u64 {
-    let mut b = gnitz_core::CircuitBuilder::new(0, tid);
+    let mut b = gnitz_core::CircuitBuilder::new(tid);
     let src = b.input_delta();
     let filtered = b.filter(src, None);
     b.sink(filtered);
     let vids = client
         .create_view_chain(
             sn,
+            "v",
             vec![gnitz_core::PlannedView {
-                name: gnitz_core::ViewName::Named("v".to_string()),
-                sql_text: String::new(),
+                seg: 0,
                 circuit: b.build(),
                 output_columns: cols(),
                 pk_cols: vec![0],

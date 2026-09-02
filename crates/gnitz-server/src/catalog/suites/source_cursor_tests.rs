@@ -66,7 +66,7 @@ fn fixture_with(name: &str, bound: Option<ScanBound>, val_of: impl Fn(u64) -> u6
     let vid = engine.allocate_table_id().unwrap();
     write_bounded_identity_circuit(&mut engine, vid, tid, bound);
     engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
-    let batch = build_view_tab_row(vid, "v_base", "SELECT * FROM base");
+    let batch = build_view_tab_row(vid, "v_base");
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
     (engine, tid, vid)
 }

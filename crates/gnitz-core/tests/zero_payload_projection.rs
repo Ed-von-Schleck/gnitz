@@ -20,14 +20,14 @@ use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
 
 /// The PK-only reply for `schema`: its PK columns in `pk_indices()` order, keyed
 /// on all of them, with no payload column at all.
-fn pk_only_reply_schema(schema: &Schema) -> Schema {
+fn pk_only_reply_schema(schema: &Schema) -> std::sync::Arc<Schema> {
     let cols: Vec<ColumnDef> = schema
         .pk_indices()
         .iter()
         .map(|&ci| schema.columns[ci].clone())
         .collect();
     let k = cols.len();
-    Schema::from_parts(cols, (0..k).collect()).expect("a PK-only reply schema is admissible")
+    std::sync::Arc::new(Schema::from_parts(cols, (0..k).collect()).expect("a PK-only reply schema is admissible"))
 }
 
 /// `col > threshold` as a compiled predicate blob, over the SOURCE schema's

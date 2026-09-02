@@ -3,7 +3,8 @@
 //! `CREATE INDEX` name-uniqueness regression tests (Bug 4). The SQL path pushed
 //! directly to IDX_TAB with no duplicate-name guard, so two rows could share a
 //! name; `drop_index_by_name` stops after the first match, orphaning the second.
-//! `client.create_index` now rejects a duplicate name before allocating an id.
+//! The engine's precheck now rejects a duplicate name — the client makes no
+//! name probe of its own.
 
 mod common;
 use common::*;
@@ -128,12 +129,6 @@ fn drop_index_reserved_name_rejected() {
     assert!(
         matches!(e_reserved, GnitzSqlError::Plan(_)),
         "reserved-prefix DROP INDEX name must be a Plan error, got {e_reserved:?}"
-    );
-    // The `__fk_` infix — reserved for FK-backing index names — is rejected too.
-    let e_fk = try_exec(&mut client, &sn, "DROP INDEX \"x__fk_y\"").unwrap_err();
-    assert!(
-        matches!(e_fk, GnitzSqlError::Plan(_)),
-        "reserved `__fk_` infix in DROP INDEX must be a Plan error, got {e_fk:?}"
     );
 }
 

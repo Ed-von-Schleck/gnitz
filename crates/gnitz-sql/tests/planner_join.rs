@@ -1188,10 +1188,9 @@ fn test_outer_range_where_circuit_shape() {
 
 /// Chain column pruning, pinned at the segment level. A 3-way join whose 2nd ON
 /// references a leftmost-table column (`a.v`) absent from the final projection: that
-/// column is RETAINED in the hidden segment `h0 = a ⋈ b` (a later ON needs it), while
-/// `a`'s dead column and `b`'s columns are pruned out. Resolve `h0` by
-/// `hidden_view_name(final_vid, 0)` and assert its registered schema is exactly the
-/// live set.
+/// column is RETAINED in the internal segment `h0 = a ⋈ b` (a later ON needs it),
+/// while `a`'s dead column and `b`'s columns are pruned out. Resolve `h0` by
+/// `segment_name` and assert its registered schema is exactly the live set.
 #[test]
 fn test_chain_segment_pruned_to_live_columns() {
     let srv = match ServerHandle::start() {
@@ -1217,7 +1216,9 @@ fn test_chain_segment_pruned_to_live_columns() {
         .unwrap();
     }
     let final_vid = client.resolve_table_or_view_id(&sn, "v").unwrap().0;
-    let h0_name = gnitz_core::hidden_view_name(final_vid, 0);
+    // One bundle, one contiguous id run, the user-named view last — so the sole
+    // segment took the id below `v`'s, and its name is minted from that id.
+    let h0_name = gnitz_core::segment_name(final_vid - 1);
     let (_h0_id, h0_schema) = client.resolve_table_or_view_id(&sn, &h0_name).unwrap();
 
     let names: Vec<&str> = h0_schema.columns.iter().map(|c| c.name.as_str()).collect();

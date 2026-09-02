@@ -5,10 +5,10 @@ use crate::{
     CIRCNODES_PAY_OPCODE, CIRCNODES_PAY_SOURCE_TABLE, CIRCUIT_EDGES_COLS, CIRCUIT_NODES_COLS,
     CIRCUIT_NODE_COLUMNS_COLS, COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN,
     COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND,
-    COLTAB_PAY_TYPE_CODE, COL_TAB_COLS, IDXTAB_PAY_IS_UNIQUE, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID,
-    IDXTAB_PAY_SOURCE_COLS, IDX_TAB_COLS, SCHEMA_TAB_COLS, TABLE_TAB_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_NAME,
-    TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_NAME,
-    VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_SQL, VIEW_TAB_COLS,
+    COLTAB_PAY_TYPE_CODE, COL_TAB_COLS, IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
+    IDX_TAB_COLS, SCHEMA_TAB_COLS, TABLE_TAB_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_NAME, TABTAB_PAY_PK_COL_IDX,
+    TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_NAME, VIEWTAB_PAY_OWNER_VIEW_ID,
+    VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID, VIEW_TAB_COLS,
 };
 
 /// A sink that records what a writer emitted, so the tests below read the
@@ -123,7 +123,7 @@ fn values_land_in_their_named_payload_slots() {
             owner_id: 16,
             source_col_idx: 9,
             name: "idx_t_b",
-            is_unique: 1,
+            flags: 3,
         },
         1,
     );
@@ -132,7 +132,7 @@ fn values_land_in_their_named_payload_slots() {
     assert_eq!(v[IDXTAB_PAY_OWNER_ID], Val::U64(16));
     assert_eq!(v[IDXTAB_PAY_SOURCE_COLS], Val::U64(9));
     assert_eq!(v[IDXTAB_PAY_NAME], Val::Str("idx_t_b".into()));
-    assert_eq!(v[IDXTAB_PAY_IS_UNIQUE], Val::U64(1));
+    assert_eq!(v[IDXTAB_PAY_FLAGS], Val::U64(3));
 
     // Distinct values per field, so a transposed pair in the writer body
     // fails here rather than round-tripping unnoticed.
@@ -162,10 +162,10 @@ fn values_land_in_their_named_payload_slots() {
             view_id: 20,
             schema_id: 4,
             name: "v",
-            sql_definition: "SELECT 1",
             pk_col_idx: 6,
             capacity_bytes: 4096,
             delta_bytes: 1 << 20,
+            owner_view_id: 21,
         },
         1,
     );
@@ -173,10 +173,10 @@ fn values_land_in_their_named_payload_slots() {
     let v = r.row(VIEW_TAB_COLS, 1);
     assert_eq!(v[VIEWTAB_PAY_SCHEMA_ID], Val::U64(4));
     assert_eq!(v[VIEWTAB_PAY_NAME], Val::Str("v".into()));
-    assert_eq!(v[VIEWTAB_PAY_SQL], Val::Str("SELECT 1".into()));
     assert_eq!(v[VIEWTAB_PAY_PK_COL_IDX], Val::U64(6));
     assert_eq!(v[VIEWTAB_PAY_CAPACITY], Val::U64(4096));
     assert_eq!(v[VIEWTAB_PAY_DELTA], Val::U64(1 << 20));
+    assert_eq!(v[VIEWTAB_PAY_OWNER_VIEW_ID], Val::U64(21));
 
     let mut r = Recorder::default();
     write_schema_tab_row(

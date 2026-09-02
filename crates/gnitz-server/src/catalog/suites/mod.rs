@@ -57,9 +57,9 @@ fn count_records(mut c: ReadCursor) -> usize {
 
 /// A single-row unbounded-VIEW_TAB batch for tests that register a view via the
 /// raw system-table path.
-fn build_view_tab_row(vid: i64, view_name: &str, sql: &str) -> Batch {
+fn build_view_tab_row(vid: i64, view_name: &str) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
-    push_view_tab_row(&mut bb, 1, vid, view_name, sql, 0, 0);
+    push_view_tab_row(&mut bb, 1, vid, view_name, 0, 0, 0);
     bb.finish()
 }
 

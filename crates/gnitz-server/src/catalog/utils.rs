@@ -1,9 +1,11 @@
 use super::*;
 
-/// The name an FK auto-index is created under. `FK_INDEX_INFIX` lives in
-/// `gnitz-wire`, shared with the SQL planner.
-pub(in crate::catalog) fn make_fk_index_name(schema_name: &str, table_name: &str, col_name: &str) -> String {
-    format!("{schema_name}__{table_name}{FK_INDEX_INFIX}{col_name}")
+/// The name an FK auto-index is created under. **Injective**, which the minting
+/// site's `index_by_name` skip needs to be exact — an interpolated name is not,
+/// and a collision there silently skips creating the second FK's index. The
+/// leading `_` keeps it unspellable at every user surface.
+pub(in crate::catalog) fn make_fk_index_name(table_id: i64, col_idx: usize) -> String {
+    format!("_fk_{table_id}_{col_idx}")
 }
 
 // ---------------------------------------------------------------------------

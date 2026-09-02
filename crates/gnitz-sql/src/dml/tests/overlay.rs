@@ -23,8 +23,11 @@ fn del(schema: &Schema, pk: u128) -> ZSetBatch {
 
 /// The full net map, straight off a buffer (the client-free half of
 /// `buffered_all`).
-fn net_of(buf: &TxnBuffer, tid: u64) -> Net<'_> {
-    buf.last_ops(tid).map(|(pk, b, row)| (pk, op_of(b, row))).collect()
+fn net_of(buf: &mut TxnBuffer, tid: u64) -> Net<'_> {
+    buf.reads(tid)
+        .last_ops()
+        .map(|(pk, b, row)| (pk, op_of(b, row)))
+        .collect()
 }
 
 fn val_of(net: &Net, pk: u128) -> Option<i64> {
@@ -75,7 +78,7 @@ fn net_folds_last_op_per_pk() {
     // Delete pk=2 [coalesces with the Update family above].
     buf.push(tid, &schema, del(&schema, 2), WireConflictMode::Update);
 
-    let net = net_of(&buf, tid);
+    let net = net_of(&mut buf, tid);
     assert_eq!(net.len(), 2);
     assert_eq!(val_of(&net, 1), Some(11), "pk=1 last op is the update");
     assert!(is_deleted(&net, 2), "pk=2 deleted");
@@ -89,7 +92,7 @@ fn net_delete_then_reinsert_is_present() {
     buf.push(tid, &schema, batch(&schema, &[(5, 50, 1)]), WireConflictMode::Error);
     buf.push(tid, &schema, del(&schema, 5), WireConflictMode::Update);
     buf.push(tid, &schema, batch(&schema, &[(5, 99, 1)]), WireConflictMode::Error);
-    let net = net_of(&buf, tid);
+    let net = net_of(&mut buf, tid);
     assert_eq!(
         val_of(&net, 5),
         Some(99),
@@ -105,7 +108,7 @@ fn net_scopes_by_tid_and_skips_zero_weight() {
     buf.push(2, &schema, batch(&schema, &[(2, 20, 1)]), WireConflictMode::Error);
     // w=0 contributes nothing
     buf.push(1, &schema, batch(&schema, &[(3, 30, 0)]), WireConflictMode::Update);
-    let net1 = net_of(&buf, 1);
+    let net1 = net_of(&mut buf, 1);
     assert_eq!(net1.len(), 1);
     assert_eq!(val_of(&net1, 1), Some(10));
     assert!(!net1.contains_key(&PkTuple::from_u128(8, 3)), "w=0 row skipped");
@@ -129,7 +132,7 @@ fn present_rows_keeps_overrides_and_born_rows_and_drops_tombstones() {
     buf.push(tid, &schema, del(&schema, 2), WireConflictMode::Update); // delete committed 2
     buf.push(tid, &schema, batch(&schema, &[(5, 50, 1)]), WireConflictMode::Update); // transaction-born
 
-    let present = present_rows(&net_of(&buf, tid), &schema);
+    let present = present_rows(&net_of(&mut buf, tid), &schema);
     assert_eq!(rows_of(&present), vec![(1, 99), (5, 50)]);
 }
 
@@ -147,12 +150,13 @@ fn net_restricted_to_keys_excludes_untouched_and_unlisted() {
 
     // A key-pinned bound restricts the net to the keys it names: restricting
     // to [1] leaves pk=2's buffered row out of the candidates entirely.
-    let full = net_of(&buf, tid);
+    let full_len = net_of(&mut buf, tid).len();
+    let reads = buf.reads(tid);
     let only_1: Net = [PkTuple::from_u128(8, 1)]
         .iter()
-        .filter_map(|pk| buf.last_op(tid, pk).map(|(b, r)| (*pk, op_of(b, r))))
+        .filter_map(|pk| reads.last_op(pk).map(|(b, r)| (*pk, op_of(b, r))))
         .collect();
-    assert_eq!(full.len(), 2);
+    assert_eq!(full_len, 2);
     assert_eq!(only_1.len(), 1);
     assert_eq!(rows_of(&present_rows(&only_1, &schema)), vec![(1, 11)]);
 }

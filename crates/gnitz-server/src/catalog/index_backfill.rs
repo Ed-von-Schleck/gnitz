@@ -259,8 +259,6 @@ impl CatalogEngine {
         let pk_cols = owner_schema.pk_indices();
         let col_defs = self.read_column_defs(table_id);
 
-        let (schema_name, table_name) = self.caches.entity_by_id.get(&table_id).cloned().unwrap_or_default();
-
         for (col_idx, cd) in col_defs.iter().enumerate() {
             if cd.fk_table_id == 0 {
                 continue;
@@ -270,7 +268,7 @@ impl CatalogEngine {
             if pk_cols.contains(&(col_idx as u32)) {
                 continue;
             }
-            let index_name = make_fk_index_name(&schema_name, &table_name, &cd.name);
+            let index_name = make_fk_index_name(table_id, col_idx);
             if self.caches.index_by_name.contains_key(&index_name) {
                 continue;
             }
@@ -280,8 +278,14 @@ impl CatalogEngine {
                 .map_err(|e| format!("index id allocation failed: {e}"))?;
 
             // Write index record to sys_indices (FK indices are not unique).
+            // `submit_local` bypasses the precheck, and is the only path allowed
+            // to set the internal bit.
             let packed_cols = gnitz_wire::pack_pk_cols(&[col_idx as u32]);
-            let batch = idx_tab_batch(index_id, table_id, packed_cols, &index_name, false, 1);
+            let props = gnitz_wire::IndexProps {
+                is_unique: false,
+                is_internal: true,
+            };
+            let batch = idx_tab_batch(index_id, table_id, packed_cols, &index_name, props, 1);
             // hook_cascade_fk fires on master and every worker, so each side
             // creates its own FK indices locally; submit_local applies + fires
             // hooks without a broadcast. submit would broadcast IDX_TAB before
@@ -292,7 +296,7 @@ impl CatalogEngine {
                 // reverse the storage write and any partial cache updates;
                 // otherwise the next boot's replay opens a missing index
                 // directory and crashes.
-                let undo = idx_tab_batch(index_id, table_id, packed_cols, &index_name, false, -1);
+                let undo = idx_tab_batch(index_id, table_id, packed_cols, &index_name, props, -1);
                 self.rollback_index_registration(undo, index_id)?;
                 return Err(e);
             }

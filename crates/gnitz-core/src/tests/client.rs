@@ -59,8 +59,9 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
         ]
     );
 
-    let op = |tid, pk: u64| {
-        buf.last_op(tid, &PkTuple::from_u128(8, pk as u128))
+    let mut op = |tid, pk: u64| {
+        buf.reads(tid)
+            .last_op(&PkTuple::from_u128(8, pk as u128))
             .map(|(b, row)| (b.weights[row], row))
     };
     assert_eq!(op(16, 1), Some((1, 0)), "the last of three ops on pk=1");
@@ -68,39 +69,76 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
     assert_eq!(op(16, 3), Some((1, 0)), "row 0 of the mode-split family");
     assert_eq!(op(16, 9), None, "an untouched PK");
     assert_eq!(op(17, 2), None, "another tid's PK");
-    assert_eq!(buf.last_ops(16).count(), 3);
+    assert_eq!(buf.reads(16).last_ops().count(), 3);
 }
 
-/// A corrupt catalog batch must surface as `Err`, never as the absent-row miss
-/// an honest lookup returns.
+/// The read-your-own-writes index is built on read, from a per-family
+/// watermark: a blind transaction builds none of it, and an interleaved
+/// read/write one folds each row exactly once however often it reads.
 #[test]
-fn catalog_lookups_separate_a_miss_from_a_decode_error() {
+fn the_overlay_index_is_built_on_read_and_only_once() {
+    let s = kv_schema();
+    let mut buf = TxnBuffer::default();
+    for pk in 1..=4u64 {
+        buf.push(16, &s, ins(&s, pk), WireConflictMode::Error);
+    }
+    assert_eq!(buf.indexed_rows(), 0, "a blind transaction indexes nothing");
+
+    assert_eq!(buf.reads(16).last_ops().count(), 4);
+    assert_eq!(buf.indexed_rows(), 4);
+    // A second read folds nothing further — the watermark already covers them.
+    assert_eq!(buf.reads(16).last_ops().count(), 4);
+    assert_eq!(buf.indexed_rows(), 4);
+
+    // A write after a read is picked up by the next read, and only it.
+    buf.push(16, &s, ins(&s, 9), WireConflictMode::Error);
+    assert_eq!(buf.indexed_rows(), 4, "the write itself indexes nothing");
+    assert_eq!(buf.reads(16).last_ops().count(), 5);
+    assert_eq!(buf.indexed_rows(), 5);
+
+    // An untouched relation is not indexed by another's read.
+    assert_eq!(buf.reads(17).last_ops().count(), 0);
+    assert_eq!(buf.indexed_rows(), 5);
+}
+
+/// The rename pair every catalog retraction is built from: a verbatim copy at
+/// `-1` reproduces the stored row in every column, and the `+1` differs only
+/// where `set_string_cell` patched it.
+#[test]
+fn a_copied_catalog_row_differs_only_where_it_is_patched() {
     let schema = sys_schema(TABLE_TAB);
-    let mut batch = ZSetBatch::new(schema);
+    let mut scanned = ZSetBatch::new(schema);
     gnitz_wire::sys_rows::write_table_tab_row(
-        &mut BatchAppender::new(&mut batch, schema),
+        &mut BatchAppender::new(&mut scanned, schema),
         &TableTabRow {
             table_id: 7,
             schema_id: 1,
             name: "t",
             pk_col_idx: 0,
-            flags: 0,
+            flags: 9,
         },
         1,
     );
-    assert_eq!(find_table_tab_row(&batch, 7).unwrap().map(|r| r.name), Some("t"));
-    assert!(find_table_tab_row(&batch, 8).unwrap().is_none(), "an absent tid");
+    let i = scanned.live_row_with_pk(7).expect("the row just written");
+    assert!(scanned.live_row_with_pk(8).is_none(), "an absent tid");
 
-    // Truncate the schema_id column (Fixed) so `col_u64` on the live row is out
-    // of bounds — a real decode error, which must not read as an absent name.
-    let ColData::Fixed(bytes) = &mut batch.columns[TABTAB_COL_SCHEMA_ID] else {
+    let mut pair = ZSetBatch::new(schema);
+    pair.copy_row_at(&scanned, i, -1, schema);
+    pair.copy_row_at(&scanned, i, 1, schema);
+    pair.set_string_cell(1, TABTAB_COL_NAME, "t2");
+
+    assert_eq!(pair.weights, vec![-1, 1]);
+    assert_eq!(pair.pks.to_vec_u128(), vec![7, 7], "the rename keeps the id");
+    assert_eq!(pair.nulls, vec![scanned.nulls[i]; 2]);
+    // Every non-name column is the stored row's, in both halves.
+    let ColData::Fixed(flags) = &pair.columns[gnitz_wire::TABTAB_COL_FLAGS] else {
         panic!("expected Fixed column");
     };
-    bytes.clear();
-    assert!(
-        matches!(find_table_tab_row(&batch, 7), Err(ClientError::ServerError(_))),
-        "a decode error must not be masked as a miss"
-    );
+    assert_eq!(flags[..], [9u64.to_le_bytes(), 9u64.to_le_bytes()].concat()[..]);
+    let ColData::Strings(names) = &pair.columns[TABTAB_COL_NAME] else {
+        panic!("expected Strings column");
+    };
+    assert_eq!(names, &[Some("t".to_string()), Some("t2".to_string())]);
 }
 
 #[test]

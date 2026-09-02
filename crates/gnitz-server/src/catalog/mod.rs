@@ -74,7 +74,6 @@ use sys_tables::*;
 pub(in crate::catalog) use apply_context::{ApplyContext, ApplyMode};
 pub(in crate::catalog) use cache::{CatalogCacheSet, SchemaWireEntry};
 pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
-pub(in crate::catalog) use gnitz_wire::FK_INDEX_INFIX;
 pub(in crate::catalog) use registry::raise_id_counter;
 // The child-directory grammar and the directory primitives are storage's; the
 // catalog only consumes them.

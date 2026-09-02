@@ -83,7 +83,7 @@ fn index_rows(owner_id: u64, rows: &[(u64, i64)]) -> ZSetBatch {
                 owner_id,
                 source_col_idx: gnitz_wire::pack_pk_cols(&[1]),
                 name: "ix",
-                is_unique: 0,
+                flags: 0,
             },
             weight,
         );
@@ -258,10 +258,12 @@ fn a_three_family_create_table_bundle_still_commits() {
     assert_eq!(desc.indexes.len(), 1);
 }
 
-/// An index name carrying the reserved FK infix would be undroppable, so the
-/// master refuses it whatever wrote it.
+/// An index flagged engine-internal is one `DROP INDEX` refuses, so a client
+/// that could set the flag could deny a name in the index namespace permanently
+/// from one frame. Only `submit_local` — the FK auto-index, which bypasses the
+/// precheck — may set it.
 #[test]
-fn an_index_name_carrying_the_reserved_fk_infix_is_refused() {
+fn a_wire_supplied_internal_index_flag_is_refused() {
     let Some(srv) = ServerHandle::start() else { return };
     let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
     client.create_schema("infix").unwrap();
@@ -283,13 +285,47 @@ fn an_index_name_carrying_the_reserved_fk_infix_is_refused() {
             index_id: iid,
             owner_id: tid,
             source_col_idx: gnitz_wire::pack_pk_cols(&[1]),
-            name: "t__fk_b",
-            is_unique: 0,
+            name: "forged",
+            flags: gnitz_wire::IndexProps {
+                is_unique: false,
+                is_internal: true,
+            }
+            .pack(),
         },
         1,
     );
     let err = format!("{:?}", s.push_ddl_txn(&[(IDX_TAB, b)]).unwrap_err());
-    assert!(err.contains("reserved"), "{err}");
+    assert!(err.contains("engine-internal"), "{err}");
+}
+
+/// A VIEW_TAB `+1` naming an `owner_view_id` no relation holds is refused: the
+/// drop cascade keys on that column, so a forged owner would point a cascade at
+/// nothing.
+#[test]
+fn a_wire_supplied_owner_view_id_must_name_a_real_view() {
+    let Some(srv) = ServerHandle::start() else { return };
+    let mut s = session(&srv);
+    let sid = s.alloc_schema_id().unwrap();
+    s.push_ddl_txn(&[(SCHEMA_TAB, schema_row(sid, "owned"))]).unwrap();
+
+    let vid = s.alloc_table_id().unwrap();
+    let view_s = sys_schema(gnitz_wire::VIEW_TAB);
+    let mut b = ZSetBatch::new(view_s);
+    gnitz_wire::sys_rows::write_view_tab_row(
+        &mut BatchAppender::new(&mut b, view_s),
+        &gnitz_wire::sys_rows::ViewTabRow {
+            view_id: vid,
+            schema_id: sid,
+            name: "seg",
+            pk_col_idx: 0,
+            capacity_bytes: 0,
+            delta_bytes: 0,
+            owner_view_id: 999_999,
+        },
+        1,
+    );
+    let err = format!("{:?}", s.push_ddl_txn(&[(gnitz_wire::VIEW_TAB, b)]).unwrap_err());
+    assert!(err.contains("owner_view_id"), "{err}");
 }
 
 /// An all-negative multi-family bundle is applied View → Table → Schema: a view
@@ -373,15 +409,15 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
         .unwrap();
     let first = client.create_view("mixed", "v", tid, &cols).unwrap();
 
-    let mut cb = gnitz_core::CircuitBuilder::new(0, tid);
+    let mut cb = gnitz_core::CircuitBuilder::new(tid);
     let scan = cb.input_delta();
     cb.sink(scan);
     let vids = client
         .create_view_chain(
             "mixed",
+            "v",
             vec![gnitz_core::PlannedView {
-                name: gnitz_core::ViewName::Named("v".to_string()),
-                sql_text: String::new(),
+                seg: 0,
                 circuit: cb.build(),
                 output_columns: cols.to_vec(),
                 pk_cols: vec![0],

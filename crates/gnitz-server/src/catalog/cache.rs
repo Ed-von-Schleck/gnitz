@@ -45,6 +45,10 @@ pub(in crate::catalog) struct CatalogCacheSet {
     pub(in crate::catalog) schema_version: FxHashMap<i64, u16>,
     pub(in crate::catalog) index_by_name: FxHashMap<String, i64>,
     pub(in crate::catalog) indices_by_owner: FxHashMap<i64, Vec<i64>>,
+    /// The internal chain segments each user view owns, from `VIEW_TAB`'s
+    /// `owner_view_id` — what the drop cascade retracts. Flat by construction,
+    /// so the cascade cannot recurse.
+    pub(in crate::catalog) segments_by_owner: FxHashMap<i64, Vec<i64>>,
     pub(in crate::catalog) fk_by_child: FxHashMap<i64, Vec<FkEdge>>,
     pub(in crate::catalog) fk_by_parent: FxHashMap<i64, Vec<FkEdge>>,
     /// Tables whose writes need the push lock, each with its materialized lock
@@ -56,9 +60,21 @@ pub(in crate::catalog) struct CatalogCacheSet {
     pub(in crate::catalog) needs_lock: FxHashMap<i64, Vec<i64>>,
 }
 
+/// Append `id` to the Vec at `key` unless it is already there — the shared
+/// register shape of the owner-indexed caches, and idempotent because the SAL
+/// dedupe filter under-dedupes by design while [`remove_where`] drops only the
+/// first match, so a duplicate would be permanent.
+fn insert_owned<K: Eq + std::hash::Hash>(map: &mut FxHashMap<K, Vec<i64>>, key: K, id: i64) {
+    let owned = map.entry(key).or_default();
+    if !owned.contains(&id) {
+        owned.push(id);
+    }
+}
+
 /// Remove the first element matching `pred` from the Vec at `key`, dropping
-/// the map entry once the Vec empties — the shared retract shape of the
-/// Vec-valued caches (`indices_by_owner`, `fk_by_child`, `fk_by_parent`).
+/// the map entry once the Vec empties — [`insert_owned`]'s inverse, and the
+/// shared retract shape of every Vec-valued cache (`indices_by_owner`,
+/// `segments_by_owner`, `fk_by_child`, `fk_by_parent`).
 fn remove_where<K: Eq + std::hash::Hash, V>(map: &mut FxHashMap<K, Vec<V>>, key: K, pred: impl Fn(&V) -> bool) {
     if let Entry::Occupied(mut e) = map.entry(key) {
         let items = e.get_mut();
@@ -133,7 +149,7 @@ impl CatalogEngine {
     /// Maintain `entity_by_qname` and `entity_by_id` from one pass over a
     /// TABLE_TAB or VIEW_TAB delta (the two families share the leading
     /// `(schema_id, name)` payload prefix).
-    pub(in crate::catalog) fn apply_entity_caches(&mut self, batch: &Batch) {
+    pub(in crate::catalog) fn apply_entity_caches(&mut self, family: SysFamily, batch: &Batch) {
         for i in 0..batch.len() {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
@@ -142,15 +158,17 @@ impl CatalogEngine {
                 let sid = batch.read_payload_u64(i, TABTAB_PAY_SCHEMA_ID) as i64;
                 let name = batch.read_payload_string(i, TABTAB_PAY_NAME);
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
-                let qualified = format!("{schema_name}.{name}");
+                let qualified = gnitz_wire::qualified_key(&schema_name, &name);
                 self.caches.entity_by_qname.insert(qualified, tid);
                 self.caches.entity_by_id.insert(tid, (schema_name, name));
+                self.apply_segment_owner(family, batch, i, tid, weight);
             } else {
+                self.apply_segment_owner(family, batch, i, tid, weight);
                 // Retract sequence, in this order: read the old name
                 // from entity_by_id → remove the qname → clear the per-table
                 // column caches → remove the id entry.
                 if let Some((sn, en)) = self.caches.entity_by_id.get(&tid) {
-                    let qualified = format!("{sn}.{en}");
+                    let qualified = gnitz_wire::qualified_key(sn, en);
                     self.caches.entity_by_qname.remove(&qualified);
                 }
                 // Entity dropped: clear per-table cache entries without bumping
@@ -205,6 +223,24 @@ impl CatalogEngine {
         }
     }
 
+    /// Maintain `segments_by_owner` from one VIEW_TAB row. A no-op for
+    /// TABLE_TAB, which shares `apply_entity_caches` but carries no owner
+    /// column.
+    fn apply_segment_owner(&mut self, family: SysFamily, batch: &Batch, i: usize, vid: i64, weight: i64) {
+        if family != SysFamily::View {
+            return;
+        }
+        let owner = batch.read_payload_u64(i, gnitz_wire::VIEWTAB_PAY_OWNER_VIEW_ID) as i64;
+        if owner == 0 {
+            return;
+        }
+        if weight > 0 {
+            insert_owned(&mut self.caches.segments_by_owner, owner, vid);
+        } else {
+            remove_where(&mut self.caches.segments_by_owner, owner, |&id| id == vid);
+        }
+    }
+
     /// Maintain `index_by_name` and `indices_by_owner` from one pass over an
     /// IDX_TAB delta — both key off the same row and share their lifecycle.
     pub(in crate::catalog) fn apply_index_caches(&mut self, batch: &Batch) {
@@ -216,13 +252,7 @@ impl CatalogEngine {
 
             if weight > 0 {
                 self.caches.index_by_name.insert(name, idx_id);
-                // Idempotent under a re-applied `+1`, like its two siblings: the
-                // SAL dedupe filter under-dedupes by design and `remove_where`
-                // drops only the first match, so a duplicate would be permanent.
-                let owned = self.caches.indices_by_owner.entry(owner_id).or_default();
-                if !owned.contains(&idx_id) {
-                    owned.push(idx_id);
-                }
+                insert_owned(&mut self.caches.indices_by_owner, owner_id, idx_id);
             } else {
                 self.caches.index_by_name.remove(&name);
                 remove_where(&mut self.caches.indices_by_owner, owner_id, |&id| id == idx_id);

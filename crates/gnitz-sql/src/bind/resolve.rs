@@ -115,11 +115,11 @@ impl<'a> Binder<'a> {
         }
         // Referenced relations obey the same reserved-prefix rule as created
         // ones: a fresh catalog probe of a leading-`_` name can only be a user
-        // naming internal plumbing (a hidden chain segment `__h{vid}_{idx}`), and
-        // honoring it leaks a dependency that makes the owner view undroppable.
-        // Placed after the cache check — every cached name passed the same rule
-        // on insert (`cache_alias` validates; `cache_relation` is fed from these
-        // already-validated probes), never a raw `__h…` catalog name.
+        // naming internal plumbing (a chain segment), and honoring it leaks a
+        // dependency that makes the owner view undroppable. Placed after the
+        // cache check — every cached name passed the same rule on insert
+        // (`cache_alias` validates; `cache_relation` is fed from these
+        // already-validated probes), never a raw internal catalog name.
         crate::validate::validate_user_name(name)?;
         let rel = cat
             .get(self.schema_name, name)

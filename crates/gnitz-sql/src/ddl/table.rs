@@ -139,7 +139,7 @@ fn resolve_fk_target_inline(
     // A column referencing itself is a tautology every row satisfies by
     // construction, and it has no index to validate against: the referenced
     // column is the lone PK, so the child column would be a PK column too, and
-    // the auto-created `__fk_` index skips PK columns (the PK region already
+    // the FK auto-index skips PK columns (the PK region already
     // stores them). Every parent delete would then fail on a missing child
     // index. Rejecting it keeps the self-FK column non-PK and its index present.
     if ref_col_idx == fk_col_idx {
@@ -603,9 +603,9 @@ pub(crate) fn execute_drop(
                 client.drop_view(schema_name, &name)?;
             }
             ObjectType::Index => {
-                // Mirror CREATE INDEX's name rule (reserved prefix + `__fk_`
-                // infix): a clearer planner-side error, one fewer round-trip —
-                // the engine's own FK-index drop refusal stays the backstop.
+                // Mirror CREATE INDEX's name rule: a clearer planner-side
+                // error, one fewer round-trip — the engine's own internal-index
+                // drop refusal stays the backstop.
                 validate_user_index_name(&name)?;
                 // Plain DROP INDEX drops loudly (like DROP TABLE/VIEW); only
                 // ALTER TABLE ... DROP CONSTRAINT IF EXISTS passes `true`.
@@ -659,8 +659,7 @@ pub(crate) fn create_index_core(
 ) -> Result<SqlResult, GnitzSqlError> {
     // A user-supplied index/constraint name flows through to the IDX_TAB row so
     // `DROP INDEX`/`DROP CONSTRAINT <name>` resolves it. Validate it before
-    // anything else: a malformed or `__fk_`-infixed name would persist and be
-    // undroppable.
+    // anything else: a malformed name would persist and be undroppable.
     if let Some(ref name) = explicit_name {
         validate_user_index_name(name)?;
     }

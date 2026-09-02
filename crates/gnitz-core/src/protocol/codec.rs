@@ -6,6 +6,8 @@
 use super::error::ProtocolError;
 use super::types::{type_code_from_u64, ColumnDef, Schema};
 use gnitz_wire::schema_block::{SchemaBlock, SchemaBlockCol};
+use std::sync::Arc;
+
 use gnitz_wire::{col_meta_hidden, col_meta_nullable, col_meta_serial, pack_col_meta_flags, PK_LIST_MAX_COLS};
 
 /// Encode the meta-schema WAL block for `schema` under table id `tid` — the
@@ -35,6 +37,32 @@ pub fn encode_schema_block(schema: &Schema, tid: u32) -> Vec<u8> {
         })
         .collect();
     gnitz_wire::schema_block::encode(tid, &cols)
+}
+
+/// A `SCAN_SPEC` reply schema together with the wire block that ships it, both
+/// a pure function of `(schema, target_id)`. A caller that repeats a read
+/// against one relation — a mirror poll — builds this once and pays neither the
+/// encode nor a schema clone per call.
+pub struct ReplySchema {
+    schema: Arc<Schema>,
+    block: Vec<u8>,
+}
+
+impl ReplySchema {
+    pub fn new(schema: Arc<Schema>, target_id: u64) -> Self {
+        let block = encode_schema_block(&schema, target_id as u32);
+        ReplySchema { schema, block }
+    }
+
+    /// The decode hint, cheap to hand to a pending slot.
+    pub(crate) fn schema(&self) -> Arc<Schema> {
+        Arc::clone(&self.schema)
+    }
+
+    /// The encoded block the request carries.
+    pub(crate) fn block(&self) -> &[u8] {
+        &self.block
+    }
 }
 
 /// Reconstruct a `Schema` from meta-schema block bytes.

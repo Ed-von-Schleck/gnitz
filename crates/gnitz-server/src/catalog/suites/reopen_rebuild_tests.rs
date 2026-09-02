@@ -380,7 +380,7 @@ fn checkpointed_traced_view(dir: &str) -> i64 {
     );
     engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();
     engine
-        .ingest_to_family(VIEW_TAB_ID, &build_view_tab_row(vid, "v_traced", "SELECT * FROM vbase"))
+        .ingest_to_family(VIEW_TAB_ID, &build_view_tab_row(vid, "v_traced"))
         .unwrap();
     assert!(
         engine.dag.ensure_compiled(&engine.registry, vid).unwrap(),

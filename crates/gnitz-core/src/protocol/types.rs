@@ -67,25 +67,6 @@ impl ColumnDef {
         }
     }
 
-    /// The column def of a *computed* projection item, from the expression's
-    /// nominal type. One home for the three rules every computed column obeys,
-    /// so the ad-hoc and CREATE VIEW binders (which each build their own
-    /// projection schema) cannot drift:
-    /// - `_expr{idx}` when the item has no alias;
-    /// - always nullable — an expression over a NOT NULL column can still be
-    ///   NULL (division by zero, an unmatched CASE);
-    /// - typed by the register image the engine's register sink stores whole, not the
-    ///   nominal type: `-f32col` computes in f64, so declaring the column `F32`
-    ///   would ship the low half of the double. STRING maps to itself, which
-    ///   `register_image` already accounts for.
-    pub fn computed(alias: Option<String>, idx: usize, nominal: TypeCode) -> Self {
-        Self::new(
-            alias.unwrap_or_else(|| format!("_expr{idx}")),
-            nominal.register_image(),
-            true,
-        )
-    }
-
     /// This column as the `COL_TAB` row recording it: column `col_idx` of
     /// `owner_id`, whose kind is `owner_kind`.
     ///
@@ -851,6 +832,28 @@ impl ZSetBatch {
             // is: its values live in the OPK region.
             .map(|(ci, col)| ColData::filled(col.type_code, if schema.is_pk_col(ci) { 0 } else { count }))
             .collect()
+    }
+
+    /// Append row `i` of `src` to `self` at `weight`, verbatim — so a `-1`
+    /// reproduces the stored row rather than relying on a decoder and an encoder
+    /// agreeing. `src` and `self` must both be built from `schema`.
+    pub fn copy_row_at(&mut self, src: &ZSetBatch, i: usize, weight: i64, schema: &Schema) {
+        self.pks.push_from(&src.pks, i);
+        self.weights.push(weight);
+        self.nulls.push(src.nulls[i]);
+        for (_pi, ci, def) in schema.payload_columns() {
+            src.columns[ci].push_row_from(i, def.type_code.wire_stride(), &mut self.columns[ci]);
+        }
+    }
+
+    /// Overwrite the STRING cell at `(row, ci)`. Addressable rather than
+    /// "patch the row I just pushed", so a caller that copied two rows can name
+    /// which one it means.
+    pub fn set_string_cell(&mut self, row: usize, ci: usize, v: &str) {
+        match &mut self.columns[ci] {
+            ColData::Strings(c) => c[row] = Some(v.to_string()),
+            _ => panic!("set_string_cell: column {ci} is not a Strings column"),
+        }
     }
 
     /// An empty batch with every growth stream sized for `n` rows: the PK

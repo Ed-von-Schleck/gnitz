@@ -194,9 +194,9 @@ impl CatalogEngine {
                 continue;
             };
             let (src, ri) = sr.source();
-            let (row_owner, row_cols, is_uniq) = read_idx_tab_row(src, ri);
+            let (row_owner, row_cols, props) = read_idx_tab_row(src, ri);
             if row_owner == owner_id && row_cols.as_slice() == cols {
-                f(idx_id, is_uniq);
+                f(idx_id, props.is_unique);
             }
         }
     }

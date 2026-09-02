@@ -20,15 +20,15 @@ fn a_mis_sized_promotion_target_list_is_refused() {
     CircuitBuilder::promotion_targets(&[2, 5], &[0]);
 }
 
-/// `base → seg → final` lowered with symbolic ids substitutes to the circuit
-/// inline real-id allocation would have produced, and leaves the base-table id
-/// alone — an id absent from the map passes through.
+/// `base → seg → final` lowered with a symbolic upstream substitutes to the
+/// circuit inline real-id allocation would have produced, and leaves the
+/// base-table id alone — an id absent from the map passes through.
 #[test]
 fn resolve_seg_ids_reproduces_inline_allocation() {
-    let (base, seg_real, final_real) = (100u64, 4096u64, 4097u64);
-    let (seg_a, seg_b) = (segment_id(0), segment_id(1));
-    let chain = |seg: u64, fin: u64| {
-        let mut cb = CircuitBuilder::new(fin, seg);
+    let (base, seg_real) = (100u64, 4096u64);
+    let seg_a = segment_id(0);
+    let chain = |seg: u64| {
+        let mut cb = CircuitBuilder::new(seg);
         let up = cb.input_delta_tagged(base);
         let inp = cb.input_delta();
         cb.sink(up);
@@ -36,34 +36,34 @@ fn resolve_seg_ids_reproduces_inline_allocation() {
         cb.build()
     };
 
-    let mut symbolic = chain(seg_a, seg_b);
-    let map = HashMap::from([(seg_a, seg_real), (seg_b, final_real)]);
-    symbolic.resolve_seg_ids(&map).expect("every tag is in the map");
+    let mut symbolic = chain(seg_a);
+    symbolic
+        .resolve_seg_ids(&HashMap::from([(seg_a, seg_real)]))
+        .expect("every tag is in the map");
 
-    let inline = chain(seg_real, final_real);
+    let inline = chain(seg_real);
     assert_eq!(symbolic, inline, "substitution must reproduce the inline circuit");
     assert_eq!(inline.dependencies(), vec![base, seg_real]);
 }
 
-/// A tag that survives the substitution is rejected, in `view_id` and in a
-/// `ScanDelta.source` alike, whether the map is empty or merely missing that
-/// one entry.
+/// A tag that survives the substitution is rejected, whether the map is empty
+/// or merely missing that one entry.
 #[test]
 fn resolve_seg_ids_rejects_a_surviving_tag() {
-    let tagged = |view: u64, source: u64| {
-        let mut cb = CircuitBuilder::new(view, 100);
+    let tagged = |source: u64| {
+        let mut cb = CircuitBuilder::new(100);
         let up = cb.input_delta_tagged(source);
         cb.sink(up);
         cb.build()
     };
     assert!(
-        tagged(segment_id(0), 100).resolve_seg_ids(&HashMap::new()).is_err(),
-        "tagged view_id"
+        tagged(segment_id(0)).resolve_seg_ids(&HashMap::new()).is_err(),
+        "an empty map resolves nothing"
     );
 
     // A tagged source absent from a non-empty map: the lowering path that mints
     // a segment id and forgets to register it.
-    let err = tagged(17, segment_id(7))
+    let err = tagged(segment_id(7))
         .resolve_seg_ids(&HashMap::from([(segment_id(0), 17u64)]))
         .expect_err("tagged source");
     assert!(

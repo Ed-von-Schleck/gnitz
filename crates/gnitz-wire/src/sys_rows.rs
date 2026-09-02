@@ -124,22 +124,24 @@ pub struct ViewTabRow<'a> {
     pub view_id: u64,
     pub schema_id: u64,
     pub name: &'a str,
-    pub sql_definition: &'a str,
     pub pk_col_idx: u64,
     /// `WITH (capacity = …)` in bytes; `0` is unbounded.
     pub capacity_bytes: u64,
     /// `WITH (delta = …)` in bytes; `0` is no delta feed.
     pub delta_bytes: u64,
+    /// The user view this row is an internal chain segment of; `0` is a user
+    /// view.
+    pub owner_view_id: u64,
 }
 
 pub fn write_view_tab_row(sink: &mut impl SysRowSink, r: &ViewTabRow, weight: i64) {
     sink.begin_row(&[r.view_id as u128], weight);
     sink.put_u64(r.schema_id);
     sink.put_string(r.name);
-    sink.put_string(r.sql_definition);
     sink.put_u64(r.pk_col_idx);
     sink.put_u64(r.capacity_bytes);
     sink.put_u64(r.delta_bytes);
+    sink.put_u64(r.owner_view_id);
     sink.end_row();
 }
 
@@ -150,14 +152,15 @@ pub fn write_view_tab_row(sink: &mut impl SysRowSink, r: &ViewTabRow, weight: i6
 /// One `IDX_TAB` row. `source_col_idx` carries `pack_pk_cols(&col_indices)` for
 /// every index, single- and multi-column alike.
 ///
-/// `is_unique` is the stored word, not a `bool`: a `-1` echoes back exactly what
-/// the reader gave it, and only a byte-equal payload cancels.
+/// `flags` is the packed word (`IndexProps::pack`), not a decoded struct: a
+/// `-1` echoes back exactly what the reader gave it, and only a byte-equal
+/// payload cancels.
 pub struct IdxTabRow<'a> {
     pub index_id: u64,
     pub owner_id: u64,
     pub source_col_idx: u64,
     pub name: &'a str,
-    pub is_unique: u64,
+    pub flags: u64,
 }
 
 pub fn write_idx_tab_row(sink: &mut impl SysRowSink, r: &IdxTabRow, weight: i64) {
@@ -165,7 +168,7 @@ pub fn write_idx_tab_row(sink: &mut impl SysRowSink, r: &IdxTabRow, weight: i64)
     sink.put_u64(r.owner_id);
     sink.put_u64(r.source_col_idx);
     sink.put_string(r.name);
-    sink.put_u64(r.is_unique);
+    sink.put_u64(r.flags);
     sink.end_row();
 }
 

@@ -46,12 +46,19 @@ fn resolve_reports_found_absent_and_missing_schema() {
     assert_eq!(schema.pk_cols, vec![0]);
 
     // Relation absent under a live schema: `Ok(None)` from the optional probe,
-    // and the "Table or view" wording from the erroring one.
+    // and the classified absence from the erroring one — the noun and the
+    // qualified name are carried, not formatted into a message a caller must
+    // match on.
     assert!(client.resolve(&sn, "nope").unwrap().is_none());
-    let err = client.resolve_relation(&sn, "nope").unwrap_err().to_string();
-    assert!(err.contains("Table or view") && err.contains("not found"), "got: {err}");
+    let err = client.resolve_relation(&sn, "nope").unwrap_err();
+    assert!(
+        matches!(&err, gnitz_core::ClientError::NotFound { noun, name }
+            if *noun == "table or view" && name == &format!("{sn}.nope")),
+        "got: {err:?}"
+    );
 
-    // Schema absent is an error on every entry point, with the schema's wording.
+    // A missing schema is the master's own error — the resolve never reaches a
+    // client-side catalog lookup.
     let err = client.resolve("no_such_schema", "t").unwrap_err().to_string();
     assert!(err.contains("Schema 'no_such_schema' not found"), "got: {err}");
 }
@@ -77,8 +84,11 @@ fn a_view_resolves_as_a_view_and_fails_the_base_table_probe() {
     );
     assert_eq!(client.resolve(&sn, "v").unwrap().map(|d| d.tid), Some(rel.tid));
 
-    let err = client.resolve_table_id(&sn, "v").unwrap_err().to_string();
-    assert!(err.contains("Table") && err.contains("not found"), "got: {err}");
+    let err = client.resolve_table_id(&sn, "v").unwrap_err();
+    assert!(
+        matches!(&err, gnitz_core::ClientError::NotFound { noun, .. } if *noun == "table"),
+        "got: {err:?}"
+    );
 
     // …and the SQL layer's ladder turns that miss into the precise error.
     assert_rejects_variant(
@@ -677,8 +687,9 @@ fn alter_rename_column_rejects_a_view_at_the_gateway() {
     );
     exec(&mut client, &sn, "CREATE VIEW vw AS SELECT id, v FROM t");
 
+    let vid = client.resolve_table_or_view_id(&sn, "vw").unwrap().0;
     let err = client
-        .alter_rename_column(&sn, "vw", "v", "w")
+        .alter_rename_column(vid, 1, "w")
         .expect_err("a view is not a base table")
         .to_string();
     assert!(err.contains("requires a base table"), "got: {err}");

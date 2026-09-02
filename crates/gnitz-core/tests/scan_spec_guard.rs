@@ -22,7 +22,8 @@ fn scan_spec_at_a_system_tid_is_rejected_and_the_connection_survives() {
 
     // `handle_scan_spec` rejects the system tid at the verb, before a single
     // worker is dispatched — so the reply schema below is never consulted.
-    let reply_schema = Schema::from_parts(vec![ColumnDef::new("k", TypeCode::U64, false)], vec![0]).unwrap();
+    let reply_schema =
+        std::sync::Arc::new(Schema::from_parts(vec![ColumnDef::new("k", TypeCode::U64, false)], vec![0]).unwrap());
     let err = client
         .scan_spec(TABLE_TAB, &spec, &reply_schema)
         .expect_err("a ReadSpec at a system tid must be rejected");

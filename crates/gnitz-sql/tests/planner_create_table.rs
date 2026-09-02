@@ -1,6 +1,6 @@
 #![cfg(feature = "integration")]
 
-use gnitz_core::{GnitzClient, PlannedView, TableProps, TypeCode, ViewName};
+use gnitz_core::{GnitzClient, PlannedView, TableProps, TypeCode};
 use gnitz_sql::{GnitzSqlError, SqlPlanner};
 use gnitz_test_harness::ServerHandle;
 
@@ -547,8 +547,7 @@ fn test_create_view_with_nullable_first_column_rejected() {
 
     // Manually construct a SCAN→SINK circuit and try to register a view whose
     // first output column is nullable.
-    let vid = client.alloc_table_id().unwrap();
-    let mut cb = CircuitBuilder::new(vid, src_tid);
+    let mut cb = CircuitBuilder::new(src_tid);
     let scan = cb.input_delta();
     cb.sink(scan);
     let circuit = cb.build();
@@ -560,9 +559,9 @@ fn test_create_view_with_nullable_first_column_rejected() {
     let err = client
         .create_view_chain(
             &sn,
+            "bad_view",
             vec![PlannedView {
-                name: ViewName::Named("bad_view".to_string()),
-                sql_text: String::new(),
+                seg: 0,
                 circuit,
                 output_columns: bad_out,
                 pk_cols: vec![0],
@@ -976,40 +975,17 @@ fn test_self_ref_fk_before_inline_pk() {
 }
 
 #[test]
-fn test_reserved_fk_infix_constraint_name_rejected() {
+fn a_constraint_name_carrying_the_old_fk_infix_is_now_legal() {
     let srv = match ServerHandle::start() {
         Some(s) => s,
         None => return,
     };
     let (mut client, sn) = make_planner(&srv);
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = p
-        .execute("CREATE TABLE ur (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT my__fk_thing UNIQUE(a))")
-        .unwrap_err();
-    match err {
-        GnitzSqlError::Plan(s) => assert!(s.contains("reserved '__fk_' infix"), "got: {}", s),
-        e => panic!("expected Plan, got {:?}", e),
-    }
-}
-
-#[test]
-fn test_reserved_fk_infix_mixed_case_constraint_name_rejected() {
-    let srv = match ServerHandle::start() {
-        Some(s) => s,
-        None => return,
-    };
-    let (mut client, sn) = make_planner(&srv);
-    let mut p = SqlPlanner::new(&mut client, &sn);
-    // A mixed-case `__FK_` infix must also be rejected: names are canonicalized to
-    // lowercase at store time, so `my__FK_thing` would otherwise persist as the
-    // reserved `my__fk_thing` and become an undroppable index.
-    let err = p
-        .execute("CREATE TABLE ur (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT my__FK_thing UNIQUE(a))")
-        .unwrap_err();
-    match err {
-        GnitzSqlError::Plan(s) => assert!(s.contains("reserved '__fk_' infix"), "got: {}", s),
-        e => panic!("expected Plan, got {:?}", e),
-    }
+    // No longer reserved: the constraint name is stored and droppable as-is.
+    p.execute("CREATE TABLE ur (id BIGINT PRIMARY KEY, a BIGINT, CONSTRAINT my__fk_thing UNIQUE(a))")
+        .unwrap();
+    p.execute("DROP INDEX my__fk_thing").unwrap();
 }
 
 #[test]
@@ -1106,11 +1082,9 @@ fn test_create_index_reserved_infix_rejected() {
             .unwrap();
     }
     let mut p = SqlPlanner::new(&mut client, &sn);
-    let err = p.execute("CREATE INDEX my__fk_thing ON ri(col)").unwrap_err();
-    match err {
-        GnitzSqlError::Plan(s) => assert!(s.contains("reserved '__fk_' infix"), "got: {}", s),
-        e => panic!("expected Plan, got {:?}", e),
-    }
+    // No longer reserved: an internal index is flagged, not named.
+    p.execute("CREATE INDEX my__fk_thing ON ri(col)").unwrap();
+    p.execute("DROP INDEX my__fk_thing").unwrap();
 }
 
 #[test]
@@ -1238,13 +1212,12 @@ fn inline_unique_over_the_index_arity_limit_is_rejected_before_dispatch() {
     }
 }
 
-/// The `__fk_` infix is reserved for internal FK-backing index names, which
-/// `drop_index` identifies by substring. A user identifier carrying it is a trap:
-/// the auto index name interpolates it (`{schema}__{table}__idx_{cols}`) and the
-/// resulting index is undroppable by planner and engine alike. The contract is
-/// enforced on every user identifier, not just an explicit index name.
+/// `__fk_` is no longer reserved anywhere: an internal FK index is identified by
+/// a flag bit on its catalog row and named from ids, so nothing interpolates a
+/// user name into a reserved shape. Every identifier that carried the infix —
+/// table, column, view, index — is legal again, on every surface that mints one.
 #[test]
-fn fk_infix_is_rejected_in_every_user_identifier() {
+fn the_fk_infix_is_reserved_nowhere() {
     let srv = match ServerHandle::start() {
         Some(s) => s,
         None => return,
@@ -1253,35 +1226,15 @@ fn fk_infix_is_rejected_in_every_user_identifier() {
     for sql in [
         "CREATE TABLE a__fk_b (id BIGINT PRIMARY KEY, x BIGINT)",
         "CREATE TABLE ok1 (id BIGINT PRIMARY KEY, a__fk_b BIGINT)",
-        "CREATE VIEW v__fk_w AS SELECT 1",
-        // Mixed case: names are canonicalized at store time, so the guard must
-        // read the lowercase form or `x__FK_y` lands as the reserved `x__fk_y`.
-        "CREATE TABLE a__FK_b (id BIGINT PRIMARY KEY, x BIGINT)",
+        "CREATE VIEW v__fk_w AS SELECT x FROM a__fk_b",
     ] {
-        let e = try_exec(&mut client, &sn, sql).unwrap_err();
-        assert!(
-            format!("{e:?}").contains("__fk_"),
-            "`{sql}` must be rejected for the reserved infix, got {e:?}"
-        );
+        exec(&mut client, &sn, sql);
     }
     // The ALTER surfaces mint column names too.
     exec(&mut client, &sn, "CREATE TABLE alt (id BIGINT PRIMARY KEY, a BIGINT)");
-    for sql in [
-        "ALTER TABLE alt ADD COLUMN c__fk_d BIGINT",
-        "ALTER TABLE alt RENAME COLUMN a TO c__fk_d",
-    ] {
-        let e = try_exec(&mut client, &sn, sql).unwrap_err();
-        assert!(
-            format!("{e:?}").contains("__fk_"),
-            "`{sql}` must be rejected for the reserved infix, got {e:?}"
-        );
-    }
-    // Names that merely resemble it stay legal.
-    exec(
-        &mut client,
-        &sn,
-        "CREATE TABLE fkb (id BIGINT PRIMARY KEY, fk_x BIGINT, x_fk BIGINT)",
-    );
-    exec(&mut client, &sn, "CREATE INDEX ON fkb (x_fk)");
-    exec(&mut client, &sn, &format!("DROP INDEX {sn}__fkb__idx_x_fk"));
+    exec(&mut client, &sn, "ALTER TABLE alt ADD COLUMN c__fk_d BIGINT");
+    exec(&mut client, &sn, "ALTER TABLE alt RENAME COLUMN a TO e__fk_f");
+    // And an index over such a column is droppable under its interpolated name.
+    exec(&mut client, &sn, "CREATE INDEX ON alt (c__fk_d)");
+    exec(&mut client, &sn, &format!("DROP INDEX {sn}__alt__idx_c__fk_d"));
 }

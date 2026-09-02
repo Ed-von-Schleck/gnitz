@@ -251,6 +251,20 @@ class TestPushViewTargetRejected:
         with pytest.raises(gnitz.GnitzError, match="not found"):
             client.push(99999999, batch)
 
+    def test_absent_relation_raises_the_not_found_class(self, client):
+        """A relation the client itself could not resolve raises a catchable
+        class, so a caller branches on absence without matching prose."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            with pytest.raises(gnitz.GnitzNotFoundError) as ei:
+                client.drop_table(sn, "nope")
+            assert f"{sn}.nope" in str(ei.value)
+            # Still a GnitzError, so an existing broad handler keeps working.
+            assert isinstance(ei.value, gnitz.GnitzError)
+        finally:
+            client.drop_schema(sn)
+
 
 # ---------------------------------------------------------------------------
 # Schema construction limits
@@ -285,9 +299,29 @@ class TestSchemaColumnLimit:
             gnitz.Schema(cols)
 
 
+class TestCreateTableColumnNames:
+    def test_duplicate_column_name_rejected_at_the_client(self, client):
+        """The SQL layer rejects a duplicate at parse time, but `create_table`
+        is reachable without it and the engine precheck does not scan COL_TAB
+        for names — so a duplicate would land in storage and only surface later
+        as an ambiguous column reference."""
+        sn = "err" + _uid()
+        try:
+            client.create_schema(sn)
+            cols = [
+                gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+                gnitz.ColumnDef("a", gnitz.TypeCode.I64),
+                gnitz.ColumnDef("A", gnitz.TypeCode.I64),
+            ]
+            with pytest.raises(gnitz.GnitzError, match="duplicate column name"):
+                client.create_table(sn, "t", cols)
+        finally:
+            _cleanup(client, sn)
+
+
 # ---------------------------------------------------------------------------
 # Name reservation — user identifiers cannot start with `_` (reserved for the
-# system prefix and for synthesized hidden views `__h{vid}_{i}`). The SQL
+# system prefix and for the engine's own internal relation names). The SQL
 # planner enforces this for CREATE/DROP TABLE and VIEW; the client enforces it
 # for create_schema (no SQL surface). This is the single production gate.
 # ---------------------------------------------------------------------------

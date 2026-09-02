@@ -25,6 +25,7 @@ from _uid import uid as _uid
 
 OPCODE_EXCHANGE_SHARD = 20
 CIRCUIT_NODES_TAB = 11
+VIEW_TAB = 3
 
 
 
@@ -55,6 +56,18 @@ def _weights(client, sn, view, cols):
         key = tuple(d[c] for c in cols)
         m[key] = m.get(key, 0) + r.weight
     return m
+
+
+def _sole_segment_vid(client, owner_vid):
+    """The vid of the one internal chain segment `owner_vid` owns.
+
+    Read off VIEW_TAB's ownership column — the same thing the engine's drop
+    cascade keys on — so nothing here assumes how the ids were allocated.
+    """
+    segs = [r["view_id"] for r in client.scan(VIEW_TAB)
+            if r["owner_view_id"] == owner_vid]
+    assert len(segs) == 1, f"expected exactly one segment, got {segs}"
+    return segs[0]
 
 
 def _has_exchange_shard(client, vid):
@@ -102,7 +115,7 @@ def test_bfseg_linear_over_grouped_cte(client):
         # reduce needs. An `ExchangeShard` here would be a cluster-wide IPC
         # barrier on every epoch, paid solely to order the backfill.
         vid = client.resolve_table(sn_d, "s")[0]
-        seg_vid = client.resolve_table(sn_d, f"__h{vid}_0")[0]
+        seg_vid = _sole_segment_vid(client, vid)
         assert not _has_exchange_shard(client, vid), \
             "a linear view over a grouped CTE must not be sharded to order its backfill"
         assert _has_exchange_shard(client, seg_vid), \
