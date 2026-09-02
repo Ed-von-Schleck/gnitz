@@ -124,7 +124,7 @@ fn a_checkpoint_bumps_the_generation_once_and_restamps_at_it() {
     let disp = test_dispatcher(Vec::new(), &mut engine);
     // Epoch 0 is the empty-slot sentinel, so the region needs a boot reset
     // before any group is written — what `server_main` does after worker ACKs.
-    disp.rewind_sal(1);
+    disp.boot_rewind_sal(0);
 
     let gen = disp.cat().durable_generation();
     assert_eq!(

@@ -234,7 +234,7 @@ fn commit_sentinel_round_trip() {
     let mut cursor = 0u64;
     let mut seen = Vec::new();
     while let SalStep::Group(msg, next) = view.read_at(cursor, EpochGate::Walk(1)) {
-        seen.push((msg.lsn, msg.kind, msg.txn_commit));
+        seen.push((msg.lsn, msg.kind, msg.mark == ZoneMark::Commit));
         cursor = next;
     }
     assert_eq!(
@@ -276,8 +276,10 @@ fn zone_two_groups_one_sentinel() {
     assert_eq!((m1.lsn, m2.lsn, m3.lsn), (zone_lsn, zone_lsn, zone_lsn));
     assert_eq!((m1.target_id, m2.target_id), (200, 201));
     assert_eq!((m1.kind, m2.kind), (SalMessageKind::Push, SalMessageKind::Push));
-    assert_eq!((m1.zone_start, m2.zone_start, m3.zone_start), (true, false, false));
-    assert_eq!((m1.txn_commit, m2.txn_commit, m3.txn_commit), (false, false, true));
+    assert_eq!(
+        (m1.mark, m2.mark, m3.mark),
+        (ZoneMark::Start, ZoneMark::Plain, ZoneMark::Commit)
+    );
     for w in 0..nw {
         assert!(m1.slot(w).is_some(), "first group has data for worker {w}");
         assert!(m2.slot(w).is_some(), "second group has data for worker {w}");
@@ -726,8 +728,7 @@ fn every_kind_and_framing_round_trips_through_the_flag_word() {
             log.try_write(0, 0, kind, mark, &[&[0u8; 8]]).expect("group fits");
             let msg = group_at(log.log(), 0);
             assert_eq!(msg.kind, kind, "kind {kind:?} under {mark:?}");
-            assert_eq!(msg.zone_start, mark == ZoneMark::Start, "{kind:?} under {mark:?}");
-            assert_eq!(msg.txn_commit, mark == ZoneMark::Commit, "{kind:?} under {mark:?}");
+            assert_eq!(msg.mark, mark, "{kind:?} under {mark:?}");
         }
     }
 }
@@ -751,7 +752,7 @@ fn the_live_path_parks_on_a_leftover_whose_prefix_epoch_was_raised() {
         let word = log.ptr() as *mut u64;
         *word = (*word & 0xFFFF_FFFF) | (2u64 << 32);
     }
-    let reader = unsafe { SalReader::new(log.ptr() as *const u8, 0, log.size, -1, 2) };
+    let reader = unsafe { SalReader::new(log.ptr() as *const u8, 0, log.size, -1, 1) };
     assert!(
         reader.next().is_none(),
         "a previous epoch's group must park, whatever its prefix claims"
@@ -788,11 +789,11 @@ fn the_live_path_aborts_on_a_damaged_header_internal() {
     let log = TestLog::new(1 << 20, 1, 1);
     log.write(7, 11, SalMessageKind::Scan, &[&[0u8; 32]]);
     // A sanity read before the damage, so the abort below is the damage.
-    let reader = unsafe { SalReader::new(log.ptr() as *const u8, 0, log.size, -1, 1) };
+    let reader = unsafe { SalReader::new(log.ptr() as *const u8, 0, log.size, -1, 0) };
     assert!(reader.next().is_some());
     unsafe { *log.ptr().add(8) ^= 1 };
 
-    let reader = unsafe { SalReader::new(log.ptr() as *const u8, 0, log.size, -1, 1) };
+    let reader = unsafe { SalReader::new(log.ptr() as *const u8, 0, log.size, -1, 0) };
     let _ = reader.next();
     unreachable!("a damaged header on the live path must fail-stop, not park");
 }

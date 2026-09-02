@@ -324,7 +324,7 @@ fn next_sal_message_gates_on_the_epoch() {
     write(44, 102, SalMessageKind::Push, 2);
 
     let mut wp = make_test_worker(std::ptr::null_mut(), unsafe { std::mem::zeroed() });
-    wp.sal_reader = unsafe { SalReader::new(sal.ptr() as *const u8, 0, SAL_SIZE, -1, 1) };
+    wp.sal_reader = unsafe { SalReader::new(sal.ptr() as *const u8, 0, SAL_SIZE, -1, 0) };
 
     let next = |wp: &mut WorkerProcess| wp.next_sal_message().map(|m| (m.kind, m.target_id));
     assert_eq!(next(&mut wp), Some((SalMessageKind::Push, 42)));

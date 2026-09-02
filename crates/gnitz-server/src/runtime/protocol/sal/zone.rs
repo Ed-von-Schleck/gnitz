@@ -205,7 +205,7 @@ impl<'a> CommittedTail<'a> {
                 first_group_slots = Some(msg.slots());
             }
             let mine = open.as_ref().is_some_and(|z| z.lsn == msg.lsn);
-            if msg.txn_commit {
+            if msg.mark == ZoneMark::Commit {
                 // A damaged zone that did close is fatal once a *later* sentinel
                 // proves a committed zone is durable behind it; the log's last one
                 // is only demoted. Derived here rather than carried, so the message
@@ -247,7 +247,7 @@ impl<'a> CommittedTail<'a> {
                     ));
                 }
             }
-            if msg.zone_start {
+            if msg.mark == ZoneMark::Start {
                 open = Some(Zone {
                     lsn: msg.lsn,
                     start: msg.base,

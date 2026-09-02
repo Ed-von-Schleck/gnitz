@@ -122,11 +122,11 @@ impl MasterDispatcher {
         &self.sal_writer_excl
     }
 
-    /// The boot [`SalWriter::rewind`], to the same `live_epoch` the workers were
-    /// launched with. Sole caller is `server_main`, once every worker has
-    /// finished recovery.
-    pub fn rewind_sal(&self, epoch: u32) {
-        self.sal.rewind(epoch);
+    /// The boot [`SalWriter::boot_rewind`], above the same `walk_epoch` the
+    /// workers were launched with. Sole caller is `server_main`, once every
+    /// worker has finished recovery.
+    pub fn boot_rewind_sal(&self, walk_epoch: u32) {
+        self.sal.boot_rewind(walk_epoch);
     }
 
     /// `target_id`'s wire identity, off the catalog's cache: the block is built

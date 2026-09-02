@@ -390,7 +390,6 @@ fn run_worker_child(
     catalog_ptr: *mut CatalogEngine,
     ipc: &SharedIpc,
     walk_epoch: u32,
-    live_epoch: u32,
     placement: Option<&affinity::Placement>,
 ) -> ! {
     // Die immediately if the master exits for any reason. The `getppid` probe a
@@ -450,7 +449,7 @@ fn run_worker_child(
             w as u32,
             sal_mmap_size(),
             ipc.m2w_efds[w],
-            live_epoch,
+            walk_epoch,
         )
     };
     let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w]);
@@ -545,11 +544,6 @@ fn run_server(
     // The recovered walk epoch is this boot's floor, so a previous boot's
     // leftover always carries a strictly lower one than anything written now.
     let (walk_epoch, tail_slots) = recover_system_tables_from_sal(ipc.sal_ptr as *const u8, &mut catalog)?;
-    // One above it: what the master rewinds to and what every worker's live drain
-    // accepts. Bound once — were the two ever to disagree, every group would park
-    // as another epoch, the drain would end silently, and the committer would wait
-    // forever on an ACK.
-    let live_epoch = walk_epoch + 1;
     {
         // Abort before forking workers and long before the SAL reset: the
         // replayed DDL lives only in master memory until this flush makes it
@@ -633,7 +627,6 @@ fn run_server(
                 catalog_ptr,
                 &ipc,
                 walk_epoch,
-                live_epoch,
                 placement.as_ref(),
             ),
             pid => worker_pids.push(pid),
@@ -674,9 +667,9 @@ fn run_server(
         .collect_acks("recovery sync")
         .map_err(|e| format!("Error collecting worker acks: {e}"))?;
 
-    // Reset the SAL for fresh use, now that every worker has recovered. The same
-    // `live_epoch` the workers were launched with.
-    dispatcher.rewind_sal(live_epoch);
+    // Reset the SAL for fresh use, now that every worker has recovered, above the
+    // same `walk_epoch` the workers were launched with.
+    dispatcher.boot_rewind_sal(walk_epoch);
 
     inject_recovery_panic("reset");
 
