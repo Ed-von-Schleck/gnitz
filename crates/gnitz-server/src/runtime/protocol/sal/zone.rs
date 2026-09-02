@@ -106,6 +106,8 @@ pub(crate) struct CommittedTail<'a> {
     /// absent from the map has no store to recover into.
     family_lsns: &'a HashMap<i64, u64>,
     committed: HashSet<u64>,
+    /// The group at offset 0's slot count, recorded by pass 1's first step.
+    first_group_slots: Option<u32>,
 }
 
 impl<'a> CommittedTail<'a> {
@@ -122,9 +124,16 @@ impl<'a> CommittedTail<'a> {
             kind,
             family_lsns,
             committed: HashSet::new(),
+            first_group_slots: None,
         };
-        tail.committed = tail.collect_committed_lsns()?;
+        (tail.committed, tail.first_group_slots) = tail.collect_committed_lsns()?;
         Ok(tail)
+    }
+
+    /// The width the boot that wrote this tail sliced it at — the slot count of
+    /// the group at offset 0, `None` when nothing valid sits there.
+    pub(crate) fn first_group_slots(&self) -> Option<u32> {
+        self.first_group_slots
     }
 
     /// Whether this walk applies `msg`. The kind test comes first and is not a
@@ -154,7 +163,8 @@ impl<'a> CommittedTail<'a> {
         })
     }
 
-    /// Pass 1: the LSNs whose zone is both closed and intact.
+    /// Pass 1: the LSNs whose zone is both closed and intact, and the slot count
+    /// of the group at offset 0 (`None` when nothing valid sits there).
     ///
     /// A zone's byte span runs from its [`ZoneMark::Start`] group to its commit
     /// sentinel, and nothing else lives in it — a zone is written with no
@@ -173,10 +183,11 @@ impl<'a> CommittedTail<'a> {
     /// zone open lost its zone's *first* group, and a zone with a group after it but
     /// no sentinel lost its *sentinel* (an unclosed zone can only be the last thing
     /// in the log).
-    fn collect_committed_lsns(&self) -> Result<HashSet<u64>, String> {
+    fn collect_committed_lsns(&self) -> Result<(HashSet<u64>, Option<u32>), String> {
         let mut committed: HashSet<u64> = HashSet::new();
         let mut open: Option<Zone> = None;
         let mut last_closed: Option<Zone> = None;
+        let mut first_group_slots: Option<u32> = None;
 
         for step in self.log.walk(self.epoch) {
             let msg = match step {
@@ -188,6 +199,11 @@ impl<'a> CommittedTail<'a> {
                 }
                 WalkStep::Group(msg) => msg,
             };
+            // The walk starts at offset 0 and only advances, so this fires on the
+            // first group or not at all.
+            if msg.base == 0 {
+                first_group_slots = Some(msg.slots());
+            }
             let mine = open.as_ref().is_some_and(|z| z.lsn == msg.lsn);
             if msg.txn_commit {
                 // A damaged zone that did close is fatal once a *later* sentinel
@@ -245,7 +261,7 @@ impl<'a> CommittedTail<'a> {
                 committed.remove(&zone.lsn);
             }
         }
-        Ok(committed)
+        Ok((committed, first_group_slots))
     }
 
     /// Whether every block of `zone` that [`groups`](Self::groups) would yield

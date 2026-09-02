@@ -20,7 +20,7 @@ use crate::runtime::executor::ServerExecutor;
 use crate::runtime::m2w;
 use crate::runtime::master::MasterDispatcher;
 use crate::runtime::sal::zone::CommittedTail;
-use crate::runtime::sal::{sal_mmap_size, EpochGate, SalLog, SalMessageKind, SalReader, SalStep, SalWriter};
+use crate::runtime::sal::{sal_mmap_size, SalLog, SalMessage, SalMessageKind, SalReader, SalWriter};
 use crate::runtime::tls::{setup_tls_listener, TlsCli};
 use crate::runtime::w2m::{self, W2mReceiver, W2mWriter};
 use crate::runtime::wire as ipc;
@@ -42,13 +42,25 @@ fn boot_log(msg: &str) {
 // and differ only in which groups are theirs and what they do with the bytes.
 // ---------------------------------------------------------------------------
 
+/// Decode one committed group slot, failing the boot rather than skipping it:
+/// pass 1 demoted the last zone if it was torn, so a block that fails here has a
+/// durable committed zone behind it, and skipping it would lose an ACKed write.
+fn decode_group_slot(msg: &SalMessage, data: &[u8]) -> Result<ipc::DecodedWire, String> {
+    ipc::decode_wire(data).map_err(|e| {
+        format!(
+            "SAL replay: corrupt block at offset={} lsn={} target={}: {e}",
+            msg.base, msg.lsn, msg.target_id
+        )
+    })
+}
+
 /// Master pre-fork system-table replay. Builds the system-table family map from
 /// the flushed LSNs, then ingests every committed DdlSync batch addressed
 /// to a system table — orphan COL_TAB rows from a crashed DDL are skipped
 /// because their zone never closed.
 ///
-/// Returns the walk's epoch, which is the floor the next writer epoch and the
-/// workers' initial `expected_epoch` are taken from.
+/// Returns the walk's epoch — the floor the next writer epoch and the workers'
+/// initial `expected_epoch` are taken from — and the width the tail was written at.
 fn recover_system_tables_from_sal(
     sal_ptr: *const u8,
     catalog: &mut CatalogEngine,
@@ -66,18 +78,9 @@ fn recover_system_tables_from_sal(
     for msg in tail.groups() {
         // A system family broadcasts, so slot 0 carries the whole batch.
         let Some(data) = msg.slot(0) else { continue };
-        // Pass 1 already demoted the last zone if it was torn, so anything that
-        // fails here has a durable committed zone behind it — a hole, not a crash
-        // artifact. Dropping it silently would lose an ACKed, fdatasync'd DDL.
-        let decoded = ipc::decode_wire(data).map_err(|e| {
-            format!(
-                "SAL replay: corrupt block at offset={} lsn={} target={}: {e}",
-                msg.base, msg.lsn, msg.target_id
-            )
-        })?;
-        let batch = match decoded.data_batch {
-            Some(b) if !b.is_empty() => b,
-            _ => continue,
+        let decoded = decode_group_slot(&msg, data)?;
+        let Some(batch) = decoded.data_batch.filter(|b| !b.is_empty()) else {
+            continue;
         };
         // `ddl_sync`, not `ingest_to_family`: these rows are master-validated by
         // definition, and re-running the precheck would false-reject a replayed DROP
@@ -95,14 +98,7 @@ fn recover_system_tables_from_sal(
     if replayed > 0 {
         boot_log(&format!("SAL system table recovery: replayed {replayed} entries\n"));
     }
-    // The tail's slot count comes back with the epoch because this walk has
-    // already read the first group's header; the boot log names it, and no
-    // separate probe re-reads it.
-    let tail_slots = match log.read_at(0, EpochGate::Walk(epoch)) {
-        SalStep::Group(msg, _) => Some(msg.slots()),
-        _ => None,
-    };
-    Ok((epoch, tail_slots))
+    Ok((epoch, tail.first_group_slots()))
 }
 
 /// `GNITZ_INJECT_RECOVERY_PANIC=<stage>`: panic when recovery reaches the named
@@ -172,7 +168,6 @@ fn recover_from_sal(
         // digest. A tail-wide probe reads one header for all of them, and a torn
         // one picks the wrong mode — losing every slot above `rank`.
         let reslice = msg.slots() != num_workers;
-        let wanted = if reslice { 0..msg.slots() } else { rank..rank + 1 };
         let tid = msg.target_id as i64;
         // The catalog's schema, not the wire's: only the catalog stamps the
         // `replicated` bit the branch below reads. `SchemaDescriptor` is `Copy`, so
@@ -185,25 +180,18 @@ fn recover_from_sal(
         // would re-ingest the same rows and add their weights again. Never re-sliced
         // either — this worker needs the full copy, not a share of it.
         let replicated = schema.placement().is_replicated();
-        for (w, data) in msg.slots_written().filter(|(w, _)| wanted.contains(w)) {
-            // Keyed on the range, not on the first slot the iterator happens to
-            // yield, so a replicated group with an unwritten slot 0 cannot make
-            // this read a second copy.
-            if replicated && w != wanted.start {
+        let sliced = if reslice { 0..msg.slots() } else { rank..rank + 1 };
+        // A broadcast repeats one copy in every slot, so exactly one is read — and
+        // none at all when that slot went unwritten, which beats double-counting.
+        let wanted = if replicated {
+            sliced.start..sliced.start + 1
+        } else {
+            sliced
+        };
+        for (_, data) in msg.slots_written().filter(|(w, _)| wanted.contains(w)) {
+            let decoded = decode_group_slot(&msg, data)?;
+            let Some(mut batch) = decoded.data_batch.filter(|b| !b.is_empty()) else {
                 continue;
-            }
-            // Pass 1 demoted the last zone if it was torn, so a failure here has a
-            // durable committed zone behind it — a hole, not a crash artifact.
-            // Dropping it silently would lose an ACKed, fdatasync'd transaction.
-            let decoded = ipc::decode_wire(data).map_err(|e| {
-                format!(
-                    "SAL replay: corrupt block at offset={} lsn={} target={}: {e}",
-                    msg.base, msg.lsn, msg.target_id
-                )
-            })?;
-            let mut batch = match decoded.data_batch {
-                Some(b) if !b.is_empty() => b,
-                _ => continue,
             };
             // The one place an old-width batch enters the engine. A pre-ALTER
             // `Push` frame decodes against its own embedded schema block, but the
@@ -215,10 +203,9 @@ fn recover_from_sal(
             // is already shaped by the table schema. One site covers both.
             let in_schema = decoded
                 .schema
-                .as_ref()
                 .ok_or_else(|| format!("SAL replay: push frame carries no schema (lsn={})", msg.lsn))?;
             if in_schema.num_payload_cols() < schema.num_payload_cols() {
-                batch = batch.widened_with_null_tail(in_schema, &schema);
+                batch = batch.widened_with_null_tail(&in_schema, &schema);
             }
             let owned = if reslice && !replicated {
                 // Re-cut with the write path's own router, so what survives is exactly
