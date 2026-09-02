@@ -161,27 +161,14 @@ pub fn op_join_delta_trace(
         return Batch::empty_with_schema(out_schema);
     }
     let delta_mb = consolidated.as_mem_batch();
-    // Seeded at the delta size: exact for a 1:1 key match, a floor otherwise.
-    let mut output = Batch::with_capacity(*out_schema, n);
-    // One dedup cache for the whole join: a `D×T` key group re-appends each left
-    // payload `T` times and each right payload `D` times.
-    let mut cache = BlobCacheGuard::acquire(out_schema, n);
+    let mut writer = JoinRowWriter::open(left_schema, right_schema, out_schema, n);
 
     let mut emit = |rs: usize, re: usize, c: &ReadCursor| {
         let w_trace = c.current_weight;
         for i in rs..re {
             let w_out = delta_mb.get_weight(i).wrapping_mul(w_trace);
             if w_out != 0 {
-                write_join_row(
-                    &mut output,
-                    &delta_mb,
-                    i,
-                    c,
-                    w_out,
-                    left_schema,
-                    right_schema,
-                    &mut cache,
-                );
+                writer.write(&delta_mb, i, c, w_out);
             }
         }
     };
@@ -193,7 +180,7 @@ pub fn op_join_delta_trace(
         JoinProbe::Range(probe) => range_merge_walk(&delta_mb, cursor, probe, emit),
     }
 
-    output
+    writer.finish()
 }
 
 // ---------------------------------------------------------------------------
@@ -303,11 +290,11 @@ fn skip_to_group(delta: &MemBatch, eq_size: usize, from: usize, group: &[u8]) ->
 // The output schema
 // ---------------------------------------------------------------------------
 
-/// `left`'s PK, then both sides' payloads — the layout [`write_join_row`] below
+/// `left`'s PK, then both sides' payloads — the layout [`JoinRowWriter`] below
 /// writes, homed beside it because that writer derives the same layout
-/// independently (`extend_pk_bytes(left)`, then `append_payload_cols` at 0 and
-/// at `left_npc`). An outer join's null-fill columns are appended by the
-/// compiler's own null-extend builder, not here.
+/// independently, from the same `(left, right)` pair (`extend_pk_bytes(left)`,
+/// then `append_payload_cols` at 0 and at `left_npc`). An outer join's null-fill
+/// columns are appended by the compiler's own null-extend builder, not here.
 pub fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor) -> Option<SchemaDescriptor> {
     let mut b = DerivedSchema::new();
     b.push_pk_of(left)?;
@@ -321,45 +308,73 @@ pub fn merge_schemas_for_join(left: &SchemaDescriptor, right: &SchemaDescriptor)
 // The row writer
 // ---------------------------------------------------------------------------
 
-/// Write one composite join output row: `[left_PK, left_payload..., right_payload...]`.
-///
-/// Left columns come from the delta MemBatch, right columns from the cursor's
-/// current row — both halves through the shared, monomorphic
-/// `Batch::append_payload_cols` body (German-string blob relocation included).
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn write_join_row(
-    output: &mut Batch,
-    left_batch: &MemBatch,
-    left_row: usize,
-    right_cursor: &ReadCursor,
-    weight: i64,
-    left_schema: &SchemaDescriptor,
-    right_schema: &SchemaDescriptor,
-    cache: &mut BlobCacheGuard,
-) {
-    let left_null = left_batch.get_null_word(left_row);
-    let right_null = right_cursor.current_null_word;
+/// One join's output under construction: the batch, the blob dedup cache, and
+/// the two input schemas that fix the row layout `[left_PK, left_payload...,
+/// right_payload...]`. Opened from the same `(left, right)` pair
+/// [`merge_schemas_for_join`] derives `out_schema` from, so the schema and the
+/// rows written under it come from one input.
+struct JoinRowWriter<'s> {
+    output: Batch,
+    /// One dedup cache for the whole join: a `D×T` key group re-appends each left
+    /// payload `T` times and each right payload `D` times.
+    cache: BlobCacheGuard,
+    left_schema: &'s SchemaDescriptor,
+    right_schema: &'s SchemaDescriptor,
+    /// The left half's payload count: the right half's first payload slot, and
+    /// the bit the two null words are joined at.
+    left_npc: usize,
+}
 
-    let left_npc = left_schema.num_payload_cols();
-    let null_word = merge_null_words(left_null, right_null, left_npc);
+impl<'s> JoinRowWriter<'s> {
+    /// `rows` seeds the output capacity: exact for a 1:1 key match, a floor
+    /// otherwise.
+    fn open(
+        left_schema: &'s SchemaDescriptor,
+        right_schema: &'s SchemaDescriptor,
+        out_schema: &SchemaDescriptor,
+        rows: usize,
+    ) -> Self {
+        JoinRowWriter {
+            output: Batch::with_capacity(*out_schema, rows),
+            cache: BlobCacheGuard::acquire(out_schema, rows),
+            left_schema,
+            right_schema,
+            left_npc: left_schema.num_payload_cols(),
+        }
+    }
 
-    output.extend_pk_bytes(left_batch.get_pk_bytes(left_row));
-    output.extend_weight(&weight.to_le_bytes());
-    output.extend_null_bmp(&null_word.to_le_bytes());
+    /// Write one output row at `weight`: the left half from `left[left_row]`, the
+    /// right half from `right`'s current row — both through the shared,
+    /// monomorphic `Batch::append_payload_cols` body (German-string blob
+    /// relocation included).
+    #[inline]
+    fn write(&mut self, left: &MemBatch, left_row: usize, right: &ReadCursor, weight: i64) {
+        let left_null = left.get_null_word(left_row);
+        let right_null = right.current_null_word;
+        let null_word = merge_null_words(left_null, right_null, self.left_npc);
 
-    output.append_payload_cols(0, left_schema, left_batch, left_row, left_null, cache.get_mut());
-    let (right_src, right_row) = right_cursor.current_row_source();
-    output.append_payload_cols(
-        left_npc,
-        right_schema,
-        right_src,
-        right_row,
-        right_null,
-        cache.get_mut(),
-    );
+        let output = &mut self.output;
+        output.extend_pk_bytes(left.get_pk_bytes(left_row));
+        output.extend_weight(&weight.to_le_bytes());
+        output.extend_null_bmp(&null_word.to_le_bytes());
 
-    output.count += 1;
+        output.append_payload_cols(0, self.left_schema, left, left_row, left_null, self.cache.get_mut());
+        let (right_src, right_row) = right.current_row_source();
+        output.append_payload_cols(
+            self.left_npc,
+            self.right_schema,
+            right_src,
+            right_row,
+            right_null,
+            self.cache.get_mut(),
+        );
+
+        output.count += 1;
+    }
+
+    fn finish(self) -> Batch {
+        self.output
+    }
 }
 
 // ---------------------------------------------------------------------------
