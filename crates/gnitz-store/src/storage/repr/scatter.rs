@@ -120,10 +120,10 @@ pub fn batch_project_index(
 /// weight. Indices are NOT sorted — rows are written in the order given.
 ///
 /// The single-source kernel: `&[u32]` indices, source hoisted out of every loop.
-/// A caller that reorders rows across *several* sources, or overrides their
-/// weights, uses [`scatter_unified_sources`] — whose
-/// `(src, row, weight)` triples are 4× the index memory this one needs, on the
-/// per-worker SAL ingest scatter and the boot relayout.
+/// A caller that reorders rows across *several* sources uses
+/// [`scatter_unified_sources`] — whose `(src, row, weight)` triples are 4× the
+/// index memory this one needs, on the per-worker SAL ingest scatter and the
+/// boot relayout.
 pub(crate) fn scatter_copy(batch: &MemBatch, indices: &[u32], writer: &mut DirectWriter) {
     if indices.is_empty() {
         return;

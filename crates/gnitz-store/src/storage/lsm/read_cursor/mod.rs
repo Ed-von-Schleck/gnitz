@@ -5,6 +5,7 @@
 
 use std::cell::OnceCell;
 use std::cmp::Ordering;
+use std::ops::Range;
 #[cfg(test)]
 use std::rc::Rc;
 
@@ -25,9 +26,6 @@ mod output;
 use super::run::Run;
 pub use gather::PkSetGather;
 use gnitz_expr::RowSource;
-
-/// See [`ReadCursor::payload_cmp_vs_mem`].
-pub(crate) type PayloadCmpVsMem = fn(&ReadCursor, &SchemaDescriptor, &MemBatch, usize) -> Ordering;
 
 // ---------------------------------------------------------------------------
 // ReadCursor
@@ -354,26 +352,6 @@ impl ReadCursor {
         (&self.sources[self.current_entry_idx], self.current_row)
     }
 
-    /// The schema-selected payload comparator for "this cursor's current row
-    /// versus a `MemBatch` row", resolved **once** so a caller's inner loop makes
-    /// the dispatch zero times rather than once per comparison. The same two
-    /// comparators `with_payload_cmp!` picks between at every merge seat; this is
-    /// the seat whose other operand is an in-memory batch rather than a second
-    /// cursor source, which is why it cannot go through the macro directly. Gate
-    /// each call on `valid`.
-    pub(crate) fn payload_cmp_vs_mem(&self) -> PayloadCmpVsMem {
-        match self.schema.payload_cmp {
-            crate::schema::PayloadCmpKind::FixedIntNonnull => |c, s, mb, i| {
-                let (src, row) = c.current_row_source();
-                crate::storage::columnar::compare_rows_fixedint_nonnull(s, src, row, mb, i)
-            },
-            crate::schema::PayloadCmpKind::Generic => |c, s, mb, i| {
-                let (src, row) = c.current_row_source();
-                crate::storage::compare_rows(s, src, row, mb, i)
-            },
-        }
-    }
-
     /// The current row's PK as its native scalar value. Only narrow
     /// (`pk_stride ≤ 16`) relations have one; panics above that width. Gate on
     /// `valid` first.
@@ -436,6 +414,57 @@ impl ReadCursor {
         while self.valid && self.current_pk_eq(key) {
             f(&*self);
             self.drive_with(row_cmp);
+        }
+    }
+
+    /// `f(i, w)` for each row `i` of `mb[range]`, one PK group, with the weight of
+    /// the byte-equal (PK, payload) trace row, or `0`: one lockstep pass over the
+    /// two sorted sides from the cursor's position, which the caller has put at
+    /// or past the group, in place of a seek per row.
+    pub(crate) fn for_each_mem_row_weight<F: FnMut(usize, i64)>(&mut self, mb: &MemBatch, range: Range<usize>, f: F) {
+        with_payload_cmp!(self.schema, Self::for_each_mem_row_weight_with::<_, _>, self, mb, range, f);
+    }
+
+    #[inline]
+    fn for_each_mem_row_weight_with<F, RowCmp>(&mut self, mb: &MemBatch, range: Range<usize>, mut f: F, row_cmp: RowCmp)
+    where
+        F: FnMut(usize, i64),
+        RowCmp: for<'x> merge::RowComparator<Run, MemBatch<'x>>,
+    {
+        if range.is_empty() {
+            return;
+        }
+        let key = mb.get_pk_bytes(range.start);
+        debug_assert!(
+            pk_bytes_eq(key, mb.get_pk_bytes(range.end - 1)),
+            "for_each_mem_row_weight: range spans more than one PK group"
+        );
+        debug_assert!(
+            !self.valid || self.current_pk_cmp_bytes(key) != Ordering::Less,
+            "for_each_mem_row_weight: cursor behind the group"
+        );
+        for i in range {
+            let w = loop {
+                if !self.valid || !self.current_pk_eq(key) {
+                    break 0;
+                }
+                match row_cmp(
+                    &self.schema,
+                    &self.sources[self.current_entry_idx],
+                    self.current_row,
+                    mb,
+                    i,
+                ) {
+                    Ordering::Less => self.advance(),
+                    Ordering::Equal => {
+                        let w = self.current_weight;
+                        self.advance();
+                        break w;
+                    }
+                    Ordering::Greater => break 0,
+                }
+            };
+            f(i, w);
         }
     }
 

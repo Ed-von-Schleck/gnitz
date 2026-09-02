@@ -683,11 +683,15 @@ pub(crate) fn run_merge<S: ColumnarSource>(
     with_payload_cmp!(schema, run_merge_body, sources, &mut cursors, schema, emit)
 }
 
-/// The payload comparator every merge path is monomorphized over, for a source
-/// type `S`. `Copy` lets one selected comparator forward down a whole call chain
-/// at no cost. `with_payload_cmp!` is what picks the concrete one.
-pub(crate) trait RowComparator<S>: Fn(&SchemaDescriptor, &S, usize, &S, usize) -> Ordering + Copy {}
-impl<S, F> RowComparator<S> for F where F: Fn(&SchemaDescriptor, &S, usize, &S, usize) -> Ordering + Copy {}
+/// The payload comparator every merge path is monomorphized over: row `ai` of an
+/// `A` against row `bi` of a `B`, one source type at every seat but the read
+/// cursor's walk against an in-memory batch. `Copy` lets one selected comparator
+/// forward down a whole call chain at no cost. `with_payload_cmp!` picks it.
+pub(crate) trait RowComparator<A, B = A>:
+    Fn(&SchemaDescriptor, &A, usize, &B, usize) -> Ordering + Copy
+{
+}
+impl<A, B, F> RowComparator<A, B> for F where F: Fn(&SchemaDescriptor, &A, usize, &B, usize) -> Ordering + Copy {}
 
 /// The (PK, payload) merge comparator trio, shared by the flush/compaction
 /// kernel ([`run_merge_body`]) and the read cursor's loser-tree drives so the

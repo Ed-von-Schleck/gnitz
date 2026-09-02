@@ -729,6 +729,15 @@ impl Batch {
             chunk.copy_from_slice(&f(w).to_le_bytes());
         }
     }
+    /// Overwrite every row's weight with `weights`, one per row in row order.
+    /// Arbitrary weights can mint ghosts, so the layout claim is dropped.
+    pub fn overwrite_weights(&mut self, weights: &[i64]) {
+        debug_assert_eq!(weights.len(), self.count, "overwrite_weights: one weight per row");
+        for (dst, w) in self.weight_data_mut().chunks_exact_mut(8).zip(weights) {
+            dst.copy_from_slice(&w.to_le_bytes());
+        }
+        self.downgrade();
+    }
     /// Summed weight of rows `[start, end)`, read straight off the contiguous
     /// weight region so the fold vectorizes (rather than a `get_weight` per row).
     #[inline]
@@ -1327,9 +1336,9 @@ impl Batch {
     }
 
     /// Scatter-copy selected rows from a MemBatch into a new Batch, each carrying
-    /// its own weight. A caller emitting *different* weights writes them over
-    /// [`weight_data_mut`](Self::weight_data_mut) afterwards — one sequential
-    /// blit, against a per-(row, column) dispatch in the scatter.
+    /// its own weight. A caller emitting *different* weights follows with
+    /// [`overwrite_weights`](Self::overwrite_weights) — one sequential blit,
+    /// against a per-(row, column) dispatch in the scatter.
     pub fn from_indexed_rows(batch: &MemBatch, indices: &[u32], schema: &SchemaDescriptor) -> Self {
         if indices.is_empty() {
             return Self::empty_with_schema(schema);
