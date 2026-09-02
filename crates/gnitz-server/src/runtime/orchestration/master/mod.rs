@@ -27,8 +27,8 @@ use crate::runtime::reactor::{AsyncMutex, ScanLease};
 use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalFit, SalMessageKind, SalWriter, ZoneMark};
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::wire::{
-    self, unique_preflight_wire_schema, DecodedWire, SchemaWithVersion, BACKFILL_DECISION_CHECKPOINT,
-    BACKFILL_DECISION_CONTINUE, BACKFILL_DECISION_STOP, FLAG_SCAN_LAST,
+    self, unique_preflight_wire_schema, DecodedWire, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_CONTINUE,
+    BACKFILL_DECISION_STOP, FLAG_SCAN_LAST,
 };
 use exchange::PendingRelay;
 use gnitz_store::ops::{op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode};

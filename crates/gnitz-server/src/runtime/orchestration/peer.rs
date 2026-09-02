@@ -104,7 +104,7 @@ impl Peer {
     /// it is copied into a pooled send buffer and dispatched through the shared
     /// `send_buffer` path (per-connection, so the extra copy is off any hot path).
     pub async fn send_hello_ack(&self, published_lsn: u64) -> i32 {
-        let ack = gnitz_wire::encode_hello_ack(gnitz_wire::MAX_FRAME_PAYLOAD_SERVER as u32, published_lsn);
+        let ack = gnitz_wire::encode_hello_ack(crate::runtime::wire::FRAME_CAP as u32, published_lsn);
         let mut buf = gnitz_store::storage::batch_pool::acquire_buf();
         buf.extend_from_slice(&ack);
         self.send_buffer(PooledSendBuf(buf)).await

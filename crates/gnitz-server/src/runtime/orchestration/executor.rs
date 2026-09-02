@@ -41,7 +41,7 @@ use crate::runtime::reactor::{
     chan, oneshot, select2, AsyncRwLock, Either, FsyncFuture, Reactor, ReadGuard, ReplyFuture, WriteGuard,
 };
 use crate::runtime::sal::{GroupTargets, SalFit, SalMessageKind};
-use crate::runtime::wire::{self as ipc, validate_schema_match, SchemaWithVersion, BACKFILL_DECISION_CONTINUE};
+use crate::runtime::wire::{self as ipc, validate_schema_match, BACKFILL_DECISION_CONTINUE};
 use gnitz_store::relation::RelationKind;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
@@ -1022,7 +1022,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     // decision and the push decode all read this same parse, so a malicious
     // client cannot forge a directory that points one at one region and another
     // at another.
-    let ctrl = match ipc::peek_frame_control(data) {
+    let ctrl = match ipc::peek_control_block(data) {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("decode error: {e}");
@@ -1180,11 +1180,7 @@ fn decode_push_frame(
     } else {
         None
     };
-    let hint = catalog_schema.as_ref().map(|descriptor| SchemaWithVersion {
-        descriptor,
-        version: client_version,
-    });
-    decode_client_wire(data, ctrl, hint).map_err(|e| PushReject::Error(format!("decode error: {e}")))
+    decode_client_wire(data, ctrl, catalog_schema.as_ref()).map_err(|e| PushReject::Error(format!("decode error: {e}")))
 }
 
 async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_wire::control::DecodedControl) {
@@ -1549,11 +1545,11 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
 fn decode_client_wire(
     data: &[u8],
     ctrl: gnitz_wire::control::DecodedControl,
-    hint: Option<SchemaWithVersion<'_>>,
+    hint: Option<&SchemaDescriptor>,
 ) -> Result<ipc::DecodedWire, &'static str> {
     let decoded = ipc::decode_wire_with_ctrl(data, ctrl, hint)?;
-    // `decode_wire_body` builds a data batch only against a resolved schema, so
-    // the two are present or absent together.
+    // The decoder builds a data batch only against a resolved schema, so the
+    // two are present or absent together.
     if let (Some(b), Some(schema)) = (decoded.data_batch.as_ref(), decoded.schema.as_ref()) {
         reject_not_null_bits(b, schema)?;
     }

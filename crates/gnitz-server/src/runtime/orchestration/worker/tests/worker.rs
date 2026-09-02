@@ -1,6 +1,5 @@
 use super::*;
 use crate::catalog::PUBLIC_SCHEMA_ID;
-use crate::runtime::test_support::decode_continuation;
 use crate::runtime::w2m::{self, W2mReceiver};
 use crate::test_support::{col_def, make_batch_raw, make_schema_u64_i64, u64_pk_schema};
 use gnitz_store::schema::SchemaColumn;
@@ -497,7 +496,8 @@ fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
         assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
 
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-        let decoded = decode_continuation(&data, &schema, 0, &mut offsets).expect("decode with schema hint");
+        let decoded = ipc::decode_wire_ipc_zero_copy_with_ctrl(&data, ctrl, Some(&schema), &mut offsets)
+            .expect("decode with schema hint");
         let b = decoded.data_batch.as_ref().expect("data block");
         assert_eq!(b.len(), 5);
         for i in 0..5usize {
@@ -663,7 +663,7 @@ fn pending_streams_drain_two_trains_fifo() {
                     "a continuation carries no schema block, so it cannot decode standalone"
                 );
                 let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-                let decoded = decode_continuation(bytes, schema, 0, &mut offsets)
+                let decoded = ipc::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, Some(schema), &mut offsets)
                     .expect("continuation decodes against the schema hint");
                 rows += decoded.data_batch.map(|b| b.len()).unwrap_or(0);
             }

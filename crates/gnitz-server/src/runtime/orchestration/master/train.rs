@@ -93,23 +93,18 @@ pub(super) async fn drain_index_scan(
 ) -> Result<(), WorkerFault> {
     for (i, mut slot) in slots.into_iter().enumerate() {
         let (w, req_id) = scan.reply(i);
-        let mut saved_schema: Option<(SchemaDescriptor, u16)> = None;
+        let mut saved_schema: Option<SchemaDescriptor> = None;
         loop {
             let (ctrl, has_more) = parse_train_header(&slot, w, what)?;
-            let server_version = gnitz_wire::wire_flags_get_schema_version(ctrl.flags);
             let frame_len = slot.bytes().len();
-            let schema_hint = saved_schema.as_ref().map(|(s, v)| SchemaWithVersion {
-                descriptor: s,
-                version: *v,
-            });
             let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-            let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl, schema_hint, &mut offsets)
+            let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl, saved_schema.as_ref(), &mut offsets)
                 .map_err(|e| scan_decode_err(w, e))?;
             if saved_schema.is_none() {
                 if let Some(ref s) = zc.schema {
                     wire::validate_schema_match(s, expected)
                         .map_err(|e| WorkerFault::from(format!("worker {w}: {what}: {e}")))?;
-                    saved_schema = Some((*s, server_version));
+                    saved_schema = Some(*s);
                 }
             }
             if let Some(ref mb) = zc.data_batch {

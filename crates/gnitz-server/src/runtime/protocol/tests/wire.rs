@@ -1,15 +1,14 @@
 use crate::catalog::encode_schema_block;
-use crate::runtime::test_support::decode_continuation;
 use crate::runtime::wire::{
-    decode_wire, decode_wire_ipc, peek_frame_control, validate_schema_match, WireData, WireMsg,
+    decode_wire, decode_wire_ipc, decode_wire_ipc_zero_copy_with_ctrl, validate_schema_match, WireData, WireMsg,
 };
 use crate::test_support::{make_batch, make_batch_raw, u64_pk_schema};
 use gnitz_store::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder, MAX_BATCH_REGIONS};
-use gnitz_wire::control::CTRL_BLOCK_SIZE_NO_BLOB;
+use gnitz_wire::control::{peek_control_block_ipc, CTRL_BLOCK_SIZE_NO_BLOB};
 use gnitz_wire::try_decode_german_string;
 use gnitz_wire::type_code;
-use gnitz_wire::{wire_flags_set_schema_version, FLAG_CONTINUATION, STATUS_ERROR, STATUS_OK};
+use gnitz_wire::{FLAG_CONTINUATION, STATUS_ERROR, STATUS_OK};
 
 /// The anonymous schema block a frame for `sd` under `target_id` carries — what
 /// every producer in the tree hands `WireMsg::schema_block`.
@@ -307,29 +306,6 @@ fn decode_wire_round_trips_every_control_field() {
     assert!(decoded.data_batch.is_none());
 }
 
-#[test]
-fn peek_frame_control_on_valid_wire() {
-    let wire = WireMsg {
-        target_id: 99,
-        client_id: 0xCAFE_BABE,
-        ..Default::default()
-    }
-    .encode_to_vec();
-    let ctrl = peek_frame_control(&wire).unwrap();
-    assert_eq!(ctrl.target_id, 99);
-    assert_eq!(ctrl.client_id, 0xCAFE_BABE);
-}
-
-#[test]
-fn peek_frame_control_rejects_short_data() {
-    // Any slice shorter than WAL_HEADER_SIZE must fail.
-    let result = peek_frame_control(&[0u8; 10]);
-    assert!(
-        result.is_err(),
-        "peek_frame_control should reject slices < WAL_HEADER_SIZE"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Scan chunking tests
 // ---------------------------------------------------------------------------
@@ -383,16 +359,13 @@ fn encode_range_roundtrip() {
 }
 
 /// A continuation frame (FLAG_HAS_DATA, no FLAG_HAS_SCHEMA) decodes against a
-/// versioned schema hint, and only against a matching version.
+/// schema hint, and not without one.
 #[test]
 fn continuation_frame_decoded_with_schema_hint() {
     let sd = simple_schema();
     let batch = make_blobless_batch(4);
 
     // Encode a continuation frame: no schema, FLAG_CONTINUATION set.
-    // Embed server_version=7 in wire_flags bits 24-39.
-    let server_version: u16 = 7;
-    let frame_flags = wire_flags_set_schema_version(FLAG_CONTINUATION, server_version);
     let sz = WireMsg {
         data: WireData::Range {
             batch: &batch,
@@ -405,7 +378,7 @@ fn continuation_frame_decoded_with_schema_hint() {
     let mut buf = vec![0u8; sz];
     WireMsg {
         target_id: 1,
-        flags: frame_flags,
+        flags: FLAG_CONTINUATION,
         data: WireData::Range {
             batch: &batch,
             start_row: 0,
@@ -421,9 +394,11 @@ fn continuation_frame_decoded_with_schema_hint() {
         "decode_wire_ipc should fail for continuation frame without schema"
     );
 
-    // A hint at the matching version must succeed.
+    // With a hint it decodes, every region sliced by the same rows.
+    let ctrl = peek_control_block_ipc(&buf).expect("control block");
     let mut offsets = [0usize; MAX_BATCH_REGIONS];
-    let decoded = decode_continuation(&buf, &sd, server_version, &mut offsets).expect("decode with schema hint");
+    let decoded =
+        decode_wire_ipc_zero_copy_with_ctrl(&buf, ctrl, Some(&sd), &mut offsets).expect("decode with schema hint");
     let b = decoded.data_batch.as_ref().expect("data_batch");
     assert_eq!(b.len(), 4);
     for i in 0..4usize {
@@ -433,12 +408,6 @@ fn continuation_frame_decoded_with_schema_hint() {
         );
         assert_eq!(b.get_weight(i), i as i64 + 1, "row {i} weight");
     }
-    drop(decoded);
-
-    // A hint at a different version must fail.
-    let mut offsets = [0usize; MAX_BATCH_REGIONS];
-    let err = decode_continuation(&buf, &sd, server_version + 1, &mut offsets);
-    assert!(err.is_err(), "version mismatch must return Err");
 }
 
 #[test]

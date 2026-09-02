@@ -4,14 +4,16 @@ use std::rc::Rc;
 
 use gnitz_store::schema::{decode_schema_block, SchemaDescriptor};
 use gnitz_store::storage::{Batch, Layout, MemBatch, MAX_BATCH_REGIONS};
-use gnitz_wire::control::{peek_control_block, peek_control_block_ipc, DecodedControl};
-use gnitz_wire::{wire_flags_get_schema_version, FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
+use gnitz_wire::control::{peek_control_block_ipc, DecodedControl};
+use gnitz_wire::{FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
 
-/// The most one reply frame may carry on its way to a client. A worker frame is
-/// forwarded verbatim, and the client's ceiling is `min(server, client)` over the
-/// limit the HELLO ACK advertises — which is `MAX_FRAME_PAYLOAD_SERVER`. So it
-/// bounds the chunk split point, the single-frame paths that cannot chunk, and
-/// the master's merge of per-worker replies alike. The W2M ring's own bound,
+/// The most one reply frame may carry on its way to a client, and the limit the
+/// HELLO ACK advertises (`Peer::send_hello_ack`): the client bounds its reader
+/// by `min(server, client)` over the advertised value, so advertising this
+/// constant is what keeps every frame the server emits readable. A worker frame
+/// is forwarded verbatim, so it bounds the chunk split point, the single-frame
+/// paths that cannot chunk, and the master's merge of per-worker replies alike.
+/// The server's *ingress* limit is the wire constant itself. The W2M ring's own bound,
 /// `MAX_W2M_MSG`, is deliberately the larger of the two — it is the right limit
 /// for a train the master consumes rather than forwards.
 pub(crate) const FRAME_CAP: usize = gnitz_wire::MAX_FRAME_PAYLOAD_SERVER;
@@ -296,8 +298,9 @@ pub(crate) fn validate_schema_match(wire: &SchemaDescriptor, expected: &SchemaDe
     }
     // `==` is the verdict; the scan only *names* the first differing column and
     // restates no field list — `SchemaColumn: PartialEq` covers every field, and
-    // `Debug` renders exactly the fields `PartialEq` compares. Four error paths
-    // surface this string, and a 65-column schema is not diffable by eye.
+    // `Debug` renders exactly the fields `PartialEq` compares. Every error path
+    // that surfaces this string does so to a human, and a 65-column schema is not
+    // diffable by eye.
     let at = (wire.num_columns() == expected.num_columns())
         .then(|| (0..wire.num_columns()).find(|&i| wire.columns[i] != expected.columns[i]))
         .flatten()
@@ -322,42 +325,29 @@ pub(crate) fn unique_preflight_wire_schema(idx_schema: &SchemaDescriptor, n_prom
     SchemaDescriptor::new(cols, &pks)
 }
 
-/// Full decoded wire message.
-pub struct DecodedWire {
+/// Full decoded wire message. `B` is the data batch's form: an owned [`Batch`]
+/// — the default — or a [`MemBatch`] borrowing the frame bytes, from the
+/// zero-copy ring decoder.
+pub struct DecodedWire<B = Batch> {
     pub control: DecodedControl,
+    /// The frame's own schema block, decoded — or, for a continuation frame
+    /// that carries data with no block, the hint its data was decoded against.
+    /// A data batch is therefore never present without the descriptor it was
+    /// read under.
     pub schema: Option<SchemaDescriptor>,
-    pub data_batch: Option<Batch>,
+    pub data_batch: Option<B>,
 }
 
-/// Zero-copy decoded wire message: data borrows directly from the source buffer.
-pub struct DecodedWireZeroCopy<'a> {
-    pub control: DecodedControl,
-    pub schema: Option<SchemaDescriptor>,
-    pub data_batch: Option<MemBatch<'a>>,
-}
-
-/// A schema descriptor paired with the server-side schema version.
-/// Passed to decode functions so continuation frames (no schema block)
-/// can be decoded against a cached schema and the version can be verified
-/// against what the sender embedded in `wire_flags`.
-pub struct SchemaWithVersion<'a> {
-    pub descriptor: &'a SchemaDescriptor,
-    pub version: u16,
-}
-
-/// Parse a frame's control block once, bounds-limited to the block's own
-/// `block_size` slice (exactly the slice the full decode would parse, so the
-/// routing/auth fields and the decode see one directory — a malicious client
-/// cannot forge a directory that points the auth check at one offset and the
-/// decoder at another).
-pub fn peek_frame_control(data: &[u8]) -> Result<DecodedControl, &'static str> {
-    let ctrl = gnitz_wire::wal::block_slice_at(data, 0)?;
-    peek_control_block(ctrl)
-}
+/// Checksum-verified control-block parse, for a frame that crossed a trust or
+/// durability boundary. It bounds every read by the block's own size field, so
+/// the routing fields and the decode that follows read one directory — a
+/// malicious client cannot forge one that points the auth check at one offset
+/// and the decoder at another.
+pub(crate) use gnitz_wire::control::peek_control_block;
 
 /// Client-boundary decode with a pre-parsed control block (the `handle_message`
 /// single-parse path). Full checksum verification on all three blocks — the
-/// control block's by the `peek_frame_control` that produced `control`.
+/// control block's by the [`peek_control_block`] that produced `control`.
 ///
 /// The batch comes back `Raw`: unlike [`decode_wire`] this never installs the
 /// frame's `FLAG_BATCH_SORTED` / `FLAG_BATCH_CONSOLIDATED` claim, which a client
@@ -365,10 +355,20 @@ pub fn peek_frame_control(data: &[u8]) -> Result<DecodedControl, &'static str> {
 pub fn decode_wire_with_ctrl(
     data: &[u8],
     control: DecodedControl,
-    schema_hint: Option<SchemaWithVersion<'_>>,
+    hint: Option<&SchemaDescriptor>,
 ) -> Result<DecodedWire, &'static str> {
-    let ctrl_size = control.block_size;
-    decode_wire_body(data, ctrl_size, control, schema_hint, true)
+    decode_frame(data, control, hint, true, |block, schema| {
+        Batch::decode_from_wal_block(block, schema, true).map(|(b, _)| b)
+    })
+}
+
+/// Decode a full checksum-verified wire message from raw bytes: the SAL, the
+/// boot replay and the worker's own SAL consumption all read frames this way.
+pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
+    let control = peek_control_block(data)?;
+    let mut decoded = decode_wire_with_ctrl(data, control, None)?;
+    certify_engine_frame(&mut decoded);
+    Ok(decoded)
 }
 
 /// Decode one W2M ring frame into an owned `DecodedWire`. No checksum
@@ -382,159 +382,92 @@ pub fn decode_wire_with_ctrl(
 /// frame with no dead heap. One policy for the ring, not the cheaper of the two
 /// per frame.
 pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, &'static str> {
-    let ctrl = gnitz_wire::wal::block_slice_at(data, 0)?;
-    let control = peek_control_block_ipc(ctrl)?;
-    let mut offsets = [0usize; MAX_BATCH_REGIONS];
-    let zc = decode_wire_ipc_zero_copy_with_ctrl(data, control, None, &mut offsets)?;
-    let flags = zc.control.flags;
-    let schema = zc.schema;
-    let data_batch = match zc.data_batch {
-        Some(mb) => {
-            let sch = schema.as_ref().ok_or("FLAG_HAS_DATA set but no schema")?;
-            let mut owned = Batch::with_capacity(*sch, mb.len());
-            owned.append_mem_batch(&mb);
-            // The wire flags are ground truth. `append_mem_batch` leaves `owned`
-            // `Raw`; raise it to the frame's claim, debug-verifying the data.
-            owned.certify_layout(Layout::from_wire_flags(flags), sch);
-            Some(owned)
-        }
-        None => None,
-    };
-    Ok(DecodedWire {
-        control: zc.control,
-        schema,
-        data_batch,
+    let control = peek_control_block_ipc(data)?;
+    let mut decoded = decode_frame(data, control, None, false, |block, schema| {
+        let mut offsets = [0usize; MAX_BATCH_REGIONS];
+        let mb = gnitz_store::storage::decode_mem_batch_from_wal_block(block, schema, &mut offsets)?;
+        let mut owned = Batch::with_capacity(*schema, mb.len());
+        owned.append_mem_batch(&mb);
+        Ok(owned)
+    })?;
+    certify_engine_frame(&mut decoded);
+    Ok(decoded)
+}
+
+/// Decode a W2M ring frame without copying data: the data block comes back as
+/// a [`MemBatch`] borrowing `data`, so the caller keeps `data` live (holds the
+/// `W2mSlot`) while reading it, and lends the region-offset array the view
+/// borrows (see [`MemBatch::offsets`]).
+///
+/// Takes a pre-parsed `control` block (from `peek_control_block_ipc`) so the
+/// train readers can inspect the header before choosing a decode path without
+/// a second parse. `hint` is what a continuation frame decodes against.
+pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
+    data: &'a [u8],
+    control: DecodedControl,
+    hint: Option<&SchemaDescriptor>,
+    offsets: &'a mut [usize; MAX_BATCH_REGIONS],
+) -> Result<DecodedWire<MemBatch<'a>>, &'static str> {
+    decode_frame(data, control, hint, false, move |block, schema| {
+        gnitz_store::storage::decode_mem_batch_from_wal_block(block, schema, offsets)
     })
 }
 
-/// Decode a full checksum-verified wire message from raw bytes: the SAL, the
-/// boot replay and the worker's own SAL consumption all read frames this way.
-pub fn decode_wire(data: &[u8]) -> Result<DecodedWire, &'static str> {
-    let ctrl = gnitz_wire::wal::block_slice_at(data, 0)?;
-    let control = peek_control_block(ctrl)?;
-    let mut decoded = decode_wire_body(data, ctrl.len(), control, None, true)?;
-    // An engine-authored frame (SAL consumption, W2M, boot replay): its layout
-    // claim is real and skipping the re-sort is the point of sending it, so
-    // raise the batch off `Raw`. `certify_layout` debug-verifies what it
-    // installs, which is why the client path (`decode_wire_with_ctrl`) does not
-    // come through here — a lying client frame must be answered with an error,
-    // not a debug-build abort.
+/// Install an engine-authored frame's layout claim: its `FLAG_BATCH_SORTED` /
+/// `FLAG_BATCH_CONSOLIDATED` bits are real, and skipping the re-sort is the
+/// point of sending them, so the batch is raised off `Raw`. `certify_layout`
+/// debug-verifies what it installs, which is why the client path
+/// (`decode_wire_with_ctrl`) never comes through here — a lying client frame
+/// must be answered with an error, not a debug-build abort.
+fn certify_engine_frame(decoded: &mut DecodedWire) {
     let flags = decoded.control.flags;
     if let (Some(b), Some(schema)) = (decoded.data_batch.as_mut(), decoded.schema.as_ref()) {
         b.certify_layout(Layout::from_wire_flags(flags), schema);
     }
-    Ok(decoded)
 }
 
-/// Resolve a frame's schema and locate its data block — the prologue both
-/// decoders run. Returns the schema the data block must be read against, and
-/// the data block itself when the frame carries one.
+/// The one frame walk behind every decoder: locate the schema and data blocks
+/// after the control block, resolve the descriptor the data is read against,
+/// and decode the data block through `decode` — which is the only thing the
+/// owned and the zero-copy decoders do differently.
 ///
-/// With a `hint`, any block in the frame must equal it, and the hint's
-/// descriptor is what comes back — it carries the placement the block does not.
-fn split_wire_blocks<'a>(
+/// A frame that carries a schema block decodes against that block. A
+/// continuation frame — data with no block of its own — decodes against `hint`,
+/// and without one there is nothing to do but reject it.
+fn decode_frame<'a, B>(
     data: &'a [u8],
-    ctrl_size: usize,
-    flags: u64,
-    hint: Option<SchemaWithVersion<'_>>,
+    control: DecodedControl,
+    hint: Option<&SchemaDescriptor>,
     verify: bool,
-) -> Result<(Option<SchemaDescriptor>, Option<&'a [u8]>), &'static str> {
-    let has_schema = (flags & FLAG_HAS_SCHEMA) != 0;
-    let has_data = (flags & FLAG_HAS_DATA) != 0;
+    decode: impl FnOnce(&'a [u8], &SchemaDescriptor) -> Result<B, &'static str>,
+) -> Result<DecodedWire<B>, &'static str> {
+    let has_schema = control.flags & FLAG_HAS_SCHEMA != 0;
+    let has_data = control.flags & FLAG_HAS_DATA != 0;
+    let mut off = control.block_size;
 
-    let mut off = ctrl_size;
-    let mut wire_schema: Option<SchemaDescriptor> = None;
-
-    // A continuation frame carries data with no block of its own; without a hint
-    // to decode it against there is nothing to do but reject it. The hint's
-    // version must match what the sender stamped into `flags`, or the cached
-    // descriptor no longer describes these rows.
-    if has_data && !has_schema {
-        let h = hint.as_ref().ok_or("FLAG_HAS_DATA without FLAG_HAS_SCHEMA")?;
-        if wire_flags_get_schema_version(flags) != h.version {
-            return Err("schema version mismatch on continuation frame");
-        }
-        wire_schema = Some(*h.descriptor);
-    }
-
-    if has_schema {
+    let block_schema = if has_schema {
         let sblock = gnitz_wire::wal::block_slice_at(data, off)?;
-        let parsed = decode_schema_block(sblock, verify)?;
-        wire_schema = Some(match hint {
-            Some(ref h) => {
-                if parsed != *h.descriptor {
-                    return Err("schema mismatch: client schema differs from server schema");
-                }
-                *h.descriptor
-            }
-            None => parsed,
-        });
         off += sblock.len();
-    }
-
-    let dblock = if has_data {
-        Some(gnitz_wire::wal::block_slice_at(data, off)?)
+        Some(decode_schema_block(sblock, verify)?)
     } else {
         None
     };
-    Ok((wire_schema, dblock))
-}
-
-/// Leaves the decoded batch `Raw`. Whether the frame's layout claim may be
-/// installed on top depends on who sent it, so that is the caller's call.
-fn decode_wire_body(
-    data: &[u8],
-    ctrl_size: usize,
-    control: DecodedControl,
-    schema_hint: Option<SchemaWithVersion<'_>>,
-    verify_checksum: bool,
-) -> Result<DecodedWire, &'static str> {
-    let (schema, dblock) = split_wire_blocks(data, ctrl_size, control.flags, schema_hint, verify_checksum)?;
-    let data_batch = match dblock {
-        Some(dblock) => {
-            let eff_schema = schema.as_ref().ok_or("no schema for data block")?;
-            Some(Batch::decode_from_wal_block(dblock, eff_schema, verify_checksum)?.0)
-        }
-        None => None,
-    };
-
+    if !has_data {
+        return Ok(DecodedWire {
+            control,
+            schema: block_schema,
+            data_batch: None,
+        });
+    }
+    let schema = block_schema
+        .or(hint.copied())
+        .ok_or("FLAG_HAS_DATA without FLAG_HAS_SCHEMA")?;
+    let dblock = gnitz_wire::wal::block_slice_at(data, off)?;
+    let data_batch = decode(dblock, &schema)?;
     Ok(DecodedWire {
         control,
-        schema,
-        data_batch,
-    })
-}
-
-/// Decode a W2M IPC message without copying data: schema is parsed from the
-/// wire bytes directly and the data block is returned as a `MemBatch<'a>`
-/// that borrows slices from `data`.  The caller must keep `data` live (i.e.
-/// hold the `W2mSlot`) until it is done reading from the `MemBatch`.
-///
-/// Takes a pre-parsed `control` block (from `peek_control_block`) so the
-/// caller can inspect flags before choosing a decode path without
-/// triggering a redundant parse, and the region-offset array the returned
-/// `MemBatch` borrows (see [`MemBatch::offsets`]).
-pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
-    data: &'a [u8],
-    control: DecodedControl,
-    schema_hint: Option<SchemaWithVersion<'_>>,
-    offsets: &'a mut [usize; MAX_BATCH_REGIONS],
-) -> Result<DecodedWireZeroCopy<'a>, &'static str> {
-    let (schema, dblock) = split_wire_blocks(data, control.block_size, control.flags, schema_hint, false)?;
-    let data_batch = match dblock {
-        Some(dblock) => {
-            let eff_schema = schema.as_ref().ok_or("no schema for data block")?;
-            Some(gnitz_store::storage::decode_mem_batch_from_wal_block(
-                dblock, eff_schema, offsets,
-            )?)
-        }
-        None => None,
-    };
-
-    Ok(DecodedWireZeroCopy {
-        control,
-        schema,
-        data_batch,
+        schema: Some(schema),
+        data_batch: Some(data_batch),
     })
 }
 

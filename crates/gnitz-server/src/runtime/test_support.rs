@@ -33,25 +33,6 @@ pub(crate) unsafe fn assert_child_exited_ok(pid: libc::pid_t) {
     );
 }
 
-/// Decode a continuation frame — data, no schema block — the way the master's
-/// reply-train reader does: the zero-copy decoder, fed the frame's own control
-/// block and a caller-held region-offset array. Only tests compose the two
-/// halves; production splits them because the caller needs the control block in
-/// between.
-pub(crate) fn decode_continuation<'a>(
-    bytes: &'a [u8],
-    schema: &gnitz_store::schema::SchemaDescriptor,
-    version: u16,
-    offsets: &'a mut [usize; gnitz_store::storage::MAX_BATCH_REGIONS],
-) -> Result<crate::runtime::wire::DecodedWireZeroCopy<'a>, &'static str> {
-    let ctrl = gnitz_wire::control::peek_control_block_ipc(bytes)?;
-    let hint = crate::runtime::wire::SchemaWithVersion {
-        descriptor: schema,
-        version,
-    };
-    crate::runtime::wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, Some(hint), offsets)
-}
-
 /// Poll a future exactly once with a noop waker; `None` if it is still pending.
 /// For the tests that assert what a *single* poll does and then discard the
 /// future — one that is re-polled needs its own pinned handle instead.

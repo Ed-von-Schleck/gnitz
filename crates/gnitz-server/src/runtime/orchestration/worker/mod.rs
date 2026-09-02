@@ -560,7 +560,7 @@ impl WorkerProcess {
                 // so the replay stamps the round that produced this delta rather
                 // than whatever the counter reaches by then.
                 let req_id = wire
-                    .and_then(|d| ipc::peek_frame_control(d).ok())
+                    .and_then(|d| ipc::peek_control_block(d).ok())
                     .map(|c| c.request_id)
                     .unwrap_or(0);
                 self.exchange.deferred_replay.push(Deferred::Tick {

@@ -9,7 +9,7 @@
 
 use crate::runtime::w2m::fixtures::make_ring;
 use crate::runtime::w2m::{W2mReceiver, W2mWriter};
-use crate::runtime::wire::{self, unique_preflight_wire_schema, SchemaWithVersion, FLAG_SCAN_LAST};
+use crate::runtime::wire::{self, unique_preflight_wire_schema, FLAG_SCAN_LAST};
 use crate::runtime::worker::send_unique_preflight_keys;
 use crate::test_support::pk_only_schema;
 use gnitz_store::schema::key::PkBuf;
@@ -78,7 +78,7 @@ fn with_test_ring(f: impl FnOnce(&W2mWriter, &W2mReceiver)) {
 /// (`get_pk_bytes` → `PkBuf`), continuations against the saved schema hint.
 fn drain_train(receiver: &W2mReceiver, expected_req_id: u64) -> Vec<PkBuf> {
     let mut keys = Vec::new();
-    let mut saved_schema: Option<(SchemaDescriptor, u16)> = None;
+    let mut saved_schema: Option<SchemaDescriptor> = None;
     let mut frames = 0usize;
     loop {
         let slot = receiver.try_read_slot(0).expect("frame missing from train");
@@ -107,21 +107,16 @@ fn drain_train(receiver: &W2mReceiver, expected_req_id: u64) -> Vec<PkBuf> {
                 "continuation frames must not re-send the schema",
             );
         }
-        let server_version = gnitz_wire::wire_flags_get_schema_version(ctrl.flags);
-        let hint = saved_schema.as_ref().map(|(s, v)| SchemaWithVersion {
-            descriptor: s,
-            version: *v,
-        });
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-        let zc =
-            wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl, hint, &mut offsets).expect("frame decodes");
+        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl, saved_schema.as_ref(), &mut offsets)
+            .expect("frame decodes");
         if saved_schema.is_none() {
             let s = zc.schema.expect("first frame schema");
             // The reply schema's PK region IS the OPK leading-key span; every
             // column is in the PK, no payload columns.
             assert!(s.num_columns() >= 1);
             assert_eq!(s.pk_indices().len(), s.num_columns());
-            saved_schema = Some((s, server_version));
+            saved_schema = Some(s);
         }
         if let Some(ref mb) = zc.data_batch {
             for i in 0..mb.len() {

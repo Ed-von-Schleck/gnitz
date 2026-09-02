@@ -204,18 +204,19 @@ impl PreflightKeyStream {
         self.count = 0;
         let (ctrl, has_more) = parse_train_header(&slot, self.w, "unique pre-flight").map_err(|f| f.text)?;
         self.has_more = has_more;
-        // Every frame decodes against the shared compile-time wire schema
-        // (version 0): the first frame's embedded schema block equals it by
-        // construction (`send_unique_preflight_keys`), and continuation
-        // frames carry no schema and resolve through the hint.
-        let schema_hint = Some(SchemaWithVersion {
-            descriptor: frame_schema,
-            version: 0,
-        });
+        let carries_block = ctrl.flags & FLAG_HAS_SCHEMA != 0;
         let bytes = slot.bytes();
         let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
-        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, schema_hint, &mut offsets)
+        // Continuation frames carry no schema and decode against `frame_schema`.
+        let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, Some(frame_schema), &mut offsets)
             .map_err(|e| scan_decode_err(self.w, e).text)?;
+        // The first frame's block is built by the worker from the same inputs as
+        // `frame_schema` (`send_unique_preflight_keys`), so a disagreement is an
+        // engine bug — refused, since the merge reads key bytes at this width.
+        if let (true, Some(s)) = (carries_block, zc.schema.as_ref()) {
+            wire::validate_schema_match(s, frame_schema)
+                .map_err(|e| format!("worker {}: unique pre-flight: {e}", self.w))?;
+        }
         if let Some(mb) = zc.data_batch.as_ref() {
             let pk = mb.pk();
             // `pk` points inside `bytes`, which `slot` owns for as long as it is
