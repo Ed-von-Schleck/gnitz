@@ -21,6 +21,6 @@ pub(crate) unsafe fn test_ring(capacity: usize) -> SharedRegion {
 /// # Safety
 /// As [`test_ring`].
 pub(crate) unsafe fn make_ring(msg_sz: usize, n_msgs: usize, slack: u64) -> SharedRegion {
-    let capacity = W2M_HEADER_SIZE as u64 + n_msgs as u64 * (8 + align8(msg_sz) as u64) + slack;
+    let capacity = W2M_HEADER_SIZE as u64 + n_msgs as u64 * slot_stride(msg_sz) + slack;
     test_ring(capacity as usize)
 }

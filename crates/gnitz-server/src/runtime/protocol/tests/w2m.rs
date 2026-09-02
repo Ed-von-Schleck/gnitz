@@ -25,7 +25,7 @@ unsafe fn publish(
     let mut reservation = try_reserve(&wc, sz, internal_req_id)?;
     encode(reservation.slot());
     commit(&mut wc, reservation);
-    Some((wc.virt, wc.virt - before != (8 + align8(sz)) as u64))
+    Some((wc.virt, wc.virt - before != slot_stride(sz)))
 }
 
 // -- futex primitives ----------------------------------------------------
@@ -55,7 +55,7 @@ fn a_shared_futex_wake_crosses_a_process_boundary() {
 
     // `Retry` covers both proofs: woken by the child, or the value had
     // already moved. `TimedOut` is the failure this asserts against.
-    let rc = futex_wait_u32(atomic_ptr as *const AtomicU32, 7, 5000);
+    let rc = futex_waitv_u32(&[futex_waitv_entry(atomic_ptr as *const AtomicU32, 7)], 5000);
     assert_eq!(rc, Parked::Retry, "the child's wake never reached the parent");
     let final_val = unsafe { (*atomic_ptr).load(Ordering::Acquire) };
     assert_eq!(final_val, 8);
@@ -78,7 +78,7 @@ fn futex_waitv_wakes_on_any_word() {
         (*w0).store(0, Ordering::Release);
         (*w1).store(0, Ordering::Release);
     }
-    let word = |w: *const AtomicU32, val: u64| FutexWaitV::new().val(val).uaddr(w as u64).flags(FUTEX2_SIZE_U32);
+    let word = futex_waitv_entry;
 
     let rc = futex_waitv_u32(&[word(w0, 0), word(w1, 999)], 2000);
     assert_eq!(rc, Parked::Retry, "value mismatch must fast-return");
@@ -127,14 +127,14 @@ fn a_published_message_round_trips_in_place() {
         let (new_wc, wrapped) = publish(ptr, payload.len(), 0, |slot| slot.copy_from_slice(&payload))
             .expect("unexpected Full on empty ring");
         assert!(!wrapped);
-        assert_eq!(new_wc, W2M_HEADER_SIZE as u64 + 8 + 128);
+        assert_eq!(new_wc, W2M_HEADER_SIZE as u64 + slot_stride(128));
         assert_eq!(recv.write_cursor(0), new_wc);
 
         let data = consume_one(&recv).expect("message must be visible");
         assert_eq!(data, &payload);
         assert_eq!(
             data.as_ptr(),
-            ptr.add(W2M_HEADER_SIZE + 8) as *const u8,
+            ptr.add(W2M_HEADER_SIZE + RING_PREFIX_BYTES as usize) as *const u8,
             "the payload must be mmap-resident — decode_wire reads it in place"
         );
         assert_eq!(recv.read_cursor(0), new_wc);
@@ -185,7 +185,7 @@ fn an_exact_fit_publishes_contiguously() {
         // Zero slack: DCAP is exactly N messages, so the N-th ends on `cap`.
         let region = make_ring(msg_sz, N, 0);
         let ptr = region.ptr();
-        let total = 8 + align8(msg_sz) as u64;
+        let total = slot_stride(msg_sz);
         let recv = W2mReceiver::new(vec![ptr]);
 
         for i in 0..N {
@@ -286,7 +286,8 @@ fn init_region_rejects_unaligned_capacity() {
 #[should_panic(expected = "leaves no room")]
 fn init_region_rejects_undersized_capacity() {
     unsafe {
-        let cap = W2M_HEADER_SIZE + 8;
+        // Room for a prefix word and nothing after it.
+        let cap = W2M_HEADER_SIZE + RING_PREFIX_BYTES as usize;
         let region = SharedRegion::new(cap);
         init_region(region.ptr(), cap as u64);
     }

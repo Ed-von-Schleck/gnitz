@@ -152,6 +152,26 @@ pub fn madvise_hugepage(ptr: *mut u8, size: usize) {
     }
 }
 
+/// An anonymous read-write mapping shared with every `fork()`ed child. Not
+/// commit-charged (`MAP_NORESERVE`), so a mapping sized far above its live
+/// occupancy does not fail under `vm.overcommit_memory=2`.
+pub fn map_anon_shared(size: usize) -> std::io::Result<*mut u8> {
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ptr as *mut u8)
+}
+
 /// mmap `size` bytes of `fd` `MAP_SHARED` read-write, `fallocate`ing the file to
 /// `size` first: `mmap` past the end of a file succeeds and the first store into
 /// the resulting hole raises `SIGBUS`, which nothing here handles. Reserving the

@@ -44,8 +44,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use self::uring::{Cqe, IoUringRing, CQE_F_MORE};
 
-use crate::runtime::w2m::{W2mReceiver, W2mSlot, FUTEX2_SIZE_U32};
-use crate::runtime::wire::{self, DecodedWire};
+use crate::runtime::w2m::{futex_waitv_entry, W2mReceiver, W2mSlot};
+use crate::runtime::wire::DecodedWire;
 use gnitz_wire::{FLAG_EXCHANGE, MAX_WORKERS};
 
 /// High bit of `internal_req_id` (u32), set on scan-allocated request ids.
@@ -339,10 +339,7 @@ fn probe_futex_waitv_support() {
     static PROBED: Once = Once::new();
     PROBED.call_once(|| {
         let atomic = Box::new(AtomicU32::new(42));
-        let futexv: Box<[FutexWaitV; 1]> = Box::new([FutexWaitV::new()
-            .val(0)
-            .uaddr(&*atomic as *const AtomicU32 as u64)
-            .flags(FUTEX2_SIZE_U32)]);
+        let futexv: Box<[FutexWaitV; 1]> = Box::new([futex_waitv_entry(&*atomic as *const AtomicU32, 0)]);
 
         let mut ring = match IoUringRing::new(8) {
             Ok(r) => r,
@@ -644,10 +641,7 @@ impl Reactor {
                 continue;
             }
             let prefix = slot.internal_req_id;
-            let decoded = match wire::decode_wire_ipc(slot.bytes()) {
-                Ok(d) => d,
-                Err(e) => gnitz_fatal_abort!("reactor: worker={} W2M decode failed: {:?} — ring corrupt", w, e),
-            };
+            let decoded = slot.decode(w);
             // RAII: advance release_cursor before waking the awaiter.
             drop(slot);
             self.route_reply(w, prefix, decoded);

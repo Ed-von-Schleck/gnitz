@@ -21,7 +21,11 @@ impl crate::runtime::wire::WireMsg<'_> {
 pub(crate) unsafe fn assert_child_exited_ok(pid: libc::pid_t) {
     let mut status = 0i32;
     while libc::waitpid(pid, &mut status, 0) < 0 {
-        assert_eq!(*libc::__errno_location(), libc::EINTR, "waitpid failed on child {pid}");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINTR),
+            "waitpid failed on child {pid}"
+        );
     }
     assert!(
         libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
@@ -61,11 +65,8 @@ pub(crate) fn try_poll_once<T>(fut: impl std::future::Future<Output = T>) -> Opt
     }
 }
 
-/// Anonymous `MAP_SHARED` region for IPC-shaped tests; unmapped on drop.
-/// `MAP_SHARED` so a `fork()`ed child sees the same pages (a child that
-/// `_exit`s never runs drops, so only the parent unmaps). Pages are
-/// kernel-zeroed and lazily populated, and `MAP_NORESERVE` keeps even a
-/// ring-sized region off `Committed_AS`.
+/// Anonymous `MAP_SHARED` region for IPC-shaped tests; unmapped on drop. A
+/// child that `_exit`s never runs drops, so only the parent unmaps.
 pub(crate) struct SharedRegion {
     ptr: *mut u8,
     size: usize,
@@ -73,21 +74,8 @@ pub(crate) struct SharedRegion {
 
 impl SharedRegion {
     pub(crate) fn new(size: usize) -> Self {
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_SHARED | libc::MAP_NORESERVE,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(ptr, libc::MAP_FAILED, "SharedRegion mmap failed");
-        SharedRegion {
-            ptr: ptr as *mut u8,
-            size,
-        }
+        let ptr = gnitz_store::foundation::posix_io::map_anon_shared(size).expect("SharedRegion mmap failed");
+        SharedRegion { ptr, size }
     }
 
     pub(crate) fn ptr(&self) -> *mut u8 {
