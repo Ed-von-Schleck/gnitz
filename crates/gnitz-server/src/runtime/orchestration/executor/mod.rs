@@ -29,8 +29,8 @@ use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
-    await_worker_acks, dispatch_scan_multi_fanout, exchange::ExchangeAccumulator, replicated_unicast, scan_spec_route,
-    Fanout, MasterDispatcher, TxnFamily, WorkerFault,
+    await_worker_acks, dispatch_scan_multi_fanout, exchange::ExchangeAccumulator, read_fanout, Fanout,
+    MasterDispatcher, TxnFamily, WorkerFault,
 };
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{
@@ -98,7 +98,9 @@ pub enum TickTrigger {
     /// pending — even nothing — and report the tick's verdict on `done`. A reader
     /// that waited on a failed tick must be told: its view is stale, and reporting
     /// success would serve stale rows under `STATUS_OK`.
-    Drain { done: oneshot::Sender<Result<(), String>> },
+    Drain {
+        done: oneshot::Sender<Result<(), WireFault>>,
+    },
     /// Pause the tick subsystem for a DDL bundle. On dequeue the tick loop
     /// signals `acked` — proving no tick is in flight (the loop is serial, so
     /// the prior tick has returned) and none will start — then blocks on
@@ -193,10 +195,7 @@ impl Shared {
     }
 
     /// Exclusive access, for the catalog methods that genuinely take `&mut self`.
-    ///
-    /// The dispatcher owns the pointer; this is a second name for its own
-    /// accessor rather than a second owner of the raw pointer. The master reactor
-    /// is single-threaded and the catalog outlives both.
+    /// Reaches the catalog through the dispatcher's accessor, like [`Self::cat`].
     #[allow(clippy::mut_from_ref)]
     fn cat_mut(&self) -> &mut CatalogEngine {
         self.dispatcher.cat()
@@ -652,8 +651,7 @@ async fn watchdog(shared: Rc<Shared>) {
             return;
         }
 
-        let crashed = shared.disp().check_workers();
-        if crashed >= 0 {
+        if let Some(crashed) = shared.disp().check_workers() {
             let base_dir = shared.cat().base_dir().to_string();
             gnitz_error!("Worker {crashed} crashed (log: {base_dir}/worker_{crashed}.log), shutting down");
             shared.worker_crashed.set(true);
@@ -703,7 +701,7 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
     let mut ack_slots: Vec<Option<ipc::DecodedWire>> = Vec::with_capacity(nw);
     let mut triggers: Vec<TickTrigger> = Vec::new();
     // The batch's `Drain` repliers, held across the tick they are waiting on.
-    let mut dones: Vec<oneshot::Sender<Result<(), String>>> = Vec::new();
+    let mut dones: Vec<oneshot::Sender<Result<(), WireFault>>> = Vec::new();
     // Reused across every tick; `drain_live_tick_rows_into` clears it before
     // refilling so capacity is retained.
     let mut tids_scratch: Vec<i64> = Vec::new();
@@ -762,7 +760,7 @@ async fn run_tick(
     nw: usize,
     fut_slots: &mut Vec<ReplyFuture>,
     ack_slots: &mut Vec<Option<ipc::DecodedWire>>,
-) -> Result<(), String> {
+) -> Result<(), WireFault> {
     // Snapshot before any .await: a concurrent push can advance the published LSN
     // while we wait for tick ACKs, and setting last_tick_lsn to that
     // higher value would report an LSN that this tick never processed.
@@ -788,12 +786,15 @@ async fn run_tick(
     // are also correct on `guard_panic`'s panic arm, which discards the closure's
     // return value.
     let emitted = Cell::new(0usize);
+    // The emit verdict rides out as the `Ok` value, so it keeps its typed status:
+    // `guard_panic` is pinned to `Result<T, String>`, and a full SAL must reach a
+    // waiting reader as the retryable `STATUS_SAL_FULL` rather than flattened.
     let emit = guard_panic("tick", || {
         let disp = shared.disp();
         let mut result = Ok(());
         for (i, &tid) in tids.iter().enumerate() {
             if let Err(e) = disp.write_tick_group(tid, GroupTargets::All(&req_ids[i * nw..(i + 1) * nw])) {
-                result = Err(e.text);
+                result = Err(e);
                 break;
             }
             emitted.set(i + 1);
@@ -805,8 +806,9 @@ async fn run_tick(
         if emitted.get() > 0 {
             disp.signal_all();
         }
-        result
+        Ok(result)
     });
+    let emit = emit.map_err(WireFault::from).and_then(|r| r);
     drop(_sal_excl);
     drop(_cat_read);
 
@@ -1185,7 +1187,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
         .validate_txn_distributed(&shared.reactor, std::slice::from_ref(&family))
         .await
     {
-        send_error(peer, target_id, client_id, e.as_bytes()).await;
+        send_fault(peer, target_id, client_id, &e).await;
         return;
     }
     let TxnFamily { batch, .. } = family;
@@ -1277,7 +1279,7 @@ async fn serve_seek(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::control
             .await
         {
             Ok(slot) => peer.send_or_close(slot).await,
-            Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
+            Err(f) => send_fault(peer, target_id, client_id, &f).await,
         }
     }
 }
@@ -1642,7 +1644,7 @@ async fn handle_seek_by_index(
             )
             .await;
         }
-        Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
+        Err(f) => send_fault(peer, target_id, client_id, &f).await,
     }
 }
 
@@ -1832,9 +1834,9 @@ enum ReadFreshness {
 /// so awaiting `done` also serializes behind a concurrent `Auto`, without which a
 /// read could observe a view mid-tick. A failed tick is reported, not swallowed:
 /// its views are stale, and serving them under `STATUS_OK` is a silent stale read.
-async fn drain_and_relock(shared: &Rc<Shared>, guard: ReadGuard) -> Result<ReadGuard, String> {
+async fn drain_and_relock(shared: &Rc<Shared>, guard: ReadGuard) -> Result<ReadGuard, WireFault> {
     drop(guard);
-    let (tx, rx) = oneshot::channel::<Result<(), String>>();
+    let (tx, rx) = oneshot::channel::<Result<(), WireFault>>();
     shared.tick_tx.send(TickTrigger::Drain { done: tx });
     // A cancelled receiver means the tick loop is gone; treat it as done.
     if let Some(Err(e)) = rx.await {
@@ -1868,8 +1870,8 @@ async fn read_lock(
     // emitted later), so a failed drain is still reportable as a plain error.
     let g = match drain_and_relock(shared, g).await {
         Ok(g) => g,
-        Err(e) => {
-            send_error(peer, target_id, client_id, e.as_bytes()).await;
+        Err(f) => {
+            send_fault(peer, target_id, client_id, &f).await;
             return None;
         }
     };
@@ -1935,10 +1937,7 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id
         }
     }
 
-    // Worker-0 unicast for a replicated relation — its full copy lives on every
-    // worker, so a broadcast would concatenate W identical copies — else a
-    // broadcast.
-    let unicast = replicated_unicast(shared.disp(), target_id);
+    let unicast = read_fanout(shared.disp(), target_id, None);
     // Embed the client's schema version in wire_flags so workers can decide
     // whether to include the schema block in their response.
     let result = shared
@@ -2005,8 +2004,8 @@ async fn finish_scan_fanout(
 ///
 /// The request blob is unpacked **once**, at the top, and the resulting spec
 /// drives all three of the dispatch classification, the routing and the gate —
-/// `confined_worker` takes that spec rather than unpacking the blob again to
-/// reach the same bytes.
+/// `read_fanout` takes that spec rather than unpacking the blob again to reach
+/// the same bytes.
 ///
 /// 1. It takes no drain ([`ReadFreshness::AsOfLastTick`]).
 /// 2. Its group is a `DeltaScanSpec`, which is what makes the worker
@@ -2014,11 +2013,11 @@ async fn finish_scan_fanout(
 /// 3. Its terminal frame reports `(cursor tag, T)` instead of the last-committed
 ///    LSN, and an up-to-date poll is answered here, master-locally.
 async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, seek_pk_extra: &[u8]) {
-    // The one unpack of the request blob on this side; `confined_worker` takes
-    // the spec it yields rather than reaching the same bytes a second time. A
-    // blob that does not split is left to the worker — the sole `ReadSpec`
-    // decoder and trust boundary — and routes meanwhile as an empty spec, which
-    // names no PK range and so confines nothing.
+    // The one unpack of the request blob on this side; `read_fanout` takes the
+    // spec it yields rather than reaching the same bytes a second time. A blob
+    // that does not split is left to the worker — the sole `ReadSpec` decoder and
+    // trust boundary — and routes meanwhile as an empty spec, which names no PK
+    // range and so confines nothing.
     let spec = gnitz_wire::unpack_scan_spec_extra(seek_pk_extra)
         .map(|(spec, _block)| spec)
         .unwrap_or(gnitz_wire::SpecBytes(&[]));
@@ -2065,7 +2064,7 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
     // A PK range confined to one partition unicasts: one SAL slot instead of W,
     // each of which would carry its own copy of the spec blob under the exclusive
     // SAL mutex.
-    let unicast = scan_spec_route(shared.disp(), target_id, spec);
+    let unicast = read_fanout(shared.disp(), target_id, Some(spec));
     let msg_kind = if delta_cursor.is_some() {
         SalMessageKind::DeltaScanSpec
     } else {
@@ -2092,10 +2091,8 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
 }
 
 /// A delta reply's terminal `seek_pk`: the cursor tag in the high half, `T` in
-/// the low half. One field, because "is this cursor mine?" and "which boot is it
-/// from?" are the same question — a client that does not recognise the tag
-/// discards its copy and re-reads at `after_tick = 0`, which is the right answer
-/// to both.
+/// the low half. `MasterDispatcher::delta_cursor_tag` states why one field
+/// answers both questions.
 fn delta_terminal_seek_pk(disp: &MasterDispatcher, target_id: i64, round: u64) -> u128 {
     gnitz_wire::pack_delta_watermark(disp.delta_cursor_tag(target_id), round)
 }
@@ -2125,7 +2122,7 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, client_id: u64, dat
         // Shape/tid rejection (before any group is written) or a worker fault
         // mid-stream (leases already dropped in the body): one error frame. The
         // client discards any partial results it read.
-        Err(e) => send_error(peer, 0, client_id, e.as_bytes()).await,
+        Err(f) => send_fault(peer, 0, client_id, &f).await,
     }
 }
 
@@ -2134,7 +2131,7 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, client_id: u64, dat
 /// shape/tid rejection or a mid-stream worker fault. All `ScanLease`s live in
 /// the `dispatches` vec and drop on return, so any error/disconnect return
 /// deregisters every id and discards undrained frames at the ring boundary.
-async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) -> Result<bool, String> {
+async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) -> Result<bool, WireFault> {
     // ── Phase 0: decode + frame-local shape rules ──────────────────────────
     // The count/duplicate shape rules are the shared client/server validator
     // (`gnitz_wire::validate_scan_multi_tids`); this is the authoritative check —
@@ -2172,9 +2169,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             // family, which stays on the plain path that serves it
             // master-locally.
             target_kind(shared, tid, Access::UserRead)?;
-            // Worker-0 unicast for a replicated relation, broadcast otherwise —
-            // the same policy `handle_scan` applies per relation.
-            let unicast = replicated_unicast(shared.disp(), tid);
+            let unicast = read_fanout(shared.disp(), tid, None);
             // Capture (not emit) each relation's preliminary schema frame here so
             // Phase 2 can send it after the one-cut dispatch, in request order.
             let (server_version, block) = schema_block_for_reply(shared, tid, client_ver);
@@ -2185,9 +2180,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             });
             fanout.push((tid, unicast, server_version));
         }
-        let dispatches = dispatch_scan_multi_fanout(shared.disp(), &shared.reactor, client_id, &fanout)
-            .await
-            .map_err(|f| f.text)?;
+        let dispatches = dispatch_scan_multi_fanout(shared.disp(), &shared.reactor, client_id, &fanout).await?;
         // Release the catalog read lock here: Phase 2 touches no catalog state
         // (the snapshot is worker-frozen and the schemas are captured), so
         // holding it across the whole bulk read would needlessly block DDL.
@@ -2205,10 +2198,10 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
         }
         // Drain this relation's train (all workers, ascending) before the next —
         // the FIFO reply contract makes request order == ring order.
-        match MasterDispatcher::await_and_drain_scan_relation(&shared.reactor, peer, d).await {
+        match d.await_and_forward(&shared.reactor, peer).await {
             Ok(true) => {}
             Ok(false) => return Ok(false),
-            Err(f) => return Err(f.text),
+            Err(f) => return Err(f),
         }
         // Terminal frame for this relation (tid + the shared LSN).
         let terminal = make_terminal_scan_frame(plan.tid, client_id, lsn as u128);

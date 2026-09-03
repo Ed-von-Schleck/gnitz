@@ -683,15 +683,12 @@ impl RelationRegistry {
         self.entry(id).map(|e| e.kind)
     }
 
-    /// True iff `id`'s output is a full copy on every worker — read off the
-    /// [`Placement`] stamped on its schema at registration. The one spelling of the
-    /// replication probe, so the write broadcast, the read single-sourcing, and the
-    /// store shape all read one answer.
+    /// True iff `id`'s output is a full copy on every worker — [`Placement`]'s own
+    /// probe, for a caller holding an id rather than the schema.
     ///
-    /// Any **gather** of a replicated relation must therefore single-source it,
-    /// taking one worker's copy instead of N identical ones — both the scan
-    /// dispatch and the exchange relay read this for that. SEEK already unicasts
-    /// to one worker, so it needs no check.
+    /// Any **gather** of a replicated relation must single-source it, taking one
+    /// worker's copy instead of N identical ones. SEEK already unicasts to one
+    /// worker, so it needs no check.
     pub fn relation_is_replicated(&self, id: i64) -> bool {
         self.entry(id).is_some_and(|e| e.schema.placement().is_replicated())
     }

@@ -664,7 +664,7 @@ fn run_server(
     // Wait for all workers to complete recovery and signal readiness
     let dispatcher = &*dispatcher_rc;
     dispatcher
-        .collect_acks("recovery sync")
+        .collect_acks_and_relay("recovery sync", false)
         .map_err(|e| format!("Error collecting worker acks: {e}"))?;
 
     // Reset the SAL for fresh use, now that every worker has recovered, above the

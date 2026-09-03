@@ -1,37 +1,12 @@
 //! Master SAL dispatcher: the `MasterDispatcher` core — SAL group/broadcast
 //! writes, worker signalling + ack collection, relay emit, the fan-out family
-//! (seek / scan / index / gather), checkpointing, and the scan-fanout helpers.
+//! (backfill / seek / scan / index), the checkpoint rounds, the tick-round
+//! counter and worker reaping.
 
 use super::*;
 use crate::runtime::w2m::{worker_mask, BitIter};
 use gnitz_store::foundation::fault::Seam;
-
-/// Route a ScanSpec read, as the [`Fanout`] every fan-out helper speaks.
-///
-/// A replicated relation is a full identical copy on every worker, so worker 0
-/// answers it alone; otherwise the read goes to the single worker owning its PK
-/// range when [`confined_worker`] can prove one, and is broadcast when it cannot.
-pub(crate) fn scan_spec_route(disp: &MasterDispatcher, target_id: i64, spec: SpecBytes<'_>) -> Fanout {
-    match replicated_unicast(disp, target_id) {
-        Fanout::One(w) => Fanout::One(w),
-        Fanout::Broadcast => confined_worker(disp, target_id, spec).map_or(Fanout::Broadcast, Fanout::One),
-    }
-}
-
-/// The one worker that can answer this read, or `None` for a non-`PkRange` bound
-/// and for whatever `SchemaDescriptor::confined_worker` declines. An
-/// `IndexRange` is never confined — a secondary index is one unpartitioned table
-/// per worker, so nothing derives its owner from the key.
-///
-/// Takes the already-unpacked `ReadSpec` (`handle_scan_spec` unpacks the blob
-/// once, for the gate and the routing both), and the schema from the catalog:
-/// the master holds no store after the fork, so its own handles cannot speak for
-/// the workers'.
-fn confined_worker(disp: &MasterDispatcher, target_id: i64, spec: SpecBytes<'_>) -> Option<usize> {
-    let schema = disp.cat().registry().get_schema_desc(target_id)?;
-    let desc = gnitz_wire::peek_pk_range(spec)?;
-    schema.confined_worker(&desc, disp.num_workers())
-}
+use gnitz_store::foundation::posix_io::retry_eintr;
 
 /// Ceiling on the synchronous `W2mReceiver::wait_any` park in the collect loop
 /// below, and so also the loop's `fail_if_worker_dead` cadence: a worker that
@@ -49,13 +24,11 @@ static BACKFILL_RELAY_SPACE_LOW: Seam = Seam::new("GNITZ_INJECT_BACKFILL_RELAY_S
 /// emit, once, as a full SAL would.
 static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
 
-/// A `u64` from the OS entropy pool, mixed into every delta reply's cursor tag.
-///
-/// From the OS rather than from a seeded generator because two back-to-back
-/// boots must not collide: a client holding a cursor across a restart has to see
-/// a tag it does not recognise, discard its copy and re-read at `after_tick = 0`.
-/// A short read or an unavailable pool falls back to the boot's wall clock and
-/// pid, which is weaker but still distinguishes two boots of one machine.
+/// A `u64` from the OS entropy pool for [`MasterDispatcher::delta_cursor_tag`],
+/// whose doc states what the tag is for. From the OS rather than from a seeded
+/// generator because two back-to-back boots must not collide. A short read or an
+/// unavailable pool falls back to the boot's wall clock and pid, which is weaker
+/// but still distinguishes two boots of one machine.
 fn boot_nonce() -> u64 {
     let mut bytes = [0u8; 8];
     let n = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
@@ -71,7 +44,7 @@ fn boot_nonce() -> u64 {
 impl MasterDispatcher {
     /// `last_ephemeral_gen` seeds `note_flush_round`'s ordering check: the
     /// boot's recovered durable generation.
-    pub fn new(
+    pub(crate) fn new(
         worker_pids: Vec<i32>,
         catalog: *mut CatalogEngine,
         last_ephemeral_gen: u64,
@@ -102,11 +75,9 @@ impl MasterDispatcher {
     }
 
     /// The catalog behind the raw pointer the dispatcher was constructed with.
-    /// Every `&self` method reaches the catalog through here, so the pointer is
-    /// dereferenced in one place — and on the master side this is the *only*
-    /// place: `executor::Shared::cat`/`cat_mut` are two names for this accessor
-    /// rather than a second owner of the pointer. `WorkerProcess::cat` is the
-    /// worker-side equivalent, in a different process. Sound because the master
+    /// The pointer is dereferenced here and nowhere else on the master side —
+    /// every other master-side name for the catalog is a wrapper around this
+    /// accessor, not a second owner of the pointer. Sound because the master
     /// reactor is single-threaded and the catalog outlives the dispatcher.
     #[allow(clippy::mut_from_ref)]
     pub(crate) fn cat(&self) -> &mut CatalogEngine {
@@ -124,9 +95,9 @@ impl MasterDispatcher {
     }
 
     /// The boot [`SalWriter::boot_rewind`], above the same `walk_epoch` the
-    /// workers were launched with. Sole caller is `server_main`, once every
-    /// worker has finished recovery.
-    pub fn boot_rewind_sal(&self, walk_epoch: u32) {
+    /// workers were launched with. Runs once every worker has finished recovery,
+    /// and before any group is written.
+    pub(crate) fn boot_rewind_sal(&self, walk_epoch: u32) {
         self.sal.boot_rewind(walk_epoch);
     }
 
@@ -146,8 +117,9 @@ impl MasterDispatcher {
     // Core send/receive helpers
     // -----------------------------------------------------------------------
 
-    /// Write one SAL group and nothing else — no signal, no ack collection.
-    /// The one group writer; a refusal is the client-facing `SAL full` fault.
+    /// Write one SAL group and nothing else — no signal, no ack collection. The
+    /// one writer that turns a refusal into the client-facing `SAL full` fault;
+    /// the scatter writers hand the raw [`SalFit`] to the committer instead.
     pub(super) fn write_group(&self, g: &DirectGroup) -> Result<(), WorkerFault> {
         self.sal.write(g).map_err(|fit| fit.refusal(g.kind))
     }
@@ -197,7 +169,7 @@ impl MasterDispatcher {
     /// Both sides hold a clone: the dispatcher's synchronous collect helpers stay
     /// usable during the reactor-parked stop-the-world CREATE-VIEW backfill,
     /// where the reactor (the only other reader) is parked inside that call.
-    pub fn w2m_receiver(&self) -> Rc<W2mReceiver> {
+    pub(crate) fn w2m_receiver(&self) -> Rc<W2mReceiver> {
         Rc::clone(&self.w2m)
     }
 
@@ -205,22 +177,14 @@ impl MasterDispatcher {
     /// (panic / OOM-kill / SIGKILL) leaves its `write_cursor` frozen, so the park
     /// only ever times out and the wait loop would spin forever. Callers probe
     /// before parking and surface the dead worker as an error instead of hanging
-    /// the master; `ctx` names the phase ("recovery sync", "backfill relay"). On
-    /// these paths workers stay alive after acking, so a reaped worker has not
-    /// published the awaited frame — no ack is lost.
+    /// the master; `ctx` names the phase the caller is in. On these paths workers
+    /// stay alive after acking, so a reaped worker has not published the awaited
+    /// frame — no ack is lost.
     fn fail_if_worker_dead(&self, ctx: &str) -> Result<(), String> {
-        let dead = self.check_workers();
-        if dead >= 0 {
-            return Err(format!("worker {dead} exited during {ctx}"));
+        match self.check_workers() {
+            Some(dead) => Err(format!("worker {dead} exited during {ctx}")),
+            None => Ok(()),
         }
-        Ok(())
-    }
-
-    /// Collect one ACK per worker with no backfill relay to service and no
-    /// checkpoint permitted — [`Self::collect_acks_and_relay`] under the
-    /// narrowest of its shapes.
-    pub fn collect_acks(&self, ctx: &str) -> Result<(), String> {
-        self.collect_acks_and_relay(false, ctx)
     }
 
     pub(crate) fn num_workers(&self) -> usize {
@@ -242,8 +206,9 @@ impl MasterDispatcher {
     /// epoch while workers stay on the old one and wedge the cluster; pass
     /// `false` to force CONTINUE.
     ///
-    /// `ctx` names the phase in a worker-fault or dead-worker error.
-    fn collect_acks_and_relay(&self, checkpoint_allowed: bool, ctx: &str) -> Result<(), String> {
+    /// `ctx` names the phase in a worker-fault or dead-worker error, so it must
+    /// be the phase this call is in rather than the collector's own busiest use.
+    pub(crate) fn collect_acks_and_relay(&self, ctx: &str, checkpoint_allowed: bool) -> Result<(), String> {
         let nw = self.num_workers();
         // One bit per worker still owing its ACK.
         let mut pending_mask: u64 = worker_mask(nw);
@@ -263,53 +228,52 @@ impl MasterDispatcher {
                     continue;
                 };
                 progressed = true;
-                if decoded.control.flags & FLAG_EXCHANGE != 0 {
-                    if let Some(relay) = acc.process(w, decoded) {
-                        // A round just completed. If a prior round was stamped
-                        // CHECKPOINT, every worker has now consumed that relay
-                        // — a worker issues its next round only after consuming
-                        // the prior relay and bumping its read epoch inline, so
-                        // this round's `num_workers` reports prove it. Reclaim
-                        // the SAL write side NOW, before writing this round, so
-                        // this round lands at write_cursor 0 in the new epoch the
-                        // workers already expect. Direct checkpoint_reset only —
-                        // never checkpoint_post_ack / Flush, which a
-                        // mid-backfill flush would race, orphaning unconsumed
-                        // backfill groups and hanging boot.
-                        if pending_reset {
-                            self.sal.checkpoint_reset();
-                            pending_reset = false;
-                        }
-                        // Decide this round's collective verdict, stamped onto
-                        // its relay. Stop takes precedence: an all-pad round ends
-                        // the backfill and its leftover SAL is reclaimed by the
-                        // normal post-backfill checkpoint. Otherwise, when space
-                        // runs short against this round's own size, stamp
-                        // CHECKPOINT (continue + tell workers to re-epoch inline)
-                        // and arm the reset for the next round barrier. That
-                        // cannot rescue this round — the reset only lands at the
-                        // next barrier, so this round is written at the current
-                        // cursor either way.
-                        let all_pad = relay.all_pad;
-                        let prep = self.prepare_relay(relay)?;
-                        let decision = if all_pad {
-                            BACKFILL_DECISION_STOP
-                        } else if checkpoint_allowed
-                            && (self.relay_fit(prep.footprint) != SalFit::Fits || BACKFILL_RELAY_SPACE_LOW.armed())
-                        {
-                            pending_reset = true;
-                            BACKFILL_DECISION_CHECKPOINT
-                        } else {
-                            BACKFILL_DECISION_CONTINUE
-                        };
-                        self.emit_relay_with_decision(&prep, decision)?;
-                    }
-                } else {
+                if decoded.control.flags & FLAG_EXCHANGE == 0 {
                     if let Some(e) = worker_error(w, ctx, &decoded.control) {
                         return Err(e.text);
                     }
                     pending_mask &= !(1u64 << w);
+                    continue;
                 }
+                let Some(relay) = acc.process(w, decoded) else {
+                    continue; // round still incomplete
+                };
+                // A round just completed. If a prior round was stamped
+                // CHECKPOINT, every worker has now consumed that relay — a worker
+                // issues its next round only after consuming the prior relay and
+                // bumping its read epoch inline, so this round's `num_workers`
+                // reports prove it. Reclaim the SAL write side NOW, before
+                // writing this round, so this round lands at write_cursor 0 in
+                // the new epoch the workers already expect. Direct
+                // checkpoint_reset only — never checkpoint_post_ack / Flush,
+                // which a mid-backfill flush would race, orphaning unconsumed
+                // backfill groups and hanging boot.
+                if pending_reset {
+                    self.sal.checkpoint_reset();
+                    pending_reset = false;
+                }
+                // Decide this round's collective verdict, stamped onto its relay.
+                // Stop takes precedence: an all-pad round ends the backfill and
+                // its leftover SAL is reclaimed by the normal post-backfill
+                // checkpoint. Otherwise, when space runs short against this
+                // round's own size, stamp CHECKPOINT (continue + tell workers to
+                // re-epoch inline) and arm the reset for the next round barrier.
+                // That cannot rescue this round — the reset only lands at the
+                // next barrier, so this round is written at the current cursor
+                // either way.
+                let all_pad = relay.all_pad;
+                let prep = self.prepare_relay(relay)?;
+                let decision = if all_pad {
+                    BACKFILL_DECISION_STOP
+                } else if checkpoint_allowed
+                    && (self.relay_fit(prep.footprint) != SalFit::Fits || BACKFILL_RELAY_SPACE_LOW.armed())
+                {
+                    pending_reset = true;
+                    BACKFILL_DECISION_CHECKPOINT
+                } else {
+                    BACKFILL_DECISION_CONTINUE
+                };
+                self.emit_relay_with_decision(&prep, decision)?;
             }
             if !progressed {
                 self.fail_if_worker_dead(ctx)?;
@@ -326,29 +290,18 @@ impl MasterDispatcher {
     // SAL Checkpoint
     // -----------------------------------------------------------------------
 
-    /// Reclaim before a backfill whose first round could be arbitrarily large.
-    /// A backfill round cannot reclaim mid-flight — the reset must reach the
-    /// workers stamped on the *previous* round's relay, so round one gets
-    /// whatever the cursor happens to leave, and starting from a reclaimed SAL
-    /// is the only lever there is. An idle server past neither line pays
-    /// nothing.
-    fn checkpoint_before_backfill(&self) -> Result<(), String> {
-        // `needs_checkpoint()` is not implied by the margin test:
-        // `GNITZ_CHECKPOINT_BYTES` is unclamped and may sit below the margin.
-        if self.sal.past_reclaim_margin() || self.sal.needs_checkpoint() {
-            self.reclaim_base()?;
-        }
-        Ok(())
+    /// True while a base round has published past the last ephemeral round —
+    /// i.e. every checkpointed view and index on disk is invalid until
+    /// [`Self::restamp_derived`] runs.
+    pub(crate) fn derived_needs_restamp(&self) -> bool {
+        self.cat().durable_generation() > self.last_ephemeral_gen.get()
     }
 
-    /// Invariant: callers must live on a path that owns SAL checkpoint
-    /// exclusivity. Today that is the bootstrap backfill and boot checkpoint, and
-    /// the reactor-parked stop-the-world CREATE-VIEW window (`handle_ddl_txn`
-    /// holds the catalog write lock with the committer proven idle and the
-    /// reactor parked, so no other SAL writer exists — the same exclusivity boot
-    /// has). The *async* fan-out / tick / steady-state DDL paths must NOT call
-    /// this — a concurrent Flush races the committer's own and orphans SAL
-    /// writes straddling `sal.checkpoint_reset`.
+    /// Invariant: the caller must own SAL checkpoint exclusivity — either by
+    /// running before the reactor, or with it parked under the catalog write
+    /// lock and the committer proven idle. The *async* fan-out / tick /
+    /// steady-state DDL paths must NOT call this: a concurrent Flush races the
+    /// committer's own and orphans SAL writes straddling `sal.checkpoint_reset`.
     ///
     /// Publish every base table's shards and reset the SAL, invalidating
     /// checkpointed derived state first. The bump is not optional: this path
@@ -361,12 +314,11 @@ impl MasterDispatcher {
     /// silently stale — the same ordering step 0 of `run_checkpoint_sequence`
     /// uses.
     ///
-    /// Half a checkpoint on its own. Both callers pair it with `restamp_derived`
-    /// in the same reactor-parked span.
-    fn reclaim_base(&self) -> Result<u64, String> {
-        let gen = self.bump_checkpoint_generation()?;
-        self.sync_round(0, SalMessageKind::Flush)?;
-        Ok(gen)
+    /// Half a checkpoint on its own: it must be paired with `restamp_derived` in
+    /// the same reactor-parked span.
+    fn reclaim_base(&self) -> Result<(), String> {
+        self.cat().bump_checkpoint_generation()?;
+        self.sync_round(0, SalMessageKind::Flush)
     }
 
     /// Re-stamp the derived state a `reclaim_base` invalidated, inside the
@@ -393,10 +345,17 @@ impl MasterDispatcher {
     /// A `FlushEph` round's `lsn` IS the checkpoint generation (workers
     /// latch it via `set_resume_generation`); the base round passes 0.
     fn sync_round(&self, lsn: u64, kind: SalMessageKind) -> Result<(), String> {
+        // `kind` already discriminates the two callers, so it names the phase a
+        // dead worker is reported against too.
+        let ctx = if kind == SalMessageKind::FlushEph {
+            "checkpoint ephemeral round"
+        } else {
+            "checkpoint base round"
+        };
         self.write_checkpoint_group(lsn, kind, GroupTargets::AllSilent)
             .map_err(|f| f.text)?;
         self.signal_all();
-        self.collect_acks("recovery sync")?;
+        self.collect_acks_and_relay(ctx, false)?;
         self.checkpoint_post_ack()
     }
 
@@ -405,12 +364,11 @@ impl MasterDispatcher {
     /// bump**, and no second base round once an ephemeral round has re-stamped
     /// derived state at the current generation.
     ///
-    /// Both master-side emitters funnel through here (`sync_round` and
-    /// `write_checkpoint_group`), so the rule is checked in one place rather
-    /// than left as an obligation on each call site. The committer's
-    /// reclaim-only base round inside `await_servicing` rides step 0's bump
-    /// without one of its own — that is the "no intervening ephemeral round"
-    /// clause, encoded rather than excepted.
+    /// Checked on the one path that emits a round rather than left as an
+    /// obligation on each call site. The committer's reclaim-only base round
+    /// inside `await_servicing` rides step 0's bump without one of its own — that
+    /// is the "no intervening ephemeral round" clause, encoded rather than
+    /// excepted.
     fn note_flush_round(&self, lsn: u64, kind: SalMessageKind) {
         let durable = self.cat().durable_generation();
         if kind == SalMessageKind::FlushEph {
@@ -432,9 +390,8 @@ impl MasterDispatcher {
     // -----------------------------------------------------------------------
 
     /// Can a relay of `need` bytes be written, and if not, is a checkpoint enough
-    /// to make room? Every SAL-space decision — `relay_loop`'s, the committer's
-    /// checkpoint test, the watchdog's reclaim timer, the boot backfill — reads
-    /// this one predicate.
+    /// to make room? The one SAL-space predicate: every space decision in the
+    /// tree reads it, so none can disagree with another.
     pub(crate) fn relay_fit(&self, need: usize) -> SalFit {
         self.sal.fit_relay(need)
     }
@@ -497,7 +454,7 @@ impl MasterDispatcher {
         // scattering all W would route each row to its owner W times for the
         // post-relay consolidate to sum into one row at weight W. Take worker
         // 0's payload alone — the same single-sourcing the read gather applies
-        // (`replicated_unicast`). Dropping the copies rather than clamping keeps
+        // (`read_fanout`). Dropping the copies rather than clamping keeps
         // a genuine multiplicity in the source intact. A unary side relays under
         // `source_id == 0`, which names no relation — the guard skips a lookup
         // that cannot hit, and such a view needs no rule anyway: one whose
@@ -561,15 +518,11 @@ impl MasterDispatcher {
     /// this codebase has: `relay_loop` holds `sal_writer_excl` across the call,
     /// while `collect_acks_and_relay` instead runs with the reactor parked, so
     /// no other task can reach the SAL at all.
-    ///
-    /// `collect_acks_and_relay` is the sole STOP/CHECKPOINT stamper (it
-    /// terminates a backfill's chunked exchange on an all-pad round); the
-    /// reactor's `relay_loop` serves only steady-state tick exchanges and always
-    /// passes CONTINUE, which is 0.
     pub(crate) fn emit_relay_with_decision(&self, prep: &RelayPrepared, decision: u64) -> Result<(), String> {
         self.with_relay_group(&prep.view, prep.source_id, &prep.dest, decision, |g| {
-            self.sal.write(g).map_err(|fit| fit.refusal(g.kind).text)
-        })?;
+            self.write_group(g)
+        })
+        .map_err(|f| f.text)?;
         self.signal_all();
         Ok(())
     }
@@ -589,10 +542,17 @@ impl MasterDispatcher {
     /// no-concurrent-relay paths this runs on (boot; the reactor-parked DDL
     /// window). A reclaim here bumps the generation, leaving every checkpointed
     /// view and index invalid until an ephemeral round re-stamps them — so a
-    /// caller that observes the bump must run `restamp_derived` before its window
-    /// closes.
+    /// caller must run `restamp_derived` before its window closes whenever
+    /// [`Self::derived_needs_restamp`] answers true afterwards.
     fn fan_out_backfill(&self, view_id: i64, source_id: i64) -> Result<(), String> {
-        self.checkpoint_before_backfill()?;
+        // A backfill round cannot reclaim mid-flight — the reset reaches the
+        // workers stamped on the *previous* round's relay — so round one gets
+        // whatever the cursor leaves, and reclaiming first is the only lever.
+        // Neither test implies the other: `GNITZ_CHECKPOINT_BYTES` is unclamped
+        // and may sit below the margin.
+        if self.sal.past_reclaim_margin() || self.sal.needs_checkpoint() {
+            self.reclaim_base()?;
+        }
         // Dataless, but it still carries a schema block: that block is what
         // stamps `Batch.schema` on the worker side.
         let source = wire::WireSchema::encoded(source_id, self.schema_desc_for(source_id));
@@ -605,7 +565,7 @@ impl MasterDispatcher {
         })
         .map_err(|f| f.text)?;
         self.signal_all();
-        self.collect_acks_and_relay(true, "backfill relay")
+        self.collect_acks_and_relay("backfill relay", true)
     }
 
     /// Backfill every view in `view_ids`, in dependency order, from each of its
@@ -622,7 +582,7 @@ impl MasterDispatcher {
     /// barrier and `fan_out_backfill` accommodates that — no relay arrives, so
     /// each worker stops on its own drain exhaustion — which is why one driver
     /// serves every shape.
-    pub fn backfill_views_in_dep_order(&self, view_ids: &[i64]) -> Result<(), String> {
+    pub(crate) fn backfill_views_in_dep_order(&self, view_ids: &[i64]) -> Result<(), String> {
         let (dag, registry) = self.cat().dag_and_registry_mut();
         for vid in dag.order_by_view_deps(registry, view_ids) {
             let sources = dag.get_source_ids(registry, vid);
@@ -642,22 +602,28 @@ impl MasterDispatcher {
     /// races this. Checkpointing is forced off: a tick carries no backfill pad,
     /// so a CHECKPOINT verdict would advance only the master's epoch and wedge
     /// the cluster (see `collect_acks_and_relay`).
+    ///
+    /// Writes under no SAL mutex, so `fn` rather than `async fn` is what keeps
+    /// its group out of `fan_out_scan`'s sampled round: making it `async` lets
+    /// the reactor interleave it and breaks that read-freshness contract.
     pub(crate) fn drain_tick_blocking(&self, source_id: i64) -> Result<(), String> {
         self.write_tick_group(source_id, GroupTargets::AllSilent)
             .map_err(|f| f.text)?;
         self.signal_all();
-        self.collect_acks_and_relay(false, "backfill relay")
+        self.collect_acks_and_relay("view tick drain", false)
     }
 
-    pub async fn fan_out_seek(
+    /// Point lookup: unicast to the worker owning `pk`, and hand its single
+    /// reply frame back verbatim.
+    pub(crate) async fn fan_out_seek(
         &self,
         reactor: &crate::runtime::reactor::Reactor,
         target_id: i64,
         pk: u128,
         seek_pk_extra: &[u8],
-    ) -> Result<W2mSlot, String> {
+    ) -> Result<W2mSlot, WorkerFault> {
         let num_workers = self.num_workers();
-        let schema = self.cat().registry().table_entry(target_id)?.schema;
+        let schema = self.schema_desc_for(target_id);
         // Decode the wire pair to the OPK bytes (width-universal), then route off
         // the distribution prefix via the shared `worker_for_pk`. A Seek
         // always carries the full PK and the prefix ⊆ the PK, so a full-PK seek
@@ -678,56 +644,41 @@ impl MasterDispatcher {
                 ..DirectGroup::new(SalMessageKind::Seek)
             })
         })
-        .await
-        .map_err(|f| f.text)?;
+        .await?;
         let slot = slots.pop().expect("unicast fan-out returns one slot");
         // A point seek's reply must fit one frame; a train would be forwarded
         // truncated, so reject it rather than silently drop the remainder.
-        expect_single_frame(&slot, worker, "seek").map_err(|f| f.text)?;
+        expect_single_frame(&slot, worker, "seek")?;
         Ok(slot)
     }
 
-    /// Index lookup: fan one frame out to ALL workers and MERGE every matching
-    /// base row into one batch via the train drain (an oversized worker reply
-    /// arrives as a chunked train; a single-frame reply is a length-1 train).
-    /// Returns the merged base rows, or `None` when no row matches.
+    /// Index lookup: fan one frame out and MERGE every matching base row into
+    /// one batch via the train drain, or `None` when no row matches.
     ///
-    /// The sole index-seek fan-out — a secondary index is one unpartitioned
-    /// table per worker, so nothing derives the owning worker from an indexed
-    /// value and every arity, unique or not, must ask all of them. A unique
-    /// index matches at most one row, so merging one is correct.
+    /// A secondary index is one unpartitioned table per worker, so nothing
+    /// derives the owning worker from an indexed value and every arity, unique or
+    /// not, must ask all of them.
     ///
-    /// The master forwards the client's wire payload verbatim — it never
-    /// decodes seek_pk_extra into u128s and re-encodes them (the worker is
-    /// the sole OPK encoder). seek_col_idx carries pack_pk_cols(col_indices),
-    /// already validated by the caller.
-    /// `_lease` held across the full drain: its workers stream, so releasing
-    /// the gate before every train is consumed (or the drain errors and the
-    /// lease drop discards the rest) risks a discarded late frame.
-    pub async fn fan_out_seek_by_index_collect(
+    /// `seek_col_idx` and `seek_pk_extra` are forwarded verbatim: the worker is
+    /// the sole OPK encoder, and the caller validated the packed column list.
+    pub(crate) async fn fan_out_seek_by_index_collect(
         &self,
         reactor: &crate::runtime::reactor::Reactor,
         target_id: i64,
         seek_col_idx: u64,
         seek_pk: u128,
         seek_pk_extra: &[u8],
-    ) -> Result<Option<Batch>, String> {
+    ) -> Result<Option<Batch>, WorkerFault> {
         const OP: &str = "seek_by_index";
-        // `expected` is captured inside the fan-out closure so the reply
-        // guard is definitionally the schema the request was built from; a
-        // separate pre-fanout catalog read could diverge across the
-        // `sal_excl` await if a DDL interleaves, failing healthy replies.
-        // Single-source a REPLICATED owner: a broadcast-and-merge would append
-        // each matching row `nw` times (weights copied verbatim, no consolidation),
-        // handing the client `nw` duplicates of every row. Hashed owners keep
-        // the fan-out (matches scatter by PK).
-        let unicast = replicated_unicast(self, target_id);
-        let mut expected: Option<SchemaDescriptor> = None;
+        // Single-sourcing a REPLICATED owner is correctness here, not thrift: a
+        // broadcast-and-merge appends each matching row `nw` times (weights
+        // copied verbatim, no consolidation), handing the client `nw` duplicates
+        // of every row.
+        let unicast = read_fanout(self, target_id, None);
+        // The master's own reply guard, not something the group carries: the
+        // worker's `seek_by_index` arm resolves the schema from its own catalog.
+        let expected = self.schema_desc_for(target_id);
         let (slots, scan) = dispatch_scan_fanout(self, reactor, unicast, |targets| {
-            // The schema is the master's own reply guard, not something the
-            // group carries: the worker's `seek_by_index` arm resolves its
-            // own from its own catalog.
-            expected = Some(self.schema_desc_for(target_id));
             self.write_group(&DirectGroup {
                 template: wire::WireMsg {
                     target_id: target_id as u64,
@@ -740,9 +691,7 @@ impl MasterDispatcher {
                 ..DirectGroup::new(SalMessageKind::SeekByIndex)
             })
         })
-        .await
-        .map_err(|f| f.text)?;
-        let expected = expected.expect("fan-out closure ran");
+        .await?;
 
         let mut acc: Option<Batch> = None;
         let mut merged_bytes = 0usize;
@@ -765,61 +714,41 @@ impl MasterDispatcher {
             a.append_mem_batch(mb);
             Ok(())
         })
-        .await
-        .map_err(|f| f.text)?;
+        .await?;
         // The sink runs only for non-empty frames, so `Some` implies rows.
         Ok(acc)
     }
 
-    /// Fan out a SCAN to the workers `unicast` names — [`Fanout`] states what
-    /// each shape costs. Forwards every response frame directly to the client, continuation
-    /// chunks included, and returns `Ok(true)` when all drained trains finish,
-    /// `Ok(false)` if the client disconnects mid-stream, `Err` on a worker
-    /// error.
+    /// Fan out a SCAN to the workers `unicast` names and forward every response
+    /// frame straight to the client, continuation chunks included. `Ok(false)` on
+    /// a mid-stream client disconnect.
     ///
-    /// `kind`/`wire_flags`/`seek_pk_extra` select the read shape. A plain
-    /// scan passes the client's schema version in `wire_flags` so workers can
-    /// decide whether to include a schema block; a [`SalMessageKind::ScanSpec`]
-    /// (`ReadSpec`) read passes the client's bundled spec + reply-schema blob
-    /// **verbatim** in `seek_pk_extra` with `wire_flags = 0`, negotiating no
-    /// version (its reply carries no schema block — the client decodes against
-    /// the schema it authored). The master reads only the bound header out of
-    /// the spec, to route (`confined_worker`); the worker is the sole
-    /// `ReadSpec`/OPK decoder. `unicast` comes from
-    /// [`replicated_unicast`] or [`scan_spec_route`], which own the routing
-    /// policy (replicated relations to worker 0, confinable ranges to their
-    /// owner).
+    /// `kind`/`wire_flags`/`seek_pk_extra` select the read shape: a plain scan
+    /// negotiates its schema block through `wire_flags`, while a `ReadSpec` read
+    /// passes the client's spec blob **verbatim** in `seek_pk_extra` and
+    /// negotiates nothing — the master reads only the bound header, to route, and
+    /// the worker is the sole `ReadSpec`/OPK decoder.
     ///
-    /// `forward_scan_slots` returns on the FIRST worker fault, decode error, or
-    /// client disconnect: `_lease` drops on return and `route_scan_slot` discards
-    /// every undrained frame at the ring boundary, advancing `release_cursor`, so
-    /// a still-streaming worker cannot wedge in `W2mWriter::send_msg` — draining the
-    /// doomed trains would be pure waste. The client may already have received
-    /// earlier workers' data frames when the fault surfaces, so the fault frame
-    /// `finish_scan_fanout` emits can arrive mid-stream: the client's reply
-    /// accumulator, the one reply reassembler, completes the slot on the first
-    /// failing status and discards the batch it had accumulated, so no partial
-    /// rows surface.
+    /// `forward_scan_slots` returns on the FIRST worker fault, decode error or
+    /// client disconnect, without draining the doomed trains: `_lease` drops on
+    /// return and `route_scan_slot` discards every undrained frame at the ring
+    /// boundary, so a still-streaming worker cannot wedge in
+    /// `W2mWriter::send_msg`. The fault frame can therefore reach a client that
+    /// already read earlier data frames; its reply accumulator discards those.
     ///
     /// **It also returns the tick round it sampled**, and samples it *inside* the
-    /// closure `dispatch_scan_fanout` runs under `sal_writer_excl` — the same
+    /// closure `dispatch_scan_fanout` runs under `sal_writer_excl`, the same
     /// window the read's group is written in. That is what makes the round a
     /// property of the SAL prefix rather than of a tick's success: every worker
-    /// sees the read group after exactly the tick groups of rounds `<= T` and
-    /// before any group of a later round.
+    /// sees the read group after exactly the tick groups of rounds `<= T`. The
+    /// mutex earns its place against the *committer*, which holds it across an
+    /// fsync and would otherwise put a read group inside a commit zone.
     ///
-    /// No tick group can land between the sample and the write. `run_tick`
-    /// writes its groups under this mutex; `drain_tick_blocking` writes under
-    /// none, but is `fn` rather than `async fn`, so the single-threaded reactor
-    /// cannot interleave it. The mutex earns its place against the *committer*,
-    /// which holds it across an fsync and would otherwise put a read group
-    /// inside a commit zone.
-    ///
-    /// The round is written into the group's `seek_pk` as well as returned, so the
-    /// worker cuts the delta interval at it rather than walking to the end of its
-    /// store. `seek_pk` is free on a scan group: neither scan arm reads it.
+    /// The round also rides in the group's `seek_pk`, free there because neither
+    /// scan arm reads it, so the worker cuts the delta interval at it rather than
+    /// walking to the end of its store.
     #[allow(clippy::too_many_arguments)]
-    pub async fn fan_out_scan(
+    pub(crate) async fn fan_out_scan(
         &self,
         reactor: &crate::runtime::reactor::Reactor,
         unicast: Fanout,
@@ -852,30 +781,6 @@ impl MasterDispatcher {
         Ok((ok, sampled))
     }
 
-    /// Await + forward one already-dispatched scan relation: the await+drain
-    /// half of `fan_out_scan`, factored out for the multi-scan path
-    /// (`handle_scan_multi`), which writes every relation's group up front under
-    /// one SAL cut via `dispatch_scan_multi_fanout` and then drains each relation
-    /// here, in request order. Awaits every worker's first reply frame (join_all
-    /// across workers for a broadcast, the single slot for a unicast), then
-    /// forwards each worker's train to the client in ascending worker order.
-    ///
-    /// `Ok(false)` on client disconnect, `Err` on a worker fault / malformed
-    /// train. The caller holds the relation's `ScanLease` for the whole call, so
-    /// a `false`/`Err` return drops it and discards the undrained remainder at
-    /// the ring boundary. Draining relation `i` fully before relation `i+1` is
-    /// the FIFO invariant's supported usage: with `FLAG_SCAN_FIFO_REPLY`, each
-    /// worker streams the relations in request order, so relation `i`'s frames
-    /// sit at the front of every ring with a live consumer.
-    pub(crate) async fn await_and_drain_scan_relation(
-        reactor: &crate::runtime::reactor::Reactor,
-        peer: &Peer,
-        scan: &ScanDispatch,
-    ) -> Result<bool, WorkerFault> {
-        let slots = await_scan_slots(reactor, scan).await;
-        forward_scan_slots(reactor, peer, slots, scan).await
-    }
-
     /// Broadcast a DDL batch to every worker inside the zone at `lsn` — one LSN
     /// across all broadcasts of a DDL so recovery can group them as an atomic
     /// zone. The writer marks the first one it admits as the zone's start, which
@@ -884,7 +789,7 @@ impl MasterDispatcher {
     /// Signals nobody: the caller writes inside a `defer_publication` scope, so
     /// nothing here is visible until that scope drops. The zone's one wake is
     /// [`Self::commit_zone`]'s, after it does.
-    pub fn broadcast_ddl(&self, target_id: i64, batch: &Batch, lsn: u64) -> Result<(), WorkerFault> {
+    pub(crate) fn broadcast_ddl(&self, target_id: i64, batch: &Batch, lsn: u64) -> Result<(), WorkerFault> {
         let relation = self.wire_schema(target_id);
         self.write_group(&DirectGroup {
             template: relation.frame(wire::WireMsg::default()),
@@ -901,7 +806,7 @@ impl MasterDispatcher {
     /// workers; `Ok(false)` when no zone is open, and only the wake goes out.
     /// All preceding groups at the zone's LSN belong to it; recovery applies
     /// them only when the sentinel reaches disk before the crash.
-    pub fn commit_zone(&self) -> Result<bool, WorkerFault> {
+    pub(crate) fn commit_zone(&self) -> Result<bool, WorkerFault> {
         let closed = self
             .sal
             .close_zone()
@@ -914,76 +819,33 @@ impl MasterDispatcher {
     // Tick group writer (used by the async tick task in executor.rs)
     // -----------------------------------------------------------------------
 
-    /// The one-shot tick-emit latch, but only for the table the seam names;
-    /// `None` when the seam is unset or `tid` is some other table. Checked before
-    /// the catalog lookup, so an unset seam costs no name resolution.
-    fn injected_tick_emit_latch(&self, tid: i64) -> Option<&'static std::sync::atomic::AtomicBool> {
-        static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let name = TICK_EMIT_ERROR.names()?;
-        let (_, table) = self.cat().get_qualified_name(tid)?;
-        (table == name).then_some(&ARMED)
-    }
-
-    /// Arm half: a committed non-empty push to the named table arms the one-shot
-    /// tick-emit failure.
-    ///
-    /// Arming on a push rather than on "the next tick anywhere" is what makes the
-    /// seam land where the scenario it models does: a `CREATE VIEW` drives one
-    /// tick of its source to seed the view, well before any test read reaches the
-    /// tick loop, so an unconditional latch would always be spent by the CREATE.
-    /// That seeding push carries no rows, hence the row-count test.
-    fn arm_injected_tick_emit_error(&self, target_id: i64, rows: usize) {
-        if rows > 0 {
-            if let Some(armed) = self.injected_tick_emit_latch(target_id) {
-                armed.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// Fire half: fail the armed table's next `write_tick_group` before it writes
-    /// anything — what a full SAL does to a tick. One-shot, so the follow-up read
-    /// can watch the re-queued tid tick and the view converge.
-    fn take_injected_tick_emit_error(&self, tid: i64) -> bool {
-        let fires = self
-            .injected_tick_emit_latch(tid)
-            .is_some_and(|armed| armed.swap(false, std::sync::atomic::Ordering::Relaxed));
-        if fires {
-            gnitz_debug!("injected tick emit error fires (tid={})", tid);
-        }
-        fires
-    }
-
     /// Write a Tick group for `tid`. Does NOT signal: the caller writes
     /// every group in the batch, then calls `signal_all` once — a signal is a
     /// wake, not framing, so batching it changes no outcome. No schema block:
     /// `handle_tick` looks the target's schema up in its own catalog.
     ///
-    /// **This is where the tick round is allocated**, because this is the one
-    /// writer of a tick group: `run_tick` and `drain_tick_blocking` — itself the
-    /// CREATE-VIEW drain, the boot recovery sweep and the post-reclaim restamp —
-    /// all funnel here. Allocating anywhere else means enumerating those paths,
-    /// and an enumeration is wrong the day a fifth appears. It also makes the
-    /// idle-poll map complete for free: the round, the record of which views it
-    /// reaches, and the group write are one synchronous await-free body, so a poll
-    /// that sees the counter advanced also sees the round recorded.
+    /// **The tick round is allocated here**, because this is the one writer of a
+    /// tick group — anywhere else and the allocation would have to enumerate the
+    /// paths that emit one. It also makes the idle-poll map complete for free:
+    /// the round, the record of which views it reaches, and the group write are
+    /// one await-free body, so a poll that sees the counter advanced also sees
+    /// the round recorded.
     ///
-    /// The round rides in the group header's `lsn`, which is free for it: every
-    /// command verb passes `0` there except the ephemeral flush round, which
-    /// carries the checkpoint generation, and the replay walk already says a
-    /// non-zero `lsn` alone does not make a group a zone. So the round costs no
-    /// SAL bytes and changes no recovery behaviour.
+    /// The round rides in the group header's `lsn`, free there because every
+    /// command verb but the ephemeral flush round passes `0`, and a non-zero
+    /// `lsn` alone does not make a group a zone on the replay walk.
     ///
-    /// The counter is advanced — and the map written — **before** the
-    /// injected-failure seam fires, so a failed emit burns a round rather than
-    /// reusing it: rounds must be strictly increasing, and the re-queued tid ticks
-    /// again under a later one. Recording a round that never reached a worker
-    /// gates away nothing: no rows exist at it, and the re-tick raises the map
-    /// past it, so a cursor sitting at the burnt round falls through again.
+    /// A failed emit **burns** its round rather than reusing it, since rounds
+    /// must be strictly increasing. That gates nothing away: no rows exist at the
+    /// burnt round, and the re-queued tid's next tick raises the map past it.
     pub(crate) fn write_tick_group(&self, tid: i64, targets: GroupTargets<'_>) -> Result<(), WorkerFault> {
         let round = self.tick_round.get() + 1;
         self.tick_round.set(round);
         self.record_delta_round(tid, round);
-        if self.take_injected_tick_emit_error(tid) {
+        // Only a replied tick: the CREATE-VIEW, boot-sweep and restamp drains
+        // write `AllSilent` and would otherwise spend the one-shot before the
+        // test's own tick ever reaches the tick loop.
+        if matches!(targets, GroupTargets::All(_)) && TICK_EMIT_ERROR.take_once() {
             return Err(format!("injected tick emit error (tid={tid})").into());
         }
         self.write_group(&DirectGroup {
@@ -1074,55 +936,48 @@ impl MasterDispatcher {
     // Lifecycle
     // -----------------------------------------------------------------------
 
-    pub fn check_workers(&self) -> i32 {
-        // Probe each worker by its own pid, not `waitpid(-1)`. A per-pid
-        // `waitpid` returns ECHILD — a detected death — even if the zombie was
-        // reaped elsewhere, whereas `waitpid(-1)` returns 0 ("some child is
-        // alive") and silently misses one worker's death while others run, so it
-        // would go blind the moment a SIGCHLD/signalfd reaper or SA_NOCLDWAIT is
-        // ever added. It also names the exact dead worker for the error/log.
+    /// The first dead worker, reported exactly once: its pid slot is zeroed, so
+    /// the next probe skips it rather than re-reading ECHILD off a non-child.
+    ///
+    /// Probes each worker by its own pid, not `waitpid(-1)`. A per-pid `waitpid`
+    /// returns ECHILD — a detected death — even if the zombie was reaped
+    /// elsewhere, whereas `waitpid(-1)` returns 0 ("some child is alive") and
+    /// silently misses one worker's death while others run, so it would go blind
+    /// the moment a SIGCHLD/signalfd reaper or SA_NOCLDWAIT is ever added. It
+    /// also names the exact dead worker for the error/log.
+    pub(crate) fn check_workers(&self) -> Option<usize> {
         for w in 0..self.num_workers() {
             let pid = self.worker_pids.borrow()[w];
             if pid <= 0 {
                 continue;
             }
             let mut status: i32 = 0;
-            loop {
-                let rpid = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-                if rpid > 0 {
-                    self.worker_pids.borrow_mut()[w] = 0; // reaped — never waitpid it again
-                    return w as i32;
-                }
-                if rpid == 0 {
-                    break; // still running
-                }
-                // rpid == -1
-                match std::io::Error::last_os_error().raw_os_error() {
-                    Some(libc::EINTR) => continue, // signal, not death — retry
-                    Some(libc::ECHILD) => {
-                        self.worker_pids.borrow_mut()[w] = 0; // already gone
-                        return w as i32;
-                    }
-                    _ => break, // unexpected errno: treat as alive
-                }
+            let dead = match retry_eintr(|| unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }) {
+                Ok(0) => false, // still running
+                Ok(_) => true,  // its zombie was ours to reap
+                // ECHILD: reaped elsewhere, so equally dead. Any other errno is
+                // unexpected and read as alive rather than as a crash.
+                Err(e) => e.raw_os_error() == Some(libc::ECHILD),
+            };
+            if dead {
+                self.worker_pids.borrow_mut()[w] = 0;
+                return Some(w);
             }
         }
-        -1
+        None
     }
 
     /// Broadcast `Shutdown` (each worker flushes + `_exit`s) and reap the
-    /// worker processes.
-    pub fn shutdown_workers(&self) {
+    /// worker processes, blocking on each.
+    pub(crate) fn shutdown_workers(&self) {
         // No schema block: the worker's `Shutdown` arm takes no arguments.
         let _ = self.write_group(&DirectGroup::new(SalMessageKind::Shutdown));
         self.signal_all();
         for w in 0..self.num_workers() {
-            let pid = self.worker_pids.borrow()[w];
+            let pid = std::mem::replace(&mut self.worker_pids.borrow_mut()[w], 0);
             if pid > 0 {
                 let mut status: i32 = 0;
-                unsafe {
-                    libc::waitpid(pid, &mut status, 0);
-                }
+                let _ = retry_eintr(|| unsafe { libc::waitpid(pid, &mut status, 0) });
             }
         }
         // All workers reaped: no process can race a removal. Reclaim any dirs
@@ -1147,7 +1002,6 @@ impl MasterDispatcher {
         req_ids: &[u64],
         recoverable: bool,
     ) -> Result<(), SalFit> {
-        self.arm_injected_tick_emit_error(target_id, batch.len());
         let relation = self.wire_schema(target_id);
         // Identical scatter for both routings; only the per-worker index fill
         // differs (full broadcast vs PK-partitioned). One `with_group` call site
@@ -1194,26 +1048,20 @@ impl MasterDispatcher {
         })
     }
 
-    /// Post-ACK checkpoint cleanup: flush system tables before resetting
-    /// the SAL cursor (their data lives in SAL entries about to be
-    /// discarded), then advance the epoch. Called by both the synchronous
-    /// `sync_round` and the async committer after it collects Flush ACKs.
+    /// Post-ACK checkpoint cleanup, run once a round's Flush ACKs are in: flush
+    /// the system tables before resetting the SAL cursor (their data lives in
+    /// SAL entries about to be discarded), then advance the epoch.
     ///
-    /// Finalizes **both** checkpoint rounds — base and ephemeral. The ephemeral
-    /// round must flush too: a `commit_serial_range_durable` advance can land in
-    /// the `sys_sequences` MemTable during the drain window (after the base
-    /// round's reset), so this flush is its only durability event before the
-    /// ephemeral reset makes the SAL tail useless for recovery. The
-    /// gated-deletion drain is a no-op in the ephemeral position (DDL is
-    /// barrier-deferred through the whole checkpoint, so nothing enqueues after
-    /// the base round drained).
+    /// Finalizes **both** rounds. The ephemeral one must flush too: a
+    /// `commit_serial_range_durable` advance can land in the `sys_sequences`
+    /// MemTable during the drain window, after the base round's reset, so this
+    /// flush is its only durability event before the ephemeral reset makes the
+    /// SAL tail useless for recovery.
     ///
     /// Returns the flush error WITHOUT resetting the SAL when the system-table
     /// flush fails: the SAL entries about to be discarded are that data's only
-    /// durable copy, so resetting on a swallowed failure destroys it — the same
-    /// hazard the boot path guards via `flush_all_system_tables`. Callers leave
-    /// the SAL intact and retry on a later checkpoint (committer) or abort boot
-    /// (`sync_round`).
+    /// durable copy, so resetting on a swallowed failure destroys it. The caller
+    /// leaves the SAL intact and either retries on a later checkpoint or aborts.
     pub(crate) fn checkpoint_post_ack(&self) -> Result<(), String> {
         let cat = self.cat();
         cat.flush_all_system_tables()?;
@@ -1223,13 +1071,6 @@ impl MasterDispatcher {
         self.sal.checkpoint_reset();
         gnitz_info!("SAL checkpoint epoch={}", self.sal.epoch());
         Ok(())
-    }
-
-    /// Bump the committed checkpoint generation (step 0 of the sequence).
-    /// Delegates to the catalog: durably records the seq-4 row and moves this
-    /// engine's resume generation onto it. Returns the new generation.
-    pub(crate) fn bump_checkpoint_generation(&self) -> Result<u64, String> {
-        self.cat().bump_checkpoint_generation()
     }
 
     /// Synchronous boot-end checkpoint (pre-reactor W2M path): record the
@@ -1250,28 +1091,19 @@ impl MasterDispatcher {
 
     /// Accessor for the committer. True when the SAL write cursor has
     /// crossed the configured checkpoint threshold.
-    pub fn sal_needs_checkpoint(&self) -> bool {
+    pub(crate) fn sal_needs_checkpoint(&self) -> bool {
         self.sal.needs_checkpoint()
     }
 
-    /// Get the schema descriptor for a target_id. Panics if the table
-    /// has no schema (committer should only see tables that validated).
-    pub fn schema_desc_for(&self, target_id: i64) -> SchemaDescriptor {
+    /// The descriptor `target_id` is registered with. Panics on an unregistered
+    /// id: every caller reaches it holding the catalog lock the registry's own
+    /// writers take, so a miss is broken lock discipline, not a bad client id.
+    pub(crate) fn schema_desc_for(&self, target_id: i64) -> SchemaDescriptor {
         self.cat()
             .registry()
             .get_schema_desc(target_id)
             .unwrap_or_else(|| panic!("master: no schema for target_id={target_id}"))
     }
-}
-
-/// Await the first reply slot of every worker this scan dispatched to, in reply
-/// order. Shared by `dispatch_scan_fanout`, `fan_out_scan` and
-/// `await_and_drain_scan_relation`.
-pub(crate) async fn await_scan_slots(reactor: &crate::runtime::reactor::Reactor, scan: &ScanDispatch) -> Vec<W2mSlot> {
-    crate::runtime::reactor::join_all_unpin(
-        (0..scan.reply_count()).map(|i| reactor.await_scan_slot(scan.reply(i).1 as u32)),
-    )
-    .await
 }
 
 #[cfg(test)]

@@ -20,13 +20,8 @@ impl crate::runtime::wire::WireMsg<'_> {
 /// broken child and a green test.
 pub(crate) unsafe fn assert_child_exited_ok(pid: libc::pid_t) {
     let mut status = 0i32;
-    while libc::waitpid(pid, &mut status, 0) < 0 {
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EINTR),
-            "waitpid failed on child {pid}"
-        );
-    }
+    gnitz_store::foundation::posix_io::retry_eintr(|| libc::waitpid(pid, &mut status, 0))
+        .unwrap_or_else(|e| panic!("waitpid failed on child {pid}: {e}"));
     assert!(
         libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
         "child {pid} did not exit cleanly (status {status:#x})"

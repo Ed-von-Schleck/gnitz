@@ -7,12 +7,13 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use libc::c_int;
 
 /// Retry a raw syscall until it succeeds (`>= 0`) or fails with an error other
-/// than EINTR. The success value is discarded, so this suits only calls whose
-/// outcome is "it happened" — never a short `write`.
-pub fn retry_eintr(mut f: impl FnMut() -> c_int) -> std::io::Result<()> {
+/// than EINTR, handing back what it returned. Still not for a short `write`: a
+/// partial write returns a non-negative count, which this reports as success.
+pub fn retry_eintr(mut f: impl FnMut() -> c_int) -> std::io::Result<c_int> {
     loop {
-        if f() >= 0 {
-            return Ok(());
+        let ret = f();
+        if ret >= 0 {
+            return Ok(ret);
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EINTR) {

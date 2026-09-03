@@ -107,8 +107,8 @@ pub struct MasterDispatcher {
     /// (DDL between bursts) is still checked at pop time.
     check_batch_pool: RefCell<FxHashMap<preflight::PoolSlot, Vec<Batch>>>,
 
-    /// The generation the last ephemeral round stamped. Read only inside
-    /// `note_flush_round`'s `debug_assert!`, so it is a debug-build guard.
+    /// The generation the last ephemeral round stamped. Set unconditionally, so
+    /// `derived_needs_restamp` reads it in release builds too.
     last_ephemeral_gen: Cell<u64>,
 
     /// The last tick round allocated. **Strictly increasing**, one per emitted
@@ -149,9 +149,9 @@ pub struct MasterDispatcher {
     /// send, zero SAL bytes, zero wakeups.
     ///
     /// Written where the round is allocated, in `write_tick_group`, and for the
-    /// same reason: a map maintained in `run_tick` would miss every round the
-    /// three `drain_tick_blocking` callers emit, and a view reached by one of those
-    /// would then be gated as unchanged — a silent hole.
+    /// same reason: a map maintained in `run_tick` would miss every round a
+    /// `drain_tick_blocking` emits, and a view reached by one of those would then
+    /// be gated as unchanged — a silent hole.
     ///
     /// An **over-approximation** that errs in the one safe direction: it is raised
     /// for every view in the emitted tid's forward closure, but a view whose
@@ -170,7 +170,7 @@ pub struct MasterDispatcher {
     last_delta_round: RefCell<FxHashMap<i64, u64>>,
 
     /// A `u64` taken from the OS at boot, mixed into every delta reply's cursor
-    /// tag. Not from a seeded generator: two back-to-back boots must not collide.
+    /// tag; `MasterDispatcher::delta_cursor_tag` states what the tag answers.
     boot_nonce: u64,
 }
 
@@ -179,7 +179,6 @@ mod preflight;
 mod train;
 mod unique_filter;
 
-pub(crate) use dispatch::scan_spec_route;
 pub(crate) use preflight::TxnFamily;
 use train::{drain_index_scan, expect_single_frame, forward_scan_slots, parse_train_header, scan_decode_err};
 pub(crate) use unique_filter::UniqueFilter;
@@ -230,16 +229,13 @@ pub(crate) async fn await_worker_acks(
     op: &str,
     futs: &mut Vec<crate::runtime::reactor::ReplyFuture>,
     acks: &mut Vec<Option<DecodedWire>>,
-) -> Result<(), String> {
+) -> Result<(), WorkerFault> {
     futs.clear();
     futs.extend(ids.iter().map(|&id| reactor.await_reply(id)));
     crate::runtime::reactor::join_into(futs, acks).await;
     let err = first_worker_error_opt(op, acks);
     acks.clear();
-    // Flattened: an ACK-shaped fan-out (push, tick, flush, relay) is reported by
-    // a caller with no typed status to forward. Only the scan-forward stack and
-    // the commit path carry the whole [`WorkerFault`].
-    err.map_or(Ok(()), |f| Err(f.text))
+    err.map_or(Ok(()), Err)
 }
 
 /// Which workers a scan-shaped dispatch goes to, before any request id exists.
@@ -252,17 +248,23 @@ pub(crate) enum Fanout {
     One(usize),
 }
 
-/// Fan-out shape for a scan-shaped dispatch over `target_id`: worker 0 alone
-/// when the relation is REPLICATED — every worker holds an identical full copy,
-/// so a broadcast would stream/merge the same rows `nw` times — else broadcast.
-/// The single owner of the replicated→single-source routing policy for
-/// `dispatch_scan_fanout` callers.
-pub(crate) fn replicated_unicast(disp: &MasterDispatcher, target_id: i64) -> Fanout {
-    if disp.cat().registry().relation_is_replicated(target_id) {
-        Fanout::One(0)
-    } else {
-        Fanout::Broadcast
+/// Which workers answer a read of `target_id`: the one read-routing rule, taking
+/// the `ReadSpec` its verb already unpacked when there is one.
+///
+/// Single-sourcing a replicated relation is **correctness**, not thrift, for two
+/// of the callers: a fan-out returns the same row `nw` times, which
+/// `fan_out_seek_by_index_collect` merges into `nw` duplicates for the client and
+/// `PreflightAccumulator::offer` reads as a duplicate key.
+pub(crate) fn read_fanout(disp: &MasterDispatcher, target_id: i64, spec: Option<SpecBytes<'_>>) -> Fanout {
+    let Some(entry) = disp.cat().registry().entry(target_id) else {
+        return Fanout::Broadcast;
+    };
+    if entry.schema.placement().is_replicated() {
+        return Fanout::One(0);
     }
+    spec.and_then(gnitz_wire::peek_pk_range)
+        .and_then(|r| entry.schema.confined_worker(&r, disp.num_workers()))
+        .map_or(Fanout::Broadcast, Fanout::One)
 }
 
 /// A dispatched scan: who answers it, on which request ids, and the lease
@@ -271,10 +273,10 @@ pub(crate) fn replicated_unicast(disp: &MasterDispatcher, target_id: i64) -> Fan
 /// Replies are addressed only through [`Self::reply`], which returns the
 /// producing worker and its request id together.
 ///
-/// **Hold it to the end of the drain.** Dropping it releases the lease, which
-/// deregisters the ids; `route_scan_slot` then discards every queued and future
-/// frame at the ring boundary, which is what cancels a scan on client death and
-/// what would silently truncate one that is still wanted.
+/// Dropping it releases the lease, which deregisters the ids; `route_scan_slot`
+/// then discards every queued and future frame at the ring boundary — what
+/// cancels a scan on client death. The drain verbs take `&self`, so no drain
+/// outlives the lease that keeps its frames arriving.
 pub(crate) struct ScanDispatch {
     /// Reply `i` arrives on `ids[i]`, for `i < n`. Indexed by **reply**, never
     /// by worker — a unicast has one reply, so it uses one slot.
@@ -330,6 +332,33 @@ impl ScanDispatch {
     pub(crate) fn reply(&self, i: usize) -> (usize, u64) {
         (self.worker.unwrap_or(i), self.ids[i])
     }
+
+    /// Await the first reply slot of every worker this scan dispatched to, in
+    /// reply order.
+    pub(crate) async fn await_slots(&self, reactor: &crate::runtime::reactor::Reactor) -> Vec<W2mSlot> {
+        crate::runtime::reactor::join_all_unpin(
+            (0..self.reply_count()).map(|i| reactor.await_scan_slot(self.reply(i).1 as u32)),
+        )
+        .await
+    }
+
+    /// Await this scan's replies and forward every worker's train to the client
+    /// in ascending worker order — the await+drain half of `fan_out_scan`, which
+    /// the multi-scan path reaches on its own after dispatching every relation
+    /// under one SAL cut. `Ok(false)` on client disconnect.
+    ///
+    /// Draining relation `i` fully before relation `i+1` is the FIFO invariant's
+    /// supported usage: under `FLAG_SCAN_FIFO_REPLY` each worker streams the
+    /// relations in request order, so relation `i`'s frames sit at the front of
+    /// every ring with a live consumer.
+    pub(crate) async fn await_and_forward(
+        &self,
+        reactor: &crate::runtime::reactor::Reactor,
+        peer: &Peer,
+    ) -> Result<bool, WorkerFault> {
+        let slots = self.await_slots(reactor).await;
+        forward_scan_slots(reactor, peer, slots, self).await
+    }
 }
 
 /// Fan a scan/seek group out to the workers under `submit` and await their
@@ -364,7 +393,7 @@ where
             Fanout::Broadcast => disp.signal_all(),
         }
     }
-    let slots = dispatch::await_scan_slots(reactor, &scan).await;
+    let slots = scan.await_slots(reactor).await;
     Ok((slots, scan))
 }
 

@@ -285,7 +285,7 @@ fn drain_ready_batch(rx: &mut chan::Receiver<CommitRequest>, first: CommitReques
 /// advance can land in the `sys_sequences` MemTable during the drain window
 /// after the base round's reset, so the ephemeral reset must flush the system
 /// tables first or that advance is discarded on a crash.
-async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) -> Result<(), String> {
+async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) -> Result<(), WireFault> {
     let nw = shared.disp().num_workers();
     // A round already costs a broadcast, an `nw`-way ACK wait, a system-table
     // flush and a SAL reset, so it allocates its own scratch rather than
@@ -305,14 +305,13 @@ async fn flush_round(shared: &Rc<Shared>, ephemeral_gen: Option<u64>) -> Result<
             Some(gen) => (gen, SalMessageKind::FlushEph),
             None => (0, SalMessageKind::Flush),
         };
-        disp.write_checkpoint_group(lsn, kind, GroupTargets::All(&req_ids))
-            .map_err(|f| f.text)?;
+        disp.write_checkpoint_group(lsn, kind, GroupTargets::All(&req_ids))?;
         disp.signal_all();
     }
 
     await_worker_acks(&shared.reactor, &req_ids, "checkpoint", &mut fut_slots, &mut ack_slots).await?;
     // Both rounds finalize the same way: flush system tables, then reset the SAL.
-    guard_panic("checkpoint_post_ack", || shared.disp().checkpoint_post_ack())
+    guard_panic("checkpoint_post_ack", || shared.disp().checkpoint_post_ack()).map_err(WireFault::from)
 }
 
 /// The full steady-state checkpoint sequence: gen bump → base round → drain →
@@ -336,7 +335,7 @@ async fn run_checkpoint_sequence(
 ) {
     // Step 0: gen bump. From this instant every existing rederived manifest is
     // stale; a crash below rebuilds views instead of silently staleifying them.
-    let gen = match shared.disp().bump_checkpoint_generation() {
+    let gen = match shared.disp().cat().bump_checkpoint_generation() {
         Ok(g) => g,
         // The generation bump is what makes every existing rederived manifest
         // stale before the rounds below overwrite the base. Failing it leaves
@@ -370,7 +369,7 @@ async fn run_checkpoint_sequence(
     // Step 2 — DRAIN (lock released). One Drain suffices: the tick loop walks the
     // source's full dependent closure with inline exchange rounds, and pushes are
     // held so `tick_rows` cannot grow. Mirrors the SCAN drain.
-    let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
+    let (done_tx, done_rx) = oneshot::channel::<Result<(), WireFault>>();
     shared.tick_tx.send(TickTrigger::Drain { done: done_tx });
     let drained = await_servicing(done_rx, rx, batch, shared).await;
     // Step 3 would stamp every view manifest at `gen` while the views are missing

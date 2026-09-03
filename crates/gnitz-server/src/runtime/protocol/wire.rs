@@ -65,8 +65,9 @@ pub(crate) struct WireSchema {
 }
 
 impl WireSchema {
-    /// A one-off anonymous block, encoded here and cached nowhere — for a
-    /// projected or synthetic schema no catalog entry describes.
+    /// A one-off **anonymous** block, encoded here and cached nowhere: smaller in
+    /// every worker's SAL slot than [`Self::from_catalog`]'s cached *named* one,
+    /// and the only option for a schema no catalog entry describes.
     pub(crate) fn encoded(tid: i64, descriptor: SchemaDescriptor) -> Self {
         WireSchema {
             tid,

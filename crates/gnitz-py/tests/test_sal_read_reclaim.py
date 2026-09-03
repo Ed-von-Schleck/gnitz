@@ -242,7 +242,6 @@ def test_failed_tick_reports_and_requeues(tick_emit_fault_server):
     client = tick_emit_fault_server
     sn = "tef_" + str(random.randint(100_000, 999_999))
     client.create_schema(sn)
-    # `tickfault` is the name the fixture armed the seam on.
     client.execute_sql(
         "CREATE TABLE tickfault (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
         schema_name=sn,

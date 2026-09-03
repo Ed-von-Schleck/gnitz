@@ -17,7 +17,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use super::{await_barrier, decode_client_batch, guard_panic, park_until, send_error, send_msg, Shared, TickTrigger};
+use super::{await_barrier, decode_client_batch, guard_panic, park_until, send_fault, send_msg, Shared, TickTrigger};
 use crate::catalog::{family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates, SysFamily, SEQ_TAB_ID};
 use crate::runtime::committer::BarrierKind;
 use crate::runtime::lsn::ZoneLsnAllocator;
@@ -28,7 +28,7 @@ use crate::runtime::sal::SalFit;
 use crate::runtime::wire as ipc;
 use gnitz_store::foundation::fault::Seam;
 use gnitz_store::storage::Batch;
-use gnitz_wire::STATUS_OK;
+use gnitz_wire::{WireFault, STATUS_OK};
 
 /// `GNITZ_INJECT_DDL_PANIC=after_broadcasts`: crash the master between a DDL
 /// zone's broadcasts and its commit sentinel.
@@ -174,7 +174,9 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: 
                 gnitz_debug!("DDL_TXN SLOW total={:?} families={}", total, family_count);
             }
         }
-        Err(e) => send_error(peer, 0, client_id, e.as_bytes()).await,
+        // `validate_unique_index_create`'s refusal keeps its own status; every
+        // other failure in the body is the untyped `STATUS_ERROR` it already was.
+        Err(f) => send_fault(peer, 0, client_id, &f).await,
     }
 }
 
@@ -189,12 +191,12 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: 
 /// SCHEMA bundle pass the empty-schema guard. On any failure the applied families
 /// are negated in master memory before broadcast, so neither a crash nor a
 /// precheck failure can strand an orphan row.
-async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), String> {
+async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), WireFault> {
     // Decode the bundle and materialise each family's wal-block slice into an
     // owned Batch up front (before any lock) — see `decode_sys_family`.
     let raw_families = gnitz_wire::txn_frame::decode_ddl_txn(data).map_err(|e| format!("decode error: {e}"))?;
     if raw_families.is_empty() {
-        return Err("DDL_TXN: empty family bundle".to_string());
+        return Err("DDL_TXN: empty family bundle".into());
     }
     let family_count = raw_families.len();
     // Slotted by discriminant, so "at most one block per family" is a structural
@@ -206,7 +208,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
     for &(tid, slice) in &raw_families {
         let (family, batch) = decode_sys_family(tid as i64, slice).map_err(|e| format!("DDL_TXN: {e}"))?;
         if families[family.index()].replace(batch).is_some() {
-            return Err(format!("DDL_TXN: bundle carries two blocks for family {tid}"));
+            return Err(format!("DDL_TXN: bundle carries two blocks for family {tid}").into());
         }
     }
 
@@ -440,7 +442,6 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
 
     // Populate every new view. A post-fsync Err cannot be rolled back (the CREATE
     // is durable), so abort — restart's boot rebuild refills it.
-    let gen_before = shared.cat().durable_generation();
     guard_panic("view-backfill", || {
         shared.disp().backfill_views_in_dep_order(&new_view_ids)
     })
@@ -451,12 +452,10 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         );
     });
 
-    // `checkpoint_before_backfill` is the only thing above that bumps. If it
-    // fired, every view and index is invalid on disk right now; finish the
-    // checkpoint here, while the reactor is still parked and the tick loop
-    // still quiesced, rather than leaving the database rebuild-on-boot until
+    // Finish the checkpoint here, while the reactor is still parked and the tick
+    // loop still quiesced, rather than leaving the database rebuild-on-boot until
     // something wakes the committer.
-    if shared.cat().durable_generation() != gen_before {
+    if shared.disp().derived_needs_restamp() {
         let mut pending = Vec::new();
         shared.drain_live_tick_rows_into(&mut pending);
         guard_panic("view-restamp", || shared.disp().restamp_derived(&pending)).unwrap_or_else(|e| {

@@ -1,7 +1,7 @@
 //! Master-side unique-index filter cache: the `UniqueFilter` / `WarmupGuard` /
-//! `UniqueIndexDesc` types, `extract_into_filter`, and the `MasterDispatcher`
-//! methods that warm, query, seed, and invalidate the per-`(table,
-//! packed_cols)` filters (the preflight seed path shares the types).
+//! `UniqueIndexDesc` types, `extract_into_filter`, and the verbs that warm,
+//! query, seed, and invalidate the per-`(table, packed_cols)` filters (the
+//! preflight seed path shares the types).
 
 use super::*;
 use gnitz_store::schema::key::probe_key;
@@ -247,93 +247,6 @@ impl MasterDispatcher {
         self.unique_filters.borrow_mut().remove(&(owner_id, packed));
     }
 
-    /// Populate every not-yet-warm unique filter on `table_id` from a full scan
-    /// of the committed table, feeding each worker's reply frames straight into
-    /// the filters. Nothing is concatenated master-side: on a table of tens of
-    /// millions of rows a merged `Batch` would peak at the whole scan size.
-    pub(super) async fn ensure_unique_filters_warm(
-        disp: &MasterDispatcher,
-        reactor: &crate::runtime::reactor::Reactor,
-        table_id: i64,
-    ) -> Result<(), String> {
-        let (missing, mut guard): (Vec<UniqueIndexDesc>, WarmupGuard) = {
-            let mut filters = disp.unique_filters.borrow_mut();
-            let missing: Vec<UniqueIndexDesc> = disp
-                .unique_index_descriptors(table_id)
-                .into_iter()
-                .filter(|d| !filters.contains_key(&(table_id, d.packed)))
-                .collect();
-            if missing.is_empty() {
-                return Ok(());
-            }
-            for d in &missing {
-                filters.insert((table_id, d.packed), UniqueFilter::new());
-            }
-            let guard = WarmupGuard {
-                disp,
-                table_id,
-                keys: missing.iter().map(|d| d.packed).collect(),
-                disarmed: false,
-            };
-            (missing, guard)
-        };
-        let schema = disp.schema_desc_for(table_id);
-
-        // Single-source a REPLICATED table's warmup scan: a fan-out would
-        // stream `nw` copies of the same rows back to build one filter (a set —
-        // dedup keeps it correct, but the extra `nw - 1` full-table scans are
-        // pure waste).
-        let unicast = replicated_unicast(disp, table_id);
-
-        // `_lease` held across the full continuation drain below; its workers
-        // stream multi-frame trains, and on an early error return (or a
-        // mid-scan cancellation) the lease drop discards every undrained
-        // frame at the ring boundary.
-        let (slots, scan) = dispatch_scan_fanout(disp, reactor, unicast, |targets| {
-            disp.write_group(&DirectGroup {
-                template: wire::WireMsg {
-                    target_id: table_id as u64,
-                    ..Default::default()
-                },
-                targets,
-                ..DirectGroup::new(SalMessageKind::Scan)
-            })
-        })
-        .await
-        .map_err(|f| f.text)?;
-
-        // Drain every worker's continuation-frame train into the cold filters.
-        // `drain_index_scan` owns the early-return error contract (the lease
-        // drop above discards any undrained frames at the ring boundary), the
-        // schema guard against DDL-lagged worker replies, the zero-copy
-        // `MemBatch` lifetime, and the continuation-schema-hint handling.
-        // On failure (worker crash mid-scan or cancellation) the guard is left
-        // armed, so its Drop removes the cold entries and the next validation
-        // retries warmup from scratch.
-        drain_index_scan(slots, &scan, reactor, "scan", &schema, |mb, _| {
-            let mut filters = disp.unique_filters.borrow_mut();
-            for d in &missing {
-                if let Some(filter) = filters.get_mut(&(table_id, d.packed)) {
-                    extract_into_filter(filter, mb, &d.spec);
-                }
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|f| f.text)?;
-
-        // Fully populated → mark warm so the broadcast-skip shortcut may trust
-        // them, and disarm the guard so its Drop leaves them in place.
-        let mut filters = disp.unique_filters.borrow_mut();
-        for d in &missing {
-            if let Some(f) = filters.get_mut(&(table_id, d.packed)) {
-                f.warm = true;
-            }
-        }
-        guard.disarmed = true;
-        Ok(())
-    }
-
     /// Publish the `(table_id, packed)` filter the CREATE-time pre-flight
     /// built under the catalog write lock, marking it warm so the first INSERT
     /// skips `ensure_unique_filters_warm`. A pre-flight that overflowed hands
@@ -345,6 +258,90 @@ impl MasterDispatcher {
         filter.warm = true; // pre-flight scanned every worker under the write lock
         self.unique_filters.borrow_mut().insert((table_id, packed), filter);
     }
+}
+
+/// Populate every not-yet-warm unique filter on `table_id` from a full scan
+/// of the committed table, feeding each worker's reply frames straight into
+/// the filters. Nothing is concatenated master-side: on a table of tens of
+/// millions of rows a merged `Batch` would peak at the whole scan size.
+pub(super) async fn ensure_unique_filters_warm(
+    disp: &MasterDispatcher,
+    reactor: &crate::runtime::reactor::Reactor,
+    table_id: i64,
+) -> Result<(), WorkerFault> {
+    let (missing, mut guard): (Vec<UniqueIndexDesc>, WarmupGuard) = {
+        let mut filters = disp.unique_filters.borrow_mut();
+        let missing: Vec<UniqueIndexDesc> = disp
+            .unique_index_descriptors(table_id)
+            .into_iter()
+            .filter(|d| !filters.contains_key(&(table_id, d.packed)))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        for d in &missing {
+            filters.insert((table_id, d.packed), UniqueFilter::new());
+        }
+        let guard = WarmupGuard {
+            disp,
+            table_id,
+            keys: missing.iter().map(|d| d.packed).collect(),
+            disarmed: false,
+        };
+        (missing, guard)
+    };
+    let schema = disp.schema_desc_for(table_id);
+
+    // Cost only, not correctness: the filter is a set, so a fan-out's `nw`
+    // copies of every row dedup away — but the extra `nw - 1` full-table
+    // scans are pure waste.
+    let unicast = read_fanout(disp, table_id, None);
+
+    // `_lease` held across the full continuation drain below; its workers
+    // stream multi-frame trains, and on an early error return (or a
+    // mid-scan cancellation) the lease drop discards every undrained
+    // frame at the ring boundary.
+    let (slots, scan) = dispatch_scan_fanout(disp, reactor, unicast, |targets| {
+        disp.write_group(&DirectGroup {
+            template: wire::WireMsg {
+                target_id: table_id as u64,
+                ..Default::default()
+            },
+            targets,
+            ..DirectGroup::new(SalMessageKind::Scan)
+        })
+    })
+    .await?;
+
+    // Drain every worker's continuation-frame train into the cold filters.
+    // `drain_index_scan` owns the early-return error contract (the lease
+    // drop above discards any undrained frames at the ring boundary), the
+    // schema guard against DDL-lagged worker replies, the zero-copy
+    // `MemBatch` lifetime, and the continuation-schema-hint handling.
+    // On failure (worker crash mid-scan or cancellation) the guard is left
+    // armed, so its Drop removes the cold entries and the next validation
+    // retries warmup from scratch.
+    drain_index_scan(slots, &scan, reactor, "scan", &schema, |mb, _| {
+        let mut filters = disp.unique_filters.borrow_mut();
+        for d in &missing {
+            if let Some(filter) = filters.get_mut(&(table_id, d.packed)) {
+                extract_into_filter(filter, mb, &d.spec);
+            }
+        }
+        Ok(())
+    })
+    .await?;
+
+    // Fully populated → mark warm so the broadcast-skip shortcut may trust
+    // them, and disarm the guard so its Drop leaves them in place.
+    let mut filters = disp.unique_filters.borrow_mut();
+    for d in &missing {
+        if let Some(f) = filters.get_mut(&(table_id, d.packed)) {
+            f.warm = true;
+        }
+    }
+    guard.disarmed = true;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -48,9 +48,9 @@ fn check_workers_reports_each_dead_worker_exactly_once() {
 
     let disp = test_dispatcher(vec![live, zombie, reaped], std::ptr::null_mut());
 
-    assert_eq!(disp.check_workers(), 1, "the unreaped zombie is detected dead");
-    assert_eq!(disp.check_workers(), 2, "then the already-reaped worker");
-    assert_eq!(disp.check_workers(), -1, "a zeroed worker is never re-reported");
+    assert_eq!(disp.check_workers(), Some(1), "the unreaped zombie is detected dead");
+    assert_eq!(disp.check_workers(), Some(2), "then the already-reaped worker");
+    assert_eq!(disp.check_workers(), None, "a zeroed worker is never re-reported");
     assert_eq!(
         *disp.worker_pids.borrow(),
         vec![live, 0, 0],
@@ -64,15 +64,15 @@ fn check_workers_reports_each_dead_worker_exactly_once() {
     }
 }
 
-/// Both ACK-collection entry points make no progress on an empty ring and reach
-/// their park arm, whose liveness probe must surface the dead worker as a clean
-/// error naming the worker and the caller's context — not loop on the park.
+/// ACK collection makes no progress on an empty ring and reaches its park arm,
+/// whose liveness probe must surface the dead worker as a clean error naming the
+/// worker and the caller's own phase — not loop on the park.
 #[test]
 fn ack_collection_errors_when_a_worker_is_dead() {
-    for ctx in ["recovery sync", "backfill relay"] {
+    for ctx in ["checkpoint base round", "backfill relay"] {
         let disp = test_dispatcher(vec![spawn_and_reap_dead()], std::ptr::null_mut());
         let err = disp
-            .collect_acks(ctx)
+            .collect_acks_and_relay(ctx, false)
             .expect_err("a dead worker must fail ack collection");
         assert!(err.contains("worker 0") && err.contains(ctx), "{err}");
     }
@@ -127,22 +127,21 @@ fn a_checkpoint_bumps_the_generation_once_and_restamps_at_it() {
     disp.boot_rewind_sal(0);
 
     let gen = disp.cat().durable_generation();
+    disp.reclaim_base().unwrap();
     assert_eq!(
-        disp.reclaim_base().unwrap(),
+        disp.cat().durable_generation(),
         gen + 1,
         "the base round bumps exactly once"
     );
-    assert_ne!(
-        disp.last_ephemeral_gen.get(),
-        gen + 1,
+    assert!(
+        disp.derived_needs_restamp(),
         "the base round alone leaves every derived manifest behind the new generation"
     );
 
     // Empty drain set: zero workers hold no pending deltas.
     disp.restamp_derived(&[]).unwrap();
-    assert_eq!(
-        disp.last_ephemeral_gen.get(),
-        disp.cat().durable_generation(),
+    assert!(
+        !disp.derived_needs_restamp(),
         "the ephemeral round re-validates the derived state at the durable generation"
     );
 

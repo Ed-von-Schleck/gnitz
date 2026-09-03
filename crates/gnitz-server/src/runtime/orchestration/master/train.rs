@@ -12,8 +12,9 @@
 use super::*;
 use gnitz_wire::MAX_WORKERS;
 
-pub(super) fn scan_decode_err(w: usize, e: &'static str) -> WorkerFault {
-    format!("scan: worker {w}: decode error: {e}").into()
+/// A decode failure on one frame of a reply train, named after the verb `what`.
+pub(super) fn scan_decode_err(w: usize, what: &str, e: &'static str) -> WorkerFault {
+    format!("{what}: worker {w}: decode error: {e}").into()
 }
 
 /// Parse one frame header of worker `w`'s train. Returns the control block plus
@@ -39,7 +40,7 @@ pub(super) fn parse_train_header(
     w: usize,
     what: &str,
 ) -> Result<(gnitz_wire::control::DecodedControl, bool), WorkerFault> {
-    let ctrl = peek_control_block_ipc(slot.bytes()).map_err(|e| scan_decode_err(w, e))?;
+    let ctrl = peek_control_block_ipc(slot.bytes()).map_err(|e| scan_decode_err(w, what, e))?;
     if let Some(e) = super::worker_error(w, what, &ctrl) {
         return Err(e);
     }
@@ -99,7 +100,7 @@ pub(super) async fn drain_index_scan(
             let frame_len = slot.bytes().len();
             let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
             let zc = wire::decode_wire_ipc_zero_copy_with_ctrl(slot.bytes(), ctrl, saved_schema.as_ref(), &mut offsets)
-                .map_err(|e| scan_decode_err(w, e))?;
+                .map_err(|e| scan_decode_err(w, what, e))?;
             if saved_schema.is_none() {
                 if let Some(ref s) = zc.schema {
                     wire::validate_schema_match(s, expected)

@@ -496,11 +496,11 @@ def relay_lowspace_server(dedicated_server):
 
 @pytest.fixture
 def tick_emit_fault_server(seamed_server):
-    """Server whose first master-side tick emission for a table named
-    `tickfault` fails, reproducing what a full SAL does to a tick. Name-scoped so
-    a CREATE's own ticks cannot spend it, and one-shot so the follow-up read
-    observes the re-queued tid ticking and the view converging."""
-    return seamed_server({"GNITZ_INJECT_TICK_EMIT_ERROR": "tickfault"})
+    """Server whose first *replied* master-side tick emission fails, reproducing
+    what a full SAL does to a tick. The CREATE's own view-seeding drain writes a
+    silent tick group and so cannot spend it, and it is one-shot, so the
+    follow-up read observes the re-queued tid ticking and the view converging."""
+    return seamed_server({"GNITZ_INJECT_TICK_EMIT_ERROR": "1"})
 
 
 @pytest.fixture
