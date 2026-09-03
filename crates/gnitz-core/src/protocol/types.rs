@@ -865,13 +865,20 @@ impl ZSetBatch {
     /// column-at-a-time fill reallocates its way up from zero.
     pub fn with_capacity(schema: &Schema, n: usize) -> Self {
         let mut b = Self::new(schema);
-        b.pks.buf.reserve(n * schema.pk_stride());
-        b.weights.reserve(n);
-        b.nulls.reserve(n);
-        for (_pi, ci, col) in schema.payload_columns() {
-            b.columns[ci].reserve(col.type_code, n);
-        }
+        b.reserve(schema, n);
         b
+    }
+
+    /// Room for `n` more rows in every growth stream — the PK buffer, the
+    /// weights, the null words and each payload column. Additive, as
+    /// [`Vec::reserve`] is, so repeated appends to one batch compose.
+    pub fn reserve(&mut self, schema: &Schema, n: usize) {
+        self.pks.buf.reserve(n * schema.pk_stride());
+        self.weights.reserve(n);
+        self.nulls.reserve(n);
+        for (_pi, ci, col) in schema.payload_columns() {
+            self.columns[ci].reserve(col.type_code, n);
+        }
     }
 
     pub fn len(&self) -> usize {

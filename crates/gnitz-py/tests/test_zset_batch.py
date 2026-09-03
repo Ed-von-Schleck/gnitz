@@ -409,6 +409,23 @@ class TestExtend:
         batch.extend([{"pk": 4, "val": 40}])
         assert len(batch) == 2
 
+    def test_generator_rows_match_a_list_of_the_same_rows(self):
+        """A generator has no `__len__`, so `extend` cannot pre-size for it.
+
+        Pre-sizing is an allocation optimization and must be invisible in the
+        result: the batch built from a generator equals the one built from the
+        same rows as a list.
+        """
+        rows = [{"pk": i, "val": i * 10} for i in range(5)]
+        from_list = ZSetBatch(self._schema())
+        from_list.extend(rows)
+        from_gen = ZSetBatch(self._schema())
+        from_gen.extend(dict(r) for r in rows)
+        assert len(from_gen) == len(from_list)
+        assert from_gen.pks == from_list.pks
+        assert from_gen.columns == from_list.columns
+        assert from_gen.weights == from_list.weights
+
     def test_list_of_dicts_round_trip(self, client):
         sn, tid, schema = _make_table(client)
         try:

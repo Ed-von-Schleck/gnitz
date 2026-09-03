@@ -120,6 +120,7 @@ impl PkSlot {
 }
 
 /// `None` reached a PK column.
+#[cold]
 fn pk_none_err(schema: &Schema, ci: usize) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(format!("PK column {:?} cannot be None", schema.columns[ci].name))
 }
@@ -648,6 +649,11 @@ impl PyZSetBatch {
         // wrapping the whole loop truncates to the pre-call length on any error,
         // giving `extend` the same all-or-nothing contract `append` has.
         slf.borrow_mut().with_rollback(|s| {
+            // A sized sequence lets every growth stream skip its climb from
+            // zero; a generator has no `__len__`, so the probe is discarded.
+            if let Ok(n) = rows.len() {
+                s.batch.reserve(s.schema.as_ref(), n);
+            }
             for row_item in rows.try_iter()? {
                 let row_item = row_item?;
                 let dict: &Bound<'_, PyDict> = row_item.cast()?;
@@ -760,8 +766,12 @@ fn write_fixed_le_into(dst: &mut [u8], tc: TypeCode, item: &Bound<'_, PyAny>) ->
 /// a stack slot adds a 16-byte zero-init LLVM cannot prove away (it cannot see
 /// the slot as fully initialized across the extraction call), and growing `buf`
 /// by the stride first adds the fill that grow does. Measured, the in-place form
-/// costs ~89 more instructions per 5-column `append` — ~6% of the call. The
-/// duplication is deliberate; see [`write_fixed_le_into`] for what keeps the two
+/// costs ~89 more instructions per 5-column `append` — ~6% of the call. That
+/// figure is a local instructions-retired measurement with no in-tree bench
+/// behind it: `gnitz-py` is excluded from `make test` (a pyo3 extension cannot
+/// link a test harness), so the repo's `#[ignore]`d `*_bench` convention is
+/// unavailable here, and the end-to-end Python harness cannot resolve 89
+/// instructions. The duplication is deliberate; see [`write_fixed_le_into`] for what keeps the two
 /// tables in step, and for the range check each arm's `extract` doubles as.
 fn write_fixed_le(buf: &mut Vec<u8>, tc: TypeCode, item: &Bound<'_, PyAny>) -> PyResult<()> {
     match tc {

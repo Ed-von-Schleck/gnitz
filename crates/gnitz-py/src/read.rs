@@ -133,9 +133,12 @@ impl PyRow {
         })
     }
 
-    /// The row's Z-set weight, always: no column can be named `_weight`, because
-    /// the write surface reserves that spelling for the same quantity. A column
-    /// *may* be named `weight`, and its descriptor then shadows the alias below.
+    /// The row's Z-set weight, always. The row object owns its underscore
+    /// names, so a column spelled `_weight` — which the write surface does
+    /// permit, letting the schema take the name back there — is shadowed on
+    /// attribute access here exactly as a column named `_fields` or `_asdict`
+    /// is, and is read through `_asdict()` or by position. A column *may* be
+    /// named `weight`, and its descriptor then shadows the alias below.
     #[getter(_weight)]
     pub fn weight_(&self) -> i64 {
         self.weight
