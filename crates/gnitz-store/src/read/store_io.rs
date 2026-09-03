@@ -416,11 +416,8 @@ fn copy_cursor_col_to_batch(cursor: &ReadCursor, out: &mut Batch, ci: usize, pi:
     // read cursor always tracks it regardless of stride. For narrow PKs it
     // equals `widen_pk_be(current_pk_bytes) == current_key_narrow()`; for wide
     // PKs it is the only PK form, so one path serves both.
-    out.extend_pk_bytes(cursor.current_pk_bytes());
-    out.extend_weight(&1i64.to_le_bytes());
+    out.begin_row(cursor.current_pk_bytes(), 1);
 
-    // The regions are independent append buffers, so the null word can be
-    // appended after the column data.
     let mut proj_null = 0u64;
     if gnitz_wire::null_word_get(cursor.current_null_word, pi) {
         gnitz_wire::null_word_set(&mut proj_null, 0, true);
@@ -429,6 +426,5 @@ fn copy_cursor_col_to_batch(cursor: &ReadCursor, out: &mut Batch, ci: usize, pi:
         Some(data) => out.extend_col(0, data),
         None => out.fill_col_zero(0, col_size),
     }
-    out.extend_null_bmp(&proj_null.to_le_bytes());
-    out.count += 1;
+    out.commit_row(proj_null);
 }

@@ -627,8 +627,10 @@ impl SchemaDescriptor {
         parts.join(", ")
     }
 
-    /// Number of non-PK ("payload") columns.
-    #[inline]
+    /// Number of non-PK ("payload") columns. `#[inline(always)]`: `Batch` derives
+    /// its region count from this, so at `-O0` a plain `#[inline]` puts a real
+    /// call on the per-row appenders that read it as a loop bound.
+    #[inline(always)]
     pub const fn num_payload_cols(&self) -> usize {
         self.num_columns as usize - self.pk_count as usize
     }

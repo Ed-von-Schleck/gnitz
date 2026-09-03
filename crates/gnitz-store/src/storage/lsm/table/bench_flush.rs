@@ -22,10 +22,9 @@ use crate::test_support::pk_u64_two_i64_schema;
 fn push_row(b: &mut Batch, pk: u64, payload: i64, weight: i64) {
     b.extend_pk(pk as u128);
     b.extend_weight(&weight.to_le_bytes());
-    b.extend_null_bmp(&0u64.to_le_bytes());
     b.extend_col(0, &payload.to_le_bytes());
     b.extend_col(1, &payload.to_le_bytes());
-    b.count += 1;
+    b.commit_row(0);
 }
 
 /// One tick of `distinct(d)`: `d` rows with fresh keys `t*d .. t*d+d`, weight +1

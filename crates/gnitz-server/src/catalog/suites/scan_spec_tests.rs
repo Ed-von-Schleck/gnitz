@@ -529,7 +529,7 @@ fn gather_of_64_payload_columns_covers_every_slot() {
     for r in 0..got.len() {
         let id = got.get_pk(r) as u64;
         for k in 0..P {
-            assert_eq!(got.read_payload_u64(r, k), id * 100 + k as u64, "row {r} slot {k}");
+            assert_eq!(payload_u64(&got, r, k), id * 100 + k as u64, "row {r} slot {k}");
         }
     }
 }
@@ -563,7 +563,7 @@ fn all_pk_sourced_projection_zeroes_null_words_across_chunks() {
             "row {r}: a PK-sourced column is never NULL, so the whole word must be 0"
         );
         let pk = got.get_pk(r) as u64;
-        assert_eq!(got.read_payload_u64(r, 0), pk, "row {r}: PK-decoded payload");
+        assert_eq!(payload_u64(&got, r, 0), pk, "row {r}: PK-decoded payload");
     }
 }
 
@@ -615,12 +615,7 @@ fn permuted_gather_with_string_and_nullable_across_chunks() {
                 true => None,
                 false => Some(i64::from_le_bytes(got.get_col_ptr(r, 2, 8).try_into().unwrap())),
             };
-            (
-                got.get_pk(r),
-                got.read_payload_string(r, 0),
-                got.read_payload_u64(r, 1),
-                nv,
-            )
+            (got.get_pk(r), payload_string(&got, r, 0), payload_u64(&got, r, 1), nv)
         })
         .collect();
     decoded.sort();

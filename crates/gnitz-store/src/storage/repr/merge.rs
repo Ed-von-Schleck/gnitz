@@ -133,17 +133,42 @@ pub(crate) type BlobCache = FxHashMap<(usize, usize, usize), usize>;
 /// above the recycle cap.
 ///
 /// Rounds the per-row share up, so a source holding fewer heap bytes than rows
-/// still reserves something rather than nothing; computes the product in `u128`,
-/// so a large heap times a large row count cannot overflow into a small estimate;
-/// and clamps to `src_blob`, since no slice needs more than the whole heap. A
-/// hint only — every consumer grows on demand — so being off costs one realloc.
+/// still reserves a byte per row rather than nothing; computes the product in
+/// `u128`, so a large heap times a large row count cannot overflow into a small
+/// estimate; and clamps to `src_blob`, since no slice needs more than the whole
+/// heap. A hint only — every consumer grows on demand — so being off costs one
+/// realloc. An empty source heap asks for zero: the destination writes no heap
+/// bytes either.
 pub(crate) fn prorated_blob_cap(src_blob: usize, src_rows: usize, out_rows: usize) -> usize {
     if src_blob == 0 || src_rows == 0 {
-        return 1;
+        return 0;
     }
     let per_row = src_blob.div_ceil(src_rows) as u128;
-    let est = (per_row * out_rows as u128).min(src_blob as u128) as usize;
-    est.max(1)
+    (per_row * out_rows as u128).min(src_blob as u128) as usize
+}
+
+/// Cost of relocating one German-string cell, in bytes of whole-heap memcpy — the
+/// unit that lets [`should_relocate_blob`] weigh the two arms with one
+/// comparison. Set from `slice_blob_relocate_bench`, which sweeps both arms over
+/// slice fraction × string width; the resulting crossovers (~3 % of a 16-byte-string
+/// source, ~7 % at 40 bytes, ~34 % at 256, ~67 % at 1024) are what this value fits.
+const RELOCATE_CELL_COST_BYTES: usize = 500;
+
+/// Whether copying `out_rows` rows out of a `src_rows`-row source whose heap is
+/// `src_blob` bytes should relocate the slice's own string cells rather than
+/// carry the source's whole heap.
+///
+/// The two arms cost: relocation, one cell rewrite per row plus the slice's own
+/// share of the heap (`src_blob / src_rows` per row); the whole-heap copy,
+/// `src_blob` regardless of how few rows are kept. Expressing the per-cell
+/// rewrite as [`RELOCATE_CELL_COST_BYTES`] of memcpy makes that one comparison.
+///
+/// Only worth consulting where both arms are available — a destination that
+/// cannot carry the source's heap verbatim (different blob identity, gathered
+/// rather than contiguous rows, a result that is shipped) must relocate
+/// regardless.
+pub(crate) fn should_relocate_blob(src_blob: usize, src_rows: usize, out_rows: usize) -> bool {
+    src_rows > 0 && src_blob > out_rows.saturating_mul(RELOCATE_CELL_COST_BYTES + src_blob / src_rows)
 }
 
 /// Copy a 16-byte German string cell and (for long strings) migrate the
@@ -546,6 +571,61 @@ pub(crate) struct DirectWriter<'a> {
 }
 
 impl<'a> DirectWriter<'a> {
+    /// Open over a contiguous arena of `rows` rows, carving it at the offsets
+    /// [`super::batch::compute_offsets`] gives for `schema` — so the arena's
+    /// eventual reader addresses each region where this wrote it.
+    pub(crate) fn over_arena(
+        data: &'a mut [u8],
+        schema: &'a SchemaDescriptor,
+        rows: usize,
+        blob: &'a mut Vec<u8>,
+    ) -> Self {
+        use super::batch::{compute_offsets, strides_from_schema, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+
+        let (strides, nr) = strides_from_schema(schema);
+        let nr = nr as usize;
+        let (offsets, _total) = compute_offsets(&strides, nr, rows);
+
+        // Walk regions in order, splitting off [alignment pad | region] for each;
+        // `base` is the absolute offset of `rest[0]`, so `offsets[r] - base` is
+        // the pad to discard before region `r`.
+        let mut pk: Option<&mut [u8]> = None;
+        let mut weight: Option<&mut [u8]> = None;
+        let mut null_bmp: Option<&mut [u8]> = None;
+        let mut col_bufs: Vec<&mut [u8]> = Vec::with_capacity(nr - REG_PAYLOAD_START);
+        let mut rest: &mut [u8] = data;
+        let mut base = 0usize;
+        for r in 0..nr {
+            let pad = offsets[r] - base;
+            let after_pad = std::mem::take(&mut rest).split_at_mut(pad).1;
+            let sz = rows * strides[r] as usize;
+            let (region, remainder) = after_pad.split_at_mut(sz);
+            match r {
+                REG_PK => pk = Some(region),
+                REG_WEIGHT => weight = Some(region),
+                REG_NULL_BMP => null_bmp = Some(region),
+                _ => col_bufs.push(region),
+            }
+            base = offsets[r] + sz;
+            rest = remainder;
+        }
+
+        DirectWriter {
+            pk: pk.expect("REG_PK"),
+            pk_stride: schema.pk_stride(),
+            weight: weight.expect("REG_WEIGHT"),
+            null_bmp: null_bmp.expect("REG_NULL_BMP"),
+            col_bufs,
+            blob,
+            blob_cache: BlobCacheGuard::acquire(schema, rows),
+            count: 0,
+            schema,
+        }
+    }
+
+    /// The region slices supplied one by one, for a test that builds them by
+    /// hand rather than out of one arena.
+    #[cfg(test)]
     pub(crate) fn new(
         pk: &'a mut [u8],
         weight: &'a mut [u8],
@@ -586,8 +666,9 @@ impl<'a> DirectWriter<'a> {
         // extend_pk_bytes already asserts bytes.len() == pk_stride at ingest
         // time, so a stride mismatch is caught there.
         self.pk[out_row * stride..][..stride].copy_from_slice(pk_bytes);
-        self.weight[out_row * 8..out_row * 8 + 8].copy_from_slice(&weight.to_le_bytes());
-        self.null_bmp[out_row * 8..out_row * 8 + 8].copy_from_slice(&null_word.to_le_bytes());
+        let w_off = out_row * super::batch::FIXED_REGION_BYTES;
+        self.weight[w_off..w_off + super::batch::FIXED_REGION_BYTES].copy_from_slice(&weight.to_le_bytes());
+        self.null_bmp[w_off..w_off + super::batch::FIXED_REGION_BYTES].copy_from_slice(&null_word.to_le_bytes());
 
         let schema = self.schema;
         // Fast path: every payload column is a non-nullable fixed-width int (the

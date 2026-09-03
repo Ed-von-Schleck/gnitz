@@ -129,7 +129,7 @@ impl CatalogEngine {
         for i in 0..batch.len() {
             let weight = batch.get_weight(i);
             let sid = batch.get_pk(i) as i64;
-            let name = batch.read_payload_string(i, SCHEMATAB_PAY_NAME);
+            let name = payload_string(batch, i, SCHEMATAB_PAY_NAME);
 
             if weight > 0 {
                 self.caches.schema_by_name.insert(name.clone(), sid);
@@ -155,8 +155,8 @@ impl CatalogEngine {
             let tid = batch.get_pk(i) as i64;
 
             if weight > 0 {
-                let sid = batch.read_payload_u64(i, TABTAB_PAY_SCHEMA_ID) as i64;
-                let name = batch.read_payload_string(i, TABTAB_PAY_NAME);
+                let sid = payload_u64(batch, i, TABTAB_PAY_SCHEMA_ID) as i64;
+                let name = payload_string(batch, i, TABTAB_PAY_NAME);
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let qualified = gnitz_wire::qualified_key(&schema_name, &name);
                 self.caches.entity_by_qname.insert(qualified, tid);
@@ -194,7 +194,7 @@ impl CatalogEngine {
         for i in 0..batch.len() {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
-            let sid = batch.read_payload_u64(i, TABTAB_PAY_SCHEMA_ID) as i64;
+            let sid = payload_u64(batch, i, TABTAB_PAY_SCHEMA_ID) as i64;
 
             if weight > 0 {
                 self.caches.members_by_schema.entry(sid).or_default().insert(tid);
@@ -230,7 +230,7 @@ impl CatalogEngine {
         if family != SysFamily::View {
             return;
         }
-        let owner = batch.read_payload_u64(i, gnitz_wire::VIEWTAB_PAY_OWNER_VIEW_ID) as i64;
+        let owner = payload_u64(batch, i, gnitz_wire::VIEWTAB_PAY_OWNER_VIEW_ID) as i64;
         if owner == 0 {
             return;
         }
@@ -247,8 +247,8 @@ impl CatalogEngine {
         for i in 0..batch.len() {
             let weight = batch.get_weight(i);
             let idx_id = batch.get_pk(i) as i64;
-            let owner_id = batch.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64;
-            let name = batch.read_payload_string(i, IDXTAB_PAY_NAME);
+            let owner_id = payload_u64(batch, i, IDXTAB_PAY_OWNER_ID) as i64;
+            let name = payload_string(batch, i, IDXTAB_PAY_NAME);
 
             if weight > 0 {
                 self.caches.index_by_name.insert(name, idx_id);

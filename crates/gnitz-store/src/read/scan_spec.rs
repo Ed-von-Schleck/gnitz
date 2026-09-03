@@ -451,7 +451,7 @@ fn survivor_ranges(predicate: Option<&Evaluator>, chunk: &Batch, out: &mut Vec<(
 /// projection. There is no intermediate survivor batch and no projected batch.
 fn append_survivors(projection: Option<&MapPlan>, chunk: &Batch, keeper: &mut Batch, ranges: &[(usize, usize)]) {
     match projection {
-        None => keeper.append_ranges(chunk, ranges),
+        None => keeper.append_ranges(&chunk.as_mem_batch(), ranges),
         Some(p) => p.append_map_ranges(chunk, keeper, ranges),
     }
 }

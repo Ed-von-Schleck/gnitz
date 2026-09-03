@@ -20,7 +20,7 @@ use std::io::Write;
 
 use gnitz_core::{DeltaCursor, MirrorError};
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, BatchBuilder};
+use gnitz_store::storage::{payload_bytes, payload_string, payload_u64, Batch, BatchBuilder};
 use gnitz_wire::{null_word_get, read_u64_le, type_code};
 
 /// `<base_dir>/mirror_state` — the file this module owns.
@@ -88,15 +88,15 @@ pub(crate) fn read_state(base_dir: &str) -> Option<PersistedState> {
     let mut records = HashMap::with_capacity(batch.len());
     for row in 0..batch.len() {
         let cursor = (!null_word_get(batch.get_null_word(row), TAG)).then(|| DeltaCursor {
-            tag: batch.read_payload_u64(row, TAG),
-            tick: batch.read_payload_u64(row, TICK),
+            tag: payload_u64(&batch, row, TAG),
+            tick: payload_u64(&batch, row, TICK),
         });
         records.insert(
             batch.get_pk(row) as u64,
             MirrorRecord {
-                schema_name: batch.read_payload_string(row, SCHEMA_NAME),
-                name: batch.read_payload_string(row, NAME),
-                block: batch.read_payload_bytes(row, BLOCK).to_vec(),
+                schema_name: payload_string(&batch, row, SCHEMA_NAME),
+                name: payload_string(&batch, row, NAME),
+                block: payload_bytes(&batch, row, BLOCK).to_vec(),
                 cursor,
             },
         );

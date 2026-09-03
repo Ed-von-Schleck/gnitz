@@ -682,7 +682,7 @@ fn two_complete_sets_resolve_by_layout_sequence() {
         let batch = t.open_cursor().materialize();
         for i in 0..batch.len() {
             assert!(
-                batch.read_payload_u64(i, 0) >= 1000,
+                payload_u64(&*batch, i, 0) >= 1000,
                 "the stale 2-set won: row {} carries the old payload",
                 batch.get_pk(i)
             );

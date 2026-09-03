@@ -60,8 +60,8 @@ pub(crate) const IPC_CONTROL_TID: u32 = 0xFFFF_FFFF;
 /// Maximum region count a block directory may name, including the trailing blob
 /// region. A legitimate schema has ≤ 65 columns (1 PK), so ≤ 68 regions
 /// (pk + weight + null + ≤ 64 payload + blob); 69 only ever caps a forged
-/// block. The engine ties its own arena capacity to this
-/// (`MAX_WIRE_REGIONS == MAX_BATCH_REGIONS + 1`).
+/// block. The engine derives its own arena capacity from this — the blob heap
+/// is not in the arena, so `MAX_BATCH_REGIONS` is this less one slot.
 pub const MAX_WIRE_REGIONS: usize = 69;
 
 /// Compute the total byte size of a WAL block with the given regions.

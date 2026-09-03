@@ -7,7 +7,8 @@
 //! (`bloom`, `shard_filter`), the shard-image encoder and its atomic writer
 //! (`shard_file`), and the shard-format constants (`layout`). The low-level
 //! WAL-block framer lives in `gnitz_wire::wal` (the one definition client and
-//! engine share); `batch_wire` and the SAL scatter writer call it.
+//! engine share); `batch_wire` and the SAL scatter writer call it. The
+//! row-at-a-time system-table writer over a batch is `batch_builder`.
 //!
 //! The shard *image* has one owner at this layer: `shard_file` encodes it,
 //! `shard_reader` mmaps and validates it, and `layout` holds the format rules
@@ -24,6 +25,7 @@
 //! private items.
 
 pub(super) mod batch;
+pub(super) mod batch_builder;
 pub mod batch_pool;
 pub(super) mod batch_wire;
 pub(super) mod bloom;

@@ -28,22 +28,6 @@ fn emit_agg_col(output: &mut Batch, acc: &Accumulator, out_pi: usize, null_word:
     }
 }
 
-/// Write a row's PK region and its `+1` weight. Paired with [`finish_row`],
-/// which pushes the null word the payload emitters accumulated and commits the
-/// row; every payload column between the two writes its own region at its own
-/// payload index, so their order is free.
-#[inline]
-fn begin_row(output: &mut Batch, out_pk_bytes: &[u8]) {
-    output.extend_pk_bytes(out_pk_bytes);
-    output.extend_weight(&1i64.to_le_bytes());
-}
-
-#[inline]
-fn finish_row(output: &mut Batch, null_word: u64) {
-    output.extend_null_bmp(&null_word.to_le_bytes());
-    output.count += 1;
-}
-
 /// Emit the trailing aggregate columns, starting at payload index `pi_base`
 /// (= the plan's group-exemplar count).
 #[inline]
@@ -67,7 +51,7 @@ pub(super) fn emit_reduce_row(
 ) {
     // The caller materialised the group's output PK bytes once (verbatim source
     // PK for natural-PK grouping, the synthetic group key otherwise); copy them.
-    begin_row(output, out_pk_bytes);
+    output.begin_row(out_pk_bytes, 1);
     let mut null_word: u64 = 0;
 
     for (out_pi, loc) in plan.exemplar_locs().iter().enumerate() {
@@ -93,7 +77,7 @@ pub(super) fn emit_reduce_row(
     }
     emit_agg_cols(output, accs, plan.exemplar_locs().len(), &mut null_word);
 
-    finish_row(output, null_word);
+    output.commit_row(null_word);
 }
 
 /// Emit the synthetic **ground row** of a global (ungrouped) aggregate at PK
@@ -116,8 +100,8 @@ pub(super) fn emit_global_ground(raw_output: &mut Batch, out_pk_bytes: &[u8], pl
     // untouched, never stepped — and `emit_agg_col` renders each by
     // `empty_renders_zero`, so the ground row shares the one render path with a
     // normal row.
-    begin_row(raw_output, out_pk_bytes);
+    raw_output.begin_row(out_pk_bytes, 1);
     let mut null_word: u64 = 0;
     emit_agg_cols(raw_output, &plan.acc_template, 0, &mut null_word);
-    finish_row(raw_output, null_word);
+    raw_output.commit_row(null_word);
 }

@@ -1,11 +1,12 @@
 //! Per-row accessors for [`MappedShard`] — the region reads, the PK-filter probe and
 //! the OPK binary searches — plus the bulk `*_owned_batch` materializers.
 
-use super::super::batch::{
-    acquire_arena, Fill, FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT,
-};
+use super::super::batch::{FIXED_REGION_BYTES, REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
+use super::super::batch_pool::{acquire_arena, Fill};
 use super::super::layout::two_value_bit;
-use super::super::merge::{prorated_blob_cap, relocate_german_string_vec, BlobCacheGuard, ColPtr, UnifiedSource};
+use super::super::merge::{
+    prorated_blob_cap, relocate_german_string_vec, should_relocate_blob, BlobCacheGuard, ColPtr, UnifiedSource,
+};
 use super::{MappedShard, PackedRegion, PayloadRegion, RegionView, WeightRegion, ZERO_CELL};
 use crate::schema::key::PkBuf;
 use crate::schema::SchemaDescriptor;
@@ -172,7 +173,7 @@ impl MappedShard {
     /// Bulk-copy a contiguous slice of rows into an Batch.
     /// Bypasses per-row cursor overhead entirely — one memcpy per column.
     ///
-    /// Picks the blob arm via [`Batch::should_relocate_blob`]: a narrow slice off a
+    /// Picks the blob arm via [`should_relocate_blob`]: a narrow slice off a
     /// wide heap relocates only its own rows' strings, anything else copies the
     /// whole region.
     #[inline]
@@ -182,7 +183,7 @@ impl MappedShard {
         row_count: usize,
         schema: &crate::schema::SchemaDescriptor,
     ) -> super::super::batch::Batch {
-        let relocate = super::super::batch::Batch::should_relocate_blob(row_count, self.count, self.blob_len);
+        let relocate = should_relocate_blob(self.blob_len, self.count, row_count);
         self.slice_to_owned_batch_with(start, row_count, schema, relocate)
     }
 
@@ -216,8 +217,8 @@ impl MappedShard {
         let shard = self.data();
 
         // Compute the final columnar layout before allocating anything.
-        let (strides, num_regions_u8) = strides_from_schema(schema);
-        let nr = num_regions_u8 as usize; // 4 + npc
+        let (strides, nr) = strides_from_schema(schema);
+        let nr = nr as usize; // 4 + npc
         let (offsets, total_size) = compute_offsets(&strides, nr, row_count);
 
         // One allocation for all fixed-stride columnar data. Materializing a
@@ -343,8 +344,7 @@ impl MappedShard {
             Vec::new()
         };
 
-        let mut batch =
-            unsafe { Batch::from_prebuilt(data, blob, strides, offsets, num_regions_u8, row_count, *schema) };
+        let mut batch = unsafe { Batch::from_prebuilt(data, blob, strides, offsets, row_count, *schema) };
         // Shards are written consolidated; a contiguous slice stays (PK, payload)-
         // sorted and ghost-free (shards are ghost-free by construction). Certify it.
         batch.certify_layout(Layout::Consolidated, schema);

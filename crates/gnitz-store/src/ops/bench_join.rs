@@ -98,7 +98,6 @@ fn build(schema: &SchemaDescriptor, p: Payload, rows: &[Row]) -> Batch {
             Payload::Nullable if i % 4 == 0 => 1u64 << 1,
             _ => 0,
         };
-        b.extend_null_bmp(&null_word.to_le_bytes());
         b.extend_col(0, &ord.to_le_bytes());
         match p {
             Payload::Int => {}
@@ -112,7 +111,7 @@ fn build(schema: &SchemaDescriptor, p: Payload, rows: &[Row]) -> Batch {
                 b.extend_col(1, &cell);
             }
         }
-        b.count += 1;
+        b.commit_row(null_word);
     }
     b.certify_layout(Layout::Consolidated, schema);
     b

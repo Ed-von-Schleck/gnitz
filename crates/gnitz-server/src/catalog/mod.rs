@@ -96,6 +96,9 @@ pub(in crate::catalog) use gnitz_store::relation::{
 // `BatchBuilder` holds no catalog state and lives in `storage`; re-export it
 // for the catalog's row builders.
 pub(in crate::catalog) use gnitz_store::storage::BatchBuilder;
+// The generic payload-cell readers every system-row decoder in this subsystem
+// reads a cell through, whatever the row's source.
+pub(in crate::catalog) use gnitz_store::storage::{payload_string, payload_u64};
 
 // ---------------------------------------------------------------------------
 // CatalogEngine

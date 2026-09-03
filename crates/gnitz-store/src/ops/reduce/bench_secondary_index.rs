@@ -57,10 +57,9 @@ fn build_input(schema: &SchemaDescriptor) -> Batch {
     for row in 0..N_ROWS as u64 {
         b.extend_pk(row as u128);
         b.extend_weight(&1i64.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &((row % N_GROUPS) as u32).to_le_bytes());
         b.extend_col(1, &((row.wrapping_mul(2654435761)) as i64).to_le_bytes());
-        b.count += 1;
+        b.commit_row(0);
     }
     b
 }
@@ -154,11 +153,9 @@ fn bench_single_pk_sort(label: &str, pk_schema: SchemaDescriptor, pk_bytes_for: 
     let build = || {
         let mut out = Batch::with_capacity(pk_schema, N_ROWS);
         for row in 0..N_ROWS {
-            out.extend_pk_bytes(&pk_bytes_for(row));
-            out.extend_weight(&1i64.to_le_bytes());
-            out.extend_null_bmp(&0u64.to_le_bytes());
+            out.begin_row(&pk_bytes_for(row), 1);
             out.extend_col(0, &((row as i64).wrapping_mul(2654435761)).to_le_bytes());
-            out.count += 1;
+            out.commit_row(0);
         }
         out
     };

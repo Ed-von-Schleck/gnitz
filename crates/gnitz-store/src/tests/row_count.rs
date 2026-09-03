@@ -71,8 +71,9 @@ fn no_other_crate_writes_a_batch_row_count() {
                 assert!(
                     receiver_is_self(line, at),
                     "{}:{}: `.count {op}` writes a row count from outside gnitz-store — \
-                     append rows through push_key_row / push_zero_filled_row / BatchBuilder, \
-                     each of which advances the count and every region together\n  {}",
+                     append rows through Batch::begin_row/commit_row, push_key_row, \
+                     push_zero_filled_row or BatchBuilder, each of which advances the count \
+                     and every region together\n  {}",
                     f.display(),
                     n + 1,
                     line.trim(),

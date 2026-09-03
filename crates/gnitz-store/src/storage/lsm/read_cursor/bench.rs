@@ -26,7 +26,7 @@ use std::rc::Rc;
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn shard_merge_scan_bench() {
-    use super::super::batch::BatchBuilder;
+    use crate::storage::BatchBuilder;
     use std::time::Instant;
     let dir = tempfile::tempdir().unwrap();
 

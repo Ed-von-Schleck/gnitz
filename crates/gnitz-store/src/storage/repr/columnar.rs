@@ -1,4 +1,5 @@
-//! Shared columnar data access trait and generic row comparison.
+//! Shared columnar data access trait, the generic payload-cell readers, and
+//! generic row comparison.
 
 use std::cmp::Ordering;
 
@@ -37,6 +38,32 @@ pub(crate) trait ColumnarSource: RowSource {
     fn is_skeleton(&self) -> bool {
         false
     }
+}
+
+// ---------------------------------------------------------------------------
+// Generic payload-cell readers
+// ---------------------------------------------------------------------------
+//
+// `RowSource` is the whole surface reading one cell needs, so one spelling
+// serves a `Batch`, a `StoredRow`, a positioned `ReadCursor` and a mirror alike.
+
+/// One row's fixed 8-byte payload slot `pi`, little-endian.
+pub fn payload_u64<S: RowSource>(src: &S, row: usize, pi: usize) -> u64 {
+    let cell = src.get_col_ptr(row, pi, 8);
+    // Exactly 8 bytes by construction — `get_col_ptr` returns the width asked for.
+    u64::from_le_bytes(cell.try_into().expect("an 8-byte payload cell"))
+}
+
+/// One row's German-string (STRING or BLOB) payload slot `pi`, resolved through
+/// the source's own blob heap so a value over 12 bytes reads back whole.
+pub fn payload_bytes<S: RowSource>(src: &S, row: usize, pi: usize) -> &[u8] {
+    let cell = src.get_col_ptr(row, pi, 16);
+    gnitz_wire::german_string_content(cell, src.blob())
+}
+
+/// [`payload_bytes`] as a `String`; empty when not UTF-8.
+pub fn payload_string<S: RowSource>(src: &S, row: usize, pi: usize) -> String {
+    String::from_utf8(payload_bytes(src, row, pi).to_vec()).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------

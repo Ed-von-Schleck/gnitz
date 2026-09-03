@@ -1,5 +1,6 @@
 use super::*;
 use crate::schema::type_code;
+use crate::storage::payload_string;
 use crate::test_support::{
     make_batch, make_batch_bytes, make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string,
     make_schema_u64_i64, opk_pk, pk_payload_schema,
@@ -146,8 +147,8 @@ fn union_orders_shared_pk_string_payloads_through_the_generic_comparator() {
     assert!(out.is_sorted());
     assert_eq!(out.get_pk(0) as u64, 1);
     assert_eq!(out.get_pk(1) as u64, 1);
-    assert_eq!(out.read_payload_string(0, 0), "apple");
-    assert_eq!(out.read_payload_string(1, 0), "banana");
+    assert_eq!(payload_string(&out, 0, 0), "apple");
+    assert_eq!(payload_string(&out, 1, 0), "banana");
 }
 
 /// Neither side sorted: the merge is unavailable, so `op_union` concatenates and

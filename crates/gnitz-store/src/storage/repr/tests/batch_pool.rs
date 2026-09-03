@@ -12,8 +12,8 @@ fn only_buffers_within_the_cap_are_pooled() {
     // trap memory; both are dropped rather than retained.
     for (offered, pooled) in [
         (0usize, false),
-        (MAX_RECYCLE_CAPACITY + 1, false),
-        (MAX_RECYCLE_CAPACITY, true),
+        (POOL_BYPASS_BYTES + 1, false),
+        (POOL_BYPASS_BYTES, true),
         (4096, true),
     ] {
         drain_pool();

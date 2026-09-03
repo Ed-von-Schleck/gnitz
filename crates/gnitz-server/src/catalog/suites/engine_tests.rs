@@ -137,13 +137,9 @@ fn test_reserve_user_sequence_seed_and_contiguous() {
     assert_eq!(engine.user_sequences.get(&seq_id).copied(), Some(128));
     assert_eq!(delta2.len(), 2);
     assert_eq!(delta2.get_weight(0), -1);
-    assert_eq!(
-        delta2.read_payload_u64(0, 0),
-        64,
-        "the -1 must carry the live high-water"
-    );
+    assert_eq!(payload_u64(&delta2, 0, 0), 64, "the -1 must carry the live high-water");
     assert_eq!(delta2.get_weight(1), 1);
-    assert_eq!(delta2.read_payload_u64(1, 0), 128);
+    assert_eq!(payload_u64(&delta2, 1, 0), 128);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -445,7 +441,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     let scan = engine.scan_family(tid).unwrap().0;
     assert_eq!(scan.len(), 1);
     assert_eq!(scan.get_pk(0), 1);
-    assert_eq!(scan.read_payload_u64(0, 0), 200, "the later write must win the PK");
+    assert_eq!(payload_u64(&*scan, 0, 0), 200, "the later write must win the PK");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

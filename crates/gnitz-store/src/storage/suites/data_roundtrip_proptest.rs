@@ -105,8 +105,6 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
                 gnitz_wire::null_word_set(&mut nw, pi, true);
             }
         }
-        batch.extend_null_bmp(&nw.to_le_bytes());
-
         // Payload columns, in payload (not schema-column) index order.
         for (pi, col) in schema.payload_columns() {
             let cs = col.size() as usize;
@@ -121,7 +119,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
                 batch.extend_col(pi, &v.to_le_bytes()[..cs]);
             }
         }
-        batch.count += 1;
+        batch.commit_row(nw);
     }
 
     // extend_* did not touch the flags and the constructor defaults to Raw; a

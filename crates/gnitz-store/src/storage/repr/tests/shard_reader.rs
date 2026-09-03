@@ -886,8 +886,8 @@ fn packed_roundtrip_all_surfaces() {
     // payload region against the control.
     let pb = packed.slice_to_owned_batch(0, packed.count, &schema);
     let rb = raw.slice_to_owned_batch(0, raw.count, &schema);
-    let pbytes = pb.regions()[REG_PAYLOAD_START];
-    let rbytes = rb.regions()[REG_PAYLOAD_START];
+    let pbytes = pb.region_or_blob(REG_PAYLOAD_START);
+    let rbytes = rb.region_or_blob(REG_PAYLOAD_START);
     assert_eq!(pbytes.len(), rbytes.len());
     assert_eq!(pbytes, rbytes, "whole-shard slice payload region byte-identical");
 
@@ -1133,7 +1133,7 @@ fn slice_blob_relocate_bench() {
             let rc = (N * pct / 100).max(1);
             let reloc = time_arm(&shard, rc, true);
             let copy = time_arm(&shard, rc, false);
-            let picks = if crate::storage::Batch::should_relocate_blob(rc, shard.count, shard.blob_len) {
+            let picks = if super::super::merge::should_relocate_blob(shard.blob_len, shard.count, rc) {
                 "relocate"
             } else {
                 "memcpy  "

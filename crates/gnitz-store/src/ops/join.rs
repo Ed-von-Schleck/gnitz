@@ -376,9 +376,7 @@ impl<'s> JoinRowWriter<'s> {
         let null_word = merge_null_words(left_null, right_null, self.left_npc);
 
         let output = &mut self.output;
-        output.extend_pk_bytes(left.get_pk_bytes(left_row));
-        output.extend_weight(&weight.to_le_bytes());
-        output.extend_null_bmp(&null_word.to_le_bytes());
+        output.begin_row(left.get_pk_bytes(left_row), weight);
 
         output.append_payload_cols(0, self.left_schema, left, left_row, left_null, self.cache.get_mut());
         let (right_src, right_row) = right.current_row_source();
@@ -391,7 +389,7 @@ impl<'s> JoinRowWriter<'s> {
             self.cache.get_mut(),
         );
 
-        output.count += 1;
+        output.commit_row(null_word);
     }
 
     fn finish(self) -> Batch {

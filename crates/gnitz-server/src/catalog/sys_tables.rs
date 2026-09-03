@@ -7,7 +7,7 @@
 use super::ColumnDef;
 use gnitz_store::relation::RelationKind;
 use gnitz_store::schema::{Placement, SchemaDescriptor};
-use gnitz_store::storage::{Batch, BatchBuilder};
+use gnitz_store::storage::{payload_string, payload_u64, Batch, BatchBuilder};
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow};
 
 use gnitz_expr::RowSource;
@@ -194,8 +194,8 @@ pub(super) fn read_table_tab_row<S: RowSource>(
     row: usize,
     id: i64,
 ) -> Result<(i64, String, PkColList, RelationKind, Placement), String> {
-    let name = sys_string(src, row, TABTAB_PAY_NAME);
-    let props = gnitz_wire::TableProps::from_flags(sys_u64(src, row, TABTAB_PAY_FLAGS));
+    let name = payload_string(src, row, TABTAB_PAY_NAME);
+    let props = gnitz_wire::TableProps::from_flags(payload_u64(src, row, TABTAB_PAY_FLAGS));
     let placement = if props.replicated {
         if props.dist_prefix_len != 0 {
             return Err(format!(
@@ -211,9 +211,9 @@ pub(super) fn read_table_tab_row<S: RowSource>(
         }
     };
     Ok((
-        sys_u64(src, row, TABTAB_PAY_SCHEMA_ID) as i64,
+        payload_u64(src, row, TABTAB_PAY_SCHEMA_ID) as i64,
         name,
-        unpack_pk_cols(sys_u64(src, row, TABTAB_PAY_PK_COL_IDX)),
+        unpack_pk_cols(payload_u64(src, row, TABTAB_PAY_PK_COL_IDX)),
         if props.stream {
             RelationKind::Stream
         } else {
@@ -232,30 +232,15 @@ pub(super) fn read_view_tab_row<S: RowSource>(
     row: usize,
 ) -> (i64, String, PkColList, gnitz_store::relation::ViewBudgets, i64) {
     (
-        sys_u64(src, row, VIEWTAB_PAY_SCHEMA_ID) as i64,
-        sys_string(src, row, VIEWTAB_PAY_NAME),
-        unpack_pk_cols(sys_u64(src, row, VIEWTAB_PAY_PK_COL_IDX)),
+        payload_u64(src, row, VIEWTAB_PAY_SCHEMA_ID) as i64,
+        payload_string(src, row, VIEWTAB_PAY_NAME),
+        unpack_pk_cols(payload_u64(src, row, VIEWTAB_PAY_PK_COL_IDX)),
         gnitz_store::relation::ViewBudgets {
-            capacity_bytes: Some(sys_u64(src, row, VIEWTAB_PAY_CAPACITY)).filter(|&b| b != 0),
-            delta_bytes: Some(sys_u64(src, row, VIEWTAB_PAY_DELTA)).filter(|&b| b != 0),
+            capacity_bytes: Some(payload_u64(src, row, VIEWTAB_PAY_CAPACITY)).filter(|&b| b != 0),
+            delta_bytes: Some(payload_u64(src, row, VIEWTAB_PAY_DELTA)).filter(|&b| b != 0),
         },
-        sys_u64(src, row, VIEWTAB_PAY_OWNER_VIEW_ID) as i64,
+        payload_u64(src, row, VIEWTAB_PAY_OWNER_VIEW_ID) as i64,
     )
-}
-
-/// One row's fixed 8-byte payload slot `pi`, little-endian. `RowSource` is the
-/// whole surface a system row needs, which is what lets the decoders below read
-/// a wire `Batch`, a probed `StoredRow` and a positioned `ReadCursor` alike.
-fn sys_u64<S: RowSource>(src: &S, row: usize, pi: usize) -> u64 {
-    let cell = src.get_col_ptr(row, pi, 8);
-    u64::from_le_bytes(cell.try_into().unwrap_or([0; 8]))
-}
-
-/// One row's German-string payload slot `pi`, resolved through the source's own
-/// blob heap (so a value over 12 bytes reads back whole).
-fn sys_string<S: RowSource>(src: &S, row: usize, pi: usize) -> String {
-    let cell = src.get_col_ptr(row, pi, 16);
-    String::from_utf8(gnitz_wire::german_string_content(cell, src.blob()).to_vec()).unwrap_or_default()
 }
 
 /// Decode IDX_TAB `row`: `(owner_id, source_cols, props)`. `source_cols`
@@ -263,22 +248,22 @@ fn sys_string<S: RowSource>(src: &S, row: usize, pi: usize) -> String {
 /// 1-element degenerate case).
 pub(super) fn read_idx_tab_row<S: RowSource>(src: &S, row: usize) -> (i64, PkColList, gnitz_wire::IndexProps) {
     (
-        sys_u64(src, row, IDXTAB_PAY_OWNER_ID) as i64,
-        unpack_pk_cols(sys_u64(src, row, IDXTAB_PAY_SOURCE_COLS)),
-        gnitz_wire::IndexProps::from_flags(sys_u64(src, row, IDXTAB_PAY_FLAGS)),
+        payload_u64(src, row, IDXTAB_PAY_OWNER_ID) as i64,
+        unpack_pk_cols(payload_u64(src, row, IDXTAB_PAY_SOURCE_COLS)),
+        gnitz_wire::IndexProps::from_flags(payload_u64(src, row, IDXTAB_PAY_FLAGS)),
     )
 }
 
 /// Decode COL_TAB `row` into the `ColumnDef` the schema builder consumes.
 pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> ColumnDef {
     ColumnDef {
-        name: sys_string(src, row, COLTAB_PAY_NAME),
-        type_code: sys_u64(src, row, COLTAB_PAY_TYPE_CODE) as u8,
-        is_nullable: sys_u64(src, row, COLTAB_PAY_IS_NULLABLE) != 0,
-        fk_table_id: sys_u64(src, row, COLTAB_PAY_FK_TABLE_ID) as i64,
-        fk_col_idx: sys_u64(src, row, COLTAB_PAY_FK_COL_IDX) as u32,
-        is_serial: sys_u64(src, row, COLTAB_PAY_IS_SERIAL) != 0,
-        is_hidden: sys_u64(src, row, COLTAB_PAY_IS_HIDDEN) != 0,
+        name: payload_string(src, row, COLTAB_PAY_NAME),
+        type_code: payload_u64(src, row, COLTAB_PAY_TYPE_CODE) as u8,
+        is_nullable: payload_u64(src, row, COLTAB_PAY_IS_NULLABLE) != 0,
+        fk_table_id: payload_u64(src, row, COLTAB_PAY_FK_TABLE_ID) as i64,
+        fk_col_idx: payload_u64(src, row, COLTAB_PAY_FK_COL_IDX) as u32,
+        is_serial: payload_u64(src, row, COLTAB_PAY_IS_SERIAL) != 0,
+        is_hidden: payload_u64(src, row, COLTAB_PAY_IS_HIDDEN) != 0,
     }
 }
 
@@ -312,11 +297,11 @@ impl ColTabIdent {
 /// transposed field would type-check.
 pub(super) fn read_col_tab_ident<S: RowSource>(src: &S, row: usize) -> ColTabIdent {
     ColTabIdent {
-        owner_id: sys_u64(src, row, COLTAB_PAY_OWNER_ID) as i64,
-        owner_kind: sys_u64(src, row, COLTAB_PAY_OWNER_KIND) as i64,
-        col_idx: sys_u64(src, row, COLTAB_PAY_COL_IDX),
-        fk_table_id: sys_u64(src, row, COLTAB_PAY_FK_TABLE_ID) as i64,
-        fk_col_idx: sys_u64(src, row, COLTAB_PAY_FK_COL_IDX) as u32,
+        owner_id: payload_u64(src, row, COLTAB_PAY_OWNER_ID) as i64,
+        owner_kind: payload_u64(src, row, COLTAB_PAY_OWNER_KIND) as i64,
+        col_idx: payload_u64(src, row, COLTAB_PAY_COL_IDX),
+        fk_table_id: payload_u64(src, row, COLTAB_PAY_FK_TABLE_ID) as i64,
+        fk_col_idx: payload_u64(src, row, COLTAB_PAY_FK_COL_IDX) as u32,
     }
 }
 
@@ -329,7 +314,7 @@ pub(crate) fn idx_tab_unique_creates(batch: &Batch) -> Vec<(i64, u64, PkColList)
         .filter(|&i| batch.get_weight(i) > 0)
         .filter_map(|i| {
             let (owner_id, cols, props) = read_idx_tab_row(batch, i);
-            let packed = batch.read_payload_u64(i, IDXTAB_PAY_SOURCE_COLS);
+            let packed = payload_u64(batch, i, IDXTAB_PAY_SOURCE_COLS);
             (props.is_unique && cols.is_well_formed()).then_some((owner_id, packed, cols))
         })
         .collect()
@@ -343,8 +328,8 @@ pub(crate) fn idx_tab_drops(batch: &Batch) -> Vec<(i64, u64)> {
         .filter(|&i| batch.get_weight(i) < 0)
         .map(|i| {
             (
-                batch.read_payload_u64(i, IDXTAB_PAY_OWNER_ID) as i64,
-                batch.read_payload_u64(i, IDXTAB_PAY_SOURCE_COLS),
+                payload_u64(batch, i, IDXTAB_PAY_OWNER_ID) as i64,
+                payload_u64(batch, i, IDXTAB_PAY_SOURCE_COLS),
             )
         })
         .collect()

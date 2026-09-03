@@ -12,9 +12,9 @@ use std::ffi::CStr;
 
 use super::super::error::StorageError;
 use super::batch::{
-    acquire_arena, carve_writer_slices, compute_offsets, copy_regions, strides_from_schema, Batch, Fill,
-    MAX_BATCH_REGIONS, MAX_WIRE_REGIONS, REG_PK,
+    compute_offsets, copy_regions, strides_from_schema, Batch, MAX_BATCH_REGIONS, MAX_WIRE_REGIONS, REG_PK,
 };
+use super::batch_pool::{acquire_arena, Fill};
 use super::merge::{DirectWriter, MemBatch};
 use super::shard_file;
 use crate::schema::SchemaDescriptor;
@@ -63,8 +63,9 @@ impl Batch {
         schema: &SchemaDescriptor,
         opts: shard_file::ShardWriteOpts,
     ) -> Result<(), StorageError> {
-        let regions = self.regions();
-        shard_file::write_shard_streaming(libc::AT_FDCWD, path, self.count as u32, &regions, schema, opts)
+        let mut regions: [&[u8]; MAX_WIRE_REGIONS] = [&[]; MAX_WIRE_REGIONS];
+        let n = self.fill_regions(&mut regions, 0, self.count, &self.blob);
+        shard_file::write_shard_streaming(libc::AT_FDCWD, path, self.count as u32, &regions[..n], schema, opts)
     }
 
     // ── Wire serialization (used by the server's SAL and frame codecs) ─────
@@ -73,7 +74,7 @@ impl Batch {
     /// `blob_len`-byte heap — the sizing half of the region convention, shared by
     /// the whole-batch and range encoders below.
     fn wire_size_of(&self, count: usize, blob_len: usize) -> usize {
-        let blob_idx = self.num_regions as usize;
+        let blob_idx = self.num_regions();
         let mut sizes = [0u32; MAX_WIRE_REGIONS];
         for (i, size) in sizes[..blob_idx].iter_mut().enumerate() {
             *size = (count * self.region_stride(i) as usize) as u32;
@@ -95,9 +96,29 @@ impl Batch {
         self.wire_size_of(count, 0)
     }
 
+    /// Fill `out` with rows `[start_row, start_row + count)` of every fixed
+    /// region, then `blob` as the trailing heap region, in canonical order.
+    /// Returns the region count — the `&[&[u8]]` both the WAL framer and the
+    /// shard writer take, built on the caller's stack.
+    fn fill_regions<'a>(
+        &'a self,
+        out: &mut [&'a [u8]; MAX_WIRE_REGIONS],
+        start_row: usize,
+        count: usize,
+        blob: &'a [u8],
+    ) -> usize {
+        let blob_idx = self.num_regions();
+        for (i, region) in out[..blob_idx].iter_mut().enumerate() {
+            let stride = self.region_stride(i) as usize;
+            *region = &self.region_or_blob(i)[start_row * stride..(start_row + count) * stride];
+        }
+        out[blob_idx] = blob;
+        blob_idx + 1
+    }
+
     /// Encode rows `[start_row, start_row + count)` of every fixed region, plus
     /// `blob` as the trailing heap region, as one WAL block at `out[offset..]`.
-    /// Returns bytes written. The one region-array build both encoders share.
+    /// Returns bytes written.
     #[allow(clippy::too_many_arguments)]
     fn encode_regions(
         &self,
@@ -109,14 +130,9 @@ impl Batch {
         offset: usize,
         checksum: bool,
     ) -> usize {
-        let blob_idx = self.num_regions as usize;
         let mut regions: [&[u8]; MAX_WIRE_REGIONS] = [&[]; MAX_WIRE_REGIONS];
-        for (i, region) in regions[..blob_idx].iter_mut().enumerate() {
-            let stride = self.region_stride(i) as usize;
-            *region = &self.region_slice(i)[start_row * stride..(start_row + count) * stride];
-        }
-        regions[blob_idx] = blob;
-        let new_offset = wal::encode(out, offset, table_id, count as u32, &regions[..blob_idx + 1], checksum)
+        let n = self.fill_regions(&mut regions, start_row, count, blob);
+        let new_offset = wal::encode(out, offset, table_id, count as u32, &regions[..n], checksum)
             .expect("WAL encode failed: buffer too small");
         new_offset - offset
     }
@@ -209,11 +225,10 @@ impl Batch {
         // The writer carves `rest` (body after header+directory) into per-region
         // slices: [pk | weight | null | col_0 | ...], each sized for `count` rows.
         let (_, rest) = block.split_at_mut(wire_header_dir_size(schema));
-        let (pk, weight, null_bmp, col_slices) = carve_writer_slices(rest, schema, count);
         // No German-string columns here; `DirectWriter` still
         // wants a blob arena, so hand it a 0-cap stack local it must not grow.
         let mut empty_blob: Vec<u8> = Vec::new();
-        let mut writer = DirectWriter::new(pk, weight, null_bmp, col_slices, &mut empty_blob, schema, 0);
+        let mut writer = DirectWriter::over_arena(rest, schema, count, &mut empty_blob);
         super::scatter::scatter_copy(&self.as_mem_batch(), indices, &mut writer);
         debug_assert!(
             empty_blob.is_empty(),
@@ -284,7 +299,7 @@ impl Batch {
 
         // SAFETY: `data_buf`/`offsets` were laid out by compute_offsets for
         // `mb.count` rows of these strides and every region was filled above.
-        let batch = unsafe { Batch::from_prebuilt(data_buf, blob, strides, offsets, nr, mb.count, *schema) };
+        let batch = unsafe { Batch::from_prebuilt(data_buf, blob, strides, offsets, mb.count, *schema) };
         Ok((batch, bytes_consumed))
     }
 }

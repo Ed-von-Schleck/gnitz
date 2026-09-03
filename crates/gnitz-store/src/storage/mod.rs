@@ -35,7 +35,7 @@ mod spill;
 // `crate::storage::batch_pool` paths resolve without touching the moved bodies.
 mod repr;
 pub use repr::batch_pool;
-use repr::{batch, batch_wire, columnar, merge, scatter};
+use repr::{batch, batch_builder, batch_wire, columnar, merge, scatter};
 
 #[cfg(test)]
 mod suites;
@@ -55,7 +55,8 @@ pub use scatter::route_rows_by_pk;
 pub(crate) use scatter::scatter_unified_sources;
 
 // ── Operator hot-path types ──────────────────────────────────────────────────
-pub use batch::{BatchBuilder, Layout};
+pub use batch::Layout;
+pub use batch_builder::BatchBuilder;
 pub use batch_wire::wire_block_size;
 // `ColumnarSource` is deliberately NOT re-exported: it adds only the Z-set
 // weight, and every out-of-storage consumer (the comparators, the group-key
@@ -67,7 +68,11 @@ pub use batch_wire::wire_block_size;
 // every seat is in storage. The macro names the comparator through
 // `crate::storage::columnar`, which resolves only from inside storage.
 pub use columnar::compare_rows;
+// The three generic payload-cell readers: one spelling for every `RowSource`,
+// which is what lets a catalog decoder read a `Batch`, a `StoredRow` and a
+// positioned `ReadCursor` through the same call.
 pub use columnar::compare_rows_except;
+pub use columnar::{payload_bytes, payload_string, payload_u64};
 // The OPK key cluster is NOT re-exported here: `schema::key` owns it and every
 // caller names `crate::schema::key::X`. Re-exporting it split one byte-order
 // rule across two import paths, visibly — `ops/reduce/sort.rs` and

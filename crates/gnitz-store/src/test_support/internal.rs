@@ -53,9 +53,8 @@ pub fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i
     for &(c0, c1, c2, w, val) in rows {
         b.extend_pk_opk(schema, &[c0 as u128, c1 as u128, c2 as u128]);
         b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &val.to_le_bytes());
-        b.count += 1;
+        b.commit_row(0);
     }
     for r in 1..b.count {
         assert_ne!(
@@ -143,9 +142,8 @@ pub fn make_batch_i64pk(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> 
     for &(pk, w, val) in rows {
         b.extend_pk_opk(schema, &[(pk as u64) as u128]);
         b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &val.to_le_bytes());
-        b.count += 1;
+        b.commit_row(0);
     }
     b.certify_layout(Layout::Consolidated, schema);
     b
@@ -170,9 +168,8 @@ pub fn make_batch_bytes(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -
         let cell = gnitz_wire::encode_german_string(val, &mut b.blob);
         b.extend_pk(pk as u128);
         b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &cell);
-        b.count += 1;
+        b.commit_row(0);
     }
     b.certify_layout(Layout::Consolidated, schema);
     b

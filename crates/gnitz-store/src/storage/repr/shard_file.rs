@@ -391,11 +391,9 @@ pub(in crate::storage) fn write_test_shard(
     );
     let mut b = super::batch::Batch::with_capacity(*schema, rows.len().max(1));
     for (pk, w, v) in rows {
-        b.extend_pk_bytes(pk);
-        b.extend_weight(&w.to_le_bytes());
-        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.begin_row(pk, *w);
         b.extend_col(0, &v.to_le_bytes());
-        b.count += 1;
+        b.commit_row(0);
     }
     let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
     b.write_as_shard(&cpath, schema, opts).unwrap();

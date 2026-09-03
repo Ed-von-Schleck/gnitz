@@ -402,10 +402,10 @@ impl CatalogEngine {
                     // this demands exactly 1, and the pair mask excludes both
                     // slots from the contract's field comparison, so a payload
                     // word of 2 would otherwise slip through a `!= 0` decode.
-                    let hid_old = batch.read_payload_u64(nj, COLTAB_PAY_IS_HIDDEN);
-                    let hid_new = batch.read_payload_u64(pj, COLTAB_PAY_IS_HIDDEN);
-                    let null_old = batch.read_payload_u64(nj, COLTAB_PAY_IS_NULLABLE);
-                    let null_new = batch.read_payload_u64(pj, COLTAB_PAY_IS_NULLABLE);
+                    let hid_old = payload_u64(batch, nj, COLTAB_PAY_IS_HIDDEN);
+                    let hid_new = payload_u64(batch, pj, COLTAB_PAY_IS_HIDDEN);
+                    let null_old = payload_u64(batch, nj, COLTAB_PAY_IS_NULLABLE);
+                    let null_new = payload_u64(batch, pj, COLTAB_PAY_IS_NULLABLE);
                     // Direction: is_hidden / is_nullable only 0→1 (forward path).
                     if hid_new != hid_old && !(hid_old == 0 && hid_new == 1) {
                         return Err("a column-ALTER may only set is_hidden 0→1 (DROP COLUMN)".into());
@@ -717,7 +717,7 @@ impl CatalogEngine {
         // directory (the deletion is queued by name).
         let mut claimed: FxHashSet<String> = FxHashSet::default();
         for i in (0..batch.len()).filter(|&i| batch.get_weight(i) > 0) {
-            let name = batch.read_payload_string(i, SCHEMATAB_PAY_NAME);
+            let name = payload_string(batch, i, SCHEMATAB_PAY_NAME);
             // The full identifier rule, leading-`_` included: a schema name is
             // the one the engine interpolates into a filesystem path
             // (`hook_schema_dir` → `create_dir_all`, and `remove_dir_all` on
@@ -857,7 +857,7 @@ impl CatalogEngine {
         let noun = SysFamily::Index.row_noun();
         for i in (0..batch.len()).filter(|&i| batch.get_weight(i) > 0) {
             let (owner_id, cols, props) = read_idx_tab_row(batch, i);
-            let index_name = batch.read_payload_string(i, IDXTAB_PAY_NAME);
+            let index_name = payload_string(batch, i, IDXTAB_PAY_NAME);
             reject_unstorable_name(&index_name, noun)?;
             // Only `submit_local` — the FK auto-index, which bypasses this
             // precheck — may set the internal bit: the drop guard below refuses

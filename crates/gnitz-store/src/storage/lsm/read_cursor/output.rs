@@ -190,7 +190,9 @@ impl ReadCursor {
             && self.states[0].count == self.sources[0].count()
         {
             if let Run::Mem(rc) = &self.sources[0] {
-                if rc.consolidated_verified(&self.schema) {
+                // Non-verifying, deliberately: `RunSet::push` verified this run
+                // on the way in, and re-walking it per drain buys nothing.
+                if rc.is_consolidated() {
                     return Rc::clone(rc);
                 }
             }

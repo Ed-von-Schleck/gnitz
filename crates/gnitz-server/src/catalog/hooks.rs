@@ -108,7 +108,7 @@ impl CatalogEngine {
                 continue;
             }
             let seq_id = batch.get_pk(i) as i64;
-            let hw = batch.read_payload_u64(i, SEQTAB_PAY_VALUE) as i64;
+            let hw = payload_u64(batch, i, SEQTAB_PAY_VALUE) as i64;
             self.observe_user_sequence(seq_id, hw);
         }
     }
@@ -118,7 +118,7 @@ impl CatalogEngine {
     fn hook_schema_dir(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.len() {
             let weight = batch.get_weight(i);
-            let name = batch.read_payload_string(i, SCHEMATAB_PAY_NAME);
+            let name = payload_string(batch, i, SCHEMATAB_PAY_NAME);
             let path = schema_dir(&self.base_dir, &name);
             if weight > 0 {
                 // A prior DROP SCHEMA may have queued this exact (name-based)

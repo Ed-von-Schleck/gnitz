@@ -553,7 +553,7 @@ impl MapPlan {
         let (src, ranges) = if starves_kernel {
             compacted = {
                 let mut c = Batch::with_capacity(src.schema, total);
-                c.append_ranges(src, ranges);
+                c.append_ranges(&src.as_mem_batch(), ranges);
                 c
             };
             (&compacted, &[(0, total)][..])

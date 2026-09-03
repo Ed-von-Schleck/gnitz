@@ -2749,8 +2749,8 @@ fn result_ab_quads(r: Option<Batch>) -> Vec<(u128, u64, u64, i64)> {
             .map(|i| {
                 (
                     b.get_pk(i),
-                    b.read_payload_u64(i, 0),
-                    b.read_payload_u64(i, 1),
+                    payload_u64(&b, i, 0),
+                    payload_u64(&b, i, 1),
                     b.get_weight(i),
                 )
             })
