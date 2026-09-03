@@ -144,9 +144,9 @@ fn boolean_gives_helpful_error() {
 
 #[test]
 fn unknown_type_gives_unsupported_error() {
-    // Date is not supported
+    // Date is not supported, and the type is echoed as written, not as a parser dump.
     let msg = err(DataType::Date);
-    assert!(msg.contains("unsupported SQL type"), "unexpected error: {msg}");
+    assert!(msg.contains("unsupported SQL type: DATE"), "unexpected error: {msg}");
 }
 
 // --- SERIAL recognition (serial_underlying) ---

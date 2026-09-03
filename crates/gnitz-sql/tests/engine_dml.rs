@@ -1,21 +1,30 @@
 #![cfg(feature = "integration")]
 
 //! DML contracts that need a server: the write targets a statement may name,
-//! the INSERT arity guard, EXPLAIN inside a transaction, and the reply-frame
+//! the INSERT arity and value guards, EXPLAIN inside a transaction, and the reply-frame
 //! ceiling a DML read runs into.
 
 mod common;
 use common::*;
 use gnitz_core::{BatchAppender, GnitzClient, ZSetBatch};
 
-/// A VALUES row must carry exactly one value per column, and a rejected
-/// INSERT writes nothing.
+/// A VALUES row must carry exactly one value per column and only values the
+/// writer evaluates (an unsupported one is echoed as the SQL written, not a
+/// parser dump); a rejected INSERT writes nothing.
 #[test]
-fn insert_arity_is_exact() {
+fn rejected_inserts_write_nothing() {
     let (_srv, mut client, sn) = boot(1);
     exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
-    for sql in ["INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (1, 10, 99)"] {
-        assert_rejects_variant(&mut client, &sn, sql, "Bind", "expects 2 value(s)");
+    for (sql, variant, needle) in [
+        ("INSERT INTO t VALUES (1)", "Bind", "expects 2 value(s)"),
+        ("INSERT INTO t VALUES (1, 10, 99)", "Bind", "expects 2 value(s)"),
+        (
+            "INSERT INTO t VALUES (1, EXTRACT(YEAR FROM 2))",
+            "Unsupported",
+            "EXTRACT(YEAR FROM 2)",
+        ),
+    ] {
+        assert_rejects_variant(&mut client, &sn, sql, variant, needle);
     }
     assert!(rows(&mut client, &sn, "SELECT * FROM t", &["id", "v"]).is_empty());
 }

@@ -104,13 +104,13 @@ pub(crate) fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Ex
                     _ => Err(GnitzSqlError::Bind("string literal for non-string column".to_string())),
                 },
                 _ => Err(GnitzSqlError::Unsupported(format!(
-                    "unsupported value in INSERT: {:?}",
+                    "unsupported value in INSERT: {}",
                     vws.value
                 ))),
             }
         }
         _ => Err(GnitzSqlError::Unsupported(format!(
-            "unsupported value expression in INSERT: {val_expr:?}"
+            "unsupported value expression in INSERT: {val_expr}"
         ))),
     }
 }

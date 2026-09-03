@@ -1538,7 +1538,7 @@ impl<L: LeafBinder<HirRef>> GroupedLeaf<'_, L> {
         // already aggregates rather than a second one.
         let arg = match arg_expr {
             Some(e) => Some(find_bound(self.extra, &bind_structural(e, self.leaf)?).ok_or_else(|| {
-                GnitzSqlError::Unsupported(format!("{}: unsupported aggregate argument {e:?}", self.clause))
+                GnitzSqlError::Unsupported(format!("{}: unsupported aggregate argument {e}", self.clause))
             })?),
             None => None,
         };

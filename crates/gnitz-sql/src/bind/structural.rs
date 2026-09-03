@@ -334,9 +334,9 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::Subquery(_) | Expr::AnyOp { .. } | Expr::AllOp { .. } => {
             leaf.bind_subquery(expr)
         }
-        _ => Err(GnitzSqlError::Unsupported(format!(
-            "expression type not supported: {expr:?}"
-        ))),
+        // Rendered as SQL, never `Debug`: the parser's `Debug` is a wall of
+        // spans, and the reader wants the form they wrote.
+        _ => Err(GnitzSqlError::Unsupported(format!("expression not supported: {expr}"))),
     }
 }
 

@@ -28,7 +28,7 @@ pub(crate) fn sql_type_to_typecode(dt: &DataType) -> Result<TypeCode, GnitzSqlEr
         DataType::Boolean => Err(GnitzSqlError::Unsupported(
             "BOOLEAN has no gnitz type; use TINYINT(1)".to_string(),
         )),
-        _ => Err(GnitzSqlError::Unsupported(format!("unsupported SQL type: {dt:?}"))),
+        _ => Err(GnitzSqlError::Unsupported(format!("unsupported SQL type: {dt}"))),
     }
 }
 
