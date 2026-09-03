@@ -56,7 +56,9 @@ fn agg_result_type_sum_preserves_u64() {
         ],
         pk_cols: vec![0],
     };
-    let rt = |f, i: usize| agg_typing(f, Some(&s.columns[i])).unwrap().view_type;
+    // The raw reduce value type; only AVG (untested here) diverges from it, and
+    // `HirAgg::view_type` is what renders that.
+    let rt = |f, i: usize| agg_typing(f, Some(&s.columns[i])).unwrap().ops[0].1;
     assert_eq!(rt(AggFunc::Sum, 1), TypeCode::U64); // SUM(u64) → U64
     assert_eq!(rt(AggFunc::Sum, 2), TypeCode::I64); // SUM(u32) → I64
     assert_eq!(rt(AggFunc::Sum, 3), TypeCode::I64); // SUM(i64) → I64

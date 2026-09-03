@@ -45,7 +45,7 @@ pub(crate) fn computed_column(alias: Option<String>, idx: usize, nominal: TypeCo
 /// Reject an output column list that names the same *visible* column twice.
 /// Hidden key slots are skipped — they are excluded from name resolution, so
 /// they cannot bind ambiguously. `context` names the DDL surface for the error
-/// message (e.g. "CREATE VIEW projection", "join view").
+/// message (e.g. "CREATE VIEW projection", "GROUP BY view").
 pub(crate) fn reject_duplicate_column_names<'a>(
     cols: impl Iterator<Item = &'a ColumnDef>,
     context: &str,

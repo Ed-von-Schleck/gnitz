@@ -813,16 +813,18 @@ class TestMultiwayPruning:
             assert raw_names.count("_join_pk") == 1, raw_names
 
             # Wildcard DISTINCT over a join keeps the wildcard H and dedups full rows.
-            # Distinct column names so the DISTINCT output has no duplicate-name clash.
+            # Both sides carry `id` and `v`: a name-preserving wildcard names nothing
+            # of its own, so the duplicates ride through positionally — the same rule
+            # a plain `SELECT * FROM a JOIN b` view is created under.
             client.execute_sql(
-                "CREATE TABLE da (id BIGINT NOT NULL PRIMARY KEY, dfk BIGINT NOT NULL, dav BIGINT NOT NULL)",
+                "CREATE TABLE da (id BIGINT NOT NULL PRIMARY KEY, dfk BIGINT NOT NULL, v BIGINT NOT NULL)",
                 schema_name=sn,
             )
             client.execute_sql(
-                "CREATE TABLE db (bid BIGINT NOT NULL PRIMARY KEY, dbv BIGINT NOT NULL)", schema_name=sn
+                "CREATE TABLE db (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)", schema_name=sn
             )
             client.execute_sql(
-                "CREATE VIEW vd AS SELECT DISTINCT * FROM da JOIN db ON da.dfk = db.bid",
+                "CREATE VIEW vd AS SELECT DISTINCT * FROM da JOIN db ON da.dfk = db.id",
                 schema_name=sn,
             )
             client.execute_sql("INSERT INTO db VALUES (5, 42)", schema_name=sn)

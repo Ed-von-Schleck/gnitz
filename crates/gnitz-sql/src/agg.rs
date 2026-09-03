@@ -393,27 +393,14 @@ pub(crate) fn finalize_agg_bexpr<R>(value: R, companion: Option<R>, func: AggFun
     }
 }
 
-/// Whether an aggregate's **finalize** output is nullable. AVG's and nullable-SUM's
-/// null-ness lives in the COUNT_NON_NULL companion (the finalize renders NULL via
-/// div-by-zero), so a companion-carrying shape is unconditionally nullable; a direct
-/// shape is exactly the raw reduce column's nullability, which is the shared
-/// `AggFunc::raw_output_nullable` the engine's physical reduce schema also obeys
-/// (`ops[0]` is the value spec — for AVG the SUM component, whose shape
-/// short-circuits above anyway).
-pub(crate) fn agg_output_nullable(typing: &AggTyping, arg_nullable: bool, is_global: bool) -> bool {
-    typing.shape.has_count_companion() || typing.ops[0].0.raw_output_nullable(arg_nullable, is_global)
-}
-
 /// An aggregate's typing: everything decided by the function and its argument's
 /// definition alone, with no physical column positions involved.
 pub(crate) struct AggTyping {
     pub(crate) shape: AggShape,
     /// The physical ops and their output types, in spec order. `ops[0].1` is the
     /// aggregate's **raw** reduce value type (for AVG, the SUM component's — not
-    /// the F64 the finalize renders).
+    /// the F64 the finalize renders; `HirAgg::view_type` is what renders it).
     pub(crate) ops: Vec<(WireAggFunc, TypeCode)>,
-    /// The finalize (SELECT-visible) output type — F64 for AVG, else the raw type.
-    pub(crate) view_type: TypeCode,
 }
 
 /// Decide an aggregate's shape, physical op sequence, and output types from its
@@ -473,15 +460,7 @@ pub(crate) fn agg_typing(agg_func: AggFunc, arg: Option<&ColumnDef>) -> Result<A
         AggFunc::Sum => (AggShape::Direct, vec![op(WireAggFunc::Sum)]),
         AggFunc::Avg => (AggShape::Avg, vec![op(WireAggFunc::Sum), op(WireAggFunc::CountNonNull)]),
     };
-    // AVG is planner-lowered to SUM/COUNT plus a finalize divide, so what SELECT
-    // sees is F64 rather than the SUM component's type; every other aggregate
-    // renders its value op's own output type.
-    let view_type = if agg_func == AggFunc::Avg {
-        TypeCode::F64
-    } else {
-        ops[0].1
-    };
-    Ok(AggTyping { shape, view_type, ops })
+    Ok(AggTyping { shape, ops })
 }
 
 /// Every planner-built reduce gates group existence on a NULL-blind COUNT(*)

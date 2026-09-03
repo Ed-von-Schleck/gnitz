@@ -7,6 +7,12 @@ use crate::test_support::{
 };
 use sqlparser::ast::Expr;
 
+/// Bind against `schema` as relation `t` — the alias every qualified reference
+/// in this file writes.
+fn bind1(e: &Expr, schema: &gnitz_core::Schema) -> Result<crate::ir::BoundExpr, crate::error::GnitzSqlError> {
+    bind_single_table(e, schema, "t")
+}
+
 /// `(id U64 pk, a tc, b tc)` — indexable cols a=1, b=2, `b` nullable per arg.
 fn schema3(tc: TypeCode, b_nullable: bool) -> Schema {
     Schema {
@@ -96,13 +102,13 @@ fn an_equality_packs_its_key_at_the_columns_width() {
 #[test]
 fn double_quoted_uuid_binds_as_column_ref_not_seek() {
     let schema = uuid_schema_payload();
-    let sq = bind_single_table(&parse_expr_sql("uid = '550e8400-e29b-41d4-a716-446655440000'"), &schema).unwrap();
+    let sq = bind1(&parse_expr_sql("uid = '550e8400-e29b-41d4-a716-446655440000'"), &schema).unwrap();
     assert!(
         try_col_eq_literal(&sq, &schema).is_some(),
         "single-quoted UUID is a seek key"
     );
 
-    let err = bind_single_table(
+    let err = bind1(
         &parse_expr_sql("uid = \"550e8400-e29b-41d4-a716-446655440000\""),
         &schema,
     )
@@ -389,7 +395,7 @@ fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
     assert_eq!(got_insert.split_wire().0, expected, "extract_pk_value");
 
     // 2. try_col_eq_literal (bound WHERE pk = literal).
-    let eq = bind_single_table(&eq_expr("id", literal.clone()), &schema).expect("bind eq");
+    let eq = bind1(&eq_expr("id", literal.clone()), &schema).expect("bind eq");
     assert_eq!(
         try_col_eq_literal(&eq, &schema),
         Some((0, expected)),
@@ -398,7 +404,7 @@ fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
 
     // 3. try_extract_pk_in — the repeat keeps it an `InList` (a one-item list
     // folds to the `Eq` leg 2 already covers); the dedup collapses it to one key.
-    let in_e = bind_single_table(&in_list_expr("id", vec![literal.clone(), literal]), &schema).expect("bind in");
+    let in_e = bind1(&in_list_expr("id", vec![literal.clone(), literal]), &schema).expect("bind in");
     assert_eq!(
         try_extract_pk_in(&in_e, &schema).map(|(keys, _)| keys),
         Some(vec![expected]),

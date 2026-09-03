@@ -48,9 +48,10 @@ fn resolve_proj_col(
     item: &SelectItem,
     idx: usize,
     source_schema: &Schema,
+    rel_alias: &str,
 ) -> Result<(ProjItem, ColumnDef), GnitzSqlError> {
     let (expr, alias) = scalar_projection_item(item, "projection")?;
-    let bound = bind_single_table(expr, source_schema)?;
+    let bound = bind_single_table(expr, source_schema, rel_alias)?;
     // A (possibly aliased / qualified / parenthesized) bare column reference is a
     // pass-through; an alias only renames the output column. Anything else is a
     // computed column, built by `computed_column` from its `infer_type`.
@@ -66,12 +67,17 @@ fn resolve_proj_col(
     }
 }
 
+/// The `(type_code, nullable)` declarations parallel to a compiled projection
+/// program's payload slots — what [`declared_out_cols`] produces and what every
+/// carrier of one is typed by.
+pub(crate) type DeclaredCols = Vec<(u8, bool)>;
+
 /// The `(type_code, nullable)` declaration parallel to a compiled projection
 /// program's payload slots. `SELECT a + b` is not a copy list, so the engine
 /// cannot derive the schema of the map it types; this is what
 /// `CircuitBuilder::map_expr` ships instead. `cols` must be the same payload
 /// slice `compile_projection_map` was given.
-pub(crate) fn declared_out_cols(cols: &[ColumnDef]) -> Vec<(u8, bool)> {
+pub(crate) fn declared_out_cols(cols: &[ColumnDef]) -> DeclaredCols {
     cols.iter().map(|c| (c.type_code as u8, c.is_nullable)).collect()
 }
 
@@ -159,6 +165,7 @@ pub(crate) fn place_pk_front(
 pub(crate) fn build_read_projection(
     projection: &[SelectItem],
     source_schema: &Schema,
+    rel_alias: &str,
 ) -> Result<(Vec<ProjItem>, Vec<ColumnDef>), GnitzSqlError> {
     let mut items: Vec<ProjItem> = Vec::new();
     let mut out_cols: Vec<ColumnDef> = Vec::new();
@@ -175,7 +182,7 @@ pub(crate) fn build_read_projection(
                 out_cols.push(out);
             }
         } else {
-            let (it, col) = resolve_proj_col(item, idx, source_schema)?;
+            let (it, col) = resolve_proj_col(item, idx, source_schema, rel_alias)?;
             items.push(it);
             out_cols.push(col);
         }

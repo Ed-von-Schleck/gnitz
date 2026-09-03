@@ -304,30 +304,6 @@ pub(crate) fn group_by_target<'a>(
     Ok(peel_nested(target))
 }
 
-/// A column written outside both the grouping and an aggregate. `clause` names
-/// where it was written (`"GROUP BY SELECT"` / `"HAVING"`), which is the only
-/// thing that varies: one grouped binder raises this, so a direct SELECT and the
-/// equivalent view read the identical sentence.
-pub(crate) fn reject_ungrouped_column(clause: &str, name: &str) -> GnitzSqlError {
-    GnitzSqlError::Plan(format!(
-        "{clause}: column '{name}' must appear in GROUP BY or an aggregate function"
-    ))
-}
-
-/// An expression over the grouped relation that is neither a group key nor an
-/// aggregate. The shape is named, not dumped: the parser's `Debug` is a wall of
-/// spans, and the reader wrote the SQL.
-pub(crate) fn reject_grouped_column_ref(clause: &str) -> GnitzSqlError {
-    GnitzSqlError::Unsupported(format!("{clause}: expected a group key or an aggregate"))
-}
-
-/// An aggregate a finalize leaf could not match to one the reduce computes.
-/// Defensive on both paths: an aggregate reaching a finalize leaf was collected
-/// into the reduce first, so no SQL body resolves to it.
-pub(crate) fn reject_unresolved_aggregate(clause: &str, func: AggFunc, arg: &str) -> GnitzSqlError {
-    GnitzSqlError::Bind(format!("{clause}: aggregate {func:?}({arg}) could not be resolved"))
-}
-
 /// The direct operand subexpressions of `e` — the node set the structural
 /// binder recurses through (binary/unary ops, parens, BETWEEN, IS [NOT] NULL,
 /// IN lists, CEIL/FLOOR/CAST) plus function-call arguments. Subquery nodes

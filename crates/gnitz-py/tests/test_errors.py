@@ -19,6 +19,40 @@ def _cleanup(client, sn, tables=()):
         pass
 
 
+def test_a_written_qualifier_must_name_the_relation(client):
+    """A single-relation statement resolves a qualified reference against the FROM
+    item's effective alias — the written one when there is one — so a qualifier
+    naming something else is a rejection, not a silently ignored decoration."""
+    sn = "q" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)", schema_name=sn
+        )
+        client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20)", schema_name=sn)
+
+        # The relation's own name and a written alias both answer.
+        assert len(client.execute_sql("SELECT t.a FROM t", schema_name=sn)[0]["rows"]) == 2
+        assert len(client.execute_sql("SELECT x.a FROM t AS x", schema_name=sn)[0]["rows"]) == 2
+        client.execute_sql("UPDATE t AS x SET a = 99 WHERE x.a = 10", schema_name=sn)
+        assert sorted(r["a"] for r in client.execute_sql("SELECT a FROM t", schema_name=sn)[0]["rows"]) == [20, 99]
+
+        # A qualifier naming no relation in scope, on each surface.
+        for stmt in [
+            "SELECT b.a FROM t",
+            "SELECT a FROM t WHERE b.a = 1",
+            # The written alias displaces the table name.
+            "SELECT t.a FROM t AS x",
+            "UPDATE t AS x SET a = 1 WHERE t.a = 1",
+            "DELETE FROM t WHERE nope.a = 1",
+            "CREATE VIEW v AS SELECT b.a FROM t",
+        ]:
+            with pytest.raises(gnitz.GnitzError):
+                client.execute_sql(stmt, schema_name=sn)
+    finally:
+        _cleanup(client, sn, ["t"])
+
+
 def test_push_to_nonexistent_target(client):
     cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
             gnitz.ColumnDef("val", gnitz.TypeCode.I64)]

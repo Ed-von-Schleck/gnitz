@@ -115,8 +115,10 @@ pub(crate) fn in_list_expr(col: &str, items: Vec<Expr>) -> Expr {
 
 /// Parse + bind a WHERE predicate against `schema` into a bound conjunct tree —
 /// the natural input for the `access` recognizers, which run on the bound IR.
+/// The relation is `t`, which is what every qualified reference in these tests
+/// writes.
 pub(crate) fn bind_where(sql: &str, schema: &Schema) -> BoundExpr {
-    crate::bind::bind_single_table(&parse_expr_sql(sql), schema).expect("bind WHERE")
+    crate::bind::bind_single_table(&parse_expr_sql(sql), schema, "t").expect("bind WHERE")
 }
 
 /// Parse a bare SQL expression (e.g. a WHERE predicate) via `GenericDialect`.

@@ -818,6 +818,39 @@ def test_distinct_parity(client):
         _cleanup(client, sn, "u")
 
 
+def test_distinct_over_computed_and_duplicate_names(client):
+    """`SELECT DISTINCT <expr>` and `SELECT DISTINCT *` over a duplicate-name view
+    both bind through the one front end, so each accepts exactly what the
+    identical `CREATE VIEW` body accepts."""
+    sn = "dc" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE c (pk BIGINT PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO c VALUES (1,1,4),(2,2,3),(3,5,0),(4,1,4)", schema_name=sn
+        )
+        # A computed set-identity key: rows 1, 2 and 4 all sum to 5.
+        rows = _parity(client, sn, "SELECT DISTINCT a + b AS s FROM c")
+        assert sorted(r["s"] for r in rows) == [5]
+        _parity(client, sn, "SELECT DISTINCT a, a + b AS s FROM c")
+
+        # A name-preserving wildcard names nothing of its own, so a duplicate among
+        # the source's names rides through positionally — on both paths.
+        client.execute_sql(
+            "CREATE TABLE d (pk BIGINT PRIMARY KEY, a BIGINT NOT NULL)", schema_name=sn
+        )
+        client.execute_sql("INSERT INTO d VALUES (1, 1), (2, 2)", schema_name=sn)
+        client.execute_sql(
+            "CREATE VIEW dup AS SELECT * FROM c JOIN d ON c.a = d.pk", schema_name=sn
+        )
+        assert len(_rows(client, sn, "SELECT DISTINCT * FROM dup")) == 3
+    finally:
+        _cleanup(client, sn, "dup", "c", "d")
+
+
 def test_distinct_star_wide_table(client):
     sn = "dw" + _uid()
     client.create_schema(sn)

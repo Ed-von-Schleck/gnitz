@@ -56,20 +56,25 @@ pub(crate) fn bind_and_lower(
 }
 
 /// The ad-hoc read path's entry to the same core: bind a single-relation grouped
-/// body and lower it to fold pieces instead of to a circuit. One binder, two
-/// sinks — which is what makes `SELECT … GROUP BY …` and `CREATE VIEW AS
-/// SELECT … GROUP BY …` accept the same statements and compute them the same way.
+/// or `SELECT DISTINCT` body and lower it to fold pieces instead of to a
+/// circuit. One binder, two sinks — which is what makes `SELECT … GROUP BY …`
+/// and `CREATE VIEW AS SELECT … GROUP BY …` accept the same statements and
+/// compute them the same way, DISTINCT included.
 ///
 /// There is no decorrelate/classify step: the ad-hoc router rejects every
 /// subquery and join shape before a body reaches here, so the bound tree is
-/// already the `Project(Filter_having?(Reduce(PreMap?(Get))))` the lowering
-/// expects.
+/// already one of the two shapes `lower_fold` expects.
 pub(crate) fn bind_and_lower_fold(
     select: &sqlparser::ast::Select,
     schema: &Arc<Schema>,
+    alias: &str,
 ) -> Result<lower::fold::FoldPieces, GnitzSqlError> {
     let ids = ColIdGen::new();
-    let rel = bind::bind_adhoc_grouped(&ids, select, Arc::clone(schema))?;
+    let rel = if select.distinct.is_some() {
+        bind::bind_adhoc_distinct(&ids, select, Arc::clone(schema), alias)?
+    } else {
+        bind::bind_adhoc_grouped(&ids, select, Arc::clone(schema), alias)?
+    };
     lower::fold::lower_fold(&rel, schema)
 }
 
@@ -266,9 +271,7 @@ impl SubqueryRef {
         match self.kind {
             SubqueryKind::Exists { .. } => TypeCode::I64,
             SubqueryKind::Scalar => match self.scalar_agg() {
-                Ok(agg) if agg.func == AggFunc::Avg => TypeCode::F64,
-                // COALESCE(COUNT, 0) is I64 — as is a raw COUNT's own out type.
-                Ok(agg) => agg.out.def.type_code,
+                Ok(agg) => agg.view_type(),
                 Err(_) => TypeCode::I64,
             },
         }
@@ -290,7 +293,7 @@ impl SubqueryRef {
     }
 
     /// The single aggregate of a scalar subquery — its `rel` is invariantly the
-    /// one-aggregate `Reduce` built by `build_scalar_reduce`. The one home for
+    /// one-aggregate `Reduce` `hir::bind`'s `scalar_leaf` builds. The one home for
     /// reading that invariant: every decorrelation site that needs the aggregate
     /// (finalize value, null test, uncorrelated join key) resolves it here.
     pub(crate) fn scalar_agg(&self) -> Result<&HirAgg, GnitzSqlError> {
@@ -413,11 +416,13 @@ impl HirAgg {
         ids: &ColIdGen,
         func: AggFunc,
         arg: Option<ColId>,
-        typing: &crate::agg::AggTyping,
-        arg_nullable: bool,
+        env: &[HirCol],
         is_global: bool,
-    ) -> Self {
-        HirAgg {
+    ) -> Result<Self, GnitzSqlError> {
+        let arg_def = arg.map(|id| &hircol_of(env, id).def);
+        let typing = crate::agg::agg_typing(func, arg_def)?;
+        let arg_nullable = arg_def.map(|d| d.is_nullable).unwrap_or(false);
+        Ok(HirAgg {
             func,
             arg,
             // Hidden: a raw reduce-output column is addressed by `ColId`, never
@@ -436,7 +441,33 @@ impl HirAgg {
                 .shape
                 .has_count_companion()
                 .then(|| HirCol::new(ids.next(), ColumnDef::new("_cnt", TypeCode::I64, false).hidden())),
+        })
+    }
+
+    /// The finalize composite over this aggregate's raw reduce column(s) — the one
+    /// home, shared with `hir::rewrite`'s scalar-subquery substitution and the
+    /// grouped binder's SELECT / HAVING leaf.
+    pub(crate) fn finalize(&self) -> HirExpr {
+        crate::agg::finalize_agg_bexpr(
+            HirRef::Col(self.out.id),
+            self.companion.as_ref().map(|c| HirRef::Col(c.id)),
+            self.func,
+        )
+    }
+
+    /// AVG divides to F64; every other aggregate renders its raw value type.
+    pub(crate) fn view_type(&self) -> TypeCode {
+        if self.func == AggFunc::Avg {
+            TypeCode::F64
+        } else {
+            self.out.def.type_code
         }
+    }
+
+    /// A companion carries the null-ness (the finalize renders NULL by
+    /// div-by-zero); otherwise the raw column's own.
+    pub(crate) fn view_nullable(&self) -> bool {
+        self.companion.is_some() || self.out.def.is_nullable
     }
 }
 

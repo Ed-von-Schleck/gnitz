@@ -20,7 +20,7 @@
 //! `dml::explain` formats the same plan instead of dispatching it.
 
 use crate::ast_util::{
-    body_is_grouped, classify_from, extract_table_factor_name, has_exists_in_subquery, has_scalar_subquery,
+    body_is_grouped, classify_from, extract_table_name_and_alias, has_exists_in_subquery, has_scalar_subquery,
     is_bare_wildcard_projection, FromShape,
 };
 use crate::bind::{cte_passthrough, Binder};
@@ -91,6 +91,9 @@ enum Sink {
 /// see.
 struct Route<'q> {
     target: Target,
+    /// The FROM item's effective alias — the written one if there is one, else
+    /// the relation name. A qualified reference in this query must name it.
+    alias: String,
     select: &'q Select,
     limit: Option<usize>,
     offset: usize,
@@ -215,7 +218,7 @@ fn route_select<'q>(
     let offset = extract_offset(query)?;
     // Step 3 established that `from[0]` is a plain table/view, so this only
     // rejects an exotic table qualifier (a table function, AS OF, …).
-    let table_name = extract_table_factor_name(&select.from[0].relation, "FROM")?;
+    let (table_name, table_alias) = extract_table_name_and_alias(&select.from[0].relation, "FROM")?;
 
     // Step 5 — aggregate / DISTINCT shapes fold via the fold sink. DISTINCT takes
     // precedence over GROUP BY (its arm rejects GROUP BY), matching the view path.
@@ -237,6 +240,7 @@ fn route_select<'q>(
         let target = resolve_target(cat, binder, table_name)?;
         return Ok(Route {
             target,
+            alias: table_alias,
             select,
             limit,
             offset,
@@ -274,6 +278,7 @@ fn route_select<'q>(
 
     Ok(Route {
         target,
+        alias: table_alias,
         select,
         limit,
         offset,
@@ -439,8 +444,8 @@ pub fn plan_read(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> 
 /// so a query unsupported on both axes names the same one whichever sink it
 /// routes to. The bound WHERE lives and dies here; only the owned [`Access`]
 /// outlives it.
-fn plan_access(target: &Target, select: &Select) -> Result<Access, GnitzSqlError> {
-    let bound_where = bind_where(&target.schema, select.selection.as_ref())?;
+fn plan_access(target: &Target, alias: &str, select: &Select) -> Result<Access, GnitzSqlError> {
+    let bound_where = bind_where(&target.schema, alias, select.selection.as_ref())?;
     let indexes = target.desc.as_ref().map(|d| &d.indexes[..]).unwrap_or_default();
     let plan = bound_and_predicate(&target.schema, bound_where.as_ref(), ReadBudget::OneRequest, indexes)?;
     Ok(plan.access)
@@ -448,8 +453,8 @@ fn plan_access(target: &Target, select: &Select) -> Result<Access, GnitzSqlError
 
 fn plan_rows_read(query: &Query, route: &Route<'_>) -> Result<SpecRead, GnitzSqlError> {
     let (target, select) = (&route.target, route.select);
-    let access = plan_access(target, select)?;
-    let shape = build_rows_shape(select, query, &target.schema)?;
+    let access = plan_access(target, &route.alias, select)?;
+    let shape = build_rows_shape(select, query, &target.schema, &route.alias)?;
     // OFFSET+LIMIT logical rows; `0` = unbounded (an OFFSET with no LIMIT too).
     let limit_k = route.limit.map(|l| l.saturating_add(route.offset) as u64).unwrap_or(0);
     Ok(SpecRead {
@@ -470,8 +475,8 @@ fn plan_rows_read(query: &Query, route: &Route<'_>) -> Result<SpecRead, GnitzSql
 
 fn plan_fold_read(query: &Query, route: &Route<'_>) -> Result<SpecRead, GnitzSqlError> {
     let (target, select) = (&route.target, route.select);
-    let access = plan_access(target, select)?;
-    let shape = build_fold_shape(select, &target.schema)?;
+    let access = plan_access(target, &route.alias, select)?;
+    let shape = build_fold_shape(select, &target.schema, &route.alias)?;
     // Resolved against the finished output schema at plan time, so a key naming a
     // missing column rejects before the fold is dispatched, as HAVING already does.
     let order = resolve_out_schema_order(query.order_by.as_ref(), &shape.out_schema)?;
@@ -577,10 +582,10 @@ struct RowsShape {
 /// express (a qualified-wildcard / other non-map projection, an ORDER BY
 /// expression) surfaces the offending resolver's own feature-named `Unsupported`;
 /// an unknown column is a `Bind` error.
-fn build_rows_shape(select: &Select, query: &Query, schema: &Schema) -> Result<RowsShape, GnitzSqlError> {
+fn build_rows_shape(select: &Select, query: &Query, schema: &Schema, alias: &str) -> Result<RowsShape, GnitzSqlError> {
     // Projection items — the source PK hidden-prepended to slots `0..k`, then
     // every SELECT item as a payload slot in SELECT order.
-    let (mut items, mut out_cols) = build_read_projection(&select.projection, schema)?;
+    let (mut items, mut out_cols) = build_read_projection(&select.projection, schema, alias)?;
 
     // ORDER BY keys over the reply columns; a non-projected source column is
     // appended as a hidden payload column (so it can still order the result).

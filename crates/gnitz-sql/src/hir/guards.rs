@@ -32,7 +32,7 @@ pub(crate) fn join_keys_and_type(join: &sqlparser::ast::Join) -> Result<(JoinKey
         JoinOperator::CrossJoin(c) => (c, JoinType::Inner),
         _ => {
             return Err(GnitzSqlError::Unsupported(
-                "CREATE VIEW JOIN: only INNER / LEFT / RIGHT / FULL JOIN, with ON / USING / \
+                "JOIN: only INNER / LEFT / RIGHT / FULL JOIN, with ON / USING / \
                  NATURAL, are supported"
                     .into(),
             ))
@@ -71,8 +71,8 @@ pub(crate) enum JoinKeys<'a> {
 
 /// The merged column is the preserved side's copy, which INNER / LEFT / RIGHT can
 /// pass through. FULL preserves both, so its merged column would be
-/// `COALESCE(l.c, r.c)` — computed, and a join projection carries only
-/// pass-throughs.
+/// `COALESCE(l.c, r.c)` — a value neither side carries, and the join emitter
+/// projects columns of its two inputs, never a computed one.
 fn reject_full_join_column_merge(kind: JoinType, clause: &str) -> Result<(), GnitzSqlError> {
     if kind != JoinType::Full {
         return Ok(());

@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::ast_util::{extract_name, extract_table_factor_name};
+use crate::ast_util::{extract_name, extract_table_name_and_alias};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_column_value, check_not_null, set_target_admits, ColumnValue};
 use crate::codec::pk_codec::{bound_num_literal, pack_pk_value, NumLit};
@@ -300,8 +300,8 @@ fn write_set_rows(
 /// over an empty SELECT list is exactly that — the PK is always prepended, and
 /// there is no payload item to follow it — so the reply carries the key region
 /// and no blob heap, and the projection program relocates nothing.
-fn pk_only_reply(schema: &Schema) -> Result<(Schema, ReadSink), GnitzSqlError> {
-    let (items, out_cols) = build_read_projection(&[], schema)?;
+fn pk_only_reply(schema: &Schema, alias: &str) -> Result<(Schema, ReadSink), GnitzSqlError> {
+    let (items, out_cols) = build_read_projection(&[], schema, alias)?;
     let (reply_schema, projection) = read_reply_shape(&items, out_cols, schema)?;
     let sink = ReadSink::Rows {
         projection,
@@ -372,7 +372,7 @@ pub(crate) fn execute_update(
 ) -> Result<SqlResult, GnitzSqlError> {
     let (table, assignments_raw, selection) = (&update.table, &update.assignments, &update.selection);
 
-    let table_name = extract_table_factor_name(&table.relation, "UPDATE")?;
+    let (table_name, table_alias) = extract_table_name_and_alias(&table.relation, "UPDATE")?;
 
     let target = binder.resolve_base_table(client, &table_name)?;
     let (table_id, schema) = (target.tid, &target.schema);
@@ -382,7 +382,7 @@ pub(crate) fn execute_update(
     let mut seen: Vec<usize> = Vec::with_capacity(assignments_raw.len());
     for assignment in assignments_raw {
         let col_idx = resolve_set_target(assignment, schema, &mut seen, "UPDATE SET")?;
-        assignments.push((col_idx, bind_single_table(&assignment.value, schema)?));
+        assignments.push((col_idx, bind_single_table(&assignment.value, schema, &table_alias)?));
     }
 
     // Compile the SET list against the catalog schema — the one the RHS was bound
@@ -398,7 +398,7 @@ pub(crate) fn execute_update(
         .map(|(ci, e)| Ok((*ci, classify_set_rhs(e, *ci, schema)?)))
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
 
-    let where_expr = bind_where(schema, selection.as_ref())?;
+    let where_expr = bind_where(schema, &table_alias, selection.as_ref())?;
     let plan = bound_and_predicate(schema, where_expr.as_ref(), ReadBudget::MayChunk, &target.indexes)?;
     let sink = ReadSink::all_rows();
 
@@ -441,14 +441,14 @@ pub(crate) fn execute_delete(
             "DELETE: exactly one simple FROM table required".to_string(),
         ));
     }
-    let table_name = extract_table_factor_name(&tables[0].relation, "DELETE")?;
+    let (table_name, table_alias) = extract_table_name_and_alias(&tables[0].relation, "DELETE")?;
 
     let target = binder.resolve_base_table(client, &table_name)?;
     let (table_id, schema) = (target.tid, &target.schema);
 
-    let where_expr = bind_where(schema, del.selection.as_ref())?;
+    let where_expr = bind_where(schema, &table_alias, del.selection.as_ref())?;
     let plan = bound_and_predicate(schema, where_expr.as_ref(), ReadBudget::MayChunk, &target.indexes)?;
-    let (reply_schema, sink) = pk_only_reply(schema)?;
+    let (reply_schema, sink) = pk_only_reply(schema, &table_alias)?;
     let reply_schema = Arc::new(reply_schema);
 
     // Resolve the target PKs and build the retraction batch under the RMW driver

@@ -58,7 +58,11 @@ pub(crate) type Projection = Option<(Schema, Vec<usize>)>;
 /// invalid projection (INSERT ... RETURNING, which writes in between; the
 /// ordering sink, which sorts in between) can resolve first and [`project`]
 /// after, with no batch copy.
-pub(crate) fn resolve_projection(projection: &[SelectItem], schema: &Schema) -> Result<Projection, GnitzSqlError> {
+pub(crate) fn resolve_projection(
+    projection: &[SelectItem],
+    schema: &Schema,
+    rel_alias: &str,
+) -> Result<Projection, GnitzSqlError> {
     // Only a *bare* `*` on a schema with no hidden payload column is the no-op
     // passthrough; a `* EXCEPT/EXCLUDE/RENAME` (or a rejected `* REPLACE/ILIKE`),
     // or a DROP COLUMN'd base table, falls through to the expansion arm so the
@@ -82,7 +86,7 @@ pub(crate) fn resolve_projection(projection: &[SelectItem], schema: &Schema) -> 
             }
             _ => {
                 let (e, alias) = scalar_projection_item(item, "SELECT projection")?;
-                let BoundExpr::ColRef(idx) = bind_single_table(e, schema)? else {
+                let BoundExpr::ColRef(idx) = bind_single_table(e, schema, rel_alias)? else {
                     return Err(GnitzSqlError::Unsupported(
                         "only simple column references supported in SELECT projection".to_string(),
                     ));

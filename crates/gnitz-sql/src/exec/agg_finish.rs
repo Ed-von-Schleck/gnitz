@@ -34,8 +34,8 @@ use gnitz_expr::{ColumnLocator, Evaluator, ExprResults, SchemaFacts};
 use gnitz_wire::{cmp_typed_le, AggFunc as WireAggFunc};
 
 use crate::agg::AggSpec;
+use crate::codec::project_schema::DeclaredCols;
 use crate::error::GnitzSqlError;
-use crate::validate::reject_duplicate_column_names;
 
 /// The fold sink's whole shape, built once at plan time
 /// (`dml::select::build_fold_shape`) and read by the dispatch, by EXPLAIN, and by
@@ -56,7 +56,7 @@ pub(crate) struct FoldShape {
     /// The fold sink's pre-map program and the reduce-input payload columns it
     /// writes, both empty when the reduce reads source columns directly.
     pub(crate) pre_map: Vec<u8>,
-    pub(crate) pre_payload: Vec<(u8, bool)>,
+    pub(crate) pre_payload: DeclaredCols,
     /// The per-worker SyntheticFold reduce-output layout: what the partial reply
     /// decodes against, and what `having` and every [`FinalizeItem`] resolve
     /// against.
@@ -427,14 +427,12 @@ fn acc_bits(acc: &ColAcc) -> Option<u64> {
 /// The final output schema of an ad-hoc aggregate / DISTINCT SELECT: a hidden
 /// synthetic PK (like `_distinct_pk` / `_group_pk`, stripped at presentation)
 /// followed by the SELECT-order visible columns the binder named and typed.
-/// Rejects duplicate visible names — the same gate every view compile applies —
-/// so the routing arm fails at plan time (and the executor re-raises the
-/// identical error) instead of returning a dup-named result the view path would
-/// refuse to create.
+///
+/// The duplicate-name guard is `build_fold_shape`'s: only there is the projection
+/// in hand, and a wildcard that names nothing of its own must stay exempt.
 pub(crate) fn build_agg_out_schema(out_cols: &[ColumnDef]) -> Result<Schema, GnitzSqlError> {
     let mut cols = vec![ColumnDef::new("_agg_pk", TypeCode::U128, false).hidden()];
     cols.extend(out_cols.iter().cloned());
-    reject_duplicate_column_names(cols.iter(), "aggregate SELECT")?;
     Schema::from_parts(cols, vec![0])
         .map_err(|e| GnitzSqlError::Unsupported(format!("ad-hoc aggregate output schema is invalid: {e}")))
 }

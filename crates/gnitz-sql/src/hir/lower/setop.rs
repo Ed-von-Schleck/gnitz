@@ -13,7 +13,7 @@ use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::physical;
 use crate::ir::{BExpr, BoundExpr};
-use crate::validate::{reject_duplicate_column_names, reject_float_keys};
+use crate::validate::reject_float_keys;
 use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, TypeCode};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -85,7 +85,7 @@ pub(crate) fn lower_setop(
         }
     };
     cb.sink(out_node);
-    hashed_out(cb, "_set_pk", out.iter().map(|c| &c.out), "set operation view")
+    hashed_out(cb, "_set_pk", out.iter().map(|c| &c.out))
 }
 
 /// Lower a `SELECT DISTINCT` body (`Distinct(Project(...))`) — dedup over the
@@ -105,17 +105,19 @@ pub(crate) fn lower_distinct(
     let sharded = hash_shard_side(&mut cb, node, &slots, &[], 0);
     let distinct_node = cb.distinct(sharded);
     cb.sink(distinct_node);
-    hashed_out(cb, "_distinct_pk", side_cols.iter(), "SELECT DISTINCT view")
+    hashed_out(cb, "_distinct_pk", side_cols.iter())
 }
 
 /// Finish a content-hashed body: build the circuit and pair the synthetic hidden
 /// U128 hash PK with the body's output columns, returning the pieces plus the
 /// output `ColId` layout. One home for the `_set_pk` / `_distinct_pk` convention.
+///
+/// No duplicate-name guard: bind runs one over the projection these columns come
+/// from, and neither shell renames anything.
 fn hashed_out<'a>(
     cb: CircuitBuilder,
     pk_name: &str,
     cols: impl Iterator<Item = &'a HirCol>,
-    dup_ctx: &str,
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     let circuit = cb.build();
     let (mut out_cols, mut layout) = (
@@ -126,7 +128,6 @@ fn hashed_out<'a>(
         out_cols.push(c.def.clone());
         layout.push(c.id);
     }
-    reject_duplicate_column_names(out_cols.iter(), dup_ctx)?;
     Ok(((circuit, out_cols, 1), layout))
 }
 

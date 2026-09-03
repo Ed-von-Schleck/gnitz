@@ -10,7 +10,6 @@ use super::{
     as_col, col_by_id, hircol_of, ColId, ColIdGen, EqPair, HirCol, HirExpr, HirRange, HirRef, JoinClass, JoinOn,
     ProjEntry, RelExpr, SubqueryKind, SubqueryRef,
 };
-use crate::agg::finalize_agg_bexpr;
 use crate::error::GnitzSqlError;
 use crate::hir::guards::{converse_rel, validate_join_key_pair, validate_range_join_key_pair};
 use crate::hir::JoinType;
@@ -548,11 +547,7 @@ fn build_uncorrelated_inner(
 /// `false`: it drops unmatched rows instead, so there is nothing to repair.
 fn scalar_value(s: &SubqueryRef, null_filled: bool) -> Result<HirExpr, GnitzSqlError> {
     let agg = s.scalar_agg()?;
-    let v = finalize_agg_bexpr(
-        HirRef::Col(agg.out.id),
-        agg.companion.as_ref().map(|c| HirRef::Col(c.id)),
-        agg.func,
-    );
+    let v = agg.finalize();
     if null_filled && s.never_null() {
         // COUNT is Direct (`v == ColRef(agg.out)`); after the LEFT join it is
         // nullable, so `CASE WHEN it IS NOT NULL THEN it ELSE 0`.

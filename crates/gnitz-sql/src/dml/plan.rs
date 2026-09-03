@@ -134,12 +134,14 @@ impl<'e> AccessPlan<'e> {
 }
 
 /// Bind a single-table `WHERE` (or its absence) for [`bound_and_predicate`].
+/// `alias` is the relation's effective alias, which a written qualifier must name.
 pub(crate) fn bind_where(
     schema: &Schema,
+    alias: &str,
     where_expr: Option<&sqlparser::ast::Expr>,
 ) -> Result<Option<BoundExpr>, GnitzSqlError> {
     where_expr
-        .map(|we| crate::bind::bind_single_table(we, schema))
+        .map(|we| crate::bind::bind_single_table(we, schema, alias))
         .transpose()
 }
 

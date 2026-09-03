@@ -149,7 +149,7 @@ class TestViewOutputColumnAliases:
                 "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)", schema_name=sn
             )
             client.execute_sql("INSERT INTO u VALUES (7, 10)", schema_name=sn)
-            with pytest.raises(gnitz.GnitzError, match="duplicate column name 'id' in JOIN view"):
+            with pytest.raises(gnitz.GnitzError, match="duplicate column name 'id' in CREATE VIEW projection"):
                 client.execute_sql(
                     "CREATE VIEW j (x, y) AS SELECT t.id, u.id FROM t JOIN u ON t.a = u.a", schema_name=sn
                 )

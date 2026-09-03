@@ -1,5 +1,7 @@
 use super::resolve::find_unique_column;
-use crate::ast_util::{classify_agg_call, function_positional_args, single_fn_name, single_relation_col_name};
+use crate::ast_util::{
+    classify_agg_call, function_positional_args, peel_nested, single_fn_name, single_relation_col_name,
+};
 use crate::codec::pk_codec::{extract_sql_literal, SqlLiteral};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, NumFunc, StrFunc, TrimMode, UnaryOp};
@@ -14,9 +16,9 @@ use sqlparser::ast::{
 /// set-op branches, DML). The structural recursion lives in `bind_structural`;
 /// the `SingleTable` leaf supplies the schema-aware decisions (column lookup,
 /// aggregate calls, nullability). Context is fully determined by
-/// `(expr, schema)` — no binder state is involved.
-pub(crate) fn bind_single_table(expr: &Expr, schema: &Schema) -> Result<BoundExpr, GnitzSqlError> {
-    bind_structural(expr, &SingleTable { schema })
+/// `(expr, schema, alias)` — no binder state is involved.
+pub(crate) fn bind_single_table(expr: &Expr, schema: &Schema, alias: &str) -> Result<BoundExpr, GnitzSqlError> {
+    bind_structural(expr, &SingleTable { schema, alias })
 }
 
 // ---------------------------------------------------------------------------
@@ -32,9 +34,9 @@ pub(crate) fn bind_single_table(expr: &Expr, schema: &Schema) -> Result<BoundExp
 // context at the same time and cannot silently drift between hand-copied walks.
 
 /// The schema-aware leaves of `bind_structural`, generic over the leaf reference
-/// type `R` (the `ColRef` payload). `R` defaults to `usize`,
-/// which is what the two ad-hoc read-path leaves resolve to unannotated; the four
-/// view-path leaves in `hir::bind` instantiate the column-identity `HirRef`.
+/// type `R` (the `ColRef` payload). `R` defaults to `usize`, which is what the
+/// ad-hoc read path's [`SingleTable`] resolves to unannotated; the two view-path
+/// leaves in `hir::bind` instantiate the column-identity `HirRef`.
 pub(crate) trait LeafBinder<R = usize> {
     /// A whole expression this leaf's context names, claimed before the recursion
     /// descends into it — a GROUP BY key over a grouped relation. `None` recurses
@@ -382,7 +384,7 @@ fn literal_string(v: &Value) -> Option<String> {
 /// Parentheses are peeled first, so `TRIM(s, ('ab'))` reads like `TRIM(s, 'ab')`
 /// — the operand positions get that from `bind_structural`'s `Nested` arm.
 fn literal_expr_string(e: &Expr) -> Option<String> {
-    match crate::ast_util::peel_nested(e) {
+    match peel_nested(e) {
         Expr::Value(v) => literal_string(&v.value),
         _ => None,
     }
@@ -803,19 +805,26 @@ pub(crate) fn null_test<R, L: LeafBinder<R>>(value: BExpr<R>, want_null: bool, l
 }
 
 /// The position of an `Identifier` / two-part `CompoundIdentifier` within one
-/// relation's columns. The qualifier on a compound ref is informational in a
-/// single-relation context (it carries no disambiguating information — a
-/// duplicated name is ambiguous even when qualified).
+/// relation's columns. A written qualifier must name `alias`, the relation's
+/// effective alias, so `SELECT b.val FROM a` is a rejection rather than a read of
+/// `a.val`; it disambiguates nothing beyond that.
 ///
 /// The one home for the single-relation resolve contract — the "expected a column
-/// reference" / "column not found" pair and the ambiguity error `find_unique_column`
-/// raises — shared by the runtime `SingleTable` leaf (columns by slice) and the HIR
-/// `HirSingleTable` leaf (columns behind `HirCol`), which resolve to a `usize` and a
-/// `ColId` respectively off the same index.
+/// reference" / "column not found" pair and `find_unique_column`'s ambiguity
+/// error.
 pub(crate) fn single_relation_col_idx<'a>(
     cols: impl IntoIterator<Item = &'a ColumnDef>,
+    alias: &str,
     e: &Expr,
 ) -> Result<usize, GnitzSqlError> {
+    if let Expr::CompoundIdentifier(p) = peel_nested(e) {
+        if p.len() == 2 && !p[0].value.eq_ignore_ascii_case(alias) {
+            return Err(GnitzSqlError::Bind(format!(
+                "table alias '{}' not found (the relation in scope is '{alias}')",
+                p[0].value
+            )));
+        }
+    }
     let name =
         single_relation_col_name(e).ok_or_else(|| GnitzSqlError::Unsupported("expected a column reference".into()))?;
     find_unique_column(cols, name)?.ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found")))
@@ -824,11 +833,13 @@ pub(crate) fn single_relation_col_idx<'a>(
 /// Leaf for a single-relation schema (WHERE, projections, set-ops, DML).
 pub(crate) struct SingleTable<'a> {
     pub schema: &'a Schema,
+    /// The relation's effective alias — what a written qualifier must name.
+    pub alias: &'a str,
 }
 
 impl SingleTable<'_> {
     fn idx(&self, e: &Expr) -> Result<usize, GnitzSqlError> {
-        single_relation_col_idx(&self.schema.columns, e)
+        single_relation_col_idx(&self.schema.columns, self.alias, e)
     }
 }
 

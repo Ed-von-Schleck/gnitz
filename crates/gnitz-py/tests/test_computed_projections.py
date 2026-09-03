@@ -272,6 +272,39 @@ class TestComputedProjections:
         finally:
             _cleanup(client, sn)
 
+    def test_computed_over_a_join(self, client):
+        """A computed projection over a join is not rejected: the lowering cuts the
+        join to a hidden segment and maps the expression above it."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE ja (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT NOT NULL, x BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE jb (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT ja.x + jb.y AS s FROM ja JOIN jb ON ja.fk = jb.id",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO jb VALUES (5, 100), (6, 200)", schema_name=sn)
+            client.execute_sql("INSERT INTO ja VALUES (1, 5, 1), (2, 6, 2)", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            assert sorted(r["s"] for r in _scan_dicts(client, vid)) == [101, 202]
+        finally:
+            try:
+                client.execute_sql("DROP VIEW v", schema_name=sn)
+            except Exception:
+                pass
+            for name in ["ja", "jb"]:
+                try:
+                    client.execute_sql(f"DROP TABLE {name}", schema_name=sn)
+                except Exception:
+                    pass
+            _cleanup(client, sn)
+
 
 # ---------------------------------------------------------------------------
 # TestFloatExpressions

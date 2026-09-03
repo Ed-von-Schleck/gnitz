@@ -182,8 +182,9 @@ fn order_target(e: &Expr) -> Result<OrderTarget, GnitzSqlError> {
     if let Some(pos) = clause_position(e, "ORDER BY position")? {
         return Ok(OrderTarget::Position(pos));
     }
-    // Bare or qualified (`t.col`) identifier → name; qualifier is ignored
-    // (crate-wide single-relation convention).
+    // Bare or qualified (`t.col`) identifier → its name, which is resolved
+    // against the read's *output* columns, not the relation's — so there is no
+    // qualifier to check it against and none is read.
     if let Some(name) = single_relation_col_name(e) {
         return Ok(OrderTarget::Name(name.to_string()));
     }

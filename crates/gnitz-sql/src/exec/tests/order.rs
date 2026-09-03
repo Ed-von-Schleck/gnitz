@@ -104,7 +104,7 @@ fn order_limit_project(
     offset: usize,
     limit: Option<usize>,
 ) -> Result<(Schema, ZSetBatch), GnitzSqlError> {
-    let resolved = resolve_projection(projection, actual_schema)?;
+    let resolved = resolve_projection(projection, actual_schema, "t")?;
     let full = full_batch.unwrap_or_else(|| ZSetBatch::new(actual_schema));
     let (_, windowed) = passthrough(actual_schema.clone(), full, order_by, offset, limit)?;
     Ok(project(resolved, actual_schema, Some(windowed)))

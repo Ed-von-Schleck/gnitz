@@ -158,7 +158,7 @@ pub(crate) fn execute_insert(
                             "ON CONFLICT ... DO UPDATE WHERE not supported".to_string(),
                         ));
                     }
-                    let assignments = bind_do_update_assignments(&do_update.assignments, schema)?;
+                    let assignments = bind_do_update_assignments(&do_update.assignments, schema, &table_name_str)?;
                     ConflictPlan::DoUpdatePk { assignments }
                 }
             }
@@ -281,7 +281,9 @@ pub(crate) fn execute_insert(
             // BEFORE the write, so a bad RETURNING list writes nothing rather than
             // committing the row and then failing; `project` afterwards is
             // infallible and consumes the batch, so nothing is copied.
-            let proj = returning.map(|items| resolve_projection(items, schema)).transpose()?;
+            let proj = returning
+                .map(|items| resolve_projection(items, schema, &table_name_str))
+                .transpose()?;
             // A stream has no PK conflict to reject: the engine refuses `Error` on
             // one and leaves `Update` unread, so the push appends. INSERTing the
             // same row twice therefore yields one element at weight 2.
@@ -351,6 +353,7 @@ pub(crate) fn execute_insert(
 fn bind_do_update_assignments(
     raw: &[Assignment],
     schema: &Schema,
+    alias: &str,
 ) -> Result<Vec<(usize, BoundUpdateExpr)>, GnitzSqlError> {
     let mut out = Vec::with_capacity(raw.len());
     let mut seen: Vec<usize> = Vec::with_capacity(raw.len());
@@ -358,13 +361,18 @@ fn bind_do_update_assignments(
         let col_idx = resolve_set_target(assignment, schema, &mut seen, "ON CONFLICT DO UPDATE SET")?;
         // Recognize EXCLUDED.col as a special form. sqlparser parses it
         // as a CompoundIdentifier: `EXCLUDED`.`col`.
-        let value = bind_do_update_rhs(&assignment.value, col_idx, schema)?;
+        let value = bind_do_update_rhs(&assignment.value, col_idx, schema, alias)?;
         out.push((col_idx, value));
     }
     Ok(out)
 }
 
-fn bind_do_update_rhs(expr: &Expr, target: usize, schema: &Schema) -> Result<BoundUpdateExpr, GnitzSqlError> {
+fn bind_do_update_rhs(
+    expr: &Expr,
+    target: usize,
+    schema: &Schema,
+    alias: &str,
+) -> Result<BoundUpdateExpr, GnitzSqlError> {
     // `EXCLUDED.col` — sqlparser produces `CompoundIdentifier`.
     if let Expr::CompoundIdentifier(parts) = expr {
         if parts.len() == 2 && parts[0].value.eq_ignore_ascii_case("EXCLUDED") {
@@ -380,10 +388,8 @@ fn bind_do_update_rhs(expr: &Expr, target: usize, schema: &Schema) -> Result<Bou
             )?));
         }
     }
-    // Reject expressions that embed EXCLUDED references inside compound
-    // expressions (e.g. `col + EXCLUDED.col`): the standard binder strips
-    // table qualifiers, so it would silently bind EXCLUDED.col to the
-    // existing row's col, producing wrong results.
+    // `col + EXCLUDED.col`. The binder already rejects it (`EXCLUDED` names no
+    // relation in scope); this says why, which its message cannot.
     if expr_contains_excluded(expr) {
         return Err(GnitzSqlError::Unsupported(
             "EXCLUDED column references inside compound expressions are not \
@@ -392,7 +398,7 @@ fn bind_do_update_rhs(expr: &Expr, target: usize, schema: &Schema) -> Result<Bou
         ));
     }
     Ok(BoundUpdateExpr::Existing(classify_set_rhs(
-        &bind_single_table(expr, schema)?,
+        &bind_single_table(expr, schema, alias)?,
         target,
         schema,
     )?))

@@ -1,4 +1,4 @@
-use crate::ast_util::{classify_from, extract_table_factor_name, is_bare_wildcard_projection, FromShape};
+use crate::ast_util::{classify_from, extract_table_name_and_alias, is_bare_wildcard_projection, FromShape};
 use crate::error::GnitzSqlError;
 use gnitz_core::{CatalogSnapshot, ClientError, ColumnDef, GnitzClient, RelClass, RelDescriptor, Schema};
 use sqlparser::ast::{Expr, Ident, Select, SelectItem, TableAliasColumnDef};
@@ -274,13 +274,12 @@ pub(crate) fn cte_passthrough(
     if !matches!(classify_from(&cte_select.from), FromShape::SinglePlainRelation) {
         return Ok(None);
     }
-    let cte_table_name = extract_table_factor_name(&cte_select.from[0].relation, "CTE")?;
+    let (cte_table_name, cte_alias) = extract_table_name_and_alias(&cte_select.from[0].relation, "CTE")?;
     let (cte_tid, cte_schema, cte_kind) = binder.resolve(cat, &cte_table_name)?;
-    // Positional identity projection: `*`, or one identifier per source column in
-    // order. The qualified form (`SELECT t.a, t.b FROM t`) parses as `CompoundIdentifier`
-    // and is the same positional pass-through; a dup-named source fails the per-position
-    // compare and is not identity. Only a *bare* `*` is identity — a
-    // `* EXCEPT/EXCLUDE/RENAME` (or a rejected `* REPLACE/ILIKE`) CTE body is not.
+    // Positional identity projection: a *bare* `*`, or one identifier per source
+    // column in order. A qualified identifier (`SELECT t.a FROM t`) is the same
+    // pass-through, but only under the source's own alias — the compiled path
+    // rejects any other qualifier, so this fast path must too.
     let proj_is_identity = is_bare_wildcard_projection(&cte_select.projection)
         || (cte_select.projection.len() == cte_schema.columns.len()
             && cte_select.projection.iter().enumerate().all(|(i, item)| {
@@ -288,7 +287,7 @@ pub(crate) fn cte_passthrough(
                 match item {
                     SelectItem::UnnamedExpr(Expr::Identifier(id)) => id.value.eq_ignore_ascii_case(want),
                     SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 2 => {
-                        parts[1].value.eq_ignore_ascii_case(want)
+                        parts[0].value.eq_ignore_ascii_case(&cte_alias) && parts[1].value.eq_ignore_ascii_case(want)
                     }
                     _ => false,
                 }
