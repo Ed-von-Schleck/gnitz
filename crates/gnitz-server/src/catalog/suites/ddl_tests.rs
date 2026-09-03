@@ -829,11 +829,12 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
 
     // (replicated, depth) for a registered relation.
-    let stamp = |e: &CatalogEngine, id: i64| {
-        let t = e.registry().table_entry(id).expect("registered");
-        (t.schema.placement().is_replicated(), t.depth)
+    let stamp = |e: &mut CatalogEngine, id: i64| {
+        let CatalogEngine { registry, dag, .. } = e;
+        let t = registry.table_entry(id).expect("registered");
+        (t.schema.placement().is_replicated(), dag.depth_of(registry, id))
     };
-    let assert_stamps = |e: &CatalogEngine, when: &str| {
+    let assert_stamps = |e: &mut CatalogEngine, when: &str| {
         assert!(stamp(e, rt).0, "replicated base table ({when})");
         assert_eq!(stamp(e, r_producer), (true, 1), "view over a replicated table ({when})");
         assert_eq!(
@@ -844,12 +845,12 @@ fn replicated_bit_is_transitive_and_survives_replay() {
         assert_eq!(stamp(e, p_producer), (false, 1), "view over a table ({when})");
         assert_eq!(stamp(e, p_consumer), (false, 2), "view over a view ({when})");
     };
-    assert_stamps(&engine, "live CREATE");
+    assert_stamps(&mut engine, "live CREATE");
 
     engine.close();
 
-    let engine2 = CatalogEngine::open(&dir, 1).unwrap();
-    assert_stamps(&engine2, "after replay");
+    let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
+    assert_stamps(&mut engine2, "after replay");
     engine2.close();
 
     let _ = fs::remove_dir_all(&dir);

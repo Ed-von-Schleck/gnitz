@@ -114,8 +114,8 @@ impl fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-/// The server's and the mirror's error plumbing is string-typed; this is what
-/// keeps `?` working at every one of their call sites.
+/// The server's error plumbing is string-typed; this is what keeps `?` working
+/// at every one of its call sites.
 impl From<StoreError> for String {
     fn from(e: StoreError) -> String {
         e.to_string()

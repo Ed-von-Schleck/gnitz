@@ -31,7 +31,7 @@ pub fn relation_dir(base_dir: &str, schema_name: &str, kind: RelationKind, id: i
 /// orphan sweeps' `remove_dir_all`, and matching the exact shapes would strand a
 /// directory written under an older naming scheme instead of reclaiming it.
 /// Anything not ending in `_<digits>` is left untouched.
-pub fn is_table_dir_name(name: &str) -> bool {
+pub(super) fn is_table_dir_name(name: &str) -> bool {
     name.rsplit_once('_').is_some_and(|(_, id)| has_numeric_id(id))
 }
 
@@ -77,21 +77,24 @@ fn lock_file_path(base_dir: &str) -> String {
     format!("{base_dir}/{DIR_LOCK_FILENAME}")
 }
 
-/// How long [`lock_data_dir`] keeps retrying before it reports the directory as
-/// held, and how long it sleeps between attempts.
+/// How long the server has [`lock_data_dir`] retry before it reports the
+/// directory as held.
 ///
-/// It is a bounded retry rather than one `LOCK_NB` attempt because of how a
-/// server restarts: a worker is a forked child carrying `PR_SET_PDEATHSIG`, so
-/// it dies *after* the master, while the master's exit is what a supervisor
-/// observes. Between those two instants a worker still holds the inherited
-/// lock, and a bare `LOCK_NB` would turn every fast restart into an intermittent
-/// "another process holds this data directory". A directory whose owner is
-/// genuinely live still fails, because it stays held for the whole window.
-const DIR_LOCK_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+/// A bounded retry rather than one `LOCK_NB` attempt because of how a server
+/// restarts: a worker is a forked child carrying `PR_SET_PDEATHSIG`, so it dies
+/// *after* the master, while the master's exit is what a supervisor observes.
+/// Between those two instants a worker still holds the inherited lock, and a
+/// bare `LOCK_NB` would turn every fast restart into an intermittent "another
+/// process holds this data directory". A directory whose owner is genuinely
+/// live still fails, because it stays held for the whole window.
+pub const DIR_LOCK_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long [`lock_data_dir`] sleeps between attempts.
 const DIR_LOCK_RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// Take the exclusive `flock` on `base_dir`'s lock file, so exactly one live
-/// handle writes it.
+/// Create `base_dir` if absent and take the exclusive `flock` on its lock file,
+/// so exactly one live handle writes it — retrying a held lock for `retry`: the
+/// server's restart window, zero for a host whose directory no forked child can
+/// hold.
 ///
 /// Two writers on one directory silently corrupt shard state: `current_lsn` is
 /// per-`Table` and reseeded from `max_lsn + 1` at open, so both would mint
@@ -103,7 +106,10 @@ const DIR_LOCK_RETRY_EVERY: std::time::Duration = std::time::Duration::from_mill
 ///
 /// The returned file must outlive every store under `base_dir`: closing it
 /// releases the lock.
-pub fn lock_data_dir(base_dir: &str) -> Result<fs::File, StoreError> {
+pub fn lock_data_dir(base_dir: &str, retry: std::time::Duration) -> Result<fs::File, StoreError> {
+    // The directory before the lock: the lock file is opened with
+    // `create(true)`, which fails if its directory is absent.
+    ensure_dir(base_dir)?;
     let path = lock_file_path(base_dir);
     let file = fs::OpenOptions::new()
         .read(true)
@@ -113,7 +119,7 @@ pub fn lock_data_dir(base_dir: &str) -> Result<fs::File, StoreError> {
         .open(&path)
         .map_err(|e| StoreError::storage(format!("open data-directory lock '{path}'"), e.into()))?;
     let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
-    let deadline = std::time::Instant::now() + DIR_LOCK_RETRY_FOR;
+    let deadline = std::time::Instant::now() + retry;
     loop {
         if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(file);

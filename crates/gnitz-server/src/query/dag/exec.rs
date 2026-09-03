@@ -6,7 +6,7 @@ use crate::query::compiler::{Side, Sides};
 use gnitz_store::storage::StorageError;
 
 /// One edge of a tick's schedule: `producer`'s output feeds `view`, and `depth`
-/// is `view`'s stamped registration depth. Field order is the sort order, so
+/// is `view`'s depth in the dependency map. Field order is the sort order, so
 /// sorting a schedule puts every producer before the steps it feeds.
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Step {
@@ -158,8 +158,8 @@ impl DagEngine {
     // ── DAG traversal driver ────────────────────────────────────────────
 
     /// One [`Step`] per dependency edge out of `source_id`'s forward closure, in
-    /// execution order. A pure function of the dep map and the stamped depths,
-    /// both worker-identical — which is what keeps the workers in lockstep.
+    /// execution order. A pure function of the dep map, which is
+    /// worker-identical — what keeps the workers in lockstep.
     fn tick_schedule(&mut self, registry: &RelationRegistry, source_id: i64) -> Vec<Step> {
         // A push into a table no view scans is the common case, and reaches
         // nothing.
@@ -173,9 +173,9 @@ impl DagEngine {
             for &view in self.dep.forward.get(&producer).into_iter().flatten() {
                 // The dep map is built from `CircuitNodes`, which can still name a
                 // relation the registry no longer holds.
-                if let Some(entry) = registry.entry(view) {
+                if registry.has_id(view) {
                     schedule.push(Step {
-                        depth: entry.depth,
+                        depth: self.dep.depth.get(&view).copied().unwrap_or(0),
                         view,
                         producer,
                     });

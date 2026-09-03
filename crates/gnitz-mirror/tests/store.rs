@@ -2,17 +2,14 @@
 //!
 //! It is testable in isolation because it no longer owns one — every method is a
 //! statement about the copy it holds. What lives here is the store's lifecycle:
-//! the registration and its retraction set, the teardown ladder, the readability
-//! gate, the ingest's ordering, and what a checkpoint makes durable. The
-//! acceptance suite beside it (`mirror.rs`) drives a real client against a real
-//! server.
+//! the registration and what it retracts, the teardown ladder, the ingest's
+//! ordering, and what a checkpoint makes durable. The acceptance suite beside it
+//! (`mirror.rs`) drives a real client against a real server.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
-use gnitz_core::{
-    ColData, ColumnDef, DeltaCursor, Invalidate, MirrorStore, RawBlock, Schema, Shape, StoreRead, TypeCode,
-};
+use gnitz_core::{ColData, ColumnDef, DeltaCursor, Invalidate, MirrorStore, RawBlock, Schema, Shape, TypeCode};
 use gnitz_mirror::Mirror;
 use gnitz_store::schema::make_delta_schema;
 use gnitz_store::storage::Batch;
@@ -78,15 +75,13 @@ fn stamped(tick: u64, rows: &[(u64, i64, i64)]) -> Vec<RawBlock> {
 fn registered(name: &str) -> (Mirror, String) {
     let dir = scratch_dir("mirror_store", name);
     let mut store = Mirror::open(&dir).expect("a fresh store opens");
-    let retracted = store
+    store
         .register(TID, SCHEMA, "v", &view_schema())
         .expect("a first registration");
-    assert!(retracted.is_empty(), "a first registration retracts nothing");
     (store, dir)
 }
 
-/// `(pk, payload) → summed weight` for every row the copy holds, or `None` when
-/// the store does not answer for it.
+/// `(pk, payload) → summed weight` for every row the copy holds.
 ///
 /// **Weight-exact, because that is what correctness means here**: a row-set
 /// comparison would accept a delta applied twice, which leaves the row set
@@ -96,8 +91,8 @@ fn registered(name: &str) -> (Mirror, String) {
 /// every store path uses. Folding on the PK alone would sum two rows that differ
 /// only in payload onto one entry, and would let a payload the round-stamp strip
 /// mangled pass unnoticed — the keys and their weights would still line up.
-fn held(store: &mut Mirror, tid: u64) -> Option<BTreeMap<(u64, i64), i64>> {
-    let (_, batch) = store.scan(tid).expect("a scan of a held copy")?;
+fn held(store: &mut Mirror, tid: u64) -> BTreeMap<(u64, i64), i64> {
+    let batch = store.scan(tid, &view_schema()).expect("a scan of a held copy");
     let ColData::Fixed(vals) = &batch.columns[1] else {
         panic!("the copy's one payload column is fixed-width")
     };
@@ -108,7 +103,7 @@ fn held(store: &mut Mirror, tid: u64) -> Option<BTreeMap<(u64, i64), i64>> {
         *out.entry((pk, val)).or_insert(0) += batch.weights[row];
     }
     out.retain(|_, w| *w != 0);
-    Some(out)
+    out
 }
 
 /// The `MirrorStore` bound the client's `Box<dyn MirrorStore>` needs, and the
@@ -120,34 +115,34 @@ fn the_store_is_send() {
 }
 
 /// A registration stands while the id and the layout do; a *different* id under
-/// the same qualified name retracts the incumbent, and says which.
+/// the same qualified name retracts the incumbent.
 #[test]
 fn a_registration_stands_and_a_moved_name_retracts_the_incumbent() {
     let _g = serial();
     let (mut store, _dir) = registered("registration");
 
-    let again = store
-        .register(TID, SCHEMA, "v", &view_schema())
-        .expect("a second registration");
-    assert!(
-        again.is_empty(),
-        "the same id at the same layout stands, so nothing is retracted",
-    );
-
     store
         .ingest(TID, plain(&[(1, 1, 10)]), Shape::Plain, cursor(4))
         .unwrap();
-    let moved = store
+    store
+        .register(TID, SCHEMA, "v", &view_schema())
+        .expect("a second registration");
+    assert_eq!(
+        store.cursor_of(TID),
+        Some(cursor(4)),
+        "the same id at the same layout stands, cursor and all",
+    );
+
+    store
         .register(OTHER_TID, SCHEMA, "v", &view_schema())
         .expect("the name moves to a fresh id");
-    assert_eq!(moved, vec![TID], "the incumbent under that name is reported retracted");
     assert_eq!(
         store.cursor_of(TID),
         None,
         "a retracted registration takes its cursor with it, or the next poll \
          delivers onto an erased copy and loses everything below its round",
     );
-    assert!(store.scan(TID).unwrap().is_none(), "and its copy is gone");
+    assert!(store.scan(TID, &view_schema()).is_err(), "and its copy is gone");
 }
 
 /// The ladder, level by level: each does everything the level above it does, and
@@ -165,14 +160,14 @@ fn the_invalidate_ladder_stops_where_it_is_asked() {
         store
             .ingest(TID, plain(&[(1, 1, 10), (2, 1, 20)]), Shape::Plain, cursor(4))
             .unwrap();
-        assert_eq!(held(&mut store, TID).unwrap().len(), 2);
+        assert_eq!(held(&mut store, TID).len(), 2);
 
         store.invalidate(TID, level).unwrap();
         assert_eq!(store.cursor_of(TID), None, "{level:?} drops the cursor");
 
         store.ingest(TID, Vec::new(), Shape::Plain, cursor(4)).unwrap();
         assert_eq!(
-            held(&mut store, TID).unwrap().len(),
+            held(&mut store, TID).len(),
             want,
             "{level:?} must leave exactly {want} rows",
         );
@@ -184,7 +179,7 @@ fn the_invalidate_ladder_stops_where_it_is_asked() {
         .unwrap();
     store.invalidate(TID, Invalidate::Registration).unwrap();
     assert_eq!(store.cursor_of(TID), None);
-    assert!(store.scan(TID).unwrap().is_none(), "the copy is gone");
+    assert!(store.scan(TID, &view_schema()).is_err(), "the copy is gone");
     assert!(
         store
             .ingest(TID, plain(&[(1, 1, 10)]), Shape::Plain, cursor(5))
@@ -193,38 +188,10 @@ fn the_invalidate_ladder_stops_where_it_is_asked() {
     );
     store
         .invalidate(TID, Invalidate::Registration)
-        .expect("an id the catalog does not hold tears down to Ok");
+        .expect("an id the store does not hold tears down to Ok");
     store
         .register(TID, SCHEMA, "v", &view_schema())
         .expect("the id can be registered again");
-}
-
-/// The gate is the cursor, on both reads.
-///
-/// A registration is written before the copy behind it exists, so a read gated on
-/// the registration alone would answer an erased copy with zero rows, no request
-/// and no error. `NotHeld` is what sends it upstream instead — and it stays
-/// distinct from an empty answer off a readable copy.
-#[test]
-fn the_cursor_is_the_read_gate() {
-    let _g = serial();
-    let (mut store, _dir) = registered("gate");
-    let spec = gnitz_wire::ReadSpec::encode_parts(&gnitz_wire::ReadBound::None, &[], &gnitz_wire::ReadSink::all_rows());
-
-    assert!(store.scan(TID).unwrap().is_none(), "no cursor, no local scan");
-    assert!(
-        matches!(store.scan_spec(TID, &spec, &view_schema()).unwrap(), StoreRead::NotHeld),
-        "no cursor, no local spec read",
-    );
-
-    store
-        .ingest(TID, plain(&[(1, 1, 10)]), Shape::Plain, cursor(4))
-        .unwrap();
-    assert_eq!(held(&mut store, TID).unwrap(), BTreeMap::from([((1, 10), 1)]));
-    let StoreRead::Held(rows) = store.scan_spec(TID, &spec, &view_schema()).unwrap() else {
-        panic!("a copy with a cursor answers its own reads")
-    };
-    assert_eq!(rows.map_or(0, |b| b.weights.len()), 1);
 }
 
 /// An ingest advances the cursor only after its blocks are applied, and a
@@ -243,7 +210,7 @@ fn an_ingest_applies_before_it_advances() {
         .unwrap();
     assert_eq!(store.cursor_of(TID), Some(cursor(5)));
     assert_eq!(
-        held(&mut store, TID).unwrap(),
+        held(&mut store, TID),
         BTreeMap::from([((1, 10), 2), ((2, 20), 1), ((3, 30), 1)]),
         "the round stamp is stripped and the repeated key folds onto its own element",
     );
@@ -252,7 +219,7 @@ fn an_ingest_applies_before_it_advances() {
 /// A checkpoint covers every copy the store holds a position for — including one
 /// this session never re-registered.
 ///
-/// The flush round republishes every copy in the local catalog, so a cursor set
+/// The flush round republishes every copy the store holds, so a cursor set
 /// gathered from this session's registrations alone would strand the unclaimed
 /// one: published at the new generation with no cursor, and bootstrapped next
 /// session though it was intact.
@@ -273,13 +240,16 @@ fn a_checkpoint_covers_a_cursor_this_session_never_claimed() {
         store.checkpoint().unwrap();
     }
     {
-        // Claim only one, and checkpoint again.
+        // Claim only one, move it, and checkpoint again.
         let mut store = Mirror::open(&dir).expect("the checkpointed store reopens");
         assert!(
             store.cursor_of(TID).is_some() && store.cursor_of(OTHER_TID).is_some(),
             "both positions came back",
         );
         store.register(TID, SCHEMA, "v", &view_schema()).unwrap();
+        store
+            .ingest(TID, stamped(5, &[(1, 1, 10)]), Shape::Stamped, cursor(5))
+            .unwrap();
         store.checkpoint().unwrap();
     }
 
@@ -290,7 +260,7 @@ fn a_checkpoint_covers_a_cursor_this_session_never_claimed() {
         "the unclaimed copy's position survived the checkpoint that republished it",
     );
     store.register(OTHER_TID, SCHEMA, "w", &view_schema()).unwrap();
-    assert_eq!(held(&mut store, OTHER_TID).unwrap(), BTreeMap::from([((9, 90), 1)]));
+    assert_eq!(held(&mut store, OTHER_TID), BTreeMap::from([((9, 90), 1)]));
 }
 
 // ---------------------------------------------------------------------------
@@ -338,7 +308,7 @@ fn failed_copy_teardown_child() {
             "the cursor went before the erase could fail"
         );
         assert!(store.poisoned().is_none(), "a failed teardown is not a poisoning");
-        // The drop checkpoints, which is what writes the cursor set below.
+        store.checkpoint().expect("the checkpoint writes the cursor set below");
     }
 
     let store = Mirror::open(&dir).expect("the store reopens");
@@ -392,17 +362,14 @@ fn auto_checkpoint_failure_child() {
         Some(cursor(4)),
         "the cursor advanced with the delta it followed; what failed was durability",
     );
-    assert_eq!(
-        held(&mut store, TID).unwrap(),
-        BTreeMap::from([((1, 10), 1), ((2, 20), 1)])
-    );
+    assert_eq!(held(&mut store, TID), BTreeMap::from([((1, 10), 1), ((2, 20), 1)]));
 
     // The seam is one-shot, so this round's own checkpoint is the real thing.
     store
         .ingest(TID, stamped(5, &[(2, 1, 20)]), Shape::Stamped, cursor(5))
         .expect("the next round applies");
     assert_eq!(
-        held(&mut store, TID).unwrap(),
+        held(&mut store, TID),
         BTreeMap::from([((1, 10), 1), ((2, 20), 2)]),
         "the interval the failed checkpoint covered must not be applied a second time",
     );

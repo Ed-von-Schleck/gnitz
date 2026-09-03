@@ -706,16 +706,19 @@ impl Batch {
         }
         u64::from_le_bytes(col[off..off + 8].try_into().unwrap_or([0; 8]))
     }
-    /// Read one row's value from a German-string payload column; empty on a
-    /// short region or a malformed descriptor.
-    pub fn read_payload_string(&self, row: usize, pi: usize) -> String {
+    /// Read one row's bytes from a German-string (STRING or BLOB) payload
+    /// column; empty on a short region or a malformed descriptor.
+    pub fn read_payload_bytes(&self, row: usize, pi: usize) -> &[u8] {
         let off = row * 16;
         let data = self.col_data(pi);
         if off + 16 > data.len() {
-            return String::new();
+            return &[];
         }
-        let bytes = gnitz_wire::german_string_content(&data[off..off + 16], &self.blob);
-        String::from_utf8(bytes.to_vec()).unwrap_or_default()
+        gnitz_wire::german_string_content(&data[off..off + 16], &self.blob)
+    }
+    /// [`Self::read_payload_bytes`] as a `String`; empty when not UTF-8.
+    pub fn read_payload_string(&self, row: usize, pi: usize) -> String {
+        String::from_utf8(self.read_payload_bytes(row, pi).to_vec()).unwrap_or_default()
     }
     /// Apply `f` to every row's weight in place. Generic so the per-epoch
     /// callers (negate, delta doubling) monomorphize to a tight loop. The
@@ -2255,7 +2258,7 @@ impl BatchBuilder {
 
     /// Put raw bytes for the current STRING/BLOB payload column — the one
     /// German-string encode site; `read_german_bytes` is the read-back twin.
-    pub(crate) fn put_blob(&mut self, b: &[u8]) {
+    pub fn put_blob(&mut self, b: &[u8]) {
         let st = gnitz_wire::encode_german_string(b, &mut self.batch.blob);
         self.batch.extend_col(self.curr_col, &st);
         self.curr_col += 1;

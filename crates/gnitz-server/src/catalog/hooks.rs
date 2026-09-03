@@ -4,8 +4,8 @@ use gnitz_wire::{SCHEMATAB_PAY_NAME, SEQTAB_PAY_VALUE};
 use rustc_hash::FxHashMap;
 
 /// What `register_relation` needs to build and register one relation: the
-/// values decoded off its TABLE_TAB / VIEW_TAB row, plus the placement and
-/// depth its own family derives.
+/// values decoded off its TABLE_TAB / VIEW_TAB row, plus the placement its own
+/// family derives.
 struct RelationRegistration {
     kind: RelationKind,
     id: i64,
@@ -13,7 +13,6 @@ struct RelationRegistration {
     name: String,
     pk: PkColList,
     placement: Placement,
-    depth: i32,
     /// The `WITH (…)` byte budgets; both `None` for a base table and for a plain
     /// view.
     budgets: gnitz_store::relation::ViewBudgets,
@@ -154,7 +153,6 @@ impl CatalogEngine {
             name,
             pk,
             placement,
-            depth,
             budgets,
         } = reg;
         let col_defs = self.read_column_defs(id);
@@ -184,7 +182,6 @@ impl CatalogEngine {
             kind,
             schema,
             directory,
-            depth,
             budgets,
         })?;
         raise_id_counter(&mut self.next_table_id, id);
@@ -287,7 +284,7 @@ impl CatalogEngine {
     }
 
     /// The registration values for TABLE_TAB row `i`: placement folded out of
-    /// `TABLE_TAB.flags`, at depth 0, never capacity-bounded.
+    /// `TABLE_TAB.flags`, never capacity-bounded.
     fn table_registration(batch: &Batch, i: usize, tid: i64) -> Result<RelationRegistration, String> {
         let (schema_id, name, pk, kind, placement) = read_table_tab_row(batch, i, tid)?;
         Ok(RelationRegistration {
@@ -297,13 +294,12 @@ impl CatalogEngine {
             name,
             pk,
             placement,
-            depth: 0,
             budgets: gnitz_store::relation::ViewBudgets::default(),
         })
     }
 
-    /// The registration values for VIEW_TAB row `i`: placement and depth folded
-    /// out of the view's sources' own stamped placements, plus the `WITH` budgets.
+    /// The registration values for VIEW_TAB row `i`: placement folded out of the
+    /// view's sources' own stamped placements, plus the `WITH` budgets.
     ///
     /// The view's physical PK is the persisted leading-k column list: a single
     /// synthetic hash column for join/set-op/distinct views, or the source PK
@@ -319,7 +315,7 @@ impl CatalogEngine {
         // `relation_row_order` registers this view after its sources, so a view
         // over it reads the answer back off one value.
         let CatalogEngine { registry, dag, .. } = self;
-        let (placement, depth) = dag.view_placement(registry, vid, &source_ids, pk.as_slice().len());
+        let placement = dag.view_placement(registry, vid, &source_ids, pk.as_slice().len());
         Ok(RelationRegistration {
             kind: RelationKind::View,
             id: vid,
@@ -327,7 +323,6 @@ impl CatalogEngine {
             name,
             pk,
             placement,
-            depth,
             budgets,
         })
     }

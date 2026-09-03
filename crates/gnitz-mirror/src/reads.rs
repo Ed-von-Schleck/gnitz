@@ -16,37 +16,23 @@
 //! happens, because that is what the finishers consume, so the engine→wire→client
 //! conversion is work the remote path pays too and the copy merely relocates. An
 //! applied delta ends in an engine `Batch`, so a detour through `ZSetBatch` would
-//! be a conversion *added* by mirroring. What the copy does not relocate is the
-//! staging: the server streams its encode out in frame-sized chunks, where this
-//! holds the keeper, its whole wire block and the decoded batch live at once.
-//! Narrow the bound and it is nothing; full-scan a large view and the peak is
-//! three copies of the result where a remote client holds one.
-
-use std::sync::Arc;
+//! be a conversion *added* by mirroring. A full scan holds the keeper, its wire
+//! block and the decoded batch at once; narrow the bound and it is nothing.
 
 use gnitz_core::protocol::decode_wal_block;
 use gnitz_core::{MirrorError, Schema, ZSetBatch};
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 
-use crate::handle::{engine, Mirror, Shapes};
+use crate::handle::{engine, Mirror};
 use crate::register::descriptor_of;
 
 impl Mirror {
-    /// The shapes `table_id` was registered under, or the error every
-    /// mirrored-relation lookup reports.
-    pub(crate) fn shapes(&self, table_id: u64) -> Result<&Shapes, MirrorError> {
-        self.shapes
-            .get(&table_id)
-            .ok_or_else(|| MirrorError::Engine(format!("relation {table_id} is not mirrored")))
-    }
-
-    /// Every row of the copy, in the schema its registration resolved.
-    pub(crate) fn scan_inner(&mut self, table_id: u64) -> Result<(Arc<Schema>, ZSetBatch), MirrorError> {
-        let schema = Arc::clone(&self.shapes(table_id)?.schema);
+    /// Every row of the copy, decoded under `schema` — the client-side schema
+    /// its registration resolved.
+    pub(crate) fn scan_inner(&mut self, table_id: u64, schema: &Schema) -> Result<ZSetBatch, MirrorError> {
         let (batch, desc) = self.registry.scan_family(table_id as i64, None).map_err(engine)?;
-        let rows = reply_batch(&batch, &desc, table_id, &schema)?;
-        Ok((schema, rows))
+        reply_batch(&batch, &desc, table_id, schema)
     }
 
     /// Run the spec against the copy through the engine's own executor, and reply
@@ -64,7 +50,7 @@ impl Mirror {
         table_id: u64,
         spec: &[u8],
         reply_schema: &Schema,
-    ) -> Result<Option<ZSetBatch>, MirrorError> {
+    ) -> Result<ZSetBatch, MirrorError> {
         let spec =
             gnitz_wire::ReadSpec::decode(spec).map_err(|e| MirrorError::Engine(format!("mirror: read spec: {e}")))?;
         let reply_desc = descriptor_of(reply_schema)?;
@@ -72,10 +58,7 @@ impl Mirror {
             .registry
             .scan_spec_family(table_id as i64, &spec, &reply_desc, 0, None)
             .map_err(engine)?;
-        if keeper.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(reply_batch(&keeper, &reply_desc, table_id, reply_schema)?))
+        reply_batch(&keeper, &reply_desc, table_id, reply_schema)
     }
 }
 

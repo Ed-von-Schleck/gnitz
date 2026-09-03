@@ -634,24 +634,28 @@ impl GnitzClient {
     ///
     /// The trade is a name → id binding as stale as the copy itself; the feed
     /// detects it (the next poll's tag stops continuing) and the recovery
-    /// re-resolves before it reseeds. Answered off the registration rather than
-    /// the readability gate, so a name whose copy is not valid still binds
-    /// locally and only the read it feeds goes upstream.
+    /// re-resolves before it reseeds. A name binds locally exactly when its copy
+    /// answers locally: the cursor is the one gate, for names and reads alike.
+    /// The stored names are canonical, so part-wise case-insensitive equality is
+    /// the same test as folding the joined name, without the allocation.
     pub fn resolve_local_first(
         &mut self,
         schema_name: &str,
         name: &str,
     ) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
-        let qname = qualified_name(schema_name, name);
         let local = self.mirror.as_deref().and_then(|m| {
-            m.by_qname
-                .get(&qname)
-                .and_then(|tid| m.views.get(tid))
-                .map(|v| Arc::clone(&v.desc))
+            m.views
+                .iter()
+                .find(|(&t, v)| {
+                    m.store.cursor_of(t).is_some()
+                        && v.schema_name.eq_ignore_ascii_case(schema_name)
+                        && v.name.eq_ignore_ascii_case(name)
+                })
+                .map(|(_, v)| Arc::clone(&v.desc))
         });
         match local {
             Some(desc) => {
-                self.record_relation(&qname, Some(Arc::clone(&desc)));
+                self.record_relation(&qualified_name(schema_name, name), Some(Arc::clone(&desc)));
                 Ok(Some(desc))
             }
             None => self.resolve(schema_name, name),
@@ -661,15 +665,17 @@ impl GnitzClient {
     /// Every row of `table_id` off the copy, or `None` when the copy does not
     /// hold it and the read is the caller's to delegate.
     ///
-    /// **The store answers whether it holds the relation**, so nothing outside it
-    /// spells that gate a second time. For a caller that delegates on its own
+    /// The gate is [`Self::mirrors`]. For a caller that delegates on its own
     /// terms — an async handle, which delegates on its own connection rather than
     /// this one; [`Self::scan_local_first`] delegates here.
     pub fn scan_local(&mut self, table_id: u64) -> Result<Option<(Arc<Schema>, ZSetBatch)>, ClientError> {
-        match self.mirror.as_deref_mut() {
-            Some(m) => Ok(m.store.scan(table_id)?),
-            None => Ok(None),
+        if !self.mirrors(table_id) {
+            return Ok(None);
         }
+        let m = self.mirror.as_deref_mut().expect("mirrors() saw a store");
+        let schema = Arc::clone(&m.views[&table_id].desc.schema);
+        let batch = m.store.scan(table_id, &schema)?;
+        Ok(Some((schema, batch)))
     }
 
     /// [`Self::scan`], answered off the copy when it holds `table_id`.
@@ -694,10 +700,9 @@ impl GnitzClient {
         spec: &[u8],
         reply_schema: &Arc<Schema>,
     ) -> Result<Option<ZSetBatch>, ClientError> {
-        if let Some(m) = self.mirror.as_deref_mut() {
-            if let crate::mirror::StoreRead::Held(batch) = m.store.scan_spec(table_id, spec, reply_schema)? {
-                return Ok(batch);
-            }
+        if self.mirrors(table_id) {
+            let m = self.mirror.as_deref_mut().expect("mirrors() saw a store");
+            return Ok(Some(m.store.scan_spec(table_id, spec, reply_schema)?));
         }
         self.scan_spec(table_id, spec, reply_schema)
     }
@@ -712,9 +717,9 @@ impl GnitzClient {
     /// `self` until the new session exists, so a failed connect leaves this
     /// client exactly as it was.
     ///
-    /// A copy rides along and is repointed by `rebind_to_new_server`, whose doc
-    /// carries that rule. A poisoned store crosses unchanged, because poison is a
-    /// statement about the copy and not about the connection.
+    /// A copy rides along with every cursor dropped: the new connection may be a
+    /// different server, where the same name is a different id, so the next
+    /// poll re-resolves every view by name. A poisoned store crosses unchanged.
     pub fn reconnect(&mut self, target: &str) -> Result<(), ClientError> {
         if self.txn_active() {
             return Err(ClientError::ServerError(
@@ -727,7 +732,7 @@ impl GnitzClient {
         fresh.session.set_park_hook(self.session.take_park_hook());
         fresh.mirror = self.mirror.take();
         if let Some(m) = fresh.mirror.as_deref_mut() {
-            m.rebind_to_new_server();
+            m.store.clear_cursors();
         }
         *self = fresh;
         Ok(())
@@ -1676,9 +1681,8 @@ impl GnitzClient {
         self.push_ddl(&[(family, b)])?;
         if desc.class.is_view() {
             // The whole registration, though a rename keeps the id and so costs a
-            // re-bootstrap: the store's `VIEW_TAB` row carries the *old* name,
-            // which is the state a re-registration reads to detect a
-            // drop-and-recreate.
+            // re-bootstrap: the record carries the old name, and the teardown
+            // makes the re-mirror bootstrap under the new one.
             self.invalidate_own_copy(desc.tid)?;
         }
         Ok(())

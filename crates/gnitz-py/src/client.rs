@@ -143,19 +143,24 @@ impl PyGnitzClient {
         Ok(self.live()?.requests_sent())
     }
 
-    /// Close the connection and release any mirror store with it. Calling it
-    /// twice is fine.
+    /// Close the connection: closing checkpoints the mirror store, then releases
+    /// it. Calling it twice is fine.
     ///
-    /// The GIL goes down for the drop: with a store inside, that drop is a
-    /// checkpoint plus an engine close — fsync-bound and unbounded in the copy's
-    /// size — and it is also what releases the store's directory lock.
+    /// The GIL goes down for it: the checkpoint is fsync-bound and unbounded in
+    /// the copy's size, and the drop is what releases the store's directory lock.
     pub fn close(&mut self, py: Python<'_>) {
         let taken = self
             .inner
             .get_mut()
             .expect("nothing locks this mutex, so it cannot be poisoned")
             .take();
-        py.detach(move || drop(taken));
+        py.detach(move || {
+            if let Some(mut client) = taken {
+                // A `NoMirrorStore` error is the no-store case.
+                let _ = client.close_mirror();
+                drop(client);
+            }
+        });
     }
 
     pub fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {

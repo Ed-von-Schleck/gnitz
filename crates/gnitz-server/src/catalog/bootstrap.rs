@@ -30,11 +30,9 @@ impl CatalogEngine {
     }
 
     fn open_as(base_dir: &str, num_workers: u32, is_master: bool) -> Result<Self, String> {
-        ensure_dir(base_dir)?;
-
         // Before any store opens: two writers on one directory mint identical
         // shard names and corrupt it silently.
-        let dir_lock = lock_data_dir(base_dir)?;
+        let dir_lock = lock_data_dir(base_dir, DIR_LOCK_RETRY_FOR)?;
 
         ensure_dir(&sys_catalog_dir(base_dir))?;
 
@@ -219,7 +217,6 @@ impl CatalogEngine {
                 kind: RelationKind::SystemCatalog,
                 schema: family.schema(),
                 directory: sys_family_dir(&base_dir, family.name()),
-                depth: 0,
                 budgets: ViewBudgets::default(),
             };
             self.registry.register_owned(spec, Box::new(store));

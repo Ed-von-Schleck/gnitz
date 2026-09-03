@@ -2659,7 +2659,6 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
             kind: RelationKind::BaseTable,
             schema,
             directory: dir.clone(),
-            depth: 0,
             budgets: ViewBudgets::default(),
         },
         Box::new(base),

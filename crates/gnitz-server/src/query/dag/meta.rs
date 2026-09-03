@@ -18,6 +18,8 @@ pub(super) struct DepMap {
     /// pushed into it, so a present entry is never empty.
     pub(in crate::query) forward: FxHashMap<i64, Vec<i64>>,
     pub(in crate::query) reverse: FxHashMap<i64, Vec<i64>>, // view_id → [source_table_ids]
+    /// view_id → longest scan chain beneath it; a relation with no scan edge is 0.
+    pub(in crate::query) depth: FxHashMap<i64, i32>,
     pub(in crate::query) valid: bool,
 }
 
@@ -29,10 +31,11 @@ impl DepMap {
         self.valid = false;
     }
 
-    /// Rebuild both maps from the CircuitNodes system table if stale and return
-    /// the forward (source → views) map. An edge is one `ScanDelta` node, read
-    /// through the same reader that builds the circuit, so the graph the
-    /// scheduler walks names the sources the circuit actually scans.
+    /// Rebuild both maps and the depth fold from the CircuitNodes system table if
+    /// stale and return the forward (source → views) map. An edge is one
+    /// `ScanDelta` node, read through the same reader that builds the circuit,
+    /// so the graph the scheduler walks names the sources the circuit actually
+    /// scans.
     ///
     /// The registry is a disjoint parameter rather than a field of the engine, so
     /// reading the circuit table through it does not double-borrow against
@@ -53,8 +56,29 @@ impl DepMap {
                 self.reverse.entry(v_id).or_default().push(dep_tid);
             }
         });
+        self.depth.clear();
+        for &v in self.reverse.keys() {
+            Self::fold_depth(&self.reverse, &mut self.depth, v);
+        }
         self.valid = true;
         &self.forward
+    }
+
+    /// `id`'s depth: one more than the deepest source it scans, memoized so a
+    /// chain is walked once. A pure function of the edges, so the order views
+    /// were registered in cannot change it.
+    fn fold_depth(reverse: &FxHashMap<i64, Vec<i64>>, memo: &mut FxHashMap<i64, i32>, id: i64) -> i32 {
+        if let Some(&d) = memo.get(&id) {
+            return d;
+        }
+        let d = reverse.get(&id).map_or(0, |srcs| {
+            srcs.iter()
+                .map(|&s| Self::fold_depth(reverse, memo, s) + 1)
+                .max()
+                .unwrap_or(0)
+        });
+        memo.insert(id, d);
+        d
     }
 
     /// Transitive closure of `seeds` over one half of the map, seeds excluded.
@@ -187,29 +211,19 @@ impl DagEngine {
         bases
     }
 
-    /// Where a view's rows live and how far above the bases it sits — the two
-    /// values `TableEntry` stamps, both folded from its `sources`' own stamped
-    /// entries, so the scheduling key is derived here rather than a second time
-    /// at the registering caller.
-    pub(crate) fn view_placement(
-        &mut self,
-        registry: &RelationRegistry,
-        view_id: i64,
-        sources: &[i64],
-        pk_arity: usize,
-    ) -> (Placement, i32) {
-        let depth = sources
-            .iter()
-            .filter_map(|&id| registry.entry(id))
-            .map(|e| e.depth + 1)
-            .max()
-            .unwrap_or(0);
-        (self.source_placement(registry, view_id, sources, pk_arity), depth)
+    /// How far above the bases `id` sits: the longest scan chain beneath it,
+    /// off the dependency map — rebuilt first if stale. A test probe: the
+    /// scheduler reads the map directly.
+    #[cfg(test)]
+    pub(crate) fn depth_of(&mut self, registry: &RelationRegistry, id: i64) -> i32 {
+        self.get_dep_map(registry);
+        self.dep.depth.get(&id).copied().unwrap_or(0)
     }
 
-    /// Where a view's rows live, folded from its `sources`' **stamped**
-    /// placements. `pk_arity` is the view's own declared PK column count (it is
-    /// not registered yet, so the arity cannot be read back off the registry).
+    /// Where a view's rows live — the value `TableEntry` stamps — folded from
+    /// its `sources`' **stamped** placements. `pk_arity` is the view's own
+    /// declared PK column count (it is not registered yet, so the arity cannot
+    /// be read back off the registry).
     ///
     /// Reading the sources' stamped placement rather than re-deriving "has a
     /// replicated source" from the direct sources is what makes the property
@@ -221,7 +235,7 @@ impl DagEngine {
     /// direction is always safe (a replicated store holds every row; the read
     /// gathers all workers) and it avoids a second, subtler predicate for "does
     /// this exchange actually run at runtime".
-    fn source_placement(
+    pub(crate) fn view_placement(
         &mut self,
         registry: &RelationRegistry,
         view_id: i64,

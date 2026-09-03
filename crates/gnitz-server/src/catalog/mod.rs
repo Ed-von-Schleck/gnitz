@@ -80,7 +80,9 @@ pub(in crate::catalog) use index_backfill::IndexPass;
 pub(in crate::catalog) use registry::raise_id_counter;
 // The child-directory grammar and the directory primitives are storage's; the
 // catalog only consumes them.
-pub(in crate::catalog) use gnitz_store::storage::{children_at_generation, fsync_dir, subdir_names, ChildAddr};
+#[cfg(test)]
+pub(in crate::catalog) use gnitz_store::storage::subdir_names;
+pub(in crate::catalog) use gnitz_store::storage::{children_at_generation, fsync_dir, ChildAddr};
 #[cfg(test)]
 pub(in crate::catalog) use utils::cursor_read_string;
 pub(in crate::catalog) use utils::{
@@ -89,7 +91,7 @@ pub(in crate::catalog) use utils::{
 };
 // The relation rung's directory primitives; the catalog only consumes them.
 pub(in crate::catalog) use gnitz_store::relation::{
-    ensure_dir, is_table_dir_name, lock_data_dir, relation_dir, staged_dir,
+    ensure_dir, lock_data_dir, relation_dir, staged_dir, DIR_LOCK_RETRY_FOR,
 };
 // `BatchBuilder` holds no catalog state and lives in `storage`; re-export it
 // for the catalog's row builders.

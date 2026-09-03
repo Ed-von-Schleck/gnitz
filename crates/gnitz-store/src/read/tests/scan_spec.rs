@@ -38,7 +38,6 @@ fn rows_fixture(name: &str, n: u64, weight: i64) -> RelationRegistry {
             kind: RelationKind::View,
             schema,
             directory: crate::test_support::scratch_dir("read", name),
-            depth: 0,
             budgets: ViewBudgets {
                 capacity_bytes: None,
                 delta_bytes: None,
@@ -172,7 +171,6 @@ fn dehydrated_fixture(name: &str, on_disk: std::ops::Range<u64>, in_ram: std::op
             kind: RelationKind::View,
             schema,
             directory: crate::test_support::scratch_dir("read", name),
-            depth: 0,
             budgets: ViewBudgets {
                 capacity_bytes: Some(1),
                 delta_bytes: None,

@@ -225,9 +225,8 @@ impl AsyncClient {
     /// Checkpoint (unless poisoned) and release the store, reporting the final
     /// checkpoint. The handle can attach again afterwards.
     ///
-    /// **A mirroring host must call it**: otherwise the last clone's `Drop` runs
-    /// the store's own — an fsync unbounded in the copy's size — on whatever
-    /// thread happens to drop it, which in a reactor task is a reactor thread.
+    /// A drop forfeits the rounds since the last checkpoint — at most one
+    /// bootstrap per view, when the feed no longer covers them.
     pub async fn close_mirror(&self) -> Result<(), ClientError> {
         let slot = Arc::clone(&self.mirror);
         blocking(move || {
@@ -321,13 +320,10 @@ impl AsyncClient {
 
     /// [`Self::scan`], answered off the copy when it holds `tid`.
     ///
-    /// A handle that never attached takes the wire path with no thread hop:
-    /// `try_lock` sees an empty uncontended slot without blocking a reactor
-    /// thread. Otherwise one `spawn_blocking` asks the copy, which answers "not
-    /// held" itself, so the **delegation runs on the async path** and keeps the
-    /// driver's back-pressure and its reply's LSN — at the price of a hop that
-    /// can wait behind an in-flight poll, because which relations the copy holds
-    /// is itself store state.
+    /// A handle that never attached takes the wire path with no thread hop.
+    /// Otherwise one `spawn_blocking` asks the client's `scan_local`, and a
+    /// relation it does not mirror is delegated on the async path, keeping the
+    /// driver's back-pressure and its reply's LSN.
     ///
     /// [`Self::seek`] and [`Self::scan_many`] stay wire-only: no caller has
     /// needed a local-first form of either.

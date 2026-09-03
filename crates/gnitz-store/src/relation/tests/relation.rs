@@ -34,7 +34,6 @@ fn register_entry(
         kind,
         schema,
         directory,
-        depth: 0,
         budgets: ViewBudgets::default(),
     };
     registry.register_owned(spec, table);
@@ -137,7 +136,6 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
             kind: RelationKind::View,
             schema,
             directory: relation_test_dir("fed_view_delta"),
-            depth: 1,
             budgets: ViewBudgets {
                 capacity_bytes: None,
                 delta_bytes: Some(1 << 20),

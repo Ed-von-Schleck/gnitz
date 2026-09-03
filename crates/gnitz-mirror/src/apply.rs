@@ -2,6 +2,7 @@
 
 use gnitz_core::{MirrorError, RawBlock, Shape};
 use gnitz_store::foundation::fault::Seam;
+use gnitz_store::schema::make_delta_schema;
 use gnitz_store::storage::Batch;
 
 use crate::handle::Mirror;
@@ -18,8 +19,9 @@ use crate::handle::Mirror;
 static PANIC_SEAM: Seam = Seam::new("GNITZ_INJECT_MIRROR_INGEST_PANIC");
 
 impl Mirror {
-    /// Decode each block under the schema `shape` names — both come from the
-    /// registration — and ingest it.
+    /// Decode each block under the schema `shape` names — the copy's own, or the
+    /// delta-store shape derived from it — and ingest it. Returns the bytes
+    /// applied.
     ///
     /// Two engine entries here have a near twin that is silently wrong for a
     /// socket frame, so each is named for what it keeps: the **public** decode
@@ -32,15 +34,22 @@ impl Mirror {
         table_id: u64,
         blocks: Vec<RawBlock>,
         shape: Shape,
-    ) -> Result<(), MirrorError> {
+    ) -> Result<usize, MirrorError> {
         if shape == Shape::Stamped && PANIC_SEAM.take_once() {
             panic!("injected mirror ingest panic");
         }
-        let shapes = self.shapes(table_id)?;
-        let (view_desc, delta_desc) = (shapes.view_desc, shapes.delta_desc);
+        let view_desc = self
+            .registry
+            .get_schema_desc(table_id as i64)
+            .ok_or_else(|| MirrorError::Engine(format!("relation {table_id} is not mirrored")))?;
         let in_desc = match shape {
             Shape::Plain => view_desc,
-            Shape::Stamped => delta_desc,
+            // The server derived this same shape, with this same builder, to
+            // open the feed this copy is fed by: it refuses `WITH (delta)` on a
+            // shape that overruns, live and on replay.
+            Shape::Stamped => {
+                make_delta_schema(&view_desc).expect("the server derived this same shape to open the feed")
+            }
         };
         let mut applied = 0usize;
         for raw in blocks {
@@ -60,7 +69,6 @@ impl Mirror {
                 .map(drop)
                 .map_err(|e| self.poison(format!("applying a delta to {table_id} failed: {e}")))?;
         }
-        self.note_applied(applied);
-        Ok(())
+        Ok(applied)
     }
 }

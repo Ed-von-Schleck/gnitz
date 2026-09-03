@@ -37,8 +37,7 @@ const FEED: &str = "8 MB";
 struct Fixture {
     server: ServerHandle,
     direct: GnitzClient,
-    /// `Option` so a test can drop it — which checkpoints and releases the
-    /// directory — and open a fresh one on the same directory.
+    /// `Option` so a test can close or drop it, releasing the directory.
     mirror: Option<GnitzClient>,
     dir: tempfile::TempDir,
 }
@@ -100,10 +99,18 @@ impl Fixture {
         self.mirror().reconnect(&target).expect("reconnect");
     }
 
-    /// Drop the client (whose drop checkpoints the store and releases the
-    /// directory) and open a fresh one on the same directory.
+    /// Close the client's store — the exit checkpoint — and open a fresh one on
+    /// the same directory.
     fn reopen(&mut self) {
-        self.mirror = None;
+        let mut client = self.mirror.take().expect("a client to close");
+        client.close_mirror().expect("exit checkpoint");
+        self.open();
+    }
+
+    /// Open a fresh client on the directory, which must be free: a test models
+    /// a crash by dropping the client without closing it, then calls this.
+    fn open(&mut self) {
+        assert!(self.mirror.is_none(), "the directory is still held");
         let dir = self.base_dir();
         self.mirror = Some(mirroring_client(self.server.sock_path(), &dir));
     }
@@ -524,11 +531,13 @@ fn two_handles_on_two_directories_keep_their_own_state() {
 
     // Put the two directories at *different* generations, so a shared one would
     // leave at least one of them looking for a generation its manifests never
-    // carried. The drop below checkpoints each again, first to 2, second to 1.
+    // carried. The closes below checkpoint each again, first to 2, second to 1.
     fx.mirror().checkpoint_mirror().expect("checkpoint the first copy");
+    churn(&mut fx.direct, 81, 100);
+    fx.quiesce();
 
     // Both checkpoint on the way out, then both come back.
-    drop(second);
+    second.close_mirror().expect("close the second handle");
     fx.reopen();
     let mut second = mirroring_client(fx.server.sock_path(), second_dir.path().to_str().unwrap());
 
@@ -584,9 +593,8 @@ fn a_cursor_naming_an_absent_copy_bootstraps() {
 
 /// Runs only in the child `a_cursor_naming_an_absent_copy_bootstraps` spawns.
 ///
-/// `std::process::exit` rather than a drop: it is what a crash or a `SIGKILL`
-/// leaves behind — a durable cursor file and a durable registration, both from
-/// the checkpoint, and no record of the forget.
+/// What a crash or a `SIGKILL` leaves behind — a durable cursor file and a
+/// durable registration, both from the checkpoint, and no record of the forget.
 #[test]
 fn forgotten_view_leaves_its_cursor_child() {
     let Some((sock, dir)) = child_target() else { return };
@@ -595,18 +603,14 @@ fn forgotten_view_leaves_its_cursor_child() {
     mirror.checkpoint_mirror().expect("checkpoint the copy and its cursor");
     mirror.forget_view(tid).expect("forget v_keyed");
     println!("{CHILD_OK}");
-    std::process::exit(0);
 }
 
 /// Forgetting a view and mirroring it again — same server id, same layout —
 /// leaves a working copy.
 ///
-/// The retraction and the re-registration meet in the local COL_TAB. Retracting
-/// the VIEW_TAB row cascades a retraction of the relation's columns, so a
-/// retraction that also negated them itself would leave each at net `-1`; the
-/// re-registration's `+1` would then sum to zero and the relation would register
-/// with no columns at all. Nothing weaker catches it: a view recreated upstream
-/// takes a *new* id, where the stranded rows are invisible.
+/// The retraction removes the record and the directory; the re-registration
+/// enters a fresh one under the same id. Nothing weaker catches a mistake
+/// there: a view recreated upstream takes a *new* id.
 #[test]
 fn a_forgotten_view_can_be_mirrored_again() {
     let _g = serial();
@@ -695,7 +699,7 @@ fn poisons_on_a_storage_fault_child() {
     // hole in it.
     assert!(mirror.poll_mirror().is_err());
     assert!(mirror.checkpoint_mirror().is_err());
-    // And the drop must not checkpoint a possibly-torn store.
+    // And the drop checkpoints nothing.
     drop(mirror);
     println!("{CHILD_OK}");
 }
@@ -956,7 +960,7 @@ fn a_torn_checkpoint_reseeds_rather_than_corrupts() {
     fx.mirror = None;
     std::fs::write(&state_path, &stale).unwrap();
 
-    fx.reopen();
+    fx.open();
     fx.mirror_both();
     fx.quiesce();
     fx.differential("s", "SELECT * FROM v_keyed");
@@ -967,9 +971,10 @@ fn a_torn_checkpoint_reseeds_rather_than_corrupts() {
     fx.mirror()
         .checkpoint_mirror()
         .expect("checkpoint before the torn bump");
-    patch_state_header(&mut fx, STATE_OFF_GENERATION, |g| g + 1);
+    fx.mirror = None;
+    patch_state_header(&fx.base_dir(), STATE_OFF_GENERATION, |g| g + 1);
 
-    fx.reopen();
+    fx.open();
     fx.mirror_both();
     fx.quiesce();
     fx.differential("s", "SELECT * FROM v_keyed");
@@ -1005,9 +1010,10 @@ fn an_applied_delta_drives_its_own_checkpoint() {
 /// A checkpoint by a handle that re-registered only some of its views keeps every
 /// cursor.
 ///
-/// The flush round republishes every copy in the catalog, so a cursor set gathered
-/// from the registrations alone strands the unclaimed one — published at the new
-/// generation with no cursor, and bootstrapped next session though it was intact.
+/// The flush round republishes every copy the store holds, so a cursor set
+/// gathered from the registrations alone strands the unclaimed one — published
+/// at the new generation with no cursor, and bootstrapped next session though it
+/// was intact.
 /// Checked by the manifest, before any further checkpoint republishes one.
 #[test]
 fn a_partially_registered_reopen_keeps_every_cursor() {
@@ -1039,52 +1045,6 @@ fn a_partially_registered_reopen_keeps_every_cursor() {
     fx.differential("s", "SELECT * FROM v_keyed");
 }
 
-/// A foreign topology word reseeds, even though the generation still matches.
-///
-/// Without this gate the copies resume on the generation alone, because a view's
-/// own recovery source never consults topology — so a state-format bump would
-/// let a mirror resume shards written in the previous layout. Driven through the
-/// engine's public topology record rather than by poking the field: the mirror
-/// always opens at one worker, so a recorded `2` mismatches for the same reason
-/// a state-format bump would.
-///
-/// The observable is the copy's **manifest**, which is what "erased" means on
-/// disk: a checkpoint publishes one, a resume loads it, and an erase-and-reseed
-/// unlinks it and writes nothing until the next checkpoint. A cursor round would
-/// not do: with nothing pushed in between, a bootstrap and a poll report the same
-/// round, so the two paths are indistinguishable by it.
-#[test]
-fn a_foreign_topology_word_reseeds() {
-    let _g = serial();
-    let mut fx = Fixture::start();
-
-    churn(&mut fx.direct, 1, 60);
-    let (tid, _) = fx.mirror_both();
-    fx.quiesce();
-    fx.mirror().checkpoint_mirror().expect("checkpoint");
-    assert!(
-        has_manifest(&fx.base_dir(), tid),
-        "a checkpoint must publish the copy's manifest",
-    );
-    patch_state_header(&mut fx, STATE_OFF_TOPOLOGY, |_| {
-        // What a two-worker layout would have stamped. The mirror always opens
-        // at one worker, so this mismatches for the same reason a state-format
-        // bump would.
-        gnitz_store::storage::topology_word(2)
-    });
-
-    fx.reopen();
-    fx.mirror().mirror_view("s", "v_keyed").expect("re-mirror");
-    assert!(
-        !has_manifest(&fx.base_dir(), tid),
-        "a foreign topology word must erase the copy and bootstrap it, not resume it",
-    );
-    fx.mirror().mirror_view("s", "v_repl").expect("re-mirror v_repl");
-    fx.quiesce();
-    fx.differential("s", "SELECT * FROM v_keyed");
-    fx.differential("s", "SELECT * FROM v_repl");
-}
-
 /// The record file the crate writes beside the copies.
 fn state_file(base_dir: &str) -> String {
     format!("{base_dir}/mirror_state")
@@ -1099,7 +1059,7 @@ fn state_file(base_dir: &str) -> String {
 /// answering `false` forever. A copy is laid out for one worker, at the solo
 /// slot every mirror opens under.
 fn has_manifest(base_dir: &str, view_id: u64) -> bool {
-    let rel_dir = relation_dir(&format!("{base_dir}/_copies"), "s", RelationKind::View, view_id as i64);
+    let rel_dir = relation_dir(base_dir, "_copies", RelationKind::View, view_id as i64);
     std::path::Path::new(&ChildAddr::worker(Slot::SOLO).manifest(&rel_dir)).exists()
 }
 
@@ -1128,22 +1088,16 @@ fn a_server_restart_reseeds_the_copy() {
     fx.differential("s", "SELECT * FROM v_repl");
 }
 
-/// Byte offsets of the two `mirror_state` header words the tests below
-/// fabricate. The crate owns the layout; these two are what a torn checkpoint
-/// and a foreign topology are *expressible as*, so a layout change that moved
-/// them would fail these tests rather than silently stop testing anything.
-const STATE_OFF_GENERATION: usize = 8;
-const STATE_OFF_TOPOLOGY: usize = 16;
+/// Byte offset of the `mirror_state` generation word the test above fabricates.
+/// The crate owns the layout; this is what a torn checkpoint is *expressible
+/// as*, so a layout change that moved it would fail that test rather than
+/// silently stop testing anything.
+const STATE_OFF_GENERATION: usize = 0;
 
 /// Rewrite one `u64` of the mirror's record-file header, to fabricate a durable
 /// state the handle would never write.
-///
-/// Drops the handle first — the directory takes one writer, and the handle
-/// rewrites the whole file on the way out — which is why this takes the fixture
-/// rather than a path.
-fn patch_state_header(fx: &mut Fixture, offset: usize, f: impl FnOnce(u64) -> u64) {
-    fx.mirror = None;
-    let path = state_file(&fx.base_dir());
+fn patch_state_header(base_dir: &str, offset: usize, f: impl FnOnce(u64) -> u64) {
+    let path = state_file(base_dir);
     let mut bytes = std::fs::read(&path).expect("a checkpoint wrote the record file");
     let old = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
     bytes[offset..offset + 8].copy_from_slice(&f(old).to_le_bytes());
@@ -1543,9 +1497,9 @@ fn a_bootstrap_and_a_poll_span_many_frames() {
 
 /// Two schemas in one handle, and forgetting a view out of one.
 ///
-/// The local catalog holds **one** shared `SCHEMA_TAB` row per schema, so a
-/// retraction that took it down with one view would leave every other view of
-/// that schema unreadable.
+/// A record carries its own schema name and the store enters no schema of its
+/// own, so a retraction takes down exactly one view and leaves every other view
+/// of that schema readable.
 #[test]
 fn two_schemas_share_one_handle() {
     let _g = serial();
@@ -2089,6 +2043,52 @@ fn ddl_through_the_mirroring_client_retires_its_own_copy() {
         .execute("ALTER VIEW v_renamed AS SELECT a, b, v FROM t WHERE v > 1")
         .expect_err("a fed view cannot be retargeted");
     assert!(e.to_string().contains("delta feed"), "{e}");
+}
+
+/// A view another client renamed keeps its copy when this client re-mirrors it
+/// under the new name and then mirrors a new view created under the old one:
+/// the record's name is refreshed, so the new view does not match it.
+#[test]
+fn a_view_renamed_upstream_survives_a_new_view_under_its_old_name() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 60);
+    let renamed = fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed").view_id;
+    fx.quiesce();
+
+    fx.direct
+        .alter_rename_relation("s", "v_keyed", "v_moved")
+        .expect("rename through the other client");
+    sql(
+        &mut fx.direct,
+        "s",
+        &format!("CREATE VIEW v_keyed WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE b = 3"),
+    );
+    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_keyed");
+
+    assert_eq!(
+        fx.mirror()
+            .mirror_view("s", "v_moved")
+            .expect("re-mirror under the new name")
+            .view_id,
+        renamed,
+        "a rename keeps the id",
+    );
+    let fresh = fx
+        .mirror()
+        .mirror_view("s", "v_keyed")
+        .expect("mirror the new view")
+        .view_id;
+    assert_ne!(fresh, renamed);
+    assert!(
+        fx.mirror().mirrored_ids().contains(&renamed),
+        "the renamed view's registration must survive a new view under its old name",
+    );
+    assert!(fx.mirror().mirrors(renamed), "and its copy still answers");
+    assert!(fx.mirror().mirrors(fresh));
+    fx.quiesce();
+    fx.differential("s", "SELECT * FROM v_moved");
+    fx.differential("s", "SELECT * FROM v_keyed");
 }
 
 /// A reconnect keeps every registration, is refused inside a transaction, and

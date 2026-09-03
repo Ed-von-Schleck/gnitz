@@ -37,7 +37,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::client::{delta_reply_schema, qualified_name, DeltaCursor, GnitzClient, RelDescriptor};
+use crate::client::{delta_reply_schema, DeltaCursor, GnitzClient, RelDescriptor};
 use crate::connection::RawBlock;
 use crate::error::ClientError;
 use crate::protocol::{ReplySchema, Schema, ZSetBatch};
@@ -64,32 +64,33 @@ pub trait MirrorStore: Send {
     fn base_dir(&self) -> &str;
 
     /// Register `tid` under `schema`, retracting whatever the store held at that
-    /// id or under that qualified name; returns the ids retracted.
+    /// id with another layout, or under that qualified name at another id.
     ///
     /// The qualified name is what the store records the copy under, and the only
     /// thing it needs beyond the id: the store mints no ids of its own, so there
-    /// is no `SCHEMA_TAB` id for a schema to be entered under.
-    fn register(&mut self, tid: u64, schema_name: &str, name: &str, schema: &Schema) -> Result<Vec<u64>, MirrorError>;
+    /// is no schema id for a schema to be entered under.
+    fn register(&mut self, tid: u64, schema_name: &str, name: &str, schema: &Schema) -> Result<(), MirrorError>;
 
     /// Tear `tid` down to `level`. See [`Invalidate`] — this is the *only* way a
     /// copy, a cursor or a registration is ever dropped. Idempotent, and a `tid`
-    /// the local catalog does not hold is `Ok(())`.
+    /// the store does not hold is `Ok(())`.
     fn invalidate(&mut self, tid: u64, level: Invalidate) -> Result<(), MirrorError>;
 
     /// Apply `blocks` to `tid`'s copy under `shape`, then advance its cursor to
     /// `next`.
     fn ingest(&mut self, tid: u64, blocks: Vec<RawBlock>, shape: Shape, next: DeltaCursor) -> Result<(), MirrorError>;
 
-    /// Every row of `tid`; `None` when the copy does not hold it — the read is
-    /// the client's to delegate. Not [`Self::scan_spec`] with an all-rows spec: a
-    /// bare `SELECT *` with no WHERE, ORDER BY, LIMIT or OFFSET over a relation
-    /// with no hidden payload column builds no `ReadSpec` at all, so this is the
-    /// shape the planner actually asks for there.
-    fn scan(&mut self, tid: u64) -> Result<Option<(Arc<Schema>, ZSetBatch)>, MirrorError>;
+    /// Every row of `tid`'s copy, decoded under `schema` — the client-side schema
+    /// its registration resolved, hidden columns included. Not
+    /// [`Self::scan_spec`] with an all-rows spec: a bare `SELECT *` with no
+    /// WHERE, ORDER BY, LIMIT or OFFSET over a relation with no hidden payload
+    /// column builds no `ReadSpec` at all, so this is the shape the planner
+    /// actually asks for there.
+    fn scan(&mut self, tid: u64, schema: &Schema) -> Result<ZSetBatch, MirrorError>;
 
     /// Run the encoded `ReadSpec` `spec` against `tid`'s copy, replying under
     /// `reply_schema`.
-    fn scan_spec(&mut self, tid: u64, spec: &[u8], reply_schema: &Schema) -> Result<StoreRead, MirrorError>;
+    fn scan_spec(&mut self, tid: u64, spec: &[u8], reply_schema: &Schema) -> Result<ZSetBatch, MirrorError>;
 
     /// The round `tid`'s copy answers at, and by its presence that the copy is
     /// valid at all — the store half of the readability gate.
@@ -110,21 +111,6 @@ pub trait MirrorStore: Send {
 
     /// The message that poisoned this store, if any.
     fn poisoned(&self) -> Option<&str>;
-}
-
-/// A [`MirrorStore::scan_spec`] answer.
-///
-/// `NotHeld` and `Held(None)` must stay distinct: an empty answer off a readable
-/// copy *is* the answer, while `NotHeld` sends the read upstream. Collapsing them
-/// would push every legitimately empty mirrored read over the wire at a different
-/// freshness. Named rather than an `Option<Option<_>>` because it crosses a trait
-/// boundary. [`MirrorStore::scan`] needs no such enum — a held relation always
-/// answers with a batch, so `Option` is exact there.
-pub enum StoreRead {
-    /// The copy does not hold this relation. The client delegates the read.
-    NotHeld,
-    /// The copy answered. `None` is an empty answer, not an absent one.
-    Held(Option<ZSetBatch>),
 }
 
 /// Which reply shape a train of blocks carries. The bytes do not say; the caller
@@ -153,7 +139,7 @@ pub enum Invalidate {
     /// The cursor, then the copy's rows — the registration stands, so a
     /// bootstrap can refill it under the same id.
     Copy,
-    /// The cursor, the rows, and the catalog rows that name the relation; its
+    /// The cursor, the rows, and the record that names the relation; its
     /// directory goes with them.
     Registration,
 }
@@ -166,7 +152,7 @@ pub enum Invalidate {
 #[derive(Debug)]
 pub enum MirrorError {
     /// The local engine refused or failed: a storage fault, a registration the
-    /// catalog rejected, a read the spec could not express.
+    /// registry rejected, a read the spec could not express.
     Engine(String),
     /// The store is poisoned and refuses every further call that touches a copy.
     /// A delta that did not reach the store leaves a hole the cursor would step
@@ -187,12 +173,6 @@ impl std::fmt::Display for MirrorError {
 }
 
 impl std::error::Error for MirrorError {}
-
-impl From<String> for MirrorError {
-    fn from(m: String) -> Self {
-        MirrorError::Engine(m)
-    }
-}
 
 /// How a store failure reaches a caller of the client. It keeps its class rather
 /// than flattening to a message, so a poisoned copy stays something a host can
@@ -277,37 +257,6 @@ pub(crate) struct MirrorState {
     /// [`GnitzClient::reconnect`]: it carries the `(schema_name, name)` the
     /// re-resolve runs on.
     pub(crate) views: HashMap<u64, MirroredView>,
-    /// Canonical `"schema.name"` → id, for the local resolve.
-    ///
-    /// Not a second copy of the store's own qname index — a *separately
-    /// clearable* one, which is why it is here rather than read back through the
-    /// trait. See [`MirrorState::rebind_to_new_server`].
-    pub(crate) by_qname: HashMap<String, u64>,
-}
-
-impl MirrorState {
-    /// Drop `tid`'s registration and its name binding together, so neither can
-    /// go stale against the other.
-    pub(crate) fn drop_view(&mut self, tid: u64) {
-        if let Some(v) = self.views.remove(&tid) {
-            self.by_qname.remove(&qualified_name(&v.schema_name, &v.name));
-        }
-    }
-
-    /// Point the copies at a connection that may be a **different server**,
-    /// where the same qualified name is a different id and ids collide by
-    /// construction.
-    ///
-    /// So nothing that binds a name to an id or reads a copy survives until a
-    /// poll has re-resolved it, and everything that poll needs does: `views` is
-    /// its work list and carries the `(schema, name)` to re-resolve by, every
-    /// name binding goes, and every cursor goes — which shuts the read gate at
-    /// once. Nothing is erased: that would redo the bootstrap's work for every
-    /// view, polled or not.
-    pub(crate) fn rebind_to_new_server(&mut self) {
-        self.by_qname.clear();
-        self.store.clear_cursors();
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,8 +287,8 @@ impl GnitzClient {
             .ok_or_else(|| ClientError::ServerError(format!("relation {tid} is not mirrored")))
     }
 
-    /// Resolve `schema_name.name` upstream, reconcile that against the local
-    /// catalog, and leave a registration for the result. Returns the relation's
+    /// Resolve `schema_name.name` upstream, reconcile that against the store's
+    /// records, and leave a registration for the result. Returns the relation's
     /// server id.
     ///
     /// Reconciliation is keyed by **id**, not by name: the id is what the copy is
@@ -371,7 +320,7 @@ impl GnitzClient {
 
         let tid = rel.tid;
         let schema = Arc::clone(&rel.schema);
-        let retracted = self.mirror_state()?.store.register(tid, schema_name, name, &schema)?;
+        self.mirror_state()?.store.register(tid, schema_name, name, &schema)?;
 
         let entry = MirroredView {
             schema_name: schema_name.to_string(),
@@ -380,10 +329,16 @@ impl GnitzClient {
             delta_reply: Arc::new(ReplySchema::new(Arc::new(delta_reply_schema(&schema)?), tid)),
         };
         let m = self.mirror_state()?;
-        for old in retracted {
-            m.drop_view(old);
+        // The store retracted the incumbent under this name at another id — a
+        // relation dropped and recreated — so its registration goes too.
+        if let Some(old) = m
+            .views
+            .iter()
+            .find(|(&t, v)| t != tid && v.schema_name == schema_name && v.name == name)
+            .map(|(&t, _)| t)
+        {
+            m.views.remove(&old);
         }
-        m.by_qname.insert(qualified_name(schema_name, name), tid);
         m.views.insert(tid, entry);
         Ok(tid)
     }
@@ -492,15 +447,15 @@ impl GnitzClient {
     /// the engine's job and this crate does not link it: a host writes
     /// `client.attach_mirror(gnitz_mirror::Mirror::open(dir)?)?`, and the
     /// dependency is the host's. The directory has no default — a derived one
-    /// would collide on the engine's `flock` and take seconds to discover.
+    /// would collide on the engine's `flock`.
     ///
     /// A second call is refused, naming the path already held and dropping the
     /// store it was passed (which releases that store's `flock`).
     ///
-    /// **Dropping a mirroring client checkpoints**: drop glue reaches the store's
-    /// own `Drop` through the `Box`, which is fsync-bound and unbounded in the
-    /// copy's size. [`Self::close_mirror`] is where a host pays that
-    /// deliberately.
+    /// **Dropping a mirroring client does not checkpoint**: [`Self::close_mirror`]
+    /// is where a host pays the exit checkpoint, and reports it. A drop forfeits
+    /// the rounds since the last checkpoint — at most one bootstrap per view,
+    /// when the feed no longer covers them.
     pub fn attach_mirror(&mut self, store: impl MirrorStore + 'static) -> Result<(), ClientError> {
         if let Some(m) = &self.mirror {
             return Err(ClientError::ServerError(format!(
@@ -511,7 +466,6 @@ impl GnitzClient {
         self.mirror = Some(Box::new(MirrorState {
             store: Box::new(store),
             views: HashMap::new(),
-            by_qname: HashMap::new(),
         }));
         Ok(())
     }
@@ -520,7 +474,7 @@ impl GnitzClient {
     ///
     /// Idempotent, and the same call whether this is a first registration or a
     /// reopen: it resolves the relation upstream, reconciles that against
-    /// whatever the local catalog replayed, and then either advances the copy
+    /// whatever record the store replayed, and then either advances the copy
     /// from its persisted cursor or reseeds it. The outcome says which.
     ///
     /// Only a view with a delta feed can be mirrored — create it
@@ -528,10 +482,10 @@ impl GnitzClient {
     /// `Err`, so the outcome never carries [`PollResult::Failed`].
     pub fn mirror_view(&mut self, schema_name: &str, name: &str) -> Result<PollOutcome, ClientError> {
         self.refuse_poisoned_mirror()?;
-        // The rows the registration writes must carry the same spelling the
-        // server's do, or a later resolve of the local catalog would miss — so
-        // the name takes the same validate-then-fold every catalog gateway
-        // applies, not a bare fold of its own.
+        // The record the registration writes must carry the same spelling the
+        // server's row does, or a later local resolve would miss — so the name
+        // takes the same validate-then-fold every catalog gateway applies, not a
+        // bare fold of its own.
         let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
         let name = gnitz_wire::canonical_identifier(name)?;
 
@@ -545,8 +499,8 @@ impl GnitzClient {
         Ok(self.outcome(id, result))
     }
 
-    /// Stop mirroring `table_id`: its local catalog rows are retracted, its
-    /// directory removed, and a later read of it is delegated upstream.
+    /// Stop mirroring `table_id`: its record is retracted, its directory
+    /// removed, and a later read of it is delegated upstream.
     ///
     /// The host's word for the bottom of [`Invalidate`]'s ladder — a host says
     /// "stop mirroring this", not "tear it down to its registration".
@@ -556,7 +510,7 @@ impl GnitzClient {
         // that one, because a reopened store holds copies this client has not
         // registered — and forgetting one is exactly the call that erases it.
         let m = self.mirror_state()?;
-        m.drop_view(table_id);
+        m.views.remove(&table_id);
         m.store.invalidate(table_id, Invalidate::Registration)?;
         Ok(())
     }
@@ -657,8 +611,7 @@ impl GnitzClient {
             Some(_) => Ok(()),
             None => Ok(store.checkpoint()?),
         };
-        // The drop releases the directory `flock`, and is where a non-poisoned
-        // store's own exit checkpoint would otherwise have run unreported.
+        // The drop releases the directory lock.
         drop(m);
         out
     }
@@ -697,7 +650,7 @@ impl GnitzClient {
         if !m.views.contains_key(&tid) && m.store.cursor_of(tid).is_none() {
             return Ok(());
         }
-        m.drop_view(tid);
+        m.views.remove(&tid);
         m.store.invalidate(tid, Invalidate::Registration)?;
         Ok(())
     }

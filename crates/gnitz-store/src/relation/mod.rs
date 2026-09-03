@@ -18,11 +18,13 @@
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::schema::SchemaDescriptor;
 
-use crate::storage::{Batch, ChildAddr, RamBudgets, RecoverySource, Slot, StorageError, StoreError, Table};
+use crate::storage::{
+    subdir_names, Batch, ChildAddr, RamBudgets, RecoverySource, Slot, StorageError, StoreError, Table,
+};
 use gnitz_wire::PkColList;
 
 mod build;
@@ -31,7 +33,8 @@ mod ingest;
 mod store_handle;
 mod store_lsn;
 
-pub use dirs::{ensure_dir, is_table_dir_name, lock_data_dir, relation_dir, staged_dir};
+use dirs::is_table_dir_name;
+pub use dirs::{ensure_dir, lock_data_dir, relation_dir, staged_dir, DIR_LOCK_RETRY_FOR};
 pub(crate) use store_handle::StoreHandle;
 
 // ---------------------------------------------------------------------------
@@ -230,7 +233,6 @@ pub struct TableEntry {
     pub(crate) delta: Option<Box<DeltaFeed>>,
     pub schema: SchemaDescriptor,
     pub kind: RelationKind,
-    pub depth: i32,
     /// This relation's on-disk directory, parent of its `ChildAddr` subdirs. It
     /// exists once the relation is created, so it anchors an `O_TMPFILE` spill
     /// onto the same disk as the relation's data.
@@ -249,7 +251,6 @@ impl TableEntry {
         stores: RelationStores,
         schema: SchemaDescriptor,
         kind: RelationKind,
-        depth: i32,
         directory: String,
         budgets: ViewBudgets,
     ) -> Self {
@@ -258,7 +259,6 @@ impl TableEntry {
             delta: stores.delta,
             schema,
             kind,
-            depth,
             directory,
             index_circuits: Vec::new(),
             budgets,
@@ -381,10 +381,6 @@ pub struct RelationSpec {
     /// `<root>/<schema_name>/<t|v>_<id>`, from [`relation_dir`]. The parent of
     /// the `ChildAddr` subdir the store itself opens.
     pub directory: String,
-    /// Depth in the view dependency chain; 0 for a base table and for any
-    /// relation whose rows arrive from outside. Only the DBSP layer computes a
-    /// non-zero value.
-    pub depth: i32,
     pub budgets: ViewBudgets,
 }
 
@@ -481,11 +477,10 @@ impl RelationRegistry {
             kind,
             schema,
             directory,
-            depth,
             budgets,
         } = spec;
         self.tables
-            .insert(id, TableEntry::new(stores, schema, kind, depth, directory, budgets));
+            .insert(id, TableEntry::new(stores, schema, kind, directory, budgets));
     }
 
     /// Drop `table_id`'s entry, and with it its owned `Box<Table>` and fds.
@@ -790,6 +785,69 @@ impl RelationRegistry {
     /// boot orphan sweep names its live table and index directories from.
     pub fn entries(&self) -> impl Iterator<Item = (i64, &TableEntry)> + '_ {
         self.tables.iter().map(|(&id, e)| (id, e))
+    }
+
+    /// Remove every relation directory under `schema_dirs` that no registered
+    /// relation owns, and every `idx_<id>` child of a live relation that no
+    /// registered index owns. Only `<tag>_<digits>` names are eligible.
+    /// Best-effort: a failure to remove one orphan is logged and never aborts
+    /// the caller.
+    pub fn reclaim_orphan_relation_dirs(&self, schema_dirs: impl IntoIterator<Item = String>) {
+        // An index directory carries its circuit's `index_id`: a promoted circuit
+        // outlives the IDX_TAB row that named it, and this sweep must not delete it.
+        let mut live_tables: FxHashSet<&str> = FxHashSet::default();
+        let mut live_indices: FxHashSet<String> = FxHashSet::default();
+        for (_, entry) in self.entries() {
+            live_tables.insert(entry.directory.as_str());
+            live_indices.extend(
+                entry
+                    .index_circuits
+                    .iter()
+                    .map(|ic| ChildAddr::Index { id: ic.index_id }.dir(&entry.directory)),
+            );
+        }
+
+        for schema_dir in schema_dirs {
+            for name in subdir_names(&schema_dir) {
+                let full = format!("{schema_dir}/{name}");
+
+                if live_tables.contains(full.as_str()) {
+                    // Live table/view: sweep orphaned `idx_<id>` sub-dirs left by
+                    // a standalone DROP INDEX whose gated deletion was lost to a
+                    // crash.
+                    for idx_name in subdir_names(&full) {
+                        if !matches!(ChildAddr::parse(&idx_name), Some(ChildAddr::Index { .. })) {
+                            continue;
+                        }
+                        let idx_full = format!("{full}/{idx_name}");
+                        if live_indices.contains(&idx_full) {
+                            // Its per-worker children are `reconcile_child_dirs`'
+                            // job — the sweep descends into an index dir.
+                            continue;
+                        }
+                        match std::fs::remove_dir_all(&idx_full) {
+                            Ok(()) => gnitz_debug!("recovery: removed orphan index dir {}", idx_full),
+                            Err(e) => gnitz_debug!("recovery: failed to remove orphan index dir {}: {}", idx_full, e),
+                        }
+                    }
+                    continue;
+                }
+
+                // Only `<something>_<digits>` dirs — the shape of table
+                // (`t_<tid>`), view (`v_<vid>`), and the pre-flight's throwaway
+                // root (`_preflight_<vid>`) — are eligible for removal. Never
+                // touch an unexpected entry. Those three are the only writers
+                // directly under a schema dir, so a matching name absent from
+                // `live_tables` is orphaned either way.
+                if !is_table_dir_name(&name) {
+                    continue;
+                }
+                match std::fs::remove_dir_all(&full) {
+                    Ok(()) => gnitz_debug!("recovery: removed orphan table/view dir {}", full),
+                    Err(e) => gnitz_debug!("recovery: failed to remove orphan dir {}: {}", full, e),
+                }
+            }
+        }
     }
 
     // ── The resume fence ────────────────────────────────────────────────

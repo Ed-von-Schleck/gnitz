@@ -255,21 +255,6 @@ impl CatalogEngine {
     /// too: otherwise the drain could remove a recreated same-name schema whose
     /// live path SAL replay left in the queue.
     pub(crate) fn gc_orphan_directories(&mut self) {
-        // Every live relation directory, and every live index directory under one.
-        // An index directory carries its circuit's `index_id`: a promoted circuit
-        // outlives the IDX_TAB row that named it, and this sweep must not delete it.
-        let mut live_tables: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
-        let mut live_indices: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
-        for (_, entry) in self.registry.entries() {
-            live_tables.insert(entry.directory.as_str());
-            live_indices.extend(
-                entry
-                    .index_circuits
-                    .iter()
-                    .map(|ic| index_dir(&entry.directory, ic.index_id)),
-            );
-        }
-
         // Scan only schemas the catalog knows about. We never enumerate
         // `base_dir` for unknown directories: a schema path is an arbitrary user
         // name with no structural marker (`<base>/<schema>`), so removing an
@@ -278,48 +263,12 @@ impl CatalogEngine {
         // registered schema name, so it is never reached; the `_system`/`public`
         // logical-schema dirs are scanned but the system tables live under
         // `_system_catalog`, so nothing system-owned is ever a candidate.
-        for schema_name in self.caches.schema_by_id.values() {
-            let schema_dir = schema_dir(&self.base_dir, schema_name);
-            for name in subdir_names(&schema_dir) {
-                let full = format!("{schema_dir}/{name}");
-
-                if live_tables.contains(full.as_str()) {
-                    // Live table/view: sweep orphaned `idx_<id>` sub-dirs left by
-                    // a standalone DROP INDEX whose gated deletion was lost to a
-                    // crash.
-                    for idx_name in subdir_names(&full) {
-                        if !matches!(ChildAddr::parse(&idx_name), Some(ChildAddr::Index { .. })) {
-                            continue;
-                        }
-                        let idx_full = format!("{full}/{idx_name}");
-                        if live_indices.contains(&idx_full) {
-                            // Its per-worker children are `reconcile_child_dirs`'
-                            // job — the sweep descends into an index dir.
-                            continue;
-                        }
-                        match std::fs::remove_dir_all(&idx_full) {
-                            Ok(()) => gnitz_debug!("recovery: removed orphan index dir {}", idx_full),
-                            Err(e) => gnitz_debug!("recovery: failed to remove orphan index dir {}: {}", idx_full, e),
-                        }
-                    }
-                    continue;
-                }
-
-                // Defense in depth: only `<something>_<digits>` dirs — the shape
-                // of table (`t_<tid>`), view (`v_<vid>`), and the pre-flight's
-                // throwaway root (`_preflight_<vid>`) — are eligible for removal.
-                // Never touch an unexpected entry. Those three are the only
-                // writers directly under a schema dir, so a matching name absent
-                // from `live_tables` is orphaned either way.
-                if !is_table_dir_name(&name) {
-                    continue;
-                }
-                match std::fs::remove_dir_all(&full) {
-                    Ok(()) => gnitz_debug!("recovery: removed orphan table/view dir {}", full),
-                    Err(e) => gnitz_debug!("recovery: failed to remove orphan dir {}: {}", full, e),
-                }
-            }
-        }
+        self.registry.reclaim_orphan_relation_dirs(
+            self.caches
+                .schema_by_id
+                .values()
+                .map(|schema_name| schema_dir(&self.base_dir, schema_name)),
+        );
 
         // SAL replay of any DROP fired hooks that re-pushed the dropped directory
         // onto `pending_dir_deletions` (the committed-but-unflushed crash window).

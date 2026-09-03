@@ -38,7 +38,7 @@ pub use error::{ClientError, ConflictClass};
 pub use gnitz_wire::{
     validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, RelClass, TableProps,
 };
-pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult, Shape, StoreRead};
+pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult, Shape};
 pub use protocol::{
     null_word_get, null_word_set, wire_flags_get_schema_version, wire_flags_set_conflict_mode, BatchAppender, ColData,
     ColumnDef, FixedInt, PkColumn, PkTuple, ProtocolError, ScalarKind, Schema, TypeCode, ViewBuffers, WireConflictMode,
