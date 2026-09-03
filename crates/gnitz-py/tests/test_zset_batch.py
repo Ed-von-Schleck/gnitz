@@ -1,5 +1,5 @@
-"""The client-side batch writer: the schema rules gnitz-py owns, the two row
-writers (`append`'s resolved keyword plan and `extend`'s dict walk) and the
+"""The client-side batch writer: the schema rules gnitz-py owns, the one row
+writer both `append` and `extend` resolve their call shape through, the
 rollback contract they share, and value coercion at the binding boundary.
 
 The shared rule set lives in gnitz-core and is tested there; what is pinned here
@@ -157,10 +157,10 @@ def _rand_value(rng, tc):
 class TestAppendKeywordPlan:
 
     def test_matches_dict_path_across_random_schemas(self):
-        """`append(**row)` and `extend([row])` are separate writers — one reads a
-        resolved keyword plan, the other looks each column up in a dict. They must
-        produce byte-identical batches for any schema, and between them the two
-        paths cover every type code."""
+        """`append(**row)` and `extend([row])` resolve one write plan from two
+        sources — a keyword-name tuple and a dict's key walk. They must produce
+        byte-identical batches for any schema, and between them the two paths
+        cover every type code."""
         rng = random.Random(20260729)
         seen = set()
         for _ in range(2000):
@@ -198,9 +198,8 @@ class TestAppendKeywordPlan:
         assert seen == set(_ALL_TYPES)
 
     def test_cycling_call_sites_keeps_every_row_correct(self):
-        """Rows arrive through a cache of resolved call sites. Cycling far more
-        keyword shapes than that cache holds must not let one row's plan write
-        another's row."""
+        """A batch caches the last call shape's resolved plan. Cycling shapes
+        must not let one row's plan write another's row."""
         cols = [ColumnDef("pk", TypeCode.U64, primary_key=True)] + [
             ColumnDef("c%d" % i, TypeCode.I64, is_nullable=True) for i in range(5)]
         schema = Schema(cols)
@@ -307,6 +306,26 @@ class TestAppendKeywordPlan:
             batch.append(pk=1, val=Reenter())
         assert len(batch) == 0
         batch.append(pk=2, val=2)          # still usable
+        assert batch.pks == [2]
+
+    def test_reentrant_extend_raises_instead_of_aborting(self):
+        """The same guard for `extend`: a row value that re-enters the batch is a
+        `RuntimeError`, and the batch stays usable."""
+        schema = Schema([
+            ColumnDef("pk",  TypeCode.U64, primary_key=True),
+            ColumnDef("val", TypeCode.I64),
+        ])
+        batch = ZSetBatch(schema)
+
+        class Reenter:
+            def __index__(self):
+                batch.extend([{"pk": 99, "val": 99}])
+                return 5
+
+        with pytest.raises(RuntimeError):
+            batch.extend([{"pk": 1, "val": Reenter()}])
+        assert len(batch) == 0
+        batch.extend([{"pk": 2, "val": 2}])
         assert batch.pks == [2]
 
     def test_signature_is_introspectable(self):
@@ -659,8 +678,8 @@ class TestValueCoercion:
         assert len(batch) == 0
 
     def test_seek_accepts_a_uuid_object(self, client):
-        """The seek key runs through the same typed PK encoder as `append`, so a
-        `uuid.UUID` that can be written must also be usable to look the row up."""
+        """A `uuid.UUID` reaches `seek` through the same value coercion `append`
+        uses, so a key that can be written can also look the row up."""
         sn = "zb" + _uid()
         client.create_schema(sn)
         try:

@@ -23,18 +23,13 @@ use crate::schema::resolve_py_schema;
 /// Encode the Python PK values `pks` (each an int/UUID for a single-column key,
 /// or packed `bytes`) into a `PkColumn` for `schema`. Shared by
 /// `PyGnitzClient::delete` and `PyTxn::delete`; a single-column key runs through
-/// the same typed encoder the append path uses, so a signed or UUID key packs
-/// identically whichever surface supplied it.
+/// the same encoder the append path uses.
 pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyResult<PkColumn> {
     let stride = schema.pk_stride();
     let mut pk_col = PkColumn::empty_for_schema(schema);
-    // One scratch tuple for every key: each key rewrites the whole leading
-    // `stride` bytes, which is all `push_tuple` reads.
-    let mut t = gnitz_core::PkTuple::new(stride as u8);
-    // A compound key never reaches the typed encoder below, so the lone column's
-    // slot is the only one this loop can need.
+    pk_col.buf.reserve(pks.len() * stride);
     let single_pk = match schema.pk_indices() {
-        &[ci] => Some(PkSlot::resolve(schema, ci)),
+        &[ci] => Some(&schema.columns[ci]),
         _ => None,
     };
     for pk_val in pks {
@@ -47,82 +42,19 @@ pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyR
                     stride
                 )));
             }
-            t.buf[..stride].copy_from_slice(b);
-        } else if let Some(slot) = single_pk {
-            slot.write(schema, &mut t, pk_val)?;
+            pk_col.push_bytes(b);
+        } else if let Some(col) = single_pk {
+            if pk_val.is_none() {
+                return Err(not_nullable_err(&col.name));
+            }
+            push_fixed_le(&mut pk_col.buf, col.type_code, pk_val)?;
         } else {
             return Err(pyo3::exceptions::PyTypeError::new_err(
                 "a compound pk must be passed as packed bytes",
             ));
         }
-        pk_col.push_tuple(&t);
     }
     Ok(pk_col)
-}
-
-/// Extract one 16-byte integer value. Keyed off [`TypeCode::is_wide_int`] by
-/// both write paths, so a newly added 16-byte type cannot fall through to the
-/// fixed-width arm unnoticed.
-///
-/// Text reaches only a type [`TypeCode::admits_text_literal`] admits it for —
-/// UUID here — the same predicate the SQL `INSERT` writer gates on, so a `U128`
-/// column takes an integer and nothing else on either path. `u128`, not the
-/// `i128` arm, because a `U128` above `i128::MAX` is legal.
-fn extract_wide_int(tc: TypeCode, val: &Bound<'_, PyAny>) -> PyResult<u128> {
-    if tc.admits_text_literal() {
-        return extract_uuid_or_u128(val);
-    }
-    match tc {
-        TypeCode::U128 => val.extract::<u128>(),
-        _ => Ok(val.extract::<i128>()? as u128),
-    }
-}
-
-/// Encode one non-null PK value into `dst`, whose length is `tc.wire_stride()`.
-/// The one typed PK encoder: shared by the keyword append path (which already
-/// knows the type code and offset from its resolved plan), the dict path, and
-/// [`py_pks_to_column`], so a signed, UUID, or wide key packs the same way
-/// whichever surface supplied it.
-fn write_pk_bytes(dst: &mut [u8], tc: TypeCode, val: &Bound<'_, PyAny>) -> PyResult<()> {
-    if tc.is_wide_int() {
-        dst.copy_from_slice(&extract_wide_int(tc, val)?.to_le_bytes());
-        return Ok(());
-    }
-    write_fixed_le_into(dst, tc, val)
-}
-
-/// One PK column's address in the packed key. [`Self::resolve`] derives the
-/// offset from the column index, so no caller can pair the two wrongly; it walks
-/// the PK list summing wire strides, so it is resolved per schema, not per row.
-#[derive(Clone, Copy)]
-struct PkSlot {
-    ci: usize,
-    off: usize,
-}
-
-impl PkSlot {
-    fn resolve(schema: &Schema, ci: usize) -> Self {
-        PkSlot {
-            ci,
-            off: schema.pk_byte_offset(ci),
-        }
-    }
-
-    /// Encode one PK column's Python value into `t` at this slot, rejecting
-    /// `None`.
-    fn write(self, schema: &Schema, t: &mut gnitz_core::PkTuple, val: &Bound<'_, PyAny>) -> PyResult<()> {
-        if val.is_none() {
-            return Err(pk_none_err(schema, self.ci));
-        }
-        let tc = schema.columns[self.ci].type_code;
-        write_pk_bytes(&mut t.buf[self.off..self.off + tc.wire_stride()], tc, val)
-    }
-}
-
-/// `None` reached a PK column.
-#[cold]
-fn pk_none_err(schema: &Schema, ci: usize) -> PyErr {
-    pyo3::exceptions::PyValueError::new_err(format!("PK column {:?} cannot be None", schema.columns[ci].name))
 }
 
 /// Stores batch data in Rust Vecs with a cached Schema. `append` / `extend`
@@ -133,75 +65,14 @@ fn pk_none_err(schema: &Schema, ci: usize) -> PyErr {
 pub struct PyZSetBatch {
     pub(crate) schema: Arc<Schema>,
     pub(crate) batch: ZSetBatch,
-    /// PK scratch for the row under construction. Reused rather than rebuilt
-    /// per row, which would re-zero all `MAX_PK_BYTES`: a row missing a PK
-    /// column is an error, so every row rewrites the whole `pk_stride` prefix
-    /// `push_tuple` reads.
-    key_scratch: gnitz_core::PkTuple,
-    /// Is [`WEIGHT_KW`] the name of a column? Then it means that column, not the
-    /// row weight: the schema is the authority on what a name means, and
+    /// Is [`WEIGHT_KW`] the name of a visible column? Then it means that column,
+    /// not the row weight: the schema is the authority on what a name means, and
     /// `extend`'s own `_weight` parameter still sets the weight for such a batch.
     weight_is_column: bool,
     /// The plan the last row was written through — see [`KwPlan`].
     kw_plan: Option<KwPlan>,
 }
 
-/// One row under construction. Payload values land in the batch's columns as
-/// they arrive; the PK, weight and null word are pushed together at the end.
-/// Both append surfaces write through this, so they agree on column ordering,
-/// null handling and error messages by construction.
-struct RowWriter<'a> {
-    batch: &'a mut ZSetBatch,
-    schema: &'a Schema,
-    nulls: u64,
-}
-
-impl<'a> RowWriter<'a> {
-    fn new(batch: &'a mut ZSetBatch, schema: &'a Schema) -> Self {
-        RowWriter {
-            batch,
-            schema,
-            nulls: 0,
-        }
-    }
-
-    /// `None` — no value supplied, or an explicit `None` — writes NULL. A
-    /// tombstone column never reaches here: the plan routes it to
-    /// [`Self::filler`] instead. (A hidden *PK* column is a view's key slot, and
-    /// is written normally.)
-    fn payload(&mut self, payload_idx: usize, ci: usize, val: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
-        let col = &self.schema.columns[ci];
-        match val {
-            Some(v) if !v.is_none() => push_column_value(self.batch, ci, col.type_code, v),
-            _ => {
-                if !col.is_nullable {
-                    return Err(not_nullable_err(&col.name));
-                }
-                null_word_set(&mut self.nulls, payload_idx, true);
-                self.batch.columns[ci].push_null(col.type_code);
-                Ok(())
-            }
-        }
-    }
-
-    /// A DROP COLUMN tombstone: the type's zero filler and no null bit — it stays
-    /// NOT NULL, as the SQL `INSERT` writer also pushes it.
-    fn filler(&mut self, ci: usize) {
-        let tc = self.schema.columns[ci].type_code;
-        self.batch.columns[ci].push_filler(tc);
-    }
-
-    /// Close the row: the PK, its weight and the null word are pushed together.
-    /// Consuming, so a writer cannot outlive its row and push a second one under
-    /// the first row's accumulated null word.
-    fn finish(self, key: &gnitz_core::PkTuple, weight: i64) {
-        self.batch.pks.push_tuple(key);
-        self.batch.weights.push(weight);
-        self.batch.nulls.push(self.nulls);
-    }
-}
-
-/// Private helpers — shared between `append` and `extend`.
 impl PyZSetBatch {
     /// Run `body` against `self`; on error, truncate every per-row vector back
     /// to the pre-call row count, so a half-written row never leaves the batch
@@ -224,29 +95,13 @@ impl PyZSetBatch {
     }
 }
 
-/// Append one non-null payload value. The `let … else` arms make the
-/// schema/`ColData` agreement a checked precondition: a mismatch would
-/// otherwise push nothing while the weight and null vectors still advanced,
-/// silently skewing that column's length against the rest of the batch.
-fn push_column_value(batch: &mut ZSetBatch, ci: usize, tc: TypeCode, val: &Bound<'_, PyAny>) -> PyResult<()> {
-    let col = &mut batch.columns[ci];
-    match tc {
-        TypeCode::String => {
-            let ColData::Strings(v) = col else { variant_mismatch() };
-            v.push(Some(val.extract::<String>()?));
-        }
-        TypeCode::Blob => {
-            let ColData::Bytes(v) = col else { variant_mismatch() };
-            v.push(Some(val.extract::<Vec<u8>>()?));
-        }
-        tc if tc.is_wide_int() => {
-            let ColData::Fixed(buf) = col else { variant_mismatch() };
-            buf.extend_from_slice(&extract_wide_int(tc, val)?.to_le_bytes());
-        }
-        tc => {
-            let ColData::Fixed(buf) = col else { variant_mismatch() };
-            write_fixed_le(buf, tc, val)?;
-        }
+/// Append one non-null payload value. The variant is the column's own, so a
+/// cell always lands in the vector whose length the batch is checked against.
+fn push_column_value(col: &mut ColData, tc: TypeCode, val: &Bound<'_, PyAny>) -> PyResult<()> {
+    match col {
+        ColData::Strings(v) => v.push(Some(val.extract::<String>()?)),
+        ColData::Bytes(v) => v.push(Some(val.extract::<Vec<u8>>()?)),
+        ColData::Fixed(buf) => push_fixed_le(buf, tc, val)?,
     }
     Ok(())
 }
@@ -257,28 +112,18 @@ fn missing_pk_err(schema: &Schema, ci: usize) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(format!("missing PK column {:?}", schema.columns[ci].name))
 }
 
-/// `None` reached a NOT NULL column.
+/// `None` reached a NOT NULL column — every PK column is one.
 #[cold]
 fn not_nullable_err(name: &str) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(format!("Non-nullable column {name:?} cannot be None"))
 }
 
-/// The `TypeError` for a supplied name that matches no column. Shared by both
-/// append surfaces, so the same mistake reads the same either way.
+/// The `TypeError` for a supplied name that matches no column.
 #[cold]
 fn unexpected_name_err(name: &str) -> PyErr {
     pyo3::exceptions::PyTypeError::new_err(format!(
         "ZSetBatch got an unexpected column name '{name}' (the row weight is spelled '{WEIGHT_KW}')"
     ))
-}
-
-/// A payload column's `ColData` variant did not match its declared type code.
-/// `ZSetBatch::new` derives one from the other, so reaching this means the batch
-/// was assembled outside that constructor.
-#[cold]
-#[inline(never)]
-fn variant_mismatch() -> ! {
-    panic!("ColData variant does not match the column's type code")
 }
 
 // ---------------------------------------------------------------------------
@@ -293,17 +138,36 @@ const WEIGHT_KW: &str = "_weight";
 /// resolves it from the keyword-name tuple CPython hands the call, `extend` from
 /// the key sequence it walks off a row dict.
 ///
-/// A batch caches one. A receiver that does alternate shapes rebuilds per row —
-/// correct, and ~1-2 µs against a ~92 ns row.
+/// A batch caches one. A receiver that alternates shapes rebuilds per row —
+/// correct, at roughly twice the cost of a row that hits the cache.
 struct KwPlan {
     kwnames: Py<PyTuple>,
     /// Argument position of [`WEIGHT_KW`], if the call passed it.
     weight: Option<usize>,
-    /// The argument position feeding each PK column, and that column's slot, in
-    /// PK order.
-    pks: Vec<(usize, PkSlot)>,
-    /// `(column index, source)` per payload column, by dense payload index.
-    payload: Vec<(usize, PayloadSrc)>,
+    /// One entry per PK column, in PK order — the order their bytes are
+    /// appended to the batch's PK buffer.
+    pks: Vec<PkPlan>,
+    /// One entry per payload column, by dense payload index.
+    payload: Vec<PayloadPlan>,
+}
+
+/// A PK column of the plan. Carries the type code so the row loop reads the
+/// schema only to name a column in an error.
+#[derive(Clone, Copy)]
+struct PkPlan {
+    pos: usize,
+    ci: usize,
+    tc: TypeCode,
+}
+
+/// A payload column of the plan, with what the row loop needs of its
+/// definition.
+#[derive(Clone, Copy)]
+struct PayloadPlan {
+    ci: usize,
+    tc: TypeCode,
+    nullable: bool,
+    src: PayloadSrc,
 }
 
 /// Where one payload slot's value comes from, for a call of this shape.
@@ -317,36 +181,31 @@ enum PayloadSrc {
     Absent,
 }
 
-/// Same names in the same order? Interned names settle on pointer identity; the
-/// text compare is the fallback for names that were not interned.
-fn kwnames_eq(a: &[Bound<'_, PyAny>], b: &[Bound<'_, PyAny>]) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b).all(|(x, y)| {
-            if x.is(y) {
-                return true;
-            }
-            let (Ok(xs), Ok(ys)) = (x.cast::<PyString>(), y.cast::<PyString>()) else {
-                return false;
-            };
-            matches!((xs.to_str(), ys.to_str()), (Ok(xc), Ok(yc)) if xc == yc)
-        })
-}
-
 /// Is `plan` the one resolved from this call's names? A call site with its own
 /// keyword tuple is tried by pointer alone: CPython holds a literal call site's
 /// name tuple as a code-object constant, so the same object comes back every
-/// iteration and one compare settles the hot path.
+/// iteration and one compare settles the hot path. Otherwise the names are
+/// compared in order — interned names settle on pointer identity, the text
+/// compare is the fallback for names that were not interned.
 fn plan_hits(py: Python<'_>, plan: &KwPlan, names: &[Bound<'_, PyAny>], tuple: Option<&Bound<'_, PyTuple>>) -> bool {
     if let Some(t) = tuple {
         if plan.kwnames.as_ptr() == t.as_ptr() {
             return true;
         }
     }
-    kwnames_eq(plan.kwnames.bind(py).as_slice(), names)
+    let mine = plan.kwnames.bind(py).as_slice();
+    mine.len() == names.len()
+        && mine.iter().zip(names).all(|(x, y)| {
+            x.is(y)
+                || match (x.cast::<PyString>(), y.cast::<PyString>()) {
+                    (Ok(xs), Ok(ys)) => matches!((xs.to_str(), ys.to_str()), (Ok(a), Ok(b)) if a == b),
+                    _ => false,
+                }
+        })
 }
 
 /// First position in `names` holding `col`.
-fn kw_position(names: &[Bound<'_, PyString>], col: &str) -> Option<usize> {
+fn kw_position(names: &[&Bound<'_, PyString>], col: &str) -> Option<usize> {
     names.iter().position(|n| n.to_str().is_ok_and(|s| s == col))
 }
 
@@ -354,21 +213,19 @@ fn kw_position(names: &[Bound<'_, PyString>], col: &str) -> Option<usize> {
 ///
 /// Walks the *schema*, not the name list, so a name held by two columns feeds
 /// both — `Schema` admits duplicate names, since hidden columns are exempt from
-/// the duplicate-name check. A hidden payload column is skipped: it is a DROP
-/// COLUMN tombstone, planned as [`PayloadSrc::Filler`] and never named by a
-/// keyword — so one spelling it falls through to [`unexpected_name_err`].
+/// the duplicate-name check. A hidden payload column is a DROP COLUMN
+/// tombstone, planned as [`PayloadSrc::Filler`] and never named by a keyword —
+/// so one spelling it falls through to [`unexpected_name_err`].
 fn build_kw_plan(schema: &Schema, weight_is_column: bool, kwnames: &Bound<'_, PyTuple>) -> PyResult<KwPlan> {
-    let nkw = kwnames.len();
-    let mut names: Vec<Bound<'_, PyString>> = Vec::with_capacity(nkw);
+    let mut names: Vec<&Bound<'_, PyString>> = Vec::with_capacity(kwnames.len());
     for item in kwnames.as_slice() {
         names.push(
-            item.clone()
-                .cast_into::<PyString>()
+            item.cast::<PyString>()
                 .map_err(|_| pyo3::exceptions::PyTypeError::new_err("column names must be strings"))?,
         );
     }
 
-    let mut consumed = vec![false; nkw];
+    let mut consumed = vec![false; names.len()];
     let weight = if weight_is_column {
         None
     } else {
@@ -383,11 +240,15 @@ fn build_kw_plan(schema: &Schema, weight_is_column: bool, kwnames: &Bound<'_, Py
             return Err(missing_pk_err(schema, ci));
         };
         consumed[i] = true;
-        pks.push((i, PkSlot::resolve(schema, ci)));
+        pks.push(PkPlan {
+            pos: i,
+            ci,
+            tc: schema.columns[ci].type_code,
+        });
     }
-    let mut payload = Vec::with_capacity(nkw);
+    let mut payload = Vec::with_capacity(names.len());
     for (_, ci, col) in schema.payload_columns() {
-        let src = if schema.is_hidden_payload(ci) {
+        let src = if col.is_hidden {
             PayloadSrc::Filler
         } else if let Some(i) = kw_position(&names, &col.name) {
             consumed[i] = true;
@@ -395,16 +256,15 @@ fn build_kw_plan(schema: &Schema, weight_is_column: bool, kwnames: &Bound<'_, Py
         } else {
             PayloadSrc::Absent
         };
-        payload.push((ci, src));
+        payload.push(PayloadPlan {
+            ci,
+            tc: col.type_code,
+            nullable: col.is_nullable,
+            src,
+        });
     }
     if let Some(i) = consumed.iter().position(|c| !c) {
-        let name = names[i].to_str()?;
-        if names[..i].iter().any(|n| n.to_str().is_ok_and(|s| s == name)) {
-            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                "ZSetBatch.append() got multiple values for keyword argument '{name}'"
-            )));
-        }
-        return Err(unexpected_name_err(name));
+        return Err(unexpected_name_err(names[i].to_str()?));
     }
 
     Ok(KwPlan {
@@ -420,8 +280,11 @@ impl PyZSetBatch {
     /// read each column's value through `arg`, which maps a name's position in
     /// `names` to its value. `tuple` is those names as a Python tuple where the
     /// caller holds one, which the plan is matched against by pointer first.
-    /// Rolls nothing back: each surface wraps its own call in
-    /// [`Self::with_rollback`].
+    ///
+    /// PK bytes go straight into the batch's PK buffer, then each payload cell
+    /// into its column, and the weight and null word close the row. Rolls
+    /// nothing back on error: each surface wraps its own call in
+    /// [`Self::with_rollback`], which cuts a half-written row off every stream.
     fn write_row<'a, 'py>(
         &mut self,
         py: Python<'py>,
@@ -433,7 +296,6 @@ impl PyZSetBatch {
         let PyZSetBatch {
             batch,
             schema,
-            key_scratch,
             weight_is_column,
             kw_plan,
         } = &mut *self;
@@ -454,20 +316,39 @@ impl PyZSetBatch {
                 .map_err(|e| argument_extraction_error(py, WEIGHT_KW, e))?,
             None => default_weight,
         };
-        let mut row = RowWriter::new(batch, schema);
-        for &(pos, slot) in &plan.pks {
-            slot.write(schema, key_scratch, &arg(pos))?;
+        for &PkPlan { pos, ci, tc } in &plan.pks {
+            let v = arg(pos);
+            if v.is_none() {
+                return Err(not_nullable_err(&schema.columns[ci].name));
+            }
+            push_fixed_le(&mut batch.pks.buf, tc, &v)?;
         }
+        let mut nulls = 0u64;
         // `enumerate`, because the dense payload index is the null-bitmap bit
         // position.
-        for (payload_idx, &(ci, src)) in plan.payload.iter().enumerate() {
-            match src {
-                PayloadSrc::Filler => row.filler(ci),
-                PayloadSrc::Arg(i) => row.payload(payload_idx, ci, Some(&*arg(i)))?,
-                PayloadSrc::Absent => row.payload(payload_idx, ci, None)?,
+        for (payload_idx, &PayloadPlan { ci, tc, nullable, src }) in plan.payload.iter().enumerate() {
+            let v = match src {
+                PayloadSrc::Filler => {
+                    batch.columns[ci].push_filler(tc);
+                    continue;
+                }
+                PayloadSrc::Arg(i) => Some(arg(i)),
+                PayloadSrc::Absent => None,
+            };
+            match v {
+                Some(v) if !v.is_none() => push_column_value(&mut batch.columns[ci], tc, &v)?,
+                _ => {
+                    if !nullable {
+                        return Err(not_nullable_err(&schema.columns[ci].name));
+                    }
+                    null_word_set(&mut nulls, payload_idx, true);
+                    batch.columns[ci].push_null(tc);
+                }
             }
         }
-        row.finish(key_scratch, weight);
+        batch.weights.push(weight);
+        batch.nulls.push(nulls);
+        debug_assert_eq!(batch.pks.buf.len(), batch.weights.len() * schema.pk_stride());
         Ok(())
     }
 
@@ -483,12 +364,11 @@ impl PyZSetBatch {
         args: &mut Vec<Bound<'py, PyAny>>,
         default_weight: i64,
     ) -> PyResult<i64> {
-        let py = dict.py();
         names.clear();
         args.clear();
         let mut supplied = None;
         for (key, val) in dict.iter() {
-            if !self.weight_is_column && is_weight_key(py, &key) {
+            if !self.weight_is_column && is_weight_key(&key) {
                 supplied = Some(val);
                 continue;
             }
@@ -501,22 +381,15 @@ impl PyZSetBatch {
             None => Ok(default_weight),
             Some(w) => w
                 .extract::<i64>()
-                .map_err(|e| argument_extraction_error(py, WEIGHT_KW, e)),
+                .map_err(|e| argument_extraction_error(dict.py(), WEIGHT_KW, e)),
         }
     }
 }
 
-/// Does this dict key spell [`WEIGHT_KW`]? Interned keys — every literal in
-/// Python source — settle on the pointer; the text compare is the fallback for a
-/// name built at runtime.
-fn is_weight_key(py: Python<'_>, key: &Bound<'_, PyAny>) -> bool {
-    if key.is(pyo3::intern!(py, WEIGHT_KW)) {
-        return true;
-    }
-    let Ok(text) = key.cast::<PyString>() else {
-        return false;
-    };
-    text.to_str().is_ok_and(|s| s == WEIGHT_KW)
+/// Does this dict key spell [`WEIGHT_KW`]?
+fn is_weight_key(key: &Bound<'_, PyAny>) -> bool {
+    key.cast::<PyString>()
+        .is_ok_and(|s| s.to_str().is_ok_and(|t| t == WEIGHT_KW))
 }
 
 /// `ZSetBatch.append(**columns)` — the raw `METH_FASTCALL | METH_KEYWORDS` slot.
@@ -540,9 +413,7 @@ unsafe fn append_fastcall(
     nargs: ffi::Py_ssize_t,
     kwnames: *mut ffi::PyObject,
 ) -> PyResult<*mut ffi::PyObject> {
-    // The flag CPython ORs into `nargs` to say the callee may borrow the
-    // caller's frame is not part of the count, so mask it off.
-    if (nargs as usize) & !ffi::PY_VECTORCALL_ARGUMENTS_OFFSET != 0 {
+    if nargs != 0 {
         return Err(pyo3::exceptions::PyTypeError::new_err(
             "ZSetBatch.append() takes no positional arguments (columns are keywords)",
         ));
@@ -582,11 +453,6 @@ An omitted or None column is NULL; _weight is the row's Z-set weight\n\
 
 /// pyo3's own slot wrapper around [`append_fastcall`]: it attaches the
 /// interpreter and returns null on error.
-///
-/// It is *not* what protects the re-entrant case — a value whose `__index__`
-/// calls back into `append` on this batch is caught by `try_borrow_mut()?`
-/// below, which returns a `PyBorrowMutError` (Python `RuntimeError`), never a
-/// panic.
 const ZSB_APPEND_METHOD: ffi::PyCFunctionFastWithKeywords =
     pyo3::get_trampoline_function!(fastcall_cfunction_with_keywords, append_fastcall);
 
@@ -620,10 +486,9 @@ impl PyZSetBatch {
     #[new]
     #[pyo3(signature = (schema))]
     pub fn new(#[pyo3(from_py_with = resolve_py_schema)] schema: Arc<Schema>) -> PyResult<Self> {
-        let weight_is_column = schema.columns.iter().any(|c| c.name == WEIGHT_KW);
+        let weight_is_column = schema.visible_columns().any(|(_, c)| c.name == WEIGHT_KW);
         let batch = ZSetBatch::new(&schema);
         Ok(PyZSetBatch {
-            key_scratch: gnitz_core::PkTuple::new(schema.pk_stride() as u8),
             batch,
             weight_is_column,
             kw_plan: None,
@@ -645,10 +510,10 @@ impl PyZSetBatch {
         // resolve the plan against, and the values the writer reads through.
         let mut names: Vec<Bound<'_, PyAny>> = Vec::new();
         let mut args: Vec<Bound<'_, PyAny>> = Vec::new();
-        // Batch-level atomicity: the row writer rolls nothing back on its own, so
-        // wrapping the whole loop truncates to the pre-call length on any error,
-        // giving `extend` the same all-or-nothing contract `append` has.
-        slf.borrow_mut().with_rollback(|s| {
+        // `try_borrow_mut`, as `append` does: a row value that re-enters this
+        // batch raises instead of aborting the interpreter. Wrapping the whole
+        // loop in one rollback gives `extend` the same all-or-nothing contract.
+        slf.try_borrow_mut()?.with_rollback(|s| {
             // A sized sequence lets every growth stream skip its climb from
             // zero; a generator has no `__len__`, so the probe is discarded.
             if let Ok(n) = rows.len() {
@@ -702,8 +567,8 @@ impl PyZSetBatch {
 /// (`gnitz_wire::parse_uuid`, the crate that owns wire-value text). Which
 /// *columns* a string may be written to is not decided here: this function is
 /// also reached from the schema-less wire paths (`pk_tuple_from_py`,
-/// `seek_by_index`), which have no type code to consult. The type-directed
-/// gate lives at [`extract_wide_int`], the one call site that knows the type.
+/// `seek_by_index`), which have no type code to consult. The typed encoder
+/// [`push_fixed_le`] reaches it for UUID alone.
 pub(crate) fn extract_uuid_or_u128(val: &Bound<'_, PyAny>) -> PyResult<u128> {
     // `cast` before `extract` on both arms: a failed `extract` builds *and
     // normalizes* a full `PyErr` only to discard it, which a `uuid.UUID` or
@@ -727,53 +592,19 @@ pub(crate) fn extract_uuid_or_u128(val: &Bound<'_, PyAny>) -> PyResult<u128> {
     ))
 }
 
-/// Write one fixed-width value as little-endian bytes into `dst` (length must
-/// equal `tc.wire_stride()`). Zero-allocation; used for PK regions, where the
-/// destination already exists.
+/// Append one non-null fixed-width value to `buf` as its native little-endian
+/// bytes — the one typed encoder, serving the PK buffer and every `Fixed`
+/// payload column alike, so a key packs the same way whichever surface
+/// supplied it.
 ///
-/// This table and [`write_fixed_le`]'s are kept apart deliberately: each writes
-/// straight to its own destination shape, and folding either into the other
-/// costs a second write per cell (measured there). Because both match every
-/// `TypeCode` variant by name with no wildcard, a new fixed-width type is a
-/// non-exhaustive-match error in *both* — the compiler, not convention, is what
-/// keeps them in step.
-///
-/// In both, per-arm `extract` is also the range check — `extract::<u8>()` raises
+/// Per-arm `extract` is also the range check — `extract::<u8>()` raises
 /// Python's `OverflowError` for `append(c=300)` on a `U8` column, where a
-/// width-generic pack would silently truncate.
-fn write_fixed_le_into(dst: &mut [u8], tc: TypeCode, item: &Bound<'_, PyAny>) -> PyResult<()> {
-    match tc {
-        TypeCode::U8 => dst[0] = item.extract::<u8>()?,
-        TypeCode::I8 => dst[0] = item.extract::<i8>()? as u8,
-        TypeCode::U16 => dst.copy_from_slice(&item.extract::<u16>()?.to_le_bytes()),
-        TypeCode::I16 => dst.copy_from_slice(&item.extract::<i16>()?.to_le_bytes()),
-        TypeCode::U32 => dst.copy_from_slice(&item.extract::<u32>()?.to_le_bytes()),
-        TypeCode::I32 => dst.copy_from_slice(&item.extract::<i32>()?.to_le_bytes()),
-        TypeCode::F32 => dst.copy_from_slice(&item.extract::<f32>()?.to_le_bytes()),
-        TypeCode::U64 => dst.copy_from_slice(&item.extract::<u64>()?.to_le_bytes()),
-        TypeCode::I64 => dst.copy_from_slice(&item.extract::<i64>()?.to_le_bytes()),
-        TypeCode::F64 => dst.copy_from_slice(&item.extract::<f64>()?.to_le_bytes()),
-        TypeCode::String | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob | TypeCode::I128 => {
-            unreachable!("not a fixed-width type; handled before write_fixed_le_into")
-        }
-    }
-    Ok(())
-}
-
-/// Append one fixed-width value as little-endian bytes to `buf`. Extends per
-/// arm from the extracted value's own `to_le_bytes`, which is one write per
-/// cell. Both ways of folding this into [`write_fixed_le_into`] cost a second:
-/// a stack slot adds a 16-byte zero-init LLVM cannot prove away (it cannot see
-/// the slot as fully initialized across the extraction call), and growing `buf`
-/// by the stride first adds the fill that grow does. Measured, the in-place form
-/// costs ~89 more instructions per 5-column `append` — ~6% of the call. That
-/// figure is a local instructions-retired measurement with no in-tree bench
-/// behind it: `gnitz-py` is excluded from `make test` (a pyo3 extension cannot
-/// link a test harness), so the repo's `#[ignore]`d `*_bench` convention is
-/// unavailable here, and the end-to-end Python harness cannot resolve 89
-/// instructions. The duplication is deliberate; see [`write_fixed_le_into`] for what keeps the two
-/// tables in step, and for the range check each arm's `extract` doubles as.
-fn write_fixed_le(buf: &mut Vec<u8>, tc: TypeCode, item: &Bound<'_, PyAny>) -> PyResult<()> {
+/// width-generic pack would silently truncate. Text is accepted for UUID
+/// alone, the one non-string type [`TypeCode::admits_text_literal`] names, so a
+/// `U128` column takes an integer and nothing else, as the SQL `INSERT` writer
+/// also rules; `U128` extracts as `u128` because a value above `i128::MAX` is
+/// legal there.
+fn push_fixed_le(buf: &mut Vec<u8>, tc: TypeCode, item: &Bound<'_, PyAny>) -> PyResult<()> {
     match tc {
         TypeCode::U8 => buf.push(item.extract::<u8>()?),
         TypeCode::I8 => buf.push(item.extract::<i8>()? as u8),
@@ -785,31 +616,33 @@ fn write_fixed_le(buf: &mut Vec<u8>, tc: TypeCode, item: &Bound<'_, PyAny>) -> P
         TypeCode::U64 => buf.extend_from_slice(&item.extract::<u64>()?.to_le_bytes()),
         TypeCode::I64 => buf.extend_from_slice(&item.extract::<i64>()?.to_le_bytes()),
         TypeCode::F64 => buf.extend_from_slice(&item.extract::<f64>()?.to_le_bytes()),
-        TypeCode::String | TypeCode::U128 | TypeCode::UUID | TypeCode::Blob | TypeCode::I128 => {
-            unreachable!("handled before write_fixed_le")
+        TypeCode::U128 => buf.extend_from_slice(&item.extract::<u128>()?.to_le_bytes()),
+        TypeCode::I128 => buf.extend_from_slice(&item.extract::<i128>()?.to_le_bytes()),
+        TypeCode::UUID => buf.extend_from_slice(&extract_uuid_or_u128(item)?.to_le_bytes()),
+        TypeCode::String | TypeCode::Blob => {
+            unreachable!("a German-string column is never a Fixed column or a PK column")
         }
     }
     Ok(())
 }
 
 /// Build a `PkTuple` for the wire-only `seek` paths, which have no schema at the
-/// FFI boundary: `bytes` is taken verbatim, and an integer becomes a narrow
-/// 16-byte tuple whose high padding is inert (the server reads only the
-/// column's own stride). The signed fallback keeps a negative key packing to the
-/// same two's-complement bytes the typed append path writes.
+/// FFI boundary: `bytes` is taken verbatim, and an integer becomes a 16-byte
+/// tuple of which the server reads only the relation's own stride. That read is
+/// a truncation, not a range check: a key past the column's width seeks the
+/// low bytes. The signed fallback keeps a negative key packing to the same
+/// two's-complement bytes the typed append path writes.
 pub(crate) fn pk_tuple_from_py(pk: &Bound<'_, PyAny>) -> PyResult<gnitz_core::PkTuple> {
     // bytes first: `extract_uuid_or_u128` below falls through to
     // `getattr("int")`, which a bytes key would walk before failing.
     if let Ok(bytes) = pk.cast::<pyo3::types::PyBytes>() {
         return gnitz_core::PkTuple::try_from_bytes(bytes.as_bytes()).map_err(pyo3::exceptions::PyValueError::new_err);
     }
-    if let Ok(val) = extract_uuid_or_u128(pk) {
-        return Ok(gnitz_core::PkTuple::from_u128_narrow(val));
-    }
+    // `i128` first, so a negative key does not build and discard an
+    // `OverflowError` on the unsigned arm; a `U128` key above `i128::MAX`, a
+    // `uuid.UUID` and UUID text all fall to the second.
     if let Ok(val) = pk.extract::<i128>() {
         return Ok(gnitz_core::PkTuple::from_u128_narrow(val as u128));
     }
-    Err(pyo3::exceptions::PyTypeError::new_err(
-        "pk must be int, uuid.UUID, UUID string, or bytes",
-    ))
+    extract_uuid_or_u128(pk).map(gnitz_core::PkTuple::from_u128_narrow)
 }
