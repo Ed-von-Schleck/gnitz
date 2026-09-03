@@ -504,6 +504,20 @@ def tick_emit_fault_server(seamed_server):
 
 
 @pytest.fixture
+def push_hold_target(dedicated_server):
+    """Connect target of a server whose FIRST client push is held between its
+    frame decode and its catalog read lock until a DDL changes the target's
+    schema version (GNITZ_INJECT_PUSH_HOLD_FOR_DDL), so a warm push is guaranteed
+    to reach the lock with a decode-time descriptor the catalog has already
+    replaced. That is the interleaving a queued `ALTER TABLE` writer produces in
+    production, since the catalog lock is writer-preferring. Ordering, not timing.
+
+    The target rather than a client: the race needs the push and the ALTER on two
+    connections."""
+    return dedicated_server({"GNITZ_INJECT_PUSH_HOLD_FOR_DDL": "1"}).target
+
+
+@pytest.fixture
 def relay_hold_server(seamed_server):
     """Server whose FIRST steady-state exchange relay is held until a DDL asks the
     tick loop to quiesce (GNITZ_INJECT_RELAY_HOLD_FOR_DDL), so that DDL is

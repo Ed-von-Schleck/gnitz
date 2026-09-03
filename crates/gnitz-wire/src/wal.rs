@@ -257,6 +257,26 @@ pub fn block_slice_at(data: &[u8], off: usize) -> Result<&[u8], WalError> {
     Ok(&data[off..off + size])
 }
 
+/// Verify a framed block's XXH3 body checksum on its own — the standalone form of
+/// the check [`validate_and_parse`] folds into a full parse, for a framed decoder
+/// that walks a run of blocks by header alone. A header-only block carries no
+/// checksum and passes.
+pub fn verify_body_checksum(block: &[u8]) -> Result<(), WalError> {
+    if block.len() < WAL_HEADER_SIZE {
+        return Err(WalError::Truncated);
+    }
+    let total_size = read_u32_le(block, WAL_OFF_SIZE) as usize;
+    if total_size > block.len() || total_size < WAL_HEADER_SIZE {
+        return Err(WalError::Truncated);
+    }
+    if total_size > WAL_HEADER_SIZE
+        && checksum(&block[WAL_HEADER_SIZE..total_size]) != read_u64_le(block, WAL_OFF_CHECKSUM)
+    {
+        return Err(WalError::ChecksumMismatch);
+    }
+    Ok(())
+}
+
 /// Validate a WAL block and extract its header + directory entries.
 ///
 /// On success: the returned [`WalBlockHeader`] carries the header fields, the

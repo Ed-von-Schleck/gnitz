@@ -268,12 +268,13 @@ def test_a_poll_of_a_stream_fed_view_does_not_drive_a_tick(client):
     delta poll answers "what has happened", so it takes no drain and a round the
     tick loop has not run yet is a round the next poll will carry.
 
-    Observable because a drain is *synchronous*: it skips the coalesce window and
-    the caller waits for the tick. So a poll issued microseconds after a push ACK
-    either already carries that push (it drained) or does not (it did not) —
-    against a 20 ms coalesce deadline the second is what a correct server does
-    every time. Several trials, requiring only that one poll came back empty, so
-    an unlucky scheduling hiccup cannot fail a correct server.
+    Observable because a drain is *synchronous*: the caller waits for the tick.
+    So a poll issued microseconds after a push ACK either already carries that
+    push (it drained) or does not (it did not) — and this push is far below the
+    row threshold that makes the committer trigger a tick of its own, so the
+    second is what a correct server does every time. Several trials, requiring
+    only that one poll came back empty, so an unlucky scheduling hiccup cannot
+    fail a correct server.
     """
     sn = "s" + _uid()
     client.create_schema(sn)

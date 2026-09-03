@@ -770,6 +770,10 @@ async fn commit_pushes(
         // the fsync CQE so DAG evaluation overlaps with fdatasync. We
         // bump tick_rows on writes that succeeded at the worker level —
         // the LSN publish is deferred but tick batching can proceed.
+        //
+        // CONTRACT for `read_is_fresh`: this mark must precede the Phase-D
+        // `publish`, or a tick whose snapshot already reached that LSN can miss
+        // the tid and the freshness test serves the view without its delta.
         {
             let mut tr = shared.tick_rows.borrow_mut();
             for g in &groups {

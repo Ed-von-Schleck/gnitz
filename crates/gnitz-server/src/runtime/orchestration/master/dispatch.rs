@@ -39,13 +39,10 @@ fn confined_worker(disp: &MasterDispatcher, target_id: i64, spec: SpecBytes<'_>)
 /// directly, so on every live path the ceiling is unhit.
 const W2M_SYNC_WAIT_MS: i32 = 10;
 
-/// `GNITZ_INJECT_RELAY_SPACE_LOW` / `GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW`:
-/// report SAL relay space as low — for the steady-state relay until the next
-/// checkpoint bumps the epoch, for the backfill on every non-stop round. Lets
-/// tests drive the SAL reclamation protocol (worker re-epoch, master
-/// `checkpoint_reset`, epoch advancing) over a small table that would never
-/// approach the 1 GiB mmap.
-static RELAY_SPACE_LOW: Seam = Seam::new("GNITZ_INJECT_RELAY_SPACE_LOW");
+/// `GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW`: report SAL relay space as low for the
+/// backfill on every non-stop round, so tests drive the reclamation protocol over
+/// a small table. The steady-state relay's equivalent is `executor`'s own
+/// `RELAY_SPACE_LOW`, beside the loop it perturbs.
 static BACKFILL_RELAY_SPACE_LOW: Seam = Seam::new("GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW");
 
 /// `GNITZ_INJECT_TICK_EMIT_ERROR=<table>`: fail the named table's next tick
@@ -298,7 +295,7 @@ impl MasterDispatcher {
                         let decision = if all_pad {
                             BACKFILL_DECISION_STOP
                         } else if checkpoint_allowed
-                            && (self.relay_fit_raw(prep.footprint) != SalFit::Fits || BACKFILL_RELAY_SPACE_LOW.armed())
+                            && (self.relay_fit(prep.footprint) != SalFit::Fits || BACKFILL_RELAY_SPACE_LOW.armed())
                         {
                             pending_reset = true;
                             BACKFILL_DECISION_CHECKPOINT
@@ -434,15 +431,11 @@ impl MasterDispatcher {
     // Exchange relay
     // -----------------------------------------------------------------------
 
-    fn seam_armed_epoch() -> &'static std::sync::atomic::AtomicU32 {
-        static ARMED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
-        &ARMED
-    }
-
-    /// [`SalWriter::fit_relay`], ignoring the `relay_loop` test seam — what the
-    /// boot backfill relay and the watchdog's reclaim timer need: the seam would
-    /// spuriously fail an in-progress backfill.
-    pub(crate) fn relay_fit_raw(&self, need: usize) -> SalFit {
+    /// Can a relay of `need` bytes be written, and if not, is a checkpoint enough
+    /// to make room? Every SAL-space decision — `relay_loop`'s, the committer's
+    /// checkpoint test, the watchdog's reclaim timer, the boot backfill — reads
+    /// this one predicate.
+    pub(crate) fn relay_fit(&self, need: usize) -> SalFit {
         self.sal.fit_relay(need)
     }
 
@@ -478,36 +471,6 @@ impl MasterDispatcher {
                 let slots: Vec<wire::WireData> = batches.iter().map(|b| wire::WireData::Whole(Some(b))).collect();
                 f(&group(GroupData::PerWorker(&slots)))
             }
-        }
-    }
-
-    /// [`Self::relay_fit_raw`] with the `relay_loop` test seam folded in: while
-    /// the seam is armed at the live SAL epoch, a relay that would fit reports
-    /// [`SalFit::Transient`] instead, so a checkpoint runs and its epoch bump
-    /// disarms it. Checked *before* consuming a relay, so low space is resolved
-    /// rather than silently discarding the relay and deadlocking blocked workers.
-    pub(crate) fn relay_fit(&self, need: usize) -> SalFit {
-        let fit = self.relay_fit_raw(need);
-        if fit == SalFit::Fits
-            && RELAY_SPACE_LOW.armed()
-            && Self::seam_armed_epoch().load(std::sync::atomic::Ordering::Relaxed) == self.sal.epoch()
-        {
-            return SalFit::Transient;
-        }
-        fit
-    }
-
-    /// Arm the `relay_loop` space seam at the live SAL epoch, once per process.
-    /// Called by `relay_loop` before its own space check, so [`Self::relay_fit`]
-    /// stays a predicate rather than a predicate with a side effect.
-    pub(crate) fn arm_relay_space_seam(&self) {
-        if RELAY_SPACE_LOW.armed() {
-            let _ = Self::seam_armed_epoch().compare_exchange(
-                u32::MAX,
-                self.sal.epoch(),
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            );
         }
     }
 
@@ -917,6 +880,10 @@ impl MasterDispatcher {
     /// across all broadcasts of a DDL so recovery can group them as an atomic
     /// zone. The writer marks the first one it admits as the zone's start, which
     /// is what gives the zone a byte span recovery can attribute damage to.
+    ///
+    /// Signals nobody: the caller writes inside a `defer_publication` scope, so
+    /// nothing here is visible until that scope drops. The zone's one wake is
+    /// [`Self::commit_zone`]'s, after it does.
     pub fn broadcast_ddl(&self, target_id: i64, batch: &Batch, lsn: u64) -> Result<(), WorkerFault> {
         let relation = self.wire_schema(target_id);
         self.write_group(&DirectGroup {
@@ -926,7 +893,6 @@ impl MasterDispatcher {
             zoned: true,
             ..DirectGroup::new(SalMessageKind::DdlSync)
         })?;
-        self.signal_all();
         gnitz_debug!("broadcast_ddl tid={} rows={} lsn={}", target_id, batch.len(), lsn);
         Ok(())
     }

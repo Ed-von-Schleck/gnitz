@@ -422,6 +422,58 @@ def test_add_column_concurrent_with_inserts_and_scans(client, server):
         client.drop_schema(sn)
 
 
+def test_a_warm_push_racing_an_alter_is_refused(push_hold_target):
+    """A warm push decodes its batch against the catalog's descriptor BEFORE it
+    takes the catalog read lock, and the lock is writer-preferring — so an
+    `ALTER TABLE ADD COLUMN` queued in between is applied while the push is
+    parked, and the descriptor the push decoded against is stale by the time it
+    resumes. The push must be refused, not committed: its batch is laid out for
+    the old width, and the commit path would re-frame it against the new one.
+
+    The seam makes that interleaving certain: the first push holds, holding no
+    lock, until a DDL has moved the target's schema version.
+    """
+    with gnitz.connect(push_hold_target) as client:
+        sn = "race" + _uid()
+        client.create_schema(sn)
+        cols = [
+            gnitz.ColumnDef("id", gnitz.TypeCode.U64, primary_key=True),
+            gnitz.ColumnDef("a", gnitz.TypeCode.I64),
+        ]
+        tid = client.create_table(sn, "t", cols)
+        schema = gnitz.Schema(cols)
+
+        outcome = {}
+        pushed = threading.Event()
+
+        def pusher():
+            with gnitz.connect(push_hold_target) as conn:
+                # Warm this connection's schema cache at the pre-ALTER version, so
+                # the push below ships no schema block and takes the warm path.
+                conn.scan(tid)
+                batch = gnitz.ZSetBatch(schema)
+                batch.append(id=1, a=7)
+                pushed.set()
+                try:
+                    outcome["lsn"] = conn.push(tid, batch)
+                except Exception as e:  # noqa: BLE001 — the outcome under test
+                    outcome["err"] = e
+
+        th = threading.Thread(target=pusher)
+        th.start()
+        try:
+            assert pushed.wait(30), "the pusher thread never reached its push"
+            client.execute_sql("ALTER TABLE t ADD COLUMN c BIGINT", schema_name=sn)
+        finally:
+            th.join(timeout=60)
+        assert not th.is_alive(), "the held push never returned"
+
+        assert "err" in outcome, f"the racing push committed at LSN {outcome.get('lsn')}"
+        # Nothing was written: the pre-ALTER-shaped batch never reached a store.
+        assert list(client.scan(tid)) == []
+        client.drop_schema(sn)
+
+
 # ── Durability ──────────────────────────────────────────────────────────────
 
 

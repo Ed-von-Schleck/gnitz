@@ -201,6 +201,16 @@ fn decode_prologue(data: &[u8], ctx: &'static str, min_item_bytes: usize) -> Res
     Ok((count, off))
 }
 
+/// Walk to the block at `off`, verifying its body checksum — here at the frame
+/// walk, not in the caller's later decode, which runs under the server's catalog
+/// lock. Every block a client frame carries is written checksummed
+/// ([`WalBlock::write`]).
+fn checked_block_at<'a>(data: &'a [u8], off: usize, ctx: &str, what: &str) -> Result<&'a [u8], String> {
+    let block = wal::block_slice_at(data, off).map_err(|e| format!("{ctx}: {what}: {e}"))?;
+    wal::verify_body_checksum(block).map_err(|e| format!("{ctx}: {what}: {e}"))?;
+    Ok(block)
+}
+
 /// Decode a `FLAG_DDL_TXN` frame into its per-family `(table_id, wal-block
 /// slice)` list, in send order. Walks the concatenated blocks by header alone —
 /// `table_id` at `WAL_OFF_TID`, total size at `WAL_OFF_SIZE` — so the caller
@@ -211,7 +221,7 @@ pub fn decode_ddl_txn(data: &[u8]) -> Result<Vec<(u32, &[u8])>, String> {
     let (count, mut off) = decode_prologue(data, CTX, WAL_HEADER_SIZE)?;
     let mut families = Vec::with_capacity(count);
     for _ in 0..count {
-        let block = wal::block_slice_at(data, off).map_err(|e| format!("{CTX}: family block: {e}"))?;
+        let block = checked_block_at(data, off, CTX, "family block")?;
         families.push((read_u32_le(block, WAL_OFF_TID), block));
         off += block.len();
     }
@@ -252,9 +262,9 @@ pub fn decode_push_txn(data: &[u8]) -> Result<DecodedPushTxn<'_>, String> {
         }
         let mode = data[off];
         off += 1;
-        let schema_block = wal::block_slice_at(data, off).map_err(|e| format!("{CTX}: schema block: {e}"))?;
+        let schema_block = checked_block_at(data, off, CTX, "schema block")?;
         off += schema_block.len();
-        let wal_block = wal::block_slice_at(data, off).map_err(|e| format!("{CTX}: data block: {e}"))?;
+        let wal_block = checked_block_at(data, off, CTX, "data block")?;
         off += wal_block.len();
         families.push(TxnFamily {
             tid: read_u32_le(wal_block, WAL_OFF_TID),

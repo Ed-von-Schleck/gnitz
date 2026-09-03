@@ -699,9 +699,9 @@ impl RelationRegistry {
     /// True iff at least one registered view carries a delta feed. The master's
     /// idle-poll bookkeeping — the forward-closure walk and the last-round map —
     /// is skipped outright when this is false, which is every server that does not
-    /// use the feature. A walk rather than a maintained counter: `.any()`
-    /// short-circuits, so the full walk runs only when no feed exists, once per
-    /// emitted tick group, beside a SAL write and an eventfd.
+    /// use the feature. A walk rather than a maintained counter: no-feed is the
+    /// default, so the full `O(|relations|)` walk is the steady state — priced
+    /// once per emitted tick group, beside a SAL write and an eventfd.
     pub fn any_delta_feed(&self) -> bool {
         self.tables.values().any(|e| e.budgets.delta_bytes.is_some())
     }

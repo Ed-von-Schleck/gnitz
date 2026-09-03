@@ -28,7 +28,7 @@ fn scan_spec_at_a_system_tid_is_rejected_and_the_connection_survives() {
     let ClientError::ServerError(msg) = &err else {
         panic!("expected a STATUS_ERROR reply, got {err:?}");
     };
-    assert!(msg.contains("not a user relation"), "{msg}");
+    assert!(msg.contains("system catalog family"), "{msg}");
 
     // The error frame is non-continuation, so the connection is still usable for
     // a full round trip.

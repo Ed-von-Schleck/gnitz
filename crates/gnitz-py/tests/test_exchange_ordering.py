@@ -14,7 +14,7 @@ def _scan_positive(client, tid):
 
 def test_multi_source_join_tick_consistency(client):
     """A view joining two tables must correctly route exchange relays when
-    both sources are pushed in the same tick window."""
+    both sources are pushed before the tick that carries them."""
     sn = "exo_ms_" + _uid()
     client.create_schema(sn)
     try:

@@ -350,7 +350,7 @@ def test_error_paths(client):
             client.scan_many([t, t])
         _healthy()
 
-        # System tid (rejected server-side: not a user relation).
+        # System tid (rejected server-side: a fan-out read has no form for one).
         with pytest.raises(gnitz.GnitzError):
             client.scan_many([gnitz.TABLE_TAB])
         _healthy()
