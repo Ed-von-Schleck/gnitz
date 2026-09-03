@@ -2,10 +2,11 @@
 //! and the scan/reindex/range-key circuit queries the DAG consults at runtime.
 
 use super::*;
+use gnitz_store::storage::{payload_bytes, payload_is_null, payload_u64};
 use gnitz_wire::{
-    CIRCEDGES_COL_DST_NODE, CIRCEDGES_COL_DST_PORT, CIRCEDGES_COL_SRC_NODE, CIRCNCOL_COL_KIND, CIRCNCOL_COL_NODE_ID,
-    CIRCNCOL_COL_POSITION, CIRCNCOL_COL_VALUE1, CIRCNCOL_COL_VALUE2, CIRCNODES_COL_EXPR_PROGRAM, CIRCNODES_COL_NODE_ID,
-    CIRCNODES_COL_OPCODE, CIRCNODES_COL_SOURCE_TABLE,
+    CIRCEDGES_PAY_DST_NODE, CIRCEDGES_PAY_DST_PORT, CIRCEDGES_PAY_SRC_NODE, CIRCNCOL_PAY_KIND, CIRCNCOL_PAY_NODE_ID,
+    CIRCNCOL_PAY_POSITION, CIRCNCOL_PAY_VALUE1, CIRCNCOL_PAY_VALUE2, CIRCNODES_PAY_EXPR_PROGRAM, CIRCNODES_PAY_NODE_ID,
+    CIRCNODES_PAY_OPCODE, CIRCNODES_PAY_SOURCE_TABLE,
 };
 
 // ---------------------------------------------------------------------------
@@ -21,12 +22,13 @@ pub(in crate::query) fn for_each_scan_edge(host: &dyn SchemaSource, mut f: impl 
     };
     // No prefix — every view's nodes, in view_id order.
     cur.for_each_positive_with_prefix(&[], |ch| {
-        if ch.read_i64(CIRCNODES_COL_OPCODE) != gnitz_wire::OPCODE_SCAN_DELTA as i64
-            || ch.col_is_null(CIRCNODES_COL_SOURCE_TABLE)
+        let (src, row) = ch.current_row_source();
+        if payload_u64(src, row, CIRCNODES_PAY_OPCODE) != gnitz_wire::OPCODE_SCAN_DELTA
+            || payload_is_null(src, row, CIRCNODES_PAY_SOURCE_TABLE)
         {
             return;
         }
-        let source = ch.read_i64(CIRCNODES_COL_SOURCE_TABLE);
+        let source = payload_u64(src, row, CIRCNODES_PAY_SOURCE_TABLE) as i64;
         if source <= 0 {
             return;
         }
@@ -73,35 +75,36 @@ pub(super) fn load_circuit(host: &dyn SchemaSource, view_id: u64) -> Result<Load
     // Phase 1: read CircuitNodeColumns, gathered per node. `decode_op_node`
     // orders them by `position` within a kind.
     let mut cols_by_node: HashMap<i32, Vec<gnitz_wire::CircuitNodeColumn>> = HashMap::new();
-    node_cols_cur.for_each_positive_with_prefix(&prefix, |ch| match node_id_i32(ch.read_i64(CIRCNCOL_COL_NODE_ID)) {
-        Some(nid) => cols_by_node
-            .entry(nid)
-            .or_default()
-            .push(gnitz_wire::CircuitNodeColumn {
-                kind: ch.read_i64(CIRCNCOL_COL_KIND) as u64,
-                position: ch.read_i64(CIRCNCOL_COL_POSITION) as u16,
-                value1: ch.read_i64(CIRCNCOL_COL_VALUE1) as u64,
-                value2: ch.read_i64(CIRCNCOL_COL_VALUE2) as u64,
-            }),
-        None => drop(invalid.get_or_insert("circuit node id out of range")),
+    node_cols_cur.for_each_positive_with_prefix(&prefix, |ch| {
+        let (src, row) = ch.current_row_source();
+        match node_id_i32(payload_u64(src, row, CIRCNCOL_PAY_NODE_ID) as i64) {
+            Some(nid) => cols_by_node
+                .entry(nid)
+                .or_default()
+                .push(gnitz_wire::CircuitNodeColumn {
+                    kind: payload_u64(src, row, CIRCNCOL_PAY_KIND),
+                    position: payload_u64(src, row, CIRCNCOL_PAY_POSITION) as u16,
+                    value1: payload_u64(src, row, CIRCNCOL_PAY_VALUE1),
+                    value2: payload_u64(src, row, CIRCNCOL_PAY_VALUE2),
+                }),
+            None => drop(invalid.get_or_insert("circuit node id out of range")),
+        }
     });
     // Phase 2: read CircuitNodes; call decode_op_node for each.
     nodes_cur.for_each_positive_with_prefix(&prefix, |ch| {
-        let Some(node_id) = node_id_i32(ch.read_i64(CIRCNODES_COL_NODE_ID)) else {
+        let (src, row) = ch.current_row_source();
+        let Some(node_id) = node_id_i32(payload_u64(src, row, CIRCNODES_PAY_NODE_ID) as i64) else {
             invalid.get_or_insert("circuit node id out of range");
             return;
         };
-        let opcode = ch.read_i64(CIRCNODES_COL_OPCODE) as u64;
+        let opcode = payload_u64(src, row, CIRCNODES_PAY_OPCODE);
 
-        let src_tab: Option<u64> = if ch.col_is_null(CIRCNODES_COL_SOURCE_TABLE) {
-            None
-        } else {
-            Some(ch.read_i64(CIRCNODES_COL_SOURCE_TABLE) as u64)
-        };
+        let src_tab: Option<u64> = (!payload_is_null(src, row, CIRCNODES_PAY_SOURCE_TABLE))
+            .then(|| payload_u64(src, row, CIRCNODES_PAY_SOURCE_TABLE));
         // `None` is a NULL cell only. An empty cell is a damaged blob, and each
         // opcode already judges one: Filter rejects, a ScanDelta bound degrades.
-        let expr_blob: Option<Vec<u8>> =
-            (!ch.col_is_null(CIRCNODES_COL_EXPR_PROGRAM)).then(|| ch.read_german_bytes(CIRCNODES_COL_EXPR_PROGRAM));
+        let expr_blob: Option<Vec<u8>> = (!payload_is_null(src, row, CIRCNODES_PAY_EXPR_PROGRAM))
+            .then(|| payload_bytes(src, row, CIRCNODES_PAY_EXPR_PROGRAM).to_vec());
 
         let cols = cols_by_node.get(&node_id).map(|v| v.as_slice()).unwrap_or(&[]);
         match gnitz_wire::decode_op_node(opcode, src_tab, expr_blob, cols) {
@@ -114,11 +117,12 @@ pub(super) fn load_circuit(host: &dyn SchemaSource, view_id: u64) -> Result<Load
 
     // Phase 3: read CircuitEdges. A truncating endpoint id aborts the load.
     edges_cur.for_each_positive_with_prefix(&prefix, |ch| {
+        let (row_src, row) = ch.current_row_source();
         match (
-            node_id_i32(ch.read_i64(CIRCEDGES_COL_SRC_NODE)),
-            node_id_i32(ch.read_i64(CIRCEDGES_COL_DST_NODE)),
+            node_id_i32(payload_u64(row_src, row, CIRCEDGES_PAY_SRC_NODE) as i64),
+            node_id_i32(payload_u64(row_src, row, CIRCEDGES_PAY_DST_NODE) as i64),
         ) {
-            (Some(src), Some(dst)) => edges.push((src, dst, ch.read_i64(CIRCEDGES_COL_DST_PORT) as i32)),
+            (Some(src), Some(dst)) => edges.push((src, dst, payload_u64(row_src, row, CIRCEDGES_PAY_DST_PORT) as i32)),
             _ => drop(invalid.get_or_insert("circuit edge endpoint id out of range")),
         }
     });

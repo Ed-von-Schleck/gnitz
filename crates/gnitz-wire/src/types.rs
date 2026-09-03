@@ -394,10 +394,10 @@ pub fn index_key_types(col_types: &[u8], src_pk_count: usize, src_pk_stride: usi
 
 /// Which rule a candidate primary key broke. Returned by
 /// [`validate_pk_indices`] / [`validate_pk_column_types`] instead of a formatted
-/// string so each layer can render its own message — the SQL planner names the
-/// offending column, the catalog quotes the type code, the client returns a
-/// `&'static str` — while the *rule set itself* stays in one place. `Display`
-/// gives the neutral wording for callers that need no decoration.
+/// string, so the *rule set* stays in one place while a layer that can say more
+/// than the rule knows renders its own message. Only the SQL planner does: it
+/// names the offending column by its SQL identifier. The client and the engine
+/// catalog both take `Display`'s neutral wording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkRule {
     /// No PK columns at all. Every base table has an enforced primary key.

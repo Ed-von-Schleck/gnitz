@@ -598,17 +598,36 @@ class _Contender:
         out = call()
         return out, self.count - before
 
+    def wins(self, call, n=200):
+        """`call()`'s last result, and whether this thread ran inside any of up to
+        `n` repeats of it — stopping at the first window it did.
+
+        Dropping the GIL only makes this thread *runnable*: the caller can retake
+        it before the OS ever schedules us, losing three windows in four with
+        every core busy. Retrying is the floor one window has not got. A call that
+        never drops the GIL loses every window whatever the load, so the control
+        needs only one.
+        """
+        out = None
+        for _ in range(n):
+            out, count = self.during(call)
+            if count:
+                return out, True
+        return out, False
+
 
 def test_a_mirror_call_releases_the_gil(client, mirror):
     """A mirror method that does work lets the rest of the interpreter run.
 
-    Two windows that work — one that talks to the server, one answered entirely
+    Two calls that work — one that talks to the server, one answered entirely
     off the copy — and one control that only reads memory. The control is what
     makes the other two mean anything: without it the test cannot tell a released
     GIL from ambient scheduling.
 
-    Each window holds one extension call and nothing else, so the control's count
-    is structural: no Python bytecode runs inside it to be preempted.
+    Every window holds one extension call and nothing else, so the control's zero
+    is structural — no Python bytecode runs inside it to be preempted — and one
+    window settles it. The other two are races against the OS scheduler rather
+    than structural, so they retry until won.
     """
     sn = "s" + _uid()
     _fed_view(client, sn, LINEAR)
@@ -620,10 +639,10 @@ def test_a_mirror_call_releases_the_gil(client, mirror):
 
         _churn(client, sn, 201, 400)
         client.execute_sql("SELECT COUNT(*) AS n FROM f", schema_name=sn)
-        polled, during_poll = spin.during(mirror.poll)
+        polled, poll_dropped_gil = spin.wins(mirror.poll)
 
         before = mirror.requests_sent
-        held, during_mirrored = spin.during(
+        held, read_dropped_gil = spin.wins(
             lambda: mirror.execute_sql("SELECT * FROM f", schema_name=sn)
         )
         assert mirror.requests_sent == before, "the mirrored read must be answered off the copy"
@@ -633,8 +652,8 @@ def test_a_mirror_call_releases_the_gil(client, mirror):
     assert polled, "the poll must have covered the registered view"
     assert _rows(held), "the mirrored read must return rows, or it proves nothing"
 
-    assert during_poll > 0, "a poll must drop the GIL across its delta read"
-    assert during_mirrored > 0, "a mirrored read must drop the GIL across the engine scan"
+    assert poll_dropped_gil, "a poll must drop the GIL across its delta read"
+    assert read_dropped_gil, "a mirrored read must drop the GIL across the engine scan"
     assert during_control == 0, (
         f"a metadata getter answers out of memory, so it must never drop the GIL; "
         f"got {during_control} increments"

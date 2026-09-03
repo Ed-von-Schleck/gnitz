@@ -10,7 +10,7 @@
 //! `ddl_tests` / `dir_deletion_tests`.
 
 use super::*;
-use gnitz_wire::{IDXTAB_COL_FLAGS, IDXTAB_COL_NAME, IDXTAB_COL_OWNER_ID, IDXTAB_COL_SOURCE_COLS};
+use gnitz_wire::IDXTAB_PAY_NAME;
 use std::path::Path;
 
 /// A one-row SCHEMA_TAB batch (the family's only payload column is the name).
@@ -35,16 +35,21 @@ struct IdxRow {
 
 fn live_index_row(engine: &CatalogEngine, idx_id: i64) -> IdxRow {
     let schema = SysFamily::Index.schema();
-    let mut c = engine.sys_store(SysFamily::Index).open_cursor();
-    assert!(
-        c.advance_to_exact_live(sys_opk(&schema, idx_id as u128).pk_bytes()),
-        "live IDX_TAB row for index {idx_id} missing"
-    );
+    let key = sys_opk(&schema, idx_id as u128);
+    let store = engine.sys_store(SysFamily::Index);
+    let sr = store
+        .live_row_at(key.pk_bytes())
+        .1
+        .unwrap_or_else(|| panic!("live IDX_TAB row for index {idx_id} missing"));
+    let (src, row) = sr.source();
+    // Through the production decoder, so the reproduced row is what the engine
+    // itself reads back; `name` is the one field it does not carry.
+    let (owner_id, source_cols, props) = read_idx_tab_row(src, row);
     IdxRow {
-        owner_id: cursor_read_u64(&c, IDXTAB_COL_OWNER_ID) as i64,
-        source_cols: cursor_read_u64(&c, IDXTAB_COL_SOURCE_COLS),
-        name: cursor_read_string(&c, IDXTAB_COL_NAME),
-        props: gnitz_wire::IndexProps::from_flags(cursor_read_u64(&c, IDXTAB_COL_FLAGS)),
+        owner_id,
+        source_cols,
+        name: payload_string(src, row, IDXTAB_PAY_NAME),
+        props,
     }
 }
 

@@ -72,7 +72,7 @@ pub use columnar::compare_rows;
 // which is what lets a catalog decoder read a `Batch`, a `StoredRow` and a
 // positioned `ReadCursor` through the same call.
 pub use columnar::compare_rows_except;
-pub use columnar::{payload_bytes, payload_string, payload_u64};
+pub use columnar::{payload_bytes, payload_is_null, payload_string, payload_u64};
 // The OPK key cluster is NOT re-exported here: `schema::key` owns it and every
 // caller names `crate::schema::key::X`. Re-exporting it split one byte-order
 // rule across two import paths, visibly — `ops/reduce/sort.rs` and

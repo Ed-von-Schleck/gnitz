@@ -375,7 +375,7 @@ impl ServerExecutor {
         };
 
         // Seed the zone-LSN allocator above every table's current_lsn so each
-        // new zone LSN is strictly greater, keeping `ingest_to_family`'s direct
+        // new zone LSN is strictly greater, keeping the `submit` path's direct
         // current_lsn assignment monotonic across restarts.
         let initial_lsn = dispatcher.cat().registry().max_table_current_lsn();
 

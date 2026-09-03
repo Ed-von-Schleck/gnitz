@@ -328,4 +328,49 @@ impl CatalogEngine {
         let batch = self.build_col_batch(owner_id, kind, col_defs, 1);
         self.submit(SysFamily::Column, batch)
     }
+
+    /// Ingest into any relation by raw id: a system family through
+    /// [`CatalogEngine::submit`], a user table through the registry's DML path.
+    /// Production emitters name the family and own their batch, so they call
+    /// `submit` and pay no clone.
+    pub(in crate::catalog) fn ingest_to_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
+        if table_id < FIRST_USER_TABLE_ID {
+            let family = SysFamily::from_id(table_id).ok_or_else(|| format!("Unknown system family {table_id}"))?;
+            self.submit(family, batch.clone())
+        } else {
+            self.registry
+                .ingest_returning_effective(table_id, batch.clone_batch(), false)
+                .map(drop)
+                .map_err(|e| format!("ingest failed for table_id={table_id}: {e}"))
+        }
+    }
+
+    /// Register a base table at a caller-chosen `tid` the way a worker does: the
+    /// COL_TAB and TABLE_TAB rows a DDL bundle carries, each through `ddl_sync`,
+    /// so the register hooks fire and the relation store is built. `pk` names PK
+    /// column indices into `cols`, in key order. The register hook raises the id
+    /// counter past `tid`, so a later engine-side allocation cannot collide.
+    pub(crate) fn register_table(
+        &mut self,
+        tid: i64,
+        schema_id: i64,
+        name: &str,
+        cols: &[ColumnDef],
+        pk: &[u32],
+    ) -> Result<(), String> {
+        let col_batch = self.build_col_batch(tid, OWNER_KIND_TABLE, cols, 1);
+        self.ddl_sync(SysFamily::Column.id(), col_batch)?;
+
+        let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+        push_table_tab_row(
+            &mut bb,
+            tid,
+            schema_id,
+            name,
+            gnitz_wire::pack_pk_cols(pk),
+            gnitz_wire::TableProps::default().pack(),
+            1,
+        );
+        self.ddl_sync(SysFamily::Table.id(), bb.finish())
+    }
 }

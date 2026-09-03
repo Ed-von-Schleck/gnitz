@@ -59,24 +59,6 @@ pub(in crate::catalog) fn index_dir(owner_dir: &str, idx_id: i64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Helper: read column data from cursor
-// ---------------------------------------------------------------------------
-
-/// Read a u64 from a cursor column. `logical_col` is the schema column index.
-/// `read_i64(col) as u64` is bit-for-bit `u64::from_le_bytes` of the same 8 bytes.
-pub(in crate::catalog) fn cursor_read_u64(cursor: &ReadCursor, logical_col: usize) -> u64 {
-    cursor.read_i64(logical_col) as u64
-}
-
-/// Read a German string from a cursor column. `logical_col` is the schema column index.
-/// Test-only: every production sys-row read goes through the `RowSource` decoders
-/// in `sys_tables`.
-#[cfg(test)]
-pub(in crate::catalog) fn cursor_read_string(cursor: &ReadCursor, logical_col: usize) -> String {
-    String::from_utf8(cursor.read_german_bytes(logical_col)).unwrap_or_default()
-}
-
-// ---------------------------------------------------------------------------
 // Copy/retract helpers
 // ---------------------------------------------------------------------------
 
@@ -100,11 +82,20 @@ pub(in crate::catalog) fn retract_key_range(
     batch
 }
 
-/// The OPK image of a native system-table PK. `pk` is the packed native value
-/// (`u128` covers every system family: a single U64 id, or a compound
-/// `(view_id, sub)` written `(vid << 64) | sub`).
+/// The OPK image of a **single-column** native system-table PK: a U64 id, or
+/// COL_TAB's packed `(owner_id, col_idx)` word. The two-column circuit key has
+/// its own [`circuit_opk`].
 pub(in crate::catalog) fn sys_opk(schema: &SchemaDescriptor, pk: u128) -> gnitz_store::schema::key::PkBuf {
-    gnitz_store::schema::key::opk_key(schema, &pk.to_le_bytes())
+    gnitz_store::schema::key::opk_key_cols(schema, &[pk])
+}
+
+/// The OPK image of a circuit family's compound PK `(view_id, sub)`.
+pub(in crate::catalog) fn circuit_opk(
+    schema: &SchemaDescriptor,
+    view_id: i64,
+    sub: u64,
+) -> gnitz_store::schema::key::PkBuf {
+    gnitz_store::schema::key::opk_key_cols(schema, &[view_id as u64 as u128, sub as u128])
 }
 
 /// Emit a weight=−1 batch of the live rows of `table` at `ids`; an id with no

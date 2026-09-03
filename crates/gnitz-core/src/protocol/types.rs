@@ -302,8 +302,7 @@ impl Schema {
                 columns.len()
             ));
         }
-        gnitz_wire::validate_pk_indices(pk_cols, columns.len()).map_err(|r| r.to_string())?;
-        gnitz_wire::validate_pk_column_types(pk_cols, |c| {
+        gnitz_wire::validate_pk_tuple(pk_cols, columns.len(), |c| {
             let cd = &columns[c as usize];
             (cd.type_code as u8, cd.is_nullable)
         })

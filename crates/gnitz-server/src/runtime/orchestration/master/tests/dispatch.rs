@@ -1,5 +1,5 @@
 use super::super::fixtures::test_dispatcher;
-use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID, SEQ_TAB_ID};
+use crate::catalog::{CatalogEngine, SysFamily, FIRST_USER_TABLE_ID};
 use gnitz_store::foundation::posix_io::retry_eintr;
 
 /// Fork a child that exits immediately and block until it is a zombie *without*
@@ -92,7 +92,7 @@ fn checkpoint_post_ack_flushes_a_memtable_only_sequence_advance() {
         // Reserve + ingest straight into the catalog — no SAL involved, so the
         // advance lands ONLY in the sys_sequences MemTable.
         let (_base, delta, _lsn) = engine.reserve_user_sequence(user_seq, 64);
-        engine.ingest_to_family(SEQ_TAB_ID, &delta).unwrap();
+        engine.submit(SysFamily::Sequence, delta).unwrap();
 
         let disp = test_dispatcher(Vec::new(), &mut engine);
         disp.checkpoint_post_ack().unwrap();

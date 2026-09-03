@@ -17,7 +17,7 @@ use std::cmp::Ordering;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::*;
-use gnitz_store::schema::make_index_schema;
+use gnitz_store::schema::{make_index_schema, MAX_COLUMNS};
 use gnitz_store::storage::{compare_rows, compare_rows_except};
 use gnitz_wire::{COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME};
 
@@ -50,6 +50,67 @@ fn reject_non_canonical(name: &str, noun: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The two rules a relation's column records must satisfy on their own, with no
+/// PK list in hand. This is the trust boundary where COL_TAB rows become a
+/// `SchemaDescriptor`: [`validate_pk_against_cols`] allow-lists the PK columns'
+/// type codes, and an unknown *payload* code is not inert either (see
+/// `gnitz_wire::is_valid_type_code`).
+pub(super) fn check_col_defs(col_defs: &[ColumnDef]) -> Result<(), String> {
+    // Reachable from a plain view as well as a wide CREATE TABLE: a compound-PK
+    // plain projection prepends the k source PK columns, so `SELECT *` over a wide
+    // compound-PK table can cross MAX_COLUMNS.
+    if col_defs.len() > MAX_COLUMNS {
+        return Err(format!("has {} columns (max {})", col_defs.len(), MAX_COLUMNS));
+    }
+    if let Some(cd) = col_defs.iter().find(|cd| !gnitz_wire::is_valid_type_code(cd.type_code)) {
+        return Err(format!("column '{}' has invalid type code {}", cd.name, cd.type_code));
+    }
+    Ok(())
+}
+
+/// `gnitz-wire`'s PK rule set, in wire's own wording. Also run by
+/// `build_schema_from_col_defs` over the pair it is about to construct from,
+/// which is what makes that builder total where `SchemaDescriptor::new_with_placement`
+/// would abort.
+pub(super) fn validate_pk_against_cols(col_defs: &[ColumnDef], pk_cols: &[u32]) -> Result<(), String> {
+    gnitz_wire::validate_pk_tuple(pk_cols, col_defs.len(), |c| {
+        let cd = &col_defs[c as usize];
+        (cd.type_code, cd.is_nullable)
+    })
+    .map(|_stride| ())
+    .map_err(|rule| rule.to_string())
+}
+
+/// One admissibility check for a relation's column records + PK list, run by the
+/// TABLE/VIEW precheck arms and again by both register hooks, for the paths that
+/// skip precheck (boot replay, worker `ddl_sync`).
+pub(super) fn validate_relation_defs(
+    kind: RelationKind,
+    id: i64,
+    name: &str,
+    col_defs: &[ColumnDef],
+    pk: &PkColList,
+) -> Result<(), String> {
+    let noun = kind.noun();
+    if col_defs.is_empty() {
+        return Err(format!(
+            "catalog invariant violated: {noun} '{name}' (id={id}) registered \
+             before its column records: the register hook reads them back \
+             through sys_columns storage, which held none for this id."
+        ));
+    }
+    check_col_defs(col_defs).map_err(|e| format!("{noun} '{name}' (id={id}) {e}"))?;
+    // `as_slice()` clamps, so the raw count is the only place an over-range one
+    // is still visible.
+    if !pk.is_well_formed() {
+        return Err(gnitz_wire::PkRule::TooManyColumns {
+            count: pk.decoded_count(),
+        }
+        .to_string());
+    }
+    validate_pk_against_cols(col_defs, pk.as_slice())
 }
 
 /// How a guard message names one row of `family`. A COL_TAB PK packs
@@ -660,7 +721,7 @@ impl CatalogEngine {
     /// already holds, and agree with it on identity and kind. A row on a phantom
     /// owner is **unretractable** — the only COL_TAB retractor is the owner's own
     /// drop cascade, which returns early on an unregistered id — and
-    /// `apply_fk_constraints` builds a permanent `FkEdge` from its payload. The
+    /// `apply_fk_edges_and_locks` builds a permanent `FkEdge` from its payload. The
     /// kind clause matters on its own: that field alone decides a row declares an
     /// FK, so a view's columns claiming `OWNER_KIND_TABLE` plant an unvalidated edge.
     fn check_column_owners(&self, cols: &Batch, families: &[Option<Batch>; SysFamily::COUNT]) -> Result<(), String> {
@@ -764,7 +825,8 @@ impl CatalogEngine {
             self.check_column_contiguity(id)?;
             let col_defs = self.read_column_defs(id);
             let (sid, name, pk, kind) = if is_table {
-                let (sid, name, pk, kind, _placement) = read_table_tab_row(batch, i, id)?;
+                let (sid, name, pk, kind, _placement) =
+                    read_table_tab_row(batch, i).map_err(|e| format!("{e} (tid={id})"))?;
                 (sid, name, pk, kind)
             } else {
                 let (sid, name, pk, budgets, owner_view_id) = read_view_tab_row(batch, i);
@@ -778,7 +840,7 @@ impl CatalogEngine {
                 (sid, name, pk, RelationKind::View)
             };
             validate_relation_defs(kind, id, &name, &col_defs, &pk)?;
-            reject_unstorable_name(&name, family.row_noun())?;
+            reject_unstorable_name(&name, kind.noun())?;
 
             if is_table {
                 // A stream push must stay a pure append: SERIAL would draw from a
@@ -856,7 +918,8 @@ impl CatalogEngine {
         let mut claimed: FxHashSet<String> = FxHashSet::default();
         let noun = SysFamily::Index.row_noun();
         for i in (0..batch.len()).filter(|&i| batch.get_weight(i) > 0) {
-            let (owner_id, cols, props) = read_idx_tab_row(batch, i);
+            let (owner_id, packed_cols, props) = read_idx_tab_row(batch, i);
+            let cols = gnitz_wire::unpack_pk_cols(packed_cols);
             let index_name = payload_string(batch, i, IDXTAB_PAY_NAME);
             reject_unstorable_name(&index_name, noun)?;
             // Only `submit_local` — the FK auto-index, which bypasses this
@@ -896,7 +959,7 @@ impl CatalogEngine {
         drop_ids.sort_unstable();
 
         for i in (0..batch.len()).filter(|&i| batch.get_weight(i) < 0) {
-            let (owner_id, cols, props) = read_idx_tab_row(batch, i);
+            let (owner_id, packed_cols, props) = read_idx_tab_row(batch, i);
             // An internal index backs the FK RESTRICT seek; dropping one would
             // silently disarm FK enforcement. Keyed on the raw `-1` rows, not on
             // net-dead: a rewrite pair must not slip past it.
@@ -906,6 +969,7 @@ impl CatalogEngine {
             // FK backing is single-column: a composite index never satisfies a
             // single-column FK/uniqueness requirement, so dropping one is never
             // blocked by the FK-target guard.
+            let cols = gnitz_wire::unpack_pk_cols(packed_cols);
             if cols.as_slice().len() != 1 {
                 continue;
             }

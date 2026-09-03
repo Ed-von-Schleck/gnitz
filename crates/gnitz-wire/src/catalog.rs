@@ -232,15 +232,15 @@ pub const CIRCUIT_NODE_COLUMNS_COLS: &[WireSysCol] = &[
 // catalog batches and must agree on every position, so they are stated once,
 // here, rather than derived again in each crate.
 //
-// `*_COL_*` index a full schema (`ZSetBatch::columns[..]` / a cursor read, PK
-// included); `*_PAY_*` index the payload region only.
+// `*_PAY_*` index the payload region — the space every engine-side read uses.
+// `*_COL_*` index a full schema, PK slot included: the shape of the client's
+// `ZSetBatch::columns[..]`, and nothing else reads it.
 
 pub const SCHEMATAB_COL_NAME: usize = col_index_in(SCHEMA_TAB_COLS, "name");
 pub const SCHEMATAB_PAY_NAME: usize = pay_index_in(SCHEMA_TAB_COLS, "name");
 
 pub const TABTAB_COL_SCHEMA_ID: usize = col_index_in(TABLE_TAB_COLS, "schema_id");
 pub const TABTAB_COL_NAME: usize = col_index_in(TABLE_TAB_COLS, "name");
-pub const TABTAB_COL_PK_COL_IDX: usize = col_index_in(TABLE_TAB_COLS, "pk_col_idx");
 pub const TABTAB_COL_FLAGS: usize = col_index_in(TABLE_TAB_COLS, "flags");
 pub const TABTAB_PAY_SCHEMA_ID: usize = pay_index_in(TABLE_TAB_COLS, "schema_id");
 pub const TABTAB_PAY_NAME: usize = pay_index_in(TABLE_TAB_COLS, "name");
@@ -249,9 +249,6 @@ pub const TABTAB_PAY_FLAGS: usize = pay_index_in(TABLE_TAB_COLS, "flags");
 
 pub const VIEWTAB_COL_SCHEMA_ID: usize = col_index_in(VIEW_TAB_COLS, "schema_id");
 pub const VIEWTAB_COL_NAME: usize = col_index_in(VIEW_TAB_COLS, "name");
-pub const VIEWTAB_COL_PK_COL_IDX: usize = col_index_in(VIEW_TAB_COLS, "pk_col_idx");
-pub const VIEWTAB_COL_CAPACITY: usize = col_index_in(VIEW_TAB_COLS, "capacity_bytes");
-pub const VIEWTAB_COL_DELTA: usize = col_index_in(VIEW_TAB_COLS, "delta_bytes");
 pub const VIEWTAB_PAY_SCHEMA_ID: usize = pay_index_in(VIEW_TAB_COLS, "schema_id");
 pub const VIEWTAB_PAY_NAME: usize = pay_index_in(VIEW_TAB_COLS, "name");
 pub const VIEWTAB_PAY_PK_COL_IDX: usize = pay_index_in(VIEW_TAB_COLS, "pk_col_idx");
@@ -263,16 +260,16 @@ pub const VIEWTAB_PAY_OWNER_VIEW_ID: usize = pay_index_in(VIEW_TAB_COLS, "owner_
 /// One code path decodes TABLE_TAB and VIEW_TAB on both sides — the engine's
 /// `apply_entity_caches`, the client's `schema_members` — reading
 /// either family through the `TABTAB_*` positions. That needs the two to agree
-/// on where `(schema_id, name)` sits.
+/// on where `(schema_id, name)` sits, in *both* index spaces: the client reads
+/// the `*_COL_*` pair, the engine the `*_PAY_*` one, and the catalog's
+/// `pair_change_mask` returns `1 << TABTAB_PAY_NAME` for both families.
 const _: () = {
     assert!(TABTAB_COL_SCHEMA_ID == VIEWTAB_COL_SCHEMA_ID);
     assert!(TABTAB_COL_NAME == VIEWTAB_COL_NAME);
+    assert!(TABTAB_PAY_SCHEMA_ID == VIEWTAB_PAY_SCHEMA_ID);
+    assert!(TABTAB_PAY_NAME == VIEWTAB_PAY_NAME);
 };
 
-pub const COLTAB_COL_OWNER_ID: usize = col_index_in(COL_TAB_COLS, "owner_id");
-pub const COLTAB_COL_OWNER_KIND: usize = col_index_in(COL_TAB_COLS, "owner_kind");
-pub const COLTAB_COL_COL_IDX: usize = col_index_in(COL_TAB_COLS, "col_idx");
-pub const COLTAB_COL_NAME: usize = col_index_in(COL_TAB_COLS, "name");
 pub const COLTAB_PAY_OWNER_ID: usize = pay_index_in(COL_TAB_COLS, "owner_id");
 pub const COLTAB_PAY_OWNER_KIND: usize = pay_index_in(COL_TAB_COLS, "owner_kind");
 pub const COLTAB_PAY_COL_IDX: usize = pay_index_in(COL_TAB_COLS, "col_idx");
@@ -284,43 +281,28 @@ pub const COLTAB_PAY_FK_COL_IDX: usize = pay_index_in(COL_TAB_COLS, "fk_col_idx"
 pub const COLTAB_PAY_IS_NULLABLE: usize = pay_index_in(COL_TAB_COLS, "is_nullable");
 pub const COLTAB_PAY_IS_HIDDEN: usize = pay_index_in(COL_TAB_COLS, "is_hidden");
 
-pub const CIRCNODES_COL_NODE_ID: usize = col_index_in(CIRCUIT_NODES_COLS, "node_id");
-pub const CIRCNODES_COL_OPCODE: usize = col_index_in(CIRCUIT_NODES_COLS, "opcode");
-pub const CIRCNODES_COL_SOURCE_TABLE: usize = col_index_in(CIRCUIT_NODES_COLS, "source_table");
-pub const CIRCNODES_COL_EXPR_PROGRAM: usize = col_index_in(CIRCUIT_NODES_COLS, "expr_program");
 pub const CIRCNODES_PAY_NODE_ID: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "node_id", CIRCUIT_FAMILY_PK);
 pub const CIRCNODES_PAY_OPCODE: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "opcode", CIRCUIT_FAMILY_PK);
 pub const CIRCNODES_PAY_SOURCE_TABLE: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "source_table", CIRCUIT_FAMILY_PK);
 pub const CIRCNODES_PAY_EXPR_PROGRAM: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "expr_program", CIRCUIT_FAMILY_PK);
 
-pub const CIRCEDGES_COL_DST_NODE: usize = col_index_in(CIRCUIT_EDGES_COLS, "dst_node");
-pub const CIRCEDGES_COL_DST_PORT: usize = col_index_in(CIRCUIT_EDGES_COLS, "dst_port");
-pub const CIRCEDGES_COL_SRC_NODE: usize = col_index_in(CIRCUIT_EDGES_COLS, "src_node");
 pub const CIRCEDGES_PAY_DST_NODE: usize = pay_index_in_keyed(CIRCUIT_EDGES_COLS, "dst_node", CIRCUIT_FAMILY_PK);
 pub const CIRCEDGES_PAY_DST_PORT: usize = pay_index_in_keyed(CIRCUIT_EDGES_COLS, "dst_port", CIRCUIT_FAMILY_PK);
 pub const CIRCEDGES_PAY_SRC_NODE: usize = pay_index_in_keyed(CIRCUIT_EDGES_COLS, "src_node", CIRCUIT_FAMILY_PK);
 
-pub const CIRCNCOL_COL_NODE_ID: usize = col_index_in(CIRCUIT_NODE_COLUMNS_COLS, "node_id");
-pub const CIRCNCOL_COL_KIND: usize = col_index_in(CIRCUIT_NODE_COLUMNS_COLS, "kind");
-pub const CIRCNCOL_COL_POSITION: usize = col_index_in(CIRCUIT_NODE_COLUMNS_COLS, "position");
-pub const CIRCNCOL_COL_VALUE1: usize = col_index_in(CIRCUIT_NODE_COLUMNS_COLS, "value1");
-pub const CIRCNCOL_COL_VALUE2: usize = col_index_in(CIRCUIT_NODE_COLUMNS_COLS, "value2");
 pub const CIRCNCOL_PAY_NODE_ID: usize = pay_index_in_keyed(CIRCUIT_NODE_COLUMNS_COLS, "node_id", CIRCUIT_FAMILY_PK);
 pub const CIRCNCOL_PAY_KIND: usize = pay_index_in_keyed(CIRCUIT_NODE_COLUMNS_COLS, "kind", CIRCUIT_FAMILY_PK);
 pub const CIRCNCOL_PAY_POSITION: usize = pay_index_in_keyed(CIRCUIT_NODE_COLUMNS_COLS, "position", CIRCUIT_FAMILY_PK);
 pub const CIRCNCOL_PAY_VALUE1: usize = pay_index_in_keyed(CIRCUIT_NODE_COLUMNS_COLS, "value1", CIRCUIT_FAMILY_PK);
 pub const CIRCNCOL_PAY_VALUE2: usize = pay_index_in_keyed(CIRCUIT_NODE_COLUMNS_COLS, "value2", CIRCUIT_FAMILY_PK);
 
-pub const IDXTAB_COL_OWNER_ID: usize = col_index_in(IDX_TAB_COLS, "owner_id");
 pub const IDXTAB_COL_SOURCE_COLS: usize = col_index_in(IDX_TAB_COLS, "source_col_idx");
 pub const IDXTAB_COL_NAME: usize = col_index_in(IDX_TAB_COLS, "name");
-pub const IDXTAB_COL_FLAGS: usize = col_index_in(IDX_TAB_COLS, "flags");
 pub const IDXTAB_PAY_OWNER_ID: usize = pay_index_in(IDX_TAB_COLS, "owner_id");
 pub const IDXTAB_PAY_SOURCE_COLS: usize = pay_index_in(IDX_TAB_COLS, "source_col_idx");
 pub const IDXTAB_PAY_NAME: usize = pay_index_in(IDX_TAB_COLS, "name");
 pub const IDXTAB_PAY_FLAGS: usize = pay_index_in(IDX_TAB_COLS, "flags");
 
-pub const SEQTAB_COL_VALUE: usize = col_index_in(SEQ_TAB_COLS, "next_val");
 pub const SEQTAB_PAY_VALUE: usize = pay_index_in(SEQ_TAB_COLS, "next_val");
 
 // ---------------------------------------------------------------------------
@@ -756,7 +738,7 @@ impl PkColList {
     /// Always in bounds: indexes at most the `PK_LIST_MAX_COLS`-element
     /// backing array even when the decoded count is out of range. A crafted
     /// over-range wire count must NOT panic here — it has to survive long
-    /// enough to reach `validate_pk_cols` and be returned as `Err`.
+    /// enough to reach the catalog's `validate_relation_defs` and be returned as `Err`.
     pub fn as_slice(&self) -> &[u32] {
         &self.cols[..self.len.min(PK_LIST_MAX_COLS)]
     }
@@ -916,13 +898,15 @@ impl PkKeyVals {
 // `k` is byte-aligned so the boolean flag bits stay free for future flags
 // without colliding with it. `replicated` and a non-default `k` are mutually
 // exclusive (a CLUSTER BY prefix is meaningless when every worker holds the
-// full copy); the packing cannot represent that constraint, so DDL validation
-// must enforce it.
+// full copy); the packing cannot represent that constraint, so
+// [`TableProps::validate`] carries it instead, and every layer that builds a
+// `TableProps` calls it.
 // ---------------------------------------------------------------------------
 
 /// Bit 0: the table is **replicated** — every worker holds an identical full
 /// copy (writes broadcast, reads single-source). Mutually exclusive with a
-/// non-default `dist_prefix_len` (enforced at DDL, not by this packing).
+/// non-default `dist_prefix_len` — see [`TableProps::validate`], since this
+/// packing cannot represent the constraint.
 const TABLE_FLAG_REPLICATED: u64 = 1;
 /// Bit 1: the table is a **stream** — a storeless, append-only ingestion point.
 /// Independent of every other bit: a stream may be replicated or CLUSTER BY'd.
@@ -1009,6 +993,22 @@ impl TableProps {
             stream: flags & TABLE_FLAG_STREAM != 0,
             dist_prefix_len: ((flags >> TABLE_FLAG_DIST_SHIFT) & TABLE_FLAG_DIST_MASK) as usize,
         }
+    }
+
+    /// The one rule the flags packing cannot make unrepresentable: `replicated`
+    /// and a non-default `dist_prefix_len` are mutually exclusive. Beside the
+    /// packing, so every layer holding a `TableProps` shares it, and
+    /// `Result<_, String>` like [`validate_dist_prefix`], so each layer decorates
+    /// the sentence rather than re-wording the rule.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.replicated && self.dist_prefix_len != 0 {
+            return Err(format!(
+                "REPLICATED and CLUSTER BY are mutually exclusive: a replicated table keeps \
+                 a full copy on every worker, so a hash-distribution prefix (k={}) is meaningless",
+                self.dist_prefix_len
+            ));
+        }
+        Ok(())
     }
 }
 

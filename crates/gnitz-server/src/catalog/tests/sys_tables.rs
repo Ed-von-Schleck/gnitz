@@ -1,33 +1,6 @@
 use super::*;
 
 #[test]
-fn test_pk_col_packing() {
-    for case in [vec![0u32], vec![7], vec![0, 1], vec![3, 9, 40, 64]] {
-        let list = unpack_pk_cols(pack_pk_cols(&case));
-        assert_eq!(list.decoded_count(), case.len());
-        assert_eq!(list.as_slice(), case.as_slice());
-    }
-
-    // Reserved bits [32..63) are zero, bit 63 is set on packed values.
-    let packed = pack_pk_cols(&[3, 9, 40, 64]);
-    assert_eq!(packed >> 63, 1);
-    assert_eq!((packed >> 32) & 0x7FFF_FFFF, 0);
-
-    // Bare-index fallback (flag clear → single index).
-    assert_eq!(unpack_pk_cols(0).as_slice(), &[0]);
-    assert_eq!(unpack_pk_cols(0).decoded_count(), 1);
-    assert_eq!(unpack_pk_cols(7).as_slice(), &[7]);
-    assert_eq!(unpack_pk_cols(7).decoded_count(), 1);
-
-    // Malformed flag-set value with an out-of-range count: as_slice and
-    // decoded_count must be panic-free, slice clamped to PK_LIST_MAX_COLS.
-    // `15` is the max the 4-bit count field can hold (independent of the cap).
-    let malformed = unpack_pk_cols(PK_LIST_PACKED_FLAG | 15);
-    assert_eq!(malformed.decoded_count(), 15);
-    assert_eq!(malformed.as_slice(), vec![0u32; PK_LIST_MAX_COLS].as_slice());
-}
-
-#[test]
 fn circuit_tables_have_compound_view_id_sub_pk() {
     // from_wire_cols(&[0, 1]) must produce a 2-column PK whose stride is the
     // sum of the first two columns (U64 + U64 = 16 bytes).

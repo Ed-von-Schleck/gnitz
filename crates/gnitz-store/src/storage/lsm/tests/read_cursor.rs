@@ -731,11 +731,11 @@ fn multi_shard_merge_folds_cross_source_weights() {
 
 /// A long-string struct (len > 12) whose blob offset overruns the (empty) blob
 /// must read back empty rather than abort: the offset bounds check is part of
-/// `read_german_bytes`' decode. This is the engine-side hardening the panicking
-/// decoder lacked, and it runs under the default debug profile — there is
-/// deliberately no `debug_assert` on the overrun case.
+/// `german_string_content`'s decode. This is the engine-side hardening the
+/// panicking decoder lacked, and it runs under the default debug profile — there
+/// is deliberately no `debug_assert` on the overrun case.
 #[test]
-fn test_read_german_bytes_out_of_bounds_offset_returns_empty() {
+fn a_long_string_whose_offset_overruns_the_blob_reads_back_empty() {
     let schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U128, 0),
@@ -756,9 +756,12 @@ fn test_read_german_bytes_out_of_bounds_offset_returns_empty() {
     b.certify_layout(Layout::Consolidated, &schema);
     let cursor = create_read_cursor(&[Rc::new(b)], &[], schema);
     assert!(cursor.valid, "cursor must position on the single row");
+    // Logical column 1 is the STRING; the U128 PK occupies no payload slot, so
+    // it is payload index 0.
+    let (src, row) = cursor.current_row_source();
     assert_eq!(
-        cursor.read_german_bytes(1),
-        Vec::<u8>::new(),
+        crate::storage::payload_bytes(src, row, 0),
+        &[] as &[u8],
         "out-of-bounds long-string offset must decode to empty, not panic"
     );
 }

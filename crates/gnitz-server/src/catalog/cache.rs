@@ -55,7 +55,7 @@ pub(in crate::catalog) struct CatalogCacheSet {
     /// set: the table itself plus all FK parents and children, sorted ascending
     /// and deduped for deadlock-free acquisition. Recomputed by
     /// `recompute_needs_lock` on every trigger (`relock_from_table_delta` /
-    /// `relock_from_column_delta`), so `fk_lock_set` is a plain borrow on the
+    /// `apply_fk_edges_and_locks`), so `fk_lock_set` is a plain borrow on the
     /// push path.
     pub(in crate::catalog) needs_lock: FxHashMap<i64, Vec<i64>>,
 }
@@ -215,7 +215,9 @@ impl CatalogEngine {
     pub(in crate::catalog) fn apply_col_names_invalidate(&mut self, batch: &Batch) {
         let mut last: Option<i64> = None;
         for i in 0..batch.len() {
-            let owner_id = read_col_tab_ident(batch, i).owner_id;
+            // The owner is the high half of the PK, so one inlined big-endian
+            // load rather than the five payload reads a full ident decode costs.
+            let owner_id = gnitz_wire::unpack_col_id(batch.get_pk(i) as u64).0 as i64;
             if last != Some(owner_id) {
                 self.caches.invalidate_col_names(owner_id);
                 last = Some(owner_id);
@@ -260,13 +262,13 @@ impl CatalogEngine {
         }
     }
 
-    /// Maintain `fk_by_child` and `fk_by_parent` from a single pass over a
-    /// COL_TAB delta — both hold the same [`FkEdge`], indexed from either end,
-    /// and at boot replay the batch is the full sys_columns scan, so decoding
-    /// it once matters.
-    ///
-    /// Only base-table rows carry a constraint (`ColTabIdent::declares_fk`).
-    pub(in crate::catalog) fn apply_fk_constraints(&mut self, batch: &Batch) {
+    /// All three derived states an FK-carrying COL_TAB row feeds, off one decode
+    /// of it: both `fk_by_*` indexes, and the lock set of either end (which names
+    /// the other). At boot replay the batch is the full sys_columns scan, so a
+    /// second pass would re-decode every live column record in the database.
+    pub(in crate::catalog) fn apply_fk_edges_and_locks(&mut self, batch: &Batch) {
+        let CatalogEngine { caches, registry, .. } = self;
+        let mut tids: Vec<i64> = Vec::new();
         for i in 0..batch.len() {
             let ident = read_col_tab_ident(batch, i);
             if !ident.declares_fk() {
@@ -282,19 +284,25 @@ impl CatalogEngine {
             let same = |e: &FkEdge| e.child_tid == edge.child_tid && e.fk_col == edge.fk_col;
 
             if batch.get_weight(i) > 0 {
-                let by_child = self.caches.fk_by_child.entry(edge.child_tid).or_default();
+                let by_child = caches.fk_by_child.entry(edge.child_tid).or_default();
                 if !by_child.iter().any(same) {
                     by_child.push(edge);
                 }
-                let by_parent = self.caches.fk_by_parent.entry(edge.parent_tid).or_default();
+                let by_parent = caches.fk_by_parent.entry(edge.parent_tid).or_default();
                 if !by_parent.iter().any(same) {
                     by_parent.push(edge);
                 }
             } else {
-                remove_where(&mut self.caches.fk_by_child, edge.child_tid, same);
-                remove_where(&mut self.caches.fk_by_parent, edge.parent_tid, same);
+                remove_where(&mut caches.fk_by_child, edge.child_tid, same);
+                remove_where(&mut caches.fk_by_parent, edge.parent_tid, same);
+            }
+
+            tids.push(edge.child_tid);
+            if registry.has_id(edge.parent_tid) {
+                tids.push(edge.parent_tid);
             }
         }
+        self.relock_all(tids);
     }
 
     /// A TABLE_TAB delta relocks every relation it names: the lock rule reads
@@ -303,23 +311,6 @@ impl CatalogEngine {
         let mut tids = Vec::with_capacity(batch.len());
         for i in 0..batch.len() {
             tids.push(batch.get_pk(i) as i64);
-        }
-        self.relock_all(tids);
-    }
-
-    /// An FK-carrying COL_TAB delta relocks both ends of each edge it declares:
-    /// the lock set of either end names the other.
-    pub(in crate::catalog) fn relock_from_column_delta(&mut self, batch: &Batch) {
-        let mut tids = Vec::with_capacity(batch.len() * 2);
-        for i in 0..batch.len() {
-            let ident = read_col_tab_ident(batch, i);
-            if !ident.declares_fk() {
-                continue;
-            }
-            tids.push(ident.owner_id);
-            if self.registry.has_id(ident.fk_table_id) {
-                tids.push(ident.fk_table_id);
-            }
         }
         self.relock_all(tids);
     }

@@ -70,6 +70,29 @@ fn a_crafted_pk_col_count_survives_to_is_well_formed() {
     }
 }
 
+/// The bare (flag-clear) form of the persisted word is a **single** column
+/// index, not an empty list: an unmodified `gnitz-core` client and every
+/// engine-written system-table row spell a 1-column PK that way.
+#[test]
+fn a_flag_clear_word_decodes_as_one_bare_column_index() {
+    for raw in [0u64, 7] {
+        let list = unpack_pk_cols(raw);
+        assert_eq!(list.as_slice(), &[raw as u32]);
+        assert_eq!(list.decoded_count(), 1);
+        assert!(list.is_well_formed());
+    }
+}
+
+/// A packed list occupies the low 32 bits plus the flag at bit 63, leaving bits
+/// [32..63) clear — which is what gives `HAS_PK_WANT_HOLDER` (bit 62, below) and
+/// any later directive room in the same word.
+#[test]
+fn a_packed_list_leaves_the_reserved_bits_clear() {
+    let packed = pack_pk_cols(&[3, 9, 40, 64]);
+    assert_eq!(packed >> 63, 1, "the packed flag is bit 63");
+    assert_eq!((packed >> 32) & 0x7FFF_FFFF, 0, "bits [32..63) are reserved");
+}
+
 /// `HAS_PK_WANT_HOLDER` rides bit 62 of the same `seek_col_idx` word that
 /// carries the packed column list, and `pk_cols_word` is what strips it. Both
 /// directions are used: the worker reads the directive off a word carrying a

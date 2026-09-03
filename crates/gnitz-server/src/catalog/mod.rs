@@ -59,7 +59,7 @@ use gnitz_store::storage::{Batch, RamBudgets, ReadCursor, RecoverySource, Slot, 
 // The DDL_TXN driver's bundle decoders: it resolves each family once, carries
 // the value, and reads back what the bundle created or dropped.
 pub(crate) use sys_tables::{family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates};
-pub(crate) use sys_tables::{SysFamily, FIRST_USER_TABLE_ID, PUBLIC_SCHEMA_ID, SEQ_TAB_ID};
+pub(crate) use sys_tables::{SysFamily, FIRST_USER_TABLE_ID, PUBLIC_SCHEMA_ID};
 pub(crate) use types::{ColumnDef, FkEdge};
 // The reply path's schema-wire-block encoders. The `SchemaWireEntry` they fill
 // is named only inside the catalog — the reply path takes one by value from
@@ -67,6 +67,7 @@ pub(crate) use types::{ColumnDef, FkEdge};
 pub(crate) use schema_block::{encode_schema_block, encode_schema_block_ipc};
 
 // Import everything from sys_tables for internal use.
+use precheck::{check_col_defs, validate_pk_against_cols, validate_relation_defs};
 use registry::build_schema_from_col_defs;
 use sys_tables::*;
 
@@ -83,10 +84,8 @@ pub(in crate::catalog) use registry::raise_id_counter;
 #[cfg(test)]
 pub(in crate::catalog) use gnitz_store::storage::subdir_names;
 pub(in crate::catalog) use gnitz_store::storage::{children_at_generation, fsync_dir, ChildAddr};
-#[cfg(test)]
-pub(in crate::catalog) use utils::cursor_read_string;
 pub(in crate::catalog) use utils::{
-    cursor_read_u64, index_dir, make_fk_index_name, preflight_dir, retract_key_range, retract_pk_list, schema_dir,
+    circuit_opk, index_dir, make_fk_index_name, preflight_dir, retract_key_range, retract_pk_list, schema_dir,
     sys_catalog_dir, sys_family_dir, sys_opk,
 };
 // The relation rung's directory primitives; the catalog only consumes them.

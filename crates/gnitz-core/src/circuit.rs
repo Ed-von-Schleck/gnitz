@@ -67,7 +67,7 @@ impl Circuit {
     pub fn dependencies(&self) -> Vec<TableId> {
         // A view's dependency set is 1–4 entries; a linear `Vec::contains` dedup
         // is alloc-free and beats a HashSet at this n (same small-n convention as
-        // `Schema::validate_pk_cols`).
+        // `Schema::validate_parts`).
         let mut deps: Vec<TableId> = Vec::new();
         for op in self.nodes.values() {
             if let OpNode::ScanDelta { source, .. } = op {

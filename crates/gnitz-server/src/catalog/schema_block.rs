@@ -93,12 +93,10 @@ impl CatalogEngine {
         if let Some(cached) = self.get_cached_schema_wire_block(tid) {
             return cached;
         }
-        // `defs` is empty for a **system family**: `catalog::bootstrap` registers
-        // one in the DAG with a built-in schema and no COL_TAB rows describing
-        // itself, so there are no names or flags to carry. A user relation has
-        // one COL_TAB row per physical column, which is what makes `defs[ci]`
-        // describe `schema.columns[ci]` — callers with a *projected* schema
-        // build a one-off anonymous block instead of coming here.
+        // One COL_TAB row per physical column — a system family included, since
+        // `bootstrap` writes each one's self-description — is what makes
+        // `defs[ci]` describe `schema.columns[ci]`. A caller with a *projected*
+        // schema builds a one-off anonymous block instead of coming here.
         let defs = self.read_column_defs(tid);
         let block = Rc::new(if defs.is_empty() {
             encode_schema_block(schema, tid as u32)

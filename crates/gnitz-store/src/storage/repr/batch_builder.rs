@@ -126,7 +126,7 @@ impl BatchBuilder {
     }
 
     /// Put raw bytes for the current STRING/BLOB payload column — the one
-    /// German-string encode site; `read_german_bytes` is the read-back twin.
+    /// German-string encode site; `payload_bytes` is the read-back twin.
     pub fn put_blob(&mut self, b: &[u8]) {
         let st = gnitz_wire::encode_german_string(b, &mut self.batch.blob);
         self.batch.extend_col(self.curr_col, &st);

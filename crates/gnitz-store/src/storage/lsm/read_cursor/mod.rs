@@ -732,7 +732,7 @@ impl ReadCursor {
     /// instead — a PK column has no payload slot to read here.
     ///
     /// Does NOT consult the null bitmap: a NULL *value* still yields `Some` bytes,
-    /// so callers needing NULL semantics check `col_is_null` / the null word first.
+    /// so callers needing NULL semantics read the null word first.
     pub(crate) fn col_bytes(&self, col: usize, size: usize) -> Option<&[u8]> {
         if !self.valid {
             return None;
@@ -746,51 +746,6 @@ impl ReadCursor {
             payload_idx,
             size,
         ))
-    }
-
-    /// Blob arena slice (bounds-carrying) for the current row's source.
-    fn blob_slice(&self) -> &[u8] {
-        if !self.valid {
-            return &[];
-        }
-        self.sources[self.current_entry_idx].blob()
-    }
-
-    /// Decode the German string at logical column `col` of the current row into raw
-    /// bytes (STRING and BLOB share the 16-byte layout). Returns empty when the column
-    /// pointer is null or a long-string offset overruns the blob — the latter is
-    /// `german_string_content`'s own degrade-to-empty contract, shared with the
-    /// ordering and hashing paths so every reader sees a corrupt cell the same way.
-    pub fn read_german_bytes(&self, col: usize) -> Vec<u8> {
-        match self.col_bytes(col, 16) {
-            Some(cell) => gnitz_wire::german_string_content(cell, self.blob_slice()).to_vec(),
-            None => Vec::new(),
-        }
-    }
-
-    /// Read a fixed 8-byte little-endian integer at logical column `col` of the
-    /// current row. Every system/circuit column read this way is 8-byte; the
-    /// `debug_assert` catches schema drift in dev. An absent column (invalid
-    /// cursor, PK, or out of range — the null bitmap is not consulted, so a NULL
-    /// *value* still reads its bytes) degrades to 0, the same
-    /// degrade-don't-abort contract as `read_german_bytes`.
-    pub fn read_i64(&self, col: usize) -> i64 {
-        debug_assert_eq!(
-            self.schema.columns[col].size() as usize,
-            8,
-            "read_i64: column not 8-byte"
-        );
-        self.col_bytes(col, 8)
-            .map_or(0, |b| i64::from_le_bytes(b.try_into().unwrap()))
-    }
-
-    /// True iff logical column `col` is NULL in the current row. PK columns are never
-    /// null (`try_payload_idx` returns `None` for them).
-    pub fn col_is_null(&self, col: usize) -> bool {
-        match self.schema.try_payload_idx(col) {
-            Some(pi) => gnitz_wire::null_word_get(self.current_null_word, pi),
-            None => false,
-        }
     }
 }
 

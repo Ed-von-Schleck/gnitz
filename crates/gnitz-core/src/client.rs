@@ -1291,6 +1291,11 @@ impl GnitzClient {
         // any id allocation instead of relying on the server-side reject (and
         // `pack_pk_cols` below can never panic).
         Schema::validate_parts(pk_cols, columns).map_err(|e| ClientError::ServerError(format!("create_table: {e}")))?;
+        // The rule the flags packing cannot represent, shared with the planner
+        // and the engine's own decoder.
+        props
+            .validate()
+            .map_err(|e| ClientError::ServerError(format!("create_table: {e}")))?;
         // `dist_prefix_len` is a leading-PK-prefix length (0 = default = full PK);
         // a value past the PK count is meaningless and the engine would silently
         // clamp it, so reject it here to catch the caller's mistake.

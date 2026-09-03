@@ -66,6 +66,13 @@ pub fn payload_string<S: RowSource>(src: &S, row: usize, pi: usize) -> String {
     String::from_utf8(payload_bytes(src, row, pi).to_vec()).unwrap_or_default()
 }
 
+/// Whether one row's payload slot `pi` holds NULL — the null-bit member of this
+/// family, so a reader that needs both the bit and the value addresses them
+/// through the same payload index.
+pub fn payload_is_null<S: RowSource>(src: &S, row: usize, pi: usize) -> bool {
+    gnitz_wire::null_word_get(src.get_null_word(row), pi)
+}
+
 // ---------------------------------------------------------------------------
 // Generic compare_rows
 // ---------------------------------------------------------------------------

@@ -194,8 +194,8 @@ impl CatalogEngine {
                 continue;
             };
             let (src, ri) = sr.source();
-            let (row_owner, row_cols, props) = read_idx_tab_row(src, ri);
-            if row_owner == owner_id && row_cols.as_slice() == cols {
+            let (row_owner, packed_cols, props) = read_idx_tab_row(src, ri);
+            if row_owner == owner_id && gnitz_wire::unpack_pk_cols(packed_cols).as_slice() == cols {
                 f(idx_id, props.is_unique);
             }
         }

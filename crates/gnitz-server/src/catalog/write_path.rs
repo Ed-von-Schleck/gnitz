@@ -27,7 +27,7 @@ impl CatalogEngine {
     /// memtable-only object-id high-water. The DDL_TXN handler drives the same
     /// two steps itself so it can tell a precheck rejection from a post-apply
     /// failure.
-    pub(in crate::catalog) fn submit(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
+    pub(crate) fn submit(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
         if self.ctx.in_rollback() {
             // During rollback all cascade writes must bypass pending_broadcasts
             // so no compensating row is re-broadcast to workers.
@@ -128,26 +128,7 @@ impl CatalogEngine {
         self.fire_hooks(family, batch)
     }
 
-    // -- System ingestion entry + broadcast / dir-deletion queues -----------
-
-    /// Ingest a batch into any relation, system or user: a system family goes
-    /// through [`Self::submit`] (precheck → ingest → hooks → broadcast-queue), a
-    /// user table through [`RelationRegistry::ingest_returning_effective`] (PK
-    /// enforcement, store, index projection). The `&Batch` entry serves callers
-    /// that hold a borrow; an emitter with an owned batch calls `submit` directly
-    /// to skip the clone. Every production caller targets a system family, so the
-    /// user-table arm's clone is on a test-only path.
-    pub(crate) fn ingest_to_family(&mut self, table_id: i64, batch: &Batch) -> Result<(), String> {
-        if table_id < FIRST_USER_TABLE_ID {
-            let family = SysFamily::from_id(table_id).ok_or_else(|| format!("Unknown system family {table_id}"))?;
-            self.submit(family, batch.clone())
-        } else {
-            self.registry
-                .ingest_returning_effective(table_id, batch.clone_batch(), false)
-                .map(drop)
-                .map_err(|e| format!("ingest failed for table_id={table_id}: {e}"))
-        }
-    }
+    // -- Broadcast / dir-deletion queues ------------------------------------
 
     /// Apply one system-family delta to storage, fire its hooks, and enqueue it
     /// for broadcast — the mutating half of [`Self::submit`], pinned
@@ -167,7 +148,7 @@ impl CatalogEngine {
     /// Drain the pending-broadcast queue. Master calls this once per
     /// top-level DDL and forwards each entry to `broadcast_ddl`. Workers
     /// receive system-table changes via `DdlSync` → `ddl_sync`, which
-    /// bypasses `ingest_to_family` entirely, so the queue stays empty there.
+    /// bypasses [`Self::submit`] entirely, so the queue stays empty there.
     pub(crate) fn drain_pending_broadcasts(&mut self) -> Vec<(SysFamily, Batch)> {
         std::mem::take(&mut self.pending_broadcasts)
     }

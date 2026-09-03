@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{await_barrier, decode_client_batch, guard_panic, park_until, send_fault, send_msg, Shared, TickTrigger};
-use crate::catalog::{family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates, SysFamily, SEQ_TAB_ID};
+use crate::catalog::{family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates, SysFamily};
 use crate::runtime::committer::BarrierKind;
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::UniqueFilter;
@@ -128,7 +128,7 @@ pub(super) async fn hold_relay_for_ddl(shared: &Shared) {
 /// below `FIRST_USER_TABLE_ID`, plain `PUSH` is refused because a
 /// `SystemCatalog` relation is no ingestion point, and `ddl_sync` carries
 /// master-broadcast rows. The engine's own sequence writes reach `submit`
-/// through `ingest_to_family` and never cross this decoder.
+/// through `submit` and never cross this decoder.
 fn decode_sys_family(tid: i64, slice: &[u8]) -> Result<(SysFamily, Batch), String> {
     let family = SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?;
     if !family.client_writable() {
@@ -564,7 +564,7 @@ pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64
         // A sys_sequences advance is a pure system-table write (no evaluate_dag,
         // no rollback); a hook failure on a well-formed 2-row delta is an
         // invariant violation — abort rather than compensate.
-        if let Err(e) = shared.cat_mut().ingest_to_family(SEQ_TAB_ID, &delta) {
+        if let Err(e) = shared.cat_mut().submit(SysFamily::Sequence, delta) {
             gnitz_fatal_abort!("sys_sequences ingest (serial range) failed: {}", e);
         }
         shared.cat_mut().close_ddl_zone();

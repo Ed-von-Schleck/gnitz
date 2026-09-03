@@ -79,7 +79,7 @@ fn recover_system_tables_from_sal(sal_ptr: *const u8, catalog: &mut CatalogEngin
         let Some(batch) = decoded.data_batch.filter(|b| !b.is_empty()) else {
             continue;
         };
-        // `ddl_sync`, not `ingest_to_family`: these rows are master-validated by
+        // `ddl_sync`, not `submit`: these rows are master-validated by
         // definition, and re-running the precheck would false-reject a replayed DROP
         // TABLE cascade. Hooks still fire, so an ALTER in the tail reaches the base
         // before the pushes that depend on it.

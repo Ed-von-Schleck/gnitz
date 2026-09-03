@@ -78,7 +78,7 @@ fn test_table_tab_no_cols_leaves_clean_state() {
 
 #[test]
 fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
-    // validate_pk_cols runs inside hook_relation_register *after*
+    // validate_relation_defs runs inside hook_relation_register *after*
     // `apply_entity_caches` runs before the register hook, so a hook rejection
     // must leave no cache entry behind.
     let dir = temp_dir("atomicity_bad_pk_type");

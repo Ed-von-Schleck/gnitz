@@ -7,8 +7,7 @@
 use crate::catalog::{CatalogEngine, ColumnDef, SysFamily, PUBLIC_SCHEMA_ID};
 use gnitz_store::storage::{BatchBuilder, ReadCursor};
 use gnitz_wire::sys_rows::{
-    write_circuit_edge_row, write_circuit_node_row, write_col_tab_row, write_table_tab_row, write_view_tab_row,
-    CircuitEdgeRow, CircuitNodeRow, ColTabRow, TableTabRow, ViewTabRow,
+    write_circuit_edge_row, write_circuit_node_row, write_view_tab_row, CircuitEdgeRow, CircuitNodeRow, ViewTabRow,
 };
 use gnitz_wire::type_code;
 
@@ -92,9 +91,7 @@ pub fn write_circuit_chain(engine: &mut CatalogEngine, vid: i64, nodes: &[Circui
         )
         .unwrap();
     }
-    engine
-        .ingest_to_family(SysFamily::CircuitNodes.id(), &bb.finish())
-        .unwrap();
+    engine.submit(SysFamily::CircuitNodes, bb.finish()).unwrap();
 
     let mut bb = BatchBuilder::new(SysFamily::CircuitEdges.schema());
     for src in 0..nodes.len().saturating_sub(1) as u64 {
@@ -110,9 +107,7 @@ pub fn write_circuit_chain(engine: &mut CatalogEngine, vid: i64, nodes: &[Circui
         )
         .unwrap();
     }
-    engine
-        .ingest_to_family(SysFamily::CircuitEdges.id(), &bb.finish())
-        .unwrap();
+    engine.submit(SysFamily::CircuitEdges, bb.finish()).unwrap();
 }
 
 /// The minimal identity circuit `ScanDelta(source) → Integrate`. `scan_blob` is
@@ -174,74 +169,11 @@ pub fn try_register_identity_view(
         .unwrap();
     let mut bb = BatchBuilder::new(SysFamily::View.schema());
     push_view_tab_row(&mut bb, 1, vid, name, capacity_bytes, delta_bytes, 0);
-    engine.ingest_to_family(SysFamily::View.id(), &bb.finish())?;
+    engine.submit(SysFamily::View, bb.finish())?;
     Ok(vid)
 }
 
 /// [`try_register_identity_view`] for an unbounded view that must succeed.
 pub fn register_identity_view(engine: &mut CatalogEngine, source_tid: i64, name: &str, cols: &[ColumnDef]) -> i64 {
     try_register_identity_view(engine, source_tid, name, cols, 0, 0).unwrap()
-}
-
-// ---------------------------------------------------------------------------
-// register_table — register a relation the way a worker does
-// ---------------------------------------------------------------------------
-
-impl CatalogEngine {
-    /// In-process registration of a base table at a caller-chosen `tid`, for
-    /// tests that need a real relation store without a server. `pk` names the PK
-    /// column indices into `cols`, in key order.
-    ///
-    /// It writes the same COL_TAB and TABLE_TAB rows a DDL bundle carries and
-    /// hands each to [`CatalogEngine::ddl_sync`], which is the ingest tail the
-    /// wire path reaches too — so the register hooks fire and the relation store
-    /// is built. The columns go first: the TABLE_TAB register hook reads them
-    /// back out of `sys_columns` to derive the schema.
-    ///
-    /// A caller-chosen id lifts the engine's allocator past itself (the register
-    /// hook raises the id counter to `tid + 1`), so a later engine-side
-    /// allocation cannot collide with one chosen here.
-    pub fn register_table(
-        &mut self,
-        tid: i64,
-        schema_id: i64,
-        name: &str,
-        cols: &[ColumnDef],
-        pk: &[u32],
-    ) -> Result<(), String> {
-        let mut bb = BatchBuilder::new(SysFamily::Column.schema());
-        for (i, cd) in cols.iter().enumerate() {
-            write_col_tab_row(
-                &mut bb,
-                &ColTabRow {
-                    owner_id: tid as u64,
-                    owner_kind: gnitz_wire::OWNER_KIND_TABLE,
-                    col_idx: i as u64,
-                    name: &cd.name,
-                    type_code: cd.type_code as u64,
-                    is_nullable: cd.is_nullable,
-                    fk_table_id: cd.fk_table_id as u64,
-                    fk_col_idx: cd.fk_col_idx as u64,
-                    is_serial: cd.is_serial,
-                    is_hidden: cd.is_hidden,
-                },
-                1,
-            )?;
-        }
-        self.ddl_sync(SysFamily::Column.id(), bb.finish())?;
-
-        let mut bb = BatchBuilder::new(SysFamily::Table.schema());
-        write_table_tab_row(
-            &mut bb,
-            &TableTabRow {
-                table_id: tid as u64,
-                schema_id: schema_id as u64,
-                name,
-                pk_col_idx: gnitz_wire::pack_pk_cols(pk),
-                flags: gnitz_wire::TableProps::default().pack(),
-            },
-            1,
-        );
-        self.ddl_sync(SysFamily::Table.id(), bb.finish())
-    }
 }

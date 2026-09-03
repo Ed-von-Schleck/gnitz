@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_wire::{COLTAB_COL_COL_IDX, COLTAB_COL_NAME, COLTAB_COL_OWNER_ID, COLTAB_COL_OWNER_KIND};
+use gnitz_wire::{COLTAB_PAY_COL_IDX, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND};
 use std::collections::HashMap;
 
 // ── test_identifiers ─────────────────────────────────────────────────
@@ -81,13 +81,16 @@ fn bootstrap_self_description_matches_the_wire_column_lists() {
     let mut described: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
     let mut c = engine.sys_store(SysFamily::Column).open_cursor();
     while c.valid {
-        if c.current_weight > 0 && cursor_read_u64(&c, COLTAB_COL_OWNER_KIND) == OWNER_KIND_TABLE as u64 {
-            let owner = cursor_read_u64(&c, COLTAB_COL_OWNER_ID);
-            let entry = (
-                cursor_read_u64(&c, COLTAB_COL_COL_IDX),
-                cursor_read_string(&c, COLTAB_COL_NAME),
-            );
-            described.entry(owner).or_default().push(entry);
+        if c.current_weight > 0 {
+            let (src, row) = c.current_row_source();
+            if payload_u64(src, row, COLTAB_PAY_OWNER_KIND) == OWNER_KIND_TABLE as u64 {
+                let owner = payload_u64(src, row, COLTAB_PAY_OWNER_ID);
+                let entry = (
+                    payload_u64(src, row, COLTAB_PAY_COL_IDX),
+                    payload_string(src, row, COLTAB_PAY_NAME),
+                );
+                described.entry(owner).or_default().push(entry);
+            }
         }
         c.advance();
     }
@@ -493,11 +496,11 @@ fn test_hook_relation_register_rejects_malformed_pk() {
     // (count=2, idx0@bit4=0, idx1@bit11=0) even though they evaluate to 0.
     #[allow(clippy::identity_op)]
     let packed = PK_LIST_PACKED_FLAG | 2 | (0u64 << 4) | (0u64 << 11);
-    assert_rejects(packed, "duplicate column");
+    assert_rejects(packed, "names column 0 twice");
     // Non-integer PK column (c1 is STRING).
-    assert_rejects(PK_LIST_PACKED_FLAG | 1 | (1 << 4), "must be a fixed-width integer");
+    assert_rejects(PK_LIST_PACKED_FLAG | 1 | (1 << 4), "only fixed-width integer");
     // Float PK column (c3 is F32) — floats break the byte-equal PK contract.
-    assert_rejects(PK_LIST_PACKED_FLAG | 1 | (3 << 4), "must be a fixed-width integer");
+    assert_rejects(PK_LIST_PACKED_FLAG | 1 | (3 << 4), "only fixed-width integer");
     // Nullable PK column (c2 is nullable).
     assert_rejects(PK_LIST_PACKED_FLAG | 1 | (2 << 4), "must not be nullable");
 

@@ -450,8 +450,8 @@ fn a_sequence_block_is_refused_from_the_wire() {
 
 /// A COL_TAB row on an owner nothing registers is unretractable — the only
 /// COL_TAB retractor is the owner's own drop cascade, which returns early on an
-/// unregistered id — and `apply_fk_constraints` would build a permanent FK edge
-/// from its payload.
+/// unregistered id — and `apply_fk_edges_and_locks` would build a permanent FK
+/// edge from its payload.
 #[test]
 fn a_column_block_whose_owner_is_never_registered_is_refused() {
     let srv = ServerHandle::start();

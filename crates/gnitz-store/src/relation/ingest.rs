@@ -159,8 +159,8 @@ impl RelationRegistry {
 
     /// Ingest a user-relation batch into its store + index projections and
     /// return the effective batch (after PK enforcement) — what downstream views
-    /// need to see. System families are not supported (the catalog's
-    /// `ingest_to_family` routes those through the precheck/hooks path).
+    /// need to see. System families are not supported (the catalog's `submit`
+    /// routes those through the precheck/hooks path).
     ///
     /// `StoreError::Rejected` means nothing was applied and the request is at
     /// fault; `StoreError::Storage` means committed data did not reach the

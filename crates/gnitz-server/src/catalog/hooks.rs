@@ -15,7 +15,7 @@ struct RelationRegistration {
     placement: Placement,
     /// The `WITH (…)` byte budgets; both `None` for a base table and for a plain
     /// view.
-    budgets: gnitz_store::relation::ViewBudgets,
+    budgets: ViewBudgets,
 }
 
 impl CatalogEngine {
@@ -52,8 +52,7 @@ impl CatalogEngine {
             }
             SysFamily::Column => {
                 self.apply_col_names_invalidate(batch);
-                self.apply_fk_constraints(batch);
-                self.relock_from_column_delta(batch);
+                self.apply_fk_edges_and_locks(batch);
                 // MUST be last — after `apply_col_names_invalidate` evicts the
                 // cached col defs — so the DROP NOT NULL descriptor rebuild reads
                 // the post-ALTER column defs.
@@ -234,7 +233,17 @@ impl CatalogEngine {
                     continue;
                 }
                 let reg = if family == SysFamily::Table {
-                    Self::table_registration(batch, i, id)?
+                    let (schema_id, name, pk, kind, placement) =
+                        read_table_tab_row(batch, i).map_err(|e| format!("{e} (tid={id})"))?;
+                    RelationRegistration {
+                        kind,
+                        id,
+                        schema_id,
+                        name,
+                        pk,
+                        placement,
+                        budgets: ViewBudgets::default(),
+                    }
                 } else {
                     self.view_registration(batch, i, id)?
                 };
@@ -281,21 +290,6 @@ impl CatalogEngine {
         // order among themselves.
         rows[first_live..].sort_by_key(|&i| rank[&(batch.get_pk(i) as i64)]);
         rows
-    }
-
-    /// The registration values for TABLE_TAB row `i`: placement folded out of
-    /// `TABLE_TAB.flags`, never capacity-bounded.
-    fn table_registration(batch: &Batch, i: usize, tid: i64) -> Result<RelationRegistration, String> {
-        let (schema_id, name, pk, kind, placement) = read_table_tab_row(batch, i, tid)?;
-        Ok(RelationRegistration {
-            kind,
-            id: tid,
-            schema_id,
-            name,
-            pk,
-            placement,
-            budgets: gnitz_store::relation::ViewBudgets::default(),
-        })
     }
 
     /// The registration values for VIEW_TAB row `i`: placement folded out of the
@@ -470,12 +464,9 @@ impl CatalogEngine {
         ] {
             let schema = family.schema();
             // These families use the compound PK `(view_id, sub)`, so one view's
-            // rows are the key band `[(vid, 0), (vid + 1, 0))`. `sys_opk` takes
-            // the native value in pk-list column order, so `view_id` (column 0)
-            // occupies the LOW u128 half — the byte-order dual of the
-            // `(vid << 64) | sub` image `Batch::extend_pk` writes.
-            let start = sys_opk(&schema, vid as u64 as u128);
-            let end = sys_opk(&schema, vid as u64 as u128 + 1);
+            // rows are the key band `[(vid, 0), (vid + 1, 0))`.
+            let start = circuit_opk(&schema, vid, 0);
+            let end = circuit_opk(&schema, vid + 1, 0);
             let batch = retract_key_range(self.sys_store(family), &schema, start.pk_bytes(), end.pk_bytes());
             if !batch.is_empty() {
                 self.submit_cascade(family, batch)?;
@@ -491,7 +482,8 @@ impl CatalogEngine {
     fn hook_index_register(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.len() {
             let idx_id = batch.get_pk(i) as i64;
-            let (owner_id, cols, props) = read_idx_tab_row(batch, i);
+            let (owner_id, packed_cols, props) = read_idx_tab_row(batch, i);
+            let cols = gnitz_wire::unpack_pk_cols(packed_cols);
             if batch.get_weight(i) > 0 {
                 self.register_index(idx_id, owner_id, &cols, props.is_unique)?;
             } else {

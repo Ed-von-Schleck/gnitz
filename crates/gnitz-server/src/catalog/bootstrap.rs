@@ -1,7 +1,6 @@
 use super::*;
 use gnitz_store::foundation::env::env_num;
 use gnitz_wire::sys_rows::{write_schema_tab_row, SchemaTabRow};
-use gnitz_wire::SEQTAB_COL_VALUE;
 
 impl CatalogEngine {
     // -- Open engine (main entry point) ------------------------------------
@@ -182,7 +181,8 @@ impl CatalogEngine {
         let mut cursor = self.sys_store(SysFamily::Sequence).open_cursor();
         cursor.for_each_positive(|c| {
             let seq_id = c.current_key_narrow() as u64 as i64;
-            let val = cursor_read_u64(c, SEQTAB_COL_VALUE) as i64;
+            let (src, row) = c.current_row_source();
+            let val = payload_u64(src, row, gnitz_wire::SEQTAB_PAY_VALUE) as i64;
             match seq_id {
                 SEQ_ID_SCHEMAS => raise_id_counter(&mut self.next_schema_id, val),
                 SEQ_ID_TABLES => raise_id_counter(&mut self.next_table_id, val),

@@ -443,7 +443,7 @@ pub(crate) fn execute_create_table(
 
     // Admission rule — every base table must satisfy these conditions. The rule
     // set is `gnitz-wire`'s, shared with the client's `validate_parts` and the
-    // engine catalog's `validate_pk_cols`, so this pre-check and the engine
+    // engine catalog's `validate_pk_against_cols`, so this pre-check and the engine
     // backstop cannot disagree on what a legal PK is. Only the wording is the
     // planner's: it names the offending column, which the engine cannot.
     gnitz_wire::validate_pk_tuple(&pk_indices, cols.len(), |c| {
@@ -517,20 +517,11 @@ pub(crate) fn execute_create_table(
         0
     };
 
-    // Phase 7 — the boolean `WITH (…)` properties. REPLICATED is mutually exclusive
-    // with CLUSTER BY: a hash-distribution prefix is meaningless when every worker
-    // already holds the whole table. The flags packing cannot make the conflict
-    // unrepresentable (replicated is a boolean bit, k a byte), so reject it here.
-    // STREAM composes freely with both.
+    // Phase 7 — the boolean `WITH (…)` properties. The one rule the flags packing
+    // cannot represent rides on `TableProps` itself.
     let mut props = parse_table_options(&create.table_options)?;
     props.dist_prefix_len = dist_prefix_len;
-    if props.replicated && dist_prefix_len != 0 {
-        return Err(GnitzSqlError::Plan(
-            "REPLICATED and CLUSTER BY are mutually exclusive: a replicated table keeps \
-             a full copy on every worker, so a hash-distribution prefix is meaningless"
-                .into(),
-        ));
-    }
+    props.validate().map_err(GnitzSqlError::Plan)?;
 
     // Fold every inline UNIQUE constraint into the CREATE TABLE bundle so the
     // table and its unique indices commit — or roll back — as one atomic DDL

@@ -7,7 +7,7 @@
 //! `crates/gnitz-sql/tests/planner_alter.rs`.
 
 use super::*;
-use gnitz_wire::{TABTAB_COL_FLAGS, TABTAB_COL_NAME, TABTAB_COL_PK_COL_IDX, TABTAB_COL_SCHEMA_ID};
+use gnitz_wire::{TABTAB_PAY_FLAGS, TABTAB_PAY_NAME, TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID};
 use std::path::Path;
 
 /// The live TABLE_TAB row's payload for `tid`. Named fields rather than a tuple
@@ -20,17 +20,19 @@ struct TableRow {
 }
 
 fn live_table_row(engine: &CatalogEngine, tid: i64) -> TableRow {
-    let mut c = engine.sys_store(SysFamily::Table).open_cursor();
-    c.seek_bytes(&(tid as u64).to_be_bytes());
-    assert!(
-        c.valid && c.current_key_narrow() as u64 == tid as u64,
-        "live TABLE_TAB row for tid {tid} missing"
-    );
+    let schema = SysFamily::Table.schema();
+    let key = sys_opk(&schema, tid as u128);
+    let store = engine.sys_store(SysFamily::Table);
+    let sr = store
+        .live_row_at(key.pk_bytes())
+        .1
+        .unwrap_or_else(|| panic!("live TABLE_TAB row for tid {tid} missing"));
+    let (src, row) = sr.source();
     TableRow {
-        schema_id: cursor_read_u64(&c, TABTAB_COL_SCHEMA_ID),
-        name: cursor_read_string(&c, TABTAB_COL_NAME),
-        pk_col_idx: cursor_read_u64(&c, TABTAB_COL_PK_COL_IDX),
-        flags: cursor_read_u64(&c, TABTAB_COL_FLAGS),
+        schema_id: payload_u64(src, row, TABTAB_PAY_SCHEMA_ID),
+        name: payload_string(src, row, TABTAB_PAY_NAME),
+        pk_col_idx: payload_u64(src, row, TABTAB_PAY_PK_COL_IDX),
+        flags: payload_u64(src, row, TABTAB_PAY_FLAGS),
     }
 }
 

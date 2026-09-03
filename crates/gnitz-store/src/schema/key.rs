@@ -118,6 +118,22 @@ pub fn opk_key(schema: &SchemaDescriptor, native_le: &[u8]) -> PkBuf {
     out
 }
 
+/// [`opk_key`]'s per-column form: one native value per PK column, in PK-list
+/// order, rather than one packed native image. Prefer it wherever the caller
+/// holds the columns separately — the packed image leaves which half a column
+/// occupies to convention, and a compound key is where that convention bites.
+///
+/// Encodes through the same `encode_leading_opk` as `Batch::extend_pk_opk`, so a
+/// key built here is byte-identical to the one the ingest path wrote.
+pub fn opk_key_cols(schema: &SchemaDescriptor, natives: &[u128]) -> PkBuf {
+    debug_assert_eq!(
+        natives.len(),
+        schema.pk_indices().len(),
+        "opk_key_cols: one native value per PK column",
+    );
+    encode_leading_opk(schema.pk_columns().map(|(_, col)| (col.type_code, *col)), natives)
+}
+
 /// Reassemble the native seek image from the wire pair `(low, extra)` — the
 /// inverse of `PkTuple::split_wire` — and OPK-encode it via [`opk_key`]. The
 /// shared seek-key encoder for the master partition router (`fan_out_seek`) and
