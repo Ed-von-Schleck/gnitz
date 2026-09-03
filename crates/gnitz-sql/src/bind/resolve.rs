@@ -1,7 +1,7 @@
 use crate::ast_util::{classify_from, extract_table_factor_name, is_bare_wildcard_projection, FromShape};
 use crate::error::GnitzSqlError;
 use gnitz_core::{CatalogSnapshot, ClientError, ColumnDef, GnitzClient, RelClass, RelDescriptor, Schema};
-use sqlparser::ast::{Expr, Select, SelectItem, TableAliasColumnDef};
+use sqlparser::ast::{Expr, Ident, Select, SelectItem, TableAliasColumnDef};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -219,35 +219,34 @@ impl<'a> Binder<'a> {
     }
 }
 
-/// Apply positional column aliases (`WITH d(a, b) AS …` / `(subquery) AS d(a, b)`)
-/// to the *visible* columns of a body's output, in order — a rename only (`ColId`s
-/// and layout are untouched). A JOIN body's leading synthetic-PK region is hidden
-/// and skipped automatically, so positional aliases name exactly the visible output
-/// columns — the same columns a downstream query sees — with no misalignment.
+/// Apply positional column aliases (`WITH d(a, b) AS …` / `(subquery) AS d(a, b)`
+/// / `CREATE VIEW v (a, b) AS …`) to the *visible* columns of a body's output, in
+/// order — a rename only, leaving `ColId`s and layout untouched. Hidden columns
+/// (a JOIN body's synthetic-PK region) are skipped, so an alias list names exactly
+/// what a downstream query sees.
 ///
-/// One home for both column shapes this runs over: a hidden segment's registered
-/// `ColumnDef`s, and the `HirCol` scope/env cols a derived table resolves
-/// `d.col` / wildcard against (the caller projects to `&mut c.def`).
-pub(crate) fn apply_positional_aliases(
-    aliases: &[TableAliasColumnDef],
+/// A rename can collide where the original names did not, so the duplicate check
+/// belongs here rather than at each caller.
+pub(crate) fn apply_positional_aliases<'a>(
+    aliases: impl ExactSizeIterator<Item = &'a Ident>,
     defs: Vec<&mut ColumnDef>,
     ctx: &str,
 ) -> Result<(), GnitzSqlError> {
-    if aliases.is_empty() {
+    let n_aliases = aliases.len();
+    if n_aliases == 0 {
         return Ok(());
     }
     let mut visible: Vec<&mut ColumnDef> = defs.into_iter().filter(|c| !c.is_hidden).collect();
-    if aliases.len() != visible.len() {
+    if n_aliases != visible.len() {
         return Err(GnitzSqlError::Plan(format!(
-            "{ctx} defines {} column aliases but body returns {} columns",
-            aliases.len(),
+            "{ctx} defines {n_aliases} column aliases but body returns {} columns",
             visible.len(),
         )));
     }
     for (col, alias) in visible.iter_mut().zip(aliases) {
-        col.name = alias.name.value.clone();
+        col.name = alias.value.clone();
     }
-    Ok(())
+    crate::validate::reject_duplicate_column_names(visible.iter().map(|c| &**c), &format!("{ctx} column aliases"))
 }
 
 /// The pure pass-through predicate shared by the CTE binding (`bind_ctes`) and the
@@ -300,7 +299,11 @@ pub(crate) fn cte_passthrough(
     // Apply CTE column aliases (`WITH cte(a, b) AS ...`).
     let cte_schema = if !column_aliases.is_empty() {
         let mut s = (*cte_schema).clone();
-        apply_positional_aliases(column_aliases, s.columns.iter_mut().collect(), "CTE")?;
+        apply_positional_aliases(
+            column_aliases.iter().map(|a| &a.name),
+            s.columns.iter_mut().collect(),
+            "CTE",
+        )?;
         Arc::new(s)
     } else {
         cte_schema

@@ -1,8 +1,10 @@
-//! Predicate-classification rewrite (pass 3). Partitions every `Join.on` into a
-//! `JoinClass` (equality pairs + an optional range conjunct + the residual) and
-//! folds the WHERE `Filter` — INNER into the residual, OUTER left as a
-//! post-null-fill filter. Left-vs-right is a `ColId` membership test (bind mints
-//! distinct ids per reference site, so even a self-join's two sides are disjoint).
+//! Predicate-classification rewrite (pass 3). Partitions a join's conjuncts into
+//! a `JoinClass` (equality pairs + an optional range conjunct + the residual). An
+//! INNER join also classifies the WHERE directly above it — `ON p WHERE q ≡
+//! ON (p AND q)` — which is what keys a comma-join step; an OUTER join leaves it
+//! above as a post-null-fill filter. Left-vs-right is a `ColId` membership test
+//! (bind mints distinct ids per reference site, so even a self-join's two sides
+//! are disjoint).
 
 use super::{
     as_col, col_by_id, hircol_of, ColId, ColIdGen, EqPair, HirCol, HirExpr, HirRange, HirRef, JoinClass, JoinOn,
@@ -34,42 +36,38 @@ pub(crate) fn classify(rel: Rc<RelExpr>) -> Result<Rc<RelExpr>, GnitzSqlError> {
 /// The per-pass `Rc` identity memo: original node pointer → rewritten node.
 type RewriteMemo = HashMap<*const RelExpr, Rc<RelExpr>>;
 
-/// Rebuild the spine: classify every buried `Join`, and fold each WHERE `Filter`
-/// directly above a Join into its residual (INNER) or keep it as a post-null-fill
-/// filter (OUTER). Every other node delegates its reassembly to the generic
-/// `RelExpr::map_children`.
+/// Rebuild the spine: classify every buried `Join`, folding each WHERE `Filter`
+/// directly above a Join into that join's own classification (INNER) or keeping
+/// it as a post-null-fill filter (OUTER). Every other node delegates its
+/// reassembly to the generic `RelExpr::map_children`.
 fn classify_rel(rel: Rc<RelExpr>, memo: &mut RewriteMemo) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    if matches!(rel.as_ref(), RelExpr::Join { .. }) {
+        return classify_join(&rel, &[], memo);
+    }
     let key = Rc::as_ptr(&rel);
     if let Some(done) = memo.get(&key) {
         return Ok(Rc::clone(done));
     }
     let out = match rel.as_ref() {
         RelExpr::Filter { input, preds } if matches!(input.as_ref(), RelExpr::Join { .. }) => {
-            let mut join = classify_join(input, memo)?;
-            if matches!(
-                join.as_ref(),
+            let inner = matches!(
+                input.as_ref(),
                 RelExpr::Join {
                     kind: JoinType::Inner,
                     ..
                 }
-            ) {
-                // INNER: `ON p WHERE q ≡ ON (p AND q)` — fold WHERE into the residual.
-                // `classify_join` returns a fresh Join, so mutate in place.
-                let RelExpr::Join {
-                    on: JoinOn::Class(class),
-                    ..
-                } = Rc::get_mut(&mut join).expect("classify_join returns a fresh Join")
-                else {
-                    unreachable!("classify_join returns a classified Join")
-                };
-                class.residual.extend(preds.iter().cloned());
+            );
+            // INNER: `ON p WHERE q ≡ ON (p AND q)`, so the WHERE joins the ON in one
+            // classification and may key the join. OUTER: it is a 3VL filter over the
+            // post-null-fill output, so it stays above and contributes no key.
+            let extra: &[HirExpr] = if inner { preds } else { &[] };
+            let join = classify_join(input, extra, memo)?;
+            if inner {
                 join
             } else {
-                // OUTER: the WHERE is a 3VL filter over the post-null-fill output.
                 RelExpr::filter(join, preds.clone())
             }
         }
-        RelExpr::Join { .. } => classify_join(&rel, memo)?,
         _ => RelExpr::map_children(&rel, &mut |child| classify_rel(Rc::clone(child), memo))?,
     };
     memo.insert(key, Rc::clone(&out));
@@ -77,7 +75,14 @@ fn classify_rel(rel: Rc<RelExpr>, memo: &mut RewriteMemo) -> Result<Rc<RelExpr>,
 }
 
 /// Classify one `Join` node (`JoinOn::Raw` → `JoinOn::Class`, recursing children).
-fn classify_join(rel: &Rc<RelExpr>, memo: &mut RewriteMemo) -> Result<Rc<RelExpr>, GnitzSqlError> {
+/// `extra` carries the WHERE conjuncts an INNER join absorbs.
+fn classify_join(rel: &Rc<RelExpr>, extra: &[HirExpr], memo: &mut RewriteMemo) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    // Shared through the memo only when the result is the node's own: classified
+    // against `extra`, it belongs to the parent that pushed those conjuncts down.
+    let key = extra.is_empty().then_some(Rc::as_ptr(rel));
+    if let Some(done) = key.and_then(|k| memo.get(&k)) {
+        return Ok(Rc::clone(done));
+    }
     let RelExpr::Join {
         left,
         right,
@@ -89,72 +94,182 @@ fn classify_join(rel: &Rc<RelExpr>, memo: &mut RewriteMemo) -> Result<Rc<RelExpr
     else {
         unreachable!("classify_join receives a Join");
     };
-    let new_left = classify_rel(Rc::clone(left), memo)?;
+    let left_cols = left.cols();
+    let right_cols = right.cols();
+
+    // A left-deep spine puts every step's WHERE above the TOP join, so a conjunct
+    // naming only left-input columns keys a step further down. Hand those there —
+    // but never below an outer join, which would run them before its null-fill.
+    let inner_left = matches!(
+        left.as_ref(),
+        RelExpr::Join {
+            kind: JoinType::Inner,
+            ..
+        }
+    );
+    let (here, deeper): (Vec<HirExpr>, Vec<HirExpr>) = extra
+        .iter()
+        .cloned()
+        .partition(|c| !inner_left || !refs_within(c, &left_cols));
+
+    let new_left = if deeper.is_empty() {
+        classify_rel(Rc::clone(left), memo)?
+    } else {
+        classify_join(left, &deeper, memo)?
+    };
     let new_right = classify_rel(Rc::clone(right), memo)?;
     let JoinOn::Raw(raw) = on else {
         unreachable!("classify visits each join once")
     };
-    let class = classify_on(raw, &left.cols(), &right.cols())?;
+    let class = classify_on(raw, &here, &left_cols, &right_cols)?;
     crate::hir::guards::reject_outer_with_residual(*kind, class.residual.is_empty())?;
-    Ok(Rc::new(RelExpr::Join {
+    let out = Rc::new(RelExpr::Join {
         left: new_left,
         right: new_right,
         kind: *kind,
         on: JoinOn::Class(class),
         mark: mark.clone(),
-    }))
+    });
+    if let Some(k) = key {
+        memo.insert(k, Rc::clone(&out));
+    }
+    Ok(out)
 }
 
-/// Partition the flattened `on` conjuncts into a `JoinClass`. `left_cols` /
-/// `right_cols` define the left-vs-right membership.
-fn classify_on(on: &[HirExpr], left_cols: &[HirCol], right_cols: &[HirCol]) -> Result<JoinClass, GnitzSqlError> {
-    let mut eq: Vec<EqPair> = Vec::new();
-    let mut range: Option<HirRange> = None;
-    let mut residual: Vec<HirExpr> = Vec::new();
+/// Whether `conj` names at least one column and every column it names lives in
+/// `cols` — the test for "this conjunct is about the left input alone", and so a
+/// candidate for a step further down the spine. A non-column reference (a
+/// subquery leaf) keeps it here, where its operands are known to resolve.
+fn refs_within(conj: &HirExpr, cols: &[HirCol]) -> bool {
+    let mut seen = 0usize;
+    let mut within = true;
+    conj.for_each_ref(&mut |r: &HirRef| {
+        seen += 1;
+        within &= matches!(r, HirRef::Col(id) if col_by_id(cols, *id).is_some());
+    });
+    seen > 0 && within
+}
 
-    for conj in on {
-        match conj {
-            BExpr::BinOp(l, op, r) => {
-                let cross = match (as_col(l), as_col(r)) {
-                    (Some(l), Some(r)) => cross_table(l, r, left_cols, right_cols),
-                    _ => None,
-                };
-                match (op, cross) {
-                    (BinOp::Eq, Some((lc, rc, _swapped))) => {
-                        // Drop an exact-duplicate / sides-swapped-duplicate pair.
-                        if eq.iter().any(|p| p.left == lc && p.right == rc) {
-                            continue;
-                        }
-                        let tc = validate_join_key_pair(&hircol_of(left_cols, lc).def, &hircol_of(right_cols, rc).def)?;
-                        eq.push(EqPair {
+/// Partition the join's conjuncts into a `JoinClass`. `left_cols` / `right_cols`
+/// define the left-vs-right membership. `on` is what the join step wrote, `extra`
+/// what an INNER join's WHERE contributes.
+fn classify_on(
+    on: &[HirExpr],
+    extra: &[HirExpr],
+    left_cols: &[HirCol],
+    right_cols: &[HirCol],
+) -> Result<JoinClass, GnitzSqlError> {
+    let mut class = JoinClass {
+        eq: Vec::new(),
+        range: None,
+        residual: Vec::new(),
+    };
+    absorb_conjuncts(&mut class, on, left_cols, right_cols, KeyDemand::Required)?;
+    absorb_conjuncts(&mut class, extra, left_cols, right_cols, KeyDemand::Optional)?;
+    crate::hir::guards::reject_join_key_arity(class.eq.len(), class.range.is_some())?;
+    Ok(class)
+}
+
+/// What a cross-table comparison this join cannot key means.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyDemand {
+    /// It was written as the join's own predicate: raise the error that names why
+    /// it cannot be a key (a float key column, an unpromotable type pair, one
+    /// range conjunct too many).
+    Required,
+    /// It was written as a WHERE predicate: keep it as a residual filter. The
+    /// promotion is a better plan for the same rows, never a requirement, so a
+    /// pair that will not key must not turn a working query into an error.
+    Optional,
+}
+
+/// One conjunct's cross-table shape, or `None` for anything that is not a
+/// comparison between a left column and a right one — which is every conjunct
+/// this join can only apply as a filter. `swapped` records that it was written
+/// `right OP left`, so a range operator can be turned to face the same way.
+fn cross_comparison(
+    conj: &HirExpr,
+    left_cols: &[HirCol],
+    right_cols: &[HirCol],
+) -> Option<(ColId, ColId, bool, BinOp)> {
+    let BExpr::BinOp(l, op, r) = conj else {
+        return None;
+    };
+    let (lc, rc, swapped) = cross_table(as_col(l)?, as_col(r)?, left_cols, right_cols)?;
+    Some((lc, rc, swapped, *op))
+}
+
+/// Fold `conjuncts` into `class`: each cross-table equality becomes a key column,
+/// the first cross-table range comparison becomes the range slot, and everything
+/// else becomes a residual predicate.
+fn absorb_conjuncts(
+    class: &mut JoinClass,
+    conjuncts: &[HirExpr],
+    left_cols: &[HirCol],
+    right_cols: &[HirCol],
+    demand: KeyDemand,
+) -> Result<(), GnitzSqlError> {
+    for conj in conjuncts {
+        let Some((lc, rc, swapped, op)) = cross_comparison(conj, left_cols, right_cols) else {
+            class.residual.push(conj.clone());
+            continue;
+        };
+        // A pair this join has already keyed on, in either orientation, adds
+        // nothing — the duplicate is dropped rather than widening the key.
+        if op == BinOp::Eq && class.eq.iter().any(|p| p.left == lc && p.right == rc) {
+            continue;
+        }
+        let (left_def, right_def) = (&hircol_of(left_cols, lc).def, &hircol_of(right_cols, rc).def);
+        // Past the cap a `Required` conjunct still claims a slot, so the closing
+        // `reject_join_key_arity` reports the count the user wrote; an `Optional` one
+        // stays a residual filter, which computes the same rows.
+        let range_after = class.range.is_some() || op != BinOp::Eq;
+        let fits = |eq: usize| {
+            demand == KeyDemand::Required
+                || crate::hir::guards::reject_join_key_arity(class.eq.len() + eq, range_after).is_ok()
+        };
+        // `binop_to_range_rel` never answers for `Eq`, so the two key arms cannot
+        // both match and neither needs to exclude the other.
+        let failed = match (op, binop_to_range_rel(op)) {
+            (BinOp::Eq, _) if fits(1) => match validate_join_key_pair(left_def, right_def) {
+                Ok(tc) => {
+                    class.eq.push(EqPair {
+                        left: lc,
+                        right: rc,
+                        tc,
+                    });
+                    continue;
+                }
+                Err(e) => e,
+            },
+            (_, Some(rel)) if class.range.is_none() && fits(0) => {
+                match validate_range_join_key_pair(left_def, right_def) {
+                    Ok(tc) => {
+                        class.range = Some(HirRange {
                             left: lc,
                             right: rc,
+                            op: if swapped { converse_rel(rel) } else { rel },
                             tc,
                         });
+                        continue;
                     }
-                    (_, Some((lc, rc, swapped))) if range.is_none() && binop_to_range_rel(*op).is_some() => {
-                        let rel = binop_to_range_rel(*op).expect("guarded above");
-                        let op = if swapped { converse_rel(rel) } else { rel };
-                        let tc = validate_range_join_key_pair(
-                            &hircol_of(left_cols, lc).def,
-                            &hircol_of(right_cols, rc).def,
-                        )?;
-                        range = Some(HirRange {
-                            left: lc,
-                            right: rc,
-                            op,
-                            tc,
-                        });
-                    }
-                    _ => residual.push(conj.clone()),
+                    Err(e) => e,
                 }
             }
-            _ => residual.push(conj.clone()),
+            // No slot for it, or an operator no key can carry: a filter.
+            _ => {
+                class.residual.push(conj.clone());
+                continue;
+            }
+        };
+        // The pair will not key. Written as the join's own predicate that is the
+        // error; written in the WHERE it is still a perfectly good filter.
+        if demand == KeyDemand::Required {
+            return Err(failed);
         }
+        class.residual.push(conj.clone());
     }
-
-    crate::hir::guards::reject_join_key_arity(eq.len(), range.is_some())?;
-    Ok(JoinClass { eq, range, residual })
+    Ok(())
 }
 
 /// Canonicalize a cross-table pair to `(left ColId, right ColId, swapped)`,
@@ -340,10 +455,7 @@ fn build_joined_subref(
                 ));
             }
             let mark_id = ids.next();
-            let mark = HirCol {
-                id: mark_id,
-                def: ColumnDef::new("_mark", TypeCode::I64, false).hidden(),
-            };
+            let mark = HirCol::new(mark_id, ColumnDef::new("_mark", TypeCode::I64, false).hidden());
             let joined = RelExpr::join(cur, Rc::clone(&s.rel), JoinType::Mark, corr_on(s), Some(mark));
             // The mark column is 1 iff the subquery matched; the node's truth is
             // `matched` (EXISTS) or `!matched` (NOT EXISTS).
@@ -406,12 +518,9 @@ fn build_uncorrelated_inner(
     let (right, key_id) = match &agg.companion {
         None => (Rc::clone(&subref.rel), agg.out.id),
         Some(_) => {
-            let key = HirCol {
-                id: ids.next(),
-                // Hidden like every other synthetic slot: the finalized value
-                // exists to be a join key, and no name reaches it.
-                def: ColumnDef::new("_agg", agg.out.def.type_code, true).hidden(),
-            };
+            // Hidden like every other synthetic slot: the finalized value exists
+            // to be a join key, and no name reaches it.
+            let key = HirCol::new(ids.next(), ColumnDef::new("_agg", agg.out.def.type_code, true).hidden());
             let key_id = key.id;
             let proj = RelExpr::project(
                 Rc::clone(&subref.rel),

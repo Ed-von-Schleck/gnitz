@@ -183,10 +183,9 @@ fn route_select<'q>(
         }
     }
 
-    // Step 3 — FROM shape. Zero FROM is a plain `Unsupported`; an explicit JOIN
-    // or a derived table derives (a view serves both); a comma-join is a shape
-    // CREATE VIEW rejects too, so it gets its own advice (rewrite as an explicit
-    // JOIN first) instead of the derivation template.
+    // Step 3 — FROM shape. Zero FROM is a plain `Unsupported`; every other
+    // multi-relation or derived shape derives a new relation, which is what a
+    // view is for — one template for all of them.
     match classify_from(&select.from) {
         FromShape::Empty => {
             return Err(GnitzSqlError::Unsupported(
@@ -194,13 +193,7 @@ fn route_select<'q>(
             ))
         }
         FromShape::Join => return reject_derivation("JOIN"),
-        FromShape::CommaJoin => {
-            return Err(GnitzSqlError::Unsupported(
-                "comma-join FROM (FROM a, b) is not supported; rewrite it as an explicit JOIN … ON …, then \
-                 CREATE VIEW <name> AS <that query> and SELECT from it"
-                    .to_string(),
-            ))
-        }
+        FromShape::CommaJoin => return reject_derivation("comma-join FROM"),
         FromShape::DerivedTable => return reject_derivation("derived table in FROM"),
         FromShape::SinglePlainRelation => {}
     }

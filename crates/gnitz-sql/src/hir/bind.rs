@@ -16,13 +16,13 @@ use crate::ast_util::{
     flatten_conjuncts, for_each_agg_call, group_by_exprs, group_by_target, has_exists_in_subquery, has_scalar_subquery,
     is_agg_call, peel_nested, projection_item_expr, reject_grouped_column_ref, reject_ungrouped_column,
     reject_unresolved_aggregate, reject_unsupported_fn_qualifiers, scalar_projection_item, single_relation_col_name,
-    unknown_function, FromShape,
+    unknown_function, wildcard_name_is_visible, FromShape,
 };
 use crate::bind::{apply_positional_aliases, cte_passthrough};
 use crate::bind::{bind_structural, find_unique_column, single_relation_col_idx, Binder, LeafBinder};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::chain::ViewChain;
-use crate::hir::guards::join_on_and_type;
+use crate::hir::guards::{join_keys_and_type, JoinKeys};
 use crate::ir::{AggFunc, BExpr, BinOp};
 use crate::validate::{
     cte_body, non_recursive_ctes, plain_select_body, reject_duplicate_projection_names, reject_float_key,
@@ -73,7 +73,11 @@ pub(crate) fn bind_ctes(
         // aliases applied to the emitted visible columns.
         let (seg_vid, seg_schema, ()) = chain.add_segment(|chain| {
             let (circuit, mut cols, pk) = bind_and_lower(cat, binder, chain, body, false)?;
-            apply_positional_aliases(&cte.alias.columns, cols.iter_mut().collect(), &ctx)?;
+            apply_positional_aliases(
+                cte.alias.columns.iter().map(|a| &a.name),
+                cols.iter_mut().collect(),
+                &ctx,
+            )?;
             Ok(((circuit, cols, pk), ()))
         })?;
         // A chain-minted segment id, not a catalog one: no kind, no index bound.
@@ -152,7 +156,11 @@ fn resolve_table_factor(
         let body = reject_query_envelope_body(subquery, &ctx)?;
         let subtree = bind_body(cat, binder, ids, body)?;
         let mut cols = subtree.cols();
-        apply_positional_aliases(&alias.columns, cols.iter_mut().map(|c| &mut c.def).collect(), &ctx)?;
+        apply_positional_aliases(
+            alias.columns.iter().map(|a| &a.name),
+            cols.iter_mut().map(|c| &mut c.def).collect(),
+            &ctx,
+        )?;
         return Ok((subtree, alias.name.value.clone(), cols));
     }
     let (name, alias) = extract_table_name_and_alias(factor, "CREATE VIEW")?;
@@ -169,15 +177,14 @@ fn bind_select(
     ids: &ColIdGen,
     select: &Select,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    if select.from.len() != 1 {
-        return Err(GnitzSqlError::Unsupported(
-            "CREATE VIEW: only single FROM item supported".to_string(),
-        ));
-    }
-    if select.from[0].joins.is_empty() {
-        bind_linear_select(cat, binder, ids, select)
-    } else {
-        bind_join_select(cat, binder, ids, select)
+    match select.from.as_slice() {
+        [] => Err(GnitzSqlError::Unsupported(
+            "CREATE VIEW: a view body reads at least one relation; this one has no FROM clause".to_string(),
+        )),
+        // One relation and no join step: the linear body. Everything else — a
+        // JOIN chain, a comma-separated FROM, or both — is a join body.
+        [single] if single.joins.is_empty() => bind_linear_select(cat, binder, ids, select),
+        _ => bind_join_select(cat, binder, ids, select),
     }
 }
 
@@ -266,19 +273,22 @@ fn bind_body_suffix<L: LeafBinder<HirRef>>(
 }
 
 /// Expand a bare `*` item over `cols` (honoring `EXCEPT`/`EXCLUDE`/`RENAME`,
-/// skipping hidden columns) into pass-through `ProjEntry`s — the one wildcard
-/// expansion, shared by the linear and join projections.
+/// skipping hidden and merged columns) into pass-through `ProjEntry`s — the one
+/// wildcard expansion, shared by the linear and join projections.
 fn expand_wildcard(
     item: &SelectItem,
     cols: &[HirCol],
     ctx: &str,
     ids: &ColIdGen,
 ) -> Result<Vec<ProjEntry>, GnitzSqlError> {
+    // Merged columns are dropped before the expansion rather than inside it, so
+    // the indices it returns address this list.
+    let cols: Vec<&HirCol> = cols.iter().filter(|c| !c.merged).collect();
     Ok(expand_wildcard_item(item, cols.iter().map(|c| &c.def), ctx)?
         .into_iter()
         .map(|(i, def)| ProjEntry {
             expr: BExpr::ColRef(HirRef::Col(cols[i].id)),
-            out: HirCol { id: ids.next(), def },
+            out: HirCol::new(ids.next(), def),
         })
         .collect())
 }
@@ -341,10 +351,7 @@ fn bind_proj_expr<L: LeafBinder<HirRef>>(
     };
     Ok(ProjEntry {
         expr: bound,
-        out: HirCol {
-            id: ids.next(),
-            def: out_def,
-        },
+        out: HirCol::new(ids.next(), out_def),
     })
 }
 
@@ -878,11 +885,13 @@ fn build_scalar_reduce(
 
 // ── FROM-join binding ──────────────────────────────────────────────────────────
 
-/// Bind a FROM-join body to `Project(Filter?(Join(...)))`. The join list folds
+/// Bind a FROM-join body to `Project(Filter?(Join(...)))`. Every step folds
 /// left-deep in syntactic order (no reordering), so `a LEFT JOIN b JOIN c` is
-/// `(a LEFT JOIN b) JOIN c`. ON conjuncts bind raw into `Join.on` (the predicate
-/// rewrite classifies them); the WHERE binds to a `Filter` over the top join (the
-/// rewrite folds INNER into the residual, keeps OUTER as a post-null-fill filter).
+/// `(a LEFT JOIN b) JOIN c`; a comma between FROM items is one more INNER step,
+/// binding loosest, so `FROM a JOIN b ON …, c` is `((a JOIN b) , c)`.
+///
+/// Conjuncts bind raw — into `Join.on` from the step, into a `Filter` from the
+/// WHERE. `hir::rewrite` is what classifies them into keys.
 fn bind_join_select(
     cat: &CatalogSnapshot,
     binder: &mut Binder<'_>,
@@ -892,25 +901,29 @@ fn bind_join_select(
     let grouped = body_is_grouped(select);
     let distinct = select.distinct.is_some();
     reject_unhonored_select_clauses(select, HonoredClauses::for_body(grouped, distinct), "CREATE VIEW JOIN")?;
-    let from = &select.from[0];
 
-    // Leftmost relation (a table, a CTE, or a derived table).
-    let (left_src, lalias, lcols) = resolve_table_factor(cat, binder, ids, &from.relation)?;
+    // `bind_select` sends a FROM-less body to its own rejection, so the first
+    // item is always there to seed the accumulator.
+    let first = select
+        .from
+        .first()
+        .expect("bind_select routes a FROM-less body to its own rejection");
+    let (mut left, alias, cols) = resolve_table_factor(cat, binder, ids, &first.relation)?;
     let mut scope = JoinScope::new();
-    scope.push(&lalias, lcols);
-    let mut left = left_src;
+    scope.push(&alias, cols);
 
-    // Each join step: resolve the right relation, bind the ON conjuncts against the
-    // accumulated scope, then fold into a `Join` node.
-    for join in &from.joins {
-        let (on_expr, kind) = join_on_and_type(join)?;
-        let (right_src, ralias, rcols) = resolve_table_factor(cat, binder, ids, &join.relation)?;
-        scope.push(&ralias, rcols);
-        let on = bind_conjuncts(on_expr, &join_leaf(&scope))?;
-        left = RelExpr::join(left, right_src, kind, on, None);
-        // Reflect this step's null-widening back into the scope so a later ON /
-        // the WHERE / the projection resolve against the widened nullability.
-        scope.widen_step(kind);
+    for (i, item) in select.from.iter().enumerate() {
+        // Item 0's relation seeded the accumulator above; every later item is one
+        // more INNER step carrying no keys of its own — the comma's whole meaning.
+        if i > 0 {
+            let comma = (JoinKeys::None, JoinType::Inner);
+            left = fold_join_step(cat, binder, ids, &mut scope, left, &item.relation, comma)?;
+        }
+        // Then that item's own JOIN chain, left-deep in syntactic order.
+        for join in &item.joins {
+            let step = join_keys_and_type(join)?;
+            left = fold_join_step(cat, binder, ids, &mut scope, left, &join.relation, step)?;
+        }
     }
 
     // The WHERE lands as a `Filter` over the top join (raw conjuncts; the rewrite
@@ -919,6 +932,107 @@ fn bind_join_select(
     // against the join output scope (column references + wildcard only; a
     // computed expression over a join output is rejected).
     bind_body_suffix(ids, select, left, &scope.combined, &join_leaf(&scope), "JOIN view")
+}
+
+/// Fold one join step onto the accumulated left input: resolve the right
+/// relation, derive the step's ON conjuncts from its constraint, merge away the
+/// duplicate copy of each `USING` / `NATURAL` column, and widen the scope by the
+/// step's null semantics.
+fn fold_join_step(
+    cat: &CatalogSnapshot,
+    binder: &mut Binder<'_>,
+    ids: &ColIdGen,
+    scope: &mut JoinScope,
+    left: Rc<RelExpr>,
+    relation: &TableFactor,
+    (keys, kind): (JoinKeys<'_>, JoinType),
+) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    let (right_src, ralias, rcols) = resolve_table_factor(cat, binder, ids, relation)?;
+
+    let pairs = match &keys {
+        JoinKeys::Using(cols) => {
+            let mut names = Vec::with_capacity(cols.len());
+            for c in *cols {
+                names.push(crate::ast_util::extract_name(c, "JOIN USING")?);
+            }
+            crate::validate::reject_duplicate_names(names.iter().map(String::as_str), "JOIN USING")?;
+            merge_pairs(scope, &rcols, &names, "USING")?
+        }
+        JoinKeys::Natural => {
+            let names = scope.shared_names(&rcols);
+            if names.is_empty() {
+                return Err(GnitzSqlError::Unsupported(
+                    "NATURAL JOIN over two relations that share no column name is a keyless \
+                     product, which is not supported; name the predicate with `ON …`"
+                        .to_string(),
+                ));
+            }
+            merge_pairs(scope, &rcols, &names, "NATURAL")?
+        }
+        JoinKeys::On(_) | JoinKeys::None => Vec::new(),
+    };
+
+    scope.push(&ralias, rcols);
+
+    // One match on `keys`, above. Every other form states its keys as `pairs`,
+    // which is empty for a keyless step — so a step with no constraint of its own
+    // needs no arm of its own, and the WHERE is what may key it.
+    let on = match &keys {
+        JoinKeys::On(e) => bind_conjuncts(e, &join_leaf(scope))?,
+        _ => pairs
+            .iter()
+            .map(|&(l, r)| {
+                BExpr::BinOp(
+                    Box::new(BExpr::ColRef(HirRef::Col(l))),
+                    BinOp::Eq,
+                    Box::new(BExpr::ColRef(HirRef::Col(r))),
+                )
+            })
+            .collect(),
+    };
+
+    // The merged column's value is the PRESERVED side's copy, so the other side's
+    // stops answering an unqualified reference and leaves `*`. `alias.col` still
+    // reaches it — the two are distinct columns of the join output, and only the
+    // one name they share was ambiguous.
+    for &(l, r) in &pairs {
+        scope.merge_away(if kind == JoinType::Right { l } else { r });
+    }
+
+    let out = RelExpr::join(left, right_src, kind, on, None);
+    // Reflect this step's null-widening back into the scope so a later ON /
+    // the WHERE / the projection resolve against the widened nullability.
+    scope.widen_step(kind);
+    Ok(out)
+}
+
+/// The `(left col, right col)` pair for each merged column name: the left copy
+/// resolved against the scope as it stands, the right copy by name within the
+/// incoming relation. `clause` names the surface for the error.
+fn merge_pairs(
+    scope: &JoinScope,
+    rcols: &[HirCol],
+    names: &[String],
+    clause: &str,
+) -> Result<Vec<(ColId, ColId)>, GnitzSqlError> {
+    let mut pairs = Vec::with_capacity(names.len());
+    for name in names {
+        // `?` first: a name the left side carries twice is ambiguous, and the
+        // scope's own wording says so — reporting it as "not found" would send
+        // the reader looking for a column that is right there, twice.
+        let l = scope.find_unqualified(name)?.ok_or_else(|| {
+            GnitzSqlError::Bind(format!(
+                "JOIN {clause}: column '{name}' not found on the left of the join"
+            ))
+        })?;
+        let idx = find_unique_column(rcols.iter().map(|c| &c.def), name)?.ok_or_else(|| {
+            GnitzSqlError::Bind(format!(
+                "JOIN {clause}: column '{name}' not found on the right of the join"
+            ))
+        })?;
+        pairs.push((l, rcols[idx].id));
+    }
+    Ok(pairs)
 }
 
 /// The name-resolution scope of a FROM-join body: all in-scope (null-widened)
@@ -936,6 +1050,33 @@ impl JoinScope {
             combined: Vec::new(),
             relations: Vec::new(),
         }
+    }
+
+    /// Mark the non-preserved side's copy of a `USING` / `NATURAL` column: it
+    /// stops answering an unqualified name and leaves `*`, but stays reachable as
+    /// `alias.col`.
+    fn merge_away(&mut self, id: ColId) {
+        for c in self.combined.iter_mut().filter(|c| c.id == id) {
+            c.merged = true;
+        }
+    }
+
+    /// The visible column names this scope currently answers unqualified — what
+    /// `NATURAL` intersects the incoming relation's names against. Hidden slots
+    /// are not names a user can write, so they pair with nothing.
+    fn shared_names(&self, rcols: &[HirCol]) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for c in self.combined.iter().filter(|c| !c.def.is_hidden && !c.merged) {
+            // A NAME, once. Two like-named visible left columns are one name to
+            // pair on, and `merge_pairs` is what reports it as ambiguous; listing
+            // it twice would pair and merge the same column twice.
+            if wildcard_name_is_visible(rcols.iter().map(|r| &r.def), &c.def.name)
+                && !names.iter().any(|n| n.eq_ignore_ascii_case(&c.def.name))
+            {
+                names.push(c.def.name.clone());
+            }
+        }
+        names
     }
 
     fn push(&mut self, alias: &str, cols: Vec<HirCol>) {
@@ -980,18 +1121,18 @@ impl JoinScope {
         Ok(cols[idx].id)
     }
 
+    /// Look up an unqualified reference across the whole scope — one lookup, so a
+    /// name two relations both carry is the same ambiguity as one relation carrying
+    /// it twice. Merged columns are skipped, which is what makes a merged name
+    /// resolve rather than collide; absence is `Ok(None)` so a caller can word it.
+    fn find_unqualified(&self, name: &str) -> Result<Option<ColId>, GnitzSqlError> {
+        let visible: Vec<&HirCol> = self.combined.iter().filter(|c| !c.merged).collect();
+        Ok(find_unique_column(visible.iter().map(|c| &c.def), name)?.map(|i| visible[i].id))
+    }
+
     fn resolve_unqualified(&self, name: &str) -> Result<ColId, GnitzSqlError> {
-        let mut found: Option<ColId> = None;
-        for (_, span) in &self.relations {
-            let cols = self.rel_cols(span);
-            if let Some(idx) = find_unique_column(cols.iter().map(|c| &c.def), name)? {
-                if found.is_some() {
-                    return Err(GnitzSqlError::Bind(format!("column reference '{name}' is ambiguous")));
-                }
-                found = Some(cols[idx].id);
-            }
-        }
-        found.ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found in any table")))
+        self.find_unqualified(name)?
+            .ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found in any table")))
     }
 
     fn is_nullable(&self, id: ColId) -> bool {
@@ -1119,14 +1260,14 @@ impl<'a> PreMap<'a> {
             return Ok(id);
         }
         let ty = bound.infer_type_with(&|r: &HirRef| type_of(&self.env, r));
-        let out = HirCol {
-            id: self.ids.next(),
-            // Nullable because a computed value can be NULL (`a / 0`) and nothing
-            // infers otherwise — so an aggregate over one takes the null-skipping
-            // shape where the same aggregate over a NOT NULL column would not.
-            // Hidden because only the expression that minted it may reach it.
-            def: ColumnDef::new(format!("_pre{}", self.extra.len()), ty, true).hidden(),
-        };
+        // Nullable because a computed value can be NULL (`a / 0`) and nothing
+        // infers otherwise — so an aggregate over one takes the null-skipping shape
+        // where the same aggregate over a NOT NULL column would not. Hidden because
+        // only the expression that minted it may reach it.
+        let out = HirCol::new(
+            self.ids.next(),
+            ColumnDef::new(format!("_pre{}", self.extra.len()), ty, true).hidden(),
+        );
         let id = out.id;
         self.env.push(out.clone());
         self.extra.push(ProjEntry { expr: bound, out });
@@ -1344,10 +1485,7 @@ fn bind_finalize_projection<L: LeafBinder<HirRef>>(
             let name = alias.unwrap_or_else(|| default_agg_name(ga.agg.func, idx));
             items.push(ProjEntry {
                 expr: finalize_agg_expr(ga),
-                out: HirCol {
-                    id: ids.next(),
-                    def: ColumnDef::new(name, ga.view_type, ga.output_nullable),
-                },
+                out: HirCol::new(ids.next(), ColumnDef::new(name, ga.view_type, ga.output_nullable)),
             });
             continue;
         }
@@ -1474,15 +1612,13 @@ fn bind_set_op(
         }
         _ => {}
     }
+    // Exhaustive (no `_`): a set operator a future `sqlparser` adds stops the
+    // build here rather than reaching `RelExpr::set_op` as a silent EXCEPT.
     let kind = match op {
         SetOperator::Union => SetOpKind::Union,
         SetOperator::Intersect => SetOpKind::Intersect,
-        SetOperator::Except => SetOpKind::Except,
-        _ => {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "set operation {op:?} not supported"
-            )))
-        }
+        // MINUS is Oracle's spelling of EXCEPT, quantifier included.
+        SetOperator::Except | SetOperator::Minus => SetOpKind::Except,
     };
     let all = matches!(quantifier, SetQuantifier::All);
     // Each side binds as any relational body — a plain SELECT, a join, a grouped

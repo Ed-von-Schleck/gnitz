@@ -3,6 +3,8 @@
 Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_set_ops.py -v --tb=short
 """
+from collections import Counter
+
 import pytest
 import gnitz
 import _oracle as oracle
@@ -1068,5 +1070,71 @@ class TestSetOpIntegerPromotion:
             with pytest.raises(gnitz.GnitzError, match=err):
                 client.execute_sql(
                     "CREATE VIEW v AS SELECT val FROM t1 UNION ALL SELECT val FROM t2", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+
+class TestMinus:
+    """`MINUS` is Oracle's spelling of `EXCEPT`, and `parse_set_quantifier`
+    accepts `ALL` / `DISTINCT` after it exactly as after `EXCEPT` — so the two
+    spellings compile to one operator, quantifier included."""
+
+    def _setup(self, client, sn):
+        _create_ab_tables(client, sn)
+        # `a` carries 20 twice (two PKs, same val) so a DISTINCT-vs-ALL difference
+        # shows up as a weight, which a row-set comparison would miss.
+        client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 20), (3, 20), (4, 30)", schema_name=sn)
+        client.execute_sql("INSERT INTO b VALUES (1, 30), (2, 40)", schema_name=sn)
+
+    @pytest.mark.parametrize("quantifier", ["", " ALL", " DISTINCT"])
+    def test_minus_is_except(self, client, quantifier):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            _create_ab_tables(client, sn)
+            client.execute_sql(
+                f"CREATE VIEW m AS SELECT val FROM a MINUS{quantifier} SELECT val FROM b", schema_name=sn
+            )
+            client.execute_sql(
+                f"CREATE VIEW e AS SELECT val FROM a EXCEPT{quantifier} SELECT val FROM b", schema_name=sn
+            )
+            mid = client.resolve_table(sn, "m")[0]
+            eid = client.resolve_table(sn, "e")[0]
+            client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 20), (3, 20), (4, 30)", schema_name=sn)
+            client.execute_sql("INSERT INTO b VALUES (1, 30), (2, 40)", schema_name=sn)
+
+            got = oracle.scan_multiset(client, mid, ["val"])
+            want = oracle.scan_multiset(client, eid, ["val"])
+            assert got == want, f"MINUS{quantifier} must equal EXCEPT{quantifier}: {got} vs {want}"
+            # And the weights are the operator's, not merely a matching row set:
+            # ALL keeps 20 at weight 2, DISTINCT collapses it to 1.
+            expect_20 = 2 if quantifier == " ALL" else 1
+            assert got[(20,)] == expect_20, f"MINUS{quantifier} weight for 20: {got}"
+            assert (30,) not in got, f"30 is in b, so MINUS must remove it: {got}"
+        finally:
+            client.drop_schema(sn)
+
+    def test_minus_chains_with_union_and_except(self, client):
+        """MINUS binds at UNION/EXCEPT's precedence, so a mixed chain associates
+        identically to the same chain written with EXCEPT throughout."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            _create_ab_tables(client, sn)
+            client.execute_sql(
+                "CREATE TABLE c (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn
+            )
+            body = "SELECT val FROM a UNION SELECT val FROM b {} SELECT val FROM c"
+            client.execute_sql(f"CREATE VIEW m AS {body.format('MINUS')}", schema_name=sn)
+            client.execute_sql(f"CREATE VIEW e AS {body.format('EXCEPT')}", schema_name=sn)
+            mid = client.resolve_table(sn, "m")[0]
+            eid = client.resolve_table(sn, "e")[0]
+            client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 20)", schema_name=sn)
+            client.execute_sql("INSERT INTO b VALUES (1, 20), (2, 30)", schema_name=sn)
+            client.execute_sql("INSERT INTO c VALUES (1, 30)", schema_name=sn)
+            got = oracle.scan_multiset(client, mid, ["val"])
+            assert got == oracle.scan_multiset(client, eid, ["val"]), got
+            # `(a ∪ b) − c` left to right: {10,20,30} − {30}.
+            assert got == Counter({(10,): 1, (20,): 1}), got
         finally:
             client.drop_schema(sn)

@@ -606,3 +606,33 @@ def test_a_narrowed_worker_count_reclaims_the_delta_children(server_dirs):
         assert _delta_child_names(data_dir, vid) == {"delta_w0"}
     finally:
         narrow.stop()
+
+
+def test_a_cursor_across_or_replace_is_rejected(client):
+    """`CREATE OR REPLACE VIEW` is `DROP VIEW; CREATE VIEW` under one name: the
+    replacement takes a fresh id, so the tag — `boot_nonce ^ splitmix64(view_id)`
+    — changes even though the boot did not and the NAME did not. That is what
+    stops a subscriber silently applying the new view's deltas on top of a copy
+    built from the old one; unlike the drop case, the name still resolves, so
+    nothing else would tell it."""
+    sn = "s" + _uid()
+    _base_tables(client, sn)
+    _mk_feed(client, sn, "f", LINEAR)
+    sub = Subscriber(client, sn, "f")
+    client.execute_sql("INSERT INTO t VALUES (1, 100, 'a')", schema_name=sn)
+    sub.bootstrap()
+    sub.drain()
+    old_tag, old_tick = sub.tag, sub.tick
+
+    client.execute_sql(
+        f"CREATE OR REPLACE VIEW f WITH (delta = '{FEED}') AS {LINEAR}", schema_name=sn
+    )
+    client.execute_sql("INSERT INTO t VALUES (2, 200, 'b')", schema_name=sn)
+
+    fresh = Subscriber(client, sn, "f")
+    assert fresh.vid != sub.vid, "a replaced view takes a fresh id"
+    with pytest.raises(gnitz.GnitzDeltaExpiredError):
+        client.delta_poll(fresh.vid, fresh.delta_schema, old_tag, old_tick, include_hidden=True)
+
+    fresh.bootstrap()
+    fresh.assert_converged("after re-resolving and bootstrapping")

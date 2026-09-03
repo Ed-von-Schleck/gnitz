@@ -18,7 +18,7 @@ use gnitz_core::{
 use gnitz_sql::sqlparser::ast::Statement;
 use gnitz_sql::sqlparser::dialect::GenericDialect;
 use gnitz_sql::sqlparser::parser::Parser;
-use gnitz_sql::{plan_read, plan_view, GnitzSqlError, PlannedChain, ReadPlan};
+use gnitz_sql::{plan_read, plan_view, GnitzSqlError, PlannedChain, ReadPlan, ViewPlan};
 
 pub const SN: &str = "s";
 
@@ -175,9 +175,13 @@ pub fn base() -> CatalogSnapshot {
     ])
 }
 
-/// Plan a `CREATE VIEW` / `ALTER VIEW … AS` against `cat`.
+/// Plan a `CREATE VIEW` / `ALTER VIEW … AS` against `cat`. None of the statements
+/// here carry `IF NOT EXISTS`, the one clause that plans a skip.
 pub fn plan(cat: &CatalogSnapshot, sql: &str) -> Result<PlannedChain, GnitzSqlError> {
-    plan_view(&parse(sql), cat, SN)
+    plan_view(&parse(sql), cat, SN).map(|p| match p {
+        ViewPlan::Create { chain, .. } => chain,
+        ViewPlan::Skip { .. } => panic!("`{sql}` planned a skip"),
+    })
 }
 
 /// Plan a read (`SELECT` / `EXPLAIN`) against `cat`.

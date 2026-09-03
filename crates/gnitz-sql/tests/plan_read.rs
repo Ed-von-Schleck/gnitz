@@ -574,9 +574,13 @@ fn the_loop_resolves_only_what_the_planner_asks_for() {
         match &stmt {
             Statement::CreateView(_) => {
                 let (looped, asked) = resolving(&known, |c| gnitz_sql::plan_view(&stmt, c, SN));
-                let looped = looped.unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+                let chain = |p| match p {
+                    gnitz_sql::ViewPlan::Create { chain, .. } => chain,
+                    gnitz_sql::ViewPlan::Skip { .. } => panic!("`{sql}` planned a skip"),
+                };
+                let looped = chain(looped.unwrap_or_else(|e| panic!("`{sql}`: {e:?}")));
                 assert_eq!(asked, want, "`{sql}`");
-                let single = gnitz_sql::plan_view(&stmt, &known, SN).unwrap();
+                let single = chain(gnitz_sql::plan_view(&stmt, &known, SN).unwrap());
                 assert_eq!(looped.views.len(), single.views.len(), "`{sql}`");
                 for (a, b) in looped.views.iter().zip(&single.views) {
                     assert_eq!((a.seg, &a.circuit), (b.seg, &b.circuit), "`{sql}`");

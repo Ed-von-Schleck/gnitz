@@ -358,6 +358,7 @@ class TestSqlSelect:
                 ("SELECT pk, (SELECT MAX(k) FROM u) FROM t", "scalar subquery"),
                 ("SELECT x FROM (SELECT val AS x FROM t) d", "derived table in FROM"),
                 ("WITH c AS (SELECT pk FROM t WHERE val > 20) SELECT pk FROM c", "non-pass-through CTE"),
+                ("SELECT t.pk FROM t, u WHERE t.val = u.k", "comma-join FROM"),
             ]
             for sql, construct in cases:
                 with pytest.raises(gnitz.GnitzError) as ei:
@@ -367,15 +368,11 @@ class TestSqlSelect:
                 assert f"({construct})" in msg, f"{sql!r}: must name '{construct}', got: {msg}"
                 assert "CREATE VIEW" in msg, f"{sql!r}: must point at CREATE VIEW, got: {msg}"
 
-            # A comma-join is a shape CREATE VIEW rejects too, so the template's
-            # "CREATE VIEW AS <your query>" advice would be false for it: it gets
-            # its own message advising the explicit-JOIN rewrite.
-            with pytest.raises(gnitz.GnitzError) as ei:
-                client.execute_sql("SELECT pk FROM t, u WHERE t.val = u.k", schema_name=sn)
-            msg = str(ei.value)
-            assert "this query derives a new one" not in msg, f"comma-join must not use the template: {msg}"
-            assert "comma-join" in msg and "explicit JOIN" in msg and "CREATE VIEW" in msg, (
-                f"comma-join must advise the explicit-JOIN + CREATE VIEW rewrite, got: {msg}"
+            # The comma-join's advice is the template's, verbatim: a view body may
+            # be written that way, so "CREATE VIEW AS <your query>" is literally
+            # what the user should do next.
+            client.execute_sql(
+                "CREATE VIEW comma_ok AS SELECT t.pk FROM t, u WHERE t.val = u.k", schema_name=sn
             )
         finally:
             client.drop_schema(sn)
@@ -552,8 +549,8 @@ class TestSqlSelect:
         try:
             client.execute_sql("CREATE TABLE p (k BIGINT PRIMARY KEY)", schema_name=sn)
             client.execute_sql("CREATE TABLE t (pk BIGINT PRIMARY KEY, c BIGINT)", schema_name=sn)
-            with pytest.raises(gnitz.GnitzError, match="CREATE VIEW: output column aliases is not supported"):
-                client.execute_sql("CREATE VIEW v (a) AS SELECT pk FROM t", schema_name=sn)
+            with pytest.raises(gnitz.GnitzError, match="defines 2 column aliases but body returns 1"):
+                client.execute_sql("CREATE VIEW vbad (a, b) AS SELECT pk FROM t", schema_name=sn)
             with pytest.raises(gnitz.GnitzError, match="CREATE VIEW: TEMPORARY is not supported"):
                 client.execute_sql("CREATE TEMPORARY VIEW vt AS SELECT pk FROM t", schema_name=sn)
             # MATERIALIZED accepted (gnitz views are incrementally materialized).

@@ -2046,3 +2046,58 @@ def test_min_max_view_survives_restart_across_source_types(own_server):
     assert abs(rows[0]["f32_lo"] - 1.5) < 1e-6, f"MIN(f32) must recede to 1.5, got {rows[0]['f32_lo']}"
     assert abs(rows[0]["f64_lo"] - 1.5) < 1e-6, f"MIN(f64) must recede to 1.5, got {rows[0]['f64_lo']}"
     conn.close()
+
+
+def test_a_replaced_view_survives_restart(own_server):
+    """A view retargeted under its own name is the one shape where a restart has
+    two candidates for a name: the retired definition and the replacement. The
+    replacement takes a FRESH id and the retired one's stores are torn down by
+    the engine's cascade in the same DDL zone — so a boot has exactly one live
+    view to resume, serving the NEW body, and the retired id is gone.
+
+    Both spellings of the retarget are checked, since they build the same bundle:
+    `CREATE OR REPLACE VIEW` and `ALTER VIEW … AS`.
+    """
+    sn = "replace_restart"
+    own_server.start()
+    conn = gnitz.connect(own_server.sock_path)
+    conn.create_schema(sn)
+    conn.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
+        schema_name=sn,
+    )
+    conn.execute_sql("INSERT INTO t VALUES (1, 10, 100)", schema_name=sn)
+
+    conn.execute_sql("CREATE VIEW r AS SELECT pk, a FROM t", schema_name=sn)
+    retired_r, _ = conn.resolve_table(sn, "r")
+    conn.execute_sql("CREATE OR REPLACE VIEW r AS SELECT pk, b FROM t", schema_name=sn)
+    live_r, _ = conn.resolve_table(sn, "r")
+
+    conn.execute_sql("CREATE VIEW a2 AS SELECT pk, a FROM t", schema_name=sn)
+    retired_a, _ = conn.resolve_table(sn, "a2")
+    conn.execute_sql("ALTER VIEW a2 AS SELECT pk, b FROM t", schema_name=sn)
+    live_a, _ = conn.resolve_table(sn, "a2")
+
+    assert live_r != retired_r and live_a != retired_a, "a retarget takes a fresh id"
+    conn.close()
+
+    own_server.restart()
+    conn = gnitz.connect(own_server.sock_path)
+
+    for name, live, retired in (("r", live_r, retired_r), ("a2", live_a, retired_a)):
+        again, _ = conn.resolve_table(sn, name)
+        assert again == live, f"{name}: the name must still resolve to the replacement, not {again}"
+        # The retired id is gone, not merely shadowed by the name.
+        with pytest.raises(gnitz.GnitzError):
+            conn.scan(retired)
+        # And the resumed view serves the NEW body over the data already there.
+        rows = {r["pk"]: r for r in conn.scan(again)}
+        assert rows[1]["b"] == 100, f"{name}: resumed with the new body, got {rows}"
+
+    # Still maintained after the restart.
+    conn.execute_sql("INSERT INTO t VALUES (2, 20, 200)", schema_name=sn)
+    for name in ("r", "a2"):
+        vid, _ = conn.resolve_table(sn, name)
+        rows = {r["pk"]: r for r in conn.scan(vid)}
+        assert rows[2]["b"] == 200, f"{name}: not maintained after restart, got {rows}"
+    conn.close()

@@ -158,16 +158,13 @@ pub(crate) fn execute_statement(
             reject_unhonored_create_table_clauses(create, "CREATE TABLE")?;
             ddl::execute_create_table(client, schema_name, create)
         }
-        Statement::Drop { .. } => {
-            let (object_type, names) = drop_parts(stmt, "DROP")?;
-            ddl::execute_drop(client, schema_name, object_type, names)
-        }
+        Statement::Drop { .. } => ddl::execute_drop(client, schema_name, drop_parts(stmt, "DROP")?),
         Statement::CreateView(cv) => {
             reject_unhonored_create_view_clauses(cv, "CREATE VIEW")?;
-            let views = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {
+            let plan = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {
                 crate::plan_view(stmt, cat, schema_name)
             })?;
-            crate::hir::execute_create_view(client, schema_name, views)
+            crate::hir::execute_create_view(client, schema_name, plan)
         }
         Statement::Insert(insert) => {
             reject_unhonored_insert_clauses(insert, "INSERT")?;
@@ -192,10 +189,10 @@ pub(crate) fn execute_statement(
         Statement::AlterView { .. } => {
             // The clause reject rides in `plan_view`'s narrowing, which is the
             // one place `AlterView` is destructured.
-            let views = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {
+            let plan = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {
                 crate::plan_view(stmt, cat, schema_name)
             })?;
-            crate::hir::execute_alter_view(client, schema_name, views)
+            crate::hir::execute_alter_view(client, schema_name, plan)
         }
         _ => Err(GnitzSqlError::Unsupported(format!("unsupported SQL statement: {stmt}"))),
     }

@@ -1,14 +1,20 @@
 //! CREATE / ALTER VIEW front door: validate the query envelope, then drive the
 //! HIR pipeline — the CTE phase (`hir::bind::bind_ctes`) followed by
 //! `bind_and_lower` of the body — into a `ViewChain` committed atomically.
+//!
+//! Both statements plan into one [`ViewPlan`], which also carries what the
+//! statement's clauses decided about a name already in use: create it, supersede
+//! what stands there, or leave it alone.
 
+use crate::bind::apply_positional_aliases;
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{debug_assert_exchange_topology, ViewChain};
 use crate::validate::{alter_view_parts, reject_unhonored_query_clauses, validate_user_name, HonoredQueryClauses};
 use crate::SqlResult;
-use gnitz_core::{CatalogSnapshot, GnitzClient, PlannedView, RelClass};
-use sqlparser::ast::{CreateTableOptions, ObjectName, Query, Statement, Value, ValueWithSpan};
+use gnitz_core::{CatalogSnapshot, GnitzClient, PlannedView, RelClass, RelDescriptor, ViewReplace};
+use sqlparser::ast::{CreateTableOptions, Ident, ObjectName, Query, Statement, Value, ValueWithSpan};
+use std::sync::Arc;
 
 /// Binary units accepted by a `WITH (<option> = '<uint><unit>')` size string.
 const SIZE_UNITS: [(&str, u64); 3] = [("KB", 1 << 10), ("MB", 1 << 20), ("GB", 1 << 30)];
@@ -121,20 +127,30 @@ fn parse_size(option: &str, text: &str) -> Result<u64, GnitzSqlError> {
 /// the bundle rather than carried on it, because only that one element has one;
 /// every earlier segment is an internal one it depends on, which is the
 /// dependency order `create_view_chain` wants anyway.
-pub fn plan_view(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> Result<PlannedChain, GnitzSqlError> {
+pub fn plan_view(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> Result<ViewPlan, GnitzSqlError> {
     // A fresh binder per pass: the alias cache a re-run's discarded pass filled
     // must not reach the next one.
     let mut binder = Binder::new(schema_name).for_view_body();
     match stmt {
-        Statement::CreateView(cv) => plan_create_view(cat, cv, &mut binder),
+        Statement::CreateView(cv) => plan_create_view(cat, schema_name, cv, &mut binder),
         Statement::AlterView { .. } => {
-            let (name, query) = alter_view_parts(stmt, "ALTER VIEW")?;
-            plan_alter_view(cat, schema_name, name, query, &mut binder)
+            let (name, columns, query) = alter_view_parts(stmt, "ALTER VIEW")?;
+            plan_alter_view(cat, schema_name, name, columns, query, &mut binder)
         }
         _ => Err(GnitzSqlError::Unsupported(
             "plan_view describes a CREATE VIEW or an ALTER VIEW … AS; this statement is neither".to_string(),
         )),
     }
+}
+
+/// What a `CREATE VIEW` / `ALTER VIEW … AS` statement asks the connection to do.
+pub enum ViewPlan {
+    /// Register `chain`, superseding the view that already holds its name when
+    /// `replace` says so.
+    Create { chain: PlannedChain, replace: ViewReplace },
+    /// `IF NOT EXISTS`, and the name is taken: nothing to register. Carries the
+    /// id of the relation already standing there.
+    Skip { existing_id: u64 },
 }
 
 /// A planned `CREATE VIEW` / `ALTER VIEW … AS`: the user-facing name and the
@@ -144,14 +160,49 @@ pub struct PlannedChain {
     pub views: Vec<PlannedView>,
 }
 
+/// The relation `name` resolves to in the statement's snapshot, or `None` for a
+/// free name. Raises `CatalogMiss` for a name the snapshot has not probed, which
+/// is what drives `plan_resolving`'s resolve-and-re-run loop.
+fn probe(cat: &CatalogSnapshot, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
+    cat.get(schema_name, name)
+        .ok_or_else(|| GnitzSqlError::CatalogMiss(name.to_string()))
+}
+
 fn plan_create_view(
     cat: &CatalogSnapshot,
+    schema_name: &str,
     cv: &sqlparser::ast::CreateView,
     binder: &mut Binder<'_>,
-) -> Result<PlannedChain, GnitzSqlError> {
+) -> Result<ViewPlan, GnitzSqlError> {
     let query: &Query = &cv.query;
     let view_name = crate::ast_util::extract_name(&cv.name, "CREATE VIEW")?;
     validate_user_name(&view_name)?;
+
+    // Both clauses test the NAME, not the standing definition — a view's catalog
+    // rows are its compiled circuit, never its text. Probed only under a clause, so
+    // a plain CREATE VIEW still resolves nothing beyond what its body reads.
+    let replaced_vid = if cv.if_not_exists {
+        // Any relation under the name ends the statement, whatever its kind.
+        if let Some(rel) = probe(cat, schema_name, &view_name)? {
+            return Ok(ViewPlan::Skip { existing_id: rel.tid });
+        }
+        None
+    } else if cv.or_replace {
+        match probe(cat, schema_name, &view_name)? {
+            Some(rel) if rel.class.is_view() => Some(rel.tid),
+            // Replacing a table would destroy its rows; `DROP TABLE` says that out loud.
+            Some(rel) => {
+                return Err(GnitzSqlError::Unsupported(format!(
+                    "'{schema_name}.{view_name}' is a {}; CREATE OR REPLACE VIEW requires a view",
+                    rel.class.noun()
+                )))
+            }
+            // A free name: `OR REPLACE` degenerates to a plain create.
+            None => None,
+        }
+    } else {
+        None
+    };
 
     reject_unhonored_query_clauses(query, HonoredQueryClauses::VIEW_BODY, "CREATE VIEW")?;
 
@@ -159,9 +210,23 @@ fn plan_create_view(
 
     let mut chain = ViewChain::new();
     build_query_segments(cat, query, binder, &mut chain, options)?;
-    Ok(PlannedChain {
-        name: view_name,
-        views: chain.segments,
+
+    if let Some(old_vid) = replaced_vid {
+        reject_self_reference(&chain, old_vid, schema_name, &view_name, "CREATE OR REPLACE VIEW")?;
+    }
+
+    apply_output_aliases(&mut chain, cv.columns.iter().map(|c| &c.name), "CREATE VIEW")?;
+
+    Ok(ViewPlan::Create {
+        chain: PlannedChain {
+            name: view_name,
+            views: chain.segments,
+        },
+        replace: match replaced_vid {
+            // The statement carried the whole definition, `WITH (…)` included.
+            Some(_) => ViewReplace::WithBudgets,
+            None => ViewReplace::Nothing,
+        },
     })
 }
 
@@ -176,9 +241,10 @@ fn plan_alter_view(
     cat: &CatalogSnapshot,
     schema_name: &str,
     name: &ObjectName,
+    columns: &[Ident],
     query: &Query,
     binder: &mut Binder<'_>,
-) -> Result<PlannedChain, GnitzSqlError> {
+) -> Result<ViewPlan, GnitzSqlError> {
     let view_name = crate::ast_util::extract_name(name, "ALTER VIEW")?;
     validate_user_name(&view_name)?;
 
@@ -190,32 +256,71 @@ fn plan_alter_view(
     let mut chain = ViewChain::new();
     build_query_segments(cat, query, binder, &mut chain, ViewOptions::default())?;
 
-    // Reject self-reference: `FROM v` in the new query resolves to the still-live
-    // old vid, which would appear as a source of the new plan — the bundle
-    // retracts that vid, so the new definition would lose its own input.
+    reject_self_reference(&chain, old_vid, schema_name, &view_name, "ALTER VIEW")?;
+    apply_output_aliases(&mut chain, columns.iter(), "ALTER VIEW")?;
+
+    Ok(ViewPlan::Create {
+        chain: PlannedChain {
+            name: view_name,
+            views: chain.segments,
+        },
+        // `ALTER VIEW … AS` re-renders its body with no option clause.
+        replace: ViewReplace::BodyOnly,
+    })
+}
+
+/// Rename the chain's final segment's visible output columns positionally —
+/// `CREATE VIEW v (x, y) AS …` and `ALTER VIEW v (x, y) AS …` alike. The final
+/// segment is the user-named view, the only one whose column names a user wrote.
+fn apply_output_aliases<'a>(
+    chain: &mut ViewChain,
+    aliases: impl ExactSizeIterator<Item = &'a Ident>,
+    what: &str,
+) -> Result<(), GnitzSqlError> {
+    let final_seg = chain
+        .segments
+        .last_mut()
+        .expect("build_query_segments pushes the final view");
+    apply_positional_aliases(aliases, final_seg.output_columns.iter_mut().collect(), what)
+}
+
+/// A replacing bundle retracts `old_vid` in the same zone as it registers the new
+/// chain, so the new body may not scan it: `FROM v` in the new query resolves to
+/// the still-live old vid, and the new definition would lose its own input.
+/// `what` names the statement for the message.
+fn reject_self_reference(
+    chain: &ViewChain,
+    old_vid: u64,
+    schema_name: &str,
+    view_name: &str,
+    what: &str,
+) -> Result<(), GnitzSqlError> {
     if chain
         .segments
         .iter()
         .any(|s| s.circuit.dependencies().contains(&old_vid))
     {
         return Err(GnitzSqlError::Unsupported(format!(
-            "ALTER VIEW '{schema_name}.{view_name}' AS a query referencing the view itself is not supported"
+            "{what} '{schema_name}.{view_name}' AS a query referencing the view itself is not supported"
         )));
     }
-
-    Ok(PlannedChain {
-        name: view_name,
-        views: chain.segments,
-    })
+    Ok(())
 }
 
-/// Commit a planned `CREATE VIEW` bundle; the owner's real id comes back from it.
+/// Commit a planned `CREATE [OR REPLACE] VIEW [IF NOT EXISTS]`; the owner's real
+/// id comes back from the bundle. A skipped statement answers with the id of the
+/// view already standing under the name — the same shape a create answers with,
+/// because the caller asked for that name to hold a view and it does.
 pub(crate) fn execute_create_view(
     client: &mut GnitzClient,
     schema_name: &str,
-    chain: PlannedChain,
+    plan: ViewPlan,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let vids = client.create_view_chain(schema_name, &chain.name, chain.views, None)?;
+    let (chain, replace) = match plan {
+        ViewPlan::Skip { existing_id } => return Ok(SqlResult::ViewCreated { view_id: existing_id }),
+        ViewPlan::Create { chain, replace } => (chain, replace),
+    };
+    let vids = client.create_view_chain(schema_name, &chain.name, chain.views, replace)?;
     let view_id = *vids
         .last()
         .ok_or_else(|| GnitzSqlError::Internal("create_view_chain returned no ids".to_string()))?;
@@ -229,9 +334,14 @@ pub(crate) fn execute_create_view(
 pub(crate) fn execute_alter_view(
     client: &mut GnitzClient,
     schema_name: &str,
-    chain: PlannedChain,
+    plan: ViewPlan,
 ) -> Result<SqlResult, GnitzSqlError> {
-    client.create_view_chain(schema_name, &chain.name, chain.views, Some(&chain.name))?;
+    let ViewPlan::Create { chain, replace } = plan else {
+        return Err(GnitzSqlError::Internal(
+            "ALTER VIEW … AS always plans a bundle; only CREATE VIEW IF NOT EXISTS skips".to_string(),
+        ));
+    };
+    client.create_view_chain(schema_name, &chain.name, chain.views, replace)?;
     Ok(SqlResult::Altered {
         object: "view".to_string(),
         name: chain.name,
@@ -241,10 +351,7 @@ pub(crate) fn execute_alter_view(
 /// Resolve `name` to a VIEW id, rejecting `ALTER VIEW <table>` and a missing
 /// relation.
 fn resolve_view_id(cat: &CatalogSnapshot, schema_name: &str, name: &str) -> Result<u64, GnitzSqlError> {
-    let resolved = cat
-        .get(schema_name, name)
-        .ok_or_else(|| GnitzSqlError::CatalogMiss(name.to_string()))?;
-    match resolved {
+    match probe(cat, schema_name, name)? {
         // `ALTER VIEW … AS` re-renders its body as a bare `CREATE VIEW … AS …`,
         // dropping any option clause — so retargeting a bounded view would
         // silently convert it into an unbounded one.

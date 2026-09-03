@@ -11,6 +11,7 @@
 use gnitz_core::connection::{COL_TAB, IDX_TAB, SCHEMA_TAB, SEQ_TAB, TABLE_TAB};
 use gnitz_core::protocol::{BatchAppender, ColumnDef, TypeCode, ZSetBatch};
 use gnitz_core::types::sys_schema;
+use gnitz_core::ViewReplace;
 use gnitz_core::{CircuitBuilder, GnitzClient, PlannedView, Session, TableProps};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::sys_rows::{
@@ -424,7 +425,7 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
                 capacity_bytes: None,
                 delta_bytes: None,
             }],
-            Some("v"),
+            ViewReplace::BodyOnly,
         )
         .expect("the replacement bundle applies");
     assert_ne!(vids[0], first, "the replacement takes a fresh id");
@@ -509,7 +510,7 @@ fn a_circuit_row_naming_a_view_the_bundle_does_not_create_is_refused() {
     assert!(err.contains("does not create"), "{err}");
 
     // The table it named is still droppable, which is the whole point.
-    client.drop_table("phantomview", "t").unwrap();
+    client.drop_table("phantomview", "t", false).unwrap();
 }
 
 /// Two `+1` rows under one schema name both pass the cache check and both apply:
@@ -648,17 +649,26 @@ fn a_bounded_or_fed_view_cannot_be_retargeted() {
             delta_bytes,
         }
     };
-    client
-        .create_view_chain("retarget", "b", vec![view(Some(1 << 20), None)], None)
-        .unwrap();
-    client
-        .create_view_chain("retarget", "f", vec![view(None, Some(1 << 20))], None)
-        .unwrap();
+    let budgets = [("b", Some(1 << 20), None), ("f", None, Some(1 << 20))];
+    for (name, capacity, delta) in budgets {
+        client
+            .create_view_chain("retarget", name, vec![view(capacity, delta)], ViewReplace::Nothing)
+            .unwrap();
+    }
+    // `BodyOnly` is `ALTER VIEW … AS`, whose grammar carries no `WITH (…)`: the
+    // budget would vanish with nothing in the statement saying so.
     for (name, needle) in [("b", "capacity-bounded"), ("f", "delta feed")] {
         let err = client
-            .create_view_chain("retarget", name, vec![view(None, None)], Some(name))
+            .create_view_chain("retarget", name, vec![view(None, None)], ViewReplace::BodyOnly)
             .expect_err("retargeting must be refused")
             .to_string();
         assert!(err.contains(needle), "got: {err}");
+    }
+    // `WithBudgets` is `CREATE OR REPLACE VIEW`, which writes the budgets out — so
+    // the same bundle that `BodyOnly` refuses is exactly what it asks for.
+    for (name, capacity, delta) in budgets {
+        client
+            .create_view_chain("retarget", name, vec![view(capacity, delta)], ViewReplace::WithBudgets)
+            .unwrap_or_else(|e| panic!("replacing '{name}' with its budgets restated: {e}"));
     }
 }

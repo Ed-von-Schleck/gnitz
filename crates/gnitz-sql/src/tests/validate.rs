@@ -73,7 +73,10 @@ fn transaction_control_rejected_clause_matrix() {
 fn alter_view_rejected_clause_matrix() {
     let guard = |sql: &str| alter_view_parts(&parse_stmt(sql), "ALTER VIEW").map(|_| ());
     assert!(guard("ALTER VIEW v AS SELECT a FROM t").is_ok());
-    // Both would silently produce a view whose schema is not the query's.
-    assert!(guard("ALTER VIEW v (x, y) AS SELECT a, b FROM t").is_err());
+    // The column list is consumed as positional output aliases, exactly as
+    // `CREATE VIEW v (x, y) AS` is — the planner applies it and checks its arity.
+    assert!(guard("ALTER VIEW v (x, y) AS SELECT a, b FROM t").is_ok());
+    // `WITH (…)` parses here and is rejected: ALTER VIEW retargets a body, so
+    // letting it set a budget would make the clause-less form silently drop one.
     assert!(guard("ALTER VIEW v WITH (security_barrier = true) AS SELECT a FROM t").is_err());
 }

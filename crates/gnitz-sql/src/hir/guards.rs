@@ -1,6 +1,6 @@
 //! The pass-neutral guards: what the HIR *rejects*, independent of which pass
-//! notices. Bind classifies a FROM-clause `JOIN … ON` here, the classification
-//! rewrite validates each key pair and the ON arity here, and lowering checks the
+//! notices. Bind classifies a FROM-clause join step here, the classification
+//! rewrite validates each key pair and the key arity here, and lowering checks the
 //! range-join output caps here — so no pass has to reach into another for a rule,
 //! and `hir::lower` depends only downward.
 
@@ -10,14 +10,13 @@ use crate::validate::reject_float_keys;
 use gnitz_core::{ColumnDef, RangeRel, TypeCode};
 use sqlparser::ast::{Expr, JoinConstraint, JoinOperator};
 
-/// The ON expression and type of one join step. Each step supports
-/// INNER / LEFT / RIGHT / FULL, left-deep in syntactic order (no reordering),
-/// so `a LEFT JOIN b JOIN c` is `(a LEFT JOIN b) JOIN c` — each step's emit is the
-/// standard 2-way emit, outer null-fill included.
+/// What supplies one join step's key columns, and the step's type — orthogonal in
+/// the grammar, so `NATURAL LEFT JOIN` is `(JoinKeys::Natural, JoinType::Left)`.
 ///
-/// sqlparser 0.56 spells the bare/`OUTER` forms as separate variants
-/// (`Left`/`LeftOuter`, `Right`/`RightOuter`); FULL has only `FullOuter`.
-pub(crate) fn join_on_and_type(join: &sqlparser::ast::Join) -> Result<(&Expr, JoinType), GnitzSqlError> {
+/// A `CROSS JOIN` is an INNER step stating no keys, which is what a comma between
+/// FROM items is too; `reject_join_key_arity` is the one place a join with no
+/// cross-table predicate at all is refused.
+pub(crate) fn join_keys_and_type(join: &sqlparser::ast::Join) -> Result<(JoinKeys<'_>, JoinType), GnitzSqlError> {
     let sqlparser::ast::Join {
         relation: _, // resolved by the caller as the step's right input
         // Inert: ClickHouse's `GLOBAL` asks for evaluation against the whole
@@ -25,21 +24,64 @@ pub(crate) fn join_on_and_type(join: &sqlparser::ast::Join) -> Result<(&Expr, Jo
         global: _,
         join_operator,
     } = join;
-    match join_operator {
-        JoinOperator::Inner(JoinConstraint::On(e)) | JoinOperator::Join(JoinConstraint::On(e)) => {
-            Ok((e, JoinType::Inner))
+    let (constraint, kind) = match join_operator {
+        JoinOperator::Inner(c) | JoinOperator::Join(c) => (c, JoinType::Inner),
+        JoinOperator::LeftOuter(c) | JoinOperator::Left(c) => (c, JoinType::Left),
+        JoinOperator::RightOuter(c) | JoinOperator::Right(c) => (c, JoinType::Right),
+        JoinOperator::FullOuter(c) => (c, JoinType::Full),
+        JoinOperator::CrossJoin(c) => (c, JoinType::Inner),
+        _ => {
+            return Err(GnitzSqlError::Unsupported(
+                "CREATE VIEW JOIN: only INNER / LEFT / RIGHT / FULL JOIN, with ON / USING / \
+                 NATURAL, are supported"
+                    .into(),
+            ))
         }
-        JoinOperator::LeftOuter(JoinConstraint::On(e)) | JoinOperator::Left(JoinConstraint::On(e)) => {
-            Ok((e, JoinType::Left))
+    };
+    let keys = match constraint {
+        JoinConstraint::On(e) => JoinKeys::On(e),
+        JoinConstraint::Using(cols) => {
+            reject_full_join_column_merge(kind, "USING")?;
+            JoinKeys::Using(cols)
         }
-        JoinOperator::RightOuter(JoinConstraint::On(e)) | JoinOperator::Right(JoinConstraint::On(e)) => {
-            Ok((e, JoinType::Right))
+        JoinConstraint::Natural => {
+            reject_full_join_column_merge(kind, "NATURAL")?;
+            JoinKeys::Natural
         }
-        JoinOperator::FullOuter(JoinConstraint::On(e)) => Ok((e, JoinType::Full)),
-        _ => Err(GnitzSqlError::Unsupported(
-            "CREATE VIEW JOIN: only INNER / LEFT / RIGHT / FULL JOIN ... ON supported".into(),
-        )),
+        // No constraint at all: `CROSS JOIN b`, `INNER JOIN b` with nothing after
+        // it, and the comma between FROM items are one shape, and bind as one.
+        JoinConstraint::None => JoinKeys::None,
+    };
+    Ok((keys, kind))
+}
+
+/// Where one join step's key columns come from.
+pub(crate) enum JoinKeys<'a> {
+    /// `ON <expr>` — the conjuncts are classified as written.
+    On(&'a Expr),
+    /// `USING (c, …)` — each named column is equated across the two sides and the
+    /// two copies merge into one output column.
+    Using(&'a [sqlparser::ast::ObjectName]),
+    /// `NATURAL` — `USING` over every column name the two sides share.
+    Natural,
+    /// No constraint: a `CROSS JOIN`, a comma-separated FROM item, or `JOIN b`
+    /// with nothing after it. Keyless on its own; the WHERE is what may key it.
+    None,
+}
+
+/// The merged column is the preserved side's copy, which INNER / LEFT / RIGHT can
+/// pass through. FULL preserves both, so its merged column would be
+/// `COALESCE(l.c, r.c)` — computed, and a join projection carries only
+/// pass-throughs.
+fn reject_full_join_column_merge(kind: JoinType, clause: &str) -> Result<(), GnitzSqlError> {
+    if kind != JoinType::Full {
+        return Ok(());
     }
+    Err(GnitzSqlError::Unsupported(format!(
+        "FULL JOIN … {clause} is not supported: the merged column would be \
+         COALESCE(left, right), which a join projection cannot compute. Write the \
+         equality as `ON …` and project the two columns you want."
+    )))
 }
 
 /// Outer + residual is unsupported: an outer preserved-side row's null-fill
@@ -230,7 +272,10 @@ pub(crate) fn converse_rel(r: RangeRel) -> RangeRel {
 pub(crate) fn reject_join_key_arity(n_eq: usize, has_range: bool) -> Result<(), GnitzSqlError> {
     if n_eq == 0 && !has_range {
         return Err(GnitzSqlError::Bind(
-            "JOIN ON must have at least one equijoin or range predicate".into(),
+            "a join needs at least one equijoin or range predicate between its two sides. \
+             Write it in the step's ON / USING clause; an INNER step — which a CROSS JOIN \
+             and a comma-separated FROM both are — can also take it from the WHERE."
+                .into(),
         ));
     }
     let slots = n_eq + has_range as usize;

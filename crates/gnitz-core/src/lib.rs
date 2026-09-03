@@ -28,7 +28,7 @@ pub use circuit::{
 };
 pub use client::{
     delta_reply_schema, qualified_name, retraction_batch, segment_name, CatalogSnapshot, DeltaCursor, GnitzClient,
-    IndexMeta, InlineUniqueIndex, PlannedView, RelDescriptor, TxnBuffer, TxnReads, MAX_CHAIN_SEGMENTS,
+    IndexMeta, InlineUniqueIndex, PlannedView, RelDescriptor, TxnBuffer, TxnReads, ViewReplace, MAX_CHAIN_SEGMENTS,
 };
 pub use connection::{
     Completions, Interest, LocalScanReply, ParkHook, RawBlock, RelTarget, Reply, ReplyTrain, Request, ScanReply,

@@ -4,6 +4,8 @@ Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_joins.py -v --tb=short
 """
 import os
+from collections import Counter
+
 import pytest
 import gnitz
 import _oracle as oracle
@@ -960,3 +962,705 @@ class TestJoins:
             assert got() == expected(), "DELETE one tie-break sibling leaves the others intact"
         finally:
             _cleanup(client, sn, tables=["a", "b"], views=["v"])
+
+
+class TestJoinFormDesugars:
+    """The join spellings that carry their keys somewhere other than a literal
+    `ON` clause: a comma-separated FROM keyed by the WHERE, `USING (c)`, and
+    `NATURAL`. All three compile to the same equi-join, so each is checked by
+    weight-multiset against the `ON` form it desugars to."""
+
+    ROWS_T = [(i, i % 3, i % 2) for i in range(1, 13)]  # (id, k, a)
+    ROWS_U = [(i, i % 3, 100 + i) for i in range(1, 13)]  # (id, k, w)
+
+    def _setup(self, client, sn):
+        client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, a BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, w BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+
+    def _insert(self, client, sn):
+        client.execute_sql(
+            "INSERT INTO t VALUES " + ",".join(f"({a},{b},{c})" for a, b, c in self.ROWS_T), schema_name=sn
+        )
+        client.execute_sql(
+            "INSERT INTO u VALUES " + ",".join(f"({a},{b},{c})" for a, b, c in self.ROWS_U), schema_name=sn
+        )
+
+    def _expect_on_k(self):
+        exp = Counter()
+        for (ti, tk, _) in self.ROWS_T:
+            for (ui, uk, _) in self.ROWS_U:
+                if tk == uk:
+                    exp[(ti, ui)] += 1
+        return exp
+
+    def test_comma_join_is_keyed_by_the_where(self, client):
+        """`FROM a, b WHERE a.k = b.k` carries no ON at all: the equality reaches
+        the join's key classification from the WHERE, which is the whole of what
+        makes the comma form expressible."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT t.id AS tid, u.id AS uid FROM t, u WHERE t.k = u.k",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            self._insert(client, sn)
+            oracle.assert_view_matches(client, vid, ["tid", "uid"], self._expect_on_k())
+        finally:
+            _cleanup(client, sn, tables=["t", "u"], views=["v"])
+
+    def test_comma_join_without_a_predicate_is_refused(self, client):
+        """No ON, no keying WHERE: a keyless product, which is not supported."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            with pytest.raises(gnitz.GnitzError, match="at least one equijoin or range predicate"):
+                client.execute_sql(
+                    "CREATE VIEW v AS SELECT t.id AS tid, u.id AS uid FROM t, u", schema_name=sn
+                )
+        finally:
+            _cleanup(client, sn, tables=["t", "u"], views=["v"])
+
+    def test_where_equality_becomes_a_second_key_column(self, client):
+        """`ON p WHERE q` and `ON (p AND q)` are the same rows for an INNER join,
+        and now the same plan: the WHERE conjunct is classified as a key rather
+        than left as a post-join filter. Checked by weight, not row presence."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW split AS SELECT t.id AS tid, u.id AS uid FROM t JOIN u ON t.k = u.k WHERE t.a = u.w",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW fused AS SELECT t.id AS tid, u.id AS uid FROM t JOIN u ON t.k = u.k AND t.a = u.w",
+                schema_name=sn,
+            )
+            ids = [client.resolve_table(sn, n)[0] for n in ("split", "fused")]
+            self._insert(client, sn)
+            exp = Counter()
+            for (ti, tk, ta) in self.ROWS_T:
+                for (ui, uk, uw) in self.ROWS_U:
+                    if tk == uk and ta == uw:
+                        exp[(ti, ui)] += 1
+            for vid, name in zip(ids, ("split", "fused")):
+                oracle.assert_view_matches(client, vid, ["tid", "uid"], exp, name)
+        finally:
+            _cleanup(client, sn, tables=["t", "u"], views=["split", "fused"])
+
+    def test_where_conjunct_that_cannot_key_stays_a_filter(self, client):
+        """A cross-table equality over FLOAT columns cannot be a join key. Written
+        in the WHERE it must stay a residual filter, not turn a working query into
+        an error — the promotion is a better plan, never a requirement."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE tf (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, f DOUBLE NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE uf (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, f DOUBLE NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT tf.id AS tid, uf.id AS uid FROM tf JOIN uf ON tf.k = uf.k WHERE tf.f = uf.f",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql("INSERT INTO tf VALUES (1, 1, 1.5), (2, 1, 2.5)", schema_name=sn)
+            client.execute_sql("INSERT INTO uf VALUES (10, 1, 1.5), (11, 1, 9.5)", schema_name=sn)
+            oracle.assert_view_matches(client, vid, ["tid", "uid"], Counter({(1, 10): 1}))
+        finally:
+            _cleanup(client, sn, tables=["tf", "uf"], views=["v"])
+
+    def test_using_merges_the_named_column(self, client):
+        """`USING (k)` equates the two copies and merges them into one output
+        column: `SELECT *` emits `k` once, and the qualified `u.k` still reaches
+        the right side's own copy."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT t.id AS tid, u.id AS uid FROM t JOIN u USING (k)", schema_name=sn
+            )
+            client.execute_sql("CREATE VIEW star AS SELECT * FROM t JOIN u USING (k)", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW qual AS SELECT t.id AS tid, k AS merged, u.k AS right_k FROM t JOIN u USING (k)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            star = client.resolve_table(sn, "star")[0]
+            qual = client.resolve_table(sn, "qual")[0]
+            self._insert(client, sn)
+            oracle.assert_view_matches(client, vid, ["tid", "uid"], self._expect_on_k())
+
+            names = [c for c in client.scan(star).mappings()[0].keys()]
+            assert names.count("k") == 1, f"USING merges `k` into one output column, got {names}"
+
+            # The merged column and the right side's own copy are equal on every
+            # matched row, which is what makes the merge a pass-through.
+            for row in client.scan(qual).mappings():
+                assert row["merged"] == row["right_k"], row
+        finally:
+            _cleanup(client, sn, tables=["t", "u"], views=["v", "star", "qual"])
+
+    def test_natural_join_uses_every_shared_name(self, client):
+        """`t` and `u` share `id` and `k`, so NATURAL keys on both — not on `k`
+        alone, which is what a `USING (k)` would have said."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT id AS shared_id, a, w FROM t NATURAL JOIN u", schema_name=sn
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            self._insert(client, sn)
+            exp = Counter()
+            for (ti, tk, ta) in self.ROWS_T:
+                for (ui, uk, uw) in self.ROWS_U:
+                    if ti == ui and tk == uk:
+                        exp[(ti, ta, uw)] += 1
+            oracle.assert_view_matches(client, vid, ["shared_id", "a", "w"], exp)
+        finally:
+            _cleanup(client, sn, tables=["t", "u"], views=["v"])
+
+    def test_left_join_using_null_fills_and_keeps_the_left_copy(self, client):
+        """The merged column's value is the PRESERVED side's copy, so an unmatched
+        left row carries its own `k` while every `u` column is null-filled."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT t.id AS tid, k AS merged, u.w AS w FROM t LEFT JOIN u USING (k)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql("INSERT INTO t VALUES (1, 7, 0), (2, 8, 0)", schema_name=sn)
+            client.execute_sql("INSERT INTO u VALUES (10, 7, 70)", schema_name=sn)
+            oracle.assert_view_matches(
+                client, vid, ["tid", "merged", "w"], Counter({(1, 7, 70): 1, (2, 8, None): 1})
+            )
+        finally:
+            _cleanup(client, sn, tables=["t", "u"], views=["v"])
+
+    def test_full_join_column_merge_is_refused(self, client):
+        """FULL preserves both sides, so its merged column would be
+        COALESCE(l, r) — a computed expression a join projection cannot carry."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            for sql in (
+                "CREATE VIEW v AS SELECT t.id AS tid FROM t FULL OUTER JOIN u USING (k)",
+                "CREATE VIEW v AS SELECT t.id AS tid FROM t NATURAL FULL OUTER JOIN u",
+            ):
+                with pytest.raises(gnitz.GnitzError, match="COALESCE"):
+                    client.execute_sql(sql, schema_name=sn)
+        finally:
+            _cleanup(client, sn, tables=["t", "u"], views=["v"])
+
+    def test_natural_join_without_a_shared_name_is_refused(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE l (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn
+            )
+            client.execute_sql(
+                "CREATE TABLE r (rid BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn
+            )
+            with pytest.raises(gnitz.GnitzError, match="share no column name"):
+                client.execute_sql("CREATE VIEW v AS SELECT x, y FROM l NATURAL JOIN r", schema_name=sn)
+        finally:
+            _cleanup(client, sn, tables=["l", "r"], views=["v"])
+
+    def test_using_names_a_column_neither_side_has(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            with pytest.raises(gnitz.GnitzError, match="JOIN USING: column 'nope' not found"):
+                client.execute_sql(
+                    "CREATE VIEW v AS SELECT t.id AS tid FROM t JOIN u USING (nope)", schema_name=sn
+                )
+        finally:
+            _cleanup(client, sn, tables=["t", "u"], views=["v"])
+
+
+class TestCommaJoinSpine:
+    """A comma-separated FROM folds left-deep, so every step's key has to be
+    found in one WHERE sitting above the whole spine — including the keys of
+    steps the top join cannot see across its own two sides."""
+
+    def _setup(self, client, sn):
+        for t in ("a", "b", "c"):
+            client.execute_sql(
+                f"CREATE TABLE {t} (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, j BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+
+    def _rows(self):
+        return {
+            "a": [(1, 1, 0), (2, 2, 0), (3, 1, 0)],
+            "b": [(10, 1, 5), (11, 2, 6), (12, 2, 5)],
+            "c": [(20, 0, 5), (21, 0, 6)],
+        }
+
+    def _insert(self, client, sn):
+        for t, rows in self._rows().items():
+            client.execute_sql(
+                f"INSERT INTO {t} VALUES " + ",".join(f"({i},{k},{j})" for i, k, j in rows), schema_name=sn
+            )
+
+    def _expect(self):
+        r = self._rows()
+        exp = Counter()
+        for (ai, ak, _) in r["a"]:
+            for (bi, bk, bj) in r["b"]:
+                if ak != bk:
+                    continue
+                for (ci, _, cj) in r["c"]:
+                    if bj == cj:
+                        exp[(ai, bi, ci)] += 1
+        return exp
+
+    def test_three_way_comma_join(self, client):
+        """`a.k = b.k` keys the inner `(a, b)` step; the outer step sees only
+        `b.j = c.j` across its own sides."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.id AS ai, b.id AS bi, c.id AS ci "
+                "FROM a, b, c WHERE a.k = b.k AND b.j = c.j",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            self._insert(client, sn)
+            oracle.assert_view_matches(client, vid, ["ai", "bi", "ci"], self._expect())
+        finally:
+            _cleanup(client, sn, tables=["a", "b", "c"], views=["v"])
+
+    def test_three_way_comma_join_matches_the_explicit_form(self, client):
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW explicit AS SELECT a.id AS ai, b.id AS bi, c.id AS ci "
+                "FROM a JOIN b ON a.k = b.k JOIN c ON b.j = c.j",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW commaform AS SELECT a.id AS ai, b.id AS bi, c.id AS ci "
+                "FROM a, b, c WHERE a.k = b.k AND b.j = c.j",
+                schema_name=sn,
+            )
+            ids = {n: client.resolve_table(sn, n)[0] for n in ("explicit", "commaform")}
+            self._insert(client, sn)
+            for name, vid in ids.items():
+                oracle.assert_view_matches(client, vid, ["ai", "bi", "ci"], self._expect(), name)
+        finally:
+            _cleanup(client, sn, tables=["a", "b", "c"], views=["explicit", "commaform"])
+
+    def test_mixed_comma_and_explicit_join(self, client):
+        """The comma binds loosest, so `FROM a JOIN b ON …, c` is `((a ⋈ b) , c)`
+        and the WHERE keys only the outer step."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.id AS ai, b.id AS bi, c.id AS ci "
+                "FROM a JOIN b ON a.k = b.k, c WHERE b.j = c.j",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            self._insert(client, sn)
+            oracle.assert_view_matches(client, vid, ["ai", "bi", "ci"], self._expect())
+        finally:
+            _cleanup(client, sn, tables=["a", "b", "c"], views=["v"])
+
+    def test_a_left_only_filter_still_applies_when_pushed_down(self, client):
+        """A conjunct naming only the left input is pushed to the step below, so
+        the rows it removes must be gone from the result all the same."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.id AS ai, b.id AS bi, c.id AS ci "
+                "FROM a, b, c WHERE a.k = b.k AND b.j = c.j AND a.id > 1",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            self._insert(client, sn)
+            exp = Counter({k: w for k, w in self._expect().items() if k[0] > 1})
+            oracle.assert_view_matches(client, vid, ["ai", "bi", "ci"], exp)
+        finally:
+            _cleanup(client, sn, tables=["a", "b", "c"], views=["v"])
+
+    def test_comma_join_inside_a_derived_table_and_a_cte(self, client):
+        """Both wrap a body through the same bind, so the comma form reaches them
+        without a rule of its own."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW d AS SELECT ai, bi FROM "
+                "(SELECT a.id AS ai, b.id AS bi FROM a, b WHERE a.k = b.k) x",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW w AS WITH x AS (SELECT a.id AS ai, b.id AS bi FROM a, b WHERE a.k = b.k) "
+                "SELECT ai, bi FROM x",
+                schema_name=sn,
+            )
+            ids = {n: client.resolve_table(sn, n)[0] for n in ("d", "w")}
+            self._insert(client, sn)
+            r = self._rows()
+            exp = Counter()
+            for (ai, ak, _) in r["a"]:
+                for (bi, bk, _) in r["b"]:
+                    if ak == bk:
+                        exp[(ai, bi)] += 1
+            for name, vid in ids.items():
+                oracle.assert_view_matches(client, vid, ["ai", "bi"], exp, name)
+        finally:
+            _cleanup(client, sn, tables=["a", "b", "c"], views=["d", "w"])
+
+
+class TestJoinDesugarEdges:
+    """The orientations and compositions the first pass of the desugars did not
+    exercise: the mirror of LEFT, a merge chained across three relations, a
+    grouped body reading a merged column, and the range-only comma join."""
+
+    def _setup(self, client, sn, tables=("t", "u")):
+        for name in tables:
+            client.execute_sql(
+                f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+
+    def test_right_join_using_keeps_the_right_copy(self, client):
+        """The merged column is the PRESERVED side's, so for RIGHT it is the right
+        input's — an unmatched right row carries its own `k` while every left
+        column is null-filled. The mirror of the LEFT case, and the one that would
+        break if the merge always kept the left."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT u.id AS uid, k AS merged, t.v AS tv FROM t RIGHT JOIN u USING (k)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql("INSERT INTO t VALUES (1, 7, 70)", schema_name=sn)
+            client.execute_sql("INSERT INTO u VALUES (10, 7, 0), (11, 8, 0)", schema_name=sn)
+            oracle.assert_view_matches(
+                client, vid, ["uid", "merged", "tv"], Counter({(10, 7, 70): 1, (11, 8, None): 1})
+            )
+        finally:
+            _cleanup(client, sn, tables=["t", "u"], views=["v"])
+
+    def test_natural_join_chains_across_three_relations(self, client):
+        """The second step intersects against the *visible* left names, so the
+        column the first step merged away cannot pair a second time."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn, ("a", "b", "c"))
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT id, k, v FROM a NATURAL JOIN b NATURAL JOIN c", schema_name=sn
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            for name in ("a", "b", "c"):
+                client.execute_sql(f"INSERT INTO {name} VALUES (1, 5, 9), (2, 6, 9)", schema_name=sn)
+            # All three share every column name, so NATURAL keys on all three and
+            # the output is one row per fully-matching triple.
+            oracle.assert_view_matches(client, vid, ["id", "k", "v"], Counter({(1, 5, 9): 1, (2, 6, 9): 1}))
+            names = list(client.scan(vid).mappings()[0].keys())
+            assert sorted(names) == ["id", "k", "v"], f"each shared name survives once, got {names}"
+        finally:
+            _cleanup(client, sn, tables=["a", "b", "c"], views=["v"])
+
+    def test_grouped_body_over_a_merged_column(self, client):
+        """A GROUP BY names the merged column, which resolves through the same
+        scope the projection does — the grouped tail takes no separate route."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT k, COUNT(*) AS n FROM t JOIN u USING (k) GROUP BY k", schema_name=sn
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql("INSERT INTO t VALUES (1, 5, 0), (2, 5, 0), (3, 6, 0)", schema_name=sn)
+            client.execute_sql("INSERT INTO u VALUES (10, 5, 0), (11, 6, 0), (12, 6, 0)", schema_name=sn)
+            # k=5: 2 t-rows × 1 u-row = 2; k=6: 1 × 2 = 2.
+            oracle.assert_view_matches(client, vid, ["k", "n"], Counter({(5, 2): 1, (6, 2): 1}))
+        finally:
+            _cleanup(client, sn, tables=["t", "u"], views=["v"])
+
+    def test_range_only_comma_join(self, client):
+        """A comma join whose WHERE carries only a range comparison keys on the
+        range slot alone — `n_eq == 0 && has_range` satisfies the arity rule — and
+        takes the broadcast pure-range path. Checked by weight at W=4, since that
+        path replicates one side."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT t.id AS tid, u.id AS uid FROM t, u WHERE t.v < u.v", schema_name=sn
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            rt = [(i, 0, i) for i in range(1, 7)]
+            ru = [(i, 0, 2 * i) for i in range(1, 7)]
+            client.execute_sql(
+                "INSERT INTO t VALUES " + ",".join(f"({a},{b},{c})" for a, b, c in rt), schema_name=sn
+            )
+            client.execute_sql(
+                "INSERT INTO u VALUES " + ",".join(f"({a},{b},{c})" for a, b, c in ru), schema_name=sn
+            )
+            exp = Counter()
+            for (ti, _, tv) in rt:
+                for (ui, _, uv) in ru:
+                    if tv < uv:
+                        exp[(ti, ui)] += 1
+            oracle.assert_view_matches(client, vid, ["tid", "uid"], exp)
+        finally:
+            _cleanup(client, sn, tables=["t", "u"], views=["v"])
+
+    def test_using_on_a_name_the_left_carries_twice_is_ambiguous(self, client):
+        """Three relations, all with `k`: by the third step the left side has two
+        visible `k`, and `USING (k)` names neither. The error has to say
+        *ambiguous* — "not found" would send the reader looking for a column that
+        is there twice."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn, ("a", "b", "c"))
+            with pytest.raises(gnitz.GnitzError, match="'k' is ambiguous"):
+                client.execute_sql(
+                    "CREATE VIEW v AS SELECT a.id AS ai FROM a JOIN b ON a.id = b.id JOIN c USING (k)",
+                    schema_name=sn,
+                )
+        finally:
+            _cleanup(client, sn, tables=["a", "b", "c"], views=["v"])
+
+    def test_a_merged_name_is_no_longer_ambiguous(self, client):
+        """The mirror of the case above: once the first step MERGED `k`, the left
+        side carries one visible `k`, so the third relation pairs with it."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn, ("a", "b", "c"))
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.id AS ai, c.id AS ci FROM a JOIN b USING (k) JOIN c USING (k)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            for name in ("a", "b", "c"):
+                client.execute_sql(f"INSERT INTO {name} VALUES (1, 5, 0), (2, 6, 0)", schema_name=sn)
+            exp = Counter()
+            for ai, ak in [(1, 5), (2, 6)]:
+                for _bi, bk in [(1, 5), (2, 6)]:
+                    for ci, ck in [(1, 5), (2, 6)]:
+                        if ak == bk and ak == ck:
+                            exp[(ai, ci)] += 1
+            oracle.assert_view_matches(client, vid, ["ai", "ci"], exp)
+        finally:
+            _cleanup(client, sn, tables=["a", "b", "c"], views=["v"])
+
+    def test_self_join_with_using(self, client):
+        """The same relation on both sides: the merge resolves its names before
+        the right alias enters the scope, and the lowering's self-collision
+        wrapper still sees two distinct sources."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT x.id AS xid, y.id AS yid FROM t x JOIN t y USING (k)", schema_name=sn
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql("INSERT INTO t VALUES (1, 5, 0), (2, 5, 0), (3, 6, 0)", schema_name=sn)
+            rows = [(1, 5), (2, 5), (3, 6)]
+            exp = Counter()
+            for (xi, xk) in rows:
+                for (yi, yk) in rows:
+                    if xk == yk:
+                        exp[(xi, yi)] += 1
+            oracle.assert_view_matches(client, vid, ["xid", "yid"], exp)
+        finally:
+            _cleanup(client, sn, tables=["t"], views=["v"])
+
+    def test_promotion_across_a_null_filled_left_input(self, client):
+        """The subtlest promotion: an INNER step whose left is a LEFT JOIN, and a
+        WHERE conjunct spanning the null-fillable side and the right relation.
+        Promoting it to a key changes how a NULL is handled — a NULL equi-join key
+        matches nothing, where a residual `NULL = x` is filtered — so the two must
+        agree, and the rows a null-fill produced must not leak."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn, ("a", "b", "c"))
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT a.id AS ai, c.id AS ci "
+                "FROM a LEFT JOIN b ON a.k = b.k JOIN c ON a.id = c.id WHERE b.v = c.v",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            # a=1 matches b (v=9); a=2 matches no b, so b.v is null-filled.
+            client.execute_sql("INSERT INTO a VALUES (1, 5, 0), (2, 99, 0)", schema_name=sn)
+            client.execute_sql("INSERT INTO b VALUES (10, 5, 9)", schema_name=sn)
+            client.execute_sql("INSERT INTO c VALUES (1, 0, 9), (2, 0, 9)", schema_name=sn)
+            # Only a=1 has a non-NULL b.v, and it equals c.v for c.id = 1.
+            # a=2's null-filled b.v must match nothing at all.
+            oracle.assert_view_matches(client, vid, ["ai", "ci"], Counter({(1, 1): 1}))
+        finally:
+            _cleanup(client, sn, tables=["a", "b", "c"], views=["v"])
+
+    def test_using_merges_several_columns_at_once(self, client):
+        """`USING (k, v)` is two key pairs and two merges in one step — the loop,
+        not the single-name case every other test exercises."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT t.id AS tid, u.id AS uid, k, v FROM t JOIN u USING (k, v)",
+                schema_name=sn,
+            )
+            star = "CREATE VIEW star AS SELECT * FROM t JOIN u USING (k, v)"
+            client.execute_sql(star, schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            sid = client.resolve_table(sn, "star")[0]
+            rt = [(1, 5, 50), (2, 5, 51), (3, 6, 60)]
+            ru = [(10, 5, 50), (11, 6, 60), (12, 6, 61)]
+            client.execute_sql(
+                "INSERT INTO t VALUES " + ",".join(f"({a},{b},{c})" for a, b, c in rt), schema_name=sn
+            )
+            client.execute_sql(
+                "INSERT INTO u VALUES " + ",".join(f"({a},{b},{c})" for a, b, c in ru), schema_name=sn
+            )
+            exp = Counter()
+            for (ti, tk, tv) in rt:
+                for (ui, uk, uv) in ru:
+                    if tk == uk and tv == uv:
+                        exp[(ti, ui, tk, tv)] += 1
+            oracle.assert_view_matches(client, vid, ["tid", "uid", "k", "v"], exp)
+            names = list(client.scan(sid).mappings()[0].keys())
+            assert names.count("k") == 1 and names.count("v") == 1, f"both merge once, got {names}"
+        finally:
+            _cleanup(client, sn, tables=["t", "u"], views=["v", "star"])
+
+    def test_using_over_a_view_and_a_cte(self, client):
+        """The merge resolves names off whatever `resolve_table_factor` handed the
+        scope, so a view or a CTE pairs exactly as a base table does."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql("CREATE VIEW tv AS SELECT id, k FROM t", schema_name=sn)
+            client.execute_sql(
+                "CREATE VIEW v AS WITH cu AS (SELECT id AS uid, k FROM u) "
+                "SELECT tv.id AS tid, cu.uid AS uid, k FROM tv JOIN cu USING (k)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql("INSERT INTO t VALUES (1, 5, 0), (2, 6, 0)", schema_name=sn)
+            client.execute_sql("INSERT INTO u VALUES (10, 5, 0), (11, 7, 0)", schema_name=sn)
+            oracle.assert_view_matches(client, vid, ["tid", "uid", "k"], Counter({(1, 10, 5): 1}))
+        finally:
+            _cleanup(client, sn, tables=["t", "u"], views=["v", "tv"])
+
+    def test_distinct_over_a_merged_column(self, client):
+        """The DISTINCT tail takes its own lowering arm; it reads the same merged
+        scope the grouped and plain projections do."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT DISTINCT k FROM t JOIN u USING (k)", schema_name=sn
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql("INSERT INTO t VALUES (1, 5, 0), (2, 5, 0), (3, 6, 0)", schema_name=sn)
+            client.execute_sql("INSERT INTO u VALUES (10, 5, 0), (11, 5, 0), (12, 6, 0)", schema_name=sn)
+            # k=5 pairs 2×2 and k=6 pairs 1×1; DISTINCT collapses each to weight 1.
+            oracle.assert_view_matches(client, vid, ["k"], Counter({(5,): 1, (6,): 1}))
+        finally:
+            _cleanup(client, sn, tables=["t", "u"], views=["v"])
+
+    def test_comma_join_as_a_set_operation_side(self, client):
+        """A set-op side binds as any relational body, so the comma form reaches
+        it for the same reason it reaches a derived table and a CTE — no rule of
+        its own, and none needed."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT t.id AS x FROM t, u WHERE t.k = u.k "
+                "UNION ALL SELECT id AS x FROM u",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            client.execute_sql("INSERT INTO t VALUES (1, 5, 0), (2, 9, 0)", schema_name=sn)
+            client.execute_sql("INSERT INTO u VALUES (10, 5, 0)", schema_name=sn)
+            # left branch: t.id=1 pairs with u; right branch: u.id=10.
+            oracle.assert_view_matches(client, vid, ["x"], Counter({(1,): 1, (10,): 1}))
+        finally:
+            _cleanup(client, sn, tables=["t", "u"], views=["v"])
+
+    def test_cross_join_is_the_comma_join_spelled_out(self, client):
+        """`CROSS JOIN` states no keys of its own, exactly as the comma does — so
+        a WHERE keys it the same way, and the two spellings of one query cannot
+        disagree. Bare, with nothing to key it, both are still refused by the one
+        arity rule."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW x AS SELECT t.id AS tid, u.id AS uid FROM t CROSS JOIN u WHERE t.k = u.k",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW c AS SELECT t.id AS tid, u.id AS uid FROM t, u WHERE t.k = u.k",
+                schema_name=sn,
+            )
+            ids = {n: client.resolve_table(sn, n)[0] for n in ("x", "c")}
+            client.execute_sql("INSERT INTO t VALUES (1, 5, 0), (2, 6, 0)", schema_name=sn)
+            client.execute_sql("INSERT INTO u VALUES (10, 5, 0), (11, 5, 0)", schema_name=sn)
+            exp = Counter({(1, 10): 1, (1, 11): 1})
+            for name, vid in ids.items():
+                oracle.assert_view_matches(client, vid, ["tid", "uid"], exp, name)
+
+            # Bare, both spellings hit the same rule with the same message.
+            for body in ("FROM t CROSS JOIN u", "FROM t, u"):
+                with pytest.raises(gnitz.GnitzError, match="at least one equijoin or range predicate"):
+                    client.execute_sql(
+                        f"CREATE VIEW bad AS SELECT t.id AS tid {body}", schema_name=sn
+                    )
+        finally:
+            _cleanup(client, sn, tables=["t", "u"], views=["x", "c", "bad"])

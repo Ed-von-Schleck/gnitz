@@ -479,9 +479,9 @@ fn is_scalar_subquery(e: &sqlparser::ast::Expr) -> bool {
 pub(crate) enum FromShape {
     /// No FROM item at all.
     Empty,
-    /// Multiple comma-separated FROM items (an implicit comma join). Distinct
-    /// from `Join` because CREATE VIEW serves an explicit JOIN chain but rejects
-    /// a multi-item FROM — the two shapes need different advice.
+    /// Multiple comma-separated FROM items (an implicit comma join). A view body
+    /// serves it as an INNER join keyed from the WHERE; distinct from `Join` only
+    /// so a rejection can name the shape the user actually wrote.
     CommaJoin,
     /// One FROM item carrying an explicit JOIN chain.
     Join,

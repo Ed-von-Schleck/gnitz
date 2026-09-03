@@ -24,7 +24,7 @@ mod physical;
 mod rewrite;
 
 pub(crate) use create::{execute_alter_view, execute_create_view};
-pub use create::{plan_view, PlannedChain};
+pub use create::{plan_view, PlannedChain, ViewPlan};
 
 use crate::bind::Binder;
 use crate::error::GnitzSqlError;
@@ -117,6 +117,19 @@ impl ColIdGen {
 pub(crate) struct HirCol {
     pub id: ColId,
     pub def: ColumnDef,
+    /// A `USING` / `NATURAL` step merged this column into the preserved side's
+    /// copy: it no longer answers an unqualified name or appears in `*`, but
+    /// `alias.col` still reaches it. Weaker than `def.is_hidden`, which also takes
+    /// a column out of qualified resolution.
+    pub merged: bool,
+}
+
+impl HirCol {
+    /// A column no join step has merged — every column outside a `USING` /
+    /// `NATURAL` join scope.
+    pub(crate) fn new(id: ColId, def: ColumnDef) -> HirCol {
+        HirCol { id, def, merged: false }
+    }
 }
 
 /// The `HirCol` a `ColId` names within a column list, `None` when absent.
@@ -407,22 +420,22 @@ impl HirAgg {
         HirAgg {
             func,
             arg,
-            out: HirCol {
-                id: ids.next(),
-                // Hidden: a raw reduce-output column is addressed by `ColId`, never
-                // by name — the finalize composite is built for it, not looked up.
-                def: ColumnDef::new(
+            // Hidden: a raw reduce-output column is addressed by `ColId`, never
+            // by name — the finalize composite is built for it, not looked up.
+            out: HirCol::new(
+                ids.next(),
+                ColumnDef::new(
                     "_agg",
                     typing.ops[0].1,
                     typing.ops[0].0.raw_output_nullable(arg_nullable, is_global),
                 )
                 .hidden(),
-            },
+            ),
             // The companion is COUNT_NON_NULL, whose empty render is a concrete `0`.
-            companion: typing.shape.has_count_companion().then(|| HirCol {
-                id: ids.next(),
-                def: ColumnDef::new("_cnt", TypeCode::I64, false).hidden(),
-            }),
+            companion: typing
+                .shape
+                .has_count_companion()
+                .then(|| HirCol::new(ids.next(), ColumnDef::new("_cnt", TypeCode::I64, false).hidden())),
         }
     }
 }
@@ -522,8 +535,10 @@ pub(crate) struct HirRange {
     pub tc: TypeCode,
 }
 
-/// A join's ON predicate classified into equality pairs, an optional range
-/// conjunct, and the residual (non-key) conjuncts — filled by the rewrite.
+/// A join's predicate classified into equality pairs, an optional range conjunct,
+/// and the residual (non-key) conjuncts — filled by the rewrite. Its source is
+/// the join's own ON / USING / NATURAL keys plus, for an INNER join, the WHERE
+/// conjuncts above it that span its two sides.
 #[derive(Clone)]
 pub(crate) struct JoinClass {
     pub eq: Vec<EqPair>,
@@ -561,10 +576,7 @@ impl RelExpr {
         let cols = schema
             .columns
             .iter()
-            .map(|c| HirCol {
-                id: ids.next(),
-                def: c.clone(),
-            })
+            .map(|c| HirCol::new(ids.next(), c.clone()))
             .collect();
         Rc::new(RelExpr::Get {
             tid,
@@ -673,7 +685,7 @@ impl RelExpr {
                 right: r.id,
                 left_target: target(l.def.type_code),
                 right_target: target(r.def.type_code),
-                out: HirCol { id: ids.next(), def },
+                out: HirCol::new(ids.next(), def),
             });
         }
         Ok(Rc::new(RelExpr::SetOp {

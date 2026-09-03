@@ -646,12 +646,11 @@ pub(crate) fn reject_unhonored_delete_clauses(
     Ok(())
 }
 
-/// The `(object_type, names)` `execute_drop` acts on, once every `DROP` clause it
+/// The [`DropParts`] `execute_drop` acts on, once every `DROP` clause it
 /// does not consume is rejected: `cascade`/`restrict` (dependent-object policy),
 /// `purge` (Hive data deletion), `temporary` (MySQL DROP TEMPORARY), and `table`
 /// (MySQL `DROP INDEX i ON t` — the ON target) all parse under `GenericDialect`
-/// and would otherwise be silently dropped. `if_exists` drops *loudly* (a missing
-/// object still errors), so it is not rejected; implement it later.
+/// and would otherwise be silently dropped. `if_exists` is returned with them.
 ///
 /// The crate's only `Drop` destructure (no `..`): returning the consumed fields is
 /// what keeps it the only one, so a future `sqlparser` field cannot be dropped by
@@ -659,11 +658,11 @@ pub(crate) fn reject_unhonored_delete_clauses(
 pub(crate) fn drop_parts<'a>(
     stmt: &'a sqlparser::ast::Statement,
     context: &str,
-) -> Result<(&'a sqlparser::ast::ObjectType, &'a [sqlparser::ast::ObjectName]), GnitzSqlError> {
+) -> Result<DropParts<'a>, GnitzSqlError> {
     let sqlparser::ast::Statement::Drop {
         object_type,
         names,
-        if_exists: _, // loud on drop; implement later
+        if_exists,
         cascade,
         restrict,
         purge,
@@ -678,7 +677,19 @@ pub(crate) fn drop_parts<'a>(
     reject_if(*purge, context, "PURGE")?;
     reject_if(*temporary, context, "TEMPORARY")?;
     reject_if(table.is_some(), context, "ON <table> (MySQL DROP INDEX target)")?;
-    Ok((object_type, names))
+    Ok(DropParts {
+        object_type,
+        names,
+        if_exists: *if_exists,
+    })
+}
+
+/// What [`drop_parts`] hands `execute_drop`: the object kind, the names, and
+/// whether a missing one is an error or a no-op.
+pub(crate) struct DropParts<'a> {
+    pub(crate) object_type: &'a sqlparser::ast::ObjectType,
+    pub(crate) names: &'a [sqlparser::ast::ObjectName],
+    pub(crate) if_exists: bool,
 }
 
 /// Reject every `EXPLAIN` option `execute_explain` does not honor. EXPLAIN
@@ -805,8 +816,9 @@ pub(crate) fn reject_unhonored_rollback_clauses(
 /// `partition_of`/`for_values` (silently creates a standalone table instead of a partition child). The
 /// `_`-bound remainder parses under `GenericDialect` or not, but carries no gnitz-honorable semantics
 /// — storage/engine/vendor metadata accepted as no-ops, never changing a result.
-/// `or_replace`/`if_not_exists` drop *loudly* (a name collision still errors), so they are not
-/// rejected; implement them later.
+/// `if_not_exists` is consumed (the dispatcher's skip route); `or_replace` is rejected — no dialect
+/// gnitz targets defines `CREATE OR REPLACE TABLE`, and the plain reading of it, dropping a table and
+/// its rows to install a new shape, is what `DROP TABLE` already spells out loud.
 ///
 /// Exhaustive destructure (no `..`) over every field: a future `sqlparser` field stops the build.
 pub(crate) fn reject_unhonored_create_table_clauses(
@@ -821,10 +833,10 @@ pub(crate) fn reject_unhonored_create_table_clauses(
         constraints: _,
         cluster_by: _,
         table_options: _,
-        // Loud on drop, not silent; implement later.
-        or_replace: _,
+        // Consumed: the dispatcher's skip route.
         if_not_exists: _,
         // Rejected: each silently changes the result if dropped.
+        or_replace,
         temporary,
         global,
         query,
@@ -881,6 +893,7 @@ pub(crate) fn reject_unhonored_create_table_clauses(
     } = create;
 
     reject_if(query.is_some(), context, "AS SELECT (CTAS)")?;
+    reject_if(*or_replace, context, "OR REPLACE (it would discard the table's rows)")?;
     reject_if(*temporary, context, "TEMPORARY")?;
     reject_if(global.is_some(), context, "GLOBAL/LOCAL")?;
     reject_if(like.is_some(), context, "LIKE")?;
@@ -927,12 +940,13 @@ pub(crate) fn require_kv_option<'a>(
 }
 
 /// Reject every `CREATE VIEW` clause `execute_create_view` does not consume
-/// (`name`, `query`, and `options` — see `hir::create::decode_capacity`).
-/// `materialized` is accepted — a gnitz view is already incrementally materialized. `temporary`
-/// (silent permanent view), `to` (silently ignored target), and `columns` (output aliases dropped →
-/// wrong view schema) are rejected. `or_alter`/`or_replace`/`if_not_exists` drop loudly; implement
-/// later. `with_no_schema_binding` parses but is a no-op optimizer hint; the rest cannot populate
-/// under `GenericDialect`. `options` is consumed, not rejected.
+/// (`name`, `query`, `options` — see `hir::create::decode_view_options` — plus
+/// `columns` as positional output aliases and `or_replace`/`if_not_exists` as the
+/// dispatcher's create route). `materialized` is accepted — a gnitz view is already
+/// incrementally materialized. `temporary` (silent permanent view) and `to`
+/// (silently ignored target) are rejected, as is `or_alter`: T-SQL's `CREATE OR
+/// ALTER` is `OR REPLACE` under another name. `with_no_schema_binding` parses but is
+/// a no-op optimizer hint; the rest cannot populate under `GenericDialect`.
 pub(crate) fn reject_unhonored_create_view_clauses(
     cv: &sqlparser::ast::CreateView,
     context: &str,
@@ -941,24 +955,55 @@ pub(crate) fn reject_unhonored_create_view_clauses(
         name: _,
         query: _,
         materialized: _, // accepted: names gnitz's real behavior
-        or_alter: _,
-        or_replace: _,
-        if_not_exists: _,          // loud on drop; implement later
+        // Consumed here (they are mutually exclusive) and by the dispatcher's
+        // replace / skip routes.
+        or_replace,
+        if_not_exists,
         name_before_not_exists: _, // positional flag for if_not_exists
         with_no_schema_binding: _, // no-op optimizer hint
         secure: _,                 // Snowflake SECURE modifier: no result impact
         copy_grants: _,            // Snowflake COPY GRANTS: no result impact
         options: _,
+        columns, // consumed: positional output aliases, checked for decorations below
         cluster_by: _,
         comment: _,
         params: _, // cannot populate under GenericDialect
-        columns,
+        or_alter,
         temporary,
         to, // rejected
     } = cv;
-    reject_if(!columns.is_empty(), context, "output column aliases")?;
+    reject_if(*or_alter, context, "OR ALTER (spell it OR REPLACE)")?;
     reject_if(*temporary, context, "TEMPORARY")?;
     reject_if(to.is_some(), context, "TO (target table)")?;
+    reject_view_column_alias_decorations(columns, context)?;
+    // Not `reject_if`: that template names ONE clause a statement does not honor,
+    // and each of these is honored alone. `sqlparser` parses the pair; no dialect
+    // defines it.
+    if *or_replace && *if_not_exists {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{context}: OR REPLACE and IF NOT EXISTS ask for opposite outcomes — replace what \
+             is there, or leave what is there alone. Write one of them."
+        )));
+    }
+    Ok(())
+}
+
+/// A view column alias names a column and nothing else: a declared type or a
+/// column option would have to be checked against the body's derived type or
+/// silently ignored, and gnitz does neither.
+fn reject_view_column_alias_decorations(
+    columns: &[sqlparser::ast::ViewColumnDef],
+    context: &str,
+) -> Result<(), GnitzSqlError> {
+    for col in columns {
+        let sqlparser::ast::ViewColumnDef {
+            name: _,
+            data_type,
+            options,
+        } = col;
+        reject_if(data_type.is_some(), context, "a type on an output column alias")?;
+        reject_if(options.is_some(), context, "an option list on an output column alias")?;
+    }
     Ok(())
 }
 
@@ -966,7 +1011,7 @@ pub(crate) fn reject_unhonored_create_view_clauses(
 /// `columns`, `unique`). `using` is accepted only for the BTree default (gnitz's index is ordered /
 /// range-scannable); any other type, plus `predicate` (partial index → full index), `concurrently`
 /// (no non-blocking-build guarantee), `include`/`nulls_distinct`/`with` (silent default semantics)
-/// are rejected. `if_not_exists` drops loudly; implement later.
+/// are rejected. `if_not_exists` is consumed (the dispatcher's skip route).
 pub(crate) fn reject_unhonored_create_index_clauses(
     ci: &sqlparser::ast::CreateIndex,
     context: &str,
@@ -976,7 +1021,7 @@ pub(crate) fn reject_unhonored_create_index_clauses(
         table_name: _,
         columns: _,
         unique: _,
-        if_not_exists: _, // loud on drop; implement later
+        if_not_exists: _, // consumed: the dispatcher's skip route
         using,
         concurrently,
         include,
@@ -1258,11 +1303,10 @@ pub(crate) fn reject_unhonored_alter_table_clauses(
     Ok(())
 }
 
-/// The `(name, query)` an `ALTER VIEW … AS` is planned from, once the clauses
-/// gnitz cannot honor are rejected: output column aliases
-/// (`ALTER VIEW v (a,b) AS`) and `WITH` options would each silently produce a
-/// view whose schema is not the query's. sqlparser's `AlterView` has no
-/// `if_exists`, so `ALTER VIEW IF EXISTS` never parses.
+/// The `(name, columns, query)` an `ALTER VIEW … AS` is planned from. `columns` is
+/// the positional output alias list, honored exactly as `CREATE VIEW v (a, b) AS`
+/// is. sqlparser's `AlterView` has no `if_exists`, so `ALTER VIEW IF EXISTS` never
+/// parses.
 ///
 /// The crate's only `AlterView` destructure (no `..`): returning the consumed
 /// fields is what keeps it the only one, so a future `sqlparser` field cannot be
@@ -1270,7 +1314,14 @@ pub(crate) fn reject_unhonored_alter_table_clauses(
 pub(crate) fn alter_view_parts<'a>(
     stmt: &'a sqlparser::ast::Statement,
     context: &str,
-) -> Result<(&'a sqlparser::ast::ObjectName, &'a sqlparser::ast::Query), GnitzSqlError> {
+) -> Result<
+    (
+        &'a sqlparser::ast::ObjectName,
+        &'a [sqlparser::ast::Ident],
+        &'a sqlparser::ast::Query,
+    ),
+    GnitzSqlError,
+> {
     let sqlparser::ast::Statement::AlterView {
         name,
         query,
@@ -1280,9 +1331,10 @@ pub(crate) fn alter_view_parts<'a>(
     else {
         return Err(GnitzSqlError::Internal("not an ALTER VIEW statement".to_string()));
     };
-    reject_if(!columns.is_empty(), context, "output column aliases")?;
+    // `ALTER VIEW` retargets a body; letting it set a budget would make the
+    // clause-less form silently drop one. `CREATE OR REPLACE VIEW` restates both.
     reject_if(!with_options.is_empty(), context, "WITH options")?;
-    Ok((name, query))
+    Ok((name, columns, query))
 }
 
 #[cfg(test)]

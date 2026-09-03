@@ -356,6 +356,9 @@ fn add_constraint(
         &u.columns,
         true,
         explicit_name,
+        // `ADD CONSTRAINT` has no IF NOT EXISTS spelling of its own — `if_exists`
+        // above is the ALTER TABLE target's, already resolved.
+        false,
         "ADD CONSTRAINT",
     )
 }

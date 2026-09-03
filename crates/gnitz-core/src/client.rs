@@ -62,6 +62,25 @@ fn not_found(noun: &'static str, schema_name: &str, name: &str) -> ClientError {
     }
 }
 
+/// A [`ViewReplace::BodyOnly`] bundle states no `capacity` / `delta`, so
+/// superseding a view that has one would silently drop it.
+fn reject_budget_loss(
+    replace: ViewReplace,
+    desc: &RelDescriptor,
+    schema_name: &str,
+    view_name: &str,
+) -> Result<(), ClientError> {
+    let why = match replace {
+        ViewReplace::BodyOnly if desc.class == RelClass::BoundedView => "a capacity-bounded view",
+        ViewReplace::BodyOnly if desc.delta => "a view with a delta feed",
+        _ => return Ok(()),
+    };
+    Err(ClientError::ServerError(format!(
+        "cannot retarget {why}; DROP and CREATE '{}' instead",
+        qualified_name(schema_name, view_name)
+    )))
+}
+
 /// Build the `-1` retraction batch for `pks`: the server's `retract_pk` matches
 /// by PK alone, so the payload columns are inert filler (built directly, not via
 /// `BatchAppender`, whose `add_row` takes a single scalar PK). Shared by
@@ -280,6 +299,24 @@ impl RelDescriptor {
             indexes: Arc::new(blob.indexes),
         }
     }
+}
+
+/// Whether a [`GnitzClient::create_view_chain`] bundle supersedes the view that
+/// already holds its name, and whether its `capacity` / `delta` budgets are the
+/// caller's whole answer for that view. The superseded view is always the one
+/// whose name the chain takes, so this names no second relation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewReplace {
+    /// Nothing is superseded. A name already in use is a collision, raised by the
+    /// engine.
+    Nothing,
+    /// Supersede it, and the chain's budgets are the caller's whole answer — an
+    /// absent one means "unbounded", not "dropped".
+    WithBudgets,
+    /// Supersede it with a body only: the caller had no way to state a budget, so
+    /// a bounded or fed view is refused rather than silently coming back
+    /// unbounded or unfed. `ALTER VIEW … AS` is the statement shaped this way.
+    BodyOnly,
 }
 
 /// What one statement has already read, dropped whole at `end_statement`.
@@ -979,15 +1016,11 @@ impl GnitzClient {
         Ok(index_id)
     }
 
-    /// Drop an index by name. `if_exists` swallows a missing index (returns
-    /// `Ok(())`) — honored at the primitive's own not-found path, NOT via a
-    /// client-side existence pre-check, which would be a TOCTOU (a concurrent
-    /// DROP landing in the gap resurfaces the very "not found" `IF EXISTS` must
-    /// suppress). `ALTER TABLE ... DROP CONSTRAINT IF EXISTS` sets it; the plain
-    /// `DROP INDEX` statement passes `false` (drops loudly, like DROP TABLE/VIEW).
-    /// The swallow covers only the scan below finding no such index: a concurrent
-    /// DROP landing between that scan and the push surfaces the engine's
-    /// retraction-contract rejection, `if_exists` or not.
+    /// Drop an index by name. `if_exists` is answered at this verb's own not-found
+    /// path — never by a pre-check, which would leave a window a concurrent DROP
+    /// could land in and resurface the "not found" it must suppress. Every drop
+    /// verb follows that rule. A DROP racing the push below still surfaces the
+    /// engine's retraction-contract rejection, `if_exists` or not.
     pub fn drop_index_by_name(&mut self, index_name: &str, if_exists: bool) -> Result<(), ClientError> {
         let index_name = gnitz_wire::canonical_identifier(index_name)?;
         let missing = || -> Result<(), ClientError> {
@@ -1016,13 +1049,11 @@ impl GnitzClient {
         missing()
     }
 
-    /// `(name, indexed columns)` of every live secondary-index IDX_TAB row (name in
-    /// canonical lowercase, since `create_index`/`create_table` canonicalize at
-    /// store time). The planner uses it to reject a re-index of an identical column
-    /// set under the auto base name and to disambiguate an auto-generated name
-    /// against the taken set. Reads the same slots `create_index` writes and
-    /// `drop_index_by_name` reads.
-    pub fn index_name_cols(&mut self) -> Result<Vec<(String, gnitz_wire::PkColList)>, ClientError> {
+    /// `(id, name, indexed columns)` of every live secondary index. Names come back
+    /// canonical (lowercase), since `create_index`/`create_table` fold them at store
+    /// time. Reads the same slots `create_index` writes and `drop_index_by_name`
+    /// reads.
+    pub fn index_rows(&mut self) -> Result<Vec<(u64, String, gnitz_wire::PkColList)>, ClientError> {
         let Some(idx_batch) = checked_sys_rows(IDX_TAB, self.session.scan(IDX_TAB)?)? else {
             return Ok(Vec::new());
         };
@@ -1030,7 +1061,7 @@ impl GnitzClient {
         for i in idx_batch.live_rows() {
             let name = col_str(&idx_batch.columns[IDXTAB_COL_NAME], i)?.to_string();
             let cols = gnitz_wire::unpack_pk_cols(col_u64(&idx_batch.columns[IDXTAB_COL_SOURCE_COLS], i)?);
-            out.push((name, cols));
+            out.push((idx_batch.pks.get(i) as u64, name, cols));
         }
         Ok(out)
     }
@@ -1351,11 +1382,14 @@ impl GnitzClient {
         Ok(new_tid)
     }
 
-    pub fn drop_table(&mut self, schema_name: &str, table_name: &str) -> Result<(), ClientError> {
+    pub fn drop_table(&mut self, schema_name: &str, table_name: &str, if_exists: bool) -> Result<(), ClientError> {
         let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
         let table_name = gnitz_wire::canonical_identifier(table_name)?;
         let missing = || not_found("table", &schema_name, &table_name);
-        let tid = self.resolve(&schema_name, &table_name)?.ok_or_else(missing)?.tid;
+        let Some(desc) = self.resolve(&schema_name, &table_name)? else {
+            return if if_exists { Ok(()) } else { Err(missing()) };
+        };
+        let tid = desc.tid;
         let scanned = self.seek_sys_row(TABLE_TAB, tid)?.ok_or_else(missing)?;
         let i = scanned.live_row_with_pk(tid).ok_or_else(missing)?;
 
@@ -1393,7 +1427,7 @@ impl GnitzClient {
                 capacity_bytes: None,
                 delta_bytes: None,
             }],
-            None,
+            ViewReplace::Nothing,
         )?;
         Ok(vids[0])
     }
@@ -1416,16 +1450,16 @@ impl GnitzClient {
     /// **`views.last()` is the user-named view and takes `view_name`**; every
     /// earlier element is an internal segment it owns — see [`segment_name`].
     ///
-    /// `replaces` names an existing view this chain supersedes — an ALTER VIEW.
-    /// Its `-1` joins the same VIEW_TAB batch ahead of the new chain's `+1`s, so
-    /// a rejection anywhere in the zone leaves the old view exactly as it was;
-    /// its own segments are retracted by the engine's cascade.
+    /// `replace` says whether an existing view of this same name is superseded. Its
+    /// `-1` rides the same VIEW_TAB batch, so a rejection anywhere in the zone
+    /// leaves the old view exactly as it was — including a replace over a view
+    /// something else reads, which is refused whole.
     pub fn create_view_chain(
         &mut self,
         schema_name: &str,
         view_name: &str,
         views: Vec<PlannedView>,
-        replaces: Option<&str>,
+        replace: ViewReplace,
     ) -> Result<Vec<u64>, ClientError> {
         let view_name = gnitz_wire::canonical_identifier(view_name)?;
         crate::validate_user_identifier(&view_name)?;
@@ -1456,13 +1490,15 @@ impl GnitzClient {
         // The outgoing view's row, resolved before any id is allocated so a
         // missing view surfaces with no residue. Only the user-named view: the
         // engine cascades its segments off `owner_view_id`.
-        let replaced = match replaces {
-            Some(old) => {
-                let old = gnitz_wire::canonical_identifier(old)?;
-                self.reject_unretargetable(&schema_name, &old)?;
-                Some(self.view_retraction(&schema_name, &old)?)
+        let replaced = match replace {
+            ViewReplace::Nothing => None,
+            _ => {
+                let (desc, scanned, i) = self
+                    .view_retraction(&schema_name, &view_name)?
+                    .ok_or_else(|| not_found("view", &schema_name, &view_name))?;
+                reject_budget_loss(replace, &desc, &schema_name, &view_name)?;
+                Some((scanned, i, desc.tid))
             }
-            None => None,
         };
 
         // The whole bundle is assigned in one allocation before any substitution
@@ -1561,8 +1597,8 @@ impl GnitzClient {
 
         self.push_ddl(&families)?;
 
-        // Unreachable in practice: `reject_unretargetable` above refuses a fed
-        // view, and a feed is what makes a view mirrorable. Kept because only the
+        // The retired view may have been mirrored — `CREATE OR REPLACE VIEW`
+        // restates `WITH (delta = …)` and so is allowed over a fed view. Only the
         // user-named view can be mirrored, and it is exactly what was retired.
         if let Some((_, _, old_vid)) = replaced {
             self.invalidate_own_copy(old_vid)?;
@@ -1575,10 +1611,20 @@ impl GnitzClient {
     /// owns are retracted by the engine's own cascade off `owner_view_id`, in the
     /// same DDL zone, so the chain still retires atomically and the client never
     /// names a segment.
-    pub fn drop_view(&mut self, schema_name: &str, view_name: &str) -> Result<(), ClientError> {
+    ///
+    /// `if_exists` makes a missing view a no-op, under the same rule as
+    /// [`Self::drop_index_by_name`].
+    pub fn drop_view(&mut self, schema_name: &str, view_name: &str, if_exists: bool) -> Result<(), ClientError> {
         let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
         let view_name = gnitz_wire::canonical_identifier(view_name)?;
-        let (scanned, i, vid) = self.view_retraction(&schema_name, &view_name)?;
+        let Some((desc, scanned, i)) = self.view_retraction(&schema_name, &view_name)? else {
+            return if if_exists {
+                Ok(())
+            } else {
+                Err(not_found("view", &schema_name, &view_name))
+            };
+        };
+        let vid = desc.tid;
 
         let view_s = sys_schema(VIEW_TAB);
         let mut vb = ZSetBatch::new(view_s);
@@ -1613,39 +1659,22 @@ impl GnitzClient {
         Ok(Retractions { scanned, rows })
     }
 
-    /// Refuse to retarget a view whose `WITH` options a rebuild would silently
-    /// drop: `ALTER VIEW … AS` carries no option clause, so a bounded view would
-    /// come back unbounded and a fed one unfed.
-    ///
-    /// Read off the resolved descriptor's own `class` and `delta` — the two
-    /// fields the SQL layer's guard reads — so the two cannot disagree, and a
-    /// host calling `create_view_chain` directly gets the same refusal.
-    fn reject_unretargetable(&mut self, schema_name: &str, view_name: &str) -> Result<(), ClientError> {
-        let desc = self
-            .resolve(schema_name, view_name)?
-            .ok_or_else(|| not_found("view", schema_name, view_name))?;
-        let why = if desc.class == RelClass::BoundedView {
-            "a capacity-bounded view"
-        } else if desc.delta {
-            "a view with a delta feed"
-        } else {
-            return Ok(());
-        };
-        Err(ClientError::ServerError(format!(
-            "cannot retarget {why}; DROP and CREATE '{}' instead",
-            qualified_name(schema_name, view_name)
-        )))
-    }
-
-    /// The live VIEW_TAB row of `view_name`, as `(batch, row, vid)` — the whole
-    /// of what retiring it retracts, since the engine cascades its segments off
-    /// [`segment_name`]'s ownership column. One master-local seek, not a scan.
-    fn view_retraction(&mut self, schema_name: &str, view_name: &str) -> Result<(ZSetBatch, usize, u64), ClientError> {
+    /// The live VIEW_TAB row of `view_name` and the descriptor it resolved through
+    /// — the whole of what retiring it retracts, since the engine cascades the
+    /// segments off [`segment_name`]'s ownership column. One master-local seek, not
+    /// a scan; `Ok(None)` for a free name, so no caller probes first.
+    fn view_retraction(
+        &mut self,
+        schema_name: &str,
+        view_name: &str,
+    ) -> Result<Option<(Arc<RelDescriptor>, ZSetBatch, usize)>, ClientError> {
         let missing = || not_found("view", schema_name, view_name);
-        let vid = self.resolve(schema_name, view_name)?.ok_or_else(missing)?.tid;
-        let scanned = self.seek_sys_row(VIEW_TAB, vid)?.ok_or_else(missing)?;
-        let i = scanned.live_row_with_pk(vid).ok_or_else(missing)?;
-        Ok((scanned, i, vid))
+        let Some(desc) = self.resolve(schema_name, view_name)? else {
+            return Ok(None);
+        };
+        let scanned = self.seek_sys_row(VIEW_TAB, desc.tid)?.ok_or_else(missing)?;
+        let i = scanned.live_row_with_pk(desc.tid).ok_or_else(missing)?;
+        Ok(Some((desc, scanned, i)))
     }
 
     /// Rename a table or view: a `(-1, +1)` rewrite pair on TABLE_TAB / VIEW_TAB,

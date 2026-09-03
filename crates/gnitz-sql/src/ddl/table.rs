@@ -256,6 +256,16 @@ pub(crate) fn execute_create_table(
     let table_name = extract_name(&create.name, "CREATE TABLE")?;
     validate_user_name(&table_name)?;
 
+    // `IF NOT EXISTS` tests the NAME, not the definition — no dialect compares
+    // the two — so any relation standing under it ends the statement, whatever
+    // its kind. Probed only under the clause, so a plain CREATE TABLE still costs
+    // no resolve.
+    if create.if_not_exists {
+        if let Some(rel) = client.resolve(schema_name, &table_name)? {
+            return Ok(SqlResult::TableCreated { table_id: rel.tid });
+        }
+    }
+
     let sql_cols = &create.columns;
 
     // Reject duplicate column names up front: the PK/UNIQUE column lookups
@@ -579,39 +589,34 @@ pub(crate) fn execute_create_table(
 pub(crate) fn execute_drop(
     client: &mut GnitzClient,
     schema_name: &str,
-    object_type: &ObjectType,
-    names: &[sqlparser::ast::ObjectName],
+    parts: crate::validate::DropParts<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
+    let crate::validate::DropParts {
+        object_type,
+        names,
+        if_exists,
+    } = parts;
+    // The kind is the statement's, not each name's, so it is settled once.
+    if !matches!(object_type, ObjectType::Table | ObjectType::View | ObjectType::Index) {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "DROP {object_type:?} not supported"
+        )));
+    }
     for obj_name in names {
         let name = extract_name(obj_name, "DROP")?;
+        // No user object can carry a leading `_`, so this keeps a synthesized hidden
+        // view and an engine-internal index undroppable by name — a clearer error
+        // than the engine's own refusal, which stays the backstop.
+        validate_user_name(&name)?;
 
+        // `IF EXISTS` rides the verb rather than a probe here: each client drop
+        // verb resolves its own target, so it is the one place that can answer
+        // "no such object" without a second lookup. It softens nothing else —
+        // a dependent view, an FK child and an internal index all still refuse.
         match object_type {
-            ObjectType::Table => {
-                // Reject a leading-`_` target planner-side: no user object can
-                // carry such a name (creation validates it too), and this keeps
-                // synthesized hidden views (`__h…`) undroppable by name — they
-                // are only removed by the owning view's cascade.
-                validate_user_name(&name)?;
-                client.drop_table(schema_name, &name)?;
-            }
-            ObjectType::View => {
-                validate_user_name(&name)?;
-                client.drop_view(schema_name, &name)?;
-            }
-            ObjectType::Index => {
-                // Mirror CREATE INDEX's name rule: a clearer planner-side
-                // error, one fewer round-trip — the engine's own internal-index
-                // drop refusal stays the backstop.
-                validate_user_name(&name)?;
-                // Plain DROP INDEX drops loudly (like DROP TABLE/VIEW); only
-                // ALTER TABLE ... DROP CONSTRAINT IF EXISTS passes `true`.
-                client.drop_index_by_name(&name, false)?;
-            }
-            _ => {
-                return Err(GnitzSqlError::Unsupported(format!(
-                    "DROP {object_type:?} not supported"
-                )))
-            }
+            ObjectType::View => client.drop_view(schema_name, &name, if_exists)?,
+            ObjectType::Index => client.drop_index_by_name(&name, if_exists)?,
+            _ => client.drop_table(schema_name, &name, if_exists)?,
         }
     }
     Ok(SqlResult::Dropped)
@@ -633,6 +638,7 @@ pub(crate) fn execute_create_index(
         &ci.columns,
         ci.unique,
         explicit_name,
+        ci.if_not_exists,
         "CREATE INDEX",
     )
 }
@@ -651,14 +657,19 @@ pub(crate) fn create_index_core(
     columns: &[sqlparser::ast::IndexColumn],
     is_unique: bool,
     explicit_name: Option<String>,
+    if_not_exists: bool,
     ctx: &str,
 ) -> Result<SqlResult, GnitzSqlError> {
-    // A user-supplied index/constraint name flows through to the IDX_TAB row so
-    // `DROP INDEX`/`DROP CONSTRAINT <name>` resolves it. Validate it before
-    // anything else: a malformed name would persist and be undroppable.
-    if let Some(ref name) = explicit_name {
-        validate_user_name(name)?;
-    }
+    // The name reaches the IDX_TAB row, so a malformed one would persist and be
+    // undroppable. Folded here because the catalog stores the folded form, which
+    // the `IF NOT EXISTS` test below compares against.
+    let explicit_name = match explicit_name {
+        Some(name) => {
+            validate_user_name(&name)?;
+            Some(canonical_user_name(&name)?)
+        }
+        None => None,
+    };
 
     if columns.is_empty() {
         return Err(GnitzSqlError::Bind(format!("{ctx}: at least one column required")));
@@ -683,22 +694,38 @@ pub(crate) fn create_index_core(
     reject_unbuildable_index_key(&col_names, &col_types, schema.pk_count(), schema.pk_stride(), ctx)?;
 
     let index_name = match explicit_name {
-        Some(name) => name, // explicit: an exact-name collision still errors in `create_index`
+        Some(name) => {
+            // `IF NOT EXISTS` is a name test, and the grammar requires the name
+            // after the clause, so it reaches only this arm. An index already
+            // standing under the name IS the one the statement asked for; without
+            // the clause the collision still errors in `create_index`.
+            if if_not_exists {
+                let standing = client
+                    .index_rows()?
+                    .into_iter()
+                    .find(|(_, n, _)| n == &name)
+                    .map(|(id, _, _)| id);
+                if let Some(index_id) = standing {
+                    return Ok(SqlResult::IndexCreated { index_id });
+                }
+            }
+            name
+        }
         None => {
             let base = default_index_name(schema_name, table_name, &col_names);
-            let existing = client.index_name_cols()?;
+            let existing = client.index_rows()?;
             // A prior *auto-named* index on this exact column set is the same index.
             // An FK-backing or explicitly-named index on these columns carries a
             // different name, so it never blocks a distinct auto-name.
             if existing
                 .iter()
-                .any(|(name, cols)| name == &base && cols.as_slice() == col_indices.as_slice())
+                .any(|(_, name, cols)| name == &base && cols.as_slice() == col_indices.as_slice())
             {
                 return Err(GnitzSqlError::Plan(format!(
                     "an index on these columns already exists as '{base}'"
                 )));
             }
-            let taken: std::collections::HashSet<String> = existing.into_iter().map(|(n, _)| n).collect();
+            let taken: std::collections::HashSet<String> = existing.into_iter().map(|(_, n, _)| n).collect();
             disambiguate_index_name(base, &taken)
         }
     };

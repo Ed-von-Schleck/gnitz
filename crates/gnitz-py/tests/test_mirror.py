@@ -670,3 +670,40 @@ def test_the_copy_answers_with_the_server_stopped(own_server, mirror_on, mirror_
     )
     with pytest.raises(gnitz.GnitzError):
         m.execute_sql("SELECT * FROM t", schema_name=sn)
+
+
+def test_replacing_a_mirrored_view_invalidates_the_copy(client, mirror):
+    """`CREATE OR REPLACE VIEW` retires the view a copy was built from and puts a
+    different one under the same name. The replacing client drops its own copy on
+    the way out (`invalidate_own_copy`), so it cannot go on serving rows from a
+    view that no longer exists — a name lookup would not tell it, since the name
+    still resolves."""
+    sn = "s" + _uid()
+    _base_tables(client, sn)
+    _mk_feed(client, sn, "f", LINEAR)
+    old_vid = mirror.mirror_view(sn, "f").view_id
+    _churn(client, sn, 1, 40)
+    _quiesce(client, mirror, sn)
+    q = "SELECT * FROM f"
+    _same_zset(q, _local(mirror, sn, old_vid, q), _rows(client.execute_sql(q, schema_name=sn)))
+
+    # Replace through the mirroring client itself: the copy it holds is the one
+    # being retired.
+    mirror.execute_sql(
+        f"CREATE OR REPLACE VIEW f WITH (delta = '{FEED}') AS SELECT id, v, body FROM t WHERE v > 20",
+        schema_name=sn,
+    )
+    new_vid = client.resolve_table(sn, "f")[0]
+    assert new_vid != old_vid, "a replaced view takes a fresh id"
+
+    # The retired copy is gone: nothing answers off it any more.
+    assert all(r.view_id != old_vid for r in mirror.poll()), (
+        "the retired view left the mirror's poll set"
+    )
+
+    # Re-mirroring under the same name picks up the NEW definition and converges.
+    fresh_vid = mirror.mirror_view(sn, "f").view_id
+    assert fresh_vid == new_vid
+    _churn(client, sn, 41, 60)
+    _quiesce(client, mirror, sn)
+    _same_zset(q, _local(mirror, sn, fresh_vid, q), _rows(client.execute_sql(q, schema_name=sn)))
