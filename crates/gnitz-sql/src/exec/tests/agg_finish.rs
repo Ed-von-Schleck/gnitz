@@ -1,6 +1,6 @@
 use super::*;
 use crate::agg::{finalize_agg_bexpr, push_agg_specs, synthetic_fold_cols};
-use crate::expr_lower::compile_finalize_evaluator;
+use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::AggFunc;
 use crate::test_support::col_def;
 use gnitz_core::PkColumn;
@@ -266,7 +266,7 @@ fn avg_shape() -> FoldShape {
     let partial_schema = partial_schema(&src, &[], &agg_specs);
     // A global aggregate has no group columns, so the SUM lands at partial
     // column 1 and its COUNT_NON_NULL companion at 2.
-    let ev = compile_finalize_evaluator(&finalize_agg_bexpr(1, Some(2), AggFunc::Avg), &partial_schema).unwrap();
+    let ev = compile_scalar_evaluator(&finalize_agg_bexpr(1, Some(2), AggFunc::Avg), &partial_schema).unwrap();
     assert!(!ev.result_is_str(), "AVG finalizes to a scalar");
     FoldShape {
         reduce_schema: Arc::new(src),

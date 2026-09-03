@@ -1,6 +1,6 @@
 use super::*;
 use gnitz_core::{ColumnDef, Schema, TypeCode};
-use gnitz_expr::LogicalInstr;
+use gnitz_expr::{ExprValidateErr, LogicalInstr};
 use gnitz_wire::ExprOp;
 
 fn col(name: &str, tc: TypeCode) -> ColumnDef {
@@ -22,7 +22,7 @@ fn str_schema() -> Schema {
 fn compile(left: &BoundExpr, op: BinOp, right: &BoundExpr, schema: &Schema) -> Vec<LogicalInstr> {
     let mut eb = ExprBuilder::new();
     let reg =
-        try_compile_string_cmp(left, &op, right, &schema.columns, &mut eb).expect("recognized as a string comparison");
+        try_compile_string_cmp(left, op, right, &schema.columns, &mut eb).expect("recognized as a string comparison");
     eb.build(Some(reg)).expect("a well-formed program").instrs().to_vec()
 }
 
@@ -318,7 +318,7 @@ fn min_max_n_rotates_a_u64_argument_to_the_fold_head() {
             other => panic!("the fold must open with a column load, got {other:?}"),
         }
     };
-    let neg1 = BoundExpr::UnaryOp(UnaryOp::Neg, Box::new(BoundExpr::LitInt(1)));
+    let neg1 = BoundExpr::LitInt(-1);
     let u = BoundExpr::ColRef(4);
     assert_eq!(
         head_operand(vec![neg1.clone(), BoundExpr::LitInt(1), u.clone()]),
@@ -341,13 +341,8 @@ fn min_max_n_rejects_non_numeric_arguments() {
         pk_cols: vec![0],
     };
     for c in [1usize, 2] {
-        let mut eb = ExprBuilder::new();
-        let r = OpcodeBackend {
-            cols: &s.columns,
-            eb: &mut eb,
-        }
-        .lower(&min_max(true, vec![BoundExpr::ColRef(c), BoundExpr::ColRef(c)]));
-        assert!(matches!(r, Err(GnitzSqlError::Unsupported(_))), "column {c}");
+        let err = lower_err(&min_max(true, vec![BoundExpr::ColRef(c), BoundExpr::ColRef(c)]), &s);
+        assert!(matches!(err, GnitzSqlError::Unsupported(_)), "column {c}");
     }
 }
 
@@ -367,7 +362,7 @@ fn min_max_n_arity_is_bounded_by_the_register_file() {
     }
     .lower(&min_max(true, args))
     .expect("lowering itself does not bound arity");
-    match eb.build(Some(reg)).map_err(expr_unsupported).err() {
+    match eb.build(Some(reg)).map_err(GnitzSqlError::from).err() {
         Some(GnitzSqlError::Unsupported(msg)) => assert!(msg.contains("reg"), "got {msg:?}"),
         other => panic!("expected a register-budget rejection, got {other:?}"),
     }
@@ -417,23 +412,6 @@ fn string_cmp_col_lit_is_symmetric() {
     }
 }
 
-/// `a <op> b` (two string columns) is unaffected by the symmetrization.
-#[test]
-fn string_cmp_col_vs_col_unchanged() {
-    let schema = str_schema();
-    let a = BoundExpr::ColRef(1);
-    let b = BoundExpr::ColRef(2);
-    let got = compile(&a, BinOp::Lt, &b, &schema);
-    let mut eb = ExprBuilder::new();
-    let reg = eb.emit(L::StrColCol {
-        op: StrOp::Lt,
-        col_a: 1,
-        col_b: 2,
-    });
-    let want = eb.build(Some(reg)).expect("a well-formed program");
-    assert_eq!(got, want.instrs(), "a < b must stay str_col_lt_col(a, b)");
-}
-
 /// The column/literal interception *declines* a non-comparison operator
 /// rather than erroring, so `strcol || 'lit'` reaches the register channel;
 /// the rejection of a genuinely undefined operator moves there and still
@@ -444,7 +422,7 @@ fn string_cmp_interception_declines_non_comparisons() {
     let s = BoundExpr::ColRef(1);
     let lit = BoundExpr::LitStr("x".to_string());
     let mut eb = ExprBuilder::new();
-    assert!(try_compile_string_cmp(&lit, &BinOp::Add, &s, &schema.columns, &mut eb).is_none());
+    assert!(try_compile_string_cmp(&lit, BinOp::Add, &s, &schema.columns, &mut eb).is_none());
     assert!(
         eb.build(None).expect("a well-formed program").instrs().is_empty(),
         "a declined shape must emit nothing"
@@ -468,8 +446,8 @@ fn blob_schema() -> Schema {
     }
 }
 
-/// A BLOB comparison lowers to the same German-string content opcodes as STRING
-/// (§6.6a): blob col-vs-col and col-vs-literal compile byte-identically to the
+/// A BLOB comparison lowers to the same German-string content opcodes as
+/// STRING: blob col-vs-col and col-vs-literal compile byte-identically to the
 /// STRING form for every comparison operator.
 #[test]
 fn blob_cmp_matches_string_cmp() {
@@ -490,38 +468,6 @@ fn blob_cmp_matches_string_cmp() {
             "blob {op:?} 'lit' must match string {op:?} 'lit'"
         );
     }
-}
-
-/// col 0 = pk (U64), col 1 = s (String), col 2 = n (I64).
-fn string_int_schema() -> Schema {
-    Schema {
-        columns: vec![
-            col("pk", TypeCode::U64),
-            col("s", TypeCode::String),
-            col("n", TypeCode::I64),
-        ],
-        pk_cols: vec![0],
-    }
-}
-
-/// A string-vs-int comparison (`a.s > b.n`) is NOT a content comparison
-/// (`try_compile_string_cmp` declines a mixed pair), so it reaches the `ColRef`
-/// integer-load path with a string column and must error — the §6.6b corruption
-/// guard, now a clean `Unsupported` instead of a garbage int load.
-#[test]
-fn mixed_string_int_cmp_rejects() {
-    let schema = string_int_schema();
-    let expr = BoundExpr::BinOp(
-        Box::new(BoundExpr::ColRef(1)),
-        BinOp::Gt,
-        Box::new(BoundExpr::ColRef(2)),
-    );
-    let mut eb = ExprBuilder::new();
-    let err = compile_bound_expr(&expr, &schema.columns, &mut eb).expect_err("string > int must not compile");
-    assert!(
-        matches!(err, GnitzSqlError::Unsupported(_)),
-        "expected Unsupported, got {err:?}"
-    );
 }
 
 /// Each instruction's wire opcode, off the one encode table.
@@ -579,8 +525,8 @@ fn case_float_unification_lifts_int_branches() {
     );
 }
 
-/// A string-typed CASE result reaches the integer/string-load path and is
-/// rejected (the register file carries 8-byte values only).
+/// A string-typed CASE lowers through the string channel to a `StrSelect`
+/// fold, and its result is a string register.
 #[test]
 fn case_string_branches_compile_through_the_string_channel() {
     let schema = case_schema();
@@ -600,24 +546,6 @@ fn case_string_branches_compile_through_the_string_channel() {
     // register reaching a string operand, so a CASE that blended its string
     // branches with the numeric SELECT would fail here rather than compile.
     assert_str_program(&case_str, &schema);
-}
-
-/// String arithmetic (`a.s + 1`) likewise reaches the integer-load path and is
-/// rejected at CREATE rather than silently miscompiled (§6.6b).
-#[test]
-fn string_arithmetic_rejects() {
-    let schema = str_schema();
-    let expr = BoundExpr::BinOp(
-        Box::new(BoundExpr::ColRef(1)),
-        BinOp::Add,
-        Box::new(BoundExpr::LitInt(1)),
-    );
-    let mut eb = ExprBuilder::new();
-    let err = compile_bound_expr(&expr, &schema.columns, &mut eb).expect_err("string + 1 must not compile");
-    assert!(
-        matches!(err, GnitzSqlError::Unsupported(_)),
-        "expected Unsupported, got {err:?}"
-    );
 }
 
 // ------------------------------------------------------------------
@@ -643,28 +571,18 @@ fn in_list(inner: BoundExpr, items: Vec<BoundExpr>) -> BoundExpr {
     }
 }
 
-/// `-v` binds to `UnaryOp(Neg, LitInt(v))` (sqlparser lexes the minus
-/// separately); the fold path must still emit INT_IN_SET.
-fn neg_lit(v: i64) -> BoundExpr {
-    BoundExpr::UnaryOp(UnaryOp::Neg, Box::new(BoundExpr::LitInt(v)))
-}
-
-/// An integer operand with all-integer-literal items → one INT_IN_SET, for
-/// both positive and negative-literal lists.
+/// An integer operand with all-integer-literal items → one INT_IN_SET; the
+/// binder folds a negated literal, so a negative item is a literal like any
+/// other.
 #[test]
 fn in_list_int_emits_int_in_set() {
     let schema = two_int_schema();
-    for items in [
-        vec![BoundExpr::LitInt(1), BoundExpr::LitInt(2), BoundExpr::LitInt(3)],
-        vec![neg_lit(1), neg_lit(2)],
-    ] {
-        let prog = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), items), &schema.columns).unwrap();
-        let ops = opcodes(&prog);
-        assert!(
-            ops.contains(&ExprOp::IntInSet.as_wire()),
-            "int IN must emit INT_IN_SET, ops={ops:?}"
-        );
-    }
+    let items = vec![BoundExpr::LitInt(-1), BoundExpr::LitInt(2)];
+    let prog = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), items), &schema.columns).unwrap();
+    assert_eq!(
+        opcodes(&prog),
+        [ExprOp::LoadColInt.as_wire(), ExprOp::IntInSet.as_wire()]
+    );
 }
 
 /// The pool is sorted and deduplicated: `a IN (1, 1, 2)` packs 2 i64s (16
@@ -749,27 +667,15 @@ fn in_list_string_operand_falls_back_to_or_chain() {
     );
 }
 
-/// Why the fused compare cannot be dropped in favour of the register
-/// channel, stated as a budget rather than a speed. A string `IN` list is an
-/// OR chain, and a register *is* an instruction, so the per-term instruction
-/// cost is what caps the list: one per fused compare plus one per OR, over
-/// a `MAX_REGS` of 64. At 22 items that is 43 and compiles; through the
-/// register channel each term would spend three instead of one, putting the
-/// same list over the cap.
+/// A string `IN` list is an OR chain over fused compares: one register per
+/// compare plus one per OR. Through the register channel each term would
+/// spend three, which is what puts a longer list over the 64-register cap.
 #[test]
-fn in_list_string_list_fits_only_because_the_compare_is_fused() {
+fn in_list_string_list_spends_one_register_per_fused_compare() {
     let schema = str_schema();
     let items: Vec<BoundExpr> = (0..22).map(|i| BoundExpr::LitStr(format!("tag{i}"))).collect();
     let prog = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), items), &schema.columns).unwrap();
-    assert_eq!(
-        prog.instrs().len(),
-        2 * 22 - 1,
-        "one register per fused compare, one per OR"
-    );
-    assert!(
-        prog.instrs().len() + 22 > 64,
-        "the same list must not fit once each term costs a third register"
-    );
+    assert_eq!(prog.instrs().len(), 2 * 22 - 1);
 }
 
 /// The operand costs one register for the whole list, not one per item: each
@@ -927,24 +833,10 @@ fn lit(s: &str) -> BoundExpr {
     BoundExpr::LitStr(s.to_string())
 }
 
-/// A plain `col op 'lit'` must keep the specialized 16-byte-cell opcodes;
-/// the register channel exists for computed operands. Routing this shape
-/// through it would build a string register per row for nothing: the fused
-/// kernel short-circuits on the cell's 4-byte prefix, which a `StrView`
-/// does not carry. `str_const_filter_bench` in gnitz-expr drives either
-/// channel over four value domains under `perf`; the prefix collision rate
-/// controls the gap, and nothing bounds that rate, so there is no one number
-/// to quote here.
-///
-/// The register cap is the part that does not depend on speed at all. A
-/// register is the index of the instruction that writes it, and `MAX_REGS`
-/// is 64. A string
-/// `IN (N)` list lowers to an OR chain; each term intercepted into a fused
-/// compare costs one register, plus one per OR — `2N-1`. Through the
-/// register channel a term is a column load, a const load and a compare,
-/// three registers where the fused form spends one, so the same list caps
-/// strictly lower. `in_list_string_list_fits_only_because_the_compare_is_fused`
-/// pins the case that separates them.
+/// A plain `col op 'lit'` or `col op col` keeps the fused 16-byte-cell
+/// opcodes; the register channel exists for computed operands. The fused
+/// kernel short-circuits on the cell's 4-byte prefix, which a `StrView` does
+/// not carry, and spends one register where the channel spends three.
 #[test]
 fn plain_column_comparisons_keep_the_specialized_opcodes() {
     let schema = str_schema();
@@ -982,25 +874,36 @@ fn computed_operands_compare_through_the_register_channel() {
     assert!(p.resolve_filter(&schema).is_ok());
 }
 
-/// `NE`, `GT` and `GE` have no opcode of their own on either path; they ride
-/// the three that exist. Getting the swap backwards is invisible until the
-/// operands differ, so drive it against the transposition directly.
+/// Every comparison has its own opcode on the register channel too, so none
+/// pays a swap or a `BOOL_NOT`.
 #[test]
-fn register_compare_derives_ne_gt_ge_from_the_three_opcodes() {
+fn register_compare_has_all_six_operators() {
     let schema = str_schema();
     let up = |i| BoundExpr::StrCall {
         f: StrFunc::Upper,
         args: vec![str_col(i)],
     };
-    let cmp = |op| lower_ops(&BoundExpr::BinOp(Box::new(up(1)), op, Box::new(up(2))), &schema);
-    let tail = |ops: Vec<u32>| ops[ops.len() - 1];
-    assert_eq!(tail(cmp(BinOp::Lt)), ExprOp::StrCmpLt.as_wire());
-    assert_eq!(tail(cmp(BinOp::Le)), ExprOp::StrCmpLe.as_wire());
-    // GT/GE swap the operands rather than negating, so no BOOL_NOT appears.
-    assert_eq!(tail(cmp(BinOp::Gt)), ExprOp::StrCmpLt.as_wire());
-    assert_eq!(tail(cmp(BinOp::Ge)), ExprOp::StrCmpLe.as_wire());
-    // NE is the negation of EQ.
-    assert_eq!(tail(cmp(BinOp::Ne)), ExprOp::BoolNot.as_wire());
+    for (op, want) in [
+        (BinOp::Eq, ExprOp::StrCmpEq),
+        (BinOp::Ne, ExprOp::StrCmpNe),
+        (BinOp::Gt, ExprOp::StrCmpGt),
+        (BinOp::Ge, ExprOp::StrCmpGe),
+        (BinOp::Lt, ExprOp::StrCmpLt),
+        (BinOp::Le, ExprOp::StrCmpLe),
+    ] {
+        let ops = lower_ops(&BoundExpr::BinOp(Box::new(up(1)), op, Box::new(up(2))), &schema);
+        assert_eq!(
+            ops,
+            [
+                ExprOp::LoadColStr.as_wire(),
+                ExprOp::StrUpper.as_wire(),
+                ExprOp::LoadColStr.as_wire(),
+                ExprOp::StrUpper.as_wire(),
+                want.as_wire()
+            ],
+            "{op:?}"
+        );
+    }
 }
 
 #[test]
@@ -1131,9 +1034,12 @@ fn strings_in_numeric_positions_are_rejected_by_lowering() {
             "{e:?} must be rejected by lowering"
         );
     }
-    // A comparison carries no implicit cast either way.
+    // A comparison carries no implicit cast either way — against a literal or
+    // against an integer column (`pk` here).
     let mixed = BoundExpr::BinOp(Box::new(s()), BinOp::Eq, Box::new(BoundExpr::LitInt(1)));
     assert!(lower_err(&mixed, &schema).to_string().contains("strings"));
+    let mixed_cols = BoundExpr::BinOp(Box::new(s()), BinOp::Gt, Box::new(BoundExpr::ColRef(0)));
+    assert!(lower_err(&mixed_cols, &schema).to_string().contains("strings"));
 }
 
 /// BLOB keeps exactly its existing comparison support: the column/literal
@@ -1280,28 +1186,6 @@ fn like_over_a_numeric_operand_is_a_typed_error() {
         panic!("expected Unsupported, got {err:?}")
     };
     assert!(msg.contains("expected a string value"), "got {msg}");
-}
-
-/// A computed STRING column must be *declared* STRING. The register image
-/// maps STRING to I64, which was right while every computed value was an
-/// 8-byte register.
-#[test]
-fn a_computed_string_projection_declares_a_string_column() {
-    let schema = str_schema();
-    let e = BoundExpr::StrCall {
-        f: StrFunc::Upper,
-        args: vec![str_col(1)],
-    };
-    let nominal = e.infer_type(&schema.columns);
-    assert_eq!(nominal, TypeCode::String);
-    let def = crate::validate::computed_column(None, 0, nominal);
-    assert_eq!(def.type_code, TypeCode::String);
-    assert!(def.is_nullable);
-    // A numeric expression still takes its register image.
-    assert_eq!(
-        crate::validate::computed_column(None, 0, TypeCode::F32).type_code,
-        TypeCode::F64
-    );
 }
 
 /// The transcendentals lift an integer argument to float and always answer
@@ -1453,4 +1337,39 @@ fn null_test_lowers_by_its_operand() {
     );
     let ops = lower_ops(&test(sum, false), &schema);
     assert_eq!(ops[ops.len() - 1], ExprOp::IsNotNullReg.as_wire());
+}
+
+/// A true-constant conjunct — the binder's fold of `IS NOT NULL` on a
+/// non-nullable column — is dropped wherever it sits, so `a > 1 AND <true>`
+/// costs no `BOOL_AND` per row; a list of nothing but true constants is the
+/// statically-true verdict, and a false constant keeps its program.
+#[test]
+fn filter_program_drops_true_constant_conjuncts_in_any_position() {
+    let schema = two_int_schema();
+    let gt = BoundExpr::BinOp(
+        Box::new(BoundExpr::ColRef(1)),
+        BinOp::Gt,
+        Box::new(BoundExpr::LitInt(1)),
+    );
+    let t = BoundExpr::LitInt(1);
+    let f = BoundExpr::LitInt(0);
+    let ops = |conjuncts: &[&BoundExpr]| {
+        compile_filter_program(conjuncts.iter().copied(), &schema.columns)
+            .expect("lowers")
+            .map(|p| opcodes(&p))
+    };
+    let alone = ops(&[&gt]).expect("a program");
+    assert_eq!(ops(&[&t, &gt, &t]), Some(alone));
+    assert_eq!(ops(&[&t, &t]), None);
+    assert_eq!(ops(&[]), None);
+    assert_eq!(ops(&[&f]), Some(vec![ExprOp::LoadConst.as_wire()]));
+}
+
+/// Every conjunct is a boolean, a lone one included: a string column on its
+/// own draws the lowering's own message rather than reaching the resolver.
+#[test]
+fn a_lone_string_conjunct_is_rejected_by_lowering() {
+    let schema = str_schema();
+    let err = compile_filter_program([&str_col(1)], &schema.columns).expect_err("a string is not a predicate");
+    assert!(err.to_string().contains("strings"), "{err}");
 }

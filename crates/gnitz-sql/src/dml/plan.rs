@@ -77,9 +77,9 @@ impl Access {
 /// transaction's own buffer. A read takes the `Access` and drops the rest.
 pub(crate) struct AccessPlan<'e> {
     pub(super) access: Access,
-    /// The WHERE this plan serves, `None` when there was none.
-    where_expr: Option<&'e BoundExpr>,
-    /// The bound conjuncts the walk does not apply exactly.
+    /// Every conjunct of the WHERE this plan serves; empty when there was none.
+    all: Vec<&'e BoundExpr>,
+    /// The conjuncts the walk does not apply exactly.
     residual: Vec<&'e BoundExpr>,
 }
 
@@ -90,16 +90,16 @@ impl<'e> AccessPlan<'e> {
     /// relies on that.
     pub(super) fn new(
         bound: ReadBound,
-        where_expr: Option<&'e BoundExpr>,
+        all: &[&'e BoundExpr],
         residual: Vec<&'e BoundExpr>,
         schema: &Schema,
     ) -> Result<Self, GnitzSqlError> {
         Ok(AccessPlan {
             access: Access {
-                predicate: compile_wire_conjuncts(&residual, &schema.columns)?,
+                predicate: compile_wire_conjuncts(residual.iter().copied(), &schema.columns)?,
                 bound,
             },
-            where_expr,
+            all: all.to_vec(),
             residual,
         })
     }
@@ -128,21 +128,23 @@ impl<'e> AccessPlan<'e> {
         };
         match keys {
             Some(keys) => (Some(keys), &self.residual),
-            None => (None, self.where_expr.as_slice()),
+            None => (None, &self.all),
         }
     }
 }
 
-/// Bind a single-table `WHERE` (or its absence) for [`bound_and_predicate`].
-/// `alias` is the relation's effective alias, which a written qualifier must name.
+/// Bind a single-table `WHERE` (or its absence) for [`bound_and_predicate`], as
+/// its conjunct list. `alias` is the relation's effective alias, which a written
+/// qualifier must name.
 pub(crate) fn bind_where(
     schema: &Schema,
     alias: &str,
     where_expr: Option<&sqlparser::ast::Expr>,
-) -> Result<Option<BoundExpr>, GnitzSqlError> {
-    where_expr
-        .map(|we| crate::bind::bind_single_table(we, schema, alias))
-        .transpose()
+) -> Result<Vec<BoundExpr>, GnitzSqlError> {
+    match where_expr {
+        Some(we) => crate::bind::bind_conjuncts(we, &crate::bind::SingleTable { schema, alias }),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Bind-once WHERE → the access plan that serves it. The one way any statement
@@ -151,7 +153,7 @@ pub(crate) fn bind_where(
 /// The predicate is: empty for `PkSet` (the gather is exact); the extractor's
 /// residual for `PkRange` (a byte-exact walk at any PK width — consumed
 /// conjuncts are applied exactly and stripped); the whole bound WHERE for
-/// `None`; and for an `IndexRange` whichever [`index_plan`] can compile. A PK
+/// `None`; and for an `IndexRange` whichever form [`index_plan`] takes. A PK
 /// bound that pins no PK column yields to a point covering every column of a
 /// UNIQUE index, which admits at most one row. A WHERE the expression VM cannot
 /// compile is an `Unsupported`, propagated.
@@ -163,22 +165,25 @@ pub(crate) fn bind_where(
 /// The caller owns the bound WHERE, because the plan borrows its conjuncts.
 pub(crate) fn bound_and_predicate<'e>(
     schema: &Schema,
-    where_expr: Option<&'e BoundExpr>,
+    conjuncts: &'e [BoundExpr],
     budget: ReadBudget,
     indexes: &[IndexMeta],
 ) -> Result<AccessPlan<'e>, GnitzSqlError> {
-    let Some(bound_where) = where_expr else {
-        return AccessPlan::new(ReadBound::None, None, Vec::new(), schema);
-    };
+    let all: Vec<&'e BoundExpr> = conjuncts.iter().collect();
 
     // `pk IN (…)` → an exact gather of those keys, with the remaining conjuncts as
     // the predicate. Keys ship deduplicated (`try_extract_pk_in`); the worker
     // OPK-sorts before its forward sweep.
-    let gather = try_extract_pk_in(bound_where, schema)
+    let gather = try_extract_pk_in(conjuncts, schema)
         .filter(|(keys, _)| budget == ReadBudget::MayChunk || keys.len() <= gnitz_wire::MAX_PK_SET_KEYS);
     if let Some((keys, residual)) = gather {
-        return AccessPlan::new(ReadBound::PkSet(keys), where_expr, residual, schema);
+        return AccessPlan::new(ReadBound::PkSet(keys), &all, residual, schema);
     }
+
+    // Whether the VM can carry the whole WHERE is a property of the WHERE, not
+    // of the walk under it, so it is decided once and picks every index rung's
+    // form.
+    let whole_compiles = if_supported(compile_wire_conjuncts(all.iter().copied(), &schema.columns))?.is_some();
 
     // A PK equality / range → a byte-exact bounded PK walk; the residual (the WHERE
     // minus every conjunct the walk applies exactly) is the predicate. Exactness at
@@ -186,7 +191,7 @@ pub(crate) fn bound_and_predicate<'e>(
     // It yields only when the descriptor pins no PK column and a point covering
     // every column of a UNIQUE index is available: that admits one row where an
     // unpinned PK range admits the table.
-    if let Some((desc, residual)) = try_extract_pk_range(bound_where, schema) {
+    if let Some((desc, residual)) = try_extract_pk_range(conjuncts, schema) {
         // A descriptor pinning nothing is the only one worth giving up: the ladder
         // bets that a pinned leading PK column shares the distribution prefix and
         // unicasts, which holds only under a `CLUSTER BY` shorter than the PK.
@@ -194,29 +199,29 @@ pub(crate) fn bound_and_predicate<'e>(
             // The index arm re-imposes more of the WHERE than the PK arm's
             // residual, so a conjunct the VM refuses (a wide literal, a U128
             // column) can sink it; keep the PK walk rather than fail the query.
-            if let Some(c) = ranked_index_bounds(bound_where, schema, indexes)
+            if let Some(c) = ranked_index_bounds(conjuncts, schema, indexes)
                 .into_iter()
                 .next()
                 .filter(|c| c.is_unique_point())
             {
-                if let Some(p) = if_supported(index_plan(c, bound_where, schema))? {
+                if let Some(p) = if_supported(index_plan(c, &all, whole_compiles, schema))? {
                     return Ok(p);
                 }
             }
         }
-        return AccessPlan::new(ReadBound::PkRange(desc), where_expr, residual, schema);
+        return AccessPlan::new(ReadBound::PkRange(desc), &all, residual, schema);
     }
 
     // Most-constrained first, and the first whose plan compiles wins: the tightest
     // bound is not servable if its leftover conjunct has no compiled form, where a
     // looser candidate consumes that same conjunct byte-exactly.
-    for c in ranked_index_bounds(bound_where, schema, indexes) {
-        if let Some(p) = if_supported(index_plan(c, bound_where, schema))? {
+    for c in ranked_index_bounds(conjuncts, schema, indexes) {
+        if let Some(p) = if_supported(index_plan(c, &all, whole_compiles, schema))? {
             return Ok(p);
         }
     }
 
-    AccessPlan::new(ReadBound::None, where_expr, vec![bound_where], schema)
+    AccessPlan::new(ReadBound::None, &all, all.clone(), schema)
 }
 
 /// `Ok(None)` for the one error a ladder rung may be abandoned on — `Unsupported`
@@ -236,33 +241,25 @@ fn if_supported<T>(r: Result<T, GnitzSqlError>) -> Result<Option<T>, GnitzSqlErr
 /// the worker free to trade the index walk for a full cursor when the range
 /// covers too much of the table. The bounded conjuncts are stripped — and the
 /// walk marked `exact`, which forbids that trade — exactly when the predicate
-/// cannot carry them, which the compiler alone decides (a wide-int index column
-/// has no VM register; a literal past the VM's `i64` constant has no encoding).
-/// Stripping and exactness are set together, so a conjunct the predicate drops is
-/// always one the walk applies.
+/// cannot carry them (`whole_compiles` is false: a wide-int index column has no
+/// VM register, a literal past the VM's `i64` constant has no encoding). A
+/// residual that still cannot compile abandons this rung like any other.
+/// Stripping and exactness are set together, so a conjunct the predicate drops
+/// is always one the walk applies.
 fn index_plan<'e>(
     c: IndexRangeCandidate<'e>,
-    bound_where: &'e BoundExpr,
+    all: &[&'e BoundExpr],
+    whole_compiles: bool,
     schema: &Schema,
 ) -> Result<AccessPlan<'e>, GnitzSqlError> {
     let idx_cols = gnitz_wire::pack_pk_cols(c.idx_cols.as_slice());
-    let inexact = ReadBound::IndexRange {
+    let bound = ReadBound::IndexRange {
         idx_cols,
-        exact: false,
+        exact: !whole_compiles,
         desc: c.desc,
     };
-    if let Some(p) = if_supported(AccessPlan::new(inexact, Some(bound_where), vec![bound_where], schema))? {
-        return Ok(p);
-    }
-    // Something in the WHERE has no compiled form. The exact walk applies the
-    // bounded conjuncts byte-exactly; if what is left over still cannot compile,
-    // that error is the real one.
-    let exact = ReadBound::IndexRange {
-        idx_cols,
-        exact: true,
-        desc: c.desc,
-    };
-    AccessPlan::new(exact, Some(bound_where), c.residual, schema)
+    let residual = if whole_compiles { all.to_vec() } else { c.residual };
+    AccessPlan::new(bound, all, residual, schema)
 }
 
 // ---------------------------------------------------------------------------

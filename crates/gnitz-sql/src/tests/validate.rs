@@ -1,5 +1,7 @@
 use super::*;
+use crate::ir::{BoundExpr, StrFunc};
 use crate::test_support::parse_stmt;
+use gnitz_core::{ColumnDef, Schema, TypeCode};
 
 #[test]
 fn validate_user_name_rejects_reserved_and_malformed() {
@@ -79,4 +81,29 @@ fn alter_view_rejected_clause_matrix() {
     // `WITH (…)` parses here and is rejected: ALTER VIEW retargets a body, so
     // letting it set a budget would make the clause-less form silently drop one.
     assert!(guard("ALTER VIEW v WITH (security_barrier = true) AS SELECT a FROM t").is_err());
+}
+
+/// A computed STRING column must be *declared* STRING. The register image
+/// maps STRING to I64, which was right while every computed value was an
+/// 8-byte register.
+#[test]
+fn a_computed_string_projection_declares_a_string_column() {
+    let schema = Schema {
+        columns: vec![
+            ColumnDef::new("pk", TypeCode::U64, true),
+            ColumnDef::new("s", TypeCode::String, true),
+        ],
+        pk_cols: vec![0],
+    };
+    let e = BoundExpr::StrCall {
+        f: StrFunc::Upper,
+        args: vec![BoundExpr::ColRef(1)],
+    };
+    let nominal = e.infer_type(&schema.columns);
+    assert_eq!(nominal, TypeCode::String);
+    let def = computed_column(None, 0, nominal);
+    assert_eq!(def.type_code, TypeCode::String);
+    assert!(def.is_nullable);
+    // A numeric expression still takes its register image.
+    assert_eq!(computed_column(None, 0, TypeCode::F32).type_code, TypeCode::F64);
 }

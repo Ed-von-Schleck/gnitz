@@ -80,6 +80,14 @@ pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema)
             // every batch reaching SET is built from a `Schema`, so the declared
             // type code decides the representation.
             BoundExpr::ColRef(c) if schema.columns[*c].type_code == TypeCode::String => SetProgram::StrCol(*c),
+            // A SET value is written into a fixed-width integer or a string
+            // column; an f64 register has no destination, and nothing downstream
+            // can tell its bit pattern from an integer's.
+            _ if expr.infer_type(&schema.columns).is_float() => {
+                return Err(GnitzSqlError::Unsupported(
+                    "SET from a floating-point expression is not supported".to_string(),
+                ))
+            }
             _ => SetProgram::Expr(Box::new(compile_scalar_evaluator(expr, schema)?)),
         }
     };
@@ -399,7 +407,7 @@ pub(crate) fn execute_update(
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
 
     let where_expr = bind_where(schema, &table_alias, selection.as_ref())?;
-    let plan = bound_and_predicate(schema, where_expr.as_ref(), ReadBudget::MayChunk, &target.indexes)?;
+    let plan = bound_and_predicate(schema, &where_expr, ReadBudget::MayChunk, &target.indexes)?;
     let sink = ReadSink::all_rows();
 
     // Read the target rows and build the SET batch under the RMW driver: an
@@ -447,7 +455,7 @@ pub(crate) fn execute_delete(
     let (table_id, schema) = (target.tid, &target.schema);
 
     let where_expr = bind_where(schema, &table_alias, del.selection.as_ref())?;
-    let plan = bound_and_predicate(schema, where_expr.as_ref(), ReadBudget::MayChunk, &target.indexes)?;
+    let plan = bound_and_predicate(schema, &where_expr, ReadBudget::MayChunk, &target.indexes)?;
     let (reply_schema, sink) = pk_only_reply(schema, &table_alias)?;
     let reply_schema = Arc::new(reply_schema);
 

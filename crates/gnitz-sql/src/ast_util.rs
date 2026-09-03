@@ -484,26 +484,6 @@ pub(crate) fn classify_from(from: &[sqlparser::ast::TableWithJoins]) -> FromShap
     }
 }
 
-/// Flattens an `AND`-tree into its leaf conjuncts, left to right. Descends
-/// through `AND` nesting and unwraps parenthesised `Nested` wrappers; any other
-/// node (an equality, a range, an `OR`-group, …) is a leaf kept intact. The
-/// AST form; `access::flatten_bound_conjuncts` is the `BoundExpr` analogue.
-pub(crate) fn flatten_conjuncts<'e>(expr: &'e sqlparser::ast::Expr, out: &mut Vec<&'e sqlparser::ast::Expr>) {
-    use sqlparser::ast::{BinaryOperator, Expr};
-    match expr {
-        Expr::Nested(inner) => flatten_conjuncts(inner, out),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            flatten_conjuncts(left, out);
-            flatten_conjuncts(right, out);
-        }
-        _ => out.push(expr),
-    }
-}
-
 /// Extract table name from a TableFactor::Table. Strict — a derived table
 /// (subquery in FROM) is rejected.
 ///

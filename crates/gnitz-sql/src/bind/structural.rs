@@ -21,6 +21,28 @@ pub(crate) fn bind_single_table(expr: &Expr, schema: &Schema, alias: &str) -> Re
     bind_structural(expr, &SingleTable { schema, alias })
 }
 
+/// A WHERE / ON clause as its bound conjunct list — the one home of that shape,
+/// which every access recognizer and predicate compiler reads. Bound whole, then
+/// split at every top-level `AND`, so a desugar that produces one (BETWEEN)
+/// contributes its conjuncts like the written ones.
+pub(crate) fn bind_conjuncts<R: Clone, L: LeafBinder<R>>(
+    expr: &Expr,
+    leaf: &L,
+) -> Result<Vec<BExpr<R>>, GnitzSqlError> {
+    fn split<R>(e: BExpr<R>, out: &mut Vec<BExpr<R>>) {
+        match e {
+            BExpr::BinOp(l, BinOp::And, r) => {
+                split(*l, out);
+                split(*r, out);
+            }
+            e => out.push(e),
+        }
+    }
+    let mut out = Vec::new();
+    split(bind_structural(expr, leaf)?, &mut out);
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Shared structural expression binding
 // ---------------------------------------------------------------------------
@@ -46,8 +68,16 @@ pub(crate) trait LeafBinder<R = usize> {
     }
     /// An `Identifier` / `CompoundIdentifier` column reference.
     fn bind_column(&self, e: &Expr) -> Result<BExpr<R>, GnitzSqlError>;
-    /// A function call (aggregates, or a context-specific rejection).
-    fn bind_function(&self, f: &Function) -> Result<BExpr<R>, GnitzSqlError>;
+    /// A function call. Only a grouped context admits an aggregate, so the
+    /// default rejects one — after `classify_agg_call`, so an unknown or
+    /// malformed call is named as such and reaching past it means the name
+    /// really is an aggregate.
+    fn bind_function(&self, f: &Function) -> Result<BExpr<R>, GnitzSqlError> {
+        classify_agg_call(f)?;
+        Err(GnitzSqlError::Unsupported(
+            "aggregate function not allowed in expression context".to_string(),
+        ))
+    }
     /// Whether the value a leaf reference names can be NULL — the one
     /// nullability fact a leaf owns, which [`null_test`] folds a test by.
     fn is_nullable(&self, r: &R) -> bool;
@@ -279,7 +309,15 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
                     )))
                 }
             };
-            Ok(BExpr::UnaryOp(uop, Box::new(inner)))
+            // sqlparser lexes the minus separately, so `-1` arrives as a negated
+            // literal; it leaves here as the literal `-1`, the one shape every
+            // consumer reads a constant by. A magnitude of `i64::MIN` binds as
+            // `LitWide`, so the negation cannot overflow.
+            Ok(match (uop, inner) {
+                (UnaryOp::Neg, BExpr::LitInt(v)) => BExpr::LitInt(-v),
+                (UnaryOp::Neg, BExpr::LitFloat(v)) => BExpr::LitFloat(-v),
+                (uop, inner) => BExpr::UnaryOp(uop, Box::new(inner)),
+            })
         }
         // `e BETWEEN lo AND hi` ≡ `e >= lo AND e <= hi`; NOT BETWEEN negates it.
         // NULL semantics are SQL-correct under either form (a NULL operand makes
@@ -846,17 +884,6 @@ impl SingleTable<'_> {
 impl LeafBinder for SingleTable<'_> {
     fn bind_column(&self, e: &Expr) -> Result<BoundExpr, GnitzSqlError> {
         Ok(BoundExpr::ColRef(self.idx(e)?))
-    }
-    fn bind_function(&self, func: &Function) -> Result<BoundExpr, GnitzSqlError> {
-        // Shape dispatch (COUNT(*) vs COUNT(x), arity) is leaf-independent — one
-        // home in `classify_agg_call`; this leaf only binds the argument. Its
-        // type is checked where the aggregate is typed (`agg_typing`).
-        let (agg_func, arg) = classify_agg_call(func)?;
-        let bound = arg.map(|e| bind_structural(e, self)).transpose()?;
-        Ok(BoundExpr::AggCall {
-            func: agg_func,
-            arg: bound.map(Box::new),
-        })
     }
     fn is_nullable(&self, r: &usize) -> bool {
         self.schema.columns[*r].is_nullable

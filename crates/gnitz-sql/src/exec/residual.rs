@@ -7,7 +7,7 @@ use gnitz_core::{Schema, ZSetBatch};
 /// increasing order. Serves the UPDATE/DELETE resolution, which re-imposes the
 /// WHERE on the transaction's own buffered rows and needs the passing indices.
 ///
-/// The conjuncts go through the shared `and_fold` and are compiled once, then
+/// The conjuncts are AND-compiled once, then
 /// driven over the whole batch by the shared evaluator — the same program a
 /// `CREATE VIEW` WHERE compiles to, so a DML residual and a view filter cannot
 /// disagree.
@@ -43,7 +43,7 @@ pub(crate) fn matching_indices(
     // `WHERE nonnull_col IS NOT NULL` arrives as `LitInt(1)` and must keep every
     // row. The mirror needs nothing — `LitInt(0)` compiles to a real
     // `LoadConst 0` and drops every row.
-    let Some(ev) = compile_conjuncts_evaluator(preds, schema)? else {
+    let Some(ev) = compile_conjuncts_evaluator(preds.iter().copied(), schema)? else {
         return Ok((0..n).collect());
     };
     // One view over the whole batch: `ViewBuffers::view` rebuilds a region list

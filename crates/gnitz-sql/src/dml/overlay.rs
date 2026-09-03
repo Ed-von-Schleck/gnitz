@@ -109,7 +109,7 @@ fn fetch_committed(
         // a key set it already holds, so it takes this bound directly rather than
         // re-deriving it from a synthetic `pk IN (…)`.
         let keys = keys.iter().map(|k| k.split_wire().0).collect();
-        let plan = AccessPlan::new(ReadBound::PkSet(keys), None, Vec::new(), schema)?;
+        let plan = AccessPlan::new(ReadBound::PkSet(keys), &[], Vec::new(), schema)?;
         return fetch_bound(client, tid, &plan.access, &ReadSink::all_rows(), schema);
     }
     let gather = RowGather::new(schema);

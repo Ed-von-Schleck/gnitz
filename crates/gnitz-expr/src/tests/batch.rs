@@ -17,7 +17,7 @@ use crate::test_support::{
     filter_prog, make_int_view, make_n_col_view, make_string_view, passing_rows, push_payload_cols, row_str, row_value,
     scalar_prog, schema_pk_ints, schema_pk_strings, set_row_pk, TestSchema, TestView,
 };
-use crate::{CmpOp, Evaluator, LogicalInstr, ResolvedProgram, RowSource, StrOp};
+use crate::{CmpOp, Evaluator, LogicalInstr, ResolvedProgram, RowSource};
 
 /// `eval_batch` with the string-buffer table the drive methods assemble. These
 /// tests sit below `Evaluator`, so they build the same preamble it does.
@@ -1236,7 +1236,7 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
         &[0xFF, 0x00],
         "zzz".as_bytes(),
     ];
-    const OPS: [StrOp; 3] = [StrOp::Eq, StrOp::Lt, StrOp::Le];
+    const OPS: [CmpOp; 6] = [CmpOp::Eq, CmpOp::Ne, CmpOp::Gt, CmpOp::Ge, CmpOp::Lt, CmpOp::Le];
     let mut blob = Vec::new();
     let cells: Vec<[u8; 16]> = corpus
         .iter()
@@ -1290,7 +1290,14 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
             for (i, a) in corpus.iter().enumerate() {
                 let view = make_string_view(&schema, &[&[a, b]]);
                 let want = gnitz_wire::compare_german_strings(&cells[i], &blob, &cells[j], &blob);
-                let want = [want.is_eq() as i64, want.is_lt() as i64, want.is_le() as i64];
+                let want = [
+                    want.is_eq() as i64,
+                    want.is_ne() as i64,
+                    want.is_gt() as i64,
+                    want.is_ge() as i64,
+                    want.is_lt() as i64,
+                    want.is_le() as i64,
+                ];
                 for (channel, evs) in [("StrCmp", &regs), ("StrColCol", &col_col), ("StrColConst", &col_const)] {
                     let got: Vec<i64> = evs
                         .iter()
@@ -1326,12 +1333,12 @@ fn heap_backed_constants_at_two_arena_offsets() {
         &schema,
         vec![
             LogicalInstr::StrColConst {
-                op: StrOp::Eq,
+                op: CmpOp::Eq,
                 col: 1,
                 const_idx: ConstIdx(0),
             },
             LogicalInstr::StrColConst {
-                op: StrOp::Eq,
+                op: CmpOp::Eq,
                 col: 2,
                 const_idx: ConstIdx(1),
             },
@@ -1372,12 +1379,12 @@ fn a_cell_index_is_dense_over_the_constants_the_fused_compare_names() {
                 set_idx: ConstIdx(0),
             },
             LogicalInstr::StrColConst {
-                op: StrOp::Eq,
+                op: CmpOp::Eq,
                 col: 2,
                 const_idx: ConstIdx(2),
             },
             LogicalInstr::StrColConst {
-                op: StrOp::Eq,
+                op: CmpOp::Eq,
                 col: 1,
                 const_idx: ConstIdx(1),
             },

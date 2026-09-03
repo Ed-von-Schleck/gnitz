@@ -7,7 +7,7 @@
 //! structural rules (register limit, operand order, const-pool bounds) are
 //! decided there, so a caller emits first and is told what is unsupported once.
 
-use crate::{ConstIdx, ExprValidateErr, LogicalInstr, LogicalProgram, Reg, Sink};
+use crate::{ConstIdx, ExprValidateErr, LogicalInstr, LogicalProgram, Reg, Sink, MAX_REGS};
 
 /// Accumulates the instructions, sinks and constants of one expression program.
 #[derive(Default)]
@@ -26,8 +26,13 @@ impl ExprBuilder {
     /// already writes, else a fresh one — its own index. Every instruction is a
     /// pure function of its operands, so identical ones share a register.
     pub fn emit(&mut self, instr: LogicalInstr) -> Reg {
-        if let Some(i) = self.instrs.iter().position(|e| *e == instr) {
-            return Reg(i as u16);
+        // The fold scan stops paying once the program is already past the
+        // register cap — `build` rejects it whatever follows — so lowering a
+        // huge expression stays linear instead of quadratic in its size.
+        if self.instrs.len() <= MAX_REGS {
+            if let Some(i) = self.instrs.iter().position(|e| *e == instr) {
+                return Reg(i as u16);
+            }
         }
         let reg = Reg(self.instrs.len() as u16);
         self.instrs.push(instr);

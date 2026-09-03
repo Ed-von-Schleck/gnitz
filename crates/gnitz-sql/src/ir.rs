@@ -32,8 +32,8 @@ pub(crate) enum BExpr<R> {
     /// A non-fractional integer literal too wide for `i64` (`(i64::MAX, u128::MAX]`
     /// unsigned, or the `i64::MIN` magnitude under an outer `Neg`). The payload is
     /// the raw unsigned decimal magnitude (`Value::Number`'s digit string); a
-    /// negative wide literal rides as an outer `UnaryOp(Neg, LitWide)`, mirroring
-    /// `LitInt`. `bind_literal` is schemaless, so it cannot choose `i128`-vs-`u128`
+    /// negative wide literal rides as an outer `UnaryOp(Neg, LitWide)` — unlike a
+    /// `LitInt`, which carries its sign. `bind_literal` is schemaless, so it cannot choose `i128`-vs-`u128`
     /// parsing — only the access-path recognizer, holding the column `TypeCode`,
     /// parses the string (byte-exactly, via `pk_codec`) into a PK/index seek bound.
     /// Everywhere else a `LitWide` is un-servable: the one reject arm in
@@ -51,10 +51,6 @@ pub(crate) enum BExpr<R> {
     NullTest {
         inner: Box<BExpr<R>>,
         want_null: bool,
-    },
-    AggCall {
-        func: AggFunc,
-        arg: Option<Box<BExpr<R>>>,
     },
     /// Searched CASE: `(condition, result)` branches taken in order, with an
     /// optional ELSE (implicit ELSE NULL when absent). `COALESCE`/`NULLIF`
@@ -295,17 +291,6 @@ impl<R> BExpr<R> {
             BExpr::UnaryOp(UnaryOp::Neg, inner) => inner.infer_type_with(leaf_ty),
             BExpr::UnaryOp(UnaryOp::Not, _) => TypeCode::I64,
             BExpr::NullTest { .. } => TypeCode::I64,
-            BExpr::AggCall { func, arg } => match func {
-                AggFunc::Avg => TypeCode::F64,
-                AggFunc::Min | AggFunc::Max => {
-                    if let Some(inner) = arg {
-                        inner.infer_type_with(leaf_ty)
-                    } else {
-                        TypeCode::I64
-                    }
-                }
-                _ => TypeCode::I64,
-            },
             BExpr::Case { branches, else_ } => Self::case_type(branches, else_.as_deref(), leaf_ty),
             // The membership and pattern tests are booleans, like the comparison
             // `BinOp` arm.
@@ -383,10 +368,6 @@ impl<R> BExpr<R> {
                 expr: boxed(expr)?,
                 to: *to,
             },
-            BExpr::AggCall { func, arg } => BExpr::AggCall {
-                func: *func,
-                arg: opt(arg.as_deref())?,
-            },
             BExpr::Case { branches, else_ } => BExpr::Case {
                 branches: branches
                     .iter()
@@ -437,11 +418,6 @@ impl<R> BExpr<R> {
             BExpr::Func { arg, .. } => arg.for_each_ref(f),
             BExpr::MinMaxN { args, .. } => args.iter().for_each(|a| a.for_each_ref(f)),
             BExpr::Cast { expr, .. } => expr.for_each_ref(f),
-            BExpr::AggCall { arg, .. } => {
-                if let Some(a) = arg {
-                    a.for_each_ref(f);
-                }
-            }
             BExpr::Case { branches, else_ } => {
                 for (c, r) in branches {
                     c.for_each_ref(f);
@@ -477,19 +453,6 @@ impl BExpr<usize> {
     pub(crate) fn infer_type(&self, cols: &[ColumnDef]) -> TypeCode {
         self.infer_type_with(&|idx: &usize| cols[*idx].type_code)
     }
-}
-
-/// The one home of "a WHERE is the left-associated AND of its conjuncts";
-/// `None` when there are none. Every predicate the client compiles — the view
-/// filter, the wire ReadSpec residual, the DML residual — is built here.
-///
-/// Left-association is `reduce`'s own shape, not a downstream requirement:
-/// nothing that consumes the folded predicate inspects its association — this
-/// crate's own conjunct flatteners recurse into both sides.
-pub(crate) fn and_fold(preds: impl IntoIterator<Item = BoundExpr>) -> Option<BoundExpr> {
-    preds
-        .into_iter()
-        .reduce(|acc, e| BExpr::BinOp(Box::new(acc), BinOp::And, Box::new(e)))
 }
 
 /// The one message for every un-servable wide-integer literal.

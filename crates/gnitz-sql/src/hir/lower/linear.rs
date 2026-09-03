@@ -1,7 +1,7 @@
 //! The linear segment emitter: an optional WHERE filter plus a projection (pure
 //! column reorder/subset, or an expr-map when the projection derives or duplicates
 //! a PK column). `lower::lower_linear` resolves the HIR to the physical inputs
-//! (source, scan bound, folded predicate, physicalized projection) and hands them
+//! (source, scan bound, WHERE conjuncts, physicalized projection) and hands them
 //! here; this module owns only the `CircuitBuilder` call sequence.
 
 use super::physical::PhysProjection;
@@ -23,19 +23,16 @@ use gnitz_wire::ScanBound;
 pub(super) fn emit_linear(
     src: &SegInput,
     bound: Option<ScanBound>,
-    filter: Option<BoundExpr>,
+    filter: &[BoundExpr],
     proj: &PhysProjection,
 ) -> Result<EmitPieces, GnitzSqlError> {
     let source_schema = &src.schema;
     let items = &proj.items;
     let k = proj.pk_arity;
 
-    // Filter program (if any), compiled against the source schema. A predicate
-    // that bound to a true constant compiles to no filter at all.
-    let expr_prog = match &filter {
-        Some(pred) => compile_filter_program(pred, &source_schema.columns)?,
-        None => None,
-    };
+    // Filter program (if any), compiled against the source schema. A WHERE with
+    // nothing left to test compiles to no filter at all.
+    let expr_prog = compile_filter_program(filter, &source_schema.columns)?;
 
     // Slots 0..k are the view's physical PK (carried verbatim by commit_row). A
     // payload slot (>= k) that is a PK PassThrough is a duplicate PK value; a

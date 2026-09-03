@@ -85,9 +85,8 @@ pub(crate) fn pack_pk_value(tc: TypeCode, v: i128) -> Option<u128> {
 // The bound-literal seam
 // ---------------------------------------------------------------------------
 
-/// A bound numeric literal, sign applied. `LitInt` and `LitWide` — the two numeric
-/// literal shapes binding produces — optionally under an outer `Neg`, are the only
-/// cases: a negative literal rides as `UnaryOp(Neg, Lit…)`.
+/// A bound numeric literal, sign applied. `LitInt` carries its own sign; a
+/// `LitWide` magnitude rides under an outer `Neg` when negative.
 #[derive(Clone, Copy)]
 pub(crate) enum NumLit<'e> {
     /// A native literal (any i64, sign applied — `-(i64::MIN)` fits i128).
@@ -117,7 +116,6 @@ pub(crate) fn bound_num_literal(e: &BoundExpr) -> Option<NumLit<'_>> {
         BExpr::LitInt(v) => Some(NumLit::Small(*v as i128)),
         BExpr::LitWide(s) => Some(NumLit::Wide(s, false)),
         BExpr::UnaryOp(UnaryOp::Neg, inner) => match inner.as_ref() {
-            BExpr::LitInt(v) => Some(NumLit::Small(-(*v as i128))),
             BExpr::LitWide(s) => Some(NumLit::Wide(s, true)),
             _ => None,
         },

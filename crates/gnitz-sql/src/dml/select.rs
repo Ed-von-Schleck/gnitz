@@ -447,7 +447,7 @@ pub fn plan_read(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> 
 fn plan_access(target: &Target, alias: &str, select: &Select) -> Result<Access, GnitzSqlError> {
     let bound_where = bind_where(&target.schema, alias, select.selection.as_ref())?;
     let indexes = target.desc.as_ref().map(|d| &d.indexes[..]).unwrap_or_default();
-    let plan = bound_and_predicate(&target.schema, bound_where.as_ref(), ReadBudget::OneRequest, indexes)?;
+    let plan = bound_and_predicate(&target.schema, &bound_where, ReadBudget::OneRequest, indexes)?;
     Ok(plan.access)
 }
 

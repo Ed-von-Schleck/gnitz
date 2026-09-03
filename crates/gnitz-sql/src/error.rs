@@ -93,6 +93,15 @@ impl From<sqlparser::parser::ParserError> for GnitzSqlError {
     }
 }
 
+/// A shared-evaluator rejection as a SQL-layer `Unsupported`. The wording is
+/// `ExprValidateErr`'s own `Display`, so a query rejected here and the same
+/// program rejected by the engine's circuit compiler read identically.
+impl From<gnitz_expr::ExprValidateErr> for GnitzSqlError {
+    fn from(e: gnitz_expr::ExprValidateErr) -> Self {
+        GnitzSqlError::Unsupported(e.to_string())
+    }
+}
+
 /// The crate's one spelling of an "unhonored clause" rejection: every surface
 /// that turns a parsed-but-unimplemented clause away renders it through this.
 pub(crate) fn unsupported_clause(context: &str, clause: &str) -> GnitzSqlError {

@@ -13,12 +13,12 @@ use super::{
 use crate::agg::default_agg_name;
 use crate::ast_util::{
     aliased_def, body_is_grouped, classify_agg_call, classify_from, expand_wildcard_item, extract_table_name_and_alias,
-    flatten_conjuncts, for_each_agg_call, group_by_exprs, group_by_target, has_exists_in_subquery, has_scalar_subquery,
-    is_agg_call, peel_nested, projection_item_expr, scalar_projection_item, single_relation_col_name,
-    wildcard_name_is_visible, FromShape,
+    for_each_agg_call, group_by_exprs, group_by_target, has_exists_in_subquery, has_scalar_subquery, is_agg_call,
+    peel_nested, projection_item_expr, scalar_projection_item, single_relation_col_name, wildcard_name_is_visible,
+    FromShape,
 };
 use crate::bind::{apply_positional_aliases, cte_passthrough};
-use crate::bind::{bind_structural, find_unique_column, single_relation_col_idx, Binder, LeafBinder};
+use crate::bind::{bind_conjuncts, bind_structural, find_unique_column, single_relation_col_idx, Binder, LeafBinder};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::chain::ViewChain;
 use crate::hir::guards::{join_keys_and_type, JoinKeys};
@@ -106,15 +106,6 @@ pub(crate) fn bind_body(
             "CREATE VIEW only supports SELECT and set operations".to_string(),
         )),
     }
-}
-
-/// Flatten `expr` into its top-level AND conjuncts and bind each through `leaf` —
-/// the one home for "a WHERE / ON clause → its bound conjunct list", shared by the
-/// linear, join, grouped, and subquery binds.
-fn bind_conjuncts(expr: &Expr, leaf: &ScopeLeaf<'_>) -> Result<Vec<HirExpr>, GnitzSqlError> {
-    let mut conjuncts = Vec::new();
-    flatten_conjuncts(expr, &mut conjuncts);
-    conjuncts.iter().map(|c| bind_structural(c, leaf)).collect()
 }
 
 /// Resolve one FROM table factor to `(source subtree, alias, output cols)`. A

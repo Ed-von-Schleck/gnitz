@@ -19,7 +19,7 @@ use crate::test_support::{
     both_arms, filter_prog, is_null_op, make_n_col_view, map_prog, passing_rows, push_payload_cols, scalar_prog,
     schema_pk_ints, schema_pk_strings, set_row_pk, FilterShape, TestSchema, TestView,
 };
-use crate::{CmpOp, ConstIdx, Evaluator, IntArithOp, LogicalInstr, Reg, Sink, StrOp};
+use crate::{CmpOp, ConstIdx, Evaluator, IntArithOp, LogicalInstr, Reg, Sink};
 
 /// Assert the `GNITZ_BENCH_*` selector matched at least one of the shapes the
 /// bench built. A misspelled selector would otherwise drive nothing and
@@ -95,7 +95,7 @@ fn str_const_filter_bench() {
             mb.set_string(row, 0, value(row).as_bytes());
         }
 
-        for (name, op) in [("eq", StrOp::Eq), ("lt", StrOp::Lt)] {
+        for (name, op) in [("eq", CmpOp::Eq), ("lt", CmpOp::Lt)] {
             let consts = vec![constant.as_bytes().to_vec()];
             let fused = filter_prog(
                 &schema,

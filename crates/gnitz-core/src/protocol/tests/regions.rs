@@ -3,7 +3,6 @@ use crate::protocol::types::{ColumnDef, TypeCode};
 use crate::protocol::wal_block::{decode_wal_block_verified, encode_wal_block};
 use gnitz_expr::{
     BatchView, CmpOp, Evaluator, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Reg, RowSource, SchemaFacts,
-    StrOp,
 };
 
 /// One row's scalar result. `Evaluator` drives whole batches, and these tests
@@ -305,7 +304,7 @@ fn string_columns_compare_through_the_shared_blob_heap() {
     // STRING (ci4) vs BLOB (ci5): both pass `check_col(GermanString)`.
     let ev = LogicalProgram::new(
         vec![LogicalInstr::StrColCol {
-            op: StrOp::Lt,
+            op: CmpOp::Lt,
             col_a: 4,
             col_b: 5,
         }],

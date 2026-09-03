@@ -16,7 +16,7 @@ use crate::test_support::{
 };
 use crate::{
     CmpOp, ConstIdx, Evaluator, ExprValidateErr, FloatArithOp, Instr, IntArithOp, LogicalInstr, LogicalProgram, Reg,
-    Sink, StrOp,
+    Sink,
 };
 
 /// The phrase a `ColKindMismatch` renders for `kind`, read from its one source
@@ -138,6 +138,27 @@ fn int_to_float_widens_the_register() {
     let prog = scalar_prog(&schema, instrs, Reg(1), vec![]);
     let val = row_value(&prog, &mb, 0).expect("not NULL");
     assert_eq!(decode_f64(val), 42.0);
+}
+
+/// Lifting a constant folds at resolve: the result leaves the instruction
+/// stream as a second constant register, and reads back as the f64 image.
+#[test]
+fn int_to_float_over_a_constant_is_folded_at_resolve() {
+    let schema = schema_pk_ints(1, true);
+    let mb = make_int_view(&schema, &[(1, 0, &[42])]);
+
+    let instrs = vec![
+        LogicalInstr::LoadConst { val: -7 },
+        LogicalInstr::IntToFloat { a: Reg(0) },
+    ];
+    let prog = scalar_prog(&schema, instrs, Reg(1), vec![]);
+    assert!(
+        prog.prog.const_regs.contains(&(1, encode_f64(-7.0))),
+        "the lifted constant must be a constant register, not a stream instruction"
+    );
+    assert!(prog.prog.instrs.is_empty(), "nothing is left to run per morsel");
+    let val = row_value(&prog, &mb, 0).expect("not NULL");
+    assert_eq!(decode_f64(val), -7.0);
 }
 
 /// A `U64` column tracks its register as unsigned, which must select the
@@ -363,9 +384,12 @@ fn str_col_const_is_classified_never_null() {
 
     // STR_COL_*_CONST on col1
     for (op, _name) in &[
-        (StrOp::Eq, "EQ_CONST"),
-        (StrOp::Lt, "LT_CONST"),
-        (StrOp::Le, "LE_CONST"),
+        (CmpOp::Eq, "EQ_CONST"),
+        (CmpOp::Ne, "NE_CONST"),
+        (CmpOp::Gt, "GT_CONST"),
+        (CmpOp::Ge, "GE_CONST"),
+        (CmpOp::Lt, "LT_CONST"),
+        (CmpOp::Le, "LE_CONST"),
     ] {
         let instrs = vec![LogicalInstr::StrColConst {
             op: *op,
@@ -382,7 +406,14 @@ fn str_col_const_is_classified_never_null() {
     }
 
     // STR_COL_*_COL — both operands matter
-    for (op, _name) in &[(StrOp::Eq, "EQ_COL"), (StrOp::Lt, "LT_COL"), (StrOp::Le, "LE_COL")] {
+    for (op, _name) in &[
+        (CmpOp::Eq, "EQ_COL"),
+        (CmpOp::Ne, "NE_COL"),
+        (CmpOp::Gt, "GT_COL"),
+        (CmpOp::Ge, "GE_COL"),
+        (CmpOp::Lt, "LT_COL"),
+        (CmpOp::Le, "LE_COL"),
+    ] {
         let instrs = vec![LogicalInstr::StrColCol {
             op: *op,
             col_a: 1,
@@ -2082,7 +2113,7 @@ fn every_variant() -> Vec<LogicalInstr> {
             b: Reg(105),
         });
     }
-    for op in [StrOp::Eq, StrOp::Lt, StrOp::Le] {
+    for op in [CmpOp::Eq, CmpOp::Ne, CmpOp::Gt, CmpOp::Ge, CmpOp::Lt, CmpOp::Le] {
         v.push(L::StrColConst {
             op,
             col: 107,

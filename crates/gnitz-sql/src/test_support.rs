@@ -113,12 +113,19 @@ pub(crate) fn in_list_expr(col: &str, items: Vec<Expr>) -> Expr {
     }
 }
 
-/// Parse + bind a WHERE predicate against `schema` into a bound conjunct tree —
-/// the natural input for the `access` recognizers, which run on the bound IR.
-/// The relation is `t`, which is what every qualified reference in these tests
-/// writes.
-pub(crate) fn bind_where(sql: &str, schema: &Schema) -> BoundExpr {
-    crate::bind::bind_single_table(&parse_expr_sql(sql), schema, "t").expect("bind WHERE")
+/// Parse + bind a WHERE predicate against `schema` into its bound conjuncts —
+/// the production shape, and the input of the `access` recognizers. The relation
+/// is `t`, which is what every qualified reference in these tests writes.
+pub(crate) fn bind_where(sql: &str, schema: &Schema) -> Vec<BoundExpr> {
+    crate::dml::plan::bind_where(schema, "t", Some(&parse_expr_sql(sql))).expect("bind WHERE")
+}
+
+/// [`bind_where`] for a predicate that is one conjunct — the input of the
+/// single-conjunct recognizers.
+pub(crate) fn bind_conjunct(sql: &str, schema: &Schema) -> BoundExpr {
+    let mut conjuncts = bind_where(sql, schema);
+    assert_eq!(conjuncts.len(), 1, "{sql}: one conjunct");
+    conjuncts.pop().expect("one conjunct")
 }
 
 /// Parse a bare SQL expression (e.g. a WHERE predicate) via `GenericDialect`.

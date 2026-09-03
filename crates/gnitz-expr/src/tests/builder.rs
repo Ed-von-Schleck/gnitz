@@ -1,5 +1,5 @@
 use super::*;
-use crate::{CmpOp, IntArithOp, LogicalInstr as L, LogicalProgram, StrOp};
+use crate::{CmpOp, IntArithOp, LogicalInstr as L, LogicalProgram};
 
 /// The blob a built program encodes to must decode back to the instructions the
 /// builder recorded — which is what makes `to_blob_bytes` and the engine's
@@ -16,7 +16,7 @@ fn the_blob_round_trips_through_the_wire_decoder() {
     });
     let s_idx = b.add_const_string("längre sträng".to_string());
     let _ = b.emit(L::StrColConst {
-        op: StrOp::Eq,
+        op: CmpOp::Eq,
         col: 1,
         const_idx: s_idx,
     });

@@ -151,50 +151,6 @@ fn infer_type_covers_remaining_arms() {
         assert_eq!(t.infer_type(&s.columns), TypeCode::I64);
     }
 
-    // AggCall: AVG is always F64; MIN/MAX inherit the argument type
-    // (U64 here) and fall back to I64 with no argument; every other
-    // aggregate (COUNT/SUM/…) is I64.
-    assert_eq!(
-        BoundExpr::AggCall {
-            func: AggFunc::Avg,
-            arg: Some(Box::new(BoundExpr::ColRef(1)))
-        }
-        .infer_type(&s.columns),
-        TypeCode::F64
-    );
-    assert_eq!(
-        BoundExpr::AggCall {
-            func: AggFunc::Max,
-            arg: Some(Box::new(BoundExpr::ColRef(1)))
-        }
-        .infer_type(&s.columns),
-        TypeCode::U64
-    );
-    assert_eq!(
-        BoundExpr::AggCall {
-            func: AggFunc::Min,
-            arg: None
-        }
-        .infer_type(&s.columns),
-        TypeCode::I64
-    );
-    assert_eq!(
-        BoundExpr::AggCall {
-            func: AggFunc::Sum,
-            arg: Some(Box::new(BoundExpr::ColRef(1)))
-        }
-        .infer_type(&s.columns),
-        TypeCode::I64
-    );
-    assert_eq!(
-        BoundExpr::AggCall {
-            func: AggFunc::Count,
-            arg: None
-        }
-        .infer_type(&s.columns),
-        TypeCode::I64
-    );
-
     // InList is a boolean membership test → I64.
     assert_eq!(
         BoundExpr::InList {

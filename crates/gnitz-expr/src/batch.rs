@@ -12,7 +12,7 @@ use std::fmt::{self, Write as _};
 use crate::chars::{char_count, char_offset, reverse_chars};
 use crate::like::{fields, find};
 use crate::program::{FloatUnaryOp, IntReg, IntUnaryOp, ResolvedIntOp};
-use crate::{BatchView, CmpOp, FloatArithOp, Instr, ResolvedProgram, StrOp};
+use crate::{BatchView, CmpOp, FloatArithOp, Instr, ResolvedProgram};
 use gnitz_wire::{
     compare_german_strings, german_string_heap, german_string_inline, null_word_get, read_u64_le, FixedInt,
 };
@@ -1670,15 +1670,18 @@ fn minmax2(scratch: &mut EvalScratch, mo: &Morsel<'_>, d: u16, a: u16, b: u16, p
     maybe_pack_bool_bits(scratch, mo, d);
 }
 
-/// Dispatch a German-string compare on its operator, hoisting the three-way
+/// Dispatch a German-string compare on its operator, hoisting the six-way
 /// branch out of the row loop: each arm instantiates [`eval_str_cmp`] with its
 /// own `Ordering` predicate. `#[inline(always)]` for the reason stated there.
 #[inline(always)]
-fn str_cmp(scratch: &mut EvalScratch, mo: &Morsel<'_>, op: StrOp, d: u16, a: StrOperand<'_>, b: StrOperand<'_>) {
+fn str_cmp(scratch: &mut EvalScratch, mo: &Morsel<'_>, op: CmpOp, d: u16, a: StrOperand<'_>, b: StrOperand<'_>) {
     match op {
-        StrOp::Eq => eval_str_cmp(scratch, mo, d, a, b, |o| o == Ordering::Equal),
-        StrOp::Lt => eval_str_cmp(scratch, mo, d, a, b, |o| o == Ordering::Less),
-        StrOp::Le => eval_str_cmp(scratch, mo, d, a, b, |o| o != Ordering::Greater),
+        CmpOp::Eq => eval_str_cmp(scratch, mo, d, a, b, |o| o == Ordering::Equal),
+        CmpOp::Ne => eval_str_cmp(scratch, mo, d, a, b, |o| o != Ordering::Equal),
+        CmpOp::Gt => eval_str_cmp(scratch, mo, d, a, b, |o| o == Ordering::Greater),
+        CmpOp::Ge => eval_str_cmp(scratch, mo, d, a, b, |o| o != Ordering::Less),
+        CmpOp::Lt => eval_str_cmp(scratch, mo, d, a, b, |o| o == Ordering::Less),
+        CmpOp::Le => eval_str_cmp(scratch, mo, d, a, b, |o| o != Ordering::Greater),
     }
 }
 
@@ -2064,7 +2067,7 @@ pub(crate) fn eval_batch(
             // ----------------------------------------------------------------
             // Both arms are the same compare over two operands; only where
             // operand B comes from differs. `str_cmp` keeps the three-way
-            // operator branch outside the row loop, so each `StrOp` gets its own
+            // operator branch outside the row loop, so each operator gets its own
             // branch-free kernel.
             Instr::StrColConst { op, dst, pi, cell_idx } => str_cmp(
                 scratch,
@@ -2134,13 +2137,12 @@ pub(crate) fn eval_batch(
             // The operator branch stays outside the row loop, as `str_cmp` does
             // for the `EXPR_STR_COL_*` family.
             Instr::StrCmp { op, dst, a, b } => match op {
-                StrOp::Eq => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| (x == y) as i64),
-                StrOp::Lt => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| {
-                    (x.cmp(y) == Ordering::Less) as i64
-                }),
-                StrOp::Le => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| {
-                    (x.cmp(y) != Ordering::Greater) as i64
-                }),
+                CmpOp::Eq => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| (x == y) as i64),
+                CmpOp::Ne => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| (x != y) as i64),
+                CmpOp::Gt => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| (x > y) as i64),
+                CmpOp::Ge => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| (x >= y) as i64),
+                CmpOp::Lt => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| (x < y) as i64),
+                CmpOp::Le => str2_to_scalar(scratch, &mo, bufs, dst, a, b, |x, y| (x <= y) as i64),
             },
 
             // Unswitched on `chars`, so each measure is its own monomorphised loop.

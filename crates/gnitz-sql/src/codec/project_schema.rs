@@ -98,7 +98,7 @@ pub(crate) fn compile_projection_map(items: &[ProjItem], schema: &Schema) -> Res
             }
         }
     }
-    eb.build(None).map_err(|e| GnitzSqlError::Unsupported(e.to_string()))
+    Ok(eb.build(None)?)
 }
 
 /// Pin the full source PK to output slots `0..k` in `pk_indices()` order,

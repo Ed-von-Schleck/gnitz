@@ -23,18 +23,13 @@ pub(crate) fn resolve_refs(expr: &HirExpr, layout: &[ColId]) -> Result<BoundExpr
     })
 }
 
-/// Resolve each conjunct against `layout`, then hand them to [`crate::ir::and_fold`]
-/// — the HIR entry to that one rule, consumed by the scan bound and every filter
-/// emit.
-pub(crate) fn fold_preds<'a>(
+/// Resolve each conjunct against `layout`. The list is what the scan bound and
+/// every filter emit consume; nothing folds it into a tree.
+pub(crate) fn resolve_preds<'a>(
     preds: impl IntoIterator<Item = &'a HirExpr>,
     layout: &[ColId],
-) -> Result<Option<BoundExpr>, GnitzSqlError> {
-    let resolved: Vec<BoundExpr> = preds
-        .into_iter()
-        .map(|p| resolve_refs(p, layout))
-        .collect::<Result<_, _>>()?;
-    Ok(crate::ir::and_fold(resolved))
+) -> Result<Vec<BoundExpr>, GnitzSqlError> {
+    preds.into_iter().map(|p| resolve_refs(p, layout)).collect()
 }
 
 /// A physicalized projection: the emission items, the output column defs, the

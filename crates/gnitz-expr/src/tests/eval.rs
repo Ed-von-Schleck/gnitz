@@ -12,7 +12,7 @@ use crate::test_support::{
     passing_rows, push_payload_cols, row_value, scalar_prog, schema_pk_ints, schema_pk_strings, set_row_pk,
     FilterShape, TestSchema, TestView,
 };
-use crate::{CmpOp, Evaluator, ExprResults, IntArithOp, LogicalInstr, StrOp};
+use crate::{CmpOp, Evaluator, ExprResults, IntArithOp, LogicalInstr};
 
 /// True iff `ev`'s predicate passes for `row`.
 fn passes(ev: &Evaluator, mb: &TestView, row: usize) -> bool {
@@ -157,7 +157,7 @@ fn a_fused_string_compare_never_passes_a_null_row() {
 
     // Predicate: col1 = 'foo'. result_reg = 0.
     let instrs = vec![LogicalInstr::StrColConst {
-        op: StrOp::Eq,
+        op: CmpOp::Eq,
         col: 1,
         const_idx: ConstIdx(0),
     }];
@@ -740,7 +740,7 @@ fn not_null_load_shapes() -> Vec<(&'static str, FilterShape, bool)> {
                     LogicalInstr::LoadColStr { col: 3 },
                     LogicalInstr::LoadConstStr { const_idx: ConstIdx(0) },
                     LogicalInstr::StrCmp {
-                        op: StrOp::Lt,
+                        op: CmpOp::Lt,
                         a: Reg(0),
                         b: Reg(1),
                     },
@@ -753,7 +753,7 @@ fn not_null_load_shapes() -> Vec<(&'static str, FilterShape, bool)> {
             "str_col_const",
             (
                 vec![LogicalInstr::StrColConst {
-                    op: StrOp::Lt,
+                    op: CmpOp::Lt,
                     col: 3,
                     const_idx: ConstIdx(0),
                 }],
@@ -765,7 +765,7 @@ fn not_null_load_shapes() -> Vec<(&'static str, FilterShape, bool)> {
             "str_col_col",
             (
                 vec![LogicalInstr::StrColCol {
-                    op: StrOp::Lt,
+                    op: CmpOp::Lt,
                     col_a: 3,
                     col_b: 4,
                 }],
@@ -906,12 +906,12 @@ fn nullable_and_not_null_columns_side_by_side() {
         LogicalInstr::LoadColStr { col: 3 },
         LogicalInstr::LoadColStr { col: 4 },
         LogicalInstr::StrColConst {
-            op: StrOp::Lt,
+            op: CmpOp::Lt,
             col: 4,
             const_idx: ConstIdx(0),
         },
         LogicalInstr::StrColCol {
-            op: StrOp::Lt,
+            op: CmpOp::Lt,
             col_a: 3,
             col_b: 4,
         },

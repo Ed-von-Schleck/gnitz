@@ -2,8 +2,8 @@ use super::*;
 use crate::bind::bind_single_table;
 use crate::codec::pk_codec::extract_pk_value;
 use crate::test_support::{
-    bind_where, col_def, compound_schema_u64_u64, eq_expr, idx_metas, idx_metas_flagged, in_list_expr, neg_num_expr,
-    num_expr, parse_expr_sql, pk_schema, two_col, uuid_schema_payload, uuid_schema_pk,
+    bind_conjunct, bind_where, col_def, compound_schema_u64_u64, eq_expr, idx_metas, idx_metas_flagged, in_list_expr,
+    neg_num_expr, num_expr, parse_expr_sql, pk_schema, two_col, uuid_schema_payload, uuid_schema_pk,
 };
 use sqlparser::ast::Expr;
 
@@ -45,13 +45,15 @@ fn picked(where_sql: &str, sch: &Schema, lists: &[&[u32]]) -> Option<(Vec<u32>, 
 /// The bound [`bound_column_list`] derives for the key list `cols`, plus its
 /// residual — the one recognizer alone, without the PK-list construction or
 /// the cross-index ranking wrapped around it.
-fn bound_list_of<'e>(expr: &'e BoundExpr, cols: &[u32], sch: &Schema) -> Option<(RangeDescriptor, Vec<&'e BoundExpr>)> {
-    let mut conjuncts = Vec::new();
-    flatten_bound_conjuncts(expr, &mut conjuncts);
-    let eqs = collect_eq_conjuncts(&conjuncts, sch);
-    let ends = collect_range_ends(&conjuncts, sch);
+fn bound_list_of<'e>(
+    conjuncts: &'e [BoundExpr],
+    cols: &[u32],
+    sch: &Schema,
+) -> Option<(RangeDescriptor, Vec<&'e BoundExpr>)> {
+    let eqs = collect_eq_conjuncts(conjuncts, sch);
+    let ends = collect_range_ends(conjuncts, sch);
     let (desc, consumed) = bound_column_list(cols, &eqs, &ends, sch)?;
-    Some((desc, residual_conjuncts(&conjuncts, &consumed)))
+    Some((desc, residual_conjuncts(conjuncts, &consumed)))
 }
 
 // ------------------------------------------------------------------
@@ -61,7 +63,7 @@ fn bound_list_of<'e>(expr: &'e BoundExpr, cols: &[u32], sch: &Schema) -> Option<
 #[test]
 fn test_uuid_index_seek_string_literal() {
     let schema = uuid_schema_payload();
-    let expr = bind_where("uid = '550e8400-e29b-41d4-a716-446655440000'", &schema);
+    let expr = bind_conjunct("uid = '550e8400-e29b-41d4-a716-446655440000'", &schema);
     assert_eq!(
         try_col_eq_literal(&expr, &schema),
         Some((1, 0x550e8400_e29b_41d4_a716_446655440000_u128))
@@ -86,7 +88,7 @@ fn an_equality_packs_its_key_at_the_columns_width() {
         (TypeCode::U64, "val = 18446744073709551615", Some(u64::MAX as u128)),
     ] {
         let schema = two_col(tc);
-        let expr = bind_where(sql, &schema);
+        let expr = bind_conjunct(sql, &schema);
         assert_eq!(
             try_col_eq_literal(&expr, &schema),
             want.map(|key| (1, key)),
@@ -123,7 +125,7 @@ fn double_quoted_uuid_binds_as_column_ref_not_seek() {
 fn a_flipped_qualified_equality_is_the_same_seek_key() {
     let schema = pk_schema(TypeCode::U64); // (id U64 pk, v I64)
     assert_eq!(
-        try_col_eq_literal(&bind_where("5 = t.v", &schema), &schema),
+        try_col_eq_literal(&bind_conjunct("5 = t.v", &schema), &schema),
         Some((1, 5))
     );
 }
@@ -135,8 +137,8 @@ fn a_flipped_qualified_equality_is_the_same_seek_key() {
 /// The key a `WHERE` resolves to through the PK-range recognizer, plus that
 /// recognizer's residual. `None` when the descriptor pins fewer than every PK
 /// column (it then names a key group, not a key).
-fn pk_point_of<'e>(expr: &'e BoundExpr, schema: &Schema) -> Option<(PkTuple, Vec<&'e BoundExpr>)> {
-    let (desc, residual) = try_extract_pk_range(expr, schema)?;
+fn pk_point_of<'e>(conjuncts: &'e [BoundExpr], schema: &Schema) -> Option<(PkTuple, Vec<&'e BoundExpr>)> {
+    let (desc, residual) = try_extract_pk_range(conjuncts, schema)?;
     pk_point_tuple(&desc, schema).map(|t| (t, residual))
 }
 
@@ -406,7 +408,7 @@ fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
     // folds to the `Eq` leg 2 already covers); the dedup collapses it to one key.
     let in_e = bind1(&in_list_expr("id", vec![literal.clone(), literal]), &schema).expect("bind in");
     assert_eq!(
-        try_extract_pk_in(&in_e, &schema).map(|(keys, _)| keys),
+        try_extract_pk_in(&[in_e], &schema).map(|(keys, _)| keys),
         Some(vec![expected]),
         "try_extract_pk_in"
     );
@@ -470,7 +472,7 @@ fn parse_range_cut_saturates() {
 fn try_col_range_literal_orientations() {
     use Cut::{After, Before};
     let schema = two_col(TypeCode::I64);
-    let ck = |sql: &str| try_col_range_literal(&bind_where(sql, &schema), &schema);
+    let ck = |sql: &str| try_col_range_literal(&bind_conjunct(sql, &schema), &schema);
     let (c, e) = ck("val > 5").unwrap();
     assert_eq!(c, 1);
     assert!(e.side == RangeSide::Start && e.cut == After(5));

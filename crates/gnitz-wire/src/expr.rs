@@ -68,6 +68,17 @@ wire_enum! {
         /// binary-searches the sorted copy. NULL input propagates to NULL. `set_idx` is
         /// a const-pool index (full u32, like `ExprOp::StrCol*Const`), not a register.
         IntInSet = 46,
+        /// The other half of the six-way compare for the three string shapes;
+        /// each mirrors the `CmpEq..CmpLe` integer set.
+        StrColNeConst = 95,
+        StrColGtConst = 96,
+        StrColGeConst = 97,
+        StrColNeCol = 98,
+        StrColGtCol = 99,
+        StrColGeCol = 100,
+        StrCmpNe = 101,
+        StrCmpGt = 102,
+        StrCmpGe = 103,
 
         // Numeric scalar functions and numeric CAST. Codes 37-39 fill the gap the string
         // compares left after LOAD_NULL; the rest continue past INT_IN_SET, keeping the
@@ -127,6 +138,7 @@ wire_enum! {
         /// `[op, a, b]` — compare two string registers, writing 0/1 into the
         /// *scalar* register. Byte-lexicographic (`[u8]::cmp` over the content
         /// bytes), the same order `compare_german_strings` imposes on canonical cells.
+        /// `StrCmpNe/Gt/Ge` sit at 101–103.
         StrCmpEq = 61,
         StrCmpLt = 62,
         StrCmpLe = 63,

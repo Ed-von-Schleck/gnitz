@@ -285,14 +285,6 @@ pub(crate) enum ResolvedIntOp {
     },
 }
 
-/// German-string comparison operator.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StrOp {
-    Eq,
-    Lt,
-    Le,
-}
-
 // ---------------------------------------------------------------------------
 // LogicalInstr — the wire-mirroring form (logical column indices)
 // ---------------------------------------------------------------------------
@@ -460,12 +452,12 @@ pub enum LogicalInstr {
         invert: bool,
     },
     StrColConst {
-        op: StrOp,
+        op: CmpOp,
         col: u32,
         const_idx: ConstIdx,
     },
     StrColCol {
-        op: StrOp,
+        op: CmpOp,
         col_a: u32,
         col_b: u32,
     },
@@ -494,7 +486,7 @@ pub enum LogicalInstr {
     },
     /// String compare writing a boolean into a *scalar* register.
     StrCmp {
-        op: StrOp,
+        op: CmpOp,
         a: Reg,
         b: Reg,
     },
@@ -743,13 +735,13 @@ pub(crate) enum Instr {
     /// `resolve` into `ResolvedProgram.const_cells`; `cell_idx` indexes that
     /// vector, not the const pool.
     StrColConst {
-        op: StrOp,
+        op: CmpOp,
         dst: u16,
         pi: u8,
         cell_idx: u32,
     },
     StrColCol {
-        op: StrOp,
+        op: CmpOp,
         dst: u16,
         pi_a: u8,
         pi_b: u8,
@@ -780,7 +772,7 @@ pub(crate) enum Instr {
         b: u16,
     },
     StrCmp {
-        op: StrOp,
+        op: CmpOp,
         dst: u16,
         a: u16,
         b: u16,
@@ -1010,9 +1002,12 @@ impl LogicalInstr {
             ),
             L::StrColConst { op, col: c, const_idx } => [
                 match op {
-                    StrOp::Eq => ExprOp::StrColEqConst,
-                    StrOp::Lt => ExprOp::StrColLtConst,
-                    StrOp::Le => ExprOp::StrColLeConst,
+                    CmpOp::Eq => ExprOp::StrColEqConst,
+                    CmpOp::Ne => ExprOp::StrColNeConst,
+                    CmpOp::Gt => ExprOp::StrColGtConst,
+                    CmpOp::Ge => ExprOp::StrColGeConst,
+                    CmpOp::Lt => ExprOp::StrColLtConst,
+                    CmpOp::Le => ExprOp::StrColLeConst,
                 }
                 .as_wire(),
                 c,
@@ -1020,9 +1015,12 @@ impl LogicalInstr {
             ],
             L::StrColCol { op, col_a, col_b } => [
                 match op {
-                    StrOp::Eq => ExprOp::StrColEqCol,
-                    StrOp::Lt => ExprOp::StrColLtCol,
-                    StrOp::Le => ExprOp::StrColLeCol,
+                    CmpOp::Eq => ExprOp::StrColEqCol,
+                    CmpOp::Ne => ExprOp::StrColNeCol,
+                    CmpOp::Gt => ExprOp::StrColGtCol,
+                    CmpOp::Ge => ExprOp::StrColGeCol,
+                    CmpOp::Lt => ExprOp::StrColLtCol,
+                    CmpOp::Le => ExprOp::StrColLeCol,
                 }
                 .as_wire(),
                 col_a,
@@ -1033,9 +1031,12 @@ impl LogicalInstr {
             L::LoadConstStr { const_idx } => col(ExprOp::LoadConstStr, const_idx.0),
             L::StrCmp { op, a, b } => bin(
                 match op {
-                    StrOp::Eq => ExprOp::StrCmpEq,
-                    StrOp::Lt => ExprOp::StrCmpLt,
-                    StrOp::Le => ExprOp::StrCmpLe,
+                    CmpOp::Eq => ExprOp::StrCmpEq,
+                    CmpOp::Ne => ExprOp::StrCmpNe,
+                    CmpOp::Gt => ExprOp::StrCmpGt,
+                    CmpOp::Ge => ExprOp::StrCmpGe,
+                    CmpOp::Lt => ExprOp::StrCmpLt,
+                    CmpOp::Le => ExprOp::StrCmpLe,
                 },
                 a,
                 b,
@@ -1488,12 +1489,18 @@ impl LogicalProgram {
                 }
             }
             ExprOp::LoadNull => L::LoadNull,
-            ExprOp::StrColEqConst => str_col_const(StrOp::Eq),
-            ExprOp::StrColLtConst => str_col_const(StrOp::Lt),
-            ExprOp::StrColLeConst => str_col_const(StrOp::Le),
-            ExprOp::StrColEqCol => str_col_col(StrOp::Eq),
-            ExprOp::StrColLtCol => str_col_col(StrOp::Lt),
-            ExprOp::StrColLeCol => str_col_col(StrOp::Le),
+            ExprOp::StrColEqConst => str_col_const(CmpOp::Eq),
+            ExprOp::StrColNeConst => str_col_const(CmpOp::Ne),
+            ExprOp::StrColGtConst => str_col_const(CmpOp::Gt),
+            ExprOp::StrColGeConst => str_col_const(CmpOp::Ge),
+            ExprOp::StrColLtConst => str_col_const(CmpOp::Lt),
+            ExprOp::StrColLeConst => str_col_const(CmpOp::Le),
+            ExprOp::StrColEqCol => str_col_col(CmpOp::Eq),
+            ExprOp::StrColNeCol => str_col_col(CmpOp::Ne),
+            ExprOp::StrColGtCol => str_col_col(CmpOp::Gt),
+            ExprOp::StrColGeCol => str_col_col(CmpOp::Ge),
+            ExprOp::StrColLtCol => str_col_col(CmpOp::Lt),
+            ExprOp::StrColLeCol => str_col_col(CmpOp::Le),
             // `set_idx` takes the full `a2` u32 const index, never truncated to
             // a register's u16.
             ExprOp::IntInSet => L::IntInSet {
@@ -1513,9 +1520,12 @@ impl LogicalProgram {
                     b: Reg(sb),
                 }
             }
-            ExprOp::StrCmpEq => str_cmp(StrOp::Eq),
-            ExprOp::StrCmpLt => str_cmp(StrOp::Lt),
-            ExprOp::StrCmpLe => str_cmp(StrOp::Le),
+            ExprOp::StrCmpEq => str_cmp(CmpOp::Eq),
+            ExprOp::StrCmpNe => str_cmp(CmpOp::Ne),
+            ExprOp::StrCmpGt => str_cmp(CmpOp::Gt),
+            ExprOp::StrCmpGe => str_cmp(CmpOp::Ge),
+            ExprOp::StrCmpLt => str_cmp(CmpOp::Lt),
+            ExprOp::StrCmpLe => str_cmp(CmpOp::Le),
             ExprOp::StrLenBytes => L::StrLen { a, chars: false },
             ExprOp::StrLenChars => L::StrLen { a, chars: true },
             ExprOp::StrUpper => L::StrCase { a, upper: true },
@@ -1715,8 +1725,9 @@ impl LogicalProgram {
         for (i, li) in self.instrs.into_iter().enumerate() {
             // A register is the index of the instruction that writes it.
             let dst = i as u16;
-            // One logical instruction, one resolved instruction — bar the two
-            // constant loads, which leave the stream for their own tables.
+            // One logical instruction, one resolved instruction — bar the
+            // constants (the two loads, and a lift or PK null test over one),
+            // which leave the stream for their own tables.
             let resolved = match li {
                 L::LoadColInt { col } => {
                     let loc = schema.locate(col as usize);
@@ -1824,10 +1835,19 @@ impl LogicalProgram {
                     b: Reg(b),
                     is_max,
                 } => I::FloatMinMax2 { dst, a, b, is_max },
-                L::IntToFloat { a: Reg(a) } => I::IntToFloat {
-                    dst,
-                    a,
-                    signed: !is_u64(a),
+                // A constant lifted to f64 is another constant: `LoadConst` is
+                // never U64, so the signed conversion is the one the kernel
+                // would run, and a constant lane carries no null bit to copy.
+                L::IntToFloat { a: Reg(a) } => match const_regs.iter().find(|(r, _)| *r == a) {
+                    Some(&(_, val)) => {
+                        const_regs.push((dst, crate::batch::encode_f64(val as f64)));
+                        continue;
+                    }
+                    None => I::IntToFloat {
+                        dst,
+                        a,
+                        signed: !is_u64(a),
+                    },
                 },
                 L::Select {
                     cond: Reg(cond),

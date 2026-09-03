@@ -1,5 +1,4 @@
 use super::*;
-use crate::ir::AggFunc;
 use crate::test_support::parse_expr_sql;
 use gnitz_core::{ColumnDef, Schema, TypeCode};
 
@@ -185,12 +184,11 @@ fn test_bind_in_list_folds_one_item_else_binds_faithful() {
             other => panic!("{src}: expected Not(_), got {other:?}"),
         }
     }
-    // Negative-literal items bind as `UnaryOp(Neg, LitInt)` (sqlparser lexes
-    // the minus separately) — the INT_IN_SET lowering unwraps them.
+    // sqlparser lexes the minus separately; the binder folds it into the
+    // literal, so every consumer reads one constant shape.
     match bind1(&parse_expr_sql("c IN (-1, -2)"), &schema).unwrap() {
         BoundExpr::InList { items, .. } => {
-            assert_eq!(items.len(), 2);
-            assert!(matches!(items[0], BoundExpr::UnaryOp(UnaryOp::Neg, _)));
+            assert_eq!(items, vec![BoundExpr::LitInt(-1), BoundExpr::LitInt(-2)]);
         }
         other => panic!("expected InList, got {other:?}"),
     }
@@ -416,10 +414,11 @@ fn test_bind_nullif() {
     assert_unsupported(bind1(&parse_expr_sql("NULLIF(c)"), &s), "exactly two");
 }
 
-/// The accepted qualifier (`ALL`, the SQL default — `COUNT(ALL c)` ≡
-/// `COUNT(c)`) and the plain forms must keep binding.
+/// Only a grouped context admits an aggregate; the single-table leaf rejects
+/// every well-formed one — including the accepted `ALL` qualifier — by name,
+/// after the qualifier check has had its say.
 #[test]
-fn test_binder_accepts_all_and_plain_aggregates() {
+fn aggregates_are_rejected_outside_a_grouped_context() {
     let schema = schema_with_val(TypeCode::I64);
     for src in [
         "COUNT(*)",
@@ -429,8 +428,9 @@ fn test_binder_accepts_all_and_plain_aggregates() {
         "MIN(c)",
         "MAX(c)",
         "AVG(c)",
+        "ABS(SUM(c))",
     ] {
-        assert!(bind1(&parse_expr_sql(src), &schema).is_ok(), "expected {src} to bind");
+        assert_unsupported(bind1(&parse_expr_sql(src), &schema), "aggregate function not allowed");
     }
 }
 
@@ -553,7 +553,7 @@ fn greatest_least_bind_n_ary_with_computed_args() {
             assert!(is_max);
             assert_eq!(args.len(), 4);
             assert!(matches!(args[1], BoundExpr::BinOp(_, BinOp::Add, _)));
-            assert!(matches!(args[2], BoundExpr::UnaryOp(UnaryOp::Neg, _)));
+            assert_eq!(args[2], BoundExpr::LitInt(-1));
             assert!(matches!(args[3], BoundExpr::LitNull));
         }
         other => panic!("expected MinMaxN, got {other:?}"),
@@ -641,25 +641,6 @@ fn cast_accepts_every_numeric_target_and_rejects_the_rest() {
     // BOOLEAN has no gnitz type at all, so it rejects one level earlier.
     assert!(bind_num("CAST(c AS BOOLEAN)").is_err());
     assert_unsupported(bind_num("CAST(c AS INT ARRAY)"), "ARRAY");
-}
-
-/// The scalar wrapper is consumed above the leaf, so its aggregate argument
-/// still resolves through the leaf on the recursion.
-#[test]
-fn scalar_functions_wrap_an_aggregate_argument() {
-    let s = schema_with_val(TypeCode::I64);
-    for src in ["ABS(SUM(c))", "CAST(SUM(c) AS INT)", "GREATEST(SUM(c), COUNT(*))"] {
-        assert!(bind1(&parse_expr_sql(src), &s).is_ok(), "expected {src} to bind");
-    }
-    match bind1(&parse_expr_sql("ABS(SUM(c))"), &s).unwrap() {
-        BoundExpr::Func {
-            f: NumFunc::Unary(FloatUnaryOp::Abs),
-            arg,
-        } => {
-            assert!(matches!(*arg, BoundExpr::AggCall { func: AggFunc::Sum, .. }))
-        }
-        other => panic!("expected Func(Abs, AggCall), got {other:?}"),
-    }
 }
 
 /// The shared qualifier inventory applies to the new names too — a dropped

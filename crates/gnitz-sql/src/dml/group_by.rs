@@ -11,7 +11,7 @@
 
 use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::{build_agg_out_schema, FinalizeItem, FoldShape};
-use crate::expr_lower::{compile_conjuncts_evaluator, compile_finalize_evaluator};
+use crate::expr_lower::{compile_conjuncts_evaluator, compile_scalar_evaluator};
 use crate::hir::bind_and_lower_fold;
 use crate::ir::BoundExpr;
 use crate::validate::reject_duplicate_projection_names;
@@ -37,8 +37,7 @@ pub(crate) fn build_fold_shape(select: &Select, schema: &Arc<Schema>, alias: &st
     // predicate that fails to compile here fails as a view too — including a
     // wide literal, which `OpcodeBackend::lower` rejects with the message that
     // names it.
-    let having_refs: Vec<&BoundExpr> = pieces.having.iter().collect();
-    let having = compile_conjuncts_evaluator(&having_refs, &pieces.partial_schema)?;
+    let having = compile_conjuncts_evaluator(&pieces.having, &pieces.partial_schema)?;
 
     let mut finalize = Vec::with_capacity(pieces.finalize.len());
     let mut out_cols = Vec::with_capacity(pieces.finalize.len());
@@ -85,6 +84,6 @@ fn finalize_item(expr: &BoundExpr, def: &ColumnDef, partial: &Schema) -> Result<
         }
     }
     Ok(FinalizeItem::Computed {
-        ev: Box::new(compile_finalize_evaluator(expr, partial)?),
+        ev: Box::new(compile_scalar_evaluator(expr, partial)?),
     })
 }

@@ -58,12 +58,12 @@ pub(crate) fn lower_reduce(
     // Resolve the reduce's input: inline a base/segment `Get` (with WHERE + scan
     // bound), or cut a combine input (`Filter?(Join)`) to a hidden segment.
     let (inner_where, inner_source) = split_filter(reduce_input);
-    let (source, bound, where_folded) = match seginput_of_get(inner_source) {
+    let (source, bound, where_preds) = match seginput_of_get(inner_source) {
         Some(seg) => {
             // Base/segment Get: apply the WHERE + scan bound inline.
-            let folded = physical::fold_preds(inner_where, &seg.layout)?;
-            let bound = extract_scan_bound(&folded, &seg);
-            (seg, bound, folded)
+            let preds = physical::resolve_preds(inner_where, &seg.layout)?;
+            let bound = extract_scan_bound(&preds, &seg);
+            (seg, bound, preds)
         }
         None => {
             // Cut the whole input (WHERE included) to a hidden segment; the reduce
@@ -71,7 +71,7 @@ pub(crate) fn lower_reduce(
             let mut live: HashSet<ColId> = HashSet::new();
             live.extend(group_cols.iter().copied());
             live.extend(aggs.iter().filter_map(|a| a.arg));
-            (cut_segment(chain, memo, input, &live)?, None, None)
+            (cut_segment(chain, memo, input, &live)?, None, Vec::new())
         }
     };
     // The pre-map, physicalized over the source. Its output is what the reduce
@@ -115,15 +115,12 @@ pub(crate) fn lower_reduce(
     // Circuit: input delta + optional WHERE.
     let mut cb = CircuitBuilder::new(source_tid);
     let inp = cb.input_delta_bounded(bound);
-    let filtered = match where_folded {
-        // Already folded above (the scan bound reads the same folded predicate),
-        // against `source.layout` — so it types against the source, not
-        // `reduce_in`: the pre-map moves the source PK columns to the front, and a
-        // PK not already at slot 0 makes the two orders disagree.
-        Some(f) => match compile_filter_program(&f, &source.schema.columns)? {
-            Some(p) => cb.filter(inp, Some(p)),
-            None => inp,
-        },
+    // Resolved above against `source.layout` (the scan bound reads the same
+    // conjuncts) — so it types against the source, not `reduce_in`: the pre-map
+    // moves the source PK columns to the front, and a PK not already at slot 0
+    // makes the two orders disagree.
+    let filtered = match compile_filter_program(&where_preds, &source.schema.columns)? {
+        Some(p) => cb.filter(inp, Some(p)),
         None => inp,
     };
 

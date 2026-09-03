@@ -40,19 +40,6 @@ fn bound_col_vs_literal(expr: &BoundExpr) -> Option<(usize, BoundLit<'_>, BinOp)
     None
 }
 
-/// Flatten a bound `AND`-tree into its leaf conjuncts, left to right. Binding
-/// already unwrapped `Nested`, so there is nothing else to descend. The bound
-/// analogue of `ast_util::flatten_conjuncts`, kept local so this leaf imports no
-/// `ast_util`.
-fn flatten_bound_conjuncts<'e>(expr: &'e BoundExpr, out: &mut Vec<&'e BoundExpr>) {
-    if let BExpr::BinOp(l, BinOp::And, r) = expr {
-        flatten_bound_conjuncts(l, out);
-        flatten_bound_conjuncts(r, out);
-    } else {
-        out.push(expr);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Front matchers
 // ---------------------------------------------------------------------------
@@ -103,19 +90,19 @@ fn pk_in_keys(conjunct: &BoundExpr, schema: &Schema) -> Option<Vec<u128>> {
     Some(pks)
 }
 
-/// `Some((keys, residual))` when one conjunct of `expr` is `pk IN (literal, …)` on a
-/// single-column PK: the gather keys plus the bound conjuncts to filter against the
-/// gathered rows. Conjunct-level like every recognizer beside it, so
-/// `pk IN (1, 2) AND v > 5` is a two-key gather rather than a full scan. `None`
-/// routes the WHERE back to the seek/index/scan ladder.
-pub(crate) fn try_extract_pk_in<'e>(expr: &'e BoundExpr, schema: &Schema) -> Option<(Vec<u128>, Vec<&'e BoundExpr>)> {
-    let mut conjuncts = Vec::new();
-    flatten_bound_conjuncts(expr, &mut conjuncts);
+/// `Some((keys, residual))` when one of `conjuncts` is `pk IN (literal, …)` on a
+/// single-column PK: the gather keys plus the conjuncts to filter against the
+/// gathered rows, so `pk IN (1, 2) AND v > 5` is a two-key gather rather than a
+/// full scan. `None` routes the WHERE back to the seek/index/scan ladder.
+pub(crate) fn try_extract_pk_in<'e>(
+    conjuncts: &'e [BoundExpr],
+    schema: &Schema,
+) -> Option<(Vec<u128>, Vec<&'e BoundExpr>)> {
     let (ci, keys) = conjuncts
         .iter()
         .enumerate()
-        .find_map(|(i, &c)| pk_in_keys(c, schema).map(|k| (i, k)))?;
-    Some((keys, residual_conjuncts(&conjuncts, &[ci])))
+        .find_map(|(i, c)| pk_in_keys(c, schema).map(|k| (i, k)))?;
+    Some((keys, residual_conjuncts(conjuncts, &[ci])))
 }
 
 /// The single key a **fully-pinned** point PK descriptor names: `desc`'s equality
@@ -137,22 +124,20 @@ pub(crate) fn pk_point_tuple(desc: &RangeDescriptor, schema: &Schema) -> Option<
     Some(PkTuple::from_columns(schema, vals))
 }
 
-/// An **exact-or-superset** PK range for `where_expr` plus the residual bound
-/// conjuncts — the PK as one more key list through [`bound_column_list`]. The walk
-/// is byte-exact at any width, so a consumed conjunct is applied exactly and
+/// An **exact-or-superset** PK range for `conjuncts` plus the residual ones —
+/// the PK as one more key list through [`bound_column_list`]. The walk is
+/// byte-exact at any width, so a consumed conjunct is applied exactly and
 /// stripped, which is what serves a wide (U128) PK range without the predicate VM.
 pub(crate) fn try_extract_pk_range<'e>(
-    where_expr: &'e BoundExpr,
+    conjuncts: &'e [BoundExpr],
     schema: &Schema,
 ) -> Option<(RangeDescriptor, Vec<&'e BoundExpr>)> {
-    let mut conjuncts = Vec::new();
-    flatten_bound_conjuncts(where_expr, &mut conjuncts);
-    let eqs = collect_eq_conjuncts(&conjuncts, schema);
-    let ends = collect_range_ends(&conjuncts, schema);
+    let eqs = collect_eq_conjuncts(conjuncts, schema);
+    let ends = collect_range_ends(conjuncts, schema);
 
     let pk_cols: Vec<u32> = schema.pk_indices().iter().map(|&c| c as u32).collect();
     let (desc, consumed) = bound_column_list(&pk_cols, &eqs, &ends, schema)?;
-    Some((desc, residual_conjuncts(&conjuncts, &consumed)))
+    Some((desc, residual_conjuncts(conjuncts, &consumed)))
 }
 
 // ---------------------------------------------------------------------------
@@ -171,11 +156,11 @@ struct EqConjunct {
 /// index so the residual can exclude exactly the consumed ones. Unscreened by
 /// column: [`consume_leading_eq_prefix`] matches against the key list itself, and
 /// a PK column carrying a secondary index is matched there like any other.
-fn collect_eq_conjuncts(conjuncts: &[&BoundExpr], schema: &Schema) -> Vec<EqConjunct> {
+fn collect_eq_conjuncts(conjuncts: &[BoundExpr], schema: &Schema) -> Vec<EqConjunct> {
     conjuncts
         .iter()
         .enumerate()
-        .filter_map(|(ci, &cand)| {
+        .filter_map(|(ci, cand)| {
             try_col_eq_literal(cand, schema).map(|(col, key)| EqConjunct { conjunct: ci, col, key })
         })
         .collect()
@@ -210,12 +195,12 @@ fn uncovered_trailing_nullable(cols: &[u32], covered: usize, schema: &Schema) ->
 /// The conjuncts a seek/range plan did not consume, kept as post-scan filters.
 /// Borrows: at most one candidate wins, so only the winner's residual is ever
 /// cloned or compiled by the caller.
-fn residual_conjuncts<'e>(conjuncts: &[&'e BoundExpr], consumed: &[usize]) -> Vec<&'e BoundExpr> {
+fn residual_conjuncts<'e>(conjuncts: &'e [BoundExpr], consumed: &[usize]) -> Vec<&'e BoundExpr> {
     conjuncts
         .iter()
         .enumerate()
         .filter(|(i, _)| !consumed.contains(i))
-        .map(|(_, &e)| e)
+        .map(|(_, e)| e)
         .collect()
 }
 
@@ -291,9 +276,9 @@ fn try_col_range_literal(expr: &BoundExpr, schema: &Schema) -> Option<(usize, Ra
 /// Every range end among `conjuncts` (`col OP lit` and flipped forms), tagged with
 /// its conjunct index. BETWEEN desugars to two `>=`/`<=` conjuncts at bind, each a
 /// separate entry here.
-fn collect_range_ends(conjuncts: &[&BoundExpr], schema: &Schema) -> Vec<RangeEndEntry> {
+fn collect_range_ends(conjuncts: &[BoundExpr], schema: &Schema) -> Vec<RangeEndEntry> {
     let mut ends: Vec<RangeEndEntry> = Vec::new();
-    for (ci, &cand) in conjuncts.iter().enumerate() {
+    for (ci, cand) in conjuncts.iter().enumerate() {
         if let Some((col, end)) = try_col_range_literal(cand, schema) {
             ends.push(RangeEndEntry { conjunct: ci, col, end });
         }
@@ -383,19 +368,17 @@ impl IndexRangeCandidate<'_> {
     }
 }
 
-/// Every index-servable bound for `where_expr`, most-constrained first, each with
+/// Every index-servable bound for `conjuncts`, most-constrained first, each with
 /// the residual its own walk leaves behind. A ranked list rather than one winner
 /// because only the caller can tell whether a residual has a compiled form — the
 /// tightest bound is not servable if its leftover conjunct is not.
 pub(crate) fn ranked_index_bounds<'e>(
-    where_expr: &'e BoundExpr,
+    conjuncts: &'e [BoundExpr],
     schema: &Schema,
     indexes: &[IndexMeta],
 ) -> Vec<IndexRangeCandidate<'e>> {
-    let mut conjuncts = Vec::new();
-    flatten_bound_conjuncts(where_expr, &mut conjuncts);
-    let eqs = collect_eq_conjuncts(&conjuncts, schema);
-    let ends = collect_range_ends(&conjuncts, schema);
+    let eqs = collect_eq_conjuncts(conjuncts, schema);
+    let ends = collect_range_ends(conjuncts, schema);
 
     let mut out: Vec<IndexRangeCandidate<'e>> = indexes
         .iter()
@@ -404,7 +387,7 @@ pub(crate) fn ranked_index_bounds<'e>(
             Some(IndexRangeCandidate {
                 idx_cols: meta.cols,
                 desc,
-                residual: residual_conjuncts(&conjuncts, &consumed),
+                residual: residual_conjuncts(conjuncts, &consumed),
                 is_unique: meta.is_unique,
             })
         })

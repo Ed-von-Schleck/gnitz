@@ -21,7 +21,7 @@
 //!   `ViewChain::add_segment` and at the final emit.
 //!
 //! The linear path resolves the HIR to its physical inputs (source, scan bound,
-//! folded predicate, physicalized projection) and delegates to
+//! WHERE conjuncts, physicalized projection) and delegates to
 //! `linear::emit_linear` — one home for the emission strategy; only the
 //! scan-bound extraction and the `HirExpr → BoundExpr` resolution are HIR work.
 //!
@@ -585,20 +585,19 @@ fn lower_linear(
     filter_preds: &[HirExpr],
     proj_items: &[ProjEntry],
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
-    let folded = physical::fold_preds(filter_preds, &src.layout)?;
-    let bound = extract_scan_bound(&folded, src);
+    let preds = physical::resolve_preds(filter_preds, &src.layout)?;
+    let bound = extract_scan_bound(&preds, src);
     let proj = physical::physicalize_projection(proj_items, &src.layout, &src.schema)?;
-    let pieces = linear::emit_linear(src, bound, folded, &proj)?;
+    let pieces = linear::emit_linear(src, bound, &preds, &proj)?;
     Ok((pieces, proj.layout))
 }
 
-/// Resolve `preds` against `layout`, AND-fold them, compile the program, and emit
-/// the filter — passing `node` through untouched when there is nothing to filter
-/// or the predicate folds to a constant true. Shared by the emits that fold and
-/// compile in one step: HAVING, the join and EXISTS residuals, and a set-op
-/// segment's WHERE. A primary-position WHERE does not come through here —
-/// `linear` and `reduce` fold it earlier, because the scan bound reads that same
-/// folded predicate, and compile it themselves.
+/// Resolve `preds` against `layout`, compile their AND, and emit the filter —
+/// passing `node` through untouched when nothing is left to test. Shared by the
+/// emits that resolve and compile in one step: HAVING, the join and EXISTS
+/// residuals, and a set-op segment's WHERE. A primary-position WHERE does not
+/// come through here — `linear` and `reduce` resolve it earlier, because the scan
+/// bound reads the same conjuncts, and compile it themselves.
 pub(crate) fn emit_filter<'a>(
     cb: &mut gnitz_core::CircuitBuilder,
     node: gnitz_core::NodeId,
@@ -606,27 +605,22 @@ pub(crate) fn emit_filter<'a>(
     layout: &[ColId],
     cols: &[ColumnDef],
 ) -> Result<gnitz_core::NodeId, GnitzSqlError> {
-    match physical::fold_preds(preds, layout)? {
-        Some(folded) => match crate::expr_lower::compile_filter_program(&folded, cols)? {
-            Some(prog) => Ok(cb.filter(node, Some(prog))),
-            None => Ok(node),
-        },
+    let preds = physical::resolve_preds(preds, layout)?;
+    match crate::expr_lower::compile_filter_program(&preds, cols)? {
+        Some(prog) => Ok(cb.filter(node, Some(prog))),
         None => Ok(node),
     }
 }
 
 /// Scan-bound extraction — a primary-position lowering decision (source and the
-/// resolved WHERE both in hand). Only a catalog source with a folded WHERE bounds.
-/// Shared by every primary-position `Get` lowering (`lower_linear` here,
-/// `reduce::lower_reduce`'s inline-source arm).
-pub(crate) fn extract_scan_bound(folded: &Option<crate::ir::BoundExpr>, src: &SegInput) -> Option<ScanBound> {
-    let (Some(f), Some(desc)) = (folded, src.desc.as_ref()) else {
-        return None;
-    };
+/// resolved WHERE both in hand). Only a catalog source bounds. Shared by every
+/// primary-position `Get` lowering (`lower_linear` here, `reduce::lower_reduce`'s
+/// inline-source arm).
+pub(crate) fn extract_scan_bound(preds: &[crate::ir::BoundExpr], src: &SegInput) -> Option<ScanBound> {
     // The head candidate outright: this path compiles no residual — the `Filter`
     // is emitted verbatim either way — so there is nothing a later candidate
     // could express that the best-ranked one cannot.
-    ranked_index_bounds(f, &src.schema, &desc.indexes)
+    ranked_index_bounds(preds, &src.schema, &src.desc.as_ref()?.indexes)
         .into_iter()
         .next()
         .map(|c| ScanBound {

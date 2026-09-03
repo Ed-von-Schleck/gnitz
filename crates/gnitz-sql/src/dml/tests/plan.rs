@@ -4,12 +4,12 @@ use gnitz_core::TypeCode;
 
 /// The plan for `where_expr` against `lists` (the table's indexes).
 fn plan_of<'e>(
-    where_expr: Option<&'e BoundExpr>,
+    conjuncts: &'e [BoundExpr],
     schema: &Schema,
     lists: &[(&[u32], bool)],
     budget: ReadBudget,
 ) -> AccessPlan<'e> {
-    bound_and_predicate(schema, where_expr, budget, &idx_metas_flagged(lists)).expect("the WHERE must plan")
+    bound_and_predicate(schema, conjuncts, budget, &idx_metas_flagged(lists)).expect("the WHERE must plan")
 }
 
 /// The bound's discriminant name, for a shape assertion that does not care
@@ -53,8 +53,8 @@ fn the_ladder_maps_each_where_shape_to_its_bound() {
         (Some("id = 3.5"), "None", 1, 0),
         (Some("v = 5 OR id = 1"), "None", 1, 0),
     ] {
-        let bound_where = sql.map(|s| bind_where(s, &schema));
-        let plan = plan_of(bound_where.as_ref(), &schema, idx, ReadBudget::OneRequest);
+        let bound_where = sql.map(|s| bind_where(s, &schema)).unwrap_or_default();
+        let plan = plan_of(&bound_where, &schema, idx, ReadBudget::OneRequest);
         let label = sql.unwrap_or("<no WHERE>");
         assert_eq!(shape(&plan.access.bound), want_shape, "{label}");
         assert_eq!(plan.residual.len(), want_residual, "{label}: residual");
@@ -79,11 +79,11 @@ fn an_over_cap_pk_in_list_needs_a_chunking_budget() {
     let schema = pk_schema(TypeCode::U64);
     let n = gnitz_wire::MAX_PK_SET_KEYS + 1;
     // Built directly: the same list as SQL text is megabytes for the parser.
-    let where_expr = BoundExpr::InList {
+    let where_expr = [BoundExpr::InList {
         inner: Box::new(BoundExpr::ColRef(0)),
         items: (0..n as i64).map(BoundExpr::LitInt).collect(),
-    };
-    let declined = plan_of(Some(&where_expr), &schema, &[], ReadBudget::OneRequest);
+    }];
+    let declined = plan_of(&where_expr, &schema, &[], ReadBudget::OneRequest);
     assert_eq!(
         shape(&declined.access.bound),
         "None",
@@ -95,7 +95,7 @@ fn an_over_cap_pk_in_list_needs_a_chunking_budget() {
         "the list ships as a predicate instead"
     );
 
-    let gathered = plan_of(Some(&where_expr), &schema, &[], ReadBudget::MayChunk);
+    let gathered = plan_of(&where_expr, &schema, &[], ReadBudget::MayChunk);
     assert_eq!(shape(&gathered.access.bound), "PkSet");
     assert_eq!(gathered.buffered_scope(&schema).0.map_or(0, |k| k.len()), n);
 }
@@ -130,7 +130,7 @@ fn a_pk_bound_yields_only_to_a_unique_index_point() {
         ("id = 7 AND v = 42", uniq, "PkRange", "a PK point is never given up"),
     ] {
         let where_expr = bind_where(sql, &schema);
-        let plan = plan_of(Some(&where_expr), &schema, idx, ReadBudget::OneRequest);
+        let plan = plan_of(&where_expr, &schema, idx, ReadBudget::OneRequest);
         assert_eq!(shape(&plan.access.bound), want, "{sql}: {why}");
     }
 
@@ -153,7 +153,7 @@ fn a_pk_bound_yields_only_to_a_unique_index_point() {
         ("tenant = 7 AND email = 42", "a bare prefix lowers to a pinned point"),
     ] {
         let where_expr = bind_where(sql, &compound);
-        let plan = plan_of(Some(&where_expr), &compound, email_uniq, ReadBudget::OneRequest);
+        let plan = plan_of(&where_expr, &compound, email_uniq, ReadBudget::OneRequest);
         assert_eq!(shape(&plan.access.bound), "PkRange", "{sql}: {why}");
     }
 }
@@ -179,12 +179,12 @@ fn an_index_walk_is_exact_only_when_the_predicate_cannot_carry_its_conjunct() {
     let idx: &[(&[u32], bool)] = &[(&[1], false)];
     for (schema, sql, want_exact, want_residual) in [
         (&narrow, "v = 5", false, 1),
-        (&narrow, "v = 5 AND w = 9", false, 1),
+        (&narrow, "v = 5 AND w = 9", false, 2),
         (&narrow, "v = 18446744073709551615", true, 0),
         (&wide, "val = 7", true, 0),
     ] {
         let where_expr = bind_where(sql, schema);
-        let plan = plan_of(Some(&where_expr), schema, idx, ReadBudget::OneRequest);
+        let plan = plan_of(&where_expr, schema, idx, ReadBudget::OneRequest);
         let ReadBound::IndexRange { exact, .. } = plan.access.bound else {
             panic!("{sql}: expected an index bound, got {}", shape(&plan.access.bound));
         };
@@ -199,7 +199,7 @@ fn an_index_walk_is_exact_only_when_the_predicate_cannot_carry_its_conjunct() {
 fn an_unpinned_pk_range_yields_to_a_full_unique_point() {
     let schema = two_col(TypeCode::U64);
     let where_expr = bind_where("pk > 0 AND val = 42", &schema);
-    let plan = plan_of(Some(&where_expr), &schema, &[(&[1], true)], ReadBudget::OneRequest);
+    let plan = plan_of(&where_expr, &schema, &[(&[1], true)], ReadBudget::OneRequest);
     assert_eq!(shape(&plan.access.bound), "IndexRange");
     assert!(
         plan.buffered_scope(&schema).0.is_none(),
