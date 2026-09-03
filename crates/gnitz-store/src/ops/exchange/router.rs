@@ -9,10 +9,10 @@ use super::super::group_key::GroupKeyCols;
 use crate::schema::key::ReindexPacker;
 
 /// Keep only the rows this worker owns, by packed-PK hash — the trace-side
-/// counterpart of the **pure** range-join broadcast input relay. A pure range
-/// join (n_eq == 0) has no eq prefix to scatter by, so it broadcasts; every worker
-/// receives the full delta and, before it integrates into the trace, this drops
-/// the rows whose `worker_for_pk_bytes` owner is not
+/// counterpart of a broadcast join input relay. A pure range join (n_eq == 0)
+/// has no eq prefix to scatter by, and a cross join no key at all, so both
+/// broadcast; every worker receives the full delta and, before it integrates
+/// into the trace, this drops the rows whose `worker_for_pk_bytes` owner is not
 /// `worker_id`. (A band join scatters by the eq prefix instead — its trace is
 /// already eq-prefix-partitioned and carries no `WorkerFilter`.) It is the SAME
 /// hash the equality scatter (`RouteMode::JoinPromote`)

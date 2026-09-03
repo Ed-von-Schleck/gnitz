@@ -327,11 +327,16 @@ impl CircuitBuilder {
         self.binary_join(OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel }), delta, trace_node)
     }
 
+    /// Keyless (cross) join term: every delta row pairs with every trace row.
+    /// Neither side's key is compared, so the two sides need not agree on a key
+    /// type or width — each keys on whatever partitions its trace.
+    pub fn join_with_trace_cross_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
+        self.binary_join(OpNode::Join(JoinKind::DeltaTraceCross), delta, trace_node)
+    }
+
     /// Keep only rows this worker owns (by packed-PK partition) before they
-    /// integrate into a **pure** range-join trace under the broadcast input relay
-    /// (a band join's eq-prefix scatter omits this node — its trace is already
-    /// eq-prefix-partitioned). Worker identity is baked in at compile time, so the
-    /// node carries no payload; single-process compiles emit `(0, 1)` = keep-all.
+    /// integrate into the trace of a join whose input relay broadcasts. Worker
+    /// identity is baked in at compile time, so the node carries no payload.
     pub fn worker_filter(&mut self, input: NodeId) -> NodeId {
         self.alloc_unary(OpNode::WorkerFilter, input)
     }

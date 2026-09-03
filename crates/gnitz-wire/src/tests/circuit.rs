@@ -283,6 +283,7 @@ fn every_op_node_variant_roundtrips() {
     for &rel in RangeRel::ALL {
         nodes.push(OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 3, rel }));
     }
+    nodes.push(OpNode::Join(JoinKind::DeltaTraceCross));
     for node in nodes {
         assert_eq!(roundtrip(node.clone()).unwrap(), node, "round-trip failed for {node:?}");
     }

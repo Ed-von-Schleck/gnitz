@@ -99,9 +99,30 @@ fn join_key_rules() {
             ),
             (&over_cap, "Unsupported", "equijoin key columns"),
             (
-                "SELECT * FROM a JOIN b ON a.v <> b.w",
-                "Bind",
-                "at least one equijoin or range",
+                "SELECT * FROM a LEFT JOIN b ON a.v <> b.w",
+                "Unsupported",
+                "may be keyless",
+            ),
+            ("SELECT * FROM a RIGHT JOIN b ON 1 = 1", "Unsupported", "may be keyless"),
+            (
+                "SELECT c.v FROM c NATURAL LEFT JOIN ty",
+                "Unsupported",
+                "may be keyless",
+            ),
+            (
+                "SELECT a.id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.w <> a.v)",
+                "Unsupported",
+                "may be keyless",
+            ),
+            (
+                "SELECT a.id FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.w <> a.v)",
+                "Unsupported",
+                "may be keyless",
+            ),
+            (
+                "SELECT * FROM a FULL JOIN b ON a.v <> b.w",
+                "Unsupported",
+                "may be keyless",
             ),
             (
                 "SELECT * FROM ty JOIN w ON ty.s < w.s",
@@ -544,6 +565,7 @@ fn capacity_rules() {
         "SELECT t.id, u.v FROM t RIGHT JOIN u ON t.id = u.g",
         "SELECT t.id, u.v FROM t FULL JOIN u ON t.id = u.g",
         "SELECT t.id, u.v FROM t JOIN u ON t.id = u.g AND t.v < u.v",
+        "SELECT t.id, u.v FROM t CROSS JOIN u",
     ] {
         view(&cat, body);
         let sql = format!("CREATE VIEW v WITH (capacity = '1 MB') AS {body}");

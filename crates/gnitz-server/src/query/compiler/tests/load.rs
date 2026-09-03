@@ -266,12 +266,13 @@ fn port_set_violations_fail_at_load() {
     );
 }
 
-/// A range join is discriminated by its `Join(DeltaTraceRange)` node, never by
+/// The join relay is read off the `Join` node's kind, never off
 /// `has_join_shard && has_exchange`: that predicate is also true of every GROUP
 /// BY view (a group reindex plus an output shard), so keying on it would divert
-/// those views into the relay path and corrupt them.
+/// those views into the broadcast relay and corrupt them. A circuit without a
+/// join routes by the whole key, and each join kind names its own relay.
 #[test]
-fn a_group_by_view_is_not_classified_as_a_range_join() {
+fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key() {
     let loaded = loaded_for_test(
         HashMap::from([
             (0, scan_delta(7)),
@@ -290,7 +291,32 @@ fn a_group_by_view_is_not_classified_as_a_range_join() {
         ]),
         vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN), (3, 4, PORT_IN)],
     );
-    assert_eq!(load::circuit_range_join_n_eq(&loaded), None);
+    assert_eq!(load::circuit_join_relay(&loaded), load::JoinRelay::WholeKey);
+
+    let joined = |kind: gnitz_wire::JoinKind| {
+        loaded_for_test(
+            HashMap::from([
+                (0, scan_delta(7)),
+                (1, scan_delta(9)),
+                (2, OpNode::IntegrateTrace),
+                (3, OpNode::Join(kind)),
+                (4, OpNode::IntegrateSink),
+            ]),
+            vec![(0, 3, PORT_IN_A), (1, 2, PORT_IN), (2, 3, PORT_TRACE), (3, 4, PORT_IN)],
+        )
+    };
+    let range = |n_eq| gnitz_wire::JoinKind::DeltaTraceRange {
+        n_eq,
+        rel: gnitz_wire::RangeRel::Lt,
+    };
+    for (kind, want) in [
+        (gnitz_wire::JoinKind::DeltaTrace, load::JoinRelay::WholeKey),
+        (range(2), load::JoinRelay::EqPrefix { n_eq: 2 }),
+        (range(0), load::JoinRelay::Broadcast),
+        (gnitz_wire::JoinKind::DeltaTraceCross, load::JoinRelay::Broadcast),
+    ] {
+        assert_eq!(load::circuit_join_relay(&joined(kind)), want, "{kind:?}");
+    }
 }
 
 // ── scatter_key_of_scan: the forward (scan → reindex Map) walk ──────────

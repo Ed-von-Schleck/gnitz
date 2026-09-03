@@ -1,16 +1,16 @@
-//! Equi-, range/band-, semi/anti-, and mark-join emission. The `lower_*_view`
-//! shells source the keep-set, residual filter, and output projection from the
-//! HIR (`JoinClass`, `ColId`s, `ProjEntry`); the AST-free circuit primitives they
-//! drive — reindex each side onto the join key, run the symmetric 2-term DBSP
-//! join against the other side's trace, normalize onto `[A cols, B cols]`, and
-//! attach the outer null-fill — live in the second half of this module, shared
-//! with `exists.rs`. Also hosts the `JoinType`-driven emit geometry and the
-//! key-arity / outer-residual / pure-range guards.
+//! Equi-, range/band-, cross-, semi/anti-, and mark-join emission.
+//!
+//! The `lower_*_view` shells read the keep-set, residual and output projection off
+//! the HIR. The AST-free circuit primitives they drive live in the second half of
+//! this module, shared with `exists.rs`.
 
 use super::super::guards::{converse_rel, reject_pair_pk_overflow, reject_pure_range_outer};
-use super::super::{slot_of, widen_if, ColId, EqPair, HirExpr, HirRange, JoinClass, JoinType, ProjEntry, RelExpr};
+use super::super::{
+    slot_of, widen_if, ColId, EqPair, HirExpr, HirRange, JoinClass, JoinShape, JoinType, ProjEntry, RelExpr,
+};
 use super::prims::{
-    keep_all, multi_null_filter_prog, null_gate, pure_range_m_output_cols, rekey_on_source_pk, schema_type_codes,
+    keep_all, multi_null_filter_prog, null_gate, pure_range_m_output_cols, rekey_aux_on_source_pk,
+    rekey_scatter_on_source_pk, schema_type_codes,
 };
 use super::{
     apply_projection, collect_live_cols, key_region_layout, resolve_collisions, resolve_input, resolve_projection,
@@ -56,7 +56,7 @@ pub(crate) fn lower_join_view(
     let pieces = emit_step(chain, memo, down, join)?;
     // The emitted pk-list is the synthetic key region; its width is the number of
     // identity-free slots the layout leads with.
-    let layout = key_region_layout(pieces.2, project_items);
+    let layout = key_region_layout(pieces.2, project_items.iter().map(|i| i.out.id));
     Ok((pieces, layout))
 }
 
@@ -96,10 +96,10 @@ fn emit_step(
     resolve_collisions(chain, &mut inputs, &[left, right], false)?;
     let [left_in, right_in] = inputs;
 
-    if class.range.is_some() {
-        emit_range(down, class, *kind, &left_in, &right_in)
-    } else {
-        emit_equi(down, class, *kind, &left_in, &right_in)
+    match class.shape() {
+        JoinShape::Range => emit_range(down, class, *kind, &left_in, &right_in),
+        JoinShape::Cross => emit_cross(down, class, *kind, &left_in, &right_in),
+        JoinShape::Equi => emit_equi(down, class, *kind, &left_in, &right_in),
     }
 }
 
@@ -203,12 +203,15 @@ fn emit_equi(
     let mut out_cols: Vec<ColumnDef> = join_pk_coldefs(&target_tcs);
     out_cols.extend(combined_payload_coldefs(&pruned_left, &pruned_right, kind));
 
-    // The merged-layout ColId vector: k identity-free key slots then the kept
-    // payload ids — resolve_refs against it yields `k + pruned_index` for both the
-    // residual filter and the output projection.
-    let mut merged_layout = vec![ColId::NONE; k];
-    merged_layout.extend(keep_l.iter().map(|&i| left_in.layout[i as usize]));
-    merged_layout.extend(keep_r.iter().map(|&i| right_in.layout[i as usize]));
+    // [`ab_layout`] over the KEPT columns: the pruned payload's ids, so a
+    // `resolve_refs` against it yields `k + pruned_index`.
+    let merged_layout = key_region_layout(
+        k,
+        keep_l
+            .iter()
+            .map(|&i| left_in.layout[i as usize])
+            .chain(keep_r.iter().map(|&i| right_in.layout[i as usize])),
+    );
 
     // One residual/WHERE filter over the normalized output (at most one source is
     // non-empty — the rewrite folds the WHERE into the INNER residual and leaves an
@@ -251,7 +254,7 @@ fn emit_range(
     let pb = right_schema.pk_cols.len();
     let pair_pk = pa + pb;
 
-    reject_pair_pk_overflow(pa, pb)?;
+    reject_pair_pk_overflow("range JOIN", pa, pb)?;
     crate::validate::reject_column_overflow("range JOIN view intermediate", pair_pk + k + left_n + right_n)?;
 
     if n_eq == 0 {
@@ -287,25 +290,14 @@ fn emit_range(
     // The `[key region, A, B]` layout at any key width — the residual, the output
     // projection, and the outer WHERE each read the same payload behind a different
     // leading key region (`_join_pk × k`, `_pair_pk + _join_pk`, `_pair_pk`).
-    let side_layout = |npk: usize| -> Vec<ColId> {
-        let mut l = vec![ColId::NONE; npk];
-        l.extend(left_in.layout.iter().copied());
-        l.extend(right_in.layout.iter().copied());
-        l
-    };
+    let side_layout = |npk: usize| ab_layout(npk, left_in, right_in);
 
     // Residual filter over the pre-rekey `[_join_pk × k, A, B]` layout at base k.
     let union_schema = band_union_schema(&all_tcs, left_schema, right_schema);
     let merged = super::emit_filter(&mut cb, merged, &class.residual, &side_layout(k), &union_schema.columns)?;
 
     // Re-key onto the source-PK pair `_pair_pk`.
-    let mut pair_pk_cols: Vec<usize> = Vec::with_capacity(pair_pk);
-    for &a_pk in &left_schema.pk_cols {
-        pair_pk_cols.push(k + a_pk);
-    }
-    for &b_pk in &right_schema.pk_cols {
-        pair_pk_cols.push(k + left_n + b_pk);
-    }
+    let pair_pk_cols = pair_pk_slots(left_schema, right_schema, k, k + left_n);
     let rekey = cb.map_reindex(
         merged,
         &pair_pk_cols,
@@ -315,7 +307,6 @@ fn emit_range(
     );
 
     let payload_offset = pair_pk + k;
-    let pair_pk_coldefs: Vec<ColumnDef> = pair_pk_coldefs(left_schema, right_schema);
 
     // Output projection: INNER reads off `rekey` (payload at `payload_offset`, and
     // always maps to drop the per-term `_join_pk` slots); OUTER reads off the
@@ -325,8 +316,11 @@ fn emit_range(
     } else {
         pair_pk
     };
-    let (final_projection, final_cols) =
-        resolve_projection(down.items, &side_layout(user_offset), pair_pk_coldefs.clone())?;
+    let (final_projection, final_cols) = resolve_projection(
+        down.items,
+        &side_layout(user_offset),
+        pair_pk_coldefs(left_schema, right_schema),
+    )?;
 
     let sink_input = if kind == JoinType::Inner {
         cb.map(rekey, &final_projection)
@@ -369,16 +363,8 @@ fn emit_range(
                 if !kind.preserves(preserved_is_left) {
                     continue;
                 }
-                let pi = band_pi_preserved(
-                    &mut cb,
-                    merged,
-                    union_schema.columns.len(),
-                    pk_slots,
-                    k,
-                    payload_off,
-                    payload_n,
-                );
-                let all = rekey_on_source_pk(&mut cb, raw, schema);
+                let pi = band_pi_preserved(&mut cb, merged, pk_slots, k, payload_off, payload_n);
+                let all = rekey_aux_on_source_pk(&mut cb, raw, schema);
                 let nu = cb.positive_diff(all, pi);
                 let branch = emit_range_null_fill_tail(&mut cb, left_schema, right_schema, nu, preserved_is_left);
                 acc = cb.union(branch, acc);
@@ -387,14 +373,12 @@ fn emit_range(
         };
 
         // One linear 3VL WHERE over the full-width `[pair-PK, A, B]` (base pair_pk).
-        let combined_payload = combined_payload_coldefs(&left_schema.columns, &right_schema.columns, kind);
-        let combined_cols: Vec<ColumnDef> = pair_pk_coldefs.iter().cloned().chain(combined_payload).collect();
         let filtered = super::emit_filter(
             &mut cb,
             unioned,
             down.where_preds,
             &side_layout(pair_pk),
-            &combined_cols,
+            &pair_pk_output_coldefs(left_schema, right_schema, kind),
         )?;
 
         apply_projection(&mut cb, filtered, &final_projection, left_n + right_n, pair_pk)
@@ -405,6 +389,85 @@ fn emit_range(
     cb.sink(sharded);
     let circuit = cb.build();
     Ok((circuit, final_cols, pair_pk))
+}
+
+// ── Cross emission ──────────────────────────────────────────────────────────────
+
+/// The keyless join `A × B`, INNER only. Each side keys its trace on its own
+/// source PK, which takes no part in the match — it only partitions the trace the
+/// broadcast delta is paired against.
+fn emit_cross(
+    down: Demand<'_>,
+    class: &JoinClass,
+    kind: JoinType,
+    left_in: &SegInput,
+    right_in: &SegInput,
+) -> Result<EmitPieces, GnitzSqlError> {
+    debug_assert_eq!(
+        kind,
+        JoinType::Inner,
+        "reject_join_key_arity admits only an INNER keyless step"
+    );
+    let left_schema = &left_in.schema;
+    let right_schema = &right_in.schema;
+    let left_n = left_schema.columns.len();
+    let right_n = right_schema.columns.len();
+    let pa = left_schema.pk_cols.len();
+    let pb = right_schema.pk_cols.len();
+    let pair_pk = pa + pb;
+
+    reject_pair_pk_overflow("CROSS JOIN", pa, pb)?;
+    crate::validate::reject_column_overflow("CROSS JOIN view intermediate", pair_pk + left_n + right_n)?;
+
+    let mut cb = CircuitBuilder::new(0);
+    let input_a_raw = cb.input_delta_tagged(left_in.tid);
+    let input_b_raw = cb.input_delta_tagged(right_in.tid);
+
+    let reindex_a = rekey_scatter_on_source_pk(&mut cb, input_a_raw, left_schema);
+    let reindex_b = rekey_scatter_on_source_pk(&mut cb, input_b_raw, right_schema);
+    let int_a = cb.worker_filter(reindex_a);
+    let int_b = cb.worker_filter(reindex_b);
+    let trace_a = cb.integrate_trace(int_a);
+    let trace_b = cb.integrate_trace(int_b);
+    let join_ab = cb.join_with_trace_cross_node(reindex_a, trace_b); // [a.pk × pa, A, B]
+    let join_ba = cb.join_with_trace_cross_node(reindex_b, trace_a); // [b.pk × pb, B, A]
+
+    // Re-key both terms onto the pair-PK: their key regions are two different
+    // source keys, and a union needs one schema. `keep` is the reindex's OUTPUT
+    // payload order, so BA's `[B, A]` → `[A, B]` rides the same node.
+    let ab = cb.map_reindex(
+        join_ab,
+        &pair_pk_slots(left_schema, right_schema, pa, pa + left_n),
+        &[],
+        &(pa as u32..(pa + left_n + right_n) as u32).collect::<Vec<_>>(),
+        ReindexRole::Auxiliary,
+    );
+    let ba_keep: Vec<u32> = ba_to_ab_cols(pb, left_n, right_n).map(|c| c as u32).collect();
+    let ba = cb.map_reindex(
+        join_ba,
+        &pair_pk_slots(left_schema, right_schema, pb + right_n, pb),
+        &[],
+        &ba_keep,
+        ReindexRole::Auxiliary,
+    );
+    let merged = cb.union(ab, ba); // [pair-PK, A, B]
+
+    let layout = ab_layout(pair_pk, left_in, right_in);
+    let filtered = super::emit_filter(
+        &mut cb,
+        merged,
+        class.residual.iter().chain(down.where_preds),
+        &layout,
+        &pair_pk_output_coldefs(left_schema, right_schema, kind),
+    )?;
+    let (final_projection, final_cols) =
+        resolve_projection(down.items, &layout, pair_pk_coldefs(left_schema, right_schema))?;
+    let sink_input = apply_projection(&mut cb, filtered, &final_projection, left_n + right_n, pair_pk);
+
+    let pair_pk_idxs: Vec<usize> = (0..pair_pk).collect();
+    let sharded = cb.shard(sink_input, &pair_pk_idxs);
+    cb.sink(sharded);
+    Ok((cb.build(), final_cols, pair_pk))
 }
 
 // ── keep-set + shared helpers ───────────────────────────────────────────────────
@@ -530,21 +593,20 @@ pub(crate) fn normalize_to_ab(
     left_n: usize,
     right_n: usize,
 ) -> gnitz_core::NodeId {
-    // Path AB projection: identity (already canonical: [PK cols, A_cols, B_cols])
+    // Term AB is already canonical behind its key region; term BA is swapped.
     let proj_ab: Vec<usize> = (k..k + left_n + right_n).collect();
-    let proj_ab_node = cb.map(join_ab, &proj_ab);
+    let proj_ba: Vec<usize> = ba_to_ab_cols(k, left_n, right_n).collect();
+    let ab = cb.map(join_ab, &proj_ab);
+    let ba = cb.map(join_ba, &proj_ba);
+    cb.union(ab, ba)
+}
 
-    // Path BA projection: reorder [A_cols, B_cols]
-    let mut proj_ba: Vec<usize> = Vec::new();
-    for i in 0..left_n {
-        proj_ba.push(k + right_n + i);
-    }
-    for i in 0..right_n {
-        proj_ba.push(k + i);
-    }
-    let proj_ba_node = cb.map(join_ba, &proj_ba);
-
-    cb.union(proj_ab_node, proj_ba_node)
+/// Term BA's columns in canonical `[A, B]` order, behind a `k`-wide key region.
+/// A join emits `[left_PK, left_payload…, right_payload…]`, so the BA term names
+/// B as its left — one home for the swap, whether a caller spends it as a `map`
+/// projection or as a reindex keep list.
+fn ba_to_ab_cols(k: usize, left_n: usize, right_n: usize) -> impl Iterator<Item = usize> {
+    (k + right_n..k + right_n + left_n).chain(k..k + right_n)
 }
 
 /// One side of the symmetric equi-join term emission: its (unfiltered) input
@@ -645,6 +707,37 @@ fn pair_pk_coldefs(left_schema: &Schema, right_schema: &Schema) -> Vec<ColumnDef
         .collect()
 }
 
+/// The pair-PK slot list `[a.pk…, b.pk…]` over a layout carrying A's columns
+/// from `a_base` and B's from `b_base`: each source PK column at its offset
+/// inside its own side. One home for every re-key onto the pair-PK, so the
+/// inner terms and the null-fill branches key byte-identically and cancel.
+fn pair_pk_slots(left: &Schema, right: &Schema, a_base: usize, b_base: usize) -> Vec<usize> {
+    let mut slots = pk_slots(left, a_base);
+    slots.extend(pk_slots(right, b_base));
+    slots
+}
+
+/// One schema's PK columns at their offsets inside a wider layout that carries
+/// that schema's columns from `base`.
+pub(super) fn pk_slots(schema: &Schema, base: usize) -> Vec<usize> {
+    schema.pk_cols.iter().map(|&c| base + c).collect()
+}
+
+/// The `[key region × npk, A, B]` `ColId` layout — what a residual, WHERE or
+/// output projection resolves against behind any leading key region.
+fn ab_layout(npk: usize, left_in: &SegInput, right_in: &SegInput) -> Vec<ColId> {
+    key_region_layout(npk, left_in.layout.iter().chain(&right_in.layout).copied())
+}
+
+/// The `[pair-PK, A, B]` column list an outer WHERE or a residual resolves
+/// against, with the outer nullability applied to the payload.
+fn pair_pk_output_coldefs(left: &Schema, right: &Schema, kind: JoinType) -> Vec<ColumnDef> {
+    pair_pk_coldefs(left, right)
+        .into_iter()
+        .chain(combined_payload_coldefs(&left.columns, &right.columns, kind))
+        .collect()
+}
+
 /// The shared null-fill tail of a range/band outer join: null-extend `ν_P` with
 /// the O-side NULL columns, re-key onto the pair-PK `[a.pk…, b.pk…]` (the other
 /// side's PK rides in the NULL-O payload, packing to the synthetic 0), and
@@ -674,26 +767,17 @@ fn emit_range_null_fill_tail(
     });
     let nullfill = cb.null_extend(nf_keyed, &o_col_tcs); // [P.pk × p_pk, P, NULL-O]
 
-    // Pair-PK [a.pk…, b.pk…]: preserved side's pk from the PK region (0..p_pk),
-    // other side's pk from the NULL-O payload (p_pk + p_n + pk → synthetic 0).
-    let mut nf_pair_pk_cols: Vec<usize> = Vec::with_capacity(pair_pk);
-    if preserved_is_left {
-        nf_pair_pk_cols.extend(0..pa);
-        for &b_pk in &right_schema.pk_cols {
-            nf_pair_pk_cols.push(p_pk + p_n + b_pk);
-        }
+    // Pair-PK [a.pk…, b.pk…], both read out of the payload: the preserved side's
+    // pk from its own columns behind the key region, the other side's from the
+    // NULL-O payload (→ synthetic 0).
+    let nf_pair_pk_cols = if preserved_is_left {
+        pair_pk_slots(left_schema, right_schema, p_pk, p_pk + p_n)
     } else {
-        for &a_pk in &left_schema.pk_cols {
-            nf_pair_pk_cols.push(p_pk + p_n + a_pk);
-        }
-        nf_pair_pk_cols.extend(0..pb);
-    }
+        pair_pk_slots(left_schema, right_schema, p_pk + p_n, p_pk)
+    };
 
-    // Keep the [P, NULL-O] payload and DROP the leading P.pk × p_pk columns —
-    // they are the null-fill's own key source, already consumed by
-    // `nf_pair_pk_cols` above, and nothing downstream reads them. The payload is
-    // P's columns followed by O's, in input order — no reorder, since
-    // map_reindex locks the output payload to input order.
+    // Keep the [P, NULL-O] payload and DROP the leading P.pk × p_pk key region —
+    // its columns are also inside P, and nothing downstream reads the region.
     let keep: Vec<u32> = (p_pk as u32..(p_pk + p_n + o_col_tcs.len()) as u32).collect();
     let nf_rekey = cb.map_reindex(nullfill, &nf_pair_pk_cols, &[], &keep, ReindexRole::Auxiliary);
 
@@ -802,22 +886,20 @@ fn emit_equi_null_fill(cb: &mut CircuitBuilder, nf: EquiNullFill<'_>) -> gnitz_c
 /// semi-join build their π here.
 ///
 /// `pk_slots` are the preserved side's PK positions in the pre-rekey
-/// `[_join_pk × k, A, B]` layout; the re-key prepends them, making the layout
-/// `[P.pk × p, _join_pk × k, A, B]`, so the side's payload starts at
-/// `p + k + payload_off` (`0` for the left side, `left_n` for the right).
+/// `[_join_pk × k, A, B]` layout, where the side's payload starts at
+/// `k + payload_off` (`0` for the left side, `left_n` for the right). The re-key
+/// keeps only that payload, so its output is `[P.pk × p, P]` in one node.
 pub(crate) fn band_pi_preserved(
     cb: &mut CircuitBuilder,
     merged: NodeId,
-    union_n: usize,
     pk_slots: &[usize],
     k: usize,
     payload_off: usize,
     payload_n: usize,
 ) -> NodeId {
-    let p = pk_slots.len();
-    let rekey = cb.map_reindex(merged, pk_slots, &[], &keep_all(union_n), ReindexRole::Auxiliary);
-    let base = p + k + payload_off;
-    cb.map(rekey, &(base..base + payload_n).collect::<Vec<_>>())
+    let base = (k + payload_off) as u32;
+    let keep: Vec<u32> = (base..base + payload_n as u32).collect();
+    cb.map_reindex(merged, pk_slots, &[], &keep, ReindexRole::Auxiliary)
 }
 
 /// The pure-range unmatched set `A − matched`, union the NULL-range-key rows a
@@ -982,9 +1064,9 @@ pub(crate) struct PureRangeThreshold {
 /// only the trace swapped to `trace_m`/`reindex_m`. The `a`-side term taps the
 /// filtered `int_a` against the replicated `trace_m`; the `m`-side term taps
 /// the replicated `reindex_m` against the filtered `trace_a`, so neither
-/// duplicates under broadcast. All range nodes carry n_eq == 0 — load-bearing
-/// for the view-level `circuit_range_join_n_eq` discriminator, which reads an
-/// ARBITRARY `DeltaTraceRange.n_eq` and is correct only because they all agree.
+/// duplicates under broadcast. All range nodes carry n_eq == 0, which is what
+/// makes `circuit_join_relay` correct: it reads an ARBITRARY join node's kind,
+/// so the relay it derives is the intended one only because they all agree.
 ///
 /// Both `matched_raw` and the `int_a` passthrough are `[Tc PK, A]` (a.pk lives
 /// INSIDE A, not in the PK). Re-keying BOTH onto `[a.pk…, A]` with one shared
@@ -1045,7 +1127,7 @@ pub(crate) fn build_pure_range_threshold(
         columns: std::iter::once(jp).chain(left_schema.columns.iter().cloned()).collect(),
         pk_cols: vec![0],
     };
-    let a_pk_in_raw: Vec<usize> = left_schema.pk_cols.iter().map(|&p| 1 + p).collect();
+    let a_pk_in_raw = pk_slots(left_schema, 1);
     let a_cols: Vec<usize> = (pa + 1..pa + 1 + left_n).collect();
     // One shared kept-column list drives both re-keys, so the IDENTICAL encoding
     // is structural — `matched` and `a_pass` differ only in their input node.
@@ -1086,7 +1168,7 @@ pub(crate) fn join_pk_coldefs(target_tcs: &[TypeCode]) -> Vec<ColumnDef> {
 /// (`k = all_tcs.len()` synthetic slots as the PK region, both sides' columns
 /// verbatim behind them) — the schema the band builders compile their re-key
 /// reindex programs and residual filters against.
-pub(crate) fn band_union_schema(all_tcs: &[TypeCode], left: &Schema, right: &Schema) -> Schema {
+fn band_union_schema(all_tcs: &[TypeCode], left: &Schema, right: &Schema) -> Schema {
     let k = all_tcs.len();
     let mut cols: Vec<ColumnDef> = Vec::with_capacity(k + left.columns.len() + right.columns.len());
     for (i, &t) in all_tcs.iter().enumerate() {
@@ -1117,7 +1199,7 @@ fn union_null_key_rows(
     schema: &Schema,
 ) -> Result<gnitz_core::NodeId, GnitzSqlError> {
     let anull = cb.filter(source, Some(multi_null_filter_prog(cols, &schema.columns, true)?));
-    let anull_keyed = rekey_on_source_pk(cb, anull, schema);
+    let anull_keyed = rekey_aux_on_source_pk(cb, anull, schema);
     let anull_owned = cb.worker_filter(anull_keyed);
     Ok(cb.union(nf_match, anull_owned))
 }

@@ -959,15 +959,9 @@ fn fold_join_step(
             merge_pairs(scope, &rcols, &names, "USING")?
         }
         JoinKeys::Natural => {
-            let names = scope.shared_names(&rcols);
-            if names.is_empty() {
-                return Err(GnitzSqlError::Unsupported(
-                    "NATURAL JOIN over two relations that share no column name is a keyless \
-                     product, which is not supported; name the predicate with `ON …`"
-                        .to_string(),
-                ));
-            }
-            merge_pairs(scope, &rcols, &names, "NATURAL")?
+            // SQL's rule: no shared name makes the step keyless, i.e. a CROSS
+            // JOIN. The keyless guard decides it like any other keyless step.
+            merge_pairs(scope, &rcols, &scope.shared_names(&rcols), "NATURAL")?
         }
         JoinKeys::On(_) | JoinKeys::None => Vec::new(),
     };

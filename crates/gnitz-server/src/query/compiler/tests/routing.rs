@@ -291,7 +291,7 @@ fn join_cols(route: &RelayRoute) -> Option<Vec<u32>> {
 /// its matches spread over the whole key space, so a scatter would leave each
 /// worker probing a slice it does not own and drop rows silently.
 ///
-/// `range_join_n_eq` governs a JOIN relay ONLY: neither the output relay
+/// The join relay governs a JOIN relay ONLY: neither the output relay
 /// (`source_id == 0`) nor a source whose scans reach no reindex key (9) is
 /// one, and reading either as one broadcasts what must scatter.
 #[test]
@@ -301,6 +301,24 @@ fn only_the_keyed_source_of_a_pure_range_join_broadcasts() {
         matches!(meta.relay_route(7), RelayRoute::Broadcast),
         "the keyed input relay of a pure-range join must broadcast"
     );
+    non_join_relays_route_by_shard_cols(&meta);
+}
+
+/// A cross join has no key at all, so its keyed source broadcasts exactly as a
+/// pure-range join's does.
+#[test]
+fn a_cross_join_broadcasts_like_a_pure_range_join() {
+    let meta = join_meta(JoinKind::DeltaTraceCross, &[1]);
+    assert!(
+        matches!(meta.relay_route(7), RelayRoute::Broadcast),
+        "the keyed input relay of a cross join must broadcast"
+    );
+    non_join_relays_route_by_shard_cols(&meta);
+}
+
+/// Shared tail of the two broadcast tests: the relays that are NOT the join's
+/// keyed input route by the view's shard cols, exactly as under an equi join.
+fn non_join_relays_route_by_shard_cols(meta: &ViewMeta) {
     assert_eq!(
         group_key_cols(meta.relay_route(0)).as_deref(),
         Some(&[1u32][..]),
@@ -316,8 +334,8 @@ fn only_the_keyed_source_of_a_pure_range_join_broadcasts() {
 /// A band join (`n_eq >= 1`) scatters by the equality prefix, dropping the
 /// trailing range slot: equal eq-values then co-partition both sides and the
 /// range probe stays partition-local. The trace-side key is `[eq…, range]`,
-/// so the relay's columns are one shorter than it — where an equi-join, which
-/// carries no `range_join_n_eq`, routes by the whole key.
+/// so the relay's columns are one shorter than it — where an equi-join, whose
+/// relay is `WholeKey`, routes by the whole key.
 #[test]
 fn a_band_join_routes_by_the_equality_prefix_and_an_equi_join_by_the_whole_key() {
     let band = join_meta(pure_range(1), &[3, 4]);
@@ -331,17 +349,22 @@ fn a_band_join_routes_by_the_equality_prefix_and_an_equi_join_by_the_whole_key()
     assert_eq!(join_cols(equi.relay_route(7)), Some(vec![3, 4]));
 }
 
-/// A range join relays its keyed source even where that source's distribution IS
-/// the join key: its matches spread over the whole key space, so co-partitioning
-/// places none of them. The equi-join over the same fixture is the control.
+/// A broadcast join relays its keyed source even where that source's distribution
+/// IS the key it reindexes on: its matches spread over the whole other side, so
+/// co-partitioning places none of them. The equi-join over the same fixture is
+/// the control.
 #[test]
-fn a_range_join_relays_a_co_partitioned_source_that_an_equi_join_would_skip() {
+fn a_broadcast_join_relays_a_co_partitioned_source_that_an_equi_join_would_skip() {
     let keyed_by_pk = |kind| {
         let ext: ExtTables = HashMap::from([(7i64, make_schema_u64_i64())]);
         join_meta_in(kind, &[0], ext).scatters(7)
     };
     assert!(!keyed_by_pk(JoinKind::DeltaTrace), "the equi join skips the relay");
     assert!(keyed_by_pk(pure_range(0)), "the range join must relay anyway");
+    assert!(
+        keyed_by_pk(JoinKind::DeltaTraceCross),
+        "the cross join must relay anyway"
+    );
 }
 
 /// A circuit that could not be read routes everything by `∅` — every row to

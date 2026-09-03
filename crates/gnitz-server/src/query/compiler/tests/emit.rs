@@ -499,34 +499,16 @@ fn a_hash_row_map_promotes_within_the_copy_kernel_domain_or_is_rejected() {
 /// rejected rather than reach the operator.
 #[test]
 fn range_join_probe_preconditions_are_rejected_at_compile_time() {
-    use gnitz_wire::{JoinKind, OpNode, RangeRel};
-    let plan = |delta_schema: SchemaDescriptor, trace_schema: SchemaDescriptor, n_eq: u8| {
-        let dir = tempfile::tempdir().unwrap();
-        let loaded = loaded_for_test(
-            HashMap::from([
-                (0, scan_delta(10)),
-                (1, scan_delta(11)),
-                (2, OpNode::IntegrateTrace),
-                (
-                    3,
-                    OpNode::Join(JoinKind::DeltaTraceRange {
-                        n_eq,
-                        rel: RangeRel::Lt,
-                    }),
-                ),
-                (4, OpNode::IntegrateSink),
-            ]),
-            vec![(0, 3, PORT_IN_A), (1, 2, PORT_IN), (2, 3, PORT_TRACE), (3, 4, PORT_IN)],
-        );
-        build_plan(
-            &loaded,
-            &loaded.subgraph_ordered(3),
-            &HashMap::from([(10i64, delta_schema), (11, trace_schema)]),
-            test_site(dir.path().to_str().unwrap(), 1),
-            gnitz_store::schema::Placement::KEYED_DEFAULT,
-            PlanTarget::Subgraph { out: 3 },
+    use gnitz_wire::{JoinKind, RangeRel};
+    let plan = |delta_schema, trace_schema, n_eq| {
+        plan_two_source_join(
+            JoinKind::DeltaTraceRange {
+                n_eq,
+                rel: RangeRel::Lt,
+            },
+            delta_schema,
+            trace_schema,
         )
-        .map(drop)
     };
     // The shape the reindex packer produces: `[eq slot, range slot]` PK, then payload.
     let band = |eq_tc: u8| pk_payload_schema(&[eq_tc, type_code::U64]);
@@ -557,6 +539,49 @@ fn range_join_probe_preconditions_are_rejected_at_compile_time() {
         rejection(plan(pk_last, pk_last, 1)),
         "range join: eq prefix covers the whole key"
     );
+}
+
+/// The cross probe compares no key, so the two sides' PK regions need not agree
+/// on a stride — the pair the range probe rejects above compiles as a cross
+/// join.
+#[test]
+fn a_cross_join_accepts_sides_of_different_pk_strides() {
+    let narrow = pk_payload_schema(&[type_code::U32]);
+    let wide = pk_payload_schema(&[type_code::U64, type_code::U64]);
+    let plan = plan_two_source_join(gnitz_wire::JoinKind::DeltaTraceCross, narrow, wide);
+    assert!(plan.is_ok(), "{:?}", plan.err());
+}
+
+/// Compile the minimal two-source join circuit — a delta on `PORT_IN_A`, the
+/// integral of a second scan on `PORT_TRACE` — at the given kind and side
+/// schemas. The probe preconditions are all this shape exercises, so the join
+/// kind and the two schemas are the only things a caller varies.
+fn plan_two_source_join(
+    kind: gnitz_wire::JoinKind,
+    delta_schema: SchemaDescriptor,
+    trace_schema: SchemaDescriptor,
+) -> Result<(), CompileError> {
+    use gnitz_wire::OpNode;
+    let dir = tempfile::tempdir().unwrap();
+    let loaded = loaded_for_test(
+        HashMap::from([
+            (0, scan_delta(10)),
+            (1, scan_delta(11)),
+            (2, OpNode::IntegrateTrace),
+            (3, OpNode::Join(kind)),
+            (4, OpNode::IntegrateSink),
+        ]),
+        vec![(0, 3, PORT_IN_A), (1, 2, PORT_IN), (2, 3, PORT_TRACE), (3, 4, PORT_IN)],
+    );
+    build_plan(
+        &loaded,
+        &loaded.subgraph_ordered(3),
+        &HashMap::from([(10i64, delta_schema), (11, trace_schema)]),
+        test_site(dir.path().to_str().unwrap(), 1),
+        gnitz_store::schema::Placement::KEYED_DEFAULT,
+        PlanTarget::Subgraph { out: 3 },
+    )
+    .map(drop)
 }
 
 /// A trace port fed by a node that is not an integral is rejected at compile

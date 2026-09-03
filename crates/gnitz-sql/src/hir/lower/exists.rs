@@ -8,11 +8,10 @@
 
 use super::super::{ColId, EqPair, HirExpr, HirRange, HirRef, JoinClass, ProjEntry, RelExpr};
 use super::join::{
-    band_pi_preserved, band_union_schema, build_pure_range_threshold, emit_equi_join_terms, join_pk_coldefs,
-    normalize_to_ab, pure_range_unmatched, range_prologue, resolve_eq_cols, side_target_tcs, EquiKeys, EquiSide,
-    RangePrologue,
+    band_pi_preserved, build_pure_range_threshold, emit_equi_join_terms, join_pk_coldefs, normalize_to_ab, pk_slots,
+    pure_range_unmatched, range_prologue, resolve_eq_cols, side_target_tcs, EquiKeys, EquiSide, RangePrologue,
 };
-use super::prims::{keep_all, rekey_on_source_pk};
+use super::prims::{keep_all, rekey_aux_on_source_pk};
 use super::{
     apply_projection, collect_live_cols, emit_filter, key_region_layout, resolve_collisions, resolve_input,
     resolve_projection, seginput_of_get, split_filter, CutMemo, SegInput,
@@ -275,9 +274,9 @@ impl ExistsCore<'_> {
             reindex_b,
             left_key_nullable,
             left_reindex_cols,
-            all_tcs,
             rel_ab,
             rel_ba,
+            ..
         } = range_prologue(cb, left_in, right_in, a_local, b_local, eq, range)?;
 
         let (primary, unmatched): (NodeId, Option<NodeId>) = if n_eq == 0 {
@@ -325,10 +324,8 @@ impl ExistsCore<'_> {
             let merged = normalize_to_ab(cb, join_ab, join_ba, k, a_n, right_in.schema.columns.len());
 
             // π_A(inner) keyed by the outer source PK.
-            let union_schema = band_union_schema(&all_tcs, &left_in.schema, &right_in.schema);
-            let a_pk_in_union: Vec<usize> = left_in.schema.pk_cols.iter().map(|&p| k + p).collect();
-            let proj_a = band_pi_preserved(cb, merged, union_schema.columns.len(), &a_pk_in_union, k, 0, a_n);
-            let a_all = rekey_on_source_pk(cb, a_local, &left_in.schema);
+            let proj_a = band_pi_preserved(cb, merged, &pk_slots(&left_in.schema, k), k, 0, a_n);
+            let a_all = rekey_aux_on_source_pk(cb, a_local, &left_in.schema);
             exists_branches(cb, a_all, proj_a, kind)
         };
 
@@ -369,8 +366,7 @@ pub(crate) fn lower_semi_anti_view(
 
     let npk = out_pk_cols.len();
     let a_n = left_in.schema.columns.len();
-    let mut proj_layout: Vec<ColId> = vec![ColId::NONE; npk];
-    proj_layout.extend(left_in.layout.iter().copied());
+    let proj_layout = key_region_layout(npk, left_in.layout.iter().copied());
     let (final_projection, final_cols) = resolve_projection(items, &proj_layout, out_pk_cols)?;
     let mut sink_input = apply_projection(&mut cb, primary, &final_projection, a_n, npk);
     if shard {
@@ -378,7 +374,10 @@ pub(crate) fn lower_semi_anti_view(
     }
     cb.sink(sink_input);
     let circuit = cb.build();
-    Ok(((circuit, final_cols, npk), key_region_layout(npk, items)))
+    Ok((
+        (circuit, final_cols, npk),
+        key_region_layout(npk, items.iter().map(|i| i.out.id)),
+    ))
 }
 
 /// Lower a decorrelated `Project(Filter?(Join{Mark}))` to circuit pieces: the
@@ -416,8 +415,7 @@ pub(crate) fn lower_mark_view(
         columns: branch_cols,
         pk_cols: (0..npk).collect(),
     };
-    let mut branch_layout: Vec<ColId> = vec![ColId::NONE; npk];
-    branch_layout.extend(left_in.layout.iter().copied());
+    let branch_layout = key_region_layout(npk, left_in.layout.iter().copied());
 
     let branch = MarkBranch {
         mark_id,
@@ -436,7 +434,10 @@ pub(crate) fn lower_mark_view(
     }
     cb.sink(out);
     let circuit = cb.build();
-    Ok(((circuit, out_cols, npk), key_region_layout(npk, items)))
+    Ok((
+        (circuit, out_cols, npk),
+        key_region_layout(npk, items.iter().map(|i| i.out.id)),
+    ))
 }
 
 /// Everything a mark branch emits from, shared verbatim by the matched and

@@ -132,27 +132,6 @@ class TestJoins:
         finally:
             _cleanup(client, sn, tables=["t1", "t2"], views=["v"])
 
-    def test_join_cross_rejects(self, client):
-        """CROSS JOIN should be rejected."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t1 (id BIGINT NOT NULL PRIMARY KEY)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE TABLE t2 (id BIGINT NOT NULL PRIMARY KEY)",
-                schema_name=sn,
-            )
-            with pytest.raises(Exception):
-                client.execute_sql(
-                    "CREATE VIEW v AS SELECT * FROM t1 CROSS JOIN t2",
-                    schema_name=sn,
-                )
-        finally:
-            _cleanup(client, sn, tables=["t1", "t2"], views=["v"])
-
     def test_global_join_is_the_plain_join(self, client):
         """ClickHouse `GLOBAL JOIN` names the whole-relation evaluation a DBSP
         join already does, so it is accepted and yields the plain join's rows."""
@@ -1017,19 +996,6 @@ class TestJoinFormDesugars:
         finally:
             _cleanup(client, sn, tables=["t", "u"], views=["v"])
 
-    def test_comma_join_without_a_predicate_is_refused(self, client):
-        """No ON, no keying WHERE: a keyless product, which is not supported."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            with pytest.raises(gnitz.GnitzError, match="at least one equijoin or range predicate"):
-                client.execute_sql(
-                    "CREATE VIEW v AS SELECT t.id AS tid, u.id AS uid FROM t, u", schema_name=sn
-                )
-        finally:
-            _cleanup(client, sn, tables=["t", "u"], views=["v"])
-
     def test_where_equality_becomes_a_second_key_column(self, client):
         """`ON p WHERE q` and `ON (p AND q)` are the same rows for an INNER join,
         and now the same plan: the WHERE conjunct is classified as a key rather
@@ -1173,7 +1139,10 @@ class TestJoinFormDesugars:
         finally:
             _cleanup(client, sn, tables=["t", "u"], views=["v"])
 
-    def test_natural_join_without_a_shared_name_is_refused(self, client):
+    def test_natural_join_without_a_shared_name_is_the_product(self, client):
+        """SQL's rule: a NATURAL JOIN over relations sharing no column name is a
+        CROSS JOIN. It is a keyless step like any other, so the INNER form is the
+        product and the outer form is refused by the key-arity rule."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -1183,10 +1152,15 @@ class TestJoinFormDesugars:
             client.execute_sql(
                 "CREATE TABLE r (rid BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn
             )
-            with pytest.raises(gnitz.GnitzError, match="share no column name"):
-                client.execute_sql("CREATE VIEW v AS SELECT x, y FROM l NATURAL JOIN r", schema_name=sn)
+            client.execute_sql("CREATE VIEW v AS SELECT x, y FROM l NATURAL JOIN r", schema_name=sn)
+            client.execute_sql("INSERT INTO l VALUES (1, 10), (2, 20)", schema_name=sn)
+            client.execute_sql("INSERT INTO r VALUES (7, 70), (8, 80), (9, 90)", schema_name=sn)
+            exp = Counter({(x, y): 1 for x in (10, 20) for y in (70, 80, 90)})
+            oracle.assert_view_matches(client, client.resolve_table(sn, "v")[0], ["x", "y"], exp)
+            with pytest.raises(gnitz.GnitzError, match="may be keyless"):
+                client.execute_sql("CREATE VIEW w AS SELECT x, y FROM l NATURAL LEFT JOIN r", schema_name=sn)
         finally:
-            _cleanup(client, sn, tables=["l", "r"], views=["v"])
+            _cleanup(client, sn, tables=["l", "r"], views=["v", "w"])
 
     def test_using_names_a_column_neither_side_has(self, client):
         sn = "s" + _uid()
@@ -1635,8 +1609,7 @@ class TestJoinDesugarEdges:
     def test_cross_join_is_the_comma_join_spelled_out(self, client):
         """`CROSS JOIN` states no keys of its own, exactly as the comma does — so
         a WHERE keys it the same way, and the two spellings of one query cannot
-        disagree. Bare, with nothing to key it, both are still refused by the one
-        arity rule."""
+        disagree."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -1656,11 +1629,5 @@ class TestJoinDesugarEdges:
             for name, vid in ids.items():
                 oracle.assert_view_matches(client, vid, ["tid", "uid"], exp, name)
 
-            # Bare, both spellings hit the same rule with the same message.
-            for body in ("FROM t CROSS JOIN u", "FROM t, u"):
-                with pytest.raises(gnitz.GnitzError, match="at least one equijoin or range predicate"):
-                    client.execute_sql(
-                        f"CREATE VIEW bad AS SELECT t.id AS tid {body}", schema_name=sn
-                    )
         finally:
-            _cleanup(client, sn, tables=["t", "u"], views=["x", "c", "bad"])
+            _cleanup(client, sn, tables=["t", "u"], views=["x", "c"])

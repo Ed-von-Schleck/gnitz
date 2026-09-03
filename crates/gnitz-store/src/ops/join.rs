@@ -1,9 +1,10 @@
-//! The delta-trace inner join, equi and non-equi.
+//! The delta-trace inner join, equi, non-equi and keyless.
 //!
 //! One opcode over a compiler-baked [`JoinProbe`]: `Equi` co-groups the delta
 //! against the trace on equal key, `Range` walks an ordered half-open span per
-//! delta equality group. Both drive the same emission — the product of a
-//! contiguous delta run with the cursor's current trace row — and both produce
+//! delta equality group, `Cross` walks the whole trace once against the whole
+//! delta. All three drive the same emission — the product of a contiguous
+//! delta run with the cursor's current trace row — and all produce
 //! `[left_PK, left_payload…, right_payload…]`.
 
 use std::cmp::Ordering;
@@ -28,6 +29,9 @@ pub enum JoinProbe {
     Equi,
     /// An ordered span within an equality group.
     Range(RangeProbe),
+    /// Every trace row, for every delta row: the keyless join. Neither side's
+    /// key takes part, so the probe has nothing to resolve.
+    Cross,
 }
 
 /// A range relation as its two independent dimensions, plus the width they
@@ -142,10 +146,11 @@ impl RangeProbe {
 /// `[left_PK, left_payload..., right_payload...]`, built by
 /// [`merge_schemas_for_join`] above and handed down as `out_schema`.
 ///
-/// Emission is trace-major under both probes: each trace row is walked once and
+/// Emission is trace-major under every probe: each trace row is walked once and
 /// producted against a contiguous, random-access delta run. So the output is
-/// PK-sorted but not (PK, payload)-sorted, and unfolded; it carries no layout
-/// claim, and downstream re-sorts and consolidates.
+/// unfolded and not (PK, payload)-sorted — under `Cross` not even PK-sorted,
+/// since each trace row re-emits the whole delta; it carries no layout claim,
+/// and downstream re-sorts and consolidates.
 pub fn op_join_delta_trace(
     delta: &Batch,
     cursor: &mut ReadCursor,
@@ -161,7 +166,17 @@ pub fn op_join_delta_trace(
         return Batch::empty_with_schema(out_schema);
     }
     let delta_mb = consolidated.as_mem_batch();
-    let mut writer = JoinRowWriter::open(left_schema, right_schema, out_schema, n);
+    // A keyless probe emits exactly `n × |trace|` rows, so the arena is sized once
+    // rather than re-copied at every doubling. A keyed probe walks a bounded span
+    // per delta row and has no such bound: `n` is its floor.
+    let rows = match probe {
+        JoinProbe::Cross => {
+            cursor.rewind();
+            n.saturating_mul(cursor.estimated_length())
+        }
+        _ => n,
+    };
+    let mut writer = JoinRowWriter::open(left_schema, right_schema, out_schema, rows);
 
     let mut emit = |rs: usize, re: usize, c: &ReadCursor| {
         let w_trace = c.current_weight;
@@ -178,6 +193,13 @@ pub fn op_join_delta_trace(
             m.for_each_pk_group_row(key, |c| emit(r.start, r.end, c));
         }),
         JoinProbe::Range(probe) => range_merge_walk(&delta_mb, cursor, probe, emit),
+        JoinProbe::Cross => {
+            // Every probe positions its own cursor; this one has no key to seek
+            // by, so it rewinds. Idempotent — the sizing pass above also rewinds,
+            // and neither relies on the other having run.
+            cursor.rewind();
+            cursor.for_each_row_while(|_| true, |c| emit(0, n, c))
+        }
     }
 
     writer.finish()

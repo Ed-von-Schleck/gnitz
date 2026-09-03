@@ -15,9 +15,9 @@ pub(crate) enum RelayRoute {
     /// co-partitions it with the trace sides, so the round must be refused
     /// rather than routed by a key nothing was stored under.
     NoSingleKey,
-    /// Pure range join (`n_eq == 0`): the matches are spread over the whole key
-    /// space, so every worker needs the full delta and trims to its owned slice
-    /// (`WorkerFilter`) before integrating.
+    /// Pure range join (`n_eq == 0`) or cross join: the matches are spread over
+    /// the whole other side, so every worker needs the full delta and trims to
+    /// its owned slice (`WorkerFilter`) before integrating.
     Broadcast,
     /// Scatter by `cols`, already truncated to the routing prefix. A band join
     /// (`n_eq >= 1`) routes by the equality prefix alone, dropping the trailing
@@ -135,13 +135,13 @@ impl ViewMeta {
             .iter()
             .map(|(&tid, s)| (tid, s.iter().flatten().copied().collect()))
             .collect();
-        let range_join_n_eq = load::circuit_range_join_n_eq(loaded);
-        // A range join's matches spread over the whole key space, so no source
-        // distribution places them: nothing co-partitions, and every source
-        // relays.
-        let co_partitioned = match range_join_n_eq {
-            Some(_) => HashSet::new(),
-            None => compute_co_partitioned(&concatenated, host),
+        let join_relay = load::circuit_join_relay(loaded);
+        // A range or cross join's matches spread over the whole other side, so
+        // no source distribution places them: nothing co-partitions, and every
+        // source relays.
+        let co_partitioned = match join_relay {
+            load::JoinRelay::WholeKey => compute_co_partitioned(&concatenated, host),
+            load::JoinRelay::EqPrefix { .. } | load::JoinRelay::Broadcast => HashSet::new(),
         };
 
         let shard = load::output_exchange_shard(loaded);
@@ -159,7 +159,7 @@ impl ViewMeta {
                 // `pack(a ‖ b)` while each trace side is keyed by `pack(a)` or
                 // `pack(b)`, dropping every match silently.
                 let route = match <[_; 1]>::try_from(s) {
-                    Ok([seq]) => join_route(seq, range_join_n_eq),
+                    Ok([seq]) => join_route(seq, join_relay),
                     Err(_) => RelayRoute::NoSingleKey,
                 };
                 let relay = SourceRelay {
@@ -213,16 +213,18 @@ fn group_key_route(shard_cols: Option<Rc<[u32]>>) -> RelayRoute {
 
 /// The route a source carrying a reindex key takes. `pairs` is that key,
 /// `(column, promotion target)` per slot, in trace-side reindex order.
-fn join_route(pairs: Vec<(u32, u8)>, range_join_n_eq: Option<u8>) -> RelayRoute {
-    if range_join_n_eq == Some(0) {
-        return RelayRoute::Broadcast;
-    }
-    debug_assert!(
-        range_join_n_eq.is_none_or(|n_eq| pairs.len() == n_eq as usize + 1),
-        "range-join reindex key = [eq…, range]: len must be n_eq + 1"
-    );
-    // A band join routes by the eq prefix; an equi-join by the whole key.
-    let route_len = range_join_n_eq.map_or(pairs.len(), |n_eq| n_eq as usize);
+fn join_route(pairs: Vec<(u32, u8)>, relay: load::JoinRelay) -> RelayRoute {
+    let route_len = match relay {
+        load::JoinRelay::Broadcast => return RelayRoute::Broadcast,
+        load::JoinRelay::WholeKey => pairs.len(),
+        load::JoinRelay::EqPrefix { n_eq } => {
+            debug_assert!(
+                pairs.len() == n_eq as usize + 1,
+                "band-join reindex key = [eq…, range]: len must be n_eq + 1"
+            );
+            n_eq as usize
+        }
+    };
     RelayRoute::Scatter {
         cols: pairs[..route_len].iter().map(|&(c, _)| c).collect(),
         target_tcs: pairs[..route_len].iter().map(|&(_, t)| t).collect(),

@@ -39,8 +39,8 @@ pub(crate) mod setop;
 
 use super::chain::{EmitPieces, ViewChain};
 use super::physical;
-use super::JoinType;
 use super::{slot_of, ColId, HirAgg, HirExpr, HirRef, ProjEntry, RelExpr};
+use super::{JoinShape, JoinType};
 use crate::access::ranked_index_bounds;
 use crate::agg::{push_agg_specs, AggSpec};
 use crate::error::GnitzSqlError;
@@ -173,13 +173,13 @@ pub(crate) fn collect_live_cols<'a>(exprs: impl IntoIterator<Item = &'a HirExpr>
     }
 }
 
-/// The output `ColId` layout of a combine emit: `npk` identity-free key slots (the
-/// synthetic `_join_pk` / `_pair_pk` / `_set_pk` region — hidden, so nothing can
-/// reference them) followed by one projected id per payload column, in item order.
-/// Every combine shell's output has this shape, so this is its one home.
-pub(crate) fn key_region_layout(npk: usize, items: &[ProjEntry]) -> Vec<ColId> {
+/// A `ColId` layout behind a key region: `npk` identity-free slots (the synthetic
+/// `_join_pk` / `_pair_pk` / `_set_pk` region — hidden, so nothing can reference
+/// them) followed by `payload`. Every combine emit's output has this shape, and so
+/// does every layout a residual, WHERE or output projection resolves against.
+pub(crate) fn key_region_layout(npk: usize, payload: impl IntoIterator<Item = ColId>) -> Vec<ColId> {
     let mut layout = vec![ColId::NONE; npk];
-    layout.extend(items.iter().map(|i| i.out.id));
+    layout.extend(payload);
     layout
 }
 
@@ -283,12 +283,14 @@ fn reject_ineligible_capacity_body(rel: &RelExpr) -> Result<(), GnitzSqlError> {
                     kind: JoinType::Inner,
                     on,
                     ..
-                } => match on.class()?.range.is_some() {
+                } => match on.class()?.shape() {
                     // A range/band join's null-fill threshold pipeline is not
-                    // replayable per key.
-                    true => "a range or band join",
+                    // replayable per key; a cross join has no key at all, so a
+                    // skeleton row names no trace group to replay.
+                    JoinShape::Range => "a range or band join",
+                    JoinShape::Cross => "a cross join",
                     // Eligible: plain inner equi-join.
-                    false => return Ok(()),
+                    JoinShape::Equi => return Ok(()),
                 },
                 RelExpr::Join {
                     kind: JoinType::Left | JoinType::Right | JoinType::Full,

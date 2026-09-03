@@ -485,7 +485,7 @@ pub(crate) struct SetOpCol {
 /// `preserves_left`/`preserves_right` predicates (they are `matches!`-based, so
 /// the new variants get `false` automatically), and carry only the left columns
 /// (plus, for `Mark`, the mark column) — see `RelExpr::cols`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JoinType {
     Inner,
     Left,
@@ -544,6 +544,26 @@ pub(crate) struct JoinClass {
     pub eq: Vec<EqPair>,
     pub range: Option<HirRange>,
     pub residual: Vec<HirExpr>,
+}
+
+/// Which physical join a classified ON calls for. An enum rather than field probes
+/// at each site: a pure range join has an empty `eq` too, so probing `eq` first
+/// would read it as keyless and drop the range predicate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JoinShape {
+    Equi,
+    Range,
+    Cross,
+}
+
+impl JoinClass {
+    pub(crate) fn shape(&self) -> JoinShape {
+        match (self.range.is_some(), self.eq.is_empty()) {
+            (true, _) => JoinShape::Range,
+            (false, true) => JoinShape::Cross,
+            (false, false) => JoinShape::Equi,
+        }
+    }
 }
 
 /// A join's ON predicate in one of its two forms: the raw conjuncts bind produced

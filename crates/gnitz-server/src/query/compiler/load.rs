@@ -361,16 +361,41 @@ pub(super) fn output_exchange_shard(loaded: &LoadedCircuit) -> Option<(i32, Vec<
     })
 }
 
-/// The equality-conjunct count of a non-equi (range / band) join, read off its
-/// `Join(DeltaTraceRange)` node — both bilinear terms carry the same `n_eq`, so
-/// which one the walk reaches is not observable. `Some` is the range-join
-/// discriminator, and the value tells the relay whether to eq-prefix-scatter
-/// (band) or broadcast (`n_eq == 0`, pure range).
-pub(super) fn circuit_range_join_n_eq(loaded: &LoadedCircuit) -> Option<u8> {
-    loaded.ops().find_map(|(_, op)| match op {
-        gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange { n_eq, .. }) => Some(*n_eq),
-        _ => None,
-    })
+/// How a view's join, if it has one, needs its inputs placed — what the master
+/// relay routes a source's delta by, and whether any source can skip the
+/// scatter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum JoinRelay {
+    /// Route by the whole reindex key: an equi join, whose matches share a key,
+    /// and every circuit without a join (a GROUP BY routes by its group key the
+    /// same way).
+    WholeKey,
+    /// A band join: route by the `n_eq` leading equality slots alone, dropping
+    /// the range slot, so equal eq-values co-partition and the range probe
+    /// stays partition-local.
+    EqPrefix { n_eq: u8 },
+    /// A pure range join or a cross join: the matches spread over the whole
+    /// other side, so every worker needs the full delta and a `WorkerFilter`
+    /// trims what it integrates.
+    Broadcast,
+}
+
+/// The join relay a circuit's `Join` node calls for, read off the first one —
+/// both bilinear terms carry the same kind, so which one the walk reaches is
+/// not observable.
+pub(super) fn circuit_join_relay(loaded: &LoadedCircuit) -> JoinRelay {
+    use gnitz_wire::{JoinKind, OpNode};
+    loaded
+        .ops()
+        .find_map(|(_, op)| match op {
+            OpNode::Join(kind) => Some(match kind {
+                JoinKind::DeltaTrace => JoinRelay::WholeKey,
+                JoinKind::DeltaTraceRange { n_eq: 0, .. } | JoinKind::DeltaTraceCross => JoinRelay::Broadcast,
+                JoinKind::DeltaTraceRange { n_eq, .. } => JoinRelay::EqPrefix { n_eq: *n_eq },
+            }),
+            _ => None,
+        })
+        .unwrap_or(JoinRelay::WholeKey)
 }
 
 /// The `(source table id, bound)` the planner pushed onto a `ScanDelta`'s

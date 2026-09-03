@@ -29,9 +29,10 @@ pub const OPCODE_MAP_HASH_ROW: u64 = 29;
 /// Non-equi (range) join: symmetric delta-trace join whose probe is an ordered
 /// half-open range walk over the trace instead of an equal-key seek.
 pub const OPCODE_JOIN_DELTA_TRACE_RANGE: u64 = 32;
-/// Drop trace rows this worker does not own (**pure** range-join broadcast input;
-/// a band join scatters by its eq prefix and omits this node). Worker identity is
-/// a compile-time constant, so the node carries no payload.
+/// Drop trace rows this worker does not own — the trace side of a broadcast
+/// join input (a **pure** range join and the keyless cross join; a band join
+/// scatters by its eq prefix and omits this node). Worker identity is a
+/// compile-time constant, so the node carries no payload.
 pub const OPCODE_WORKER_FILTER: u64 = 33;
 /// Multiplicity-preserving sibling of DISTINCT: clamps each consolidated
 /// (PK, payload)'s net weight to `[0, i64::MAX]` (vs DISTINCT's `[-1, 1]`). The
@@ -43,6 +44,10 @@ pub const OPCODE_POSITIVE_PART: u64 = 34;
 /// a compute map has a program blob and declared output columns, a reindex two
 /// column lists and no blob.
 pub const OPCODE_MAP_REINDEX: u64 = 35;
+/// Keyless (cross) join: symmetric delta-trace join whose probe pairs every
+/// delta row with every trace row. No parameter row — there is no key to
+/// describe.
+pub const OPCODE_JOIN_DELTA_TRACE_CROSS: u64 = 36;
 
 // ---------------------------------------------------------------------------
 // Circuit-layer type aliases
@@ -365,6 +370,7 @@ pub enum ReduceOutSlot {
 pub enum JoinKind {
     DeltaTrace,
     DeltaTraceRange { n_eq: u8, rel: RangeRel },
+    DeltaTraceCross,
 }
 
 wire_enum! {
@@ -698,6 +704,7 @@ pub fn encode_op_node(op: OpNode) -> (NodeFields, Vec<NodeColumnPayload>) {
             (OPCODE_JOIN_DELTA_TRACE_RANGE, None, None),
             vec![(NODE_COL_KIND_RANGE_JOIN, 0, n_eq as u64, rel.as_wire())],
         ),
+        OpNode::Join(JoinKind::DeltaTraceCross) => ((OPCODE_JOIN_DELTA_TRACE_CROSS, None, None), Vec::new()),
         OpNode::IntegrateSink => ((OPCODE_INTEGRATE, None, None), Vec::new()),
         OpNode::IntegrateTrace => ((OPCODE_INTEGRATE_TRACE, None, None), Vec::new()),
         OpNode::ExchangeShard { shard_cols } => (
@@ -888,6 +895,7 @@ pub fn decode_op_node(
                 .ok_or_else(|| format!("JOIN_DELTA_TRACE_RANGE unknown rel {}", row.value2))?;
             OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel })
         }
+        OPCODE_JOIN_DELTA_TRACE_CROSS => OpNode::Join(JoinKind::DeltaTraceCross),
         OPCODE_INTEGRATE => OpNode::IntegrateSink,
         OPCODE_INTEGRATE_TRACE => OpNode::IntegrateTrace,
         OPCODE_EXCHANGE_SHARD => OpNode::ExchangeShard {

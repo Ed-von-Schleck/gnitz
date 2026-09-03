@@ -68,17 +68,34 @@ fn converse_rel_is_an_involution() {
     assert_eq!(converse_rel(RangeRel::Le), RangeRel::Ge);
 }
 
-/// A residual cannot stand alone (it would be an incremental cross-join), and
-/// the reindex-slot arity is capped by the PK-list width.
+/// The reindex-slot arity is capped by the PK-list width; the keyless case is
+/// no concern of this guard's, at any width.
 #[test]
 fn join_key_arity_bounds() {
-    assert!(reject_join_key_arity(0, false).is_err());
-    reject_join_key_arity(0, true).unwrap();
-    reject_join_key_arity(1, false).unwrap();
+    reject_join_key_arity(0, false).unwrap();
     reject_join_key_arity(gnitz_core::PK_LIST_MAX_COLS, false).unwrap();
     assert!(reject_join_key_arity(gnitz_core::PK_LIST_MAX_COLS + 1, false).is_err());
     // The range slot counts toward the same cap.
     assert!(reject_join_key_arity(gnitz_core::PK_LIST_MAX_COLS, true).is_err());
+}
+
+/// Only an INNER step may be keyless (the cross join); every other kind needs an
+/// equi or range key, and no kind is refused once it has one.
+#[test]
+fn only_an_inner_step_may_be_keyless() {
+    reject_keyless_non_inner(JoinType::Inner, JoinShape::Cross).unwrap();
+    for kind in [
+        JoinType::Left,
+        JoinType::Right,
+        JoinType::Full,
+        JoinType::Semi,
+        JoinType::Anti,
+        JoinType::Mark,
+    ] {
+        assert!(reject_keyless_non_inner(kind, JoinShape::Cross).is_err(), "{kind:?}");
+        reject_keyless_non_inner(kind, JoinShape::Range).unwrap();
+        reject_keyless_non_inner(kind, JoinShape::Equi).unwrap();
+    }
 }
 
 /// INNER alone tolerates a residual; the outer and the decorrelation kinds each

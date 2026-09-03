@@ -4,7 +4,7 @@
 //! range-join output caps here — so no pass has to reach into another for a rule,
 //! and `hir::lower` depends only downward.
 
-use super::JoinType;
+use super::{JoinShape, JoinType};
 use crate::error::GnitzSqlError;
 use crate::validate::reject_float_keys;
 use gnitz_core::{ColumnDef, RangeRel, TypeCode};
@@ -14,8 +14,8 @@ use sqlparser::ast::{Expr, JoinConstraint, JoinOperator};
 /// the grammar, so `NATURAL LEFT JOIN` is `(JoinKeys::Natural, JoinType::Left)`.
 ///
 /// A `CROSS JOIN` is an INNER step stating no keys, which is what a comma between
-/// FROM items is too; `reject_join_key_arity` is the one place a join with no
-/// cross-table predicate at all is refused.
+/// FROM items is too; `reject_keyless_non_inner` is the one place such a step is
+/// refused for any other join type.
 pub(crate) fn join_keys_and_type(join: &sqlparser::ast::Join) -> Result<(JoinKeys<'_>, JoinType), GnitzSqlError> {
     let sqlparser::ast::Join {
         relation: _, // resolved by the caller as the step's right input
@@ -117,16 +117,14 @@ pub(crate) fn reject_outer_with_residual(kind: JoinType, residual_empty: bool) -
     }
 }
 
-/// The range-join output pair-PK arity cap (`a.pk_count + b.pk_count ≤
-/// PK_LIST_MAX_COLS`) — the binding constraint on the synthesized output PK; the
-/// stride ceiling is non-binding (≤ 4·16 = 64 ≤ MAX_PK_BYTES). The engine's
-/// `validate_pk_cols` is the backstop; this is the friendly planner error. One
-/// home, so both range-join emitters reject identically.
-pub(crate) fn reject_pair_pk_overflow(pa: usize, pb: usize) -> Result<(), GnitzSqlError> {
+/// The pair-PK output arity cap — the binding constraint on a synthesized output
+/// PK (its stride cannot reach `MAX_PK_BYTES` first). `validate_pk_cols` is the
+/// engine-side backstop; this is the planner error naming the surface written.
+pub(crate) fn reject_pair_pk_overflow(surface: &str, pa: usize, pb: usize) -> Result<(), GnitzSqlError> {
     let pair_pk = pa + pb;
     if pair_pk > gnitz_core::PK_LIST_MAX_COLS {
         return Err(GnitzSqlError::Unsupported(format!(
-            "range JOIN output PK has {pair_pk} columns (a.pk {pa} + b.pk {pb}), \
+            "{surface} output PK has {pair_pk} columns (a.pk {pa} + b.pk {pb}), \
              exceeding the {}-column limit",
             gnitz_core::PK_LIST_MAX_COLS
         )));
@@ -258,26 +256,27 @@ pub(crate) fn converse_rel(r: RangeRel) -> RangeRel {
     }
 }
 
-/// The JOIN ON key-arity rules, shared by both join planners.
-///
-/// A residual cannot stand alone: a residual-only ON (`ON a.r <> b.s`) would be an
-/// incremental cross-join, which the engine cannot build. Residuals are only ever
-/// evaluated alongside a physical equi/range anchor (§3).
-///
-/// Reindex-slot arity cap: each equality pair plus the optional range slot becomes
-/// one synthetic `_join_pk` PK-list slot, and the codec holds at most
-/// `PK_LIST_MAX_COLS`. Reject a wider ON here as a clean planner error rather than
-/// a `pack_pk_cols` panic at registration. (The output pair-PK has its own cap,
-/// checked in the range circuit builder.)
-pub(crate) fn reject_join_key_arity(n_eq: usize, has_range: bool) -> Result<(), GnitzSqlError> {
-    if n_eq == 0 && !has_range {
-        return Err(GnitzSqlError::Bind(
-            "a join needs at least one equijoin or range predicate between its two sides. \
-             Write it in the step's ON / USING clause; an INNER step — which a CROSS JOIN \
-             and a comma-separated FROM both are — can also take it from the WHERE."
+/// Only an INNER step may be keyless: it is the cross join, whose residual (if
+/// any) filters the product. An outer or decorrelated step decides its null-fill
+/// or match existence from a key, and a keyless one would need a global "is the
+/// other side empty" witness no emitter builds.
+pub(crate) fn reject_keyless_non_inner(kind: JoinType, shape: JoinShape) -> Result<(), GnitzSqlError> {
+    if shape == JoinShape::Cross && kind != JoinType::Inner {
+        return Err(GnitzSqlError::Unsupported(
+            "a LEFT/RIGHT/FULL JOIN or an EXISTS/IN correlation needs at least one equijoin \
+             or range predicate between its two sides; only an INNER step (CROSS JOIN, a \
+             comma-separated FROM, or JOIN … ON with no cross-table comparison) may be keyless."
                 .into(),
         ));
     }
+    Ok(())
+}
+
+/// The JOIN ON reindex-slot arity cap: each equality pair plus the optional range
+/// slot becomes one `_join_pk` PK-list slot, and the codec holds at most
+/// `PK_LIST_MAX_COLS`. A planner error here rather than a `pack_pk_cols` panic at
+/// registration. The output pair-PK has its own cap above.
+pub(crate) fn reject_join_key_arity(n_eq: usize, has_range: bool) -> Result<(), GnitzSqlError> {
     let slots = n_eq + has_range as usize;
     if slots > gnitz_core::PK_LIST_MAX_COLS {
         return Err(GnitzSqlError::Unsupported(if !has_range {

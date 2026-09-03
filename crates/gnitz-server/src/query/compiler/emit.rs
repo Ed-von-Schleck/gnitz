@@ -392,13 +392,14 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
             if ctx.reg_meta[b_reg as usize].owned_table.is_none() {
                 return Err(CompileError::Rejected("join: trace port is not an integral"));
             }
-            // Both kinds produce the same output layout — only the probe differs —
+            // Every kind produces the same output layout — only the probe differs —
             // so the schema, the register meta and the operand registers are shared.
             let probe = match kind {
                 gnitz_wire::JoinKind::DeltaTrace => JoinProbe::Equi,
                 gnitz_wire::JoinKind::DeltaTraceRange { n_eq, rel } => JoinProbe::Range(
                     RangeProbe::new(&a_schema, &b_schema, *n_eq, *rel).map_err(CompileError::Rejected)?,
                 ),
+                gnitz_wire::JoinKind::DeltaTraceCross => JoinProbe::Cross,
             };
             let out_schema = merge_schemas_for_join(&a_schema, &b_schema)
                 .ok_or(CompileError::Rejected("join: merged schema exceeds MAX_COLUMNS"))?;

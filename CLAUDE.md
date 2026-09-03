@@ -199,6 +199,13 @@ PK = left input PK = the join key after exchange repartition; the right batch's
 PK is not duplicated. Original table PKs survive as payload columns, moved there
 by `map_reindex`.
 
+**Keyless (cross) joins** — `CROSS JOIN`, a comma-separated FROM, or an ON/WHERE
+with no cross-table comparison — are INNER only; every other kind is rejected at
+plan time. The output PK is the pair `[a.pk…, b.pk…]`, a residual (`ON a.v <> b.w`)
+filters the product, and the product is computed partition-locally under a
+broadcast of the delta, with no second exchange. Every epoch emits
+`|Δ| × |other side|` rows.
+
 ### Outer joins (LEFT / RIGHT / FULL)
 
 Described for LEFT; RIGHT is the mirror, FULL does both sides. For each delta

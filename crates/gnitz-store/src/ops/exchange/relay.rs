@@ -346,7 +346,7 @@ pub fn op_relay_scatter_consolidated_mode(
 /// slice), so their concatenation is the full delta with no duplication. One
 /// batch is built; the SAL emit references it once per worker slot
 /// (`RelayDest::Broadcast`), so no per-worker clone is materialized. The
-/// range-join probe needs the whole delta on every worker — a range match can
+/// range and cross probes need the whole delta on every worker — a match can
 /// live on any worker's trace — which the equality scatter (one destination per
 /// row) cannot deliver. Sibling of `op_repartition_batches_mode` /
 /// `op_relay_scatter_consolidated_mode`, but without `col_indices` / `RouteMode`

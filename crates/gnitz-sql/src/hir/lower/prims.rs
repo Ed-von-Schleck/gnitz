@@ -72,21 +72,25 @@ pub(crate) fn keep_all(n_cols: usize) -> Vec<u32> {
     (0..n_cols as u32).collect()
 }
 
-/// Re-key `node` onto its own source PK, payload verbatim — the `P_all` operand of
-/// an outer null-fill's `positive_part(P_all − π_P(inner))`, and the NULL-key
-/// bypass re-key. The target type codes are all-zero (self-derive): the source PK
-/// columns already carry their own types, so the re-key is width- and sign-exact.
-/// One home, so every null-fill's preserved side is keyed identically to the
-/// `π_P(inner)` it is subtracted from — a drift there would be a silent weight bug.
-///
-pub(crate) fn rekey_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, schema: &Schema) -> NodeId {
-    cb.map_reindex(
-        node,
-        &schema.pk_cols,
-        &[],
-        &keep_all(schema.columns.len()),
-        ReindexRole::Auxiliary,
-    )
+/// Re-key `node` onto its own source PK, payload verbatim, self-deriving each key
+/// slot's type. One home, so every operand keyed this way is byte-identical to
+/// every other — a null-fill subtracts two of them, where a drift would silently
+/// mis-weight.
+fn rekey_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, schema: &Schema, role: ReindexRole) -> NodeId {
+    cb.map_reindex(node, &schema.pk_cols, &[], &keep_all(schema.columns.len()), role)
+}
+
+/// [`rekey_on_source_pk`] for an internal operand: the `P_all` of a null-fill's
+/// `positive_part(P_all − π_P(inner))`, or the NULL-key bypass.
+pub(crate) fn rekey_aux_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, schema: &Schema) -> NodeId {
+    rekey_on_source_pk(cb, node, schema, ReindexRole::Auxiliary)
+}
+
+/// [`rekey_on_source_pk`] as a source's route key — the reindex the relay reads a
+/// scan's scatter key off. A source whose every reindex is `Auxiliary` is refused,
+/// so this is what a keyless join's per-side trace key must use.
+pub(crate) fn rekey_scatter_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, schema: &Schema) -> NodeId {
+    rekey_on_source_pk(cb, node, schema, ReindexRole::ScatterKey)
 }
 
 /// A schema's column type codes in order — the `null_extend` argument naming the

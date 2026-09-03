@@ -122,6 +122,7 @@ fn classify_join(rel: &Rc<RelExpr>, extra: &[HirExpr], memo: &mut RewriteMemo) -
         unreachable!("classify visits each join once")
     };
     let class = classify_on(raw, &here, &left_cols, &right_cols)?;
+    crate::hir::guards::reject_keyless_non_inner(*kind, class.shape())?;
     crate::hir::guards::reject_outer_with_residual(*kind, class.residual.is_empty())?;
     let out = Rc::new(RelExpr::Join {
         left: new_left,

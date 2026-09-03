@@ -126,6 +126,19 @@ fn range_join(schema: &SchemaDescriptor, n_eq: usize, rel: RangeRel, delta: &Bat
     )
 }
 
+/// The cross join of `delta` (under `left`) against the cursor's trace (under
+/// `right`).
+fn cross_join(left: &SchemaDescriptor, right: &SchemaDescriptor, delta: &Batch, cursor: &mut ReadCursor) -> Batch {
+    op_join_delta_trace(
+        delta,
+        cursor,
+        left,
+        right,
+        &join_out_schema(left, right),
+        JoinProbe::Cross,
+    )
+}
+
 // -----------------------------------------------------------------------
 // Equi delta-trace
 // -----------------------------------------------------------------------
@@ -166,15 +179,7 @@ fn equi_join_products_the_trace_group_at_every_pk_shape() {
         // (left payload, right payload, weight) — trace-major: each trace row is
         // walked once and producted against the whole delta group. `absent`
         // contributes nothing.
-        let got: Vec<(i64, i64, i64)> = (0..out.count)
-            .map(|r| {
-                (
-                    read_i64_le(out.col_data(0), r * 8),
-                    read_i64_le(out.col_data(1), r * 8),
-                    out.get_weight(r),
-                )
-            })
-            .collect();
+        let got = out_triples(&out);
         let want: Vec<(i64, i64, i64)> = [(100i64, 1i64), (200, 2)]
             .into_iter()
             .flat_map(|(right, w)| [10i64, 20, 30].map(move |left| (left, right, w)))
@@ -187,6 +192,53 @@ fn equi_join_products_the_trace_group_at_every_pk_shape() {
         // folded; the output carries no layout claim and downstream re-sorts.
         assert_eq!(out.layout(), Layout::Raw, "{name}");
     }
+}
+
+// -----------------------------------------------------------------------
+// Cross delta-trace
+// -----------------------------------------------------------------------
+
+/// The cross join pairs every delta row with every trace row at `w_delta × w_trace`,
+/// trace-major, keyed by the left PK. The sides differ in PK width here: neither
+/// key is read. The walk rewinds, so an exhausted cursor still yields the product.
+#[test]
+fn cross_join_products_every_delta_row_with_every_trace_row() {
+    let left = pk_payload_schema(&[type_code::U64]);
+    let right = pk_payload_schema(&[type_code::U64; 3]);
+    let (l1, l2) = (opk_pk(&left, &[1]), opk_pk(&left, &[2]));
+    let (r1, r2, r3) = (
+        opk_pk(&right, &[1, 1, 1]),
+        opk_pk(&right, &[1, 1, 2]),
+        opk_pk(&right, &[9, 0, 0]),
+    );
+
+    let mut trace = make_batch_opk(&right, &[(&r1, 1, 100), (&r2, 2, 200), (&r3, 1, 300)]);
+    trace.certify_layout(Layout::Sorted, &right);
+    let mut ch = trace_cursor(trace, right);
+    // The probe states its own start, so an exhausted cursor still yields the
+    // whole product.
+    ch.advance_to(&opk_pk(&right, &[u64::MAX as u128, 0, 0]));
+    assert!(!ch.valid, "the fixture must start with an exhausted cursor");
+
+    let mut delta = make_batch_opk(&left, &[(&l1, 3, 10), (&l2, -1, 20)]);
+    delta.certify_layout(Layout::Sorted, &left);
+
+    let out = cross_join(&left, &right, &delta, &mut ch);
+    let got = out_triples(&out);
+    let want: Vec<(i64, i64, i64)> = [(100i64, 1i64), (200, 2), (300, 1)]
+        .into_iter()
+        .flat_map(|(right_v, w)| [(10i64, 3i64), (20, -1)].map(move |(left_v, wd)| (left_v, right_v, wd * w)))
+        .collect();
+    assert_eq!(got, want);
+    let left_pks: Vec<&[u8]> = (0..out.count).map(|r| out.get_pk_bytes(r)).collect();
+    assert_eq!(left_pks, [&l1[..], &l2[..]].repeat(3), "the output PK is the left PK");
+    assert_eq!(out.layout(), Layout::Raw, "trace-major: not even PK-sorted");
+
+    // An empty trace pairs with nothing; an empty delta emits nothing.
+    let mut empty = trace_cursor(Batch::empty_with_schema(&right), right);
+    assert_eq!(cross_join(&left, &right, &delta, &mut empty).count, 0);
+    let none = Batch::empty_with_schema(&left);
+    assert_eq!(cross_join(&left, &right, &none, &mut ch).count, 0);
 }
 
 // -----------------------------------------------------------------------
@@ -544,6 +596,20 @@ fn make_range_batch(schema: &SchemaDescriptor, rows: &[(Vec<u64>, u64, i64, i64)
 
 /// Right-payload (trace I64 col) + weight of each emitted range-join row, in
 /// emission order. The trace payload identifies which trace rows matched.
+/// Each output row as `(left payload, right payload, weight)` — what a join whose
+/// two sides carry one payload column each denotes, in emission order.
+fn out_triples(out: &Batch) -> Vec<(i64, i64, i64)> {
+    (0..out.count)
+        .map(|r| {
+            (
+                read_i64_le(out.col_data(0), r * 8),
+                read_i64_le(out.col_data(1), r * 8),
+                out.get_weight(r),
+            )
+        })
+        .collect()
+}
+
 fn range_out_pairs(out: &Batch) -> Vec<(i64, i64)> {
     (0..out.count)
         .map(|r| (read_i64_le(out.col_data(1), r * 8), out.get_weight(r)))
