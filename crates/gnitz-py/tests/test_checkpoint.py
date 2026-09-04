@@ -3,7 +3,7 @@
 These tests start a dedicated server with a very small GNITZ_CHECKPOINT_BYTES
 so that SAL checkpoints fire frequently during normal push activity.  They
 guard against data loss in the checkpoint code paths — in particular the
-pre_write_pushes path where entries could be silently dropped if checkpoint
+commit_pushes path where entries could be silently dropped if checkpoint
 handling was incorrect.
 
 The server is function-scoped (each test gets its own instance) so that a

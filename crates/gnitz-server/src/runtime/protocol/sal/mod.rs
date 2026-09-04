@@ -188,16 +188,19 @@ impl<'a> DirectGroup<'a> {
             matches!(self.template.data, WireData::Whole(None)) && self.template.request_id == 0,
             "DirectGroup template must leave `data` and `request_id` to the per-worker fill"
         );
+        let data = match self.data {
+            GroupData::Same(d) => d,
+            GroupData::PerWorker(d) => d[w],
+        };
+        let keeps_schema = data.row_count() > 0 || self.kind.schema_survives_a_rowless_slot();
         WireMsg {
-            data: match self.data {
-                GroupData::Same(d) => d,
-                GroupData::PerWorker(d) => d[w],
-            },
+            data,
             request_id: match self.targets {
                 GroupTargets::AllSilent => 0,
                 GroupTargets::All(ids) => ids[w],
                 GroupTargets::One { req_id, .. } => req_id,
             },
+            schema_block: self.template.schema_block.filter(|_| keeps_schema),
             ..self.template
         }
     }
@@ -365,6 +368,18 @@ gnitz_wire::wire_enum! {
         /// All preceding groups at the same LSN belong to the zone; recovery
         /// applies them only when this reaches disk.
         ZoneCommit = 16,
+    }
+}
+
+impl SalMessageKind {
+    /// Whether a slot of this kind still needs the group's schema block when it
+    /// carries no rows. Only a `Push` does not: its rowless slots are the ones a
+    /// scatter left empty, and every consumer reaches its own no-op before asking
+    /// for a schema. An `ExchangeRelay`'s block *is* the payload of an empty slot
+    /// — the worker builds its batch from it and `fatal_shutdown`s without one —
+    /// and so is every other kind's, until one says otherwise here.
+    fn schema_survives_a_rowless_slot(self) -> bool {
+        self != SalMessageKind::Push
     }
 }
 
@@ -696,6 +711,10 @@ pub(crate) struct SalWriter {
     /// group laid out from `cursor` on is unpublished until the scope ends.
     deferred_from: Cell<Option<u64>>,
     checkpoint_threshold: u64,
+    /// A group was refused as [`SalFit::Transient`] since the last reset: a
+    /// checkpoint would admit it, so one is warranted whatever the write cursor
+    /// says. Cleared by [`Self::rewind`].
+    refused_transient: Cell<bool>,
     /// Slots per group: the group header's `slot_count`, the directory's length
     /// and every slot offset are all this. It is the log's framing, so it is the
     /// log writer's own field — never read off some other per-worker resource.
@@ -717,6 +736,7 @@ impl SalWriter {
             zone: Cell::new(None),
             deferred_from: Cell::new(None),
             checkpoint_threshold,
+            refused_transient: Cell::new(false),
             num_workers,
         }
     }
@@ -751,9 +771,16 @@ impl SalWriter {
     }
 
     /// Whether more than the reclaim margin is already written — the opposite
-    /// sense to [`Self::fit_relay`], which asks for that much *free*.
+    /// sense to [`Self::below_reclaim_margin`], which asks for that much *free*.
     pub(crate) fn past_reclaim_margin(&self) -> bool {
         self.write_cursor.get() as usize > self.reclaim_margin()
+    }
+
+    /// Less than the reclaim margin is free, so a relay-sized group would be
+    /// refused — the opposite sense to [`Self::past_reclaim_margin`], which asks
+    /// whether that much is already *written*.
+    pub(crate) fn below_reclaim_margin(&self) -> bool {
+        self.fit_relay(0) != SalFit::Fits
     }
 
     /// The margin below which the SAL is "running low": one eighth of the
@@ -794,6 +821,11 @@ impl SalWriter {
         let total = PREFIX_BYTES + payload_size;
         let fit = self.fit_within(effective_max(kind, self.mmap_size), total);
         if fit != SalFit::Fits {
+            // On the writer, not on the deferred-publication scope: the group did
+            // not fit whether or not a rolled-back transaction contained it.
+            if fit == SalFit::Transient {
+                self.refused_transient.set(true);
+            }
             gnitz_debug!(
                 "SAL group refused as {:?}: cursor={} mmap={} epoch={} need={}",
                 fit,
@@ -917,8 +949,12 @@ impl SalWriter {
         group_total_size(group_header_size(nw), g.slot_sizes(nw)[..nw].iter().copied())
     }
 
+    /// Whether a checkpoint is warranted: the write cursor has crossed the
+    /// configured threshold, or a group has been refused as
+    /// [`SalFit::Transient`] since the last reset — one a checkpoint would admit,
+    /// on a log whose cursor may still sit below the threshold.
     pub(crate) fn needs_checkpoint(&self) -> bool {
-        self.write_cursor.get() >= self.checkpoint_threshold
+        self.write_cursor.get() >= self.checkpoint_threshold || self.refused_transient.get()
     }
 
     /// Rewind to cursor 0 at `epoch` and end the log there, so readers at cursor
@@ -932,6 +968,7 @@ impl SalWriter {
         debug_assert!(self.zone.get().is_none(), "a rewind inside an open zone loses it");
         self.write_cursor.set(0);
         self.epoch.set(epoch);
+        self.refused_transient.set(false);
         unsafe { write_end_prefix(self.ptr, 0) };
     }
 

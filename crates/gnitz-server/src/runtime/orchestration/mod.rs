@@ -27,6 +27,9 @@ pub(super) mod worker;
 /// site whose panic would leave master and workers inconsistent — relay
 /// emission, DDL compensation, view backfill and re-stamp — turns it into
 /// `gnitz_fatal_abort!`. Which one a site is, is in its `Err` arm, not here.
+///
+/// Debug and test builds only: release is `panic = "abort"` (`crates/Cargo.toml`),
+/// where the process dies at the panic and no `Err` arm below ever runs.
 pub(crate) fn guard_panic<T, F>(op: &'static str, f: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String>,

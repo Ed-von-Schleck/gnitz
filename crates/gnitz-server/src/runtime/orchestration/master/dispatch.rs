@@ -390,8 +390,9 @@ impl MasterDispatcher {
     // -----------------------------------------------------------------------
 
     /// Can a relay of `need` bytes be written, and if not, is a checkpoint enough
-    /// to make room? The one SAL-space predicate: every space decision in the
-    /// tree reads it, so none can disagree with another.
+    /// to make room? The one *fit* computation: every sized space decision in the
+    /// tree reads it, so no two can size the same group differently.
+    /// [`Self::sal_space_low`] is the same rule with no group in hand.
     pub(crate) fn relay_fit(&self, need: usize) -> SalFit {
         self.sal.fit_relay(need)
     }
@@ -1089,10 +1090,16 @@ impl MasterDispatcher {
         self.restamp_derived(&[])
     }
 
-    /// Accessor for the committer. True when the SAL write cursor has
-    /// crossed the configured checkpoint threshold.
+    /// Accessor for the committer. True when a checkpoint is warranted — see
+    /// [`SalWriter::needs_checkpoint`].
     pub(crate) fn sal_needs_checkpoint(&self) -> bool {
         self.sal.needs_checkpoint()
+    }
+
+    /// Accessor for the committer and the watchdog. True when less than the
+    /// reclaim margin is free, so the next relay-sized group would be refused.
+    pub(crate) fn sal_space_low(&self) -> bool {
+        self.sal.below_reclaim_margin()
     }
 
     /// The descriptor `target_id` is registered with. Panics on an unregistered

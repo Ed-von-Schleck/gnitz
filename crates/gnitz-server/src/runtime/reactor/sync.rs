@@ -100,7 +100,9 @@ pub mod oneshot {
 // The committer's and the tick loop's request channel. `chan`, not `spsc`:
 // many tasks send, reaching the one `Sender` through a shared `Rc<Shared>`.
 // It is that one — `Sender` is not cloneable — so its drop closes the queue and
-// the receiver's next `recv` resolves to `None`, which is how both loops exit.
+// the receiver's next `recv` resolves to `None`. Neither loop exits that way in
+// practice: `Shared` owns the sender and each loop's task holds an `Rc<Shared>`
+// for its whole life, so both exit by reactor shutdown dropping the task.
 
 pub mod chan {
     use super::*;
@@ -135,10 +137,10 @@ pub mod chan {
             RecvOne { inner: &self.inner }
         }
 
-        /// Non-blocking receive: returns `Some(T)` if the queue has an
-        /// item, `None` otherwise. Never awaits. Used by the committer
-        /// to drain pipelined requests without paying the 1ms debounce
-        /// timer when nothing more is available.
+        /// Non-blocking receive: returns `Some(T)` if the queue has an item,
+        /// `None` otherwise. Never awaits — which is what lets the committer
+        /// batch whatever is already pipelined behind a request without waiting
+        /// on a timer for more.
         pub fn try_recv(&mut self) -> Option<T> {
             self.inner.borrow_mut().pop()
         }

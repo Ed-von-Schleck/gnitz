@@ -600,7 +600,8 @@ impl Reactor {
     /// Submit an fdatasync and await its completion. Returns the CQE `res`
     /// (0 on success, negative errno on failure). The SQE is flushed to the
     /// kernel immediately so the fsync can overlap with subsequent CPU work —
-    /// the `pre_write_pushes` Phase-A / tick-evaluation overlap depends on it.
+    /// `commit_pushes` awaits its worker ACKs and fires the tick between the
+    /// submit and the CQE, and depends on it.
     pub fn fsync(&self, fd: i32) -> FsyncFuture {
         let id = self.inner.alloc_op_id();
         {

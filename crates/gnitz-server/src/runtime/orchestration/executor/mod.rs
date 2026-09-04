@@ -89,8 +89,9 @@ async fn hold_push_for_ddl(shared: &Shared, target_id: i64) {
 
 use gnitz_wire::ClientVerb;
 
-/// One tick request to `tick_loop`.
-pub enum TickTrigger {
+/// One tick request to `tick_loop`. Minted only by `request_drain`,
+/// `request_quiesce` and [`Shared::note_commit_rows`].
+enum TickTrigger {
     /// Fire-and-forget trigger from INSERT when a tid crosses the row
     /// coalesce threshold.  Tids come from `tick_rows`.
     Auto,
@@ -101,17 +102,32 @@ pub enum TickTrigger {
     Drain {
         done: oneshot::Sender<Result<(), WireFault>>,
     },
-    /// Pause the tick subsystem for a DDL bundle. On dequeue the tick loop
-    /// signals `acked` — proving no tick is in flight (the loop is serial, so
-    /// the prior tick has returned) and none will start — then blocks on
-    /// `release` until the DDL hands the gate back. This drains any in-flight
-    /// steady-state exchange tick before the DDL broadcasts its `DdlSync`, so no
-    /// worker is mid-epoch (and thus deferring that broadcast) when the client
-    /// is ACKed; see `handle_ddl_txn`.
-    Quiesce {
-        acked: oneshot::Sender<()>,
-        release: oneshot::Receiver<()>,
-    },
+    /// Pause the tick subsystem. On dequeue the loop sends a [`TickPark`] on
+    /// `acked` — proving no tick is in flight (the loop is serial) and none will
+    /// start — then blocks until that token is dropped. The ack therefore also
+    /// means any in-flight exchange tick has drained, which is what
+    /// `handle_ddl_txn` waits on.
+    Quiesce { acked: oneshot::Sender<TickPark> },
+}
+
+/// Holding one parks the tick loop; dropping it is the release, so no path can
+/// forget to send one — the tick loop's `release.await` resolves `None` either
+/// way.
+pub(super) type TickPark = oneshot::Sender<()>;
+
+/// Ask the tick loop to tick everything pending and report the tick's verdict.
+pub(super) fn request_drain(shared: &Shared) -> oneshot::Receiver<Result<(), WireFault>> {
+    let (done, rx) = oneshot::channel();
+    shared.tick_tx.send(TickTrigger::Drain { done });
+    rx
+}
+
+/// Ask the tick loop to park. The reply carries the token whose drop releases
+/// it; `None` means the tick loop was already gone, so there is nothing parked.
+pub(super) fn request_quiesce(shared: &Shared) -> oneshot::Receiver<TickPark> {
+    let (acked, rx) = oneshot::channel();
+    shared.tick_tx.send(TickTrigger::Quiesce { acked });
+    rx
 }
 
 /// Send a committer barrier of `kind` and wait for it to resolve.
@@ -127,27 +143,19 @@ pub struct Shared {
     dispatcher: Rc<MasterDispatcher>,
     committer_tx: chan::Sender<CommitRequest>,
     catalog_rwlock: Rc<AsyncRwLock>,
-    /// Tick trigger sender; senders include the committer (auto-trigger on
-    /// threshold cross) and SCAN (explicit drain).
-    pub(super) tick_tx: chan::Sender<TickTrigger>,
+    /// Tick trigger sender. Reached only through `request_drain`,
+    /// `request_quiesce` and [`Shared::note_commit_rows`], so every trigger this
+    /// process sends is minted in one place.
+    tick_tx: chan::Sender<TickTrigger>,
     /// Zone-LSN allocation high-water + durability watermark, read by the
     /// committer so SCAN/SEEK handlers report the same LSN it assigns.
     pub(super) lsn_alloc: ZoneLsnAllocator,
     last_tick_lsn: Cell<u64>,
-    /// One-shot "checkpoint before the next batch" request, for the one path that
-    /// needs a checkpoint on an otherwise-idle server where `sal_needs_checkpoint`
-    /// would stay false: `commit_pushes` when a transaction is rejected for
-    /// transient SAL overflow, so the client's retry finds a reclaimed SAL.
-    ///
-    /// Consumed with `take()` in the committer's checkpoint decision, which only
-    /// reaches it outside a DDL window — so a request raised inside one survives
-    /// until the window closes.
-    pub(super) force_checkpoint: Cell<bool>,
     /// Tables with a pending delta, each with the row count feeding the tick
     /// threshold. `run_tick` writes one `Tick` group per tid inside one
     /// `sal_writer_excl` window before awaiting any ACK, so the order the map
     /// yields them in only changes the order the workers see the groups in.
-    pub(super) tick_rows: RefCell<FxHashMap<i64, usize>>,
+    tick_rows: RefCell<FxHashMap<i64, usize>>,
     /// Per-table write serialization. A push whose validation reads committed
     /// state (`push_reads_committed_state`) and every transaction take the write
     /// guard; a push that reads no committed state takes the read guard, so
@@ -301,12 +309,20 @@ impl Shared {
         self.disp().forget_delta_round(id);
     }
 
-    /// True iff some pending tid has crossed the row coalesce threshold. The
-    /// committer's send condition for [`TickTrigger::Auto`]: below it a push
-    /// only accumulates rows against the threshold, so nothing is ticked until
-    /// some tid crosses it or a read asks for a drain.
-    pub(super) fn any_threshold_crossed(&self) -> bool {
-        self.tick_rows.borrow().values().any(|&rows| rows >= TICK_COALESCE_ROWS)
+    /// Credit `rows` against each tid's pending-tick count and fire the auto-tick
+    /// if any tid now stands at or above the coalesce threshold. Below it a push
+    /// only accumulates, and nothing ticks until a read asks for a drain.
+    pub(super) fn note_commit_rows(&self, rows: impl Iterator<Item = (i64, usize)>) {
+        let crossed = {
+            let mut pending = self.tick_rows.borrow_mut();
+            for (tid, n) in rows {
+                *pending.entry(tid).or_insert(0) += n;
+            }
+            pending.values().any(|&rows| rows >= TICK_COALESCE_ROWS)
+        };
+        if crossed {
+            self.tick_tx.send(TickTrigger::Auto);
+        }
     }
 
     /// Drain the pending tids into `out`, dropping any a DDL has since dropped —
@@ -389,7 +405,6 @@ impl ServerExecutor {
             tick_tx,
             lsn_alloc: ZoneLsnAllocator::new(initial_lsn),
             last_tick_lsn: Cell::new(initial_lsn),
-            force_checkpoint: Cell::new(false),
             tick_rows: RefCell::new(FxHashMap::default()),
             table_locks: RefCell::new(FxHashMap::default()),
             draining: Cell::new(false),
@@ -669,15 +684,15 @@ async fn watchdog(shared: Rc<Shared>) {
         // On a write workload it is inert: the committer already checkpoints at
         // 3/4 on every push, well before this 7/8 line. Skipped inside a DDL
         // window, where the committer refuses every checkpoint anyway.
-        if shared.ddl_window.get() == 0 && shared.disp().relay_fit(0) != SalFit::Fits {
-            let (tx, done) = oneshot::channel();
+        if shared.ddl_window.get() == 0 && shared.disp().sal_space_low() {
+            let (done_tx, done_rx) = oneshot::channel();
             shared.committer_tx.send(CommitRequest::Barrier {
                 kind: BarrierKind::Reclaim { forced: false },
-                done: tx,
+                done: done_tx,
             });
             // Fire-and-forget: dropping the receiver is the whole point, not an
             // RAII hold.
-            drop(done);
+            drop(done_rx);
         }
     }
 }
@@ -708,7 +723,8 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
     loop {
         let first = match rx.recv().await {
             Some(t) => t,
-            None => return, // all senders dropped — clean shutdown
+            // Needs an arm but cannot arrive; see the committer's `rx.recv()`.
+            None => return,
         };
         triggers.push(first);
 
@@ -723,9 +739,10 @@ async fn tick_loop(shared: Rc<Shared>, mut rx: chan::Receiver<TickTrigger>) {
         // answered after the tick below.
         for trigger in triggers.drain(..) {
             match trigger {
-                TickTrigger::Quiesce { acked, release } => {
-                    acked.send(());
-                    let _ = release.await;
+                TickTrigger::Quiesce { acked } => {
+                    let (release_tx, release_rx) = oneshot::channel();
+                    acked.send(release_tx);
+                    let _ = release_rx.await;
                 }
                 TickTrigger::Drain { done } => dones.push(done),
                 TickTrigger::Auto => {}
@@ -1836,10 +1853,8 @@ enum ReadFreshness {
 /// its views are stale, and serving them under `STATUS_OK` is a silent stale read.
 async fn drain_and_relock(shared: &Rc<Shared>, guard: ReadGuard) -> Result<ReadGuard, WireFault> {
     drop(guard);
-    let (tx, rx) = oneshot::channel::<Result<(), WireFault>>();
-    shared.tick_tx.send(TickTrigger::Drain { done: tx });
     // A cancelled receiver means the tick loop is gone; treat it as done.
-    if let Some(Err(e)) = rx.await {
+    if let Some(Err(e)) = request_drain(shared).await {
         return Err(e);
     }
     Ok(shared.catalog_rwlock.read().await)

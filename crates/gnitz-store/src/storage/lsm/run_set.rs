@@ -229,8 +229,8 @@ fn consolidate_batches(batches: &[MemBatch], schema: &SchemaDescriptor) -> Batch
     let total_blob: usize = batches.iter().map(|b| b.blob.len()).sum();
 
     // Consolidate and count survivors first, so the output arena — whose
-    // zero-fill and allocation dominate the flush provision cost — is sized to
-    // the post-cancellation row count, not the Σ-input upper bound. Aggregation
+    // allocation dominates the flush provision cost — is sized to the
+    // post-cancellation row count, not the Σ-input upper bound. Aggregation
     // trace folds cancel heavily (retract + insert per re-aggregated group), so
     // `survivors.len()` is routinely a fraction of the input row count. The blob
     // bound stays `total_blob` (survivors' blobs are a subset; blob is reserved,

@@ -297,6 +297,15 @@ impl Batch {
         }
     }
 
+    /// [`Self::with_capacity`] with the blob heap pre-sized. For the callers that
+    /// know the byte count up front; `with_capacity` leaves it empty because most
+    /// writers do not.
+    pub fn with_capacity_blob(schema: SchemaDescriptor, rows: usize, blob_bytes: usize) -> Self {
+        let mut b = Self::with_capacity(schema, rows);
+        b.blob = acquire_arena(blob_bytes, Fill::Reserve);
+        b
+    }
+
     /// `rows` all-zero rows, already published. The one shape [`Self::with_capacity`]
     /// cannot serve: a test that needs a batch of a given wire size but no
     /// particular content, and so writes no rows at all.
@@ -1797,10 +1806,7 @@ pub(crate) fn write_to_batch(
     max_blob: usize,
     write_fn: impl FnOnce(&mut merge::DirectWriter),
 ) -> Batch {
-    let mut b = Batch::with_capacity(*schema, max_rows);
-    if max_blob > 0 {
-        b.blob = acquire_arena(max_blob, Fill::Reserve);
-    }
+    let mut b = Batch::with_capacity_blob(*schema, max_rows, max_blob);
     let rows = {
         // `b.capacity`, not `max_rows`: the writer must carve at the offsets the
         // batch will read back through.

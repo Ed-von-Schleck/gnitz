@@ -248,8 +248,8 @@ impl<'a> CommittedTail<'a> {
     /// `sal_writer_excl`), so the span this finds is the zone's own.
     ///
     /// "Decodes" is not "carries rows": a push whose rows all land on one worker
-    /// leaves the other slots a control block and a schema block with no data
-    /// block, which is correctly a no-op on replay.
+    /// leaves the other slots a control block alone — no schema and no data
+    /// block — which is correctly a no-op on replay.
     fn zone_blocks_decode(&self, zone: &Zone) -> bool {
         for step in self.log.walk_from(zone.start, self.epoch) {
             let SalStep::Group(msg, _) = step else {

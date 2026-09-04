@@ -17,14 +17,16 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use super::{await_barrier, decode_client_batch, guard_panic, park_until, send_fault, send_msg, Shared, TickTrigger};
+use super::{
+    await_barrier, decode_client_batch, guard_panic, park_until, request_quiesce, send_fault, send_msg, Shared,
+    TickPark,
+};
 use crate::catalog::{family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates, SysFamily};
 use crate::runtime::committer::BarrierKind;
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::UniqueFilter;
 use crate::runtime::peer::Peer;
-use crate::runtime::reactor::{oneshot, FsyncFuture};
-use crate::runtime::sal::SalFit;
+use crate::runtime::reactor::FsyncFuture;
 use crate::runtime::wire as ipc;
 use gnitz_store::foundation::fault::Seam;
 use gnitz_store::storage::Batch;
@@ -55,9 +57,9 @@ static DDL_QUIESCE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 /// A depth rather than a flag: at shutdown the tick loop returns and drops every
 /// queued `Quiesce` sender at once, so several `enter`s resolve together.
 struct TickGate {
-    /// Dropping it is the release signal — the tick loop's `release.await`
-    /// resolves `None`, so nothing has to send.
-    _release: oneshot::Sender<()>,
+    /// See [`TickPark`]: dropping it releases the tick loop. `None` when the
+    /// loop was already gone — nothing parked, nothing to release.
+    _release: Option<TickPark>,
     shared: Rc<Shared>,
 }
 
@@ -65,19 +67,14 @@ impl TickGate {
     /// Park the tick loop and enter a DDL window. Returns once the loop has
     /// acked — no tick is in flight and none will start until this gate drops.
     async fn enter(shared: &Rc<Shared>) -> Self {
-        let (acked_tx, acked_rx) = oneshot::channel::<()>();
-        let (release_tx, release_rx) = oneshot::channel::<()>();
-        shared.tick_tx.send(TickTrigger::Quiesce {
-            acked: acked_tx,
-            release: release_rx,
-        });
+        let acked_rx = request_quiesce(shared);
         if RELAY_HOLD_FOR_DDL.armed() {
             DDL_QUIESCE_REQUESTS.fetch_add(1, Ordering::Relaxed);
         }
-        let _ = acked_rx.await;
+        let park = acked_rx.await;
         shared.ddl_window.set(shared.ddl_window.get() + 1);
         TickGate {
-            _release: release_tx,
+            _release: park,
             shared: Rc::clone(shared),
         }
     }
@@ -221,18 +218,15 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         .unwrap_or_default();
     let view_create = !new_view_ids.is_empty();
 
-    // No checkpoint runs inside a DDL window, and this bundle's emission comes
-    // after its in-memory catalog mutation, where a refusal is unrecoverable. So
-    // reclaim out here, where the space question still has an answer.
-    if shared.disp().relay_fit(0) != SalFit::Fits {
-        await_barrier(shared, BarrierKind::Reclaim { forced: true }).await;
-    }
-
     // Drain the committer barrier BEFORE acquiring the catalog write lock. The
     // barrier flushes user-table WAL and waits for worker ACKs (tens of ms under
     // load); holding the write lock across that wait would block every concurrent
     // SCAN/SEEK read for no reason — no catalog mutation happens until after the
     // barrier returns.
+    //
+    // It is also where this bundle's SAL space comes from: the committer answers
+    // this barrier with a full checkpoint whenever the SAL is low, and no
+    // checkpoint can run once the window below is open.
     await_barrier(shared, BarrierKind::Ddl).await;
 
     // Quiesce the ticks before the write lock (run_tick/relay_loop take the read
