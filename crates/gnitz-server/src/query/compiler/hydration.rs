@@ -56,10 +56,7 @@ fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, CompileErro
             // The linear shape: the whole program replays over the source store,
             // seeded at this `ScanDelta`'s own register.
             OpNode::ScanDelta { source, .. } => {
-                return Ok(HydrationNodes::Relation {
-                    nid: cur,
-                    source: *source as i64,
-                })
+                return Ok(HydrationNodes::Relation { nid: cur, source: *source as i64 })
             }
             OpNode::Union => break,
             _ => return Err(CompileError::Rejected("bounded view: unsupported circuit shape")),

@@ -49,10 +49,7 @@ pub(crate) fn lower_join_view(
     where_preds: &[HirExpr],
     join: &RelExpr,
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
-    let down = Demand {
-        items: project_items,
-        where_preds,
-    };
+    let down = Demand { items: project_items, where_preds };
     let pieces = emit_step(chain, memo, down, join)?;
     // The emitted pk-list is the synthetic key region; its width is the number of
     // identity-free slots the layout leads with.
@@ -67,10 +64,7 @@ fn emit_step(
     down: Demand<'_>,
     join: &RelExpr,
 ) -> Result<EmitPieces, GnitzSqlError> {
-    let RelExpr::Join {
-        left, right, kind, on, ..
-    } = join
-    else {
+    let RelExpr::Join { left, right, kind, on, .. } = join else {
         unreachable!("emit_step receives a Join");
     };
     let class = on.class()?;
@@ -1176,10 +1170,7 @@ fn band_union_schema(all_tcs: &[TypeCode], left: &Schema, right: &Schema) -> Sch
     }
     cols.extend(left.columns.iter().cloned());
     cols.extend(right.columns.iter().cloned());
-    Schema {
-        columns: cols,
-        pk_cols: (0..k).collect(),
-    }
+    Schema { columns: cols, pk_cols: (0..k).collect() }
 }
 
 /// Union the pure-range NULL-range-key rows into `nf_match` (`A − matched`):

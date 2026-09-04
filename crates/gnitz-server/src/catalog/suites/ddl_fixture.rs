@@ -59,14 +59,7 @@ impl CatalogEngine {
         // Write schema record
         let schema = SysFamily::Schema.schema();
         let mut bb = BatchBuilder::new(schema);
-        write_schema_tab_row(
-            &mut bb,
-            &SchemaTabRow {
-                schema_id: sid as u64,
-                name,
-            },
-            1,
-        );
+        write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id: sid as u64, name }, 1);
         let batch = bb.finish();
 
         // Submit the schemas-family delta (triggers hook).
@@ -114,14 +107,7 @@ impl CatalogEngine {
         // this row.
         let schema = SysFamily::Schema.schema();
         let mut bb = BatchBuilder::new(schema);
-        write_schema_tab_row(
-            &mut bb,
-            &SchemaTabRow {
-                schema_id: sid as u64,
-                name,
-            },
-            -1,
-        );
+        write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id: sid as u64, name }, -1);
         let batch = bb.finish();
 
         self.submit(SysFamily::Schema, batch)?;
@@ -256,10 +242,7 @@ impl CatalogEngine {
             owner_id,
             packed_cols,
             &index_name,
-            gnitz_wire::IndexProps {
-                is_unique,
-                is_internal: false,
-            },
+            gnitz_wire::IndexProps { is_unique, is_internal: false },
             1,
         );
         self.precheck_family(SysFamily::Index, &batch)?;
@@ -274,10 +257,7 @@ impl CatalogEngine {
                 owner_id,
                 packed_cols,
                 &index_name,
-                gnitz_wire::IndexProps {
-                    is_unique,
-                    is_internal: false,
-                },
+                gnitz_wire::IndexProps { is_unique, is_internal: false },
                 -1,
             );
             self.rollback_index_registration(undo, index_id).unwrap();

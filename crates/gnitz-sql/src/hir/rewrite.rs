@@ -49,13 +49,7 @@ fn classify_rel(rel: Rc<RelExpr>, memo: &mut RewriteMemo) -> Result<Rc<RelExpr>,
     }
     let out = match rel.as_ref() {
         RelExpr::Filter { input, preds } if matches!(input.as_ref(), RelExpr::Join { .. }) => {
-            let inner = matches!(
-                input.as_ref(),
-                RelExpr::Join {
-                    kind: JoinType::Inner,
-                    ..
-                }
-            );
+            let inner = matches!(input.as_ref(), RelExpr::Join { kind: JoinType::Inner, .. });
             // INNER: `ON p WHERE q ≡ ON (p AND q)`, so the WHERE joins the ON in one
             // classification and may key the join. OUTER: it is a 3VL filter over the
             // post-null-fill output, so it stays above and contributes no key.
@@ -82,15 +76,7 @@ fn classify_join(rel: &Rc<RelExpr>, extra: &[HirExpr], memo: &mut RewriteMemo) -
     if let Some(done) = key.and_then(|k| memo.get(&k)) {
         return Ok(Rc::clone(done));
     }
-    let RelExpr::Join {
-        left,
-        right,
-        kind,
-        on,
-        mark,
-        ..
-    } = rel.as_ref()
-    else {
+    let RelExpr::Join { left, right, kind, on, mark, .. } = rel.as_ref() else {
         unreachable!("classify_join receives a Join");
     };
     let left_cols = left.cols();
@@ -99,13 +85,7 @@ fn classify_join(rel: &Rc<RelExpr>, extra: &[HirExpr], memo: &mut RewriteMemo) -
     // A left-deep spine puts every step's WHERE above the TOP join, so a conjunct
     // naming only left-input columns keys a step further down. Hand those there —
     // but never below an outer join, which would run them before its null-fill.
-    let inner_left = matches!(
-        left.as_ref(),
-        RelExpr::Join {
-            kind: JoinType::Inner,
-            ..
-        }
-    );
+    let inner_left = matches!(left.as_ref(), RelExpr::Join { kind: JoinType::Inner, .. });
     let (here, deeper): (Vec<HirExpr>, Vec<HirExpr>) = extra
         .iter()
         .cloned()
@@ -233,11 +213,7 @@ fn absorb_conjuncts(
         let failed = match (op, binop_to_range_rel(op)) {
             (BinOp::Eq, _) if fits(1) => match validate_join_key_pair(left_def, right_def) {
                 Ok(tc) => {
-                    class.eq.push(EqPair {
-                        left: lc,
-                        right: rc,
-                        tc,
-                    });
+                    class.eq.push(EqPair { left: lc, right: rc, tc });
                     continue;
                 }
                 Err(e) => e,

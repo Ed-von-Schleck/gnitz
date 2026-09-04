@@ -144,11 +144,7 @@ fn table_flags_roundtrip() {
     for &replicated in &[false, true] {
         for &stream in &[false, true] {
             for dist_prefix_len in 0..=PK_LIST_MAX_COLS {
-                let p = TableProps {
-                    replicated,
-                    stream,
-                    dist_prefix_len,
-                };
+                let p = TableProps { replicated, stream, dist_prefix_len };
                 assert_eq!(TableProps::from_flags(p.pack()), p);
             }
         }
@@ -156,11 +152,7 @@ fn table_flags_roundtrip() {
     // `TABLE_TAB.flags` is persisted, so the bit *positions* are a wire
     // contract: pinned as literals, since comparing against the constants the
     // packer is written from would hold for any value it gave them.
-    let props = |replicated, stream, dist_prefix_len| TableProps {
-        replicated,
-        stream,
-        dist_prefix_len,
-    };
+    let props = |replicated, stream, dist_prefix_len| TableProps { replicated, stream, dist_prefix_len };
     assert_eq!(props(true, false, 0).pack(), 0b01);
     assert_eq!(props(false, true, 0).pack(), 0b10);
     assert_eq!(props(false, false, 2).pack(), 2 << 8);

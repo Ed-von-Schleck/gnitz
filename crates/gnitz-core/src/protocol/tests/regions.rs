@@ -64,10 +64,7 @@ fn pk12(k0: i64, k1: u32) -> [u8; 12] {
 }
 
 fn fixture_a_batch() -> ZSetBatch {
-    let mut pks = PkColumn {
-        stride: 12,
-        buf: Vec::new(),
-    };
+    let mut pks = PkColumn { stride: 12, buf: Vec::new() };
     for row in 0..3 {
         pks.push_bytes(&pk12(PK3[row], PK0[row]));
     }
@@ -172,9 +169,7 @@ fn locate_addresses_the_pk_region_the_builder_hands_out() {
             let pk: Vec<gnitz_expr::PkColExpect<'_>> = want
                 .iter()
                 .map(|&(ci, vals)| match SchemaFacts::locate(schema, ci) {
-                    gnitz_expr::ColumnLocator::Pk {
-                        byte_off, type_code, ..
-                    } => (type_code, byte_off as usize, vals),
+                    gnitz_expr::ColumnLocator::Pk { byte_off, type_code, .. } => (type_code, byte_off as usize, vals),
                     other => panic!("column {ci} must locate to the PK region, got {other:?}"),
                 })
                 .collect();
@@ -276,11 +271,7 @@ fn filter_over_the_region_path() {
         vec![
             LogicalInstr::LoadColInt { col: 2 },
             LogicalInstr::LoadConst { val: 0 },
-            LogicalInstr::Cmp {
-                op: CmpOp::Gt,
-                a: Reg(0),
-                b: Reg(1),
-            },
+            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         ],
         Vec::new(),
         Some(Reg(2)),
@@ -303,11 +294,7 @@ fn string_columns_compare_through_the_shared_blob_heap() {
 
     // STRING (ci4) vs BLOB (ci5): both pass `check_col(GermanString)`.
     let ev = LogicalProgram::new(
-        vec![LogicalInstr::StrColCol {
-            op: CmpOp::Lt,
-            col_a: 4,
-            col_b: 5,
-        }],
+        vec![LogicalInstr::StrColCol { op: CmpOp::Lt, col_a: 4, col_b: 5 }],
         Vec::new(),
         Some(Reg(0)),
         vec![],

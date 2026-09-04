@@ -137,10 +137,7 @@ pub(crate) fn execute_insert(
                     .to_string(),
             ));
         }
-        Some(OnInsert::OnConflict(OnConflict {
-            conflict_target,
-            action,
-        })) => {
+        Some(OnInsert::OnConflict(OnConflict { conflict_target, action })) => {
             // Both actions resolve the incoming row against existing rows with a
             // client-side seek before pushing, and a stream has no store to seek.
             if is_stream {
@@ -301,10 +298,7 @@ pub(crate) fn execute_insert(
             match proj {
                 Some(proj) => {
                     let (proj_schema, proj_batch) = project(proj, schema, returned);
-                    Ok(SqlResult::Rows {
-                        schema: proj_schema,
-                        batch: proj_batch,
-                    })
+                    Ok(SqlResult::Rows { schema: proj_schema, batch: proj_batch })
                 }
                 None => Ok(SqlResult::RowsAffected { count: n }),
             }
@@ -628,11 +622,7 @@ fn extract_values_rows(query: &Query) -> Result<&[Parens<Vec<Expr>>], GnitzSqlEr
     match query.body.as_ref() {
         // Inert MySQL spellings of `VALUES (…)`: `VALUES ROW(…)` and `VALUE (…)`
         // parse to the same `rows`, so the row inserted is identical.
-        SetExpr::Values(Values {
-            rows,
-            explicit_row: _,
-            value_keyword: _,
-        }) => Ok(rows),
+        SetExpr::Values(Values { rows, explicit_row: _, value_keyword: _ }) => Ok(rows),
         _ => Err(GnitzSqlError::Unsupported(
             "INSERT only supports VALUES (not INSERT INTO ... SELECT)".to_string(),
         )),

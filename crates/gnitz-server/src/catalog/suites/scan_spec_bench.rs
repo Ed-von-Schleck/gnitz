@@ -121,11 +121,7 @@ fn scan_spec_sinks_bench() {
             eb.emit(gnitz_expr::LogicalInstr::LoadColInt { col: 3 }),
             eb.emit(gnitz_expr::LogicalInstr::LoadColInt { col: 4 }),
         );
-        let sum = eb.emit(gnitz_expr::LogicalInstr::IntArith {
-            op: gnitz_expr::IntArithOp::Add,
-            a,
-            b,
-        });
+        let sum = eb.emit(gnitz_expr::LogicalInstr::IntArith { op: gnitz_expr::IntArithOp::Add, a, b });
         eb.sink(gnitz_expr::Sink::Reg(sum));
         eb.sink(gnitz_expr::Sink::Col(1));
         eb.build(None).expect("a well-formed program").to_blob_bytes()
@@ -137,11 +133,7 @@ fn scan_spec_sinks_bench() {
     });
 
     // ORDER BY .. LIMIT — the bounded top-k arm and its `topk_keep` compactions.
-    let order = vec![OrderKey {
-        col: 1,
-        desc: false,
-        nulls_first: false,
-    }];
+    let order = vec![OrderKey { col: 1, desc: false, nulls_first: false }];
     let spec = rows_spec(contiguous.clone(), gather3.clone(), order, 100);
     cell("rows, ORDER BY .. LIMIT 100 (top-k)", n, || {
         e.scan_spec_family(tid, &spec, &reply3, 0).unwrap()
@@ -162,14 +154,8 @@ fn scan_spec_sinks_bench() {
     let agg = AggReadSpec::direct(
         vec![1],
         vec![
-            AggDescriptor {
-                agg_op: AggFunc::Count,
-                col_idx: 0,
-            },
-            AggDescriptor {
-                agg_op: AggFunc::Sum,
-                col_idx: 3,
-            },
+            AggDescriptor { agg_op: AggFunc::Count, col_idx: 0 },
+            AggDescriptor { agg_op: AggFunc::Sum, col_idx: 3 },
         ],
     );
     // SyntheticFold reply: `_agg_pk` U128 PK, the group column, then one partial

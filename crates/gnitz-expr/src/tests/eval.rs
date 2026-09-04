@@ -87,11 +87,7 @@ fn filter_ranges_collects_into_a_reused_buffer() {
         vec![
             LogicalInstr::LoadColInt { col: 1 },
             LogicalInstr::LoadConst { val: 0 },
-            LogicalInstr::Cmp {
-                op: CmpOp::Gt,
-                a: Reg(0),
-                b: Reg(1),
-            },
+            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         ],
         Reg(2),
         vec![],
@@ -115,13 +111,9 @@ fn filter_agrees_with_the_row_read() {
     let schema = schema_pk_ints(1, true);
     // Pass iff col[1] > 15.
     let instrs = vec![
-        LogicalInstr::LoadColInt { col: 1 }, // r0 = col[1] (payload[0])
-        LogicalInstr::LoadConst { val: 15 }, // r1 = 15
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(0),
-            b: Reg(1),
-        }, // r2 = r0 > r1
+        LogicalInstr::LoadColInt { col: 1 },                       // r0 = col[1] (payload[0])
+        LogicalInstr::LoadConst { val: 15 },                       // r1 = 15
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) }, // r2 = r0 > r1
     ];
     let ev = filter_prog(&schema, instrs, Reg(2), vec![]);
 
@@ -209,11 +201,7 @@ fn filter_range_case(schema: TestSchema) {
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
         LogicalInstr::LoadConst { val: 0 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(0),
-            b: Reg(1),
-        },
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
     ];
     let ev = filter_prog(&schema, instrs, Reg(2), vec![]);
 
@@ -283,36 +271,16 @@ fn three_and_chain_boundary_sweep() {
 
     for (label, k0, value, null_at) in arrangements {
         let instrs = vec![
-            LogicalInstr::LoadColInt { col: 1 }, // r0 = col0
-            LogicalInstr::LoadConst { val: k0 }, // r1 = k0
-            LogicalInstr::Cmp {
-                op: CmpOp::Gt,
-                a: Reg(0),
-                b: Reg(1),
-            }, // r2 = col0 > k0
-            LogicalInstr::LoadColInt { col: 2 }, // r3 = col1
-            LogicalInstr::LoadConst { val: 1 },  // r4 = 1
-            LogicalInstr::Cmp {
-                op: CmpOp::Gt,
-                a: Reg(3),
-                b: Reg(4),
-            }, // r5 = col1 > 1
-            LogicalInstr::BoolBinary {
-                is_or: false,
-                a: Reg(2),
-                b: Reg(5),
-            }, // r6 = r2 AND r5
-            LogicalInstr::LoadColInt { col: 3 }, // r7 = col2
-            LogicalInstr::Cmp {
-                op: CmpOp::Gt,
-                a: Reg(7),
-                b: Reg(4),
-            }, // r8 = col2 > 1
-            LogicalInstr::BoolBinary {
-                is_or: false,
-                a: Reg(6),
-                b: Reg(8),
-            }, // r9 = r6 AND r8  (result_reg)
+            LogicalInstr::LoadColInt { col: 1 },                             // r0 = col0
+            LogicalInstr::LoadConst { val: k0 },                             // r1 = k0
+            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },       // r2 = col0 > k0
+            LogicalInstr::LoadColInt { col: 2 },                             // r3 = col1
+            LogicalInstr::LoadConst { val: 1 },                              // r4 = 1
+            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(4) },       // r5 = col1 > 1
+            LogicalInstr::BoolBinary { is_or: false, a: Reg(2), b: Reg(5) }, // r6 = r2 AND r5
+            LogicalInstr::LoadColInt { col: 3 },                             // r7 = col2
+            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(7), b: Reg(4) },       // r8 = col2 > 1
+            LogicalInstr::BoolBinary { is_or: false, a: Reg(6), b: Reg(8) }, // r9 = r6 AND r8  (result_reg)
         ];
 
         for &n in &[1, 7, 63, 64, 65, 127, 128, 255, 256, 257, 300] {
@@ -354,14 +322,10 @@ fn bit_only_not_3vl_truth_table() {
 
         // Filter: NOT(col1 != 0). result_reg = NOT result (bit_only eligible).
         let instrs = vec![
-            LogicalInstr::LoadColInt { col: 1 }, // r0 = col1
-            LogicalInstr::LoadConst { val: 0 },  // r1 = 0
-            LogicalInstr::Cmp {
-                op: CmpOp::Ne,
-                a: Reg(0),
-                b: Reg(1),
-            }, // r2 = bool(col1)
-            LogicalInstr::BoolNot { a: Reg(2) }, // r3 = NOT r2
+            LogicalInstr::LoadColInt { col: 1 },                       // r0 = col1
+            LogicalInstr::LoadConst { val: 0 },                        // r1 = 0
+            LogicalInstr::Cmp { op: CmpOp::Ne, a: Reg(0), b: Reg(1) }, // r2 = bool(col1)
+            LogicalInstr::BoolNot { a: Reg(2) },                       // r3 = NOT r2
         ];
         let kind = filter_prog(&schema, instrs, Reg(3), vec![]);
         let passed = !passing_ranges(&kind, &mb).is_empty();
@@ -415,11 +379,7 @@ fn is_not_null_and_over_partial_word() {
     let instrs = vec![
         is_not_null_op(1),
         is_not_null_op(2),
-        LogicalInstr::BoolBinary {
-            is_or: false,
-            a: Reg(0),
-            b: Reg(1),
-        },
+        LogicalInstr::BoolBinary { is_or: false, a: Reg(0), b: Reg(1) },
     ];
     let kind = filter_prog(&schema, instrs, Reg(2), vec![]);
 
@@ -456,11 +416,7 @@ fn bool_not_tail_mask() {
         let instrs = vec![
             LogicalInstr::LoadColInt { col: 1 },
             LogicalInstr::LoadConst { val: 0 },
-            LogicalInstr::Cmp {
-                op: CmpOp::Ge,
-                a: Reg(0),
-                b: Reg(1),
-            },
+            LogicalInstr::Cmp { op: CmpOp::Ge, a: Reg(0), b: Reg(1) },
             LogicalInstr::BoolNot { a: Reg(2) },
         ];
         let ev = filter_prog(&schema, instrs, Reg(3), vec![]);
@@ -518,11 +474,7 @@ fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
                 vec![
                     is_null_op(1),
                     is_not_null_op(2),
-                    LogicalInstr::BoolBinary {
-                        is_or: false,
-                        a: Reg(0),
-                        b: Reg(1),
-                    },
+                    LogicalInstr::BoolBinary { is_or: false, a: Reg(0), b: Reg(1) },
                 ],
                 Reg(2),
             ),
@@ -533,11 +485,7 @@ fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
                 vec![
                     is_null_op(1),
                     is_null_op(2),
-                    LogicalInstr::BoolBinary {
-                        is_or: true,
-                        a: Reg(0),
-                        b: Reg(1),
-                    },
+                    LogicalInstr::BoolBinary { is_or: true, a: Reg(0), b: Reg(1) },
                 ],
                 Reg(2),
             ),
@@ -555,17 +503,9 @@ fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
                 vec![
                     is_null_op(1),
                     is_null_op(2),
-                    LogicalInstr::BoolBinary {
-                        is_or: false,
-                        a: Reg(0),
-                        b: Reg(1),
-                    },
+                    LogicalInstr::BoolBinary { is_or: false, a: Reg(0), b: Reg(1) },
                     is_null_op(3),
-                    LogicalInstr::BoolBinary {
-                        is_or: false,
-                        a: Reg(2),
-                        b: Reg(3),
-                    },
+                    LogicalInstr::BoolBinary { is_or: false, a: Reg(2), b: Reg(3) },
                 ],
                 Reg(4),
             ),
@@ -580,11 +520,7 @@ fn null_test_shapes() -> Vec<(&'static str, FilterShape)> {
                     is_null_op(1),
                     LogicalInstr::LoadConst { val: 1 },
                     LogicalInstr::LoadConst { val: 0 },
-                    LogicalInstr::Select {
-                        cond: Reg(0),
-                        a: Reg(1),
-                        b: Reg(2),
-                    },
+                    LogicalInstr::Select { cond: Reg(0), a: Reg(1), b: Reg(2) },
                 ],
                 Reg(3),
             ),
@@ -706,11 +642,7 @@ fn not_null_load_shapes() -> Vec<(&'static str, FilterShape, bool)> {
                 vec![
                     LogicalInstr::LoadColInt { col: 1 },
                     LogicalInstr::LoadConst { val: 0 },
-                    LogicalInstr::Cmp {
-                        op: CmpOp::Gt,
-                        a: Reg(0),
-                        b: Reg(1),
-                    },
+                    LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
                 ],
                 Reg(2),
             ),
@@ -723,11 +655,7 @@ fn not_null_load_shapes() -> Vec<(&'static str, FilterShape, bool)> {
                     LogicalInstr::LoadColFloat { col: 2 },
                     LogicalInstr::LoadConst { val: 3 },
                     LogicalInstr::IntToFloat { a: Reg(1) },
-                    LogicalInstr::FCmp {
-                        op: CmpOp::Gt,
-                        a: Reg(0),
-                        b: Reg(2),
-                    },
+                    LogicalInstr::FCmp { op: CmpOp::Gt, a: Reg(0), b: Reg(2) },
                 ],
                 Reg(3),
             ),
@@ -739,11 +667,7 @@ fn not_null_load_shapes() -> Vec<(&'static str, FilterShape, bool)> {
                 vec![
                     LogicalInstr::LoadColStr { col: 3 },
                     LogicalInstr::LoadConstStr { const_idx: ConstIdx(0) },
-                    LogicalInstr::StrCmp {
-                        op: CmpOp::Lt,
-                        a: Reg(0),
-                        b: Reg(1),
-                    },
+                    LogicalInstr::StrCmp { op: CmpOp::Lt, a: Reg(0), b: Reg(1) },
                 ],
                 Reg(2),
             ),
@@ -764,11 +688,7 @@ fn not_null_load_shapes() -> Vec<(&'static str, FilterShape, bool)> {
         (
             "str_col_col",
             (
-                vec![LogicalInstr::StrColCol {
-                    op: CmpOp::Lt,
-                    col_a: 3,
-                    col_b: 4,
-                }],
+                vec![LogicalInstr::StrColCol { op: CmpOp::Lt, col_a: 3, col_b: 4 }],
                 Reg(0),
             ),
             false,
@@ -910,11 +830,7 @@ fn nullable_and_not_null_columns_side_by_side() {
             col: 4,
             const_idx: ConstIdx(0),
         },
-        LogicalInstr::StrColCol {
-            op: CmpOp::Lt,
-            col_a: 3,
-            col_b: 4,
-        },
+        LogicalInstr::StrColCol { op: CmpOp::Lt, col_a: 3, col_b: 4 },
     ];
     let ev = scalar_prog(&schema, instrs, Reg(0), vec![b"m".to_vec()]);
     assert!(
@@ -978,22 +894,10 @@ fn or_does_not_take_a_null_row_stored_value_as_definite_true() {
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
         LogicalInstr::LoadConst { val: 5 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(0),
-            b: Reg(1),
-        },
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         LogicalInstr::LoadColInt { col: 2 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(3),
-            b: Reg(1),
-        },
-        LogicalInstr::BoolBinary {
-            is_or: true,
-            a: Reg(2),
-            b: Reg(4),
-        },
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(1) },
+        LogicalInstr::BoolBinary { is_or: true, a: Reg(2), b: Reg(4) },
     ];
     let ev = filter_prog(&schema, instrs, Reg(5), vec![]);
     assert_eq!(
@@ -1027,33 +931,13 @@ fn and_chain_null_and_false_per_row() {
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
         LogicalInstr::LoadConst { val: 0 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(0),
-            b: Reg(1),
-        },
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         LogicalInstr::LoadColInt { col: 2 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(3),
-            b: Reg(1),
-        },
-        LogicalInstr::BoolBinary {
-            is_or: false,
-            a: Reg(2),
-            b: Reg(4),
-        },
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(1) },
+        LogicalInstr::BoolBinary { is_or: false, a: Reg(2), b: Reg(4) },
         LogicalInstr::LoadColInt { col: 3 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(6),
-            b: Reg(1),
-        },
-        LogicalInstr::BoolBinary {
-            is_or: false,
-            a: Reg(5),
-            b: Reg(7),
-        },
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(6), b: Reg(1) },
+        LogicalInstr::BoolBinary { is_or: false, a: Reg(5), b: Reg(7) },
     ];
     let ev = filter_prog(&schema, instrs, Reg(8), vec![]);
 
@@ -1085,34 +969,14 @@ fn and_chain_survivors_agree_across_arms() {
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
         LogicalInstr::LoadConst { val: -1 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Eq,
-            a: Reg(0),
-            b: Reg(1),
-        },
+        LogicalInstr::Cmp { op: CmpOp::Eq, a: Reg(0), b: Reg(1) },
         LogicalInstr::LoadColInt { col: 2 },
         LogicalInstr::LoadConst { val: 0 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(3),
-            b: Reg(4),
-        },
-        LogicalInstr::BoolBinary {
-            is_or: false,
-            a: Reg(2),
-            b: Reg(5),
-        },
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(4) },
+        LogicalInstr::BoolBinary { is_or: false, a: Reg(2), b: Reg(5) },
         LogicalInstr::LoadColInt { col: 3 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(7),
-            b: Reg(4),
-        },
-        LogicalInstr::BoolBinary {
-            is_or: false,
-            a: Reg(6),
-            b: Reg(8),
-        },
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(7), b: Reg(4) },
+        LogicalInstr::BoolBinary { is_or: false, a: Reg(6), b: Reg(8) },
     ];
 
     // A survivor is `row % 4 == 0` in both; col1 = col2 = 5 always passes.

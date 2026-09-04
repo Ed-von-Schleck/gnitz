@@ -89,11 +89,7 @@ impl RangeProbe {
             RangeRel::Lt => (false, false),
             RangeRel::Le => (false, true),
         };
-        RangeProbe {
-            eq_size,
-            prefix,
-            nonstrict,
-        }
+        RangeProbe { eq_size, prefix, nonstrict }
     }
 
     /// The trace key range this probe covers for a delta row whose PK region is

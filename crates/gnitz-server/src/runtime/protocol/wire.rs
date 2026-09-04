@@ -84,11 +84,7 @@ impl WireSchema {
         descriptor: SchemaDescriptor,
     ) -> Self {
         let entry = cat.schema_wire_entry(tid, &descriptor);
-        WireSchema {
-            tid,
-            descriptor,
-            block: entry.block,
-        }
+        WireSchema { tid, descriptor, block: entry.block }
     }
 
     pub(crate) fn descriptor(&self) -> &SchemaDescriptor {
@@ -269,11 +265,9 @@ impl<'a> WireMsg<'a> {
         if has_data {
             pos += match self.data {
                 WireData::Whole(b) => b.unwrap().encode_to_wire(self.target_id as u32, out, pos, checksum),
-                WireData::Range {
-                    batch,
-                    start_row,
-                    count,
-                } => batch.encode_range_to_wire(start_row, count, self.target_id as u32, out, pos, checksum),
+                WireData::Range { batch, start_row, count } => {
+                    batch.encode_range_to_wire(start_row, count, self.target_id as u32, out, pos, checksum)
+                }
                 WireData::Scattered { batch, indices, schema } => {
                     batch.encode_scattered_to_wire(indices, schema, self.target_id as u32, out, pos, checksum)
                 }

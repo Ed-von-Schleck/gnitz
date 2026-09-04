@@ -45,14 +45,7 @@ fn only_an_ascii_uppercase_byte_makes_a_name_non_canonical() {
 fn schema_batch(rows: &[(i64, &str, i64)]) -> Batch {
     let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
     for &(schema_id, name, weight) in rows {
-        write_schema_tab_row(
-            &mut bb,
-            &SchemaTabRow {
-                schema_id: schema_id as u64,
-                name,
-            },
-            weight,
-        );
+        write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id: schema_id as u64, name }, weight);
     }
     bb.finish()
 }

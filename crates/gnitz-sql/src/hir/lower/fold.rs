@@ -112,12 +112,7 @@ pub(crate) fn lower_fold(rel: &RelExpr, source_schema: &Arc<Schema>) -> Result<F
         RelExpr::Filter { input, preds } => (preds.as_slice(), input.as_ref()),
         other => (&[][..], other),
     };
-    let RelExpr::Reduce {
-        input,
-        group_cols,
-        aggs,
-    } = reduce
-    else {
+    let RelExpr::Reduce { input, group_cols, aggs } = reduce else {
         return Err(GnitzSqlError::Internal("ad-hoc grouped body has no reduce".into()));
     };
 
@@ -226,11 +221,8 @@ fn lower_distinct_fold(input: &RelExpr, source_schema: &Arc<Schema>) -> Result<F
         "SELECT DISTINCT over a computed column",
     )?;
 
-    let ReduceLayout {
-        schema: partial_schema,
-        group_slots,
-        ..
-    } = fold_partial_schema(&reduce_schema, &group_positions, &[])?;
+    let ReduceLayout { schema: partial_schema, group_slots, .. } =
+        fold_partial_schema(&reduce_schema, &group_positions, &[])?;
     // Every item is a pass-through of its own group slot: the reduce already
     // evaluated a computed one into that slot.
     let finalize = group_slots

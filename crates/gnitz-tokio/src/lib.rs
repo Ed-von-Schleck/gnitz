@@ -127,10 +127,7 @@ impl AsyncClient {
         // A full channel suspends here: `Connection` drains only below
         // `Session::at_capacity`, so back-pressure is a wait, never its error.
         self.tx
-            .send(Submission {
-                encode: Box::new(encode),
-                reply,
-            })
+            .send(Submission { encode: Box::new(encode), reply })
             .await
             .map_err(|_| ClientError::Closed)?;
         rx.await.map_err(|_| ClientError::Closed)?

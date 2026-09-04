@@ -32,11 +32,7 @@ fn set_tiny_rcvbuf(fd: RawFd) {
 /// POLLHUP/POLLERR are output-only and always reported, so buffered-but-unread
 /// data does not wake the poll.
 fn peer_hung_up_within(fd: RawFd, deadline_ms: i32) -> bool {
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLRDHUP,
-        revents: 0,
-    };
+    let mut pfd = libc::pollfd { fd, events: libc::POLLRDHUP, revents: 0 };
     let rc = unsafe { libc::poll(&mut pfd, 1, deadline_ms) };
     rc > 0 && (pfd.revents & (libc::POLLHUP | libc::POLLRDHUP)) != 0
 }
@@ -58,10 +54,7 @@ fn slow_scan_client_is_evicted_after_deadline() {
     let table_id = client
         .create_table(&sn, "t", &cols, &[0], TableProps::default(), &[])
         .unwrap();
-    let schema = Schema {
-        columns: cols,
-        pk_cols: vec![0],
-    };
+    let schema = Schema { columns: cols, pk_cols: vec![0] };
     let mut batch = ZSetBatch::new(&schema);
     let mut app = BatchAppender::new(&mut batch, &schema);
     for pk in 0..40_000u128 {

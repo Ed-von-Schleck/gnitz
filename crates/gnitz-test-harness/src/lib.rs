@@ -320,12 +320,7 @@ fn boot_scaffold() -> BootScaffold {
     let sock_path = tmpdir.path().join("gnitz.sock");
     let stderr_path = tmpdir.path().join("server_stderr.log");
     BootScaffold {
-        paths: BootPaths {
-            bin,
-            data_dir,
-            sock_path,
-            stderr_path,
-        },
+        paths: BootPaths { bin, data_dir, sock_path, stderr_path },
         tmpdir,
     }
 }

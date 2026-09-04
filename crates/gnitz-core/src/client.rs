@@ -334,9 +334,7 @@ pub struct CatalogSnapshot {
 
 /// What a planning pass sees outside a statement bracket: nothing, because every
 /// read issued between statements hits the wire.
-static EMPTY_CATALOG: CatalogSnapshot = CatalogSnapshot {
-    relations: BTreeMap::new(),
-};
+static EMPTY_CATALOG: CatalogSnapshot = CatalogSnapshot { relations: BTreeMap::new() };
 
 impl CatalogSnapshot {
     /// This statement's verdict for `schema_name.name`: `None` if the statement
@@ -517,13 +515,8 @@ impl GnitzClient {
         }
         let want = count.max(SERIAL_RANGE_SIZE);
         let base = self.session.alloc_serial_range(table_id, want)?;
-        self.serial_cache.insert(
-            table_id,
-            SerialRange {
-                next: base,
-                end: base + want,
-            },
-        );
+        self.serial_cache
+            .insert(table_id, SerialRange { next: base, end: base + want });
         Ok(())
     }
 
@@ -943,10 +936,7 @@ impl GnitzClient {
             return Ok(d);
         }
         self.fetch_descriptor(RelTarget::Id(tid))?
-            .ok_or_else(|| ClientError::NotFound {
-                noun: "relation",
-                name: tid.to_string(),
-            })
+            .ok_or_else(|| ClientError::NotFound { noun: "relation", name: tid.to_string() })
     }
 
     /// Persist a secondary-index catalog row over an already-resolved base table.
@@ -1002,11 +992,7 @@ impl GnitzClient {
                 name: &index_name,
                 // A client-authored index is never internal; the precheck
                 // rejects a `+1` that claims otherwise.
-                flags: gnitz_wire::IndexProps {
-                    is_unique,
-                    is_internal: false,
-                }
-                .pack(),
+                flags: gnitz_wire::IndexProps { is_unique, is_internal: false }.pack(),
             },
             1,
         );
@@ -1026,10 +1012,7 @@ impl GnitzClient {
             if if_exists {
                 Ok(())
             } else {
-                Err(ClientError::NotFound {
-                    noun: "index",
-                    name: index_name.clone(),
-                })
+                Err(ClientError::NotFound { noun: "index", name: index_name.clone() })
             }
         };
         let Some(idx_batch) = checked_sys_rows(IDX_TAB, self.session.scan(IDX_TAB)?)? else {
@@ -1181,10 +1164,7 @@ impl GnitzClient {
         let mut batch = ZSetBatch::new(schema);
         gnitz_wire::sys_rows::write_schema_tab_row(
             &mut BatchAppender::new(&mut batch, schema),
-            &gnitz_wire::sys_rows::SchemaTabRow {
-                schema_id: new_sid,
-                name: &name,
-            },
+            &gnitz_wire::sys_rows::SchemaTabRow { schema_id: new_sid, name: &name },
             1,
         );
         self.push_ddl(&[(SCHEMA_TAB, batch)])?;
@@ -1369,11 +1349,7 @@ impl GnitzClient {
                             owner_id: new_tid,
                             source_col_idx: gnitz_wire::pack_pk_cols(spec.col_indices),
                             name: &index_names[k],
-                            flags: gnitz_wire::IndexProps {
-                                is_unique: true,
-                                is_internal: false,
-                            }
-                            .pack(),
+                            flags: gnitz_wire::IndexProps { is_unique: true, is_internal: false }.pack(),
                         },
                         1,
                     );

@@ -211,10 +211,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         }
         // `POSITION(needle IN hay)` is `STRPOS(hay, needle)` with its arguments
         // the other way round.
-        Expr::Position {
-            expr: needle,
-            r#in: hay,
-        } => Ok(BExpr::StrCall {
+        Expr::Position { expr: needle, r#in: hay } => Ok(BExpr::StrCall {
             f: StrFunc::Pos,
             args: vec![bind_structural(hay, leaf)?, bind_structural(needle, leaf)?],
         }),
@@ -336,12 +333,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         // `e BETWEEN lo AND hi` ≡ `e >= lo AND e <= hi`; NOT BETWEEN negates it.
         // NULL semantics are SQL-correct under either form (a NULL operand makes
         // the AND NULL, and NOT(NULL) is NULL → the row is excluded).
-        Expr::Between {
-            expr: e,
-            negated,
-            low,
-            high,
-        } => {
+        Expr::Between { expr: e, negated, low, high } => {
             let ge = BExpr::BinOp(
                 Box::new(bind_structural(e, leaf)?),
                 BinOp::Ge,
@@ -645,9 +637,7 @@ fn bind_scalar_call<R: Clone, L: LeafBinder<R>>(
                 set: trim_set(set)?,
             })
         }
-        Call::Concat => Ok(BExpr::ConcatN {
-            args: bind_all(name, &args, leaf)?,
-        }),
+        Call::Concat => Ok(BExpr::ConcatN { args: bind_all(name, &args, leaf)? }),
     }
 }
 
@@ -848,10 +838,7 @@ pub(crate) fn null_test<R, L: LeafBinder<R>>(value: BExpr<R>, want_null: bool, l
     };
     match never_null {
         Some(never_null) => BExpr::LitInt(i64::from(never_null != want_null)),
-        None => BExpr::NullTest {
-            inner: Box::new(value),
-            want_null,
-        },
+        None => BExpr::NullTest { inner: Box::new(value), want_null },
     }
 }
 

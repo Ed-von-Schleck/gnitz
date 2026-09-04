@@ -191,10 +191,7 @@ fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
             &HashMap::from([(10i64, source)]),
             test_site("", 1),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            PlanTarget::ViewOutput {
-                out_schema: view_schema,
-                seeds: &[],
-            },
+            PlanTarget::ViewOutput { out_schema: view_schema, seeds: &[] },
         )
     };
     assert!(against(&view_schema, view_schema).is_ok(), "an equal pair compiles");
@@ -257,10 +254,7 @@ fn a_reduce_out_key_the_schema_does_not_warrant_is_rejected() {
         group_cols: group,
         // A linear COUNT keeps the MIN/MAX-eligibility guard out of the picture,
         // isolating the out_key validation.
-        agg: vec![gnitz_wire::AggDescriptor {
-            agg_op: AggFunc::Count,
-            col_idx: 0,
-        }],
+        agg: vec![gnitz_wire::AggDescriptor { agg_op: AggFunc::Count, col_idx: 0 }],
         global_ground: false,
         out_key,
     };
@@ -308,10 +302,7 @@ fn reduce_column_indices_out_of_range_are_rejected() {
     use gnitz_wire::{AggFunc, OpNode};
     let reduce = |group: Vec<u32>, agg_col: u32| OpNode::Reduce {
         group_cols: group,
-        agg: vec![gnitz_wire::AggDescriptor {
-            agg_op: AggFunc::Count,
-            col_idx: agg_col,
-        }],
+        agg: vec![gnitz_wire::AggDescriptor { agg_op: AggFunc::Count, col_idx: agg_col }],
         global_ground: false,
         out_key: ReduceOutKey::PkPermutation,
     };
@@ -337,10 +328,7 @@ fn a_value_reading_aggregate_over_a_non_scalar_column_is_rejected() {
     // aggregate column, whose type is the only thing varying.
     let reduce = |func| OpNode::Reduce {
         group_cols: vec![0],
-        agg: vec![gnitz_wire::AggDescriptor {
-            agg_op: func,
-            col_idx: 1,
-        }],
+        agg: vec![gnitz_wire::AggDescriptor { agg_op: func, col_idx: 1 }],
         global_ground: false,
         out_key: ReduceOutKey::PkPermutation,
     };
@@ -384,9 +372,7 @@ fn projection_columns_out_of_range_are_rejected() {
 fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
     use gnitz_wire::OpNode;
     const GUARD: &str = "null-extend: merged schema exceeds MAX_COLUMNS";
-    let extend = |n: usize| OpNode::NullExtend {
-        type_codes: vec![type_code::I64; n],
-    };
+    let extend = |n: usize| OpNode::NullExtend { type_codes: vec![type_code::I64; n] };
     let narrow = MidCircuit::new(make_schema_u64_i64());
     assert!(narrow.compiles(extend(1)), "a short type_codes list extends cleanly");
     // MAX_COLUMNS type_codes overflow the fixed schema array on their own.
@@ -515,10 +501,7 @@ fn range_join_probe_preconditions_are_rejected_at_compile_time() {
     use gnitz_wire::{JoinKind, RangeRel};
     let plan = |delta_schema, trace_schema, n_eq| {
         plan_two_source_join(
-            JoinKind::DeltaTraceRange {
-                n_eq,
-                rel: RangeRel::Lt,
-            },
+            JoinKind::DeltaTraceRange { n_eq, rel: RangeRel::Lt },
             delta_schema,
             trace_schema,
         )

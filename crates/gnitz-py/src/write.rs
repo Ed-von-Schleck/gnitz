@@ -293,12 +293,7 @@ impl PyZSetBatch {
         arg: impl Fn(usize) -> Borrowed<'a, 'py, PyAny>,
         default_weight: i64,
     ) -> PyResult<()> {
-        let PyZSetBatch {
-            batch,
-            schema,
-            weight_is_column,
-            kw_plan,
-        } = &mut *self;
+        let PyZSetBatch { batch, schema, weight_is_column, kw_plan } = &mut *self;
         let schema: &Schema = schema;
         let plan = match kw_plan {
             Some(p) if plan_hits(py, p, names, tuple) => p,

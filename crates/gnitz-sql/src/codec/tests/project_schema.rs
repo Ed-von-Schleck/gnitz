@@ -15,9 +15,7 @@ fn projection(schema: &Schema, srcs: &[Option<usize>]) -> (Vec<ProjItem>, Vec<Co
         .iter()
         .map(|s| match s {
             Some(ci) => ProjItem::PassThrough { src_col: *ci },
-            None => ProjItem::Computed {
-                bound_expr: BoundExpr::ColRef(0),
-            },
+            None => ProjItem::Computed { bound_expr: BoundExpr::ColRef(0) },
         })
         .collect();
     let cols = srcs

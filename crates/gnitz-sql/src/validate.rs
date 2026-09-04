@@ -375,18 +375,12 @@ pub(crate) struct HonoredQueryClauses {
 impl HonoredQueryClauses {
     /// A site that honors no envelope clause at all — every narrowing site
     /// except direct SELECT.
-    pub(crate) const NONE: Self = HonoredQueryClauses {
-        with: false,
-        ordering_sink: false,
-    };
+    pub(crate) const NONE: Self = HonoredQueryClauses { with: false, ordering_sink: false };
 
     /// A view body, shared by CREATE VIEW and `ALTER VIEW … AS`: `WITH` is
     /// compiled by the CTE phase, and no other tail clause has incremental-view
     /// semantics.
-    pub(crate) const VIEW_BODY: Self = HonoredQueryClauses {
-        with: true,
-        ordering_sink: false,
-    };
+    pub(crate) const VIEW_BODY: Self = HonoredQueryClauses { with: true, ordering_sink: false };
 }
 
 /// Reject every `Query`-envelope clause a narrowing site does not consume. `GenericDialect`
@@ -799,12 +793,7 @@ pub(crate) fn reject_unhonored_commit_clauses(
     stmt: &sqlparser::ast::Statement,
     context: &str,
 ) -> Result<(), GnitzSqlError> {
-    let sqlparser::ast::Statement::Commit {
-        chain,
-        end: _,
-        modifier,
-    } = stmt
-    else {
+    let sqlparser::ast::Statement::Commit { chain, end: _, modifier } = stmt else {
         return Err(GnitzSqlError::Internal("not a COMMIT statement".to_string()));
     };
     reject_if(*chain, context, "AND CHAIN")?;
@@ -1018,11 +1007,7 @@ fn reject_view_column_alias_decorations(
     context: &str,
 ) -> Result<(), GnitzSqlError> {
     for col in columns {
-        let sqlparser::ast::ViewColumnDef {
-            name: _,
-            data_type,
-            options,
-        } = col;
+        let sqlparser::ast::ViewColumnDef { name: _, data_type, options } = col;
         reject_if(data_type.is_some(), context, "a type on an output column alias")?;
         reject_if(options.is_some(), context, "an option list on an output column alias")?;
     }
@@ -1344,13 +1329,7 @@ pub(crate) fn alter_view_parts<'a>(
     ),
     GnitzSqlError,
 > {
-    let sqlparser::ast::Statement::AlterView {
-        name,
-        query,
-        columns,
-        with_options,
-    } = stmt
-    else {
+    let sqlparser::ast::Statement::AlterView { name, query, columns, with_options } = stmt else {
         return Err(GnitzSqlError::Internal("not an ALTER VIEW statement".to_string()));
     };
     // `ALTER VIEW` retargets a body; letting it set a budget would make the

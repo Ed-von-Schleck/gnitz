@@ -515,17 +515,11 @@ impl PkTuple {
     /// The "no seek" PK tuple: stride 0, splitting to the inert wire pair
     /// `(0u128, &[])`. Passed by non-seek frames (push / scan / alloc) so the
     /// call layer never hand-writes the wire split.
-    pub const EMPTY: PkTuple = PkTuple {
-        stride: 0,
-        buf: [0u8; MAX_PK_BYTES],
-    };
+    pub const EMPTY: PkTuple = PkTuple { stride: 0, buf: [0u8; MAX_PK_BYTES] };
 
     pub fn new(stride: u8) -> Self {
         debug_assert!(stride as usize <= MAX_PK_BYTES);
-        Self {
-            stride,
-            buf: [0u8; MAX_PK_BYTES],
-        }
+        Self { stride, buf: [0u8; MAX_PK_BYTES] }
     }
 
     /// Construct from a u128 whose low `stride` bytes carry the column's

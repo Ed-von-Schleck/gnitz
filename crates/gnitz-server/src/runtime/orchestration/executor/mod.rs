@@ -385,10 +385,7 @@ impl ServerExecutor {
         if let Some(tl) = &tls {
             reactor.attach_listener(tl.fd());
         }
-        let accept_ctx = AcceptCtx {
-            unix_fd: server_fd,
-            tls,
-        };
+        let accept_ctx = AcceptCtx { unix_fd: server_fd, tls };
 
         // Seed the zone-LSN allocator above every table's current_lsn so each
         // new zone LSN is strictly greater, keeping the `submit` path's direct
@@ -1194,11 +1191,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
     // one-family bundle — the same four rules over the same fold — so the batch
     // rides into the family for the validation and back out for the commit
     // request. The validator itself skips a bundle no rule would read a row for.
-    let family = TxnFamily {
-        tid: target_id,
-        mode,
-        batch,
-    };
+    let family = TxnFamily { tid: target_id, mode, batch };
     if let Err(e) = shared
         .disp()
         .validate_txn_distributed(&shared.reactor, std::slice::from_ref(&family))
@@ -2188,11 +2181,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             // Capture (not emit) each relation's preliminary schema frame here so
             // Phase 2 can send it after the one-cut dispatch, in request order.
             let (server_version, block) = schema_block_for_reply(shared, tid, client_ver);
-            plans.push(ScanMultiRelPlan {
-                tid,
-                server_version,
-                block,
-            });
+            plans.push(ScanMultiRelPlan { tid, server_version, block });
             fanout.push((tid, unicast, server_version));
         }
         let dispatches = dispatch_scan_multi_fanout(shared.disp(), &shared.reactor, client_id, &fanout).await?;

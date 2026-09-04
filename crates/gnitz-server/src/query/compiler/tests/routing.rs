@@ -256,10 +256,7 @@ fn join_meta_in(kind: JoinKind, key_cols: &[u32], ext: ExtTables) -> ViewMeta {
 }
 
 fn pure_range(n_eq: u8) -> JoinKind {
-    JoinKind::DeltaTraceRange {
-        n_eq,
-        rel: RangeRel::Lt,
-    }
+    JoinKind::DeltaTraceRange { n_eq, rel: RangeRel::Lt }
 }
 
 /// The `GroupKey` scatter's columns, or `None` when the route is not one.

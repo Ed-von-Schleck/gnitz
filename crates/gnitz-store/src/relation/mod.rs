@@ -462,13 +462,7 @@ impl RelationRegistry {
     /// Record `spec` against `stores`. The one insert, so the two entry points
     /// above cannot come to record a registration differently.
     fn enter(&mut self, spec: RelationSpec, stores: RelationStores) {
-        let RelationSpec {
-            id,
-            kind,
-            schema,
-            directory,
-            budgets,
-        } = spec;
+        let RelationSpec { id, kind, schema, directory, budgets } = spec;
         self.tables
             .insert(id, TableEntry::new(stores, schema, kind, directory, budgets));
     }

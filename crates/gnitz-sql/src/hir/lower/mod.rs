@@ -90,11 +90,7 @@ pub(crate) fn resolve_reduce_specs(
         let arg_pos = a.arg.map(|id| slot_of(layout, id)).transpose()?;
         push_agg_specs(a.func, arg_pos, &schema.columns, &mut specs)?;
     }
-    Ok(ReduceSpecs {
-        group_positions,
-        specs,
-        agg_starts,
-    })
+    Ok(ReduceSpecs { group_positions, specs, agg_starts })
 }
 
 /// The reduce output's `ColId` at each of its `width` physical slots:
@@ -224,13 +220,7 @@ pub(crate) fn apply_projection(
 /// (which must instead be cut to a hidden segment). The one home for the
 /// `Get → SegInput` mapping every combine input and linear source shares.
 pub(crate) fn seginput_of_get(rel: &RelExpr) -> Option<SegInput> {
-    let RelExpr::Get {
-        tid,
-        schema,
-        cols,
-        desc,
-    } = rel
-    else {
+    let RelExpr::Get { tid, schema, cols, desc } = rel else {
         return None;
     };
     Some(SegInput {
@@ -284,11 +274,7 @@ fn reject_ineligible_capacity_body(rel: &RelExpr) -> Result<(), GnitzSqlError> {
                 }
                 // Eligible: filter/projection over one relation.
                 RelExpr::Get { .. } => return Ok(()),
-                RelExpr::Join {
-                    kind: JoinType::Inner,
-                    on,
-                    ..
-                } => match on.class()?.shape() {
+                RelExpr::Join { kind: JoinType::Inner, on, .. } => match on.class()?.shape() {
                     // A range/band join's null-fill threshold pipeline is not
                     // replayable per key; a cross join has no key at all, so a
                     // skeleton row names no trace group to replay.
@@ -302,12 +288,9 @@ fn reject_ineligible_capacity_body(rel: &RelExpr) -> Result<(), GnitzSqlError> {
                     ..
                 } => "an outer join",
                 RelExpr::Join {
-                    kind: JoinType::Semi | JoinType::Anti,
-                    ..
+                    kind: JoinType::Semi | JoinType::Anti, ..
                 } => "EXISTS / NOT EXISTS / IN",
-                RelExpr::Join {
-                    kind: JoinType::Mark, ..
-                } => "a mark join (IN / ANY over a subquery)",
+                RelExpr::Join { kind: JoinType::Mark, .. } => "a mark join (IN / ANY over a subquery)",
                 RelExpr::Reduce { .. } => "GROUP BY / an aggregate",
                 _ => "a derived table / DISTINCT / set-operation subquery",
             }
@@ -349,12 +332,11 @@ fn lower_body(
                     lower_linear(&src, fpreds, items)
                 }
                 RelExpr::Join {
-                    kind: JoinType::Semi | JoinType::Anti,
-                    ..
+                    kind: JoinType::Semi | JoinType::Anti, ..
                 } => exists::lower_semi_anti_view(chain, memo, items, fpreds, source),
-                RelExpr::Join {
-                    kind: JoinType::Mark, ..
-                } => exists::lower_mark_view(chain, memo, items, fpreds, source),
+                RelExpr::Join { kind: JoinType::Mark, .. } => {
+                    exists::lower_mark_view(chain, memo, items, fpreds, source)
+                }
                 RelExpr::Join { .. } => join::lower_join_view(chain, memo, items, fpreds, source),
                 RelExpr::Reduce { .. } => reduce::lower_reduce(chain, memo, items, fpreds, source),
                 // A derived table (a projection, DISTINCT, or set operation) is not a
@@ -635,8 +617,5 @@ pub(crate) fn extract_scan_bound(preds: &[crate::ir::BoundExpr], src: &SegInput)
     ranked_index_bounds(preds, &src.schema, &src.desc.as_ref()?.indexes)
         .into_iter()
         .next()
-        .map(|c| ScanBound {
-            idx_cols: c.idx_cols,
-            desc: c.desc,
-        })
+        .map(|c| ScanBound { idx_cols: c.idx_cols, desc: c.desc })
 }

@@ -38,10 +38,7 @@ fn rows_fixture(name: &str, n: u64, weight: i64) -> RelationRegistry {
             kind: RelationKind::View,
             schema,
             directory: crate::test_support::scratch_dir("read", name),
-            budgets: ViewBudgets {
-                capacity_bytes: None,
-                delta_bytes: None,
-            },
+            budgets: ViewBudgets { capacity_bytes: None, delta_bytes: None },
         })
         .unwrap();
     let mut bb = BatchBuilder::new(schema);
@@ -60,21 +57,13 @@ fn rows_spec(order: Vec<OrderKey>, limit_k: u64) -> ReadSpec {
     ReadSpec {
         bound: ReadBound::None,
         predicate: Vec::new(),
-        sink: ReadSink::Rows {
-            projection: Vec::new(),
-            order,
-            limit_k,
-        },
+        sink: ReadSink::Rows { projection: Vec::new(), order, limit_k },
     }
 }
 
 /// `ORDER BY val DESC`.
 fn val_desc() -> Vec<OrderKey> {
-    vec![OrderKey {
-        col: 1,
-        desc: true,
-        nulls_first: false,
-    }]
+    vec![OrderKey { col: 1, desc: true, nulls_first: false }]
 }
 
 /// `(id, weight)` pairs of a reply batch, in reply order.
@@ -127,11 +116,7 @@ fn a_maximal_limit_k_neither_overflows_nor_trims() {
 #[test]
 fn an_out_of_range_order_key_is_rejected() {
     let mut r = rows_fixture("order_oob", 4, 1);
-    let order = vec![OrderKey {
-        col: 99,
-        desc: false,
-        nulls_first: false,
-    }];
+    let order = vec![OrderKey { col: 99, desc: false, nulls_first: false }];
     let Err(err) = run(&mut r, &rows_spec(order, 0)) else {
         panic!("an out-of-range order key must be rejected");
     };

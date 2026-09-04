@@ -119,12 +119,7 @@ impl RangeDescriptor {
         );
         let mut eq = [0u128; PK_LIST_MAX_COLS];
         eq[..eq_vals.len()].copy_from_slice(eq_vals);
-        RangeDescriptor {
-            eq,
-            n_eq: eq_vals.len(),
-            start,
-            end,
-        }
+        RangeDescriptor { eq, n_eq: eq_vals.len(), start, end }
     }
 
     /// A full or partial equality lowered to its degenerate point range:

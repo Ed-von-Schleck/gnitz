@@ -6,10 +6,7 @@ fn parse_inverts_name_for_every_grammar() {
     for addr in [
         ChildAddr::Worker { rank: 0, of: 1 },
         ChildAddr::Worker { rank: 3, of: 64 },
-        ChildAddr::Scratch {
-            child: "_reduce_9_3",
-            rank: 2,
-        },
+        ChildAddr::Scratch { child: "_reduce_9_3", rank: 2 },
         ChildAddr::Index { id: 7 },
         ChildAddr::Delta { rank: 0 },
         ChildAddr::Delta { rank: 5 },

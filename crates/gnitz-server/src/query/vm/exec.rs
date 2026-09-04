@@ -125,12 +125,7 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
     // Destructured because the three are disjoint fields: that is what lets an
     // operator hold a batch and a cursor (or a table) at once, with no interior
     // mutability and no raw pointer.
-    let VmHandle {
-        program,
-        regfile,
-        tables,
-        ..
-    } = vm;
+    let VmHandle { program, regfile, tables, .. } = vm;
     let RegisterFile { batches, cursors } = regfile;
     let last_read = &program.last_read[..];
 
@@ -143,22 +138,14 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
     // Indexed, so `pc` is the absolute offset `last_read` is keyed by.
     for pc in start_pc..program.instructions.len() {
         match &program.instructions[pc] {
-            Instr::Filter {
-                in_reg,
-                out_reg,
-                pred_idx,
-            } => {
+            Instr::Filter { in_reg, out_reg, pred_idx } => {
                 let pred = &program.predicates[pred_idx.at()];
                 let schema = &program.reg_meta[*in_reg as usize].schema;
                 let result = ops::op_filter(&batches[*in_reg as usize], pred, schema);
                 batches[*out_reg as usize] = result;
             }
 
-            Instr::Map {
-                in_reg,
-                out_reg,
-                map_idx,
-            } => {
+            Instr::Map { in_reg, out_reg, map_idx } => {
                 let result = program.maps[map_idx.at()].evaluate_map_batch(&batches[*in_reg as usize]);
                 batches[*out_reg as usize] = result;
             }
@@ -195,13 +182,7 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
                 batches[*out_reg as usize] = result;
             }
 
-            Instr::WeightClamp {
-                in_reg,
-                hist_reg,
-                out_reg,
-                lo,
-                hi,
-            } => {
+            Instr::WeightClamp { in_reg, hist_reg, out_reg, lo, hi } => {
                 let cursor = bound_cursor(cursors, *hist_reg);
                 let schema = &program.reg_meta[*in_reg as usize].schema;
                 let delta = take_or_clone(batches, last_read, *in_reg, pc);
@@ -213,12 +194,7 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
                 log_tick_ingest_err("weight-clamp history", hist_table, res)?;
             }
 
-            Instr::JoinDT {
-                delta_reg,
-                trace_reg,
-                out_reg,
-                probe,
-            } => {
+            Instr::JoinDT { delta_reg, trace_reg, out_reg, probe } => {
                 let left_schema = &program.reg_meta[*delta_reg as usize].schema;
                 let right_schema = &program.reg_meta[*trace_reg as usize].schema;
                 let out_schema = &program.reg_meta[*out_reg as usize].schema;
@@ -233,12 +209,7 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
                 batches[*out_reg as usize] = result;
             }
 
-            Instr::WorkerFilter {
-                in_reg,
-                out_reg,
-                worker_id,
-                num_workers,
-            } => {
+            Instr::WorkerFilter { in_reg, out_reg, worker_id, num_workers } => {
                 let schema = &program.reg_meta[*in_reg as usize].schema;
                 let result = ops::op_worker_filter(&batches[*in_reg as usize], schema, *worker_id, *num_workers);
                 batches[*out_reg as usize] = result;
@@ -266,12 +237,7 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
                 log_tick_ingest_err("integrate", trace_table, res)?;
             }
 
-            Instr::Reduce {
-                in_reg,
-                trace_out_reg,
-                out_reg,
-                plan_idx,
-            } => {
+            Instr::Reduce { in_reg, trace_out_reg, out_reg, plan_idx } => {
                 let baked = &program.reduce_plans[plan_idx.at()];
                 let to_cursor = bound_cursor(cursors, *trace_out_reg);
 

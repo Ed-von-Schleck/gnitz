@@ -366,10 +366,7 @@ fn base_publish_preserves_the_layout_sequence() {
         super::super::manifest::prepare_file(
             &cpath,
             &entries,
-            super::super::manifest::ManifestHeader {
-                layout_seq: 7,
-                ..header
-            },
+            super::super::manifest::ManifestHeader { layout_seq: 7, ..header },
         )
         .unwrap()
         .commit()

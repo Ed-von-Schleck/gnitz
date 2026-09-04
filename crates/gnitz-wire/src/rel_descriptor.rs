@@ -232,11 +232,7 @@ impl RelDescriptorBlob {
                     "rel descriptor: foreign key names column {col_idx}, but the relation has {num_columns} columns"
                 ));
             }
-            fks.push(RelFk {
-                col_idx,
-                fk_col_idx,
-                fk_table_id,
-            });
+            fks.push(RelFk { col_idx, fk_col_idx, fk_table_id });
         }
 
         // Cap the reservation by what the blob could still hold (16 bytes per

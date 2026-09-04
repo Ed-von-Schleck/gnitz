@@ -197,11 +197,7 @@ fn filter_keeps_exactly_the_matching_rows() {
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
         LogicalInstr::LoadConst { val: 10 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(0),
-            b: Reg(1),
-        },
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
     ];
     let func = LogicalProgram::new(instrs, Vec::new(), Some(Reg(2)), vec![])
         .resolve_filter(&schema)

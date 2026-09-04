@@ -862,15 +862,7 @@ mod columnar_materialize_differential {
             run(&mut writer);
             count = writer.row_count();
         }
-        OutBufs {
-            count,
-            pk_stride,
-            pk,
-            nb,
-            wt,
-            cols,
-            blob,
-        }
+        OutBufs { count, pk_stride, pk, nb, wt, cols, blob }
     }
 
     #[derive(Debug, PartialEq)]

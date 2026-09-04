@@ -90,10 +90,7 @@ fn test_orphaned_metadata_recovery() {
                 99999,
                 1,
                 "orphaned_idx",
-                gnitz_wire::IndexProps {
-                    is_unique: false,
-                    is_internal: false,
-                },
+                gnitz_wire::IndexProps { is_unique: false, is_internal: false },
                 1,
             ))
             .unwrap();

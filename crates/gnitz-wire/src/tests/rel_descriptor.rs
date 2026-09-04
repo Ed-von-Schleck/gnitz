@@ -30,11 +30,7 @@ fn delta_flag_roundtrips_on_a_view_and_is_refused_elsewhere() {
     };
     assert_eq!(roundtrip(&d, 2), d);
     for class in [RelClass::Table, RelClass::Stream, RelClass::BoundedView] {
-        let mut bytes = RelDescriptorBlob {
-            class,
-            ..Default::default()
-        }
-        .encode();
+        let mut bytes = RelDescriptorBlob { class, ..Default::default() }.encode();
         bytes[1] |= DESC_FLAG_DELTA;
         assert!(RelDescriptorBlob::decode(&bytes, 2).unwrap_err().contains("delta feed"));
     }
@@ -102,11 +98,7 @@ fn multi_column_index_and_multi_fk_roundtrip() {
 fn every_class_roundtrips_with_replicated() {
     for class in [RelClass::Table, RelClass::Stream, RelClass::View, RelClass::BoundedView] {
         for &replicated in &[false, true] {
-            let d = RelDescriptorBlob {
-                class,
-                replicated,
-                ..Default::default()
-            };
+            let d = RelDescriptorBlob { class, replicated, ..Default::default() };
             let back = roundtrip(&d, 2);
             assert_eq!(back, d, "{class:?} replicated={replicated}");
         }

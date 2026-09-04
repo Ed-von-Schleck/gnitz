@@ -124,16 +124,8 @@ pub(in crate::query) enum Instr {
 /// error here, not a register the liveness pass then lets someone take mid-read.
 pub(in crate::query) fn reads(instr: &Instr) -> [Option<u16>; 2] {
     match instr {
-        Instr::Filter {
-            in_reg,
-            out_reg: _,
-            pred_idx: _,
-        } => [Some(*in_reg), None],
-        Instr::Map {
-            in_reg,
-            out_reg: _,
-            map_idx: _,
-        } => [Some(*in_reg), None],
+        Instr::Filter { in_reg, out_reg: _, pred_idx: _ } => [Some(*in_reg), None],
+        Instr::Map { in_reg, out_reg: _, map_idx: _ } => [Some(*in_reg), None],
         Instr::Negate { in_reg, out_reg: _ } => [Some(*in_reg), None],
         Instr::Union { in_a, in_b, out_reg: _ } => [Some(*in_a), Some(*in_b)],
         Instr::WeightClamp {
@@ -233,12 +225,7 @@ impl VmHandle {
     /// before this tick's delta — by construction.
     fn bind_trace_cursors(&mut self) {
         gnitz_debug!("vm: bind_trace_cursors, {} trace regs", self.trace_regs.len());
-        let VmHandle {
-            regfile,
-            tables,
-            trace_regs,
-            ..
-        } = self;
+        let VmHandle { regfile, tables, trace_regs, .. } = self;
         for &(reg_id, table_idx) in trace_regs.iter() {
             let cursor = tables[table_idx.at()].open_cursor();
             match &mut regfile.cursors[reg_id as usize] {
@@ -282,16 +269,10 @@ pub(in crate::query) struct RegisterMeta {
 
 impl RegisterMeta {
     pub(super) const fn delta(schema: SchemaDescriptor) -> Self {
-        Self {
-            schema,
-            owned_table: None,
-        }
+        Self { schema, owned_table: None }
     }
     pub(super) const fn trace(schema: SchemaDescriptor, owned_table: TableIdx) -> Self {
-        Self {
-            schema,
-            owned_table: Some(owned_table),
-        }
+        Self { schema, owned_table: Some(owned_table) }
     }
 }
 

@@ -88,11 +88,7 @@ impl RelationRegistry {
                 let mut source = self.open_scan_spec_cursor(target_id, &spec.bound, &src_schema, cut_tick, hydrator)?;
                 run_scan_fold_sink(&mut source, ctx, pre.as_ref(), fold)
             }
-            ReadSink::Rows {
-                projection,
-                order,
-                limit_k,
-            } => {
+            ReadSink::Rows { projection, order, limit_k } => {
                 let projection = resolve_rows_projection(projection, &src_schema, reply_schema)?;
                 let order_locs = resolve_order_locs(order, reply_schema)?;
                 let window = saturated_window(*limit_k);

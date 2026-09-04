@@ -210,11 +210,9 @@ impl ColumnLocator {
     #[inline(always)]
     pub fn native_key(&self, mb: &impl RowSource, row: usize) -> u128 {
         match *self {
-            ColumnLocator::Pk {
-                byte_off,
-                size,
-                type_code,
-            } => gnitz_wire::pk_native_key(mb.get_pk_bytes(row), byte_off as usize, size as usize, type_code),
+            ColumnLocator::Pk { byte_off, size, type_code } => {
+                gnitz_wire::pk_native_key(mb.get_pk_bytes(row), byte_off as usize, size as usize, type_code)
+            }
             ColumnLocator::Payload { slot, size, type_code } => gnitz_wire::payload_native_key(
                 mb.get_col_ptr(row, slot as usize, size as usize),
                 0,

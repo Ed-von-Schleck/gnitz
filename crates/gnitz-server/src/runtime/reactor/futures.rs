@@ -26,11 +26,7 @@ pub(super) struct TimerFuture {
 
 impl TimerFuture {
     pub(super) fn new(deadline: Instant, inner: Rc<ReactorShared>) -> Self {
-        TimerFuture {
-            deadline,
-            timer_id: None,
-            inner,
-        }
+        TimerFuture { deadline, timer_id: None, inner }
     }
 }
 
@@ -161,11 +157,7 @@ impl ScanLease {
         }
         let mut buf = [0u32; MAX_WORKERS];
         buf[..ids.len()].copy_from_slice(ids);
-        ScanLease {
-            inner,
-            ids: buf,
-            len: ids.len() as u8,
-        }
+        ScanLease { inner, ids: buf, len: ids.len() as u8 }
     }
 }
 
@@ -284,10 +276,7 @@ impl PeerToken {
         if let Some(conn) = reactor.inner.conns.borrow_mut().get_mut(&fd) {
             conn.peer_held = true;
         }
-        PeerToken {
-            inner: Rc::clone(&reactor.inner),
-            fd,
-        }
+        PeerToken { inner: Rc::clone(&reactor.inner), fd }
     }
 
     pub(crate) fn fd(&self) -> i32 {

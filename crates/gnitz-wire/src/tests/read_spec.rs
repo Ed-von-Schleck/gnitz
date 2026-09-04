@@ -10,16 +10,8 @@ fn enc(spec: &ReadSpec) -> Vec<u8> {
 
 fn sample_order() -> Vec<OrderKey> {
     vec![
-        OrderKey {
-            col: 3,
-            desc: false,
-            nulls_first: true,
-        },
-        OrderKey {
-            col: 0,
-            desc: true,
-            nulls_first: false,
-        },
+        OrderKey { col: 3, desc: false, nulls_first: true },
+        OrderKey { col: 0, desc: true, nulls_first: false },
     ]
 }
 
@@ -75,10 +67,7 @@ fn roundtrips_every_bound_against_every_sink() {
             AggFunc::ALL
                 .iter()
                 .enumerate()
-                .map(|(i, &agg_op)| AggDescriptor {
-                    agg_op,
-                    col_idx: i as u32,
-                })
+                .map(|(i, &agg_op)| AggDescriptor { agg_op, col_idx: i as u32 })
                 .collect(),
         )),
         // DISTINCT: group cols, no aggs.
@@ -86,19 +75,13 @@ fn roundtrips_every_bound_against_every_sink() {
         // A global aggregate: no group cols.
         ReadSink::Fold(AggReadSpec::direct(
             vec![],
-            vec![AggDescriptor {
-                agg_op: AggFunc::Min,
-                col_idx: 4,
-            }],
+            vec![AggDescriptor { agg_op: AggFunc::Min, col_idx: 4 }],
         )),
         // A pre-map fold (`GROUP BY a + b`, `SUM(a * b)`): the program plus the
         // reduce input's payload declarations, both non-empty.
         ReadSink::Fold(AggReadSpec {
             group_cols: vec![7],
-            aggs: vec![AggDescriptor {
-                agg_op: AggFunc::Sum,
-                col_idx: 8,
-            }],
+            aggs: vec![AggDescriptor { agg_op: AggFunc::Sum, col_idx: 8 }],
             pre: Some(ComputeMap {
                 program: vec![4, 1, 5, 9, 2, 6],
                 out_cols: vec![

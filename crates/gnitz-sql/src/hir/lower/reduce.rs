@@ -34,12 +34,7 @@ pub(crate) fn lower_reduce(
     having_preds: &[HirExpr],
     reduce: &RelExpr,
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
-    let RelExpr::Reduce {
-        input,
-        group_cols,
-        aggs,
-    } = reduce
-    else {
+    let RelExpr::Reduce { input, group_cols, aggs } = reduce else {
         unreachable!("lower_reduce receives a Reduce");
     };
 
@@ -90,11 +85,8 @@ pub(crate) fn lower_reduce(
         None => (Arc::clone(&source.schema), &source.layout),
     };
 
-    let ReduceSpecs {
-        group_positions,
-        mut specs,
-        agg_starts,
-    } = resolve_reduce_specs(group_cols, aggs, reduce_in_layout, &reduce_in)?;
+    let ReduceSpecs { group_positions, mut specs, agg_starts } =
+        resolve_reduce_specs(group_cols, aggs, reduce_in_layout, &reduce_in)?;
     // The emission-only cardinality COUNT is the circuit's alone: it is the
     // `should_emit` signal a stateful reduce gates group existence on, which the
     // stateless fold has no use for.

@@ -753,10 +753,7 @@ pub(crate) fn run_merge<S: ColumnarSource>(
     }
     let mut cursors: Vec<PosCursor> = sources
         .iter()
-        .map(|s| PosCursor {
-            position: 0,
-            count: s.row_count(),
-        })
+        .map(|s| PosCursor { position: 0, count: s.row_count() })
         .collect();
 
     // Dispatch the payload comparator, monomorphizing one branch-free copy of the

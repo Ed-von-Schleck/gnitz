@@ -93,10 +93,7 @@ fn format_line(buf: &mut [u8; LINE_MAX], level_tag: &str, args: core::fmt::Argum
     let tag = std::str::from_utf8(&tag_bytes[..tag_len]).unwrap_or("");
 
     // The writer gets all but the final byte, which is reserved for '\n'.
-    let mut w = TruncatingWriter {
-        buf: &mut buf[..LINE_MAX - 1],
-        pos: 0,
-    };
+    let mut w = TruncatingWriter { buf: &mut buf[..LINE_MAX - 1], pos: 0 };
     let _ = write!(w, "{}.{:03} {} {} ", now.as_secs(), now.subsec_millis(), tag, level_tag);
     let _ = w.write_fmt(args);
     let pos = w.pos;

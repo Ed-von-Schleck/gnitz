@@ -367,10 +367,7 @@ pub struct WireFault {
 
 impl<S: Into<String>> From<S> for WireFault {
     fn from(text: S) -> Self {
-        WireFault {
-            status: STATUS_ERROR,
-            text: text.into(),
-        }
+        WireFault { status: STATUS_ERROR, text: text.into() }
     }
 }
 

@@ -138,10 +138,7 @@ impl MappedShard {
             if e.size != needed {
                 return Err(StorageError::InvalidShard);
             }
-            Ok(RegionView {
-                offset: e.offset,
-                stride,
-            })
+            Ok(RegionView { offset: e.offset, stride })
         };
         // Payload columns are the sole `ENCODING_FOR`-eligible role, and only for
         // fixed-int types — the FoR codec widens whole integer cells, so a forged

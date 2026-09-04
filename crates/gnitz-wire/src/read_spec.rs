@@ -71,11 +71,7 @@ impl AggReadSpec {
     /// A fold that reads source columns directly — the shape every grouped
     /// SELECT has until it groups by, or aggregates, an expression.
     pub fn direct(group_cols: Vec<u32>, aggs: Vec<AggDescriptor>) -> Self {
-        AggReadSpec {
-            group_cols,
-            aggs,
-            pre: None,
-        }
+        AggReadSpec { group_cols, aggs, pre: None }
     }
 }
 
@@ -322,11 +318,7 @@ impl ReadSpec {
         w.bytes32(predicate);
 
         match sink {
-            ReadSink::Rows {
-                projection,
-                order,
-                limit_k,
-            } => {
+            ReadSink::Rows { projection, order, limit_k } => {
                 w.u8(order.len() as u8).u64(*limit_k);
                 for key in order {
                     let mut flags = 0u8;
@@ -447,11 +439,7 @@ impl ReadSpec {
                     });
                 }
                 let projection = r.bytes32()?.to_vec();
-                ReadSink::Rows {
-                    projection,
-                    order,
-                    limit_k,
-                }
+                ReadSink::Rows { projection, order, limit_k }
             }
             SINK_FOLD => {
                 // Trust-boundary caps only: a legitimate fold's reply schema is
@@ -477,10 +465,7 @@ impl ReadSpec {
                     let op_byte = r.u8()?;
                     let agg_op = AggFunc::from_wire(op_byte as u64)
                         .ok_or_else(|| format!("read_spec: unknown aggregate op {op_byte}"))?;
-                    aggs.push(AggDescriptor {
-                        agg_op,
-                        col_idx: r.u16()? as u32,
-                    });
+                    aggs.push(AggDescriptor { agg_op, col_idx: r.u16()? as u32 });
                 }
                 let n_pre = r.u16()? as usize;
                 if n_pre > MAX_COLUMNS {

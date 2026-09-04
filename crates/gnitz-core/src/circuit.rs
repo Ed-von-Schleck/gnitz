@@ -133,25 +133,13 @@ impl CircuitBuilder {
     /// bound entirely. The caller still emits the full `Filter` downstream — the
     /// bound narrows what is read, never what the view contains.
     pub fn input_delta_bounded(&mut self, bound: Option<gnitz_wire::ScanBound>) -> NodeId {
-        self.alloc_wired(
-            OpNode::ScanDelta {
-                source: self.primary_source_id,
-                bound,
-            },
-            &[],
-        )
+        self.alloc_wired(OpNode::ScanDelta { source: self.primary_source_id, bound }, &[])
     }
 
     /// Tagged secondary delta input for multi-input views (e.g. equijoin).
     /// `source_table_id` becomes a real dependency.
     pub fn input_delta_tagged(&mut self, source_table_id: u64) -> NodeId {
-        self.alloc_wired(
-            OpNode::ScanDelta {
-                source: source_table_id,
-                bound: None,
-            },
-            &[],
-        )
+        self.alloc_wired(OpNode::ScanDelta { source: source_table_id, bound: None }, &[])
     }
 
     pub fn filter(&mut self, input: NodeId, expr: Option<LogicalProgram>) -> NodeId {
@@ -203,10 +191,7 @@ impl CircuitBuilder {
     /// to both sides of deduplicating set-ops.
     pub fn map_hash_row(&mut self, input: NodeId, cols: &[(u32, u8)], branch_id: u8) -> NodeId {
         self.alloc_wired(
-            OpNode::Map(MapKind::HashRow {
-                cols: cols.to_vec(),
-                branch_id,
-            }),
+            OpNode::Map(MapKind::HashRow { cols: cols.to_vec(), branch_id }),
             &[input],
         )
     }
@@ -295,10 +280,7 @@ impl CircuitBuilder {
         let group: Vec<u32> = group_cols.iter().map(|&c| c as u32).collect();
         let specs: Vec<AggDescriptor> = agg_specs
             .iter()
-            .map(|&(agg_op, col)| AggDescriptor {
-                agg_op,
-                col_idx: col as u32,
-            })
+            .map(|&(agg_op, col)| AggDescriptor { agg_op, col_idx: col as u32 })
             .collect();
         self.alloc_wired(
             OpNode::Reduce {
@@ -386,10 +368,7 @@ impl CircuitBuilder {
 
     /// Finalises the circuit.
     pub fn build(self) -> Circuit {
-        Circuit {
-            nodes: self.nodes,
-            inputs: self.inputs,
-        }
+        Circuit { nodes: self.nodes, inputs: self.inputs }
     }
 }
 

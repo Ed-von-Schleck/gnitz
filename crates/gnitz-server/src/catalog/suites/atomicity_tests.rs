@@ -244,10 +244,7 @@ fn test_idx_tab_bad_owner_leaves_clean_state() {
         nonexistent_owner,
         0,
         "bad_owner_idx",
-        gnitz_wire::IndexProps {
-            is_unique: false,
-            is_internal: false,
-        },
+        gnitz_wire::IndexProps { is_unique: false, is_internal: false },
         1,
     );
     let result = engine.ingest_to_family(IDX_TAB_ID, &batch);
@@ -299,10 +296,7 @@ fn test_idx_tab_view_owner_rejected() {
         vid,
         0,
         "idx_on_view",
-        gnitz_wire::IndexProps {
-            is_unique: false,
-            is_internal: false,
-        },
+        gnitz_wire::IndexProps { is_unique: false, is_internal: false },
         1,
     );
     let err = engine
@@ -362,10 +356,7 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
         tid,
         2,
         orig_name,
-        gnitz_wire::IndexProps {
-            is_unique: false,
-            is_internal: false,
-        },
+        gnitz_wire::IndexProps { is_unique: false, is_internal: false },
         1,
     );
     let result = engine.ingest_to_family(IDX_TAB_ID, &batch);
@@ -474,10 +465,7 @@ fn test_next_index_id_advances_on_index_register() {
         tid,
         1,
         "public__seqsync__idx_val_sync",
-        gnitz_wire::IndexProps {
-            is_unique: false,
-            is_internal: false,
-        },
+        gnitz_wire::IndexProps { is_unique: false, is_internal: false },
         1,
     );
     engine.ingest_to_family(IDX_TAB_ID, &batch).unwrap();

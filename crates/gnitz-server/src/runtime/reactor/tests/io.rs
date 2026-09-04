@@ -11,14 +11,7 @@ use crate::runtime::test_support::try_poll_once;
 fn assert_refused(cap: usize, max_payload: Option<usize>, wire: &[u8], why: &str) {
     unsafe {
         let (read_fd, write_fd) = stream_pair();
-        let r = Reactor::new(
-            16,
-            Limits {
-                inbound_cap: cap,
-                ..Limits::TEST
-            },
-        )
-        .expect("reactor");
+        let r = Reactor::new(16, Limits { inbound_cap: cap, ..Limits::TEST }).expect("reactor");
         r.register_conn(read_fd);
         if let Some(limit) = max_payload {
             r.set_max_payload_len(read_fd, limit);
@@ -81,14 +74,7 @@ fn inbound_cap_counts_in_flight_and_refuses_new_conn() {
     unsafe {
         let (read_fd, write_fd) = stream_pair();
         // Exactly one 10_000-byte in-flight buffer fits.
-        let r = Reactor::new(
-            16,
-            Limits {
-                inbound_cap: 10_000,
-                ..Limits::TEST
-            },
-        )
-        .expect("reactor");
+        let r = Reactor::new(16, Limits { inbound_cap: 10_000, ..Limits::TEST }).expect("reactor");
         r.register_conn(read_fd);
         r.set_max_payload_len(read_fd, 1 << 20);
 
@@ -132,16 +118,7 @@ fn inbound_cap_accounting_balances_on_consume() {
     // Cap admits several frames; the pipeline holds ~1 at a time because
     // each frame is popped in the same tick it lands, so 10 frames/round of
     // 1_000-weight traffic (10_000 > cap) never trips.
-    let r = Rc::new(
-        Reactor::new(
-            16,
-            Limits {
-                inbound_cap: 5_000,
-                ..Limits::TEST
-            },
-        )
-        .expect("reactor"),
-    );
+    let r = Rc::new(Reactor::new(16, Limits { inbound_cap: 5_000, ..Limits::TEST }).expect("reactor"));
     r.register_conn(read_fd);
     r.set_max_payload_len(read_fd, 1 << 20);
 

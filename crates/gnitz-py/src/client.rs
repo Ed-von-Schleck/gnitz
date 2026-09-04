@@ -250,10 +250,7 @@ impl PyGnitzClient {
     /// ```
     pub fn transaction(slf: Bound<'_, PyGnitzClient>) -> PyResult<PyTxn> {
         to_py_err(slf.borrow_mut().live()?.txn_begin())?;
-        Ok(PyTxn {
-            open: true,
-            client: slf.unbind(),
-        })
+        Ok(PyTxn { open: true, client: slf.unbind() })
     }
 
     // ----- Views -----

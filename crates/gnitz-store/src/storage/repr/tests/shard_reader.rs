@@ -35,10 +35,7 @@ fn build_test_shard_weights(
         &path,
         &make_schema_u64_i64(),
         &rows,
-        ShardWriteOpts {
-            pack_ints: pack,
-            ..Default::default()
-        },
+        ShardWriteOpts { pack_ints: pack, ..Default::default() },
     );
     path.to_str().unwrap().to_string()
 }

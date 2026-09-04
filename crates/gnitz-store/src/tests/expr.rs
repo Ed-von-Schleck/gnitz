@@ -317,11 +317,7 @@ fn test_from_predicate_filter_ranges_over_a_batch() {
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
         LogicalInstr::LoadConst { val: 15 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(0),
-            b: Reg(1),
-        },
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
     ];
     let func = LogicalProgram::new(instrs, Vec::new(), Some(Reg(2)), vec![])
         .resolve_filter(&schema)

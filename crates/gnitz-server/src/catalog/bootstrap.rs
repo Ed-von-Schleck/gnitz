@@ -130,14 +130,7 @@ impl CatalogEngine {
         {
             let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
             for (schema_id, name) in [(SYSTEM_SCHEMA_ID, "_system"), (PUBLIC_SCHEMA_ID, "public")] {
-                write_schema_tab_row(
-                    &mut bb,
-                    &SchemaTabRow {
-                        schema_id: schema_id as u64,
-                        name,
-                    },
-                    1,
-                );
+                write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id: schema_id as u64, name }, 1);
             }
             self.bootstrap_ingest(SysFamily::Schema, bb)?;
         }

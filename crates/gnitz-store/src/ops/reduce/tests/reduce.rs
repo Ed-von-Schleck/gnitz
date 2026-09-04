@@ -32,10 +32,7 @@ fn avi_schema(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> SchemaDescrip
     make_bake(
         schema,
         group_by_cols,
-        &[AggDescriptor {
-            col_idx: 0,
-            agg_op: AggFunc::Min,
-        }],
+        &[AggDescriptor { col_idx: 0, agg_op: AggFunc::Min }],
     )
     .schema
 }
@@ -254,10 +251,7 @@ fn grouped_reduce_two_column_digest_key() {
     // A two-column group set is not canonical ⇒ the XXH3 digest arm. Group
     // *order* is the digest's, so the assertion is per group, never positional.
     let in_schema = make_schema_u64_uuid_i64();
-    let aggs = [AggDescriptor {
-        col_idx: 0,
-        agg_op: AggFunc::Count,
-    }];
+    let aggs = [AggDescriptor { col_idx: 0, agg_op: AggFunc::Count }];
     let out_schema = out_schema_for(&in_schema, &[1u32, 2u32], &aggs);
     let mut to_ch = empty_trace(out_schema);
 
@@ -516,12 +510,8 @@ fn linear_sum_only_new_all_null_group_present() {
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 3 }, // r0 = cnn
         LogicalInstr::LoadConst { val: 0 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Ne,
-            a: Reg(0),
-            b: Reg(1),
-        }, // r2 = (cnn != 0)
-        LogicalInstr::LoadColInt { col: 2 }, // r3 = sum
+        LogicalInstr::Cmp { op: CmpOp::Ne, a: Reg(0), b: Reg(1) }, // r2 = (cnn != 0)
+        LogicalInstr::LoadColInt { col: 2 },                       // r3 = sum
         LogicalInstr::IntArith {
             op: IntArithOp::Div,
             a: Reg(3),
@@ -539,18 +529,12 @@ fn linear_sum_only_new_all_null_group_present() {
     .unwrap();
 
     let aggs = [
-        AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Sum,
-        },
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum },
         AggDescriptor {
             col_idx: 2,
             agg_op: AggFunc::CountNonNull,
         },
-        AggDescriptor {
-            col_idx: 0,
-            agg_op: AggFunc::Count,
-        },
+        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
     ];
 
     // New group g=7 whose only row has val=NULL.
@@ -606,10 +590,7 @@ fn count_star_only_emptied_group_eliminated() {
         ],
         &[0],
     );
-    let aggs = [AggDescriptor {
-        col_idx: 0,
-        agg_op: AggFunc::Count,
-    }];
+    let aggs = [AggDescriptor { col_idx: 0, agg_op: AggFunc::Count }];
 
     let reduce = |delta: &Batch, to: &mut crate::storage::ReadCursor| {
         op_reduce(delta, to, &in_schema, &[1u32], &aggs, None, false, false)
@@ -691,14 +672,10 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     //   emit sum-gate = sum(col 3) / (cnn(col 4) != 0) → fin payload 2.
     // div-by-zero (cnn == 0) marks the SUM NULL; div-by-1 (cnn > 0) is exact.
     let instrs = vec![
-        LogicalInstr::LoadColInt { col: 4 }, // r0 = cnn (col 4)
-        LogicalInstr::LoadConst { val: 0 },  // r1 = 0
-        LogicalInstr::Cmp {
-            op: CmpOp::Ne,
-            a: Reg(0),
-            b: Reg(1),
-        }, // r2 = (cnn != 0) → 1/0
-        LogicalInstr::LoadColInt { col: 3 }, // r3 = sum (col 3)
+        LogicalInstr::LoadColInt { col: 4 },                       // r0 = cnn (col 4)
+        LogicalInstr::LoadConst { val: 0 },                        // r1 = 0
+        LogicalInstr::Cmp { op: CmpOp::Ne, a: Reg(0), b: Reg(1) }, // r2 = (cnn != 0) → 1/0
+        LogicalInstr::LoadColInt { col: 3 },                       // r3 = sum (col 3)
         LogicalInstr::IntArith {
             op: IntArithOp::Div,
             a: Reg(3),
@@ -716,14 +693,8 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     .unwrap();
 
     let aggs = [
-        AggDescriptor {
-            col_idx: 0,
-            agg_op: AggFunc::Count,
-        },
-        AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Sum,
-        },
+        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum },
         AggDescriptor {
             col_idx: 2,
             agg_op: AggFunc::CountNonNull,
@@ -839,14 +810,8 @@ fn null_min_retraction_re_emits_null() {
         &[0],
     );
     let aggs = [
-        AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Count,
-        },
-        AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Min,
-        },
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Count },
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Min },
     ];
     let min_null_bit = 1u64 << 2;
 
@@ -922,14 +887,8 @@ fn null_sum_fold_stays_null() {
         &[0],
     );
     let aggs = [
-        AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Count,
-        },
-        AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Sum,
-        },
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Count },
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum },
     ];
     let sum_null_bit = 1u64 << 2;
     let null_row = |pk: u128| {
@@ -1218,10 +1177,7 @@ fn test_reduce_count() {
     // 3 rows: pk=1,2,3 all GROUP BY pk (single group using pk as group)
     let delta = make_batch(&in_schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
 
-    let agg = AggDescriptor {
-        col_idx: 0,
-        agg_op: AggFunc::Count,
-    };
+    let agg = AggDescriptor { col_idx: 0, agg_op: AggFunc::Count };
 
     // GROUP BY pk → each row is its own group
     let out = op_reduce(&delta, &mut to_ch, &in_schema, &[0u32], &[agg], None, false, false);
@@ -1354,10 +1310,7 @@ fn test_reduce_min_f32() {
     // (PK, payload) order so the consolidated flag the helper stamps is honest.
     let delta = make_batch_f32(&in_schema, &[(1, 1, -1.0f32), (1, 1, 3.5f32), (1, 1, 7.0f32)]);
 
-    let agg = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 1, agg_op: AggFunc::Min };
 
     // GROUP BY pk → all 3 rows in same group
     let out = op_reduce(&delta, &mut to_ch, &in_schema, &[0u32], &[agg], None, false, false);
@@ -1372,10 +1325,7 @@ fn test_reduce_min_f32() {
 fn test_reduce_max_i16() {
     let in_schema = make_schema_with_type(type_code::I16);
 
-    let agg = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggFunc::Max,
-    };
+    let agg = AggDescriptor { col_idx: 1, agg_op: AggFunc::Max };
     // MIN/MAX select an existing row, so the output column keeps the I16 source
     // width — the read below is 2 bytes, not 8.
     let out_schema = out_schema_for(&in_schema, &[0u32], std::slice::from_ref(&agg));
@@ -1770,10 +1720,7 @@ fn test_emit_reduce_row_compound_pk_bytes() {
     let mb = input.as_mem_batch();
 
     let mut output = Batch::with_capacity(out_schema, 1);
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Count,
-    };
+    let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Count };
     // Natural-PK grouping passes the source row's PK bytes; they're copied verbatim.
     let plan = make_plan(&in_schema, &[0u32, 1u32], std::slice::from_ref(&agg), false, false);
     let accs = plan.acc_template.clone();
@@ -1817,10 +1764,7 @@ fn test_reduce_min_pk_col_compound_pk() {
     let delta = make_batch_compound_2xu64(&in_schema, &[(10, 7, 1, 100), (20, 3, 1, 200)]);
 
     // MIN over the SECOND PK column (col_idx=1).
-    let agg = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 1, agg_op: AggFunc::Min };
 
     let out = op_reduce(
         &delta,
@@ -1863,10 +1807,7 @@ fn test_reduce_min_pk_col_single_pk_u64() {
     // passes that order straight through.
     let delta = make_batch(&in_schema, &[(7, 1, 0), (42, 1, 0), (99, 1, 0)]);
 
-    let agg = AggDescriptor {
-        col_idx: 0,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 0, agg_op: AggFunc::Min };
     let out = op_reduce(&delta, &mut to_ch, &in_schema, &[0u32], &[agg], None, false, false);
     // GROUP BY pk → each row is its own group; MIN(pk) per group equals the row's pk.
     assert_eq!(out.count, 3);
@@ -1895,10 +1836,7 @@ fn test_reduce_group_by_pk_permuted_preserves_pk_order() {
     // PK-sorted (pk_indices=[0,1]) order: (1,2) then (2,1).
     let delta = make_batch_compound_2xu64(&in_schema, &[(1, 2, 1, 10), (2, 1, 1, 20)]);
 
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Count,
-    };
+    let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Count };
 
     // group_by_cols permuted to [1, 0] — a valid set permutation of pk_indices.
     let out = op_reduce(
@@ -1998,14 +1936,7 @@ fn test_compare_by_group_cols_pk_sentinel_single_pk_bit_identical() {
 
     let descs_v = locate_cols(&schema, &[0u32]);
     let descs = &descs_v[..];
-    assert!(matches!(
-        descs[0],
-        ColumnLocator::Pk {
-            byte_off: 0,
-            size: 8,
-            ..
-        }
-    ));
+    assert!(matches!(descs[0], ColumnLocator::Pk { byte_off: 0, size: 8, .. }));
 
     assert_eq!(compare_by_group_cols(&mb, 0, &mb, 1, descs), std::cmp::Ordering::Less);
     assert_eq!(
@@ -2071,10 +2002,7 @@ fn test_op_reduce_compound_pk_group_by_subset_count() {
     // PK-sorted (pk0, pk1): (1,10), (1,20), (2,10).
     let delta = make_batch_compound_2xu64(&in_schema, &[(1, 10, 1, 0), (1, 20, 1, 0), (2, 10, 1, 0)]);
 
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Count,
-    };
+    let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Count };
 
     let out = op_reduce(&delta, &mut to_ch, &in_schema, &[0u32], &[agg], None, false, false);
 
@@ -2168,10 +2096,7 @@ fn make_batch_u64pk_i64grp_i64val(
 #[test]
 fn test_reduce_min_u64_high_bit_set() {
     let in_schema = make_schema_u64pk_i64grp_u64val();
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Min };
     let out_schema = out_schema_for(&in_schema, &[1u32], std::slice::from_ref(&agg));
 
     let mut to_ch = empty_trace(out_schema);
@@ -2193,10 +2118,7 @@ fn test_reduce_min_u64_high_bit_set() {
 #[test]
 fn test_reduce_max_u64_high_bit_set() {
     let in_schema = make_schema_u64pk_i64grp_u64val();
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Max,
-    };
+    let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Max };
     let out_schema = out_schema_for(&in_schema, &[1u32], std::slice::from_ref(&agg));
 
     let mut to_ch = empty_trace(out_schema);
@@ -2217,10 +2139,7 @@ fn test_reduce_max_u64_high_bit_set() {
 #[test]
 fn test_reduce_min_u64_incremental() {
     let in_schema = make_schema_u64pk_i64grp_u64val();
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Min };
     let out_schema = out_schema_for(&in_schema, &[1u32], std::slice::from_ref(&agg));
 
     // Tick 1: one row with val=1u64<<60 → MIN = 1u64<<60.
@@ -2280,10 +2199,7 @@ fn test_reduce_min_u64_incremental() {
 #[test]
 fn test_reduce_max_u64_incremental() {
     let in_schema = make_schema_u64pk_i64grp_u64val();
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Max,
-    };
+    let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Max };
     let out_schema = out_schema_for(&in_schema, &[1u32], std::slice::from_ref(&agg));
 
     // Tick 1: MAX over a single low value → MAX = 10.
@@ -2342,10 +2258,7 @@ fn test_avi_seed_u64_high_bit() {
     // delta rows.
     let in_schema = make_schema_with_type(type_code::U64);
 
-    let desc = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggFunc::Min,
-    };
+    let desc = AggDescriptor { col_idx: 1, agg_op: AggFunc::Min };
     let mut acc = make_acc(&in_schema, &[0], desc);
 
     // AVI seeds the accumulator with 1u64<<63 (high bit set); a U64's order
@@ -2382,10 +2295,7 @@ fn test_reduce_min_max_i64_boundary() {
     // MIN of {i64::MIN, -1, 0, i64::MAX} = i64::MIN,
     // MAX = i64::MAX.
     let in_schema = u64pk_i64grp_i64val(false);
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Min };
     let out_schema = out_schema_for(&in_schema, &[1u32], std::slice::from_ref(&agg));
 
     // MIN test.
@@ -2412,10 +2322,7 @@ fn test_reduce_min_max_i64_boundary() {
             &[(1, 1, 7, i64::MIN), (2, 1, 7, -1), (3, 1, 7, 0), (4, 1, 7, i64::MAX)],
         );
 
-        let agg = AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Max,
-        };
+        let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Max };
 
         let out = op_reduce(&delta, &mut to_ch, &in_schema, &[1u32], &[agg], None, false, false);
         assert_eq!(out.count, 1);
@@ -2462,14 +2369,8 @@ fn make_batch_raw_pk<T: Copy>(
 /// planner produces for `SELECT …, SUM(v) … GROUP BY …`.
 fn sum_count_aggs(sum_col: u32) -> [AggDescriptor; 2] {
     [
-        AggDescriptor {
-            col_idx: sum_col,
-            agg_op: AggFunc::Sum,
-        },
-        AggDescriptor {
-            col_idx: 0,
-            agg_op: AggFunc::Count,
-        },
+        AggDescriptor { col_idx: sum_col, agg_op: AggFunc::Sum },
+        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
     ]
 }
 
@@ -2511,10 +2412,7 @@ fn test_reduce_group_by_pk_unsorted_input_linear_sum() {
 #[test]
 fn test_reduce_group_by_pk_unsorted_input_count() {
     let in_schema = make_schema_u64_i64();
-    let agg = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggFunc::Count,
-    };
+    let agg = AggDescriptor { col_idx: 1, agg_op: AggFunc::Count };
     let out_schema = out_schema_for(&in_schema, &[0u32], std::slice::from_ref(&agg));
     let mut to_ch = empty_trace(out_schema);
 
@@ -2572,10 +2470,7 @@ fn test_reduce_group_by_pk_unsorted_compound_pk_permuted() {
     let mut delta = make_batch_compound_2xu64(&in_schema, &[(2, 1, 1, 20), (1, 2, 1, 10)]);
     delta.set_layout_unchecked(Layout::Raw);
 
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Count,
-    };
+    let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Count };
 
     // Permuted GROUP BY: [1, 0]. PkPermutation still holds.
     let out = op_reduce(
@@ -2710,10 +2605,7 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
     // weight consolidation does: the retracted entry nets to zero and the seek
     // walks past it to 20.
     let in_schema = make_schema_u64_i64();
-    let agg = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 1, agg_op: AggFunc::Min };
     let out_schema = out_schema_for(&in_schema, &[0u32], std::slice::from_ref(&agg));
 
     // History: pk=1 with two payloads (val=10, val=20). The group IS the PK, so
@@ -2840,10 +2732,7 @@ fn avi_two_groups_distinct_byte_form_keys() {
     let mut to_ch = empty_trace(out_schema);
     let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
-    let agg = AggDescriptor {
-        col_idx: 3,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 3, agg_op: AggFunc::Min };
 
     let out = op_reduce(
         &delta,
@@ -2953,10 +2842,7 @@ fn avi_retraction_returns_next_extremum() {
     let mut to_ch = trace_cursor(to_batch, out_schema);
     let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Min };
 
     let out = op_reduce(
         &delta,
@@ -3049,10 +2935,7 @@ fn avi_non_power_of_two_stride_drives_cursor() {
         let mut to_ch = empty_trace(out_schema);
         let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
-        let agg = AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Min,
-        };
+        let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Min };
 
         let out = op_reduce(
             &delta,
@@ -3146,10 +3029,7 @@ fn min_tie_retract_one_copy_keeps_min() {
 
     let mut to_ch = trace_cursor(to_batch, out_schema);
 
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Min };
 
     let mut avi = Avi::new(&in_schema, &[1u32], &[agg], &[&ti_batch, &delta]);
     let out = op_reduce(
@@ -3223,10 +3103,7 @@ fn min_ignores_null_values() {
 
     let mut to_ch = empty_trace(out_schema);
 
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Min };
 
     let out = op_reduce(&delta, &mut to_ch, &in_schema, &[1u32], &[agg], None, false, false);
 
@@ -3317,10 +3194,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
     let mut to_ch = trace_cursor(to_batch, out_schema);
     let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
-    let agg = AggDescriptor {
-        col_idx: 3,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 3, agg_op: AggFunc::Min };
 
     let out = op_reduce(
         &delta,
@@ -3464,10 +3338,7 @@ fn avi_wide_two_u64_groups_match_reference() {
     let mut to_ch = empty_trace(out_schema);
     let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
-    let agg = AggDescriptor {
-        col_idx: 3,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 3, agg_op: AggFunc::Min };
 
     let out = op_reduce(
         &delta,
@@ -3559,10 +3430,7 @@ fn avi_wide_single_u128_group_distinct() {
     let mut to_ch = empty_trace(out_schema);
     let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Min };
 
     let out = op_reduce(
         &delta,
@@ -3666,10 +3534,7 @@ fn avi_wide_mixed_signed_unsigned_key() {
     let mut to_ch = empty_trace(out_schema);
     let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
-    let agg = AggDescriptor {
-        col_idx: 3,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 3, agg_op: AggFunc::Min };
 
     let out = op_reduce(
         &delta,
@@ -3768,10 +3633,7 @@ fn avi_wide_prefix_collision_distinct_groups() {
     let mut to_ch = empty_trace(out_schema);
     let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
-    let agg = AggDescriptor {
-        col_idx: 4,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 4, agg_op: AggFunc::Min };
 
     let out = op_reduce(
         &delta,
@@ -3879,10 +3741,7 @@ fn avi_wide_retraction_returns_next_extremum() {
     let mut to_ch = trace_cursor(to_batch, out_schema);
     let mut avi_ch = trace_cursor(avi_batch, avi_schema);
 
-    let agg = AggDescriptor {
-        col_idx: 3,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 3, agg_op: AggFunc::Min };
 
     let out = op_reduce(
         &delta,
@@ -3944,10 +3803,7 @@ fn count_accumulator_over_uuid_pk_does_not_panic() {
         b.extend_col(schema.try_payload_idx(1).unwrap(), &0i64.to_le_bytes());
         b.count += 1;
     }
-    let desc = AggDescriptor {
-        col_idx: 0,
-        agg_op: AggFunc::Count,
-    };
+    let desc = AggDescriptor { col_idx: 0, agg_op: AggFunc::Count };
     let mut acc = make_acc(&schema, &[0], desc);
     let mb = b.as_mem_batch();
     acc.step_from_batch(&mb, 0, 1);
@@ -4139,10 +3995,7 @@ fn avi_full_path_pk_source_unsigned_high_byte() {
 #[test]
 fn avi_f32_seed_promotes_to_f64_bits() {
     let in_schema = make_schema_with_type(type_code::F32);
-    let desc = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggFunc::Min,
-    };
+    let desc = AggDescriptor { col_idx: 1, agg_op: AggFunc::Min };
     for v in [1.5f32, -2.25, 0.0, 1.0e30] {
         let mut acc = make_acc(&in_schema, &[0], desc);
         acc.seed_encoded_extreme(gnitz_wire::ieee_order_bits_f32(v.to_bits()));
@@ -4200,10 +4053,7 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
 
     let mut to_ch = empty_trace(out_schema);
 
-    let agg = AggDescriptor {
-        col_idx: 0,
-        agg_op: AggFunc::Count,
-    };
+    let agg = AggDescriptor { col_idx: 0, agg_op: AggFunc::Count };
 
     let out = op_reduce(
         &delta,
@@ -4296,10 +4146,7 @@ fn run_nullable_grp_min_i64(
         &[0],
     );
 
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Min };
 
     // --- Tick 1: empty history, empty trace_out ---
     let delta1 = build_grp_val_delta(&in_schema, tick1_rows);
@@ -4446,10 +4293,7 @@ fn min_multi_col_group_resolves_per_group() {
         &[0],
     );
 
-    let agg = AggDescriptor {
-        col_idx: 3,
-        agg_op: AggFunc::Min,
-    };
+    let agg = AggDescriptor { col_idx: 3, agg_op: AggFunc::Min };
 
     let pi_c1 = in_schema.try_payload_idx(1).unwrap();
     let pi_c2 = in_schema.try_payload_idx(2).unwrap();
@@ -4711,10 +4555,7 @@ fn test_reduce_max_blob_group_retraction() {
         ],
         &[0],
     );
-    let agg = AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Max,
-    };
+    let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Max };
 
     let blob_a: &[u8] = b"PREFIX_AAAAAAAAAA"; // 17 bytes (long)
     let blob_b: &[u8] = b"PREFIX_BBBBBBBBBB"; // 17 bytes, same prefix+length
@@ -4782,18 +4623,9 @@ fn g_delta(rows: &[(u64, i64, i64)]) -> Batch {
     make_batch(&u64_pk_schema(SchemaColumn::new(type_code::I64, 1)), rows)
 }
 
-const G_COUNT: AggDescriptor = AggDescriptor {
-    col_idx: 0,
-    agg_op: AggFunc::Count,
-};
-const G_SUM: AggDescriptor = AggDescriptor {
-    col_idx: 1,
-    agg_op: AggFunc::Sum,
-};
-const G_MIN: AggDescriptor = AggDescriptor {
-    col_idx: 1,
-    agg_op: AggFunc::Min,
-};
+const G_COUNT: AggDescriptor = AggDescriptor { col_idx: 0, agg_op: AggFunc::Count };
+const G_SUM: AggDescriptor = AggDescriptor { col_idx: 1, agg_op: AggFunc::Sum };
+const G_MIN: AggDescriptor = AggDescriptor { col_idx: 1, agg_op: AggFunc::Min };
 
 /// Output `[_group_pk:U128, count:I64, min:I64(nullable)]` — the mixed
 /// non-linear global-aggregate shape (`SELECT COUNT(*), MIN(x)`).
@@ -5150,10 +4982,7 @@ fn sumzero_folds_like_sum_and_empty_renders_zero() {
     assert!(AggFunc::SumZero.is_linear(), "SumZero must be linear");
 
     let schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
-    let desc = AggDescriptor {
-        col_idx: 1,
-        agg_op: AggFunc::SumZero,
-    };
+    let desc = AggDescriptor { col_idx: 1, agg_op: AggFunc::SumZero };
     let mut acc = make_acc(&schema, &[0], desc);
 
     // Fresh: untouched, and renders 0 (Count's identity) rather than NULL (Sum's).
@@ -5249,10 +5078,7 @@ fn emit_global_ground_renders_count_family_zero_null_clear() {
         &[0],
     );
     let descs = [
-        AggDescriptor {
-            col_idx: 0,
-            agg_op: AggFunc::Count,
-        },
+        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
         AggDescriptor {
             col_idx: 1,
             agg_op: AggFunc::CountNonNull,
@@ -5321,14 +5147,8 @@ fn combine_partials(rows: &[(i64, Option<i64>)]) -> Batch {
 
 // SumZero merges the partial counts; a trailing Count counts partial rows (the
 // existence gate `op_reduce` finds via the lone AggFunc::Count).
-const C_SUMZERO: AggDescriptor = AggDescriptor {
-    col_idx: 1,
-    agg_op: AggFunc::SumZero,
-};
-const C_COUNT_PARTIALS: AggDescriptor = AggDescriptor {
-    col_idx: 0,
-    agg_op: AggFunc::Count,
-};
+const C_SUMZERO: AggDescriptor = AggDescriptor { col_idx: 1, agg_op: AggFunc::SumZero };
+const C_COUNT_PARTIALS: AggDescriptor = AggDescriptor { col_idx: 0, agg_op: AggFunc::Count };
 
 /// The phase-3 combine `op_reduce` over hand-built partials (empty group cols →
 /// one global group at V₀, `global_ground = true`, `i_am_owner = true`).
@@ -5494,18 +5314,9 @@ fn reduce_multi_avi_foreign_group() {
         &[0],
     );
     let aggs = [
-        AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Min,
-        },
-        AggDescriptor {
-            col_idx: 3,
-            agg_op: AggFunc::Max,
-        },
-        AggDescriptor {
-            col_idx: 0,
-            agg_op: AggFunc::Count,
-        },
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Min },
+        AggDescriptor { col_idx: 3, agg_op: AggFunc::Max },
+        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
     ];
 
     // pk=1 and pk=2 each span groups g=10 and g=20 (the foreign-group trigger).
@@ -5596,14 +5407,8 @@ fn cg3_delta(rows: &[(u64, i64, i32, i64, bool)]) -> Batch {
     }
     b
 }
-const CG3_MIN: AggDescriptor = AggDescriptor {
-    col_idx: 2,
-    agg_op: AggFunc::Min,
-};
-const CG3_COUNT: AggDescriptor = AggDescriptor {
-    col_idx: 0,
-    agg_op: AggFunc::Count,
-};
+const CG3_MIN: AggDescriptor = AggDescriptor { col_idx: 2, agg_op: AggFunc::Min };
+const CG3_COUNT: AggDescriptor = AggDescriptor { col_idx: 0, agg_op: AggFunc::Count };
 
 /// Helper: run one combined-index reduce tick over `cg3_src()` (MIN + COUNT).
 /// `avi_deltas` is the accumulated integral; `delta` is this tick's input.
@@ -5781,14 +5586,8 @@ fn reduce_multi_avi_same_col_min_max() {
         &[0],
     );
     let aggs = [
-        AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Min,
-        },
-        AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Max,
-        },
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Min },
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Max },
         CG3_COUNT,
     ];
     let delta = cg3_delta(&[(1, 1, 7, 5, false), (2, 1, 7, 8, false), (3, 1, 7, 1, false)]);
@@ -5842,14 +5641,8 @@ fn reduce_multi_avi_compound_group_key() {
         &[0],
     );
     let aggs = [
-        AggDescriptor {
-            col_idx: 3,
-            agg_op: AggFunc::Min,
-        },
-        AggDescriptor {
-            col_idx: 0,
-            agg_op: AggFunc::Count,
-        },
+        AggDescriptor { col_idx: 3, agg_op: AggFunc::Min },
+        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
     ];
     let delta = {
         let mut b = Batch::with_capacity(in_schema, 4);
@@ -5918,18 +5711,9 @@ fn reduce_multi_avi_global_emptied() {
         &[0],
     );
     let aggs = [
-        AggDescriptor {
-            col_idx: 1,
-            agg_op: AggFunc::Min,
-        },
-        AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Sum,
-        },
-        AggDescriptor {
-            col_idx: 0,
-            agg_op: AggFunc::Count,
-        },
+        AggDescriptor { col_idx: 1, agg_op: AggFunc::Min },
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum },
+        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
     ];
     let mk = |rows: &[(u64, i64, i64, i64)]| {
         let mut b = Batch::with_capacity(in_schema, rows.len().max(1));
@@ -6438,18 +6222,9 @@ fn mm_in_schema() -> SchemaDescriptor {
 /// `MIN(val), MAX(val), COUNT(pk)` — MIN ordinal 0, MAX ordinal 1 in the AVI.
 fn mm_aggs() -> [AggDescriptor; 3] {
     [
-        AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Min,
-        },
-        AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Max,
-        },
-        AggDescriptor {
-            col_idx: 0,
-            agg_op: AggFunc::Count,
-        },
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Min },
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Max },
+        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
     ]
 }
 
@@ -6752,18 +6527,9 @@ fn avi_skip_mixed_int_min_float_max() {
         &[0],
     );
     let aggs = [
-        AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Min,
-        },
-        AggDescriptor {
-            col_idx: 3,
-            agg_op: AggFunc::Max,
-        },
-        AggDescriptor {
-            col_idx: 0,
-            agg_op: AggFunc::Count,
-        },
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Min },
+        AggDescriptor { col_idx: 3, agg_op: AggFunc::Max },
+        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
     ];
     let build = |rows: &[(u64, i64, i64, f64, i64)]| -> Batch {
         let g_pi = in_schema.try_payload_idx(1).unwrap();
@@ -6826,18 +6592,9 @@ fn check_float_minmax_against_oracle(val_tc: TypeCode, epochs_rows: &[Vec<(u64, 
         &[0],
     );
     let aggs = [
-        AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Min,
-        },
-        AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Max,
-        },
-        AggDescriptor {
-            col_idx: 0,
-            agg_op: AggFunc::Count,
-        },
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Min },
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Max },
+        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
     ];
     let build = |rows: &[(u64, i64, f64, i64)]| -> Batch {
         let g_pi = in_schema.try_payload_idx(1).unwrap();
@@ -6946,14 +6703,8 @@ fn check_pk_source_max(b_signed: bool) {
         &[0],
     );
     let aggs = [
-        AggDescriptor {
-            col_idx: 1,
-            agg_op: AggFunc::Max,
-        },
-        AggDescriptor {
-            col_idx: 0,
-            agg_op: AggFunc::Count,
-        },
+        AggDescriptor { col_idx: 1, agg_op: AggFunc::Max },
+        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
     ];
     let build = |rows: &[(u64, i64, i64)]| -> Batch {
         let pad_pi = in_schema.try_payload_idx(2).unwrap();
@@ -7029,18 +6780,9 @@ fn avi_skip_global_aggregate() {
         &[0],
     );
     let aggs = [
-        AggDescriptor {
-            col_idx: 1,
-            agg_op: AggFunc::Min,
-        },
-        AggDescriptor {
-            col_idx: 1,
-            agg_op: AggFunc::Max,
-        },
-        AggDescriptor {
-            col_idx: 0,
-            agg_op: AggFunc::Count,
-        },
+        AggDescriptor { col_idx: 1, agg_op: AggFunc::Min },
+        AggDescriptor { col_idx: 1, agg_op: AggFunc::Max },
+        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
     ];
     let build = |rows: &[(u64, i64, i64)]| -> Batch {
         let v_pi = in_schema.try_payload_idx(1).unwrap();
@@ -7160,10 +6902,7 @@ fn test_build_reduce_output_schema_natural_pk() {
         ],
         &[0],
     );
-    let aggs = vec![AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Sum,
-    }];
+    let aggs = vec![AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum }];
     let out = build_reduce_output_schema(&input, &[1], &aggs, crate::schema::ReduceOutKey::SingleNaturalCol).unwrap();
     // Natural PK (single U64 group col) → [U64_PK, I64_agg]
     assert_eq!(out.num_columns(), 2);
@@ -7182,10 +6921,7 @@ fn test_build_reduce_output_schema_compound_natural_pk() {
         ],
         &[0, 1],
     );
-    let aggs = vec![AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Count,
-    }];
+    let aggs = vec![AggDescriptor { col_idx: 2, agg_op: AggFunc::Count }];
     // group_cols = [1, 0] — permuted; the set still equals pk_indices.
     let out = build_reduce_output_schema(&input, &[1, 0], &aggs, crate::schema::ReduceOutKey::PkPermutation).unwrap();
     // 2 PK cols + 1 agg col; pk_indices in source's pk-list order [0, 1].
@@ -7207,10 +6943,7 @@ fn test_build_reduce_output_schema_single_pk_group_by_pk() {
         ],
         &[0],
     );
-    let aggs = vec![AggDescriptor {
-        col_idx: 1,
-        agg_op: AggFunc::Sum,
-    }];
+    let aggs = vec![AggDescriptor { col_idx: 1, agg_op: AggFunc::Sum }];
     let out = build_reduce_output_schema(&input, &[0], &aggs, crate::schema::ReduceOutKey::PkPermutation).unwrap();
     assert_eq!(out.num_columns(), 2);
     assert_eq!(out.pk_indices(), &[0]);
@@ -7228,10 +6961,7 @@ fn test_build_reduce_output_schema_synthetic_pk() {
         ],
         &[0],
     );
-    let aggs = vec![AggDescriptor {
-        col_idx: 2,
-        agg_op: AggFunc::Count,
-    }];
+    let aggs = vec![AggDescriptor { col_idx: 2, agg_op: AggFunc::Count }];
     let out = build_reduce_output_schema(&input, &[1], &aggs, crate::schema::ReduceOutKey::SyntheticFold).unwrap();
     // Synthetic PK (STRING group col) → [U128_hash, STRING_group, I64_count]
     assert_eq!(out.num_columns(), 3);

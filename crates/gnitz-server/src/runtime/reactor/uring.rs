@@ -27,9 +27,7 @@ pub(super) struct IoUringRing {
 
 impl IoUringRing {
     pub(super) fn new(entries: u32) -> std::io::Result<Self> {
-        Ok(IoUringRing {
-            ring: IoUring::new(entries)?,
-        })
+        Ok(IoUringRing { ring: IoUring::new(entries)? })
     }
 
     /// Queue one SQE, flushing the pending batch first if the ring is full.

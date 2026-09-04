@@ -19,10 +19,7 @@ fn generic_twin(pattern: &[u8], escape: Option<u8>, ci: bool) -> LikeMatcher {
     if ci {
         fold_lits(&mut toks);
     }
-    LikeMatcher {
-        kind: LikeKind::Generic(toks),
-        ci,
-    }
+    LikeMatcher { kind: LikeKind::Generic(toks), ci }
 }
 
 /// The matcher shape a pattern compiles to, as text — what the specialization

@@ -174,13 +174,8 @@ impl CatalogEngine {
             gnitz_store::storage::repartition_relation(&directory, &schema, id as u32, self.registry.num_workers())?;
         }
         // `register` owns the staged-directory reclaim and the parent fsync.
-        self.registry.register(RelationSpec {
-            id,
-            kind,
-            schema,
-            directory,
-            budgets,
-        })?;
+        self.registry
+            .register(RelationSpec { id, kind, schema, directory, budgets })?;
         raise_id_counter(&mut self.next_table_id, id);
         Ok(())
     }

@@ -230,10 +230,7 @@ impl Mmap {
                 libc::madvise(raw, len, libc::MADV_SEQUENTIAL);
             }
         }
-        Ok(Mmap {
-            ptr: raw as *mut u8,
-            len,
-        })
+        Ok(Mmap { ptr: raw as *mut u8, len })
     }
 
     /// Open `path` read-only and mmap the whole (non-empty) file.

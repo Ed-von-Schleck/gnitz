@@ -398,11 +398,7 @@ fn order_key_column_out_of_range_is_rejected() {
     let (mut e, tid) = fixture("ss_order_oob", 4, |id| id as i64);
     let spec = identity_spec(
         ReadBound::None,
-        vec![OrderKey {
-            col: 99,
-            desc: false,
-            nulls_first: false,
-        }],
+        vec![OrderKey { col: 99, desc: false, nulls_first: false }],
         0,
     );
     let reply_schema = e.registry().get_schema_desc(tid).unwrap();
@@ -413,11 +409,7 @@ fn order_key_column_out_of_range_is_rejected() {
 fn order_by_desc_limit_keeps_top_k() {
     let (mut e, tid) = fixture("ss_topk", 20, |i| i as i64); // val == id
                                                              // ORDER BY val DESC LIMIT 3  →  the 3 largest vals (ids 19, 18, 17).
-    let order = vec![OrderKey {
-        col: 1,
-        desc: true,
-        nulls_first: false,
-    }];
+    let order = vec![OrderKey { col: 1, desc: true, nulls_first: false }];
     let mut got = run(&mut e, tid, &identity_spec(ReadBound::None, order, 3));
     got.sort();
     assert_eq!(got, vec![(17u128, 17, 1), (18u128, 18, 1), (19u128, 19, 1)]);
@@ -426,11 +418,7 @@ fn order_by_desc_limit_keeps_top_k() {
 #[test]
 fn order_by_asc_limit_keeps_smallest() {
     let (mut e, tid) = fixture("ss_topk_asc", 20, |i| i as i64);
-    let order = vec![OrderKey {
-        col: 1,
-        desc: false,
-        nulls_first: false,
-    }];
+    let order = vec![OrderKey { col: 1, desc: false, nulls_first: false }];
     let mut got = run(&mut e, tid, &identity_spec(ReadBound::None, order, 3));
     got.sort();
     assert_eq!(got, vec![(0u128, 0, 1), (1u128, 1, 1), (2u128, 2, 1)]);
@@ -445,11 +433,7 @@ fn top_k_keeps_boundary_row_whole() {
         "ss_topk_weight",
         [(1u64, 100i64, 3i64), (2, 50, 1), (3, 10, 1)].into_iter(),
     );
-    let order = vec![OrderKey {
-        col: 1,
-        desc: true,
-        nulls_first: false,
-    }];
+    let order = vec![OrderKey { col: 1, desc: true, nulls_first: false }];
     let got = run(&mut e, tid, &identity_spec(ReadBound::None, order, 2));
     assert_eq!(got, vec![(1u128, 100, 3)], "boundary row kept whole at its true weight");
 }
@@ -729,11 +713,7 @@ fn gather_top_k_keeps_boundary_row_whole() {
     e.registry_mut().set_scan_chunk_rows(8);
     // Reply: id U64 PK | val I64 — a gather of the single payload column.
     let reply = e.registry().get_schema_desc(tid).unwrap();
-    let order = vec![OrderKey {
-        col: 1,
-        desc: false,
-        nulls_first: false,
-    }];
+    let order = vec![OrderKey { col: 1, desc: false, nulls_first: false }];
     let spec = rows_spec(vec![], proj_blob(&[(1, 0)]), order, 2);
     let got = e.scan_spec_family(tid, &spec, &reply, 0).unwrap();
     // LIMIT 2 is covered by the single smallest row's weight 3 — kept whole.

@@ -362,11 +362,7 @@ impl WorkerProcess {
             target_id,
             client_id,
             flags: Self::train_flags(server_version, is_last),
-            data: WireData::Range {
-                batch,
-                start_row,
-                count,
-            },
+            data: WireData::Range { batch, start_row, count },
             schema_block: prebuilt,
             ..Default::default()
         }

@@ -93,10 +93,7 @@ fn test_system_table_flush_compacts_l0() {
                 0,
                 0,
                 &format!("idx{i}"),
-                gnitz_wire::IndexProps {
-                    is_unique: false,
-                    is_internal: false,
-                },
+                gnitz_wire::IndexProps { is_unique: false, is_internal: false },
                 1,
             ))
             .unwrap();

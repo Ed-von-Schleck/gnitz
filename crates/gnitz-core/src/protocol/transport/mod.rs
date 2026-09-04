@@ -177,10 +177,7 @@ fn unix_read_into(fd: RawFd, buf: &mut [MaybeUninit<u8>]) -> Result<ReadOutcome,
             return Ok(ReadOutcome::Eof);
         }
         let n = n as usize;
-        return Ok(ReadOutcome::Data {
-            n,
-            drained: n < buf.len(),
-        });
+        return Ok(ReadOutcome::Data { n, drained: n < buf.len() });
     }
 }
 

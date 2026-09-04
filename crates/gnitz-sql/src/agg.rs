@@ -137,11 +137,7 @@ pub(crate) fn fold_partial_schema(
     let agg_col_offset = cols.len() - agg_specs.len();
     let schema = Schema::from_parts(cols, vec![0])
         .map_err(|e| GnitzSqlError::Unsupported(format!("aggregate SELECT partial-reply layout: {e}")))?;
-    Ok(ReduceLayout {
-        schema,
-        group_slots,
-        agg_col_offset,
-    })
+    Ok(ReduceLayout { schema, group_slots, agg_col_offset })
 }
 
 /// The raw reduce column's nullability for one physical spec, via the shared

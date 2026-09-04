@@ -657,14 +657,7 @@ pub(crate) fn delta_reply_to_py(
 ) -> PyResult<Py<PyDeltaReply>> {
     let (batch, cursor) = out;
     let rows = batch_to_lazy(py, Some(schema), batch, None, include_hidden)?;
-    Py::new(
-        py,
-        PyDeltaReply {
-            rows,
-            tag: cursor.tag,
-            tick: cursor.tick,
-        },
-    )
+    Py::new(py, PyDeltaReply { rows, tag: cursor.tag, tick: cursor.tick })
 }
 
 /// The `PyScanResult` build shared by the read paths and the SQL path, which

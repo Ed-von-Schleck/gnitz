@@ -65,8 +65,7 @@ fn decode_view_options(options: &CreateTableOptions) -> Result<ViewOptions, Gnit
             )));
         };
         let sqlparser::ast::Expr::Value(ValueWithSpan {
-            value: Value::SingleQuotedString(text),
-            ..
+            value: Value::SingleQuotedString(text), ..
         }) = value
         else {
             return Err(GnitzSqlError::Plan(format!(
@@ -218,10 +217,7 @@ fn plan_create_view(
     apply_output_aliases(&mut chain, cv.columns.iter().map(|c| &c.name), "CREATE VIEW")?;
 
     Ok(ViewPlan::Create {
-        chain: PlannedChain {
-            name: view_name,
-            views: chain.segments,
-        },
+        chain: PlannedChain { name: view_name, views: chain.segments },
         replace: match replaced_vid {
             // The statement carried the whole definition, `WITH (…)` included.
             Some(_) => ViewReplace::WithBudgets,
@@ -260,10 +256,7 @@ fn plan_alter_view(
     apply_output_aliases(&mut chain, columns.iter(), "ALTER VIEW")?;
 
     Ok(ViewPlan::Create {
-        chain: PlannedChain {
-            name: view_name,
-            views: chain.segments,
-        },
+        chain: PlannedChain { name: view_name, views: chain.segments },
         // `ALTER VIEW … AS` re-renders its body with no option clause.
         replace: ViewReplace::BodyOnly,
     })

@@ -760,11 +760,7 @@ impl SchemaDescriptor {
                 size,
                 type_code,
             },
-            Some(slot) => ColumnLocator::Payload {
-                slot: slot as u8,
-                size,
-                type_code,
-            },
+            Some(slot) => ColumnLocator::Payload { slot: slot as u8, size, type_code },
         }
     }
 }

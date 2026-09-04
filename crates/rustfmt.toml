@@ -1,2 +1,3 @@
 # crates/rustfmt.toml
 max_width = 120
+struct_lit_width = 40

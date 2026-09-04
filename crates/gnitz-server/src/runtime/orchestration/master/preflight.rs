@@ -990,12 +990,7 @@ async fn txn_check_unique_indices<'a>(
                 batch: chk,
                 schema: wire::WireSchema::encoded(tid, idx_schema),
             });
-            plans.push(UniquePlan {
-                tid,
-                col_indices,
-                spec,
-                by_span,
-            });
+            plans.push(UniquePlan { tid, col_indices, spec, by_span });
         }
     }
     let results = execute_and_reclaim(disp, reactor, checks).await?;

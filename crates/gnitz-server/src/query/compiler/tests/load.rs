@@ -260,10 +260,7 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
             vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],
         )
     };
-    let range = |n_eq| gnitz_wire::JoinKind::DeltaTraceRange {
-        n_eq,
-        rel: gnitz_wire::RangeRel::Lt,
-    };
+    let range = |n_eq| gnitz_wire::JoinKind::DeltaTraceRange { n_eq, rel: gnitz_wire::RangeRel::Lt };
     for (kind, want) in [
         (gnitz_wire::JoinKind::DeltaTrace, load::JoinRelay::WholeKey),
         (range(2), load::JoinRelay::EqPrefix { n_eq: 2 }),
@@ -291,10 +288,7 @@ fn the_scatter_key_is_collected_once_however_the_reindex_map_fans_out() {
             (3, OpNode::IntegrateTrace),
             (
                 4,
-                OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange {
-                    n_eq: 0,
-                    rel: gnitz_wire::RangeRel::Le,
-                }),
+                OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange { n_eq: 0, rel: gnitz_wire::RangeRel::Le }),
             ),
         ]),
         vec![
@@ -397,10 +391,7 @@ fn an_auxiliary_reindex_never_contributes_the_scatter_key() {
                 (1, join_reindex),
                 (
                     2,
-                    OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange {
-                        n_eq: 1,
-                        rel: gnitz_wire::RangeRel::Le,
-                    }),
+                    OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange { n_eq: 1, rel: gnitz_wire::RangeRel::Le }),
                 ),
                 (3, OpNode::IntegrateTrace),
                 (4, aux_rekey),

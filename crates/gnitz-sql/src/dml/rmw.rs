@@ -81,7 +81,5 @@ where
     }
     // Exhausted the internal bound under sustained contention: surface a named
     // conflict so the application can retry the whole statement.
-    Err(GnitzSqlError::Conflict {
-        table: Some(table_name.to_string()),
-    })
+    Err(GnitzSqlError::Conflict { table: Some(table_name.to_string()) })
 }

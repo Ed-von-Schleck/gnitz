@@ -13,10 +13,7 @@ use std::sync::Arc;
 fn catalog() -> CatalogSnapshot {
     let mut cat = CatalogSnapshot::default();
     let mut add = |tid: u64, name: &str, class: RelClass, columns: Vec<ColumnDef>| {
-        let schema = Arc::new(Schema {
-            columns,
-            pk_cols: vec![0],
-        });
+        let schema = Arc::new(Schema { columns, pk_cols: vec![0] });
         cat.insert(
             "public",
             name,

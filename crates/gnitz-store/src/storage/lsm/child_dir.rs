@@ -67,10 +67,7 @@ impl Slot {
 impl<'a> ChildAddr<'a> {
     /// `slot`'s store of a relation laid out for `slot.of` workers.
     pub fn worker(slot: Slot) -> Self {
-        ChildAddr::Worker {
-            rank: slot.rank,
-            of: slot.of,
-        }
+        ChildAddr::Worker { rank: slot.rank, of: slot.of }
     }
 
     /// `slot`'s delta store of a fed view.
@@ -105,10 +102,7 @@ impl<'a> ChildAddr<'a> {
     pub fn parse(name: &'a str) -> Option<Self> {
         if let Some(rest) = name.strip_prefix('w') {
             if let Some((rank, of)) = rest.split_once("of") {
-                return Some(ChildAddr::Worker {
-                    rank: parse_id(rank)?,
-                    of: parse_id(of)?,
-                });
+                return Some(ChildAddr::Worker { rank: parse_id(rank)?, of: parse_id(of)? });
             }
         }
         if let Some(id) = name.strip_prefix("idx_") {
@@ -118,10 +112,7 @@ impl<'a> ChildAddr<'a> {
             return Some(ChildAddr::Delta { rank: parse_id(rank)? });
         }
         let (child, rank) = name.strip_prefix("scratch_")?.rsplit_once("_w")?;
-        Some(ChildAddr::Scratch {
-            child,
-            rank: parse_id(rank)?,
-        })
+        Some(ChildAddr::Scratch { child, rank: parse_id(rank)? })
     }
 
     /// True when a relation launched at `num_workers` still owns this child. A

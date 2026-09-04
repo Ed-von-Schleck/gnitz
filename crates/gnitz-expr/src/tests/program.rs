@@ -70,10 +70,7 @@ fn int_add_and_negate() {
     // NEG: -10
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::IntUnary {
-            op: IntUnaryOp::Neg,
-            a: Reg(0),
-        },
+        LogicalInstr::IntUnary { op: IntUnaryOp::Neg, a: Reg(0) },
     ];
     let prog = scalar_prog(&schema, instrs, Reg(1), vec![]);
     let val = row_value(&prog, &mb, 0).expect("not NULL");
@@ -249,22 +246,10 @@ fn conjunction_over_two_cols() -> Vec<LogicalInstr> {
     vec![
         LogicalInstr::LoadColInt { col: 1 },
         LogicalInstr::LoadConst { val: 1 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(0),
-            b: Reg(1),
-        },
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         LogicalInstr::LoadColInt { col: 2 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(3),
-            b: Reg(1),
-        },
-        LogicalInstr::BoolBinary {
-            is_or: false,
-            a: Reg(2),
-            b: Reg(4),
-        },
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(1) },
+        LogicalInstr::BoolBinary { is_or: false, a: Reg(2), b: Reg(4) },
     ]
 }
 
@@ -391,11 +376,7 @@ fn str_col_const_is_classified_never_null() {
         (CmpOp::Lt, "LT_CONST"),
         (CmpOp::Le, "LE_CONST"),
     ] {
-        let instrs = vec![LogicalInstr::StrColConst {
-            op: *op,
-            col: 1,
-            const_idx: ConstIdx(0),
-        }];
+        let instrs = vec![LogicalInstr::StrColConst { op: *op, col: 1, const_idx: ConstIdx(0) }];
         let prog = scalar_prog(&nullable_schema, instrs.clone(), Reg(0), vec![b"x".to_vec()]);
         assert!(!prog.prog.no_nulls, "{_name}: nullable col1 must yield no_nulls=false");
         let prog = scalar_prog(&nonnull_schema, instrs, Reg(0), vec![b"x".to_vec()]);
@@ -414,11 +395,7 @@ fn str_col_const_is_classified_never_null() {
         (CmpOp::Lt, "LT_COL"),
         (CmpOp::Le, "LE_COL"),
     ] {
-        let instrs = vec![LogicalInstr::StrColCol {
-            op: *op,
-            col_a: 1,
-            col_b: 2,
-        }];
+        let instrs = vec![LogicalInstr::StrColCol { op: *op, col_a: 1, col_b: 2 }];
         let prog = scalar_prog(&nullable_schema, instrs.clone(), Reg(0), vec![]);
         assert!(
             !prog.prog.no_nulls,
@@ -445,11 +422,7 @@ fn load_null_else_branch_eval() {
         LogicalInstr::LoadColInt { col: 1 }, // cond
         LogicalInstr::LoadConst { val: 42 }, // a
         LogicalInstr::LoadNull,              // else NULL
-        LogicalInstr::Select {
-            cond: Reg(0),
-            a: Reg(1),
-            b: Reg(2),
-        },
+        LogicalInstr::Select { cond: Reg(0), a: Reg(1), b: Reg(2) },
     ];
     let prog = scalar_prog(&schema, instrs, Reg(3), vec![]);
 
@@ -479,11 +452,7 @@ fn load_null_forces_the_nullable_path() {
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
         LogicalInstr::LoadNull,
-        LogicalInstr::Select {
-            cond: Reg(0),
-            a: Reg(0),
-            b: Reg(1),
-        },
+        LogicalInstr::Select { cond: Reg(0), a: Reg(0), b: Reg(1) },
     ];
     let prog = scalar_prog(&nonnull_schema, instrs, Reg(2), vec![]);
     assert!(!prog.prog.no_nulls, "LoadNull must force the nullable path");
@@ -498,11 +467,7 @@ fn select_is_non_nullable_when_both_branches_are() {
         LogicalInstr::LoadColInt { col: 1 },
         LogicalInstr::LoadColInt { col: 2 },
         LogicalInstr::LoadColInt { col: 3 },
-        LogicalInstr::Select {
-            cond: Reg(0),
-            a: Reg(1),
-            b: Reg(2),
-        },
+        LogicalInstr::Select { cond: Reg(0), a: Reg(1), b: Reg(2) },
     ];
     let prog = scalar_prog(&nonnull_schema, instrs, Reg(3), vec![]);
     assert!(
@@ -521,17 +486,9 @@ fn select_propagates_u64_tracking_to_its_reader() {
         LogicalInstr::LoadColInt { col: 2 }, // cond (i64)
         LogicalInstr::LoadColInt { col: 1 }, // a (U64)
         LogicalInstr::LoadColInt { col: 2 }, // b (i64)
-        LogicalInstr::Select {
-            cond: Reg(0),
-            a: Reg(1),
-            b: Reg(2),
-        },
+        LogicalInstr::Select { cond: Reg(0), a: Reg(1), b: Reg(2) },
         LogicalInstr::LoadConst { val: 100 },
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(3),
-            b: Reg(4),
-        },
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(4) },
     ];
     let prog = scalar_prog(&schema, instrs, Reg(5), vec![]);
     // Found by shape, not by position: which index resolution lands the compare
@@ -556,21 +513,11 @@ fn select_classification_of_cond_and_result() {
         LogicalInstr::LoadColInt { col: 1 }, // cond
         LogicalInstr::LoadColInt { col: 2 }, // a
         LogicalInstr::LoadColInt { col: 3 }, // b
-        LogicalInstr::Select {
-            cond: Reg(0),
-            a: Reg(1),
-            b: Reg(2),
-        },
+        LogicalInstr::Select { cond: Reg(0), a: Reg(1), b: Reg(2) },
         LogicalInstr::LoadColInt { col: 4 }, // other bool
-        LogicalInstr::BoolBinary {
-            is_or: false,
-            a: Reg(3),
-            b: Reg(4),
-        },
+        LogicalInstr::BoolBinary { is_or: false, a: Reg(3), b: Reg(4) },
     ];
-    let ProgramFacts {
-        bit_only, bool_pack, ..
-    } = analyze(&instrs, &[], &schema, Some(Reg(5)), true);
+    let ProgramFacts { bit_only, bool_pack, .. } = analyze(&instrs, &[], &schema, Some(Reg(5)), true);
     // The same program must also be a legal filter.
     filter_prog(&schema, instrs, Reg(5), vec![]);
     // Neither r0 nor r3 is bool-produced, so neither can be bit_only and their
@@ -594,11 +541,7 @@ fn a_select_result_reads_back_as_a_value() {
         LogicalInstr::LoadColInt { col: 1 }, // cond, truthy
         LogicalInstr::LoadConst { val: 5 },
         LogicalInstr::LoadConst { val: 7 },
-        LogicalInstr::Select {
-            cond: Reg(0),
-            a: Reg(1),
-            b: Reg(2),
-        },
+        LogicalInstr::Select { cond: Reg(0), a: Reg(1), b: Reg(2) },
     ];
     let prog = scalar_prog(&schema, instrs, Reg(3), vec![]);
     assert!(!prog.prog.no_nulls, "the nullable load keeps this off the no_nulls arm");
@@ -613,21 +556,13 @@ fn nested_selects_evaluate_inside_out() {
     // Schema: pk, c1, c2, v1, v2, v3.
     let schema = schema_pk_ints(5, true);
     let instrs = vec![
-        LogicalInstr::LoadColInt { col: 1 }, // c1
-        LogicalInstr::LoadColInt { col: 2 }, // c2
-        LogicalInstr::LoadColInt { col: 3 }, // v1
-        LogicalInstr::LoadColInt { col: 4 }, // v2
-        LogicalInstr::LoadColInt { col: 5 }, // v3
-        LogicalInstr::Select {
-            cond: Reg(1),
-            a: Reg(3),
-            b: Reg(4),
-        }, // inner = c2 ? v2 : v3
-        LogicalInstr::Select {
-            cond: Reg(0),
-            a: Reg(2),
-            b: Reg(5),
-        }, // outer = c1 ? v1 : inner
+        LogicalInstr::LoadColInt { col: 1 },                         // c1
+        LogicalInstr::LoadColInt { col: 2 },                         // c2
+        LogicalInstr::LoadColInt { col: 3 },                         // v1
+        LogicalInstr::LoadColInt { col: 4 },                         // v2
+        LogicalInstr::LoadColInt { col: 5 },                         // v3
+        LogicalInstr::Select { cond: Reg(1), a: Reg(3), b: Reg(4) }, // inner = c2 ? v2 : v3
+        LogicalInstr::Select { cond: Reg(0), a: Reg(2), b: Reg(5) }, // outer = c1 ? v1 : inner
     ];
     let prog = scalar_prog(&schema, instrs, Reg(6), vec![]);
     // payload cols: c1, c2, v1=10, v2=20, v3=30.
@@ -721,14 +656,7 @@ fn validate_err_display_names_the_register_limit() {
     // The type half of the requirement. The region half is its own variant, and
     // its own sentence below — a PK column is exactly what a client is likely to
     // have named.
-    let mismatch = |want| {
-        ExprValidateErr::ColKindMismatch {
-            col: 2,
-            type_code: type_code::U64,
-            want,
-        }
-        .to_string()
-    };
+    let mismatch = |want| ExprValidateErr::ColKindMismatch { col: 2, type_code: type_code::U64, want }.to_string();
     assert_eq!(
         mismatch(type_phrase(ColKind::FixedIntCol)),
         "column 2 (type code 8) cannot be used here; this operator needs a fixed-width integer column"
@@ -761,10 +689,7 @@ fn from_wire_rejects_a_bad_register_file() {
     // A result register no instruction writes.
     assert_eq!(
         wire_err(LogicalProgram::from_wire(&[3, 0, 0], &[], Some(Reg(3)), vec![])),
-        ExprValidateErr::ResultRegOutOfRange {
-            result_reg: 3,
-            num_regs: 1,
-        }
+        ExprValidateErr::ResultRegOutOfRange { result_reg: 3, num_regs: 1 }
     );
 }
 
@@ -802,10 +727,7 @@ fn validate_rejects_an_out_of_range_column() {
     let prog = LogicalProgram::from_wire(&[1, 200, 0], &[], None, vec![]).unwrap();
     assert_eq!(
         prog.validate(&s3, None),
-        Err(ExprValidateErr::ColOutOfRange {
-            col: 200,
-            num_columns: 3,
-        })
+        Err(ExprValidateErr::ColOutOfRange { col: 200, num_columns: 3 })
     );
 }
 
@@ -1002,12 +924,7 @@ fn copy_col_admits_only_a_widening_destination() {
     ] {
         assert_eq!(
             pair(src, dst),
-            Err(ExprValidateErr::CopyTypeMismatch {
-                col: 1,
-                src_tc: src,
-                out: 0,
-                out_tc: dst,
-            }),
+            Err(ExprValidateErr::CopyTypeMismatch { col: 1, src_tc: src, out: 0, out_tc: dst }),
             "{src} -> {dst} must be rejected"
         );
     }
@@ -1070,10 +987,7 @@ fn validate_rejects_a_sink_list_that_does_not_cover_the_output() {
     // Only slot 0 written.
     assert_eq!(
         map(&[0, 1]).validate(&schema, Some(&schema)),
-        Err(ExprValidateErr::OutputSlotCountMismatch {
-            sinks: 1,
-            num_payload_cols: 2,
-        })
+        Err(ExprValidateErr::OutputSlotCountMismatch { sinks: 1, num_payload_cols: 2 })
     );
 
     // A predicate over the same program is unaffected — no output plan.
@@ -1107,10 +1021,7 @@ fn in_set_prog(col_tc: u8, set: &[i64]) -> (TestSchema, Evaluator) {
     let schema = TestSchema::with_pk_at(0, &[type_code::U64, col_tc]);
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::IntInSet {
-            value_reg: Reg(0),
-            set_idx: ConstIdx(0),
-        },
+        LogicalInstr::IntInSet { value_reg: Reg(0), set_idx: ConstIdx(0) },
     ];
     let prog = scalar_prog(&schema, instrs, Reg(1), vec![gnitz_wire::as_le_bytes(set).to_vec()]);
     (schema, prog)
@@ -1170,10 +1081,7 @@ fn not_in_set_excludes_a_null_operand() {
     let schema = schema_pk_ints(1, true);
     let instrs = vec![
         LogicalInstr::LoadColInt { col: 1 },
-        LogicalInstr::IntInSet {
-            value_reg: Reg(0),
-            set_idx: ConstIdx(0),
-        },
+        LogicalInstr::IntInSet { value_reg: Reg(0), set_idx: ConstIdx(0) },
         LogicalInstr::BoolNot { a: Reg(1) },
     ];
     let prog = scalar_prog(
@@ -1235,9 +1143,7 @@ fn validate_rejects_an_out_of_range_set_idx() {
 fn classifier_pure_conjunction_filter() {
     let schema = schema_pk_ints(2, true);
     let instrs = conjunction_over_two_cols();
-    let ProgramFacts {
-        bit_only, bool_pack, ..
-    } = analyze(&instrs, &[], &schema, Some(Reg(5)), true);
+    let ProgramFacts { bit_only, bool_pack, .. } = analyze(&instrs, &[], &schema, Some(Reg(5)), true);
     // The same program must also be a legal filter.
     filter_prog(&schema, instrs, Reg(5), vec![]);
     // Bool producers: r2 (CMP_GT), r4 (CMP_GT), r5 (BOOL_AND).
@@ -1353,32 +1259,19 @@ fn narrowing_casts_manufacture_null_but_pure_transforms_do_not() {
         scalar_prog(&nonnull, instrs, Reg(1), vec![]).prog.no_nulls
     };
     for instr in [
-        LogicalInstr::IntUnary {
-            op: IntUnaryOp::Abs,
-            a: Reg(0),
-        },
+        LogicalInstr::IntUnary { op: IntUnaryOp::Abs, a: Reg(0) },
         LogicalInstr::FloatUnary {
             op: super::FloatUnaryOp::Round,
             a: Reg(0),
         },
-        LogicalInstr::IntMinMax2 {
-            a: Reg(0),
-            b: Reg(0),
-            is_max: true,
-        },
+        LogicalInstr::IntMinMax2 { a: Reg(0), b: Reg(0), is_max: true },
     ] {
         assert!(with(instr), "a propagating transform keeps no_nulls");
     }
     for instr in [
         LogicalInstr::FloatToF32 { a: Reg(0) },
-        LogicalInstr::IntCast {
-            a: Reg(0),
-            fi: FixedInt::I8,
-        },
-        LogicalInstr::FloatToInt {
-            a: Reg(0),
-            fi: FixedInt::I8,
-        },
+        LogicalInstr::IntCast { a: Reg(0), fi: FixedInt::I8 },
+        LogicalInstr::FloatToInt { a: Reg(0), fi: FixedInt::I8 },
     ] {
         assert!(!with(instr), "a narrowing cast manufactures NULL");
     }
@@ -1448,18 +1341,10 @@ fn min_max2_compare_domain_and_u64_propagation() {
         let instrs = vec![
             LogicalInstr::LoadColInt { col: a_col },
             LogicalInstr::LoadColInt { col: b_col },
-            LogicalInstr::IntMinMax2 {
-                a: Reg(0),
-                b: Reg(1),
-                is_max: true,
-            },
+            LogicalInstr::IntMinMax2 { a: Reg(0), b: Reg(1), is_max: true },
             // A second fold against the signed column reads dst's taint.
             LogicalInstr::LoadColInt { col: 2 },
-            LogicalInstr::IntMinMax2 {
-                a: Reg(2),
-                b: Reg(3),
-                is_max: true,
-            },
+            LogicalInstr::IntMinMax2 { a: Reg(2), b: Reg(3), is_max: true },
         ];
         let prog = scalar_prog(&schema, instrs, Reg(4), vec![]);
         prog.prog
@@ -1490,11 +1375,7 @@ fn int_cast_reseeds_u64_tracking_from_its_target() {
             LogicalInstr::LoadColInt { col: src_col },
             LogicalInstr::IntCast { a: Reg(0), fi },
             LogicalInstr::LoadConst { val: 0 },
-            LogicalInstr::Cmp {
-                op: CmpOp::Gt,
-                a: Reg(1),
-                b: Reg(2),
-            },
+            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(1), b: Reg(2) },
         ];
         let prog = scalar_prog(&schema, instrs, Reg(3), vec![]);
         prog.prog
@@ -1522,10 +1403,7 @@ fn int_cast_records_the_source_signedness() {
     let src_signed_of = |src_col: u32| {
         let instrs = vec![
             LogicalInstr::LoadColInt { col: src_col },
-            LogicalInstr::IntCast {
-                a: Reg(0),
-                fi: FixedInt::I8,
-            },
+            LogicalInstr::IntCast { a: Reg(0), fi: FixedInt::I8 },
         ];
         let prog = scalar_prog(&schema, instrs, Reg(1), vec![]);
         prog.prog
@@ -1663,19 +1541,13 @@ fn a_register_sink_must_match_its_destination_column() {
     let scalar_src = LogicalProgram::from_wire(&[ExprOp::LoadConst.as_wire(), 7, 0], store_r0, None, vec![]).unwrap();
     assert_eq!(
         scalar_src.validate(&in_str, Some(&str_out)),
-        Err(ExprValidateErr::EmitClassMismatch {
-            out: 0,
-            type_code: type_code::STRING
-        })
+        Err(ExprValidateErr::EmitClassMismatch { out: 0, type_code: type_code::STRING })
     );
 
     let str_src = LogicalProgram::from_wire(&[ExprOp::LoadColStr.as_wire(), 1, 0], store_r0, None, vec![]).unwrap();
     assert_eq!(
         str_src.validate(&in_str, Some(&int_out)),
-        Err(ExprValidateErr::EmitClassMismatch {
-            out: 0,
-            type_code: type_code::I64
-        })
+        Err(ExprValidateErr::EmitClassMismatch { out: 0, type_code: type_code::I64 })
     );
     // The matching pairing is accepted, and the class mask the check read holds
     // reg 0 to be a string for one program and a scalar for the other.
@@ -1830,11 +1702,7 @@ fn string_nullability_classification() {
     assert!(no_nulls(vec![LogicalInstr::StrReverse { a: Reg(0) }]));
     assert!(no_nulls(vec![
         LogicalInstr::LoadConst { val: 1 },
-        LogicalInstr::StrSide {
-            src: Reg(0),
-            n_reg: Reg(1),
-            left: true
-        }
+        LogicalInstr::StrSide { src: Reg(0), n_reg: Reg(1), left: true }
     ]));
     assert!(!no_nulls(vec![LogicalInstr::StrReplace {
         s: Reg(0),
@@ -1852,16 +1720,9 @@ fn string_nullability_classification() {
     ]));
     assert!(!no_nulls(vec![
         LogicalInstr::LoadConst { val: 1 },
-        LogicalInstr::StrSplitPart {
-            s: Reg(0),
-            delim: Reg(0),
-            n_reg: Reg(1)
-        }
+        LogicalInstr::StrSplitPart { s: Reg(0), delim: Reg(0), n_reg: Reg(1) }
     ]));
-    assert!(!no_nulls(vec![LogicalInstr::StrToInt {
-        a: Reg(0),
-        fi: FixedInt::I64
-    }]));
+    assert!(!no_nulls(vec![LogicalInstr::StrToInt { a: Reg(0), fi: FixedInt::I64 }]));
     // SUBSTR's only NULL is a negative length, so the two forms classify
     // differently: with a FOR clause it can produce one, without it cannot. The
     // window itself is total either way.
@@ -1870,11 +1731,7 @@ fn string_nullability_classification() {
         if len_reg.is_some() {
             tail.push(LogicalInstr::LoadConst { val: 3 });
         }
-        tail.push(LogicalInstr::StrSubstr {
-            src: Reg(0),
-            start_reg: Reg(1),
-            len_reg,
-        });
+        tail.push(LogicalInstr::StrSubstr { src: Reg(0), start_reg: Reg(1), len_reg });
         no_nulls(tail)
     };
     assert!(substr(None), "no FOR clause writes no fail flag");
@@ -1963,9 +1820,7 @@ fn every_variant() -> Vec<LogicalInstr> {
     let mut v = vec![
         L::LoadColInt { col: 2 },
         L::LoadColFloat { col: 4 },
-        L::LoadConst {
-            val: -1_234_567_890_123,
-        },
+        L::LoadConst { val: -1_234_567_890_123 },
         L::IntArith {
             op: IntArithOp::Add,
             a: Reg(7),
@@ -2013,30 +1868,12 @@ fn every_variant() -> Vec<LogicalInstr> {
         },
         L::IntToFloat { a: Reg(34) },
         L::FloatToF32 { a: Reg(36) },
-        L::FloatToInt {
-            a: Reg(38),
-            fi: FixedInt::I16,
-        },
-        L::IntCast {
-            a: Reg(40),
-            fi: FixedInt::I32,
-        },
-        L::Select {
-            cond: Reg(42),
-            a: Reg(43),
-            b: Reg(44),
-        },
+        L::FloatToInt { a: Reg(38), fi: FixedInt::I16 },
+        L::IntCast { a: Reg(40), fi: FixedInt::I32 },
+        L::Select { cond: Reg(42), a: Reg(43), b: Reg(44) },
         L::LoadNull,
-        L::BoolBinary {
-            is_or: false,
-            a: Reg(47),
-            b: Reg(48),
-        },
-        L::BoolBinary {
-            is_or: true,
-            a: Reg(50),
-            b: Reg(51),
-        },
+        L::BoolBinary { is_or: false, a: Reg(47), b: Reg(48) },
+        L::BoolBinary { is_or: true, a: Reg(50), b: Reg(51) },
         L::BoolNot { a: Reg(53) },
         L::IsNull { col: 55, invert: false },
         L::IsNull { col: 57, invert: true },
@@ -2045,15 +1882,9 @@ fn every_variant() -> Vec<LogicalInstr> {
             set_idx: ConstIdx(60),
         },
         L::LoadColStr { col: 62 },
-        L::LoadConstStr {
-            const_idx: ConstIdx(64),
-        },
+        L::LoadConstStr { const_idx: ConstIdx(64) },
         L::LoadNullStr,
-        L::StrSelect {
-            cond: Reg(67),
-            a: Reg(68),
-            b: Reg(69),
-        },
+        L::StrSelect { cond: Reg(67), a: Reg(68), b: Reg(69) },
         // The two packed-pair families sit in *different* operand words —
         // SELECT/SUBSTR in a2, TRIM/LIKE in a1 — which is the single
         // per-opcode fact the encoder and decoder can silently disagree on.
@@ -2094,41 +1925,18 @@ fn every_variant() -> Vec<LogicalInstr> {
         },
         L::IntToStr { a: Reg(87) },
         L::FloatToStr { a: Reg(89) },
-        L::StrToInt {
-            a: Reg(91),
-            fi: FixedInt::I64,
-        },
+        L::StrToInt { a: Reg(91), fi: FixedInt::I64 },
         L::StrToFloat { a: Reg(93) },
     ];
     // The operator- and flag-parameterized families, every value of each.
     for op in [CmpOp::Eq, CmpOp::Ne, CmpOp::Gt, CmpOp::Ge, CmpOp::Lt, CmpOp::Le] {
-        v.push(L::Cmp {
-            op,
-            a: Reg(101),
-            b: Reg(102),
-        });
-        v.push(L::FCmp {
-            op,
-            a: Reg(104),
-            b: Reg(105),
-        });
+        v.push(L::Cmp { op, a: Reg(101), b: Reg(102) });
+        v.push(L::FCmp { op, a: Reg(104), b: Reg(105) });
     }
     for op in [CmpOp::Eq, CmpOp::Ne, CmpOp::Gt, CmpOp::Ge, CmpOp::Lt, CmpOp::Le] {
-        v.push(L::StrColConst {
-            op,
-            col: 107,
-            const_idx: ConstIdx(108),
-        });
-        v.push(L::StrColCol {
-            op,
-            col_a: 110,
-            col_b: 111,
-        });
-        v.push(L::StrCmp {
-            op,
-            a: Reg(113),
-            b: Reg(114),
-        });
+        v.push(L::StrColConst { op, col: 107, const_idx: ConstIdx(108) });
+        v.push(L::StrColCol { op, col_a: 110, col_b: 111 });
+        v.push(L::StrCmp { op, a: Reg(113), b: Reg(114) });
     }
     for op in [IntUnaryOp::Neg, IntUnaryOp::Abs, IntUnaryOp::Sign] {
         v.push(L::IntUnary { op, a: Reg(116) });
@@ -2154,16 +1962,8 @@ fn every_variant() -> Vec<LogicalInstr> {
         b: Reg(120),
     });
     for is_max in [true, false] {
-        v.push(L::IntMinMax2 {
-            a: Reg(120),
-            b: Reg(121),
-            is_max,
-        });
-        v.push(L::FloatMinMax2 {
-            a: Reg(123),
-            b: Reg(124),
-            is_max,
-        });
+        v.push(L::IntMinMax2 { a: Reg(120), b: Reg(121), is_max });
+        v.push(L::FloatMinMax2 { a: Reg(123), b: Reg(124), is_max });
     }
     for chars in [false, true] {
         v.push(L::StrLen { a: Reg(126), chars });
@@ -2175,11 +1975,7 @@ fn every_variant() -> Vec<LogicalInstr> {
         v.push(L::IsNullReg { a: Reg(129), invert });
     }
     for left in [true, false] {
-        v.push(L::StrSide {
-            src: Reg(132),
-            n_reg: Reg(133),
-            left,
-        });
+        v.push(L::StrSide { src: Reg(132), n_reg: Reg(133), left });
         v.push(L::StrPad {
             s: Reg(134),
             n_reg: Reg(135),
@@ -2187,10 +1983,7 @@ fn every_variant() -> Vec<LogicalInstr> {
             left,
         });
     }
-    v.push(L::StrPos {
-        hay: Reg(137),
-        needle: Reg(138),
-    });
+    v.push(L::StrPos { hay: Reg(137), needle: Reg(138) });
     v.push(L::StrReverse { a: Reg(139) });
     v.push(L::StrReplace {
         s: Reg(140),
@@ -2203,11 +1996,7 @@ fn every_variant() -> Vec<LogicalInstr> {
         n_reg: Reg(145),
     });
     for skip_null in [false, true] {
-        v.push(L::StrConcat {
-            a: Reg(130),
-            b: Reg(131),
-            skip_null,
-        });
+        v.push(L::StrConcat { a: Reg(130), b: Reg(131), skip_null });
     }
     v
 }

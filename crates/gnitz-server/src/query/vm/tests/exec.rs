@@ -98,11 +98,7 @@ fn union_nullability_schemas() -> (SchemaDescriptor, SchemaDescriptor, SchemaDes
 /// the test seeds it. Three delta registers under one schema, output reg 1.
 fn union_program(schema: SchemaDescriptor) -> Box<VmHandle> {
     let mut builder = ProgramBuilder::new();
-    builder.push(Instr::Union {
-        in_a: 0,
-        in_b: 2,
-        out_reg: 1,
-    });
+    builder.push(Instr::Union { in_a: 0, in_b: 2, out_reg: 1 });
     builder.build(vec![RegisterMeta::delta(schema); 3], 1)
 }
 
@@ -128,11 +124,7 @@ fn test_filter_negate_pipeline() {
     let pred_prog = gnitz_expr::LogicalProgram::new(pred_instrs, Vec::new(), Some(Reg(2)), vec![]);
     let mut builder = ProgramBuilder::new();
     let pred_idx = builder.push_predicate(pred_prog.resolve_filter(&schema).unwrap());
-    builder.push(Instr::Filter {
-        in_reg: 0,
-        out_reg: 1,
-        pred_idx,
-    });
+    builder.push(Instr::Filter { in_reg: 0, out_reg: 1, pred_idx });
     builder.push(Instr::Negate { in_reg: 1, out_reg: 2 });
 
     let input = make_batch_u128(&schema, &[(1, 1, 10), (2, 1, -5), (3, 1, 20)]);
@@ -212,11 +204,7 @@ fn test_union_runs_under_the_merged_output_schema() {
     right.certify_layout(Layout::Sorted, &schema_b);
 
     let mut builder = ProgramBuilder::new();
-    builder.push(Instr::Union {
-        in_a: 0,
-        in_b: 2,
-        out_reg: 1,
-    });
+    builder.push(Instr::Union { in_a: 0, in_b: 2, out_reg: 1 });
     let reg_meta = vec![
         RegisterMeta::delta(schema_a),
         RegisterMeta::delta(merged),
@@ -248,11 +236,7 @@ fn test_union_identity_path_output_carries_out_register_schema() {
     let left = make_batch_u128(&schema_a, &[(1, 1, -3)]);
 
     let mut builder = ProgramBuilder::new();
-    builder.push(Instr::Union {
-        in_a: 0,
-        in_b: 2,
-        out_reg: 1,
-    });
+    builder.push(Instr::Union { in_a: 0, in_b: 2, out_reg: 1 });
     let reg_meta = vec![
         RegisterMeta::delta(schema_a),
         RegisterMeta::delta(merged),
@@ -274,11 +258,7 @@ fn test_union_identity_path_output_carries_out_register_schema() {
 fn test_self_union_doubles_weights() {
     let schema = make_schema_u128_i64();
     let mut builder = ProgramBuilder::new();
-    builder.push(Instr::Union {
-        in_a: 0,
-        in_b: 0,
-        out_reg: 1,
-    });
+    builder.push(Instr::Union { in_a: 0, in_b: 0, out_reg: 1 });
     let input = make_batch_u128(&schema, &[(1, 1, 10), (2, 3, 20)]);
     let mut vm = builder.build(vec![RegisterMeta::delta(schema); 2], 1);
     let result = execute_epoch(&mut vm, input, 0).unwrap().unwrap();
@@ -299,11 +279,7 @@ fn a_non_consuming_union_leaves_its_operand_readable() {
     let mut builder = ProgramBuilder::new();
     // reg1 = -reg0; reg2 = reg0 ∪ reg1; reg3 = -reg0 again.
     builder.push(Instr::Negate { in_reg: 0, out_reg: 1 });
-    builder.push(Instr::Union {
-        in_a: 0,
-        in_b: 1,
-        out_reg: 2,
-    });
+    builder.push(Instr::Union { in_a: 0, in_b: 1, out_reg: 2 });
     builder.push(Instr::Negate { in_reg: 0, out_reg: 3 });
 
     let input = make_batch_u128(&schema, &[(1, 1, 10), (2, 3, 20)]);
@@ -367,11 +343,7 @@ fn test_map_operator() {
         )
         .unwrap(),
     );
-    builder.push(Instr::Map {
-        in_reg: 0,
-        out_reg: 1,
-        map_idx,
-    });
+    builder.push(Instr::Map { in_reg: 0, out_reg: 1, map_idx });
 
     let input = make_batch_2col(in_schema, &[(1, 1, 10, 100), (2, 1, 20, 200)]);
     let reg_meta = vec![RegisterMeta::delta(in_schema), RegisterMeta::delta(out_schema)];
@@ -500,24 +472,15 @@ fn test_reduce_groups_by_a_payload_column() {
     // SUM of payload col 1 (schema col 2), plus the trailing Count cardinality
     // companion every all-linear reduce carries.
     let agg_descs = [
-        AggDescriptor {
-            col_idx: 2,
-            agg_op: AggFunc::Sum,
-        },
-        AggDescriptor {
-            col_idx: 0,
-            agg_op: AggFunc::Count,
-        },
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Sum },
+        AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
     ];
     let group_cols = [1u32]; // schema col 1 = payload col 0 (group key)
 
     let mut builder = ProgramBuilder::new();
     builder.push_table(trace_out_table);
     push_reduce(&mut builder, &agg_descs, &group_cols, in_schema, false, false);
-    builder.push(Instr::Integrate {
-        in_reg: 2,
-        trace_reg: 1,
-    });
+    builder.push(Instr::Integrate { in_reg: 2, trace_reg: 1 });
 
     let reg_meta = vec![
         RegisterMeta::delta(in_schema),
@@ -550,10 +513,7 @@ fn test_reduce_multi_agg() {
             col_idx: 1, // schema col index for the val column
             agg_op: AggFunc::Count,
         },
-        AggDescriptor {
-            col_idx: 1,
-            agg_op: AggFunc::Sum,
-        },
+        AggDescriptor { col_idx: 1, agg_op: AggFunc::Sum },
     ];
     // GROUP BY col 0 (= pk, schema col index 0)
     let group_cols = [0u32];
@@ -561,10 +521,7 @@ fn test_reduce_multi_agg() {
     let mut builder = ProgramBuilder::new();
     builder.push_table(trace_out_table);
     push_reduce(&mut builder, &agg_descs, &group_cols, in_schema, false, false);
-    builder.push(Instr::Integrate {
-        in_reg: 2,
-        trace_reg: 1,
-    });
+    builder.push(Instr::Integrate { in_reg: 2, trace_reg: 1 });
 
     let reg_meta = vec![
         RegisterMeta::delta(in_schema),
@@ -591,18 +548,12 @@ fn test_reduce_multi_agg() {
 #[test]
 fn an_empty_epoch_mints_the_ground_row_once() {
     let in_schema = make_schema_u128_i64();
-    let aggs = [AggDescriptor {
-        col_idx: 1,
-        agg_op: AggFunc::Count,
-    }];
+    let aggs = [AggDescriptor { col_idx: 1, agg_op: AggFunc::Count }];
     let dir = tempfile::tempdir().unwrap();
     let mut builder = ProgramBuilder::new();
     let out_schema = push_reduce(&mut builder, &aggs, &[], in_schema, true, true);
     builder.push_table(owned_table(dir.path(), "ground_tr", out_schema));
-    builder.push(Instr::Integrate {
-        in_reg: 2,
-        trace_reg: 1,
-    });
+    builder.push(Instr::Integrate { in_reg: 2, trace_reg: 1 });
     let reg_meta = vec![
         RegisterMeta::delta(in_schema),
         RegisterMeta::trace(out_schema, TableIdx(0)),
@@ -633,10 +584,7 @@ fn an_empty_epoch_mints_the_ground_row_once() {
 #[test]
 fn a_ground_reduce_this_worker_does_not_own_leaves_the_latch_clear() {
     let in_schema = make_schema_u128_i64();
-    let aggs = [AggDescriptor {
-        col_idx: 1,
-        agg_op: AggFunc::Count,
-    }];
+    let aggs = [AggDescriptor { col_idx: 1, agg_op: AggFunc::Count }];
     let dir = tempfile::tempdir().unwrap();
     let mut builder = ProgramBuilder::new();
     let out_schema = push_reduce(&mut builder, &aggs, &[], in_schema, true, false);

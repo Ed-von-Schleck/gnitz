@@ -601,12 +601,7 @@ fn desugar(
     };
     let items = items
         .into_iter()
-        .map(|it| {
-            Ok(ProjEntry {
-                expr: h.refs(&it.expr)?,
-                out: it.out,
-            })
-        })
+        .map(|it| Ok(ProjEntry { expr: h.refs(&it.expr)?, out: it.out }))
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
     let qualify = qualify.map(|q| h.refs(&q)).transpose()?;
     let calls: Vec<Call<ColId>> = win
@@ -643,10 +638,7 @@ fn desugar(
         _ => None,
     };
     let w = match in_place {
-        Some(pos) => WRel {
-            rel: Rc::clone(&input),
-            pos,
-        },
+        Some(pos) => WRel { rel: Rc::clone(&input), pos },
         None => WRel {
             pos: h.items.iter().enumerate().map(|(i, it)| (it.out.id, i)).collect(),
             rel: RelExpr::project(input, h.items),
@@ -661,11 +653,7 @@ fn desugar(
     let mut values: HashMap<ColId, ColId> = HashMap::new();
     for (si, spec) in specs.iter().enumerate() {
         let mine: Vec<&Call<ColId>> = calls.iter().filter(|c| c.spec == si).collect();
-        let Windowed {
-            rel: right,
-            keys,
-            values: vals,
-        } = if spec.order.is_empty() {
+        let Windowed { rel: right, keys, values: vals } = if spec.order.is_empty() {
             whole_partition(ids, &w, spec, &mine)?
         } else {
             cumulative(ids, &w, spec, &mine)?
@@ -710,12 +698,7 @@ fn desugar(
     };
     let items = items
         .into_iter()
-        .map(|it| {
-            Ok(ProjEntry {
-                expr: remap(&it.expr)?,
-                out: it.out,
-            })
-        })
+        .map(|it| Ok(ProjEntry { expr: remap(&it.expr)?, out: it.out }))
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
     let rel = match qualify {
         Some(q) => RelExpr::filter(cur, vec![remap(&q)?]),
@@ -787,10 +770,7 @@ fn present(
                 ColumnDef::new(format!("_k{i}"), def.type_code, def.is_nullable),
             );
             let id = out.id;
-            items.push(ProjEntry {
-                expr: BExpr::ColRef(HirRef::Col(k)),
-                out,
-            });
+            items.push(ProjEntry { expr: BExpr::ColRef(HirRef::Col(k)), out });
             id
         })
         .collect();

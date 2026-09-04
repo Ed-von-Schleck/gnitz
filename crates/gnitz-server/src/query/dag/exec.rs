@@ -80,11 +80,7 @@ impl DagEngine {
             // set-op pair's two sides must still meet on one worker.
             Some(m) => m.skips_exchange && matches!(plan.sides, Sides::Unary(_)),
         };
-        let mut relay = Relay {
-            exchange,
-            view_id,
-            elide,
-        };
+        let mut relay = Relay { exchange, view_id, elide };
         Self::run_plan(&mut plan.sides, &mut plan.post, input, src_id, &mut relay).map_err(|e| e.to_string())
     }
 

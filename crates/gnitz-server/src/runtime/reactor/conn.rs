@@ -164,9 +164,7 @@ impl Reactor {
     /// Future resolving to the next newly-accepted `(conn_fd, listener_fd)`
     /// pair. Called by the accept-loop task.
     pub fn accept(&self) -> AcceptFuture {
-        AcceptFuture {
-            inner: Rc::clone(&self.inner),
-        }
+        AcceptFuture { inner: Rc::clone(&self.inner) }
     }
 
     /// One-shot raw recv into the caller's buffer, resolving with
@@ -181,10 +179,7 @@ impl Reactor {
             .ring()
             .prep_recv(fd, buf.as_mut_ptr(), buf.len() as u32, udata(KIND_RAW_RECV, id));
         self.inner.raw_recvs.open(id, Some(buf));
-        RawRecvFuture {
-            id,
-            inner: Rc::clone(&self.inner),
-        }
+        RawRecvFuture { id, inner: Rc::clone(&self.inner) }
     }
 
     /// Elevate `fd`'s per-connection payload ceiling. Called after the
@@ -225,10 +220,7 @@ impl Reactor {
     /// [`io::RecvBuf`] (freed on drop), or `None` when the peer has
     /// disconnected.  Each call drains at most one message.
     pub fn recv(&self, fd: i32) -> RecvFuture {
-        RecvFuture {
-            fd,
-            inner: Rc::clone(&self.inner),
-        }
+        RecvFuture { fd, inner: Rc::clone(&self.inner) }
     }
 
     /// Send `payload`'s whole byte range, returning total bytes sent (>= 0) or
@@ -264,11 +256,7 @@ impl Reactor {
                 .ring()
                 .prep_send(fd, cur_ptr, remaining, udata(KIND_SEND, send_id));
             self.inner.sends.open(send_id, Some((fd, Rc::clone(&alive))));
-            let rc = SendFuture {
-                send_id,
-                inner: Rc::clone(&self.inner),
-            }
-            .await;
+            let rc = SendFuture { send_id, inner: Rc::clone(&self.inner) }.await;
             if rc < 0 {
                 final_rc = rc;
                 break;

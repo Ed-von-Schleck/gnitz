@@ -88,11 +88,7 @@ impl MappedShard {
     pub(crate) fn get_weight(&self, row: usize) -> i64 {
         match &self.weight {
             WeightRegion::Direct(v) => read_i64_le(self.data(), v.row_off(row)),
-            WeightRegion::TwoValue {
-                value_a,
-                value_b,
-                bitvec_off,
-            } => {
+            WeightRegion::TwoValue { value_a, value_b, bitvec_off } => {
                 if two_value_bit(&self.data()[*bitvec_off..], row) {
                     *value_b
                 } else {
@@ -261,11 +257,7 @@ impl MappedShard {
         };
         let expand_weight = |region: &WeightRegion, dst: &mut [u8]| match region {
             WeightRegion::Direct(v) => expand_view(v, FIXED_REGION_BYTES, dst),
-            WeightRegion::TwoValue {
-                value_a,
-                value_b,
-                bitvec_off,
-            } => {
+            WeightRegion::TwoValue { value_a, value_b, bitvec_off } => {
                 let a_bytes = value_a.to_le_bytes();
                 let b_bytes = value_b.to_le_bytes();
                 let bitvec = &shard[*bitvec_off..];
@@ -383,10 +375,7 @@ impl MappedShard {
                 // `stride == 0` constant region already uses, so the gather has
                 // no per-row branch. The scatter gathers every schema payload
                 // column regardless of the null bit, so the pointer must be real.
-                PayloadRegion::Absent => ColPtr {
-                    base: ZERO_CELL.as_ptr(),
-                    stride: 0,
-                },
+                PayloadRegion::Absent => ColPtr { base: ZERO_CELL.as_ptr(), stride: 0 },
             });
         }
 

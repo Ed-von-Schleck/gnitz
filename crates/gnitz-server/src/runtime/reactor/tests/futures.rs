@@ -384,12 +384,7 @@ fn a_dropped_awaiter_leaves_no_waker_in_any_wake_queue() {
 fn a_park_slot_ends_by_completion_abandonment_or_reclaim() {
     let r = make_reactor();
     let mut cx = Context::from_waker(Waker::noop());
-    let fsync_future = |id| {
-        Box::pin(FsyncFuture {
-            id,
-            inner: Rc::clone(&r.inner),
-        })
-    };
+    let fsync_future = |id| Box::pin(FsyncFuture { id, inner: Rc::clone(&r.inner) });
 
     // 1. Dropped while pending: the slot is abandoned, so the late CQE retires
     //    it rather than parking a result nobody will collect.

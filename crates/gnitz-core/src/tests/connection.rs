@@ -133,15 +133,7 @@ mod spine_tests {
     }
 
     fn reply_status(status: u32, text: &str, seek_pk: u128) -> Vec<u8> {
-        encode_control_block(
-            &Header {
-                status,
-                seek_pk,
-                ..Header::default()
-            },
-            text,
-            &[],
-        )
+        encode_control_block(&Header { status, seek_pk, ..Header::default() }, text, &[])
     }
 
     /// A cache entry for `tid` at `version`, warmed by one cold-answered scan —

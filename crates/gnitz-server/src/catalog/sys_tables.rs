@@ -108,9 +108,7 @@ pub(super) fn read_table_tab_row<S: RowSource>(
     let placement = if props.replicated {
         Placement::Replicated
     } else {
-        Placement::Keyed {
-            prefix_len: props.dist_prefix_len as u8,
-        }
+        Placement::Keyed { prefix_len: props.dist_prefix_len as u8 }
     };
     Ok((
         payload_u64(src, row, TABTAB_PAY_SCHEMA_ID) as i64,

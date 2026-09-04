@@ -177,14 +177,7 @@ fn values_land_in_their_named_payload_slots() {
     assert_eq!(v[VIEWTAB_PAY_OWNER_VIEW_ID], Val::U64(21));
 
     let mut r = Recorder::default();
-    write_schema_tab_row(
-        &mut r,
-        &SchemaTabRow {
-            schema_id: 3,
-            name: "public",
-        },
-        1,
-    );
+    write_schema_tab_row(&mut r, &SchemaTabRow { schema_id: 3, name: "public" }, 1);
     assert_eq!(r.pk, [3]);
     assert_eq!(r.row(SCHEMA_TAB_COLS, 1)[0], Val::Str("public".into()));
 

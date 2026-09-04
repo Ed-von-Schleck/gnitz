@@ -56,13 +56,7 @@ impl Node {
             RangeJoin => matches!(op, OpNode::Join(JoinKind::DeltaTraceRange { .. })),
             CrossJoin => matches!(op, OpNode::Join(JoinKind::DeltaTraceCross)),
             Reduce => matches!(op, OpNode::Reduce { .. }),
-            GlobalGround => matches!(
-                op,
-                OpNode::Reduce {
-                    global_ground: true,
-                    ..
-                }
-            ),
+            GlobalGround => matches!(op, OpNode::Reduce { global_ground: true, .. }),
             Distinct => matches!(op, OpNode::Distinct),
             PositivePart => matches!(op, OpNode::PositivePart),
             WorkerFilter => matches!(op, OpNode::WorkerFilter),

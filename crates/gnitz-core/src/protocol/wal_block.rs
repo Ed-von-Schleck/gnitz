@@ -184,10 +184,7 @@ fn decode_wal_block_impl(
             }
             decoded.extend_from_slice(&le_row[..pk_stride]);
         }
-        PkColumn {
-            stride: pk_stride as u8,
-            buf: decoded,
-        }
+        PkColumn { stride: pk_stride as u8, buf: decoded }
     };
     let weights: Vec<i64> = read_64bit_region(data, wt_off, wt_sz, count, "weights")?;
     let nulls: Vec<u64> = read_64bit_region(data, null_off, null_sz, count, "nulls")?;
@@ -236,15 +233,7 @@ fn decode_wal_block_impl(
         };
     }
 
-    Ok((
-        ZSetBatch {
-            pks,
-            weights,
-            nulls,
-            columns,
-        },
-        table_id,
-    ))
+    Ok((ZSetBatch { pks, weights, nulls, columns }, table_id))
 }
 
 #[cfg(test)]

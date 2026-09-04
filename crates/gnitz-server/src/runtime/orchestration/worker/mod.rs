@@ -442,11 +442,7 @@ impl WorkerProcess {
         while !self.exchange.deferred_replay.is_empty() {
             for entry in std::mem::take(&mut self.exchange.deferred_replay) {
                 match entry {
-                    Deferred::Tick {
-                        target_id,
-                        round,
-                        req_id,
-                    } => match self.handle_tick(target_id, round, req_id) {
+                    Deferred::Tick { target_id, round, req_id } => match self.handle_tick(target_id, round, req_id) {
                         Ok(()) => self.send_ack(target_id as u64, req_id),
                         Err(e) => self.send_error(&e, req_id),
                     },

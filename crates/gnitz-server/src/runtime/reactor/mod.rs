@@ -477,10 +477,7 @@ impl Reactor {
         for &id in &ids {
             self.inner.replies.open(id, None);
         }
-        ReplyLease {
-            inner: Rc::clone(&self.inner),
-            ids,
-        }
+        ReplyLease { inner: Rc::clone(&self.inner), ids }
     }
 
     /// Allocate a scan request_id: the same counter as [`Self::alloc_replies`]
@@ -503,10 +500,7 @@ impl Reactor {
     /// Concrete, not `impl Future`, so callers can hold a `Vec<ReplyFuture>`
     /// scratch buffer across reactor calls.
     pub fn await_reply(&self, req_id: u64) -> ReplyFuture {
-        ReplyFuture {
-            req_id,
-            inner: Rc::clone(&self.inner),
-        }
+        ReplyFuture { req_id, inner: Rc::clone(&self.inner) }
     }
 
     /// Return a future that resolves to the raw `W2mSlot` routed to
@@ -518,10 +512,7 @@ impl Reactor {
     /// the definition: behind `impl Future` a new `!Unpin` field would error at
     /// the fan-out call site instead of here.
     pub fn await_scan_slot(&self, req_id: u32) -> ScanSlotFuture {
-        ScanSlotFuture {
-            req_id,
-            inner: Rc::clone(&self.inner),
-        }
+        ScanSlotFuture { req_id, inner: Rc::clone(&self.inner) }
     }
 
     /// The next `FLAG_EXCHANGE` frame a worker published, as `(worker, frame)`.
@@ -529,9 +520,7 @@ impl Reactor {
     /// worker's frames into completed rounds is orchestration policy and lives
     /// with the relay task that consumes them.
     pub fn next_exchange(&self) -> impl Future<Output = (usize, DecodedWire)> {
-        ExchangeFuture {
-            inner: Rc::clone(&self.inner),
-        }
+        ExchangeFuture { inner: Rc::clone(&self.inner) }
     }
 
     /// Create a `ScanLease` that registers `ids` as active scans for its
@@ -610,10 +599,7 @@ impl Reactor {
             ring.flush_sqes("fsync");
         }
         self.inner.fsyncs.open(id, None);
-        FsyncFuture {
-            id,
-            inner: Rc::clone(&self.inner),
-        }
+        FsyncFuture { id, inner: Rc::clone(&self.inner) }
     }
 
     /// Drive the reactor forever; returns when `request_shutdown` is

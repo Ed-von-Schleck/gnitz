@@ -423,10 +423,7 @@ fn test_validate_wide_pk_buffer_not_multiple_of_stride() {
     // Keep weights/nulls consistent with the truncated row count (1) so
     // only the stride-divisibility check can trip.
     let batch = ZSetBatch {
-        pks: PkColumn {
-            stride: 16,
-            buf: vec![0u8; 20],
-        },
+        pks: PkColumn { stride: 16, buf: vec![0u8; 20] },
         weights: vec![1],
         nulls: vec![0],
         columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![])],
@@ -441,10 +438,7 @@ fn test_validate_wide_pk_zero_stride() {
     // A zero stride would panic the `len()`/modulo divides; validate must
     // reject it as the malformed-input gate.
     let batch = ZSetBatch {
-        pks: PkColumn {
-            stride: 0,
-            buf: vec![0u8; 16],
-        },
+        pks: PkColumn { stride: 0, buf: vec![0u8; 16] },
         weights: vec![],
         nulls: vec![],
         columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![])],

@@ -259,11 +259,7 @@ impl ShardIndex {
         kind: CompactionKind,
         drop_sources: impl FnOnce(&mut Self),
     ) -> Result<(), StorageError> {
-        let CompactionInputs {
-            files,
-            max_lsn,
-            bytes: in_bytes,
-        } = inputs;
+        let CompactionInputs { files, max_lsn, bytes: in_bytes } = inputs;
         let compact_seq = self.next_compact_seq();
         let cstrings = to_cstrings(&files)?;
         let cstrs: Vec<&CStr> = cstrings.iter().map(|c| c.as_c_str()).collect();

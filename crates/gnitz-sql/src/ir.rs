@@ -379,18 +379,9 @@ impl<R> BExpr<R> {
             BExpr::LitNull => BExpr::LitNull,
             BExpr::BinOp(l, op, r) => BExpr::BinOp(boxed(l)?, *op, boxed(r)?),
             BExpr::UnaryOp(op, inner) => BExpr::UnaryOp(*op, boxed(inner)?),
-            BExpr::Func { f, arg } => BExpr::Func {
-                f: *f,
-                arg: boxed(arg)?,
-            },
-            BExpr::MinMaxN { is_max, args } => BExpr::MinMaxN {
-                is_max: *is_max,
-                args: all(args)?,
-            },
-            BExpr::Cast { expr, to } => BExpr::Cast {
-                expr: boxed(expr)?,
-                to: *to,
-            },
+            BExpr::Func { f, arg } => BExpr::Func { f: *f, arg: boxed(arg)? },
+            BExpr::MinMaxN { is_max, args } => BExpr::MinMaxN { is_max: *is_max, args: all(args)? },
+            BExpr::Cast { expr, to } => BExpr::Cast { expr: boxed(expr)?, to: *to },
             BExpr::Case { branches, else_ } => BExpr::Case {
                 branches: branches
                     .iter()
@@ -398,14 +389,8 @@ impl<R> BExpr<R> {
                     .collect::<Result<_, E>>()?,
                 else_: opt(else_.as_deref())?,
             },
-            BExpr::InList { inner, items } => BExpr::InList {
-                inner: boxed(inner)?,
-                items: all(items)?,
-            },
-            BExpr::StrCall { f, args } => BExpr::StrCall {
-                f: *f,
-                args: all(args)?,
-            },
+            BExpr::InList { inner, items } => BExpr::InList { inner: boxed(inner)?, items: all(items)? },
+            BExpr::StrCall { f, args } => BExpr::StrCall { f: *f, args: all(args)? },
             BExpr::Substr { s, start, len } => BExpr::Substr {
                 s: boxed(s)?,
                 start: boxed(start)?,

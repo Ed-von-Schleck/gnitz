@@ -156,10 +156,7 @@ impl LikeMatcher {
         if ci {
             fold_lits(&mut toks);
         }
-        LikeMatcher {
-            kind: specialize(toks),
-            ci,
-        }
+        LikeMatcher { kind: specialize(toks), ci }
     }
 
     /// Does `h` match? Total on any bytes, valid UTF-8 or not.

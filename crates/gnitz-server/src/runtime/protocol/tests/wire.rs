@@ -161,11 +161,7 @@ fn every_frame_shape() -> Vec<Vec<u8>> {
     let batch = make_simple_batch(1, 42);
     let blk = sblock(&sd, 1);
     vec![
-        WireMsg {
-            target_id: 1,
-            ..Default::default()
-        }
-        .encode_to_vec(),
+        WireMsg { target_id: 1, ..Default::default() }.encode_to_vec(),
         WireMsg {
             target_id: 1,
             schema_block: Some(&blk),
@@ -320,11 +316,7 @@ fn encode_range_roundtrip() {
     // Encode rows [2, 5) into a wire frame with the schema block.
     let sz = WireMsg {
         schema_block: Some(&blk),
-        data: WireData::Range {
-            batch: &batch,
-            start_row: 0,
-            count: 3,
-        },
+        data: WireData::Range { batch: &batch, start_row: 0, count: 3 },
         ..Default::default()
     }
     .size();
@@ -332,11 +324,7 @@ fn encode_range_roundtrip() {
     WireMsg {
         target_id: 1,
         schema_block: Some(&blk),
-        data: WireData::Range {
-            batch: &batch,
-            start_row: 2,
-            count: 3,
-        },
+        data: WireData::Range { batch: &batch, start_row: 2, count: 3 },
         ..Default::default()
     }
     .encode_ipc(&mut buf, 0);
@@ -367,11 +355,7 @@ fn continuation_frame_decoded_with_schema_hint() {
 
     // Encode a continuation frame: no schema, FLAG_CONTINUATION set.
     let sz = WireMsg {
-        data: WireData::Range {
-            batch: &batch,
-            start_row: 0,
-            count: 4,
-        },
+        data: WireData::Range { batch: &batch, start_row: 0, count: 4 },
         ..Default::default()
     }
     .size();
@@ -379,11 +363,7 @@ fn continuation_frame_decoded_with_schema_hint() {
     WireMsg {
         target_id: 1,
         flags: FLAG_CONTINUATION,
-        data: WireData::Range {
-            batch: &batch,
-            start_row: 0,
-            count: 4,
-        },
+        data: WireData::Range { batch: &batch, start_row: 0, count: 4 },
         ..Default::default()
     }
     .encode_ipc(&mut buf, 0);

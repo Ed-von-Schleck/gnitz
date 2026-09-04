@@ -25,14 +25,7 @@ pub(crate) fn lower_setop(
     memo: &mut CutMemo,
     setop: &RelExpr,
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
-    let RelExpr::SetOp {
-        op,
-        all,
-        left,
-        right,
-        out,
-    } = setop
-    else {
+    let RelExpr::SetOp { op, all, left, right, out } = setop else {
         unreachable!("lower_setop receives a SetOp");
     };
 

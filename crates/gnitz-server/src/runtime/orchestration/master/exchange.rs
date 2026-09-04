@@ -69,10 +69,7 @@ impl ExchangeAccumulator {
             nw <= MAX_WORKERS,
             "ExchangeAccumulator: nw={nw} exceeds MAX_WORKERS={MAX_WORKERS}"
         );
-        ExchangeAccumulator {
-            rounds: FxHashMap::default(),
-            nw,
-        }
+        ExchangeAccumulator { rounds: FxHashMap::default(), nw }
     }
 
     /// Accept one FLAG_EXCHANGE reply.  Returns `Some(PendingRelay)` once

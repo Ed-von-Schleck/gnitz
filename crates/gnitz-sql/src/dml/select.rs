@@ -101,12 +101,7 @@ struct Route<'q> {
 /// Resolve `name` to the read's target; the relation kind rides the resolution.
 fn resolve_target(cat: &CatalogSnapshot, binder: &mut Binder<'_>, name: String) -> Result<Target, GnitzSqlError> {
     let (tid, schema, desc) = binder.resolve(cat, &name)?;
-    Ok(Target {
-        name,
-        tid,
-        schema,
-        desc,
-    })
+    Ok(Target { name, tid, schema, desc })
 }
 
 /// Validate an ad-hoc SELECT's shape, route it to its sink, and resolve the one
@@ -123,10 +118,7 @@ fn route_select<'q>(
     // FORMAT, pipe operators) is rejected up front so nothing is silently dropped.
     reject_unhonored_query_clauses(
         query,
-        HonoredQueryClauses {
-            with: true,
-            ordering_sink: true,
-        },
+        HonoredQueryClauses { with: true, ordering_sink: true },
         "direct SELECT",
     )?;
     // The `LIMIT … BY` (ClickHouse per-group) sub-form has no operator here, so
@@ -432,10 +424,7 @@ pub fn plan_read(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> 
         Sink::Rows => ReadCase::Spec(Box::new(plan_rows_read(query, &route)?)),
         Sink::Fold => ReadCase::Spec(Box::new(plan_fold_read(query, &route)?)),
     };
-    Ok(ReadPlan {
-        target: route.target,
-        case,
-    })
+    Ok(ReadPlan { target: route.target, case })
 }
 
 /// The WHERE → access step. Both sinks take it before building their own shape,
@@ -485,10 +474,7 @@ fn plan_fold_read(query: &Query, route: &Route<'_>) -> Result<SpecRead, GnitzSql
         aggs: shape
             .agg_specs
             .iter()
-            .map(|s| AggDescriptor {
-                agg_op: s.op,
-                col_idx: s.col as u32,
-            })
+            .map(|s| AggDescriptor { agg_op: s.op, col_idx: s.col as u32 })
             .collect(),
         pre: shape.pre.clone(),
     });
@@ -521,19 +507,9 @@ pub(crate) fn execute_select(client: &mut GnitzClient, plan: ReadPlan) -> Result
             .map(|s| (*s).clone())
             .unwrap_or_else(|| (*plan.target.schema).clone());
         let batch = batch_opt.unwrap_or_else(|| ZSetBatch::new(&out_schema));
-        return Ok(SqlResult::Rows {
-            schema: out_schema,
-            batch,
-        });
+        return Ok(SqlResult::Rows { schema: out_schema, batch });
     };
-    let SpecRead {
-        access,
-        sink,
-        order,
-        offset,
-        limit,
-        tail,
-    } = *spec;
+    let SpecRead { access, sink, order, offset, limit, tail } = *spec;
     // The output schema the window runs over, and the batch to window. `LIMIT 0`
     // answers from the schema alone, with no request issued.
     let (out_schema, batch) = match tail {
@@ -590,9 +566,5 @@ fn build_rows_shape(select: &Select, query: &Query, schema: &Schema, alias: &str
 
     // Reply schema + projection blob.
     let (reply_schema, projection) = read_reply_shape(&items, out_cols, schema)?;
-    Ok(RowsShape {
-        reply_schema,
-        projection,
-        order,
-    })
+    Ok(RowsShape { reply_schema, projection, order })
 }

@@ -116,12 +116,7 @@ impl ManifestEntryRaw {
         // `pk_stride`.
         let mut key = [0u8; W_GUARD_KEY];
         key.copy_from_slice(guard_key.padded(W_GUARD_KEY));
-        ManifestEntryRaw {
-            max_lsn,
-            filename,
-            level,
-            guard_key: key,
-        }
+        ManifestEntryRaw { max_lsn, filename, level, guard_key: key }
     }
 
     pub(crate) fn filename_str(&self) -> &str {

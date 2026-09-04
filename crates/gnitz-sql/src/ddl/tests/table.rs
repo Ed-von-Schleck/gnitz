@@ -12,11 +12,7 @@ fn table_options_of(sql: &str) -> CreateTableOptions {
 #[test]
 fn with_options_carry_replicated_and_stream_independently() {
     let t = "CREATE TABLE t (id BIGINT PRIMARY KEY)";
-    let props = |replicated, stream| TableProps {
-        replicated,
-        stream,
-        dist_prefix_len: 0,
-    };
+    let props = |replicated, stream| TableProps { replicated, stream, dist_prefix_len: 0 };
     for (tail, want) in [
         ("", props(false, false)),
         (" WITH (replicated = true)", props(true, false)),

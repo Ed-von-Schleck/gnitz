@@ -46,11 +46,7 @@ fn try_compile_string_cmp(
         _ => return None,
     };
     let const_idx = eb.add_const_string(s.clone());
-    Some(eb.emit(L::StrColConst {
-        op: cmp,
-        col: col as u32,
-        const_idx,
-    }))
+    Some(eb.emit(L::StrColConst { op: cmp, col: col as u32, const_idx }))
 }
 
 /// Which register class a lowered node produced. `Int` and `Float` are the two
@@ -97,12 +93,7 @@ impl OpcodeBackend<'_> {
         match expr {
             BoundExpr::ColRef(c) => self.col_ref(*c),
             BoundExpr::LitInt(v) => Ok((self.eb.emit(L::LoadConst { val: *v }), ExprKind::Int)),
-            BoundExpr::LitFloat(v) => Ok((
-                self.eb.emit(L::LoadConst {
-                    val: v.to_bits() as i64,
-                }),
-                ExprKind::Float,
-            )),
+            BoundExpr::LitFloat(v) => Ok((self.eb.emit(L::LoadConst { val: v.to_bits() as i64 }), ExprKind::Float)),
             BoundExpr::LitStr(s) => {
                 let idx = self.eb.add_const_string(s.clone());
                 Ok((self.eb.emit(L::LoadConstStr { const_idx: idx }), ExprKind::Str))
@@ -279,15 +270,8 @@ impl OpcodeBackend<'_> {
             (FloatArithOp::Div, FloatArithOp::Mul)
         };
         let v = self.eb.emit(L::FloatArith { op: first, a, b: scale });
-        let v = self.eb.emit(L::FloatUnary {
-            op: FloatUnaryOp::Round,
-            a: v,
-        });
-        self.eb.emit(L::FloatArith {
-            op: undo,
-            a: v,
-            b: scale,
-        })
+        let v = self.eb.emit(L::FloatUnary { op: FloatUnaryOp::Round, a: v });
+        self.eb.emit(L::FloatArith { op: undo, a: v, b: scale })
     }
 
     fn str_call(&mut self, f: StrFunc, args: &[BoundExpr]) -> Result<(Reg, ExprKind), GnitzSqlError> {
@@ -305,25 +289,11 @@ impl OpcodeBackend<'_> {
             (StrFunc::LenBytes, &[a]) => L::StrLen { a, chars: false },
             (StrFunc::Reverse, &[a]) => L::StrReverse { a },
             (StrFunc::Left, &[src, n_reg]) => L::StrSide { src, n_reg, left: true },
-            (StrFunc::Right, &[src, n_reg]) => L::StrSide {
-                src,
-                n_reg,
-                left: false,
-            },
+            (StrFunc::Right, &[src, n_reg]) => L::StrSide { src, n_reg, left: false },
             (StrFunc::Pos, &[hay, needle]) => L::StrPos { hay, needle },
             (StrFunc::Replace, &[s, from, to]) => L::StrReplace { s, from, to },
-            (StrFunc::Lpad, &[s, n_reg, fill]) => L::StrPad {
-                s,
-                n_reg,
-                fill,
-                left: true,
-            },
-            (StrFunc::Rpad, &[s, n_reg, fill]) => L::StrPad {
-                s,
-                n_reg,
-                fill,
-                left: false,
-            },
+            (StrFunc::Lpad, &[s, n_reg, fill]) => L::StrPad { s, n_reg, fill, left: true },
+            (StrFunc::Rpad, &[s, n_reg, fill]) => L::StrPad { s, n_reg, fill, left: false },
             (StrFunc::SplitPart, &[s, delim, n_reg]) => L::StrSplitPart { s, delim, n_reg },
             _ => unreachable!("the binder sizes a string call's arguments by its signature"),
         };
@@ -346,14 +316,7 @@ impl OpcodeBackend<'_> {
         let len_reg = len
             .map(|l| self.int_operand(l, || "SUBSTRING: length".into()))
             .transpose()?;
-        Ok((
-            self.eb.emit(L::StrSubstr {
-                src,
-                start_reg,
-                len_reg,
-            }),
-            ExprKind::Str,
-        ))
+        Ok((self.eb.emit(L::StrSubstr { src, start_reg, len_reg }), ExprKind::Str))
     }
 
     fn trim_call(&mut self, s: &BoundExpr, mode: TrimMode, set: &str) -> Result<(Reg, ExprKind), GnitzSqlError> {
@@ -376,15 +339,7 @@ impl OpcodeBackend<'_> {
         // A NUL escape is `ESCAPE ''` — no escape at all — which the binder has
         // already rejected as a literal, so nothing is lost by the narrowing.
         let escape = escape.and_then(std::num::NonZeroU8::new);
-        Ok((
-            self.eb.emit(L::StrLike {
-                src,
-                escape,
-                pat_idx,
-                ci,
-            }),
-            ExprKind::Int,
-        ))
+        Ok((self.eb.emit(L::StrLike { src, escape, pat_idx, ci }), ExprKind::Int))
     }
 
     /// `CONCAT(args…)`, a strictly left fold seeded with the empty string, so
@@ -397,11 +352,7 @@ impl OpcodeBackend<'_> {
         let mut acc = self.eb.emit(L::LoadConstStr { const_idx: empty });
         for a in args {
             let r = self.str_operand(a, true)?;
-            acc = self.eb.emit(L::StrConcat {
-                a: acc,
-                b: r,
-                skip_null: true,
-            });
+            acc = self.eb.emit(L::StrConcat { a: acc, b: r, skip_null: true });
         }
         Ok((acc, ExprKind::Str))
     }
@@ -558,11 +509,7 @@ impl OpcodeBackend<'_> {
         let (mut acc, _) = self.binop(inner, BinOp::Eq, &items[0])?;
         for it in &items[1..] {
             let (r, _) = self.binop(inner, BinOp::Eq, it)?;
-            acc = self.eb.emit(L::BoolBinary {
-                a: acc,
-                b: r,
-                is_or: true,
-            });
+            acc = self.eb.emit(L::BoolBinary { a: acc, b: r, is_or: true });
         }
         Ok((acc, ExprKind::Int))
     }
@@ -585,11 +532,7 @@ impl OpcodeBackend<'_> {
             return self.str_binop(op, (l, l_kind), (r, r_kind));
         }
         if let BinOp::And | BinOp::Or = op {
-            let reg = self.eb.emit(L::BoolBinary {
-                a: l,
-                b: r,
-                is_or: op == BinOp::Or,
-            });
+            let reg = self.eb.emit(L::BoolBinary { a: l, b: r, is_or: op == BinOp::Or });
             return Ok((reg, ExprKind::Int));
         }
         let (l_float, r_float) = (l_kind == ExprKind::Float, r_kind == ExprKind::Float);

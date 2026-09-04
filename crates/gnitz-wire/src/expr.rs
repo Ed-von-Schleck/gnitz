@@ -417,12 +417,7 @@ pub fn decode_expr_blob(blob: &[u8]) -> Option<ExprBlob> {
         const_strings.push(r.bytes32().ok()?.to_vec());
     }
     r.expect_consumed().ok()?;
-    Some(ExprBlob {
-        result_reg,
-        code,
-        sinks,
-        const_strings,
-    })
+    Some(ExprBlob { result_reg, code, sinks, const_strings })
 }
 
 #[cfg(test)]

@@ -113,9 +113,7 @@ impl ScatterKey {
         let pk = schema.pk_indices();
         let kind = match spec {
             ScatterSpec::GroupKey(cols) if cols == pk => ScatterKind::PkBytes,
-            ScatterSpec::GroupKey(cols) => ScatterKind::Fold {
-                keys: GroupKeyCols::new(schema, cols),
-            },
+            ScatterSpec::GroupKey(cols) => ScatterKind::Fold { keys: GroupKeyCols::new(schema, cols) },
             ScatterSpec::JoinKey(slots)
                 if slots.len() == pk.len() && slots.iter().zip(pk).all(|(&(c, tc), &p)| c == p && tc == 0) =>
             {

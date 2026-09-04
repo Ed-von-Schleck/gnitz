@@ -97,22 +97,14 @@ fn copy_column(
     blob: BlobMode<'_>,
     w: RowWindow,
 ) {
-    let RowWindow {
-        src: src_start,
-        dst: dst_base,
-        n,
-    } = w;
+    let RowWindow { src: src_start, dst: dst_base, n } = w;
     let dst_payload = dst_payload as usize;
     let stride = dst_stride as usize; // destination write width
 
     // Destructured ONCE before the row loops, so the per-row bodies below carry
     // no locator dispatch (and no `native_le_bytes` by-value [u8; 16]).
     match src_loc {
-        ColumnLocator::Pk {
-            byte_off,
-            size,
-            type_code,
-        } => {
+        ColumnLocator::Pk { byte_off, size, type_code } => {
             // PK region holds OPK bytes; decode the addressed column back to
             // native LE. A raw byte copy would be wrong for signed (sign-flipped)
             // and big-endian-encoded columns. Both regions are resolved once, as
@@ -585,11 +577,7 @@ impl MapPlan {
         }
         let mut dst = old;
         for &(start, end) in ranges {
-            let w = RowWindow {
-                src: start,
-                dst,
-                n: end - start,
-            };
+            let w = RowWindow { src: start, dst, n: end - start };
             let blob = match shares_blob {
                 true => BlobMode::Verbatim,
                 false => BlobMode::Relocate(cache.get_mut()),
@@ -608,11 +596,7 @@ impl MapPlan {
     /// moves, then the compute kernel. `out.count` must already cover the
     /// destination window — every `*_mut` accessor is `count`-bounded.
     fn map_rows_into(&self, in_batch: &Batch, output: &mut Batch, w: RowWindow, mut blob: BlobMode<'_>) {
-        let RowWindow {
-            src: src_start,
-            dst: dst_base,
-            n,
-        } = w;
+        let RowWindow { src: src_start, dst: dst_base, n } = w;
         if let PkSource::Inherit = self.pk_source {
             let pk_st = in_batch.pk_stride() as usize;
             debug_assert_eq!(

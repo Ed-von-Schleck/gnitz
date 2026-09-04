@@ -40,10 +40,7 @@ pub(crate) struct HeapNode {
 /// field is unused for sentinels — discrimination is on `source_idx` alone.
 const SENTINEL: u32 = u32::MAX;
 
-const SENTINEL_NODE: HeapNode = HeapNode {
-    source_idx: SENTINEL,
-    row: 0,
-};
+const SENTINEL_NODE: HeapNode = HeapNode { source_idx: SENTINEL, row: 0 };
 
 pub(crate) struct LoserTree {
     /// `tree[0]` is the overall champion. `tree[1..tree.len()]` hold the
@@ -113,10 +110,7 @@ impl LoserTree {
         self.winners[n_pad..].fill(SENTINEL_NODE);
         for i in 0..self.n {
             if let Some(row) = init_fn(i) {
-                self.winners[n_pad + i] = HeapNode {
-                    source_idx: i as u32,
-                    row,
-                };
+                self.winners[n_pad + i] = HeapNode { source_idx: i as u32, row };
             }
         }
 
@@ -191,10 +185,7 @@ impl LoserTree {
     pub(crate) fn replace_top(&mut self, new_row: u32, less: &impl Fn(&HeapNode, &HeapNode) -> bool) {
         debug_assert!(!self.is_empty(), "replace_top on empty tree");
         let source_idx = self.tree[0].source_idx;
-        let cur = HeapNode {
-            source_idx,
-            row: new_row,
-        };
+        let cur = HeapNode { source_idx, row: new_row };
         let idx = (self.tree.len() + source_idx as usize) >> 1;
         self.tree[0] = self.walk_up(cur, idx, less);
     }

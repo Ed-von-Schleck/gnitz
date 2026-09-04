@@ -117,17 +117,11 @@ fn test_compound_identifier_null_test_binds() {
     };
     assert!(matches!(
         bind1(&parse_expr_sql("t.c IS NULL"), &nullable).unwrap(),
-        BoundExpr::NullTest {
-            inner: _,
-            want_null: true
-        }
+        BoundExpr::NullTest { inner: _, want_null: true }
     ));
     assert!(matches!(
         bind1(&parse_expr_sql("t.c IS NOT NULL"), &nullable).unwrap(),
-        BoundExpr::NullTest {
-            inner: _,
-            want_null: false
-        }
+        BoundExpr::NullTest { inner: _, want_null: false }
     ));
 }
 
@@ -312,10 +306,7 @@ fn test_bind_coalesce_base_cases() {
             assert_eq!(branches.len(), 1);
             assert!(matches!(
                 branches[0].0,
-                BoundExpr::NullTest {
-                    inner: _,
-                    want_null: false
-                }
+                BoundExpr::NullTest { inner: _, want_null: false }
             ));
             assert!(matches!(branches[0].1, BoundExpr::ColRef(1)));
             assert!(matches!(else_.as_deref(), Some(BoundExpr::LitInt(0))));
@@ -345,23 +336,11 @@ fn test_bind_coalesce_nested_three_arg() {
         BoundExpr::Case { branches, else_ } => {
             assert!(matches!(
                 branches[0].0,
-                BoundExpr::NullTest {
-                    inner: _,
-                    want_null: false
-                }
+                BoundExpr::NullTest { inner: _, want_null: false }
             ));
             match else_.as_deref() {
-                Some(BoundExpr::Case {
-                    branches: inner,
-                    else_: inner_else,
-                }) => {
-                    assert!(matches!(
-                        inner[0].0,
-                        BoundExpr::NullTest {
-                            inner: _,
-                            want_null: false
-                        }
-                    ));
+                Some(BoundExpr::Case { branches: inner, else_: inner_else }) => {
+                    assert!(matches!(inner[0].0, BoundExpr::NullTest { inner: _, want_null: false }));
                     assert!(matches!(inner_else.as_deref(), Some(BoundExpr::LitInt(0))));
                 }
                 other => panic!("expected nested Case, got {other:?}"),
@@ -380,10 +359,7 @@ fn test_bind_coalesce_computed_operand_tests_its_value() {
         BoundExpr::Case { branches, else_ } => {
             assert_eq!(branches.len(), 1);
             match &branches[0].0 {
-                BoundExpr::NullTest {
-                    inner,
-                    want_null: false,
-                } => {
+                BoundExpr::NullTest { inner, want_null: false } => {
                     assert!(matches!(**inner, BoundExpr::BinOp(_, BinOp::Add, _)));
                 }
                 other => panic!("expected NullTest over the sum, got {other:?}"),
@@ -518,9 +494,7 @@ fn ceil_floor_reject_the_field_carrying_forms() {
 fn round_scale_must_be_a_small_integer_literal() {
     for (src, want) in [("ROUND(c, 2)", 2i8), ("ROUND(c, -2)", -2), ("ROUND(c, +15)", 15)] {
         match bind_num(src).unwrap() {
-            BoundExpr::Func {
-                f: NumFunc::Round(n), ..
-            } => assert_eq!(n, want, "{src}"),
+            BoundExpr::Func { f: NumFunc::Round(n), .. } => assert_eq!(n, want, "{src}"),
             other => panic!("{src}: expected Round, got {other:?}"),
         }
     }
@@ -665,9 +639,7 @@ fn like_parts(src: &str) -> (String, Option<u8>, bool, bool) {
         other => (other, false),
     };
     match e {
-        BoundExpr::Like {
-            pattern, escape, ci, ..
-        } => (pattern, escape, ci, negated),
+        BoundExpr::Like { pattern, escape, ci, .. } => (pattern, escape, ci, negated),
         other => panic!("expected Like, got {other:?}"),
     }
 }
@@ -880,10 +852,7 @@ fn is_distinct_from_desugars_to_a_definite_case() {
 fn null_test_over_a_computed_operand_tests_its_value() {
     let s = nullable_schema(TypeCode::I64);
     match bind1(&parse_expr_sql("(c + 1) IS NOT NULL"), &s).unwrap() {
-        BoundExpr::NullTest {
-            inner,
-            want_null: false,
-        } => {
+        BoundExpr::NullTest { inner, want_null: false } => {
             assert!(matches!(*inner, BoundExpr::BinOp(_, BinOp::Add, _)));
         }
         other => panic!("expected NullTest, got {other:?}"),

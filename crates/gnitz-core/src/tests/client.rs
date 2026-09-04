@@ -147,10 +147,7 @@ fn find_schema_id_miss_vs_hit() {
     let mut batch = ZSetBatch::new(schema);
     gnitz_wire::sys_rows::write_schema_tab_row(
         &mut BatchAppender::new(&mut batch, schema),
-        &gnitz_wire::sys_rows::SchemaTabRow {
-            schema_id: 3,
-            name: "foo",
-        },
+        &gnitz_wire::sys_rows::SchemaTabRow { schema_id: 3, name: "foo" },
         1,
     );
     assert_eq!(find_schema_id(&batch, "foo").unwrap(), Some(3));

@@ -40,15 +40,11 @@ enum PeerInner {
 impl Peer {
     pub fn unix(fd: i32, reactor: Rc<Reactor>) -> Peer {
         let conn = PeerToken::new(&reactor, fd);
-        Peer {
-            inner: PeerInner::Unix { conn, reactor },
-        }
+        Peer { inner: PeerInner::Unix { conn, reactor } }
     }
 
     pub fn tls(conn: Rc<TlsShared>) -> Peer {
-        Peer {
-            inner: PeerInner::Tls(conn),
-        }
+        Peer { inner: PeerInner::Tls(conn) }
     }
 
     /// Next complete inbound frame payload (owned, freed on drop on every

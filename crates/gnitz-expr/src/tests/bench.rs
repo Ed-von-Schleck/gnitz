@@ -99,11 +99,7 @@ fn str_const_filter_bench() {
             let consts = vec![constant.as_bytes().to_vec()];
             let fused = filter_prog(
                 &schema,
-                vec![LogicalInstr::StrColConst {
-                    op,
-                    col: 1,
-                    const_idx: ConstIdx(0),
-                }],
+                vec![LogicalInstr::StrColConst { op, col: 1, const_idx: ConstIdx(0) }],
                 Reg(0),
                 consts.clone(),
             );
@@ -112,11 +108,7 @@ fn str_const_filter_bench() {
                 vec![
                     LogicalInstr::LoadColStr { col: 1 },
                     LogicalInstr::LoadConstStr { const_idx: ConstIdx(0) },
-                    LogicalInstr::StrCmp {
-                        op,
-                        a: Reg(0),
-                        b: Reg(1),
-                    },
+                    LogicalInstr::StrCmp { op, a: Reg(0), b: Reg(1) },
                 ],
                 Reg(2),
                 consts,
@@ -188,11 +180,7 @@ fn filter_kernel_bench() {
         vec![
             LogicalInstr::LoadColInt { col: 0 },
             LogicalInstr::LoadConst { val: (n / 2) as i64 },
-            LogicalInstr::Cmp {
-                op: CmpOp::Gt,
-                a: Reg(0),
-                b: Reg(1),
-            },
+            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         ],
         Reg(2),
         vec![],
@@ -216,23 +204,11 @@ fn filter_kernel_bench() {
                 a: Reg(0),
             },
             LogicalInstr::LoadConst { val: 0 },
-            LogicalInstr::Cmp {
-                op: CmpOp::Gt,
-                a: Reg(1),
-                b: Reg(2),
-            },
+            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(1), b: Reg(2) },
             LogicalInstr::LoadColInt { col: 2 },
             LogicalInstr::LoadConst { val: 80 },
-            LogicalInstr::Cmp {
-                op: CmpOp::Lt,
-                a: Reg(4),
-                b: Reg(5),
-            },
-            LogicalInstr::BoolBinary {
-                is_or: false,
-                a: Reg(3),
-                b: Reg(6),
-            },
+            LogicalInstr::Cmp { op: CmpOp::Lt, a: Reg(4), b: Reg(5) },
+            LogicalInstr::BoolBinary { is_or: false, a: Reg(3), b: Reg(6) },
         ],
         Reg(7),
         vec![],
@@ -258,20 +234,12 @@ fn filter_kernel_bench() {
         let k = lit_instrs.len() as u16;
         lit_instrs.push(LogicalInstr::LoadConst { val });
         let c = lit_instrs.len() as u16;
-        lit_instrs.push(LogicalInstr::Cmp {
-            op,
-            a: Reg(0),
-            b: Reg(k),
-        });
+        lit_instrs.push(LogicalInstr::Cmp { op, a: Reg(0), b: Reg(k) });
         acc_reg = Some(match acc_reg {
             None => c,
             Some(prev) => {
                 let d = lit_instrs.len() as u16;
-                lit_instrs.push(LogicalInstr::BoolBinary {
-                    is_or: false,
-                    a: Reg(prev),
-                    b: Reg(c),
-                });
+                lit_instrs.push(LogicalInstr::BoolBinary { is_or: false, a: Reg(prev), b: Reg(c) });
                 d
             }
         });
@@ -321,11 +289,7 @@ fn is_null_chain(k: i64, n_cmp: u16) -> FilterShape {
     for i in 0..n_cmp {
         let base = 2 + i * 3;
         instrs.push(LogicalInstr::LoadColInt { col: u32::from(i) + 2 });
-        instrs.push(LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(base),
-            b: Reg(1),
-        });
+        instrs.push(LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(base), b: Reg(1) });
         instrs.push(LogicalInstr::BoolBinary {
             is_or: false,
             a: Reg(acc),
@@ -541,13 +505,7 @@ fn expr_kernel_bench() {
 
     let int_cast = scalar_prog(
         &ints,
-        vec![
-            load2(1),
-            LogicalInstr::IntCast {
-                a: Reg(0),
-                fi: FixedInt::I32,
-            },
-        ],
+        vec![load2(1), LogicalInstr::IntCast { a: Reg(0), fi: FixedInt::I32 }],
         Reg(1),
         vec![],
     );
@@ -572,16 +530,8 @@ fn expr_kernel_bench() {
         vec![
             load2(1),
             load2(2),
-            LogicalInstr::Cmp {
-                op: CmpOp::Gt,
-                a: Reg(0),
-                b: Reg(1),
-            },
-            LogicalInstr::Select {
-                cond: Reg(2),
-                a: Reg(0),
-                b: Reg(1),
-            },
+            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
+            LogicalInstr::Select { cond: Reg(2), a: Reg(0), b: Reg(1) },
         ],
         Reg(3),
         vec![],
@@ -600,13 +550,7 @@ fn expr_kernel_bench() {
 
     let str_len = scalar_prog(
         &strs,
-        vec![
-            load_str(1),
-            LogicalInstr::StrLen {
-                a: Reg(0),
-                chars: false,
-            },
-        ],
+        vec![load_str(1), LogicalInstr::StrLen { a: Reg(0), chars: false }],
         Reg(1),
         vec![],
     );
@@ -650,11 +594,7 @@ fn expr_kernel_bench() {
         vec![
             load_str(1),
             load_str(2),
-            LogicalInstr::StrConcat {
-                a: Reg(0),
-                b: Reg(1),
-                skip_null: false,
-            },
+            LogicalInstr::StrConcat { a: Reg(0), b: Reg(1), skip_null: false },
         ],
         Reg(2),
         vec![],

@@ -86,10 +86,7 @@ pub struct SqlPlanner<'a> {
 
 impl<'a> SqlPlanner<'a> {
     pub fn new(client: &'a mut GnitzClient, schema_name: impl Into<String>) -> Self {
-        SqlPlanner {
-            client,
-            schema_name: schema_name.into(),
-        }
+        SqlPlanner { client, schema_name: schema_name.into() }
     }
 
     /// Parse `sql` and execute each statement, returning one `SqlResult` per statement.

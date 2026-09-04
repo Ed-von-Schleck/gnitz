@@ -100,10 +100,7 @@ impl Future for YieldOnce {
 pub(super) fn synthetic_decoded_wire(req_id: u64) -> DecodedWire {
     use gnitz_wire::control::DecodedControl;
     DecodedWire {
-        control: DecodedControl {
-            request_id: req_id,
-            ..Default::default()
-        },
+        control: DecodedControl { request_id: req_id, ..Default::default() },
         schema: None,
         data_batch: None,
     }

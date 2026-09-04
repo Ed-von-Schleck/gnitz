@@ -42,9 +42,7 @@ pub(super) struct ParkMap<T, A = ()> {
 
 impl<T, A> Default for ParkMap<T, A> {
     fn default() -> Self {
-        ParkMap {
-            ops: RefCell::new(FxHashMap::default()),
-        }
+        ParkMap { ops: RefCell::new(FxHashMap::default()) }
     }
 }
 

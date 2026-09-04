@@ -125,13 +125,7 @@ pub(crate) fn resolve_projection(
         ));
     }
 
-    Ok(Some((
-        Schema {
-            columns: out_defs,
-            pk_cols: new_pk_cols,
-        },
-        col_indices,
-    )))
+    Ok(Some((Schema { columns: out_defs, pk_cols: new_pk_cols }, col_indices)))
 }
 
 /// Apply a resolved projection to `batch` (absent = an empty batch). Infallible:

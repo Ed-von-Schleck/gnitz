@@ -120,11 +120,7 @@ impl Accumulator {
     #[inline(always)]
     pub(super) fn extreme_index_spec(&self) -> Option<ExtremeSpec> {
         match self.kind {
-            StepKind::Extreme { max, kind } => Some(ExtremeSpec {
-                loc: self.src,
-                kind,
-                for_max: max,
-            }),
+            StepKind::Extreme { max, kind } => Some(ExtremeSpec { loc: self.src, kind, for_max: max }),
             _ => None,
         }
     }

@@ -28,10 +28,7 @@ fn make_base(client: &mut GnitzClient, sn: &str) -> (u64, Vec<ColumnDef>) {
     let tid = client
         .create_table(sn, "base", &cols, &[0], TableProps::default(), &[])
         .unwrap();
-    let schema = Schema {
-        columns: cols.clone(),
-        pk_cols: vec![0],
-    };
+    let schema = Schema { columns: cols.clone(), pk_cols: vec![0] };
     let mut batch = ZSetBatch::new(&schema);
     let mut app = BatchAppender::new(&mut batch, &schema);
     for (pk, v) in BASE_ROWS {

@@ -77,10 +77,7 @@ fn emit_exists_circuit(
     left_prefilter: &[HirExpr],
     items: &[ProjEntry],
 ) -> Result<ExistsCircuit, GnitzSqlError> {
-    let RelExpr::Join {
-        left, right, kind, on, ..
-    } = source.as_ref()
-    else {
+    let RelExpr::Join { left, right, kind, on, .. } = source.as_ref() else {
         unreachable!("emit_exists_circuit receives a Join");
     };
     let class = on.class()?;

@@ -109,26 +109,17 @@ fn validate_rejects_each_way_a_descriptor_can_be_wrong() {
         ),
         (
             "mask disagrees with segment_length",
-            Descriptor {
-                segment_length_mask: 7,
-                ..ok.clone()
-            },
+            Descriptor { segment_length_mask: 7, ..ok.clone() },
             16,
         ),
         (
             "segment_count_length zero",
-            Descriptor {
-                segment_count_length: 0,
-                ..ok.clone()
-            },
+            Descriptor { segment_count_length: 0, ..ok.clone() },
             8,
         ),
         (
             "segment_count_length not a multiple of segment_length",
-            Descriptor {
-                segment_count_length: 5,
-                ..ok.clone()
-            },
+            Descriptor { segment_count_length: 5, ..ok.clone() },
             13,
         ),
         ("fingerprint length disagrees", ok.clone(), 17),

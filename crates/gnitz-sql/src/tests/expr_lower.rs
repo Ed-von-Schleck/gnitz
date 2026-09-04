@@ -43,12 +43,9 @@ fn cast_schema() -> Schema {
 /// `lower_ops` is the same without the class.
 fn lower_ops_kind(expr: &BoundExpr, schema: &Schema) -> (Vec<u32>, ExprKind) {
     let mut eb = ExprBuilder::new();
-    let (reg, kind) = OpcodeBackend {
-        cols: &schema.columns,
-        eb: &mut eb,
-    }
-    .lower(expr)
-    .expect("lowers");
+    let (reg, kind) = OpcodeBackend { cols: &schema.columns, eb: &mut eb }
+        .lower(expr)
+        .expect("lowers");
     (opcodes(&eb.build(Some(reg)).expect("a well-formed program")), kind)
 }
 
@@ -64,12 +61,9 @@ fn lower_ops(expr: &BoundExpr, schema: &Schema) -> Vec<u32> {
 /// The lowering error `expr` produces, for the reject cases.
 fn lower_err(expr: &BoundExpr, schema: &Schema) -> GnitzSqlError {
     let mut eb = ExprBuilder::new();
-    OpcodeBackend {
-        cols: &schema.columns,
-        eb: &mut eb,
-    }
-    .lower(expr)
-    .expect_err("must be rejected")
+    OpcodeBackend { cols: &schema.columns, eb: &mut eb }
+        .lower(expr)
+        .expect_err("must be rejected")
 }
 
 /// Lower `expr` and hold it to the same rules the engine does.
@@ -100,10 +94,7 @@ const FLOAT_OPS: [u32; 6] = [
 ];
 
 fn cast_emits(expr: &BoundExpr, to: TypeCode, schema: &Schema) -> bool {
-    let cast = BoundExpr::Cast {
-        expr: Box::new(expr.clone()),
-        to,
-    };
+    let cast = BoundExpr::Cast { expr: Box::new(expr.clone()), to };
     lower_ops(&cast, schema).contains(&ExprOp::IntCast.as_wire())
 }
 
@@ -306,12 +297,9 @@ fn min_max_n_rotates_a_u64_argument_to_the_fold_head() {
                            // The fold's head operand: the first instruction's column.
     let head_operand = |args: Vec<BoundExpr>| -> u32 {
         let mut eb = ExprBuilder::new();
-        let (reg, _) = OpcodeBackend {
-            cols: &s.columns,
-            eb: &mut eb,
-        }
-        .lower(&min_max(true, args))
-        .expect("lowers");
+        let (reg, _) = OpcodeBackend { cols: &s.columns, eb: &mut eb }
+            .lower(&min_max(true, args))
+            .expect("lowers");
         let prog = eb.build(Some(reg)).expect("a well-formed program");
         match prog.instrs().first().expect("non-empty") {
             &LogicalInstr::LoadColInt { col, .. } => col,
@@ -356,12 +344,9 @@ fn min_max_n_arity_is_bounded_by_the_register_file() {
     // reads of one column would be one register.
     let args: Vec<BoundExpr> = (0..40).map(BoundExpr::LitInt).collect();
     let mut eb = ExprBuilder::new();
-    let (reg, _) = OpcodeBackend {
-        cols: &s.columns,
-        eb: &mut eb,
-    }
-    .lower(&min_max(true, args))
-    .expect("lowering itself does not bound arity");
+    let (reg, _) = OpcodeBackend { cols: &s.columns, eb: &mut eb }
+        .lower(&min_max(true, args))
+        .expect("lowering itself does not bound arity");
     match eb.build(Some(reg)).map_err(GnitzSqlError::from).err() {
         Some(GnitzSqlError::Unsupported(msg)) => assert!(msg.contains("reg"), "got {msg:?}"),
         other => panic!("expected a register-budget rejection, got {other:?}"),
@@ -565,10 +550,7 @@ fn two_int_schema() -> Schema {
 }
 
 fn in_list(inner: BoundExpr, items: Vec<BoundExpr>) -> BoundExpr {
-    BoundExpr::InList {
-        inner: Box::new(inner),
-        items,
-    }
+    BoundExpr::InList { inner: Box::new(inner), items }
 }
 
 /// An integer operand with all-integer-literal items → one INT_IN_SET; the
@@ -1012,14 +994,8 @@ fn strings_in_numeric_positions_are_rejected_by_lowering() {
             f: NumFunc::Unary(FloatUnaryOp::Abs),
             arg: Box::new(s()),
         },
-        BoundExpr::Func {
-            f: NumFunc::Round(2),
-            arg: Box::new(s()),
-        },
-        BoundExpr::MinMaxN {
-            is_max: true,
-            args: vec![s(), lit("x")],
-        },
+        BoundExpr::Func { f: NumFunc::Round(2), arg: Box::new(s()) },
+        BoundExpr::MinMaxN { is_max: true, args: vec![s(), lit("x")] },
         BoundExpr::UnaryOp(UnaryOp::Neg, Box::new(s())),
         BoundExpr::UnaryOp(UnaryOp::Not, Box::new(s())),
         BoundExpr::Substr {
@@ -1064,10 +1040,7 @@ fn blob_columns_stay_outside_the_string_surface() {
 #[test]
 fn cast_from_a_string_emits_a_parse_and_is_never_elided() {
     let schema = str_schema();
-    let to = |tc| BoundExpr::Cast {
-        expr: Box::new(str_col(1)),
-        to: tc,
-    };
+    let to = |tc| BoundExpr::Cast { expr: Box::new(str_col(1)), to: tc };
     assert_eq!(
         lower_ops(&to(TypeCode::I64), &schema),
         [ExprOp::LoadColStr.as_wire(), ExprOp::StrToInt.as_wire()]
@@ -1309,10 +1282,7 @@ fn string_calls_lower_to_their_opcodes() {
 #[test]
 fn null_test_lowers_by_its_operand() {
     let schema = str_schema(); // every column nullable
-    let test = |inner, want_null| BoundExpr::NullTest {
-        inner: Box::new(inner),
-        want_null,
-    };
+    let test = |inner, want_null| BoundExpr::NullTest { inner: Box::new(inner), want_null };
     assert_eq!(lower_ops(&test(str_col(1), true), &schema), [ExprOp::IsNull.as_wire()]);
     assert_eq!(
         lower_ops(&test(str_col(1), false), &schema),

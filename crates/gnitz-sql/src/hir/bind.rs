@@ -115,12 +115,7 @@ pub(crate) struct BindCx<'c, 'b> {
 
 impl<'c, 'b> BindCx<'c, 'b> {
     pub(crate) fn new(cat: &'c CatalogSnapshot, binder: &'c mut Binder<'b>, ids: &'c ColIdGen) -> Self {
-        BindCx {
-            cat,
-            binder,
-            ids,
-            ctes: HashMap::new(),
-        }
+        BindCx { cat, binder, ids, ctes: HashMap::new() }
     }
 }
 
@@ -142,12 +137,7 @@ fn resolve_relation(cx: &mut BindCx<'_, '_>, name: &str) -> Result<Rc<RelExpr>, 
 pub(crate) fn bind_body(cx: &mut BindCx<'_, '_>, body: &SetExpr) -> Result<Rc<RelExpr>, GnitzSqlError> {
     match body {
         SetExpr::Select(select) => bind_select(cx, select),
-        SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left,
-            right,
-        } => bind_set_op(cx, *op, *set_quantifier, left, right),
+        SetExpr::SetOperation { op, set_quantifier, left, right } => bind_set_op(cx, *op, *set_quantifier, left, right),
         SetExpr::Query(q) => bind_body(cx, reject_query_envelope_body(q, "parenthesized query")?),
         _ => Err(GnitzSqlError::Unsupported(
             "CREATE VIEW only supports SELECT and set operations".to_string(),
@@ -166,13 +156,7 @@ fn resolve_table_factor(
     cx: &mut BindCx<'_, '_>,
     factor: &TableFactor,
 ) -> Result<(Rc<RelExpr>, String, Vec<HirCol>), GnitzSqlError> {
-    if let TableFactor::Derived {
-        lateral,
-        subquery,
-        alias,
-        sample,
-    } = factor
-    {
+    if let TableFactor::Derived { lateral, subquery, alias, sample } = factor {
         let Some(alias) = alias else {
             return Err(GnitzSqlError::Unsupported(
                 "a derived table (subquery in FROM) needs an alias".to_string(),
@@ -382,10 +366,7 @@ pub(crate) fn bind_projection<L: ItemLeaf>(
         if let Expr::Function(f) = peel_nested(expr) {
             if let Some(call) = leaf.call_item(f, &alias, idx) {
                 let (expr, def) = call?;
-                items.push(ProjEntry {
-                    expr,
-                    out: HirCol::new(ids.next(), def),
-                });
+                items.push(ProjEntry { expr, out: HirCol::new(ids.next(), def) });
                 continue;
             }
         }
@@ -673,23 +654,10 @@ fn single_projection_expr<'e>(select: &'e Select, err: &str) -> Result<&'e Expr,
 fn bind_one_subquery(cx: &mut SubCtx<'_, '_, '_>, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
     match e {
         Expr::Exists { subquery, negated } => bind_exists_sub(cx, subquery, None, *negated),
-        Expr::InSubquery {
-            expr,
-            subquery,
-            negated,
-        } => bind_exists_sub(cx, subquery, Some(expr), *negated),
+        Expr::InSubquery { expr, subquery, negated } => bind_exists_sub(cx, subquery, Some(expr), *negated),
         Expr::Subquery(q) => bind_scalar_sub(cx, q),
-        Expr::AnyOp {
-            left,
-            compare_op,
-            right,
-            ..
-        } => bind_quantifier_sub(cx, left, compare_op, right, true),
-        Expr::AllOp {
-            left,
-            compare_op,
-            right,
-        } => bind_quantifier_sub(cx, left, compare_op, right, false),
+        Expr::AnyOp { left, compare_op, right, .. } => bind_quantifier_sub(cx, left, compare_op, right, true),
+        Expr::AllOp { left, compare_op, right } => bind_quantifier_sub(cx, left, compare_op, right, false),
         other => Err(GnitzSqlError::Internal(format!(
             "bind_one_subquery on a non-subquery node: {other:?}"
         ))),
@@ -1180,11 +1148,7 @@ struct PreMap<'a> {
 
 impl<'a> PreMap<'a> {
     fn new(ids: &'a ColIdGen, env: Vec<HirCol>) -> Self {
-        PreMap {
-            ids,
-            env,
-            extra: Vec::new(),
-        }
+        PreMap { ids, env, extra: Vec::new() }
     }
 
     /// The column `e` names, materializing one on first sight.

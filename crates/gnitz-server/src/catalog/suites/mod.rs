@@ -96,11 +96,7 @@ fn pred_lt_blob(col: usize, lit: i64) -> Vec<u8> {
         eb.emit(gnitz_expr::LogicalInstr::LoadColInt { col: col as u32 }),
         eb.emit(gnitz_expr::LogicalInstr::LoadConst { val: lit }),
     );
-    let r = eb.emit(gnitz_expr::LogicalInstr::Cmp {
-        op: gnitz_expr::CmpOp::Lt,
-        a,
-        b,
-    });
+    let r = eb.emit(gnitz_expr::LogicalInstr::Cmp { op: gnitz_expr::CmpOp::Lt, a, b });
     eb.build(Some(r)).expect("a well-formed program").to_blob_bytes()
 }
 
@@ -125,11 +121,7 @@ fn rows_spec(
     gnitz_wire::ReadSpec {
         bound: gnitz_wire::ReadBound::None,
         predicate,
-        sink: gnitz_wire::ReadSink::Rows {
-            projection,
-            order,
-            limit_k,
-        },
+        sink: gnitz_wire::ReadSink::Rows { projection, order, limit_k },
     }
 }
 
@@ -208,28 +200,16 @@ fn create_flagged_table(
 /// The three non-default `TABLE_TAB.flags` words the fixtures use, so a test reads
 /// as the property under test rather than as a bit pattern.
 fn replicated_flags() -> u64 {
-    gnitz_wire::TableProps {
-        replicated: true,
-        ..Default::default()
-    }
-    .pack()
+    gnitz_wire::TableProps { replicated: true, ..Default::default() }.pack()
 }
 
 /// CLUSTER BY the PK's leading `k` columns.
 fn clustered_flags(k: usize) -> u64 {
-    gnitz_wire::TableProps {
-        dist_prefix_len: k,
-        ..Default::default()
-    }
-    .pack()
+    gnitz_wire::TableProps { dist_prefix_len: k, ..Default::default() }.pack()
 }
 
 fn stream_flags() -> u64 {
-    gnitz_wire::TableProps {
-        stream: true,
-        ..Default::default()
-    }
-    .pack()
+    gnitz_wire::TableProps { stream: true, ..Default::default() }.pack()
 }
 
 /// A COL_TAB rewrite pair on column `col_idx` of `owner_id`: `mutate` produces

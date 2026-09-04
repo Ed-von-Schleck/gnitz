@@ -165,12 +165,7 @@ struct EquiShape {
 }
 
 const EQUI_SHAPES: [EquiShape; 5] = [
-    EquiShape {
-        name: "1:1",
-        d: 1,
-        t: 1,
-        miss_stride: 1,
-    },
+    EquiShape { name: "1:1", d: 1, t: 1, miss_stride: 1 },
     EquiShape {
         name: "trace-fanout(1:64)",
         d: 1,

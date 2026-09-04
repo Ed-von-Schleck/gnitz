@@ -254,10 +254,7 @@ struct LevelGuard {
 
 impl LevelGuard {
     pub(crate) fn new(gk: PkBuf) -> Self {
-        LevelGuard {
-            guard_key: gk,
-            entries: Vec::new(),
-        }
+        LevelGuard { guard_key: gk, entries: Vec::new() }
     }
 
     /// Whether this guard holds only skeleton shards — the state a capacity

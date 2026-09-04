@@ -358,12 +358,7 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
         // SUBSTRING and TRIM are keyword-dispatched too. TRIM's `trim_what` is a
         // literal by the time the binder accepts it, but it is a bound operand
         // position and belongs in the walk regardless.
-        Expr::Substring {
-            expr,
-            substring_from,
-            substring_for,
-            ..
-        } => std::iter::once(expr.as_ref())
+        Expr::Substring { expr, substring_from, substring_for, .. } => std::iter::once(expr.as_ref())
             .chain(substring_from.as_deref())
             .chain(substring_for.as_deref())
             .collect(),
@@ -831,10 +826,7 @@ impl<'a> WildcardRewrite<'a> {
     /// `*` carrying no modifier, so every expansion loop runs the same
     /// drop-then-rename transform whether or not the item had one.
     fn empty() -> Self {
-        Self {
-            drop: Vec::new(),
-            rename: Vec::new(),
-        }
+        Self { drop: Vec::new(), rename: Vec::new() }
     }
 
     /// Whether an expanded column named `name` is dropped (`EXCEPT`/`EXCLUDE`).

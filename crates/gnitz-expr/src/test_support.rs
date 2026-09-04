@@ -174,17 +174,9 @@ impl SchemaFacts for TestSchema {
         let (type_code, _) = self.cols[ci];
         let size = gnitz_wire::wire_stride(type_code) as u8;
         if self.pk.contains(&ci) {
-            ColumnLocator::Pk {
-                byte_off: self.addr[ci],
-                size,
-                type_code,
-            }
+            ColumnLocator::Pk { byte_off: self.addr[ci], size, type_code }
         } else {
-            ColumnLocator::Payload {
-                slot: self.addr[ci],
-                size,
-                type_code,
-            }
+            ColumnLocator::Payload { slot: self.addr[ci], size, type_code }
         }
     }
     fn payload_col_idx(&self, pi: usize) -> usize {
@@ -223,12 +215,7 @@ pub fn push_payload_cols(v: &mut TestView, schema: &TestSchema) -> Vec<usize> {
 /// bit pattern, so a signed column reads it two's-complement.
 pub fn set_row_pk(v: &mut TestView, schema: &TestSchema, row: usize, pk: u64) {
     for ci in 0..schema.num_columns() {
-        if let ColumnLocator::Pk {
-            byte_off,
-            size,
-            type_code,
-        } = schema.locate(ci)
-        {
+        if let ColumnLocator::Pk { byte_off, size, type_code } = schema.locate(ci) {
             v.set_pk_col(
                 row,
                 byte_off as usize,

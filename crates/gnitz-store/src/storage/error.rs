@@ -84,10 +84,7 @@ impl StoreError {
     }
 
     pub fn storage(context: impl Into<String>, err: StorageError) -> Self {
-        StoreError::Storage {
-            context: context.into(),
-            err,
-        }
+        StoreError::Storage { context: context.into(), err }
     }
 
     /// Prefix a `Storage` context with what the caller was doing; the other

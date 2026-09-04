@@ -507,12 +507,7 @@ impl MasterDispatcher {
             self.sal.footprint(g)
         });
 
-        Ok(RelayPrepared {
-            view,
-            source_id,
-            dest,
-            footprint,
-        })
+        Ok(RelayPrepared { view, source_id, dest, footprint })
     }
 
     /// Synchronous second half of a relay: writes the ExchangeRelay group to
@@ -1046,11 +1041,7 @@ impl MasterDispatcher {
         targets: GroupTargets<'_>,
     ) -> Result<(), WorkerFault> {
         self.note_flush_round(lsn, kind);
-        self.write_group(&DirectGroup {
-            lsn,
-            targets,
-            ..DirectGroup::new(kind)
-        })
+        self.write_group(&DirectGroup { lsn, targets, ..DirectGroup::new(kind) })
     }
 
     /// Post-ACK checkpoint cleanup, run once a round's Flush ACKs are in: flush

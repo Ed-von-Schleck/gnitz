@@ -56,10 +56,7 @@ pub(crate) struct InboundBudget {
 
 impl InboundBudget {
     pub(crate) fn new(cap: usize) -> Self {
-        InboundBudget {
-            held: Cell::new(0),
-            cap: Cell::new(cap),
-        }
+        InboundBudget { held: Cell::new(0), cap: Cell::new(cap) }
     }
 
     /// Bytes currently held (test observability).

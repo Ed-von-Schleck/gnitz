@@ -14,10 +14,7 @@ const NBASE: u64 = 200;
 /// writer over the scan node's `params` blob, built by the same encoder the
 /// planner ships through.
 fn write_bounded_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, bound: Option<ScanBound>) {
-    let (_, _, params) = gnitz_wire::encode_op_node(gnitz_wire::OpNode::ScanDelta {
-        source: base_tid as u64,
-        bound,
-    });
+    let (_, _, params) = gnitz_wire::encode_op_node(gnitz_wire::OpNode::ScanDelta { source: base_tid as u64, bound });
     write_identity_circuit(engine, vid, base_tid, params.as_deref());
 }
 

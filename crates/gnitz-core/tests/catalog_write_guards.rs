@@ -212,14 +212,8 @@ fn two_indexes_under_one_name_in_one_bundle_are_refused() {
                 &[0],
                 TableProps::default(),
                 &[
-                    gnitz_core::InlineUniqueIndex {
-                        col_indices: &[1],
-                        name: "u",
-                    },
-                    gnitz_core::InlineUniqueIndex {
-                        col_indices: &[2],
-                        name: "U",
-                    },
+                    gnitz_core::InlineUniqueIndex { col_indices: &[1], name: "u" },
+                    gnitz_core::InlineUniqueIndex { col_indices: &[2], name: "U" },
                 ],
             )
             .unwrap_err()
@@ -248,10 +242,7 @@ fn a_three_family_create_table_bundle_still_commits() {
             &cols,
             &[0],
             TableProps::default(),
-            &[gnitz_core::InlineUniqueIndex {
-                col_indices: &[1],
-                name: "u_b",
-            }],
+            &[gnitz_core::InlineUniqueIndex { col_indices: &[1], name: "u_b" }],
         )
         .unwrap();
     let desc = client.resolve("ok", "t").unwrap().expect("the table exists");
@@ -287,11 +278,7 @@ fn a_wire_supplied_internal_index_flag_is_refused() {
             owner_id: tid,
             source_col_idx: gnitz_wire::pack_pk_cols(&[1]),
             name: "forged",
-            flags: gnitz_wire::IndexProps {
-                is_unique: false,
-                is_internal: true,
-            }
-            .pack(),
+            flags: gnitz_wire::IndexProps { is_unique: false, is_internal: true }.pack(),
         },
         1,
     );
@@ -525,14 +512,7 @@ fn two_schema_rows_sharing_a_name_in_one_bundle_are_refused() {
     let mut batch = ZSetBatch::new(sc);
     let mut app = BatchAppender::new(&mut batch, sc);
     for id in [a, b] {
-        write_schema_tab_row(
-            &mut app,
-            &SchemaTabRow {
-                schema_id: id,
-                name: "twice",
-            },
-            1,
-        );
+        write_schema_tab_row(&mut app, &SchemaTabRow { schema_id: id, name: "twice" }, 1);
     }
     let err = format!("{:?}", s.push_ddl_txn(&[(SCHEMA_TAB, batch)]).unwrap_err());
     assert!(err.contains("Schema already exists"), "{err}");
@@ -555,10 +535,7 @@ fn the_per_pk_shape_rules_reject_what_no_emitter_writes() {
     let mut heavy = ZSetBatch::new(sc);
     write_schema_tab_row(
         &mut BatchAppender::new(&mut heavy, sc),
-        &SchemaTabRow {
-            schema_id: sid,
-            name: "heavy",
-        },
+        &SchemaTabRow { schema_id: sid, name: "heavy" },
         2,
     );
     let err = format!("{:?}", s.push_ddl_txn(&[(SCHEMA_TAB, heavy)]).unwrap_err());
@@ -569,14 +546,7 @@ fn the_per_pk_shape_rules_reject_what_no_emitter_writes() {
     let mut pair = ZSetBatch::new(sc);
     let mut app = BatchAppender::new(&mut pair, sc);
     for w in [-1, 1] {
-        write_schema_tab_row(
-            &mut app,
-            &SchemaTabRow {
-                schema_id: sid,
-                name: "p",
-            },
-            w,
-        );
+        write_schema_tab_row(&mut app, &SchemaTabRow { schema_id: sid, name: "p" }, w);
     }
     let err = format!("{:?}", s.push_ddl_txn(&[(SCHEMA_TAB, pair)]).unwrap_err());
     assert!(err.contains("more than one row for schema"), "{err}");

@@ -180,10 +180,7 @@ impl CatalogEngine {
             // `submit_local` bypasses the precheck, and is the only path allowed
             // to set the internal bit.
             let packed_cols = gnitz_wire::pack_pk_cols(&[col_idx as u32]);
-            let props = gnitz_wire::IndexProps {
-                is_unique: false,
-                is_internal: true,
-            };
+            let props = gnitz_wire::IndexProps { is_unique: false, is_internal: true };
             let batch = idx_tab_batch(index_id, table_id, packed_cols, &index_name, props, 1);
             // hook_cascade_fk fires on master and every worker, so each side
             // creates its own FK indices locally; submit_local applies + fires

@@ -105,10 +105,7 @@ pub(super) fn validate_relation_defs(
     // `as_slice()` clamps, so the raw count is the only place an over-range one
     // is still visible.
     if !pk.is_well_formed() {
-        return Err(gnitz_wire::PkRule::TooManyColumns {
-            count: pk.decoded_count(),
-        }
-        .to_string());
+        return Err(gnitz_wire::PkRule::TooManyColumns { count: pk.decoded_count() }.to_string());
     }
     validate_pk_against_cols(col_defs, pk.as_slice())
 }

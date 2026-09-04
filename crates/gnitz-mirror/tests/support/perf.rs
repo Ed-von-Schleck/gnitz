@@ -54,16 +54,8 @@ impl Instructions {
     /// capability — so a caller skips rather than fails.
     pub fn open() -> Option<Self> {
         Self::open_with(false)
-            .map(|fd| Instructions {
-                fd,
-                counts_kernel: true,
-            })
-            .or_else(|| {
-                Self::open_with(true).map(|fd| Instructions {
-                    fd,
-                    counts_kernel: false,
-                })
-            })
+            .map(|fd| Instructions { fd, counts_kernel: true })
+            .or_else(|| Self::open_with(true).map(|fd| Instructions { fd, counts_kernel: false }))
     }
 
     fn open_with(exclude_kernel: bool) -> Option<libc::c_int> {

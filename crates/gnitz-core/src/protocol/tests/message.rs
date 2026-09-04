@@ -128,10 +128,7 @@ fn ctrl_block_seek_pk_extra_roundtrip() {
 #[test]
 fn test_request_id_roundtrip_reserved_values() {
     for &req_id in &[0u64, u64::MAX, 0x1234_5678_DEAD_BEEFu64] {
-        let h = Header {
-            request_id: req_id,
-            ..Header::default()
-        };
+        let h = Header { request_id: req_id, ..Header::default() };
         let encoded = encode_control_block(&h, "", &[]);
         let (decoded, _, _) = decode_control_block(&encoded).unwrap();
         assert_eq!(decoded.request_id, req_id);

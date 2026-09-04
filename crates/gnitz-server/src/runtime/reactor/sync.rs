@@ -230,10 +230,7 @@ impl AsyncRwLock {
     }
 
     pub fn write(self: &Rc<Self>) -> WriteFuture {
-        WriteFuture {
-            lock: Rc::clone(self),
-            parked: false,
-        }
+        WriteFuture { lock: Rc::clone(self), parked: false }
     }
 
     /// Wake every future the current state now admits — writers first, readers
@@ -291,9 +288,7 @@ impl Future for ReadFuture {
         let mut s = self.lock.inner.borrow_mut();
         if s.read_ok() {
             s.readers += 1;
-            return Poll::Ready(ReadGuard {
-                lock: Rc::clone(&self.lock),
-            });
+            return Poll::Ready(ReadGuard { lock: Rc::clone(&self.lock) });
         }
         s.read_waiters.push_back(cx.waker().clone());
         Poll::Pending

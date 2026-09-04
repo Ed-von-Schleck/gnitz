@@ -86,10 +86,7 @@ impl RawBlock {
     /// frame. [`MirrorStore::ingest`](crate::MirrorStore::ingest) takes these, so
     /// a store's own tests need a way to build one.
     pub fn from_block(block: Vec<u8>) -> RawBlock {
-        RawBlock {
-            block: 0..block.len(),
-            frame: block,
-        }
+        RawBlock { block: 0..block.len(), frame: block }
     }
 }
 
@@ -134,9 +131,7 @@ fn check_response(msg: Message) -> Result<Message, ClientError> {
         // Control-only frame: the fresh basis rides in `seek_pk`. Left as a
         // structured error so the SQL layer can retry (autocommit) or surface
         // it (BEGIN/COMMIT); the human-readable text is synthesized upstream.
-        return Err(ClientError::TxnConflict {
-            fresh_basis: msg.seek_pk as u64,
-        });
+        return Err(ClientError::TxnConflict { fresh_basis: msg.seek_pk as u64 });
     }
     if msg.status == STATUS_ERROR {
         // Fall back to the default text on an empty string, not only on None:
@@ -184,22 +179,10 @@ pub struct Interest {
 }
 
 impl Interest {
-    pub const NONE: Interest = Interest {
-        read: false,
-        write: false,
-    };
-    pub const READ: Interest = Interest {
-        read: true,
-        write: false,
-    };
-    pub const WRITE: Interest = Interest {
-        read: false,
-        write: true,
-    };
-    pub const BOTH: Interest = Interest {
-        read: true,
-        write: true,
-    };
+    pub const NONE: Interest = Interest { read: false, write: false };
+    pub const READ: Interest = Interest { read: true, write: false };
+    pub const WRITE: Interest = Interest { read: false, write: true };
+    pub const BOTH: Interest = Interest { read: true, write: true };
 
     pub fn is_empty(self) -> bool {
         self == Interest::NONE
@@ -603,12 +586,7 @@ impl Session {
             }
             Request::Uncorrelated(frame) => (control_parts(frame), SlotKind::Uncorrelated),
             Request::Resolve(target) => (control_parts(self.resolve_request(target)), SlotKind::Resolve),
-            Request::Push {
-                target_id,
-                schema,
-                batch,
-                mode,
-            } => {
+            Request::Push { target_id, schema, batch, mode } => {
                 // In-process, so a convenience and never a trust boundary; the
                 // server checks the same things. Here so no driver has to
                 // remember to.
@@ -642,22 +620,14 @@ impl Session {
                 };
                 (parts, SlotKind::Push { tid: target_id })
             }
-            Request::ScanSpec {
-                target_id,
-                spec,
-                reply_schema,
-                raw,
-            } => {
+            Request::ScanSpec { target_id, spec, reply_schema, raw } => {
                 // The reply schema rides the request blob (the master forwards it
                 // verbatim) and stays with the slot as the decode hint.
                 let extra = gnitz_wire::pack_scan_spec_extra(spec, reply_schema.block());
                 let ctrl = encode_control_frame(target_id, client_id, FLAG_SCAN_SPEC, 0, 0, &extra);
                 (
                     control_parts(ctrl),
-                    SlotKind::ScanSpec {
-                        reply_schema: reply_schema.schema(),
-                        raw,
-                    },
+                    SlotKind::ScanSpec { reply_schema: reply_schema.schema(), raw },
                 )
             }
             Request::ScanMulti(tids) => (
@@ -807,10 +777,7 @@ impl Session {
         let acc = &mut self.accum;
         acc.schema = acc.schema.take().or(schema);
         if let Some(range) = block {
-            acc.blocks.push(RawBlock {
-                frame: buf,
-                block: range,
-            });
+            acc.blocks.push(RawBlock { frame: buf, block: range });
         }
         if let Some(batch) = decoded {
             match acc.data.as_mut() {
@@ -979,12 +946,7 @@ impl Session {
         batch: &ZSetBatch,
         mode: WireConflictMode,
     ) -> Result<u64, ClientError> {
-        let push = || Request::Push {
-            target_id,
-            schema,
-            batch,
-            mode,
-        };
+        let push = || Request::Push { target_id, schema, batch, mode };
         let reply = match self.round_trip(push()) {
             Err(ClientError::SchemaMismatch) => self.round_trip(push())?,
             other => other?,
@@ -1170,12 +1132,7 @@ impl Session {
         spec: &[u8],
         reply_schema: &ReplySchema,
     ) -> Result<(Vec<RawBlock>, u128), ClientError> {
-        match self.round_trip(Request::ScanSpec {
-            target_id,
-            spec,
-            reply_schema,
-            raw: true,
-        })? {
+        match self.round_trip(Request::ScanSpec { target_id, spec, reply_schema, raw: true })? {
             Reply::Raw { blocks, terminal } => Ok((blocks, terminal.seek_pk)),
             _ => unreachable!("a raw scan_spec completes as Reply::Raw"),
         }
@@ -1235,11 +1192,7 @@ impl Session {
 
 /// A control-only frame as queue parts.
 fn control_parts(ctrl: Vec<u8>) -> MessageParts {
-    MessageParts {
-        ctrl,
-        schema: None,
-        data: Vec::new(),
-    }
+    MessageParts { ctrl, schema: None, data: Vec::new() }
 }
 
 #[cfg(test)]

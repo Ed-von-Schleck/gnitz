@@ -37,10 +37,7 @@ fn send_cqe_wakes_its_waker_and_settles_the_conn() {
         .insert(fd, Box::new(io::Conn::new(Rc::clone(&r.inner.inbound))));
     r.inner.conns.borrow_mut().get_mut(&fd).unwrap().send_inflight = 1;
 
-    let mut fut = std::pin::pin!(SendFuture {
-        send_id: 77,
-        inner: Rc::clone(&r.inner),
-    });
+    let mut fut = std::pin::pin!(SendFuture { send_id: 77, inner: Rc::clone(&r.inner) });
     let waker = make_waker(11);
     let mut cx = Context::from_waker(&waker);
     assert!(fut.as_mut().poll(&mut cx).is_pending());
@@ -80,10 +77,7 @@ fn dropped_send_future_keeps_buffer_alive_until_its_cqe() {
     let r = make_reactor();
     let alive: SendAlive = Rc::new(gnitz_store::storage::batch_pool::PooledSendBuf(vec![0xAB_u8; 64]));
     r.inner.sends.open(88, Some((i32::MAX, Rc::clone(&alive))));
-    drop(SendFuture {
-        send_id: 88,
-        inner: Rc::clone(&r.inner),
-    });
+    drop(SendFuture { send_id: 88, inner: Rc::clone(&r.inner) });
 
     assert!(r.inner.sends.is_abandoned(88), "drop must abandon the slot");
     assert_eq!(

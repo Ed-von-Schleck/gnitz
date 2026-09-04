@@ -233,11 +233,7 @@ fn parse_table_options(table_options: &CreateTableOptions) -> Result<TableProps,
                 key.value
             )));
         };
-        let Expr::Value(ValueWithSpan {
-            value: Value::Boolean(b),
-            ..
-        }) = value
-        else {
+        let Expr::Value(ValueWithSpan { value: Value::Boolean(b), .. }) = value else {
             return Err(GnitzSqlError::Plan(format!(
                 "WITH ({} = …) expects a boolean (true/false)",
                 key.value
@@ -351,11 +347,9 @@ pub(crate) fn execute_create_table(
     for (i, col) in sql_cols.iter().enumerate() {
         for opt in &col.options {
             match &opt.option {
-                ColumnOption::ForeignKey(ForeignKeyConstraint {
-                    foreign_table,
-                    referred_columns,
-                    ..
-                }) => fk_sites.push((i, foreign_table, referred_columns)),
+                ColumnOption::ForeignKey(ForeignKeyConstraint { foreign_table, referred_columns, .. }) => {
+                    fk_sites.push((i, foreign_table, referred_columns))
+                }
                 ColumnOption::Unique(_) if !unique_cols.iter().any(|(c, _)| c.as_slice() == [i as u32]) => {
                     unique_cols.push((vec![i as u32], None));
                 }
@@ -368,10 +362,7 @@ pub(crate) fn execute_create_table(
     // named rather than positional.
     for constraint in &create.constraints {
         if let TableConstraint::ForeignKey(ForeignKeyConstraint {
-            columns,
-            foreign_table,
-            referred_columns,
-            ..
+            columns, foreign_table, referred_columns, ..
         }) = constraint
         {
             if columns.len() != 1 {
@@ -410,12 +401,7 @@ pub(crate) fn execute_create_table(
     // significant: it drives the composite index's leading-key span and prefix
     // seeks).
     for constraint in &create.constraints {
-        if let TableConstraint::Unique(UniqueConstraint {
-            name: name_ident,
-            columns,
-            ..
-        }) = constraint
-        {
+        if let TableConstraint::Unique(UniqueConstraint { name: name_ident, columns, .. }) = constraint {
             if columns.is_empty() {
                 return Err(GnitzSqlError::Plan("UNIQUE constraint cannot be empty".into()));
             }
@@ -582,11 +568,7 @@ pub(crate) fn execute_drop(
     schema_name: &str,
     parts: crate::validate::DropParts<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let crate::validate::DropParts {
-        object_type,
-        names,
-        if_exists,
-    } = parts;
+    let crate::validate::DropParts { object_type, names, if_exists } = parts;
     // The kind is the statement's, not each name's, so it is settled once.
     if !matches!(object_type, ObjectType::Table | ObjectType::View | ObjectType::Index) {
         return Err(GnitzSqlError::Unsupported(format!(

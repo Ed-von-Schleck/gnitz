@@ -19,11 +19,7 @@ pub struct WireSysCol {
 /// not part of the public surface. `const` so it is callable in the `pub const`
 /// table initializers (visibility does not affect const-eval).
 pub(crate) const fn col(name: &'static str, type_code: TypeCode, nullable: bool) -> WireSysCol {
-    WireSysCol {
-        name,
-        type_code,
-        nullable,
-    }
+    WireSysCol { name, type_code, nullable }
 }
 
 /// Index of the column named `name` in `cols`, resolved at compile time.
@@ -361,12 +357,7 @@ pub struct WireSysFamily {
 }
 
 const fn fam(id: u64, name: &'static str, cols: &'static [WireSysCol], pk_cols: &'static [u32]) -> WireSysFamily {
-    WireSysFamily {
-        id,
-        name,
-        cols,
-        pk_cols,
-    }
+    WireSysFamily { id, name, cols, pk_cols }
 }
 
 /// Every system family, in the order both sides index them by.
@@ -680,10 +671,7 @@ impl PkColList {
         }
         let mut arr = [0u32; PK_LIST_MAX_COLS];
         arr[..cols.len()].copy_from_slice(cols);
-        Some(PkColList {
-            cols: arr,
-            len: cols.len(),
-        })
+        Some(PkColList { cols: arr, len: cols.len() })
     }
     /// The count exactly as decoded from the wire. May be 0 or larger than
     /// `PK_LIST_MAX_COLS` for a malformed/crafted packed value — deliberately

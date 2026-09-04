@@ -316,10 +316,7 @@ impl ScanDispatch {
     pub(crate) fn targets(&self) -> GroupTargets<'_> {
         match self.worker {
             None => GroupTargets::All(&self.ids[..self.n]),
-            Some(worker) => GroupTargets::One {
-                worker,
-                req_id: self.ids[0],
-            },
+            Some(worker) => GroupTargets::One { worker, req_id: self.ids[0] },
         }
     }
 

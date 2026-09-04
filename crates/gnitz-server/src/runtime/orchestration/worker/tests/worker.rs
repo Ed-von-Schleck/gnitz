@@ -68,10 +68,7 @@ fn from_wire_decodes_the_column_list_with_and_without_the_holder_directive() {
         for want in [false, true] {
             let word = packed | if want { gnitz_wire::HAS_PK_WANT_HOLDER } else { 0 };
             match HasPkLookup::from_wire(word) {
-                HasPkLookup::SecondaryIndex {
-                    cols: decoded,
-                    want_holder,
-                } => {
+                HasPkLookup::SecondaryIndex { cols: decoded, want_holder } => {
                     assert_eq!(decoded.as_slice(), cols);
                     assert_eq!(want_holder, want);
                 }
@@ -141,11 +138,7 @@ fn tick_defers_inside_exchange() {
     assert!(
         matches!(
             wp.exchange.deferred_replay[0],
-            Deferred::Tick {
-                target_id: 999,
-                round: 7,
-                ..
-            }
+            Deferred::Tick { target_id: 999, round: 7, .. }
         ),
         "the Tick's target and its round must both be carried into the replay queue"
     );
@@ -395,11 +388,7 @@ fn consume_one(ptr: *mut u8) -> Vec<u8> {
 /// Wire size of a `count`-row range of `batch`, with an optional schema block.
 fn range_size(batch: &Batch, count: usize, prebuilt: Option<&[u8]>) -> usize {
     ipc::WireMsg {
-        data: ipc::WireData::Range {
-            batch,
-            start_row: 0,
-            count,
-        },
+        data: ipc::WireData::Range { batch, start_row: 0, count },
         schema_block: prebuilt,
         ..Default::default()
     }

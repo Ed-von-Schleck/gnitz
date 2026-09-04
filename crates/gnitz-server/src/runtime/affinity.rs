@@ -208,10 +208,7 @@ fn assign(nodes: &[Vec<Core>], allowed: &[u32], workers: usize) -> Result<Placem
     let worker_cpus: Vec<Vec<u32>> = order.iter().take(workers).map(|c| (*c).clone()).collect();
     let taken: Vec<u32> = worker_cpus.iter().flatten().copied().collect();
     let master: Vec<u32> = allowed.iter().copied().filter(|c| !taken.contains(c)).collect();
-    Ok(Placement {
-        master,
-        workers: worker_cpus,
-    })
+    Ok(Placement { master, workers: worker_cpus })
 }
 
 /// Plan the whole server's placement — one sysfs walk, one decision — or say

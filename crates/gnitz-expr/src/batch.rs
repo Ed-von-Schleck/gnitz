@@ -157,11 +157,7 @@ impl EvalScratch {
         }
         for &(dst, off, len) in &prog.const_str_regs {
             let base_d = dst as usize * MORSEL;
-            self.str_views[base_d..base_d + MORSEL].fill(StrView {
-                off: off as u64,
-                len,
-                src: SRC_ARENA,
-            });
+            self.str_views[base_d..base_d + MORSEL].fill(StrView { off: off as u64, len, src: SRC_ARENA });
         }
     }
 
@@ -824,11 +820,7 @@ pub(crate) fn with_str_bufs(prog: &ResolvedProgram, mb: &dyn BatchView, f: impl 
 impl StrView {
     /// A view over `[off, off + len)` of `src`'s buffer.
     fn at(src: u32, off: usize, len: usize) -> Self {
-        StrView {
-            off: off as u64,
-            len: len as u32,
-            src,
-        }
+        StrView { off: off as u64, len: len as u32, src }
     }
 
     fn arena(off: usize, len: usize) -> Self {
@@ -1084,9 +1076,7 @@ fn str_to_str(
     f: impl Fn(&mut Vec<u8>, StrBufs<'_>, StrView) -> StrView,
 ) {
     {
-        let EvalScratch {
-            str_views, str_arena, ..
-        } = &mut *scratch;
+        let EvalScratch { str_views, str_arena, .. } = &mut *scratch;
         let ([va], vd) = split_windows(str_views, MORSEL, [a as usize], dst as usize, mo.m);
         for (i, r) in vd.iter_mut().enumerate() {
             *r = f(str_arena, bufs, va[i]);
@@ -1109,12 +1099,7 @@ fn str_to_scalar(
 ) {
     let (d, ai) = (dst as usize, a as usize);
     {
-        let EvalScratch {
-            regs,
-            str_views,
-            str_arena,
-            ..
-        } = &mut *scratch;
+        let EvalScratch { regs, str_views, str_arena, .. } = &mut *scratch;
         // Both windows cut to the morsel: the destination already was, and
         // relating the two is what lets LLVM drop the source's per-row bound.
         let (va, rd) = (
@@ -1143,12 +1128,7 @@ fn str_parse_to_scalar(
     let (d, ai) = (dst as usize, a as usize);
     let mut bad = [0u8; MORSEL];
     {
-        let EvalScratch {
-            regs,
-            str_views,
-            str_arena,
-            ..
-        } = &mut *scratch;
+        let EvalScratch { regs, str_views, str_arena, .. } = &mut *scratch;
         let (va, rd) = (
             &str_views[ai * MORSEL..ai * MORSEL + mo.m],
             &mut regs[d * MORSEL..d * MORSEL + mo.m],
@@ -1174,12 +1154,7 @@ fn str_parse_to_scalar(
 fn num_to_str(scratch: &mut EvalScratch, mo: &Morsel<'_>, dst: u16, a: u16, f: impl Fn(&mut Vec<u8>, i64) -> StrView) {
     let (d, ai, m) = (dst as usize, a as usize, mo.m);
     {
-        let EvalScratch {
-            regs,
-            str_views,
-            str_arena,
-            ..
-        } = &mut *scratch;
+        let EvalScratch { regs, str_views, str_arena, .. } = &mut *scratch;
         let (ra, vd) = (
             &regs[ai * MORSEL..ai * MORSEL + m],
             &mut str_views[d * MORSEL..d * MORSEL + m],
@@ -1206,12 +1181,7 @@ fn str2_to_scalar(
 ) {
     let (base_a, base_b, base_d) = (a as usize * MORSEL, b as usize * MORSEL, dst as usize * MORSEL);
     {
-        let EvalScratch {
-            regs,
-            str_views,
-            str_arena,
-            ..
-        } = &mut *scratch;
+        let EvalScratch { regs, str_views, str_arena, .. } = &mut *scratch;
         // All three windows cut to the morsel: indexing the lane `Vec` directly
         // costs two bounds checks and two counter bumps per row.
         let (sa, sb) = (&str_views[base_a..base_a + mo.m], &str_views[base_b..base_b + mo.m]);
@@ -1241,12 +1211,7 @@ fn str_kernel<const S: usize, const I: usize>(
     let m = mo.m;
     let mut bad = [0u8; MORSEL];
     {
-        let EvalScratch {
-            regs,
-            str_views,
-            str_arena,
-            ..
-        } = &mut *scratch;
+        let EvalScratch { regs, str_views, str_arena, .. } = &mut *scratch;
         let (srcs, vd) = split_windows(str_views, MORSEL, strs.map(usize::from), dst as usize, m);
         for (i, r) in vd.iter_mut().enumerate() {
             let views = srcs.map(|w| w[i]);
@@ -1320,12 +1285,7 @@ fn eval_str_substr(
     let (base_s, base_d) = (si as usize * MORSEL, d as usize * MORSEL);
     let mut bad = [0u8; MORSEL];
     {
-        let EvalScratch {
-            regs,
-            str_views,
-            str_arena,
-            ..
-        } = &mut *scratch;
+        let EvalScratch { regs, str_views, str_arena, .. } = &mut *scratch;
         for i in 0..m {
             let v = str_views[base_s + i];
             let (s, base_off) = view_bytes_at(v, str_arena, bufs);
@@ -1392,12 +1352,7 @@ fn eval_str_concat(
     let m = mo.m;
     let mut bad = [0u8; MORSEL];
     {
-        let EvalScratch {
-            str_views,
-            str_arena,
-            null_bits,
-            ..
-        } = &mut *scratch;
+        let EvalScratch { str_views, str_arena, null_bits, .. } = &mut *scratch;
         let b_null_base = b as usize * NULL_WORDS_PER_REG;
         let ([sa, sb], sd) = split_windows(str_views, MORSEL, [a as usize, b as usize], d as usize, m);
         for i in 0..m {
@@ -1879,13 +1834,7 @@ pub(crate) fn eval_batch(
                     })
                 }
             }
-            Instr::IntMinMax2 {
-                dst,
-                a,
-                b,
-                is_max,
-                signed,
-            } => match (is_max, signed) {
+            Instr::IntMinMax2 { dst, a, b, is_max, signed } => match (is_max, signed) {
                 (true, true) => minmax2(scratch, &mo, dst, a, b, |x, y| x > y),
                 (false, true) => minmax2(scratch, &mo, dst, a, b, |x, y| x < y),
                 (true, false) => minmax2(scratch, &mo, dst, a, b, |x, y| (x as u64) > (y as u64)),
@@ -1915,11 +1864,7 @@ pub(crate) fn eval_batch(
             // (NULL rows too, tracked in `null_bits`), so the search reads a real
             // i64 for all rows and the NULL-row result is masked by `null_copy1`
             // — exactly how the int negate handles a NULL row.
-            Instr::IntInSet {
-                dst,
-                value_reg,
-                set_idx,
-            } => {
+            Instr::IntInSet { dst, value_reg, set_idx } => {
                 let set = &prog.int_sets[set_idx as usize]; // decoded once, sorted ascending
                 un_op(scratch, &mo, dst, value_reg, |x| set.binary_search(&x).is_ok() as i64)
             }
@@ -2100,9 +2045,7 @@ pub(crate) fn eval_batch(
                 let blob_len = bufs.blob.len();
                 let base_d = dst as usize * MORSEL;
                 {
-                    let EvalScratch {
-                        str_views, str_arena, ..
-                    } = &mut *scratch;
+                    let EvalScratch { str_views, str_arena, .. } = &mut *scratch;
                     // Destination `base_d + i`, source `morsel_start + i`: the
                     // two offsets differ, so the lane window is cut and walked
                     // rather than indexed twice.

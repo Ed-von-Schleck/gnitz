@@ -73,11 +73,7 @@ fn select_boundary_sweep() {
         LogicalInstr::LoadColInt { col: 1 }, // cond
         LogicalInstr::LoadColInt { col: 2 }, // a
         LogicalInstr::LoadColInt { col: 3 }, // b
-        LogicalInstr::Select {
-            cond: Reg(0),
-            a: Reg(1),
-            b: Reg(2),
-        },
+        LogicalInstr::Select { cond: Reg(0), a: Reg(1), b: Reg(2) },
     ];
     let prog = resolved(&schema, instrs, Reg(3));
 
@@ -138,11 +134,7 @@ fn select_no_nulls_fast_arm() {
         LogicalInstr::LoadColInt { col: 1 },
         LogicalInstr::LoadColInt { col: 2 },
         LogicalInstr::LoadColInt { col: 3 },
-        LogicalInstr::Select {
-            cond: Reg(0),
-            a: Reg(1),
-            b: Reg(2),
-        },
+        LogicalInstr::Select { cond: Reg(0), a: Reg(1), b: Reg(2) },
     ];
     let prog = resolved(&schema, instrs, Reg(3));
     assert!(prog.no_nulls, "NOT NULL branches must select the no_nulls fast arm");
@@ -184,25 +176,13 @@ fn bit_only_demotion_when_bool_feeds_arithmetic() {
     let mb = make_int_view(&schema, &[(1, 0, &[2, 3])]);
 
     let instrs = vec![
-        LogicalInstr::LoadColInt { col: 1 }, // r0 = col1
-        LogicalInstr::LoadConst { val: 1 },  // r1 = 1
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(0),
-            b: Reg(1),
-        }, // r2 = col1 > 1
-        LogicalInstr::LoadColInt { col: 2 }, // r3 = col2
-        LogicalInstr::Cmp {
-            op: CmpOp::Gt,
-            a: Reg(3),
-            b: Reg(1),
-        }, // r4 = col2 > 1
-        LogicalInstr::BoolBinary {
-            is_or: false,
-            a: Reg(2),
-            b: Reg(4),
-        }, // r5 = r2 AND r4    (consumed by ADD → not bit_only)
-        LogicalInstr::LoadConst { val: 0 },  // r6 = 0
+        LogicalInstr::LoadColInt { col: 1 },                             // r0 = col1
+        LogicalInstr::LoadConst { val: 1 },                              // r1 = 1
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },       // r2 = col1 > 1
+        LogicalInstr::LoadColInt { col: 2 },                             // r3 = col2
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(3), b: Reg(1) },       // r4 = col2 > 1
+        LogicalInstr::BoolBinary { is_or: false, a: Reg(2), b: Reg(4) }, // r5 = r2 AND r4    (consumed by ADD → not bit_only)
+        LogicalInstr::LoadConst { val: 0 },                              // r6 = 0
         LogicalInstr::IntArith {
             op: IntArithOp::Add,
             a: Reg(5),
@@ -592,11 +572,7 @@ fn division_nulls_the_row_on_a_zero_or_null_divisor() {
     let fa = a.map(|x| encode_f64(x as f64));
     let fb = b.map(|x| encode_f64(x as f64));
     let fdiv = run_binary_rows(type_code::I64, &fa, &fb, &no, &b_null, |a, b| {
-        LogicalInstr::FloatArith {
-            op: FloatArithOp::Div,
-            a,
-            b,
-        }
+        LogicalInstr::FloatArith { op: FloatArithOp::Div, a, b }
     });
     assert_eq!(decode_f64(fdiv[0].0), 10.0 / 3.0);
     assert!(fdiv[1].1 && fdiv[2].1, "a zero and a NULL divisor both null the row");
@@ -791,9 +767,7 @@ fn mixed_prog(
     let mut instrs: Vec<LogicalInstr> = (0..strs.len())
         .map(|k| LogicalInstr::LoadColStr { col: k as u32 + 1 })
         .collect();
-    instrs.extend((0..ints.len()).map(|k| LogicalInstr::LoadColInt {
-        col: (strs.len() + k) as u32 + 1,
-    }));
+    instrs.extend((0..ints.len()).map(|k| LogicalInstr::LoadColInt { col: (strs.len() + k) as u32 + 1 }));
     let regs: Vec<Reg> = (0..instrs.len()).map(|i| Reg(i as u16)).collect();
     instrs.extend(mk(&regs));
     let result = Reg(instrs.len() as u16 - 1);
@@ -864,15 +838,7 @@ fn a_string_column_past_the_buffer_table_still_reads_its_own_bytes() {
         .prog
         .instrs
         .iter()
-        .filter(|i| {
-            matches!(
-                i,
-                crate::Instr::LoadColStr {
-                    buf: super::SRC_ARENA,
-                    ..
-                }
-            )
-        })
+        .filter(|i| matches!(i, crate::Instr::LoadColStr { buf: super::SRC_ARENA, .. }))
         .count();
     assert_eq!(
         via_arena, 1,
@@ -916,10 +882,7 @@ fn case_fold_round_trips_every_cell_class_and_propagates_null() {
     let got = run_str_rows(&CELL_CLASSES, &nulls, |a| {
         vec![
             LogicalInstr::StrCase { a, upper: true },
-            LogicalInstr::StrCase {
-                a: Reg(1),
-                upper: false,
-            },
+            LogicalInstr::StrCase { a: Reg(1), upper: false },
         ]
     });
     for (i, want) in CELL_CLASSES.iter().enumerate() {
@@ -965,11 +928,7 @@ fn substring_window_matches_postgres_and_is_total() {
             instrs.push(LogicalInstr::LoadConst { val: l });
             Reg(2)
         });
-        instrs.push(LogicalInstr::StrSubstr {
-            src: Reg(0),
-            start_reg: Reg(1),
-            len_reg,
-        });
+        instrs.push(LogicalInstr::StrSubstr { src: Reg(0), start_reg: Reg(1), len_reg });
         instrs
     };
     let one = |s: &[u8], start: i64, len: Option<i64>| {
@@ -1084,11 +1043,7 @@ fn trim_strips_the_selected_ends_only() {
     let vals: &[&[u8]] = &[b"xyaxybyx", b"xyxy", b"", b"abc"];
     let run = |mode: TrimMode| {
         let (ev, view) = str_prog(vals, &[false; 4], vec![set.clone()], |a| {
-            vec![LogicalInstr::StrTrim {
-                a,
-                mode,
-                set_idx: ConstIdx(0),
-            }]
+            vec![LogicalInstr::StrTrim { a, mode, set_idx: ConstIdx(0) }]
         });
         (0..vals.len()).map(|i| row_str(&ev, &view, i).0).collect::<Vec<_>>()
     };
@@ -1148,11 +1103,7 @@ fn concat_null_rules_differ_by_operand_side() {
         let instrs = vec![
             LogicalInstr::LoadColStr { col: 1 },
             LogicalInstr::LoadColStr { col: 2 },
-            LogicalInstr::StrConcat {
-                a: Reg(0),
-                b: Reg(1),
-                skip_null,
-            },
+            LogicalInstr::StrConcat { a: Reg(0), b: Reg(1), skip_null },
         ];
         let ev = scalar_prog(&schema, instrs, Reg(2), vec![]);
         (0..3).map(|i| row_str(&ev, &view, i)).collect::<Vec<_>>()
@@ -1179,11 +1130,7 @@ fn concat_is_classified_null_producing_so_the_no_nulls_arm_cannot_take_it() {
         vec![
             LogicalInstr::LoadColStr { col: 1 },
             LogicalInstr::LoadColStr { col: 2 },
-            LogicalInstr::StrConcat {
-                a: Reg(0),
-                b: Reg(1),
-                skip_null: false,
-            },
+            LogicalInstr::StrConcat { a: Reg(0), b: Reg(1), skip_null: false },
         ],
         Reg(2),
         vec![],
@@ -1253,11 +1200,7 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
                 vec![
                     LogicalInstr::LoadColStr { col: 1 },
                     LogicalInstr::LoadColStr { col: 2 },
-                    LogicalInstr::StrCmp {
-                        op,
-                        a: Reg(0),
-                        b: Reg(1),
-                    },
+                    LogicalInstr::StrCmp { op, a: Reg(0), b: Reg(1) },
                 ],
                 Reg(2),
                 vec![],
@@ -1278,11 +1221,7 @@ fn every_string_compare_channel_agrees_with_the_cell_comparator() {
             let col_const = OPS.map(|op| {
                 scalar_prog(
                     &schema,
-                    vec![LogicalInstr::StrColConst {
-                        op,
-                        col: 1,
-                        const_idx: ConstIdx(0),
-                    }],
+                    vec![LogicalInstr::StrColConst { op, col: 1, const_idx: ConstIdx(0) }],
                     Reg(0),
                     vec![b.to_vec()],
                 )
@@ -1342,11 +1281,7 @@ fn heap_backed_constants_at_two_arena_offsets() {
                 col: 2,
                 const_idx: ConstIdx(1),
             },
-            LogicalInstr::BoolBinary {
-                is_or: false,
-                a: Reg(0),
-                b: Reg(1),
-            },
+            LogicalInstr::BoolBinary { is_or: false, a: Reg(0), b: Reg(1) },
         ],
         Reg(2),
         vec![a.to_vec(), b.to_vec()],
@@ -1374,10 +1309,7 @@ fn a_cell_index_is_dense_over_the_constants_the_fused_compare_names() {
         &schema,
         vec![
             LogicalInstr::LoadColInt { col: 0 },
-            LogicalInstr::IntInSet {
-                value_reg: Reg(0),
-                set_idx: ConstIdx(0),
-            },
+            LogicalInstr::IntInSet { value_reg: Reg(0), set_idx: ConstIdx(0) },
             LogicalInstr::StrColConst {
                 op: CmpOp::Eq,
                 col: 2,
@@ -1388,16 +1320,8 @@ fn a_cell_index_is_dense_over_the_constants_the_fused_compare_names() {
                 col: 1,
                 const_idx: ConstIdx(1),
             },
-            LogicalInstr::BoolBinary {
-                is_or: false,
-                a: Reg(2),
-                b: Reg(3),
-            },
-            LogicalInstr::BoolBinary {
-                is_or: false,
-                a: Reg(1),
-                b: Reg(4),
-            },
+            LogicalInstr::BoolBinary { is_or: false, a: Reg(2), b: Reg(3) },
+            LogicalInstr::BoolBinary { is_or: false, a: Reg(1), b: Reg(4) },
         ],
         Reg(5),
         vec![set, a.to_vec(), b.to_vec()],
@@ -1545,11 +1469,7 @@ fn text_to_u64_seeds_the_unsigned_tracking() {
                 LogicalInstr::LoadColStr { col: 1 },
                 LogicalInstr::StrToInt { a: Reg(0), fi },
                 LogicalInstr::LoadConst { val: 5 },
-                LogicalInstr::Cmp {
-                    op: CmpOp::Gt,
-                    a: Reg(1),
-                    b: Reg(2),
-                },
+                LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(1), b: Reg(2) },
             ],
             Reg(3),
             vec![],
@@ -1662,18 +1582,10 @@ fn string_select_takes_the_chosen_branch_and_its_null_bit() {
         vec![
             LogicalInstr::LoadColInt { col: 0 },
             LogicalInstr::LoadConst { val: 2 },
-            LogicalInstr::Cmp {
-                op: CmpOp::Ne,
-                a: Reg(0),
-                b: Reg(1),
-            },
+            LogicalInstr::Cmp { op: CmpOp::Ne, a: Reg(0), b: Reg(1) },
             LogicalInstr::LoadColStr { col: 1 },
             LogicalInstr::LoadColStr { col: 2 },
-            LogicalInstr::StrSelect {
-                cond: Reg(2),
-                a: Reg(3),
-                b: Reg(4),
-            },
+            LogicalInstr::StrSelect { cond: Reg(2), a: Reg(3), b: Reg(4) },
         ],
         Reg(5),
         vec![],
@@ -1805,17 +1717,11 @@ fn is_null_reg_on_the_no_nulls_arm_is_the_constant() {
 #[test]
 fn sign_reads_its_operand_signedness_and_keeps_the_float_domain() {
     let signed = run_unary_rows(type_code::I64, &[-5, 0, 7, i64::MIN], &[false; 4], |a| {
-        LogicalInstr::IntUnary {
-            op: IntUnaryOp::Sign,
-            a,
-        }
+        LogicalInstr::IntUnary { op: IntUnaryOp::Sign, a }
     });
     assert_eq!(signed, [(-1, false), (0, false), (1, false), (-1, false)]);
     let unsigned = run_unary_rows(type_code::U64, &[u64::MAX as i64, 0], &[false; 2], |a| {
-        LogicalInstr::IntUnary {
-            op: IntUnaryOp::Sign,
-            a,
-        }
+        LogicalInstr::IntUnary { op: IntUnaryOp::Sign, a }
     });
     assert_eq!(unsigned, [(1, false), (0, false)]);
     let vals: Vec<i64> = [-2.5, 0.0, -0.0, 3.0, f64::NAN]
@@ -1856,11 +1762,7 @@ fn transcendentals_and_power_are_the_ieee_result() {
         &[encode_f64(10.0), encode_f64(-1.0)],
         &[false; 2],
         &[false; 2],
-        |a, b| LogicalInstr::FloatArith {
-            op: FloatArithOp::Pow,
-            a,
-            b,
-        },
+        |a, b| LogicalInstr::FloatArith { op: FloatArithOp::Pow, a, b },
     );
     assert_eq!(decode_f64(got[0].0), 1024.0);
     assert_eq!(decode_f64(got[1].0), f64::INFINITY);
@@ -1879,11 +1781,7 @@ fn left_and_right_count_characters_from_either_end() {
     let n: &[i64] = &[2, -1, 10, 0, -10];
     let run = |left: bool| {
         let (ev, view) = mixed_prog(&[s], &[n], vec![], |r| {
-            vec![LogicalInstr::StrSide {
-                src: r[0],
-                n_reg: r[1],
-                left,
-            }]
+            vec![LogicalInstr::StrSide { src: r[0], n_reg: r[1], left }]
         });
         str_rows(&ev, &view, 5).into_iter().map(|(v, _)| v).collect::<Vec<_>>()
     };
@@ -1898,10 +1796,7 @@ fn strpos_is_a_character_index() {
     let hay: &[&[u8]] = &["héllo".as_bytes(); 4];
     let needle: &[&[u8]] = &[b"l", b"", b"z", "éll".as_bytes()];
     let (ev, view) = mixed_prog(&[hay, needle], &[], vec![], |r| {
-        vec![LogicalInstr::StrPos {
-            hay: r[0],
-            needle: r[1],
-        }]
+        vec![LogicalInstr::StrPos { hay: r[0], needle: r[1] }]
     });
     let got: Vec<Option<i64>> = (0..4).map(|i| row_value(&ev, &view, i)).collect();
     assert_eq!(got, [Some(3), Some(1), Some(0), Some(2)]);
@@ -1926,11 +1821,7 @@ fn replace_rewrites_every_occurrence_left_to_right() {
     let from: &[&[u8]] = &[b"X", b"", b"aa", b"z", b"X"];
     let to: &[&[u8]] = &[b"--", b"z", b"b", b"q", b""];
     let (ev, view) = mixed_prog(&[s, from, to], &[], vec![], |r| {
-        vec![LogicalInstr::StrReplace {
-            s: r[0],
-            from: r[1],
-            to: r[2],
-        }]
+        vec![LogicalInstr::StrReplace { s: r[0], from: r[1], to: r[2] }]
     });
     let got: Vec<Vec<u8>> = str_rows(&ev, &view, 5).into_iter().map(|(v, _)| v).collect();
     assert_eq!(
@@ -1956,11 +1847,7 @@ fn replace_over_arena_operands_rewrites_correctly() {
         vec![
             LogicalInstr::StrCase { a: r[0], upper: true },
             LogicalInstr::StrCase { a: r[2], upper: true },
-            LogicalInstr::StrReplace {
-                s: Reg(3),
-                from: r[1],
-                to: Reg(4),
-            },
+            LogicalInstr::StrReplace { s: Reg(3), from: r[1], to: Reg(4) },
         ]
     });
     assert_eq!(row_str(&ev, &view, 0).0, b"AYYBYYC");
@@ -1975,12 +1862,7 @@ fn pad_measures_characters_and_truncates_a_long_subject() {
     let fill: &[&[u8]] = &[b"xy", "éx".as_bytes(), b"x", b"x", b"", b"x"];
     let run = |left: bool| {
         let (ev, view) = mixed_prog(&[s, fill], &[n], vec![], |r| {
-            vec![LogicalInstr::StrPad {
-                s: r[0],
-                n_reg: r[2],
-                fill: r[1],
-                left,
-            }]
+            vec![LogicalInstr::StrPad { s: r[0], n_reg: r[2], fill: r[1], left }]
         });
         str_rows(&ev, &view, 6).into_iter().map(|(v, _)| v).collect::<Vec<_>>()
     };
@@ -1997,11 +1879,7 @@ fn split_part_indexes_fields_from_either_end_and_nulls_on_zero() {
     let d: &[&[u8]] = &[b",", b",", b",", b",", b",", b"", b"", b","];
     let n: &[i64] = &[2, -1, 5, -5, 1, 1, 2, 0];
     let (ev, view) = mixed_prog(&[s, d], &[n], vec![], |r| {
-        vec![LogicalInstr::StrSplitPart {
-            s: r[0],
-            delim: r[1],
-            n_reg: r[2],
-        }]
+        vec![LogicalInstr::StrSplitPart { s: r[0], delim: r[1], n_reg: r[2] }]
     });
     let got = str_rows(&ev, &view, 8);
     let want: Vec<(Vec<u8>, bool)> = [
@@ -2026,11 +1904,7 @@ fn string_producers_propagate_a_null_operand_of_either_class() {
     let s: &[&[u8]] = &[b"abc", b"abc"];
     let n: &[i64] = &[1, 1];
     let (ev, mut view) = mixed_prog(&[s], &[n], vec![], |r| {
-        vec![LogicalInstr::StrSide {
-            src: r[0],
-            n_reg: r[1],
-            left: true,
-        }]
+        vec![LogicalInstr::StrSide { src: r[0], n_reg: r[1], left: true }]
     });
     view.set_null(0, 0);
     view.set_null(1, 1);

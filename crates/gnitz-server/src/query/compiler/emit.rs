@@ -302,11 +302,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
                 .map_err(expr_reject("filter: invalid predicate program"))?;
             let pred_idx = ctx.builder.push_predicate(pred);
             let out_reg = ctx.push_delta_reg(in_schema);
-            ctx.builder.push(Instr::Filter {
-                in_reg,
-                out_reg,
-                pred_idx,
-            });
+            ctx.builder.push(Instr::Filter { in_reg, out_reg, pred_idx });
             Ok(out_reg)
         }
 
@@ -349,22 +345,14 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
             };
             let hist_reg = ctx.push_trace_reg(&format!("_hist_{}_{nid}", ctx.site.id), in_reg_schema)?;
             let out_reg = ctx.push_delta_reg(in_reg_schema);
-            ctx.builder.push(Instr::WeightClamp {
-                in_reg,
-                hist_reg,
-                out_reg,
-                lo,
-                hi,
-            });
+            ctx.builder
+                .push(Instr::WeightClamp { in_reg, hist_reg, out_reg, lo, hi });
             Ok(out_reg)
         }
 
-        gnitz_wire::OpNode::Reduce {
-            group_cols,
-            agg,
-            global_ground,
-            out_key,
-        } => emit_reduce(ctx, nid, group_cols, agg, *global_ground, *out_key),
+        gnitz_wire::OpNode::Reduce { group_cols, agg, global_ground, out_key } => {
+            emit_reduce(ctx, nid, group_cols, agg, *global_ground, *out_key)
+        }
 
         gnitz_wire::OpNode::Join(kind) => {
             let (delta, trace) = ctx.loaded.inputs(nid).binary();
@@ -567,11 +555,7 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, mk: &gnitz_wire::MapKind) -> Result<u16
     let map_idx = ctx.builder.push_map(plan);
 
     let out_reg = ctx.push_delta_reg(node_schema);
-    ctx.builder.push(Instr::Map {
-        in_reg,
-        out_reg,
-        map_idx,
-    });
+    ctx.builder.push(Instr::Map { in_reg, out_reg, map_idx });
     Ok(out_reg)
 }
 
@@ -654,10 +638,7 @@ fn emit_reduce(
         plan_idx,
     });
 
-    ctx.builder.push(Instr::Integrate {
-        in_reg: out_reg,
-        trace_reg,
-    });
+    ctx.builder.push(Instr::Integrate { in_reg: out_reg, trace_reg });
     Ok(out_reg)
 }
 

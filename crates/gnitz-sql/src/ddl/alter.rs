@@ -35,10 +35,7 @@ pub(crate) fn execute_alter_table(
             };
             rename_relation(client, schema_name, &alter.name, alter.if_exists, target)
         }
-        AlterTableOperation::RenameColumn {
-            old_column_name,
-            new_column_name,
-        } => rename_column(
+        AlterTableOperation::RenameColumn { old_column_name, new_column_name } => rename_column(
             client,
             schema_name,
             &alter.name,
@@ -50,11 +47,7 @@ pub(crate) fn execute_alter_table(
             reject_if(*not_valid, "ALTER TABLE ADD CONSTRAINT", "NOT VALID")?;
             add_constraint(client, schema_name, &alter.name, alter.if_exists, constraint, binder)
         }
-        AlterTableOperation::DropConstraint {
-            if_exists,
-            name,
-            drop_behavior: _,
-        } => drop_constraint(
+        AlterTableOperation::DropConstraint { if_exists, name, drop_behavior: _ } => drop_constraint(
             client,
             schema_name,
             &alter.name,
@@ -471,10 +464,7 @@ fn rename_target_name(target: &ObjectName, source_schema: &str) -> Result<String
 /// The `Altered` result — also the IF-EXISTS no-op success (nothing to alter,
 /// but the statement succeeds), carrying the intended name.
 fn altered(object: &str, name: String) -> SqlResult {
-    SqlResult::Altered {
-        object: object.to_string(),
-        name,
-    }
+    SqlResult::Altered { object: object.to_string(), name }
 }
 
 fn missing(what: &str, schema: &str, name: &str) -> GnitzSqlError {

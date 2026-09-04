@@ -36,11 +36,7 @@ fn gt_predicate(col: usize, threshold: i64) -> Vec<u8> {
     let mut b = ExprBuilder::new();
     let c = b.emit(L::LoadColInt { col: col as u32 });
     let k = b.emit(L::LoadConst { val: threshold });
-    let cond = b.emit(L::Cmp {
-        op: CmpOp::Gt,
-        a: c,
-        b: k,
-    });
+    let cond = b.emit(L::Cmp { op: CmpOp::Gt, a: c, b: k });
     b.build(Some(cond)).expect("a well-formed program").to_blob_bytes()
 }
 

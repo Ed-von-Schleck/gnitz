@@ -45,10 +45,7 @@ fn sample(op: Opcode) -> OpNode {
             cols: vec![(1, 0), (2, crate::type_code::I32)],
             branch_id: 0,
         }),
-        Opcode::JoinDeltaTraceRange => OpNode::Join(JoinKind::DeltaTraceRange {
-            n_eq: 3,
-            rel: RangeRel::Le,
-        }),
+        Opcode::JoinDeltaTraceRange => OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 3, rel: RangeRel::Le }),
         Opcode::WorkerFilter => OpNode::WorkerFilter,
         Opcode::PositivePart => OpNode::PositivePart,
         Opcode::MapReindex => OpNode::Map(MapKind::Reindex {
@@ -80,14 +77,8 @@ fn every_op_node_variant_roundtrips() {
         OpNode::ScanDelta { source: 7, bound: None },
         OpNode::Filter(None),
         OpNode::Map(MapKind::Projection(vec![])),
-        OpNode::Map(MapKind::Compute(ComputeMap {
-            program: vec![9, 9],
-            out_cols: vec![],
-        })),
-        OpNode::Map(MapKind::HashRow {
-            cols: vec![(3, 0)],
-            branch_id: 1,
-        }),
+        OpNode::Map(MapKind::Compute(ComputeMap { program: vec![9, 9], out_cols: vec![] })),
+        OpNode::Map(MapKind::HashRow { cols: vec![(3, 0)], branch_id: 1 }),
         OpNode::Reduce {
             group_cols: vec![],
             agg: vec![agg(AggFunc::Count, 0)],
@@ -154,10 +145,7 @@ fn a_truncated_or_over_long_params_cell_is_rejected() {
             for bytes in [&params.as_ref().unwrap()[..1], over_long.as_slice()] {
                 assert_eq!(
                     decode(bytes).unwrap(),
-                    OpNode::ScanDelta {
-                        source: 42,
-                        bound: None
-                    },
+                    OpNode::ScanDelta { source: 42, bound: None },
                     "a damaged scan bound must degrade, not fail",
                 );
             }

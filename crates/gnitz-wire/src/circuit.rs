@@ -589,12 +589,7 @@ pub fn encode_op_node(op: OpNode) -> (Opcode, Option<TableId>, Option<Vec<u8>>) 
         OpNode::Union => (Opcode::Union, None, None),
         OpNode::Distinct => (Opcode::Distinct, None, None),
         OpNode::PositivePart => (Opcode::PositivePart, None, None),
-        OpNode::Reduce {
-            group_cols,
-            agg,
-            global_ground,
-            out_key,
-        } => {
+        OpNode::Reduce { group_cols, agg, global_ground, out_key } => {
             w.u8(out_key.as_wire() as u8).u8(global_ground as u8);
             write_cols(&mut w, &group_cols);
             w.u16(agg.len() as u16);
@@ -681,11 +676,7 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<TableId>, params: Option<&[u8
             if key.is_empty() {
                 return Err("MAP_REINDEX names no key columns".to_string());
             }
-            OpNode::Map(MapKind::Reindex {
-                keep: read_cols(&mut r)?,
-                key,
-                role,
-            })
+            OpNode::Map(MapKind::Reindex { keep: read_cols(&mut r)?, key, role })
         }
         Opcode::MapHashRow => {
             let branch_id = r.u8()?;
@@ -713,10 +704,7 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<TableId>, params: Option<&[u8
                 let func_byte = r.u8()?;
                 let agg_op =
                     AggFunc::from_wire(func_byte as u64).ok_or_else(|| format!("unknown agg func id {func_byte}"))?;
-                agg.push(AggDescriptor {
-                    agg_op,
-                    col_idx: r.u32()?,
-                });
+                agg.push(AggDescriptor { agg_op, col_idx: r.u32()? });
             }
             if agg.is_empty() {
                 return Err("REDUCE node carries no aggregate spec".to_string());
@@ -728,12 +716,7 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<TableId>, params: Option<&[u8
             if global_ground && !group_cols.is_empty() {
                 return Err("REDUCE is global-ground over a non-empty group set".to_string());
             }
-            OpNode::Reduce {
-                group_cols,
-                agg,
-                global_ground,
-                out_key,
-            }
+            OpNode::Reduce { group_cols, agg, global_ground, out_key }
         }
         Opcode::JoinDeltaTrace => OpNode::Join(JoinKind::DeltaTrace),
         Opcode::JoinDeltaTraceRange => {
@@ -746,9 +729,7 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<TableId>, params: Option<&[u8
         Opcode::JoinDeltaTraceCross => OpNode::Join(JoinKind::DeltaTraceCross),
         Opcode::Integrate => OpNode::IntegrateSink,
         Opcode::IntegrateTrace => OpNode::IntegrateTrace,
-        Opcode::ExchangeShard => OpNode::ExchangeShard {
-            shard_cols: read_cols(&mut r)?,
-        },
+        Opcode::ExchangeShard => OpNode::ExchangeShard { shard_cols: read_cols(&mut r)? },
         Opcode::NullExtend => {
             let n = r.u16()? as usize;
             let mut type_codes = Vec::with_capacity(n);

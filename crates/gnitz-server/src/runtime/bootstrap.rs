@@ -379,12 +379,7 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
         m2w_efds.push(efd);
     }
 
-    Ok(SharedIpc {
-        sal_fd,
-        sal_ptr,
-        w2m_ptrs,
-        m2w_efds,
-    })
+    Ok(SharedIpc { sal_fd, sal_ptr, w2m_ptrs, m2w_efds })
 }
 
 /// The forked child's whole life: latch its rank, redirect its logs to
@@ -634,12 +629,7 @@ fn run_server(
     }
 
     // --- Parent process ---
-    let SharedIpc {
-        sal_fd,
-        sal_ptr,
-        w2m_ptrs,
-        m2w_efds,
-    } = ipc;
+    let SharedIpc { sal_fd, sal_ptr, w2m_ptrs, m2w_efds } = ipc;
 
     let sal_writer = SalWriter::new(sal_ptr, sal_fd, sal_mmap_size(), nw);
     let w2m_receiver = std::rc::Rc::new(W2mReceiver::new(w2m_ptrs));

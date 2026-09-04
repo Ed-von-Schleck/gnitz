@@ -172,10 +172,7 @@ fn syscall_count_child() {
     };
     let tid: u64 = tid.parse().unwrap();
     let n: usize = n.parse().unwrap();
-    let schema = Arc::new(Schema {
-        columns: cols(),
-        pk_cols: vec![0],
-    });
+    let schema = Arc::new(Schema { columns: cols(), pk_cols: vec![0] });
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

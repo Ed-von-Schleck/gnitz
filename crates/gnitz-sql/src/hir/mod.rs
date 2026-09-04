@@ -657,12 +657,7 @@ impl RelExpr {
             .iter()
             .map(|c| HirCol::new(ids.next(), c.clone()))
             .collect();
-        Rc::new(RelExpr::Get {
-            tid,
-            schema,
-            cols,
-            desc,
-        })
+        Rc::new(RelExpr::Get { tid, schema, cols, desc })
     }
 
     /// A linear filter: pass-through columns (same ids, same order as `input`).
@@ -708,11 +703,7 @@ impl RelExpr {
     /// A reduce. `aggs` are already validated + nullability-stamped by bind (which
     /// holds the input env), so this is a plain node build — parity by construction.
     pub(crate) fn reduce(input: Rc<RelExpr>, group_cols: Vec<ColId>, aggs: Vec<HirAgg>) -> Rc<RelExpr> {
-        Rc::new(RelExpr::Reduce {
-            input,
-            group_cols,
-            aggs,
-        })
+        Rc::new(RelExpr::Reduce { input, group_cols, aggs })
     }
 
     /// A DISTINCT over its input's visible columns.
@@ -826,13 +817,7 @@ impl RelExpr {
                 out: HirCol::new(ids.next(), def),
             });
         }
-        Ok(Rc::new(RelExpr::SetOp {
-            op,
-            all,
-            left,
-            right,
-            out,
-        }))
+        Ok(Rc::new(RelExpr::SetOp { op, all, left, right, out }))
     }
 
     /// Rebuild this node with each child replaced by `f(child)`, preserving `Rc`
@@ -870,35 +855,18 @@ impl RelExpr {
             RelExpr::Filter { input, preds } => one!(input, |n| RelExpr::filter(n, preds.clone())),
             RelExpr::Project { input, items } => one!(input, |n| RelExpr::project(n, items.clone())),
             RelExpr::Distinct { input } => one!(input, RelExpr::distinct),
-            RelExpr::Alias { input, cols } => one!(input, |n| Rc::new(RelExpr::Alias {
-                input: n,
-                cols: cols.clone(),
-            })),
-            RelExpr::Reduce {
-                input,
-                group_cols,
-                aggs,
-            } => one!(input, |n| RelExpr::reduce(n, group_cols.clone(), aggs.clone())),
-            RelExpr::Join {
-                left,
-                right,
-                kind,
-                on,
-                mark,
-            } => two!(left, right, |l, r| Rc::new(RelExpr::Join {
+            RelExpr::Alias { input, cols } => one!(input, |n| Rc::new(RelExpr::Alias { input: n, cols: cols.clone() })),
+            RelExpr::Reduce { input, group_cols, aggs } => {
+                one!(input, |n| RelExpr::reduce(n, group_cols.clone(), aggs.clone()))
+            }
+            RelExpr::Join { left, right, kind, on, mark } => two!(left, right, |l, r| Rc::new(RelExpr::Join {
                 left: l,
                 right: r,
                 kind: *kind,
                 on: on.clone(),
                 mark: mark.clone(),
             })),
-            RelExpr::SetOp {
-                op,
-                all,
-                left,
-                right,
-                out,
-            } => two!(left, right, |l, r| Rc::new(RelExpr::SetOp {
+            RelExpr::SetOp { op, all, left, right, out } => two!(left, right, |l, r| Rc::new(RelExpr::SetOp {
                 op: *op,
                 all: *all,
                 left: l,
@@ -918,13 +886,7 @@ impl RelExpr {
             RelExpr::Get { cols, .. } => cols.clone(),
             RelExpr::Filter { input, .. } => input.cols(),
             RelExpr::Project { items, .. } => items.iter().map(|e| e.out.clone()).collect(),
-            RelExpr::Join {
-                left,
-                right,
-                kind,
-                mark,
-                ..
-            } => match kind {
+            RelExpr::Join { left, right, kind, mark, .. } => match kind {
                 // A semi/anti join carries only the left (outer) columns; a mark
                 // join appends its synthetic `0/1` column after them. The equi/
                 // outer joins are left ++ right with the null-providing side widened
@@ -945,11 +907,7 @@ impl RelExpr {
                     cols
                 }
             },
-            RelExpr::Reduce {
-                input,
-                group_cols,
-                aggs,
-            } => {
+            RelExpr::Reduce { input, group_cols, aggs } => {
                 // Group cols keep their source `HirCol`s (from the input); then
                 // each aggregate's raw value + companion columns. The physical
                 // cardinality COUNT has no logical column and is absent here.

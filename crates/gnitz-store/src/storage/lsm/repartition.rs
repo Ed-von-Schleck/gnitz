@@ -266,11 +266,7 @@ fn remove_set(rel_dir: &str, of: u32) {
 /// manifest — hard-linked `launched` times. No other source child is ever
 /// consulted.
 fn link_targets(rel_dir: &str, source: &SourceSet, launched: u32, seq: u64) -> Result<(), StorageError> {
-    let source_dir = ChildAddr::Worker {
-        rank: source.source.rank,
-        of: source.of,
-    }
-    .dir(rel_dir);
+    let source_dir = ChildAddr::Worker { rank: source.source.rank, of: source.of }.dir(rel_dir);
     for target in super::child_dir::cluster_children(launched) {
         link_child(
             &source_dir,

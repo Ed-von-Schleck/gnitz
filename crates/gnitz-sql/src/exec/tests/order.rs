@@ -120,10 +120,7 @@ fn run(sql: &str, schema: &Schema, batch: ZSetBatch) -> Result<Vec<(u64, Option<
     // The test SQL only ever uses `LIMIT <n>`; the deeper `Expr::Value` is
     // folded into the outer pattern so no re-match of the same binding.
     let limit = match &q.limit_clause {
-        Some(sqlparser::ast::LimitClause::LimitOffset {
-            limit: Some(Expr::Value(vws)),
-            ..
-        }) => match &vws.value {
+        Some(sqlparser::ast::LimitClause::LimitOffset { limit: Some(Expr::Value(vws)), .. }) => match &vws.value {
             sqlparser::ast::Value::Number(n, _) => n.parse::<usize>().ok(),
             _ => None,
         },
@@ -526,11 +523,7 @@ fn resolve_order_by_rejects_clickhouse_duckdb_extensions() {
         kind: OrderByKind::Expressions(vec![OrderByExpr {
             expr: Expr::Identifier(Ident::new("v")),
             options: OrderByOptions::default(),
-            with_fill: Some(WithFill {
-                from: None,
-                to: None,
-                step: None,
-            }),
+            with_fill: Some(WithFill { from: None, to: None, step: None }),
         }]),
         interpolate: None,
     };

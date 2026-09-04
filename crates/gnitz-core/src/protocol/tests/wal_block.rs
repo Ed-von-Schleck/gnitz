@@ -429,10 +429,7 @@ fn pk_stride_wal_roundtrip_bytes_24() {
     }
 
     let batch = ZSetBatch {
-        pks: PkColumn {
-            stride: 24,
-            buf: pk_buf.clone(),
-        },
+        pks: PkColumn { stride: 24, buf: pk_buf.clone() },
         weights: weights.clone(),
         nulls: nulls.clone(),
         columns: vec![
@@ -498,10 +495,7 @@ fn pk_stride_wal_roundtrip_bytes_64() {
     }
 
     let batch = ZSetBatch {
-        pks: PkColumn {
-            stride: 64,
-            buf: pk_buf.clone(),
-        },
+        pks: PkColumn { stride: 64, buf: pk_buf.clone() },
         weights: vec![1; n],
         nulls: vec![0; n],
         columns: vec![

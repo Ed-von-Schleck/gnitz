@@ -289,10 +289,7 @@ impl NarrowPkOpk {
             stride == 16 || (pk >> (stride * 8)) == 0,
             "narrow PK {pk} does not fit {stride} bytes",
         );
-        NarrowPkOpk {
-            be: pk.to_be_bytes(),
-            stride,
-        }
+        NarrowPkOpk { be: pk.to_be_bytes(), stride }
     }
 
     /// The `stride` order-preserving bytes — a full PK region for one row.
@@ -509,10 +506,7 @@ impl PkBuf {
         debug_assert!(slice.len() <= MAX_PK_BYTES);
         let mut bytes = [0u8; MAX_PK_BYTES];
         bytes[..slice.len()].copy_from_slice(slice);
-        PkBuf {
-            bytes,
-            len: slice.len() as u8,
-        }
+        PkBuf { bytes, len: slice.len() as u8 }
     }
 
     /// In-place [`Self::from_bytes`]: overwrite this key with `src`. Reuses the
@@ -599,11 +593,7 @@ impl IndexKeySpec {
     /// `idx_schema` supplies the promoted leading columns the span encodes at.
     pub fn new(cols: &[u32], owner: &SchemaDescriptor, idx_schema: &SchemaDescriptor) -> Self {
         debug_assert!(!cols.is_empty() && cols.len() <= gnitz_wire::PK_LIST_MAX_COLS);
-        let mut locators = [ColumnLocator::Pk {
-            byte_off: 0,
-            size: 0,
-            type_code: 0,
-        }; gnitz_wire::PK_LIST_MAX_COLS];
+        let mut locators = [ColumnLocator::Pk { byte_off: 0, size: 0, type_code: 0 }; gnitz_wire::PK_LIST_MAX_COLS];
         let mut idx_cols = [SchemaColumn::EMPTY; gnitz_wire::PK_LIST_MAX_COLS];
         for (i, &c) in cols.iter().enumerate() {
             locators[i] = owner.locate(c as usize);
@@ -1139,12 +1129,7 @@ fn group_key_layout(cols: &[(u8, bool)], reserve_cols: usize, reserve_bytes: usi
     if has_fold {
         slots.push(type_code::U128);
     }
-    GroupKeyLayout {
-        has_bitmap,
-        n_packed,
-        has_fold,
-        slots,
-    }
+    GroupKeyLayout { has_bitmap, n_packed, has_fold, slots }
 }
 
 #[derive(Clone, Copy)]
@@ -1209,11 +1194,7 @@ impl ColPromoter {
     const PLACEHOLDER: ColPromoter = ColPromoter {
         out_col: SchemaColumn::EMPTY,
         nullable: false,
-        kind: PromoteKind::Col(ColumnLocator::Pk {
-            byte_off: 0,
-            size: 0,
-            type_code: 0,
-        }),
+        kind: PromoteKind::Col(ColumnLocator::Pk { byte_off: 0, size: 0, type_code: 0 }),
     };
 
     /// A slot packing into a `out_tc` output PK column. The one place the output

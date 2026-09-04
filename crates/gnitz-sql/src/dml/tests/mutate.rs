@@ -397,9 +397,7 @@ fn a_computed_string_rhs_routes_to_the_string_arm_and_evaluates() {
 #[test]
 fn a_string_rhs_against_an_integer_column_is_rejected() {
     let schema = two_col(TypeCode::I64);
-    let concat = BoundExpr::ConcatN {
-        args: vec![BoundExpr::LitInt(1)],
-    };
+    let concat = BoundExpr::ConcatN { args: vec![BoundExpr::LitInt(1)] };
     assert!(matches!(
         classify_set_rhs(&concat, 1, &schema),
         Err(GnitzSqlError::Bind(_))
