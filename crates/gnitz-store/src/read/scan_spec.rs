@@ -232,8 +232,7 @@ impl RelationRegistry {
         exact: bool,
         desc: &RangeDescriptor,
     ) -> Result<SourceCursor, StoreError> {
-        let cols = gnitz_wire::unpack_pk_cols(idx_cols);
-        self.validate_index_cols(source, &cols, "scan_spec")?;
+        let cols = self.index_cols(source, idx_cols, "scan_spec")?;
         // `exact`: the walk alone imposes the range. Otherwise the conjuncts ride
         // the residual predicate and the walk may be traded away.
         let walk = if exact {

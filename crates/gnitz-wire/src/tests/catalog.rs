@@ -50,23 +50,21 @@ fn from_slice_and_the_packed_codec_agree_at_every_arity() {
     ] {
         let list = PkColList::from_slice(&cols);
         assert_eq!(list.as_slice(), cols.as_slice());
-        assert_eq!(list.decoded_count(), cols.len());
-        assert!(list.is_well_formed());
-        assert_eq!(unpack_pk_cols(pack_pk_cols(&cols)), list, "{cols:?}");
+        assert_eq!(unpack_pk_cols(pack_pk_cols(&cols)), Ok(list), "{cols:?}");
     }
 }
 
-/// A crafted packed word can name a count of zero or one past the cap.
-/// `decoded_count()` must return it **raw** — that is the value `is_well_formed`
-/// gates on — while `as_slice()` clamps rather than panics, so the malformed
-/// list survives as far as the schema validation that returns it as an `Err`.
+/// A crafted packed word can name a count of zero or one past the cap. Both are
+/// refused at the decode, so no `PkColList` with such a count is ever built.
 #[test]
-fn a_crafted_pk_col_count_survives_to_is_well_formed() {
-    for n in [0usize, PK_LIST_MAX_COLS + 1, (1 << PK_LIST_COUNT_BITS) - 1] {
-        let list = unpack_pk_cols(PK_LIST_PACKED_FLAG | n as u64);
-        assert_eq!(list.decoded_count(), n, "the raw count must reach is_well_formed");
-        assert!(!list.is_well_formed(), "count {n} is out of range");
-        assert!(list.as_slice().len() <= PK_LIST_MAX_COLS, "as_slice must clamp");
+fn a_crafted_pk_col_count_is_rejected_at_unpack() {
+    let over = [PK_LIST_MAX_COLS + 1, (1 << PK_LIST_COUNT_BITS) - 1];
+    assert_eq!(unpack_pk_cols(PK_LIST_PACKED_FLAG), Err(crate::PkRule::Empty));
+    for n in over {
+        assert_eq!(
+            unpack_pk_cols(PK_LIST_PACKED_FLAG | n as u64),
+            Err(crate::PkRule::TooManyColumns { count: n })
+        );
     }
 }
 
@@ -76,21 +74,23 @@ fn a_crafted_pk_col_count_survives_to_is_well_formed() {
 #[test]
 fn a_flag_clear_word_decodes_as_one_bare_column_index() {
     for raw in [0u64, 7] {
-        let list = unpack_pk_cols(raw);
+        let list = unpack_pk_cols(raw).expect("a bare word is a one-column list");
         assert_eq!(list.as_slice(), &[raw as u32]);
-        assert_eq!(list.decoded_count(), 1);
-        assert!(list.is_well_formed());
     }
 }
 
 /// A packed list occupies the low 32 bits plus the flag at bit 63, leaving bits
 /// [32..63) clear — which is what gives `HAS_PK_WANT_HOLDER` (bit 62, below) and
-/// any later directive room in the same word.
+/// any later directive room in the same word. Bit 63 also makes a packed word
+/// non-zero, which is what lets `0` stay the worker's has-PK sentinel.
 #[test]
 fn a_packed_list_leaves_the_reserved_bits_clear() {
-    let packed = pack_pk_cols(&[3, 9, 40, 64]);
-    assert_eq!(packed >> 63, 1, "the packed flag is bit 63");
-    assert_eq!((packed >> 32) & 0x7FFF_FFFF, 0, "bits [32..63) are reserved");
+    for cols in [&[0u32][..], &[3][..], &[3, 9, 40, 64][..]] {
+        let packed = pack_pk_cols(cols);
+        assert_eq!(packed >> 63, 1, "{cols:?}: the packed flag is bit 63");
+        assert_ne!(packed, 0, "{cols:?}: never the PK sentinel");
+        assert_eq!((packed >> 32) & 0x7FFF_FFFF, 0, "{cols:?}: bits [32..63) are reserved");
+    }
 }
 
 /// `HAS_PK_WANT_HOLDER` rides bit 62 of the same `seek_col_idx` word that
@@ -106,7 +106,10 @@ fn the_want_holder_bit_is_clear_of_every_packed_column_list() {
         assert_eq!(packed & HAS_PK_WANT_HOLDER, 0, "{cols:?} must leave bit 62 clear");
         let with_directive = packed | HAS_PK_WANT_HOLDER;
         assert_eq!(pk_cols_word(with_directive), packed, "{cols:?}");
-        assert_eq!(unpack_pk_cols(pk_cols_word(with_directive)).as_slice(), cols.as_slice());
+        assert_eq!(
+            unpack_pk_cols(pk_cols_word(with_directive)).map(|l| l.as_slice().to_vec()),
+            Ok(cols.clone())
+        );
     }
 }
 

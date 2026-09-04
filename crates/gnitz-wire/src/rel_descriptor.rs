@@ -182,15 +182,9 @@ impl RelDescriptorBlob {
     /// relation-absent answer. `num_columns` is the column count of the schema
     /// block that arrived in the same frame.
     ///
-    /// [`Reader`] bounds every *read*; the two checks this adds bound the
-    /// *values*:
-    ///
-    /// * an index's `packed_cols` must decode to a well-formed column list —
-    ///   `PkColList::as_slice` silently clamps an out-of-range count, so without
-    ///   this an over-long list reads back truncated and an empty one reads back
-    ///   as zero columns;
-    /// * an FK's `col_idx` must name a real column, so every consumer can index
-    ///   `schema.columns[col_idx]` without a bound of its own.
+    /// [`Reader`] bounds every *read*; the value bound this adds is that an FK's
+    /// `col_idx` names a real column, so every consumer can index
+    /// `schema.columns[col_idx]` without a bound of its own.
     pub fn decode(buf: &[u8], num_columns: usize) -> Result<Option<Self>, String> {
         if buf.is_empty() {
             return Ok(None);
@@ -240,15 +234,13 @@ impl RelDescriptorBlob {
         // first read fails — the same bound the FK arm gets from `num_columns`.
         let mut indexes = Vec::with_capacity(index_count.min(r.remaining() / 16));
         for _ in 0..index_count {
-            let cols = unpack_pk_cols(r.u64()?);
-            let entry_flags = r.u64()?;
-            if !cols.is_well_formed() {
-                return Err(format!(
-                    "rel descriptor: index column-list count {} out of range 1..={}",
-                    cols.decoded_count(),
+            let cols = unpack_pk_cols(r.u64()?).map_err(|_| {
+                format!(
+                    "rel descriptor: index column-list count out of range 1..={}",
                     crate::PK_LIST_MAX_COLS
-                ));
-            }
+                )
+            })?;
+            let entry_flags = r.u64()?;
             indexes.push(RelIndex {
                 cols,
                 is_unique: entry_flags & INDEX_FLAG_UNIQUE != 0,

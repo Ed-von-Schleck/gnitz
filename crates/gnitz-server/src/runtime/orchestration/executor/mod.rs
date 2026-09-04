@@ -1606,20 +1606,19 @@ async fn handle_seek_by_index(
     else {
         return;
     };
-    // `seek_col_idx` is `pack_pk_cols(col_indices)`, whose packed flag at bit 63
-    // is always set — so a bare `col_idx as usize >= num_columns` guard would
-    // always trip; unpack first, then admit the whole list. Bind the result
-    // before testing it: an `if let Err(_)` scrutinee would hold the
-    // `&mut CatalogEngine` temporary across the await below.
-    let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
+    // Bind the result before matching on it: an `if let Err(_)` scrutinee would
+    // hold the `&mut CatalogEngine` temporary across the await below.
     let admitted = shared
         .cat()
         .registry()
-        .validate_index_cols(target_id, &cols, "seek_by_index");
-    if let Err(msg) = admitted {
-        send_error(peer, target_id, client_id, msg.to_string().as_bytes()).await;
-        return;
-    }
+        .index_cols(target_id, seek_col_idx, "seek_by_index");
+    let cols = match admitted {
+        Ok(cols) => cols,
+        Err(e) => {
+            send_error(peer, target_id, client_id, e.to_string().as_bytes()).await;
+            return;
+        }
+    };
     // Single catalog scan (exact list match) answers "is there an index for this
     // column list"; the borrow ends with the condition, so none is held across
     // the await below.

@@ -54,29 +54,6 @@ fn send_helpers_echo_the_request_id() {
     assert_eq!(decoded_ids, vec![req_ack, req_resp, req_err]);
 }
 
-/// `seek_col_idx` carries `pack_pk_cols(cols)` — the packed flag (bit 63) is
-/// always set, so it is never 0 and never collides with the PK sentinel —
-/// optionally OR'd with the holder directive on bit 62, which must survive
-/// the round trip without disturbing the column list.
-#[test]
-fn from_wire_decodes_the_column_list_with_and_without_the_holder_directive() {
-    assert!(matches!(HasPkLookup::from_wire(0), HasPkLookup::PrimaryKey));
-    for cols in [&[0u32][..], &[3][..], &[63][..], &[1, 4][..], &[0, 2, 5, 7][..]] {
-        let packed = gnitz_wire::pack_pk_cols(cols);
-        assert_ne!(packed, 0);
-        for want in [false, true] {
-            let word = packed | if want { gnitz_wire::HAS_PK_WANT_HOLDER } else { 0 };
-            match HasPkLookup::from_wire(word) {
-                HasPkLookup::SecondaryIndex { cols: decoded, want_holder } => {
-                    assert_eq!(decoded.as_slice(), cols);
-                    assert_eq!(want_holder, want);
-                }
-                HasPkLookup::PrimaryKey => panic!("packed list must decode to SecondaryIndex"),
-            }
-        }
-    }
-}
-
 // -- Walk-the-matrix dispatch tests ---------------------------------------
 
 /// The one test constructor for `WorkerProcess`, through the production one so

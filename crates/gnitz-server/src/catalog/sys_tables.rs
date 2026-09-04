@@ -110,10 +110,12 @@ pub(super) fn read_table_tab_row<S: RowSource>(
     } else {
         Placement::Keyed { prefix_len: props.dist_prefix_len as u8 }
     };
+    let pk = unpack_pk_cols(payload_u64(src, row, TABTAB_PAY_PK_COL_IDX))
+        .map_err(|rule| format!("catalog invariant violated: table '{name}' {rule}"))?;
     Ok((
         payload_u64(src, row, TABTAB_PAY_SCHEMA_ID) as i64,
         name,
-        unpack_pk_cols(payload_u64(src, row, TABTAB_PAY_PK_COL_IDX)),
+        pk,
         if props.stream {
             RelationKind::Stream
         } else {
@@ -126,18 +128,25 @@ pub(super) fn read_table_tab_row<S: RowSource>(
 /// Decode VIEW_TAB `row`: `(schema_id, name, pk_list, budgets, owner_view_id)`.
 /// A bare `0` pk_list decodes back to `[0]`; a `0` budget word decodes to `None`
 /// here so no caller repeats the sentinel. `owner_view_id` is `0` for a user
-/// view.
-pub(super) fn read_view_tab_row<S: RowSource>(src: &S, row: usize) -> (i64, String, PkColList, ViewBudgets, i64) {
-    (
+/// view. Like [`read_table_tab_row`], this is the reader every registration
+/// crosses, so a malformed PK word is rejected here.
+pub(super) fn read_view_tab_row<S: RowSource>(
+    src: &S,
+    row: usize,
+) -> Result<(i64, String, PkColList, ViewBudgets, i64), String> {
+    let name = payload_string(src, row, VIEWTAB_PAY_NAME);
+    let pk = unpack_pk_cols(payload_u64(src, row, VIEWTAB_PAY_PK_COL_IDX))
+        .map_err(|rule| format!("catalog invariant violated: view '{name}' {rule}"))?;
+    Ok((
         payload_u64(src, row, VIEWTAB_PAY_SCHEMA_ID) as i64,
-        payload_string(src, row, VIEWTAB_PAY_NAME),
-        unpack_pk_cols(payload_u64(src, row, VIEWTAB_PAY_PK_COL_IDX)),
+        name,
+        pk,
         ViewBudgets {
             capacity_bytes: Some(payload_u64(src, row, VIEWTAB_PAY_CAPACITY)).filter(|&b| b != 0),
             delta_bytes: Some(payload_u64(src, row, VIEWTAB_PAY_DELTA)).filter(|&b| b != 0),
         },
         payload_u64(src, row, VIEWTAB_PAY_OWNER_VIEW_ID) as i64,
-    )
+    ))
 }
 
 /// Decode IDX_TAB `row` into the three words it stores. The middle one is the
@@ -204,16 +213,16 @@ pub(super) fn read_col_tab_ident<S: RowSource>(src: &S, row: usize) -> ColTabIde
 }
 
 /// The `(owner_id, packed_source_cols, col_indices)` of every UNIQUE index this
-/// IDX_TAB family creates — positive-weight rows whose column list is
-/// well-formed. The DDL driver pre-flights each one before the bundle is made
-/// durable; `packed` is the same word the unique-filter map is keyed by.
+/// IDX_TAB family creates — positive-weight rows whose column list decodes. The
+/// DDL driver pre-flights each one before the bundle is made durable; `packed`
+/// is the same word the unique-filter map is keyed by.
 pub(crate) fn idx_tab_unique_creates(batch: &Batch) -> Vec<(i64, u64, PkColList)> {
     (0..batch.len())
         .filter(|&i| batch.get_weight(i) > 0)
         .filter_map(|i| {
             let (owner_id, packed, props) = read_idx_tab_row(batch, i);
-            let cols = unpack_pk_cols(packed);
-            (props.is_unique && cols.is_well_formed()).then_some((owner_id, packed, cols))
+            let cols = unpack_pk_cols(packed).ok()?;
+            props.is_unique.then_some((owner_id, packed, cols))
         })
         .collect()
 }

@@ -30,22 +30,8 @@ pub fn segment_id(k: u64) -> u64 {
 }
 
 /// Whether `id` is a symbolic segment id rather than a real relation id.
-pub fn is_segment_id(id: u64) -> bool {
+pub(crate) fn is_segment_id(id: u64) -> bool {
     id >= gnitz_wire::RELATION_ID_CEILING
-}
-
-/// Rewrite one id slot through `map`, rejecting a segment id that survives it: a
-/// slot whose id was minted but never registered. Both substitution sites use
-/// this — [`Circuit::resolve_seg_ids`] for the circuit's own slots,
-/// `create_view_chain` for a hidden segment's owner.
-pub fn substitute_seg_id(slot: u64, map: &HashMap<u64, u64>) -> Result<u64, ClientError> {
-    let real = map.get(&slot).copied().unwrap_or(slot);
-    if is_segment_id(real) {
-        return Err(ClientError::ServerError(format!(
-            "view bundle carries unresolved segment id {slot}"
-        )));
-    }
-    Ok(real)
 }
 
 impl Circuit {
@@ -66,14 +52,19 @@ impl Circuit {
         deps
     }
 
-    /// Rewrite every `ScanDelta.source` through `map`. Nothing downstream
-    /// catches a segment id that survives: the engine's id-ceiling rejection
-    /// covers only TABLE_TAB and VIEW_TAB PKs, so a phantom source would commit
-    /// as a durable dependency edge on a relation that does not exist.
+    /// Rewrite every `ScanDelta.source` through `map`, rejecting a segment id
+    /// that survives it — locally, before any id is allocated. The engine's
+    /// `"scan-delta: unknown source table"` is the later backstop.
     pub fn resolve_seg_ids(&mut self, map: &HashMap<u64, u64>) -> Result<(), ClientError> {
         for op in self.nodes.values_mut() {
             if let OpNode::ScanDelta { source, .. } = op {
-                *source = substitute_seg_id(*source, map)?;
+                let real = map.get(source).copied().unwrap_or(*source);
+                if is_segment_id(real) {
+                    return Err(ClientError::ServerError(format!(
+                        "view bundle carries unresolved segment id {source}"
+                    )));
+                }
+                *source = real;
             }
         }
         Ok(())
@@ -263,13 +254,44 @@ impl CircuitBuilder {
         self.alloc_wired(OpNode::WorkerFilter, &[input])
     }
 
-    /// Shared `Reduce`-node construction: map the group cols + agg specs and
-    /// alloc the node over `input`. The caller decides the
-    /// partitioning of `input` — `reduce`/`reduce_multi` shard first;
-    /// `reduce_multi_local` passes a deliberately pre-replicated input straight
-    /// through. `agg_specs` must not be empty (the engine rejects a spec-less
-    /// REDUCE at decode).
-    fn reduce_node(
+    /// Multi-aggregate reduce with automatic shard insertion (required for
+    /// multi-worker correctness). `agg_specs`: list of (agg func, col_idx).
+    /// `global_ground` is `true` only for the user's ungrouped scalar aggregate
+    /// (empty `group_cols`); the grouped builder passes `group_cols.is_empty()`.
+    /// `out_key` is the caller's schema-derived output-key decision; the engine
+    /// validates it against the input schema.
+    pub fn reduce_multi(
+        &mut self,
+        input: NodeId,
+        group_cols: &[usize],
+        agg_specs: &[(AggFunc, usize)],
+        global_ground: bool,
+        out_key: ReduceOutKey,
+    ) -> NodeId {
+        let sharded = self.shard(input, group_cols);
+        self.reduce_multi_local(sharded, group_cols, agg_specs, global_ground, out_key)
+    }
+
+    /// Shard-free multi-aggregate reduce: aggregates `input` **locally on every
+    /// worker** with NO upstream `ExchangeShard`. Two valid modes, distinguished by
+    /// `input`'s partitioning (the builder cannot type-enforce which):
+    ///
+    /// * **Replicated input** (byte-identical *contents* per worker): each worker's
+    ///   local reduce computes the SAME full global aggregate. Pass
+    ///   `global_ground = true` for the user's ungrouped scalar aggregate so each
+    ///   worker seeds the ground over an empty source.
+    /// * **Partitioned input** (the two-phase global aggregate, phase 1): each worker
+    ///   folds its own shard into a per-worker *partial*, which a downstream
+    ///   `reduce_multi` then exchanges (≤ N partials) and combines. Pass
+    ///   `global_ground = false` — a worker with no local rows must contribute no
+    ///   partial, never a spurious per-worker ground row.
+    ///
+    /// The LEFT range-join threshold reduce (also empty group cols) likewise passes
+    /// `false` so it never seeds a spurious `(m=NULL)` row.
+    ///
+    /// `agg_specs` must not be empty (the engine rejects a spec-less REDUCE at
+    /// decode).
+    pub fn reduce_multi_local(
         &mut self,
         input: NodeId,
         group_cols: &[usize],
@@ -291,51 +313,6 @@ impl CircuitBuilder {
             },
             &[input],
         )
-    }
-
-    /// Multi-aggregate reduce with automatic shard insertion (required for
-    /// multi-worker correctness). `agg_specs`: list of (agg func, col_idx).
-    /// `global_ground` is `true` only for the user's ungrouped scalar aggregate
-    /// (empty `group_cols`); the grouped builder passes `group_cols.is_empty()`.
-    /// `out_key` is the caller's schema-derived output-key decision; the engine
-    /// validates it against the input schema.
-    pub fn reduce_multi(
-        &mut self,
-        input: NodeId,
-        group_cols: &[usize],
-        agg_specs: &[(AggFunc, usize)],
-        global_ground: bool,
-        out_key: ReduceOutKey,
-    ) -> NodeId {
-        let sharded = self.shard(input, group_cols);
-        self.reduce_node(sharded, group_cols, agg_specs, global_ground, out_key)
-    }
-
-    /// Shard-free multi-aggregate reduce: aggregates `input` **locally on every
-    /// worker** with NO upstream `ExchangeShard`. Two valid modes, distinguished by
-    /// `input`'s partitioning (the builder cannot type-enforce which):
-    ///
-    /// * **Replicated input** (byte-identical *contents* per worker): each worker's
-    ///   local reduce computes the SAME full global aggregate. Pass
-    ///   `global_ground = true` for the user's ungrouped scalar aggregate so each
-    ///   worker seeds the ground over an empty source.
-    /// * **Partitioned input** (the two-phase global aggregate, phase 1): each worker
-    ///   folds its own shard into a per-worker *partial*, which a downstream
-    ///   `reduce_multi` then exchanges (≤ N partials) and combines. Pass
-    ///   `global_ground = false` — a worker with no local rows must contribute no
-    ///   partial, never a spurious per-worker ground row.
-    ///
-    /// The LEFT range-join threshold reduce (also empty group cols) likewise passes
-    /// `false` so it never seeds a spurious `(m=NULL)` row.
-    pub fn reduce_multi_local(
-        &mut self,
-        input: NodeId,
-        group_cols: &[usize],
-        agg_specs: &[(AggFunc, usize)],
-        global_ground: bool,
-        out_key: ReduceOutKey,
-    ) -> NodeId {
-        self.reduce_node(input, group_cols, agg_specs, global_ground, out_key)
     }
 
     /// Exchange shard: routes rows to workers by hashing the given columns.

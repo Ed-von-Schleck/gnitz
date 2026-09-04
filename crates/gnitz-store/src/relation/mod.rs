@@ -728,20 +728,16 @@ impl RelationRegistry {
         self.index_circuits(table_id).iter().any(|ic| ic.is_unique)
     }
 
-    /// Reject a column list that is malformed or names a column outside
-    /// `table_id`'s schema. The one admission test for every frame carrying a
-    /// `pack_pk_cols` word: the master applies it as an early client-facing
-    /// reject, the worker as its trust boundary, and both render the same error.
-    pub fn validate_index_cols(&self, table_id: i64, cols: &PkColList, op: &str) -> Result<(), StoreError> {
+    /// The column list a frame's `pack_pk_cols` word names, admitted against
+    /// `table_id`'s schema. The one decode-and-admit for every frame carrying such
+    /// a word: the master applies it as an early client-facing reject, the worker
+    /// as its trust boundary, and both render the same error.
+    pub fn index_cols(&self, table_id: i64, packed: u64, op: &str) -> Result<PkColList, StoreError> {
+        let reject = || StoreError::rejected(format!("{op}: invalid column list for table {table_id}"));
+        let cols = gnitz_wire::unpack_pk_cols(packed).map_err(|_| reject())?;
         match self.entry(table_id) {
-            Some(e)
-                if cols.is_well_formed() && cols.as_slice().iter().all(|&c| (c as usize) < e.schema.num_columns()) =>
-            {
-                Ok(())
-            }
-            _ => Err(StoreError::rejected(format!(
-                "{op}: invalid column list for table {table_id}"
-            ))),
+            Some(e) if cols.as_slice().iter().all(|&c| (c as usize) < e.schema.num_columns()) => Ok(cols),
+            _ => Err(reject()),
         }
     }
 

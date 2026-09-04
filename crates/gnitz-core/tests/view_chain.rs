@@ -108,12 +108,7 @@ fn a_misordered_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
     let (base_tid, cols) = make_base(&mut client, &sn);
 
     let vids = client
-        .create_view_chain(
-            &sn,
-            "f",
-            misordered_chain(base_tid, &cols),
-            gnitz_core::ViewReplace::Nothing,
-        )
+        .create_view_chain(&sn, "f", misordered_chain(base_tid, &cols), false)
         .unwrap();
     let owner = *vids.last().unwrap();
     assert_eq!(
@@ -161,23 +156,13 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
 
     // A committed view whose name the bundle's user-named view reuses.
     let taken = *client
-        .create_view_chain(
-            &sn,
-            "taken",
-            vec![segment(0, base_tid, &cols)],
-            gnitz_core::ViewReplace::Nothing,
-        )
+        .create_view_chain(&sn, "taken", vec![segment(0, base_tid, &cols)], false)
         .unwrap()
         .last()
         .unwrap();
 
     let err = client
-        .create_view_chain(
-            &sn,
-            "taken",
-            misordered_chain(base_tid, &cols),
-            gnitz_core::ViewReplace::Nothing,
-        )
+        .create_view_chain(&sn, "taken", misordered_chain(base_tid, &cols), false)
         .unwrap_err()
         .to_string();
     assert!(err.contains("already exists"), "got: {err}");
@@ -199,7 +184,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
     let over = gnitz_core::MAX_CHAIN_SEGMENTS + 1;
     let planned: Vec<PlannedView> = (0..over).map(|_| segment(0, base_tid, &cols)).collect();
     let err = client
-        .create_view_chain(&sn, "x", planned, gnitz_core::ViewReplace::Nothing)
+        .create_view_chain(&sn, "x", planned, false)
         .unwrap_err()
         .to_string();
     assert!(

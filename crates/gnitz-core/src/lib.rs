@@ -23,12 +23,11 @@ pub mod types;
 // this list carries no meaning beyond "spelled often enough to be worth
 // shortening".
 pub use circuit::{
-    agg_output_type, is_segment_id, segment_id, Circuit, CircuitBuilder, NodeId, OpNode, RangeRel, ReduceOutKey,
-    ReindexRole,
+    agg_output_type, segment_id, Circuit, CircuitBuilder, NodeId, OpNode, RangeRel, ReduceOutKey, ReindexRole,
 };
 pub use client::{
-    delta_reply_schema, qualified_name, retraction_batch, segment_name, CatalogSnapshot, DeltaCursor, GnitzClient,
-    IndexMeta, InlineUniqueIndex, PlannedView, RelDescriptor, TxnBuffer, TxnReads, ViewReplace, MAX_CHAIN_SEGMENTS,
+    delta_reply_schema, qualified_name, retraction_batch, CatalogSnapshot, DeltaCursor, GnitzClient, IndexMeta,
+    InlineUniqueIndex, PlannedView, RelDescriptor, TxnBuffer, TxnReads, MAX_CHAIN_SEGMENTS,
 };
 pub use connection::{
     Completions, Interest, LocalScanReply, ParkHook, RawBlock, RelTarget, Reply, ReplyTrain, Request, ScanReply,

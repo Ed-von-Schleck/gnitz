@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::circuit::Circuit;
+use crate::mirror::{MirrorState, MirrorStore, MirroredView};
 use crate::types::sys_schema;
 use gnitz_wire::sys_rows::{IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::{
@@ -61,25 +62,6 @@ fn not_found(noun: &'static str, schema_name: &str, name: &str) -> ClientError {
     }
 }
 
-/// A [`ViewReplace::BodyOnly`] bundle states no `capacity` / `delta`, so
-/// superseding a view that has one would silently drop it.
-fn reject_budget_loss(
-    replace: ViewReplace,
-    desc: &RelDescriptor,
-    schema_name: &str,
-    view_name: &str,
-) -> Result<(), ClientError> {
-    let why = match replace {
-        ViewReplace::BodyOnly if desc.class == RelClass::BoundedView => "a capacity-bounded view",
-        ViewReplace::BodyOnly if desc.delta => "a view with a delta feed",
-        _ => return Ok(()),
-    };
-    Err(ClientError::ServerError(format!(
-        "cannot retarget {why}; DROP and CREATE '{}' instead",
-        qualified_name(schema_name, view_name)
-    )))
-}
-
 /// Build the `-1` retraction batch for `pks`: the server's `retract_pk` matches
 /// by PK alone, so the payload columns are inert filler (built directly, not via
 /// `BatchAppender`, whose `add_row` takes a single scalar PK). Shared by
@@ -100,7 +82,7 @@ pub fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
 /// A secondary-index descriptor: the declared column list (the unique key — the
 /// circuit list is deduped by column list) and the system's operative
 /// uniqueness truth. This is the wire type verbatim, so a resolved descriptor's
-/// index list moves into the client instead of being re-collected.
+/// index list moves into the client.
 pub use gnitz_wire::RelIndex as IndexMeta;
 
 /// One inline `UNIQUE` constraint to fold into a `CREATE TABLE`'s atomic DDL
@@ -138,16 +120,14 @@ pub const MAX_CHAIN_SEGMENTS: usize = 64;
 /// Unique because vids are, and unspellable at every user surface because
 /// [`crate::validate_user_identifier`] rejects a leading `_`. Ownership is the
 /// `owner_view_id` column, not the name.
-pub fn segment_name(vid: u64) -> String {
+fn segment_name(vid: u64) -> String {
     format!("_seg{vid}")
 }
 
-/// Reject a COL_TAB write against anything but a user base table. Every such row
-/// carries `owner_kind = OWNER_KIND_TABLE`, so against a stored view row a `-1`
-/// would fail as an opaque CAS conflict and a `+1` as the engine's own owner-kind
-/// rejection; naming the relation's kind here is the same verdict, readable. The
-/// SQL layer rejects a view earlier — this is the backstop for the non-SQL
-/// entry point, the Python binding.
+/// Reject a COL_TAB write against anything but a user base table. The engine's
+/// own kind check is unreachable for these verbs: `alter_col_pair` stamps
+/// `OWNER_KIND_TABLE`, so a view target fails the retraction CAS first, as a
+/// false "catalog changed concurrently".
 fn reject_non_base_table(desc: &RelDescriptor, op: &str) -> Result<(), ClientError> {
     if desc.class != RelClass::Table {
         return Err(ClientError::ServerError(format!(
@@ -300,24 +280,6 @@ impl RelDescriptor {
     }
 }
 
-/// Whether a [`GnitzClient::create_view_chain`] bundle supersedes the view that
-/// already holds its name, and whether its `capacity` / `delta` budgets are the
-/// caller's whole answer for that view. The superseded view is always the one
-/// whose name the chain takes, so this names no second relation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ViewReplace {
-    /// Nothing is superseded. A name already in use is a collision, raised by the
-    /// engine.
-    Nothing,
-    /// Supersede it, and the chain's budgets are the caller's whole answer — an
-    /// absent one means "unbounded", not "dropped".
-    WithBudgets,
-    /// Supersede it with a body only: the caller had no way to state a budget, so
-    /// a bounded or fed view is refused rather than silently coming back
-    /// unbounded or unfed. `ALTER VIEW … AS` is the statement shaped this way.
-    BodyOnly,
-}
-
 /// What one statement has already read, dropped whole at `end_statement`.
 ///
 /// One entry per resolved canonical `"schema.name"`, absent verdicts included,
@@ -360,7 +322,7 @@ impl CatalogSnapshot {
 
     /// The descriptor this statement resolved for `tid`. A linear scan with no
     /// wire fallback; a statement resolves a handful of relations.
-    pub fn by_tid(&self, tid: u64) -> Option<Arc<RelDescriptor>> {
+    pub(crate) fn by_tid(&self, tid: u64) -> Option<Arc<RelDescriptor>> {
         self.relations.values().flatten().find(|d| d.tid == tid).map(Arc::clone)
     }
 }
@@ -494,53 +456,32 @@ impl GnitzClient {
     /// [`Self::resolve_local_first`] must do: the planner's resolve loop reads
     /// the statement snapshot back rather than the return value, and that is its
     /// termination proof. A no-op outside a statement bracket.
-    fn record_relation(&mut self, qname: &str, desc: Option<Arc<RelDescriptor>>) {
+    fn record_relation(&mut self, qname: String, desc: Option<Arc<RelDescriptor>>) {
         if let Some(scope) = &mut self.scope {
-            scope.insert_qname(qname.to_string(), desc);
+            scope.insert_qname(qname, desc);
         }
     }
 
-    /// Reserve at least `count` SERIAL ids for `table_id` in **one** master round
-    /// trip, so a multi-row INSERT that knows its row count up front pays one
-    /// fsynced durable advance instead of `ceil(count / SERIAL_RANGE_SIZE)` of
-    /// them. Any tail left in the previous range is abandoned — the same
-    /// intentional, PostgreSQL-style gap a refill already leaves.
-    pub fn reserve_serial_ids(&mut self, table_id: u64, count: u64) -> Result<(), ClientError> {
-        let held = self
-            .serial_cache
-            .get(&table_id)
-            .map_or(0, |r| r.end.saturating_sub(r.next));
-        if held >= count {
-            return Ok(());
-        }
-        let want = count.max(SERIAL_RANGE_SIZE);
-        let base = self.session.alloc_serial_range(table_id, want)?;
-        self.serial_cache
-            .insert(table_id, SerialRange { next: base, end: base + want });
-        Ok(())
-    }
-
-    /// Draw the next SERIAL id for `table_id` from the per-connection range
-    /// cache, refilling from the master's durable sequence when the range is
-    /// exhausted. Ids are contiguous within a range; a refill may leave a gap
-    /// if a prior range's tail was never issued (intentional, PostgreSQL-style).
-    pub fn next_serial_id(&mut self, table_id: u64) -> Result<u64, ClientError> {
-        if let Some(r) = self.serial_cache.get_mut(&table_id) {
-            if r.next < r.end {
-                let id = r.next;
-                r.next += 1;
-                return Ok(id);
+    /// Reserve `count` contiguous SERIAL ids for `table_id` and return the first,
+    /// so an INSERT that knows its row count pays one fsynced durable advance
+    /// rather than `ceil(count / SERIAL_RANGE_SIZE)`. An abandoned tail — the old
+    /// range's, or this reservation's — is the intentional PostgreSQL-style gap.
+    pub fn reserve_serial_ids(&mut self, table_id: u64, count: u64) -> Result<u64, ClientError> {
+        match self.serial_cache.get_mut(&table_id) {
+            Some(r) if r.end.saturating_sub(r.next) >= count => {
+                let base = r.next;
+                r.next += count;
+                Ok(base)
+            }
+            // Refill, abandoning whatever tail the old range still held.
+            _ => {
+                let want = count.max(SERIAL_RANGE_SIZE);
+                let base = self.session.alloc_serial_range(table_id, want)?;
+                self.serial_cache
+                    .insert(table_id, SerialRange { next: base + count, end: base + want });
+                Ok(base)
             }
         }
-        let base = self.session.alloc_serial_range(table_id, SERIAL_RANGE_SIZE)?;
-        self.serial_cache.insert(
-            table_id,
-            SerialRange {
-                next: base + 1,
-                end: base + SERIAL_RANGE_SIZE,
-            },
-        );
-        Ok(base)
     }
 
     // --- Raw ops ---
@@ -684,26 +625,33 @@ impl GnitzClient {
         });
         match local {
             Some(desc) => {
-                self.record_relation(&qualified_name(schema_name, name), Some(Arc::clone(&desc)));
+                self.record_relation(qualified_name(schema_name, name), Some(Arc::clone(&desc)));
                 Ok(Some(desc))
             }
             None => self.resolve(schema_name, name),
         }
     }
 
+    /// The registration and the store behind a local read of `tid` — the gate
+    /// [`Self::mirrors`] tests, returning what it proved. `None` when the copy
+    /// does not hold `tid` and the read is the caller's to delegate.
+    pub(crate) fn local_read(&mut self, tid: u64) -> Option<(&MirroredView, &mut dyn MirrorStore)> {
+        let m = self.mirror.as_deref_mut()?;
+        m.store.cursor_of(tid)?;
+        let MirrorState { store, views } = m; // disjoint fields, so two borrows
+        Some((views.get(&tid)?, store.as_mut()))
+    }
+
     /// Every row of `table_id` off the copy, or `None` when the copy does not
-    /// hold it and the read is the caller's to delegate.
-    ///
-    /// The gate is [`Self::mirrors`]. For a caller that delegates on its own
-    /// terms — an async handle, which delegates on its own connection rather than
-    /// this one; [`Self::scan_local_first`] delegates here.
+    /// hold it and the read is the caller's to delegate — which an async handle
+    /// does on its own connection rather than this one, and
+    /// [`Self::scan_local_first`] does here.
     pub fn scan_local(&mut self, table_id: u64) -> Result<Option<(Arc<Schema>, ZSetBatch)>, ClientError> {
-        if !self.mirrors(table_id) {
+        let Some((view, store)) = self.local_read(table_id) else {
             return Ok(None);
-        }
-        let m = self.mirror.as_deref_mut().expect("mirrors() saw a store");
-        let schema = Arc::clone(&m.views[&table_id].desc.schema);
-        let batch = m.store.scan(table_id, &schema)?;
+        };
+        let schema = Arc::clone(&view.desc.schema);
+        let batch = store.scan(table_id, &schema)?;
         Ok(Some((schema, batch)))
     }
 
@@ -729,9 +677,8 @@ impl GnitzClient {
         spec: &[u8],
         reply_schema: &Arc<Schema>,
     ) -> Result<Option<ZSetBatch>, ClientError> {
-        if self.mirrors(table_id) {
-            let m = self.mirror.as_deref_mut().expect("mirrors() saw a store");
-            return Ok(Some(m.store.scan_spec(table_id, spec, reply_schema)?));
+        if let Some((_, store)) = self.local_read(table_id) {
+            return Ok(Some(store.scan_spec(table_id, spec, reply_schema)?));
         }
         self.scan_spec(table_id, spec, reply_schema)
     }
@@ -1042,7 +989,8 @@ impl GnitzClient {
         let mut out = Vec::new();
         for i in idx_batch.live_rows() {
             let name = col_str(&idx_batch.columns[IDXTAB_COL_NAME], i)?.to_string();
-            let cols = gnitz_wire::unpack_pk_cols(col_u64(&idx_batch.columns[IDXTAB_COL_SOURCE_COLS], i)?);
+            let cols = gnitz_wire::unpack_pk_cols(col_u64(&idx_batch.columns[IDXTAB_COL_SOURCE_COLS], i)?)
+                .map_err(|rule| ClientError::ServerError(format!("index '{name}': {rule}")))?;
             out.push((idx_batch.pks.get(i) as u64, name, cols));
         }
         Ok(out)
@@ -1191,17 +1139,10 @@ impl GnitzClient {
         // carrying this `schema_id`, so the whole matching set is already complete
         // — and the engine's co-drop carve-out admits it, every dependent being in
         // the same drop set.
-        let view_s = sys_schema(VIEW_TAB);
-        let tbl_s = sys_schema(TABLE_TAB);
         let schema_s = sys_schema(SCHEMA_TAB);
 
-        let views = self.schema_members(VIEW_TAB, schema_id)?;
-        let tables = self.schema_members(TABLE_TAB, schema_id)?;
-
-        let mut vb = ZSetBatch::new(view_s);
-        views.append_retractions(&mut vb, view_s);
-        let mut tb = ZSetBatch::new(tbl_s);
-        tables.append_retractions(&mut tb, tbl_s);
+        let (vb, vids) = self.schema_retractions(VIEW_TAB, schema_id)?;
+        let (tb, _) = self.schema_retractions(TABLE_TAB, schema_id)?;
 
         // `create_schema`'s own writer at `-1`: both values are in hand, so this
         // family keeps exactly one writer.
@@ -1225,7 +1166,7 @@ impl GnitzClient {
         // The VIEW_TAB `-1`s go out directly rather than through `drop_view`, so
         // each vid is invalidated here — without it a `SELECT` after a
         // `DROP SCHEMA` on this client answers off a dropped view.
-        for vid in views.ids() {
+        for vid in vids {
             self.invalidate_own_copy(vid)?;
         }
         Ok(())
@@ -1250,20 +1191,6 @@ impl GnitzClient {
             .iter()
             .map(|spec| gnitz_wire::canonical_identifier(spec.name).map_err(ClientError::ServerError))
             .collect::<Result<_, _>>()?;
-        // The engine precheck does not scan COL_TAB for names, so a duplicate
-        // reaching the non-SQL entry point would land in storage and surface
-        // later as "column reference is ambiguous". Not in `validate_parts`
-        // below: that also runs over chain segments, and a join segment
-        // legitimately carries two visible columns of one name.
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::with_capacity(columns.len());
-        for c in columns {
-            if !c.is_hidden && !seen.insert(c.name.to_ascii_lowercase()) {
-                return Err(ClientError::ServerError(format!(
-                    "duplicate column name '{}' in table '{table_name}'",
-                    c.name
-                )));
-            }
-        }
         let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
         // Full schema-admissibility rule set (column cap + PK rules), applied
         // here so a caller that skipped the planner gets a clean error before
@@ -1407,7 +1334,7 @@ impl GnitzClient {
                 capacity_bytes: None,
                 delta_bytes: None,
             }],
-            ViewReplace::Nothing,
+            false,
         )?;
         Ok(vids[0])
     }
@@ -1430,19 +1357,18 @@ impl GnitzClient {
     /// **`views.last()` is the user-named view and takes `view_name`**; every
     /// earlier element is an internal segment it owns — see [`segment_name`].
     ///
-    /// `replace` says whether an existing view of this same name is superseded. Its
+    /// `replace` supersedes the view already holding this name: `false` leaves a
+    /// name collision to the engine, `true` makes a missing view an error. Its
     /// `-1` rides the same VIEW_TAB batch, so a rejection anywhere in the zone
-    /// leaves the old view exactly as it was — including a replace over a view
-    /// something else reads, which is refused whole.
+    /// leaves the old view exactly as it was.
     pub fn create_view_chain(
         &mut self,
         schema_name: &str,
         view_name: &str,
         views: Vec<PlannedView>,
-        replace: ViewReplace,
+        replace: bool,
     ) -> Result<Vec<u64>, ClientError> {
         let view_name = gnitz_wire::canonical_identifier(view_name)?;
-        crate::validate_user_identifier(&view_name)?;
         let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
         // Reject a malformed chain before any allocation. An empty bundle names
         // no view to create and would return no vid for the caller to use.
@@ -1470,16 +1396,12 @@ impl GnitzClient {
         // The outgoing view's row, resolved before any id is allocated so a
         // missing view surfaces with no residue. Only the user-named view: the
         // engine cascades its segments off `owner_view_id`.
-        let replaced = match replace {
-            ViewReplace::Nothing => None,
-            _ => {
-                let (desc, scanned, i) = self
-                    .view_retraction(&schema_name, &view_name)?
-                    .ok_or_else(|| not_found("view", &schema_name, &view_name))?;
-                reject_budget_loss(replace, &desc, &schema_name, &view_name)?;
-                Some((scanned, i, desc.tid))
-            }
-        };
+        let replaced = replace
+            .then(|| {
+                self.view_retraction(&schema_name, &view_name)?
+                    .ok_or_else(|| not_found("view", &schema_name, &view_name))
+            })
+            .transpose()?;
 
         // The whole bundle is assigned in one allocation before any substitution
         // runs, because a downstream segment's `ScanDelta` names an upstream
@@ -1507,7 +1429,7 @@ impl GnitzClient {
         let mut view_batch = ZSetBatch::new(view_s);
 
         // 0. The replaced view's retraction, ahead of the new chain's `+1`s.
-        if let Some((scanned, i, _)) = &replaced {
+        if let Some((_, scanned, i)) = &replaced {
             view_batch.copy_row_at(scanned, *i, -1, view_s);
         }
 
@@ -1567,7 +1489,7 @@ impl GnitzClient {
         // The retired view may have been mirrored — `CREATE OR REPLACE VIEW`
         // restates `WITH (delta = …)` and so is allowed over a fed view. Only the
         // user-named view can be mirrored, and it is exactly what was retired.
-        if let Some((_, _, old_vid)) = replaced {
+        if let Some((old_vid, _, _)) = replaced {
             self.invalidate_own_copy(old_vid)?;
         }
 
@@ -1584,14 +1506,13 @@ impl GnitzClient {
     pub fn drop_view(&mut self, schema_name: &str, view_name: &str, if_exists: bool) -> Result<(), ClientError> {
         let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
         let view_name = gnitz_wire::canonical_identifier(view_name)?;
-        let Some((desc, scanned, i)) = self.view_retraction(&schema_name, &view_name)? else {
+        let Some((vid, scanned, i)) = self.view_retraction(&schema_name, &view_name)? else {
             return if if_exists {
                 Ok(())
             } else {
                 Err(not_found("view", &schema_name, &view_name))
             };
         };
-        let vid = desc.tid;
 
         let view_s = sys_schema(VIEW_TAB);
         let mut vb = ZSetBatch::new(view_s);
@@ -1606,42 +1527,43 @@ impl GnitzClient {
         Ok(())
     }
 
-    /// Every live row of system family `family` whose `schema_id` matches — the
-    /// members `DROP SCHEMA` retracts. One code path over TABLE_TAB and VIEW_TAB,
-    /// which the static assert beside their column constants licenses: the two
-    /// agree on where `schema_id` sits.
-    fn schema_members(&mut self, family: u64, schema_id: u64) -> Result<Retractions, ClientError> {
+    /// The `-1` batch retiring every live row of system family `family` whose
+    /// `schema_id` matches — the members `DROP SCHEMA` retracts — and their
+    /// relation ids. Each `-1` is the scanned row copied verbatim. One code path
+    /// over TABLE_TAB and VIEW_TAB, which the static assert beside their column
+    /// constants licenses: the two agree on where `schema_id` sits.
+    fn schema_retractions(&mut self, family: u64, schema_id: u64) -> Result<(ZSetBatch, Vec<u64>), ClientError> {
+        let s = sys_schema(family);
+        let mut out = ZSetBatch::new(s);
+        let mut ids = Vec::new();
         let Some(scanned) = checked_sys_rows(family, self.session.scan(family)?)? else {
-            return Ok(Retractions {
-                scanned: ZSetBatch::new(sys_schema(family)),
-                rows: Vec::new(),
-            });
+            return Ok((out, ids));
         };
-        let mut rows = Vec::new();
         for i in scanned.live_rows() {
             if col_u64(&scanned.columns[TABTAB_COL_SCHEMA_ID], i)? == schema_id {
-                rows.push(i);
+                out.copy_row_at(&scanned, i, -1, s);
+                ids.push(scanned.pks.get(i) as u64);
             }
         }
-        Ok(Retractions { scanned, rows })
+        Ok((out, ids))
     }
 
-    /// The live VIEW_TAB row of `view_name` and the descriptor it resolved through
-    /// — the whole of what retiring it retracts, since the engine cascades the
-    /// segments off [`segment_name`]'s ownership column. One master-local seek, not
-    /// a scan; `Ok(None)` for a free name, so no caller probes first.
+    /// The live VIEW_TAB row of `view_name` and the vid it resolved to — the whole
+    /// of what retiring it retracts, since the engine cascades the segments off
+    /// [`segment_name`]'s ownership column. One master-local seek, not a scan;
+    /// `Ok(None)` for a free name, so no caller probes first.
     fn view_retraction(
         &mut self,
         schema_name: &str,
         view_name: &str,
-    ) -> Result<Option<(Arc<RelDescriptor>, ZSetBatch, usize)>, ClientError> {
+    ) -> Result<Option<(u64, ZSetBatch, usize)>, ClientError> {
         let missing = || not_found("view", schema_name, view_name);
         let Some(desc) = self.resolve(schema_name, view_name)? else {
             return Ok(None);
         };
         let scanned = self.seek_sys_row(VIEW_TAB, desc.tid)?.ok_or_else(missing)?;
         let i = scanned.live_row_with_pk(desc.tid).ok_or_else(missing)?;
-        Ok(Some((desc, scanned, i)))
+        Ok(Some((desc.tid, scanned, i)))
     }
 
     /// Rename a table or view: a `(-1, +1)` rewrite pair on TABLE_TAB / VIEW_TAB,
@@ -1835,13 +1757,13 @@ impl GnitzClient {
     /// is a missing schema or a decode error, not a miss.
     pub fn resolve(&mut self, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, ClientError> {
         // Built once and reused as the memo key, the wire target and the memo
-        // write — the same three uses spelled three allocations before.
+        // write.
         let qname = qualified_name(schema_name, name);
         if let Some(hit) = self.catalog().get_qname(&qname) {
             return Ok(hit);
         }
         let found = self.fetch_descriptor(RelTarget::Name(&qname))?;
-        self.record_relation(&qname, found.clone());
+        self.record_relation(qname, found.clone());
         Ok(found)
     }
 
@@ -1963,20 +1885,20 @@ impl TxnBuffer {
         if batch.is_empty() {
             return;
         }
-        let own = self.families_of.entry(tid).or_default();
-        let extend = own.last().is_some_and(|&idx| self.families[idx].mode == mode);
-        if extend {
-            let idx = *own.last().expect("extend implies a family");
-            self.families[idx].batch.extend_from_owned(batch);
-        } else {
-            own.push(self.families.len());
-            self.families.push(BufferedFamily {
-                tid,
-                schema: schema.clone(),
-                batch,
-                mode,
-                indexed: 0,
-            });
+        // Copied out, so no borrow of `families_of` spans the `families` read.
+        let last = self.families_of.get(&tid).and_then(|v| v.last().copied());
+        match last.filter(|&i| self.families[i].mode == mode) {
+            Some(i) => self.families[i].batch.extend_from_owned(batch),
+            None => {
+                self.families_of.entry(tid).or_default().push(self.families.len());
+                self.families.push(BufferedFamily {
+                    tid,
+                    schema: schema.clone(),
+                    batch,
+                    mode,
+                    indexed: 0,
+                });
+            }
         }
     }
 
@@ -2052,30 +1974,6 @@ fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<Option<u64>, ClientEr
         }
     }
     Ok(None)
-}
-
-/// The rows of a scanned system-catalog batch that a DDL is about to retract —
-/// the batch included, because a `-1` reproduces the live row by being read back
-/// out of the batch it was scanned from.
-struct Retractions {
-    scanned: ZSetBatch,
-    rows: Vec<usize>,
-}
-
-impl Retractions {
-    /// The relation id of each selected row.
-    fn ids(&self) -> impl Iterator<Item = u64> + '_ {
-        self.rows.iter().map(|&i| self.scanned.pks.get(i) as u64)
-    }
-
-    /// Append every selected row to `dst` at `-1`, copied verbatim out of the
-    /// batch it was scanned from — so the retraction is the stored row by
-    /// construction, whatever family it belongs to.
-    fn append_retractions(&self, dst: &mut ZSetBatch, schema: &Schema) {
-        for &i in &self.rows {
-            dst.copy_row_at(&self.scanned, i, -1, schema);
-        }
-    }
 }
 
 /// A system family's rows, with the reply's schema checked against

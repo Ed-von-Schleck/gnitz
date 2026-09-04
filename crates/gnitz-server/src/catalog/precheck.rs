@@ -102,10 +102,21 @@ pub(super) fn validate_relation_defs(
         ));
     }
     check_col_defs(col_defs).map_err(|e| format!("{noun} '{name}' (id={id}) {e}"))?;
-    // `as_slice()` clamps, so the raw count is the only place an over-range one
-    // is still visible.
-    if !pk.is_well_formed() {
-        return Err(gnitz_wire::PkRule::TooManyColumns { count: pk.decoded_count() }.to_string());
+    // Ingestion points only: a view segment legitimately carries two visible
+    // columns of one name (a join chain's output). Nothing downstream refuses the
+    // duplicate; it surfaces at query time as "column reference is ambiguous".
+    if kind.is_ingestion_point() {
+        let mut seen = FxHashSet::default();
+        if let Some(cd) = col_defs
+            .iter()
+            .filter(|c| !c.is_hidden)
+            .find(|c| !seen.insert(c.name.to_ascii_lowercase()))
+        {
+            return Err(format!(
+                "{noun} '{name}' (id={id}) has duplicate column name '{}'",
+                cd.name
+            ));
+        }
     }
     validate_pk_against_cols(col_defs, pk.as_slice())
 }
@@ -633,8 +644,8 @@ impl CatalogEngine {
         Ok(())
     }
 
-    /// The shared IDX_TAB registration guards: a well-formed column list and a
-    /// base-table owner (returned for the callers' schema/context reads).
+    /// The shared IDX_TAB registration guard: a base-table owner, returned for
+    /// the callers' schema/context reads.
     ///
     /// Only base tables can own a secondary index: index projection runs only
     /// on the base-table DML paths (`ingest_store_and_indices`); view deltas
@@ -647,15 +658,7 @@ impl CatalogEngine {
     pub(in crate::catalog) fn validate_index_registration(
         &self,
         owner_id: i64,
-        cols: &PkColList,
     ) -> Result<&gnitz_store::relation::TableEntry, String> {
-        if !cols.is_well_formed() {
-            return Err(format!(
-                "Index: column list count {} out of range 1..={}",
-                cols.decoded_count(),
-                gnitz_wire::PK_LIST_MAX_COLS
-            ));
-        }
         let entry = self
             .registry
             .entry(owner_id)
@@ -818,7 +821,8 @@ impl CatalogEngine {
                     read_table_tab_row(batch, i).map_err(|e| format!("{e} (tid={id})"))?;
                 (sid, name, pk, kind)
             } else {
-                let (sid, name, pk, budgets, owner_view_id) = read_view_tab_row(batch, i);
+                let (sid, name, pk, budgets, owner_view_id) =
+                    read_view_tab_row(batch, i).map_err(|e| format!("{e} (vid={id})"))?;
                 // `topo_priority` applies CircuitNodes (2) before View (6) in a
                 // creating bundle, so the view's sources resolve here; an
                 // all-negative bundle sorts descending but carries no `+1` VIEW_TAB
@@ -908,7 +912,7 @@ impl CatalogEngine {
         let noun = SysFamily::Index.row_noun();
         for i in (0..batch.len()).filter(|&i| batch.get_weight(i) > 0) {
             let (owner_id, packed_cols, props) = read_idx_tab_row(batch, i);
-            let cols = gnitz_wire::unpack_pk_cols(packed_cols);
+            let cols = gnitz_wire::unpack_pk_cols(packed_cols).map_err(|rule| format!("Index: column list {rule}"))?;
             let index_name = payload_string(batch, i, IDXTAB_PAY_NAME);
             reject_unstorable_name(&index_name, noun)?;
             // Only `submit_local` — the FK auto-index, which bypasses this
@@ -918,7 +922,7 @@ impl CatalogEngine {
             if props.is_internal {
                 return Err(format!("index '{index_name}' claims the engine-internal flag"));
             }
-            let entry = self.validate_index_registration(owner_id, &cols)?;
+            let entry = self.validate_index_registration(owner_id)?;
 
             // Bounds, per-column eligibility (STRING/BLOB/float), and
             // arity/stride limits, identical to what registration will enforce —
@@ -958,7 +962,9 @@ impl CatalogEngine {
             // FK backing is single-column: a composite index never satisfies a
             // single-column FK/uniqueness requirement, so dropping one is never
             // blocked by the FK-target guard.
-            let cols = gnitz_wire::unpack_pk_cols(packed_cols);
+            let Ok(cols) = gnitz_wire::unpack_pk_cols(packed_cols) else {
+                continue;
+            };
             if cols.as_slice().len() != 1 {
                 continue;
             }

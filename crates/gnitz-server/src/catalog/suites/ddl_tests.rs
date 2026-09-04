@@ -486,8 +486,8 @@ fn test_hook_relation_register_rejects_malformed_pk() {
         assert!(err.contains(snippet), "expected '{snippet}', got: {err}");
     };
 
-    // Count out of range (decoded count, not clamped slice length).
-    assert_rejects(PK_LIST_PACKED_FLAG, "out of range 1..=4"); // count 0
+    // Count out of range, rejected at the decode.
+    assert_rejects(PK_LIST_PACKED_FLAG, "at least one column"); // count 0
     assert_rejects(PK_LIST_PACKED_FLAG | 5, "out of range 1..=4"); // count 5
     assert_rejects(PK_LIST_PACKED_FLAG | 15, "out of range 1..=4"); // count 15
                                                                     // Out-of-bounds index (index 5, only 3 columns).
@@ -917,4 +917,48 @@ fn a_view_at_the_column_limit_cannot_carry_a_feed() {
     try_register_identity_view(&mut engine, tid, "plain_wide", &cols, 0, 0).expect("unfed wide view");
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── duplicate visible column names ───────────────────────────────────
+
+// Driven through the wire-ingest path, since the SQL planner rejects the shape
+// before it gets here. A stream carries the rule because it is an ingestion
+// point; a hidden column does not, being invisible to name resolution.
+#[test]
+fn duplicate_visible_column_names_are_rejected_for_a_table_and_a_stream() {
+    let dir = temp_dir("duplicate_column_names");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+
+    for (name, flags) in [("dup_table", 0), ("dup_stream", stream_flags())] {
+        let col_defs = vec![
+            col_def("id", type_code::U64),
+            col_def("a", type_code::I64),
+            // The catalog folds names, so a case difference is the same name.
+            col_def("A", type_code::I64),
+        ];
+        let tid = engine.allocate_table_id().unwrap();
+        engine.write_column_records(tid, OWNER_KIND_TABLE, &col_defs).unwrap();
+        let batch = build_table_tab_row_flags(tid, pack_pk_cols(&[0]), name, flags);
+        let err = engine
+            .ingest_to_family(TABLE_TAB_ID, &batch)
+            .expect_err("a duplicate visible column name must be refused");
+        assert!(err.contains("duplicate column name"), "{name}: {err}");
+    }
+
+    // A hidden column repeating a visible name still registers.
+    let col_defs = vec![
+        col_def("id", type_code::U64),
+        col_def("a", type_code::I64),
+        ColumnDef {
+            is_hidden: true,
+            ..col_def("a", type_code::I64)
+        },
+    ];
+    let tid = engine.allocate_table_id().unwrap();
+    engine.write_column_records(tid, OWNER_KIND_TABLE, &col_defs).unwrap();
+    let batch = build_table_tab_row_flags(tid, pack_pk_cols(&[0]), "hidden_dup", 0);
+    engine.ingest_to_family(TABLE_TAB_ID, &batch).unwrap();
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
 }

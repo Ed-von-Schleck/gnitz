@@ -45,23 +45,6 @@ enum HasPkLookup {
     },
 }
 
-impl HasPkLookup {
-    /// A zero column-list word → PrimaryKey. Otherwise the word carries
-    /// `pack_pk_cols(col_indices)`, whose packed flag (bit 63) is always set, so
-    /// a real index check is never 0 and never collides with the PK sentinel.
-    /// The column list is validated against the table's schema by
-    /// `CatalogEngine::validate_index_cols` at the dispatch arm.
-    fn from_wire(seek_col_idx: u64) -> Self {
-        match gnitz_wire::pk_cols_word(seek_col_idx) {
-            0 => HasPkLookup::PrimaryKey,
-            cols_word => HasPkLookup::SecondaryIndex {
-                cols: gnitz_wire::unpack_pk_cols(cols_word),
-                want_holder: seek_col_idx & gnitz_wire::HAS_PK_WANT_HOLDER != 0,
-            },
-        }
-    }
-}
-
 /// A DDL_SYNC message received during an exchange wait, decoded eagerly.
 struct DeferredDdl {
     target_id: i64,
@@ -732,10 +715,15 @@ impl WorkerProcess {
             }
 
             SalMessageKind::HasPk => {
-                let lookup = HasPkLookup::from_wire(seek_col_idx);
-                if let HasPkLookup::SecondaryIndex { cols, .. } = &lookup {
-                    self.cat().registry().validate_index_cols(target_id, cols, "has_pk")?;
-                }
+                // A zero column-list word is the PK sentinel; `pack_pk_cols` always
+                // sets bit 63, so a real index check never collides with it.
+                let lookup = match gnitz_wire::pk_cols_word(seek_col_idx) {
+                    0 => HasPkLookup::PrimaryKey,
+                    packed => HasPkLookup::SecondaryIndex {
+                        cols: self.cat().registry().index_cols(target_id, packed, "has_pk")?,
+                        want_holder: seek_col_idx & gnitz_wire::HAS_PK_WANT_HOLDER != 0,
+                    },
+                };
                 self.handle_has_pk(route, batch, lookup, seek_pk)
             }
 
@@ -789,10 +777,10 @@ impl WorkerProcess {
             }
 
             SalMessageKind::SeekByIndex => {
-                let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
-                self.cat()
+                let cols = self
+                    .cat()
                     .registry()
-                    .validate_index_cols(target_id, &cols, "seek_by_index")?;
+                    .index_cols(target_id, seek_col_idx, "seek_by_index")?;
                 // A prefix seek supplies fewer values than the index's arity.
                 let keys = gnitz_wire::unpack_index_key_slots(seek_pk, &seek_pk_extra, cols.as_slice().len())?;
                 let (result, schema) =
@@ -848,10 +836,10 @@ impl WorkerProcess {
                 // sort them, and stream the sorted spans back for the master's
                 // k-way merge. An error here surfaces as the terminal fault frame
                 // the master's merge expects (send_fault in run_via_dispatch_inner).
-                let cols = gnitz_wire::unpack_pk_cols(seek_col_idx);
-                self.cat()
+                let cols = self
+                    .cat()
                     .registry()
-                    .validate_index_cols(target_id, &cols, "unique pre-flight")?;
+                    .index_cols(target_id, seek_col_idx, "unique pre-flight")?;
                 self.handle_unique_preflight(target_id, cols.as_slice(), request_id)?;
                 Ok(())
             }

@@ -412,10 +412,11 @@ fn a_recreated_schema_resolves_its_new_members() {
     assert_eq!(schema.columns.len(), 2);
 }
 
-/// The client gateway is public API, so it backstops the planner:
 /// `alter_rename_column` against a view name must raise the "requires a base
 /// table" error rather than write an `OWNER_KIND_TABLE` row against a stored
-/// view row and fail as a CAS conflict.
+/// view row and fail as a CAS conflict — which is what the engine answers if
+/// the row reaches it, since the retraction CAS differs on `owner_kind` before
+/// the readable kind check runs.
 #[test]
 fn alter_rename_column_rejects_a_view_at_the_gateway() {
     let (_srv, mut client, sn) = boot(1);

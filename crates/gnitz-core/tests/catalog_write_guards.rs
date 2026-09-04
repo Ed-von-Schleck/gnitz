@@ -11,8 +11,7 @@
 use gnitz_core::connection::{COL_TAB, IDX_TAB, SCHEMA_TAB, SEQ_TAB, TABLE_TAB};
 use gnitz_core::protocol::{BatchAppender, ColumnDef, TypeCode, ZSetBatch};
 use gnitz_core::types::sys_schema;
-use gnitz_core::ViewReplace;
-use gnitz_core::{CircuitBuilder, GnitzClient, PlannedView, Session, TableProps};
+use gnitz_core::{GnitzClient, Session, TableProps};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::sys_rows::{
     write_circuit_node_row, write_col_tab_row, write_idx_tab_row, write_schema_tab_row, write_table_tab_row,
@@ -412,7 +411,7 @@ fn an_alter_view_bundle_still_applies_in_creation_order() {
                 capacity_bytes: None,
                 delta_bytes: None,
             }],
-            ViewReplace::BodyOnly,
+            true,
         )
         .expect("the replacement bundle applies");
     assert_ne!(vids[0], first, "the replacement takes a fresh id");
@@ -593,52 +592,4 @@ fn the_per_pk_shape_rules_reject_what_no_emitter_writes() {
             .unwrap_err()
     );
     assert!(err.contains("id ceiling"), "{err}");
-}
-
-/// `create_view_chain` with a `replaces` refuses to rebuild a capacity-bounded
-/// or delta-fed view: the replacement carries no `WITH` clause, so the rebuild
-/// would silently drop it.
-#[test]
-fn a_bounded_or_fed_view_cannot_be_retargeted() {
-    let srv = ServerHandle::start();
-    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
-    let tid = a_table(&mut client, "retarget");
-    let view = |capacity_bytes, delta_bytes| {
-        let mut cb = CircuitBuilder::new(tid);
-        let scan = cb.input_delta();
-        cb.sink(scan);
-        PlannedView {
-            seg: 0,
-            circuit: cb.build(),
-            output_columns: vec![
-                ColumnDef::new("id", TypeCode::U64, false),
-                ColumnDef::new("v", TypeCode::I64, false),
-            ],
-            pk_cols: vec![0],
-            capacity_bytes,
-            delta_bytes,
-        }
-    };
-    let budgets = [("b", Some(1 << 20), None), ("f", None, Some(1 << 20))];
-    for (name, capacity, delta) in budgets {
-        client
-            .create_view_chain("retarget", name, vec![view(capacity, delta)], ViewReplace::Nothing)
-            .unwrap();
-    }
-    // `BodyOnly` is `ALTER VIEW … AS`, whose grammar carries no `WITH (…)`: the
-    // budget would vanish with nothing in the statement saying so.
-    for (name, needle) in [("b", "capacity-bounded"), ("f", "delta feed")] {
-        let err = client
-            .create_view_chain("retarget", name, vec![view(None, None)], ViewReplace::BodyOnly)
-            .expect_err("retargeting must be refused")
-            .to_string();
-        assert!(err.contains(needle), "got: {err}");
-    }
-    // `WithBudgets` is `CREATE OR REPLACE VIEW`, which writes the budgets out — so
-    // the same bundle that `BodyOnly` refuses is exactly what it asks for.
-    for (name, capacity, delta) in budgets {
-        client
-            .create_view_chain("retarget", name, vec![view(capacity, delta)], ViewReplace::WithBudgets)
-            .unwrap_or_else(|e| panic!("replacing '{name}' with its budgets restated: {e}"));
-    }
 }

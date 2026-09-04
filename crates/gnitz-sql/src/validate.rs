@@ -93,7 +93,7 @@ pub(crate) fn reject_duplicate_names<'a>(
 /// become index names.
 ///
 /// This is *policy*: the leading-`_` reservation is what makes the engine's own
-/// internal names (`gnitz_core::segment_name`, `make_fk_index_name`)
+/// internal names (a view chain's `_seg<vid>`, `make_fk_index_name`)
 /// unspellable here, and the engine cannot enforce it — it must accept exactly
 /// those rows.
 pub(crate) fn validate_user_name(name: &str) -> Result<(), GnitzSqlError> {

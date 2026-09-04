@@ -204,12 +204,13 @@ pub(crate) fn execute_insert(
     // so leaving it in the row loop pays that scan per row per column.
     let payload = merge_payload_plan(schema);
     // The row count is known here, so the whole statement's ids come from one
-    // durable advance rather than one per 64 rows.
-    if is_serial {
-        client.reserve_serial_ids(tid, n as u64)?;
-    }
+    // durable advance and each row stamps `base + i`. A row failing the arity
+    // guard below abandons the rest — a wider gap of the same intentional kind.
+    let serial = serial_max
+        .map(|max| Ok::<_, GnitzSqlError>((client.reserve_serial_ids(tid, n as u64)?, max)))
+        .transpose()?;
 
-    for row in rows {
+    for (row_i, row) in rows.iter().enumerate() {
         // Standard SQL rejects a VALUES row whose arity differs from the expected
         // count, in either direction — too few values, or excess trailing ones.
         // This guard makes every per-column index below in-bounds.
@@ -227,12 +228,11 @@ pub(crate) fn execute_insert(
                 hint
             )));
         }
-        if let Some(max) = serial_max {
-            // Draw the next SERIAL id and reject an exhausted sequence (a value
-            // past the column type's max), mirroring PostgreSQL. A client-side
-            // rejection, so it is a `Bind` error like the arity guard above — not
-            // `Exec`, which is reserved for surfaced server `ClientError`s.
-            let id = client.next_serial_id(tid)?;
+        if let Some((base, max)) = serial {
+            // Reject an exhausted sequence (a value past the column type's max),
+            // mirroring PostgreSQL. Client-side, so it is a `Bind` error like the
+            // arity guard above — `Exec` is for surfaced server `ClientError`s.
+            let id = base + row_i as u64;
             if id as i128 > max {
                 return Err(GnitzSqlError::Bind(format!(
                     "SERIAL primary key exhausted: next value {id} exceeds the column type maximum {max}"

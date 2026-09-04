@@ -148,10 +148,13 @@ pub(crate) fn connect_client(py: Python<'_>, target: &str) -> PyResult<GnitzClie
 /// `IDX_TAB.source_col_idx`) into a plain list of column indices. Delegates to
 /// the shared `gnitz_wire` bit-layout codec so the Python side cannot drift
 /// from the Rust encoder; returns a list to match the test callers' `[1]`-style
-/// comparisons.
+/// comparisons. A word whose packed count is out of range raises, rather than
+/// coming back as a truncated or empty list.
 #[pyfunction]
-fn unpack_pk_cols(v: u64) -> Vec<u32> {
-    gnitz_wire::unpack_pk_cols(v).as_slice().to_vec()
+fn unpack_pk_cols(v: u64) -> PyResult<Vec<u32>> {
+    gnitz_wire::unpack_pk_cols(v)
+        .map(|cols| cols.as_slice().to_vec())
+        .map_err(|rule| pyo3::exceptions::PyValueError::new_err(rule.to_string()))
 }
 
 /// The reply schema of an incremental delta poll, derived from a view's own

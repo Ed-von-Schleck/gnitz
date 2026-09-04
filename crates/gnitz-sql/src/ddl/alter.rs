@@ -12,7 +12,7 @@ use crate::validate::{
     reject_unhonored_column_options, reject_unhonored_unique_fields, validate_user_name, ColumnOptionSite,
 };
 use crate::SqlResult;
-use gnitz_core::{GnitzClient, RelClass};
+use gnitz_core::{GnitzClient, RelClass, RelDescriptor};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTable, AlterTableOperation, DropBehavior, Ident, ObjectName, RenameTableNameKind,
     TableConstraint,
@@ -153,15 +153,13 @@ fn rename_column(
     new_col: &str,
 ) -> Result<SqlResult, GnitzSqlError> {
     let source_name = extract_name(source, "ALTER TABLE")?;
-    let Some((tid, schema)) =
-        resolve_alter_base_table_with_schema(client, schema_name, &source_name, if_exists, "RENAME COLUMN")?
-    else {
+    let Some(rel) = resolve_alter_base_table(client, schema_name, &source_name, if_exists, "RENAME COLUMN")? else {
         return Ok(altered("column", new_col.to_string()));
     };
-    let Some(col_idx) = find_unique_column(&schema.columns, old_col)? else {
+    let Some(col_idx) = find_unique_column(&rel.schema.columns, old_col)? else {
         return Err(missing("column", schema_name, old_col));
     };
-    client.alter_rename_column(tid, col_idx, new_col)?;
+    client.alter_rename_column(rel.tid, col_idx, new_col)?;
     Ok(altered("column", new_col.to_string()))
 }
 
@@ -195,11 +193,10 @@ fn add_column(
     let source_name = extract_name(source, "ALTER TABLE")?;
     // No identifier validation: `validate_user_name` guards *relation* names
     // only, and neither CREATE TABLE nor RENAME COLUMN validates a column one.
-    let Some((tid, _)) =
-        resolve_alter_base_table_with_schema(client, schema_name, &source_name, tbl_if_exists, "ADD COLUMN")?
-    else {
+    let Some(rel) = resolve_alter_base_table(client, schema_name, &source_name, tbl_if_exists, "ADD COLUMN")? else {
         return Ok(altered("column", col_name.clone()));
     };
+    let tid = rel.tid;
 
     let type_code = sql_type_to_typecode(&column_def.data_type)?;
     let def = gnitz_core::ColumnDef::new(col_name, type_code, /* is_nullable */ true);
@@ -236,11 +233,10 @@ fn drop_column(
     };
     let col_name = &col.value;
     let source_name = extract_name(source, "ALTER TABLE")?;
-    let Some((tid, schema)) =
-        resolve_alter_base_table_with_schema(client, schema_name, &source_name, tbl_if_exists, "DROP COLUMN")?
-    else {
+    let Some(rel) = resolve_alter_base_table(client, schema_name, &source_name, tbl_if_exists, "DROP COLUMN")? else {
         return Ok(altered("column", col_name.clone()));
     };
+    let (tid, schema) = (rel.tid, &rel.schema);
 
     let Some(col_idx) = find_unique_column(&schema.columns, col_name)? else {
         if col_if_exists {
@@ -271,8 +267,11 @@ fn drop_column(
     // dormant). Served from the statement's resolved descriptor; `cols` are
     // physical indices in the same space as `col_idx`, so a composite-index
     // member is caught.
-    let indexes = Arc::clone(&client.describe_by_id(tid)?.indexes);
-    if indexes.iter().any(|im| im.cols.as_slice().contains(&(col_idx as u32))) {
+    if rel
+        .indexes
+        .iter()
+        .any(|im| im.cols.as_slice().contains(&(col_idx as u32)))
+    {
         return Err(GnitzSqlError::Unsupported(format!(
             "cannot DROP COLUMN '{col_name}': it is covered by a secondary index; DROP the index first"
         )));
@@ -295,11 +294,10 @@ fn drop_not_null(
     col_name: &str,
 ) -> Result<SqlResult, GnitzSqlError> {
     let source_name = extract_name(source, "ALTER TABLE")?;
-    let Some((tid, schema)) =
-        resolve_alter_base_table_with_schema(client, schema_name, &source_name, tbl_if_exists, "DROP NOT NULL")?
-    else {
+    let Some(rel) = resolve_alter_base_table(client, schema_name, &source_name, tbl_if_exists, "DROP NOT NULL")? else {
         return Ok(altered("column", col_name.to_string()));
     };
+    let (tid, schema) = (rel.tid, &rel.schema);
     let Some(col_idx) = find_unique_column(&schema.columns, col_name)? else {
         return Err(missing("column", schema_name, col_name));
     };
@@ -337,7 +335,7 @@ fn add_constraint(
     // `u.name` (the CONSTRAINT name) becomes the created index's name; `None`
     // auto-generates one (`create_index_core` via default_index_name).
     let explicit_name = u.name.as_ref().map(|n| n.value.clone());
-    if !alter_base_table_exists(client, schema_name, &source_name, if_exists, "ADD CONSTRAINT")? {
+    if resolve_alter_base_table(client, schema_name, &source_name, if_exists, "ADD CONSTRAINT")?.is_none() {
         return Ok(altered("constraint", explicit_name.unwrap_or_default()));
     }
 
@@ -368,7 +366,7 @@ fn drop_constraint(
 ) -> Result<SqlResult, GnitzSqlError> {
     validate_user_name(name)?;
     let source_name = extract_name(source, "ALTER TABLE")?;
-    if !alter_base_table_exists(client, schema_name, &source_name, tbl_if_exists, "DROP CONSTRAINT")? {
+    if resolve_alter_base_table(client, schema_name, &source_name, tbl_if_exists, "DROP CONSTRAINT")?.is_none() {
         return Ok(altered("constraint", name.to_string()));
     }
     client.drop_index_by_name(name, constraint_if_exists)?;
@@ -377,19 +375,21 @@ fn drop_constraint(
 
 // --- shared helpers ---
 
-/// Check the ALTER target is a writable base table (validated name, view and
-/// system relation rejected). `Ok(false)` is the `IF EXISTS` no-op — the target
-/// does not exist and the caller returns its success result untouched.
-fn alter_base_table_exists(
+/// The ALTER target as a writable base table (validated name, view and system
+/// relation rejected). `Ok(None)` is the `IF EXISTS` no-op — the target does not
+/// exist and the caller returns its success result untouched. The descriptor's
+/// schema is the physical one the column-level guards index into: hidden
+/// (dropped) slots included, `pk_cols` physical.
+fn resolve_alter_base_table(
     client: &mut GnitzClient,
     schema_name: &str,
     source_name: &str,
     if_exists: bool,
     op: &str,
-) -> Result<bool, GnitzSqlError> {
+) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
     validate_user_name(source_name)?;
     match client.resolve(schema_name, source_name)? {
-        None if if_exists => Ok(false),
+        None if if_exists => Ok(None),
         None => Err(missing("Table", schema_name, source_name)),
         // No class but a base table has a column shape to ALTER: a view is
         // column-bound by ordinal, and a stream holds no rows (it is RESTRICTed while
@@ -402,28 +402,9 @@ fn alter_base_table_exists(
         ))),
         Some(rel) => {
             reject_system_relation(rel.tid)?;
-            Ok(true)
+            Ok(Some(rel))
         }
     }
-}
-
-/// As [`alter_base_table_exists`], but also loads the resolved base table's full
-/// physical schema — columns include any hidden (dropped) slot and `pk_cols` are
-/// physical indices — for the DROP COLUMN / DROP NOT NULL column-level guards.
-/// `Ok(None)` is the `IF EXISTS` no-op.
-fn resolve_alter_base_table_with_schema(
-    client: &mut GnitzClient,
-    schema_name: &str,
-    source_name: &str,
-    if_exists: bool,
-    op: &str,
-) -> Result<Option<(u64, Arc<gnitz_core::Schema>)>, GnitzSqlError> {
-    if !alter_base_table_exists(client, schema_name, source_name, if_exists, op)? {
-        return Ok(None);
-    }
-    // Second call, but a memo hit inside the statement bracket: no round trip.
-    let (tid, schema) = client.resolve_table_id(schema_name, source_name)?;
-    Ok(Some((tid, schema)))
 }
 
 /// Reject an ALTER of a system relation (id below the user band). The engine's

@@ -12,7 +12,7 @@ use crate::error::GnitzSqlError;
 use crate::hir::chain::{debug_assert_exchange_topology, ViewChain};
 use crate::validate::{alter_view_parts, reject_unhonored_query_clauses, validate_user_name, HonoredQueryClauses};
 use crate::SqlResult;
-use gnitz_core::{CatalogSnapshot, GnitzClient, PlannedView, RelClass, RelDescriptor, ViewReplace};
+use gnitz_core::{CatalogSnapshot, GnitzClient, PlannedView, RelClass, RelDescriptor, Schema};
 use sqlparser::ast::{CreateTableOptions, Ident, ObjectName, Query, Statement, Value, ValueWithSpan};
 use std::sync::Arc;
 
@@ -146,7 +146,7 @@ pub fn plan_view(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> 
 pub enum ViewPlan {
     /// Register `chain`, superseding the view that already holds its name when
     /// `replace` says so.
-    Create { chain: PlannedChain, replace: ViewReplace },
+    Create { chain: PlannedChain, replace: bool },
     /// `IF NOT EXISTS`, and the name is taken: nothing to register. Carries the
     /// id of the relation already standing there.
     Skip { existing_id: u64 },
@@ -218,11 +218,7 @@ fn plan_create_view(
 
     Ok(ViewPlan::Create {
         chain: PlannedChain { name: view_name, views: chain.segments },
-        replace: match replaced_vid {
-            // The statement carried the whole definition, `WITH (…)` included.
-            Some(_) => ViewReplace::WithBudgets,
-            None => ViewReplace::Nothing,
-        },
+        replace: replaced_vid.is_some(),
     })
 }
 
@@ -257,8 +253,9 @@ fn plan_alter_view(
 
     Ok(ViewPlan::Create {
         chain: PlannedChain { name: view_name, views: chain.segments },
-        // `ALTER VIEW … AS` re-renders its body with no option clause.
-        replace: ViewReplace::BodyOnly,
+        // `resolve_view_id` above already refused a bounded or fed view, which is
+        // what `ALTER VIEW … AS` cannot restate — it carries no option clause.
+        replace: true,
     })
 }
 
@@ -416,13 +413,17 @@ fn build_query_segments(
     // hidden ones were checked inside `add_segment`; this is the other of the two
     // paths every emitted circuit reaches.
     debug_assert_exchange_topology(&circuit);
-    crate::hir::chain::schema_of(&out_cols, pk_cols, "view output")?;
+    // The admissibility rules only — not `schema_of`, whose `Schema::from_parts`
+    // deep-clones every `ColumnDef` for a value nothing here reads.
+    let pk_col_list = crate::hir::chain::pk_col_list(pk_cols);
+    Schema::validate_parts(&pk_col_list, &out_cols)
+        .map_err(|e| GnitzSqlError::Unsupported(format!("view output: {e}")))?;
     chain.segments.push(PlannedView {
         // The user-named view is always the chain's slot 0.
         seg: 0,
         circuit,
         output_columns: out_cols,
-        pk_cols: crate::hir::chain::pk_col_list(pk_cols),
+        pk_cols: pk_col_list,
         capacity_bytes: capacity,
         delta_bytes: options.delta,
     });

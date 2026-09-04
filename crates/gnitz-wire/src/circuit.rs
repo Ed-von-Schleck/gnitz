@@ -550,10 +550,7 @@ fn write_cols_with_tcs(w: &mut Writer, slots: &[(u32, u8)]) {
 /// `Err`: see [`ScanBound`].
 fn read_scan_bound(params: &[u8]) -> Option<ScanBound> {
     let mut r = Reader::new(params, PARAMS_CTX);
-    let idx_cols = crate::unpack_pk_cols(r.u64().ok()?);
-    if !idx_cols.is_well_formed() {
-        return None;
-    }
+    let idx_cols = crate::unpack_pk_cols(r.u64().ok()?).ok()?;
     let desc = crate::range::read_range_descriptor(&mut r).ok()?;
     r.expect_consumed().ok()?;
     Some(ScanBound { idx_cols, desc })

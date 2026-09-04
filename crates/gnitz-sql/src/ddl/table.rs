@@ -636,13 +636,7 @@ pub(crate) fn create_index_core(
     // The name reaches the IDX_TAB row, so a malformed one would persist and be
     // undroppable. Folded here because the catalog stores the folded form, which
     // the `IF NOT EXISTS` test below compares against.
-    let explicit_name = match explicit_name {
-        Some(name) => {
-            validate_user_name(&name)?;
-            Some(canonical_user_name(&name)?)
-        }
-        None => None,
-    };
+    let explicit_name = explicit_name.map(|name| canonical_user_name(&name)).transpose()?;
 
     if columns.is_empty() {
         return Err(GnitzSqlError::Bind(format!("{ctx}: at least one column required")));

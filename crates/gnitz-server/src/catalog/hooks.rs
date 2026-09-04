@@ -292,7 +292,7 @@ impl CatalogEngine {
     /// synthetic hash column for join/set-op/distinct views, or the source PK
     /// passed through (0..k) for a plain projection over a compound-PK table.
     fn view_registration(&mut self, batch: &Batch, i: usize, vid: i64) -> Result<RelationRegistration, String> {
-        let (schema_id, name, pk, budgets, owner_view_id) = read_view_tab_row(batch, i);
+        let (schema_id, name, pk, budgets, owner_view_id) = read_view_tab_row(batch, i)?;
         // The circuit's `circuit_nodes` are persisted before this VIEW_TAB row,
         // so `get_source_ids` resolves here. Re-check for the paths that skip the
         // precheck (boot replay, worker `ddl_sync`).
@@ -471,7 +471,8 @@ impl CatalogEngine {
         for i in 0..batch.len() {
             let idx_id = batch.get_pk(i) as i64;
             let (owner_id, packed_cols, props) = read_idx_tab_row(batch, i);
-            let cols = gnitz_wire::unpack_pk_cols(packed_cols);
+            let cols = gnitz_wire::unpack_pk_cols(packed_cols)
+                .map_err(|rule| format!("index {idx_id} on relation {owner_id}: column list {rule}"))?;
             if batch.get_weight(i) > 0 {
                 self.register_index(idx_id, owner_id, &cols, props.is_unique)?;
             } else {
@@ -500,7 +501,7 @@ impl CatalogEngine {
         // `precheck_family`, so re-run the shared registration guards here (see
         // `validate_index_registration`). Resolve the owner entry once for
         // everything below.
-        let entry = self.validate_index_registration(owner_id, cols)?;
+        let entry = self.validate_index_registration(owner_id)?;
         let owner_dir = entry.directory.clone();
 
         if let Some(was_unique) = entry.index_circuit_on(cols.as_slice()).map(|ic| ic.is_unique) {
