@@ -1,7 +1,6 @@
 use super::super::batch::REG_PK;
 use super::super::layout::ENCODING_CONSTANT;
 use super::super::shard_file::region_dir;
-use super::output::Drain;
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::{BatchBuilder, Layout};
@@ -35,8 +34,9 @@ fn compound_pk_bytes(c0: u64, c1: u64) -> Vec<u8> {
 fn scan_all_with_val(cursor: &mut ReadCursor) -> Vec<(u64, i64, i64)> {
     let mut rows = Vec::new();
     while cursor.valid {
-        let cell = cursor.col_bytes(1, 8).expect("payload column of a valid cursor row");
-        let val = i64::from_le_bytes(cell.try_into().unwrap());
+        let (src, row) = cursor.current_row_source();
+        // Logical col 1 is payload slot 0 of this fixture's schema.
+        let val = crate::storage::payload_u64(src, row, 0) as i64;
         rows.push((cursor.current_key_narrow() as u64, cursor.current_weight, val));
         cursor.advance();
     }
@@ -185,22 +185,6 @@ fn test_cursor_same_pk_nonadjacent_payload_fold() {
     );
 }
 
-#[test]
-fn col_bytes_answers_only_for_a_payload_column_of_a_valid_row() {
-    let schema = make_schema_u128_i64();
-    let cursor = create_read_cursor(&[make_batch(&[(7, 1, 1234)])], &[], schema);
-    assert!(cursor.valid);
-
-    let pk_index = cursor.schema.pk_indices()[0] as usize;
-    assert!(cursor.col_bytes(pk_index, 16).is_none(), "PK index has no payload slot");
-    let cell = cursor.col_bytes(1, 8).expect("logical col 1 = i64 payload");
-    assert_eq!(i64::from_le_bytes(cell.try_into().unwrap()), 1234);
-
-    let exhausted = create_read_cursor(&[], &[], schema);
-    assert!(!exhausted.valid);
-    assert!(exhausted.col_bytes(1, 8).is_none());
-}
-
 /// The bound counts the row the cursor sits on, so it is what a walk from here
 /// will emit — a freshly-opened 3-row cursor answers 3, even though the open's
 /// own drive already moved `position` past the first row.
@@ -265,26 +249,46 @@ fn seek_bytes_lands_on_lower_bound_narrow() {
     }
 }
 
-/// Drive one reused cursor over `sources` through `probes`, asserting each
-/// `advance_to` lands exactly where a from-scratch `seek_bytes` on a fresh
-/// cursor would. The fresh cursor is the oracle for any probe order — a
-/// strict-forward step (the in-place loser-tree gallop), an `Equal` re-seek
-/// of the current key, or a backward step (both the rebuild fallback). The
-/// reused position must never change the landing — including the emitted
-/// weight, which pins cross-source ghost folding.
-fn assert_advance_to_matches_seek_oracle(schema: SchemaDescriptor, sources: &[Rc<Batch>], probes: &[u128]) {
-    let n = sources.len();
-    let mut adv = create_read_cursor(sources, &[], schema);
-    for &key in probes {
-        adv.advance_to(&key.to_be_bytes());
-        let mut fresh = create_read_cursor(sources, &[], schema);
-        fresh.seek_bytes(&key.to_be_bytes());
-        assert_eq!(adv.valid, fresh.valid, "n_src={n} key={key}");
+/// OPK bytes for key `n` at `stride`: `n`'s big-endian image right-aligned into
+/// `stride` zero-padded bytes. That is the column's OPK for a single-column
+/// U64/U128 PK and the concat-OPK for a compound all-`U64` one — monotone in `n`
+/// either way, and full-width through the stride's dispatch arm.
+#[inline]
+pub(super) fn adv_key(n: u64, stride: usize) -> [u8; 40] {
+    let mut k = [0u8; 40];
+    k[stride - 8..stride].copy_from_slice(&n.to_be_bytes());
+    k
+}
+
+/// Drive one reused cursor through `keys`, asserting each `advance_to` lands where
+/// a from-scratch `seek_bytes` on a fresh `mk()` cursor would — at any probe order:
+/// strict-forward (the in-place gallop), `Equal`, or backward (both the replay).
+/// Weight included, which is what pins cross-source ghost folding.
+pub(super) fn adv_assert_cursor_oracle(mk: impl Fn() -> ReadCursor, stride: usize, keys: &[u64]) {
+    let mut adv = mk();
+    for &v in keys {
+        let k = adv_key(v, stride);
+        adv.advance_to(&k[..stride]);
+        let mut fresh = mk();
+        fresh.seek_bytes(&k[..stride]);
+        assert_eq!(adv.valid, fresh.valid, "advance_to oracle valid v={v}");
         if adv.valid {
-            assert_eq!(adv.current_pk_bytes(), fresh.current_pk_bytes(), "n_src={n} key={key}");
-            assert_eq!(adv.current_weight, fresh.current_weight, "n_src={n} key={key}");
+            assert_eq!(
+                adv.current_pk_bytes(),
+                fresh.current_pk_bytes(),
+                "advance_to oracle pk v={v}"
+            );
+            assert_eq!(
+                adv.current_weight, fresh.current_weight,
+                "advance_to oracle weight v={v}"
+            );
         }
     }
+}
+
+/// [`adv_assert_cursor_oracle`] over the `u128`-PK batch fixtures below.
+fn assert_advance_to_matches_seek_oracle(schema: SchemaDescriptor, sources: &[Rc<Batch>], probes: &[u64]) {
+    adv_assert_cursor_oracle(|| create_read_cursor(sources, &[], schema), 16, probes);
 }
 
 /// `advance_to` (forward-only, position-seeded) lands on the identical row a
@@ -299,7 +303,7 @@ fn advance_to_lands_like_seek_bytes_monotone() {
     let b0 = make_batch(&[(10u128, 1, 100), (30, 1, 300), (50, 1, 500), (70, 1, 700)]);
     let b1 = make_batch(&[(20u128, 1, 200), (40, 1, 400), (60, 1, 600)]);
     // Monotone ascending: below-min, present, absent-between, above-max.
-    let probes: &[u128] = &[0, 10, 15, 20, 35, 50, 55, 70, 71];
+    let probes: &[u64] = &[0, 10, 15, 20, 35, 50, 55, 70, 71];
     assert_advance_to_matches_seek_oracle(schema, &[Rc::clone(&b0)], probes);
     assert_advance_to_matches_seek_oracle(schema, &[b0, b1], probes);
 }
@@ -767,8 +771,9 @@ fn a_long_string_whose_offset_overruns_the_blob_reads_back_empty() {
 }
 
 // ---------------------------------------------------------------------------
-// count_range_raw — the source drive's index-vs-full-scan gate reads the range
-// size before deciding, so it must be exact over raw entries and side-effect free.
+// seek_range_bytes' raw window count — the index-vs-full-scan gate reads the
+// range size off the seek that positions the cursor, so it must be exact over
+// raw entries.
 // ---------------------------------------------------------------------------
 
 /// Count `[start, end)` the expensive way: drive the merge and count the groups
@@ -803,16 +808,17 @@ fn counted_walk_raw(
     n
 }
 
-/// Over a multi-run cursor (memtable runs + a shard), `count_range_raw` equals a
-/// counted walk of `[start, end)` — including a run that holds no entry in range,
-/// and a `end = None` arm that counts to the end of every run.
+/// Over a multi-run cursor (memtable runs + a shard), the count `seek_range_bytes`
+/// returns equals a counted walk of `[start, end)` — including a run that holds no
+/// entry in range, and an `end = None` arm that counts to the end of every run.
+/// A fresh cursor per range, because the window only ever narrows.
 #[test]
-fn count_range_raw_equals_counted_walk() {
+fn seek_range_bytes_counts_the_raw_window() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u128_i64();
 
     // Overlapping runs: run A and the shard both hold pk=20 (a cross-run
-    // duplicate `count_range_raw` counts twice, by contract), and run C holds
+    // duplicate the raw count counts twice, by contract), and run C holds
     // nothing inside [10, 40).
     let a = make_batch(&[(5, 1, 50), (20, 1, 200), (30, 1, 300)]);
     let b = make_batch(&[(10, 1, 100), (25, 1, 250), (60, 1, 600)]);
@@ -821,7 +827,6 @@ fn count_range_raw_equals_counted_walk() {
 
     let batches = [Rc::clone(&a), Rc::clone(&b), Rc::clone(&c)];
     let shards = [Rc::clone(&shard)];
-    let cursor = create_read_cursor(&batches, &shards, schema);
 
     for (lo, hi) in [
         (10u128, Some(40u128)), // spans all four runs; C contributes 0
@@ -833,39 +838,17 @@ fn count_range_raw_equals_counted_walk() {
         (0, None),
     ] {
         let want = counted_walk_raw(&batches, &shards, schema, lo, hi);
-        let got = cursor.count_range_raw(&lo.to_be_bytes(), hi.map(|h| h.to_be_bytes()).as_ref().map(|k| &k[..]));
-        assert_eq!(got, want, "count_range_raw([{lo}, {hi:?}))");
+        let mut cursor = create_read_cursor(&batches, &shards, schema);
+        let got = cursor.seek_range_bytes(&lo.to_be_bytes(), hi.map(|h| h.to_be_bytes()).as_ref().map(|k| &k[..]));
+        assert_eq!(got, want, "seek_range_bytes([{lo}, {hi:?}))");
     }
     // The cross-run duplicate is counted raw, once per run — the gate's inputs
     // are both raw counts, so both err the same direction.
+    let mut cursor = create_read_cursor(&batches, &shards, schema);
     assert_eq!(
-        cursor.count_range_raw(&20u128.to_be_bytes(), Some(&21u128.to_be_bytes()[..])),
+        cursor.seek_range_bytes(&20u128.to_be_bytes(), Some(&21u128.to_be_bytes()[..])),
         2
     );
-}
-
-/// `count_range_raw` takes `&self` and builds no merge tree: a following
-/// `seek_bytes` must land identically with or without it.
-#[test]
-fn count_range_raw_does_not_reposition() {
-    let schema = make_schema_u128_i64();
-    let batches = [
-        make_batch(&[(5, 1, 50), (20, 1, 200), (30, 1, 300)]),
-        make_batch(&[(10, 1, 100), (25, 1, 250)]),
-    ];
-
-    let mut plain = create_read_cursor(&batches, &[], schema);
-    let mut counted = create_read_cursor(&batches, &[], schema);
-
-    assert!(counted.count_range_raw(&10u128.to_be_bytes(), Some(&30u128.to_be_bytes()[..])) > 0);
-    assert_eq!(counted.valid, plain.valid);
-    assert_eq!(counted.current_pk_bytes(), plain.current_pk_bytes());
-
-    plain.seek_bytes(&25u128.to_be_bytes());
-    counted.seek_bytes(&25u128.to_be_bytes());
-    assert_eq!(counted.valid, plain.valid);
-    assert_eq!(counted.current_pk_bytes(), plain.current_pk_bytes());
-    assert_eq!(scan_all(&mut counted), scan_all(&mut plain));
 }
 
 // -- Live-source mode derivation ---------------------------------------
@@ -895,10 +878,10 @@ fn expect_rows(lo: u64, hi: u64) -> Vec<(u64, i64, i64)> {
 
 /// The mode tracks which sources are live, at every count the dispatch
 /// distinguishes, and never destroys a source to get there: a bounded or unbounded
-/// seek collapses `Multi` down to `Single`/`Empty`, while `rewind` and a
-/// backward `advance_to` re-liven what a range seek emptied. The from-scratch
-/// oracle at the end pins the landing row and its weight across the whole
-/// collapse, which the mode assertions alone do not.
+/// seek collapses the merge mode down to a single source or to none, while
+/// `rewind` and a backward `advance_to` re-liven what a range seek emptied. The
+/// from-scratch oracle at the end pins the landing row and its weight across the
+/// whole collapse, which the mode assertions alone do not.
 #[test]
 fn mode_follows_the_live_source_set() {
     let schema = make_schema_u128_i64();
@@ -906,17 +889,17 @@ fn mode_follows_the_live_source_set() {
     let opk = |pk: u128| pk.to_be_bytes();
 
     let mut c = create_read_cursor(&b, &[], schema);
-    assert!(matches!(c.mode, SourceMode::Multi));
+    assert!(c.mode.is_none());
 
     c.seek_range_bytes(&opk(301), Some(&opk(311)));
-    assert!(matches!(c.mode, SourceMode::Single(3)), "range inside source 3");
+    assert_eq!(c.mode, Some(3), "range inside source 3");
     assert_eq!(c.sources.len(), 4, "no source is destroyed");
     assert_eq!(scan_all_with_val(&mut c), expect_rows(301, 310));
 
     // A source a range seek emptied is only unpositioned, so a backward
     // `advance_to` brings it back — in full, up to its clamped count.
     c.advance_to(&opk(101));
-    assert!(matches!(c.mode, SourceMode::Multi), "sources 1 and 2 are live again");
+    assert!(c.mode.is_none(), "sources 1 and 2 are live again");
     let rows = scan_all_with_val(&mut c);
     assert_eq!(rows.len(), 40 + 40 + 10);
     assert_eq!(rows.first().copied(), Some((101, 1, 1010)));
@@ -924,7 +907,7 @@ fn mode_follows_the_live_source_set() {
     // A window spanning exactly two sources still merges through the tree.
     let mut c = create_read_cursor(&b, &[], schema);
     c.seek_range_bytes(&opk(220), Some(&opk(320)));
-    assert!(matches!(c.mode, SourceMode::Multi));
+    assert!(c.mode.is_none());
     // 220..=240 from source 2, 301..=319 from source 3.
     assert_eq!(scan_all_with_val(&mut c).len(), 21 + 19);
 
@@ -932,55 +915,175 @@ fn mode_follows_the_live_source_set() {
     // not — and `rewind` from it re-livens every source.
     let mut c = create_read_cursor(&b, &[], schema);
     c.seek_bytes(&opk(301));
-    assert!(matches!(c.mode, SourceMode::Single(3)));
+    assert_eq!(c.mode, Some(3));
     assert_eq!(scan_all_with_val(&mut c).len(), 40);
     c.rewind();
-    assert!(matches!(c.mode, SourceMode::Multi), "rewind re-livens every source");
+    assert!(c.mode.is_none(), "rewind re-livens every source");
     assert_eq!(scan_all_with_val(&mut c).len(), 4 * 40);
 
     // A window covering nothing: no rows, no drain, no panic.
     let mut c = create_read_cursor(&b, &[], schema);
     c.seek_range_bytes(&opk(41), Some(&opk(51)));
-    assert!(matches!(c.mode, SourceMode::Empty));
-    assert!(!c.valid);
-    assert!(c.drain_to_batch(Drain::All).is_none());
+    assert!(c.mode.is_none());
+    assert!(!c.valid, "no live source, so the merge drives to invalid");
+    assert!(c.drain_chunk(usize::MAX).is_none());
 
     assert_advance_to_matches_seek_oracle(schema, &b, &[0, 105, 250, 305, 120, 341, 220]);
 }
 
-/// `materialize` reserves every source's heap up front where a chunked drain
-/// grows on demand — both halves of one `Drain` value. Getting it wrong costs
-/// only speed, so nothing else notices. Sizing is load-bearing: the sources must
-/// sum past `POOL_BYPASS_BYTES` (2 MiB) so the reservation allocates fresh at
-/// its exact size, and nearly every row must cancel so the survivor is smaller.
+/// A full drain of an untouched cursor reserves every source's heap — what the
+/// blob proration collapses to when the row bound is the whole source set. The
+/// fixture must sum past `POOL_BYPASS_BYTES` (2 MiB) so the reservation allocates
+/// at its exact size, cancel nearly every row so the survivor is smaller, and keep
+/// the FIRST key alive so the open's own drive stops there.
 #[test]
 fn materialize_reserves_the_whole_blob_arena() {
     let schema = make_schema_pk_u64_payload_string();
-    const ROWS: usize = 4096;
+    const ROWS: u64 = 4096;
     let text = |pk: u64| format!("{pk:0>512}");
-    let run = |n: usize, weight: i64| {
+    let run = |lo: u64, weight: i64| {
         let mut bb = BatchBuilder::new(schema);
-        for pk in 0..n as u64 {
+        for pk in lo..ROWS {
             bb.begin_row(pk as u128, weight);
             bb.put_string(&text(pk));
             bb.end_row();
         }
         Rc::new(bb.finish())
     };
-    // Same keys and payloads at opposite weights, but for one uncancelled key.
-    let inserts = run(ROWS, 1);
-    let retracts = run(ROWS - 1, -1);
+    // Same keys and payloads at opposite weights, but for key 0.
+    let inserts = run(0, 1);
+    let retracts = run(1, -1);
     let reserved = inserts.blob.len() + retracts.blob.len();
     assert!(reserved > 2 * 1024 * 1024, "must exceed POOL_BYPASS_BYTES: {reserved}");
 
     let batch = create_read_cursor(&[inserts, retracts], &[], schema).materialize();
-    assert_eq!(batch.count, 1, "all but the last key cancels");
+    assert_eq!(batch.count, 1, "all but the first key cancels");
     assert_eq!(batch.blob.len(), 512, "one surviving string");
     assert!(
         batch.blob.capacity() >= reserved,
         "a full drain reserves every source's heap: {} < {reserved}",
         batch.blob.capacity(),
     );
+}
+
+/// The chunked drain's blob reservation stays O(chunk) as the drain advances.
+/// Prorating by the rows *remaining* would grow the per-row density every chunk,
+/// reaching the whole heap on the last — the peak `drain_chunk` exists to avoid.
+/// Observable because the pool retains nothing above `POOL_BYPASS_BYTES`.
+#[test]
+fn drain_chunk_blob_reservation_stays_o_chunk() {
+    let schema = make_schema_pk_u64_payload_string();
+    const PER_SOURCE: u64 = 4096;
+    const CHUNK: usize = 512;
+    let text = |pk: u64| format!("{pk:0>512}");
+    // Interleaved keys, so both sources stay live and the drain runs through the
+    // merge rather than the single-source bulk copy.
+    let run = |parity: u64| {
+        let mut bb = BatchBuilder::new(schema);
+        for i in 0..PER_SOURCE {
+            let pk = i * 2 + parity;
+            bb.begin_row(pk as u128, 1);
+            bb.put_string(&text(pk));
+            bb.end_row();
+        }
+        Rc::new(bb.finish())
+    };
+    let (even, odd) = (run(0), run(1));
+    let total_blob = even.blob.len() + odd.blob.len();
+    assert!(
+        total_blob > 2 * 1024 * 1024,
+        "the whole heap must exceed POOL_BYPASS_BYTES for a whole-heap reservation to show: {total_blob}"
+    );
+
+    let mut cursor = create_read_cursor(&[even, odd], &[], schema);
+    assert!(cursor.mode.is_none(), "both sources must stay live");
+    let mut rows = 0usize;
+    while let Some(chunk) = cursor.drain_chunk(CHUNK) {
+        rows += chunk.count;
+        assert!(
+            chunk.blob.capacity() <= 2 * 1024 * 1024,
+            "chunk reserved {} blob bytes of a {total_blob}-byte relation",
+            chunk.blob.capacity(),
+        );
+    }
+    assert_eq!(rows as u64, 2 * PER_SOURCE);
+}
+
+/// A key list interleaving present and absent keys over a multi-run cursor yields
+/// exactly what a per-key fresh-cursor seek yields — including a key that is
+/// absent only because its group folded to net zero, the case that makes
+/// "the cursor is past the key ⇒ the key is absent" non-obvious.
+#[test]
+fn ascending_key_sweep_matches_per_key_fresh_seeks() {
+    let schema = make_schema_u128_i64();
+    // pk=30 nets to zero across the two runs; pk=50 carries two payloads.
+    let a = make_batch(&[(10, 1, 100), (30, 1, 300), (50, 1, 500), (70, 1, 700)]);
+    let b = make_batch(&[(20, 1, 200), (30, -1, 300), (50, 2, 501), (90, 1, 900)]);
+    let sources = [Rc::clone(&a), Rc::clone(&b)];
+    // Below the minimum, present, absent-between, the ghost, multi-payload, and
+    // past the maximum.
+    let keys: &[u128] = &[5, 10, 15, 20, 30, 40, 50, 70, 90, 95];
+
+    let mut got = Batch::with_capacity(schema, 8);
+    let mut sweep = create_read_cursor(&sources, &[], schema);
+    for &k in keys {
+        let key = k.to_be_bytes();
+        if sweep.seek_pk_group_ascending(&key) {
+            sweep.copy_positioned_pk_group_into(&key, &mut got);
+        }
+    }
+
+    let mut want = Batch::with_capacity(schema, 8);
+    for &k in keys {
+        create_read_cursor(&sources, &[], schema).copy_live_pk_group_into(&k.to_be_bytes(), &mut want);
+    }
+
+    let rows = |b: &Batch| -> Vec<(u128, i64, i64)> {
+        (0..b.count)
+            .map(|r| {
+                let val = i64::from_le_bytes(b.get_col_ptr(r, 0, 8).try_into().unwrap());
+                (b.get_pk(r), b.get_weight(r), val)
+            })
+            .collect()
+    };
+    assert_eq!(rows(&got), rows(&want));
+    assert_eq!(
+        rows(&got),
+        vec![
+            (10, 1, 100),
+            (20, 1, 200),
+            (50, 1, 500),
+            (50, 2, 501),
+            (70, 1, 700),
+            (90, 1, 900)
+        ],
+        "the ghost at 30 and every absent key contribute nothing",
+    );
+}
+
+/// `next_chunk` stops on the row budget mid-list and resumes at the key it has not
+/// consumed: a chunk boundary must not skip the next chunk's first key, and an
+/// absent key inside a chunk must not shift the ones behind it.
+#[test]
+fn pk_set_gather_spans_chunk_boundaries() {
+    let schema = make_schema_u128_i64();
+    let present: Vec<u128> = (1..=8u128).map(|i| i * 10).collect();
+    let batch = make_batch(&present.iter().map(|&pk| (pk, 1i64, pk as i64 * 10)).collect::<Vec<_>>());
+    // 35 and 85 are absent; the rest are present, strictly ascending.
+    let asked: Vec<u128> = vec![10, 20, 30, 35, 40, 50, 60, 70, 80, 85];
+    let flat: Vec<u8> = asked.iter().flat_map(|k| k.to_be_bytes()).collect();
+
+    for chunk in [1usize, 3, 7, 100] {
+        let mut gather = PkSetGather::open(flat.clone(), schema, |_, _| {
+            create_read_cursor(std::slice::from_ref(&batch), &[], schema)
+        });
+        let mut got: Vec<u128> = Vec::new();
+        while let Some(out) = gather.next_chunk(chunk) {
+            assert!(out.count > 0, "an empty chunk must be reported as None");
+            got.extend((0..out.count).map(|r| out.get_pk(r)));
+        }
+        assert_eq!(got, present, "chunk={chunk}");
+    }
 }
 
 /// A bounded read over a multi-shard STRING partition that only one shard covers
@@ -1015,9 +1118,9 @@ fn bounded_string_read_carries_only_its_own_rows() {
 
     let mut c = create_read_cursor(&[], &shards, schema);
     c.seek_range_bytes(&10_001u64.to_be_bytes(), Some(&10_004u64.to_be_bytes()));
-    assert!(matches!(c.mode, SourceMode::Single(1)));
+    assert_eq!(c.mode, Some(1));
 
-    let batch = c.drain_to_batch(Drain::All).expect("shard 1 window");
+    let batch = c.drain_chunk(usize::MAX).expect("shard 1 window");
     assert_eq!(batch.count, 3);
     assert_eq!(batch.blob.len(), 3 * 40, "only the drained rows' strings");
     for i in 0..3 {

@@ -25,13 +25,11 @@ use crate::storage::{Batch, ReadCursor};
 /// match cursor (a trace register reused by several ops in one epoch) is reset
 /// to the co-group start from any prior position — `advance_to` is
 /// backward-capable. This subsumes the old `rewind` + `seek_bytes(delta[0])`
-/// the merge-walk paid; `cogroup_left` self-positions the same way on its first
-/// group's `advance_to`.
+/// the merge-walk paid; `cogroup_left`'s ascending gate positions the same way.
 ///
-/// **Callback contract.** `on_match` reads its match group by walking the
-/// forward-only `m` with the cursor's own step (`while m.valid &&
-/// m.current_pk_eq(key) { … m.advance() }`) and must walk the *whole* group to
-/// emit correctly. Loop
+/// **Callback contract.** `on_match` reads its match group through
+/// `ReadCursor::for_each_pk_group_row` and must walk the *whole* group to emit
+/// correctly. Loop
 /// *progress* is robust either way: the skeleton re-establishes the match
 /// position with `advance_to` at the next delta key (an under-walk forfeits rows
 /// the callback should have read; an over-walk merely sends the following
@@ -80,7 +78,9 @@ pub(crate) fn cogroup_left(
     while i < n {
         let dk = delta.get_pk_bytes(i);
         let j = delta.pk_group_end(i);
-        m.advance_to(dk); // galloping skip; group may be empty
+        // Ascending, so an absent group costs a comparison; the first key
+        // positions the cursor, which is what self-positions the whole walk.
+        m.seek_pk_group_ascending(dk);
         on_group(dk, i..j, m);
         i = j;
     }

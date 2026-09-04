@@ -17,8 +17,9 @@ use gnitz_wire::{cmp_col_window, null_word_get, read_unsigned_exact};
 ///
 /// The per-row accessors are [`RowSource`], the one shared definition the
 /// resolved-addressing types ([`crate::schema::ColumnLocator`]) bind to, so any
-/// `ColumnarSource` can be read through a locator directly. This trait adds
-/// exactly the one method the evaluator has no use for.
+/// `ColumnarSource` can be read through a locator directly. This trait adds the
+/// two the evaluator has no use for: the Z-set weight, and whether the row is a
+/// payload-less skeleton.
 ///
 /// It cannot be folded into `BatchView` in the other direction: `MappedShard`,
 /// and the `Run` that may wrap one, can address a cell but have no contiguous

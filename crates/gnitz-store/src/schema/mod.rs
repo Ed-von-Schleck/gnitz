@@ -659,8 +659,8 @@ impl SchemaDescriptor {
     /// Dense payload slot (batch payload region + null-bitmap bit position) for
     /// `col_idx`, or `None` when it names no payload column of this schema —
     /// a PK column, or out of range. Total, so it doubles as the "is this a real
-    /// payload column" test; `read_cursor::col_bytes` feeds the result straight
-    /// to `get_col_ptr`.
+    /// payload column" test; [`Self::locate`] feeds the result straight to
+    /// `ColumnLocator::Payload`.
     #[inline]
     pub(crate) fn try_payload_idx(&self, col_idx: usize) -> Option<usize> {
         if col_idx >= self.num_columns() || self.is_pk_col(col_idx) {

@@ -14,14 +14,12 @@ use crate::schema::SchemaDescriptor;
 
 pub struct PkSetGather {
     cursor: ReadCursor,
-    /// The keys' OPK images, `stride` bytes each, concatenated. **Ascending**:
-    /// OPK order is typed PK order, so a sorted list makes the walk monotone
-    /// regardless of the order the caller received the keys in.
+    /// The keys' OPK images, one `pk_stride` each, concatenated and strictly
+    /// ascending — OPK order is typed PK order, so sorting the images makes the
+    /// walk one forward sweep whatever order the caller received them in.
     keys: Vec<u8>,
-    stride: usize,
     /// Index of the next key, in keys — not bytes.
     next: usize,
-    src_schema: SchemaDescriptor,
 }
 
 /// The key range a flat **ascending** OPK key list spans — its first and last
@@ -35,43 +33,25 @@ fn key_list_range(keys: &[u8], stride: usize) -> Option<(&[u8], &[u8])> {
 
 impl PkSetGather {
     /// Gather `keys` out of a store, opening over exactly the range they span —
-    /// `open` is that store's ranged cursor open. The bound comes from the list
-    /// this gather already owns, so no caller re-derives it.
+    /// `open` is that store's ranged cursor open, and the bound comes from the
+    /// list this gather already owns. `src_schema` is a parameter rather than the
+    /// cursor's because the empty-key arm has no cursor to read it off.
     pub fn open(
         keys: Vec<u8>,
         src_schema: SchemaDescriptor,
         open: impl FnOnce(&[u8], Option<&[u8]>) -> ReadCursor,
     ) -> Self {
         let stride = src_schema.pk_stride() as usize;
+        debug_assert!(
+            stride > 0 && keys.len().is_multiple_of(stride),
+            "key buffer is not a whole key list"
+        );
         let cursor = match key_list_range(&keys, stride) {
             Some((lo, hi)) => open(lo, Some(hi)),
             // No key to gather, so nothing to open over.
             None => super::empty(src_schema),
         };
-        Self::new(cursor, keys, src_schema)
-    }
-
-    /// `keys` is the flat concatenation of the OPK images, each exactly
-    /// `src_schema.pk_stride()` bytes, in ascending order.
-    fn new(cursor: ReadCursor, keys: Vec<u8>, src_schema: SchemaDescriptor) -> Self {
-        let stride = src_schema.pk_stride() as usize;
-        debug_assert!(
-            stride > 0 && keys.len().is_multiple_of(stride),
-            "key buffer is not a whole key list"
-        );
-        debug_assert!(
-            keys.chunks_exact(stride)
-                .zip(keys.chunks_exact(stride).skip(1))
-                .all(|(a, b)| a <= b),
-            "PkSetGather keys must be sorted ascending",
-        );
-        PkSetGather {
-            cursor,
-            keys,
-            stride,
-            next: 0,
-            src_schema,
-        }
+        PkSetGather { cursor, keys, next: 0 }
     }
 
     /// Whether the range this gather opened over holds a skeleton shard — see
@@ -102,18 +82,23 @@ impl PkSetGather {
     /// drained, so a chunk can overshoot to `max_rows - 1 + |largest group|`.
     pub fn next_chunk(&mut self, max_rows: usize) -> Option<Batch> {
         debug_assert!(max_rows > 0, "a zero row budget would never consume a key");
-        let total = self.keys.len() / self.stride;
+        let schema = self.cursor.schema;
+        let stride = schema.pk_stride() as usize;
+        let total = self.keys.len() / stride;
         if self.next >= total {
             return None;
         }
         let cap = (total - self.next).min(max_rows);
-        let mut out = Batch::with_capacity(self.src_schema, cap);
+        let mut out = Batch::with_capacity(schema, cap);
         while self.next < total && out.count < max_rows {
-            let off = self.next * self.stride;
-            let key = &self.keys[off..off + self.stride];
+            let off = self.next * stride;
+            let key = &self.keys[off..off + stride];
             self.next += 1;
-            // An absent key, or one this worker holds no row for, copies nothing.
-            self.cursor.copy_live_pk_group_into(key, &mut out);
+            // `next` only rises, across chunks too, so the whole list is one
+            // ascending sweep; an absent key copies nothing.
+            if self.cursor.seek_pk_group_ascending(key) {
+                self.cursor.copy_positioned_pk_group_into(key, &mut out);
+            }
         }
         (out.count > 0).then_some(out)
     }

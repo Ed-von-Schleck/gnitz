@@ -1,109 +1,21 @@
 //! Output / drain — turning the merge stream into owned `Batch`es.
 //!
-//! `materialize`/`drain_chunk` collect the merge order into a thread-local scratch
-//! buffer (`DrainGuard`), then column-scatter it through `repr::scatter`. The
+//! `materialize`/`drain_chunk` collect the merge order into the cursor's own
+//! scratch buffer, then column-scatter it through `repr::scatter`. The
 //! `impl ReadCursor` here is a continuation of the merge-engine impl in the parent
 //! module; it reads `ReadCursor`'s private fields directly (this submodule is a
-//! descendant) and drives the cursor via the parent's private advance/drive
-//! helpers.
+//! descendant) and drives the cursor via the parent's private advance helpers.
 
-use std::cell::Cell;
-use std::num::NonZeroUsize;
 use std::rc::Rc;
 
 use super::super::batch::{write_to_batch, Batch, Layout};
-use super::super::columnar::with_payload_cmp;
-use super::super::merge::DirectWriter;
+use super::super::columnar::{with_payload_cmp, ColumnarSource};
+use super::super::heap::drive_merge;
+use super::super::merge::{self, prorated_blob_cap, RowComparator};
 use super::super::run::Run;
 use super::super::scatter::scatter_unified_sources;
-use super::{ReadCursor, RowComparator, SourceMode};
+use super::ReadCursor;
 use gnitz_expr::RowSource;
-
-thread_local! {
-    /// Reusable per-thread scratch buffer for `drain_sorted_into`. Each
-    /// 16-byte tuple is much smaller than the corresponding output row, so
-    /// keeping peak capacity for the thread's lifetime is cheap relative to
-    /// the batches it feeds.
-    ///
-    /// `Cell<Vec<_>>` (not `RefCell`) — `DrainGuard` moves the Vec out via
-    /// `Cell::take` and returns it on drop, skipping the runtime borrow
-    /// check `RefCell` would impose.
-    static DRAIN_BUFFER: Cell<Vec<(u32, u32, i64)>> =
-        const { Cell::new(Vec::new()) };
-}
-
-/// RAII handle wrapping the thread-local drain scratch buffer.  Behaves like
-/// `&mut Vec<_>` via `Deref`/`DerefMut`.  On drop it returns the buffer to the
-/// thread-local, keeping whichever Vec has the larger capacity (capped at
-/// `MAX_DRAIN_BUFFER_CAP`); because the slot is a `Cell`, an unwind through
-/// `Drop` cannot poison it.
-pub(crate) struct DrainGuard {
-    inner: Vec<(u32, u32, i64)>,
-}
-
-impl DrainGuard {
-    #[inline]
-    pub(crate) fn new() -> Self {
-        // The thread-local Vec is reused across queries and may hold stale
-        // elements; clear so `new()` always yields an empty buffer. The
-        // elements are `Copy`, so this is an O(1) length reset.
-        let mut inner = DRAIN_BUFFER.with(|b| b.take());
-        inner.clear();
-        Self { inner }
-    }
-}
-
-impl std::ops::Deref for DrainGuard {
-    type Target = Vec<(u32, u32, i64)>;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl std::ops::DerefMut for DrainGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-/// 65 536 × 16 bytes = 1 MB. Caps the retained scratch so a one-off oversized
-/// query can't pin an unusually large allocation for the thread's lifetime.
-const MAX_DRAIN_BUFFER_CAP: usize = 65_536;
-
-impl Drop for DrainGuard {
-    #[inline]
-    fn drop(&mut self) {
-        DRAIN_BUFFER.with(|b| {
-            // Keep whichever Vec has the larger capacity. A nested cursor may
-            // drop a smaller guard after we took the (larger) thread-local;
-            // unconditionally writing our own inner back would shrink it.
-            let mut cached = b.take();
-            if self.inner.capacity() > cached.capacity() && self.inner.capacity() <= MAX_DRAIN_BUFFER_CAP {
-                cached = std::mem::take(&mut self.inner);
-            }
-            b.set(cached);
-        });
-    }
-}
-
-/// How much of the merge stream one drain takes. Also decides the output blob
-/// arena, which is not separately spellable: `All` reserves every source's heap
-/// (a tight bound), `Rows` grows on demand rather than reserving the whole
-/// relation per chunk.
-#[derive(Clone, Copy)]
-pub(super) enum Drain {
-    All,
-    Rows(NonZeroUsize),
-}
-
-impl Drain {
-    fn max_rows(self) -> usize {
-        match self {
-            Drain::All => usize::MAX,
-            Drain::Rows(n) => n.get(),
-        }
-    }
-}
 
 impl ReadCursor {
     /// Copy the current row into `batch` with an explicit weight, downgrading
@@ -143,39 +55,47 @@ impl ReadCursor {
         );
     }
 
-    /// Drain net rows in merge order into an owned `Batch` (sorted +
-    /// consolidated), as far as `limit` allows. Returns `None` once the cursor
-    /// is exhausted / nothing drained. Single owner of the drain → scatter →
-    /// flag pipeline shared by `materialize` and `drain_chunk`.
-    pub(super) fn drain_to_batch(&mut self, limit: Drain) -> Option<Batch> {
-        if !self.valid {
+    /// Drain up to `max_rows` net rows in merge order into an owned `Batch`
+    /// (sorted + consolidated); `None` once the cursor is exhausted. A chunk
+    /// boundary cannot split a (PK, payload) group — each drained entry is one
+    /// fully-folded merge group — so a DDL backfill or uniqueness scan loops on
+    /// this instead of `materialize` and keeps peak memory O(chunk).
+    pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
+        // Load-bearing: without it a zero-row drain would copy nothing, return an
+        // empty batch and still advance, consuming a row.
+        if max_rows == 0 || !self.valid {
             return None;
         }
-        if let Some(batch) = self.drain_single_source(limit) {
-            // Faithful verbatim copy carrying the source's own flags (no
-            // re-sort / re-consolidate) — exactly `drain_chunk`'s prior
-            // fast-path behavior. Every drain caller opens over
-            // `Table`, whose single `Batch` sources are always
-            // sorted + consolidated, so the propagated flags are `true`.
-            return (batch.count > 0).then_some(batch);
+        if let Some(batch) = self.drain_single_source(max_rows) {
+            return Some(batch);
         }
-        let mut merge_order = DrainGuard::new();
-        self.drain_sorted_into(limit, &mut merge_order);
-        if merge_order.is_empty() {
-            return None;
-        }
-        // After the early-outs, so the sum costs nothing on paths that skip it.
-        let blob_cap = match limit {
-            Drain::All => self.total_blob_len(),
-            Drain::Rows(_) => 0,
-        };
-        let mut batch = write_to_batch(&self.schema, merge_order.len(), blob_cap, |writer| {
-            self.scatter_drained_into(&merge_order, writer)
+        // Read before the drain, which shrinks `estimated_length`. The proration's
+        // denominator is the whole source set, so the per-row density it implies
+        // stays constant across a chunked drain (pinned by
+        // `drain_chunk_blob_reservation_stays_o_chunk`).
+        let rows_ahead = self.estimated_length();
+        let src_rows: usize = self.sources.iter().map(Run::count).sum();
+        let blob_cap = prorated_blob_cap(self.total_blob_len(), src_rows, max_rows.min(rows_ahead));
+
+        let mut order = std::mem::take(&mut self.merge_order);
+        self.drain_sorted_into(max_rows, rows_ahead, &mut order);
+        let drained = (!order.is_empty()).then(|| {
+            let mut cols = Vec::new();
+            let unified: Vec<_> = self
+                .sources
+                .iter()
+                .map(|s| s.to_unified(&self.schema, &mut cols))
+                .collect();
+            let mut batch = write_to_batch(&self.schema, order.len(), blob_cap, |writer| {
+                scatter_unified_sources(&unified, &cols, &order, writer);
+            });
+            // The merge walk emits in (PK, payload) order with consolidated
+            // weights; `write_to_batch` returns `Raw`, so certify `Consolidated`.
+            batch.certify_layout(Layout::Consolidated, &self.schema);
+            batch
         });
-        // The merge walk emits in (PK, payload) order with consolidated weights;
-        // `write_to_batch` returns `Raw`, so certify `Consolidated`.
-        batch.certify_layout(Layout::Consolidated, &self.schema);
-        Some(batch)
+        self.merge_order = order;
+        drained
     }
 
     /// Materialize all non-zero-weight rows in merge order into an owned
@@ -197,56 +117,34 @@ impl ReadCursor {
                 }
             }
         }
-        self.drain_to_batch(Drain::All)
+        self.drain_chunk(usize::MAX)
             .map(Rc::new)
             .unwrap_or_else(|| Rc::new(Batch::empty_with_schema(&self.schema)))
-    }
-
-    /// Drain up to `max_rows` net rows in merge order into an owned `Batch`
-    /// (sorted + consolidated, like `materialize`). Returns `None` once the
-    /// cursor is exhausted. Chunk boundaries cannot split a (PK, payload)
-    /// group: each drained entry is one fully-folded merge group.
-    ///
-    /// DDL backfills and uniqueness scans call this in a loop instead of
-    /// `materialize` so peak memory is O(chunk) instead of O(relation).
-    ///
-    /// A zero-row chunk drains nothing, so the count keeps its plain `usize`
-    /// meaning here.
-    pub fn drain_chunk(&mut self, max_rows: usize) -> Option<Batch> {
-        self.drain_to_batch(Drain::Rows(NonZeroUsize::new(max_rows)?))
     }
 
     /// Bulk-drain a cursor with exactly one live source into a Batch, bypassing
     /// per-row iteration. Returns `None` when two or more sources can still
     /// contribute, signaling the caller to fall back to row-at-a-time.
     ///
-    /// Keys on `SourceMode::Single(i)`, not on `sources.len() == 1`: the other
-    /// sources have an empty `[position, count)` window, so nothing they hold can
-    /// fold against the drained rows — which is the precondition this bulk copy
-    /// actually needs.
-    pub(super) fn drain_single_source(&mut self, limit: Drain) -> Option<Batch> {
-        let SourceMode::Single(i) = self.mode else {
-            return None;
-        };
-        if !self.valid {
-            return None;
-        }
-        // The undrained window starts at the committed row: the drive that
+    /// Keys on the drive mode, not on `sources.len() == 1`: every other source's
+    /// window is empty, which is the precondition this bulk copy actually needs.
+    /// Never empty — `max_rows >= 1` and the committed row is still undrained.
+    pub(super) fn drain_single_source(&mut self, max_rows: usize) -> Option<Batch> {
+        let i = self.mode?;
+        // The undrained window starts at the committed row: the advance that
         // emitted it already stepped `position` past it.
         let start = self.current_row;
         let remaining = self.states[i].count - start;
-        let row_count = remaining.min(limit.max_rows());
+        let row_count = remaining.min(max_rows);
         let schema = &self.schema;
 
         // A verbatim slice copy — neither sorts nor consolidates — so it carries
-        // whatever the backing can claim. (In practice every cursor-source batch
-        // is already consolidated; see the note in `drain_to_batch`. This helper
-        // relies on neither.)
+        // whatever the backing can claim.
         let batch = self.sources[i].slice_to_owned_batch(start, row_count, schema);
 
         // Advance position past the drained rows
         self.states[i].position = start + row_count;
-        self.drive();
+        self.advance();
         Some(batch)
     }
 
@@ -257,58 +155,74 @@ impl ReadCursor {
         self.sources.iter().map(|s| s.blob().len()).sum()
     }
 
-    /// Walk the merge order and fill `out` with `(entry_idx, row_idx, weight)`
-    /// for every row whose net consolidated weight is non-zero, as far as
-    /// `limit` allows.  Clears `out` first.
-    ///
-    /// The buffered weight is the **net** weight produced by the merge —
-    /// callers must not read it back from the exemplar source's stored weight,
-    /// which is the per-source contribution and may not equal the net.
-    /// Callers needing custom termination (group-bounded iteration, predicate
-    /// filters) collect into a local `Vec` instead — this helper only supports
-    /// row-count and full-cursor termination.
-    fn drain_sorted_into(&mut self, limit: Drain, out: &mut Vec<(u32, u32, i64)>) {
-        with_payload_cmp!(self.schema, Self::drain_sorted_into_with, self, limit, out);
+    /// Fill `out` with `(entry_idx, row_idx, net_weight)` for up to `max_rows`
+    /// merge groups, clearing it first; `rows_ahead` pre-sizes it. The weight is
+    /// the merge's **net**, not the exemplar source's stored contribution. On
+    /// return `current_*` holds the first undrained group, or the cursor is
+    /// invalid.
+    fn drain_sorted_into(&mut self, max_rows: usize, rows_ahead: usize, out: &mut Vec<(u32, u32, i64)>) {
+        with_payload_cmp!(
+            self.schema,
+            Self::drain_sorted_into_with,
+            self,
+            max_rows,
+            rows_ahead,
+            out
+        );
     }
 
+    /// One `drive_merge` for the whole chunk: re-entering it per emitted group
+    /// rebuilt three comparator closures each time, ~39 instructions per row.
     #[inline]
-    fn drain_sorted_into_with<RowCmp: RowComparator>(
+    fn drain_sorted_into_with<RowCmp: RowComparator<Run>>(
         &mut self,
-        limit: Drain,
+        max_rows: usize,
+        rows_ahead: usize,
         out: &mut Vec<(u32, u32, i64)>,
         row_cmp: RowCmp,
     ) {
         out.clear();
-        let cap = limit.max_rows();
-        let mut count = 0usize;
-        while self.valid {
-            if count >= cap {
-                break;
-            }
-            let w = self.current_weight;
-            if w != 0 {
-                // src_idx is u32 because partitioned-table cursors can exceed
-                // 256 entries; a u8 cast would wrap silently.
-                out.push((self.current_entry_idx as u32, self.current_row as u32, w));
-                count += 1;
-            }
-            self.drive_with(row_cmp);
-        }
-    }
+        out.reserve(max_rows.min(rows_ahead));
+        // The committed row is an earlier drive's, not yet drained — and
+        // `drive_merge` emits only non-zero groups, so it needs no weight gate.
+        // `u32` because a partitioned-table cursor can exceed 256 entries.
+        out.push((
+            self.current_entry_idx as u32,
+            self.current_row as u32,
+            self.current_weight,
+        ));
 
-    pub(crate) fn scatter_drained_into(&self, rows: &[(u32, u32, i64)], writer: &mut DirectWriter<'_>) {
-        if rows.is_empty() {
-            return;
-        }
-        let (unified, cols) = self.unified_sources.get_or_init(|| {
-            let mut cols = Vec::new();
-            let views = self
-                .sources
-                .iter()
-                .map(|s| s.to_unified(&self.schema, &mut cols))
-                .collect();
-            (views, cols)
-        });
-        scatter_unified_sources(unified, cols, rows, writer);
+        let ReadCursor {
+            tree,
+            sources,
+            states,
+            schema,
+            any_skeleton,
+            ..
+        } = &mut *self;
+        let coarsen = *any_skeleton;
+        // The group that did not fit, which the next drain resumes from.
+        let mut last: Option<(usize, usize, i64)> = None;
+        drive_merge(
+            tree,
+            merge::merge_less(schema, sources, row_cmp, coarsen),
+            |src| {
+                states[src].advance();
+                states[src].is_valid().then(|| states[src].position as u32)
+            },
+            merge::merge_same_pk(sources),
+            merge::merge_eq_payload(schema, sources, row_cmp, coarsen),
+            |src, row| sources[src].get_weight(row),
+            |gs, gr, nw| {
+                if out.len() == max_rows {
+                    last = Some((gs, gr, nw));
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    out.push((gs as u32, gr as u32, nw));
+                    std::ops::ControlFlow::Continue(())
+                }
+            },
+        );
+        self.commit_emitted(last);
     }
 }

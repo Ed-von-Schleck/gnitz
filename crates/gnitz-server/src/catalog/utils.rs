@@ -100,8 +100,9 @@ pub(in crate::catalog) fn circuit_opk(
 
 /// Emit a weight=−1 batch of the live rows of `table` at `ids`; an id with no
 /// live row contributes nothing, so a one-element list is the "retract this row,
-/// or return an empty batch" case. Takes `ids` by value and sorts them, because
-/// the whole list rides one forward-only cursor.
+/// or return an empty batch" case. Takes `ids` by value and sorts and dedups
+/// them, because the whole list rides one forward-only cursor: strictly ascending
+/// is what lets an id with no live row be settled without repositioning.
 pub(in crate::catalog) fn retract_pk_list(table: &Table, schema: &SchemaDescriptor, mut ids: Vec<u128>) -> Batch {
     ids.sort_unstable();
     ids.dedup();
@@ -113,7 +114,8 @@ pub(in crate::catalog) fn retract_pk_list(table: &Table, schema: &SchemaDescript
     let mut cursor = table.open_cursor_in_range(lo.pk_bytes(), Some(hi.pk_bytes()));
     for pk in ids {
         let key = sys_opk(schema, pk);
-        if cursor.advance_to_exact_live(key.pk_bytes()) {
+        // The weight gate rejects a tombstone an uncompacted source still holds.
+        if cursor.seek_pk_group_ascending(key.pk_bytes()) && cursor.current_weight > 0 {
             cursor.copy_current_row_into(&mut batch, -1);
         }
     }

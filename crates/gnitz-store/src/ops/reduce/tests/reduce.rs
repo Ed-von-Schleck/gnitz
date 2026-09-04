@@ -5976,17 +5976,13 @@ fn reduce_multi_avi_global_emptied() {
 }
 
 // ===========================================================================
-// Monotone trace_out probe for canonical single-column group keys.
+// The ascending trace_out probe, over every group-key arm.
 //
-// A canonical single-column GROUP BY — a single PK sub-column (Pk arm) or a
-// single non-nullable routable-int payload column (Payload arm) — visits
-// groups in ascending output-PK order, so `op_reduce` upgrades its `trace_out`
-// retraction probe from the absolute `seek_bytes` to the galloping
-// `advance_to`. These tests drive that path across multi-epoch retraction
-// (incl. sign-flip boundaries), confirm a nullable group key stays on the
-// absolute seek (hash arm), force `SourceMode::Multi` so the multi-source
-// gallop and the debug ascending tripwire run at scale, and pin the shared
-// classifier directly.
+// `op_reduce` visits groups in ascending output-PK order on every arm, which is
+// what its one retraction probe, `seek_pk_group_ascending`, is sound under. These
+// tests drive it across multi-epoch retraction (incl. sign-flip boundaries) and
+// over the nullable/hash arm, force a multi-source trace cursor so the merge-mode
+// gallop and the ascending tripwire run at scale, and pin the classifier.
 // ===========================================================================
 
 /// One input row over a `[U64 pk, <grp>, I64 val]` schema: `(pk, grp, val,
@@ -6051,7 +6047,7 @@ fn sum_count_reference<'a>(
 /// integrating each epoch's output delta back into the trace (flushed once
 /// after epoch 0 when `flush_after_first`). Returns the final consolidated
 /// trace_out batch and the maximum source count any epoch's probe cursor was
-/// built from, so a caller can assert `SourceMode::Multi` (≥ 3 sources, all live at open) was
+/// built from, so a caller can assert the cursor's merge mode (≥ 3 sources, all live at open) was
 /// exercised.
 fn run_reduce_trace_epochs(
     dir: &std::path::Path,
@@ -6103,7 +6099,7 @@ fn readback_synthetic_i64(batch: &Batch) -> std::collections::BTreeMap<Option<i6
 
 // Payload I64 group key, multi-epoch retraction across the sign flip. GROUP BY
 // a non-nullable I64 payload column ⇒ canonical Payload-arm key + synthetic
-// U128 output PK ⇒ the monotone `advance_to` probe. Epoch 1 inserts every
+// U128 output PK. Epoch 1 inserts every
 // group; epoch 2 updates and deletes rows in several groups (including the
 // negative ones), so the retraction probe galloping over sign-flipped output
 // PKs must land on the exact old aggregate row.
@@ -6160,8 +6156,8 @@ fn reduce_monotone_probe_payload_i64_group() {
 
 // Payload U64 group key — the unsigned arm. A non-nullable U64 payload column is
 // natural-PK-eligible, so the output PK IS the group value (stride 8) and the
-// key is Payload-arm canonical ⇒ monotone `advance_to`. Groups straddle the high
-// byte (1 vs 256) so a byte-order slip in the gallop would misorder them.
+// key is Payload-arm canonical. Groups straddle the high byte (1 vs 256) so a
+// byte-order slip in the gallop would misorder them.
 #[test]
 fn reduce_monotone_probe_payload_u64_group() {
     let in_schema = SchemaDescriptor::new(
@@ -6226,12 +6222,12 @@ fn reduce_monotone_probe_payload_u64_group() {
     );
 }
 
-// A nullable group column takes the hash arm, so the classifier returns None,
-// the probe stays on the absolute `seek_bytes`, and the ascending tripwire
-// never fires. Same retraction workload plus a NULL group (its own group);
+// A nullable group column takes the hash arm, so the classifier returns None —
+// but the visit order still ascends, which is what lets the one retraction probe
+// serve every arm. Same retraction workload plus a NULL group (its own group);
 // results must still match the from-scratch reference.
 #[test]
-fn reduce_nullable_group_stays_absolute_seek() {
+fn reduce_nullable_group_takes_the_hash_arm() {
     let in_schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
@@ -6307,7 +6303,7 @@ fn single_col_canonical_group_key_predicate() {
 // Many groups per epoch over ≥ 3 trace_out sources. 200 groups spanning the sign
 // flip (-100..99), six epochs each touching every group (insert / update /
 // delete). One flush after epoch 0 plus accumulating memtable runs pushes the
-// trace_out cursor to `SourceMode::Multi` (≥ 3 sources, all live at open) from epoch 3 on, so the
+// trace_out cursor into merge mode (≥ 3 sources, all live at open) from epoch 3 on, so the
 // multi-source gallop (`seek_forward_multi`) and the debug ascending tripwire
 // both execute across hundreds of monotone probes. Construction makes every
 // group's final aggregate identical (SUM=10, COUNT=3), so any mis-landed
@@ -6357,7 +6353,7 @@ fn reduce_monotone_probe_many_groups_multi_source() {
 
     assert!(
         max_sources >= 3,
-        "trace_out probe must reach SourceMode::Multi (≥ 3 sources, all live at open); saw {max_sources}",
+        "trace_out probe must reach merge mode (≥ 3 sources, all live at open); saw {max_sources}",
     );
     assert_eq!(
         final_batch.count,

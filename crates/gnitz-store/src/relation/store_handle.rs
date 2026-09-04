@@ -107,8 +107,10 @@ impl StoreHandle {
         }
     }
 
-    /// Whether a read of this store can meet a skeleton row it has to hydrate.
-    /// A detached relation reads empty, so it never can.
+    /// Whether this store actually holds a skeleton row. Every read path branches
+    /// on this rather than on `capacity_bytes`, so a bounded view under its cap
+    /// keeps the ordinary cached/bulk paths and the branch cannot disagree with
+    /// what the sweep did. A detached relation reads empty, so it never can.
     pub(crate) fn has_skeleton_rows(&self) -> bool {
         self.as_owned().is_some_and(Table::has_skeleton_rows)
     }

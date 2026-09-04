@@ -208,8 +208,9 @@ fn absent_pk_mid_chunk_does_not_truncate_the_gather() {
     let victim_key = gnitz_store::schema::key::opk_key(&schema, &(victim as u128).to_le_bytes());
     let probe_entry = engine.registry().table_entry(tid).unwrap();
     let mut probe = probe_entry.open_cursor();
+    probe.seek_bytes(victim_key.pk_bytes());
     assert!(
-        !probe.advance_to_exact_live(victim_key.pk_bytes()),
+        !(probe.valid && probe.current_pk_eq(victim_key.pk_bytes()) && probe.current_weight > 0),
         "the store must hold no live row at the victim's key"
     );
     drop(probe);

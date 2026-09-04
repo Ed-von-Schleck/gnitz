@@ -336,16 +336,6 @@ impl TableEntry {
         self.handle.full_scan(&self.schema)
     }
 
-    /// Whether reads of this relation must go through hydration — i.e. whether its
-    /// store actually holds a skeleton row. This, not `capacity_bytes`, is what
-    /// every read path branches on: a bounded view under its cap has dehydrated
-    /// nothing and reads exactly like an unbounded one, so it keeps the ordinary
-    /// cached/bulk read paths, and the branch cannot disagree with what the
-    /// capacity sweep did.
-    pub(crate) fn needs_hydration(&self) -> bool {
-        self.handle.has_skeleton_rows()
-    }
-
     /// The index circuit covering exactly `cols`, if one exists. The circuit
     /// list is deduped by ordered column list, so at most one entry matches.
     pub fn index_circuit_on(&self, cols: &[u32]) -> Option<&IndexCircuitEntry> {

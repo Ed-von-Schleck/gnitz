@@ -180,7 +180,7 @@ fn dehydrated_fixture(name: &str, on_disk: std::ops::Range<u64>, in_ram: std::op
     ingest(&mut registry, on_disk);
     registry.flush_ephemeral_outputs(1).unwrap();
     assert!(
-        registry.table_entry(TID).unwrap().needs_hydration(),
+        registry.table_entry(TID).unwrap().handle.has_skeleton_rows(),
         "premise: the capacity sweep must have dehydrated the flushed shard",
     );
     ingest(&mut registry, in_ram);

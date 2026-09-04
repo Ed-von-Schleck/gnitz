@@ -8,8 +8,7 @@
 //! cargo test -p gnitz-store --release _bench -- --ignored --nocapture --test-threads=1
 //! ```
 
-use super::output::Drain;
-use super::tests::write_test_shard;
+use super::tests::{adv_assert_cursor_oracle, adv_key, write_test_shard};
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::Layout;
@@ -22,7 +21,7 @@ use std::rc::Rc;
 /// exceed `SHORT_STRING_THRESHOLD` so they live in the blob heap and the drain's
 /// German-string blob relocation on the scatter path is exercised; the nullable
 /// I64 column is NULL on a subset. Drains a 4-source `ReadCursor` via
-/// `drain_to_batch`, pinning the loser-tree merge + scatter over mmap'd shards.
+/// `drain_chunk`, pinning the loser-tree merge + scatter over mmap'd shards.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn shard_merge_scan_bench() {
@@ -80,14 +79,14 @@ fn shard_merge_scan_bench() {
     // warm-up drain faults in the cold PK/payload pages (lazy mmap, no
     // MAP_POPULATE) so the timed region reflects merge/scatter compute.
     let mut c = create_read_cursor(&[], &shards, schema);
-    std::hint::black_box(c.drain_to_batch(Drain::All));
+    std::hint::black_box(c.drain_chunk(usize::MAX));
 
     const ITERS: usize = 10;
     let mut sink = 0usize;
     let t = Instant::now();
     for _ in 0..ITERS {
         c.rewind();
-        let out = c.drain_to_batch(Drain::All).expect("non-empty drain");
+        let out = c.drain_chunk(usize::MAX).expect("non-empty drain");
         sink = sink.wrapping_add(out.count);
         std::hint::black_box(&out);
     }
@@ -98,13 +97,9 @@ fn shard_merge_scan_bench() {
 }
 
 /// Baseline: shard PK point-probe throughput. One 1M-row shard (U64 PK, single
-/// I64 payload). 100K `advance_to_exact_live` probes over present keys in
-/// ascending order (the exact-hit lower-bound / monotone-sweep path) plus 100K
-/// shuffled `seek_bytes` probes drawn ~50/50 from present keys and absent keys
-/// (odd keys landing *between* the sparse even shard keys → lower-bound
-/// resolution). Both APIs run a raw-`memcmp` binary-search/gallop over the PK
-/// region — they do not consult the PK filter — so this pins the
-/// gallop/binary-search cost.
+/// I64 payload), 100K shuffled `seek_bytes` probes ~50/50 present / absent (odd
+/// keys landing between the sparse even shard keys). The only *timed* coverage of
+/// the stateless search — every other cursor bench seeds at a live position.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn shard_point_probe_bench() {
@@ -119,10 +114,6 @@ fn shard_point_probe_bench() {
     // two present keys. Construction + open outside the timed region.
     let rows: Vec<(u128, i64, i64)> = (0..N).map(|i| ((i * 2) as u128, 1, i as i64)).collect();
     let shard = write_test_shard(&dir, &schema, 0, &rows);
-
-    // Evenly-spaced ascending present keys for the monotone advance sweep.
-    let step = (N / PROBES as u64).max(1);
-    let asc_keys: Vec<[u8; 8]> = (0..PROBES as u64).map(|j| (j * step * 2).to_be_bytes()).collect();
 
     // Shuffled 50/50 present (even) / absent (odd, between keys) probes.
     let mut rng = crate::test_rng::Rng::new(0xC0DE_1234_5678_9ABC);
@@ -139,41 +130,25 @@ fn shard_point_probe_bench() {
 
     let mut c = create_read_cursor(&[], std::slice::from_ref(&shard), schema);
 
-    // Untimed warm-up: one full ascending sweep faults in the PK pages.
-    for k in &asc_keys {
-        std::hint::black_box(c.advance_to_exact_live(k));
+    // Untimed warm-up: one full sweep faults in the PK pages.
+    for k in &seek_keys {
+        c.seek_bytes(k);
+        std::hint::black_box(c.valid);
     }
 
-    // Timed: advance_to_exact_live monotone forward sweep over present keys.
-    c.rewind();
-    let mut hits = 0usize;
-    let t1 = Instant::now();
-    for k in &asc_keys {
-        if std::hint::black_box(c.advance_to_exact_live(k)) {
-            hits += 1;
-        }
-    }
-    let s1 = t1.elapsed().as_secs_f64();
-    std::hint::black_box(hits);
-    println!(
-        "point_probe advance_to_exact_live: {PROBES} probes in {s1:.4}s = {:.0} probes/s ({hits} hits)",
-        PROBES as f64 / s1
-    );
-
-    // Timed: seek_bytes shuffled present/absent probes (absolute seeks).
     let mut sink = 0u64;
-    let t2 = Instant::now();
+    let t = Instant::now();
     for k in &seek_keys {
         c.seek_bytes(k);
         if c.valid {
             sink = sink.wrapping_add(c.current_key_narrow() as u64);
         }
     }
-    let s2 = t2.elapsed().as_secs_f64();
+    let secs = t.elapsed().as_secs_f64();
     std::hint::black_box(sink);
     println!(
-        "point_probe seek_bytes: {PROBES} probes in {s2:.4}s = {:.0} probes/s",
-        PROBES as f64 / s2
+        "point_probe seek_bytes: {PROBES} probes in {secs:.4}s = {:.0} probes/s",
+        PROBES as f64 / secs
     );
 }
 
@@ -299,19 +274,6 @@ fn adv_schema_u64_u32_u8() -> SchemaDescriptor {
         ],
         &[0, 1, 2],
     )
-}
-
-/// OPK bytes for bench key `n` at `stride`: `n`'s big-endian image right-aligned
-/// into `stride` bytes (leading bytes zero). For a single-column U64/U128 PK this
-/// is the column's OPK; for a compound all-`U64` PK it equals the concat-OPK with
-/// a zero leading prefix and `n` in the trailing column — monotone in `n` (so the
-/// gallop hint only moves forward), and every probe forces the full-width decode
-/// and compare of the stride's dispatch arm before the boundary is decided.
-#[inline]
-fn adv_key(n: u64, stride: usize) -> [u8; 40] {
-    let mut k = [0u8; 40];
-    k[stride - 8..stride].copy_from_slice(&n.to_be_bytes());
-    k
 }
 
 /// Timed-probe budget per (driver, tier): enough for a stable `ns/probe`. Point
@@ -448,7 +410,7 @@ fn adv_write_shard_rows(
     adv_write_shard(dir, schema, name, &pks, &weights, &vals)
 }
 
-/// `Multi` fixture: one in-RAM delta batch + `k` shards, keys interleaved over
+/// Merge-mode fixture: one in-RAM delta batch + `k` shards, keys interleaved over
 /// `k + 1` sources (source 0 = delta), so every source overlaps the others. Each
 /// key gets a base `+1` in its home source; a `retract_step`-th key also gets a
 /// canceling `-1` at the SAME payload in its neighbour (a net-zero cross-source
@@ -491,35 +453,27 @@ fn adv_build_multi_fixture(
     (delta, shards)
 }
 
-/// Off-clock oracle: a monotone (or any-order) `advance_to` sweep on a reused
-/// cursor lands exactly where a from-scratch `seek_bytes` on a fresh cursor would
-/// — same validity, PK bytes, and net weight (the last pins cross-source ghost
-/// folding). `mk` rebuilds a fresh cursor over the same sources.
-fn adv_assert_cursor_oracle(mk: impl Fn() -> ReadCursor, stride: usize, keys: &[u64]) {
-    let mut adv = mk();
-    for &v in keys {
-        let k = adv_key(v, stride);
-        adv.advance_to(&k[..stride]);
-        let mut fresh = mk();
-        fresh.seek_bytes(&k[..stride]);
-        assert_eq!(adv.valid, fresh.valid, "advance_to oracle valid v={v}");
-        if adv.valid {
-            assert_eq!(
-                adv.current_pk_bytes(),
-                fresh.current_pk_bytes(),
-                "advance_to oracle pk v={v}"
-            );
-            assert_eq!(
-                adv.current_weight, fresh.current_weight,
-                "advance_to oracle weight v={v}"
-            );
-        }
+/// Off-clock oracle: the galloped landing equals the stateless lower bound at both
+/// a cold and a live seed, and both equal `r` since row `r` holds key `r`.
+/// Independent of gap and pattern, so it runs once per fixture.
+fn adv_assert_leaf_oracle(
+    count: usize,
+    stride: usize,
+    advance: impl Fn(&[u8], usize) -> usize,
+    lower_bound: impl Fn(&[u8]) -> usize,
+) {
+    let mut r = count / 33;
+    while r < count {
+        let k = adv_key(r as u64, stride);
+        assert_eq!(advance(&k[..stride], 0), r, "leaf oracle hint=0 r={r}");
+        assert_eq!(advance(&k[..stride], r), r, "leaf oracle hint=live r={r}");
+        assert_eq!(lower_bound(&k[..stride]), r, "leaf lower_bound r={r}");
+        r += count / 33;
     }
 }
 
 /// Time one leaf-gallop corner (Bench 1). `advance(key, hint)` is
-/// `Batch`/`MappedShard::advance_to`; `lower_bound(key)` is the stateless
-/// `find_lower_bound_bytes` oracle. `monotone` threads the returned index back as
+/// `Batch`/`MappedShard::advance_to`. `monotone` threads the returned index back as
 /// the next hint (the `CursorState::advance_to` skip pattern); `!monotone` passes
 /// `hint = 0` every probe (the full `O(log N)` point-lookup worst case). Cold
 /// flushes the cache before each sweep and times only the sweep (not the flush).
@@ -532,21 +486,8 @@ fn adv_time_leaf(
     tier: Tier,
     scratch: &mut [u8],
     advance: impl Fn(&[u8], usize) -> usize,
-    lower_bound: impl Fn(&[u8]) -> usize,
 ) -> f64 {
     use std::time::{Duration, Instant};
-
-    // Oracle (off-clock): the galloped landing equals the stateless lower bound at
-    // both a cold (hint = 0) and a live (hint = row) seed, and both equal `r` since
-    // row `r` holds key `r`.
-    let mut r = count / 33;
-    while r < count {
-        let k = adv_key(r as u64, stride);
-        assert_eq!(advance(&k[..stride], 0), r, "leaf oracle hint=0 r={r}");
-        assert_eq!(advance(&k[..stride], r), r, "leaf oracle hint=live r={r}");
-        assert_eq!(lower_bound(&k[..stride]), r, "leaf lower_bound r={r}");
-        r += count / 33;
-    }
 
     let target = adv_target(monotone, tier);
     let mut elapsed = Duration::ZERO;
@@ -590,7 +531,7 @@ fn adv_time_leaf(
     elapsed.as_nanos() as f64 / done as f64
 }
 
-/// Time one `Multi`-cursor `seek_phase` corner (Bench 2): a monotone ascending
+/// Time one merge-mode `seek_phase` corner (Bench 2): a monotone ascending
 /// probe sweep at mean gap `gap`. `rewind` between *sweeps* only (never between
 /// probes — that would restart every gallop from 0 and measure re-galloping, not
 /// the monotone skip). Cold flushes between sweeps and times only the sweep.
@@ -698,11 +639,10 @@ fn adv_time_cursor_sweep(
     elapsed.as_nanos() as f64 / done as f64
 }
 
-/// Time the `Multi` `key == current_pk` rebuild path (Bench 3, arm B): each probe
-/// re-seeks the current PK, which is NOT strictly-forward, so `advance_to` takes
-/// the from-scratch loser-tree rebuild (its two `Vec` allocations) rather than
-/// `seek_phase`. Stationary by design — the leaf resolves in `O(1)`, isolating the
-/// rebuild/alloc cost. Alloc/CPU-bound, so hot and cold read alike.
+/// Time the merge mode's `key == current_pk` replay path (Bench 3, arm B): the
+/// probe is not strictly-forward, so `advance_to` replays the tournament instead
+/// of galloping it. Stationary, so the leaf resolves in `O(1)` and only the
+/// replay's `O(n)` compares are left. It allocates nothing — hot and cold alike.
 fn adv_time_cursor_stationary(c: &mut ReadCursor, tier: Tier, scratch: &mut [u8]) -> f64 {
     use std::time::Instant;
     let iters = if matches!(tier, Tier::Hot) {
@@ -758,30 +698,28 @@ fn advance_to_leaf_gallop_bench() {
             let shards = adv_build_interleaved_shards(&dir, &schema, &format!("b1_{}_{stride}", tier.tag()), count, 1);
             let shard = &shards[0];
             let batch = adv_build_batch_dense(schema, count);
+            adv_assert_leaf_oracle(
+                count,
+                stride,
+                |k, h| shard.advance_to(k, h),
+                |k| shard.find_lower_bound_bytes(k),
+            );
+            adv_assert_leaf_oracle(
+                count,
+                stride,
+                |k, h| batch.advance_to(k, h),
+                |k| batch.find_lower_bound_bytes(k),
+            );
 
             for &gap in &ADV_GAPS {
                 for &monotone in &[true, false] {
                     let pat = if monotone { "monotone" } else { "point" };
-                    let ns_s = adv_time_leaf(
-                        count,
-                        stride,
-                        gap,
-                        monotone,
-                        tier,
-                        &mut scratch,
-                        |k, h| shard.advance_to(k, h),
-                        |k| shard.find_lower_bound_bytes(k),
-                    );
-                    let ns_b = adv_time_leaf(
-                        count,
-                        stride,
-                        gap,
-                        monotone,
-                        tier,
-                        &mut scratch,
-                        |k, h| batch.advance_to(k, h),
-                        |k| batch.find_lower_bound_bytes(k),
-                    );
+                    let ns_s = adv_time_leaf(count, stride, gap, monotone, tier, &mut scratch, |k, h| {
+                        shard.advance_to(k, h)
+                    });
+                    let ns_b = adv_time_leaf(count, stride, gap, monotone, tier, &mut scratch, |k, h| {
+                        batch.advance_to(k, h)
+                    });
                     println!(
                         "leaf {:>4} shard stride={stride:>2} gap={gap:>4} {pat:>8}: {ns_s:7.1} ns/probe  {:>11.0} probes/s",
                         tier.tag(),
@@ -799,7 +737,7 @@ fn advance_to_leaf_gallop_bench() {
 }
 
 /// Bench 2 — the merge fast path (`ReadCursor::advance_to` → `seek_phase`), the
-/// exact reduce/distinct/join trace-probe shape. A `Multi` cursor (delta batch +
+/// exact reduce/distinct/join trace-probe shape. A merge-mode cursor (delta batch +
 /// `K` overlapping shards, with cross-shard duplicate PKs at differing payloads
 /// and a swept fraction of canceling weights) is driven by a monotone ascending
 /// probe sweep. Sweeping `K` separates the leaf-gallop cost from the `Θ(log K)`
@@ -821,10 +759,7 @@ fn read_cursor_advance_to_multi_bench() {
                     let name = format!("b2_{}_{stride}_{k}_{retract_step}", tier.tag());
                     let (delta, shards) = adv_build_multi_fixture(&dir, &schema, &name, total, k, retract_step);
                     let mut c = create_read_cursor(std::slice::from_ref(&delta), &shards, schema);
-                    assert!(
-                        matches!(c.mode, SourceMode::Multi),
-                        "bench must drive the Multi fast path (k={k})"
-                    );
+                    assert!(c.mode.is_none(), "bench must drive the merge fast path (k={k})");
 
                     // Oracle (off-clock): ascending sample matches from-scratch seeks.
                     let sample: Vec<u64> = (1..=16).map(|i| (i * total / 17) as u64).collect();
@@ -850,11 +785,10 @@ fn read_cursor_advance_to_multi_bench() {
 
 /// Bench 3 — the slow path the fast path avoids, each arm mapped to a real caller.
 /// `fwd-single`/`fwd-pair`: the absolute-reposition drive a low-run / freshly-
-/// compacted table takes. `eq-multi`: the `key == current_pk` loser-tree rebuild,
-/// which reuses both buffers and allocates nothing. `bwd-single`: the bounded-backward `[0, hint)` leaf
-/// gallop — the range-join `Lt/Le, n_eq==0` reset that re-seeks to the minimum
-/// every row. A first-class guardrail: a fast-path win must not silently regress
-/// these.
+/// compacted table takes. `eq-multi`: the `key == current_pk` tournament replay.
+/// `bwd-single`: the bounded-backward `[0, hint)` leaf gallop — the range join's
+/// per-group reset, which at `eq_size > 0` seeks to a cut that can sort below the
+/// cursor. A guardrail: a fast-path win must not silently regress these.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
 fn read_cursor_advance_to_rebuild_bench() {
@@ -874,7 +808,7 @@ fn read_cursor_advance_to_rebuild_bench() {
 
             {
                 let mut c = create_read_cursor(&[], &single, schema);
-                assert!(matches!(c.mode, SourceMode::Single(_)));
+                assert!(c.mode.is_some());
                 adv_assert_cursor_oracle(|| create_read_cursor(&[], &single, schema), stride, &sample);
                 let ns = adv_time_cursor_sweep(&mut c, stride, count, 128, true, tier, &mut scratch);
                 println!(
@@ -884,7 +818,7 @@ fn read_cursor_advance_to_rebuild_bench() {
             }
             {
                 let mut c = create_read_cursor(&[], &pair, schema);
-                assert!(matches!(c.mode, SourceMode::Multi));
+                assert!(c.mode.is_none());
                 adv_assert_cursor_oracle(|| create_read_cursor(&[], &pair, schema), stride, &sample);
                 let ns = adv_time_cursor_sweep(&mut c, stride, count, 128, true, tier, &mut scratch);
                 println!(
@@ -894,7 +828,7 @@ fn read_cursor_advance_to_rebuild_bench() {
             }
             {
                 let mut c = create_read_cursor(&[], &multi, schema);
-                assert!(matches!(c.mode, SourceMode::Multi));
+                assert!(c.mode.is_none());
                 adv_assert_cursor_oracle(|| create_read_cursor(&[], &multi, schema), stride, &sample);
                 let ns = adv_time_cursor_stationary(&mut c, tier, &mut scratch);
                 println!(

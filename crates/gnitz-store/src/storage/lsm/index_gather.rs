@@ -13,7 +13,6 @@
 
 use super::batch::{Batch, Layout};
 use super::read_cursor::{PkSetGather, ReadCursor};
-use crate::schema::key::PkBuf;
 use crate::schema::IndexKeySpec;
 use crate::storage::spill::sort_indices;
 
@@ -49,23 +48,11 @@ pub struct BoundedIndexCursor {
 }
 
 impl BoundedIndexCursor {
-    /// Position `idx` at `start` and wrap the index cursor and the base cursor
-    /// for the walk over the half-open range `[start, end)` (`end = None` ⇒ to
-    /// the end of the index). The range is the cursor's from then on — no walk
-    /// re-checks it, per `ReadCursor::seek_range_bytes`. `spec` supplies
-    /// `key_size()`, the leading-key byte length where each entry's source-PK OPK
-    /// suffix starts. `pk_capacity` pre-sizes the per-chunk PK scratch in keys
-    /// (pass the measured range size capped at the chunk size, or 0 to grow).
-    pub(crate) fn new(
-        mut idx: ReadCursor,
-        src: ReadCursor,
-        start: PkBuf,
-        end: Option<PkBuf>,
-        spec: IndexKeySpec,
-        pk_capacity: usize,
-    ) -> Self {
-        idx.seek_range_bytes(start.pk_bytes(), end.as_ref().map(PkBuf::pk_bytes));
-        let stride = src.schema().pk_stride() as usize;
+    /// Wrap an index cursor its opener already range-seeked — that seek is the
+    /// only thing bounding the walk — plus the base cursor its entries resolve
+    /// against. `pk_capacity` pre-sizes the per-chunk PK scratch, in keys.
+    pub(crate) fn new(idx: ReadCursor, src: ReadCursor, spec: IndexKeySpec, pk_capacity: usize) -> Self {
+        let stride = src.schema.pk_stride() as usize;
         BoundedIndexCursor {
             idx,
             src,
@@ -83,7 +70,7 @@ impl BoundedIndexCursor {
     /// last, and `advance_to` is backward-capable via a binary search, so a chunk
     /// boundary costs O(log N) on the first probe — not a rescan.
     pub(crate) fn drain_chunk(&mut self, n: usize) -> Option<Batch> {
-        let stride = self.src.schema().pk_stride() as usize;
+        let stride = self.src.schema.pk_stride() as usize;
         self.pks.clear();
         let mut collected = 0;
         // `new` clamped the cursor at `end`, so exhaustion IS the range bound.
@@ -111,7 +98,7 @@ impl BoundedIndexCursor {
         sort_indices(&self.pks, stride, &mut self.order);
         // One live payload per PK (an index owner is always a base table), so the
         // collected count sizes the result exactly.
-        let mut batch = Batch::with_capacity(*self.src.schema(), collected);
+        let mut batch = Batch::with_capacity(self.src.schema, collected);
         // Skipping a record equal to its predecessor IS the dedup, so each PK
         // group is copied once, at its net `current_weight` (never a hardcoded 1,
         // so Z-Set multiplicity survives).
@@ -129,7 +116,7 @@ impl BoundedIndexCursor {
         // at sub-group granularity over strictly-ascending PKs, at nonzero net
         // weights. Certifying it spares the ingest tail an O(chunk log chunk)
         // re-sort, as the full-scan drain path does.
-        batch.certify_layout(Layout::Consolidated, self.src.schema());
+        batch.certify_layout(Layout::Consolidated, &self.src.schema);
         Some(batch)
     }
 }

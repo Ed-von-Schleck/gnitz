@@ -459,8 +459,8 @@ impl std::borrow::Borrow<[u8]> for PkBuf {
 // Byte-lexicographic (`memcmp`) order over `bytes[..len]` — identical to
 // `compare_pk_bytes`, the canonical PK comparator, and consistent with the
 // `Eq`/`Hash` impls above (which also read only `bytes[..len]`). This is the
-// order `seek_first_positive_with_prefix` / `walk_to_positive_with_prefix`
-// walk the index in, and the valid merge order for the unique pre-flight
+// order `seek_first_positive_with_prefix` walks the index in, and the valid
+// merge order for the unique pre-flight
 // k-way merge whose keys are OPK leading-key spans of any width.
 impl PartialOrd for PkBuf {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {

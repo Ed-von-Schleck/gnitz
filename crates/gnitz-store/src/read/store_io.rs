@@ -8,8 +8,9 @@ use std::rc::Rc;
 
 use super::SkeletonHydrator;
 use crate::relation::RelationRegistry;
-use crate::schema::{project_schema, SchemaDescriptor};
+use crate::schema::{project_schema, ColumnLocator, SchemaDescriptor};
 use crate::storage::{Batch, BoundedIndexCursor, ReadCursor, SourceCursor, StoreError};
+use gnitz_expr::RowSource;
 
 impl RelationRegistry {
     /// Scan all positive-weight rows from a relation. One registry lookup serves
@@ -25,7 +26,7 @@ impl RelationRegistry {
         // Asked of the store, not of a cursor: the non-hydrating answer is
         // `full_scan`'s cached `Rc` snapshot, and opening a cursor to ask
         // whether this walk meets a skeleton row would defeat that cache.
-        if entry.needs_hydration() {
+        if entry.handle.has_skeleton_rows() {
             let schema = entry.schema;
             let cursor = entry.open_cursor();
             // The hydrated scan is not cached: `full_scan`'s snapshot is
@@ -98,8 +99,9 @@ impl RelationRegistry {
             // from wherever the open left the cursor.
             Some(k) => {
                 for key in k.chunks_exact(stride) {
-                    cursor.seek_pk_group(key);
-                    cursor.for_each_pk_group_row(key, &mut visit);
+                    if cursor.seek_pk_group_ascending(key) {
+                        cursor.for_each_pk_group_row(key, &mut visit);
+                    }
                 }
             }
             None => cursor.for_each_row_while(|_| true, &mut visit),
@@ -174,6 +176,10 @@ impl RelationRegistry {
     /// requires that — it indexes the result by PK, so a second row of a group
     /// would overwrite the first rather than join it. The seek and `pk IN (…)`
     /// readers, whose consumers take whole groups, walk instead.
+    ///
+    /// Ascending is a producer guarantee: the master sorts before scattering and
+    /// `scatter::with_group` preserves per-worker order, which is what lets an
+    /// absent key — most of a broadcast list, at W workers — cost a comparison.
     pub fn gather_family_bytes<'k>(
         &self,
         table_id: i64,
@@ -188,16 +194,20 @@ impl RelationRegistry {
         // gather only a non-PK referenced column), which this rejects: a PK
         // `ref_col` would be skipped by `project_schema` and leave the reply
         // payload-less.
-        let ci = ref_col as usize;
-        let pi = schema.try_payload_idx(ci).expect("FK projection excludes PK columns");
-        let col_size = schema.columns[ci].size() as usize;
+        // Once, outside the loop: `locate`'s own doc rules out running it per row.
+        let loc = schema.locate(ref_col as usize);
+        assert!(
+            matches!(loc, ColumnLocator::Payload { .. }),
+            "FK projection excludes PK columns"
+        );
         // The master SCATTERS the key list, so `pks` is this worker's own sublist
         // and `pks.len()` is a tight bound, not a W× over-allocation.
         let mut out = Batch::with_capacity(result_schema, pks.len());
         let mut cursor = entry.open_cursor();
         for pk in pks {
-            if cursor.advance_to_exact_live(pk) {
-                copy_cursor_col_to_batch(&cursor, &mut out, ci, pi, col_size);
+            // The weight gate rejects a tombstone an uncompacted source holds.
+            if cursor.seek_pk_group_ascending(pk) && cursor.current_weight > 0 {
+                copy_cursor_col_to_batch(&cursor, &mut out, loc);
             }
         }
         Ok((out, result_schema))
@@ -308,9 +318,9 @@ impl RelationRegistry {
     /// cheaper. For a range matching M of N rows it costs an index walk of M, an
     /// M log M sort, and M galloping base probes, where a full scan is one
     /// sequential columnar drain of N — so it loses badly as M → N
-    /// (`WHERE indexed > 0` matches everything). M is not estimated:
-    /// `count_range_raw` measures it exactly in O(sources × log N) off the index
-    /// cursor already open, and repositions nothing. N comes from `estimated_rows` —
+    /// (`WHERE indexed > 0` matches everything). M is not estimated: positioning
+    /// the index cursor hands back an upper bound on it (raw entries, so a
+    /// cross-run duplicate counts twice) for free. N comes from `estimated_rows` —
     /// arithmetic over the children's run and shard counts — rather than a
     /// cursor's `estimated_length`, so the base cursor is never opened
     /// speculatively. M also sizes the walk's per-chunk PK scratch exactly,
@@ -339,8 +349,8 @@ impl RelationRegistry {
             Err(e) => return IndexScan::Decline(StoreError::rejected(e)),
         };
         let end_bytes = end.as_ref().map(|e| e.pk_bytes());
-        let idx = ic.open_cursor_in_range(start.pk_bytes(), end_bytes);
-        let matches = idx.count_range_raw(start.pk_bytes(), end_bytes);
+        let mut idx = ic.open_cursor_in_range(start.pk_bytes(), end_bytes);
+        let matches = idx.seek_range_bytes(start.pk_bytes(), end_bytes);
         if walk == IndexWalk::Optional {
             // Only user base tables own index circuits, so a resolved index
             // implies a base store unless this process detached it (the post-fork
@@ -357,8 +367,6 @@ impl RelationRegistry {
         IndexScan::Cursor(Box::new(BoundedIndexCursor::new(
             idx,
             entry.open_cursor(),
-            start,
-            end,
             ic.key_spec,
             matches.min(self.config.scan_chunk_rows),
         )))
@@ -406,25 +414,25 @@ fn live_pk_group(cursor: &mut ReadCursor, pk: &[u8]) -> Option<Batch> {
 }
 
 /// Projecting sibling of `ReadCursor::copy_current_row_into`: append the cursor's
-/// current row to `out` (which has the one-column `project_schema` layout) with
-/// weight 1, copying only column `ci` — whose caller-resolved source payload
-/// slot is `pi` and whose width is `col_size`. The projected row's single
-/// payload column and null bit 0 mirror that source column. The column is
-/// scalar, so no blob relocation is required.
-fn copy_cursor_col_to_batch(cursor: &ReadCursor, out: &mut Batch, ci: usize, pi: usize, col_size: usize) {
-    // `current_pk_bytes()` is the verbatim OPK PK region for any width, and the
-    // read cursor always tracks it regardless of stride. For narrow PKs it
-    // equals `widen_pk_be(current_pk_bytes) == current_key_narrow()`; for wide
-    // PKs it is the only PK form, so one path serves both.
+/// current row to `out` (which has the one-column `project_schema` layout) at
+/// weight 1, copying only the column `loc` addresses into payload slot 0.
+///
+/// `current_pk_bytes()` is the verbatim OPK region at any width, so one path
+/// serves narrow and wide PKs alike; the cell goes through the shared appender,
+/// so a NULL zero-fills and a German string relocates rather than carrying a
+/// source-heap offset into a batch that does not own it.
+fn copy_cursor_col_to_batch(cursor: &ReadCursor, out: &mut Batch, loc: ColumnLocator) {
     out.begin_row(cursor.current_pk_bytes(), 1);
-
+    let (src, row) = cursor.current_row_source();
     let mut proj_null = 0u64;
-    if gnitz_wire::null_word_get(cursor.current_null_word, pi) {
+    // Off the word the cursor already caches, where `ColumnLocator::is_null`
+    // would re-load it through `Run`'s dispatch.
+    let cell = if loc.is_null_word(cursor.current_null_word) {
         gnitz_wire::null_word_set(&mut proj_null, 0, true);
-    }
-    match cursor.col_bytes(ci, col_size) {
-        Some(data) => out.extend_col(0, data),
-        None => out.fill_col_zero(0, col_size),
-    }
+        None
+    } else {
+        Some(loc.bytes(src, row))
+    };
+    out.append_payload_cell(0, loc.type_code(), loc.size(), cell, src.blob(), None);
     out.commit_row(proj_null);
 }

@@ -203,10 +203,8 @@ pub fn op_reduce(
     let mut num_groups = 0usize;
     // Every path visits in ascending output-PK order: the PK paths in canonical
     // PK order, the keyed argsort in group-key order (the output PK being that
-    // key's big-endian image). The tripwire below turns a key-encoding divergence
-    // into a test failure rather than a silent `advance_to` rescan.
-    #[cfg(debug_assertions)]
-    let mut prev_out_pk: Vec<u8> = Vec::new();
+    // key's big-endian image). `seek_pk_group_ascending` is what turns a
+    // key-encoding divergence into a test failure rather than a silent misprobe.
     while idx < n {
         let group_start_pos = idx;
         let group_start_idx = match &sorted_indices {
@@ -230,19 +228,6 @@ pub fn op_reduce(
             narrow_out_pk.bytes()
         };
 
-        // Strict `<`: consecutive groups are distinct in the key the visit order
-        // sorts by, so an equal consecutive key is itself an encoding/comparator
-        // divergence — exactly what this catches. All slices share the
-        // loop-invariant output stride, so slice-lex order is OPK order.
-        #[cfg(debug_assertions)]
-        {
-            assert!(
-                prev_out_pk.is_empty() || prev_out_pk.as_slice() < out_pk_bytes,
-                "group key must strictly ascend in group-visit order",
-            );
-            out_pk_bytes.clone_into(&mut prev_out_pk);
-        }
-
         // Step accumulators over the group's delta rows (the Some/None dispatch
         // is per group; each arm is a monomorphic walk).
         for acc in accs.iter_mut() {
@@ -265,11 +250,10 @@ pub fn op_reduce(
         // disagree: an un-capped group has every positive row in its accumulator.
         let capped = (idx - group_start_pos) > SKIP_TRACK_CAP;
 
-        // Retraction: read old value from trace_out, keyed by the group's output
-        // PK (`out_pk_bytes`). `advance_to` seeds each source's search at its live
-        // position, and the visit order ascends, so the probe sweeps forward.
-        trace_out_cursor.advance_to(out_pk_bytes);
-        let has_old = trace_out_cursor.valid && trace_out_cursor.current_pk_eq(out_pk_bytes);
+        // Retraction: the old value from trace_out, keyed by the group's output
+        // PK. The visit order ascends, so a group this reduce has never emitted —
+        // every group of a first epoch — costs one comparison.
+        let has_old = trace_out_cursor.seek_pk_group_ascending(out_pk_bytes);
 
         if has_old {
             // δ_out's −Agg(history) term IS the stored output row: copy trace_out's

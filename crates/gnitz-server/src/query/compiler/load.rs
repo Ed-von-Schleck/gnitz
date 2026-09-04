@@ -20,8 +20,9 @@ pub(in crate::query) fn for_each_scan_edge(host: &dyn SchemaSource, mut f: impl 
     let Some(mut cur) = host.open_sys_cursor(gnitz_wire::CIRCUIT_NODES_TAB as i64) else {
         return;
     };
-    // No prefix — every view's nodes, in view_id order.
-    cur.for_each_positive_with_prefix(&[], |ch| {
+    // Every view's nodes, in view_id order: `open_sys_cursor` already yields a
+    // row-0 cursor, so there is no prefix to seek to.
+    cur.for_each_positive(|ch| {
         let (src, row) = ch.current_row_source();
         if payload_u64(src, row, CIRCNODES_PAY_OPCODE) != gnitz_wire::OPCODE_SCAN_DELTA
             || payload_is_null(src, row, CIRCNODES_PAY_SOURCE_TABLE)
