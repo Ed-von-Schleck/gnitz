@@ -307,6 +307,29 @@ impl<R> BExpr<R> {
         }
     }
 
+    /// Whether the expression can never evaluate to NULL, parameterized over
+    /// whether a leaf reference can: arithmetic other than a division,
+    /// comparison, and the connectives preserve non-nullness; a division by
+    /// anything but a non-zero literal, a CASE without an ELSE, a cast, and
+    /// every other node may produce NULL. Conservative: `false` is always safe.
+    pub(crate) fn never_null_with<F: Fn(&R) -> bool>(&self, leaf_nullable: &F) -> bool {
+        let go = |e: &BExpr<R>| e.never_null_with(leaf_nullable);
+        match self {
+            BExpr::ColRef(r) => !leaf_nullable(r),
+            BExpr::LitInt(_) | BExpr::LitFloat(_) | BExpr::LitStr(_) | BExpr::LitWide(_) => true,
+            BExpr::LitNull => false,
+            BExpr::BinOp(l, BinOp::Div | BinOp::Mod, r) => matches!(r.as_ref(), BExpr::LitInt(n) if *n != 0) && go(l),
+            BExpr::BinOp(_, BinOp::Pow, _) => false,
+            BExpr::BinOp(l, _, r) => go(l) && go(r),
+            BExpr::UnaryOp(_, inner) => go(inner),
+            BExpr::NullTest { .. } => true,
+            BExpr::Case { branches, else_ } => {
+                else_.as_deref().is_some_and(go) && branches.iter().all(|(_, result)| go(result))
+            }
+            _ => false,
+        }
+    }
+
     /// A CASE's result type, from its result branches and its else — the one
     /// walk both `infer_type_with` and lowering read it out of. Each branch is
     /// inferred exactly once, which matters because a CASE nested in a CASE would

@@ -312,15 +312,29 @@ fn binop_to_range_rel(op: BinOp) -> Option<RangeRel> {
 // `HirRef::Subquery` survives — a leftover is the physicalization's hard error.
 
 /// Decorrelate every subquery leaf in `rel`, minting mark columns from `ids`.
+/// Memoized by `Rc::as_ptr` like `classify`, so a subtree two aliases share
+/// stays one node.
 pub(crate) fn decorrelate(rel: Rc<RelExpr>, ids: &ColIdGen) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    decorrelate_rel(rel, ids, &mut RewriteMemo::new())
+}
+
+fn decorrelate_rel(rel: Rc<RelExpr>, ids: &ColIdGen, memo: &mut RewriteMemo) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    let key = Rc::as_ptr(&rel);
+    if let Some(done) = memo.get(&key) {
+        return Ok(Rc::clone(done));
+    }
     // Subqueries live only in a single-table linear body's `Project(Filter?(Get))`
     // (bind rejects them elsewhere); transform that node, else recurse.
-    if let RelExpr::Project { input, items } = rel.as_ref() {
-        if items.iter().any(|i| expr_has_subquery(&i.expr)) || filter_has_subquery(input) {
-            return decorrelate_body(items, input, ids);
+    let out = match rel.as_ref() {
+        RelExpr::Project { input, items }
+            if items.iter().any(|i| expr_has_subquery(&i.expr)) || filter_has_subquery(input) =>
+        {
+            decorrelate_body(items, input, ids)?
         }
-    }
-    RelExpr::map_children(&rel, &mut |c| decorrelate(Rc::clone(c), ids))
+        _ => RelExpr::map_children(&rel, &mut |c| decorrelate_rel(Rc::clone(c), ids, memo))?,
+    };
+    memo.insert(key, Rc::clone(&out));
+    Ok(out)
 }
 
 /// Whether an expression carries a `HirRef::Subquery` leaf.

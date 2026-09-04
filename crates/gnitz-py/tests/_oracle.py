@@ -265,6 +265,18 @@ def _agg_value(kind, arg, slot):
     raise ValueError(f"oracle_groupby_aggregate: unknown agg kind {kind!r}")
 
 
+def agg_over(kind, vals):
+    """One aggregate over an unweighted list of values — the weight-1 case of the
+    per-group rule ``oracle_groupby_aggregate`` applies, for callers whose groups
+    are plain row lists (window frames). ``kind`` is ``"COUNT*"`` to count the
+    values themselves, else the aggregate name, which counts/folds only the
+    non-NULL ones. The i64 wrap, float total order and AVG division are the same
+    ones the grouped oracle uses, so both match the engine identically.
+    """
+    slot = {"weight": len(vals), "vals": {"x": [(v, 1) for v in vals]}}
+    return _agg_value("COUNT", None, slot) if kind == "COUNT*" else _agg_value(kind, "x", slot)
+
+
 def _wrap_i64(x):
     """Reduce a Python int to the signed 64-bit value the engine's ``wrapping_add``
     accumulator holds — mod 2**64, two's-complement — so an integer SUM matches the

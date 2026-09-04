@@ -72,9 +72,7 @@ pub(super) struct Target {
     pub(super) name: String,
     pub(super) tid: u64,
     pub(super) schema: Arc<Schema>,
-    /// `None` only for a chain-minted id, which an ad-hoc read never names: a
-    /// derived table or non-pass-through CTE is rejected as a derivation first.
-    pub(super) desc: Option<Arc<RelDescriptor>>,
+    pub(super) desc: Arc<RelDescriptor>,
 }
 
 /// Which sink a validated ad-hoc SELECT lands on.
@@ -446,7 +444,7 @@ pub fn plan_read(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> 
 /// outlives it.
 fn plan_access(target: &Target, alias: &str, select: &Select) -> Result<Access, GnitzSqlError> {
     let bound_where = bind_where(&target.schema, alias, select.selection.as_ref())?;
-    let indexes = target.desc.as_ref().map(|d| &d.indexes[..]).unwrap_or_default();
+    let indexes = &target.desc.indexes[..];
     let plan = bound_and_predicate(&target.schema, &bound_where, ReadBudget::OneRequest, indexes)?;
     Ok(plan.access)
 }

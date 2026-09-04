@@ -4,6 +4,8 @@
 //! per-segment emit product; `debug_assert_exchange_topology` is the one
 //! structural backstop every emitted circuit passes through.
 
+use super::lower::SegInput;
+use super::ColId;
 use crate::error::GnitzSqlError;
 use gnitz_core::{segment_id, Circuit, ColumnDef, PlannedView, Schema};
 use std::sync::Arc;
@@ -142,16 +144,22 @@ impl ViewChain {
     /// The mint order is the invariant this owns: the slot is taken before the
     /// circuit is built, so a downstream circuit can reference this segment, and
     /// segments land on the chain in dependency order.
-    pub(crate) fn add_segment<T>(
+    pub(crate) fn add_segment(
         &mut self,
-        emit: impl FnOnce(&mut ViewChain) -> Result<(EmitPieces, T), GnitzSqlError>,
-    ) -> Result<(u64, Arc<Schema>, T), GnitzSqlError> {
+        emit: impl FnOnce(&mut ViewChain) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError>,
+    ) -> Result<SegInput, GnitzSqlError> {
         let seg = self.mint();
-        let ((circuit, cols, pk), extra) = emit(self)?;
+        let ((circuit, cols, pk), layout) = emit(self)?;
         debug_assert_exchange_topology(&circuit);
         let schema = schema_of(&cols, pk, "view segment output")?;
         self.push_hidden(seg, cols, pk, circuit);
-        Ok((segment_id(seg as u64), schema, extra))
+        Ok(SegInput {
+            tid: segment_id(seg as u64),
+            schema,
+            layout,
+            // A chain-minted id, not a catalog one: no kind, no index bound.
+            desc: None,
+        })
     }
 
     /// Append an internal segment. It carries no name: `create_view_chain` names

@@ -266,7 +266,8 @@ fn wildcard_modifiers_rewrite_the_expansion() {
 // ── CTEs and derived tables ──────────────────────────────────────────────────
 
 /// A CTE's column aliases name its output; an identity body is a pass-through
-/// (one segment) while any other body is cut into a hidden segment.
+/// (one segment) while any other body is cut into a hidden segment where it is
+/// read — and not at all where nothing reads it.
 #[test]
 fn a_cte_body_is_a_pass_through_only_when_it_is_the_identity() {
     let i = TypeCode::I64;
@@ -292,10 +293,11 @@ fn a_cte_body_is_a_pass_through_only_when_it_is_the_identity() {
             2,
             sh(&[("a", false, false)]),
         ),
-        // The same-named derived alias shadows the CTE in the final body.
+        // The same-named derived alias shadows the CTE in the final body, so the
+        // CTE is never read and never cut.
         (
             "WITH x AS (SELECT a AS ca FROM ab) SELECT * FROM (SELECT b AS cb FROM ab) x",
-            3,
+            2,
             sh(&[("a", true, false), ("cb", false, false)]),
         ),
     ];
@@ -304,6 +306,63 @@ fn a_cte_body_is_a_pass_through_only_when_it_is_the_identity() {
         assert_eq!(chain.views.len(), *segments, "{body}");
         assert_eq!(&output_shape(&chain), shape, "{body}");
     }
+}
+
+/// A CTE is one shared subtree read through an alias wherever it is named: a
+/// body carrying work is cut once however often it is read, a pass-through
+/// costs nothing wherever it is read, and both are visible to a subquery.
+#[test]
+fn a_cte_is_a_shared_subtree_read_through_aliases() {
+    let cat = base();
+    let segments = |body: &str| view(&cat, body).views.len();
+
+    // An identity body collapses to its table, read in place: no segment.
+    assert_eq!(segments("WITH c AS (SELECT * FROM t) SELECT id, g FROM c"), 1);
+    assert_eq!(segments("WITH c AS (SELECT id, g, v FROM t) SELECT id FROM c"), 1);
+    // A pass-through CTE costs nothing wherever it is read.
+    assert_eq!(
+        segments(
+            "WITH c AS (SELECT * FROM t) SELECT k, SUM(v * 2) AS s FROM (SELECT id, g AS k, v FROM c) d GROUP BY k"
+        ),
+        segments("SELECT k, SUM(v * 2) AS s FROM (SELECT id, g AS k, v FROM t) d GROUP BY k"),
+    );
+    // A pre-map over a pass-through CTE stays inline in the reduce's circuit.
+    assert_eq!(
+        segments("WITH c AS (SELECT * FROM t) SELECT g, SUM(v * 2) AS s FROM c GROUP BY g"),
+        1
+    );
+
+    // A body carrying work is cut once, however often it is named: the second
+    // read of the one segment goes through the collision wrapper.
+    assert_eq!(
+        segments("WITH c AS (SELECT id, g FROM t WHERE g > 0) SELECT id FROM c"),
+        2
+    );
+    assert_eq!(
+        segments("WITH c AS (SELECT id, g FROM t WHERE g > 0) SELECT c.id, d.g FROM c JOIN c AS d ON c.id = d.id"),
+        3
+    );
+
+    // Column aliases name the reference, and a later CTE sees an earlier one
+    // (the source key `x` leads: the linear view's PK-front convention).
+    let chain = view(
+        &cat,
+        "WITH c(x, y) AS (SELECT id, g FROM t WHERE g > 0), e AS (SELECT * FROM c) SELECT y, x FROM e",
+    );
+    assert_eq!(chain.views.len(), 2);
+    assert_eq!(&output_shape(&chain), &sh(&[("x", false, false), ("y", false, false)]));
+
+    // A CTE is visible to a subquery's inner relation.
+    assert_eq!(
+        segments(
+            "WITH c AS (SELECT * FROM t WHERE g > 0) SELECT id FROM t WHERE EXISTS (SELECT id FROM c WHERE c.id = t.g)"
+        ),
+        2
+    );
+    assert_eq!(
+        segments("WITH c AS (SELECT * FROM t) SELECT id, (SELECT COUNT(*) FROM c WHERE c.g = t.g) AS n FROM t"),
+        segments("SELECT id, (SELECT COUNT(*) FROM t AS c WHERE c.g = t.g) AS n FROM t"),
+    );
 }
 
 /// Which names the planner asks the catalog for says what a reference bound

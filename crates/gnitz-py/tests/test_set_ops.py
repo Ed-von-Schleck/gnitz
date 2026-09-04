@@ -434,9 +434,12 @@ class TestSetOps:
             rejects("CREATE VIEW v AS SELECT DISTINCT TOP 5 a FROM t", "TOP is not supported")
 
             # --- exotic clauses now each report by name (QUALIFY on DISTINCT, SORT BY on simple) ---
+            # QUALIFY is honored by every view body (it filters on window values,
+            # before a DISTINCT dedups); one with nothing to filter on is refused,
+            # not dropped.
             rejects(
-                "CREATE VIEW v AS SELECT DISTINCT a FROM t QUALIFY ROW_NUMBER() OVER (PARTITION BY a) = 1",
-                "QUALIFY is not supported",
+                "CREATE VIEW v AS SELECT DISTINCT a FROM t QUALIFY a > 1",
+                "QUALIFY needs a window function",
             )
             rejects("CREATE VIEW v AS SELECT a FROM t SORT BY a", "SORT BY is not supported")
 

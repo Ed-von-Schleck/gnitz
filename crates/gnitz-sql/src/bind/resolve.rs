@@ -46,25 +46,18 @@ pub(crate) fn find_unique_column<'a>(
 /// One Binder cache entry: a name's resolved id and schema, plus the catalog
 /// descriptor the id came from.
 ///
-/// `desc` is `None` for a chain-minted CTE/derived-table segment id: its catalog
-/// rows are not published until the whole chain is created at statement end, so
-/// there is no descriptor to carry. It lives in the entry so an alias that
-/// shadows an earlier resolution (`FROM (SELECT * FROM t) t` re-caching `t` as a
-/// minted segment) replaces id and descriptor together.
-///
 /// The schema rides beside the descriptor rather than being read out of it: a
 /// CTE's positional column aliases rename the schema the alias resolves through,
 /// while the descriptor keeps the source relation's own names.
 struct CachedRelation {
     table_id: u64,
     schema: Arc<Schema>,
-    desc: Option<Arc<RelDescriptor>>,
+    desc: Arc<RelDescriptor>,
 }
 
 /// A resolved relation: its id, the schema references resolve through, and its
-/// catalog descriptor — `None` if the id was chain-minted rather than
-/// catalog-issued.
-pub(crate) type Resolved = (u64, Arc<Schema>, Option<Arc<RelDescriptor>>);
+/// catalog descriptor.
+pub(crate) type Resolved = (u64, Arc<Schema>, Arc<RelDescriptor>);
 
 pub(crate) struct Binder<'a> {
     schema_name: &'a str,
@@ -95,7 +88,7 @@ impl<'a> Binder<'a> {
     /// form — the single fold site, so a case-varying reference (`WITH Cc … FROM
     /// cc`) hits regardless of which caller inserted (SQL identifiers are
     /// case-insensitive).
-    fn cache_relation(&mut self, name: &str, table_id: u64, schema: Arc<Schema>, desc: Option<Arc<RelDescriptor>>) {
+    fn cache_relation(&mut self, name: &str, table_id: u64, schema: Arc<Schema>, desc: Arc<RelDescriptor>) {
         self.cache
             .insert(name.to_ascii_lowercase(), CachedRelation { table_id, schema, desc });
     }
@@ -109,7 +102,7 @@ impl<'a> Binder<'a> {
     /// pass. A name it holds as a recorded absence is the ordinary "not found".
     pub(crate) fn resolve(&mut self, cat: &CatalogSnapshot, name: &str) -> Result<Resolved, GnitzSqlError> {
         // Probe with the canonical key — the cache holds base-table resolutions
-        // *and* CTE/derived-table aliases (which never reach the catalog).
+        // *and* the ad-hoc read's pass-through CTE aliases.
         if let Some(entry) = self.cache.get(&name.to_ascii_lowercase()) {
             return Ok((entry.table_id, Arc::clone(&entry.schema), entry.desc.clone()));
         }
@@ -136,8 +129,8 @@ impl<'a> Binder<'a> {
         // would have to hydrate through it, and its own store would be a second
         // derived copy of already-lossy state. One funnel, one check: this covers
         // direct FROM, join sides, subquery inners, set-op sides and CTE bodies
-        // alike. A chain-minted segment id never reaches here (it is served from
-        // the alias cache) and a hidden segment never carries a capacity.
+        // alike. A hidden segment never carries a capacity, and its leading-`_`
+        // name is refused above.
         if self.view_body && rel.class == RelClass::BoundedView {
             return Err(GnitzSqlError::Unsupported(format!(
                 "'{name}' is a capacity-bounded view; views cannot be created over it"
@@ -150,8 +143,8 @@ impl<'a> Binder<'a> {
                 "'{name}' is a stream; it holds no rows and can only be read inside a view body"
             )));
         }
-        self.cache_relation(name, rel.tid, Arc::clone(&schema), Some(Arc::clone(&rel)));
-        Ok((rel.tid, schema, Some(rel)))
+        self.cache_relation(name, rel.tid, Arc::clone(&schema), Arc::clone(&rel));
+        Ok((rel.tid, schema, rel))
     }
 
     /// Resolve a write/index target that must be a base table: UPDATE, DELETE and
@@ -178,7 +171,7 @@ impl<'a> Binder<'a> {
                 rel.class.noun()
             )));
         }
-        self.cache_relation(name, rel.tid, Arc::clone(&rel.schema), Some(Arc::clone(&rel)));
+        self.cache_relation(name, rel.tid, Arc::clone(&rel.schema), Arc::clone(&rel));
         Ok(rel)
     }
 
@@ -209,8 +202,8 @@ impl<'a> Binder<'a> {
     /// probed before validation), so it is held to the same reserved-prefix rule
     /// here — the one gate every alias passes to become resolvable.
     ///
-    /// The descriptor is the caller's: a pass-through CTE passes its source's, a
-    /// compiled derived table / CTE segment passes `None` (see [`CachedRelation`]).
+    /// The descriptor is the caller's: a pass-through CTE passes its source's
+    /// (see [`CachedRelation`]).
     pub(crate) fn cache_alias(&mut self, name: &str, resolved: Resolved) -> Result<(), GnitzSqlError> {
         crate::validate::validate_user_name(name)?;
         let (table_id, schema, desc) = resolved;
@@ -249,21 +242,15 @@ pub(crate) fn apply_positional_aliases<'a>(
     crate::validate::reject_duplicate_column_names(visible.iter().map(|c| &**c), &format!("{ctx} column aliases"))
 }
 
-/// The pure pass-through predicate shared by the CTE binding (`bind_ctes`) and the
-/// ad-hoc read route (`dml::select`): a CTE body that is a bare single-table (or
+/// The ad-hoc read route's (`dml::select`) pass-through predicate: a CTE body that is a bare single-table (or
 /// view) identity/positional projection resolves directly to its source relation,
 /// with any column aliases applied. Returns `Some(resolved)` for such an aliasable
 /// pass-through, `None` for everything else (a joined / multi-FROM / derived-table
-/// FROM or a non-identity projection); `Err` only on a hard bind failure (unknown
-/// source relation). The caller decides what `None` means: the CTE binding compiles
-/// a hidden segment; the read route rejects the whole query as a derivation. Both
-/// callers reject a WHERE'd / grouped / DISTINCT / exotic-clause body BEFORE
-/// calling (each with its own verdict), so such a body never reaches this
-/// predicate.
-///
-/// The source's provenance rides the result: a pass-through over an earlier CTE
-/// that compiled to a chain-minted segment inherits that segment's `None`, so the
-/// alias never claims a catalog id it does not have.
+/// FROM or a non-identity projection), which the read route rejects as a
+/// derivation; `Err` only on a hard bind failure (unknown source relation). The
+/// caller rejects a WHERE'd / grouped / DISTINCT / exotic-clause body BEFORE
+/// calling, so such a body never reaches this predicate. A view body's CTEs do
+/// not come through here: they bind to shared subtrees (`hir::bind::bind_ctes`).
 pub(crate) fn cte_passthrough(
     cat: &CatalogSnapshot,
     cte_select: &Select,

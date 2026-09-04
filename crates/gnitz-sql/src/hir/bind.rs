@@ -1,26 +1,25 @@
 //! AST → HIR binding. `bind_body` resolves every name to an opaque `ColId`,
 //! validates the honored clauses, and produces a logical `RelExpr` tree for any
 //! relational body (linear / join / grouped / DISTINCT / set operation). The CTE
-//! phase (`bind_ctes`) compiles each CTE body to a hidden segment ahead of the
-//! main bind and registers its alias, so a `Get` resolves a CTE by name; a
-//! derived table binds its subquery recursively to an inline subtree
-//! (`resolve_table_factor`), never a segment.
+//! phase (`bind_ctes`) binds each CTE body to a shared subtree ahead of the
+//! main bind and registers it by name, so a reference aliases it; a derived
+//! table binds its subquery recursively to an inline subtree
+//! (`resolve_table_factor`).
 
 use super::{
-    as_col, bind_and_lower, col_by_id, hircol_of, widen_if, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, InPair,
-    JoinType, ProjEntry, RelExpr, SetOpKind, SubqueryKind, SubqueryRef,
+    as_col, col_by_id, hircol_of, widen_if, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, InPair, JoinType,
+    ProjEntry, RelExpr, SetOpKind, SubqueryKind, SubqueryRef,
 };
 use crate::agg::default_agg_name;
 use crate::ast_util::{
     aliased_def, body_is_grouped, classify_agg_call, classify_from, expand_wildcard_item, extract_table_name_and_alias,
     for_each_agg_call, group_by_exprs, group_by_target, has_exists_in_subquery, has_scalar_subquery, is_agg_call,
-    peel_nested, projection_item_expr, scalar_projection_item, single_relation_col_name, wildcard_name_is_visible,
-    FromShape,
+    peel_nested, projection_item_expr, scalar_projection_item, select_has_window, single_relation_col_name,
+    wildcard_name_is_visible, window_spec_keys, FromShape,
 };
-use crate::bind::{apply_positional_aliases, cte_passthrough};
+use crate::bind::apply_positional_aliases;
 use crate::bind::{bind_conjuncts, bind_structural, find_unique_column, single_relation_col_idx, Binder, LeafBinder};
 use crate::error::{reject_if, GnitzSqlError};
-use crate::hir::chain::ViewChain;
 use crate::hir::guards::{join_keys_and_type, JoinKeys};
 use crate::ir::{AggFunc, BExpr, BinOp};
 use crate::validate::{
@@ -30,78 +29,126 @@ use crate::validate::{
 };
 use gnitz_core::{CatalogSnapshot, ColumnDef, Schema, TypeCode};
 use sqlparser::ast::{
-    BinaryOperator, Expr, Function, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, TableFactor,
+    BinaryOperator, Expr, Function, NamedWindowExpr, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier,
+    TableFactor,
 };
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// Compile a query's CTEs ahead of the main body bind. A plain pass-through CTE
-/// (`SELECT * FROM t`, no WHERE/GROUP/DISTINCT) aliases to the source's real
-/// catalog id — preserving its downstream index-bound eligibility; every other
-/// CTE body compiles to a hidden segment via the shared HIR pipeline
-/// (`bind_and_lower`), registered under the CTE name so the body (and later CTEs)
-/// resolve it by name. Scoping precedence as SQL defines it: a CTE shadows a
-/// catalog name, and a later CTE sees earlier ones (registration is immediate).
-pub(crate) fn bind_ctes(
-    cat: &CatalogSnapshot,
-    binder: &mut Binder<'_>,
-    chain: &mut ViewChain,
-    query: &Query,
-) -> Result<(), GnitzSqlError> {
+/// Bind a query's CTEs ahead of its body. Each binds to one subtree registered
+/// under its name, which the body (and later CTEs) read through an
+/// [`RelExpr::Alias`] and the lowering cuts once. Scoping precedence as SQL
+/// defines it: a CTE shadows a catalog name, and a later CTE sees earlier ones.
+pub(crate) fn bind_ctes(cx: &mut BindCx<'_, '_>, query: &Query) -> Result<(), GnitzSqlError> {
     for cte in non_recursive_ctes(query)? {
         let name = cte.alias.name.value.clone();
+        // A CTE name is a relation name later references resolve, so it is held
+        // to the reserved-prefix rule every such name passes.
+        validate_user_name(&name)?;
         let ctx = format!("CTE '{name}'");
-        let body = cte_body(cte, &ctx)?;
-        // Pass-through fast path: an identity `SELECT * FROM t` body with no
-        // WHERE / GROUP BY / DISTINCT aliases straight to its source table. A
-        // WHERE'd / grouped / DISTINCT body compiles instead (it carries real
-        // work), and the exotic tail (TOP, PREWHERE, …) is rejected here.
-        if let SetExpr::Select(s) = body {
-            if s.selection.is_none() && !body_is_grouped(s) && s.distinct.is_none() {
-                reject_unhonored_select_clauses(s, HonoredClauses::PLAIN, &ctx)?;
-                if let Some(resolved) = cte_passthrough(cat, s, &cte.alias.columns, binder)? {
-                    binder.cache_alias(&name, resolved)?;
-                    continue;
-                }
-            }
-        }
-        // Compiled path: a hidden HIR segment, with the CTE's positional column
-        // aliases applied to the emitted visible columns.
-        let (seg_vid, seg_schema, ()) = chain.add_segment(|chain| {
-            let (circuit, mut cols, pk) = bind_and_lower(cat, binder, chain, body, false)?;
-            apply_positional_aliases(
-                cte.alias.columns.iter().map(|a| &a.name),
-                cols.iter_mut().collect(),
-                &ctx,
-            )?;
-            Ok(((circuit, cols, pk), ()))
-        })?;
-        // A chain-minted segment id, not a catalog one: no kind, no index bound.
-        binder.cache_alias(&name, (seg_vid, seg_schema, None))?;
+        let rel = bind_body(cx, cte_body(cte, &ctx)?)?;
+        let (rel, mut defs) = collapse_identity(rel);
+        apply_positional_aliases(
+            cte.alias.columns.iter().map(|a| &a.name),
+            defs.iter_mut().collect(),
+            &ctx,
+        )?;
+        cx.ctes.insert(name.to_ascii_lowercase(), Cte { rel, defs });
     }
     Ok(())
+}
+
+/// A bound CTE: the shared subtree every reference aliases, and the column
+/// defs a reference carries — the subtree's own, renamed by the SELECT list's
+/// aliases and the CTE's positional ones.
+pub(crate) struct Cte {
+    rel: Rc<RelExpr>,
+    defs: Vec<ColumnDef>,
+}
+
+/// A body that only renames its source's visible columns, in order, collapses
+/// to that source under the new names: the projection carries no work, and an
+/// alias over the source reads it in place where an alias over the projection
+/// would cut a copy. Any other body is returned as it is, under its own defs.
+fn collapse_identity(rel: Rc<RelExpr>) -> (Rc<RelExpr>, Vec<ColumnDef>) {
+    if let RelExpr::Project { input, items } = rel.as_ref() {
+        let in_cols = input.cols();
+        let visible: Vec<&HirCol> = in_cols.iter().filter(|c| !c.def.is_hidden).collect();
+        let identity = items.len() == visible.len()
+            && items
+                .iter()
+                .zip(&visible)
+                .all(|(it, c)| as_col(&it.expr) == Some(c.id) && !it.out.def.is_hidden);
+        if identity {
+            let mut renamed = items.iter();
+            let defs = in_cols
+                .iter()
+                .map(|c| {
+                    if c.def.is_hidden {
+                        c.def.clone()
+                    } else {
+                        renamed.next().expect("one item per visible column").out.def.clone()
+                    }
+                })
+                .collect();
+            return (Rc::clone(input), defs);
+        }
+    }
+    let defs = rel.cols().into_iter().map(|c| c.def).collect();
+    (rel, defs)
+}
+
+/// Everything a body bind resolves against: the catalog snapshot, the alias
+/// binder, the `ColId` minter, and the query's CTEs. One value threaded through
+/// the recursion, so a derived table, a set-operation side and a subquery bind
+/// against the same four.
+pub(crate) struct BindCx<'c, 'b> {
+    pub(crate) cat: &'c CatalogSnapshot,
+    pub(crate) binder: &'c mut Binder<'b>,
+    pub(crate) ids: &'c ColIdGen,
+    /// The CTEs bound so far, by canonical (ASCII-lowercase) name.
+    ctes: HashMap<String, Cte>,
+}
+
+impl<'c, 'b> BindCx<'c, 'b> {
+    pub(crate) fn new(cat: &'c CatalogSnapshot, binder: &'c mut Binder<'b>, ids: &'c ColIdGen) -> Self {
+        BindCx {
+            cat,
+            binder,
+            ids,
+            ctes: HashMap::new(),
+        }
+    }
+}
+
+/// Resolve a relation name to the subtree a FROM reference reads: an alias of
+/// the CTE it names, else a `Get` on the catalog relation. The one resolution
+/// every relation reference goes through — a FROM item, a join step, a
+/// subquery's inner relation — so a CTE is visible to all of them alike.
+fn resolve_relation(cx: &mut BindCx<'_, '_>, name: &str) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    if let Some(cte) = cx.ctes.get(&name.to_ascii_lowercase()) {
+        return Ok(RelExpr::alias_as(cx.ids, Rc::clone(&cte.rel), &cte.defs));
+    }
+    let (tid, schema, desc) = cx.binder.resolve(cx.cat, name)?;
+    Ok(RelExpr::get(cx.ids, tid, schema, Some(desc)))
 }
 
 /// Bind one query body — a single SELECT (linear / join / grouped / DISTINCT) or
 /// a set operation whose sides bind recursively. A parenthesized side is a whole
 /// `Query`, whose envelope is rejected before its body binds.
-pub(crate) fn bind_body(
-    cat: &CatalogSnapshot,
-    binder: &mut Binder<'_>,
-    ids: &ColIdGen,
-    body: &SetExpr,
-) -> Result<Rc<RelExpr>, GnitzSqlError> {
+pub(crate) fn bind_body(cx: &mut BindCx<'_, '_>, body: &SetExpr) -> Result<Rc<RelExpr>, GnitzSqlError> {
     match body {
-        SetExpr::Select(select) => bind_select(cat, binder, ids, select),
+        SetExpr::Select(select) => bind_select(cx, select),
         SetExpr::SetOperation {
             op,
             set_quantifier,
             left,
             right,
-        } => bind_set_op(cat, binder, ids, *op, *set_quantifier, left, right),
-        SetExpr::Query(q) => bind_body(cat, binder, ids, reject_query_envelope_body(q, "parenthesized query")?),
+        } => bind_set_op(cx, *op, *set_quantifier, left, right),
+        SetExpr::Query(q) => bind_body(cx, reject_query_envelope_body(q, "parenthesized query")?),
         _ => Err(GnitzSqlError::Unsupported(
             "CREATE VIEW only supports SELECT and set operations".to_string(),
         )),
@@ -116,9 +163,7 @@ pub(crate) fn bind_body(
 /// caller pushes into its scope/env. The subtree itself keeps its own names; a
 /// derived alias resolves through the caller's scope, never the binder cache.
 fn resolve_table_factor(
-    cat: &CatalogSnapshot,
-    binder: &mut Binder<'_>,
-    ids: &ColIdGen,
+    cx: &mut BindCx<'_, '_>,
     factor: &TableFactor,
 ) -> Result<(Rc<RelExpr>, String, Vec<HirCol>), GnitzSqlError> {
     if let TableFactor::Derived {
@@ -143,7 +188,7 @@ fn resolve_table_factor(
         // Silently dropping TABLESAMPLE would return all rows — a wrong result.
         reject_if(sample.is_some(), &ctx, "TABLESAMPLE")?;
         let body = reject_query_envelope_body(subquery, &ctx)?;
-        let subtree = bind_body(cat, binder, ids, body)?;
+        let subtree = bind_body(cx, body)?;
         let mut cols = subtree.cols();
         apply_positional_aliases(
             alias.columns.iter().map(|a| &a.name),
@@ -153,10 +198,9 @@ fn resolve_table_factor(
         return Ok((subtree, alias.name.value.clone(), cols));
     }
     let (name, alias) = extract_table_name_and_alias(factor, "CREATE VIEW")?;
-    let (tid, schema, desc) = binder.resolve(cat, &name)?;
-    let get = RelExpr::get(ids, tid, schema, desc);
-    let cols = get.cols();
-    Ok((get, alias, cols))
+    let rel = resolve_relation(cx, &name)?;
+    let cols = rel.cols();
+    Ok((rel, alias, cols))
 }
 
 /// Bind one single-SELECT body to `Project(Filter?(source))`, where `source` is
@@ -167,12 +211,7 @@ fn resolve_table_factor(
 ///
 /// Conjuncts bind raw — into `Join.on` from the step, into a `Filter` from the
 /// WHERE. `hir::rewrite` is what classifies them into keys.
-fn bind_select(
-    cat: &CatalogSnapshot,
-    binder: &mut Binder<'_>,
-    ids: &ColIdGen,
-    select: &Select,
-) -> Result<Rc<RelExpr>, GnitzSqlError> {
+fn bind_select(cx: &mut BindCx<'_, '_>, select: &Select) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let Some(first) = select.from.first() else {
         return Err(GnitzSqlError::Unsupported(
             "CREATE VIEW: a view body reads at least one relation; this one has no FROM clause".to_string(),
@@ -180,11 +219,15 @@ fn bind_select(
     };
     let grouped = body_is_grouped(select);
     let distinct = select.distinct.is_some();
-    reject_unhonored_select_clauses(select, HonoredClauses::for_body(grouped, distinct), "CREATE VIEW")?;
+    reject_unhonored_select_clauses(
+        select,
+        HonoredClauses::for_body(grouped, distinct).with_windows(),
+        "CREATE VIEW",
+    )?;
 
     // The first FROM relation (a table, a CTE, or a derived table) seeds the
     // accumulator and the scope; its cols are what name resolution starts from.
-    let (mut left, alias, cols) = resolve_table_factor(cat, binder, ids, &first.relation)?;
+    let (mut left, alias, cols) = resolve_table_factor(cx, &first.relation)?;
     let mut scope = JoinScope::single(&alias, cols);
 
     for (i, item) in select.from.iter().enumerate() {
@@ -192,12 +235,12 @@ fn bind_select(
         // more INNER step carrying no keys of its own — the comma's whole meaning.
         if i > 0 {
             let comma = (JoinKeys::None, JoinType::Inner);
-            left = fold_join_step(cat, binder, ids, &mut scope, left, &item.relation, comma)?;
+            left = fold_join_step(cx, &mut scope, left, &item.relation, comma)?;
         }
         // Then that item's own JOIN chain, left-deep in syntactic order.
         for join in &item.joins {
             let step = join_keys_and_type(join)?;
-            left = fold_join_step(cat, binder, ids, &mut scope, left, &join.relation, step)?;
+            left = fold_join_step(cx, &mut scope, left, &join.relation, step)?;
         }
     }
 
@@ -218,7 +261,7 @@ fn bind_select(
             )));
         }
         if !grouped && !distinct && (has_exists_in || has_scalar_subquery(select)) {
-            return bind_linear_subquery_body(cat, binder, ids, select, left, &scope, &alias);
+            return bind_linear_subquery_body(cx, select, left, &scope, &alias);
         }
     }
 
@@ -230,7 +273,7 @@ fn bind_select(
         clause: "CREATE VIEW",
         sub: SubPolicy::PerKind,
     };
-    bind_body_suffix(ids, select, left, &leaf, "CREATE VIEW projection")
+    bind_body_suffix(cx.ids, select, left, &leaf, "CREATE VIEW projection")
 }
 
 /// WHERE, then the projection in whichever shape the body carries — the tail
@@ -253,9 +296,15 @@ fn bind_body_suffix(
     if body_is_grouped(select) && select.distinct.is_none() {
         return bind_grouped_suffix(ids, select, rel, leaf);
     }
-    let items = bind_projection(&select.projection, leaf, ids, ctx)?;
-    reject_duplicate_projection_names(&select.projection, items.iter().map(|e| &e.out.def), ctx)?;
-    let projected = RelExpr::project(rel, items);
+    // The window desugar owns its own projection (it must place the SELECT list
+    // over the joined-in window values), so it hands back the projected relation.
+    let projected = if select_has_window(select) {
+        super::window::bind_window_final(ids, select, rel, leaf, ctx)?
+    } else {
+        let items = bind_projection(&select.projection, leaf, ids, ctx)?;
+        reject_duplicate_projection_names(&select.projection, items.iter().map(|e| &e.out.def), ctx)?;
+        RelExpr::project(rel, items)
+    };
     Ok(if select.distinct.is_some() {
         RelExpr::distinct(projected)
     } else {
@@ -284,25 +333,63 @@ fn expand_wildcard(
         .collect())
 }
 
+/// The leaf a SELECT list binds through, beyond expression binding: the
+/// columns it types, whether a bare `*` is an item, and what a top-level call
+/// item's output column is. One rule for the linear, grouped and windowed
+/// projections, so an item means the same thing wherever it is written.
+pub(crate) trait ItemLeaf: LeafBinder<HirRef> {
+    /// The columns in scope — the typing table for every `ColId` this leaf
+    /// hands out.
+    fn env(&self) -> &[HirCol];
+    /// The declared type of a leaf reference. A leaf minting columns of its own
+    /// (a window placeholder) answers for those; everything else is the env's.
+    fn type_of(&self, r: &HirRef) -> TypeCode {
+        type_of(self.env(), r)
+    }
+    /// Whether a bare `*` is an item here — false for a grouped body, where
+    /// every item is a group key or an aggregate.
+    fn expands_wildcard(&self) -> bool;
+    /// A top-level function-call item's value and output def — an aggregate in
+    /// a grouped body takes its own name, type and nullability, a window call
+    /// its placeholder's — or `None` to bind the item as any other expression.
+    fn call_item(
+        &self,
+        _f: &Function,
+        _alias: &Option<String>,
+        _idx: usize,
+    ) -> Option<Result<(HirExpr, ColumnDef), GnitzSqlError>> {
+        None
+    }
+}
+
 /// Resolve every SELECT item into a `ProjEntry` in SELECT order, expanding a bare
 /// `*` via [`expand_wildcard`].
-fn bind_projection(
+pub(crate) fn bind_projection<L: ItemLeaf>(
     projection: &[SelectItem],
-    leaf: &ScopeLeaf<'_>,
+    leaf: &L,
     ids: &ColIdGen,
     ctx: &str,
 ) -> Result<Vec<ProjEntry>, GnitzSqlError> {
     let mut items = Vec::new();
     for (idx, item) in projection.iter().enumerate() {
-        match item {
-            // Only a *bare* `*` expands: a `tbl.*` QualifiedWildcard is not a
-            // single-table projection item, so it falls to the `_` reject arm.
-            SelectItem::Wildcard(_) => items.extend(expand_wildcard(item, leaf.env(), ctx, ids)?),
-            _ => {
-                let (expr, alias) = scalar_projection_item(item, ctx)?;
-                items.push(bind_proj_expr(expr, alias, idx, leaf.env(), leaf, ids)?);
+        // Only a *bare* `*` expands: a `tbl.*` QualifiedWildcard is not a
+        // single-table projection item, so it falls to the `_` reject arm.
+        if matches!(item, SelectItem::Wildcard(_)) && leaf.expands_wildcard() {
+            items.extend(expand_wildcard(item, leaf.env(), ctx, ids)?);
+            continue;
+        }
+        let (expr, alias) = scalar_projection_item(item, ctx)?;
+        if let Expr::Function(f) = peel_nested(expr) {
+            if let Some(call) = leaf.call_item(f, &alias, idx) {
+                let (expr, def) = call?;
+                items.push(ProjEntry {
+                    expr,
+                    out: HirCol::new(ids.next(), def),
+                });
+                continue;
             }
         }
+        items.push(bind_proj_expr(expr, alias, idx, leaf, ids)?);
     }
     Ok(items)
 }
@@ -317,21 +404,23 @@ fn bind_projection(
 /// it resolves a written composite GROUP BY key to the pre-map column holding it
 /// — since every other leaf resolves names through `find_unique_column`, which
 /// skips hidden columns.
-fn bind_proj_expr<L: LeafBinder<HirRef>>(
+fn bind_proj_expr<L: ItemLeaf>(
     expr: &Expr,
     alias: Option<String>,
     idx: usize,
-    env: &[HirCol],
     leaf: &L,
     ids: &ColIdGen,
 ) -> Result<ProjEntry, GnitzSqlError> {
     let bound = bind_structural(expr, leaf)?;
+    // A leaf's own minted column (a window placeholder) is hidden, so it never
+    // passes through — the computed branch types it through `leaf.type_of`.
     let src_def = as_col(&bound)
-        .map(|id| &hircol_of(env, id).def)
+        .and_then(|id| col_by_id(leaf.env(), id))
+        .map(|c| &c.def)
         .filter(|d| !d.is_hidden);
     let out_def = match src_def {
         Some(d) => aliased_def(d, alias),
-        None => crate::validate::computed_column(alias, idx, bound.infer_type_with(&|r: &HirRef| type_of(env, r))),
+        None => crate::validate::computed_column(alias, idx, bound.infer_type_with(&|r| leaf.type_of(r))),
     };
     Ok(ProjEntry {
         expr: bound,
@@ -342,7 +431,7 @@ fn bind_proj_expr<L: LeafBinder<HirRef>>(
 /// The declared type of a leaf reference — the env column's type code, or the
 /// bound subquery's contributed value type (a computed projection may embed a
 /// subquery leaf before decorrelation substitutes it).
-fn type_of(env: &[HirCol], r: &HirRef) -> TypeCode {
+pub(crate) fn type_of(env: &[HirCol], r: &HirRef) -> TypeCode {
     match r {
         HirRef::Col(id) => hircol_of(env, *id).def.type_code,
         HirRef::Subquery(sq) => sq.value_type(),
@@ -375,11 +464,13 @@ struct ScopeLeaf<'a> {
     sub: SubPolicy<'a>,
 }
 
-impl ScopeLeaf<'_> {
-    /// The columns in scope, in relation order — the typing table for every
-    /// `ColId` this leaf hands out.
+impl ItemLeaf for ScopeLeaf<'_> {
+    /// The columns in scope, in relation order.
     fn env(&self) -> &[HirCol] {
         &self.scope.combined
+    }
+    fn expands_wildcard(&self) -> bool {
+        true
     }
 }
 
@@ -431,7 +522,7 @@ impl LeafBinder<HirRef> for ScopeLeaf<'_> {
 
 /// Whether a leaf reference over `env` can be NULL: a column by its definition,
 /// a subquery by its shape (an EXISTS/IN test or a COUNT never is).
-fn hir_ref_nullable(env: &[HirCol], r: &HirRef) -> bool {
+pub(crate) fn hir_ref_nullable(env: &[HirCol], r: &HirRef) -> bool {
     match r {
         HirRef::Col(id) => hircol_of(env, *id).def.is_nullable,
         HirRef::Subquery(s) => !s.never_null(),
@@ -448,14 +539,12 @@ fn hir_ref_nullable(env: &[HirCol], r: &HirRef) -> bool {
 // reaching the snapshot and the binder through a `RefCell` (the `LeafBinder`
 // methods take `&self`). Decorrelation (`hir::rewrite`) consumes the leaves.
 
-/// Everything a subquery bind resolves against: the catalog snapshot, the mutable
-/// binder, and the outer scope it correlates to.
-struct SubCtx<'a, 'b, 'c> {
-    cat: &'c CatalogSnapshot,
-    binder: &'a mut Binder<'b>,
-    ids: &'c ColIdGen,
-    outer_env: &'c [HirCol],
-    outer_alias: &'c str,
+/// Everything a subquery bind resolves against: the body bind's own context,
+/// plus the outer scope it correlates to.
+struct SubCtx<'a, 'c, 'b> {
+    cx: &'a mut BindCx<'c, 'b>,
+    outer_env: &'a [HirCol],
+    outer_alias: &'a str,
 }
 
 /// Bind a subquery-carrying single-table linear body to `Project(Filter?(Get))`.
@@ -465,22 +554,19 @@ struct SubCtx<'a, 'b, 'c> {
 /// The `RefCell` is `LeafBinder`'s `&self`; nothing re-enters it, since a nested
 /// subquery is rejected by the inner correlation leaf.
 fn bind_linear_subquery_body(
-    cat: &CatalogSnapshot,
-    binder: &mut Binder<'_>,
-    ids: &ColIdGen,
+    cx: &mut BindCx<'_, '_>,
     select: &Select,
     get: Rc<RelExpr>,
     scope: &JoinScope,
     outer_alias: &str,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    let cx = RefCell::new(SubCtx {
-        cat,
-        binder,
-        ids,
+    let ids = cx.ids;
+    let sub = RefCell::new(SubCtx {
+        cx,
         outer_env: &scope.combined,
         outer_alias,
     });
-    let bind_sub = |e: &Expr| bind_one_subquery(&mut cx.borrow_mut(), e);
+    let bind_sub = |e: &Expr| bind_one_subquery(&mut sub.borrow_mut(), e);
     let leaf = ScopeLeaf {
         scope,
         clause: "CREATE VIEW",
@@ -521,8 +607,7 @@ fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_, '_>, subquery: &'e Query) -> Result
             "relation alias '{outer_alias}' is used by both the view FROM and its subquery; rename one"
         )));
     }
-    let (inner_tid, inner_schema, inner_desc) = cx.binder.resolve(cx.cat, &inner_name)?;
-    let inner_get = RelExpr::get(cx.ids, inner_tid, inner_schema, inner_desc);
+    let inner_get = resolve_relation(cx.cx, &inner_name)?;
     let inner_cols = inner_get.cols();
 
     let mut local_preds: Vec<HirExpr> = Vec::new();
@@ -674,7 +759,7 @@ fn bind_exists_sub(
 /// Bind a scalar aggregate subquery into a `Scalar`-kind `SubqueryRef` whose `rel`
 /// is a grouped (correlated) / global (uncorrelated) `Reduce`.
 fn bind_scalar_sub(cx: &mut SubCtx<'_, '_, '_>, q: &Query) -> Result<HirExpr, GnitzSqlError> {
-    let ids = cx.ids;
+    let ids = cx.cx.ids;
     let ir = resolve_inner(cx, q)?;
     let err = "a scalar subquery must be a single aggregate over its correlation group";
     let proj_expr = single_projection_expr(ir.inner_select, err)?;
@@ -722,7 +807,7 @@ fn bind_quantifier_sub(
     };
     // x < ANY ⟺ < MAX; x > ANY ⟺ > MIN; x < ALL ⟺ < MIN; x > ALL ⟺ > MAX.
     let agg_func = if is_any == less { AggFunc::Max } else { AggFunc::Min };
-    let (ids, outer_env, outer_alias) = (cx.ids, cx.outer_env, cx.outer_alias);
+    let (ids, outer_env, outer_alias) = (cx.cx.ids, cx.outer_env, cx.outer_alias);
     let ir = resolve_inner(cx, q)?;
     let err = "a range ANY/ALL subquery must select a single non-nullable column";
     let proj_expr = single_projection_expr(ir.inner_select, err)?;
@@ -869,15 +954,13 @@ fn scalar_leaf(
 /// duplicate copy of each `USING` / `NATURAL` column, and widen the scope by the
 /// step's null semantics.
 fn fold_join_step(
-    cat: &CatalogSnapshot,
-    binder: &mut Binder<'_>,
-    ids: &ColIdGen,
+    cx: &mut BindCx<'_, '_>,
     scope: &mut JoinScope,
     left: Rc<RelExpr>,
     relation: &TableFactor,
     (keys, kind): (JoinKeys<'_>, JoinType),
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    let (right_src, ralias, rcols) = resolve_table_factor(cat, binder, ids, relation)?;
+    let (right_src, ralias, rcols) = resolve_table_factor(cx, relation)?;
 
     // Before `scope.push` below: a `USING`/`NATURAL` name pairs against the left
     // side alone, where an `ON` (bound after the push) sees both sides.
@@ -1111,9 +1194,8 @@ impl<'a> PreMap<'a> {
             return Ok(id);
         }
         let ty = bound.infer_type_with(&|r: &HirRef| type_of(&self.env, r));
-        // Nullable because a computed value can be NULL (`a / 0`) and nothing
-        // infers otherwise — so an aggregate over one takes the null-skipping shape
-        // where the same aggregate over a NOT NULL column would not. Hidden because
+        // Declared nullable unconditionally (a computed value can be NULL: `a / 0`),
+        // so an aggregate over one takes the null-skipping shape. Hidden because
         // only the expression that minted it may reach it.
         let out = HirCol::new(
             self.ids.next(),
@@ -1276,7 +1358,8 @@ fn adhoc_source(ids: &ColIdGen, schema: Arc<Schema>, alias: &str) -> (Rc<RelExpr
 
 /// Bind the GROUP BY / aggregate / HAVING suffix over `input` (the `Filter?(source)`
 /// tree built by the FROM binder), producing
-/// `Project(Filter_having?(Reduce(PreMap?(input))))`.
+/// `Project(Filter_having?(Reduce(PreMap?(input))))` — through the window
+/// desugar when the SELECT list carries a window call.
 fn bind_grouped_suffix(
     ids: &ColIdGen,
     select: &Select,
@@ -1287,18 +1370,26 @@ fn bind_grouped_suffix(
     let group_cols = resolve_group_cols(select, leaf, &mut pre)?;
     let is_global = group_cols.is_empty();
 
-    // Aggregates from the projection ∪ HAVING, deduped by `(func, arg)`.
+    // Aggregates from the projection ∪ HAVING ∪ QUALIFY ∪ the WINDOW clause,
+    // deduped by `(func, arg)`. An inline window specification's keys are
+    // operands of the call, which the walk reaches on its own.
     let mut aggs: Vec<HirAgg> = Vec::new();
-    for item in &select.projection {
-        if let Some(expr) = projection_item_expr(item) {
-            collect_aggs(expr, leaf, is_global, &mut aggs, &mut pre)?;
-        }
-    }
-    if let Some(having) = &select.having {
-        collect_aggs(having, leaf, is_global, &mut aggs, &mut pre)?;
+    let named_keys = select.named_window.iter().flat_map(|d| match &d.1 {
+        NamedWindowExpr::WindowSpec(s) => window_spec_keys(s).collect::<Vec<_>>(),
+        NamedWindowExpr::NamedWindow(_) => Vec::new(),
+    });
+    for expr in select
+        .projection
+        .iter()
+        .filter_map(projection_item_expr)
+        .chain(select.having.iter())
+        .chain(select.qualify.iter())
+        .chain(named_keys)
+    {
+        collect_aggs(expr, leaf, is_global, &mut aggs, &mut pre)?;
     }
 
-    let reduce = RelExpr::reduce(pre.reduce_input(input), group_cols.clone(), aggs.clone());
+    let mut rel = RelExpr::reduce(pre.reduce_input(input), group_cols.clone(), aggs.clone());
 
     // The pre-map's columns, extended with each aggregate's raw value and
     // companion: everything a `ColId` in an expression over the reduce output can
@@ -1320,49 +1411,19 @@ fn bind_grouped_suffix(
     };
 
     // HAVING → a Filter over the raw reduce output.
-    let mut rel = reduce;
     if let Some(having) = &select.having {
         let hexpr = bind_structural(having, &grouped("HAVING"))?;
         rel = RelExpr::filter(rel, vec![hexpr]);
     }
 
+    let select_leaf = grouped("GROUP BY SELECT");
+    if select_has_window(select) {
+        return super::window::bind_window_final(ids, select, rel, &select_leaf, "GROUP BY");
+    }
     // The dup-name guard is `lower_reduce`'s: its output carries the group
     // columns, including ones this projection never named.
-    let items = bind_finalize_projection(select, ids, &grouped("GROUP BY SELECT"))?;
+    let items = bind_projection(&select.projection, &select_leaf, ids, "GROUP BY")?;
     Ok(RelExpr::project(rel, items))
-}
-
-/// The finalize (SELECT) projection over the raw reduce output. An item that
-/// *is* an aggregate call takes that aggregate's own name, type and nullability
-/// — kept out of [`bind_proj_expr`], whose computed branch hardcodes nullability
-/// to `true` and would declare a COUNT column nullable. Every other item goes
-/// through it, the one projection-item rule.
-fn bind_finalize_projection(
-    select: &Select,
-    ids: &ColIdGen,
-    grouped: &GroupedLeaf<'_>,
-) -> Result<Vec<ProjEntry>, GnitzSqlError> {
-    let mut items = Vec::new();
-    for (idx, item) in select.projection.iter().enumerate() {
-        let (expr, alias) = scalar_projection_item(item, "GROUP BY")?;
-        if let Expr::Function(f) = peel_nested(expr) {
-            if is_agg_call(f) {
-                let agg = grouped.find_agg(f)?;
-                let name = alias.unwrap_or_else(|| default_agg_name(agg.func, idx));
-                items.push(ProjEntry {
-                    expr: agg.finalize(),
-                    out: HirCol::new(ids.next(), ColumnDef::new(name, agg.view_type(), agg.view_nullable())),
-                });
-                continue;
-            }
-        }
-        // Everything else is an ordinary projection item over the reduce output,
-        // bound through the grouped leaf: a group column passes its def through, a
-        // composite key resolves to a hidden pre-map column and so reads as
-        // computed.
-        items.push(bind_proj_expr(expr, alias, idx, grouped.env, grouped, ids)?);
-    }
-    Ok(items)
 }
 
 /// The leaf for an expression over the grouped relation — HAVING and the finalize
@@ -1419,6 +1480,35 @@ impl GroupedLeaf<'_> {
     }
 }
 
+impl ItemLeaf for GroupedLeaf<'_> {
+    fn env(&self) -> &[HirCol] {
+        self.env
+    }
+    fn expands_wildcard(&self) -> bool {
+        false
+    }
+    /// An item that *is* an aggregate call takes that aggregate's own name,
+    /// type and nullability — kept out of the computed branch, which hardcodes
+    /// nullability to `true` and would declare a COUNT column nullable.
+    fn call_item(
+        &self,
+        f: &Function,
+        alias: &Option<String>,
+        idx: usize,
+    ) -> Option<Result<(HirExpr, ColumnDef), GnitzSqlError>> {
+        if !is_agg_call(f) {
+            return None;
+        }
+        Some(self.find_agg(f).map(|agg| {
+            let name = alias.clone().unwrap_or_else(|| default_agg_name(agg.func, idx));
+            (
+                agg.finalize(),
+                ColumnDef::new(name, agg.view_type(), agg.view_nullable()),
+            )
+        }))
+    }
+}
+
 impl LeafBinder<HirRef> for GroupedLeaf<'_> {
     /// A written GROUP BY key, wherever it appears: `(a + b) * 2` binds over
     /// `GROUP BY a + b`. With no computed key there is nothing to match, and
@@ -1465,9 +1555,7 @@ impl LeafBinder<HirRef> for GroupedLeaf<'_> {
 /// Bind a set operation, binding both sides recursively; the `SetOp` constructor
 /// pairs columns positionally and promotes cross-width types.
 fn bind_set_op(
-    cat: &CatalogSnapshot,
-    binder: &mut Binder<'_>,
-    ids: &ColIdGen,
+    cx: &mut BindCx<'_, '_>,
     op: SetOperator,
     quantifier: SetQuantifier,
     left: &SetExpr,
@@ -1493,9 +1581,9 @@ fn bind_set_op(
     // Each side binds as any relational body — a plain SELECT, a join, a grouped
     // query, a nested set operation, or a derived table (all handled by
     // `bind_body` → `resolve_table_factor`).
-    let left_rel = bind_body(cat, binder, ids, left)?;
-    let right_rel = bind_body(cat, binder, ids, right)?;
-    RelExpr::set_op(ids, kind, all, left_rel, right_rel)
+    let left_rel = bind_body(cx, left)?;
+    let right_rel = bind_body(cx, right)?;
+    RelExpr::set_op(cx.ids, kind, all, left_rel, right_rel)
 }
 
 #[cfg(test)]

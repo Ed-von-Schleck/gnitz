@@ -54,7 +54,8 @@ fn bound_cols(sql: &str) -> Result<Vec<HirCol>, GnitzSqlError> {
     let mut binder = Binder::new("public");
     let ids = ColIdGen::new();
     let body = crate::validate::reject_query_envelope_body(&cv.query, "view body")?;
-    bind_body(&cat, &mut binder, &ids, body).map(|r| r.cols())
+    let mut cx = BindCx::new(&cat, &mut binder, &ids);
+    bind_body(&mut cx, body).map(|r| r.cols())
 }
 
 /// `(name, type, nullable)` of every output column — what a projection item's

@@ -598,6 +598,13 @@ Every read of a stream-fed view drains pending ticks: freshness is measured
 against the published tick, which a stream push never advances. A cost, not a
 correctness defect — when nothing is pending the drain takes the empty fast path.
 
+## Window functions
+
+A window call (`f(…) OVER (…)`, `QUALIFY`, `WINDOW`) desugars in the planner into
+ordinary joins and reduces, and is legal only in a view body. Partition and order
+keys are join keys and carry the join-key rules; `ROW_NUMBER` is `RANK` over the
+ORDER BY extended by the input's row key, so it needs one.
+
 ## Delta feeds
 
 `CREATE VIEW … WITH (delta = '32 MB')` retains a view's recent deltas, read back

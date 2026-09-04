@@ -22,6 +22,7 @@ mod guards;
 mod lower;
 mod physical;
 mod rewrite;
+mod window;
 
 pub(crate) use create::{execute_alter_view, execute_create_view};
 pub use create::{plan_view, PlannedChain, ViewPlan};
@@ -31,25 +32,25 @@ use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr};
 use chain::{EmitPieces, ViewChain};
 use gnitz_core::{CatalogSnapshot, ColumnDef, RangeRel, RelDescriptor, Schema, TypeCode};
-use sqlparser::ast::SetExpr;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// The one shared compiler core: bind a query body to `RelExpr`, decorrelate its
-/// subqueries, classify join predicates, and lower to circuit pieces. Every
-/// body reaches it — the top-level view body
-/// and each CTE body (inside its own `chain.add_segment`) — so the CTE phase and
-/// the top path share one pipeline; only the CTE phase threads `chain` ahead of
-/// it (to compile CTE segments before the body binds against their aliases).
+/// The one compiler core: bind a query — its CTEs, then its body — to one
+/// `RelExpr` tree, decorrelate its subqueries, classify join predicates, and
+/// lower to circuit pieces. A CTE is a shared subtree of that one tree, read
+/// through an `Alias` wherever it is named, so nothing is compiled before the
+/// tree is whole; the lowering decides what each shared subtree becomes.
 pub(crate) fn bind_and_lower(
     cat: &CatalogSnapshot,
     binder: &mut Binder<'_>,
     chain: &mut ViewChain,
-    body: &SetExpr,
+    query: &sqlparser::ast::Query,
     bounded: bool,
 ) -> Result<EmitPieces, GnitzSqlError> {
     let ids = ColIdGen::new();
-    let rel = bind::bind_body(cat, binder, &ids, body)?;
+    let mut cx = bind::BindCx::new(cat, binder, &ids);
+    bind::bind_ctes(&mut cx, query)?;
+    let rel = bind::bind_body(&mut cx, query.body.as_ref())?;
     let rel = rewrite::decorrelate(rel, &ids)?;
     let rel = rewrite::classify(rel)?;
     lower::lower(chain, rel, bounded)
@@ -176,7 +177,7 @@ pub(crate) fn is_pre_map(input: &RelExpr, items: &[ProjEntry]) -> bool {
         && cols
             .iter()
             .zip(items)
-            .all(|(c, it)| it.out.id == c.id && matches!(it.expr, BExpr::ColRef(HirRef::Col(id)) if id == c.id))
+            .all(|(c, it)| it.out.id == c.id && as_col(&it.expr) == Some(c.id))
 }
 
 /// The physical position of a `ColId` in a layout.
@@ -327,9 +328,9 @@ pub(crate) enum RelExpr {
         tid: u64,
         schema: Arc<Schema>,
         cols: Vec<HirCol>,
-        /// The catalog descriptor `tid` resolved to, or `None` for a chain-minted
-        /// segment id, which has no catalog rows until the chain commits: no index
-        /// list to bound a scan with and no replication flag to read.
+        /// The catalog descriptor `tid` resolved to, or `None` for the ad-hoc
+        /// read's source, which names its relation in the `ReadSpec` and so has
+        /// no `tid` here: no index list to bound a scan with, no replication flag.
         desc: Option<Arc<RelDescriptor>>,
     },
     Filter {
@@ -371,6 +372,20 @@ pub(crate) enum RelExpr {
     /// content-hash key.
     Distinct {
         input: Rc<RelExpr>,
+    },
+    /// The same relation read again under fresh column identities — the HIR of
+    /// a second reference to one *subtree*, as a second mention of a CTE or the
+    /// window desugar's repeated reads of its own input are. (A second `FROM`
+    /// mention of a base table mints a fresh `Get` instead; there is no subtree
+    /// to share.) `cols` is parallel to `input.cols()` and carries the same defs
+    /// under new ids, so two aliases of one shared `input` are distinguishable
+    /// by id wherever they meet (a self-join's two sides).
+    /// The lowering resolves it to its input's delta source — a table in place,
+    /// anything else cut once and shared through the cut memo — under the
+    /// alias's ids; it never materializes anything of its own.
+    Alias {
+        input: Rc<RelExpr>,
+        cols: Vec<HirCol>,
     },
     /// A set operation (UNION / INTERSECT / EXCEPT, ALL or distinct). `out` pairs
     /// each left/right column positionally with the promoted common type and the
@@ -419,7 +434,20 @@ impl HirAgg {
         env: &[HirCol],
         is_global: bool,
     ) -> Result<Self, GnitzSqlError> {
-        let arg_def = arg.map(|id| &hircol_of(env, id).def);
+        Self::with_arg_def(ids, func, arg, arg.map(|id| &hircol_of(env, id).def), is_global)
+    }
+
+    /// [`Self::new`] with the argument's definition supplied rather than looked
+    /// up — for a caller typing an aggregate whose argument is not yet a column
+    /// of any relation (the window desugar, which types the call at bind and
+    /// hoists its argument afterwards).
+    pub(crate) fn with_arg_def(
+        ids: &ColIdGen,
+        func: AggFunc,
+        arg: Option<ColId>,
+        arg_def: Option<&ColumnDef>,
+        is_global: bool,
+    ) -> Result<Self, GnitzSqlError> {
         let typing = crate::agg::agg_typing(func, arg_def)?;
         let arg_nullable = arg_def.map(|d| d.is_nullable).unwrap_or(false);
         Ok(HirAgg {
@@ -692,6 +720,65 @@ impl RelExpr {
         Rc::new(RelExpr::Distinct { input })
     }
 
+    /// A fresh read of `input`: every column under a newly minted id.
+    pub(crate) fn alias(ids: &ColIdGen, input: Rc<RelExpr>) -> Rc<RelExpr> {
+        let cols = input
+            .cols()
+            .into_iter()
+            .map(|c| HirCol::new(ids.next(), c.def))
+            .collect();
+        Rc::new(RelExpr::Alias { input, cols })
+    }
+
+    /// A fresh read of `input` under `defs`, one per input column in order — a
+    /// CTE reference, whose columns carry the CTE's names.
+    pub(crate) fn alias_as(ids: &ColIdGen, input: Rc<RelExpr>, defs: &[ColumnDef]) -> Rc<RelExpr> {
+        let cols = defs.iter().map(|d| HirCol::new(ids.next(), d.clone())).collect();
+        Rc::new(RelExpr::Alias { input, cols })
+    }
+
+    /// The relation's row key — the columns that identify a row uniquely — as
+    /// `ColId`s of its output, or `None` where rows have no unique key: a join
+    /// (its key is the join key), a stream (an append-only bag), or a relation
+    /// keyed by a join key. A table's is its primary key, a reduce's its group
+    /// key, a DISTINCT's or set operation's every column; a projection keeps
+    /// the key iff it passes every key column through.
+    pub(crate) fn row_key(&self) -> Option<Vec<ColId>> {
+        match self {
+            RelExpr::Get { schema, cols, desc, .. } => {
+                if desc.as_ref().is_some_and(|d| d.class == gnitz_core::RelClass::Stream) {
+                    return None;
+                }
+                let pk = schema.pk_indices();
+                if pk
+                    .iter()
+                    .any(|&i| lower::join::is_join_key_name(&schema.columns[i].name))
+                {
+                    return None;
+                }
+                Some(pk.iter().map(|&i| cols[i].id).collect())
+            }
+            RelExpr::Filter { input, .. } => input.row_key(),
+            RelExpr::Project { input, items } => input
+                .row_key()?
+                .iter()
+                .map(|k| items.iter().find(|it| as_col(&it.expr) == Some(*k)).map(|it| it.out.id))
+                .collect(),
+            RelExpr::Alias { input, cols } => {
+                let in_cols = input.cols();
+                input
+                    .row_key()?
+                    .iter()
+                    .map(|k| in_cols.iter().position(|c| c.id == *k).map(|p| cols[p].id))
+                    .collect()
+            }
+            RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),
+            RelExpr::Distinct { input } => Some(input.cols().iter().map(|c| c.id).collect()),
+            RelExpr::SetOp { out, .. } => Some(out.iter().map(|c| c.out.id).collect()),
+            RelExpr::Join { .. } => None,
+        }
+    }
+
     /// A set operation. Pairs the two sides' output columns positionally,
     /// promoting each pair to its common type (`set_op_common_type`) and stamping
     /// the per-operator output nullability (Union `l||r`, Intersect `l&&r`, Except
@@ -783,6 +870,10 @@ impl RelExpr {
             RelExpr::Filter { input, preds } => one!(input, |n| RelExpr::filter(n, preds.clone())),
             RelExpr::Project { input, items } => one!(input, |n| RelExpr::project(n, items.clone())),
             RelExpr::Distinct { input } => one!(input, RelExpr::distinct),
+            RelExpr::Alias { input, cols } => one!(input, |n| Rc::new(RelExpr::Alias {
+                input: n,
+                cols: cols.clone(),
+            })),
             RelExpr::Reduce {
                 input,
                 group_cols,
@@ -873,6 +964,7 @@ impl RelExpr {
                 cols
             }
             RelExpr::Distinct { input } => input.cols(),
+            RelExpr::Alias { cols, .. } => cols.clone(),
             RelExpr::SetOp { out, .. } => out.iter().map(|c| c.out.clone()).collect(),
         }
     }

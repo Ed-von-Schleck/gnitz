@@ -1,5 +1,5 @@
 //! CREATE / ALTER VIEW front door: validate the query envelope, then drive the
-//! HIR pipeline — the CTE phase (`hir::bind::bind_ctes`) followed by
+//! HIR pipeline — the CTE phase (`hir::bind::bind_ctes`) and then
 //! `bind_and_lower` of the body — into a `ViewChain` committed atomically.
 //!
 //! Both statements plan into one [`ViewPlan`], which also carries what the
@@ -393,20 +393,14 @@ fn build_query_segments(
     options: ViewOptions,
 ) -> Result<(), GnitzSqlError> {
     let capacity = options.capacity;
-    // The CTE phase compiles each CTE body (a pass-through alias into the binder
-    // cache, or a hidden segment on `chain`) and registers it, so the body below
-    // resolves a CTE by name. A derived table is not pre-compiled — it binds as an
-    // inline subtree inside the body bind (`resolve_table_factor`).
-    crate::hir::bind::bind_ctes(cat, binder, chain, query)?;
-
-    // Every view shape — linear, join, GROUP BY, DISTINCT, set operation, and every
-    // subquery form (EXISTS/IN, scalar aggregate, ANY/ALL) — routes through the HIR
-    // pipeline: bind the `query` body to a logical `RelExpr` tree, decorrelate
-    // subqueries into `Join`/`Reduce` structure, classify predicates, then lower to
-    // circuit(s) — nested combine segments / self-collision pass-through wrappers
-    // land on `chain`, and the final step becomes the chain's slot-0 view.
-    let (circuit, out_cols, pk_cols) =
-        crate::hir::bind_and_lower(cat, binder, chain, query.body.as_ref(), capacity.is_some())?;
+    // Every view shape — linear, join, GROUP BY, DISTINCT, set operation, CTEs,
+    // and every subquery form (EXISTS/IN, scalar aggregate, ANY/ALL) — routes
+    // through the HIR pipeline: bind the `query` to a logical `RelExpr` tree,
+    // decorrelate subqueries into `Join`/`Reduce` structure, classify predicates,
+    // then lower to circuit(s) — nested combine segments, shared CTE subtrees and
+    // self-collision pass-through wrappers land on `chain`, and the final step
+    // becomes the chain's slot-0 view.
+    let (circuit, out_cols, pk_cols) = crate::hir::bind_and_lower(cat, binder, chain, query, capacity.is_some())?;
 
     // Structural eligibility, over what the body actually compiled to rather than
     // over the shapes it was written in: both bounded shapes are a single segment,

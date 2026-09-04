@@ -116,8 +116,17 @@ pub(crate) fn agg_func_name(f: AggFunc) -> &'static str {
 pub(crate) fn classify_agg_call(
     f: &sqlparser::ast::Function,
 ) -> Result<(AggFunc, Option<&sqlparser::ast::Expr>), GnitzSqlError> {
-    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
     reject_unsupported_fn_qualifiers(f, "aggregates")?;
+    classify_agg_shape(f)
+}
+
+/// The argument-shape half of [`classify_agg_call`], with the qualifiers
+/// already checked by the caller — a windowed aggregate (`SUM(x) OVER (…)`)
+/// consumes its `OVER` and classifies its name and argument through here.
+pub(crate) fn classify_agg_shape(
+    f: &sqlparser::ast::Function,
+) -> Result<(AggFunc, Option<&sqlparser::ast::Expr>), GnitzSqlError> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
     let base = single_fn_name(f)
         .and_then(agg_func_from_name)
         .ok_or_else(|| unknown_function(f))?;
@@ -200,9 +209,29 @@ pub(crate) fn unknown_function(f: &sqlparser::ast::Function) -> GnitzSqlError {
     ))
 }
 
-/// Whether a function call names one of the aggregates.
+/// Whether a function call names one of the aggregates. A windowed call is not
+/// one: `SUM(x) OVER (…)` is a window function whose *argument* may hold an
+/// aggregate, and it neither groups its body nor is collected into a reduce.
 pub(crate) fn is_agg_call(f: &sqlparser::ast::Function) -> bool {
-    single_fn_name(f).and_then(agg_func_from_name).is_some()
+    f.over.is_none() && single_fn_name(f).and_then(agg_func_from_name).is_some()
+}
+
+/// The expressions a window specification keys on: its PARTITION BY, then its
+/// ORDER BY. The one definition, so the grouped bind, the operand walk and the
+/// window binder cannot disagree on what a specification references.
+pub(crate) fn window_spec_keys(spec: &sqlparser::ast::WindowSpec) -> impl Iterator<Item = &sqlparser::ast::Expr> {
+    spec.partition_by.iter().chain(spec.order_by.iter().map(|o| &o.expr))
+}
+
+/// Whether a SELECT carries a window call (`… OVER (…)`) in its projection or
+/// its QUALIFY — the routing test for the windowed SELECT list.
+pub(crate) fn select_has_window(select: &sqlparser::ast::Select) -> bool {
+    select_exprs(select).any(|e| {
+        expr_any(
+            e,
+            &|e| matches!(e, sqlparser::ast::Expr::Function(f) if f.over.is_some()),
+        )
+    })
 }
 
 /// Strip redundant parentheses.
@@ -363,17 +392,25 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
             ops.extend(else_result.as_deref());
             ops
         }
-        Expr::Function(f) => match &f.args {
-            FunctionArguments::List(list) => list
-                .args
-                .iter()
-                .filter_map(|a| match a {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => Some(inner),
-                    _ => None,
-                })
-                .collect(),
-            _ => Vec::new(),
-        },
+        // An inline window specification's keys are operands too, so the walkers
+        // see the aggregate in `ORDER BY SUM(x)` and a subquery written there.
+        Expr::Function(f) => {
+            let mut ops: Vec<&Expr> = match &f.args {
+                FunctionArguments::List(list) => list
+                    .args
+                    .iter()
+                    .filter_map(|a| match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => Some(inner),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &f.over {
+                ops.extend(window_spec_keys(spec));
+            }
+            ops
+        }
         _ => Vec::new(),
     }
 }
@@ -413,15 +450,16 @@ pub(crate) fn aliased_def(src: &ColumnDef, alias: Option<String>) -> ColumnDef {
     def
 }
 
-/// The two expression surfaces subquery detection scans — a SELECT's WHERE and its
-/// projection items (a wildcard contributes none). The one definition of "which
-/// surfaces decide subquery detection", shared by the EXISTS/IN and scalar/ANY/ALL
-/// detectors below.
+/// The expression surfaces subquery and window detection scan — a SELECT's
+/// WHERE, its projection items (a wildcard contributes none) and its QUALIFY.
+/// The one definition of "which surfaces decide detection", shared by the
+/// EXISTS/IN, scalar/ANY/ALL and window detectors.
 fn select_exprs(select: &sqlparser::ast::Select) -> impl Iterator<Item = &sqlparser::ast::Expr> {
     select
         .selection
         .iter()
         .chain(select.projection.iter().filter_map(projection_item_expr))
+        .chain(select.qualify.iter())
 }
 
 /// Whether `select` carries a `[NOT] EXISTS` / `[NOT] IN (SELECT …)` subquery in
@@ -550,6 +588,16 @@ pub(crate) fn extract_table_name_and_alias(
 /// Exhaustive destructure (no `..`): a future `sqlparser` `Function` field stops
 /// the build until it is classified consumed / inert / rejected.
 pub(crate) fn reject_unsupported_fn_qualifiers(func: &sqlparser::ast::Function, on: &str) -> Result<(), GnitzSqlError> {
+    reject_fn_qualifiers(func, on, false)
+}
+
+/// [`reject_unsupported_fn_qualifiers`] for a call whose `OVER` the caller
+/// consumes: every other qualifier is rejected the same way.
+pub(crate) fn reject_window_fn_qualifiers(func: &sqlparser::ast::Function, on: &str) -> Result<(), GnitzSqlError> {
+    reject_fn_qualifiers(func, on, true)
+}
+
+fn reject_fn_qualifiers(func: &sqlparser::ast::Function, on: &str, over_consumed: bool) -> Result<(), GnitzSqlError> {
     use sqlparser::ast::{DuplicateTreatment, FunctionArguments};
     let sqlparser::ast::Function {
         // Consumed: the name dispatches the call, the argument list is bound.
@@ -572,7 +620,7 @@ pub(crate) fn reject_unsupported_fn_qualifiers(func: &sqlparser::ast::Function, 
     if filter.is_some() {
         return unsupported("FILTER (WHERE …)");
     }
-    if over.is_some() {
+    if over.is_some() && !over_consumed {
         return unsupported("window functions (OVER)");
     }
     if !within_group.is_empty() {

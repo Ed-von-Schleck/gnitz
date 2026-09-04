@@ -93,7 +93,7 @@ fn emit_step(
         resolve_input(chain, memo, left, &live)?,
         resolve_input(chain, memo, right, &live)?,
     ];
-    resolve_collisions(chain, &mut inputs, &[left, right], false)?;
+    resolve_collisions(chain, &mut inputs, false)?;
     let [left_in, right_in] = inputs;
 
     match class.shape() {
@@ -1153,6 +1153,15 @@ pub(crate) fn join_pk_coldefs(target_tcs: &[TypeCode]) -> Vec<ColumnDef> {
             ColumnDef::new(name, t, false).hidden()
         })
         .collect()
+}
+
+/// Whether a column name is one this module mints for a synthetic join key.
+/// Such a key identifies a matched *pair*, not a row, and is not unique — so a
+/// relation keyed by one has no row identity. The predicate sits beside the two
+/// producers ([`join_pk_coldefs`] and `pair_pk_coldefs`) so renaming either
+/// cannot silently make a reader believe the key is a row key.
+pub(crate) fn is_join_key_name(name: &str) -> bool {
+    name.starts_with("_join_pk") || name.starts_with("_pair_pk")
 }
 
 /// The band re-key's union-layout schema `[_join_pk × k, A cols, B cols]`

@@ -9,7 +9,7 @@
 use super::super::physical;
 use super::super::{is_pre_map, ColId, HirExpr, HirRef, ProjEntry, RelExpr};
 use super::{
-    cut_segment, emit_filter, extract_scan_bound, reduce_out_layout, resolve_reduce_specs, seginput_of_get,
+    cut_segment, emit_filter, extract_scan_bound, reduce_out_layout, resolve_in_place, resolve_reduce_specs,
     split_filter, CutMemo, ReduceSpecs,
 };
 use crate::agg::{emit_reduce, ensure_cardinality_count, reduce_output_schema, ReduceLayout, ReduceShape};
@@ -44,30 +44,26 @@ pub(crate) fn lower_reduce(
     };
 
     // The pre-map bind inserted so the reduce could group by, or aggregate, an
-    // expression. Emitted as a map in this circuit; cutting it to its own segment
-    // would materialize a second copy of the source forever.
-    let (pre_map, reduce_input) = match input.as_ref() {
-        RelExpr::Project { input: below, items }
-            if is_pre_map(below, items) && seginput_of_get(split_filter(below).1).is_some() =>
-        {
-            (Some(items.as_slice()), below)
-        }
+    // expression, and the source under it.
+    let (mut pre_map, reduce_input) = match input.as_ref() {
+        RelExpr::Project { input: below, items } if is_pre_map(below, items) => (Some(items.as_slice()), below),
         _ => (None, input),
     };
 
-    // Resolve the reduce's input: inline a base/segment `Get` (with WHERE + scan
-    // bound), or cut a combine input (`Filter?(Join)`) to a hidden segment.
+    // Resolve that source: read it in place (applying the WHERE and scan bound
+    // here), or cut the whole input to a hidden segment. The pre-map fuses only
+    // on the in-place arm — over a cut source it is already inside the segment,
+    // and emitting it again would materialize a second copy forever.
     let (inner_where, inner_source) = split_filter(reduce_input);
-    let (source, bound, where_preds) = match seginput_of_get(inner_source) {
+    let (source, bound, where_preds) = match resolve_in_place(chain, memo, inner_source)? {
         Some(seg) => {
-            // Base/segment Get: apply the WHERE + scan bound inline.
             let preds = physical::resolve_preds(inner_where, &seg.layout)?;
             let bound = extract_scan_bound(&preds, &seg);
             (seg, bound, preds)
         }
         None => {
-            // Cut the whole input (WHERE included) to a hidden segment; the reduce
-            // reads it delta-bounded with no bound / no re-applied WHERE.
+            pre_map = None;
+            // The reduce reads the segment delta-bounded: no bound, no re-applied WHERE.
             let mut live: HashSet<ColId> = HashSet::new();
             live.extend(group_cols.iter().copied());
             live.extend(aggs.iter().filter_map(|a| a.arg));

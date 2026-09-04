@@ -9,11 +9,11 @@
 
 use super::super::{slot_of, ColId, HirCol, HirExpr, ProjEntry, RelExpr, SetOpKind};
 use super::prims::self_derived_key;
-use super::{cut_segment, emit_filter, resolve_collisions, seginput_of_get, CutMemo, SegInput};
+use super::{emit_filter, resolve_collisions, resolve_in_place, resolve_input, CutMemo, SegInput};
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::physical;
-use crate::ir::{BExpr, BoundExpr};
+use crate::ir::BoundExpr;
 use crate::validate::reject_float_keys;
 use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, TypeCode};
 use std::collections::HashSet;
@@ -157,7 +157,7 @@ fn lower_sides(
     // The collision rule may re-point a side at a pass-through wrapper segment; the
     // wrapper's layout still carries the source ids, so the addressing kind holds.
     let mut inputs = [l_seg, r_seg];
-    resolve_collisions(chain, &mut inputs, &sides, exempt)?;
+    resolve_collisions(chain, &mut inputs, exempt)?;
     let [l_seg, r_seg] = inputs;
     let (l_node, l_slots) = emit_side(cb, &l_seg, &l_kind, &side_ids[0])?;
     let (r_node, r_slots) = emit_side(cb, &r_seg, &r_kind, &side_ids[1])?;
@@ -190,30 +190,31 @@ fn resolve_set_input<'a>(
     side: &'a Rc<RelExpr>,
     side_ids: &[ColId],
 ) -> Result<(SegInput, SetSideKind<'a>), GnitzSqlError> {
-    if let Some((get, items, where_preds)) = passthrough_parts(side) {
-        // A pass-through side's base is a `Get`, so it is read in place and can
-        // never be cut — no live set is consulted.
-        let seg = seginput_of_get(get).expect("a pass-through side's base is a Get");
-        return Ok((seg, SetSideKind::PassThrough { items, where_preds }));
+    // A pass-through side is one only while its base is read in place: a base
+    // that must be cut has no set identity until it is materialized, so the side
+    // becomes an ordinary segment.
+    if let Some((base, items, where_preds)) = passthrough_parts(side) {
+        if let Some(seg) = resolve_in_place(chain, memo, base)? {
+            return Ok((seg, SetSideKind::PassThrough { items, where_preds }));
+        }
     }
     let live: HashSet<ColId> = side_ids.iter().copied().collect();
-    Ok((cut_segment(chain, memo, side, &live)?, SetSideKind::Segment))
+    Ok((resolve_input(chain, memo, side, &live)?, SetSideKind::Segment))
 }
 
-/// A pure pass-through side (`Project(Filter?(Get))` whose every item is a bare
-/// column ref), split into its base `Get`, projection items, and WHERE — else
-/// `None`, since a computed item has no set identity until it is materialized.
-/// Returning the parts (rather than just the `Get`) is what lets the emit below
-/// consume the shape without re-matching it.
+/// A `Project(Filter?(_))` whose every item is a bare column ref, split into its
+/// base, projection items and WHERE — else `None`, since a computed item has no
+/// set identity until it is materialized. Returning the parts (rather than just
+/// the base) is what lets the emit below consume the shape without re-matching.
 fn passthrough_parts(side: &Rc<RelExpr>) -> Option<(&Rc<RelExpr>, &[ProjEntry], &[HirExpr])> {
     let RelExpr::Project { input, items } = side.as_ref() else {
         return None;
     };
-    if !items.iter().all(|e| matches!(&e.expr, BExpr::ColRef(_))) {
+    if super::projection_is_computed(items) {
         return None;
     }
     let (where_preds, inner) = super::split_filter(input);
-    matches!(inner.as_ref(), RelExpr::Get { .. }).then_some((inner, items, where_preds))
+    Some((inner, items, where_preds))
 }
 
 /// Emit one resolved side's delta input and return it with the slots

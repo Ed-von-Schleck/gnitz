@@ -223,6 +223,9 @@ pub(crate) struct HonoredClauses {
     /// Plain `DISTINCT`. Honored only by the DISTINCT path (which dedups after
     /// this returns). `DISTINCT ON` is always rejected, independent of this flag.
     pub(crate) distinct: bool,
+    /// `QUALIFY` and the `WINDOW` clause. Honored by a view body, whose SELECT
+    /// list binds window calls; nowhere else.
+    pub(crate) windows: bool,
 }
 
 impl HonoredClauses {
@@ -231,6 +234,7 @@ impl HonoredClauses {
     pub(crate) const PLAIN: HonoredClauses = HonoredClauses {
         grouping: false,
         distinct: false,
+        windows: false,
     };
 
     /// The grouped-vs-DISTINCT split every SELECT-bodied surface makes, in one
@@ -242,7 +246,14 @@ impl HonoredClauses {
         HonoredClauses {
             grouping: grouped && !distinct,
             distinct,
+            windows: false,
         }
+    }
+
+    /// The view-body surface: the one that binds window calls, so QUALIFY and
+    /// the WINDOW clause are honored — an ad-hoc read keeps rejecting both.
+    pub(crate) fn with_windows(self) -> Self {
+        HonoredClauses { windows: true, ..self }
     }
 }
 
@@ -277,17 +288,18 @@ pub(crate) fn reject_unhonored_select_clauses(
         distinct,
         group_by,
         having,
+        // Conditionally honored (see `HonoredClauses::windows`).
+        qualify,
+        named_window,
         // Never honored: each carries semantics no view builder implements.
         top,
         into,
         prewhere,
-        qualify,
         connect_by,
         lateral_views,
         cluster_by,
         distribute_by,
         sort_by,
-        named_window,
         // `SELECT * EXCLUDE (c)` (Redshift/DuckDB) drops columns from the
         // wildcard: silently dropping it would widen the view's output schema.
         exclude,
@@ -321,14 +333,24 @@ pub(crate) fn reject_unhonored_select_clauses(
     reject_if(top.is_some(), context, "TOP")?;
     reject_if(prewhere.is_some(), context, "PREWHERE")?;
     reject_if(into.is_some(), context, "SELECT INTO")?;
-    reject_if(qualify.is_some(), context, "QUALIFY")?;
     reject_if(!connect_by.is_empty(), context, "CONNECT BY")?;
     reject_if(exclude.is_some(), context, "SELECT * EXCLUDE")?;
     reject_if(!lateral_views.is_empty(), context, "LATERAL VIEW")?;
     reject_if(!cluster_by.is_empty(), context, "CLUSTER BY")?;
     reject_if(!distribute_by.is_empty(), context, "DISTRIBUTE BY")?;
     reject_if(!sort_by.is_empty(), context, "SORT BY")?;
-    reject_if(!named_window.is_empty(), context, "WINDOW")?;
+    if honored.windows {
+        // Honored, so not reported unsupported — but a QUALIFY with no window
+        // value to filter on would then be silently dropped.
+        if qualify.is_some() && !crate::ast_util::select_has_window(select) {
+            return Err(GnitzSqlError::Unsupported(
+                "QUALIFY needs a window function in the SELECT list or in the QUALIFY predicate".into(),
+            ));
+        }
+    } else {
+        reject_if(qualify.is_some(), context, "QUALIFY")?;
+        reject_if(!named_window.is_empty(), context, "WINDOW")?;
+    }
     Ok(())
 }
 

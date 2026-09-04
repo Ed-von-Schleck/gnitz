@@ -152,12 +152,12 @@ pub(crate) struct SegInput {
 /// dropped it would split a shared node into two segments). Per-shell memos would
 /// defeat both.
 ///
-/// No producer shares a node *today* — bind builds a tree, and decorrelation
-/// dedups its cloned subquery `rel`s before placing them. Two references to one
-/// CTE are **not** an exception: each mints a fresh `Get` on the same tid, which
-/// [`resolve_collisions`] reconciles by tid, not this memo by identity. The memo
-/// keeps single-cutting a property of the lowering rather than an obligation on
-/// every producer.
+/// Shared nodes reach the lowering through `RelExpr::Alias` — a CTE named twice,
+/// and the window desugar's reads of its own `W` — and this memo is what cuts
+/// each such subtree once, however many aliases read it. Where two aliases then
+/// meet as inputs of one combine, [`resolve_collisions`] gives the later one a
+/// pass-through wrapper, since a circuit's delta inputs must carry distinct
+/// source ids.
 pub(crate) type CutMemo = HashMap<*const RelExpr, SegInput>;
 
 /// Insert every `HirRef::Col` id referenced anywhere in `exprs` into `live` — the
@@ -269,6 +269,11 @@ fn reject_ineligible_capacity_body(rel: &RelExpr) -> Result<(), GnitzSqlError> {
     let shape = match rel {
         RelExpr::Project { input, items } => {
             let (_, source) = split_filter(input);
+            // An alias reads what it aliases; the shape is the target's.
+            let mut source = source;
+            while let RelExpr::Alias { input, .. } = source.as_ref() {
+                source = input;
+            }
             match source.as_ref() {
                 // The cut materializes the whole pre-WHERE combine output at full
                 // width in a hidden, unbounded segment, so a capacity here would
@@ -354,8 +359,8 @@ fn lower_body(
                 RelExpr::Reduce { .. } => reduce::lower_reduce(chain, memo, items, fpreds, source),
                 // A derived table (a projection, DISTINCT, or set operation) is not a
                 // delta source the linear path can read in place, so it cuts even for
-                // a bare-column projection.
-                RelExpr::Project { .. } | RelExpr::Distinct { .. } | RelExpr::SetOp { .. } => {
+                // a bare-column projection; an alias resolves to whatever it reads.
+                RelExpr::Project { .. } | RelExpr::Distinct { .. } | RelExpr::SetOp { .. } | RelExpr::Alias { .. } => {
                     lower_computed_over_combine(chain, memo, items, fpreds, source)
                 }
                 _ => Err(unsupported_body()),
@@ -407,7 +412,7 @@ fn lower_computed_over_combine(
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     let mut live: HashSet<ColId> = HashSet::new();
     collect_live_cols(items.iter().map(|i| &i.expr).chain(where_preds), &mut live);
-    let seg = cut_segment(chain, memo, source, &live)?;
+    let seg = resolve_input(chain, memo, source, &live)?;
     lower_linear(&seg, where_preds, items)
 }
 
@@ -421,18 +426,52 @@ fn unsupported_body() -> GnitzSqlError {
 /// Resolve one input of a combine node to a `SegInput` — **the** segment-cut
 /// rule, in one place rather than re-derived as a structural match per lowering
 /// shell. A bare `Get` is read in place (the delta source is the relation
-/// itself); every other shape — a nested combine, or a linear spine whose
-/// projection must be materialized first — is cut to a hidden segment.
+/// itself), and an alias is whatever it reads under its own ids; every other
+/// shape — a nested combine, or a linear spine whose projection must be
+/// materialized first — is cut to a hidden segment.
 pub(crate) fn resolve_input(
     chain: &mut ViewChain,
     memo: &mut CutMemo,
     input: &Rc<RelExpr>,
     live: &HashSet<ColId>,
 ) -> Result<SegInput, GnitzSqlError> {
-    match seginput_of_get(input) {
+    match resolve_in_place(chain, memo, input)? {
         Some(seg) => Ok(seg),
         None => cut_segment(chain, memo, input, live),
     }
+}
+
+/// The half of [`resolve_input`] that materializes nothing new: a `Get` read in
+/// place, or an alias resolved to its input's source (cut once with every column
+/// live, since every alias of it reads that one segment) under the alias's own
+/// ids. `None` for a shape that must be cut — the one test of "is this read in
+/// place", which the reduce and set-op shells ask directly because their inline
+/// arms do their own WHERE and scan-bound work.
+pub(crate) fn resolve_in_place(
+    chain: &mut ViewChain,
+    memo: &mut CutMemo,
+    input: &Rc<RelExpr>,
+) -> Result<Option<SegInput>, GnitzSqlError> {
+    if let Some(seg) = seginput_of_get(input) {
+        return Ok(Some(seg));
+    }
+    let RelExpr::Alias { input: inner, cols } = input.as_ref() else {
+        return Ok(None);
+    };
+    let inner_cols = inner.cols();
+    let all: HashSet<ColId> = inner_cols.iter().map(|c| c.id).collect();
+    let seg = resolve_input(chain, memo, inner, &all)?;
+    let layout = seg
+        .layout
+        .iter()
+        .map(|id| {
+            inner_cols
+                .iter()
+                .position(|c| c.id == *id)
+                .map_or(ColId::NONE, |p| cols[p].id)
+        })
+        .collect();
+    Ok(Some(SegInput { layout, ..seg }))
 }
 
 /// Cut a subtree to a hidden segment and return a `SegInput` over it. A subtree
@@ -451,13 +490,7 @@ pub(crate) fn cut_segment(
         return Ok(cached.clone());
     }
     let body = as_body(subtree, live);
-    let (seg_vid, seg_schema, layout) = chain.add_segment(|chain| lower_body(chain, memo, &body))?;
-    let seg = SegInput {
-        tid: seg_vid,
-        schema: seg_schema,
-        layout,
-        desc: None,
-    };
+    let seg = chain.add_segment(|chain| lower_body(chain, memo, &body))?;
     memo.insert(key, seg.clone());
     Ok(seg)
 }
@@ -482,16 +515,21 @@ fn as_body(subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Rc<RelExpr> {
             }
         }
         RelExpr::Distinct { .. } | RelExpr::SetOp { .. } => Rc::clone(subtree),
-        _ => identity_project(subtree, |c| live.contains(&c.id)),
+        // The HIR spelling of `SELECT <live cols> FROM <subtree>`.
+        _ => {
+            let items = RelExpr::passthrough_items(subtree.cols().into_iter().filter(|c| live.contains(&c.id)));
+            RelExpr::project(Rc::clone(subtree), items)
+        }
     }
 }
 
 /// Resolve the source-collision rule over a combine's already-resolved inputs:
 /// a circuit's delta inputs must carry distinct source ids, so a repeated `tid`
 /// wraps the later side in an identity pass-through segment. One home for the
-/// self-join wrapper and the same-relation INTERSECT/EXCEPT wrapper — it compares
-/// **resolved** tids, so a side that already became its own segment is correctly
-/// seen as distinct and never wrapped redundantly.
+/// self-join wrapper (a table twice, or a shared segment through two aliases)
+/// and the same-relation INTERSECT/EXCEPT wrapper — it compares **resolved**
+/// tids, so a side that already became its own segment is correctly seen as
+/// distinct and never wrapped redundantly.
 ///
 /// `exempt` skips the rule for UNION / UNION ALL: those are linear merges the dag
 /// explicitly drives by cloning one epoch's delta to both sides, and `a UNION a`
@@ -499,70 +537,44 @@ fn as_body(subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Rc<RelExpr> {
 pub(crate) fn resolve_collisions(
     chain: &mut ViewChain,
     inputs: &mut [SegInput],
-    sources: &[&Rc<RelExpr>],
     exempt: bool,
 ) -> Result<(), GnitzSqlError> {
     if exempt {
         return Ok(());
     }
     let mut seen: HashSet<u64> = HashSet::new();
-    for (i, input) in inputs.iter_mut().enumerate() {
+    for input in inputs.iter_mut() {
         if seen.insert(input.tid) {
             continue;
         }
-        // Only a bare `Get` can collide — a cut segment carries a fresh vid.
-        let get = base_get(sources[i]);
-        if !matches!(get.as_ref(), RelExpr::Get { .. }) {
-            return Err(GnitzSqlError::Internal(
-                "HIR source collision on a non-Get input".into(),
-            ));
-        }
-        *input = wrap_passthrough_segment(chain, get)?;
+        *input = wrap_passthrough_segment(chain, input)?;
         seen.insert(input.tid);
     }
     Ok(())
 }
 
-/// The `Get` at the base of a linear spine, else the node itself.
-fn base_get(rel: &Rc<RelExpr>) -> &Rc<RelExpr> {
-    match rel.as_ref() {
-        RelExpr::Filter { input, .. } | RelExpr::Project { input, .. } => base_get(input),
-        _ => rel,
-    }
-}
-
-/// An identity `Project` over the columns of `subtree` that satisfy `keep` — the
-/// HIR spelling of `SELECT <cols> FROM <subtree>`, shared by the segment-cut wrap
-/// (live cols) and the collision pass-through wrap (visible cols).
-fn identity_project(subtree: &Rc<RelExpr>, keep: impl Fn(&super::HirCol) -> bool) -> Rc<RelExpr> {
-    let items = RelExpr::passthrough_items(subtree.cols().into_iter().filter(|c| keep(c)));
-    RelExpr::project(Rc::clone(subtree), items)
-}
-
-/// Wrap a `Get` in an identity pass-through segment and return a `SegInput` over
-/// it — the collision-resolution device shared by the self-join wrapper and the
-/// same-relation set-op/DISTINCT wrapper.
+/// Wrap a resolved source in an identity pass-through segment and return a
+/// `SegInput` over it — the collision-resolution device shared by the self-join
+/// wrapper and the same-relation set-op/DISTINCT wrapper.
 ///
-/// Built as a HIR identity `Project` over the `Get`'s **visible** columns and
+/// Built as a HIR identity `Project` over the source's **visible** columns and
 /// lowered through `lower_linear`, so the wrapper is an ordinary linear body: the
 /// PK-front convention and the resulting `ColId` layout both come from
 /// `physicalize_projection`, the one home, instead of being hand-rolled here
 /// against a separately-synthesized `SELECT *`.
-fn wrap_passthrough_segment(chain: &mut ViewChain, get: &Rc<RelExpr>) -> Result<SegInput, GnitzSqlError> {
-    // Visible columns only — `place_pk_front` re-prepends an unprojected source
-    // PK (staying hidden), exactly as a `SELECT *` view body would.
-    let body = identity_project(get, |c| !c.def.is_hidden);
-    let RelExpr::Project { items, .. } = body.as_ref() else {
-        unreachable!("identity_project builds a Project");
-    };
-    let src = seginput_of_get(get).expect("pass-through wrapper receives a Get");
-    let (wrap_vid, wrap_schema, layout) = chain.add_segment(|_chain| lower_linear(&src, &[], items))?;
-    Ok(SegInput {
-        tid: wrap_vid,
-        schema: wrap_schema,
-        layout,
-        desc: None,
-    })
+fn wrap_passthrough_segment(chain: &mut ViewChain, src: &SegInput) -> Result<SegInput, GnitzSqlError> {
+    // Visible columns only, under the source's own layout ids — `place_pk_front`
+    // re-prepends an unprojected source PK (staying hidden), exactly as a
+    // `SELECT *` view body would.
+    let items = RelExpr::passthrough_items(
+        src.schema
+            .columns
+            .iter()
+            .zip(&src.layout)
+            .filter(|(def, _)| !def.is_hidden)
+            .map(|(def, id)| super::HirCol::new(*id, def.clone())),
+    );
+    chain.add_segment(|_chain| lower_linear(src, &[], &items))
 }
 
 /// Split an optional `Filter` off a node, returning its conjuncts (empty when

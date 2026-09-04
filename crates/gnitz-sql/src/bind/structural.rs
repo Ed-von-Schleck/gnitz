@@ -81,6 +81,13 @@ pub(crate) trait LeafBinder<R = usize> {
     /// Whether the value a leaf reference names can be NULL — the one
     /// nullability fact a leaf owns, which [`null_test`] folds a test by.
     fn is_nullable(&self, r: &R) -> bool;
+    /// Whether a windowed call (`f(…) OVER (…)`) may be written here. Only the
+    /// windowed SELECT list and QUALIFY of a view body admit one; every other
+    /// context — a WHERE, a HAVING, an ad-hoc read, and a window call's own
+    /// operands — rejects it in [`bind_structural`].
+    fn binds_windows(&self) -> bool {
+        false
+    }
     /// A subquery node — `[NOT] EXISTS`, `[NOT] IN (SELECT …)`, a scalar
     /// `(SELECT …)`, or an `ANY`/`ALL`/`SOME` comparison. The HIR view leaf
     /// overrides this to record/bind the subquery for decorrelation; every other
@@ -116,6 +123,13 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         // functions) bind here, above the leaf, so all three leaf impls stay
         // untouched. Every other name falls through to the leaf — aggregates, or a
         // context rejection.
+        // Asked here, where every call funnels through, so a scalar call, an
+        // aggregate and an unknown name are refused alike.
+        Expr::Function(f) if f.over.is_some() && !leaf.binds_windows() => Err(GnitzSqlError::Unsupported(
+            "window functions (OVER) are only supported in the SELECT list and QUALIFY of a CREATE VIEW \
+             body, and cannot be nested in another window function's operands"
+                .into(),
+        )),
         Expr::Function(f) => match scalar_call(f) {
             Some((name, call)) => bind_scalar_call(name, call, f, leaf),
             None => leaf.bind_function(f),
@@ -820,18 +834,17 @@ fn bind_coalesce<R: Clone, L: LeafBinder<R>>(args: &[&Expr], leaf: &L) -> Result
     }
 }
 
-/// `value IS [NOT] NULL`, settled at bind time where the value's nullness is
-/// known — a literal, or a leaf reference the leaf vouches for — so a never-null
-/// operand costs no test at runtime and a filter over one can be elided whole.
-/// Anything else is a `NullTest` over the value.
+/// `value IS [NOT] NULL`, settled at bind time wherever the value's nullness is
+/// provable ([`BExpr::never_null_with`] over the leaf's own verdict per
+/// reference), so a never-null operand costs no test at runtime and a filter
+/// over one can be elided whole. Anything else is a `NullTest` over the value.
 pub(crate) fn null_test<R, L: LeafBinder<R>>(value: BExpr<R>, want_null: bool, leaf: &L) -> BExpr<R> {
     // `Some(true)`: provably never NULL; `Some(false)`: always NULL; `None`:
-    // only the row can tell.
+    // only the row can tell. `LitNull` leads — it is the one value the prover
+    // reports as nullable *because* it is always NULL.
     let never_null = match &value {
-        BExpr::ColRef(r) => (!leaf.is_nullable(r)).then_some(true),
         BExpr::LitNull => Some(false),
-        BExpr::LitInt(_) | BExpr::LitFloat(_) | BExpr::LitStr(_) | BExpr::LitWide(_) => Some(true),
-        _ => None,
+        v => v.never_null_with(&|r| leaf.is_nullable(r)).then_some(true),
     };
     match never_null {
         Some(never_null) => BExpr::LitInt(i64::from(never_null != want_null)),

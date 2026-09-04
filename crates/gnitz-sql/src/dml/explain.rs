@@ -112,10 +112,11 @@ fn order_limit_facts(spec: &SpecRead) -> Vec<String> {
 /// before serving. EXPLAIN cannot know staleness at plan time, so it names the
 /// condition, not a verdict.
 fn read_line(target: &Target) -> String {
-    match target.desc.as_ref().map(|d| d.class) {
-        Some(c) if c.is_view() => format!("read view {} (drains pending ticks when stale)", target.name),
-        Some(c) => format!("read {} {}", c.noun(), target.name),
-        None => format!("read {}", target.name),
+    let class = target.desc.class;
+    if class.is_view() {
+        format!("read view {} (drains pending ticks when stale)", target.name)
+    } else {
+        format!("read {} {}", class.noun(), target.name)
     }
 }
 

@@ -332,6 +332,8 @@ impl ReadCursor {
     /// already open. Debug-asserts the strict ascent the gate above reads as proof
     /// of absence — the one way to misuse it, so it fails a test rather than
     /// quietly under-reporting a group.
+    // `key` feeds the tripwire alone, which a release build compiles out.
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))]
     fn note_sweep_key(&mut self, key: &[u8]) -> bool {
         let open = std::mem::replace(&mut self.sweep_open, true);
         #[cfg(debug_assertions)]

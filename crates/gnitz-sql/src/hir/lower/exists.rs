@@ -13,8 +13,8 @@ use super::join::{
 };
 use super::prims::{keep_all, rekey_aux_on_source_pk};
 use super::{
-    apply_projection, collect_live_cols, emit_filter, key_region_layout, resolve_collisions, resolve_input,
-    resolve_projection, seginput_of_get, split_filter, CutMemo, SegInput,
+    apply_projection, collect_live_cols, emit_filter, key_region_layout, resolve_collisions, resolve_in_place,
+    resolve_input, resolve_projection, split_filter, CutMemo, SegInput,
 };
 use crate::codec::project_schema::{compile_projection_map, declared_out_cols, ProjItem};
 use crate::error::GnitzSqlError;
@@ -98,14 +98,14 @@ fn emit_exists_circuit(
 
     let left_in = resolve_input(chain, memo, left, &live)?;
     let (inner_preds, inner_src) = split_filter(right);
-    let right_in = seginput_of_get(inner_src)
-        .ok_or_else(|| GnitzSqlError::Internal("EXISTS/IN inner relation is not a base Get".into()))?;
+    let right_in = resolve_in_place(chain, memo, inner_src)?
+        .ok_or_else(|| GnitzSqlError::Internal("EXISTS/IN inner relation is not read in place".into()))?;
 
     // Self-collision: EXISTS/IN over the outer's own relation must read the inner
     // as a distinct source (single-source-per-epoch) — wrap the colliding inner
     // side in a pass-through segment (the shared source-collision rule).
     let mut inputs = [left_in, right_in];
-    resolve_collisions(chain, &mut inputs, &[left, right], false)?;
+    resolve_collisions(chain, &mut inputs, false)?;
     let [left_in, right_in] = inputs;
 
     let a_n = left_in.schema.columns.len();
