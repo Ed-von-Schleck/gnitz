@@ -19,7 +19,7 @@
 //! [`BatchView`] for *where a value physically sits* and [`SchemaFacts`] for
 //! *what the schema says about it*.
 //!
-//! `LogicalInstr::to_wire` and `LogicalProgram::decode_triple` are two tables over
+//! `LogicalInstr::to_wire` and `LogicalProgram::decode_instr` are two tables over
 //! `gnitz_wire::ExprOp`; both live in `program.rs`, and `tests/program.rs`'s
 //! drift tests are what check them against each other.
 //!

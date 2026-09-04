@@ -151,19 +151,19 @@ impl Evaluator {
 
     /// The scalar-register emits: one bulk copy of the register image each.
     pub fn scalar_emits(&self) -> &[(u16, u32)] {
-        self.prog.scalar_emits()
+        &self.prog.scalar_emits
     }
 
     /// The string-register emits: a German-string cell encoded per row each.
     pub fn str_emits(&self) -> &[(u16, u32)] {
-        self.prog.str_emits()
+        &self.prog.str_emits
     }
 
     /// True iff the program writes any output slot out of the register file, so
     /// driving the kernel can change the output. A pure projection emits
     /// nothing.
     pub fn emits_anything(&self) -> bool {
-        !self.prog.emits.is_empty()
+        !self.scalar_emits().is_empty() || !self.str_emits().is_empty()
     }
 
     /// Bit `N` set iff payload slot `N` of the schema this program was resolved

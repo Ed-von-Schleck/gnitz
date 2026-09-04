@@ -17,7 +17,10 @@ wire_enum! {
         Filter = 1,
         Negate = 3,
         Union = 4,
-        JoinDeltaTrace = 5,
+        /// Symmetric delta-trace join. Which probe — equal-key seek, ordered
+        /// range walk, or full cross product — is a [`JoinKind`] tag leading the
+        /// params blob, not a second opcode.
+        Join = 5,
         /// Primary INTEGRATE: writes to view storage.
         Integrate = 7,
         Reduce = 9,
@@ -36,9 +39,6 @@ wire_enum! {
         MapExpr = 27,
         /// MAP sub-variant: copy all columns to payload, set PK = hash of full row.
         MapHashRow = 29,
-        /// Non-equi (range) join: symmetric delta-trace join whose probe is an
-        /// ordered half-open range walk over the trace instead of an equal-key seek.
-        JoinDeltaTraceRange = 32,
         /// Drop trace rows this worker does not own — the trace side of a broadcast
         /// join input (a **pure** range join and the keyless cross join; a band join
         /// scatters by its eq prefix and omits this node). Worker identity is a
@@ -55,17 +55,13 @@ wire_enum! {
         /// shape — a compute map has a program blob and declared output columns, a
         /// reindex two column lists and no program.
         MapReindex = 35,
-        /// Keyless (cross) join: symmetric delta-trace join whose probe pairs every
-        /// delta row with every trace row. No parameters — there is no key to
-        /// describe.
-        JoinDeltaTraceCross = 36,
     }
 }
 
 /// The `params` blob layout. Folded into [`crate::SYS_SCHEMA_DIGEST`] rather
 /// than written into the blob, so a bump rejects an existing data directory at
 /// boot instead of reinterpreting it.
-pub(crate) const CIRCUIT_PARAMS_VERSION: u8 = 1;
+pub(crate) const CIRCUIT_PARAMS_VERSION: u8 = 2;
 
 // ---------------------------------------------------------------------------
 // Circuit-layer type aliases
@@ -308,8 +304,27 @@ pub enum ReduceOutSlot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JoinKind {
     DeltaTrace,
-    DeltaTraceRange { n_eq: u8, rel: RangeRel },
+    /// Non-equi (range) join: the probe is an ordered half-open range walk over
+    /// the trace instead of an equal-key seek.
+    DeltaTraceRange {
+        n_eq: u8,
+        rel: RangeRel,
+    },
+    /// Keyless (cross) join: the probe pairs every delta row with every trace
+    /// row.
     DeltaTraceCross,
+}
+
+wire_enum! {
+    /// Which probe [`JoinKind`] names, leading `Opcode::Join`'s params blob. A
+    /// separate enum because `JoinKind` carries data, which a wire enum cannot;
+    /// named for the probe rather than mirroring `JoinKind`'s shared
+    /// `DeltaTrace` prefix, which discriminates nothing.
+    pub(crate) enum JoinKindTag: u8 {
+        Equi = 0,
+        Range = 1,
+        Cross = 2,
+    }
 }
 
 wire_enum! {
@@ -598,12 +613,16 @@ pub fn encode_op_node(op: OpNode) -> (Opcode, Option<TableId>, Option<Vec<u8>>) 
             }
             (Opcode::Reduce, None, Some(w.into_vec()))
         }
-        OpNode::Join(JoinKind::DeltaTrace) => (Opcode::JoinDeltaTrace, None, None),
-        OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel }) => {
-            w.u8(n_eq).u8(rel.as_wire() as u8);
-            (Opcode::JoinDeltaTraceRange, None, Some(w.into_vec()))
+        OpNode::Join(kind) => {
+            match kind {
+                JoinKind::DeltaTrace => w.u8(JoinKindTag::Equi.as_wire()),
+                JoinKind::DeltaTraceRange { n_eq, rel } => {
+                    w.u8(JoinKindTag::Range.as_wire()).u8(n_eq).u8(rel.as_wire() as u8)
+                }
+                JoinKind::DeltaTraceCross => w.u8(JoinKindTag::Cross.as_wire()),
+            };
+            (Opcode::Join, None, Some(w.into_vec()))
         }
-        OpNode::Join(JoinKind::DeltaTraceCross) => (Opcode::JoinDeltaTraceCross, None, None),
         OpNode::IntegrateSink => (Opcode::Integrate, None, None),
         OpNode::IntegrateTrace => (Opcode::IntegrateTrace, None, None),
         OpNode::ExchangeShard { shard_cols } => {
@@ -718,15 +737,21 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<TableId>, params: Option<&[u8
             }
             OpNode::Reduce { group_cols, agg, global_ground, out_key }
         }
-        Opcode::JoinDeltaTrace => OpNode::Join(JoinKind::DeltaTrace),
-        Opcode::JoinDeltaTraceRange => {
-            let n_eq = r.u8()?;
-            let rel_byte = r.u8()?;
-            let rel = RangeRel::from_wire(rel_byte as u64)
-                .ok_or_else(|| format!("JOIN_DELTA_TRACE_RANGE unknown rel {rel_byte}"))?;
-            OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel })
+        Opcode::Join => {
+            let tag_byte = r.u8()?;
+            let tag = JoinKindTag::from_wire(tag_byte).ok_or_else(|| format!("JOIN unknown kind {tag_byte}"))?;
+            OpNode::Join(match tag {
+                JoinKindTag::Equi => JoinKind::DeltaTrace,
+                JoinKindTag::Range => {
+                    let n_eq = r.u8()?;
+                    let rel_byte = r.u8()?;
+                    let rel =
+                        RangeRel::from_wire(rel_byte as u64).ok_or_else(|| format!("JOIN unknown rel {rel_byte}"))?;
+                    JoinKind::DeltaTraceRange { n_eq, rel }
+                }
+                JoinKindTag::Cross => JoinKind::DeltaTraceCross,
+            })
         }
-        Opcode::JoinDeltaTraceCross => OpNode::Join(JoinKind::DeltaTraceCross),
         Opcode::Integrate => OpNode::IntegrateSink,
         Opcode::IntegrateTrace => OpNode::IntegrateTrace,
         Opcode::ExchangeShard => OpNode::ExchangeShard { shard_cols: read_cols(&mut r)? },

@@ -99,15 +99,16 @@ pub(crate) fn int_cast_target(tc: TypeCode) -> Result<FixedInt, GnitzSqlError> {
 
 /// True iff every value of integer type `child` is representable in integer type
 /// `parent`, so rewriting an FK child column to the parent's type loses no value
-/// the child could legally hold. Only valid for integer inputs (both
-/// `is_integer_type`); UUID and the non-integers never reach it.
+/// the child could legally hold.
+///
+/// Reads back `join_key_common_type`'s contract rather than re-deriving the
+/// sign/width ladder gnitz-wire owns: `parent` holds `child` exactly when the
+/// pair's common type *is* `parent`. Valid over integer inputs alone (both
+/// `is_integer_type`) — that ladder sends a UUID pair to U128. Not
+/// `is_widening_promotion`, whose `is_fixed_int(target)` gate would reject the
+/// `(U64, I128)` an FK needs.
 pub(crate) fn int_domain_fits(child: TypeCode, parent: TypeCode) -> bool {
-    let (cw, pw) = (child.wire_stride(), parent.wire_stride());
-    match (child.is_signed_int(), parent.is_signed_int()) {
-        (false, false) | (true, true) => cw <= pw, // same signedness → parent ≥ child width
-        (false, true) => cw < pw,                  // unsigned child needs a strictly wider signed parent
-        (true, false) => false,                    // signed child has negatives no unsigned parent holds
-    }
+    child.join_key_common_type(parent) == Some(parent)
 }
 
 #[cfg(test)]

@@ -53,9 +53,10 @@ pub trait SchemaFacts {
     /// Number of logical columns (PK + payload).
     fn num_columns(&self) -> usize;
     /// Column `ci`'s SQL type code. **A `u8`, not a `TypeCode`** — it feeds the
-    /// compiler's `reg_u64: [bool; MAX_REGS]` tracking, is compared against
-    /// `gnitz_wire::type_code::U64`, and is handed to `gnitz_wire::is_fixed_int`
-    /// / `is_float` / `is_german_string` by the column-operand check.
+    /// compiler's per-register U64 tracking (a `u64` bitmask, one bit per
+    /// register) by comparison against `gnitz_wire::type_code::U64`, and is
+    /// handed to `gnitz_wire::is_fixed_int` / `is_float` / `is_german_string`
+    /// by the column-operand check.
     fn col_type_code(&self, ci: usize) -> u8;
     /// True iff column `ci` admits NULL.
     fn col_nullable(&self, ci: usize) -> bool;

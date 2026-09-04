@@ -11,7 +11,7 @@ use std::fmt::{self, Write as _};
 
 use crate::chars::{char_count, char_offset, reverse_chars};
 use crate::like::{fields, find};
-use crate::program::{FloatUnaryOp, IntReg, IntUnaryOp, ResolvedIntOp};
+use crate::program::{FloatUnaryOp, IntArithOp, IntReg, IntUnaryOp};
 use crate::{BatchView, CmpOp, FloatArithOp, Instr, ResolvedProgram};
 use gnitz_wire::{
     compare_german_strings, german_string_heap, german_string_inline, null_word_get, read_u64_le, FixedInt,
@@ -81,17 +81,10 @@ pub(crate) struct EvalScratch {
 /// this file: `regs` and `null_bits` differ only in element type and stride, and
 /// the binary and ternary opcodes only in how many sources they read.
 ///
-/// Sound because the windows are disjoint: SSA register allocation never reuses
-/// a destination as one of its own sources, and `LogicalProgram::validate`
-/// rejects a program that does for every opcode routed through here — in every
-/// profile, since `new`/`from_wire` both run the structure-only pass. The
-/// `debug_assert`s restate both halves of that (disjointness, and every window
-/// inside the buffer [`EvalScratch::new`] sized).
-///
-/// Only `d` must differ. **Duplicate sources are legal and sound** — `IntAdd
-/// { dst: 2, a: 0, b: 0 }` passes validation and is reachable through
-/// `ExprBuilder::add(x, x)` — because two shared windows over one range alias
-/// harmlessly.
+/// Sound because `d` is none of `srcs`: a register *is* the index of its writing
+/// instruction, and `LogicalProgram::from_instrs` — which every constructor
+/// routes through — rejects an operand not written before its reader. Duplicate
+/// *sources* alias harmlessly. The `debug_assert`s restate both halves.
 fn split_windows<T, const N: usize>(
     buf: &mut [T],
     stride: usize,
@@ -123,13 +116,15 @@ impl EvalScratch {
     /// touches it.
     pub(crate) fn new(prog: &ResolvedProgram) -> Self {
         let num_regs = prog.num_regs as usize;
+        // Full width, unlike `regs`: `set_null_reg` indexes these by the raw
+        // register and runs for `LoadNullStr`, a string one.
         let null_cap = if prog.no_nulls {
             0
         } else {
             num_regs * NULL_WORDS_PER_REG
         };
         let mut scratch = EvalScratch {
-            regs: vec![0; num_regs * MORSEL],
+            regs: vec![0; prog.scalar_lanes as usize * MORSEL],
             null_bits: vec![0; null_cap],
             bool_bits: vec![0; null_cap],
             filter_bits: Vec::new(),
@@ -325,6 +320,9 @@ impl MorselOut<'_> {
     /// The same values as their little-endian byte image, 8 bytes per row —
     /// what an 8-byte output slot stores. `check_emit_slot` holds every register sink
     /// destination to such a slot, so a caller can blit this straight into one.
+    ///
+    /// Only a *scalar* register has a lane here (`ResolvedProgram::scalar_lanes`
+    /// sizes the buffer); a string one panics on the index.
     #[inline(always)]
     pub fn reg_bytes(&self, reg: usize) -> &[u8] {
         gnitz_wire::as_le_bytes(self.reg_values(reg))
@@ -1770,12 +1768,12 @@ pub(crate) fn eval_batch(
             // ----------------------------------------------------------------
             // The operator match is OUTSIDE the row loop, so each arm is its own
             // branch-free loop.
-            Instr::IntArith { op, dst, a, b } => match op {
-                ResolvedIntOp::Add => bin_op(scratch, &mo, dst, a, b, |x, y| x.wrapping_add(y)),
-                ResolvedIntOp::Sub => bin_op(scratch, &mo, dst, a, b, |x, y| x.wrapping_sub(y)),
-                ResolvedIntOp::Mul => bin_op(scratch, &mo, dst, a, b, |x, y| x.wrapping_mul(y)),
-                ResolvedIntOp::Div { signed } => int_divmod::<false>(scratch, &mo, dst, a, b, signed),
-                ResolvedIntOp::Mod { signed } => int_divmod::<true>(scratch, &mo, dst, a, b, signed),
+            Instr::IntArith { op, dst, a, b, signed } => match op {
+                IntArithOp::Add => bin_op(scratch, &mo, dst, a, b, |x, y| x.wrapping_add(y)),
+                IntArithOp::Sub => bin_op(scratch, &mo, dst, a, b, |x, y| x.wrapping_sub(y)),
+                IntArithOp::Mul => bin_op(scratch, &mo, dst, a, b, |x, y| x.wrapping_mul(y)),
+                IntArithOp::Div => int_divmod::<false>(scratch, &mo, dst, a, b, signed),
+                IntArithOp::Mod => int_divmod::<true>(scratch, &mo, dst, a, b, signed),
             },
             Instr::IntUnary { op, dst, a, signed } => match op {
                 IntUnaryOp::Neg => un_op(scratch, &mo, dst, a, |x| x.wrapping_neg()),

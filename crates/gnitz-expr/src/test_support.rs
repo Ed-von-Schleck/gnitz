@@ -311,20 +311,6 @@ pub fn scalar_prog(
         .expect("test program must validate")
 }
 
-/// [`scalar_prog`] for a program that also writes output slots — the shape the
-/// sink tests drive, reading a result register *and* emitting.
-pub fn scalar_prog_with_sinks(
-    schema: &TestSchema,
-    instrs: Vec<LogicalInstr>,
-    sinks: Vec<Sink>,
-    result_reg: Reg,
-    const_strings: Vec<Vec<u8>>,
-) -> Evaluator {
-    LogicalProgram::new(instrs, sinks, Some(result_reg), const_strings)
-        .resolve_scalar(schema)
-        .expect("test program must validate")
-}
-
 /// A predicate as [`filter_prog`] takes it: `(instrs, result_reg)`.
 pub type FilterShape = (Vec<LogicalInstr>, Reg);
 

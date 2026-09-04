@@ -40,3 +40,25 @@ fn the_builder_folds_identical_instructions_and_pool_entries() {
     assert_eq!(prog.instrs().len(), 4);
     assert_eq!(prog.const_strings().len(), 1);
 }
+
+/// A lift of a constant is another constant, folded at emit rather than at
+/// resolve: the `IntToFloat` never enters the program, so no schema-resolution
+/// pass has to read back what an earlier instruction wrote.
+#[test]
+fn a_lift_over_a_constant_folds_to_a_float_constant() {
+    let mut b = ExprBuilder::new();
+    let c = b.emit(L::LoadConst { val: -7 });
+    let lifted = b.emit(L::IntToFloat { a: c });
+    let prog = b.build(Some(lifted)).expect("a well-formed program");
+    assert!(matches!(
+        prog.instrs(),
+        [L::LoadConst { val: -7 }, L::LoadConst { val }] if f64::from_bits(*val as u64) == -7.0
+    ));
+
+    // A lift over a computed register is untouched.
+    let mut b = ExprBuilder::new();
+    let col = b.emit(L::LoadColInt { col: 1 });
+    let lifted = b.emit(L::IntToFloat { a: col });
+    let prog = b.build(Some(lifted)).expect("a well-formed program");
+    assert!(matches!(prog.instrs(), [L::LoadColInt { .. }, L::IntToFloat { .. }]));
+}

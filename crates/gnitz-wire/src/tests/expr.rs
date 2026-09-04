@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn round_trip_program_with_strings() {
-    let code = [1u32, 2, 3, 4, 5, 6];
+    let code = [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10];
     let sinks = [0u32, 7, 1, 9];
     // Empty string, multi-byte UTF-8, and a non-UTF-8 byte string (byte-transparency).
     let s0: &[u8] = b"alpha";
@@ -73,10 +73,10 @@ fn each_decode_guard_rejects_its_own_forgery() {
         ("reserved byte 5", poke(5, 1)),
         ("reserved byte 10", poke(10, 1)),
         ("reserved byte 11", poke(11, 1)),
-        // 3 is not a multiple of 4, so the code section has no word boundary.
+        // 3 is not a whole instruction, which is five words.
         ("unaligned code length", code_len(3)),
-        // 4 words declared, no code bytes present.
-        ("truncated before code", code_len(4)),
+        // One instruction declared, no code bytes present.
+        ("truncated before code", code_len(5)),
         // A corrupt count must not drive a huge `with_capacity`.
         ("huge string count", s_count(u32::MAX)),
         ("string count with no bytes", s_count(1)),
@@ -103,14 +103,5 @@ fn load_const_round_trips() {
     ] {
         let (a1, a2) = encode_load_const(v);
         assert_eq!(decode_load_const(a1, a2), v, "load_const round-trip for {v}");
-    }
-}
-
-#[test]
-fn operand_pair_round_trip() {
-    for a in 0u32..64 {
-        for b in 0u32..64 {
-            assert_eq!(unpack_operand_pair(pack_operand_pair(a, b)), (a as u16, b as u16));
-        }
     }
 }

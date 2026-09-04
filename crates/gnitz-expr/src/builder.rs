@@ -26,6 +26,20 @@ impl ExprBuilder {
     /// already writes, else a fresh one — its own index. Every instruction is a
     /// pure function of its operands, so identical ones share a register.
     pub fn emit(&mut self, instr: LogicalInstr) -> Reg {
+        // A lift of a constant is another constant — algebraic and
+        // schema-independent, so it folds here rather than at resolve. The
+        // integer constant it reads stays: a register *is* its instruction's
+        // index, so `emit` can only append or reuse, never delete.
+        let instr = match instr {
+            // `get`, not an index: an out-of-range operand is `build`'s to reject.
+            LogicalInstr::IntToFloat { a } => match self.instrs.get(a.0 as usize) {
+                Some(&LogicalInstr::LoadConst { val }) => LogicalInstr::LoadConst {
+                    val: crate::batch::encode_f64(val as f64),
+                },
+                _ => instr,
+            },
+            _ => instr,
+        };
         // The fold scan stops paying once the program is already past the
         // register cap — `build` rejects it whatever follows — so lowering a
         // huge expression stays linear instead of quadratic in its size.

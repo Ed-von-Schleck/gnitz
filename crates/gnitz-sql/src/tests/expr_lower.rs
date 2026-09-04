@@ -1,7 +1,6 @@
 use super::*;
 use gnitz_core::{ColumnDef, Schema, TypeCode};
-use gnitz_expr::{ExprValidateErr, LogicalInstr};
-use gnitz_wire::ExprOp;
+use gnitz_expr::{CmpOp, ExprValidateErr, FloatArithOp, IntUnaryOp, LogicalInstr, LogicalInstr as L};
 
 fn col(name: &str, tc: TypeCode) -> ColumnDef {
     ColumnDef::new(name, tc, true)
@@ -39,23 +38,35 @@ fn cast_schema() -> Schema {
     }
 }
 
-/// The opcodes `expr` lowers to, plus its result register's class.
-/// `lower_ops` is the same without the class.
-fn lower_ops_kind(expr: &BoundExpr, schema: &Schema) -> (Vec<u32>, ExprKind) {
+/// The typed instructions `expr` lowers to, plus its result register's class;
+/// `lower_instrs` is the same without the class. Typed rather than wire words:
+/// these are tests of the *lowerer*, so no encoding change reaches this file.
+fn lower_instrs_kind(expr: &BoundExpr, schema: &Schema) -> (Vec<LogicalInstr>, ExprKind) {
     let mut eb = ExprBuilder::new();
     let (reg, kind) = OpcodeBackend { cols: &schema.columns, eb: &mut eb }
         .lower(expr)
         .expect("lowers");
-    (opcodes(&eb.build(Some(reg)).expect("a well-formed program")), kind)
+    let prog = eb.build(Some(reg)).expect("a well-formed program");
+    (prog.instrs().to_vec(), kind)
 }
 
-fn lower_ops_isf(expr: &BoundExpr, schema: &Schema) -> (Vec<u32>, bool) {
-    let (ops, kind) = lower_ops_kind(expr, schema);
-    (ops, kind == ExprKind::Float)
+fn lower_instrs_isf(expr: &BoundExpr, schema: &Schema) -> (Vec<LogicalInstr>, bool) {
+    let (instrs, kind) = lower_instrs_kind(expr, schema);
+    (instrs, kind == ExprKind::Float)
 }
 
-fn lower_ops(expr: &BoundExpr, schema: &Schema) -> Vec<u32> {
-    lower_ops_isf(expr, schema).0
+fn lower_instrs(expr: &BoundExpr, schema: &Schema) -> Vec<LogicalInstr> {
+    lower_instrs_isf(expr, schema).0
+}
+
+/// `contains` over typed instructions: a variant carrying fields is *matched*,
+/// not compared, so every predicate below is a `matches!`.
+fn has(instrs: &[LogicalInstr], p: impl Fn(&LogicalInstr) -> bool) -> bool {
+    instrs.iter().any(p)
+}
+
+fn count(instrs: &[LogicalInstr], p: impl Fn(&LogicalInstr) -> bool) -> usize {
+    instrs.iter().filter(|i| p(i)).count()
 }
 
 /// The lowering error `expr` produces, for the reject cases.
@@ -83,19 +94,29 @@ fn assert_str_program(expr: &BoundExpr, schema: &Schema) {
     }
 }
 
-/// The float opcodes a fold-to-identity must never emit.
-const FLOAT_OPS: [u32; 6] = [
-    ExprOp::IntToFloat.as_wire(),
-    ExprOp::FloatMul.as_wire(),
-    ExprOp::FloatDiv.as_wire(),
-    ExprOp::FloatRound.as_wire(),
-    ExprOp::FloatFloor.as_wire(),
-    ExprOp::FloatCeil.as_wire(),
-];
+/// The float instructions a fold-to-identity must never emit.
+fn is_float_op(i: &LogicalInstr) -> bool {
+    matches!(
+        i,
+        L::IntToFloat { .. }
+            | L::FloatArith {
+                op: FloatArithOp::Mul | FloatArithOp::Div,
+                ..
+            }
+            | L::FloatUnary {
+                op: FloatUnaryOp::Round | FloatUnaryOp::Floor | FloatUnaryOp::Ceil,
+                ..
+            }
+    )
+}
+
+fn is_round(instrs: &[LogicalInstr]) -> bool {
+    has(instrs, |i| matches!(i, L::FloatUnary { op: FloatUnaryOp::Round, .. }))
+}
 
 fn cast_emits(expr: &BoundExpr, to: TypeCode, schema: &Schema) -> bool {
     let cast = BoundExpr::Cast { expr: Box::new(expr.clone()), to };
-    lower_ops(&cast, schema).contains(&ExprOp::IntCast.as_wire())
+    has(&lower_instrs(&cast, schema), |i| matches!(i, L::IntCast { .. }))
 }
 
 /// The elision rule keys on the register IMAGE, not value-domain containment.
@@ -150,8 +171,8 @@ fn cast_elision_preserves_u64_tracking() {
     );
 }
 
-fn round_ops(n: i8, arg: &BoundExpr, schema: &Schema) -> (Vec<u32>, bool) {
-    lower_ops_isf(&func(NumFunc::Round(n), arg.clone()), schema)
+fn round_instrs(n: i8, arg: &BoundExpr, schema: &Schema) -> (Vec<LogicalInstr>, bool) {
+    lower_instrs_isf(&func(NumFunc::Round(n), arg.clone()), schema)
 }
 
 /// n >= 0 on an integer argument is the identity: no opcode, and the value
@@ -162,24 +183,32 @@ fn round_scaled_folds_integer_nonnegative_scale() {
     let s = cast_schema();
     let icol = BoundExpr::ColRef(1);
     for n in [0i8, 2, 15] {
-        let (ops, isf) = round_ops(n, &icol, &s);
+        let (instrs, isf) = round_instrs(n, &icol, &s);
         assert!(!isf, "n={n}: stays integer");
-        assert!(!ops.iter().any(|o| FLOAT_OPS.contains(o)), "n={n}: no float arithmetic");
+        assert!(!has(&instrs, is_float_op), "n={n}: no float arithmetic");
     }
-    assert!(round_ops(2, &BoundExpr::LitFloat(1.5), &s).1, "float arg stays float");
-    let (ops, isf) = round_ops(-2, &icol, &s);
+    assert!(
+        round_instrs(2, &BoundExpr::LitFloat(1.5), &s).1,
+        "float arg stays float"
+    );
+    let (instrs, isf) = round_instrs(-2, &icol, &s);
     assert!(isf, "negative scale yields F64");
-    assert!(ops.contains(&ExprOp::FloatRound.as_wire()), "negative scale rounds");
+    assert!(is_round(&instrs), "negative scale rounds");
 }
 
 /// `ROUND(x)` is the bare unary opcode, not a scale-by-1 round trip.
 #[test]
 fn unscaled_round_is_plain_round() {
     let s = cast_schema();
-    let (ops, _) = lower_ops_isf(&func(NumFunc::Unary(FloatUnaryOp::Round), BoundExpr::LitFloat(2.5)), &s);
-    assert!(ops.contains(&ExprOp::FloatRound.as_wire()));
-    assert!(!ops.contains(&ExprOp::FloatMul.as_wire()));
-    assert!(!ops.contains(&ExprOp::FloatDiv.as_wire()));
+    let (instrs, _) = lower_instrs_isf(&func(NumFunc::Unary(FloatUnaryOp::Round), BoundExpr::LitFloat(2.5)), &s);
+    assert!(is_round(&instrs));
+    assert!(!has(&instrs, |i| matches!(
+        i,
+        L::FloatArith {
+            op: FloatArithOp::Mul | FloatArithOp::Div,
+            ..
+        }
+    )));
 }
 
 /// A positive scale multiplies first and divides back; a negative one does
@@ -188,36 +217,22 @@ fn unscaled_round_is_plain_round() {
 #[test]
 fn round_scaled_picks_the_scaling_direction() {
     let s = cast_schema();
-    let ops = |n: i8| -> Vec<u32> {
-        round_ops(n, &BoundExpr::LitFloat(1.5), &s)
+    // The scaling steps in order, spelled as one letter each: (M)ul, (D)iv,
+    // (R)ound — everything else the lowering emits is dropped.
+    let steps = |n: i8| -> String {
+        round_instrs(n, &BoundExpr::LitFloat(1.5), &s)
             .0
-            .into_iter()
-            .filter(|op| {
-                [
-                    ExprOp::FloatMul.as_wire(),
-                    ExprOp::FloatDiv.as_wire(),
-                    ExprOp::FloatRound.as_wire(),
-                ]
-                .contains(op)
+            .iter()
+            .filter_map(|i| match i {
+                L::FloatArith { op: FloatArithOp::Mul, .. } => Some('M'),
+                L::FloatArith { op: FloatArithOp::Div, .. } => Some('D'),
+                L::FloatUnary { op: FloatUnaryOp::Round, .. } => Some('R'),
+                _ => None,
             })
             .collect()
     };
-    assert_eq!(
-        ops(2),
-        vec![
-            ExprOp::FloatMul.as_wire(),
-            ExprOp::FloatRound.as_wire(),
-            ExprOp::FloatDiv.as_wire()
-        ]
-    );
-    assert_eq!(
-        ops(-2),
-        vec![
-            ExprOp::FloatDiv.as_wire(),
-            ExprOp::FloatRound.as_wire(),
-            ExprOp::FloatMul.as_wire()
-        ]
-    );
+    assert_eq!(steps(2), "MRD");
+    assert_eq!(steps(-2), "DRM");
 }
 
 fn func(f: NumFunc, arg: BoundExpr) -> BoundExpr {
@@ -237,26 +252,24 @@ fn integer_arguments_fold_the_unary_transforms_away() {
         NumFunc::Round(2),
         NumFunc::Unary(FloatUnaryOp::Trunc),
     ] {
-        let ops = lower_ops(&func(f, BoundExpr::ColRef(1)), &s);
-        assert!(!ops.iter().any(|o| FLOAT_OPS.contains(o)), "{f:?}(i32col) folds away");
+        let instrs = lower_instrs(&func(f, BoundExpr::ColRef(1)), &s);
+        assert!(!has(&instrs, is_float_op), "{f:?}(i32col) folds away");
     }
+    let int_abs = |i: &LogicalInstr| matches!(i, L::IntUnary { op: IntUnaryOp::Abs, .. });
     for c in [2usize, 4] {
-        let ops = lower_ops(&func(NumFunc::Unary(FloatUnaryOp::Abs), BoundExpr::ColRef(c)), &s);
-        assert!(
-            !ops.contains(&ExprOp::IntAbs.as_wire()),
-            "ABS over an unsigned column folds away"
-        );
+        let instrs = lower_instrs(&func(NumFunc::Unary(FloatUnaryOp::Abs), BoundExpr::ColRef(c)), &s);
+        assert!(!has(&instrs, int_abs), "ABS over an unsigned column folds away");
     }
     // A signed integer argument does need the opcode.
-    assert!(
-        lower_ops(&func(NumFunc::Unary(FloatUnaryOp::Abs), BoundExpr::ColRef(1)), &s)
-            .contains(&ExprOp::IntAbs.as_wire())
-    );
+    assert!(has(
+        &lower_instrs(&func(NumFunc::Unary(FloatUnaryOp::Abs), BoundExpr::ColRef(1)), &s),
+        int_abs
+    ));
     // A float argument takes the float opcode in every case.
-    assert!(
-        lower_ops(&func(NumFunc::Unary(FloatUnaryOp::Floor), BoundExpr::LitFloat(1.5)), &s)
-            .contains(&ExprOp::FloatFloor.as_wire())
-    );
+    assert!(has(
+        &lower_instrs(&func(NumFunc::Unary(FloatUnaryOp::Floor), BoundExpr::LitFloat(1.5)), &s),
+        |i| matches!(i, L::FloatUnary { op: FloatUnaryOp::Floor, .. })
+    ));
 }
 
 fn min_max(is_max: bool, args: Vec<BoundExpr>) -> BoundExpr {
@@ -270,21 +283,24 @@ fn min_max_n_folds_linearly_and_picks_the_float_domain() {
     let s = cast_schema();
     for n in [1usize, 3] {
         let args: Vec<BoundExpr> = (0..n).map(|_| BoundExpr::ColRef(1)).collect();
-        let ops = lower_ops(&min_max(true, args), &s);
+        let instrs = lower_instrs(&min_max(true, args), &s);
         assert_eq!(
-            ops.iter().filter(|&&o| o == ExprOp::IntMax2.as_wire()).count(),
+            count(&instrs, |i| matches!(i, L::IntMinMax2 { is_max: true, .. })),
             n - 1,
             "arity {n}: n-1 folds"
         );
     }
-    assert!(lower_ops(&min_max(false, vec![BoundExpr::ColRef(1); 2]), &s).contains(&ExprOp::IntMin2.as_wire()));
+    assert!(has(
+        &lower_instrs(&min_max(false, vec![BoundExpr::ColRef(1); 2]), &s),
+        |i| matches!(i, L::IntMinMax2 { is_max: false, .. })
+    ));
     // One float argument lifts every integer argument and switches the whole
     // fold to the float opcodes — the same global unification CASE applies.
     let mixed = min_max(true, vec![BoundExpr::ColRef(1), BoundExpr::LitFloat(1.5)]);
-    let ops = lower_ops(&mixed, &s);
-    assert!(ops.contains(&ExprOp::FloatMax2.as_wire()));
-    assert!(ops.contains(&ExprOp::IntToFloat.as_wire()));
-    assert!(!ops.contains(&ExprOp::IntMax2.as_wire()));
+    let instrs = lower_instrs(&mixed, &s);
+    assert!(has(&instrs, |i| matches!(i, L::FloatMinMax2 { is_max: true, .. })));
+    assert!(has(&instrs, |i| matches!(i, L::IntToFloat { .. })));
+    assert!(!has(&instrs, |i| matches!(i, L::IntMinMax2 { .. })));
 }
 
 /// With a U64 argument anywhere in the list, one U64 argument is rotated to
@@ -361,17 +377,23 @@ fn cast_picks_the_conversion_opcode_from_the_source_domain() {
     let cast = |e: BoundExpr, to| BoundExpr::Cast { expr: Box::new(e), to };
     let f = BoundExpr::LitFloat(2.7);
 
-    assert!(lower_ops(&cast(f.clone(), TypeCode::I32), &s).contains(&ExprOp::FloatToInt.as_wire()));
-    // float -> DOUBLE is a no-op: the register already holds an f64.
-    let ops = lower_ops(&cast(f.clone(), TypeCode::F64), &s);
-    assert!(!ops.contains(&ExprOp::FloatToF32.as_wire()) && !ops.contains(&ExprOp::IntToFloat.as_wire()));
-    assert!(lower_ops(&cast(f, TypeCode::F32), &s).contains(&ExprOp::FloatToF32.as_wire()));
+    let to_f32 = |i: &LogicalInstr| matches!(i, L::FloatToF32 { .. });
+    let lift = |i: &LogicalInstr| matches!(i, L::IntToFloat { .. });
 
-    let ops = lower_ops(&cast(BoundExpr::ColRef(1), TypeCode::F64), &s);
-    assert!(ops.contains(&ExprOp::IntToFloat.as_wire()) && !ops.contains(&ExprOp::FloatToF32.as_wire()));
+    assert!(has(&lower_instrs(&cast(f.clone(), TypeCode::I32), &s), |i| matches!(
+        i,
+        L::FloatToInt { .. }
+    )));
+    // float -> DOUBLE is a no-op: the register already holds an f64.
+    let instrs = lower_instrs(&cast(f.clone(), TypeCode::F64), &s);
+    assert!(!has(&instrs, to_f32) && !has(&instrs, lift));
+    assert!(has(&lower_instrs(&cast(f, TypeCode::F32), &s), to_f32));
+
+    let instrs = lower_instrs(&cast(BoundExpr::ColRef(1), TypeCode::F64), &s);
+    assert!(has(&instrs, lift) && !has(&instrs, to_f32));
     // int -> FLOAT is the two-step lift; the double rounding is committed.
-    let ops = lower_ops(&cast(BoundExpr::ColRef(1), TypeCode::F32), &s);
-    assert!(ops.contains(&ExprOp::IntToFloat.as_wire()) && ops.contains(&ExprOp::FloatToF32.as_wire()));
+    let instrs = lower_instrs(&cast(BoundExpr::ColRef(1), TypeCode::F32), &s);
+    assert!(has(&instrs, lift) && has(&instrs, to_f32));
 }
 
 /// `col <op> 'lit'` and the transposed `'lit' <op'> col` must compile to the
@@ -455,11 +477,6 @@ fn blob_cmp_matches_string_cmp() {
     }
 }
 
-/// Each instruction's wire opcode, off the one encode table.
-fn opcodes(p: &LogicalProgram) -> Vec<u32> {
-    p.instrs().iter().map(|i| i.to_wire()[0]).collect()
-}
-
 fn case_schema() -> Schema {
     Schema {
         columns: vec![
@@ -490,10 +507,13 @@ fn case_float_unification_lifts_int_branches() {
         branches: vec![(gt0(), BoundExpr::ColRef(1))],
         else_: Some(Box::new(BoundExpr::LitInt(0))),
     };
-    let ops = opcodes(&compile_bound_expr_to_program(&case_int, &schema.columns).unwrap());
-    assert!(ops.contains(&ExprOp::Select.as_wire()), "CASE must lower to a SELECT");
+    let prog = compile_bound_expr_to_program(&case_int, &schema.columns).unwrap();
     assert!(
-        !ops.contains(&ExprOp::IntToFloat.as_wire()),
+        has(prog.instrs(), |i| matches!(i, L::Select { .. })),
+        "CASE must lower to a SELECT"
+    );
+    assert!(
+        !has(prog.instrs(), |i| matches!(i, L::IntToFloat { .. })),
         "all-int CASE needs no float lift"
     );
 
@@ -502,10 +522,13 @@ fn case_float_unification_lifts_int_branches() {
         branches: vec![(gt0(), BoundExpr::ColRef(2))],
         else_: Some(Box::new(BoundExpr::ColRef(1))),
     };
-    let ops = opcodes(&compile_bound_expr_to_program(&case_mixed, &schema.columns).unwrap());
-    assert!(ops.contains(&ExprOp::Select.as_wire()), "CASE must lower to a SELECT");
+    let prog = compile_bound_expr_to_program(&case_mixed, &schema.columns).unwrap();
     assert!(
-        ops.contains(&ExprOp::IntToFloat.as_wire()),
+        has(prog.instrs(), |i| matches!(i, L::Select { .. })),
+        "CASE must lower to a SELECT"
+    );
+    assert!(
+        has(prog.instrs(), |i| matches!(i, L::IntToFloat { .. })),
         "mixed CASE lifts int branches to float"
     );
 }
@@ -526,7 +549,7 @@ fn case_string_branches_compile_through_the_string_channel() {
         )],
         else_: Some(Box::new(BoundExpr::LitStr("y".into()))),
     };
-    assert_eq!(lower_ops_kind(&case_str, &schema).1, ExprKind::Str);
+    assert_eq!(lower_instrs_kind(&case_str, &schema).1, ExprKind::Str);
     // The engine's class validator is the real check: it rejects a scalar
     // register reaching a string operand, so a CASE that blended its string
     // branches with the numeric SELECT would fail here rather than compile.
@@ -561,10 +584,7 @@ fn in_list_int_emits_int_in_set() {
     let schema = two_int_schema();
     let items = vec![BoundExpr::LitInt(-1), BoundExpr::LitInt(2)];
     let prog = compile_bound_expr_to_program(&in_list(BoundExpr::ColRef(1), items), &schema.columns).unwrap();
-    assert_eq!(
-        opcodes(&prog),
-        [ExprOp::LoadColInt.as_wire(), ExprOp::IntInSet.as_wire()]
-    );
+    assert!(matches!(prog.instrs(), [L::LoadColInt { .. }, L::IntInSet { .. }]));
 }
 
 /// The pool is sorted and deduplicated: `a IN (1, 1, 2)` packs 2 i64s (16
@@ -615,13 +635,12 @@ fn in_list_float_operand_falls_back_to_or_chain() {
         &schema.columns,
     )
     .unwrap();
-    let ops = opcodes(&prog);
     assert!(
-        !ops.contains(&ExprOp::IntInSet.as_wire()),
+        !has(prog.instrs(), |i| matches!(i, L::IntInSet { .. })),
         "float IN must not emit INT_IN_SET"
     );
     assert!(
-        ops.contains(&ExprOp::FcmpEq.as_wire()),
+        has(prog.instrs(), |i| matches!(i, L::FCmp { op: CmpOp::Eq, .. })),
         "float IN lowers to fcmp OR-chain"
     );
 }
@@ -638,13 +657,12 @@ fn in_list_string_operand_falls_back_to_or_chain() {
         &schema.columns,
     )
     .unwrap();
-    let ops = opcodes(&prog);
     assert!(
-        !ops.contains(&ExprOp::IntInSet.as_wire()),
+        !has(prog.instrs(), |i| matches!(i, L::IntInSet { .. })),
         "string IN must not emit INT_IN_SET"
     );
     assert!(
-        ops.contains(&ExprOp::StrColEqConst.as_wire()),
+        has(prog.instrs(), |i| matches!(i, L::StrColConst { op: CmpOp::Eq, .. })),
         "string IN lowers to str_col_eq_const"
     );
 }
@@ -673,11 +691,11 @@ fn in_list_shares_a_computed_operand_across_the_fold() {
     let items: Vec<BoundExpr> = (0..14).map(|i| BoundExpr::LitStr(format!("tag{i}"))).collect();
     let prog = compile_bound_expr_to_program(&in_list(upper, items), &schema.columns)
         .expect("the shared operand fits the register budget");
-    let ops = opcodes(&prog);
     assert_eq!(
-        ops.iter().filter(|&&o| o == ExprOp::StrUpper.as_wire()).count(),
+        count(prog.instrs(), |i| matches!(i, L::StrCase { upper: true, .. })),
         1,
-        "the operand is folded once, not once per item: {ops:?}"
+        "the operand is folded once, not once per item: {:?}",
+        prog.instrs()
     );
 }
 
@@ -696,11 +714,11 @@ fn in_list_shares_an_integer_column_operand() {
         &schema.columns,
     )
     .unwrap();
-    let ops = opcodes(&prog);
     assert_eq!(
-        ops.iter().filter(|&&o| o == ExprOp::LoadColInt.as_wire()).count(),
+        count(prog.instrs(), |i| matches!(i, L::LoadColInt { .. })),
         2,
-        "one load for the operand, one for the column item: {ops:?}"
+        "one load for the operand, one for the column item: {:?}",
+        prog.instrs()
     );
 }
 
@@ -713,15 +731,14 @@ fn in_list_keeps_the_fused_compare_for_a_literal_operand() {
     let schema = str_schema();
     let prog =
         compile_bound_expr_to_program(&in_list(lit("x"), vec![str_col(1), str_col(2)]), &schema.columns).unwrap();
-    let ops = opcodes(&prog);
-    assert_eq!(
-        ops,
+    assert!(matches!(
+        prog.instrs(),
         [
-            ExprOp::StrColEqConst.as_wire(),
-            ExprOp::StrColEqConst.as_wire(),
-            ExprOp::BoolOr.as_wire()
+            L::StrColConst { op: CmpOp::Eq, .. },
+            L::StrColConst { op: CmpOp::Eq, .. },
+            L::BoolBinary { is_or: true, .. }
         ]
-    );
+    ));
 }
 
 /// A non-literal item (a column) forces the OR-chain even for an int operand.
@@ -733,13 +750,12 @@ fn in_list_non_literal_item_falls_back_to_or_chain() {
         &schema.columns,
     )
     .unwrap();
-    let ops = opcodes(&prog);
     assert!(
-        !ops.contains(&ExprOp::IntInSet.as_wire()),
+        !has(prog.instrs(), |i| matches!(i, L::IntInSet { .. })),
         "non-literal item must not emit INT_IN_SET"
     );
     assert!(
-        ops.contains(&ExprOp::CmpEq.as_wire()),
+        has(prog.instrs(), |i| matches!(i, L::Cmp { op: CmpOp::Eq, .. })),
         "non-literal item lowers to cmp OR-chain"
     );
 }
@@ -758,7 +774,7 @@ fn in_list_float_literal_item_falls_back_to_or_chain() {
     )
     .unwrap();
     assert!(
-        !opcodes(&prog).contains(&ExprOp::IntInSet.as_wire()),
+        !has(prog.instrs(), |i| matches!(i, L::IntInSet { .. })),
         "a float-literal item must not emit INT_IN_SET"
     );
 }
@@ -822,16 +838,16 @@ fn lit(s: &str) -> BoundExpr {
 #[test]
 fn plain_column_comparisons_keep_the_specialized_opcodes() {
     let schema = str_schema();
-    let ops = lower_ops(
+    let instrs = lower_instrs(
         &BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Eq, Box::new(lit("x"))),
         &schema,
     );
-    assert_eq!(ops, [ExprOp::StrColEqConst.as_wire()]);
-    let cols = lower_ops(
+    assert!(matches!(instrs[..], [L::StrColConst { op: CmpOp::Eq, .. }]));
+    let cols = lower_instrs(
         &BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Lt, Box::new(str_col(2))),
         &schema,
     );
-    assert_eq!(cols, [ExprOp::StrColLtCol.as_wire()]);
+    assert!(matches!(cols[..], [L::StrColCol { op: CmpOp::Lt, .. }]));
 }
 
 /// A *computed* operand has no specialized form, so it falls through to the
@@ -848,9 +864,12 @@ fn computed_operands_compare_through_the_register_channel() {
         BinOp::Eq,
         Box::new(lit("X")),
     );
-    let ops = lower_ops(&upper_eq, &schema);
-    assert!(ops.contains(&ExprOp::StrCmpEq.as_wire()), "{ops:?}");
-    assert!(!ops.contains(&ExprOp::StrColEqConst.as_wire()), "{ops:?}");
+    let instrs = lower_instrs(&upper_eq, &schema);
+    assert!(
+        has(&instrs, |i| matches!(i, L::StrCmp { op: CmpOp::Eq, .. })),
+        "{instrs:?}"
+    );
+    assert!(!has(&instrs, |i| matches!(i, L::StrColConst { .. })), "{instrs:?}");
     // The comparison is a boolean, so it is a legitimate filter predicate.
     let p = compile_bound_expr_to_program(&upper_eq, &schema.columns).expect("lowers");
     assert!(p.resolve_filter(&schema).is_ok());
@@ -866,24 +885,26 @@ fn register_compare_has_all_six_operators() {
         args: vec![str_col(i)],
     };
     for (op, want) in [
-        (BinOp::Eq, ExprOp::StrCmpEq),
-        (BinOp::Ne, ExprOp::StrCmpNe),
-        (BinOp::Gt, ExprOp::StrCmpGt),
-        (BinOp::Ge, ExprOp::StrCmpGe),
-        (BinOp::Lt, ExprOp::StrCmpLt),
-        (BinOp::Le, ExprOp::StrCmpLe),
+        (BinOp::Eq, CmpOp::Eq),
+        (BinOp::Ne, CmpOp::Ne),
+        (BinOp::Gt, CmpOp::Gt),
+        (BinOp::Ge, CmpOp::Ge),
+        (BinOp::Lt, CmpOp::Lt),
+        (BinOp::Le, CmpOp::Le),
     ] {
-        let ops = lower_ops(&BoundExpr::BinOp(Box::new(up(1)), op, Box::new(up(2))), &schema);
-        assert_eq!(
-            ops,
-            [
-                ExprOp::LoadColStr.as_wire(),
-                ExprOp::StrUpper.as_wire(),
-                ExprOp::LoadColStr.as_wire(),
-                ExprOp::StrUpper.as_wire(),
-                want.as_wire()
-            ],
-            "{op:?}"
+        let instrs = lower_instrs(&BoundExpr::BinOp(Box::new(up(1)), op, Box::new(up(2))), &schema);
+        assert!(
+            matches!(
+                instrs[..],
+                [
+                    L::LoadColStr { .. },
+                    L::StrCase { upper: true, .. },
+                    L::LoadColStr { .. },
+                    L::StrCase { upper: true, .. },
+                    L::StrCmp { op: got, .. },
+                ] if got == want
+            ),
+            "{op:?}: {instrs:?}"
         );
     }
 }
@@ -895,17 +916,26 @@ fn concat_operator_and_function_compile_and_differ_in_their_null_rule() {
     // type error — `str_operand` intercepts the literal before recursing.
     let pipe_null = BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Concat, Box::new(BoundExpr::LitNull));
     assert_str_program(&pipe_null, &schema);
-    assert!(lower_ops(&pipe_null, &schema).contains(&ExprOp::LoadNullStr.as_wire()));
+    assert!(has(&lower_instrs(&pipe_null, &schema), |i| matches!(i, L::LoadNullStr)));
 
     let pipe = BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Concat, Box::new(lit("x")));
-    assert!(lower_ops(&pipe, &schema).contains(&ExprOp::StrConcat.as_wire()));
+    assert!(has(&lower_instrs(&pipe, &schema), |i| matches!(
+        i,
+        L::StrConcat { skip_null: false, .. }
+    )));
 
     // CONCAT folds through the null-as-empty step instead, and seeds the fold
     // so even a single argument is non-NULL.
     let one = BoundExpr::ConcatN { args: vec![str_col(1)] };
-    let ops = lower_ops(&one, &schema);
-    assert!(ops.contains(&ExprOp::StrConcatNn.as_wire()), "{ops:?}");
-    assert!(!ops.contains(&ExprOp::StrConcat.as_wire()), "{ops:?}");
+    let instrs = lower_instrs(&one, &schema);
+    assert!(
+        has(&instrs, |i| matches!(i, L::StrConcat { skip_null: true, .. })),
+        "{instrs:?}"
+    );
+    assert!(
+        !has(&instrs, |i| matches!(i, L::StrConcat { skip_null: false, .. })),
+        "{instrs:?}"
+    );
     assert_str_program(&one, &schema);
 }
 
@@ -917,9 +947,9 @@ fn concat_casts_numeric_arguments_but_the_operator_does_not() {
     let mixed = BoundExpr::ConcatN {
         args: vec![str_col(1), BoundExpr::LitInt(42), BoundExpr::LitFloat(1.5)],
     };
-    let ops = lower_ops(&mixed, &schema);
-    assert!(ops.contains(&ExprOp::IntToStr.as_wire()), "{ops:?}");
-    assert!(ops.contains(&ExprOp::FloatToStr.as_wire()), "{ops:?}");
+    let instrs = lower_instrs(&mixed, &schema);
+    assert!(has(&instrs, |i| matches!(i, L::IntToStr { .. })), "{instrs:?}");
+    assert!(has(&instrs, |i| matches!(i, L::FloatToStr { .. })), "{instrs:?}");
     assert_str_program(&mixed, &schema);
 
     let pipe_int = BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Concat, Box::new(BoundExpr::LitInt(1)));
@@ -966,7 +996,7 @@ fn an_all_null_case_still_types_as_an_integer() {
         else_: None,
     };
     assert_eq!(all_null.infer_type(&schema.columns), TypeCode::I64);
-    assert_eq!(lower_ops_kind(&all_null, &schema).1, ExprKind::Int);
+    assert_eq!(lower_instrs_kind(&all_null, &schema).1, ExprKind::Int);
 }
 
 #[test]
@@ -1025,7 +1055,10 @@ fn strings_in_numeric_positions_are_rejected_by_lowering() {
 fn blob_columns_stay_outside_the_string_surface() {
     let schema = blob_schema();
     let cmp = BoundExpr::BinOp(Box::new(str_col(1)), BinOp::Eq, Box::new(lit("x")));
-    assert_eq!(lower_ops(&cmp, &schema), [ExprOp::StrColEqConst.as_wire()]);
+    assert!(matches!(
+        lower_instrs(&cmp, &schema)[..],
+        [L::StrColConst { op: CmpOp::Eq, .. }]
+    ));
 
     let upper = BoundExpr::StrCall {
         f: StrFunc::Lower,
@@ -1041,27 +1074,23 @@ fn blob_columns_stay_outside_the_string_surface() {
 fn cast_from_a_string_emits_a_parse_and_is_never_elided() {
     let schema = str_schema();
     let to = |tc| BoundExpr::Cast { expr: Box::new(str_col(1)), to: tc };
-    assert_eq!(
-        lower_ops(&to(TypeCode::I64), &schema),
-        [ExprOp::LoadColStr.as_wire(), ExprOp::StrToInt.as_wire()]
-    );
-    assert_eq!(
-        lower_ops(&to(TypeCode::F64), &schema),
-        [ExprOp::LoadColStr.as_wire(), ExprOp::StrToFloat.as_wire()]
-    );
-    assert_eq!(
-        lower_ops(&to(TypeCode::F32), &schema),
-        [
-            ExprOp::LoadColStr.as_wire(),
-            ExprOp::StrToFloat.as_wire(),
-            ExprOp::FloatToF32.as_wire()
-        ]
-    );
+    assert!(matches!(
+        lower_instrs(&to(TypeCode::I64), &schema)[..],
+        [L::LoadColStr { .. }, L::StrToInt { .. }]
+    ));
+    assert!(matches!(
+        lower_instrs(&to(TypeCode::F64), &schema)[..],
+        [L::LoadColStr { .. }, L::StrToFloat { .. }]
+    ));
+    assert!(matches!(
+        lower_instrs(&to(TypeCode::F32), &schema)[..],
+        [L::LoadColStr { .. }, L::StrToFloat { .. }, L::FloatToF32 { .. }]
+    ));
     // STRING → STRING is the identity.
-    assert_eq!(
-        lower_ops(&to(TypeCode::String), &schema),
-        [ExprOp::LoadColStr.as_wire()]
-    );
+    assert!(matches!(
+        lower_instrs(&to(TypeCode::String), &schema)[..],
+        [L::LoadColStr { .. }]
+    ));
 }
 
 #[test]
@@ -1071,12 +1100,15 @@ fn cast_to_text_emits_the_numeric_to_text_opcode_for_its_source_domain() {
         expr: Box::new(BoundExpr::ColRef(c)),
         to: TypeCode::String,
     };
-    assert!(lower_ops(&to_text(1), &schema).contains(&ExprOp::IntToStr.as_wire()));
+    assert!(has(&lower_instrs(&to_text(1), &schema), |i| matches!(
+        i,
+        L::IntToStr { .. }
+    )));
     let f = BoundExpr::Cast {
         expr: Box::new(BoundExpr::LitFloat(1.5)),
         to: TypeCode::String,
     };
-    assert!(lower_ops(&f, &schema).contains(&ExprOp::FloatToStr.as_wire()));
+    assert!(has(&lower_instrs(&f, &schema), |i| matches!(i, L::FloatToStr { .. })));
     assert_str_program(&to_text(1), &schema);
 }
 
@@ -1103,14 +1135,17 @@ fn like_lowers_to_one_opcode_carrying_its_escape() {
     };
 
     let p = prog(Some(b'\\'), false);
-    assert_eq!(opcodes(&p), [ExprOp::LoadColStr.as_wire(), ExprOp::StrLike.as_wire()]);
+    assert!(matches!(
+        p.instrs(),
+        [L::LoadColStr { .. }, L::StrLike { ci: false, .. }]
+    ));
     assert_eq!(p.const_strings()[0], b"a%");
     assert_eq!(escape_of(&p), std::num::NonZeroU8::new(b'\\'));
-    // ILIKE is the same shape under the case-insensitive opcode …
-    assert_eq!(
-        opcodes(&prog(Some(b'\\'), true)),
-        [ExprOp::LoadColStr.as_wire(), ExprOp::StrIlike.as_wire()]
-    );
+    // ILIKE is the same shape, `ci` set …
+    assert!(matches!(
+        prog(Some(b'\\'), true).instrs(),
+        [L::LoadColStr { .. }, L::StrLike { ci: true, .. }]
+    ));
     // … and `ESCAPE ''` is the absence of an escape.
     assert_eq!(escape_of(&prog(None, false)), None);
 }
@@ -1124,28 +1159,20 @@ fn like_takes_a_computed_subject_and_propagates_a_null_literal() {
         f: StrFunc::Upper,
         args: vec![str_col(1)],
     };
-    assert_eq!(
-        lower_ops(&like_of(upper, "A%", Some(b'\\'), false), &schema),
-        [
-            ExprOp::LoadColStr.as_wire(),
-            ExprOp::StrUpper.as_wire(),
-            ExprOp::StrLike.as_wire()
-        ]
-    );
-    assert_eq!(
-        lower_ops(&like_of(BoundExpr::LitNull, "a", Some(b'\\'), false), &schema),
-        [ExprOp::LoadNullStr.as_wire(), ExprOp::StrLike.as_wire()]
-    );
+    assert!(matches!(
+        lower_instrs(&like_of(upper, "A%", Some(b'\\'), false), &schema)[..],
+        [L::LoadColStr { .. }, L::StrCase { upper: true, .. }, L::StrLike { .. }]
+    ));
+    assert!(matches!(
+        lower_instrs(&like_of(BoundExpr::LitNull, "a", Some(b'\\'), false), &schema)[..],
+        [L::LoadNullStr, L::StrLike { .. }]
+    ));
     // The verdict is a boolean, so `NOT LIKE` reads it like any other.
     let negated = BoundExpr::UnaryOp(UnaryOp::Not, Box::new(like_of(str_col(1), "a", Some(b'\\'), false)));
-    assert_eq!(
-        lower_ops(&negated, &schema),
-        [
-            ExprOp::LoadColStr.as_wire(),
-            ExprOp::StrLike.as_wire(),
-            ExprOp::BoolNot.as_wire()
-        ]
-    );
+    assert!(matches!(
+        lower_instrs(&negated, &schema)[..],
+        [L::LoadColStr { .. }, L::StrLike { .. }, L::BoolNot { .. }]
+    ));
 }
 
 /// The subject goes through the shared string-operand channel, so a numeric
@@ -1167,33 +1194,41 @@ fn like_over_a_numeric_operand_is_a_typed_error() {
 #[test]
 fn transcendentals_lift_and_sign_keeps_the_domain() {
     let s = cast_schema(); // col 1 = i32, col 4 = u64
-    for (f, op) in [
-        (NumFunc::Unary(FloatUnaryOp::Sqrt), ExprOp::FloatSqrt),
-        (NumFunc::Unary(FloatUnaryOp::Ln), ExprOp::FloatLn),
-        (NumFunc::Unary(FloatUnaryOp::Log10), ExprOp::FloatLog10),
-        (NumFunc::Unary(FloatUnaryOp::Exp), ExprOp::FloatExp),
+    for want in [
+        FloatUnaryOp::Sqrt,
+        FloatUnaryOp::Ln,
+        FloatUnaryOp::Log10,
+        FloatUnaryOp::Exp,
     ] {
-        let (ops, is_float) = lower_ops_isf(&func(f, BoundExpr::ColRef(1)), &s);
-        assert_eq!(
-            ops,
-            [ExprOp::LoadColInt.as_wire(), ExprOp::IntToFloat.as_wire(), op.as_wire()],
-            "{f:?}"
+        let f = NumFunc::Unary(want);
+        let (instrs, is_float) = lower_instrs_isf(&func(f, BoundExpr::ColRef(1)), &s);
+        assert!(
+            matches!(
+                instrs[..],
+                [L::LoadColInt { .. }, L::IntToFloat { .. }, L::FloatUnary { op, .. }] if op == want
+            ),
+            "{f:?}: {instrs:?}"
         );
         assert!(is_float);
-        let (ops, _) = lower_ops_isf(&func(f, BoundExpr::LitFloat(2.0)), &s);
-        assert_eq!(
-            &ops[ops.len() - 1..],
-            &[op.as_wire()],
+        let (instrs, _) = lower_instrs_isf(&func(f, BoundExpr::LitFloat(2.0)), &s);
+        assert!(
+            matches!(instrs.last(), Some(&L::FloatUnary { op, .. }) if op == want),
             "{f:?} over a float takes no lift"
         );
     }
     for c in [1usize, 4] {
-        let (ops, is_float) = lower_ops_isf(&func(NumFunc::Unary(FloatUnaryOp::Sign), BoundExpr::ColRef(c)), &s);
-        assert_eq!(ops, [ExprOp::LoadColInt.as_wire(), ExprOp::IntSign.as_wire()]);
+        let (instrs, is_float) = lower_instrs_isf(&func(NumFunc::Unary(FloatUnaryOp::Sign), BoundExpr::ColRef(c)), &s);
+        assert!(matches!(
+            instrs[..],
+            [L::LoadColInt { .. }, L::IntUnary { op: IntUnaryOp::Sign, .. }]
+        ));
         assert!(!is_float);
     }
-    let (ops, is_float) = lower_ops_isf(&func(NumFunc::Unary(FloatUnaryOp::Sign), BoundExpr::LitFloat(-2.0)), &s);
-    assert_eq!(ops[ops.len() - 1], ExprOp::FloatSign.as_wire());
+    let (instrs, is_float) = lower_instrs_isf(&func(NumFunc::Unary(FloatUnaryOp::Sign), BoundExpr::LitFloat(-2.0)), &s);
+    assert!(matches!(
+        instrs.last(),
+        Some(L::FloatUnary { op: FloatUnaryOp::Sign, .. })
+    ));
     assert!(is_float);
 }
 
@@ -1206,10 +1241,24 @@ fn power_lifts_both_operands_to_float() {
         BinOp::Pow,
         Box::new(BoundExpr::LitInt(2)),
     );
-    let (ops, is_float) = lower_ops_isf(&pow, &s);
+    let (instrs, is_float) = lower_instrs_isf(&pow, &s);
     assert!(is_float);
-    assert_eq!(ops.iter().filter(|&&o| o == ExprOp::IntToFloat.as_wire()).count(), 2);
-    assert_eq!(ops[ops.len() - 1], ExprOp::FloatPow.as_wire());
+    assert!(
+        matches!(instrs.last(), Some(L::FloatArith { op: FloatArithOp::Pow, .. })),
+        "{instrs:?}"
+    );
+    // Both operands reach POWER in the float domain. The column takes the lift;
+    // the literal's lift is folded to a float constant by `ExprBuilder::emit`,
+    // so it is a `LoadConst` of the f64 bit pattern and not a second
+    // `IntToFloat`.
+    assert_eq!(count(&instrs, |i| matches!(i, L::IntToFloat { .. })), 1, "{instrs:?}");
+    assert!(
+        has(
+            &instrs,
+            |i| matches!(i, &L::LoadConst { val } if f64::from_bits(val as u64) == 2.0)
+        ),
+        "{instrs:?}"
+    );
 }
 
 /// Every string function lowers to its opcode with the class its result type
@@ -1219,50 +1268,52 @@ fn string_calls_lower_to_their_opcodes() {
     let schema = str_schema();
     let call = |f, args: Vec<BoundExpr>| BoundExpr::StrCall { f, args };
     let n = || BoundExpr::LitInt(2);
-    for (expr, op, kind) in [
+    // The instruction each call must end on, as a predicate over the typed form.
+    type Last = fn(&LogicalInstr) -> bool;
+    for (expr, last, kind) in [
         (
             call(StrFunc::Reverse, vec![str_col(1)]),
-            ExprOp::StrReverse,
+            (|i| matches!(i, L::StrReverse { .. })) as Last,
             ExprKind::Str,
         ),
         (
             call(StrFunc::Left, vec![str_col(1), n()]),
-            ExprOp::StrLeft,
+            |i| matches!(i, L::StrSide { left: true, .. }),
             ExprKind::Str,
         ),
         (
             call(StrFunc::Right, vec![str_col(1), n()]),
-            ExprOp::StrRight,
+            |i| matches!(i, L::StrSide { left: false, .. }),
             ExprKind::Str,
         ),
         (
             call(StrFunc::Pos, vec![str_col(1), lit("x")]),
-            ExprOp::StrPos,
+            |i| matches!(i, L::StrPos { .. }),
             ExprKind::Int,
         ),
         (
             call(StrFunc::Replace, vec![str_col(1), lit("a"), lit("b")]),
-            ExprOp::StrReplace,
+            |i| matches!(i, L::StrReplace { .. }),
             ExprKind::Str,
         ),
         (
             call(StrFunc::Lpad, vec![str_col(1), n(), lit(" ")]),
-            ExprOp::StrLpad,
+            |i| matches!(i, L::StrPad { left: true, .. }),
             ExprKind::Str,
         ),
         (
             call(StrFunc::Rpad, vec![str_col(1), n(), lit(" ")]),
-            ExprOp::StrRpad,
+            |i| matches!(i, L::StrPad { left: false, .. }),
             ExprKind::Str,
         ),
         (
             call(StrFunc::SplitPart, vec![str_col(1), lit(","), n()]),
-            ExprOp::StrSplitPart,
+            |i| matches!(i, L::StrSplitPart { .. }),
             ExprKind::Str,
         ),
     ] {
-        let (ops, got_kind) = lower_ops_kind(&expr, &schema);
-        assert_eq!(ops[ops.len() - 1], op.as_wire(), "{expr:?}");
+        let (instrs, got_kind) = lower_instrs_kind(&expr, &schema);
+        assert!(instrs.last().is_some_and(last), "{expr:?}: {instrs:?}");
         assert_eq!(got_kind, kind, "{expr:?}");
     }
     // An integer position rejects a float, naming the function and position;
@@ -1283,30 +1334,33 @@ fn string_calls_lower_to_their_opcodes() {
 fn null_test_lowers_by_its_operand() {
     let schema = str_schema(); // every column nullable
     let test = |inner, want_null| BoundExpr::NullTest { inner: Box::new(inner), want_null };
-    assert_eq!(lower_ops(&test(str_col(1), true), &schema), [ExprOp::IsNull.as_wire()]);
-    assert_eq!(
-        lower_ops(&test(str_col(1), false), &schema),
-        [ExprOp::IsNotNull.as_wire()]
-    );
+    assert!(matches!(
+        lower_instrs(&test(str_col(1), true), &schema)[..],
+        [L::IsNull { invert: false, .. }]
+    ));
+    assert!(matches!(
+        lower_instrs(&test(str_col(1), false), &schema)[..],
+        [L::IsNull { invert: true, .. }]
+    ));
     let upper = BoundExpr::StrCall {
         f: StrFunc::Upper,
         args: vec![str_col(1)],
     };
-    assert_eq!(
-        lower_ops(&test(upper, true), &schema),
+    assert!(matches!(
+        lower_instrs(&test(upper, true), &schema)[..],
         [
-            ExprOp::LoadColStr.as_wire(),
-            ExprOp::StrUpper.as_wire(),
-            ExprOp::IsNullReg.as_wire()
+            L::LoadColStr { .. },
+            L::StrCase { upper: true, .. },
+            L::IsNullReg { invert: false, .. }
         ]
-    );
+    ));
     let sum = BoundExpr::BinOp(
         Box::new(BoundExpr::ColRef(0)),
         BinOp::Add,
         Box::new(BoundExpr::LitInt(1)),
     );
-    let ops = lower_ops(&test(sum, false), &schema);
-    assert_eq!(ops[ops.len() - 1], ExprOp::IsNotNullReg.as_wire());
+    let instrs = lower_instrs(&test(sum, false), &schema);
+    assert!(matches!(instrs.last(), Some(L::IsNullReg { invert: true, .. })));
 }
 
 /// A true-constant conjunct — the binder's fold of `IS NOT NULL` on a
@@ -1323,16 +1377,16 @@ fn filter_program_drops_true_constant_conjuncts_in_any_position() {
     );
     let t = BoundExpr::LitInt(1);
     let f = BoundExpr::LitInt(0);
-    let ops = |conjuncts: &[&BoundExpr]| {
+    let instrs = |conjuncts: &[&BoundExpr]| {
         compile_filter_program(conjuncts.iter().copied(), &schema.columns)
             .expect("lowers")
-            .map(|p| opcodes(&p))
+            .map(|p| p.instrs().to_vec())
     };
-    let alone = ops(&[&gt]).expect("a program");
-    assert_eq!(ops(&[&t, &gt, &t]), Some(alone));
-    assert_eq!(ops(&[&t, &t]), None);
-    assert_eq!(ops(&[]), None);
-    assert_eq!(ops(&[&f]), Some(vec![ExprOp::LoadConst.as_wire()]));
+    let alone = instrs(&[&gt]).expect("a program");
+    assert_eq!(instrs(&[&t, &gt, &t]), Some(alone));
+    assert_eq!(instrs(&[&t, &t]), None);
+    assert_eq!(instrs(&[]), None);
+    assert!(matches!(instrs(&[&f]).as_deref(), Some([L::LoadConst { val: 0 }])));
 }
 
 /// Every conjunct is a boolean, a lone one included: a string column on its

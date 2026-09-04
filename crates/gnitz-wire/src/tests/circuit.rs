@@ -13,7 +13,7 @@ fn sample(op: Opcode) -> OpNode {
         Opcode::Filter => OpNode::Filter(Some(vec![1, 2, 3, 4])),
         Opcode::Negate => OpNode::Negate,
         Opcode::Union => OpNode::Union,
-        Opcode::JoinDeltaTrace => OpNode::Join(JoinKind::DeltaTrace),
+        Opcode::Join => OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 3, rel: RangeRel::Le }),
         Opcode::Integrate => OpNode::IntegrateSink,
         Opcode::Reduce => OpNode::Reduce {
             group_cols: vec![2, 7],
@@ -45,7 +45,6 @@ fn sample(op: Opcode) -> OpNode {
             cols: vec![(1, 0), (2, crate::type_code::I32)],
             branch_id: 0,
         }),
-        Opcode::JoinDeltaTraceRange => OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 3, rel: RangeRel::Le }),
         Opcode::WorkerFilter => OpNode::WorkerFilter,
         Opcode::PositivePart => OpNode::PositivePart,
         Opcode::MapReindex => OpNode::Map(MapKind::Reindex {
@@ -53,7 +52,6 @@ fn sample(op: Opcode) -> OpNode {
             key: vec![(2, 0), (5, crate::type_code::I64)],
             role: ReindexRole::ScatterKey,
         }),
-        Opcode::JoinDeltaTraceCross => OpNode::Join(JoinKind::DeltaTraceCross),
     }
 }
 
@@ -111,6 +109,12 @@ fn every_op_node_variant_roundtrips() {
             out_key,
         });
     }
+    // Every join kind, and every relation the range kind can carry — `Join`'s
+    // own sample can only be one of them.
+    nodes.extend([
+        OpNode::Join(JoinKind::DeltaTrace),
+        OpNode::Join(JoinKind::DeltaTraceCross),
+    ]);
     for &rel in RangeRel::ALL {
         nodes.push(OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 3, rel }));
     }
