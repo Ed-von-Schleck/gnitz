@@ -6,87 +6,80 @@ use gnitz_wire::{MapKind, OpNode, ReindexRole};
 fn a_cyclic_circuit_is_rejected() {
     let nodes = HashMap::from([(0, OpNode::Filter(None)), (1, OpNode::Filter(None))]);
     assert!(matches!(
-        load::topo_sorted(nodes, vec![(0, 1, 0), (1, 0, 0)]),
+        load::topo_sorted(nodes, wire_slots(&[(0, 1, SLOT_IN), (1, 0, SLOT_IN)])),
         Err(CompileError::Rejected("circuit graph has a cycle"))
     ));
 }
 
 // ── load_circuit against the real system tables ─────────────────────────
 
-/// The three circuit system tables `load_circuit` reads, on one tempdir.
-/// All three must be live: `load_circuit` opens a cursor over each up front and
-/// fails on a null one, which would pass these assertions vacuously. Their
-/// schemas differ (6/5/7 columns), so one cannot stand in for another.
+/// The `CircuitNodes` system table `load_circuit` reads, on one tempdir. It must
+/// be live: `load_circuit` opens a cursor over it up front and fails on a null
+/// one, which would pass these assertions vacuously.
 struct CircuitTables {
     _tmp: tempfile::TempDir,
     nodes: Table,
-    edges: Table,
-    cols: Table,
 }
 
 impl CircuitTables {
     const VIEW_ID: u64 = 1;
 
-    fn schema(cols: &[gnitz_wire::WireSysCol]) -> SchemaDescriptor {
-        gnitz_store::schema::from_wire_cols(cols, gnitz_wire::CIRCUIT_FAMILY_PK)
+    fn schema() -> SchemaDescriptor {
+        gnitz_store::schema::from_wire_cols(gnitz_wire::CIRCUIT_NODES_COLS, gnitz_wire::CIRCUIT_FAMILY_PK)
     }
 
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        let open = |name: &str, cols: &[gnitz_wire::WireSysCol]| {
-            // Each `Table` owns its path, so it outlives the `TempDir` binding.
-            Table::new(
-                &format!("{}/{name}", tmp.path().to_str().unwrap()),
-                Self::schema(cols),
-                0,
-                RecoverySource::Rederive { resume_at: None },
-            )
-            .unwrap()
-        };
-        Self {
-            nodes: open("nodes", gnitz_wire::CIRCUIT_NODES_COLS),
-            edges: open("edges", gnitz_wire::CIRCUIT_EDGES_COLS),
-            cols: open("cols", gnitz_wire::CIRCUIT_NODE_COLUMNS_COLS),
-            _tmp: tmp,
-        }
-    }
-
-    fn fill(tab: &mut Table, cols: &[gnitz_wire::WireSysCol], f: impl FnOnce(&mut gnitz_store::storage::BatchBuilder)) {
-        let mut bb = gnitz_store::storage::BatchBuilder::new(Self::schema(cols));
-        f(&mut bb);
-        tab.ingest_owned_batch(bb.finish()).unwrap();
+        // The `Table` owns its path, so it outlives the `TempDir` binding.
+        let nodes = Table::new(
+            &format!("{}/nodes", tmp.path().to_str().unwrap()),
+            Self::schema(),
+            0,
+            RecoverySource::Rederive { resume_at: None },
+        )
+        .unwrap();
+        Self { nodes, _tmp: tmp }
     }
 
     fn put_nodes(&mut self, f: impl FnOnce(&mut gnitz_store::storage::BatchBuilder)) -> &mut Self {
-        Self::fill(&mut self.nodes, gnitz_wire::CIRCUIT_NODES_COLS, f);
-        self
-    }
-
-    fn put_edges(&mut self, f: impl FnOnce(&mut gnitz_store::storage::BatchBuilder)) -> &mut Self {
-        Self::fill(&mut self.edges, gnitz_wire::CIRCUIT_EDGES_COLS, f);
+        let mut bb = gnitz_store::storage::BatchBuilder::new(Self::schema());
+        f(&mut bb);
+        self.nodes.ingest_owned_batch(bb.finish()).unwrap();
         self
     }
 
     /// One `CircuitNodes` row under `view_id`, through the shared row codec — so
-    /// a fixture cannot disagree with what the client lays down.
+    /// a fixture cannot disagree with what the client lays down. `input` is the
+    /// producer feeding slot 0.
     fn node_row(
         bb: &mut gnitz_store::storage::BatchBuilder,
         view_id: u64,
         node_id: u64,
-        opcode: u64,
-        source: Option<u64>,
+        op: OpNode,
+        input: Option<u64>,
     ) {
-        Self::node_row_with_blob(bb, view_id, node_id, opcode, source, None);
+        let (opcode, source_table, params) = gnitz_wire::encode_op_node(op);
+        Self::raw_row(
+            bb,
+            view_id,
+            node_id,
+            opcode.as_wire(),
+            source_table,
+            input,
+            params.as_deref(),
+        );
     }
 
-    /// [`Self::node_row`] carrying an expr/param blob.
-    fn node_row_with_blob(
+    /// [`Self::node_row`] with the row fields spelled out, for the shapes no
+    /// `OpNode` encodes to (an unknown opcode, a damaged parameter cell).
+    fn raw_row(
         bb: &mut gnitz_store::storage::BatchBuilder,
         view_id: u64,
         node_id: u64,
         opcode: u64,
-        source: Option<u64>,
-        expr_program: Option<&[u8]>,
+        source_table: Option<u64>,
+        input: Option<u64>,
+        params: Option<&[u8]>,
     ) {
         gnitz_wire::sys_rows::write_circuit_node_row(
             bb,
@@ -94,27 +87,12 @@ impl CircuitTables {
                 view_id,
                 node_id,
                 opcode,
-                source_table: source,
-                expr_program,
+                source_table,
+                inputs: [input, None],
+                params,
             },
             1,
-        )
-        .unwrap();
-    }
-
-    /// One `CircuitEdges` row under `view_id`: `src_node → (dst_node, PORT_IN)`.
-    fn edge_row(bb: &mut gnitz_store::storage::BatchBuilder, view_id: u64, src_node: u64, dst_node: u64) {
-        gnitz_wire::sys_rows::write_circuit_edge_row(
-            bb,
-            &gnitz_wire::sys_rows::CircuitEdgeRow {
-                view_id,
-                dst_node,
-                dst_port: PORT_IN as u64,
-                src_node,
-            },
-            1,
-        )
-        .unwrap();
+        );
     }
 
     fn load(&mut self) -> Result<LoadedCircuit, CompileError> {
@@ -122,148 +100,122 @@ impl CircuitTables {
     }
 }
 
-/// The three circuit tables answer a load in place, the way the registry does
-/// for the engine. No relation schemas — nothing under test here resolves one.
+/// The circuit table answers a load in place, the way the registry does for the
+/// engine. No relation schemas — nothing under test here resolves one.
 impl SchemaSource for CircuitTables {
     fn schema_of(&self, _tid: i64) -> Option<SchemaDescriptor> {
         None
     }
 
     fn open_sys_cursor(&self, tid: i64) -> Option<ReadCursor> {
-        Some(match tid as u64 {
-            gnitz_wire::CIRCUIT_NODES_TAB => self.nodes.open_cursor(),
-            gnitz_wire::CIRCUIT_EDGES_TAB => self.edges.open_cursor(),
-            gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB => self.cols.open_cursor(),
-            _ => return None,
-        })
+        (tid as u64 == gnitz_wire::CIRCUIT_NODES_TAB).then(|| self.nodes.open_cursor())
     }
 }
 
 /// Every malformed-row shape must abort the WHOLE load and say which check
-/// fired: skipping a row would leave edges dangling and silently corrupt the
+/// fired: skipping a row would leave an input dangling and silently corrupt the
 /// topological order.
 #[test]
 fn a_malformed_row_aborts_the_load_and_names_the_check() {
     // An opcode `decode_op_node` rejects.
     let mut c = CircuitTables::new();
-    c.put_nodes(|bb| CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 1, 9999, None));
+    c.put_nodes(|bb| CircuitTables::raw_row(bb, CircuitTables::VIEW_ID, 1, 9999, None, None, None));
     assert!(matches!(
         c.load(),
         Err(CompileError::Rejected("circuit node failed to decode"))
     ));
 
-    // An edge whose dst is not a node of the circuit: honouring it would create
-    // a phantom node.
+    // A node naming a producer that is not a node of the circuit: honouring it
+    // would create a phantom node.
     let mut c = CircuitTables::new();
     c.put_nodes(|bb| {
-        CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 0, gnitz_wire::OPCODE_SCAN_DELTA, Some(99));
-        CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 1, gnitz_wire::OPCODE_INTEGRATE, None);
-    })
-    .put_edges(|bb| {
-        // dst_node 7 — no such node.
-        CircuitTables::edge_row(bb, CircuitTables::VIEW_ID, 0, 7);
+        CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 0, scan_delta(99), None);
+        CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 1, OpNode::IntegrateSink, Some(7));
     });
     assert!(matches!(
         c.load(),
-        Err(CompileError::Rejected("edge endpoint is not a node of the circuit"))
+        Err(CompileError::Rejected("a node's input is not a node of the circuit"))
     ));
 }
 
 /// The load is filtered to one view's rows by the `view_id` OPK prefix, and a
-/// non-NULL expr blob that reads back empty stays present: `None` is how an
-/// absent program is spelled and would turn a Filter into `WHERE TRUE`.
-/// Rejecting the undecodable blob is the compile's job, not the load's.
+/// `Filter` whose program is present but undecodable stays present: rejecting
+/// the program is the compile's job, not the load's. A NULL cell is how an
+/// absent program is spelled and would turn the Filter into `WHERE TRUE`, so the
+/// two must not collapse.
 #[test]
-fn the_load_takes_one_views_rows_and_keeps_a_damaged_blob_present() {
+fn the_load_takes_one_views_rows_and_keeps_a_damaged_program_present() {
     let mut c = CircuitTables::new();
     c.put_nodes(|bb| {
-        CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 0, gnitz_wire::OPCODE_SCAN_DELTA, Some(10));
-        // expr_program non-NULL, zero length.
-        CircuitTables::node_row_with_blob(
-            bb,
-            CircuitTables::VIEW_ID,
-            1,
-            gnitz_wire::OPCODE_FILTER,
-            None,
-            Some(&[]),
-        );
+        CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 0, scan_delta(10), None);
+        CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 1, OpNode::Filter(Some(vec![0xff])), Some(0));
         // A second view's nodes, which this load must not see. An undecodable
         // opcode, so a load that ignored the prefix would fail outright.
-        CircuitTables::node_row(bb, CircuitTables::VIEW_ID + 1, 2, 9999, None);
-    })
-    .put_edges(|bb| {
-        CircuitTables::edge_row(bb, CircuitTables::VIEW_ID, 0, 1);
+        CircuitTables::raw_row(bb, CircuitTables::VIEW_ID + 1, 2, 9999, None, None, None);
     });
-    let loaded = c.load().expect("a damaged blob is not a load failure");
+    let loaded = c.load().expect("a damaged program is not a load failure");
     assert_eq!(loaded.nodes.len(), 2, "only this view's nodes are loaded");
     assert!(
-        matches!(loaded.nodes.get(&1), Some(OpNode::Filter(Some(b))) if b.is_empty()),
-        "an empty blob must stay present, not collapse to a pass-all filter"
+        matches!(loaded.nodes.get(&1), Some(OpNode::Filter(Some(b))) if b == &[0xff]),
+        "an undecodable program must stay present, not collapse to a pass-all filter"
     );
 }
 
-/// A host holding none of the circuit tables must fail the load rather than
+/// A host holding no circuit table must fail the load rather than
 /// yield a silently empty circuit — a compile attempted against one is a caller
 /// error the load has to report.
 #[test]
 fn a_load_from_unopened_system_tables_fails() {
     assert!(matches!(
         load_circuit(&ExtTables::new(), 0),
-        Err(CompileError::Rejected("circuit system tables are not open"))
+        Err(CompileError::Rejected("the circuit system table is not open"))
     ));
 }
 
-/// A reduce owns its trace-in: `PORT_TRACE` is written solely by a binary join,
-/// but the circuit families carry no catalog precheck, so a forged bundle can
-/// land the edge anywhere. Honouring one would hand the reduce a delta register
-/// with no `Integrate` behind it and abort a worker on the null cursor. One
-/// load-time check stands in for the arity test each operand read would
-/// otherwise carry, so every node's edge set must be exactly its operator's
-/// port set.
+/// Slot 1 is filled solely by a binary join, but the circuit family carries no
+/// catalog precheck, so a forged bundle can fill it anywhere — handing a reduce a
+/// delta register with no `Integrate` behind it, and aborting a worker on the
+/// null cursor. This one load-time check stands in for the arity test each
+/// operand read would otherwise carry.
 #[test]
-fn port_set_violations_fail_at_load() {
-    let load = |dst: OpNode, edges: Vec<(i32, i32, i32)>| {
+fn arity_violations_fail_at_load() {
+    let load = |dst: OpNode, edges: &[(i32, i32, usize)]| {
         let nodes = HashMap::from([(0, scan_delta(10)), (1, scan_delta(11)), (2, dst)]);
-        load::topo_sorted(nodes, edges)
+        load::topo_sorted(nodes, wire_slots(edges))
     };
     let rejected = |r: Result<LoadedCircuit, CompileError>, what: &str| {
         assert!(
             matches!(
                 r,
                 Err(CompileError::Rejected(
-                    "node's input edges do not match its operator's ports"
+                    "node's inputs do not match its operator's arity"
                 ))
             ),
             "{what} must fail at load",
         );
     };
-    assert!(load(OpNode::Filter(None), vec![(0, 2, PORT_IN)]).is_ok(), "control");
+    assert!(load(OpNode::Filter(None), &[(0, 2, SLOT_IN)]).is_ok(), "control");
 
-    rejected(
-        load(OpNode::Filter(None), vec![(0, 2, PORT_IN), (1, 2, PORT_IN)]),
-        "two edges into one port",
-    );
-    rejected(load(OpNode::Filter(None), vec![(0, 2, 2)]), "a port beyond the arity");
     rejected(
         load(
             OpNode::Reduce {
                 group_cols: vec![0],
-                agg: vec![(gnitz_wire::AggFunc::Count, 1)],
+                agg: vec![gnitz_wire::AggDescriptor {
+                    agg_op: gnitz_wire::AggFunc::Count,
+                    col_idx: 1,
+                }],
                 global_ground: false,
                 out_key: gnitz_store::schema::ReduceOutKey::PkPermutation,
             },
-            vec![(0, 2, PORT_IN), (1, 2, PORT_TRACE)],
+            &[(0, 2, SLOT_IN), (1, 2, SLOT_TRACE)],
         ),
-        "a forged Reduce trace edge",
+        "a forged Reduce trace input",
     );
     rejected(
-        load(OpNode::ExchangeShard { shard_cols: vec![0] }, vec![]),
+        load(OpNode::ExchangeShard { shard_cols: vec![0] }, &[]),
         "an input-less ExchangeShard",
     );
-    rejected(
-        load(OpNode::Union, vec![(0, 2, PORT_IN_A)]),
-        "a Union wired on one port",
-    );
+    rejected(load(OpNode::Union, &[(0, 2, SLOT_IN)]), "a Union wired on one slot");
 }
 
 /// The join relay is read off the `Join` node's kind, never off
@@ -282,14 +234,17 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
                 3,
                 OpNode::Reduce {
                     group_cols: vec![1],
-                    agg: vec![(gnitz_wire::AggFunc::Count, 0)],
+                    agg: vec![gnitz_wire::AggDescriptor {
+                        agg_op: gnitz_wire::AggFunc::Count,
+                        col_idx: 0,
+                    }],
                     global_ground: false,
                     out_key: gnitz_store::schema::ReduceOutKey::SyntheticFold,
                 },
             ),
             (4, OpNode::IntegrateSink),
         ]),
-        vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN), (3, 4, PORT_IN)],
+        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_IN), (3, 4, SLOT_IN)],
     );
     assert_eq!(load::circuit_join_relay(&loaded), load::JoinRelay::WholeKey);
 
@@ -302,7 +257,7 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
                 (3, OpNode::Join(kind)),
                 (4, OpNode::IntegrateSink),
             ]),
-            vec![(0, 3, PORT_IN_A), (1, 2, PORT_IN), (2, 3, PORT_TRACE), (3, 4, PORT_IN)],
+            vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],
         )
     };
     let range = |n_eq| gnitz_wire::JoinKind::DeltaTraceRange {
@@ -343,11 +298,11 @@ fn the_scatter_key_is_collected_once_however_the_reindex_map_fans_out() {
             ),
         ]),
         vec![
-            (0, 1, PORT_IN),
-            (1, 4, PORT_IN_A), // reindex Map → Join (delta term, DIRECT edge)
-            (1, 2, PORT_IN),   // reindex Map → WorkerFilter (toward the trace)
-            (2, 3, PORT_IN),
-            (3, 4, PORT_TRACE),
+            (0, 1, SLOT_IN),
+            (1, 4, SLOT_IN), // reindex Map → Join (delta term, DIRECT edge)
+            (1, 2, SLOT_IN), // reindex Map → WorkerFilter (toward the trace)
+            (2, 3, SLOT_IN),
+            (3, 4, SLOT_TRACE),
         ],
     );
     assert_eq!(load::scatter_key_of_scan(&loaded, 0).0, vec![vec![(2, 0)]]);
@@ -367,7 +322,7 @@ fn a_scan_fanning_into_two_reindex_maps_yields_two_sequences() {
             (3, scatter_reindex(&[5])),
         ]),
         // The second reindex sits behind a Filter, which the walk steps through.
-        vec![(0, 1, PORT_IN), (0, 2, PORT_IN), (2, 3, PORT_IN)],
+        vec![(0, 1, SLOT_IN), (0, 2, SLOT_IN), (2, 3, SLOT_IN)],
     );
     assert_eq!(
         load::scatter_key_of_scan(&loaded, 0).0,
@@ -391,13 +346,12 @@ fn a_key_sequence_survives_verbatim_but_identical_siblings_collapse() {
                 1,
                 OpNode::Map(MapKind::Reindex {
                     keep: vec![0],
-                    reindex_cols: vec![3, 3],
-                    reindex_target_tcs: vec![0, type_code::I64],
+                    key: vec![(3, 0), (3, type_code::I64)],
                     role: ReindexRole::ScatterKey,
                 }),
             ),
         ]),
-        vec![(0, 1, PORT_IN)],
+        vec![(0, 1, SLOT_IN)],
     );
     assert_eq!(
         load::scatter_key_of_scan(&overlapping, 0).0,
@@ -413,7 +367,7 @@ fn a_key_sequence_survives_verbatim_but_identical_siblings_collapse() {
             (3, OpNode::Filter(Some(dummy_expr_blob()))),
             (4, scatter_reindex(&[2])),
         ]),
-        vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (0, 3, PORT_IN), (3, 4, PORT_IN)],
+        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (0, 3, SLOT_IN), (3, 4, SLOT_IN)],
     );
     assert_eq!(
         load::scatter_key_of_scan(&siblings, 0).0,
@@ -432,8 +386,7 @@ fn an_auxiliary_reindex_never_contributes_the_scatter_key() {
     let aux_rekey = || {
         OpNode::Map(MapKind::Reindex {
             keep: vec![0],
-            reindex_cols: vec![0],
-            reindex_target_tcs: vec![],
+            key: vec![(0, 0)],
             role: ReindexRole::Auxiliary,
         })
     };
@@ -455,13 +408,13 @@ fn an_auxiliary_reindex_never_contributes_the_scatter_key() {
                 (6, OpNode::Distinct),
             ]),
             vec![
-                (0, 1, PORT_IN),
-                (1, 2, PORT_IN_A),
-                (1, 3, PORT_IN), // join reindex → its own integral
-                (3, 2, PORT_TRACE),
-                (0, 4, PORT_IN),
-                (4, 5, PORT_IN),
-                (5, 6, PORT_IN), // aux a.pk re-key → proj → distinct
+                (0, 1, SLOT_IN),
+                (1, 2, SLOT_IN),
+                (1, 3, SLOT_IN), // join reindex → its own integral
+                (3, 2, SLOT_TRACE),
+                (0, 4, SLOT_IN),
+                (4, 5, SLOT_IN),
+                (5, 6, SLOT_IN), // aux a.pk re-key → proj → distinct
             ],
         )
     };
@@ -485,13 +438,13 @@ fn a_non_reindex_map_contributes_no_scatter_key() {
             (0, scan_delta(7)),
             (
                 1,
-                OpNode::Map(MapKind::Compute {
+                OpNode::Map(MapKind::Compute(gnitz_wire::ComputeMap {
                     program: dummy_expr_blob(),
                     out_cols: vec![],
-                }),
+                })),
             ),
         ]),
-        vec![(0, 1, PORT_IN)],
+        vec![(0, 1, SLOT_IN)],
     );
     assert!(load::scatter_key_of_scan(&loaded, 0).0.is_empty());
 }
@@ -518,7 +471,7 @@ fn the_shard_walk_crosses_filters_and_nothing_else() {
         for (i, op) in mids.into_iter().enumerate() {
             nodes.insert(i as i32 + 1, op);
         }
-        let edges = (0..shard).map(|i| (i, i + 1, PORT_IN)).collect();
+        let edges = (0..shard).map(|i| (i, i + 1, SLOT_IN)).collect();
         scan_tid_through_filters(&loaded_for_test(nodes, edges), shard)
     };
     let filter = || OpNode::Filter(Some(dummy_expr_blob()));
@@ -555,8 +508,8 @@ fn the_shard_walk_bails_at_a_fan_in() {
         for (i, op) in tail.into_iter().enumerate() {
             nodes.insert(i as i32 + 3, op);
         }
-        let mut edges = vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B)];
-        edges.extend((2..shard).map(|i| (i, i + 1, PORT_IN)));
+        let mut edges = vec![(0, 2, SLOT_IN), (1, 2, SLOT_TRACE)];
+        edges.extend((2..shard).map(|i| (i, i + 1, SLOT_IN)));
         scan_tid_through_filters(&loaded_for_test(nodes, edges), shard)
     };
     assert_eq!(union_then(vec![]), None, "the Union feeds the shard directly");

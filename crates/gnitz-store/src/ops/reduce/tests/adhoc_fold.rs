@@ -1,7 +1,7 @@
 use super::*;
 use crate::schema::{type_code, SchemaColumn};
 use crate::storage::Layout;
-use gnitz_wire::{read_i64_le, AggFunc, AggReadItem, AGG_COUNT, AGG_COUNT_NON_NULL, AGG_MAX, AGG_MIN, AGG_SUM};
+use gnitz_wire::{read_i64_le, AggDescriptor, AggFunc};
 
 // Source: pk(U64), grp(I64), val(I64, nullable). val is payload slot 1.
 fn src_schema() -> SchemaDescriptor {
@@ -53,11 +53,8 @@ fn build(rows: &[(u64, i64, i64, Option<i64>)]) -> Batch {
     b
 }
 
-fn agg(op: u64, col: u16) -> AggReadItem {
-    AggReadItem {
-        op: AggFunc::from_wire(op).unwrap(),
-        src_col: col,
-    }
+fn agg(agg_op: AggFunc, col_idx: u32) -> AggDescriptor {
+    AggDescriptor { agg_op, col_idx }
 }
 
 /// Collect the partial output by group value (grp is payload col 0), returning
@@ -100,11 +97,11 @@ fn fold_grouped_multi_agg_with_nulls() {
     let spec = AggReadSpec::direct(
         vec![1],
         vec![
-            agg(AGG_COUNT, 0),
-            agg(AGG_COUNT_NON_NULL, 2),
-            agg(AGG_SUM, 2),
-            agg(AGG_MIN, 2),
-            agg(AGG_MAX, 2),
+            agg(AggFunc::Count, 0),
+            agg(AggFunc::CountNonNull, 2),
+            agg(AggFunc::Sum, 2),
+            agg(AggFunc::Min, 2),
+            agg(AggFunc::Max, 2),
         ],
     );
     let (src, reply) = (src_schema(), reply_schema(5));
@@ -119,7 +116,7 @@ fn fold_grouped_multi_agg_with_nulls() {
 
 #[test]
 fn fold_accumulates_across_chunks() {
-    let spec = AggReadSpec::direct(vec![1], vec![agg(AGG_COUNT, 0), agg(AGG_SUM, 2)]);
+    let spec = AggReadSpec::direct(vec![1], vec![agg(AggFunc::Count, 0), agg(AggFunc::Sum, 2)]);
     let (src, reply) = (src_schema(), reply_schema(2));
     let mut fold = AdhocFold::new(&src, &reply, &spec, 1000).unwrap();
     let (c1, c2) = (
@@ -138,7 +135,7 @@ fn fold_accumulates_across_chunks() {
 /// range never appears.
 #[test]
 fn fold_ranges_folds_only_the_given_ranges() {
-    let spec = AggReadSpec::direct(vec![1], vec![agg(AGG_COUNT, 0), agg(AGG_SUM, 2)]);
+    let spec = AggReadSpec::direct(vec![1], vec![agg(AggFunc::Count, 0), agg(AggFunc::Sum, 2)]);
     let (src, reply) = (src_schema(), reply_schema(2));
     let batch = build(&[
         (1, 1, 7, Some(10)),
@@ -156,7 +153,7 @@ fn fold_ranges_folds_only_the_given_ranges() {
 
 #[test]
 fn fold_global_single_group() {
-    let spec = AggReadSpec::direct(vec![], vec![agg(AGG_COUNT, 0), agg(AGG_MAX, 2)]);
+    let spec = AggReadSpec::direct(vec![], vec![agg(AggFunc::Count, 0), agg(AggFunc::Max, 2)]);
     let src = src_schema();
     // Global reply: _agg_pk(U128) + 2 agg cols (no group col).
     let reply = SchemaDescriptor::new(
@@ -179,7 +176,7 @@ fn fold_global_single_group() {
 
 #[test]
 fn fold_group_cap_aborts() {
-    let spec = AggReadSpec::direct(vec![1], vec![agg(AGG_COUNT, 0)]);
+    let spec = AggReadSpec::direct(vec![1], vec![agg(AggFunc::Count, 0)]);
     let (src, reply) = (src_schema(), reply_schema(1));
     // Cap of 2 distinct groups; a third distinct group trips it.
     let mut fold = AdhocFold::new(&src, &reply, &spec, 2).unwrap();
@@ -193,7 +190,7 @@ fn fold_group_cap_aborts() {
 /// never fed to `ReducePlan::new` (whose `cbase` arithmetic would panic).
 #[test]
 fn fold_rejects_mismatched_reply_schema() {
-    let spec = AggReadSpec::direct(vec![1], vec![agg(AGG_COUNT, 0)]);
+    let spec = AggReadSpec::direct(vec![1], vec![agg(AggFunc::Count, 0)]);
     let src = src_schema();
     let too_few = SchemaDescriptor::new(
         &[
@@ -229,16 +226,16 @@ fn fold_rejects_aggregates_with_no_encoding() {
         &[0],
     );
     let reply = reply_schema(1);
-    for (op, col) in [(AGG_SUM, 1u16), (AGG_MIN, 2)] {
+    for (op, col) in [(AggFunc::Sum, 1u32), (AggFunc::Min, 2)] {
         let spec = AggReadSpec::direct(vec![], vec![agg(op, col)]);
         let Err(err) = AdhocFold::new(&src, &reply, &spec, 1000) else {
-            panic!("{op:#x} over column {col} must be rejected");
+            panic!("{op:?} over column {col} must be rejected");
         };
         assert!(err.to_string().contains("no scalar register image"), "{err}");
     }
     // COUNT reads no value, so the same columns are countable.
-    for col in [1u16, 2] {
-        let spec = AggReadSpec::direct(vec![], vec![agg(AGG_COUNT, col)]);
+    for col in [1u32, 2] {
+        let spec = AggReadSpec::direct(vec![], vec![agg(AggFunc::Count, col)]);
         assert!(AdhocFold::new(&src, &reply_global(1), &spec, 1000).is_ok());
     }
 }
@@ -246,7 +243,7 @@ fn fold_rejects_aggregates_with_no_encoding() {
 #[test]
 fn fold_rejects_out_of_range_column() {
     // group column 9: no such column
-    let spec = AggReadSpec::direct(vec![9], vec![agg(AGG_COUNT, 0)]);
+    let spec = AggReadSpec::direct(vec![9], vec![agg(AggFunc::Count, 0)]);
     let (src, reply) = (src_schema(), reply_schema(1));
     assert!(AdhocFold::new(&src, &reply, &spec, 1000).is_err());
 }

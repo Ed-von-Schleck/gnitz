@@ -32,14 +32,15 @@ fn over_cap_pred_blob() -> Vec<u8> {
 /// rejecting one. With the filter first, a rejection would return before any
 /// directory existed and "nothing left behind" would hold vacuously.
 fn write_filtered_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, pred: &[u8]) {
+    let (_, _, filter_params) = gnitz_wire::encode_op_node(gnitz_wire::OpNode::Filter(Some(pred.to_vec())));
     write_circuit_chain(
         engine,
         vid,
         &[
-            (gnitz_wire::OPCODE_SCAN_DELTA, Some(base_tid), None),
-            (gnitz_wire::OPCODE_INTEGRATE_TRACE, None, None),
-            (gnitz_wire::OPCODE_FILTER, None, Some(pred)),
-            (gnitz_wire::OPCODE_INTEGRATE, None, None),
+            (gnitz_wire::Opcode::ScanDelta, Some(base_tid), None),
+            (gnitz_wire::Opcode::IntegrateTrace, None, None),
+            (gnitz_wire::Opcode::Filter, None, filter_params.as_deref()),
+            (gnitz_wire::Opcode::Integrate, None, None),
         ],
     );
 }

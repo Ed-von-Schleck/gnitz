@@ -224,10 +224,9 @@ impl TypeCode {
 
     /// Whether a single non-nullable column of this type may serve as a reduce's
     /// output primary key directly, rather than a synthetic U128 group fold —
-    /// the type half of the `SingleNaturalCol` predicate feeding
-    /// [`crate::ReduceOutKey::decide`] on both the planner and engine side.
-    /// Narrow unsigned/signed integers are excluded; only the natural key-width
-    /// unsigned types qualify.
+    /// the type half of [`crate::ReduceOutKey::for_group_cols`]'s
+    /// `SingleNaturalCol` predicate. Only the natural key-width unsigned types
+    /// qualify.
     #[inline]
     pub(crate) const fn is_natural_reduce_key(&self) -> bool {
         matches!(self, TypeCode::U64 | TypeCode::U128 | TypeCode::UUID)

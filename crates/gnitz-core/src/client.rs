@@ -12,9 +12,8 @@ use crate::circuit::Circuit;
 use crate::types::sys_schema;
 use gnitz_wire::sys_rows::{IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::{
-    RelClass, RelDescriptorBlob, TableProps, CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB,
-    IDXTAB_COL_NAME, IDXTAB_COL_SOURCE_COLS, OWNER_KIND_TABLE, OWNER_KIND_VIEW, SCHEMATAB_COL_NAME, TABTAB_COL_NAME,
-    TABTAB_COL_SCHEMA_ID,
+    RelClass, RelDescriptorBlob, TableProps, CIRCUIT_NODES_TAB, IDXTAB_COL_NAME, IDXTAB_COL_SOURCE_COLS,
+    OWNER_KIND_TABLE, OWNER_KIND_VIEW, SCHEMATAB_COL_NAME, TABTAB_COL_NAME, TABTAB_COL_SCHEMA_ID,
 };
 
 // --- Module-private helpers ---
@@ -1521,18 +1520,14 @@ impl GnitzClient {
             .collect();
 
         // One batch per family, spanning all views. COL_TAB and VIEW_TAB are
-        // always non-empty; the circuit families are included only if some view
+        // always non-empty; the circuit family is included only if some view
         // contributed rows.
         let col_s = sys_schema(COL_TAB);
         let nodes_s = sys_schema(CIRCUIT_NODES_TAB);
-        let edges_s = sys_schema(CIRCUIT_EDGES_TAB);
-        let ncol_s = sys_schema(CIRCUIT_NODE_COLUMNS_TAB);
         let view_s = sys_schema(VIEW_TAB);
 
         let mut col_batch = ZSetBatch::new(col_s);
         let mut nodes_batch = ZSetBatch::new(nodes_s);
-        let mut edges_batch = ZSetBatch::new(edges_s);
-        let mut ncol_batch = ZSetBatch::new(ncol_s);
         let mut view_batch = ZSetBatch::new(view_s);
 
         // 0. The replaced view's retraction, ahead of the new chain's `+1`s.
@@ -1543,8 +1538,6 @@ impl GnitzClient {
         {
             let mut col_a = BatchAppender::new(&mut col_batch, col_s);
             let mut nodes_a = BatchAppender::new(&mut nodes_batch, nodes_s);
-            let mut edges_a = BatchAppender::new(&mut edges_batch, edges_s);
-            let mut ncol_a = BatchAppender::new(&mut ncol_batch, ncol_s);
             let mut view_a = BatchAppender::new(&mut view_batch, view_s);
 
             let last = views.len() - 1;
@@ -1561,11 +1554,10 @@ impl GnitzClient {
                 // 1. Column records.
                 append_col_rows(&mut col_a, vid, OWNER_KIND_VIEW, &pv.output_columns)?;
 
-                // 2–4. Materialise the typed circuit into the three-table bundle.
-                let rows = pv.circuit.into_rows();
-                append_circuit_rows(&mut nodes_a, &mut edges_a, &mut ncol_a, vid, &rows)?;
+                // 2. Circuit node rows.
+                append_circuit_rows(&mut nodes_a, vid, pv.circuit);
 
-                // 5. View row — the VIEW_TAB register hook triggers server-side
+                // 3. View row — the VIEW_TAB register hook triggers server-side
                 // compilation. Encode the view PK with the shared wire packer so the
                 // engine catalog decodes it identically to a TABLE_TAB PK.
                 gnitz_wire::sys_rows::write_view_tab_row(
@@ -1591,12 +1583,6 @@ impl GnitzClient {
         families.push((COL_TAB, col_batch));
         if !nodes_batch.is_empty() {
             families.push((CIRCUIT_NODES_TAB, nodes_batch));
-        }
-        if !edges_batch.is_empty() {
-            families.push((CIRCUIT_EDGES_TAB, edges_batch));
-        }
-        if !ncol_batch.is_empty() {
-            families.push((CIRCUIT_NODE_COLUMNS_TAB, ncol_batch));
         }
         families.push((VIEW_TAB, view_batch));
 
@@ -2144,62 +2130,27 @@ fn append_col_rows(
     Ok(())
 }
 
-/// Append a circuit's node / edge / node-column rows to the three circuit-family
-/// batch appenders under `vid` (the compound `(view_id, sub)` PK prefix). The
-/// single home for the circuit-family wire layout — the PK packings and the
-/// nullable `source_table` / `expr_program` writers — used by CREATE VIEW
-/// (`create_view_chain`).
-fn append_circuit_rows(
-    nodes_a: &mut BatchAppender<'_>,
-    edges_a: &mut BatchAppender<'_>,
-    ncol_a: &mut BatchAppender<'_>,
-    vid: u64,
-    rows: &crate::circuit::CircuitRows,
-) -> Result<(), ClientError> {
-    use gnitz_wire::sys_rows::{
-        write_circuit_edge_row, write_circuit_node_column_row, write_circuit_node_row, CircuitEdgeRow,
-        CircuitNodeColumnRow, CircuitNodeRow,
-    };
-    for (node_id, opcode, src_tab, expr_blob) in &rows.nodes {
+/// Append a circuit's node rows to the `CircuitNodes` batch appender under `vid`
+/// (the compound `(view_id, node_id)` PK prefix). The single home for the
+/// circuit family's wire layout, used by CREATE VIEW (`create_view_chain`).
+fn append_circuit_rows(nodes_a: &mut BatchAppender<'_>, vid: u64, circuit: crate::circuit::Circuit) {
+    use gnitz_wire::sys_rows::{write_circuit_node_row, CircuitNodeRow};
+    for (node_id, op) in circuit.nodes {
+        let inputs = circuit.inputs.get(&node_id).copied().unwrap_or([None; 2]);
+        let (opcode, source_table, params) = gnitz_wire::encode_op_node(op);
         write_circuit_node_row(
             nodes_a,
             &CircuitNodeRow {
                 view_id: vid,
-                node_id: *node_id,
-                opcode: *opcode,
-                source_table: *src_tab,
-                expr_program: expr_blob.as_deref(),
+                node_id,
+                opcode: opcode.as_wire(),
+                source_table,
+                inputs,
+                params: params.as_deref(),
             },
             1,
-        )?;
+        );
     }
-    for (dst_node, dst_port, src_node) in &rows.edges {
-        write_circuit_edge_row(
-            edges_a,
-            &CircuitEdgeRow {
-                view_id: vid,
-                dst_node: *dst_node,
-                dst_port: *dst_port as u64,
-                src_node: *src_node,
-            },
-            1,
-        )?;
-    }
-    for (node_id, kind, position, v1, v2) in &rows.node_columns {
-        write_circuit_node_column_row(
-            ncol_a,
-            &CircuitNodeColumnRow {
-                view_id: vid,
-                node_id: *node_id,
-                kind: *kind,
-                position: *position as u64,
-                value1: *v1,
-                value2: *v2,
-            },
-            1,
-        )?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

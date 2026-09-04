@@ -52,7 +52,7 @@ fn the_output_exchange_skips_only_at_the_two_ends_of_the_prefix() {
                 (0, scan_delta(7)),
                 (1, gnitz_wire::OpNode::ExchangeShard { shard_cols }),
             ]),
-            vec![(0, 1, PORT_IN)],
+            vec![(0, 1, SLOT_IN)],
         );
         let ext: ExtTables = HashMap::from([(7, schema)]);
         ViewMeta::derive(&loaded, &ext).unwrap().skips_exchange
@@ -141,11 +141,11 @@ fn a_source_reached_by_two_scans_routes_by_one_key_or_refuses() {
                 (5, gnitz_wire::OpNode::IntegrateSink),
             ]),
             vec![
-                (0, 1, PORT_IN),
-                (2, 3, PORT_IN),
-                (1, 4, PORT_IN_A),
-                (3, 4, PORT_TRACE),
-                (4, 5, PORT_IN),
+                (0, 1, SLOT_IN),
+                (2, 3, SLOT_IN),
+                (1, 4, SLOT_IN),
+                (3, 4, SLOT_TRACE),
+                (4, 5, SLOT_IN),
             ],
         );
         ViewMeta::derive(&loaded, &ExtTables::default()).unwrap()
@@ -178,11 +178,11 @@ fn a_source_with_no_reindex_map_takes_the_view_shard_route() {
             (5, gnitz_wire::OpNode::IntegrateTrace),
         ]),
         vec![
-            (0, 2, PORT_IN),
-            (1, 5, PORT_IN), // ScanDelta(20) → IntegrateTrace, no reindex
-            (5, 3, PORT_TRACE),
-            (2, 3, PORT_IN_A),
-            (3, 4, PORT_IN),
+            (0, 2, SLOT_IN),
+            (1, 5, SLOT_IN), // ScanDelta(20) → IntegrateTrace, no reindex
+            (5, 3, SLOT_TRACE),
+            (2, 3, SLOT_IN),
+            (3, 4, SLOT_IN),
         ],
     );
     let meta = ViewMeta::derive(&loaded, &ExtTables::default()).unwrap();
@@ -206,13 +206,12 @@ fn a_source_with_no_reindex_map_takes_the_view_shard_route() {
 fn a_scan_whose_reindex_maps_are_all_auxiliary_is_rejected() {
     let aux = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
         keep: vec![0],
-        reindex_cols: vec![1],
-        reindex_target_tcs: vec![],
+        key: vec![(1, 0)],
         role: gnitz_wire::ReindexRole::Auxiliary,
     });
     let loaded = loaded_for_test(
         HashMap::from([(0, scan_delta(10)), (1, aux), (2, gnitz_wire::OpNode::IntegrateSink)]),
-        vec![(0, 1, PORT_IN), (1, 2, PORT_IN)],
+        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
     );
     assert!(
         matches!(
@@ -247,11 +246,11 @@ fn join_meta_in(kind: JoinKind, key_cols: &[u32], ext: ExtTables) -> ViewMeta {
         (5, OpNode::IntegrateSink),
     ]);
     let edges = vec![
-        (0, 1, PORT_IN),
-        (1, 3, PORT_IN_A),
-        (2, 3, PORT_TRACE),
-        (3, 4, PORT_IN),
-        (4, 5, PORT_IN),
+        (0, 1, SLOT_IN),
+        (1, 3, SLOT_IN),
+        (2, 3, SLOT_TRACE),
+        (3, 4, SLOT_IN),
+        (4, 5, SLOT_IN),
     ];
     ViewMeta::derive(&loaded_for_test(nodes, edges), &ext).expect("fixture routes")
 }
@@ -266,23 +265,15 @@ fn pure_range(n_eq: u8) -> JoinKind {
 /// The `GroupKey` scatter's columns, or `None` when the route is not one.
 fn group_key_cols(route: &RelayRoute) -> Option<Vec<u32>> {
     match route {
-        RelayRoute::Scatter {
-            cols,
-            mode: RouteMode::GroupKey,
-            ..
-        } => Some(cols.to_vec()),
+        RelayRoute::GroupKey(cols) => Some(cols.to_vec()),
         _ => None,
     }
 }
 
-/// The `JoinPromote` scatter's columns, or `None` when the route is not one.
+/// The `JoinKey` scatter's columns, or `None` when the route is not one.
 fn join_cols(route: &RelayRoute) -> Option<Vec<u32>> {
     match route {
-        RelayRoute::Scatter {
-            cols,
-            mode: RouteMode::JoinPromote,
-            ..
-        } => Some(cols.to_vec()),
+        RelayRoute::JoinKey(slots) => Some(slots.iter().map(|&(c, _)| c).collect()),
         _ => None,
     }
 }
@@ -392,7 +383,7 @@ fn repartitions_covers_the_output_shard_and_a_bare_join() {
     assert!(
         !repartitions_of(
             HashMap::from([(0, scan_delta(7)), (1, OpNode::IntegrateSink)]),
-            vec![(0, 1, PORT_IN)],
+            vec![(0, 1, SLOT_IN)],
         ),
         "a bare scan re-emits its source's PK region"
     );
@@ -403,7 +394,7 @@ fn repartitions_covers_the_output_shard_and_a_bare_join() {
                 (1, OpNode::ExchangeShard { shard_cols: vec![] }),
                 (2, OpNode::IntegrateSink),
             ]),
-            vec![(0, 1, PORT_IN), (1, 2, PORT_IN)],
+            vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
         ),
         "a global aggregate shards on the empty key — still a repartition"
     );
@@ -416,7 +407,7 @@ fn repartitions_covers_the_output_shard_and_a_bare_join() {
                 (3, OpNode::Join(JoinKind::DeltaTrace)),
                 (4, OpNode::IntegrateSink),
             ]),
-            vec![(0, 1, PORT_IN), (1, 3, PORT_IN_A), (2, 3, PORT_TRACE), (3, 4, PORT_IN)],
+            vec![(0, 1, SLOT_IN), (1, 3, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],
         ),
         "an equi-join carries no ExchangeShard and still repartitions"
     );

@@ -395,7 +395,7 @@ fn a_rename_stores_the_new_name_for_a_table_and_for_a_view() {
 
 /// A mixed-sign bundle keeps the ascending creation order: `ALTER VIEW … AS`
 /// retracts the incumbent and registers its replacement in one VIEW_TAB batch,
-/// which only applies if COL_TAB and the circuit families land first.
+/// which only applies if COL_TAB and the circuit rows land first.
 #[test]
 fn an_alter_view_bundle_still_applies_in_creation_order() {
     let srv = ServerHandle::start();
@@ -496,13 +496,13 @@ fn a_circuit_row_naming_a_view_the_bundle_does_not_create_is_refused() {
         &CircuitNodeRow {
             view_id: phantom,
             node_id: 0,
-            opcode: gnitz_wire::OPCODE_SCAN_DELTA,
+            opcode: gnitz_wire::Opcode::ScanDelta.as_wire(),
             source_table: Some(tid),
-            expr_program: None,
+            inputs: [None; 2],
+            params: None,
         },
         1,
-    )
-    .unwrap();
+    );
     let err = format!(
         "{:?}",
         s.push_ddl_txn(&[(gnitz_wire::CIRCUIT_NODES_TAB, b)]).unwrap_err()

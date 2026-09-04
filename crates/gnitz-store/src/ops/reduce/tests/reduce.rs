@@ -11,12 +11,13 @@ use crate::test_support::{
 use gnitz_wire::{encode_german_string, read_i64_le, read_u64_le};
 
 use super::super::group_key::GroupKeyCols;
-use super::agg::{Accumulator, AggDescriptor};
+use super::agg::Accumulator;
 use super::avi::AviBake;
 use super::emit::{emit_global_ground, emit_reduce_row};
 use super::plan::{build_reduce_output_schema, ReducePlan};
 use super::sort::{argsort_delta, compare_by_group_cols};
 use crate::schema::ColumnLocator;
+use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
 
 /// Resolve `cols` to the baked group-column locators — what `ReducePlan::new`
@@ -4821,7 +4822,7 @@ fn g_reduce(
     let in_schema = u64_pk_schema(SchemaColumn::new(type_code::I64, 1));
     let mut avi = aggs
         .iter()
-        .any(|d| d.agg_op.uses_value_index())
+        .any(|d| !d.agg_op.is_linear())
         .then(|| Avi::new(&in_schema, &[], aggs, history));
     let mut cursor = avi.as_mut().map(|a| a.cursor());
     op_reduce(

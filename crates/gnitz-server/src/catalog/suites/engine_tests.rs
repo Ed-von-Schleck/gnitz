@@ -663,11 +663,11 @@ fn test_dep_map_is_the_scan_delta_nodes() {
         &mut engine,
         7,
         &[
-            (gnitz_wire::OPCODE_SCAN_DELTA, Some(100), None),
-            (gnitz_wire::OPCODE_SCAN_DELTA, Some(200), None),
-            (gnitz_wire::OPCODE_SCAN_DELTA, Some(100), None),
-            (gnitz_wire::OPCODE_SCAN_DELTA, Some(0), None),
-            (gnitz_wire::OPCODE_INTEGRATE, Some(300), None),
+            (gnitz_wire::Opcode::ScanDelta, Some(100), None),
+            (gnitz_wire::Opcode::ScanDelta, Some(200), None),
+            (gnitz_wire::Opcode::ScanDelta, Some(100), None),
+            (gnitz_wire::Opcode::ScanDelta, Some(0), None),
+            (gnitz_wire::Opcode::Integrate, Some(300), None),
         ],
     );
 
@@ -780,7 +780,7 @@ fn test_circuit_table_surface_introspectable() {
 
     // Inject a row directly into CIRCUIT_NODES so the store is non-empty: view 7,
     // with a single node, through the shared row codec.
-    write_circuit_chain(&mut engine, 7, &[(11, None, None)]);
+    write_circuit_chain(&mut engine, 7, &[(gnitz_wire::Opcode::ScanDelta, Some(100), None)]);
 
     // The new schema is SQL-introspectable — `SELECT * FROM CircuitNodes`
     // must return what we just inserted (full-scan path, used by SQL planner).

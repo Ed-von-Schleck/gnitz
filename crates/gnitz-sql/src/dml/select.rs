@@ -38,7 +38,7 @@ use crate::validate::{
 };
 use crate::SqlResult;
 use gnitz_core::{CatalogSnapshot, GnitzClient, RelDescriptor, Schema, ZSetBatch};
-use gnitz_wire::{AggReadItem, AggReadSpec, ReadSink};
+use gnitz_wire::{AggDescriptor, AggReadSpec, ReadSink};
 use sqlparser::ast::{LimitClause, Query, Select, SetExpr, Statement};
 use std::sync::Arc;
 
@@ -483,17 +483,16 @@ fn plan_fold_read(query: &Query, route: &Route<'_>) -> Result<SpecRead, GnitzSql
     // `group_cols` / `src_col` index the reduce input — the pre-map's output when
     // the fold carries one, which is exactly what `shape` resolved them against.
     let sink = ReadSink::Fold(AggReadSpec {
-        group_cols: shape.group_positions.iter().map(|&c| c as u16).collect(),
+        group_cols: shape.group_positions.iter().map(|&c| c as u32).collect(),
         aggs: shape
             .agg_specs
             .iter()
-            .map(|s| AggReadItem {
-                op: s.op,
-                src_col: s.col as u16,
+            .map(|s| AggDescriptor {
+                agg_op: s.op,
+                col_idx: s.col as u32,
             })
             .collect(),
-        pre_map: shape.pre_map.clone(),
-        pre_payload: shape.pre_payload.clone(),
+        pre: shape.pre.clone(),
     });
     Ok(SpecRead {
         access,

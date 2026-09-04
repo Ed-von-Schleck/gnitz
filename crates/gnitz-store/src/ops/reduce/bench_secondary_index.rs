@@ -19,12 +19,12 @@
 
 use std::time::Duration;
 
-use super::agg::AggDescriptor;
 use super::avi::{avi_batch, op_populate_avi, AviBake};
 use super::plan::ReducePlan;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
 use crate::storage::{Batch, RamBudgets, RecoverySource, Table};
 use crate::test_support::{bench_time, bench_time_each};
+use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
 
 const N_ROWS: usize = 500_000;

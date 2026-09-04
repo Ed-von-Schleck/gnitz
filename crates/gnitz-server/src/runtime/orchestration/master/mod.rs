@@ -30,7 +30,7 @@ use crate::runtime::wire::{
     BACKFILL_DECISION_STOP, FLAG_SCAN_LAST,
 };
 use exchange::PendingRelay;
-use gnitz_store::ops::{op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode};
+use gnitz_store::ops::{op_relay_broadcast, op_relay_scatter_consolidated, op_repartition_batches, ScatterSpec};
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::storage::Batch;
 use gnitz_wire::control::peek_control_block_ipc;

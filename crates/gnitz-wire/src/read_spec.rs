@@ -12,8 +12,9 @@
 // ---------------------------------------------------------------------------
 
 use crate::catalog::MAX_COLUMNS;
-use crate::circuit::AggFunc;
+use crate::circuit::{AggDescriptor, AggFunc, ComputeMap};
 use crate::codec::{Reader, Writer};
+use crate::range::read_range_descriptor;
 use crate::range::RangeDescriptor;
 
 /// ORDER BY keys apply in sequence; a spec carries at most this many.
@@ -49,54 +50,31 @@ pub struct OrderKey {
     pub nulls_first: bool,
 }
 
-/// One physical aggregate item in a fold sink. This is the physical reduce
-/// layout the view planner's `push_agg_specs` produces — **not** the SELECT
-/// list: AVG contributes `[Sum, CountNonNull]`, a nullable SUM carries its
-/// `CountNonNull` companion, HAVING-only aggregates append items. `src_col` is
-/// a source-schema column index (`col 0` for COUNT(*), whose arm never reads
-/// the column).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AggReadItem {
-    pub op: AggFunc,
-    pub src_col: u16,
-}
-
-/// The fold sink's aggregate spec: a per-worker hash-fold over the scanned
-/// rows. `group_cols` and `aggs[].src_col` index the **reduce input** — the
-/// pre-map's output when one is present, else the source schema (empty
-/// `group_cols` = a global aggregate; `aggs = []` = `SELECT DISTINCT` over
-/// `group_cols`).
+/// The fold sink's aggregate spec: a per-worker hash-fold over the scanned rows.
+/// `group_cols` and `aggs[].col_idx` index the **reduce input** — `pre`'s output
+/// when one is present, else the source schema (empty `group_cols` = a global
+/// aggregate; `aggs = []` = `SELECT DISTINCT`). `aggs` is the physical reduce
+/// layout `push_agg_specs` produces, not the SELECT list: AVG contributes
+/// `[Sum, CountNonNull]`, and HAVING-only aggregates append items.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AggReadSpec {
-    pub group_cols: Vec<u16>,
-    pub aggs: Vec<AggReadItem>,
-    /// Compiled map program over the SOURCE schema, run between the predicate
-    /// and the fold so the reduce can group by, or aggregate, an expression
-    /// (`GROUP BY a + b`, `SUM(a * b)`). Empty = no pre-map, and the reduce
-    /// input is the source schema itself.
-    ///
-    /// The same device the view path emits at the same pipeline position — a
-    /// MAP between the WHERE filter and the reduce — so a grouped SELECT and
-    /// the equivalent grouped view compute the key and the argument alike.
-    pub pre_map: Vec<u8>,
-    /// The reduce input's payload columns as `(type_code, nullable)`, in output
-    /// order: the slots `pre_map` writes. The PK region is inherited verbatim
-    /// from the source, so the worker rebuilds the reduce-input schema as the
-    /// source's PK columns followed by these. Empty iff `pre_map` is.
-    pub pre_payload: Vec<(u8, bool)>,
+    pub group_cols: Vec<u32>,
+    pub aggs: Vec<AggDescriptor>,
+    /// The map between the predicate and the fold, so the reduce can group by or
+    /// aggregate an expression (`GROUP BY a + b`). Compiled over the SOURCE
+    /// schema; the worker rebuilds the reduce input as the source's PK columns
+    /// followed by the map's declared slots. `None` = the source *is* the input.
+    pub pre: Option<ComputeMap>,
 }
 
 impl AggReadSpec {
     /// A fold that reads source columns directly — the shape every grouped
-    /// SELECT has until it groups by, or aggregates, an expression. Pairs the
-    /// two pre-map halves as empty, which is the only combination the decoder
-    /// accepts for "no pre-map".
-    pub fn direct(group_cols: Vec<u16>, aggs: Vec<AggReadItem>) -> Self {
+    /// SELECT has until it groups by, or aggregates, an expression.
+    pub fn direct(group_cols: Vec<u32>, aggs: Vec<AggDescriptor>) -> Self {
         AggReadSpec {
             group_cols,
             aggs,
-            pre_map: Vec::new(),
-            pre_payload: Vec::new(),
+            pre: None,
         }
     }
 }
@@ -293,17 +271,6 @@ pub fn peek_delta_bound(spec: SpecBytes<'_>) -> Option<u64> {
     peek_bound(spec, BOUND_DELTA)?.u64().ok()
 }
 
-/// Read an embedded `RangeDescriptor`: peek its `n_eq` to learn its span, slice
-/// exactly that many bytes, and defer full validation to `RangeDescriptor::decode`.
-/// (`n_eq` is one byte, so `encoded_len` cannot overflow; a pathological value
-/// exceeds `remaining` and `take` rejects it, and a valid one is re-validated —
-/// arity, flags, exact length — by the descriptor decoder.)
-fn read_range_descriptor(r: &mut Reader) -> Result<RangeDescriptor, String> {
-    let n_eq = r.peek_u8()? as usize;
-    let bytes = r.take(RangeDescriptor::encoded_len(n_eq))?;
-    RangeDescriptor::decode(bytes)
-}
-
 impl ReadSpec {
     /// Serialise to a version-prefixed LE byte sequence (§ layout below), from
     /// borrowed parts: the planner holds the bound, predicate and sink
@@ -326,7 +293,9 @@ impl ReadSpec {
             + match sink {
                 ReadSink::Rows { projection, order, .. } => projection.len() + 4 * order.len(),
                 ReadSink::Fold(agg) => {
-                    2 * agg.group_cols.len() + 3 * agg.aggs.len() + agg.pre_map.len() + 2 * agg.pre_payload.len()
+                    4 * agg.group_cols.len()
+                        + 5 * agg.aggs.len()
+                        + agg.pre.as_ref().map_or(0, |p| p.program.len() + 2 * p.out_cols.len())
                 }
             };
         let mut w = Writer::with_capacity(cap);
@@ -372,19 +341,28 @@ impl ReadSpec {
                 w.bytes32(projection);
             }
             ReadSink::Fold(agg) => {
+                // Engine-produced state: the SQL layer already width-checks a
+                // legitimate fold's reply schema against `MAX_COLUMNS`, so a count
+                // or index past a `u16` marks a planner bug, not a client one.
+                debug_assert!(agg.group_cols.iter().all(|&c| c <= u16::MAX as u32));
+                debug_assert!(agg.aggs.iter().all(|d| d.col_idx <= u16::MAX as u32));
                 w.u16(agg.group_cols.len() as u16);
                 for &c in &agg.group_cols {
-                    w.u16(c);
+                    w.u16(c as u16);
                 }
                 w.u8(agg.aggs.len() as u8);
-                for item in &agg.aggs {
-                    w.u8(item.op as u8).u16(item.src_col);
+                for d in &agg.aggs {
+                    w.u8(d.agg_op as u8).u16(d.col_idx as u16);
                 }
-                w.u16(agg.pre_payload.len() as u16);
-                for &(tc, nullable) in &agg.pre_payload {
+                let (program, out_cols) = match &agg.pre {
+                    Some(p) => (p.program.as_slice(), p.out_cols.as_slice()),
+                    None => (&[][..], &[][..]),
+                };
+                w.u16(out_cols.len() as u16);
+                for &(tc, nullable) in out_cols {
                     w.u8(tc).u8(nullable as u8);
                 }
-                w.bytes32(&agg.pre_map);
+                w.bytes32(program);
             }
         }
         w.into_vec()
@@ -488,7 +466,7 @@ impl ReadSpec {
                 }
                 let mut group_cols = Vec::with_capacity(n_group_cols);
                 for _ in 0..n_group_cols {
-                    group_cols.push(r.u16()?);
+                    group_cols.push(r.u16()? as u32);
                 }
                 let n_aggs = r.u8()? as usize;
                 if n_aggs > MAX_COLUMNS {
@@ -497,16 +475,18 @@ impl ReadSpec {
                 let mut aggs = Vec::with_capacity(n_aggs);
                 for _ in 0..n_aggs {
                     let op_byte = r.u8()?;
-                    let op = AggFunc::from_wire(op_byte as u64)
+                    let agg_op = AggFunc::from_wire(op_byte as u64)
                         .ok_or_else(|| format!("read_spec: unknown aggregate op {op_byte}"))?;
-                    let src_col = r.u16()?;
-                    aggs.push(AggReadItem { op, src_col });
+                    aggs.push(AggDescriptor {
+                        agg_op,
+                        col_idx: r.u16()? as u32,
+                    });
                 }
                 let n_pre = r.u16()? as usize;
                 if n_pre > MAX_COLUMNS {
                     return Err(format!("read_spec: {n_pre} pre-map columns exceeds cap {MAX_COLUMNS}"));
                 }
-                let mut pre_payload = Vec::with_capacity(n_pre);
+                let mut out_cols = Vec::with_capacity(n_pre);
                 for _ in 0..n_pre {
                     let tc = r.u8()?;
                     if !crate::is_valid_type_code(tc) {
@@ -516,21 +496,17 @@ impl ReadSpec {
                     if nullable > 1 {
                         return Err(format!("read_spec: pre-map column nullable flag is {nullable}"));
                     }
-                    pre_payload.push((tc, nullable == 1));
+                    out_cols.push((tc, nullable == 1));
                 }
-                let pre_map = r.bytes32()?.to_vec();
+                let program = r.bytes32()?.to_vec();
                 // The two halves describe one reduce input: a program with no
                 // declared output slots cannot be resolved against a schema, and
                 // declared slots with no program would leave every one unwritten.
-                if pre_map.is_empty() != pre_payload.is_empty() {
+                if program.is_empty() != out_cols.is_empty() {
                     return Err("read_spec: fold pre-map program and column declarations disagree".to_string());
                 }
-                ReadSink::Fold(AggReadSpec {
-                    group_cols,
-                    aggs,
-                    pre_map,
-                    pre_payload,
-                })
+                let pre = (!program.is_empty()).then_some(ComputeMap { program, out_cols });
+                ReadSink::Fold(AggReadSpec { group_cols, aggs, pre })
             }
             other => return Err(format!("read_spec: unknown sink tag {other}")),
         };

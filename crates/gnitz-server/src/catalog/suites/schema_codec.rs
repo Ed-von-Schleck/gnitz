@@ -157,9 +157,7 @@ fn ddl_txn_roundtrip_client_to_server() {
     use gnitz_core::protocol::types::{BatchAppender, ZSetBatch};
     use gnitz_core::types::sys_schema;
     use gnitz_wire::txn_frame::decode_ddl_txn;
-    use gnitz_wire::{
-        COL_TAB, IDX_TAB, TABLE_TAB, VIEW_TAB, {CIRCUIT_EDGES_TAB, CIRCUIT_NODES_TAB, CIRCUIT_NODE_COLUMNS_TAB},
-    };
+    use gnitz_wire::{CIRCUIT_NODES_TAB, COL_TAB, IDX_TAB, TABLE_TAB, VIEW_TAB};
 
     // Build a small COL_TAB batch for `oid` with `n` U64 columns.
     let col_batch = |oid: u64, kind: u64, n: usize| -> ZSetBatch {
@@ -208,7 +206,7 @@ fn ddl_txn_roundtrip_client_to_server() {
 
     // Verify a bundle roundtrips: family count, order (tid), per-row weight,
     // and — for single-PK families — the PK. `check_pk` skips the compound-PK
-    // circuit families whose engine `get_pk` returns the packed narrow key
+    // circuit family whose engine `get_pk` returns the packed narrow key
     // rather than the client's low/high u128 layout.
     let verify = |families: &[(u64, ZSetBatch)], check_pk: &[bool]| {
         let payload = gnitz_core::protocol::encode_ddl_txn(0xABCD, families);
@@ -257,49 +255,29 @@ fn ddl_txn_roundtrip_client_to_server() {
     // families are built with the client's exact low/high u128 packing.
     let vid: u64 = 20;
     let src: u64 = 16;
-    // Compound-PK families: `pk = view_id (low) | sub (high)`, matching the
-    // client's low/high packing. `check_pk` is false for these, so the exact
-    // sub values are arbitrary — pick non-trivial ones (clippy `identity_op`).
+    // Compound-PK family: `pk = view_id (low) | node_id (high)`, matching the
+    // client's low/high packing. `check_pk` is false for it, so the exact node
+    // ids are arbitrary — pick non-trivial ones (clippy `identity_op`).
     let nodes = {
         let s = sys_schema(CIRCUIT_NODES_TAB);
         let mut b = ZSetBatch::new(s);
         {
             let mut a = BatchAppender::new(&mut b, s);
+            // ScanDelta(src), unwired and parameterless.
             a.add_row((vid as u128) | (1u128 << 64), 1)
-                .u64_val(1)
-                .u64_val(0)
+                .u64_val(gnitz_wire::Opcode::ScanDelta.as_wire())
                 .u64_val(src)
+                .null()
+                .null()
                 .null();
+            // Integrate, fed by node 1.
             a.add_row((vid as u128) | (2u128 << 64), 1)
-                .u64_val(2)
+                .u64_val(gnitz_wire::Opcode::Integrate.as_wire())
+                .null()
                 .u64_val(1)
                 .null()
                 .null();
         }
-        b
-    };
-    let edges = {
-        let s = sys_schema(CIRCUIT_EDGES_TAB);
-        let mut b = ZSetBatch::new(s);
-        let sub = (2u128 << 8) | 1u128; // (dst_node, dst_port)
-        BatchAppender::new(&mut b, s)
-            .add_row((vid as u128) | (sub << 64), 1)
-            .u64_val(2)
-            .u64_val(1)
-            .u64_val(1);
-        b
-    };
-    let node_cols = {
-        let s = sys_schema(CIRCUIT_NODE_COLUMNS_TAB);
-        let mut b = ZSetBatch::new(s);
-        let sub = (1u128 << 24) | (2u128 << 16) | 3u128; // (node_id, kind, position)
-        BatchAppender::new(&mut b, s)
-            .add_row((vid as u128) | (sub << 64), 1)
-            .u64_val(1)
-            .u64_val(2)
-            .u64_val(3)
-            .u64_val(4)
-            .u64_val(5);
         b
     };
     let view = {
@@ -319,11 +297,9 @@ fn ddl_txn_roundtrip_client_to_server() {
         &[
             (COL_TAB, col_batch(vid, 1, 1)),
             (CIRCUIT_NODES_TAB, nodes),
-            (CIRCUIT_EDGES_TAB, edges),
-            (CIRCUIT_NODE_COLUMNS_TAB, node_cols),
             (VIEW_TAB, view),
         ],
-        // Skip pk check on the compound-PK circuit families.
-        &[true, false, false, false, true],
+        // Skip pk check on the compound-PK circuit family.
+        &[true, false, true],
     );
 }

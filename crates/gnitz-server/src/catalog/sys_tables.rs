@@ -68,8 +68,6 @@ pub(super) const IDX_TAB_ID: i64 = gnitz_wire::IDX_TAB as i64;
 pub(crate) const SEQ_TAB_ID: i64 = gnitz_wire::SEQ_TAB as i64;
 #[cfg(test)]
 pub(super) const CIRCUIT_NODES_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODES_TAB as i64;
-#[cfg(test)]
-pub(super) const CIRCUIT_NODE_COLUMNS_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB as i64;
 
 // PK list encoding lives in gnitz-wire so the client and engine cannot drift
 // on the on-disk format. Production code spells the packers `gnitz_wire::…` (or
@@ -438,9 +436,9 @@ pub(super) fn pack_column_id(owner_id: i64, col_idx: i64) -> u64 {
     gnitz_wire::pack_col_id(owner_id as u64, col_idx as u64).expect("catalog col-id packing out of range")
 }
 
-/// The `(view_id, sub)` halves of a circuit family's compound PK as
+/// The `(view_id, node_id)` halves of a circuit row's compound PK as
 /// `Batch::get_pk` reads it back out of the PK region: `view_id` in the high
-/// u128 half, `sub` in the low one.
+/// u128 half, `node_id` in the low one.
 pub(super) fn unpack_circuit_pk(pk: u128) -> (i64, u64) {
     ((pk >> 64) as i64, pk as u64)
 }
@@ -472,8 +470,6 @@ const TOPO_PRIORITY: [u8; SysFamily::COUNT] = [
     7,  // Index
     99, // Sequence
     2,  // CircuitNodes
-    3,  // CircuitEdges
-    4,  // CircuitNodeColumns
 ];
 
 /// A catalog system-table family (every id below `FIRST_USER_TABLE_ID`). Used
@@ -493,8 +489,6 @@ pub(crate) enum SysFamily {
     Index = gnitz_wire::IDX_TAB as isize,
     Sequence = gnitz_wire::SEQ_TAB as isize,
     CircuitNodes = gnitz_wire::CIRCUIT_NODES_TAB as isize,
-    CircuitEdges = gnitz_wire::CIRCUIT_EDGES_TAB as isize,
-    CircuitNodeColumns = gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB as isize,
 }
 
 impl SysFamily {
@@ -510,8 +504,6 @@ impl SysFamily {
         SysFamily::Index,
         SysFamily::Sequence,
         SysFamily::CircuitNodes,
-        SysFamily::CircuitEdges,
-        SysFamily::CircuitNodeColumns,
     ];
 
     /// This family's position in `gnitz_wire::SYS_FAMILIES` — the index every
@@ -569,7 +561,7 @@ impl SysFamily {
             SysFamily::Column => Some(pack_column_id(FIRST_USER_TABLE_ID, 0) as i64),
             SysFamily::Index => Some(FIRST_USER_INDEX_ID),
             SysFamily::Sequence => Some(FIRST_USER_TABLE_ID),
-            SysFamily::CircuitNodes | SysFamily::CircuitEdges | SysFamily::CircuitNodeColumns => None,
+            SysFamily::CircuitNodes => None,
         }
     }
 
@@ -581,12 +573,7 @@ impl SysFamily {
     pub(super) fn id_ceiling(self) -> Option<i64> {
         match self {
             SysFamily::Table | SysFamily::View | SysFamily::Index => Some(RELATION_ID_CEILING),
-            SysFamily::Schema
-            | SysFamily::Column
-            | SysFamily::Sequence
-            | SysFamily::CircuitNodes
-            | SysFamily::CircuitEdges
-            | SysFamily::CircuitNodeColumns => None,
+            SysFamily::Schema | SysFamily::Column | SysFamily::Sequence | SysFamily::CircuitNodes => None,
         }
     }
 
@@ -602,11 +589,7 @@ impl SysFamily {
                 Some((1 << COLTAB_PAY_NAME) | (1 << COLTAB_PAY_IS_HIDDEN) | (1 << COLTAB_PAY_IS_NULLABLE))
             }
             SysFamily::Sequence => Some(1 << gnitz_wire::SEQTAB_PAY_VALUE),
-            SysFamily::Schema
-            | SysFamily::Index
-            | SysFamily::CircuitNodes
-            | SysFamily::CircuitEdges
-            | SysFamily::CircuitNodeColumns => None,
+            SysFamily::Schema | SysFamily::Index | SysFamily::CircuitNodes => None,
         }
     }
 
@@ -622,20 +605,15 @@ impl SysFamily {
             | SysFamily::View
             | SysFamily::Column
             | SysFamily::Index
-            | SysFamily::CircuitNodes
-            | SysFamily::CircuitEdges
-            | SysFamily::CircuitNodeColumns => true,
+            | SysFamily::CircuitNodes => true,
         }
     }
 
     /// Is this family's PK the identity of at most one live row — the premise
-    /// the retraction CAS and the per-PK net bound rest on? False for the
-    /// circuit families, whose `(view_id, sub)` addresses a node of a circuit.
+    /// the retraction CAS and the per-PK net bound rest on? False for the circuit
+    /// family, whose `(view_id, node_id)` addresses a node of a circuit.
     pub(super) fn pk_is_live_row_identity(self) -> bool {
-        !matches!(
-            self,
-            SysFamily::CircuitNodes | SysFamily::CircuitEdges | SysFamily::CircuitNodeColumns
-        )
+        !matches!(self, SysFamily::CircuitNodes)
     }
 
     /// What one of this family's rows is called in a guard message.
@@ -647,7 +625,7 @@ impl SysFamily {
             SysFamily::Column => "column",
             SysFamily::Index => "index",
             SysFamily::Sequence => "sequence",
-            SysFamily::CircuitNodes | SysFamily::CircuitEdges | SysFamily::CircuitNodeColumns => "circuit row",
+            SysFamily::CircuitNodes => "circuit row",
         }
     }
 

@@ -13,9 +13,9 @@ use std::fmt;
 use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
 use gnitz_expr::{ExprValidateErr, LogicalProgram};
 use gnitz_store::expr::MapPlan;
-use gnitz_store::ops::AggDescriptor;
 use gnitz_store::schema::{project_schema, SchemaDescriptor};
 use gnitz_store::storage::{RamBudgets, ReadCursor, RecoverySource, Slot, StorageError, Table};
+use gnitz_wire::AggDescriptor;
 
 mod emit;
 mod hydration;
@@ -35,16 +35,24 @@ use load::scan_tid_through_filters;
 pub(crate) use routing::RelayRoute;
 pub(super) use routing::ViewMeta;
 
-// Port numbers reach the compiler only in hand-written fixture edge lists; every
-// production read of an operand goes through [`NodeInputs`].
+// Input slots reach the compiler only in hand-written fixtures; every production
+// read of an operand goes through [`NodeInputs`]. Slot 0 is a unary operator's
+// input and a binary one's delta/left operand, slot 1 the trace/right operand.
 #[cfg(test)]
-pub(super) const PORT_IN: i32 = gnitz_wire::PORT_IN as i32;
+pub(super) const SLOT_IN: usize = 0;
 #[cfg(test)]
-pub(super) const PORT_IN_A: i32 = gnitz_wire::PORT_IN_A as i32;
+pub(super) const SLOT_TRACE: usize = 1;
+
+/// Fixture wiring: `(producer, consumer, slot)` triples into the per-node input
+/// slots `load_circuit` reads out of a node row's `input_0`/`input_1` columns.
 #[cfg(test)]
-pub(super) const PORT_IN_B: i32 = gnitz_wire::PORT_IN_B as i32;
-#[cfg(test)]
-pub(super) const PORT_TRACE: i32 = gnitz_wire::PORT_TRACE as i32;
+pub(super) fn wire_slots(edges: &[(i32, i32, usize)]) -> HashMap<i32, [Option<i32>; 2]> {
+    let mut by_node: HashMap<i32, [Option<i32>; 2]> = HashMap::new();
+    for &(src, dst, slot) in edges {
+        by_node.entry(dst).or_default()[slot] = Some(src);
+    }
+    by_node
+}
 
 /// Why `compile_view` failed to turn a stored view circuit into a runnable plan.
 /// Rendered by `Display` into the `CREATE VIEW` error the client receives, so
@@ -88,7 +96,7 @@ impl fmt::Display for CompileError {
 pub(super) struct LoadedCircuit {
     nodes: HashMap<i32, gnitz_wire::OpNode>,
     ordered: Vec<i32>,
-    outgoing: HashMap<i32, Vec<(i32, i32)>>,
+    outgoing: HashMap<i32, Vec<i32>>,
     inputs: HashMap<i32, NodeInputs>,
     /// `Distinct` nodes the elision pass dropped. Derived by the constructor, so
     /// it cannot disagree with the circuit and a plan built over a slice of the
@@ -144,16 +152,16 @@ impl LoadedCircuit {
     }
 }
 
-/// A node's inputs in the shape its operator's port set allows. `topo_sorted`
-/// settles the arity against `OpNode::ports()` before building one, so a reader
-/// destructures instead of re-checking — and a `Filter` wired only on
-/// `PORT_TRACE` is unrepresentable rather than merely rejected downstream.
+/// A node's inputs in the shape its operator's arity allows. `topo_sorted`
+/// settles the arity against `OpNode::arity()` before building one, so a reader
+/// destructures instead of re-checking — and a `Filter` wired only on its trace
+/// slot is unrepresentable rather than merely rejected downstream.
 pub(super) enum NodeInputs {
-    /// A `ScanDelta`: fed by the source drive, not by an edge.
+    /// A `ScanDelta`: fed by the source drive, not by a producer.
     Source,
     Unary(i32),
-    /// `a` is `PORT_IN_A` — a join's delta side, a union's left operand; `b` is
-    /// `PORT_TRACE` / `PORT_IN_B`.
+    /// `a` is slot 0 — a join's delta side, a union's left operand; `b` is slot
+    /// 1, the trace / right operand.
     Binary {
         a: i32,
         b: i32,
@@ -165,7 +173,7 @@ impl NodeInputs {
     fn unary(&self) -> i32 {
         match self {
             NodeInputs::Unary(src) => *src,
-            _ => unreachable!("a unary operator's port set is [PORT_IN]"),
+            _ => unreachable!("a unary operator fills exactly its one input slot"),
         }
     }
 
@@ -192,8 +200,8 @@ impl NodeInputs {
 /// Build a `LoadedCircuit` from raw nodes/edges. Test-only: the struct's fields
 /// are module-private, so a test outside this module cannot construct one.
 #[cfg(test)]
-pub(super) fn loaded_for_test(nodes: HashMap<i32, gnitz_wire::OpNode>, edges: Vec<(i32, i32, i32)>) -> LoadedCircuit {
-    load::topo_sorted(nodes, edges).expect("test circuit must be a well-formed DAG")
+pub(super) fn loaded_for_test(nodes: HashMap<i32, gnitz_wire::OpNode>, edges: Vec<(i32, i32, usize)>) -> LoadedCircuit {
+    load::topo_sorted(nodes, wire_slots(&edges)).expect("test circuit must be a well-formed DAG")
 }
 
 /// An unbounded delta scan — every fixture circuit's source shape.
@@ -209,8 +217,7 @@ pub(super) fn scan_delta(source: u64) -> gnitz_wire::OpNode {
 pub(super) fn scatter_reindex(cols: &[u32]) -> gnitz_wire::OpNode {
     gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
         keep: vec![0],
-        reindex_cols: cols.to_vec(),
-        reindex_target_tcs: vec![],
+        key: cols.iter().map(|&c| (c, 0)).collect(),
         role: gnitz_wire::ReindexRole::ScatterKey,
     })
 }
@@ -228,7 +235,7 @@ pub(super) fn dummy_expr_blob() -> Vec<u8> {
 }
 
 /// What a compile may read out of the host: the registered relations' schemas,
-/// and the circuit system tables the circuit itself is stored in. A lookup
+/// and the circuit system table the circuit itself is stored in. A lookup
 /// rather than an owned map, which would copy every relation's schema per
 /// compile to answer under ten calls.
 pub(super) trait SchemaSource {
@@ -241,7 +248,7 @@ pub(super) trait SchemaSource {
 }
 
 /// A standalone relation set — what the compiler's own tests build. It holds no
-/// circuit tables, so every load against one is refused.
+/// circuit table, so every load against one is refused.
 pub(super) type ExtTables = HashMap<i64, SchemaDescriptor>;
 
 impl SchemaSource for ExtTables {

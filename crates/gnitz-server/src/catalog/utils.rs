@@ -65,7 +65,7 @@ pub(in crate::catalog) fn index_dir(owner_dir: &str, idx_id: i64) -> String {
 /// Emit a weight=−1 batch of every live row of `table` in the OPK key range
 /// `[start, end)` (`end` `None` = unbounded above). The band-bounded half of the
 /// catalog's retraction pair — one owner's packed column ids, or one view's
-/// `(view_id, sub)` prefix; [`retract_pk_list`] is the key-list half. Both take
+/// `view_id` prefix; [`retract_pk_list`] is the key-list half. Both take
 /// their bounds through `schema::key`, so no call site re-derives the OPK layout.
 pub(in crate::catalog) fn retract_key_range(
     table: &Table,
@@ -89,13 +89,13 @@ pub(in crate::catalog) fn sys_opk(schema: &SchemaDescriptor, pk: u128) -> gnitz_
     gnitz_store::schema::key::opk_key_cols(schema, &[pk])
 }
 
-/// The OPK image of a circuit family's compound PK `(view_id, sub)`.
+/// The OPK image of a circuit row's compound PK `(view_id, node_id)`.
 pub(in crate::catalog) fn circuit_opk(
     schema: &SchemaDescriptor,
     view_id: i64,
-    sub: u64,
+    node_id: u64,
 ) -> gnitz_store::schema::key::PkBuf {
-    gnitz_store::schema::key::opk_key_cols(schema, &[view_id as u64 as u128, sub as u128])
+    gnitz_store::schema::key::opk_key_cols(schema, &[view_id as u64 as u128, node_id as u128])
 }
 
 /// Emit a weight=−1 batch of the live rows of `table` at `ids`; an id with no

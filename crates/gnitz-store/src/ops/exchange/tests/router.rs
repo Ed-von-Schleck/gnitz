@@ -44,7 +44,7 @@ fn test_worker_filter_empty_in_empty_out() {
 /// The `ScatterKey` collapse replaced the single-column `route_partition_key`
 /// (routable-int → `route_key`, string → `german_string_promote_key`) and the
 /// `compound_join_packer` path with one packed-`ReindexPacker` route.
-/// For every reachable JoinPromote key shape, the packed owner must equal
+/// For every reachable `JoinKey` shape, the packed owner must equal
 /// what the pre-collapse routing produced — so no row moves workers. The
 /// NULL arms are null-blind by design (they read the canonically-zeroed key
 /// slot), exactly as the deleted `route_partition_key` was.
@@ -52,10 +52,14 @@ fn test_worker_filter_empty_in_empty_out() {
 fn test_scatter_key_packed_matches_legacy_routing() {
     use crate::storage::MemBatch;
 
-    // Run the JoinPromote `ScatterKey` over `row` and return its worker.
+    // Run the `JoinKey` `ScatterKey` over `row` and return its worker.
     const NW: usize = 4;
     fn packed(schema: &SchemaDescriptor, cols: &[u32], tcs: &[u8], mb: &MemBatch, row: usize) -> usize {
-        let mut sk = ScatterKey::new(RouteMode::JoinPromote, cols, tcs, schema, NW);
+        let key: Vec<(u32, u8)> = cols
+            .iter()
+            .map(|&c| (c, tcs.iter().copied().next().unwrap_or(0)))
+            .collect();
+        let mut sk = ScatterKey::new(ScatterSpec::JoinKey(&key), schema, NW);
         assert!(!sk.is_pk_routed(), "test key shapes must take the packed route");
         sk.worker(mb, row)
     }
@@ -141,7 +145,7 @@ fn test_scatter_key_packed_matches_legacy_routing() {
         assert_eq!(packed(&schema, &[1], &[], &mb, 0), legacy, "U128 payload");
     }
 
-    // (6) single sub-column of a compound PK — the one legacy JoinPromote
+    // (6) single sub-column of a compound PK — the one legacy join-key
     // shape that fell through `route_partition_key`'s non-PK guard to the
     // group fold `GroupKeyCols::key_row` (its Pk arm is `pk_route_key`).
     {

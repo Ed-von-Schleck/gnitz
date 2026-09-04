@@ -21,12 +21,13 @@
 use super::super::{chain::schema_of, physical, slot_of};
 use super::super::{is_pre_map, ColId, RelExpr};
 use super::{reduce_out_layout, resolve_reduce_specs, ReduceSpecs};
-use crate::agg::{fold_partial_schema, group_col_reduce_pos, AggSpec};
-use crate::codec::project_schema::{compile_projection_map, declared_out_cols, DeclaredCols, ProjItem};
+use crate::agg::{fold_partial_schema, AggSpec, ReduceLayout};
+use crate::codec::project_schema::{compile_projection_map, declared_out_cols, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use crate::validate::reject_float_keys;
-use gnitz_core::{ColumnDef, ReduceOutKey, Schema};
+use gnitz_core::{ColumnDef, Schema};
+use gnitz_wire::ComputeMap;
 use std::sync::Arc;
 
 /// Everything an ad-hoc grouped read needs, in layout terms: what the workers
@@ -46,12 +47,9 @@ pub(crate) struct FoldPieces {
     /// (`[_group_pk | group cols | agg partials]`) the workers emit and every
     /// `BoundExpr` below is written against.
     pub(crate) partial_schema: Schema,
-    /// The fold sink's pre-map program over the source schema, empty when the
-    /// reduce groups and aggregates source columns directly.
-    pub(crate) pre_map: Vec<u8>,
-    /// The reduce input's payload columns, parallel to `pre_map` (both empty or
-    /// both not) — what the worker rebuilds the reduce-input schema from.
-    pub(crate) pre_payload: DeclaredCols,
+    /// The fold sink's pre-map over the source schema, `None` when the reduce
+    /// groups and aggregates source columns directly.
+    pub(crate) pre: Option<ComputeMap>,
     /// HAVING over the raw reduce output, `None` when the body has none or the
     /// binder folded it to a true constant.
     pub(crate) having: Vec<BoundExpr>,
@@ -84,24 +82,15 @@ fn reduce_input_of<'a>(
 fn pre_map_blob(
     pre: &Option<physical::PhysProjection>,
     source_schema: &Schema,
-) -> Result<(Vec<u8>, DeclaredCols), GnitzSqlError> {
-    match pre {
-        Some(p) => Ok((
-            compile_projection_map(&p.items[p.pk_arity..], source_schema)?.to_blob_bytes(),
-            declared_out_cols(&p.out_cols[p.pk_arity..]),
-        )),
-        None => Ok((Vec::new(), Vec::new())),
-    }
-}
-
-/// Each group column's slot in the partial layout, through the same key-region
-/// rule the circuit lowering uses — the fold's out-key is always SyntheticFold,
-/// so this is the `_group_pk` at slot 0 and the group columns after it.
-fn group_col_slots(group_positions: &[usize], reduce_schema: &Schema) -> Vec<usize> {
-    group_positions
-        .iter()
-        .map(|&p| group_col_reduce_pos(p, ReduceOutKey::SyntheticFold, reduce_schema, group_positions))
-        .collect()
+) -> Result<Option<ComputeMap>, GnitzSqlError> {
+    pre.as_ref()
+        .map(|p| {
+            Ok(ComputeMap {
+                program: compile_projection_map(&p.items[p.pk_arity..], source_schema)?.to_blob_bytes(),
+                out_cols: declared_out_cols(&p.out_cols[p.pk_arity..]),
+            })
+        })
+        .transpose()
 }
 
 /// Lower a bound ad-hoc grouped body to its fold pieces.
@@ -159,15 +148,19 @@ pub(crate) fn lower_fold(rel: &RelExpr, source_schema: &Arc<Schema>) -> Result<F
     } = resolve_reduce_specs(group_cols, aggs, reduce_layout, &reduce_schema)?;
 
     // The partial reply layout, which every expression below resolves against.
-    let partial_schema = fold_partial_schema(&reduce_schema, &group_positions, &agg_specs)?;
+    let ReduceLayout {
+        schema: partial_schema,
+        group_slots,
+        agg_col_offset,
+    } = fold_partial_schema(&reduce_schema, &group_positions, &agg_specs)?;
 
     let out_layout = reduce_out_layout(
         partial_schema.columns.len(),
         group_cols,
-        &group_col_slots(&group_positions, &reduce_schema),
+        &group_slots,
         aggs,
         &agg_starts,
-        1 + group_positions.len(),
+        agg_col_offset,
     );
 
     let having = having_preds
@@ -179,15 +172,14 @@ pub(crate) fn lower_fold(rel: &RelExpr, source_schema: &Arc<Schema>) -> Result<F
         .map(|e| Ok((physical::resolve_refs(&e.expr, &out_layout)?, e.out.def.clone())))
         .collect::<Result<Vec<_>, GnitzSqlError>>()?;
 
-    let (pre_map, pre_payload) = pre_map_blob(&pre, source_schema)?;
+    let pre_map = pre_map_blob(&pre, source_schema)?;
 
     Ok(FoldPieces {
         reduce_schema,
         group_positions,
         agg_specs,
         partial_schema,
-        pre_map,
-        pre_payload,
+        pre: pre_map,
         having,
         finalize,
     })
@@ -234,23 +226,26 @@ fn lower_distinct_fold(input: &RelExpr, source_schema: &Arc<Schema>) -> Result<F
         "SELECT DISTINCT over a computed column",
     )?;
 
-    let partial_schema = fold_partial_schema(&reduce_schema, &group_positions, &[])?;
+    let ReduceLayout {
+        schema: partial_schema,
+        group_slots,
+        ..
+    } = fold_partial_schema(&reduce_schema, &group_positions, &[])?;
     // Every item is a pass-through of its own group slot: the reduce already
     // evaluated a computed one into that slot.
-    let finalize = group_col_slots(&group_positions, &reduce_schema)
+    let finalize = group_slots
         .into_iter()
         .zip(items)
         .map(|(slot, e)| (BoundExpr::ColRef(slot), e.out.def.clone()))
         .collect();
-    let (pre_map, pre_payload) = pre_map_blob(&pre, source_schema)?;
+    let pre_map = pre_map_blob(&pre, source_schema)?;
 
     Ok(FoldPieces {
         reduce_schema,
         group_positions,
         agg_specs: Vec::new(),
         partial_schema,
-        pre_map,
-        pre_payload,
+        pre: pre_map,
         having: Vec::new(),
         finalize,
     })

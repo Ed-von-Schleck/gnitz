@@ -46,7 +46,7 @@ pub const WAL_HEADER_SIZE: usize = 32;
 /// block-layout change or a system-family column-shape change: a SAL frame
 /// carries its own schema block and replay decodes against that, so nothing but
 /// this word rejects a stale frame — or an old client's catalog writes.
-pub const WAL_FORMAT_VERSION: u32 = 11;
+pub const WAL_FORMAT_VERSION: u32 = 12;
 
 pub const WAL_OFF_TID: usize = 0;
 pub const WAL_OFF_COUNT: usize = 4;

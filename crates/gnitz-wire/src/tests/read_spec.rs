@@ -70,47 +70,43 @@ fn roundtrips_every_bound_against_every_sink() {
             limit_k: 100,
         },
         // Every aggregate the enum names, at a distinct source column.
-        ReadSink::Fold(AggReadSpec {
-            group_cols: vec![0, 3],
-            aggs: AggFunc::ALL
+        ReadSink::Fold(AggReadSpec::direct(
+            vec![0, 3],
+            AggFunc::ALL
                 .iter()
                 .enumerate()
-                .map(|(i, &op)| AggReadItem { op, src_col: i as u16 })
+                .map(|(i, &agg_op)| AggDescriptor {
+                    agg_op,
+                    col_idx: i as u32,
+                })
                 .collect(),
-            pre_map: vec![],
-            pre_payload: vec![],
-        }),
+        )),
         // DISTINCT: group cols, no aggs.
-        ReadSink::Fold(AggReadSpec {
-            group_cols: vec![1, 2, 5],
-            aggs: vec![],
-            pre_map: vec![],
-            pre_payload: vec![],
-        }),
+        ReadSink::Fold(AggReadSpec::direct(vec![1, 2, 5], vec![])),
         // A global aggregate: no group cols.
-        ReadSink::Fold(AggReadSpec {
-            group_cols: vec![],
-            aggs: vec![AggReadItem {
-                op: AggFunc::Min,
-                src_col: 4,
+        ReadSink::Fold(AggReadSpec::direct(
+            vec![],
+            vec![AggDescriptor {
+                agg_op: AggFunc::Min,
+                col_idx: 4,
             }],
-            pre_map: vec![],
-            pre_payload: vec![],
-        }),
+        )),
         // A pre-map fold (`GROUP BY a + b`, `SUM(a * b)`): the program plus the
         // reduce input's payload declarations, both non-empty.
         ReadSink::Fold(AggReadSpec {
             group_cols: vec![7],
-            aggs: vec![AggReadItem {
-                op: AggFunc::Sum,
-                src_col: 8,
+            aggs: vec![AggDescriptor {
+                agg_op: AggFunc::Sum,
+                col_idx: 8,
             }],
-            pre_map: vec![4, 1, 5, 9, 2, 6],
-            pre_payload: vec![
-                (TypeCode::I64 as u8, false),
-                (TypeCode::I64 as u8, true),
-                (TypeCode::F64 as u8, true),
-            ],
+            pre: Some(ComputeMap {
+                program: vec![4, 1, 5, 9, 2, 6],
+                out_cols: vec![
+                    (TypeCode::I64 as u8, false),
+                    (TypeCode::I64 as u8, true),
+                    (TypeCode::F64 as u8, true),
+                ],
+            }),
         }),
     ];
     for (i, bound) in bounds.iter().enumerate() {

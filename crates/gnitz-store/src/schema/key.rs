@@ -1252,13 +1252,13 @@ impl ReindexPacker {
     ///
     /// `None` on arity over `MAX_PK_COLUMNS`, an out-of-range column, or a stride
     /// over `MAX_PK_BYTES` — a forged circuit is rejected, never panicked on.
-    pub fn new(schema: &SchemaDescriptor, reindex_cols: &[u32], target_tcs: &[u8]) -> Option<Self> {
-        if reindex_cols.len() > MAX_PK_COLUMNS {
+    pub fn new(schema: &SchemaDescriptor, key: &[(u32, u8)]) -> Option<Self> {
+        if key.len() > MAX_PK_COLUMNS {
             return None;
         }
         let mut cols = [ColPromoter::PLACEHOLDER; MAX_PK_COLUMNS];
         let mut stride = 0usize;
-        for (i, &c) in reindex_cols.iter().enumerate() {
+        for (i, &(c, carried)) in key.iter().enumerate() {
             // `locate`'s own out-of-range guard is a release-active panic, so the
             // rejection has to happen here — bound to the call, not merely ahead
             // of it.
@@ -1267,7 +1267,6 @@ impl ReindexPacker {
             // Carried promotion target (`0` = self-derive); the slot type and width
             // follow `resolve_reindex_type` so the scatter packer and the trace-side
             // reindex Map derive identical widths.
-            let carried = target_tcs.get(i).copied().unwrap_or(0);
             let cp = ColPromoter::new(gnitz_wire::resolve_reindex_type(loc.type_code(), carried), false, kind);
             // A payload slot right-aligns its source, so one narrower than the
             // source would truncate it. `resolve_reindex_type` never derives that;
@@ -1284,7 +1283,7 @@ impl ReindexPacker {
         }
         Some(ReindexPacker {
             cols,
-            num_cols: reindex_cols.len(),
+            num_cols: key.len(),
             out_stride: stride,
             folded: Vec::new(),
         })

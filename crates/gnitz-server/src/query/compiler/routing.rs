@@ -5,7 +5,6 @@
 //! `compile_view`, which stamps scratch tables with the caller's rank.
 
 use super::*;
-use gnitz_store::ops::RouteMode;
 use gnitz_store::schema::Placement;
 use std::rc::Rc;
 
@@ -19,18 +18,15 @@ pub(crate) enum RelayRoute {
     /// the whole other side, so every worker needs the full delta and trims to
     /// its owned slice (`WorkerFilter`) before integrating.
     Broadcast,
-    /// Scatter by `cols`, already truncated to the routing prefix. A band join
+    /// Scatter by the view's own shard columns, under the null-distinct group
+    /// fold `op_reduce` keys its output with.
+    GroupKey(Rc<[u32]>),
+    /// Scatter by a join key, already truncated to the routing prefix and
+    /// mirroring the trace-side reindex Map slot-for-slot. A band join
     /// (`n_eq >= 1`) routes by the equality prefix alone, dropping the trailing
     /// range slot, so equal eq-values co-partition both sides and the range
     /// probe stays partition-local.
-    Scatter {
-        cols: Rc<[u32]>,
-        /// The per-slot promotion targets a `JoinPromote` scatter carries,
-        /// mirroring the trace-side reindex Map slot-for-slot. Empty under
-        /// `GroupKey`, which promotes nothing.
-        target_tcs: Rc<[u8]>,
-        mode: RouteMode,
-    },
+    JoinKey(Rc<[(u32, u8)]>),
 }
 
 /// source table id → join/group reindex `(column, carried promotion tc)` pairs.
@@ -201,14 +197,10 @@ impl ViewMeta {
     }
 }
 
-/// The view's shard columns under `GroupKey`, consistent with `op_reduce`'s
-/// output PK. `None` — no `ExchangeShard` in the circuit — routes by `∅`.
+/// The view's shard columns, consistent with `op_reduce`'s output PK. `None` —
+/// no `ExchangeShard` in the circuit — routes by `∅`.
 fn group_key_route(shard_cols: Option<Rc<[u32]>>) -> RelayRoute {
-    RelayRoute::Scatter {
-        cols: shard_cols.unwrap_or_else(|| Rc::from([])),
-        target_tcs: Rc::from([]),
-        mode: RouteMode::GroupKey,
-    }
+    RelayRoute::GroupKey(shard_cols.unwrap_or_else(|| Rc::from([])))
 }
 
 /// The route a source carrying a reindex key takes. `pairs` is that key,
@@ -225,11 +217,7 @@ fn join_route(pairs: Vec<(u32, u8)>, relay: load::JoinRelay) -> RelayRoute {
             n_eq as usize
         }
     };
-    RelayRoute::Scatter {
-        cols: pairs[..route_len].iter().map(|&(c, _)| c).collect(),
-        target_tcs: pairs[..route_len].iter().map(|&(_, t)| t).collect(),
-        mode: RouteMode::JoinPromote,
-    }
+    RelayRoute::JoinKey(Rc::from(&pairs[..route_len]))
 }
 
 /// True iff `cols` is **exactly** `schema`'s distribution prefix, so a derived

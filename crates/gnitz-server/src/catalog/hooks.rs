@@ -66,11 +66,9 @@ impl CatalogEngine {
             // SAL-replayed advance so a committed SERIAL id is never re-issued.
             SysFamily::Sequence => self.hook_sequence_register(batch),
             // The dependency map is derived from the `ScanDelta` nodes, so a
-            // circuit-node write restates the graph. Edges and node columns
-            // carry no dependency and the circuit itself is loaded by
-            // `load_circuit`, not by hooks.
+            // circuit-node write restates the graph. The circuit itself is
+            // loaded by `load_circuit`, not by hooks.
             SysFamily::CircuitNodes => self.dag.invalidate_dep_map(),
-            SysFamily::CircuitEdges | SysFamily::CircuitNodeColumns => {}
         }
         Ok(())
     }
@@ -457,20 +455,15 @@ impl CatalogEngine {
     }
 
     fn cascade_retract_circuit(&mut self, vid: i64) -> Result<(), String> {
-        for family in [
-            SysFamily::CircuitNodes,
-            SysFamily::CircuitEdges,
-            SysFamily::CircuitNodeColumns,
-        ] {
-            let schema = family.schema();
-            // These families use the compound PK `(view_id, sub)`, so one view's
-            // rows are the key band `[(vid, 0), (vid + 1, 0))`.
-            let start = circuit_opk(&schema, vid, 0);
-            let end = circuit_opk(&schema, vid + 1, 0);
-            let batch = retract_key_range(self.sys_store(family), &schema, start.pk_bytes(), end.pk_bytes());
-            if !batch.is_empty() {
-                self.submit_cascade(family, batch)?;
-            }
+        let family = SysFamily::CircuitNodes;
+        let schema = family.schema();
+        // The family uses the compound PK `(view_id, node_id)`, so one view's
+        // rows are the key band `[(vid, 0), (vid + 1, 0))`.
+        let start = circuit_opk(&schema, vid, 0);
+        let end = circuit_opk(&schema, vid + 1, 0);
+        let batch = retract_key_range(self.sys_store(family), &schema, start.pk_bytes(), end.pk_bytes());
+        if !batch.is_empty() {
+            self.submit_cascade(family, batch)?;
         }
         Ok(())
     }

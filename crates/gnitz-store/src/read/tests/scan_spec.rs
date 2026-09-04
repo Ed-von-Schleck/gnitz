@@ -252,12 +252,11 @@ fn premap_src() -> SchemaDescriptor {
     )
 }
 
-fn premap_spec(pre_map: Vec<u8>, pre_payload: Vec<(u8, bool)>) -> AggReadSpec {
+fn premap_spec(program: Vec<u8>, out_cols: Vec<(u8, bool)>) -> AggReadSpec {
     AggReadSpec {
         group_cols: vec![1],
         aggs: vec![],
-        pre_map,
-        pre_payload,
+        pre: Some(gnitz_wire::ComputeMap { program, out_cols }),
     }
 }
 
@@ -270,11 +269,11 @@ fn premap_err(spec: &AggReadSpec) -> String {
     }
 }
 
-/// No program is the ordinary fold: the source *is* the reduce input, and
+/// No pre-map is the ordinary fold: the source *is* the reduce input, and
 /// nothing is compiled.
 #[test]
 fn fold_pre_map_is_absent_without_a_program() {
-    let spec = premap_spec(Vec::new(), Vec::new());
+    let spec = AggReadSpec::direct(vec![1], vec![]);
     assert!(compile_fold_pre_map(&spec, &premap_src()).unwrap().is_none());
 }
 

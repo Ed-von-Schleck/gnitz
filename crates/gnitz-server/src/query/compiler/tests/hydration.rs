@@ -13,7 +13,7 @@ use gnitz_wire::{JoinKind, MapKind, OpNode};
 ///                         └─────────────┴────────┴→ 7 J_ba (delta=3, trace=4)
 ///   6 → 8 map → 10 union ← 9 map ← 7;  10 → 11 filter → 12 map → 13 sink
 /// ```
-fn equi_join(mutate: impl FnOnce(&mut HashMap<i32, OpNode>, &mut Vec<(i32, i32, i32)>)) -> LoadedCircuit {
+fn equi_join(mutate: impl FnOnce(&mut HashMap<i32, OpNode>, &mut Vec<(i32, i32, usize)>)) -> LoadedCircuit {
     let m = || OpNode::Map(MapKind::Projection(vec![0]));
     let mut nodes = HashMap::from([
         (0, scan_delta(100)),
@@ -32,21 +32,21 @@ fn equi_join(mutate: impl FnOnce(&mut HashMap<i32, OpNode>, &mut Vec<(i32, i32, 
         (13, OpNode::IntegrateSink),
     ]);
     let mut edges = vec![
-        (0, 2, PORT_IN),
-        (1, 3, PORT_IN),
-        (2, 4, PORT_IN),
-        (3, 5, PORT_IN),
-        (2, 6, PORT_IN_A),
-        (5, 6, PORT_TRACE),
-        (3, 7, PORT_IN_A),
-        (4, 7, PORT_TRACE),
-        (6, 8, PORT_IN),
-        (7, 9, PORT_IN),
-        (8, 10, PORT_IN_A),
-        (9, 10, PORT_IN_B),
-        (10, 11, PORT_IN),
-        (11, 12, PORT_IN),
-        (12, 13, PORT_IN),
+        (0, 2, SLOT_IN),
+        (1, 3, SLOT_IN),
+        (2, 4, SLOT_IN),
+        (3, 5, SLOT_IN),
+        (2, 6, SLOT_IN),
+        (5, 6, SLOT_TRACE),
+        (3, 7, SLOT_IN),
+        (4, 7, SLOT_TRACE),
+        (6, 8, SLOT_IN),
+        (7, 9, SLOT_IN),
+        (8, 10, SLOT_IN),
+        (9, 10, SLOT_TRACE),
+        (10, 11, SLOT_IN),
+        (11, 12, SLOT_IN),
+        (12, 13, SLOT_IN),
     ];
     mutate(&mut nodes, &mut edges);
     loaded_for_test(nodes, edges)
@@ -78,7 +78,7 @@ fn hydration_of_a_linear_circuit_names_its_source() {
             (2, OpNode::Map(MapKind::Projection(vec![0]))),
             (3, OpNode::IntegrateSink),
         ]),
-        vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN)],
+        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_IN)],
     );
     assert_eq!(
         hydration_nodes(&lc).unwrap(),
@@ -111,14 +111,17 @@ fn a_malformed_circuit_is_rejected_rather_than_guessed_at() {
                     1,
                     OpNode::Reduce {
                         group_cols: vec![0],
-                        agg: vec![(gnitz_wire::AggFunc::Count, 0)],
+                        agg: vec![gnitz_wire::AggDescriptor {
+                            agg_op: gnitz_wire::AggFunc::Count,
+                            col_idx: 0,
+                        }],
                         global_ground: false,
                         out_key: gnitz_store::schema::ReduceOutKey::SyntheticFold,
                     },
                 ),
                 (2, OpNode::IntegrateSink),
             ]),
-            vec![(0, 1, PORT_IN), (1, 2, PORT_IN)],
+            vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
         ),
         "bounded view: unsupported circuit shape",
     );
@@ -131,7 +134,7 @@ fn a_malformed_circuit_is_rejected_rather_than_guessed_at() {
                 (2, OpNode::Union),
                 (3, OpNode::IntegrateSink),
             ]),
-            vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B), (2, 3, PORT_IN)],
+            vec![(0, 2, SLOT_IN), (1, 2, SLOT_TRACE), (2, 3, SLOT_IN)],
         ),
         "bounded view: union input is not an inner delta/trace join",
     );
@@ -140,8 +143,8 @@ fn a_malformed_circuit_is_rejected_rather_than_guessed_at() {
     // no trace integrates `J_a`'s own delta port.
     rejected(
         equi_join(|_, edges| {
-            edges.retain(|&(s, d, p)| !(s == 4 && d == 7 && p == PORT_TRACE));
-            edges.push((5, 7, PORT_TRACE));
+            edges.retain(|&(s, d, p)| !(s == 4 && d == 7 && p == SLOT_TRACE));
+            edges.push((5, 7, SLOT_TRACE));
         }),
         "bounded view: the join's trace port is not the other branch's delta integral",
     );

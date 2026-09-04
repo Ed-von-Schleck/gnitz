@@ -65,6 +65,11 @@ pub(crate) fn null_gate(
     };
     Ok((gated, nullable))
 }
+/// A reindex key over `cols` with every slot self-derived (`MapKind::Reindex`'s
+/// `0`) — the shape of every re-key that moves rows without widening them.
+pub(crate) fn self_derived_key(cols: &[usize]) -> Vec<(u32, u8)> {
+    cols.iter().map(|&c| (c as u32, 0)).collect()
+}
 
 /// The reindex kept-column list that prunes nothing — every source column
 /// survives as payload, in order.
@@ -77,7 +82,12 @@ pub(crate) fn keep_all(n_cols: usize) -> Vec<u32> {
 /// every other — a null-fill subtracts two of them, where a drift would silently
 /// mis-weight.
 fn rekey_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, schema: &Schema, role: ReindexRole) -> NodeId {
-    cb.map_reindex(node, &schema.pk_cols, &[], &keep_all(schema.columns.len()), role)
+    cb.map_reindex(
+        node,
+        &self_derived_key(&schema.pk_cols),
+        &keep_all(schema.columns.len()),
+        role,
+    )
 }
 
 /// [`rekey_on_source_pk`] for an internal operand: the `P_all` of a null-fill's
@@ -91,12 +101,6 @@ pub(crate) fn rekey_aux_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, sche
 /// so this is what a keyless join's per-side trace key must use.
 pub(crate) fn rekey_scatter_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, schema: &Schema) -> NodeId {
     rekey_on_source_pk(cb, node, schema, ReindexRole::ScatterKey)
-}
-
-/// A schema's column type codes in order — the `null_extend` argument naming the
-/// NULL columns to append for the non-preserved side of an outer-join null-fill.
-pub(crate) fn schema_type_codes(coldefs: &[ColumnDef]) -> Vec<u64> {
-    coldefs.iter().map(|c| c.type_code as u64).collect()
 }
 
 /// Output columns of the inline pure-range-LEFT threshold `m`: the scalar

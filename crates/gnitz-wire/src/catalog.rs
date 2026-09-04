@@ -62,7 +62,7 @@ pub const fn col_index_in(cols: &[WireSysCol], name: &str) -> usize {
 /// where the payload index collapses to `col_index_in(..) - 1`. Every list this
 /// is called with is one (`SCHEMA_TAB`, `TABLE_TAB`, `VIEW_TAB`, `COL_TAB`,
 /// `IDX_TAB`, `SEQ_TAB`, and the IPC control block); the compound-PK lists
-/// (the circuit families) renumber around *every* PK position, so the closed
+/// (the circuit family) renumbers around *every* PK position, so the closed
 /// form does not hold for them and this must not be used there. The
 /// `assert!` rejects the PK column itself, and `col_index_in`'s own const-eval
 /// panic covers a renamed column — both at compile time.
@@ -190,37 +190,23 @@ pub(crate) const SEQ_TAB_COLS: &[WireSysCol] = &[
     col("next_val", TypeCode::U64, false),
 ];
 
-// Circuit catalog tables use a real compound primary key `(view_id, sub)`
-// instead of hand-packing both halves into one U128 column. `sub` is the
-// per-view secondary key (node_id, an (dst_node,dst_port) pack, or a
-// (node_id,kind,position) pack). The remaining columns denormalise the
-// decoded fields as payload so the engine's logical-column readers are
-// unchanged. PK = columns [0, 1].
+// The circuit table uses a real compound primary key `(view_id, node_id)`
+// instead of hand-packing both halves into one U128 column. PK = columns [0, 1].
+//
+// `opcode` and `source_table` stay scannable columns so `for_each_scan_edge` can
+// rebuild the dependency map without the `params` codec. `input_0`/`input_1` are
+// port-indexed, so the column name *is* the port; keeping them out of `params`
+// leaves a parameterless node with no blob cell at all.
 pub const CIRCUIT_NODES_COLS: &[WireSysCol] = &[
     col("view_id", TypeCode::U64, false),
-    col("sub", TypeCode::U64, false),
     col("node_id", TypeCode::U64, false),
     col("opcode", TypeCode::U64, false),
     col("source_table", TypeCode::U64, true),
-    col("expr_program", TypeCode::Blob, true),
-];
-
-pub const CIRCUIT_EDGES_COLS: &[WireSysCol] = &[
-    col("view_id", TypeCode::U64, false),
-    col("sub", TypeCode::U64, false),
-    col("dst_node", TypeCode::U64, false),
-    col("dst_port", TypeCode::U64, false),
-    col("src_node", TypeCode::U64, false),
-];
-
-pub const CIRCUIT_NODE_COLUMNS_COLS: &[WireSysCol] = &[
-    col("view_id", TypeCode::U64, false),
-    col("sub", TypeCode::U64, false),
-    col("node_id", TypeCode::U64, false),
-    col("kind", TypeCode::U64, false),
-    col("position", TypeCode::U64, false),
-    col("value1", TypeCode::U64, false),
-    col("value2", TypeCode::U64, false),
+    col("input_0", TypeCode::U64, true),
+    col("input_1", TypeCode::U64, true),
+    // The node's per-opcode parameters (`encode_op_node`); NULL for an operator
+    // that carries none.
+    col("params", TypeCode::Blob, true),
 ];
 
 // ---------------------------------------------------------------------------
@@ -281,20 +267,11 @@ pub const COLTAB_PAY_FK_COL_IDX: usize = pay_index_in(COL_TAB_COLS, "fk_col_idx"
 pub const COLTAB_PAY_IS_NULLABLE: usize = pay_index_in(COL_TAB_COLS, "is_nullable");
 pub const COLTAB_PAY_IS_HIDDEN: usize = pay_index_in(COL_TAB_COLS, "is_hidden");
 
-pub const CIRCNODES_PAY_NODE_ID: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "node_id", CIRCUIT_FAMILY_PK);
 pub const CIRCNODES_PAY_OPCODE: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "opcode", CIRCUIT_FAMILY_PK);
 pub const CIRCNODES_PAY_SOURCE_TABLE: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "source_table", CIRCUIT_FAMILY_PK);
-pub const CIRCNODES_PAY_EXPR_PROGRAM: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "expr_program", CIRCUIT_FAMILY_PK);
-
-pub const CIRCEDGES_PAY_DST_NODE: usize = pay_index_in_keyed(CIRCUIT_EDGES_COLS, "dst_node", CIRCUIT_FAMILY_PK);
-pub const CIRCEDGES_PAY_DST_PORT: usize = pay_index_in_keyed(CIRCUIT_EDGES_COLS, "dst_port", CIRCUIT_FAMILY_PK);
-pub const CIRCEDGES_PAY_SRC_NODE: usize = pay_index_in_keyed(CIRCUIT_EDGES_COLS, "src_node", CIRCUIT_FAMILY_PK);
-
-pub const CIRCNCOL_PAY_NODE_ID: usize = pay_index_in_keyed(CIRCUIT_NODE_COLUMNS_COLS, "node_id", CIRCUIT_FAMILY_PK);
-pub const CIRCNCOL_PAY_KIND: usize = pay_index_in_keyed(CIRCUIT_NODE_COLUMNS_COLS, "kind", CIRCUIT_FAMILY_PK);
-pub const CIRCNCOL_PAY_POSITION: usize = pay_index_in_keyed(CIRCUIT_NODE_COLUMNS_COLS, "position", CIRCUIT_FAMILY_PK);
-pub const CIRCNCOL_PAY_VALUE1: usize = pay_index_in_keyed(CIRCUIT_NODE_COLUMNS_COLS, "value1", CIRCUIT_FAMILY_PK);
-pub const CIRCNCOL_PAY_VALUE2: usize = pay_index_in_keyed(CIRCUIT_NODE_COLUMNS_COLS, "value2", CIRCUIT_FAMILY_PK);
+pub const CIRCNODES_PAY_INPUT_0: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "input_0", CIRCUIT_FAMILY_PK);
+pub const CIRCNODES_PAY_INPUT_1: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "input_1", CIRCUIT_FAMILY_PK);
+pub const CIRCNODES_PAY_PARAMS: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "params", CIRCUIT_FAMILY_PK);
 
 pub const IDXTAB_COL_SOURCE_COLS: usize = col_index_in(IDX_TAB_COLS, "source_col_idx");
 pub const IDXTAB_COL_NAME: usize = col_index_in(IDX_TAB_COLS, "name");
@@ -333,21 +310,26 @@ const fn fold_family(mut h: u64, cols: &[WireSysCol], pk: &[u32]) -> u64 {
     h
 }
 
-/// Digest of every system family's stored shape. Shards and SAL frames are
-/// decoded against the *live* schema, so a shape change silently reinterprets
-/// an existing data directory unless a format word rejects it first — see the
-/// pin in [`crate::wal::WAL_FORMAT_VERSION`]'s test.
+/// Digest of every system family's stored shape, and of the blob layouts stored
+/// *inside* one. Shards and SAL frames are decoded against the *live* schema, so
+/// a shape change silently reinterprets an existing data directory unless a
+/// format word rejects it first — see the pin in
+/// [`crate::wal::WAL_FORMAT_VERSION`]'s test.
 ///
-/// Folded straight over [`SYS_FAMILIES`], so a family added there is covered
-/// here without a second edit. A hand-chained list would keep hashing the old
-/// set and report an unchanged digest for a changed catalog.
+/// The column half is folded straight over [`SYS_FAMILIES`], so a family added
+/// there is covered without a second edit. The version consts cover what that
+/// fold cannot see: a `Blob` column's bytes are as durable as its neighbours',
+/// but its internal layout is invisible to a fold over names and types.
 pub const SYS_SCHEMA_DIGEST: u64 = {
+    const PRIME: u64 = 0x100_0000_01b3;
     let mut h = 0xcbf2_9ce4_8422_2325;
     let mut i = 0;
     while i < SYS_FAMILIES.len() {
         h = fold_family(h, SYS_FAMILIES[i].cols, SYS_FAMILIES[i].pk_cols);
         i += 1;
     }
+    h = (h ^ crate::circuit::CIRCUIT_PARAMS_VERSION as u64).wrapping_mul(PRIME);
+    h = (h ^ crate::expr::EXPR_BLOB_VERSION as u64).wrapping_mul(PRIME);
     h
 };
 
@@ -362,11 +344,8 @@ pub const COL_TAB: u64 = 4;
 pub const IDX_TAB: u64 = 5;
 pub const SEQ_TAB: u64 = 7;
 pub const CIRCUIT_NODES_TAB: u64 = 11;
-pub const CIRCUIT_EDGES_TAB: u64 = 12;
-pub const CIRCUIT_NODE_COLUMNS_TAB: u64 = 13;
 
-/// The circuit families' compound primary key: columns `(view_id, sub)`. Shared
-/// by all three, which is why it is named once rather than per family.
+/// The circuit family's compound primary key: columns `(view_id, node_id)`.
 pub const CIRCUIT_FAMILY_PK: &[u32] = &[0, 1];
 
 /// One system family's wire identity: the table id both sides address it by,
@@ -402,18 +381,6 @@ pub const SYS_FAMILIES: &[WireSysFamily] = &[
         CIRCUIT_NODES_TAB,
         "_circuit_nodes",
         CIRCUIT_NODES_COLS,
-        CIRCUIT_FAMILY_PK,
-    ),
-    fam(
-        CIRCUIT_EDGES_TAB,
-        "_circuit_edges",
-        CIRCUIT_EDGES_COLS,
-        CIRCUIT_FAMILY_PK,
-    ),
-    fam(
-        CIRCUIT_NODE_COLUMNS_TAB,
-        "_circuit_node_columns",
-        CIRCUIT_NODE_COLUMNS_COLS,
         CIRCUIT_FAMILY_PK,
     ),
 ];

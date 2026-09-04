@@ -16,25 +16,20 @@ use gnitz_store::schema::{DerivedSchema, SchemaColumn};
 // `ops::merge_schemas_for_join`, `build_reduce_output_schema`, `project_schema`).
 
 /// Output schema of a HashRow (set-op full-row identity) Map: a synthetic U128
-/// PK at slot 0, then the projected payload columns. `target_tcs[j] != 0`
-/// promotes payload column `j` to that <=8-byte integer type (cross-width
-/// set-op coercion) — `new` re-derives size/signedness for the promoted type —
-/// keeping THIS SIDE's nullability. Per-side, not the operator-merged view
-/// nullability: an INTERSECT/EXCEPT leaf is `distinct`-ed on its own before
-/// the tuple-tightening combine, so its row comparator must classify by what
-/// this side can actually emit.
-fn hashrow_output_schema(
-    in_schema: &SchemaDescriptor,
-    proj_cols: &[u32],
-    target_tcs: &[u8],
-) -> Option<SchemaDescriptor> {
+/// PK at slot 0, then the projected payload columns, each promoted to its
+/// non-zero target but keeping THIS SIDE's nullability. Per-side, not the
+/// operator-merged view nullability: an INTERSECT/EXCEPT leaf is `distinct`-ed
+/// before the tuple-tightening combine, so its row comparator must classify by
+/// what this side can actually emit.
+fn hashrow_output_schema(in_schema: &SchemaDescriptor, cols: &[(u32, u8)]) -> Option<SchemaDescriptor> {
     let mut b = DerivedSchema::new();
     b.push_pk(SchemaColumn::new(gnitz_store::schema::type_code::U128, 0))?;
-    for (j, &c) in proj_cols.iter().enumerate() {
+    for &(c, tgt) in cols {
         let src = in_schema.columns[c as usize];
-        let tgt = target_tcs.get(j).copied().unwrap_or(0);
-        let out_tc = if tgt != 0 { tgt } else { src.type_code };
-        b.push(SchemaColumn::new(out_tc, src.nullable))?;
+        b.push(SchemaColumn::new(
+            if tgt != 0 { tgt } else { src.type_code },
+            src.nullable,
+        ))?;
     }
     Some(b.finish())
 }
@@ -109,22 +104,13 @@ pub(super) fn oob_cols(cols: impl IntoIterator<Item = u32>, schema: &SchemaDescr
     cols.into_iter().any(|c| c as usize >= schema.num_columns())
 }
 
-/// True iff any carried target in `target_tcs` is invalid for its source column
-/// in `cols` under `valid`, the domain predicate of the promotion's destination.
-/// A violation means a corrupt/forged catalog; callers abort the compile cleanly
-/// rather than panic/truncate in the copy kernels. An out-of-range column is a
-/// violation too, so the check is total — the callers' own `oob_cols` runs first
-/// only to name the more specific guard. A zero target carries no promotion and
-/// is always accepted. Shared body of [`key_promotion_invalid`] and
-/// [`payload_promotion_invalid`], which differ only in `valid`.
-fn promotion_invalid(
-    cols: &[u32],
-    target_tcs: &[u8],
-    schema: &SchemaDescriptor,
-    valid: impl Fn(u8, u8) -> bool,
-) -> bool {
-    cols.iter().enumerate().any(|(i, &c)| {
-        let t = target_tcs.get(i).copied().unwrap_or(0);
+/// True iff any slot's carried target (`0` = none) is invalid for its source
+/// column under `valid`, the domain predicate of the promotion's destination — a
+/// corrupt/forged catalog, which callers abort the compile on rather than
+/// panic/truncate in the copy kernels. Shared body of
+/// [`key_promotion_invalid`] and [`payload_promotion_invalid`].
+fn promotion_invalid(slots: &[(u32, u8)], schema: &SchemaDescriptor, valid: impl Fn(u8, u8) -> bool) -> bool {
+    slots.iter().any(|&(c, t)| {
         t != 0
             && !schema
                 .columns
@@ -138,8 +124,8 @@ fn promotion_invalid(
 /// re-deriving the sign/width ladder — `t` is value-preserving for `src` iff
 /// `join_key_common_type(src, t) == Some(t)` — which also screens PK-ineligible
 /// targets for free, since that function only yields PK-eligible types.
-fn key_promotion_invalid(cols: &[u32], target_tcs: &[u8], schema: &SchemaDescriptor) -> bool {
-    promotion_invalid(cols, target_tcs, schema, |src, t| {
+fn key_promotion_invalid(slots: &[(u32, u8)], schema: &SchemaDescriptor) -> bool {
+    promotion_invalid(slots, schema, |src, t| {
         gnitz_wire::join_key_common_type(src, t) == Some(t)
     })
 }
@@ -148,8 +134,8 @@ fn key_promotion_invalid(cols: &[u32], target_tcs: &[u8], schema: &SchemaDescrip
 /// promotion the copy kernel supports. Identical to the rule `check_copy_types`
 /// holds a column sink's destination to — the HashRow payload widen is that same
 /// kernel — so it is narrower than [`key_promotion_invalid`], not a mode of it.
-pub(super) fn payload_promotion_invalid(cols: &[u32], target_tcs: &[u8], schema: &SchemaDescriptor) -> bool {
-    promotion_invalid(cols, target_tcs, schema, gnitz_wire::is_widening_promotion)
+pub(super) fn payload_promotion_invalid(slots: &[(u32, u8)], schema: &SchemaDescriptor) -> bool {
+    promotion_invalid(slots, schema, gnitz_wire::is_widening_promotion)
 }
 
 // ---------------------------------------------------------------------------
@@ -494,40 +480,36 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, mk: &gnitz_wire::MapKind) -> Result<u16
     let in_reg = ctx.unary_in(nid)?;
     let in_reg_schema = ctx.reg_meta[in_reg as usize].schema;
     let (node_schema, prog, pk_source) = match mk {
-        gnitz_wire::MapKind::Compute { program, out_cols } => {
+        gnitz_wire::MapKind::Compute(map) => {
             // The declared payload slots ARE the layout: a computed projection has
             // no dense copy list to derive one from. `from_map` below validates the
             // program against them, which is what catches a false declaration.
-            let node_schema = compute_map_output_schema(&in_reg_schema, out_cols)
+            let node_schema = compute_map_output_schema(&in_reg_schema, &map.out_cols)
                 .ok_or(CompileError::Rejected("compute map: output exceeds MAX_COLUMNS"))?;
             // The only arm whose program is client bytes; the rest build theirs
             // from a column list. Rejected, not asserted: skipping a corrupt blob
             // would leave the output register at the default empty schema.
-            let prog = LogicalProgram::from_map_blob(program, "map").map_err(expr_reject("map: invalid program"))?;
+            let prog =
+                LogicalProgram::from_map_blob(&map.program, "map").map_err(expr_reject("map: invalid program"))?;
             (node_schema, prog, PkSource::Inherit)
         }
 
-        gnitz_wire::MapKind::Reindex {
-            keep,
-            reindex_cols,
-            reindex_target_tcs,
-            ..
-        } => {
-            if oob_cols(reindex_cols.iter().copied(), &in_reg_schema) {
+        gnitz_wire::MapKind::Reindex { keep, key, .. } => {
+            if oob_cols(key.iter().map(|&(c, _)| c), &in_reg_schema) {
                 return Err(CompileError::Rejected("map: reindex columns out of range"));
             }
             if oob_cols(keep.iter().copied(), &in_reg_schema) {
                 return Err(CompileError::Rejected("map: reindex payload column out of range"));
             }
             // Must follow the in-bounds check: it reads `columns[c]`.
-            if key_promotion_invalid(reindex_cols, reindex_target_tcs, &in_reg_schema) {
+            if key_promotion_invalid(key, &in_reg_schema) {
                 return Err(CompileError::Rejected("map: invalid reindex promotion target"));
             }
             // The packer is built first because it *is* the layout: its output
             // schema reads the promoters the per-row pack writes through, so the
             // reindexed `_join_pk` and the delta scatter co-partition by
             // construction. Same packer the exchange scatter builds from `ViewMeta`.
-            let packer = gnitz_store::schema::key::ReindexPacker::new(&in_reg_schema, reindex_cols, reindex_target_tcs)
+            let packer = gnitz_store::schema::key::ReindexPacker::new(&in_reg_schema, key)
                 .ok_or(CompileError::Rejected("map: invalid reindex key"))?;
             let node_schema = packer
                 .output_schema(&in_reg_schema, keep)
@@ -535,22 +517,23 @@ fn emit_map(ctx: &mut EmitCtx, nid: i32, mk: &gnitz_wire::MapKind) -> Result<u16
             (node_schema, LogicalProgram::copy_cols(keep), PkSource::Pack(packer))
         }
 
-        gnitz_wire::MapKind::HashRow(proj_cols, target_tcs, branch_id) => {
+        gnitz_wire::MapKind::HashRow { cols, branch_id } => {
             // `hashrow_output_schema` declares the synthetic U128 PK the map
             // hashes, and `create_universal_projection` widens each source into
             // its (possibly promoted) slot — so both set-op sides hash one
             // physical layout.
-            if oob_cols(proj_cols.iter().copied(), &in_reg_schema) {
+            if oob_cols(cols.iter().map(|&(c, _)| c), &in_reg_schema) {
                 return Err(CompileError::Rejected("hash-row map: columns out of range"));
             }
-            if payload_promotion_invalid(proj_cols, target_tcs, &in_reg_schema) {
+            if payload_promotion_invalid(cols, &in_reg_schema) {
                 return Err(CompileError::Rejected("hash-row map: invalid promotion target"));
             }
-            let node_schema = hashrow_output_schema(&in_reg_schema, proj_cols, target_tcs)
+            let node_schema = hashrow_output_schema(&in_reg_schema, cols)
                 .ok_or(CompileError::Rejected("hash-row map: output exceeds MAX_COLUMNS"))?;
+            let proj: Vec<u32> = cols.iter().map(|&(c, _)| c).collect();
             (
                 node_schema,
-                LogicalProgram::copy_cols(proj_cols),
+                LogicalProgram::copy_cols(&proj),
                 PkSource::HashRow { branch_id: *branch_id },
             )
         }
@@ -600,7 +583,7 @@ fn emit_reduce(
     ctx: &mut EmitCtx,
     nid: i32,
     group_cols: &[u32],
-    agg: &[(gnitz_wire::AggFunc, u32)],
+    agg: &[AggDescriptor],
     global_ground: bool,
     out_key: gnitz_store::schema::ReduceOutKey,
 ) -> Result<u16, CompileError> {
@@ -608,22 +591,17 @@ fn emit_reduce(
     let in_reg_id = ctx.unary_in(nid)?;
     let in_reg_schema = ctx.reg_meta[in_reg_id as usize].schema;
 
-    // Raw wire column indices below index the fixed `[_; 65]` schema array. Reject
-    // an out-of-range group column or aggregate column before `agg_descs` is built
-    // (which reads `columns[col_idx]`), so a crafted/corrupt node fails the compile
-    // rather than reading a zeroed slot or aborting at the first push.
+    // Raw wire column indices below index the fixed `[_; 65]` schema array, and
+    // `ReducePlan::new` reads `columns[col_idx]`. Reject an out-of-range group or
+    // aggregate column first, so a crafted/corrupt node fails the compile rather
+    // than reading a zeroed slot or aborting at the first push.
     if oob_cols(group_cols.iter().copied(), &in_reg_schema) {
         return Err(CompileError::Rejected("reduce: group columns out of range"));
     }
     debug_assert!(!agg.is_empty(), "decode_op_node rejects a spec-less REDUCE");
-    if oob_cols(agg.iter().map(|&(_, c)| c), &in_reg_schema) {
+    if oob_cols(agg.iter().map(|d| d.col_idx), &in_reg_schema) {
         return Err(CompileError::Rejected("reduce: aggregate column out of range"));
     }
-
-    let agg_descs: Vec<AggDescriptor> = agg
-        .iter()
-        .map(|&(agg_op, col_idx)| AggDescriptor { col_idx, agg_op })
-        .collect();
 
     // The output layout and `op_reduce`'s row keying both obey `out_key`, so a
     // kind the schema does not warrant would silently scramble the output columns.
@@ -634,8 +612,9 @@ fn emit_reduce(
     // A worker owns the global-aggregate ground row when it holds the whole
     // input: the view is replicated (correct-local everywhere, read
     // single-sourced from worker 0), or nothing shards into this reduce, or it is
-    // the one worker a sharded funnel routes V₀ to. `ReducePlan::new` conjoins
-    // this with `global_ground`, so a grouped reduce cannot carry a live seed.
+    // the one worker a sharded funnel routes V₀ to. That a *grouped* reduce never
+    // seeds one is `decode_op_node`'s: it rejects `global_ground` over a
+    // non-empty group set.
     let unsharded = !matches!(
         loaded.op(loaded.inputs(nid).unary()),
         gnitz_wire::OpNode::ExchangeShard { .. }
@@ -649,15 +628,8 @@ fn emit_reduce(
     // SQL binder — which the low-level CircuitBuilder path bypasses — is not the
     // only thing that must reject an unaggregatable column type. `ReducePlan::new`
     // owns both, so a bad circuit fails the compile instead of aborting a worker.
-    let plan = gnitz_store::ops::ReducePlan::new(
-        &in_reg_schema,
-        group_cols,
-        &agg_descs,
-        out_key,
-        global_ground,
-        i_am_owner,
-    )
-    .map_err(CompileError::Rejected)?;
+    let plan = gnitz_store::ops::ReducePlan::new(&in_reg_schema, group_cols, agg, out_key, global_ground, i_am_owner)
+        .map_err(CompileError::Rejected)?;
     let reduce_out_schema = plan.output_schema;
 
     let trace_reg = ctx.push_trace_reg(&format!("_reduce_{}_{nid}", ctx.site.id), reduce_out_schema)?;

@@ -85,13 +85,13 @@ fn circuit_batch(rows: &[(i64, u64, i64)]) -> Batch {
             &CircuitNodeRow {
                 view_id: view_id as u64,
                 node_id,
-                opcode: gnitz_wire::OPCODE_INTEGRATE,
+                opcode: gnitz_wire::Opcode::Integrate.as_wire(),
                 source_table: None,
-                expr_program: None,
+                inputs: [None; 2],
+                params: None,
             },
             weight,
-        )
-        .unwrap();
+        );
     }
     bb.finish()
 }
@@ -193,8 +193,8 @@ fn a_rewrite_pair_is_rejected_for_a_family_with_no_pair_mask() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A duplicate `(view_id, sub)` makes `load_circuit`'s node insert
-/// last-writer-wins in cursor order, so rule 3 is the circuit families' whole
+/// A duplicate `(view_id, node_id)` makes `load_circuit`'s node insert
+/// last-writer-wins in cursor order, so rule 3 is the circuit family's whole
 /// batch-local contract.
 #[test]
 fn a_duplicate_circuit_key_is_rejected_and_a_distinct_one_is_not() {
@@ -205,9 +205,9 @@ fn a_duplicate_circuit_key_is_rejected_and_a_distinct_one_is_not() {
         &circuit_batch(&[(20, 0, 1), (20, 0, 1)]),
     );
     assert!(err.contains("more than one row for circuit row"), "{err}");
-    assert!(err.contains("view 20 sub 0"), "the message names both halves: {err}");
+    assert!(err.contains("view 20 node 0"), "the message names both halves: {err}");
 
-    // Two nodes of one view are distinct keys, and the circuit families take no
+    // Two nodes of one view are distinct keys, and the circuit family takes no
     // live-row probe — that their view exists is the bundle guard's rule.
     engine
         .check_family_contract(SysFamily::CircuitNodes, &circuit_batch(&[(20, 0, 1), (20, 1, 1)]))

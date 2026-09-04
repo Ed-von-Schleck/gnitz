@@ -24,8 +24,8 @@ pub trait SysRowSink {
     fn begin_row(&mut self, pk: &[u128], weight: i64);
     fn put_u64(&mut self, v: u64);
     fn put_string(&mut self, s: &str);
-    /// A variable-length column that is not UTF-8 (the circuit families' encoded
-    /// expression programs).
+    /// A variable-length column that is not UTF-8 (a circuit node's encoded
+    /// parameters).
     fn put_bytes(&mut self, b: &[u8]);
     /// A NULL in the next payload slot. The slot still consumes its position —
     /// the writers below emit one value per payload column either way.
@@ -173,108 +173,45 @@ pub fn write_idx_tab_row(sink: &mut impl SysRowSink, r: &IdxTabRow, weight: i64)
 }
 
 // ---------------------------------------------------------------------------
-// The circuit families (CIRCUIT_NODES / CIRCUIT_EDGES / CIRCUIT_NODE_COLUMNS)
+// CIRCUIT_NODES
 // ---------------------------------------------------------------------------
 
-/// The second PK column of every circuit family: the per-family fields packed
-/// into one u64, widest first. The first column is always `view_id`, which is
-/// what the engine's per-view prefix seek reads.
-///
-/// `Err` when a field overflows the width it was given: it would alias another
-/// row's record, so the writer emits nothing rather than a colliding key.
-fn circuit_sub(fields: &[(&str, u64, u32)]) -> Result<u64, String> {
-    // Packed in a u128 so a single 64-bit field's `<< 64` is a shift, not an
-    // overflow. Every family's widths sum to 64, so the result always narrows.
-    let mut sub: u128 = 0;
-    for &(name, value, bits) in fields {
-        if bits < 64 && value >= 1 << bits {
-            return Err(format!("CircuitTables: {name} {value} exceeds maximum"));
-        }
-        sub = (sub << bits) | value as u128;
-    }
-    debug_assert!(
-        sub <= u64::MAX as u128,
-        "a circuit family's sub fields must pack into 64 bits"
-    );
-    Ok(sub as u64)
-}
-
-/// One `CircuitNodes` row: node `node_id` of view `view_id`.
+/// One `CircuitNodes` row: node `node_id` of view `view_id`. Keyed by
+/// `(view_id, node_id)`, so the per-view prefix seek reads the leading half.
 pub struct CircuitNodeRow<'a> {
     pub view_id: u64,
     pub node_id: u64,
     pub opcode: u64,
     /// `None` for every opcode but `ScanDelta`.
     pub source_table: Option<u64>,
-    /// The encoded expression program, for the opcodes that carry one.
-    pub expr_program: Option<&'a [u8]>,
+    /// The producers feeding this node's input slots, in port order: `None` past
+    /// the operator's arity. A port takes one producer, which is why it is a
+    /// column and not a row of its own.
+    pub inputs: [Option<u64>; 2],
+    /// The node's per-opcode parameters (`encode_op_node`), or `None` for an
+    /// operator that carries none.
+    pub params: Option<&'a [u8]>,
 }
 
-pub fn write_circuit_node_row(sink: &mut impl SysRowSink, r: &CircuitNodeRow, weight: i64) -> Result<(), String> {
-    let sub = circuit_sub(&[("node_id", r.node_id, 64)])?;
-    sink.begin_row(&[r.view_id as u128, sub as u128], weight);
-    sink.put_u64(r.node_id);
+pub fn write_circuit_node_row(sink: &mut impl SysRowSink, r: &CircuitNodeRow, weight: i64) {
+    sink.begin_row(&[r.view_id as u128, r.node_id as u128], weight);
     sink.put_u64(r.opcode);
-    // Both nullable columns still take their payload slot when absent.
+    // Every nullable column still takes its payload slot when absent.
     match r.source_table {
         Some(t) => sink.put_u64(t),
         None => sink.put_null(),
     }
-    match r.expr_program {
+    for input in r.inputs {
+        match input {
+            Some(src) => sink.put_u64(src),
+            None => sink.put_null(),
+        }
+    }
+    match r.params {
         Some(b) => sink.put_bytes(b),
         None => sink.put_null(),
     }
     sink.end_row();
-    Ok(())
-}
-
-/// One `CircuitEdges` row. Keyed by its **destination** port, which is unique: a
-/// port takes one producer.
-pub struct CircuitEdgeRow {
-    pub view_id: u64,
-    pub dst_node: u64,
-    pub dst_port: u64,
-    pub src_node: u64,
-}
-
-pub fn write_circuit_edge_row(sink: &mut impl SysRowSink, r: &CircuitEdgeRow, weight: i64) -> Result<(), String> {
-    let sub = circuit_sub(&[("dst_node", r.dst_node, 40), ("dst_port", r.dst_port, 8)])?;
-    sink.begin_row(&[r.view_id as u128, sub as u128], weight);
-    sink.put_u64(r.dst_node);
-    sink.put_u64(r.dst_port);
-    sink.put_u64(r.src_node);
-    sink.end_row();
-    Ok(())
-}
-
-/// One `CircuitNodeColumns` row: the `position`-th entry of `kind` on `node_id`.
-pub struct CircuitNodeColumnRow {
-    pub view_id: u64,
-    pub node_id: u64,
-    pub kind: u64,
-    pub position: u64,
-    pub value1: u64,
-    pub value2: u64,
-}
-
-pub fn write_circuit_node_column_row(
-    sink: &mut impl SysRowSink,
-    r: &CircuitNodeColumnRow,
-    weight: i64,
-) -> Result<(), String> {
-    let sub = circuit_sub(&[
-        ("node_id", r.node_id, 40),
-        ("kind", r.kind, 8),
-        ("position", r.position, 16),
-    ])?;
-    sink.begin_row(&[r.view_id as u128, sub as u128], weight);
-    sink.put_u64(r.node_id);
-    sink.put_u64(r.kind);
-    sink.put_u64(r.position);
-    sink.put_u64(r.value1);
-    sink.put_u64(r.value2);
-    sink.end_row();
-    Ok(())
 }
 
 #[cfg(test)]

@@ -27,7 +27,7 @@ impl MidCircuit {
     fn build(&self, mid: gnitz_wire::OpNode) -> Result<PlanBuildResult, CompileError> {
         let loaded = loaded_for_test(
             HashMap::from([(0, scan_delta(10)), (1, mid), (2, gnitz_wire::OpNode::IntegrateSink)]),
-            vec![(0, 1, PORT_IN), (1, 2, PORT_IN)],
+            vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
         );
         build_plan(
             &loaded,
@@ -108,7 +108,7 @@ fn union_of_mismatched_input_layouts_is_rejected() {
     let one = SchemaDescriptor::minimal_u64();
     let loaded = loaded_for_test(
         HashMap::from([(0, scan_delta(10)), (1, scan_delta(11)), (2, gnitz_wire::OpNode::Union)]),
-        vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B)],
+        vec![(0, 2, SLOT_IN), (1, 2, SLOT_TRACE)],
     );
     // `Subgraph` so the union guard is the only one that can fire — the sink
     // contract never runs.
@@ -142,7 +142,7 @@ fn a_subgraph_outputs_the_named_node_and_must_not_hold_the_sink() {
             (1, gnitz_wire::OpNode::Negate),
             (2, gnitz_wire::OpNode::IntegrateSink),
         ]),
-        vec![(0, 1, PORT_IN), (1, 2, PORT_IN)],
+        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
     );
     let ext: ExtTables = HashMap::from([(10i64, SchemaDescriptor::minimal_u64())]);
     let plan = |ordered: &[i32]| {
@@ -182,7 +182,7 @@ fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
     );
     let loaded = loaded_for_test(
         HashMap::from([(0, scan_delta(10)), (1, gnitz_wire::OpNode::IntegrateSink)]),
-        vec![(0, 1, PORT_IN)],
+        vec![(0, 1, SLOT_IN)],
     );
     let against = |view_schema: &SchemaDescriptor, source: SchemaDescriptor| {
         build_plan(
@@ -220,7 +220,7 @@ fn a_register_count_over_u16_max_is_rejected() {
     let mut edges = Vec::new();
     for nid in 1..n {
         nodes.insert(nid, gnitz_wire::OpNode::Negate);
-        edges.push((nid - 1, nid, PORT_IN));
+        edges.push((nid - 1, nid, SLOT_IN));
     }
     let loaded = loaded_for_test(nodes, edges);
     assert_eq!(loaded.ordered.len(), n as usize);
@@ -257,7 +257,10 @@ fn a_reduce_out_key_the_schema_does_not_warrant_is_rejected() {
         group_cols: group,
         // A linear COUNT keeps the MIN/MAX-eligibility guard out of the picture,
         // isolating the out_key validation.
-        agg: vec![(AggFunc::Count, 0)],
+        agg: vec![gnitz_wire::AggDescriptor {
+            agg_op: AggFunc::Count,
+            col_idx: 0,
+        }],
         global_ground: false,
         out_key,
     };
@@ -305,7 +308,10 @@ fn reduce_column_indices_out_of_range_are_rejected() {
     use gnitz_wire::{AggFunc, OpNode};
     let reduce = |group: Vec<u32>, agg_col: u32| OpNode::Reduce {
         group_cols: group,
-        agg: vec![(AggFunc::Count, agg_col)],
+        agg: vec![gnitz_wire::AggDescriptor {
+            agg_op: AggFunc::Count,
+            col_idx: agg_col,
+        }],
         global_ground: false,
         out_key: ReduceOutKey::PkPermutation,
     };
@@ -331,7 +337,10 @@ fn a_value_reading_aggregate_over_a_non_scalar_column_is_rejected() {
     // aggregate column, whose type is the only thing varying.
     let reduce = |func| OpNode::Reduce {
         group_cols: vec![0],
-        agg: vec![(func, 1)],
+        agg: vec![gnitz_wire::AggDescriptor {
+            agg_op: func,
+            col_idx: 1,
+        }],
         global_ground: false,
         out_key: ReduceOutKey::PkPermutation,
     };
@@ -412,10 +421,10 @@ fn a_corrupt_expression_blob_aborts_the_compile() {
         );
         assert!(
             fixture
-                .rejection(OpNode::Map(MapKind::Compute {
+                .rejection(OpNode::Map(MapKind::Compute(gnitz_wire::ComputeMap {
                     program: blob.clone(),
                     out_cols: vec![],
-                }))
+                })))
                 .starts_with("map: invalid program"),
             "a {}-byte Map blob must abort compilation",
             blob.len()
@@ -429,11 +438,10 @@ fn a_corrupt_expression_blob_aborts_the_compile() {
 #[test]
 fn reindex_key_and_kept_column_lists_are_bounds_checked() {
     use gnitz_wire::{MapKind, OpNode};
-    let reindex = |keep: Vec<u32>, reindex_cols: Vec<u32>| {
+    let reindex = |keep: Vec<u32>, key_cols: Vec<u32>| {
         OpNode::Map(MapKind::Reindex {
             keep,
-            reindex_cols,
-            reindex_target_tcs: vec![],
+            key: key_cols.into_iter().map(|c| (c, 0)).collect(),
             role: gnitz_wire::ReindexRole::ScatterKey,
         })
     };
@@ -474,7 +482,12 @@ fn reindex_key_and_kept_column_lists_are_bounds_checked() {
 #[test]
 fn a_hash_row_map_promotes_within_the_copy_kernel_domain_or_is_rejected() {
     use gnitz_wire::{MapKind, OpNode};
-    let hash_row = |cols: Vec<u32>, tcs: Vec<u8>| OpNode::Map(MapKind::HashRow(cols, tcs, 0));
+    let hash_row = |cols: Vec<u32>, tcs: Vec<u8>| {
+        OpNode::Map(MapKind::HashRow {
+            cols: cols.into_iter().zip(tcs).collect(),
+            branch_id: 0,
+        })
+    };
     let fixture = MidCircuit::new(u64_pk_schema(SchemaColumn::new(type_code::U32, 0)));
     assert!(fixture.compiles(hash_row(vec![1], vec![0])), "no promotion");
     assert!(
@@ -552,8 +565,8 @@ fn a_cross_join_accepts_sides_of_different_pk_strides() {
     assert!(plan.is_ok(), "{:?}", plan.err());
 }
 
-/// Compile the minimal two-source join circuit — a delta on `PORT_IN_A`, the
-/// integral of a second scan on `PORT_TRACE` — at the given kind and side
+/// Compile the minimal two-source join circuit — a delta on `SLOT_IN`, the
+/// integral of a second scan on `SLOT_TRACE` — at the given kind and side
 /// schemas. The probe preconditions are all this shape exercises, so the join
 /// kind and the two schemas are the only things a caller varies.
 fn plan_two_source_join(
@@ -571,7 +584,7 @@ fn plan_two_source_join(
             (3, OpNode::Join(kind)),
             (4, OpNode::IntegrateSink),
         ]),
-        vec![(0, 3, PORT_IN_A), (1, 2, PORT_IN), (2, 3, PORT_TRACE), (3, 4, PORT_IN)],
+        vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],
     );
     build_plan(
         &loaded,
@@ -587,7 +600,7 @@ fn plan_two_source_join(
 /// A trace port fed by a node that is not an integral is rejected at compile
 /// time: `topo_sorted` checks a `Join`'s port arity, not its producer's kind,
 /// and such a register would reach the dispatch with no cursor. The ONLY
-/// difference between the two builds is which node feeds `PORT_TRACE`.
+/// difference between the two builds is which node feeds `SLOT_TRACE`.
 #[test]
 fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
@@ -602,7 +615,7 @@ fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
                 (2, gnitz_wire::OpNode::IntegrateTrace),
                 (3, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace)),
             ]),
-            vec![(1, 2, PORT_IN), (0, 3, PORT_IN_A), (trace_src, 3, PORT_TRACE)],
+            vec![(1, 2, SLOT_IN), (0, 3, SLOT_IN), (trace_src, 3, SLOT_TRACE)],
         );
         build_plan(
             &loaded,
@@ -631,7 +644,7 @@ fn a_wide_pk_join_compiles() {
             (3, gnitz_wire::OpNode::IntegrateSink),
             (4, gnitz_wire::OpNode::IntegrateTrace),
         ]),
-        vec![(0, 2, PORT_IN_A), (1, 4, PORT_IN), (4, 2, PORT_TRACE), (2, 3, PORT_IN)],
+        vec![(0, 2, SLOT_IN), (1, 4, SLOT_IN), (4, 2, SLOT_TRACE), (2, 3, SLOT_IN)],
     );
     // The plan owns scratch dirs under `dir`, so it must drop first: build it
     // inside the assert rather than binding it past `dir`'s scope.
@@ -661,7 +674,7 @@ fn a_failed_compile_removes_the_scratch_dirs_it_created() {
             (2, gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Projection(vec![200]))),
             (3, gnitz_wire::OpNode::IntegrateSink),
         ]),
-        vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN)],
+        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_IN)],
     );
     let result = build_plan(
         &loaded,
@@ -703,7 +716,7 @@ fn a_chained_exchange_is_rejected_instead_of_panicking() {
             (3, gnitz_wire::OpNode::ExchangeShard { shard_cols: vec![0] }),
             (4, gnitz_wire::OpNode::IntegrateSink),
         ]),
-        vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (2, 3, PORT_IN), (3, 4, PORT_IN)],
+        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_IN), (3, 4, SLOT_IN)],
     );
 
     // The carve `compile_view` performs for the sink-nearest shard.
@@ -795,7 +808,7 @@ fn a_destructive_op_takes_its_input_only_when_it_is_the_last_reader() {
                 (distinct_id, gnitz_wire::OpNode::Distinct),
                 (reader_id, gnitz_wire::OpNode::Negate),
             ]),
-            vec![(0, distinct_id, PORT_IN), (0, reader_id, PORT_IN)],
+            vec![(0, distinct_id, SLOT_IN), (0, reader_id, SLOT_IN)],
         );
         let plan = build_plan(
             &loaded,
@@ -828,7 +841,7 @@ fn a_destructive_op_takes_its_input_only_when_it_is_the_last_reader() {
 #[test]
 fn a_union_takes_each_unread_operand_but_never_the_sink_register() {
     let two_col = make_schema_u64_i64();
-    let flags = |nodes: HashMap<i32, gnitz_wire::OpNode>, edges: Vec<(i32, i32, i32)>, out: i32| {
+    let flags = |nodes: HashMap<i32, gnitz_wire::OpNode>, edges: Vec<(i32, i32, usize)>, out: i32| {
         let loaded = loaded_for_test(nodes, edges);
         let plan = build_plan(
             &loaded,
@@ -845,7 +858,7 @@ fn a_union_takes_each_unread_operand_but_never_the_sink_register() {
     assert_eq!(
         flags(
             HashMap::from([(0, scan_delta(10)), (1, scan_delta(11)), (2, gnitz_wire::OpNode::Union),]),
-            vec![(0, 2, PORT_IN_A), (1, 2, PORT_IN_B)],
+            vec![(0, 2, SLOT_IN), (1, 2, SLOT_TRACE)],
             2,
         ),
         vec![("union.a", true), ("union.b", true)],
@@ -859,7 +872,7 @@ fn a_union_takes_each_unread_operand_but_never_the_sink_register() {
                 (1, gnitz_wire::OpNode::Negate),
                 (2, gnitz_wire::OpNode::Union),
             ]),
-            vec![(0, 1, PORT_IN), (1, 2, PORT_IN_A), (0, 2, PORT_IN_B)],
+            vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (0, 2, SLOT_TRACE)],
             1,
         ),
         vec![("negate", false), ("union.a", false), ("union.b", true)],
@@ -883,7 +896,10 @@ fn an_elided_distinct_does_not_trip_the_destructive_fanout_guard() {
                 1,
                 gnitz_wire::OpNode::Reduce {
                     group_cols: vec![],
-                    agg: vec![(gnitz_wire::AggFunc::Count, 0)],
+                    agg: vec![gnitz_wire::AggDescriptor {
+                        agg_op: gnitz_wire::AggFunc::Count,
+                        col_idx: 0,
+                    }],
                     global_ground: false,
                     out_key: ReduceOutKey::SyntheticFold,
                 },
@@ -891,7 +907,7 @@ fn an_elided_distinct_does_not_trip_the_destructive_fanout_guard() {
             (2, gnitz_wire::OpNode::Distinct),
             (3, gnitz_wire::OpNode::Negate),
         ]),
-        vec![(0, 1, PORT_IN), (1, 2, PORT_IN), (1, 3, PORT_IN)],
+        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (1, 3, SLOT_IN)],
     );
     assert!(
         loaded.skip_nodes.contains(&2),

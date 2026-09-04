@@ -11,7 +11,7 @@ use crate::storage::{
 };
 use gnitz_wire::MAX_WORKERS;
 
-use super::router::{RouteMode, ScatterKey};
+use super::router::{ScatterKey, ScatterSpec};
 
 // Thread-local pool: reuse the per-worker (source, row, weight) scratch across calls.
 thread_local! {
@@ -66,18 +66,16 @@ fn worker_rows_to_batches(
         .collect()
 }
 
-pub fn op_repartition_batches_mode(
+pub fn op_repartition_batches(
     sources: &[Option<&Batch>],
-    col_indices: &[u32],
-    target_tcs: &[u8],
+    spec: ScatterSpec<'_>,
     schema: &SchemaDescriptor,
     num_workers: usize,
-    mode: RouteMode,
 ) -> Vec<Batch> {
     gnitz_debug!(
-        "op_repartition_batches_mode: sources={} mode={:?}",
+        "op_repartition_batches: sources={} spec={:?}",
         sources.iter().filter(|s| matches!(s, Some(sb) if sb.count > 0)).count(),
-        mode,
+        spec,
     );
     let mem_batches: Vec<Option<MemBatch>> = sources
         .iter()
@@ -95,9 +93,9 @@ pub fn op_repartition_batches_mode(
 
         // One `ScatterKey` per scatter, built out of the row loop: native PK
         // bytes when the key is exactly the PK (so the owner matches the one the
-        // write path routes to), a packed `_join_pk` for a `JoinPromote` key, the
-        // group fold for a `GroupKey` key.
-        let mut scatter_key = ScatterKey::new(mode, col_indices, target_tcs, schema, num_workers);
+        // write path routes to), a packed `_join_pk` for a `JoinKey`, the group
+        // fold for a `GroupKey`.
+        let mut scatter_key = ScatterKey::new(spec, schema, num_workers);
         let is_pk_routing = scatter_key.is_pk_routed();
         for (si, mb_opt) in mem_batches.iter().enumerate() {
             let mb = match mb_opt {
@@ -226,12 +224,10 @@ fn relay_walk_inner<'a, Route>(
 /// No post-sort needed. Caller holds `WORKER_ROWS` borrow_mut.
 fn relay_scatter_merge_walk(
     mem_batches: &[Option<MemBatch<'_>>],
-    col_indices: &[u32],
-    target_tcs: &[u8],
+    spec: ScatterSpec<'_>,
     schema: &SchemaDescriptor,
     num_workers: usize,
     worker_rows: &mut Vec<Vec<(u32, u32, i64)>>,
-    mode: RouteMode,
 ) {
     assert!(
         mem_batches.len() <= MAX_WORKERS,
@@ -262,9 +258,9 @@ fn relay_scatter_merge_walk(
     // One `ScatterKey` picked once (never per row): native PK bytes when the key
     // is exactly the PK (byte-identical to the old narrow `worker_for_key(get_pk)`
     // route — both reduce to `mix(widen_pk_be(bytes))`), a packed `_join_pk` for
-    // JoinPromote, the group fold for GroupKey. The `&mut scatter_key` capture
-    // (the packer's inline scratch) is why `relay_walk_inner` takes `FnMut`.
-    let mut scatter_key = ScatterKey::new(mode, col_indices, target_tcs, schema, num_workers);
+    // a `JoinKey`, the group fold for a `GroupKey`. The `&mut scatter_key`
+    // capture (the packer's inline scratch) is why `relay_walk_inner` takes `FnMut`.
+    let mut scatter_key = ScatterKey::new(spec, schema, num_workers);
     relay_walk_inner(
         mem_batches,
         worker_rows,
@@ -276,13 +272,11 @@ fn relay_scatter_merge_walk(
     );
 }
 
-pub fn op_relay_scatter_consolidated_mode(
+pub fn op_relay_scatter_consolidated(
     sources: &[Option<&Batch>],
-    col_indices: &[u32],
-    target_tcs: &[u8],
+    spec: ScatterSpec<'_>,
     schema: &SchemaDescriptor,
     num_workers: usize,
-    mode: RouteMode,
 ) -> Vec<Batch> {
     // The dispatch gate selected these on `is_consolidated()`; debug-verify each
     // source's data here before the merge-walk fast-paths on it.
@@ -315,15 +309,7 @@ pub fn op_relay_scatter_consolidated_mode(
 
     WORKER_ROWS.with(|pool| {
         let mut worker_rows = pool.borrow_mut();
-        relay_scatter_merge_walk(
-            &mem_batches,
-            col_indices,
-            target_tcs,
-            schema,
-            num_workers,
-            &mut worker_rows,
-            mode,
-        );
+        relay_scatter_merge_walk(&mem_batches, spec, schema, num_workers, &mut worker_rows);
 
         let mut out = worker_rows_to_batches(schema, &mem_batches, &worker_rows[..num_workers], total_blob);
         // One contributing source ⇒ each worker's PK-routed slice is an
@@ -348,9 +334,9 @@ pub fn op_relay_scatter_consolidated_mode(
 /// (`RelayDest::Broadcast`), so no per-worker clone is materialized. The
 /// range and cross probes need the whole delta on every worker — a match can
 /// live on any worker's trace — which the equality scatter (one destination per
-/// row) cannot deliver. Sibling of `op_repartition_batches_mode` /
-/// `op_relay_scatter_consolidated_mode`, but without `col_indices` / `RouteMode`
-/// (broadcast routes nothing).
+/// row) cannot deliver. Sibling of `op_repartition_batches` /
+/// `op_relay_scatter_consolidated`, but without a `ScatterSpec` (broadcast
+/// routes nothing).
 pub fn op_relay_broadcast(sources: &[Option<&Batch>], schema: &SchemaDescriptor) -> Batch {
     let total: usize = sources.iter().flatten().map(|b| b.count).sum();
     if total == 0 {

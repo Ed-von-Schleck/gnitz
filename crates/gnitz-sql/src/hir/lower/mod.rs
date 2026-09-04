@@ -104,7 +104,7 @@ pub(crate) fn resolve_reduce_specs(
 ///
 /// Slots with no logical identity — a synthetic key, the cardinality COUNT —
 /// stay [`ColId::NONE`], which nothing can reference. `group_slots` is the
-/// caller's because the key region differs by sink (`group_col_reduce_pos` over
+/// caller's because the key region differs by sink (the reduce output layout over
 /// the circuit's chosen out-key; the fold's is always SyntheticFold).
 pub(crate) fn reduce_out_layout(
     width: usize,

@@ -2,9 +2,9 @@
 
 use super::*;
 use crate::test_support::{make_batch_u128, make_schema_u128_i64, opk_pk, scratch_table, zset_of};
-use gnitz_store::ops::AggDescriptor;
 use gnitz_store::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder, Layout, StorageError};
+use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
 
 // ── Test helpers ─────────────────────────────────────────────────────────

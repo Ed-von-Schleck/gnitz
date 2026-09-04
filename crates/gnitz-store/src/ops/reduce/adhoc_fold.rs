@@ -27,7 +27,8 @@ use rustc_hash::FxHashMap;
 
 use gnitz_wire::AggReadSpec;
 
-use super::agg::{Accumulator, AggDescriptor};
+use super::agg::Accumulator;
+
 use super::emit::emit_reduce_row;
 use super::plan::ReducePlan;
 use super::sort::compare_by_group_cols;
@@ -69,7 +70,7 @@ impl AdhocFold {
     /// reply schema are a trust boundary: the column indices are range-checked
     /// here, the aggregate types and output width by `ReducePlan::new`, and the
     /// reply schema against the plan's own layout. (Aggregate-op validity is
-    /// already decode-enforced — `AggReadItem.op` is typed.)
+    /// already decode-enforced — `AggDescriptor.agg_op` is typed.)
     pub(crate) fn new(
         src_schema: &SchemaDescriptor,
         reply_schema: &SchemaDescriptor,
@@ -78,29 +79,24 @@ impl AdhocFold {
     ) -> Result<Self, StoreError> {
         let n_cols = src_schema.num_columns();
 
-        let mut group_cols = Vec::with_capacity(agg.group_cols.len());
+        // `ReadSpec`'s decoder carries no schema, so this is the only place a
+        // client-supplied column index meets a column count — and downstream
+        // `build_reduce_output_schema` indexes a fixed array, reading a zeroed
+        // slot rather than panicking.
         for &c in &agg.group_cols {
-            let c = c as usize;
-            if c >= n_cols {
+            if c as usize >= n_cols {
                 return Err(StoreError::rejected(format!(
                     "scan_spec fold: group column {c} out of range ({n_cols} cols)"
                 )));
             }
-            group_cols.push(c as u32);
         }
-
-        let mut agg_descs = Vec::with_capacity(agg.aggs.len());
-        for item in &agg.aggs {
-            let c = item.src_col as usize;
-            if c >= n_cols {
+        for d in &agg.aggs {
+            if d.col_idx as usize >= n_cols {
                 return Err(StoreError::rejected(format!(
-                    "scan_spec fold: agg column {c} out of range ({n_cols} cols)"
+                    "scan_spec fold: agg column {} out of range ({n_cols} cols)",
+                    d.col_idx
                 )));
             }
-            agg_descs.push(AggDescriptor {
-                col_idx: c as u32,
-                agg_op: item.op,
-            });
         }
 
         // The ad-hoc partial layout is ALWAYS synthetic-fold: `_agg_pk` U128 PK,
@@ -111,8 +107,8 @@ impl AdhocFold {
         // frame is malformed.
         let plan = ReducePlan::new(
             src_schema,
-            &group_cols,
-            &agg_descs,
+            &agg.group_cols,
+            &agg.aggs,
             ReduceOutKey::SyntheticFold,
             false, // global_ground — the client synthesizes the empty-input ground row
             false, // i_am_owner

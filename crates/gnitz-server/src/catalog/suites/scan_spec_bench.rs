@@ -27,7 +27,7 @@ use std::time::Instant;
 use super::*;
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::Batch;
-use gnitz_wire::{AggFunc, AggReadItem, AggReadSpec, OrderKey, ReadBound, ReadSink, ReadSpec, AGG_COUNT, AGG_SUM};
+use gnitz_wire::{AggDescriptor, AggFunc, AggReadSpec, OrderKey, ReadBound, ReadSink, ReadSpec};
 
 /// Sorted runs the cursor must merge (one ingest round each).
 const INGEST_ROUNDS: u64 = 8;
@@ -162,13 +162,13 @@ fn scan_spec_sinks_bench() {
     let agg = AggReadSpec::direct(
         vec![1],
         vec![
-            AggReadItem {
-                op: AggFunc::from_wire(AGG_COUNT).unwrap(),
-                src_col: 0,
+            AggDescriptor {
+                agg_op: AggFunc::Count,
+                col_idx: 0,
             },
-            AggReadItem {
-                op: AggFunc::from_wire(AGG_SUM).unwrap(),
-                src_col: 3,
+            AggDescriptor {
+                agg_op: AggFunc::Sum,
+                col_idx: 3,
             },
         ],
     );

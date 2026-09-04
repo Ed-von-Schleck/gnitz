@@ -11,37 +11,14 @@ use gnitz_wire::{Cut, PkColList, RangeDescriptor, ScanBound};
 const NBASE: u64 = 200;
 
 /// `ScanDelta(base, bound?) → Integrate` for `vid`: the shared identity-circuit
-/// writer plus, for a bound, the descriptor blob on the scan node and its
-/// `NODE_COL_KIND_SCAN_BOUND` col rows — the same wire channel the planner ships.
+/// writer over the scan node's `params` blob, built by the same encoder the
+/// planner ships through.
 fn write_bounded_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, bound: Option<ScanBound>) {
-    write_identity_circuit(
-        engine,
-        vid,
-        base_tid,
-        bound.as_ref().map(|b| b.desc.encode()).as_deref(),
-    );
-
-    if let Some(b) = &bound {
-        let mut bb = BatchBuilder::new(SysFamily::CircuitNodeColumns.schema());
-        for (i, &c) in b.idx_cols.as_slice().iter().enumerate() {
-            gnitz_wire::sys_rows::write_circuit_node_column_row(
-                &mut bb,
-                &gnitz_wire::sys_rows::CircuitNodeColumnRow {
-                    view_id: vid as u64,
-                    node_id: 0,
-                    kind: gnitz_wire::NODE_COL_KIND_SCAN_BOUND,
-                    position: i as u64, // the list's order
-                    value1: c as u64,   // the column index
-                    value2: 0,
-                },
-                1,
-            )
-            .unwrap();
-        }
-        engine
-            .ingest_to_family(CIRCUIT_NODE_COLUMNS_TAB_ID, &bb.finish())
-            .unwrap();
-    }
+    let (_, _, params) = gnitz_wire::encode_op_node(gnitz_wire::OpNode::ScanDelta {
+        source: base_tid as u64,
+        bound,
+    });
+    write_identity_circuit(engine, vid, base_tid, params.as_deref());
 }
 
 /// A `(id U64 PK | val I64)` base of `NBASE` rows with `val = val_of(id)`,

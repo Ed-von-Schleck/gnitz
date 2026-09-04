@@ -1,5 +1,5 @@
-//! Exchange worker routing: `RouteMode`, `ScatterKey`,
-//! and the per-row routing-key helpers.
+//! Exchange worker routing: `ScatterSpec`, `ScatterKey`, and the per-row
+//! routing-key helpers.
 
 use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, MemBatch};
@@ -15,7 +15,7 @@ use crate::schema::key::ReindexPacker;
 /// into the trace, this drops the rows whose `worker_for_pk_bytes` owner is not
 /// `worker_id`. (A band join scatters by the eq prefix instead — its trace is
 /// already eq-prefix-partitioned and carries no `WorkerFilter`.) It is the SAME
-/// hash the equality scatter (`RouteMode::JoinPromote`)
+/// hash the equality scatter (`ScatterSpec::JoinKey`)
 /// applies to the SAME packed PK bytes, so the integrated trace is partitioned
 /// identically to a scattered equi-join trace — no trace replicates, no match
 /// duplicates. Worker identity is a compile-time constant baked into the emitted
@@ -42,13 +42,17 @@ pub fn op_worker_filter(batch: &Batch, schema: &SchemaDescriptor, worker_id: u32
     batch.ascending_subset(&indices, schema)
 }
 
-/// Which routing key a non-PK scatter uses; picks between `ScatterKind::Packed`
-/// and `ScatterKind::Fold` (whose docs carry the two contracts). The two keys
-/// diverge for nullable and string columns, so the scatter caller picks.
+/// Which routing key a scatter uses, and the columns it reads. The two keys
+/// diverge for nullable and string columns, so the circuit states which it means
+/// rather than the scatter guessing — see `ScatterKind::Packed` / `::Fold` for
+/// the two contracts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RouteMode {
-    GroupKey,
-    JoinPromote,
+pub enum ScatterSpec<'a> {
+    /// GROUP BY / set-op: the null-distinct group fold over these columns.
+    GroupKey(&'a [u32]),
+    /// Equi-join: the packed `_join_pk`, one slot per `(source column, promoted
+    /// key type code)` — `0` derives the slot type from the source column.
+    JoinKey(&'a [(u32, u8)]),
 }
 
 /// Per-scatter row router, built once (out of the row loop — a packer's
@@ -59,14 +63,14 @@ pub enum RouteMode {
 ///   [`ScatterKey::new`]) — route by the row's native OPK bytes. Deliberately
 ///   not the write-path fan-out's rule, which routes by the distribution prefix
 ///   — a different hash domain with no promotion concept.
-/// - `Packed`: a `JoinPromote` scatter packs the SAME OPK bytes the downstream
+/// - `Packed`: a `JoinKey` scatter packs the SAME OPK bytes the downstream
 ///   reindex Map stamps as the `_join_pk`, so the delta scatter and the
 ///   reindexed trace co-partition byte-for-byte. It is null-blind and
 ///   value-preserving by design — a LEFT-join NULL-key bypass row reads its
 ///   canonically-zeroed key slot and routes to the `_join_pk 0` owner, the
 ///   same place the reindex Map stamps it. (Float columns, the only type whose
 ///   OPK image would diverge from the routing hash, cannot be join keys — they
-///   are rejected at plan time — so packing every `JoinPromote` key is exact.)
+///   are rejected at plan time — so packing every `JoinKey` is exact.)
 ///   `buf` is the pack scratch; `pack_into` fully overwrites the `out_stride`
 ///   prefix it reads, so no inter-row clear is needed.
 /// - `Fold`: a `GroupKey` (GROUP BY / set-op) scatter routes by the
@@ -101,33 +105,30 @@ pub(super) struct ScatterKey {
 
 impl ScatterKey {
     #[inline]
-    pub(crate) fn new(
-        mode: RouteMode,
-        cols: &[u32],
-        tcs: &[u8],
-        schema: &SchemaDescriptor,
-        num_workers: usize,
-    ) -> Self {
+    pub(crate) fn new(spec: ScatterSpec<'_>, schema: &SchemaDescriptor, num_workers: usize) -> Self {
         // Sequence equality, not set equality: `worker_for_pk_bytes` hashes OPK
         // bytes in schema order, so a permuted compound PK routes differently.
         // And `tc == 0` throughout: a promoted key packs at the wider `T`, so its
         // narrow source PK bytes must not route natively.
-        let kind = if cols == schema.pk_indices() && tcs.iter().all(|&tc| tc == 0) {
-            ScatterKind::PkBytes
-        } else {
-            match mode {
-                // `.expect`, not `?`: the scatter path has no compile-time
-                // guard, so an invalid key must fail loudly rather than route
-                // rows to the wrong worker.
-                RouteMode::JoinPromote => ScatterKind::Packed {
-                    packer: ReindexPacker::new(schema, cols, tcs)
-                        .expect("ScatterKey: reindex key columns invalid for this schema"),
-                    buf: [0u8; crate::schema::MAX_PK_BYTES],
-                },
-                RouteMode::GroupKey => ScatterKind::Fold {
-                    keys: GroupKeyCols::new(schema, cols),
-                },
+        let pk = schema.pk_indices();
+        let kind = match spec {
+            ScatterSpec::GroupKey(cols) if cols == pk => ScatterKind::PkBytes,
+            ScatterSpec::GroupKey(cols) => ScatterKind::Fold {
+                keys: GroupKeyCols::new(schema, cols),
+            },
+            ScatterSpec::JoinKey(slots)
+                if slots.len() == pk.len() && slots.iter().zip(pk).all(|(&(c, tc), &p)| c == p && tc == 0) =>
+            {
+                ScatterKind::PkBytes
             }
+            // `.expect`, not `?`: the scatter path has no compile-time guard, so
+            // an invalid key must fail loudly rather than route rows to the wrong
+            // worker.
+            ScatterSpec::JoinKey(slots) => ScatterKind::Packed {
+                packer: ReindexPacker::new(schema, slots)
+                    .expect("ScatterKey: reindex key columns invalid for this schema"),
+                buf: [0u8; crate::schema::MAX_PK_BYTES],
+            },
         };
         ScatterKey { kind, num_workers }
     }

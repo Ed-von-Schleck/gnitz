@@ -468,6 +468,19 @@ impl MasterDispatcher {
         };
         let sources: Vec<Option<&Batch>> = payloads[..n_src].iter().map(|o| o.as_ref()).collect();
 
+        // Every contributing source must be consolidated to take the merge-walk
+        // scatter; a single non-consolidated one falls back to the re-sorting
+        // repartition. The scatter (`op_relay_scatter_consolidated`) debug-verifies
+        // each.
+        let num_workers = self.num_workers();
+        let scatter = |spec: ScatterSpec<'_>| {
+            RelayDest::PerWorker(if sources.iter().flatten().all(|b| b.is_consolidated()) {
+                op_relay_scatter_consolidated(&sources, spec, &schema, num_workers)
+            } else {
+                op_repartition_batches(&sources, spec, &schema, num_workers)
+            })
+        };
+
         let (dag, registry) = cat.dag_and_registry_mut();
         let meta = dag.view_meta(registry, view_id);
         let dest = match meta.relay_route(source_id) {
@@ -478,17 +491,8 @@ impl MasterDispatcher {
                 ))
             }
             RelayRoute::Broadcast => RelayDest::Broadcast(Box::new(op_relay_broadcast(&sources, &schema))),
-            RelayRoute::Scatter { cols, target_tcs, mode } => {
-                // Every contributing source must be consolidated to take the
-                // merge-walk scatter; a single non-consolidated source falls back to
-                // the re-sorting repartition. The scatter
-                // (`op_relay_scatter_consolidated_mode`) debug-verifies each.
-                RelayDest::PerWorker(if sources.iter().flatten().all(|b| b.is_consolidated()) {
-                    op_relay_scatter_consolidated_mode(&sources, cols, target_tcs, &schema, self.num_workers(), *mode)
-                } else {
-                    op_repartition_batches_mode(&sources, cols, target_tcs, &schema, self.num_workers(), *mode)
-                })
-            }
+            RelayRoute::GroupKey(cols) => scatter(ScatterSpec::GroupKey(cols)),
+            RelayRoute::JoinKey(slots) => scatter(ScatterSpec::JoinKey(slots)),
         };
 
         // Encoded once and carried forward: `emit_relay_with_decision` runs the

@@ -282,7 +282,7 @@ impl TrimMode {
 /// Spelled out because a reader hexdumping a blob will not find "EXPR".
 const EXPR_BLOB_MAGIC: u32 = 0x5258_5045;
 /// Current wire-format version for expr blobs.
-const EXPR_BLOB_VERSION: u8 = 2;
+pub(crate) const EXPR_BLOB_VERSION: u8 = 2;
 /// Fixed header width, in bytes.
 const EXPR_BLOB_HEADER_SIZE: usize = 16;
 

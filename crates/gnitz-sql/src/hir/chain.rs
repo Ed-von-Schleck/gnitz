@@ -55,14 +55,14 @@ pub(crate) fn debug_assert_exchange_topology(circuit: &Circuit) {
         .nodes
         .values()
         .any(|op| matches!(op, gnitz_core::OpNode::Join(_)));
-    // A node's consumers (the nodes it feeds). `edges` maps (consumer, port) →
-    // producer, so a consumer of `src` is any key whose value is `src`.
+    // A node's consumers (the nodes it feeds). `inputs` maps a consumer to its
+    // producer per slot, so a consumer of `src` is any node holding `src`.
     let feeds = |src: gnitz_core::NodeId| -> Vec<&gnitz_core::OpNode> {
         circuit
-            .edges
+            .inputs
             .iter()
-            .filter(|(_, producer)| **producer == src)
-            .filter_map(|((consumer, _port), _)| circuit.nodes.get(consumer))
+            .filter(|(_, slots)| slots.contains(&Some(src)))
+            .filter_map(|(consumer, _)| circuit.nodes.get(consumer))
             .collect()
     };
     // Every node reachable downstream of `src`. Transitive, so an intervening
@@ -70,8 +70,8 @@ pub(crate) fn debug_assert_exchange_topology(circuit: &Circuit) {
     let reaches = |src: gnitz_core::NodeId| -> Vec<gnitz_core::NodeId> {
         let (mut seen, mut stack) = (Vec::new(), vec![src]);
         while let Some(n) = stack.pop() {
-            for ((consumer, _), producer) in &circuit.edges {
-                if *producer == n && !seen.contains(consumer) {
+            for (consumer, slots) in &circuit.inputs {
+                if slots.contains(&Some(n)) && !seen.contains(consumer) {
                     seen.push(*consumer);
                     stack.push(*consumer);
                 }

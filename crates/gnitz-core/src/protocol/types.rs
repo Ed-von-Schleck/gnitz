@@ -1220,8 +1220,8 @@ impl<'a> BatchAppender<'a> {
     }
 
     /// Map the payload cursor to the actual schema column index, skipping every
-    /// PK column. Supports compound PKs (e.g. the catalog circuit tables whose
-    /// PK is (view_id, sub)): payload value N targets the N-th non-PK column.
+    /// PK column. Supports compound PKs (e.g. the catalog circuit table, keyed
+    /// `(view_id, node_id)`): payload value N targets the N-th non-PK column.
     fn col_index(&self) -> usize {
         // Hard assert (not debug-only): a misbehaving caller gets a clear panic
         // here instead of an OOB index panicking at the `columns[ci]` call site.

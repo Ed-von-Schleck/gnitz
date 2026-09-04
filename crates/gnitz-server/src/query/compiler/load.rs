@@ -1,12 +1,11 @@
-//! Circuit loading: read the system tables into a `LoadedCircuit`, topo-sort it,
+//! Circuit loading: read the `CircuitNodes` rows into a `LoadedCircuit`, topo-sort it,
 //! and the scan/reindex/range-key circuit queries the DAG consults at runtime.
 
 use super::*;
 use gnitz_store::storage::{payload_bytes, payload_is_null, payload_u64};
 use gnitz_wire::{
-    CIRCEDGES_PAY_DST_NODE, CIRCEDGES_PAY_DST_PORT, CIRCEDGES_PAY_SRC_NODE, CIRCNCOL_PAY_KIND, CIRCNCOL_PAY_NODE_ID,
-    CIRCNCOL_PAY_POSITION, CIRCNCOL_PAY_VALUE1, CIRCNCOL_PAY_VALUE2, CIRCNODES_PAY_EXPR_PROGRAM, CIRCNODES_PAY_NODE_ID,
-    CIRCNODES_PAY_OPCODE, CIRCNODES_PAY_SOURCE_TABLE,
+    CIRCNODES_PAY_INPUT_0, CIRCNODES_PAY_INPUT_1, CIRCNODES_PAY_OPCODE, CIRCNODES_PAY_PARAMS,
+    CIRCNODES_PAY_SOURCE_TABLE,
 };
 
 // ---------------------------------------------------------------------------
@@ -24,7 +23,7 @@ pub(in crate::query) fn for_each_scan_edge(host: &dyn SchemaSource, mut f: impl 
     // row-0 cursor, so there is no prefix to seek to.
     cur.for_each_positive(|ch| {
         let (src, row) = ch.current_row_source();
-        if payload_u64(src, row, CIRCNODES_PAY_OPCODE) != gnitz_wire::OPCODE_SCAN_DELTA
+        if payload_u64(src, row, CIRCNODES_PAY_OPCODE) != gnitz_wire::Opcode::ScanDelta.as_wire()
             || payload_is_null(src, row, CIRCNODES_PAY_SOURCE_TABLE)
         {
             return;
@@ -52,86 +51,66 @@ fn node_id_i32(v: i64) -> Option<i32> {
     }
 }
 
-/// Read the three circuit system tables (filtered by the `view_id` OPK prefix)
-/// into a `LoadedCircuit`: the per-node column gather, the `decode_op_node`
-/// calls and the node-id `i32` reject. The edge set is then `topo_sorted`'s to
-/// validate.
+/// Read the `CircuitNodes` rows of one view (filtered by the `view_id` OPK
+/// prefix) into a `LoadedCircuit`: the `decode_op_node` calls, the node-id `i32`
+/// reject, and the per-node input slots. Holding those slots to each operator's
+/// arity is then `topo_sorted`'s.
 pub(super) fn load_circuit(host: &dyn SchemaSource, view_id: u64) -> Result<LoadedCircuit, CompileError> {
-    let unopened = || CompileError::Rejected("circuit system tables are not open");
-    let open = |tid: u64| host.open_sys_cursor(tid as i64).ok_or_else(unopened);
-    let mut nodes_cur = open(gnitz_wire::CIRCUIT_NODES_TAB)?;
-    let mut edges_cur = open(gnitz_wire::CIRCUIT_EDGES_TAB)?;
-    let mut node_cols_cur = open(gnitz_wire::CIRCUIT_NODE_COLUMNS_TAB)?;
+    let mut nodes_cur = host
+        .open_sys_cursor(gnitz_wire::CIRCUIT_NODES_TAB as i64)
+        .ok_or(CompileError::Rejected("the circuit system table is not open"))?;
     let mut nodes: HashMap<i32, gnitz_wire::OpNode> = HashMap::new();
-    let mut edges: Vec<(i32, i32, i32)> = Vec::new();
+    let mut inputs: HashMap<i32, [Option<i32>; 2]> = HashMap::new();
 
-    // The circuit tables share a compound `(view_id, sub)` PK; the OPK image of
+    // The circuit table has a compound `(view_id, node_id)` PK; the OPK image of
     // the leading unsigned view_id column is its big-endian bytes.
     let prefix = view_id.to_be_bytes();
     // The first malformed row's reason, naming which check fired. Every shape
-    // here aborts the WHOLE load — silently skipping a row leaves edges dangling,
-    // yielding an invalid topological order or silent output corruption.
+    // here aborts the WHOLE load — silently skipping a row leaves an input
+    // dangling, yielding an invalid topological order or silent output corruption.
     let mut invalid: Option<&'static str> = None;
 
-    // Phase 1: read CircuitNodeColumns, gathered per node. `decode_op_node`
-    // orders them by `position` within a kind.
-    let mut cols_by_node: HashMap<i32, Vec<gnitz_wire::CircuitNodeColumn>> = HashMap::new();
-    node_cols_cur.for_each_positive_with_prefix(&prefix, |ch| {
-        let (src, row) = ch.current_row_source();
-        match node_id_i32(payload_u64(src, row, CIRCNCOL_PAY_NODE_ID) as i64) {
-            Some(nid) => cols_by_node
-                .entry(nid)
-                .or_default()
-                .push(gnitz_wire::CircuitNodeColumn {
-                    kind: payload_u64(src, row, CIRCNCOL_PAY_KIND),
-                    position: payload_u64(src, row, CIRCNCOL_PAY_POSITION) as u16,
-                    value1: payload_u64(src, row, CIRCNCOL_PAY_VALUE1),
-                    value2: payload_u64(src, row, CIRCNCOL_PAY_VALUE2),
-                }),
-            None => drop(invalid.get_or_insert("circuit node id out of range")),
-        }
-    });
-    // Phase 2: read CircuitNodes; call decode_op_node for each.
     nodes_cur.for_each_positive_with_prefix(&prefix, |ch| {
         let (src, row) = ch.current_row_source();
-        let Some(node_id) = node_id_i32(payload_u64(src, row, CIRCNODES_PAY_NODE_ID) as i64) else {
+        // Compound PK `(view_id, node_id)`: node_id is the trailing big-endian
+        // 8 bytes of the 16-byte PK region.
+        let node_id_raw = u64::from_be_bytes(ch.current_pk_bytes()[8..16].try_into().unwrap()) as i64;
+        let Some(node_id) = node_id_i32(node_id_raw) else {
             invalid.get_or_insert("circuit node id out of range");
             return;
         };
         let opcode = payload_u64(src, row, CIRCNODES_PAY_OPCODE);
 
-        let src_tab: Option<u64> = (!payload_is_null(src, row, CIRCNODES_PAY_SOURCE_TABLE))
-            .then(|| payload_u64(src, row, CIRCNODES_PAY_SOURCE_TABLE));
+        let nullable_u64 = |pay: usize| (!payload_is_null(src, row, pay)).then(|| payload_u64(src, row, pay));
+        let src_tab = nullable_u64(CIRCNODES_PAY_SOURCE_TABLE);
         // `None` is a NULL cell only. An empty cell is a damaged blob, and each
-        // opcode already judges one: Filter rejects, a ScanDelta bound degrades.
-        let expr_blob: Option<Vec<u8>> = (!payload_is_null(src, row, CIRCNODES_PAY_EXPR_PROGRAM))
-            .then(|| payload_bytes(src, row, CIRCNODES_PAY_EXPR_PROGRAM).to_vec());
+        // opcode already judges one: every layout rejects it, and a ScanDelta
+        // bound degrades to `None`.
+        let params: Option<&[u8]> =
+            (!payload_is_null(src, row, CIRCNODES_PAY_PARAMS)).then(|| payload_bytes(src, row, CIRCNODES_PAY_PARAMS));
 
-        let cols = cols_by_node.get(&node_id).map(|v| v.as_slice()).unwrap_or(&[]);
-        match gnitz_wire::decode_op_node(opcode, src_tab, expr_blob, cols) {
+        let mut slots = [None; 2];
+        for (slot, pay) in slots.iter_mut().zip([CIRCNODES_PAY_INPUT_0, CIRCNODES_PAY_INPUT_1]) {
+            let Some(raw) = nullable_u64(pay) else { continue };
+            match node_id_i32(raw as i64) {
+                Some(producer) => *slot = Some(producer),
+                None => drop(invalid.get_or_insert("circuit node id out of range")),
+            }
+        }
+
+        match gnitz_wire::decode_op_node(opcode, src_tab, params) {
             Ok(op) => {
                 nodes.insert(node_id, op);
+                inputs.insert(node_id, slots);
             }
             Err(_) => drop(invalid.get_or_insert("circuit node failed to decode")),
-        }
-    });
-
-    // Phase 3: read CircuitEdges. A truncating endpoint id aborts the load.
-    edges_cur.for_each_positive_with_prefix(&prefix, |ch| {
-        let (row_src, row) = ch.current_row_source();
-        match (
-            node_id_i32(payload_u64(row_src, row, CIRCEDGES_PAY_SRC_NODE) as i64),
-            node_id_i32(payload_u64(row_src, row, CIRCEDGES_PAY_DST_NODE) as i64),
-        ) {
-            (Some(src), Some(dst)) => edges.push((src, dst, payload_u64(row_src, row, CIRCEDGES_PAY_DST_PORT) as i32)),
-            _ => drop(invalid.get_or_insert("circuit edge endpoint id out of range")),
         }
     });
     if let Some(reason) = invalid {
         return Err(CompileError::Rejected(reason));
     }
 
-    topo_sorted(nodes, edges)
+    topo_sorted(nodes, inputs)
 }
 
 // ---------------------------------------------------------------------------
@@ -143,54 +122,43 @@ pub(super) fn load_circuit(host: &dyn SchemaSource, view_id: u64) -> Result<Load
 /// they are populated.
 pub(super) fn topo_sorted(
     nodes: HashMap<i32, gnitz_wire::OpNode>,
-    edges: Vec<(i32, i32, i32)>,
+    by_slot: HashMap<i32, [Option<i32>; 2]>,
 ) -> Result<LoadedCircuit, CompileError> {
-    let malformed = || CompileError::Rejected("node's input edges do not match its operator's ports");
-    let mut outgoing: HashMap<i32, Vec<(i32, i32)>> = HashMap::new();
-    // Each node's producer per port, filled straight from the edge list. Ports
-    // are 0 and 1 (`PORT_IN == PORT_IN_A`, `PORT_TRACE == PORT_IN_B`), so a port
-    // beyond the set and a duplicate one are the same rejection.
-    let mut by_port: HashMap<i32, [Option<i32>; 2]> = HashMap::new();
+    let malformed = || CompileError::Rejected("node's inputs do not match its operator's arity");
+    let mut outgoing: HashMap<i32, Vec<i32>> = HashMap::new();
     for &nid in nodes.keys() {
         outgoing.entry(nid).or_default();
-        by_port.entry(nid).or_default();
     }
 
-    for &(src, dst, port) in &edges {
-        // A dangling endpoint — a node that failed to decode, a partial schema
-        // flush, a hand-built fixture — would strand its partner rather than fail,
-        // so it is rejected before it can become a phantom adjacency entry.
-        let (Some(outs), Some(ports)) = (outgoing.get_mut(&src), by_port.get_mut(&dst)) else {
-            return Err(CompileError::Rejected("edge endpoint is not a node of the circuit"));
-        };
-        match ports.get_mut(port as usize) {
-            Some(slot @ None) => *slot = Some(src),
-            _ => return Err(malformed()),
-        }
-        outs.push((dst, port));
-    }
-
-    // Hold every node's filled port slots to the set its operator declares, and
-    // keep them as [`NodeInputs`]. Rejecting a duplicate port, a missing one and
-    // an out-of-range one in one place is what lets the emit layer destructure an
-    // operand instead of asking whether it exists. The durable form already
-    // enforces uniqueness — the `CircuitEdges` PK is `(view_id, dst_node,
-    // dst_port)` — but a hand-built circuit does not, so the check lives here, in
-    // the only constructor.
-    let inputs: HashMap<i32, NodeInputs> = nodes
-        .iter()
-        .map(|(&nid, op)| {
-            // Matching the operator's arity against the filled slots IS the
-            // port-set equality: a missing port leaves its slot empty.
-            let resolved = match (op.ports(), by_port[&nid]) {
-                ([], [None, None]) => NodeInputs::Source,
-                ([_], [Some(src), None]) => NodeInputs::Unary(src),
-                ([_, _], [Some(a), Some(b)]) => NodeInputs::Binary { a, b },
-                _ => return Err(malformed()),
+    // Rejecting a missing, surplus or dangling operand here, in the only
+    // constructor, is what lets the emit layer destructure an operand instead of
+    // asking whether it exists. A duplicate or out-of-range port needs no reject:
+    // the slot index *is* the port.
+    let mut inputs: HashMap<i32, NodeInputs> = HashMap::with_capacity(nodes.len());
+    for (&nid, op) in &nodes {
+        let slots = by_slot.get(&nid).copied().unwrap_or([None; 2]);
+        for producer in slots.into_iter().flatten() {
+            let Some(outs) = outgoing.get_mut(&producer) else {
+                return Err(CompileError::Rejected("a node's input is not a node of the circuit"));
             };
-            Ok((nid, resolved))
-        })
-        .collect::<Result<_, _>>()?;
+            outs.push(nid);
+        }
+        // Matching the operator's arity against the filled slots IS the port-set
+        // equality: a missing port leaves its slot empty.
+        let resolved = match (op.arity(), slots) {
+            (0, [None, None]) => NodeInputs::Source,
+            (1, [Some(src), None]) => NodeInputs::Unary(src),
+            (2, [Some(a), Some(b)]) => NodeInputs::Binary { a, b },
+            _ => return Err(malformed()),
+        };
+        inputs.insert(nid, resolved);
+    }
+    // `nodes` is a HashMap, so the walk above fills each consumer list in the
+    // hasher's order, which differs between the master and each worker. Forward
+    // walks pick the first match they like, so the order must not.
+    for outs in outgoing.values_mut() {
+        outs.sort_unstable();
+    }
 
     let mut in_degree: HashMap<i32, i32> = inputs.iter().map(|(&nid, i)| (nid, i.iter().count() as i32)).collect();
 
@@ -203,7 +171,7 @@ pub(super) fn topo_sorted(
         ordered.push(nid);
         if let Some(outs) = outgoing.get(&nid) {
             let mut next_batch: Vec<i32> = Vec::new();
-            for &(dst, _) in outs {
+            for &dst in outs {
                 let deg = in_degree.get_mut(&dst).unwrap();
                 *deg -= 1;
                 if *deg == 0 {
@@ -261,7 +229,7 @@ fn compute_skip_nodes(
             gnitz_wire::OpNode::Map(mk) => {
                 let re_keys = matches!(
                     mk,
-                    gnitz_wire::MapKind::Reindex { .. } | gnitz_wire::MapKind::HashRow(..)
+                    gnitz_wire::MapKind::Reindex { .. } | gnitz_wire::MapKind::HashRow { .. }
                 );
                 if !re_keys && input_distinct(nid) {
                     distinct_at.insert(nid);
@@ -303,25 +271,15 @@ pub(super) fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec
         let Some(outs) = loaded.outgoing.get(&cur) else {
             continue;
         };
-        for &(dst, _port) in outs {
+        for &dst in outs {
             match loaded.op(dst) {
-                gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
-                    reindex_cols,
-                    reindex_target_tcs,
-                    role,
-                    ..
-                }) => {
+                gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex { key, role, .. }) => {
                     if *role != gnitz_wire::ReindexRole::ScatterKey {
                         saw_auxiliary = true;
                         continue;
                     }
-                    let seq: Vec<(u32, u8)> = reindex_cols
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &rc)| (rc, reindex_target_tcs.get(i).copied().unwrap_or(0)))
-                        .collect();
-                    if !seqs.contains(&seq) {
-                        seqs.push(seq);
+                    if !seqs.contains(key) {
+                        seqs.push(key.clone());
                     }
                 }
                 gnitz_wire::OpNode::Filter(_) => queue.push_back(dst),

@@ -1,5 +1,5 @@
 use super::*;
-use crate::query::compiler::{scan_delta, scatter_reindex, ExtTables, PORT_IN};
+use crate::query::compiler::{scan_delta, scatter_reindex, ExtTables, SLOT_IN};
 use gnitz_wire::OpNode;
 use std::collections::HashMap;
 
@@ -12,7 +12,7 @@ fn meta_scanning(src: i64) -> ViewMeta {
             (1, scatter_reindex(&[0])),
             (2, OpNode::IntegrateSink),
         ]),
-        vec![(0, 1, PORT_IN), (1, 2, PORT_IN)],
+        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
     );
     ViewMeta::derive(&loaded, &ExtTables::default()).expect("fixture routes")
 }

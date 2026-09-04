@@ -364,33 +364,33 @@ fn compile_fold_pre_map(
     agg: &AggReadSpec,
     src_schema: &SchemaDescriptor,
 ) -> Result<Option<(SchemaDescriptor, MapPlan)>, StoreError> {
-    if agg.pre_map.is_empty() {
+    let Some(pre) = &agg.pre else {
         return Ok(None);
-    }
+    };
     // Through `DerivedSchema`, the front door that *rejects* what
-    // `SchemaDescriptor::new` asserts on: `pre_payload`'s length is the client's,
-    // and an over-wide one has to be a malformed frame rather than an abort
-    // inside a `const fn`. `push_pk_of` is the same inherit-the-input's-key
-    // prologue every other derived schema uses.
+    // `SchemaDescriptor::new` asserts on: the declared column count is the
+    // client's, and an over-wide one has to be a malformed frame rather than an
+    // abort inside a `const fn`. `push_pk_of` is the same
+    // inherit-the-input's-key prologue every other derived schema uses.
     let mut out = DerivedSchema::new();
     let built = out.push_pk_of(src_schema).is_some()
-        && agg
-            .pre_payload
+        && pre
+            .out_cols
             .iter()
             .all(|&(tc, nullable)| out.push(SchemaColumn::new(tc, nullable as u8)).is_some());
     if !built {
         return Err(StoreError::rejected(format!(
             "scan_spec fold: a pre-map declaring {} payload columns over a {}-column key \
              is not a legal reduce input",
-            agg.pre_payload.len(),
+            pre.out_cols.len(),
             src_schema.pk_indices().len()
         )));
     }
     let out_schema = out.finish();
     // `compile_projection` requires the program to write every declared payload
-    // slot, so a program disagreeing with `pre_payload` is rejected here rather
-    // than folding over an unwritten column.
-    let plan = compile_projection(&agg.pre_map, src_schema, &out_schema)?;
+    // slot, so a program disagreeing with the declarations is rejected here
+    // rather than folding over an unwritten column.
+    let plan = compile_projection(&pre.program, src_schema, &out_schema)?;
     Ok(Some((out_schema, plan)))
 }
 

@@ -9,7 +9,7 @@
 use super::super::{ColId, EqPair, HirExpr, HirRange, HirRef, JoinClass, ProjEntry, RelExpr};
 use super::join::{
     band_pi_preserved, build_pure_range_threshold, emit_equi_join_terms, join_pk_coldefs, normalize_to_ab, pk_slots,
-    pure_range_unmatched, range_prologue, resolve_eq_cols, side_target_tcs, EquiKeys, EquiSide, RangePrologue,
+    pure_range_unmatched, range_prologue, resolve_eq_cols, side_reindex_key, EquiKeys, EquiSide, RangePrologue,
 };
 use super::prims::{keep_all, rekey_aux_on_source_pk};
 use super::{
@@ -214,22 +214,20 @@ impl ExistsCore<'_> {
             right: right_cols,
             tcs: target_tcs,
         } = resolve_eq_cols(eq, left_in, right_in)?;
-        let left_target_tcs = side_target_tcs(&left_cols, &left_in.schema.columns, &target_tcs);
-        let right_target_tcs = side_target_tcs(&right_cols, &right_in.schema.columns, &target_tcs);
+        let left_key = side_reindex_key(&left_cols, &left_in.schema.columns, &target_tcs);
+        let right_key = side_reindex_key(&right_cols, &right_in.schema.columns, &target_tcs);
         let keep_a = keep_all(a_n);
         let keep_b = keep_all(b_n);
 
         let side_a = EquiSide {
             input: a_local,
-            cols: &left_cols,
-            target_tcs: &left_target_tcs,
+            key: &left_key,
             coldefs: &left_in.schema.columns,
             keep: &keep_a,
         };
         let side_b = EquiSide {
             input: b_local,
-            cols: &right_cols,
-            target_tcs: &right_target_tcs,
+            key: &right_key,
             coldefs: &right_in.schema.columns,
             keep: &keep_b,
         };

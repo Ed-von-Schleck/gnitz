@@ -7,8 +7,9 @@
 use crate::schema::{type_code, ColumnLocator, DerivedSchema, ReduceOutKey, SchemaColumn, SchemaDescriptor};
 
 use super::super::group_key::GroupKeyCols;
-use super::agg::{Accumulator, AggDescriptor};
+use super::agg::Accumulator;
 use super::avi::AviBake;
+use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
 
 /// Build the reduce output schema by **obeying** the planner's shipped

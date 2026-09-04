@@ -214,6 +214,18 @@ impl RangeDescriptor {
     }
 }
 
+/// Read an embedded `RangeDescriptor` out of a larger blob: peek its `n_eq` to
+/// learn its span, slice exactly that many bytes, and defer full validation to
+/// [`RangeDescriptor::decode`]. (`n_eq` is one byte, so `encoded_len` cannot
+/// overflow; a pathological value exceeds `remaining` and `take` rejects it, and
+/// a valid one is re-validated — arity, flags, exact length — by the descriptor
+/// decoder.)
+pub(crate) fn read_range_descriptor(r: &mut Reader) -> Result<RangeDescriptor, String> {
+    let n_eq = r.peek_u8()? as usize;
+    let bytes = r.take(RangeDescriptor::encoded_len(n_eq))?;
+    RangeDescriptor::decode(bytes)
+}
+
 #[cfg(test)]
 #[path = "tests/range.rs"]
 mod tests;

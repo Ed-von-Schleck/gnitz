@@ -369,9 +369,9 @@ fn checkpointed_traced_view(dir: &str) -> i64 {
         &mut engine,
         vid,
         &[
-            (gnitz_wire::OPCODE_SCAN_DELTA, Some(tid), None),
-            (gnitz_wire::OPCODE_INTEGRATE_TRACE, None, None),
-            (gnitz_wire::OPCODE_INTEGRATE, None, None),
+            (gnitz_wire::Opcode::ScanDelta, Some(tid), None),
+            (gnitz_wire::Opcode::IntegrateTrace, None, None),
+            (gnitz_wire::Opcode::Integrate, None, None),
         ],
     );
     engine.write_column_records(vid, OWNER_KIND_VIEW, &cols).unwrap();

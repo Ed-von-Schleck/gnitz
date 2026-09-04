@@ -31,10 +31,9 @@ use std::sync::Arc;
 
 use gnitz_core::{null_word_set, ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch, ZSetBatchView};
 use gnitz_expr::{ColumnLocator, Evaluator, ExprResults, SchemaFacts};
-use gnitz_wire::{cmp_typed_le, AggFunc as WireAggFunc};
+use gnitz_wire::{cmp_typed_le, AggFunc as WireAggFunc, ComputeMap};
 
 use crate::agg::AggSpec;
-use crate::codec::project_schema::DeclaredCols;
 use crate::error::GnitzSqlError;
 
 /// The fold sink's whole shape, built once at plan time
@@ -53,10 +52,9 @@ pub(crate) struct FoldShape {
     /// One accumulator per physical reduce spec, in the partial layout's agg
     /// order.
     pub(crate) agg_specs: Vec<AggSpec>,
-    /// The fold sink's pre-map program and the reduce-input payload columns it
-    /// writes, both empty when the reduce reads source columns directly.
-    pub(crate) pre_map: Vec<u8>,
-    pub(crate) pre_payload: DeclaredCols,
+    /// The fold sink's pre-map, `None` when the reduce reads source columns
+    /// directly.
+    pub(crate) pre: Option<ComputeMap>,
     /// The per-worker SyntheticFold reduce-output layout: what the partial reply
     /// decodes against, and what `having` and every [`FinalizeItem`] resolve
     /// against.

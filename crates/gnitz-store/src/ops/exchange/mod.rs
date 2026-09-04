@@ -8,9 +8,9 @@
 mod relay;
 mod router;
 
-pub use relay::{op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode};
+pub use relay::{op_relay_broadcast, op_relay_scatter_consolidated, op_repartition_batches};
 pub use router::op_worker_filter;
-pub use router::RouteMode;
+pub use router::ScatterSpec;
 
 /// Reset `out` to `num_workers` empty slots, keeping the pooled allocations —
 /// the prologue of every per-worker row-index fan-out, here and on the master's

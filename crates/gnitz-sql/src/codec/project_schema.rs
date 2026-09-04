@@ -67,17 +67,10 @@ fn resolve_proj_col(
     }
 }
 
-/// The `(type_code, nullable)` declarations parallel to a compiled projection
-/// program's payload slots — what [`declared_out_cols`] produces and what every
-/// carrier of one is typed by.
-pub(crate) type DeclaredCols = Vec<(u8, bool)>;
-
 /// The `(type_code, nullable)` declaration parallel to a compiled projection
-/// program's payload slots. `SELECT a + b` is not a copy list, so the engine
-/// cannot derive the schema of the map it types; this is what
-/// `CircuitBuilder::map_expr` ships instead. `cols` must be the same payload
-/// slice `compile_projection_map` was given.
-pub(crate) fn declared_out_cols(cols: &[ColumnDef]) -> DeclaredCols {
+/// program's payload slots — a [`gnitz_wire::ComputeMap`]'s other half. `cols`
+/// must be the same payload slice `compile_projection_map` was given.
+pub(crate) fn declared_out_cols(cols: &[ColumnDef]) -> Vec<(u8, bool)> {
     cols.iter().map(|c| (c.type_code as u8, c.is_nullable)).collect()
 }
 

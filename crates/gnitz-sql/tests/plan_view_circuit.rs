@@ -258,7 +258,7 @@ fn union_all_tags_its_branches() {
             .iter()
             .flat_map(|pv| pv.circuit.nodes.values())
             .filter_map(|op| match op {
-                OpNode::Map(MapKind::HashRow(_, _, branch)) => Some(*branch),
+                OpNode::Map(MapKind::HashRow { branch_id, .. }) => Some(*branch_id),
                 _ => None,
             })
             .collect();

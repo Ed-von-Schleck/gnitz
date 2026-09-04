@@ -1,24 +1,4 @@
 use super::*;
-use gnitz_wire::type_code;
-
-/// `&[]` is the spelling for "nothing promoted", and expands to the parallel
-/// all-zero vector the encoding needs. A stated list is carried verbatim.
-#[test]
-fn promotion_targets_are_parallel_to_the_key_columns() {
-    assert_eq!(CircuitBuilder::promotion_targets(&[2, 5], &[]), vec![0, 0]);
-    assert_eq!(
-        CircuitBuilder::promotion_targets(&[2, 5], &[0, type_code::I64]),
-        vec![0, type_code::I64]
-    );
-}
-
-/// A stated list of the wrong length is a caller bug, and fails at the
-/// caller's own site rather than as a padded encoding two crates away.
-#[test]
-#[should_panic(expected = "one promotion target per key column")]
-fn a_mis_sized_promotion_target_list_is_refused() {
-    CircuitBuilder::promotion_targets(&[2, 5], &[0]);
-}
 
 /// `base → seg → final` lowered with a symbolic upstream substitutes to the
 /// circuit inline real-id allocation would have produced, and leaves the

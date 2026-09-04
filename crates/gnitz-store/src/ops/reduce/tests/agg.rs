@@ -1,6 +1,7 @@
 use super::*;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::Batch;
+use gnitz_wire::AggDescriptor;
 
 /// Single-row batch with a U64 PK and one F64 payload column carrying `val`.
 fn f64_batch(val: f64) -> Batch {

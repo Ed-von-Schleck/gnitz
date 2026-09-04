@@ -204,7 +204,7 @@ impl DagEngine {
             slot: registry.slot(),
             ram: registry.config().ram,
         };
-        // The compiler layer sees only the circuit system tables, never `VIEW_TAB`,
+        // The compiler layer sees only the circuit system table, never `VIEW_TAB`,
         // so it cannot derive whether the view is capacity-bounded.
         compiler::compile_view(site, &entry.schema, registry, entry.budgets.capacity_bytes.is_some())
     }

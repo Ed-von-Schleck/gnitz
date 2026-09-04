@@ -1,7 +1,13 @@
 //! Shared wire-protocol definitions for GnitzDB.
 //!
-//! Single source of truth for constants and codecs that both the client
-//! (gnitz-core) and server (gnitz-server) must agree on.
+//! Single source of truth for what the client (gnitz-core) and the server
+//! (gnitz-server) must agree on: the constants and codecs, the typed forms of
+//! the wire payloads (`OpNode`, `MapKind`, `ScanBound`, `ReadSpec`), and the
+//! semantic rules both sides compute with (`agg_output_type`,
+//! `raw_output_nullable`, `merge_func`, `join_key_common_type`,
+//! `is_natural_reduce_key`, `worker_for_key`). It is the only common ancestor of
+//! gnitz-sql, gnitz-store and gnitz-core, so a rule that lands anywhere else can
+//! drift.
 //!
 //! The crate is organized into topic modules, and most items are re-exported
 //! flat at the crate root (`gnitz_wire::FOO`) so callers need not track which

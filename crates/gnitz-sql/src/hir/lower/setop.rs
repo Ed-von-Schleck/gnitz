@@ -8,6 +8,7 @@
 //! rule then wraps a repeated relation (`t EXCEPT t`) in a pass-through segment.
 
 use super::super::{slot_of, ColId, HirCol, HirExpr, ProjEntry, RelExpr, SetOpKind};
+use super::prims::self_derived_key;
 use super::{cut_segment, emit_filter, resolve_collisions, seginput_of_get, CutMemo, SegInput};
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
@@ -38,10 +39,6 @@ pub(crate) fn lower_setop(
     // A float set-identity column breaks content-hash equality (IEEE-754).
     reject_float_keys(out.iter().map(|c| &c.out.def), "set operation")?;
 
-    // Promotion targets, stamped per pair by `RelExpr::set_op`.
-    let left_tt: Vec<u8> = out.iter().map(|c| c.left_target).collect();
-    let right_tt: Vec<u8> = out.iter().map(|c| c.right_target).collect();
-
     // UNION ALL keeps both copies of an identical row, so the right side hashes on
     // a distinct branch id; every deduplicating op uses branch 0.
     let right_branch_id = matches!((op, all), (SetOpKind::Union, true)) as u8;
@@ -62,8 +59,21 @@ pub(crate) fn lower_setop(
         matches!(op, SetOpKind::Union),
     )?;
 
-    let left_node = hash_shard_side(&mut cb, l_node, &l_slots, &left_tt, 0);
-    let right_node = hash_shard_side(&mut cb, r_node, &r_slots, &right_tt, right_branch_id);
+    // Each side's hashed columns, carrying the promotion target `RelExpr::set_op`
+    // stamped per pair.
+    let left_key: Vec<(u32, u8)> = l_slots
+        .iter()
+        .zip(out)
+        .map(|(&s, c)| (s as u32, c.left_target))
+        .collect();
+    let right_key: Vec<(u32, u8)> = r_slots
+        .iter()
+        .zip(out)
+        .map(|(&s, c)| (s as u32, c.right_target))
+        .collect();
+
+    let left_node = hash_shard_side(&mut cb, l_node, &left_key, 0);
+    let right_node = hash_shard_side(&mut cb, r_node, &right_key, right_branch_id);
 
     let out_node = match op {
         SetOpKind::Union if *all => cb.union(left_node, right_node),
@@ -102,7 +112,7 @@ pub(crate) fn lower_distinct(
     let mut cb = CircuitBuilder::new(0);
     let (seg, kind) = resolve_set_input(chain, memo, input, &side_ids)?;
     let (node, slots) = emit_side(&mut cb, &seg, &kind, &side_ids)?;
-    let sharded = hash_shard_side(&mut cb, node, &slots, &[], 0);
+    let sharded = hash_shard_side(&mut cb, node, &self_derived_key(&slots), 0);
     let distinct_node = cb.distinct(sharded);
     cb.sink(distinct_node);
     hashed_out(cb, "_distinct_pk", side_cols.iter())
@@ -241,21 +251,20 @@ fn emit_side(
     }
 }
 
-/// Hash the projected columns to a synthetic content PK — widening
-/// each column whose `target_tcs` entry is non-zero into the promoted layout so
-/// both set-op sides share one physical representation — then shard by that PK.
+/// Hash the projected columns to a synthetic content PK — widening each column
+/// carrying a non-zero promotion target into the promoted layout so both set-op
+/// sides share one physical representation — then shard by that PK.
 fn hash_shard_side(
     cb: &mut CircuitBuilder,
     filtered: gnitz_core::NodeId,
-    proj_indices: &[usize],
-    target_tcs: &[u8],
+    cols: &[(u32, u8)],
     branch_id: u8,
 ) -> gnitz_core::NodeId {
     // Reindex by a hash of the projected columns, so set membership
     // (EXCEPT/INTERSECT/UNION-distinct) is decided by the projected row content,
     // not by the source table's PK: two rows from different tables sharing a PK
     // but differing in payload must not match.
-    let reindexed = cb.map_hash_row(filtered, proj_indices, target_tcs, branch_id);
+    let reindexed = cb.map_hash_row(filtered, cols, branch_id);
     // Repartition by the synthetic hash PK (column 0) so that under
     // multiple workers each row lands on the worker that owns its new PK's
     // shard, co-locating matching rows for the downstream set arithmetic and

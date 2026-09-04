@@ -1,14 +1,12 @@
 use super::*;
 use crate::{
-    CIRCEDGES_PAY_DST_NODE, CIRCEDGES_PAY_DST_PORT, CIRCEDGES_PAY_SRC_NODE, CIRCNCOL_PAY_KIND, CIRCNCOL_PAY_NODE_ID,
-    CIRCNCOL_PAY_POSITION, CIRCNCOL_PAY_VALUE1, CIRCNCOL_PAY_VALUE2, CIRCNODES_PAY_EXPR_PROGRAM, CIRCNODES_PAY_NODE_ID,
-    CIRCNODES_PAY_OPCODE, CIRCNODES_PAY_SOURCE_TABLE, CIRCUIT_EDGES_COLS, CIRCUIT_NODES_COLS,
-    CIRCUIT_NODE_COLUMNS_COLS, COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN,
-    COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND,
-    COLTAB_PAY_TYPE_CODE, COL_TAB_COLS, IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS,
-    IDX_TAB_COLS, SCHEMA_TAB_COLS, TABLE_TAB_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_NAME, TABTAB_PAY_PK_COL_IDX,
-    TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_NAME, VIEWTAB_PAY_OWNER_VIEW_ID,
-    VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID, VIEW_TAB_COLS,
+    CIRCNODES_PAY_INPUT_0, CIRCNODES_PAY_INPUT_1, CIRCNODES_PAY_OPCODE, CIRCNODES_PAY_PARAMS,
+    CIRCNODES_PAY_SOURCE_TABLE, CIRCUIT_NODES_COLS, COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID,
+    COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID,
+    COLTAB_PAY_OWNER_KIND, COLTAB_PAY_TYPE_CODE, COL_TAB_COLS, IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID,
+    IDXTAB_PAY_SOURCE_COLS, IDX_TAB_COLS, SCHEMA_TAB_COLS, TABLE_TAB_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_NAME,
+    TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_NAME,
+    VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID, VIEW_TAB_COLS,
 };
 
 /// A sink that records what a writer emitted, so the tests below read the
@@ -190,7 +188,7 @@ fn values_land_in_their_named_payload_slots() {
     assert_eq!(r.pk, [3]);
     assert_eq!(r.row(SCHEMA_TAB_COLS, 1)[0], Val::Str("public".into()));
 
-    // The circuit families. `view_id` must occupy the LOW u128 half of the
+    // The circuit family. `view_id` must occupy the LOW u128 half of the
     // compound key: the PK region OPK-encodes each column independently, low
     // bytes first, so that is what puts view_id in the leading at-rest bytes
     // the engine's per-view prefix seek reads.
@@ -202,20 +200,21 @@ fn values_land_in_their_named_payload_slots() {
             node_id: 5,
             opcode: 9,
             source_table: Some(31),
-            expr_program: Some(&[0xAB, 0xCD]),
+            inputs: [Some(4), Some(3)],
+            params: Some(&[0xAB, 0xCD]),
         },
         1,
-    )
-    .unwrap();
+    );
     assert_eq!(r.pk, [7, 5]);
     let v = r.row(CIRCUIT_NODES_COLS, 2); // compound PK: two key columns
-    assert_eq!(v[CIRCNODES_PAY_NODE_ID], Val::U64(5));
     assert_eq!(v[CIRCNODES_PAY_OPCODE], Val::U64(9));
     assert_eq!(v[CIRCNODES_PAY_SOURCE_TABLE], Val::U64(31));
-    assert_eq!(v[CIRCNODES_PAY_EXPR_PROGRAM], Val::Bytes(vec![0xAB, 0xCD]));
+    assert_eq!(v[CIRCNODES_PAY_INPUT_0], Val::U64(4));
+    assert_eq!(v[CIRCNODES_PAY_INPUT_1], Val::U64(3));
+    assert_eq!(v[CIRCNODES_PAY_PARAMS], Val::Bytes(vec![0xAB, 0xCD]));
 
-    // The two nullable columns still take their slots when absent, so an
-    // omitted `put_null` would shift every later value.
+    // Every nullable column still takes its slot when absent, so an omitted
+    // `put_null` would shift every later value.
     let mut r = Recorder::default();
     write_circuit_node_row(
         &mut r,
@@ -224,74 +223,16 @@ fn values_land_in_their_named_payload_slots() {
             node_id: 5,
             opcode: 9,
             source_table: None,
-            expr_program: None,
+            inputs: [Some(4), None],
+            params: None,
         },
         1,
-    )
-    .unwrap();
+    );
     let v = r.row(CIRCUIT_NODES_COLS, 2);
     assert_eq!(v[CIRCNODES_PAY_SOURCE_TABLE], Val::Null);
-    assert_eq!(v[CIRCNODES_PAY_EXPR_PROGRAM], Val::Null);
-
-    let mut r = Recorder::default();
-    write_circuit_edge_row(
-        &mut r,
-        &CircuitEdgeRow {
-            view_id: 7,
-            dst_node: 5,
-            dst_port: 1,
-            src_node: 4,
-        },
-        1,
-    )
-    .unwrap();
-    assert_eq!(r.pk, [7, (5 << 8) | 1]);
-    let v = r.row(CIRCUIT_EDGES_COLS, 2);
-    assert_eq!(v[CIRCEDGES_PAY_DST_NODE], Val::U64(5));
-    assert_eq!(v[CIRCEDGES_PAY_DST_PORT], Val::U64(1));
-    assert_eq!(v[CIRCEDGES_PAY_SRC_NODE], Val::U64(4));
-
-    let mut r = Recorder::default();
-    write_circuit_node_column_row(
-        &mut r,
-        &CircuitNodeColumnRow {
-            view_id: 7,
-            node_id: 5,
-            kind: 3,
-            position: 2,
-            value1: 11,
-            value2: 12,
-        },
-        1,
-    )
-    .unwrap();
-    assert_eq!(r.pk, [7, (5 << 24) | (3 << 16) | 2]);
-    let v = r.row(CIRCUIT_NODE_COLUMNS_COLS, 2);
-    assert_eq!(v[CIRCNCOL_PAY_NODE_ID], Val::U64(5));
-    assert_eq!(v[CIRCNCOL_PAY_KIND], Val::U64(3));
-    assert_eq!(v[CIRCNCOL_PAY_POSITION], Val::U64(2));
-    assert_eq!(v[CIRCNCOL_PAY_VALUE1], Val::U64(11));
-    assert_eq!(v[CIRCNCOL_PAY_VALUE2], Val::U64(12));
-}
-
-/// A `sub` field that overflows its bit range would alias another row's
-/// record, so `circuit_sub` refuses and the writer emits nothing.
-#[test]
-fn a_circuit_sub_field_that_would_alias_another_record_is_rejected() {
-    let mut r = Recorder::default();
-    let err = write_circuit_edge_row(
-        &mut r,
-        &CircuitEdgeRow {
-            view_id: 1,
-            dst_node: 1 << 40,
-            dst_port: 0,
-            src_node: 0,
-        },
-        1,
-    )
-    .unwrap_err();
-    assert!(err.contains("dst_node"), "{err}");
-    assert!(r.vals.is_empty(), "a rejected row must emit nothing");
+    assert_eq!(v[CIRCNODES_PAY_INPUT_0], Val::U64(4));
+    assert_eq!(v[CIRCNODES_PAY_INPUT_1], Val::Null);
+    assert_eq!(v[CIRCNODES_PAY_PARAMS], Val::Null);
 }
 
 /// A column index past the packed key's own field would alias another column's

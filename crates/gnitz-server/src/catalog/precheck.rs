@@ -114,17 +114,17 @@ pub(super) fn validate_relation_defs(
 }
 
 /// How a guard message names one row of `family`. A COL_TAB PK packs
-/// `(owner_id, col_idx)` and a circuit PK packs `(view_id, sub)`, so neither is
-/// meaningful rendered as the one number it is stored as.
+/// `(owner_id, col_idx)` and a circuit PK packs `(view_id, node_id)`, so neither
+/// is meaningful rendered as the one number it is stored as.
 fn pk_label(family: SysFamily, pk: u128) -> String {
     match family {
         SysFamily::Column => {
             let (owner_id, col_idx) = gnitz_wire::unpack_col_id(pk as u64);
             format!("column {col_idx} of owner {owner_id}")
         }
-        SysFamily::CircuitNodes | SysFamily::CircuitEdges | SysFamily::CircuitNodeColumns => {
-            let (view_id, sub) = unpack_circuit_pk(pk);
-            format!("view {view_id} sub {sub}")
+        SysFamily::CircuitNodes => {
+            let (view_id, node_id) = unpack_circuit_pk(pk);
+            format!("view {view_id} node {node_id}")
         }
         _ => format!("id {pk}"),
     }
@@ -152,8 +152,8 @@ fn check_row_weights(family: SysFamily, batch: &Batch) -> Result<(), String> {
 }
 
 /// A family that admits a rewrite pair takes at most one row per sign; one that
-/// admits none takes at most one row per PK. For the circuit families this is
-/// the whole batch-local contract: a duplicate `(view_id, sub)` makes
+/// admits none takes at most one row per PK. For the circuit family this is
+/// the whole batch-local contract: a duplicate `(view_id, node_id)` makes
 /// `load_circuit`'s node insert last-writer-wins in cursor order.
 fn check_pk_multiplicity(family: SysFamily, sig: &PkSignature) -> Result<(), String> {
     if sig.repeats_a_sign || (family.pair_change_mask().is_none() && sig.is_pair()) {
@@ -687,9 +687,7 @@ impl CatalogEngine {
             SysFamily::Table | SysFamily::View => self.precheck_relation_family(family, batch, net_dead),
             SysFamily::Column => self.precheck_column_family(batch, &sigs),
             SysFamily::Index => self.precheck_index_family(batch, net_dead),
-            SysFamily::Sequence | SysFamily::CircuitNodes | SysFamily::CircuitEdges | SysFamily::CircuitNodeColumns => {
-                Ok(())
-            }
+            SysFamily::Sequence | SysFamily::CircuitNodes => Ok(()),
         }
     }
 
@@ -705,14 +703,8 @@ impl CatalogEngine {
         if let Some(cols) = families[SysFamily::Column.index()].as_ref() {
             self.check_column_owners(cols, families)?;
         }
-        for family in [
-            SysFamily::CircuitNodes,
-            SysFamily::CircuitEdges,
-            SysFamily::CircuitNodeColumns,
-        ] {
-            if let Some(b) = families[family.index()].as_ref() {
-                check_circuit_view_ids(b, new_view_ids)?;
-            }
+        if let Some(b) = families[SysFamily::CircuitNodes.index()].as_ref() {
+            check_circuit_view_ids(b, new_view_ids)?;
         }
         Ok(())
     }

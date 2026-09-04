@@ -31,10 +31,10 @@ mod bench_join;
 pub use distinct::op_weight_clamp;
 pub use exchange::op_worker_filter;
 pub use exchange::{
-    op_relay_broadcast, op_relay_scatter_consolidated_mode, op_repartition_batches_mode, reset_slots, RouteMode,
+    op_relay_broadcast, op_relay_scatter_consolidated, op_repartition_batches, reset_slots, ScatterSpec,
 };
 pub use join::{merge_schemas_for_join, op_join_delta_trace, JoinProbe, RangeProbe};
 pub use linear::op_union;
 pub use linear::{op_filter, op_negate};
 pub(crate) use reduce::AdhocFold;
-pub use reduce::{op_populate_avi, op_reduce, AggDescriptor, ReducePlan};
+pub use reduce::{op_populate_avi, op_reduce, ReducePlan};

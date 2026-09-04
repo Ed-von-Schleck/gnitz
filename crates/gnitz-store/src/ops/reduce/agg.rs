@@ -4,15 +4,6 @@ use crate::schema::{ColumnLocator, TypeCode};
 use gnitz_expr::RowSource;
 use gnitz_wire::{AggFunc, ScalarKind};
 
-/// Descriptor for one aggregate function — exactly the `(AggFunc, u16)` spec the
-/// wire ships. It carries no column *type*: that is `schema.columns[col_idx]`,
-/// which every consumer already holds, resolved or not.
-#[derive(Clone, Copy)]
-pub struct AggDescriptor {
-    pub col_idx: u32,
-    pub agg_op: AggFunc,
-}
-
 /// The value-index parameters of one MIN/MAX aggregate: the column the index
 /// reads, how to encode it, and which end of the order the index puts first.
 /// Named fields rather than a positional triple — two of the three are scalars

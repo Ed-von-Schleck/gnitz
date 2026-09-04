@@ -22,7 +22,6 @@ mod bench_secondary_index;
 mod tests;
 
 pub(crate) use adhoc_fold::AdhocFold;
-pub use agg::AggDescriptor;
 pub use avi::op_populate_avi;
 pub use op_reduce::op_reduce;
 pub use plan::ReducePlan;

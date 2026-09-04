@@ -2,7 +2,7 @@
 //! decomposed aggregate specs, HAVING filter, and finalize projection from the
 //! HIR `Reduce` node, and drives the shared `crate::agg` primitives — the
 //! strategy selection (`emit_reduce`), the reduce-output layout
-//! (`reduce_output_schema`, `group_col_reduce_pos`), and the spec decomposition
+//! (`reduce_output_schema`), and the spec decomposition
 //! (`push_agg_specs`) — which it shares with `lower::fold`, the same reduce
 //! lowered to an ad-hoc read's fold sink instead of to a circuit.
 
@@ -12,7 +12,7 @@ use super::{
     cut_segment, emit_filter, extract_scan_bound, reduce_out_layout, resolve_reduce_specs, seginput_of_get,
     split_filter, CutMemo, ReduceSpecs,
 };
-use crate::agg::{emit_reduce, ensure_cardinality_count, group_col_reduce_pos, reduce_output_schema, ReduceShape};
+use crate::agg::{emit_reduce, ensure_cardinality_count, reduce_output_schema, ReduceLayout, ReduceShape};
 use crate::codec::project_schema::{compile_projection_map, declared_out_cols, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_filter_program;
@@ -108,8 +108,11 @@ pub(crate) fn lower_reduce(
     // segment carries no descriptor, and is never replicated anyway.
     let source_replicated = source.desc.as_ref().is_some_and(|d| d.replicated);
     let shape = ReduceShape::new(&reduce_in, &group_positions, &specs, source_replicated);
-    let out_key = shape.out_key;
-    let (reduce_schema, agg_col_offset) = reduce_output_schema(&shape)?;
+    let ReduceLayout {
+        schema: reduce_schema,
+        group_slots,
+        agg_col_offset,
+    } = reduce_output_schema(&shape)?;
     let pk_len = reduce_schema.pk_cols.len();
 
     // Circuit: input delta + optional WHERE.
@@ -139,17 +142,10 @@ pub(crate) fn lower_reduce(
 
     let reduced = emit_reduce(&mut cb, mapped, &shape);
 
-    // Each group column's physical reduce-output slot — computed once here and
-    // reused by the finalize loop below (`group_reduce_pos[j]`), rather than
-    // re-deriving the same `group_col_reduce_pos` lookup a second time per item.
-    let group_reduce_pos: Vec<usize> = (0..group_cols.len())
-        .map(|j| group_col_reduce_pos(group_positions[j], out_key, &reduce_in, &group_positions))
-        .collect();
-
     let reduce_layout = reduce_out_layout(
         reduce_schema.columns.len(),
         group_cols,
-        &group_reduce_pos,
+        &group_slots,
         aggs,
         &agg_starts,
         agg_col_offset,
@@ -165,12 +161,12 @@ pub(crate) fn lower_reduce(
     let mut out_layout: Vec<ColId> = reduce_layout[..pk_len].to_vec();
     let mut pk_renamed = vec![false; pk_len];
     let mut proj_items: Vec<ProjItem> = Vec::new();
-    let is_natural = out_key != ReduceOutKey::SyntheticFold;
+    let is_natural = shape.out_key != ReduceOutKey::SyntheticFold;
     for entry in items {
         // A bare reference to a group column: its reduce-output slot, resolved in
         // one scan (the position is what the emit needs, not the id).
         let group_slot = match &entry.expr {
-            BExpr::ColRef(HirRef::Col(id)) => group_cols.iter().position(|g| g == id).map(|j| group_reduce_pos[j]),
+            BExpr::ColRef(HirRef::Col(id)) => group_cols.iter().position(|g| g == id).map(|j| group_slots[j]),
             _ => None,
         };
         let item = match group_slot {

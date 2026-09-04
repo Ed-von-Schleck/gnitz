@@ -1,5 +1,5 @@
 use super::*;
-use crate::agg::{finalize_agg_bexpr, push_agg_specs, synthetic_fold_cols};
+use crate::agg::{finalize_agg_bexpr, fold_partial_schema, push_agg_specs};
 use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::AggFunc;
 use crate::test_support::col_def;
@@ -38,8 +38,9 @@ fn agg_specs() -> Vec<AggSpec> {
 }
 
 fn partial_schema(src: &Schema, group_cols: &[usize], specs: &[AggSpec]) -> Schema {
-    Schema::from_parts(synthetic_fold_cols(src, group_cols, specs), vec![0])
+    fold_partial_schema(src, group_cols, specs)
         .expect("the SyntheticFold layout is a valid client schema")
+        .schema
 }
 
 /// The concatenated LE images of `vs` — what a `Fixed` i64 column holds.
@@ -68,8 +69,7 @@ fn fill_only_shape(src: &Schema, group_positions: Vec<usize>, agg_specs: Vec<Agg
         reduce_schema: Arc::new(src.clone()),
         group_positions,
         agg_specs,
-        pre_map: Vec::new(),
-        pre_payload: Vec::new(),
+        pre: None,
         partial_schema: Arc::new(partial_schema),
         // `fill_group_batch` never reads the output schema; it only has to exist.
         out_schema: Schema::from_parts(vec![col_def("_agg_pk", TypeCode::U128, false).hidden()], vec![0]).unwrap(),
@@ -196,8 +196,7 @@ fn count_shape(src: &Schema, group_positions: Vec<usize>) -> FoldShape {
         reduce_schema: Arc::new(src.clone()),
         group_positions,
         agg_specs,
-        pre_map: Vec::new(),
-        pre_payload: Vec::new(),
+        pre: None,
         out_schema: build_agg_out_schema(&out_cols).unwrap(),
         partial_schema: Arc::new(partial_schema),
         having: None,
@@ -272,8 +271,7 @@ fn avg_shape() -> FoldShape {
         reduce_schema: Arc::new(src),
         group_positions: Vec::new(),
         agg_specs,
-        pre_map: Vec::new(),
-        pre_payload: Vec::new(),
+        pre: None,
         out_schema: build_agg_out_schema(&[col_def("a", TypeCode::F64, true)]).unwrap(),
         partial_schema: Arc::new(partial_schema),
         having: None,
