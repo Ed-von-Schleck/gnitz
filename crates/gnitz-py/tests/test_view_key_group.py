@@ -125,9 +125,10 @@ def test_oversized_group_errors_and_the_connection_survives(client):
     size bound — so a group past the 64 MiB frame the client accepts is rejected
     rather than emitted. The reply is a plain error: the connection stays usable.
 
-    The payload is TEXT, the ordinary string type here, so the case also covers
-    the blob-bearing reply shape (which never passes through the chunking frame
-    budget). The limit is a compiled-in constant, not a debug-only seam, so this
+    A seek is the one reply verb that never chunks — its consumer forwards the
+    single frame verbatim — so the cap binds it whatever the schema; the TEXT
+    payload also puts a string heap in that frame. The limit is a compiled-in
+    constant, not a debug-only seam, so this
     holds in a release build as well — which also means the test must genuinely
     move ~68 MiB. Wide rows keep that cheap: the push path is per-row bound well
     below 16 KiB/row, so few-and-wide costs about half of many-and-narrow.

@@ -70,13 +70,110 @@ fn decode_mem_batch_rejects_blob_region_past_block() {
     assert_eq!(r.err(), Some("data WAL block invalid"));
 }
 
+// ---------------------------------------------------------------------------
+// Reply chunking: wire_chunk_within
+// ---------------------------------------------------------------------------
+
+/// A U64 PK with one STRING payload column, and `(pk, value)` rows at weight 1
+/// over it. Values past `SHORT_STRING_THRESHOLD` live in the heap.
+fn string_rows(rows: &[(u64, &str)]) -> (SchemaDescriptor, Batch) {
+    let schema = crate::test_support::u64_pk_schema(crate::schema::SchemaColumn::new(type_code::STRING, 0));
+    let mut b = super::super::batch_builder::BatchBuilder::new(schema);
+    for &(pk, v) in rows {
+        b.begin_row(pk as u128, 1);
+        b.put_string(v);
+        b.end_row();
+    }
+    (schema, b.finish())
+}
+
+/// A strict subrange of a heap-bearing batch ships a heap holding only the spans
+/// its own rows reference, keeps every cell's content, and keeps the source's
+/// layout claim — which is what the frame encoder stamps into the wire flags.
 #[test]
-#[should_panic(expected = "no German string")]
-fn encode_range_to_wire_panics_on_nonempty_blob() {
-    let schema = pk_payload_schema(&[type_code::U64]);
-    let mut b = make_batch_raw(&schema, &[(1, 1, 7)]);
-    // A non-empty heap on a range encode must fail loudly, not vanish.
-    b.blob.push(0xAB);
-    let mut out = vec![0u8; b.wire_byte_size() + 16];
-    b.encode_range_to_wire(0, 1, 1, &mut out, 0, false);
+fn wire_chunk_compacts_the_heap_and_inherits_the_layout() {
+    let (schema, mut src) = string_rows(&[
+        (1, "the first long value"),
+        (2, "the second long value"),
+        (3, "the third long value"),
+        (4, "the fourth long value"),
+    ]);
+    src.certify_layout(super::super::batch::Layout::Consolidated, &schema);
+
+    let chunk = src.wire_chunk(1, 2);
+    assert_eq!(chunk.len(), 2);
+    assert!(
+        chunk.blob.len() < src.blob.len(),
+        "a 2-of-4 subrange must carry only its own spans ({} vs {})",
+        chunk.blob.len(),
+        src.blob.len()
+    );
+    for (i, want) in [(0usize, "the second long value"), (1, "the third long value")] {
+        assert_eq!(crate::storage::payload_string(&chunk, i, 0), want);
+        assert_eq!(chunk.get_pk(i), (i + 2) as u128);
+        assert_eq!(chunk.get_weight(i), 1);
+    }
+    assert_eq!(
+        chunk.layout(),
+        src.layout(),
+        "a contiguous subrange of an ordered, ghost-free batch is both"
+    );
+}
+
+/// Rows pointing at ONE source span cost that span once — the shape a join's
+/// fan-out produces, where `scatter_copy` writes a left row's string once and
+/// points every output row at it. Counting per row instead would size each frame
+/// as if every row carried a private copy, and emit far too many frames.
+#[test]
+fn wire_chunk_within_counts_a_shared_span_once() {
+    const N: usize = 20;
+    let (schema, one) = string_rows(&[(1, &"v".repeat(200))]);
+    // One append session, so its blob cache dedups the repeated range: every
+    // row of `shared` points at the same span of `shared`'s own heap.
+    let mut shared = Batch::with_capacity(schema, N);
+    shared.append_ranges(&one.as_mem_batch(), &[(0, 1); N]);
+
+    let distinct_rows: Vec<(u64, String)> = (0..N as u64).map(|i| (i, format!("{i:-<200}"))).collect();
+    let (_, distinct) = string_rows(&distinct_rows.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>());
+
+    let budget = shared.wire_byte_size();
+    assert_eq!(shared.wire_chunk_within(0, 0, budget).len(), N);
+    assert!(
+        distinct.wire_chunk_within(0, 0, budget).len() < N,
+        "the same budget cannot hold {N} private 200-byte copies"
+    );
+}
+
+/// A short (inline) string contributes no heap bytes. Reading a heap extent off
+/// one instead — its bytes 8..16 are content, not an offset — yields a bogus
+/// span and one row per frame. Both arms are covered: an all-short batch has an
+/// empty heap and takes the bisection, and one long row puts the rest on the
+/// forward walk.
+#[test]
+fn wire_chunk_within_does_not_collapse_on_short_strings() {
+    let short_rows: Vec<(u64, &str)> = (0..30u64).map(|i| (i, "abcdefghijkl")).collect();
+    let (_, all_short) = string_rows(&short_rows);
+    assert!(all_short.blob.is_empty(), "12-byte values stay inline");
+
+    let mut mixed_rows: Vec<(u64, String)> = vec![(0, "a".repeat(64))];
+    mixed_rows.extend((1..30u64).map(|i| (i, "abcdefghijkl".to_string())));
+    let (_, mixed) = string_rows(&mixed_rows.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>());
+    assert!(!mixed.blob.is_empty(), "the one long value takes the forward walk");
+
+    // Room for ten rows beside the block header.
+    let budget = all_short.wire_byte_size_range(10);
+    assert_eq!(all_short.wire_chunk_within(0, 0, budget).len(), 10);
+    assert_eq!(
+        mixed.wire_chunk_within(1, 0, budget).len(),
+        10,
+        "the short rows past the long one cost their fixed width and nothing more"
+    );
+}
+
+/// A row too wide for the budget still ships: the chunk carries it alone rather
+/// than coming back empty, and the caller sizes what it got.
+#[test]
+fn wire_chunk_within_never_returns_an_empty_chunk() {
+    let (_, batch) = string_rows(&[(1, &"w".repeat(4096)), (2, &"w".repeat(4096))]);
+    assert_eq!(batch.wire_chunk_within(0, 0, 64).len(), 1);
 }

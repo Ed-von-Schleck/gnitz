@@ -122,8 +122,9 @@ pub const FLAG_SCAN_FIFO_REPLY: u64 = 1 << 55;
 pub const FLAG_BATCH_SORTED: u64 = 1 << 50;
 pub const FLAG_BATCH_CONSOLIDATED: u64 = 1 << 51;
 /// Engine-internal W2M flag set on the last (or only) scan chunk from a
-/// worker; stripped before reaching clients. See the engine's reply path
-/// for why FLAG_CONTINUATION cannot carry this meaning.
+/// worker. Frames are forwarded verbatim, so the bit does reach clients; no
+/// client reads it. See the engine's reply path for why FLAG_CONTINUATION
+/// cannot carry this meaning.
 pub const FLAG_SCAN_LAST: u64 = 1 << 53;
 
 // ---------------------------------------------------------------------------

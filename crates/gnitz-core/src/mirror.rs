@@ -22,13 +22,6 @@
 //! read spanning both is no consistent cut. A relation the copy does not hold is
 //! delegated upstream and keeps every guarantee a server read has.
 //!
-//! **A read ceiling it inherits.** A reply carrying STRING or BLOB values goes
-//! out as one frame, so the server refuses one past its frame cap — for every
-//! client, not just this one. A bootstrap cannot narrow its way out (it reads the
-//! view whole) and its one recovery is to bootstrap again, so a view whose
-//! STRING/BLOB rows on one worker exceed the cap cannot be mirrored;
-//! [`GnitzClient::mirror_view`] reports the server's refusal.
-//!
 //! **Cost.** One thread reads what W workers read in parallel. Total work is the
 //! same, so a copy wins outright on point and small bounded reads and the margin
 //! narrows as the walk grows: a full scan of a large view at high W is a loss.

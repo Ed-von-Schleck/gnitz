@@ -1285,7 +1285,7 @@ async fn serve_seek(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::control
     } else {
         match shared
             .disp()
-            .fan_out_seek(&shared.reactor, target_id, pk, seek_pk_extra)
+            .fan_out_seek(&shared.reactor, target_id, pk, seek_pk_extra, client_version)
             .await
         {
             Ok(slot) => peer.send_or_close(slot).await,
@@ -1887,10 +1887,11 @@ async fn read_lock(
     Some((g, kind))
 }
 
-/// Every reply that can carry a schema block negotiates it here: compare the
-/// client's cached `client_version` against the server's, and fetch the block
-/// only on a miss — a warm reply, the whole steady state, would otherwise pay a
-/// `SchemaDescriptor` copy, a hash probe and an `Rc` clone/drop to discard it.
+/// Where a **master-authored** reply negotiates its schema block — the worker's
+/// twin is `reply_schema_block`. Compare the client's cached `client_version`
+/// against the server's and fetch the block only on a miss: a warm reply, the
+/// whole steady state, would otherwise pay a `SchemaDescriptor` copy, a hash
+/// probe and an `Rc` clone/drop to discard it.
 ///
 /// `(server_version, block)` — one version, not two: the effective client version
 /// handed to the workers is `server_version` either way, a cache hit meaning the
@@ -2267,10 +2268,26 @@ fn encode_response_buffer(msg: ipc::WireMsg<'_>) -> PooledSendBuf {
     PooledSendBuf(inner)
 }
 
-/// Encode `msg` and send it, closing the peer if the write fails. The one send
-/// path for a reply built as a [`ipc::WireMsg`] literal — every field defaults to
-/// zero/absent, so each caller names only the fields its frame carries.
+/// Encode `msg` and send it, closing the peer if the write fails — and the one
+/// place a master-authored reply meets [`ipc::FRAME_CAP`]. The master-local
+/// system-family scan and seek have no other bound; the builders that encode
+/// without coming through here are structurally bounded (a schema block by
+/// `MAX_COLS`, terminal and prelim frames by carrying no data, a resolve
+/// descriptor by the relation's FK and index counts).
 async fn send_msg(peer: &Peer, msg: ipc::WireMsg<'_>) {
+    let sz = msg.size();
+    if sz > ipc::FRAME_CAP {
+        let text = ipc::oversized_frame_message(sz);
+        let fallback = ipc::WireMsg {
+            target_id: msg.target_id,
+            client_id: msg.client_id,
+            status: STATUS_ERROR,
+            error_msg: text.as_bytes(),
+            ..Default::default()
+        };
+        peer.send_or_close(encode_response_buffer(fallback)).await;
+        return;
+    }
     peer.send_or_close(encode_response_buffer(msg)).await
 }
 

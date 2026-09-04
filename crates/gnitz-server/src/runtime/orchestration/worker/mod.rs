@@ -239,28 +239,20 @@ pub struct WorkerProcess {
     /// Queued-but-unemitted is safe; the relay does not depend on any train
     /// draining.
     pending_streams: VecDeque<PendingScan>,
-    /// Per-frame wire budget for chunked reply trains (`send_scan_response`,
-    /// `stream_batch_response`, `emit_pending_scan_chunk`): [`ipc::FRAME_CAP`]
-    /// in production, since every chunk reaches the client as one frame.
-    /// `GNITZ_REPLY_FRAME_BUDGET` (read once at construction) shrinks it so e2e
-    /// tests exercise multi-frame trains with small tables; a larger value is
-    /// ignored. The master parks a full train per ring while draining another
-    /// worker, but `InFlightState` grows to track it, so the train length an
-    /// override produces is bounded only by the ring's byte capacity — there is
-    /// no per-train frame-count ceiling.
-    ///
-    /// This budgets only the chunk split point; single-frame paths that cannot
-    /// chunk (blob-bearing STRING replies) check `FRAME_CAP` directly.
+    /// Per-frame wire budget for every reply train and for the pre-flight key
+    /// train: [`ipc::FRAME_CAP`] in production, since every frame reaches the
+    /// client verbatim. `GNITZ_REPLY_FRAME_BUDGET` (read once at construction)
+    /// shrinks it so e2e tests exercise multi-frame trains with small tables; a
+    /// larger value is ignored. A frame that cannot be built inside `FRAME_CAP`
+    /// even at one row is the only reply-size failure left.
     reply_frame_budget: usize,
 }
 
 mod exchange;
 mod reply;
 
-pub(crate) use reply::send_unique_preflight_keys;
 use reply::PendingScan;
-#[cfg(test)]
-use reply::PendingScanKind;
+pub(crate) use reply::{preflight_keys_per_frame, send_unique_preflight_keys};
 
 /// `GNITZ_INJECT_UNIQUE_PREFLIGHT_ERROR`: fail the pre-flight on every worker so
 /// tests can assert the master surfaces the fault, drains the fan-out, and
@@ -279,26 +271,33 @@ pub(crate) fn buffer_pending_delta(pending: &mut HashMap<i64, Batch>, tid: i64, 
     }
 }
 
+/// Where one reply goes: the relation it names and the two ids the master
+/// reactor routes it by. `dispatch_inner` resolves all three together, so no
+/// reply helper takes them apart.
+#[derive(Clone, Copy)]
+struct ReplyRoute {
+    target_id: u64,
+    request_id: u64,
+    client_id: u64,
+}
+
 /// Which schema wire block a worker reply carries, declared by the dispatch arm
-/// that knows where the descriptor came from. Resolved by `reply_schema_block`;
-/// the descriptor never reaches the encoder (a block, when one is emitted,
-/// supersedes it).
-///
-/// `Table` is the target table's own schema: the reply may serve (and
-/// populate) the table's cached schema wire block. `OneOff` is a projected or
-/// synthetic schema — Gather's projection, HasPk UniqueIndex's index schema —
-/// whose block is built fresh per reply: serving the table's cached block for
-/// those would make the master decode the frames with the table's row stride,
-/// and caching them would poison the table's block. `ClientAuthored` is the
-/// ScanSpec reply schema the client built and shipped in `seek_pk_extra`: the
-/// client decodes the reply against its own copy, so no block is emitted, but
-/// the descriptor is still consulted for `has_german_string`, which is what
-/// keeps a STRING projection off the chunking path.
+/// that knows where the descriptor came from and resolved by
+/// `reply_schema_block`.
 #[derive(Clone, Copy)]
 enum ReplySchema<'a> {
+    /// The target's own schema: the reply serves and populates the table's
+    /// cached block, and negotiates its version against the client's.
     Table(&'a SchemaDescriptor),
+    /// A projected or synthetic schema — Gather's projection, HasPk
+    /// UniqueIndex's index schema. Built fresh per reply and never cached:
+    /// the table's block would decode these rows at the wrong stride, and
+    /// caching theirs would poison the table's. Unchecksummed, so only for a
+    /// reply the master consumes — its ring decode verifies none.
     OneOff(&'a SchemaDescriptor),
-    ClientAuthored(&'a SchemaDescriptor),
+    /// The ScanSpec reply schema the client shipped in `seek_pk_extra` and
+    /// decodes against: no block, and no descriptor needed here.
+    ClientAuthored,
 }
 
 /// What one probe row resolved to. The reply key is named by the variant rather
@@ -456,8 +455,12 @@ impl WorkerProcess {
                         seek_pk,
                         seek_pk_extra,
                     } => {
-                        if let Err(f) = self.answer_scan_spec(target_id, request_id, client_id, seek_pk, &seek_pk_extra)
-                        {
+                        let route = ReplyRoute {
+                            target_id: target_id as u64,
+                            request_id,
+                            client_id,
+                        };
+                        if let Err(f) = self.answer_scan_spec(route, seek_pk, &seek_pk_extra) {
                             self.send_fault(&f, request_id);
                         }
                     }
@@ -663,7 +666,14 @@ impl WorkerProcess {
         let seek_col_idx = decoded.control.seek_col_idx;
         let client_id = decoded.control.client_id;
         let ctrl_wire_flags = decoded.control.flags;
+        // On a scan this is the version the client holds; on a seek the master
+        // stamps the same field with it too (see `fan_out_seek`'s template).
         let client_version = gnitz_wire::wire_flags_get_schema_version(ctrl_wire_flags);
+        let route = ReplyRoute {
+            target_id: target_id as u64,
+            request_id,
+            client_id,
+        };
         // Wide-PK seek key tail (bytes 16..stride); empty for narrow PKs. Taken
         // (not cloned) — nothing reads the control block after this point.
         let seek_pk_extra: Vec<u8> = std::mem::take(&mut decoded.control.seek_pk_extra);
@@ -726,7 +736,7 @@ impl WorkerProcess {
                 if let HasPkLookup::SecondaryIndex { cols, .. } = &lookup {
                     self.cat().registry().validate_index_cols(target_id, cols, "has_pk")?;
                 }
-                self.handle_has_pk(target_id, batch, lookup, request_id, client_id, seek_pk)
+                self.handle_has_pk(route, batch, lookup, seek_pk)
             }
 
             SalMessageKind::Gather => {
@@ -758,14 +768,8 @@ impl WorkerProcess {
                 };
                 // The projected reply schema is synthetic — never the
                 // table's cached block.
-                self.stream_batch_response(
-                    target_id as u64,
-                    Some(result),
-                    ReplySchema::OneOff(&schema),
-                    request_id,
-                    client_id,
-                    0,
-                )
+                self.send_scan_response(route, Rc::new(result), ReplySchema::OneOff(&schema), 0, false);
+                Ok(())
             }
 
             SalMessageKind::Push => {
@@ -795,14 +799,13 @@ impl WorkerProcess {
                     self.cat()
                         .registry_mut()
                         .seek_by_index(target_id, cols.as_slice(), keys.as_slice())?;
-                self.stream_batch_response(
-                    target_id as u64,
-                    result,
-                    ReplySchema::Table(&schema),
-                    request_id,
-                    client_id,
-                    seek_pk,
-                )
+                // A miss replies with a zero-row frame rather than a dataless
+                // one: `drain_index_scan` skips it either way, and the frame
+                // still carries the schema block its `validate_schema_match`
+                // guard reads.
+                let batch = result.unwrap_or_else(|| Batch::empty_with_schema(&schema));
+                self.send_scan_response(route, Rc::new(batch), ReplySchema::Table(&schema), 0, false);
+                Ok(())
             }
 
             SalMessageKind::Seek => {
@@ -815,12 +818,11 @@ impl WorkerProcess {
                 // reply has no size bound of its own. `send_response` rejects one
                 // too large for the client rather than emitting it.
                 self.send_response(
-                    target_id as u64,
+                    route,
                     result.as_ref(),
                     ReplySchema::Table(&schema),
-                    request_id,
-                    client_id,
                     seek_pk,
+                    client_version,
                 )
             }
 
@@ -831,19 +833,12 @@ impl WorkerProcess {
                 // so ring order equals request order (the master drains a
                 // multi-scan's relations one train at a time, in request order).
                 let force_fifo = ctrl_wire_flags & gnitz_wire::FLAG_SCAN_FIFO_REPLY != 0;
-                self.send_scan_response(
-                    target_id as u64,
-                    result,
-                    ReplySchema::Table(&schema),
-                    request_id,
-                    client_id,
-                    client_version,
-                    force_fifo,
-                )
+                self.send_scan_response(route, result, ReplySchema::Table(&schema), client_version, force_fifo);
+                Ok(())
             }
 
             SalMessageKind::ScanSpec | SalMessageKind::DeltaScanSpec => {
-                self.answer_scan_spec(target_id, request_id, client_id, seek_pk, &seek_pk_extra)
+                self.answer_scan_spec(route, seek_pk, &seek_pk_extra)
             }
 
             SalMessageKind::UniquePreflight => {
@@ -948,12 +943,11 @@ impl WorkerProcess {
     /// status out through the one reply path every other failure here takes.
     fn answer_scan_spec(
         &mut self,
-        target_id: i64,
-        request_id: u64,
-        client_id: u64,
+        route: ReplyRoute,
         seek_pk: u128,
         seek_pk_extra: &[u8],
     ) -> Result<(), gnitz_wire::WireFault> {
+        let target_id = route.target_id as i64;
         let (spec_bytes, reply_block) =
             gnitz_wire::unpack_scan_spec_extra(seek_pk_extra).map_err(|e| format!("scan_spec: {e}"))?;
         let spec = gnitz_wire::ReadSpec::decode(spec_bytes.0).map_err(|e| format!("scan_spec: {e}"))?;
@@ -975,15 +969,8 @@ impl WorkerProcess {
             "delta reply carries a row above the cut {}",
             seek_pk as u64,
         );
-        self.send_scan_response(
-            target_id as u64,
-            Rc::new(keeper),
-            ReplySchema::ClientAuthored(&reply_schema),
-            request_id,
-            client_id,
-            0,
-            false,
-        )
+        self.send_scan_response(route, Rc::new(keeper), ReplySchema::ClientAuthored, 0, false);
+        Ok(())
     }
 
     /// Distributed CREATE-VIEW backfill, worker side. Streams this worker's
@@ -1197,7 +1184,7 @@ impl WorkerProcess {
             owner_id as u64,
             &frame_schema,
             request_id,
-            unique_preflight_keys_per_frame(),
+            preflight_keys_per_frame(&frame_schema, self.reply_frame_budget),
             &mut producer,
         );
         Ok(())
@@ -1205,13 +1192,12 @@ impl WorkerProcess {
 
     fn handle_has_pk(
         &mut self,
-        target_id: i64,
+        route: ReplyRoute,
         batch: Option<Batch>,
         lookup: HasPkLookup,
-        request_id: u64,
-        client_id: u64,
         seek_pk: u128,
     ) -> Result<(), gnitz_wire::WireFault> {
+        let target_id = route.target_id as i64;
         // Each arm resolves the probe and names the schema its reply carries;
         // the single exit below frames both the same way.
         let (result, schema, one_off) = match lookup {
@@ -1272,18 +1258,15 @@ impl WorkerProcess {
             }
         };
 
-        self.send_response(
-            target_id as u64,
-            Some(&result),
-            if one_off {
-                ReplySchema::OneOff(&schema)
-            } else {
-                ReplySchema::Table(&schema)
-            },
-            request_id,
-            client_id,
-            seek_pk,
-        )
+        // The HasPk group template carries no schema version, so version 0
+        // reaches here and the block always ships — the master decodes each
+        // reply on its own.
+        let schema = if one_off {
+            ReplySchema::OneOff(&schema)
+        } else {
+            ReplySchema::Table(&schema)
+        };
+        self.send_response(route, Some(&result), schema, seek_pk, 0)
     }
 
     /// Base checkpoint round: flush every user relation's store + index
@@ -1377,23 +1360,19 @@ impl WorkerProcess {
 // Unique pre-flight key stream
 // ---------------------------------------------------------------------------
 
-/// Keys per W2M frame for the unique pre-flight stream. The per-key wire size is
-/// `idx_key_size + 16` (the OPK leading-key span + 8 B weight + 8 B null word): a
-/// single ≤8-byte column promotes to an 8-byte (U64/I64) span → 24 B/key; a
-/// composite span can reach `MAX_PK_BYTES` (80 B) → ~96 B/key, so a full frame is
-/// ~24–96 MiB — comfortably under `MAX_W2M_MSG` (256 MiB) at this key count.
+/// Keys per W2M frame for the unique pre-flight stream, before
+/// `preflight_keys_per_frame` clamps it to the reply frame budget. A key costs
+/// `idx_key_size + 16` on the wire (the OPK span, the weight and the null word),
+/// so a full frame at this count is 24 MiB for a single 8-byte column and would
+/// be ~96 MiB for an 80-byte composite — which is where the clamp binds.
 ///
-/// The count is a pure throughput/memory knob: larger frames amortize the
-/// per-frame wire and park/drain overhead over more keys. It has no correctness
-/// floor — the W2M ring back-pressures a slow client by bytes, and
-/// `InFlightState` grows to track however many frames a ring holds, so any frame
-/// size is safe.
+/// A throughput/memory knob with no correctness floor: `InFlightState` grows
+/// with however many frames a ring holds.
 const UNIQUE_PREFLIGHT_KEYS_PER_FRAME: usize = 1 << 20;
 
-/// Frame size for the unique pre-flight stream, overridable via
+/// [`UNIQUE_PREFLIGHT_KEYS_PER_FRAME`], overridable via
 /// `GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME` so tests exercise multi-frame trains
-/// with small tables; any value is safe now that `InFlightState` grows with the
-/// parked depth (see [`UNIQUE_PREFLIGHT_KEYS_PER_FRAME`]).
+/// with small tables. Read only through `preflight_keys_per_frame`.
 fn unique_preflight_keys_per_frame() -> usize {
     gnitz_store::foundation::env::env_num("GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME", UNIQUE_PREFLIGHT_KEYS_PER_FRAME)
 }

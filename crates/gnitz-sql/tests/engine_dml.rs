@@ -66,18 +66,19 @@ fn explain_runs_inside_a_transaction() {
     exec(&mut client, &sn, "COMMIT");
 }
 
-// ── The reply-frame ceiling ──────────────────────────────────────────────────
+// ── Reply framing past one frame ─────────────────────────────────────────────
 //
-// A scan reply can only be split across frames when every column of its schema
-// is a non-German-string type whose width is a multiple of 8; a TEXT column
-// disqualifies the whole schema, so the worker single-frames it and errors past
-// the frame cap. An unprojected DML read therefore **fails**, not merely gets
-// slow, past a bounded number of rows in one partition. A replicated table
-// reaches that bound at any worker count.
+// A reply of any schema splits across frames, a TEXT column included: each frame
+// carries a heap compacted to its own rows. So an unprojected read of a table
+// far past the frame payload cap gets *slower*, never refused — and the DML
+// reads built on one (DELETE's key read-back, UPDATE's row read-back) inherit
+// that. A replicated table puts the whole table on every worker, so it crosses
+// the cap at any worker count.
 //
-// DELETE reads back keys, and a PK-only reply schema is chunkable, so it clears
-// the bound outright. UPDATE reads back rows, so its ceiling only *moves* — from
-// the table's size to the matched rows' size.
+// What still bounds a whole-table UPDATE is the other direction: it writes the
+// rewritten rows back as one push, and a push is one frame against the server's
+// *ingress* cap. So its ceiling is the matched rows' size — a limit on the
+// write, not on the read.
 
 /// 100 000 × ≈854 B encodes to ≈85 MB — past the 64 MiB frame payload cap.
 const ROWS: u64 = 100_000;
@@ -88,9 +89,9 @@ const CHUNK: u64 = 5_000;
 /// `v = id % GROUPS`, so any one `v` value selects `ROWS / GROUPS` rows.
 const GROUPS: u64 = 1_000;
 
-/// The error a non-chunkable reply past the frame cap raises: what separates
-/// "the read failed" from "the read was slow".
-const CHUNKING_ERR: &str = "cannot be chunked";
+/// The error a push past the server's ingress cap raises — the one ceiling a
+/// whole-table UPDATE still meets.
+const INGRESS_ERR: &str = "server ingress cap";
 
 /// `SELECT COUNT(*) FROM t` — a fold sink, so it never materialises a row.
 fn count_rows(client: &mut GnitzClient, sn: &str) -> i64 {
@@ -99,7 +100,7 @@ fn count_rows(client: &mut GnitzClient, sn: &str) -> i64 {
 }
 
 #[test]
-fn a_text_table_past_one_frame_deletes_by_predicate_where_a_whole_table_update_still_fails() {
+fn a_text_table_past_one_frame_reads_back_whole_where_a_whole_table_update_still_fails() {
     let (_srv, mut client, sn) = boot(4);
     exec(
         &mut client,
@@ -121,25 +122,24 @@ fn a_text_table_past_one_frame_deletes_by_predicate_where_a_whole_table_update_s
         client.push(tid, &schema, &batch).unwrap();
     }
 
-    // The unprojected read of this table does not get slow — it fails.
-    let msg = client.scan(tid).map(|_| ()).unwrap_err().to_string();
-    assert!(msg.contains(CHUNKING_ERR), "the whole-table read must fail: {msg}");
+    // The unprojected read of this table spans many frames and reassembles whole.
+    let (_, batch, _) = client.scan(tid).expect("an 85 MB TEXT reply chunks like any other");
+    assert_eq!(batch.map(|b| b.len()).unwrap_or(0), ROWS as usize);
 
-    // DELETE reads back keys, which chunk: a predicate DELETE succeeds where that
-    // scan cannot even be framed.
+    // DELETE reads back keys: a predicate DELETE clears its matched group.
     let per_group = (ROWS / GROUPS) as usize;
     assert_eq!(affected(&mut client, &sn, "DELETE FROM t WHERE v = 7"), per_group);
     assert_eq!(count_rows(&mut client, &sn), (ROWS as usize - per_group) as i64);
 
-    // UPDATE reads back rows, so its ceiling moved rather than lifted: a
-    // selective UPDATE succeeds…
+    // UPDATE reads back whole rows, TEXT cell and all — selectively…
     assert_eq!(
         affected(&mut client, &sn, "UPDATE t SET v = 4242 WHERE v = 9"),
         per_group
     );
 
-    // …while one matching the whole table still crosses the frame cap.
-    assert_rejects_variant(&mut client, &sn, "UPDATE t SET v = 0", "Exec", CHUNKING_ERR);
+    // …while one matching the whole table still fails, now on the write-back
+    // push rather than on the read that feeds it.
+    assert_rejects_variant(&mut client, &sn, "UPDATE t SET v = 0", "Exec", INGRESS_ERR);
 
     // The no-WHERE DELETE reads every key and nothing else, and clears the table.
     assert_eq!(affected(&mut client, &sn, "DELETE FROM t"), ROWS as usize - per_group);

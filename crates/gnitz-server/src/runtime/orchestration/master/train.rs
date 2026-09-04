@@ -32,9 +32,10 @@ pub(super) fn scan_decode_err(w: usize, what: &str, e: &'static str) -> WorkerFa
 ///
 /// A healthy frame WITHOUT `FLAG_CONTINUATION` is a length-1 train: the
 /// single-frame `send_response` reply shape carries no train flags at all, so
-/// "no continuation flag" must read as terminal. Every multi-frame producer
-/// (worker scan chunks, chunked seek/gather replies, unique pre-flight frames)
-/// sets `FLAG_CONTINUATION` on every frame and `FLAG_SCAN_LAST` on the last.
+/// "no continuation flag" must read as terminal. Every train producer (worker
+/// scan/gather/index-seek replies, unique pre-flight frames) sets
+/// `FLAG_CONTINUATION` on every frame and `FLAG_SCAN_LAST` on the last, a
+/// one-frame train included.
 pub(super) fn parse_train_header(
     slot: &W2mSlot,
     w: usize,
@@ -53,9 +54,10 @@ pub(super) fn parse_train_header(
 /// including a length-1 train's terminal `FLAG_SCAN_LAST` frame — is rejected.
 /// The slot is forwarded verbatim as a complete reply, so a chunked train would
 /// be truncated to its first frame with the remainder silently discarded by the
-/// lease drop. Callers only route requests whose replies fit one frame (e.g. a
-/// unique point seek); a train means that invariant broke (e.g. a shrunken
-/// GNITZ_REPLY_FRAME_BUDGET) — fail loudly instead.
+/// lease drop. The one caller routes a `Seek`, which the worker answers through
+/// `send_response` — a shape that carries no train flags at any reply budget. A
+/// train here means that arm was rerouted through the chunking path; fail loudly
+/// instead.
 pub(super) fn expect_single_frame(slot: &W2mSlot, w: usize, what: &str) -> Result<(), WorkerFault> {
     let (ctrl, _) = parse_train_header(slot, w, what)?;
     if ctrl.flags & FLAG_CONTINUATION != 0 {

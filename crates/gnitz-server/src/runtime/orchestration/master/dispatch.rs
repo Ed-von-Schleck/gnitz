@@ -621,6 +621,7 @@ impl MasterDispatcher {
         target_id: i64,
         pk: u128,
         seek_pk_extra: &[u8],
+        client_version: u16,
     ) -> Result<W2mSlot, WorkerFault> {
         let num_workers = self.num_workers();
         let schema = self.schema_desc_for(target_id);
@@ -636,6 +637,10 @@ impl MasterDispatcher {
             self.write_group(&DirectGroup {
                 template: wire::WireMsg {
                     target_id: target_id as u64,
+                    // The version the client already HAS, so the worker omits
+                    // the block on a hit — where `handle_scan` stamps the one the
+                    // client *will* have, its prelim frame having just sent it.
+                    flags: gnitz_wire::wire_flags_set_schema_version(0, client_version),
                     seek_pk: pk,
                     seek_pk_extra,
                     ..Default::default()

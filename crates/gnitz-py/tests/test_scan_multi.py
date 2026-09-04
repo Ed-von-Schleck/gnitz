@@ -369,7 +369,7 @@ def test_error_paths(client):
 
 
 def _text_table(client, sn, name):
-    """(pk U64 PK, s TEXT) table — a blob-bearing reply, which cannot split."""
+    """(pk U64 PK, s TEXT) table — a reply whose rows carry a string heap."""
     cols = [
         gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
         gnitz.ColumnDef("s", gnitz.TypeCode.STRING),
@@ -385,7 +385,8 @@ def test_fifo_ordering_big_then_small(reply_frame_budget_server):
     must stream in request order without wedging — the shape that deadlocks
     without FLAG_SCAN_FIFO_REPLY (the immediate-emit fast path would jump the
     tiny relations ahead of big's queued chunks). Both orderings, plus a
-    blob-bearing (TEXT) sibling, must complete and be correct."""
+    heap-bearing (TEXT) sibling whose own train chunks, must complete and be
+    correct."""
     c = reply_frame_budget_server
     sn = "sm" + _uid()
     c.create_schema(sn)
@@ -416,15 +417,20 @@ def test_fifo_ordering_big_then_small(reply_frame_budget_server):
             assert _rows(res[j]) == exp
         assert _rows(res[-1]) == big_rows
 
-        # A blob-bearing sibling: a TEXT dimension must FIFO behind big too.
+        # A blob-bearing sibling: a TEXT dimension must FIFO behind big too, and
+        # its own train chunks like any other. The values are past the 12-byte
+        # inline threshold, so every row points into the batch's string heap and
+        # each frame carries a heap compacted to its own rows: 400 * ~230 B is
+        # ~23 KiB per worker against the 16 KiB budget.
         dim, dim_sch = _text_table(c, sn, "dim_text")
         db = gnitz.ZSetBatch(dim_sch)
-        for i in range(5):
-            db.append(pk=i, s=f"name-{i}", _weight=1)
+        long_names = [f"name-{i}-" + "z" * 200 for i in range(400)]
+        for i, nm in enumerate(long_names):
+            db.append(pk=i, s=nm, _weight=1)
         c.push(dim, db)
         res = c.scan_many([big, dim])
         assert _rows(res[0]) == big_rows
-        assert sorted((r.pk, r.s) for r in res[1]) == [(i, f"name-{i}") for i in range(5)]
+        assert sorted((r.pk, r.s) for r in res[1]) == list(enumerate(long_names))
     finally:
         c.drop_schema(sn)
 

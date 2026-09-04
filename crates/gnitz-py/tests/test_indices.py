@@ -2626,6 +2626,41 @@ class TestChunkedReplyTrains:
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
 
+    def test_unique_index_over_a_long_text_table_past_one_frame(
+            self, reply_frame_budget_server):
+        """CREATE UNIQUE INDEX warms its cold filters from an UNPROJECTED
+        whole-table scan, so a table with a long TEXT column reaches that scan's
+        frame budget on rows the user never asked to read. Every frame carries a
+        heap compacted to its own rows, so the DDL completes and the index it
+        builds enforces uniqueness."""
+        client = reply_frame_budget_server
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+                "u BIGINT NOT NULL, body TEXT NOT NULL)", schema_name=sn)
+            # 200 bytes of heap per row: 4 000 rows is ~800 KB, far past the
+            # 16 KiB budget on every worker.
+            body = "z" * 200
+            n = 4_000
+            _insert_rows(client, sn,
+                         [(i, i, f"'row-{i}-{body}'") for i in range(n)], chunk=500)
+
+            client.execute_sql("CREATE UNIQUE INDEX ON t(u)", schema_name=sn)
+            # The index is live: a duplicate is refused, a fresh value accepted.
+            with pytest.raises(Exception):
+                client.execute_sql("INSERT INTO t VALUES (99999, 7, 'dup')",
+                                   schema_name=sn)
+            client.execute_sql(f"INSERT INTO t VALUES (99999, {n}, 'new')",
+                               schema_name=sn)
+            # And it still serves reads over the long-TEXT rows it indexes.
+            rows = _result_rows(client.execute_sql(
+                "SELECT pk, u FROM t WHERE u = 17", schema_name=sn))
+            assert rows == [(17, 17)]
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_u"], tables=["t"])
+
 
 # ---------------------------------------------------------------------------
 # TestIndexBoundPushdown — the index bound pushed into a circuit's backfill scan

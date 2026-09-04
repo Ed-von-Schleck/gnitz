@@ -15,7 +15,7 @@ use super::batch::{
     compute_offsets, copy_regions, strides_from_schema, Batch, MAX_BATCH_REGIONS, MAX_WIRE_REGIONS, REG_PK,
 };
 use super::batch_pool::{acquire_arena, Fill};
-use super::merge::{DirectWriter, MemBatch};
+use super::merge::{BlobCacheGuard, DirectWriter, MemBatch};
 use super::shard_file;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::wal;
@@ -64,15 +64,15 @@ impl Batch {
         opts: shard_file::ShardWriteOpts,
     ) -> Result<(), StorageError> {
         let mut regions: [&[u8]; MAX_WIRE_REGIONS] = [&[]; MAX_WIRE_REGIONS];
-        let n = self.fill_regions(&mut regions, 0, self.count, &self.blob);
+        let n = self.fill_regions(&mut regions);
         shard_file::write_shard_streaming(libc::AT_FDCWD, path, self.count as u32, &regions[..n], schema, opts)
     }
 
     // ── Wire serialization (used by the server's SAL and frame codecs) ─────
 
     /// WAL-block byte size for `count` rows of this batch's fixed regions plus a
-    /// `blob_len`-byte heap — the sizing half of the region convention, shared by
-    /// the whole-batch and range encoders below.
+    /// `blob_len`-byte heap — the sizing half of the region convention, and the
+    /// one both size accessors below read.
     fn wire_size_of(&self, count: usize, blob_len: usize) -> usize {
         let blob_idx = self.num_regions();
         let mut sizes = [0u32; MAX_WIRE_REGIONS];
@@ -89,100 +89,139 @@ impl Batch {
     }
 
     /// Byte count of the WAL-block encoding for `count` rows from this batch,
-    /// with an empty heap. Monotone non-decreasing in `count` — each region
-    /// grows with it and the block framer's `align8` walk is monotone in each
-    /// region size — which is what lets the reply chunker search it.
-    pub fn wire_byte_size_range(&self, count: usize) -> usize {
+    /// with an empty heap. Monotone non-decreasing in `count`, which is what lets
+    /// [`Self::rows_within`] search it.
+    fn wire_byte_size_range(&self, count: usize) -> usize {
         self.wire_size_of(count, 0)
     }
 
-    /// Fill `out` with rows `[start_row, start_row + count)` of every fixed
-    /// region, then `blob` as the trailing heap region, in canonical order.
-    /// Returns the region count — the `&[&[u8]]` both the WAL framer and the
-    /// shard writer take, built on the caller's stack.
-    fn fill_regions<'a>(
-        &'a self,
-        out: &mut [&'a [u8]; MAX_WIRE_REGIONS],
-        start_row: usize,
-        count: usize,
-        blob: &'a [u8],
-    ) -> usize {
+    /// Rows from `start` as a batch of their own, encoding within `budget` bytes
+    /// beside `overhead` bytes of frame around it, and carrying a string heap
+    /// compacted to just the spans those rows reference.
+    ///
+    /// Always at least one row while any remain: a row too wide for `budget`
+    /// comes back over it rather than not at all.
+    pub fn wire_chunk_within(&self, start: usize, overhead: usize, budget: usize) -> Batch {
+        let mut rows = self.rows_within(start, overhead, budget);
+        loop {
+            let chunk = self.wire_chunk(start, rows);
+            let size = overhead + chunk.wire_byte_size();
+            if size <= budget || rows == 1 {
+                return chunk;
+            }
+            // `rows_within` walks the relocation rule `wire_chunk` applies, so a
+            // repeat means the two drifted apart.
+            debug_assert!(
+                false,
+                "rows_within over-predicted: {rows} rows encode to {size} > {budget}"
+            );
+            rows = (rows * budget / size).clamp(1, rows - 1);
+        }
+    }
+
+    /// Rows `[start, start + count)` as a batch of their own, heap compacted.
+    /// `inherit_layout` restores the claim `append_ranges_inner`'s `downgrade()`
+    /// drops and the frame encoder ships.
+    fn wire_chunk(&self, start: usize, count: usize) -> Batch {
+        let mut out = Batch::with_capacity(self.schema, count);
+        out.append_batch(self, start, start + count);
+        out.inherit_layout(self);
+        out
+    }
+
+    /// Row count [`Self::wire_chunk_within`] starts from. The blob region is
+    /// last, so `wire_size_of(n, heap) == wire_byte_size_range(n) + heap` and
+    /// both arms measure against that one identity.
+    fn rows_within(&self, start: usize, overhead: usize, budget: usize) -> usize {
+        let remaining = self.count - start;
+        if remaining == 0 {
+            return 0;
+        }
+        let fits = |n: usize, heap: usize| overhead + self.wire_byte_size_range(n) + heap <= budget;
+        if self.blob.is_empty() {
+            // Searched, not inverted: `wal::block_size_from` re-`align8`s per
+            // region, so the size is monotone in `n` but affine only while every
+            // stride is a multiple of 8 — and `pk_stride` is routinely 4 or 12.
+            let (mut lo, mut hi) = (0usize, remaining);
+            while lo < hi {
+                let mid = lo + (hi - lo).div_ceil(2);
+                if fits(mid, 0) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            return lo.max(1);
+        }
+
+        // Each long span costs its bytes once, keyed as
+        // `relocate_german_string_vec` dedups — which is what will build the
+        // chunk. A join fans one row's string out across many, and counting it
+        // per row would emit orders of magnitude too many frames.
+        let mut guard = BlobCacheGuard::acquire(&self.schema, remaining);
+        let seen = guard
+            .get_mut()
+            .expect("a non-empty heap implies a German-string column");
+        let mut heap = 0usize;
+        let mut rows = 0usize;
+        while rows < remaining {
+            let row_heap = heap + self.row_heap_cost(start + rows, seen);
+            // The first row goes in whatever it costs; a frame carries whole rows.
+            if rows > 0 && !fits(rows + 1, row_heap) {
+                break;
+            }
+            heap = row_heap;
+            rows += 1;
+        }
+        rows
+    }
+
+    /// Heap bytes row `row` adds to a chunk whose spans so far are in `seen`: the
+    /// sizing twin of one `relocate_german_string_vec` pass, branching as it
+    /// does. `wire_chunk_within`'s retry is what covers the two drifting apart.
+    fn row_heap_cost(&self, row: usize, seen: &mut super::merge::BlobCache) -> usize {
+        let mut cost = 0;
+        for (pi, col) in self.schema.payload_columns() {
+            if !gnitz_wire::is_german_string(col.type_code) {
+                continue;
+            }
+            let cell = self.get_col_ptr(row, pi, 16);
+            let length = gnitz_wire::read_u32_le(cell, 0) as usize;
+            if length <= gnitz_wire::SHORT_STRING_THRESHOLD {
+                continue;
+            }
+            let Some(span) = gnitz_wire::blob_extent(self.blob.len(), gnitz_wire::read_u64_le(cell, 8), length) else {
+                continue;
+            };
+            if seen
+                .insert((self.blob.as_ptr() as usize, span.start, length), 0)
+                .is_none()
+            {
+                cost += span.len();
+            }
+        }
+        cost
+    }
+
+    /// Fill `out` with every fixed region followed by the blob heap, in
+    /// canonical order. Returns the region count — the `&[&[u8]]` both the WAL
+    /// framer and the shard writer take, built on the caller's stack.
+    fn fill_regions<'a>(&'a self, out: &mut [&'a [u8]; MAX_WIRE_REGIONS]) -> usize {
         let blob_idx = self.num_regions();
         for (i, region) in out[..blob_idx].iter_mut().enumerate() {
-            let stride = self.region_stride(i) as usize;
-            *region = &self.region_or_blob(i)[start_row * stride..(start_row + count) * stride];
+            *region = self.region_or_blob(i);
         }
-        out[blob_idx] = blob;
+        out[blob_idx] = &self.blob;
         blob_idx + 1
-    }
-
-    /// Encode rows `[start_row, start_row + count)` of every fixed region, plus
-    /// `blob` as the trailing heap region, as one WAL block at `out[offset..]`.
-    /// Returns bytes written.
-    #[allow(clippy::too_many_arguments)]
-    fn encode_regions(
-        &self,
-        start_row: usize,
-        count: usize,
-        blob: &[u8],
-        table_id: u32,
-        out: &mut [u8],
-        offset: usize,
-        checksum: bool,
-    ) -> usize {
-        let mut regions: [&[u8]; MAX_WIRE_REGIONS] = [&[]; MAX_WIRE_REGIONS];
-        let n = self.fill_regions(&mut regions, start_row, count, blob);
-        let new_offset = wal::encode(out, offset, table_id, count as u32, &regions[..n], checksum)
-            .expect("WAL encode failed: buffer too small");
-        new_offset - offset
-    }
-
-    /// Encode rows `[start_row, start_row + count)` into WAL V4 wire format at
-    /// `out[offset..]`. Returns bytes written. Only valid for a schema with no
-    /// (no STRING columns, all strides 8-aligned). The blob region is encoded
-    /// German-string column, whose batches carry no heap for it to drop.
-    pub fn encode_range_to_wire(
-        &self,
-        start_row: usize,
-        count: usize,
-        table_id: u32,
-        out: &mut [u8],
-        offset: usize,
-        checksum: bool,
-    ) -> usize {
-        // Release-active: this bounds the per-region sub-slice `[start_row *
-        // stride..(start_row + count) * stride]` below. A debug-only check would
-        // strip in release and let a bad range index out of the region (a panic,
-        // or on an overflow a wrong slice). `saturating_add` (not `+`) so an
-        // overflowing range fails the bound rather than wrapping to a small
-        // value that slips past it.
-        let end = start_row.saturating_add(count);
-        assert!(
-            end <= self.count,
-            "encode_range_to_wire: range [{start_row}, {end}) out of bounds (batch count = {})",
-            self.count,
-        );
-        // A schema with no German-string column carries an empty blob heap, which
-        // is intentionally dropped below. Callers gate this encoder on
-        // `has_german_string`; a STRING/BLOB batch routes to the full-blob
-        // `encode_to_wire` path. Assert it so a future caller that mis-routes
-        // string data fails loudly here rather than shipping structs whose heap
-        // vanished.
-        debug_assert!(
-            self.blob.is_empty(),
-            "encode_range_to_wire on a batch with a {}-byte blob: this encoder takes only a \
-             schema with no German string; the heap would be silently dropped",
-            self.blob.len(),
-        );
-        // The assert above bounds `start_row + count <= self.count`, so each
-        // region sub-slice stays inside its `self.count * stride` bytes. The blob
-        // region is passed empty, as the schema's absent German string implies.
-        self.encode_regions(start_row, count, &[], table_id, out, offset, checksum)
     }
 
     /// Encode self into WAL wire format at out[offset..]. Returns bytes written.
     pub fn encode_to_wire(&self, table_id: u32, out: &mut [u8], offset: usize, checksum: bool) -> usize {
-        self.encode_regions(0, self.count, &self.blob, table_id, out, offset, checksum)
+        let mut regions: [&[u8]; MAX_WIRE_REGIONS] = [&[]; MAX_WIRE_REGIONS];
+        let n = self.fill_regions(&mut regions);
+        let end = wal::encode(out, offset, table_id, self.count as u32, &regions[..n], checksum)
+            .expect("WAL encode failed: buffer too small");
+        end - offset
     }
 
     /// [`Self::encode_to_wire`] into a buffer of its own, sized by

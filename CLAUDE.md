@@ -645,12 +645,6 @@ the view whole. That is a discontinuity every subscriber has to react to, and no
 cursor carries it: an expiry-driven reseed inside one boot keeps the tag and moves
 the tick forward, which is exactly what an ordinary advance looks like.
 
-A view whose STRING/BLOB rows on one worker exceed the reply frame cap **cannot
-be mirrored**: such a reply goes out as one frame, and a bootstrap reads the view
-whole, so it has no projection, predicate or `LIMIT` to narrow and its one
-recovery — bootstrap again — fails identically. The ceiling is the server's, not
-the mirror's: an unprojected read of that view fails for any client.
-
 ## SAL durability contract
 
 **Rule: an ACK to a client implies fdatasync iff the operation wrote something a

@@ -1448,12 +1448,9 @@ fn a_second_worker_count_mirrors_the_same() {
     );
 }
 
-/// A bootstrap and a poll that each span many reply frames.
-///
-/// The server chunks at a tiny frame budget, over a view with **no** string
-/// column — STRING and BLOB replies go out as one frame and never chunk, so
-/// only an all-fixed-width view produces the multi-block train this is about. A
-/// loop that stopped at the first block loses rows silently.
+/// A bootstrap and a poll that each span many reply frames, over an
+/// all-fixed-width view: every frame's data block is a pure region copy, with no
+/// heap to relocate. A loop that stopped at the first block loses rows silently.
 ///
 /// The view is created over an already-populated table, so this also covers the
 /// first bootstrap of a view whose rows all arrived through a `CREATE VIEW`
@@ -1493,6 +1490,50 @@ fn a_bootstrap_and_a_poll_span_many_frames() {
     fx.drain("fr", &["v_wide"]);
     let polled = fx.differential("fr", "SELECT * FROM v_wide");
     assert!(polled >= 40_000, "the poll carried only {polled} rows");
+}
+
+/// The same, over long TEXT: every row points into the batch's string heap, so
+/// each frame ships a heap compacted to its own rows. A bootstrap reads the view
+/// whole and cannot narrow, so this is the shape that used to be unmirrorable.
+#[test]
+fn a_long_text_view_mirrors_across_many_frames() {
+    let _g = serial();
+    let mut fx = Fixture::start_with(WORKERS, &[("GNITZ_REPLY_FRAME_BUDGET", "16384")]);
+    fx.direct.create_schema("tx").unwrap();
+    sql(
+        &mut fx.direct,
+        "tx",
+        "CREATE TABLE d (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, body TEXT NOT NULL)",
+    );
+    // 200 bytes per row of heap, so 5 000 rows is ~1 MB across four workers —
+    // ~16× the frame budget on each of them.
+    let fill = |client: &mut GnitzClient, lo: i64, hi: i64| {
+        for chunk in (lo..=hi).step_by(500) {
+            let end = (chunk + 499).min(hi);
+            let rows: Vec<String> = (chunk..=end)
+                .map(|i| format!("({i}, {}, '{}')", i % 7, format_args!("row-{i}-{}", "z".repeat(200))))
+                .collect();
+            sql(client, "tx", &format!("INSERT INTO d VALUES {}", rows.join(",")));
+        }
+    };
+    fill(&mut fx.direct, 1, 5_000);
+    sql(
+        &mut fx.direct,
+        "tx",
+        &format!("CREATE VIEW v_text WITH (delta = '{FEED}') AS SELECT id, k, body FROM d WHERE k >= 0"),
+    );
+
+    fx.mirror().mirror_view("tx", "v_text").expect("mirror v_text");
+    fx.drain("tx", &["v_text"]);
+    let bootstrapped = fx.differential("tx", "SELECT * FROM v_text");
+    assert!(bootstrapped >= 5_000, "the bootstrap carried only {bootstrapped} rows");
+
+    fill(&mut fx.direct, 5_001, 10_000);
+    fx.drain("tx", &["v_text"]);
+    let polled = fx.differential("tx", "SELECT * FROM v_text");
+    assert!(polled >= 10_000, "the poll carried only {polled} rows");
+    // The strings themselves, not just the row count.
+    fx.ordered_differential("tx", "SELECT id, body FROM v_text WHERE k = 3 ORDER BY id");
 }
 
 /// Two schemas in one handle, and forgetting a view out of one.

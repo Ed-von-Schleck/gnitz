@@ -203,7 +203,8 @@ fn every_truncation_of_a_frame_is_rejected() {
 fn encode_writes_exactly_the_predicted_size() {
     let sd = simple_schema();
     let batch = make_simple_batch(100, 999);
-    let range_batch = make_blobless_batch(8);
+    let empty = make_blobless_batch(0);
+    let few = make_blobless_batch(4);
     let blk = sblock(&sd, 0);
     let msgs = [
         WireMsg::default(),
@@ -223,20 +224,12 @@ fn encode_writes_exactly_the_predicted_size() {
         },
         WireMsg {
             schema_block: Some(&blk),
-            data: WireData::Range {
-                batch: &range_batch,
-                start_row: 0,
-                count: 0,
-            },
+            data: WireData::Whole(Some(&empty)),
             ..Default::default()
         },
         WireMsg {
             schema_block: Some(&blk),
-            data: WireData::Range {
-                batch: &range_batch,
-                start_row: 0,
-                count: 4,
-            },
+            data: WireData::Whole(Some(&few)),
             ..Default::default()
         },
     ];
@@ -306,28 +299,26 @@ fn decode_wire_round_trips_every_control_field() {
 // Scan chunking tests
 // ---------------------------------------------------------------------------
 
-/// A `WireData::Range` message's `size` must match its encoded byte count.
+/// One chunk of a reply train — rows [2, 5) of an 8-row batch — round-trips
+/// through the frame codec at its predicted size.
 #[test]
-fn encode_range_roundtrip() {
+fn encode_chunk_roundtrip() {
     let sd = simple_schema();
     let batch = make_blobless_batch(8);
     let blk = sblock(&sd, 1);
 
-    // Encode rows [2, 5) into a wire frame with the schema block.
-    let sz = WireMsg {
-        schema_block: Some(&blk),
-        data: WireData::Range { batch: &batch, start_row: 0, count: 3 },
-        ..Default::default()
-    }
-    .size();
-    let mut buf = vec![0u8; sz];
-    WireMsg {
+    // A budget sized for exactly three rows of this schema.
+    let chunk = batch.wire_chunk_within(2, 0, make_blobless_batch(3).wire_byte_size());
+    assert_eq!(chunk.len(), 3);
+    let msg = WireMsg {
         target_id: 1,
         schema_block: Some(&blk),
-        data: WireData::Range { batch: &batch, start_row: 2, count: 3 },
+        data: WireData::Whole(Some(&chunk)),
         ..Default::default()
-    }
-    .encode_ipc(&mut buf, 0);
+    };
+    let sz = msg.size();
+    let mut buf = vec![0u8; sz];
+    assert_eq!(msg.encode_ipc(&mut buf, 0), sz);
 
     // Every region must be sliced by the same range: PK, weight and payload are
     // distinct per row, so a range applied to one region and not another shows up.
@@ -354,19 +345,14 @@ fn continuation_frame_decoded_with_schema_hint() {
     let batch = make_blobless_batch(4);
 
     // Encode a continuation frame: no schema, FLAG_CONTINUATION set.
-    let sz = WireMsg {
-        data: WireData::Range { batch: &batch, start_row: 0, count: 4 },
-        ..Default::default()
-    }
-    .size();
-    let mut buf = vec![0u8; sz];
-    WireMsg {
+    let msg = WireMsg {
         target_id: 1,
         flags: FLAG_CONTINUATION,
-        data: WireData::Range { batch: &batch, start_row: 0, count: 4 },
+        data: WireData::Whole(Some(&batch)),
         ..Default::default()
-    }
-    .encode_ipc(&mut buf, 0);
+    };
+    let mut buf = vec![0u8; msg.size()];
+    msg.encode_ipc(&mut buf, 0);
 
     // decode_wire_ipc must fail (no schema in frame, no hint).
     assert!(

@@ -192,6 +192,28 @@ fn preflight_train_empty_partition_single_terminal_frame() {
     });
 }
 
+/// The byte clamp, not the key count, is what bounds a pre-flight frame: at a
+/// small reply budget `preflight_keys_per_frame` cuts the configured count down
+/// to what fits, and the train it produces spans several frames.
+#[test]
+fn preflight_frames_are_cut_by_the_byte_budget() {
+    let frame_schema = u128_frame_schema();
+    // 16 B span + 8 B weight + 8 B null word per key.
+    let budget = 8 * 32;
+    let per_frame = crate::runtime::worker::preflight_keys_per_frame(&frame_schema, budget);
+    assert_eq!(
+        per_frame, 8,
+        "the budget, not the configured 1<<20 count, must decide the frame's keys"
+    );
+
+    let keys: Vec<PkBuf> = (0..24u128).map(span_u128).collect();
+    with_test_ring(|writer, receiver| {
+        send_unique_preflight_keys(writer, 77, &frame_schema, 11, per_frame, &mut producer_of(&keys));
+        let got = drain_train(receiver, 11);
+        assert_eq!(got, keys, "the clamped train still carries every span in order");
+    });
+}
+
 /// A composite two-column span round-trips through the wire frame: the reply
 /// schema's PK region holds the full span verbatim, however many columns the
 /// index spans.

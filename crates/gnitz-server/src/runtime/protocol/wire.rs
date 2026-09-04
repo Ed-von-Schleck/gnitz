@@ -7,21 +7,29 @@ use gnitz_store::storage::{Batch, Layout, MemBatch, MAX_BATCH_REGIONS};
 use gnitz_wire::control::{peek_control_block_ipc, DecodedControl};
 use gnitz_wire::{FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
 
-/// The most one reply frame may carry on its way to a client, and the limit the
-/// HELLO ACK advertises (`Peer::send_hello_ack`): the client bounds its reader
-/// by `min(server, client)` over the advertised value, so advertising this
-/// constant is what keeps every frame the server emits readable. A worker frame
-/// is forwarded verbatim, so it bounds the chunk split point, the single-frame
-/// paths that cannot chunk, and the master's merge of per-worker replies alike.
-/// The server's *ingress* limit is the wire constant itself. The W2M ring's own bound,
-/// `MAX_W2M_MSG`, is deliberately the larger of the two — it is the right limit
-/// for a train the master consumes rather than forwards.
+/// The operative bound on **every** reply the server emits, forwarded or not,
+/// and the limit the HELLO ACK advertises (`Peer::send_hello_ack`). A worker
+/// frame reaches a client verbatim, so this is the only readable size there; for
+/// a reply the master consumes instead — `HasPk`, `Gather`, `SeekByIndex`, the
+/// unique pre-flight — it turns a would-be `try_reserve` abort into an error at
+/// the producer. `MAX_W2M_MSG` is the ring's structural ceiling, never the
+/// operative limit; the server's *ingress* limit is the wire constant itself.
 pub(crate) const FRAME_CAP: usize = gnitz_wire::MAX_FRAME_PAYLOAD_SERVER;
 const _: () = assert!(FRAME_CAP < super::w2m::MAX_W2M_MSG as usize);
 
+/// The one text for a reply that cannot be framed, shared by the two producers
+/// that check [`FRAME_CAP`].
+pub(crate) fn oversized_frame_message(sz: usize) -> String {
+    format!(
+        "reply wire_size={sz} exceeds the maximum frame payload {FRAME_CAP}; \
+         one row wider than the cap cannot be returned at all"
+    )
+}
+
 /// Set on the last (or only) scan chunk from a worker. `pub` in `gnitz_wire` so
 /// the bit is guarded against every other wire flag; narrowed to this crate
-/// here, because it is stripped before a frame reaches a client.
+/// here, because nothing outside the engine sets or reads it. It is forwarded to
+/// clients along with the rest of the frame's flags, and ignored there.
 pub(crate) use gnitz_wire::FLAG_SCAN_LAST;
 
 // ---------------------------------------------------------------------------
@@ -111,11 +119,6 @@ impl WireSchema {
 #[derive(Clone, Copy)]
 pub enum WireData<'a> {
     Whole(Option<&'a Batch>),
-    Range {
-        batch: &'a Batch,
-        start_row: usize,
-        count: usize,
-    },
     /// The rows `indices` selects, in that order, encoded straight into the
     /// destination — no per-worker sub-`Batch` in between. Valid only for a
     /// schema with no German-string column.
@@ -141,7 +144,6 @@ impl<'a> WireData<'a> {
     pub(crate) fn row_count(&self) -> usize {
         match *self {
             WireData::Whole(b) => b.map(|b| b.len()).unwrap_or(0),
-            WireData::Range { count, .. } => count,
             WireData::Scattered { indices, .. } => indices.len(),
         }
     }
@@ -149,14 +151,13 @@ impl<'a> WireData<'a> {
     fn layout_batch(&self) -> Option<&'a Batch> {
         match *self {
             WireData::Whole(b) => b,
-            WireData::Range { batch, .. } | WireData::Scattered { batch, .. } => Some(batch),
+            WireData::Scattered { batch, .. } => Some(batch),
         }
     }
 
     fn wire_byte_size(&self) -> usize {
         match *self {
             WireData::Whole(b) => b.map(|b| b.wire_byte_size()).unwrap_or(0),
-            WireData::Range { batch, count, .. } => batch.wire_byte_size_range(count),
             WireData::Scattered { indices, schema, .. } => {
                 gnitz_store::storage::wire_block_size(schema, indices.len(), 0)
             }
@@ -265,9 +266,6 @@ impl<'a> WireMsg<'a> {
         if has_data {
             pos += match self.data {
                 WireData::Whole(b) => b.unwrap().encode_to_wire(self.target_id as u32, out, pos, checksum),
-                WireData::Range { batch, start_row, count } => {
-                    batch.encode_range_to_wire(start_row, count, self.target_id as u32, out, pos, checksum)
-                }
                 WireData::Scattered { batch, indices, schema } => {
                     batch.encode_scattered_to_wire(indices, schema, self.target_id as u32, out, pos, checksum)
                 }

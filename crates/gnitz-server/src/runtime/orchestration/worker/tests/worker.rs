@@ -43,8 +43,7 @@ fn send_helpers_echo_the_request_id() {
     // Pass ReplySchema::ClientAuthored: it emits no block and so consults
     // no catalog, which this test does not have (null catalog pointer).
     // The id round-trip is the assertion of interest.
-    let schema = make_schema_u64_i64();
-    wp.send_response(8, None, ReplySchema::ClientAuthored(&schema), req_resp, 0, 0u128)
+    wp.send_response(route(8, req_resp, 0), None, ReplySchema::ClientAuthored, 0u128, 0)
         .unwrap();
     wp.send_error("boom", req_err);
 
@@ -89,6 +88,12 @@ fn make_test_worker(catalog: *mut CatalogEngine, writer: W2mWriter) -> WorkerPro
     let mut wp = WorkerProcess::new(0, catalog, unsafe { std::mem::zeroed() }, writer, -1, HashMap::new());
     wp.reply_frame_budget = ipc::FRAME_CAP;
     wp
+}
+
+/// The reply route every helper below takes, in the order `dispatch_inner`
+/// resolves it.
+fn route(target_id: u64, request_id: u64, client_id: u64) -> ReplyRoute {
+    ReplyRoute { target_id, request_id, client_id }
 }
 
 /// One SAL group as the matrix tests hand it to `dispatch`: a kind, a
@@ -374,6 +379,25 @@ fn make_n_row_batch(schema: SchemaDescriptor, n: usize) -> Batch {
     b.finish()
 }
 
+/// A U64 PK with one STRING payload column — the shape whose batches carry a
+/// live blob heap, so every frame of a train over one must compact it.
+fn string_schema() -> SchemaDescriptor {
+    u64_pk_schema(SchemaColumn::new(type_code::STRING, 0))
+}
+
+/// `(pk, string)` rows over [`string_schema`] at weight 1. Values past
+/// `SHORT_STRING_THRESHOLD` (12 bytes) land in the heap; shorter ones stay
+/// inline and leave the heap empty.
+fn long_string_batch(schema: &SchemaDescriptor, rows: &[(u64, &str)]) -> Batch {
+    let mut b = BatchBuilder::new(*schema);
+    for &(pk, v) in rows {
+        b.begin_row(pk as u128, 1);
+        b.put_string(v);
+        b.end_row();
+    }
+    b.finish()
+}
+
 /// Row `row`'s PK widened from its OPK bytes — `Batch::get_pk` for a
 /// borrowed `MemBatch`.
 fn mem_pk(b: &gnitz_store::storage::MemBatch<'_>, row: usize) -> u128 {
@@ -385,10 +409,11 @@ fn consume_one(ptr: *mut u8) -> Vec<u8> {
     frame
 }
 
-/// Wire size of a `count`-row range of `batch`, with an optional schema block.
-fn range_size(batch: &Batch, count: usize, prebuilt: Option<&[u8]>) -> usize {
+/// Wire size of a frame carrying `count` rows of `schema`, with an optional
+/// schema block — the budget that fits exactly that many rows.
+fn frame_size(schema: SchemaDescriptor, count: usize, prebuilt: Option<&[u8]>) -> usize {
     ipc::WireMsg {
-        data: ipc::WireData::Range { batch, start_row: 0, count },
+        data: ipc::WireData::Whole(Some(&make_n_row_batch(schema, count))),
         schema_block: prebuilt,
         ..Default::default()
     }
@@ -404,10 +429,11 @@ fn train_frames_fill_the_budget_to_within_one_row() {
         ("8-aligned", make_n_row_batch(make_schema_u64_i64(), 40)),
         ("padded", make_n_row_batch(padded_schema(), 40)),
     ] {
-        let block = Rc::new(crate::catalog::encode_schema_block(&batch.schema, 1));
-        let per_row = batch.wire_byte_size_range(2) - batch.wire_byte_size_range(1);
+        let schema = batch.schema;
+        let block = Rc::new(crate::catalog::encode_schema_block(&schema, 1));
+        let per_row = frame_size(schema, 2, None) - frame_size(schema, 1, None);
         // Room for four rows beside the schema block on the first frame.
-        let budget = range_size(&batch, 4, Some(block.as_slice()));
+        let budget = frame_size(schema, 4, Some(block.as_slice()));
 
         let (region, writer) = make_ring();
         let ptr = region.ptr();
@@ -415,12 +441,10 @@ fn train_frames_fill_the_budget_to_within_one_row() {
         wp.reply_frame_budget = budget;
         wp.pending_streams.push_back(PendingScan {
             batch: Rc::new(batch),
-            request_id: 5,
-            client_id: 0,
-            target_id: 1,
+            route: route(1, 5, 0),
             prebuilt_schema: Some(block),
             server_version: 0,
-            kind: PendingScanKind::Chunked { next_row: 0 },
+            next_row: 0,
         });
         let mut passes = 0;
         while !wp.pending_streams.is_empty() {
@@ -462,25 +486,16 @@ fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
 
         wp.send_scan_response(
-            1,
+            route(1, 3, 0),
             Rc::new(make_n_row_batch(schema, 5)),
-            ReplySchema::ClientAuthored(&schema),
-            3,
-            0,
+            ReplySchema::ClientAuthored,
             0,
             force_fifo,
-        )
-        .expect("a small batch must not error");
+        );
 
         if force_fifo {
             assert_eq!(wp.pending_streams.len(), 1, "force_fifo must enqueue, not emit");
-            assert!(
-                matches!(
-                    wp.pending_streams.front().map(|p| &p.kind),
-                    Some(PendingScanKind::Chunked { .. })
-                ),
-                "a splittable reply queues as the Chunked variant"
-            );
+            assert_eq!(wp.pending_streams.front().unwrap().next_row, 0);
             wp.emit_pending_scan_chunk();
         }
         assert!(wp.pending_streams.is_empty(), "the queue ends empty either way");
@@ -502,58 +517,51 @@ fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
     }
 }
 
-/// A blob-bearing (STRING/TEXT) reply must FIFO too: under force_fifo it
-/// queues as `PendingScanKind::WholeBlob` (not immediately emitted), and
-/// `emit_pending_scan_chunk` emits its one frame with
-/// FLAG_CONTINUATION | FLAG_SCAN_LAST, then pops. This is the mainline case a
-/// TEXT dimension table hits.
+/// A `force_fifo` reply that fits goes out as ONE frame over the SOURCE batch —
+/// no sub-batch, so no copy and no heap relocation on the path every `scan_many`
+/// relation takes. The source carries dead heap bytes (what a blob-sharing
+/// filter produces), which a sub-batch would compact away: the frame's byte size
+/// is what tells the two paths apart.
 #[test]
-fn force_fifo_queues_a_whole_blob_reply() {
-    let dir = crate::test_support::scratch_dir("worker", "force_fifo_text");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64), col_def("s", type_code::STRING)];
-    let tid = crate::catalog::FIRST_USER_TABLE_ID;
-    engine
-        .register_table(tid, PUBLIC_SCHEMA_ID, "tfifo", &cols, &[0])
-        .unwrap();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
-    assert!(schema.has_german_string(), "a STRING schema carries a German string");
+fn force_fifo_emits_a_fitting_reply_over_the_source_batch() {
+    let schema = string_schema();
+    let mut batch = long_string_batch(&schema, &[(1, "a long enough value"), (2, "another long value")]);
+    batch.blob.extend_from_slice(&[0u8; 4096]);
+    let batch = Rc::new(batch);
+    let compacted = batch.wire_chunk_within(0, 0, usize::MAX);
+    assert!(
+        compacted.wire_byte_size() < batch.wire_byte_size(),
+        "the fixture must have a dedupable heap for the size test to discriminate"
+    );
 
     let (region, writer) = make_ring();
     let ptr = region.ptr();
-    let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
-
-    // One all-zero TEXT row (empty inline string), well under MAX_W2M_MSG.
-    let batch = Batch::zeroed(schema, 1);
-    wp.send_scan_response(tid as u64, Rc::new(batch), ReplySchema::Table(&schema), 5, 0, 0, true)
-        .unwrap();
-    assert_eq!(wp.pending_streams.len(), 1);
-    assert!(
-        matches!(
-            wp.pending_streams.front().map(|p| &p.kind),
-            Some(PendingScanKind::WholeBlob)
-        ),
-        "a TEXT reply must queue as the WholeBlob variant under force_fifo"
-    );
+    let mut wp = make_test_worker(std::ptr::null_mut(), writer);
+    wp.send_scan_response(route(1, 5, 0), Rc::clone(&batch), ReplySchema::ClientAuthored, 0, true);
+    assert_eq!(wp.pending_streams.len(), 1, "force_fifo queues even a fitting reply");
     assert!(walk_frames(ptr).is_empty(), "nothing is emitted at enqueue time");
 
     wp.emit_pending_scan_chunk();
-    assert!(wp.pending_streams.is_empty(), "the single blob frame pops the train");
+    assert!(wp.pending_streams.is_empty(), "one frame drains the train");
     let frames = walk_frames(ptr);
     assert_eq!(frames.len(), 1);
     let ctrl = gnitz_wire::control::peek_control_block_ipc(&frames[0].1).unwrap();
     assert_eq!(ctrl.status, STATUS_OK);
     assert_ne!(ctrl.flags & FLAG_SCAN_LAST, 0);
     assert_ne!(ctrl.flags & FLAG_CONTINUATION, 0);
-    // Decodes via the blob-capable path; the first frame carries the schema block.
-    let decoded = ipc::decode_wire_ipc(&frames[0].1).expect("the blob frame decodes standalone");
-    assert!(decoded.schema.is_some(), "the frame carries the schema block");
-    assert_eq!(decoded.data_batch.map(|b| b.len()).unwrap_or(0), 1);
-
-    engine.close();
+    let whole = ipc::WireMsg {
+        data: ipc::WireData::Whole(Some(&batch)),
+        ..Default::default()
+    }
+    .size();
+    assert_eq!(
+        frames[0].1.len(),
+        whole,
+        "the frame must be the source batch verbatim, heap and all"
+    );
 }
 
-// -- stream_batch_response / pending_streams FIFO tests --------------------
+// -- reply-train FIFO and chunking tests -----------------------------------
 
 /// Read every published message off a test ring in publish order,
 /// returning `(ring_prefix_req_id, frame_bytes)`.
@@ -590,28 +598,24 @@ fn pending_streams_drain_two_trains_fifo() {
 
     // Budget: exactly the first chunk's size at 4 rows (A's schema block
     // included), so train A's 10 rows span at least two frames.
-    let budget = range_size(&batch_a, 4, Some(block_a.as_slice()));
+    let budget = frame_size(schema_a, 4, Some(block_a.as_slice()));
 
     let (region, writer) = make_ring();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.pending_streams.push_back(PendingScan {
         batch: Rc::new(batch_a),
-        request_id: 11,
-        client_id: 0,
-        target_id: 1,
+        route: route(1, 11, 0),
         prebuilt_schema: Some(block_a),
         server_version: 0,
-        kind: PendingScanKind::Chunked { next_row: 0 },
+        next_row: 0,
     });
     wp.pending_streams.push_back(PendingScan {
         batch: Rc::new(batch_b),
-        request_id: 22,
-        client_id: 0,
-        target_id: 2,
+        route: route(2, 22, 0),
         prebuilt_schema: Some(block_b),
         server_version: 0,
-        kind: PendingScanKind::Chunked { next_row: 0 },
+        next_row: 0,
     });
 
     // One chunk per pass, as drain_sal drives it.
@@ -668,60 +672,10 @@ fn pending_streams_drain_two_trains_fifo() {
     }
 }
 
-/// A fitting result through `stream_batch_response` must be byte-identical
-/// to `send_response` (same flags, `seek_pk` + `request_id` echo): unicast
-/// consumers forward these slots verbatim, so the single-frame wire shape
-/// must not change. Covers both the non-empty and the empty-result paths.
+/// An oversized result enqueues a train instead of emitting a frame past
+/// `ipc::FRAME_CAP`; nothing is emitted until drain_sal.
 #[test]
-fn a_fitting_stream_batch_is_byte_identical_to_send_response() {
-    let schema = make_schema_u64_i64();
-    let batch = make_n_row_batch(schema, 5);
-
-    let (region_ref, writer_ref) = make_ring();
-    let (region_new, writer_new) = make_ring();
-    let ptr_ref = region_ref.ptr();
-    let ptr_new = region_new.ptr();
-    let mut wp_ref = make_test_worker(std::ptr::null_mut(), writer_ref);
-    let mut wp_new = make_test_worker(std::ptr::null_mut(), writer_new);
-
-    let req = 0xCAFE_u64;
-    let client = 7u64;
-    let pk = 0xDEAD_BEEF_u128;
-    wp_ref
-        .send_response(8, Some(&batch), ReplySchema::ClientAuthored(&schema), req, client, pk)
-        .unwrap();
-    wp_ref
-        .send_response(8, None, ReplySchema::ClientAuthored(&schema), req + 1, client, 0)
-        .unwrap();
-
-    assert!(wp_new
-        .stream_batch_response(
-            8,
-            Some(batch.clone()),
-            ReplySchema::ClientAuthored(&schema),
-            req,
-            client,
-            pk
-        )
-        .is_ok());
-    assert!(wp_new
-        .stream_batch_response(8, None, ReplySchema::ClientAuthored(&schema), req + 1, client, 0)
-        .is_ok());
-    assert!(wp_new.pending_streams.is_empty(), "fitting results never enqueue");
-
-    let ref_frames = walk_frames(ptr_ref);
-    let new_frames = walk_frames(ptr_new);
-    assert_eq!(ref_frames.len(), 2);
-    assert_eq!(
-        ref_frames, new_frames,
-        "single-frame stream_batch_response must be byte-identical to send_response"
-    );
-}
-
-/// An oversized splittable result enqueues a train instead of emitting a
-/// frame past `ipc::FRAME_CAP`; nothing is emitted until drain_sal.
-#[test]
-fn an_oversized_stream_batch_enqueues_a_train() {
+fn an_oversized_reply_enqueues_a_train() {
     let schema = make_schema_u64_i64(); // 32 B/row on the wire
     let rows = (ipc::FRAME_CAP / 32) + 4096;
     let batch = Batch::zeroed(schema, rows);
@@ -729,60 +683,152 @@ fn an_oversized_stream_batch_enqueues_a_train() {
     let (region, writer) = make_ring();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    let err = wp.stream_batch_response(3, Some(batch), ReplySchema::ClientAuthored(&schema), 5, 9, 0);
-    assert!(err.is_ok(), "an oversized splittable result must chunk, not error");
+    wp.send_scan_response(route(3, 5, 9), Rc::new(batch), ReplySchema::ClientAuthored, 0, false);
     assert_eq!(wp.pending_streams.len(), 1);
     let ps = wp.pending_streams.front().unwrap();
-    let PendingScanKind::Chunked { next_row, .. } = &ps.kind else {
-        panic!("an oversized splittable result must enqueue a Chunked train");
-    };
-    assert_eq!(*next_row, 0);
-    assert_eq!(ps.request_id, 5);
-    assert_eq!(ps.client_id, 9);
+    assert_eq!(ps.next_row, 0);
+    assert_eq!(ps.route.request_id, 5);
+    assert_eq!(ps.route.client_id, 9);
     assert!(
         walk_frames(ptr).is_empty(),
         "the train's first chunk is emitted by drain_sal, not at enqueue time"
     );
 }
 
-/// An oversized blob-bearing (STRING) result returns the clean error — the
-/// variable-width streaming chunker is an explicit non-goal.
+/// A single row wider than a shrunken `reply_frame_budget` still ships: the
+/// budget is a split point, not a limit, so the frame goes out over budget and
+/// no fault is raised. Only [`ipc::FRAME_CAP`] — what the client can read — is
+/// a refusal.
 #[test]
-fn an_oversized_string_batch_cannot_be_chunked() {
-    let dir = crate::test_support::scratch_dir("worker", "string_oversized");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let cols = vec![col_def("id", type_code::U64), col_def("s", type_code::STRING)];
-    let tid = crate::catalog::FIRST_USER_TABLE_ID;
-    engine
-        .register_table(tid, PUBLIC_SCHEMA_ID, "tstr", &cols, &[0])
-        .unwrap();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
-    assert!(schema.has_german_string());
+fn a_row_wider_than_the_budget_ships_one_over_budget_frame() {
+    let schema = string_schema();
+    let batch = long_string_batch(&schema, &[(1, &"x".repeat(4096)), (2, &"y".repeat(4096))]);
 
-    // 40 B/row (8 pk + 8 weight + 8 null + 16 string struct), empty blob.
-    let rows = (ipc::FRAME_CAP / 40) + 4096;
-    let batch = Batch::zeroed(schema, rows);
+    let (region, writer) = make_ring();
+    let ptr = region.ptr();
+    let mut wp = make_test_worker(std::ptr::null_mut(), writer);
+    wp.reply_frame_budget = 512;
+    wp.send_scan_response(route(1, 5, 0), Rc::new(batch), ReplySchema::ClientAuthored, 0, false);
 
-    let (_region, writer) = make_ring();
-    let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
-    let err = wp
-        .stream_batch_response(tid as u64, Some(batch), ReplySchema::Table(&schema), 5, 0, 0)
-        .expect_err("oversized STRING result must surface the clean error");
-    assert!(
-        err.text.contains("cannot be chunked"),
-        "error names the limitation: {err}"
+    let mut passes = 0;
+    while !wp.pending_streams.is_empty() {
+        wp.emit_pending_scan_chunk();
+        passes += 1;
+        assert!(passes < 10, "the train must drain within a bounded pass count");
+    }
+    let frames = walk_frames(ptr);
+    assert_eq!(
+        frames.len(),
+        2,
+        "one row per frame, since one row alone busts the budget"
     );
-    assert!(wp.pending_streams.is_empty(), "a blob-bearing result never enqueues");
+    for (_, bytes) in &frames {
+        let ctrl = gnitz_wire::control::peek_control_block_ipc(bytes).unwrap();
+        assert_eq!(ctrl.status, STATUS_OK, "an over-budget frame is not a fault");
+        assert!(bytes.len() > 512, "each frame is one row wider than the budget");
+    }
+}
 
-    engine.close();
+/// A single row wider than [`ipc::FRAME_CAP`] has nothing left to narrow: the
+/// train pops and the request is answered with the oversize fault.
+#[test]
+fn a_row_wider_than_the_frame_cap_faults() {
+    let schema = string_schema();
+    // One row whose string alone exceeds what a client can read in one frame.
+    let batch = long_string_batch(&schema, &[(1, &"z".repeat(ipc::FRAME_CAP + 4096))]);
+
+    let (region, writer) = make_ring();
+    let ptr = region.ptr();
+    let mut wp = make_test_worker(std::ptr::null_mut(), writer);
+    wp.send_scan_response(route(1, 5, 0), Rc::new(batch), ReplySchema::ClientAuthored, 0, false);
+    assert_eq!(
+        wp.pending_streams.len(),
+        1,
+        "an oversized reply queues before it faults"
+    );
+
+    wp.emit_pending_scan_chunk();
+    assert!(wp.pending_streams.is_empty(), "the faulting train pops");
+    let frames = walk_frames(ptr);
+    assert_eq!(frames.len(), 1, "the fault is the whole reply");
+    let ctrl = gnitz_wire::control::peek_control_block_ipc(&frames[0].1).unwrap();
+    assert_eq!(ctrl.status, gnitz_wire::STATUS_ERROR);
+    assert_eq!(ctrl.request_id, 5);
+    let text = String::from_utf8_lossy(&ctrl.error_msg);
+    assert!(
+        text.contains("exceeds the maximum frame payload"),
+        "the fault names the cap: {text}"
+    );
+}
+
+/// A STRING-column reply splits across frames like any other, and every frame
+/// carries a heap compacted to its own rows. Drive one to exhaustion at a small
+/// budget and reassemble: PKs, **weights** and string contents must all match
+/// the source, and no frame may exceed the budget — in a Z-set engine a row-set
+/// comparison would test nothing.
+#[test]
+fn a_long_string_train_reassembles_with_its_weights() {
+    let schema = string_schema();
+    let rows: Vec<(u64, String)> = (0..25u64)
+        .map(|i| (i, format!("value-{i}-{}", "p".repeat(40))))
+        .collect();
+    let source = long_string_batch(&schema, &rows.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>());
+    assert!(!source.blob.is_empty(), "40+ byte values must live in the heap");
+
+    // ~230 B per row, so a 2 KiB budget puts a handful of rows in each frame.
+    let budget = 2048;
+
+    let (region, writer) = make_ring();
+    let ptr = region.ptr();
+    let mut wp = make_test_worker(std::ptr::null_mut(), writer);
+    wp.reply_frame_budget = budget;
+    wp.send_scan_response(route(1, 5, 0), Rc::new(source), ReplySchema::ClientAuthored, 0, false);
+    let mut passes = 0;
+    while !wp.pending_streams.is_empty() {
+        wp.emit_pending_scan_chunk();
+        passes += 1;
+        assert!(passes < 50, "the train must drain within a bounded pass count");
+    }
+
+    let frames = walk_frames(ptr);
+    assert!(
+        frames.len() >= 2,
+        "a {budget}-byte budget must split 25 long-string rows"
+    );
+    let mut got: Vec<(u128, i64, String)> = Vec::new();
+    for (i, (_, bytes)) in frames.iter().enumerate() {
+        assert!(bytes.len() <= budget, "frame {i} is {} bytes of {budget}", bytes.len());
+        let ctrl = gnitz_wire::control::peek_control_block_ipc(bytes).unwrap();
+        assert_eq!(ctrl.status, STATUS_OK);
+        assert_eq!(
+            ctrl.flags & FLAG_SCAN_LAST != 0,
+            i == frames.len() - 1,
+            "FLAG_SCAN_LAST only on the terminal frame"
+        );
+        let mut offsets = [0usize; gnitz_store::storage::MAX_BATCH_REGIONS];
+        let decoded = ipc::decode_wire_ipc_zero_copy_with_ctrl(bytes, ctrl, Some(&schema), &mut offsets)
+            .expect("every frame decodes against the client's own schema");
+        let b = decoded.data_batch.as_ref().expect("data block");
+        for r in 0..b.len() {
+            got.push((
+                mem_pk(b, r),
+                b.get_weight(r),
+                gnitz_store::storage::payload_string(b, r, 0),
+            ));
+        }
+    }
+    let want: Vec<(u128, i64, String)> = rows.iter().map(|(k, v)| (*k as u128, 1i64, v.clone())).collect();
+    assert_eq!(got, want, "the train reassembles to the source, weights included");
 }
 
 /// A projected (gather) reply schema must ride a ONE-OFF wire block: the
 /// table-keyed cache must neither serve it (the master would decode
 /// projected rows with the base table's stride) nor store it (a later
-/// table reply would be decoded with the projected stride).
+/// table reply would be decoded with the projected stride). The block is
+/// unchecksummed — every consumer of a one-off reply decodes through the ring,
+/// which verifies none.
 #[test]
-fn a_projected_stream_batch_carries_a_one_off_block() {
+fn a_projected_reply_carries_a_one_off_block() {
     let dir = crate::test_support::scratch_dir("worker", "projected_one_off");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![
@@ -804,9 +850,13 @@ fn a_projected_stream_batch_carries_a_one_off_block() {
 
     // Fitting projected reply: one frame carrying the projected schema.
     let small = Batch::zeroed(projected, 2);
-    assert!(wp
-        .stream_batch_response(tid as u64, Some(small), ReplySchema::OneOff(&projected), 5, 0, 0)
-        .is_ok());
+    wp.send_scan_response(
+        route(tid as u64, 5, 0),
+        Rc::new(small),
+        ReplySchema::OneOff(&projected),
+        0,
+        false,
+    );
     let frames = walk_frames(ptr);
     assert_eq!(frames.len(), 1);
     let decoded = ipc::decode_wire_ipc(&frames[0].1).expect("decode projected reply");
@@ -818,16 +868,17 @@ fn a_projected_stream_batch_carries_a_one_off_block() {
     // Oversized projected reply: the queued train holds the one-off block.
     let rows = (ipc::FRAME_CAP / 32) + 4096;
     let big = Batch::zeroed(projected, rows);
-    assert!(wp
-        .stream_batch_response(tid as u64, Some(big), ReplySchema::OneOff(&projected), 6, 0, 0)
-        .is_ok());
-    assert_eq!(wp.pending_streams.len(), 1);
-    let expected_block = crate::catalog::encode_schema_block(&projected, tid as u32);
-    let ps = wp.pending_streams.front().unwrap();
-    assert!(
-        matches!(ps.kind, PendingScanKind::Chunked { .. }),
-        "an oversized projected reply must enqueue a Chunked train"
+    wp.send_scan_response(
+        route(tid as u64, 6, 0),
+        Rc::new(big),
+        ReplySchema::OneOff(&projected),
+        0,
+        false,
     );
+    assert_eq!(wp.pending_streams.len(), 1);
+    let expected_block = crate::catalog::encode_schema_block_ipc(&projected, tid as u32);
+    let ps = wp.pending_streams.front().unwrap();
+    assert_eq!(ps.next_row, 0);
     assert_eq!(
         ps.prebuilt_schema.as_deref().map(Vec::as_slice),
         Some(expected_block.as_slice()),
