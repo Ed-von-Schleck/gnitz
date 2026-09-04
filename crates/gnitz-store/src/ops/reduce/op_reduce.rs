@@ -44,7 +44,7 @@ impl<'a> GroupBoundary<'a> {
             GroupBoundary::Single
         } else {
             GroupBoundary::Cols {
-                descs: &plan.group_key.cols,
+                descs: plan.group_key.cols.locs(),
                 exemplar: first_row,
             }
         }
@@ -213,20 +213,9 @@ pub fn op_reduce(
         };
 
         // Materialised once for both the retraction seek and the emitted row, so
-        // the two cannot drift. `PkPermutation` copies the input PK region
-        // verbatim, exact at every width and arity; the other kinds key the output
-        // by a value the input PK does not carry, whose ≤16-byte OPK image
-        // `NarrowPkOpk` writes at the output stride.
-        let narrow_out_pk;
-        let out_pk_bytes: &[u8] = if plan.out_key == ReduceOutKey::PkPermutation {
-            mb.get_pk_bytes(group_start_idx)
-        } else {
-            narrow_out_pk = NarrowPkOpk::new(
-                plan.group_key.key_row(&mb, group_start_idx),
-                output_schema.pk_stride() as usize,
-            );
-            narrow_out_pk.bytes()
-        };
+        // the two cannot drift.
+        let out_pk = plan.out_pk(&mb, group_start_idx);
+        let out_pk_bytes: &[u8] = out_pk.bytes();
 
         // Step accumulators over the group's delta rows (the Some/None dispatch
         // is per group; each arm is a monomorphic walk).

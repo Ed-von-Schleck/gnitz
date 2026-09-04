@@ -197,7 +197,7 @@ fn secondary_index_bench_single_u64_pk_sort() {
 #[test]
 #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
 fn index_write_span_bench() {
-    use crate::schema::{make_index_schema, IndexKeySpec};
+    use crate::schema::IndexKeySpec;
 
     // `src_schema()` / `build_input` from the top of this file: U64 pk (col 0) |
     // U32 (col 1) | I64 (col 2), 500k rows. The four shapes map onto it directly.
@@ -212,8 +212,7 @@ fn index_write_span_bench() {
         ("U32 payload   (promoted)", &[1][..]),
         ("compound (PK, I64)      ", &[0, 2][..]),
     ] {
-        let idx = make_index_schema(cols, &src).unwrap();
-        let spec = IndexKeySpec::new(cols, &src, &idx);
+        let spec = IndexKeySpec::new(cols, &src).unwrap();
         let elapsed = bench_time(ITERS, || {
             let mut key = [0u8; MAX_PK_BYTES];
             for row in 0..N_ROWS {

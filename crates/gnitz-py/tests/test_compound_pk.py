@@ -549,6 +549,61 @@ def test_view_group_by_compound_pk_multiworker(client):
         _cleanup(client, sn, "src")
 
 
+def test_view_group_by_over_a_four_column_pk_with_extremes(client):
+    """`GROUP BY` over ALL FOUR columns of a 4-column PK, with MIN/MAX.
+
+    The widest `ReduceOutKey::PkPermutation` output PK the engine can produce,
+    driving the non-linear aggregates' value index — the reduce keys each group
+    by the source PK region verbatim and indexes its extremes beside it. Both
+    the group-key derivation and that index are packed key layers, so a fault in
+    either shows up here as a wrong extreme rather than as a wrong row count.
+    """
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE src (a INT UNSIGNED, b INT UNSIGNED, c INT UNSIGNED, "
+            "d INT UNSIGNED, v BIGINT NOT NULL, PRIMARY KEY (a, b, c, d))",
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "CREATE VIEW g AS SELECT a AS ka, b AS kb, c AS kc, d AS kd, "
+            "COUNT(*) AS n, MIN(v) AS lo, MAX(v) AS hi "
+            "FROM src GROUP BY a, b, c, d",
+            schema_name=sn,
+        )
+        vid = client.resolve_table(sn, "g")[0]
+        client.execute_sql(
+            "INSERT INTO src (a, b, c, d, v) VALUES "
+            "(1, 1, 1, 1, 10), (1, 1, 1, 2, 20), (1, 2, 3, 4, 30), (2, 1, 1, 1, 40)",
+            schema_name=sn,
+        )
+        # Full-PK grouping: one singleton group per row, each extreme its own v.
+        assert _group_rows(client, vid, "ka", "kb", "kc", "kd", "n", "lo", "hi") == [
+            (1, 1, 1, 1, 1, 10, 10),
+            (1, 1, 1, 2, 1, 20, 20),
+            (1, 2, 3, 4, 1, 30, 30),
+            (2, 1, 1, 1, 1, 40, 40),
+        ]
+        # Retracting the group's only row must retract its extremes with it —
+        # the path that reads the value index rather than recomputing.
+        client.execute_sql(
+            "DELETE FROM src WHERE a = 1 AND b = 1 AND c = 1 AND d = 2",
+            schema_name=sn,
+        )
+        assert _group_rows(client, vid, "ka", "kb", "kc", "kd", "n", "lo", "hi") == [
+            (1, 1, 1, 1, 1, 10, 10),
+            (1, 2, 3, 4, 1, 30, 30),
+            (2, 1, 1, 1, 1, 40, 40),
+        ]
+    finally:
+        try:
+            client.execute_sql("DROP VIEW g", schema_name=sn)
+        except Exception:
+            pass
+        _cleanup(client, sn, "src")
+
+
 # ---------------------------------------------------------------------------
 # Set-operation / DISTINCT views over a compound-PK source.
 # Membership is decided by the synthetic content hash (`_set_pk` /

@@ -29,7 +29,7 @@ use super::SkeletonHydrator;
 use crate::expr::{MapPlan, PkSource};
 use crate::ops::AdhocFold;
 use crate::relation::RelationRegistry;
-use crate::schema::key::{compare_pk_bytes, opk_key, pack_pk_be, pk_range_keys};
+use crate::schema::key::{compare_pk_bytes, opk_key, pack_pk_be, IndexKeySpec};
 use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor};
 use crate::storage::{compare_rows, Batch, PkSetGather, ReadCursor, SourceCursor, StoreError};
 use gnitz_expr::{Evaluator, LogicalProgram};
@@ -255,7 +255,8 @@ fn range_cursor(
     desc: &RangeDescriptor,
     open: impl FnOnce(&[u8], Option<&[u8]>) -> ReadCursor,
 ) -> Result<Option<ReadCursor>, StoreError> {
-    let Some((start, end_key)) = pk_range_keys(schema, desc).map_err(StoreError::rejected)? else {
+    let range_keys = IndexKeySpec::for_pk(schema).range_keys(schema.pk_stride() as usize, desc);
+    let Some((start, end_key)) = range_keys.map_err(StoreError::rejected)? else {
         return Ok(None);
     };
     let end = end_key.as_ref().map(|e| e.pk_bytes());

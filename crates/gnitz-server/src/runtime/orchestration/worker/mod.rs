@@ -1154,7 +1154,7 @@ impl WorkerProcess {
         // protocol-level mismatch rather than a user error) and yields the
         // promoted per-column types/sizes for the span.
         let idx_schema = gnitz_store::schema::make_index_schema(col_indices, &schema)?;
-        let spec = gnitz_store::schema::IndexKeySpec::new(col_indices, &schema, &idx_schema);
+        let spec = gnitz_store::schema::IndexKeySpec::new(col_indices, &schema)?;
         let frame_schema = crate::runtime::wire::unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
         let stride = spec.key_size();

@@ -2,7 +2,7 @@
 //! set has a canonical (order-preserving, injective) single-column key, and the
 //! 128-bit key of a row either way.
 
-use crate::schema::key::hash_fold;
+use crate::schema::key::FoldCols;
 use crate::schema::{ColumnLocator, SchemaDescriptor};
 use gnitz_expr::RowSource;
 
@@ -48,21 +48,20 @@ pub(super) struct GroupKeyCols {
     /// [`GroupKeyCols::canonical_col`], so the flag and the single column it
     /// promises can never be consulted apart.
     canonical: bool,
-    /// The group columns' resolved locators, in group-set order. Empty for a
-    /// global (ungrouped) aggregate, whose key is the constant
-    /// `gnitz_wire::global_group_key()` — which is what `key_row` folds to over
+    /// The group columns in group-set order. Empty for a global (ungrouped)
+    /// aggregate, whose key is `gnitz_wire::global_group_key()` — the fold of
     /// zero columns.
-    pub(super) cols: Vec<ColumnLocator>,
+    pub(super) cols: FoldCols,
 }
 
 impl GroupKeyCols {
     pub(crate) fn new(schema: &SchemaDescriptor, group_by_cols: &[u32]) -> Self {
         // Resolve first: `locate` carries the release-active in-range assert, so
         // every index is proven before anything else reads `schema.columns`.
-        let cols: Vec<ColumnLocator> = group_by_cols.iter().map(|&c| schema.locate(c as usize)).collect();
+        let cols = group_by_cols.iter().map(|&c| schema.locate(c as usize)).collect();
         GroupKeyCols {
             canonical: single_col_canonical_group_key(schema, group_by_cols),
-            cols,
+            cols: FoldCols::new(cols),
         }
     }
 
@@ -71,7 +70,7 @@ impl GroupKeyCols {
     /// injective and order-preserving on the group value".
     #[inline]
     pub(super) fn canonical_col(&self) -> Option<ColumnLocator> {
-        self.canonical.then(|| self.cols[0])
+        self.canonical.then(|| self.cols.locs()[0])
     }
 
     /// The 128-bit group key of `row`. Over an empty group set this is the fold
@@ -82,7 +81,7 @@ impl GroupKeyCols {
         if let Some(col) = self.canonical_col() {
             return col.route_key(src, row);
         }
-        hash_fold(&self.cols, src, row, src.get_null_word(row))
+        self.cols.key_row(src, row, src.get_null_word(row))
     }
 }
 

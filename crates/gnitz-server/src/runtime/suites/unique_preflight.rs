@@ -227,8 +227,7 @@ fn preflight_train_composite_wide_span_roundtrip() {
 /// row's OPK span via `IndexKeySpec::key_bytes`, emitting it once per unit of
 /// weight (capped at a pair), skipping any-NULL rows. Returns the SORTED spans.
 fn project_sorted(batch: &Batch, owner: &SchemaDescriptor, cols: &[u32]) -> Vec<PkBuf> {
-    let idx_schema = make_index_schema(cols, owner).expect("index schema");
-    let spec = IndexKeySpec::new(cols, owner, &idx_schema);
+    let spec = IndexKeySpec::new(cols, owner).unwrap();
     let mb = batch.as_mem_batch();
     let mut keys: Vec<PkBuf> = Vec::new();
     let mut keybuf = PkBuf::zeroed(0);

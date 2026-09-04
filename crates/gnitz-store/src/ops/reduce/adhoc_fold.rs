@@ -32,7 +32,6 @@ use super::agg::Accumulator;
 use super::emit::emit_reduce_row;
 use super::plan::ReducePlan;
 use super::sort::compare_by_group_cols;
-use crate::schema::key::NarrowPkOpk;
 use crate::schema::{ReduceOutKey, SchemaDescriptor};
 use crate::storage::{Batch, StoreError};
 
@@ -192,7 +191,8 @@ impl AdhocFold {
             // probe alike, so a digest collision can never merge two groups.
             let same = |ord: u32| {
                 injective_key
-                    || compare_by_group_cols(&mb, row, &rep_mb, ord as usize, &plan.group_key.cols) == Ordering::Equal
+                    || compare_by_group_cols(&mb, row, &rep_mb, ord as usize, plan.group_key.cols.locs())
+                        == Ordering::Equal
             };
             let ord = match *last {
                 Some((k, ord)) if k == key && same(ord) => ord,
@@ -241,15 +241,11 @@ impl AdhocFold {
         // The exact output row count is the group count — reserve once.
         let mut output = Batch::with_capacity(self.plan.output_schema, self.rep_rows.count.max(1));
         let rep_mb = self.rep_rows.as_mem_batch();
-        let stride = self.plan.output_schema.pk_stride() as usize;
         for ord in 0..self.rep_rows.count {
-            // Synthetic `_agg_pk`: the group key (re-derived from the retained
-            // representative row — a pure function of its group columns),
-            // order-preserving big-endian truncated to the PK stride — the same
-            // bytes `op_reduce` writes. Over an empty group set `key_row` folds
-            // nothing and yields `global_group_key()`, so the global partial and
-            // a view's ground row land on the same V₀ with no arm of its own.
-            let pk = NarrowPkOpk::new(self.plan.group_key.key_row(&rep_mb, ord), stride);
+            // Synthetic `_agg_pk`, off the retained representative row — a pure
+            // function of its group columns. An empty group set folds to
+            // `global_group_key()`, the same V₀ a view's ground row lands on.
+            let pk = self.plan.out_pk(&rep_mb, ord);
             emit_reduce_row(
                 &mut output,
                 (&rep_mb, ord),

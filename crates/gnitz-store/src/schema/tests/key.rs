@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::{make_index_schema, type_code, IndexKeySpec, Placement, SchemaColumn, SchemaDescriptor};
+use crate::schema::{type_code, IndexKeySpec, Placement, SchemaColumn, SchemaDescriptor};
 use crate::storage::BatchBuilder;
 use crate::test_support::pk_only_schema;
 use gnitz_wire::{read_signed_exact, read_unsigned_exact};
@@ -176,7 +176,7 @@ fn compare_pk_bytes_pk_indices_order_not_schema_order() {
 /// and the `9..=15` overlapping pair — must be byte-value-identical to the
 /// generic pad-and-copy at every width. A changed value would silently
 /// corrupt every `pack_pk_be` consumer (the cached sort keys, the route/guard
-/// keys, the bloom probes). Sweeps `1..=16` so no arm boundary is untested.
+/// keys, the bloom probes). Sweeps `0..=16` so no arm boundary is untested.
 #[test]
 fn pack_pk_be_specialization_matches_naive() {
     fn naive(pk: &[u8]) -> u128 {
@@ -185,12 +185,22 @@ fn pack_pk_be_specialization_matches_naive() {
         buf[..take].copy_from_slice(&pk[..take]);
         u128::from_be_bytes(buf)
     }
-    for width in (1usize..=16).chain([24, 80]) {
+    for width in (0usize..=16).chain([24, 80]) {
         for seed in 0u32..256 {
             let bytes: Vec<u8> = (0..width)
                 .map(|i| seed.wrapping_mul(31).wrapping_add(i as u32) as u8)
                 .collect();
             assert_eq!(pack_pk_be(&bytes), naive(&bytes), "width {width} seed {seed}");
+            // Same width taxonomy as `gnitz_wire::widen_pk_be`, opposite
+            // alignment. Pinned here rather than expressed in code: doing the
+            // latter costs a runtime 128-bit shift at every narrow width.
+            if (1..16).contains(&width) {
+                assert_eq!(
+                    pack_pk_be(&bytes),
+                    gnitz_wire::widen_pk_be(&bytes, width) << (8 * (16 - width)),
+                    "width {width} seed {seed}: widen_pk_be identity",
+                );
+            }
         }
     }
 }
@@ -527,7 +537,6 @@ fn index_key_spec_skips_any_null_column() {
         &[0],
     );
     let cols = [1u32, 2];
-    let idx_schema = make_index_schema(&cols, &owner).unwrap();
     // (id, a, b): both present, a NULL, b NULL.
     let rows: [(u128, Option<u128>, Option<u128>); 3] = [
         (1, Some(5), Some(6)), // both present → indexed
@@ -546,7 +555,7 @@ fn index_key_spec_skips_any_null_column() {
         bb.end_row();
     }
     let batch = bb.finish();
-    let spec = IndexKeySpec::new(&cols, &owner, &idx_schema);
+    let spec = IndexKeySpec::new(&cols, &owner).unwrap();
     let mb = batch.as_mem_batch();
     let mut keybuf = PkBuf::zeroed(0);
     assert!(spec.key_bytes(&mb, 0, &mut keybuf), "both columns present ⇒ indexed");
@@ -593,14 +602,12 @@ fn key_bytes_reused_buffer_zeros_tail_when_narrowing() {
 
     // WIDE composite span over (col1, col2): two promoted U64 columns ⇒ 16 bytes.
     let wide_cols = [1u32, 2];
-    let wide_idx = make_index_schema(&wide_cols, &owner).expect("wide index schema");
-    let wide = IndexKeySpec::new(&wide_cols, &owner, &wide_idx);
+    let wide = IndexKeySpec::new(&wide_cols, &owner).unwrap();
     assert_eq!(wide.key_size(), 16, "two U64 index columns ⇒ 16-byte span");
 
     // NARROW span over (col2) alone: one promoted U64 column ⇒ 8 bytes.
     let narrow_cols = [2u32];
-    let narrow_idx = make_index_schema(&narrow_cols, &owner).expect("narrow index schema");
-    let narrow = IndexKeySpec::new(&narrow_cols, &owner, &narrow_idx);
+    let narrow = IndexKeySpec::new(&narrow_cols, &owner).unwrap();
     assert_eq!(narrow.key_size(), 8, "single U64 index column ⇒ 8-byte span");
 
     // ONE reused scratch buffer: wide first, then narrow.
@@ -723,6 +730,78 @@ fn test_german_string_promote_key_empty_is_zero() {
 
     let mb = b.as_mem_batch();
     assert_eq!(german_string_promote_key(mb.get_col_ptr(0, 0, 16), mb.blob), 0);
+}
+
+// -----------------------------------------------------------------------
+// FoldCols::key_row — the one-shot and the streaming form are one digest
+// -----------------------------------------------------------------------
+
+/// The one-shot fold assembles into a stack scratch exactly what the streaming
+/// fold pushes through `RowHasher`. Nothing else would catch them diverging: the
+/// digest feeds group keys, output PKs and AVI buckets, all self-consistent
+/// under either spelling.
+#[test]
+fn hash_fold_one_shot_matches_the_streaming_form() {
+    /// The same columns folded the other way — the arm `FoldCols::new` did not pick.
+    fn flipped(f: &FoldCols) -> FoldCols {
+        FoldCols {
+            locs: f.locs().to_vec(),
+            inline: !f.inline,
+        }
+    }
+
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),  // 0: PK
+            SchemaColumn::new(type_code::I32, 0),  // 1: NOT NULL payload  (slot 0)
+            SchemaColumn::new(type_code::U64, 1),  // 2: nullable payload  (slot 1)
+            SchemaColumn::new(type_code::U128, 0), // 3: wide payload      (slot 2)
+            SchemaColumn::new(type_code::U16, 1),  // 4: nullable payload  (slot 3)
+        ],
+        &[0],
+    );
+    let mut b = Batch::with_capacity(schema, 2);
+    // Row 0: nothing NULL. Row 1: the two nullable columns NULL, so both the
+    // marker-only arm and the marker+route-key arm run in one row.
+    for (pk, null_word) in [(7u128, 0u64), (8u128, (1u64 << 1) | (1u64 << 3))] {
+        b.extend_pk(pk);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&null_word.to_le_bytes());
+        b.extend_col(0, &(-9i32).to_le_bytes());
+        b.extend_col(1, &42u64.to_le_bytes());
+        b.extend_col(2, &(u128::MAX - 3).to_le_bytes());
+        b.extend_col(3, &5u16.to_le_bytes());
+        b.count += 1;
+    }
+    let mb = b.as_mem_batch();
+
+    let all: Vec<ColumnLocator> = (0..5).map(|c| schema.locate(c)).collect();
+    // Every arity from the global aggregate's empty fold up to the full set.
+    for k in 0..=all.len() {
+        let f = FoldCols::new(all[..k].to_vec());
+        assert!(f.inline, "arity {k} is fixed-width and fits the scratch");
+        let g = flipped(&f);
+        for row in 0..2 {
+            let null_word = mb.get_null_word(row);
+            assert_eq!(
+                f.key_row(&mb, row, null_word),
+                g.key_row(&mb, row, null_word),
+                "arity {k}, row {row}"
+            );
+        }
+    }
+
+    // The two shapes that must keep streaming: variable-length content, and a
+    // group set wider than the stack scratch.
+    let gs = make_schema_pk_u64_payload_string();
+    assert!(
+        !FoldCols::new(vec![gs.locate(1)]).inline,
+        "a German-string column streams"
+    );
+    assert!(
+        !FoldCols::new(vec![all[1]; FOLD_INLINE_COLS + 1]).inline,
+        "a group set past the scratch streams"
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -1415,8 +1494,14 @@ fn probe_key_distinguishes_spans_past_the_narrow_width() {
 }
 
 // ---------------------------------------------------------------------------
-// `pk_range_keys` — a range descriptor's cut pair as a base-PK key range
+// A range descriptor's cut pair as a base-PK key range
 // ---------------------------------------------------------------------------
+
+/// The base-PK key range, through the degenerate identity-promotion span. The
+/// expected bytes below predate `for_pk`, so they pin its promotion too.
+fn pk_range_keys(schema: &SchemaDescriptor, d: &RangeDescriptor) -> Result<Option<(PkBuf, Option<PkBuf>)>, String> {
+    IndexKeySpec::for_pk(schema).range_keys(schema.pk_stride() as usize, d)
+}
 
 fn opk_u64(v: u64) -> Vec<u8> {
     v.to_be_bytes().to_vec() // U64 OPK is plain big-endian

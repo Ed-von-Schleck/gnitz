@@ -500,7 +500,7 @@ impl RelationRegistry {
                 index_schema,
             )?),
         };
-        let key_spec = crate::schema::IndexKeySpec::new(cols, &owner_schema, &index_schema);
+        let key_spec = crate::schema::IndexKeySpec::new(cols, &owner_schema).map_err(StoreError::rejected)?;
         self.tables
             .get_mut(&owner)
             .expect("resolved above")

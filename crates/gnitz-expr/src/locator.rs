@@ -46,6 +46,11 @@ const _: () = assert!(
 );
 
 impl ColumnLocator {
+    /// The designated padding locator: a zero-width PK column at offset 0.
+    /// Names no real column — it fills the unused slots of a fixed-size
+    /// locator array, mirroring `SchemaColumn::EMPTY` beside it.
+    pub const EMPTY: ColumnLocator = ColumnLocator::Pk { byte_off: 0, size: 0, type_code: 0 };
+
     #[inline(always)]
     pub fn size(&self) -> usize {
         match *self {

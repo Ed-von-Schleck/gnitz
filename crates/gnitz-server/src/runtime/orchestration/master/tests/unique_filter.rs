@@ -1,7 +1,6 @@
 use super::super::fixtures::{make_row_batch, test_dispatcher, two_col_schema};
 use super::super::preflight::PreflightAccumulator;
 use super::*;
-use gnitz_store::schema::make_index_schema;
 
 /// The OPK leading-key span of a single U64 value — what `key_bytes` produces
 /// for a U64-promoted index column.
@@ -12,7 +11,7 @@ fn span_u64(v: u64) -> PkBuf {
 /// Span-extraction spec for a unique index on `cols`, promoted exactly as
 /// production circuit registration does.
 fn test_spec(cols: &[u32], schema: &SchemaDescriptor) -> IndexKeySpec {
-    IndexKeySpec::new(cols, schema, &make_index_schema(cols, schema).unwrap())
+    IndexKeySpec::new(cols, schema).unwrap()
 }
 
 /// The filter's whole contract: it never proves a present span absent, and past

@@ -1655,7 +1655,7 @@ fn test_seek_prefix_matches_projection() {
         let b = bb.finish();
         gnitz_store::storage::batch_project_index(
             &b,
-            &gnitz_store::schema::IndexKeySpec::new(&[1, 2], &src, &idx),
+            &gnitz_store::schema::IndexKeySpec::new(&[1, 2], &src).unwrap(),
             &idx,
         )
     };
@@ -1664,7 +1664,7 @@ fn test_seek_prefix_matches_projection() {
     let key_size = idx.leading_key_size(2);
     let proj_key = &projected.get_pk_bytes(0)[..key_size];
 
-    let spec = IndexKeySpec::new(&[1, 2], &src, &idx);
+    let spec = IndexKeySpec::new(&[1, 2], &src).unwrap();
     let opk = spec.seek_prefix(&[(-5i32) as u32 as u128, 42u128]);
     assert_eq!(opk.pk_bytes().len(), key_size);
     assert_eq!(
@@ -1694,7 +1694,7 @@ fn index_key_spec_equals_projected_leading_span() {
     // Composite unique on (a, b): promoted (I64→U64, U128→U128) = 8 + 16 = 24.
     let cols = [1u32, 2];
     let idx_schema = make_index_schema(&cols, &owner).unwrap();
-    let spec = IndexKeySpec::new(&cols, &owner, &idx_schema);
+    let spec = IndexKeySpec::new(&cols, &owner).unwrap();
     let idx_key_size = spec.key_size();
     assert_eq!(idx_key_size, 8 + 16, "I64→U64 (8) + U128 (16)");
 
@@ -1710,7 +1710,7 @@ fn index_key_spec_equals_projected_leading_span() {
 
     // Reference: the projected index entry's leading idx_key_size bytes.
     let projected =
-        gnitz_store::storage::batch_project_index(&batch, &IndexKeySpec::new(&cols, &owner, &idx_schema), &idx_schema);
+        gnitz_store::storage::batch_project_index(&batch, &IndexKeySpec::new(&cols, &owner).unwrap(), &idx_schema);
     assert_eq!(projected.len(), rows.len());
 
     let mb = batch.as_mem_batch();
@@ -1745,7 +1745,7 @@ fn project_leading_span(src: SchemaDescriptor, idx: &SchemaDescriptor, native: u
     bb.end_row();
     let projected = {
         let b = bb.finish();
-        gnitz_store::storage::batch_project_index(&b, &gnitz_store::schema::IndexKeySpec::new(&[1], &src, idx), idx)
+        gnitz_store::storage::batch_project_index(&b, &gnitz_store::schema::IndexKeySpec::new(&[1], &src).unwrap(), idx)
     };
     let key_size = idx.columns[0].size() as usize;
     projected.get_pk_bytes(0)[..key_size].to_vec()
@@ -1831,7 +1831,7 @@ fn write_span_matches_the_oracle_on_compound_null_and_entry_shapes() {
     );
     let cols = [1u32, 2];
     let idx = make_index_schema(&cols, &src).unwrap();
-    let spec = IndexKeySpec::new(&cols, &src, &idx);
+    let spec = IndexKeySpec::new(&cols, &src).unwrap();
 
     let mut bb = BatchBuilder::new(src);
     for (i, &(a, v)) in [(7u32, -1i64), (0, 0), (u32::MAX, i64::MIN), (3, i64::MAX)]
@@ -1909,7 +1909,7 @@ fn write_span_matches_seek_prefix_across_type_ladder() {
         let pk_src = SchemaDescriptor::new(&[SchemaColumn::new(t, 0), SchemaColumn::new(tc::U64, 0)], &[0]);
         let pk_idx = make_index_schema(&[0], &pk_src).unwrap();
         assert_eq!(pk_idx.columns[0].type_code, idx_type);
-        let pk_spec = IndexKeySpec::new(&[0], &pk_src, &pk_idx);
+        let pk_spec = IndexKeySpec::new(&[0], &pk_src).unwrap();
 
         for &v in values {
             let native = native_u128_at(v, sz);
@@ -1966,7 +1966,7 @@ fn composite_index_signed_leading_unsigned_tiebreak_orders() {
             let b = bb.finish();
             gnitz_store::storage::batch_project_index(
                 &b,
-                &gnitz_store::schema::IndexKeySpec::new(&[1, 2], &src, &idx),
+                &gnitz_store::schema::IndexKeySpec::new(&[1, 2], &src).unwrap(),
                 &idx,
             )
         };

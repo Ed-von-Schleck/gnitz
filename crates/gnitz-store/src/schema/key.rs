@@ -10,9 +10,15 @@
 //! ([`IndexKeySpec`]) and a reindex's synthetic PK ([`ReindexPacker`]). None of
 //! them reaches up into storage — the dependency runs `storage → schema::key`,
 //! the legitimate downward direction. This module is the one import path: every
-//! caller, storage included, names `crate::schema::key::X`, and every
-//! native→OPK encoder lives here so the write, seek and route sides cannot
-//! spell the encoding differently.
+//! caller, storage included, names `crate::schema::key::X`.
+//!
+//! Native→OPK encoding has a three-way seam, and this module is one face of it:
+//! `gnitz_wire::pk` is the untyped per-column codec shared with the client,
+//! `gnitz_expr::locator` the row-sourced face (what `write_span` and `pack_into`
+//! read through), and this module the schema-typed, value-sourced face — every
+//! such encoder in this crate lives here, so the write, seek and route sides
+//! cannot spell one differently. `gnitz-core`'s `build_pk_region_into` is the
+//! client's own face of the same codec.
 
 use std::cmp::Ordering;
 
@@ -35,6 +41,14 @@ use crate::schema::{
 /// identical to the typed comparison of the PK columns for any width. `a.cmp(b)`
 /// compiles to an optimal `memcmp`. `a` and `b` are the OPK bytes produced by
 /// `Batch::get_pk_bytes` / `MappedShard::get_pk_bytes`.
+///
+/// This and [`compare_pk_ordering`] return the same `Ordering` for equal-width
+/// inputs. The rule between them: this one is **total** — it accepts operands of
+/// differing width and orders them lexicographically — while
+/// `compare_pk_ordering` requires equal widths and settles everything up to 16
+/// bytes on the packed `u128` image instead. Reach for that one wherever the two
+/// operands are one relation's rows (a merge, a group fold, a probe); reach for
+/// this one where a width may differ or the operand is untrusted.
 #[inline(always)]
 pub fn compare_pk_bytes(a: &[u8], b: &[u8]) -> Ordering {
     a.cmp(b)
@@ -42,7 +56,7 @@ pub fn compare_pk_bytes(a: &[u8], b: &[u8]) -> Ordering {
 
 /// Typed lexicographic OPK ordering of two **equal-length** PK regions — the
 /// comparator the N-way merge and the read-cursor loser tree read through their
-/// sources. Returns the same `Ordering` as `compare_pk_bytes` at every width,
+/// sources. Returns the same `Ordering` as [`compare_pk_bytes`] at every width,
 /// settling the common case on the leading-16 `pack_pk_be` image. For `len ≤ 16`
 /// that image is the *whole* PK and is injective, so a `pack_pk_be` tie is
 /// already a byte-equal PK — the byte
@@ -59,14 +73,10 @@ pub(crate) fn compare_pk_ordering(a: &[u8], b: &[u8]) -> Ordering {
 }
 
 /// OPK byte-equality of two **equal-length** PK regions (a full PK, or a shared
-/// equi-prefix sliced to the same width on both sides) — the equality sibling of
-/// [`compare_pk_ordering`]. `pk_bytes_eq(a, b) == (a == b)` at every width: for
-/// `len ≤ 16` the executed path is the register `pack_pk_be` compare with no
-/// `bcmp`/`memcmp` call (OPK encoding is a bijection, so the left-aligned `u128`
-/// images are equal iff the keys are byte-equal); for `len > 16` it confirms a
-/// leading-16 prefix tie with the full `compare_pk_bytes`. Operates under the same
-/// equal-width contract as `compare_pk_ordering`. Use at every merge/group fold or
-/// probe that tests "same PK".
+/// equi-prefix sliced to the same width on both sides): [`compare_pk_ordering`]'s
+/// `Equal`, so it inherits that function's equal-width contract, its width
+/// reasoning and its `pk_bytes_eq(a, b) == (a == b)` guarantee. Use at every
+/// merge/group fold or probe that tests "same PK".
 #[inline(always)]
 pub(crate) fn pk_bytes_eq(a: &[u8], b: &[u8]) -> bool {
     compare_pk_ordering(a, b) == Ordering::Equal
@@ -93,9 +103,8 @@ pub(crate) fn pk_in_range(min: &[u8], max: &[u8], key: &[u8]) -> bool {
 /// [`seek_opk_bytes`].
 ///
 /// The schema-typed face of [`gnitz_wire::encode_pk_tuple`], fed
-/// `schema.pk_columns()` — the *same* iterator `compare_pk_bytes` walks — so a
-/// non-identity `pk_indices` (e.g. `[1, 0]`) encodes in pk-list order, matching
-/// the comparator.
+/// `schema.pk_columns()`, so a non-identity `pk_indices` (e.g. `[1, 0]`) encodes
+/// in pk-list order — which is the order the resulting bytes are compared in.
 ///
 /// The encoding is **injective**: `encode(a) == encode(b)` iff `a == b`
 /// byte-for-byte, because each column's transform is a bijection on its byte
@@ -172,11 +181,15 @@ pub fn seek_opk_bytes(schema: &SchemaDescriptor, low: u128, extra: &[u8]) -> Res
 /// minimum full key of its group and may be widened with [`PkBuf::padded`].
 ///
 /// The one native→OPK leading-span encoder, shared by the index seek path
-/// (`IndexKeySpec::seek_prefix`, whose sources promote to wider index columns)
-/// and the base-table PK range path (whose source and target types are equal,
-/// making the promotion the identity arm of `encode_pk_column_promoted`). Both
-/// must agree byte-for-byte with the write side's `IndexKeySpec::write_span`,
-/// which is why they encode through the same call rather than each spelling it.
+/// (whose sources promote to wider index columns) and the base-table PK range
+/// path (whose source and target types are equal, making the promotion the
+/// identity arm of `encode_pk_column_promoted`).
+///
+/// Its bytes must equal the write side's, which reaches the encoding through
+/// `ColumnLocator::encode_opk_promoted` rather than through here. They do:
+/// both bottom out in `gnitz_wire::encode_pk_column_promoted`, and the write
+/// side's PK arm reaches the same image through `promote_opk_column`, which is
+/// that call composed with `encode_pk_column`'s inverse.
 pub(crate) fn encode_leading_opk(cols: impl IntoIterator<Item = (u8, SchemaColumn)>, natives: &[u128]) -> PkBuf {
     let mut out = PkBuf::zeroed(0);
     let mut off = 0usize;
@@ -266,11 +279,14 @@ pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
 /// width. A *native* value must be encoded through [`opk_key`] instead, which
 /// applies the per-column sign flip this does not.
 ///
-/// The one home for "right-align a `u128` into an OPK of width `stride`" — every
-/// synthetic-key writer (the batch PK setters, the reduce group-key emitters)
-/// builds one, so the width checks below cannot be skipped by hand-rolling
-/// `&pk.to_be_bytes()[16 - stride..]`, which silently truncates a value that
-/// overflows the stride. Zero-cost: a stack value, no allocation.
+/// The home for "right-align a `u128` into an OPK of width `stride`" wherever
+/// the stride is a runtime value — the batch PK setters and the reduce
+/// group-key emitters build one, so the width checks below cannot be skipped by
+/// hand-rolling `&pk.to_be_bytes()[16 - stride..]`, which silently truncates a
+/// value that overflows the stride. (A writer whose slot width is fixed by the
+/// schema — the packer's string and float arms, `AviBake::entry` — is
+/// width-total already and copies its `to_be_bytes` directly.) Zero-cost: a
+/// stack value, no allocation.
 pub(crate) struct NarrowPkOpk {
     be: [u8; 16],
     stride: usize,
@@ -375,9 +391,11 @@ impl PkSortKey for [u128; 2] {
         if opk.len() == 32 {
             [hi, u128::from_be_bytes(opk[16..32].try_into().unwrap())]
         } else {
-            let mut lo = [0u8; 16];
-            lo[..opk.len() - 16].copy_from_slice(&opk[16..]);
-            [hi, u128::from_be_bytes(lo)]
+            // `pack_pk_be` is left-align-into-a-`u128`, so its width arms give the
+            // partial limb register loads where a runtime-length copy lowered to a
+            // `memcpy` call. Measured per key build, against that copy: -48% at
+            // stride 24, -37% at 20, -3% at 31, +2% at 17.
+            [hi, pack_pk_be(&opk[16..])]
         }
     }
 }
@@ -475,6 +493,8 @@ impl PkBuf {
     /// empty-shard form, and the mutable scratch every reused key buffer starts
     /// from. The fields are crate-visible: in-crate callers write the meaningful
     /// span in place, outside go through `set_from` / `pk_bytes` / `padded`.
+    ///
+    #[inline(always)] // per-row across the crate boundary; dev builds inline nothing else
     pub fn zeroed(len: usize) -> Self {
         debug_assert!(len <= MAX_PK_BYTES);
         PkBuf {
@@ -488,6 +508,7 @@ impl PkBuf {
     /// so no key of that width sorts above it. The upper bound an open-ended
     /// range takes, where a short key would sort *below* every full key sharing
     /// its prefix.
+    #[inline(always)]
     pub(crate) fn max(len: usize) -> Self {
         debug_assert!(len <= MAX_PK_BYTES);
         let mut k = PkBuf {
@@ -502,6 +523,7 @@ impl PkBuf {
     /// zero. The row constructor: `MappedShard::get_pk_bytes(row)`
     /// returns exactly `pk_stride` bytes, and manifest `parse` passes
     /// its on-disk `len`/payload slice.
+    #[inline(always)]
     pub fn from_bytes(slice: &[u8]) -> Self {
         debug_assert!(slice.len() <= MAX_PK_BYTES);
         let mut bytes = [0u8; MAX_PK_BYTES];
@@ -565,63 +587,97 @@ impl PkBuf {
     }
 }
 
-/// Precomputed read/encode plan for one index's OPK leading-key span: per
-/// indexed column, the owner-side read coordinate (PK-or-payload, resolved via
-/// `locate` — a PK source column is sliced from the packed OPK PK region, a
-/// payload column read from its dense slot) and the promoted index column it
-/// is encoded at. Built once per circuit so the row paths do no catalog
-/// reborrow, schema indexing, or allocation; `Copy`, so descriptors carrying
-/// it stay allocation-free.
-///
-/// The span is the single definition of "what key do this row's indexed
-/// columns map to", shared by every uniqueness-enforcement site (in-batch
-/// validator, backfill dedup via `batch_project_index`, broadcast-skip filter,
-/// insert-time check, pre-flight) — byte-equal ⟺ index-value equal at any
-/// width, and byte-lexicographic order is the seek/merge order.
+/// One indexed column: where the owner-side value lives (`locate` — a PK source
+/// is sliced from the OPK region, a payload column read from its dense slot),
+/// and the promoted key column it encodes at, whose `size()` is the slot width.
+#[derive(Clone, Copy)]
+struct IndexKeyCol {
+    loc: ColumnLocator,
+    out: SchemaColumn,
+}
+
+impl IndexKeyCol {
+    /// Unused slots of the fixed array: the schema layer's designated padding
+    /// column and locator. `kind` is arbitrary — nothing reads past `n`.
+    const EMPTY: IndexKeyCol = IndexKeyCol {
+        loc: ColumnLocator::EMPTY,
+        out: SchemaColumn::EMPTY,
+    };
+
+    fn new(loc: ColumnLocator, out: SchemaColumn) -> Self {
+        IndexKeyCol { loc, out }
+    }
+}
+
+/// The single definition of "what key do these columns map to": byte-equal ⟺
+/// value-equal at any width, byte-lexicographic order is the seek/merge order.
+/// Built once per circuit, `Copy`, so the row paths allocate nothing.
+/// [`Self::new`] is a secondary index's span, [`Self::for_pk`] a base table's
+/// own PK under the identity promotion.
 #[derive(Clone, Copy)]
 pub struct IndexKeySpec {
     n: u8,
-    /// Span width in bytes — the sum of the promoted column widths, precomputed
-    /// so the per-row `key_bytes` path does no re-summation.
+    /// Sum of the promoted column widths, so the row path re-sums nothing.
     key_size: u8,
-    locators: [ColumnLocator; gnitz_wire::PK_LIST_MAX_COLS],
-    idx_cols: [SchemaColumn; gnitz_wire::PK_LIST_MAX_COLS],
+    /// Sized by `MAX_PK_COLUMNS`, not the wire's `PK_LIST_MAX_COLS`: `for_pk`
+    /// may be handed an index schema, whose PK arity reaches the engine limit.
+    cols: [IndexKeyCol; MAX_PK_COLUMNS],
 }
 
 impl IndexKeySpec {
-    /// `cols` is the circuit's source column list (owner-schema indices);
-    /// `idx_schema` supplies the promoted leading columns the span encodes at.
-    pub fn new(cols: &[u32], owner: &SchemaDescriptor, idx_schema: &SchemaDescriptor) -> Self {
-        debug_assert!(!cols.is_empty() && cols.len() <= gnitz_wire::PK_LIST_MAX_COLS);
-        let mut locators = [ColumnLocator::Pk { byte_off: 0, size: 0, type_code: 0 }; gnitz_wire::PK_LIST_MAX_COLS];
-        let mut idx_cols = [SchemaColumn::EMPTY; gnitz_wire::PK_LIST_MAX_COLS];
-        for (i, &c) in cols.iter().enumerate() {
-            locators[i] = owner.locate(c as usize);
-            idx_cols[i] = idx_schema.columns[i];
-            // Spec-invariant, so checked once per circuit rather than per column
-            // per row: `write_span` hands each source's bytes to the OPK encoder
-            // *at `idx_cols[i].type_code`*, so the index column must be exactly
-            // the source's promotion. `index_key_type` errors on STRING/BLOB, so
-            // this also subsumes "a German-string source needs a content hash,
-            // not a raw cell encode" — its 16-byte struct (a heap offset for a
-            // long string) would otherwise encode as if it were an integer. Every
-            // production caller builds `idx_schema` through `make_index_schema`,
-            // which derives it from this very function.
-            debug_assert_eq!(
-                gnitz_wire::index_key_type(locators[i].type_code()).ok(),
-                Some(idx_cols[i].type_code),
-                "IndexKeySpec: index column {i} is not the source column's promotion",
-            );
+    /// The span of a secondary index on `cols` of `owner`, promoted through the
+    /// [`gnitz_wire::index_key_type`] that `make_index_schema` also derives the
+    /// index schema from — so spec and schema cannot disagree.
+    ///
+    /// `Err` on an arity outside `1..=MAX_PK_COLUMNS`, an out-of-range column, or
+    /// a type no index key carries (floats, and STRING/BLOB, whose German-string
+    /// struct would encode as if it were an integer).
+    pub fn new(cols: &[u32], owner: &SchemaDescriptor) -> Result<Self, String> {
+        // An arity the fixed array cannot hold is rejected, not asserted: this is
+        // `pub`, and an untrusted circuit naming six columns would otherwise be a
+        // release-active index-out-of-bounds.
+        if cols.is_empty() || cols.len() > MAX_PK_COLUMNS {
+            return Err(format!(
+                "Index: key arity {} is outside 1..={MAX_PK_COLUMNS}",
+                cols.len(),
+            ));
         }
-        IndexKeySpec {
+        let mut spec = IndexKeySpec {
             n: cols.len() as u8,
-            key_size: idx_schema.leading_key_size(cols.len()) as u8,
-            locators,
-            idx_cols,
+            key_size: 0,
+            cols: [IndexKeyCol::EMPTY; MAX_PK_COLUMNS],
+        };
+        for (i, &c) in cols.iter().enumerate() {
+            if c as usize >= owner.num_columns() {
+                return Err(format!(
+                    "Index: column index {c} out of bounds (columns={})",
+                    owner.num_columns(),
+                ));
+            }
+            let loc = owner.locate(c as usize);
+            let out = SchemaColumn::new(gnitz_wire::index_key_type(loc.type_code())?, 0);
+            spec.cols[i] = IndexKeyCol::new(loc, out);
+            spec.key_size += out.size();
         }
+        Ok(spec)
     }
 
-    /// Span width (`idx_key_size`); see `SchemaDescriptor::leading_key_size`.
+    /// A base table's own PK as the degenerate span: each column encodes at its
+    /// own type, which is `encode_pk_column_promoted`'s identity arm. Lets a PK
+    /// range walk read through the same [`Self::range_keys`] an index walk does.
+    pub(crate) fn for_pk(schema: &SchemaDescriptor) -> Self {
+        let mut spec = IndexKeySpec {
+            n: schema.pk_indices().len() as u8,
+            key_size: schema.pk_stride(),
+            cols: [IndexKeyCol::EMPTY; MAX_PK_COLUMNS],
+        };
+        for (i, (ci, col)) in schema.pk_columns().enumerate() {
+            spec.cols[i] = IndexKeyCol::new(schema.locate(ci), *col);
+        }
+        spec
+    }
+
+    /// Span width in bytes (`idx_key_size`) — the sum of the promoted widths.
     #[inline]
     pub fn key_size(&self) -> usize {
         self.key_size as usize
@@ -634,31 +690,28 @@ impl IndexKeySpec {
     /// to the seek-side [`Self::seek_prefix`], so the in-memory key, the
     /// projected index entry, and the seek prefix agree by construction.
     ///
-    /// Each column encodes through `encode_pk_column_promoted`, sign-extending a
+    /// Each column bottoms out in `encode_pk_column_promoted`, sign-extending a
     /// signed source from its native width before OPK-encoding at the promoted
     /// index column: the span is order-preserving for every type (a signed source
     /// promotes to a signed `I64`/`I128` index column whose sign-flip puts
     /// negatives below non-negatives), and equality-correct (equal logical values
     /// pack byte-identically regardless of source/target width). A column whose
     /// source already matches the index type (`U128`/`UUID`, base unsigned ≤8B)
-    /// reduces to `encode_pk_column`.
+    /// reduces to a copy of its at-rest OPK window.
     ///
-    /// The encoding is the locator's own `encode_opk_promoted`, which is also
-    /// what the sibling [`ReindexPacker::pack_into`] calls: the two must emit
-    /// byte-identical keys for one logical value, and sharing the method is what
-    /// makes that hold by construction rather than by two sites agreeing.
+    /// The sibling [`ReindexPacker::pack_into`] emits byte-identical keys for one
+    /// logical value; both reach `gnitz_wire::encode_pk_column_promoted`.
     pub fn write_span(&self, mb: &impl RowSource, row: usize, dst: &mut [u8]) -> bool {
         debug_assert!(dst.len() >= self.key_size(), "write_span: dst shorter than the span");
         let mut off = 0;
-        let n = self.n as usize;
-        for (loc, col) in self.locators[..n].iter().zip(&self.idx_cols[..n]) {
-            // PK columns are never null, so this is the payload-only NULL gate.
-            if loc.is_null(mb, row) {
+        for c in &self.cols[..self.n as usize] {
+            if c.loc.is_null(mb, row) {
                 return false;
             }
-            let target_w = col.size() as usize; // promoted index column width
-            loc.encode_opk_promoted(mb, row, col.type_code, &mut dst[off..off + target_w]);
-            off += target_w;
+            let w = c.out.size() as usize;
+            c.loc
+                .encode_opk_promoted(mb, row, c.out.type_code, &mut dst[off..off + w]);
+            off += w;
         }
         true
     }
@@ -708,9 +761,9 @@ impl IndexKeySpec {
     /// Seek-side counterpart of [`Self::write_span`]: OPK-encode native key
     /// values (zero-extended, as `pk_native_key`/`payload_native_key` produce
     /// them) into the leading-key span, returned as a [`PkBuf`] of exactly
-    /// the encoded span's width. Encodes through the shared
-    /// [`encode_leading_opk`], the same per-column call `write_span` makes,
-    /// so the seek prefix matches the projected entries by construction. Bytes
+    /// the encoded span's width. Encodes through [`encode_leading_opk`], which
+    /// bottoms out in the same `gnitz_wire::encode_pk_column_promoted` the write
+    /// side reaches, so the seek prefix matches the projected entries. Bytes
     /// past the span stay zero (the source-PK suffix is not part of it).
     ///
     /// A leading-prefix seek passes fewer values than the spec has columns and
@@ -723,29 +776,51 @@ impl IndexKeySpec {
             k >= 1 && k <= self.n as usize,
             "seek_prefix: one native value per leading spec column"
         );
-        let cols = self.locators[..k]
-            .iter()
-            .zip(&self.idx_cols[..k])
-            .map(|(loc, col)| (loc.type_code(), *col));
-        encode_leading_opk(cols, natives)
+        encode_leading_opk(self.cols[..k].iter().map(|c| (c.loc.type_code(), c.out)), natives)
     }
 
-    /// The half-open OPK key range `[start, end)` for `range` over this index's
-    /// key space, each key exactly `stride` bytes (leading span plus source-PK
-    /// suffix) — [`eq_prefix_range_keys`] with [`Self::seek_prefix`] as its
-    /// group-prefix encoder, which is the same baked spec `write_span` projects
-    /// entries with, so cut and entry are byte-identical by construction.
+    /// The half-open OPK key range `[start, end)` for `range` over this key
+    /// space, each key exactly `stride` bytes (the leading span plus, for a
+    /// secondary index, the source-PK suffix).
     ///
-    /// `Ok(None)` = provably empty; `Err` = the descriptor pins every indexed
-    /// column with no range column left.
+    /// `range` pins its leading `eq_vals()` columns and cut-bounds the next.
+    /// Each cut names the group [`Self::seek_prefix`] encodes for it — the same
+    /// baked spec `write_span` projects entries with.
+    ///
+    /// `Ok(None)` = provably empty; `Err` = every column pinned, no range column
+    /// left (which also keeps the group prefix narrower than `stride`).
     pub(crate) fn range_keys(
         &self,
         stride: usize,
         range: &RangeDescriptor,
     ) -> Result<Option<(PkBuf, Option<PkBuf>)>, String> {
-        eq_prefix_range_keys(range, self.n as usize, stride, "index range", |natives| {
-            self.seek_prefix(natives)
-        })
+        fn cut(c: Cut, group: &PkBuf) -> KeyCut<'_> {
+            match c {
+                Cut::Before(_) => KeyCut::min_of(group.pk_bytes()),
+                Cut::After(_) => KeyCut::above(group.pk_bytes()),
+            }
+        }
+        let eq_natives = range.eq_vals();
+        let n_eq = eq_natives.len();
+        // Written `n_eq >= arity`, never a `+ 1` that could overflow on an
+        // adversarial length.
+        if n_eq >= self.n as usize {
+            return Err(format!(
+                "key range: n_eq {n_eq} has no range column within arity {}",
+                self.n
+            ));
+        }
+        let mut natives = [0u128; MAX_PK_COLUMNS];
+        natives[..n_eq].copy_from_slice(eq_natives);
+        natives[n_eq] = range.start.value();
+        let start = self.seek_prefix(&natives[..=n_eq]);
+        natives[n_eq] = range.end.value();
+        let end = self.seek_prefix(&natives[..=n_eq]);
+        Ok(key_range_between_cuts(
+            cut(range.start, &start),
+            cut(range.end, &end),
+            stride,
+        ))
     }
 }
 
@@ -825,63 +900,8 @@ pub(crate) fn key_range_between_cuts(start: KeyCut, end: KeyCut, stride: usize) 
     Some((start, end))
 }
 
-/// Map `range`'s cut pair to its half-open `[start, end)` OPK key range via
-/// [`key_range_between_cuts`]: `Before(v)` is [`KeyCut::min_of`] the group
-/// `encode(v)` names, `After(v)` is [`KeyCut::above`] it. `encode` returns that
-/// group as a `PkBuf` whose `len` is the prefix width.
-///
-/// SQL bound semantics (inclusivity, unboundedness, out-of-range saturation)
-/// are resolved to cuts in the planner; none reach this layer.
-pub(crate) fn range_keys_from_cuts(
-    range: &RangeDescriptor,
-    stride: usize,
-    mut encode: impl FnMut(u128) -> PkBuf,
-) -> Option<(PkBuf, Option<PkBuf>)> {
-    fn cut(c: Cut, group: &PkBuf) -> KeyCut<'_> {
-        match c {
-            Cut::Before(_) => KeyCut::min_of(group.pk_bytes()),
-            Cut::After(_) => KeyCut::above(group.pk_bytes()),
-        }
-    }
-    let (s, e) = (encode(range.start.value()), encode(range.end.value()));
-    key_range_between_cuts(cut(range.start, &s), cut(range.end, &e), stride)
-}
-
-/// [`range_keys_from_cuts`] for a range whose leading `range.eq_vals()` columns
-/// are equality-pinned and whose next column is cut-bounded — the shape both the
-/// base-PK and the secondary-index walks take. `encode_leading` OPK-encodes the
-/// first `n_eq + 1` column values into their group prefix; `arity` is the key's
-/// column count and `stride` its full byte width.
-///
-/// `Ok(None)` = provably empty. `Err` = the descriptor pins every column with no
-/// range column left within `arity` — a trust-boundary rejection the `pub` seek
-/// paths surface and a backfill bound merely degrades on. Guarding here also
-/// keeps `prefix_len < stride` strict, so the pad always extends the group key.
-/// `what` names the key space in that message.
-fn eq_prefix_range_keys(
-    range: &RangeDescriptor,
-    arity: usize,
-    stride: usize,
-    what: &str,
-    encode_leading: impl Fn(&[u128]) -> PkBuf,
-) -> Result<Option<(PkBuf, Option<PkBuf>)>, String> {
-    let eq_natives = range.eq_vals();
-    let n_eq = eq_natives.len();
-    // Written `n_eq >= arity`, never a `+ 1` that could overflow on an
-    // adversarial length.
-    if n_eq >= arity {
-        return Err(format!("{what}: n_eq {n_eq} has no range column within arity {arity}"));
-    }
-    let mut natives = [0u128; gnitz_wire::PK_LIST_MAX_COLS];
-    natives[..n_eq].copy_from_slice(eq_natives);
-    Ok(range_keys_from_cuts(range, stride, |v| {
-        natives[n_eq] = v;
-        encode_leading(&natives[..=n_eq])
-    }))
-}
-
 /// True when every key in a half-open `[start, end)` range from
-/// [`range_keys_from_cuts`] shares its leading `prefix` bytes. Since OPK order IS
+/// [`IndexKeySpec::range_keys`] shares its leading `prefix` bytes. Since OPK order IS
 /// byte order, it is enough that the range's first and last keys agree there.
 ///
 /// The last key is `end - 1`, undoing the `After` successor (and any carry ripple)
@@ -901,34 +921,6 @@ fn range_shares_prefix(start: &PkBuf, end: Option<&PkBuf>, prefix: usize) -> boo
     start.pk_bytes()[..prefix] == last.pk_bytes()[..prefix]
 }
 
-/// The half-open OPK key range `[start, end)` for `range` over `schema`'s PK —
-/// the base-PK sibling of [`IndexKeySpec::range_keys`], contributing only the
-/// PK-column group-prefix encoder to the shared [`eq_prefix_range_keys`].
-/// `Ok(None)` = provably empty; `Err` = the descriptor pins every PK column with
-/// no range column left.
-pub(crate) fn pk_range_keys(
-    schema: &SchemaDescriptor,
-    range: &RangeDescriptor,
-) -> Result<Option<(PkBuf, Option<PkBuf>)>, String> {
-    eq_prefix_range_keys(
-        range,
-        schema.pk_indices().len(),
-        schema.pk_stride() as usize,
-        "pk range",
-        |natives| {
-            // Source and target column are the same here (no index promotion),
-            // so the shared encoder's promote step is its identity arm. The
-            // trailing PK columns stay raw-zero — the minimum OPK for any type,
-            // so `group(v)` IS `pad(group(v))`.
-            let cols = schema
-                .pk_columns()
-                .take(natives.len())
-                .map(|(_, col)| (col.type_code, *col));
-            encode_leading_opk(cols, natives)
-        },
-    )
-}
-
 impl SchemaDescriptor {
     /// The one worker every row matching `range` can live on — the master's
     /// confinement test, which turns a broadcast into a unicast. `None` whenever
@@ -943,7 +935,10 @@ impl SchemaDescriptor {
         if !self.placement().is_key_routed() {
             return None;
         }
-        let (start, end) = pk_range_keys(self, range).ok().flatten()?;
+        let (start, end) = IndexKeySpec::for_pk(self)
+            .range_keys(self.pk_stride() as usize, range)
+            .ok()
+            .flatten()?;
         range_shares_prefix(&start, end.as_ref(), self.dist_stride() as usize)
             .then(|| self.worker_for_pk(start.pk_bytes(), num_workers))
     }
@@ -972,9 +967,8 @@ pub(crate) fn hash_german_string_content(hasher: &mut RowHasher, struct_bytes: &
     hasher.update(content);
 }
 
-/// Hash one group column into the fold-path digest. The single per-column body
-/// [`hash_fold`] folds with — a divergence would silently merge or split groups
-/// (a wrong output PK, and a wrong AVI bucket).
+/// Hash one group column into the streaming fold — the single per-column body
+/// [`FoldCols::key_row`] streams.
 ///
 /// Reads the null bit unconditionally, like the sibling `compare_by_group_cols`:
 /// a NOT NULL column never carries one, so masking it off would cost a per-row
@@ -1000,16 +994,65 @@ fn hash_group_col<R: RowSource>(hasher: &mut RowHasher, src: &R, row: usize, nul
     }
 }
 
-/// The 128-bit XXH3 fold of `locs` over one row. The one body behind both folds
-/// — `ops::group_key::GroupKeyCols::key_row`'s non-canonical branch and the packed
-/// group key's overflow slot — so the two cannot drift apart.
-#[inline]
-pub(crate) fn hash_fold<R: RowSource>(locs: &[ColumnLocator], src: &R, row: usize, null_word: u64) -> u128 {
-    let mut hasher = RowHasher::new();
-    for &loc in locs {
-        hash_group_col(&mut hasher, src, row, null_word, loc);
+/// Group columns a one-shot fold assembles on the stack. Sized by the PK arity —
+/// the shape every real group set has; a wider one is legal SQL and streams.
+const FOLD_INLINE_COLS: usize = MAX_PK_COLUMNS;
+
+/// The columns one 128-bit key folds, and how — one value rather than a list
+/// plus a flag, so a fold cannot run under a verdict taken over other columns.
+/// Both engine folds hold one, so neither can drift from the other.
+pub(crate) struct FoldCols {
+    locs: Vec<ColumnLocator>,
+    /// Every column contributes a fixed 17 bytes and they fit the stack scratch.
+    /// A German string streams variable-length content instead.
+    inline: bool,
+}
+
+impl FoldCols {
+    pub(crate) fn new(locs: Vec<ColumnLocator>) -> Self {
+        let inline =
+            locs.len() <= FOLD_INLINE_COLS && !locs.iter().any(|l| gnitz_wire::is_german_string(l.type_code()));
+        FoldCols { locs, inline }
     }
-    hasher.digest128()
+
+    /// The folded columns, in key order.
+    #[inline]
+    pub(crate) fn locs(&self) -> &[ColumnLocator] {
+        &self.locs
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.locs.is_empty()
+    }
+
+    /// The 128-bit XXH3 fold of these columns over `row`. The two arms write the
+    /// same bytes and XXH3's one-shot and streaming forms agree at every length,
+    /// so they are one digest — pinned by
+    /// `hash_fold_one_shot_matches_the_streaming_form`.
+    #[inline]
+    pub(crate) fn key_row<R: RowSource>(&self, src: &R, row: usize, null_word: u64) -> u128 {
+        if self.inline {
+            let mut buf = [0u8; 17 * FOLD_INLINE_COLS];
+            let mut n = 0usize;
+            for &loc in &self.locs {
+                if loc.is_null_word(null_word) {
+                    buf[n] = 0; // null marker
+                    n += 1;
+                    continue;
+                }
+                buf[n] = 1; // non-null marker
+                buf[n + 1..n + 17].copy_from_slice(&loc.route_key(src, row).to_le_bytes());
+                n += 17;
+            }
+            return xxh::checksum_128(&buf[..n]);
+        }
+        let mut hasher = RowHasher::new();
+        for &loc in &self.locs {
+            hash_group_col(&mut hasher, src, row, null_word, loc);
+        }
+        hasher.digest128()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1038,6 +1081,17 @@ pub(crate) fn german_string_promote_key(struct_bytes: &[u8], blob: &[u8]) -> u12
 // Packed group key
 // ---------------------------------------------------------------------------
 
+/// The two slots a packed group key carries besides its columns: a leading
+/// presence bitmap and a trailing overflow fold. Every width below is read back
+/// off these, so the schema, the stride and the pack offsets cannot disagree.
+const BITMAP_COL: SchemaColumn = SchemaColumn::new(type_code::U8, 0);
+const FOLD_COL: SchemaColumn = SchemaColumn::new(type_code::U128, 0);
+const BITMAP_BYTES: usize = BITMAP_COL.size() as usize;
+const FOLD_BYTES: usize = FOLD_COL.size() as usize;
+// `pack_into` writes the bitmap as one bare byte and the fold as a `u128`'s
+// big-endian image, which are those columns' OPK images only at these widths.
+const _: () = assert!(BITMAP_BYTES == 1 && FOLD_BYTES == 16);
+
 /// The PK slot type one group column packs into.
 ///
 /// A `≤8`-byte integer (and the signed 128-bit one) keeps its own width and sign,
@@ -1056,106 +1110,27 @@ const fn group_key_slot_type(tc: u8) -> u8 {
     }
 }
 
-/// The layout of a packed group key: which slots its PK region carries, and how
-/// many of the group columns got a slot of their own.
-///
-/// Every grouped reduce has one, at any arity and over any column type — that
-/// universality is the point. Columns past the budget do not make the key
-/// unbuildable; they fold into the trailing hash slot.
-struct GroupKeyLayout {
-    /// A leading `U8` presence bitmap: bit *i* is set iff packed column *i* is
-    /// NULL. Present iff some group column is nullable. One byte total, not one
-    /// per column — without it a NULL group and a `0` group collide on one
-    /// output PK.
-    has_bitmap: bool,
-    /// How many leading group columns carry their own slot. The rest fold.
-    n_packed: usize,
-    /// Whether a trailing 16-byte hash slot folds the group columns past
-    /// `n_packed`. Equivalently `n_packed < group_cols.len()`.
-    has_fold: bool,
-    /// The PK slot type codes in order: the bitmap (if any), then one per packed
-    /// column, then the fold slot (if any).
-    slots: Vec<u8>,
-}
-
-impl GroupKeyLayout {
-    /// Total PK stride of the packed key.
-    fn stride(&self) -> usize {
-        self.slots.iter().map(|&t| gnitz_wire::wire_stride(t)).sum()
-    }
-}
-
-/// Resolve the packed group-key layout for `cols`, each given as its
-/// `(type_code, nullable)`, inside the PK budget the caller's `reserve` for its
-/// own trailing suffix columns leaves free.
-///
-/// Greedy: pack leading columns while the budget still leaves room for the fold
-/// slot the remaining columns would need. Total — every group set gets a layout,
-/// which is what lets the reduce drop its eligibility gate.
-fn group_key_layout(cols: &[(u8, bool)], reserve_cols: usize, reserve_bytes: usize) -> GroupKeyLayout {
-    let max_cols = MAX_PK_COLUMNS - reserve_cols;
-    let max_bytes = MAX_PK_BYTES - reserve_bytes;
-    // Both bounds are functions of the reservation alone, so they are checked
-    // here rather than left to each caller to assert for itself.
-    assert!(
-        max_cols >= 2 && max_bytes >= 17,
-        "group-key reservation must leave room for a bitmap byte and a 16-byte fold slot",
-    );
-    assert!(max_cols <= 9, "the one bitmap byte addresses at most 8 packed columns");
-    let has_bitmap = cols.iter().any(|&(_, nullable)| nullable);
-    let mut slots: Vec<u8> = Vec::with_capacity(cols.len() + 2);
-    let mut bytes = 0usize;
-    if has_bitmap {
-        slots.push(type_code::U8);
-        bytes += 1;
-    }
-    let mut n_packed = 0usize;
-    for (i, &(tc, _)) in cols.iter().enumerate() {
-        let slot = group_key_slot_type(tc);
-        let w = gnitz_wire::wire_stride(slot);
-        // Room this column needs, plus the fold slot the columns behind it would
-        // still require. Reserving it here is what keeps the greedy walk from
-        // packing a column it would have to give back.
-        let tail_cols = usize::from(i + 1 < cols.len());
-        let tail_bytes = tail_cols * 16;
-        if slots.len() + 1 + tail_cols > max_cols || bytes + w + tail_bytes > max_bytes {
-            break;
-        }
-        slots.push(slot);
-        bytes += w;
-        n_packed += 1;
-    }
-    let has_fold = n_packed < cols.len();
-    if has_fold {
-        slots.push(type_code::U128);
-    }
-    GroupKeyLayout { has_bitmap, n_packed, has_fold, slots }
-}
-
+/// How one source column's bytes become key bytes. The group key's bitmap and
+/// fold are facts of the whole [`ReindexPacker`], not columns, and live there.
 #[derive(Clone, Copy)]
 enum PromoteKind {
     /// Any scalar source column, at either width and either sign: the locator
     /// says which region holds the bytes, and the encode differs only by that.
     ///
     /// A float here packs raw IEEE bits — equality-correct, not order-preserving;
-    /// [`Self::Float`] is the group key's spelling. `reject_float_key` blocks a
-    /// float from every join / set-op / GROUP BY key, so neither is reachable.
+    /// [`Self::Float`] is the group key's spelling. Floats are rejected from
+    /// every join / set-op / GROUP BY key upstream, in the SQL planner the
+    /// engine does not link, so neither arm is reachable through it — a raw
+    /// `gnitz-core` client is the only producer that could name one.
     Col(ColumnLocator),
     /// STRING/BLOB payload: sign-agnostic XXH3 content-hash key. The only source
     /// that is not a scalar cell the OPK encoders can consume.
     String(ColumnLocator),
-    /// Group-key presence bitmap (one leading `U8` slot): bit *i* is set iff
-    /// packed column *i* is NULL. Written by `pack_into` after the slot loop,
-    /// from the NULL tests that loop already performs.
-    Bitmap,
     /// Group-key float slot: the column's `order_bits` image, big-endian in a
     /// `U64` slot — order-preserving where the raw bits are not, matching the
     /// `total_cmp` order the group comparator uses. Carries the column's own
     /// [`ScalarKind`] so the per-row pack re-derives nothing.
     Float(ColumnLocator, ScalarKind),
-    /// Group-key overflow fold (one trailing `U128` slot): the 128-bit hash of
-    /// every group column past the packed prefix — [`ReindexPacker::folded`].
-    Fold,
 }
 
 /// Per-column classifier for "read a source column, project it to OPK PK
@@ -1194,7 +1169,7 @@ impl ColPromoter {
     const PLACEHOLDER: ColPromoter = ColPromoter {
         out_col: SchemaColumn::EMPTY,
         nullable: false,
-        kind: PromoteKind::Col(ColumnLocator::Pk { byte_off: 0, size: 0, type_code: 0 }),
+        kind: PromoteKind::Col(ColumnLocator::EMPTY),
     };
 
     /// A slot packing into a `out_tc` output PK column. The one place the output
@@ -1219,9 +1194,12 @@ pub struct ReindexPacker {
     cols: [ColPromoter; MAX_PK_COLUMNS], // first `num_cols` valid
     num_cols: usize,
     pub(crate) out_stride: usize,
-    /// Group columns past the packed prefix, hashed into the trailing fold slot.
-    /// Empty for a join key and for a group key with no fold.
-    folded: Vec<ColumnLocator>,
+    /// Group-key only: a leading `U8` slot, bit *i* set iff packed column *i* is
+    /// NULL. Without it a NULL group and a `0` group collide on one output PK.
+    has_bitmap: bool,
+    /// Group columns past the packed prefix, hashed into a trailing 16-byte
+    /// fold slot. Empty for a join key and for a group key with no fold.
+    fold: FoldCols,
 }
 
 impl ReindexPacker {
@@ -1266,7 +1244,8 @@ impl ReindexPacker {
             cols,
             num_cols: key.len(),
             out_stride: stride,
-            folded: Vec::new(),
+            has_bitmap: false,
+            fold: FoldCols::new(Vec::new()),
         })
     }
 
@@ -1275,7 +1254,12 @@ impl ReindexPacker {
     /// these describes what `pack_into` writes by construction —
     /// [`Self::output_schema`] and `AviBake::new` both take theirs from here.
     pub(crate) fn key_columns(&self) -> impl Iterator<Item = SchemaColumn> + '_ {
-        self.cols[..self.num_cols].iter().map(|cp| cp.out_col)
+        let bitmap = self.has_bitmap.then_some(BITMAP_COL);
+        let fold = (!self.fold.is_empty()).then_some(FOLD_COL);
+        bitmap
+            .into_iter()
+            .chain(self.cols[..self.num_cols].iter().map(|cp| cp.out_col))
+            .chain(fold)
     }
 
     /// The reindex Map's output schema: the packer's own [`Self::key_columns`]
@@ -1297,65 +1281,79 @@ impl ReindexPacker {
 
     /// Build the packer for a **group** key over `group_cols`, leaving the PK
     /// budget `reserve` needs for the suffix columns the caller appends behind
-    /// the key. Every slot type comes from [`group_key_layout`], read here and
-    /// nowhere else: every schema over this key goes through
-    /// [`Self::key_columns`], so a group key's slots and its bytes cannot
-    /// disagree.
+    /// the key. Every slot is derived here and read back through
+    /// [`Self::key_columns`], so a group key's slots and its bytes agree.
     ///
-    /// Unlike a join key this is total — columns past the budget fold into one
-    /// trailing hash slot — which is what lets the reduce index every group set
-    /// instead of rescanning the trace per epoch.
+    /// Greedy: pack leading columns while the budget still leaves room for the
+    /// fold slot the rest would need. Unlike a join key this is total — the
+    /// overflow folds into one hash slot — so every group set has a key.
     pub(crate) fn new_group_key(schema: &SchemaDescriptor, group_cols: &[u32], reserve: &[SchemaColumn]) -> Self {
-        let descs: Vec<(u8, bool)> = group_cols
-            .iter()
-            .map(|&c| {
-                let col = &schema.columns[c as usize];
-                (col.type_code, col.nullable != 0)
-            })
-            .collect();
         // The reservation is the suffix columns themselves, so their count and
         // their width are one fact rather than two that can drift.
-        let layout = group_key_layout(&descs, reserve.len(), reserve.iter().map(|c| c.size() as usize).sum());
-        let folded: Vec<ColumnLocator> = group_cols[layout.n_packed..]
-            .iter()
-            .map(|&c| schema.locate(c as usize))
-            .collect();
+        let max_cols = MAX_PK_COLUMNS - reserve.len();
+        let max_bytes = MAX_PK_BYTES - reserve.iter().map(|c| c.size() as usize).sum::<usize>();
+        // Both bounds are functions of the reservation alone, so they are
+        // checked here rather than left to each caller to assert for itself.
+        assert!(
+            max_cols >= 2 && max_bytes >= BITMAP_BYTES + FOLD_BYTES,
+            "group-key reservation must leave room for a bitmap byte and a fold slot",
+        );
+        assert!(max_cols <= 9, "the one bitmap byte addresses at most 8 packed columns");
+        // Over *all* group columns: narrowing it to the packed prefix would be
+        // circular, since the reservation is an input to the budget deciding it.
+        let has_bitmap = group_cols.iter().any(|&c| schema.columns[c as usize].nullable != 0);
 
+        // The bitmap occupies one leading slot, so both budgets start spent by it.
+        let lead = usize::from(has_bitmap);
         let mut cols = [ColPromoter::PLACEHOLDER; MAX_PK_COLUMNS];
-        let mut slot = 0usize;
-        if layout.has_bitmap {
-            cols[slot] = ColPromoter::new(layout.slots[slot], false, PromoteKind::Bitmap);
-            slot += 1;
-        }
-        for (i, &(tc, nullable)) in descs[..layout.n_packed].iter().enumerate() {
-            let loc = schema.locate(group_cols[i] as usize);
-            let kind = match ScalarKind::from_type_code(TypeCode::from_validated_u8(tc)) {
+        let mut stride = lead * BITMAP_BYTES;
+        let mut n_packed = 0usize;
+        for (i, &c) in group_cols.iter().enumerate() {
+            let col = schema.columns[c as usize];
+            let out_tc = group_key_slot_type(col.type_code);
+            let w = gnitz_wire::wire_stride(out_tc);
+            // Room this column needs, plus the fold slot the columns behind it
+            // would still require. Reserving it here is what keeps the greedy
+            // walk from packing a column it would have to give back.
+            let tail_cols = usize::from(i + 1 < group_cols.len());
+            if lead + n_packed + 1 + tail_cols > max_cols || stride + w + tail_cols * FOLD_BYTES > max_bytes {
+                break;
+            }
+            let loc = schema.locate(c as usize);
+            let kind = match ScalarKind::from_type_code(TypeCode::from_validated_u8(col.type_code)) {
                 Some(sk) if sk.is_float() => PromoteKind::Float(loc, sk),
                 _ => classify_promote(loc),
             };
-            cols[slot] = ColPromoter::new(layout.slots[slot], nullable, kind);
-            slot += 1;
+            cols[n_packed] = ColPromoter::new(out_tc, col.nullable != 0, kind);
+            stride += w;
+            n_packed += 1;
         }
-        if layout.has_fold {
-            cols[slot] = ColPromoter::new(layout.slots[slot], false, PromoteKind::Fold);
-            slot += 1;
-        }
+        let fold = FoldCols::new(
+            group_cols[n_packed..]
+                .iter()
+                .map(|&c| schema.locate(c as usize))
+                .collect(),
+        );
+        stride += if fold.is_empty() { 0 } else { FOLD_BYTES };
+
         ReindexPacker {
             cols,
-            num_cols: slot,
-            out_stride: layout.stride(),
-            folded,
+            num_cols: n_packed,
+            out_stride: stride,
+            has_bitmap,
+            fold,
         }
     }
 
     /// Pack the full reindex key (`out_stride` OPK bytes) for `row` into `dst`.
     ///
-    /// One pass: the running slot offset, and — for a group key — the presence
-    /// bitmap, whose bits are the NULL tests the packed slots already perform.
+    /// One pass over the source columns, between the two key-level slots a
+    /// group key carries: the leading presence bitmap, whose bits are the NULL
+    /// tests the packed slots already perform, and the trailing fold.
     #[inline]
     pub(crate) fn pack_into<R: RowSource>(&self, dst: &mut [u8], batch: &R, row: usize) {
         let null_word = batch.get_null_word(row);
-        let mut off = 0usize;
+        let mut off = usize::from(self.has_bitmap) * BITMAP_BYTES;
         let mut null_bits = 0u8;
         for (i, cp) in self.cols[..self.num_cols].iter().enumerate() {
             let w = cp.out_col.size() as usize;
@@ -1363,12 +1361,10 @@ impl ReindexPacker {
             off += w;
             match cp.kind {
                 // A NULL packed column: zeroed slot, and its bit in the bitmap.
-                // `nullable` implies the bitmap exists and is slot 0, so this
-                // slot's packed index is `i - 1`.
                 PromoteKind::Col(loc) | PromoteKind::String(loc) | PromoteKind::Float(loc, _)
                     if cp.nullable && loc.is_null_word(null_word) =>
                 {
-                    null_bits |= 1 << (i - 1);
+                    null_bits |= 1 << i;
                     slot.fill(0);
                 }
                 PromoteKind::Col(loc) => loc.encode_opk_promoted(batch, row, cp.out_col.type_code, slot),
@@ -1376,20 +1372,20 @@ impl ReindexPacker {
                     let h = german_string_promote_key(loc.bytes(batch, row), batch.blob());
                     slot.copy_from_slice(&h.to_be_bytes());
                 }
-                PromoteKind::Bitmap => {}
                 PromoteKind::Float(loc, sk) => {
                     slot.copy_from_slice(&loc.order_bits(batch, row, sk).to_be_bytes());
                 }
-                PromoteKind::Fold => {
-                    slot.copy_from_slice(&hash_fold(&self.folded, batch, row, null_word).to_be_bytes());
-                }
             }
         }
-        // Unconditional per row, so every slot of `dst` is fully overwritten —
-        // which is what lets a caller reuse one destination across rows with no
-        // inter-row clear.
-        if matches!(self.cols[0].kind, PromoteKind::Bitmap) {
+        // Both unconditional per row for the keys that have them, so every slot
+        // of `dst` is fully overwritten — which is what lets a caller reuse one
+        // destination across rows with no inter-row clear.
+        if self.has_bitmap {
             dst[0] = null_bits;
+        }
+        if !self.fold.is_empty() {
+            let h = self.fold.key_row(batch, row, null_word);
+            dst[off..off + FOLD_BYTES].copy_from_slice(&h.to_be_bytes());
         }
     }
 }

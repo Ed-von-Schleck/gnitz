@@ -4,7 +4,9 @@
 //! coherence the old 13-parameter `op_reduce` signature spread across the
 //! instruction operands; the per-epoch call re-derives nothing.
 
+use crate::schema::key::NarrowPkOpk;
 use crate::schema::{type_code, ColumnLocator, DerivedSchema, ReduceOutKey, SchemaColumn, SchemaDescriptor};
+use crate::storage::MemBatch;
 
 use super::super::group_key::GroupKeyCols;
 use super::agg::Accumulator;
@@ -161,6 +163,22 @@ impl ReducePlan {
         })
     }
 
+    /// The output PK of the group `row` of `mb` belongs to — the one derivation,
+    /// read by the group walk's retraction seek and emitted row and by the
+    /// ad-hoc fold's reply row. `PkPermutation` borrows the input PK region;
+    /// every other kind keys by a value it does not carry.
+    #[inline]
+    pub(super) fn out_pk<'a>(&self, mb: &'a MemBatch, row: usize) -> OutPk<'a> {
+        if self.out_key == ReduceOutKey::PkPermutation {
+            OutPk::Borrowed(mb.get_pk_bytes(row))
+        } else {
+            OutPk::Narrow(NarrowPkOpk::new(
+                self.group_key.key_row(mb, row),
+                self.output_schema.pk_stride() as usize,
+            ))
+        }
+    }
+
     /// Group-exemplar output columns, in payload order — the *leading* payload
     /// columns, with the aggregates trailing, so exemplar `j` sits at payload
     /// index `j` and aggregate `k` at `exemplar_locs().len() + k`. Empty unless
@@ -169,9 +187,28 @@ impl ReducePlan {
     #[inline(always)]
     pub(super) fn exemplar_locs(&self) -> &[ColumnLocator] {
         if self.out_key == ReduceOutKey::SyntheticFold {
-            &self.group_key.cols
+            self.group_key.cols.locs()
         } else {
             &[]
+        }
+    }
+}
+
+/// One row's reduce output PK: borrowed out of the batch, or held inline. A
+/// returned value rather than a caller's scratch, so the borrowed arm copies
+/// nothing.
+pub(super) enum OutPk<'a> {
+    Borrowed(&'a [u8]),
+    Narrow(NarrowPkOpk),
+}
+
+impl OutPk<'_> {
+    /// The `pk_stride` OPK bytes of the key.
+    #[inline]
+    pub(super) fn bytes(&self) -> &[u8] {
+        match self {
+            OutPk::Borrowed(b) => b,
+            OutPk::Narrow(k) => k.bytes(),
         }
     }
 }
