@@ -1,7 +1,7 @@
 //! SQL LIKE / ILIKE: the pattern tokenizer and the matcher it compiles into.
 //!
 //! Pattern bytes in, a matcher out, so the shape contract is testable without
-//! building a program. `_` steps by the character boundary [`crate::batch`]
+//! building a program. `_` steps by the character boundary [`crate::chars`]
 //! defines, the same one SUBSTRING uses.
 //!
 //! `%` is byte-granular and `_` character-granular. The asymmetry is forced:
@@ -160,6 +160,12 @@ impl LikeMatcher {
     }
 
     /// Does `h` match? Total on any bytes, valid UTF-8 or not.
+    ///
+    /// `#[inline]` so the dispatch below lands inside the caller's row loop,
+    /// where `self.kind` is loop-invariant and LLVM unswitches it. Out of line it
+    /// is a call plus a five-way jump per row: `expr_kernel_bench` retires 21 %
+    /// more on `str_like`, 11 % on a 12-byte `Contains`, 10 % on a 128-byte one.
+    #[inline]
     pub(crate) fn matches(&self, h: &[u8]) -> bool {
         let ci = self.ci;
         match &self.kind {
@@ -175,32 +181,76 @@ impl LikeMatcher {
 /// Byte compare — unequal lengths are unequal — ASCII-case-insensitively under
 /// `ci`. The `Lit` bytes are already lowercased at compile, so only the haystack
 /// side folds here.
+///
+/// `<[u8]>::eq` lowers to a `memcmp` **call** at every length, which the few-byte
+/// literal compared once per candidate position cannot amortize. Those compare
+/// inline; the call is left to the lengths that pay for it.
+#[inline]
 fn lit_eq(a: &[u8], b: &[u8], ci: bool) -> bool {
     if ci {
-        a.eq_ignore_ascii_case(b)
-    } else {
-        a == b
+        return a.eq_ignore_ascii_case(b);
     }
+    if a.len() != b.len() {
+        return false;
+    }
+    if a.len() <= SHORT_LIT {
+        return a.iter().zip(b).all(|(x, y)| x == y);
+    }
+    a == b
 }
 
+/// Literal length at or below which [`lit_eq`] compares byte by byte. Four,
+/// measured: it takes 4 % off `expr_kernel_bench`'s three `str_generic_*` shapes,
+/// where eight costs `str_like` 9 % — `memcmp` does eight bytes in one word.
+const SHORT_LIT: usize = 4;
+
 /// The byte offset of the first occurrence of `needle` in `h`, `Some(0)` for an
-/// empty needle: a skip-scan on the needle's first byte, then a window compare,
-/// ASCII-case-insensitively under `ci`. LIKE's `%x%` shape reads it as a
-/// verdict; STRPOS, REPLACE and SPLIT_PART read the offset.
+/// empty needle: a candidate scan on the needle's first byte, then a window
+/// compare, ASCII-case-insensitively under `ci`. LIKE's `%x%` shape reads it as
+/// a verdict; STRPOS, REPLACE and SPLIT_PART read the offset.
+///
+/// Candidate-start count at or below which [`find`] scans byte by byte. `memchr`'s
+/// runtime dispatch and vector prologue are a fixed ~33 retired instructions, and
+/// short is not a corner: an inline German string, and the haystack `fields`,
+/// `REPLACE` and `SPLIT_PART` walk down toward zero.
+const SHORT_HAYSTACK: usize = 16;
+
+/// The byte offset of the first occurrence of `needle` in `h`, `Some(0)` for an
+/// empty needle: a candidate scan on the needle's first byte, then a window
+/// compare, ASCII-case-insensitively under `ci`. LIKE's `%x%` shape reads it as
+/// a verdict; STRPOS, REPLACE and SPLIT_PART read the offset. `memchr` past
+/// [`SHORT_HAYSTACK`] is worth 6.7× on a 128-byte haystack and an order of
+/// magnitude on `Generic`'s repeated resumes.
 pub(crate) fn find(h: &[u8], needle: &[u8], ci: bool) -> Option<usize> {
     let Some(&first) = needle.first() else {
         return Some(0);
     };
     // How many start positions fit; `None` when the needle is longer than `h`.
     let starts = h.len().checked_sub(needle.len() - 1)?;
+    let hay = &h[..starts];
     // `Lit` bytes are lowercased at compile, so `first` is already the folded
-    // form and only its uppercase twin needs testing under `ci`.
-    let upper = first.to_ascii_uppercase();
-    h[..starts]
-        .iter()
-        .enumerate()
-        .find(|&(i, &b)| (b == first || (ci && b == upper)) && lit_eq(&h[i..i + needle.len()], needle, ci))
-        .map(|(i, _)| i)
+    // form and only its uppercase twin needs scanning for. Under `!ci` the two
+    // candidates coincide, which makes the two-byte scan behave as a one-byte
+    // one — that is what keeps this a single loop with the case test hoisted out
+    // of it.
+    let alt = if ci { first.to_ascii_uppercase() } else { first };
+    if hay.len() <= SHORT_HAYSTACK {
+        for (i, &b) in hay.iter().enumerate() {
+            if (b == first || b == alt) && lit_eq(&h[i..i + needle.len()], needle, ci) {
+                return Some(i);
+            }
+        }
+        return None;
+    }
+    let mut off = 0;
+    while let Some(k) = memchr::memchr2(first, alt, &hay[off..]) {
+        let i = off + k;
+        if lit_eq(&h[i..i + needle.len()], needle, ci) {
+            return Some(i);
+        }
+        off = i + 1;
+    }
+    None
 }
 
 /// The `(start, end)` byte span of each field of `s` split on the non-empty
@@ -269,6 +319,17 @@ fn generic_match(toks: &[LikeTok], h: &[u8], ci: bool) -> bool {
             // resume positions the specializations accept on non-UTF-8 bytes.
             Some((ret_ti, ret_hi)) if *ret_hi < n => {
                 *ret_hi += 1;
+                // The anchor's token is what resume tries first, so if it is a
+                // literal every position before its next occurrence fails on that
+                // same literal, and no occurrence means no resume can succeed.
+                // A `Lit` is never empty, so `find` cannot answer `Some(0)` and
+                // the anchor still only moves right.
+                if let Some(LikeTok::Lit(l)) = toks.get(*ret_ti) {
+                    match find(&h[*ret_hi..], l, ci) {
+                        Some(k) => *ret_hi += k,
+                        None => return false,
+                    }
+                }
                 (ti, hi) = (*ret_ti, *ret_hi);
             }
             _ => return false,

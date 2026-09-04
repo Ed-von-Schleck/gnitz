@@ -73,9 +73,14 @@ def server_preexec():
 
 def is_debug_build():
     """Whether the server under test still carries the `#[cfg(debug_assertions)]`
-    injection seams. Cargo's default `cargo build` is debug and keeps them;
-    release builds drop them. There is no reliable signal in the stripped
-    binary, so we trust the GNITZ_RELEASE env the bench harness sets."""
+    injection seams. Cargo's default `cargo build` keeps them, and so does the
+    `checked-server` build (release codegen, debug assertions on); only
+    `release-server` drops them.
+
+    There is no reliable signal in the binary, so this reads `GNITZ_RELEASE`,
+    which the `e2e-release` Makefile target sets beside `GNITZ_SERVER_BIN` —
+    the two name the same build and are set on one line for that reason.
+    Nothing else sets it, so every other entry point answers "debug"."""
     return os.environ.get("GNITZ_RELEASE", "0") == "0"
 
 

@@ -28,13 +28,24 @@ fn selected(var: &str, only: &str, count: usize) {
     assert!(count > 0, "{var} matched nothing: {only:?}");
 }
 
-/// The evidence for keeping the fused `STR_COL_EQ_CONST` opcode over the
+/// The evidence for keeping the fused `StrColConst` opcode over the
 /// register channel on the `col <op> 'const'` filter loop — ~1M rows,
 /// non-nullable STRING. Both channels are built for every domain and their hit
 /// counts asserted equal, which is the only differential correctness check
 /// between them; `GNITZ_BENCH_CHANNEL` and `GNITZ_BENCH_DOMAIN` then cut the
 /// *driven* region down to one, so a `perf stat` over two pass counts
 /// differences to one channel's retired instructions on one domain.
+///
+/// Retired instructions per row per operator, `n = 1M`, differenced over
+/// `GNITZ_BENCH_PASSES` 1 and 21 — the register channel is 1.6× to 6× the fused
+/// one on every domain:
+///
+/// | domain             | fused | registers |
+/// |--------------------|-------|-----------|
+/// | mixed              |  22.5 |     112.0 |
+/// | long               |  77.9 |     127.6 |
+/// | digits-first       |  19.8 |     118.6 |
+/// | abcd-shared-prefix |  53.9 |     118.6 |
 ///
 /// The controlled pair is `digits-first` against `abcd-shared-prefix`: same
 /// lengths, same content bytes, differing only in whether the 4-byte prefix
@@ -451,6 +462,24 @@ fn is_null_arm_bench() {
     selected("GNITZ_BENCH_SHAPE", &only, n_selected);
 }
 
+/// One `len`-byte haystack per row in the single STRING payload slot, matching
+/// neither `%needle%` nor `%a%b%`: a fixed length is what makes a per-byte slope
+/// readable, where [`str_bench_view`]'s alternating widths average two regimes.
+/// Every row differs, so no matcher can be hoisted out of the row loop.
+fn fixed_len_str_view(schema: &TestSchema, n: usize, len: usize) -> TestView {
+    let mut v = TestView::new(n, schema.pk_stride());
+    push_payload_cols(&mut v, schema);
+    for row in 0..n {
+        set_row_pk(&mut v, schema, row, row as u64 + 1);
+        // `x` and the digits hold neither literal, so every scan runs to the end
+        // — the non-matching haystack the slope is measured on.
+        let mut s = vec![b'x'; len];
+        s[row % len] = b'0' + (row % 10) as u8;
+        v.set_string(row, 0, &s);
+    }
+    v
+}
+
 /// One row of `cols` German strings per payload slot, alternating either side of
 /// the 12-byte inline boundary so a string bench drives both the in-place inline
 /// view and the blob view.
@@ -476,7 +505,10 @@ fn str_bench_view(schema: &TestSchema, n: usize, cols: usize) -> TestView {
 /// pass counts and difference, never report wall-clock.
 ///
 ///   for s in int_cast int_div select str_len str_upper str_like str_substr \
-///            str_concat int_to_str map; do
+///            str_concat int_to_str map \
+///            str_contains_12 str_contains_128 str_contains_512 \
+///            str_generic_12 str_generic_128 str_generic_512 \
+///            str_side_64 str_side_512; do
 ///     for p in 1 501; do \
 ///       GNITZ_BENCH_SHAPE=$s GNITZ_BENCH_PASSES=$p perf stat -e instructions:u \
 ///       cargo test -p gnitz-expr --release expr_kernel_bench -- --ignored --nocapture
@@ -484,6 +516,11 @@ fn str_bench_view(schema: &TestSchema, n: usize, cols: usize) -> TestView {
 ///
 /// One shape per opcode family, never combined: a scalar `idiv` swamps a cast by
 /// an order of magnitude, so a shared shape would difference to that one arm.
+///
+/// The three suffixed families carry a haystack length because their cost is a
+/// slope in it, not a constant: `Contains` and `Generic` scan the value, and
+/// `RIGHT` walks it. `str_like`'s own `%boundary` pattern specializes to
+/// `Suffix`, which answers off the tail alone and enters neither scan.
 #[test]
 #[ignore]
 fn expr_kernel_bench() {
@@ -600,6 +637,45 @@ fn expr_kernel_bench() {
         vec![],
     );
 
+    // --- LIKE shapes whose cost is a slope in the haystack: `Contains` runs
+    //     `find`'s scan, `Generic` the anchor slide. One STRING column, so the
+    //     view is the fixture and the pattern is the shape.
+    let str1 = schema_pk_strings(1, false);
+    let like_lens = [12usize, 128, 512];
+    let like_views: Vec<TestView> = like_lens.iter().map(|&l| fixed_len_str_view(&str1, n, l)).collect();
+    let like_prog = |pat: &[u8]| {
+        scalar_prog(
+            &str1,
+            vec![
+                load_str(1),
+                LogicalInstr::StrLike {
+                    src: Reg(0),
+                    escape: None,
+                    pat_idx: ConstIdx(0),
+                    ci: false,
+                },
+            ],
+            Reg(1),
+            vec![pat.to_vec()],
+        )
+    };
+    let contains = like_prog(b"%needle%");
+    let generic = like_prog(b"%a%b%");
+
+    // --- `RIGHT(c, 10)`: the one kernel whose walk is from the far end.
+    let side_lens = [64usize, 512];
+    let side_views: Vec<TestView> = side_lens.iter().map(|&l| fixed_len_str_view(&str1, n, l)).collect();
+    let str_side = scalar_prog(
+        &str1,
+        vec![
+            load_str(1),
+            LogicalInstr::LoadConst { val: 10 },
+            LogicalInstr::StrSide { src: Reg(0), n_reg: Reg(1), left: false },
+        ],
+        Reg(2),
+        vec![],
+    );
+
     // --- a real map: six compute opcodes plus two register sinks, driven through
     //     `eval_morsels` the way a maintained view's projection is ---
     let map_in = schema_pk_ints(3, false);
@@ -635,14 +711,28 @@ fn expr_kernel_bench() {
     let mut acc = 0i64;
     // Scalar-result shapes: sum the result register, as a register sink into an 8-byte
     // slot would read it.
-    for (name, ev, view, reg) in [
+    let mut scalar_shapes: Vec<(&str, &Evaluator, &TestView, usize)> = vec![
         ("int_cast", &int_cast, &int_view, 1usize),
         ("int_div", &int_div, &int_view, 2),
         ("select", &select, &int_view, 3),
         ("str_len", &str_len, &str_view, 1),
         ("str_like", &str_like, &str_view, 1),
         ("map", &map, &map_view, 5),
-    ] {
+    ];
+    // Named per length, so one `perf` pair reads one point of the slope.
+    for (k, name) in ["str_contains_12", "str_contains_128", "str_contains_512"]
+        .iter()
+        .enumerate()
+    {
+        scalar_shapes.push((name, &contains, &like_views[k], 1));
+    }
+    for (k, name) in ["str_generic_12", "str_generic_128", "str_generic_512"]
+        .iter()
+        .enumerate()
+    {
+        scalar_shapes.push((name, &generic, &like_views[k], 1));
+    }
+    for (name, ev, view, reg) in scalar_shapes {
         if !driven(name) {
             continue;
         }
@@ -652,12 +742,16 @@ fn expr_kernel_bench() {
         }
     }
     // String-result shapes: resolve every view, as a string sink does.
-    for (name, ev, view, reg) in [
+    let mut str_shapes: Vec<(&str, &Evaluator, &TestView, usize)> = vec![
         ("int_to_str", &int_to_str, &int_view, 1usize),
         ("str_upper", &str_upper, &str_view, 1),
         ("str_substr", &str_substr, &str_view, 3),
         ("str_concat", &str_concat, &str_view, 2),
-    ] {
+    ];
+    for (k, name) in ["str_side_64", "str_side_512"].iter().enumerate() {
+        str_shapes.push((name, &str_side, &side_views[k], 2));
+    }
+    for (name, ev, view, reg) in str_shapes {
         if !driven(name) {
             continue;
         }

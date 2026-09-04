@@ -13,7 +13,7 @@ use gnitz_wire::{encode_german_string, ExprOp, FixedInt, SinkKind, TrimMode, Typ
 use std::fmt;
 use std::num::NonZeroU8;
 
-/// The register file is capped at 64: the BOOL_AND/BOOL_OR 3VL paths, the
+/// The register file is capped at 64: the `BoolBinary` 3VL paths, the
 /// null-bit propagation, and every register-indexed mask address registers by
 /// bit in a `u64`. Public for the engine's view pre-flight tests, which build a
 /// program at the limit.
@@ -96,17 +96,18 @@ pub enum ExprValidateErr {
 /// The client-facing rendering. Lives on the type so the planner's `Unsupported`
 /// and the engine's compile rejection print the same wording, and so the limit
 /// printed is the one [`LogicalProgram::from_wire`] enforces. The three variants
-/// an API mistake can raise get sentences — a large SQL predicate, and a
-/// `LogicalProgram` a client hand-built through [`crate::ExprBuilder`] and
-/// `gnitz_core::CircuitBuilder`. The rest are internal-shape violations with no
-/// user action, rendered as `Debug`.
+/// an API mistake can raise get sentences — a large SQL predicate or computed
+/// projection, and a `LogicalProgram` a client hand-built through
+/// [`crate::ExprBuilder`] and `gnitz_core::CircuitBuilder`. The rest are
+/// internal-shape violations with no user action, rendered as `Debug`.
 impl fmt::Display for ExprValidateErr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ExprValidateErr::TooManyRegs(n) => {
                 write!(
                     f,
-                    "expression needs {n} registers; the limit is {MAX_REGS} — split the predicate"
+                    "expression needs {n} registers; the limit is {MAX_REGS} — \
+                     split the predicate, or project fewer computed columns"
                 )
             }
             ExprValidateErr::ColKindMismatch { col, type_code, want } => {
@@ -598,7 +599,8 @@ pub enum LogicalInstr {
 
 /// One resolved, evaluable instruction. `signed` flags carry the result of the
 /// per-register U64 type tracking: `signed: false` selects the unsigned path on
-/// `Cmp`/`IntDiv`/`IntMod`/`IntToFloat`, reinterpreting the i64 register as u64.
+/// `Cmp`, on `IntArith`'s `Div` and `Mod`, and on `IntToFloat`, reinterpreting
+/// the i64 register as u64.
 ///
 /// Operands and null behaviour are classified on [`LogicalInstr`], by
 /// [`operands`]. A variant here with no 1:1 logical counterpart therefore
@@ -761,12 +763,11 @@ pub(crate) enum Instr {
         set_idx: u32,
     },
     /// A German-string column into a string register. `pi` is the payload slot,
-    /// resolved from the logical column index; `buf` is the column region's
-    /// buffer slot, assigned by `batch::str_col_slot`.
+    /// resolved from the logical column index, and is also the kernel's buffer
+    /// index into [`ResolvedProgram::str_cols`]' table.
     LoadColStr {
         dst: u16,
         pi: u8,
-        buf: u32,
     },
     LoadNullStr {
         dst: u16,
@@ -1372,12 +1373,12 @@ impl LogicalProgram {
                 .expect("validate pinned this operand to a payload column")
         };
         let mut instrs = Vec::with_capacity(self.instrs.len());
-        // Decoded `INT_IN_SET` pools, indexed by the resolved `set_idx`. Decoded
+        // Decoded `IntInSet` pools, indexed by the resolved `set_idx`. Decoded
         // once here (never per row); each `IntInSet` re-points its `set_idx` at
         // its slot in this vector.
         let mut int_sets: Vec<Vec<i64>> = Vec::new();
         let mut set_slots: Vec<Option<u32>> = vec![None; self.const_strings.len()];
-        // Decoded `STR_TRIM` byte sets as 256-bit membership tables, addressed
+        // Decoded `StrTrim` byte sets as 256-bit membership tables, addressed
         // the same way. `trim_slots` maps a const-pool index to the slot it was
         // decoded into, so two TRIMs over one set share a table.
         let mut trim_sets: Vec<[u64; 4]> = Vec::new();
@@ -1407,8 +1408,9 @@ impl LogicalProgram {
         // per-morsel dispatch a no-op arm.
         let mut const_regs: Vec<(u16, i64)> = Vec::new();
         let mut const_str_regs: Vec<(u16, u32, u32)> = Vec::new();
-        // Filled by `batch::str_col_slot`, in buffer-slot order.
-        let mut str_cols: Vec<u8> = Vec::new();
+        // Bit `pi` per string column some `LoadColStr` loads; the drive resolves
+        // one column region per set bit.
+        let mut str_cols: u64 = 0;
         // Resolution is 1:1 on every instruction and carries each register
         // operand through by name, so masks taken off the logical stream apply
         // unchanged to the resolved one; the sinks are a separate list, and name
@@ -1525,7 +1527,7 @@ impl LogicalProgram {
                 L::StrColConst { op, col, const_idx: ConstIdx(const_idx) } => {
                     let ci = const_idx as usize;
                     // Encoded on first reference, so a pool entry no `StrColConst`
-                    // names — an `INT_IN_SET` set, a TRIM byte set — costs neither
+                    // names — an `IntInSet` set, a TRIM byte set — costs neither
                     // a cell nor a copy of its bytes into the arena. An IN list
                     // rides one pool entry of 8 bytes per item and nothing caps its
                     // length, so encoding it unread would park that many bytes in
@@ -1570,11 +1572,8 @@ impl LogicalProgram {
                 }
                 L::LoadColStr { col } => {
                     let pi = payload_slot(col as usize);
-                    I::LoadColStr {
-                        dst,
-                        pi,
-                        buf: crate::batch::str_col_slot(&mut str_cols, pi),
-                    }
+                    str_cols |= 1u64 << pi;
+                    I::LoadColStr { dst, pi }
                 }
                 L::LoadConstStr { const_idx: ConstIdx(const_idx) } => {
                     let ci = const_idx as usize;
@@ -1678,6 +1677,7 @@ impl LogicalProgram {
                 .map_or(0, |r| r + 1),
             str_cols,
             result_is_str: self.result_reg.is_some_and(|r| (str_class >> r.0) & 1 != 0),
+            is_filter: matches!(role, Role::Filter),
         }
     }
 
@@ -1819,10 +1819,12 @@ impl LogicalProgram {
                 non_bool_read |= 1u64 << r.0;
             }
         }
-        let bit_only = bool_produced & !non_bool_read;
         ProgramFacts {
-            bit_only,
-            bool_pack: bit_only | bool_input,
+            bit_only: bool_produced & !non_bool_read,
+            // `bool_input` alone: a register in `bit_only \ bool_input` has
+            // `IsNullReg` as its only possible reader, which reads `null_bits`
+            // and never the packed bit.
+            bool_pack: bool_input,
             no_nulls,
             reg_u64,
         }
@@ -1830,7 +1832,7 @@ impl LogicalProgram {
 }
 
 /// Bound the const-pool index an opcode carries rather than names as an
-/// operand, and hold an `INT_IN_SET` pool to whole i64s — a truncating entry is
+/// operand, and hold an `IntInSet` pool to whole i64s — a truncating entry is
 /// a clean rejection rather than a silent `chunks_exact` tail-drop.
 fn check_extra(extra: Extra, const_strings: &[Vec<u8>]) -> Result<(), ExprValidateErr> {
     match extra {
@@ -1951,7 +1953,7 @@ enum Extra {
     None,
     /// A const-pool index.
     ConstIdx(ConstIdx),
-    /// An `INT_IN_SET` value pool: a const index whose entry must be whole i64s.
+    /// An `IntInSet` value pool: a const index whose entry must be whole i64s.
     IntSet(ConstIdx),
 }
 
@@ -2324,12 +2326,12 @@ pub(crate) struct ResolvedProgram {
     /// `resolve` hands it back from the same push, not because anything bounds
     /// it: it is not a const-pool index and no validating pass sees it.
     pub(crate) const_cells: Vec<[u8; 16]>,
-    /// Decoded `INT_IN_SET` value pools, indexed by the resolved `set_idx`. Each
+    /// Decoded `IntInSet` value pools, indexed by the resolved `set_idx`. Each
     /// pool is sorted ascending in signed-i64 `Ord` by `resolve` — the wire order
     /// is not trusted — so `eval_batch` binary-searches it directly. Duplicates
     /// are left in place; `binary_search` is correct over them.
     pub(crate) int_sets: Vec<Vec<i64>>,
-    /// Decoded `STR_TRIM` byte sets as 256-bit membership tables, indexed by the
+    /// Decoded `StrTrim` byte sets as 256-bit membership tables, indexed by the
     /// resolved `set_idx`. Held here rather than inlined into `Instr` — 32 bytes
     /// would dominate the enum.
     pub(crate) trim_sets: Vec<[u64; 4]>,
@@ -2346,10 +2348,11 @@ pub(crate) struct ResolvedProgram {
     /// `const_arena.len()`, so a `LoadConstStr` span stays valid for the
     /// evaluator's life.
     pub(crate) const_arena: Vec<u8>,
-    /// The payload slots of the string columns this program holds views into, in
-    /// the buffer-slot order `batch::str_col_slot` assigned. A drive resolves one
-    /// column region per entry.
-    pub(crate) str_cols: Vec<u8>,
+    /// Bit `pi` set iff some `LoadColStr` holds views into payload slot `pi`'s
+    /// string column. A drive resolves one column region per set bit, into the
+    /// slot the bit names — so a string register's `src` is a payload slot, not
+    /// an allocation order, and no column can be left without one.
+    pub(crate) str_cols: u64,
     /// How many string register lanes the scratch must hold: one past the
     /// highest string register, 0 for a program with none. Lanes are
     /// register-major, so sizing by [`Self::num_regs`] would reserve 4 KiB per
@@ -2365,6 +2368,11 @@ pub(crate) struct ResolvedProgram {
     /// map has none, so this is false for one without a second test of what the
     /// program is for.
     result_is_str: bool,
+    /// True iff this program resolved as [`Role::Filter`], which is what forces
+    /// `result_reg` into `bool_input`. The two read-back paths are not
+    /// interchangeable either way — a filter's result register may hold no `regs`
+    /// lane, a scalar's no `bool_bits` word — so each asserts on this.
+    is_filter: bool,
     /// True iff no instruction can produce a NULL against the schema this program
     /// was resolved against, so the evaluator skips null-bit tracking entirely.
     /// Resolved once — the answer is only meaningful for that one schema, since
@@ -2384,11 +2392,9 @@ pub(crate) struct ResolvedProgram {
     /// and `IsNullReg` skip the lane and write `bool_bits` natively; the eight
     /// other boolean producers go through `bin_op`/`un_op` and write it anyway.
     bit_only_mask: u64,
-    /// Bit `r` set iff `r`'s producer must write `bool_bits[r]` — either a
-    /// downstream boolean consumer reads it, or `r` is bit_only and the filter
-    /// reads `bool_bits[result_reg]` directly. Stored as the union rather than
-    /// its two halves: `needs_bool_pack` is the only reader and runs per
-    /// instruction per morsel.
+    /// Bit `r` set iff `r`'s producer must write `bool_bits[r]`: some downstream
+    /// consumer reads it as a truth bit. A filter's `result_reg` is covered
+    /// because `analyze` forces it into that set, whatever opcode writes it.
     bool_pack_mask: u64,
 }
 
@@ -2402,6 +2408,12 @@ impl ResolvedProgram {
     /// per morsel, from `maybe_pack_bool_bits`.
     pub(crate) fn needs_bool_pack(&self, reg: usize) -> bool {
         (self.bool_pack_mask >> reg) & 1 != 0
+    }
+
+    /// True iff this program resolved as a filter — the guard on both read-back
+    /// entry points, which are not interchangeable in either direction.
+    pub(crate) fn is_filter(&self) -> bool {
+        self.is_filter
     }
 
     /// True iff [`crate::Evaluator::eval_all`] must hand the result back as
@@ -2418,9 +2430,8 @@ struct ProgramFacts {
     /// Bit `r` set iff `r` is only consumed by boolean ops, so nothing reads
     /// `regs[r]`. [`ResolvedProgram::bit_only_mask`] states what it permits.
     bit_only: u64,
-    /// Bit `r` set iff `r`'s producer must write `bool_bits[r]` — a boolean
-    /// consumer reads it, or it is bit_only and the filter reads the packed bit
-    /// directly. The union, because that is the only form read back.
+    /// Bit `r` set iff `r`'s producer must write `bool_bits[r]`: some downstream
+    /// consumer reads it as a truth bit, a filter's `result_reg` included.
     bool_pack: u64,
     /// True iff no instruction can produce a NULL against the schema, so the
     /// evaluator skips null-bit tracking entirely.

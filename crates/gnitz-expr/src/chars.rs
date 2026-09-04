@@ -11,7 +11,7 @@
 /// belongs to no character at all. On valid UTF-8 these are exactly the codepoint
 /// boundaries; on arbitrary bytes it stays total and panic-free, which is what a
 /// byte-transparent engine needs.
-fn char_starts(s: &[u8]) -> impl Iterator<Item = usize> + '_ {
+fn char_starts(s: &[u8]) -> impl DoubleEndedIterator<Item = usize> + '_ {
     s.iter().enumerate().filter(|(_, &b)| is_char_start(b)).map(|(k, _)| k)
 }
 
@@ -52,3 +52,19 @@ pub(crate) fn char_count(s: &[u8]) -> usize {
 pub(crate) fn char_offset(s: &[u8], from: usize, n: usize) -> usize {
     char_starts(&s[from..]).nth(n).map_or(s.len(), |k| k + from)
 }
+
+/// Byte offset where the last `n` characters begin — the mirror of
+/// [`char_offset`], walked from the end so the cost follows `n` rather than the
+/// string. `n == 0` is the end of the string, and a string with fewer than `n`
+/// character starts begins at its first one (`s.len()` when it has none, as
+/// `[0x80]` does).
+pub(crate) fn char_offset_back(s: &[u8], n: usize) -> usize {
+    let Some(k) = n.checked_sub(1) else { return s.len() };
+    char_starts(s)
+        .nth_back(k)
+        .unwrap_or_else(|| char_starts(s).next().unwrap_or(s.len()))
+}
+
+#[cfg(test)]
+#[path = "tests/chars.rs"]
+mod tests;

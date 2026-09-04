@@ -1,11 +1,13 @@
 //! The one expression evaluator GnitzDB runs — on the engine and in the SQL
 //! client alike.
 //!
-//! A leaf crate below the entire engine: its only dependency is `gnitz-wire`
-//! (type codes, the OPK codec, the German-string layout), so both the server
-//! and the client-side planner can link it without pulling in storage, the
-//! catalog, or the runtime. Whatever the engine computes for an expression, the
-//! client computes bit-for-bit, because it is the same code.
+//! A leaf crate below the entire engine: its only in-workspace dependency is
+//! `gnitz-wire` (type codes, the OPK codec, the German-string layout), so both
+//! the server and the client-side planner can link it without pulling in
+//! storage, the catalog, or the runtime. Its one external crate, `memchr`, is
+//! `no_std` and dependency-free and supplies the substring scan behind LIKE.
+//! Whatever the engine computes for an expression, the client computes
+//! bit-for-bit, because it is the same code.
 //!
 //! The crate is organized into topic modules with every item re-exported flat at
 //! the crate root (`gnitz_expr::FOO`), matching `gnitz-wire`'s leaf-crate shape.

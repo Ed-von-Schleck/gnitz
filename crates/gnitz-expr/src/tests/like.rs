@@ -239,6 +239,99 @@ fn the_trailing_escape_rule_is_the_tokenizer_walk() {
 }
 
 // ---------------------------------------------------------------------------
+// The `Generic` anchor jump
+// ---------------------------------------------------------------------------
+
+/// An independent oracle for the walk: plain backtracking recursion, which
+/// shares none of the anchored walk's resume rule and so cannot be wrong the
+/// same way `generic_twin` would be. Exponential in the `%` count, which is why
+/// it stays here and takes only short haystacks.
+fn ref_match(toks: &[LikeTok], h: &[u8], ci: bool) -> bool {
+    match toks.first() {
+        None => h.is_empty(),
+        Some(LikeTok::AnyMany) => (0..=h.len()).any(|k| ref_match(&toks[1..], &h[k..], ci)),
+        // The same character step the walk takes, so the oracle differs from it
+        // only in how it backtracks.
+        Some(LikeTok::AnyOne) => !h.is_empty() && ref_match(&toks[1..], &h[crate::chars::char_offset(h, 0, 1)..], ci),
+        Some(LikeTok::Lit(l)) => {
+            h.len() >= l.len() && lit_eq(&h[..l.len()], l, ci) && ref_match(&toks[1..], &h[l.len()..], ci)
+        }
+    }
+}
+
+/// Assert the compiled matcher and the oracle agree on every haystack, LIKE and
+/// ILIKE alike — the second is what drives `find`'s two-candidate scan.
+fn agrees_with_reference(pattern: &[u8], haystacks: &[&[u8]]) {
+    for ci in [false, true] {
+        let mut toks = tokenize(pattern, ESC).0;
+        if ci {
+            fold_lits(&mut toks);
+        }
+        let m = LikeMatcher::compile(pattern, ESC, ci);
+        for h in haystacks {
+            assert_eq!(
+                m.matches(h),
+                ref_match(&toks, h, ci),
+                "pattern {:?} (ci={ci}) disagrees with the reference on {h:?}",
+                String::from_utf8_lossy(pattern),
+            );
+        }
+    }
+}
+
+/// Every shape the anchor can resume into. `agrees_with_generic` cannot cover
+/// these — they *are* `Generic` — so the oracle above stands in for the
+/// byte-at-a-time slide the literal jump replaced.
+#[test]
+fn the_generic_anchor_jump_answers_as_the_byte_slide_did() {
+    // The anchor token is `AnyOne`, not a literal, so no jump is taken at all.
+    agrees_with_reference(b"%_abc%", &[b"abc", b"xabc", b"xxabcyy", b"", b"_abc", b"AXABC"]);
+    // The anchor literal never occurs anywhere: the jump answers `false` at once
+    // rather than sliding to the end.
+    agrees_with_reference(
+        b"%foo%bar%",
+        &[b"xxxxxxxxxxxx", b"foo", b"barfoo", b"a foo b bar c", b"FOO..BAR"],
+    );
+    // It occurs only past a partial match, so the scan must restart one byte
+    // past each failed candidate rather than past the whole needle.
+    agrees_with_reference(b"%ab%ab%", &[b"aXab", b"abab", b"aabab", b"ab", b"aab", b"aAbAB"]);
+    // Two literals either side of a `_`, so the token the anchor resumes on
+    // alternates between a literal and a wildcard.
+    agrees_with_reference(b"%a_c%d%", &[b"abcd", b"zabczzd", b"abc", b"dabc", b"a_cd", b"ZABCZZD"]);
+    // A trailing literal, which resumes with no `%` left behind it.
+    agrees_with_reference(b"%x%yz", &[b"xyz", b"xxyz", b"xyzz", b"yz", b"XxYZ"]);
+}
+
+/// `%` is byte-granular, and the anchor jump must stay so: it lands on
+/// `find`'s byte offsets, which are not character boundaries on bytes that are
+/// not valid UTF-8.
+#[test]
+fn the_anchor_jump_stays_byte_granular_on_non_utf8() {
+    // A lone continuation byte has no character start at all, and a truncated
+    // multi-byte sequence puts the literal mid-character.
+    let bytes: [&[u8]; 6] = [
+        &[0x80, b'a', b'b', 0x80, b'a', b'b'],
+        &[0xE2, 0x82, b'a', b'b'],
+        &[0xFF, 0xFE, b'a', b'b', 0xFF],
+        b"ab",
+        &[0x80],
+        &[],
+    ];
+    agrees_with_reference(b"%ab%b%", &bytes);
+    agrees_with_reference(b"%_ab%", &bytes);
+    agrees_with_reference(&[b'%', 0x80, b'%', b'a', b'%'], &bytes);
+}
+
+/// `find` restarts one byte past a failed candidate, not one needle past it, so
+/// an occurrence overlapping a partial match is still found.
+#[test]
+fn a_contains_scan_restarts_one_byte_past_a_failed_candidate() {
+    agrees_with_generic("%ab%", &[b"aXab", b"aab", b"aaab", b"ab", b"a"]);
+    assert!(like("%ab%").matches(b"aXab"));
+    assert!(ilike("%aB%").matches(b"AxaB"));
+}
+
+// ---------------------------------------------------------------------------
 // ILIKE
 // ---------------------------------------------------------------------------
 

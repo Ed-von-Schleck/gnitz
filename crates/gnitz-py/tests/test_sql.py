@@ -699,7 +699,7 @@ class TestInListViewFilter:
             client.drop_schema(sn)
 
     def test_view_where_string_in_list(self, client):
-        """String elements route through the EXPR_STR_COL_EQ_CONST lowering."""
+        """String elements route through the ``StrColConst`` lowering."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:

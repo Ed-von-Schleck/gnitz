@@ -327,6 +327,21 @@ pub fn filter_prog(
         .expect("test predicate must validate")
 }
 
+/// One predicate resolved both ways: as a filter, read back as packed bits, and
+/// as a scalar, read back as the register's value. The two read-backs are guarded
+/// apart by role, so a test wanting both needs two evaluators.
+pub fn filter_and_scalar(
+    schema: &TestSchema,
+    instrs: Vec<LogicalInstr>,
+    result_reg: Reg,
+    const_strings: Vec<Vec<u8>>,
+) -> (Evaluator, Evaluator) {
+    (
+        filter_prog(schema, instrs.clone(), result_reg, const_strings.clone()),
+        scalar_prog(schema, instrs, result_reg, const_strings),
+    )
+}
+
 /// Build and resolve a map program, checked against both the schema it reads
 /// and the one it writes. Same unwrap rule as [`scalar_prog`].
 pub fn map_prog(

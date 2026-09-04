@@ -6,7 +6,7 @@ Two gap areas covered:
      Before the fix, any DELETE/UPDATE on a narrow-typed payload column would
      panic inside the DISTINCT operator.
   2. TestSqlThreeValuedLogic: NULL OR TRUE = TRUE and NULL AND FALSE = FALSE
-     in WHERE clauses (SQL 3VL correctness for BOOL_OR / BOOL_AND).
+     in WHERE clauses (SQL 3VL correctness for ``BoolBinary``).
 """
 import pytest
 import gnitz
@@ -166,7 +166,7 @@ class TestNarrowTypeViewOps:
 class TestSqlThreeValuedLogic:
     """Validates SQL 3-valued logic for OR and AND in view WHERE clauses.
 
-    Before the fix, BOOL_OR and BOOL_AND propagated NULL whenever either
+    Before the fix, ``BoolBinary`` propagated NULL whenever either
     operand was NULL, violating:
       - NULL OR  TRUE  = TRUE   (must include row)
       - TRUE  OR NULL  = TRUE   (must include row)

@@ -272,17 +272,25 @@ pub fn null_word_set(word: &mut u64, pi: usize, is_null: bool) {
     }
 }
 
-/// Null word with the low `npc` payload bits set — "all `npc` payload columns
-/// are null". `npc` reaches the row-major cap of 64 only when a schema has
-/// exactly 64 payload columns; `1u64 << 64` would panic in debug builds, so
-/// that boundary returns all-ones directly.
+/// A `u64` with its low `n` bits set, total at every `n`: `1u64 << 64` is
+/// undefined, so `n >= 64` answers all-ones directly. The one place that guard
+/// lives, whatever the bits mean — a caller whose `n` is provably below 64 needs
+/// no guard and says so where it proves it.
 #[inline]
-pub fn all_payload_null_mask(npc: usize) -> u64 {
-    if npc < 64 {
-        (1u64 << npc) - 1
+pub const fn low_bits_mask(n: usize) -> u64 {
+    if n < 64 {
+        (1u64 << n) - 1
     } else {
         u64::MAX
     }
+}
+
+/// Null word with the low `npc` payload bits set — "all `npc` payload columns
+/// are null". `npc` reaches the row-major cap of 64 only when a schema has
+/// exactly 64 payload columns.
+#[inline]
+pub fn all_payload_null_mask(npc: usize) -> u64 {
+    low_bits_mask(npc)
 }
 
 /// Concatenate two rows' null words for an output row laid out as

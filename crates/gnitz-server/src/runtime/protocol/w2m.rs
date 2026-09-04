@@ -487,15 +487,12 @@ fn wake_master(park: &ParkWord, flags: u32) {
     futex_wake_u32(futex_word(&park.cursor), FLAG_MASTER_ANY.count_ones(), "wake_master");
 }
 
-/// The mask naming workers `0..n`. Written here beside [`BitIter`] because the
-/// `n == 64` arm is a shift-overflow guard, not a policy: `1u64 << 64` is UB.
+/// The mask naming workers `0..n`. Named here beside [`BitIter`] because the
+/// call sites read it as a domain fact ("one bit per worker"); the shift guard
+/// it is spelled through is `gnitz_wire`'s.
 #[inline]
 pub(crate) fn worker_mask(n: usize) -> u64 {
-    if n >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << n) - 1
-    }
+    gnitz_wire::low_bits_mask(n)
 }
 
 /// Yields the set bit positions of a worker mask, lowest first.

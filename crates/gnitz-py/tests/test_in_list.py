@@ -1,4 +1,4 @@
-"""E2E tests: large integer ``IN`` / ``NOT IN`` lists compile to one INT_IN_SET
+"""E2E tests: large integer ``IN`` / ``NOT IN`` lists compile to one ``IntInSet``
 opcode (removing the old ~16-item OR-chain register cliff) and maintain
 correctly across inserts and deletes.
 
@@ -47,7 +47,7 @@ class TestLargeInList:
                 "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
                 schema_name=sn,
             )
-            # Previously TooManyRegs at CREATE VIEW; now one INT_IN_SET.
+            # Previously TooManyRegs at CREATE VIEW; now one ``IntInSet``.
             client.execute_sql(
                 f"CREATE VIEW v AS SELECT * FROM t WHERE val IN ({SET_SQL})",
                 schema_name=sn,
@@ -94,7 +94,7 @@ class TestLargeInList:
     def test_having_large_in_list(self, client):
         # HAVING is lowered against the reduce-output schema, so a large IN there
         # compiled to the same register-capped OR-chain and hit TooManyRegs at
-        # ~17 items. It now takes the INT_IN_SET fast path.
+        # ~17 items. It now takes the ``IntInSet`` fast path.
         sn = "s" + _uid()
         client.create_schema(sn)
         try:

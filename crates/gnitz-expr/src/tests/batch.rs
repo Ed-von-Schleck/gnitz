@@ -9,13 +9,11 @@ use crate::{ConstIdx, FloatArithOp, IntArithOp, Reg};
 use gnitz_wire::{type_code, FixedInt, TrimMode};
 use std::num::NonZeroU8;
 
-use super::{
-    decode_f64, encode_f64, eval_batch, with_str_bufs, EvalScratch, MAX_STR_COL_BUFS, MORSEL, NULL_WORDS_PER_REG,
-};
+use super::{decode_f64, encode_f64, eval_batch, with_str_bufs, EvalScratch, MORSEL, NULL_WORDS_PER_REG};
 use crate::program::{FloatUnaryOp, IntUnaryOp};
 use crate::test_support::{
-    filter_prog, make_int_view, make_n_col_view, make_string_view, passing_rows, push_payload_cols, row_str, row_value,
-    scalar_prog, schema_pk_ints, schema_pk_strings, set_row_pk, TestSchema, TestView,
+    both_arms, filter_prog, make_int_view, make_n_col_view, make_string_view, passing_rows, push_payload_cols, row_str,
+    row_value, scalar_prog, schema_pk_ints, schema_pk_strings, set_row_pk, TestSchema, TestView,
 };
 use crate::{CmpOp, Evaluator, LogicalInstr, ResolvedProgram, RowSource};
 
@@ -542,7 +540,7 @@ fn float_to_int_truncates_and_bounds_exclusively() {
     assert_eq!(out[3], (-128, false), "-128.9 truncates toward zero to -128, in range");
 }
 
-/// `div_like` is the one kernel behind `IntDiv`, `IntMod` and `FloatDiv`: it
+/// `div_like` is the one kernel behind integer `Div`/`Mod` and float `Div`: it
 /// nulls the row on a zero divisor rather than trapping, and a NULL divisor is
 /// ordinary null propagation. Row 0 is live in every case, so a kernel that
 /// nulled unconditionally would not pass.
@@ -791,16 +789,16 @@ fn run_str_to_scalar(vals: &[&[u8]], nulls: &[bool], mk: impl Fn(Reg) -> Vec<Log
     (0..vals.len()).map(|i| row_value(&ev, &view, i)).collect()
 }
 
-/// A program past `MAX_STR_COL_BUFS` distinct string columns. The first
-/// `MAX_STR_COL_BUFS` address their column regions in place; the overflow column
-/// falls back to copying its inline cells into the arena. Both forms must read
-/// back the same bytes, which is the whole point of keeping the fallback.
+/// Far more distinct string columns than a program is likely to name: every one
+/// addresses its own column region in place, because the buffer slot *is* the
+/// payload slot. A short cell's view points into the column region and a long
+/// one into the blob — no column is ever copied into the arena on load.
 #[test]
-fn a_string_column_past_the_buffer_table_still_reads_its_own_bytes() {
-    const N: usize = MAX_STR_COL_BUFS + 1;
+fn every_string_column_addresses_its_own_region_in_place() {
+    const N: usize = 12;
     let schema = schema_pk_strings(N, false);
-    // Mixed widths: a short cell is addressed inline, a long one lands in the
-    // blob whichever buffer slot its column was given.
+    // Mixed widths: a short cell is addressed inline in its column region, a
+    // long one in the blob.
     let vals: Vec<Vec<u8>> = (0..N)
         .map(|c| {
             if c % 2 == 0 {
@@ -828,22 +826,27 @@ fn a_string_column_past_the_buffer_table_still_reads_its_own_bytes() {
     let ev = scalar_prog(&schema, instrs, acc, vec![]);
 
     assert_eq!(
-        ev.prog.str_cols.len(),
-        MAX_STR_COL_BUFS,
-        "the buffer table fills before the overflow column asks for a slot",
+        ev.prog.str_cols,
+        (1u64 << N) - 1,
+        "every string column the program loads is registered at its own slot",
     );
-    // Counted rather than indexed by position: exactly one column overflows the
-    // table, and which slot in the stream it lands at is not the claim.
-    let via_arena = ev
-        .prog
-        .instrs
-        .iter()
-        .filter(|i| matches!(i, crate::Instr::LoadColStr { buf: super::SRC_ARENA, .. }))
-        .count();
-    assert_eq!(
-        via_arena, 1,
-        "exactly the column past the table loads through the arena copy"
-    );
+    // Drive the loads alone and read back which buffer each lane resolved
+    // against — the claim the concatenation below cannot make, since its own
+    // result always lands in the arena.
+    let mut scratch = EvalScratch::new(&ev.prog);
+    drive(&ev.prog, &view, 0, 1, &mut scratch);
+    for (c, val) in vals.iter().enumerate() {
+        let want = match gnitz_wire::german_string_inline(crate::BatchView::col_data(&view, c, 16)) {
+            Some(_) => super::SRC_COL_BASE + c as u32,
+            None => super::SRC_BLOB,
+        };
+        assert_eq!(
+            scratch.str_views[c * MORSEL].src,
+            want,
+            "column {c} ({} bytes) loaded through the wrong buffer",
+            val.len(),
+        );
+    }
 
     assert_eq!(row_str(&ev, &view, 0).0, vals.concat());
 }
@@ -1774,20 +1777,68 @@ fn transcendentals_and_power_are_the_ieee_result() {
 // ---------------------------------------------------------------------------
 
 /// LEFT/RIGHT count characters, a negative count drops from the other end,
-/// and an oversized one is the whole string.
+/// and an oversized one is the whole string. RIGHT walks from the end, so its
+/// row is where an off-by-one in the backward walk shows.
 #[test]
 fn left_and_right_count_characters_from_either_end() {
     let s: &[&[u8]] = &["héllo".as_bytes(); 5];
     let n: &[i64] = &[2, -1, 10, 0, -10];
-    let run = |left: bool| {
-        let (ev, view) = mixed_prog(&[s], &[n], vec![], |r| {
+    let run = |vals: &[&[u8]], counts: &[i64], left: bool| {
+        let (ev, view) = mixed_prog(&[vals], &[counts], vec![], |r| {
             vec![LogicalInstr::StrSide { src: r[0], n_reg: r[1], left }]
         });
-        str_rows(&ev, &view, 5).into_iter().map(|(v, _)| v).collect::<Vec<_>>()
+        str_rows(&ev, &view, vals.len())
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect::<Vec<_>>()
     };
     let want = |ss: [&str; 5]| ss.iter().map(|x| x.as_bytes().to_vec()).collect::<Vec<_>>();
-    assert_eq!(run(true), want(["hé", "héll", "héllo", "", ""]));
-    assert_eq!(run(false), want(["lo", "éllo", "héllo", "", ""]));
+    assert_eq!(run(s, n, true), want(["hé", "héll", "héllo", "", ""]));
+    assert_eq!(run(s, n, false), want(["lo", "éllo", "héllo", "", ""]));
+
+    // Bytes with no character start at all, and a count past the total. `0x80`
+    // is a continuation byte, so it belongs to the character before it and the
+    // last row is two characters, not three; a string of nothing but
+    // continuation bytes has no character at all and RIGHT drops all of it.
+    let odd: &[&[u8]] = &[
+        &[0x80, 0x80],
+        &[0x80, 0x80],
+        b"",
+        &[0xFF, b'a', 0x80],
+        &[0xFF, b'a', 0x80],
+    ];
+    let counts: &[i64] = &[1, 9, 3, 1, 9];
+    assert_eq!(
+        run(odd, counts, false),
+        vec![vec![], vec![], vec![], vec![b'a', 0x80], vec![0xFF, b'a', 0x80]],
+    );
+}
+
+/// `StrSide` is the one string producer instantiated infallible, so it merges no
+/// fail mask — not even a provably-zero one. Both arms must still answer the
+/// same, and the `no_nulls` one must produce no NULL at all, since a dropped
+/// fail flag there is exactly what the instantiation asserts cannot happen.
+#[test]
+fn right_is_infallible_and_agrees_across_the_arms() {
+    let schema = schema_pk_strings(1, false);
+    let vals: Vec<&[u8]> = vec!["héllo wörld".as_bytes(), b"", b"abc", &[0x80, 0xFF, b'z']];
+    let rows: Vec<&[&[u8]]> = vals.iter().map(std::slice::from_ref).collect();
+    let view = make_string_view(&schema, &rows);
+    let instrs = vec![
+        LogicalInstr::LoadColStr { col: 1 },
+        LogicalInstr::LoadConst { val: 2 },
+        LogicalInstr::StrSide { src: Reg(0), n_reg: Reg(1), left: false },
+    ];
+    let (fast, nullable) = both_arms("str_side", || scalar_prog(&schema, instrs.clone(), Reg(2), vec![]));
+    let read = |ev: &Evaluator| str_rows(ev, &view, vals.len());
+    let got = read(&fast);
+    assert_eq!(got, read(&nullable), "the arms disagree");
+    assert!(!got.iter().any(|&(_, is_null)| is_null), "RIGHT never makes a NULL");
+    // The last fixture leads with a continuation byte, which begins no
+    // character of its own: the value is the two characters `0xFF` and `z`, so
+    // RIGHT(2) keeps both and the leading byte falls off.
+    let want: Vec<&[u8]> = vec!["ld".as_bytes(), b"", b"bc", &[0xFF, b'z']];
+    assert_eq!(got.iter().map(|(v, _)| v.as_slice()).collect::<Vec<_>>(), want);
 }
 
 /// STRPOS is a 1-based *character* index, 0 when absent, 1 for an empty needle.

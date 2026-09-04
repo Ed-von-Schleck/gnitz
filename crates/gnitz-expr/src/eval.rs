@@ -82,10 +82,11 @@ impl LogicalProgram {
     ///
     /// `result_reg` is not marked as a filter's, so it is excluded from
     /// `bool_input` and a bare non-boolean result has no `bool_bits` bit — which
-    /// is why a predicate must go through [`Self::resolve_filter`] instead. A
-    /// boolean-valued RHS (`SET flag = a AND b`) still reads back correctly:
-    /// `bool_pack_mask` covers every bit_only register, so the read-back finds
-    /// the packed bit.
+    /// is why a predicate must go through [`Self::resolve_filter`] instead, and
+    /// why [`Evaluator::filter_ranges`] refuses an evaluator resolved here. A
+    /// boolean-valued RHS (`SET flag = a AND b`) reads back off the `regs` lane
+    /// like any other: `analyze` puts a non-filter `result_reg` in
+    /// `non_bool_read`, so it is never bit_only and its producer unpacks.
     pub fn resolve_scalar(self, schema: &dyn SchemaFacts) -> Result<Evaluator, ExprValidateErr> {
         self.into_evaluator(schema, Role::Scalar)
     }
@@ -178,6 +179,12 @@ impl Evaluator {
     /// across chunks). The bitmap stays inside the scratch. `[(0, n)]` is the
     /// agreed spelling of "no predicate".
     pub fn filter_ranges(&self, mb: &dyn BatchView, out: &mut Vec<(usize, usize)>) {
+        assert!(
+            self.prog.is_filter(),
+            "filter_ranges on an evaluator that did not resolve as a filter: only \
+             `resolve_filter` forces the result register into `bool_pack`, so no \
+             `bool_bits` word is written for it and every row would read as failing",
+        );
         out.clear();
         let n = mb.row_count();
         self.scratch.borrow_mut().ensure_filter_words(n);
@@ -191,6 +198,11 @@ impl Evaluator {
     /// `row_count()` single-row drives would each pay `eval_batch`'s
     /// straight-line prologue for one row.
     pub fn eval_all(&self, mb: &dyn BatchView) -> ExprResults {
+        assert!(
+            !self.prog.is_filter(),
+            "eval_all on a filter-resolved evaluator: its result register may be bit_only, \
+             whose producer skips the unpack, so the `regs` lane holds no value to read back",
+        );
         let n = mb.row_count();
         if !self.prog.result_is_str() {
             let mut vals = Vec::with_capacity(n);

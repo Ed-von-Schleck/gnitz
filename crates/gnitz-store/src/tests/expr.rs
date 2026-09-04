@@ -507,6 +507,75 @@ fn map_with_pack_pk_source_promotes_payload_to_pk() {
     assert!(!out.is_consolidated(), "a stamped PK must not be marked consolidated");
 }
 
+/// Every PK width is its own monomorphization in `copy_column`'s unswitched PK
+/// arm. A compound PK whose list order is not its column order drives all five at
+/// once: each column lands in a payload slot of its own type, as the native
+/// little-endian value with the OPK sign flip undone.
+#[test]
+fn a_compound_permuted_pk_decodes_at_every_width() {
+    let pk_types = [
+        type_code::I8,
+        type_code::U16,
+        type_code::I32,
+        type_code::U64,
+        type_code::I128,
+    ];
+    // PK-list order, deliberately not column order: each column's OPK byte
+    // offset comes from this list, so a width mixed up here would be caught as
+    // a wrong value rather than a wrong length.
+    let pk_order: [u32; 5] = [3, 0, 4, 1, 2];
+
+    let mut cols = [SchemaColumn::EMPTY; MAX_COLUMNS];
+    for (i, &t) in pk_types.iter().enumerate() {
+        cols[i] = SchemaColumn::new(t, 0);
+    }
+    let in_schema = SchemaDescriptor::new(&cols[..5], &pk_order);
+    // The output inherits the PK and adds one payload column per PK column, at
+    // that column's own type — so the copy widens nothing and the bytes written
+    // are exactly what the decode produced.
+    let mut out_cols = cols;
+    for (i, &t) in pk_types.iter().enumerate() {
+        out_cols[5 + i] = SchemaColumn::new(t, 1);
+    }
+    let out_schema = SchemaDescriptor::new(&out_cols[..10], &pk_order);
+
+    // Both extremes and a wrap-adjacent value per width: the sign flip is what
+    // orders these, and dropping it shows up first at the ends.
+    let rows: [[i128; 5]; 3] = [
+        [i8::MIN as i128, 0, i32::MIN as i128, 0, i128::MIN],
+        [-1, 40_000, -1, u64::MAX as i128, -1],
+        [i8::MAX as i128, u16::MAX as i128, i32::MAX as i128, 1, i128::MAX],
+    ];
+    let mut batch = Batch::with_capacity(in_schema, rows.len());
+    for vals in &rows {
+        let natives: Vec<u128> = pk_order.iter().map(|&ci| vals[ci as usize] as u128).collect();
+        batch.extend_pk_opk(&in_schema, &natives);
+        batch.extend_weight(&1i64.to_le_bytes());
+        batch.extend_null_bmp(&0u64.to_le_bytes());
+        batch.count += 1;
+    }
+
+    let plan = MapPlan::from_map(
+        LogicalProgram::copy_cols(&[0, 1, 2, 3, 4]),
+        &in_schema,
+        &out_schema,
+        PkSource::Inherit,
+    )
+    .unwrap();
+    let out = plan.evaluate_map_batch(&batch);
+    assert_eq!(out.count, rows.len());
+    for (row, vals) in rows.iter().enumerate() {
+        for (pi, (&v, &t)) in vals.iter().zip(&pk_types).enumerate() {
+            let w = gnitz_wire::wire_stride(t);
+            assert_eq!(
+                &out.col_data(pi)[row * w..row * w + w],
+                &(v as u128).to_le_bytes()[..w],
+                "row {row}, PK column {pi} (type {t}) decoded wrong",
+            );
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // Benchmark
 // -----------------------------------------------------------------------
@@ -528,8 +597,10 @@ fn map_ranges_bench() {
     const N: usize = 200_000;
     const ITERS: usize = 20;
 
-    // --- Reindex map: [U64 PK, I64, I64] reindexed on col 1, both payload
-    // columns kept — the equijoin / GROUP BY repartition shape.
+    // --- Reindex map: [U64 PK, I64, I64] reindexed on col 1, the source PK and
+    // both payload columns kept — the equijoin / GROUP BY repartition shape.
+    // Column 0 is what puts a `ColumnLocator::Pk` copy in the loop; the keep-set
+    // rules retain the source PK on every one of those.
     let rx_in = make_schema(0, &[type_code::U64, type_code::I64, type_code::I64]);
     let mut rx_batch = Batch::with_capacity(rx_in, N);
     for i in 0..N as u64 {
@@ -541,9 +612,9 @@ fn map_ranges_bench() {
         rx_batch.count += 1;
     }
     let rx_packer = ReindexPacker::new(&rx_in, &[(1, 0)]).unwrap();
-    let rx_out = rx_packer.output_schema(&rx_in, &[1, 2]).unwrap();
+    let rx_out = rx_packer.output_schema(&rx_in, &[0, 1, 2]).unwrap();
     let rx_plan = MapPlan::from_map(
-        LogicalProgram::copy_cols(&[1, 2]),
+        LogicalProgram::copy_cols(&[0, 1, 2]),
         &rx_in,
         &rx_out,
         PkSource::Pack(rx_packer),

@@ -147,7 +147,7 @@ fn test_binder_rejects_aggregate_qualifiers() {
 /// (un-desugared); a one-item list folds to the `Eq` it is; `NOT IN` wraps the
 /// result in `Not`. The tested operand is bound once as `inner`; every list
 /// item is bound in order into `items`. Lowering — not binding — chooses the
-/// INT_IN_SET fast path vs the OR-chain fallback.
+/// `IntInSet` fast path vs the OR-chain fallback.
 #[test]
 fn test_bind_in_list_folds_one_item_else_binds_faithful() {
     let schema = schema_with_val(TypeCode::I64); // (pk U64, c I64)
@@ -504,7 +504,7 @@ fn round_scale_must_be_a_small_integer_literal() {
     assert_unsupported(bind_num("ROUND(c, 1, 2)"), "one or two arguments");
 }
 
-/// MOD is a pure desugar onto `%`, so it inherits `IntMod`'s total semantics
+/// MOD is a pure desugar onto `%`, so it inherits `IntArith`'s `Mod` total semantics
 /// (zero divisor NULLs the row) with no opcode of its own.
 #[test]
 fn mod_desugars_to_the_modulo_binop() {

@@ -95,10 +95,15 @@ e2e-tls: server pyext ## Run the full E2E suite over TLS (on-demand transport sh
 	cd crates/gnitz-py && GNITZ_TRANSPORT=tls GNITZ_WORKERS=$(WORKERS) \
 		uv run pytest tests/ -v $(if $(K),-k '$(K)')
 
+# `GNITZ_RELEASE=1` travels with the binary, not beside it: this is the one
+# build with `debug_assertions` off, so every `GNITZ_INJECT_*` seam is folded
+# away and the tests that drive one must skip. Without it those tests inject
+# into a server that cannot honour the request and then wait for an abort that
+# never comes.
 e2e-release: WORKERS = 4
 e2e-release: release-server pyext ## Run the E2E suite against the release server
-	cd crates/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release GNITZ_WORKERS=$(WORKERS) \
-		uv run pytest tests/ -v $(if $(K),-k '$(K)')
+	cd crates/gnitz-py && GNITZ_SERVER_BIN=../../gnitz-server-release GNITZ_RELEASE=1 \
+		GNITZ_WORKERS=$(WORKERS) uv run pytest tests/ -v $(if $(K),-k '$(K)')
 
 # The debug-logging loop. It exists as a target so the documented way to chase a
 # failure still rebuilds first: run `uv run pytest` by hand and you test whatever

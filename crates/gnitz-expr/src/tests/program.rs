@@ -234,11 +234,11 @@ fn conjunction_over_two_cols() -> Vec<LogicalInstr> {
 
 /// A sink counts as a non-bool read of its register, so a boolean it ships is not
 /// `bit_only` and its producer writes `regs`. Were the source missing from the
-/// operand table, BOOL_AND would skip the unpack and the sink would read a stale
+/// operand table, `BoolBinary` would skip the unpack and the sink would read a stale
 /// lane.
 #[test]
 fn an_emitted_boolean_lands_in_regs() {
-    // Nullable payload columns: under `no_nulls`, BOOL_AND writes `regs`
+    // Nullable payload columns: under `no_nulls`, `BoolBinary` writes `regs`
     // whatever `bit_only` says, which would make the value assertion vacuous.
     let schema = schema_pk_ints(2, true);
     let mb = make_int_view(&schema, &[(1, 0, &[10, 20])]);
@@ -410,7 +410,7 @@ fn str_col_const_is_classified_never_null() {
 }
 
 // ---------------------------------------------------------------------------
-// SELECT / LOAD_NULL (SQL CASE blend)
+// Select / LoadNull (SQL CASE blend)
 // ---------------------------------------------------------------------------
 
 /// `CASE WHEN cond THEN 42 END` (implicit ELSE NULL) lowers to
@@ -504,7 +504,7 @@ fn select_propagates_u64_tracking_to_its_reader() {
     );
 }
 
-/// SELECT feeding BOOL_AND: `cond` is a bool_input, the select result feeds the
+/// `Select` feeding `BoolBinary`: `cond` is a bool_input, the select result feeds the
 /// AND as a bool_input, and the select dst (a value register) is never bit_only.
 #[test]
 fn select_classification_of_cond_and_result() {
@@ -525,7 +525,7 @@ fn select_classification_of_cond_and_result() {
     // Neither r0 nor r3 is bool-produced, so neither can be bit_only and their
     // `bool_pack` bits can only come from the bool_input half.
     assert_ne!(bool_pack & (1 << 0), 0, "cond is read as a bool_input");
-    assert_ne!(bool_pack & (1 << 3), 0, "select result feeds BOOL_AND as bool_input");
+    assert_ne!(bool_pack & (1 << 3), 0, "select result feeds BoolBinary as bool_input");
     assert_eq!(bit_only & (1 << 3), 0, "select dst is a value register, never bit_only");
 }
 
@@ -672,7 +672,7 @@ fn validate_err_display_names_the_register_limit() {
     assert_eq!(
         ExprValidateErr::TooManyRegs(66).to_string(),
         format!(
-            "expression needs 66 registers; the limit is {} — split the predicate",
+            "expression needs 66 registers; the limit is {} — split the predicate, or project fewer computed columns",
             crate::MAX_REGS
         )
     );
@@ -1058,7 +1058,7 @@ fn new_panics_on_a_forward_register_reference() {
 }
 
 // ---------------------------------------------------------------------------
-// INT_IN_SET — set membership as one opcode (O(1) registers, O(log N) per row)
+// IntInSet — set membership as one opcode (O(1) registers, O(log N) per row)
 // ---------------------------------------------------------------------------
 
 /// `r0 = col1; r1 = r0 IN set`, result_reg = 1 — the compiled shape of
@@ -1167,7 +1167,7 @@ fn validate_rejects_a_misaligned_in_set_pool() {
     // A pool whose length is not a multiple of 8 is a clean IntSetNotAligned,
     // not a silent chunks_exact tail-drop at resolve. `from_wire` runs the
     // structure-only validate, so it rejects here.
-    // Quad: [INT_IN_SET=46, dst=1, value_reg=0, set_idx=0], pool of 5 bytes.
+    // Instruction: [IntInSet=24, selector 0, value_reg=0, set_idx=0], pool of 5 bytes.
     assert_eq!(
         wire_err(LogicalProgram::from_wire(
             &one(ExprOp::IntInSet, 0, &[0, 0]),
@@ -1204,16 +1204,16 @@ fn classifier_pure_conjunction_filter() {
     let prog = LogicalProgram::new(instrs.clone(), vec![], Some(Reg(5)), vec![]);
     let ProgramFacts { bit_only, bool_pack, .. } = prog.analyze(&schema, Role::Filter);
     filter_prog(&schema, instrs, Reg(5), vec![]);
-    // Bool producers: r2 (CMP_GT), r4 (CMP_GT), r5 (BOOL_AND).
+    // Bool producers: r2 (`Cmp` Gt), r4 (`Cmp` Gt), r5 (`BoolBinary`).
     // Non-bool readers consume r0/r1/r3 (CMPs read them as i64), so those
-    // never qualify for bit_only. r2/r4 are read only by BOOL_AND, and r5
+    // never qualify for bit_only. r2/r4 are read only by `BoolBinary`, and r5
     // (result_reg) stays bit_only under is_filter=true.
     let expected_bit_only = (1u64 << 2) | (1u64 << 4) | (1u64 << 5);
     assert_eq!(
         bit_only, expected_bit_only,
         "expected r2/r4/r5 bit_only; got mask {bit_only:#010b}"
     );
-    // r2 and r4 are read by BOOL_AND; r5 (result_reg) is force-marked a bool
+    // r2 and r4 are read by `BoolBinary`; r5 (result_reg) is force-marked a bool
     // input so the filter's nullable word merge always finds it packed. Every
     // bit_only register is packed too, and here the two halves coincide.
     assert_eq!(bool_pack, (1 << 2) | (1 << 4) | (1 << 5));

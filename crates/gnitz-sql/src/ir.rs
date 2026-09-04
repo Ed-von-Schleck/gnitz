@@ -61,7 +61,7 @@ pub(crate) enum BExpr<R> {
     },
     /// `inner IN (items…)` bound faithfully (un-desugared): lowering decides the
     /// form — a `≤8-byte-integer` operand with all-integer-literal items compiles to
-    /// one `INT_IN_SET`; anything else falls back to the
+    /// one `IntInSet`; anything else falls back to the
     /// `inner = i0 OR inner = i1 OR …` chain. `NOT IN` is the outer
     /// `UnaryOp(Not, InList)`. `items` always holds two or more entries: the binder
     /// rejects `IN ()` and folds `IN (l)` to `Eq`, so the recognizers over bound

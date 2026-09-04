@@ -93,7 +93,7 @@ impl OpcodeBackend<'_> {
         match expr {
             BoundExpr::ColRef(c) => self.col_ref(*c),
             BoundExpr::LitInt(v) => Ok((self.eb.emit(L::LoadConst { val: *v }), ExprKind::Int)),
-            BoundExpr::LitFloat(v) => Ok((self.eb.emit(L::LoadConst { val: v.to_bits() as i64 }), ExprKind::Float)),
+            BoundExpr::LitFloat(v) => Ok((self.eb.const_f64(*v), ExprKind::Float)),
             BoundExpr::LitStr(s) => {
                 let idx = self.eb.add_const_string(s.clone());
                 Ok((self.eb.emit(L::LoadConstStr { const_idx: idx }), ExprKind::Str))
@@ -261,9 +261,7 @@ impl OpcodeBackend<'_> {
     /// for `n > 0`, divide first for `n < 0` — because negative powers of ten
     /// are not f64-exact.
     fn scaled_round(&mut self, a: Reg, n: i8) -> Reg {
-        let scale = self.eb.emit(L::LoadConst {
-            val: 10f64.powi(n.unsigned_abs() as i32).to_bits() as i64,
-        });
+        let scale = self.eb.const_f64(10f64.powi(n.unsigned_abs() as i32));
         let (first, undo) = if n > 0 {
             (FloatArithOp::Mul, FloatArithOp::Div)
         } else {
@@ -487,7 +485,7 @@ impl OpcodeBackend<'_> {
     }
 
     /// `inner IN (items…)`. A ≤8-byte-integer operand with all-integer-literal
-    /// items is one `INT_IN_SET`; anything else is the `inner = item` OR chain.
+    /// items is one `IntInSet`; anything else is the `inner = item` OR chain.
     /// `self.cols` is the schema `inner` was bound against, so the gate holds
     /// for a HAVING over the reduce output as much as for a table filter.
     fn in_list(&mut self, inner: &BoundExpr, items: &[BoundExpr]) -> Result<(Reg, ExprKind), GnitzSqlError> {

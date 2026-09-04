@@ -73,27 +73,28 @@ pub fn encode_pk_tuple(cols: impl IntoIterator<Item = (usize, u8)>, src: &[u8], 
 /// big-endian image is read, its sign bit un-flipped for signed types, and the
 /// native little-endian value stored — the mirror of the encoder, arm for arm,
 /// and likewise never a read-modify-write of `dst`.
+///
+/// Each arm stores through a `&mut [u8; W]`, never `copy_from_slice`: LLVM
+/// tail-merges four runtime-length copies into one shared `memcpy` call, leaving
+/// a caller's row loop an indirect branch and a `call memcpy`. In the type the
+/// width propagates and the store is one instruction.
 #[inline(always)]
 pub fn decode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
     debug_assert_eq!(dst.len(), src.len());
     let flip = crate::is_signed_int(tc);
+    macro_rules! decode {
+        ($ty:ty, $sign_bit:expr) => {{
+            const W: usize = std::mem::size_of::<$ty>();
+            let v = <$ty>::from_be_bytes(src.try_into().unwrap()) ^ ((flip as $ty) << $sign_bit);
+            let d: &mut [u8; W] = dst.try_into().unwrap();
+            *d = v.to_le_bytes();
+        }};
+    }
     match src.len() {
-        16 => {
-            let v = u128::from_be_bytes(src.try_into().unwrap()) ^ ((flip as u128) << 127);
-            dst.copy_from_slice(&v.to_le_bytes());
-        }
-        8 => {
-            let v = u64::from_be_bytes(src.try_into().unwrap()) ^ ((flip as u64) << 63);
-            dst.copy_from_slice(&v.to_le_bytes());
-        }
-        4 => {
-            let v = u32::from_be_bytes(src.try_into().unwrap()) ^ ((flip as u32) << 31);
-            dst.copy_from_slice(&v.to_le_bytes());
-        }
-        2 => {
-            let v = u16::from_be_bytes(src.try_into().unwrap()) ^ ((flip as u16) << 15);
-            dst.copy_from_slice(&v.to_le_bytes());
-        }
+        16 => decode!(u128, 127),
+        8 => decode!(u64, 63),
+        4 => decode!(u32, 31),
+        2 => decode!(u16, 15),
         1 => dst[0] = src[0] ^ ((flip as u8) << 7),
         other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
     }

@@ -232,7 +232,7 @@ class TestRound:
 
 
 # ---------------------------------------------------------------------------
-# MOD: the total IntMod opcode, not Rust's `%`
+# MOD: the total ``IntArith`` Mod selector, not Rust's `%`
 # ---------------------------------------------------------------------------
 
 

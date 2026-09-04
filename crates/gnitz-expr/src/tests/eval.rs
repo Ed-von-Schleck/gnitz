@@ -8,13 +8,14 @@ use gnitz_wire::type_code;
 
 use crate::batch::MORSEL;
 use crate::test_support::{
-    both_arms, filter_prog, is_not_null_op, is_null_op, make_int_view, make_n_col_view, map_prog, passing_ranges,
-    passing_rows, push_payload_cols, row_value, scalar_prog, schema_pk_ints, schema_pk_strings, set_row_pk,
-    FilterShape, TestSchema, TestView,
+    both_arms, filter_and_scalar, filter_prog, is_not_null_op, is_null_op, make_int_view, make_n_col_view, map_prog,
+    passing_ranges, passing_rows, push_payload_cols, row_value, scalar_prog, schema_pk_ints, schema_pk_strings,
+    set_row_pk, FilterShape, TestSchema, TestView,
 };
 use crate::{CmpOp, Evaluator, ExprResults, IntArithOp, LogicalInstr};
 
-/// True iff `ev`'s predicate passes for `row`.
+/// True iff `ev`'s predicate passes for `row`, read back as a value. `ev` must be
+/// the *scalar* resolution: `eval_all` refuses a filter-resolved evaluator.
 fn passes(ev: &Evaluator, mb: &TestView, row: usize) -> bool {
     row_value(ev, mb, row).is_some_and(|val| val != 0)
 }
@@ -104,8 +105,8 @@ fn filter_ranges_collects_into_a_reused_buffer() {
     assert_eq!(out, vec![(0, 8)]);
 }
 
-/// The batch filter and the m=1 row read are two drives of one program and must
-/// agree row for row.
+/// The batch filter and the m=1 row read are the two read-backs of one
+/// instruction stream and must agree row for row.
 #[test]
 fn filter_agrees_with_the_row_read() {
     let schema = schema_pk_ints(1, true);
@@ -115,7 +116,7 @@ fn filter_agrees_with_the_row_read() {
         LogicalInstr::LoadConst { val: 15 },                       // r1 = 15
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) }, // r2 = r0 > r1
     ];
-    let ev = filter_prog(&schema, instrs, Reg(2), vec![]);
+    let (ev, row_reader) = filter_and_scalar(&schema, instrs, Reg(2), vec![]);
 
     let rows: &[(u64, u64, &[i64])] = &[(1, 0, &[5]), (2, 0, &[15]), (3, 0, &[25]), (4, 0, &[0])];
     let mb = make_int_view(&schema, rows);
@@ -123,9 +124,41 @@ fn filter_agrees_with_the_row_read() {
     let passing = passing_rows(&ev, &mb);
 
     for (i, &(_, _, vals)) in rows.iter().enumerate() {
-        assert_eq!(passing[i], passes(&ev, &mb, i), "row {i}: val={}", vals[0]);
+        assert_eq!(passing[i], passes(&row_reader, &mb, i), "row {i}: val={}", vals[0]);
     }
     assert_eq!(passing, vec![false, false, true, false]);
+}
+
+/// The two read-backs are guarded apart by role, in both directions: a scalar
+/// resolution writes no `bool_bits` word for its result register (so the filter
+/// would report that nothing passes), and a filter's may be bit_only (so the
+/// value read would find an unwritten lane). Neither may answer wrongly.
+#[test]
+#[should_panic(expected = "filter_ranges on an evaluator that did not resolve as a filter")]
+fn filter_ranges_refuses_a_scalar_resolved_evaluator() {
+    let schema = schema_pk_ints(1, false);
+    let mb = make_int_view(&schema, &[(1, 0, &[25])]);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadConst { val: 15 },
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
+    ];
+    let ev = scalar_prog(&schema, instrs, Reg(2), vec![]);
+    ev.filter_ranges(&mb, &mut Vec::new());
+}
+
+#[test]
+#[should_panic(expected = "eval_all on a filter-resolved evaluator")]
+fn eval_all_refuses_a_filter_resolved_evaluator() {
+    let schema = schema_pk_ints(1, false);
+    let mb = make_int_view(&schema, &[(1, 0, &[25])]);
+    let instrs = vec![
+        LogicalInstr::LoadColInt { col: 1 },
+        LogicalInstr::LoadConst { val: 15 },
+        LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
+    ];
+    let ev = filter_prog(&schema, instrs, Reg(2), vec![]);
+    ev.eval_all(&mb);
 }
 
 /// A fused string compare against a nullable column keeps the program on the
@@ -153,13 +186,13 @@ fn a_fused_string_compare_never_passes_a_null_row() {
         col: 1,
         const_idx: ConstIdx(0),
     }];
-    let kind = filter_prog(&schema, instrs, Reg(0), vec![b"foo".to_vec()]);
+    let (kind, row_reader) = filter_and_scalar(&schema, instrs, Reg(0), vec![b"foo".to_vec()]);
 
     // Drive the (multi-morsel) batch path through the filter and compare to
     // the m=1 read.
     let passing = passing_rows(&kind, &mb);
     for (row, &batch_pass) in passing.iter().enumerate() {
-        let row_pass = passes(&kind, &mb, row);
+        let row_pass = passes(&row_reader, &mb, row);
         assert_eq!(batch_pass, row_pass, "row {row}: batch={batch_pass} per-row={row_pass}",);
         // Stronger invariant: a null column value can never satisfy `=`.
         let null_word = crate::RowSource::get_null_word(&mb, row);
@@ -394,7 +427,7 @@ fn is_not_null_and_over_partial_word() {
     }
 }
 
-/// The filter's nullable-arm tail mask. BOOL_NOT is the op that dirties the
+/// The filter's nullable-arm tail mask. `BoolNot` is the op that dirties the
 /// tail: it complements whole `bool_bits` words (`!va & !na`), so every bit
 /// above `m % 64` of the last word comes out set, and the word merge into
 /// `filter_bits` carries them through. The loaded nullable column is what keeps
@@ -594,6 +627,37 @@ fn is_null_map_arms_agree() {
                 drive(&nullable, &mb, n),
                 "{arrangement}: map arms disagree at n={n}",
             );
+        }
+    }
+}
+
+/// The register-sink destination `eval_is_null`'s packed-arm gate exists for:
+/// nothing reads `dst` as a packed bit, so the verdict has to arrive in the
+/// `regs` lane. Pinned to absolute values rather than compared arm to arm, which
+/// two identically wrong arms would pass.
+#[test]
+fn is_null_into_a_register_sink_reads_back_per_row() {
+    let in_schema = schema_pk_ints(1, true);
+    let out_schema = schema_pk_ints(1, false);
+    // Rows 3 mod 8 are NULL, so every word carries both verdicts and the morsel
+    // tail is a partial word holding some of each.
+    let n = MORSEL + 7;
+    let mb = make_n_col_view(&in_schema, n, |row, _| row as i64, |row, _| row % 8 == 3);
+    for invert in [false, true] {
+        let instrs = vec![LogicalInstr::IsNull { col: 1, invert }];
+        let (fast, nullable) = both_arms("map", || {
+            map_prog(&in_schema, &out_schema, instrs.clone(), vec![Sink::Reg(Reg(0))], vec![])
+        });
+        let want: Vec<i64> = (0..n).map(|row| i64::from((row % 8 == 3) ^ invert)).collect();
+        for (label, ev) in [("fast", &fast), ("nullable", &nullable)] {
+            let mut vals = Vec::with_capacity(n);
+            let mut nulls = vec![false; n];
+            ev.eval_morsels(&mb, 0, n, |rel, out| {
+                vals.extend_from_slice(out.reg_values(0));
+                out.for_each_null_row(0, |i| nulls[rel + i] = true);
+            });
+            assert_eq!(vals, want, "{label}/invert={invert}: wrong verdict");
+            assert!(!nulls.iter().any(|&x| x), "{label}: an IS NULL result is never NULL");
         }
     }
 }
@@ -910,8 +974,8 @@ fn or_does_not_take_a_null_row_stored_value_as_definite_true() {
 /// A 3-conjunct chain read back per row, which reports the null bit
 /// directly where `filter` cannot: it consumes `bool_bits & !null_bits`, so a
 /// cleared bool already forces the verdict and NULL is indistinguishable from
-/// FALSE there. A filter-resolved program really is driven this way — `passes`
-/// above is exactly that.
+/// FALSE there. Resolved as a scalar, which is the read-back that can tell the
+/// two apart at all: a filter reports both as "does not pass".
 ///
 /// Two rows, because the interesting cases are the two the chain can produce:
 /// `TRUE AND NULL AND TRUE` is NULL, and a definite-FALSE chain is FALSE rather
@@ -939,7 +1003,7 @@ fn and_chain_null_and_false_per_row() {
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(6), b: Reg(1) },
         LogicalInstr::BoolBinary { is_or: false, a: Reg(5), b: Reg(7) },
     ];
-    let ev = filter_prog(&schema, instrs, Reg(8), vec![]);
+    let ev = scalar_prog(&schema, instrs, Reg(8), vec![]);
 
     assert_eq!(row_value(&ev, &mb, 0), None, "TRUE AND NULL AND TRUE is NULL");
     assert_eq!(

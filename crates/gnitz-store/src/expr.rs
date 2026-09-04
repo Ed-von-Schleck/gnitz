@@ -98,6 +98,11 @@ fn copy_column(
     w: RowWindow,
 ) {
     let RowWindow { src: src_start, dst: dst_base, n } = w;
+    if n == 0 {
+        // Every arm below is a no-op over an empty window, and the PK arm's
+        // source span is expressed off row `n - 1`.
+        return;
+    }
     let dst_payload = dst_payload as usize;
     let stride = dst_stride as usize; // destination write width
 
@@ -118,14 +123,31 @@ fn copy_column(
             // row. Each read is the source column's OWN width — the wider
             // destination stride would over-read into the next PK column.
             if src_stride == stride {
-                for i in 0..n {
-                    let off = (src_start + i) * pk_stride + pk_off;
-                    let row = dst_base + i;
-                    gnitz_wire::decode_pk_column(
-                        &pk[off..off + stride],
-                        type_code,
-                        &mut dst[row * stride..row * stride + stride],
-                    );
+                // The width is unswitched out too, so `decode_pk_column` takes
+                // fixed-size arrays and its own width match folds away.
+                macro_rules! decode_rows {
+                    ($w:expr) => {{
+                        const W: usize = $w;
+                        // Both windows cut once, as `Instr::LoadPk`'s row loop
+                        // does: three bounds checks per row the loop drops.
+                        let base = src_start * pk_stride + pk_off;
+                        let cells = &pk[base..base + (n - 1) * pk_stride + W];
+                        let out = &mut dst[dst_base * W..(dst_base + n) * W];
+                        for (d, k) in out.chunks_exact_mut(W).zip((0..n).map(|i| i * pk_stride)) {
+                            let s: &[u8; W] = cells[k..k + W].try_into().unwrap();
+                            gnitz_wire::decode_pk_column(s, type_code, d.try_into().unwrap());
+                        }
+                    }};
+                }
+                // `decode_pk_column`'s own domain: a PK column is 1, 2, 4, 8 or
+                // 16 bytes, and it says so itself on anything else.
+                match stride {
+                    1 => decode_rows!(1),
+                    2 => decode_rows!(2),
+                    4 => decode_rows!(4),
+                    8 => decode_rows!(8),
+                    16 => decode_rows!(16),
+                    other => unreachable!("PK column size must be 1/2/4/8/16, got {other}"),
                 }
             } else {
                 // One PK column, so 16 bytes covers every fixed-width type — not
@@ -627,7 +649,6 @@ impl MapPlan {
         if self.ev.emits_anything() {
             let in_mb = in_batch.as_mem_batch();
             self.ev.eval_morsels(&in_mb, src_start, n, |morsel_start, out| {
-                let m = out.rows();
                 // Emits: write each computed register to its output column. One
                 // `Iterator::next` per emit, against a `copy_from_slice` of up
                 // to 2 KiB — unlike `NullPerm`'s per-row loop, where the call
@@ -639,27 +660,18 @@ impl MapPlan {
                     // the row-major NULL bitmap are written in the same pass over
                     // the null rows.
                     let (col, nb, _) = output.col_null_and_blob_mut(out_payload);
-
-                    // One blit: the morsel's rows are contiguous in the column.
-                    let win = &mut col[row0 * 8..(row0 + m) * 8];
-                    debug_assert_eq!(win.len(), out.reg_bytes(reg).len(), "scalar emit stride is not 8");
-                    win.copy_from_slice(out.reg_bytes(reg));
-
-                    out.write_null_rows(reg, win, nb, row0, out_payload);
+                    out.emit_scalar_cells(reg, col, nb, row0, out_payload);
                 }
 
-                // String emits. Two passes like the scalar path rather than a
-                // per-row nullness branch, because `MorselOut` exposes nullness
-                // only through `write_null_rows` — and under `no_nulls` there
-                // is no `null_bits` to index at all. Both passes live on
-                // `MorselOut`, so the per-row loops run at gnitz-expr's
-                // opt-level rather than this crate's.
+                // String emits. Two passes inside the emit rather than a per-row
+                // nullness branch, because under `no_nulls` there is no
+                // `null_bits` to index at all. Both passes live on `MorselOut`,
+                // so the per-row loops run at gnitz-expr's opt-level rather than
+                // this crate's.
                 for &(reg, out_payload) in self.ev.str_emits() {
                     let (reg, out_payload) = (reg as usize, out_payload as usize);
                     let (col, nb, blob) = output.col_null_and_blob_mut(out_payload);
-                    let win = &mut col[row0 * 16..(row0 + m) * 16];
-                    out.write_str_cells(reg, win, blob);
-                    out.write_null_rows(reg, win, nb, row0, out_payload);
+                    out.emit_str_cells(reg, col, nb, blob, row0, out_payload);
                 }
             });
         }

@@ -75,7 +75,15 @@ impl ExprBuilder {
         self.add_const_bytes(s.into_bytes())
     }
 
-    /// Push an i64 value pool for `INT_IN_SET`, packed as `N × 8-byte LE`, and
+    /// The register holding `v`'s f64 image. A float register *is* an i64 slot
+    /// carrying `to_bits`, and the kernels read it back through that same codec,
+    /// so a caller must never write `v as i64` — which compiles and is silently
+    /// a different number.
+    pub fn const_f64(&mut self, v: f64) -> Reg {
+        self.emit(LogicalInstr::LoadConst { val: crate::batch::encode_f64(v) })
+    }
+
+    /// Push an i64 value pool for `IntInSet`, packed as `N × 8-byte LE`, and
     /// return its const index. Sorting is not a wire contract: the engine's
     /// `resolve` sorts the decoded pool before binary-searching it, because set
     /// membership does not depend on order and trusting the client here would

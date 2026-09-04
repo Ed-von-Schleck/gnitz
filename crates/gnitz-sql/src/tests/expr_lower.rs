@@ -557,7 +557,7 @@ fn case_string_branches_compile_through_the_string_channel() {
 }
 
 // ------------------------------------------------------------------
-// IN-list lowering: INT_IN_SET fast path vs OR-chain fallback
+// IN-list lowering: `IntInSet` fast path vs OR-chain fallback
 // ------------------------------------------------------------------
 
 /// col0 = pk (U64), col1 = a (I64), col2 = b (I64).
@@ -576,7 +576,7 @@ fn in_list(inner: BoundExpr, items: Vec<BoundExpr>) -> BoundExpr {
     BoundExpr::InList { inner: Box::new(inner), items }
 }
 
-/// An integer operand with all-integer-literal items → one INT_IN_SET; the
+/// An integer operand with all-integer-literal items → one `IntInSet`; the
 /// binder folds a negated literal, so a negative item is a literal like any
 /// other.
 #[test]
@@ -626,7 +626,7 @@ fn in_list_large_int_list_compiles_within_register_cap() {
 }
 
 /// A float operand falls back to the OR-chain (int-cast + fcmp), never
-/// INT_IN_SET.
+/// `IntInSet`.
 #[test]
 fn in_list_float_operand_falls_back_to_or_chain() {
     let schema = case_schema(); // col2 = f (F64)
@@ -637,7 +637,7 @@ fn in_list_float_operand_falls_back_to_or_chain() {
     .unwrap();
     assert!(
         !has(prog.instrs(), |i| matches!(i, L::IntInSet { .. })),
-        "float IN must not emit INT_IN_SET"
+        "float IN must not emit IntInSet"
     );
     assert!(
         has(prog.instrs(), |i| matches!(i, L::FCmp { op: CmpOp::Eq, .. })),
@@ -659,7 +659,7 @@ fn in_list_string_operand_falls_back_to_or_chain() {
     .unwrap();
     assert!(
         !has(prog.instrs(), |i| matches!(i, L::IntInSet { .. })),
-        "string IN must not emit INT_IN_SET"
+        "string IN must not emit IntInSet"
     );
     assert!(
         has(prog.instrs(), |i| matches!(i, L::StrColConst { op: CmpOp::Eq, .. })),
@@ -701,7 +701,7 @@ fn in_list_shares_a_computed_operand_across_the_fold() {
 
 /// An integer column operand is never fused into the per-item compare, so its
 /// load is shared the same way: one for the whole list rather than one per
-/// item. (A literal list would take `INT_IN_SET`; one non-literal item is
+/// item. (A literal list would take `IntInSet`; one non-literal item is
 /// what forces the fold.)
 #[test]
 fn in_list_shares_an_integer_column_operand() {
@@ -752,7 +752,7 @@ fn in_list_non_literal_item_falls_back_to_or_chain() {
     .unwrap();
     assert!(
         !has(prog.instrs(), |i| matches!(i, L::IntInSet { .. })),
-        "non-literal item must not emit INT_IN_SET"
+        "non-literal item must not emit IntInSet"
     );
     assert!(
         has(prog.instrs(), |i| matches!(i, L::Cmp { op: CmpOp::Eq, .. })),
@@ -775,7 +775,7 @@ fn in_list_float_literal_item_falls_back_to_or_chain() {
     .unwrap();
     assert!(
         !has(prog.instrs(), |i| matches!(i, L::IntInSet { .. })),
-        "a float-literal item must not emit INT_IN_SET"
+        "a float-literal item must not emit IntInSet"
     );
 }
 
@@ -876,7 +876,7 @@ fn computed_operands_compare_through_the_register_channel() {
 }
 
 /// Every comparison has its own opcode on the register channel too, so none
-/// pays a swap or a `BOOL_NOT`.
+/// pays a swap or a `BoolNot`.
 #[test]
 fn register_compare_has_all_six_operators() {
     let schema = str_schema();
@@ -1365,7 +1365,7 @@ fn null_test_lowers_by_its_operand() {
 
 /// A true-constant conjunct — the binder's fold of `IS NOT NULL` on a
 /// non-nullable column — is dropped wherever it sits, so `a > 1 AND <true>`
-/// costs no `BOOL_AND` per row; a list of nothing but true constants is the
+/// costs no `BoolBinary` per row; a list of nothing but true constants is the
 /// statically-true verdict, and a false constant keeps its program.
 #[test]
 fn filter_program_drops_true_constant_conjuncts_in_any_position() {

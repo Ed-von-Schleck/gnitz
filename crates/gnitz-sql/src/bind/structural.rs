@@ -353,7 +353,7 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         // what makes the equality visible to the `access` recognizers, which all gate
         // on `BinOp(_, Eq, _)`. Two or more items keep the faithful `InList` node, so
         // lowering can pick a ≤8-byte-integer operand with all-integer-literal items
-        // to one `INT_IN_SET` and everything else to the `e = l1 OR … OR e = ln`
+        // to one `IntInSet` and everything else to the `e = l1 OR … OR e = ln`
         // chain. `NOT IN` wraps whichever node the arity picked. Item binding is
         // eager, so a NULL/string/non-literal item errors in its written position.
         Expr::InList { expr: e, list, negated } => {
@@ -769,7 +769,7 @@ fn map_binop(op: &BinaryOperator) -> Result<BinOp, GnitzSqlError> {
 /// over `R` without a `Clone` bound.
 fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
     match v {
-        // NULL is an ordinary value here: it lowers to `LOAD_NULL`, types as
+        // NULL is an ordinary value here: it lowers to `LoadNull`, types as
         // `unify_blend_type`'s neutral element, and every consumer of the bound IR
         // already has a `LitNull` arm.
         Value::Null => Ok(BExpr::LitNull),
