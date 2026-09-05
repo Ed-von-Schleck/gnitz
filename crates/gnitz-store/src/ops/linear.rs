@@ -36,42 +36,35 @@ pub fn op_negate(mut batch: Batch) -> Batch {
     batch
 }
 
-/// Union: algebraic addition of two Z-Set streams; sorted inputs take an O(N)
-/// merge. `out_schema` is the UNION's own, not either input's — the merge
-/// certifies `Sorted` under it, so a narrower comparator would leave a false
-/// order claim for `into_consolidated` to trust.
+/// Union: algebraic addition of two Z-Set streams. Two consolidated inputs take an
+/// O(N) merge that sums equal elements' weights, so the output is consolidated and
+/// may hold *fewer* rows than the two inputs together. Anything else concatenates
+/// and stays `Raw`: the outer- and band-join lowering chains `op_union` over `Raw`
+/// operands, and sorting each link would pay for a fold the consumer runs once.
+///
+/// `out_schema` is the UNION's own, not either input's — it is the comparator the
+/// merge folds and certifies under.
 pub fn op_union(batch_a: Batch, batch_b: &Batch, out_schema: &SchemaDescriptor) -> Batch {
     if batch_b.count == 0 {
-        // O(1) pass-through: no allocation, sorted/consolidated preserved.
+        // O(1) pass-through: no allocation, the layout claim preserved.
         gnitz_debug!("op_union: a={} b=0 identity", batch_a.count);
         return batch_a;
     }
     if batch_a.count == 0 {
         return batch_b.clone_batch();
     }
+    let (n_a, n_b) = (batch_a.count, batch_b.count);
 
-    if batch_a.sorted_verified(out_schema) && batch_b.sorted_verified(out_schema) {
-        let mut output = batch_a.merged_sorted(batch_b, out_schema);
-        // A payload-aware merge of two sorted inputs is genuinely
-        // (PK, payload)-sorted, but unfolded (Z-Set `+` does not sum weights).
-        output.certify_layout(Layout::Sorted, out_schema);
-        gnitz_debug!(
-            "op_union: a={} b={} out={} sorted_merge",
-            batch_a.count,
-            batch_b.count,
-            output.count
-        );
+    if batch_a.consolidated_verified(out_schema) && batch_b.consolidated_verified(out_schema) {
+        let mut output = batch_a.merged_consolidated(batch_b, out_schema);
+        output.certify_layout(Layout::Consolidated, out_schema);
+        gnitz_debug!("op_union: a={n_a} b={n_b} out={} sorted_merge", output.count);
         return output;
     }
 
-    // Unsorted: concatenate (the appends leave `output` `Raw`).
+    // Not both consolidated: concatenate (the appends leave `output` `Raw`).
     let output = batch_a.concatenated(batch_b, out_schema);
-    gnitz_debug!(
-        "op_union: a={} b={} out={} concat",
-        batch_a.count,
-        batch_b.count,
-        output.count
-    );
+    gnitz_debug!("op_union: a={n_a} b={n_b} out={} concat", output.count);
     output
 }
 

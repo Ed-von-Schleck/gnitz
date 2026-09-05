@@ -21,9 +21,9 @@
 //! sort key: OPK byte order *is* the order at every PK width, so the comparator
 //! (`compare_pk_ordering`) reads each player's bytes straight from its source.
 //!
-//! No `pos_map`. No caller advances a non-root entry: ReadCursor folds
-//! tied rows by repeatedly popping/replacing the root; the flush merge
-//! and compaction peel the root one at a time.
+//! No `pos_map`. No caller advances a non-root entry: the (PK, payload) merge
+//! driver (`merge::drive`) folds tied rows by repeatedly stepping the root, and
+//! the spill merge peels the root one at a time.
 
 #[derive(Clone, Copy)]
 pub(crate) struct HeapNode {
@@ -234,84 +234,6 @@ impl LoserTree {
         // is 0 and walk_up is a no-op returning the sentinel; tree[0]
         // becomes sentinel and is_empty returns true.
         self.tree[0] = self.walk_up(cur, idx, less);
-    }
-}
-
-/// Drive an N-way merge to completion.
-///
-/// `less` — compare two `HeapNode`s; reads each player's OPK bytes (and payload)
-///   from the caller's sources via `(source_idx, row)`, NEVER reads live cursor
-///   state directly. This is what frees `advance` below to hold the only
-///   `&mut cursors` borrow.
-/// `advance(src) -> Option<row>` — advance source `src`; returns the cursor's new
-///   `row` (a `u32` index) or `None` when exhausted.
-/// `same_pk(a_src, a_row, b_src, b_row) -> bool` — true when both positions carry
-///   the same PK (OPK byte equality, width-agnostic). The PK term of the group
-///   boundary.
-/// `eq_payload(a_src, a_row, b_src, b_row) -> bool` — true when both positions
-///   carry the same payload. The payload term of the group boundary; never inside
-///   the heap.
-/// `weight(src, row) -> i64` — weight at `(src, row)`.
-/// `emit(group_src, group_row, net_weight) -> ControlFlow<()>` — called for each
-///   non-ghost group; `Break` returns immediately. The output PK is re-derived
-///   from `(group_src, group_row)` by the caller (no cached key to pass).
-///
-/// `#[inline(always)]`: the compact/merge `emit` closures return a
-/// constant `ControlFlow::Continue(())` and read_cursor's returns a
-/// constant `Break(())`. Forced inlining lets LLVM evaluate the branch
-/// at compile time and DCE the unused arm in each monomorphisation.
-#[inline(always)]
-pub(crate) fn drive_merge<ADV, SP, EQ, W, EM>(
-    heap: &mut LoserTree,
-    less: impl Fn(&HeapNode, &HeapNode) -> bool,
-    mut advance: ADV,
-    mut same_pk: SP,
-    mut eq_payload: EQ,
-    mut weight: W,
-    mut emit: EM,
-) where
-    ADV: FnMut(usize) -> Option<u32>,
-    SP: FnMut(usize, usize, usize, usize) -> bool,
-    EQ: FnMut(usize, usize, usize, usize) -> bool,
-    W: FnMut(usize, usize) -> i64,
-    EM: FnMut(usize, usize, i64) -> std::ops::ControlFlow<()>,
-{
-    loop {
-        if heap.is_empty() {
-            return;
-        }
-
-        let (group_src, group_row) = {
-            let top = heap.peek();
-            (top.source_idx as usize, top.row as usize)
-        };
-
-        // Open the group: account for the root's weight and step past it.
-        // No `same_pk`/`eq_payload` test on the first row — by construction it is
-        // the group exemplar, so the tests would be tautologically true and
-        // `eq_payload` walks every payload column (expensive on wide rows).
-        let mut net_weight: i64 = weight(group_src, group_row);
-        heap.step_top(advance(group_src), &less);
-
-        // Fold tied rows: each iteration peeks the new root, breaks on a PK or
-        // payload mismatch, otherwise accumulates weight and steps again. The PK
-        // term (`same_pk`) is exact at every width, so a low-16-prefix collision
-        // cannot false-merge two distinct wide PKs.
-        while !heap.is_empty() {
-            let (cur_src, cur_row) = {
-                let top = heap.peek();
-                (top.source_idx as usize, top.row as usize)
-            };
-            if !same_pk(group_src, group_row, cur_src, cur_row) || !eq_payload(group_src, group_row, cur_src, cur_row) {
-                break;
-            }
-            net_weight += weight(cur_src, cur_row);
-            heap.step_top(advance(cur_src), &less);
-        }
-
-        if net_weight != 0 && emit(group_src, group_row, net_weight).is_break() {
-            return;
-        }
     }
 }
 

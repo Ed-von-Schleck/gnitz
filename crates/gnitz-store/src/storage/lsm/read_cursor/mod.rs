@@ -10,7 +10,7 @@ use std::rc::Rc;
 use super::batch::Batch;
 use super::columnar::with_payload_cmp;
 use super::columnar::ColumnarSource;
-use super::heap::{drive_merge, HeapNode, LoserTree};
+use super::heap::{HeapNode, LoserTree};
 use super::merge::MemBatch;
 use super::merge::{self, PosCursor, RowComparator};
 #[cfg(test)]
@@ -50,8 +50,8 @@ pub struct ReadCursor {
     /// At least one source is a capacity-bounded view's skeleton shard, so the
     /// merge runs with payload coarsening on (see [`merge::merge_less`]). Derived
     /// once at open, but not constant-folded away: `merge_less` stays
-    /// out-of-line, so every relation re-tests it on each PK tie and each
-    /// `merge_eq_payload` group boundary.
+    /// out-of-line, so every relation re-tests it on each PK tie and each group
+    /// boundary.
     any_skeleton: bool,
     /// The drain's merge-order scratch. A chunked drain loop runs one cursor to
     /// exhaustion, so one buffer serves the whole scan.
@@ -639,11 +639,15 @@ impl ReadCursor {
         }
     }
 
-    /// Merge-mode advance (`self.mode.is_none()`), monomorphized on payload.
-    /// `drive_merge` folds tied rows; `emit` `Break`s on the first non-ghost group,
-    /// so ghosts are passed over rather than surfaced.
+    /// The five-field destructure both merge-mode walks need before handing the
+    /// tournament to [`merge::drive`]: `advance_merge_with` takes one group,
+    /// `output::drain_sorted_into_with` a whole chunk.
     #[inline]
-    fn advance_merge_with<RowCmp: RowComparator<Run>>(&mut self, row_cmp: RowCmp) {
+    pub(super) fn drive<RowCmp: RowComparator<Run>>(
+        &mut self,
+        row_cmp: RowCmp,
+        emit: impl FnMut(usize, usize, i64) -> std::ops::ControlFlow<()>,
+    ) {
         let ReadCursor {
             tree,
             sources,
@@ -653,25 +657,22 @@ impl ReadCursor {
             ..
         } = &mut *self;
         let coarsen = *any_skeleton;
+        merge::drive(tree, schema, sources, states, row_cmp, coarsen, emit);
+    }
+
+    /// Merge-mode advance (`self.mode.is_none()`), monomorphized on payload.
+    /// [`merge::drive`] folds tied rows; `emit` `Break`s on the first non-ghost
+    /// group, so ghosts are passed over rather than surfaced.
+    #[inline]
+    fn advance_merge_with<RowCmp: RowComparator<Run>>(&mut self, row_cmp: RowCmp) {
         // The emitted group comes back as a tuple rather than being written to
-        // `self.current_*` in place: the closures below already reborrow
-        // `&sources` + `&mut states`, so capturing `&mut self` too would conflict.
+        // `self.current_*` in place: the drive already holds `&mut self`, so the
+        // closure cannot.
         let mut emitted: Option<(usize, usize, i64)> = None;
-        drive_merge(
-            tree,
-            merge::merge_less(schema, sources, row_cmp, coarsen),
-            |src| {
-                states[src].advance();
-                states[src].is_valid().then(|| states[src].position as u32)
-            },
-            merge::merge_same_pk(sources),
-            merge::merge_eq_payload(schema, sources, row_cmp, coarsen),
-            |src, row| sources[src].get_weight(row),
-            |gs, gr, nw| {
-                emitted = Some((gs, gr, nw));
-                std::ops::ControlFlow::Break(())
-            },
-        );
+        self.drive(row_cmp, |gs, gr, nw| {
+            emitted = Some((gs, gr, nw));
+            std::ops::ControlFlow::Break(())
+        });
         self.commit_emitted(emitted);
     }
 

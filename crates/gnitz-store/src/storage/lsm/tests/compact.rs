@@ -386,7 +386,7 @@ fn test_compact_same_pk_different_payload_cancels() {
 /// The k-way heap MUST order by (PK, payload) so the two payload-100 rows
 /// reach the fold root consecutively and cancel; the payload-200 row
 /// survives. A PK-only heap `less` (dropping the payload tiebreak) leaves
-/// the three same-PK rows unordered among themselves, so `drive_merge`'s
+/// the three same-PK rows unordered among themselves, so `merge::drive`'s
 /// fold breaks on the first payload mismatch and the +1/-1 payload-100
 /// pair never sums — leaking a spurious row.
 #[test]

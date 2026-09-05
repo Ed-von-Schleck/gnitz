@@ -6,10 +6,10 @@ use crate::test_support::{
     make_schema_u64_i64, make_wide_batch, opk_pk, pk_payload_schema, wide_pk_3xu64_schema,
 };
 use gnitz_wire::{worker_for_key, worker_for_pk_bytes};
+use std::cmp::Ordering;
 
-/// Scatter pre-consolidated batches across workers using a merge-walk.
-/// All sources must satisfy the consolidated invariant (sorted, no duplicate PKs).
-/// Output batches are sorted but not consolidated (duplicate PKs can appear across sources).
+/// Scatter pre-consolidated batches across workers. Every source must satisfy
+/// the consolidated invariant; each output slice is consolidated too.
 fn scatter_by_group_key(
     sources: &[Option<&Batch>],
     col_indices: &[u32],
@@ -29,15 +29,13 @@ fn test_relay_scatter_wide_pk_order_and_routing() {
     let num_workers = 4;
     // (1,1,*) prefix-twins span the three sources: they share the leading
     // BE(1)++BE(1) 16-byte OPK prefix and differ only in the trailing column,
-    // so the unified `relay_walk_inner` comparator must fall through its cached
-    // 16-byte-prefix register compare to the `compare_pk_bytes` byte tiebreak
-    // (the twins are byte-distinct, so that fallback is decisive — never Equal).
-    // The multi-byte values are LE/BE order inversions — c2 ∈ {1,2,256,257}
-    // and c0 ∈ {2,256} — so OPK encoding is load-bearing for the builder's
-    // sorted assert (a dropped BE flip sorts 256 before 1/2 and trips it).
-    // Additionally, b1 and b2 both carry PK (3,3,3) with DISTINCT payloads
-    // (99 vs 31): a byte-EQUAL wide PK whose `compare_pk_bytes` fallback returns
-    // Equal, exercising the source-index tiebreak at wide width.
+    // so the merge comparator must order them on the full OPK bytes rather than
+    // any leading-prefix shortcut. The multi-byte values are LE/BE order
+    // inversions — c2 ∈ {1,2,256,257} and c0 ∈ {2,256} — so OPK encoding is
+    // load-bearing for the builder's sorted assert (a dropped BE flip sorts 256
+    // before 1/2 and trips it). Additionally, b1 and b2 both carry PK (3,3,3)
+    // with DISTINCT payloads (99 vs 31): a byte-EQUAL wide PK, where the payload
+    // comparator alone decides the order and keeps them two elements.
     let b0 = make_wide_batch(
         &schema,
         &[
@@ -63,8 +61,6 @@ fn test_relay_scatter_wide_pk_order_and_routing() {
             (7, 0, 0, 1, 32),
         ],
     );
-    // sources[1] = b1 (si=1), sources[2] = b2 (si=2): the tiebreak must emit
-    // b1's (3,3,3) copy before b2's.
     let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1), Some(&b2)];
     let result = scatter_by_group_key(&sources, schema.pk_indices(), &schema, num_workers);
 
@@ -88,12 +84,10 @@ fn test_relay_scatter_wide_pk_order_and_routing() {
         }
     }
 
-    // (c) Byte-equal wide-PK source-index tiebreak. b1 (si=1) and b2 (si=2)
-    // both carry PK (3,3,3): equal cached prefix AND equal full OPK bytes, so
-    // the comparator's `compare_pk_bytes` fallback returns Equal and the
-    // ascending-source-index tiebreak decides. Both copies co-locate (equal PK
-    // → equal partition) and emit adjacently in merge order, so collecting the
-    // (3,3,3) payloads across workers yields b1's 99 before b2's 31.
+    // (c) Byte-equal wide PK, distinct payloads. b1 and b2 both carry PK
+    // (3,3,3), so `compare_pk_bytes` ties and the payload comparator decides:
+    // the two stay separate elements, ordered 31 before 99. Both co-locate
+    // (equal PK → equal partition) and emit adjacently in merge order.
     let pk_333 = opk_pk(&schema, &[3, 3, 3]);
     let mut payloads_333 = Vec::new();
     for sb in &result {
@@ -105,8 +99,8 @@ fn test_relay_scatter_wide_pk_order_and_routing() {
     }
     assert_eq!(
         payloads_333,
-        vec![99, 31],
-        "byte-equal wide PK (3,3,3) must emit b1's si=1 copy (payload 99) before b2's si=2 copy (payload 31)",
+        vec![31, 99],
+        "byte-equal wide PK (3,3,3) must order its two copies by payload, not by source",
     );
 }
 
@@ -397,23 +391,22 @@ fn test_repartition_batch_string_col() {
 fn test_repartition_batch_pk_routing_propagates_flags() {
     let schema = make_schema_u64_i64(); // PK = col 0 (U64), payload = col 1 (I64)
     let b = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-    assert!(b.is_sorted() && b.is_consolidated());
+    assert!(b.is_consolidated());
 
-    // PK routing (col 0 == pk_indices()): single source ⇒ flags propagate.
+    // PK routing (col 0 == pk_indices()): single source ⇒ the claim propagates.
     let pk_routed = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[0u32]), &schema, 4);
     for sb in pk_routed.iter().filter(|s| s.count > 0) {
-        assert!(sb.is_sorted(), "PK-routed sub-batch must inherit sorted");
-        assert!(sb.is_consolidated(), "PK-routed sub-batch must inherit consolidated");
+        assert_eq!(
+            sb.layout(),
+            Layout::Consolidated,
+            "PK-routed sub-batch must inherit consolidated"
+        );
     }
 
     // Non-PK routing (col 1): hash distribution destroys PK order ⇒ no flags.
     let hash_routed = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[1u32]), &schema, 4);
     for sb in hash_routed.iter().filter(|s| s.count > 0) {
-        assert!(!sb.is_sorted(), "non-PK-routed sub-batch must not claim sorted");
-        assert!(
-            !sb.is_consolidated(),
-            "non-PK-routed sub-batch must not claim consolidated"
-        );
+        assert_eq!(sb.layout(), Layout::Raw, "non-PK-routed sub-batch must claim nothing");
     }
 }
 
@@ -425,9 +418,9 @@ fn test_repartition_batches_pk_routing_single_vs_multi_source() {
     let single: Vec<Option<&Batch>> = vec![Some(&b0)];
     let out = op_repartition_batches(&single, ScatterSpec::GroupKey(&[0u32]), &schema, 4);
     for sb in out.iter().filter(|s| s.count > 0) {
-        assert!(sb.is_sorted(), "single-source PK-routed must inherit sorted");
-        assert!(
-            sb.is_consolidated(),
+        assert_eq!(
+            sb.layout(),
+            Layout::Consolidated,
             "single-source PK-routed must inherit consolidated"
         );
     }
@@ -438,26 +431,7 @@ fn test_repartition_batches_pk_routing_single_vs_multi_source() {
     let multi: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
     let out = op_repartition_batches(&multi, ScatterSpec::GroupKey(&[0u32]), &schema, 4);
     for sb in out.iter().filter(|s| s.count > 0) {
-        assert!(!sb.is_sorted(), "multi-source scatter must not claim sorted");
-        assert!(
-            !sb.is_consolidated(),
-            "multi-source scatter must not claim consolidated"
-        );
-    }
-}
-
-#[test]
-fn test_repartition_batch_sorted_not_consolidated_pk_routing() {
-    let schema = make_schema_u64_i64();
-    let mut b = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-    // Sorted but not consolidated source: only `sorted` may propagate.
-    b.set_layout_unchecked(Layout::Sorted);
-    assert!(b.is_sorted() && !b.is_consolidated());
-
-    let out = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[0u32]), &schema, 4);
-    for sb in out.iter().filter(|s| s.count > 0) {
-        assert!(sb.is_sorted(), "PK-routed sub-batch inherits sorted");
-        assert!(!sb.is_consolidated(), "must not invent consolidated");
+        assert_eq!(sb.layout(), Layout::Raw, "multi-source scatter must claim nothing");
     }
 }
 
@@ -472,35 +446,58 @@ fn test_relay_scatter_consolidated_path() {
     let result = scatter_by_group_key(&sources, &[0u32], &schema, num_workers);
 
     assert_eq!(total_rows(&result), 6);
-    for sb in &result {
-        if sb.count > 0 {
-            // Multiple sources merge by PK only (not (PK, payload)), so the
-            // output claims neither Consolidated nor Sorted — the consumer
-            // re-folds. The rows are still PK-ordered, though: verify that.
-            assert!(
-                !sb.is_consolidated(),
-                "merged path uses PK-only comparison, must not claim consolidated"
+    for sb in result.iter().filter(|s| s.count > 0) {
+        // The N-way merge folds across sources, so each slice is consolidated —
+        // independently of the tag, its rows must be strictly PK-ascending here
+        // (these PKs are distinct).
+        assert!(sb.is_consolidated(), "multi-source merge output must be consolidated");
+        for r in 1..sb.count {
+            assert_eq!(
+                compare_pk_bytes(sb.get_pk_bytes(r - 1), sb.get_pk_bytes(r)),
+                Ordering::Less,
+                "merged path output not PK-ordered at row {r}",
             );
-            assert!(!sb.is_sorted(), "multi-source merged path is left Raw");
-            for r in 1..sb.count {
-                assert_ne!(
-                    compare_pk_bytes(sb.get_pk_bytes(r - 1), sb.get_pk_bytes(r)),
-                    Ordering::Greater,
-                    "merged path output not PK-ordered at row {r}",
-                );
-            }
         }
     }
 
-    // Single contributing source: no cross-source duplicate PK possible, so
-    // the output is consolidated as well as sorted.
+    // Single contributing source: the linear route, which folds nothing because
+    // its one source already is.
     let single: Vec<Option<&Batch>> = vec![Some(&b0)];
     let result = scatter_by_group_key(&single, &[0u32], &schema, num_workers);
     assert_eq!(total_rows(&result), 3);
     for sb in result.iter().filter(|s| s.count > 0) {
-        assert!(sb.is_sorted(), "single-source merge output must be sorted");
-        assert!(sb.is_consolidated(), "single-source merge output must be consolidated");
+        assert!(sb.is_consolidated(), "single-source route output must be consolidated");
     }
+}
+
+/// The multi-source relay is Z-Set `+` across its sources, not a PK-ordered
+/// concatenation: one source's retraction of another's row must cancel inside
+/// the relay, and a repeated (PK, payload) must come out at the summed weight.
+/// Both are what the `Consolidated` claim on each slice asserts.
+#[test]
+fn test_relay_scatter_folds_across_sources() {
+    let schema = make_schema_u64_i64();
+    let num_workers = 4;
+    // pk=1 cancels outright; pk=2 sums to 3; pk=3 carries two payloads at one
+    // key, which stay two elements; pk=4 is single-sided.
+    let b0 = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
+    let b1 = make_batch(&schema, &[(1, -1, 10), (2, 2, 20), (3, 1, 31), (4, 1, 40)]);
+
+    let result = scatter_by_group_key(&[Some(&b0), Some(&b1)], &[0u32], &schema, num_workers);
+
+    let mut got: Vec<(u64, i64, i64)> = Vec::new();
+    for sb in result.iter().filter(|s| s.count > 0) {
+        assert!(sb.is_consolidated(), "each slice must be consolidated");
+        for r in 0..sb.count {
+            got.push((
+                sb.get_pk(r) as u64,
+                gnitz_wire::read_i64_le(sb.col_data(0), r * 8),
+                sb.get_weight(r),
+            ));
+        }
+    }
+    got.sort();
+    assert_eq!(got, vec![(2, 20, 3), (3, 30, 1), (3, 31, 1), (4, 40, 1)]);
 }
 
 #[test]
@@ -516,10 +513,7 @@ fn test_relay_scatter_fallback_path() {
     assert_eq!(total_rows(&result), 2);
     for sb in &result {
         if sb.count > 0 {
-            assert!(
-                !sb.is_consolidated(),
-                "non-consolidated path output must not be consolidated"
-            );
+            assert_eq!(sb.layout(), Layout::Raw, "non-consolidated path output claims nothing");
         }
     }
 }
@@ -574,18 +568,17 @@ fn test_repartition_routing_contract() {
 fn test_repartition_merged_duplicate_rows() {
     let schema = make_schema_u64_i64();
     let num_workers = 4;
-    // Two sources with identical (PK=1, val=10) rows — merged output must NOT
-    // claim consolidated because it uses PK-only comparison.
+    // The same (PK=1, val=10) element in two sources is ONE Z-Set element at
+    // weight 2, not two rows: the relay's merge folds it.
     let b0 = make_batch(&schema, &[(1, 1, 10)]);
     let b1 = make_batch(&schema, &[(1, 1, 10)]);
     let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
     let result = scatter_by_group_key(&sources, &[0u32], &schema, num_workers);
 
-    assert_eq!(total_rows(&result), 2, "both rows must appear in output");
-    for sb in &result {
-        if sb.count > 0 {
-            assert!(!sb.is_consolidated(), "merged path must not claim consolidated");
-        }
+    assert_eq!(total_rows(&result), 1, "the shared element folds to one row");
+    for sb in result.iter().filter(|s| s.count > 0) {
+        assert!(sb.is_consolidated(), "the folded slice is consolidated");
+        assert_eq!(sb.get_weight(0), 2, "weights sum across sources");
     }
 }
 
@@ -920,4 +913,69 @@ fn scatter_route_bench() {
         "scatter_route_bench: {:.1} Mrows/s ({N} rows × {ITERS} iters in {secs:.3}s, checksum {acc})",
         (N * ITERS) as f64 / secs / 1e6,
     );
+}
+
+/// Release-only microbench for the consolidated relay's two routes: the linear
+/// sweep at one contributing source, and the shared N-way merge above it. K is
+/// the contributing *worker* count, so K=1 (a replicated source, or a
+/// single-worker run) and K=4 are the reachable range; K=16 is the headroom
+/// point. Each source is a disjoint stripe of one ascending key space — the
+/// shape a `CREATE VIEW` backfill's per-worker chunks and a set-op-fed
+/// input-delta scatter both produce — so the merge genuinely interleaves them.
+///
+/// `cd crates && cargo test -p gnitz-store --release relay_scatter_merge_bench -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore]
+fn relay_scatter_merge_bench() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let schema = make_schema_u64_i64();
+    const N: usize = 1_000_000;
+    const ITERS: usize = 20;
+    const WORKERS: usize = 4;
+
+    for k in [1usize, 4, 16] {
+        let per = N / k;
+        let batches: Vec<Batch> = (0..k)
+            .map(|j| {
+                let rows: Vec<(u64, i64, i64)> = (0..per).map(|i| ((i * k + j) as u64, 1, i as i64)).collect();
+                make_batch(&schema, &rows)
+            })
+            .collect();
+        let sources: Vec<Option<&Batch>> = batches.iter().map(Some).collect();
+
+        // Warm up, and pin the invariant the timing would otherwise hide: the
+        // stripes are PK-disjoint, so nothing folds and no row is dropped.
+        let warm = op_relay_scatter_consolidated(&sources, ScatterSpec::GroupKey(&[0u32]), &schema, WORKERS);
+        assert_eq!(total_rows(&warm), per * k, "K={k}: scatter dropped rows");
+
+        // Two timings: the scatter alone, and the scatter plus the
+        // `into_consolidated` the receiving side runs on each slice
+        // (`dag::exec::run_side`). The second is the one the layout contract
+        // moves — a certified slice returns by move where a `Raw` one pays a
+        // full argsort into a fresh arena.
+        for (label, consolidate) in [("scatter", false), ("scatter+consolidate", true)] {
+            let t = Instant::now();
+            let mut acc = 0usize;
+            for _ in 0..ITERS {
+                let out = op_relay_scatter_consolidated(&sources, ScatterSpec::GroupKey(&[0u32]), &schema, WORKERS);
+                acc += if consolidate {
+                    black_box(
+                        out.into_iter()
+                            .map(|b| b.into_consolidated(&schema).count)
+                            .sum::<usize>(),
+                    )
+                } else {
+                    black_box(total_rows(&out))
+                };
+            }
+            let secs = t.elapsed().as_secs_f64();
+            println!(
+                "relay_scatter_merge/K{k}/{label}: {:.1} Mrows/s ({} rows × {ITERS} iters in {secs:.3}s, checksum {acc})",
+                (per * k * ITERS) as f64 / secs / 1e6,
+                per * k,
+            );
+        }
+    }
 }

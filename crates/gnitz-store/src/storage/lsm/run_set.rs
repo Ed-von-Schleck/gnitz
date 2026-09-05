@@ -243,7 +243,7 @@ fn consolidate_batches(batches: &[MemBatch], schema: &SchemaDescriptor) -> Batch
     if survivors.is_empty() {
         return Batch::empty_with_schema(schema);
     }
-    let mut cols = Vec::new();
+    let mut cols = Vec::with_capacity(batches.len() * schema.num_payload_cols());
     let unified: Vec<_> = batches
         .iter()
         .map(|b| merge::mem_batch_to_unified(b, schema, &mut cols))

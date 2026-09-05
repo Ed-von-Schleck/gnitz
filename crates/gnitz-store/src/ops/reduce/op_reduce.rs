@@ -166,13 +166,13 @@ pub fn op_reduce(
     let mb = working.as_mem_batch();
 
     // The visit order, following `GroupBoundary::for_group`'s three cases.
-    // `PkPermutation`: canonical PK order *is* group order, so a `sorted_verified`
-    // input (consolidation, integrated trace, sorted union) needs no order at all
+    // `PkPermutation`: canonical PK order *is* group order, so a consolidated
+    // input (consolidation, integrated trace, merged union) needs no order at all
     // and `None` visits positions directly. One group: likewise no order.
     // Otherwise one keyed argsort.
     let ungrouped = plan.out_key != ReduceOutKey::PkPermutation && plan.group_key.cols.is_empty();
     let sorted_indices: Option<Vec<u32>> = if plan.out_key == ReduceOutKey::PkPermutation {
-        (!working.sorted_verified(input_schema)).then(|| argsort_pk_canonical(&mb))
+        (!working.consolidated_verified(input_schema)).then(|| argsort_pk_canonical(&mb))
     } else if ungrouped {
         None
     } else {

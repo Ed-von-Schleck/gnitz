@@ -172,7 +172,6 @@ fn reduce_output_folds_to_the_latest_aggregate() {
             b.extend_col(1, &av.to_le_bytes());
             b.count += 1;
         }
-        b.certify_layout(Layout::Sorted, &schema);
         Rc::new(b.into_consolidated(&schema))
     };
 

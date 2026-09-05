@@ -190,7 +190,7 @@ impl Batch {
             if length <= gnitz_wire::SHORT_STRING_THRESHOLD {
                 continue;
             }
-            let Some(span) = gnitz_wire::blob_extent(self.blob.len(), gnitz_wire::read_u64_le(cell, 8), length) else {
+            let Some(span) = gnitz_wire::german_string_heap(cell, self.blob.len()) else {
                 continue;
             };
             if seen

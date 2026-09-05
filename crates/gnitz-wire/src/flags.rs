@@ -116,10 +116,9 @@ pub fn validate_scan_multi_tids(tids: &[u64]) -> Result<(), String> {
 /// other flag.
 pub const FLAG_SCAN_FIFO_REPLY: u64 = 1 << 55;
 
-/// Engine-internal batch-layout claims stamped on SAL / W2M frames
-/// (sorted / consolidated); never sent to clients. Defined here so the
-/// disjointness guard below covers them against every wire flag.
-pub const FLAG_BATCH_SORTED: u64 = 1 << 50;
+/// Engine-internal batch-layout claim stamped on SAL / W2M frames; never sent to
+/// clients. Defined here so the disjointness guard below covers it against every
+/// wire flag.
 pub const FLAG_BATCH_CONSOLIDATED: u64 = 1 << 51;
 /// Engine-internal W2M flag set on the last (or only) scan chunk from a
 /// worker. Frames are forwarded verbatim, so the bit does reach clients; no
@@ -151,7 +150,6 @@ const _: () = {
         FLAG_SCAN_SPEC,
         FLAG_HAS_SCHEMA,
         FLAG_HAS_DATA,
-        FLAG_BATCH_SORTED,
         FLAG_BATCH_CONSOLIDATED,
         FLAG_CONTINUATION,
         FLAG_SCAN_LAST,

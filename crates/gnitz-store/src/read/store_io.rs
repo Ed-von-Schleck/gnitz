@@ -47,8 +47,8 @@ impl RelationRegistry {
     ///
     /// Walks the cursor once, copying each hydrated row verbatim and pushing each
     /// skeleton `(PK, coarse weight)` onto a key list, then hydrates that list and
-    /// merges the two. Both halves are ascending and disjoint by PK, so the merge
-    /// is exact and no sort is needed.
+    /// merges the two. Both halves are consolidated, so the union merges and folds
+    /// them in one pass rather than sorting the hydrated relation.
     ///
     /// Row-at-a-time on purpose: `drain_chunk` goes through
     /// `slice_to_owned_batch_with`, which dereferences every German-string cell
@@ -133,12 +133,10 @@ impl RelationRegistry {
         if out.count == 0 {
             return Ok(hydrated);
         }
-        // Disjoint by PK, so the merge emits a consolidated batch — which
-        // `op_union` cannot certify in general and `into_consolidated` would
-        // therefore re-fold through a second full arena.
-        let mut merged = crate::ops::op_union(out, &hydrated, &schema);
-        merged.certify_layout(crate::storage::Layout::Consolidated, &schema);
-        Ok(merged)
+        // Both operands are consolidated — `out` by the walk above, `hydrated` by
+        // `hydrate_keys` — so the union takes its folding merge and certifies the
+        // result itself; nothing here re-folds through a second arena.
+        Ok(crate::ops::op_union(out, &hydrated, &schema))
     }
 
     /// Point lookup by OPK bytes: every live row of `pk`'s group, or `None` for

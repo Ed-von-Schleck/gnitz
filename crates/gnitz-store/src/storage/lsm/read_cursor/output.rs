@@ -9,9 +9,8 @@
 use std::rc::Rc;
 
 use super::super::batch::{write_to_batch, Batch, Layout};
-use super::super::columnar::{with_payload_cmp, ColumnarSource};
-use super::super::heap::drive_merge;
-use super::super::merge::{self, prorated_blob_cap, RowComparator};
+use super::super::columnar::with_payload_cmp;
+use super::super::merge::{prorated_blob_cap, RowComparator};
 use super::super::run::Run;
 use super::super::scatter::scatter_unified_sources;
 use super::ReadCursor;
@@ -80,7 +79,7 @@ impl ReadCursor {
         let mut order = std::mem::take(&mut self.merge_order);
         self.drain_sorted_into(max_rows, rows_ahead, &mut order);
         let drained = (!order.is_empty()).then(|| {
-            let mut cols = Vec::new();
+            let mut cols = Vec::with_capacity(self.sources.len() * self.schema.num_payload_cols());
             let unified: Vec<_> = self
                 .sources
                 .iter()
@@ -171,8 +170,8 @@ impl ReadCursor {
         );
     }
 
-    /// One `drive_merge` for the whole chunk: re-entering it per emitted group
-    /// rebuilt three comparator closures each time, ~39 instructions per row.
+    /// One `merge::drive` for the whole chunk: re-entering it per emitted group
+    /// rebuilt the comparator closures each time, ~39 instructions per row.
     #[inline]
     fn drain_sorted_into_with<RowCmp: RowComparator<Run>>(
         &mut self,
@@ -183,8 +182,8 @@ impl ReadCursor {
     ) {
         out.clear();
         out.reserve(max_rows.min(rows_ahead));
-        // The committed row is an earlier drive's, not yet drained — and
-        // `drive_merge` emits only non-zero groups, so it needs no weight gate.
+        // The committed row is an earlier drive's, not yet drained — and the
+        // drive emits only non-zero groups, so it needs no weight gate.
         // `u32` because a partitioned-table cursor can exceed 256 entries.
         out.push((
             self.current_entry_idx as u32,
@@ -192,37 +191,17 @@ impl ReadCursor {
             self.current_weight,
         ));
 
-        let ReadCursor {
-            tree,
-            sources,
-            states,
-            schema,
-            any_skeleton,
-            ..
-        } = &mut *self;
-        let coarsen = *any_skeleton;
         // The group that did not fit, which the next drain resumes from.
         let mut last: Option<(usize, usize, i64)> = None;
-        drive_merge(
-            tree,
-            merge::merge_less(schema, sources, row_cmp, coarsen),
-            |src| {
-                states[src].advance();
-                states[src].is_valid().then(|| states[src].position as u32)
-            },
-            merge::merge_same_pk(sources),
-            merge::merge_eq_payload(schema, sources, row_cmp, coarsen),
-            |src, row| sources[src].get_weight(row),
-            |gs, gr, nw| {
-                if out.len() == max_rows {
-                    last = Some((gs, gr, nw));
-                    std::ops::ControlFlow::Break(())
-                } else {
-                    out.push((gs as u32, gr as u32, nw));
-                    std::ops::ControlFlow::Continue(())
-                }
-            },
-        );
+        self.drive(row_cmp, |gs, gr, nw| {
+            if out.len() == max_rows {
+                last = Some((gs, gr, nw));
+                std::ops::ControlFlow::Break(())
+            } else {
+                out.push((gs as u32, gr as u32, nw));
+                std::ops::ControlFlow::Continue(())
+            }
+        });
         self.commit_emitted(last);
     }
 }

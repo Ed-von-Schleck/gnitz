@@ -1456,10 +1456,10 @@ fn validate_client_schema(shared: &Shared, tid: i64, client: &SchemaDescriptor) 
 }
 
 /// Decode a CLIENT-supplied frame. `decode_wire_with_ctrl` is the client-trust
-/// entry: it leaves the batch `Raw`, dropping any FLAG_BATCH_SORTED /
-/// FLAG_BATCH_CONSOLIDATED claim ("already sorted/consolidated, skip the work"),
-/// which a client must never be trusted to make; downstream consolidation (the
-/// catalog DDL ingest and the commit path) establishes those invariants. Every
+/// entry: it leaves the batch `Raw`, dropping any FLAG_BATCH_CONSOLIDATED claim
+/// ("already consolidated, skip the work"), which a client must never be trusted
+/// to make; downstream consolidation (the catalog DDL ingest and the commit path)
+/// establishes those invariants. Every
 /// client-boundary decode goes through this or its sibling
 /// `decode_client_batch`.
 fn decode_client_wire(

@@ -46,13 +46,13 @@ fn batch(schema: &SchemaDescriptor, keys: &[i128; 8], rows: Rows) -> Batch {
     b
 }
 
-/// Union is Z-Set `+`: every row of both sides survives at its own weight, in
-/// (PK, payload) order, with nothing folded. The oracle is the two inputs'
-/// multiset sorted by (OPK bytes, payload) — a stable sort with `a` first, which
-/// is the tie-break the merge's `!= Greater` pick makes — so it pins the emitted
-/// order and not just the contents, at every PK stride.
+/// Union of two consolidated batches is Z-Set `+` with the fold: the two inputs'
+/// multiset grouped by (OPK bytes, payload), each group's weights summed, and
+/// net-zero groups dropped — in (PK, payload) order, at every PK stride. The
+/// oracle below is that definition, so it pins the emitted order and the folded
+/// weights, not just the contents.
 #[test]
-fn union_emits_every_row_of_both_sides_in_pk_payload_order() {
+fn union_folds_both_sides_into_one_zset_in_pk_payload_order() {
     let cases: &[(Rows, Rows)] = &[
         // disjoint keys plus one shared
         (
@@ -82,9 +82,15 @@ fn union_emits_every_row_of_both_sides_in_pk_payload_order() {
         // a shared key whose payloads order each way round
         (&[(1, 1, 10)], &[(1, 1, 20)]),
         (&[(1, 1, 20)], &[(1, 1, 10)]),
-        // equal (PK, payload) at opposite weights: they must land adjacent, so a
-        // later consolidation cancels them
+        // equal (PK, payload) at opposite weights: the element cancels outright,
+        // so the union emits nothing
         (&[(1, 1, 10)], &[(1, -1, 10)]),
+        // a shared key where one payload folds to a non-zero weight and another
+        // cancels, with a third payload on each side left alone
+        (
+            &[(2, 1, 10), (2, 3, 20), (2, 1, 30)],
+            &[(2, 2, 10), (2, -3, 20), (2, 1, 40)],
+        ),
         (&[(1, 1, 1), (2, 1, 2)], &[]),
         (&[], &[(1, 1, 1), (2, 1, 2)]),
     ];
@@ -94,11 +100,17 @@ fn union_emits_every_row_of_both_sides_in_pk_payload_order() {
         for (ai, bi) in cases {
             let out = op_union(batch(&schema, &keys, ai), &batch(&schema, &keys, bi), &schema);
 
-            let mut want: Vec<(Vec<u8>, i64, i64)> = ai
-                .iter()
-                .chain(bi.iter())
-                .map(|&(i, w, v)| (key_of(&schema, &keys, i), v, w))
-                .collect();
+            // (pk bytes, payload) is the element identity; sum the weights of
+            // each group and drop the ones that cancel.
+            let mut want: Vec<(Vec<u8>, i64, i64)> = Vec::new();
+            for &(i, w, v) in ai.iter().chain(bi.iter()) {
+                let k = key_of(&schema, &keys, i);
+                match want.iter_mut().find(|e| e.0 == k && e.1 == v) {
+                    Some(e) => e.2 += w,
+                    None => want.push((k, v, w)),
+                }
+            }
+            want.retain(|e| e.2 != 0);
             want.sort_by(|x, y| (&x.0, x.1).cmp(&(&y.0, y.1)));
             let got: Vec<(Vec<u8>, i64, i64)> = (0..out.count)
                 .map(|r| {
@@ -111,14 +123,9 @@ fn union_emits_every_row_of_both_sides_in_pk_payload_order() {
                 .collect();
 
             assert_eq!(got, want, "{tcs:?}: a={ai:?} b={bi:?}");
-            assert!(out.is_sorted());
-            // A merge of two non-empty sides is unfolded, so only the
-            // pass-through of an empty side keeps the `Consolidated` claim.
-            assert_eq!(
-                out.is_consolidated(),
-                ai.is_empty() || bi.is_empty(),
-                "{tcs:?}: a={ai:?} b={bi:?}",
-            );
+            // Consolidated in, consolidated out — the merge folds, so nothing
+            // downstream has to.
+            assert!(out.is_consolidated(), "{tcs:?}: a={ai:?} b={bi:?}");
         }
     }
 }
@@ -143,19 +150,20 @@ fn union_orders_shared_pk_string_payloads_through_the_generic_comparator() {
         &schema,
     );
 
-    assert_eq!(out.count, 2, "Z-Set + keeps both shared-PK rows");
-    assert!(out.is_sorted());
+    assert_eq!(out.count, 2, "distinct payloads at one PK stay two elements");
+    assert!(out.is_consolidated());
     assert_eq!(out.get_pk(0) as u64, 1);
     assert_eq!(out.get_pk(1) as u64, 1);
     assert_eq!(payload_string(&out, 0, 0), "apple");
     assert_eq!(payload_string(&out, 1, 0), "banana");
 }
 
-/// Neither side sorted: the merge is unavailable, so `op_union` concatenates and
-/// leaves the result `Raw` for a downstream re-sort. This is the shape `UNION
-/// ALL` over a join or reduce output takes — both emit `Raw` batches.
+/// Neither side consolidated: the merge is unavailable, so `op_union`
+/// concatenates and leaves the result `Raw` for a downstream fold. This is the
+/// shape `UNION ALL` over a join or reduce output takes — both emit `Raw`
+/// batches.
 #[test]
-fn union_concatenates_unsorted_inputs_and_leaves_them_raw() {
+fn union_concatenates_unconsolidated_inputs_and_leaves_them_raw() {
     let schema = make_schema_u64_i64();
     let a = make_batch_raw(&schema, &[(3, 1, 30), (1, 1, 10)]);
     let b = make_batch_raw(&schema, &[(2, 1, 20)]);
@@ -207,7 +215,7 @@ fn filter_keeps_exactly_the_matching_rows() {
     let got: Vec<u64> = (0..out.count).map(|r| out.get_pk(r) as u64).collect();
     let want: Vec<u64> = rows.iter().filter(|&&(_, _, v)| v > 10).map(|&(pk, ..)| pk).collect();
     assert_eq!(got, want);
-    assert!(out.is_consolidated() && out.is_sorted());
+    assert!(out.is_consolidated());
 }
 
 /// Negate is the Z-Set group inverse: every weight flips sign and nothing else
@@ -223,4 +231,71 @@ fn negate_flips_every_weight() {
         .collect();
     assert_eq!(got, vec![(-3, 10), (1, 20), (i64::MIN, 30)]);
     assert!(out.is_consolidated());
+}
+
+/// One side's `(pk, weight, payload)` row generator, indexed by row number.
+type RowGen<'a> = &'a dyn Fn(usize) -> (u64, i64, i64);
+
+/// Release-only microbench for `op_union`'s two-way merge, over the shapes its
+/// three arms see. `shared_pk_interleave` and `shared_pk_fold` put every row in
+/// an equal-PK group, which is the arm that folds; `alt1` alternates single rows
+/// (what a set operation's uniform hashed `_set_pk` produces) and `runs4096` is
+/// the `store_io` shape — long PK-disjoint runs. The last two stay entirely in
+/// the galloping arms, which the fold does not touch, so they are the controls.
+///
+/// `cd crates && cargo test -p gnitz-store --release union_merge_bench -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore]
+fn union_merge_bench() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    const N: usize = 500_000;
+    const ITERS: usize = 20;
+    const RUN: usize = 4096;
+    let schema = make_schema_u64_i64();
+
+    // Each side is built strictly (PK, payload)-ascending, so `make_batch`'s
+    // `Consolidated` certification is honest and `op_union` takes its merge.
+    let side = |f: RowGen| -> Batch { make_batch(&schema, &(0..N).map(f).collect::<Vec<_>>()) };
+
+    let cases: [(&str, RowGen, RowGen); 4] = [
+        // Every PK shared, 8 payloads a side, payloads interleaving one for one:
+        // the fold arm's per-row loop with a side switch at every step.
+        (
+            "shared_pk_interleave",
+            &|i| ((i / 8) as u64, 1, (2 * (i % 8)) as i64),
+            &|i| ((i / 8) as u64, 1, (2 * (i % 8) + 1) as i64),
+        ),
+        // Every (PK, payload) shared: every step folds and appends one row.
+        ("shared_pk_fold", &|i| ((i / 8) as u64, 1, (i % 8) as i64), &|i| {
+            ((i / 8) as u64, 1, (i % 8) as i64)
+        }),
+        // Disjoint PKs alternating one for one: the galloping arms at run 1.
+        ("alt1", &|i| (2 * i as u64, 1, i as i64), &|i| {
+            (2 * i as u64 + 1, 1, i as i64)
+        }),
+        // Disjoint PKs in guard-sized blocks: the galloping arms at run 4096.
+        (
+            "runs4096",
+            &|i| ((2 * (i / RUN) * RUN + i % RUN) as u64, 1, i as i64),
+            &|i| ((2 * (i / RUN) * RUN + RUN + i % RUN) as u64, 1, i as i64),
+        ),
+    ];
+
+    for (label, fa, fb) in cases {
+        let (a, b) = (side(fa), side(fb));
+        let t = Instant::now();
+        let mut acc = 0usize;
+        for _ in 0..ITERS {
+            acc += black_box(op_union(a.clone_batch(), &b, &schema).count);
+        }
+        let secs = t.elapsed().as_secs_f64();
+        println!(
+            "union_merge/{label}: {:.1} Mrows/s ({} in-rows × {ITERS} iters in {secs:.3}s, out {})",
+            (2 * N * ITERS) as f64 / secs / 1e6,
+            2 * N,
+            acc / ITERS,
+        );
+    }
 }

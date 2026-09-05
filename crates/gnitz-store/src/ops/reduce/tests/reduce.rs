@@ -2400,13 +2400,10 @@ fn test_reduce_group_by_pk_unsorted_input_linear_sum() {
     assert_eq!(sum0, 20, "SUM for pk=3");
     assert_eq!(sum1, 40, "SUM for pk=5 (10+30) — pre-fix produced two split rows");
     // The rows above are physically in canonical PK order (3 before 5), but
-    // op_reduce now ships its output as an honest unconsolidated delta: it never
-    // certifies the flags (a decreasing aggregate would emit a descending old/new
+    // op_reduce ships its output as an honest unconsolidated delta: it never
+    // certifies the claim (a decreasing aggregate would emit a descending old/new
     // pair at the same PK), so downstream re-sorts/folds.
-    assert!(
-        !out.is_sorted() && !out.is_consolidated(),
-        "reduce output is an unconsolidated delta"
-    );
+    assert!(!out.is_consolidated(), "reduce output is an unconsolidated delta");
 }
 
 #[test]
@@ -2436,10 +2433,11 @@ fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
     let out_schema = out_schema_for(&in_schema, &[0u32], &aggs);
     let mut to_ch = empty_trace(out_schema);
 
-    // Same data as the unsorted-sum test but pre-sorted. The
-    // sorted-`working` branch must produce identical output.
+    // Same data as the unsorted-sum test but already in (PK, payload) order. The
+    // consolidated-`working` branch, which skips the argsort, must produce
+    // identical output.
     let mut delta = make_batch_raw_pk(&in_schema, &[(3, 1, 20), (5, 1, 10), (5, 1, 30)], |pk: u64| pk as u128);
-    delta.set_layout_unchecked(Layout::Sorted);
+    delta.certify_layout(Layout::Consolidated, &in_schema);
 
     let out = op_reduce(&delta, &mut to_ch, &in_schema, &[0u32], &aggs, None, false, false);
 
@@ -4066,12 +4064,9 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
         false,
     );
 
-    // op_reduce ships an honest unconsolidated delta — it no longer certifies the
-    // flags even on the group-by-PK fast path.
-    assert!(
-        !out.is_sorted() && !out.is_consolidated(),
-        "reduce output is an unconsolidated delta"
-    );
+    // op_reduce ships an honest unconsolidated delta — it does not certify even on
+    // the group-by-PK fast path.
+    assert!(!out.is_consolidated(), "reduce output is an unconsolidated delta");
     // The argsort_pk_canonical branch still physically orders the wide compound-PK
     // output: (1,1) (cnt 2) precedes (1,2) (cnt 1). Read counts in physical row
     // order to pin that canonical ordering (the branch under test).

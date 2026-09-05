@@ -555,7 +555,7 @@ fn drain_chunks(cursor: &mut ReadCursor, n: usize) -> Vec<(u128, i64, i64)> {
     while let Some(chunk) = cursor.drain_chunk(n) {
         assert!(chunk.count <= n, "chunk overflow: {} > {}", chunk.count, n);
         assert!(chunk.count > 0, "drain_chunk returned an empty Some chunk");
-        assert!(chunk.is_sorted() && chunk.is_consolidated());
+        assert!(chunk.is_consolidated());
         for row in 0..chunk.count {
             let val = i64::from_le_bytes(chunk.get_col_ptr(row, 0, 8).try_into().unwrap());
             rows.push((chunk.get_pk(row), chunk.get_weight(row), val));

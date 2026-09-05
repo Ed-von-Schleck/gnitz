@@ -91,7 +91,7 @@ pub use lsm::read_cursor::{PkSetGather, ReadCursor};
 pub use lsm::repartition::repartition_relation;
 pub use lsm::run::StoredRow;
 pub use merge::BlobCacheGuard;
-pub(crate) use merge::{mem_batch_to_unified, prorated_blob_cap, relocate_german_string_vec, BlobCache};
+pub(crate) use merge::{mem_batch_to_unified, prorated_blob_cap, relocate_german_string_vec, run_merge, BlobCache};
 pub use spill::{KeyProducer, SpillSort};
 
 /// Convert a path string to a `CString`, mapping an interior NUL to

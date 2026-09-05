@@ -166,14 +166,14 @@ fn equi_join_products_the_trace_group_at_every_pk_shape() {
         let (held, absent) = (opk_pk(&schema, held), opk_pk(&schema, absent));
 
         let mut trace = make_batch_opk(&schema, &[(&held, 1, 100), (&held, 2, 200)]);
-        trace.certify_layout(Layout::Sorted, &schema);
+        trace.certify_layout(Layout::Consolidated, &schema);
         let mut ch = trace_cursor(trace, schema);
 
         let mut delta = make_batch_opk(
             &schema,
             &[(&held, 1, 10), (&held, 1, 20), (&held, 1, 30), (&absent, 1, 40)],
         );
-        delta.certify_layout(Layout::Sorted, &schema);
+        delta.certify_layout(Layout::Consolidated, &schema);
 
         let out = equi_join(&schema, &delta, &mut ch);
         // (left payload, right payload, weight) — trace-major: each trace row is
@@ -213,7 +213,7 @@ fn cross_join_products_every_delta_row_with_every_trace_row() {
     );
 
     let mut trace = make_batch_opk(&right, &[(&r1, 1, 100), (&r2, 2, 200), (&r3, 1, 300)]);
-    trace.certify_layout(Layout::Sorted, &right);
+    trace.certify_layout(Layout::Consolidated, &right);
     let mut ch = trace_cursor(trace, right);
     // The probe states its own start, so an exhausted cursor still yields the
     // whole product.
@@ -221,7 +221,7 @@ fn cross_join_products_every_delta_row_with_every_trace_row() {
     assert!(!ch.valid, "the fixture must start with an exhausted cursor");
 
     let mut delta = make_batch_opk(&left, &[(&l1, 3, 10), (&l2, -1, 20)]);
-    delta.certify_layout(Layout::Sorted, &left);
+    delta.certify_layout(Layout::Consolidated, &left);
 
     let out = cross_join(&left, &right, &delta, &mut ch);
     let got = out_triples(&out);
@@ -496,8 +496,8 @@ fn owned(rows: RangeRows) -> Vec<(Vec<u64>, u64, i64, i64)> {
 }
 
 /// Random `(eq.., range, weight, payload)` rows over a tiny key space, returned
-/// in `(eq.., range, payload)` order — the full (PK, payload) order the `Sorted`
-/// flag `make_range_batch` sets claims. Weights span `{-2..=2}` so a trace
+/// in `(eq.., range, payload)` order — the full (PK, payload) order the range
+/// join's walk reads them in. Weights span `{-2..=2}` so a trace
 /// carries tombstones and a delta retractions; the four-value key space forces
 /// dense eq groups, boundary equality (`d == s`) and non-matching groups, and
 /// the occasional `u64::MAX` slot reaches the maximal cuts.
@@ -569,8 +569,8 @@ fn make_range_schema(n_eq: usize, wide: bool) -> SchemaDescriptor {
 /// payloads stay equal cell-for-cell and that sort order is the full
 /// (PK, payload) order.
 ///
-/// Flagged `Sorted`, not `Consolidated`: these fixtures carry tombstones and
-/// multiset duplicates.
+/// Left `Raw`: these fixtures carry tombstones and multiset duplicates, so no
+/// layout claim holds over them.
 fn make_range_batch(schema: &SchemaDescriptor, rows: &[(Vec<u64>, u64, i64, i64)]) -> Batch {
     let wide = schema.num_payload_cols() > 1;
     let mut b = Batch::with_capacity(*schema, rows.len().max(1));
@@ -590,7 +590,6 @@ fn make_range_batch(schema: &SchemaDescriptor, rows: &[(Vec<u64>, u64, i64, i64)
         }
         b.count += 1;
     }
-    b.certify_layout(Layout::Sorted, schema);
     b
 }
 

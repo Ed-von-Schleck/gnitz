@@ -8,7 +8,7 @@
 //! cost `O(K · log gap)`, not `O(K · log N)` or a linear `O(K + N)` scan.
 //!
 //! Equal key is the whole contract — which is why neither the range join's
-//! ordered-span walk nor `Batch::merged_sorted` is a third skeleton here.
+//! ordered-span walk nor `Batch::merged_consolidated` is a third skeleton here.
 
 use std::cmp::Ordering;
 use std::ops::Range;

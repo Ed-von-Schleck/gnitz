@@ -503,7 +503,7 @@ fn map_with_pack_pk_source_promotes_payload_to_pk() {
     assert_eq!(payload(1), 100);
     assert_eq!(payload(2), 300);
     // The PK stamp destroys PK order — output must be marked accordingly.
-    assert!(!out.is_sorted(), "a stamped PK must not be marked sorted");
+    assert!(!out.is_consolidated(), "a stamped PK must drop the layout claim");
     assert!(!out.is_consolidated(), "a stamped PK must not be marked consolidated");
 }
 

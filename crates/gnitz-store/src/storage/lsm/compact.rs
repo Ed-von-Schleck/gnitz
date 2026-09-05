@@ -128,7 +128,7 @@ pub(super) fn merge_and_route(
     // contiguous survivor slice. The `UnifiedSource` views hold raw pointers into
     // each shard's mmap (no lifetime tie); `shards` outlives them and every
     // scatter, all within this call.
-    let mut cols: Vec<ColPtr> = Vec::new();
+    let mut cols: Vec<ColPtr> = Vec::with_capacity(shards.len() * schema.num_payload_cols());
     let unified: Vec<UnifiedSource> = shards.iter().map(|s| s.to_unified(schema, &mut cols)).collect();
     let nsurv = survivors.len();
     let mut out: Vec<(PkBuf, String)> = Vec::with_capacity(guards.len());

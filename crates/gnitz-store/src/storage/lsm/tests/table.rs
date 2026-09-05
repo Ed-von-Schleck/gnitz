@@ -217,7 +217,7 @@ fn test_ingest_owned_batch_unsorted() {
     // Build a reverse-sorted batch (PK order: 30, 20, 10).
     let batch = make_batch(&[(30, 1, 300), (20, 1, 200), (10, 1, 100)]);
     // make_batch produces a Raw (unsorted) batch.
-    assert!(!batch.is_sorted());
+    assert!(!batch.is_consolidated());
 
     t.ingest_owned_batch(batch).unwrap();
 

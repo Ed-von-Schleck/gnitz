@@ -28,10 +28,11 @@ fn write_to_batch_narrow_pk_odd_rowcount_round_trips() {
         }
         let src_mb = src.as_mem_batch();
 
+        let mut cols = Vec::new();
+        let unified = [crate::storage::mem_batch_to_unified(&src_mb, &schema, &mut cols)];
+        let survivors: Vec<(u32, u32, i64)> = (0..rows.len()).map(|i| (0, i as u32, src_mb.get_weight(i))).collect();
         let out = write_to_batch(&schema, rows.len(), 0, |w| {
-            for i in 0..rows.len() {
-                w.write_row(&src_mb, i, src_mb.get_weight(i));
-            }
+            crate::storage::scatter_unified_sources(&unified, &cols, &survivors, w);
         });
 
         assert_eq!(out.count, rows.len(), "tc={tc} stride={stride}: row count");
@@ -270,8 +271,7 @@ fn append_row_from_source_bytes_copies_pk_weight_and_payload() {
     assert_eq!(i64::from_le_bytes(payload.try_into().unwrap()), 0x4242);
 }
 
-// ── Consumer skip-point flag verifiers (debug_verify_sorted /
-//    debug_verify_consolidated) ─────────────────────────────────────────
+// ── Consumer skip-point claim verifier (debug_verify_consolidated) ────
 //
 // Build a single-col-U64-PK / I64-payload batch from (pk, weight, payload)
 // triples and stamp a (possibly lying) layout directly via the test-only
@@ -285,16 +285,6 @@ fn flagged_batch(rows: &[(u128, i64, i64)], layout: Layout) -> (Batch, SchemaDes
     );
     b.set_layout_unchecked(layout);
     (b, schema)
-}
-
-// The `already_sorted` fold path trusts the Sorted tag: descending PKs under
-// a Sorted stamp must trip the verifier rather than fold in the wrong order.
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic(expected = "flagged sorted")]
-fn into_consolidated_panics_on_lying_sorted() {
-    let (b, schema) = flagged_batch(&[(2, 1, 0), (1, 1, 0)], Layout::Sorted);
-    let _ = b.into_consolidated(&schema);
 }
 
 // The consolidated short-circuit trusts the Consolidated tag: an adjacent-equal
@@ -342,7 +332,7 @@ fn layout_lifecycle_default_raise_and_lower() {
 
     // Genuinely (PK, payload)-sorted, ghost-free → certify Consolidated.
     b.certify_layout(Layout::Consolidated, &schema);
-    assert!(b.is_sorted() && b.is_consolidated());
+    assert!(b.is_consolidated());
 
     // Any append downgrades all the way to Raw (the W2M-class fail-safe).
     let mut src = Batch::with_capacity(schema, 1);
@@ -355,17 +345,30 @@ fn layout_lifecycle_default_raise_and_lower() {
     assert_eq!(b.count, 0, "clear drops the rows");
 }
 
-// An empty batch reads sorted + consolidated regardless of its (Raw) tag — the
-// `count == 0` special-case inside the accessors, so the constructor flip to
-// `Raw` needs no per-reader audit.
+// An empty batch reads consolidated regardless of its (Raw) tag — the
+// `count == 0` special-case inside the accessor, so the constructor flip to
+// `Raw` needs no per-reader audit. A lone non-ghost row is structurally
+// consolidated for the same reason: no pair of rows can violate the claim.
 #[test]
-fn empty_batch_reads_sorted_and_consolidated() {
+fn empty_and_single_row_batches_read_consolidated() {
     let schema = crate::test_support::pk_payload_schema(&[type_code::U64]);
     let b = Batch::with_capacity(schema, 4);
     assert_eq!(b.count, 0);
     assert_eq!(b.layout(), Layout::Raw);
-    assert!(b.is_sorted(), "empty batch is structurally sorted");
     assert!(b.is_consolidated(), "empty batch is structurally consolidated");
+
+    let one = crate::test_support::make_batch_raw(&crate::test_support::make_schema_u64_i64(), &[(7, 1, 70)]);
+    assert_eq!(one.layout(), Layout::Raw);
+    assert!(
+        one.is_consolidated(),
+        "a lone non-ghost row is structurally consolidated"
+    );
+
+    let ghost = crate::test_support::make_batch_raw(&crate::test_support::make_schema_u64_i64(), &[(7, 0, 70)]);
+    assert!(
+        !ghost.is_consolidated(),
+        "a lone zero-weight row is a ghost, not consolidated"
+    );
 }
 
 // ── `Batch` and batch-pool behaviour (no LSM tier involved) ──────────
@@ -522,7 +525,6 @@ fn from_ranges_inherits_its_source_layout() {
         subset.is_consolidated(),
         "a disjoint ascending subset keeps order, weights and distinctness",
     );
-    assert!(subset.is_sorted());
 }
 
 /// Regression: the widen must carry the input's blob heap, or a long
@@ -588,11 +590,11 @@ fn empty_batch_drop_is_noop() {
     assert_eq!(acquire_buf().capacity(), 0, "empty batch should not pollute pool");
 }
 
-/// The wire-bit pair is a bijection over the ladder: every variant survives
-/// encode→decode, including `Sorted` alone, whose single bit no other test sets.
+/// The wire bit is a bijection over the claim: every variant survives
+/// encode→decode.
 #[test]
 fn layout_wire_flags_round_trip() {
-    for l in [Layout::Raw, Layout::Sorted, Layout::Consolidated] {
+    for l in [Layout::Raw, Layout::Consolidated] {
         assert_eq!(Layout::from_wire_flags(l.to_wire_flags()), l, "{l:?}");
     }
 }

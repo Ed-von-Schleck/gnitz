@@ -343,8 +343,8 @@ pub(crate) use gnitz_wire::control::peek_control_block;
 /// control block's by the [`peek_control_block`] that produced `control`.
 ///
 /// The batch comes back `Raw`: unlike [`decode_wire`] this never installs the
-/// frame's `FLAG_BATCH_SORTED` / `FLAG_BATCH_CONSOLIDATED` claim, which a client
-/// must not be trusted to make.
+/// frame's `FLAG_BATCH_CONSOLIDATED` claim, which a client must not be trusted
+/// to make.
 pub fn decode_wire_with_ctrl(
     data: &[u8],
     control: DecodedControl,
@@ -406,9 +406,9 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
     })
 }
 
-/// Install an engine-authored frame's layout claim: its `FLAG_BATCH_SORTED` /
-/// `FLAG_BATCH_CONSOLIDATED` bits are real, and skipping the re-sort is the
-/// point of sending them, so the batch is raised off `Raw`. `certify_layout`
+/// Install an engine-authored frame's layout claim: its `FLAG_BATCH_CONSOLIDATED`
+/// bit is real, and skipping the re-fold is the point of sending it, so the batch
+/// is raised off `Raw`. `certify_layout`
 /// debug-verifies what it installs, which is why the client path
 /// (`decode_wire_with_ctrl`) never comes through here — a lying client frame
 /// must be answered with an error, not a debug-build abort.

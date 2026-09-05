@@ -270,7 +270,7 @@ fn gather_col<const N: usize>(src: &[u8], dst: &mut [u8], indices: &[u32]) {
 ///
 /// Used by the read-cursor drain, shard compaction and the flush-path merge.
 /// Callers must pass only net-nonzero weights; both the drain walk and
-/// `drive_merge`'s group fold emit only net-nonzero groups.
+/// `merge::drive`'s group fold emit only net-nonzero groups.
 pub(crate) fn scatter_unified_sources(
     sources: &[UnifiedSource],
     cols: &[ColPtr],

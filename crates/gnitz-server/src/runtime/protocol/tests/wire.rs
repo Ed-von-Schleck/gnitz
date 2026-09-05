@@ -4,7 +4,7 @@ use crate::runtime::wire::{
 };
 use crate::test_support::{make_batch, make_batch_raw, u64_pk_schema};
 use gnitz_store::schema::{decode_schema_block, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, BatchBuilder, MAX_BATCH_REGIONS};
+use gnitz_store::storage::{Batch, BatchBuilder, Layout, MAX_BATCH_REGIONS};
 use gnitz_wire::control::{peek_control_block_ipc, CTRL_BLOCK_SIZE_NO_BLOB};
 use gnitz_wire::try_decode_german_string;
 use gnitz_wire::type_code;
@@ -87,8 +87,7 @@ fn encode_decode_roundtrip_with_data() {
     let val = u64::from_le_bytes(db.col_data(0)[0..8].try_into().unwrap());
     assert_eq!(val, 999);
     assert_eq!(db.get_weight(0), 1, "the row's weight must survive the round-trip");
-    assert!(db.is_sorted());
-    assert!(db.is_consolidated());
+    assert_eq!(db.layout(), Layout::Consolidated, "the layout claim survives the frame");
 }
 
 /// Compound-PK order (including a non-identity `pk_indices` permutation) must
@@ -391,10 +390,11 @@ fn schemaless_command_slot_is_a_bare_control_block() {
     assert_eq!(buf.len(), CTRL_BLOCK_SIZE_NO_BLOB);
 }
 
-/// The shared decoder applies the header's FLAG_BATCH_SORTED /
-/// FLAG_BATCH_CONSOLIDATED bits onto the decoded batch. Encode a frame whose
-/// data batch is flagged sorted+consolidated (the encoder mirrors the batch's
-/// own claim into the header), decode it, and confirm both arrive set.
+/// The shared decoder applies the header's `FLAG_BATCH_CONSOLIDATED` bit onto
+/// the decoded batch. Encode a frame whose data batch is flagged consolidated
+/// (the encoder mirrors the batch's own claim into the header), decode it, and
+/// confirm the claim arrives — read as the tag, since the one-row batch would
+/// answer `is_consolidated()` structurally either way.
 #[test]
 fn decode_applies_batch_flags() {
     let schema = two_col_schema(0);
@@ -411,8 +411,11 @@ fn decode_applies_batch_flags() {
 
     let decoded = decode_wire(&wire).expect("decode");
     let b = decoded.data_batch.as_ref().expect("data batch present");
-    assert!(b.is_sorted(), "decoder applies FLAG_BATCH_SORTED");
-    assert!(b.is_consolidated(), "decoder applies FLAG_BATCH_CONSOLIDATED");
+    assert_eq!(
+        b.layout(),
+        Layout::Consolidated,
+        "decoder applies FLAG_BATCH_CONSOLIDATED"
+    );
 }
 
 fn two_col_schema(col1_nullable: u8) -> SchemaDescriptor {

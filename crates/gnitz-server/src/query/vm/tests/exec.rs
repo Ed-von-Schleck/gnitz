@@ -185,8 +185,8 @@ fn a_union_with_an_empty_left_operand_returns_the_right_one() {
 /// under the OUTPUT register's schema. Only the merged schema selects the
 /// null-aware comparator, which sorts a NULL cell below -3; the left input's
 /// null-blind one reads the cell's zero bytes as the integer 0 and sorts it
-/// above. `op_union_merge` certifies whichever order it produced `Sorted`,
-/// so the next `into_consolidated` trusts it rather than re-sorting.
+/// above. `op_union` certifies the order it produced `Consolidated`, so the next
+/// `into_consolidated` trusts it rather than re-folding.
 #[test]
 fn test_union_runs_under_the_merged_output_schema() {
     let (schema_a, schema_b, merged) = union_nullability_schemas();
@@ -194,14 +194,14 @@ fn test_union_runs_under_the_merged_output_schema() {
     // Both rows on the same PK, so the merge resolves them against each
     // other: left is a negative value, right a canonical zero-filled NULL.
     let mut left = make_batch_u128(&schema_a, &[(1, 1, -3)]);
-    left.certify_layout(Layout::Sorted, &schema_a);
+    left.certify_layout(Layout::Consolidated, &schema_a);
 
     let mut rb = BatchBuilder::new(schema_b);
     rb.begin_row(1u128, 1);
     rb.put_null();
     rb.end_row();
     let mut right = rb.finish();
-    right.certify_layout(Layout::Sorted, &schema_b);
+    right.certify_layout(Layout::Consolidated, &schema_b);
 
     let mut builder = ProgramBuilder::new();
     builder.push(Instr::Union { in_a: 0, in_b: 2, out_reg: 1 });

@@ -44,7 +44,7 @@ fn scatter_into(schema: &SchemaDescriptor, n: usize, f: impl FnOnce(&mut DirectW
             "the writer must take its stride from the schema"
         );
         f(&mut w);
-        count = w.row_count();
+        count = w.count;
     }
     (0..count)
         .map(|i| {

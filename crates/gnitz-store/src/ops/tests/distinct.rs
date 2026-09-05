@@ -41,7 +41,7 @@ fn weight_clamp_emits_the_clamped_transition_at_both_presets() {
         let got: Vec<i64> = (0..out.count).map(|r| out.get_weight(r)).collect();
         let want: Vec<i64> = if want == 0 { vec![] } else { vec![want] };
         assert_eq!(got, want, "({lo},{hi}) w_old={w_old} Δ={w_delta}");
-        assert!(out.is_consolidated() && out.is_sorted());
+        assert!(out.is_consolidated());
         assert!(consolidated.is_consolidated());
     }
 

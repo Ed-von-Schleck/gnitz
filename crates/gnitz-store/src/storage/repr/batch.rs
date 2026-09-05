@@ -137,35 +137,25 @@ pub(super) unsafe fn copy_regions(
     }
 }
 
-/// Cached row-layout guarantee. Ordered ladder `Raw < Sorted < Consolidated`,
-/// where `Consolidated` implies `Sorted`, so `#[derive(Ord)]` makes
-/// `is_sorted()` a `>= Sorted` test. A mutation can only *lower* it; two paths
-/// raise it — `certify_layout`, which debug-verifies first, and `inherit_layout`,
-/// which copies an already-verified tag across a faithful copy.
-///
-/// `pub(crate)` so callers name the variants, but the `Batch.layout` field is
-/// private — only `certify_layout` / `inherit_layout` / `downgrade` (and
-/// `set_weight`'s `Sorted` ceiling) mutate it.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+/// Cached row-layout guarantee. A mutation can only clear it; two paths set it —
+/// `certify_layout`, which debug-verifies first, and `inherit_layout`, which
+/// copies an already-verified tag across a faithful copy. `pub` so callers name
+/// the variants; the `Batch.layout` field itself is private.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Layout {
     /// No order/fold guarantee.
     Raw,
-    /// Rows are (PK, payload)-sorted (non-decreasing), but may carry unfolded
-    /// duplicates or zero-weight ghosts.
-    Sorted,
     /// Strictly (PK, payload)-increasing and ghost-free (weights folded). The
     /// `into_consolidated` / merge fast paths trust this to skip a re-fold.
     Consolidated,
 }
 
 impl Layout {
-    /// This claim as wire flag bits. `Consolidated` normalizes to *both* bits,
-    /// which is what makes [`Layout::from_wire_flags`] its inverse.
+    /// This claim as wire flag bits; [`Layout::from_wire_flags`] is its inverse.
     pub fn to_wire_flags(self) -> u64 {
         match self {
             Layout::Raw => 0,
-            Layout::Sorted => gnitz_wire::FLAG_BATCH_SORTED,
-            Layout::Consolidated => gnitz_wire::FLAG_BATCH_SORTED | gnitz_wire::FLAG_BATCH_CONSOLIDATED,
+            Layout::Consolidated => gnitz_wire::FLAG_BATCH_CONSOLIDATED,
         }
     }
 
@@ -175,8 +165,6 @@ impl Layout {
     pub fn from_wire_flags(flags: u64) -> Layout {
         if flags & gnitz_wire::FLAG_BATCH_CONSOLIDATED != 0 {
             Layout::Consolidated
-        } else if flags & gnitz_wire::FLAG_BATCH_SORTED != 0 {
-            Layout::Sorted
         } else {
             Layout::Raw
         }
@@ -934,6 +922,13 @@ impl<'d> AppendSession<'d> {
         self.dst
             .append_ranges_inner(src, ranges, self.mask, self.guard.get_mut());
     }
+
+    /// Append one row of `src` at an explicit weight, under the session's own
+    /// blob dedup cache. A zero weight appends nothing.
+    pub(crate) fn push_row(&mut self, src: &MemBatch<'_>, row: usize, weight: i64) {
+        self.dst
+            .append_row_from_source_bytes(src.get_pk_bytes(row), weight, src, row, self.guard.get_mut());
+    }
 }
 
 impl Batch {
@@ -966,34 +961,13 @@ impl Batch {
         self.layout
     }
 
-    /// True if the rows are (PK, payload)-sorted. An empty batch is sorted
-    /// structurally (no pair can be out of order), independent of the cached tag —
-    /// so the constructor default of `Raw` needs no per-reader special-casing.
-    #[inline]
-    pub fn is_sorted(&self) -> bool {
-        self.count == 0 || self.layout >= Layout::Sorted
-    }
-
     /// True if the rows are consolidated (strictly (PK, payload)-increasing and
-    /// ghost-free). An empty batch is consolidated structurally.
+    /// ghost-free). No batch of under two live rows can violate that, so those
+    /// answer `true` whatever the cached tag says — which is what keeps a
+    /// single-row DML push off the arena + argsort + scatter path.
     #[inline]
     pub fn is_consolidated(&self) -> bool {
-        self.count == 0 || self.layout == Layout::Consolidated
-    }
-
-    /// `is_sorted()`, additionally asserting in debug builds that the data really
-    /// is (PK, payload)-sorted whenever the cached tag claims it. Prefer this over
-    /// `is_sorted()` at any skip-point that trusts the claim to avoid a re-sort: a
-    /// lying tag is caught here, exactly where it would otherwise cause silent
-    /// weight errors.
-    #[cfg_attr(not(debug_assertions), allow(unused_variables))]
-    #[inline]
-    pub(crate) fn sorted_verified(&self, schema: &SchemaDescriptor) -> bool {
-        #[cfg(debug_assertions)]
-        if self.layout >= Layout::Sorted {
-            self.debug_verify_sorted(schema);
-        }
-        self.is_sorted()
+        self.count == 0 || self.layout == Layout::Consolidated || (self.count == 1 && self.get_weight(0) != 0)
     }
 
     /// `is_consolidated()`, additionally asserting in debug builds that the data
@@ -1032,7 +1006,6 @@ impl Batch {
         #[cfg(debug_assertions)]
         match layout {
             Layout::Raw => {}
-            Layout::Sorted => self.debug_verify_sorted(schema),
             Layout::Consolidated => self.debug_verify_consolidated(schema),
         }
         self.layout = layout;
@@ -1063,8 +1036,8 @@ impl Batch {
     }
 
     /// Debug-only (PK, payload) order of adjacent rows `i` and `i + 1` — the total
-    /// order every merge/consolidation path sorts by. Both verifiers select
-    /// `row_cmp` once and thread it in; `with_payload_cmp!` expands at its call
+    /// order every merge/consolidation path sorts by. The verifier selects
+    /// `row_cmp` once and threads it in; `with_payload_cmp!` expands at its call
     /// site, so selecting it here would run per row.
     #[cfg(debug_assertions)]
     fn adjacent_pair_ord<RowCmp>(&self, schema: &SchemaDescriptor, i: usize, row_cmp: RowCmp) -> std::cmp::Ordering
@@ -1106,31 +1079,9 @@ impl Batch {
         );
     }
 
-    /// Debug-only: assert the data is sorted by (PK, payload) — non-decreasing,
-    /// adjacent ties permitted. The `sorted` contract, nothing more.
-    #[cfg(debug_assertions)]
-    fn debug_verify_sorted(&self, schema: &SchemaDescriptor) {
-        super::columnar::with_payload_cmp!(schema, Self::debug_verify_sorted_body, self, schema)
-    }
-
-    #[cfg(debug_assertions)]
-    fn debug_verify_sorted_body<RowCmp>(&self, schema: &SchemaDescriptor, row_cmp: RowCmp)
-    where
-        RowCmp: super::merge::RowComparator<Batch>,
-    {
-        for i in 0..self.count.saturating_sub(1) {
-            debug_assert_ne!(
-                self.adjacent_pair_ord(schema, i, row_cmp),
-                std::cmp::Ordering::Greater,
-                "batch flagged sorted, but row {i} > row {} by (PK, payload)",
-                i + 1
-            );
-        }
-    }
-
     /// Debug-only: assert the data is fully consolidated — strictly increasing by
     /// (PK, payload) (no unfolded duplicate) AND no zero-weight row (ghost
-    /// eliminated, §2). Subsumes `debug_verify_sorted`.
+    /// eliminated, §2).
     #[cfg(debug_assertions)]
     pub(crate) fn debug_verify_consolidated(&self, schema: &SchemaDescriptor) {
         super::columnar::with_payload_cmp!(schema, Self::debug_verify_consolidated_body, self, schema)
@@ -1330,10 +1281,9 @@ impl Batch {
         let mut output = self.shell_for(in_schema, out_schema);
         output.pk_data_mut().copy_from_slice(self.pk_data());
 
-        // A NULL cell is zero — the invariant `DirectWriter::write_row` and
-        // `BatchBuilder::put_null` uphold actively. Zeroing just the appended
-        // columns keeps every counted row fully written without provisioning the
-        // whole arena zeroed (see `Batch::with_capacity`).
+        // Zeroing just the appended columns keeps every counted row fully written
+        // without provisioning the whole arena zeroed (`Batch::with_capacity`).
+        // Nothing reads the value: every reader decides on the null bit.
         for pi in in_npc..out_npc {
             output.col_data_mut(pi).fill(0);
         }
@@ -1721,20 +1671,22 @@ impl Batch {
         (!batch.consolidated_verified(schema)).then(|| Self::consolidate_into_new(batch, schema))
     }
 
-    /// Sort (if needed) and weight-fold `batch` into a fresh certified batch —
-    /// the consolidation slow path both entry points above share, so the two can
-    /// never diverge on how the output arena is provisioned or which merge kernel
-    /// runs.
+    /// Sort and weight-fold `batch` into a fresh certified batch — the
+    /// consolidation slow path both entry points above share.
+    ///
+    /// The fold runs first so the arena is sized to the survivor count, not the
+    /// input row count: that is poison fill skipped in debug, and in release a
+    /// heavily-cancelling fold that stays under `POOL_BYPASS_BYTES` and is
+    /// recycled. Blob capacity is reserved, not zeroed, so the whole source heap
+    /// is a free bound.
     fn consolidate_into_new(batch: &Batch, schema: &SchemaDescriptor) -> Batch {
-        let already_sorted = batch.sorted_verified(schema);
         let mb = batch.as_mem_batch();
-        let blob_cap = mb.blob.len();
-        let mut result = write_to_batch(schema, batch.count, blob_cap, |writer| {
-            if already_sorted {
-                merge::fold_sorted(&mb, schema, writer);
-            } else {
-                merge::sort_and_consolidate(&mb, schema, writer);
-            }
+        let mut survivors: Vec<(u32, u32, i64)> = Vec::with_capacity(batch.count);
+        merge::consolidate_groups(&mb, schema, &mut survivors);
+        let mut cols = Vec::with_capacity(schema.num_payload_cols());
+        let unified = [merge::mem_batch_to_unified(&mb, schema, &mut cols)];
+        let mut result = write_to_batch(schema, survivors.len(), mb.blob.len(), |writer| {
+            super::scatter::scatter_unified_sources(&unified, &cols, &survivors, writer);
         });
         result.certify_layout(Layout::Consolidated, schema);
         result
@@ -1812,7 +1764,7 @@ pub(crate) fn write_to_batch(
         // batch will read back through.
         let mut writer = merge::DirectWriter::over_arena(&mut b.data, &b.schema, b.capacity, &mut b.blob);
         write_fn(&mut writer);
-        writer.row_count()
+        writer.count
     };
     b.count = rows;
     // Nothing was written: return the buffer rather than park it in a batch whose
