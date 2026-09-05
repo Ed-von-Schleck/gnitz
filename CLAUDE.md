@@ -711,7 +711,10 @@ Workflow: `make bench` → change → commit → `make bench` → compare `summa
 
 `make bench` is end-to-end (full server + IPC), so it can't isolate a tight
 in-process loop. For that, the engine carries `#[ignore]`d timing tests that
-print throughput and must be run in `--release`:
+print throughput and must be run in `--release`.
+
+`make bench-rust` runs the set, `make bench-rust T=<name>` one of them. It builds
+the whole workspace in release, so iterate on a single crate with cargo directly:
 
 ```bash
 cd crates && cargo test -p gnitz-store --release <name>_bench \

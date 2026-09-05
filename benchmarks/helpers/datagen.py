@@ -147,7 +147,7 @@ class DataGen:
                     lo, hi = col_ranges[c]
                     vals.append(str(self._rng.randint(lo, hi)))
                 else:
-                    vals.append(str(self._rng.randint(0, 1_000_000)))
+                    vals.append(str(self._rng.randint(0, PAYLOAD_MAX)))
             rows.append(f"({', '.join(vals)})")
         col_list = ", ".join(cols)
         return f"INSERT INTO {table} ({col_list}) VALUES {', '.join(rows)}"
@@ -172,6 +172,8 @@ class DataGen:
 # ---------------------------------------------------------------------------
 # push() value generation
 # ---------------------------------------------------------------------------
+
+PAYLOAD_MAX = 1_000_000
 
 _NARROW = {
     gnitz.TypeCode.I8: (-100, 100),
@@ -204,7 +206,7 @@ def gen_value(rng, col, i, pools=None, skew=None):
     if tc in _NARROW:
         lo, hi = _NARROW[tc]
         return rng.randint(lo, hi)
-    return rng.randint(0, 1_000_000)
+    return rng.randint(0, PAYLOAD_MAX)
 
 
 def bulk_load(
@@ -383,3 +385,26 @@ def stream_and_assert(client, sn, bench_timer, tid, schema, build, sz, read_view
     if not allow_empty:
         assert len(client.scan(vid)) > 0, f"{read_view} empty after streaming {n} rows"
     return n
+
+
+# ---------------------------------------------------------------------------
+# Secondary-index probe rows (micro/ index-seek benches)
+# ---------------------------------------------------------------------------
+
+# `val` above every generated payload, so a probe matches only its own row; one
+# row per iteration of the longest scale, so no iteration re-probes a warm one.
+PROBE_BASE = PAYLOAD_MAX + 1
+PROBE_COUNT = max(max(s["read_iters"], s["write_iters"]) for s in SCALES.values())
+
+
+def seed_index_probes(conn, schema_name: str, table_name: str, first_pk: int) -> None:
+    """Push PROBE_COUNT rows into a `(pk, val, cat)` table for `probe_val` to hit."""
+    tid, schema = conn.resolve_table(schema_name, table_name)
+    push_rows(conn, tid, schema,
+              [{"pk": first_pk + i, "val": PROBE_BASE + i, "cat": 0}
+               for i in range(PROBE_COUNT)])
+
+
+def probe_val(i: int) -> int:
+    """The `val` of probe row `i`."""
+    return PROBE_BASE + i % PROBE_COUNT

@@ -34,7 +34,7 @@ def test_view_scan(client, schema_name, bench_timer, scale_mode):
                 lambda b, k: b.append(pk=k + 1, g=k % NGROUP, v=(k * 7) % 1000), sz["base"])
     vid, _ = client.resolve_table(sn, "v")
     for _ in range(_reads(scale_mode)):
-        res = bench_timer.measure(client.scan, vid, rows_per_call=NGROUP)  # noqa: F841
+        bench_timer.measure(client.scan, vid, rows_per_call=NGROUP)
     assert len(client.scan(vid)) > 0
 
 
@@ -99,7 +99,7 @@ def test_seek_by_index(client, schema_name, bench_timer, scale_mode):
     reads = _reads(scale_mode)
     for i in range(reads):
         key = i % NGROUP
-        bench_timer.measure(client.seek_by_index, tid, [1], [key], rows_per_call=1)
+        bench_timer.measure_rows(client.seek_by_index, tid, [1], [key], rows_fn=len)
     assert len(client.seek_by_index(tid, [1], [0])) > 0
 
 

@@ -3,6 +3,7 @@
 
 import gnitz
 from helpers.datagen import bulk_load
+from helpers.timing import rows_affected
 
 
 def _setup(client, schema_name, num_rows):
@@ -36,9 +37,9 @@ def test_delete_scan(client, schema_name, bench_timer, scale):
         # Delete a narrow slice each iteration to avoid emptying the table
         lo = 900_000 + i * 1000
         hi = lo + 1000
-        bench_timer.measure(
+        bench_timer.measure_rows(
             client.execute_sql,
             f"DELETE FROM t WHERE val > {lo} AND val < {hi}",
             schema_name,
-            rows_per_call=1,
+            rows_fn=rows_affected,
         )

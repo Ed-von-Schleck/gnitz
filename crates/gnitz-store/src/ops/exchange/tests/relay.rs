@@ -876,12 +876,9 @@ fn test_single_key_promote_scatter_copartitions() {
     }
 }
 
-/// Release-only microbench pinning the single-column `JoinKey` scatter
-/// route after the `ScatterKey` collapse: the per-row cost moved from
-/// `route_key` (register sign-flip + widen) to `pack_into` (one ≤8-byte OPK
-/// store) + `worker_for_pk_bytes`. Times the whole
-/// `op_relay_scatter_consolidated_mode` over 1M rows keyed by a single I64
-/// payload column. Run before/after the router commit to confirm parity:
+/// Release-only microbench of the single-column `JoinKey` scatter route: the
+/// whole of `op_relay_scatter_consolidated_mode` over 1M rows keyed by one I64
+/// payload column.
 /// `cd crates && cargo test -p gnitz-store --release scatter_route_bench -- --ignored --nocapture --test-threads=1`
 #[test]
 #[ignore]

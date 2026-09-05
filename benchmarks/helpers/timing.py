@@ -57,6 +57,21 @@ class BenchTimer:
             self._rows += rows_per_call
         return dt
 
+    def measure_rows(self, fn, *args, rows_fn, **kwargs) -> float:
+        """Like `measure`, but take the row count from the call's return value.
+
+        Separate from `measure` so that `measure`'s timed window keeps its exact
+        shape: binding the reply moves its deallocation outside the window.
+        """
+        start = time.perf_counter()
+        out = fn(*args, **kwargs)
+        dt = time.perf_counter() - start
+        self._iterations += 1
+        if self._iterations > self._warmup:
+            self._latencies.append(dt * 1000.0)
+            self._rows += rows_fn(out)
+        return dt
+
     def add_latencies(self, latencies_ms, rows: int = 0) -> None:
         """Ingest externally-collected per-op latencies (ms) and row count.
 
@@ -84,6 +99,11 @@ class BenchTimer:
             num_clients=self.num_clients,
             extra=dict(self.extra),
         )
+
+
+def rows_affected(result) -> int:
+    """The engine's own affected-row count for a DML statement."""
+    return sum(r["count"] for r in result if r["type"] == "RowsAffected")
 
 
 def run_pool(specs, *, timeout: float = 300.0) -> list[dict]:

@@ -31,7 +31,7 @@ TARGET_CPU ?= x86-64-v3
         server release-server checked-server pyext pyext-release e2e e2e-tls e2e-release \
         e2e-checked e2e-debug release-test \
         clean distclean \
-        bench bench-full bench-features bench-txn bench-sweep bench-sweep-dwarf \
+        bench-rust bench bench-full bench-features bench-txn bench-sweep bench-sweep-dwarf \
         bench-perf bench-perf-dwarf bench-native bench-profile profiling-server profiling-server-dwarf
 
 all: test
@@ -146,13 +146,24 @@ distclean: clean ## clean + cargo target cache + post-mortem logs
 	@rm -f tmp/*.log
 
 # ---------------------------------------------------------------------------
-# Benchmarks — SQL-level performance suite (release server + release planner)
+# Benchmarks — the in-process Rust microbenchmarks and the SQL-level suite
 # ---------------------------------------------------------------------------
+
+# The in-process microbenchmarks `make bench` cannot isolate. A green run says
+# they still execute, not that the number any of them prints is meaningful.
+#
+# `--tests` excludes doctests: `--ignored` makes an ```ignore fenced example
+# compile, and those are illustrative fragments that do not.
+bench-rust: release-server ## Run every Rust microbenchmark in release (T= runs one)
+	cd crates && GNITZ_SERVER_BIN=$(abspath gnitz-server-release) \
+		cargo test --release --workspace --exclude gnitz-py --tests $(T) \
+		-- --ignored --nocapture --test-threads=1
 
 bench: release-server pyext-release ## Run the SQL benchmark suite
 	cd crates/gnitz-py && uv run python ../../benchmarks/run.py \
 		$(if $(FULL),--full) \
 		--workers=$(WORKERS) --clients=$(CLIENTS) \
+		$(if $(K),-k '$(K)') \
 		$(if $(PERF),--perf --perf-stat) \
 		$(if $(PERF_DWARF),--perf-dwarf)
 

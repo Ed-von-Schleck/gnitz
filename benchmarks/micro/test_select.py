@@ -1,7 +1,7 @@
 """SELECT throughput benchmarks: full scan, PK seek, index seek, LIMIT."""
 
 
-from helpers.datagen import bulk_load
+from helpers.datagen import PROBE_BASE, bulk_load, probe_val, seed_index_probes
 import gnitz
 
 
@@ -43,10 +43,14 @@ def test_pk_seek(client, schema_name, bench_timer, scale):
 def test_index_seek(client, schema_name, bench_timer, scale):
     _setup_table(client, schema_name, scale["rows"])
     client.execute_sql("CREATE INDEX ON t(val)", schema_name=schema_name)
+    seed_index_probes(client, schema_name, "t", scale["rows"] + 1)
+    res = client.execute_sql(
+        f"SELECT * FROM t WHERE val = {PROBE_BASE}", schema_name)
+    assert len(list(res[0]["rows"])) == 1, "index probe matched no row"
     for i in range(scale["read_iters"]):
         bench_timer.measure(
             client.execute_sql,
-            f"SELECT * FROM t WHERE val = {i * 100}", schema_name,
+            f"SELECT * FROM t WHERE val = {probe_val(i)}", schema_name,
             rows_per_call=1,
         )
 

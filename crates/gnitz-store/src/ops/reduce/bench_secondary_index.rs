@@ -2,7 +2,7 @@
 //! default; run with:
 //!
 //! ```text
-//! cargo test -p gnitz-store --release secondary_index_bench -- --ignored --nocapture --test-threads=1
+//! cargo test -p gnitz-store --release secondary_index -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! Lives inside `reduce` so the decomposition calls the production `avi_batch`
@@ -96,7 +96,7 @@ fn report(index: &str, population: Duration, sort: Duration, full: Duration) {
 
 #[test]
 #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
-fn secondary_index_bench_avi_decomposition() {
+fn secondary_index_avi_decomposition_bench() {
     let schema = src_schema();
     let bake = min_bake(&schema);
     let avi_schema = bake.schema;
@@ -170,7 +170,7 @@ fn bench_single_pk_sort(label: &str, pk_schema: SchemaDescriptor, pk_bytes_for: 
 /// accidental routing of the fast path through the OPK encoder.
 #[test]
 #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
-fn secondary_index_bench_single_u64_pk_sort() {
+fn secondary_index_single_u64_pk_sort_bench() {
     let schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
@@ -252,12 +252,11 @@ fn index_write_span_bench() {
     }
 }
 
-/// Single-I64 PK: the signed single-column case. Confirms the order-preserving
-/// key is a net win (or at least not a regression) versus the old
-/// per-comparison signed cast.
+/// Single-I64 PK: the signed arm, where the sign flip makes the OPK encode
+/// non-verbatim.
 #[test]
 #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
-fn secondary_index_bench_single_i64_pk_sort() {
+fn secondary_index_single_i64_pk_sort_bench() {
     let schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::I64, 0),

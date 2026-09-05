@@ -115,8 +115,8 @@ fn bench_dir(tmp: &tempfile::TempDir, name: String) -> std::path::PathBuf {
 
 /// Open a fresh compaction-stats window and return the RNG the scatter ticks
 /// draw from. The seed lives here so every arm of every sweep replays the same
-/// arrival order — `filter_share_of_compaction`'s two arms must report identical
-/// compacted bytes or their cycle delta means nothing.
+/// arrival order — `filter_share_of_compaction_bench`'s two arms must report
+/// identical compacted bytes or their cycle delta means nothing.
 fn start_compaction_sweep() -> crate::test_rng::Rng {
     crate::storage::lsm::shard_index::cstats::reset();
     crate::test_rng::Rng::new(0x5EED_1234)
@@ -321,14 +321,14 @@ fn compaction_amplification_bench() {
 /// for t in 4000 16000; do
 ///   for f in 0 1; do
 ///     GNITZ_BENCH_DIR=$(realpath tmp)/bfs GNITZ_NO_PK_FILTER=$f GNITZ_BENCH_TICKS=$t \
-///       perf stat -e cycles,instructions -x, $BIN filter_share_of_compaction \
+///       perf stat -e cycles,instructions -x, $BIN filter_share_of_compaction_bench \
 ///       --ignored --nocapture --test-threads=1
 ///   done
 /// done
 /// ```
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
-fn filter_share_of_compaction() {
+fn filter_share_of_compaction_bench() {
     const ROWS_PER_TICK: usize = 4096;
 
     use crate::foundation::env::{env_flag, env_num};

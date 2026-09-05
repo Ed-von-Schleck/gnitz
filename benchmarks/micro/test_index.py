@@ -1,6 +1,8 @@
 """Index benchmarks: CREATE INDEX cost, indexed vs non-indexed INSERT."""
 
 
+import time
+
 import gnitz
 from helpers.datagen import DataGen, bulk_load
 
@@ -18,10 +20,11 @@ def test_create_index_on_populated(client, schema_name, bench_timer, scale):
         gnitz.ColumnDef("cat", gnitz.TypeCode.I64),
     ]
     bulk_load(client, schema_name, "t", cols, scale["rows"])
-    bench_timer.measure(
-        client.execute_sql, "CREATE INDEX ON t(val)", schema_name,
-        rows_per_call=scale["rows"],
-    )
+    # One sample — `measure`'s warmup gate would discard it.
+    start = time.perf_counter()
+    client.execute_sql("CREATE INDEX ON t(val)", schema_name=schema_name)
+    bench_timer.add_latencies([(time.perf_counter() - start) * 1000.0],
+                              rows=scale["rows"])
 
 
 def test_insert_with_index(client, schema_name, bench_timer, scale):

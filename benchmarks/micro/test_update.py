@@ -2,7 +2,8 @@
 
 
 import gnitz
-from helpers.datagen import DataGen, bulk_load
+from helpers.datagen import PROBE_BASE, DataGen, bulk_load, probe_val, seed_index_probes
+from helpers.timing import rows_affected
 
 
 def _setup(client, schema_name, num_rows, with_index=False):
@@ -36,10 +37,14 @@ def test_update_pk_seek(client, schema_name, bench_timer, scale):
 
 def test_update_index_seek(client, schema_name, bench_timer, scale):
     _setup(client, schema_name, scale["rows"], with_index=True)
+    seed_index_probes(client, schema_name, "t", scale["rows"] + 1)
+    res = client.execute_sql(
+        f"UPDATE t SET cat = -1 WHERE val = {PROBE_BASE}", schema_name)
+    assert rows_affected(res) == 1, "index probe matched no row"
     for i in range(scale["write_iters"]):
         bench_timer.measure(
             client.execute_sql,
-            f"UPDATE t SET cat = {i} WHERE val = {i * 100}",
+            f"UPDATE t SET cat = {i} WHERE val = {probe_val(i)}",
             schema_name,
             rows_per_call=1,
         )
@@ -48,9 +53,9 @@ def test_update_index_seek(client, schema_name, bench_timer, scale):
 def test_update_full_scan(client, schema_name, bench_timer, scale):
     _setup(client, schema_name, scale["rows"])
     for i in range(scale["write_iters"]):
-        bench_timer.measure(
+        bench_timer.measure_rows(
             client.execute_sql,
             f"UPDATE t SET val = val + 1 WHERE val > {900_000 + i}",
             schema_name,
-            rows_per_call=1,
+            rows_fn=rows_affected,
         )
