@@ -9,6 +9,8 @@ Distinct from `test_transactions.py`, which exercises the lower-level
 `with client.transaction()` binding on the same core buffer.
 """
 
+import re
+
 import pytest
 import gnitz
 from _uid import uid as _uid
@@ -130,9 +132,17 @@ def test_commit_or_rollback_without_transaction_errors(client):
 def test_rejected_transaction_clauses(client):
     sn = _schema(client)
     try:
-        for bad in ["BEGIN READ ONLY", "COMMIT AND CHAIN", "ROLLBACK AND CHAIN",
-                    "ROLLBACK TO SAVEPOINT sp"]:
-            with pytest.raises(gnitz.GnitzError):
+        # Each clause names itself in the rejection: the guards live in the
+        # statement's own dispatch arm, which has no other pure entry point.
+        for bad, clause in [
+            ("BEGIN READ ONLY", "transaction modes"),
+            ("START TRANSACTION ISOLATION LEVEL SERIALIZABLE", "transaction modes"),
+            ("BEGIN DEFERRED", "BEGIN modifier"),
+            ("COMMIT AND CHAIN", "AND CHAIN"),
+            ("ROLLBACK AND CHAIN", "AND CHAIN"),
+            ("ROLLBACK TO SAVEPOINT sp", "TO SAVEPOINT"),
+        ]:
+            with pytest.raises(gnitz.GnitzError, match=re.escape(clause)):
                 client.execute_sql(bad, schema_name=sn)
         # A rejected BEGIN opened no transaction, and the rejected COMMIT/ROLLBACK
         # closed none: a COMMIT now finds no transaction open.

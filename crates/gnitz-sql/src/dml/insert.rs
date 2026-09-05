@@ -19,6 +19,7 @@ use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
 use crate::exec::batch::{project, resolve_projection, RowGather};
 use crate::ir::BoundExpr;
+use crate::validate::reject_unhonored_insert_clauses;
 use crate::SqlResult;
 use gnitz_core::null_word_set;
 use gnitz_core::{FixedInt, GnitzClient, PkTuple, RelClass, Schema, ViewBuffers, WireConflictMode, ZSetBatch};
@@ -107,6 +108,7 @@ pub(crate) fn execute_insert(
     insert: &Insert,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
+    reject_unhonored_insert_clauses(insert)?;
     // Extract table name, row source, ON CONFLICT action, and RETURNING clause.
     let (table_name_str, rows, columns, on_insert, returning) = extract_insert_parts(insert)?;
 
@@ -544,7 +546,7 @@ fn validate_insert_column_list(columns: &[ObjectName], schema: &Schema) -> Resul
         .map(|c| {
             object_name_ident(c)
                 .map(|i| i.value.as_str())
-                .ok_or_else(|| GnitzSqlError::Bind("INSERT column list: column must be a simple identifier".into()))
+                .ok_or_else(|| GnitzSqlError::Plan("INSERT column list: column must be a simple identifier".into()))
         })
         .collect::<Result<_, _>>()?;
     // Expected list = every visible (non-hidden), non-SERIAL column, in schema

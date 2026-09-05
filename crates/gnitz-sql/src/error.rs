@@ -4,9 +4,15 @@ use std::fmt;
 #[derive(Debug)]
 pub enum GnitzSqlError {
     Parse(sqlparser::parser::ParserError),
+    /// The statement disagrees with a **catalog relation**: a name that does not
+    /// resolve, a value count against the schema, a nullability.
     Bind(String),
+    /// Two parts of the **statement** disagree, or a literal is out of range —
+    /// no catalog decides it. A set-op column-count mismatch is `Plan`; an arity
+    /// against a table's schema is `Bind`.
     Plan(String),
     Exec(gnitz_core::ClientError),
+    /// Well-formed and schema-consistent; gnitz does not implement it.
     Unsupported(String),
     /// A planner invariant broke: a shape an earlier guard was supposed to have
     /// rejected reached a stage that cannot represent it. Never raisable by any
@@ -102,8 +108,9 @@ impl From<gnitz_expr::ExprValidateErr> for GnitzSqlError {
     }
 }
 
-/// The crate's one spelling of an "unhonored clause" rejection: every surface
-/// that turns a parsed-but-unimplemented clause away renders it through this.
+/// The `"{context}: {clause} is not supported"` spelling, shared by every
+/// statement guard. `ast_util::reject_fn_qualifiers` has its own inverted
+/// template, for a qualifier on a call rather than a clause on a statement.
 pub(crate) fn unsupported_clause(context: &str, clause: &str) -> GnitzSqlError {
     GnitzSqlError::Unsupported(format!("{context}: {clause} is not supported"))
 }

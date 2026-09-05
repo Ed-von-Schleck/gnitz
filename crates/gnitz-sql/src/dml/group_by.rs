@@ -45,8 +45,10 @@ pub(crate) fn build_fold_shape(select: &Select, schema: &Arc<Schema>, alias: &st
         finalize.push(finalize_item(expr, def, &pieces.partial_schema)?);
         out_cols.push(def.clone());
     }
-    // The ad-hoc sink's own gate, under the same rule a view compile applies —
-    // so one written projection is accepted or refused identically on both paths.
+    // Over what THIS sink outputs. A view compile gates `lower_reduce`'s output,
+    // which also carries the group columns — a different column set, so the two
+    // gates legitimately disagree: `SELECT COUNT(*) AS kind FROM t GROUP BY kind`
+    // is `[kind, kind]` as a view and refused, `[kind]` here and accepted.
     let ctx = if select.distinct.is_some() {
         "SELECT DISTINCT"
     } else {

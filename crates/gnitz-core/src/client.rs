@@ -1247,8 +1247,10 @@ impl GnitzClient {
             // Structural rules only (arity, in-range, no duplicates) — unlike a
             // PK, an indexed column may be nullable. In-range against the actual
             // column list also keeps the `columns[c]` read below panic-free.
-            gnitz_wire::validate_pk_indices(spec.col_indices, columns.len())
-                .map_err(|e| ClientError::ServerError(format!("create_table: unique index '{}': {e}", spec.name)))?;
+            gnitz_wire::validate_pk_indices(spec.col_indices, columns.len()).map_err(|rule| {
+                let msg = rule.for_role(gnitz_wire::PkListRole::ColumnList);
+                ClientError::ServerError(format!("create_table: unique index '{}': {msg}", spec.name))
+            })?;
             for &c in spec.col_indices {
                 gnitz_wire::index_key_type(columns[c as usize].type_code as u8)?;
             }

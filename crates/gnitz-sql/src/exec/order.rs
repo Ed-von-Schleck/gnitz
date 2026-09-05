@@ -23,7 +23,7 @@ use crate::exec::batch::RowGather;
 use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_wire::cmp_typed_le;
-use sqlparser::ast::{Expr, OrderBy, OrderByKind};
+use sqlparser::ast::{Expr, OrderBy, OrderByExpr, OrderByKind, OrderByOptions};
 
 // ---------------------------------------------------------------------------
 // One sort key over the full pre-projection schema
@@ -196,25 +196,29 @@ fn order_target(e: &Expr) -> Result<OrderTarget, GnitzSqlError> {
 /// Parse the whole ORDER BY clause into resolved key specs, rejecting the
 /// unsupported ClickHouse/DuckDB extensions as a clean `Unsupported` error.
 fn resolve_order_by(ob: &OrderBy) -> Result<Vec<OrderKey>, GnitzSqlError> {
-    if ob.interpolate.is_some() {
+    // Exhaustive (no `..`) at each of the three levels: a dropped ORDER BY
+    // modifier is a wrong result, so a future `sqlparser` field stops the build.
+    let OrderBy { kind, interpolate } = ob;
+    if interpolate.is_some() {
         return Err(unsupported("ORDER BY ... INTERPOLATE"));
     }
-    let exprs = match &ob.kind {
+    let exprs = match kind {
         OrderByKind::Expressions(e) => e,
         OrderByKind::All(_) => return Err(unsupported("ORDER BY ALL")),
     };
     let mut keys = Vec::with_capacity(exprs.len());
     for obe in exprs {
-        if obe.with_fill.is_some() {
+        let OrderByExpr { expr, options, with_fill } = obe;
+        if with_fill.is_some() {
             return Err(unsupported("ORDER BY ... WITH FILL"));
         }
-        let asc = obe.options.asc.unwrap_or(true);
-        // Absolute default: ASC → NULLS LAST, DESC → NULLS FIRST.
-        let nulls_first = obe.options.nulls_first.unwrap_or(!asc);
+        let OrderByOptions { asc, nulls_first } = options;
+        let asc = asc.unwrap_or(true);
         keys.push(OrderKey {
-            target: order_target(&obe.expr)?,
+            target: order_target(expr)?,
             asc,
-            nulls_first,
+            // Absolute default: ASC → NULLS LAST, DESC → NULLS FIRST.
+            nulls_first: nulls_first.unwrap_or(!asc),
         });
     }
     Ok(keys)

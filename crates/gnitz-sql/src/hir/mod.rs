@@ -46,9 +46,10 @@ pub(crate) fn bind_and_lower(
     chain: &mut ViewChain,
     query: &sqlparser::ast::Query,
     bounded: bool,
+    surface: bind::ViewSurface,
 ) -> Result<EmitPieces, GnitzSqlError> {
     let ids = ColIdGen::new();
-    let mut cx = bind::BindCx::new(cat, binder, &ids);
+    let mut cx = bind::BindCx::new(cat, binder, &ids, surface);
     bind::bind_ctes(&mut cx, query)?;
     let rel = bind::bind_body(&mut cx, query.body.as_ref())?;
     let rel = rewrite::decorrelate(rel, &ids)?;

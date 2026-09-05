@@ -9,7 +9,8 @@ use crate::bind::{find_unique_column, Binder};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::types::{serial_underlying, sql_type_to_typecode};
 use crate::validate::{
-    reject_unhonored_column_options, reject_unhonored_unique_fields, validate_user_name, ColumnOptionSite,
+    reject_unhonored_alter_table_clauses, reject_unhonored_column_options, reject_unhonored_unique_fields,
+    validate_user_name, ColumnOptionSite,
 };
 use crate::SqlResult;
 use gnitz_core::{GnitzClient, RelClass, RelDescriptor};
@@ -25,8 +26,9 @@ pub(crate) fn execute_alter_table(
     alter: &AlterTable,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
-    // Exactly one operation per statement (the multi-op comma form is rejected by
-    // `reject_unhonored_alter_table_clauses` before we get here).
+    // First, so the index below is total: the guard is what rejects the multi-op
+    // comma form, and a clause rejection outranks a bad name or missing relation.
+    reject_unhonored_alter_table_clauses(alter)?;
     match &alter.operations[0] {
         AlterTableOperation::RenameTable { table_name } => {
             // `RENAME TO` and (some dialects') `RENAME AS` both mean rename-to.
@@ -180,7 +182,7 @@ fn add_column(
     tbl_if_exists: bool,
     column_def: &sqlparser::ast::ColumnDef,
 ) -> Result<SqlResult, GnitzSqlError> {
-    reject_unhonored_column_options(column_def, "ADD COLUMN", ColumnOptionSite::AddColumn)?;
+    reject_unhonored_column_options(column_def, ColumnOptionSite::AddColumn)?;
     // A SERIAL column's generator is seeded from the table's live rows, which an
     // append has none of; named here so it does not fall out as "unsupported type".
     if serial_underlying(&column_def.data_type).is_some() {
@@ -438,7 +440,9 @@ fn rename_target_name(target: &ObjectName, source_schema: &str) -> Result<String
             }
             Ok((*n).to_string())
         }
-        _ => Err(GnitzSqlError::Bind("RENAME TO: unsupported qualified name".to_string())),
+        _ => Err(GnitzSqlError::Unsupported(
+            "RENAME TO: unsupported qualified name".to_string(),
+        )),
     }
 }
 

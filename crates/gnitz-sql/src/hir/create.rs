@@ -8,9 +8,12 @@
 
 use crate::bind::apply_positional_aliases;
 use crate::bind::Binder;
-use crate::error::GnitzSqlError;
+use crate::error::{reject_if, GnitzSqlError};
+use crate::hir::bind::ViewSurface;
 use crate::hir::chain::{debug_assert_exchange_topology, ViewChain};
-use crate::validate::{alter_view_parts, reject_unhonored_query_clauses, validate_user_name, HonoredQueryClauses};
+use crate::validate::{
+    kv_options, reject_unhonored_create_view_clauses, reject_unhonored_query_clauses, validate_user_name, QueryEnvelope,
+};
 use crate::SqlResult;
 use gnitz_core::{CatalogSnapshot, GnitzClient, PlannedView, RelClass, RelDescriptor, Schema};
 use sqlparser::ast::{CreateTableOptions, Ident, ObjectName, Query, Statement, Value, ValueWithSpan};
@@ -50,8 +53,7 @@ pub(crate) struct ViewOptions {
 /// this is where the message is legible.
 fn decode_view_options(options: &CreateTableOptions) -> Result<ViewOptions, GnitzSqlError> {
     let mut out = ViewOptions::default();
-    for opt in crate::validate::with_options(options)? {
-        let (key, value) = crate::validate::require_kv_option(opt, "CREATE VIEW")?;
+    for (key, value) in kv_options(options, "CREATE VIEW")? {
         // The option's name and the field it fills are bound together, so a third
         // option is one arm rather than an arm plus a second dispatch on the name.
         let (name, slot) = if key.value.eq_ignore_ascii_case("capacity") {
@@ -132,8 +134,13 @@ pub fn plan_view(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> 
     let mut binder = Binder::new(schema_name).for_view_body();
     match stmt {
         Statement::CreateView(cv) => plan_create_view(cat, schema_name, cv, &mut binder),
-        Statement::AlterView { .. } => {
-            let (name, columns, query) = alter_view_parts(stmt, "ALTER VIEW")?;
+        // `columns` is the positional output alias list, honored exactly as
+        // `CREATE VIEW v (a, b) AS` is.
+        Statement::AlterView { name, query, columns, with_options } => {
+            // `ALTER VIEW` retargets a body; letting it set a budget would make
+            // the clause-less form silently drop one. `CREATE OR REPLACE VIEW`
+            // restates both.
+            reject_if(!with_options.is_empty(), "ALTER VIEW", "WITH options")?;
             plan_alter_view(cat, schema_name, name, columns, query, &mut binder)
         }
         _ => Err(GnitzSqlError::Unsupported(
@@ -173,6 +180,7 @@ fn plan_create_view(
     cv: &sqlparser::ast::CreateView,
     binder: &mut Binder<'_>,
 ) -> Result<ViewPlan, GnitzSqlError> {
+    reject_unhonored_create_view_clauses(cv)?;
     let query: &Query = &cv.query;
     let view_name = crate::ast_util::extract_name(&cv.name, "CREATE VIEW")?;
     validate_user_name(&view_name)?;
@@ -203,12 +211,12 @@ fn plan_create_view(
         None
     };
 
-    reject_unhonored_query_clauses(query, HonoredQueryClauses::VIEW_BODY, "CREATE VIEW")?;
+    reject_unhonored_query_clauses(query, QueryEnvelope::ViewBody, "CREATE VIEW")?;
 
     let options = decode_view_options(&cv.options)?;
 
     let mut chain = ViewChain::new();
-    build_query_segments(cat, query, binder, &mut chain, options)?;
+    build_query_segments(cat, query, binder, &mut chain, options, ViewSurface::CREATE)?;
 
     if let Some(old_vid) = replaced_vid {
         reject_self_reference(&chain, old_vid, schema_name, &view_name, "CREATE OR REPLACE VIEW")?;
@@ -243,10 +251,17 @@ fn plan_alter_view(
     // Resolve the old vid; reject `ALTER VIEW <table>` and a missing relation.
     let old_vid = resolve_view_id(cat, schema_name, &view_name)?;
 
-    reject_unhonored_query_clauses(query, HonoredQueryClauses::VIEW_BODY, "ALTER VIEW")?;
+    reject_unhonored_query_clauses(query, QueryEnvelope::ViewBody, "ALTER VIEW")?;
 
     let mut chain = ViewChain::new();
-    build_query_segments(cat, query, binder, &mut chain, ViewOptions::default())?;
+    build_query_segments(
+        cat,
+        query,
+        binder,
+        &mut chain,
+        ViewOptions::default(),
+        ViewSurface::ALTER,
+    )?;
 
     reject_self_reference(&chain, old_vid, schema_name, &view_name, "ALTER VIEW")?;
     apply_output_aliases(&mut chain, columns.iter(), "ALTER VIEW")?;
@@ -381,6 +396,7 @@ fn build_query_segments(
     binder: &mut Binder<'_>,
     chain: &mut ViewChain,
     options: ViewOptions,
+    surface: ViewSurface,
 ) -> Result<(), GnitzSqlError> {
     let capacity = options.capacity;
     // Every view shape — linear, join, GROUP BY, DISTINCT, set operation, CTEs,
@@ -390,7 +406,8 @@ fn build_query_segments(
     // then lower to circuit(s) — nested combine segments, shared CTE subtrees and
     // self-collision pass-through wrappers land on `chain`, and the final step
     // becomes the chain's slot-0 view.
-    let (circuit, out_cols, pk_cols) = crate::hir::bind_and_lower(cat, binder, chain, query, capacity.is_some())?;
+    let (circuit, out_cols, pk_cols) =
+        crate::hir::bind_and_lower(cat, binder, chain, query, capacity.is_some(), surface)?;
 
     // Structural eligibility, over what the body actually compiled to rather than
     // over the shapes it was written in: both bounded shapes are a single segment,

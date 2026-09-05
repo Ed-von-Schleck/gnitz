@@ -448,7 +448,7 @@ fn like_pattern(pattern: &Expr, escape: Option<u8>) -> Result<String, GnitzSqlEr
     // The engine's own tokenizer answers, so the binder's rule and the matcher's
     // cannot drift.
     if gnitz_expr::like_pattern_ends_with_live_escape(s.as_bytes(), escape) {
-        return Err(GnitzSqlError::Bind(
+        return Err(GnitzSqlError::Plan(
             "LIKE pattern must not end with escape character".to_string(),
         ));
     }
@@ -709,7 +709,7 @@ fn bind_round<R: Clone, L: LeafBinder<R>>(args: &[&Expr], leaf: &L) -> Result<BE
 /// `-15..=15`. f64 carries ~15–17 significant decimal digits, so a wider scale
 /// has no digits left to round at.
 fn round_scale(e: &Expr) -> Result<i8, GnitzSqlError> {
-    let bad = || GnitzSqlError::Bind("ROUND: scale must be an integer literal in -15..=15".to_string());
+    let bad = || GnitzSqlError::Plan("ROUND: scale must be an integer literal in -15..=15".to_string());
     let Some(SqlLiteral::Number(mag, neg)) = extract_sql_literal(e) else {
         return Err(bad());
     };
@@ -779,7 +779,7 @@ fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
             } else if n.contains(['.', 'e', 'E']) {
                 n.parse::<f64>()
                     .map(BExpr::LitFloat)
-                    .map_err(|_| GnitzSqlError::Bind(format!("invalid number literal: {n}")))
+                    .map_err(|_| GnitzSqlError::Plan(format!("invalid number literal: {n}")))
             } else {
                 // Non-fractional literal that overflows i64 (U128/UUID/I128 range,
                 // or the `i64::MIN` magnitude under an outer `Neg`). Bind it

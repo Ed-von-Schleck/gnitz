@@ -444,13 +444,13 @@ fn transcendental_names_bind_to_their_function() {
     assert_unsupported(bind_num("LOG(c, 2)"), "exactly one argument");
 }
 
-fn assert_bind_err(r: Result<BoundExpr, GnitzSqlError>, want_substr: &str) {
+fn assert_plan_err(r: Result<BoundExpr, GnitzSqlError>, want_substr: &str) {
     match r.unwrap_err() {
-        GnitzSqlError::Bind(msg) => assert!(
+        GnitzSqlError::Plan(msg) => assert!(
             msg.contains(want_substr),
-            "got Bind({msg:?}), expected to contain {want_substr:?}"
+            "got Plan({msg:?}), expected to contain {want_substr:?}"
         ),
-        e => panic!("expected Bind, got {e:?}"),
+        e => panic!("expected Plan, got {e:?}"),
     }
 }
 
@@ -499,7 +499,7 @@ fn round_scale_must_be_a_small_integer_literal() {
         }
     }
     for src in ["ROUND(c, 16)", "ROUND(c, -16)", "ROUND(c, 2.5)", "ROUND(c, c)"] {
-        assert_bind_err(bind_num(src), "scale must be an integer literal");
+        assert_plan_err(bind_num(src), "scale must be an integer literal");
     }
     assert_unsupported(bind_num("ROUND(c, 1, 2)"), "one or two arguments");
 }
@@ -688,8 +688,8 @@ fn like_rejects_what_it_cannot_bake_in() {
 #[test]
 fn like_rejects_a_pattern_ending_in_a_live_escape() {
     match bind_str(r"c LIKE 'ab\'").unwrap_err() {
-        GnitzSqlError::Bind(msg) => assert_eq!(msg, "LIKE pattern must not end with escape character"),
-        e => panic!("expected Bind, got {e:?}"),
+        GnitzSqlError::Plan(msg) => assert_eq!(msg, "LIKE pattern must not end with escape character"),
+        e => panic!("expected Plan, got {e:?}"),
     }
     assert_eq!(like_parts(r"c LIKE 'ab\\'").0, r"ab\\");
     // With escaping disabled the byte is ordinary.

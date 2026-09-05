@@ -676,15 +676,7 @@ pub fn validate_pk_col_list(cols: &[u32]) -> Result<(), String> {
     // The rule itself is `validate_pk_indices`; the packed 7-bit field is this
     // list's column-count bound. Only the wording differs — these lists are also
     // secondary-index column lists, which "primary key ..." would misname.
-    crate::validate_pk_indices(cols, 1 << PK_LIST_COL_BITS).map_err(|rule| match rule {
-        crate::PkRule::Empty | crate::PkRule::TooManyColumns { .. } => {
-            format!("column count {} out of range 1..={PK_LIST_MAX_COLS}", cols.len())
-        }
-        crate::PkRule::IndexOutOfRange { col } => format!("column index {col} exceeds {PK_LIST_COL_MAX}"),
-        crate::PkRule::Duplicate { col } => format!("duplicate column {col} in list"),
-        // `validate_pk_indices` reports only the structural rules above.
-        other => other.to_string(),
-    })
+    crate::validate_pk_indices(cols, 1 << PK_LIST_COL_BITS).map_err(|rule| rule.for_role(crate::PkListRole::ColumnList))
 }
 
 /// Validate a `CLUSTER BY` column list against the table's PK, returning the

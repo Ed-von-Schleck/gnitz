@@ -404,6 +404,24 @@ fn explain_plans_the_query_it_describes_and_shares_its_rejection() {
     );
 }
 
+/// Only the plain `EXPLAIN <statement>` is honored; every option asks for a
+/// rendering the output shape does not have, and is named in the rejection.
+#[test]
+fn explain_rejected_clause_matrix() {
+    let cat = cat();
+    assert!(read(&cat, "EXPLAIN SELECT v FROM t").is_ok());
+    for (sql, clause) in [
+        ("EXPLAIN ANALYZE SELECT v FROM t", "ANALYZE"),
+        ("EXPLAIN VERBOSE SELECT v FROM t", "VERBOSE"),
+        ("EXPLAIN QUERY PLAN SELECT v FROM t", "QUERY PLAN"),
+        ("EXPLAIN ESTIMATE SELECT v FROM t", "ESTIMATE"),
+        ("EXPLAIN FORMAT JSON SELECT v FROM t", "FORMAT"),
+        ("EXPLAIN (FORMAT JSON) SELECT v FROM t", "the parenthesized option list"),
+    ] {
+        assert_rejects(sql, read(&cat, sql), "Unsupported", clause);
+    }
+}
+
 // ── Read shapes ──────────────────────────────────────────────────────────────
 
 /// Every ad-hoc read shape plans to the sink it belongs on and says whether a

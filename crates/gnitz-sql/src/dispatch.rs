@@ -3,13 +3,8 @@
 //! per-statement `Binder` and routes a `Statement` to the matching handler.
 
 use crate::bind::Binder;
+use crate::error::reject_if;
 use crate::error::GnitzSqlError;
-use crate::validate::{
-    drop_parts, reject_unhonored_alter_table_clauses, reject_unhonored_commit_clauses,
-    reject_unhonored_create_index_clauses, reject_unhonored_create_table_clauses, reject_unhonored_create_view_clauses,
-    reject_unhonored_delete_clauses, reject_unhonored_explain_clauses, reject_unhonored_insert_clauses,
-    reject_unhonored_rollback_clauses, reject_unhonored_start_transaction_clauses, reject_unhonored_update_clauses,
-};
 use crate::SqlResult;
 use crate::{ddl, dml};
 use gnitz_core::CatalogSnapshot;
@@ -113,7 +108,6 @@ pub(crate) fn execute_statement(
         // separate feature — and falls to the catch-all below. `plan_read` rejects
         // the EXPLAIN of a non-SELECT.
         Statement::Explain { .. } => {
-            reject_unhonored_explain_clauses(stmt, "EXPLAIN")?;
             let plan = plan_resolving(client, GnitzClient::resolve_local_first, schema_name, |cat| {
                 crate::plan_read(stmt, cat, schema_name)
             })?;
@@ -127,18 +121,38 @@ pub(crate) fn execute_statement(
     let mut binder = Binder::new(schema_name);
 
     match stmt {
-        // Transaction control. Each is a pure client-state-machine transition
-        // (no compile, no data reshape), so the handler is inlined here; the
-        // clause-reject lives in `crate::validate` like every other statement's.
-        // All state-machine errors (`transaction already open`, `no transaction
-        // open`) are raised by the `client.txn_*` calls.
-        Statement::StartTransaction { .. } => {
-            reject_unhonored_start_transaction_clauses(stmt, "BEGIN")?;
+        // Transaction control is a pure client-state-machine transition, so the
+        // arm is the whole consumer: `transaction already open` and `no
+        // transaction open` come from the `client.txn_*` calls below.
+        // `transaction`, `begin` and `has_end_keyword` are inert phrasing.
+        Statement::StartTransaction {
+            modes,
+            begin: _,
+            transaction: _,
+            modifier,
+            statements,
+            exception,
+            has_end_keyword: _,
+        } => {
+            const CTX: &str = "BEGIN";
+            // gnitz has one fixed isolation: atomicity + constraint consistency.
+            reject_if(
+                !modes.is_empty(),
+                CTX,
+                "transaction modes (READ ONLY / ISOLATION LEVEL)",
+            )?;
+            reject_if(modifier.is_some(), CTX, "a BEGIN modifier (DEFERRED / TRY / CATCH)")?;
+            reject_if(!statements.is_empty(), CTX, "a BEGIN ... END block")?;
+            reject_if(exception.is_some(), CTX, "an EXCEPTION clause")?;
             client.txn_begin()?;
             Ok(SqlResult::TransactionStarted)
         }
-        Statement::Commit { .. } => {
-            reject_unhonored_commit_clauses(stmt, "COMMIT")?;
+        // `end` is inert (`END` is a `COMMIT` spelling).
+        Statement::Commit { chain, end: _, modifier } => {
+            const CTX: &str = "COMMIT";
+            // AND CHAIN would open an immediate successor transaction.
+            reject_if(*chain, CTX, "AND CHAIN")?;
+            reject_if(modifier.is_some(), CTX, "a COMMIT modifier (TRY / CATCH)")?;
             // A COMMIT-time OCC conflict is not auto-retried — the buffered reads
             // are stale by definition. `txn_commit` already took the buffer out
             // (transaction closed), so surfacing `Conflict` leaves nothing open;
@@ -149,46 +163,47 @@ pub(crate) fn execute_statement(
                 Err(e) => Err(GnitzSqlError::Exec(e)),
             }
         }
-        Statement::Rollback { .. } => {
-            reject_unhonored_rollback_clauses(stmt, "ROLLBACK")?;
+        Statement::Rollback { chain, savepoint } => {
+            const CTX: &str = "ROLLBACK";
+            reject_if(*chain, CTX, "AND CHAIN")?;
+            reject_if(savepoint.is_some(), CTX, "TO SAVEPOINT")?;
             client.txn_rollback()?;
             Ok(SqlResult::TransactionRolledBack)
         }
-        Statement::CreateTable(create) => {
-            reject_unhonored_create_table_clauses(create, "CREATE TABLE")?;
-            ddl::execute_create_table(client, schema_name, create)
+        Statement::CreateTable(create) => ddl::execute_create_table(client, schema_name, create),
+        // The one statement whose clause rejections live in the router: sqlparser
+        // gives `Drop` no payload struct, so `execute_drop` could destructure it
+        // only by taking the whole `Statement` back.
+        Statement::Drop {
+            object_type,
+            names,
+            if_exists,
+            cascade,
+            restrict,
+            purge,
+            temporary,
+            table,
+        } => {
+            const CTX: &str = "DROP";
+            reject_if(*cascade, CTX, "CASCADE")?;
+            reject_if(*restrict, CTX, "RESTRICT")?;
+            reject_if(*purge, CTX, "PURGE")?;
+            reject_if(*temporary, CTX, "TEMPORARY")?;
+            reject_if(table.is_some(), CTX, "ON <table> (MySQL DROP INDEX target)")?;
+            ddl::execute_drop(client, schema_name, object_type, names, *if_exists)
         }
-        Statement::Drop { .. } => ddl::execute_drop(client, schema_name, drop_parts(stmt, "DROP")?),
-        Statement::CreateView(cv) => {
-            reject_unhonored_create_view_clauses(cv, "CREATE VIEW")?;
+        Statement::CreateView(_) => {
             let plan = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {
                 crate::plan_view(stmt, cat, schema_name)
             })?;
             crate::hir::execute_create_view(client, schema_name, plan)
         }
-        Statement::Insert(insert) => {
-            reject_unhonored_insert_clauses(insert, "INSERT")?;
-            dml::execute_insert(client, insert, &mut binder)
-        }
-        Statement::CreateIndex(ci) => {
-            reject_unhonored_create_index_clauses(ci, "CREATE INDEX")?;
-            ddl::execute_create_index(client, schema_name, ci, &mut binder)
-        }
-        Statement::Update(update) => {
-            reject_unhonored_update_clauses(update, "UPDATE")?;
-            dml::execute_update(client, update, &mut binder)
-        }
-        Statement::Delete(del) => {
-            reject_unhonored_delete_clauses(del, "DELETE")?;
-            dml::execute_delete(client, del, &mut binder)
-        }
-        Statement::AlterTable(a) => {
-            reject_unhonored_alter_table_clauses(a, "ALTER TABLE")?;
-            ddl::execute_alter_table(client, schema_name, a, &mut binder)
-        }
+        Statement::Insert(insert) => dml::execute_insert(client, insert, &mut binder),
+        Statement::CreateIndex(ci) => ddl::execute_create_index(client, schema_name, ci, &mut binder),
+        Statement::Update(update) => dml::execute_update(client, update, &mut binder),
+        Statement::Delete(del) => dml::execute_delete(client, del, &mut binder),
+        Statement::AlterTable(a) => ddl::execute_alter_table(client, schema_name, a, &mut binder),
         Statement::AlterView { .. } => {
-            // The clause reject rides in `plan_view`'s narrowing, which is the
-            // one place `AlterView` is destructured.
             let plan = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {
                 crate::plan_view(stmt, cat, schema_name)
             })?;

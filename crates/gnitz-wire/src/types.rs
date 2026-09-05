@@ -372,23 +372,61 @@ pub fn index_key_type(field_type_code: u8) -> Result<u8, String> {
 /// shared by the SQL planner's CREATE INDEX pre-check and the engine's
 /// `make_index_schema`, so the friendly planner error and the engine backstop
 /// can never disagree on a column's promoted width or the limits.
-pub fn index_key_types(col_types: &[u8], src_pk_count: usize, src_pk_stride: usize) -> Result<Vec<u8>, String> {
-    let promoted: Vec<u8> = col_types.iter().map(|&t| index_key_type(t)).collect::<Result<_, _>>()?;
+pub fn index_key_types(col_types: &[u8], src_pk_count: usize, src_pk_stride: usize) -> Result<Vec<u8>, IndexKeyRule> {
+    let mut promoted: Vec<u8> = Vec::with_capacity(col_types.len());
+    for (col, &t) in col_types.iter().enumerate() {
+        // Indexed by position, so the layer above can name the SQL column that
+        // failed; `index_key_type`'s own string says only the type code.
+        let p = index_key_type(t).map_err(|_| IndexKeyRule::NotEligible { col, type_code: t })?;
+        promoted.push(p);
+    }
     let n = promoted.len();
     if n + src_pk_count > crate::MAX_PK_COLUMNS {
-        return Err(format!(
-            "index arity {n} + source PK arity {src_pk_count} exceeds the limit of {}",
-            crate::MAX_PK_COLUMNS,
-        ));
+        return Err(IndexKeyRule::ArityOutOfRange { n, src_pk_count });
     }
     let stride: usize = promoted.iter().map(|&t| wire_stride(t)).sum::<usize>() + src_pk_stride;
     if stride > crate::MAX_PK_BYTES {
-        return Err(format!(
-            "index record stride {stride} exceeds the limit of {} bytes",
-            crate::MAX_PK_BYTES,
-        ));
+        return Err(IndexKeyRule::StrideOutOfRange { stride });
     }
     Ok(promoted)
+}
+
+/// Which rule a candidate secondary-index key broke — [`PkRule`]'s counterpart
+/// for [`index_key_types`], so the SQL planner can name the offending column by
+/// its SQL identifier. `col` indexes `col_types`, never the appended source PK:
+/// only the indexed columns are promoted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexKeyRule {
+    /// STRING/BLOB/float (or an unknown code) has no order-preserving
+    /// fixed-width index key to promote to.
+    NotEligible { col: usize, type_code: u8 },
+    /// The index record is the indexed columns plus the source PK, and every one
+    /// of them is a PK column, so their total arity is capped by
+    /// [`crate::MAX_PK_COLUMNS`].
+    ArityOutOfRange { n: usize, src_pk_count: usize },
+    /// The same record's packed PK region must fit [`crate::MAX_PK_BYTES`].
+    StrideOutOfRange { stride: usize },
+}
+
+impl core::fmt::Display for IndexKeyRule {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            IndexKeyRule::NotEligible { col, type_code } => write!(
+                f,
+                "Secondary index on column type {type_code} not supported (index key column {col})"
+            ),
+            IndexKeyRule::ArityOutOfRange { n, src_pk_count } => write!(
+                f,
+                "index arity {n} + source PK arity {src_pk_count} exceeds the limit of {}",
+                crate::MAX_PK_COLUMNS
+            ),
+            IndexKeyRule::StrideOutOfRange { stride } => write!(
+                f,
+                "index record stride {stride} exceeds the limit of {} bytes",
+                crate::MAX_PK_BYTES
+            ),
+        }
+    }
 }
 
 /// Which rule a candidate primary key broke. Returned by
@@ -417,32 +455,56 @@ pub enum PkRule {
     StrideOutOfRange { stride: usize },
 }
 
-impl core::fmt::Display for PkRule {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+/// Which list a [`PkRule`] is about: [`validate_pk_indices`]' four structural
+/// rules are equally a secondary index's column-list rules, so only the noun
+/// differs. Not a `&str`, which a call site could spell wrong unnoticed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PkListRole {
+    PrimaryKey,
+    ColumnList,
+}
+
+impl PkListRole {
+    /// The noun every rule's message opens with.
+    fn noun(self) -> &'static str {
+        match self {
+            PkListRole::PrimaryKey => "primary key",
+            PkListRole::ColumnList => "column list",
+        }
+    }
+}
+
+impl PkRule {
+    /// This rule's message, worded for the list it is about.
+    pub fn for_role(&self, role: PkListRole) -> String {
+        let what = role.noun();
         match *self {
-            PkRule::Empty => write!(f, "primary key must name at least one column"),
-            PkRule::TooManyColumns { count } => {
-                write!(
-                    f,
-                    "primary key column count {count} out of range 1..={}",
-                    crate::PK_LIST_MAX_COLS
-                )
-            }
-            PkRule::IndexOutOfRange { col } => write!(f, "primary key index {col} out of bounds"),
-            PkRule::Duplicate { col } => write!(f, "primary key names column {col} twice"),
-            PkRule::NotEligible { col, type_code } => write!(
-                f,
-                "primary key column {col} has type_code {type_code}; only fixed-width integer, \
+            PkRule::Empty => format!("{what} must name at least one column"),
+            PkRule::TooManyColumns { count } => format!(
+                "{what} column count {count} out of range 1..={}",
+                crate::PK_LIST_MAX_COLS
+            ),
+            PkRule::IndexOutOfRange { col } => format!("{what} index {col} out of bounds"),
+            PkRule::Duplicate { col } => format!("{what} names column {col} twice"),
+            PkRule::NotEligible { col, type_code } => format!(
+                "{what} column {col} has type_code {type_code}; only fixed-width integer, \
                  U128, UUID, and I128 columns can be PK columns \
                  (String, Blob, and float columns cannot)"
             ),
-            PkRule::Nullable { col } => write!(f, "primary key column {col} must not be nullable"),
-            PkRule::StrideOutOfRange { stride } => write!(
-                f,
-                "primary key total stride must be 1..={} bytes, got {stride}",
+            PkRule::Nullable { col } => format!("{what} column {col} must not be nullable"),
+            PkRule::StrideOutOfRange { stride } => format!(
+                "{what} total stride must be 1..={} bytes, got {stride}",
                 crate::MAX_PK_BYTES
             ),
         }
+    }
+}
+
+/// The primary-key wording — the role every caller that does not say otherwise
+/// is about.
+impl core::fmt::Display for PkRule {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.for_role(PkListRole::PrimaryKey))
     }
 }
 

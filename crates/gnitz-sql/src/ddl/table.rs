@@ -6,9 +6,9 @@ use crate::bind::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
 use crate::types::{int_domain_fits, is_integer_type, serial_underlying, sql_type_to_typecode};
 use crate::validate::{
-    canonical_user_name, default_index_name, disambiguate_index_name, non_key_eligible_error, reject_duplicate_names,
-    reject_unbuildable_index_key, reject_unhonored_column_options, reject_unhonored_table_constraints,
-    validate_user_name, ColumnOptionSite,
+    canonical_user_name, kv_options, non_key_eligible_error, reject_duplicate_names, reject_unbuildable_index_key,
+    reject_unhonored_column_options, reject_unhonored_create_index_clauses, reject_unhonored_create_table_clauses,
+    reject_unhonored_table_constraints, validate_user_name, ColumnOptionSite,
 };
 use crate::SqlResult;
 use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, InlineUniqueIndex, TableProps, TypeCode};
@@ -16,6 +16,49 @@ use sqlparser::ast::{
     ColumnOption, CreateTableOptions, Expr, ForeignKeyConstraint, ObjectType, PrimaryKeyConstraint, TableConstraint,
     UniqueConstraint, Value, ValueWithSpan, WrappedCollection,
 };
+
+/// Catalog name for an auto-generated (unnamed) secondary index:
+/// `{schema}__{table}__idx_{col1}_{col2}…` (column names joined with `_`).
+/// `DROP INDEX <name>` resolves this exact string, so the format is a stable
+/// contract (the drop-by-name assertions in `tests/engine_ddl.rs` pin it); this
+/// is its single definition, shared by CREATE INDEX and CREATE TABLE … UNIQUE.
+/// The output is lowercased so the base is canonical (matching the client's
+/// store-time canonicalization), which the collision disambiguation depends on.
+fn default_index_name(schema_name: &str, table_name: &str, col_names: &[&str]) -> String {
+    format!("{schema_name}__{table_name}__idx_{}", col_names.join("_")).to_ascii_lowercase()
+}
+
+/// Return `base` if free, else the first `{base}_{n}` (n ≥ 2) not in `taken` —
+/// PostgreSQL's scheme, keeping the readable base for the common non-colliding
+/// case. Both are canonical: `base` comes from [`default_index_name`], `taken`
+/// from the catalog.
+fn disambiguate_index_name(base: String, taken: &std::collections::HashSet<String>) -> String {
+    if !taken.contains(&base) {
+        return base;
+    }
+    for n in 2u32.. {
+        let candidate = format!("{base}_{n}");
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("u32 range exhausted")
+}
+
+/// A UNIQUE constraint's `CONSTRAINT <name>`, validated and canonicalized once
+/// where the statement first hands it over. `raw` is kept for messages: someone
+/// who wrote `CONSTRAINT MyIdx` twice must be told about `MyIdx`, not `myidx`.
+struct ConstraintName {
+    raw: String,
+    canonical: String,
+}
+
+fn constraint_name(ident: &sqlparser::ast::Ident) -> Result<ConstraintName, GnitzSqlError> {
+    Ok(ConstraintName {
+        raw: ident.value.clone(),
+        canonical: canonical_user_name(&ident.value)?,
+    })
+}
 
 /// FK child/parent type compatibility: an integer child widens to an integer
 /// parent whose domain covers it; otherwise the types must match exactly. Returns
@@ -38,17 +81,14 @@ fn check_fk_type_compat(fk_col_type: TypeCode, parent_col_type: TypeCode) -> Res
 }
 
 /// Reject a UNIQUE constraint whose backing index the engine could not build.
-/// No `Schema` exists yet, so the PK stride `Schema::pk_stride` would return is
-/// summed here from the same definition.
+/// `src_pk_stride` is the one `validate_pk_tuple` already returned for this same
+/// column list.
 fn reject_unbuildable_unique_index(
-    unique_cols: &[(Vec<u32>, Option<String>)],
+    unique_cols: &[(Vec<u32>, Option<ConstraintName>)],
     cols: &[ColumnDef],
     pk_indices: &[u32],
+    src_pk_stride: usize,
 ) -> Result<(), GnitzSqlError> {
-    let src_pk_stride: usize = pk_indices
-        .iter()
-        .map(|&c| cols[c as usize].type_code.wire_stride())
-        .sum();
     for (col_indices, _) in unique_cols {
         let names: Vec<&str> = col_indices.iter().map(|&c| cols[c as usize].name.as_str()).collect();
         let types: Vec<TypeCode> = col_indices.iter().map(|&c| cols[c as usize].type_code).collect();
@@ -221,8 +261,7 @@ fn resolve_fk_target(
 /// typo cannot be silently ignored.
 fn parse_table_options(table_options: &CreateTableOptions) -> Result<TableProps, GnitzSqlError> {
     let mut props = TableProps::default();
-    for opt in crate::validate::with_options(table_options)? {
-        let (key, value) = crate::validate::require_kv_option(opt, "CREATE TABLE")?;
+    for (key, value) in kv_options(table_options, "CREATE TABLE")? {
         let slot = if key.value.eq_ignore_ascii_case("replicated") {
             &mut props.replicated
         } else if key.value.eq_ignore_ascii_case("stream") {
@@ -249,6 +288,7 @@ pub(crate) fn execute_create_table(
     schema_name: &str,
     create: &sqlparser::ast::CreateTable,
 ) -> Result<SqlResult, GnitzSqlError> {
+    reject_unhonored_create_table_clauses(create)?;
     let table_name = extract_name(&create.name, "CREATE TABLE")?;
     validate_user_name(&table_name)?;
 
@@ -274,9 +314,9 @@ pub(crate) fn execute_create_table(
     // than being silently dropped or masked by the "requires at least one
     // PRIMARY KEY column" admission error below.
     for col in sql_cols {
-        reject_unhonored_column_options(col, "column definition", ColumnOptionSite::CreateTable)?;
+        reject_unhonored_column_options(col, ColumnOptionSite::CreateTable)?;
     }
-    reject_unhonored_table_constraints(&create.constraints, "table constraint")?;
+    reject_unhonored_table_constraints(&create.constraints)?;
 
     // Phase 1 — build column defs (name, type, nullability only). A SERIAL
     // column resolves to its underlying signed int, is always NOT NULL, and
@@ -305,10 +345,10 @@ pub(crate) fn execute_create_table(
     let mut pk_indices: Vec<u32> = Vec::new();
     let mut pk_decl_seen = false;
     // Column lists carrying a UNIQUE constraint, paired with the user-specified
-    // constraint name (if any). A column-level `UNIQUE` is a 1-element list and
-    // carries no name (always `None`); a table-level `UNIQUE (a, b, …)` is the
-    // full ordered list and may carry a `CONSTRAINT <name>`.
-    let mut unique_cols: Vec<(Vec<u32>, Option<String>)> = Vec::new();
+    // constraint name (if any). A column-level `UNIQUE` is a 1-element list; a
+    // table-level `UNIQUE (a, b, …)` is the full ordered list. Both spellings may
+    // carry a `CONSTRAINT <name>`, and it names the created index either way.
+    let mut unique_cols: Vec<(Vec<u32>, Option<ConstraintName>)> = Vec::new();
 
     // Table-level PRIMARY KEY (...). Done before the inline pass so an
     // unknown column name produces a Bind error rather than being eclipsed
@@ -351,7 +391,8 @@ pub(crate) fn execute_create_table(
                     fk_sites.push((i, foreign_table, referred_columns))
                 }
                 ColumnOption::Unique(_) if !unique_cols.iter().any(|(c, _)| c.as_slice() == [i as u32]) => {
-                    unique_cols.push((vec![i as u32], None));
+                    let name = opt.name.as_ref().map(constraint_name).transpose()?;
+                    unique_cols.push((vec![i as u32], name));
                 }
                 _ => {}
             }
@@ -412,11 +453,7 @@ pub(crate) fn execute_create_table(
                     col_names.join(", ")
                 )));
             }
-            let constraint_name = name_ident.as_ref().map(|n| n.value.clone());
-            if let Some(ref name) = constraint_name {
-                validate_user_name(name)?;
-            }
-            unique_cols.push((col_indices, constraint_name));
+            unique_cols.push((col_indices, name_ident.as_ref().map(constraint_name).transpose()?));
         }
     }
 
@@ -432,7 +469,7 @@ pub(crate) fn execute_create_table(
     // engine catalog's `validate_pk_against_cols`, so this pre-check and the engine
     // backstop cannot disagree on what a legal PK is. Only the wording is the
     // planner's: it names the offending column, which the engine cannot.
-    gnitz_wire::validate_pk_tuple(&pk_indices, cols.len(), |c| {
+    let pk_stride = gnitz_wire::validate_pk_tuple(&pk_indices, cols.len(), |c| {
         let cd = &cols[c as usize];
         (cd.type_code as u8, cd.is_nullable)
     })
@@ -477,12 +514,14 @@ pub(crate) fn execute_create_table(
     // single-element lone PK, so both are kept (the engine supports unique
     // indices on PK columns, and the engine's trivial-uniqueness short-circuit
     // skips the pre-flight scan for a composite UNIQUE equal to a compound PK).
+    // A written `CONSTRAINT <name>` on such a column goes with the index it named:
+    // there is no index left to carry it, and the PK is not droppable by that name.
     let lone_pk: &[u32] = if pk_indices.len() == 1 { &pk_indices } else { &[] };
     unique_cols.retain(|(c, _)| c.as_slice() != lone_pk);
 
     // Before `create_table`, since DDL is not transactional: a rejection after the
     // table exists would leave an orphan.
-    reject_unbuildable_unique_index(&unique_cols, &cols, &pk_indices)?;
+    reject_unbuildable_unique_index(&unique_cols, &cols, &pk_indices, pk_stride)?;
 
     // Phase 6 — CLUSTER BY (hash distribution key). The named columns must be the
     // PK's leading prefix in PK order; the prefix length `k` is persisted in
@@ -528,8 +567,8 @@ pub(crate) fn execute_create_table(
     // than a silently-shadowed index.
     for (_, constraint_name) in &unique_cols {
         if let Some(n) = constraint_name {
-            if !taken.insert(canonical_user_name(n)?) {
-                return Err(GnitzSqlError::Plan(format!("duplicate constraint name '{n}'")));
+            if !taken.insert(n.canonical.clone()) {
+                return Err(GnitzSqlError::Plan(format!("duplicate constraint name '{}'", n.raw)));
             }
         }
     }
@@ -538,7 +577,7 @@ pub(crate) fn execute_create_table(
     let mut index_names: Vec<String> = Vec::with_capacity(unique_cols.len());
     for (col_indices, constraint_name) in &unique_cols {
         let name = match constraint_name {
-            Some(n) => canonical_user_name(n)?,
+            Some(n) => n.canonical.clone(),
             None => {
                 let col_names: Vec<&str> = col_indices.iter().map(|&c| cols[c as usize].name.as_str()).collect();
                 let base = default_index_name(schema_name, &table_name, &col_names);
@@ -566,9 +605,10 @@ pub(crate) fn execute_create_table(
 pub(crate) fn execute_drop(
     client: &mut GnitzClient,
     schema_name: &str,
-    parts: crate::validate::DropParts<'_>,
+    object_type: &ObjectType,
+    names: &[sqlparser::ast::ObjectName],
+    if_exists: bool,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let crate::validate::DropParts { object_type, names, if_exists } = parts;
     // The kind is the statement's, not each name's, so it is settled once.
     if !matches!(object_type, ObjectType::Table | ObjectType::View | ObjectType::Index) {
         return Err(GnitzSqlError::Unsupported(format!(
@@ -601,6 +641,7 @@ pub(crate) fn execute_create_index(
     ci: &sqlparser::ast::CreateIndex,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
+    reject_unhonored_create_index_clauses(ci)?;
     let table_name = extract_name(&ci.table_name, "CREATE INDEX")?;
     let explicit_name = ci.name.as_ref().map(|n| extract_name(n, "CREATE INDEX")).transpose()?;
     create_index_core(
@@ -639,7 +680,7 @@ pub(crate) fn create_index_core(
     let explicit_name = explicit_name.map(|name| canonical_user_name(&name)).transpose()?;
 
     if columns.is_empty() {
-        return Err(GnitzSqlError::Bind(format!("{ctx}: at least one column required")));
+        return Err(GnitzSqlError::Plan(format!("{ctx}: at least one column required")));
     }
 
     // Resolve the target as a base table: this rejects a view (read-only — a

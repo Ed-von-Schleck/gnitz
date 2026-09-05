@@ -48,8 +48,8 @@ use crate::ir::{AggFunc, BExpr, BinOp};
 use crate::validate::{reject_duplicate_projection_names, reject_float_key_of};
 use gnitz_core::{ColumnDef, TypeCode};
 use sqlparser::ast::{
-    Expr, Function, FunctionArguments, Ident, NamedWindowDefinition, NamedWindowExpr, Select, WindowFrame,
-    WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
+    Expr, Function, FunctionArguments, Ident, NamedWindowDefinition, NamedWindowExpr, OrderByExpr, OrderByOptions,
+    Select, WindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -194,14 +194,14 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
                 .iter()
                 .find(|d| d.0.value.eq_ignore_ascii_case(&name.value))
                 .ok_or_else(|| {
-                    GnitzSqlError::Bind(format!("window '{}' is not defined in the WINDOW clause", name.value))
+                    GnitzSqlError::Plan(format!("window '{}' is not defined in the WINDOW clause", name.value))
                 })?;
             match &def.1 {
                 NamedWindowExpr::WindowSpec(s) => return inline(s),
                 NamedWindowExpr::NamedWindow(next) => name = next,
             }
         }
-        Err(GnitzSqlError::Bind(format!(
+        Err(GnitzSqlError::Plan(format!(
             "window '{}' is defined in terms of itself",
             name.value
         )))
@@ -217,21 +217,33 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
         // grouped body resolves to its finalize and a nested OVER is refused
         // there.
         let arg = arg_expr.map(|e| bind_structural(e, self.inner)).transpose()?;
-        let partition = spec
-            .partition_by
+        // `window_name` is rejected by `resolve_spec`, which is what hands `spec`
+        // over. Exhaustive (no `..`): a future frame or exclusion field stops the
+        // build rather than being dropped into a maintained view.
+        let WindowSpec {
+            window_name: _,
+            partition_by,
+            order_by,
+            window_frame,
+        } = spec;
+        let partition = partition_by
             .iter()
             .map(|e| bind_structural(e, self.inner))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut order = Vec::with_capacity(spec.order_by.len());
-        for o in &spec.order_by {
-            if o.with_fill.is_some() {
+        let mut order = Vec::with_capacity(order_by.len());
+        for o in order_by {
+            let OrderByExpr { expr, options, with_fill } = o;
+            if with_fill.is_some() {
                 return Err(GnitzSqlError::Unsupported(
                     "window ORDER BY: WITH FILL is not supported".into(),
                 ));
             }
-            order.push((bind_structural(&o.expr, self.inner)?, o.options.asc.unwrap_or(true)));
+            // `nulls_first` is inert: `check_key` below refuses a key that is not
+            // provably NOT NULL, so this ORDER BY sees no NULL to place.
+            let OrderByOptions { asc, nulls_first: _ } = options;
+            order.push((bind_structural(expr, self.inner)?, asc.unwrap_or(true)));
         }
-        if !frame_is_cumulative(spec.window_frame.as_ref(), !order.is_empty())? {
+        if !frame_is_cumulative(window_frame.as_ref(), !order.is_empty())? {
             order.clear();
         }
         let written = order.len();

@@ -19,6 +19,7 @@ use crate::exec::batch::RowGather;
 use crate::exec::residual::matching_indices;
 use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::BoundExpr;
+use crate::validate::{reject_unhonored_delete_clauses, reject_unhonored_update_clauses};
 use crate::SqlResult;
 use gnitz_core::null_word_set;
 use gnitz_core::{
@@ -378,6 +379,7 @@ pub(crate) fn execute_update(
     update: &sqlparser::ast::Update,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
+    reject_unhonored_update_clauses(update)?;
     let (table, assignments_raw, selection) = (&update.table, &update.assignments, &update.selection);
 
     let (table_name, table_alias) = extract_table_name_and_alias(&table.relation, "UPDATE")?;
@@ -441,6 +443,7 @@ pub(crate) fn execute_delete(
     del: &sqlparser::ast::Delete,
     binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
+    reject_unhonored_delete_clauses(del)?;
     let tables = match &del.from {
         FromTable::WithFromKeyword(ts) | FromTable::WithoutKeyword(ts) => ts,
     };

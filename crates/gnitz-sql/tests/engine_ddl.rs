@@ -235,6 +235,15 @@ fn inline_unique_matrix() {
     }
     exec(&mut client, &sn, "DROP INDEX u_c");
     assert_eq!(unique_on(&mut client, &sn, "u", "c"), None);
+    // A column-level `CONSTRAINT <n> UNIQUE` names its index, as the table-level
+    // spelling does — so the index is droppable by the name that was written.
+    exec(
+        &mut client,
+        &sn,
+        "CREATE TABLE cn (id BIGINT PRIMARY KEY, e BIGINT CONSTRAINT uq_e UNIQUE)",
+    );
+    exec(&mut client, &sn, "DROP INDEX uq_e");
+    assert_eq!(unique_on(&mut client, &sn, "cn", "e"), None);
     exec(&mut client, &sn, &format!("DROP INDEX {sn}__u__idx_d_e_f"));
     exec(&mut client, &sn, &format!("DROP INDEX {sn}__u__idx_d_e_f_2"));
 
@@ -349,6 +358,10 @@ fn create_index_naming_and_rejections() {
     for (sql, variant, needle) in [
         ("CREATE INDEX _bad ON t(a)", "Plan", "cannot start with '_'"),
         ("DROP INDEX \"__invalid\"", "Plan", "cannot start with '_'"),
+        // Every DROP clause gnitz does not honor, named rather than dropped.
+        ("DROP TABLE t CASCADE", "Unsupported", "CASCADE"),
+        ("DROP TABLE t RESTRICT", "Unsupported", "RESTRICT"),
+        ("DROP TABLE t PURGE", "Unsupported", "PURGE"),
         // An ineligible column is named, on both index surfaces.
         ("CREATE INDEX ON t(s)", "Unsupported", "'s'"),
         ("CREATE INDEX ON t(f)", "Unsupported", "'f'"),

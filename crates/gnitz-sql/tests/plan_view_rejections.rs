@@ -457,8 +457,8 @@ fn projection_and_envelope_rules() {
             ("SELECT t.*, t.* FROM t", "Unsupported", "SELECT item"),
             ("SELECT * FROM t LIMIT 10", "Unsupported", "LIMIT"),
             ("SELECT * EXCEPT (nope) FROM t", "Bind", "nope"),
-            ("SELECT * EXCEPT (g) RENAME (g AS v) FROM t", "Bind", "excluded"),
-            ("SELECT * RENAME (g AS x, g AS y) FROM t", "Bind", "twice"),
+            ("SELECT * EXCEPT (g) RENAME (g AS v) FROM t", "Plan", "excluded"),
+            ("SELECT * RENAME (g AS x, g AS y) FROM t", "Plan", "twice"),
             ("SELECT * RENAME (g AS v) FROM t", "Plan", "duplicate column name"),
             ("SELECT * REPLACE (g + 1 AS g) FROM t", "Unsupported", "REPLACE"),
             ("SELECT * ILIKE 'g%' FROM t", "Unsupported", "ILIKE"),
@@ -614,4 +614,42 @@ fn alter_view_retargets_but_never_onto_itself() {
     assert_rejects(sql, plan(&cat, sql), "Unsupported", "itself");
     let sql = "ALTER VIEW t AS SELECT id, v FROM u";
     assert_rejects(sql, plan(&cat, sql), "Unsupported", "is a table");
+}
+
+/// The statement clauses `plan_view` itself turns away, on both spellings:
+/// the entry point rejects them, not a guard a caller must remember to run.
+#[test]
+fn view_statement_rejected_clause_matrix() {
+    let cat = cat();
+    for (sql, needle) in [
+        ("CREATE TEMPORARY VIEW v AS SELECT id FROM t", "TEMPORARY"),
+        ("CREATE OR ALTER VIEW v AS SELECT id FROM t", "OR ALTER"),
+        // A declared type on a view alias parses only under ClickHouseDialect;
+        // the option list is the half `GenericDialect` reaches.
+        (
+            "CREATE VIEW v (a NOT NULL) AS SELECT id FROM t",
+            "an option list on an output column alias",
+        ),
+        // `ALTER VIEW` retargets a body and carries no option clause, so a `WITH`
+        // it accepted would be silently dropped.
+        (
+            "ALTER VIEW tv WITH (security_barrier = true) AS SELECT id, v FROM t",
+            "WITH options",
+        ),
+    ] {
+        assert_rejects(sql, plan(&cat, sql), "Unsupported", needle);
+    }
+    // The column list is consumed as positional output aliases on both.
+    assert!(plan(&cat, "ALTER VIEW tv (x, y) AS SELECT id, v FROM t").is_ok());
+}
+
+/// An `ALTER VIEW … AS` body reports the statement the user wrote, though its
+/// rejections share `bind_select` with `CREATE VIEW`.
+#[test]
+fn an_alter_view_body_names_alter_view() {
+    let cat = cat();
+    let sql = "ALTER VIEW tv AS SELECT 1";
+    assert_rejects(sql, plan(&cat, sql), "Unsupported", "ALTER VIEW: a view body reads");
+    let sql = "ALTER VIEW tv AS VALUES (1)";
+    assert_rejects(sql, plan(&cat, sql), "Unsupported", "ALTER VIEW only supports SELECT");
 }

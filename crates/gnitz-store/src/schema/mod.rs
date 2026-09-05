@@ -886,7 +886,8 @@ pub fn make_index_schema(source_cols: &[u32], source: &SchemaDescriptor) -> Resu
     let src_pk = source.pk_indices();
     // Shared with the SQL planner's CREATE INDEX pre-check, so the promotion
     // rule and the arity/stride limits can never disagree across the layers.
-    let promoted = gnitz_wire::index_key_types(&col_types, src_pk.len(), source.pk_stride() as usize)?;
+    let promoted = gnitz_wire::index_key_types(&col_types, src_pk.len(), source.pk_stride() as usize)
+        .map_err(|r| r.to_string())?;
     let mut b = DerivedSchema::new();
     // Structural backstop: `index_key_types` above already rejects arity, stride
     // and ineligible types, so this cannot know which rule the builder tripped.

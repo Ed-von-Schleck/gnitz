@@ -14,7 +14,7 @@ pub(crate) fn object_name_ident(name: &sqlparser::ast::ObjectName) -> Option<&sq
 pub(crate) fn extract_name(name: &sqlparser::ast::ObjectName, context: &str) -> Result<String, GnitzSqlError> {
     object_name_ident(name)
         .map(|i| i.value.clone())
-        .ok_or_else(|| GnitzSqlError::Bind(format!("empty name in {context}")))
+        .ok_or_else(|| GnitzSqlError::Plan(format!("empty name in {context}")))
 }
 
 /// True when the projection is one unqualified wildcard that names no output
@@ -670,7 +670,7 @@ pub(crate) fn function_positional_args<'f>(
 pub(crate) fn simple_ident_expr<'a>(e: &'a sqlparser::ast::Expr, context: &str) -> Result<&'a str, GnitzSqlError> {
     match e {
         sqlparser::ast::Expr::Identifier(id) => Ok(&id.value),
-        _ => Err(GnitzSqlError::Bind(format!(
+        _ => Err(GnitzSqlError::Unsupported(format!(
             "{context}: column must be a simple identifier"
         ))),
     }
@@ -806,7 +806,7 @@ impl<'a> WildcardRewrite<'a> {
         }
         // A column that is both excluded and renamed is a contradiction.
         if let Some((f, _)) = me.rename.iter().find(|(f, _)| me.excludes(f)) {
-            return Err(GnitzSqlError::Bind(format!(
+            return Err(GnitzSqlError::Plan(format!(
                 "{context}: SELECT * RENAME names excluded column '{f}'"
             )));
         }
@@ -814,7 +814,7 @@ impl<'a> WildcardRewrite<'a> {
         // would silently keep only the first. Reject rather than drop `y`.
         for (i, (f, _)) in me.rename.iter().enumerate() {
             if me.rename[i + 1..].iter().any(|(g, _)| g.eq_ignore_ascii_case(f)) {
-                return Err(GnitzSqlError::Bind(format!(
+                return Err(GnitzSqlError::Plan(format!(
                     "{context}: SELECT * RENAME names column '{f}' twice"
                 )));
             }

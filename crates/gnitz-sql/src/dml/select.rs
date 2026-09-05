@@ -29,12 +29,12 @@ use crate::dml::group_by::build_fold_shape;
 use crate::dml::plan::{
     bind_where, bound_and_predicate, extract_limit, extract_offset, fetch_bound, Access, ReadBudget,
 };
-use crate::error::GnitzSqlError;
+use crate::error::{reject_if, GnitzSqlError};
 use crate::exec::agg_finish::{agg_finish, FoldShape};
 use crate::exec::order::{read_spec_finish, resolve_out_schema_order, resolve_read_spec_order};
 use crate::validate::{
-    cte_select_body, non_recursive_ctes, reject_unhonored_query_clauses, reject_unhonored_select_clauses,
-    HonoredClauses, HonoredQueryClauses,
+    as_plain_select, cte_body, non_recursive_ctes, reject_unhonored_query_clauses, reject_unhonored_select_clauses,
+    HonoredClauses, QueryEnvelope,
 };
 use crate::SqlResult;
 use gnitz_core::{CatalogSnapshot, GnitzClient, RelDescriptor, Schema, ZSetBatch};
@@ -116,11 +116,7 @@ fn route_select<'q>(
     // ordering sink over the fetched batch, and WITH is inlined below
     // (`cte_passthrough`). Everything else (FETCH, FOR UPDATE/SHARE, SETTINGS,
     // FORMAT, pipe operators) is rejected up front so nothing is silently dropped.
-    reject_unhonored_query_clauses(
-        query,
-        HonoredQueryClauses { with: true, ordering_sink: true },
-        "direct SELECT",
-    )?;
+    reject_unhonored_query_clauses(query, QueryEnvelope::DirectSelect, "direct SELECT")?;
     // The `LIMIT … BY` (ClickHouse per-group) sub-form has no operator here, so
     // reject it rather than silently accept-and-ignore it.
     if let Some(LimitClause::LimitOffset { limit_by, .. }) = &query.limit_clause {
@@ -158,7 +154,7 @@ fn route_select<'q>(
     // derives, and one such CTE rejects the whole query.
     for cte in non_recursive_ctes(query)? {
         let ctx = format!("CTE '{}'", cte.alias.name.value);
-        let cte_select = cte_select_body(cte, &ctx)?;
+        let cte_select = as_plain_select(cte_body(cte, &ctx)?, &ctx)?;
         // Clauses CREATE VIEW cannot serve on a CTE either (DISTINCT, the exotic
         // tail: PREWHERE, TOP, QUALIFY, …) keep their targeted error — the
         // derivation template's CREATE VIEW advice would be false for them.
@@ -401,14 +397,40 @@ impl SpecRead {
 pub fn plan_read(stmt: &Statement, cat: &CatalogSnapshot, schema_name: &str) -> Result<ReadPlan, GnitzSqlError> {
     let query = match stmt {
         Statement::Query(q) => q.as_ref(),
-        Statement::Explain { statement, .. } => match statement.as_ref() {
-            Statement::Query(q) => q.as_ref(),
-            _ => {
-                return Err(GnitzSqlError::Unsupported(
-                    "EXPLAIN describes a SELECT; this statement is not one".to_string(),
-                ))
+        // EXPLAIN describes the plan a query *would* take, so it consumes only
+        // the statement it wraps. `describe_alias` is inert phrasing: `EXPLAIN`,
+        // `DESCRIBE` and `DESC` all introduce the same statement.
+        Statement::Explain {
+            describe_alias: _,
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement,
+            format,
+            options,
+        } => {
+            const CTX: &str = "EXPLAIN";
+            // `analyze` runs the query — the one option that changes what EXPLAIN
+            // does; the rest each ask for a rendering this output shape lacks.
+            reject_if(*analyze, CTX, "ANALYZE")?;
+            reject_if(*verbose, CTX, "VERBOSE")?;
+            reject_if(*query_plan, CTX, "QUERY PLAN")?;
+            reject_if(*estimate, CTX, "ESTIMATE")?;
+            reject_if(format.is_some(), CTX, "FORMAT")?;
+            // `GenericDialect` sets `supports_explain_with_utility_options`, so the
+            // parenthesized Postgres form parses into `options` rather than failing
+            // at parse time.
+            reject_if(options.is_some(), CTX, "the parenthesized option list")?;
+            match statement.as_ref() {
+                Statement::Query(q) => q.as_ref(),
+                _ => {
+                    return Err(GnitzSqlError::Unsupported(
+                        "EXPLAIN describes a SELECT; this statement is not one".to_string(),
+                    ))
+                }
             }
-        },
+        }
         _ => {
             return Err(GnitzSqlError::Unsupported(
                 "plan_read describes a SELECT or the EXPLAIN of one; this statement is neither".to_string(),

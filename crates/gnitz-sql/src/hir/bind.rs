@@ -23,9 +23,8 @@ use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::guards::{join_keys_and_type, JoinKeys};
 use crate::ir::{AggFunc, BExpr, BinOp};
 use crate::validate::{
-    cte_body, non_recursive_ctes, plain_select_body, reject_duplicate_projection_names, reject_float_key,
-    reject_float_key_of, reject_query_envelope_body, reject_unhonored_select_clauses, validate_user_name,
-    HonoredClauses,
+    as_plain_select, cte_body, non_recursive_ctes, reject_duplicate_projection_names, reject_float_key,
+    reject_query_envelope_body, reject_unhonored_select_clauses, validate_user_name, HonoredClauses,
 };
 use gnitz_core::{CatalogSnapshot, ColumnDef, Schema, TypeCode};
 use sqlparser::ast::{
@@ -101,21 +100,54 @@ fn collapse_identity(rel: Rc<RelExpr>) -> (Rc<RelExpr>, Vec<ColumnDef>) {
     (rel, defs)
 }
 
+/// Which view statement is being planned, in the two spellings its rejections
+/// use. Two constants, so no message is built at run time.
+#[derive(Clone, Copy)]
+pub(crate) struct ViewSurface {
+    pub(crate) stmt: &'static str,
+    pub(crate) projection: &'static str,
+}
+
+impl ViewSurface {
+    pub(crate) const CREATE: Self = ViewSurface {
+        stmt: "CREATE VIEW",
+        projection: "CREATE VIEW projection",
+    };
+    pub(crate) const ALTER: Self = ViewSurface {
+        stmt: "ALTER VIEW",
+        projection: "ALTER VIEW projection",
+    };
+}
+
 /// Everything a body bind resolves against: the catalog snapshot, the alias
-/// binder, the `ColId` minter, and the query's CTEs. One value threaded through
-/// the recursion, so a derived table, a set-operation side and a subquery bind
-/// against the same four.
+/// binder, the `ColId` minter, the query's CTEs, and which view statement is
+/// asking. One value threaded through the recursion, so a derived table, a
+/// set-operation side and a subquery bind against the same five.
 pub(crate) struct BindCx<'c, 'b> {
     pub(crate) cat: &'c CatalogSnapshot,
     pub(crate) binder: &'c mut Binder<'b>,
     pub(crate) ids: &'c ColIdGen,
+    /// `CREATE VIEW` or `ALTER VIEW … AS`, so a rejection names the statement
+    /// the user wrote.
+    pub(crate) surface: ViewSurface,
     /// The CTEs bound so far, by canonical (ASCII-lowercase) name.
     ctes: HashMap<String, Cte>,
 }
 
 impl<'c, 'b> BindCx<'c, 'b> {
-    pub(crate) fn new(cat: &'c CatalogSnapshot, binder: &'c mut Binder<'b>, ids: &'c ColIdGen) -> Self {
-        BindCx { cat, binder, ids, ctes: HashMap::new() }
+    pub(crate) fn new(
+        cat: &'c CatalogSnapshot,
+        binder: &'c mut Binder<'b>,
+        ids: &'c ColIdGen,
+        surface: ViewSurface,
+    ) -> Self {
+        BindCx {
+            cat,
+            binder,
+            ids,
+            surface,
+            ctes: HashMap::new(),
+        }
     }
 }
 
@@ -139,9 +171,10 @@ pub(crate) fn bind_body(cx: &mut BindCx<'_, '_>, body: &SetExpr) -> Result<Rc<Re
         SetExpr::Select(select) => bind_select(cx, select),
         SetExpr::SetOperation { op, set_quantifier, left, right } => bind_set_op(cx, *op, *set_quantifier, left, right),
         SetExpr::Query(q) => bind_body(cx, reject_query_envelope_body(q, "parenthesized query")?),
-        _ => Err(GnitzSqlError::Unsupported(
-            "CREATE VIEW only supports SELECT and set operations".to_string(),
-        )),
+        _ => Err(GnitzSqlError::Unsupported(format!(
+            "{} only supports SELECT and set operations",
+            cx.surface.stmt
+        ))),
     }
 }
 
@@ -181,7 +214,7 @@ fn resolve_table_factor(
         )?;
         return Ok((subtree, alias.name.value.clone(), cols));
     }
-    let (name, alias) = extract_table_name_and_alias(factor, "CREATE VIEW")?;
+    let (name, alias) = extract_table_name_and_alias(factor, cx.surface.stmt)?;
     let rel = resolve_relation(cx, &name)?;
     let cols = rel.cols();
     Ok((rel, alias, cols))
@@ -197,16 +230,17 @@ fn resolve_table_factor(
 /// WHERE. `hir::rewrite` is what classifies them into keys.
 fn bind_select(cx: &mut BindCx<'_, '_>, select: &Select) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let Some(first) = select.from.first() else {
-        return Err(GnitzSqlError::Unsupported(
-            "CREATE VIEW: a view body reads at least one relation; this one has no FROM clause".to_string(),
-        ));
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{}: a view body reads at least one relation; this one has no FROM clause",
+            cx.surface.stmt
+        )));
     };
     let grouped = body_is_grouped(select);
     let distinct = select.distinct.is_some();
     reject_unhonored_select_clauses(
         select,
         HonoredClauses::for_body(grouped, distinct).with_windows(),
-        "CREATE VIEW",
+        cx.surface.stmt,
     )?;
 
     // The first FROM relation (a table, a CTE, or a derived table) seeds the
@@ -254,10 +288,10 @@ fn bind_select(cx: &mut BindCx<'_, '_>, select: &Select) -> Result<Rc<RelExpr>, 
     // the lowering cuts the join to a hidden segment.
     let leaf = ScopeLeaf {
         scope: &scope,
-        clause: "CREATE VIEW",
+        clause: cx.surface.stmt,
         sub: SubPolicy::PerKind,
     };
-    bind_body_suffix(cx.ids, select, left, &leaf, "CREATE VIEW projection")
+    bind_body_suffix(cx.ids, select, left, &leaf, cx.surface.projection, grouped)
 }
 
 /// WHERE, then the projection in whichever shape the body carries — the tail
@@ -271,13 +305,14 @@ fn bind_body_suffix(
     select: &Select,
     source: Rc<RelExpr>,
     leaf: &ScopeLeaf<'_>,
-    ctx: &str,
+    ctx: &'static str,
+    grouped: bool,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let mut rel = source;
     if let Some(where_expr) = &select.selection {
         rel = RelExpr::filter(rel, bind_conjuncts(where_expr, leaf)?);
     }
-    if body_is_grouped(select) && select.distinct.is_none() {
+    if grouped && select.distinct.is_none() {
         return bind_grouped_suffix(ids, select, rel, leaf);
     }
     // The window desugar owns its own projection (it must place the SELECT list
@@ -541,7 +576,7 @@ fn bind_linear_subquery_body(
     scope: &JoinScope,
     outer_alias: &str,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    let ids = cx.ids;
+    let (ids, surface) = (cx.ids, cx.surface);
     let sub = RefCell::new(SubCtx {
         cx,
         outer_env: &scope.combined,
@@ -550,10 +585,11 @@ fn bind_linear_subquery_body(
     let bind_sub = |e: &Expr| bind_one_subquery(&mut sub.borrow_mut(), e);
     let leaf = ScopeLeaf {
         scope,
-        clause: "CREATE VIEW",
+        clause: surface.stmt,
         sub: SubPolicy::Bind(&bind_sub),
     };
-    bind_body_suffix(ids, select, get, &leaf, "CREATE VIEW projection")
+    // The `!grouped && !distinct` guard is what routed the body here.
+    bind_body_suffix(ids, select, get, &leaf, surface.projection, false)
 }
 
 /// The resolved inner relation of a subquery: `Filter?(Get)` with the inner-local
@@ -575,8 +611,9 @@ struct InnerResolved<'e> {
 /// the outer relation is rejected (hoisting would be wrong for NOT EXISTS).
 fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_, '_>, subquery: &'e Query) -> Result<InnerResolved<'e>, GnitzSqlError> {
     let (outer_env, outer_alias) = (cx.outer_env, cx.outer_alias);
-    let inner_select = plain_select_body(subquery, "subquery")?;
-    reject_unhonored_select_clauses(inner_select, HonoredClauses::PLAIN, "subquery")?;
+    let ctx = "subquery";
+    let inner_select = as_plain_select(reject_query_envelope_body(subquery, ctx)?, ctx)?;
+    reject_unhonored_select_clauses(inner_select, HonoredClauses::PLAIN, ctx)?;
     if !matches!(classify_from(&inner_select.from), FromShape::SinglePlainRelation) {
         return Err(GnitzSqlError::Unsupported(
             "EXISTS/IN subquery: only a single FROM table without JOINs is supported; compose via views".into(),
@@ -792,7 +829,7 @@ fn bind_quantifier_sub(
     let outer_scope = JoinScope::single(outer_alias, outer_env.to_vec());
     let outer_leaf = ScopeLeaf {
         scope: &outer_scope,
-        clause: "CREATE VIEW",
+        clause: cx.cx.surface.stmt,
         sub: SubPolicy::PerKind,
     };
     let x = bind_structural(left, &outer_leaf)?;
@@ -1226,16 +1263,7 @@ fn resolve_group_cols(
         // The key binds through the FROM leaf, whose rejection names the column but
         // not the clause it was written in.
         let id = pre.column_for(target, leaf).map_err(|e| clause_error("GROUP BY", e))?;
-        // A key the pre-map minted is hidden and has no name the user wrote, so
-        // it is described rather than named; a source column names itself.
-        let def = &hircol_of(&pre.env, id).def;
-        if def.is_hidden {
-            if def.type_code.is_float() {
-                return Err(reject_float_key_of("a float-valued expression", "GROUP BY"));
-            }
-        } else {
-            reject_float_key(def, "GROUP BY")?;
-        }
+        reject_float_key(&hircol_of(&pre.env, id).def, "GROUP BY")?;
         cols.push(id);
     }
     Ok(cols)

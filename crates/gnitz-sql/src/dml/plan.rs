@@ -318,8 +318,10 @@ pub(crate) fn fetch_bound(
 /// return every row, violating the unhonored-clause contract.
 pub(crate) fn extract_limit(query: &sqlparser::ast::Query) -> Result<Option<usize>, GnitzSqlError> {
     let limit = match &query.limit_clause {
-        Some(LimitClause::LimitOffset { limit: Some(e), .. }) => e,
-        Some(LimitClause::OffsetCommaLimit { limit: e, .. }) => e,
+        // Exhaustive (no `..`): `limit_by` is the ClickHouse per-group sub-form,
+        // rejected in `route_select`; a future `sqlparser` field stops the build.
+        Some(LimitClause::LimitOffset { limit: Some(e), offset: _, limit_by: _ }) => e,
+        Some(LimitClause::OffsetCommaLimit { limit: e, offset: _ }) => e,
         _ => return Ok(None),
     };
     expr_usize_literal(limit, "LIMIT").map(Some)
@@ -330,8 +332,8 @@ pub(crate) fn extract_limit(query: &sqlparser::ast::Query) -> Result<Option<usiz
 /// value errors rather than silently skipping nothing.
 pub(crate) fn extract_offset(query: &sqlparser::ast::Query) -> Result<usize, GnitzSqlError> {
     let offset = match &query.limit_clause {
-        Some(LimitClause::LimitOffset { offset: Some(o), .. }) => &o.value,
-        Some(LimitClause::OffsetCommaLimit { offset, .. }) => offset,
+        Some(LimitClause::LimitOffset { offset: Some(o), limit: _, limit_by: _ }) => &o.value,
+        Some(LimitClause::OffsetCommaLimit { offset, limit: _ }) => offset,
         _ => return Ok(0),
     };
     expr_usize_literal(offset, "OFFSET")
