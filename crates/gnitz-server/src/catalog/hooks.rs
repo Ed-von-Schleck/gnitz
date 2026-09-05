@@ -506,7 +506,7 @@ impl CatalogEngine {
 
         if let Some(was_unique) = entry.index_circuit_on(cols.as_slice()).map(|ic| ic.is_unique) {
             if is_unique && !was_unique {
-                self.promote_index_to_unique(owner_id, cols.as_slice())?;
+                self.promote_index_to_unique(owner_id, cols.as_slice());
             }
             return Ok(());
         }
@@ -533,15 +533,7 @@ impl CatalogEngine {
             // — unless the store resumed from a checkpointed manifest, which
             // already holds those rows.
             if !self.ctx.in_rollback() && !self.is_master && !resumed {
-                // Re-checked on a first apply only, exactly as in
-                // `promote_index_to_unique`: replayed and compensated data
-                // passed its check when originally written.
-                let pass = if is_unique && self.ctx.mode() == ApplyMode::Live {
-                    IndexPass::FillUnique
-                } else {
-                    IndexPass::Fill
-                };
-                if let Err(e) = self.backfill_index(owner_id, cols.as_slice(), pass) {
+                if let Err(e) = self.backfill_index(owner_id, cols.as_slice()) {
                     // The circuit was entered before the backfill so the
                     // projection could ingest through it; a failed CREATE INDEX
                     // leaves no circuit.

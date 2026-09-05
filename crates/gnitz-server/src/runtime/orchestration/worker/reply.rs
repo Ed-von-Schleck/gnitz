@@ -21,50 +21,50 @@ pub(super) struct PendingScan {
     pub(super) next_row: usize,
 }
 
-/// The wire flags every frame of a reply train carries. FLAG_CONTINUATION is
-/// always set so the client's "stop on no FLAG_CONTINUATION" loop still
-/// terminates on the frame after the last one; FLAG_SCAN_LAST marks this
-/// worker's terminal frame.
-fn train_flags(server_version: u16, is_last: bool) -> u64 {
+/// The wire flags every frame of a train carries — the convention
+/// `train_has_more` reads back. FLAG_CONTINUATION is always set so the client's
+/// "stop on no FLAG_CONTINUATION" loop still terminates on the frame after the
+/// last one; FLAG_SCAN_LAST marks this worker's terminal frame.
+pub(super) fn train_flags(server_version: u16, is_last: bool) -> u64 {
     let last = if is_last { FLAG_SCAN_LAST } else { 0 };
     gnitz_wire::wire_flags_set_schema_version(FLAG_CONTINUATION | last, server_version)
 }
 
-impl PendingScan {
-    /// The routing and schema fields every frame of this train carries.
-    fn base_frame(&self) -> WireMsg<'_> {
-        WireMsg {
-            target_id: self.route.target_id,
-            client_id: self.route.client_id,
-            // The schema block rides the first frame only.
-            schema_block: (self.next_row == 0)
-                .then(|| self.prebuilt_schema.as_deref().map(Vec::as_slice))
-                .flatten(),
-            ..Default::default()
-        }
+/// One frame of a worker reply, but for its payload.
+fn reply_frame<'a>(route: ReplyRoute, block: Option<&'a [u8]>, server_version: u16, last: bool) -> WireMsg<'a> {
+    WireMsg {
+        target_id: route.target_id,
+        client_id: route.client_id,
+        flags: train_flags(server_version, last),
+        schema_block: block,
+        ..Default::default()
     }
+}
 
-    /// Emit the whole batch as one terminal frame if it fits `budget` — heap and
-    /// all, over the source batch, so no sub-batch is built. `false` leaves the
-    /// train untouched for [`Self::emit_next`] to split.
-    fn emit_if_whole_fits(&mut self, w2m: &W2mWriter, budget: usize) -> bool {
-        let msg = WireMsg {
-            flags: train_flags(self.server_version, true),
-            data: WireData::Whole(Some(&self.batch)),
-            ..self.base_frame()
-        };
-        // A row-less train has no data block to shrink, so it goes at any budget.
-        if !self.batch.is_empty() && msg.size() > budget {
-            return false;
-        }
-        w2m.send_msg(self.route.request_id, &msg);
-        self.next_row = self.batch.len();
-        true
+impl PendingScan {
+    /// This train's next frame, but for its payload and its terminal flag —
+    /// which `emit_next` can only set once it has sized the chunk.
+    fn base_frame(&self) -> WireMsg<'_> {
+        // The schema block rides the first frame only.
+        let block = (self.next_row == 0)
+            .then(|| self.prebuilt_schema.as_deref().map(Vec::as_slice))
+            .flatten();
+        reply_frame(self.route, block, self.server_version, false)
     }
 
     /// Emit this train's next frame, returning whether more remain.
     fn emit_next(&mut self, w2m: &W2mWriter, budget: usize) -> Result<bool, gnitz_wire::WireFault> {
-        if self.next_row == 0 && self.emit_if_whole_fits(w2m, budget) {
+        if self.next_row == 0
+            && emit_whole_if_fits(
+                w2m,
+                self.route,
+                self.prebuilt_schema.as_deref().map(Vec::as_slice),
+                self.server_version,
+                &self.batch,
+                budget,
+            )
+        {
+            self.next_row = self.batch.len();
             return Ok(false);
         }
         let base = self.base_frame();
@@ -117,10 +117,6 @@ impl WorkerProcess {
     /// The block a reply of this [`ReplySchema`] carries, and the schema version
     /// its flags report — which the caller stamps even when the block is
     /// suppressed, so the version cannot ride inside the `Option`.
-    ///
-    /// A `Table` block is fetched only when the client's copy is stale: reading
-    /// the version first is safe because `clear_col_cache_no_bump` drops the
-    /// cache entry *before* the bump, so a surviving entry always matches.
     fn reply_schema_block(
         &mut self,
         tid_key: i64,
@@ -135,12 +131,11 @@ impl WorkerProcess {
                 Some(Rc::new(crate::catalog::encode_schema_block_ipc(s, tid_key as u32))),
                 0,
             ),
-            ReplySchema::Table(s) => {
-                let server_version = self.cat().get_schema_version(tid_key);
-                let block = gnitz_wire::wire_should_include_schema(client_version, server_version)
-                    .then(|| self.cat().schema_wire_entry(tid_key, s).block);
-                (block, server_version)
-            }
+            // The dispatch arm already resolved the descriptor, so the
+            // negotiation never has to look one up and cannot miss.
+            ReplySchema::Table(s) => self
+                .cat()
+                .negotiated_schema_block(tid_key, client_version, |_| Some(*s)),
             ReplySchema::ClientAuthored => (None, 0),
         }
     }
@@ -179,13 +174,40 @@ impl WorkerProcess {
         Ok(())
     }
 
-    /// Reply with `batch` as a train: one frame when it fits, otherwise queued
-    /// and split, a frame per `drain_sal` pass. The one scan-shaped reply path —
-    /// a STRING-column result splits like any other.
+    /// Reply with an **owned** `batch`: one frame when it fits, otherwise queued
+    /// and split, a frame per `drain_sal` pass. A STRING-column result splits
+    /// like any other.
+    ///
+    /// The fit is tested by reference, so the single-frame case never reaches
+    /// `Rc::new`; [`Self::send_shared_scan_response`] is for a caller that
+    /// genuinely shares.
+    pub(super) fn send_scan_response(
+        &mut self,
+        route: ReplyRoute,
+        batch: Batch,
+        schema: ReplySchema<'_>,
+        client_version: u16,
+    ) {
+        let (block, version) = self.reply_schema_block(route.target_id as i64, schema, client_version);
+        if emit_whole_if_fits(
+            &self.w2m_writer,
+            route,
+            block.as_deref().map(Vec::as_slice),
+            version,
+            &batch,
+            self.reply_frame_budget,
+        ) {
+            return;
+        }
+        self.queue_train(route, Rc::new(batch), block, version);
+    }
+
+    /// [`Self::send_scan_response`] for a batch this worker keeps a handle to —
+    /// a cached full-scan snapshot.
     ///
     /// `force_fifo` queues even a fitting reply so this relation reaches the
     /// ring in request order (the multi-scan FIFO contract).
-    pub(super) fn send_scan_response(
+    pub(super) fn send_shared_scan_response(
         &mut self,
         route: ReplyRoute,
         batch: Rc<Batch>,
@@ -193,17 +215,38 @@ impl WorkerProcess {
         client_version: u16,
         force_fifo: bool,
     ) {
-        let (prebuilt_schema, server_version) = self.reply_schema_block(route.target_id as i64, schema, client_version);
-        let mut train = PendingScan {
+        let (block, version) = self.reply_schema_block(route.target_id as i64, schema, client_version);
+        if !force_fifo
+            && emit_whole_if_fits(
+                &self.w2m_writer,
+                route,
+                block.as_deref().map(Vec::as_slice),
+                version,
+                &batch,
+                self.reply_frame_budget,
+            )
+        {
+            return;
+        }
+        self.queue_train(route, batch, block, version);
+    }
+
+    /// Queue a reply that did not go out whole, for `emit_pending_scan_chunk` to
+    /// split one frame per `drain_sal` pass.
+    fn queue_train(
+        &mut self,
+        route: ReplyRoute,
+        batch: Rc<Batch>,
+        prebuilt_schema: Option<Rc<Vec<u8>>>,
+        server_version: u16,
+    ) {
+        self.pending_streams.push_back(PendingScan {
             batch,
             route,
             prebuilt_schema,
             server_version,
             next_row: 0,
-        };
-        if force_fifo || !train.emit_if_whole_fits(&self.w2m_writer, self.reply_frame_budget) {
-            self.pending_streams.push_back(train);
-        }
+        });
     }
 
     /// Emit one frame of the FRONT pending train, popping it once its terminal
@@ -228,20 +271,59 @@ impl WorkerProcess {
     }
 }
 
+/// Emit `batch` whole as one terminal frame if it fits `budget` — heap and all,
+/// over the source batch, so no sub-batch is built. `false` means it must be
+/// split into a train. By reference, so an owned reply can be tested for fit
+/// before anything decides whether it needs an `Rc`.
+fn emit_whole_if_fits(
+    w2m: &W2mWriter,
+    route: ReplyRoute,
+    block: Option<&[u8]>,
+    server_version: u16,
+    batch: &Batch,
+    budget: usize,
+) -> bool {
+    let msg = WireMsg {
+        data: WireData::Whole(Some(batch)),
+        ..reply_frame(route, block, server_version, true)
+    };
+    // A row-less train has no data block to shrink, so it goes at any budget.
+    if !batch.is_empty() && msg.size() > budget {
+        return false;
+    }
+    w2m.send_msg(route.request_id, &msg);
+    true
+}
+
 /// A reply frame one row wide that still exceeds what a client can read. The
 /// row count is already at its floor, so there is nothing left to narrow.
 fn oversized_reply(sz: usize) -> gnitz_wire::WireFault {
     gnitz_wire::WireFault::from(crate::runtime::wire::oversized_frame_message(sz))
 }
 
+/// What one pre-flight frame spends on everything that is not a key: the control
+/// block, the schema block, and the data block's header at zero rows. Charged
+/// against the budget before it is divided into keys, or the frame runs a
+/// kilobyte or two over. The first frame is the widest, so it bounds them all.
+pub(crate) fn preflight_frame_overhead(frame_schema: &SchemaDescriptor, schema_block: &[u8]) -> usize {
+    let framing = reply_frame(ReplyRoute::default(), Some(schema_block), 0, true).size();
+    framing + gnitz_store::storage::wire_block_size(frame_schema, 0, 0)
+}
+
 /// Keys one pre-flight frame may carry: [`unique_preflight_keys_per_frame`]
-/// clamped so the frame's data block stays inside `budget`. Unclamped, that
-/// test-only override reaches `w2m::try_reserve`'s `MAX_W2M_MSG` assertion,
-/// which aborts in release.
-pub(crate) fn preflight_keys_per_frame(frame_schema: &SchemaDescriptor, budget: usize) -> usize {
+/// clamped so the whole frame — `overhead` included — stays inside `budget`.
+/// Unclamped, that test-only override reaches `w2m::try_reserve`'s
+/// `MAX_W2M_MSG` assertion, which aborts in release.
+///
+/// Charging per key over-counts the region alignment `block_size_from` does
+/// once, so the count is conservative; `send_unique_preflight_keys` asserts the
+/// frame it actually builds.
+pub(crate) fn preflight_keys_per_frame(frame_schema: &SchemaDescriptor, budget: usize, overhead: usize) -> usize {
     let per_key = gnitz_store::storage::wire_block_size(frame_schema, 1, 0)
         - gnitz_store::storage::wire_block_size(frame_schema, 0, 0);
-    unique_preflight_keys_per_frame().min(budget / per_key.max(1)).max(1)
+    unique_preflight_keys_per_frame()
+        .min(budget.saturating_sub(overhead) / per_key.max(1))
+        .max(1)
 }
 
 /// Stream the sorted OPK leading-key spans `keys` lends to the master as a train
@@ -251,21 +333,30 @@ pub(crate) fn preflight_keys_per_frame(frame_schema: &SchemaDescriptor, budget: 
 ///
 /// Deliberately NOT `send_scan_response`: that path materializes the reply as
 /// one `Batch`, which is what `keys` exists to avoid — this refills one chunk
-/// batch per frame. It also runs synchronously inside a DDL window, where
-/// blocking on a full ring is wanted rather than the cooperative
-/// one-frame-per-`drain_sal` discipline.
+/// batch per frame.
+///
+/// It also emits the whole train synchronously, which `pending_streams` forbids
+/// inside an exchange wait. Safe here alone: this runs under the catalog WRITE
+/// lock, which excludes `handle_scan` — the only thing that could be holding the
+/// ring slots a blocked `send_msg` would wait behind.
 pub(crate) fn send_unique_preflight_keys(
     w2m_writer: &W2mWriter,
     target_id: u64,
     frame_schema: &SchemaDescriptor,
     request_id: u64,
-    keys_per_frame: usize,
+    budget: usize,
     keys: &mut gnitz_store::storage::KeyProducer,
 ) {
-    debug_assert!(keys_per_frame > 0, "keys_per_frame must be positive");
     // The master's merge decodes every reply block through `decode_wire_ipc`,
     // which verifies no checksum.
     let schema_block = crate::catalog::encode_schema_block_ipc(frame_schema, target_id as u32);
+    // Measured off the block this train actually ships, so what is charged and
+    // what is emitted cannot drift; the assertion in the loop is what says so.
+    let keys_per_frame = preflight_keys_per_frame(
+        frame_schema,
+        budget,
+        preflight_frame_overhead(frame_schema, &schema_block),
+    );
 
     // Reusable chunk batch: filled, encoded, and cleared per frame, sized up
     // front to exactly one frame's fill.
@@ -291,6 +382,13 @@ pub(crate) fn send_unique_preflight_keys(
             schema_block: is_first.then_some(schema_block.as_slice()),
             ..Default::default()
         };
+        // Over `budget` only at the one-key floor, where there is nothing left
+        // to narrow — the same rule `PendingScan::emit_next` states.
+        debug_assert!(
+            msg.size() <= budget || n <= 1,
+            "a pre-flight frame of {n} keys is {} bytes over its {budget}-byte budget",
+            msg.size().saturating_sub(budget),
+        );
         w2m_writer.send_msg(request_id, &msg);
         is_first = false;
         if is_last {

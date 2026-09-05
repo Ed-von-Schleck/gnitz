@@ -1,8 +1,10 @@
 //! The worker reply-train contract and its consumers.
 //!
 //! A worker answers a scan-shaped request with a *train*: one or more frames on
-//! the same request id. `parse_train_header` is the single definition of where a
-//! train ends; everything else here is a consumer of it —
+//! the same request id. [`train_has_more`] is the single definition of where a
+//! train ends — `ExchangeAccumulator` reads its own frames through it too, from
+//! an owned decode rather than a slot. Everything else here is a consumer of
+//! `parse_train_header` —
 //! [`drain_index_scan`] (decode each frame in worker order),
 //! [`forward_scan_slots`] / [`drain_scan_train`] (pass frames to a client
 //! without decoding), and [`expect_single_frame`] (reject a train outright).
@@ -29,13 +31,6 @@ pub(super) fn scan_decode_err(w: usize, what: &str, e: &'static str) -> WorkerFa
 /// emits nothing more for the request. The error therefore MUST stop the drain:
 /// keying `has_more` off `FLAG_SCAN_LAST` alone would read the fault frame's `0`
 /// flags as "more coming" and block forever in `await_scan_slot`.
-///
-/// A healthy frame WITHOUT `FLAG_CONTINUATION` is a length-1 train: the
-/// single-frame `send_response` reply shape carries no train flags at all, so
-/// "no continuation flag" must read as terminal. Every train producer (worker
-/// scan/gather/index-seek replies, unique pre-flight frames) sets
-/// `FLAG_CONTINUATION` on every frame and `FLAG_SCAN_LAST` on the last, a
-/// one-frame train included.
 pub(super) fn parse_train_header(
     slot: &W2mSlot,
     w: usize,
@@ -45,8 +40,21 @@ pub(super) fn parse_train_header(
     if let Some(e) = super::worker_error(w, what, &ctrl) {
         return Err(e);
     }
-    let has_more = ctrl.flags & FLAG_SCAN_LAST == 0 && ctrl.flags & FLAG_CONTINUATION != 0;
+    let has_more = train_has_more(ctrl.flags);
     Ok((ctrl, has_more))
+}
+
+/// Whether more frames follow the one carrying `flags` — the one definition of
+/// where a train ends.
+///
+/// Every producer sets `FLAG_CONTINUATION` on every frame and `FLAG_SCAN_LAST`
+/// on the last, a one-frame train included: worker scan/gather/index-seek
+/// replies, unique pre-flight frames, and a worker's exchange partition. So a
+/// frame with neither flag is terminal — the single-frame `send_response` shape,
+/// and `send_error`'s fault frame, whose `0` flags would otherwise read as
+/// "more coming" and block the drain forever.
+pub(crate) fn train_has_more(flags: u64) -> bool {
+    flags & FLAG_SCAN_LAST == 0 && flags & FLAG_CONTINUATION != 0
 }
 
 /// Enforce the single-frame reply contract on `slot`: a fault frame or corrupt

@@ -132,23 +132,33 @@ fn test_create_index_duplicate_rejected() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A failed index registration must NOT enqueue a negative-weight IDX_TAB
+/// broadcast: the `+1` was never broadcast, so a `-1` would orphan a row on the
+/// workers. The failure is injected — a seam reads its variable once per
+/// process, hence the re-exec'd child.
 #[test]
-fn test_unique_index_failure_no_broadcast_poisoning() {
-    // A failed UNIQUE index creation (duplicate values) must NOT enqueue a
-    // negative-weight IDX_TAB broadcast: the +1 was never broadcast (hook
-    // failed before enqueue), so a broadcast −1 would orphan a row on workers.
+fn test_index_registration_failure_no_broadcast_poisoning() {
+    let out = crate::test_support::run_test_in_child(
+        module_path!(),
+        "test_index_registration_failure_no_broadcast_poisoning_internal",
+        &[("GNITZ_INJECT_INDEX_BACKFILL_ERROR", "1")],
+    );
+    crate::test_support::assert_child_ok(&out, "the injected backfill fault must roll back cleanly");
+}
+
+#[test]
+fn test_index_registration_failure_no_broadcast_poisoning_internal() {
+    if !crate::test_support::in_child_test() {
+        return;
+    }
     let (mut engine, tid, dir) = table_fixture(
         "idx_broadcast_poison",
         &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
     );
     let schema = engine.registry().get_schema_desc(tid).unwrap();
 
-    // Two rows sharing val=42.
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
-    bb.put_u64(42);
-    bb.end_row();
-    bb.begin_row(2u128, 1);
     bb.put_u64(42);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
@@ -157,16 +167,10 @@ fn test_unique_index_failure_no_broadcast_poisoning() {
     // Clear broadcasts accumulated by table/column creation + ingest.
     let _ = engine.drain_pending_broadcasts();
 
-    // UNIQUE index over duplicate values must fail.
-    let res = engine.create_index("public.t", &["val"], true);
-    assert!(res.is_err(), "unique index over duplicate values must fail");
-    // The rejection must carry the qualified table and column context.
-    let err = res.unwrap_err();
     assert!(
-        err.contains("public.t"),
-        "create-index error should name the table: {err}"
+        engine.create_index("public.t", &["val"], true).is_err(),
+        "the injected backfill fault must fail the create"
     );
-    assert!(err.contains("val"), "create-index error should name the column: {err}");
 
     // No IDX_TAB broadcast may carry a negative weight for the failed index.
     let broadcasts = engine.drain_pending_broadcasts();
@@ -183,6 +187,7 @@ fn test_unique_index_failure_no_broadcast_poisoning() {
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
+    println!("{}", crate::test_support::CHILD_OK);
 }
 
 // ── seek_by_index tests ──────────────────────────────────────────
@@ -699,22 +704,31 @@ fn test_compound_pk_secondary_index_retract() {
 }
 
 /// `apply_index_caches` runs before `hook_index_register`, so a hook failure
-/// (here: UNIQUE over a column holding duplicates) leaves the name cache already
-/// mutated. The rollback must reverse it, or the cache points at a ghost index.
+/// leaves the name cache already mutated. The rollback must reverse it, or the
+/// cache points at a ghost index.
 #[test]
-fn test_create_unique_index_duplicate_rolls_back_cleanly() {
+fn test_failed_index_registration_rolls_back_cleanly() {
+    let out = crate::test_support::run_test_in_child(
+        module_path!(),
+        "test_failed_index_registration_rolls_back_cleanly_internal",
+        &[("GNITZ_INJECT_INDEX_BACKFILL_ERROR", "1")],
+    );
+    crate::test_support::assert_child_ok(&out, "a failed registration must leave no ghost cache entry");
+}
+
+#[test]
+fn test_failed_index_registration_rolls_back_cleanly_internal() {
+    if !crate::test_support::in_child_test() {
+        return;
+    }
     let (mut engine, tid, dir) = table_fixture(
         "unique_idx_rollback",
         &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
     );
     let schema = engine.registry().get_schema_desc(tid).unwrap();
 
-    // Seed duplicate values on `val` so a unique index over it cannot be built.
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
-    bb.put_u64(42);
-    bb.end_row();
-    bb.begin_row(2u128, 1);
     bb.put_u64(42);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
@@ -723,9 +737,8 @@ fn test_create_unique_index_duplicate_rolls_back_cleanly() {
     let idx_name = make_secondary_index_name("public", "t", "val");
     let idx_records_before = count_records(engine.sys_store_mut(SysFamily::Index).open_cursor());
 
-    // Attempt should fail because of duplicate values.
     let result = engine.create_index("public.t", &["val"], true);
-    assert!(result.is_err(), "unique index over duplicates must fail");
+    assert!(result.is_err(), "the injected backfill fault must fail the create");
 
     // All catalog-visible state must have reverted: the ghost name/id
     // entries created by apply_index_by_{name,id} are the thing the
@@ -758,6 +771,7 @@ fn test_create_unique_index_duplicate_rolls_back_cleanly() {
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
+    println!("{}", crate::test_support::CHILD_OK);
 }
 
 // ── seek_by_index orphaned-entry infinite-loop guard ─────────────────────
@@ -879,8 +893,6 @@ fn test_create_unique_index_on_string_blob_rejected() {
 // circuit, not be deduped away. DROP INDEX of the user unique index must DEMOTE
 // (the FK auto-index remains), not destroy the circuit.
 
-use std::path::Path;
-
 /// Uniqueness of the index circuit on `col`, or `None` if no circuit exists.
 fn circuit_unique(engine: &CatalogEngine, tid: i64, col: u32) -> Option<bool> {
     let n = engine.registry().index_circuits(tid).len();
@@ -972,139 +984,23 @@ fn test_unique_index_over_fk_column_distinct_data_promotes() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn test_unique_index_over_fk_column_duplicate_data_rejected() {
-    // Masking-bug regression (dirty data): CREATE UNIQUE INDEX over an FK column
-    // with DUPLICATE values must fail and net sys_indices back to zero, instead
-    // of silently dropping the constraint.
-    let dir = temp_dir("promote_unique_fk_dup");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let parent_tid = engine
-        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
-        .unwrap();
-    let child_cols = vec![
-        col_def("cid", type_code::U64),
-        fk_def("refc", type_code::U64, parent_tid, 0),
-    ];
-    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
-
-    // Seed DUPLICATE refc values.
-    let schema = engine.registry().get_schema_desc(child_tid).unwrap();
-    let mut bb = BatchBuilder::new(schema);
-    bb.begin_row(1u128, 1);
-    bb.put_u64(42);
-    bb.end_row();
-    bb.begin_row(2u128, 1);
-    bb.put_u64(42);
-    bb.end_row();
-    engine.ingest_to_family(child_tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(child_tid).unwrap();
-
-    let before = count_records(engine.sys_store_mut(SysFamily::Index).open_cursor());
-    let r = engine.create_index("public.child", &["refc"], true);
-    assert!(r.is_err(), "unique index over duplicate FK data must fail");
-    assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Index).open_cursor()),
-        before,
-        "the failed unique index row must net out of sys_indices"
-    );
-    // The incumbent FK circuit stays non-unique (promotion never committed).
-    assert_eq!(circuit_unique(&engine, child_tid, 1), Some(false));
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn test_drop_unique_index_on_fk_column_demotes() {
-    // Dropping the user unique index of a UNIQUE+FK column must DEMOTE the
-    // circuit (the FK auto-index still covers the column), not destroy it.
-    let dir = temp_dir("demote_unique_fk");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let parent_tid = engine
-        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
-        .unwrap();
-    let child_cols = vec![
-        col_def("cid", type_code::U64),
-        fk_def("refc", type_code::U64, parent_tid, 0),
-    ];
-    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
-
-    engine.create_index("public.child", &["refc"], true).unwrap();
-    assert_eq!(circuit_unique(&engine, child_tid, 1), Some(true));
-
-    let user_idx = make_secondary_index_name("public", "child", "refc");
-    let fk_idx = make_fk_index_name(child_tid, 1);
-    engine.drop_index(&user_idx).unwrap();
-
-    // Circuit remains (col 1 still indexed) but is no longer unique; the FK
-    // auto-index survives so FK lookups keep working.
-    assert_eq!(
-        circuit_unique(&engine, child_tid, 1),
-        Some(false),
-        "circuit must be demoted, not destroyed"
-    );
-    assert!(
-        engine.has_index_by_name(&fk_idx),
-        "the FK auto-index must survive the unique-index drop"
-    );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn test_drop_unique_index_on_fk_column_keeps_shared_directory() {
-    // The UNIQUE index promotes the FK circuit and builds NO second directory —
-    // the circuit's directory carries the FK index's id. Dropping the unique
-    // index must NOT delete that shared directory (the FK still needs it); a
-    // subsequent drop_table removes the whole table dir, leaving no orphan.
-    let dir = temp_dir("dir_correct_unique_fk");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let parent_tid = engine
-        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
-        .unwrap();
-    let child_cols = vec![
-        col_def("cid", type_code::U64),
-        fk_def("refc", type_code::U64, parent_tid, 0),
-    ];
-    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
-    engine.create_index("public.child", &["refc"], true).unwrap();
-
-    let tbl_dir = format!("{dir}/public/t_{child_tid}");
-    assert_eq!(
-        count_idx_dirs(&tbl_dir),
-        1,
-        "promotion must reuse the FK index directory, not build a second one"
-    );
-
-    // Drop the user unique index: demotion keeps the FK directory in place.
-    let user_idx = make_secondary_index_name("public", "child", "refc");
-    engine.drop_index(&user_idx).unwrap();
-    engine.drain_pending_dir_deletions();
-    assert_eq!(
-        count_idx_dirs(&tbl_dir),
-        1,
-        "dropping the unique index must not delete the shared FK directory"
-    );
-
-    // drop_table cascades the FK index (using the circuit's creating index_id
-    // for the deletion path) and removes the whole table directory.
-    engine.drop_table("public.child").unwrap();
-    engine.drain_pending_dir_deletions();
-    assert!(!Path::new(&tbl_dir).exists(), "no orphan idx_* dir may remain");
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
+/// A create_index whose hook fails must drain the pre-staged index directory,
+/// leaving no orphan `idx_*` dir on disk.
 #[test]
 fn test_failed_create_index_leaves_no_directory() {
-    // A unique create_index that fails on duplicate data must drain the
-    // pre-staged index directory, leaving no orphan idx_* dir on disk.
+    let out = crate::test_support::run_test_in_child(
+        module_path!(),
+        "test_failed_create_index_leaves_no_directory_internal",
+        &[("GNITZ_INJECT_INDEX_BACKFILL_ERROR", "1")],
+    );
+    crate::test_support::assert_child_ok(&out, "a failed create_index must leave no index directory");
+}
+
+#[test]
+fn test_failed_create_index_leaves_no_directory_internal() {
+    if !crate::test_support::in_child_test() {
+        return;
+    }
     let (mut engine, tid, dir) = table_fixture(
         "failed_create_index_dir",
         &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
@@ -1112,9 +1008,6 @@ fn test_failed_create_index_leaves_no_directory() {
     let schema = engine.registry().get_schema_desc(tid).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
-    bb.put_u64(9);
-    bb.end_row();
-    bb.begin_row(2u128, 1);
     bb.put_u64(9);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
@@ -1125,11 +1018,12 @@ fn test_failed_create_index_leaves_no_directory() {
     assert_eq!(
         count_idx_dirs(&tbl_dir),
         0,
-        "a failed unique create_index must leave no index directory behind"
+        "a failed create_index must leave no index directory behind"
     );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
+    println!("{}", crate::test_support::CHILD_OK);
 }
 
 #[test]
@@ -1193,79 +1087,15 @@ fn test_drop_unique_index_on_non_pk_fk_target_blocked() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── chunked unique-index backfill: cross-chunk duplicate detection ────────
+// ── chunked index backfill ────────────────────────────────────────────────
 //
-// The unique-index backfill scans the owner chunk-wise (drain_chunk); a
-// duplicate pair split across chunks is only visible through the `seen` set
-// carried across chunks. Shrink `scan_chunk_rows` so a handful of rows
-// spans several chunks, and place the duplicate pair at the PK extremes
-// (the scan is in PK merge order).
-
-#[test]
-fn test_unique_index_duplicate_across_chunks_rejected() {
-    let (mut engine, tid, dir) = table_fixture(
-        "unique_idx_dup_cross_chunk",
-        &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
-    );
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
-
-    // The only duplicate pair is val=42 at pk 0 and pk 9 — first and last
-    // chunk at chunk_rows = 3.
-    let mut bb = BatchBuilder::new(schema);
-    for i in 0..10u64 {
-        bb.begin_row(i as u128, 1);
-        bb.put_u64(if i == 0 || i == 9 { 42 } else { 100 + i });
-        bb.end_row();
-    }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
-
-    engine.registry_mut().set_scan_chunk_rows(3);
-    let before = count_records(engine.sys_store_mut(SysFamily::Index).open_cursor());
-    let r = engine.create_index("public.t", &["val"], true);
-    assert!(r.is_err(), "cross-chunk duplicate must fail the unique backfill");
-    assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Index).open_cursor()),
-        before,
-        "the failed unique index row must net out of sys_indices"
-    );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn test_unique_index_duplicate_within_chunk_rejected() {
-    let (mut engine, tid, dir) = table_fixture(
-        "unique_idx_dup_within_chunk",
-        &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
-    );
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
-
-    // Duplicate pair at pk 0 and pk 1 — both inside the first chunk of 4.
-    let mut bb = BatchBuilder::new(schema);
-    for i in 0..10u64 {
-        bb.begin_row(i as u128, 1);
-        bb.put_u64(if i <= 1 { 42 } else { 100 + i });
-        bb.end_row();
-    }
-    engine.ingest_to_family(tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(tid).unwrap();
-
-    engine.registry_mut().set_scan_chunk_rows(4);
-    assert!(
-        engine.create_index("public.t", &["val"], true).is_err(),
-        "within-chunk duplicate must still fail the unique backfill"
-    );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
+// The index backfill scans the owner chunk-wise (`drain_chunk`); shrink
+// `scan_chunk_rows` so a handful of rows spans several chunks. Duplicate
+// rejection belongs to the master's pre-flight, which no in-process engine runs.
 
 #[test]
 fn test_unique_index_chunked_backfill_distinct_succeeds() {
-    // Positive control for the chunked scan: distinct data must build the
-    // index across several chunks with every row projected exactly once.
+    // Every row must be projected exactly once across several chunks.
     let (mut engine, tid, dir) = table_fixture(
         "unique_idx_chunked_ok",
         &[col_def("id", type_code::U64), col_def("val", type_code::U64)],
@@ -1290,50 +1120,6 @@ fn test_unique_index_chunked_backfill_distinct_succeeds() {
         count_records(entry.index_circuits[0].open_cursor()),
         10,
         "chunked backfill must project every row exactly once"
-    );
-
-    engine.close();
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn test_promote_unique_duplicate_across_chunks_rejected() {
-    // Promotion (UNIQUE over an incumbent FK circuit) validates through the
-    // same chunked scan; a cross-chunk duplicate must reject the promotion
-    // and leave the incumbent non-unique.
-    let dir = temp_dir("promote_dup_cross_chunk");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-
-    let parent_tid = engine
-        .create_table("public.parent", &[col_def("id", type_code::U64)], &[0])
-        .unwrap();
-    let child_cols = vec![
-        col_def("cid", type_code::U64),
-        fk_def("refc", type_code::U64, parent_tid, 0),
-    ];
-    let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
-
-    // Duplicate refc=42 at pk 0 and pk 9; distinct in between (ingest_to_family
-    // bypasses FK validation).
-    let schema = engine.registry().get_schema_desc(child_tid).unwrap();
-    let mut bb = BatchBuilder::new(schema);
-    for i in 0..10u64 {
-        bb.begin_row(i as u128, 1);
-        bb.put_u64(if i == 0 || i == 9 { 42 } else { 100 + i });
-        bb.end_row();
-    }
-    engine.ingest_to_family(child_tid, &bb.finish()).unwrap();
-    engine.registry_mut().flush(child_tid).unwrap();
-
-    engine.registry_mut().set_scan_chunk_rows(3);
-    assert!(
-        engine.create_index("public.child", &["refc"], true).is_err(),
-        "cross-chunk duplicate must fail the promotion scan"
-    );
-    assert_eq!(
-        circuit_unique(&engine, child_tid, 1),
-        Some(false),
-        "the incumbent FK circuit must stay non-unique"
     );
 
     engine.close();

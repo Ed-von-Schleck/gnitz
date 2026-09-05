@@ -4,7 +4,12 @@
 //! store itself is the registry's — opened by `add_index`, rehomed by `rehome`.
 
 use super::*;
-use gnitz_store::schema::key::PkBuf;
+use gnitz_store::foundation::fault::Seam;
+
+/// `GNITZ_INJECT_INDEX_BACKFILL_ERROR`: fail a live index registration inside its
+/// staged directory, for the rollback tests. One-shot, so the retry that proves
+/// the rollback left nothing blocking still succeeds.
+static INDEX_BACKFILL_ERROR: Seam = Seam::new("GNITZ_INJECT_INDEX_BACKFILL_ERROR");
 
 impl CatalogEngine {
     /// Locally retract an index registration whose +1 was applied but never
@@ -26,12 +31,10 @@ impl CatalogEngine {
 
     /// Fill the circuit on `cols` of `owner_id` from the owner's local slice.
     /// The circuit is already entered — the projection ingests through it.
-    pub(in crate::catalog) fn backfill_index(
-        &mut self,
-        owner_id: i64,
-        cols: &[u32],
-        pass: IndexPass,
-    ) -> Result<(), String> {
+    pub(in crate::catalog) fn backfill_index(&mut self, owner_id: i64, cols: &[u32]) -> Result<(), String> {
+        if INDEX_BACKFILL_ERROR.take_once() {
+            return Err("injected index backfill fault".to_string());
+        }
         // The relation filled here is the *index store* (`owner_id` is the
         // indexed relation, a durable base table). Refused unless empty, in every
         // build: an index that resumed from its checkpoint already holds these
@@ -48,7 +51,7 @@ impl CatalogEngine {
                 "backfill_index into a non-empty index (owner {owner_id}): would double-count"
             ));
         }
-        self.stream_index_projection(owner_id, &[PkColList::from_slice(cols)], pass)
+        self.stream_index_projection(owner_id, &[PkColList::from_slice(cols)])
     }
 
     /// Worker-boot index rebuild: fill every index store that neither resumed
@@ -76,31 +79,29 @@ impl CatalogEngine {
         let mut rebuilt = 0usize;
         for (owner_id, targets) in worklist {
             rebuilt += targets.len();
-            self.stream_index_projection(owner_id, &targets, IndexPass::Fill)?;
+            self.stream_index_projection(owner_id, &targets)?;
         }
         Ok(rebuilt)
     }
 
     /// One chunked scan of `owner_id`, each chunk projected into every target
-    /// circuit's index layout and handled as `pass` says. Peak memory is
-    /// O(chunk × row_width) plus, when checking, one `PkBuf` per scanned key.
-    fn stream_index_projection(&mut self, owner_id: i64, targets: &[PkColList], pass: IndexPass) -> Result<(), String> {
+    /// circuit's index layout and ingested through it. Peak memory is
+    /// O(chunk × row_width).
+    ///
+    /// No uniqueness check, for a fresh unique index or a promotion alike:
+    /// `validate_unique_index_create` ran the global pre-flight before the
+    /// IDX_TAB `+1`, and a partition-local check cannot see a duplicate
+    /// straddling two workers' slices.
+    fn stream_index_projection(&mut self, owner_id: i64, targets: &[PkColList]) -> Result<(), String> {
         if targets.is_empty() {
             return Ok(());
         }
-        let check_dups = pass != IndexPass::Fill;
         let chunk_rows = self.registry.scan_chunk_rows();
-        let mut seen: Vec<rustc_hash::FxHashSet<PkBuf>> = if check_dups {
-            targets.iter().map(|_| rustc_hash::FxHashSet::default()).collect()
-        } else {
-            Vec::new()
-        };
-
         let Some(mut handle) = self.registry.open_store_cursor(owner_id) else {
             return Ok(());
         };
         while let Some(chunk) = handle.drain_chunk(chunk_rows) {
-            for (ti, cols) in targets.iter().enumerate() {
+            for cols in targets {
                 let ic = self
                     .registry
                     .index_circuit_for_cols(owner_id, cols.as_slice())
@@ -109,40 +110,19 @@ impl CatalogEngine {
                 if projected.is_empty() {
                     continue;
                 }
-                // The duplicate check applies to the full composite leading span.
-                if check_dups && projected_chunk_has_dup_keys(&projected, ic.key_spec.key_size(), &mut seen[ti]) {
-                    return Err(self.unique_create_dup_err(owner_id, cols.as_slice()));
-                }
-                if pass != IndexPass::VerifyUnique {
-                    ic.ingest_owned_batch(projected)
-                        .map_err(|e| format!("index backfill: ingest failed (owner {owner_id}): {e}"))?;
-                }
+                ic.ingest_owned_batch(projected)
+                    .map_err(|e| format!("index backfill: ingest failed (owner {owner_id}): {e}"))?;
             }
         }
         Ok(())
     }
 
-    /// Promote the existing index circuit on `col_idx` to unique, after verifying
-    /// the committed base rows contain no duplicate keys. Used when a UNIQUE index
-    /// registers over a column that already has a circuit (an FK auto-index, or a
-    /// prior non-unique index): the per-column dedup keeps one circuit, so the
-    /// uniqueness is folded into the incumbent — no second index store is built
-    /// (the index schema does not depend on `is_unique`; uniqueness is the flag
-    /// plus the duplicate check, not a different storage layout). Empty base table
-    /// → pure flag flip. The verification scan runs on a first apply only: replayed
-    /// and compensated data passed its duplicate check when originally written,
-    /// and under compensation a spurious `Err` is a fatal abort. The flag flip
-    /// below runs unconditionally.
-    pub(in crate::catalog) fn promote_index_to_unique(
-        &mut self,
-        owner_id: i64,
-        col_indices: &[u32],
-    ) -> Result<(), String> {
-        if self.ctx.mode() == ApplyMode::Live {
-            self.stream_index_projection(owner_id, &[PkColList::from_slice(col_indices)], IndexPass::VerifyUnique)?;
-        }
+    /// Fold uniqueness into the incumbent circuit on `col_idx` — an FK
+    /// auto-index or a prior non-unique index the per-column dedup kept. No
+    /// second store: the index schema does not depend on `is_unique`, and the
+    /// duplicate check is the master's pre-flight, already run.
+    pub(in crate::catalog) fn promote_index_to_unique(&mut self, owner_id: i64, col_indices: &[u32]) {
         self.registry.set_index_circuit_uniqueness(owner_id, col_indices, true);
-        Ok(())
     }
 
     // -- FK auto-index creation -------------------------------------------
@@ -200,59 +180,3 @@ impl CatalogEngine {
         Ok(())
     }
 }
-
-/// What one `stream_index_projection` pass does with each projected chunk. The
-/// boot rebuild only fills: its rows passed the unique check when first
-/// written, and a slice-local check cannot see a duplicate straddling two
-/// workers' slices.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(in crate::catalog) enum IndexPass {
-    /// Ingest through the circuit.
-    Fill,
-    /// Ingest, refusing a duplicate leading key — a live CREATE UNIQUE INDEX.
-    FillUnique,
-    /// Refuse a duplicate leading key and ingest nothing — a UNIQUE promotion
-    /// of an already-filled circuit.
-    VerifyUnique,
-}
-
-/// True if a positive-weight row in a projected index chunk shares its leading
-/// index key (the first `key_size` bytes of the index PK) with another row of
-/// this chunk or any earlier chunk recorded in `seen`.
-///
-/// Compound-PK index layout: index PK is `(indexed_key…, src_pk…)`. Uniqueness
-/// applies to the leading `indexed_key` span only — two rows differing only in
-/// their source-PK suffix represent two source rows sharing the indexed value.
-/// For a composite `UNIQUE (a, b, …)` the span is the sum of every promoted
-/// column's width and can exceed 16 bytes, so the dedup token is a `PkBuf`
-/// holding the raw span (a stack key, no per-row heap allocation), not a
-/// truncating `u128`.
-///
-/// `seen` is caller-owned because the scan is chunked: cross-chunk duplicates
-/// are only visible through state carried across calls. Shared by
-/// `backfill_index` (fresh unique index) and `promote_index_to_unique`
-/// (UNIQUE folded into an existing circuit) so both gate on the same predicate.
-fn projected_chunk_has_dup_keys(projected: &Batch, key_size: usize, seen: &mut rustc_hash::FxHashSet<PkBuf>) -> bool {
-    for row in 0..projected.len() {
-        let weight = projected.get_weight(row);
-        if weight <= 0 {
-            continue;
-        }
-        // Base-table scan chunks are consolidated: weight ≥ 2 is the same
-        // (PK, payload) row inserted multiple times — that many live
-        // instances of the same index key. NULL-valued rows never reach
-        // here (batch_project_index skips them).
-        if weight > 1 {
-            return true;
-        }
-        let pk_bytes = projected.get_pk_bytes(row);
-        if !seen.insert(PkBuf::from_bytes(&pk_bytes[..key_size])) {
-            return true;
-        }
-    }
-    false
-}
-
-#[cfg(test)]
-#[path = "tests/index_backfill.rs"]
-mod tests;

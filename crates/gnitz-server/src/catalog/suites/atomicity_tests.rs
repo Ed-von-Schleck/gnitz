@@ -387,12 +387,24 @@ fn test_idx_tab_dup_name_leaves_clean_state() {
 // Part 2d — CREATE INDEX backfill failure must not leak the index directory
 // ---------------------------------------------------------------------------
 
+/// `Table::new` creates the index directory before the hook can fail, so a
+/// failed registration would orphan it — but `with_staged_dir` reclaims a stage
+/// whose closure failed, with no drain from the caller.
 #[test]
-fn test_create_unique_index_backfill_fail_no_dir_leak() {
-    // `Table::new` creates the index directory before backfill_index checks for
-    // duplicates, so a failed backfill would orphan it. The hook stages the
-    // directory first, and `with_staged_dir` reclaims a stage whose closure
-    // failed — no caller has to remember to drain.
+fn test_create_index_backfill_fail_no_dir_leak() {
+    let out = crate::test_support::run_test_in_child(
+        module_path!(),
+        "test_create_index_backfill_fail_no_dir_leak_internal",
+        &[("GNITZ_INJECT_INDEX_BACKFILL_ERROR", "1")],
+    );
+    crate::test_support::assert_child_ok(&out, "a failed backfill must reclaim its staged directory");
+}
+
+#[test]
+fn test_create_index_backfill_fail_no_dir_leak_internal() {
+    if !crate::test_support::in_child_test() {
+        return;
+    }
     let dir = temp_dir("atomicity_idx_dir_leak");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
@@ -400,12 +412,8 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
     let tid = engine.create_table("public.leaktest", &cols, &[0]).unwrap();
     let schema = engine.registry().get_schema_desc(tid).unwrap();
 
-    // Ingest two rows that share the same 'val' — unique index backfill must fail.
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
-    bb.put_u64(42u64);
-    bb.end_row();
-    bb.begin_row(2u128, 1);
     bb.put_u64(42u64);
     bb.end_row();
     engine.ingest_to_family(tid, &bb.finish()).unwrap();
@@ -417,7 +425,7 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
     let idx_dir = format!("{owner_dir}/idx_{expected_idx_id}");
 
     let result = engine.create_index("public.leaktest", &["val"], true);
-    assert!(result.is_err(), "unique index with duplicate values must fail");
+    assert!(result.is_err(), "the injected backfill fault must fail the create");
 
     // Reclaimed by the failing stage itself, with no drain from the caller.
     assert!(
@@ -439,6 +447,7 @@ fn test_create_unique_index_backfill_fail_no_dir_leak() {
     );
 
     let _ = fs::remove_dir_all(&dir);
+    println!("{}", crate::test_support::CHILD_OK);
 }
 
 // ---------------------------------------------------------------------------

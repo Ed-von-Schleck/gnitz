@@ -1,76 +1,44 @@
-//! Worker exchange-wait re-entry: the defer-then-replay machinery
-//! (`do_exchange_wait` inline dispatch loop + `dispatch_deferred`;
-//! deferred ticks replay in `replay_deferred`).
+//! The worker's half of an exchange round: publishing its partition
+//! (`publish_exchange`), waiting out the master's relay (`do_exchange_wait`),
+//! and the defer-then-replay machinery that wait needs — `dispatch_deferred`
+//! here, `replay_deferred` at top level.
 
 use super::*;
 
 impl WorkerProcess {
+    /// Apply what the exchange wait deferred to this point — a catalog mutation
+    /// — now that the DAG has returned and before the ACK that implies it.
     pub(super) fn dispatch_deferred(&mut self) {
-        for ddl in std::mem::take(&mut self.exchange.deferred) {
-            if let Err(e) = self.cat().ddl_sync(ddl.target_id, ddl.batch) {
-                // A failed deferred DDL permanently diverges this worker's
-                // catalog from the master — silently wrong results. Fail-stop,
-                // same as the main-dispatch DdlSync path and the deferred-decode
-                // failure branch.
-                self.fatal_shutdown(&format!(
-                    "deferred DdlSync application failed for tid={}: {}",
-                    ddl.target_id, e
-                ));
-            }
+        for req in std::mem::take(&mut self.exchange.deferred) {
+            self.handle_request(req);
         }
-        // See the DdlSync dispatch arm: the master owns physical directory
-        // removal for the shared tree; the worker only discards its queue.
-        self.cat().discard_pending_dir_deletions();
     }
 
     /// Send FLAG_EXCHANGE to the master and block until its ExchangeRelay
-    /// for `view_id` comes back on the SAL. Messages that arrive mid-wait are
-    /// dispatched inline — handle_push, handle_tick — so ACKs flow back through
-    /// the master reactor in their natural arrival order, routed by req_id.
-    /// Relays whose view_id does not match the innermost wait are parked in
-    /// `pending_relays`; the next nested wait to ask for them will pick them
-    /// up without re-reading the SAL.
+    /// for `view_id` comes back on the SAL, returning it with the backfill
+    /// decision the master stamped onto it. Messages arriving mid-wait are
+    /// dispatched per [`in_eval`]; a relay for another `(view_id, source_id)`
+    /// parks in `pending_relays`.
+    ///
+    /// `pad` is this chunk's backfill pad bit; a steady-state tick passes
+    /// `false` and ignores the (then always CONTINUE == 0) decision.
     pub(super) fn do_exchange_wait(
         &mut self,
         view_id: i64,
         batch: &Batch,
         source_id: i64,
         tick_request_id: u64,
-    ) -> Batch {
-        let schema = batch.schema;
-        // During a backfill, stamp this chunk's pad bit onto the FLAG_EXCHANGE so
-        // the master can AND it across workers and decide termination. Outside a
-        // backfill (backfill_pad == None) the field stays 0.
-        let pad_bit = if self.exchange.backfill_pad == Some(true) {
-            BACKFILL_PAD_BIT
-        } else {
-            0
-        };
-        // Unchecksummed: this frame goes out on the W2M ring, which the master
-        // reads back through `decode_wire_ipc` — it verifies nothing, so an
-        // XXH3 over the block would be computed and never read.
-        let schema_block = crate::catalog::encode_schema_block_ipc(&schema, view_id as u32);
-        let msg = ipc::WireMsg {
-            target_id: view_id as u64,
-            flags: FLAG_EXCHANGE,
-            seek_pk: source_id as u128,
-            seek_col_idx: pad_bit,
-            request_id: tick_request_id,
-            schema_block: Some(&schema_block),
-            data: ipc::WireData::Whole(Some(batch)),
-            ..Default::default()
-        };
-        self.w2m_writer.send_msg(tick_request_id, &msg);
+        pad: bool,
+    ) -> (Batch, u64) {
+        self.publish_exchange(view_id, batch, source_id, tick_request_id, pad);
 
         let want_key = (view_id, source_id);
-        let ctx = DispatchContext::InEval { relay_wait: want_key };
 
         // A relay parked by an earlier, differently-keyed wait satisfies this one
         // without touching the SAL. Only checked here: once the drain loop below
-        // starts, a matching relay short-circuits out of `dispatch` instead.
-        if let Some((b, decision)) = self.exchange.pending_relays.remove(&want_key) {
-            self.consume_backfill_decision(decision);
-            return b;
+        // starts, a matching relay short-circuits out of `dispatch_in_eval`.
+        if let Some(hit) = self.exchange.pending_relays.remove(&want_key) {
+            return hit;
         }
 
         loop {
@@ -83,10 +51,86 @@ impl WorkerProcess {
             }
 
             while let Some((msg, wire)) = self.next_sal_message() {
-                if let Some(batch) = self.dispatch(ctx, &msg, wire) {
-                    return batch;
+                if let Some(hit) = self.dispatch_in_eval(want_key, &msg, wire) {
+                    return (hit.batch, hit.decision);
                 }
             }
         }
+    }
+
+    /// Publish this worker's exchange partition as a train of frames inside
+    /// [`ipc::FRAME_CAP`] — the bound every other producer already holds itself
+    /// to. What a frame carries is [`exchange_frame`]'s; this only cuts rows.
+    fn publish_exchange(&self, view_id: i64, batch: &Batch, source_id: i64, req_id: u64, pad: bool) {
+        let block = crate::catalog::encode_schema_block_ipc(&batch.schema, view_id as u32);
+        let frame = |last| exchange_frame(view_id, source_id, req_id, &block, last, pad);
+
+        // Whole and unsplit off the source batch — no sub-batch, no per-row
+        // German-string walk — which is the path a real payload takes: a
+        // 65,536-row chunk at 100 B/row is 6.5 MB against a 64 MiB frame.
+        let whole = ipc::WireMsg {
+            data: ipc::WireData::Whole(Some(batch)),
+            ..frame(true)
+        };
+        if whole.size() <= ipc::FRAME_CAP {
+            self.w2m_writer.send_msg(req_id, &whole);
+            return;
+        }
+
+        // An empty partition fits above, so this loop has rows, and
+        // `wire_chunk_within` yields at least one — so it terminates.
+        let overhead = frame(false).size();
+        let mut next_row = 0;
+        while next_row < batch.len() {
+            let chunk = batch.wire_chunk_within(next_row, overhead, ipc::FRAME_CAP);
+            let size = overhead + chunk.wire_byte_size();
+            if size > ipc::FRAME_CAP {
+                // One row too wide to frame. A reply faults its client with
+                // `oversized_reply`; an exchange has no client to fault.
+                gnitz_fatal_abort!(
+                    "worker: exchange row {} of view_id={} encodes to {} bytes, past the {} byte frame cap",
+                    next_row,
+                    view_id,
+                    size,
+                    ipc::FRAME_CAP,
+                );
+            }
+            next_row += chunk.len();
+            self.w2m_writer.send_msg(
+                req_id,
+                &ipc::WireMsg {
+                    data: ipc::WireData::Whole(Some(&chunk)),
+                    ..frame(next_row == batch.len())
+                },
+            );
+        }
+    }
+}
+
+/// One frame of a worker's exchange train, but for its payload. The schema block
+/// is not optional: the master decodes a ring slot with no hint, and rejects
+/// `FLAG_HAS_DATA` without `FLAG_HAS_SCHEMA` by aborting. `last` gates the
+/// round's bookkeeping, so a partial train cannot complete a round.
+fn exchange_frame<'a>(
+    view_id: i64,
+    source_id: i64,
+    req_id: u64,
+    schema_block: &'a [u8],
+    last: bool,
+    pad: bool,
+) -> ipc::WireMsg<'a> {
+    ipc::WireMsg {
+        target_id: view_id as u64,
+        // An exchange carries no schema version, so its train flags are the bare
+        // convention `train_has_more` reads back.
+        flags: FLAG_EXCHANGE | super::reply::train_flags(0, last),
+        seek_pk: source_id as u128,
+        // The backfill pad bit the master ANDs across workers. A pad round is
+        // empty, hence a single terminal frame, so it still rides the frame that
+        // counts.
+        seek_col_idx: if last && pad { BACKFILL_PAD_BIT } else { 0 },
+        request_id: req_id,
+        schema_block: Some(schema_block),
+        ..Default::default()
     }
 }

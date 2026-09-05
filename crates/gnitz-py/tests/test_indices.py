@@ -983,11 +983,10 @@ class TestIndexReadBarrier:
 #
 # CREATE UNIQUE INDEX over a table that ALREADY holds rows must validate
 # uniqueness globally (across all workers) on the master BEFORE broadcasting
-# the index. Uniqueness is global, but the per-worker backfill only sees one
-# partition: without the master pre-flight a within-partition duplicate would
-# fatally _exit every affected worker, and a cross-partition duplicate would be
-# silently accepted. Distinct from TestIndexIntegrity, which creates the index
-# FIRST and exercises the INSERT-time enforcement path.
+# the index. It is the only uniqueness check there is — the per-worker backfill
+# runs none — so without it every duplicate, within a partition or across two,
+# would be silently accepted. Distinct from TestIndexIntegrity, which creates
+# the index FIRST and exercises the INSERT-time enforcement path.
 # ---------------------------------------------------------------------------
 
 class TestCreateUniqueIndexValidation:
@@ -995,8 +994,7 @@ class TestCreateUniqueIndexValidation:
         """Many rows share one non-PK value across consecutive PKs, so several
         land on the SAME worker (pigeonhole over the worker count). CREATE
         UNIQUE INDEX must return a clean error — and crucially every worker must
-        stay alive and answer a follow-up scan. (Pre-fix: each worker holding a
-        within-partition duplicate _exits, wedging the cluster.)"""
+        stay alive and answer a follow-up scan."""
         sn = _sn()
         client.create_schema(sn)
         try:
@@ -1009,8 +1007,12 @@ class TestCreateUniqueIndexValidation:
             rows = ", ".join(f"({pk}, 42)" for pk in range(1, 51))
             client.execute_sql(f"INSERT INTO t VALUES {rows}", schema_name=sn)
 
-            with pytest.raises(gnitz.GnitzError):
+            with pytest.raises(gnitz.GnitzError) as exc:
                 client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=sn)
+            # The rejection names the qualified table and the column — the
+            # pre-flight is the only producer of this message.
+            assert f"{sn}.t" in str(exc.value), exc.value
+            assert "val" in str(exc.value), exc.value
 
             # Cluster survived: a full-table scan fans out to every worker and
             # must return all 50 rows.

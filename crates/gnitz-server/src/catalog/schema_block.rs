@@ -110,4 +110,26 @@ impl CatalogEngine {
         self.set_schema_wire_block(tid, entry.clone());
         entry
     }
+
+    /// The schema block a reply to a client at `client_version` carries, and the
+    /// version its flags report. The one place that negotiation is written — the
+    /// master reply path and the worker's both come here.
+    ///
+    /// `descriptor` is consulted only on a miss (as is `None` from it), so a
+    /// warm reply pays no descriptor copy and no hash probe. Reading the version
+    /// first is safe because [`Self::clear_col_cache_no_bump`] drops the cache
+    /// entry *before* the bump, so a surviving entry always matches it.
+    pub(crate) fn negotiated_schema_block(
+        &mut self,
+        tid: i64,
+        client_version: u16,
+        descriptor: impl FnOnce(&Self) -> Option<SchemaDescriptor>,
+    ) -> (Option<Rc<Vec<u8>>>, u16) {
+        let server_version = self.get_schema_version(tid);
+        if !gnitz_wire::wire_should_include_schema(client_version, server_version) {
+            return (None, server_version);
+        }
+        let block = descriptor(self).map(|s| self.schema_wire_entry(tid, &s).block);
+        (block, server_version)
+    }
 }

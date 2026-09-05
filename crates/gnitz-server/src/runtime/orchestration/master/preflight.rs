@@ -181,7 +181,7 @@ struct PreflightKeyStream {
     count: usize,
     /// Cursor into the current frame's keys.
     row: usize,
-    /// Current frame is non-terminal: status 0 and no FLAG_SCAN_LAST.
+    /// Current frame is non-terminal, per `train_has_more`.
     has_more: bool,
 }
 
@@ -705,8 +705,10 @@ impl MasterDispatcher {
     /// leading-key spans, sorts them locally (byte-lexicographic), and streams
     /// the SORTED spans back; the master runs a streaming k-way merge
     /// (`merge_index_scan`) whose single adjacent-equal check catches both
-    /// within-partition and cross-partition duplicates that no per-worker
-    /// `backfill_index` can see. Master memory is `O(num_workers)` plus the
+    /// within-partition and cross-partition duplicates. It is the ONLY
+    /// uniqueness check: `backfill_index` runs no local one — a partition-local
+    /// check cannot see a cross-partition duplicate, and its only way to reject
+    /// would be to fatally `_exit` the worker. Master memory is `O(num_workers)` plus the
     /// (≤ cap) filter seed — never the table's distinct-key cardinality. The OPK
     /// leading-key span is lossless and injective for every type a unique index
     /// permits (`index_key_type` rejects floats/STRING/BLOB), so byte equality ⟺

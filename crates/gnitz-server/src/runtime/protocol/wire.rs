@@ -12,8 +12,10 @@ use gnitz_wire::{FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
 /// frame reaches a client verbatim, so this is the only readable size there; for
 /// a reply the master consumes instead — `HasPk`, `Gather`, `SeekByIndex`, the
 /// unique pre-flight — it turns a would-be `try_reserve` abort into an error at
-/// the producer. `MAX_W2M_MSG` is the ring's structural ceiling, never the
-/// operative limit; the server's *ingress* limit is the wire constant itself.
+/// the producer. It bounds the one non-reply a worker emits too, its exchange
+/// partition (`publish_exchange`), so nothing the engine sends is unbounded.
+/// `MAX_W2M_MSG` is the ring's structural ceiling, never the operative limit;
+/// the server's *ingress* limit is the wire constant itself.
 pub(crate) const FRAME_CAP: usize = gnitz_wire::MAX_FRAME_PAYLOAD_SERVER;
 const _: () = assert!(FRAME_CAP < super::w2m::MAX_W2M_MSG as usize);
 

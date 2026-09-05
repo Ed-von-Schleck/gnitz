@@ -266,8 +266,7 @@ impl CatalogEngine {
     }
 
     /// The ephemeral checkpoint round: force-persist every view's operator-trace
-    /// tables and output stores, stamped with this engine's resume generation,
-    /// and return that stamp.
+    /// tables and output stores, stamped with this engine's resume generation.
     ///
     /// Two global passes — traces first, then outputs — so that any output at
     /// generation `G` implies that view's own traces are already durable at `G`.
@@ -280,14 +279,26 @@ impl CatalogEngine {
     ///
     /// The caller latches the generation first: the server off the `FlushEph`
     /// message, an embedder through [`Self::bump_checkpoint_generation`].
-    pub(crate) fn flush_ephemeral_round(&mut self) -> Result<u64, String> {
+    pub(crate) fn flush_ephemeral_round(&mut self) -> Result<(), String> {
         let generation = self.registry.resume_generation();
         let CatalogEngine { registry, dag, .. } = self;
         let traces = dag.collect_ephemeral_trace_tables(registry);
         gnitz_store::storage::flush_barrier(traces, gnitz_store::storage::FlushRound::Ephemeral(generation))
             .map_err(|e| format!("ephemeral trace flush: {e}"))?;
         registry.flush_ephemeral_outputs(generation)?;
-        Ok(generation)
+        Ok(())
+    }
+
+    /// Unlink the manifest of every store [`Self::flush_ephemeral_round`]
+    /// publishes, so the next open peeks `None` and erases those shards instead
+    /// of resuming them. Its inverse, over the same two collections in the same
+    /// order — which is why the two live together.
+    pub(crate) fn unlink_derived_manifests(&mut self) {
+        let CatalogEngine { registry, dag, .. } = self;
+        let traces = dag.collect_ephemeral_trace_tables(registry);
+        for t in traces.into_iter().chain(registry.collect_ephemeral_output_tables()) {
+            t.unlink_manifest();
+        }
     }
 
     /// Flush every store this engine owns that a restart could read back — each

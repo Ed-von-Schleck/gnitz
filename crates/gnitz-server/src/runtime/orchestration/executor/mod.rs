@@ -213,16 +213,6 @@ impl Shared {
         &self.dispatcher
     }
 
-    /// Return (or build and cache) the encoded schema wire block and current
-    /// schema version for `target_id`, or `None` when `target_id` names no
-    /// relation. The block is stable for the lifetime of the table schema — it is
-    /// invalidated alongside col_names whenever DDL modifies the table.
-    fn get_schema_wire_block(&self, target_id: i64) -> Option<(Rc<Vec<u8>>, u16)> {
-        let schema = self.cat().registry().get_schema_desc(target_id)?;
-        let e = self.cat_mut().schema_wire_entry(target_id, &schema);
-        Some((e.block, e.version))
-    }
-
     fn table_lock(&self, tid: i64) -> Rc<AsyncRwLock> {
         let mut locks = self.table_locks.borrow_mut();
         if let Some(l) = locks.get(&tid) {
@@ -896,8 +886,9 @@ async fn relay_loop(shared: Rc<Shared>) {
                     fit = SalFit::Transient;
                 }
                 match fit {
-                    // The relay is written whole — there is no chunked form — so
-                    // a group over capacity is one no checkpoint can deliver.
+                    // Written whole. Chunking it as the W2M up-leg is chunked
+                    // would not help: a parked worker cannot consume a partial
+                    // train, so every chunk would be SAL-resident at once.
                     SalFit::Terminal => {
                         gnitz_fatal_abort!("exchange relay exceeds the SAL outright; no checkpoint can deliver it")
                     }
@@ -1774,9 +1765,13 @@ fn build_resolve_reply(
     // Clone the `Rc` block out of the cache so no `cat()` borrow outlives it.
     // The reply always carries the block: a resolving client holds no descriptor
     // to validate a version against.
-    let (schema_block, server_version) = shared
-        .get_schema_wire_block(tid)
+    let schema = shared
+        .cat()
+        .registry()
+        .get_schema_desc(tid)
         .ok_or_else(|| format!("table {tid} not found"))?;
+    let entry = shared.cat_mut().schema_wire_entry(tid, &schema);
+    let (schema_block, server_version) = (entry.block, entry.version);
     Ok(encode_response_buffer(ipc::WireMsg {
         target_id: tid as u64,
         client_id,
@@ -1886,20 +1881,19 @@ async fn read_lock(
     Some((g, kind))
 }
 
-/// Where a **master-authored** reply negotiates its schema block — the worker's
-/// twin is `reply_schema_block`. Compare the client's cached `client_version`
-/// against the server's and fetch the block only on a miss: a warm reply, the
-/// whole steady state, would otherwise pay a `SchemaDescriptor` copy, a hash
-/// probe and an `Rc` clone/drop to discard it.
+/// A **master-authored** reply's schema block, through the one negotiation
+/// ([`CatalogEngine::negotiated_schema_block`]) the worker's `reply_schema_block`
+/// also takes. This side resolves the descriptor from the registry, and takes a
+/// `tid` naming no relation as "no block" — a scan of one has nothing to reply
+/// about anyway.
 ///
 /// `(server_version, block)` — one version, not two: the effective client version
 /// handed to the workers is `server_version` either way, a cache hit meaning the
 /// client's already equals it.
 fn schema_block_for_reply(shared: &Rc<Shared>, tid: i64, client_version: u16) -> (u16, Option<Rc<Vec<u8>>>) {
-    let server_version = shared.cat().get_schema_version(tid);
-    let block = gnitz_wire::wire_should_include_schema(client_version, server_version)
-        .then(|| shared.get_schema_wire_block(tid).map(|(block, _)| block))
-        .flatten();
+    let (block, server_version) = shared
+        .cat_mut()
+        .negotiated_schema_block(tid, client_version, |c| c.registry().get_schema_desc(tid));
     (server_version, block)
 }
 

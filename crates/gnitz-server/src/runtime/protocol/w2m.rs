@@ -58,8 +58,13 @@ pub(crate) const MAX_W2M_MSG: u64 = 1 << 28;
 ///
 /// The region is mapped whole, so a ring that sweeps all of `DCAP`
 /// every lap holds ~1 GiB of resident shmem per worker for a transport whose
-/// live occupancy is a few KiB. The lever is `MAX_W2M_MSG`, which is this large
-/// because `worker/exchange.rs` publishes an exchange partition uncapped.
+/// live occupancy is a few KiB. The lever is `MAX_W2M_MSG` — the geometry assert
+/// below makes the region a function of it, so the two move together.
+///
+/// Nothing needs either this large any more: every producer bounds its frames at
+/// `FRAME_CAP`. Lowering them buys resident shared memory, unmeasured so far,
+/// against a capacity that is also the flow-control window (`InFlightState`
+/// releases only a front-consecutive prefix).
 pub(crate) const W2M_REGION_SIZE: usize = 1 << 30;
 // One maximum-size message must always fit past its own SKIP pad: the wrap
 // branch fires only when `total > room_to_end`, so `pad < total <= slot_stride(MAX)`.

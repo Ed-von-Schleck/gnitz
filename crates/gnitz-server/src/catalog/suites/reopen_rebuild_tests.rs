@@ -151,11 +151,9 @@ fn index_rebuilds_once_view_defers_on_reopen() {
 // chunk size cannot be shrunk before open() (the backfill runs during shard
 // replay, before any test code can touch the engine), so exercise the real
 // boundary with a base table one chunk plus a remainder wide. The secondary
-// index must rebuild across that boundary exactly once. Also covers the boot
-// index path with the unique duplicate check gated off (replay is not live),
-// since the rebuild itself must still ingest every chunk. (The catalog layer
-// never fills a view at all; `index_rebuilds_once_view_defers_on_reopen` pins
-// that.)
+// index must rebuild across that boundary exactly once, ingesting every chunk.
+// (The catalog layer never fills a view at all;
+// `index_rebuilds_once_view_defers_on_reopen` pins that.)
 
 #[test]
 fn index_rebuilds_across_chunk_boundary() {
@@ -385,7 +383,8 @@ fn checkpointed_traced_view(dir: &str) -> i64 {
 
     engine.record_topology(1).unwrap();
     let g = engine.bump_checkpoint_generation().unwrap();
-    assert_eq!(engine.flush_ephemeral_round().unwrap(), g);
+    engine.flush_ephemeral_round().unwrap();
+    assert_eq!(engine.registry().resume_generation(), g);
 
     engine.close();
     vid
@@ -441,7 +440,8 @@ fn uncompiled_view_traces_invalidate_the_view() {
     // a view no tick sweep reaches.
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let g2 = engine.bump_checkpoint_generation().unwrap();
-    assert_eq!(engine.flush_ephemeral_round().unwrap(), g2);
+    engine.flush_ephemeral_round().unwrap();
+    assert_eq!(engine.registry().resume_generation(), g2);
     engine.close();
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
