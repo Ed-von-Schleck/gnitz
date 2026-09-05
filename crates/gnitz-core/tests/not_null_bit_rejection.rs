@@ -5,38 +5,34 @@
 //!
 //! `ZSetBatch::nulls` is a `pub Vec<u64>`, and the client-side
 //! `ZSetBatch::validate` that `Session::submit` runs is skippable by anyone who
-//! encodes a frame and submits it raw — it lives in the client process, so it
-//! is a convenience, never a trust boundary. The bit it lets through is one the
-//! engine's two camps read
-//! differently: `is_null` (index projection, FK probe) and
+//! encodes a frame and writes it to the socket themselves — it lives in the
+//! client process, so it is a convenience, never a trust boundary. The bit it
+//! lets through is one the engine's two camps read differently: `is_null`
+//! (index projection, FK probe) and
 //! `compare_by_group_cols` believe the bit, while the evaluator's
 //! `nullable_slots`, a projection's `NullPerm` and the `FixedIntNonnull` row
 //! comparator believe the schema. This test drives the frame the client library
 //! would never build.
 
-use gnitz_core::protocol::{encode_message_parts, ColumnDef, Schema, TypeCode};
+use gnitz_core::protocol::{
+    encode_message_parts, hello_handshake, parse_response, ClientTransport, ColumnDef, Schema, TypeCode,
+};
 use gnitz_core::TableProps;
-use gnitz_core::{BatchAppender, GnitzClient, PkTuple, Reply, Request, Session, ZSetBatch, FLAG_PUSH};
+use gnitz_core::{BatchAppender, GnitzClient, PkTuple, ZSetBatch, FLAG_PUSH};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 
-/// Ship `batch` as a PUSH, bypassing `Session::submit`'s client-side
-/// `ZSetBatch::validate` by handing the spine an already-encoded frame — byte
-/// for byte the one `submit` would have built for a cold push.
-fn hostile_push(session: &mut Session, tid: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, String> {
-    let parts = encode_message_parts(
-        tid,
-        session.client_id,
-        FLAG_PUSH,
-        &PkTuple::EMPTY,
-        0,
-        Some((schema, batch)),
-    );
-    match session
-        .round_trip(Request::Uncorrelated(parts.segments().concat()))
-        .map_err(|e| e.to_string())?
-    {
-        Reply::Train(t) => Ok(t.terminal.seek_pk as u64),
-        _ => Err("a raw frame completes as a single train".to_string()),
+/// Ship `batch` as a PUSH, bypassing the client-side `ZSetBatch::validate` that
+/// `Session::submit` runs by writing the encoded frame to the socket itself —
+/// byte for byte the one `submit` would have built for a cold push. A scripted
+/// peer, so it needs no spine at all.
+fn hostile_push(t: &mut ClientTransport, tid: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, String> {
+    let parts = encode_message_parts(tid, 0xB0BA, FLAG_PUSH, &PkTuple::EMPTY, 0, Some((schema, batch)));
+    t.send_framed_iov(&parts.segments()).map_err(|e| e.to_string())?;
+    let buf = t.recv_framed().map_err(|e| e.to_string())?;
+    let (msg, _) = parse_response(&buf, None).map_err(|e| e.to_string())?;
+    match msg.error_text {
+        Some(text) => Err(text),
+        None => Ok(msg.seek_pk as u64),
     }
 }
 
@@ -69,8 +65,10 @@ fn a_null_bit_on_a_not_null_column_is_rejected_at_the_client_boundary() {
     };
 
     // A second, raw connection: `GnitzClient`'s own session is private, and a
-    // pre-encoded frame is what walks past the validator.
-    let (mut raw, _lsn) = Session::connect(srv.sock_path()).unwrap();
+    // pre-encoded frame written straight to the socket is what walks past the
+    // validator.
+    let mut raw = ClientTransport::connect(srv.sock_path()).unwrap();
+    hello_handshake(&mut raw).unwrap();
 
     // The same rows, unmodified, are accepted — so the rejection below is about
     // the bit and nothing else.

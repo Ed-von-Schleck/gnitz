@@ -7,7 +7,7 @@
 
 use std::os::fd::RawFd;
 
-use gnitz_core::protocol::{hello_handshake, send_control, ClientTransport};
+use gnitz_core::protocol::{encode_message_parts, hello_handshake, ClientTransport};
 use gnitz_core::{BatchAppender, ColumnDef, GnitzClient, Schema, TableProps, TypeCode, ZSetBatch};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 
@@ -66,7 +66,8 @@ fn slow_scan_client_is_evicted_after_deadline() {
     let mut slow = ClientTransport::connect(srv.sock_path()).expect("connect");
     set_tiny_rcvbuf(slow.as_raw_fd());
     hello_handshake(&mut slow).expect("hello");
-    send_control(&mut slow, table_id, 0xB0BA, 0, 0, 0, &[]).expect("send scan");
+    let scan = encode_message_parts(table_id, 0xB0BA, 0, &gnitz_core::PkTuple::EMPTY, 0, None);
+    slow.send_framed(&scan.ctrl).expect("send scan");
 
     let evicted = peer_hung_up_within(slow.as_raw_fd(), 8000);
     drop(slow);

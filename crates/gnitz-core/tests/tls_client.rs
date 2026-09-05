@@ -15,9 +15,18 @@ use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
 use gnitz_core::protocol::{
-    encode_message_parts, hello_handshake, parse_response, send_control, ClientTransport, FLAG_CONTINUATION,
-    STATUS_ERROR,
+    encode_message_parts, hello_handshake, parse_response, ClientTransport, FLAG_CONTINUATION, STATUS_ERROR,
 };
+
+/// One control-only frame, blocking until it is on the wire.
+fn send_control(
+    t: &mut ClientTransport,
+    target_id: u64,
+    client_id: u64,
+    flags: u64,
+) -> Result<(), gnitz_core::ProtocolError> {
+    t.send_framed(&encode_message_parts(target_id, client_id, flags, &PkTuple::EMPTY, 0, None).ctrl)
+}
 use gnitz_core::TableProps;
 use gnitz_core::{
     wire_flags_set_conflict_mode, ColData, ColumnDef, GnitzClient, PkColumn, PkTuple, Schema, TypeCode,
@@ -355,7 +364,7 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
             send_push(&mut t, tid, 0xF00D, push_flags, &schema, &batch).unwrap();
         }
         // The scan whose response (~18 MB) exceeds the shrunken buffers.
-        send_control(&mut t, tid, 0xF00D, 0, 0, 0, &[]).unwrap();
+        send_control(&mut t, tid, 0xF00D, 0).unwrap();
 
         // Now read everything: n ACKs, then the scan train.
         for _ in 0..n_pushes {
@@ -424,7 +433,7 @@ fn inbound_cap_breach_closes_stalled_connection() {
         hello_handshake(&mut t).unwrap();
         // Ask for the scan, then never read: the train stalls, pinning
         // connection_loop in its guarded send.
-        send_control(&mut t, tid, 0xB0BA, 0, 0, 0, &[]).unwrap();
+        send_control(&mut t, tid, 0xB0BA, 0).unwrap();
 
         // Pipeline ~80 MB of pushes; the pump queues them until the 64 MiB
         // cap trips and the recv side tears the connection down. The rows
@@ -480,7 +489,7 @@ fn stalled_scan_client_is_evicted_by_send_deadline() {
         let mut t = ClientTransport::connect(&target).unwrap();
         set_small_bufs(t.as_raw_fd());
         hello_handshake(&mut t).unwrap();
-        send_control(&mut t, tid, 0xB0BA, 0, 0, 0, &[]).unwrap();
+        send_control(&mut t, tid, 0xB0BA, 0).unwrap();
         // Never read. Allow a few deadlines of slack.
         assert!(
             eviction_observed_within(&mut t, 8_000),

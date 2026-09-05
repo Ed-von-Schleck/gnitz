@@ -3,20 +3,20 @@
 //! What the master refuses to write into its own catalog.
 //!
 //! `GnitzClient` canonicalizes and validates every name it stores, but
-//! `Session::push_ddl_txn` is public — so the rules the engine's caches, its
+//! `GnitzClient::push_ddl_txn` bypasses that — so the rules the engine's caches, its
 //! qualified-name keys and `hook_schema_dir`'s filesystem path depend on are
 //! enforced at the master's trust boundary, and these tests drive that boundary
 //! directly with hand-built bundles.
 
-use gnitz_core::connection::{COL_TAB, IDX_TAB, SCHEMA_TAB, SEQ_TAB, TABLE_TAB};
 use gnitz_core::protocol::{BatchAppender, ColumnDef, TypeCode, ZSetBatch};
 use gnitz_core::types::sys_schema;
-use gnitz_core::{GnitzClient, Session, TableProps};
+use gnitz_core::{GnitzClient, TableProps};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::sys_rows::{
     write_circuit_node_row, write_col_tab_row, write_idx_tab_row, write_schema_tab_row, write_table_tab_row,
     CircuitNodeRow, IdxTabRow, SchemaTabRow, TableTabRow,
 };
+use gnitz_wire::{COL_TAB, IDX_TAB, SCHEMA_TAB, SEQ_TAB, TABLE_TAB};
 
 /// One SCHEMA_TAB batch registering `(schema_id, name)`.
 fn schema_row(schema_id: u64, name: &str) -> ZSetBatch {
@@ -109,8 +109,11 @@ fn a_table(client: &mut GnitzClient, schema: &str) -> u64 {
         .unwrap()
 }
 
-fn session(srv: &ServerHandle) -> Session {
-    Session::connect(srv.sock_path()).expect("connect").0
+/// The catalog escape hatch: `GnitzClient::push_ddl_txn` is the same bundle the
+/// SQL layer's own DDL goes out as, submitted without its canonicalization, so
+/// these tests drive the master's trust boundary rather than the client's.
+fn session(srv: &ServerHandle) -> GnitzClient {
+    GnitzClient::connect(srv.sock_path()).expect("connect")
 }
 
 /// A schema name is the one catalog name the engine interpolates into a

@@ -3,37 +3,57 @@ use super::*;
 /// Every non-OK status maps to its own error, and a `STATUS_ERROR` whose text
 /// is absent or blank falls back to the default rather than surfacing a blank
 /// one — the warm-push guard's rejection must stay legible.
+///
+/// Driven through a real encoded control frame, not a hand-built `Message`:
+/// which statuses reach the classifier carrying text is the decoder's decision,
+/// and a hand-built one can express a state the decoder never produces.
 #[test]
 fn check_response_classifies_every_status() {
-    let msg = |status, error_text: Option<&str>| Message {
-        status,
-        seek_pk: 77,
-        error_text: error_text.map(str::to_owned),
-        ..Message::default()
-    };
-    let err = |status, text| check_response(msg(status, text)).expect_err("a non-OK status is an error");
+    use crate::protocol::message::{encode_control_block, parse_response_frame};
+    use crate::protocol::Header;
 
-    assert!(matches!(err(STATUS_SCHEMA_MISMATCH, None), ClientError::SchemaMismatch));
-    assert!(matches!(err(STATUS_DELTA_EXPIRED, None), ClientError::DeltaExpired));
+    let classify = |status: u32, text: &str| {
+        let hdr = Header {
+            status,
+            target_id: 0,
+            client_id: 0,
+            flags: 0,
+            seek_pk: 77,
+            seek_col_idx: 0,
+            request_id: 0,
+        };
+        let frame = encode_control_block(&hdr, text, &[]);
+        let mut msg = parse_response_frame(&frame, None)
+            .expect("a control frame parses")
+            .message;
+        check_response(&mut msg).map(|()| msg)
+    };
+    let err = |status, text: &str| classify(status, text).expect_err("a non-OK status is an error");
+
+    assert!(matches!(err(STATUS_SCHEMA_MISMATCH, ""), ClientError::SchemaMismatch));
+    assert!(matches!(err(STATUS_DELTA_EXPIRED, ""), ClientError::DeltaExpired));
     assert!(matches!(
-        err(STATUS_TXN_CONFLICT, None),
+        err(STATUS_TXN_CONFLICT, ""),
         ClientError::TxnConflict { fresh_basis: 77 }
     ));
-    assert!(matches!(err(STATUS_NO_INDEX, None), ClientError::ServerError(m) if m.contains("no index")));
-    assert!(matches!(err(STATUS_SAL_FULL, Some("log full")), ClientError::SalFull(m) if m == "log full"));
-    assert!(matches!(err(999, None), ClientError::ServerError(m) if m.contains("unrecognized status 999")));
+    assert!(matches!(err(STATUS_NO_INDEX, ""), ClientError::ServerError(m) if m.contains("no index")));
+    assert!(matches!(err(999, ""), ClientError::ServerError(m) if m.contains("unrecognized status 999")));
 
-    for (text, want) in [
-        (None, "unknown server error"),
-        (Some(""), "unknown server error"),
-        (Some("real error"), "real error"),
-    ] {
+    // The server formats real text for STATUS_SAL_FULL, and it must survive the
+    // decode: gating the text on STATUS_ERROR made `SalFull`'s payload dead.
+    let sal = err(STATUS_SAL_FULL, "SAL full: Push group did not fit");
+    assert!(
+        matches!(&sal, ClientError::SalFull(m) if m == "SAL full: Push group did not fit"),
+        "{sal:?}"
+    );
+
+    for (text, want) in [("", "unknown server error"), ("real error", "real error")] {
         assert!(
             matches!(err(STATUS_ERROR, text), ClientError::ServerError(m) if m == want),
             "{text:?}"
         );
     }
-    assert!(check_response(msg(STATUS_OK, None)).is_ok());
+    assert!(classify(STATUS_OK, "").is_ok());
 }
 
 mod spine_tests {
@@ -290,7 +310,7 @@ mod spine_tests {
         // that a status frame completes its slot rather than erroring `step`,
         // and carries the frame's `seek_pk` into the error it hands back.
         let (mut s, peer) = pair();
-        let slot = s.submit(Request::Uncorrelated(reply_ctrl(0, 0))).unwrap();
+        let slot = s.submit(Request::RawFrame(reply_ctrl(0, 0))).unwrap();
         s.step(Interest::WRITE).unwrap();
         peer.drain_request();
         peer.send(&reply_status(STATUS_TXN_CONFLICT, "", 77));
@@ -376,9 +396,10 @@ mod spine_tests {
         push(&mut s).unwrap();
         assert_eq!(s.queued_bytes(), 2 * one, "bytes, not submits");
 
-        // The cap is checked before queueing, so one frame of any size always
-        // goes through and it is the *next* submit that is refused.
-        s.submit(Request::Uncorrelated(vec![0u8; MAX_QUEUED_BYTES])).unwrap();
+        // The cap is checked before queueing, so one frame up to the peer's
+        // egress limit always goes through and it is the *next* submit that is
+        // refused.
+        s.submit(Request::RawFrame(vec![0u8; MAX_QUEUED_BYTES])).unwrap();
         assert!(s.queued_bytes() >= MAX_QUEUED_BYTES);
         let r = push(&mut s);
         assert!(

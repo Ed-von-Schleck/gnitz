@@ -1059,8 +1059,13 @@ fn state_file(base_dir: &str) -> String {
 /// answering `false` forever. A copy is laid out for one worker, at the solo
 /// slot every mirror opens under.
 fn has_manifest(base_dir: &str, view_id: u64) -> bool {
-    let rel_dir = relation_dir(base_dir, "_copies", RelationKind::View, view_id as i64);
-    std::path::Path::new(&ChildAddr::worker(Slot::SOLO).manifest(&rel_dir)).exists()
+    std::path::Path::new(&ChildAddr::worker(Slot::SOLO).manifest(&copy_dir(base_dir, view_id))).exists()
+}
+
+/// The directory one mirrored copy lives in, through the engine's own path
+/// grammar — the same reason [`has_manifest`] builds its path that way.
+fn copy_dir(base_dir: &str, view_id: u64) -> String {
+    relation_dir(base_dir, "_copies", RelationKind::View, view_id as i64)
 }
 
 /// A server restart erases the copy: the stored cursor tag no longer matches the
@@ -2130,6 +2135,63 @@ fn a_view_renamed_upstream_survives_a_new_view_under_its_old_name() {
     fx.quiesce();
     fx.differential("s", "SELECT * FROM v_moved");
     fx.differential("s", "SELECT * FROM v_keyed");
+}
+
+/// Two views cross-renamed upstream: `v_a → v_c`, then `v_b → v_a`. Mirroring
+/// the reused name must retract the copy that lost it, or its directory, its
+/// registry entry and its state row outlive every checkpoint with nothing left
+/// to poll them — the client has dropped the id.
+///
+/// Both views have the same column layout, so their schema blocks are
+/// byte-identical and the record at `v_b`'s id stands: the registration takes
+/// the rename-in-place arm, which is the one that used to retract nothing.
+#[test]
+fn a_cross_rename_retracts_the_copy_that_lost_its_name() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 60);
+    for (name, pred) in [("v_a", "b = 1"), ("v_b", "b = 2")] {
+        sql(
+            &mut fx.direct,
+            "s",
+            &format!("CREATE VIEW {name} WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE {pred}"),
+        );
+    }
+    let a = fx.mirror().mirror_view("s", "v_a").expect("mirror v_a").view_id;
+    let b = fx.mirror().mirror_view("s", "v_b").expect("mirror v_b").view_id;
+    fx.drain("s", &["v_a", "v_b"]);
+    let a_dir = copy_dir(&fx.base_dir(), a);
+    assert!(std::path::Path::new(&a_dir).exists(), "v_a's copy is on disk");
+
+    fx.direct
+        .alter_rename_relation("s", "v_a", "v_c")
+        .expect("rename v_a out of the way");
+    fx.direct
+        .alter_rename_relation("s", "v_b", "v_a")
+        .expect("rename v_b into the freed name");
+    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_a");
+
+    let out = fx.mirror().mirror_view("s", "v_a").expect("re-mirror");
+    assert_eq!(out.view_id, b, "the reused name now resolves to the other view");
+    // The arm under test: `v_b`'s record stood, so its copy kept its cursor and
+    // advanced. A reseed here would mean the registration fell through to the
+    // arm that always retracted, and the assertions below would prove nothing.
+    assert!(
+        !out.result.reseeded(),
+        "the record at this id stands, so the rename is in place: {:?}",
+        out.result
+    );
+    assert!(!fx.mirror().mirrors(a), "the displaced copy no longer answers");
+    assert!(
+        !fx.mirror().mirrored_ids().contains(&a),
+        "and the client drops its binding with it",
+    );
+    assert!(
+        !std::path::Path::new(&a_dir).exists(),
+        "the displaced copy's directory is gone, not left behind",
+    );
+    fx.drain("s", &["v_a"]);
+    fx.differential("s", "SELECT * FROM v_a");
 }
 
 /// A reconnect keeps every registration, is refused inside a transaction, and

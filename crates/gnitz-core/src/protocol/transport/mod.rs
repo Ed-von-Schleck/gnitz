@@ -52,6 +52,10 @@ pub struct ClientTransport {
     /// How long a blocking wrapper may park before it fails with
     /// `WouldBlock`; `None` waits untimed.
     deadline: Option<Duration>,
+    /// The largest payload this peer accepts, from the HELLO ACK — the server's
+    /// own ingress cap until `mark_established` reads the negotiated one.
+    /// `Session::submit` refuses past it.
+    egress_limit: usize,
 }
 
 enum Inner {
@@ -233,6 +237,7 @@ impl ClientTransport {
             queue: OutQueue::default(),
             frames_sent: 0,
             deadline: None,
+            egress_limit: gnitz_wire::MAX_FRAME_PAYLOAD_SERVER,
         })
     }
 
@@ -366,17 +371,15 @@ impl ClientTransport {
         self.queue.bytes
     }
 
+    /// The payload ceiling this peer advertised in its HELLO ACK.
+    pub(crate) fn egress_limit(&self) -> usize {
+        self.egress_limit
+    }
+
     /// Bytes queued, or ciphertext pending: the `WRITE` half of a driver's
     /// interest.
     pub(crate) fn wants_write(&self) -> bool {
         !self.queue.is_empty() || self.inner.has_pending_ciphertext()
-    }
-
-    /// Whether the outbound queue holds no frame — on TLS distinct from
-    /// `wants_write`, which also covers ciphertext rustls still holds.
-    #[cfg(test)]
-    pub(crate) fn queue_is_empty(&self) -> bool {
-        self.queue.is_empty()
     }
 
     /// Drop every queued frame and the cursor with them.
@@ -415,13 +418,15 @@ impl ClientTransport {
         self.reader.drained = false;
     }
 
-    /// The connection is validated (HELLO ACK in hand): the connect deadline
-    /// is cleared and the payload ceiling narrows from the pre-handshake bound
-    /// to the ACK's, clamped to the client's own hard maximum so a misbehaving
-    /// server cannot raise the allocation bound above it.
+    /// The connection is validated (HELLO ACK in hand): the connect deadline is
+    /// cleared, the inbound payload ceiling narrows from the pre-handshake bound
+    /// to the ACK's — clamped to the client's own hard maximum, so a misbehaving
+    /// server cannot raise the allocation bound — and the ACK's figure becomes
+    /// what this end may send.
     pub(crate) fn mark_established(&mut self, server_limit: usize) {
         self.deadline = None;
         self.reader.max_payload_len = server_limit.min(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT);
+        self.egress_limit = server_limit;
     }
 }
 
@@ -735,7 +740,8 @@ pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; gnitz_wire::FRAME_LEN_
 /// length-prefixed STATUS_ERROR control block (≥ 248 bytes) and closes
 /// the connection; this function detects that path via the payload
 /// length (`!= HELLO_ACK_PAYLOAD_LEN`) and surfaces the embedded error
-/// string. Both frames fit the pre-handshake ceiling the reader opens at.
+/// string as [`ProtocolError::ServerRejected`]. Both frames fit the
+/// pre-handshake ceiling the reader opens at.
 pub fn hello_handshake(t: &mut ClientTransport) -> Result<u64, ProtocolError> {
     let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION as u16);
     t.send_framed(&payload)?;
@@ -750,11 +756,11 @@ pub fn hello_handshake(t: &mut ClientTransport) -> Result<u64, ProtocolError> {
         return Ok(ack.published_lsn);
     }
 
-    // Not an ACK — the server sent a STATUS_ERROR control block. Surface
-    // the embedded error.
-    let (msg, _) = super::message::parse_response(&buf, None)?;
+    // Not an ACK — the server sent a STATUS_ERROR control block. The frame is
+    // well-formed, so its error is the peer's refusal, not a decode failure.
+    let msg = super::message::parse_response_frame(&buf, None)?.message;
     let err = msg.error_text.unwrap_or_else(|| "HELLO rejected".into());
-    Err(ProtocolError::DecodeError(err))
+    Err(ProtocolError::ServerRejected(err))
 }
 
 #[cfg(test)]

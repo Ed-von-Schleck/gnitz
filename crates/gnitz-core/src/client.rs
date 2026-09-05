@@ -1,6 +1,4 @@
-use crate::connection::{
-    MultiScanResult, RawBlock, RelTarget, ScanResult, Session, COL_TAB, IDX_TAB, SCHEMA_TAB, TABLE_TAB, VIEW_TAB,
-};
+use crate::connection::{MultiScanResult, RawBlock, RelTarget, ScanResult, Session};
 use crate::error::ClientError;
 use crate::protocol::{
     BatchAppender, ColData, ColumnDef, PkColumn, PkTuple, ReplySchema, Schema, TypeCode, WireConflictMode, ZSetBatch,
@@ -13,8 +11,9 @@ use crate::mirror::{MirrorState, MirrorStore, MirroredView};
 use crate::types::sys_schema;
 use gnitz_wire::sys_rows::{IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::{
-    RelClass, RelDescriptorBlob, TableProps, CIRCUIT_NODES_TAB, IDXTAB_COL_NAME, IDXTAB_COL_SOURCE_COLS,
-    OWNER_KIND_TABLE, OWNER_KIND_VIEW, SCHEMATAB_COL_NAME, TABTAB_COL_NAME, TABTAB_COL_SCHEMA_ID,
+    RelClass, RelDescriptorBlob, TableProps, CIRCUIT_NODES_TAB, COL_TAB, IDXTAB_COL_NAME, IDXTAB_COL_SOURCE_COLS,
+    IDX_TAB, OWNER_KIND_TABLE, OWNER_KIND_VIEW, SCHEMATAB_COL_NAME, SCHEMA_TAB, TABLE_TAB, TABTAB_COL_NAME,
+    TABTAB_COL_SCHEMA_ID, VIEW_TAB,
 };
 
 // --- Module-private helpers ---
@@ -344,7 +343,7 @@ pub struct GnitzClient {
     /// ROLLBACK, nothing was ever sent.
     ///
     /// Catalog writes never route here: DDL has its own atomic commit and is
-    /// rejected inside a transaction at the client's `push_ddl` choke point (and,
+    /// rejected inside a transaction at the client's `push_ddl_txn` choke point (and,
     /// earlier and friendlier, by the SQL front end).
     txn: Option<TxnBuffer>,
     /// The client's OCC basis: the running maximum over server-issued watermarks
@@ -488,6 +487,14 @@ impl GnitzClient {
 
     pub fn alloc_table_id(&mut self) -> Result<u64, ClientError> {
         self.session.alloc_table_id()
+    }
+
+    pub fn alloc_schema_id(&mut self) -> Result<u64, ClientError> {
+        self.session.alloc_schema_id()
+    }
+
+    pub fn alloc_index_id(&mut self) -> Result<u64, ClientError> {
+        self.session.alloc_index_id()
     }
 
     pub fn push(&mut self, table_id: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, ClientError> {
@@ -836,25 +843,10 @@ impl GnitzClient {
     /// Seek a secondary index by `col_indices` (the index's FULL declared column
     /// list — the server matches the circuit by exact list) supplying `key_vals`
     /// native key values. `key_vals.len()` may be `< col_indices.len()` for a
-    /// leading-prefix seek. The two arity guards below prevent a `pack_pk_cols`
-    /// panic and a silently-misread frame (the worker derives the value count from
-    /// the wire byte length). The SQL planner does not come through here — it
-    /// ships a `ReadBound::IndexRange` through `scan_spec`.
+    /// leading-prefix seek; the column list and the arity are validated in
+    /// `submit`, before a frame exists. The SQL planner does not come through
+    /// here — it ships a `ReadBound::IndexRange` through `scan_spec`.
     pub fn seek_by_index(&mut self, table_id: u64, col_indices: &[u32], key_vals: &[u128]) -> ScanResult {
-        // pack_pk_cols asserts its contract — reject here, never panic.
-        gnitz_wire::validate_pk_col_list(col_indices)
-            .map_err(|e| ClientError::ServerError(format!("seek_by_index: {e}")))?;
-        // K rides as the wire byte count (K = 1 + seek_pk_extra.len()/16 ≥ 1), so
-        // an empty key_vals would be misread by the worker as one value `0`. More
-        // values than columns is rejected by the worker too; fail it here for a
-        // clean local error.
-        if key_vals.is_empty() || key_vals.len() > col_indices.len() {
-            return Err(ClientError::ServerError(format!(
-                "seek_by_index: key value count {} must be in 1..={}",
-                key_vals.len(),
-                col_indices.len()
-            )));
-        }
         self.session.seek_by_index(table_id, col_indices, key_vals)
     }
 
@@ -944,7 +936,7 @@ impl GnitzClient {
             1,
         );
 
-        self.push_ddl(&[(IDX_TAB, batch)])?;
+        self.push_ddl_txn(&[(IDX_TAB, batch)])?;
         Ok(index_id)
     }
 
@@ -972,7 +964,7 @@ impl GnitzClient {
             let idx_schema = sys_schema(IDX_TAB);
             let mut batch = ZSetBatch::new(idx_schema);
             batch.copy_row_at(&idx_batch, i, -1, idx_schema);
-            self.push_ddl(&[(IDX_TAB, batch)])?;
+            self.push_ddl_txn(&[(IDX_TAB, batch)])?;
             return Ok(());
         }
         missing()
@@ -1093,7 +1085,7 @@ impl GnitzClient {
     /// reached only from the push and user-transaction handlers, never from the
     /// DDL one, so a DDL never raises a user table's commit LSN and there is no
     /// basis here for `track_lsn` to advance.
-    fn push_ddl(&mut self, families: &[(u64, ZSetBatch)]) -> Result<(), ClientError> {
+    pub fn push_ddl_txn(&mut self, families: &[(u64, ZSetBatch)]) -> Result<(), ClientError> {
         if self.txn.is_some() {
             return Err(ClientError::ServerError(
                 "DDL is not allowed inside a transaction".into(),
@@ -1115,7 +1107,7 @@ impl GnitzClient {
             &gnitz_wire::sys_rows::SchemaTabRow { schema_id: new_sid, name: &name },
             1,
         );
-        self.push_ddl(&[(SCHEMA_TAB, batch)])?;
+        self.push_ddl_txn(&[(SCHEMA_TAB, batch)])?;
         Ok(new_sid)
     }
 
@@ -1161,7 +1153,7 @@ impl GnitzClient {
             families.push((TABLE_TAB, tb));
         }
         families.push((SCHEMA_TAB, sb));
-        self.push_ddl(&families)?;
+        self.push_ddl_txn(&families)?;
 
         // The VIEW_TAB `-1`s go out directly rather than through `drop_view`, so
         // each vid is invalidated here — without it a `SELECT` after a
@@ -1284,7 +1276,7 @@ impl GnitzClient {
             }
             families.push((IDX_TAB, idx_batch));
         }
-        self.push_ddl(&families)?;
+        self.push_ddl_txn(&families)?;
 
         Ok(new_tid)
     }
@@ -1303,7 +1295,7 @@ impl GnitzClient {
         let tbl_schema = sys_schema(TABLE_TAB);
         let mut tb = ZSetBatch::new(tbl_schema);
         tb.copy_row_at(&scanned, i, -1, tbl_schema);
-        self.push_ddl(&[(TABLE_TAB, tb)])?;
+        self.push_ddl_txn(&[(TABLE_TAB, tb)])?;
 
         Ok(())
     }
@@ -1484,7 +1476,7 @@ impl GnitzClient {
         }
         families.push((VIEW_TAB, view_batch));
 
-        self.push_ddl(&families)?;
+        self.push_ddl_txn(&families)?;
 
         // The retired view may have been mirrored — `CREATE OR REPLACE VIEW`
         // restates `WITH (delta = …)` and so is allowed over a fed view. Only the
@@ -1517,7 +1509,7 @@ impl GnitzClient {
         let view_s = sys_schema(VIEW_TAB);
         let mut vb = ZSetBatch::new(view_s);
         vb.copy_row_at(&scanned, i, -1, view_s);
-        self.push_ddl(&[(VIEW_TAB, vb)])?;
+        self.push_ddl_txn(&[(VIEW_TAB, vb)])?;
 
         // Without this a `SELECT` after a `DROP VIEW` on this same client would
         // answer rows off a view it just dropped. Only the user-named view can be
@@ -1596,7 +1588,7 @@ impl GnitzClient {
         b.copy_row_at(&scanned, i, -1, s);
         b.copy_row_at(&scanned, i, 1, s);
         b.set_string_cell(1, TABTAB_COL_NAME, &new_name);
-        self.push_ddl(&[(family, b)])?;
+        self.push_ddl_txn(&[(family, b)])?;
         if desc.class.is_view() {
             // The whole registration, though a rename keeps the id and so costs a
             // re-bootstrap: the record carries the old name, and the teardown
@@ -1628,7 +1620,7 @@ impl GnitzClient {
     /// the same packed column id — the live row's exact payload at `-1`, only
     /// `is_hidden` flipped to true at `+1`. The column stays physically present
     /// (`is_nullable`, `type_code`, position untouched), so the base table keeps
-    /// its comparator. One atomic `push_ddl`; the engine precheck arm validates
+    /// its comparator. One atomic `push_ddl_txn`; the engine precheck arm validates
     /// the drop shape and the dependent-view RESTRICT.
     pub fn alter_drop_column(&mut self, tid: u64, col_idx: usize) -> Result<(), ClientError> {
         self.alter_col_pair(tid, col_idx, |cd| cd.is_hidden = true)
@@ -1675,7 +1667,7 @@ impl GnitzClient {
             let mut a = BatchAppender::new(&mut cb, col_s);
             gnitz_wire::sys_rows::write_col_tab_row(&mut a, &def.col_tab_row(tid, OWNER_KIND_TABLE, col_idx), 1)?;
         }
-        self.push_ddl(&[(COL_TAB, cb)])?;
+        self.push_ddl_txn(&[(COL_TAB, cb)])?;
         Ok(())
     }
 
@@ -1715,7 +1707,7 @@ impl GnitzClient {
             let new_row = new_cd.col_tab_row(tid, OWNER_KIND_TABLE, col_idx);
             gnitz_wire::sys_rows::write_col_tab_row(&mut a, &new_row, 1)?;
         }
-        self.push_ddl(&[(COL_TAB, cb)])?;
+        self.push_ddl_txn(&[(COL_TAB, cb)])?;
         Ok(())
     }
 

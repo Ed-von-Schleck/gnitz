@@ -300,7 +300,13 @@ impl MirrorStore for Mirror {
         &self.base_dir
     }
 
-    fn register(&mut self, tid: u64, schema_name: &str, name: &str, schema: &Schema) -> Result<(), MirrorError> {
+    fn register(
+        &mut self,
+        tid: u64,
+        schema_name: &str,
+        name: &str,
+        schema: &Schema,
+    ) -> Result<Option<u64>, MirrorError> {
         self.touching("registering a view", |m| {
             m.register_inner(tid, schema_name, name, schema)
         })

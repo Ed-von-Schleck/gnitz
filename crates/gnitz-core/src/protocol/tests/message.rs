@@ -1,8 +1,9 @@
 use super::*;
 use crate::protocol::types::{BatchAppender, ColData, ColumnDef, PkColumn, PkTuple, Schema, TypeCode, ZSetBatch};
+use crate::protocol::wal_block::decode_wal_block;
 use crate::protocol::wire_flags_set_schema_version;
 use crate::protocol::WireConflictMode;
-use crate::protocol::{Header, FLAG_PUSH, FLAG_SEEK, STATUS_ERROR};
+use crate::protocol::{ClientTransport, Header, FLAG_PUSH, FLAG_SEEK, STATUS_ERROR};
 use crate::test_support::make_transport_pair;
 
 // ── FLAG_PUSH_TXN family assembly ──────────────────────────────────────
@@ -281,7 +282,8 @@ fn test_message_roundtrip_strings() {
 fn test_message_no_schema_no_data() {
     // Control-only message (scan/alloc style)
     let (mut a, mut b) = make_transport_pair();
-    send_control(&mut a, 0, 0, FLAG_PUSH, 0, 0, &[]).unwrap();
+    a.send_framed(&encode_control_frame(0, 0, FLAG_PUSH, 0, 0, &[]))
+        .unwrap();
     let (msg, data) = parse_response(&b.recv_framed().unwrap(), None).unwrap();
     assert!(msg.schema.is_none());
     assert!(data.is_none());
@@ -292,15 +294,14 @@ fn test_message_no_schema_no_data() {
 fn test_message_recv_control_fields() {
     let seek_pk = 0xAAAA_BBBB_CCCC_DDDD_u128 | (0x1111_2222_3333_4444_u128 << 64);
     let (mut a, mut b) = make_transport_pair();
-    send_control(
-        &mut a,
+    a.send_framed(&encode_control_frame(
         0xDEAD_BEEF_1234_5678,
         0xCAFE_BABE_0000_0001,
         FLAG_PUSH,
         seek_pk,
         7,
         &[],
-    )
+    ))
     .unwrap();
     let (msg, _) = parse_response(&b.recv_framed().unwrap(), None).unwrap();
     assert_eq!(msg.target_id, 0xDEAD_BEEF_1234_5678);

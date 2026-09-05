@@ -19,15 +19,29 @@ impl Mirror {
     /// Reconcile the local registry against `tid`'s upstream layout: a record
     /// holding `tid` under the same schema block stands, cursor and all, and
     /// takes the upstream name; anything else at this id or this name is a
-    /// relation that changed identity, whose copy is retracted.
+    /// relation that changed identity, whose copy is retracted. Returns the id
+    /// whose registration that retracted, so the caller can drop its own
+    /// binding under the same name.
     pub(crate) fn register_inner(
         &mut self,
         tid: u64,
         schema_name: &str,
         name: &str,
         schema: &Schema,
-    ) -> Result<(), MirrorError> {
+    ) -> Result<Option<u64>, MirrorError> {
         let block = gnitz_core::protocol::codec::encode_schema_block(schema, 0);
+        // Whatever the store holds under this name at another id was renamed or
+        // recreated upstream; its copy directory and state row outlive every
+        // checkpoint if nothing retracts them. Outside the match because a pure
+        // rename between two identically-shaped views takes the in-place arm.
+        let renamed = self
+            .records
+            .iter()
+            .find(|(&t, r)| t != tid && r.schema_name == schema_name && r.name == name)
+            .map(|(&t, _)| t);
+        if let Some(old) = renamed {
+            self.invalidate_inner(old, Invalidate::Registration)?;
+        }
         match self.records.get_mut(&tid).filter(|r| r.block == block) {
             // A rename upstream keeps the id; a stale name here would match a
             // later view created under it.
@@ -36,16 +50,7 @@ impl Mirror {
                 r.name = name.to_string();
             }
             None => {
-                // Whatever the store holds under this name at another id was
-                // dropped and recreated upstream.
-                let renamed = self
-                    .records
-                    .iter()
-                    .find(|(&t, r)| t != tid && r.schema_name == schema_name && r.name == name)
-                    .map(|(&t, _)| t);
-                for old in std::iter::once(tid).chain(renamed) {
-                    self.invalidate_inner(old, Invalidate::Registration)?;
-                }
+                self.invalidate_inner(tid, Invalidate::Registration)?;
                 self.enter(
                     tid,
                     MirrorRecord {
@@ -57,7 +62,7 @@ impl Mirror {
                 )?;
             }
         }
-        Ok(())
+        Ok(renamed)
     }
 }
 

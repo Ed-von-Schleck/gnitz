@@ -2,7 +2,7 @@
 
 use super::error::ProtocolError;
 use super::regions::ViewBuffers;
-use super::types::{null_word_get, ColData, PkColumn, Schema, TypeCode, ZSetBatch};
+use super::types::{null_word_get, ColData, Schema, TypeCode, ZSetBatch};
 use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -10,19 +10,20 @@ use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 /// Decode a STRING/BLOB column region into per-row raw-byte cells: `None` for
 /// a null row, else the German string resolved against `blob`. Shared by the
 /// STRING and BLOB decode arms (STRING then UTF-8-validates each cell).
-/// `reg_off` is the region's directory offset; the caller has validated the
-/// region is `count * 16` bytes and in-bounds, so the per-row struct extent
-/// needs no re-check.
+///
+/// `nulls` is *this block's* null words and nothing else — it is both the row
+/// count and the region index, so an over-long slice is a wrong count rather
+/// than a read past the block. `reg_off` is the region's directory offset,
+/// which the caller has checked covers `nulls.len() * 16` bytes.
 fn decode_german_col(
     data: &[u8],
     reg_off: usize,
     blob: &[u8],
     nulls: &[u64],
     payload_idx: usize,
-    count: usize,
 ) -> Result<Vec<Option<Vec<u8>>>, ProtocolError> {
-    let mut vals: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
-    for (row, &null_word) in nulls.iter().enumerate().take(count) {
+    let mut vals: Vec<Option<Vec<u8>>> = Vec::with_capacity(nulls.len());
+    for (row, &null_word) in nulls.iter().enumerate() {
         if null_word_get(null_word, payload_idx) {
             vals.push(None);
             continue;
@@ -38,14 +39,16 @@ fn decode_german_col(
 
 // ── Region read helpers ───────────────────────────────────────────────────────
 
-/// Read a region of 64-bit values (u64 or i64) via bulk memcpy. Correct on little-endian.
-fn read_64bit_region<T: Copy>(
+/// Append a region of 64-bit values (u64 or i64) to `dst` via bulk memcpy.
+/// Correct on little-endian.
+fn read_64bit_region_into<T: Copy>(
+    dst: &mut Vec<T>,
     data: &[u8],
     off: usize,
     sz: usize,
     count: usize,
     label: &str,
-) -> Result<Vec<T>, ProtocolError> {
+) -> Result<(), ProtocolError> {
     debug_assert_eq!(std::mem::size_of::<T>(), 8);
     let expected = count * 8;
     if sz != expected {
@@ -54,15 +57,17 @@ fn read_64bit_region<T: Copy>(
         )));
     }
     let src = &data[off..off + expected];
-    let mut v: Vec<T> = Vec::with_capacity(count);
-    // SAFETY: src is `expected` bytes (bounds-checked above); v has room for
-    // `count` Ts = `expected` bytes. Both are valid, non-overlapping regions,
-    // and the copy initializes every element `set_len` then publishes.
+    let base = dst.len();
+    dst.reserve(count);
+    // SAFETY: src is `expected` bytes (bounds-checked above); `reserve` leaves
+    // room for `count` more Ts = `expected` bytes past `base`. Both are valid,
+    // non-overlapping regions, and the copy initializes every element `set_len`
+    // then publishes.
     unsafe {
-        std::ptr::copy_nonoverlapping(src.as_ptr(), v.as_mut_ptr() as *mut u8, expected);
-        v.set_len(count);
+        std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().add(base) as *mut u8, expected);
+        dst.set_len(base + count);
     }
-    Ok(v)
+    Ok(())
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -96,7 +101,21 @@ pub(crate) fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch
 /// must be *this* function: a local reply and a remote one decoded by two
 /// different rules could disagree.
 pub fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32), ProtocolError> {
-    decode_wal_block_impl(data, schema, false)
+    let mut sink = ZSetBatch::new(schema);
+    let table_id = decode_wal_block_impl(data, schema, false, &mut sink)?;
+    Ok((sink, table_id))
+}
+
+/// [`decode_wal_block`] appending into `sink` instead of building a fresh batch
+/// — what a multi-frame reply train decodes through, so no frame is copied
+/// twice. `sink` must have been built from `schema`; a mismatch is refused
+/// before anything is appended.
+///
+/// A decode error partway through leaves `sink` half-appended. Every driver
+/// closes the session on a `step` error, and `Session::close` resets the
+/// accumulator, so no torn batch is read back.
+pub(crate) fn decode_wal_block_into(sink: &mut ZSetBatch, data: &[u8], schema: &Schema) -> Result<(), ProtocolError> {
+    decode_wal_block_impl(data, schema, false, sink).map(|_| ())
 }
 
 /// Like [`decode_wal_block`] but verifies the block's XXH3 body checksum.
@@ -105,14 +124,44 @@ pub fn decode_wal_block(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32)
 /// stream and go through [`decode_wal_block`].
 #[cfg(test)]
 pub(crate) fn decode_wal_block_verified(data: &[u8], schema: &Schema) -> Result<(ZSetBatch, u32), ProtocolError> {
-    decode_wal_block_impl(data, schema, true)
+    let mut sink = ZSetBatch::new(schema);
+    let table_id = decode_wal_block_impl(data, schema, true, &mut sink)?;
+    Ok((sink, table_id))
+}
+
+/// `sink` is a well-formed batch of `schema` and so can be appended to: same PK
+/// stride, same column count, and every payload slot carrying the variant its
+/// declared type calls for at the length its row count implies.
+///
+/// [`ZSetBatch::check_columns`] is the shared column rule, not a second spelling
+/// of it. Not the whole of [`ZSetBatch::validate`]: its NOT NULL sweep walks
+/// every row, which across a train's frames would be quadratic — and the server
+/// runs that check anyway.
+fn sink_matches(sink: &ZSetBatch, schema: &Schema) -> Result<(), ProtocolError> {
+    let sink_err = |e: String| ProtocolError::DecodeError(format!("decode sink: {e}"));
+    if sink.pks.stride as usize != schema.pk_stride() {
+        return Err(sink_err(format!(
+            "mismatched PK stride: expected {}, got {}",
+            schema.pk_stride(),
+            sink.pks.stride
+        )));
+    }
+    if sink.columns.len() != schema.num_columns() {
+        return Err(sink_err(format!(
+            "column count {} != schema column count {}",
+            sink.columns.len(),
+            schema.num_columns()
+        )));
+    }
+    sink.check_columns(schema).map_err(sink_err)
 }
 
 fn decode_wal_block_impl(
     data: &[u8],
     schema: &Schema,
     verify_checksum: bool,
-) -> Result<(ZSetBatch, u32), ProtocolError> {
+    sink: &mut ZSetBatch,
+) -> Result<u32, ProtocolError> {
     // Shared framer validates format: version, `total_size` in-bounds, body
     // checksum, region count ≤ cap, and every region's [off, off+sz) extent
     // within the block. On success `dir` can index each region unchecked.
@@ -138,8 +187,10 @@ fn decode_wal_block_impl(
     let count = header.entry_count as usize;
 
     if count == 0 {
-        return Ok((ZSetBatch::new(schema), table_id));
+        return Ok(table_id);
     }
+
+    sink_matches(sink, schema)?;
 
     // Read system regions, by the shared §6 index — the same rule the encoder
     // builds the list with, rather than a counter that happens to agree.
@@ -153,41 +204,47 @@ fn decode_wal_block_impl(
             "pk region size mismatch: expected {expected_pk_sz}, got {pk_sz}"
         )));
     }
-    // The PK region at rest is OPK (order-preserving big-endian). Walk it back
-    // to the native LE bytes the in-memory `PkColumn` holds, so re-encoding the
-    // batch (which OPK-encodes assuming LE input) does not double-encode. A
-    // scalar key is the one-column case of the same walk.
-    //
-    // `le_row` is the per-row scratch, so a stride past it would index out of
-    // bounds — reject at the boundary rather than panic. This also keeps the
-    // `as u8` below lossless, since MAX_PK_BYTES is well under 255.
+    // Bound the stride so the `as u8` a `PkColumn` holds stays lossless, and so
+    // a nonsense schema cannot ask for an unbounded per-row extent.
     if pk_stride > gnitz_wire::MAX_PK_BYTES {
         return Err(ProtocolError::DecodeError(format!(
             "pk_stride {pk_stride} exceeds MAX_PK_BYTES {}",
             gnitz_wire::MAX_PK_BYTES
         )));
     }
-    let pks: PkColumn = {
+
+    // Size every stream before any of them grows: the regions are exact, and a
+    // frame carries as many rows as a 64 MiB reply budget holds.
+    sink.reserve(schema, count);
+
+    // The PK region at rest is OPK (order-preserving big-endian). Walk it back
+    // to the native LE bytes the in-memory `PkColumn` holds, so re-encoding the
+    // batch (which OPK-encodes assuming LE input) does not double-encode.
+    //
+    // Decoded in place: a per-row scratch plus an `extend_from_slice` of a
+    // runtime-length row compiles to a `call memcpy` per row. `decode_pk_column`
+    // writes through a `&mut [u8]`, so the rows are zeroed in one bulk memset
+    // first — cheaper than the memcpy it replaces, and the row loop overwrites
+    // every one of those bytes.
+    {
         let col_info: Vec<(usize, u8)> = schema.pk_col_codes().collect();
-        let mut decoded = Vec::with_capacity(pk_sz);
-        let mut le_row = [0u8; gnitz_wire::MAX_PK_BYTES];
+        let rows = super::regions::extend_zeroed(&mut sink.pks.buf, count * pk_stride);
         // Per-row extent is dominated by the `pk_sz == count * pk_stride` check
         // above plus the directory's `pk_off + pk_sz <= total_size`, so no
-        // per-row bounds check is needed.
+        // per-row bounds check is needed on the source.
         for row in 0..count {
-            let base = pk_off + row * pk_stride;
-            let src = &data[base..base + pk_stride];
+            let src = &data[pk_off + row * pk_stride..pk_off + (row + 1) * pk_stride];
+            let dst = &mut rows[row * pk_stride..(row + 1) * pk_stride];
             let mut off = 0;
             for &(cs, tc) in &col_info {
-                gnitz_wire::decode_pk_column(&src[off..off + cs], tc, &mut le_row[off..off + cs]);
+                gnitz_wire::decode_pk_column(&src[off..off + cs], tc, &mut dst[off..off + cs]);
                 off += cs;
             }
-            decoded.extend_from_slice(&le_row[..pk_stride]);
         }
-        PkColumn { stride: pk_stride as u8, buf: decoded }
-    };
-    let weights: Vec<i64> = read_64bit_region(data, wt_off, wt_sz, count, "weights")?;
-    let nulls: Vec<u64> = read_64bit_region(data, null_off, null_sz, count, "nulls")?;
+    }
+    read_64bit_region_into(&mut sink.weights, data, wt_off, wt_sz, count, "weights")?;
+    let nulls_base = sink.nulls.len();
+    read_64bit_region_into(&mut sink.nulls, data, null_off, null_sz, count, "nulls")?;
 
     // Blob region (always last)
     let (blob_off, blob_sz) = dir(num_regions - 1);
@@ -201,7 +258,10 @@ fn decode_wal_block_impl(
     // slot `pi` ↔ region `REG_PAYLOAD_START + pi` is stated, not produced as a
     // side effect of a counter; PK slots keep the empty `Fixed` placeholder
     // `ZSetBatch::filler_columns` builds.
-    let mut columns = ZSetBatch::filler_columns(schema, 0);
+    let ZSetBatch { nulls, columns, .. } = sink;
+    // This block's null words alone — `decode_german_col` derives its row count
+    // and its per-row region offset from them.
+    let nulls = &nulls[nulls_base..];
     for (pi, ci, col) in schema.payload_columns() {
         let (reg_off, reg_sz) = dir(REG_PAYLOAD_START + pi);
         // One width rule for every column kind: `wire_stride` is 16 for STRING,
@@ -212,13 +272,12 @@ fn decode_wal_block_impl(
                 "column {ci} region size mismatch: expected {expected_sz}, got {reg_sz}"
             )));
         }
-        columns[ci] = match col.type_code {
-            TypeCode::String => {
+        match (&mut columns[ci], col.type_code) {
+            (ColData::Strings(dst), TypeCode::String) => {
                 // Raw German-string cells, then UTF-8-validate each into a String.
-                let raw = decode_german_col(data, reg_off, blob, &nulls, pi, count)?;
-                let mut vals: Vec<Option<String>> = Vec::with_capacity(count);
-                for cell in raw {
-                    vals.push(match cell {
+                dst.reserve(count);
+                for cell in decode_german_col(data, reg_off, blob, nulls, pi)? {
+                    dst.push(match cell {
                         None => None,
                         Some(bytes) => Some(
                             String::from_utf8(bytes)
@@ -226,14 +285,24 @@ fn decode_wal_block_impl(
                         ),
                     });
                 }
-                ColData::Strings(vals)
             }
-            TypeCode::Blob => ColData::Bytes(decode_german_col(data, reg_off, blob, &nulls, pi, count)?),
-            _ => ColData::Fixed(data[reg_off..reg_off + reg_sz].to_vec()),
-        };
+            (ColData::Bytes(dst), TypeCode::Blob) => {
+                dst.extend(decode_german_col(data, reg_off, blob, nulls, pi)?);
+            }
+            (ColData::Fixed(dst), _) => dst.extend_from_slice(&data[reg_off..reg_off + reg_sz]),
+            // `sink_matches` already paired every payload slot with its declared
+            // type; an error rather than a panic because the sink is reached
+            // from the wire.
+            _ => {
+                return Err(ProtocolError::DecodeError(format!(
+                    "decode sink: column {ci}: ColData variant contradicts schema type {:?}",
+                    col.type_code
+                )))
+            }
+        }
     }
 
-    Ok((ZSetBatch { pks, weights, nulls, columns }, table_id))
+    Ok(table_id)
 }
 
 #[cfg(test)]

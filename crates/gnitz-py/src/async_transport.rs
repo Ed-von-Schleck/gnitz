@@ -234,10 +234,10 @@ impl PyAsyncTransport {
     fn push(&mut self, py: Python<'_>, target_id: u64, batch: PyRef<'_, PyZSetBatch>) -> PyResult<Py<PyAny>> {
         // `submit` packs warm against the session's own cache; a stale stamp's
         // mismatch fails this slot and the caller re-issues. No await here to
-        // back-pressure on, so at the cap ship what the socket will take;
-        // `submit` below raises only if that was not enough.
-        if self.session.queued_bytes() >= gnitz_core::MAX_QUEUED_BYTES {
-            self.drive(py, gnitz_core::Interest::WRITE)?;
+        // back-pressure on, so at either cap flush and retire first — `BOTH`,
+        // since only the read half relieves the in-flight cap.
+        if self.session.at_capacity() {
+            self.drive(py, gnitz_core::Interest::BOTH)?;
         }
         let schema = batch.schema.as_ref();
         let b = &batch.batch;

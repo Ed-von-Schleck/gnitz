@@ -5,6 +5,10 @@ pub enum ProtocolError {
     UnknownTypeCode(u64),
     DecodeError(String),
     IoError(std::io::Error),
+    /// The peer refused the connection itself and said why — the HELLO reject.
+    /// Its own variant because the frame that carries it is well-formed: a
+    /// `DecodeError` would attribute the server's refusal to this crate's parser.
+    ServerRejected(String),
 }
 
 impl fmt::Display for ProtocolError {
@@ -13,6 +17,7 @@ impl fmt::Display for ProtocolError {
             ProtocolError::UnknownTypeCode(code) => write!(f, "unknown type code: {code}"),
             ProtocolError::DecodeError(msg) => write!(f, "decode error: {msg}"),
             ProtocolError::IoError(e) => write!(f, "io error: {e}"),
+            ProtocolError::ServerRejected(msg) => write!(f, "server rejected: {msg}"),
         }
     }
 }

@@ -31,11 +31,12 @@ pub use client::{
 };
 pub use connection::{
     Completions, Interest, LocalScanReply, ParkHook, RawBlock, RelTarget, Reply, ReplyTrain, Request, ScanReply,
-    Session, SlotId, FIRST_USER_TABLE_ID, MAX_IN_FLIGHT, MAX_QUEUED_BYTES, TABLE_TAB,
+    Session, SlotId, MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
 };
 pub use error::{ClientError, ConflictClass};
 pub use gnitz_wire::{
     validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, RelClass, TableProps,
+    FIRST_USER_TABLE_ID, TABLE_TAB,
 };
 pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult, Shape};
 pub use protocol::{

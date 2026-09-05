@@ -1,13 +1,10 @@
 use super::codec::{encode_schema_block, schema_from_block};
 use super::error::ProtocolError;
 use super::regions::ViewBuffers;
-use super::transport::ClientTransport;
 use super::types::{PkTuple, Schema, ZSetBatch};
-use super::wal_block::{decode_wal_block, encode_wal_block};
+use super::wal_block::encode_wal_block;
 use super::WAL_BLOCK_HEADER_SIZE;
-use super::{
-    wire_flags_get_schema_version, Header, WireConflictMode, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_ERROR, STATUS_OK,
-};
+use super::{wire_flags_get_schema_version, Header, WireConflictMode, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_OK};
 use crate::types::sys_schema;
 use gnitz_wire::txn_frame::WalBlock;
 
@@ -300,27 +297,6 @@ pub(crate) fn encode_control_frame(
     .ctrl
 }
 
-/// Send one control-only frame ([`encode_control_frame`]), blocking until it
-/// is on the wire.
-pub fn send_control(
-    t: &mut ClientTransport,
-    target_id: u64,
-    client_id: u64,
-    flags: u64,
-    seek_pk: u128,
-    seek_col_idx: u64,
-    seek_pk_extra: &[u8],
-) -> Result<(), ProtocolError> {
-    t.send_framed(&encode_control_frame(
-        target_id,
-        client_id,
-        flags,
-        seek_pk,
-        seek_col_idx,
-        seek_pk_extra,
-    ))
-}
-
 /// Parse a wire payload (without 4-byte frame header) into a `Message`.
 /// The payload is what `recv_framed()` returns.
 ///
@@ -329,20 +305,18 @@ pub fn send_control(
 /// block), the hint is used to decode the data block; a version mismatch is a
 /// hard protocol error. Pass `None` for the initial frame or when no cache
 /// entry exists.
+#[cfg(any(test, feature = "integration"))]
 pub fn parse_response(
     buf: &[u8],
     schema_hint: Option<(&Schema, u16)>,
 ) -> Result<(Message, Option<ZSetBatch>), ProtocolError> {
-    let parsed = parse_response_frame(buf, schema_hint)?;
-    let data_batch = match parsed.data_block {
+    let mut parsed = parse_response_frame(buf, schema_hint)?;
+    let data_batch = match parsed.data_block.take() {
         Some(range) => {
-            let eff: &Schema = match parsed.message.schema.as_deref() {
-                Some(s) => s,
-                None => schema_hint
-                    .map(|(s, _)| s)
-                    .ok_or_else(|| ProtocolError::DecodeError("no schema for data block".into()))?,
-            };
-            Some(decode_wal_block(&buf[range], eff)?.0)
+            let eff = parsed
+                .effective(schema_hint.map(|(s, _)| s))
+                .ok_or_else(|| ProtocolError::DecodeError("no schema for data block".into()))?;
+            Some(super::wal_block::decode_wal_block(&buf[range], eff)?.0)
         }
         None => None,
     };
@@ -355,6 +329,15 @@ pub(crate) struct ParsedFrame {
     /// Where the data block sits in the frame buffer, or `None` when the frame
     /// carries no data.
     pub(crate) data_block: Option<std::ops::Range<usize>>,
+}
+
+impl ParsedFrame {
+    /// The schema this frame's data block decodes under: the block it carried,
+    /// else the caller's hint. One rule, so the two decode entries cannot
+    /// disagree about which schema a hint-only continuation frame uses.
+    pub(crate) fn effective<'s>(&'s self, hint: Option<&'s Schema>) -> Option<&'s Schema> {
+        self.message.schema.as_deref().or(hint)
+    }
 }
 
 /// Everything [`parse_response`] does except decoding the data block: frame
@@ -415,8 +398,10 @@ pub(crate) fn parse_response_frame(
     };
 
     // Every non-OK status the server emits rides a control-only frame, so both
-    // blocks are already absent and there is nothing to suppress.
-    let error_text = (ctrl_header.status == STATUS_ERROR).then_some(error_msg);
+    // blocks are already absent and there is nothing to suppress. Keyed on the
+    // text being present rather than on `STATUS_ERROR`: STATUS_SAL_FULL carries
+    // server-formatted text too, and gating on one status dropped it.
+    let error_text = (!error_msg.is_empty()).then_some(error_msg);
 
     Ok(ParsedFrame {
         message: Message {

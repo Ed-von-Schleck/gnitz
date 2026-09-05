@@ -58,11 +58,20 @@ pub trait MirrorStore: Send {
 
     /// Register `tid` under `schema`, retracting whatever the store held at that
     /// id with another layout, or under that qualified name at another id.
+    /// Returns the id whose registration that retracted, if any — the store's
+    /// verdict, which is what keeps a client's own name→id bindings free of two
+    /// live entries under one name.
     ///
     /// The qualified name is what the store records the copy under, and the only
     /// thing it needs beyond the id: the store mints no ids of its own, so there
     /// is no schema id for a schema to be entered under.
-    fn register(&mut self, tid: u64, schema_name: &str, name: &str, schema: &Schema) -> Result<(), MirrorError>;
+    fn register(
+        &mut self,
+        tid: u64,
+        schema_name: &str,
+        name: &str,
+        schema: &Schema,
+    ) -> Result<Option<u64>, MirrorError>;
 
     /// Tear `tid` down to `level`. See [`Invalidate`] — this is the *only* way a
     /// copy, a cursor or a registration is ever dropped. Idempotent, and a `tid`
@@ -313,7 +322,7 @@ impl GnitzClient {
 
         let tid = rel.tid;
         let schema = Arc::clone(&rel.schema);
-        self.mirror_state()?.store.register(tid, schema_name, name, &schema)?;
+        let retracted = self.mirror_state()?.store.register(tid, schema_name, name, &schema)?;
 
         let entry = MirroredView {
             schema_name: schema_name.to_string(),
@@ -322,14 +331,10 @@ impl GnitzClient {
             delta_reply: Arc::new(ReplySchema::new(Arc::new(delta_reply_schema(&schema)?), tid)),
         };
         let m = self.mirror_state()?;
-        // The store retracted the incumbent under this name at another id — a
-        // relation dropped and recreated — so its registration goes too.
-        if let Some(old) = m
-            .views
-            .iter()
-            .find(|(&t, v)| t != tid && v.schema_name == schema_name && v.name == name)
-            .map(|(&t, _)| t)
-        {
+        // The store's verdict, not a second scan: this map and the store's
+        // records must name the same displaced id, or `resolve_local_first`
+        // picks one of two live entries out of a `HashMap`.
+        if let Some(old) = retracted {
             m.views.remove(&old);
         }
         m.views.insert(tid, entry);

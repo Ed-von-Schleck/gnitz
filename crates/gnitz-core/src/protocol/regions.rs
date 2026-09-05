@@ -134,19 +134,27 @@ fn build_pk_region_into(dst: &mut Vec<u8>, pks: &PkColumn, pk_stride: usize, sch
     }
 }
 
-/// `dst` as exactly `n` zeroed bytes, reusing its capacity. Not `Vec::resize`:
-/// that is a per-element write loop, which LLVM turns into a memset only from
-/// `-O1` up — at `opt-level=0`, the build the whole E2E suite runs, it costs
-/// ~43 instructions per byte on every client push.
+/// Append `n` zeroed bytes to `dst` and hand back that tail to write into. Not
+/// `Vec::resize`: that is a per-element write loop, which LLVM turns into a
+/// memset only from `-O1` up — at `opt-level=0`, the build the whole E2E suite
+/// runs, it costs ~43 instructions per byte on every client push.
+pub(crate) fn extend_zeroed(dst: &mut Vec<u8>, n: usize) -> &mut [u8] {
+    let at = dst.len();
+    dst.reserve(n);
+    // SAFETY: `reserve` guarantees `n` bytes of spare capacity past `at`, and
+    // they are zeroed before `set_len` publishes them, so no uninitialized byte
+    // is observable.
+    unsafe {
+        std::ptr::write_bytes(dst.as_mut_ptr().add(at), 0, n);
+        dst.set_len(at + n);
+    }
+    &mut dst[at..]
+}
+
+/// `dst` as exactly `n` zeroed bytes, reusing its capacity.
 fn resize_zeroed(dst: &mut Vec<u8>, n: usize) {
     dst.clear();
-    dst.reserve(n);
-    // SAFETY: `reserve` guarantees `n` bytes of capacity, and they are zeroed
-    // before `set_len` publishes them, so no uninitialized byte is observable.
-    unsafe {
-        std::ptr::write_bytes(dst.as_mut_ptr(), 0, n);
-        dst.set_len(n);
-    }
+    extend_zeroed(dst, n);
 }
 
 /// Encode a STRING/BLOB column region: one 16-byte German-string struct per row

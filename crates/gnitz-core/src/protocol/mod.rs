@@ -25,9 +25,11 @@ pub use gnitz_wire::{
     FLAG_SCAN_MULTI, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, MAX_COLUMNS, STATUS_DELTA_EXPIRED, STATUS_ERROR,
     STATUS_NO_INDEX, STATUS_OK, STATUS_SAL_FULL, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
+#[cfg(any(test, feature = "integration"))]
+pub use message::parse_response;
 pub use message::{
     decode_control_block, encode_ddl_txn, encode_message_noschema_parts, encode_message_parts, encode_push_txn,
-    encode_scan_multi, parse_response, send_control, Message, MessageParts,
+    encode_scan_multi, Message, MessageParts,
 };
 pub(crate) use message::{encode_control_frame, parse_response_frame};
 pub use regions::{ViewBuffers, ZSetBatchView};

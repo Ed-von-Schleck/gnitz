@@ -142,8 +142,8 @@ fn loopback_one_record_two_frames_one_step_completes_both_slots() {
     });
     let mut s = Session::from_transport(lb.connect());
     let req = reply_ctrl(0, 0);
-    let a = s.submit(Request::Uncorrelated(req.clone())).unwrap();
-    let b = s.submit(Request::Uncorrelated(req)).unwrap();
+    let a = s.submit(Request::RawFrame(req.clone())).unwrap();
+    let b = s.submit(Request::RawFrame(req)).unwrap();
     assert!(s.step(Interest::WRITE).unwrap().is_empty());
     assert!(s.interest().read && !s.interest().write);
     // Park once; the one readable wakeup must complete both.
@@ -179,8 +179,8 @@ fn loopback_two_back_to_back_records_come_out_of_one_step() {
     });
     let mut s = Session::from_transport(lb.connect());
     let req = reply_ctrl(0, 0);
-    s.submit(Request::Uncorrelated(req.clone())).unwrap();
-    s.submit(Request::Uncorrelated(req)).unwrap();
+    s.submit(Request::RawFrame(req.clone())).unwrap();
+    s.submit(Request::RawFrame(req)).unwrap();
     s.step(Interest::WRITE).unwrap();
     // Let both records land before the one step reads.
     std::thread::sleep(Duration::from_millis(100));
@@ -224,9 +224,9 @@ fn loopback_step_write_can_empty_the_queue_with_ciphertext_still_pending() {
     let t = lb.connect();
     set_sockopt_int(t.as_raw_fd(), libc::SO_SNDBUF, 8 * 1024);
     let mut s = Session::from_transport(t);
-    let slot = s.submit(Request::Uncorrelated(frame)).unwrap();
+    let slot = s.submit(Request::RawFrame(frame)).unwrap();
     assert!(s.step(Interest::WRITE).unwrap().is_empty());
-    assert!(s.queue_is_empty(), "rustls took the whole frame");
+    assert_eq!(s.queued_bytes(), 0, "rustls took the whole frame");
     assert!(
         s.interest().write,
         "ciphertext still in sendable_tls: the queue alone is not the predicate"
