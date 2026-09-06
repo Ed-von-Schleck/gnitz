@@ -21,9 +21,7 @@ use gnitz_wire::{PkColList, SpecBytes};
 use crate::query::{oob_cols, RelayRoute};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{AsyncMutex, ScanLease};
-use crate::runtime::sal::{
-    DeferredPublication, DirectGroup, GroupData, GroupTargets, SalFit, SalMessageKind, SalWriter,
-};
+use crate::runtime::sal::{DirectGroup, GroupData, GroupTargets, SalFit, SalMessageKind, SalScope, SalWriter};
 use crate::runtime::w2m::{W2mReceiver, W2mSlot};
 use crate::runtime::wire::{
     self, unique_preflight_wire_schema, DecodedWire, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_CONTINUE,

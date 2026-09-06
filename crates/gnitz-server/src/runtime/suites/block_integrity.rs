@@ -2,7 +2,6 @@
 //! own checksum, so only the exact region-size relations constrain it) and the
 //! control block, whose own checksum this file exercises.
 
-use crate::runtime::sal::GroupTargets;
 use crate::runtime::wire::{WireData, WireMsg};
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 use gnitz_store::schema::decode_schema_block;
@@ -203,26 +202,12 @@ fn the_control_blocks_size_field_is_exact() {
 /// misses.
 #[test]
 fn the_push_fast_paths_slots_carry_a_verifiable_control_block() {
-    use crate::runtime::master::scatter::{with_commit_indices, with_group};
     use crate::runtime::sal::fixtures::{group_at, TestLog};
-    use crate::runtime::sal::{DirectGroup, SalMessageKind};
 
-    let nw = 2usize;
-    let sal = TestLog::new(1 << 20, nw, 1);
-    let writer = &sal.writer;
-
+    let sal = TestLog::new(1 << 20, 2, 1);
     let schema = make_schema_u64_i64();
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30), (4, 1, 40)]);
-    let relation = crate::runtime::wire::WireSchema::encoded(16, schema);
-    let req_ids: Vec<u64> = (0..nw as u64).collect();
-    let base = DirectGroup {
-        targets: GroupTargets::All(&req_ids),
-        lsn: 5,
-        ..DirectGroup::new(SalMessageKind::Push)
-    };
-    with_commit_indices(&batch, &schema, nw, |wi| {
-        with_group(&batch, wi, &relation, base, |g| writer.write(g)).expect("group fits")
-    });
+    sal.push_group(5, 16, schema, &batch, |g| sal.writer.write(g));
 
     let msg = group_at(sal.log(), 0);
     let slot = msg.slot(0).expect("slot 0 carries bytes");

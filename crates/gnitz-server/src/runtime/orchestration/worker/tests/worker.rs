@@ -280,7 +280,7 @@ fn flush_and_push_run_inline_inside_exchange() {
     let (region, writer) = make_ring();
     let ptr = region.ptr();
     let mut wp = make_test_worker(&mut engine, writer);
-    wp.sal_reader = unsafe { SalReader::new(sal.ptr() as *const u8, 0, SAL_SIZE, 0) };
+    wp.sal_reader = SalReader::new(sal.log(), 0, 0);
 
     // Target 7 is a system id, which a Push may not name — but a control-only
     // slot carries no rows, so the arm ACKs without reaching the store. What is
@@ -330,7 +330,7 @@ fn next_sal_message_gates_on_the_epoch() {
     write(44, 102, SalMessageKind::Push, 2);
 
     let mut wp = make_test_worker(std::ptr::null_mut(), unsafe { std::mem::zeroed() });
-    wp.sal_reader = unsafe { SalReader::new(sal.ptr() as *const u8, 0, SAL_SIZE, 0) };
+    wp.sal_reader = SalReader::new(sal.log(), 0, 0);
 
     let next = |wp: &mut WorkerProcess| wp.next_sal_message().map(|(m, _)| (m.kind, m.target_id));
     assert_eq!(next(&mut wp), Some((SalMessageKind::Push, 42)));

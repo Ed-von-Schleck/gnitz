@@ -78,11 +78,18 @@ pub fn block_size_of(regions: &[&[u8]]) -> usize {
     block_size_from(regions.len(), regions.iter().map(|r| r.len()))
 }
 
+/// Where a block's first region begins: the header, then one 8-byte directory
+/// entry per region, `align8`ed as the region walk below pads. The one spelling
+/// of that offset — a block whose regions are all empty is exactly this long.
+pub const fn body_start(num_regions: usize) -> usize {
+    align8(WAL_HEADER_SIZE + num_regions * 8)
+}
+
 /// The block-size walk both public forms share: header, directory, then each
 /// region `align8`-padded before its data — the same walk
 /// [`write_header_and_directory`] performs.
 fn block_size_from(count: usize, sizes: impl Iterator<Item = usize>) -> usize {
-    let mut pos = WAL_HEADER_SIZE + count * 8;
+    let mut pos = body_start(count);
     for sz in sizes {
         pos = align8(pos) + sz;
     }
@@ -90,32 +97,29 @@ fn block_size_from(count: usize, sizes: impl Iterator<Item = usize>) -> usize {
 }
 
 /// Write the 32-byte WAL header (all fields) and the region directory into
-/// `block`, zero-filling inter-region align8 gaps, and return each region's
-/// absolute start position within the block. Shared by [`encode`] (which then
-/// copies prebuilt region bytes) and the SAL scatter writer
-/// (`write_scattered_data_block`), which carves the body and scatters rows
+/// `block`, zero-filling inter-region align8 gaps. Shared by [`encode`] (which
+/// then copies prebuilt region bytes) and the SAL scatter writer
+/// (`encode_scattered_to_wire`), which carves the body and scatters rows
 /// directly — the one place the block framing is spelled out.
 ///
-/// The caller stamps the body checksum afterwards via [`stamp_checksum`]
+/// Each region's start position goes into its own directory entry, read back
+/// through [`dir_entry`]. The caller stamps the body checksum afterwards via [`stamp_checksum`]
 /// (or leaves the zeroed checksum field for unchecksummed IPC paths).
 pub fn write_header_and_directory(
     block: &mut [u8],
     table_id: u32,
     entry_count: u32,
-    region_sizes: &[u32],
+    region_sizes: impl ExactSizeIterator<Item = u32>,
     total_size: usize,
-) -> [usize; MAX_WIRE_REGIONS] {
+) {
     let num_regions = region_sizes.len();
-    // Sized to MAX_WIRE_REGIONS (= MAX_BATCH_REGIONS + 1) — the max region count
-    // including the trailing blob region (pk/weight/null_bmp + payload + blob).
     debug_assert!(
         num_regions <= MAX_WIRE_REGIONS,
-        "num_regions={num_regions} exceeds positions array capacity"
+        "num_regions={num_regions} exceeds the block directory's capacity"
     );
     block[..WAL_HEADER_SIZE].fill(0);
-    let mut positions = [0usize; MAX_WIRE_REGIONS];
-    let mut pos = WAL_HEADER_SIZE + num_regions * 8;
-    for (i, &sz) in region_sizes.iter().enumerate() {
+    let mut pos = body_start(num_regions);
+    for (i, sz) in region_sizes.enumerate() {
         // At most 7 bytes by construction, so this stays a handful of stores
         // rather than a `memset` call per region.
         let aligned = align8(pos);
@@ -123,7 +127,6 @@ pub fn write_header_and_directory(
             *b = 0;
         }
         pos = aligned;
-        positions[i] = pos;
         let dir_off = dir_entry_offset(i);
         write_u32_le(block, dir_off, pos as u32);
         write_u32_le(block, dir_off + 4, sz);
@@ -134,7 +137,6 @@ pub fn write_header_and_directory(
     write_u32_le(block, WAL_OFF_SIZE, total_size as u32);
     write_u32_le(block, WAL_OFF_VERSION, WAL_FORMAT_VERSION);
     write_u32_le(block, WAL_OFF_NUM_REGIONS, num_regions as u32);
-    positions
 }
 
 /// Stamp the XXH3 body checksum of a fully-written block into its header.
@@ -202,13 +204,7 @@ pub fn encode(
     regions: &[&[u8]],
     checksum_body: bool,
 ) -> Result<usize, WalError> {
-    let num_regions = regions.len();
-    let mut region_sizes = [0u32; MAX_WIRE_REGIONS];
-    for (dst, r) in region_sizes[..num_regions].iter_mut().zip(regions) {
-        *dst = r.len() as u32;
-    }
-    let region_sizes = &region_sizes[..num_regions];
-    let total_size = block_size(region_sizes);
+    let total_size = block_size_of(regions);
 
     if out_offset + total_size > out_buf.len() {
         return Err(WalError::BufferTooSmall);
@@ -216,19 +212,24 @@ pub fn encode(
 
     let block = &mut out_buf[out_offset..out_offset + total_size];
 
-    // Phase 1: header + directory, returning per-region start positions.
-    let positions = write_header_and_directory(block, table_id, entry_count, region_sizes, total_size);
+    // Phase 1: header + directory.
+    write_header_and_directory(
+        block,
+        table_id,
+        entry_count,
+        regions.iter().map(|r| r.len() as u32),
+        total_size,
+    );
 
-    // Phase 2: copy each region's bytes to its directory position. Bounds-checked
-    // `copy_from_slice` — one memcpy per non-empty region. Coalescing
-    // source-adjacent runs into a single `copy_nonoverlapping` is unsound here:
-    // the regions are independent `&[u8]` slices, so a copy spanning past region
-    // `i`'s length reads outside its provenance.
+    // Phase 2: copy each region to the position its directory entry names.
+    // Coalescing source-adjacent runs into one `copy_nonoverlapping` is unsound:
+    // the regions are independent `&[u8]`s, so a copy spanning past region `i`'s
+    // length reads outside its provenance.
     for (i, r) in regions.iter().enumerate() {
         if r.is_empty() {
             continue;
         }
-        let dst = positions[i];
+        let (dst, _) = dir_entry(block, i);
         block[dst..dst + r.len()].copy_from_slice(r);
     }
 

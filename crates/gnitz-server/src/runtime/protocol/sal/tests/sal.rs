@@ -1,8 +1,8 @@
 use super::fixtures::{group_and_next, group_at, TestLog};
 use super::{
     effective_max, group_digest, group_header_size, group_total_size, pack_prefix, DirectGroup, EpochGate, GroupData,
-    GroupTargets, SalMessageKind, SalStep, CHECKPOINT_RESERVE, MIN_SAL_BYTES, OFF_DIGEST, OFF_KIND, OFF_ZONE_START,
-    PREFIX_BYTES, SENTINEL_SIZE,
+    SalMessageKind, SalStep, CHECKPOINT_RESERVE, MIN_SAL_BYTES, OFF_DIGEST, OFF_KIND, OFF_ZONE_START, PREFIX_BYTES,
+    SENTINEL_SIZE,
 };
 use crate::runtime::m2w::{self, Wake};
 use crate::runtime::test_support::assert_child_exited_ok;
@@ -451,7 +451,7 @@ fn the_derived_stride_equals_the_writers_payload_size_at_every_width() {
 }
 
 // ---------------------------------------------------------------------------
-// Deferred publication: a group is laid out invisibly, and a rolled-back
+// The publication scope: a group is laid out invisibly, and a rolled-back
 // transaction leaves the log exactly as it was.
 // ---------------------------------------------------------------------------
 
@@ -471,13 +471,14 @@ fn a_rolled_back_transaction_publishes_nothing() {
     log.write(1, 1, SalMessageKind::Push, &[&[0u8; 64]]);
     let before_cursor = log.cursor();
 
-    let scope = log.writer.defer_publication();
+    let scope = log.writer.begin(2, "test");
     let savepoint = scope.savepoint();
     let zone_start = log.cursor();
-    log.try_write(2, 2, SalMessageKind::Push, true, &[&buf])
+    log.try_write_in(&scope, 2, SalMessageKind::Push, true, &[&buf])
         .expect("the first family fits");
     assert!(
-        log.try_write(3, 2, SalMessageKind::Push, false, &[&buf]).is_err(),
+        log.try_write_in(&scope, 3, SalMessageKind::Push, false, &[&buf])
+            .is_err(),
         "the second family must not fit"
     );
     scope.roll_back(savepoint);
@@ -492,24 +493,43 @@ fn a_rolled_back_transaction_publishes_nothing() {
     assert_eq!(group_at(log.log(), 0).target_id, 1);
 }
 
-/// Inside a deferred scope a laid-out group stays invisible until the scope
-/// publishes, and every one of them appears at once.
+/// Inside a scope a laid-out group stays invisible until the scope commits, and
+/// every one of them appears at once — the sentinel last, so a crash between
+/// the two leaves a published zone no sentinel closes.
 #[test]
-fn a_deferred_group_is_invisible_until_the_scope_publishes() {
+fn a_scoped_group_is_invisible_until_the_scope_commits() {
     let log = TestLog::new(1 << 20, 1, 1);
-    let scope = log.writer.defer_publication();
-    log.try_write(1, 1, SalMessageKind::Push, true, &[&[0u8; 32]])
+    let scope = log.writer.begin(1, "test");
+    log.try_write_in(&scope, 1, SalMessageKind::Push, true, &[&[0u8; 32]])
         .expect("group fits");
     let second = log.cursor();
-    log.try_write(2, 1, SalMessageKind::Push, false, &[&[0u8; 32]])
+    log.try_write_in(&scope, 2, SalMessageKind::Push, false, &[&[0u8; 32]])
         .expect("group fits");
+    let sentinel = log.cursor();
 
     assert!(matches!(log.log().read_at(0, EpochGate::Live(1)), SalStep::Absent));
     assert!(matches!(log.log().read_at(second, EpochGate::Live(1)), SalStep::Absent));
 
-    drop(scope);
+    assert!(scope.commit().expect("the sentinel fits"), "the zone was open");
     assert_eq!(group_at(log.log(), 0).target_id, 1);
     assert_eq!(group_at(log.log(), second).target_id, 2);
+    assert_eq!(group_at(log.log(), sentinel).kind, SalMessageKind::ZoneCommit);
+}
+
+/// A scope dropped without committing takes its whole span back, whatever the
+/// caller did or did not roll back by hand.
+#[test]
+fn an_uncommitted_scope_publishes_nothing() {
+    let log = TestLog::new(1 << 20, 1, 1);
+    log.write(1, 0, SalMessageKind::Push, &[&[0u8; 32]]);
+    let before = log.cursor();
+    {
+        let scope = log.writer.begin(9, "test");
+        log.try_write_in(&scope, 2, SalMessageKind::Push, true, &[&[0u8; 32]])
+            .expect("group fits");
+    }
+    assert_eq!(log.cursor(), before, "the cursor is back where the scope opened");
+    assert!(matches!(log.log().read_at(before, EpochGate::Live(1)), SalStep::Absent));
 }
 
 // ---------------------------------------------------------------------------
@@ -571,8 +591,7 @@ fn footprint_equals_emitted_bytes() {
 /// case that used to fall off it.
 #[test]
 fn a_narrow_fixed_width_schema_scatters_in_one_copy() {
-    use crate::runtime::master::scatter::{with_commit_indices, with_group};
-    use crate::runtime::wire::{WireData, WireSchema};
+    use crate::runtime::wire::WireData;
     use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
     use gnitz_wire::type_code;
 
@@ -585,19 +604,18 @@ fn a_narrow_fixed_width_schema_scatters_in_one_copy() {
     );
     let batch = make_batch_raw(&schema, &[(0, 1, 0), (1, 1, 1), (2, 1, 2)]);
 
-    let relation = WireSchema::encoded(16, schema);
-    with_commit_indices(&batch, &schema, 4, |wi| {
-        with_group(&batch, wi, &relation, DirectGroup::new(SalMessageKind::Push), |g| {
-            let GroupData::PerWorker(slots) = g.data else {
-                panic!("a scatter group carries per-worker slots");
-            };
-            for (w, slot) in slots.iter().enumerate() {
-                assert!(
-                    matches!(slot, WireData::Scattered { .. }),
-                    "slot {w} must scatter straight into the SAL slot"
-                );
-            }
-        })
+    let log = TestLog::new(1 << 20, 4, 1);
+    log.push_group(0, 16, schema, &batch, |g| {
+        let GroupData::PerWorker(slots) = g.data else {
+            panic!("a scatter group carries per-worker slots");
+        };
+        for (w, slot) in slots.iter().enumerate() {
+            assert!(
+                matches!(slot, WireData::Scattered { .. }),
+                "slot {w} must scatter straight into the SAL slot"
+            );
+        }
+        Ok(())
     });
 }
 
@@ -607,31 +625,16 @@ fn a_narrow_fixed_width_schema_scatters_in_one_copy() {
 /// empty slot keeps its block — there the schema *is* the payload.
 #[test]
 fn a_rowless_push_slot_carries_no_schema_block() {
-    use crate::runtime::master::scatter::{with_commit_indices, with_group};
-    use crate::runtime::wire::{decode_wire, WireData, WireMsg, WireSchema};
+    use crate::runtime::wire::{decode_wire, WireData, WireMsg};
     use crate::test_support::{make_batch, make_schema_u64_i64};
 
     let nw = 4;
     let schema = make_schema_u64_i64();
     // One row: whichever worker owns its PK, the other three slots are rowless.
     let batch = make_batch(&schema, &[(1, 1, 10)]);
-    let relation = WireSchema::encoded(16, schema);
-    let req_ids: Vec<u64> = (0..nw as u64).collect();
 
     let log = TestLog::new(1 << 20, nw, 1);
-    with_commit_indices(&batch, &schema, nw, |wi| {
-        with_group(
-            &batch,
-            wi,
-            &relation,
-            DirectGroup {
-                targets: GroupTargets::All(&req_ids),
-                lsn: 5,
-                ..DirectGroup::new(SalMessageKind::Push)
-            },
-            |g| log.writer.write(g).expect("group fits"),
-        )
-    });
+    log.push_group(5, 16, schema, &batch, |g| log.writer.write(g));
 
     let msg = group_at(log.log(), 0);
     let mut with_rows = 0;
@@ -780,6 +783,37 @@ fn restamp_header(log: &TestLog, edit: impl FnOnce(&mut [u8])) {
     gnitz_wire::write_u64_le(hdr, OFF_DIGEST, digest);
 }
 
+/// Every scalar the group header carries survives `write_slots` →
+/// `probe_header`. A header is authenticated by a digest over its whole span, so
+/// an encode/decode offset that drifted would verify and hand back the wrong
+/// field value with no error anywhere.
+#[test]
+fn every_header_field_round_trips() {
+    let log = TestLog::new(1 << 20, 3, 7);
+    let payloads: [&[u8]; 3] = [&[0u8; 8], &[], &[0u8; 24]];
+    log.try_write(
+        0xABCD_1234,
+        0x0102_0304_0506_0708,
+        SalMessageKind::Backfill,
+        true,
+        &payloads,
+    )
+    .expect("group fits");
+
+    let hdr = log.log().probe_header(0).expect("the header verifies");
+    assert_eq!(hdr.lsn, 0x0102_0304_0506_0708);
+    assert_eq!(hdr.kind, SalMessageKind::Backfill.as_wire());
+    assert_eq!(hdr.zone_start, 1);
+    assert_eq!(hdr.target_id, 0xABCD_1234);
+    assert_eq!(hdr.epoch, 7);
+    assert_eq!(hdr.slots(), 3, "the slot count is the directory's own length");
+    assert_eq!(
+        super::dir_sizes(hdr.dir).collect::<Vec<_>>(),
+        vec![8, 0, 24],
+        "every directory entry, the empty slot included"
+    );
+}
+
 /// Every kind a writer can name reads back as itself, under both zone-start
 /// values.
 #[test]
@@ -847,7 +881,7 @@ fn the_live_path_parks_on_a_leftover_whose_prefix_epoch_was_raised() {
         let word = log.ptr() as *mut u64;
         *word = (*word & 0xFFFF_FFFF) | (2u64 << 32);
     }
-    let reader = unsafe { SalReader::new(log.ptr() as *const u8, 0, log.size, 1) };
+    let reader = SalReader::new(log.log(), 0, 1);
     assert!(
         reader.next().is_none(),
         "a previous epoch's group must park, whatever its prefix claims"
@@ -884,11 +918,11 @@ fn the_live_path_aborts_on_a_damaged_header_internal() {
     let log = TestLog::new(1 << 20, 1, 1);
     log.write(7, 11, SalMessageKind::Scan, &[&[0u8; 32]]);
     // A sanity read before the damage, so the abort below is the damage.
-    let reader = unsafe { SalReader::new(log.ptr() as *const u8, 0, log.size, 0) };
+    let reader = SalReader::new(log.log(), 0, 0);
     assert!(reader.next().is_some());
     unsafe { *log.ptr().add(PREFIX_BYTES) ^= 1 };
 
-    let reader = unsafe { SalReader::new(log.ptr() as *const u8, 0, log.size, 0) };
+    let reader = SalReader::new(log.log(), 0, 0);
     let _ = reader.next();
     unreachable!("a damaged header on the live path must fail-stop, not park");
 }

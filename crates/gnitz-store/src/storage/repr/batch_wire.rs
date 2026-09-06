@@ -20,37 +20,32 @@ use super::shard_file;
 use crate::schema::SchemaDescriptor;
 use gnitz_wire::wal;
 
-/// Region byte sizes of the WAL wire block for `count` rows of `schema`, in
-/// canonical order (pk, weight, null_bmp, payload…, blob = `blob_size`), plus
-/// the region count. The schema-level face of the writer↔reader region
-/// contract (`strides_from_schema`) for callers that size or frame a block
-/// without holding a `Batch`.
-pub(crate) fn wire_region_sizes(
+/// Region byte sizes of the WAL wire block for `count` rows of `schema` into
+/// `out` — canonical order (pk, weight, null_bmp, payload…, blob), returning the
+/// region count. The schema-level face of the writer↔reader region contract
+/// (`strides_from_schema`), for a caller holding no `Batch`. Out-parameter like
+/// `compute_offsets_into`: 276 bytes, so a return costs two memcpys per call.
+pub(crate) fn wire_region_sizes_into(
     schema: &SchemaDescriptor,
     count: usize,
     blob_size: usize,
-) -> ([u32; MAX_WIRE_REGIONS], usize) {
+    out: &mut [u32; MAX_WIRE_REGIONS],
+) -> usize {
     let (strides, nr) = strides_from_schema(schema);
     let nr = nr as usize;
-    let mut sizes = [0u32; MAX_WIRE_REGIONS];
-    for (size, &stride) in sizes[..nr].iter_mut().zip(&strides[..nr]) {
+    for (size, &stride) in out[..nr].iter_mut().zip(&strides[..nr]) {
         *size = (count * stride as usize) as u32;
     }
-    sizes[nr] = blob_size as u32;
-    (sizes, nr + 1)
+    out[nr] = blob_size as u32;
+    nr + 1
 }
 
 /// Total WAL-block byte size for `count` rows of `schema` carrying `blob_size`
-/// heap bytes — `wire_region_sizes` fed through the shared block framer.
+/// heap bytes — `wire_region_sizes_into` fed through the shared block framer.
 pub fn wire_block_size(schema: &SchemaDescriptor, count: usize, blob_size: usize) -> usize {
-    let (sizes, nr) = wire_region_sizes(schema, count, blob_size);
+    let mut sizes = [0u32; MAX_WIRE_REGIONS];
+    let nr = wire_region_sizes_into(schema, count, blob_size, &mut sizes);
     wal::block_size(&sizes[..nr])
-}
-
-/// Header + directory bytes of a wire block for `schema` — the fixed prefix
-/// preceding the first region (a zero-row, zero-blob block is exactly this).
-pub(crate) fn wire_header_dir_size(schema: &SchemaDescriptor) -> usize {
-    wire_block_size(schema, 0, 0)
 }
 
 impl Batch {
@@ -254,16 +249,17 @@ impl Batch {
         checksum: bool,
     ) -> usize {
         let count = indices.len();
-        let total_size = wire_block_size(schema, count, 0);
+        // Region sizes in canonical order: pk, weight, null_bmp, payload…, blob(0).
+        let mut sizes = [0u32; MAX_WIRE_REGIONS];
+        let nr = wire_region_sizes_into(schema, count, 0, &mut sizes);
+        let total_size = wal::block_size(&sizes[..nr]);
         let block = &mut out[offset..offset + total_size];
 
-        // Region sizes in canonical order: pk, weight, null_bmp, payload…, blob(0).
-        let (sizes, nr) = wire_region_sizes(schema, count, 0);
-        wal::write_header_and_directory(block, table_id, count as u32, &sizes[..nr], total_size);
+        wal::write_header_and_directory(block, table_id, count as u32, sizes[..nr].iter().copied(), total_size);
 
         // The writer carves `rest` (body after header+directory) into per-region
         // slices: [pk | weight | null | col_0 | ...], each sized for `count` rows.
-        let (_, rest) = block.split_at_mut(wire_header_dir_size(schema));
+        let (_, rest) = block.split_at_mut(wal::body_start(nr));
         // No German-string columns here; `DirectWriter` still
         // wants a blob arena, so hand it a 0-cap stack local it must not grow.
         let mut empty_blob: Vec<u8> = Vec::new();

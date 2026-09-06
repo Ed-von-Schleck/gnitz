@@ -1,7 +1,7 @@
 //! SAL (shared append-only log): master→worker broadcast channel.
 //!
-//! Owns the mmap layout, group-header write/read helpers, SalWriter,
-//! SalMessage, SalLog/SalReader.
+//! Owns the mmap layout, group-header write/read helpers, SalWriter and its
+//! SalScope, SalMessage, SalLog/SalReader.
 //!
 //! The **zone protocol** — both directions of it, the commit sentinel a writer
 //! emits and the recovery walk a reader decides zone commitment with — lives in
@@ -17,8 +17,14 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::runtime::wire::{WireData, WireMsg};
+use gnitz_store::foundation::fault::Seam;
 use gnitz_wire::{align8, read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 use gnitz_wire::{WireFault, MAX_WORKERS, STATUS_SAL_FULL};
+
+/// `GNITZ_INJECT_SAL_ZONE_PANIC=<scope tag>`: crash the master between a zone's
+/// groups publishing and its sentinel. The tag (`"ddl"` / `"commit"`) picks
+/// which scope aborts.
+static ZONE_PANIC: Seam = Seam::new("GNITZ_INJECT_SAL_ZONE_PANIC");
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -48,6 +54,9 @@ const OFF_EPOCH: usize = 20;
 const OFF_DIGEST: usize = 24;
 const OFF_DIRECTORY: usize = 32;
 
+/// One directory entry: a slot's size as a little-endian `u32`.
+const DIR_ENTRY_BYTES: usize = 4;
+
 /// The header's fixed prefix — every scalar field, ending where the directory
 /// begins. Read as a `&[u8; HDR_PREFIX]` so the field reads are provably in
 /// bounds at const offsets.
@@ -61,7 +70,7 @@ const HDR_PREFIX: usize = OFF_DIRECTORY;
 /// reader that slot 5 of a 2-slot group is empty rather than a leftover.
 #[inline]
 const fn group_header_size(slots: usize) -> usize {
-    OFF_DIRECTORY + align8(slots * 4)
+    OFF_DIRECTORY + align8(slots * DIR_ENTRY_BYTES)
 }
 
 // Every group base is `PREFIX_BYTES`-aligned, because `payload_size` is a
@@ -96,26 +105,30 @@ fn slot_spans(sizes: impl Iterator<Item = u32>) -> impl Iterator<Item = (usize, 
 /// A group's payload bytes: header + directory + `align8`-padded slots — where
 /// [`slot_spans`] would leave off. The publication prefix in front is NOT
 /// included; [`group_total_size`] is the footprint with it.
-fn group_payload_size(hdr_size: usize, sizes: impl Iterator<Item = u32>) -> usize {
-    hdr_size + sizes.map(|sz| align8(sz as usize)).sum::<usize>()
+///
+/// The header width is derived from `slots` rather than passed beside it, so a
+/// caller cannot size a directory for one slot count and pad slots for another.
+fn group_payload_size(slots: usize, sizes: impl Iterator<Item = u32>) -> usize {
+    group_header_size(slots) + sizes.map(|sz| align8(sz as usize)).sum::<usize>()
 }
 
 /// The SAL bytes a group occupies: prefix, header, directory and padded slots —
 /// what the write cursor advances by.
-fn group_total_size(hdr_size: usize, sizes: impl Iterator<Item = u32>) -> usize {
-    PREFIX_BYTES + group_payload_size(hdr_size, sizes)
+fn group_total_size(slots: usize, sizes: impl Iterator<Item = u32>) -> usize {
+    PREFIX_BYTES + group_payload_size(slots, sizes)
 }
 
 /// A group's directory bytes read back as slot sizes.
 fn dir_sizes(dir: &[u8]) -> impl Iterator<Item = u32> + '_ {
-    dir.chunks_exact(4).map(|c| read_u32_le(c, 0))
+    dir.chunks_exact(DIR_ENTRY_BYTES).map(|c| read_u32_le(c, 0))
 }
 
 /// Which of a group's slots are written, and the request id each answers on.
 #[derive(Clone, Copy)]
 pub(crate) enum GroupTargets<'a> {
-    /// Broadcast; no slot answers. Every slot's request id is 0.
-    AllSilent,
+    /// Broadcast on request id 0. A slot that answers anyway is harvested by
+    /// ring position — `Flush`, `FlushEph` and `Tick` all do.
+    AllUnaddressed,
     /// Broadcast; slot `w` answers on `ids[w]`. `ids.len()` must be `nw`.
     All(&'a [u64]),
     /// Only `worker`'s slot is written, and it answers on `req_id`.
@@ -155,13 +168,11 @@ pub(crate) struct DirectGroup<'a> {
     /// The header's `lsn` field: a zone LSN, a tick round or a checkpoint
     /// generation by kind; `0` for every other command.
     pub(crate) lsn: u64,
-    /// Whether this group belongs to the atomic zone at `lsn`. The writer opens
-    /// the zone on the first zoned group it admits and closes it on
-    /// [`SalWriter::close_zone`]; callers never say which group is first.
-    pub(crate) zoned: bool,
     /// Every slot's message but its `data` and `request_id`, which `msg` fills
     /// from `data`/`targets` — set either of those here and the per-worker fill
-    /// overwrites it (debug-asserted in `msg`).
+    /// overwrites it (debug-asserted in `msg`). `schema_block` is read from here
+    /// and dropped per slot, on the rule
+    /// [`SalMessageKind::schema_survives_a_rowless_slot`] states.
     pub(crate) template: WireMsg<'a>,
     pub(crate) data: GroupData<'a>,
     pub(crate) targets: GroupTargets<'a>,
@@ -174,15 +185,18 @@ impl<'a> DirectGroup<'a> {
         DirectGroup {
             kind,
             lsn: 0,
-            zoned: false,
             template: WireMsg::default(),
             data: GroupData::NONE,
-            targets: GroupTargets::AllSilent,
+            targets: GroupTargets::AllUnaddressed,
         }
     }
 
     /// Worker `w`'s message. The one definition — sizing and encoding both go
     /// through it, so a slot's size and its bytes cannot disagree.
+    ///
+    /// `#[inline]` so the sizing caller's dead field stores fold away: 144 bytes
+    /// otherwise come back by `sret`, once per slot per group.
+    #[inline]
     fn msg(&self, w: usize) -> WireMsg<'a> {
         debug_assert!(
             matches!(self.template.data, WireData::Whole(None)) && self.template.request_id == 0,
@@ -196,7 +210,7 @@ impl<'a> DirectGroup<'a> {
         WireMsg {
             data,
             request_id: match self.targets {
-                GroupTargets::AllSilent => 0,
+                GroupTargets::AllUnaddressed => 0,
                 GroupTargets::All(ids) => ids[w],
                 GroupTargets::One { req_id, .. } => req_id,
             },
@@ -205,22 +219,23 @@ impl<'a> DirectGroup<'a> {
         }
     }
 
-    /// Every slot's size, zero for the ones this group does not write.
+    /// Every slot's size into `out`, zero for the ones this group does not
+    /// write — `out.len()` is the group's slot count, and every element is
+    /// assigned, so no stale entry can claim a slot the group never filled.
     ///
     /// A written slot is never zero-size — every slot carries a control block
     /// whatever else it does — which is what lets [`SalReader::next`] read an
     /// empty slot as "not for this worker". The assert below is where that would
     /// break.
-    fn slot_sizes(&self, nw: usize) -> [u32; MAX_WORKERS] {
-        let mut sizes = [0u32; MAX_WORKERS];
-        for (w, size) in sizes.iter_mut().enumerate().take(nw) {
+    fn slot_sizes_into(&self, out: &mut [u32]) {
+        for (w, size) in out.iter_mut().enumerate() {
             if matches!(self.targets, GroupTargets::One { worker, .. } if w != worker) {
+                *size = 0;
                 continue;
             }
             *size = self.msg(w).size() as u32;
             debug_assert!(*size > 0, "a written slot always carries at least a control block");
         }
-        sizes
     }
 }
 
@@ -259,6 +274,9 @@ const CHECKPOINT_RESERVE: usize = 64 << 10;
 /// in its epoch) keeps only the sentinel headroom; the sentinel keeps only the
 /// checkpoint band; everything else keeps both. Every arm is >= PREFIX_BYTES,
 /// which is what keeps a group's terminating prefix inside the mapping.
+///
+/// `Shutdown`'s arm is what makes the worker reap terminate: `shutdown_workers`
+/// blocks in `waitpid` after broadcasting it.
 const fn held_back(kind: SalMessageKind) -> usize {
     match kind {
         SalMessageKind::Shutdown | SalMessageKind::Flush | SalMessageKind::FlushEph => SENTINEL_SIZE,
@@ -268,14 +286,19 @@ const fn held_back(kind: SalMessageKind) -> usize {
     }
 }
 
-/// The highest byte a group of this kind may occupy. Saturating: the master
-/// unit-test fixture maps 4 KiB, below `CHECKPOINT_RESERVE`.
+/// The highest byte a group of this kind may occupy. Saturating because nothing
+/// structurally bounds a [`SalWriter::new`] below `CHECKPOINT_RESERVE`, and a
+/// release build would otherwise wrap to a cap past the end of the mapping.
 fn effective_max(kind: SalMessageKind, mmap_size: usize) -> usize {
     mmap_size.saturating_sub(held_back(kind))
 }
 
 /// Whether a group of a given size can be written, and if not, whether a
 /// checkpoint would change that.
+///
+/// A **pre-write** verdict, and the only place the distinction is visible: a
+/// group already handed to the writer comes back as a [`WireFault`], so no write
+/// path can tell "retry in pieces" from "checkpoint and retry whole".
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SalFit {
     /// Fits the remaining space — emit it.
@@ -293,7 +316,7 @@ impl SalFit {
     /// from a real failure; the transient/terminal distinction stays typed and is
     /// not spelled into the text. The write cursor is deliberately absent — this
     /// reaches clients verbatim — and goes to the operator log instead.
-    pub(crate) fn refusal(self, kind: SalMessageKind) -> WireFault {
+    fn refusal(self, kind: SalMessageKind) -> WireFault {
         debug_assert_ne!(self, SalFit::Fits, "a fitting group has no refusal");
         WireFault {
             status: STATUS_SAL_FULL,
@@ -306,24 +329,27 @@ impl SalFit {
 /// plus the checkpoint headroom.
 const MIN_SAL_BYTES: usize = 16 << 20;
 
-/// The SAL mmap size in bytes. `SAL_MMAP_SIZE` (1 GiB) is the production default;
-/// `GNITZ_SAL_BYTES` overrides it downward. This exists because each server
-/// eagerly `fallocate`s the *whole* SAL at startup, so on a shared data_dir
-/// filesystem (e.g. a tmpfs `/tmp`) many servers spawning in parallel can
-/// exhaust it — the integration test harness spawns dozens at once, so it sets
-/// a small value. The size is read once and cached: the master and its `fork()`ed
-/// workers inherit both the env and this cache, so they can never disagree on the
-/// wrap arithmetic. The override is clamped to `[MIN_SAL_BYTES, SAL_MMAP_SIZE]`.
-pub(crate) fn sal_mmap_size() -> usize {
-    use std::sync::OnceLock;
-    static SIZE: OnceLock<usize> = OnceLock::new();
-    *SIZE.get_or_init(|| {
-        gnitz_store::foundation::env::env_num("GNITZ_SAL_BYTES", SAL_MMAP_SIZE).clamp(MIN_SAL_BYTES, SAL_MMAP_SIZE)
-    })
+/// `SAL_MMAP_SIZE` (1 GiB), or `GNITZ_SAL_BYTES` clamped into
+/// `[MIN_SAL_BYTES, SAL_MMAP_SIZE]` and logged when the clamp moves it. The
+/// override exists because each server `fallocate`s its whole SAL at startup, so
+/// dozens of test servers sharing a tmpfs would exhaust it. Called once, by the
+/// boot that maps the SAL; every consumer carries the length beside the pointer.
+pub(in crate::runtime) fn sal_mmap_size() -> usize {
+    let asked = gnitz_store::foundation::env::env_num("GNITZ_SAL_BYTES", SAL_MMAP_SIZE);
+    let size = asked.clamp(MIN_SAL_BYTES, SAL_MMAP_SIZE);
+    if size != asked {
+        gnitz_info!("GNITZ_SAL_BYTES={asked} is outside [{MIN_SAL_BYTES}, {SAL_MMAP_SIZE}]; using {size}");
+    }
+    size
 }
 
-/// The fraction of the mapping the reclaim margin is: `mmap >> 3`, one eighth.
+/// The fraction of the mapping the relay reclaim margin is: `mmap >> 3`, one
+/// eighth. How much must be **free**.
 const RECLAIM_FRACTION_SHIFT: u32 = 3;
+
+/// The fraction past which a backfill reclaims first: how much must already be
+/// **written**, against [`RECLAIM_FRACTION_SHIFT`]'s **free**.
+const BACKFILL_RECLAIM_SHIFT: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Group kinds
@@ -353,33 +379,36 @@ gnitz_wire::wire_enum! {
         HasPk = 7,
         /// CREATE UNIQUE INDEX pre-flight: stream the sorted key spans of the
         /// column list in `seek_col_idx` for the master's merge.
-        UniquePreflight = 9,
-        Push = 10,
+        UniquePreflight = 8,
+        Push = 9,
         /// Drive one view-maintenance tick.
-        Tick = 11,
-        SeekByIndex = 12,
-        Seek = 13,
+        Tick = 10,
+        SeekByIndex = 11,
+        Seek = 12,
         /// A parameterized bounded read (`ReadSpec`).
-        ScanSpec = 14,
+        ScanSpec = 13,
         /// A `ScanSpec` with a delta bound. Its own kind because the worker's
         /// inline-vs-defer matrix is a function of `(context, kind)` alone.
-        DeltaScanSpec = 15,
+        DeltaScanSpec = 14,
         /// The zone-closing commit sentinel: a slotless group no worker acts on.
         /// All preceding groups at the same LSN belong to the zone; recovery
         /// applies them only when this reaches disk.
-        ZoneCommit = 16,
+        ZoneCommit = 15,
     }
 }
 
 impl SalMessageKind {
     /// Whether a slot of this kind still needs the group's schema block when it
-    /// carries no rows. Only a `Push` does not: its rowless slots are the ones a
-    /// scatter left empty, and every consumer reaches its own no-op before asking
-    /// for a schema. An `ExchangeRelay`'s block *is* the payload of an empty slot
-    /// — the worker builds its batch from it and `fatal_shutdown`s without one —
-    /// and so is every other kind's, until one says otherwise here.
+    /// carries no rows — the *handler's* behaviour on an empty slot decides, so
+    /// this is per-kind and not per-writer: an `ExchangeRelay` builds its batch
+    /// from the block alone, a `Push` reaches a no-op, a `HasPk` derives its own.
     fn schema_survives_a_rowless_slot(self) -> bool {
-        self != SalMessageKind::Push
+        use SalMessageKind::*;
+        match self {
+            Push | HasPk => false,
+            Scan | Shutdown | Flush | FlushEph | DdlSync | ExchangeRelay | Backfill | UniquePreflight | Tick
+            | SeekByIndex | Seek | ScanSpec | DeltaScanSpec | ZoneCommit => true,
+        }
     }
 }
 
@@ -448,7 +477,7 @@ impl SalMessage {
     /// blocks across all of them, not only the reader's own, so its verdict does
     /// not depend on which worker asked.
     pub(crate) fn slots(&self) -> u32 {
-        (self.dir.len() / 4) as u32
+        (self.dir.len() / DIR_ENTRY_BYTES) as u32
     }
 
     /// Slot `w`'s bytes, or `None` when this group did not write it (`w` at or
@@ -512,8 +541,20 @@ struct GroupHeader {
     zone_start: u8,
     target_id: u32,
     epoch: u32,
-    /// One little-endian `u32` size per slot, `slots * 4` bytes.
+    /// One little-endian `u32` size per slot, `slots * DIR_ENTRY_BYTES` bytes.
     dir: &'static [u8],
+}
+
+impl GroupHeader {
+    /// The group's slot count, off the directory it was written with.
+    fn slots(&self) -> usize {
+        self.dir.len() / DIR_ENTRY_BYTES
+    }
+
+    /// The publication prefix word this group publishes with.
+    fn prefix_word(&self) -> u64 {
+        pack_prefix(self.epoch, group_payload_size(self.slots(), dir_sizes(self.dir)))
+    }
 }
 
 /// The SAL mapping, as anything that reads it sees it.
@@ -582,7 +623,7 @@ impl SalLog {
             zone_start: prefix[OFF_ZONE_START],
             target_id: read_u32_le(prefix, OFF_TARGET_ID),
             epoch: read_u32_le(prefix, OFF_EPOCH),
-            dir: &hdr[OFF_DIRECTORY..OFF_DIRECTORY + slots * 4],
+            dir: &hdr[OFF_DIRECTORY..OFF_DIRECTORY + slots * DIR_ENTRY_BYTES],
         })
     }
 
@@ -624,8 +665,8 @@ impl SalLog {
         // The stride comes from the authenticated directory, not from the
         // prefix's `payload_size` copy, so a flipped `payload_size` changes no
         // verdict.
-        let hdr_len = group_header_size(hdr.dir.len() / 4);
-        let total = group_total_size(hdr_len, dir_sizes(hdr.dir));
+        let hdr_len = group_header_size(hdr.slots());
+        let total = group_total_size(hdr.slots(), dir_sizes(hdr.dir));
         if cursor as usize + total > self.mmap_size {
             return SalStep::Absent;
         }
@@ -650,8 +691,9 @@ impl SalLog {
     }
 
     /// Every aligned candidate at or after `from` whose header verifies, as
-    /// `(base, epoch)`. The prefix test before the digest keeps the zero run of a
-    /// partly-used ring free of hashing.
+    /// `(base, epoch)`. The prefix test in front of the digest is what keeps a
+    /// rolled-back group — digest-valid at the live epoch behind a zero prefix,
+    /// and fsynced there — out of a resync; it also leaves a zero run unhashed.
     fn valid_headers_from(&self, from: u64) -> impl Iterator<Item = (u64, u32)> + '_ {
         (from..self.mmap_size as u64)
             .step_by(PREFIX_BYTES)
@@ -688,13 +730,13 @@ impl SalLog {
 // SalWriter
 // ---------------------------------------------------------------------------
 
-/// The cursor and zone state a deferred group can be rolled back to. Taken
-/// before a group is laid out and consumed only by
-/// [`DeferredPublication::roll_back`].
+/// The cursor and zone state a group laid out in a scope can be rolled back to.
+/// Taken before a group is laid out and consumed only by
+/// [`SalScope::roll_back`].
 #[derive(Clone, Copy)]
 pub(crate) struct Savepoint {
     cursor: u64,
-    zone: Option<u64>,
+    zone_open: bool,
 }
 
 pub(crate) struct SalWriter {
@@ -703,13 +745,10 @@ pub(crate) struct SalWriter {
     mmap_size: usize,
     write_cursor: Cell<u64>,
     epoch: Cell<u32>,
-    /// `Some(lsn)` while the atomic zone at `lsn` is open: the first zoned group
-    /// admitted opens it, [`Self::close_zone`] closes it. A zoned group written
-    /// while it is `None` is the zone's start group.
-    zone: Cell<Option<u64>>,
-    /// `Some(cursor)` while a [`Self::defer_publication`] scope is open: every
-    /// group laid out from `cursor` on is unpublished until the scope ends.
-    deferred_from: Cell<Option<u64>>,
+    /// True while a [`Self::begin`] scope is open: two overlapping scopes would
+    /// each roll the shared write cursor back under the other, and a
+    /// [`Self::rewind`] inside one would lose its groups.
+    scope_open: Cell<bool>,
     checkpoint_threshold: u64,
     /// A group was refused as [`SalFit::Transient`] since the last reset: a
     /// checkpoint would admit it, so one is warranted whatever the write cursor
@@ -733,8 +772,7 @@ impl SalWriter {
             mmap_size,
             write_cursor: Cell::new(0),
             epoch: Cell::new(0),
-            zone: Cell::new(None),
-            deferred_from: Cell::new(None),
+            scope_open: Cell::new(false),
             checkpoint_threshold,
             refused_transient: Cell::new(false),
             num_workers,
@@ -770,15 +808,14 @@ impl SalWriter {
         )
     }
 
-    /// Whether more than the reclaim margin is already written — the opposite
-    /// sense to [`Self::below_reclaim_margin`], which asks for that much *free*.
-    pub(crate) fn past_reclaim_margin(&self) -> bool {
-        self.write_cursor.get() as usize > self.reclaim_margin()
+    /// Whether enough is already written that a backfill should reclaim before
+    /// it starts: more than [`BACKFILL_RECLAIM_SHIFT`] of the mapping.
+    pub(crate) fn past_backfill_reclaim_threshold(&self) -> bool {
+        self.write_cursor.get() as usize > (self.mmap_size >> BACKFILL_RECLAIM_SHIFT)
     }
 
     /// Less than the reclaim margin is free, so a relay-sized group would be
-    /// refused — the opposite sense to [`Self::past_reclaim_margin`], which asks
-    /// whether that much is already *written*.
+    /// refused.
     pub(crate) fn below_reclaim_margin(&self) -> bool {
         self.fit_relay(0) != SalFit::Fits
     }
@@ -786,15 +823,15 @@ impl SalWriter {
     /// The margin below which the SAL is "running low": one eighth of the
     /// mapping. The single name for it — a relay is refused below it so the
     /// reclaim lands on a writer with room to spare rather than on one that has
-    /// run out. Strictly under every kind's cap, so `fit_relay` still answers
-    /// [`SalFit::Terminal`] only when `need` itself is too large.
+    /// run out.
     fn reclaim_margin(&self) -> usize {
         self.mmap_size >> RECLAIM_FRACTION_SHIFT
     }
 
     /// Lay one group out at the write cursor, `fill(worker, slot)` per non-empty
-    /// slot, and publish it unless a [`Self::defer_publication`] scope is open.
-    /// A refused group leaves the log untouched. Zone state is [`Self::write`]'s.
+    /// slot, and return `(base, prefix word)` — the group is complete on the log
+    /// but not yet published, which [`Self::publish`] does. A refused group
+    /// leaves the log untouched.
     fn write_slots(
         &self,
         target_id: u32,
@@ -803,7 +840,7 @@ impl SalWriter {
         zone_start: bool,
         sizes: &[u32],
         mut fill: impl FnMut(usize, &mut [u8]),
-    ) -> Result<(), SalFit> {
+    ) -> Result<(usize, u64), SalFit> {
         assert!(
             sizes.len() <= MAX_WORKERS,
             "a SAL group cannot carry more than MAX_WORKERS slots"
@@ -817,12 +854,12 @@ impl SalWriter {
         // The header size is a multiple of 8 and every slot contributes
         // align8(sz), so `payload_size` is always a multiple of 8.
         let hdr_size = group_header_size(sizes.len());
-        let payload_size = group_payload_size(hdr_size, sizes.iter().copied());
+        let payload_size = group_payload_size(sizes.len(), sizes.iter().copied());
         let total = PREFIX_BYTES + payload_size;
         let fit = self.fit_within(effective_max(kind, self.mmap_size), total);
         if fit != SalFit::Fits {
-            // On the writer, not on the deferred-publication scope: the group did
-            // not fit whether or not a rolled-back transaction contained it.
+            // On the writer, not on the scope: the group did not fit whether or
+            // not a rolled-back transaction contained it.
             if fit == SalFit::Transient {
                 self.refused_transient.set(true);
             }
@@ -874,10 +911,7 @@ impl SalWriter {
         write_u64_le(hdr, OFF_DIGEST, digest);
 
         self.write_cursor.set(end as u64);
-        if self.deferred_from.get().is_none() {
-            self.publish(base, pack_prefix(epoch, payload_size));
-        }
-        Ok(())
+        Ok((base, pack_prefix(epoch, payload_size)))
     }
 
     /// The Release store that makes one laid-out group visible.
@@ -885,26 +919,54 @@ impl SalWriter {
         unsafe { prefix_atomic(self.ptr, base).store(word, Ordering::Release) };
     }
 
-    /// Open a deferred-publication scope: groups laid out while the guard lives
-    /// are invisible and can be rolled back; dropping it (unwinding included)
-    /// publishes them in layout order. Hold `sal_writer_excl` and do not suspend
-    /// inside the scope.
-    pub(crate) fn defer_publication(&self) -> DeferredPublication<'_> {
-        debug_assert!(
-            self.deferred_from.get().is_none(),
-            "a deferred-publication scope is already open"
-        );
-        self.deferred_from.set(Some(self.write_cursor.get()));
-        DeferredPublication { writer: self }
+    /// Publish every group laid out in `[from, end)`, in layout order — each
+    /// re-read off its own digested header, which already gives its stride.
+    fn publish_range(&self, from: u64, end: u64) {
+        let log = self.log();
+        let mut off = from;
+        while off < end {
+            let hdr = log
+                .probe_header(off)
+                .expect("a group laid out in this scope verifies at its own offset");
+            self.publish(off as usize, hdr.prefix_word());
+            off += group_total_size(hdr.slots(), dir_sizes(hdr.dir)) as u64;
+        }
     }
 
-    /// Encode a group's per-worker wire messages directly into the SAL mmap.
-    /// Does NOT sync/signal.
-    ///
-    /// A zoned group opens the zone when none is open — that is the group
-    /// recovery reads as the zone's start — and otherwise must carry the open
-    /// zone's LSN. A refused group opens nothing.
-    pub(crate) fn write(&self, g: &DirectGroup) -> Result<(), SalFit> {
+    /// This writer's mapping as a reader sees it.
+    fn log(&self) -> SalLog {
+        // SAFETY: the same mapping this writer was constructed over.
+        unsafe { SalLog::new(self.ptr, self.mmap_size) }
+    }
+
+    /// Open a publication scope at `lsn`: groups laid out in it are invisible
+    /// until [`SalScope::commit`], and an uncommitted drop discards the span.
+    /// `tag` names the scope for [`ZONE_PANIC`]. Hold `sal_writer_excl` and do
+    /// not suspend inside it.
+    pub(crate) fn begin(&self, lsn: u64, tag: &'static str) -> SalScope<'_> {
+        debug_assert!(!self.scope_open.get(), "a SAL scope is already open");
+        self.scope_open.set(true);
+        SalScope {
+            writer: self,
+            from: self.write_cursor.get(),
+            lsn,
+            tag,
+            zone_open: Cell::new(false),
+            committed: Cell::new(false),
+        }
+    }
+
+    /// Encode a group's per-worker wire messages directly into the SAL mmap and
+    /// publish it. Does NOT sync/signal.
+    pub(crate) fn write(&self, g: &DirectGroup) -> Result<(), WireFault> {
+        let (base, word) = self.lay_out(g, g.lsn, false)?;
+        self.publish(base, word);
+        Ok(())
+    }
+
+    /// Lay `g` out at the write cursor, unpublished, stamped with `lsn` and
+    /// `zone_start`. The one encode path, for both writers above.
+    fn lay_out(&self, g: &DirectGroup, lsn: u64, zone_start: bool) -> Result<(usize, u64), WireFault> {
         let nw = self.num_workers;
         if let GroupTargets::All(ids) = g.targets {
             assert_eq!(ids.len(), nw, "req_ids.len()={} != num_workers={}", ids.len(), nw);
@@ -916,17 +978,12 @@ impl SalWriter {
             g.template.schema_block.is_some() || g.data.is_dataless(),
             "data without a schema — `decode_wire` rejects FLAG_HAS_DATA without FLAG_HAS_SCHEMA",
         );
-        let zone_start = g.zoned && self.zone.get().is_none();
-        if g.zoned {
-            if let Some(open) = self.zone.get() {
-                debug_assert_eq!(open, g.lsn, "a zoned group must carry the open zone's LSN");
-            }
-        }
 
-        let sizes = g.slot_sizes(nw);
+        let mut sizes = [0u32; MAX_WORKERS];
+        g.slot_sizes_into(&mut sizes[..nw]);
         self.write_slots(
             g.template.target_id as u32,
-            g.lsn,
+            lsn,
             g.kind,
             zone_start,
             &sizes[..nw],
@@ -934,11 +991,8 @@ impl SalWriter {
                 let written = g.msg(w).encode(slot, 0);
                 debug_assert_eq!(written, slot.len());
             },
-        )?;
-        if g.zoned {
-            self.zone.set(Some(g.lsn));
-        }
-        Ok(())
+        )
+        .map_err(|fit| fit.refusal(g.kind))
     }
 
     /// The exact number of SAL bytes [`Self::write`] will consume for `g`.
@@ -946,7 +1000,9 @@ impl SalWriter {
     /// back by the fit check.
     pub(crate) fn footprint(&self, g: &DirectGroup) -> usize {
         let nw = self.num_workers;
-        group_total_size(group_header_size(nw), g.slot_sizes(nw)[..nw].iter().copied())
+        let mut sizes = [0u32; MAX_WORKERS];
+        g.slot_sizes_into(&mut sizes[..nw]);
+        group_total_size(nw, sizes[..nw].iter().copied())
     }
 
     /// Whether a checkpoint is warranted: the write cursor has crossed the
@@ -961,11 +1017,7 @@ impl SalWriter {
     /// 0 see nothing until this epoch writes.
     fn rewind(&self, epoch: u32) {
         debug_assert!(epoch >= 1, "the first live SAL epoch is 1");
-        debug_assert!(
-            self.deferred_from.get().is_none(),
-            "a rewind inside a deferred scope loses its groups"
-        );
-        debug_assert!(self.zone.get().is_none(), "a rewind inside an open zone loses it");
+        debug_assert!(!self.scope_open.get(), "a rewind inside an open scope loses its groups");
         self.write_cursor.set(0);
         self.epoch.set(epoch);
         self.refused_transient.set(false);
@@ -992,47 +1044,91 @@ impl SalWriter {
     }
 }
 
-/// An open deferred-publication scope; see [`SalWriter::defer_publication`].
-pub(crate) struct DeferredPublication<'a> {
+/// One publication span on the SAL, and the atomic zone's lifetime: a `zoned`
+/// group joins the zone at `lsn` (the first is its zone-start group), and
+/// [`Self::commit`] closes it. Nothing is visible until then, so a zone that
+/// runs out of space part-way is taken back whole. See [`SalWriter::begin`].
+pub(crate) struct SalScope<'a> {
     writer: &'a SalWriter,
+    /// Where the scope opened — the start of its publish range, and where an
+    /// uncommitted drop puts the write cursor back.
+    from: u64,
+    /// Stamped on every group written in the scope, and on the sentinel.
+    lsn: u64,
+    /// Which scope this is, for [`ZONE_PANIC`]: `"ddl"` or `"commit"`.
+    tag: &'static str,
+    zone_open: Cell<bool>,
+    committed: Cell<bool>,
 }
 
-impl DeferredPublication<'_> {
-    /// The point a deferred group can be rolled back to, taken before laying it
-    /// out.
+impl SalScope<'_> {
+    /// Lay `g` out inside the scope, unpublished. `zoned` puts it in the
+    /// scope's atomic zone; the first such group opens it.
+    pub(crate) fn write(&self, g: &DirectGroup, zoned: bool) -> Result<(), WireFault> {
+        debug_assert!(
+            g.lsn == 0 || g.lsn == self.lsn,
+            "a group written in a scope carries the scope's LSN or none"
+        );
+        let zone_start = zoned && !self.zone_open.get();
+        self.writer.lay_out(g, self.lsn, zone_start)?;
+        if zoned {
+            self.zone_open.set(true);
+        }
+        Ok(())
+    }
+
+    /// The point a group laid out in this scope can be rolled back to, taken
+    /// before laying it out.
     pub(crate) fn savepoint(&self) -> Savepoint {
         Savepoint {
             cursor: self.writer.write_cursor.get(),
-            zone: self.writer.zone.get(),
+            zone_open: self.zone_open.get(),
         }
     }
 
     /// Take back every group laid out since `sp`: nothing was published, so
-    /// restoring the cursor and the zone state is the whole undo. The bytes stay
-    /// where they are and the next group overwrites them.
+    /// restoring the cursor and the zone flag is the whole undo.
     pub(crate) fn roll_back(&self, sp: Savepoint) {
         self.writer.write_cursor.set(sp.cursor);
-        self.writer.zone.set(sp.zone);
+        self.zone_open.set(sp.zone_open);
+    }
+
+    /// Write the commit sentinel if a zone is open, publish the span, then
+    /// publish the sentinel — last, so a crash in that gap leaves a zone the
+    /// recovery walk reads as never committed. Answers whether a zone was
+    /// closed; `false` leaves the caller no `fdatasync` to owe. Signals nobody.
+    pub(crate) fn commit(self) -> Result<bool, WireFault> {
+        let sentinel = if self.zone_open.get() {
+            Some(
+                self.writer
+                    .write_slots(0, self.lsn, SalMessageKind::ZoneCommit, false, &[], |_, _| {})
+                    .map_err(|fit| fit.refusal(SalMessageKind::ZoneCommit))?,
+            )
+        } else {
+            None
+        };
+        self.committed.set(true);
+        let end = sentinel.map_or(self.writer.write_cursor.get(), |(base, _)| base as u64);
+        self.writer.publish_range(self.from, end);
+        if ZONE_PANIC.at(self.tag) {
+            // SAFETY: `libc::abort` is the whole reason this block is unsafe; it
+            // takes no argument and cannot violate an invariant.
+            unsafe { libc::abort() };
+        }
+        if let Some((base, word)) = sentinel {
+            self.writer.publish(base, word);
+        }
+        Ok(sentinel.is_some())
     }
 }
 
-impl Drop for DeferredPublication<'_> {
-    /// Publish every group laid out inside the scope, in layout order. Each is
-    /// re-read off its own digested header rather than remembered: the log
-    /// already determines a laid-out group's stride.
+impl Drop for SalScope<'_> {
+    /// An uncommitted scope publishes nothing: the write cursor goes back to
+    /// where it opened and the bytes stay for the next group to overwrite.
     fn drop(&mut self) {
-        let w = self.writer;
-        let from = w.deferred_from.take().expect("the scope is open while its guard lives");
-        let end = w.write_cursor.get();
-        let log = unsafe { SalLog::new(w.ptr, w.mmap_size) };
-        let mut off = from;
-        while off < end {
-            let hdr = log
-                .probe_header(off)
-                .expect("a group laid out in this scope verifies at its own offset");
-            let payload = group_payload_size(group_header_size(hdr.dir.len() / 4), dir_sizes(hdr.dir));
-            w.publish(off as usize, pack_prefix(hdr.epoch, payload));
-            off += (PREFIX_BYTES + payload) as u64;
+        self.writer.scope_open.set(false);
+        if !self.committed.get() {
+            self.writer.write_cursor.set(self.from);
         }
     }
 }
@@ -1054,12 +1150,9 @@ pub(crate) struct SalReader {
 impl SalReader {
     /// The live drain accepts the epoch above the recovered `walk_epoch` — the
     /// one `SalWriter::boot_rewind` starts the master at from that same value.
-    ///
-    /// # Safety
-    /// `ptr` must be a valid mmap pointer of at least `mmap_size` bytes.
-    pub(crate) unsafe fn new(ptr: *const u8, worker_id: u32, mmap_size: usize, walk_epoch: u32) -> Self {
+    pub(crate) fn new(log: SalLog, worker_id: u32, walk_epoch: u32) -> Self {
         SalReader {
-            log: SalLog::new(ptr, mmap_size),
+            log,
             worker_id,
             read_cursor: Cell::new(0),
             expected_epoch: Cell::new(next_epoch(walk_epoch)),

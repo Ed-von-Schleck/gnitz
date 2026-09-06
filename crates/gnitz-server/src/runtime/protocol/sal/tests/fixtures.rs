@@ -6,7 +6,11 @@
 //! the worker drain and the block-integrity suite need a real SAL too.
 
 use super::*;
+use crate::runtime::master::scatter::{with_commit_indices, with_group};
 use crate::runtime::test_support::SharedRegion;
+use crate::runtime::wire as ipc;
+use gnitz_store::schema::SchemaDescriptor;
+use gnitz_store::storage::Batch;
 
 /// A SAL over its own shared region. Every group's framing, digest and cursor
 /// advance come from the code under test rather than from a reimplementation.
@@ -65,21 +69,76 @@ impl TestLog {
         payloads: &[&[u8]],
     ) -> Result<u64, SalFit> {
         let base = self.cursor();
+        let (at, word) = self.lay_out(target, lsn, kind, zone_start, payloads)?;
+        self.writer.publish(at, word);
+        Ok(base)
+    }
+
+    /// [`Self::try_write`] into `scope`, so the group stays unpublished until
+    /// the scope commits. `zone_start` is spelled by the caller, as there.
+    pub(crate) fn try_write_in(
+        &self,
+        scope: &SalScope,
+        target: u32,
+        kind: SalMessageKind,
+        zone_start: bool,
+        payloads: &[&[u8]],
+    ) -> Result<u64, SalFit> {
+        let base = self.cursor();
+        self.lay_out(target, scope.lsn, kind, zone_start, payloads)?;
+        if zone_start {
+            scope.zone_open.set(true);
+        }
+        Ok(base)
+    }
+
+    /// Lay one group of verbatim slot payloads out, unpublished: `(base, prefix
+    /// word)`, the shape [`SalWriter::write_slots`] answers with.
+    fn lay_out(
+        &self,
+        target: u32,
+        lsn: u64,
+        kind: SalMessageKind,
+        zone_start: bool,
+        payloads: &[&[u8]],
+    ) -> Result<(usize, u64), SalFit> {
         let sizes: Vec<u32> = payloads.iter().map(|p| p.len() as u32).collect();
         self.writer
             .write_slots(target, lsn, kind, zone_start, &sizes, |w, slot| {
                 slot.copy_from_slice(payloads[w])
-            })?;
-        Ok(base)
+            })
     }
 
-    /// A raw commit sentinel at `lsn`, whatever zone state the writer holds.
-    /// Returns its base.
+    /// A raw commit sentinel at `lsn` — a slotless group — whatever zone state
+    /// the writer holds. Returns its base.
     pub(crate) fn sentinel(&self, lsn: u64) -> u64 {
+        self.try_write(0, lsn, SalMessageKind::ZoneCommit, false, &[])
+            .expect("sentinel fits")
+    }
+
+    /// One scattered `Push` group of `batch` over this log's slots: rows
+    /// PK-partitioned by `schema`, one request id per slot. `write` decides
+    /// where it goes — the writer's publishes, a scope's defers. Returns its base.
+    pub(crate) fn push_group(
+        &self,
+        lsn: u64,
+        tid: u32,
+        schema: SchemaDescriptor,
+        batch: &Batch,
+        write: impl FnOnce(&DirectGroup) -> Result<(), WireFault>,
+    ) -> u64 {
         let base = self.cursor();
-        self.writer
-            .write_slots(0, lsn, SalMessageKind::ZoneCommit, false, &[], |_, _| {})
-            .expect("sentinel fits");
+        let nw = self.writer.num_workers();
+        let relation = ipc::WireSchema::encoded(tid as i64, schema);
+        let req_ids: Vec<u64> = (0..nw as u64).collect();
+        let group = DirectGroup {
+            targets: GroupTargets::All(&req_ids),
+            lsn,
+            ..DirectGroup::new(SalMessageKind::Push)
+        };
+        with_commit_indices(batch, &schema, nw, |wi| {
+            with_group(batch, wi, &relation, group, write).expect("group fits")
+        });
         base
     }
 }

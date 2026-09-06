@@ -32,10 +32,6 @@ use gnitz_store::foundation::fault::Seam;
 use gnitz_store::storage::Batch;
 use gnitz_wire::{PkColList, WireFault, STATUS_OK};
 
-/// `GNITZ_INJECT_DDL_PANIC=after_broadcasts`: crash the master between a DDL
-/// zone's broadcasts and its commit sentinel.
-static DDL_PANIC: Seam = Seam::new("GNITZ_INJECT_DDL_PANIC");
-
 /// `GNITZ_INJECT_RELAY_HOLD_FOR_DDL`: see `hold_relay_for_ddl`.
 pub(super) static RELAY_HOLD_FOR_DDL: Seam = Seam::new("GNITZ_INJECT_RELAY_HOLD_FOR_DDL");
 
@@ -471,38 +467,28 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
 fn emit_zone_to_sal(shared: &Shared, op: &'static str, zone_lsn: u64) -> FsyncFuture {
     let disp = shared.disp();
     let drained = shared.cat_mut().drain_pending_broadcasts();
-    // Nothing inside the scope is visible until it ends, so a refused group
+    // Nothing inside the scope is visible until it commits, so a refused group
     // leaves no half-written zone behind. The block is synchronous throughout,
-    // which is what the deferred scope requires.
-    let scope = disp.defer_publication();
+    // which is what the scope requires.
+    let scope = disp.begin(zone_lsn, "ddl");
     let emitted = guard_panic(op, || {
         // The wire carries the family as its tid; this is the one place the
         // typed family narrows.
         for (family, bat) in &drained {
-            disp.broadcast_ddl(family.id(), bat, zone_lsn).map_err(|f| f.text)?;
+            disp.broadcast_ddl(&scope, family.id(), bat).map_err(|f| f.text)?;
         }
         Ok(())
     });
-    drop(scope);
     if let Err(e) = emitted {
         gnitz_fatal_abort!("{} broadcast failed after in-memory catalog mutation: {}", op, e);
     }
-    // Abort after the broadcasts are published but BEFORE the commit sentinel —
-    // exercises the recovery skip of a zone whose sentinel never landed. Before
-    // publication it would leave nothing at all, and the recovery tests would
-    // pass for a reason they were not written to check.
-    if DDL_PANIC.at("after_broadcasts") {
-        // SAFETY: `libc::abort` is the whole reason this block is unsafe; it
-        // takes no argument and cannot violate an invariant.
-        unsafe { libc::abort() };
-    }
     // An empty bundle (`apply_and_enqueue_family` drops empty batches) opened no
-    // zone, so this closes nothing and only wakes the workers: every sentinel
-    // follows an ordinary group by construction, which is what keeps a run of
-    // sentinels from reaching the checkpoint reserve.
-    if let Err(e) = disp.commit_zone() {
-        gnitz_fatal_abort!("{} commit sentinel failed after its zone was published: {}", op, e);
+    // zone, so this closes nothing: every sentinel follows an ordinary group,
+    // which keeps a run of them out of the checkpoint reserve.
+    if let Err(e) = scope.commit() {
+        gnitz_fatal_abort!("{} commit sentinel was refused, so its zone never published: {}", op, e);
     }
+    disp.signal_all();
     shared.reactor.fsync(shared.disp().sal_fd())
 }
 

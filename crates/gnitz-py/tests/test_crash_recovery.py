@@ -7,8 +7,10 @@ orphan COL_TAB rows survive. Without the sentinel-driven recovery, the
 COL_TAB writes that already reached SAL would be replayed at next boot
 and a table_id with no matching TABLE_TAB row would persist.
 
-The crash is injected via GNITZ_INJECT_DDL_PANIC=after_broadcasts in a
-debug build (executor.rs has #[cfg(debug_assertions)] gate).
+The crash is injected via GNITZ_INJECT_SAL_ZONE_PANIC=ddl in a debug build:
+the SAL's zone scope fires it between publishing the zone and writing its
+commit sentinel, and the tag picks the DDL scope so a push's zone is not the
+one that aborts. Release builds fold the seam away.
 """
 
 import os
@@ -64,7 +66,7 @@ def test_ddl_crash_no_orphan_columns(own_server):
     durable trace. Recovery skips the uncommitted zone; the table name is
     free for re-creation."""
     if not is_debug_build():
-        pytest.skip("requires debug build (GNITZ_INJECT_DDL_PANIC seam)")
+        pytest.skip("requires debug build (GNITZ_INJECT_SAL_ZONE_PANIC seam)")
 
     sock_path = own_server.sock_path
     # ---- Phase 1: create the schema cleanly (no injection). -----------
@@ -74,10 +76,10 @@ def test_ddl_crash_no_orphan_columns(own_server):
     conn.close()
 
     # ---- Phase 2: restart with injection, attempt CREATE TABLE. -------
-    # The DDL emits its broadcasts, then libc::abort() fires before
-    # commit_zone, leaving the SAL with broadcasts at this LSN but no
-    # sentinel.
-    own_server.restart(extra_env={"GNITZ_INJECT_DDL_PANIC": "after_broadcasts"})
+    # The DDL emits its broadcasts, they are published, then libc::abort()
+    # fires before the commit sentinel — leaving the SAL with the zone's
+    # groups at this LSN and no sentinel.
+    own_server.restart(extra_env={"GNITZ_INJECT_SAL_ZONE_PANIC": "ddl"})
     conn = gnitz.connect(sock_path)
     # The CREATE TABLE call will hang or error as the server dies
     # mid-request. Catch any exception — the precise error mode
@@ -132,7 +134,7 @@ def test_ddl_crash_with_workers_no_orphans(own_server):
     """Same as test_ddl_crash_no_orphan_columns but multi-worker. Each
     worker's recovery walk independently rejects the uncommitted zone."""
     if not is_debug_build():
-        pytest.skip("requires debug build (GNITZ_INJECT_DDL_PANIC seam)")
+        pytest.skip("requires debug build (GNITZ_INJECT_SAL_ZONE_PANIC seam)")
     if _NUM_WORKERS < 2:
         pytest.skip("requires GNITZ_WORKERS >= 2")
 
@@ -142,7 +144,7 @@ def test_ddl_crash_with_workers_no_orphans(own_server):
     conn.create_schema("crash_mw")
     conn.close()
 
-    own_server.restart(extra_env={"GNITZ_INJECT_DDL_PANIC": "after_broadcasts"})
+    own_server.restart(extra_env={"GNITZ_INJECT_SAL_ZONE_PANIC": "ddl"})
     conn = gnitz.connect(sock_path)
     try:
         conn.execute_sql(
@@ -188,7 +190,7 @@ def test_ddl_crash_fk_and_view_no_orphan(own_server):
     owning TABLE_TAB) is structurally unconstructible once a CREATE is one atomic
     message, so this is the regression proof."""
     if not is_debug_build():
-        pytest.skip("requires debug build (GNITZ_INJECT_DDL_PANIC seam)")
+        pytest.skip("requires debug build (GNITZ_INJECT_SAL_ZONE_PANIC seam)")
 
     sock_path = own_server.sock_path
     # ---- Phase 1: clean parent with data. -----------------------------
@@ -203,7 +205,7 @@ def test_ddl_crash_fk_and_view_no_orphan(own_server):
     conn.close()
 
     # ---- Phase 2a: crash a CREATE TABLE child with an FK to parent. ----
-    own_server.restart(extra_env={"GNITZ_INJECT_DDL_PANIC": "after_broadcasts"})
+    own_server.restart(extra_env={"GNITZ_INJECT_SAL_ZONE_PANIC": "ddl"})
     conn = gnitz.connect(sock_path)
     try:
         conn.execute_sql(
@@ -221,7 +223,7 @@ def test_ddl_crash_fk_and_view_no_orphan(own_server):
     own_server.wait_for_exit()
 
     # ---- Phase 2b: crash a CREATE VIEW over parent. -------------------
-    own_server.restart(extra_env={"GNITZ_INJECT_DDL_PANIC": "after_broadcasts"})
+    own_server.restart(extra_env={"GNITZ_INJECT_SAL_ZONE_PANIC": "ddl"})
     conn = gnitz.connect(sock_path)
     try:
         conn.execute_sql(
@@ -255,7 +257,7 @@ def test_ddl_crash_unique_index_foldin_rolls_back(own_server):
     After a clean restart the table does not exist, and a fresh re-create still
     enforces the unique constraint (proving the folded-in index came back)."""
     if not is_debug_build():
-        pytest.skip("requires debug build (GNITZ_INJECT_DDL_PANIC seam)")
+        pytest.skip("requires debug build (GNITZ_INJECT_SAL_ZONE_PANIC seam)")
 
     sock_path = own_server.sock_path
     own_server.start()
@@ -263,7 +265,7 @@ def test_ddl_crash_unique_index_foldin_rolls_back(own_server):
     conn.create_schema("crash_uidx")
     conn.close()
 
-    own_server.restart(extra_env={"GNITZ_INJECT_DDL_PANIC": "after_broadcasts"})
+    own_server.restart(extra_env={"GNITZ_INJECT_SAL_ZONE_PANIC": "ddl"})
     conn = gnitz.connect(sock_path)
     try:
         conn.execute_sql(

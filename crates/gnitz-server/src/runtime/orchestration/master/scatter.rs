@@ -104,6 +104,10 @@ pub(crate) fn with_group<R>(
     base: DirectGroup<'_>,
     f: impl FnOnce(&DirectGroup) -> R,
 ) -> R {
+    debug_assert!(
+        matches!(base.data, GroupData::Same(WireData::Whole(None))),
+        "with_group replaces `data` with the per-worker slices; setting it on `base` is dead"
+    );
     let schema = relation.descriptor();
     // The sub-batches must outlive the group that borrows them, so they are
     // built here rather than inside the slot fill.

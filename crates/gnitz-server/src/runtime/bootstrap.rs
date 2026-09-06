@@ -61,8 +61,7 @@ fn decode_group_slot(msg: &SalMessage, data: &[u8]) -> Result<ipc::DecodedWire, 
 ///
 /// Returns the walk's epoch — the floor the next writer epoch and the workers'
 /// initial `expected_epoch` are taken from.
-fn recover_system_tables_from_sal(sal_ptr: *const u8, catalog: &mut CatalogEngine) -> Result<u32, String> {
-    let log = unsafe { SalLog::new(sal_ptr, sal_mmap_size()) };
+fn recover_system_tables_from_sal(log: SalLog, catalog: &mut CatalogEngine) -> Result<u32, String> {
     let family_lsns = catalog.registry().system_flushed_lsns();
 
     // Derived once, before either pass: on a boot whose offset-0 header is
@@ -145,7 +144,7 @@ fn swept_base_tables(catalog: &mut CatalogEngine) -> Vec<i64> {
 /// any other count it holds neither all of them nor only them, so every written
 /// slot is walked and each partitioned group re-cut for the launched topology.
 fn recover_from_sal(
-    sal_ptr: *const u8,
+    log: SalLog,
     rank: u32,
     num_workers: u32,
     walk_epoch: u32,
@@ -155,7 +154,6 @@ fn recover_from_sal(
 
     let buffered_bases: HashSet<i64> = swept_base_tables(catalog).into_iter().collect();
 
-    let log = unsafe { SalLog::new(sal_ptr, sal_mmap_size()) };
     let tail = CommittedTail::open(log, walk_epoch, SalMessageKind::Push, &family_lsns)?;
 
     let mut pending: HashMap<i64, Batch> = HashMap::new();
@@ -277,7 +275,7 @@ fn recover_from_sal(
 /// destroyed.
 fn worker_boot_recovery(
     catalog: &mut CatalogEngine,
-    sal_ptr: *const u8,
+    log: SalLog,
     rank: u32,
     num_workers: u32,
     walk_epoch: u32,
@@ -288,7 +286,7 @@ fn worker_boot_recovery(
     // Resume-vs-rebuild marker, the index sibling of the invalid-view line: 0 ⇒
     // every index resumed from its checkpoint.
     boot_log(&format!("recovery: rebuilding {rebuilt} index(es)\n"));
-    let pending_deltas = recover_from_sal(sal_ptr, rank, num_workers, walk_epoch, catalog)?;
+    let pending_deltas = recover_from_sal(log, rank, num_workers, walk_epoch, catalog)?;
     // Keep the boot flush: the non-windowed recovery resets the SAL before the
     // master-driven tick sweep, so the replayed base rows must be shard-durable
     // first — else the reset would drop acknowledged tail data. The recovery-start
@@ -341,8 +339,20 @@ pub fn server_main(
 struct SharedIpc {
     sal_fd: i32,
     sal_ptr: *mut u8,
+    /// The mapped SAL's length — the one this boot passed to `map_file_reserved`,
+    /// so every reader and the writer wrap on the bytes that actually exist.
+    sal_len: usize,
     w2m_ptrs: Vec<*mut u8>,
     m2w_efds: Vec<i32>,
+}
+
+impl SharedIpc {
+    /// The mapped SAL as a reader sees it — pointer and length from the one
+    /// mapping this boot made, so no consumer re-derives the size.
+    fn sal_log(&self) -> SalLog {
+        // SAFETY: `sal_ptr` maps `sal_len` bytes and outlives the process.
+        unsafe { SalLog::new(self.sal_ptr, self.sal_len) }
+    }
 }
 
 /// Open and map the SAL, one W2M ring per worker, and the M2W eventfds.
@@ -364,8 +374,9 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
     posix_io::try_set_nocow(sal_fd);
     // The SAL is a real file, and reserving its blocks now is what keeps a later
     // write from failing for want of disk space.
-    let sal_ptr = posix_io::map_file_reserved(sal_fd, sal_mmap_size())
-        .map_err(|e| format!("failed to map SAL ({} bytes): {e}", sal_mmap_size()))?;
+    let sal_len = sal_mmap_size();
+    let sal_ptr = posix_io::map_file_reserved(sal_fd, sal_len)
+        .map_err(|e| format!("failed to map SAL ({sal_len} bytes): {e}"))?;
 
     let mut w2m_ptrs: Vec<*mut u8> = Vec::with_capacity(nw);
     let mut m2w_efds: Vec<i32> = Vec::with_capacity(nw);
@@ -378,7 +389,13 @@ fn acquire_shared_ipc(data_dir: &str, nw: usize) -> Result<SharedIpc, String> {
         m2w_efds.push(efd);
     }
 
-    Ok(SharedIpc { sal_fd, sal_ptr, w2m_ptrs, m2w_efds })
+    Ok(SharedIpc {
+        sal_fd,
+        sal_ptr,
+        sal_len,
+        w2m_ptrs,
+        m2w_efds,
+    })
 }
 
 /// The forked child's whole life: latch its rank, redirect its logs to
@@ -447,7 +464,7 @@ fn run_worker_child(
 
     let catalog = unsafe { &mut *catalog_ptr };
 
-    let sal_reader = unsafe { SalReader::new(ipc.sal_ptr as *const u8, w as u32, sal_mmap_size(), walk_epoch) };
+    let sal_reader = SalReader::new(ipc.sal_log(), w as u32, walk_epoch);
     let w2m_writer = W2mWriter::new(ipc.w2m_ptrs[w]);
 
     // Become worker `(w, W)` before any flush: every inherited store re-homes
@@ -464,7 +481,7 @@ fn run_worker_child(
     // rewinds the SAL.
     let (pending_deltas, boot_err): (HashMap<i64, Batch>, Option<String>) = match catalog
         .become_worker(gnitz_store::storage::Slot::new(w as u32, num_workers))
-        .and_then(|()| worker_boot_recovery(catalog, ipc.sal_ptr as *const u8, w as u32, num_workers, walk_epoch))
+        .and_then(|()| worker_boot_recovery(catalog, ipc.sal_log(), w as u32, num_workers, walk_epoch))
     {
         Ok(pd) => (pd, None),
         Err(e) => {
@@ -546,7 +563,7 @@ fn run_server(
     //
     // The recovered walk epoch is this boot's floor, so a previous boot's
     // leftover always carries a strictly lower one than anything written now.
-    let walk_epoch = recover_system_tables_from_sal(ipc.sal_ptr as *const u8, &mut catalog)?;
+    let walk_epoch = recover_system_tables_from_sal(ipc.sal_log(), &mut catalog)?;
     {
         // Abort before forking workers and long before the SAL reset: the
         // replayed DDL lives only in master memory until this flush makes it
@@ -628,9 +645,15 @@ fn run_server(
     }
 
     // --- Parent process ---
-    let SharedIpc { sal_fd, sal_ptr, w2m_ptrs, m2w_efds } = ipc;
+    let SharedIpc {
+        sal_fd,
+        sal_ptr,
+        sal_len,
+        w2m_ptrs,
+        m2w_efds,
+    } = ipc;
 
-    let sal_writer = SalWriter::new(sal_ptr, sal_fd, sal_mmap_size(), nw);
+    let sal_writer = SalWriter::new(sal_ptr, sal_fd, sal_len, nw);
     let w2m_receiver = std::rc::Rc::new(W2mReceiver::new(w2m_ptrs));
 
     // `recovery_start_generation_bump` has already run, so this is the floor

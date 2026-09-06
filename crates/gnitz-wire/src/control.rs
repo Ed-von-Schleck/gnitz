@@ -104,7 +104,7 @@ const fn ctrl_region_size(r: usize) -> usize {
 /// a future schema change introducing an unaligned column fails at compile
 /// time.
 const fn ctrl_region_offset(target_region: usize) -> usize {
-    let mut pos = WAL_HEADER_SIZE + NUM_REGIONS * 8;
+    let mut pos = crate::wal::body_start(NUM_REGIONS);
     let mut r = 0;
     while r < target_region {
         let sz = ctrl_region_size(r);
@@ -358,7 +358,7 @@ pub fn peek_control_block_ipc(data: &[u8]) -> Result<DecodedControl, &'static st
 }
 
 fn peek_control_block_impl(data: &[u8], verify_checksum: bool) -> Result<DecodedControl, &'static str> {
-    let dir_end = WAL_HEADER_SIZE + NUM_REGIONS * 8;
+    let dir_end = crate::wal::body_start(NUM_REGIONS);
     if data.len() < dir_end {
         return Err("control block too small");
     }

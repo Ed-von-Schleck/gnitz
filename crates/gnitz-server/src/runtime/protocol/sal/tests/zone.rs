@@ -1,7 +1,6 @@
 use super::*;
-use crate::runtime::master::scatter::{with_commit_indices, with_group};
 use crate::runtime::sal::fixtures::{group_at, TestLog};
-use crate::runtime::sal::{group_header_size, DirectGroup, GroupTargets};
+use crate::runtime::sal::{group_header_size, DirectGroup};
 use crate::runtime::wire::WireMsg;
 use crate::test_support::{make_batch, make_schema_u64_i64, sweep_bit_flips};
 
@@ -23,7 +22,7 @@ fn committed_lsns(log: SalLog, kind: SalMessageKind, families: &HashMap<i64, u64
 fn walk(log: SalLog) -> (Vec<(u64, u32)>, Vec<u64>) {
     let mut groups = Vec::new();
     let mut corrupt = Vec::new();
-    for step in log.walk(log.walk_epoch()) {
+    for step in log.walk_from(0, log.walk_epoch()) {
         match step {
             SalStep::Group(m, _) => groups.push((m.lsn, m.target_id)),
             SalStep::Corrupt(off) => corrupt.push(off),
@@ -289,6 +288,41 @@ fn a_zone_that_lost_its_first_group_fails_the_boot() {
     assert!(err.contains("lsn=2"), "{err}");
 }
 
+/// A zone that lost **both** its start group and its sentinel, with a middle
+/// group surviving. Pass 1 sees no damage and the boot proceeds, so the only
+/// thing keeping the survivor out of the replay is exact membership in the
+/// committed set — which is why that set must never become a high-water mark.
+#[test]
+fn a_surviving_group_of_a_headless_zone_is_not_replayed() {
+    let log = TestLog::new(SIZE, 1, 1);
+    let first = log.group(21, 2, SalMessageKind::DdlSync, true);
+    let middle = log.group(22, 2, SalMessageKind::DdlSync, false);
+    let sentinel = log.sentinel(2);
+    log.zone(3, &[31]);
+    log.damage_header(first);
+    log.damage_header(sentinel);
+
+    let view = log.log();
+    let (groups, corrupt) = walk(view);
+    assert_eq!(corrupt, vec![first, sentinel], "only the zone's ends are damaged");
+    assert!(
+        groups.contains(&(2, 22)),
+        "the middle group survives the walk: {groups:?}"
+    );
+    assert_eq!(
+        committed(view).unwrap(),
+        vec![3],
+        "zone 2 never commits, so its survivor must not replay"
+    );
+    let fams = families(&[21, 22, 31]);
+    let tail = CommittedTail::open(view, view.walk_epoch(), SalMessageKind::DdlSync, &fams).unwrap();
+    assert_eq!(
+        tail.groups().map(|m| (m.lsn, m.target_id)).collect::<Vec<_>>(),
+        vec![(3, 31)],
+        "pass 2 must skip the surviving group at offset {middle}"
+    );
+}
+
 /// A zone with a readable start, no sentinel, and a group after it did close:
 /// its sentinel was destroyed, not omitted.
 #[test]
@@ -393,29 +427,31 @@ impl TestLog {
     }
 
     /// A closed zone through the production writer: one control-only `DdlSync`
-    /// group per entry of `targets` inside the zone, then the commit sentinel.
-    /// Returns every base, the sentinel's last.
+    /// group per entry of `targets` inside one [`SalScope`], then the commit
+    /// sentinel its `commit` writes. Returns every base, the sentinel's last.
     fn zone(&self, lsn: u64, targets: &[u32]) -> Vec<u64> {
+        let scope = self.writer.begin(lsn, "test");
         let mut bases: Vec<u64> = targets
             .iter()
             .map(|&t| {
                 let base = self.cursor();
-                self.writer
-                    .write(&DirectGroup {
-                        template: WireMsg {
-                            target_id: t as u64,
-                            ..Default::default()
+                scope
+                    .write(
+                        &DirectGroup {
+                            template: WireMsg {
+                                target_id: t as u64,
+                                ..Default::default()
+                            },
+                            ..DirectGroup::new(SalMessageKind::DdlSync)
                         },
-                        lsn,
-                        zoned: true,
-                        ..DirectGroup::new(SalMessageKind::DdlSync)
-                    })
+                        true,
+                    )
                     .expect("group fits");
                 base
             })
             .collect();
         bases.push(self.cursor());
-        assert!(self.writer.close_zone().expect("sentinel fits"), "the zone was open");
+        assert!(scope.commit().expect("sentinel fits"), "the zone was open");
         bases
     }
 
@@ -432,22 +468,12 @@ impl TestLog {
     fn push_zone(&self, lsn: u64, targets: &[u32]) -> Vec<u64> {
         let schema = make_schema_u64_i64();
         let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20)]);
-        let req_ids: Vec<u64> = (0..NW as u64).collect();
-        let mut bases = Vec::new();
-        for &t in targets {
-            bases.push(self.cursor());
-            let relation = ipc::WireSchema::encoded(t as i64, schema);
-            let base = DirectGroup {
-                targets: GroupTargets::All(&req_ids),
-                lsn,
-                zoned: true,
-                ..DirectGroup::new(SalMessageKind::Push)
-            };
-            with_commit_indices(&batch, &schema, NW, |wi| {
-                with_group(&batch, wi, &relation, base, |g| self.writer.write(g)).expect("group fits")
-            });
-        }
-        assert!(self.writer.close_zone().expect("sentinel fits"), "the zone was open");
+        let scope = self.writer.begin(lsn, "test");
+        let bases: Vec<u64> = targets
+            .iter()
+            .map(|&t| self.push_group(lsn, t, schema, &batch, |g| scope.write(g, true)))
+            .collect();
+        assert!(scope.commit().expect("sentinel fits"), "the zone was open");
         bases
     }
 

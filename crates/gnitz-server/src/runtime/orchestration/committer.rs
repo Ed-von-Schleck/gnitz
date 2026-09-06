@@ -1,6 +1,6 @@
 //! Group commit task.
 //!
-//! Owns the `write_commit_group` → `commit_zone` → `fdatasync` → per-worker push
+//! Owns the `write_commit_group` → `SalScope::commit` → `fdatasync` → per-worker push
 //! ACK sequence for every user-table INSERT/UPSERT. Receives commit requests via
 //! `chan` and batches whatever is already queued behind the first — see
 //! **Batching** below; there is no debounce timer.
@@ -29,7 +29,7 @@ use super::guard_panic;
 use super::TxnFamily;
 use crate::runtime::master::{await_worker_acks, first_worker_error_opt};
 use crate::runtime::reactor::{chan, join_into, oneshot, select2, Either, ReplyFuture, ReplyLease};
-use crate::runtime::sal::{GroupTargets, SalMessageKind};
+use crate::runtime::sal::{GroupTargets, SalMessageKind, SalScope};
 use crate::runtime::wire::DecodedWire;
 use gnitz_store::storage::Batch;
 use gnitz_wire::{WireConflictMode, WireFault};
@@ -596,14 +596,14 @@ async fn commit_pushes(
         // Floor 0: a user-table push pins no system-family counter.
         let zone_lsn = shared.lsn_alloc.reserve(0);
 
-        // Nothing laid out inside the scope is visible until it ends, so a
+        // Nothing laid out inside the scope is visible until it commits, so a
         // transaction that runs out of SAL space part-way can take its earlier
         // families back. Every write, the sentinel and the fsync submit are in
         // this one synchronous block, so no reader ever observes the gap.
-        let scope = shared.disp().defer_publication();
+        let scope = shared.disp().begin(zone_lsn, "commit");
 
         // Emit every unit into the zone, in unit order (transactions first). The
-        // writer opens the zone on the first recoverable group it admits.
+        // scope opens the zone on the first recoverable group it admits.
         //
         // A unit is all-or-nothing: a family that does not fit rolls the bundle
         // back to where it started, and the families before it were never
@@ -611,10 +611,7 @@ async fn commit_pushes(
         // "a refused push degrades gracefully" means for it.
         for unit in &mut units {
             let savepoint = scope.savepoint();
-            let failure = unit
-                .groups
-                .iter()
-                .find_map(|g| lay_out_group(shared, g, zone_lsn).err());
+            let failure = unit.groups.iter().find_map(|g| lay_out_group(shared, &scope, g).err());
             if let Some(e) = failure {
                 scope.roll_back(savepoint);
                 for g in &mut unit.groups {
@@ -623,21 +620,16 @@ async fn commit_pushes(
             }
         }
 
-        let any_written = units.iter().flat_map(|u| u.live()).next().is_some();
-
-        // Every laid-out group becomes visible here, before the sentinel.
-        drop(scope);
-
-        // Close the zone with the commit sentinel before fsync. If this fails the
-        // zone has no sentinel and recovery silently drops every group in it —
-        // unrecoverable loss after a restart the client was told `Ok` about.
-        // `commit_zone` signals the workers either way; Phase C awaits the ACKs.
-        let closed = any_written
-            && match shared.disp().commit_zone() {
-                Ok(closed) => closed,
-                Err(e) => gnitz_fatal_abort!("commit_zone failed, durability lost: {}", e),
-            };
-        // A stream-only batch opened no zone: nothing to sync.
+        // Publishes every laid-out group, then closes the zone. A failure here
+        // is fatal: the alternative is telling a client `Ok` about a zone
+        // recovery will silently drop.
+        let closed = scope
+            .commit()
+            .unwrap_or_else(|e| gnitz_fatal_abort!("commit zone failed, durability lost: {}", e.text));
+        // The wake goes out whatever was written; Phase C awaits the ACKs.
+        shared.disp().signal_all();
+        // A stream-only batch — or one every group of which was refused — opened
+        // no zone: nothing to sync.
         let fsync_fut = closed.then(|| shared.reactor.fsync(shared.disp().sal_fd()));
         (zone_lsn, fsync_fut)
     };
@@ -744,21 +736,18 @@ async fn commit_pushes(
     }
 }
 
-/// Lay one group out, inside the zone when it is `recoverable`. Wrapped in
-/// `guard_panic` so a malformed batch fails the group instead of the node.
-fn lay_out_group(shared: &Rc<Shared>, g: &GroupInfo, zone_lsn: u64) -> Result<(), WireFault> {
-    // The guard covers the encode, which reads a client-supplied batch; the SAL's
-    // own verdict comes back out of it typed.
-    let refused = guard_panic("commit_write", || {
+/// Lay one group out in `scope`, inside its zone when the group is
+/// `recoverable`. `guard_panic` covers the encode of a client-supplied batch;
+/// the SAL's own refusal rides the `Ok` side, where it keeps its
+/// `STATUS_SAL_FULL` instead of flattening to the guard's `String`.
+fn lay_out_group(shared: &Rc<Shared>, scope: &SalScope, g: &GroupInfo) -> Result<(), WireFault> {
+    guard_panic("commit_write", || {
         Ok(shared
             .disp()
-            .write_commit_group(g.tid, zone_lsn, &g.merged, g.mode, &g.req_ids, g.recoverable)
+            .write_commit_group(scope, g.tid, &g.merged, g.mode, &g.req_ids, g.recoverable)
             .err())
-    })?;
-    match refused {
-        Some(fit) => Err(fit.refusal(SalMessageKind::Push)),
-        None => Ok(()),
-    }
+    })?
+    .map_or(Ok(()), Err)
 }
 
 #[cfg(test)]

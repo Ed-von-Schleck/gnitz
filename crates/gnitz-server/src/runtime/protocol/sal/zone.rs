@@ -1,8 +1,8 @@
 //! The SAL **zone protocol**: the atomic unit recovery commits, both directions.
 //!
 //! A zone's byte span runs from its zone-start group to the
-//! [`SalMessageKind::ZoneCommit`] sentinel [`SalWriter::close_zone`] closes it
-//! with, and its groups apply all-or-nothing. A whole CREATE is one zone — its N
+//! [`SalMessageKind::ZoneCommit`] sentinel `SalScope::commit` closes it with,
+//! and its groups apply all-or-nothing. A whole CREATE is one zone — its N
 //! families ride one `FLAG_DDL_TXN` bundle under a single zone LSN — so all of
 //! COL_TAB and TABLE_TAB replay, or none of it.
 //!
@@ -13,38 +13,19 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::{EpochGate, SalFit, SalLog, SalMessage, SalMessageKind, SalStep, SalWriter, PREFIX_BYTES};
+use super::{EpochGate, SalLog, SalMessage, SalMessageKind, SalStep, PREFIX_BYTES};
 use crate::runtime::wire as ipc;
 
-impl SalWriter {
-    /// Close the open zone with its slotless commit sentinel, which recovery
-    /// reads as "this LSN is closed". `Ok(false)` when no zone is open; a refused
-    /// sentinel leaves it open.
-    pub(crate) fn close_zone(&self) -> Result<bool, SalFit> {
-        let Some(lsn) = self.zone.get() else {
-            return Ok(false);
-        };
-        self.write_slots(0, lsn, SalMessageKind::ZoneCommit, false, &[], |_, _| {})?;
-        self.zone.set(None);
-        Ok(true)
-    }
-}
-
 impl SalLog {
-    /// Walk the SAL from offset 0 against the walk epoch `E`, resyncing past damage
+    /// Walk the SAL from `start` against the walk epoch `E`, resyncing past damage
     /// to the next candidate valid at `E` so that one bad offset does not discard the
     /// committed groups behind it. A zero prefix or a header at another epoch ends
     /// the walk — the ring's leftovers begin there.
     ///
-    /// Both passes walk identically, so they cannot disagree about where the log
-    /// ends. Successive resyncs examine disjoint increasing ranges, so a walk sweeps
-    /// the mapping at most once in total.
-    fn walk(&self, epoch: u32) -> impl Iterator<Item = SalStep> + '_ {
-        self.walk_from(0, epoch)
-    }
-
-    /// [`Self::walk`] from an arbitrary offset — for a re-walk of a span a first
-    /// pass already reached a verdict on.
+    /// Both passes walk from 0, and identically, so they cannot disagree about
+    /// where the log ends; a `start` past 0 re-walks a span pass 1 already
+    /// judged. Successive resyncs examine disjoint increasing ranges, so a walk
+    /// sweeps the mapping at most once.
     fn walk_from(&self, start: u64, epoch: u32) -> impl Iterator<Item = SalStep> + '_ {
         let mut offset: u64 = start;
         std::iter::from_fn(move || {
@@ -132,7 +113,7 @@ impl<'a> CommittedTail<'a> {
     /// several slots — and undecoded, so the caller's own per-slot skips run
     /// before the copy.
     pub(crate) fn groups(&self) -> impl Iterator<Item = SalMessage> + '_ {
-        self.log.walk(self.epoch).filter_map(move |step| {
+        self.log.walk_from(0, self.epoch).filter_map(move |step| {
             // Pass 1 already reached its verdict on every corrupt offset: it either
             // failed the boot or established that nothing committed lies there.
             let SalStep::Group(msg, _) = step else { return None };
@@ -165,7 +146,7 @@ impl<'a> CommittedTail<'a> {
         let mut open: Option<Zone> = None;
         let mut last_closed: Option<Zone> = None;
 
-        for step in self.log.walk(self.epoch) {
+        for step in self.log.walk_from(0, self.epoch) {
             let msg = match step {
                 SalStep::Corrupt(off) => {
                     if let Some(z) = open.as_mut() {

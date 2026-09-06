@@ -439,14 +439,18 @@ async fn execute_probe_burst(
                 flags: gnitz_wire::wire_flags_set_probe_mode(wire_flags, check.mode),
                 ..Default::default()
             }),
-            data: GroupData::Same(wire::WireData::Whole(Some(&check.batch))),
             targets,
             ..DirectGroup::new(SalMessageKind::HasPk)
         };
+        // The scatter branch carries no `data`: `with_group` replaces it with
+        // the per-worker slices, and hands a group carrying one back.
         if check.keyspace.scatters() {
             disp.write_scatter_group(&check.batch, &check.schema, g)
         } else {
-            disp.write_group(&g)
+            disp.write_group(&DirectGroup {
+                data: GroupData::Same(wire::WireData::Whole(Some(&check.batch))),
+                ..g
+            })
         }
     })
     .await?;
