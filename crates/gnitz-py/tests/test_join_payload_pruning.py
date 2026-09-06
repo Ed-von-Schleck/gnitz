@@ -1,9 +1,11 @@
-"""E2E tests: equi-join reindex-payload pruning.
+"""E2E tests: join reindex-payload pruning, on every join shape.
 
 Pruning drops source columns a join view never reads from the reindex payload and
 the join trace. It must be *behaviorally invisible* — results and weights identical
 to an unpruned view — while exercising the subtle cases the prune interacts with:
-the outer-join null-fill (ν-coarsening) and the NULL-vs-real-key rule-3 split.
+the outer-join null-fill (ν-coarsening), the NULL-vs-real-key rule-3 split, and
+the shapes that pack their output key out of the pruned payload (range, band,
+cross) or drop the inner side entirely (EXISTS / IN).
 
 Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/test_join_payload_pruning.py -v --tb=short
@@ -329,3 +331,240 @@ class TestJoinPayloadPruning:
             assert got == [(5, 111, 1), (8, 222, 1), (50, 222, 1)], got
         finally:
             _cleanup(client, sn, tables=["fact", "dim"], views=["v"])
+
+
+class TestRangeAndCrossPruning:
+    """Range, band and cross joins pack their output PK out of the payload, so the
+    prune must pin each side's PK columns there even when the SELECT names none of
+    them — and must still drop the join keys the SELECT does not read."""
+
+    def _setup(self, client, sn, body, *, late_pk=False):
+        client.create_schema(sn)
+        if late_pk:
+            # PK declared last: the pinned PK is not source column 0.
+            client.execute_sql(
+                "CREATE TABLE ra (nm BIGINT NOT NULL, k BIGINT NOT NULL, lo BIGINT NOT NULL, "
+                "x BIGINT NOT NULL, id BIGINT NOT NULL PRIMARY KEY)",
+                schema_name=sn,
+            )
+        else:
+            client.execute_sql(
+                "CREATE TABLE ra (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
+                "lo BIGINT NOT NULL, x BIGINT NOT NULL, nm BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+        client.execute_sql(
+            "CREATE TABLE rb (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
+            "hi BIGINT NOT NULL, y BIGINT NOT NULL, junk BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=sn)
+        return client.resolve_table(sn, "v")[0]
+
+    def _fill(self, client, sn, *, late_pk=False):
+        if late_pk:
+            # (nm, k, lo, x, id)
+            client.execute_sql("INSERT INTO ra VALUES (7, 10, 1, 70, 1), (8, 20, 9, 80, 2)", schema_name=sn)
+        else:
+            client.execute_sql("INSERT INTO ra VALUES (1, 10, 1, 70, 7), (2, 20, 9, 80, 8)", schema_name=sn)
+        client.execute_sql("INSERT INTO rb VALUES (5, 10, 5, 500, 0), (6, 30, 5, 600, 0)", schema_name=sn)
+
+    def test_band_inner_projects_neither_key(self, client):
+        sn = "s" + _uid()
+        try:
+            vid = self._setup(
+                client, sn, "SELECT ra.x, rb.y FROM ra JOIN rb ON ra.k = rb.k AND ra.lo < rb.hi"
+            )
+            self._fill(client, sn)
+            # ra(1): k=10, lo=1 < rb(5).hi=5 → match. ra(2): k=20 has no rb.
+            assert sorted((d["x"], d["y"], w) for d, w in _rows(client, vid)) == [(70, 500, 1)]
+        finally:
+            _cleanup(client, sn, tables=["ra", "rb"], views=["v"])
+
+    def test_band_left_projects_neither_key(self, client):
+        sn = "s" + _uid()
+        try:
+            vid = self._setup(
+                client, sn, "SELECT ra.x, rb.y FROM ra LEFT JOIN rb ON ra.k = rb.k AND ra.lo < rb.hi"
+            )
+            self._fill(client, sn)
+            got = sorted(((d["x"], d["y"], w) for d, w in _rows(client, vid)),
+                         key=lambda t: (t[0], t[1] if t[1] is not None else -1))
+            assert got == [(70, 500, 1), (80, None, 1)], got
+        finally:
+            _cleanup(client, sn, tables=["ra", "rb"], views=["v"])
+
+    def test_pure_range_inner_projects_neither_key(self, client):
+        sn = "s" + _uid()
+        try:
+            vid = self._setup(client, sn, "SELECT ra.x, rb.y FROM ra JOIN rb ON ra.lo < rb.hi")
+            self._fill(client, sn)
+            # lo=1 beats both hi=5 rows; lo=9 beats neither.
+            assert sorted((d["x"], d["y"], w) for d, w in _rows(client, vid)) == [
+                (70, 500, 1),
+                (70, 600, 1),
+            ]
+        finally:
+            _cleanup(client, sn, tables=["ra", "rb"], views=["v"])
+
+    def test_pure_range_left_projects_neither_key(self, client):
+        sn = "s" + _uid()
+        try:
+            vid = self._setup(client, sn, "SELECT ra.x, rb.y FROM ra LEFT JOIN rb ON ra.lo < rb.hi")
+            self._fill(client, sn)
+            got = sorted(((d["x"], d["y"], w) for d, w in _rows(client, vid)),
+                         key=lambda t: (t[0], t[1] if t[1] is not None else -1))
+            assert got == [(70, 500, 1), (70, 600, 1), (80, None, 1)], got
+        finally:
+            _cleanup(client, sn, tables=["ra", "rb"], views=["v"])
+
+    def test_pure_range_left_over_a_table_whose_pk_is_not_column_zero(self, client):
+        """The pinned PK is pulled to the front of the kept payload, so a PK
+        declared last must still key the threshold re-key and the null-fill."""
+        sn = "s" + _uid()
+        try:
+            vid = self._setup(
+                client, sn, "SELECT ra.nm, rb.y FROM ra LEFT JOIN rb ON ra.lo < rb.hi", late_pk=True
+            )
+            self._fill(client, sn, late_pk=True)
+            got = sorted(((d["nm"], d["y"], w) for d, w in _rows(client, vid)),
+                         key=lambda t: (t[0], t[1] if t[1] is not None else -1))
+            assert got == [(7, 500, 1), (7, 600, 1), (8, None, 1)], got
+        finally:
+            _cleanup(client, sn, tables=["ra", "rb"], views=["v"])
+
+    def test_cross_join_one_column_per_side(self, client):
+        sn = "s" + _uid()
+        try:
+            vid = self._setup(client, sn, "SELECT ra.x, rb.y FROM ra CROSS JOIN rb")
+            self._fill(client, sn)
+            assert sorted((d["x"], d["y"], w) for d, w in _rows(client, vid)) == [
+                (70, 500, 1),
+                (70, 600, 1),
+                (80, 500, 1),
+                (80, 600, 1),
+            ]
+        finally:
+            _cleanup(client, sn, tables=["ra", "rb"], views=["v"])
+
+
+class TestExistsPruning:
+    """An EXISTS/IN correlation reads nothing of its inner side but the match, so the
+    inner keeps no payload at all. Weights, not just the row set, are the contract:
+    a mis-weighted ν is invisible to a row-set comparison."""
+
+    def _setup(self, client, sn):
+        client.create_schema(sn)
+        client.execute_sql(
+            "CREATE TABLE o (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL, "
+            "w BIGINT NOT NULL, x BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        # Wide inner: every column but `k` is dead once the correlation is pruned.
+        client.execute_sql(
+            "CREATE TABLE i (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL, "
+            "j1 BIGINT NOT NULL, j2 BIGINT NOT NULL, j3 TEXT NOT NULL)",
+            schema_name=sn,
+        )
+        # Two outer rows share (k, x), so a correct semi-join reports weight 2.
+        client.execute_sql(
+            "INSERT INTO o VALUES (1, 10, 5, 100, 7), (2, 10, 5, 100, 7), (3, 20, 50, 200, 9)",
+            schema_name=sn,
+        )
+        # Three inner rows on key 10: the match multiplicity the clamp must absorb.
+        client.execute_sql(
+            "INSERT INTO i VALUES (1, 10, 1, 0, 0, 'aaa'), (2, 10, 2, 0, 0, 'bbb'), "
+            "(3, 10, 3, 0, 0, 'ccc'), (4, 30, 400, 0, 0, 'ddd')",
+            schema_name=sn,
+        )
+
+    def _pairs(self, client, sn, body):
+        client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=sn)
+        vid = client.resolve_table(sn, "v")[0]
+        out = sorted((d["x"], w) for d, w in _rows(client, vid))
+        client.execute_sql("DROP VIEW v", schema_name=sn)
+        return out
+
+    def test_exists_not_exists_and_in_over_a_wide_inner(self, client):
+        sn = "s" + _uid()
+        try:
+            self._setup(client, sn)
+            exists = "SELECT o.x FROM o WHERE EXISTS (SELECT 1 FROM i WHERE i.k = o.k)"
+            assert self._pairs(client, sn, exists) == [(7, 2)]
+            not_exists = "SELECT o.x FROM o WHERE NOT EXISTS (SELECT 1 FROM i WHERE i.k = o.k)"
+            assert self._pairs(client, sn, not_exists) == [(9, 1)]
+            in_list = "SELECT o.x FROM o WHERE o.k IN (SELECT i.k FROM i)"
+            assert self._pairs(client, sn, in_list) == [(7, 2)]
+        finally:
+            _cleanup(client, sn, tables=["o", "i"], views=["v"])
+
+    def test_rule3_null_vs_zero_key_on_an_exists_correlation(self, client):
+        """A NOT EXISTS builds a ν over its outer side, so the outer's nullable
+        correlation key must stay in the payload: NULL and a real 0 both pack to
+        synthetic PK 0, and the matched row's multiplicity would cancel the
+        NULL-keyed row's unmatched weight."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE o (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT, x BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE i (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT o.x FROM o WHERE NOT EXISTS "
+                "(SELECT 1 FROM i WHERE i.k = o.k)",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            # Same payload `x` on both outer rows: only the retained key column
+            # keeps the NULL-keyed row distinct from the matched 0-keyed one.
+            client.execute_sql("INSERT INTO o VALUES (1, NULL, 5), (2, 0, 5)", schema_name=sn)
+            client.execute_sql("INSERT INTO i VALUES (10, 0), (11, 0)", schema_name=sn)
+            got = sorted((d["x"], w) for d, w in _rows(client, vid))
+            assert got == [(5, 1)], f"NULL-keyed outer row lost to ν-coarsening: {got}"
+        finally:
+            _cleanup(client, sn, tables=["o", "i"], views=["v"])
+
+    def test_mark_where_reads_an_unprojected_column(self, client):
+        """A mark join's WHERE is applied per branch, after the mark — so its
+        columns are part of the keep demand even though the prefilter's are not.
+        All three correlation shapes."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE o (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL, "
+                "w BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE i (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "INSERT INTO o VALUES (1, 10, 5, 100), (2, 20, 50, 200), (3, 10, 500, 300)",
+                schema_name=sn,
+            )
+            client.execute_sql("INSERT INTO i VALUES (1, 10, 1), (2, 30, 400)", schema_name=sn)
+            # `pk` is projected; `w` is read only by the post-mark WHERE, and
+            # `k`/`v` only by the correlation.
+            for corr, want in [
+                ("i.k = o.k", [1, 2]),
+                ("i.k = o.k AND i.v < o.v", [1, 2]),
+                ("i.v < o.v", [1]),
+            ]:
+                body = (
+                    f"SELECT o.pk FROM o WHERE NOT (EXISTS "
+                    f"(SELECT 1 FROM i WHERE {corr}) AND o.w > 150)"
+                )
+                client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=sn)
+                vid = client.resolve_table(sn, "v")[0]
+                got = sorted(d["pk"] for d, _w in _rows(client, vid))
+                client.execute_sql("DROP VIEW v", schema_name=sn)
+                assert got == want, f"{corr}: {got}"
+        finally:
+            _cleanup(client, sn, tables=["o", "i"], views=["v"])

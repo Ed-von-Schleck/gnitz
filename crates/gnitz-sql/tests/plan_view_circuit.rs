@@ -171,8 +171,9 @@ const SHAPES: &[Row] = &[
     ("SELECT g FROM t EXCEPT ALL SELECT g FROM u", 1, &[&[0], &[0]], &[(PositivePart, 1)]),
     ("SELECT g FROM t INTERSECT ALL SELECT g FROM u", 1, &[&[0], &[0]], &[(PositivePart, 1)]),
     // Segments: a derived table, a non-trivial CTE and a subquery each cut a
-    // materialized segment; a computed group key or aggregate argument does not.
-    ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k) AS c FROM a", 3, &[&[1]], &[(EquiJoin, 2), (Reduce, 1), (PositivePart, 1), (NullExtend, 1)]),
+    // materialized segment; a computed group key or aggregate argument does not,
+    // and neither does a computed projection over a join — the join emits it.
+    ("SELECT a.id, (SELECT COUNT(*) FROM b WHERE b.k = a.k) AS c FROM a", 2, &[&[1]], &[(EquiJoin, 2), (Reduce, 1), (PositivePart, 1), (NullExtend, 1)]),
     ("SELECT a.id FROM a WHERE a.v < (SELECT MAX(w) FROM b)", 2, &[&[], &[0, 1]], &[(RangeJoin, 2), (Reduce, 1), (GlobalGround, 1), (WorkerFilter, 2), (Filter, 1)]),
     ("WITH agg AS (SELECT k, SUM(v) AS total FROM a GROUP BY k) SELECT b.w AS nm, agg.total AS tot FROM agg JOIN b ON agg.k = b.k", 2, &[&[1]], &[(EquiJoin, 2), (Reduce, 1)]),
     ("SELECT d.id FROM (SELECT id, v FROM t WHERE v > 2) d", 2, &[], &[(Filter, 1)]),

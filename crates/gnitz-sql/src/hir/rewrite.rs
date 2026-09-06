@@ -327,10 +327,8 @@ fn filter_has_subquery(input: &Rc<RelExpr>) -> bool {
 
 /// Transform a subquery-carrying `Project(items, Filter?(Get))` body.
 fn decorrelate_body(items: &[ProjEntry], input: &Rc<RelExpr>, ids: &ColIdGen) -> Result<Rc<RelExpr>, GnitzSqlError> {
-    let (fpreds, get): (Vec<HirExpr>, Rc<RelExpr>) = match input.as_ref() {
-        RelExpr::Filter { input, preds } => (preds.clone(), Rc::clone(input)),
-        _ => (Vec::new(), Rc::clone(input)),
-    };
+    let (fpreds, get) = super::split_filter(input);
+    let (fpreds, get): (Vec<HirExpr>, Rc<RelExpr>) = (fpreds.to_vec(), Rc::clone(get));
 
     let mut cur = get;
     let mut kept_preds: Vec<HirExpr> = Vec::new();

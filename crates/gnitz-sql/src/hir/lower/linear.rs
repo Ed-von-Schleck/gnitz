@@ -6,7 +6,7 @@
 
 use super::physical::PhysProjection;
 use super::SegInput;
-use crate::codec::project_schema::{compile_projection_map, declared_out_cols, ProjItem};
+use crate::codec::project_schema::{payload_map, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_filter_program;
 use crate::hir::chain::EmitPieces;
@@ -58,8 +58,7 @@ pub(super) fn emit_linear(
         // Emit only the payload slots (k..); the k physical PK columns are carried
         // by commit_row and must not appear in the program. payload_idx is the
         // dense output payload position, matching out_cols[k + payload_idx].
-        let program = compile_projection_map(&items[k..], source_schema)?;
-        cb.map_expr(filtered, program, &declared_out_cols(&proj.out_cols[k..]))
+        cb.map_expr(filtered, payload_map(&items[k..], &proj.out_cols[k..], source_schema)?)
     } else if items.len() < source_schema.columns.len()
         || items.iter().enumerate().any(|(i, item)| match item {
             ProjItem::PassThrough { src_col } => *src_col != i,

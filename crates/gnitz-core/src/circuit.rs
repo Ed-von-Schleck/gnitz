@@ -137,19 +137,13 @@ impl CircuitBuilder {
         self.alloc_wired(OpNode::Filter(expr.map(|e| e.to_blob_bytes())), &[input])
     }
 
-    /// A computed projection: `program` writes one payload slot each, and
-    /// `out_cols` declares those slots as `(type_code, nullable)` in payload
+    /// A computed projection: the map's program writes one payload slot each, and
+    /// its `out_cols` declare those slots as `(type_code, nullable)` in payload
     /// order. `SELECT a + b` has no copy list the engine could derive a schema
     /// from, so the declaration travels; the PK region is inherited from the input
     /// and is not listed.
-    pub fn map_expr(&mut self, input: NodeId, program: LogicalProgram, out_cols: &[(u8, bool)]) -> NodeId {
-        self.alloc_wired(
-            OpNode::Map(MapKind::Compute(ComputeMap {
-                program: program.to_blob_bytes(),
-                out_cols: out_cols.to_vec(),
-            })),
-            &[input],
-        )
+    pub fn map_expr(&mut self, input: NodeId, map: ComputeMap) -> NodeId {
+        self.alloc_wired(OpNode::Map(MapKind::Compute(map)), &[input])
     }
 
     /// Map with PK reindexing (equijoin pre-indexing): the new synthetic PK is

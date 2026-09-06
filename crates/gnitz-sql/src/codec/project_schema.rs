@@ -14,6 +14,7 @@ use crate::ir::BoundExpr;
 use crate::validate::reject_duplicate_projection_names;
 use gnitz_core::{ColumnDef, Schema};
 use gnitz_expr::{ExprBuilder, LogicalProgram, Sink};
+use gnitz_wire::ComputeMap;
 use sqlparser::ast::SelectItem;
 
 /// One output column of a projection: a verbatim source column
@@ -67,11 +68,21 @@ fn resolve_proj_col(
     }
 }
 
-/// The `(type_code, nullable)` declaration parallel to a compiled projection
-/// program's payload slots — a [`gnitz_wire::ComputeMap`]'s other half. `cols`
-/// must be the same payload slice `compile_projection_map` was given.
-pub(crate) fn declared_out_cols(cols: &[ColumnDef]) -> Vec<(u8, bool)> {
-    cols.iter().map(|c| (c.type_code as u8, c.is_nullable)).collect()
+/// One projection payload as a [`ComputeMap`]: the compiled program plus the
+/// `(type_code, nullable)` declaration of the slots it writes. The two halves
+/// must describe the *same* payload slice — a program writing slot `i` under a
+/// declaration for a different column emits the wrong width, silently — so they
+/// are built together here and travel as one value, rather than being paired by
+/// hand at each emit.
+pub(crate) fn payload_map(
+    items: &[ProjItem],
+    cols: &[ColumnDef],
+    schema: &Schema,
+) -> Result<ComputeMap, GnitzSqlError> {
+    Ok(ComputeMap {
+        program: compile_projection_map(items, schema)?.to_blob_bytes(),
+        out_cols: cols.iter().map(|c| (c.type_code as u8, c.is_nullable)).collect(),
+    })
 }
 
 /// Compile the *payload* slice of a projection (`items` must exclude the

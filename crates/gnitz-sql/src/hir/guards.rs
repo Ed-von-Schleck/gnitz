@@ -71,8 +71,9 @@ pub(crate) enum JoinKeys<'a> {
 
 /// The merged column is the preserved side's copy, which INNER / LEFT / RIGHT can
 /// pass through. FULL preserves both, so its merged column would be
-/// `COALESCE(l.c, r.c)` — a value neither side carries, and the join emitter
-/// projects columns of its two inputs, never a computed one.
+/// `COALESCE(l.c, r.c)` — and the merge is resolved at bind (`merge_away`), which
+/// rewrites the merged name to one side's `ColId`. A `ColId` cannot name an
+/// expression, so there is nothing for it to resolve to.
 fn reject_full_join_column_merge(kind: JoinType, clause: &str) -> Result<(), GnitzSqlError> {
     if kind != JoinType::Full {
         return Ok(());

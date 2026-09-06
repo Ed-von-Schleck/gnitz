@@ -2,7 +2,7 @@
 
 Covers schema acceptance/rejection (planner gate), INSERT/SELECT/DELETE
 round-trips, byte-path PK delivery, and named-projection through
-`apply_projection`.
+`exec::batch::project`.
 
 The Python `Schema` shim still exposes a single `pk_index` (it calls
 `pk_index_single()` under the hood), so the introspection API is not
@@ -1117,7 +1117,7 @@ def test_compound_pk_insert_distinct_rows_round_trip(client):
             schema_name=sn,
         )
         # Read back via SELECT *. Named projection through
-        # `apply_projection` rebuilds the schema as single-PK, so we go
+        # `exec::batch::project` rebuilds the schema as single-PK, so we go
         # through the wildcard branch that returns the source batch unchanged.
         # This exercises compound-PK byte decoding: the second PK
         # column lives in bytes 8..16 of each row's PK region.
@@ -1380,7 +1380,7 @@ def test_compound_pk_multi_worker_partition_routing(client):
         expected = [(i, (i * 7) % 11, i * 100) for i in range(20)]
         values = ", ".join(f"({a}, {b}, {p})" for (a, b, p) in expected)
         client.execute_sql(f"INSERT INTO t (a, b, payload) VALUES {values}", schema_name=sn)
-        # SELECT * sidesteps apply_projection's single-PK assumption.
+        # SELECT * sidesteps `exec::batch::project`'s single-PK assumption.
         results = client.execute_sql("SELECT * FROM t", schema_name=sn)
         rows_result = next(r for r in results if r["type"] == "Rows")
         seen = sorted((row.a, row.b, row.payload) for row in rows_result["rows"])
@@ -1575,7 +1575,7 @@ def test_compound_pk_stride24_delete_by_bytes(client):
 
 
 # ---------------------------------------------------------------------------
-# Named projection through apply_projection
+# Named projection through exec::batch::project
 # ---------------------------------------------------------------------------
 
 

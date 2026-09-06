@@ -9,7 +9,7 @@
 
 use super::super::{slot_of, ColId, HirCol, HirExpr, ProjEntry, RelExpr, SetOpKind};
 use super::prims::self_derived_key;
-use super::{emit_filter, resolve_collisions, resolve_in_place, resolve_input, CutMemo, SegInput};
+use super::{emit_filter, resolve_collisions, resolve_in_place, resolve_input, CutMemo, Frame, SegInput};
 use crate::error::GnitzSqlError;
 use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::physical;
@@ -149,12 +149,28 @@ fn lower_sides(
     let (r_seg, r_kind) = resolve_set_input(chain, memo, sides[1], &side_ids[1])?;
     // The collision rule may re-point a side at a pass-through wrapper segment; the
     // wrapper's layout still carries the source ids, so the addressing kind holds.
+    // Its demand is the side's set-identity columns plus the WHERE a
+    // `PassThrough` side still applies over it.
+    let live = [side_live(&side_ids[0], &l_kind), side_live(&side_ids[1], &r_kind)];
     let mut inputs = [l_seg, r_seg];
-    resolve_collisions(chain, &mut inputs, exempt)?;
+    resolve_collisions(chain, &mut inputs, &live, exempt)?;
     let [l_seg, r_seg] = inputs;
     let (l_node, l_slots) = emit_side(cb, &l_seg, &l_kind, &side_ids[0])?;
     let (r_node, r_slots) = emit_side(cb, &r_seg, &r_kind, &side_ids[1])?;
     Ok((l_node, l_slots, r_node, r_slots))
+}
+
+/// One set-op side's demand on the source a pass-through wrapper would be built
+/// over — exactly what [`emit_side`] resolves against that side's layout: the
+/// item expressions plus the still-to-be-inlined WHERE for a pass-through side,
+/// the set-identity output ids for a segment one.
+fn side_live(side_ids: &[ColId], kind: &SetSideKind<'_>) -> HashSet<ColId> {
+    let mut live: HashSet<ColId> = HashSet::new();
+    match kind {
+        SetSideKind::PassThrough { items, where_preds } => super::Demand { items, where_preds }.refs(&mut live),
+        SetSideKind::Segment => live.extend(side_ids.iter().copied()),
+    }
+    live
 }
 
 /// How a resolved set-op side addresses its set-identity columns — **not** the
@@ -206,7 +222,7 @@ fn passthrough_parts(side: &Rc<RelExpr>) -> Option<(&Rc<RelExpr>, &[ProjEntry], 
     if super::projection_is_computed(items) {
         return None;
     }
-    let (where_preds, inner) = super::split_filter(input);
+    let (where_preds, inner) = crate::hir::split_filter(input);
     Some((inner, items, where_preds))
 }
 
@@ -228,7 +244,7 @@ fn emit_side(
             Ok((inp, slots))
         }
         SetSideKind::PassThrough { items, where_preds } => {
-            let node = emit_filter(cb, inp, *where_preds, &seg.layout, &seg.schema.columns)?;
+            let node = emit_filter(cb, inp, *where_preds, &Frame::of(&seg.layout, &seg.schema))?;
             // Every item is a bare column ref — that is what makes the side
             // pass-through — so each resolves to exactly one source slot.
             let slots = items

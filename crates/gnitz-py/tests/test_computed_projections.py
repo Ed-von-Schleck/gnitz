@@ -273,8 +273,8 @@ class TestComputedProjections:
             _cleanup(client, sn)
 
     def test_computed_over_a_join(self, client):
-        """A computed projection over a join is not rejected: the lowering cuts the
-        join to a hidden segment and maps the expression above it."""
+        """A computed projection over a join is not rejected: the join emits the
+        expression in its own projection tail, materializing no extra relation."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:

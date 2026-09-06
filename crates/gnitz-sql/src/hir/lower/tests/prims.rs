@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_core::TypeCode;
 
 /// The NULL gate must build at every key arity: one leaf at `k = 1` (byte-
 /// identical to a single-column filter), a multi-leaf AND for `want_null =

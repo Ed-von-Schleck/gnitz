@@ -7,13 +7,14 @@
 //! lowered to an ad-hoc read's fold sink instead of to a circuit.
 
 use super::super::physical;
+use super::super::split_filter;
 use super::super::{is_pre_map, ColId, HirExpr, HirRef, ProjEntry, RelExpr};
 use super::{
-    cut_segment, emit_filter, extract_scan_bound, reduce_out_layout, resolve_in_place, resolve_reduce_specs,
-    split_filter, CutMemo, ReduceSpecs,
+    cut_segment, emit_filter, extract_scan_bound, reduce_out_layout, resolve_in_place, resolve_reduce_specs, CutMemo,
+    Frame, ReduceSpecs,
 };
 use crate::agg::{emit_reduce, ensure_cardinality_count, reduce_output_schema, ReduceLayout, ReduceShape};
-use crate::codec::project_schema::{compile_projection_map, declared_out_cols, ProjItem};
+use crate::codec::project_schema::{payload_map, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_filter_program;
 use crate::hir::chain::{EmitPieces, ViewChain};
@@ -122,8 +123,7 @@ pub(crate) fn lower_reduce(
     let mapped = match &pre {
         Some(p) => cb.map_expr(
             filtered,
-            compile_projection_map(&p.items[p.pk_arity..], &source.schema)?,
-            &declared_out_cols(&p.out_cols[p.pk_arity..]),
+            payload_map(&p.items[p.pk_arity..], &p.out_cols[p.pk_arity..], &source.schema)?,
         ),
         None => filtered,
     };
@@ -140,7 +140,8 @@ pub(crate) fn lower_reduce(
     );
 
     // HAVING filter over the raw reduce output.
-    let filtered_reduced = emit_filter(&mut cb, reduced, having_preds, &reduce_layout, &reduce_schema.columns)?;
+    let having_frame = Frame::of(&reduce_layout, &reduce_schema);
+    let filtered_reduced = emit_filter(&mut cb, reduced, having_preds, &having_frame)?;
 
     // Finalize map + output columns + output layout. The PK region is inherited
     // by the MAP (natural group cols renamed in place; the synthetic `_group_pk`
@@ -181,8 +182,7 @@ pub(crate) fn lower_reduce(
     // payload order, since a renamed-in-place PK column never pushes one.
     let mapped = cb.map_expr(
         filtered_reduced,
-        compile_projection_map(&proj_items, &reduce_schema)?,
-        &declared_out_cols(&out_cols[pk_len..]),
+        payload_map(&proj_items, &out_cols[pk_len..], &reduce_schema)?,
     );
     cb.sink(mapped);
     let circuit = cb.build();

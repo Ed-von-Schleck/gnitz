@@ -420,6 +420,41 @@ def test_backfill_over_prepopulated_tables_matches_fresh_data(bounded_client, bo
 # ── leaf rule ────────────────────────────────────────────────────────────────
 
 
+def test_a_computed_projection_over_a_join_is_still_ineligible(bounded_client):
+    """A join now emits its computed projection itself rather than cutting a hidden
+    segment, so eligibility can no longer be read off the fusion predicate: per-key
+    hydration would have to replay a skeleton row through the compute map."""
+    sn = "s" + _uid()
+    bounded_client.create_schema(sn)
+    try:
+        bounded_client.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL, body TEXT NOT NULL)",
+            schema_name=sn,
+        )
+        bounded_client.execute_sql(
+            "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, tid BIGINT NOT NULL, w BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        with pytest.raises(Exception) as e:
+            bounded_client.execute_sql(
+                "CREATE VIEW b WITH (capacity = '1 KB') AS "
+                "SELECT t.id, t.v + u.w AS s FROM t JOIN u ON t.id = u.tid",
+                schema_name=sn,
+            )
+        assert "not supported" in str(e.value), str(e.value)
+        # The plain inner equi-join without the computed item stays eligible.
+        bounded_client.execute_sql(
+            "CREATE VIEW b WITH (capacity = '1 KB') AS "
+            "SELECT t.id, u.w FROM t JOIN u ON t.id = u.tid",
+            schema_name=sn,
+        )
+    finally:
+        try:
+            bounded_client.drop_schema(sn)
+        except Exception:
+            pass
+
+
 def test_nothing_can_be_created_over_a_bounded_view(bounded_client):
     sn = "s" + _uid()
     bid, _pid = _setup(bounded_client, sn, LINEAR_BODY)

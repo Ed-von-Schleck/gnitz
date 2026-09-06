@@ -759,6 +759,40 @@ fn a_chain_segment_keeps_only_its_live_columns() {
     );
 }
 
+/// The pass-through wrapper the source-collision rule builds is a second
+/// materialized relation, so it carries only what its own side demands — the
+/// self-join's projected and ON columns, the set-op side's set identity — not
+/// every visible column of the source.
+#[test]
+fn a_collision_wrapper_keeps_only_its_live_columns() {
+    let i = TypeCode::I64;
+    let cat = catalog(vec![(
+        "emp",
+        table(
+            30,
+            vec![col("id", i), col("mgr", i), col("nm", i), col("dead", i)],
+            vec![0],
+        ),
+    )]);
+
+    // Self-join: the wrapper is the repeated `emp`, read for its `id` (the ON) and
+    // its `nm` (the projection). `mgr` and `dead` are the other occurrence's.
+    let chain = view(
+        &cat,
+        "SELECT e.nm AS emp, m.nm AS boss FROM emp e JOIN emp m ON e.mgr = m.id",
+    );
+    assert_eq!(chain.views.len(), 2);
+    let wrapper: Vec<&str> = chain.views[0].output_columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(wrapper, ["id", "nm"]);
+
+    // `t EXCEPT t`: the wrapper carries the set identity alone, plus the source PK
+    // the linear projection pins in front.
+    let chain = view(&base(), "SELECT g FROM t EXCEPT SELECT g FROM t");
+    assert_eq!(chain.views.len(), 2);
+    let wrapper: Vec<&str> = chain.views[0].output_columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(wrapper, ["id", "g"]);
+}
+
 /// `register` mirrors what the server records: a bounded view registers as
 /// one, so the leaf rule can be planned against it.
 #[test]

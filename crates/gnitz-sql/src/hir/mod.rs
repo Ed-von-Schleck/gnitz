@@ -189,19 +189,6 @@ pub(crate) fn slot_of(layout: &[ColId], id: ColId) -> Result<usize, GnitzSqlErro
         .ok_or_else(|| GnitzSqlError::Internal("HIR column reference has no layout slot".into()))
 }
 
-/// The physical position of a bare `ColRef` leaf in a layout. Every projection
-/// item that reaches a combine emit is a bare column reference — a computed one is
-/// cut to a linear segment before it gets there — so anything else is an internal
-/// compile error, not a user-facing limit.
-pub(crate) fn slot_of_expr(e: &HirExpr, layout: &[ColId]) -> Result<usize, GnitzSqlError> {
-    match as_col(e) {
-        Some(id) => slot_of(layout, id),
-        None => Err(GnitzSqlError::Internal(
-            "a combine projection item is not a column reference".into(),
-        )),
-    }
-}
-
 /// Leaf reference for HIR expressions: a resolved column, or a bound subquery
 /// awaiting decorrelation. A `Subquery` leaf is minted by bind (an EXISTS/IN/
 /// scalar node bound in place) and consumed entirely by the decorrelation rewrite
@@ -500,6 +487,17 @@ impl HirAgg {
     }
 }
 
+/// Split an optional `Filter` off a node, returning its conjuncts (empty when
+/// absent) and the source below it. Hands back the source as the `Rc` every caller
+/// holds anyway — a cut/exists path needs to clone it, and a `&RelExpr` deref-coerces
+/// for the rest — so this is the one home for the peel.
+pub(crate) fn split_filter(input: &Rc<RelExpr>) -> (&[HirExpr], &Rc<RelExpr>) {
+    match input.as_ref() {
+        RelExpr::Filter { input, preds } => (preds, input),
+        _ => (&[], input),
+    }
+}
+
 /// Which set operation. Copy so the generalized `classify` rebuild can carry it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SetOpKind {
@@ -575,6 +573,16 @@ impl JoinType {
             self.preserves_right()
         }
     }
+
+    /// Whether this side gets a **ν** — the unmatched set
+    /// `positive_part(P_all − π_P(inner))`. Wider than [`Self::preserves`], which
+    /// answers "emit an outer null-fill branch": `Semi`/`Anti`/`Mark` preserve
+    /// neither side yet all three build a ν over their left side to decide match
+    /// existence. The reindex keep set protects exactly the ν operands, so it asks
+    /// this rather than `preserves`.
+    pub(crate) fn has_nu(self, is_left: bool) -> bool {
+        self.preserves(is_left) || (is_left && matches!(self, JoinType::Semi | JoinType::Anti | JoinType::Mark))
+    }
 }
 
 /// An equality join-key pair: the two `ColId`s and their promoted common type.
@@ -617,6 +625,16 @@ pub(crate) enum JoinShape {
 }
 
 impl JoinClass {
+    /// The key columns this ON names on one side — what that side's reindex reads,
+    /// and so what a cut input must keep however narrow the demand above it is.
+    pub(crate) fn key_cols(&self, is_left: bool) -> impl Iterator<Item = ColId> + '_ {
+        let pick = move |(l, r)| if is_left { l } else { r };
+        self.eq
+            .iter()
+            .map(move |p| pick((p.left, p.right)))
+            .chain(self.range.iter().map(move |r| pick((r.left, r.right))))
+    }
+
     pub(crate) fn shape(&self) -> JoinShape {
         match (self.range.is_some(), self.eq.is_empty()) {
             (true, _) => JoinShape::Range,
@@ -744,7 +762,7 @@ impl RelExpr {
                 let pk = &schema.pk_cols;
                 if pk
                     .iter()
-                    .any(|&i| lower::join::is_join_key_name(&schema.columns[i as usize].name))
+                    .any(|&i| lower::joincore::is_join_key_name(&schema.columns[i as usize].name))
                 {
                     return None;
                 }

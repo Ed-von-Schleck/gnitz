@@ -19,10 +19,10 @@
 //! module (like every other `hir` one) free of the exec layer.
 
 use super::super::{chain::schema_of, physical, slot_of};
-use super::super::{is_pre_map, ColId, RelExpr};
+use super::super::{is_pre_map, split_filter, ColId, RelExpr};
 use super::{reduce_out_layout, resolve_reduce_specs, ReduceSpecs};
 use crate::agg::{fold_partial_schema, AggSpec, ReduceLayout};
-use crate::codec::project_schema::{compile_projection_map, declared_out_cols, ProjItem};
+use crate::codec::project_schema::{payload_map, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use crate::validate::reject_float_keys;
@@ -84,12 +84,7 @@ fn pre_map_blob(
     source_schema: &Schema,
 ) -> Result<Option<ComputeMap>, GnitzSqlError> {
     pre.as_ref()
-        .map(|p| {
-            Ok(ComputeMap {
-                program: compile_projection_map(&p.items[p.pk_arity..], source_schema)?.to_blob_bytes(),
-                out_cols: declared_out_cols(&p.out_cols[p.pk_arity..]),
-            })
-        })
+        .map(|p| payload_map(&p.items[p.pk_arity..], &p.out_cols[p.pk_arity..], source_schema))
         .transpose()
 }
 
@@ -108,11 +103,8 @@ pub(crate) fn lower_fold(rel: &RelExpr, source_schema: &Arc<Schema>) -> Result<F
     };
     // HAVING is a Filter between the projection and the reduce; without one the
     // projection sits straight on the reduce.
-    let (having_preds, reduce) = match input.as_ref() {
-        RelExpr::Filter { input, preds } => (preds.as_slice(), input.as_ref()),
-        other => (&[][..], other),
-    };
-    let RelExpr::Reduce { input, group_cols, aggs } = reduce else {
+    let (having_preds, reduce) = split_filter(input);
+    let RelExpr::Reduce { input, group_cols, aggs } = reduce.as_ref() else {
         return Err(GnitzSqlError::Internal("ad-hoc grouped body has no reduce".into()));
     };
 
