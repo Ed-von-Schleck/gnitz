@@ -123,7 +123,6 @@ fn write_stable_shard(dir: &std::path::Path, name: &str, base: u64) -> (String, 
 fn seed_guard(idx: &mut ShardIndex, level_idx: usize, key: PkBuf, path: &str, lsn: u64) {
     let schema = idx.schema;
     let entry = ShardEntry::open(path, &schema, lsn, true).unwrap();
-    idx.ensure_level(level_idx);
     idx.levels[level_idx].get_or_create_guard(key).entries.push(entry);
 }
 
@@ -233,7 +232,7 @@ fn test_run_compact_l0_to_l1() {
     // L0 should be empty after compaction
     assert!(idx.l0.is_empty());
     // L1 should have entries
-    assert!(!idx.levels.is_empty());
+    assert!(!idx.levels[0].guards.is_empty());
     assert!(idx.levels[0].bytes() > 0);
 
     // All keys still findable
@@ -247,7 +246,6 @@ fn the_rebalance_holds_every_level_at_its_targets() {
     let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
     // Manually populate L1 with > GUARD_FILE_THRESHOLD entries in one guard
-    idx.ensure_level(0); // L1
     let guard = idx.levels[0].get_or_create_guard(gk(0));
     let mut all_pks = Vec::new();
     for i in 0..6u64 {
@@ -279,7 +277,6 @@ fn a_failing_vertical_band_leaves_the_bands_before_it_folded() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
-    idx.ensure_level(1); // L2
 
     // Two destination guards over disjoint key bands, each large enough that
     // the trailing rebalance would neither merge nor split them.
@@ -329,7 +326,6 @@ fn test_l1_guard_routing_gap_key_below_first_guard() {
     let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
     // L1 already has a guard at key 100 (keys 100, 200).
-    idx.ensure_level(0); // L1
     let path = write_test_shard(dir.path(), "l1_g100.db", &[100, 200], &[1000, 2000]);
     seed_guard(&mut idx, 0, gk(100), &path, 1);
 
@@ -551,9 +547,6 @@ fn a_vertical_does_not_lose_keys_below_the_destination_guard() {
     let schema = make_schema_u64_i64();
     let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
 
-    // Build L1 (levels[0]) and L2 (levels[1])
-    idx.ensure_level(1); // L2
-
     // L1 guard at key=100: 5 shards (> GUARD_FILE_THRESHOLD=4) with keys in [100, 199]
     let src_pks: Vec<u64> = vec![100, 120, 140, 160, 180];
     for (i, &pk) in src_pks.iter().enumerate() {
@@ -677,7 +670,6 @@ fn test_vertical_disjoint_guards_no_name_collision() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
-    idx.ensure_level(1); // L2
 
     // Key 250 routes to the gk(100) bucket; 6000 to the gk(5000) bucket.
     // L1 guard gk(100): two entries (keys 100, 110).
@@ -738,7 +730,6 @@ fn test_vertical_same_guard_recompaction_try_cleanup_keeps_live() {
     let dir = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let mut idx = ShardIndex::new(42, dir.path().to_str().unwrap(), schema, false);
-    idx.ensure_level(1); // L2
 
     // L2 guard gk(100) pre-seeded with key 250.
     {
@@ -1164,7 +1155,7 @@ fn underfull_guards_merge_at_every_stride() {
         // The merge bound is a byte bound, so the four guards must fit it at the
         // widest stride too or the run breaks for a reason this test is not about.
         let bound = idx.guard_target_bytes(0) / 2;
-        let total: u64 = idx.guard_bytes(0).sum();
+        let total: u64 = idx.levels[0].bytes();
         assert!(
             total <= bound,
             "stride {}: {total} B does not fit the {bound} B run bound",
@@ -1415,9 +1406,9 @@ fn the_guard_count_comes_back_down_after_the_bytes_do() {
         "the count followed the bytes down: {split_count} -> {count}"
     );
     assert!(
-        count <= (idx.level_bytes(TERMINAL_LEVEL_IDX).div_ceil(target / 2) + 1) as usize,
+        count <= (idx.levels[TERMINAL_LEVEL_IDX].bytes().div_ceil(target / 2) + 1) as usize,
         "{count} guards for {} B at a {target} B target",
-        idx.level_bytes(TERMINAL_LEVEL_IDX),
+        idx.levels[TERMINAL_LEVEL_IDX].bytes(),
     );
     assert_all_found(&idx, (1..=keys).step_by(101));
 }
@@ -1439,7 +1430,7 @@ fn a_range_gather_visits_only_the_guards_that_can_own_it() {
             .count()
     };
 
-    assert_eq!(idx.all_shard_arcs().len(), 4);
+    assert_eq!(idx.all_shard_arcs_iter().count(), 4);
     assert_eq!(count(1500, Some(1500)), 1, "a point read routes to one guard");
     assert_eq!(count(1500, Some(2500)), 2, "a range takes the run it spans");
     assert_eq!(count(0, None), 4, "an open end takes the rest of the key space");
@@ -1504,7 +1495,7 @@ fn a_budgeted_terminal_target_is_an_eighth_of_the_budget_within_the_clamp() {
 
 /// The `u128` intermediate is not optional: at the design point `|L2| × R`
 /// runs past `u64::MAX`. Pure arithmetic, because reaching that product
-/// through `level_bytes` would need a terabyte of mapped shard files.
+/// through a level's registered bytes would need a terabyte of mapped shards.
 #[test]
 fn the_balanced_l1_target_computes_its_product_in_u128() {
     let r = 160 * 1024 * 1024u64;
@@ -1542,10 +1533,7 @@ fn index_with_l0(dir: &std::path::Path, n: u64) -> ShardIndex {
 fn terminal_split(idx: &ShardIndex) -> (Vec<usize>, Vec<usize>) {
     let mut dehy = Vec::new();
     let mut hyd = Vec::new();
-    let Some(l) = idx.levels.get(TERMINAL_LEVEL_IDX) else {
-        return (dehy, hyd);
-    };
-    for (gi, g) in l.guards.iter().enumerate() {
+    for (gi, g) in idx.levels[TERMINAL_LEVEL_IDX].guards.iter().enumerate() {
         if g.entries.is_empty() {
         } else if g.dehydrated() {
             dehy.push(gi);
@@ -1570,7 +1558,7 @@ fn a_slack_capacity_leaves_the_store_untouched() {
 
     assert_eq!(idx.resident_bytes(), before, "no compaction ran");
     assert_eq!(idx.l0.len(), 3, "L0 was not pushed down");
-    assert!(idx.levels.is_empty(), "no level was created");
+    assert!(idx.levels.iter().all(|l| l.guards.is_empty()), "no guard was created");
     assert!(idx.all_entries().all(|e| !e.shard.is_skeleton()));
 }
 
@@ -1601,7 +1589,7 @@ fn the_sweep_converges_to_the_skeleton_floor() {
 }
 
 // -----------------------------------------------------------------------
-// Delta-store retention (evict_by_drop)
+// Delta-store retention (Budget::Drop)
 // -----------------------------------------------------------------------
 
 /// Every `.db` file physically present in `dir` — what a leak shows up in and
@@ -1825,7 +1813,6 @@ fn dehydration_takes_the_oldest_written_terminal_guard_first() {
     let tmp = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), schema, false);
-    idx.ensure_level(TERMINAL_LEVEL_IDX);
     // Three hydrated terminal guards at distinct write recencies, each too
     // big for the rebalance to merge into its neighbour.
     for (i, base) in [1u64, 10_000, 20_000].into_iter().enumerate() {
@@ -1911,7 +1898,6 @@ fn vertical_fold_touches_only_the_guards_its_extent_overlaps() {
     let tmp = tempfile::tempdir().unwrap();
     let schema = make_schema_u64_i64();
     let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), schema, false);
-    idx.ensure_level(TERMINAL_LEVEL_IDX);
     // Three well-separated terminal bands, each too big for the rebalance to
     // merge into its neighbour or to split.
     for (i, base) in [1u64, 10_000, 20_000].into_iter().enumerate() {

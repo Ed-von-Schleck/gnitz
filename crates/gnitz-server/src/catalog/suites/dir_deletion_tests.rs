@@ -925,7 +925,7 @@ fn a_relayout_registers_its_shards_at_the_terminal_level() {
         assert!(shards > 0, "child {k} holds no shard");
         // Levels are 0-based in memory, so the relayout's output is the last:
         // nothing in L0 or L1, one terminal guard per shard.
-        assert_eq!(t.level_shape(), (0, vec![0, shards]), "child {k}: terminal placement");
+        assert_eq!(t.level_shape(), (0, [0, shards]), "child {k}: terminal placement");
     }
     drop(engine);
     let _ = fs::remove_dir_all(&dir);

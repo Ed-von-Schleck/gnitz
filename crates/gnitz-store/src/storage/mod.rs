@@ -100,6 +100,15 @@ pub(super) fn cstr(s: impl Into<Vec<u8>>) -> Result<std::ffi::CString, error::St
     std::ffi::CString::new(s).map_err(|_| error::StorageError::InvalidPath)
 }
 
+/// Path strings as `CString`s — the compaction input list (a `Vec<String>`), the
+/// barrier's by-path fdatasync sweep list (borrowed `&str`s off the live
+/// entries) and the relayout's own publish list take the same conversion.
+pub(super) fn to_cstrings<S: AsRef<str>>(
+    paths: impl IntoIterator<Item = S>,
+) -> Result<Vec<std::ffi::CString>, error::StorageError> {
+    paths.into_iter().map(|p| cstr(p.as_ref())).collect()
+}
+
 /// Append the `.tmp` suffix to a CStr basename and return a new CString.
 pub(super) fn cstr_with_tmp_suffix(base: &std::ffi::CStr) -> Result<std::ffi::CString, error::StorageError> {
     let b = base.to_bytes();

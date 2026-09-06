@@ -7,7 +7,7 @@ use std::ffi::CStr;
 
 use super::super::error::StorageError;
 use super::super::manifest::{self, ManifestEntryRaw, ManifestHeader, PreparedManifest};
-use super::{ShardEntry, ShardIndex, MAX_LEVELS};
+use super::{LevelGuard, ShardEntry, ShardIndex, MAX_LEVELS};
 use crate::schema::key::PkBuf;
 
 /// Basename of a shard's full path — its manifest identity. Shard files always
@@ -25,21 +25,27 @@ impl ShardIndex {
         let mut entries = Vec::new();
         for e in &self.l0 {
             // An L0 entry has no guard; `load_manifest` reads `guard_key` only
-            // for `level > 0`, so the zero key it stores is never consulted.
-            entries.push(self.entry_to_raw(e, 0, PkBuf::zeroed(0)));
+            // for `level > 0`, so the zero key stored here is never consulted.
+            entries.push(ManifestEntryRaw::new(
+                shard_basename(&e.filename),
+                e.max_lsn,
+                0,
+                PkBuf::zeroed(0),
+            ));
         }
         for (li, level) in self.levels.iter().enumerate() {
             for guard in &level.guards {
                 for e in &guard.entries {
-                    entries.push(self.entry_to_raw(e, Self::level_num(li) as u64, guard.guard_key));
+                    entries.push(ManifestEntryRaw::new(
+                        shard_basename(&e.filename),
+                        e.max_lsn,
+                        Self::level_num(li) as u64,
+                        guard.guard_key,
+                    ));
                 }
             }
         }
         entries
-    }
-
-    fn entry_to_raw(&self, e: &ShardEntry, level: u64, gk: PkBuf) -> ManifestEntryRaw {
-        ManifestEntryRaw::new(shard_basename(&e.filename), e.max_lsn, level, gk)
     }
 
     /// Load the shard set `path` names, returning the header it carried — the
@@ -58,7 +64,7 @@ impl ShardIndex {
         let stride = self.schema.pk_stride();
         for raw in &entries {
             // The manifest stores the basename; the shard lives in this table's
-            // directory (`entry_to_raw`). Re-prepend it to recover the path.
+            // directory (`build_manifest_entries`). Re-prepend it to recover the path.
             let filename = format!("{}/{}", self.output_dir, raw.filename_str());
             // Published manifest ⇒ the barrier that renamed it fdatasync'd this
             // file first, so it is durable and owes no sweep.
@@ -67,16 +73,14 @@ impl ShardIndex {
             if raw.level == 0 {
                 self.l0.push(entry);
             } else {
-                // Bound the level before `ensure_level`: a corrupted manifest
-                // with an arbitrary level would otherwise allocate thousands of
-                // empty FLSMLevels and crash the engine at startup.
+                // A corrupt manifest can name any level at all; the tier stack
+                // is `MAX_LEVELS` deep and indexing it is unchecked below.
                 if raw.level >= MAX_LEVELS as u64 {
                     return Err(StorageError::InvalidVersion);
                 }
                 // The read side of `ShardIndex::level_num`, which every writer
                 // goes through.
                 let level_idx = raw.level as usize - 1;
-                self.ensure_level(level_idx);
                 // Every stored guard key is exactly `pk_stride` wide (a sample
                 // key, a shard bound, or a synthetic key minted at that stride),
                 // zero-padded into the field — so the schema recovers the width
@@ -91,8 +95,9 @@ impl ShardIndex {
         // `MIN_GUARD_BYTES` floor until its first fold and shatters every guard
         // it loaded against a target orders of magnitude too small.
         self.l0_run_bytes = self.l0_run_bytes.max(
-            (0..self.levels.len())
-                .flat_map(|li| self.guard_bytes(li))
+            self.levels
+                .iter()
+                .flat_map(|l| l.guards.iter().map(LevelGuard::bytes))
                 .max()
                 .unwrap_or(0),
         );

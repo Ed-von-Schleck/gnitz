@@ -120,7 +120,7 @@ impl Table {
         // SAL reset (else the global reset drops them), republish over a compacted
         // index so the deferred drain can unlink the superseded inputs, and
         // re-stamp an unchanged or empty child.
-        let sync_paths = super::super::shard_index::to_cstrings(self.shard_index.unsynced_paths())?;
+        let sync_paths = super::super::to_cstrings(self.shard_index.unsynced_paths())?;
         let manifest_c = super::super::cstr(self.manifest_full_path())?;
         let manifest = self
             .shard_index

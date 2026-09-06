@@ -337,11 +337,11 @@ impl TargetChild {
 
     /// fdatasync every shard, then publish the manifest.
     fn publish(&self, ring: &mut LazyRing, seq: u64) -> Result<(), StorageError> {
-        let paths: Vec<CString> = self
-            .entries
-            .iter()
-            .map(|e| super::cstr(format!("{}/{}", self.dir, e.filename_str())))
-            .collect::<Result<_, _>>()?;
+        let paths = super::to_cstrings(
+            self.entries
+                .iter()
+                .map(|e| format!("{}/{}", self.dir, e.filename_str())),
+        )?;
         let refs: Vec<&CStr> = paths.iter().map(CString::as_c_str).collect();
         super::flush_barrier::sync_by_path(ring, &refs)?;
         manifest::publish_sync(

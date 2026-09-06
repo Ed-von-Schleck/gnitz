@@ -281,10 +281,9 @@ impl Table {
     }
 
     /// Configure this store as a fed view's **delta store**: bounded by `budget`
-    /// registered shard bytes, evicting by dropping its victim outright, and
-    /// unlinking every compaction's superseded inputs at once because it
-    /// publishes no manifest. Called once, by `build_relation_store`, exactly as
-    /// [`Self::set_capacity`] is.
+    /// registered shard bytes, evicting by dropping its victim outright — see
+    /// the shard index's own `Budget::Drop` for what that entails. Called once,
+    /// by `build_relation_store`, exactly as [`Self::set_capacity`] is.
     pub(crate) fn set_delta_budget(&mut self, budget: u64) {
         self.shard_index.set_delta_budget(budget);
     }
@@ -513,20 +512,21 @@ impl Table {
     /// this store about its shard set, in counts — so neither the shard type nor
     /// the index behind it has to be reachable to ask it.
     pub fn pk_filter_census(&self) -> (usize, usize) {
-        let shards = self.shard_index.all_shard_arcs();
-        (shards.len(), shards.iter().filter(|s| s.has_shard_filter()).count())
+        self.shard_index.all_shard_arcs_iter().fold((0, 0), |(n, filtered), s| {
+            (n + 1, filtered + usize::from(s.has_shard_filter()))
+        })
     }
 
     /// Test helper: shard Rcs (production reads go through `runs`). Reached from
     /// outside `lsm`, where the shard index itself is not visible.
     #[cfg(test)]
     pub(crate) fn all_shard_arcs(&self) -> Vec<Rc<MappedShard>> {
-        self.shard_index.all_shard_arcs()
+        self.shard_index.all_shard_arcs_iter().collect()
     }
 
     /// Test helper: `(L0 shard count, per-level guard count)`. Same reach as
     /// [`Self::all_shard_arcs`].
-    pub fn level_shape(&self) -> (usize, Vec<usize>) {
+    pub fn level_shape(&self) -> (usize, [usize; super::shard_index::FLSM_LEVELS]) {
         self.shard_index.level_shape()
     }
 
@@ -649,7 +649,7 @@ impl Table {
     /// deleted files, so `flush_barrier` drains them once it has republished over
     /// the compacted index. A fed view's delta store publishes none and is in
     /// neither checkpoint round, so it unlinks at the end of each compaction
-    /// instead — see `ShardIndex::unlink_superseded_now`.
+    /// instead — see the shard index's own `Budget::Drop`.
     pub fn compact_if_needed(&mut self) -> Result<(), StorageError> {
         if !self.shard_index.should_compact() {
             return Ok(());

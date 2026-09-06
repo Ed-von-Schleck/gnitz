@@ -42,4 +42,4 @@ use super::repr::{batch, bloom, columnar, heap, merge, scatter, shard_file, shar
 // Shard-format constants: only the LSM test modules assert against the image.
 #[cfg(test)]
 use super::repr::layout;
-use super::{cstr, cstr_with_tmp_suffix, error};
+use super::{cstr, cstr_with_tmp_suffix, error, to_cstrings};

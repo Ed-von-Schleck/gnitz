@@ -256,6 +256,15 @@ pub(crate) fn pack_pk_be(pk_bytes: &[u8]) -> u128 {
     }
 }
 
+/// The leading eight OPK bytes as a `u64`, right-zero-padded for a narrower key.
+/// A value accessor, where [`pack_pk_be`] is deliberately not one.
+pub(crate) fn leading_u64(pk_bytes: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let n = pk_bytes.len().min(8);
+    buf[..n].copy_from_slice(&pk_bytes[..n]);
+    u64::from_be_bytes(buf)
+}
+
 /// The `stride` OPK bytes of a narrow PK value that is **already in OPK/route
 /// space** — the widened image `widen_pk_be` produces, sign-flipped for a signed
 /// key. Right-aligning it big-endian reproduces the key's OPK region at any

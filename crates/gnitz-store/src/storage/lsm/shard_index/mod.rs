@@ -2,17 +2,16 @@
 //!
 //! Split into the in-memory index + compaction trigger ([`index`]) and the
 //! manifest serialize/load/recover path ([`persist`]). The shared types
-//! (`ShardEntry`, `LevelGuard`, `FLSMLevel`, `ShardIndex`), the
-//! range/cstring helpers, the level constants, and the constructor live here so
-//! both sub-modules read the (private) fields and helpers directly.
+//! (`ShardEntry`, `LevelGuard`, `FLSMLevel`, `ShardIndex`), the guard-routing
+//! helper, the level constants, and the constructor live here so both
+//! sub-modules read the (private) fields and helpers directly.
 
-use std::ffi::CString;
 use std::rc::Rc;
 
 use super::error::StorageError;
 use super::shard_reader::MappedShard;
 use crate::schema::key::PkBuf;
-use crate::schema::key::{compare_pk_ordering, pack_pk_be, pk_bytes_eq, pk_in_range};
+use crate::schema::key::{compare_pk_ordering, pk_bytes_eq, pk_in_range};
 use crate::schema::SchemaDescriptor;
 
 mod index;
@@ -31,6 +30,8 @@ pub(super) enum CompactionKind {
 }
 
 impl CompactionKind {
+    /// This phase's slot in [`cstats`] — exhaustive, so a new variant fails to
+    /// compile here rather than indexing past `PHASE_NAMES`.
     #[cfg(test)]
     fn slot(self) -> usize {
         match self {
@@ -53,45 +54,47 @@ pub(crate) mod cstats {
     pub(super) fn record(_kind: super::CompactionKind, _inb: u64, _outb: u64, _inf: usize) {}
 
     #[cfg(test)]
-    pub(crate) use enabled::*;
+    use std::cell::RefCell;
 
     #[cfg(test)]
-    mod enabled {
-        use std::cell::RefCell;
+    #[derive(Default, Clone)]
+    pub(crate) struct Phase {
+        pub(crate) n: usize,
+        pub(crate) in_bytes: u64,
+        pub(crate) max_in: u64,
+        pub(crate) out_bytes: u64,
+        pub(crate) in_files: usize,
+    }
 
-        #[derive(Default, Clone)]
-        pub(crate) struct Phase {
-            pub(crate) n: usize,
-            pub(crate) in_bytes: u64,
-            pub(crate) max_in: u64,
-            pub(crate) out_bytes: u64,
-            pub(crate) in_files: usize,
-        }
+    #[cfg(test)]
+    pub(crate) const PHASE_NAMES: [&str; 5] = ["l0_fold", "guard_split", "vertical", "guard_merge", "dehydrate"];
 
-        pub(crate) const PHASE_NAMES: [&str; 5] = ["l0_fold", "guard_split", "vertical", "guard_merge", "dehydrate"];
+    #[cfg(test)]
+    thread_local! {
+        static STATS: RefCell<[Phase; PHASE_NAMES.len()]> =
+            RefCell::new(std::array::from_fn(|_| Phase::default()));
+    }
 
-        thread_local! {
-            static STATS: RefCell<Vec<Phase>> = RefCell::new(vec![Phase::default(); PHASE_NAMES.len()]);
-        }
+    #[cfg(test)]
+    pub(crate) fn record(kind: super::CompactionKind, inb: u64, outb: u64, inf: usize) {
+        STATS.with(|ph| {
+            let p = &mut ph.borrow_mut()[kind.slot()];
+            p.n += 1;
+            p.in_bytes += inb;
+            p.max_in = p.max_in.max(inb);
+            p.out_bytes += outb;
+            p.in_files += inf;
+        });
+    }
 
-        pub(crate) fn record(kind: crate::storage::lsm::shard_index::CompactionKind, inb: u64, outb: u64, inf: usize) {
-            STATS.with(|ph| {
-                let p = &mut ph.borrow_mut()[kind.slot()];
-                p.n += 1;
-                p.in_bytes += inb;
-                p.max_in = p.max_in.max(inb);
-                p.out_bytes += outb;
-                p.in_files += inf;
-            });
-        }
+    #[cfg(test)]
+    pub(crate) fn reset() {
+        STATS.with(|ph| *ph.borrow_mut() = std::array::from_fn(|_| Phase::default()));
+    }
 
-        pub(crate) fn reset() {
-            STATS.with(|ph| *ph.borrow_mut() = vec![Phase::default(); PHASE_NAMES.len()]);
-        }
-
-        pub(crate) fn dump() -> Vec<Phase> {
-            STATS.with(|ph| ph.borrow().clone())
-        }
+    #[cfg(test)]
+    pub(crate) fn dump() -> [Phase; PHASE_NAMES.len()] {
+        STATS.with(|ph| ph.borrow().clone())
     }
 }
 
@@ -100,12 +103,12 @@ impl ShardIndex {
     /// One line of tree shape for the amplification bench: the observed `R`, the
     /// target it derives, and each level's bytes and guard count.
     pub(super) fn tree_report(&self) -> String {
-        let levels: Vec<String> = (0..self.levels.len())
+        let levels: Vec<String> = (0..FLSM_LEVELS)
             .map(|li| {
                 format!(
                     "L{}={}B/{}g",
                     Self::level_num(li),
-                    self.level_bytes(li),
+                    self.levels[li].bytes(),
                     self.levels[li].guards.len()
                 )
             })
@@ -124,13 +127,17 @@ impl ShardIndex {
 /// `load_manifest` rejects anything at or above `MAX_LEVELS`.
 const MAX_LEVELS: usize = 3;
 /// Guarded levels below L0 — L1 and L2.
-const FLSM_LEVELS: usize = MAX_LEVELS - 1;
+pub(super) const FLSM_LEVELS: usize = MAX_LEVELS - 1;
 /// Index of the deepest guarded level (L2). The one level whose guards fold to a
 /// single file, and the only one whose guards may be dehydrated.
 pub(super) const TERMINAL_LEVEL_IDX: usize = FLSM_LEVELS - 1;
 /// L0 shards past this count trigger the fold into L1.
 pub(super) const L0_COMPACT_THRESHOLD: usize = 4;
+/// Files one guard of a shallower guarded level holds before it folds — the
+/// wider fan-in the deepest level does not keep.
 const GUARD_FILE_THRESHOLD: usize = 4;
+/// Files one terminal-level guard holds before it folds: the deepest guarded
+/// level folds each guard down to a single file.
 const LMAX_FILE_THRESHOLD: usize = 1;
 /// Floor under every guard byte target. It bounds the guard *count*: a store
 /// holds `resident / target` guards, so a target derived from a tiny budget
@@ -165,13 +172,6 @@ pub(super) struct CompactionInputs {
     bytes: u64,
 }
 
-/// Path strings as `CString`s — the compaction input list (a `Vec<String>`) and
-/// the barrier's by-path fdatasync sweep list (borrowed `&str`s off the live
-/// entries) take the same conversion.
-pub(super) fn to_cstrings<S: AsRef<str>>(paths: impl IntoIterator<Item = S>) -> Result<Vec<CString>, StorageError> {
-    paths.into_iter().map(|f| super::super::cstr(f.as_ref())).collect()
-}
-
 pub(super) struct ShardEntry {
     shard: Rc<MappedShard>,
     filename: String,
@@ -186,9 +186,10 @@ pub(super) struct ShardEntry {
 }
 
 impl ShardEntry {
-    // An empty shard must fail every range check. A min > max sentinel cannot
-    // express that under `compare_pk_bytes` (it holds only for unsigned
-    // byte-lex), so probe/sort short-circuit on the row count instead.
+    /// An empty shard must fail every range check, and its bounds cannot say so:
+    /// `MappedShard::pk_bounds` answers the zero key, which no comparison tells
+    /// apart from a real row there. So probe, sort and key extent short-circuit
+    /// on the row count instead.
     #[inline]
     fn is_empty(&self) -> bool {
         self.shard.count == 0
@@ -265,9 +266,9 @@ impl LevelGuard {
     /// sweep never chose to evict.
     ///
     /// Only terminal-level guards are ever dehydrated (L0 and L1 always hold
-    /// full-width shards), and a terminal guard holds exactly one entry
-    /// (`LMAX_FILE_THRESHOLD == 1`), so "uniformly skeleton or uniformly
-    /// hydrated" holds by construction.
+    /// full-width shards), and a terminal guard is held at
+    /// [`LMAX_FILE_THRESHOLD`] files — so as long as that is one, "uniformly
+    /// skeleton or uniformly hydrated" holds by construction.
     fn dehydrated(&self) -> bool {
         !self.entries.is_empty() && self.entries.iter().all(|e| e.shard.is_skeleton())
     }
@@ -277,19 +278,6 @@ impl LevelGuard {
     /// the tree carries; the capacity sweep orders its victims by it.
     fn newest_lsn(&self) -> Option<u64> {
         self.entries.iter().map(|e| e.max_lsn).max()
-    }
-
-    /// The highest value the leading eight OPK bytes of this guard's rows take —
-    /// for a delta store, whose key is `_tick ‖ view PK`, the newest round it
-    /// holds. `None` for a guard holding no rows.
-    ///
-    /// Taken from the *highest* round because guard boundaries are key ranges, not
-    /// round boundaries: a drop can leave the tail of its highest round behind, and
-    /// taking that round refuses exactly the cursors that would have needed the
-    /// part that went.
-    fn highest_leading_u64(&self) -> Option<u64> {
-        self.key_extent()
-            .map(|(_, max)| (pack_pk_be(max.pk_bytes()) >> 64) as u64)
     }
 
     /// Total registered bytes of this guard's entries.
@@ -369,20 +357,18 @@ impl FLSMLevel {
         (!self.guards.is_empty()).then(|| guard_slot(&self.guards, key, |g| g.guard_key.pk_bytes()))
     }
 
-    /// The guards overlapping `[range_min, range_max]`. Guards partition the key
-    /// line, so the overlap is a contiguous run — callers may `drain` it.
+    /// The guards overlapping `[range_min, range_max]` — a contiguous run,
+    /// because guards partition the key line, so callers may `drain` it.
     ///
-    /// Never empty while a guard exists: guard 0 owns the tail below its own key,
-    /// so it answers a range that falls entirely under the partition.
+    /// Both ends route through [`guard_slot`]: the run ends one past the guard
+    /// owning `range_max`, which is what keeps it non-empty while a guard exists
+    /// even for a range falling entirely below the partition.
     fn find_guards_for_range(&self, range_min: &[u8], range_max: &[u8]) -> std::ops::Range<usize> {
         // `find_guard_idx` is `None` exactly for an empty level.
         let Some(start) = self.find_guard_idx(range_min) else {
             return 0..0;
         };
-        let end = self
-            .guards
-            .partition_point(|g| compare_pk_ordering(g.guard_key.pk_bytes(), range_max).is_le());
-        start..end.max(start + 1)
+        start..guard_slot(&self.guards, range_max, |g| g.guard_key.pk_bytes()) + 1
     }
 
     /// Total registered bytes of every guard in this level.
@@ -409,14 +395,46 @@ impl FLSMLevel {
     }
 }
 
+/// What bounds this store's registered shard bytes, and what a sweep does to
+/// its victim.
+#[derive(Clone, Copy)]
+enum Budget {
+    /// Every store but a capacity-bounded view's output store and a delta store.
+    Unbounded,
+    /// `CREATE VIEW … WITH (capacity = …)`: evict by leaving skeleton rows behind.
+    Dehydrate(u64),
+    /// A view's delta store: evict by unlinking the guard outright — its rows are
+    /// the change itself, so there is no summed weight worth a stub of. It
+    /// publishes no manifest, so it also unlinks each compaction's superseded
+    /// inputs at once; deferring them to the post-publish drain that never runs
+    /// would leak every dropped *and* every compacted-away shard for the life of
+    /// the process, invisibly to `resident_bytes`.
+    Drop(u64),
+}
+
+impl Budget {
+    /// The ceiling, for the targets that read the number and not the eviction it
+    /// implies.
+    fn cap(self) -> Option<u64> {
+        match self {
+            Budget::Unbounded => None,
+            Budget::Dehydrate(cap) | Budget::Drop(cap) => Some(cap),
+        }
+    }
+}
+
 pub(super) struct ShardIndex {
     table_id: u32,
     output_dir: String,
     pub schema: SchemaDescriptor,
 
     l0: Vec<ShardEntry>,
-    levels: Vec<FLSMLevel>,
+    levels: [FLSMLevel; FLSM_LEVELS],
 
+    /// Source of every output shard's basename. Each output-emitting compaction
+    /// draws a fresh value, and the manifest header carries it across a restart,
+    /// so no two of this table's output shards ever share a basename. Unique, not
+    /// dense: a compaction that fails after drawing one burns it.
     compact_seq: u64,
     pending_deletions: Vec<String>,
     /// Running **max** over the registered L0 bytes each `run_compact` consumed —
@@ -428,27 +446,15 @@ pub(super) struct ShardIndex {
     /// largest guard it reloads, so a resumed store does not shatter guards built
     /// under a larger `R`.
     l0_run_bytes: u64,
-    /// Ceiling on this store's **registered on-disk shard bytes**, from
-    /// `CREATE VIEW … WITH (capacity = …)`. `None` for every store but a
-    /// capacity-bounded view's output store, which pays nothing.
-    capacity_bytes: Option<u64>,
-    /// This store evicts by **dropping** its victim rather than by dehydrating
-    /// it, and unlinks each compaction's superseded inputs at once rather than
-    /// deferring them to the checkpoint barrier. `false` for every store but a
-    /// view's delta store.
-    ///
-    /// One field for both because one fact decides both: a delta store's rows
-    /// are the change itself, so there is no summed weight worth a skeleton stub
-    /// of, and it publishes no manifest, so the post-publish drain it would
-    /// otherwise defer to never runs — deferring there would leak every dropped
-    /// *and* every compacted-away shard for the life of the process, invisibly to
-    /// `resident_bytes`, which counts registered entries only.
-    evict_by_drop: bool,
+    /// What bounds this store's registered on-disk shard bytes, and how a sweep
+    /// evicts. Unbounded for every store but a capacity-bounded view's output
+    /// store and a view's delta store, both of which pay nothing.
+    budget: Budget,
     /// Running **max** over the leading eight OPK bytes — the `_tick` — of every row
     /// this store has ever dropped. A delta read at `after_tick > dropped_through`
     /// asks only for rows above it, and no such row was ever dropped; a read at or
     /// below it is refused. Zero until the first drop, and always zero for a store
-    /// that does not evict by dropping ([`Self::evict_by_drop`]).
+    /// that does not evict by dropping ([`Budget::Drop`]).
     dropped_through: u64,
     /// Passed to every compaction's write. Held rather than derived from the
     /// input shards: a derivation would let one filterless input turn the filter
@@ -461,11 +467,11 @@ impl ShardIndex {
     /// test asserts a placement against, where `tree_report` is for reading —
     /// outside the `cfg(test)` block above because `gnitz-server`'s tests
     /// reach it through [`Table::level_shape`], across the crate seam.
-    pub(crate) fn level_shape(&self) -> (usize, Vec<usize>) {
-        (self.l0.len(), self.levels.iter().map(|l| l.guards.len()).collect())
+    pub(crate) fn level_shape(&self) -> (usize, [usize; FLSM_LEVELS]) {
+        (self.l0.len(), std::array::from_fn(|i| self.levels[i].guards.len()))
     }
-    /// The 1-based level *number* of a 0-based tier index — see
-    /// [`ensure_level`](Self::ensure_level) for where that number is used.
+    /// The 1-based level *number* of a 0-based tier index — used only by the two
+    /// serde boundaries that carry it, the shard filename and the manifest field.
     pub(super) fn level_num(level_idx: usize) -> usize {
         level_idx + 1
     }
@@ -478,12 +484,11 @@ impl ShardIndex {
             output_dir: output_dir.to_string(),
             schema,
             l0: Vec::new(),
-            levels: Vec::new(),
+            levels: std::array::from_fn(|_| FLSMLevel::new()),
             compact_seq: 0,
             pending_deletions: Vec::new(),
             l0_run_bytes: MIN_GUARD_BYTES,
-            capacity_bytes: None,
-            evict_by_drop: false,
+            budget: Budget::Unbounded,
             dropped_through: 0,
             skip_pk_filter,
         }
@@ -503,14 +508,15 @@ impl ShardIndex {
         self.skip_pk_filter = skip;
     }
 
-    /// Bound this store's registered shard bytes, once, at construction.
+    /// Bound this store's registered shard bytes, once, at construction —
+    /// evicting by dehydrating its victim (see [`Budget::Dehydrate`]).
     pub(super) fn set_capacity(&mut self, capacity_bytes: Option<u64>) {
-        self.capacity_bytes = capacity_bytes;
+        self.budget = capacity_bytes.map_or(Budget::Unbounded, Budget::Dehydrate);
     }
 
     /// Configure this index as a view's **delta store**: bounded by `budget`,
     /// and evicting by dropping rather than by dehydrating (see
-    /// [`Self::evict_by_drop`]).
+    /// [`Budget::Drop`]).
     ///
     /// The budget is bytes and never a subscriber's cursor: the sweep drops the
     /// oldest-written guard whether or not someone is still reading it, so a slow
@@ -523,8 +529,7 @@ impl ShardIndex {
     /// itself. That costs every subscriber a re-read and costs correctness
     /// nothing.
     pub(super) fn set_delta_budget(&mut self, budget: u64) {
-        self.capacity_bytes = Some(budget);
-        self.evict_by_drop = true;
+        self.budget = Budget::Drop(budget);
     }
 
     /// The highest round this store has dropped; see [`Self::dropped_through`].

@@ -205,6 +205,25 @@ fn pack_pk_be_specialization_matches_naive() {
     }
 }
 
+/// `leading_u64` reads the first eight OPK bytes at *any* stride — including
+/// past eight, which is where it parts company with `PkSortKey::<u64>::from_opk`
+/// (dispatched only at strides ≤ 8, and out of bounds above them). A delta
+/// store's `_tick ‖ view PK` key is always in that upper band.
+#[test]
+fn leading_u64_reads_eight_bytes_at_every_stride() {
+    let bytes: Vec<u8> = (1..=24u8).collect();
+    for width in [0usize, 1, 4, 8, 9, 16, 24] {
+        let mut want = [0u8; 8];
+        let n = width.min(8);
+        want[..n].copy_from_slice(&bytes[..n]);
+        assert_eq!(
+            leading_u64(&bytes[..width]),
+            u64::from_be_bytes(want),
+            "width {width}: the leading eight bytes, right-zero-padded",
+        );
+    }
+}
+
 #[test]
 fn pk_bytes_eq_matches_byte_equality_direct() {
     // Wide (> 16): fully-equal → true; equal leading-16 prefix, differing
