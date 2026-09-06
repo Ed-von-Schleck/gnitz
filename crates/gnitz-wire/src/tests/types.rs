@@ -242,54 +242,56 @@ fn join_key_common_type_over_cross_sign_pairs() {
     }
 }
 
-/// `carried_reindex_tc` and `resolve_reindex_type` are inverses: a slot that
-/// needs no promotion collapses to the carried `0` ("derive from source"), a
+/// `TypeCode::carried_reindex_tc` and `resolve_reindex_type` are inverses: a
+/// slot that needs no promotion carries `None` ("derive from source"), a
 /// cross-width slot carries its target `T`, and resolving what was carried
 /// returns `T` either way.
 #[test]
 fn carried_reindex_tc_round_trips_with_resolve() {
-    use type_code::*;
-    // (source, promoted target T, the carried tc that must be persisted)
-    let cases: &[(u8, u8, u8)] = &[
+    use TypeCode::*;
+    // (source, promoted target T, whether T has to be carried)
+    let cases: &[(TypeCode, TypeCode, bool)] = &[
         // Self-deriving slots: the per-column default policy already lands on T.
-        (I32, I32, 0),
-        (U64, U64, 0),
-        (STRING, U128, 0),
-        (F64, U128, 0),
-        (U128, U128, 0),
-        (UUID, U128, 0),
+        (I32, I32, false),
+        (U64, U64, false),
+        (String, U128, false),
+        (F64, U128, false),
+        (U128, U128, false),
+        (UUID, U128, false),
         // Cross-width slots carry the promoted target.
-        (I8, I64, I64),
-        (I32, I64, I64),
-        (U8, U64, U64),
-        (U32, U64, U64),
-        (U32, U128, U128),
+        (I8, I64, true),
+        (I32, I64, true),
+        (U8, U64, true),
+        (U32, U64, true),
+        (U32, U128, true),
         // Cross-sign promotions: the unsigned side lands on a signed T.
-        (U8, I16, I16),
-        (U16, I32, I32),
-        (U32, I64, I64),
+        (U8, I16, true),
+        (U16, I32, true),
+        (U32, I64, true),
         // Every side reaching the signed-128 slot.
-        (U64, I128, I128),
-        (I8, I128, I128),
-        (I16, I128, I128),
-        (I32, I128, I128),
-        (I64, I128, I128),
+        (U64, I128, true),
+        (I8, I128, true),
+        (I16, I128, true),
+        (I32, I128, true),
+        (I64, I128, true),
     ];
     for &(src, t, want_carried) in cases {
-        let carried = carried_reindex_tc(src, t);
-        assert_eq!(carried, want_carried, "carried tc for src={src} T={t}");
-        assert_eq!(resolve_reindex_type(src, carried), t, "round-trip for src={src} T={t}");
-        // Idempotency of promotion: a *carried* (non-zero) target re-derives to
-        // itself through join_key_common_type. The engine compiler relies on
-        // exactly this to validate a carried `_join_pk` slot against the planner
-        // without re-implementing the sign/width ladder — so it must hold for
-        // every promotion a source can carry. (Self-deriving slots carry 0 and
-        // are validated by the per-column default policy, not this rule.)
-        if carried != 0 {
+        let carried = src.carried_reindex_tc(t);
+        assert_eq!(carried, want_carried.then_some(t), "carried target for {src:?} → {t:?}");
+        assert_eq!(
+            resolve_reindex_type(src as u8, carried),
+            t as u8,
+            "round-trip for {src:?} → {t:?}"
+        );
+        // A carried target re-derives to itself, which is how the compiler's
+        // `key_promotion_invalid` validates one without re-implementing the
+        // ladder. (A self-deriving slot carries nothing and is not validated
+        // this way.)
+        if carried.is_some() {
             assert_eq!(
-                join_key_common_type(src, t),
-                Some(t),
-                "promotion not idempotent for src={src} T={t}: \
+                join_key_common_type(src as u8, t as u8),
+                Some(t as u8),
+                "promotion not idempotent for {src:?} → {t:?}: \
                  compiler carried-slot guard would diverge from the planner"
             );
         }

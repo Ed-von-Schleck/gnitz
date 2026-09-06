@@ -92,15 +92,13 @@ pub(crate) fn append_value_to_col(
                 }
                 // A BLOB column is *not* text-writable: it takes bytes, and a
                 // quoted literal spells none. UUID is the one non-STRING type a
-                // text literal spells a value of, and both write paths gate on the
-                // same `admits_text_literal` predicate, so neither can start
-                // accepting text for a type the other rejects.
+                // text literal spells a value of.
                 Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => match tc {
                     TypeCode::String => {
                         col.extend_from_slice(&gnitz_wire::encode_german_string(s.as_bytes(), blob));
                         Ok(())
                     }
-                    _ if tc.admits_text_literal() => {
+                    TypeCode::UUID => {
                         col.extend_from_slice(&parse_uuid_str(s)?.to_le_bytes());
                         Ok(())
                     }

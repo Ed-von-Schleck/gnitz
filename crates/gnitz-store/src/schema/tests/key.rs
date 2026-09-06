@@ -834,7 +834,7 @@ fn packer_output_schema_pk_width_policy() {
             &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(key_tc, 0)],
             &[0],
         );
-        let node_schema = ReindexPacker::new(&in_schema, &[(1, 0)])
+        let node_schema = ReindexPacker::new(&in_schema, &[(1, None)])
             .unwrap()
             .output_schema(&in_schema, &[0, 1])
             .unwrap();
@@ -850,7 +850,7 @@ fn packer_output_schema_pk_width_policy() {
             &[0],
         );
         assert!(
-            ReindexPacker::new(&in_schema, &[(1, 0)]).is_none(),
+            ReindexPacker::new(&in_schema, &[(1, None)]).is_none(),
             "a float reindex key must be refused, not packed"
         );
         assert!(
@@ -871,7 +871,7 @@ fn packer_output_schema_compound() {
         ],
         &[0],
     );
-    let out = ReindexPacker::new(&in_schema, &[(1, 0), (2, 0)])
+    let out = ReindexPacker::new(&in_schema, &[(1, None), (2, None)])
         .unwrap()
         .output_schema(&in_schema, &[0, 1, 2])
         .unwrap();
@@ -898,7 +898,7 @@ fn packer_output_schema_cross_width_promotes() {
         ],
         &[0],
     );
-    let out = ReindexPacker::new(&in_schema, &[(1, type_code::I64), (2, 0)])
+    let out = ReindexPacker::new(&in_schema, &[(1, Some(gnitz_wire::TypeCode::I64)), (2, None)])
         .unwrap()
         .output_schema(&in_schema, &[0, 1, 2])
         .unwrap();
@@ -919,7 +919,7 @@ fn packer_output_schema_payload_prune() {
         ],
         &[0],
     );
-    let out = ReindexPacker::new(&in_schema, &[(1, 0)])
+    let out = ReindexPacker::new(&in_schema, &[(1, None)])
         .unwrap()
         .output_schema(&in_schema, &[0, 3])
         .unwrap();
@@ -962,7 +962,7 @@ fn test_reindex_packer_multi_column_bytes() {
     b.count += 1;
     let mb = b.as_mem_batch();
 
-    let packer = ReindexPacker::new(&schema, &[(1, 0), (2, 0), (3, 0)]).unwrap();
+    let packer = ReindexPacker::new(&schema, &[(1, None), (2, None), (3, None)]).unwrap();
     // out_stride = 8 (Pk U64) + 4 (I32) + 16 (U128) = 28.
     assert_eq!(packer.out_stride, 8 + 4 + 16);
 
@@ -1002,7 +1002,7 @@ fn test_reindex_packer_arity1_byte_identity() {
         let mb = b.as_mem_batch();
 
         let out_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U128, 0)], &[0]);
-        let packer = ReindexPacker::new(&schema, &[(1, 0)]).unwrap();
+        let packer = ReindexPacker::new(&schema, &[(1, None)]).unwrap();
         assert_eq!(packer.out_stride, 16, "a content-hash key is a 16-byte U128 slot");
         let mut out = Batch::zeroed(&out_schema, 3);
         promote_into(&packer, &mb, &mut out);
@@ -1056,7 +1056,7 @@ fn test_reindex_packer_copartition_contract() {
     }
     let mb = b.as_mem_batch();
 
-    let key: Vec<(u32, u8)> = cols.iter().map(|&c| (c, 0)).collect();
+    let key: Vec<gnitz_wire::ReindexSlot> = cols.iter().map(|&c| (c, None)).collect();
     let packer = ReindexPacker::new(&schema, &key).unwrap();
     let out_schema = SchemaDescriptor::new(
         &[
@@ -1113,7 +1113,7 @@ fn test_reindex_packer_copartition_contract_wide() {
     let mb = b.as_mem_batch();
 
     // Reindex on the three U64 payload columns → a 24-byte (3×U64) OPK key.
-    let packer = ReindexPacker::new(&schema, &[(1, 0), (2, 0), (3, 0)]).unwrap();
+    let packer = ReindexPacker::new(&schema, &[(1, None), (2, None), (3, None)]).unwrap();
     assert_eq!(packer.out_stride, 24, "3×U64 reindex key must be 24 bytes (wide)");
 
     // The reindex output schema = natural 3×U64 PK (what the reindex map stamps and
@@ -1192,7 +1192,7 @@ fn test_reindex_packer_null_key_determinism() {
     }
     let mb = b.as_mem_batch();
 
-    let packer = ReindexPacker::new(&schema, &[(1, 0)]).unwrap();
+    let packer = ReindexPacker::new(&schema, &[(1, None)]).unwrap();
     assert_eq!(packer.out_stride, 4); // U32 key → 4-byte slot
 
     let mut buf0 = [0u8; crate::schema::MAX_PK_BYTES];
@@ -1270,12 +1270,13 @@ mod pack_proptest {
     /// A legal carried promotion target: the widest slot of the source's own
     /// signedness. For the already-widest codes that is the self-derived type,
     /// so the two passes below are always legal, not always distinct.
-    fn carried_target(tc: u8) -> u8 {
+    fn carried_target(tc: u8) -> gnitz_wire::TypeCode {
+        use gnitz_wire::TypeCode as T;
         match tc {
-            type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => type_code::U64,
-            type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64 => type_code::I64,
-            type_code::I128 => type_code::I128,
-            _ => type_code::U128, // U128, UUID
+            type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => T::U64,
+            type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64 => T::I64,
+            type_code::I128 => T::I128,
+            _ => T::U128, // U128, UUID
         }
     }
 
@@ -1331,9 +1332,11 @@ mod pack_proptest {
             let pk_mb = kb.as_mem_batch();
 
             for carried in [false, true] {
-                let target = |tc| if carried { carried_target(tc) } else { 0 };
-                let pay_key: Vec<(u32, u8)> = types.iter().enumerate().map(|(i, &tc)| (i as u32 + 1, target(tc))).collect();
-                let pk_key: Vec<(u32, u8)> = types.iter().enumerate().map(|(i, &tc)| (i as u32, target(tc))).collect();
+                let target = |tc| carried.then(|| carried_target(tc));
+                let pay_key: Vec<gnitz_wire::ReindexSlot> =
+                    types.iter().enumerate().map(|(i, &tc)| (i as u32 + 1, target(tc))).collect();
+                let pk_key: Vec<gnitz_wire::ReindexSlot> =
+                    types.iter().enumerate().map(|(i, &tc)| (i as u32, target(tc))).collect();
                 let pay_packer = ReindexPacker::new(&pay_schema, &pay_key).unwrap();
                 let pk_packer = ReindexPacker::new(&pk_schema, &pk_key).unwrap();
                 let stride = pay_packer.out_stride;
@@ -1405,7 +1408,7 @@ fn reindex_pack_bench() {
         jb.count += 1;
     }
     let jmb = jb.as_mem_batch();
-    let join_packer = ReindexPacker::new(&join_schema, &[(1, 0), (2, 0), (3, 0)]).unwrap();
+    let join_packer = ReindexPacker::new(&join_schema, &[(1, None), (2, None), (3, None)]).unwrap();
     assert_eq!(join_packer.out_stride, 24);
 
     // --- Nullable 2-column group key: [U64 PK, I64, U32 NULL], group on (1, 2).

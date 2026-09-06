@@ -219,7 +219,7 @@ pub(super) fn scan_delta(source: u64) -> gnitz_wire::OpNode {
 pub(super) fn scatter_reindex(cols: &[u32]) -> gnitz_wire::OpNode {
     gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
         keep: vec![0],
-        key: cols.iter().map(|&c| (c, 0)).collect(),
+        key: cols.iter().map(|&c| (c, None)).collect(),
         role: gnitz_wire::ReindexRole::ScatterKey,
     })
 }

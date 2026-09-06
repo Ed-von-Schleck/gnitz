@@ -207,12 +207,10 @@ pub(crate) fn extract_sql_literal(expr: &Expr) -> Option<SqlLiteral<'_>> {
 fn parse_one_pk_literal(pk_expr: &Expr, tc: TypeCode, col_name: &str) -> Result<u128, GnitzSqlError> {
     match extract_sql_literal(pk_expr) {
         Some(SqlLiteral::Number(n, negated)) => parse_pk_literal_packed(tc, n, negated).ok_or_else(|| {
-            if negated
-                && matches!(
-                    tc,
-                    TypeCode::U8 | TypeCode::U16 | TypeCode::U32 | TypeCode::U64 | TypeCode::U128 | TypeCode::UUID
-                )
-            {
+            // `tc` is a PK column's type, so it is PK-eligible: an integer
+            // scalar at some width. On that domain "not signed" is "unsigned",
+            // which is the half a negative literal can never land in.
+            if negated && !tc.is_signed_int() {
                 GnitzSqlError::Bind(format!(
                     "PK column '{col_name}' of type {tc:?} does not accept negative literals"
                 ))

@@ -11,7 +11,9 @@ use super::prims::{multi_null_filter_prog, null_gate, rekey_aux_on_source_pk, se
 use super::JoinSide;
 use crate::error::GnitzSqlError;
 
-use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, RangeRel, ReduceOutKey, ReindexRole, Schema, TypeCode};
+use gnitz_core::{
+    CircuitBuilder, ColumnDef, NodeId, RangeRel, ReduceOutKey, ReindexRole, ReindexSlot, Schema, TypeCode,
+};
 use gnitz_wire::AggFunc as WireAggFunc;
 
 /// A join's equality pairs resolved against both inputs: each side's key-column
@@ -40,10 +42,10 @@ fn resolve_eq_cols(eq: &[EqPair], left: &JoinSide, right: &JoinSide) -> Result<E
 
 /// This side's reindex key: each slot's source column paired with the carried
 /// target type from `carried_reindex_tc` — `T_i` only where this side's own
-/// self-derived type disagrees with it, else `0`, so the engine stays the sole
-/// producer of the derived slot type. Shared by the equi, range/band and
+/// self-derived type disagrees with it, else `None`, so the engine stays the
+/// sole producer of the derived slot type. Shared by the equi, range/band and
 /// EXISTS/IN builders, which differ only in what `slot_tcs` spans.
-fn side_reindex_key(cols: &[usize], coldefs: &[ColumnDef], slot_tcs: &[TypeCode]) -> Vec<(u32, u8)> {
+fn side_reindex_key(cols: &[usize], coldefs: &[ColumnDef], slot_tcs: &[TypeCode]) -> Vec<ReindexSlot> {
     cols.iter()
         .zip(slot_tcs)
         .map(|(&c, &t)| (c as u32, coldefs[c].type_code.carried_reindex_tc(t)))
@@ -85,7 +87,7 @@ pub(super) fn ba_to_ab_cols(k: usize, left_n: usize, right_n: usize) -> impl Ite
 struct EquiSide<'a> {
     side: &'a JoinSide,
     input: NodeId,
-    key: Vec<(u32, u8)>,
+    key: Vec<ReindexSlot>,
 }
 
 impl EquiSide<'_> {
@@ -217,7 +219,7 @@ pub(crate) struct EquiInput<'a> {
 }
 
 impl<'a> EquiInput<'a> {
-    fn keyed(self, key: Vec<(u32, u8)>) -> EquiSide<'a> {
+    fn keyed(self, key: Vec<ReindexSlot>) -> EquiSide<'a> {
         EquiSide { side: self.side, input: self.node, key }
     }
 }
@@ -539,7 +541,7 @@ pub(crate) fn build_pure_range_threshold(
     let want_max = matches!(range.op, RangeRel::Lt | RangeRel::Le);
     let agg_func = if want_max { WireAggFunc::Max } else { WireAggFunc::Min };
 
-    let mbh = cb.map_hash_row(reindex_b, &[(0, 0)], 0);
+    let mbh = cb.map_hash_row(reindex_b, &[(0, None)], 0);
     // Empty group set (one global threshold over the broadcast other side) -> the
     // synthetic `_group_pk` fold, like every other empty-group reduce.
     let red = cb.reduce_multi_local(mbh, &[], &[(agg_func, 1)], false, ReduceOutKey::SyntheticFold); // [_group_pk:U128, m:Tc]

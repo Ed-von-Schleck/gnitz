@@ -54,11 +54,8 @@ fn test_scatter_key_packed_matches_legacy_routing() {
 
     // Run the `JoinKey` `ScatterKey` over `row` and return its worker.
     const NW: usize = 4;
-    fn packed(schema: &SchemaDescriptor, cols: &[u32], tcs: &[u8], mb: &MemBatch, row: usize) -> usize {
-        let key: Vec<(u32, u8)> = cols
-            .iter()
-            .map(|&c| (c, tcs.iter().copied().next().unwrap_or(0)))
-            .collect();
+    fn packed(schema: &SchemaDescriptor, cols: &[u32], mb: &MemBatch, row: usize) -> usize {
+        let key: Vec<gnitz_wire::ReindexSlot> = cols.iter().map(|&c| (c, None)).collect();
         let mut sk = ScatterKey::new(ScatterSpec::JoinKey(&key), schema, NW);
         assert!(!sk.is_pk_routed(), "test key shapes must take the packed route");
         sk.worker(mb, row)
@@ -88,7 +85,7 @@ fn test_scatter_key_packed_matches_legacy_routing() {
         for row in 0..2 {
             // Legacy: routable-int → loc.route_key → worker_for_key (null-blind).
             let legacy = worker_for_key(schema.locate(1).route_key(&mb, row), NW);
-            assert_eq!(packed(&schema, &[1], &[], &mb, row), legacy, "I64 row {row}");
+            assert_eq!(packed(&schema, &[1], &mb, row), legacy, "I64 row {row}");
         }
     }
 
@@ -120,7 +117,7 @@ fn test_scatter_key_packed_matches_legacy_routing() {
                 crate::schema::key::german_string_promote_key(mb.get_col_ptr(row, 0, 16), mb.blob),
                 NW,
             );
-            assert_eq!(packed(&schema, &[1], &[], &mb, row), legacy, "STRING row {row}");
+            assert_eq!(packed(&schema, &[1], &mb, row), legacy, "STRING row {row}");
         }
     }
 
@@ -142,7 +139,7 @@ fn test_scatter_key_packed_matches_legacy_routing() {
         b.count += 1;
         let mb = b.as_mem_batch();
         let legacy = worker_for_key(schema.locate(1).route_key(&mb, 0), NW);
-        assert_eq!(packed(&schema, &[1], &[], &mb, 0), legacy, "U128 payload");
+        assert_eq!(packed(&schema, &[1], &mb, 0), legacy, "U128 payload");
     }
 
     // (6) single sub-column of a compound PK — the one legacy join-key
@@ -169,11 +166,7 @@ fn test_scatter_key_packed_matches_legacy_routing() {
         let mb = b.as_mem_batch();
         for col in [0u32, 1u32] {
             let legacy = worker_for_key(GroupKeyCols::new(&schema, &[col]).key_row(&mb, 0), NW);
-            assert_eq!(
-                packed(&schema, &[col], &[], &mb, 0),
-                legacy,
-                "compound-PK sub-col {col}"
-            );
+            assert_eq!(packed(&schema, &[col], &mb, 0), legacy, "compound-PK sub-col {col}");
         }
     }
 }

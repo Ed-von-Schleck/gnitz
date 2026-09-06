@@ -51,8 +51,8 @@ pub enum ScatterSpec<'a> {
     /// GROUP BY / set-op: the null-distinct group fold over these columns.
     GroupKey(&'a [u32]),
     /// Equi-join: the packed `_join_pk`, one slot per `(source column, promoted
-    /// key type code)` — `0` derives the slot type from the source column.
-    JoinKey(&'a [(u32, u8)]),
+    /// key type)` — `None` derives the slot type from the source column.
+    JoinKey(&'a [gnitz_wire::ReindexSlot]),
 }
 
 /// Per-scatter row router, built once (out of the row loop — a packer's
@@ -108,14 +108,14 @@ impl ScatterKey {
     pub(crate) fn new(spec: ScatterSpec<'_>, schema: &SchemaDescriptor, num_workers: usize) -> Self {
         // Sequence equality, not set equality: `worker_for_pk_bytes` hashes OPK
         // bytes in schema order, so a permuted compound PK routes differently.
-        // And `tc == 0` throughout: a promoted key packs at the wider `T`, so its
-        // narrow source PK bytes must not route natively.
+        // And no carried target throughout: a promoted key packs at the wider
+        // `T`, so its narrow source PK bytes must not route natively.
         let pk = schema.pk_indices();
         let kind = match spec {
             ScatterSpec::GroupKey(cols) if cols == pk => ScatterKind::PkBytes,
             ScatterSpec::GroupKey(cols) => ScatterKind::Fold { keys: GroupKeyCols::new(schema, cols) },
             ScatterSpec::JoinKey(slots)
-                if slots.len() == pk.len() && slots.iter().zip(pk).all(|(&(c, tc), &p)| c == p && tc == 0) =>
+                if slots.len() == pk.len() && slots.iter().zip(pk).all(|(&(c, tc), &p)| c == p && tc.is_none()) =>
             {
                 ScatterKind::PkBytes
             }

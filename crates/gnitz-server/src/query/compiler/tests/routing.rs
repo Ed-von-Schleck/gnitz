@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{make_schema_u64_i64, pk_payload_schema};
 use gnitz_store::schema::type_code;
-use gnitz_wire::{JoinKind, OpNode, RangeRel};
+use gnitz_wire::{JoinKind, OpNode, RangeRel, TypeCode};
 
 /// 3-column compound PK `(U32, U64, U64)` + one payload, so a `CLUSTER BY`
 /// prefix has more than one proper-prefix width to be tested at.
@@ -78,13 +78,17 @@ fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
     // Compound PK (a, b) at columns 0, 1; column 2 is payload.
     let compound = pk_payload_schema(&[type_code::U64; 2]);
     let ext: ExtTables = HashMap::from([(7, compound)]);
-    let co = |cols: Vec<(u32, u8)>| compute_co_partitioned(&HashMap::from([(7i64, cols)]), &ext).contains(&7);
-    assert!(co(vec![(0, 0), (1, 0)]), "shard [pk0, pk1] equals pk_indices()");
-    assert!(!co(vec![(1, 0), (0, 0)]), "permuted [pk1, pk0] != pk_indices() order");
-    // A promoted key (non-zero carried tc) never co-partitions: native PK
+    let co =
+        |cols: Vec<gnitz_wire::ReindexSlot>| compute_co_partitioned(&HashMap::from([(7i64, cols)]), &ext).contains(&7);
+    assert!(co(vec![(0, None), (1, None)]), "shard [pk0, pk1] equals pk_indices()");
+    assert!(
+        !co(vec![(1, None), (0, None)]),
+        "permuted [pk1, pk0] != pk_indices() order"
+    );
+    // A promoted key (a carried target) never co-partitions: native PK
     // partitions are at the source width, not the T-wide trace key.
     assert!(
-        !co(vec![(0, type_code::I64), (1, 0)]),
+        !co(vec![(0, Some(TypeCode::I64)), (1, None)]),
         "a promoted PK slot must go through the exchange"
     );
 
@@ -93,7 +97,7 @@ fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
     // replication.
     let base = make_schema_u64_i64;
     let replicated = base().with_placement(Placement::Replicated);
-    let join_on_payload = HashMap::from([(7i64, vec![(1u32, 0u8)]), (8i64, vec![(1u32, 0u8)])]);
+    let join_on_payload = HashMap::from([(7i64, vec![(1u32, None)]), (8i64, vec![(1u32, None)])]);
     let both_skip = |ext: ExtTables| {
         let co = compute_co_partitioned(&join_on_payload, &ext);
         (co.contains(&7), co.contains(&8))
@@ -116,11 +120,11 @@ fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
         "replicated ⋈ replicated"
     );
     // The write broadcast already put a replicated source's full trace on every
-    // worker, so the tc-promotion gate that blocks a partitioned source does not
+    // worker, so the promotion gate that blocks a partitioned source does not
     // apply to it.
     let ext_r: ExtTables = HashMap::from([(7, replicated)]);
     assert!(
-        compute_co_partitioned(&HashMap::from([(7i64, vec![(0u32, type_code::I64)])]), &ext_r).contains(&7),
+        compute_co_partitioned(&HashMap::from([(7i64, vec![(0u32, Some(TypeCode::I64))])]), &ext_r).contains(&7),
         "replicated source skips regardless of carried type-promotion"
     );
 }
@@ -206,7 +210,7 @@ fn a_source_with_no_reindex_map_takes_the_view_shard_route() {
 fn a_scan_whose_reindex_maps_are_all_auxiliary_is_rejected() {
     let aux = gnitz_wire::OpNode::Map(gnitz_wire::MapKind::Reindex {
         keep: vec![0],
-        key: vec![(1, 0)],
+        key: vec![(1, None)],
         role: gnitz_wire::ReindexRole::Auxiliary,
     });
     let loaded = loaded_for_test(

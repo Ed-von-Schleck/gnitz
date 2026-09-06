@@ -123,8 +123,8 @@ impl TypeCode {
 
     /// Whether this type is one of the two IEEE-754 column types. Typed
     /// counterpart of the free [`is_float`].
-    pub const fn is_float(&self) -> bool {
-        is_float(*self as u8)
+    pub const fn is_float(self) -> bool {
+        is_float(self as u8)
     }
 
     /// The type of the 8-byte register image the engine materializes for a
@@ -140,34 +140,8 @@ impl TypeCode {
     /// compiled predicate, so a range walk over it must be byte-exact
     /// (un-gated). The SQL layer reads this when deciding which conjuncts it may
     /// strip; it then ships the verdict as the `exact` bit on the bound.
-    pub const fn is_wide_int(&self) -> bool {
-        is_wide_int(*self as u8)
-    }
-
-    /// Whether a **text literal** spells a value of this type, on every write
-    /// path — a SQL `INSERT` string literal and a Python `str` passed to
-    /// `ZSetBatch.append` alike. STRING is text by definition; UUID has no other
-    /// rendering. Everything else takes a number or bytes, so a string reaching
-    /// one is a type error rather than a second encoding for both paths to agree
-    /// on. Exhaustive, no `_` arm: a new variant is a compile error until someone
-    /// decides which side of that line it falls on.
-    pub const fn admits_text_literal(self) -> bool {
-        match self {
-            TypeCode::String | TypeCode::UUID => true,
-            TypeCode::U8
-            | TypeCode::I8
-            | TypeCode::U16
-            | TypeCode::I16
-            | TypeCode::U32
-            | TypeCode::I32
-            | TypeCode::F32
-            | TypeCode::U64
-            | TypeCode::I64
-            | TypeCode::F64
-            | TypeCode::U128
-            | TypeCode::Blob
-            | TypeCode::I128 => false,
-        }
+    pub const fn is_wide_int(self) -> bool {
+        is_wide_int(self as u8)
     }
 
     /// Whether this type uses the 16-byte "German string" layout (a 4-byte
@@ -176,50 +150,21 @@ impl TypeCode {
     /// and copy via the german-string paths (`compare_german_strings`, the blob
     /// heap), never via fixed-width byte ops. Allow-list so new variants are
     /// excluded until explicitly vetted.
-    pub const fn is_german_string(&self) -> bool {
-        is_german_string(*self as u8)
+    pub const fn is_german_string(self) -> bool {
+        is_german_string(self as u8)
     }
 
     /// Whether this type is a signed integer (I8/I16/I32/I64/I128). Typed
     /// counterpart of the free [`is_signed_int`]: the order-preserving encoders
     /// flip the sign bit for these so two's-complement negatives sort below
     /// non-negatives. Unsigned, float, and string types are not signed.
-    pub const fn is_signed_int(&self) -> bool {
-        is_signed_int(*self as u8)
+    pub const fn is_signed_int(self) -> bool {
+        is_signed_int(self as u8)
     }
 
-    /// Whether this type is a fixed-width **integer scalar** — equivalently,
-    /// whether an order-preserving byte encoding of it exists. That one
-    /// property answers both questions the codebase asks of a type here:
-    ///
-    /// * **May it be a PRIMARY KEY column?** PK regions are compared as raw
-    ///   bytes, which is correct only for integer scalars: String/Blob carry
-    ///   out-of-line blob heaps that cannot be bulk-copied in the PK region, and
-    ///   IEEE-754 floats break the byte-equal contract (-0.0/+0.0 compare
-    ///   unequal byte-wise but equal numerically, and NaN bit patterns have no
-    ///   single canonical form).
-    /// * **Can `payload_route_key` encode it as an order-preserving routing
-    ///   key?** Same encoder, same domain; floats, strings and blobs route via
-    ///   the content-hash path instead.
-    ///
-    /// Allow-list (not deny-list) so a new variant is ineligible for both until
-    /// explicitly vetted. Eligible: U8..U64, I8..I64, U128, UUID, I128 (the last
-    /// produced only as a cross-sign equijoin `_join_pk`, never via DDL).
-    pub const fn is_pk_eligible(&self) -> bool {
-        matches!(
-            self,
-            TypeCode::U8
-                | TypeCode::U16
-                | TypeCode::U32
-                | TypeCode::U64
-                | TypeCode::U128
-                | TypeCode::UUID
-                | TypeCode::I8
-                | TypeCode::I16
-                | TypeCode::I32
-                | TypeCode::I64
-                | TypeCode::I128,
-        )
+    /// Typed counterpart of the free [`is_pk_eligible`], which owns the rule.
+    pub const fn is_pk_eligible(self) -> bool {
+        is_pk_eligible(self as u8)
     }
 
     /// Whether a single non-nullable column of this type may serve as a reduce's
@@ -228,13 +173,13 @@ impl TypeCode {
     /// `SingleNaturalCol` predicate. Only the natural key-width unsigned types
     /// qualify.
     #[inline]
-    pub(crate) const fn is_natural_reduce_key(&self) -> bool {
+    pub(crate) const fn is_natural_reduce_key(self) -> bool {
         matches!(self, TypeCode::U64 | TypeCode::U128 | TypeCode::UUID)
     }
 
     /// Byte stride (width) of this type in a column payload. The single width
     /// table for the enum; the free [`wire_stride`] delegates here.
-    #[inline]
+    #[inline(always)]
     pub const fn wire_stride(self) -> usize {
         match self {
             TypeCode::U8 | TypeCode::I8 => 1,
@@ -267,12 +212,12 @@ impl TypeCode {
         join_key_common_type(self as u8, other as u8).map(TypeCode::from_validated_u8)
     }
 
-    /// The carried target tc to persist for this source column given its pair's
-    /// resolved common type `common`. Typed counterpart of the free
-    /// [`carried_reindex_tc`].
+    /// Inverse of [`resolve_reindex_type`]: the target to persist for a key
+    /// column of this source type whose pair resolved to `common`, or `None`
+    /// where this column already self-derives to it.
     #[inline]
-    pub fn carried_reindex_tc(self, common: TypeCode) -> u8 {
-        carried_reindex_tc(self as u8, common as u8)
+    pub fn carried_reindex_tc(self, common: TypeCode) -> Option<TypeCode> {
+        (reindex_output_type_code(self as u8) != common as u8).then_some(common)
     }
 }
 
@@ -285,7 +230,9 @@ impl TypeCode {
 /// silently mis-comparing.
 #[inline]
 pub fn cmp_typed_le(a: &[u8], b: &[u8], tc: u8) -> Ordering {
-    debug_assert_eq!(a.len(), b.len(), "cmp_typed_le: windows must be equal length");
+    // Deliberately not `debug_assert_eq!`: that takes both lengths by reference
+    // and spills them, on a per-row path.
+    debug_assert!(a.len() == b.len(), "cmp_typed_le: windows must be equal length");
     // Pin `b` to `a`'s width once. Without it every arm below dispatches on
     // `b.len()` a second time, since the debug assert above is gone in release.
     let b = &b[..a.len()];
@@ -331,15 +278,14 @@ pub fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], type_cod
     }
 }
 
-/// Whether a raw wire type code may be a PRIMARY KEY column. u8-based
-/// counterpart to [`TypeCode::is_pk_eligible`] for callers holding a raw
-/// `type_code` (mirrors the free `wire_stride`). Unknown codes are ineligible.
+/// Whether a raw wire type code may be a PRIMARY KEY column: the integer
+/// scalars of every width, and nothing else. A PK region is compared as raw
+/// bytes, which String/Blob heap offsets and IEEE-754 floats (±0.0 differ
+/// byte-wise but compare equal) do not survive. Both operands are allow-lists,
+/// so an unknown code is ineligible.
 #[inline(always)]
 pub const fn is_pk_eligible(tc: u8) -> bool {
-    match TypeCode::try_from_u8(tc) {
-        Some(t) => t.is_pk_eligible(),
-        None => false,
-    }
+    is_fixed_int(tc) || is_wide_int(tc)
 }
 
 /// Promote a base-table column's type to the leading-key type its secondary
@@ -348,8 +294,8 @@ pub const fn is_pk_eligible(tc: u8) -> bool {
 /// width; STRING/BLOB/float (and any unknown code) are index-ineligible and
 /// return `Err`. Signed columns keep a *signed* promoted code so the OPK leading
 /// key is order-preserving (`encode_pk_column` sign-flips only signed codes);
-/// `wire_stride(I64) == wire_stride(U64) == 8`, so the index record's arity and
-/// stride are identical to the old unsigned promotion. The single source of
+/// `wire_stride(I64) == wire_stride(U64) == 8`, so the sign the promotion picks
+/// never moves the index record's arity or stride. The single source of
 /// truth for index-key promotion, shared by the engine's `make_index_schema` and
 /// the SQL planner's CREATE INDEX limit pre-check so the nice SQL error and the
 /// engine backstop can never disagree on a column's promoted width.
@@ -434,7 +380,7 @@ impl core::fmt::Display for IndexKeyRule {
 }
 
 /// Which rule a candidate primary key broke. Returned by
-/// [`validate_pk_indices`] / [`validate_pk_column_types`] instead of a formatted
+/// [`validate_pk_indices`] / [`validate_pk_tuple`] instead of a formatted
 /// string, so the *rule set* stays in one place while a layer that can say more
 /// than the rule knows renders its own message. Only the SQL planner does: it
 /// names the offending column by its SQL identifier. The client and the engine
@@ -540,15 +486,10 @@ pub fn validate_pk_indices(pk_cols: &[u32], ncols: usize) -> Result<(), PkRule> 
     Ok(())
 }
 
-/// The typed half: every PK column PK-eligible and non-nullable, and the packed
-/// region within [`MAX_PK_BYTES`]. `col` yields `(type_code, nullable)` for a PK
-/// index and may assume it is in range — run [`validate_pk_indices`] first (or
-/// [`validate_pk_tuple`], which runs both). Returns the validated `pk_stride`,
-/// which every caller needs next.
-///
-/// Base-table counterpart of [`index_key_types`], which enforces the same two
-/// limits for a secondary index's record layout.
-pub fn validate_pk_column_types(pk_cols: &[u32], col: impl Fn(u32) -> (u8, bool)) -> Result<usize, PkRule> {
+/// The typed half of [`validate_pk_tuple`], which runs the structural half
+/// first, so `col` may assume its index is in range. Returns the validated
+/// `pk_stride`. Base-table counterpart of [`index_key_types`].
+fn validate_pk_column_types(pk_cols: &[u32], col: impl Fn(u32) -> (u8, bool)) -> Result<usize, PkRule> {
     let mut stride = 0usize;
     for &c in pk_cols {
         let (type_code, nullable) = col(c);
@@ -616,15 +557,10 @@ pub const fn is_valid_type_code(tc: u8) -> bool {
 /// whole, so a computed column typed any narrower would ship the low half of an
 /// `f64` or wrap a negative value into an unsigned slot.
 ///
-/// `STRING` maps to itself: the VM has a string register class beside the scalar
-/// one, and a string sink stores its 16-byte cell whole. Making the rule total over both
-/// classes is what lets expression typing read it unconditionally.
-///
-/// `BLOB` has no register of either class and normalizes to `I64` with the rest;
-/// no caller reaches this with one, because nothing produces a computed BLOB.
-/// The single rule behind both the planner's expression typing and
-/// [`agg_output_type`]'s `SUM` arm — which is gated to integers and floats
-/// before it gets here.
+/// `STRING` maps to itself — the VM has a string register class beside the
+/// scalar one — which is what makes the rule total enough for expression typing
+/// to read it unconditionally; `BLOB` has a register of neither class and falls
+/// in with the rest.
 #[inline]
 pub(crate) const fn register_image_type(tc: u8) -> u8 {
     if is_float(tc) {
@@ -639,14 +575,10 @@ pub(crate) const fn register_image_type(tc: u8) -> u8 {
 }
 
 /// True iff every value of integer type `src` is representable in `target`.
-/// Same sign class: `target` at least as wide. Unsigned into signed: strictly
-/// wider, since a signed type of equal width cannot hold the unsigned range.
-/// Non-integers (floats, strings, UUID) are in no domain — `UUID` shares U128's
-/// width but is not a number.
-///
-/// The value-domain question, kept apart from [`join_key_common_type`]: that
-/// ladder answers for a *reindex key*, whose codomain deliberately collapses
-/// UUID and the german strings onto U128.
+/// Crossing into signed needs strictly more width, an equal-width signed type
+/// not holding the unsigned range; `UUID` is in no domain, U128's width
+/// notwithstanding. The *value* domain — [`join_key_common_type`] answers the
+/// same-looking question for a reindex key, whose codomain collapses onto U128.
 pub const fn int_domain_fits(src: u8, target: u8) -> bool {
     if !is_int(src) || !is_int(target) {
         return false;
@@ -686,6 +618,7 @@ pub const fn is_signed_int(tc: u8) -> bool {
 /// (U8/I8/U16/I16/U32/I32/U64/I64, any sign). Excludes U128/UUID (16 bytes) and
 /// all float/string/blob types — these are exactly the payload columns the
 /// fixed-int fast-path row comparator can compare via a single `u64` load.
+#[inline(always)]
 pub const fn is_fixed_int(tc: u8) -> bool {
     matches!(
         tc,
@@ -1043,39 +976,22 @@ pub fn join_key_common_type(l: u8, r: u8) -> Option<u8> {
 }
 
 /// Final reindex slot type code for a key column: the carried promotion target
-/// `T` when non-zero, else the per-column default policy. The single home of the
-/// "carried-or-derive" rule, so the reindex Map's output schema and the
-/// `ReindexPacker` cannot derive divergent slot widths.
+/// when the planner disagreed with the per-column default policy, else that
+/// policy. The single home of the "carried-or-derive" rule, so the reindex Map's
+/// output schema and the `ReindexPacker` cannot derive divergent slot widths.
 #[inline]
-pub const fn resolve_reindex_type(src_tc: u8, carried_tc: u8) -> u8 {
-    if carried_tc != 0 {
-        carried_tc
-    } else {
-        reindex_output_type_code(src_tc)
-    }
-}
-
-/// Inverse of [`resolve_reindex_type`]: the per-slot carried target tc to PERSIST
-/// for a key column of source type `src_tc` whose pair resolved to common type
-/// `common_tc`. Returns `0` ("derive from source") when the column already
-/// self-derives to `common_tc` — so a slot that needs no promotion costs no
-/// param row — else the carried `common_tc`. Co-located with `resolve_reindex_type` so the encode (planner)
-/// and decode (engine) ends of the rule round-trip:
-/// `resolve_reindex_type(src, carried_reindex_tc(src, t)) == t` for any `t` a key
-/// of `src` can be promoted to.
-#[inline]
-pub(crate) const fn carried_reindex_tc(src_tc: u8, common_tc: u8) -> u8 {
-    if reindex_output_type_code(src_tc) != common_tc {
-        common_tc
-    } else {
-        0
+pub const fn resolve_reindex_type(src_tc: u8, carried: Option<TypeCode>) -> u8 {
+    match carried {
+        Some(t) => t as u8,
+        None => reindex_output_type_code(src_tc),
     }
 }
 
 /// Wire stride (byte width) for a column type code. Delegates to the single
-/// width source [`TypeCode::wire_stride`]; unknown codes return 8 (engine
-/// `compare_rows` and the trailing-slot fill depend on that default).
-#[inline]
+/// width source [`TypeCode::wire_stride`]; an unknown code returns 8, the
+/// survival width `SchemaColumn::new` — the one caller that can pass one —
+/// documents its need for.
+#[inline(always)]
 pub const fn wire_stride(tc: u8) -> usize {
     match TypeCode::try_from_u8(tc) {
         Some(t) => t.wire_stride(),
@@ -1124,7 +1040,7 @@ const _: () = {
     }
     assert!(
         wire_stride(0) == 8 && wire_stride(16) == 8,
-        "unknown-code default must be 8"
+        "an unknown code must get a non-zero survival width, not a colliding 0"
     );
 };
 

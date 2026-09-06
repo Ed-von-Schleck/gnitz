@@ -51,6 +51,8 @@ fn fk_widening_and_identity_accepted() {
     assert!(check_fk_type_compat(TypeCode::I32, TypeCode::I32).is_ok()); // identity
     assert!(check_fk_type_compat(TypeCode::U64, TypeCode::U64).is_ok()); // identity
     assert!(check_fk_type_compat(TypeCode::UUID, TypeCode::UUID).is_ok()); // non-integer exact match
+    assert!(check_fk_type_compat(TypeCode::String, TypeCode::String).is_ok()); // ditto
+    assert!(check_fk_type_compat(TypeCode::F64, TypeCode::F64).is_ok()); // ditto
 }
 
 #[test]
@@ -61,6 +63,8 @@ fn fk_narrowing_resigning_or_cross_type_rejected() {
         (TypeCode::I64, TypeCode::U64),   // signed → unsigned
         (TypeCode::U128, TypeCode::I128), // 16→16, unsigned → signed
         (TypeCode::U64, TypeCode::UUID),  // integer child → non-integer parent
+        (TypeCode::UUID, TypeCode::U128), // UUID is in no integer domain, U128's width notwithstanding
+        (TypeCode::F64, TypeCode::I64),   // float child → integer parent
     ] {
         assert!(
             matches!(check_fk_type_compat(child, parent), Err(GnitzSqlError::Bind(_))),

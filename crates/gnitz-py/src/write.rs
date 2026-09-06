@@ -618,11 +618,9 @@ pub(crate) fn extract_uuid_or_u128(val: &Bound<'_, PyAny>) -> PyResult<u128> {
 ///
 /// Per-arm `extract` is also the range check — `extract::<u8>()` raises
 /// Python's `OverflowError` for `append(c=300)` on a `U8` column, where a
-/// width-generic pack would silently truncate. Text is accepted for UUID
-/// alone, the one non-string type [`TypeCode::admits_text_literal`] names, so a
-/// `U128` column takes an integer and nothing else, as the SQL `INSERT` writer
-/// also rules; `U128` extracts as `u128` because a value above `i128::MAX` is
-/// legal there.
+/// width-generic pack would silently truncate. Text is accepted for UUID alone,
+/// so a `U128` column takes an integer and nothing else; it extracts as `u128`
+/// because a value above `i128::MAX` is legal there.
 fn push_fixed_le(buf: &mut Vec<u8>, tc: TypeCode, item: &Bound<'_, PyAny>) -> PyResult<()> {
     match tc {
         TypeCode::U8 => buf.push(item.extract::<u8>()?),

@@ -245,6 +245,10 @@ fn compute_skip_nodes(
 // Circuit queries
 // ---------------------------------------------------------------------------
 
+/// One reindex key: a `(source column, carried promotion target)` slot list, in
+/// the trace-side `ReindexPacker`'s own order.
+pub(in crate::query) type ReindexKey = Vec<gnitz_wire::ReindexSlot>;
+
 /// The scatter key of the source scanned at `scan_nid`: one sequence per
 /// `ScatterKey` reindex `Map` reachable forward through `Filter`s.
 ///
@@ -253,7 +257,7 @@ fn compute_skip_nodes(
 /// shape. The second return says the walk found only `Auxiliary` ones — a
 /// planner call site that forgot its role, which `ViewMeta::derive` turns
 /// into a failed compile rather than silently-unscattered rows.
-pub(super) fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec<Vec<(u32, u8)>>, bool) {
+pub(super) fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec<ReindexKey>, bool) {
     let mut queue = VecDeque::from([scan_nid]);
     // `visited` bounds the walk to O(nodes): without it a Filter diamond (two
     // edge paths reaching the same Filter) would re-push and re-expand nodes.
@@ -262,7 +266,7 @@ pub(super) fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec
     // null/not-null sibling Maps of a nullable LEFT-join key) is added once.
     // Duplicate columns WITHIN a sequence are preserved, so the result mirrors the
     // trace-side `ReindexPacker` slot-for-slot.
-    let mut seqs: Vec<Vec<(u32, u8)>> = Vec::new();
+    let mut seqs: Vec<ReindexKey> = Vec::new();
     let mut saw_auxiliary = false;
     while let Some(cur) = queue.pop_front() {
         if !visited.insert(cur) {

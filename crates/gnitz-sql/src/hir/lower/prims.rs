@@ -7,7 +7,7 @@
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_bound_expr_to_program;
 use crate::ir::{BinOp, BoundExpr};
-use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, ReindexRole, Schema};
+use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, ReindexRole, ReindexSlot, Schema};
 
 /// Multi-column NULL predicate for a Filter over a composite equijoin key,
 /// reusing the WHERE-clause bound-expr → program path so each column index
@@ -67,14 +67,14 @@ pub(crate) fn null_gate(
     Ok((gated, nullable))
 }
 /// A reindex key over `cols` with every slot self-derived (`MapKind::Reindex`'s
-/// `0`) — the shape of every re-key that moves rows without widening them.
-pub(crate) fn self_derived_key(cols: &[usize]) -> Vec<(u32, u8)> {
-    cols.iter().map(|&c| (c as u32, 0)).collect()
+/// `None`) — the shape of every re-key that moves rows without widening them.
+pub(crate) fn self_derived_key(cols: &[usize]) -> Vec<ReindexSlot> {
+    cols.iter().map(|&c| (c as u32, None)).collect()
 }
 
 /// [`self_derived_key`] over a schema's own PK column list.
-pub(crate) fn self_derived_pk_key(schema: &Schema) -> Vec<(u32, u8)> {
-    schema.pk_cols.iter().map(|&c| (c, 0)).collect()
+pub(crate) fn self_derived_pk_key(schema: &Schema) -> Vec<ReindexSlot> {
+    schema.pk_cols.iter().map(|&c| (c, None)).collect()
 }
 
 /// Re-key `node` onto its own source PK, self-deriving each key slot's type and

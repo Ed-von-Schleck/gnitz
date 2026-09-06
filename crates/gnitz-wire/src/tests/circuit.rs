@@ -42,14 +42,14 @@ fn sample(op: Opcode) -> OpNode {
             out_cols: vec![(crate::type_code::I64, false), (crate::type_code::STRING, true)],
         })),
         Opcode::MapHashRow => OpNode::Map(MapKind::HashRow {
-            cols: vec![(1, 0), (2, crate::type_code::I32)],
+            cols: vec![(1, None), (2, Some(TypeCode::I32))],
             branch_id: 0,
         }),
         Opcode::WorkerFilter => OpNode::WorkerFilter,
         Opcode::PositivePart => OpNode::PositivePart,
         Opcode::MapReindex => OpNode::Map(MapKind::Reindex {
             keep: vec![0],
-            key: vec![(2, 0), (5, crate::type_code::I64)],
+            key: vec![(2, None), (5, Some(TypeCode::I64))],
             role: ReindexRole::ScatterKey,
         }),
     }
@@ -76,7 +76,7 @@ fn every_op_node_variant_roundtrips() {
         OpNode::Filter(None),
         OpNode::Map(MapKind::Projection(vec![])),
         OpNode::Map(MapKind::Compute(ComputeMap { program: vec![9, 9], out_cols: vec![] })),
-        OpNode::Map(MapKind::HashRow { cols: vec![(3, 0)], branch_id: 1 }),
+        OpNode::Map(MapKind::HashRow { cols: vec![(3, None)], branch_id: 1 }),
         OpNode::Reduce {
             group_cols: vec![],
             agg: vec![agg(AggFunc::Count, 0)],
@@ -87,7 +87,7 @@ fn every_op_node_variant_roundtrips() {
     for &role in ReindexRole::ALL {
         nodes.push(OpNode::Map(MapKind::Reindex {
             keep: vec![0],
-            key: vec![(2, 0), (5, crate::type_code::I64)],
+            key: vec![(2, None), (5, Some(TypeCode::I64))],
             role,
         }));
     }
@@ -217,6 +217,10 @@ fn decode_rejects_an_out_of_domain_promotion_target() {
     )
     .unwrap_err();
     assert!(err.contains("fixed-width integer"), "got: {err}");
+
+    // An undecodable code is the same refusal, not a decode to "no target".
+    let err = decode_op_node(Opcode::MapReindex.as_wire(), None, Some(&reindex(200))).unwrap_err();
+    assert!(err.contains("not PK-eligible"), "got: {err}");
 }
 
 /// A NULL_EXTEND type code becomes a schema column verbatim. An undecodable

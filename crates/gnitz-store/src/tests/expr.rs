@@ -479,7 +479,7 @@ fn map_with_pack_pk_source_promotes_payload_to_pk() {
     let batch = make_batch(&schema, &[(1, 1, 200), (2, 1, 100), (3, 1, 300)]);
 
     // Projection plan: output keeps the same single payload column.
-    let packer = ReindexPacker::new(&schema, &[(1, 0)]).unwrap();
+    let packer = ReindexPacker::new(&schema, &[(1, None)]).unwrap();
     let plan = MapPlan::from_map(
         LogicalProgram::copy_cols(&[1]),
         &schema,
@@ -611,7 +611,7 @@ fn map_ranges_bench() {
         rx_batch.extend_col(1, &(!i).to_le_bytes());
         rx_batch.count += 1;
     }
-    let rx_packer = ReindexPacker::new(&rx_in, &[(1, 0)]).unwrap();
+    let rx_packer = ReindexPacker::new(&rx_in, &[(1, None)]).unwrap();
     let rx_out = rx_packer.output_schema(&rx_in, &[0, 1, 2]).unwrap();
     let rx_plan = MapPlan::from_map(
         LogicalProgram::copy_cols(&[0, 1, 2]),

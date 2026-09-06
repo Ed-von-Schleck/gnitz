@@ -3,10 +3,11 @@ use std::collections::HashMap;
 use gnitz_expr::LogicalProgram;
 
 use crate::error::ClientError;
+use crate::ReindexSlot;
 
 pub use gnitz_wire::{
     agg_output_type, AggDescriptor, AggFunc, ComputeMap, JoinKind, MapKind, OpNode, RangeRel, ReduceOutKey,
-    ReindexRole, TableId,
+    ReindexRole, TableId, TypeCode,
 };
 
 pub type NodeId = u64;
@@ -153,7 +154,7 @@ impl CircuitBuilder {
     ///
     /// Panics on an empty `key`: a map that re-keys nothing is a
     /// [`Self::map_expr`], and the two carry different opcodes.
-    pub fn map_reindex(&mut self, input: NodeId, key: &[(u32, u8)], keep: &[u32], role: ReindexRole) -> NodeId {
+    pub fn map_reindex(&mut self, input: NodeId, key: &[ReindexSlot], keep: &[u32], role: ReindexRole) -> NodeId {
         assert!(!key.is_empty(), "a reindex map must name its key columns");
         self.alloc_wired(
             OpNode::Map(MapKind::Reindex {
@@ -168,13 +169,13 @@ impl CircuitBuilder {
     /// Full-row-identity reindex: keep the listed columns as payload (in order)
     /// and set the synthetic PK to a hash of those payload bytes, so set
     /// membership is decided by the projected row content, not by the source PK
-    /// (EXCEPT/INTERSECT/DISTINCT). Each column's `u8` promotes it to that
-    /// ≤8-byte integer type, or `0` keeps the source type.
+    /// (EXCEPT/INTERSECT/DISTINCT). Each column's target promotes it to that
+    /// ≤8-byte integer type; `None` keeps the source type.
     ///
     /// `branch_id` is mixed into the hash; pass distinct ids (0 and 1) to the two
     /// sides of a `UNION ALL` so identical rows do not collide to one PK, and 0
     /// to both sides of deduplicating set-ops.
-    pub fn map_hash_row(&mut self, input: NodeId, cols: &[(u32, u8)], branch_id: u8) -> NodeId {
+    pub fn map_hash_row(&mut self, input: NodeId, cols: &[ReindexSlot], branch_id: u8) -> NodeId {
         self.alloc_wired(
             OpNode::Map(MapKind::HashRow { cols: cols.to_vec(), branch_id }),
             &[input],

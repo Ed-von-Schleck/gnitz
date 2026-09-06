@@ -4,6 +4,7 @@
 //! node's per-opcode parameters as one blob.
 
 use crate::codec::{Reader, Writer};
+use crate::TypeCode;
 
 // ---------------------------------------------------------------------------
 // Circuit opcodes
@@ -350,6 +351,12 @@ wire_enum! {
     }
 }
 
+/// One slot of a reindex key: a source column, and the promotion target the
+/// planner carried for it — `None` where the engine derives it
+/// ([`resolve_reindex_type`]). The shape every producer and consumer of a
+/// reindex or hash-row key list passes around.
+pub type ReindexSlot = (u32, Option<TypeCode>);
+
 /// MAP sub-variant discriminant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MapKind {
@@ -359,16 +366,16 @@ pub enum MapKind {
     /// program against the declared slots.
     Compute(ComputeMap),
     /// Re-key onto a synthetic PK for equijoin/group pre-indexing: `key` is the
-    /// source columns in key order, each with its slot's promoted type code, and
+    /// source columns in key order, each with its slot's promoted type, and
     /// `keep` the columns surviving as payload behind them, in output order.
     ///
-    /// A `0` target means the engine derives the slot type
+    /// `None` means the engine derives the slot type
     /// (`reindex_output_type_code`), so only a *disagreement* with that travels —
     /// otherwise the planner would be a second producer of a derived fact. `key`
     /// is never empty: a map that re-keys nothing is a [`MapKind::Compute`].
     Reindex {
         keep: Vec<u32>,
-        key: Vec<(u32, u8)>,
+        key: Vec<ReindexSlot>,
         role: ReindexRole,
     },
     /// Full-row-identity reindex. Like `Projection` (keep the listed columns as
@@ -376,14 +383,14 @@ pub enum MapKind {
     /// payload bytes. Used by EXCEPT/INTERSECT/DISTINCT so set membership is
     /// decided by the projected row content, not by the source PK.
     ///
-    /// Each column carries the promoted payload type code the widening projection
-    /// coerces it into (`0` = keep the source type; always a ≤8-byte integer), so
-    /// a cross-width pair like `I32 UNION I64` hashes one physical layout.
+    /// Each column carries the promoted payload type the widening projection
+    /// coerces it into (`None` = keep the source type; always a ≤8-byte integer),
+    /// so a cross-width pair like `I32 UNION I64` hashes one physical layout.
     ///
     /// `branch_id` is mixed into the hash so identical payloads on the two sides
     /// of a `UNION ALL` get distinct PKs and accumulate weight +2 rather than
     /// collapsing: 0 and 1 there, 0 on both sides of a deduplicating set-op.
-    HashRow { cols: Vec<(u32, u8)>, branch_id: u8 },
+    HashRow { cols: Vec<ReindexSlot>, branch_id: u8 },
 }
 
 /// A secondary-index range bound for a `ScanDelta`'s backfill scan: the index's
@@ -518,31 +525,36 @@ fn read_cols(r: &mut Reader) -> Result<Vec<u32>, String> {
     Ok(cols)
 }
 
-/// A counted `(source column, promoted target type code)` list. `valid` is the
-/// master's only gate on a non-zero target: `ViewMeta::for_view` never compiles,
-/// and feeds these straight into `ReindexPacker::new(..).expect(..)`.
+/// A counted `(source column, promoted target type)` list; `0` on the wire is
+/// "no target", and any other code failing `valid` refuses the node rather than
+/// decoding to one, which would pack this slot narrower than its partner. The
+/// master's only gate: `ViewMeta::for_view` feeds these straight into
+/// `ReindexPacker::new(..).expect(..)`.
 fn read_cols_with_tcs(
     r: &mut Reader,
     valid: fn(u8) -> bool,
     err: impl Fn(u8) -> String,
-) -> Result<Vec<(u32, u8)>, String> {
+) -> Result<Vec<ReindexSlot>, String> {
     let n = r.u16()? as usize;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let col = r.u32()?;
-        let tc = r.u8()?;
-        if tc != 0 && !valid(tc) {
-            return Err(err(tc));
-        }
-        out.push((col, tc));
+        let target = match r.u8()? {
+            0 => None,
+            tc => match TypeCode::try_from_u8(tc) {
+                Some(t) if valid(tc) => Some(t),
+                _ => return Err(err(tc)),
+            },
+        };
+        out.push((col, target));
     }
     Ok(out)
 }
 
-fn write_cols_with_tcs(w: &mut Writer, slots: &[(u32, u8)]) {
+fn write_cols_with_tcs(w: &mut Writer, slots: &[ReindexSlot]) {
     w.u16(slots.len() as u16);
     for &(col, tc) in slots {
-        w.u32(col).u8(tc);
+        w.u32(col).u8(tc.map_or(0, |t| t as u8));
     }
 }
 

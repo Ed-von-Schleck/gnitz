@@ -5,7 +5,7 @@ use crate::test_support::{
     make_batch, make_batch_bytes, make_batch_i64pk, make_schema_pk_u64_payload_string, make_schema_u128_i64,
     make_schema_u64_i64, make_wide_batch, opk_pk, pk_payload_schema, wide_pk_3xu64_schema,
 };
-use gnitz_wire::{worker_for_key, worker_for_pk_bytes};
+use gnitz_wire::{worker_for_key, worker_for_pk_bytes, TypeCode};
 use std::cmp::Ordering;
 
 /// Scatter pre-consolidated batches across workers. Every source must satisfy
@@ -719,7 +719,7 @@ fn test_compound_join_promote_scatter_copartitions_both_functions() {
     ];
     let cb = make_join_key_batch(&schema, rows);
 
-    let key: Vec<(u32, u8)> = cols.iter().map(|&c| (c, 0)).collect();
+    let key: Vec<gnitz_wire::ReindexSlot> = cols.iter().map(|&c| (c, None)).collect();
     let packer = ReindexPacker::new(&schema, &key).unwrap();
     let expected_worker = |sb: &Batch, r: usize| -> usize {
         let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
@@ -747,7 +747,7 @@ fn test_compound_join_promote_scatter_copartitions_both_functions() {
     };
 
     // (a) Non-consolidated path.
-    let key: Vec<(u32, u8)> = cols.iter().map(|&c| (c, 0)).collect();
+    let key: Vec<gnitz_wire::ReindexSlot> = cols.iter().map(|&c| (c, None)).collect();
     let repart = op_repartition_batches(&[Some(&cb)], ScatterSpec::JoinKey(&key), &schema, num_workers);
     check(&repart, "op_repartition_batches");
 
@@ -774,7 +774,7 @@ fn test_compound_join_promote_scatter_copartitions_both_functions() {
     );
 }
 
-/// A SINGLE promoted join key (arity 1, carried `T != 0`) must also route
+/// A SINGLE promoted join key (arity 1, carrying a target `T`) must also route
 /// through the `ReindexPacker` — the packer fires on promotion, not just on a
 /// compound key. Covers both a payload key (`Narrow` I32 → I64, including a
 /// negative value so sign-extension is exercised) and a key that is the source
@@ -804,7 +804,7 @@ fn test_single_key_promote_scatter_copartitions() {
     }
     b.certify_layout(Layout::Consolidated, &schema);
     let cb = b;
-    let key = [(1u32, type_code::I64)];
+    let key = [(1u32, Some(TypeCode::I64))];
 
     let packer = ReindexPacker::new(&schema, &key).unwrap();
     let expected_worker = |sb: &Batch, r: usize| -> usize {
@@ -859,7 +859,7 @@ fn test_single_key_promote_scatter_copartitions() {
     }
     pb.certify_layout(Layout::Consolidated, &pk_schema);
     let pk_cb = pb;
-    let pk_key = [(0u32, type_code::I64)];
+    let pk_key = [(0u32, Some(TypeCode::I64))];
     let pk_packer = ReindexPacker::new(&pk_schema, &pk_key).unwrap();
     let pk_repart = op_repartition_batches(&[Some(&pk_cb)], ScatterSpec::JoinKey(&pk_key), &pk_schema, num_workers);
     assert_eq!(total_rows(&pk_repart), pk_rows.len(), "PK-key: no dropped rows");
@@ -896,13 +896,13 @@ fn scatter_route_bench() {
     let sources = [Some(&cb)];
 
     // Warm up (and pin the invariant: the route must not drop rows).
-    let warm = op_relay_scatter_consolidated(&sources, ScatterSpec::JoinKey(&[(1, 0)]), &schema, 4);
+    let warm = op_relay_scatter_consolidated(&sources, ScatterSpec::JoinKey(&[(1, None)]), &schema, 4);
     assert_eq!(total_rows(&warm), N, "scatter dropped rows");
 
     let t = Instant::now();
     let mut acc = 0usize;
     for _ in 0..ITERS {
-        let out = op_relay_scatter_consolidated(&sources, ScatterSpec::JoinKey(&[(1, 0)]), &schema, 4);
+        let out = op_relay_scatter_consolidated(&sources, ScatterSpec::JoinKey(&[(1, None)]), &schema, 4);
         acc += black_box(total_rows(&out));
     }
     let secs = t.elapsed().as_secs_f64();

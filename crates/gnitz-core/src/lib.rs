@@ -35,7 +35,7 @@ pub use connection::{
 };
 pub use error::{ClientError, ConflictClass};
 pub use gnitz_wire::{
-    validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, RelClass, TableProps,
+    validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, ReindexSlot, RelClass, TableProps,
     FIRST_USER_TABLE_ID, TABLE_TAB,
 };
 pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult, Shape};

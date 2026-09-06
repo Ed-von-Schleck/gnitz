@@ -131,39 +131,39 @@ pub struct SchemaColumn {
 
 impl SchemaColumn {
     /// The unused-slot filler for the fixed `[SchemaColumn; MAX_COLUMNS]` arrays
-    /// every schema and schema builder carries. Distinct from [`Self::new`] so
-    /// that padding — the one legitimate use of the undecodable type code `0` —
-    /// cannot be confused with a real column, and `new` can hold every column it
-    /// builds to a decodable code.
-    pub const EMPTY: SchemaColumn = Self::raw(0, 0);
+    /// every schema and schema builder carries. Spelled out rather than built
+    /// through [`Self::new`], whose assert rejects the undecodable type code `0`
+    /// that marks a slot as padding.
+    pub const EMPTY: SchemaColumn = SchemaColumn {
+        type_code: 0,
+        size: 0,
+        nullable: 0,
+        is_signed: 0,
+    };
 
     /// A real column of type `type_code`, which must decode (see
     /// [`gnitz_wire::is_valid_type_code`] for why an unknown one is not inert).
     /// Client-supplied codes are screened at their decode boundary; the assert is
     /// the tripwire for a path that forgets to. Debug-only — the release engine
     /// must still *survive* a corrupt code, which is what the expression
-    /// validator's `check_col` and the catalog's `check_col_defs` are for.
+    /// validator's `check_col` and the catalog's `check_col_defs` are for, and
+    /// what `wire_stride`'s 8-byte fallback gives such a code here.
     pub const fn new(type_code: u8, nullable: u8) -> Self {
         debug_assert!(gnitz_wire::is_valid_type_code(type_code), "invalid column type code");
         // A flag, not a count: the two parameters are bare integers, so a caller
         // passing a column ordinal here otherwise builds a silently nullable column.
         debug_assert!(nullable <= 1, "column nullable flag must be 0 or 1");
-        Self::raw(type_code, nullable)
-    }
-
-    const fn raw(type_code: u8, nullable: u8) -> Self {
-        let is_signed = is_signed_int(type_code) as u8;
         SchemaColumn {
             type_code,
             size: gnitz_wire::wire_stride(type_code) as u8,
             nullable,
-            is_signed,
+            is_signed: is_signed_int(type_code) as u8,
         }
     }
 
     /// On-disk byte width of one cell of this column. Derived from `type_code`
     /// via `SchemaColumn::new` and never written independently.
-    #[inline]
+    #[inline(always)]
     pub const fn size(&self) -> u8 {
         self.size
     }
@@ -172,7 +172,7 @@ impl SchemaColumn {
     /// `type_code` in `new()` (like `size`); read by the fixed-int fast-path
     /// comparator to pick the order-preserving sign-flip mask without a
     /// per-column type-code branch.
-    #[inline]
+    #[inline(always)]
     pub(crate) const fn is_signed(&self) -> bool {
         self.is_signed != 0
     }

@@ -26,11 +26,11 @@ pub(crate) enum RelayRoute {
     /// (`n_eq >= 1`) routes by the equality prefix alone, dropping the trailing
     /// range slot, so equal eq-values co-partition both sides and the range
     /// probe stays partition-local.
-    JoinKey(Rc<[(u32, u8)]>),
+    JoinKey(Rc<[gnitz_wire::ReindexSlot]>),
 }
 
-/// source table id → join/group reindex `(column, carried promotion tc)` pairs.
-type JoinShardMap = HashMap<i64, Vec<(u32, u8)>>;
+/// source table id → the join/group reindex key its scans feed.
+type JoinShardMap = HashMap<i64, load::ReindexKey>;
 
 /// What one source gets: how the master routes its delta, and whether the worker
 /// must send it through the scatter at all.
@@ -94,7 +94,7 @@ impl ViewMeta {
         // source → the distinct key sequences its scans feed. Deduped across scan
         // nodes as well as within one, so two scans on a source carrying the same
         // key resolve to one sequence rather than tripping the pack-key gate below.
-        let mut seqs: HashMap<i64, Vec<Vec<(u32, u8)>>> = HashMap::new();
+        let mut seqs: HashMap<i64, Vec<load::ReindexKey>> = HashMap::new();
         for (nid, op) in loaded.ops() {
             let gnitz_wire::OpNode::ScanDelta { source, .. } = op else {
                 continue;
@@ -205,7 +205,7 @@ fn group_key_route(shard_cols: Option<Rc<[u32]>>) -> RelayRoute {
 
 /// The route a source carrying a reindex key takes. `pairs` is that key,
 /// `(column, promotion target)` per slot, in trace-side reindex order.
-fn join_route(pairs: Vec<(u32, u8)>, relay: load::JoinRelay) -> RelayRoute {
+fn join_route(pairs: load::ReindexKey, relay: load::JoinRelay) -> RelayRoute {
     let route_len = match relay {
         load::JoinRelay::Broadcast => return RelayRoute::Broadcast,
         load::JoinRelay::WholeKey => pairs.len(),
@@ -256,11 +256,11 @@ fn compute_co_partitioned(join_shard_map: &JoinShardMap, host: &dyn SchemaSource
             continue;
         }
 
-        // A non-zero carried tc means the slot is wider than the source column, so
+        // A carried target means the slot is wider than the source column, so
         // native PK partitions do not align with the T-width trace key. Partner of
-        // `ScatterKey::new`'s own `tc == 0` gate: relaxing one alone would let a
+        // `ScatterKey::new`'s own no-target gate: relaxing one alone would let a
         // promoted side skip while its partner scatters at the wider `T`.
-        if cols.iter().any(|&(_, tc)| tc != 0) {
+        if cols.iter().any(|(_, t)| t.is_some()) {
             continue;
         }
         let col_indices: Vec<u32> = cols.iter().map(|&(c, _)| c).collect();

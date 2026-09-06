@@ -429,7 +429,7 @@ fn reindex_key_and_kept_column_lists_are_bounds_checked() {
     let reindex = |keep: Vec<u32>, key_cols: Vec<u32>| {
         OpNode::Map(MapKind::Reindex {
             keep,
-            key: key_cols.into_iter().map(|c| (c, 0)).collect(),
+            key: key_cols.into_iter().map(|c| (c, None)).collect(),
             role: gnitz_wire::ReindexRole::ScatterKey,
         })
     };
@@ -470,24 +470,24 @@ fn reindex_key_and_kept_column_lists_are_bounds_checked() {
 #[test]
 fn a_hash_row_map_promotes_within_the_copy_kernel_domain_or_is_rejected() {
     use gnitz_wire::{MapKind, OpNode};
-    let hash_row = |cols: Vec<u32>, tcs: Vec<u8>| {
+    let hash_row = |cols: Vec<u32>, tcs: Vec<Option<gnitz_wire::TypeCode>>| {
         OpNode::Map(MapKind::HashRow {
             cols: cols.into_iter().zip(tcs).collect(),
             branch_id: 0,
         })
     };
     let fixture = MidCircuit::new(u64_pk_schema(SchemaColumn::new(type_code::U32, 0)));
-    assert!(fixture.compiles(hash_row(vec![1], vec![0])), "no promotion");
+    assert!(fixture.compiles(hash_row(vec![1], vec![None])), "no promotion");
     assert!(
-        fixture.compiles(hash_row(vec![1], vec![type_code::I64])),
+        fixture.compiles(hash_row(vec![1], vec![Some(gnitz_wire::TypeCode::I64)])),
         "U32 → I64 is the ≤8-byte widen the copy kernel supports"
     );
     assert_eq!(
-        fixture.rejection(hash_row(vec![9], vec![0])),
+        fixture.rejection(hash_row(vec![9], vec![None])),
         "hash-row map: columns out of range"
     );
     assert_eq!(
-        fixture.rejection(hash_row(vec![1], vec![type_code::STRING])),
+        fixture.rejection(hash_row(vec![1], vec![Some(gnitz_wire::TypeCode::String)])),
         "hash-row map: invalid promotion target",
         "a German string is not a fixed-int widen"
     );

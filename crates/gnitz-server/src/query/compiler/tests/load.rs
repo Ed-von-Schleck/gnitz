@@ -1,5 +1,4 @@
 use super::*;
-use gnitz_store::schema::type_code;
 use gnitz_wire::{MapKind, OpNode, ReindexRole};
 
 #[test]
@@ -302,7 +301,7 @@ fn the_scatter_key_is_collected_once_however_the_reindex_map_fans_out() {
             (3, 4, SLOT_TRACE),
         ],
     );
-    assert_eq!(load::scatter_key_of_scan(&loaded, 0).0, vec![vec![(2, 0)]]);
+    assert_eq!(load::scatter_key_of_scan(&loaded, 0).0, vec![vec![(2, None)]]);
 }
 
 /// A source joined on two different keys (`t ⋈ t1 ON t.a = t1.x ⋈ t2 ON t.b =
@@ -323,7 +322,7 @@ fn a_scan_fanning_into_two_reindex_maps_yields_two_sequences() {
     );
     assert_eq!(
         load::scatter_key_of_scan(&loaded, 0).0,
-        vec![vec![(2, 0)], vec![(5, 0)]],
+        vec![vec![(2, None)], vec![(5, None)]],
         "two distinct keys stay two sequences"
     );
 }
@@ -343,7 +342,7 @@ fn a_key_sequence_survives_verbatim_but_identical_siblings_collapse() {
                 1,
                 OpNode::Map(MapKind::Reindex {
                     keep: vec![0],
-                    key: vec![(3, 0), (3, type_code::I64)],
+                    key: vec![(3, None), (3, Some(gnitz_wire::TypeCode::I64))],
                     role: ReindexRole::ScatterKey,
                 }),
             ),
@@ -352,7 +351,7 @@ fn a_key_sequence_survives_verbatim_but_identical_siblings_collapse() {
     );
     assert_eq!(
         load::scatter_key_of_scan(&overlapping, 0).0,
-        vec![vec![(3, 0), (3, type_code::I64)]],
+        vec![vec![(3, None), (3, Some(gnitz_wire::TypeCode::I64))]],
         "duplicate slots and their promotion targets survive"
     );
 
@@ -368,7 +367,7 @@ fn a_key_sequence_survives_verbatim_but_identical_siblings_collapse() {
     );
     assert_eq!(
         load::scatter_key_of_scan(&siblings, 0).0,
-        vec![vec![(2, 0)]],
+        vec![vec![(2, None)]],
         "identical sibling sequences collapse to one"
     );
 }
@@ -383,7 +382,7 @@ fn an_auxiliary_reindex_never_contributes_the_scatter_key() {
     let aux_rekey = || {
         OpNode::Map(MapKind::Reindex {
             keep: vec![0],
-            key: vec![(0, 0)],
+            key: vec![(0, None)],
             role: ReindexRole::Auxiliary,
         })
     };
@@ -414,7 +413,7 @@ fn an_auxiliary_reindex_never_contributes_the_scatter_key() {
     };
     assert_eq!(
         load::scatter_key_of_scan(&circuit(scatter_reindex(&[1, 2]), aux_rekey()), 0),
-        (vec![vec![(1, 0), (2, 0)]], false),
+        (vec![vec![(1, None), (2, None)]], false),
         "only the trace/probe-feeding reindex defines the scatter key"
     );
     assert_eq!(

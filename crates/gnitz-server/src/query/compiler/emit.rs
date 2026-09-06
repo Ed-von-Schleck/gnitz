@@ -17,19 +17,20 @@ use gnitz_store::schema::{DerivedSchema, SchemaColumn};
 
 /// Output schema of a HashRow (set-op full-row identity) Map: a synthetic U128
 /// PK at slot 0, then the projected payload columns, each promoted to its
-/// non-zero target but keeping THIS SIDE's nullability. Per-side, not the
+/// carried target but keeping THIS SIDE's nullability. Per-side, not the
 /// operator-merged view nullability: an INTERSECT/EXCEPT leaf is `distinct`-ed
 /// before the tuple-tightening combine, so its row comparator must classify by
 /// what this side can actually emit.
-fn hashrow_output_schema(in_schema: &SchemaDescriptor, cols: &[(u32, u8)]) -> Option<SchemaDescriptor> {
+///
+/// An absent target keeps the SOURCE type — not
+/// [`gnitz_wire::resolve_reindex_type`], which would derive a *key* type and
+/// land a payload column on U128.
+fn hashrow_output_schema(in_schema: &SchemaDescriptor, cols: &[gnitz_wire::ReindexSlot]) -> Option<SchemaDescriptor> {
     let mut b = DerivedSchema::new();
     b.push_pk(SchemaColumn::new(gnitz_store::schema::type_code::U128, 0))?;
     for &(c, tgt) in cols {
         let src = in_schema.columns[c as usize];
-        b.push(SchemaColumn::new(
-            if tgt != 0 { tgt } else { src.type_code },
-            src.nullable,
-        ))?;
+        b.push(SchemaColumn::new(tgt.map_or(src.type_code, |t| t as u8), src.nullable))?;
     }
     Some(b.finish())
 }
@@ -104,27 +105,31 @@ pub(crate) fn oob_cols(cols: impl IntoIterator<Item = u32>, schema: &SchemaDescr
     cols.into_iter().any(|c| c as usize >= schema.num_columns())
 }
 
-/// True iff any slot's carried target (`0` = none) is invalid for its source
-/// column under `valid`, the domain predicate of the promotion's destination — a
+/// True iff any slot's carried target is invalid for its source column under
+/// `valid`, the domain predicate of the promotion's destination — a
 /// corrupt/forged catalog, which callers abort the compile on rather than
 /// panic/truncate in the copy kernels. Shared body of
 /// [`key_promotion_invalid`] and [`payload_promotion_invalid`].
-fn promotion_invalid(slots: &[(u32, u8)], schema: &SchemaDescriptor, valid: impl Fn(u8, u8) -> bool) -> bool {
+fn promotion_invalid(
+    slots: &[gnitz_wire::ReindexSlot],
+    schema: &SchemaDescriptor,
+    valid: impl Fn(u8, u8) -> bool,
+) -> bool {
     slots.iter().any(|&(c, t)| {
-        t != 0
-            && !schema
+        t.is_some_and(|t| {
+            !schema
                 .columns
                 .get(c as usize)
-                .is_some_and(|col| valid(col.type_code, t))
+                .is_some_and(|col| valid(col.type_code, t as u8))
+        })
     })
 }
 
-/// The reindex **key** domain: `t` must be the promotion the planner derives for
-/// a key of this source type. Read back off the planner's own rule rather than
-/// re-deriving the sign/width ladder — `t` is value-preserving for `src` iff
-/// `join_key_common_type(src, t) == Some(t)` — which also screens PK-ineligible
-/// targets for free, since that function only yields PK-eligible types.
-fn key_promotion_invalid(slots: &[(u32, u8)], schema: &SchemaDescriptor) -> bool {
+/// The reindex **key** domain: `join_key_common_type`'s codomain, whose collapse
+/// to U128 is what a `_join_pk` slot really does to a UUID pair — not the value
+/// domain [`gnitz_wire::int_domain_fits`] answers for. PK-ineligible targets are
+/// screened for free, that function yielding only PK-eligible types.
+fn key_promotion_invalid(slots: &[gnitz_wire::ReindexSlot], schema: &SchemaDescriptor) -> bool {
     promotion_invalid(slots, schema, |src, t| {
         gnitz_wire::join_key_common_type(src, t) == Some(t)
     })
@@ -134,7 +139,7 @@ fn key_promotion_invalid(slots: &[(u32, u8)], schema: &SchemaDescriptor) -> bool
 /// promotion the copy kernel supports. Identical to the rule `check_copy_types`
 /// holds a column sink's destination to — the HashRow payload widen is that same
 /// kernel — so it is narrower than [`key_promotion_invalid`], not a mode of it.
-pub(super) fn payload_promotion_invalid(slots: &[(u32, u8)], schema: &SchemaDescriptor) -> bool {
+pub(super) fn payload_promotion_invalid(slots: &[gnitz_wire::ReindexSlot], schema: &SchemaDescriptor) -> bool {
     promotion_invalid(slots, schema, gnitz_wire::is_widening_promotion)
 }
 

@@ -507,8 +507,8 @@ pub(crate) enum SetOpKind {
 /// the promoted output column (common type + per-operator nullability), and each
 /// side's content-hash widening target.
 ///
-/// A target is `0` when that side already carries the promoted type (hash it as
-/// it lies), else the promoted type code — so both sides hash one physical
+/// A target is `None` when that side already carries the promoted type (hash it
+/// as it lies), else the promoted type — so both sides hash one physical
 /// representation. Stamped here, where the pair's source types and the promoted
 /// type are all in hand, rather than re-derived at lowering by walking both
 /// sides' whole column lists back out of the tree.
@@ -517,8 +517,8 @@ pub(crate) struct SetOpCol {
     pub left: ColId,
     pub right: ColId,
     pub out: HirCol,
-    pub left_target: u8,
-    pub right_target: u8,
+    pub left_target: Option<TypeCode>,
+    pub right_target: Option<TypeCode>,
 }
 
 /// Which side(s) of a join survive unmatched — the join kind carried in
@@ -824,7 +824,7 @@ impl RelExpr {
             let mut def = l.def.clone();
             def.type_code = tc;
             def.is_nullable = is_nullable;
-            let target = |src: TypeCode| if src == tc { 0 } else { tc as u8 };
+            let target = |src: TypeCode| (src != tc).then_some(tc);
             out.push(SetOpCol {
                 left: l.id,
                 right: r.id,

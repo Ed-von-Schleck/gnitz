@@ -933,18 +933,6 @@ const FOLD_BYTES: usize = FOLD_COL.size() as usize;
 // big-endian image, which are those columns' OPK images only at these widths.
 const _: () = assert!(BITMAP_BYTES == 1 && FOLD_BYTES == 16);
 
-/// The PK slot type one group column packs into: a `≤8`-byte integer (and the
-/// signed 128-bit one) keeps its own width and sign; everything else —
-/// `U128`/`UUID` verbatim, `STRING`/`BLOB` by content hash — takes a 16-byte
-/// `U128`. A float has no slot at all; see [`ReindexPacker::new_group_key`].
-const fn group_key_slot_type(tc: u8) -> u8 {
-    if gnitz_wire::is_fixed_int(tc) || tc == type_code::I128 {
-        tc
-    } else {
-        type_code::U128
-    }
-}
-
 /// How one source column's bytes become key bytes. The group key's bitmap and
 /// fold are facts of the whole [`ReindexPacker`], not columns, and live there.
 #[derive(Clone, Copy)]
@@ -1042,7 +1030,7 @@ impl ReindexPacker {
     /// A float has no key image: OPK bytes are compared raw, and `+0.0`/`-0.0`
     /// differ byte-wise while comparing equal. The SQL planner refuses one
     /// already; this is the boundary for a raw `gnitz-core` client.
-    pub fn new(schema: &SchemaDescriptor, key: &[(u32, u8)]) -> Option<Self> {
+    pub fn new(schema: &SchemaDescriptor, key: &[gnitz_wire::ReindexSlot]) -> Option<Self> {
         if key.len() > MAX_PK_COLUMNS {
             return None;
         }
@@ -1057,9 +1045,9 @@ impl ReindexPacker {
                 return None;
             }
             let kind = classify_promote(loc);
-            // Carried promotion target (`0` = self-derive); the slot type and width
-            // follow `resolve_reindex_type` so the scatter packer and the trace-side
-            // reindex Map derive identical widths.
+            // Carried promotion target (`None` = self-derive); the slot type and
+            // width follow `resolve_reindex_type` so the scatter packer and the
+            // trace-side reindex Map derive identical widths.
             let cp = ColPromoter::new(gnitz_wire::resolve_reindex_type(loc.type_code(), carried), false, kind);
             // A payload slot right-aligns its source, so one narrower than the
             // source would truncate it. `resolve_reindex_type` never derives that;
@@ -1156,7 +1144,9 @@ impl ReindexPacker {
         let mut n_packed = 0usize;
         for (i, &c) in group_cols.iter().enumerate() {
             let col = schema.columns[c as usize];
-            let out_tc = group_key_slot_type(col.type_code);
+            // A group column takes the same slot a join key's would; the float
+            // arm the two policies would differ on returned above.
+            let out_tc = gnitz_wire::reindex_output_type_code(col.type_code);
             let w = gnitz_wire::wire_stride(out_tc);
             // Room this column needs, plus the fold slot the columns behind it
             // would still require. Reserving it here is what keeps the greedy

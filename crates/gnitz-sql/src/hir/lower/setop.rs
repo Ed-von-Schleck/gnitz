@@ -15,7 +15,7 @@ use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::physical;
 use crate::ir::BoundExpr;
 use crate::validate::reject_float_keys;
-use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, TypeCode};
+use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, ReindexSlot, TypeCode};
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -54,12 +54,12 @@ pub(crate) fn lower_setop(
 
     // Each side's hashed columns, carrying the promotion target `RelExpr::set_op`
     // stamped per pair.
-    let left_key: Vec<(u32, u8)> = l_slots
+    let left_key: Vec<ReindexSlot> = l_slots
         .iter()
         .zip(out)
         .map(|(&s, c)| (s as u32, c.left_target))
         .collect();
-    let right_key: Vec<(u32, u8)> = r_slots
+    let right_key: Vec<ReindexSlot> = r_slots
         .iter()
         .zip(out)
         .map(|(&s, c)| (s as u32, c.right_target))
@@ -262,12 +262,12 @@ fn emit_side(
 }
 
 /// Hash the projected columns to a synthetic content PK — widening each column
-/// carrying a non-zero promotion target into the promoted layout so both set-op
-/// sides share one physical representation — then shard by that PK.
+/// carrying a promotion target into the promoted layout so both set-op sides
+/// share one physical representation — then shard by that PK.
 fn hash_shard_side(
     cb: &mut CircuitBuilder,
     filtered: gnitz_core::NodeId,
-    cols: &[(u32, u8)],
+    cols: &[ReindexSlot],
     branch_id: u8,
 ) -> gnitz_core::NodeId {
     // Reindex by a hash of the projected columns, so set membership

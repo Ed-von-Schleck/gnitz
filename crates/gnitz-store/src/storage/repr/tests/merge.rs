@@ -185,6 +185,63 @@ fn run_merge_dup_pk_bench() {
     }
 }
 
+/// A payload that forces `compare_rows` onto its `Generic` arm: a float, a
+/// 128-bit column and a nullable one each disqualify the fixed-int fast path.
+fn bench_generic_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::F64, 0),
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    )
+}
+
+/// [`bench_sorted_batch`] for [`bench_generic_schema`]: the two leading payload
+/// columns are constant within a PK group, so a tie walks the float and the
+/// 128-bit dispatch before the trailing I64 resolves it.
+fn bench_sorted_generic_batch(schema: &SchemaDescriptor, n: usize, dup: usize) -> Batch {
+    let mut b = Batch::with_capacity(schema, n.max(1));
+    for i in 0..n {
+        let group = (i / dup) as u64;
+        b.extend_pk(group as u128);
+        b.extend_weight(&1i64.to_le_bytes());
+        b.extend_null_bmp(&0u64.to_le_bytes());
+        b.extend_col(0, &(group as f64).to_le_bytes());
+        b.extend_col(1, &(group as u128).to_le_bytes());
+        b.extend_col(2, &(i as i64).to_le_bytes());
+        b.count += 1;
+    }
+    b
+}
+
+/// [`run_merge_dup_pk_bench`] over the `Generic` payload comparator, which the
+/// benches above never reach: their non-nullable `I64` payload takes the
+/// fixed-int fast path instead of `cmp_typed_le`.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture --test-threads=1"]
+fn run_merge_dup_pk_generic_bench() {
+    const K: usize = 4;
+    const N: usize = 200_000;
+    const DUP: usize = 8;
+    const ITERS: usize = 20;
+    let schema = bench_generic_schema();
+    let batches: Vec<Batch> = (0..K).map(|_| bench_sorted_generic_batch(&schema, N, DUP)).collect();
+    let sorted: Vec<MemBatch<'_>> = batches.iter().map(|b| b.as_mem_batch()).collect();
+    let mut sink = 0i64;
+    let elapsed = crate::test_support::bench_time(ITERS, || {
+        run_merge(&sorted, &schema, |_s, _r, w| {
+            sink = sink.wrapping_add(std::hint::black_box(w));
+        });
+    });
+    std::hint::black_box(sink);
+    let (rows, secs) = (K * N, elapsed.as_secs_f64());
+    let rps = (ITERS as f64 * rows as f64) / secs;
+    println!("run_merge_generic: {rows} rows × {ITERS} iters in {secs:.3}s = {rps:.0} rows/s");
+}
+
 /// Build an owned `Batch` of `n` rows for `make_schema_flush`: PK from
 /// `key_fn(i)`, weight +1, both I64 payload columns derived from the row
 /// index (payloads are irrelevant when all PKs are distinct).
