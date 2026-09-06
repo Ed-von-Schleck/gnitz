@@ -1,5 +1,5 @@
 use crate::error::GnitzSqlError;
-use gnitz_core::{FixedInt, TypeCode};
+use gnitz_core::TypeCode;
 use sqlparser::ast::{DataType, ExactNumberInfo};
 
 pub(crate) fn sql_type_to_typecode(dt: &DataType) -> Result<TypeCode, GnitzSqlError> {
@@ -78,14 +78,6 @@ pub(crate) fn has_scalar_register(tc: TypeCode) -> bool {
 /// cast-target gate.
 pub(crate) fn is_cast_target(tc: TypeCode) -> bool {
     has_scalar_register(tc) || tc == TypeCode::String
-}
-
-/// A cast target that lands in an *integer* register, as the width it names —
-/// what [`is_cast_target`] admits, minus STRING and the two floats. The
-/// rejection is for a `BoundExpr::Cast` some rewrite built rather than the
-/// binder, which cannot produce one.
-pub(crate) fn int_cast_target(tc: TypeCode) -> Result<FixedInt, GnitzSqlError> {
-    FixedInt::from_type_code(tc).ok_or_else(|| GnitzSqlError::Unsupported(format!("CAST to {tc:?} is not supported")))
 }
 
 #[cfg(test)]

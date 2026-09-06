@@ -51,7 +51,7 @@ fn try_col_eq_literal(expr: &BoundExpr, schema: &Schema) -> Option<(usize, u128)
     if !matches!(op, BinOp::Eq) {
         return None;
     }
-    let key = bound_key_literal(lit, schema.columns[col_idx].type_code)?;
+    let key = bound_key_literal(lit, schema.columns[col_idx].type_code).ok()?;
     Some((col_idx, key))
 }
 
@@ -82,7 +82,7 @@ fn pk_in_keys(conjunct: &BoundExpr, schema: &Schema) -> Option<Vec<u128>> {
         // `bound_key_literal` is the same rule `try_col_eq_literal` applies, so
         // `IN (…)` and `= …` route identically. A NULL/float/non-literal or an
         // unparseable UUID aborts to the slow scan.
-        let v = bound_key_literal(bound_literal(item)?, pk_tc)?;
+        let v = bound_key_literal(bound_literal(item)?, pk_tc).ok()?;
         if seen.insert(v) {
             pks.push(v);
         }

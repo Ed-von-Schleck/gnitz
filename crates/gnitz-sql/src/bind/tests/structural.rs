@@ -31,33 +31,6 @@ fn assert_unsupported(r: Result<BoundExpr, GnitzSqlError>, want_substr: &str) {
     }
 }
 
-fn num(n: &str) -> Result<BoundExpr, GnitzSqlError> {
-    bind_literal(&Value::Number(n.into(), false))
-}
-
-#[test]
-fn bind_literal_wide_int_to_litwide() {
-    // u64::MAX overflows i64 and is non-fractional → bound faithfully as a
-    // `LitWide` carrying the raw magnitude string (not coerced to f64, not an
-    // error). The recognizer parses it byte-exactly; the un-servable case
-    // rejects at the compile boundary.
-    match num("18446744073709551615") {
-        Ok(BoundExpr::LitWide(s)) => assert_eq!(s, "18446744073709551615"),
-        other => panic!("expected LitWide, got {other:?}"),
-    }
-}
-
-#[test]
-fn bind_literal_accepts_fractional_and_exponent_floats() {
-    assert!(matches!(num("1.5"), Ok(BoundExpr::LitFloat(_))));
-    assert!(matches!(num("1e3"), Ok(BoundExpr::LitFloat(_))));
-}
-
-#[test]
-fn bind_literal_accepts_in_range_integer() {
-    assert!(matches!(num("42"), Ok(BoundExpr::LitInt(42))));
-}
-
 /// A null test on a PK column never survives binding: a PK column is always
 /// non-nullable, so `null_test` settles it as a literal.
 #[test]
@@ -319,6 +292,21 @@ fn test_bind_coalesce_base_cases() {
         bind1(&parse_expr_sql("COALESCE(c, 0)"), &nn).unwrap(),
         BoundExpr::ColRef(1)
     ));
+    // sqlparser accepts the empty argument list, so the arity check is what
+    // rejects it — a bare NULL would silently type the whole expression.
+    assert_unsupported(bind1(&parse_expr_sql("COALESCE()"), &s), "at least one argument");
+}
+
+/// `scalar_call` matches before the leaf ever sees a call, so a name in both
+/// tables would shadow the aggregate in every binding context at once.
+#[test]
+fn no_scalar_call_name_is_also_an_aggregate_name() {
+    for (name, _) in SCALAR_CALLS {
+        assert!(
+            crate::ast_util::agg_func_from_name(name).is_none(),
+            "'{name}' is both a scalar call and an aggregate"
+        );
+    }
 }
 
 /// A 3-arg COALESCE nests right-to-left.

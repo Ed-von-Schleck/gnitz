@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{
-    col_def, compound_schema_u64_u64, dquote_expr, neg_num_expr, num_expr, pk_schema, uuid_schema_pk, uuid_str_expr,
+    col_def, compound_schema_u64_u64, neg_num_expr, num_expr, pk_schema, uuid_schema_pk, uuid_str_expr,
 };
 
 fn compound_schema_u64_u64_u128() -> Schema {
@@ -87,16 +87,27 @@ fn extract_pk_value_u128_rejects_negative() {
     assert!(extract_pk_value(&row, &schema).is_err());
 }
 
+/// A UUID PK takes a *valid* UUID string; an invalid one is named with the
+/// column, not swallowed into "must be a numeric literal".
 #[test]
-fn test_double_quoted_pk_value_rejected() {
-    // INSERT path: a double-quoted value in a UUID PK slot is not a literal.
-    let err = parse_one_pk_literal(
-        &dquote_expr("550e8400-e29b-41d4-a716-446655440000"),
-        TypeCode::UUID,
-        "id",
-    )
-    .expect_err("double-quoted UUID PK literal must be rejected");
-    assert!(err.to_string().contains("numeric literal"), "error: {err}");
+fn an_invalid_uuid_pk_string_names_the_column() {
+    let schema = uuid_schema_pk();
+    let row = vec![uuid_str_expr("not-a-uuid")];
+    let err = extract_pk_value(&row, &schema).expect_err("an invalid UUID PK literal must be rejected");
+    assert!(err.to_string().contains("valid UUID"), "error: {err}");
+}
+
+/// A negated zero is the one negated magnitude an unsigned column accepts: it
+/// names the same value `0` does, and the sign carries no information for an
+/// integer. `-1` still rejects.
+#[test]
+fn negative_zero_is_accepted_by_an_unsigned_wide_pk() {
+    for tc in [TypeCode::U128, TypeCode::UUID] {
+        let schema = pk_schema(tc);
+        let row = vec![neg_num_expr("0"), num_expr("0")];
+        let pk = extract_pk_value(&row, &schema).unwrap_or_else(|e| panic!("{tc:?}: {e}"));
+        assert_eq!(gnitz_core::native_packed_key(&schema, &pk), 0, "{tc:?}");
+    }
 }
 
 #[test]

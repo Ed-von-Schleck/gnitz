@@ -1,7 +1,6 @@
 use crate::ast_util::{aliased_def, expand_wildcard_item, is_bare_wildcard_projection, scalar_projection_item};
-use crate::bind::bind_single_table;
+use crate::bind::single_relation_col_idx;
 use crate::error::GnitzSqlError;
-use crate::ir::BoundExpr;
 use crate::validate::reject_duplicate_projection_names;
 use gnitz_core::{Schema, TypeCode, ZSetBatch};
 use sqlparser::ast::SelectItem;
@@ -71,12 +70,15 @@ pub(crate) fn resolve_projection(
                 }
             }
             _ => {
-                let (e, alias) = scalar_projection_item(item, "SELECT projection")?;
-                let BoundExpr::ColRef(idx) = bind_single_table(e, schema, rel_alias)? else {
-                    return Err(GnitzSqlError::Unsupported(
-                        "only simple column references supported in SELECT projection".to_string(),
-                    ));
-                };
+                let (e, alias) = scalar_projection_item(item, "RETURNING")?;
+                // RETURNING projects source columns verbatim: there is no
+                // compute program on this path to bind an expression into.
+                let idx = single_relation_col_idx(&schema.columns, rel_alias, e).map_err(|e| match e {
+                    GnitzSqlError::Unsupported(_) => {
+                        GnitzSqlError::Unsupported("only simple column references supported in RETURNING".to_string())
+                    }
+                    e => e,
+                })?;
                 col_indices.push(idx);
                 out_defs.push(aliased_def(&schema.columns[idx], alias));
             }

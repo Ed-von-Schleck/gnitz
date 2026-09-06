@@ -53,19 +53,22 @@ fn resolve_proj_col(
 ) -> Result<(ProjItem, ColumnDef), GnitzSqlError> {
     let (expr, alias) = scalar_projection_item(item, "projection")?;
     let bound = bind_single_table(expr, source_schema, rel_alias)?;
-    // A (possibly aliased / qualified / parenthesized) bare column reference is a
-    // pass-through; an alias only renames the output column. Anything else is a
-    // computed column, built by `computed_column` from its `infer_type`.
-    if let BoundExpr::ColRef(ci) = bound {
-        let col = aliased_def(&source_schema.columns[ci], alias);
-        Ok((ProjItem::PassThrough { src_col: ci }, col))
-    } else {
-        let nominal = bound.infer_type(&source_schema.columns);
-        Ok((
-            ProjItem::Computed { bound_expr: bound },
-            crate::validate::computed_column(alias, idx, nominal),
-        ))
-    }
+    // The output `ColumnDef` follows the same split: a pass-through keeps the
+    // source column's declaration under the written alias — which only renames
+    // it — and a computed column is declared from its `infer_type`.
+    Ok(match ProjItem::from_bound(bound) {
+        ProjItem::PassThrough { src_col } => (
+            ProjItem::PassThrough { src_col },
+            aliased_def(&source_schema.columns[src_col], alias),
+        ),
+        ProjItem::Computed { bound_expr } => {
+            let nominal = bound_expr.infer_type(&source_schema.columns);
+            (
+                ProjItem::Computed { bound_expr },
+                crate::validate::computed_column(alias, idx, nominal),
+            )
+        }
+    })
 }
 
 /// One projection payload as a [`ComputeMap`]: the compiled program plus the

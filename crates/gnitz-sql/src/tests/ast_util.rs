@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::GnitzSqlError;
 use crate::test_support::parse_expr_sql;
 use gnitz_core::TypeCode;
 
@@ -138,5 +139,122 @@ fn a_wildcard_expands_through_its_modifiers() {
         };
         assert_eq!(got, *variant, "{sql}: {msg}");
         assert!(msg.contains(want), "{sql}: {msg}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The one literal / constant decoder
+// ---------------------------------------------------------------------------
+
+fn num(n: &str) -> Result<crate::ir::BoundExpr, GnitzSqlError> {
+    bind_literal(&Value::Number(n.into(), false))
+}
+
+#[test]
+fn bind_literal_wide_int_to_litwide() {
+    // u64::MAX overflows i64 and is non-fractional → bound faithfully as a
+    // `LitWide` carrying the raw magnitude string (not coerced to f64, not an
+    // error). The recognizer parses it byte-exactly; the un-servable case
+    // rejects at the compile boundary.
+    match num("18446744073709551615") {
+        Ok(BExpr::LitWide(s)) => assert_eq!(s, "18446744073709551615"),
+        other => panic!("expected LitWide, got {other:?}"),
+    }
+}
+
+#[test]
+fn bind_literal_accepts_fractional_and_exponent_floats() {
+    assert!(matches!(num("1.5"), Ok(BExpr::LitFloat(_))));
+    assert!(matches!(num("1e3"), Ok(BExpr::LitFloat(_))));
+}
+
+#[test]
+fn bind_literal_accepts_in_range_integer() {
+    assert!(matches!(num("42"), Ok(BExpr::LitInt(42))));
+}
+
+/// A constant position peels parentheses and one sign, in either order, and
+/// hands the magnitude back separately from the sign.
+#[test]
+fn bind_constant_peels_parens_and_one_sign() {
+    for (src, want_neg) in [
+        ("5", false),
+        ("+5", false),
+        ("-5", true),
+        ("((-5))", true),
+        ("(-(5))", true),
+    ] {
+        let c = bind_constant(&parse_expr_sql(src)).unwrap_or_else(|e| panic!("{src}: {e}"));
+        assert!(matches!(c.lit, BExpr::LitInt(5)), "{src}: {:?}", c.lit);
+        assert_eq!(c.negated, want_neg, "{src}");
+    }
+}
+
+/// A written sign implies a numeric literal or NULL — the invariant every
+/// consumer rests on, enforced in the one constructor. Either sign over a
+/// string used to be discarded silently.
+#[test]
+fn bind_constant_refuses_a_sign_on_a_string() {
+    assert!(bind_constant(&parse_expr_sql("-'abc'")).is_err());
+    assert!(bind_constant(&parse_expr_sql("+'abc'")).is_err());
+    assert!(matches!(
+        bind_constant(&parse_expr_sql("'abc'")).unwrap().lit,
+        BExpr::LitStr(_)
+    ));
+    // A sign over NULL is the NULL it spells, which is what an INSERT cell reads.
+    for src in ["+NULL", "-NULL", "NULL"] {
+        assert!(
+            matches!(bind_constant(&parse_expr_sql(src)).unwrap().lit, BExpr::LitNull),
+            "{src}"
+        );
+    }
+}
+
+#[test]
+fn bind_constant_rejects_a_non_constant() {
+    for src in ["a", "1 + 1", "-(a)", "ABS(1)"] {
+        assert!(bind_constant(&parse_expr_sql(src)).is_err(), "{src}");
+    }
+}
+
+/// The sign travels beside the magnitude so `-0` survives; folding it in would
+/// make the two indistinguishable.
+#[test]
+fn bind_constant_keeps_negative_zero_distinguishable() {
+    let neg = bind_constant(&parse_expr_sql("-0")).unwrap();
+    let pos = bind_constant(&parse_expr_sql("0")).unwrap();
+    assert_eq!(neg.lit, pos.lit);
+    assert!(neg.negated && !pos.negated);
+    assert_eq!(neg.to_string(), "-0");
+}
+
+/// LIMIT/OFFSET read the same decoder, so `(10)` and `+10` are counts; a
+/// negative or fractional one names itself in the message.
+#[test]
+fn expr_usize_literal_reads_the_constant_decoder() {
+    for src in ["10", "+10", "(10)", "((+10))"] {
+        assert_eq!(expr_usize_literal(&parse_expr_sql(src), "LIMIT").unwrap(), 10, "{src}");
+    }
+    for (src, want) in [("-1", "'-1'"), ("1.5", "'1.5'")] {
+        let e = expr_usize_literal(&parse_expr_sql(src), "LIMIT").unwrap_err();
+        assert!(e.to_string().contains(want), "{src}: {e}");
+    }
+    for src in ["'x'", "NULL", "a"] {
+        let e = expr_usize_literal(&parse_expr_sql(src), "LIMIT").unwrap_err();
+        assert!(e.to_string().contains("not an expression"), "{src}: {e}");
+    }
+}
+
+/// ORDER BY / GROUP BY positions stay narrower than a constant on purpose:
+/// `(1)` and `+1` are expressions over the output, not positions into it.
+#[test]
+fn clause_position_is_narrower_than_a_constant() {
+    assert_eq!(clause_position(&parse_expr_sql("1"), "ORDER BY").unwrap(), Some(1));
+    for src in ["(1)", "+1", "a"] {
+        assert_eq!(
+            clause_position(&parse_expr_sql(src), "ORDER BY").unwrap(),
+            None,
+            "{src}"
+        );
     }
 }

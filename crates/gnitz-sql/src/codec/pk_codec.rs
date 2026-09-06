@@ -2,18 +2,18 @@
 //! truth.
 //!
 //! `parse_pk_literal_packed` is the single helper through which every INSERT and
-//! SEEK PK literal flows (`extract_pk_value_mapped`, plus `try_col_eq_literal` /
+//! SEEK PK literal flows ([`PkPlan::extract`], plus `try_col_eq_literal` /
 //! `try_extract_pk_in` in the WHERE planner), so the master cannot route an
 //! INSERT and a DELETE for the same key to different workers.
 //!
-//! Two literal surfaces feed those packers, both defined here: the AST
-//! ([`SqlLiteral`]) that INSERT VALUES parses, and the bound IR ([`BoundLit`])
-//! that the WHERE recognizers and the UPDATE SET classifier read.
+//! One literal shape reaches those packers: the bound [`BoundLit`], read out of
+//! a `BoundExpr` by the WHERE recognizers and out of a [`Constant`] by INSERT
+//! VALUES.
 
+use crate::ast_util::Constant;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr, UnaryOp};
 use gnitz_core::{opk_key_cols, FixedInt, PkBuf, Schema, TypeCode};
-use sqlparser::ast::{Expr, UnaryOperator, Value};
 
 pub(crate) fn parse_uuid_str(s: &str) -> Result<u128, GnitzSqlError> {
     gnitz_wire::parse_uuid(s).ok_or_else(|| GnitzSqlError::Bind(format!("invalid UUID literal: {s:?}")))
@@ -44,7 +44,7 @@ pub(crate) fn parse_literal_i128(n_str: &str, negated: bool) -> Option<i128> {
 /// wrong rows — the cff7c58-class trap).
 ///
 /// This helper is the single source of truth for INSERT/SEEK PK routing —
-/// `extract_pk_value_mapped`, `try_col_eq_literal`, and `try_extract_pk_in` all
+/// [`PkPlan::extract`], `try_col_eq_literal`, and `try_extract_pk_in` all
 /// dispatch through it so the master cannot send INSERT and DELETE for the
 /// same key to different workers.
 pub(crate) fn parse_pk_literal_packed(tc: TypeCode, n_str: &str, negated: bool) -> Option<u128> {
@@ -99,6 +99,15 @@ pub(crate) enum NumLit<'e> {
 }
 
 impl NumLit<'_> {
+    /// Whether the literal is below zero, without committing to a width its
+    /// magnitude may not fit.
+    fn is_negative(self) -> bool {
+        match self {
+            NumLit::Small(v) => v < 0,
+            NumLit::Wide(_, negated) => negated,
+        }
+    }
+
     /// The literal as a signed value, for a consumer that classifies against a
     /// ≤8-byte type's range. `None` for a magnitude past `i128` — only a
     /// `U128`/`UUID` literal, which takes [`pack_num`]'s unsigned path instead.
@@ -133,7 +142,7 @@ pub(crate) fn pack_num(tc: TypeCode, lit: NumLit<'_>) -> Option<u128> {
 }
 
 /// A bound literal accepted for a seek/range key: a numeric value + sign, or a
-/// string (a single-quoted UUID). The bound-IR analogue of [`SqlLiteral`].
+/// string (a single-quoted UUID).
 pub(crate) enum BoundLit<'e> {
     Num(NumLit<'e>),
     Str(&'e str),
@@ -149,128 +158,128 @@ pub(crate) fn bound_literal(e: &BoundExpr) -> Option<BoundLit<'_>> {
     None
 }
 
+/// Why a bound literal is not a key for a column of a given type — classified
+/// rather than swallowed, so the INSERT path can name the column and the offence.
+pub(crate) enum KeyLitError {
+    /// A negative literal against an unsigned column.
+    NegativeIntoUnsigned,
+    /// A numeric literal outside the column type's range.
+    OutOfRange,
+    /// A string literal against a UUID column that does not spell a UUID.
+    BadUuid,
+    /// A literal of a kind no key is ever spelled by (a string outside UUID).
+    NotNumeric,
+}
+
 /// A bound literal as the packed key of a column of type `tc`: a single-quoted
 /// string is a key only for a UUID column, numerics pack through the same
-/// `pk_codec` path INSERT takes. The one rule behind `col = literal` and
-/// `col IN (literal, …)`, so those two spellings cannot route differently.
-pub(crate) fn bound_key_literal(lit: BoundLit<'_>, tc: TypeCode) -> Option<u128> {
+/// `pk_codec` path INSERT takes. The one rule behind `col = literal`,
+/// `col IN (literal, …)` and a written INSERT cell, so no two of those spellings
+/// can route differently.
+pub(crate) fn bound_key_literal(lit: BoundLit<'_>, tc: TypeCode) -> Result<u128, KeyLitError> {
     match lit {
-        BoundLit::Str(s) if tc == TypeCode::UUID => parse_uuid_str(s).ok(),
-        BoundLit::Str(_) => None,
-        BoundLit::Num(n) => pack_num(tc, n),
-    }
-}
-
-/// A SQL literal extracted from an `Expr` for PK/seek routing. `Number`'s
-/// second field is `negated` (the literal sat under `UnaryOp(Minus, _)`);
-/// `Str` carries the unescaped single-quoted contents.
-pub(crate) enum SqlLiteral<'a> {
-    Number(&'a str, bool),
-    Str(&'a str),
-}
-
-/// The `Expr::Value` / `UnaryOp(Minus, Number)` unwrap for the INSERT VALUES
-/// parse site ([`parse_one_pk_literal`]); the WHERE recognizers unwrap bound
-/// literals instead (`access`'s bound-literal seam).
-///
-/// Matches `SingleQuotedString` only — NOT `DoubleQuotedString`: in
-/// `GenericDialect` a double-quoted token is an identifier, so treating
-/// `col = "x"` as a UUID seek literal would silently change which queries
-/// take the index fast path.
-pub(crate) fn extract_sql_literal(expr: &Expr) -> Option<SqlLiteral<'_>> {
-    match expr {
-        Expr::Value(vws) => match &vws.value {
-            Value::Number(n, _) => Some(SqlLiteral::Number(n, false)),
-            Value::SingleQuotedString(s) => Some(SqlLiteral::Str(s)),
-            _ => None,
-        },
-        // `+5` and `-5`: sqlparser lexes the sign as a separate unary operator,
-        // so a signed literal is never a bare `Value::Number`.
-        Expr::UnaryOp {
-            op: op @ (UnaryOperator::Minus | UnaryOperator::Plus),
-            expr,
-        } => match expr.as_ref() {
-            Expr::Value(vws) => match &vws.value {
-                Value::Number(n, _) => Some(SqlLiteral::Number(n, matches!(op, UnaryOperator::Minus))),
-                _ => None,
-            },
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Parse one PK column literal at `pk_expr` into its packed u128 form.
-/// Routes through `parse_pk_literal_packed` (numerics) or `parse_uuid_str`
-/// (UUID); the returned u128's low `wire_stride` bytes carry the column's
-/// native LE bytes.
-fn parse_one_pk_literal(pk_expr: &Expr, tc: TypeCode, col_name: &str) -> Result<u128, GnitzSqlError> {
-    match extract_sql_literal(pk_expr) {
-        Some(SqlLiteral::Number(n, negated)) => parse_pk_literal_packed(tc, n, negated).ok_or_else(|| {
-            // `tc` is a PK column's type, so it is PK-eligible: an integer
-            // scalar at some width. On that domain "not signed" is "unsigned",
-            // which is the half a negative literal can never land in.
-            if negated && !tc.is_signed_int() {
-                GnitzSqlError::Bind(format!(
-                    "PK column '{col_name}' of type {tc:?} does not accept negative literals"
-                ))
+        BoundLit::Str(s) if tc == TypeCode::UUID => parse_uuid_str(s).map_err(|_| KeyLitError::BadUuid),
+        BoundLit::Str(_) => Err(KeyLitError::NotNumeric),
+        BoundLit::Num(n) => pack_num(tc, n).ok_or_else(|| {
+            // A PK column's type is PK-eligible: an integer scalar at some
+            // width. On that domain "not signed" is "unsigned", which is the
+            // half a negative literal can never land in.
+            if n.is_negative() && !tc.is_signed_int() {
+                KeyLitError::NegativeIntoUnsigned
             } else {
-                let s_disp = if negated { format!("-{n}") } else { n.to_string() };
-                GnitzSqlError::Bind(format!("PK column '{col_name}' value is not a valid {tc:?}: {s_disp}"))
+                KeyLitError::OutOfRange
             }
         }),
-        // UUID accepts a single-quoted UUID string; non-UUID PKs are numeric only.
-        Some(SqlLiteral::Str(s)) if tc == TypeCode::UUID => parse_uuid_str(s),
-        _ => Err(GnitzSqlError::Bind(format!(
-            "PK column '{col_name}' value must be a numeric literal"
-        ))),
     }
 }
 
-/// Extract the primary key from a VALUES row as a `PkBuf`, walking the PK
-/// columns in pk-list order, dispatching each through `parse_one_pk_literal`,
-/// and copying the column's native LE bytes into the tuple buffer. Test-only
-/// convenience over [`extract_pk_value_mapped`] for rows with the identity
-/// slot map; the INSERT path builds a hidden/SERIAL-aware map.
+impl Constant {
+    /// This constant as a [`BoundLit`], so a VALUES cell takes the bound-literal
+    /// key rule rather than re-spelling the `Str`-vs-`Num` dispatch.
+    fn bound_lit(&self) -> Option<BoundLit<'_>> {
+        Some(match &self.lit {
+            BExpr::LitInt(v) => BoundLit::Num(NumLit::Small(if self.negated { -(*v as i128) } else { *v as i128 })),
+            BExpr::LitWide(s) => BoundLit::Num(NumLit::Wide(s, self.negated)),
+            BExpr::LitStr(s) => BoundLit::Str(s),
+            _ => return None,
+        })
+    }
+
+    /// This constant as the packed key/cell of a column of type `tc`: the low
+    /// `tc.wire_stride()` bytes are the column's native LE image.
+    pub(crate) fn key_packed(&self, tc: TypeCode) -> Result<u128, KeyLitError> {
+        bound_key_literal(self.bound_lit().ok_or(KeyLitError::NotNumeric)?, tc)
+    }
+}
+
+/// One PK column constant packed, under the PK slot's own error wording.
+fn parse_one_pk_literal(c: &Constant, tc: TypeCode, col_name: &str) -> Result<u128, GnitzSqlError> {
+    c.key_packed(tc).map_err(|e| {
+        GnitzSqlError::Bind(match e {
+            KeyLitError::NegativeIntoUnsigned => {
+                format!("PK column '{col_name}' of type {tc:?} does not accept negative literals")
+            }
+            KeyLitError::OutOfRange => format!("PK column '{col_name}' value is not a valid {tc:?}: {c}"),
+            KeyLitError::BadUuid => format!("PK column '{col_name}' value is not a valid UUID: {c}"),
+            KeyLitError::NotNumeric => format!("PK column '{col_name}' value must be a numeric literal"),
+        })
+    })
+}
+
+/// The row-invariant half of PK extraction from a VALUES list: per PK column,
+/// in pk-list order, the VALUES slot it reads and the column it names. Resolved
+/// once per statement rather than per row.
+pub(crate) struct PkPlan<'s> {
+    schema: &'s Schema,
+    cols: Vec<(usize, TypeCode, &'s str)>,
+}
+
+impl<'s> PkPlan<'s> {
+    /// `slot_of` is the INSERT's physical-column → VALUES-slot map, `None` where
+    /// a column takes no user value. A PK column always takes one.
+    pub(crate) fn new(slot_of: &[Option<usize>], schema: &'s Schema) -> Result<Self, GnitzSqlError> {
+        let cols = schema
+            .pk_cols
+            .iter()
+            .map(|&pi| {
+                let c = &schema.columns[pi as usize];
+                let slot =
+                    slot_of.get(pi as usize).copied().flatten().ok_or_else(|| {
+                        GnitzSqlError::Bind(format!("PK column '{}' missing from INSERT row", c.name))
+                    })?;
+                Ok((slot, c.type_code, c.name.as_str()))
+            })
+            .collect::<Result<Vec<_>, GnitzSqlError>>()?;
+        Ok(PkPlan { schema, cols })
+    }
+
+    /// The primary key of one bound VALUES row as a `PkBuf`, each column's
+    /// native LE bytes copied into the tuple buffer.
+    pub(crate) fn extract(&self, row: &[Constant]) -> Result<PkBuf, GnitzSqlError> {
+        // `PK_LIST_MAX_COLS < MAX_PK_COLUMNS`, so every validated PK fits without
+        // a per-row allocation; `opk_key_cols` owns the byte layout.
+        let mut natives = [0u128; gnitz_wire::MAX_PK_COLUMNS];
+        for (native, &(slot, tc, name)) in natives.iter_mut().zip(&self.cols) {
+            let c = row
+                .get(slot)
+                .ok_or_else(|| GnitzSqlError::Bind(format!("PK column '{name}' missing from INSERT row")))?;
+            *native = parse_one_pk_literal(c, tc, name)?;
+        }
+        Ok(opk_key_cols(self.schema, natives))
+    }
+}
+
+/// Extract the primary key from a VALUES row of written expressions. Test-only
+/// convenience over [`PkPlan`] for rows with the identity slot map; the INSERT
+/// path builds a hidden/SERIAL-aware map and binds the row once.
 #[cfg(test)]
-pub(crate) fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<PkBuf, GnitzSqlError> {
+pub(crate) fn extract_pk_value(row: &[sqlparser::ast::Expr], schema: &Schema) -> Result<PkBuf, GnitzSqlError> {
     let slot_of: Vec<Option<usize>> = (0..row.len()).map(Some).collect();
-    extract_pk_value_mapped(row, &slot_of, schema)
-}
-
-/// Extract the primary key from a VALUES row as a `PkBuf`. `slot_of` maps each
-/// **physical** column index to its VALUES slot, with `None` for columns that
-/// carry no user value (SERIAL, or a hidden/dropped column). A PK column is
-/// never SERIAL-in-payload nor hidden, so every `pk_cols` entry maps to
-/// `Some` slot for a well-formed INSERT.
-pub(crate) fn extract_pk_value_mapped(
-    row: &[Expr],
-    slot_of: &[Option<usize>],
-    schema: &Schema,
-) -> Result<PkBuf, GnitzSqlError> {
-    // `PK_LIST_MAX_COLS < MAX_PK_COLUMNS`, so every validated PK fits without a
-    // per-row allocation; `opk_key_cols` owns the byte layout.
-    let mut natives = [0u128; gnitz_wire::MAX_PK_COLUMNS];
-    for (slot, &pi) in natives.iter_mut().zip(&schema.pk_cols) {
-        let pi = pi as usize;
-        let pk_expr = slot_of
-            .get(pi)
-            .copied()
-            .flatten()
-            .and_then(|s| row.get(s))
-            .ok_or_else(|| {
-                GnitzSqlError::Bind(format!(
-                    "PK column '{}' missing from INSERT row",
-                    schema.columns[pi].name
-                ))
-            })?;
-        *slot = parse_one_pk_literal(pk_expr, schema.columns[pi].type_code, &schema.columns[pi].name)?;
-    }
-    Ok(opk_key_cols(schema, natives))
-}
-
-pub(crate) fn is_null_expr(expr: &Expr) -> bool {
-    matches!(expr, Expr::Value(vws) if matches!(vws.value, Value::Null))
+    let cells = row
+        .iter()
+        .map(crate::ast_util::bind_constant)
+        .collect::<Result<Vec<_>, _>>()?;
+    PkPlan::new(&slot_of, schema)?.extract(&cells)
 }
 
 #[cfg(test)]

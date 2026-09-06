@@ -1,14 +1,27 @@
 use super::*;
+use crate::ast_util::bind_constant;
 use crate::test_support::{num_expr, uuid_schema_payload, uuid_str_expr};
+use sqlparser::ast::Expr;
 
 /// The lone UUID cell of a column region, from its 16 LE bytes.
 fn uuid_cell(col: &[u8]) -> u128 {
     u128::from_le_bytes(col[..16].try_into().unwrap())
 }
 
+/// Encode one written constant into a fresh column region, the way INSERT does.
+fn encoded(tc: TypeCode, e: &Expr) -> Result<Vec<u8>, GnitzSqlError> {
+    let mut col = Vec::new();
+    append_value_to_col(&mut col, &mut Vec::new(), tc, &bind_constant(e)?)?;
+    Ok(col)
+}
+
+/// `src` as an INSERT row carries it — signs and parentheses included.
+fn expr(src: &str) -> Expr {
+    crate::test_support::parse_expr_sql(src)
+}
+
 #[test]
 fn test_null_append_insert_update_identical_all_variants() {
-    let null_expr = Expr::value(Value::Null);
     // (wire type, expected NULL encoding) per column kind — a zeroed cell of the
     // type's own stride, German-string columns included.
     let cases: [(TypeCode, Vec<u8>); 4] = [
@@ -20,7 +33,7 @@ fn test_null_append_insert_update_identical_all_variants() {
     for (tc, expected) in cases {
         let mut blob = Vec::new();
         let mut via_insert = Vec::new();
-        append_value_to_col(&mut via_insert, &mut blob, tc, &null_expr).unwrap();
+        append_value_to_col(&mut via_insert, &mut blob, tc, &bind_constant(&expr("NULL")).unwrap()).unwrap();
         let mut via_update = Vec::new();
         append_column_value(&mut via_update, &mut blob, ColumnValue::Null, tc).unwrap();
         assert_eq!(via_insert, expected, "INSERT NULL encoding for {tc:?}");
@@ -75,49 +88,32 @@ fn set_value_in_range_encodes_natively() {
     }
 }
 
-/// INSERT integer literals encode byte-identically to the old per-type
+/// INSERT integer literals encode byte-identically to the native
 /// `parse::<uN>()` + `to_le_bytes` ladder across widths and signs, and
-/// out-of-range / wrong-sign literals are still rejected (the `FixedInt::range`
-/// check that replaced the per-type `parse`).
+/// out-of-range / wrong-sign literals are rejected by the `FixedInt::range`
+/// check.
 #[test]
 fn insert_int_encoding_matches_native_and_range_checks() {
-    use sqlparser::ast::UnaryOperator;
-
-    fn num(n: &str) -> Expr {
-        Expr::value(Value::Number(n.into(), false))
-    }
-    fn neg(n: &str) -> Expr {
-        Expr::UnaryOp {
-            op: UnaryOperator::Minus,
-            expr: Box::new(num(n)),
-        }
-    }
-    fn encoded(tc: TypeCode, e: &Expr) -> Result<Vec<u8>, GnitzSqlError> {
-        let mut col = Vec::new();
-        append_value_to_col(&mut col, &mut Vec::new(), tc, e)?;
-        Ok(col)
-    }
-
     // Byte-identical to the native casts at every width / sign / type edge.
-    assert_eq!(encoded(TypeCode::U8, &num("255")).unwrap(), vec![255u8]);
-    assert_eq!(encoded(TypeCode::I8, &neg("5")).unwrap(), vec![(-5i8) as u8]);
-    assert_eq!(encoded(TypeCode::U16, &num("65535")).unwrap(), 65535u16.to_le_bytes());
-    assert_eq!(encoded(TypeCode::I16, &neg("2")).unwrap(), (-2i16).to_le_bytes());
-    assert_eq!(encoded(TypeCode::I32, &neg("1")).unwrap(), (-1i32).to_le_bytes());
+    assert_eq!(encoded(TypeCode::U8, &expr("255")).unwrap(), vec![255u8]);
+    assert_eq!(encoded(TypeCode::I8, &expr("-5")).unwrap(), vec![(-5i8) as u8]);
+    assert_eq!(encoded(TypeCode::U16, &expr("65535")).unwrap(), 65535u16.to_le_bytes());
+    assert_eq!(encoded(TypeCode::I16, &expr("-2")).unwrap(), (-2i16).to_le_bytes());
+    assert_eq!(encoded(TypeCode::I32, &expr("-1")).unwrap(), (-1i32).to_le_bytes());
     assert_eq!(
-        encoded(TypeCode::U64, &num("18446744073709551615")).unwrap(),
+        encoded(TypeCode::U64, &expr("18446744073709551615")).unwrap(),
         u64::MAX.to_le_bytes()
     );
     assert_eq!(
-        encoded(TypeCode::I64, &neg("9223372036854775808")).unwrap(),
+        encoded(TypeCode::I64, &expr("-9223372036854775808")).unwrap(),
         i64::MIN.to_le_bytes()
     );
 
     // Out-of-range and wrong-sign literals are rejected.
-    assert!(encoded(TypeCode::U8, &num("256")).is_err());
-    assert!(encoded(TypeCode::I8, &num("128")).is_err());
-    assert!(encoded(TypeCode::U8, &neg("1")).is_err());
-    assert!(encoded(TypeCode::I32, &num("3000000000")).is_err());
+    assert!(encoded(TypeCode::U8, &expr("256")).is_err());
+    assert!(encoded(TypeCode::I8, &expr("128")).is_err());
+    assert!(encoded(TypeCode::U8, &expr("-1")).is_err());
+    assert!(encoded(TypeCode::I32, &expr("3000000000")).is_err());
 }
 
 // ------------------------------------------------------------------
@@ -130,14 +126,9 @@ fn test_uuid_non_pk_string_literal_accepted() {
     let schema = uuid_schema_payload();
     let mut batch = gnitz_core::ZSetBatch::new(&schema);
     // col 1 is UUID
+    let c = bind_constant(&uuid_str_expr("550e8400-e29b-41d4-a716-446655440000")).unwrap();
     let gnitz_core::ZSetBatch { columns, blob, .. } = &mut batch;
-    append_value_to_col(
-        &mut columns[1],
-        blob,
-        TypeCode::UUID,
-        &uuid_str_expr("550e8400-e29b-41d4-a716-446655440000"),
-    )
-    .unwrap();
+    append_value_to_col(&mut columns[1], blob, TypeCode::UUID, &c).unwrap();
     assert_eq!(
         uuid_cell(&batch.columns[1]),
         0x550e8400_e29b_41d4_a716_446655440000_u128
@@ -146,24 +137,99 @@ fn test_uuid_non_pk_string_literal_accepted() {
 
 #[test]
 fn test_uuid_decimal_literal_still_accepted() {
-    let schema = uuid_schema_payload();
-    let mut batch = gnitz_core::ZSetBatch::new(&schema);
     let big_val: u128 = 0x550e8400_e29b_41d4_a716_446655440000_u128;
-    let gnitz_core::ZSetBatch { columns, blob, .. } = &mut batch;
-    append_value_to_col(&mut columns[1], blob, TypeCode::UUID, &num_expr(&big_val.to_string())).unwrap();
-    assert_eq!(uuid_cell(&batch.columns[1]), big_val);
+    assert_eq!(
+        uuid_cell(&encoded(TypeCode::UUID, &num_expr(&big_val.to_string())).unwrap()),
+        big_val
+    );
 }
 
-/// A leading `+` reaches the payload slot the same way it reaches the PK
-/// slot: `pk_codec::extract_sql_literal` accepts both signs, so one INSERT
-/// row must not take `+1` for its key and refuse `+2` for its payload.
+/// A UUID column takes a *valid* UUID string; an invalid one is named, not
+/// silently declined the way the seek recognizers decline it.
+#[test]
+fn a_uuid_column_names_an_invalid_uuid_string() {
+    let e = encoded(TypeCode::UUID, &uuid_str_expr("not-a-uuid")).unwrap_err();
+    assert!(format!("{e:?}").contains("UUID"), "got {e:?}");
+}
+
+/// A leading `+` reaches the payload slot the same way it reaches the PK slot:
+/// one written constant decoder serves both, so an INSERT row cannot take `+1`
+/// for its key and refuse `+2` for its payload.
 #[test]
 fn a_unary_plus_literal_is_accepted_like_the_pk_slot_accepts_it() {
-    let plus = Expr::UnaryOp {
-        op: UnaryOperator::Plus,
-        expr: Box::new(num_expr("2")),
-    };
-    let mut col = Vec::new();
-    append_value_to_col(&mut col, &mut Vec::new(), TypeCode::U32, &plus).expect("`+2` must bind");
-    assert_eq!(col.as_slice(), 2u32.to_le_bytes());
+    assert_eq!(encoded(TypeCode::U32, &expr("+2")).unwrap(), 2u32.to_le_bytes());
+    // Parentheses peel too, in either order.
+    assert_eq!(encoded(TypeCode::U32, &expr("(2)")).unwrap(), 2u32.to_le_bytes());
+    assert_eq!(encoded(TypeCode::U32, &expr("(+2)")).unwrap(), 2u32.to_le_bytes());
+}
+
+/// Every numeric spelling reaches a float column, not only a written fraction:
+/// a bare integer, a magnitude past `i128` (which no integer parse would hold),
+/// and a wide negative.
+#[test]
+fn a_float_column_takes_every_numeric_spelling() {
+    fn f64_of(col: &[u8]) -> f64 {
+        f64::from_le_bytes(col[..8].try_into().unwrap())
+    }
+    fn f32_of(col: &[u8]) -> f32 {
+        f32::from_le_bytes(col[..4].try_into().unwrap())
+    }
+
+    assert_eq!(f64_of(&encoded(TypeCode::F64, &expr("5")).unwrap()), 5.0);
+    assert_eq!(f32_of(&encoded(TypeCode::F32, &expr("5")).unwrap()), 5.0f32);
+    assert_eq!(
+        f64_of(&encoded(TypeCode::F64, &expr("-18446744073709551616")).unwrap()),
+        -18446744073709551616.0
+    );
+    assert_eq!(
+        f32_of(&encoded(TypeCode::F32, &expr("-18446744073709551616")).unwrap()),
+        -18446744073709551616.0f32
+    );
+    // Above `i128::MAX`: `NumLit::to_i128` would decline this, a DOUBLE holds it.
+    assert_eq!(
+        f64_of(&encoded(TypeCode::F64, &expr("340282366920938463463374607431768211455")).unwrap()),
+        340282366920938463463374607431768211455.0
+    );
+    // An F32 literal rounds through binary64, matching `ZSetBatch::append`.
+    assert_eq!(f32_of(&encoded(TypeCode::F32, &expr("0.1")).unwrap()), 0.1f64 as f32);
+}
+
+/// `-0` into a float column keeps its sign — which is why the sign travels
+/// beside the magnitude instead of being folded into it.
+#[test]
+fn negative_zero_into_a_float_column_keeps_its_sign() {
+    for (tc, bits) in [
+        (TypeCode::F64, (-0.0f64).to_le_bytes().to_vec()),
+        (TypeCode::F32, (-0.0f32).to_le_bytes().to_vec()),
+    ] {
+        assert_eq!(encoded(tc, &expr("-0")).unwrap(), bits, "{tc:?}");
+    }
+}
+
+/// The two kind rejections: a number into a String column, and a string into a
+/// column that is neither String nor UUID.
+#[test]
+fn a_literal_of_the_wrong_kind_is_rejected_by_the_column_type() {
+    let e = encoded(TypeCode::String, &expr("5")).unwrap_err();
+    assert!(
+        format!("{e:?}").contains("number literal for string column"),
+        "got {e:?}"
+    );
+    for tc in [TypeCode::U32, TypeCode::F64] {
+        let e = encoded(tc, &expr("'5'")).unwrap_err();
+        assert!(
+            format!("{e:?}").contains("string literal for non-string column"),
+            "{tc:?}: got {e:?}"
+        );
+    }
+}
+
+/// A sign on a string is not a value: either sign used to write `abc`. Refused
+/// by the decoder, so no column type can be reached with one.
+#[test]
+fn a_signed_string_literal_is_rejected() {
+    for src in ["-'abc'", "+'abc'"] {
+        let e = bind_constant(&expr(src)).unwrap_err();
+        assert!(format!("{e:?}").contains("sign"), "{src}: got {e:?}");
+    }
 }

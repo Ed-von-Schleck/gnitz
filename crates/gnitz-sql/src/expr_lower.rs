@@ -8,8 +8,7 @@
 use crate::bind::structural::str_func_name;
 use crate::error::GnitzSqlError;
 use crate::ir::{BinOp, BoundExpr, NumFunc, StrArg, StrFunc, TrimMode, UnaryOp};
-use crate::types::int_cast_target;
-use gnitz_core::{ColumnDef, Schema, TypeCode};
+use gnitz_core::{ColumnDef, FixedInt, Schema, TypeCode};
 use gnitz_expr::{
     Evaluator, ExprBuilder, FloatArithOp, FloatUnaryOp, IntUnaryOp, LogicalInstr as L, LogicalProgram, Reg,
 };
@@ -410,7 +409,9 @@ impl OpcodeBackend<'_> {
             };
             return Ok((reg, ExprKind::Float));
         }
-        let fi = int_cast_target(to)?;
+        // Every remaining target is a `FixedInt`: the float and String branches
+        // above peeled the rest, and `is_cast_target` admits nothing else.
+        let fi = FixedInt::from_type_code(to).expect("is_cast_target admitted this");
         let reg = match kind {
             ExprKind::Str => self.eb.emit(L::StrToInt { a: r, fi }),
             ExprKind::Float => self.eb.emit(L::FloatToInt { a: r, fi }),

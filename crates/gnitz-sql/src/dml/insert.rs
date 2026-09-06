@@ -6,10 +6,10 @@
 
 use std::sync::Arc;
 
-use crate::ast_util::{extract_name, object_name_ident};
+use crate::ast_util::{bind_constant, extract_name, object_name_ident, Constant};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
-use crate::codec::pk_codec::{extract_pk_value_mapped, is_null_expr};
+use crate::codec::pk_codec::PkPlan;
 use crate::dml::mutate::{
     bind_set_program, build_merged_row, classify_set_rhs, eval_set_value, merge_payload_plan, resolve_set_target,
     SetProgram, SetValues,
@@ -18,7 +18,7 @@ use crate::dml::overlay::effective_rows;
 use crate::dml::rmw::{commit_rmw_or_buffer, RmwBuild, RmwWrite};
 use crate::error::GnitzSqlError;
 use crate::exec::batch::{project, resolve_projection, RowGather};
-use crate::ir::BoundExpr;
+use crate::ir::{BExpr, BoundExpr};
 use crate::validate::reject_unhonored_insert_clauses;
 use crate::SqlResult;
 use gnitz_core::{
@@ -28,6 +28,17 @@ use sqlparser::ast::{
     Assignment, ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query,
     SelectItem, SetExpr, TableObject, Values,
 };
+
+/// Where each row's PK comes from. The two are mutually exclusive by
+/// construction — a SERIAL PK has no VALUES slot to plan, and a written PK has
+/// no sequence to draw from — so neither branch can be reached with the other's
+/// state in hand.
+enum PkSource<'s> {
+    /// A SERIAL PK: `base + row_i`, bounded by the column type's maximum.
+    Serial { base: u64, max: i128 },
+    /// A written PK, read from the VALUES slots the plan names.
+    Written(PkPlan<'s>),
+}
 
 /// The resolved INSERT disposition after the ON CONFLICT clause (if any) is bound.
 /// The conflict target itself is validated and discarded in `validate_conflict_target`;
@@ -177,16 +188,12 @@ pub(crate) fn execute_insert(
     // stamped, and each VALUES element indexes the payload columns directly. The
     // dense `payload_idx` equals the position in the SERIAL-omitted row precisely
     // because the omitted column is the single PK (the single-PK closed form).
-    // `serial_max` is the underlying int type's max positive value
-    // (`FixedInt::range`); its presence *is* the SERIAL test, so it both selects the
-    // per-row PK source and bounds the sequence. `is_serial` names that presence.
     let serial_max: Option<i128> = schema.columns.iter().find(|c| c.is_serial).map(|c| {
         FixedInt::from_type_code(c.type_code)
             .expect("SERIAL underlying is a fixed int")
             .range()
             .1
     });
-    let is_serial = serial_max.is_some();
     // The user supplies one VALUES entry per visible, non-SERIAL column, in schema
     // order; a dropped (hidden) column and the SERIAL PK take no user value. The
     // row-invariant map physical ci → VALUES slot (`None` at SERIAL / hidden
@@ -203,22 +210,29 @@ pub(crate) fn execute_insert(
     // Built once: `payload_columns` filters on `is_pk_col`, itself a PK-list scan,
     // so leaving it in the row loop pays that scan per row per column.
     let payload = merge_payload_plan(schema);
-    // The row count is known here, so the whole statement's ids come from one
+    // One bound cell per VALUES slot, reused across rows and read by both
+    // consumers below, so a row's PK slot and payload slot cannot disagree on
+    // what a written constant is.
+    let mut cells: Vec<Constant> = Vec::new();
+    // The row count is known here, so a SERIAL statement's ids come from one
     // durable advance and each row stamps `base + i`. A row failing the arity
     // guard below abandons the rest — a wider gap of the same intentional kind.
-    let serial = serial_max
-        .map(|max| Ok::<_, GnitzSqlError>((client.reserve_serial_ids(tid, n as u64)?, max)))
-        .transpose()?;
+    let pk_source = match serial_max {
+        Some(max) => PkSource::Serial {
+            base: client.reserve_serial_ids(tid, n as u64)?,
+            max,
+        },
+        None => PkSource::Written(PkPlan::new(&slot_of, schema)?),
+    };
 
     for (row_i, row) in rows.iter().enumerate() {
         // Standard SQL rejects a VALUES row whose arity differs from the expected
         // count, in either direction — too few values, or excess trailing ones.
         // This guard makes every per-column index below in-bounds.
         if row.len() != expected {
-            let hint = if is_serial {
-                " (its SERIAL primary key is auto-assigned)"
-            } else {
-                ""
+            let hint = match pk_source {
+                PkSource::Serial { .. } => " (its SERIAL primary key is auto-assigned)",
+                PkSource::Written(_) => "",
             };
             return Err(GnitzSqlError::Bind(format!(
                 "INSERT specifies {} value(s) but table '{}' expects {} value(s){}",
@@ -228,19 +242,24 @@ pub(crate) fn execute_insert(
                 hint
             )));
         }
-        if let Some((base, max)) = serial {
-            // Reject an exhausted sequence (a value past the column type's max),
-            // mirroring PostgreSQL. Client-side, so it is a `Bind` error like the
-            // arity guard above — `Exec` is for surfaced server `ClientError`s.
-            let id = base + row_i as u64;
-            if id as i128 > max {
-                return Err(GnitzSqlError::Bind(format!(
-                    "SERIAL primary key exhausted: next value {id} exceeds the column type maximum {max}"
-                )));
+        cells.clear();
+        for e in row.iter() {
+            cells.push(bind_constant(e)?);
+        }
+        match &pk_source {
+            PkSource::Serial { base, max } => {
+                // Reject an exhausted sequence (a value past the column type's max),
+                // mirroring PostgreSQL. Client-side, so it is a `Bind` error like the
+                // arity guard above — `Exec` is for surfaced server `ClientError`s.
+                let id = base + row_i as u64;
+                if id as i128 > *max {
+                    return Err(GnitzSqlError::Bind(format!(
+                        "SERIAL primary key exhausted: next value {id} exceeds the column type maximum {max}"
+                    )));
+                }
+                batch.pks.push_u128(schema, id as u128);
             }
-            batch.pks.push_u128(schema, id as u128);
-        } else {
-            batch.pks.push_tuple(&extract_pk_value_mapped(row, &slot_of, schema)?);
+            PkSource::Written(plan) => batch.pks.push_tuple(&plan.extract(&cells)?),
         }
         batch.weights.push(1);
 
@@ -253,8 +272,9 @@ pub(crate) fn execute_insert(
                 push_zero_cell(&mut batch.columns[ci], col_def.type_code);
                 continue;
             }
-            let val_expr = &row[slot_of[ci].expect("a visible payload column has a user value")];
-            let is_null = is_null_expr(val_expr);
+            let cell = &cells[slot_of[ci].expect("a visible payload column has a user value")];
+            // Read off the *bound* constant, so `+NULL` is the NULL it spells.
+            let is_null = matches!(cell.lit, BExpr::LitNull);
             // `ConflictPlan::DoUpdatePk` pushes only the *merged* batch, so an
             // incoming NULL that survives this point never faces the wire
             // boundary's own check.
@@ -263,7 +283,7 @@ pub(crate) fn execute_insert(
                 gnitz_wire::null_word_set(&mut null_bits, payload_idx, true);
             }
             let ZSetBatch { columns, blob, .. } = &mut batch;
-            append_value_to_col(&mut columns[ci], blob, col_def.type_code, val_expr)?;
+            append_value_to_col(&mut columns[ci], blob, col_def.type_code, cell)?;
         }
         batch.nulls.push(null_bits);
     }

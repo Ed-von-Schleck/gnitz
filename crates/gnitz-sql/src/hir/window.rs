@@ -77,17 +77,19 @@ pub(crate) fn bind_window_final<L: ItemLeaf>(
     };
     let items = bind_projection(&select.projection, &wleaf, ids, ctx)?;
     reject_duplicate_projection_names(&select.projection, items.iter().map(|e| &e.out.def), ctx)?;
-    // Published only now, so the QUALIFY sees the SELECT list's names and the
-    // list itself does not.
-    *wleaf.aliases.borrow_mut() = items
-        .iter()
-        .map(|it| (it.out.def.name.clone(), it.expr.clone()))
-        .collect();
-    let qualify = select
-        .qualify
-        .as_ref()
-        .map(|q| bind_structural(q, &wleaf))
-        .transpose()?;
+    // The table exists so `QUALIFY rn = 1` can reach `… AS rn`, and the QUALIFY
+    // bind below is the only read of it — published only now, so the SELECT list
+    // itself does not see its own names.
+    let qualify = match &select.qualify {
+        Some(q) => {
+            *wleaf.aliases.borrow_mut() = items
+                .iter()
+                .map(|it| (it.out.def.name.clone(), it.expr.clone()))
+                .collect();
+            Some(bind_structural(q, &wleaf)?)
+        }
+        None => None,
+    };
     let win = wleaf.state.into_inner();
     desugar(ids, rel, leaf.env(), items, qualify, win)
 }
@@ -147,16 +149,16 @@ struct WindowLeaf<'a, L> {
 }
 
 impl<L: ItemLeaf> WindowLeaf<'_, L> {
-    /// The def of the placeholder `r` names, when it names one — a window
-    /// value's type and nullability, which the body's own leaf does not know.
-    fn placeholder(&self, r: &HirRef) -> Option<ColumnDef> {
+    /// The `(type, nullable)` of the placeholder `r` names, when it names one —
+    /// a window value's declaration, which the body's own leaf does not know.
+    fn placeholder(&self, r: &HirRef) -> Option<(TypeCode, bool)> {
         let HirRef::Col(id) = r else { return None };
         self.state
             .borrow()
             .calls
             .iter()
             .find(|c| c.out.id == *id)
-            .map(|c| c.out.def.clone())
+            .map(|c| (c.out.def.type_code, c.out.def.is_nullable))
     }
 
     /// The function the call behind placeholder `id` computes.
@@ -386,21 +388,20 @@ impl<L: ItemLeaf> LeafBinder<HirRef> for WindowLeaf<'_, L> {
         Err(err)
     }
     fn bind_function(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
-        if f.over.is_none() {
-            return self.inner.bind_function(f);
-        }
+        self.inner.bind_function(f)
+    }
+    /// The one context that admits a window call: it binds to the placeholder
+    /// column its value stands in for until the desugar joins it in.
+    fn bind_window(&self, f: &Function) -> Result<HirExpr, GnitzSqlError> {
         Ok(BExpr::ColRef(HirRef::Col(self.bind_window_call(f)?.id)))
     }
     /// This leaf's own placeholders; everything else is the body's.
     fn is_nullable(&self, r: &HirRef) -> bool {
         self.placeholder(r)
-            .map_or_else(|| self.inner.is_nullable(r), |d| d.is_nullable)
+            .map_or_else(|| self.inner.is_nullable(r), |(_, nullable)| nullable)
     }
     fn bind_subquery(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
         self.inner.bind_subquery(e)
-    }
-    fn binds_windows(&self) -> bool {
-        true
     }
 }
 
@@ -409,8 +410,7 @@ impl<L: ItemLeaf> ItemLeaf for WindowLeaf<'_, L> {
         self.inner.env()
     }
     fn type_of(&self, r: &HirRef) -> TypeCode {
-        self.placeholder(r)
-            .map_or_else(|| self.inner.type_of(r), |d| d.type_code)
+        self.placeholder(r).map_or_else(|| self.inner.type_of(r), |(tc, _)| tc)
     }
     fn expands_wildcard(&self) -> bool {
         self.inner.expands_wildcard()
@@ -515,6 +515,10 @@ struct Hoist<'a> {
     /// Subquery leaves, keyed by the relation they carry: `HirRef`'s equality
     /// never matches one, so they cannot be found by scanning `items`.
     by_sub: HashMap<*const RelExpr, ColId>,
+    /// Source columns, keyed by the id they were hoisted under — the `hoist`
+    /// return the first pass already computes, so the rebuild reads it back
+    /// rather than re-finding the entry by expression equality.
+    by_col: HashMap<ColId, ColId>,
 }
 
 impl Hoist<'_> {
@@ -547,7 +551,8 @@ impl Hoist<'_> {
             match r {
                 HirRef::Col(id) if col_by_id(self.placeholders, id).is_some() => {}
                 HirRef::Col(id) => {
-                    self.hoist(&BExpr::ColRef(HirRef::Col(id)));
+                    let w = self.hoist(&BExpr::ColRef(HirRef::Col(id)));
+                    self.by_col.insert(id, w);
                 }
                 HirRef::Subquery(s) => {
                     let key = Rc::as_ptr(&s.rel);
@@ -561,14 +566,7 @@ impl Hoist<'_> {
         e.try_rebuild(&|r| -> Result<HirExpr, GnitzSqlError> {
             let id = match r {
                 HirRef::Col(id) if col_by_id(self.placeholders, *id).is_some() => *id,
-                HirRef::Col(_) => {
-                    self.items
-                        .iter()
-                        .find(|it| it.expr == BExpr::ColRef(r.clone()))
-                        .expect("every source reference was hoisted above")
-                        .out
-                        .id
-                }
+                HirRef::Col(id) => *self.by_col.get(id).expect("every source reference was hoisted above"),
                 HirRef::Subquery(s) => self.by_sub[&Rc::as_ptr(&s.rel)],
             };
             Ok(BExpr::ColRef(HirRef::Col(id)))
@@ -621,6 +619,7 @@ fn desugar(
         placeholders: &placeholders,
         items: Vec::new(),
         by_sub: HashMap::new(),
+        by_col: HashMap::new(),
     };
     let items = items
         .into_iter()

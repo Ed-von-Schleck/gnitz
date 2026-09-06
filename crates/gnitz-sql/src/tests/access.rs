@@ -438,6 +438,11 @@ fn every_pk_type_routes_to_one_packed_key() {
         (TypeCode::U32, num_expr("4294967295"), 4294967295u128),
         // u64::MAX binds to `LitWide` for the WHERE seeks; INSERT parses it directly.
         (TypeCode::U64, num_expr("18446744073709551615"), u64::MAX as u128),
+        // `-0` names the value `0`: the sign carries no information for an
+        // integer, so an unsigned column takes it on every path. `-1` does not
+        // (`extract_pk_value_u128_rejects_negative`).
+        (TypeCode::U128, neg_num_expr("0"), 0),
+        (TypeCode::UUID, neg_num_expr("0"), 0),
     ] {
         check_pk_parity(tc, literal, expected);
     }

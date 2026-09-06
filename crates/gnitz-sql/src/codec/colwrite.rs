@@ -1,16 +1,20 @@
 //! Column value encoding: SQL literal / computed value → one §6 region cell.
 //!
-//! Two write paths share this module. INSERT appends parsed literals
+//! Two write paths share this module. INSERT appends written constants
 //! (`append_value_to_col`); SET / `ON CONFLICT DO UPDATE` append computed
 //! values (`append_column_value`). Both range-check against the column's type
-//! and reject an out-of-range value, through the same `pk_codec` packer — so
-//! `300` means the same thing whichever verb writes it, and neither path can
-//! land a value the other would refuse.
+//! and reject an out-of-range value through the same `pk_codec` packer, so `300`
+//! means the same thing whichever verb writes it.
+//!
+//! Their admissible domains differ asymmetrically: [`set_target_admits`] limits
+//! SET to `FixedInt ∪ String`, so INSERT can write a float, a UUID or a
+//! `DECIMAL(38,0)` value that SET refuses; nothing SET admits is refused here.
 
-use crate::codec::pk_codec::{pack_pk_value, parse_pk_literal_packed, parse_uuid_str};
+use crate::ast_util::Constant;
+use crate::codec::pk_codec::{pack_pk_value, KeyLitError};
 use crate::error::GnitzSqlError;
+use crate::ir::BExpr;
 use gnitz_core::{push_zero_cell, ColumnDef, FixedInt, TypeCode};
-use sqlparser::ast::{Expr, UnaryOperator, Value};
 
 /// A computed SET / `DO UPDATE` value.
 ///
@@ -26,93 +30,78 @@ pub(crate) enum ColumnValue {
     Null,
 }
 
-/// Append one INSERT literal to column region `col`, spilling a string into
-/// `blob`.
+/// Append one INSERT constant to column region `col`, spilling a string into
+/// `blob`. Dispatch is on the *column type*, never on the literal: `'5'` into an
+/// F64 column is `5.0` and `5` into a UUID column is the decimal spelling.
 pub(crate) fn append_value_to_col(
     col: &mut Vec<u8>,
     blob: &mut Vec<u8>,
     tc: TypeCode,
-    val_expr: &Expr,
+    c: &Constant,
 ) -> Result<(), GnitzSqlError> {
-    // sqlparser lexes a literal's sign as a separate unary operator, so `+5` and
-    // `-5` are both `UnaryOp`, never a bare `Value::Number`. Both signs unwrap
-    // here for the same reason `pk_codec::extract_sql_literal` accepts both: the
-    // PK slot and the payload slot of one INSERT row must agree on what a signed
-    // literal is.
-    let (val_expr, negated) = match val_expr {
-        Expr::UnaryOp {
-            op: op @ (UnaryOperator::Minus | UnaryOperator::Plus),
-            expr,
-        } => (expr.as_ref(), matches!(op, UnaryOperator::Minus)),
-        e => (e, false),
-    };
-
-    match val_expr {
-        Expr::Value(vws) => {
-            match &vws.value {
-                Value::Null => {
-                    push_zero_cell(col, tc);
-                    Ok(())
-                }
-                Value::Number(n, _) => {
-                    // A `Value::Number` is bare digits; the sign is the `UnaryOp`
-                    // peeled above. `sign` re-attaches it for the messages only.
-                    let sign = if negated { "-" } else { "" };
-                    match tc {
-                        // IEEE negation of the parsed magnitude is exact at every
-                        // value, `-0.0` and `-inf` included.
-                        TypeCode::F32 => {
-                            let v = n
-                                .parse::<f32>()
-                                .map_err(|_| GnitzSqlError::Bind(format!("invalid f32: {sign}{n}")))?;
-                            col.extend_from_slice(&(if negated { -v } else { v }).to_le_bytes());
-                            Ok(())
-                        }
-                        TypeCode::F64 => {
-                            let v = n
-                                .parse::<f64>()
-                                .map_err(|_| GnitzSqlError::Bind(format!("invalid f64: {sign}{n}")))?;
-                            col.extend_from_slice(&(if negated { -v } else { v }).to_le_bytes());
-                            Ok(())
-                        }
-                        TypeCode::String => Err(GnitzSqlError::Bind("number literal for string column".to_string())),
-                        TypeCode::Blob => Err(GnitzSqlError::Bind("number literal for blob column".to_string())),
-                        // Every integer column, narrow (U8..I64) and wide
-                        // (U128/UUID/I128) alike. Route through the single source of truth
-                        // for literal acceptance (`pk_codec`) so the INSERT-value path and
-                        // PK-seek routing accept/reject identically. The packed u128's low
-                        // `wire_stride()` bytes are the column's LE image at every width.
-                        _ => {
-                            let packed = parse_pk_literal_packed(tc, n, negated)
-                                .ok_or_else(|| GnitzSqlError::Bind(format!("{tc:?} value out of range: {sign}{n}")))?;
-                            col.extend_from_slice(&packed.to_le_bytes()[..tc.wire_stride()]);
-                            Ok(())
-                        }
-                    }
-                }
-                // A BLOB column is *not* text-writable: it takes bytes, and a
-                // quoted literal spells none. UUID is the one non-STRING type a
-                // text literal spells a value of.
-                Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => match tc {
-                    TypeCode::String => {
-                        col.extend_from_slice(&gnitz_wire::encode_german_string(s.as_bytes(), blob));
-                        Ok(())
-                    }
-                    TypeCode::UUID => {
-                        col.extend_from_slice(&parse_uuid_str(s)?.to_le_bytes());
-                        Ok(())
-                    }
-                    _ => Err(GnitzSqlError::Bind("string literal for non-string column".to_string())),
-                },
-                _ => Err(GnitzSqlError::Unsupported(format!(
-                    "unsupported value in INSERT: {}",
-                    vws.value
-                ))),
+    // NULL is the one value every column type encodes alike: a zeroed cell of
+    // the type's own stride, with the null bit set by the caller.
+    if matches!(c.lit, BExpr::LitNull) {
+        push_zero_cell(col, tc);
+        return Ok(());
+    }
+    match tc {
+        TypeCode::F32 | TypeCode::F64 => {
+            // Negating the parsed magnitude is exact at every IEEE value, `-0.0`
+            // and `-inf` included — which is why the sign travels beside it.
+            let mag = float_magnitude(c, tc)?;
+            let v = if c.negated { -mag } else { mag };
+            // F32 rounds through binary64, as `ZSetBatch::append` does for a
+            // Python float, so the two ingest paths agree bit for bit.
+            match tc {
+                TypeCode::F32 => col.extend_from_slice(&(v as f32).to_le_bytes()),
+                _ => col.extend_from_slice(&v.to_le_bytes()),
             }
+            Ok(())
         }
-        _ => Err(GnitzSqlError::Unsupported(format!(
-            "unsupported value expression in INSERT: {val_expr}"
-        ))),
+        TypeCode::String => match &c.lit {
+            BExpr::LitStr(s) => {
+                col.extend_from_slice(&gnitz_wire::encode_german_string(s.as_bytes(), blob));
+                Ok(())
+            }
+            _ => Err(GnitzSqlError::Bind("number literal for string column".to_string())),
+        },
+        // A BLOB column is *not* text-writable: it takes bytes, and a written
+        // literal spells none.
+        TypeCode::Blob => Err(GnitzSqlError::Bind(match c.lit {
+            BExpr::LitStr(_) => "string literal for non-string column".to_string(),
+            _ => "number literal for blob column".to_string(),
+        })),
+        // Every integer column, narrow and wide alike, plus a UUID column's
+        // single-quoted spelling — through `pk_codec`, so an INSERT cell and a
+        // PK seek accept and reject identically.
+        _ => {
+            let packed = c.key_packed(tc).map_err(|e| {
+                GnitzSqlError::Bind(match e {
+                    KeyLitError::NotNumeric => "string literal for non-string column".to_string(),
+                    KeyLitError::BadUuid => format!("invalid UUID literal: {c}"),
+                    KeyLitError::NegativeIntoUnsigned | KeyLitError::OutOfRange => {
+                        format!("{tc:?} value out of range: {c}")
+                    }
+                })
+            })?;
+            col.extend_from_slice(&packed.to_le_bytes()[..tc.wire_stride()]);
+            Ok(())
+        }
+    }
+}
+
+/// A float column's value with the sign not yet applied. Every numeric spelling
+/// reaches one, a magnitude past `i128` included — which a DOUBLE holds and no
+/// integer parse would.
+fn float_magnitude(c: &Constant, tc: TypeCode) -> Result<f64, GnitzSqlError> {
+    match &c.lit {
+        BExpr::LitFloat(v) => Ok(*v),
+        BExpr::LitInt(v) => Ok(*v as f64),
+        BExpr::LitWide(s) => s
+            .parse::<f64>()
+            .map_err(|_| GnitzSqlError::Bind(format!("invalid {tc:?}: {s}"))),
+        _ => Err(GnitzSqlError::Bind("string literal for non-string column".to_string())),
     }
 }
 

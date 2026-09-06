@@ -89,6 +89,41 @@ class TestEquiExists:
         finally:
             _cleanup(client, sn, "semi", "anti", "a", "b")
 
+    def test_exists_as_a_simple_case_operand(self, client):
+        """A simple `CASE <operand> WHEN … WHEN … END` over an EXISTS. The
+        operand binds once and is cloned per branch; re-binding it per branch
+        minted one subquery identity per WHEN, which the decorrelation rewrite
+        rejected for having more than one mark position — while the one-WHEN
+        form was accepted."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT id, "
+                "CASE EXISTS (SELECT 1 FROM b WHERE b.k = a.k) "
+                "WHEN 1 THEN 10 WHEN 0 THEN 20 END AS m FROM a",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+
+            client.execute_sql("INSERT INTO a VALUES (1, 10, 100), (2, 20, 200)", schema_name=sn)
+            assert _weights(client, vid, "m") == {20: 2}
+
+            client.execute_sql("INSERT INTO b VALUES (1, 10, 7)", schema_name=sn)
+            assert _weights(client, vid, "m") == {10: 1, 20: 1}
+
+            # Both occurrences of the mark collapse to their branch constants,
+            # so a second match still leaves one row at weight 1.
+            client.execute_sql("INSERT INTO b VALUES (2, 10, 8)", schema_name=sn)
+            assert _weights(client, vid, "m") == {10: 1, 20: 1}
+
+            client.execute_sql("DELETE FROM b WHERE id = 1", schema_name=sn)
+            client.execute_sql("DELETE FROM b WHERE id = 2", schema_name=sn)
+            assert _weights(client, vid, "m") == {20: 2}
+        finally:
+            _cleanup(client, sn, "v", "a", "b")
+
     def test_in_and_not_in_subquery(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)

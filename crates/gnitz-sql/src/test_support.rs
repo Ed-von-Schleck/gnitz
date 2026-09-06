@@ -88,11 +88,6 @@ pub(crate) fn uuid_str_expr(s: &str) -> Expr {
     Expr::value(Value::SingleQuotedString(s.into()))
 }
 
-/// A double-quoted token — an identifier in `GenericDialect`, never a literal.
-pub(crate) fn dquote_expr(s: &str) -> Expr {
-    Expr::value(Value::DoubleQuotedString(s.into()))
-}
-
 /// A `col = rhs` equality expression (AST), for building recognizer/parity inputs.
 pub(crate) fn eq_expr(col: &str, rhs: Expr) -> Expr {
     Expr::BinaryOp {

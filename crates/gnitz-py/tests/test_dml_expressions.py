@@ -207,6 +207,58 @@ def test_set_int_column_from_float_column_rejects(client, schema_name):
 
 
 # ---------------------------------------------------------------------------
+# Signed VALUES cells
+# ---------------------------------------------------------------------------
+
+
+def test_signed_null_writes_null_not_zero(client, schema_name):
+    """`+NULL` is the NULL it spells. The sign used to hide the literal from the
+    null check while the writer saw through it, so the cell was written zero with
+    the null bit left clear — read back as a real 0."""
+    sn = schema_name
+    tid = _table(
+        client,
+        sn,
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT)",
+        [("(1, +NULL)"), ("(2, -NULL)"), ("(3, NULL)")],
+    )
+    rows = _scan_map(client, tid)
+    for pk in (1, 2, 3):
+        assert rows[pk].v is None, f"pk {pk} must read back NULL, not 0"
+
+
+def test_signed_null_into_a_not_null_column_is_rejected(client, schema_name):
+    """The same defect skipped the NOT NULL check entirely."""
+    sn = schema_name
+    _table(client, sn, "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)")
+    with pytest.raises(gnitz.GnitzError):
+        client.execute_sql("INSERT INTO t VALUES (1, +NULL)", schema_name=sn)
+
+
+def test_a_parenthesised_or_plus_signed_cell_is_a_constant(client, schema_name):
+    """One decoder serves every constant position, so a PK slot and a payload
+    slot accept the same spellings."""
+    sn = schema_name
+    tid = _table(
+        client,
+        sn,
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+        [("(+1, (2))"), ("((3), +4)")],
+    )
+    rows = _scan_map(client, tid)
+    assert rows[1].v == 2 and rows[3].v == 4
+
+
+@pytest.mark.parametrize("cell", ["-'abc'", "+'abc'"])
+def test_a_signed_string_cell_is_rejected(client, schema_name, cell):
+    """Either sign over a string used to write `abc`, discarded silently."""
+    sn = schema_name
+    _table(client, sn, "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL)")
+    with pytest.raises(gnitz.GnitzError):
+        client.execute_sql(f"INSERT INTO t VALUES (1, {cell})", schema_name=sn)
+
+
+# ---------------------------------------------------------------------------
 # ON CONFLICT DO UPDATE
 # ---------------------------------------------------------------------------
 
