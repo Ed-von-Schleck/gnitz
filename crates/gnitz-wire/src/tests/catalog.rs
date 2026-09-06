@@ -80,35 +80,20 @@ fn a_flag_clear_word_decodes_as_one_bare_column_index() {
 }
 
 /// A packed list occupies the low 32 bits plus the flag at bit 63, leaving bits
-/// [32..63) clear — which is what gives `HAS_PK_WANT_HOLDER` (bit 62, below) and
-/// any later directive room in the same word. Bit 63 also makes a packed word
-/// non-zero, which is what lets `0` stay the worker's has-PK sentinel.
+/// [32..63) clear — room for any later directive in the same word. Bit 63 also
+/// makes a packed word non-zero, which is what lets `PROBE_KEYSPACE_PK` stay a
+/// keyspace no column list can name.
 #[test]
 fn a_packed_list_leaves_the_reserved_bits_clear() {
+    assert_eq!(crate::probe_key_columns(crate::PROBE_KEYSPACE_PK), None);
     for cols in [&[0u32][..], &[3][..], &[3, 9, 40, 64][..]] {
         let packed = pack_pk_cols(cols);
         assert_eq!(packed >> 63, 1, "{cols:?}: the packed flag is bit 63");
-        assert_ne!(packed, 0, "{cols:?}: never the PK sentinel");
         assert_eq!((packed >> 32) & 0x7FFF_FFFF, 0, "{cols:?}: bits [32..63) are reserved");
-    }
-}
-
-/// `HAS_PK_WANT_HOLDER` rides bit 62 of the same `seek_col_idx` word that
-/// carries the packed column list, and `pk_cols_word` is what strips it. Both
-/// directions are used: the worker reads the directive off a word carrying a
-/// maximal list, and the dispatch arms recover that list unchanged from a word
-/// carrying the directive.
-#[test]
-fn the_want_holder_bit_is_clear_of_every_packed_column_list() {
-    let maximal: Vec<u32> = (0..PK_LIST_MAX_COLS as u32).map(|i| PK_LIST_COL_MAX - i).collect();
-    for cols in [vec![0u32], vec![PK_LIST_COL_MAX], vec![1u32, 2, 3, 4], maximal] {
-        let packed = pack_pk_cols(&cols);
-        assert_eq!(packed & HAS_PK_WANT_HOLDER, 0, "{cols:?} must leave bit 62 clear");
-        let with_directive = packed | HAS_PK_WANT_HOLDER;
-        assert_eq!(pk_cols_word(with_directive), packed, "{cols:?}");
         assert_eq!(
-            unpack_pk_cols(pk_cols_word(with_directive)).map(|l| l.as_slice().to_vec()),
-            Ok(cols.clone())
+            crate::probe_key_columns(packed),
+            Some(packed),
+            "{cols:?}: never the PK sentinel"
         );
     }
 }

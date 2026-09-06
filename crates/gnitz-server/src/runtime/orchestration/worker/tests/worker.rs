@@ -684,7 +684,7 @@ fn an_oversized_reply_enqueues_a_train() {
     let (region, writer) = make_ring();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.send_scan_response(route(3, 5, 9), batch, ReplySchema::ClientAuthored, 0);
+    wp.send_scan_response(route(3, 5, 9), batch, ReplySchema::ClientAuthored, 0, false);
     assert_eq!(wp.pending_streams.len(), 1);
     let ps = wp.pending_streams.front().unwrap();
     assert_eq!(ps.next_row, 0);
@@ -709,7 +709,7 @@ fn a_row_wider_than_the_budget_ships_one_over_budget_frame() {
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.reply_frame_budget = 512;
-    wp.send_scan_response(route(1, 5, 0), batch, ReplySchema::ClientAuthored, 0);
+    wp.send_scan_response(route(1, 5, 0), batch, ReplySchema::ClientAuthored, 0, false);
 
     let mut passes = 0;
     while !wp.pending_streams.is_empty() {
@@ -741,7 +741,7 @@ fn a_row_wider_than_the_frame_cap_faults() {
     let (region, writer) = make_ring();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
-    wp.send_scan_response(route(1, 5, 0), batch, ReplySchema::ClientAuthored, 0);
+    wp.send_scan_response(route(1, 5, 0), batch, ReplySchema::ClientAuthored, 0, false);
     assert_eq!(
         wp.pending_streams.len(),
         1,
@@ -783,7 +783,7 @@ fn a_long_string_train_reassembles_with_its_weights() {
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.reply_frame_budget = budget;
-    wp.send_scan_response(route(1, 5, 0), source, ReplySchema::ClientAuthored, 0);
+    wp.send_scan_response(route(1, 5, 0), source, ReplySchema::ClientAuthored, 0, false);
     let mut passes = 0;
     while !wp.pending_streams.is_empty() {
         wp.emit_pending_scan_chunk();
@@ -851,7 +851,13 @@ fn a_projected_reply_carries_a_one_off_block() {
 
     // Fitting projected reply: one frame carrying the projected schema.
     let small = Batch::zeroed(projected, 2);
-    wp.send_scan_response(route(tid as u64, 5, 0), small, ReplySchema::OneOff(&projected), 0);
+    wp.send_scan_response(
+        route(tid as u64, 5, 0),
+        small,
+        ReplySchema::OneOff(&projected),
+        0,
+        false,
+    );
     let frames = walk_frames(ptr);
     assert_eq!(frames.len(), 1);
     let decoded = ipc::decode_wire_ipc(&frames[0].1).expect("decode projected reply");
@@ -863,7 +869,7 @@ fn a_projected_reply_carries_a_one_off_block() {
     // Oversized projected reply: the queued train holds the one-off block.
     let rows = (ipc::FRAME_CAP / 32) + 4096;
     let big = Batch::zeroed(projected, rows);
-    wp.send_scan_response(route(tid as u64, 6, 0), big, ReplySchema::OneOff(&projected), 0);
+    wp.send_scan_response(route(tid as u64, 6, 0), big, ReplySchema::OneOff(&projected), 0, false);
     assert_eq!(wp.pending_streams.len(), 1);
     let expected_block = crate::catalog::encode_schema_block_ipc(&projected, tid as u32);
     let ps = wp.pending_streams.front().unwrap();

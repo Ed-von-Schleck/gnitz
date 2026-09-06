@@ -233,9 +233,6 @@ impl MasterDispatcher {
     /// changes (DROP TABLE, DROP/CREATE INDEX).
     pub(crate) fn unique_filter_invalidate_table(&self, table_id: i64) {
         self.unique_filters.borrow_mut().retain(|&(t, _), _| t != table_id);
-        // The check-batch pool is a pure allocation cache; drop every slot of the
-        // dropped table so it doesn't leak across DDL cycles.
-        self.check_batch_pool.borrow_mut().retain(|&(t, _), _| t != table_id);
     }
 
     /// Remove the unique-filter entry for a single (owner_table_id, packed)

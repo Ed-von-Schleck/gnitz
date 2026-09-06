@@ -347,10 +347,10 @@ gnitz_wire::wire_enum! {
         ExchangeRelay = 5,
         /// Initial full-source scan feeding a newly created view.
         Backfill = 6,
+        /// Probe a relation's PK store or one of its secondary indexes for a
+        /// scattered/broadcast key list; `WireProbeMode` names what a matched
+        /// key is answered with, up to and including one projected column.
         HasPk = 7,
-        /// Read the stored rows for a scattered set of PKs, projected to the
-        /// column in `seek_col_idx`.
-        Gather = 8,
         /// CREATE UNIQUE INDEX pre-flight: stream the sorted key spans of the
         /// column list in `seek_col_idx` for the master's merge.
         UniquePreflight = 9,

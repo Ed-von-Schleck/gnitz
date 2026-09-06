@@ -25,18 +25,19 @@ use crate::runtime::tls::{TlsListener, TlsShared};
 use gnitz_store::foundation::fault::Seam;
 
 use self::ddl::{commit_serial_range_durable, handle_ddl_txn, hold_relay_for_ddl, RELAY_HOLD_FOR_DDL};
+use super::TxnFamily;
 use crate::catalog::{CatalogEngine, FIRST_USER_TABLE_ID};
 use crate::runtime::committer::{self, BarrierKind, CommitRequest, PendingPush, PendingTxn};
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::{
     await_worker_acks, dispatch_scan_multi_fanout, exchange::ExchangeAccumulator, read_fanout, Fanout,
-    MasterDispatcher, TxnFamily, WorkerFault,
+    MasterDispatcher, WorkerFault,
 };
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{
     chan, oneshot, select2, AsyncRwLock, Either, Reactor, ReadGuard, ReplyFuture, WriteGuard,
 };
-use crate::runtime::sal::{GroupTargets, SalFit, SalMessageKind};
+use crate::runtime::sal::{DirectGroup, GroupTargets, SalFit, SalMessageKind};
 use crate::runtime::wire::{self as ipc, validate_schema_match, BACKFILL_DECISION_CONTINUE};
 use gnitz_store::relation::RelationKind;
 use gnitz_store::schema::SchemaDescriptor;
@@ -2164,21 +2165,34 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
     let (dispatches, plans) = {
         let _cat = cat;
         let mut plans: Vec<ScanMultiRelPlan> = Vec::with_capacity(relations.len());
-        let mut fanout: Vec<(i64, Fanout, u16)> = Vec::with_capacity(relations.len());
+        let mut fanout: Vec<Fanout> = Vec::with_capacity(relations.len());
         for &(tid_u, client_ver) in &relations {
             let tid = tid_u as i64;
             // Base tables AND views are legal; `UserRead` refuses a catalog
             // family, which stays on the plain path that serves it
             // master-locally.
             target_kind(shared, tid, Access::UserRead)?;
-            let unicast = read_fanout(shared.disp(), tid, None);
+            fanout.push(read_fanout(shared.disp(), tid, None));
             // Capture (not emit) each relation's preliminary schema frame here so
             // Phase 2 can send it after the one-cut dispatch, in request order.
             let (server_version, block) = schema_block_for_reply(shared, tid, client_ver);
             plans.push(ScanMultiRelPlan { tid, server_version, block });
-            fanout.push((tid, unicast, server_version));
         }
-        let dispatches = dispatch_scan_multi_fanout(shared.disp(), &shared.reactor, client_id, &fanout).await?;
+        let disp = shared.disp();
+        let dispatches = dispatch_scan_multi_fanout(disp, &shared.reactor, &fanout, |i, targets, wire_flags| {
+            let plan = &plans[i];
+            disp.write_group(&DirectGroup {
+                template: ipc::WireMsg {
+                    target_id: plan.tid as u64,
+                    client_id,
+                    flags: gnitz_wire::wire_flags_set_schema_version(wire_flags, plan.server_version),
+                    ..Default::default()
+                },
+                targets,
+                ..DirectGroup::new(SalMessageKind::Scan)
+            })
+        })
+        .await?;
         // Release the catalog read lock here: Phase 2 touches no catalog state
         // (the snapshot is worker-frozen and the schemas are captured), so
         // holding it across the whole bulk read would needlessly block DDL.

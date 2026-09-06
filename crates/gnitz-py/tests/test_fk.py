@@ -1366,3 +1366,100 @@ def test_fk_enforced_under_concurrent_push_and_delete(server):
     finally:
         with gnitz.connect(server) as c:
             _cleanup(c, sn, "child", "parent")
+
+
+class TestFkRestrictAtScale:
+    """RESTRICT over more referenced values than one write used to be allowed to
+    ask about."""
+
+    def test_transactional_child_then_parent_delete_over_a_thousand_values(self, client):
+        """`DELETE FROM child; DELETE FROM parent;` in one transaction, over
+        1500 referenced values that each still have a committed child.
+
+        The check is bounded by the write's own row count, not by the number of
+        values it asks about: every committed holder the probe returns is a row
+        the same bundle retires, and the per-value holder cap the worker honours
+        is the bundle's child-row count. Deleting leaf-first in one atomic
+        statement pair is the natural spelling, so it must simply work.
+        """
+        n = 1500
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE child ("
+                "  cid BIGINT NOT NULL PRIMARY KEY,"
+                "  pid BIGINT NOT NULL REFERENCES parent(id)"
+                ")",
+                schema_name=sn,
+            )
+            for lo in range(0, n, 500):
+                hi = min(lo + 500, n)
+                client.execute_sql(
+                    "INSERT INTO parent VALUES "
+                    + ", ".join(f"({i}, {i * 7})" for i in range(lo, hi)),
+                    schema_name=sn,
+                )
+                client.execute_sql(
+                    "INSERT INTO child VALUES "
+                    + ", ".join(f"({i}, {i})" for i in range(lo, hi)),
+                    schema_name=sn,
+                )
+            parent_tid, _ = client.resolve_table(sn, "parent")
+            child_tid, _ = client.resolve_table(sn, "child")
+            assert len(client.scan(parent_tid)) == n
+
+            client.execute_sql(
+                "BEGIN; DELETE FROM child; DELETE FROM parent; COMMIT",
+                schema_name=sn,
+            )
+            assert len(client.scan(child_tid)) == 0
+            assert len(client.scan(parent_tid)) == 0
+        finally:
+            _cleanup(client, sn, "child", "parent")
+
+    def test_parent_delete_still_rejected_when_one_child_survives(self, client):
+        """The same shape with a single child left behind: the bundle exempts
+        every holder it retires and the one it does not is fatal, whichever
+        order the workers answer in."""
+        n = 1200
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE TABLE child ("
+                "  cid BIGINT NOT NULL PRIMARY KEY,"
+                "  pid BIGINT NOT NULL REFERENCES parent(id)"
+                ")",
+                schema_name=sn,
+            )
+            for lo in range(0, n, 400):
+                hi = min(lo + 400, n)
+                client.execute_sql(
+                    "INSERT INTO parent VALUES "
+                    + ", ".join(f"({i}, {i * 7})" for i in range(lo, hi)),
+                    schema_name=sn,
+                )
+                client.execute_sql(
+                    "INSERT INTO child VALUES "
+                    + ", ".join(f"({i}, {i})" for i in range(lo, hi)),
+                    schema_name=sn,
+                )
+            parent_tid, _ = client.resolve_table(sn, "parent")
+
+            with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+                client.execute_sql(
+                    "BEGIN; DELETE FROM child WHERE cid <> 777; DELETE FROM parent; COMMIT",
+                    schema_name=sn,
+                )
+            assert len(client.scan(parent_tid)) == n
+        finally:
+            _cleanup(client, sn, "child", "parent")

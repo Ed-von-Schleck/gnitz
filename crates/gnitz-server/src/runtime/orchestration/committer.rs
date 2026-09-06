@@ -26,7 +26,8 @@
 
 use super::executor::{request_drain, request_quiesce, Shared};
 use super::guard_panic;
-use crate::runtime::master::{await_worker_acks, first_worker_error_opt, TxnFamily};
+use super::TxnFamily;
+use crate::runtime::master::{await_worker_acks, first_worker_error_opt};
 use crate::runtime::reactor::{chan, join_into, oneshot, select2, Either, ReplyFuture, ReplyLease};
 use crate::runtime::sal::{GroupTargets, SalMessageKind};
 use crate::runtime::wire::DecodedWire;

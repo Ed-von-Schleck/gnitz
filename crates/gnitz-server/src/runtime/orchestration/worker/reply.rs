@@ -141,8 +141,8 @@ impl WorkerProcess {
     }
 
     /// Emit `result` as one frame carrying no train flags — the shape whose
-    /// consumers (`expect_single_frame` for Seek, `execute_pipeline` for HasPk)
-    /// reject a train rather than drain one.
+    /// consumer (`expect_single_frame`, for Seek) rejects a train rather than
+    /// drain one.
     ///
     /// So it cannot split: a seek's result is unbounded (a view key names its
     /// whole PK group) and past [`FRAME_CAP`] no client can read the frame, so
@@ -180,23 +180,28 @@ impl WorkerProcess {
     ///
     /// The fit is tested by reference, so the single-frame case never reaches
     /// `Rc::new`; [`Self::send_shared_scan_response`] is for a caller that
-    /// genuinely shares.
+    /// genuinely shares. `force_fifo` queues even a fitting reply, so this
+    /// request reaches the ring in request order — see
+    /// `dispatch_scan_multi_fanout`, which owns that flag.
     pub(super) fn send_scan_response(
         &mut self,
         route: ReplyRoute,
         batch: Batch,
         schema: ReplySchema<'_>,
         client_version: u16,
+        force_fifo: bool,
     ) {
         let (block, version) = self.reply_schema_block(route.target_id as i64, schema, client_version);
-        if emit_whole_if_fits(
-            &self.w2m_writer,
-            route,
-            block.as_deref().map(Vec::as_slice),
-            version,
-            &batch,
-            self.reply_frame_budget,
-        ) {
+        if !force_fifo
+            && emit_whole_if_fits(
+                &self.w2m_writer,
+                route,
+                block.as_deref().map(Vec::as_slice),
+                version,
+                &batch,
+                self.reply_frame_budget,
+            )
+        {
             return;
         }
         self.queue_train(route, Rc::new(batch), block, version);
@@ -367,9 +372,9 @@ pub(crate) fn send_unique_preflight_keys(
         let n = keys.remaining().min(keys_per_frame);
         for _ in 0..n {
             let k = keys.next().expect("producer lends `remaining` spans");
-            // The span is already OPK; the raw bytes go into the PK region
-            // (len == pk_stride). The master reads them back verbatim via
-            // `mb.get_pk_bytes(row)` → `PkBuf` — the wire is byte-transparent.
+            // The span is already OPK and `len == pk_stride`, so it lands in
+            // the PK region unchanged; `merge_index_scan` states what that
+            // buys.
             chunk.push_key_row(k, 1);
         }
         let is_last = keys.remaining() == 0;

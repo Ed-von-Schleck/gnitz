@@ -66,7 +66,6 @@ impl MasterDispatcher {
             w2m,
             catalog,
             unique_filters: RefCell::new(FxHashMap::default()),
-            check_batch_pool: RefCell::new(FxHashMap::default()),
             last_ephemeral_gen: Cell::new(last_ephemeral_gen),
             tick_round: Cell::new(1),
             last_delta_round: RefCell::new(FxHashMap::default()),
@@ -109,10 +108,6 @@ impl MasterDispatcher {
         wire::WireSchema::from_catalog(self.cat(), target_id, self.schema_desc_for(target_id))
     }
 
-    pub(super) fn pool_pop_batch(&self, slot: super::preflight::PoolSlot) -> Option<Batch> {
-        self.check_batch_pool.borrow_mut().get_mut(&slot).and_then(|v| v.pop())
-    }
-
     // -----------------------------------------------------------------------
     // Core send/receive helpers
     // -----------------------------------------------------------------------
@@ -120,7 +115,7 @@ impl MasterDispatcher {
     /// Write one SAL group and nothing else — no signal, no ack collection. The
     /// one writer that turns a refusal into the client-facing `SAL full` fault;
     /// the scatter writers hand the raw [`SalFit`] to the committer instead.
-    pub(super) fn write_group(&self, g: &DirectGroup) -> Result<(), WorkerFault> {
+    pub(crate) fn write_group(&self, g: &DirectGroup) -> Result<(), WorkerFault> {
         self.sal.write(g).map_err(|fit| fit.refusal(g.kind))
     }
 

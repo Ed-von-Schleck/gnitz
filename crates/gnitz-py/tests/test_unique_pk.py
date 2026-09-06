@@ -1,5 +1,7 @@
 """E2E tests for base-table UPSERT/DELETE-by-PK enforcement."""
 
+import pytest
+
 import gnitz
 from _uid import uid as _uid
 
@@ -183,3 +185,33 @@ def test_delete_updates_view(client):
     client.drop_view(sn, "v")
     client.drop_table(sn, "t")
     client.drop_schema(sn)
+
+
+def test_sql_insert_duplicate_on_a_clustered_table_is_rejected(client):
+    """The Error-mode PK probe is SCATTERED by the key, so it must partition at
+    the table's own router width. `CLUSTER BY a` hashes a proper prefix of the
+    PK; a probe routed at the default full-PK width lands on a worker that does
+    not store the key, comes back empty, and the duplicate commits silently —
+    with no error anywhere, since the probe schema's equality ignores placement.
+    """
+    sn = "s" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT NOT NULL, v BIGINT NOT NULL, "
+            "PRIMARY KEY (a, b)) CLUSTER BY a",
+            schema_name=sn)
+        # Several distinct `a` values, so the prefix hash spreads over the
+        # cluster and a full-PK hash of the same keys lands elsewhere.
+        rows = ", ".join(f"({a}, {b}, {a * 100 + b})" for a in range(8) for b in range(4))
+        client.execute_sql(f"INSERT INTO t VALUES {rows}", schema_name=sn)
+        tid, _ = client.resolve_table(sn, "t")
+        assert len(client.scan(tid)) == 32
+
+        for a, b in [(0, 0), (3, 2), (7, 3)]:
+            with pytest.raises(gnitz.GnitzError, match="(?i)duplicate key"):
+                client.execute_sql(f"INSERT INTO t VALUES ({a}, {b}, -1)", schema_name=sn)
+        assert len(client.scan(tid)) == 32
+    finally:
+        client.execute_sql("DROP TABLE t", schema_name=sn)
+        client.drop_schema(sn)

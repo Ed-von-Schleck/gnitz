@@ -205,9 +205,8 @@ def test_views_track_base_under_sustained_ingest_with_scans(checkpoint_server):
 # Liveness regressions: fan-out ops must not hang during concurrent checkpoints
 # ---------------------------------------------------------------------------
 #
-# Before the fix, fan_out_seek_async, fan_out_scan_async, and
-# execute_pipeline_async did not hold sal_writer_excl while writing their SAL
-# group.  A request arriving in the Flush ACK-wait window wrote with the
+# Before the fix, the seek, scan and constraint-probe fan-outs did not hold
+# sal_writer_excl while writing their SAL group.  A request arriving in the Flush ACK-wait window wrote with the
 # old epoch; workers skipped it; the operation hung forever.
 #
 # Each test below uses two connections in separate threads: a pusher that

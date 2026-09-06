@@ -571,6 +571,26 @@ impl ReadCursor {
         self.for_each_positive_while(|pk| pk.starts_with(prefix), f);
     }
 
+    /// [`Self::for_each_positive_with_prefix`] stopping once `f` has been
+    /// invoked `max` times. A non-unique index's span names every row holding
+    /// the value, so a caller with a row budget pays for what it returns rather
+    /// than for the whole group.
+    pub fn for_each_positive_with_prefix_capped<F: FnMut(&ReadCursor)>(&mut self, prefix: &[u8], max: usize, mut f: F) {
+        if max == 0 || !self.seek_first_positive_with_prefix(prefix) {
+            return;
+        }
+        // `cont` is `Fn`, and runs before each row including the ones the weight
+        // gate drops, so the count lives in a `Cell` and is bumped by `f`.
+        let taken = std::cell::Cell::new(0usize);
+        self.for_each_positive_while(
+            |pk| pk.starts_with(prefix) && taken.get() < max,
+            |c| {
+                f(c);
+                taken.set(taken.get() + 1);
+            },
+        );
+    }
+
     /// [`Self::for_each_row_while`] with the weight gate applied — the one place
     /// the two positive-row walks below spell `current_weight > 0`.
     fn for_each_positive_while<C: Fn(&[u8]) -> bool, F: FnMut(&ReadCursor)>(&mut self, cont: C, mut f: F) {

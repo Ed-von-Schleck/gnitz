@@ -5,7 +5,7 @@
 //! buffered ops layered over the committed store. `TxnBuffer` indexes each
 //! buffered row by PK as it arrives (`last_op`/`last_ops`), so the fold here is
 //! a read of that index — the last op per PK, `Present`/`Deleted` by weight sign
-//! (mirroring the engine's `fold_family`).
+//! (mirroring the engine's own per-table fold).
 //!
 //! [`effective_rows`] returns **owned** rows so the caller can then borrow the
 //! client mutably (gather, push) with no buffer borrow outstanding. The map-based

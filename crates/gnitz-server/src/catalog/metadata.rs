@@ -227,9 +227,8 @@ impl CatalogEngine {
     /// Format a unique-index constraint violation naming the qualified table and
     /// offending column(s). `in_batch` appends the "duplicate in batch" qualifier
     /// used when two rows of one ingest batch collide, versus a collision with
-    /// already-committed data. Single source of truth for this message — the
-    /// distributed path (`MasterDispatcher`) delegates here. A composite index
-    /// passes its full `col_indices`, joined as `(a, b)`.
+    /// already-committed data. A composite index passes its full `col_indices`,
+    /// joined as `(a, b)`.
     pub(crate) fn unique_violation_err(&mut self, table_id: i64, col_indices: &[u32], in_batch: bool) -> String {
         let (sn, tn, col) = self.qualified_col_names(table_id, col_indices);
         if in_batch {
@@ -270,7 +269,7 @@ impl CatalogEngine {
     }
 
     /// Format "an inserted child row references a value the parent does not
-    /// hold". Shared by the inline DDL-time check and the distributed pre-flight.
+    /// hold".
     pub(crate) fn fk_missing_err(&self, child_tid: i64, parent_tid: i64) -> String {
         let (sn, tn) = self.qualified_name_or_unknown(child_tid);
         let (tsn, ttn) = self.qualified_name_or_unknown(parent_tid);

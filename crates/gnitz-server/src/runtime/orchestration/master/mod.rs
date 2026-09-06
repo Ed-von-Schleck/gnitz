@@ -99,14 +99,6 @@ pub struct MasterDispatcher {
     /// block.
     unique_filters: RefCell<FxHashMap<(i64, u64), UniqueFilter>>,
 
-    /// Pool of `Batch`es reused by the check builders for FK / unique-index
-    /// validation, keyed per probe target and key columns (see
-    /// `PipelinedCheck::pool_slot`). After the awaited pipeline returns,
-    /// `reclaim_check_batches` pushes each check's batch back here; the next
-    /// probe on the same slot reuses it via `clear` + reload. Schema staleness
-    /// (DDL between bursts) is still checked at pop time.
-    check_batch_pool: RefCell<FxHashMap<preflight::PoolSlot, Vec<Batch>>>,
-
     /// The generation the last ephemeral round stamped. Set unconditionally, so
     /// `derived_needs_restamp` reads it in release builds too.
     last_ephemeral_gen: Cell<u64>,
@@ -178,8 +170,9 @@ mod dispatch;
 mod preflight;
 mod train;
 mod unique_filter;
+mod unique_preflight;
 
-pub(crate) use preflight::TxnFamily;
+use super::TxnFamily;
 use train::{drain_index_scan, expect_single_frame, forward_scan_slots, parse_train_header, scan_decode_err};
 pub(crate) use unique_filter::UniqueFilter;
 
@@ -239,7 +232,7 @@ pub(crate) async fn await_worker_acks(
 }
 
 /// Which workers a scan-shaped dispatch goes to, before any request id exists.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub(crate) enum Fanout {
     /// Every worker; each answers for the rows it owns. One distinct scan
     /// request id per worker, and `nw` replies awaited in worker order.
@@ -320,11 +313,6 @@ impl ScanDispatch {
         }
     }
 
-    /// Replies to expect, in arrival order — one per written slot.
-    pub(crate) fn reply_count(&self) -> usize {
-        self.n
-    }
-
     /// Reply `i`: the worker that produced it, and the request id it arrives on.
     pub(crate) fn reply(&self, i: usize) -> (usize, u64) {
         (self.worker.unwrap_or(i), self.ids[i])
@@ -333,10 +321,8 @@ impl ScanDispatch {
     /// Await the first reply slot of every worker this scan dispatched to, in
     /// reply order.
     pub(crate) async fn await_slots(&self, reactor: &crate::runtime::reactor::Reactor) -> Vec<W2mSlot> {
-        crate::runtime::reactor::join_all_unpin(
-            (0..self.reply_count()).map(|i| reactor.await_scan_slot(self.reply(i).1 as u32)),
-        )
-        .await
+        crate::runtime::reactor::join_all_unpin((0..self.n).map(|i| reactor.await_scan_slot(self.reply(i).1 as u32)))
+            .await
     }
 
     /// Await this scan's replies and forward every worker's train to the client
@@ -363,7 +349,7 @@ impl ScanDispatch {
 /// without an intermediate decode/copy.
 ///
 /// `unicast` selects the shape ([`Fanout`] states what each costs). The
-/// returned `Vec` holds one slot per [`ScanDispatch::reply_count`], in the same
+/// returned `Vec` holds one slot per reply this scan expects, in the same
 /// order.
 ///
 /// `sal_excl` is held only for the synchronous write + signal phase and
@@ -394,56 +380,50 @@ where
     Ok((slots, scan))
 }
 
-/// One SAL cut across N relations: write all N scan groups back-to-back under a
-/// single `sal_writer_excl` hold, then return each relation's dispatch handle.
-/// The read-side sibling of `commit_pushes`'s "N groups under one hold" — the
-/// mutual exclusion both forces the one cut (no push / tick / commit-zone group
-/// can land between the scan groups, so every worker snapshots all N relations
-/// at the same SAL position) and, as a side effect, serialises two concurrent
-/// multi-scans.
+/// One SAL cut across N scan-shaped requests: write all N groups back-to-back
+/// under a single `sal_writer_excl` hold, then return each one's dispatch
+/// handle. The read-side sibling of `commit_pushes`'s "N groups under one hold"
+/// — the mutual exclusion forces the one cut, so every worker snapshots all N
+/// at the same SAL position.
 ///
 /// Deliberately NOT a loop over `dispatch_scan_fanout`: that re-locks per call,
-/// so N calls would reopen the lock N times and destroy the one cut. This awaits
-/// nothing — the lock is held only for the synchronous write + signal, and the
-/// caller drains each relation's reply train sequentially in request order (the
-/// `FLAG_SCAN_FIFO_REPLY` contract). Every group carries that flag so workers
-/// queue the reply in request order.
+/// which would destroy the cut.
 ///
-/// `relations` gives, per relation in request order, `(tid, routing,
-/// effective_client_version)`; returns one [`ScanDispatch`] per relation in the
-/// same order.
-pub(crate) async fn dispatch_scan_multi_fanout(
+/// `submit` writes request `i`'s group to `targets`, and MUST carry the `flags`
+/// word it is handed: at N > 1 that is `FLAG_SCAN_FIFO_REPLY`, without which
+/// ring order can differ from request order and the drain deadlocks (see the
+/// worker's `pending_streams`). At N = 1 there is nothing to misorder, so the
+/// flag is not stamped and a fitting reply keeps the inline path.
+pub(crate) async fn dispatch_scan_multi_fanout<F>(
     disp: &MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,
-    client_id: u64,
-    relations: &[(i64, Fanout, u16)],
-) -> Result<Vec<ScanDispatch>, WorkerFault> {
+    fanouts: &[Fanout],
+    mut submit: F,
+) -> Result<Vec<ScanDispatch>, WorkerFault>
+where
+    F: FnMut(usize, GroupTargets<'_>, u64) -> Result<(), WorkerFault>,
+{
     let nw = disp.num_workers();
-    // Allocate ids + register every relation's lease BEFORE the lock (no await
+    // Allocate ids + register every request's lease BEFORE the lock (no await
     // between here and the write).
-    let dispatches: Vec<ScanDispatch> = relations
+    let dispatches: Vec<ScanDispatch> = fanouts
         .iter()
-        .map(|&(_tid, unicast, _ver)| ScanDispatch::alloc(reactor, nw, unicast))
+        .map(|&unicast| ScanDispatch::alloc(reactor, nw, unicast))
         .collect();
+    let fifo = if fanouts.len() > 1 {
+        gnitz_wire::FLAG_SCAN_FIFO_REPLY
+    } else {
+        0
+    };
 
-    // One hold: write every scan group at a consecutive `write_cursor` position,
-    // then signal once. The reactor is single-threaded and each write has no
+    // One hold: write every group at a consecutive `write_cursor` position, then
+    // signal once. The reactor is single-threaded and each write has no
     // `.await`, so the groups land contiguously — the single cut. The lock
     // releases at block end, before the caller's first await.
     {
         let _guard = disp.sal_excl().lock().await;
-        for (&(tid, _unicast, eff_ver), d) in relations.iter().zip(&dispatches) {
-            let wire_flags = gnitz_wire::wire_flags_set_schema_version(0, eff_ver) | gnitz_wire::FLAG_SCAN_FIFO_REPLY;
-            disp.write_group(&DirectGroup {
-                template: wire::WireMsg {
-                    target_id: tid as u64,
-                    client_id,
-                    flags: wire_flags,
-                    ..Default::default()
-                },
-                targets: d.targets(),
-                ..DirectGroup::new(SalMessageKind::Scan)
-            })?;
+        for (i, d) in dispatches.iter().enumerate() {
+            submit(i, d.targets(), fifo)?;
         }
         disp.signal_all();
     }

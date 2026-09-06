@@ -1,6 +1,7 @@
 use std::rc::Rc;
 
 use crate::catalog::CatalogEngine;
+use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{Batch, BatchBuilder};
 use gnitz_wire::type_code;
@@ -9,6 +10,13 @@ use super::MasterDispatcher;
 use crate::runtime::sal::SalWriter;
 use crate::runtime::test_support::SharedRegion;
 use crate::runtime::w2m::W2mReceiver;
+
+/// The OPK leading-key span of an unsigned integer value at `width` bytes —
+/// unsigned OPK is plain big-endian, so this is exactly what `key_bytes`
+/// produces for an index column promoted to that width.
+pub(super) fn span_uint(v: u128, width: usize) -> PkBuf {
+    PkBuf::from_bytes(&v.to_be_bytes()[16 - width..])
+}
 
 /// PK U64 at index 0, one **nullable** payload U64 at index 1.
 pub(super) fn two_col_schema() -> SchemaDescriptor {

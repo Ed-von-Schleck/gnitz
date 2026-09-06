@@ -35,13 +35,7 @@ enum HasPkLookup {
     /// multi-column; a composite index is located by its exact list). Unique and
     /// non-unique alike — rule F2 probes a child's FK auto-index, which is never
     /// unique.
-    SecondaryIndex {
-        cols: gnitz_wire::PkColList,
-        /// Answer each match with the matched STORED entry key
-        /// (`[span ‖ holder PK]`) instead of echoing the probe key — see
-        /// `HAS_PK_WANT_HOLDER`.
-        want_holder: bool,
-    },
+    SecondaryIndex { cols: gnitz_wire::PkColList },
 }
 
 /// One dispatched request. Fully owned — a parked request must not borrow the
@@ -109,7 +103,6 @@ fn in_eval(kind: SalMessageKind) -> InEval {
         | SalMessageKind::ScanSpec
         | SalMessageKind::Seek
         | SalMessageKind::SeekByIndex
-        | SalMessageKind::Gather
         | SalMessageKind::HasPk
         | SalMessageKind::UniquePreflight
         | SalMessageKind::Backfill
@@ -299,8 +292,8 @@ enum ReplySchema<'a> {
     /// The target's own schema: the reply serves and populates the table's
     /// cached block, and negotiates its version against the client's.
     Table(&'a SchemaDescriptor),
-    /// A projected or synthetic schema — Gather's projection, HasPk
-    /// UniqueIndex's index schema. Built fresh per reply and never cached:
+    /// A projected or synthetic schema — every `HasPk` reply, whose shape is
+    /// the probe's, not the table's. Built fresh per reply and never cached:
     /// the table's block would decode these rows at the wrong stride, and
     /// caching theirs would poison the table's. Unchecksummed, so only for a
     /// reply the master consumes — its ring decode verifies none.
@@ -588,49 +581,24 @@ impl WorkerProcess {
             }
 
             SalMessageKind::HasPk => {
-                // A zero column-list word is the PK sentinel; `pack_pk_cols` always
-                // sets bit 63, so a real index check never collides with it.
-                let lookup = match gnitz_wire::pk_cols_word(seek_col_idx) {
-                    0 => HasPkLookup::PrimaryKey,
-                    packed => HasPkLookup::SecondaryIndex {
+                let lookup = match gnitz_wire::probe_key_columns(seek_col_idx) {
+                    None => HasPkLookup::PrimaryKey,
+                    Some(packed) => HasPkLookup::SecondaryIndex {
                         cols: self.cat().registry().index_cols(target_id, packed, "has_pk")?,
-                        want_holder: seek_col_idx & gnitz_wire::HAS_PK_WANT_HOLDER != 0,
                     },
                 };
-                self.handle_has_pk(route, batch, lookup)
-            }
-
-            SalMessageKind::Gather => {
-                // The projected column index rides in `seek_col_idx`. The PK
-                // batch arrives in `data_batch` (a worker with an empty
-                // sublist still replies — the master joins one reply per
-                // worker). PKs come pre-sorted from the master's global sort
-                // (scatter preserves per-worker order), aiding the cursor.
-                let ref_col = seek_col_idx as u8;
-                // The batch PK region holds verbatim OPK bytes (the master packs
-                // them via `extend_pk_bytes`), so lend them to the seek directly,
-                // at every PK width. Round-tripping a narrow key back through
-                // `get_pk` → `opk_key` would re-OPK-encode it (double sign-flip
-                // for signed; scrambled compound bytes), probing a key that
-                // matches no stored row.
-                let (result, schema) = match batch.as_ref() {
-                    Some(b) => {
-                        let keys = (0..b.len()).map(|i| b.get_pk_bytes(i));
-                        self.cat()
-                            .registry_mut()
-                            .gather_family_bytes(target_id, keys, ref_col)?
-                    }
-                    // A worker with an empty sublist still replies — the master
-                    // joins one reply per worker.
-                    None => self
-                        .cat()
-                        .registry_mut()
-                        .gather_family_bytes(target_id, std::iter::empty(), ref_col)?,
-                };
-                // The projected reply schema is synthetic — never the
-                // table's cached block.
-                self.send_scan_response(route, result, ReplySchema::OneOff(&schema), 0);
-                Ok(())
+                // A trust boundary: bits naming no mode are refused, never
+                // defaulted, exactly as the conflict mode is.
+                let mode = gnitz_wire::wire_flags_get_probe_mode(ctrl_wire_flags)
+                    .ok_or("has_pk: frame names no probe mode")?;
+                // A multi-check burst carries FLAG_SCAN_FIFO_REPLY, so this
+                // reply is queued and ring order equals request order. That
+                // also puts it on `pending_streams`' queued side inside an
+                // exchange wait, behind whatever train is already there — the
+                // coupling the seek-collect and warm-up fan-outs already have,
+                // and not a deadlock: `relay_loop` takes no table lock.
+                let force_fifo = ctrl_wire_flags & gnitz_wire::FLAG_SCAN_FIFO_REPLY != 0;
+                self.handle_has_pk(route, batch, lookup, mode, seek_pk as usize, force_fifo)
             }
 
             SalMessageKind::Push => {
@@ -665,7 +633,7 @@ impl WorkerProcess {
                 // still carries the schema block its `validate_schema_match`
                 // guard reads.
                 let batch = result.unwrap_or_else(|| Batch::empty_with_schema(&schema));
-                self.send_scan_response(route, batch, ReplySchema::Table(&schema), 0);
+                self.send_scan_response(route, batch, ReplySchema::Table(&schema), 0, false);
                 Ok(())
             }
 
@@ -830,7 +798,7 @@ impl WorkerProcess {
             "delta reply carries a row above the cut {}",
             seek_pk as u64,
         );
-        self.send_scan_response(route, keeper, ReplySchema::ClientAuthored, 0);
+        self.send_scan_response(route, keeper, ReplySchema::ClientAuthored, 0, false);
         Ok(())
     }
 
@@ -1054,23 +1022,49 @@ impl WorkerProcess {
         Ok(())
     }
 
-    /// Answer one HasPk probe with the subset of its keys that exist committed
-    /// on this worker.
+    /// Answer one HasPk probe over the keys that exist committed on this
+    /// worker; `mode` decides what a match is answered with.
     ///
-    /// A match is rebuilt with `push_zero_filled_row`, not copied cell-by-cell.
-    /// Byte-identical here only: the master builds every probe row the same way,
-    /// so the payload is already zeros, and reads back weight and PK bytes only.
-    /// Version 0 reaches the reply, so its block always ships.
+    /// The request is key-only whichever keyspace it names, and the reply
+    /// carries the PROBE's schema as a one-off block — never the table's, which
+    /// `schema_wire_entry` would serve from cache at the wrong strides.
     fn handle_has_pk(
         &mut self,
         route: ReplyRoute,
         batch: Option<Batch>,
         lookup: HasPkLookup,
+        mode: gnitz_wire::WireProbeMode,
+        mode_param: usize,
+        force_fifo: bool,
     ) -> Result<(), gnitz_wire::WireFault> {
         let target_id = route.target_id as i64;
         let n = batch.as_ref().map_or(0, |b| b.len());
+        if let gnitz_wire::WireProbeMode::Project = mode {
+            // `seek_col_idx` is the PK sentinel here, so the column to project
+            // rides the per-mode parameter word instead.
+            if !matches!(lookup, HasPkLookup::PrimaryKey) {
+                return Err("has_pk: a projecting probe reads the table's own PK store".into());
+            }
+            let ref_col = mode_param as u8;
+            let (result, schema) = match batch.as_ref() {
+                Some(b) => {
+                    let keys = (0..b.len()).map(|i| b.get_pk_bytes(i));
+                    self.cat()
+                        .registry_mut()
+                        .gather_family_bytes(target_id, keys, ref_col)?
+                }
+                None => self
+                    .cat()
+                    .registry_mut()
+                    .gather_family_bytes(target_id, std::iter::empty(), ref_col)?,
+            };
+            // The projected reply schema is synthetic — never the table's
+            // cached block.
+            self.send_scan_response(route, result, ReplySchema::OneOff(&schema), 0, force_fifo);
+            return Ok(());
+        }
         match lookup {
-            HasPkLookup::SecondaryIndex { cols, want_holder } => {
+            HasPkLookup::SecondaryIndex { cols } => {
                 let (result, schema) = {
                     // One resolution of `(target_id, cols)`: the circuit carries
                     // the index table, its schema and the span width.
@@ -1092,29 +1086,54 @@ impl WorkerProcess {
                     // match only the zero high bytes. Width off the circuit's own
                     // key spec, so no width crosses the process boundary.
                     let idx_key_size = ic.key_spec.key_size();
-                    let mut result = Batch::with_capacity(schema, n);
+                    // Grown on demand, not reserved at the probe count: the
+                    // expected hit count on a fresh-key insert is zero, and
+                    // `with_capacity` bypasses the batch arena above 2 MiB.
+                    let mut result = Batch::empty_with_schema(&schema);
                     if let Some(b) = batch.as_ref() {
                         for i in 0..n {
                             let pkb = b.get_pk_bytes(i);
-                            if !cursor.seek_first_positive_with_prefix(&pkb[..idx_key_size]) {
-                                continue;
-                            }
+                            let prefix = &pkb[..idx_key_size];
                             // `[span ‖ holder PK]` verbatim: `IndexKeySpec::write_entry`
                             // wrote the source PK at `idx_key_size`, so the caller
                             // splits it back out without decoding anything.
-                            let key = if want_holder { cursor.current_pk_bytes() } else { pkb };
-                            result.push_zero_filled_row(key, 1, b.get_null_word(i));
+                            if let gnitz_wire::WireProbeMode::AllHolders = mode {
+                                // Capped, so one value's holder list cannot
+                                // outgrow the write that asked about it. `0`
+                                // would answer "no holders" for an occupied
+                                // span, so it floors at one.
+                                cursor.for_each_positive_with_prefix_capped(prefix, mode_param.max(1), |c| {
+                                    result.push_key_row(c.current_pk_bytes(), 1);
+                                });
+                                continue;
+                            }
+                            if !cursor.seek_first_positive_with_prefix(prefix) {
+                                continue;
+                            }
+                            let holder = matches!(mode, gnitz_wire::WireProbeMode::FirstHolder);
+                            result.push_key_row(if holder { cursor.current_pk_bytes() } else { pkb }, 1);
                         }
                     }
                     (result, schema)
                 };
                 // The index schema is not table `target_id`'s own — one-off block.
-                self.send_response(route, Some(&result), ReplySchema::OneOff(&schema), 0, 0)
+                self.send_scan_response(route, result, ReplySchema::OneOff(&schema), 0, force_fifo);
+                Ok(())
             }
             HasPkLookup::PrimaryKey => {
-                let schema = self.cat().registry().table_entry(target_id)?.schema;
+                // Off the probe batch, as the index arm does; a worker with an
+                // empty sublist still replies, and derives the same key-only
+                // image from its own catalog schema.
+                let schema = match batch.as_ref() {
+                    Some(b) => b.schema,
+                    None => {
+                        let table = self.cat().registry().table_entry(target_id)?.schema;
+                        gnitz_store::schema::project_schema(&table, &[]).expect("a PK-only projection fits MAX_COLUMNS")
+                    }
+                };
                 let store = self.cat().registry().entry(target_id).and_then(|e| e.owned_store());
-                let mut result = Batch::with_capacity(schema, n);
+                // Grown on demand — see the index arm above.
+                let mut result = Batch::empty_with_schema(&schema);
                 if let Some(b) = batch.as_ref() {
                     for i in 0..n {
                         // Route on verbatim OPK bytes for every PK width: feeding
@@ -1122,11 +1141,12 @@ impl WorkerProcess {
                         // it, a double sign-flip that misses signed PKs.
                         let pkb = b.get_pk_bytes(i);
                         if store.is_some_and(|t| t.has_pk_bytes(pkb)) {
-                            result.push_zero_filled_row(pkb, 1, b.get_null_word(i));
+                            result.push_key_row(pkb, 1);
                         }
                     }
                 }
-                self.send_response(route, Some(&result), ReplySchema::Table(&schema), 0, 0)
+                self.send_scan_response(route, result, ReplySchema::OneOff(&schema), 0, force_fifo);
+                Ok(())
             }
         }
     }

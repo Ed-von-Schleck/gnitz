@@ -1,11 +1,11 @@
-use super::super::fixtures::{make_row_batch, test_dispatcher, two_col_schema};
-use super::super::preflight::PreflightAccumulator;
+use super::super::fixtures::{make_row_batch, span_uint, test_dispatcher, two_col_schema};
+use super::super::unique_preflight::PreflightAccumulator;
 use super::*;
 
 /// The OPK leading-key span of a single U64 value — what `key_bytes` produces
 /// for a U64-promoted index column.
 fn span_u64(v: u64) -> PkBuf {
-    PkBuf::from_bytes(&v.to_be_bytes())
+    span_uint(v as u128, 8)
 }
 
 /// Span-extraction spec for a unique index on `cols`, promoted exactly as

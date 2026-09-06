@@ -48,7 +48,7 @@ pub(super) fn parse_train_header(
 /// where a train ends.
 ///
 /// Every producer sets `FLAG_CONTINUATION` on every frame and `FLAG_SCAN_LAST`
-/// on the last, a one-frame train included: worker scan/gather/index-seek
+/// on the last, a one-frame train included: worker scan/probe/index-seek
 /// replies, unique pre-flight frames, and a worker's exchange partition. So a
 /// frame with neither flag is terminal — the single-frame `send_response` shape,
 /// and `send_error`'s fault frame, whose `0` flags would otherwise read as
@@ -76,7 +76,8 @@ pub(super) fn expect_single_frame(slot: &W2mSlot, w: usize, what: &str) -> Resul
 
 /// Drain every worker's train in worker order, invoking `on_batch` with the
 /// zero-copy `MemBatch` and the raw frame byte length of each non-empty frame.
-/// Shared by the unique-filter warmup and the collect paths (index seek, gather).
+/// Shared by the unique-filter warmup and the collect paths (index seek,
+/// constraint probe).
 ///
 /// Returns on the FIRST error — worker fault, corrupt frame, schema mismatch, or
 /// an `Err` from `on_batch` — without draining the rest. All callers hold the

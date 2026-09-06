@@ -5,9 +5,9 @@
 // Wire protocol flags
 // ---------------------------------------------------------------------------
 
-// Bits 0-15 hold the request verbs and the W2M exchange flag; bits 16-39 are
-// wire-level fields (conflict mode, schema version) encoded by the sender and
-// decoded by the receiver; bits 48+ are booleans.
+// Bits 0-15 hold the request verbs and the W2M exchange flag; bits 16-41 are
+// wire-level fields (conflict mode, schema version, probe mode) encoded by the
+// sender and decoded by the receiver; bits 48+ are booleans.
 
 pub const FLAG_EXCHANGE: u64 = 16;
 /// Marks a frame as a data push, on both the client→master and master→SAL/
@@ -127,7 +127,7 @@ pub const FLAG_BATCH_CONSOLIDATED: u64 = 1 << 51;
 pub const FLAG_SCAN_LAST: u64 = 1 << 53;
 
 // ---------------------------------------------------------------------------
-// Wire-level packed fields: bits 16-39 of wire_flags
+// Wire-level packed fields: bits 16-41 of wire_flags
 // ---------------------------------------------------------------------------
 
 /// Bits 16-23: conflict mode (8 bits). Value 0 = Update (default).
@@ -136,12 +136,16 @@ const WIRE_CONFLICT_MODE_MASK: u64 = 0xFF_u64 << WIRE_CONFLICT_MODE_SHIFT;
 /// Bits 24-39: schema version (16 bits). Value 0 = client has no cached schema.
 const WIRE_SCHEMA_VERSION_SHIFT: u32 = 24;
 const WIRE_SCHEMA_VERSION_MASK: u64 = 0xFFFF_u64 << WIRE_SCHEMA_VERSION_SHIFT;
+/// Bits 40-41: probe mode (2 bits) on a `HasPk` group. Value 0 = Exists.
+const WIRE_PROBE_MODE_SHIFT: u32 = 40;
+const WIRE_PROBE_MODE_MASK: u64 = 0x3_u64 << WIRE_PROBE_MODE_SHIFT;
 
 // Compile-time guard over the whole `u64`: no two flags may share a bit, and no
 // flag may land in the wire-level packed fields. One sweep over every flag
-// declared here, seeded with the two packed-field masks.
+// declared here, seeded with every packed-field mask.
 const _: () = {
     assert!(WIRE_CONFLICT_MODE_MASK & WIRE_SCHEMA_VERSION_MASK == 0);
+    assert!(WIRE_PROBE_MODE_MASK & (WIRE_CONFLICT_MODE_MASK | WIRE_SCHEMA_VERSION_MASK) == 0);
     let flags = [
         FLAG_EXCHANGE,
         FLAG_PUSH,
@@ -164,7 +168,7 @@ const _: () = {
         FLAG_SCAN_MULTI,
     ];
 
-    let mut acc = WIRE_CONFLICT_MODE_MASK | WIRE_SCHEMA_VERSION_MASK;
+    let mut acc = WIRE_CONFLICT_MODE_MASK | WIRE_SCHEMA_VERSION_MASK | WIRE_PROBE_MODE_MASK;
     let mut i = 0;
     while i < flags.len() {
         assert!(flags[i] & acc == 0, "wire flag bit collision");
@@ -239,7 +243,7 @@ const CLIENT_VERB_MASK: u64 = {
 // collision by the guard above; this covers the *derived* mask, which that guard
 // cannot see.
 const _: () = {
-    let packed = WIRE_CONFLICT_MODE_MASK | WIRE_SCHEMA_VERSION_MASK;
+    let packed = WIRE_CONFLICT_MODE_MASK | WIRE_SCHEMA_VERSION_MASK | WIRE_PROBE_MODE_MASK;
     assert!(CLIENT_VERB_MASK & packed == 0, "a verb bit lands in a packed field");
 
     let mut acc = 0u64;
@@ -262,6 +266,17 @@ pub fn wire_flags_set_conflict_mode(flags: u64, mode: WireConflictMode) -> u64 {
 #[inline]
 pub fn wire_flags_get_conflict_mode(flags: u64) -> Option<WireConflictMode> {
     WireConflictMode::from_wire(((flags & WIRE_CONFLICT_MODE_MASK) >> WIRE_CONFLICT_MODE_SHIFT) as u8)
+}
+#[inline]
+pub fn wire_flags_set_probe_mode(flags: u64, mode: WireProbeMode) -> u64 {
+    (flags & !WIRE_PROBE_MODE_MASK) | ((mode as u64) << WIRE_PROBE_MODE_SHIFT)
+}
+/// The probe mode packed into `flags`, or `None` when those bits name no mode.
+/// The worker is a trust boundary and must reject rather than default, exactly
+/// as it does for the conflict mode.
+#[inline]
+pub fn wire_flags_get_probe_mode(flags: u64) -> Option<WireProbeMode> {
+    WireProbeMode::from_wire(((flags & WIRE_PROBE_MODE_MASK) >> WIRE_PROBE_MODE_SHIFT) as u8)
 }
 #[inline]
 pub fn wire_flags_set_schema_version(flags: u64, version: u16) -> u64 {
@@ -297,6 +312,27 @@ wire_enum! {
         /// check, and returns a PG-style `duplicate key value violates
         /// unique constraint` error.
         Error = 1,
+    }
+}
+
+wire_enum! {
+    /// What a `HasPk` probe answers each matched key with, packed into bits
+    /// 40-41 of `wire_flags`. Discriminant 0 = `Exists`, so a zero-filled flags
+    /// word is the plain existence probe. It rides `wire_flags` so
+    /// `seek_col_idx` stays one thing: the keyspace to probe.
+    pub enum WireProbeMode: u8 {
+        /// Echo the probe key back; the caller asked only whether it is
+        /// occupied.
+        Exists = 0,
+        /// Answer with the matched STORED index entry `[span ‖ holder PK]`, so
+        /// the caller learns which committed row holds the span. Index only.
+        FirstHolder = 1,
+        /// [`Self::FirstHolder`] for EVERY committed holder of the span, capped
+        /// per value at the count in `seek_pk`. Index only.
+        AllHolders = 2,
+        /// Answer each matched key with that key plus ONE of the stored row's
+        /// columns, named by `seek_pk`. PK store only.
+        Project = 3,
     }
 }
 
