@@ -1606,9 +1606,8 @@ impl GnitzClient {
     /// `+1`. The `-1` reproduces the STORED name, which is what the engine's
     /// retraction CAS compares it against.
     ///
-    /// Takes a resolved `(tid, col_idx)` like its three ALTER siblings. The
-    /// collision check stays here: `alter_col_pair` resolves `tid` anyway, and
-    /// it is the trust boundary `alter_add_column` holds for the same reason.
+    /// Takes a resolved `(tid, col_idx)` like its three ALTER siblings; the check
+    /// stays here rather than in `alter_col_pair`, which resolves `tid` anyway.
     pub fn alter_rename_column(&mut self, tid: u64, col_idx: usize, new_col: &str) -> Result<(), ClientError> {
         let desc = self.describe_by_id(tid)?;
         if desc.schema.visible_column_named(new_col).is_some_and(|i| i != col_idx) {
@@ -1648,11 +1647,8 @@ impl GnitzClient {
     /// Deliberately not through [`Self::alter_col_pair`], whose whole job is
     /// reproducing a live row at `-1`; an append has no live row.
     ///
-    /// The visible-name collision check lives here rather than in the SQL layer
-    /// because `gnitz-core` is also the non-SQL entry point the Python binding
-    /// reaches, and the engine precheck does not scan COL_TAB for names — a
-    /// duplicate would otherwise reach storage and only surface later as
-    /// "column reference is ambiguous".
+    /// The visible-name check is local, and here rather than in the SQL layer
+    /// because `gnitz-core` is also the non-SQL entry point.
     pub fn alter_add_column(&mut self, tid: u64, def: &ColumnDef) -> Result<(), ClientError> {
         let desc = self.describe_by_id(tid)?;
         reject_non_base_table(&desc, "ADD COLUMN")?;

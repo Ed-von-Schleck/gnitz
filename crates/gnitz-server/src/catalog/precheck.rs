@@ -3,14 +3,9 @@
 //! runs it as its own step so a precheck rejection (which wrote nothing) stays
 //! distinguishable from a post-apply failure (which must be compensated).
 //!
-//! Eight paths write without it — boot shard replay, SAL recovery, worker
-//! `ddl_sync`, `submit_cascade`, Stage-A compensation, the FK auto-index's
-//! `submit_local`, `bootstrap_ingest` and `advance_sequence` — all but one
-//! because their rows were validated when first written. The exception is the FK
-//! auto-index, safe by construction and unable to pass anyway: it sets the
-//! internal flag bit, which [`precheck_index_family`] rejects on any client
-//! `+1`. So this file holds the precheck arms *and* the registration guards
-//! `hooks.rs` re-runs on those paths.
+//! It is the *client* boundary: a path skips it exactly when its rows are not a
+//! client's. So this file holds the precheck arms *and* the registration guards
+//! `hooks.rs` re-runs for the paths that skip them.
 
 use std::cmp::Ordering;
 
@@ -27,9 +22,8 @@ use gnitz_wire::{COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, IDXTAB_PAY_NAME, 
 ///
 /// Deliberately **not** `validate_user_identifier`, whose leading-`_` reservation
 /// is client-side *policy*: the engine must accept the `__h…` segment rows the
-/// client writes, and spelling a `__h` grammar here would give a forger a target.
-/// The residual — a raw bundle naming a relation `_foo` — is unreferenceable from
-/// SQL and lives in a `t_<id>` directory.
+/// client writes. The residual — a raw bundle naming a relation `_foo` — is
+/// unreferenceable from SQL and lives in a `t_<id>` directory.
 fn reject_unstorable_name(name: &str, noun: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err(format!("{noun} name cannot be empty"));
@@ -52,20 +46,31 @@ fn reject_non_canonical(name: &str, noun: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The two rules a relation's column records must satisfy on their own, with no
-/// PK list in hand. This is the trust boundary where COL_TAB rows become a
-/// `SchemaDescriptor`: [`validate_pk_against_cols`] allow-lists the PK columns'
-/// type codes, and an unknown *payload* code is not inert either (see
-/// `gnitz_wire::is_valid_type_code`).
-pub(super) fn check_col_defs(col_defs: &[ColumnDef]) -> Result<(), String> {
+/// The rules a relation's column records must satisfy on their own, with no PK
+/// list in hand; messages are bare predicates, and callers add the context. The
+/// duplicate-name rule is ingestion points only — a view segment legitimately
+/// carries two visible columns of one name (a join chain's output).
+pub(super) fn check_col_defs(kind: RelationKind, col_defs: &[ColumnDef]) -> Result<(), String> {
+    if col_defs.is_empty() {
+        return Err("has no column records".into());
+    }
     // Reachable from a plain view as well as a wide CREATE TABLE: a compound-PK
-    // plain projection prepends the k source PK columns, so `SELECT *` over a wide
-    // compound-PK table can cross MAX_COLUMNS.
+    // plain projection prepends the k source PK columns.
     if col_defs.len() > MAX_COLUMNS {
         return Err(format!("has {} columns (max {})", col_defs.len(), MAX_COLUMNS));
     }
     if let Some(cd) = col_defs.iter().find(|cd| !gnitz_wire::is_valid_type_code(cd.type_code)) {
         return Err(format!("column '{}' has invalid type code {}", cd.name, cd.type_code));
+    }
+    if kind.is_ingestion_point() {
+        let mut seen = FxHashSet::default();
+        if let Some(cd) = col_defs
+            .iter()
+            .filter(|c| !c.is_hidden)
+            .find(|c| !seen.insert(c.name.to_ascii_lowercase()))
+        {
+            return Err(format!("has duplicate column name '{}'", cd.name));
+        }
     }
     Ok(())
 }
@@ -81,61 +86,6 @@ pub(super) fn validate_pk_against_cols(col_defs: &[ColumnDef], pk_cols: &[u32]) 
     })
     .map(|_stride| ())
     .map_err(|rule| rule.to_string())
-}
-
-/// One admissibility check for a relation's column records + PK list, run by the
-/// TABLE/VIEW precheck arms and again by both register hooks, for the paths that
-/// skip precheck (boot replay, worker `ddl_sync`).
-pub(super) fn validate_relation_defs(
-    kind: RelationKind,
-    id: i64,
-    name: &str,
-    col_defs: &[ColumnDef],
-    pk: &PkColList,
-) -> Result<(), String> {
-    let noun = kind.noun();
-    if col_defs.is_empty() {
-        return Err(format!(
-            "catalog invariant violated: {noun} '{name}' (id={id}) registered \
-             before its column records: the register hook reads them back \
-             through sys_columns storage, which held none for this id."
-        ));
-    }
-    check_col_defs(col_defs).map_err(|e| format!("{noun} '{name}' (id={id}) {e}"))?;
-    // Ingestion points only: a view segment legitimately carries two visible
-    // columns of one name (a join chain's output). Nothing downstream refuses the
-    // duplicate; it surfaces at query time as "column reference is ambiguous".
-    if kind.is_ingestion_point() {
-        let mut seen = FxHashSet::default();
-        if let Some(cd) = col_defs
-            .iter()
-            .filter(|c| !c.is_hidden)
-            .find(|c| !seen.insert(c.name.to_ascii_lowercase()))
-        {
-            return Err(format!(
-                "{noun} '{name}' (id={id}) has duplicate column name '{}'",
-                cd.name
-            ));
-        }
-    }
-    validate_pk_against_cols(col_defs, pk.as_slice())
-}
-
-/// How a guard message names one row of `family`. A COL_TAB PK packs
-/// `(owner_id, col_idx)` and a circuit PK packs `(view_id, node_id)`, so neither
-/// is meaningful rendered as the one number it is stored as.
-fn pk_label(family: SysFamily, pk: u128) -> String {
-    match family {
-        SysFamily::Column => {
-            let (owner_id, col_idx) = gnitz_wire::unpack_col_id(pk as u64);
-            format!("column {col_idx} of owner {owner_id}")
-        }
-        SysFamily::CircuitNodes => {
-            let (view_id, node_id) = unpack_circuit_pk(pk);
-            format!("view {view_id} node {node_id}")
-        }
-        _ => format!("id {pk}"),
-    }
 }
 
 /// A zero-weight row is not a Z-set element: `pk_signatures` skips it, so it
@@ -168,7 +118,7 @@ fn check_pk_multiplicity(family: SysFamily, sig: &PkSignature) -> Result<(), Str
         return Err(format!(
             "system-catalog write carries more than one row for {} {}",
             family.row_noun(),
-            pk_label(family, sig.pk)
+            family.pk_label(sig.pk)
         ));
     }
     Ok(())
@@ -188,7 +138,7 @@ fn check_id_range(family: SysFamily, sig: &PkSignature) -> Result<(), String> {
             "cannot {} a system {} ({})",
             sig.verb(),
             family.row_noun(),
-            pk_label(family, sig.pk)
+            family.pk_label(sig.pk)
         ));
     }
     if let Some(ceiling) = family.id_ceiling() {
@@ -196,7 +146,7 @@ fn check_id_range(family: SysFamily, sig: &PkSignature) -> Result<(), String> {
             return Err(format!(
                 "{} {} is at or above the id ceiling ({ceiling})",
                 family.row_noun(),
-                pk_label(family, sig.pk)
+                family.pk_label(sig.pk)
             ));
         }
     }
@@ -217,7 +167,7 @@ fn check_pair_fields(family: SysFamily, batch: &Batch, sig: &PkSignature) -> Res
         return Err(format!(
             "a system-catalog rewrite pair on {} {} changes a field it may not",
             family.row_noun(),
-            pk_label(family, sig.pk)
+            family.pk_label(sig.pk)
         ));
     }
     Ok(())
@@ -265,7 +215,7 @@ fn check_circuit_view_ids(batch: &Batch, new_view_ids: &[i64]) -> Result<(), Str
 
 impl CatalogEngine {
     /// Check every FK-carrying column of a relation about to be registered.
-    /// `pk` must already have passed `validate_relation_defs`, which is what
+    /// `pk` must already have passed [`validate_pk_against_cols`], which is what
     /// makes `pk[0]` an in-bounds, PK-eligible column index.
     pub(super) fn validate_fk_columns(&self, tid: i64, col_defs: &[ColumnDef], pk: &[u32]) -> Result<(), String> {
         let self_pk_type = col_defs[pk[0] as usize].type_code;
@@ -339,21 +289,14 @@ impl CatalogEngine {
     }
 
     /// Reject a CREATE whose qualified `schema.name` collides with an existing
-    /// entity. Re-ingesting the same row (e.g. a pk-col update of `self_id`) is
-    /// allowed; only a genuinely different entity under that name is rejected.
+    /// entity. A rewrite pair that leaves the name unchanged re-registers the
+    /// incumbent, so `existing == self_id` is not one.
     ///
     /// `net_dead` is this same bundle's net-dead PKs in this same family. An
-    /// incumbent among them is not a collision: one bundle may retire an id and
-    /// register a different one under the same name — an ALTER VIEW is exactly
-    /// that. Precheck reads the caches *before* apply, so they still map the name
-    /// to the outgoing id.
-    ///
-    /// Also resolves `sid`, erroring if the schema does not exist. `claimed`
-    /// collects the qualified names this same batch has already registered, so
-    /// two `+1` rows naming one relation under different ids are rejected too —
-    /// unchecked, both would register and the second would overwrite
-    /// `entity_by_qname`, stranding the first's store under a name nothing
-    /// resolves.
+    /// incumbent among them is not a collision either: one bundle may retire an
+    /// id and register a different one under the same name — an ALTER VIEW is
+    /// exactly that. Precheck reads the caches *before* apply, so they still map
+    /// the name to the outgoing id.
     fn precheck_qname_unique(
         &self,
         sid: i64,
@@ -407,7 +350,7 @@ impl CatalogEngine {
         if !(0..=1).contains(&net) {
             return Err(format!(
                 "system-catalog write would leave {noun} {} at net weight {net} (expected 0 or 1)",
-                pk_label(family, sig.pk)
+                family.pk_label(sig.pk)
             ));
         }
         Ok(net)
@@ -433,6 +376,10 @@ impl CatalogEngine {
             }
             check_pair_fields(family, batch, sig)?;
         }
+        // Sorted so the two drop guards can `binary_search` it
+        // (`precheck_qname_unique` reads it linearly); one entry per distinct PK
+        // already, from `pk_signatures`.
+        net_dead.sort_unstable();
         Ok((sigs, net_dead))
     }
 
@@ -456,6 +403,8 @@ impl CatalogEngine {
                         "catalog changed concurrently: retracting a column of unregistered owner {owner_id}"
                     ));
                 }
+                // Normal: a CREATE TABLE bundle's COL_TAB block applies before
+                // TABLE_TAB. `check_column_owners` owns these rows.
                 continue;
             };
 
@@ -482,6 +431,9 @@ impl CatalogEngine {
                     if null_new != null_old && !(null_old == 0 && null_new == 1) {
                         return Err("a column-ALTER may only set is_nullable 0→1 (DROP NOT NULL)".into());
                     }
+                    let prospective = self.col_defs_with(owner_id, col_idx, read_col_tab_row(batch, pj));
+                    check_col_defs(RelationKind::BaseTable, &prospective)
+                        .map_err(|e| format!("cannot ALTER COLUMN on table {owner_id}: {e}"))?;
                     let is_drop = (hid_old == 0 && hid_new == 1) || (null_old == 0 && null_new == 1);
                     if is_drop {
                         if owner_schema.is_pk_col(col_idx as usize) {
@@ -517,14 +469,20 @@ impl CatalogEngine {
         Ok(())
     }
 
+    /// `owner_id`'s column records as this batch's `+1` row for `col_idx` leaves
+    /// them: the decoded row replaces the live record at that index, or extends
+    /// the set when the transition appends one.
+    fn col_defs_with(&mut self, owner_id: i64, col_idx: u64, row: ColumnDef) -> Vec<ColumnDef> {
+        let mut defs = (*self.read_column_defs(owner_id)).clone();
+        match defs.get_mut(col_idx as usize) {
+            Some(live) => *live = row,
+            None => defs.push(row),
+        }
+        defs
+    }
+
     /// ADD COLUMN: one unpaired `+1` appending a trailing nullable payload
     /// column to registered base table `owner_id`.
-    ///
-    /// The contract's per-PK net bound already closes the concurrent-append
-    /// race: `pack_col_id` is a pure function of the client-read physical column
-    /// count, so two connections racing pick the *same* `column_id`, and the
-    /// second's `+1` lands on a now-live row where `live_weight + Σ = 2` fails
-    /// that bound.
     fn precheck_column_append(
         &mut self,
         batch: &Batch,
@@ -546,16 +504,12 @@ impl CatalogEngine {
                 owner_schema.num_columns()
             ));
         }
-        // Decode the appended row once; every rule below reads the decoded def.
         let appended = read_col_tab_row(batch, pj);
-        // Run the prospective column set through `check_col_defs` — the sole home
-        // of the column-record rules — so a rule added there reaches ADD COLUMN
-        // too. The PK rules are not re-run here: a trailing non-PK append cannot
-        // invalidate an already-valid PK list, and the rebuild in
-        // `hook_column_alter` re-checks them against the new defs regardless.
-        let mut prospective = (*self.read_column_defs(owner_id)).clone();
-        prospective.push(appended.clone());
-        check_col_defs(&prospective).map_err(|e| format!("cannot ADD COLUMN on table {owner_id}: {e}"))?;
+        // The PK rules are not re-run: a trailing non-PK append cannot invalidate
+        // an already-valid PK list.
+        let prospective = self.col_defs_with(owner_id, col_idx, appended.clone());
+        check_col_defs(RelationKind::BaseTable, &prospective)
+            .map_err(|e| format!("cannot ADD COLUMN on table {owner_id}: {e}"))?;
         // A new column over existing rows is unconditionally nullable, carries
         // no SERIAL/FK, and is visible.
         if !appended.is_nullable {
@@ -591,10 +545,9 @@ impl CatalogEngine {
     /// declared on, and what a bounded view may read. `source_ids` is the view's
     /// resolved `ScanDelta` sources.
     ///
-    /// Run from the precheck, and again from `view_registration` for the paths
-    /// that skip it (boot replay, worker `ddl_sync`). A within-bundle internal
-    /// segment never carries a `WITH` option, which is what keeps the second run
-    /// meaningful.
+    /// Run from the precheck and again from `view_registration`. A within-bundle
+    /// internal segment never carries a `WITH` option, which is what keeps the
+    /// second run meaningful.
     pub(in crate::catalog) fn validate_view_options(
         &self,
         vid: i64,
@@ -647,14 +600,11 @@ impl CatalogEngine {
     /// The shared IDX_TAB registration guard: a base-table owner, returned for
     /// the callers' schema/context reads.
     ///
-    /// Only base tables can own a secondary index: index projection runs only
-    /// on the base-table DML paths (`ingest_store_and_indices`); view deltas
-    /// land via the circuit-evaluation terminal-view moves, which never
-    /// project into `index_circuits`. An index on a view would backfill once
-    /// and then silently serve stale results. The SQL binder rejects this by
-    /// name resolution; the precheck rejects a raw wire push before the row is
-    /// persisted or broadcast, and `hook_index_register` re-checks for the
-    /// paths that skip precheck (boot replay, worker ddl_sync).
+    /// Only base tables can own a secondary index: index projection runs on the
+    /// base-table DML paths (`ingest_store_and_indices`) alone, and view deltas
+    /// land via the circuit-evaluation terminal-view moves, which never project
+    /// into `index_circuits`. The SQL binder rejects this by name resolution;
+    /// this rejects a raw wire push before the row is persisted or broadcast.
     pub(in crate::catalog) fn validate_index_registration(
         &self,
         owner_id: i64,
@@ -684,9 +634,9 @@ impl CatalogEngine {
         let (sigs, net_dead) = self.check_family_contract(family, batch)?;
         match family {
             SysFamily::Schema => self.precheck_schema_family(batch, &net_dead),
-            SysFamily::Table | SysFamily::View => self.precheck_relation_family(family, batch, net_dead),
+            SysFamily::Table | SysFamily::View => self.precheck_relation_family(family, batch, &net_dead),
             SysFamily::Column => self.precheck_column_family(batch, &sigs),
-            SysFamily::Index => self.precheck_index_family(batch, net_dead),
+            SysFamily::Index => self.precheck_index_family(batch, &net_dead),
             SysFamily::Sequence | SysFamily::CircuitNodes => Ok(()),
         }
     }
@@ -800,7 +750,7 @@ impl CatalogEngine {
     /// The drop guards key on `net_dead` — the PKs whose bundle net is dead — not
     /// raw `weight < 0`, so a rename pair's net-live `-1` is never rejected as
     /// "referenced by FK" / "View dependency".
-    fn precheck_relation_family(&mut self, family: SysFamily, batch: &Batch, net_dead: Vec<i64>) -> Result<(), String> {
+    fn precheck_relation_family(&mut self, family: SysFamily, batch: &Batch, net_dead: &[i64]) -> Result<(), String> {
         let is_table = family == SysFamily::Table;
         let mut claimed: FxHashSet<String> = FxHashSet::default();
 
@@ -832,7 +782,9 @@ impl CatalogEngine {
                 self.validate_view_owner(id, &name, owner_view_id, batch)?;
                 (sid, name, pk, RelationKind::View)
             };
-            validate_relation_defs(kind, id, &name, &col_defs, &pk)?;
+            check_col_defs(kind, &col_defs)
+                .and_then(|()| validate_pk_against_cols(&col_defs, pk.as_slice()))
+                .map_err(|e| format!("{} '{name}' (id={id}) {e}", kind.noun()))?;
             reject_unstorable_name(&name, kind.noun())?;
 
             if is_table {
@@ -847,32 +799,24 @@ impl CatalogEngine {
                         ));
                     }
                 }
-                // `validate_relation_defs` above proved the PK list non-empty
+                // `validate_pk_against_cols` above proved the PK list non-empty
                 // and in range, which is what makes the self-reference type
                 // lookup inside sound.
                 self.validate_fk_columns(id, &col_defs, pk.as_slice())?;
             }
 
-            self.precheck_qname_unique(sid, &name, id, &net_dead, &mut claimed)?;
+            self.precheck_qname_unique(sid, &name, id, net_dead, &mut claimed)?;
         }
-
-        // One entry per distinct PK already (`pk_signatures`); sorted here only so
-        // the two guards below can `binary_search` it.
-        let mut drop_ids = net_dead;
-        if drop_ids.is_empty() {
-            return Ok(());
-        }
-        drop_ids.sort_unstable();
 
         if is_table {
-            for &tid in &drop_ids {
+            for &tid in net_dead {
                 // A FK child being co-dropped in this same batch is
                 // self-resolving — only a child *outside* the batch blocks the
                 // drop. Mirrors the view-dependency filter below.
                 let blocking = self
                     .fk_children_of(tid)
                     .iter()
-                    .find(|r| drop_ids.binary_search(&r.child_tid).is_err());
+                    .find(|r| net_dead.binary_search(&r.child_tid).is_err());
                 if let Some(r) = blocking {
                     let (sn, tn) = self.qualified_name_or_unknown(r.child_tid);
                     return Err(format!("Integrity violation: table referenced by '{sn}.{tn}'"));
@@ -881,14 +825,14 @@ impl CatalogEngine {
         }
 
         let dep_map = self.dag.get_dep_map(&self.registry);
-        for &id in &drop_ids {
+        for &id in net_dead {
             if let Some(dependents) = dep_map.get(&id) {
                 // A dependent that is itself being dropped in this same batch is
                 // self-resolving — only an *outside* dependent blocks the drop.
-                // drop_ids is sorted, so binary_search.
+                // net_dead is sorted, so binary_search.
                 let still_active = dependents
                     .iter()
-                    .any(|&dep_id| drop_ids.binary_search(&dep_id).is_err());
+                    .any(|&dep_id| net_dead.binary_search(&dep_id).is_err());
                 if still_active {
                     let (sn, tn) = self.qualified_name_or_unknown(id);
                     return Err(format!("View dependency: entity '{sn}.{tn}'"));
@@ -903,7 +847,7 @@ impl CatalogEngine {
     /// depends on. The drop guards read the batch row rather than probing: the
     /// contract's CAS proved every `-1` content-equals the live one, `name` and
     /// `source_cols` included.
-    fn precheck_index_family(&mut self, batch: &Batch, net_dead: Vec<i64>) -> Result<(), String> {
+    fn precheck_index_family(&mut self, batch: &Batch, net_dead: &[i64]) -> Result<(), String> {
         // The names this batch has already claimed, as `precheck_qname_unique`
         // threads one for relations. Without it two rows under one name both pass
         // the persisted-cache check and the second overwrites the first in
@@ -934,30 +878,23 @@ impl CatalogEngine {
                 )
             })?;
 
-            let idx_id = batch.get_pk(i) as i64;
-            if let Some(&existing) = self.caches.index_by_name.get(&index_name) {
-                if existing != idx_id {
-                    return Err(format!("Index already exists: {index_name}"));
-                }
+            // Only live indices are mapped, and a `+1` on one already failed the
+            // net bound — so any hit is a different index.
+            if self.caches.index_by_name.contains_key(&index_name) {
+                return Err(format!("Index already exists: {index_name}"));
             }
             if let Some(dup) = claimed.replace(index_name) {
                 return Err(format!("Index already exists: {dup}"));
             }
         }
 
-        let mut drop_ids = net_dead;
-        if drop_ids.is_empty() {
-            return Ok(());
-        }
-        drop_ids.sort_unstable();
-
         for i in (0..batch.len()).filter(|&i| batch.get_weight(i) < 0) {
             let (owner_id, cols, props) =
                 read_idx_tab_row(batch, i).map_err(|rule| format!("Index: column list {rule}"))?;
-            // An internal index backs the FK RESTRICT seek; dropping one would
-            // silently disarm FK enforcement. Keyed on the raw `-1` rows, not on
-            // net-dead: a rewrite pair must not slip past it.
+            // The row, not `net_dead`: this needs `is_internal` and `cols`, which
+            // a list of ids does not carry.
             if props.is_internal {
+                // Dropping one silently disarms the FK RESTRICT seek it backs.
                 return Err("Integrity violation: cannot drop an internal FK index".into());
             }
             // FK backing is single-column: a composite index never satisfies a
@@ -985,7 +922,7 @@ impl CatalogEngine {
             // present) for another unique index on this column that survives.
             let mut unique_remains = false;
             self.for_each_index_on_cols(owner_id, &[src_col as u32], |row_id, is_uniq| {
-                if is_uniq && drop_ids.binary_search(&row_id).is_err() {
+                if is_uniq && net_dead.binary_search(&row_id).is_err() {
                     unique_remains = true;
                 }
             });

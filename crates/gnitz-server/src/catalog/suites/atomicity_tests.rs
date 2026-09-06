@@ -78,9 +78,9 @@ fn test_table_tab_no_cols_leaves_clean_state() {
 
 #[test]
 fn test_table_tab_invalid_pk_col_type_leaves_clean_state() {
-    // validate_relation_defs runs inside hook_relation_register *after*
-    // `apply_entity_caches` runs before the register hook, so a hook rejection
-    // must leave no cache entry behind.
+    // The schema build runs inside hook_relation_register, *after*
+    // `apply_entity_caches`, so a hook rejection must leave no cache entry
+    // behind.
     let dir = temp_dir("atomicity_bad_pk_type");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::Table).open_cursor());
@@ -201,9 +201,9 @@ fn test_view_tab_too_many_cols_rejected() {
     // An over-wide view must be rejected with a clean catalog error that leaves no
     // orphaned cache/memtable state — mirroring the TABLE_TAB path, where the
     // precheck rejects before `apply_entity_caches` mutates the caches.
-    // hook_relation_register carries the same guard as the build_schema_from_col_defs
-    // assert backstop. This is the engine-side counterpart to the client guard in
-    // create_view_chain.
+    // hook_relation_register reaches the same column cap through
+    // build_schema_from_col_defs. This is the engine-side counterpart to the
+    // client guard in create_view_chain.
     let dir = temp_dir("atomicity_view_too_many_cols");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let init_rows = count_records(engine.sys_store_mut(SysFamily::View).open_cursor());

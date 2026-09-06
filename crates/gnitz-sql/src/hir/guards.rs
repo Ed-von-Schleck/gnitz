@@ -119,8 +119,9 @@ pub(crate) fn reject_outer_with_residual(kind: JoinType, residual_empty: bool) -
 }
 
 /// The pair-PK output arity cap — the binding constraint on a synthesized output
-/// PK (its stride cannot reach `MAX_PK_BYTES` first). `validate_relation_defs` is
-/// the engine-side backstop; this is the planner error naming the surface written.
+/// PK (its stride cannot reach `MAX_PK_BYTES` first). The engine's own
+/// `validate_pk_against_cols` is the backstop; this is the planner error naming
+/// the surface written.
 pub(crate) fn reject_pair_pk_overflow(surface: &str, pa: usize, pb: usize) -> Result<(), GnitzSqlError> {
     let pair_pk = pa + pb;
     if pair_pk > gnitz_core::PK_LIST_MAX_COLS {

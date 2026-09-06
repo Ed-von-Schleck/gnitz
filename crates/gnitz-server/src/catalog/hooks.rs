@@ -30,6 +30,9 @@ impl CatalogEngine {
     // registers a relation whose schema build finds no columns. Live DDL applies
     // a bundle in ascending `topo_priority`; boot replay opens every sys store
     // first.
+    //
+    // A hook re-asserts a precheck guard only where the verdict cannot depend on
+    // application order and the hook already holds the guard's input.
     pub(in crate::catalog) fn fire_hooks(&mut self, family: SysFamily, batch: &Batch) -> Result<(), String> {
         let reordered = Self::canonicalize_for_hooks(batch, family);
         let batch = reordered.as_ref().unwrap_or(batch);
@@ -153,11 +156,10 @@ impl CatalogEngine {
             budgets,
         } = reg;
         let col_defs = self.read_column_defs(id);
-        validate_relation_defs(kind, id, &name, &col_defs, &pk)?;
-
         let schema_name = self.caches.schema_by_id.get(&schema_id).cloned().unwrap_or_default();
         let directory = relation_dir(&self.base_dir, &schema_name, kind, id);
-        let schema = build_schema_from_col_defs(&col_defs, pk.as_slice(), placement)?;
+        let schema = build_schema_from_col_defs(kind, &col_defs, pk.as_slice(), placement)
+            .map_err(|e| format!("{} '{name}' (id={id}) {e}", kind.noun()))?;
         gnitz_debug!(
             "catalog: creating {} dir={} name={} id={} workers={}",
             kind.noun(),
@@ -410,12 +412,13 @@ impl CatalogEngine {
     /// there, since neither changes a descriptor field.
     ///
     /// The trigger is the batch's per-PK shape against the owner's
-    /// currently-registered arity, never the apply mode — which is what makes it
-    /// right for the compensation path, where the pair arrives negated. Naming
-    /// the append shape rather than "carries a `+1`" is a cost guard: the boot
-    /// full scan hands over every live COL_TAB row at `+1`, and would re-derive
-    /// every base table's descriptor to its current value.
+    /// currently-registered arity, which is what makes it right for the
+    /// compensation path, where the pair arrives negated. Replay carries no
+    /// transition to react to, so it returns before the scan rather than through it.
     fn hook_column_alter(&mut self, batch: &Batch) -> Result<(), String> {
+        if self.ctx.mode() == ApplyMode::Replay {
+            return Ok(());
+        }
         // COL_TAB PK = pack_col_id. `pk_signatures` skips `w == 0`, so "no `-1`"
         // is "carries only `+1`s".
         for sig in pk_signatures(batch) {
@@ -439,8 +442,9 @@ impl CatalogEngine {
             // Only an is_nullable 0→1 flip or a trailing append changes the
             // descriptor; when it does, publish it into the store.
             let col_defs = self.read_column_defs(owner);
-            let rebuilt = build_schema_from_col_defs(&col_defs, cur.pk_indices(), cur.placement())
-                .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
+            let rebuilt =
+                build_schema_from_col_defs(RelationKind::BaseTable, &col_defs, cur.pk_indices(), cur.placement())
+                    .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
             if rebuilt != cur {
                 let CatalogEngine { registry, dag, .. } = self;
                 dag.swap_table_schema(registry, owner, rebuilt)?;

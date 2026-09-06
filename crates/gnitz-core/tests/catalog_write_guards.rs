@@ -14,7 +14,7 @@ use gnitz_core::{GnitzClient, TableProps};
 use gnitz_test_harness::ServerHandle;
 use gnitz_wire::sys_rows::{
     write_circuit_node_row, write_col_tab_row, write_idx_tab_row, write_schema_tab_row, write_table_tab_row,
-    CircuitNodeRow, IdxTabRow, SchemaTabRow, TableTabRow,
+    CircuitNodeRow, ColTabRow, IdxTabRow, SchemaTabRow, TableTabRow,
 };
 use gnitz_wire::{COL_TAB, IDX_TAB, SCHEMA_TAB, SEQ_TAB, TABLE_TAB};
 
@@ -67,6 +67,31 @@ fn two_columns_as(owner_id: u64, owner_kind: u64) -> ZSetBatch {
         write_col_tab_row(&mut a, &cd.col_tab_row(owner_id, owner_kind, i), 1).unwrap();
     }
     b
+}
+
+/// One COL_TAB row of base table `owner_id`, as the wire struct rather than
+/// through `ColumnDef::col_tab_row`, so a column-transition test can vary `name`
+/// and `is_hidden` on their own. Never an FK and never SERIAL.
+fn col_tab_row(
+    owner_id: u64,
+    col_idx: u64,
+    name: &str,
+    type_code: TypeCode,
+    is_nullable: bool,
+    is_hidden: bool,
+) -> ColTabRow<'_> {
+    ColTabRow {
+        owner_id,
+        owner_kind: gnitz_wire::OWNER_KIND_TABLE,
+        col_idx,
+        name,
+        type_code: type_code as u64,
+        is_nullable,
+        fk_table_id: 0,
+        fk_col_idx: 0,
+        is_serial: false,
+        is_hidden,
+    }
 }
 
 /// One IDX_TAB batch of `(index_id, weight)` rows, all naming `owner_id`'s
@@ -595,4 +620,47 @@ fn the_per_pk_shape_rules_reject_what_no_emitter_writes() {
             .unwrap_err()
     );
     assert!(err.contains("id ceiling"), "{err}");
+}
+
+/// Two visible columns of one name make the relation unregisterable at the next
+/// boot, and no column surface can undo it. The client-side guards are a
+/// read-then-push holding no lock, so two connections can race into it.
+#[test]
+fn the_duplicate_visible_name_rule_holds_at_every_column_transition() {
+    let srv = ServerHandle::start();
+    let mut client = GnitzClient::connect(srv.sock_path()).unwrap();
+    // `(id U64 PK, v I64)`.
+    let tid = a_table(&mut client, "dupcols");
+    let mut s = session(&srv);
+    let sc = sys_schema(COL_TAB);
+
+    // ADD COLUMN repeating a visible name. Nullable, so only the name rule can
+    // fire.
+    let mut appended = ZSetBatch::new(sc);
+    write_col_tab_row(
+        &mut BatchAppender::new(&mut appended, sc),
+        &col_tab_row(tid, 2, "v", TypeCode::I64, true, false),
+        1,
+    )
+    .unwrap();
+    let err = format!("{:?}", s.push_ddl_txn(&[(COL_TAB, appended)]).unwrap_err());
+    assert!(err.contains("duplicate column name"), "{err}");
+
+    // RENAME COLUMN onto another visible column's name. The pair changes only
+    // `name`, so it clears the pair mask and the retraction CAS.
+    let mut renamed = ZSetBatch::new(sc);
+    let mut a = BatchAppender::new(&mut renamed, sc);
+    write_col_tab_row(&mut a, &col_tab_row(tid, 1, "v", TypeCode::I64, false, false), -1).unwrap();
+    write_col_tab_row(&mut a, &col_tab_row(tid, 1, "id", TypeCode::I64, false, false), 1).unwrap();
+    let err = format!("{:?}", s.push_ddl_txn(&[(COL_TAB, renamed)]).unwrap_err());
+    assert!(err.contains("duplicate column name"), "{err}");
+
+    // DROP COLUMN is the same pair shape flipping `is_hidden` instead, and stays
+    // legal: the column leaves the visible set, so nothing collides. Last,
+    // because it is the one case that applies.
+    let mut dropped = ZSetBatch::new(sc);
+    let mut a = BatchAppender::new(&mut dropped, sc);
+    write_col_tab_row(&mut a, &col_tab_row(tid, 1, "v", TypeCode::I64, false, false), -1).unwrap();
+    write_col_tab_row(&mut a, &col_tab_row(tid, 1, "v", TypeCode::I64, false, true), 1).unwrap();
+    s.push_ddl_txn(&[(COL_TAB, dropped)]).unwrap();
 }

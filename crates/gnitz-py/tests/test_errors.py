@@ -334,11 +334,9 @@ class TestSchemaColumnLimit:
 
 
 class TestCreateTableColumnNames:
-    def test_duplicate_column_name_rejected_at_the_client(self, client):
-        """The SQL layer rejects a duplicate at parse time, but `create_table`
-        is reachable without it and the engine precheck does not scan COL_TAB
-        for names — so a duplicate would land in storage and only surface later
-        as an ambiguous column reference."""
+    def test_duplicate_column_name_rejected(self, client):
+        """The SQL layer rejects a duplicate at parse time, but `create_table` is
+        reachable without it."""
         sn = "err" + _uid()
         try:
             client.create_schema(sn)

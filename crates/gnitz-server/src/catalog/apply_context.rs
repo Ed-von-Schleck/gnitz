@@ -13,7 +13,8 @@ use super::CatalogEngine;
 /// One value rather than a pair of booleans, whose fourth state is unreachable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(in crate::catalog) enum ApplyMode {
-    /// Boot shard replay: rows already validated when first written.
+    /// Boot shard replay: every row arrives as a lone `+1` at its current value,
+    /// so no row carries a transition.
     Replay,
     /// First application of a client's rows.
     Live,

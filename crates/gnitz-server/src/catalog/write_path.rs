@@ -14,19 +14,15 @@ impl CatalogEngine {
     // -- The applied-delta entry points ----------------------------------------
 
     /// Apply one system-family delta and enqueue it for broadcast: precheck →
-    /// storage write → `fire_hooks` → enqueue. This is how DDL code mutates a
-    /// system family; the cascades that drop columns/indices/circuit rows are the
+    /// storage write → `fire_hooks` → enqueue. The batch is taken by value so the
+    /// applier moves it straight into `pending_broadcasts` (one storage clone, no
+    /// hooks clone); the cascades that drop columns/indices/circuit rows are the
     /// applier's declared reaction to a retraction, fired from inside
-    /// `fire_hooks`, not the emitter's concern. The batch is taken by value so
-    /// the applier moves it straight into `pending_broadcasts` (one storage
-    /// clone, no hooks clone).
+    /// `fire_hooks`, not the emitter's concern.
     ///
-    /// Two paths deliberately write without it: `bootstrap_ingest` seeds a fresh
-    /// database before the DAG exists (and `replay_catalog` fires the hooks over
-    /// those rows immediately after), and `advance_sequence` writes the
-    /// memtable-only object-id high-water. The DDL_TXN handler drives the same
-    /// two steps itself so it can tell a precheck rejection from a post-apply
-    /// failure.
+    /// Not the client boundary: a `DDL_TXN` spells the same two steps inline, as a
+    /// `precheck_family` + [`Self::apply_and_enqueue_family`] pair, so it can tell
+    /// a precheck rejection from a post-apply failure.
     pub(crate) fn submit(&mut self, family: SysFamily, batch: Batch) -> Result<(), String> {
         if self.ctx.in_rollback() {
             // During rollback all cascade writes must bypass pending_broadcasts

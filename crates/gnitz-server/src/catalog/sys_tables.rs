@@ -271,8 +271,7 @@ impl PkSignature {
 /// rows are skipped.
 ///
 /// The map, not an adjacent-run scan: `canonicalize_for_hooks` sign-partitions
-/// the batch, so a pair's two rows are never adjacent. It also keeps this linear
-/// over boot replay's full-family scan.
+/// the batch, so a pair's two rows are never adjacent.
 pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
     let mut sigs: Vec<PkSignature> = Vec::new();
     let mut by_pk: FxHashMap<u128, usize> = FxHashMap::default();
@@ -613,6 +612,23 @@ impl SysFamily {
     /// family, whose `(view_id, node_id)` addresses a node of a circuit.
     pub(super) fn pk_is_live_row_identity(self) -> bool {
         !matches!(self, SysFamily::CircuitNodes)
+    }
+
+    /// How a guard message names one row of this family. A COL_TAB PK packs
+    /// `(owner_id, col_idx)` and a circuit PK packs `(view_id, node_id)`, so
+    /// neither is meaningful rendered as the one number it is stored as.
+    pub(in crate::catalog) fn pk_label(self, pk: u128) -> String {
+        match self {
+            SysFamily::Column => {
+                let (owner_id, col_idx) = gnitz_wire::unpack_col_id(pk as u64);
+                format!("column {col_idx} of owner {owner_id}")
+            }
+            SysFamily::CircuitNodes => {
+                let (view_id, node_id) = unpack_circuit_pk(pk);
+                format!("view {view_id} node {node_id}")
+            }
+            _ => format!("id {pk}"),
+        }
     }
 
     /// What one of this family's rows is called in a guard message.

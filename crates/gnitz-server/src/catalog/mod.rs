@@ -67,7 +67,7 @@ pub(crate) use types::{ColumnDef, FkEdge};
 pub(crate) use schema_block::{encode_schema_block, encode_schema_block_ipc};
 
 // Import everything from sys_tables for internal use.
-use precheck::{check_col_defs, validate_pk_against_cols, validate_relation_defs};
+use precheck::{check_col_defs, validate_pk_against_cols};
 use registry::build_schema_from_col_defs;
 use sys_tables::*;
 

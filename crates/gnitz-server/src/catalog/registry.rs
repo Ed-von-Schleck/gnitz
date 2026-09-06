@@ -5,24 +5,23 @@
 
 use super::*;
 
-/// The one place COL_TAB column records become a `SchemaDescriptor`, and total
-/// over every `(col_defs, pk_cols)` pair: it rejects everything
-/// `new_with_placement` would `assert!` on, so no caller can abort the process
-/// with catalog data a corrupt SAL carried. That matters because
-/// `hook_column_alter` and the register hooks under boot replay / worker
-/// `ddl_sync` all skip the DDL precheck — and because the ALTER path pairs an
-/// already-built descriptor's PK list with freshly re-read column records, which
-/// a `DROP NOT NULL` on a PK column would have made inadmissible.
+/// The one place COL_TAB column records become a `SchemaDescriptor`, and the
+/// front door for the whole relation-admissibility rule set: every rule
+/// [`check_col_defs`] and [`validate_pk_against_cols`] state, duplicate visible
+/// names included, holds of what it returns. Total over every
+/// `(col_defs, pk_cols)` pair, so no caller can abort the process with catalog
+/// data a corrupt SAL carried.
 ///
 /// `placement` is where the relation's rows live: the table-register path folds
 /// it out of `TABLE_TAB.flags`, the view path out of its sources' own stamped
 /// placements (`DagEngine::view_placement`).
 pub(in crate::catalog) fn build_schema_from_col_defs(
+    kind: RelationKind,
     col_defs: &[ColumnDef],
     pk_cols: &[u32],
     placement: Placement,
 ) -> Result<SchemaDescriptor, String> {
-    check_col_defs(col_defs)?;
+    check_col_defs(kind, col_defs)?;
     validate_pk_against_cols(col_defs, pk_cols)?;
     let cols: Vec<SchemaColumn> = col_defs
         .iter()
@@ -146,13 +145,6 @@ impl CatalogEngine {
 
     /// Allocate the next durable relation id (tables and views share this
     /// counter; indices have their own).
-    ///
-    /// Panics on reaching `RELATION_ID_CEILING` rather than issuing an id at or
-    /// above it. Reaching it needs 2^31 durable CREATEs, so this is a tripwire,
-    /// not a live limit — and it is the *secondary* guard: `precheck_family`
-    /// rejects a ceiling id at the point one enters the registry, which covers the
-    /// caller-chosen ids the register hooks `raise_id_counter` from and which
-    /// never pass through here.
     #[cfg(test)]
     pub(crate) fn allocate_table_id(&mut self) -> Result<i64, StorageError> {
         self.allocate_table_ids(1)
@@ -165,6 +157,13 @@ impl CatalogEngine {
     ///
     /// `count` is clamped to at least 1 — the run length is a client-supplied
     /// wire field, and a `0` would move the durable sequence *backwards*.
+    ///
+    /// Panics on reaching `RELATION_ID_CEILING` rather than issuing an id at or
+    /// above it. Reaching it needs 2^31 durable CREATEs, so this is a tripwire,
+    /// not a live limit — and it is the *secondary* guard: `precheck_family`
+    /// rejects a ceiling id at the point one enters the registry, which covers the
+    /// caller-chosen ids the register hooks `raise_id_counter` from and which
+    /// never pass through here.
     pub(crate) fn allocate_table_ids(&mut self, count: u64) -> Result<i64, StorageError> {
         let base = self.next_table_id;
         let last = base + count.max(1) as i64 - 1;
