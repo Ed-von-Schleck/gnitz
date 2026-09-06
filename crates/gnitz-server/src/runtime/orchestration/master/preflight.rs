@@ -731,12 +731,11 @@ fn plan_unique_checks<'a>(
 
             // Every planned span provably absent ⇒ the probe would answer "none
             // occupied" and leave nothing to verify.
-            let packed = gnitz_wire::pack_pk_cols(cols);
-            if disp.unique_filter_all_absent(tid, packed, order.iter().map(|&x| span(x))) {
+            if disp.unique_filter_all_absent(tid, col_indices, order.iter().map(|&x| span(x))) {
                 continue;
             }
             checks.push(PipelinedCheck {
-                keyspace: Keyspace::Index(packed),
+                keyspace: Keyspace::index(cols),
                 // The reply must name the committed holder of each occupied
                 // span, not echo the probe key back.
                 mode: gnitz_wire::WireProbeMode::FirstHolder,

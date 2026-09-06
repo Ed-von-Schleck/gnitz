@@ -88,18 +88,19 @@ fn preflight_seed_proves_absence_only_when_it_fits_the_cap() {
 
         // Null catalog: the unique-filter methods touch only the filter map.
         let disp = test_dispatcher(Vec::new(), std::ptr::null_mut());
-        disp.unique_filter_seed(7, 0, seed);
+        let cols = PkColList::from_slice(&[0]);
+        disp.unique_filter_seed(7, cols, seed);
         assert!(
-            disp.unique_filters.borrow()[&(7, 0)].warm,
+            disp.unique_filters.borrow()[&(7, cols)].warm,
             "a published seed is warm, so no warmup scan rebuilds over it"
         );
         assert_eq!(
-            disp.unique_filter_all_absent(7, 0, [span_u64(40).pk_bytes()].into_iter()),
+            disp.unique_filter_all_absent(7, cols, [span_u64(40).pk_bytes()].into_iter()),
             !want_capped,
             "a capped seed must fall through to the broadcast",
         );
         assert!(
-            !disp.unique_filter_all_absent(7, 0, [span_u64(20).pk_bytes()].into_iter()),
+            !disp.unique_filter_all_absent(7, cols, [span_u64(20).pk_bytes()].into_iter()),
             "a seeded key falls through either way"
         );
     }

@@ -68,21 +68,20 @@ fn a_crafted_pk_col_count_is_rejected_at_unpack() {
     }
 }
 
-/// The bare (flag-clear) form of the persisted word is a **single** column
-/// index, not an empty list: an unmodified `gnitz-core` client and every
-/// engine-written system-table row spell a 1-column PK that way.
+/// A flag-clear word names no column list, whatever its other bits say. `0` is
+/// the one a `seek_col_idx` carries when it means the relation's own PK store,
+/// and a non-zero one would otherwise read as "the index on column 7".
 #[test]
-fn a_flag_clear_word_decodes_as_one_bare_column_index() {
+fn a_flag_clear_word_is_refused() {
     for raw in [0u64, 7] {
-        let list = unpack_pk_cols(raw).expect("a bare word is a one-column list");
-        assert_eq!(list.as_slice(), &[raw as u32]);
+        assert_eq!(unpack_pk_cols(raw), Err(crate::PkRule::NotPacked), "{raw}");
     }
 }
 
 /// A packed list occupies the low 32 bits plus the flag at bit 63, leaving bits
-/// [32..63) clear — room for any later directive in the same word. Bit 63 also
-/// makes a packed word non-zero, which is what lets `PROBE_KEYSPACE_PK` stay a
-/// keyspace no column list can name.
+/// [32..63) clear — room for any later directive in the same word. The count
+/// field makes it non-zero, which is what keeps `PROBE_KEYSPACE_PK` a keyspace
+/// no column list can name.
 #[test]
 fn a_packed_list_leaves_the_reserved_bits_clear() {
     assert_eq!(crate::probe_key_columns(crate::PROBE_KEYSPACE_PK), None);

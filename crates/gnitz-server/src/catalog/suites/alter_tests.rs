@@ -7,7 +7,7 @@
 //! `crates/gnitz-sql/tests/planner_alter.rs`.
 
 use super::*;
-use gnitz_wire::{TABTAB_PAY_FLAGS, TABTAB_PAY_NAME, TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID};
+use gnitz_wire::{RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX};
 use std::path::Path;
 
 /// The live TABLE_TAB row's payload for `tid`. Named fields rather than a tuple
@@ -29,8 +29,8 @@ fn live_table_row(engine: &CatalogEngine, tid: i64) -> TableRow {
         .unwrap_or_else(|| panic!("live TABLE_TAB row for tid {tid} missing"));
     let (src, row) = sr.source();
     TableRow {
-        schema_id: payload_u64(src, row, TABTAB_PAY_SCHEMA_ID),
-        name: payload_string(src, row, TABTAB_PAY_NAME),
+        schema_id: payload_u64(src, row, RELTAB_PAY_SCHEMA_ID),
+        name: payload_string(src, row, RELTAB_PAY_NAME),
         pk_col_idx: payload_u64(src, row, TABTAB_PAY_PK_COL_IDX),
         flags: payload_u64(src, row, TABTAB_PAY_FLAGS),
     }
@@ -217,13 +217,37 @@ fn system_range_mutations_rejected() {
 
     let table_drop = {
         let mut bb = BatchBuilder::new(SysFamily::Table.schema());
-        push_table_tab_row(&mut bb, IDX_TAB_ID, SYSTEM_SCHEMA_ID, "_indices", 0, 0, -1);
+        push_table_tab_row(
+            &mut bb,
+            IDX_TAB_ID,
+            SYSTEM_SCHEMA_ID,
+            "_indices",
+            pack_pk_cols(&[0]),
+            0,
+            -1,
+        );
         bb.finish()
     };
     let table_rename = {
         let mut bb = BatchBuilder::new(SysFamily::Table.schema());
-        push_table_tab_row(&mut bb, IDX_TAB_ID, SYSTEM_SCHEMA_ID, "_indices", 0, 0, -1);
-        push_table_tab_row(&mut bb, IDX_TAB_ID, SYSTEM_SCHEMA_ID, "renamed", 0, 0, 1);
+        push_table_tab_row(
+            &mut bb,
+            IDX_TAB_ID,
+            SYSTEM_SCHEMA_ID,
+            "_indices",
+            pack_pk_cols(&[0]),
+            0,
+            -1,
+        );
+        push_table_tab_row(
+            &mut bb,
+            IDX_TAB_ID,
+            SYSTEM_SCHEMA_ID,
+            "renamed",
+            pack_pk_cols(&[0]),
+            0,
+            1,
+        );
         bb.finish()
     };
     let view_rename = {

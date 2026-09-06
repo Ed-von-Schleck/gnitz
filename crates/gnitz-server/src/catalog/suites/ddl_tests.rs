@@ -486,6 +486,9 @@ fn test_hook_relation_register_rejects_malformed_pk() {
         assert!(err.contains(snippet), "expected '{snippet}', got: {err}");
     };
 
+    // A flag-clear word names no list at all, rejected at the decode before any
+    // count is read.
+    assert_rejects(0, "carries no packed-list flag");
     // Count out of range, rejected at the decode.
     assert_rejects(PK_LIST_PACKED_FLAG, "at least one column"); // count 0
     assert_rejects(PK_LIST_PACKED_FLAG | 5, "out of range 1..=4"); // count 5

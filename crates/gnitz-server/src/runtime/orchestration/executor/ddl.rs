@@ -30,7 +30,7 @@ use crate::runtime::reactor::FsyncFuture;
 use crate::runtime::wire as ipc;
 use gnitz_store::foundation::fault::Seam;
 use gnitz_store::storage::Batch;
-use gnitz_wire::{WireFault, STATUS_OK};
+use gnitz_wire::{PkColList, WireFault, STATUS_OK};
 
 /// `GNITZ_INJECT_DDL_PANIC=after_broadcasts`: crash the master between a DDL
 /// zone's broadcasts and its commit sentinel.
@@ -273,8 +273,8 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
     // hook_index_register's own owner-check still succeeds later in the loop). The
     // IDX_TAB row layout (and the IDXTAB_PAY_* payload indices) is fixed by
     // `create_index` and read identically by `hook_index_register`.
-    let mut filter_seeds: Vec<(i64, u64, UniqueFilter)> = Vec::new();
-    for (owner_id, packed, cols) in families[SysFamily::Index.index()]
+    let mut filter_seeds: Vec<(i64, PkColList, UniqueFilter)> = Vec::new();
+    for (owner_id, cols) in families[SysFamily::Index.index()]
         .as_ref()
         .map(idx_tab_unique_creates)
         .unwrap_or_default()
@@ -288,8 +288,8 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
             // the violation to the client. The write lock drops on return.
             Err(e) => return Err(e),
             // Hold the pre-flight's filter to publish post-commit, keyed by
-            // the packed column list (the filter-map key).
-            Ok(filter) => filter_seeds.push((owner_id, packed, filter)),
+            // the column list (the filter-map key).
+            Ok(filter) => filter_seeds.push((owner_id, cols, filter)),
         }
     }
 
@@ -301,7 +301,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
     let zone_lsn = shared.open_zone(shared.cat().registry().max_table_current_lsn());
 
     // The post-fsync reclamation needs the durably-dropped relation ids and
-    // (owner, packed-cols) pairs (the -1 rows); the ingest loop consumes
+    // (owner, column-list) pairs (the -1 rows); the ingest loop consumes
     // `families`, so extract those minimal lists now instead of cloning the whole
     // TABLE_TAB / VIEW_TAB / IDX_TAB batches. A bundle is one DDL, so at most one
     // family carries -1 rows; a CREATE bundle yields empty lists.
@@ -313,7 +313,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         .as_ref()
         .map(|b| family_pks_by_sign(b, false))
         .unwrap_or_default();
-    let dropped_indices: Vec<(i64, u64)> = families[SysFamily::Index.index()]
+    let dropped_indices: Vec<(i64, PkColList)> = families[SysFamily::Index.index()]
         .as_ref()
         .map(idx_tab_drops)
         .unwrap_or_default();
@@ -420,18 +420,18 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
     for &id in dropped_tids.iter().chain(&dropped_view_ids) {
         shared.forget_relation(&catalog_write, id);
     }
-    // Keying by the whole packed list means dropping `(a, b)` never clears a
+    // Keying by the whole column list means dropping `(a, b)` never clears a
     // distinct single-column filter on `a`.
-    for &(owner_id, packed) in &dropped_indices {
-        shared.disp().unique_filter_remove(owner_id, packed);
+    for &(owner_id, cols) in &dropped_indices {
+        shared.disp().unique_filter_remove(owner_id, cols);
     }
 
     // Publish the pre-flight's filters so the first INSERT skips a redundant
     // full-cluster warmup scan. Post-fsync only: a broadcast/fsync failure
     // aborts the process before this point, so no filter is published for an
     // index that never committed.
-    for (owner_id, packed, filter) in filter_seeds {
-        shared.disp().unique_filter_seed(owner_id, packed, filter);
+    for (owner_id, cols, filter) in filter_seeds {
+        shared.disp().unique_filter_seed(owner_id, cols, filter);
     }
 
     // Populate every new view. A post-fsync Err cannot be rolled back (the CREATE

@@ -1,12 +1,12 @@
 //! Master-side unique-index filter cache: the `UniqueFilter` / `WarmupGuard` /
 //! `UniqueIndexDesc` types, `extract_into_filter`, and the verbs that warm,
-//! query, seed, and invalidate the per-`(table, packed_cols)` filters (the
+//! query, seed, and invalidate the per-`(table, col_indices)` filters (the
 //! preflight seed path shares the types).
 
 use super::*;
 use gnitz_store::schema::key::probe_key;
 
-// For each `(table_id, packed_cols)` we keep a set of the OPK spans known to
+// For each `(table_id, col_indices)` we keep a set of the OPK spans known to
 // exist in that unique index. The U-SEC rule (`txn_check_unique_indices`)
 // consults it before building a broadcast: if every new span is definitely
 // absent, that index's broadcast is skipped entirely.
@@ -28,7 +28,7 @@ use gnitz_store::schema::key::probe_key;
 //      present and returns without building a rival filter. The one forbidden
 //      state is a span missing from a filter marked warm.
 
-/// Maximum number of spans tracked per `(table_id, packed_cols)` filter; a
+/// Maximum number of spans tracked per `(table_id, col_indices)` filter; a
 /// filter that would exceed it disables itself. This is the largest count that
 /// fits `FxHashSet<u64>`'s 2^23-bucket table at its 7/8 load factor, so the set
 /// never grows to the next power of two: ≈72 MiB per maxed filter, against
@@ -106,30 +106,28 @@ impl UniqueFilter {
 pub(super) struct WarmupGuard<'d> {
     pub(super) disp: &'d MasterDispatcher,
     pub(super) table_id: i64,
-    /// `pack_pk_cols(col_indices)` per cold filter — the `unique_filters` map
-    /// key, so the drop handler removes exactly the entries this warmup created.
-    pub(super) keys: Vec<u64>,
+    /// The column list per cold filter — the `unique_filters` map key, so the
+    /// drop handler removes exactly the entries this warmup created.
+    pub(super) keys: Vec<PkColList>,
     pub(super) disarmed: bool,
 }
 
 impl Drop for WarmupGuard<'_> {
     fn drop(&mut self) {
         if !self.disarmed {
-            for &packed in &self.keys {
-                self.disp.unique_filter_remove(self.table_id, packed);
+            for &cols in &self.keys {
+                self.disp.unique_filter_remove(self.table_id, cols);
             }
         }
     }
 }
 
 /// Column-extraction descriptor for one unique index on a table, `Copy` (built
-/// fresh per batch on the hot ingest path — no heap allocation). `packed`
-/// (= `pack_pk_cols(col_indices)`) keys the `unique_filters` map and is the
-/// exact `IDXTAB_PAY_SOURCE_COLS` value, so seed/drop/warmup all derive the
-/// same key; `spec` is the per-circuit span encode plan.
+/// fresh per batch on the hot ingest path — no heap allocation). `cols` keys the
+/// `unique_filters` map; `spec` is the per-circuit span encode plan.
 #[derive(Clone, Copy)]
 pub(super) struct UniqueIndexDesc {
-    pub(super) packed: u64,
+    pub(super) cols: PkColList,
     pub(super) spec: IndexKeySpec,
 }
 
@@ -183,26 +181,23 @@ impl MasterDispatcher {
             .index_circuits(table_id)
             .iter()
             .filter(|ic| ic.is_unique)
-            .map(|ic| UniqueIndexDesc {
-                packed: gnitz_wire::pack_pk_cols(ic.col_indices.as_slice()),
-                spec: ic.key_spec,
-            })
+            .map(|ic| UniqueIndexDesc { cols: ic.col_indices, spec: ic.key_spec })
             .collect()
     }
 
     /// True if every span in `spans` is definitely absent from the filter for
-    /// `(table_id, packed)`. Returns false if the filter is not warm (caller is
+    /// `(table_id, cols)`. Returns false if the filter is not warm (caller is
     /// expected to warm it first) or may contain any span — which a capped
     /// filter always does. On false, caller must fall through to the occupancy
     /// broadcast.
     pub(super) fn unique_filter_all_absent<'k>(
         &self,
         table_id: i64,
-        packed: u64,
+        cols: PkColList,
         mut spans: impl Iterator<Item = &'k [u8]>,
     ) -> bool {
         let filters = self.unique_filters.borrow();
-        let filter = match filters.get(&(table_id, packed)) {
+        let filter = match filters.get(&(table_id, cols)) {
             Some(f) => f,
             None => return false,
         };
@@ -221,7 +216,7 @@ impl MasterDispatcher {
         let mb = batch.as_mem_batch();
         let mut filters = self.unique_filters.borrow_mut();
         for d in descs {
-            let Some(filter) = filters.get_mut(&(table_id, d.packed)) else {
+            let Some(filter) = filters.get_mut(&(table_id, d.cols)) else {
                 continue; // not warm — warmup will pick this up
             };
             extract_into_filter(filter, &mb, &d.spec);
@@ -235,25 +230,24 @@ impl MasterDispatcher {
         self.unique_filters.borrow_mut().retain(|&(t, _), _| t != table_id);
     }
 
-    /// Remove the unique-filter entry for a single (owner_table_id, packed)
-    /// pair. `packed` is the `pack_pk_cols(col_indices)` / `IDXTAB_PAY_SOURCE_COLS`
-    /// value. Called on DROP INDEX so subsequent INSERTs re-trigger warmup for
+    /// Remove the unique-filter entry for a single `(owner_table_id, cols)`
+    /// pair. Called on DROP INDEX so subsequent INSERTs re-trigger warmup for
     /// the now-absent index while leaving unrelated filters on the same table; a
     /// non-existent key (e.g. a non-unique FK index) is a harmless no-op.
-    pub(crate) fn unique_filter_remove(&self, owner_id: i64, packed: u64) {
-        self.unique_filters.borrow_mut().remove(&(owner_id, packed));
+    pub(crate) fn unique_filter_remove(&self, owner_id: i64, cols: PkColList) {
+        self.unique_filters.borrow_mut().remove(&(owner_id, cols));
     }
 
-    /// Publish the `(table_id, packed)` filter the CREATE-time pre-flight
+    /// Publish the `(table_id, cols)` filter the CREATE-time pre-flight
     /// built under the catalog write lock, marking it warm so the first INSERT
     /// skips `ensure_unique_filters_warm`. A pre-flight that overflowed hands
     /// over an already-capped filter, so `unique_filter_all_absent` always
     /// falls through to the broadcast — the same steady state the lazy warmup
     /// converges to, without a redundant full-cluster scan on the first
     /// INSERT. Symmetric counterpart of `unique_filter_remove`.
-    pub(crate) fn unique_filter_seed(&self, table_id: i64, packed: u64, mut filter: UniqueFilter) {
+    pub(crate) fn unique_filter_seed(&self, table_id: i64, cols: PkColList, mut filter: UniqueFilter) {
         filter.warm = true; // pre-flight scanned every worker under the write lock
-        self.unique_filters.borrow_mut().insert((table_id, packed), filter);
+        self.unique_filters.borrow_mut().insert((table_id, cols), filter);
     }
 }
 
@@ -271,18 +265,18 @@ pub(super) async fn ensure_unique_filters_warm(
         let missing: Vec<UniqueIndexDesc> = disp
             .unique_index_descriptors(table_id)
             .into_iter()
-            .filter(|d| !filters.contains_key(&(table_id, d.packed)))
+            .filter(|d| !filters.contains_key(&(table_id, d.cols)))
             .collect();
         if missing.is_empty() {
             return Ok(());
         }
         for d in &missing {
-            filters.insert((table_id, d.packed), UniqueFilter::new());
+            filters.insert((table_id, d.cols), UniqueFilter::new());
         }
         let guard = WarmupGuard {
             disp,
             table_id,
-            keys: missing.iter().map(|d| d.packed).collect(),
+            keys: missing.iter().map(|d| d.cols).collect(),
             disarmed: false,
         };
         (missing, guard)
@@ -321,7 +315,7 @@ pub(super) async fn ensure_unique_filters_warm(
     drain_index_scan(slots, &scan, reactor, "scan", &schema, |mb, _| {
         let mut filters = disp.unique_filters.borrow_mut();
         for d in &missing {
-            if let Some(filter) = filters.get_mut(&(table_id, d.packed)) {
+            if let Some(filter) = filters.get_mut(&(table_id, d.cols)) {
                 extract_into_filter(filter, mb, &d.spec);
             }
         }
@@ -333,7 +327,7 @@ pub(super) async fn ensure_unique_filters_warm(
     // them, and disarm the guard so its Drop leaves them in place.
     let mut filters = disp.unique_filters.borrow_mut();
     for d in &missing {
-        if let Some(f) = filters.get_mut(&(table_id, d.packed)) {
+        if let Some(f) = filters.get_mut(&(table_id, d.cols)) {
             f.warm = true;
         }
     }

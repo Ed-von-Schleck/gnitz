@@ -307,7 +307,7 @@ fn a_wire_supplied_owner_view_id_must_name_a_real_view() {
             view_id: vid,
             schema_id: sid,
             name: "seg",
-            pk_col_idx: 0,
+            pk_col_idx: gnitz_wire::pack_pk_cols(&[0]),
             capacity_bytes: 0,
             delta_bytes: 0,
             owner_view_id: 999_999,

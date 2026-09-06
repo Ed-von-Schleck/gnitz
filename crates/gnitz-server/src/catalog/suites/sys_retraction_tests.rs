@@ -44,10 +44,13 @@ fn live_index_row(engine: &CatalogEngine, idx_id: i64) -> IdxRow {
     let (src, row) = sr.source();
     // Through the production decoder, so the reproduced row is what the engine
     // itself reads back; `name` is the one field it does not carry.
-    let (owner_id, source_cols, props) = read_idx_tab_row(src, row);
+    let (owner_id, cols, props) = read_idx_tab_row(src, row).expect("a live IDX_TAB row decodes");
     IdxRow {
         owner_id,
-        source_cols,
+        // `idx_tab_batch` writes the word, and the decoder hands back the list;
+        // re-packing is a round trip, so the reproduced row stays byte-equal and
+        // the retraction CAS passes.
+        source_cols: pack_pk_cols(cols.as_slice()),
         name: payload_string(src, row, IDXTAB_PAY_NAME),
         props,
     }

@@ -15,9 +15,9 @@ use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow};
 use gnitz_wire::{
     COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE,
     COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND, COLTAB_PAY_TYPE_CODE,
-    IDXTAB_PAY_FLAGS, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_NAME,
-    TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_NAME,
-    VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID,
+    IDXTAB_PAY_FLAGS, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID,
+    TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_OWNER_VIEW_ID,
+    VIEWTAB_PAY_PK_COL_IDX,
 };
 
 // ---------------------------------------------------------------------------
@@ -100,7 +100,7 @@ pub(super) fn read_table_tab_row<S: RowSource>(
     src: &S,
     row: usize,
 ) -> Result<(i64, String, PkColList, RelationKind, Placement), String> {
-    let name = payload_string(src, row, TABTAB_PAY_NAME);
+    let name = payload_string(src, row, RELTAB_PAY_NAME);
     let props = gnitz_wire::TableProps::from_flags(payload_u64(src, row, TABTAB_PAY_FLAGS));
     props
         .validate()
@@ -113,7 +113,7 @@ pub(super) fn read_table_tab_row<S: RowSource>(
     let pk = unpack_pk_cols(payload_u64(src, row, TABTAB_PAY_PK_COL_IDX))
         .map_err(|rule| format!("catalog invariant violated: table '{name}' {rule}"))?;
     Ok((
-        payload_u64(src, row, TABTAB_PAY_SCHEMA_ID) as i64,
+        payload_u64(src, row, RELTAB_PAY_SCHEMA_ID) as i64,
         name,
         pk,
         if props.stream {
@@ -126,19 +126,17 @@ pub(super) fn read_table_tab_row<S: RowSource>(
 }
 
 /// Decode VIEW_TAB `row`: `(schema_id, name, pk_list, budgets, owner_view_id)`.
-/// A bare `0` pk_list decodes back to `[0]`; a `0` budget word decodes to `None`
-/// here so no caller repeats the sentinel. `owner_view_id` is `0` for a user
-/// view. Like [`read_table_tab_row`], this is the reader every registration
-/// crosses, so a malformed PK word is rejected here.
+/// A `0` budget word decodes to `None` here so no caller repeats the sentinel;
+/// `owner_view_id` is `0` for a user view.
 pub(super) fn read_view_tab_row<S: RowSource>(
     src: &S,
     row: usize,
 ) -> Result<(i64, String, PkColList, ViewBudgets, i64), String> {
-    let name = payload_string(src, row, VIEWTAB_PAY_NAME);
+    let name = payload_string(src, row, RELTAB_PAY_NAME);
     let pk = unpack_pk_cols(payload_u64(src, row, VIEWTAB_PAY_PK_COL_IDX))
         .map_err(|rule| format!("catalog invariant violated: view '{name}' {rule}"))?;
     Ok((
-        payload_u64(src, row, VIEWTAB_PAY_SCHEMA_ID) as i64,
+        payload_u64(src, row, RELTAB_PAY_SCHEMA_ID) as i64,
         name,
         pk,
         ViewBudgets {
@@ -149,16 +147,17 @@ pub(super) fn read_view_tab_row<S: RowSource>(
     ))
 }
 
-/// Decode IDX_TAB `row` into the three words it stores. The middle one is the
-/// *stored* `pack_pk_cols(&col_indices)`, not a decoded list: `unpack_pk_cols`
-/// is not injective (a bare `5` and `pack_pk_cols(&[5])` both give `[5]`), and
-/// the unique-filter key and the retraction CAS both need the stored form.
-pub(super) fn read_idx_tab_row<S: RowSource>(src: &S, row: usize) -> (i64, u64, gnitz_wire::IndexProps) {
-    (
+/// Decode IDX_TAB `row`: `(owner_id, col_indices, props)` — the one decoding of
+/// `source_col_idx`, so no consumer holds its undecoded word.
+pub(super) fn read_idx_tab_row<S: RowSource>(
+    src: &S,
+    row: usize,
+) -> Result<(i64, PkColList, gnitz_wire::IndexProps), gnitz_wire::PkRule> {
+    Ok((
         payload_u64(src, row, IDXTAB_PAY_OWNER_ID) as i64,
-        payload_u64(src, row, IDXTAB_PAY_SOURCE_COLS),
+        unpack_pk_cols(payload_u64(src, row, IDXTAB_PAY_SOURCE_COLS))?,
         gnitz_wire::IndexProps::from_flags(payload_u64(src, row, IDXTAB_PAY_FLAGS)),
-    )
+    ))
 }
 
 /// Decode COL_TAB `row` into the `ColumnDef` the schema builder consumes.
@@ -212,31 +211,26 @@ pub(super) fn read_col_tab_ident<S: RowSource>(src: &S, row: usize) -> ColTabIde
     }
 }
 
-/// The `(owner_id, packed_source_cols, col_indices)` of every UNIQUE index this
-/// IDX_TAB family creates — positive-weight rows whose column list decodes. The
-/// DDL driver pre-flights each one before the bundle is made durable; `packed`
-/// is the same word the unique-filter map is keyed by.
-pub(crate) fn idx_tab_unique_creates(batch: &Batch) -> Vec<(i64, u64, PkColList)> {
+/// The `(owner_id, col_indices)` of every UNIQUE index this IDX_TAB family
+/// creates — positive-weight rows whose column list decodes. The DDL driver
+/// pre-flights each one before the bundle is made durable.
+pub(crate) fn idx_tab_unique_creates(batch: &Batch) -> Vec<(i64, PkColList)> {
     (0..batch.len())
         .filter(|&i| batch.get_weight(i) > 0)
         .filter_map(|i| {
-            let (owner_id, packed, props) = read_idx_tab_row(batch, i);
-            let cols = unpack_pk_cols(packed).ok()?;
-            props.is_unique.then_some((owner_id, packed, cols))
+            let (owner_id, cols, props) = read_idx_tab_row(batch, i).ok()?;
+            props.is_unique.then_some((owner_id, cols))
         })
         .collect()
 }
 
-/// The `(owner_id, packed_source_cols)` of every index this IDX_TAB family drops
-/// — its negative-weight rows. The DDL driver clears each pair's unique filter
-/// once the drop is durable.
-pub(crate) fn idx_tab_drops(batch: &Batch) -> Vec<(i64, u64)> {
+/// The `(owner_id, col_indices)` of every index this IDX_TAB family drops — its
+/// negative-weight rows whose column list decodes. The DDL driver clears each
+/// pair's unique filter once the drop is durable.
+pub(crate) fn idx_tab_drops(batch: &Batch) -> Vec<(i64, PkColList)> {
     (0..batch.len())
         .filter(|&i| batch.get_weight(i) < 0)
-        .map(|i| {
-            let (owner_id, packed, _props) = read_idx_tab_row(batch, i);
-            (owner_id, packed)
-        })
+        .filter_map(|i| read_idx_tab_row(batch, i).ok().map(|(owner, cols, _)| (owner, cols)))
         .collect()
 }
 
@@ -515,7 +509,7 @@ impl SysFamily {
 
     /// This family's position in `gnitz_wire::SYS_FAMILIES` — the index every
     /// per-family array here is laid out by. Const-evaluated for a literal
-    /// receiver; a nine-entry scan otherwise, at DDL-bundle or boot rate.
+    /// receiver; a seven-entry scan otherwise, at DDL-bundle or boot rate.
     #[inline]
     pub(crate) const fn index(self) -> usize {
         match gnitz_wire::sys_family_index(self as u64) {
@@ -589,9 +583,7 @@ impl SysFamily {
     /// there is no schema-rename or index-rename surface.
     pub(super) fn pair_change_mask(self) -> Option<u64> {
         match self {
-            // TABLE_TAB and VIEW_TAB agree on the name slot (asserted in
-            // gnitz-wire), so one constant serves both.
-            SysFamily::Table | SysFamily::View => Some(1 << TABTAB_PAY_NAME),
+            SysFamily::Table | SysFamily::View => Some(1 << RELTAB_PAY_NAME),
             SysFamily::Column => {
                 Some((1 << COLTAB_PAY_NAME) | (1 << COLTAB_PAY_IS_HIDDEN) | (1 << COLTAB_PAY_IS_NULLABLE))
             }

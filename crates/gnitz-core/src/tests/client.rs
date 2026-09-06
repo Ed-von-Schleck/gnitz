@@ -125,7 +125,7 @@ fn a_copied_catalog_row_differs_only_where_it_is_patched() {
     let mut pair = ZSetBatch::new(schema);
     pair.copy_row_at(&scanned, i, -1, schema);
     pair.copy_row_at(&scanned, i, 1, schema);
-    pair.set_string_cell(1, TABTAB_COL_NAME, "t2");
+    pair.set_string_cell(1, RELTAB_COL_NAME, "t2");
 
     assert_eq!(pair.weights, vec![-1, 1]);
     assert_eq!(pair.pks.to_vec_u128(schema), vec![7, 7], "the rename keeps the id");
@@ -133,7 +133,7 @@ fn a_copied_catalog_row_differs_only_where_it_is_patched() {
     // Every non-name column is the stored row's, in both halves.
     let flags = &pair.columns[gnitz_wire::TABTAB_COL_FLAGS];
     assert_eq!(flags[..], [9u64.to_le_bytes(), 9u64.to_le_bytes()].concat()[..]);
-    let names: Vec<&[u8]> = pair.columns[TABTAB_COL_NAME]
+    let names: Vec<&[u8]> = pair.columns[RELTAB_COL_NAME]
         .chunks_exact(16)
         .map(|cell| gnitz_wire::german_string_content(cell, &pair.blob))
         .collect();

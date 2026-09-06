@@ -525,8 +525,8 @@ pub(crate) fn execute_create_table(
     // Phase 6 — CLUSTER BY (hash distribution key). The named columns must be the
     // PK's leading prefix in PK order; the prefix length `k` is persisted in
     // `TABLE_TAB.flags` and drives write-side routing and co-partition detection.
-    // No clause ⇒ `k = 0` ⇒ default full-PK distribution (byte-identical to before
-    // this feature). `GenericDialect` parses `CLUSTER BY a, b` into `cluster_by`.
+    // No clause ⇒ `k = 0` ⇒ default full-PK distribution.
+    // `GenericDialect` parses `CLUSTER BY a, b` into `cluster_by`.
     let dist_prefix_len = if let Some(cluster) = &create.cluster_by {
         let (WrappedCollection::NoWrapping(exprs) | WrappedCollection::Parentheses(exprs)) = cluster;
         let mut cluster_indices: Vec<u32> = Vec::with_capacity(exprs.len());

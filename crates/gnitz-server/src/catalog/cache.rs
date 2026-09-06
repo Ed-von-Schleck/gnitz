@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_wire::{IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, SCHEMATAB_PAY_NAME, TABTAB_PAY_NAME, TABTAB_PAY_SCHEMA_ID};
+use gnitz_wire::{IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
 
@@ -155,8 +155,8 @@ impl CatalogEngine {
             let tid = batch.get_pk(i) as i64;
 
             if weight > 0 {
-                let sid = payload_u64(batch, i, TABTAB_PAY_SCHEMA_ID) as i64;
-                let name = payload_string(batch, i, TABTAB_PAY_NAME);
+                let sid = payload_u64(batch, i, RELTAB_PAY_SCHEMA_ID) as i64;
+                let name = payload_string(batch, i, RELTAB_PAY_NAME);
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let qualified = gnitz_wire::qualified_key(&schema_name, &name);
                 self.caches.entity_by_qname.insert(qualified, tid);
@@ -194,7 +194,7 @@ impl CatalogEngine {
         for i in 0..batch.len() {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
-            let sid = payload_u64(batch, i, TABTAB_PAY_SCHEMA_ID) as i64;
+            let sid = payload_u64(batch, i, RELTAB_PAY_SCHEMA_ID) as i64;
 
             if weight > 0 {
                 self.caches.members_by_schema.entry(sid).or_default().insert(tid);

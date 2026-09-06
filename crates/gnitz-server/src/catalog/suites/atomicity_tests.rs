@@ -294,7 +294,7 @@ fn test_idx_tab_view_owner_rejected() {
     let batch = idx_tab_batch(
         idx_id,
         vid,
-        0,
+        pack_pk_cols(&[0]),
         "idx_on_view",
         gnitz_wire::IndexProps { is_unique: false, is_internal: false },
         1,
@@ -472,7 +472,7 @@ fn test_next_index_id_advances_on_index_register() {
     let batch = idx_tab_batch(
         large_idx_id,
         tid,
-        1,
+        pack_pk_cols(&[1]),
         "public__seqsync__idx_val_sync",
         gnitz_wire::IndexProps { is_unique: false, is_internal: false },
         1,

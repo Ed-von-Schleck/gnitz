@@ -437,6 +437,9 @@ impl core::fmt::Display for IndexKeyRule {
 /// catalog both take `Display`'s neutral wording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkRule {
+    /// The word carries no [`crate::PK_LIST_PACKED_FLAG`]. The one rule about the
+    /// *word*; every other presupposes a decoded list.
+    NotPacked,
     /// No PK columns at all. Every base table has an enforced primary key.
     Empty,
     /// Arity past [`crate::PK_LIST_MAX_COLS`], the persisted PK-list codec capacity.
@@ -479,6 +482,7 @@ impl PkRule {
     pub fn for_role(&self, role: PkListRole) -> String {
         let what = role.noun();
         match *self {
+            PkRule::NotPacked => format!("{what} word carries no packed-list flag"),
             PkRule::Empty => format!("{what} must name at least one column"),
             PkRule::TooManyColumns { count } => format!(
                 "{what} column count {count} out of range 1..={}",
@@ -514,11 +518,12 @@ impl core::fmt::Display for PkRule {
 /// list can run it alone; `ncols` is whatever bound that caller has — a real
 /// column count, or a field width for a list whose columns do not exist yet.
 pub fn validate_pk_indices(pk_cols: &[u32], ncols: usize) -> Result<(), PkRule> {
-    if pk_cols.is_empty() {
-        return Err(PkRule::Empty);
-    }
-    if pk_cols.len() > crate::PK_LIST_MAX_COLS {
-        return Err(PkRule::TooManyColumns { count: pk_cols.len() });
+    if !crate::pk_list_arity_ok(pk_cols.len()) {
+        return Err(if pk_cols.is_empty() {
+            PkRule::Empty
+        } else {
+            PkRule::TooManyColumns { count: pk_cols.len() }
+        });
     }
     for (j, &c) in pk_cols.iter().enumerate() {
         if c as usize >= ncols {

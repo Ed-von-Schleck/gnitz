@@ -234,12 +234,8 @@ impl RelDescriptorBlob {
         // first read fails — the same bound the FK arm gets from `num_columns`.
         let mut indexes = Vec::with_capacity(index_count.min(r.remaining() / 16));
         for _ in 0..index_count {
-            let cols = unpack_pk_cols(r.u64()?).map_err(|_| {
-                format!(
-                    "rel descriptor: index column-list count out of range 1..={}",
-                    crate::PK_LIST_MAX_COLS
-                )
-            })?;
+            let cols = unpack_pk_cols(r.u64()?)
+                .map_err(|rule| format!("rel descriptor: index {}", rule.for_role(crate::PkListRole::ColumnList)))?;
             let entry_flags = r.u64()?;
             indexes.push(RelIndex {
                 cols,

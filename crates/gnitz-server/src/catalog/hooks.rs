@@ -470,9 +470,8 @@ impl CatalogEngine {
     fn hook_index_register(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.len() {
             let idx_id = batch.get_pk(i) as i64;
-            let (owner_id, packed_cols, props) = read_idx_tab_row(batch, i);
-            let cols = gnitz_wire::unpack_pk_cols(packed_cols)
-                .map_err(|rule| format!("index {idx_id} on relation {owner_id}: column list {rule}"))?;
+            let (owner_id, cols, props) =
+                read_idx_tab_row(batch, i).map_err(|rule| format!("index {idx_id}: column list {rule}"))?;
             if batch.get_weight(i) > 0 {
                 self.register_index(idx_id, owner_id, &cols, props.is_unique)?;
             } else {

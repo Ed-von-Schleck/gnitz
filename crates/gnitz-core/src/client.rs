@@ -12,8 +12,8 @@ use crate::types::sys_schema;
 use gnitz_wire::sys_rows::{IdxTabRow, TableTabRow, ViewTabRow};
 use gnitz_wire::{
     RelClass, RelDescriptorBlob, TableProps, CIRCUIT_NODES_TAB, COL_TAB, IDXTAB_COL_NAME, IDXTAB_COL_SOURCE_COLS,
-    IDX_TAB, OWNER_KIND_TABLE, OWNER_KIND_VIEW, SCHEMATAB_COL_NAME, SCHEMA_TAB, TABLE_TAB, TABTAB_COL_NAME,
-    TABTAB_COL_SCHEMA_ID, VIEW_TAB,
+    IDX_TAB, OWNER_KIND_TABLE, OWNER_KIND_VIEW, RELTAB_COL_NAME, RELTAB_COL_SCHEMA_ID, SCHEMATAB_COL_NAME, SCHEMA_TAB,
+    TABLE_TAB, VIEW_TAB,
 };
 
 // --- Module-private helpers ---
@@ -1212,8 +1212,7 @@ impl GnitzClient {
 
         // Encode the PK list using the shared wire packer so the engine
         // catalog decodes it identically. Single-PK callers still flow
-        // through the same packer; the packed form's flag bit is what
-        // distinguishes it from a bare scalar index.
+        // through the same packer; there is no second form of the word.
         let pk_packed = gnitz_wire::pack_pk_cols(pk_cols);
 
         // COL_TAB family — the server sorts families by topo priority, so it
@@ -1526,8 +1525,7 @@ impl GnitzClient {
     /// The `-1` batch retiring every live row of system family `family` whose
     /// `schema_id` matches — the members `DROP SCHEMA` retracts — and their
     /// relation ids. Each `-1` is the scanned row copied verbatim. One code path
-    /// over TABLE_TAB and VIEW_TAB, which the static assert beside their column
-    /// constants licenses: the two agree on where `schema_id` sits.
+    /// over TABLE_TAB and VIEW_TAB.
     fn schema_retractions(&mut self, family: u64, schema_id: u64) -> Result<(ZSetBatch, Vec<u64>), ClientError> {
         let s = sys_schema(family);
         let mut out = ZSetBatch::new(s);
@@ -1536,7 +1534,7 @@ impl GnitzClient {
             return Ok((out, ids));
         };
         for i in scanned.live_rows() {
-            if col_u64(&scanned, TABTAB_COL_SCHEMA_ID, i)? == schema_id {
+            if col_u64(&scanned, RELTAB_COL_SCHEMA_ID, i)? == schema_id {
                 out.copy_row_at(&scanned, i, -1, s);
                 ids.push(scanned.pks.get(s, i) as u64);
             }
@@ -1584,8 +1582,7 @@ impl GnitzClient {
         let desc = self.resolve(&schema_name, &current_name)?.ok_or_else(missing)?;
 
         // One arm for both families: the pair is a verbatim copy of the live row
-        // with only `name` patched, and the static assert beside the column
-        // constants pins `name` to the same slot in TABLE_TAB and VIEW_TAB.
+        // with only `name` patched.
         let family = if desc.class.is_view() { VIEW_TAB } else { TABLE_TAB };
         let s = sys_schema(family);
         let scanned = self.seek_sys_row(family, desc.tid)?.ok_or_else(missing)?;
@@ -1593,7 +1590,7 @@ impl GnitzClient {
         let mut b = ZSetBatch::new(s);
         b.copy_row_at(&scanned, i, -1, s);
         b.copy_row_at(&scanned, i, 1, s);
-        b.set_string_cell(1, TABTAB_COL_NAME, &new_name);
+        b.set_string_cell(1, RELTAB_COL_NAME, &new_name);
         self.push_ddl_txn(&[(family, b)])?;
         if desc.class.is_view() {
             // The whole registration, though a rename keeps the id and so costs a

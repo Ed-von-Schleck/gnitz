@@ -91,13 +91,12 @@ pub struct MasterDispatcher {
     w2m: Rc<W2mReceiver>,
     // Catalog pointer — reborrowed per-call because &mut self borrows conflict.
     catalog: *mut CatalogEngine,
-    /// Per-(table_id, packed_col_list) filter skipping redundant unique-index
-    /// occupancy broadcasts. The `u64` is `pack_pk_cols(col_indices)` — the same
-    /// value stored in `IDXTAB_PAY_SOURCE_COLS` — so a composite index is
-    /// identified by its whole column list, and dropping `(a, b)` never touches
+    /// Per-(table_id, column list) filter skipping redundant unique-index
+    /// occupancy broadcasts. Keyed by the decoded list, so a composite index is
+    /// identified by its whole column list and dropping `(a, b)` never touches
     /// a distinct single-column filter on `a`. See the UniqueFilter comment
     /// block.
-    unique_filters: RefCell<FxHashMap<(i64, u64), UniqueFilter>>,
+    unique_filters: RefCell<FxHashMap<(i64, PkColList), UniqueFilter>>,
 
     /// The generation the last ephemeral round stamped. Set unconditionally, so
     /// `derived_needs_restamp` reads it in release builds too.

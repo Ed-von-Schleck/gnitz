@@ -371,7 +371,7 @@ impl SchemaDescriptor {
 
     /// Construct a `SchemaDescriptor` with a stamped [`Placement`] — for a base
     /// table, the one decoded from `TABLE_TAB.flags` (see
-    /// `gnitz_wire::pack_table_flags`); for a view, the one folded from its
+    /// `gnitz_wire::TableProps::pack`); for a view, the one folded from its
     /// sources.
     ///
     /// **A `const fn` whose `assert!`s fire in release and abort the process.**

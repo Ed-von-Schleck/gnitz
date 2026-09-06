@@ -307,7 +307,7 @@ fn test_sequence_gap_recovery() {
         // Inject table record for tid=250 directly into sys_tables
         engine
             .sys_store_mut(SysFamily::Table)
-            .ingest_borrowed_batch(&build_table_tab_row(250, 0, "gap_table"))
+            .ingest_borrowed_batch(&build_table_tab_row(250, pack_pk_cols(&[0]), "gap_table"))
             .unwrap();
 
         // Inject column record for tid=250

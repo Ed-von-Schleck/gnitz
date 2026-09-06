@@ -194,10 +194,9 @@ impl CatalogEngine {
                 continue;
             };
             let (src, ri) = sr.source();
-            let (row_owner, packed_cols, props) = read_idx_tab_row(src, ri);
             // A malformed word matches no column list, so it is simply not this
             // owner's index — the register hook is where such a row is refused.
-            let Ok(row_cols) = gnitz_wire::unpack_pk_cols(packed_cols) else {
+            let Ok((row_owner, row_cols, props)) = read_idx_tab_row(src, ri) else {
                 continue;
             };
             if row_owner == owner_id && row_cols.as_slice() == cols {

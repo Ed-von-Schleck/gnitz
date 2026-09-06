@@ -4,9 +4,9 @@ use crate::{
     CIRCNODES_PAY_SOURCE_TABLE, CIRCUIT_NODES_COLS, COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID,
     COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID,
     COLTAB_PAY_OWNER_KIND, COLTAB_PAY_TYPE_CODE, COL_TAB_COLS, IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID,
-    IDXTAB_PAY_SOURCE_COLS, IDX_TAB_COLS, SCHEMA_TAB_COLS, TABLE_TAB_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_NAME,
-    TABTAB_PAY_PK_COL_IDX, TABTAB_PAY_SCHEMA_ID, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_NAME,
-    VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_SCHEMA_ID, VIEW_TAB_COLS,
+    IDXTAB_PAY_SOURCE_COLS, IDX_TAB_COLS, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB_COLS, TABLE_TAB_COLS,
+    TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_OWNER_VIEW_ID,
+    VIEWTAB_PAY_PK_COL_IDX, VIEW_TAB_COLS,
 };
 
 /// A sink that records what a writer emitted, so the tests below read the
@@ -148,8 +148,8 @@ fn values_land_in_their_named_payload_slots() {
     );
     assert_eq!(r.pk, [16]);
     let v = r.row(TABLE_TAB_COLS, 1);
-    assert_eq!(v[TABTAB_PAY_SCHEMA_ID], Val::U64(3));
-    assert_eq!(v[TABTAB_PAY_NAME], Val::Str("t".into()));
+    assert_eq!(v[RELTAB_PAY_SCHEMA_ID], Val::U64(3));
+    assert_eq!(v[RELTAB_PAY_NAME], Val::Str("t".into()));
     assert_eq!(v[TABTAB_PAY_PK_COL_IDX], Val::U64(5));
     assert_eq!(v[TABTAB_PAY_FLAGS], Val::U64(9));
 
@@ -169,8 +169,8 @@ fn values_land_in_their_named_payload_slots() {
     );
     assert_eq!(r.pk, [20]);
     let v = r.row(VIEW_TAB_COLS, 1);
-    assert_eq!(v[VIEWTAB_PAY_SCHEMA_ID], Val::U64(4));
-    assert_eq!(v[VIEWTAB_PAY_NAME], Val::Str("v".into()));
+    assert_eq!(v[RELTAB_PAY_SCHEMA_ID], Val::U64(4));
+    assert_eq!(v[RELTAB_PAY_NAME], Val::Str("v".into()));
     assert_eq!(v[VIEWTAB_PAY_PK_COL_IDX], Val::U64(6));
     assert_eq!(v[VIEWTAB_PAY_CAPACITY], Val::U64(4096));
     assert_eq!(v[VIEWTAB_PAY_DELTA], Val::U64(1 << 20));

@@ -111,7 +111,7 @@ fn every_class_roundtrips_with_replicated() {
 fn truncated_blob_is_an_error() {
     let d = RelDescriptorBlob {
         indexes: vec![RelIndex {
-            cols: PkColList::single(0),
+            cols: PkColList::from_slice(&[0]),
             is_unique: true,
         }],
         ..Default::default()
@@ -150,7 +150,7 @@ fn each_decode_guard_rejects_its_own_forgery() {
     let bad_index_count = {
         let mut bytes = RelDescriptorBlob {
             indexes: vec![RelIndex {
-                cols: PkColList::single(0),
+                cols: PkColList::from_slice(&[0]),
                 is_unique: false,
             }],
             ..Default::default()

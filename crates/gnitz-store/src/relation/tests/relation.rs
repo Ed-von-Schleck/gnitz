@@ -71,6 +71,33 @@ fn test_add_remove_index_circuit() {
     registry.close();
 }
 
+/// `SeekByIndex` hands `index_cols` its `seek_col_idx` raw, where `HasPk` would
+/// have read `0` through `probe_key_columns` as the relation's own PK store.
+/// Neither `0` nor a garbage non-zero word names a column list.
+#[test]
+fn a_flag_clear_seek_col_idx_names_no_index() {
+    let mut registry = solo_registry();
+    let schema = SchemaDescriptor::new(
+        &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 3],
+        &[0],
+    );
+    let tbl = make_test_table("seek_col_idx_zero");
+    let owner_dir = relation_test_dir("seek_col_idx_zero_owner");
+    register_entry(&mut registry, 50, tbl, schema, RelationKind::BaseTable, owner_dir);
+    registry.add_index(50, 999, &[2], false).unwrap();
+
+    assert!(registry
+        .index_cols(50, gnitz_wire::pack_pk_cols(&[2]), "seek_by_index")
+        .is_ok());
+    for raw in [gnitz_wire::PROBE_KEYSPACE_PK, 2] {
+        let err = registry
+            .index_cols(50, raw, "seek_by_index")
+            .expect_err("a flag-clear word names no column list");
+        assert!(err.to_string().contains("invalid column list"), "{raw}: {err}");
+    }
+    registry.close();
+}
+
 /// An index store is rederived, so a base round only folds it to RAM; the
 /// ephemeral round is what force-persists it, index circuits included.
 #[test]

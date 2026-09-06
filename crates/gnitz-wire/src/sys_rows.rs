@@ -96,7 +96,7 @@ pub fn write_col_tab_row(sink: &mut impl SysRowSink, r: &ColTabRow, weight: i64)
 // ---------------------------------------------------------------------------
 
 /// One `TABLE_TAB` row. `pk_col_idx` is the packed PK column list
-/// (`pack_pk_cols`); `flags` is packed by `pack_table_flags`.
+/// (`pack_pk_cols`); `flags` is packed by `TableProps::pack`.
 pub struct TableTabRow<'a> {
     pub table_id: u64,
     pub schema_id: u64,
@@ -118,8 +118,8 @@ pub fn write_table_tab_row(sink: &mut impl SysRowSink, r: &TableTabRow, weight: 
 // VIEW_TAB
 // ---------------------------------------------------------------------------
 
-/// One `VIEW_TAB` row. `pk_col_idx` is the packed view-PK column list; a bare
-/// `0` decodes back to the single-column PK `[0]`.
+/// One `VIEW_TAB` row. `pk_col_idx` is the packed view-PK column list
+/// (`pack_pk_cols`).
 pub struct ViewTabRow<'a> {
     pub view_id: u64,
     pub schema_id: u64,

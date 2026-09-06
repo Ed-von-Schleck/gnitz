@@ -911,8 +911,8 @@ impl CatalogEngine {
         let mut claimed: FxHashSet<String> = FxHashSet::default();
         let noun = SysFamily::Index.row_noun();
         for i in (0..batch.len()).filter(|&i| batch.get_weight(i) > 0) {
-            let (owner_id, packed_cols, props) = read_idx_tab_row(batch, i);
-            let cols = gnitz_wire::unpack_pk_cols(packed_cols).map_err(|rule| format!("Index: column list {rule}"))?;
+            let (owner_id, cols, props) =
+                read_idx_tab_row(batch, i).map_err(|rule| format!("Index: column list {rule}"))?;
             let index_name = payload_string(batch, i, IDXTAB_PAY_NAME);
             reject_unstorable_name(&index_name, noun)?;
             // Only `submit_local` — the FK auto-index, which bypasses this
@@ -952,7 +952,8 @@ impl CatalogEngine {
         drop_ids.sort_unstable();
 
         for i in (0..batch.len()).filter(|&i| batch.get_weight(i) < 0) {
-            let (owner_id, packed_cols, props) = read_idx_tab_row(batch, i);
+            let (owner_id, cols, props) =
+                read_idx_tab_row(batch, i).map_err(|rule| format!("Index: column list {rule}"))?;
             // An internal index backs the FK RESTRICT seek; dropping one would
             // silently disarm FK enforcement. Keyed on the raw `-1` rows, not on
             // net-dead: a rewrite pair must not slip past it.
@@ -962,9 +963,6 @@ impl CatalogEngine {
             // FK backing is single-column: a composite index never satisfies a
             // single-column FK/uniqueness requirement, so dropping one is never
             // blocked by the FK-target guard.
-            let Ok(cols) = gnitz_wire::unpack_pk_cols(packed_cols) else {
-                continue;
-            };
             if cols.as_slice().len() != 1 {
                 continue;
             }

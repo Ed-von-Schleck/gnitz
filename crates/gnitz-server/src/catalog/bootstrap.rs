@@ -139,7 +139,8 @@ impl CatalogEngine {
         {
             let mut bb = BatchBuilder::new(SysFamily::Table.schema());
             for family in SysFamily::ALL {
-                push_table_tab_row(&mut bb, family.id(), SYSTEM_SCHEMA_ID, family.name(), 0, 0, 1);
+                let pk = gnitz_wire::pack_pk_cols(family.wire().pk_cols);
+                push_table_tab_row(&mut bb, family.id(), SYSTEM_SCHEMA_ID, family.name(), pk, 0, 1);
             }
             self.bootstrap_ingest(SysFamily::Table, bb)?;
         }
