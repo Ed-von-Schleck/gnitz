@@ -126,9 +126,10 @@ fn descriptor_fields_round_trip() {
     let (_, c) = client.resolve_table_id(&sn, "c").unwrap();
     assert!(c.columns[0].is_serial);
     assert!(!c.columns[1].is_serial);
-    assert_eq!(c.columns[0].fk_table_id, 0, "the PK carries no FK");
-    assert_eq!((c.columns[1].fk_table_id, c.columns[1].fk_col_idx), (p_tid, 0));
-    assert_eq!((c.columns[2].fk_table_id, c.columns[2].fk_col_idx), (p_tid, 1));
+    use gnitz_core::FkTarget;
+    assert_eq!(c.columns[0].fk, None, "the PK carries no FK");
+    assert_eq!(c.columns[1].fk, Some(FkTarget::Table { id: p_tid, col: 0 }));
+    assert_eq!(c.columns[2].fk, Some(FkTarget::Table { id: p_tid, col: 1 }));
 }
 
 /// The index list is exact — an empty list means "no index", never "unchanged".

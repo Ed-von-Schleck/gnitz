@@ -165,7 +165,7 @@ fn index_key_slots_roundtrip() {
         let vals = &all[..k];
         let (buf, len) = pack_index_key_slots(vals);
         assert_eq!(len, k * INDEX_KEY_SLOT);
-        // `split_wire` routes slot 0 to seek_pk and the rest to the tail.
+        // `split_ctrl_key` routes slot 0 to seek_pk and the rest to the tail.
         let seek_pk = u128::from_le_bytes(buf[..INDEX_KEY_SLOT].try_into().unwrap());
         let extra = &buf[INDEX_KEY_SLOT..len];
         let back = unpack_index_key_slots(seek_pk, extra, PK_LIST_MAX_COLS).expect("well-formed");

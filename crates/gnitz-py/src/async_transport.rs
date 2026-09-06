@@ -13,7 +13,7 @@ use pyo3::prelude::*;
 use gnitz_core::{ClientError, WireConflictMode};
 
 use crate::read::triple_to_lazy;
-use crate::write::{pk_tuple_from_py, PyZSetBatch};
+use crate::write::{pk_key_from_py, PyZSetBatch};
 use crate::{build_pylist, client_err, to_py_err};
 
 // resolve directly: no thread, no channel, no cross-thread wake.
@@ -279,8 +279,8 @@ impl PyAsyncTransport {
         pk: Bound<'_, PyAny>,
         include_hidden: bool,
     ) -> PyResult<Py<PyAny>> {
-        let t = pk_tuple_from_py(&pk)?;
-        let slot = to_py_err(self.session.submit(gnitz_core::Request::seek(target_id, &t)))?;
+        let (low, extra) = pk_key_from_py(&pk)?;
+        let slot = to_py_err(self.session.submit(gnitz_core::Request::seek(target_id, low, &extra)))?;
         self.register(py, slot, include_hidden)
     }
 

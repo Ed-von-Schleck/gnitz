@@ -330,6 +330,7 @@ impl ExistsCore<'_> {
             .pk_cols
             .iter()
             .map(|&c| {
+                let c = c as usize;
                 ColumnDef::new(
                     left_in.schema.columns[c].name.clone(),
                     left_in.schema.columns[c].type_code.reindex_output_type(),
@@ -408,7 +409,7 @@ pub(crate) fn lower_mark_view(
     branch_cols.extend(left_in.schema.columns.iter().cloned());
     let branch_schema = Schema {
         columns: branch_cols,
-        pk_cols: (0..npk).collect(),
+        pk_cols: (0..npk as u32).collect(),
     };
     let branch_layout = key_region_layout(npk, left_in.layout.iter().copied());
 

@@ -1,7 +1,7 @@
 use crate::connection::{MultiScanResult, RawBlock, RelTarget, ScanResult, Session};
 use crate::error::ClientError;
 use crate::protocol::{
-    BatchAppender, ColData, ColumnDef, PkColumn, PkTuple, ReplySchema, Schema, TypeCode, WireConflictMode, ZSetBatch,
+    BatchAppender, ColumnDef, PkColumn, PkTuple, ReplySchema, Schema, TypeCode, WireConflictMode, ZSetBatch,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -18,30 +18,28 @@ use gnitz_wire::{
 
 // --- Module-private helpers ---
 
-fn col_u64(col: &ColData, i: usize) -> Result<u64, ClientError> {
-    let cell = col
-        .cell(i, 8)
+fn col_u64(batch: &ZSetBatch, ci: usize, i: usize) -> Result<u64, ClientError> {
+    let cell = batch
+        .cell(ci, i, 8)
         .ok_or_else(|| ClientError::ServerError(format!("col_u64: no 8-byte cell at row {i}")))?;
     Ok(gnitz_wire::read_u64_le(cell, 0))
 }
 
 /// Row `i` of a system-table STRING column. Every such column is declared
 /// non-nullable, so a NULL is a malformed reply, not a case — this is the trust
-/// boundary that says so rather than substituting `""`.
-fn col_str(col: &ColData, i: usize) -> Result<&str, ClientError> {
-    let ColData::Strings(v) = col else {
-        return Err(ClientError::ServerError("col_str: expected Strings column".into()));
-    };
-    match v.get(i) {
-        Some(Some(s)) => Ok(s),
-        Some(None) => Err(ClientError::ServerError(format!(
+/// boundary that says so rather than substituting `""`. UTF-8 is validated here
+/// too: the region carries bytes.
+fn col_str<'a>(batch: &'a ZSetBatch, schema: &Schema, ci: usize, i: usize) -> Result<&'a str, ClientError> {
+    let cell = batch
+        .cell(ci, i, 16)
+        .ok_or_else(|| ClientError::ServerError(format!("col_str: row {i} out of bounds")))?;
+    if gnitz_wire::null_word_get(batch.nulls[i], schema.payload_idx(ci)) {
+        return Err(ClientError::ServerError(format!(
             "col_str: NULL in a non-nullable system column at row {i}"
-        ))),
-        None => Err(ClientError::ServerError(format!(
-            "col_str: row {i} out of bounds (len {})",
-            v.len()
-        ))),
+        )));
     }
+    std::str::from_utf8(gnitz_wire::german_string_content(cell, &batch.blob))
+        .map_err(|e| ClientError::ServerError(format!("col_str: invalid UTF-8 at row {i}: {e}")))
 }
 
 /// [`gnitz_wire::qualified_key`] from names that may still be raw user text.
@@ -62,10 +60,10 @@ fn not_found(noun: &'static str, schema_name: &str, name: &str) -> ClientError {
 }
 
 /// Build the `-1` retraction batch for `pks`: the server's `retract_pk` matches
-/// by PK alone, so the payload columns are inert filler (built directly, not via
-/// `BatchAppender`, whose `add_row` takes a single scalar PK). Shared by
-/// `GnitzClient::delete` and the SQL layer's DELETE RMW retry closure (which
-/// needs the batch without an immediate push).
+/// by PK alone, so the payload columns are inert filler. Built directly rather
+/// than through `BatchAppender`, which has no way to take a whole `PkColumn`.
+/// Shared by `GnitzClient::delete` and the SQL layer's DELETE RMW retry closure
+/// (which needs the batch without an immediate push).
 pub fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
     let count = pks.len();
     ZSetBatch {
@@ -73,6 +71,7 @@ pub fn retraction_batch(schema: &Schema, pks: PkColumn) -> ZSetBatch {
         weights: vec![-1; count],
         nulls: vec![0; count],
         columns: ZSetBatch::filler_columns(schema, count),
+        blob: vec![],
     }
 }
 
@@ -214,14 +213,14 @@ pub fn delta_reply_schema(view: &Schema) -> Result<Schema, ClientError> {
     }
     let mut columns = Vec::with_capacity(view.num_columns() + 1);
     let mut pk_cols = Vec::with_capacity(view.pk_count() + 1);
-    for c in gnitz_wire::delta_schema_order(view.pk_indices(), view.num_columns()) {
+    for c in gnitz_wire::delta_schema_order(&view.pk_cols, view.num_columns()) {
         let (cd, is_key) = match c {
             gnitz_wire::DeltaCol::Tick => (ColumnDef::new("_tick", TypeCode::U64, false).hidden(), true),
             gnitz_wire::DeltaCol::Key(i) => (view.columns[i].clone(), true),
             gnitz_wire::DeltaCol::Payload(i) => (view.columns[i].clone(), false),
         };
         if is_key {
-            pk_cols.push(columns.len());
+            pk_cols.push(columns.len() as u32);
         }
         columns.push(cd);
     }
@@ -836,8 +835,11 @@ impl GnitzClient {
         self.session.scan_multi(table_ids)
     }
 
-    pub fn seek(&mut self, table_id: u64, pk: &PkTuple) -> ScanResult {
-        self.session.seek(table_id, pk)
+    /// A point SEEK by primary key, in the wire's **native** key space, split by
+    /// `gnitz_wire::control::split_ctrl_key`. The engine OPK-encodes it against
+    /// the relation's schema, so no caller here needs one.
+    pub fn seek(&mut self, table_id: u64, pk: u128, pk_extra: &[u8]) -> ScanResult {
+        self.session.seek(table_id, pk, pk_extra)
     }
 
     /// Seek a secondary index by `col_indices` (the index's FULL declared column
@@ -958,7 +960,7 @@ impl GnitzClient {
             return missing();
         };
         for i in idx_batch.live_rows() {
-            if col_str(&idx_batch.columns[IDXTAB_COL_NAME], i)? != index_name.as_str() {
+            if col_str(&idx_batch, sys_schema(IDX_TAB), IDXTAB_COL_NAME, i)? != index_name.as_str() {
                 continue;
             }
             let idx_schema = sys_schema(IDX_TAB);
@@ -980,10 +982,10 @@ impl GnitzClient {
         };
         let mut out = Vec::new();
         for i in idx_batch.live_rows() {
-            let name = col_str(&idx_batch.columns[IDXTAB_COL_NAME], i)?.to_string();
-            let cols = gnitz_wire::unpack_pk_cols(col_u64(&idx_batch.columns[IDXTAB_COL_SOURCE_COLS], i)?)
+            let name = col_str(&idx_batch, sys_schema(IDX_TAB), IDXTAB_COL_NAME, i)?.to_string();
+            let cols = gnitz_wire::unpack_pk_cols(col_u64(&idx_batch, IDXTAB_COL_SOURCE_COLS, i)?)
                 .map_err(|rule| ClientError::ServerError(format!("index '{name}': {rule}")))?;
-            out.push((idx_batch.pks.get(i) as u64, name, cols));
+            out.push((idx_batch.pks.get(sys_schema(IDX_TAB), i) as u64, name, cols));
         }
         Ok(out)
     }
@@ -1292,9 +1294,9 @@ impl GnitzClient {
         };
         let tid = desc.tid;
         let scanned = self.seek_sys_row(TABLE_TAB, tid)?.ok_or_else(missing)?;
-        let i = scanned.live_row_with_pk(tid).ok_or_else(missing)?;
-
         let tbl_schema = sys_schema(TABLE_TAB);
+        let i = scanned.live_row_with_pk(tbl_schema, tid).ok_or_else(missing)?;
+
         let mut tb = ZSetBatch::new(tbl_schema);
         tb.copy_row_at(&scanned, i, -1, tbl_schema);
         self.push_ddl_txn(&[(TABLE_TAB, tb)])?;
@@ -1534,9 +1536,9 @@ impl GnitzClient {
             return Ok((out, ids));
         };
         for i in scanned.live_rows() {
-            if col_u64(&scanned.columns[TABTAB_COL_SCHEMA_ID], i)? == schema_id {
+            if col_u64(&scanned, TABTAB_COL_SCHEMA_ID, i)? == schema_id {
                 out.copy_row_at(&scanned, i, -1, s);
-                ids.push(scanned.pks.get(i) as u64);
+                ids.push(scanned.pks.get(s, i) as u64);
             }
         }
         Ok((out, ids))
@@ -1556,7 +1558,9 @@ impl GnitzClient {
             return Ok(None);
         };
         let scanned = self.seek_sys_row(VIEW_TAB, desc.tid)?.ok_or_else(missing)?;
-        let i = scanned.live_row_with_pk(desc.tid).ok_or_else(missing)?;
+        let i = scanned
+            .live_row_with_pk(sys_schema(VIEW_TAB), desc.tid)
+            .ok_or_else(missing)?;
         Ok(Some((desc.tid, scanned, i)))
     }
 
@@ -1585,7 +1589,7 @@ impl GnitzClient {
         let family = if desc.class.is_view() { VIEW_TAB } else { TABLE_TAB };
         let s = sys_schema(family);
         let scanned = self.seek_sys_row(family, desc.tid)?.ok_or_else(missing)?;
-        let i = scanned.live_row_with_pk(desc.tid).ok_or_else(missing)?;
+        let i = scanned.live_row_with_pk(s, desc.tid).ok_or_else(missing)?;
         let mut b = ZSetBatch::new(s);
         b.copy_row_at(&scanned, i, -1, s);
         b.copy_row_at(&scanned, i, 1, s);
@@ -1791,10 +1795,9 @@ impl GnitzClient {
     /// rather than a decoded row, because a caller reads the row back out of it to
     /// write the matching `-1`.
     fn seek_sys_row(&mut self, family: u64, id: u64) -> Result<Option<ZSetBatch>, ClientError> {
-        let stride = sys_schema(family).pk_stride();
-        let reply = self
-            .session
-            .seek(family, &PkTuple::from_u128(stride as u8, id as u128))?;
+        // Every system family is keyed by a lone integer id, so the whole key
+        // rides the control block's narrow word and the extra blob is empty.
+        let reply = self.session.seek(family, id as u128, &[])?;
         checked_sys_rows(family, reply)
     }
 }
@@ -1882,7 +1885,11 @@ impl TxnBuffer {
         // Copied out, so no borrow of `families_of` spans the `families` read.
         let last = self.families_of.get(&tid).and_then(|v| v.last().copied());
         match last.filter(|&i| self.families[i].mode == mode) {
-            Some(i) => self.families[i].batch.extend_from_owned(batch),
+            Some(i) => {
+                let f = &mut self.families[i];
+                let schema = f.schema.clone();
+                f.batch.extend_from_owned(batch, &schema);
+            }
             None => {
                 self.families_of.entry(tid).or_default().push(self.families.len());
                 self.families.push(BufferedFamily {
@@ -1963,8 +1970,8 @@ impl<'a> TxnReads<'a> {
 /// corrupt catalog batch.
 fn find_schema_id(batch: &ZSetBatch, name: &str) -> Result<Option<u64>, ClientError> {
     for i in batch.live_rows() {
-        if col_str(&batch.columns[SCHEMATAB_COL_NAME], i)? == name {
-            return Ok(Some(batch.pks.get(i) as u64));
+        if col_str(batch, sys_schema(SCHEMA_TAB), SCHEMATAB_COL_NAME, i)? == name {
+            return Ok(Some(batch.pks.get(sys_schema(SCHEMA_TAB), i) as u64));
         }
     }
     Ok(None)

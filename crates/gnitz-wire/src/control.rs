@@ -152,6 +152,36 @@ pub const fn ctrl_block_size(error_msg_len: usize, seek_pk_extra_len: usize) -> 
     CTRL_BLOCK_SIZE_NO_BLOB + german_spill_len(error_msg_len) + german_spill_len(seek_pk_extra_len)
 }
 
+/// Split a packed key into the `(seek_pk, seek_pk_extra)` pair the two control
+/// columns above carry: the low [`crate::NARROW_PK_MAX_BYTES`] bytes as the
+/// `U128` word, the rest as the BLOB tail. Opaque bytes — it serves the PK seek
+/// channel and `seek_by_index`'s slot array alike. [`join_ctrl_key`] inverts it.
+#[inline]
+pub fn split_ctrl_key(key: &[u8]) -> (u128, &[u8]) {
+    let n = key.len().min(crate::NARROW_PK_MAX_BYTES);
+    let mut low = [0u8; crate::NARROW_PK_MAX_BYTES];
+    low[..n].copy_from_slice(&key[..n]);
+    (u128::from_le_bytes(low), &key[n..])
+}
+
+/// [`split_ctrl_key`]'s inverse: reassemble the key into `dst`, whose length is
+/// the key's own width. Fallible because `extra` arrives from the wire, and only
+/// the receiver's schema knows how wide the key should be.
+pub fn join_ctrl_key(low: u128, extra: &[u8], dst: &mut [u8]) -> Result<(), String> {
+    let n = dst.len().min(crate::NARROW_PK_MAX_BYTES);
+    let needed = dst.len() - n;
+    if extra.len() < needed {
+        return Err(format!(
+            "key of {} bytes requires {needed} extra bytes, got {}",
+            dst.len(),
+            extra.len()
+        ));
+    }
+    dst[..n].copy_from_slice(&low.to_le_bytes()[..n]);
+    dst[n..].copy_from_slice(&extra[..needed]);
+    Ok(())
+}
+
 /// `copy_from_slice` is not `const`, so the template below writes its
 /// little-endian fields a byte at a time. Generic over the field width, since
 /// that is the only thing the u32 and u64 forms differed in.

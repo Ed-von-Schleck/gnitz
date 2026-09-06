@@ -11,9 +11,7 @@
 //! cross-worker barrier can hold a consumer back — correct output rests
 //! entirely on the driver visiting a producer before its consumer.
 
-use gnitz_core::{
-    BatchAppender, ColData, ColumnDef, GnitzClient, PlannedView, Schema, TableProps, TypeCode, ZSetBatch,
-};
+use gnitz_core::{BatchAppender, ColumnDef, GnitzClient, PlannedView, Schema, TableProps, TypeCode, ZSetBatch};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 
 const BASE_ROWS: [(i64, i64); 3] = [(1, 10), (2, 20), (3, 30)];
@@ -68,27 +66,24 @@ fn misordered_chain(base_tid: u64, cols: &[ColumnDef]) -> Vec<PlannedView> {
 fn segment_vids_of(client: &mut GnitzClient, owner_vid: u64) -> Vec<u64> {
     let (_, batch, _) = client.scan(gnitz_wire::VIEW_TAB).expect("scan VIEW_TAB");
     let Some(b) = batch else { return Vec::new() };
-    let ColData::Fixed(owners) = &b.columns[gnitz_wire::VIEWTAB_COL_OWNER_VIEW_ID] else {
-        panic!("owner_view_id is a fixed-width column");
-    };
+    let owners = &b.columns[gnitz_wire::VIEWTAB_COL_OWNER_VIEW_ID];
     (0..b.len())
         .filter(|&i| b.weights[i] > 0)
         .filter(|&i| u64::from_le_bytes(owners[i * 8..i * 8 + 8].try_into().unwrap()) == owner_vid)
-        .map(|i| b.pks.get(i) as u64)
+        .map(|i| b.pks.get(gnitz_core::types::sys_schema(gnitz_wire::VIEW_TAB), i) as u64)
         .collect()
 }
 
 /// `(pk, v, weight)` of every row a `(pk, v)` relation holds, sorted.
 fn weighted_rows(client: &mut GnitzClient, id: u64) -> Vec<(i64, i64, i64)> {
-    let (_, batch, _) = client.scan(id).unwrap();
+    let (schema, batch, _) = client.scan(id).unwrap();
     let Some(b) = batch else { return Vec::new() };
-    let ColData::Fixed(vs) = &b.columns[1] else {
-        panic!("v is a fixed-width column");
-    };
+    let schema = schema.expect("a cold scan carries the relation's schema block");
+    let vs = &b.columns[1];
     let mut out: Vec<(i64, i64, i64)> = (0..b.len())
         .map(|i| {
             let v = i64::from_le_bytes(vs[i * 8..i * 8 + 8].try_into().unwrap());
-            (b.pks.get(i) as i64, v, b.weights[i])
+            (b.pks.get(&schema, i) as i64, v, b.weights[i])
         })
         .collect();
     out.sort();
@@ -174,7 +169,7 @@ fn a_bundle_is_refused_whole_on_a_name_collision_or_over_the_segment_cap() {
         .map(|b| {
             (0..b.len())
                 .filter(|&i| b.weights[i] > 0)
-                .map(|i| b.pks.get(i) as u64)
+                .map(|i| b.pks.get(gnitz_core::types::sys_schema(gnitz_wire::VIEW_TAB), i) as u64)
                 .collect()
         })
         .unwrap_or_default();

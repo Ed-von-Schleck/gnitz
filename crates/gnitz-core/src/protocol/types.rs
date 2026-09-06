@@ -12,13 +12,23 @@ pub fn type_code_from_u64(v: u64) -> Result<TypeCode, ProtocolError> {
     TypeCode::try_from_u8(v as u8).ok_or(ProtocolError::UnknownTypeCode(v))
 }
 
+/// The relation and column a FOREIGN KEY column references. `SelfTable` is the
+/// binding `CREATE TABLE` must defer — the id exists only once the table does —
+/// which [`ColumnDef::col_tab_row`] resolves to the owner; a schema that came
+/// back from a resolve always carries `Table`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FkTarget {
+    Table { id: u64, col: u32 },
+    SelfTable { col: u32 },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnDef {
     pub name: std::string::String,
     pub type_code: TypeCode,
     pub is_nullable: bool,
-    pub fk_table_id: u64,
-    pub fk_col_idx: u64,
+    /// The FOREIGN KEY this column carries, if any.
+    pub fk: Option<FkTarget>,
     /// True for a Postgres-style SERIAL/BIGSERIAL/SMALLSERIAL primary key: an
     /// auto-assigned, client-stamped id the user may not supply. Round-trips
     /// through the wire meta-schema (`META_FLAG_SERIAL`) and `COL_TAB`, so a
@@ -40,28 +50,16 @@ pub struct ColumnDef {
 }
 
 impl ColumnDef {
-    /// `fk_table_id` value meaning "this column references the table being
-    /// created", whose id the planner cannot name yet. [`Self::col_tab_row`]
-    /// rewrites it to the owner id, so no `COL_TAB` row carries it.
-    ///
-    /// `0` cannot serve, being the live "no FK" value. `u64::MAX` is
-    /// unreachable as a table id, and an escaped marker fails closed: the
-    /// engine reads the field as `i64`, so it arrives as `-1` and is rejected
-    /// as an FK against an unknown table.
-    pub const SELF_FK_TABLE_ID: u64 = u64::MAX;
-
     /// A non-FK, non-SERIAL column — the common case. Client-side schema builders
     /// (the SQL planner, the Python driver) synthesize columns through here; the
-    /// planner's FK path assigns `fk_table_id`/`fk_col_idx` on the returned
-    /// column once the referenced table resolves, and a SERIAL column chains
-    /// [`ColumnDef::serial`].
+    /// planner's FK path fills `fk` once the referenced table resolves, and a
+    /// SERIAL column chains [`ColumnDef::serial`].
     pub fn new(name: impl Into<String>, type_code: TypeCode, is_nullable: bool) -> Self {
         Self {
             name: name.into(),
             type_code,
             is_nullable,
-            fk_table_id: 0,
-            fk_col_idx: 0,
+            fk: None,
             is_serial: false,
             is_hidden: false,
         }
@@ -70,18 +68,17 @@ impl ColumnDef {
     /// This column as the `COL_TAB` row recording it: column `col_idx` of
     /// `owner_id`, whose kind is `owner_kind`.
     ///
-    /// The FK fields are resolved against the owner rather than taken verbatim,
-    /// which is why this sits on the type that defines [`Self::SELF_FK_TABLE_ID`]:
-    /// the marker becomes `owner_id`, and a non-table owner writes no FK — a
-    /// view's defs are clones of the source columns, and the constraint belongs to
-    /// the base table.
+    /// The FK is resolved against the owner rather than taken verbatim:
+    /// [`FkTarget::SelfTable`] becomes `owner_id`, and a non-table owner writes
+    /// no FK — a view's defs are clones of the source columns, and the constraint
+    /// belongs to the base table. The wire's `0` = "no FK" convention starts
+    /// here.
     pub fn col_tab_row(&self, owner_id: u64, owner_kind: u64, col_idx: usize) -> gnitz_wire::sys_rows::ColTabRow<'_> {
-        let (fk_table_id, fk_col_idx) = if owner_kind != gnitz_wire::OWNER_KIND_TABLE {
-            (0, 0)
-        } else if self.fk_table_id == ColumnDef::SELF_FK_TABLE_ID {
-            (owner_id, self.fk_col_idx)
-        } else {
-            (self.fk_table_id, self.fk_col_idx)
+        let (fk_table_id, fk_col_idx) = match self.fk {
+            _ if owner_kind != gnitz_wire::OWNER_KIND_TABLE => (0, 0),
+            None => (0, 0),
+            Some(FkTarget::SelfTable { col }) => (owner_id, col as u64),
+            Some(FkTarget::Table { id, col }) => (id, col as u64),
         };
         gnitz_wire::sys_rows::ColTabRow {
             owner_id,
@@ -117,8 +114,10 @@ impl ColumnDef {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Schema {
     pub columns: Vec<ColumnDef>,
-    /// PK column indices in compound-key order; length >= 1.
-    pub pk_cols: Vec<usize>,
+    /// PK column indices in compound-key order; length >= 1. `u32` because that
+    /// is what every consumer takes — the wire validators, `ReduceOutKey`, the
+    /// PK-list packer, `create_table`.
+    pub pk_cols: Vec<u32>,
 }
 
 impl Schema {
@@ -126,12 +125,6 @@ impl Schema {
     #[inline]
     pub fn num_columns(&self) -> usize {
         self.columns.len()
-    }
-
-    /// All PK column indices, in compound-key order.
-    #[inline]
-    pub fn pk_indices(&self) -> &[usize] {
-        &self.pk_cols
     }
 
     /// Number of PK columns (compound-key arity). Compound primary keys are
@@ -151,33 +144,30 @@ impl Schema {
     pub fn pk_stride(&self) -> usize {
         self.pk_cols
             .iter()
-            .map(|&ci| self.columns[ci].type_code.wire_stride())
+            .map(|&ci| self.columns[ci as usize].type_code.wire_stride())
             .sum()
     }
 
-    /// The single PK column index. Use only where a compound PK has already
-    /// been ruled out by the caller — the remaining production callers are in
-    /// the SQL planner (`ddl::table`'s lone-PK foreign-key check, `dml::insert`'s
-    /// conflict-target name lookup). Hard-asserts length-1: a `debug_assert!`
-    /// would compile out in release and let the silent truncation to the first
-    /// PK column ship to production.
+    /// The lone PK column's index, or `None` for a compound key. Total, so a
+    /// caller cannot reach the first of several PK columns by mistake.
     #[inline]
-    #[track_caller]
-    pub fn pk_index_single(&self) -> usize {
-        assert_eq!(self.pk_cols.len(), 1, "compound PK not yet supported here");
-        self.pk_cols[0]
+    pub fn pk_index_single(&self) -> Option<u32> {
+        match self.pk_cols[..] {
+            [ci] => Some(ci),
+            _ => None,
+        }
     }
 
     /// Number of non-PK ("payload") columns: `columns.len() - pk_count`.
     #[inline]
     pub fn num_payload_cols(&self) -> usize {
-        self.num_columns() - self.pk_indices().len()
+        self.num_columns() - self.pk_cols.len()
     }
 
-    /// True iff column `ci` is the PK column.
+    /// True iff column `ci` is a PK column.
     #[inline]
     pub fn is_pk_col(&self, ci: usize) -> bool {
-        self.pk_indices().contains(&ci)
+        self.pk_cols.contains(&(ci as u32))
     }
 
     /// Byte offset of PK column `col_idx` within the packed PK region.
@@ -187,8 +177,8 @@ impl Schema {
         debug_assert!(self.is_pk_col(col_idx));
         self.pk_cols
             .iter()
-            .take_while(|&&pi| pi != col_idx)
-            .map(|&pi| self.columns[pi].type_code.wire_stride())
+            .take_while(|&&pi| pi as usize != col_idx)
+            .map(|&pi| self.columns[pi as usize].type_code.wire_stride())
             .sum()
     }
 
@@ -198,7 +188,7 @@ impl Schema {
     #[inline]
     pub fn pk_col_codes(&self) -> impl Iterator<Item = (usize, u8)> + '_ {
         self.pk_cols.iter().map(move |&ci| {
-            let tc = self.columns[ci].type_code;
+            let tc = self.columns[ci as usize].type_code;
             (tc.wire_stride(), tc as u8)
         })
     }
@@ -208,7 +198,7 @@ impl Schema {
     #[inline]
     pub fn payload_idx(&self, col_idx: usize) -> usize {
         debug_assert!(!self.is_pk_col(col_idx), "payload_idx: col_idx must not be a PK column");
-        col_idx - self.pk_cols.iter().filter(|&&p| p < col_idx).count()
+        col_idx - self.pk_cols.iter().filter(|&&p| (p as usize) < col_idx).count()
     }
 
     /// Iterate over the non-PK ("payload") columns.
@@ -246,14 +236,10 @@ impl Schema {
             .map(|(i, _)| i)
     }
 
-    /// True iff any **non-PK** column is hidden — i.e. the schema carries a
-    /// DROP COLUMN'd slot (a logical drop: physically present, zero-filled NOT
-    /// NULL, flagged hidden). A view's synthetic hidden key slots
-    /// (`_join_pk`/`_set_pk`/`_group_pk`, unprojected passthrough PKs) are PK
-    /// columns and do NOT count: they are filtered at presentation, so the
-    /// bare-`SELECT *` / `RETURNING *` fast paths stay on their raw-physical
-    /// passthrough for every view. Only a dropped column forces the
-    /// hidden-filtering projection.
+    /// True iff any **non-PK** column is hidden. Both call sites ask about a
+    /// *source relation*, where that means an `ALTER … DROP COLUMN` slot and
+    /// nothing else: a view's synthetic hidden keys are PK columns, so the
+    /// bare-`SELECT *` / `RETURNING *` fast paths keep their raw passthrough.
     #[inline]
     pub fn has_hidden_payload(&self) -> bool {
         (0..self.columns.len()).any(|i| self.is_hidden_payload(i))
@@ -274,9 +260,8 @@ impl Schema {
     /// re-decided) by the engine, both through
     /// [`ReduceOutKey::for_group_cols`].
     pub fn reduce_out_key(&self, cols: &[usize]) -> ReduceOutKey {
-        let pk: Vec<u32> = self.pk_cols.iter().map(|&c| c as u32).collect();
         let group: Vec<u32> = cols.iter().map(|&c| c as u32).collect();
-        ReduceOutKey::for_group_cols(&pk, &group, |c| {
+        ReduceOutKey::for_group_cols(&self.pk_cols, &group, |c| {
             let cd = &self.columns[c as usize];
             (cd.type_code as u8, cd.is_nullable)
         })
@@ -313,12 +298,8 @@ impl Schema {
     /// Fallible constructor for a schema assembled from untrusted parts — a
     /// wire schema block or catalog rows. Runs [`Schema::validate_parts`],
     /// so every decode boundary applies the same rule set.
-    pub fn from_parts(columns: Vec<ColumnDef>, pk_cols: Vec<usize>) -> Result<Schema, String> {
-        // Saturate rather than cast: the narrowing happens *before*
-        // `validate_pk_indices` compares against the column count, so a plain
-        // `as u32` would wrap an index of exactly 2^32 to 0 and let it pass.
-        let idx: Vec<u32> = pk_cols.iter().map(|&c| c.min(u32::MAX as usize) as u32).collect();
-        Self::validate_parts(&idx, &columns)?;
+    pub fn from_parts(columns: Vec<ColumnDef>, pk_cols: Vec<u32>) -> Result<Schema, String> {
+        Self::validate_parts(&pk_cols, &columns)?;
         Ok(Schema { columns, pk_cols })
     }
 
@@ -384,54 +365,89 @@ impl gnitz_expr::SchemaFacts for Schema {
     }
 }
 
-/// A batch's PK buffer in memory: `stride` bytes per row, **native
-/// little-endian**, columns packed in PK-list order. A client `ZSetBatch` holds
-/// PK values as the wire delivered them, so a signed column reads as two's
-/// complement.
+/// One row's OPK image from the PK columns' native values in PK-list order,
+/// plus its packed width. The one native→OPK column walk on the client.
+fn opk_row(schema: &Schema, natives: impl IntoIterator<Item = u128>) -> ([u8; MAX_PK_BYTES], usize) {
+    let mut buf = [0u8; MAX_PK_BYTES];
+    let mut off = 0;
+    for ((w, tc), v) in schema.pk_col_codes().zip(natives) {
+        gnitz_wire::encode_pk_column(&v.to_le_bytes()[..w], tc, &mut buf[off..off + w]);
+        off += w;
+    }
+    debug_assert_eq!(off, schema.pk_stride(), "opk_row: one value per PK column");
+    (buf, off)
+}
+
+/// [`opk_row`] for a key already packed as its columns' native little-endian
+/// bytes. Valid bytes are `0..native_le.len()`.
+fn opk_row_from_bytes(schema: &Schema, native_le: &[u8]) -> [u8; MAX_PK_BYTES] {
+    let mut buf = [0u8; MAX_PK_BYTES];
+    gnitz_wire::encode_pk_tuple(schema.pk_col_codes(), native_le, &mut buf[..native_le.len()]);
+    buf
+}
+
+/// The inverse of [`opk_row_from_bytes`]: `opk`'s columns decoded back to their
+/// native little-endian images, at the same offsets.
+fn native_row(schema: &Schema, opk: &[u8]) -> [u8; MAX_PK_BYTES] {
+    let mut buf = [0u8; MAX_PK_BYTES];
+    let mut off = 0;
+    for (w, tc) in schema.pk_col_codes() {
+        gnitz_wire::decode_pk_column(&opk[off..off + w], tc, &mut buf[off..off + w]);
+        off += w;
+    }
+    debug_assert_eq!(off, opk.len(), "native_row: schema stride != key width");
+    buf
+}
+
+/// A batch's PK region: `stride` bytes per row of **order-preserving key** (OPK,
+/// §4) — the bytes the wire carries and the engine stores, so a client batch's
+/// region and a `BatchBuilder`'s are byte-identical.
 ///
-/// **Not the PK region.** That name belongs to the §4 form —
-/// `gnitz_wire::wal::encode` frames it, a `ZSetBatchView` presents it, and it is
-/// OPK everywhere, client-side included. `build_pk_region_into` is where this
-/// buffer becomes one. Call this the `PkColumn` buffer; a comment that calls it
-/// a PK region is one step from asserting the region is native-LE.
-///
-/// One representation at every arity: a lone U32 key is 4 bytes per row, a lone
-/// UUID 16, a compound `(u64, u32)` 12. The stride comes from the schema
-/// (`Schema::pk_stride`), so it is never independent data to keep in sync.
+/// Private fields: routing hashes these bytes, so an un-encoded write would
+/// mis-partition rather than error. Every append encodes or copies OPK.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PkColumn {
-    pub stride: u8,
-    pub buf: Vec<u8>,
+    stride: u8,
+    buf: Vec<u8>,
 }
 
 impl PkColumn {
-    /// An empty column of `stride` bytes per row.
-    pub fn new(stride: u8) -> Self {
-        PkColumn { stride, buf: vec![] }
-    }
-
-    /// Empty `PkColumn` matching `schema`'s PK layout. `ZSetBatch::new`,
-    /// `GnitzClient::delete`, and the SQL DML helpers all route through this.
+    /// Empty `PkColumn` matching `schema`'s PK layout — the only constructor, so
+    /// the stride is never independent data to keep in sync.
     pub fn empty_for_schema(schema: &Schema) -> Self {
-        Self::new(schema.pk_stride() as u8)
+        PkColumn {
+            stride: schema.pk_stride() as u8,
+            buf: vec![],
+        }
     }
 
-    /// A column of `stride`-byte keys from their packed u128 values — each
-    /// value's low `stride` bytes. The counterpart of [`Self::get`].
-    pub fn from_u128s(stride: u8, vals: impl IntoIterator<Item = u128>) -> Self {
-        let mut c = Self::new(stride);
+    /// A column of `schema`'s keys from their native packed values. The
+    /// counterpart of [`Self::get`].
+    pub fn from_natives(schema: &Schema, vals: impl IntoIterator<Item = u128>) -> Self {
+        let mut c = Self::empty_for_schema(schema);
         for v in vals {
-            c.push_u128(v);
+            c.push_u128(schema, v);
         }
         c
+    }
+
+    /// Bytes per row.
+    #[inline]
+    pub fn stride(&self) -> u8 {
+        self.stride
     }
 
     fn width(&self) -> usize {
         self.stride as usize
     }
 
-    /// The `size` bytes of the PK column at PK-region byte offset `off` for row
-    /// `i`.
+    /// The whole §6 PK region: `len()` rows of `stride` OPK bytes.
+    #[inline]
+    pub fn region(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// The `size` OPK bytes at PK-region byte offset `off` of row `i`.
     pub fn col_window(&self, i: usize, off: usize, size: usize) -> &[u8] {
         let base = i * self.width() + off;
         &self.buf[base..base + size]
@@ -445,40 +461,75 @@ impl PkColumn {
         self.buf.is_empty()
     }
 
-    /// Row `i` widened to a u128 — the low `stride` bytes are the key. Only
-    /// meaningful for a key that fits in 16 bytes; a wider compound key has no
-    /// scalar projection and callers read [`Self::get_bytes`] instead.
-    pub fn get(&self, i: usize) -> u128 {
-        low16_le(self.get_bytes(i))
+    /// Row `i`'s columns decoded and packed back into one native value. Defined
+    /// only for a key that fits in 16 bytes; a wider one is read as bytes.
+    pub fn get(&self, schema: &Schema, i: usize) -> u128 {
+        let opk = self.get_bytes(i);
+        assert!(
+            opk.len() <= gnitz_wire::NARROW_PK_MAX_BYTES,
+            "PkColumn::get: a {}-byte key has no scalar form",
+            opk.len(),
+        );
+        let native = native_row(schema, opk);
+        u128::from_le_bytes(native[..gnitz_wire::NARROW_PK_MAX_BYTES].try_into().unwrap())
     }
 
-    /// Append one raw PK tuple, already in on-wire LE layout.
-    pub fn push_bytes(&mut self, b: &[u8]) {
-        debug_assert_eq!(b.len(), self.width());
-        self.buf.extend_from_slice(b);
-    }
-
-    /// Borrow the raw `stride`-byte tuple at row `i`.
+    /// Borrow row `i`'s `stride` OPK bytes.
     pub fn get_bytes(&self, i: usize) -> &[u8] {
         let s = self.width();
         &self.buf[i * s..(i + 1) * s]
     }
 
-    /// Append a key whose low `stride` bytes carry the LE-packed columns.
-    pub fn push_u128(&mut self, pk: u128) {
-        let s = self.width();
-        // A hard assert, not debug-only: in release the slice below would
-        // otherwise OOB-panic with an opaque "index out of range".
-        assert!(s <= 16, "push_u128: stride {s} > 16 cannot come from a u128");
-        self.buf.extend_from_slice(&pk.to_le_bytes()[..s]);
+    /// Room for `n` more rows.
+    pub fn reserve(&mut self, n: usize) {
+        self.buf.reserve(n * self.width());
     }
 
-    pub fn truncate(&mut self, len: usize) {
+    /// Append a key whose low `stride` bytes carry the PK columns' native
+    /// little-endian images.
+    pub fn push_u128(&mut self, schema: &Schema, pk: u128) {
+        let s = self.width();
+        // Hard, not debug-only: in release the slice below would OOB-panic with
+        // an opaque "index out of range".
+        assert!(s <= 16, "push_u128: stride {s} > 16 cannot come from a u128");
+        self.push_bytes(schema, &pk.to_le_bytes()[..s]);
+    }
+
+    /// Append one row given as its `stride` native little-endian column bytes.
+    pub fn push_bytes(&mut self, schema: &Schema, native_le: &[u8]) {
+        debug_assert_eq!(native_le.len(), self.width());
+        self.push_region_bytes(&opk_row_from_bytes(schema, native_le)[..native_le.len()]);
+    }
+
+    /// Append one row from the PK columns' native values in PK-list order.
+    pub fn push_natives(&mut self, schema: &Schema, natives: &[u128]) {
+        let (opk, n) = opk_row(schema, natives.iter().copied());
+        self.push_region_bytes(&opk[..n]);
+    }
+
+    /// Append whole OPK rows verbatim — `opk` is a multiple of `stride` bytes
+    /// already in region form.
+    pub fn push_region_bytes(&mut self, opk: &[u8]) {
+        debug_assert!(
+            opk.len().is_multiple_of(self.width()),
+            "push_region_bytes: {} bytes is not a whole number of {}-byte rows",
+            opk.len(),
+            self.width(),
+        );
+        self.buf.extend_from_slice(opk);
+    }
+
+    /// Move every row of `other` onto this column's tail.
+    pub(crate) fn append(&mut self, other: &mut PkColumn) {
+        debug_assert_eq!(self.stride, other.stride);
+        self.buf.append(&mut other.buf);
+    }
+
+    fn truncate(&mut self, len: usize) {
         self.buf.truncate(len * self.width());
     }
 
-    /// Read row `i` into a `PkTuple`. The tuple's stride is this column's, so
-    /// it cannot disagree with the bytes it carries.
+    /// Read row `i` into a `PkTuple` — a verbatim byte move, both being OPK.
     pub fn get_tuple(&self, i: usize) -> PkTuple {
         PkTuple::from_bytes(self.get_bytes(i))
     }
@@ -489,133 +540,88 @@ impl PkColumn {
         self.buf.extend_from_slice(src.get_bytes(i));
     }
 
-    /// Append `pk`'s bytes to `self`.
+    /// Append `pk`'s bytes — verbatim, both being OPK.
     pub fn push_tuple(&mut self, pk: &PkTuple) {
         debug_assert_eq!(pk.stride, self.stride);
-        self.buf.extend_from_slice(&pk.buf[..self.width()]);
+        self.buf.extend_from_slice(pk.as_bytes());
     }
 
-    /// Every key widened to u128, for `assert_eq!(pks.to_vec_u128(), expected)`.
+    /// Every key decoded, for `assert_eq!(pks.to_vec_u128(schema), expected)`.
     #[cfg(test)]
-    pub fn to_vec_u128(&self) -> Vec<u128> {
-        (0..self.len()).map(|i| self.get(i)).collect()
+    pub fn to_vec_u128(&self, schema: &Schema) -> Vec<u128> {
+        (0..self.len()).map(|i| self.get(schema, i)).collect()
     }
 }
 
-/// SQL→client carrier for one row's PK. Carries `(stride, bytes)` so callers
-/// above the wire codec do not need to handle the `(seek_pk: u128 +
-/// seek_pk_extra: BLOB)` wire-level split.
+/// One row's PK as **order-preserving key** (OPK) bytes — the same bytes a
+/// [`PkColumn`] row holds, and the row-identity key the transaction buffer and
+/// the DML overlay key their maps on (§1: byte-equal ⟺ key-equal). Crossing
+/// into the wire's *native* key space takes a schema and is named: `from_*` in,
+/// `native_le` / `to_native_packed` out.
 #[derive(Clone, Copy)]
 pub struct PkTuple {
-    pub stride: u8,
-    pub buf: [u8; MAX_PK_BYTES],
+    stride: u8,
+    buf: [u8; MAX_PK_BYTES],
 }
 
 impl PkTuple {
-    /// The "no seek" PK tuple: stride 0, splitting to the inert wire pair
-    /// `(0u128, &[])`. Passed by non-seek frames (push / scan / alloc) so the
-    /// call layer never hand-writes the wire split.
-    pub const EMPTY: PkTuple = PkTuple { stride: 0, buf: [0u8; MAX_PK_BYTES] };
-
-    pub fn new(stride: u8) -> Self {
-        debug_assert!(stride as usize <= MAX_PK_BYTES);
-        Self { stride, buf: [0u8; MAX_PK_BYTES] }
+    /// From a u128 whose low `pk_stride` bytes carry the PK columns' native
+    /// little-endian images — a parsed PK literal, a `ReadBound::PkSet` key.
+    pub fn from_native_packed(schema: &Schema, v: u128) -> Self {
+        let stride = schema.pk_stride();
+        debug_assert!(stride <= 16);
+        Self::from_native_bytes(schema, &v.to_le_bytes()[..stride])
     }
 
-    /// Construct from a u128 whose low `stride` bytes carry the column's
-    /// native LE bytes (as produced by `parse_pk_literal_packed`). Copies
-    /// only `stride` bytes so callers cannot pollute the high padding.
-    pub fn from_u128(stride: u8, v: u128) -> Self {
-        debug_assert!(stride as usize <= 16);
-        let s = stride as usize;
-        let mut t = Self::new(stride);
-        t.buf[..s].copy_from_slice(&v.to_le_bytes()[..s]);
-        t
-    }
-
-    /// Build a tuple from the PK columns' native values in PK-list order: each
-    /// little-endian in its own `wire_stride`, at the running byte offset. The
-    /// one spelling of the wire PK region's layout, which the engine re-encodes
-    /// to the at-rest big-endian OPK on ingest.
+    /// From the PK columns' native values in PK-list order.
     pub fn from_columns(schema: &Schema, natives: impl IntoIterator<Item = u128>) -> Self {
-        let mut t = Self::new(schema.pk_stride() as u8);
-        let mut off = 0;
-        for ((w, _), v) in schema.pk_col_codes().zip(natives) {
-            t.buf[off..off + w].copy_from_slice(&v.to_le_bytes()[..w]);
-            off += w;
+        let (buf, stride) = opk_row(schema, natives);
+        Self { stride: stride as u8, buf }
+    }
+
+    /// [`Self::from_native_packed`] for a key already packed as bytes.
+    fn from_native_bytes(schema: &Schema, native_le: &[u8]) -> Self {
+        Self {
+            stride: native_le.len() as u8,
+            buf: opk_row_from_bytes(schema, native_le),
         }
-        debug_assert_eq!(off, schema.pk_stride(), "from_columns: one value per PK column");
-        t
     }
 
-    /// Build a tuple from a u128 with the full 16-byte narrow stride, without
-    /// a schema lookup — for a caller holding a key value but not the schema.
-    /// The server reads only the column's actual stride; the high padding bytes
-    /// (if any) are inert.
-    pub fn from_u128_narrow(v: u128) -> Self {
-        Self::from_u128(16, v)
-    }
-
-    /// [`PkTuple::from_bytes`] for a caller holding a length it has not checked:
-    /// the one rule (a packed PK region is 1..=`MAX_PK_BYTES` bytes) and the one
-    /// message, instead of a per-caller pre-check ahead of the hard assert
-    /// below.
-    pub fn try_from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.is_empty() || bytes.len() > MAX_PK_BYTES {
-            return Err(format!(
-                "packed pk must be 1..={MAX_PK_BYTES} bytes, got {}",
-                bytes.len()
-            ));
-        }
-        Ok(Self::from_bytes(bytes))
-    }
-
-    /// Build a tuple from a raw byte slice. `bytes.len()` becomes the stride —
-    /// for the paths that carry a packed PK region as an opaque byte buffer.
+    /// From raw OPK bytes, whose length becomes the stride.
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        // Hard assert (not debug-only): `bytes` is an externally-controlled
-        // length, and in release `t.buf[..bytes.len()]` would OOB-panic (or, for
-        // len ≥ 256, `bytes.len() as u8` would silently truncate the stride first).
-        // The assert bounds the length, making the `as u8` cast lossless.
+        // Hard, not debug-only: `bytes` is an externally-controlled length, and
+        // the cast below would silently truncate a length ≥ 256 into the stride.
         assert!(
             bytes.len() <= MAX_PK_BYTES,
             "PkTuple::from_bytes: length {} exceeds MAX_PK_BYTES {MAX_PK_BYTES}",
             bytes.len(),
         );
-        let mut t = Self::new(bytes.len() as u8);
-        t.buf[..bytes.len()].copy_from_slice(bytes);
-        t
+        let mut buf = [0u8; MAX_PK_BYTES];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        Self { stride: bytes.len() as u8, buf }
     }
 
-    /// On-wire PK region bytes 0..stride.
+    /// Bytes per key.
+    #[inline]
+    pub fn stride(&self) -> u8 {
+        self.stride
+    }
+
+    /// The tuple's OPK bytes, `0..stride`.
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.stride as usize]
     }
 
-    /// Split the tuple into the wire form `(seek_pk: u128, seek_pk_extra: &[u8])`.
-    /// `extra` is empty for a narrow PK. The engine's `seek_opk_bytes` is the
-    /// exact inverse and must cut at the same constant for every SEEK.
-    pub fn split_wire(&self) -> (u128, &[u8]) {
-        let bytes = self.as_bytes();
-        let extra: &[u8] = if bytes.len() > gnitz_wire::NARROW_PK_MAX_BYTES {
-            &bytes[gnitz_wire::NARROW_PK_MAX_BYTES..]
-        } else {
-            &[]
-        };
-        (low16_le(bytes), extra)
+    /// The key in the wire's native key space; valid bytes are `0..stride`.
+    pub fn native_le(&self, schema: &Schema) -> [u8; MAX_PK_BYTES] {
+        native_row(schema, self.as_bytes())
     }
-}
 
-/// A packed PK's low `NARROW_PK_MAX_BYTES` bytes as a u128 — the scalar projection
-/// both [`PkColumn::get`] and [`PkTuple::split_wire`] hand out. A wider key has no
-/// scalar form; its remaining bytes travel separately.
-///
-/// Little-endian, so *not* `widen_pk_be`: that recovers a big-endian OPK value.
-fn low16_le(key: &[u8]) -> u128 {
-    let n = key.len().min(gnitz_wire::NARROW_PK_MAX_BYTES);
-    let mut b = [0u8; gnitz_wire::NARROW_PK_MAX_BYTES];
-    b[..n].copy_from_slice(&key[..n]);
-    u128::from_le_bytes(b)
+    /// [`Self::native_le`] packed into one word — the form a `ReadBound::PkSet`
+    /// ships. Defined for a key of at most `NARROW_PK_MAX_BYTES`.
+    pub fn to_native_packed(&self, schema: &Schema) -> u128 {
+        gnitz_wire::control::split_ctrl_key(&self.native_le(schema)[..self.stride as usize]).0
+    }
 }
 
 impl PartialEq for PkTuple {
@@ -641,166 +647,28 @@ impl std::fmt::Debug for PkTuple {
     }
 }
 
-/// Per-column payload data.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ColData {
-    /// Raw little-endian bytes; length = count * wire_stride. Covers every
-    /// fixed-width type, the 16-byte ones (U128/UUID/I128) included — a u128's
-    /// native LE bytes are exactly its wire region.
-    Fixed(Vec<u8>),
-    Strings(Vec<Option<std::string::String>>),
-    /// Variable-length raw byte payloads. Same on-wire encoding as `Strings`
-    /// (16-byte German-string struct + blob arena spill) but the bytes are
-    /// not constrained to be valid UTF-8.
-    Bytes(Vec<Option<Vec<u8>>>),
+/// Append one zero-filled cell of wire type `tc` to a payload region — the NULL
+/// encoding and the non-null filler alike. The null bitmap is the NULL truth
+/// (§6), and a zeroed German cell *is* the empty value, which is what
+/// `encode_german_string(&[], _)` writes.
+pub fn push_zero_cell(col: &mut Vec<u8>, tc: TypeCode) {
+    col.extend(std::iter::repeat_n(0u8, tc.wire_stride()));
 }
 
-impl ColData {
-    /// Append the element at row `idx` of `self` onto `dst`. Both columns are
-    /// built from the same schema, so they are always the same variant — a
-    /// mismatch is a construction bug, not a runtime condition. `fixed_stride`
-    /// is the per-element byte width, used only by the `Fixed` variant.
-    ///
-    /// Matching on `self` alone (rather than the `(self, dst)` pair under a `_`
-    /// wildcard) makes a new `ColData` variant a compile error here rather than
-    /// a runtime panic.
-    pub fn push_row_from(&self, idx: usize, fixed_stride: usize, dst: &mut ColData) {
-        match self {
-            ColData::Fixed(s) => {
-                let ColData::Fixed(d) = dst else { variant_mismatch() };
-                d.extend_from_slice(&s[idx * fixed_stride..(idx + 1) * fixed_stride]);
-            }
-            ColData::Strings(s) => {
-                let ColData::Strings(d) = dst else { variant_mismatch() };
-                d.push(s[idx].clone());
-            }
-            ColData::Bytes(s) => {
-                let ColData::Bytes(d) = dst else { variant_mismatch() };
-                d.push(s[idx].clone());
-            }
-        }
-    }
-
-    /// Consuming variant of [`Self::push_row_from`] for a source batch the
-    /// caller owns and drops afterwards: a `Strings`/`Bytes` cell is *moved*
-    /// (`Option::take`) instead of deep-cloned, leaving `None` behind.
-    /// Correct only when each source row is taken at most once; fixed-width
-    /// variants copy exactly as `push_row_from`.
-    pub fn take_row_into(&mut self, idx: usize, fixed_stride: usize, dst: &mut ColData) {
-        match self {
-            ColData::Strings(s) => {
-                let ColData::Strings(d) = dst else { variant_mismatch() };
-                d.push(s[idx].take());
-            }
-            ColData::Bytes(s) => {
-                let ColData::Bytes(d) = dst else { variant_mismatch() };
-                d.push(s[idx].take());
-            }
-            ColData::Fixed(_) => self.push_row_from(idx, fixed_stride, dst),
-        }
-    }
-
-    /// The wire cell at `row` of a fixed-width column: exactly `stride` bytes.
-    /// `None` if the row is past the end or this is not a `Fixed` column —
-    /// callers decide whether that is an error, a panic, or a fallback.
-    pub fn cell(&self, row: usize, stride: usize) -> Option<&[u8]> {
-        match self {
-            ColData::Fixed(b) => b.get(row * stride..(row + 1) * stride),
-            _ => None,
-        }
-    }
-
-    /// Reserve room for `n` more cells of wire type `tc`.
-    pub fn reserve(&mut self, tc: TypeCode, n: usize) {
-        match self {
-            ColData::Fixed(v) => v.reserve(n * tc.wire_stride()),
-            ColData::Strings(v) => v.reserve(n),
-            ColData::Bytes(v) => v.reserve(n),
-        }
-    }
-
-    /// Append a SQL NULL cell for a column of wire type `tc`. The single NULL
-    /// encoding across all three variants: fixed-width columns get zero filler
-    /// (the null bitmap is the NULL source of truth, §6), German strings a
-    /// `None` cell.
-    pub fn push_null(&mut self, tc: TypeCode) {
-        match self {
-            ColData::Fixed(buf) => buf.extend(std::iter::repeat_n(0u8, tc.wire_stride())),
-            ColData::Strings(v) => v.push(None),
-            ColData::Bytes(v) => v.push(None),
-        }
-    }
-
-    /// The empty column of the canonical variant for wire type `tc` — the single
-    /// TypeCode→variant choice ([`ZSetBatch::filler_columns`], the appenders and
-    /// [`Self::matches_type`] all build on it). The only question is whether the
-    /// type uses the German-string layout; everything else is raw LE bytes.
-    #[inline(always)]
-    pub fn empty_for(tc: TypeCode) -> Self {
-        match tc {
-            TypeCode::String => ColData::Strings(vec![]),
-            TypeCode::Blob => ColData::Bytes(vec![]),
-            _ => ColData::Fixed(vec![]),
-        }
-    }
-
-    /// True iff this column's variant is the one [`Self::empty_for`] builds for
-    /// `tc`. Derived from that function rather than restating its table, so the
-    /// canonical choice and the check that enforces it cannot disagree.
-    #[inline(always)]
-    pub fn matches_type(&self, tc: TypeCode) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(&Self::empty_for(tc))
-    }
-
-    /// Append one zero-filled **non-null** cell for a column of wire type `tc` —
-    /// the single filler-cell encoding: a fixed column gets zero bytes, a German
-    /// string/blob an empty `Some` cell. Used per-row for the
-    /// `ALTER … DROP COLUMN` hidden slot (§6) and in bulk by
-    /// [`ZSetBatch::filler_columns`]. Differs from [`Self::push_null`] only for
-    /// Strings/Bytes (`Some("")` vs `None`): the null bit stays **unset**, so the
-    /// cell must be a real value — which keeps validate happy against a NOT-NULL
-    /// column and keeps the table on the `FixedIntNonnull` fast comparator.
-    pub fn push_filler(&mut self, tc: TypeCode) {
-        match self {
-            ColData::Fixed(buf) => buf.extend(std::iter::repeat_n(0u8, tc.wire_stride())),
-            ColData::Strings(v) => v.push(Some(std::string::String::new())),
-            ColData::Bytes(v) => v.push(Some(Vec::new())),
-        }
-    }
-
-    /// `count` filler cells in one allocation — the bulk [`Self::push_filler`],
-    /// dispatched through [`Self::empty_for`] so the TypeCode→variant table stays
-    /// defined once. `vec!`'s `SpecFromElem` reaches `alloc_zeroed`, a library
-    /// specialisation that holds at `opt-level=0` where a fill loop would not.
-    pub(crate) fn filled(tc: TypeCode, count: usize) -> Self {
-        match Self::empty_for(tc) {
-            ColData::Fixed(_) => ColData::Fixed(vec![0u8; count * tc.wire_stride()]),
-            ColData::Strings(_) => ColData::Strings(vec![Some(std::string::String::new()); count]),
-            ColData::Bytes(_) => ColData::Bytes(vec![Some(Vec::new()); count]),
-        }
-    }
-}
-
-/// The single read/write convention for the payload null bitmap (bit `pi` = the
-/// `pi`-th non-PK column in schema order, `Schema::payload_idx`, §6). Defined in
-/// `gnitz-wire` — the crate that already owns the §6 region indices — so the
-/// client, the evaluator and the engine cannot spell it three different ways.
-pub use gnitz_wire::{null_word_get, null_word_set};
-
-#[cold]
-#[inline(never)]
-#[track_caller]
-fn variant_mismatch() -> ! {
-    panic!("ColData: source and destination column variants differ");
-}
-
+/// A batch in the §6 region shape: every column is its own wire region, and a
+/// STRING/BLOB column holds 16-byte German-string cells against [`Self::blob`].
+/// Nothing here is materialized — this is the form the wire carries and the
+/// shared evaluator reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZSetBatch {
     pub pks: PkColumn,
     pub weights: Vec<i64>,
     pub nulls: Vec<u64>,
-    /// One entry per schema column. Entry at pk_index is a placeholder (Fixed(vec![])).
-    pub columns: Vec<ColData>,
+    /// One region per schema column; a PK column's slot stays empty, its values
+    /// living in `pks`.
+    pub columns: Vec<Vec<u8>>,
+    /// The arena the German cells in `columns` point into.
+    pub blob: Vec<u8>,
 }
 
 impl ZSetBatch {
@@ -810,24 +678,39 @@ impl ZSetBatch {
             weights: vec![],
             nulls: vec![],
             columns: Self::filler_columns(schema, 0),
+            blob: vec![],
         }
     }
 
-    /// One `ColData` per schema column, zero-filled for `count` rows — the
-    /// canonical TypeCode→variant choice the wire encoder accepts (PK slots are
-    /// empty `Fixed` placeholders). `new` is the `count = 0` case; the client's
-    /// `delete` uses `count > 0` as inert payload filler for retraction rows
-    /// (the server's `retract_pk` matches by PK alone, so an empty `Some` value
-    /// encoding to zero bytes under the all-present null bitmap is fine).
-    pub(crate) fn filler_columns(schema: &Schema, count: usize) -> Vec<ColData> {
+    /// One region per schema column, zero-filled for `count` rows (a PK column's
+    /// slot stays empty whatever `count` is). `new` is the `count = 0` case; the
+    /// client's `delete` uses `count > 0` as inert payload filler for retraction
+    /// rows, which the server's `retract_pk` matches by PK alone.
+    pub(crate) fn filler_columns(schema: &Schema, count: usize) -> Vec<Vec<u8>> {
         schema
             .columns
             .iter()
             .enumerate()
-            // A PK column's payload slot is an empty placeholder whatever `count`
-            // is: its values live in the OPK region.
-            .map(|(ci, col)| ColData::filled(col.type_code, if schema.is_pk_col(ci) { 0 } else { count }))
+            .map(|(ci, col)| {
+                let rows = if schema.is_pk_col(ci) { 0 } else { count };
+                vec![0u8; rows * col.type_code.wire_stride()]
+            })
             .collect()
+    }
+
+    /// Append the `tc`-wide cell at row `i` of `src.columns[src_ci]` onto
+    /// `self.columns[dst_ci]`. A German cell is re-encoded against this batch's
+    /// arena — its heap offset is relative to `src`'s and means nothing here.
+    pub fn push_cell_from(&mut self, dst_ci: usize, src: &ZSetBatch, src_ci: usize, tc: TypeCode, i: usize) {
+        let w = tc.wire_stride();
+        let cell = &src.columns[src_ci][i * w..(i + 1) * w];
+        if gnitz_wire::is_german_string(tc as u8) {
+            let content = gnitz_wire::german_string_content(cell, &src.blob);
+            let moved = gnitz_wire::encode_german_string(content, &mut self.blob);
+            self.columns[dst_ci].extend_from_slice(&moved);
+        } else {
+            self.columns[dst_ci].extend_from_slice(cell);
+        }
     }
 
     /// Append row `i` of `src` to `self` at `weight`, verbatim — so a `-1`
@@ -838,18 +721,17 @@ impl ZSetBatch {
         self.weights.push(weight);
         self.nulls.push(src.nulls[i]);
         for (_pi, ci, def) in schema.payload_columns() {
-            src.columns[ci].push_row_from(i, def.type_code.wire_stride(), &mut self.columns[ci]);
+            self.push_cell_from(ci, src, ci, def.type_code, i);
         }
     }
 
-    /// Overwrite the STRING cell at `(row, ci)`. Addressable rather than
-    /// "patch the row I just pushed", so a caller that copied two rows can name
-    /// which one it means.
+    /// Overwrite the STRING cell at `(row, ci)`. Addressable rather than "patch
+    /// the row I just pushed", so a caller that copied two rows can name which
+    /// one it means. The replaced cell's spill, if any, stays in the arena
+    /// unreferenced.
     pub fn set_string_cell(&mut self, row: usize, ci: usize, v: &str) {
-        match &mut self.columns[ci] {
-            ColData::Strings(c) => c[row] = Some(v.to_string()),
-            _ => panic!("set_string_cell: column {ci} is not a Strings column"),
-        }
+        let cell = gnitz_wire::encode_german_string(v.as_bytes(), &mut self.blob);
+        self.columns[ci][row * 16..(row + 1) * 16].copy_from_slice(&cell);
     }
 
     /// An empty batch with every growth stream sized for `n` rows: the PK
@@ -862,24 +744,29 @@ impl ZSetBatch {
         b
     }
 
-    /// Room for `n` more rows in every growth stream — the PK buffer, the
-    /// weights, the null words and each payload column. Additive, as
+    /// Room for `n` more rows in every growth stream. Additive, as
     /// [`Vec::reserve`] is, so repeated appends to one batch compose.
     pub fn reserve(&mut self, schema: &Schema, n: usize) {
-        self.pks.buf.reserve(n * schema.pk_stride());
+        self.pks.reserve(n);
         self.weights.reserve(n);
         self.nulls.reserve(n);
         for (_pi, ci, col) in schema.payload_columns() {
-            self.columns[ci].reserve(col.type_code, n);
+            self.columns[ci].reserve(n * col.type_code.wire_stride());
         }
     }
 
     pub fn len(&self) -> usize {
-        self.pks.len()
+        self.weights.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pks.is_empty()
+        self.weights.is_empty()
+    }
+
+    /// The `stride`-byte wire cell at `row` of column `ci`, or `None` past the
+    /// end.
+    pub fn cell(&self, ci: usize, row: usize, stride: usize) -> Option<&[u8]> {
+        self.columns[ci].get(row * stride..(row + 1) * stride)
     }
 
     /// Indices of the live rows — those with positive weight. A `ZSetBatch`
@@ -891,83 +778,67 @@ impl ZSetBatch {
 
     /// The index of the live row whose PK is `pk`, for a batch keyed by a single
     /// integer column (the catalog tables). `None` = no such live row.
-    pub fn live_row_with_pk(&self, pk: u64) -> Option<usize> {
-        self.live_rows().find(|&i| self.pks.get(i) as u64 == pk)
+    pub fn live_row_with_pk(&self, schema: &Schema, pk: u64) -> Option<usize> {
+        self.live_rows().find(|&i| self.pks.get(schema, i) as u64 == pk)
     }
 
-    /// Append all rows from `other` into `self`, consuming it and moving its
-    /// String/Bytes buffers instead of deep-cloning each value. O(n) pointer
-    /// copies, zero heap allocation for string/bytes content. Panics if column
-    /// layouts differ. Used in scan continuation loops.
-    pub fn extend_from_owned(&mut self, mut other: ZSetBatch) {
+    /// Append all rows of `other`, consuming it: each region concatenates, and
+    /// `other`'s arena lands on this one's tail, so every German cell it carries
+    /// has its heap offset shifted by that much.
+    pub fn extend_from_owned(&mut self, mut other: ZSetBatch, schema: &Schema) {
         assert_eq!(
             self.columns.len(),
             other.columns.len(),
             "extend_from_owned: column count mismatch",
         );
         assert_eq!(
-            self.pks.stride, other.pks.stride,
+            self.pks.stride(),
+            other.pks.stride(),
             "extend_from_owned: PK stride mismatch",
         );
-        self.pks.buf.append(&mut other.pks.buf);
+        self.pks.append(&mut other.pks);
         self.weights.append(&mut other.weights);
         self.nulls.append(&mut other.nulls);
-        for (a, b) in self.columns.iter_mut().zip(other.columns.iter_mut()) {
-            match (a, b) {
-                (ColData::Fixed(a), ColData::Fixed(b)) => a.append(b),
-                (ColData::Strings(a), ColData::Strings(b)) => a.append(b),
-                (ColData::Bytes(a), ColData::Bytes(b)) => a.append(b),
-                _ => panic!("extend_from_owned: column type mismatch"),
-            }
-        }
-    }
-
-    /// Truncate all per-row vectors back to `n` rows. PK column and
-    /// payload columns (including string/blob spill buffers) are kept
-    /// consistent — used to roll back partially appended rows.
-    pub fn truncate(&mut self, n: usize, schema: &Schema) {
-        self.pks.truncate(n);
-        self.weights.truncate(n);
-        self.nulls.truncate(n);
-        for ci in 0..self.columns.len() {
-            if schema.is_pk_col(ci) {
-                continue;
-            }
-            match &mut self.columns[ci] {
-                ColData::Fixed(buf) => {
-                    let stride = schema.columns[ci].type_code.wire_stride();
-                    buf.truncate(n * stride);
+        let delta = self.blob.len();
+        self.blob.append(&mut other.blob);
+        for (_pi, ci, col) in schema.payload_columns() {
+            let at = self.columns[ci].len();
+            self.columns[ci].append(&mut other.columns[ci]);
+            if gnitz_wire::is_german_string(col.type_code as u8) && delta != 0 {
+                for cell in self.columns[ci][at..].chunks_exact_mut(16) {
+                    gnitz_wire::shift_german_string_heap(cell, delta);
                 }
-                ColData::Strings(v) => v.truncate(n),
-                ColData::Bytes(v) => v.truncate(n),
             }
         }
     }
 
-    /// Every payload column carries the variant its declared type calls for, at
-    /// the row count `self.len()` implies. Split out of [`Self::validate`]
-    /// because the region builder needs the same rule for a batch that never
-    /// went through the push path.
-    ///
-    /// The variant is decided by the *declared* type, never by the one found: a
-    /// String-typed column carrying `Fixed` has a valid `n * 16` byte length, so
-    /// the length check cannot see it — and it would reach the expression
-    /// kernels as German cells with arbitrary heap offsets.
-    pub fn check_columns(&self, schema: &Schema) -> Result<(), std::string::String> {
+    /// The batch's current extent, for [`Self::rollback_to`].
+    pub fn mark(&self) -> BatchMark {
+        BatchMark {
+            rows: self.weights.len(),
+            blob: self.blob.len(),
+        }
+    }
+
+    /// Drop everything appended since `mark` — used to undo a half-written row,
+    /// its blob spill included.
+    pub fn rollback_to(&mut self, mark: BatchMark, schema: &Schema) {
+        self.pks.truncate(mark.rows);
+        self.weights.truncate(mark.rows);
+        self.nulls.truncate(mark.rows);
+        self.blob.truncate(mark.blob);
+        for (_pi, ci, col) in schema.payload_columns() {
+            self.columns[ci].truncate(mark.rows * col.type_code.wire_stride());
+        }
+    }
+
+    /// Every payload region is the length its declared type and row count imply.
+    /// Split out of [`Self::validate`] because the region builder needs the same
+    /// rule for a batch that never went through the push path.
+    pub(crate) fn check_columns(&self, schema: &Schema) -> Result<(), std::string::String> {
         let n = self.len();
         for (_pi, ci, col_def) in schema.payload_columns() {
-            let col = &self.columns[ci];
-            if !col.matches_type(col_def.type_code) {
-                return Err(format!(
-                    "column {ci}: ColData variant contradicts schema type {:?}",
-                    col_def.type_code
-                ));
-            }
-            let (got, want) = match col {
-                ColData::Fixed(b) => (b.len(), n * col_def.type_code.wire_stride()),
-                ColData::Strings(v) => (v.len(), n),
-                ColData::Bytes(v) => (v.len(), n),
-            };
+            let (got, want) = (self.columns[ci].len(), n * col_def.type_code.wire_stride());
             if got != want {
                 return Err(format!("column {ci}: length {got} != expected {want}"));
             }
@@ -977,24 +848,24 @@ impl ZSetBatch {
 
     /// Validate that all vectors are consistently sized for the given schema.
     pub fn validate(&self, schema: &Schema) -> Result<(), std::string::String> {
-        // The PK buffer's own shape, checked before `len()` divides by the
-        // stride. A stride that disagrees with the schema would make the region
-        // encoder read every row at the wrong offset.
-        if self.pks.stride == 0 {
+        // The PK buffer's own shape, checked before `PkColumn::len` divides by
+        // the stride. A stride that disagrees with the schema would make every
+        // row read at the wrong offset.
+        if self.pks.stride() == 0 {
             return Err("PK stride must be non-zero".into());
         }
-        if self.pks.stride as usize != schema.pk_stride() {
+        if self.pks.stride() as usize != schema.pk_stride() {
             return Err(format!(
                 "mismatched PK stride: expected {}, got {}",
                 schema.pk_stride(),
-                self.pks.stride
+                self.pks.stride()
             ));
         }
-        if !self.pks.buf.len().is_multiple_of(self.pks.stride as usize) {
+        if !self.pks.region().len().is_multiple_of(self.pks.stride() as usize) {
             return Err(format!(
                 "PK buffer length {} is not a multiple of stride {}",
-                self.pks.buf.len(),
-                self.pks.stride
+                self.pks.region().len(),
+                self.pks.stride()
             ));
         }
         let n = self.pks.len();
@@ -1015,26 +886,33 @@ impl ZSetBatch {
         // A null bit on a NOT NULL payload column would make FK/unique validation
         // skip the value (treating it as absent) while consolidation and decoders
         // read the raw bytes as live data — an inconsistency the schema forbids.
-        // Reject it. `pi` is the dense payload index (null-bitmap bit position),
-        // matching the convention the FK/unique skips use.
+        // One OR-fold and one test: the conforming case walks every row either
+        // way, and only a rejection re-walks, to name the row and the column.
         let not_null_mask = gnitz_expr::SchemaFacts::not_null_payload_slots(schema);
-        if not_null_mask != 0 {
-            for (row, &word) in self.nulls.iter().enumerate() {
-                let offending = word & not_null_mask;
-                if offending != 0 {
-                    // Name the column: the mask says only "some NOT NULL column",
-                    // and the caller cannot recover which from a bit position.
-                    let pi = offending.trailing_zeros() as usize;
-                    let name = schema
-                        .payload_columns()
-                        .find(|(p, _, _)| *p == pi)
-                        .map_or("?", |(_, _, c)| c.name.as_str());
-                    return Err(format!("row {row} sets a null bit on NOT NULL column '{name}'"));
-                }
-            }
+        if self.nulls.iter().fold(0u64, |a, &w| a | w) & not_null_mask != 0 {
+            let (row, offending) = self
+                .nulls
+                .iter()
+                .enumerate()
+                .map(|(row, &w)| (row, w & not_null_mask))
+                .find(|&(_, o)| o != 0)
+                .expect("the fold found a NOT NULL bit set");
+            let pi = offending.trailing_zeros() as usize;
+            let name = schema
+                .payload_columns()
+                .find(|(p, _, _)| *p == pi)
+                .map_or("?", |(_, _, c)| c.name.as_str());
+            return Err(format!("row {row} sets a null bit on NOT NULL column '{name}'"));
         }
         Ok(())
     }
+}
+
+/// A [`ZSetBatch`]'s extent at one moment, taken by [`ZSetBatch::mark`].
+#[derive(Clone, Copy)]
+pub struct BatchMark {
+    rows: usize,
+    blob: usize,
 }
 
 /// Builder for appending rows to a `ZSetBatch` with schema-aware column mapping.
@@ -1045,16 +923,13 @@ pub struct BatchAppender<'a> {
     batch: &'a mut ZSetBatch,
     schema: &'a Schema,
     cursor: usize,
-    row_active: bool,
     /// Payload cursor → schema column index (the N-th non-PK column), computed
     /// once so `col_index` is an array read rather than a per-value scan.
     payload_to_ci: Vec<usize>,
 }
 
 /// The client half of the shared catalog row codecs: the sink
-/// `gnitz_wire::sys_rows` writes a system-table row into. `end_row` is a no-op
-/// because this builder writes the null word eagerly in `add_row` and needs no
-/// per-row close.
+/// `gnitz_wire::sys_rows` writes a system-table row into.
 impl gnitz_wire::sys_rows::SysRowSink for BatchAppender<'_> {
     fn begin_row(&mut self, pk: &[u128], weight: i64) {
         self.add_row_cols(pk, weight);
@@ -1071,25 +946,21 @@ impl gnitz_wire::sys_rows::SysRowSink for BatchAppender<'_> {
     fn put_null(&mut self) {
         self.null();
     }
-    fn end_row(&mut self) {}
+    fn end_row(&mut self) {
+        self.check_row_complete();
+    }
 }
 
 impl<'a> BatchAppender<'a> {
     pub fn new(batch: &'a mut ZSetBatch, schema: &'a Schema) -> Self {
         let payload_to_ci: Vec<usize> = schema.payload_columns().map(|(_, ci, _)| ci).collect();
-        BatchAppender {
-            batch,
-            schema,
-            cursor: 0,
-            row_active: false,
-            payload_to_ci,
-        }
+        BatchAppender { batch, schema, cursor: 0, payload_to_ci }
     }
 
     /// Start a new row with the given single-column primary key and weight.
     pub fn add_row(&mut self, pk: u128, weight: i64) -> &mut Self {
         self.open_row(weight);
-        self.batch.pks.push_u128(pk);
+        self.batch.pks.push_u128(self.schema, pk);
         self
     }
 
@@ -1097,31 +968,30 @@ impl<'a> BatchAppender<'a> {
     /// native values in PK-list order.
     pub fn add_row_cols(&mut self, natives: &[u128], weight: i64) -> &mut Self {
         self.open_row(weight);
-        let pk = PkTuple::from_columns(self.schema, natives.iter().copied());
-        self.batch.pks.push_tuple(&pk);
+        self.batch.pks.push_natives(self.schema, natives);
         self
+    }
+
+    /// A row takes exactly one push per payload column — the `SysRowSink`
+    /// contract's `end_row`, where an under-pushed row would otherwise desync the
+    /// column regions and surface later as an un-attributed `validate` length
+    /// error. A `debug_assert`, since `validate` rejects the batch safely
+    /// anyway; this only attributes it.
+    fn check_row_complete(&self) {
+        debug_assert_eq!(
+            self.cursor,
+            self.payload_to_ci.len(),
+            "BatchAppender: row got {} of {} payload columns",
+            self.cursor,
+            self.payload_to_ci.len(),
+        );
     }
 
     /// The per-row bookkeeping both row starters owe, minus the key itself.
     fn open_row(&mut self, weight: i64) {
-        // Each row must receive exactly `num_payload_cols()` payload pushes before
-        // the next row starts. Symmetric counterpart to `col_index`'s over-push
-        // assert; an under-pushed row otherwise desyncs the column vectors and
-        // only surfaces later as an un-attributed `ZSetBatch::validate` length
-        // error. `debug_assert` (not `assert`): `validate` already rejects the bad
-        // batch totally and safely, so this is a diagnostic, not a safety guard.
-        // `row_active` exempts the first row without assuming the batch started
-        // empty.
-        debug_assert!(
-            !self.row_active || self.cursor == self.schema.num_payload_cols(),
-            "BatchAppender: previous row got {} of {} payload columns",
-            self.cursor,
-            self.schema.num_payload_cols(),
-        );
         self.batch.weights.push(weight);
         self.batch.nulls.push(0);
         self.cursor = 0;
-        self.row_active = true;
     }
 
     /// Append one fixed-width cell to the next column: `bytes` is the column's
@@ -1131,84 +1001,84 @@ impl<'a> BatchAppender<'a> {
     fn fixed_val(&mut self, bytes: &[u8]) -> &mut Self {
         let ci = self.col_index();
         let tc = self.schema.columns[ci].type_code;
-        match &mut self.batch.columns[ci] {
-            ColData::Fixed(buf) => {
-                assert_eq!(
-                    bytes.len(),
-                    tc.wire_stride(),
-                    "BatchAppender: {tc:?} column at schema index {ci} takes {} bytes",
-                    tc.wire_stride(),
-                );
-                buf.extend_from_slice(bytes);
-            }
-            _ => panic!("BatchAppender: fixed value written to {tc:?} column at schema index {ci}"),
-        }
+        assert!(
+            !gnitz_wire::is_german_string(tc as u8),
+            "BatchAppender: a fixed-width value cannot be written to the {tc:?} column at schema index {ci}",
+        );
+        assert_eq!(
+            bytes.len(),
+            tc.wire_stride(),
+            "BatchAppender: {tc:?} column at schema index {ci} takes {} bytes",
+            tc.wire_stride(),
+        );
+        self.batch.columns[ci].extend_from_slice(bytes);
         self.cursor += 1;
         self
     }
 
-    /// Append a u64 value to the next Fixed column.
+    /// Append a u64 value to the next column.
     pub fn u64_val(&mut self, v: u64) -> &mut Self {
         self.fixed_val(&v.to_le_bytes())
     }
 
-    /// Append an i64 value to the next Fixed column. Same eight bytes as
+    /// Append an i64 value to the next column. Same eight bytes as
     /// [`Self::u64_val`]; the separate name keeps a signed column's writer
     /// honest at the call site.
     pub fn i64_val(&mut self, v: i64) -> &mut Self {
         self.fixed_val(&v.to_le_bytes())
     }
 
-    /// Append an f64 value to the next Fixed column.
+    /// Append an f64 value to the next column.
     pub fn f64_val(&mut self, v: f64) -> &mut Self {
         self.fixed_val(&v.to_le_bytes())
     }
 
-    /// Append a u128 value to the next Fixed column: its 16 native LE bytes,
-    /// which are the column's wire region (U128/UUID/I128).
+    /// Append a u128 value to the next column: its 16 native LE bytes, which are
+    /// the column's wire region (U128/UUID/I128).
     pub fn u128_val(&mut self, v: u128) -> &mut Self {
         self.fixed_val(&v.to_le_bytes())
     }
 
-    /// Append a string value to the next Strings column.
+    /// Append a string value to the next STRING column.
     pub fn str_val(&mut self, s: &str) -> &mut Self {
-        let ci = self.col_index();
-        match &mut self.batch.columns[ci] {
-            ColData::Strings(v) => v.push(Some(s.to_string())),
-            _ => panic!("BatchAppender: str_val called on non-Strings column at schema index {ci}"),
-        }
-        self.cursor += 1;
-        self
+        self.german_val(s.as_bytes())
     }
 
-    /// Append a raw byte slice to the next Bytes (BLOB) column.
+    /// Append a raw byte slice to the next BLOB column.
     pub fn bytes_val(&mut self, b: &[u8]) -> &mut Self {
+        self.german_val(b)
+    }
+
+    /// Append one German-string cell, spilling into the batch's arena.
+    fn german_val(&mut self, b: &[u8]) -> &mut Self {
         let ci = self.col_index();
-        match &mut self.batch.columns[ci] {
-            ColData::Bytes(v) => v.push(Some(b.to_vec())),
-            _ => panic!("BatchAppender: bytes_val called on non-Bytes column at schema index {ci}"),
-        }
+        let tc = self.schema.columns[ci].type_code;
+        assert!(
+            gnitz_wire::is_german_string(tc as u8),
+            "BatchAppender: a string/blob value cannot be written to the {tc:?} column at schema index {ci}",
+        );
+        let cell = gnitz_wire::encode_german_string(b, &mut self.batch.blob);
+        self.batch.columns[ci].extend_from_slice(&cell);
         self.cursor += 1;
         self
     }
 
-    /// Append a SQL NULL to the next column, whatever its type: the variant's
-    /// null cell plus the row bitmap bit. Self-sufficient — no out-of-band
-    /// `null_mask` call.
+    /// Append a SQL NULL to the next column, whatever its type: a zeroed cell
+    /// plus the row bitmap bit. Self-sufficient — no out-of-band `null_mask`
+    /// call.
     ///
-    /// The read side (the expression evaluator, the WAL encoder) gates on
-    /// `nulls[row] & (1 << payload_idx)` and consults the `Option` only when that
-    /// bit is clear, so the pushed cell and the bitmap must agree.
+    /// The read side gates on `nulls[row] & (1 << payload_idx)` and reads the
+    /// cell only when that bit is clear, so the two must agree.
     pub fn null(&mut self) -> &mut Self {
         let ci = self.col_index();
-        self.batch.columns[ci].push_null(self.schema.columns[ci].type_code);
+        push_zero_cell(&mut self.batch.columns[ci], self.schema.columns[ci].type_code);
         let pi = self.schema.payload_idx(ci);
         let word = self
             .batch
             .nulls
             .last_mut()
             .expect("BatchAppender: null called before add_row");
-        null_word_set(word, pi, true);
+        gnitz_wire::null_word_set(word, pi, true);
         self.cursor += 1;
         self
     }

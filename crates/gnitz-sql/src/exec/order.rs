@@ -2,11 +2,11 @@
 //! as a single client-side pass over the fetched batch (base tables and views).
 //!
 //! The batch arrives as a client `ZSetBatch`: entries carrying an integer
-//! **weight**, decoded to native little-endian (not the engine's OPK). Entries
-//! are *not* unique by `(PK, payload)` — a reply train is concatenated and never
-//! folded — and the sink does not need them to be, only `weight >= 1`.
-//! So ordering is a per-type, per-column typed compare (the shared
-//! `gnitz_wire::cmp_typed_le`); there is no client `memcmp`/OPK trick. The sink
+//! **weight**. Entries are *not* unique by `(PK, payload)` — a reply train is
+//! concatenated and never folded — and the sink does not need them to be, only
+//! `weight >= 1`. A PK column orders by `memcmp` over its OPK bytes; a payload
+//! column is a per-type typed compare (the shared `gnitz_wire::cmp_typed_le`),
+//! its region being native little-endian. The sink
 //! sorts **before** projection so an ORDER BY key absent from the projected
 //! columns still resolves, then walks the sorted permutation by running
 //! **logical position** — LIMIT/OFFSET count multiplicity (summed weight), never
@@ -20,7 +20,7 @@ use crate::bind::find_unique_column;
 use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
 use crate::exec::batch::RowGather;
-use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_wire::cmp_typed_le;
 use sqlparser::ast::{Expr, OrderBy, OrderByExpr, OrderByKind, OrderByOptions};
@@ -53,11 +53,8 @@ impl SortKey {
     /// record, [`ColumnLocator`] — not from four independent `is_pk_col` /
     /// `pk_byte_offset` / `payload_idx` / `wire_stride` lookups that could
     /// disagree. It is the same record the engine's worker-side ORDER BY
-    /// comparator resolves through, which is what keeps the two *coordinate*-
-    /// equivalent as the schema layout evolves. Only the coordinates: the bytes
-    /// at them differ, because this comparator reads the in-memory `PkColumn`
-    /// buffer, which is native-LE, where the engine reads an OPK region — so
-    /// each comparator decodes its own side.
+    /// comparator resolves through — coordinates and bytes alike, a client
+    /// `PkColumn` holding the same OPK region the engine reads.
     fn new(schema: &Schema, ci: usize, asc: bool, nulls_first: bool) -> Self {
         let loc = SchemaFacts::locate(schema, ci);
         let (pk_offset, null_mask) = match loc {
@@ -82,32 +79,23 @@ fn col_is_null(batch: &ZSetBatch, key: &SortKey, i: usize) -> bool {
 }
 
 /// Compare the **non-null** value of the key's column between rows `ra` and
-/// `rb` in content order (callers null-check first). PK columns read through
-/// the shared `PkColumn::col_window` accessor; payload columns dispatch
-/// on their `ColData` variant. Fixed-width values compare via the shared
-/// `cmp_typed_le` — dispatched on the type code, never through
-/// `FixedInt::decode_le_i64`, which bit-reinterprets a full-width `U64` as
-/// `i64` (correct for WHERE arithmetic, wrong for ordering: it would sort
-/// `u64::MAX` first). STRING/BLOB compare byte-wise on the materialized value —
-/// provably the engine's content order (`compare_german_strings` reduces to
-/// plain lexicographic byte order for equal content, and no `COLLATE` exists).
+/// `rb` in content order (callers null-check first). A PK column compares its
+/// OPK window byte-wise — that order *is* the typed order. STRING/BLOB take the
+/// shared `compare_german_strings`, the engine's own content order; every other
+/// payload column takes `cmp_typed_le`, never `FixedInt::decode_le_i64`, which
+/// bit-reinterprets a full-width `U64` as `i64` and would sort `u64::MAX` first.
 fn cmp_col_value(batch: &ZSetBatch, key: &SortKey, ra: usize, rb: usize) -> Ordering {
     if let Some(off) = key.pk_offset {
         let wa = batch.pks.col_window(ra, off, key.stride);
         let wb = batch.pks.col_window(rb, off, key.stride);
-        return cmp_typed_le(wa, wb, key.tc as u8);
+        return wa.cmp(wb);
     }
-    match &batch.columns[key.ci] {
-        ColData::Fixed(buf) => {
-            let s = key.stride;
-            cmp_typed_le(&buf[ra * s..ra * s + s], &buf[rb * s..rb * s + s], key.tc as u8)
-        }
-        ColData::Strings(v) => v[ra]
-            .as_deref()
-            .unwrap_or("")
-            .as_bytes()
-            .cmp(v[rb].as_deref().unwrap_or("").as_bytes()),
-        ColData::Bytes(v) => v[ra].as_deref().unwrap_or(&[]).cmp(v[rb].as_deref().unwrap_or(&[])),
+    let (col, s) = (&batch.columns[key.ci], key.stride);
+    let (a, b) = (&col[ra * s..ra * s + s], &col[rb * s..rb * s + s]);
+    if gnitz_wire::is_german_string(key.tc as u8) {
+        gnitz_wire::compare_german_strings(a, &batch.blob, b, &batch.blob)
+    } else {
+        cmp_typed_le(a, b, key.tc as u8)
     }
 }
 
@@ -331,7 +319,7 @@ pub(crate) fn resolve_read_spec_order(
 /// anything else decides every tie before a payload column is ever reached.
 fn push_identity_tiebreak(keys: &mut Vec<SortKey>, schema: &Schema) {
     for &ci in &schema.pk_cols {
-        keys.push(SortKey::new(schema, ci, true, true));
+        keys.push(SortKey::new(schema, ci as usize, true, true));
     }
     for (_, ci, _) in schema.payload_columns() {
         keys.push(SortKey::new(schema, ci, true, true));
@@ -431,7 +419,7 @@ pub(crate) fn read_spec_finish(
 /// keeps its window-clipped multiplicity.
 fn finish_window(
     schema: Schema,
-    mut full: ZSetBatch,
+    full: ZSetBatch,
     mut sort_keys: Vec<SortKey>,
     offset: usize,
     limit: Option<usize>,
@@ -476,7 +464,7 @@ fn finish_window(
     let gather = RowGather::new(&schema);
     let mut gathered = ZSetBatch::with_capacity(&schema, surviving_rows.len());
     for (pos, surviving) in surviving_rows {
-        gather.take(&mut full, perm[pos], &mut gathered);
+        gather.copy(&full, perm[pos], &mut gathered);
         // The gather copied the weight verbatim; overwrite with the
         // window-clipped multiplicity (a boundary entry keeps a reduced one).
         *gathered.weights.last_mut().unwrap() = surviving;

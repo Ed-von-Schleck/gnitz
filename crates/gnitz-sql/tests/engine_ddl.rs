@@ -34,7 +34,7 @@ fn assert_altered(client: &mut GnitzClient, sn: &str, sql: &str, object: &str, n
 fn pk_admission_matrix() {
     let (_srv, mut client, sn) = boot(1);
     use TypeCode::*;
-    let accepted: &[(&str, &str, &[usize], usize, &[TypeCode], &[&str])] = &[
+    let accepted: &[(&str, &str, &[u32], usize, &[TypeCode], &[&str])] = &[
         (
             "CREATE TABLE t_int (id INT PRIMARY KEY)",
             "t_int",
@@ -123,10 +123,10 @@ fn pk_admission_matrix() {
     for &(sql, table, pk_indices, stride, tcs, names) in accepted {
         exec(&mut client, &sn, sql);
         let s = client.resolve_table_id(&sn, table).unwrap().1;
-        assert_eq!(s.pk_indices(), pk_indices, "{table}");
+        assert_eq!(s.pk_cols, pk_indices, "{table}");
         assert_eq!(s.pk_stride(), stride, "{table}");
         for ((&pi, &tc), &name) in pk_indices.iter().zip(tcs).zip(names) {
-            let c = &s.columns[pi];
+            let c = &s.columns[pi as usize];
             assert_eq!(c.type_code, tc, "{table}.{name}");
             assert!(c.name.eq_ignore_ascii_case(name), "{table}: {} != {name}", c.name);
             assert!(!c.is_nullable, "{table}.{name} must be NOT NULL");
@@ -191,7 +191,7 @@ fn fk_child_adopts_the_parent_pk_type() {
     let s = client.resolve_table_id(&sn, "child").unwrap().1;
     let fk = &s.columns[col_idx(&s, "p_id")];
     assert_eq!(fk.type_code, TypeCode::I64);
-    assert_ne!(fk.fk_table_id, 0);
+    assert!(matches!(fk.fk, Some(gnitz_core::FkTarget::Table { .. })));
 
     assert_rejects_variant(
         &mut client,

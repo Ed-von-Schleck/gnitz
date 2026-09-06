@@ -54,13 +54,6 @@ fn count_acc(n: i64) -> ColAcc {
     ColAcc::IntSum { bits: n, seen: true }
 }
 
-fn fixed(col: &ColData) -> &[u8] {
-    match col {
-        ColData::Fixed(b) => b,
-        _ => panic!("expected a Fixed column"),
-    }
-}
-
 /// A shape with no finalize items — enough for the two `fill_group_batch`
 /// tests, which never project.
 fn fill_only_shape(src: &Schema, group_positions: Vec<usize>, agg_specs: Vec<AggSpec>) -> FoldShape {
@@ -93,7 +86,7 @@ fn fill_group_batch_lays_out_values_and_null_bits() {
     // group ordinal instead of copying the key would not coincide.
     let mut partial = ZSetBatch::new(&spec.partial_schema);
     for (row, (key, g)) in [(0x77u128, 10i64), (0x33, 0)].into_iter().enumerate() {
-        partial.pks.push_u128(key);
+        partial.pks.push_u128(&spec.partial_schema, key);
         partial.weights.push(1);
         partial.nulls.push(if row == 1 { 0b1 } else { 0 });
         push_fixed_bits(&mut partial.columns[1], g as u64, 8);
@@ -126,17 +119,17 @@ fn fill_group_batch_lays_out_values_and_null_bits() {
     // Slot 0 = g, slot 1 = MIN(sm), slot 2 = COUNT. Group 1 nulls g and MIN.
     assert_eq!(got.nulls, vec![0, 0b011]);
     // `_group_pk` is the representative row's key, copied.
-    assert_eq!(got.pks, PkColumn::from_u128s(16, [0x77, 0x33]));
+    assert_eq!(got.pks, PkColumn::from_natives(&spec.partial_schema, [0x77, 0x33]));
     // g: the copied value, then `push_null`'s zero filler.
     assert_eq!(
-        fixed(&got.columns[1]),
+        got.columns[1],
         10i64.to_le_bytes().iter().chain(&[0; 8]).copied().collect::<Vec<_>>()
     );
     // MIN(sm) truncated to its declared 2 bytes, then a zeroed NULL cell.
-    assert_eq!(fixed(&got.columns[2]), &[0xfb, 0xff, 0, 0]);
+    assert_eq!(got.columns[2], [0xfb, 0xff, 0, 0]);
     // COUNT is never NULL.
     assert_eq!(
-        fixed(&got.columns[3]),
+        got.columns[3],
         2i64.to_le_bytes()
             .iter()
             .chain(&1i64.to_le_bytes())
@@ -165,7 +158,7 @@ fn fill_group_batch_handles_the_global_ground_row() {
     assert_eq!(got.len(), 1);
     // Slot 0 = MIN (NULL), slot 1 = COUNT (0, never NULL).
     assert_eq!(got.nulls, vec![0b01]);
-    assert_eq!(fixed(&got.columns[2]), &0i64.to_le_bytes());
+    assert_eq!(got.columns[2], 0i64.to_le_bytes());
 }
 
 /// The shape the fold path builds for one direct COUNT — `SELECT g, COUNT(*) …
@@ -217,7 +210,7 @@ fn the_output_row_carries_the_engine_group_key() {
     // 0x2222 then 0x1111; worker 1 emits the rest of 0x1111.
     let mut partial = ZSetBatch::new(&spec.partial_schema);
     for (key, g, n) in [(0x2222u128, 20i64, 1i64), (0x1111, 10, 2), (0x1111, 10, 3)] {
-        partial.pks.push_u128(key);
+        partial.pks.push_u128(&spec.partial_schema, key);
         partial.weights.push(1);
         partial.nulls.push(0);
         push_fixed_bits(&mut partial.columns[1], g as u64, 8);
@@ -228,11 +221,11 @@ fn the_output_row_carries_the_engine_group_key() {
 
     assert_eq!(got.len(), 2);
     // First-encounter ordinals would be `[0, 1]`; the group keys are not.
-    assert_eq!(got.pks, PkColumn::from_u128s(16, [0x2222, 0x1111]));
+    assert_eq!(got.pks, PkColumn::from_natives(&spec.partial_schema, [0x2222, 0x1111]));
     // The values stay paired with their keys: 0x2222 is g = 20 / COUNT 1,
     // 0x1111 is g = 10 / COUNT 2 + 3.
-    assert_eq!(fixed(&got.columns[1]), le(&[20, 10]));
-    assert_eq!(fixed(&got.columns[2]), le(&[1, 5]));
+    assert_eq!(got.columns[1], le(&[20, 10]));
+    assert_eq!(got.columns[2], le(&[1, 5]));
 }
 
 /// The synthesized global ground row has no partial to copy a key from, so
@@ -246,8 +239,11 @@ fn the_global_ground_row_is_keyed_at_v0() {
     let empty = ZSetBatch::new(&spec.partial_schema);
     let got = agg_finish(&spec, &empty);
 
-    assert_eq!(got.pks, PkColumn::from_u128s(16, [gnitz_wire::global_group_key()]));
-    assert_eq!(fixed(&got.columns[1]), le(&[0]));
+    assert_eq!(
+        got.pks,
+        PkColumn::from_natives(&spec.partial_schema, [gnitz_wire::global_group_key()])
+    );
+    assert_eq!(got.columns[1], le(&[0]));
 }
 
 /// A global `AVG(u)` over a `BIGINT UNSIGNED` column, built the way the planner
@@ -284,7 +280,9 @@ fn avg_shape() -> FoldShape {
 fn finish_avg(sum_bits: i64, cnt: i64) -> Option<f64> {
     let spec = avg_shape();
     let mut partial = ZSetBatch::new(&spec.partial_schema);
-    partial.pks.push_u128(gnitz_wire::global_group_key());
+    partial
+        .pks
+        .push_u128(&spec.partial_schema, gnitz_wire::global_group_key());
     partial.weights.push(1);
     partial.nulls.push(0);
     push_fixed_bits(&mut partial.columns[1], sum_bits as u64, 8);
@@ -292,8 +290,8 @@ fn finish_avg(sum_bits: i64, cnt: i64) -> Option<f64> {
 
     let got = agg_finish(&spec, &partial);
     assert_eq!(got.len(), 1);
-    (!gnitz_core::null_word_get(got.nulls[0], 0))
-        .then(|| f64::from_bits(u64::from_le_bytes(fixed(&got.columns[1])[..8].try_into().unwrap())))
+    (!gnitz_wire::null_word_get(got.nulls[0], 0))
+        .then(|| f64::from_bits(u64::from_le_bytes(got.columns[1][..8].try_into().unwrap())))
 }
 
 /// AVG divides its SUM accumulator at the accumulator's declared type. A SUM

@@ -248,7 +248,7 @@ fn drop_column(
     };
     let cd = &schema.columns[col_idx];
 
-    if schema.pk_cols.contains(&col_idx) {
+    if schema.is_pk_col(col_idx) {
         return Err(GnitzSqlError::Unsupported(format!(
             "cannot DROP COLUMN '{col_name}': it is part of the primary key"
         )));
@@ -258,7 +258,7 @@ fn drop_column(
             "cannot DROP COLUMN '{col_name}': it is a SERIAL column"
         )));
     }
-    if cd.fk_table_id != 0 {
+    if cd.fk.is_some() {
         return Err(GnitzSqlError::Unsupported(format!(
             "cannot DROP COLUMN '{col_name}': it carries a foreign key; drop the foreign key first"
         )));
@@ -303,7 +303,7 @@ fn drop_not_null(
     let Some(col_idx) = find_unique_column(&schema.columns, col_name)? else {
         return Err(missing("column", schema_name, col_name));
     };
-    if schema.pk_cols.contains(&col_idx) {
+    if schema.is_pk_col(col_idx) {
         return Err(GnitzSqlError::Unsupported(format!(
             "cannot DROP NOT NULL on '{col_name}': a primary-key column is non-nullable"
         )));

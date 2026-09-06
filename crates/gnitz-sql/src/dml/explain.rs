@@ -11,6 +11,7 @@ use crate::dml::select::{ReadCase, ReadPlan, SinkTail, SpecRead, Target};
 use crate::exec::agg_finish::FoldShape;
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, ColumnDef, Schema, TypeCode, ZSetBatch};
+use gnitz_wire::sys_rows::SysRowSink;
 use gnitz_wire::{AggFunc, ReadBound};
 
 /// Describe `plan` without running it: the EXPLAIN reply.
@@ -239,9 +240,13 @@ fn plan_rows(lines: &[String]) -> SqlResult {
     .expect("the EXPLAIN reply schema is a valid two-column schema");
     let mut batch = ZSetBatch::new(&schema);
     {
+        // Through the row sink, so the row-completeness check `end_row` carries
+        // applies here as it does to every catalog row.
         let mut a = BatchAppender::new(&mut batch, &schema);
         for (i, line) in lines.iter().enumerate() {
-            a.add_row(i as u128 + 1, 1).str_val(line);
+            a.begin_row(&[i as u128 + 1], 1);
+            a.put_string(line);
+            a.end_row();
         }
     }
     SqlResult::Rows { schema, batch }

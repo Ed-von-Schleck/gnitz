@@ -1,40 +1,32 @@
 use super::*;
 use crate::test_support::{num_expr, uuid_schema_payload, uuid_str_expr};
 
-/// The lone UUID cell of a `Fixed` column, from its 16 LE bytes.
-fn uuid_cell(col: &ColData) -> u128 {
-    let ColData::Fixed(b) = col else {
-        panic!("expected Fixed")
-    };
-    u128::from_le_bytes(b[..16].try_into().unwrap())
+/// The lone UUID cell of a column region, from its 16 LE bytes.
+fn uuid_cell(col: &[u8]) -> u128 {
+    u128::from_le_bytes(col[..16].try_into().unwrap())
 }
 
 #[test]
 fn test_null_append_insert_update_identical_all_variants() {
     let null_expr = Expr::value(Value::Null);
-    // (fresh empty ColData, wire type, expected NULL encoding) per variant.
-    let cases: [(ColData, TypeCode, ColData); 4] = [
-        (ColData::Fixed(Vec::new()), TypeCode::U32, ColData::Fixed(vec![0u8; 4])),
-        (
-            ColData::Strings(Vec::new()),
-            TypeCode::String,
-            ColData::Strings(vec![None]),
-        ),
-        (ColData::Bytes(Vec::new()), TypeCode::Blob, ColData::Bytes(vec![None])),
-        (
-            ColData::Fixed(Vec::new()),
-            TypeCode::UUID,
-            ColData::Fixed(vec![0u8; 16]),
-        ),
+    // (wire type, expected NULL encoding) per column kind — a zeroed cell of the
+    // type's own stride, German-string columns included.
+    let cases: [(TypeCode, Vec<u8>); 4] = [
+        (TypeCode::U32, vec![0u8; 4]),
+        (TypeCode::String, vec![0u8; 16]),
+        (TypeCode::Blob, vec![0u8; 16]),
+        (TypeCode::UUID, vec![0u8; 16]),
     ];
-    for (empty, tc, expected) in cases {
-        let mut via_insert = empty.clone();
-        append_value_to_col(&mut via_insert, tc, &null_expr).unwrap();
-        let mut via_update = empty.clone();
-        append_column_value(&mut via_update, ColumnValue::Null, tc).unwrap();
+    for (tc, expected) in cases {
+        let mut blob = Vec::new();
+        let mut via_insert = Vec::new();
+        append_value_to_col(&mut via_insert, &mut blob, tc, &null_expr).unwrap();
+        let mut via_update = Vec::new();
+        append_column_value(&mut via_update, &mut blob, ColumnValue::Null, tc).unwrap();
         assert_eq!(via_insert, expected, "INSERT NULL encoding for {tc:?}");
         assert_eq!(via_update, expected, "UPDATE NULL encoding for {tc:?}");
         assert_eq!(via_insert, via_update, "INSERT vs UPDATE NULL must match for {tc:?}");
+        assert!(blob.is_empty(), "a NULL cell spills nothing for {tc:?}");
     }
 }
 
@@ -52,8 +44,8 @@ fn set_value_out_of_range_is_rejected() {
         (TypeCode::U64, -1),     // wrapped to u64::MAX
     ];
     for (tc, v) in cases {
-        let mut col = ColData::Fixed(Vec::new());
-        let e = append_column_value(&mut col, ColumnValue::Int(v), tc).unwrap_err();
+        let mut col = Vec::new();
+        let e = append_column_value(&mut col, &mut Vec::new(), ColumnValue::Int(v), tc).unwrap_err();
         assert!(
             format!("{e:?}").contains("out of range"),
             "{tc:?} value {v} must be rejected, got {e:?}"
@@ -77,9 +69,9 @@ fn set_value_in_range_encodes_natively() {
         (TypeCode::I64, i64::MIN as i128, i64::MIN.to_le_bytes().to_vec()),
     ];
     for (tc, v, expected) in cases {
-        let mut col = ColData::Fixed(Vec::new());
-        append_column_value(&mut col, ColumnValue::Int(v), tc).unwrap();
-        assert_eq!(col, ColData::Fixed(expected), "encode for {tc:?} value {v}");
+        let mut col = Vec::new();
+        append_column_value(&mut col, &mut Vec::new(), ColumnValue::Int(v), tc).unwrap();
+        assert_eq!(col, expected, "encode for {tc:?} value {v}");
     }
 }
 
@@ -101,12 +93,9 @@ fn insert_int_encoding_matches_native_and_range_checks() {
         }
     }
     fn encoded(tc: TypeCode, e: &Expr) -> Result<Vec<u8>, GnitzSqlError> {
-        let mut col = ColData::Fixed(Vec::new());
-        append_value_to_col(&mut col, tc, e)?;
-        match col {
-            ColData::Fixed(b) => Ok(b),
-            _ => unreachable!(),
-        }
+        let mut col = Vec::new();
+        append_value_to_col(&mut col, &mut Vec::new(), tc, e)?;
+        Ok(col)
     }
 
     // Byte-identical to the native casts at every width / sign / type edge.
@@ -141,8 +130,10 @@ fn test_uuid_non_pk_string_literal_accepted() {
     let schema = uuid_schema_payload();
     let mut batch = gnitz_core::ZSetBatch::new(&schema);
     // col 1 is UUID
+    let gnitz_core::ZSetBatch { columns, blob, .. } = &mut batch;
     append_value_to_col(
-        &mut batch.columns[1],
+        &mut columns[1],
+        blob,
         TypeCode::UUID,
         &uuid_str_expr("550e8400-e29b-41d4-a716-446655440000"),
     )
@@ -158,7 +149,8 @@ fn test_uuid_decimal_literal_still_accepted() {
     let schema = uuid_schema_payload();
     let mut batch = gnitz_core::ZSetBatch::new(&schema);
     let big_val: u128 = 0x550e8400_e29b_41d4_a716_446655440000_u128;
-    append_value_to_col(&mut batch.columns[1], TypeCode::UUID, &num_expr(&big_val.to_string())).unwrap();
+    let gnitz_core::ZSetBatch { columns, blob, .. } = &mut batch;
+    append_value_to_col(&mut columns[1], blob, TypeCode::UUID, &num_expr(&big_val.to_string())).unwrap();
     assert_eq!(uuid_cell(&batch.columns[1]), big_val);
 }
 
@@ -171,10 +163,7 @@ fn a_unary_plus_literal_is_accepted_like_the_pk_slot_accepts_it() {
         op: UnaryOperator::Plus,
         expr: Box::new(num_expr("2")),
     };
-    let mut col = ColData::Fixed(Vec::new());
-    append_value_to_col(&mut col, TypeCode::U32, &plus).expect("`+2` must bind");
-    let ColData::Fixed(b) = &col else {
-        panic!("expected Fixed")
-    };
-    assert_eq!(b.as_slice(), 2u32.to_le_bytes());
+    let mut col = Vec::new();
+    append_value_to_col(&mut col, &mut Vec::new(), TypeCode::U32, &plus).expect("`+2` must bind");
+    assert_eq!(col.as_slice(), 2u32.to_le_bytes());
 }

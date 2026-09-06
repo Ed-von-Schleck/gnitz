@@ -1,7 +1,6 @@
 use super::codec::{encode_schema_block, schema_from_block};
 use super::error::ProtocolError;
-use super::regions::ViewBuffers;
-use super::types::{PkTuple, Schema, ZSetBatch};
+use super::types::{Schema, ZSetBatch};
 use super::wal_block::encode_wal_block;
 use super::WAL_BLOCK_HEADER_SIZE;
 use super::{wire_flags_get_schema_version, Header, WireConflictMode, FLAG_HAS_DATA, FLAG_HAS_SCHEMA, STATUS_OK};
@@ -159,10 +158,9 @@ fn encode_parts(
 /// Encode a request/response carrying `schema` in the frame. Pass the parts to
 /// `send_framed_iov`, or hand them to the outbound queue, for framing.
 ///
-/// `seek_pk` carries the seek key for `FLAG_SEEK` / `FLAG_SEEK_BY_INDEX` frames;
-/// pass `&PkTuple::EMPTY` for non-seek frames. The wire-level
-/// `(seek_pk: u128, seek_pk_extra: BLOB)` split is performed here via
-/// `PkTuple::split_wire`, so callers never handle it.
+/// `seek_pk` / `seek_pk_extra` carry the seek key for `FLAG_SEEK` /
+/// `FLAG_SEEK_BY_INDEX` frames, already in the wire's two-field form
+/// (`gnitz_wire::control::split_ctrl_key`); a non-seek frame passes `(0, &[])`.
 ///
 /// `data` pairs the rows with the schema they were encoded against, so a data
 /// block without its schema is unrepresentable. The schema block is derived
@@ -171,16 +169,16 @@ pub fn encode_message_parts(
     target_id: u64,
     client_id: u64,
     flags: u64,
-    seek_pk: &PkTuple,
+    seek_pk: u128,
+    seek_pk_extra: &[u8],
     seek_col_idx: u64,
     data: Option<(&Schema, &ZSetBatch)>,
 ) -> MessageParts {
-    let (seek_pk_lo, seek_pk_extra) = seek_pk.split_wire();
     encode_parts(
         target_id,
         client_id,
         flags,
-        seek_pk_lo,
+        seek_pk,
         seek_col_idx,
         seek_pk_extra,
         data.map(|(s, _)| encode_schema_block(s, target_id as u32)),
@@ -222,19 +220,16 @@ pub fn encode_push_txn(
     families: &[(u64, &Schema, &ZSetBatch, WireConflictMode)],
     preconditions: &[(u64, u64)],
 ) -> Vec<u8> {
-    // One `ViewBuffers` per family, because every family's regions are live at
-    // once: the frame is sized from all of them and then each batch is framed
-    // straight into it, so a batch is copied once instead of once into a
-    // per-family block and again into the frame.
-    let mut bufs: Vec<ViewBuffers> = (0..families.len()).map(|_| ViewBuffers::default()).collect();
-    let parts: Vec<(u8, Vec<u8>, Regioned<'_>)> = bufs
-        .iter_mut()
-        .zip(families)
-        .map(|(b, (tid, schema, batch, mode))| {
+    // Every family's regions are live at once: the frame is sized from all of
+    // them and then each batch is framed straight into it, so a batch is copied
+    // once instead of once into a per-family block and again into the frame.
+    let parts: Vec<(u8, Vec<u8>, Regioned<'_>)> = families
+        .iter()
+        .map(|(tid, schema, batch, mode)| {
             (
                 mode.as_wire(),
                 encode_schema_block(schema, *tid as u32),
-                Regioned::new(*tid, batch, b.regions(batch, schema)),
+                Regioned::new(*tid, batch, super::regions::regions(batch, schema)),
             )
         })
         .collect();
@@ -260,11 +255,9 @@ pub fn encode_scan_multi(client_id: u64, relations: &[(u64, u16)]) -> Vec<u8> {
 /// encoded against is that id's, derived here through [`sys_schema`], so a
 /// caller cannot pair one family's id with another's shape.
 pub fn encode_ddl_txn(client_id: u64, families: &[(u64, ZSetBatch)]) -> Vec<u8> {
-    let mut bufs: Vec<ViewBuffers> = (0..families.len()).map(|_| ViewBuffers::default()).collect();
-    let regioned: Vec<Regioned<'_>> = bufs
-        .iter_mut()
-        .zip(families)
-        .map(|(b, (tid, batch))| Regioned::new(*tid, batch, b.regions(batch, sys_schema(*tid))))
+    let regioned: Vec<Regioned<'_>> = families
+        .iter()
+        .map(|(tid, batch)| Regioned::new(*tid, batch, super::regions::regions(batch, sys_schema(*tid))))
         .collect();
     let refs: Vec<WalBlock<'_>> = regioned.iter().map(Regioned::wal).collect();
     gnitz_wire::txn_frame::encode_ddl_txn(client_id, &refs)
@@ -272,10 +265,9 @@ pub fn encode_ddl_txn(client_id: u64, families: &[(u64, ZSetBatch)]) -> Vec<u8> 
 
 /// Encode one control-only frame: no schema block, no data block.
 ///
-/// The seek key arrives as its two raw wire halves, not as a `PkTuple`, because
-/// `PkTuple::split_wire` caps the extra region at 64 bytes (`MAX_PK_BYTES - 16`)
-/// and this channel also carries the SEEK_BY_INDEX_RANGE `RangeDescriptor`, up
-/// to 82 bytes at max arity. The control block's BLOB column has no such cap.
+/// This channel also carries the SEEK_BY_INDEX_RANGE `RangeDescriptor` — up to
+/// 82 bytes at max arity, past the `MAX_PK_BYTES - 16` a split seek key can
+/// reach. The control block's BLOB column has no such cap.
 pub(crate) fn encode_control_frame(
     target_id: u64,
     client_id: u64,

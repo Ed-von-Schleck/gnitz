@@ -3,15 +3,15 @@ use crate::bind::bind_single_table;
 use crate::error::GnitzSqlError;
 use crate::ir::BoundExpr;
 use crate::validate::reject_duplicate_projection_names;
-use gnitz_core::{null_word_get, null_word_set, ColData, Schema, ZSetBatch};
+use gnitz_core::{Schema, TypeCode, ZSetBatch};
 use sqlparser::ast::SelectItem;
 
-/// One schema's payload copy plan: each payload column's index and wire stride,
+/// One schema's payload copy plan: each payload column's index and type,
 /// resolved once. A row-at-a-time gather builds this before its loop —
 /// `Schema::payload_columns` re-scans `pk_cols` per column and re-matches each
 /// type code, which over a million-row ordered result dominates the copy itself.
 pub(crate) struct RowGather {
-    payload: Vec<(usize, usize)>,
+    payload: Vec<(usize, TypeCode)>,
 }
 
 impl RowGather {
@@ -19,30 +19,18 @@ impl RowGather {
         RowGather {
             payload: schema
                 .payload_columns()
-                .map(|(_pi, ci, def)| (ci, def.type_code.wire_stride()))
+                .map(|(_pi, ci, def)| (ci, def.type_code))
                 .collect(),
         }
     }
 
-    /// Append `src`'s row `i` to `dst`, cloning String/Blob cells.
+    /// Append `src`'s row `i` to `dst`.
     pub(crate) fn copy(&self, src: &ZSetBatch, i: usize, dst: &mut ZSetBatch) {
         dst.pks.push_from(&src.pks, i);
         dst.weights.push(src.weights[i]);
         dst.nulls.push(src.nulls[i]);
-        for &(ci, stride) in &self.payload {
-            src.columns[ci].push_row_from(i, stride, &mut dst.columns[ci]);
-        }
-    }
-
-    /// Consuming variant for a source the caller owns and drops after the
-    /// gather: String/Blob cells are moved out (`ColData::take_row_into`)
-    /// instead of cloned, so each source row must be gathered at most once.
-    pub(crate) fn take(&self, src: &mut ZSetBatch, i: usize, dst: &mut ZSetBatch) {
-        dst.pks.push_from(&src.pks, i);
-        dst.weights.push(src.weights[i]);
-        dst.nulls.push(src.nulls[i]);
-        for &(ci, stride) in &self.payload {
-            src.columns[ci].take_row_into(i, stride, &mut dst.columns[ci]);
+        for &(ci, tc) in &self.payload {
+            dst.push_cell_from(ci, src, ci, tc, i);
         }
     }
 }
@@ -112,11 +100,11 @@ pub(crate) fn resolve_projection(
     }
 
     // Build the new PK column set; every projected source-PK becomes a new PK.
-    let new_pk_cols: Vec<usize> = col_indices
+    let new_pk_cols: Vec<u32> = col_indices
         .iter()
         .enumerate()
         .filter(|(_, &old_ci)| schema.is_pk_col(old_ci))
-        .map(|(new_ci, _)| new_ci)
+        .map(|(new_ci, _)| new_ci as u32)
         .collect();
 
     if new_pk_cols.is_empty() {
@@ -143,9 +131,14 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetB
         weights,
         nulls: src_nulls,
         columns: mut src_columns,
+        blob,
     } = src_batch;
     let mut new_batch = ZSetBatch::new(&new_schema);
     new_batch.weights = weights;
+    // The arena moves whole: a projection keeps every surviving cell's offset
+    // valid, and a dropped column's spill is dead weight in a per-statement
+    // buffer, not a leak.
+    new_batch.blob = blob;
 
     // PK region: move when the layout is byte-identical; else rebuild from the
     // packed source bytes. `pk_preserved` covers compound→compound when columns
@@ -155,7 +148,7 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetB
             .pk_cols
             .iter()
             .enumerate()
-            .all(|(i, &new_pk_ci)| col_indices[new_pk_ci] == schema.pk_cols[i]);
+            .all(|(i, &new_pk_ci)| col_indices[new_pk_ci as usize] as u32 == schema.pk_cols[i]);
 
     if pk_preserved {
         new_batch.pks = src_pks;
@@ -171,7 +164,7 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetB
             .pk_cols
             .iter()
             .map(|&new_pk_ci| {
-                let old_ci = col_indices[new_pk_ci];
+                let old_ci = col_indices[new_pk_ci as usize];
                 (
                     schema.pk_byte_offset(old_ci),
                     schema.columns[old_ci].type_code.wire_stride(),
@@ -180,13 +173,18 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetB
             .collect();
 
         // Every arity is the same walk: for each destination PK column, copy its
-        // bytes out of the source tuple at that column's offset.
-        new_batch.pks.buf.reserve(row_count * new_schema.pk_stride());
+        // OPK bytes out of the source tuple at that column's offset. A column's
+        // OPK image is independent of the columns around it, so no re-encode.
+        new_batch.pks.reserve(row_count);
+        let mut key = [0u8; gnitz_core::MAX_PK_BYTES];
         for i in 0..row_count {
             let row = src_pks.get_bytes(i);
+            let mut at = 0;
             for &(col_off, stride) in &pk_mappings {
-                new_batch.pks.buf.extend_from_slice(&row[col_off..col_off + stride]);
+                key[at..at + stride].copy_from_slice(&row[col_off..col_off + stride]);
+                at += stride;
             }
+            new_batch.pks.push_region_bytes(&key[..at]);
         }
     }
 
@@ -212,36 +210,29 @@ pub(crate) fn project(resolved: Projection, schema: &Schema, batch: Option<ZSetB
         for &old_word in &src_nulls {
             let mut new_word = 0u64;
             for &(new_pi, old_pi) in &pi_mappings {
-                if null_word_get(old_word, old_pi) {
-                    null_word_set(&mut new_word, new_pi, true);
+                if gnitz_wire::null_word_get(old_word, old_pi) {
+                    gnitz_wire::null_word_set(&mut new_word, new_pi, true);
                 }
             }
             new_batch.nulls.push(new_word);
         }
     }
 
-    // Payload columns: strictly payload→payload. `src_columns` is owned, so swap
-    // whole vectors instead of cloning per element — avoids per-row
-    // Option<String>/Option<Vec<u8>> allocations on string/blob result sets. A
-    // source column projected more than once is cloned for every occurrence but
-    // its last, which still takes the move.
+    // Payload columns: strictly payload→payload. `src_columns` is owned, so whole
+    // regions move rather than being copied cell by cell. A source column
+    // projected more than once is cloned for every occurrence but its last, which
+    // still takes the move.
     let payload_maps: Vec<(usize, usize)> = new_schema
         .payload_columns()
         .map(|(_, new_ci, _)| (new_ci, col_indices[new_ci]))
         .collect();
     for (pos, &(new_ci, old_ci)) in payload_maps.iter().enumerate() {
         let used_later = payload_maps[pos + 1..].iter().any(|&(_, o)| o == old_ci);
-        let src_col = if used_later {
+        new_batch.columns[new_ci] = if used_later {
             src_columns[old_ci].clone()
         } else {
-            std::mem::replace(&mut src_columns[old_ci], ColData::Fixed(Vec::new()))
+            std::mem::take(&mut src_columns[old_ci])
         };
-        match (src_col, &mut new_batch.columns[new_ci]) {
-            (ColData::Fixed(s), ColData::Fixed(d)) => *d = s,
-            (ColData::Strings(s), ColData::Strings(d)) => *d = s,
-            (ColData::Bytes(s), ColData::Bytes(d)) => *d = s,
-            _ => unreachable!("mismatched ColData variants for column {new_ci}"),
-        }
     }
 
     (new_schema, new_batch)

@@ -71,6 +71,11 @@ pub(crate) fn self_derived_key(cols: &[usize]) -> Vec<(u32, u8)> {
     cols.iter().map(|&c| (c as u32, 0)).collect()
 }
 
+/// [`self_derived_key`] over a schema's own PK column list.
+pub(crate) fn self_derived_pk_key(schema: &Schema) -> Vec<(u32, u8)> {
+    schema.pk_cols.iter().map(|&c| (c, 0)).collect()
+}
+
 /// The reindex kept-column list that prunes nothing — every source column
 /// survives as payload, in order.
 pub(crate) fn keep_all(n_cols: usize) -> Vec<u32> {
@@ -84,7 +89,7 @@ pub(crate) fn keep_all(n_cols: usize) -> Vec<u32> {
 fn rekey_on_source_pk(cb: &mut CircuitBuilder, node: NodeId, schema: &Schema, role: ReindexRole) -> NodeId {
     cb.map_reindex(
         node,
-        &self_derived_key(&schema.pk_cols),
+        &self_derived_pk_key(schema),
         &keep_all(schema.columns.len()),
         role,
     )

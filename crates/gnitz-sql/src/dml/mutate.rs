@@ -21,12 +21,10 @@ use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::BoundExpr;
 use crate::validate::{reject_unhonored_delete_clauses, reject_unhonored_update_clauses};
 use crate::SqlResult;
-use gnitz_core::null_word_set;
 use gnitz_core::{
-    retraction_batch, ColData, ColumnDef, GnitzClient, Schema, TypeCode, ViewBuffers, WireConflictMode, ZSetBatch,
-    ZSetBatchView,
+    retraction_batch, ColumnDef, GnitzClient, Schema, TypeCode, WireConflictMode, ZSetBatch, ZSetBatchView,
 };
-use gnitz_expr::{Evaluator, ExprResults};
+use gnitz_expr::{BatchView, Evaluator, ExprResults, RowSource};
 use gnitz_wire::ReadSink;
 use sqlparser::ast::{Assignment, AssignmentTarget, FromTable};
 
@@ -43,13 +41,12 @@ use sqlparser::ast::{Assignment, AssignmentTarget, FromTable};
 ///
 /// `StrCol` is gated on `TypeCode::String` rather than `is_german_string()` on
 /// purpose: a BLOB column must fall into `Expr`, where `OpcodeBackend`'s column
-/// load rejects it. That gate also keeps the arm structurally safe — a PK column
-/// can never be STRING (§1), so `StrCol` can never name one, whose slot in
-/// `ZSetBatch.columns` is an empty placeholder.
+/// load rejects it.
 pub(crate) enum SetProgram {
     /// A row-independent value: a literal, or `NULL`.
     Const(ColumnValue),
-    /// A bare reference to a `TypeCode::String` column, read verbatim.
+    /// A bare reference to a `TypeCode::String` column, read verbatim, by its
+    /// payload slot — the address the view reads through.
     StrCol(usize),
     /// A computed value, of whichever class the program resolved to. Boxed so a
     /// `SetProgram` stays small enough to sit in a `Vec` beside the other arms.
@@ -75,12 +72,11 @@ pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema)
         SetProgram::Const(ColumnValue::Int(v))
     } else {
         match expr {
-            BoundExpr::LitStr(s) => SetProgram::Const(ColumnValue::Str(s.clone())),
+            BoundExpr::LitStr(s) => SetProgram::Const(ColumnValue::Str(s.clone().into_bytes())),
             BoundExpr::LitNull => SetProgram::Const(ColumnValue::Null),
-            // `ColData::empty_for(TypeCode::String)` is the `Strings` variant and
-            // every batch reaching SET is built from a `Schema`, so the declared
-            // type code decides the representation.
-            BoundExpr::ColRef(c) if schema.columns[*c].type_code == TypeCode::String => SetProgram::StrCol(*c),
+            BoundExpr::ColRef(c) if schema.columns[*c].type_code == TypeCode::String => {
+                SetProgram::StrCol(schema.payload_idx(*c))
+            }
             // A SET value is written into a fixed-width integer or a string
             // column; an f64 register has no destination, and nothing downstream
             // can tell its bit pattern from an integer's.
@@ -124,7 +120,7 @@ pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema)
 /// per-row drive would pay `eval_batch`'s prologue for one row.
 pub(crate) enum SetValues<'a> {
     Const(&'a ColumnValue),
-    /// A `TypeCode::String` column of the bound batch, read verbatim.
+    /// A `TypeCode::String` payload slot of the bound batch, read verbatim.
     StrCol(usize),
     Computed(ExprResults),
 }
@@ -145,13 +141,14 @@ pub(crate) fn bind_set_program<'a>(p: &'a SetProgram, view: &ZSetBatchView<'_>) 
 pub(crate) fn eval_set_value(v: &SetValues<'_>, view: &ZSetBatchView<'_>, row: usize) -> ColumnValue {
     match v {
         SetValues::Const(cv) => (*cv).clone(),
-        SetValues::StrCol(c) => match &view.batch().columns[*c] {
-            ColData::Strings(vals) => match &vals[row] {
-                Some(s) => ColumnValue::Str(s.clone()),
-                None => ColumnValue::Null,
-            },
-            other => unreachable!("classify_set_rhs gates StrCol on TypeCode::String, got {other:?}"),
-        },
+        SetValues::StrCol(pi) => {
+            if gnitz_wire::null_word_get(view.get_null_word(row), *pi) {
+                ColumnValue::Null
+            } else {
+                let cell = &view.col_data(*pi, 16)[row * 16..row * 16 + 16];
+                ColumnValue::Str(gnitz_wire::german_string_content(cell, view.blob()).to_vec())
+            }
+        }
         // A `match` rather than `map_or`: this module builds at opt-level 0,
         // where `map_or` plus a constructor-as-closure is two out-of-line calls
         // moving a ~24-byte enum, and the match is free.
@@ -161,12 +158,7 @@ pub(crate) fn eval_set_value(v: &SetValues<'_>, view: &ZSetBatchView<'_>, row: u
         },
         SetValues::Computed(ExprResults::Str { bytes, spans }) => match spans[row] {
             None => ColumnValue::Null,
-            // Valid UTF-8 by construction: this path runs over the client-side
-            // `ZSetBatchView`, whose strings were UTF-8-validated at the wire
-            // decode boundary, and every string function preserves validity —
-            // ASCII case fold, character-unit substring, ASCII trim set, and
-            // concatenation of valid inputs.
-            Some((o, l)) => String::from_utf8(bytes[o..o + l].to_vec()).map_or(ColumnValue::Null, ColumnValue::Str),
+            Some((o, l)) => ColumnValue::Str(bytes[o..o + l].to_vec()),
         },
     }
 }
@@ -210,13 +202,11 @@ pub(crate) fn resolve_set_target(
 }
 
 /// [`build_merged_row`]'s row-invariant plan: each payload column's bitmap slot,
-/// physical index, definition and wire stride, resolved once per statement — the
-/// caller hoists it out of its row loop.
-pub(crate) fn merge_payload_plan(schema: &Schema) -> Vec<(usize, usize, &ColumnDef, usize)> {
-    schema
-        .payload_columns()
-        .map(|(pi, ci, def)| (pi, ci, def, def.type_code.wire_stride()))
-        .collect()
+/// physical index and definition, resolved once per statement — the caller
+/// hoists it out of its row loop, where `payload_columns` would re-scan
+/// `pk_cols` per column per row.
+pub(crate) fn merge_payload_plan(schema: &Schema) -> Vec<(usize, usize, &ColumnDef)> {
+    schema.payload_columns().collect()
 }
 
 /// Build one merged Z-set row into `dst`: PK from `(pk_src, pk_idx)`; null-bitmap
@@ -226,16 +216,14 @@ pub(crate) fn merge_payload_plan(schema: &Schema) -> Vec<(usize, usize, &ColumnD
 /// `carry_src`. Shared by UPDATE SET (pk_src == carry_src) and ON CONFLICT DO
 /// UPDATE (PK from the incoming row, carry/null-seed from the existing row).
 ///
-/// `payload` is [`merge_payload_plan`] collected once by the caller: both the
-/// `pk_cols` re-scan and the per-column wire stride are row-invariant, and over
-/// a large matched set re-deriving them costs more than the merge itself — the
+/// `payload` is [`merge_payload_plan`], collected once by the caller for the
 /// same reason [`RowGather`] resolves its plan up front.
 pub(crate) fn build_merged_row<F>(
     pk_src: &ZSetBatch,
     pk_idx: usize,
     carry_src: &ZSetBatch,
     carry_idx: usize,
-    payload: &[(usize, usize, &ColumnDef, usize)],
+    payload: &[(usize, usize, &ColumnDef)],
     dst: &mut ZSetBatch,
     mut resolve: F,
 ) -> Result<(), GnitzSqlError>
@@ -247,7 +235,7 @@ where
     // Seed from the carry source's null word; each assignment flips only its own
     // payload bit (set on a NULL result, clear on non-NULL), unassigned bits ride.
     let mut null_bits = carry_src.nulls[carry_idx];
-    for &(payload_idx, ci, col_def, stride) in payload {
+    for &(payload_idx, ci, col_def) in payload {
         match resolve(ci) {
             Some(cv) => {
                 // The NULL a SET produces at *run* time — an explicit `= NULL`, or
@@ -255,10 +243,11 @@ where
                 // `classify_set_rhs` cannot see.
                 let is_null = matches!(cv, ColumnValue::Null);
                 check_not_null(col_def, is_null)?;
-                null_word_set(&mut null_bits, payload_idx, is_null);
-                append_column_value(&mut dst.columns[ci], cv, col_def.type_code)?;
+                gnitz_wire::null_word_set(&mut null_bits, payload_idx, is_null);
+                let ZSetBatch { columns, blob, .. } = &mut *dst;
+                append_column_value(&mut columns[ci], blob, cv, col_def.type_code)?;
             }
-            None => carry_src.columns[ci].push_row_from(carry_idx, stride, &mut dst.columns[ci]),
+            None => dst.push_cell_from(ci, carry_src, ci, col_def.type_code, carry_idx),
         }
     }
     dst.nulls.push(null_bits);
@@ -277,11 +266,9 @@ fn write_set_rows(
     schema: &Schema,
     dst: &mut ZSetBatch,
 ) -> Result<(), GnitzSqlError> {
-    // One view over `current` for the whole loop — `ViewBuffers::view` rebuilds
-    // its region list per call, so a per-row view would be a malloc plus a
-    // PK-region rebuild per row.
-    let mut bufs = ViewBuffers::default();
-    let view = bufs.view(current, schema);
+    // One view over `current` for the whole loop: building one allocates a
+    // region list, which a per-row view would pay per row.
+    let view = ZSetBatchView::new(current, schema);
     // Bound before the row loop, which then only reads a buffer — leaving
     // `build_merged_row` and `append_column_value` row-major, so the order their
     // errors are raised in is unchanged.
@@ -339,7 +326,7 @@ fn resolve_where_matches(
     sink: &ReadSink,
     reply_schema: &Arc<Schema>,
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    let mut committed = fetch_bound(client, tid, &plan.access, sink, reply_schema)?;
+    let committed = fetch_bound(client, tid, &plan.access, sink, reply_schema)?;
     // In autocommit there is no buffer to overlay, and `buffered_scope`'s gather
     // can be megabytes of `PkTuple` for a large `pk IN (…)` — so ask only when a
     // transaction is open, which is the condition its doc already states.
@@ -351,7 +338,7 @@ fn resolve_where_matches(
     if net.is_empty() {
         return Ok(committed);
     }
-    let mut present = present_rows(&net, schema);
+    let present = present_rows(&net, schema);
     let matched = matching_indices(preds, &present, schema)?;
 
     let n = committed.len() + matched.len();
@@ -361,11 +348,11 @@ fn resolve_where_matches(
         // A PK the transaction has written is decided by its buffered version
         // below, whatever the committed row said.
         if !net.contains_key(&committed.pks.get_tuple(i)) {
-            gather.take(&mut committed, i, &mut eff);
+            gather.copy(&committed, i, &mut eff);
         }
     }
     for i in matched {
-        gather.take(&mut present, i, &mut eff);
+        gather.copy(&present, i, &mut eff);
     }
     Ok(eff)
 }

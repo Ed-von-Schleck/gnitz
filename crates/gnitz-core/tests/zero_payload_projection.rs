@@ -13,21 +13,23 @@
 //! permuted, non-adjacent compound PK whose OPK sign flip must survive.
 
 use gnitz_core::protocol::{ColumnDef, Schema, TypeCode};
-use gnitz_core::{BatchAppender, ColData, GnitzClient, TableProps, ZSetBatch};
+use gnitz_core::{BatchAppender, GnitzClient, TableProps, ZSetBatch};
 use gnitz_expr::{CmpOp, ExprBuilder, LogicalInstr as L};
 use gnitz_test_harness::{unique_schema, ServerHandle};
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
 
-/// The PK-only reply for `schema`: its PK columns in `pk_indices()` order, keyed
-/// on all of them, with no payload column at all.
+/// The PK-only reply for `schema`: its PK columns in PK-list order, keyed on all
+/// of them, with no payload column at all.
 fn pk_only_reply_schema(schema: &Schema) -> std::sync::Arc<Schema> {
     let cols: Vec<ColumnDef> = schema
-        .pk_indices()
+        .pk_cols
         .iter()
-        .map(|&ci| schema.columns[ci].clone())
+        .map(|&ci| schema.columns[ci as usize].clone())
         .collect();
     let k = cols.len();
-    std::sync::Arc::new(Schema::from_parts(cols, (0..k).collect()).expect("a PK-only reply schema is admissible"))
+    std::sync::Arc::new(
+        Schema::from_parts(cols, (0..k as u32).collect()).expect("a PK-only reply schema is admissible"),
+    )
 }
 
 /// `col > threshold` as a compiled predicate blob, over the SOURCE schema's
@@ -45,14 +47,12 @@ fn gt_predicate(col: usize, threshold: i64) -> Vec<u8> {
 /// one an empty placeholder, and there is no blob heap behind them because the
 /// zero-instruction program relocates nothing.
 fn assert_no_payload(reply: &ZSetBatch, reply_schema: &Schema) {
-    assert_eq!(reply.columns.len(), reply_schema.pk_indices().len());
+    assert_eq!(reply.columns.len(), reply_schema.pk_cols.len());
     for (i, c) in reply.columns.iter().enumerate() {
-        let empty = match c {
-            ColData::Fixed(v) => v.is_empty(),
-            ColData::Strings(v) => v.is_empty(),
-            ColData::Bytes(v) => v.is_empty(),
-        };
-        assert!(empty, "PK slot {i} of a PK-only reply must stay an empty placeholder");
+        assert!(
+            c.is_empty(),
+            "PK slot {i} of a PK-only reply must stay an empty placeholder"
+        );
     }
     reply
         .validate(reply_schema)
@@ -109,7 +109,9 @@ fn a_pk_only_reply_returns_exactly_the_matching_keys() {
 
     // Weights reach the client unsummed: no top-k gate, one row per key.
     assert!(reply.weights.iter().all(|&w| w == 1), "per-row weights preserved");
-    let mut got: Vec<u64> = (0..reply.pks.len()).map(|i| reply.pks.get(i) as u64).collect();
+    let mut got: Vec<u64> = (0..reply.pks.len())
+        .map(|i| reply.pks.get(&reply_schema, i) as u64)
+        .collect();
     got.sort_unstable();
     assert_eq!(got, (151u64..=200).collect::<Vec<_>>());
 
@@ -140,7 +142,8 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     let (tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
     assert_eq!(schema.pk_stride(), 12, "I64 then U32, tightly packed");
 
-    // `(c3, c0)` packed as the PK region: c3's native LE at offset 0, c0's at 8.
+    // `(c3, c0)` packed native little-endian in PK-list order — c3 at offset 0,
+    // c0 at 8 — which `add_row` OPK-encodes on append.
     let key = |c3: i64, c0: u32| -> u128 { (c3 as u64 as u128) | ((c0 as u128) << 64) };
     let rows: Vec<(i64, u32, i64)> = vec![(-9_000_000_000, 7, 10), (-1, 4_294_967_295, 20), (0, 0, 30), (5, 1, 40)];
     let mut batch = ZSetBatch::new(&schema);
@@ -164,12 +167,14 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
     let mut got: Vec<Vec<u8>> = (0..reply.pks.len())
         .map(|i| reply.pks.get_tuple(i).as_bytes().to_vec())
         .collect();
+    // The OPK image, spelled by hand: a signed I64 is big-endian with the sign
+    // bit flipped, an unsigned U32 is plain big-endian.
     let mut want: Vec<Vec<u8>> = rows[1..]
         .iter()
         .map(|&(c3, c0, _)| {
             let mut b = Vec::with_capacity(12);
-            b.extend_from_slice(&c3.to_le_bytes());
-            b.extend_from_slice(&c0.to_le_bytes());
+            b.extend_from_slice(&((c3 as u64) ^ (1u64 << 63)).to_be_bytes());
+            b.extend_from_slice(&c0.to_be_bytes());
             b
         })
         .collect();
@@ -188,8 +193,9 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
         )
         .unwrap()
         .expect("the table is non-empty");
-    assert!(
-        matches!(&full.columns[1], ColData::Strings(v) if v.len() == rows.len()),
+    assert_eq!(
+        full.columns[1].len(),
+        rows.len() * 16,
         "the identity sink still returns the TEXT column",
     );
 }

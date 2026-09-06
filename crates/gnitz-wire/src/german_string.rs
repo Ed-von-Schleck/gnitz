@@ -56,6 +56,17 @@ pub fn encode_german_string(s: &[u8], blob: &mut Vec<u8>) -> [u8; 16] {
     st
 }
 
+/// Shift a **long** cell's heap offset by `delta` — what a concatenating
+/// appender owes each cell once the source arena has been appended onto the
+/// destination's. A short cell carries no offset and is left alone.
+#[inline]
+pub fn shift_german_string_heap(cell: &mut [u8], delta: usize) {
+    if read_u32_le(cell, 0) as usize > SHORT_STRING_THRESHOLD {
+        let off = read_u64_le(cell, 8) + delta as u64;
+        cell[8..16].copy_from_slice(&off.to_le_bytes());
+    }
+}
+
 /// The one blob-extent rule: `[heap_offset, heap_offset + length)` as a `usize`
 /// range if it lies inside a heap of `blob_len` bytes, else `None`.
 ///

@@ -31,7 +31,7 @@ pub fn encode_schema_block(schema: &Schema, tid: u32) -> Vec<u8> {
                 col.is_nullable,
                 col.is_hidden,
                 col.is_serial,
-                schema.pk_cols.iter().position(|&p| p == ci).map(|p| p as u8),
+                schema.pk_cols.iter().position(|&p| p as usize == ci).map(|p| p as u8),
             ),
             name: col.name.as_bytes(),
         })
@@ -93,8 +93,7 @@ pub fn schema_from_block(block: &[u8]) -> Result<Schema, ProtocolError> {
         }
         columns.push(col);
     }
-    let pk_cols: Vec<usize> = sb.pk_indices().iter().map(|&i| i as usize).collect();
-    Schema::from_parts(columns, pk_cols).map_err(ProtocolError::DecodeError)
+    Schema::from_parts(columns, sb.pk_indices().to_vec()).map_err(ProtocolError::DecodeError)
 }
 
 #[cfg(test)]

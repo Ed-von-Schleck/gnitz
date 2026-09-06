@@ -19,7 +19,7 @@ use gnitz_sql::{SqlPlanner, SqlResult};
 
 use crate::read::{batch_to_lazy, delta_reply_to_py, triple_to_lazy, PyDeltaReply, PyScanResult};
 use crate::schema::{resolve_py_schema, rust_schema_to_py};
-use crate::write::{extract_uuid_or_u128, pk_tuple_from_py, py_pks_to_column, PyZSetBatch};
+use crate::write::{extract_uuid_or_u128, pk_key_from_py, py_pks_to_column, PyZSetBatch};
 use crate::{client_err, connect_client, gnitz_err, sql_err, to_py_err, GnitzError};
 
 /// What one view's poll did. The round its copy now answers at is `cursor`; the
@@ -193,7 +193,7 @@ impl PyGnitzClient {
         table_name: &str,
         #[pyo3(from_py_with = resolve_py_schema)] columns: Arc<Schema>,
     ) -> PyResult<u64> {
-        let pk: Vec<u32> = columns.pk_indices().iter().map(|&i| i as u32).collect();
+        let pk = columns.pk_cols.clone();
         self.call(py, move |c| {
             c.create_table(
                 schema_name,
@@ -373,11 +373,11 @@ impl PyGnitzClient {
         pk: Option<Bound<'_, PyAny>>,
         include_hidden: bool,
     ) -> PyResult<Py<PyScanResult>> {
-        let t = match pk {
-            Some(ref obj) => pk_tuple_from_py(obj)?,
-            None => gnitz_core::PkTuple::from_u128_narrow(0),
+        let (low, extra) = match pk {
+            Some(ref obj) => pk_key_from_py(obj)?,
+            None => (0, Vec::new()),
         };
-        let triple = self.call(py, move |c| c.seek(table_id, &t))?;
+        let triple = self.call(py, move |c| c.seek(table_id, low, &extra))?;
         triple_to_lazy(py, triple, include_hidden)
     }
 

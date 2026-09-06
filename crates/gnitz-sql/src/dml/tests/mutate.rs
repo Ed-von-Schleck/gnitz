@@ -75,7 +75,8 @@ fn test_write_set_clears_null_bit_on_non_null_assignment() {
         0,
         "null bit must be cleared after non-null assignment"
     );
-    if let ColData::Fixed(ref buf) = dst.columns[1] {
+    {
+        let buf = &dst.columns[1];
         assert_eq!(i64::from_le_bytes(buf[..8].try_into().unwrap()), 99);
     }
 }
@@ -93,13 +94,15 @@ fn test_write_set_sets_null_bit_when_source_col_is_null() {
         pk_cols: vec![0],
     };
     let mut current = ZSetBatch::new(&schema);
-    current.pks.push_u128(1u128);
+    current.pks.push_u128(&schema, 1u128);
     current.weights.push(1);
     current.nulls.push(0b10); // payload bit 1 (b) is NULL; bit 0 (a) is non-null
-    if let ColData::Fixed(ref mut buf) = current.columns[1] {
+    {
+        let buf = &mut current.columns[1];
         buf.extend_from_slice(&5i64.to_le_bytes());
     }
-    if let ColData::Fixed(ref mut buf) = current.columns[2] {
+    {
+        let buf = &mut current.columns[2];
         buf.extend_from_slice(&[0u8; 8]);
     }
 
@@ -126,13 +129,15 @@ fn test_write_set_preserves_null_bits_for_unassigned_cols() {
         pk_cols: vec![0],
     };
     let mut current = ZSetBatch::new(&schema);
-    current.pks.push_u128(1u128);
+    current.pks.push_u128(&schema, 1u128);
     current.weights.push(1);
     current.nulls.push(0b10); // b is NULL, a is not
-    if let ColData::Fixed(ref mut buf) = current.columns[1] {
+    {
+        let buf = &mut current.columns[1];
         buf.extend_from_slice(&5i64.to_le_bytes());
     }
-    if let ColData::Fixed(ref mut buf) = current.columns[2] {
+    {
+        let buf = &mut current.columns[2];
         buf.extend_from_slice(&[0u8; 8]);
     }
 
@@ -148,7 +153,7 @@ fn test_write_set_preserves_null_bits_for_unassigned_cols() {
 #[test]
 fn write_set_rows_carries_blob_column_through() {
     // UPDATE assigns `v` only; the unmodified BLOB column must carry
-    // through. Red against the missing `ColData::Bytes` arm (unreachable!).
+    // through.
     let schema = Schema {
         columns: vec![
             col_def("pk", TypeCode::U64, false),
@@ -158,26 +163,23 @@ fn write_set_rows_carries_blob_column_through() {
         pk_cols: vec![0],
     };
     let mut current = ZSetBatch::new(&schema);
-    current.pks.push_u128(1u128);
+    current.pks.push_u128(&schema, 1u128);
     current.weights.push(1);
     current.nulls.push(0);
-    if let ColData::Bytes(v) = &mut current.columns[1] {
-        v.push(Some(vec![1, 2, 3]));
-    }
-    if let ColData::Fixed(buf) = &mut current.columns[2] {
-        buf.extend_from_slice(&7i64.to_le_bytes());
-    }
+    let cell = gnitz_wire::encode_german_string(&[1, 2, 3], &mut current.blob);
+    current.columns[1].extend_from_slice(&cell);
+    current.columns[2].extend_from_slice(&7i64.to_le_bytes());
 
     let assignments = vec![(2usize, BoundExpr::LitInt(99))];
     let mut dst = ZSetBatch::new(&schema);
     write_set_rows(&current, &programs(&assignments, &schema), &schema, &mut dst).unwrap();
 
-    if let ColData::Bytes(v) = &dst.columns[1] {
-        assert_eq!(v[0].as_deref(), Some(&[1u8, 2, 3][..]));
-    } else {
-        panic!("expected Bytes column carried through");
-    }
-    if let ColData::Fixed(buf) = &dst.columns[2] {
+    assert_eq!(
+        gnitz_wire::german_string_content(&dst.columns[1][..16], &dst.blob),
+        &[1u8, 2, 3]
+    );
+    {
+        let buf = &dst.columns[2];
         assert_eq!(i64::from_le_bytes(buf[..8].try_into().unwrap()), 99);
     }
 }
@@ -197,27 +199,21 @@ fn build_merged_row_takes_pk_from_pk_src_and_carries_from_carry_src() {
 
     // pk_src (incoming): PK = 100; payload irrelevant (only the PK is read).
     let mut pk_src = ZSetBatch::new(&schema);
-    pk_src.pks.push_u128(100u128);
+    pk_src.pks.push_u128(&schema, 100u128);
     pk_src.weights.push(1);
     pk_src.nulls.push(0);
-    if let ColData::Fixed(buf) = &mut pk_src.columns[1] {
-        buf.extend_from_slice(&0i64.to_le_bytes());
-    }
-    if let ColData::Bytes(v) = &mut pk_src.columns[2] {
-        v.push(Some(vec![9, 9, 9]));
-    }
+    pk_src.columns[1].extend_from_slice(&0i64.to_le_bytes());
+    let cell = gnitz_wire::encode_german_string(&[9, 9, 9], &mut pk_src.blob);
+    pk_src.columns[2].extend_from_slice(&cell);
 
     // carry_src (existing): PK = 200; v = 7 (non-null); b = [1,2,3] to carry.
     let mut carry_src = ZSetBatch::new(&schema);
-    carry_src.pks.push_u128(200u128);
+    carry_src.pks.push_u128(&schema, 200u128);
     carry_src.weights.push(1);
     carry_src.nulls.push(0);
-    if let ColData::Fixed(buf) = &mut carry_src.columns[1] {
-        buf.extend_from_slice(&7i64.to_le_bytes());
-    }
-    if let ColData::Bytes(v) = &mut carry_src.columns[2] {
-        v.push(Some(vec![1, 2, 3]));
-    }
+    carry_src.columns[1].extend_from_slice(&7i64.to_le_bytes());
+    let cell = gnitz_wire::encode_german_string(&[1, 2, 3], &mut carry_src.blob);
+    carry_src.columns[2].extend_from_slice(&cell);
 
     // Resolver: assign v = NULL (must SET its null bit); leave b unassigned (carry).
     let mut dst = ZSetBatch::new(&schema);
@@ -236,11 +232,10 @@ fn build_merged_row_takes_pk_from_pk_src_and_carries_from_carry_src() {
     // v's null bit (payload_idx 0) must be SET after the NULL assignment.
     assert_ne!(dst.nulls[0] & 0b01, 0, "v must be null after SET v = NULL");
     // b carried from carry_src ([1,2,3]), not pk_src ([9,9,9]).
-    if let ColData::Bytes(v) = &dst.columns[2] {
-        assert_eq!(v[0].as_deref(), Some(&[1u8, 2, 3][..]));
-    } else {
-        panic!("expected carried Bytes column");
-    }
+    assert_eq!(
+        gnitz_wire::german_string_content(&dst.columns[2][..16], &dst.blob),
+        &[1u8, 2, 3]
+    );
 }
 
 // ------------------------------------------------------------------
@@ -249,10 +244,7 @@ fn build_merged_row_takes_pk_from_pk_src_and_carries_from_carry_src() {
 
 /// The written `i64` of `dst`'s single-row payload column `ci`.
 fn written_i64(dst: &ZSetBatch, ci: usize) -> i64 {
-    match &dst.columns[ci] {
-        ColData::Fixed(buf) => i64::from_le_bytes(buf[..8].try_into().unwrap()),
-        other => panic!("expected a Fixed column, got {other:?}"),
-    }
+    i64::from_le_bytes(dst.columns[ci][..8].try_into().unwrap())
 }
 
 /// A numeric RHS reading a **nullable** source column: the compiled program
@@ -272,13 +264,15 @@ fn set_numeric_over_a_nullable_column() {
     // b = 5 (non-null) in row 0, b = NULL in row 1.
     let mut current = ZSetBatch::new(&schema);
     for (i, (bits, null_word)) in [(5i64, 0u64), (0, 0b10)].into_iter().enumerate() {
-        current.pks.push_u128(i as u128 + 1);
+        current.pks.push_u128(&schema, i as u128 + 1);
         current.weights.push(1);
         current.nulls.push(null_word);
-        if let ColData::Fixed(buf) = &mut current.columns[1] {
+        {
+            let buf = &mut current.columns[1];
             buf.extend_from_slice(&0i64.to_le_bytes());
         }
-        if let ColData::Fixed(buf) = &mut current.columns[2] {
+        {
+            let buf = &mut current.columns[2];
             buf.extend_from_slice(&bits.to_le_bytes());
         }
     }
@@ -304,10 +298,11 @@ fn set_numeric_over_a_nullable_column() {
 fn set_reads_the_pk_column() {
     let schema = two_col(TypeCode::I64);
     let mut current = ZSetBatch::new(&schema);
-    current.pks.push_u128(41u128);
+    current.pks.push_u128(&schema, 41u128);
     current.weights.push(1);
     current.nulls.push(0);
-    if let ColData::Fixed(buf) = &mut current.columns[1] {
+    {
+        let buf = &mut current.columns[1];
         buf.extend_from_slice(&0i64.to_le_bytes());
     }
     // SET val = pk + 1
@@ -377,16 +372,14 @@ fn a_computed_string_rhs_routes_to_the_string_arm_and_evaluates() {
     // Drive it over a real row: a bare column read (`StrCol`) and the
     // computed form must agree on everything but the transform.
     let mut batch = ZSetBatch::new(&schema);
-    batch.pks.push_u128(1u128);
+    batch.pks.push_u128(&schema, 1u128);
     batch.weights.push(1);
     batch.nulls.push(0);
-    if let ColData::Strings(ref mut v) = batch.columns[1] {
-        v.push(Some("hello".to_string()));
-    }
-    let mut bufs = ViewBuffers::default();
-    let view = bufs.view(&batch, &schema);
+    let cell = gnitz_wire::encode_german_string(b"hello", &mut batch.blob);
+    batch.columns[1].extend_from_slice(&cell);
+    let view = ZSetBatchView::new(&batch, &schema);
     match eval_set_value(&bind_set_program(&p, &view), &view, 0) {
-        ColumnValue::Str(s) => assert_eq!(s, "HELLO"),
+        ColumnValue::Str(s) => assert_eq!(s, b"HELLO"),
         _ => panic!("expected a string value"),
     }
 }

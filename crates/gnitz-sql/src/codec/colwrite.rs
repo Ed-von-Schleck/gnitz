@@ -1,4 +1,4 @@
-//! Column value encoding: SQL literal / computed value → `ColData`.
+//! Column value encoding: SQL literal / computed value → one §6 region cell.
 //!
 //! Two write paths share this module. INSERT appends parsed literals
 //! (`append_value_to_col`); SET / `ON CONFLICT DO UPDATE` append computed
@@ -9,7 +9,7 @@
 
 use crate::codec::pk_codec::{pack_pk_value, parse_pk_literal_packed, parse_uuid_str};
 use crate::error::GnitzSqlError;
-use gnitz_core::{ColData, ColumnDef, FixedInt, TypeCode};
+use gnitz_core::{push_zero_cell, ColumnDef, FixedInt, TypeCode};
 use sqlparser::ast::{Expr, UnaryOperator, Value};
 
 /// A computed SET / `DO UPDATE` value.
@@ -22,11 +22,18 @@ use sqlparser::ast::{Expr, UnaryOperator, Value};
 #[derive(Clone)]
 pub(crate) enum ColumnValue {
     Int(i128),
-    Str(String),
+    Str(Vec<u8>),
     Null,
 }
 
-pub(crate) fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Expr) -> Result<(), GnitzSqlError> {
+/// Append one INSERT literal to column region `col`, spilling a string into
+/// `blob`.
+pub(crate) fn append_value_to_col(
+    col: &mut Vec<u8>,
+    blob: &mut Vec<u8>,
+    tc: TypeCode,
+    val_expr: &Expr,
+) -> Result<(), GnitzSqlError> {
     // sqlparser lexes a literal's sign as a separate unary operator, so `+5` and
     // `-5` are both `UnaryOp`, never a bare `Value::Number`. Both signs unwrap
     // here for the same reason `pk_codec::extract_sql_literal` accepts both: the
@@ -44,61 +51,57 @@ pub(crate) fn append_value_to_col(col: &mut ColData, tc: TypeCode, val_expr: &Ex
         Expr::Value(vws) => {
             match &vws.value {
                 Value::Null => {
-                    col.push_null(tc);
+                    push_zero_cell(col, tc);
                     Ok(())
                 }
                 Value::Number(n, _) => {
                     // A `Value::Number` is bare digits; the sign is the `UnaryOp`
                     // peeled above. `sign` re-attaches it for the messages only.
                     let sign = if negated { "-" } else { "" };
-                    match col {
-                        ColData::Fixed(buf) => {
-                            match tc {
-                                // IEEE negation of the parsed magnitude is exact at
-                                // every value, `-0.0` and `-inf` included.
-                                TypeCode::F32 => {
-                                    let v = n
-                                        .parse::<f32>()
-                                        .map_err(|_| GnitzSqlError::Bind(format!("invalid f32: {sign}{n}")))?;
-                                    buf.extend_from_slice(&(if negated { -v } else { v }).to_le_bytes());
-                                }
-                                TypeCode::F64 => {
-                                    let v = n
-                                        .parse::<f64>()
-                                        .map_err(|_| GnitzSqlError::Bind(format!("invalid f64: {sign}{n}")))?;
-                                    buf.extend_from_slice(&(if negated { -v } else { v }).to_le_bytes());
-                                }
-                                // Every integer column, narrow (U8..I64) and wide
-                                // (U128/UUID/I128) alike. Route through the single source of truth
-                                // for literal acceptance (`pk_codec`) so the INSERT-value path and
-                                // PK-seek routing accept/reject identically. The packed u128's low
-                                // `wire_stride()` bytes are the column's LE image at every width.
-                                _ => {
-                                    let packed = parse_pk_literal_packed(tc, n, negated).ok_or_else(|| {
-                                        GnitzSqlError::Bind(format!("{tc:?} value out of range: {sign}{n}"))
-                                    })?;
-                                    buf.extend_from_slice(&packed.to_le_bytes()[..tc.wire_stride()]);
-                                }
-                            }
+                    match tc {
+                        // IEEE negation of the parsed magnitude is exact at every
+                        // value, `-0.0` and `-inf` included.
+                        TypeCode::F32 => {
+                            let v = n
+                                .parse::<f32>()
+                                .map_err(|_| GnitzSqlError::Bind(format!("invalid f32: {sign}{n}")))?;
+                            col.extend_from_slice(&(if negated { -v } else { v }).to_le_bytes());
                             Ok(())
                         }
-                        ColData::Strings(_) => Err(GnitzSqlError::Bind("number literal for string column".to_string())),
-                        ColData::Bytes(_) => Err(GnitzSqlError::Bind("number literal for blob column".to_string())),
+                        TypeCode::F64 => {
+                            let v = n
+                                .parse::<f64>()
+                                .map_err(|_| GnitzSqlError::Bind(format!("invalid f64: {sign}{n}")))?;
+                            col.extend_from_slice(&(if negated { -v } else { v }).to_le_bytes());
+                            Ok(())
+                        }
+                        TypeCode::String => Err(GnitzSqlError::Bind("number literal for string column".to_string())),
+                        TypeCode::Blob => Err(GnitzSqlError::Bind("number literal for blob column".to_string())),
+                        // Every integer column, narrow (U8..I64) and wide
+                        // (U128/UUID/I128) alike. Route through the single source of truth
+                        // for literal acceptance (`pk_codec`) so the INSERT-value path and
+                        // PK-seek routing accept/reject identically. The packed u128's low
+                        // `wire_stride()` bytes are the column's LE image at every width.
+                        _ => {
+                            let packed = parse_pk_literal_packed(tc, n, negated)
+                                .ok_or_else(|| GnitzSqlError::Bind(format!("{tc:?} value out of range: {sign}{n}")))?;
+                            col.extend_from_slice(&packed.to_le_bytes()[..tc.wire_stride()]);
+                            Ok(())
+                        }
                     }
                 }
-                Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => match col {
-                    ColData::Strings(v) => {
-                        v.push(Some(s.clone()));
+                // A BLOB column is *not* text-writable: it takes bytes, and a
+                // quoted literal spells none. UUID is the one non-STRING type a
+                // text literal spells a value of, and both write paths gate on the
+                // same `admits_text_literal` predicate, so neither can start
+                // accepting text for a type the other rejects.
+                Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => match tc {
+                    TypeCode::String => {
+                        col.extend_from_slice(&gnitz_wire::encode_german_string(s.as_bytes(), blob));
                         Ok(())
                     }
-                    // UUID: the one non-STRING type a text literal spells a value
-                    // of. Both write paths gate on the same `admits_text_literal`
-                    // predicate, so neither can start accepting text for a type
-                    // the other rejects — the divergence class this replaces was
-                    // bare hex reaching a U128 column through the Python binding
-                    // alone.
-                    ColData::Fixed(buf) if tc.admits_text_literal() => {
-                        buf.extend_from_slice(&parse_uuid_str(s)?.to_le_bytes());
+                    _ if tc.admits_text_literal() => {
+                        col.extend_from_slice(&parse_uuid_str(s)?.to_le_bytes());
                         Ok(())
                     }
                     _ => Err(GnitzSqlError::Bind("string literal for non-string column".to_string())),
@@ -141,12 +144,18 @@ pub(crate) fn set_target_admits(tc: TypeCode, str_valued: bool) -> bool {
     if str_valued {
         tc == TypeCode::String
     } else {
-        // Implies `ColData::Fixed`: the variant is chosen from the type code.
         FixedInt::from_type_code(tc).is_some()
     }
 }
 
-pub(crate) fn append_column_value(col: &mut ColData, cv: ColumnValue, tc: TypeCode) -> Result<(), GnitzSqlError> {
+/// Append one computed SET / `DO UPDATE` value to column region `col`, spilling
+/// a string into `blob`.
+pub(crate) fn append_column_value(
+    col: &mut Vec<u8>,
+    blob: &mut Vec<u8>,
+    cv: ColumnValue,
+    tc: TypeCode,
+) -> Result<(), GnitzSqlError> {
     // `classify_set_rhs` settles the kind match per statement, where it can name
     // the column; this is the same rule restated where the two `unreachable!`s
     // below rely on it, and is unreachable in a well-formed compile.
@@ -155,21 +164,15 @@ pub(crate) fn append_column_value(col: &mut ColData, cv: ColumnValue, tc: TypeCo
         "SET value kind must be settled by classify_set_rhs, not here ({tc:?})"
     );
     match cv {
-        ColumnValue::Null => col.push_null(tc),
+        ColumnValue::Null => push_zero_cell(col, tc),
         // Range-checked and packed by the same `pk_codec` rule INSERT uses: an
         // out-of-range value declines rather than wrapping to its low bits.
-        ColumnValue::Int(i) => match col {
-            ColData::Fixed(buf) => {
-                let packed = pack_pk_value(tc, i)
-                    .ok_or_else(|| GnitzSqlError::Bind(format!("{tc:?} value out of range: {i}")))?;
-                buf.extend_from_slice(&packed.to_le_bytes()[..tc.wire_stride()]);
-            }
-            other => unreachable!("a fixed-int type code implies ColData::Fixed, got {other:?}"),
-        },
-        ColumnValue::Str(s) => match col {
-            ColData::Strings(v) => v.push(Some(s)),
-            other => unreachable!("TypeCode::String implies ColData::Strings, got {other:?}"),
-        },
+        ColumnValue::Int(i) => {
+            let packed =
+                pack_pk_value(tc, i).ok_or_else(|| GnitzSqlError::Bind(format!("{tc:?} value out of range: {i}")))?;
+            col.extend_from_slice(&packed.to_le_bytes()[..tc.wire_stride()]);
+        }
+        ColumnValue::Str(s) => col.extend_from_slice(&gnitz_wire::encode_german_string(&s, blob)),
     }
     Ok(())
 }

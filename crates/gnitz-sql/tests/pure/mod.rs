@@ -83,7 +83,7 @@ pub fn rel(
     class: RelClass,
     replicated: bool,
     columns: Vec<ColumnDef>,
-    pk_cols: Vec<usize>,
+    pk_cols: Vec<u32>,
     indexes: &[&[u32]],
 ) -> Arc<RelDescriptor> {
     Arc::new(RelDescriptor {
@@ -105,7 +105,7 @@ pub fn rel(
 }
 
 /// A plain, partitioned, unindexed base table.
-pub fn table(tid: u64, columns: Vec<ColumnDef>, pk_cols: Vec<usize>) -> Arc<RelDescriptor> {
+pub fn table(tid: u64, columns: Vec<ColumnDef>, pk_cols: Vec<u32>) -> Arc<RelDescriptor> {
     rel(tid, RelClass::Table, false, columns, pk_cols, &[])
 }
 
@@ -208,7 +208,7 @@ pub fn register(cat: &mut CatalogSnapshot, name: &str, tid: u64, chain: &Planned
     } else {
         RelClass::View
     };
-    let pk_cols = fv.pk_cols.iter().map(|&c| c as usize).collect();
+    let pk_cols = fv.pk_cols.clone();
     cat.insert(
         SN,
         name,

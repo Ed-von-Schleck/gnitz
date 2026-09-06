@@ -4,7 +4,7 @@
 //! compound PKs) and the literal-expression shapes can't drift between modules.
 
 use crate::ir::BoundExpr;
-use gnitz_core::{ColData, ColumnDef, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{ColumnDef, Schema, TypeCode, ZSetBatch};
 use sqlparser::ast::{BinaryOperator, Expr, Ident, UnaryOperator, Value};
 
 pub(crate) fn col_def(name: &str, tc: TypeCode, nullable: bool) -> ColumnDef {
@@ -31,12 +31,10 @@ pub(crate) fn two_col(val_tc: TypeCode) -> Schema {
 pub(crate) fn batch_2col(val_bytes: Vec<u8>, val_tc: TypeCode, null_bits: u64) -> ZSetBatch {
     let schema = two_col(val_tc);
     let mut b = ZSetBatch::new(&schema);
-    b.pks.push_u128(1u128);
+    b.pks.push_u128(&schema, 1u128);
     b.weights.push(1);
     b.nulls.push(null_bits);
-    if let ColData::Fixed(ref mut buf) = b.columns[1] {
-        buf.extend(val_bytes);
-    }
+    b.columns[1].extend(val_bytes);
     b
 }
 

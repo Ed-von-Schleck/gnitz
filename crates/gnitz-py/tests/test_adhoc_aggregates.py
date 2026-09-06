@@ -1223,3 +1223,38 @@ def test_index_plan_keeps_the_exact_answer_and_a_repeatable_float_sum(tiny_ddl_c
         assert _bits(_rows(client, sn, float_q)) == _bits(_rows(client, sn, float_q))
     finally:
         _cleanup(client, sn, "f")
+
+
+def test_a_spilling_string_group_column_survives_the_finalize(client):
+    """A GROUP BY over a TEXT column longer than the German-string inline bound.
+
+    The group column is copied out of the fold's own group batch into the
+    result, and a spilled cell's heap offset means nothing in the destination's
+    arena — so a copy that moved the 16-byte struct verbatim would hand back an
+    empty string for exactly the values that do not fit inline."""
+    sn = "gs" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE labelled (pk BIGINT NOT NULL PRIMARY KEY, label TEXT NOT NULL, amount BIGINT NOT NULL)",
+            schema_name=sn,
+        )
+        # Two labels well past SHORT_STRING_THRESHOLD (12), one below it.
+        labels = ["a string far past the inline bound", "another long spilling label", "short"]
+        rows = [(i, labels[i % 3], i) for i in range(12)]
+        client.execute_sql(
+            "INSERT INTO labelled VALUES "
+            + ",".join(f"({pk}, '{label}', {amount})" for pk, label, amount in rows),
+            schema_name=sn,
+        )
+        got = _as_dict(
+            _parity(client, sn, "SELECT label, SUM(amount) AS s FROM labelled GROUP BY label"),
+            "label",
+            "s",
+        )
+        want = {}
+        for _, label, amount in rows:
+            want[label] = want.get(label, 0) + amount
+        assert got == want
+    finally:
+        _cleanup(client, sn, "labelled")

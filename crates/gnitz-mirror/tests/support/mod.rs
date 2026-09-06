@@ -5,7 +5,7 @@ pub mod perf;
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
-use gnitz_core::{ColData, GnitzClient, Schema, ZSetBatch};
+use gnitz_core::{GnitzClient, Schema, ZSetBatch};
 use gnitz_sql::{SqlPlanner, SqlResult};
 
 /// Every test in this binary takes this lock.
@@ -70,29 +70,23 @@ pub fn canonical(schema: &Schema, batch: &ZSetBatch) -> BTreeMap<Row, i64> {
 /// `ORDER BY` comparison needs, since the multiset above is order-blind and so
 /// accepts the right rows in the wrong order.
 pub fn canonical_rows(schema: &Schema, batch: &ZSetBatch) -> Vec<(Row, i64)> {
-    let stride = schema.pk_stride();
-    let codes: Vec<(usize, u8)> = schema.pk_col_codes().collect();
     let mut out: Vec<(Row, i64)> = Vec::with_capacity(batch.weights.len());
     for row in 0..batch.weights.len() {
-        let mut opk = vec![0u8; stride];
-        gnitz_wire::encode_pk_tuple(
-            codes.iter().copied(),
-            &batch.pks.buf[row * stride..(row + 1) * stride],
-            &mut opk,
-        );
+        // The client column already holds the store's own OPK bytes, so the key
+        // is compared directly rather than re-encoded from a native image.
+        let opk = batch.pks.get_bytes(row).to_vec();
         let cells = schema
             .payload_columns()
             .map(|(pi, ci, cd)| {
-                if gnitz_core::null_word_get(batch.nulls[row], pi) {
+                if gnitz_wire::null_word_get(batch.nulls[row], pi) {
                     return None;
                 }
-                Some(match &batch.columns[ci] {
-                    ColData::Fixed(b) => {
-                        let w = cd.type_code.wire_stride();
-                        b[row * w..(row + 1) * w].to_vec()
-                    }
-                    ColData::Strings(v) => v[row].clone().unwrap_or_default().into_bytes(),
-                    ColData::Bytes(v) => v[row].clone().unwrap_or_default(),
+                let w = cd.type_code.wire_stride();
+                let cell = &batch.columns[ci][row * w..(row + 1) * w];
+                Some(if gnitz_wire::is_german_string(cd.type_code as u8) {
+                    gnitz_wire::german_string_content(cell, &batch.blob).to_vec()
+                } else {
+                    cell.to_vec()
                 })
             })
             .collect();

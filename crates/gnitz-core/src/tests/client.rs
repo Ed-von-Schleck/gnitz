@@ -19,7 +19,7 @@ fn ins(schema: &Schema, pk: u64) -> ZSetBatch {
 }
 
 fn del(schema: &Schema, pk: u64) -> ZSetBatch {
-    retraction_batch(schema, PkColumn::from_u128s(8, [pk as u128]))
+    retraction_batch(schema, PkColumn::from_natives(schema, [pk as u128]))
 }
 
 /// One mixed sequence pins the whole buffer: same-mode pushes extend the tid's
@@ -61,7 +61,7 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
 
     let mut op = |tid, pk: u64| {
         buf.reads(tid)
-            .last_op(&PkTuple::from_u128(8, pk as u128))
+            .last_op(&PkTuple::from_native_packed(&kv_schema(), pk as u128))
             .map(|(b, row)| (b.weights[row], row))
     };
     assert_eq!(op(16, 1), Some((1, 0)), "the last of three ops on pk=1");
@@ -119,8 +119,8 @@ fn a_copied_catalog_row_differs_only_where_it_is_patched() {
         },
         1,
     );
-    let i = scanned.live_row_with_pk(7).expect("the row just written");
-    assert!(scanned.live_row_with_pk(8).is_none(), "an absent tid");
+    let i = scanned.live_row_with_pk(schema, 7).expect("the row just written");
+    assert!(scanned.live_row_with_pk(schema, 8).is_none(), "an absent tid");
 
     let mut pair = ZSetBatch::new(schema);
     pair.copy_row_at(&scanned, i, -1, schema);
@@ -128,17 +128,16 @@ fn a_copied_catalog_row_differs_only_where_it_is_patched() {
     pair.set_string_cell(1, TABTAB_COL_NAME, "t2");
 
     assert_eq!(pair.weights, vec![-1, 1]);
-    assert_eq!(pair.pks.to_vec_u128(), vec![7, 7], "the rename keeps the id");
+    assert_eq!(pair.pks.to_vec_u128(schema), vec![7, 7], "the rename keeps the id");
     assert_eq!(pair.nulls, vec![scanned.nulls[i]; 2]);
     // Every non-name column is the stored row's, in both halves.
-    let ColData::Fixed(flags) = &pair.columns[gnitz_wire::TABTAB_COL_FLAGS] else {
-        panic!("expected Fixed column");
-    };
+    let flags = &pair.columns[gnitz_wire::TABTAB_COL_FLAGS];
     assert_eq!(flags[..], [9u64.to_le_bytes(), 9u64.to_le_bytes()].concat()[..]);
-    let ColData::Strings(names) = &pair.columns[TABTAB_COL_NAME] else {
-        panic!("expected Strings column");
-    };
-    assert_eq!(names, &[Some("t".to_string()), Some("t2".to_string())]);
+    let names: Vec<&[u8]> = pair.columns[TABTAB_COL_NAME]
+        .chunks_exact(16)
+        .map(|cell| gnitz_wire::german_string_content(cell, &pair.blob))
+        .collect();
+    assert_eq!(names, [b"t".as_slice(), b"t2".as_slice()]);
 }
 
 #[test]

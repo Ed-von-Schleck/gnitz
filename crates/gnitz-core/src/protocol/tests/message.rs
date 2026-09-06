@@ -1,5 +1,5 @@
 use super::*;
-use crate::protocol::types::{BatchAppender, ColData, ColumnDef, PkColumn, PkTuple, Schema, TypeCode, ZSetBatch};
+use crate::protocol::types::{BatchAppender, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use crate::protocol::wal_block::decode_wal_block;
 use crate::protocol::wire_flags_set_schema_version;
 use crate::protocol::WireConflictMode;
@@ -29,10 +29,11 @@ fn push_txn_families_carry_their_own_schema_and_batch() {
     let mut b1 = ZSetBatch::new(&schema);
     BatchAppender::new(&mut b1, &schema).add_row(3, 1).i64_val(30);
     let b2 = ZSetBatch {
-        pks: PkColumn::from_u128s(8, [4]),
+        pks: PkColumn::from_natives(&schema, [4]),
         weights: vec![-1],
         nulls: vec![0],
         columns: ZSetBatch::filler_columns(&schema, 1),
+        blob: vec![],
     };
 
     let families: Vec<(u64, &Schema, &ZSetBatch, WireConflictMode)> = vec![
@@ -140,7 +141,7 @@ fn test_request_id_roundtrip_reserved_values() {
 
 /// Ship one cold PUSH frame, the shape `Session::roundtrip_push` builds.
 fn send_push(t: &mut ClientTransport, schema: &Schema, batch: &ZSetBatch) {
-    let parts = encode_message_parts(0, 0, FLAG_PUSH, &PkTuple::EMPTY, 0, Some((schema, batch)));
+    let parts = encode_message_parts(0, 0, FLAG_PUSH, 0, &[], 0, Some((schema, batch)));
     t.send_framed_iov(&parts.segments()).unwrap();
 }
 
@@ -194,14 +195,11 @@ fn test_message_roundtrip_data() {
     }
 
     let batch = ZSetBatch {
-        pks: PkColumn::from_u128s(8, pks.iter().copied()),
+        pks: PkColumn::from_natives(&schema, pks.iter().copied()),
         weights: weights.clone(),
         nulls: nulls.clone(),
-        columns: vec![
-            ColData::Fixed(vec![]),
-            ColData::Fixed(i64_bytes.clone()),
-            ColData::Fixed(f64_bytes.clone()),
-        ],
+        columns: vec![vec![], i64_bytes.clone(), f64_bytes.clone()],
+        blob: vec![],
     };
 
     let (mut a, mut b) = make_transport_pair();
@@ -209,16 +207,16 @@ fn test_message_roundtrip_data() {
     let (_, data) = parse_response(&b.recv_framed().unwrap(), None).unwrap();
 
     let data = data.unwrap();
-    assert_eq!(data.pks.to_vec_u128(), pks);
+    assert_eq!(data.pks.to_vec_u128(&schema), pks);
     assert_eq!(data.weights, weights);
 
-    match &data.columns[1] {
-        ColData::Fixed(got) => assert_eq!(got, &i64_bytes),
-        _ => panic!("expected Fixed at col 1"),
+    {
+        let got = &data.columns[1];
+        assert_eq!(got, &i64_bytes);
     }
-    match &data.columns[2] {
-        ColData::Fixed(got) => assert_eq!(got, &f64_bytes),
-        _ => panic!("expected Fixed at col 2"),
+    {
+        let got = &data.columns[2];
+        assert_eq!(got, &f64_bytes);
     }
 }
 
@@ -250,15 +248,13 @@ fn test_message_roundtrip_strings() {
         .collect();
     let col2: Vec<Option<String>> = (0..n).map(|i| Some(format!("nonnull_{i}"))).collect();
 
+    let mut blob = Vec::new();
     let batch = ZSetBatch {
-        pks: PkColumn::from_u128s(8, pks.iter().copied()),
+        pks: PkColumn::from_natives(&schema, pks.iter().copied()),
         weights: weights.clone(),
         nulls: nulls.clone(),
-        columns: vec![
-            ColData::Fixed(vec![]),
-            ColData::Strings(col1.clone()),
-            ColData::Strings(col2.clone()),
-        ],
+        columns: vec![vec![], german_col(&col1, &mut blob), german_col(&col2, &mut blob)],
+        blob,
     };
 
     let (mut a, mut b) = make_transport_pair();
@@ -267,15 +263,31 @@ fn test_message_roundtrip_strings() {
 
     let data = data.unwrap();
     assert_eq!(data.nulls, nulls);
+    assert_eq!(german_vals(&data, 1, 0), col1);
+    assert_eq!(german_vals(&data, 2, 1), col2);
+}
 
-    match &data.columns[1] {
-        ColData::Strings(got) => assert_eq!(got, &col1),
-        _ => panic!("expected Strings at col 1"),
+/// A STRING column region from its values, spilling into `blob`; `None` is a
+/// NULL cell, which the region zero-fills.
+fn german_col(vals: &[Option<String>], blob: &mut Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() * 16);
+    for v in vals {
+        let bytes = v.as_deref().unwrap_or("").as_bytes();
+        out.extend_from_slice(&gnitz_wire::encode_german_string(bytes, blob));
     }
-    match &data.columns[2] {
-        ColData::Strings(got) => assert_eq!(got, &col2),
-        _ => panic!("expected Strings at col 2"),
-    }
+    out
+}
+
+/// Read a STRING column region back out, `None` where null bit `pi` is set.
+fn german_vals(batch: &ZSetBatch, ci: usize, pi: usize) -> Vec<Option<String>> {
+    (0..batch.len())
+        .map(|row| {
+            (!gnitz_wire::null_word_get(batch.nulls[row], pi)).then(|| {
+                let cell = &batch.columns[ci][row * 16..(row + 1) * 16];
+                String::from_utf8(gnitz_wire::german_string_content(cell, &batch.blob).to_vec()).unwrap()
+            })
+        })
+        .collect()
 }
 
 #[test]
@@ -328,8 +340,7 @@ fn test_message_error_response() {
 #[test]
 fn test_encode_parse_control_only() {
     let seek_pk = 42u128 | (99u128 << 64);
-    let payload =
-        encode_message_parts(0xDEAD, 0xBEEF, FLAG_PUSH, &PkTuple::from_u128_narrow(seek_pk), 7, None).to_vec();
+    let payload = encode_message_parts(0xDEAD, 0xBEEF, FLAG_PUSH, seek_pk, &[], 7, None).to_vec();
     let (msg, data) = parse_response(&payload, None).unwrap();
     assert_eq!(msg.target_id, 0xDEAD);
     assert_eq!(msg.seek_pk, seek_pk);
@@ -352,18 +363,19 @@ fn test_encode_parse_with_data() {
         val_bytes.extend_from_slice(&v.to_le_bytes());
     }
     let batch = ZSetBatch {
-        pks: PkColumn::from_u128s(8, [1, 2, 3]),
+        pks: PkColumn::from_natives(&schema, [1, 2, 3]),
         weights: vec![1, 1, 1],
         nulls: vec![0, 0, 0],
-        columns: vec![ColData::Fixed(vec![]), ColData::Fixed(val_bytes)],
+        columns: vec![vec![], val_bytes],
+        blob: vec![],
     };
 
-    let payload = encode_message_parts(42, 1, 0, &PkTuple::EMPTY, 0, Some((&schema, &batch))).to_vec();
+    let payload = encode_message_parts(42, 1, 0, 0, &[], 0, Some((&schema, &batch))).to_vec();
     let (msg, data) = parse_response(&payload, None).unwrap();
     assert_eq!(msg.target_id, 42);
     assert!(msg.schema.is_some());
     let data = data.unwrap();
-    assert_eq!(data.pks.to_vec_u128(), vec![1u128, 2u128, 3u128]);
+    assert_eq!(data.pks.to_vec_u128(&schema), vec![1u128, 2u128, 3u128]);
     assert_eq!(data.weights, vec![1, 1, 1]);
 }
 
@@ -375,7 +387,7 @@ fn test_encode_parse_empty_batch() {
     };
     let empty = ZSetBatch::new(&schema);
 
-    let payload = encode_message_parts(10, 1, 0, &PkTuple::EMPTY, 0, Some((&schema, &empty))).to_vec();
+    let payload = encode_message_parts(10, 1, 0, 0, &[], 0, Some((&schema, &empty))).to_vec();
     let (msg, data) = parse_response(&payload, None).unwrap();
     // Schema sent, but no data (empty batch)
     assert!(msg.schema.is_some());
@@ -388,13 +400,14 @@ fn test_encode_parse_empty_batch() {
 /// control block directly to inspect the extra region.
 #[test]
 fn encode_message_wide_pk_seek_emits_extra() {
-    let pk = PkTuple::from_bytes(&(0..24u8).collect::<Vec<_>>());
-    let payload = encode_message_parts(7, 1, FLAG_SEEK, &pk, 0, None).to_vec();
+    let pk: Vec<u8> = (0..24u8).collect();
+    let (lo, tail) = gnitz_wire::control::split_ctrl_key(&pk);
+    let payload = encode_message_parts(7, 1, FLAG_SEEK, lo, tail, 0, None).to_vec();
 
     let ctrl = gnitz_wire::wal::block_slice_at(&payload, 0).unwrap();
     let (hdr, _err, extra) = decode_control_block(ctrl).unwrap();
 
-    let (want_lo, want_extra) = pk.split_wire();
+    let (want_lo, want_extra) = (lo, tail);
     assert_eq!(hdr.seek_pk, want_lo);
     assert_eq!(extra, want_extra); // bytes 16..24
     assert_eq!(hdr.flags & FLAG_SEEK, FLAG_SEEK);
@@ -416,10 +429,11 @@ fn hint_only_frame_returns_data_schema_none() {
     let mut val_bytes = Vec::new();
     val_bytes.extend_from_slice(&42i64.to_le_bytes());
     let batch = ZSetBatch {
-        pks: PkColumn::from_u128s(8, [1]),
+        pks: PkColumn::from_natives(&schema, [1]),
         weights: vec![1],
         nulls: vec![0],
-        columns: vec![ColData::Fixed(vec![]), ColData::Fixed(val_bytes)],
+        columns: vec![vec![], val_bytes],
+        blob: vec![],
     };
 
     let (mut a, mut b) = make_transport_pair();
@@ -435,6 +449,6 @@ fn hint_only_frame_returns_data_schema_none() {
     assert!(msg.schema.is_none(), "schema must be None for hint-only frame");
     // Data must still decode correctly.
     let data = data.expect("the frame's data block must decode against the hint");
-    assert_eq!(data.pks.to_vec_u128(), vec![1u128]);
+    assert_eq!(data.pks.to_vec_u128(&schema), vec![1u128]);
     assert_eq!(data.weights, vec![1i64]);
 }

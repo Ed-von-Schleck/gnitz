@@ -27,9 +27,8 @@ fn pk_row(schema: &Schema, pk: u128) -> ZSetBatch {
 
 // Column *widening* (every width, both signednesses, both PK and payload) is
 // the evaluator's own contract and is pinned in `gnitz-expr`. What these
-// tests own is the client adapter in front of it: the OPK PK region and the
-// German string cells `ViewBuffers` materializes, the AND fold, and the two
-// "keep every row" exits.
+// tests own is the client adapter in front of it: the OPK PK region, the
+// German string cells, the AND fold, and the two "keep every row" exits.
 
 // ------------------------------------------------------------------
 // NULL propagation (3VL): UNKNOWN excludes the row
@@ -87,7 +86,7 @@ fn compound_pk_colref_reads_byte_region() {
     pk_bytes[8..16].copy_from_slice(&9u64.to_le_bytes());
     // Not `BatchAppender::add_row`: its scalar `u128` PK would sign-extend
     // across the second column of a compound key.
-    batch.pks.push_bytes(&pk_bytes);
+    batch.pks.push_bytes(&schema, &pk_bytes);
     batch.weights.push(1);
     batch.nulls.push(0);
     BatchAppender::new(&mut batch, &schema).i64_val(42);
@@ -143,9 +142,7 @@ fn float_payload_residual_filters() {
     }
 }
 
-/// A string residual reads the German cells `ViewBuffers` materializes — the
-/// one part of the adapter that has no counterpart in the batch it is built
-/// from.
+/// A string residual reads the batch's German cells against its blob arena.
 #[test]
 fn string_column_residual_filters() {
     let schema = two_col(TypeCode::String);

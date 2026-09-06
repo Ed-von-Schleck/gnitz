@@ -94,7 +94,7 @@ pub(crate) fn compile_projection_map(items: &[ProjItem], schema: &Schema) -> Res
     Ok(eb.build(None)?)
 }
 
-/// Pin the full source PK to output slots `0..k` in `pk_indices()` order,
+/// Pin the full source PK to output slots `0..k` in PK-list order,
 /// matching the engine's `project_schema` (which copies every PK
 /// column to the front via `DerivedSchema::push_pk_of`). A PK column already at its
 /// target slot stays; one appearing later is removed+inserted (shifting the
@@ -114,7 +114,8 @@ pub(crate) fn place_pk_front(
     source_schema: &Schema,
 ) -> Vec<Option<usize>> {
     let mut perm: Vec<Option<usize>> = (0..items.len()).map(Some).collect();
-    for (target, &pk) in source_schema.pk_indices().iter().enumerate() {
+    for (target, &pk) in source_schema.pk_cols.iter().enumerate() {
+        let pk = pk as usize;
         // First occurrence is the canonical physical-PK slot; any later
         // duplicate (SELECT pk, pk AS x) stays in the payload region and is
         // materialized by the expr-map column-copy path.
@@ -186,9 +187,9 @@ pub(crate) fn build_read_projection(
     reject_duplicate_projection_names(projection, out_cols.iter(), "SELECT projection")?;
 
     // The full source PK, hidden-prepended to slots `0..k`.
-    for (target, &pk) in source_schema.pk_indices().iter().enumerate() {
-        items.insert(target, ProjItem::PassThrough { src_col: pk });
-        out_cols.insert(target, source_schema.columns[pk].clone().hidden());
+    for (target, &pk) in source_schema.pk_cols.iter().enumerate() {
+        items.insert(target, ProjItem::PassThrough { src_col: pk as usize });
+        out_cols.insert(target, source_schema.columns[pk as usize].clone().hidden());
     }
     Ok((items, out_cols))
 }
@@ -206,8 +207,8 @@ pub(crate) fn read_reply_shape(
     out_cols: Vec<ColumnDef>,
     source_schema: &Schema,
 ) -> Result<(Schema, Vec<u8>), GnitzSqlError> {
-    let k = source_schema.pk_indices().len();
-    let reply_schema = Schema::from_parts(out_cols, (0..k).collect())
+    let k = source_schema.pk_cols.len();
+    let reply_schema = Schema::from_parts(out_cols, (0..k as u32).collect())
         .map_err(|e| GnitzSqlError::Unsupported(format!("read-spec reply schema is invalid: {e}")))?;
     Ok((
         reply_schema,

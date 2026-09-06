@@ -1,7 +1,6 @@
 use super::*;
 use crate::exec::batch::{project, resolve_projection};
 use crate::test_support::{col_def, parse_query};
-use gnitz_core::null_word_get;
 use sqlparser::ast::{SelectItem, SetExpr};
 
 // The per-type window comparison itself (`cmp_typed_le`) is pinned by
@@ -61,7 +60,7 @@ fn kv_schema() -> Schema {
 
 /// Push one row (`pk`, optional `v`, optional `s`, weight) into a `kv_schema` batch.
 fn push_kv(b: &mut ZSetBatch, pk: u64, v: Option<i64>, s: Option<&str>, weight: i64) {
-    b.pks.push_u128(pk as u128);
+    b.pks.push_u128(&kv_schema(), pk as u128);
     b.weights.push(weight);
     let mut null_word = 0u64;
     if v.is_none() {
@@ -71,12 +70,9 @@ fn push_kv(b: &mut ZSetBatch, pk: u64, v: Option<i64>, s: Option<&str>, weight: 
         null_word |= 1 << 1; // payload idx 1 = s
     }
     b.nulls.push(null_word);
-    if let ColData::Fixed(buf) = &mut b.columns[1] {
-        buf.extend_from_slice(&v.unwrap_or(0).to_le_bytes());
-    }
-    if let ColData::Strings(vs) = &mut b.columns[2] {
-        vs.push(Some(s.unwrap_or("").to_string()));
-    }
+    b.columns[1].extend_from_slice(&v.unwrap_or(0).to_le_bytes());
+    let cell = gnitz_wire::encode_german_string(s.unwrap_or("").as_bytes(), &mut b.blob);
+    b.columns[2].extend_from_slice(&cell);
 }
 
 /// The two halves the fold tail runs, composed: resolve the ORDER BY over the
@@ -132,14 +128,13 @@ fn run(sql: &str, schema: &Schema, batch: ZSetBatch) -> Result<Vec<(u64, Option<
     let v_ci = out_schema.columns.iter().position(|c| c.name == "v");
     let mut rows = Vec::new();
     for i in 0..out.len() {
-        let id = out.pks.get(i) as u64;
+        let id = out.pks.get(&out_schema, i) as u64;
         let v = v_ci.and_then(|ci| {
-            if null_word_get(out.nulls[i], out_schema.payload_idx(ci)) {
+            if gnitz_wire::null_word_get(out.nulls[i], out_schema.payload_idx(ci)) {
                 None
-            } else if let ColData::Fixed(buf) = &out.columns[ci] {
-                Some(i64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap()))
             } else {
-                None
+                let buf = &out.columns[ci];
+                Some(i64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap()))
             }
         });
         let _ = id_ci;
@@ -175,17 +170,25 @@ fn sink_order_by_alias_and_positional() {
     };
     let mut b = ZSetBatch::new(&schema);
     let mut push = |pk: u64, v: i64| {
-        b.pks.push_u128(pk as u128);
+        b.pks.push_u128(&schema, pk as u128);
         b.weights.push(1);
         b.nulls.push(0);
-        if let ColData::Fixed(buf) = &mut b.columns[1] {
+        {
+            let buf = &mut b.columns[1];
             buf.extend_from_slice(&v.to_le_bytes());
         }
     };
     push(1, 30);
     push(2, 10);
     push(3, 20);
-    let ids = |out: &ZSetBatch| (0..out.len()).map(|i| out.pks.get(i) as u64).collect::<Vec<_>>();
+    let ids = {
+        let schema = schema.clone();
+        move |out: &ZSetBatch| {
+            (0..out.len())
+                .map(|i| out.pks.get(&schema, i) as u64)
+                .collect::<Vec<_>>()
+        }
+    };
 
     let q = parse_query("SELECT * FROM t ORDER BY val");
     let (_, out) = passthrough(schema.clone(), b.clone(), q.order_by.as_ref(), 0, None).unwrap();
@@ -257,15 +260,14 @@ fn expand_kv(schema: &Schema, out: &ZSetBatch) -> Vec<(u64, Option<i64>)> {
     let v_ci = schema.columns.iter().position(|c| c.name == "v").unwrap();
     let mut rows = Vec::new();
     for i in 0..out.len() {
-        let v = if null_word_get(out.nulls[i], schema.payload_idx(v_ci)) {
+        let v = if gnitz_wire::null_word_get(out.nulls[i], schema.payload_idx(v_ci)) {
             None
-        } else if let ColData::Fixed(buf) = &out.columns[v_ci] {
-            Some(i64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap()))
         } else {
-            None
+            let buf = &out.columns[v_ci];
+            Some(i64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap()))
         };
         for _ in 0..out.weights[i] {
-            rows.push((out.pks.get(i) as u64, v));
+            rows.push((out.pks.get(schema, i) as u64, v));
         }
     }
     rows
@@ -327,13 +329,15 @@ fn sink_positional_over_hidden_view_schema() {
     };
     let mut b = ZSetBatch::new(&schema);
     let mut push = |pk: u128, city: u64, cnt: i64| {
-        b.pks.push_u128(pk);
+        b.pks.push_u128(&schema, pk);
         b.weights.push(1);
         b.nulls.push(0);
-        if let ColData::Fixed(buf) = &mut b.columns[1] {
+        {
+            let buf = &mut b.columns[1];
             buf.extend_from_slice(&city.to_le_bytes());
         }
-        if let ColData::Fixed(buf) = &mut b.columns[2] {
+        {
+            let buf = &mut b.columns[2];
             buf.extend_from_slice(&cnt.to_le_bytes());
         }
     };
@@ -353,9 +357,7 @@ fn sink_positional_over_hidden_view_schema() {
     let city_ci = out_schema.columns.iter().position(|c| c.name == "city").unwrap();
     let cities: Vec<u64> = (0..out.len())
         .map(|i| {
-            let ColData::Fixed(buf) = &out.columns[city_ci] else {
-                unreachable!()
-            };
+            let buf = &out.columns[city_ci];
             u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap())
         })
         .collect();
@@ -372,10 +374,11 @@ fn sink_null_detected_via_bitmap_in_u128_column() {
     };
     let mut b = ZSetBatch::new(&schema);
     let mut push = |pk: u128, u: Option<u128>| {
-        b.pks.push_u128(pk);
+        b.pks.push_u128(&schema, pk);
         b.weights.push(1);
         b.nulls.push(if u.is_none() { 1 } else { 0 });
-        if let ColData::Fixed(v) = &mut b.columns[1] {
+        {
+            let v = &mut b.columns[1];
             v.extend_from_slice(&u.unwrap_or(0).to_le_bytes());
         }
     };
@@ -391,7 +394,7 @@ fn sink_null_detected_via_bitmap_in_u128_column() {
     };
     let (out_schema, out) =
         order_limit_project(&select.projection, &schema, Some(b), q.order_by.as_ref(), 0, None).unwrap();
-    let ids: Vec<u64> = (0..out.len()).map(|i| out.pks.get(i) as u64).collect();
+    let ids: Vec<u64> = (0..out.len()).map(|i| out.pks.get(&out_schema, i) as u64).collect();
     assert_eq!(ids, vec![3, 1, 2]);
     let _ = out_schema;
 }
@@ -414,10 +417,11 @@ fn sink_compound_pk_key_orders_by_typed_value() {
         let mut pk = [0u8; 4];
         pk[..2].copy_from_slice(&a.to_le_bytes());
         pk[2..].copy_from_slice(&bb.to_le_bytes());
-        b.pks.push_bytes(&pk);
+        b.pks.push_bytes(&schema, &pk);
         b.weights.push(1);
         b.nulls.push(1); // w NULL (payload idx 0)
-        if let ColData::Fixed(buf) = &mut b.columns[2] {
+        {
+            let buf = &mut b.columns[2];
             buf.extend_from_slice(&0i64.to_le_bytes());
         }
     };
@@ -439,7 +443,8 @@ fn sink_compound_pk_key_orders_by_typed_value() {
     let bs: Vec<i16> = (0..out.len())
         .map(|i| {
             let w = out.pks.col_window(i, key.pk_offset.unwrap(), key.stride);
-            i16::from_le_bytes(w.try_into().unwrap())
+            let native = gnitz_wire::decode_pk_column_owned(w, key.tc as u8);
+            i16::from_le_bytes(native[..2].try_into().unwrap())
         })
         .collect();
     assert_eq!(bs, vec![-5, 1, 256]);
@@ -613,7 +618,7 @@ fn both_order_by_comparators_agree_on_every_pair() {
         let mut pk = [0u8; 10];
         pk[..8].copy_from_slice(&pk_u.to_le_bytes());
         pk[8..].copy_from_slice(&pk_i.to_le_bytes());
-        batch.pks.push_bytes(&pk);
+        batch.pks.push_bytes(&schema, &pk);
         batch.weights.push(1);
         let mut null_word = 0u64;
         for (slot, is_null) in [u.is_none(), i.is_none(), s.is_none()].into_iter().enumerate() {
@@ -622,20 +627,14 @@ fn both_order_by_comparators_agree_on_every_pair() {
             }
         }
         batch.nulls.push(null_word);
-        if let ColData::Fixed(buf) = &mut batch.columns[2] {
-            buf.extend_from_slice(&u.unwrap_or(0).to_le_bytes());
-        }
-        if let ColData::Fixed(buf) = &mut batch.columns[3] {
-            buf.extend_from_slice(&i.unwrap_or(0).to_le_bytes());
-        }
-        if let ColData::Strings(v) = &mut batch.columns[4] {
-            v.push(s.map(str::to_string));
-        }
+        batch.columns[2].extend_from_slice(&u.unwrap_or(0).to_le_bytes());
+        batch.columns[3].extend_from_slice(&i.unwrap_or(0).to_le_bytes());
+        let cell = gnitz_wire::encode_german_string(s.unwrap_or("").as_bytes(), &mut batch.blob);
+        batch.columns[4].extend_from_slice(&cell);
     }
     batch.validate(&schema).expect("the fixture batch must be well-formed");
 
-    let mut bufs = gnitz_core::ViewBuffers::default();
-    let view = bufs.view(&batch, &schema);
+    let view = gnitz_core::ZSetBatchView::new(&batch, &schema);
     let n = rows.len();
     for ci in 0..schema.columns.len() {
         let loc = SchemaFacts::locate(&schema, ci);

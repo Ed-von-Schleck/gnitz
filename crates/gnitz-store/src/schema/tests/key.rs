@@ -341,12 +341,12 @@ fn seek_opk_bytes_narrow_matches_opk_key() {
 fn seek_opk_bytes_wide_reproduces_hand_built_opk() {
     // (U64, U64, U64) = stride 24, wide. The wire pair carries the first 16
     // native bytes in `low` and the trailing U64 in `extra`, exactly as
-    // `PkTuple::split_wire` packs them. All-unsigned ⇒ OPK is each column's
+    // `split_ctrl_key` cuts them. All-unsigned ⇒ OPK is each column's
     // big-endian image, so the expected key is built by hand.
     let s = pk_only_schema(&[type_code::U64; 3]);
     assert_eq!(s.pk_stride(), 24);
     let (a, b, c): (u64, u64, u64) = (0x1122_3344_5566_7788, 0x99AA_BBCC_DDEE_FF00, 0x0102_0304_0506_0708);
-    // Native LE image = [a_LE, b_LE, c_LE]; split_wire's `low` is the first 16
+    // Native LE image = [a_LE, b_LE, c_LE]; the pair's `low` is the first 16
     // bytes (a in the low half, b in the high half), `extra` is c's 8 bytes.
     let low = (a as u128) | ((b as u128) << 64);
     let opk = seek_opk_bytes(&s, low, &c.to_le_bytes()).expect("wide seek encodes");

@@ -243,7 +243,7 @@ pub(crate) fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<PkTuple,
 /// Extract the primary key from a VALUES row as a `PkTuple`. `slot_of` maps each
 /// **physical** column index to its VALUES slot, with `None` for columns that
 /// carry no user value (SERIAL, or a hidden/dropped column). A PK column is
-/// never SERIAL-in-payload nor hidden, so every `pk_indices()` entry maps to
+/// never SERIAL-in-payload nor hidden, so every `pk_cols` entry maps to
 /// `Some` slot for a well-formed INSERT.
 pub(crate) fn extract_pk_value_mapped(
     row: &[Expr],
@@ -253,7 +253,8 @@ pub(crate) fn extract_pk_value_mapped(
     // `PK_LIST_MAX_COLS < MAX_PK_COLUMNS`, so every validated PK fits without a
     // per-row allocation; `PkTuple::from_columns` owns the byte layout.
     let mut natives = [0u128; gnitz_wire::MAX_PK_COLUMNS];
-    for (slot, &pi) in natives.iter_mut().zip(schema.pk_indices()) {
+    for (slot, &pi) in natives.iter_mut().zip(&schema.pk_cols) {
+        let pi = pi as usize;
         let pk_expr = slot_of
             .get(pi)
             .copied()

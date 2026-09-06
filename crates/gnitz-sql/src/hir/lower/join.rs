@@ -681,7 +681,7 @@ fn pair_pk_coldefs(left_schema: &Schema, right_schema: &Schema) -> Vec<ColumnDef
         .map(|(slot, (schema, c))| {
             ColumnDef::new(
                 format!("_pair_pk_{slot}"),
-                schema.columns[c].type_code.reindex_output_type(),
+                schema.columns[c as usize].type_code.reindex_output_type(),
                 false,
             )
             .hidden()
@@ -702,7 +702,7 @@ fn pair_pk_slots(left: &Schema, right: &Schema, a_base: usize, b_base: usize) ->
 /// One schema's PK columns at their offsets inside a wider layout that carries
 /// that schema's columns from `base`.
 pub(super) fn pk_slots(schema: &Schema, base: usize) -> Vec<usize> {
-    schema.pk_cols.iter().map(|&c| base + c).collect()
+    schema.pk_cols.iter().map(|&c| base + c as usize).collect()
 }
 
 /// The `[key region × npk, A, B]` `ColId` layout — what a residual, WHERE or
@@ -1170,7 +1170,10 @@ fn band_union_schema(all_tcs: &[TypeCode], left: &Schema, right: &Schema) -> Sch
     }
     cols.extend(left.columns.iter().cloned());
     cols.extend(right.columns.iter().cloned());
-    Schema { columns: cols, pk_cols: (0..k).collect() }
+    Schema {
+        columns: cols,
+        pk_cols: (0..k as u32).collect(),
+    }
 }
 
 /// Union the pure-range NULL-range-key rows into `nf_match` (`A − matched`):

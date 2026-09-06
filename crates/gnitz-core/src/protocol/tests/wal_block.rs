@@ -1,5 +1,5 @@
 use super::*;
-use crate::protocol::types::{ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
+use crate::protocol::types::{ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch};
 use gnitz_wire::{WAL_HEADER_SIZE as WAL_BLOCK_HEADER_SIZE, WAL_OFF_VERSION};
 
 /// Return the `(offset, size)` of a region from a block's directory.
@@ -27,19 +27,37 @@ fn str_schema() -> Schema {
     }
 }
 
-/// A 16-byte-int payload column from its values — the LE image the region
-/// holds, which is what `ColData::Fixed` stores at any width.
-fn wide_col(vals: &[u128]) -> ColData {
-    ColData::Fixed(vals.iter().flat_map(|v| v.to_le_bytes()).collect())
+/// A 16-byte-int payload column region from its values.
+fn wide_col(vals: &[u128]) -> Vec<u8> {
+    vals.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
 /// Read a 16-byte-int payload column back out as values.
-fn wide_vals(col: &ColData) -> Vec<u128> {
-    let ColData::Fixed(b) = col else {
-        panic!("expected Fixed")
-    };
-    b.chunks_exact(16)
+fn wide_vals(col: &[u8]) -> Vec<u128> {
+    col.chunks_exact(16)
         .map(|c| u128::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+/// A STRING/BLOB column region from its values, spilling into `blob`; `None` is
+/// a NULL cell, which the region zero-fills.
+fn german_col(vals: &[Option<&str>], blob: &mut Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() * 16);
+    for v in vals {
+        out.extend_from_slice(&gnitz_wire::encode_german_string(v.unwrap_or("").as_bytes(), blob));
+    }
+    out
+}
+
+/// Read a STRING column region back out, `None` where the null bit is set.
+fn german_vals(batch: &ZSetBatch, ci: usize, pi: usize) -> Vec<Option<String>> {
+    (0..batch.len())
+        .map(|row| {
+            (!gnitz_wire::null_word_get(batch.nulls[row], pi)).then(|| {
+                let cell = &batch.columns[ci][row * 16..(row + 1) * 16];
+                String::from_utf8(gnitz_wire::german_string_content(cell, &batch.blob).to_vec()).unwrap()
+            })
+        })
         .collect()
 }
 
@@ -60,14 +78,16 @@ fn u128_schema() -> Schema {
 #[test]
 fn a_string_cell_pointing_past_the_blob_is_a_decode_error() {
     let schema = str_schema();
+    let mut blob = Vec::new();
     let batch = ZSetBatch {
-        pks: PkColumn::from_u128s(8, [1u128]),
+        pks: PkColumn::from_natives(&schema, [1u128]),
         weights: vec![1],
         nulls: vec![0],
         columns: vec![
-            ColData::Fixed(vec![]),
-            ColData::Strings(vec![Some("a value well past the inline cell".into())]),
+            vec![],
+            german_col(&[Some("a value well past the inline cell")], &mut blob),
         ],
+        blob,
     };
     let mut block = encode_wal_block(&schema, 7, &batch);
     // The lone payload region holds one 16-byte German cell; its bytes
@@ -94,22 +114,23 @@ fn test_encode_decode_fixed() {
     }
 
     let batch = ZSetBatch {
-        pks: PkColumn::from_u128s(8, pks.iter().copied()),
+        pks: PkColumn::from_natives(&schema, pks.iter().copied()),
         weights: weights.clone(),
         nulls: nulls.clone(),
-        columns: vec![ColData::Fixed(vec![]), ColData::Fixed(val_bytes.clone())],
+        columns: vec![vec![], val_bytes.clone()],
+        blob: vec![],
     };
 
     let encoded = encode_wal_block(&schema, 42, &batch);
     let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
 
     assert_eq!(tid, 42);
-    assert_eq!(decoded.pks.to_vec_u128(), pks);
+    assert_eq!(decoded.pks.to_vec_u128(&schema), pks);
     assert_eq!(decoded.weights, weights);
     assert_eq!(decoded.nulls, nulls);
-    match &decoded.columns[1] {
-        ColData::Fixed(got) => assert_eq!(got, &val_bytes),
-        _ => panic!("expected Fixed"),
+    {
+        let got = &decoded.columns[1];
+        assert_eq!(got, &val_bytes);
     }
 }
 
@@ -127,21 +148,21 @@ fn test_encode_decode_strings() {
         Some("abcdefghijkl".into()), // exactly 12 chars
     ];
 
+    let cells: Vec<Option<&str>> = vals.iter().map(|v| v.as_deref()).collect();
+    let mut blob = Vec::new();
     let batch = ZSetBatch {
-        pks: PkColumn::from_u128s(8, 0..n as u128),
+        pks: PkColumn::from_natives(&schema, 0..n as u128),
         weights: vec![1; n],
         nulls: nulls.clone(),
-        columns: vec![ColData::Fixed(vec![]), ColData::Strings(vals.clone())],
+        columns: vec![vec![], german_col(&cells, &mut blob)],
+        blob,
     };
 
     let encoded = encode_wal_block(&schema, 0, &batch);
     let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
 
     assert_eq!(decoded.nulls, nulls);
-    match &decoded.columns[1] {
-        ColData::Strings(got) => assert_eq!(got, &vals),
-        _ => panic!("expected Strings"),
-    }
+    assert_eq!(german_vals(&decoded, 1, 0), vals);
 }
 
 #[test]
@@ -151,10 +172,11 @@ fn test_encode_decode_u128() {
     let n = vals.len();
 
     let batch = ZSetBatch {
-        pks: PkColumn::from_u128s(16, vals.iter().copied()),
+        pks: PkColumn::from_natives(&schema, vals.iter().copied()),
         weights: vec![1; n],
         nulls: vec![0; n],
-        columns: vec![ColData::Fixed(vec![]), wide_col(&vals)],
+        columns: vec![vec![], wide_col(&vals)],
+        blob: vec![],
     };
 
     let encoded = encode_wal_block(&schema, 1, &batch);
@@ -202,10 +224,11 @@ fn test_encode_decode_i128_signed_roundtrip() {
     let n = bits.len();
 
     let batch = ZSetBatch {
-        pks: PkColumn::from_u128s(16, bits.iter().copied()),
+        pks: PkColumn::from_natives(&schema, bits.iter().copied()),
         weights: vec![1; n],
         nulls: vec![0; n],
-        columns: vec![ColData::Fixed(vec![]), wide_col(&bits)],
+        columns: vec![vec![], wide_col(&bits)],
+        blob: vec![],
     };
 
     let encoded = encode_wal_block(&schema, 3, &batch);
@@ -213,7 +236,9 @@ fn test_encode_decode_i128_signed_roundtrip() {
     assert_eq!(tid, 3);
 
     // Each signed value survives — reinterpret the recovered bits as i128.
-    let got_pk: Vec<i128> = (0..decoded.pks.len()).map(|i| decoded.pks.get(i) as i128).collect();
+    let got_pk: Vec<i128> = (0..decoded.pks.len())
+        .map(|i| decoded.pks.get(&schema, i) as i128)
+        .collect();
     assert_eq!(got_pk, signed, "I128 PK sign-flip must round-trip");
 
     // The I128 payload must decode with the exact native bits.
@@ -225,10 +250,11 @@ fn test_encode_decode_i128_signed_roundtrip() {
 fn test_encode_decode_empty() {
     let schema = u64_schema();
     let empty = ZSetBatch {
-        pks: PkColumn::new(8),
+        pks: PkColumn::empty_for_schema(&schema),
         weights: vec![],
         nulls: vec![],
-        columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![])],
+        columns: vec![vec![], vec![]],
+        blob: vec![],
     };
     let encoded = encode_wal_block(&schema, 7, &empty);
     let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
@@ -240,10 +266,11 @@ fn test_encode_decode_empty() {
 fn test_bad_checksum() {
     let schema = u64_schema();
     let batch = ZSetBatch {
-        pks: PkColumn::from_u128s(8, [1]),
+        pks: PkColumn::from_natives(&schema, [1]),
         weights: vec![1],
         nulls: vec![0],
-        columns: vec![ColData::Fixed(vec![]), ColData::Fixed(8u64.to_le_bytes().to_vec())],
+        columns: vec![vec![], 8u64.to_le_bytes().to_vec()],
+        blob: vec![],
     };
     let mut encoded = encode_wal_block(&schema, 0, &batch);
     // Flip a byte in the body (after header)
@@ -256,10 +283,11 @@ fn test_bad_checksum() {
 fn test_bad_version() {
     let schema = u64_schema();
     let batch = ZSetBatch {
-        pks: PkColumn::from_u128s(8, [1]),
+        pks: PkColumn::from_natives(&schema, [1]),
         weights: vec![1],
         nulls: vec![0],
-        columns: vec![ColData::Fixed(vec![]), ColData::Fixed(8u64.to_le_bytes().to_vec())],
+        columns: vec![vec![], 8u64.to_le_bytes().to_vec()],
+        blob: vec![],
     };
     let mut encoded = encode_wal_block(&schema, 0, &batch);
     // Set format_version = 1.
@@ -277,10 +305,11 @@ fn pk_stride_wal_roundtrip_u64() {
     let pks = vec![1u128, 2, 3];
     let n = pks.len();
     let batch = ZSetBatch {
-        pks: PkColumn::from_u128s(8, pks.iter().copied()),
+        pks: PkColumn::from_natives(&schema, pks.iter().copied()),
         weights: vec![1; n],
         nulls: vec![0; n],
-        columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![0u8; n * 8])],
+        columns: vec![vec![], vec![0u8; n * 8]],
+        blob: vec![],
     };
     let encoded = encode_wal_block(&schema, 0, &batch);
 
@@ -293,7 +322,7 @@ fn pk_stride_wal_roundtrip_u64() {
     assert_eq!(&encoded[pk_off..pk_off + 8], &expected_first);
 
     let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
-    assert_eq!(decoded.pks.to_vec_u128(), pks);
+    assert_eq!(decoded.pks.to_vec_u128(&schema), pks);
 }
 
 #[test]
@@ -302,10 +331,11 @@ fn pk_stride_wal_roundtrip_u128() {
     let pks = vec![1u128, 2, 3];
     let n = pks.len();
     let batch = ZSetBatch {
-        pks: PkColumn::from_u128s(16, pks.iter().copied()),
+        pks: PkColumn::from_natives(&schema, pks.iter().copied()),
         weights: vec![1; n],
         nulls: vec![0; n],
-        columns: vec![ColData::Fixed(vec![]), wide_col(&pks)],
+        columns: vec![vec![], wide_col(&pks)],
+        blob: vec![],
     };
     let encoded = encode_wal_block(&schema, 0, &batch);
 
@@ -313,7 +343,7 @@ fn pk_stride_wal_roundtrip_u128() {
     assert_eq!(pk_sz, n * 16, "U128 PK region must be 16B/row");
 
     let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
-    assert_eq!(decoded.pks.to_vec_u128(), pks);
+    assert_eq!(decoded.pks.to_vec_u128(&schema), pks);
 }
 
 #[test]
@@ -323,15 +353,16 @@ fn wal_retraction_u64() {
     let weights = vec![1i64, -1, 3];
     let n = pks.len();
     let batch = ZSetBatch {
-        pks: PkColumn::from_u128s(8, pks.iter().copied()),
+        pks: PkColumn::from_natives(&schema, pks.iter().copied()),
         weights: weights.clone(),
         nulls: vec![0; n],
-        columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![0u8; n * 8])],
+        columns: vec![vec![], vec![0u8; n * 8]],
+        blob: vec![],
     };
     let encoded = encode_wal_block(&schema, 5, &batch);
     let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
     assert_eq!(tid, 5);
-    assert_eq!(decoded.pks.to_vec_u128(), pks);
+    assert_eq!(decoded.pks.to_vec_u128(&schema), pks);
     assert_eq!(decoded.weights, weights, "negative weight must survive encode/decode");
 }
 
@@ -350,9 +381,9 @@ fn test_batch_appender_round_trip_u64_pk() {
     let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
     assert_eq!(tid, 7);
     assert_eq!(decoded.pks.len(), 3);
-    assert_eq!(decoded.pks.get(0), 1u128);
-    assert_eq!(decoded.pks.get(1), 100u128);
-    assert_eq!(decoded.pks.get(2), (u32::MAX as u128) + 1);
+    assert_eq!(decoded.pks.get(&schema, 0), 1u128);
+    assert_eq!(decoded.pks.get(&schema, 1), 100u128);
+    assert_eq!(decoded.pks.get(&schema, 2), (u32::MAX as u128) + 1);
 }
 
 #[test]
@@ -372,7 +403,7 @@ fn test_batch_appender_round_trip_u128_pk() {
     assert_eq!(tid, 9);
     assert_eq!(decoded.pks.len(), pks.len());
     for (i, &expected) in pks.iter().enumerate() {
-        assert_eq!(decoded.pks.get(i), expected);
+        assert_eq!(decoded.pks.get(&schema, i), expected);
     }
 }
 
@@ -414,10 +445,11 @@ fn pk_stride_wal_roundtrip_bytes_24() {
         pk24(0, 0),
     ];
     let n = tuples.len();
-    let mut pk_buf = Vec::with_capacity(n * 24);
+    let mut pks = PkColumn::empty_for_schema(&schema);
     for t in &tuples {
-        pk_buf.extend_from_slice(t);
+        pks.push_bytes(&schema, t);
     }
+    let pk_region = pks.region().to_vec();
 
     let weights = vec![1i64, -1, 3, 1];
     // Row 2 has a NULL payload (payload bit 0).
@@ -429,14 +461,15 @@ fn pk_stride_wal_roundtrip_bytes_24() {
     }
 
     let batch = ZSetBatch {
-        pks: PkColumn { stride: 24, buf: pk_buf.clone() },
+        pks,
         weights: weights.clone(),
         nulls: nulls.clone(),
         columns: vec![
-            ColData::Fixed(vec![]), // pk0 placeholder
-            ColData::Fixed(vec![]), // pk1 placeholder
-            ColData::Fixed(payload_bytes.clone()),
+            vec![], // pk0 placeholder
+            vec![], // pk1 placeholder
+            payload_bytes.clone(),
         ],
+        blob: vec![],
     };
 
     let encoded = encode_wal_block(&schema, 77, &batch);
@@ -449,12 +482,12 @@ fn pk_stride_wal_roundtrip_bytes_24() {
     assert_eq!(tid, 77);
     assert_eq!(decoded.weights, weights);
     assert_eq!(decoded.nulls, nulls);
-    assert_eq!(decoded.pks.stride, 24);
-    assert_eq!(decoded.pks.buf, pk_buf, "wide PK bytes must roundtrip exactly");
+    assert_eq!(decoded.pks.stride(), 24);
+    assert_eq!(decoded.pks.region(), pk_region, "wide PK bytes must roundtrip exactly");
     assert_eq!(decoded.pks.len(), n);
-    match &decoded.columns[2] {
-        ColData::Fixed(got) => assert_eq!(got, &payload_bytes),
-        _ => panic!("expected Fixed payload"),
+    {
+        let got = &decoded.columns[2];
+        assert_eq!(got, &payload_bytes);
     }
 }
 
@@ -482,12 +515,15 @@ fn pk_stride_wal_roundtrip_bytes_64() {
         [9, 8, 7, 6],
     ];
     let n = rows.len();
-    let mut pk_buf = Vec::with_capacity(n * 64);
+    let mut pks = PkColumn::empty_for_schema(&schema);
     for r in &rows {
+        let mut native = Vec::with_capacity(64);
         for &cval in r {
-            pk_buf.extend_from_slice(&cval.to_le_bytes());
+            native.extend_from_slice(&cval.to_le_bytes());
         }
+        pks.push_bytes(&schema, &native);
     }
+    let pk_region = pks.region().to_vec();
     let payload: Vec<i64> = vec![-1, 0, 123];
     let mut payload_bytes = Vec::with_capacity(n * 8);
     for &v in &payload {
@@ -495,16 +531,11 @@ fn pk_stride_wal_roundtrip_bytes_64() {
     }
 
     let batch = ZSetBatch {
-        pks: PkColumn { stride: 64, buf: pk_buf.clone() },
+        pks,
         weights: vec![1; n],
         nulls: vec![0; n],
-        columns: vec![
-            ColData::Fixed(vec![]),
-            ColData::Fixed(vec![]),
-            ColData::Fixed(vec![]),
-            ColData::Fixed(vec![]),
-            ColData::Fixed(payload_bytes.clone()),
-        ],
+        columns: vec![vec![], vec![], vec![], vec![], payload_bytes.clone()],
+        blob: vec![],
     };
 
     let encoded = encode_wal_block(&schema, 3, &batch);
@@ -513,43 +544,41 @@ fn pk_stride_wal_roundtrip_bytes_64() {
 
     let (decoded, tid) = decode_wal_block_verified(&encoded, &schema).unwrap();
     assert_eq!(tid, 3);
-    assert_eq!(decoded.pks.stride, 64);
-    assert_eq!(&decoded.pks.buf, &pk_buf);
-    match &decoded.columns[4] {
-        ColData::Fixed(got) => assert_eq!(got, &payload_bytes),
-        _ => panic!("expected Fixed payload"),
+    assert_eq!(decoded.pks.stride(), 64);
+    assert_eq!(decoded.pks.region(), pk_region);
+    {
+        let got = &decoded.columns[4];
+        assert_eq!(got, &payload_bytes);
     }
 }
 
 #[test]
 fn wide_pk_extend_from_concatenates() {
+    let schema = wide24_schema();
     let mk = |a: u64, b: u128| {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&pk24(a, b));
+        let mut pks = PkColumn::empty_for_schema(&schema);
+        pks.push_bytes(&schema, &pk24(a, b));
         ZSetBatch {
-            pks: PkColumn { stride: 24, buf },
+            pks,
             weights: vec![1],
             nulls: vec![0],
-            columns: vec![
-                ColData::Fixed(vec![]),
-                ColData::Fixed(vec![]),
-                ColData::Fixed(5i64.to_le_bytes().to_vec()),
-            ],
+            columns: vec![vec![], vec![], 5i64.to_le_bytes().to_vec()],
+            blob: vec![],
         }
     };
     let mut a = mk(1, 11);
     let b = mk(2, 22);
-    a.extend_from_owned(b);
+    a.extend_from_owned(b, &schema);
 
     assert_eq!(a.pks.len(), 2);
-    let mut expected = Vec::new();
-    expected.extend_from_slice(&pk24(1, 11));
-    expected.extend_from_slice(&pk24(2, 22));
-    assert_eq!(a.pks.stride, 24);
-    assert_eq!(&a.pks.buf, &expected);
+    let mut expected = PkColumn::empty_for_schema(&schema);
+    expected.push_bytes(&schema, &pk24(1, 11));
+    expected.push_bytes(&schema, &pk24(2, 22));
+    assert_eq!(a.pks.stride(), 24);
+    assert_eq!(a.pks.region(), expected.region());
     assert_eq!(a.weights, vec![1, 1]);
-    match &a.columns[2] {
-        ColData::Fixed(got) => assert_eq!(got.len(), 16),
-        _ => panic!("expected Fixed"),
+    {
+        let got = &a.columns[2];
+        assert_eq!(got.len(), 16);
     }
 }

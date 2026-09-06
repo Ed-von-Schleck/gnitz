@@ -511,13 +511,13 @@ pub enum DeltaCol {
 /// num_columns)` — so it is stated once here and applied by the client (building
 /// a `Schema`) and the engine (building a `SchemaDescriptor`) alike, each keeping
 /// its own overflow behaviour.
-pub fn delta_schema_order(pk_indices: &[usize], num_columns: usize) -> Vec<DeltaCol> {
+pub fn delta_schema_order(pk_indices: &[u32], num_columns: usize) -> Vec<DeltaCol> {
     let mut out = Vec::with_capacity(num_columns + 1);
     out.push(DeltaCol::Tick);
-    out.extend(pk_indices.iter().map(|&i| DeltaCol::Key(i)));
+    out.extend(pk_indices.iter().map(|&i| DeltaCol::Key(i as usize)));
     out.extend(
         (0..num_columns)
-            .filter(|i| !pk_indices.contains(i))
+            .filter(|&i| !pk_indices.contains(&(i as u32)))
             .map(DeltaCol::Payload),
     );
     out
@@ -751,8 +751,9 @@ pub fn unpack_pk_cols(packed: u64) -> Result<PkColList, crate::PkRule> {
 pub(crate) const INDEX_KEY_SLOT: usize = 16;
 
 /// Pack K native index-key values into the `PkTuple` a `seek_by_index` request
-/// carries — one 16-byte LE slot each, which `split_wire` then routes as slot 0
-/// → `seek_pk` and slots 1..K → `seek_pk_extra`. A prefix seek supplies K < the
+/// carries — one 16-byte LE slot each, which [`crate::control::split_ctrl_key`]
+/// then routes as slot 0 → `seek_pk` and slots 1..K → `seek_pk_extra`. A prefix
+/// seek supplies K < the
 /// index's arity. Returns the packed bytes; K is bounded by [`PK_LIST_MAX_COLS`],
 /// so at most `PK_LIST_MAX_COLS * INDEX_KEY_SLOT` of the buffer is ever written.
 pub fn pack_index_key_slots(key_vals: &[u128]) -> ([u8; MAX_PK_BYTES], usize) {

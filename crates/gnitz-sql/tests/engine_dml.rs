@@ -131,18 +131,19 @@ fn a_text_table_past_one_frame_reads_back_whole_where_a_whole_table_update_still
     let batch = batch.expect("the table is not empty");
     assert_eq!(batch.len(), ROWS as usize);
     let (id_ci, v_ci, s_ci) = (col_idx(&rschema, "id"), col_idx(&rschema, "v"), col_idx(&rschema, "s"));
-    let gnitz_core::ColData::Strings(cells) = &batch.columns[s_ci] else {
-        panic!("`s` decodes as a TEXT column");
-    };
     let mut seen = vec![false; ROWS as usize];
-    for (row, cell) in cells.iter().enumerate() {
+    for (row, cell) in batch.columns[s_ci].chunks_exact(16).enumerate() {
         let id = cell_i64(&rschema, &batch, id_ci, row) as u64;
         assert!(
             id < ROWS && !std::mem::replace(&mut seen[id as usize], true),
             "row {row}: id {id}"
         );
         assert_eq!(cell_i64(&rschema, &batch, v_ci, row) as u64, id % GROUPS, "row {row}");
-        assert_eq!(cell.as_deref(), Some(text.as_str()), "row {row}");
+        assert_eq!(
+            gnitz_wire::german_string_content(cell, &batch.blob),
+            text.as_bytes(),
+            "row {row}"
+        );
         assert_eq!(batch.weights[row], 1, "row {row}");
     }
 

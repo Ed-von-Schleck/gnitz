@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
 use gnitz_core::{
-    qualified_name, ClientError, DeltaCursor, GnitzClient, Interest, LocalScanReply, MirrorStore, PkTuple, PollOutcome,
+    qualified_name, ClientError, DeltaCursor, GnitzClient, Interest, LocalScanReply, MirrorStore, PollOutcome,
     RelDescriptor, RelTarget, Reply, Request, ScanReply, Schema, Session, SlotId, WireConflictMode, ZSetBatch,
 };
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard};
@@ -157,8 +157,11 @@ impl AsyncClient {
             .map(|r| r.into_scan())
     }
 
-    pub async fn seek(&self, tid: u64, pk: PkTuple) -> Result<ScanReply, ClientError> {
-        self.call(move |s| s.submit(Request::seek(tid, &pk)))
+    /// A point SEEK by primary key, already split by
+    /// `gnitz_wire::control::split_ctrl_key`.
+    pub async fn seek(&self, tid: u64, pk: u128, pk_extra: &[u8]) -> Result<ScanReply, ClientError> {
+        let pk_extra = pk_extra.to_vec();
+        self.call(move |s| s.submit(Request::seek(tid, pk, &pk_extra)))
             .await
             .map(|r| r.into_scan())
     }

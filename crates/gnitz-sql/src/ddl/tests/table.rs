@@ -84,24 +84,21 @@ fn ident(name: &str) -> sqlparser::ast::Ident {
 }
 
 #[test]
-fn self_fk_resolves_to_the_marker_not_a_table_id() {
+fn self_fk_resolves_to_the_self_target_not_a_table_id() {
     let cols = tree_cols();
-    // `parent_id BIGINT REFERENCES tree(id)`. The table has no id yet, so
-    // the planner marks the column; `ColumnDef::col_tab_row` substitutes the owner
-    // id. `0` would collide with the engine's "no FK" encoding.
-    let (tid, ref_col, parent_type) = resolve_fk_target_inline(&cols, &[0], "tree", &[ident("id")], 1).unwrap();
-    assert_eq!(tid, ColumnDef::SELF_FK_TABLE_ID);
-    assert_ne!(tid, 0);
-    assert_eq!(ref_col, 0);
+    // `parent_id BIGINT REFERENCES tree(id)`. The table has no id yet, so the
+    // planner names the target as the table being created; `col_tab_row`
+    // substitutes the owner id.
+    let (fk, parent_type) = resolve_fk_target_inline(&cols, &[0], "tree", &[ident("id")], 1).unwrap();
+    assert_eq!(fk, FkTarget::SelfTable { col: 0 });
     assert_eq!(parent_type, TypeCode::I64);
 }
 
 #[test]
 fn self_fk_omitted_column_list_defaults_to_the_lone_pk() {
     let cols = tree_cols();
-    let (tid, ref_col, _) = resolve_fk_target_inline(&cols, &[0], "tree", &[], 1).unwrap();
-    assert_eq!(tid, ColumnDef::SELF_FK_TABLE_ID);
-    assert_eq!(ref_col, 0);
+    let (fk, _) = resolve_fk_target_inline(&cols, &[0], "tree", &[], 1).unwrap();
+    assert_eq!(fk, FkTarget::SelfTable { col: 0 });
 }
 
 #[test]

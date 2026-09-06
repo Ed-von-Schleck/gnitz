@@ -64,7 +64,7 @@ mod spine_tests {
     use crate::protocol::codec::encode_schema_block;
     use crate::protocol::message::{encode_control_block, encode_message_noschema_parts};
     use crate::protocol::transport::poll_fd;
-    use crate::protocol::{BatchAppender, ColData, ColumnDef, Header, TypeCode};
+    use crate::protocol::{BatchAppender, ColumnDef, Header, TypeCode};
     use crate::test_support::{established, framed, make_socketpair, raw_read_frame, raw_send, reply_ctrl};
     use std::os::fd::OwnedFd;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -140,7 +140,7 @@ mod spine_tests {
         if cont {
             flags |= FLAG_CONTINUATION;
         }
-        encode_message_parts(tid, 0, flags, &PkTuple::from_u128_narrow(lsn), 0, Some((schema, batch))).to_vec()
+        encode_message_parts(tid, 0, flags, lsn, &[], 0, Some((schema, batch))).to_vec()
     }
 
     /// A hint-only reply frame: data, no schema block, `version` in the flags.
@@ -211,7 +211,7 @@ mod spine_tests {
         let Reply::Scan((schema, data, _)) = reply.unwrap() else {
             panic!("scan")
         };
-        assert_eq!(data.unwrap().pks.to_vec_u128(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(data.unwrap().pks.to_vec_u128(&schema_a()), vec![1, 2, 3, 4, 5]);
         assert!(schema.is_some(), "the block the train carried");
         // Absorbed into the cache under version 3.
         assert_eq!(s.cached_schema_version(7), 3);
@@ -242,14 +242,15 @@ mod spine_tests {
         assert_eq!(replies.len(), 2);
         let d0 = replies[0].1.as_ref().unwrap();
         assert_eq!(d0.columns.len(), 2);
-        assert_eq!(d0.pks.to_vec_u128(), vec![10, 11]);
+        assert_eq!(d0.pks.to_vec_u128(&sa), vec![10, 11]);
         let d1 = replies[1].1.as_ref().unwrap();
         assert_eq!(d1.columns.len(), 3);
-        assert_eq!(d1.pks.to_vec_u128(), vec![20, 21]);
-        match &d1.columns[1] {
-            ColData::Strings(v) => assert_eq!(v.as_slice(), [Some("s20".into()), Some("s21".into())]),
-            _ => panic!("strings"),
-        }
+        assert_eq!(d1.pks.to_vec_u128(&sb), vec![20, 21]);
+        let strs: Vec<&[u8]> = d1.columns[1]
+            .chunks_exact(16)
+            .map(|cell| gnitz_wire::german_string_content(cell, &d1.blob))
+            .collect();
+        assert_eq!(strs, [b"s20".as_slice(), b"s21".as_slice()]);
         // Each reply carries its own relation's schema, resolved off the cache.
         assert_eq!(replies[0].0.as_ref().unwrap().columns.len(), 2);
         assert_eq!(replies[1].0.as_ref().unwrap().columns.len(), 3);
@@ -529,7 +530,7 @@ mod spine_tests {
         };
         assert_eq!(blocks.len(), 2);
         let (b0, _) = crate::protocol::decode_wal_block(blocks[0].block(), &sa).unwrap();
-        assert_eq!(b0.pks.to_vec_u128(), vec![1, 2]);
+        assert_eq!(b0.pks.to_vec_u128(&sa), vec![1, 2]);
         assert_eq!(terminal.target_id, 9);
         assert_eq!(s.cached_schema_version(9), 0, "a scan_spec absorbs nothing");
     }

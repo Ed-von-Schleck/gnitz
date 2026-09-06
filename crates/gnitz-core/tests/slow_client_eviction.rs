@@ -66,7 +66,7 @@ fn slow_scan_client_is_evicted_after_deadline() {
     let mut slow = ClientTransport::connect(srv.sock_path()).expect("connect");
     set_tiny_rcvbuf(slow.as_raw_fd());
     hello_handshake(&mut slow).expect("hello");
-    let scan = encode_message_parts(table_id, 0xB0BA, 0, &gnitz_core::PkTuple::EMPTY, 0, None);
+    let scan = encode_message_parts(table_id, 0xB0BA, 0, 0, &[], 0, None);
     slow.send_framed(&scan.ctrl).expect("send scan");
 
     let evicted = peer_hung_up_within(slow.as_raw_fd(), 8000);

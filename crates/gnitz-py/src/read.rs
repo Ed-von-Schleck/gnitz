@@ -11,7 +11,7 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 
-use gnitz_core::{null_word_get, ColData, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{Schema, TypeCode, ZSetBatch};
 use gnitz_expr::{ColumnLocator, SchemaFacts};
 use gnitz_wire::format_uuid;
 
@@ -247,18 +247,23 @@ impl PyRow {
 /// Materialize a `PkColumn` as a Python list. A single-column key surfaces as
 /// that column's own Python type — decoded through the same address the row
 /// path uses, so `batch.pks[i]` and `row[pk_col]` can never disagree about sign
-/// or UUID rendering. A compound key surfaces as `bytes`: one packed PK region
-/// per row.
+/// or UUID rendering. A compound key surfaces as `bytes` in the native key
+/// space, the form `py_pks_to_column` accepts back.
 pub(crate) fn pk_column_to_pylist(py: Python<'_>, schema: &Schema, batch: &ZSetBatch) -> PyResult<Py<PyList>> {
     if schema.pk_count() >= 2 {
-        let stride = batch.pks.stride as usize;
-        let chunks = batch.pks.buf.chunks_exact(stride);
-        return Ok(PyList::new(py, chunks.map(|c| pyo3::types::PyBytes::new(py, c)))?.unbind());
+        let stride = schema.pk_stride();
+        let rows: Vec<_> = (0..batch.pks.len())
+            .map(|i| {
+                let native = batch.pks.get_tuple(i).native_le(schema);
+                pyo3::types::PyBytes::new(py, &native[..stride])
+            })
+            .collect();
+        return Ok(PyList::new(py, rows)?.unbind());
     }
     // Through the resolved address, like every other decode — the offset and
     // width of the lone PK column are `SchemaFacts::locate`'s answer, not a
     // second derivation from `pk_stride` here.
-    let ci = schema.pk_indices()[0];
+    let ci = schema.pk_cols[0] as usize;
     let loc = SchemaFacts::locate(schema, ci);
     Ok(build_pylist(py, (0..batch.pks.len()).map(|i| value_at(py, batch, ci, loc, i)))?.unbind())
 }
@@ -309,14 +314,14 @@ fn u128_value_to_py(py: Python<'_>, x: u128, tc: TypeCode) -> PyResult<Py<PyAny>
 }
 
 /// Decode one payload cell into a Python object, null bit first: a set bit is
-/// `None` regardless of the stored value. Per-`ColData` decode — Fixed →
-/// [`fixed_value_to_py`], Strings → str, Bytes → bytes — shared by the row
-/// build and the `scalars` column loop. `tc` and `stride` are the column's type
-/// code and wire stride, precomputed by the caller (`stride` is read only for
-/// the Fixed arm).
+/// `None` regardless of the stored value. Shared by the row build and the
+/// `scalars` column loop. STRING surfaces as `str` — UTF-8 is validated here,
+/// the region carrying bytes — BLOB as `bytes`, everything else through
+/// [`fixed_value_to_py`].
 fn cell_to_py(
     py: Python<'_>,
-    col: &ColData,
+    batch: &ZSetBatch,
+    ci: usize,
     row: usize,
     is_null: bool,
     tc: TypeCode,
@@ -325,16 +330,20 @@ fn cell_to_py(
     if is_null {
         return Ok(py.None());
     }
-    Ok(match col {
-        ColData::Fixed(buf) => fixed_value_to_py(py, tc, &buf[row * stride..(row + 1) * stride])?,
-        ColData::Strings(v) => match &v[row] {
-            Some(s) => s.into_pyobject(py)?.into_any().unbind(),
-            None => py.None(),
-        },
-        ColData::Bytes(v) => match &v[row] {
-            Some(b) => pyo3::types::PyBytes::new(py, b).into_any().unbind(),
-            None => py.None(),
-        },
+    let cell = &batch.columns[ci][row * stride..(row + 1) * stride];
+    Ok(match tc {
+        TypeCode::String => {
+            let bytes = gnitz_wire::german_string_content(cell, &batch.blob);
+            std::str::from_utf8(bytes)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid UTF-8 in a STRING column: {e}")))?
+                .into_pyobject(py)?
+                .into_any()
+                .unbind()
+        }
+        TypeCode::Blob => pyo3::types::PyBytes::new(py, gnitz_wire::german_string_content(cell, &batch.blob))
+            .into_any()
+            .unbind(),
+        _ => fixed_value_to_py(py, tc, cell)?,
     })
 }
 
@@ -402,12 +411,13 @@ fn value_at(py: Python<'_>, batch: &ZSetBatch, ci: usize, loc: ColumnLocator, ro
     let tc = TypeCode::from_validated_u8(loc.type_code());
     match loc {
         ColumnLocator::Pk { byte_off, size, .. } => {
-            let w = batch.pks.col_window(row, byte_off as usize, size as usize);
-            fixed_value_to_py(py, tc, w)
+            let opk = batch.pks.col_window(row, byte_off as usize, size as usize);
+            let native = gnitz_wire::decode_pk_column_owned(opk, loc.type_code());
+            fixed_value_to_py(py, tc, &native[..size as usize])
         }
         ColumnLocator::Payload { slot, size, .. } => {
-            let is_null = null_word_get(batch.nulls[row], slot as usize);
-            cell_to_py(py, &batch.columns[ci], row, is_null, tc, size as usize)
+            let is_null = gnitz_wire::null_word_get(batch.nulls[row], slot as usize);
+            cell_to_py(py, batch, ci, row, is_null, tc, size as usize)
         }
     }
 }

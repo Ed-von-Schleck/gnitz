@@ -29,7 +29,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gnitz_core::{null_word_set, ColData, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch, ZSetBatchView};
+use gnitz_core::{push_zero_cell, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch, ZSetBatchView};
 use gnitz_expr::{ColumnLocator, Evaluator, ExprResults, SchemaFacts};
 use gnitz_wire::{cmp_typed_le, AggFunc as WireAggFunc, ComputeMap};
 
@@ -232,11 +232,9 @@ pub(crate) fn agg_finish(spec: &FoldShape, partial: &ZSetBatch) -> ZSetBatch {
     //    it is bounded by the result the caller is about to sort and ship.
     let groups = fill_group_batch(spec, partial, &reps, &accs);
 
-    // 4. HAVING, then 5. finalize — both over **one** view: `ViewBuffers::view`
-    //    rebuilds a region list per call, each a whole-batch OPK re-encode plus a
-    //    fresh materialisation of every German-string column.
-    let mut bufs = gnitz_core::ViewBuffers::default();
-    let view = bufs.view(&groups, &spec.partial_schema);
+    // 4. HAVING, then 5. finalize — both over **one** view: building one
+    //    allocates a region list.
+    let view = ZSetBatchView::new(&groups, &spec.partial_schema);
 
     // One batch, one drive — so the truth rule is the engine filter's own
     // (`bool_bits & !null_bits`). Without a HAVING every group is one range.
@@ -256,8 +254,8 @@ pub(crate) fn agg_finish(spec: &FoldShape, partial: &ZSetBatch) -> ZSetBatch {
 /// accumulator values]`. `reps[g] == None` is the synthesized global ground
 /// group, which by construction has no group columns.
 ///
-/// Filled a column at a time, so the destination column and its `ColData`
-/// variant are resolved once per column rather than once per cell.
+/// Filled a column at a time, so the destination column is resolved once per
+/// column rather than once per cell.
 fn fill_group_batch(spec: &FoldShape, partial: &ZSetBatch, reps: &[Option<usize>], accs: &[ColAcc]) -> ZSetBatch {
     let schema = spec.partial_schema.as_ref();
     let n_group = spec.group_positions.len();
@@ -265,16 +263,15 @@ fn fill_group_batch(spec: &FoldShape, partial: &ZSetBatch, reps: &[Option<usize>
     let n = reps.len();
 
     let mut dst = ZSetBatch::with_capacity(schema, n);
-    // Pushed rather than assigned as a `PkColumn` variant, so the variant stays
-    // the one `empty_for_schema` derived from the schema.
+    // Pushed row by row, so the column keeps the stride `empty_for_schema`
+    // derived from the schema.
     for &rep in reps {
-        push_group_key(&mut dst.pks, partial, rep);
+        push_group_key(&mut dst.pks, schema, partial, rep);
     }
     dst.weights.resize(n, 1);
     // One word per row, one bit per payload slot: materialized at its final
     // length up front so each column pass can OR in its own bit `pi`.
     dst.nulls.resize(n, 0);
-    let ZSetBatch { nulls, columns, .. } = &mut dst;
 
     // `payload_columns` yields the payload slot as its enumeration ordinal, so
     // `pi` is also the column's position in this layout: slots `0..n_group` are
@@ -282,16 +279,14 @@ fn fill_group_batch(spec: &FoldShape, partial: &ZSetBatch, reps: &[Option<usize>
     for (pi, ci, col) in schema.payload_columns() {
         let (tc, w) = (col.type_code, col.type_code.wire_stride());
         if pi < n_group {
-            // A group column keeps its source type, so the move goes through the
-            // exhaustive `push_row_from` — a new `ColData` variant then has to be
-            // handled there rather than panicking at runtime.
+            // A group column keeps its source type, so its cell is copied whole.
             let loc = SchemaFacts::locate(schema, ci);
             for (g, &rep) in reps.iter().enumerate() {
                 let rep = rep.expect("a grouped result always has a representative row");
                 if loc.is_null_word(partial.nulls[rep]) {
-                    push_null_cell(&mut columns[ci], tc, &mut nulls[g], pi);
+                    push_null_cell(&mut dst.columns[ci], &mut dst.nulls[g], tc, pi);
                 } else {
-                    partial.columns[ci].push_row_from(rep, w, &mut columns[ci]);
+                    dst.push_cell_from(ci, partial, ci, tc, rep);
                 }
             }
         } else {
@@ -300,15 +295,15 @@ fn fill_group_batch(spec: &FoldShape, partial: &ZSetBatch, reps: &[Option<usize>
             let k = pi - n_group;
             for g in 0..n {
                 match acc_bits(&accs[g * n_aggs + k]) {
-                    None => push_null_cell(&mut columns[ci], tc, &mut nulls[g], pi),
-                    Some(bits) => push_fixed_bits(&mut columns[ci], bits, w),
+                    None => push_null_cell(&mut dst.columns[ci], &mut dst.nulls[g], tc, pi),
+                    Some(bits) => push_fixed_bits(&mut dst.columns[ci], bits, w),
                 }
             }
         }
     }
 
-    // The one rule `ViewBuffers::regions` does not already assert on this batch
-    // two lines later: a set null bit under a NOT NULL group column would leave
+    // The one rule `regions` does not already assert on this batch two lines
+    // later: a set null bit under a NOT NULL group column would leave
     // the resolved program's `no_nulls` on, and the evaluator would read
     // `push_null`'s zero bytes as a real `0`. Unconditional — release is where a
     // stale bit becomes a silently wrong answer rather than a panic.
@@ -319,9 +314,9 @@ fn fill_group_batch(spec: &FoldShape, partial: &ZSetBatch, reps: &[Option<usize>
 
 /// Append a NULL cell to `col` and record it at payload slot `pi` in `word` —
 /// the one place the null bitmap and the pushed filler bytes are kept in step.
-fn push_null_cell(col: &mut ColData, tc: TypeCode, word: &mut u64, pi: usize) {
-    null_word_set(word, pi, true);
-    col.push_null(tc);
+fn push_null_cell(col: &mut Vec<u8>, word: &mut u64, tc: TypeCode, pi: usize) {
+    gnitz_wire::null_word_set(word, pi, true);
+    push_zero_cell(col, tc);
 }
 
 // ---------------------------------------------------------------------------
@@ -348,13 +343,12 @@ fn group_key(partial: &ZSetBatch, cols: &[ColumnLocator], row: usize, key: &mut 
             key.extend_from_slice(&(b.len() as u32).to_le_bytes());
             key.extend_from_slice(b);
         };
-        match &partial.columns[1 + g] {
-            ColData::Fixed(buf) => {
-                let s = loc.size();
-                put(&buf[row * s..(row + 1) * s]);
-            }
-            ColData::Strings(v) => put(v[row].as_deref().unwrap_or("").as_bytes()),
-            ColData::Bytes(v) => put(v[row].as_deref().unwrap_or(&[])),
+        let s = loc.size();
+        let cell = &partial.columns[1 + g][row * s..(row + 1) * s];
+        if gnitz_wire::is_german_string(loc.type_code()) {
+            put(gnitz_wire::german_string_content(cell, &partial.blob));
+        } else {
+            put(cell);
         }
     }
 }
@@ -392,9 +386,9 @@ fn combine(acc: &mut ColAcc, partial: &ZSetBatch, loc: &ColumnLocator, ci: usize
 }
 
 fn fixed_slice(partial: &ZSetBatch, ci: usize, row: usize, stride: usize) -> &[u8] {
-    partial.columns[ci]
-        .cell(row, stride)
-        .expect("ad-hoc numeric agg partial column is Fixed and in range")
+    partial
+        .cell(ci, row, stride)
+        .expect("ad-hoc numeric agg partial column is fixed-width and in range")
 }
 
 /// One 8-byte partial-aggregate cell; the caller picks how to read it.
@@ -444,13 +438,13 @@ pub(crate) fn build_agg_out_schema(out_cols: &[ColumnDef]) -> Result<Schema, Gni
 ///
 /// The copy is a byte move, not a re-encode — the partial's `_group_pk` and both
 /// destination keys are the same U128 stride.
-fn push_group_key(dst: &mut PkColumn, partial: &ZSetBatch, rep: Option<usize>) {
+fn push_group_key(dst: &mut PkColumn, schema: &Schema, partial: &ZSetBatch, rep: Option<usize>) {
     match rep {
         Some(row) => dst.push_from(&partial.pks, row),
         // The synthesized global ground row has no partial to copy from, so it
         // takes V₀ directly — the same key the engine's own ground row carries
         // when a worker did contribute one.
-        None => dst.push_u128(gnitz_wire::global_group_key()),
+        None => dst.push_u128(schema, gnitz_wire::global_group_key()),
     }
 }
 
@@ -511,22 +505,24 @@ fn project_groups(spec: &FoldShape, view: &ZSetBatchView<'_>, ranges: &[(usize, 
             out.weights.push(1);
             let mut null_word: u64 = 0;
             for item in &items {
-                let col = &mut out.columns[item.ci];
                 match &item.values {
                     FinalValues::PassThrough { partial_ci, loc } => {
                         if loc.is_null_word(groups.nulls[g]) {
-                            push_null_cell(col, item.tc, &mut null_word, item.pi);
+                            push_null_cell(&mut out.columns[item.ci], &mut null_word, item.tc, item.pi);
                         } else {
-                            groups.columns[*partial_ci].push_row_from(g, item.tc.wire_stride(), col);
+                            out.push_cell_from(item.ci, groups, *partial_ci, item.tc, g);
                         }
                     }
                     FinalValues::Computed(ExprResults::Scalar(vals)) => match vals[g] {
-                        None => push_null_cell(col, item.tc, &mut null_word, item.pi),
-                        Some(v) => push_fixed_bits(col, v as u64, item.tc.wire_stride()),
+                        None => push_null_cell(&mut out.columns[item.ci], &mut null_word, item.tc, item.pi),
+                        Some(v) => push_fixed_bits(&mut out.columns[item.ci], v as u64, item.tc.wire_stride()),
                     },
                     FinalValues::Computed(ExprResults::Str { bytes, spans }) => match spans[g] {
-                        None => push_null_cell(col, item.tc, &mut null_word, item.pi),
-                        Some((o, l)) => push_str_cell(col, &bytes[o..o + l]),
+                        None => push_null_cell(&mut out.columns[item.ci], &mut null_word, item.tc, item.pi),
+                        Some((o, l)) => {
+                            let cell = gnitz_wire::encode_german_string(&bytes[o..o + l], &mut out.blob);
+                            out.columns[item.ci].extend_from_slice(&cell);
+                        }
                     },
                 }
             }
@@ -541,23 +537,8 @@ fn project_groups(spec: &FoldShape, view: &ZSetBatchView<'_>, ranges: &[(usize, 
 /// `Fixed` of width ≤ 8 (`agg_output_type` routes float SUM/MIN/MAX to F64 and
 /// SUM through `register_image_type`, and preserves a ≤8-byte integer source's
 /// own width for MIN/MAX), and a computed one is the evaluator's own register.
-fn push_fixed_bits(col: &mut ColData, bits: u64, stride: usize) {
-    match col {
-        ColData::Fixed(buf) => buf.extend_from_slice(&bits.to_le_bytes()[..stride]),
-        _ => unreachable!("a fixed-width output column is a Fixed of width <= 8"),
-    }
-}
-
-/// Push a computed string/blob result. The evaluator's arena holds raw bytes; a
-/// STRING column's are UTF-8 by construction (every string a program can produce
-/// comes from a STRING column or a literal), so the lossy conversion is a
-/// total function that never fires.
-fn push_str_cell(col: &mut ColData, bytes: &[u8]) {
-    match col {
-        ColData::Strings(v) => v.push(Some(String::from_utf8_lossy(bytes).into_owned())),
-        ColData::Bytes(v) => v.push(Some(bytes.to_vec())),
-        ColData::Fixed(_) => unreachable!("a string-valued finalize writes a String/Blob column"),
-    }
+fn push_fixed_bits(col: &mut Vec<u8>, bits: u64, stride: usize) {
+    col.extend_from_slice(&bits.to_le_bytes()[..stride]);
 }
 
 #[cfg(test)]

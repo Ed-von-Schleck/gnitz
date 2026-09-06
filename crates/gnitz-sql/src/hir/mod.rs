@@ -741,14 +741,14 @@ impl RelExpr {
                 if desc.as_ref().is_some_and(|d| d.class == gnitz_core::RelClass::Stream) {
                     return None;
                 }
-                let pk = schema.pk_indices();
+                let pk = &schema.pk_cols;
                 if pk
                     .iter()
-                    .any(|&i| lower::join::is_join_key_name(&schema.columns[i].name))
+                    .any(|&i| lower::join::is_join_key_name(&schema.columns[i as usize].name))
                 {
                     return None;
                 }
-                Some(pk.iter().map(|&i| cols[i].id).collect())
+                Some(pk.iter().map(|&i| cols[i as usize].id).collect())
             }
             RelExpr::Filter { input, .. } => input.row_key(),
             RelExpr::Project { input, items } => input

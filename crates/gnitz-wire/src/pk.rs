@@ -22,8 +22,8 @@
 /// bit of the big-endian image, so XOR-ing it before the store keeps the whole
 /// transform one load, one `bswap` and one store — a trailing `dst[0] ^= 0x80`
 /// would be a read-modify-write of bytes just written. [`decode_pk_column`] is
-/// the exact mirror.
-#[inline]
+/// the exact mirror, `#[inline(always)]` for the reason stated there.
+#[inline(always)]
 pub fn encode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
     debug_assert_eq!(dst.len(), src.len());
     let flip = crate::is_signed_int(tc);
@@ -58,7 +58,7 @@ pub fn encode_pk_column(src: &[u8], tc: u8, dst: &mut [u8]) {
 /// with the wrong column order: PK-list order is what makes the result's
 /// unsigned byte comparison the typed PK order, and it is independent of column
 /// order (`PRIMARY KEY (b, a)`).
-#[inline]
+#[inline(always)]
 pub fn encode_pk_tuple(cols: impl IntoIterator<Item = (usize, u8)>, src: &[u8], dst: &mut [u8]) {
     let mut off = 0;
     for (cs, tc) in cols {

@@ -13,7 +13,7 @@ fn schema_conforms_to_schema_facts() {
             .enumerate()
             .map(|(i, &(tc, nullable))| ColumnDef::new(format!("c{i}"), TypeCode::from_validated_u8(tc), nullable))
             .collect();
-        Schema::from_parts(columns, pk.to_vec()).expect("client-valid schema")
+        Schema::from_parts(columns, pk.iter().map(|&c| c as u32).collect()).expect("client-valid schema")
     });
 }
 
@@ -76,10 +76,11 @@ fn filler_columns_encode_without_panic() {
     };
     let count = 2;
     let batch = ZSetBatch {
-        pks: PkColumn::from_u128s(8, [10, 20]),
+        pks: PkColumn::from_natives(&schema, [10, 20]),
         weights: vec![-1; count],
         nulls: vec![0; count],
         columns: ZSetBatch::filler_columns(&schema, count),
+        blob: vec![],
     };
     batch.validate(&schema).expect("filler batch must validate");
     let _ = crate::protocol::wal_block::encode_wal_block(&schema, 7, &batch);
@@ -97,7 +98,7 @@ fn test_num_payload_cols() {
     };
     assert_eq!(s.num_payload_cols(), 1);
 
-    // pk_index not at column 0 → same answer (columns.len() - pk_indices().len()).
+    // pk_index not at column 0 → same answer (columns.len() - pk_cols.len()).
     let s = Schema {
         columns: vec![
             ColumnDef::new("a", TypeCode::U64, false),
@@ -317,7 +318,7 @@ fn test_validate_mismatched_weights() {
         pk_cols: vec![0],
     };
     let mut batch = ZSetBatch::new(&schema);
-    batch.pks.push_u128(1);
+    batch.pks.push_u128(&schema, 1);
     // weights is empty — mismatch
     let err = batch.validate(&schema).unwrap_err();
     assert!(err.contains("weights"));
@@ -333,7 +334,7 @@ fn test_validate_mismatched_strings() {
         pk_cols: vec![0],
     };
     let mut batch = ZSetBatch::new(&schema);
-    batch.pks.push_u128(1);
+    batch.pks.push_u128(&schema, 1);
     batch.weights.push(1);
     batch.nulls.push(0);
     // Strings column is empty — mismatch (a cell count, not a byte length)
@@ -351,7 +352,7 @@ fn test_validate_mismatched_fixed() {
         pk_cols: vec![0],
     };
     let mut batch = ZSetBatch::new(&schema);
-    batch.pks.push_u128(1);
+    batch.pks.push_u128(&schema, 1);
     batch.weights.push(1);
     batch.nulls.push(0);
     // Fixed column 1 is empty (needs 8 bytes) — a byte length, not a count
@@ -426,7 +427,8 @@ fn test_validate_wide_pk_buffer_not_multiple_of_stride() {
         pks: PkColumn { stride: 16, buf: vec![0u8; 20] },
         weights: vec![1],
         nulls: vec![0],
-        columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![])],
+        columns: vec![vec![], vec![]],
+        blob: vec![],
     };
     let err = batch.validate(&schema).unwrap_err();
     assert!(err.contains("multiple of stride"), "unexpected error: {err}");
@@ -441,7 +443,8 @@ fn test_validate_wide_pk_zero_stride() {
         pks: PkColumn { stride: 0, buf: vec![0u8; 16] },
         weights: vec![],
         nulls: vec![],
-        columns: vec![ColData::Fixed(vec![]), ColData::Fixed(vec![])],
+        columns: vec![vec![], vec![]],
+        blob: vec![],
     };
     let err = batch.validate(&schema).unwrap_err();
     assert!(err.contains("stride must be non-zero"), "unexpected error: {err}");
@@ -463,7 +466,7 @@ fn test_extend_from_column_count_mismatch_panics() {
     };
     let mut a = ZSetBatch::new(&schema1);
     let b = ZSetBatch::new(&schema2);
-    a.extend_from_owned(b);
+    a.extend_from_owned(b, &schema1);
 }
 
 /// `extend_from_owned` (move) concatenates rows across String and Bytes
@@ -491,23 +494,24 @@ fn test_extend_from_owned_concatenates() {
     };
 
     let mut acc = build(1);
-    acc.extend_from_owned(build(10));
+    acc.extend_from_owned(build(10), &schema);
 
     assert_eq!(acc.len(), 4);
     // Values from both halves survive in order.
-    assert_eq!(acc.pks.to_vec_u128(), vec![1u128, 2, 10, 11]);
+    assert_eq!(acc.pks.to_vec_u128(&schema), vec![1u128, 2, 10, 11]);
     assert_eq!(acc.weights, vec![1, -1, 1, -1]);
-    match &acc.columns[1] {
-        ColData::Strings(v) => assert_eq!(
-            v,
-            &[
-                Some("hello world is long enough".to_string()),
-                Some("short".to_string()),
-                Some("hello world is long enough".to_string()),
-                Some("short".to_string()),
-            ]
-        ),
-        _ => panic!("expected Strings"),
+    {
+        let v = &acc.columns[1];
+        assert_eq!(
+            german_strings(&acc, 1),
+            [
+                "hello world is long enough",
+                "short",
+                "hello world is long enough",
+                "short",
+            ],
+            "{v:?}"
+        );
     }
 }
 
@@ -547,17 +551,15 @@ fn test_appender_single_row() {
         .u64_val(100)
         .u64_val(200);
     assert_eq!(batch.len(), 1);
-    assert_eq!(batch.pks.get(0), 42);
+    assert_eq!(batch.pks.get(&schema, 0), 42);
     assert_eq!(batch.weights[0], 1);
-    if let ColData::Fixed(buf) = &batch.columns[1] {
+    {
+        let buf = &batch.columns[1];
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 100);
-    } else {
-        panic!("expected Fixed");
     }
-    if let ColData::Fixed(buf) = &batch.columns[2] {
+    {
+        let buf = &batch.columns[2];
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 200);
-    } else {
-        panic!("expected Fixed");
     }
 }
 
@@ -578,15 +580,14 @@ fn test_appender_multi_row() {
         a.add_row(3u128, -1).u64_val(30);
     }
     assert_eq!(batch.len(), 3);
-    assert_eq!(batch.pks.to_vec_u128(), vec![1u128, 2u128, 3u128]);
+    assert_eq!(batch.pks.to_vec_u128(&schema), vec![1u128, 2u128, 3u128]);
     assert_eq!(batch.weights, vec![1, 1, -1]);
-    if let ColData::Fixed(buf) = &batch.columns[1] {
+    {
+        let buf = &batch.columns[1];
         assert_eq!(buf.len(), 24);
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 10);
         assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 20);
         assert_eq!(u64::from_le_bytes(buf[16..24].try_into().unwrap()), 30);
-    } else {
-        panic!("expected Fixed");
     }
 }
 
@@ -606,11 +607,7 @@ fn test_appender_string_col() {
         .u64_val(42)
         .str_val("hello");
     assert_eq!(batch.len(), 1);
-    if let ColData::Strings(v) = &batch.columns[2] {
-        assert_eq!(v[0], Some("hello".to_string()));
-    } else {
-        panic!("expected Strings");
-    }
+    assert_eq!(german_strings(&batch, 2), ["hello"]);
 }
 
 #[test]
@@ -626,9 +623,7 @@ fn test_appender_u128_col() {
     BatchAppender::new(&mut batch, &schema)
         .add_row(1u128, 1)
         .u128_val(((0xBEEF_u128) << 64) | 0xDEAD);
-    let ColData::Fixed(b) = &batch.columns[1] else {
-        panic!("expected Fixed");
-    };
+    let b = &batch.columns[1];
     assert_eq!(b, &(((0xBEEF_u128) << 64) | 0xDEAD).to_le_bytes());
 }
 
@@ -653,26 +648,10 @@ fn test_appender_mixed_types() {
         .i64_val(-5)
         .str_val("world");
     assert_eq!(batch.len(), 1);
-    if let ColData::Fixed(buf) = &batch.columns[1] {
-        assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 100);
-    } else {
-        panic!("expected Fixed for col 1");
-    }
-    if let ColData::Strings(v) = &batch.columns[2] {
-        assert_eq!(v[0], Some("hello".to_string()));
-    } else {
-        panic!("expected Strings for col 2");
-    }
-    if let ColData::Fixed(buf) = &batch.columns[3] {
-        assert_eq!(i64::from_le_bytes(buf[0..8].try_into().unwrap()), -5);
-    } else {
-        panic!("expected Fixed for col 3");
-    }
-    if let ColData::Strings(v) = &batch.columns[4] {
-        assert_eq!(v[0], Some("world".to_string()));
-    } else {
-        panic!("expected Strings for col 4");
-    }
+    assert_eq!(u64::from_le_bytes(batch.columns[1][0..8].try_into().unwrap()), 100);
+    assert_eq!(german_strings(&batch, 2), ["hello"]);
+    assert_eq!(i64::from_le_bytes(batch.columns[3][0..8].try_into().unwrap()), -5);
+    assert_eq!(german_strings(&batch, 4), ["world"]);
 }
 
 #[test]
@@ -694,24 +673,22 @@ fn test_appender_pk_not_at_zero() {
         .u64_val(20) // cursor 1 -> ci 1 (B)
         .u64_val(30); // cursor 2 -> ci 3 (C), skips pk_index=2
 
-    assert_eq!(batch.pks.get(0), 99);
-    if let ColData::Fixed(buf) = &batch.columns[0] {
+    assert_eq!(batch.pks.get(&schema, 0), 99);
+    {
+        let buf = &batch.columns[0];
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 10);
-    } else {
-        panic!("expected Fixed for col 0");
     }
-    if let ColData::Fixed(buf) = &batch.columns[1] {
+    {
+        let buf = &batch.columns[1];
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 20);
-    } else {
-        panic!("expected Fixed for col 1");
     }
-    if let ColData::Fixed(buf) = &batch.columns[2] {
+    {
+        let buf = &batch.columns[2];
         assert!(buf.is_empty(), "PK column should be empty placeholder");
     }
-    if let ColData::Fixed(buf) = &batch.columns[3] {
+    {
+        let buf = &batch.columns[3];
         assert_eq!(u64::from_le_bytes(buf[0..8].try_into().unwrap()), 30);
-    } else {
-        panic!("expected Fixed for col 3");
     }
 }
 
@@ -731,7 +708,7 @@ fn kv_schema(v: TypeCode) -> Schema {
 /// region can go out of shape — one message for `u64_val`/`i64_val`/`u128_val`,
 /// since they share one body.
 #[test]
-#[should_panic(expected = "fixed value written to String column")]
+#[should_panic(expected = "a fixed-width value cannot be written to the String column")]
 fn a_fixed_value_in_a_string_column_panics() {
     let schema = kv_schema(TypeCode::String);
     let mut batch = ZSetBatch::new(&schema);
@@ -739,7 +716,7 @@ fn a_fixed_value_in_a_string_column_panics() {
 }
 
 #[test]
-#[should_panic(expected = "str_val called on non-Strings")]
+#[should_panic(expected = "a string/blob value cannot be written to the U64 column")]
 fn a_string_in_a_fixed_column_panics() {
     let schema = kv_schema(TypeCode::U64);
     let mut batch = ZSetBatch::new(&schema);
@@ -834,44 +811,43 @@ fn a_null_cell_round_trips_as_null() {
     let encoded = encode_wal_block(&schema, 1, &batch);
     let (decoded, _) = decode_wal_block_verified(&encoded, &schema).unwrap();
     assert_eq!(decoded.nulls[0], batch.nulls[0], "null bitmap round-trips");
-    // The read side gates on the bitmap, so both columns must decode as NULL.
-    assert_eq!(
-        &decoded.columns[1],
-        &ColData::Strings(vec![None]),
-        "String must decode as NULL"
-    );
-    assert_eq!(
-        &decoded.columns[2],
-        &ColData::Bytes(vec![None]),
-        "Blob must decode as NULL"
-    );
+    // The read side gates on the bitmap; the cells themselves are zeroed.
+    assert_eq!(decoded.columns[1], [0u8; 16], "String NULL cell is zeroed");
+    assert_eq!(decoded.columns[2], [0u8; 16], "Blob NULL cell is zeroed");
 }
 
 // --- §5.2: add_row under-push tripwire ---
 
 #[test]
 #[cfg(debug_assertions)]
-#[should_panic(expected = "BatchAppender: previous row got")]
-fn add_row_under_push_trips_tripwire() {
+#[should_panic(expected = "BatchAppender: row got")]
+fn closing_an_under_pushed_row_trips_the_tripwire() {
+    use gnitz_wire::sys_rows::SysRowSink;
     let schema = nullable_str_blob_schema(); // 2 payload columns
     let mut batch = ZSetBatch::new(&schema);
     let mut a = BatchAppender::new(&mut batch, &schema);
-    a.add_row(1, 1).null(); // only 1 of 2 payload cols pushed
-    a.add_row(2, 1); // should panic: previous row incomplete
+    a.begin_row(&[1], 1);
+    a.put_null(); // only 1 of 2 payload cols pushed
+    a.end_row(); // should panic: the row is incomplete
 }
 
 #[test]
-fn add_row_over_populated_batch_no_false_trip() {
-    // Build a batch first, then attach a fresh appender; the first add_row
-    // must not trip the under-push debug_assert (row_active starts false).
+fn a_fresh_appender_writes_onto_a_populated_batch() {
     let schema = nullable_str_blob_schema();
     let mut batch = ZSetBatch::new(&schema);
     {
         let mut a = BatchAppender::new(&mut batch, &schema);
         a.add_row(1, 1).str_val("x").bytes_val(b"y");
     }
-    // Fresh appender over the already-populated batch.
     let mut a2 = BatchAppender::new(&mut batch, &schema);
-    a2.add_row(2, 1).str_val("z").bytes_val(b"w"); // must not panic
+    a2.add_row(2, 1).str_val("z").bytes_val(b"w");
     assert_eq!(batch.pks.len(), 2);
+}
+
+/// Every cell of a STRING column region, as content strings.
+fn german_strings(batch: &ZSetBatch, ci: usize) -> Vec<String> {
+    batch.columns[ci]
+        .chunks_exact(16)
+        .map(|cell| String::from_utf8(gnitz_wire::german_string_content(cell, &batch.blob).to_vec()).unwrap())
+        .collect()
 }

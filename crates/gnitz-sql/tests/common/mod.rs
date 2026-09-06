@@ -7,7 +7,7 @@
 //! each row's Z-set weight: row presence alone reads a lost row and a
 //! duplicated one as the same result.
 
-use gnitz_core::{ColData, GnitzClient, Schema, ZSetBatch};
+use gnitz_core::{GnitzClient, Schema, ZSetBatch};
 use gnitz_sql::{GnitzSqlError, SqlPlanner, SqlResult};
 use gnitz_test_harness::ServerHandle;
 
@@ -93,18 +93,18 @@ pub fn col_idx(schema: &Schema, name: &str) -> usize {
 }
 
 /// Integer column `ci` of `row`, at its own width and signedness, from
-/// whichever region it lives in. The client decodes the PK region back to
-/// native little-endian on receive, so both regions read alike.
+/// whichever region it lives in. A PK column is decoded out of the OPK region
+/// first; a payload column is native little-endian already.
 pub fn cell_i64(schema: &Schema, batch: &ZSetBatch, ci: usize, row: usize) -> i64 {
     let tc = schema.columns[ci].type_code;
     let width = tc.wire_stride();
+    let native;
     let bytes = if schema.is_pk_col(ci) {
-        batch.pks.col_window(row, schema.pk_byte_offset(ci), width)
+        let opk = batch.pks.col_window(row, schema.pk_byte_offset(ci), width);
+        native = gnitz_wire::decode_pk_column_owned(opk, tc as u8);
+        &native[..width]
     } else {
-        match &batch.columns[ci] {
-            ColData::Fixed(b) => &b[row * width..(row + 1) * width],
-            other => panic!("column {ci} is not fixed-width: {other:?}"),
-        }
+        &batch.columns[ci][row * width..(row + 1) * width]
     };
     if gnitz_wire::is_signed_int(tc as u8) {
         gnitz_wire::read_signed_exact(bytes)
@@ -114,15 +114,12 @@ pub fn cell_i64(schema: &Schema, batch: &ZSetBatch, ci: usize, row: usize) -> i6
 }
 
 pub fn cell_f64(batch: &ZSetBatch, ci: usize, row: usize) -> f64 {
-    match &batch.columns[ci] {
-        ColData::Fixed(b) => f64::from_le_bytes(b[row * 8..row * 8 + 8].try_into().unwrap()),
-        other => panic!("column {ci} is not fixed-width: {other:?}"),
-    }
+    f64::from_le_bytes(batch.columns[ci][row * 8..row * 8 + 8].try_into().unwrap())
 }
 
 /// Is payload column `ci` NULL in `row`?
 pub fn is_null_at(schema: &Schema, batch: &ZSetBatch, ci: usize, row: usize) -> bool {
-    gnitz_core::null_word_get(batch.nulls[row], schema.payload_idx(ci))
+    gnitz_wire::null_word_get(batch.nulls[row], schema.payload_idx(ci))
 }
 
 /// The named integer columns of every row `sql` returns, each row with its

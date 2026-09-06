@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use gnitz_core::{
-    ColData, ColumnDef, GnitzClient, Interest, PkColumn, PkTuple, Reply, Request, Schema, Session, SlotId, TableProps,
-    TypeCode, WireConflictMode, ZSetBatch, MAX_IN_FLIGHT,
+    ColumnDef, GnitzClient, Interest, PkColumn, Reply, Request, Schema, Session, SlotId, TableProps, TypeCode,
+    WireConflictMode, ZSetBatch, MAX_IN_FLIGHT,
 };
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
 
@@ -24,15 +24,24 @@ fn table(target: &str) -> (GnitzClient, u64, std::sync::Arc<Schema>) {
     let mut client = GnitzClient::connect(target).expect("connect");
     let sn = unique_schema("spine");
     client.create_schema(&sn).unwrap();
-    let cols = vec![
-        ColumnDef::new("pk", TypeCode::I64, false),
-        ColumnDef::new("a", TypeCode::I64, false),
-    ];
     client
-        .create_table(&sn, "t", &cols, &[0], TableProps::default(), &[])
+        .create_table(&sn, "t", &cols(), &[0], TableProps::default(), &[])
         .unwrap();
     let (tid, schema) = client.resolve_table_id(&sn, "t").unwrap();
     (client, tid, schema)
+}
+
+fn cols() -> Vec<ColumnDef> {
+    vec![
+        ColumnDef::new("pk", TypeCode::I64, false),
+        ColumnDef::new("a", TypeCode::I64, false),
+    ]
+}
+
+/// The fixture table's schema, built locally — [`rows`] needs it to encode a
+/// key, and `table()`'s copy comes back from the server.
+fn local_schema() -> Schema {
+    Schema { columns: cols(), pk_cols: vec![0] }
 }
 
 fn rows(start: i64, count: usize) -> ZSetBatch {
@@ -41,10 +50,11 @@ fn rows(start: i64, count: usize) -> ZSetBatch {
         a.extend_from_slice(&((start + i) * 3).to_le_bytes());
     }
     ZSetBatch {
-        pks: PkColumn::from_u128s(8, (0..count as i64).map(|i| (start + i) as u128)),
+        pks: PkColumn::from_natives(&local_schema(), (0..count as i64).map(|i| (start + i) as u128)),
         weights: vec![1; count],
         nulls: vec![0; count],
-        columns: vec![ColData::Fixed(vec![]), ColData::Fixed(a)],
+        columns: vec![vec![], a],
+        blob: vec![],
     }
 }
 
@@ -122,7 +132,7 @@ fn concurrent_pushes_and_scans(target: &str) {
     // The blocking client and the driver agree on the table.
     let (_, batch, _) = blocking.scan(tid).unwrap();
     assert_eq!(batch.map_or(0, |b| b.len()), n * per);
-    let (_, row, _) = blocking.seek(tid, &PkTuple::from_u128_narrow(7)).unwrap();
+    let (_, row, _) = blocking.seek(tid, 7, &[]).unwrap();
     assert!(row.is_some());
 }
 

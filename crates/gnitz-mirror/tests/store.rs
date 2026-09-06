@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
-use gnitz_core::{ColData, ColumnDef, DeltaCursor, Invalidate, MirrorStore, RawBlock, Schema, Shape, TypeCode};
+use gnitz_core::{ColumnDef, DeltaCursor, Invalidate, MirrorStore, RawBlock, Schema, Shape, TypeCode};
 use gnitz_mirror::Mirror;
 use gnitz_store::schema::make_delta_schema;
 use gnitz_store::storage::Batch;
@@ -93,12 +93,10 @@ fn registered(name: &str) -> (Mirror, String) {
 /// mangled pass unnoticed — the keys and their weights would still line up.
 fn held(store: &mut Mirror, tid: u64) -> BTreeMap<(u64, i64), i64> {
     let batch = store.scan(tid, &view_schema()).expect("a scan of a held copy");
-    let ColData::Fixed(vals) = &batch.columns[1] else {
-        panic!("the copy's one payload column is fixed-width")
-    };
+    let vals = &batch.columns[1];
     let mut out = BTreeMap::new();
     for row in 0..batch.weights.len() {
-        let pk = u64::from_le_bytes(batch.pks.buf[row * 8..row * 8 + 8].try_into().unwrap());
+        let pk = batch.pks.get(&view_schema(), row) as u64;
         let val = i64::from_le_bytes(vals[row * 8..row * 8 + 8].try_into().unwrap());
         *out.entry((pk, val)).or_insert(0) += batch.weights[row];
     }

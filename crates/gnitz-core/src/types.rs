@@ -26,6 +26,6 @@ pub(crate) fn schema_from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_cols: &[
             .iter()
             .map(|c| ColumnDef::new(c.name, c.type_code, c.nullable))
             .collect(),
-        pk_cols: pk_cols.iter().map(|&c| c as usize).collect(),
+        pk_cols: pk_cols.to_vec(),
     }
 }

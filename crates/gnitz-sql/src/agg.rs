@@ -53,7 +53,7 @@ pub(crate) struct AggSpec {
 /// re-derives a position from the out-key kind.
 struct KeyRegion {
     cols: Vec<ColumnDef>,
-    pk_cols: Vec<usize>,
+    pk_cols: Vec<u32>,
     group_slots: Vec<usize>,
 }
 
@@ -62,7 +62,6 @@ struct KeyRegion {
 /// append: their type and nullability come from the physical specs, which are
 /// per-side.
 fn reduce_out_key_region(out_key: ReduceOutKey, source_schema: &Schema, group_col_indices: &[usize]) -> KeyRegion {
-    let pk: Vec<u32> = source_schema.pk_cols.iter().map(|&i| i as u32).collect();
     let group: Vec<u32> = group_col_indices.iter().map(|&i| i as u32).collect();
     let mut r = KeyRegion {
         cols: Vec::new(),
@@ -71,19 +70,19 @@ fn reduce_out_key_region(out_key: ReduceOutKey, source_schema: &Schema, group_co
     };
     // Where each source column landed, in slot order.
     let mut slot_of_src: Vec<(u32, usize)> = Vec::new();
-    for slot in out_key.output_layout(&pk, &group) {
+    for slot in out_key.output_layout(&source_schema.pk_cols, &group) {
         let at = r.cols.len();
         let src = match slot {
             // Hidden: the synthetic group key is a physical PK column but not a
             // presentation column. The group columns follow it as visible payload,
             // so `SELECT *` shows the grouping values and aggregates, not the hash.
             ReduceOutSlot::SyntheticKey => {
-                r.pk_cols.push(at);
+                r.pk_cols.push(at as u32);
                 r.cols.push(ColumnDef::new("_group_pk", TypeCode::U128, false).hidden());
                 continue;
             }
             ReduceOutSlot::Key(c) => {
-                r.pk_cols.push(at);
+                r.pk_cols.push(at as u32);
                 c
             }
             ReduceOutSlot::Carried(c) => c,
@@ -255,7 +254,7 @@ pub(crate) fn emit_reduce(
 ) -> gnitz_core::NodeId {
     let agg_specs = sh.specs;
     let reduce_group_cols: Vec<usize> = if sh.out_key == ReduceOutKey::PkPermutation {
-        sh.source_schema.pk_cols.clone()
+        sh.source_schema.pk_cols.iter().map(|&c| c as usize).collect()
     } else {
         sh.group_cols.to_vec()
     };

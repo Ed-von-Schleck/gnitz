@@ -17,8 +17,8 @@
 //! `gnitz_expr::locator` the row-sourced face (what `write_span` and `pack_into`
 //! read through), and this module the schema-typed, value-sourced face — every
 //! such encoder in this crate lives here, so the write, seek and route sides
-//! cannot spell one differently. `gnitz-core`'s `build_pk_region_into` is the
-//! client's own face of the same codec.
+//! cannot spell one differently. The client encodes through `gnitz_wire::pk`
+//! directly, so its PK regions are byte-identical to the ones built here.
 
 use std::cmp::Ordering;
 
@@ -143,34 +143,17 @@ pub fn opk_key_cols(schema: &SchemaDescriptor, natives: &[u128]) -> PkBuf {
     encode_leading_opk(schema.pk_columns().map(|(_, col)| (col.type_code, *col)), natives)
 }
 
-/// Reassemble the native seek image from the wire pair `(low, extra)` — the
-/// inverse of `PkTuple::split_wire` — and OPK-encode it via [`opk_key`]. The
-/// shared seek-key encoder for the master partition router (`fan_out_seek`) and
-/// the worker SEEK handler (`seek_family`) at every PK width. The seek frame
-/// carries the key as native LE column bytes (it bypasses the client's
-/// `build_pk_region`, so the bytes are not yet OPK): the low
-/// [`NARROW_PK_MAX_BYTES`] ride in `low`, a wide PK's remaining suffix in
-/// `extra` (empty for narrow PKs).
-///
-/// Errors if `extra` is shorter than that suffix.
+/// [`gnitz_wire::control::join_ctrl_key`] then [`opk_key`]: the shared seek-key
+/// encoder for the master partition router (`fan_out_seek`) and the worker SEEK
+/// handler (`seek_family`) at every PK width. The seek frame carries native LE
+/// column bytes, not the OPK a PK region holds.
 pub fn seek_opk_bytes(schema: &SchemaDescriptor, low: u128, extra: &[u8]) -> Result<PkBuf, String> {
     let stride = schema.pk_stride() as usize;
     if stride > MAX_PK_BYTES {
         return Err(format!("PK stride {stride} exceeds MAX_PK_BYTES {MAX_PK_BYTES}"));
     }
-    let needed = stride.saturating_sub(NARROW_PK_MAX_BYTES);
-    if extra.len() < needed {
-        return Err(format!(
-            "PK stride {stride} requires {needed} extra bytes, got {}",
-            extra.len()
-        ));
-    }
-    // Native image = `low`'s 16 LE bytes, then the wide suffix. The upper bound
-    // is `16 + needed` (not `stride`): for a narrow PK `needed == 0` makes it the
-    // empty copy `le[16..16]` rather than the inverted range `le[16..stride]`.
     let mut le = [0u8; MAX_PK_BYTES];
-    le[..NARROW_PK_MAX_BYTES].copy_from_slice(&low.to_le_bytes());
-    le[NARROW_PK_MAX_BYTES..NARROW_PK_MAX_BYTES + needed].copy_from_slice(&extra[..needed]);
+    gnitz_wire::control::join_ctrl_key(low, extra, &mut le[..stride])?;
     Ok(opk_key(schema, &le[..stride]))
 }
 

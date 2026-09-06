@@ -81,10 +81,10 @@ pub(crate) fn effective_rows(
         }
     }
     if !undecided.is_empty() {
-        let mut committed = fetch_committed(client, tid, schema, &undecided)?;
+        let committed = fetch_committed(client, tid, schema, &undecided)?;
         for i in 0..committed.len() {
             index.insert(committed.pks.get_tuple(i), out.len());
-            gather.take(&mut committed, i, &mut out);
+            gather.copy(&committed, i, &mut out);
         }
     }
     Ok((out, index))
@@ -100,24 +100,26 @@ fn fetch_committed(
     schema: &Arc<Schema>,
     keys: &[PkTuple],
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    // `PkSet` ships each key as the 16 raw LE bytes `split_wire` hands out, and
-    // `opk_key` encodes a packed key of any arity — so the wire's scalar width,
-    // not the PK's column count, is what bounds the batched form.
+    // `PkSet` ships each key in the wire's **native** key space, and `opk_key`
+    // encodes a packed key of any arity — so the wire's scalar width, not the
+    // PK's column count, is what bounds the batched form.
     if schema.pk_stride() <= gnitz_wire::NARROW_PK_MAX_BYTES {
         // No WHERE behind it, so nothing is residual and no predicate ships: the
         // gather is the whole selection. ON CONFLICT needs the committed rows for
         // a key set it already holds, so it takes this bound directly rather than
         // re-deriving it from a synthetic `pk IN (…)`.
-        let keys = keys.iter().map(|k| k.split_wire().0).collect();
+        let keys = keys.iter().map(|k| k.to_native_packed(schema)).collect();
         let plan = AccessPlan::new(ReadBound::PkSet(keys), &[], Vec::new(), schema)?;
         return fetch_bound(client, tid, &plan.access, &ReadSink::all_rows(), schema);
     }
     let gather = RowGather::new(schema);
     let mut out = ZSetBatch::with_capacity(schema, keys.len());
     for pk in keys {
-        if let Some(mut b) = client.seek(tid, pk)?.1.filter(|b| !b.pks.is_empty()) {
+        let native = pk.native_le(schema);
+        let (low, extra) = gnitz_wire::control::split_ctrl_key(&native[..schema.pk_stride()]);
+        if let Some(b) = client.seek(tid, low, extra)?.1.filter(|b| !b.pks.is_empty()) {
             for i in 0..b.len() {
-                gather.take(&mut b, i, &mut out);
+                gather.copy(&b, i, &mut out);
             }
         }
     }

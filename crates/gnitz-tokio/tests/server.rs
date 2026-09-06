@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use gnitz_core::{ColData, ColumnDef, GnitzClient, PkColumn, PkTuple, Schema, TableProps, TypeCode, ZSetBatch};
+use gnitz_core::{ColumnDef, GnitzClient, PkColumn, Schema, TableProps, TypeCode, ZSetBatch};
 use gnitz_mirror::Mirror;
 use gnitz_test_harness::{strace_test, unique_schema, ServerHandle};
 use tokio::runtime::Runtime;
@@ -35,16 +35,23 @@ fn table(target: &str) -> (GnitzClient, u64, Arc<Schema>, String) {
     (client, tid, schema, sn)
 }
 
+/// The fixture table's schema, built locally — the batch builders below need it
+/// to encode a key, and `table()`'s copy comes back from the server.
+fn local_schema() -> Schema {
+    Schema { columns: cols(), pk_cols: vec![0] }
+}
+
 fn rows(start: i64, count: usize) -> ZSetBatch {
     let mut a = Vec::with_capacity(count * 8);
     for i in 0..count as i64 {
         a.extend_from_slice(&((start + i) * 3).to_le_bytes());
     }
     ZSetBatch {
-        pks: PkColumn::from_u128s(8, (0..count as i64).map(|i| (start + i) as u128)),
+        pks: PkColumn::from_natives(&local_schema(), (0..count as i64).map(|i| (start + i) as u128)),
         weights: vec![1; count],
         nulls: vec![0; count],
-        columns: vec![ColData::Fixed(vec![]), ColData::Fixed(a)],
+        columns: vec![vec![], a],
+        blob: vec![],
     }
 }
 
@@ -130,7 +137,7 @@ fn cloned_handles_across_tasks_each_get_their_own_result() {
     // Every read verb, and a seek whose row is its own.
     let (_, batch, _) = rt.block_on(client.scan(tid)).unwrap();
     assert_eq!(batch.map_or(0, |b| b.len()), n * 10);
-    let (_, row, _) = rt.block_on(client.seek(tid, PkTuple::from_u128_narrow(7))).unwrap();
+    let (_, row, _) = rt.block_on(client.seek(tid, 7, &[])).unwrap();
     assert_eq!(row.map_or(0, |b| b.len()), 1);
     let many = rt.block_on(client.scan_many(&[tid, tid])).unwrap_err();
     assert!(
@@ -259,7 +266,7 @@ fn weights(batch: &Option<ZSetBatch>) -> std::collections::BTreeMap<u64, i64> {
     let mut out = std::collections::BTreeMap::new();
     let Some(b) = batch else { return out };
     for row in 0..b.weights.len() {
-        let pk = u64::from_le_bytes(b.pks.buf[row * 8..row * 8 + 8].try_into().unwrap());
+        let pk = b.pks.get(&local_schema(), row) as u64;
         *out.entry(pk).or_insert(0) += b.weights[row];
     }
     out.retain(|_, w| *w != 0);

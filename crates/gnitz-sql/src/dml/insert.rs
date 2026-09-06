@@ -21,8 +21,9 @@ use crate::exec::batch::{project, resolve_projection, RowGather};
 use crate::ir::BoundExpr;
 use crate::validate::reject_unhonored_insert_clauses;
 use crate::SqlResult;
-use gnitz_core::null_word_set;
-use gnitz_core::{FixedInt, GnitzClient, PkTuple, RelClass, Schema, ViewBuffers, WireConflictMode, ZSetBatch};
+use gnitz_core::{
+    push_zero_cell, FixedInt, GnitzClient, PkTuple, RelClass, Schema, WireConflictMode, ZSetBatch, ZSetBatchView,
+};
 use sqlparser::ast::{
     Assignment, ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query,
     SelectItem, SetExpr, TableObject, Values,
@@ -70,16 +71,14 @@ fn validate_conflict_target(target: &Option<ConflictTarget>, schema: &Schema) ->
         Some(ConflictTarget::Columns(cols)) => {
             // Partial-tuple targets like `ON CONFLICT (a) DO NOTHING`
             // against `PRIMARY KEY (a, b)` are out of scope for the
-            // compound-PK planner gate. Reject before any
-            // `pk_index_single()` access so the assert turns into a
-            // clean SQL error.
-            if schema.pk_cols.len() >= 2 {
+            // compound-PK planner gate.
+            let Some(pk_ci) = schema.pk_index_single() else {
                 return Err(GnitzSqlError::Unsupported(
                     "ON CONFLICT with target columns is not supported on \
                      compound-PK tables"
                         .to_string(),
                 ));
-            }
+            };
             if cols.len() != 1 {
                 return Err(GnitzSqlError::Unsupported(
                     "composite ON CONFLICT targets not supported; \
@@ -88,7 +87,7 @@ fn validate_conflict_target(target: &Option<ConflictTarget>, schema: &Schema) ->
                 ));
             }
             let col_name = cols[0].value.as_str();
-            let pk_name = schema.columns[schema.pk_index_single()].name.as_str();
+            let pk_name = schema.columns[pk_ci as usize].name.as_str();
             if !col_name.eq_ignore_ascii_case(pk_name) {
                 return Err(GnitzSqlError::Unsupported(format!(
                     "ON CONFLICT ({col_name}) — only the primary key column '{pk_name}' is \
@@ -201,7 +200,6 @@ pub(crate) fn execute_insert(
             expected += 1;
         }
     }
-    let stride = schema.pk_stride() as u8;
     // Built once: `payload_columns` filters on `is_pk_col`, itself a PK-list scan,
     // so leaving it in the row loop pays that scan per row per column.
     let payload = merge_payload_plan(schema);
@@ -240,19 +238,19 @@ pub(crate) fn execute_insert(
                     "SERIAL primary key exhausted: next value {id} exceeds the column type maximum {max}"
                 )));
             }
-            batch.pks.push_tuple(&PkTuple::from_u128(stride, id as u128));
+            batch.pks.push_u128(schema, id as u128);
         } else {
             batch.pks.push_tuple(&extract_pk_value_mapped(row, &slot_of, schema)?);
         }
         batch.weights.push(1);
 
         let mut null_bits: u64 = 0;
-        for &(payload_idx, ci, col_def, _) in &payload {
+        for &(payload_idx, ci, col_def) in &payload {
             if col_def.is_hidden {
                 // Logical-dropped column: a zero-filled NOT-NULL filler cell (null
                 // bit left unset), keeping the batch rectangular and the table on
                 // the FixedIntNonnull comparator. The value is unobservable (§6).
-                batch.columns[ci].push_filler(col_def.type_code);
+                push_zero_cell(&mut batch.columns[ci], col_def.type_code);
                 continue;
             }
             let val_expr = &row[slot_of[ci].expect("a visible payload column has a user value")];
@@ -262,9 +260,10 @@ pub(crate) fn execute_insert(
             // boundary's own check.
             check_not_null(col_def, is_null)?;
             if is_null {
-                null_word_set(&mut null_bits, payload_idx, true);
+                gnitz_wire::null_word_set(&mut null_bits, payload_idx, true);
             }
-            append_value_to_col(&mut batch.columns[ci], col_def.type_code, val_expr)?;
+            let ZSetBatch { columns, blob, .. } = &mut batch;
+            append_value_to_col(&mut columns[ci], blob, col_def.type_code, val_expr)?;
         }
         batch.nulls.push(null_bits);
     }
@@ -479,13 +478,10 @@ fn client_side_merge_do_update(
     let mut out = ZSetBatch::with_capacity(schema, batch.pks.len());
     let gather = RowGather::new(schema);
 
-    // Two buffer sets, not one: each view holds its `&mut` for the whole loop, so
-    // a single set could not carry both. Both are built once: the resolved rows are
-    // one batch, so the `existing` view need not be rebuilt per row.
-    let mut bufs_excluded = ViewBuffers::default();
-    let mut bufs_existing = ViewBuffers::default();
-    let excluded_view = bufs_excluded.view(batch, schema);
-    let existing_view = bufs_existing.view(&rows, schema);
+    // Built once each: the resolved rows are one batch, so the `existing` view
+    // need not be rebuilt per row.
+    let excluded_view = ZSetBatchView::new(batch, schema);
+    let existing_view = ZSetBatchView::new(&rows, schema);
     // Each RHS is bound to its own scope's view here, which drives every
     // computed one over that whole batch once; the row loop below then reads a
     // buffer instead of paying a single-row drive's prologue per conflict.

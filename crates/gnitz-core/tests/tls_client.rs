@@ -25,12 +25,12 @@ fn send_control(
     client_id: u64,
     flags: u64,
 ) -> Result<(), gnitz_core::ProtocolError> {
-    t.send_framed(&encode_message_parts(target_id, client_id, flags, &PkTuple::EMPTY, 0, None).ctrl)
+    t.send_framed(&encode_message_parts(target_id, client_id, flags, 0, &[], 0, None).ctrl)
 }
 use gnitz_core::TableProps;
 use gnitz_core::{
-    wire_flags_set_conflict_mode, ColData, ColumnDef, GnitzClient, PkColumn, PkTuple, Schema, TypeCode,
-    WireConflictMode, ZSetBatch, FLAG_PUSH,
+    wire_flags_set_conflict_mode, ColumnDef, GnitzClient, PkColumn, Schema, TypeCode, WireConflictMode, ZSetBatch,
+    FLAG_PUSH,
 };
 use gnitz_test_harness::{unique_schema, ServerHandle};
 
@@ -62,7 +62,7 @@ fn send_push(
     schema: &Schema,
     batch: &ZSetBatch,
 ) -> Result<(), gnitz_core::protocol::ProtocolError> {
-    let parts = encode_message_parts(tid, client_id, flags, &PkTuple::EMPTY, 0, Some((schema, batch)));
+    let parts = encode_message_parts(tid, client_id, flags, 0, &[], 0, Some((schema, batch)));
     t.send_framed_iov(&parts.segments())
 }
 
@@ -75,25 +75,26 @@ fn make_batch(schema: &Schema, start: u64, count: usize) -> ZSetBatch {
         a.extend_from_slice(&((pk as i64) * 3).to_le_bytes());
         b.extend_from_slice(&7i64.to_le_bytes());
     }
-    let columns: Vec<ColData> = schema
+    let columns: Vec<Vec<u8>> = schema
         .columns
         .iter()
         .enumerate()
         .map(|(ci, _)| {
             if schema.is_pk_col(ci) {
-                ColData::Fixed(vec![])
+                vec![]
             } else if ci == 1 {
-                ColData::Fixed(a.clone())
+                a.clone()
             } else {
-                ColData::Fixed(b.clone())
+                b.clone()
             }
         })
         .collect();
     ZSetBatch {
-        pks: PkColumn::from_u128s(8, pks.into_iter().map(u128::from)),
+        pks: PkColumn::from_natives(schema, pks.into_iter().map(u128::from)),
         weights: vec![1i64; count],
         nulls: vec![0u64; count],
         columns,
+        blob: vec![],
     }
 }
 
@@ -247,11 +248,11 @@ fn push_scan_roundtrip_over_tls() {
     assert_eq!(batch.len(), 999, "1000 inserts − 1 retraction");
     assert!(batch.weights.iter().all(|&w| w == 1), "all net weights must be +1");
     // Spot-check payload integrity via a seek.
-    let (_, row, _) = client.seek(tid, &PkTuple::from_u128_narrow(123)).unwrap();
+    let (_, row, _) = client.seek(tid, 123, &[]).unwrap();
     let row = row.expect("seek must find pk=123");
-    match &row.columns[1] {
-        ColData::Fixed(bytes) => assert_eq!(i64::from_le_bytes(bytes[0..8].try_into().unwrap()), 369),
-        _ => panic!("expected Fixed column"),
+    {
+        let bytes = &row.columns[1];
+        assert_eq!(i64::from_le_bytes(bytes[0..8].try_into().unwrap()), 369);
     }
 }
 

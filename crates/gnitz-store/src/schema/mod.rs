@@ -948,9 +948,8 @@ pub fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaD
 /// told something false.
 pub fn make_delta_schema(view: &SchemaDescriptor) -> Option<SchemaDescriptor> {
     use gnitz_wire::DeltaCol;
-    let pk: Vec<usize> = view.pk_indices().iter().map(|&i| i as usize).collect();
     let mut b = DerivedSchema::new();
-    for c in gnitz_wire::delta_schema_order(&pk, view.num_columns()) {
+    for c in gnitz_wire::delta_schema_order(view.pk_indices(), view.num_columns()) {
         match c {
             DeltaCol::Tick => b.push_pk(SchemaColumn::new(type_code::U64, 0))?,
             DeltaCol::Key(i) => b.push_pk(view.columns[i])?,

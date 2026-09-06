@@ -31,7 +31,7 @@ use crate::protocol::ReplySchema;
 use crate::protocol::{
     encode_control_frame, encode_ddl_txn, encode_push_txn, encode_scan_multi, hello_handshake, parse_response_frame,
     wire_flags_get_schema_version, wire_flags_set_conflict_mode, wire_flags_set_schema_version, ClientTransport,
-    Message, PkTuple, ProtocolError, Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID,
+    FkTarget, Message, ProtocolError, Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID,
     FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_PUSH,
     FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_DELTA_EXPIRED, STATUS_ERROR, STATUS_NO_INDEX,
     STATUS_OK, STATUS_SAL_FULL, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
@@ -271,11 +271,9 @@ impl<'a> Request<'a> {
         }
     }
 
-    /// A point SEEK by primary key. `split_wire` routes the key's low bytes to
-    /// `seek_pk` and any overflow to `seek_pk_extra`, so no driver spells the
-    /// split itself.
-    pub fn seek(target_id: u64, pk: &'a PkTuple) -> Request<'a> {
-        let (seek_pk, seek_pk_extra) = pk.split_wire();
+    /// A point SEEK by primary key, already split by
+    /// `gnitz_wire::control::split_ctrl_key`.
+    pub fn seek(target_id: u64, seek_pk: u128, seek_pk_extra: &'a [u8]) -> Request<'a> {
         Request::Read {
             target_id,
             flags: FLAG_SEEK,
@@ -650,14 +648,7 @@ impl Session {
                         let flags = wire_flags_set_schema_version(base_flags, v);
                         encode_message_noschema_parts(target_id, client_id, flags, schema, batch)
                     }
-                    None => encode_message_parts(
-                        target_id,
-                        client_id,
-                        base_flags,
-                        &PkTuple::EMPTY,
-                        0,
-                        Some((schema, batch)),
-                    ),
+                    None => encode_message_parts(target_id, client_id, base_flags, 0, &[], 0, Some((schema, batch))),
                 };
                 (parts, SlotKind::Push { tid: target_id })
             }
@@ -685,11 +676,10 @@ impl Session {
                         col_indices.len()
                     )));
                 }
-                // `split_wire` routes slot 0 → seek_pk and the rest to
+                // `split_ctrl_key` routes slot 0 → seek_pk and the rest to
                 // seek_pk_extra; `unpack_index_key_slots` reassembles them.
                 let (kbuf, klen) = gnitz_wire::pack_index_key_slots(key_vals);
-                let key = PkTuple::from_bytes(&kbuf[..klen]);
-                let (seek_pk, seek_pk_extra) = key.split_wire();
+                let (seek_pk, seek_pk_extra) = gnitz_wire::control::split_ctrl_key(&kbuf[..klen]);
                 let flags = self.versioned_flags(table_id, FLAG_SEEK_BY_INDEX);
                 let ctrl = encode_control_frame(
                     table_id,
@@ -1082,8 +1072,8 @@ impl Session {
         self.round_trip(Request::ScanMulti(tids)).map(|r| r.into_multi())
     }
 
-    pub(crate) fn seek(&mut self, target_id: u64, pk: &PkTuple) -> ScanResult {
-        self.round_trip_scan(Request::seek(target_id, pk))
+    pub(crate) fn seek(&mut self, target_id: u64, pk: u128, pk_extra: &[u8]) -> ScanResult {
+        self.round_trip_scan(Request::seek(target_id, pk, pk_extra))
     }
 
     pub(crate) fn seek_by_index(&mut self, table_id: u64, col_indices: &[u32], key_vals: &[u128]) -> ScanResult {
@@ -1110,8 +1100,8 @@ impl Session {
 
     /// The RESOLVE request frame for `target`. The one place the wire's "name
     /// wins, else id" encoding is spelled: the name rides an explicit extra
-    /// blob rather than a `PkTuple`, whose `split_wire` would silently truncate
-    /// it past `MAX_PK_BYTES`.
+    /// blob rather than the seek-key channel, whose split would leave the first
+    /// 16 bytes in a `u128` field the server reads as a key.
     fn resolve_request(&self, target: RelTarget<'_>) -> Vec<u8> {
         let (target_id, qname) = match target {
             RelTarget::Name(q) => (0, q),
@@ -1228,8 +1218,7 @@ fn resolve_descriptor(train: ReplyTrain) -> Result<Option<(u64, Arc<Schema>, Rel
     if !desc.fks.is_empty() {
         let cols = &mut Arc::make_mut(&mut schema).columns;
         for fk in &desc.fks {
-            cols[fk.col_idx as usize].fk_table_id = fk.fk_table_id;
-            cols[fk.col_idx as usize].fk_col_idx = fk.fk_col_idx as u64;
+            cols[fk.col_idx as usize].fk = Some(FkTarget::Table { id: fk.fk_table_id, col: fk.fk_col_idx });
         }
     }
     Ok(Some((msg.target_id, schema, desc)))

@@ -19,8 +19,9 @@ use crate::pack_col_id;
 /// it as a no-op.
 pub trait SysRowSink {
     /// Begin a row keyed by `pk`: the family's PK columns in PK-list order, each
-    /// as its native value widened to `u128`. The sink packs them into its own
-    /// layout — big-endian OPK in the engine, little-endian on the wire.
+    /// as its native value widened to `u128`. Both sinks OPK-encode them into
+    /// the same PK region layout, so the client's block and the engine's are
+    /// byte-identical.
     fn begin_row(&mut self, pk: &[u128], weight: i64);
     fn put_u64(&mut self, v: u64);
     fn put_string(&mut self, s: &str);
@@ -55,9 +56,8 @@ pub fn write_schema_tab_row(sink: &mut impl SysRowSink, r: &SchemaTabRow, weight
 
 /// One `COL_TAB` row: column `col_idx` of the table or view `owner_id`.
 ///
-/// `fk_table_id` is the **resolved** parent id — the client's
-/// `SELF_FK_TABLE_ID` placeholder is a client-side policy and is substituted
-/// before a row reaches here.
+/// `fk_table_id` is the **resolved** parent id; `0` means "no FK". A client's
+/// deferred self-reference is substituted before a row reaches here.
 pub struct ColTabRow<'a> {
     pub owner_id: u64,
     pub owner_kind: u64,

@@ -96,7 +96,7 @@ fn descriptor_to_client_schema(sd: &SchemaDescriptor) -> gnitz_core::protocol::t
             )
         })
         .collect();
-    let pk_cols = sd.pk_indices().iter().map(|&i| i as usize).collect();
+    let pk_cols = sd.pk_indices().to_vec();
     Schema { columns, pk_cols }
 }
 
@@ -226,7 +226,11 @@ fn ddl_txn_roundtrip_client_to_server() {
                     "weight row {i} tid {got_tid}"
                 );
                 if check_pk[fi] {
-                    assert_eq!(batch.get_pk(i), exp_batch.pks.get(i), "pk row {i} tid {got_tid}");
+                    assert_eq!(
+                        batch.get_pk(i),
+                        exp_batch.pks.get(gnitz_core::types::sys_schema(*exp_tid), i),
+                        "pk row {i} tid {got_tid}"
+                    );
                 }
             }
         }

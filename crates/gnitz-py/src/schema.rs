@@ -65,9 +65,12 @@ fn py_col_to_rust(py: Python<'_>, c: &PyColumnDef) -> PyResult<ColumnDef> {
     let name = c.name.bind(py).to_cow()?.into_owned();
     type_code_from_u64(c.type_code as u64)
         .map(|tc| {
-            let mut cd = ColumnDef::new(name, tc, c.is_nullable);
-            cd.is_hidden = c.is_hidden;
-            cd
+            let cd = ColumnDef::new(name, tc, c.is_nullable);
+            if c.is_hidden {
+                cd.hidden()
+            } else {
+                cd
+            }
         })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
@@ -100,7 +103,7 @@ pub struct PySchema {
 impl PySchema {
     #[new]
     #[pyo3(signature = (columns, pk_indices = None))]
-    pub fn new(columns: Bound<'_, PyList>, pk_indices: Option<Vec<usize>>) -> PyResult<Self> {
+    pub fn new(columns: Bound<'_, PyList>, pk_indices: Option<Vec<u32>>) -> PyResult<Self> {
         if columns.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "Schema must have at least 1 column",
@@ -113,7 +116,7 @@ impl PySchema {
         for (i, item) in columns.iter().enumerate() {
             let c: PyRef<'_, PyColumnDef> = item.extract()?;
             if c.primary_key {
-                flagged.push(i);
+                flagged.push(i as u32);
             }
             cols.push(py_col_to_rust(columns.py(), &c)?);
         }
@@ -134,14 +137,14 @@ impl PySchema {
     }
 
     #[getter]
-    pub fn pk_indices(&self) -> Vec<usize> {
-        self.rust.pk_indices().to_vec()
+    pub fn pk_indices(&self) -> Vec<u32> {
+        self.rust.pk_cols.to_vec()
     }
 
     pub fn __repr__(&self) -> String {
         format!(
             "Schema(pk_indices={:?}, ncols={})",
-            self.rust.pk_indices(),
+            self.rust.pk_cols,
             self.rust.columns.len()
         )
     }

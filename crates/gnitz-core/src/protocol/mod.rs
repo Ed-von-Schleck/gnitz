@@ -32,10 +32,10 @@ pub use message::{
     encode_scan_multi, Message, MessageParts,
 };
 pub(crate) use message::{encode_control_frame, parse_response_frame};
-pub use regions::{ViewBuffers, ZSetBatchView};
+pub use regions::ZSetBatchView;
 pub use transport::{hello_handshake, ClientTransport};
 pub use types::{
-    null_word_get, null_word_set, BatchAppender, ColData, ColumnDef, FixedInt, PkColumn, PkTuple, ScalarKind, Schema,
-    TypeCode, ZSetBatch, MAX_PK_BYTES, PK_LIST_MAX_COLS,
+    push_zero_cell, BatchAppender, ColumnDef, FixedInt, FkTarget, PkColumn, PkTuple, ScalarKind, Schema, TypeCode,
+    ZSetBatch, MAX_PK_BYTES, PK_LIST_MAX_COLS,
 };
 pub use wal_block::decode_wal_block;

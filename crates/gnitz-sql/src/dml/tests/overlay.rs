@@ -1,15 +1,16 @@
 use super::*;
 use crate::test_support::two_col;
-use gnitz_core::{ColData, PkColumn, TxnBuffer, TypeCode, WireConflictMode};
+use gnitz_core::{PkColumn, TxnBuffer, TypeCode, WireConflictMode};
 
 /// (pk U64 PK, val I64) rows as (pk, val, weight).
 fn batch(schema: &Schema, rows: &[(u128, i64, i64)]) -> ZSetBatch {
     let mut b = ZSetBatch::new(schema);
     for &(pk, val, w) in rows {
-        b.pks.push_u128(pk);
+        b.pks.push_u128(schema, pk);
         b.weights.push(w);
         b.nulls.push(0);
-        if let ColData::Fixed(buf) = &mut b.columns[1] {
+        {
+            let buf = &mut b.columns[1];
             buf.extend_from_slice(&val.to_le_bytes());
         }
     }
@@ -18,7 +19,7 @@ fn batch(schema: &Schema, rows: &[(u128, i64, i64)]) -> ZSetBatch {
 
 /// A one-PK retraction batch — what a buffered DELETE is.
 fn del(schema: &Schema, pk: u128) -> ZSetBatch {
-    gnitz_core::retraction_batch(schema, PkColumn::from_u128s(8, [pk]))
+    gnitz_core::retraction_batch(schema, PkColumn::from_natives(schema, [pk]))
 }
 
 /// The full net map, straight off a buffer (the client-free half of
@@ -31,29 +32,29 @@ fn net_of(buf: &mut TxnBuffer, tid: u64) -> Net<'_> {
 }
 
 fn val_of(net: &Net, pk: u128) -> Option<i64> {
-    match net.get(&PkTuple::from_u128(8, pk)) {
-        Some(Buffered::Present(batch, row)) => match &batch.columns[1] {
-            ColData::Fixed(buf) => {
-                let o = row * 8;
-                Some(i64::from_le_bytes(buf[o..o + 8].try_into().unwrap()))
-            }
-            _ => None,
-        },
+    match net.get(&key(pk)) {
+        Some(Buffered::Present(batch, row)) => {
+            let o = row * 8;
+            Some(i64::from_le_bytes(batch.columns[1][o..o + 8].try_into().unwrap()))
+        }
         _ => None,
     }
 }
 
 fn is_deleted(net: &Net, pk: u128) -> bool {
-    matches!(net.get(&PkTuple::from_u128(8, pk)), Some(Buffered::Deleted))
+    matches!(net.get(&key(pk)), Some(Buffered::Deleted))
+}
+
+/// The identity key for `pk` under [`two_col`]'s single U64 PK.
+fn key(pk: u128) -> PkTuple {
+    PkTuple::from_native_packed(&two_col(TypeCode::I64), pk)
 }
 
 fn rows_of(b: &ZSetBatch) -> Vec<(u128, i64)> {
     let mut out: Vec<(u128, i64)> = (0..b.len())
         .map(|i| {
-            let pk = b.pks.get(i);
-            let val = b.columns[1]
-                .cell(i, 8)
-                .map_or(0, |c| i64::from_le_bytes(c.try_into().unwrap()));
+            let pk = b.pks.get(&two_col(TypeCode::I64), i);
+            let val = b.cell(1, i, 8).map_or(0, |c| i64::from_le_bytes(c.try_into().unwrap()));
             (pk, val)
         })
         .collect();
@@ -111,8 +112,8 @@ fn net_scopes_by_tid_and_skips_zero_weight() {
     let net1 = net_of(&mut buf, 1);
     assert_eq!(net1.len(), 1);
     assert_eq!(val_of(&net1, 1), Some(10));
-    assert!(!net1.contains_key(&PkTuple::from_u128(8, 3)), "w=0 row skipped");
-    assert!(!net1.contains_key(&PkTuple::from_u128(8, 2)), "other tid excluded");
+    assert!(!net1.contains_key(&key(3)), "w=0 row skipped");
+    assert!(!net1.contains_key(&key(2)), "other tid excluded");
 }
 
 #[test]
@@ -152,7 +153,7 @@ fn net_restricted_to_keys_excludes_untouched_and_unlisted() {
     // to [1] leaves pk=2's buffered row out of the candidates entirely.
     let full_len = net_of(&mut buf, tid).len();
     let reads = buf.reads(tid);
-    let only_1: Net = [PkTuple::from_u128(8, 1)]
+    let only_1: Net = [key(1)]
         .iter()
         .filter_map(|pk| reads.last_op(pk).map(|(b, r)| (*pk, op_of(b, r))))
         .collect();

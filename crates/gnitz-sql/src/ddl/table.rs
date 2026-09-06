@@ -11,7 +11,7 @@ use crate::validate::{
     reject_unhonored_table_constraints, validate_user_name, ColumnOptionSite,
 };
 use crate::SqlResult;
-use gnitz_core::{ColumnDef, GnitzClient, IndexMeta, InlineUniqueIndex, TableProps, TypeCode};
+use gnitz_core::{ColumnDef, FkTarget, GnitzClient, IndexMeta, InlineUniqueIndex, TableProps, TypeCode};
 use sqlparser::ast::{
     ColumnOption, CreateTableOptions, Expr, ForeignKeyConstraint, ObjectType, PrimaryKeyConstraint, TableConstraint,
     UniqueConstraint, Value, ValueWithSpan, WrappedCollection,
@@ -150,17 +150,14 @@ fn resolve_referred_column(
 
 /// Resolve a self-referencing FK against the in-flight column list (the table
 /// is not yet registered in the catalog). The referenced column must be the
-/// table's lone PK column, and may not be `fk_col_idx` itself. Returns
-/// [`ColumnDef::SELF_FK_TABLE_ID`] as the table id: the planner cannot name an
-/// id that is allocated only when the table is created, so it marks the column
-/// and the `COL_TAB` writer rewrites the marker to the owner id.
+/// table's lone PK column, and may not be `fk_col_idx` itself.
 fn resolve_fk_target_inline(
     current_cols: &[ColumnDef],
     current_pk_cols: &[u32],
     ref_table: &str,
     referred_columns: &[sqlparser::ast::Ident],
     fk_col_idx: usize,
-) -> Result<(u64, u64, TypeCode), GnitzSqlError> {
+) -> Result<(FkTarget, TypeCode), GnitzSqlError> {
     let pk_single = (current_pk_cols.len() == 1).then(|| current_pk_cols[0] as usize);
     let ref_col_idx = resolve_referred_column(referred_columns, ref_table, current_cols, pk_single)?;
 
@@ -186,10 +183,10 @@ fn resolve_fk_target_inline(
 
     let parent_col_type = current_cols[ref_col_idx].type_code;
     check_fk_type_compat(current_cols[fk_col_idx].type_code, parent_col_type)?;
-    Ok((ColumnDef::SELF_FK_TABLE_ID, ref_col_idx as u64, parent_col_type))
+    Ok((FkTarget::SelfTable { col: ref_col_idx as u32 }, parent_col_type))
 }
 
-/// Resolve a REFERENCES clause to (fk_table_id, ref_col_idx, parent_col_type).
+/// Resolve a REFERENCES clause to its target and the parent column's type.
 /// The referenced column is a legal target iff it is the parent's lone PK
 /// column or it carries its own active UNIQUE index. Validates that
 /// fk_col_type is compatible with the referenced column type and returns that
@@ -204,7 +201,7 @@ fn resolve_fk_target(
     current_table_name: &str,
     current_cols: &[ColumnDef],
     current_pk_cols: &[u32],
-) -> Result<(u64, u64, TypeCode), GnitzSqlError> {
+) -> Result<(FkTarget, TypeCode), GnitzSqlError> {
     let ref_table = extract_name(foreign_table, "REFERENCES")?;
 
     // Self-referencing FK: the table being created is not yet in the catalog,
@@ -231,7 +228,7 @@ fn resolve_fk_target(
     }
     let ref_tid = ref_rel.tid;
 
-    let pk_single = (ref_schema.pk_count() == 1).then(|| ref_schema.pk_index_single());
+    let pk_single = ref_schema.pk_index_single().map(|c| c as usize);
     let ref_col_idx = resolve_referred_column(referred_columns, &ref_table, &ref_schema.columns, pk_single)?;
 
     // Legal target iff the referenced column is the parent's lone PK, or it
@@ -253,7 +250,10 @@ fn resolve_fk_target(
     let parent_col_type = ref_schema.columns[ref_col_idx].type_code;
     check_fk_type_compat(current_cols[fk_col_idx].type_code, parent_col_type)?;
 
-    Ok((ref_tid, ref_col_idx as u64, parent_col_type))
+    Ok((
+        FkTarget::Table { id: ref_tid, col: ref_col_idx as u32 },
+        parent_col_type,
+    ))
 }
 
 /// The boolean properties of `CREATE TABLE … WITH (…)`. `dist_prefix_len` is left
@@ -422,7 +422,7 @@ pub(crate) fn execute_create_table(
     }
 
     for (col_idx, foreign_table, referred_columns) in fk_sites {
-        let (tid, idx, parent_pk_type) = resolve_fk_target(
+        let (fk, parent_pk_type) = resolve_fk_target(
             client,
             schema_name,
             foreign_table,
@@ -432,8 +432,7 @@ pub(crate) fn execute_create_table(
             &cols,
             &pk_indices,
         )?;
-        cols[col_idx].fk_table_id = tid;
-        cols[col_idx].fk_col_idx = idx;
+        cols[col_idx].fk = Some(fk);
         cols[col_idx].type_code = parent_pk_type;
     }
 

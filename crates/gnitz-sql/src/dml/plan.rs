@@ -120,9 +120,8 @@ impl<'e> AccessPlan<'e> {
     /// inside an open transaction asks, and a max-size gather is megabytes of
     /// `PkTuple`.
     pub(crate) fn buffered_scope(&self, schema: &Schema) -> (Option<Vec<PkTuple>>, &[&'e BoundExpr]) {
-        let stride = schema.pk_stride() as u8;
         let keys = match &self.access.bound {
-            ReadBound::PkSet(keys) => Some(keys.iter().map(|&k| PkTuple::from_u128(stride, k)).collect()),
+            ReadBound::PkSet(keys) => Some(keys.iter().map(|&k| PkTuple::from_native_packed(schema, k)).collect()),
             ReadBound::PkRange(desc) => pk_point_tuple(desc, schema).map(|k| vec![k]),
             _ => None,
         };
@@ -292,7 +291,7 @@ pub(crate) fn fetch_bound(
         let blob = access.encode(bound, sink);
         if let Some(batch) = client.scan_spec_local_first(table_id, &blob, reply_schema)? {
             match out.as_mut() {
-                Some(acc) => acc.extend_from_owned(batch),
+                Some(acc) => acc.extend_from_owned(batch, reply_schema),
                 None => out = Some(batch),
             }
         }

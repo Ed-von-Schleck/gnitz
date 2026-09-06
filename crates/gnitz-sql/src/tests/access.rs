@@ -149,9 +149,10 @@ fn pk_point_of<'e>(conjuncts: &'e [BoundExpr], schema: &Schema) -> Option<(PkTup
 #[test]
 fn a_compound_pk_point_names_a_key_only_when_every_column_binds() {
     let schema = compound_schema_u64_u64();
+    // OPK: each unsigned column big-endian, at its pk-list offset.
     let mut key_1_2 = [0u8; 16];
-    key_1_2[..8].copy_from_slice(&1u64.to_le_bytes());
-    key_1_2[8..16].copy_from_slice(&2u64.to_le_bytes());
+    key_1_2[..8].copy_from_slice(&1u64.to_be_bytes());
+    key_1_2[8..16].copy_from_slice(&2u64.to_be_bytes());
 
     for (sql, want_residual) in [
         ("a = 1 AND b = 2", 0),
@@ -161,7 +162,7 @@ fn a_compound_pk_point_names_a_key_only_when_every_column_binds() {
     ] {
         let expr = bind_where(sql, &schema);
         let (pk, residual) = pk_point_of(&expr, &schema).unwrap_or_else(|| panic!("{sql}: must bind"));
-        assert_eq!(pk.stride, 16, "{sql}");
+        assert_eq!(pk.stride(), 16, "{sql}");
         assert_eq!(pk.as_bytes(), &key_1_2[..], "{sql}");
         assert_eq!(residual.len(), want_residual, "{sql}: residual");
     }
@@ -183,25 +184,26 @@ fn a_compound_pk_point_names_a_key_only_when_every_column_binds() {
 /// A single-column PK: the equality and the degenerate two-sided range reach
 /// the same `(Before(v), After(v))` cuts through `bound_next_column`, so they
 /// name the same key byte for byte and both consume every conjunct. An open
-/// range names no key. A qualified reference takes the same path.
+/// range names no key. A qualified reference takes the same path. The key is
+/// the OPK image, which for an unsigned column is plain big-endian.
 #[test]
 fn a_single_pk_point_is_the_same_key_however_it_is_spelled() {
     let schema = pk_schema(TypeCode::U64);
     for sql in ["id = 5", "id >= 5 AND id <= 5"] {
         let expr = bind_where(sql, &schema);
         let (pk, residual) = pk_point_of(&expr, &schema).unwrap_or_else(|| panic!("{sql}: must bind"));
-        assert_eq!(pk.as_bytes(), &5u64.to_le_bytes()[..], "{sql}");
+        assert_eq!(pk.as_bytes(), &5u64.to_be_bytes()[..], "{sql}");
         assert!(residual.is_empty(), "{sql}: every conjunct is consumed by the walk");
     }
     let with_payload = bind_where("id = 1 AND v = 9", &schema);
     let (pk, residual) = pk_point_of(&with_payload, &schema).expect("PK binds");
-    assert_eq!(pk.as_bytes(), &1u64.to_le_bytes()[..]);
+    assert_eq!(pk.as_bytes(), &1u64.to_be_bytes()[..]);
     assert_eq!(residual.len(), 1, "the non-PK conjunct rides the residual");
     assert!(pk_point_of(&bind_where("id > 5", &schema), &schema).is_none());
 
     let qualified = bind_where("t.id = 1", &schema);
     let (pk, residual) = pk_point_of(&qualified, &schema).expect("a qualified PK binds");
-    assert_eq!(pk.as_bytes(), &1u64.to_le_bytes()[..]);
+    assert_eq!(pk.as_bytes(), &1u64.to_be_bytes()[..]);
     assert!(residual.is_empty());
 }
 
@@ -394,7 +396,7 @@ fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
     // 1. extract_pk_value (INSERT row) — pk_codec, AST-based.
     let row = vec![literal.clone(), num_expr("0")];
     let got_insert = extract_pk_value(&row, &schema).unwrap_or_else(|e| panic!("extract_pk_value({pk_tc:?}): {e}"));
-    assert_eq!(got_insert.split_wire().0, expected, "extract_pk_value");
+    assert_eq!(got_insert.to_native_packed(&schema), expected, "extract_pk_value");
 
     // 2. try_col_eq_literal (bound WHERE pk = literal).
     let eq = bind1(&eq_expr("id", literal.clone()), &schema).expect("bind eq");

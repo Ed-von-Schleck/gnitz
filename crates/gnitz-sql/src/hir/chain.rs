@@ -102,7 +102,7 @@ pub(crate) fn debug_assert_exchange_topology(circuit: &Circuit) {
 /// them to the DDL gateway — whose verdict is identical but names only a segment
 /// index, and which the ad-hoc fold's pre-map never reaches.
 pub(crate) fn schema_of(cols: &[ColumnDef], pk: PkArity, what: &str) -> Result<Arc<Schema>, GnitzSqlError> {
-    Schema::from_parts(cols.to_vec(), (0..pk).collect())
+    Schema::from_parts(cols.to_vec(), (0..pk as u32).collect())
         .map(Arc::new)
         .map_err(|e| GnitzSqlError::Unsupported(format!("{what}: {e}")))
 }

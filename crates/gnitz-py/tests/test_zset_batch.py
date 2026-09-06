@@ -656,6 +656,45 @@ class TestValueCoercion:
         batch.append(pk=1, payload=b"hello\x00world")
         assert batch.columns[1] == [b"hello\x00world"]
 
+    def test_a_str_is_refused_by_a_blob_column(self):
+        """BLOB takes bytes; `str` is not a BLOB literal. The column kinds share
+        one region form, so this is the guard that keeps them apart."""
+        schema = Schema([
+            ColumnDef("pk", TypeCode.U64, primary_key=True),
+            ColumnDef("payload", TypeCode.BLOB),
+        ])
+        batch = ZSetBatch(schema)
+        with pytest.raises(TypeError):
+            batch.append(pk=1, payload="not bytes")
+        assert len(batch) == 0
+
+    def test_bytes_are_refused_by_a_string_column(self):
+        """A STRING column's region carries bytes, so nothing downstream would
+        reject non-UTF-8 — the extraction here is where TEXT stays text."""
+        schema = Schema([
+            ColumnDef("pk", TypeCode.U64, primary_key=True),
+            ColumnDef("s", TypeCode.STRING),
+        ])
+        batch = ZSetBatch(schema)
+        with pytest.raises(TypeError):
+            batch.append(pk=1, s=b"\xff\xfe not utf-8")
+        assert len(batch) == 0
+
+    def test_a_sql_string_literal_is_refused_by_a_blob_column(self, client):
+        """`sql_type_to_typecode` names no BLOB, but the driver creates BLOB
+        columns freely and SQL can then INSERT into them — so the INSERT literal
+        path must refuse text for a column that takes bytes."""
+        sn = "zb" + _uid()
+        client.create_schema(sn)
+        try:
+            cols = [ColumnDef("pk", TypeCode.U64, primary_key=True),
+                    ColumnDef("b", TypeCode.BLOB)]
+            client.create_table(sn, "t", cols)
+            with pytest.raises(Exception, match="string literal for non-string column"):
+                client.execute_sql("INSERT INTO t (pk, b) VALUES (1, 'x')", schema_name=sn)
+        finally:
+            _cleanup(client, sn, "t")
+
     def test_compound_pk_emits_packed_bytes(self):
         batch = ZSetBatch(self._compound_schema())
         batch.append(a=7, b=9, v=100)

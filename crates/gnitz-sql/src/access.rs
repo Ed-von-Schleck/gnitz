@@ -71,7 +71,7 @@ fn pk_in_keys(conjunct: &BoundExpr, schema: &Schema) -> Option<Vec<u128>> {
     let BExpr::ColRef(col_idx) = inner.as_ref() else {
         return None;
     };
-    let pk_idx = schema.pk_indices()[0];
+    let pk_idx = schema.pk_cols[0] as usize;
     if *col_idx != pk_idx {
         return None;
     }
@@ -135,8 +135,7 @@ pub(crate) fn try_extract_pk_range<'e>(
     let eqs = collect_eq_conjuncts(conjuncts, schema);
     let ends = collect_range_ends(conjuncts, schema);
 
-    let pk_cols: Vec<u32> = schema.pk_indices().iter().map(|&c| c as u32).collect();
-    let (desc, consumed) = bound_column_list(&pk_cols, &eqs, &ends, schema)?;
+    let (desc, consumed) = bound_column_list(&schema.pk_cols, &eqs, &ends, schema)?;
     Some((desc, residual_conjuncts(conjuncts, &consumed)))
 }
 

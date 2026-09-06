@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 use pyo3::Borrowed;
 
-use gnitz_core::{null_word_set, ColData, PkColumn, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{push_zero_cell, PkColumn, Schema, TypeCode, ZSetBatch};
 
 use crate::read::{pk_column_to_pylist, rust_batch_columns_to_py};
 use crate::schema::resolve_py_schema;
@@ -27,12 +27,11 @@ use crate::schema::resolve_py_schema;
 pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyResult<PkColumn> {
     let stride = schema.pk_stride();
     let mut pk_col = PkColumn::empty_for_schema(schema);
-    pk_col.buf.reserve(pks.len() * stride);
-    let single_pk = match schema.pk_indices() {
-        &[ci] => Some(&schema.columns[ci]),
-        _ => None,
-    };
+    pk_col.reserve(pks.len());
+    let single_pk = schema.pk_index_single().map(|ci| &schema.columns[ci as usize]);
+    let mut native = Vec::with_capacity(stride);
     for pk_val in pks {
+        native.clear();
         if let Ok(bytes) = pk_val.cast::<pyo3::types::PyBytes>() {
             let b = bytes.as_bytes();
             if b.len() != stride {
@@ -42,17 +41,18 @@ pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyR
                     stride
                 )));
             }
-            pk_col.push_bytes(b);
+            native.extend_from_slice(b);
         } else if let Some(col) = single_pk {
             if pk_val.is_none() {
                 return Err(not_nullable_err(&col.name));
             }
-            push_fixed_le(&mut pk_col.buf, col.type_code, pk_val)?;
+            push_fixed_le(&mut native, col.type_code, pk_val)?;
         } else {
             return Err(pyo3::exceptions::PyTypeError::new_err(
                 "a compound pk must be passed as packed bytes",
             ));
         }
+        pk_col.push_bytes(schema, &native);
     }
     Ok(pk_col)
 }
@@ -71,6 +71,9 @@ pub struct PyZSetBatch {
     weight_is_column: bool,
     /// The plan the last row was written through — see [`KwPlan`].
     kw_plan: Option<KwPlan>,
+    /// One row's PK columns packed native-LE, reused so the per-row append
+    /// allocates nothing.
+    pk_scratch: Vec<u8>,
 }
 
 impl PyZSetBatch {
@@ -82,26 +85,31 @@ impl PyZSetBatch {
     where
         F: FnOnce(&mut Self) -> PyResult<()>,
     {
-        // `weights` rather than `batch.len()`: the row count without the
-        // division a compound-PK `PkColumn::len` does.
-        let n = self.batch.weights.len();
+        let mark = self.batch.mark();
         match body(self) {
             Ok(()) => Ok(()),
             Err(e) => {
-                self.batch.truncate(n, self.schema.as_ref());
+                self.batch.rollback_to(mark, self.schema.as_ref());
                 Err(e)
             }
         }
     }
 }
 
-/// Append one non-null payload value. The variant is the column's own, so a
-/// cell always lands in the vector whose length the batch is checked against.
-fn push_column_value(col: &mut ColData, tc: TypeCode, val: &Bound<'_, PyAny>) -> PyResult<()> {
-    match col {
-        ColData::Strings(v) => v.push(Some(val.extract::<String>()?)),
-        ColData::Bytes(v) => v.push(Some(val.extract::<Vec<u8>>()?)),
-        ColData::Fixed(buf) => push_fixed_le(buf, tc, val)?,
+/// Append one non-null payload cell of type `tc`, spilling a German string into
+/// `blob`. STRING extracts a `str` and BLOB arbitrary bytes: the region carries
+/// both alike, so this extraction is where TEXT stays valid UTF-8.
+fn push_column_value(col: &mut Vec<u8>, blob: &mut Vec<u8>, tc: TypeCode, val: &Bound<'_, PyAny>) -> PyResult<()> {
+    match tc {
+        TypeCode::String => {
+            let s = val.extract::<String>()?;
+            col.extend_from_slice(&gnitz_wire::encode_german_string(s.as_bytes(), blob));
+        }
+        TypeCode::Blob => {
+            let b = val.extract::<Vec<u8>>()?;
+            col.extend_from_slice(&gnitz_wire::encode_german_string(&b, blob));
+        }
+        _ => push_fixed_le(col, tc, val)?,
     }
     Ok(())
 }
@@ -234,8 +242,9 @@ fn build_kw_plan(schema: &Schema, weight_is_column: bool, kwnames: &Bound<'_, Py
     if let Some(i) = weight {
         consumed[i] = true;
     }
-    let mut pks = Vec::with_capacity(schema.pk_indices().len());
-    for &ci in schema.pk_indices() {
+    let mut pks = Vec::with_capacity(schema.pk_cols.len());
+    for &ci in &schema.pk_cols {
+        let ci = ci as usize;
         let Some(i) = kw_position(&names, &schema.columns[ci].name) else {
             return Err(missing_pk_err(schema, ci));
         };
@@ -293,7 +302,13 @@ impl PyZSetBatch {
         arg: impl Fn(usize) -> Borrowed<'a, 'py, PyAny>,
         default_weight: i64,
     ) -> PyResult<()> {
-        let PyZSetBatch { batch, schema, weight_is_column, kw_plan } = &mut *self;
+        let PyZSetBatch {
+            batch,
+            schema,
+            weight_is_column,
+            kw_plan,
+            pk_scratch,
+        } = &mut *self;
         let schema: &Schema = schema;
         let plan = match kw_plan {
             Some(p) if plan_hits(py, p, names, tuple) => p,
@@ -311,39 +326,46 @@ impl PyZSetBatch {
                 .map_err(|e| argument_extraction_error(py, WEIGHT_KW, e))?,
             None => default_weight,
         };
+        // Into the reused scratch first: a failed extraction must leave no
+        // half-written key behind.
+        pk_scratch.clear();
         for &PkPlan { pos, ci, tc } in &plan.pks {
             let v = arg(pos);
             if v.is_none() {
                 return Err(not_nullable_err(&schema.columns[ci].name));
             }
-            push_fixed_le(&mut batch.pks.buf, tc, &v)?;
+            push_fixed_le(pk_scratch, tc, &v)?;
         }
+        batch.pks.push_bytes(schema, pk_scratch);
         let mut nulls = 0u64;
         // `enumerate`, because the dense payload index is the null-bitmap bit
         // position.
         for (payload_idx, &PayloadPlan { ci, tc, nullable, src }) in plan.payload.iter().enumerate() {
             let v = match src {
                 PayloadSrc::Filler => {
-                    batch.columns[ci].push_filler(tc);
+                    push_zero_cell(&mut batch.columns[ci], tc);
                     continue;
                 }
                 PayloadSrc::Arg(i) => Some(arg(i)),
                 PayloadSrc::Absent => None,
             };
             match v {
-                Some(v) if !v.is_none() => push_column_value(&mut batch.columns[ci], tc, &v)?,
+                Some(v) if !v.is_none() => {
+                    let ZSetBatch { columns, blob, .. } = &mut *batch;
+                    push_column_value(&mut columns[ci], blob, tc, &v)?
+                }
                 _ => {
                     if !nullable {
                         return Err(not_nullable_err(&schema.columns[ci].name));
                     }
-                    null_word_set(&mut nulls, payload_idx, true);
-                    batch.columns[ci].push_null(tc);
+                    gnitz_wire::null_word_set(&mut nulls, payload_idx, true);
+                    push_zero_cell(&mut batch.columns[ci], tc);
                 }
             }
         }
         batch.weights.push(weight);
         batch.nulls.push(nulls);
-        debug_assert_eq!(batch.pks.buf.len(), batch.weights.len() * schema.pk_stride());
+        debug_assert_eq!(batch.pks.len(), batch.weights.len());
         Ok(())
     }
 
@@ -483,11 +505,13 @@ impl PyZSetBatch {
     pub fn new(#[pyo3(from_py_with = resolve_py_schema)] schema: Arc<Schema>) -> PyResult<Self> {
         let weight_is_column = schema.visible_columns().any(|(_, c)| c.name == WEIGHT_KW);
         let batch = ZSetBatch::new(&schema);
+        let pk_scratch = Vec::with_capacity(schema.pk_stride());
         Ok(PyZSetBatch {
             batch,
             weight_is_column,
             kw_plan: None,
             schema,
+            pk_scratch,
         })
     }
 
@@ -561,7 +585,7 @@ impl PyZSetBatch {
 /// A string is UUID text — canonical or bare 32-hex — and nothing else
 /// (`gnitz_wire::parse_uuid`, the crate that owns wire-value text). Which
 /// *columns* a string may be written to is not decided here: this function is
-/// also reached from the schema-less wire paths (`pk_tuple_from_py`,
+/// also reached from the schema-less wire paths (`pk_key_from_py`,
 /// `seek_by_index`), which have no type code to consult. The typed encoder
 /// [`push_fixed_le`] reaches it for UUID alone.
 pub(crate) fn extract_uuid_or_u128(val: &Bound<'_, PyAny>) -> PyResult<u128> {
@@ -621,23 +645,31 @@ fn push_fixed_le(buf: &mut Vec<u8>, tc: TypeCode, item: &Bound<'_, PyAny>) -> Py
     Ok(())
 }
 
-/// Build a `PkTuple` for the wire-only `seek` paths, which have no schema at the
-/// FFI boundary: `bytes` is taken verbatim, and an integer becomes a 16-byte
-/// tuple of which the server reads only the relation's own stride. That read is
-/// a truncation, not a range check: a key past the column's width seeks the
-/// low bytes. The signed fallback keeps a negative key packing to the same
+/// Split a Python seek key into the control block's `(seek_pk, seek_pk_extra)`
+/// pair. `bytes` is packed native-LE columns; an integer becomes a 16-byte key
+/// of which the server reads only the relation's own stride — a truncation, not
+/// a range check. The signed fallback keeps a negative key packing to the same
 /// two's-complement bytes the typed append path writes.
-pub(crate) fn pk_tuple_from_py(pk: &Bound<'_, PyAny>) -> PyResult<gnitz_core::PkTuple> {
+pub(crate) fn pk_key_from_py(pk: &Bound<'_, PyAny>) -> PyResult<(u128, Vec<u8>)> {
     // bytes first: `extract_uuid_or_u128` below falls through to
     // `getattr("int")`, which a bytes key would walk before failing.
     if let Ok(bytes) = pk.cast::<pyo3::types::PyBytes>() {
-        return gnitz_core::PkTuple::try_from_bytes(bytes.as_bytes()).map_err(pyo3::exceptions::PyValueError::new_err);
+        let b = bytes.as_bytes();
+        if b.is_empty() || b.len() > gnitz_core::MAX_PK_BYTES {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "packed pk must be 1..={} bytes, got {}",
+                gnitz_core::MAX_PK_BYTES,
+                b.len(),
+            )));
+        }
+        let (low, extra) = gnitz_wire::control::split_ctrl_key(b);
+        return Ok((low, extra.to_vec()));
     }
     // `i128` first, so a negative key does not build and discard an
     // `OverflowError` on the unsigned arm; a `U128` key above `i128::MAX`, a
     // `uuid.UUID` and UUID text all fall to the second.
     if let Ok(val) = pk.extract::<i128>() {
-        return Ok(gnitz_core::PkTuple::from_u128_narrow(val as u128));
+        return Ok((val as u128, Vec::new()));
     }
-    extract_uuid_or_u128(pk).map(gnitz_core::PkTuple::from_u128_narrow)
+    extract_uuid_or_u128(pk).map(|v| (v, Vec::new()))
 }

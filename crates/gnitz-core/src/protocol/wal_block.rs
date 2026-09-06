@@ -1,41 +1,10 @@
 //! WAL-block encode/decode for the client wire codec.
 
 use super::error::ProtocolError;
-use super::regions::ViewBuffers;
-use super::types::{null_word_get, ColData, Schema, TypeCode, ZSetBatch};
+use super::types::{Schema, ZSetBatch};
 use gnitz_wire::{REG_NULL_BMP, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
-
-/// Decode a STRING/BLOB column region into per-row raw-byte cells: `None` for
-/// a null row, else the German string resolved against `blob`. Shared by the
-/// STRING and BLOB decode arms (STRING then UTF-8-validates each cell).
-///
-/// `nulls` is *this block's* null words and nothing else — it is both the row
-/// count and the region index, so an over-long slice is a wrong count rather
-/// than a read past the block. `reg_off` is the region's directory offset,
-/// which the caller has checked covers `nulls.len() * 16` bytes.
-fn decode_german_col(
-    data: &[u8],
-    reg_off: usize,
-    blob: &[u8],
-    nulls: &[u64],
-    payload_idx: usize,
-) -> Result<Vec<Option<Vec<u8>>>, ProtocolError> {
-    let mut vals: Vec<Option<Vec<u8>>> = Vec::with_capacity(nulls.len());
-    for (row, &null_word) in nulls.iter().enumerate() {
-        if null_word_get(null_word, payload_idx) {
-            vals.push(None);
-            continue;
-        }
-        let struct_start = reg_off + row * 16;
-        let cell = &data[struct_start..struct_start + 16];
-        vals.push(Some(gnitz_wire::try_decode_german_string(cell, blob).ok_or_else(
-            || ProtocolError::DecodeError("German String blob arena out of bounds".into()),
-        )?));
-    }
-    Ok(vals)
-}
 
 // ── Region read helpers ───────────────────────────────────────────────────────
 
@@ -72,14 +41,14 @@ fn read_64bit_region_into<T: Copy>(
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Frame the batch's §6 region list ([`ViewBuffers::regions`]) into a WAL block.
+/// Frame the batch's §6 region list ([`super::regions::regions`]) into a WAL
+/// block.
 ///
 /// For a lone block. A transaction frame instead hands `gnitz-wire` the region
 /// lists and lets it frame each block into the frame itself, which is one copy
 /// rather than two.
 pub(crate) fn encode_wal_block(schema: &Schema, table_id: u32, batch: &ZSetBatch) -> Vec<u8> {
-    let mut bufs = ViewBuffers::default();
-    let regions = bufs.regions(batch, schema);
+    let regions = super::regions::regions(batch, schema);
     // Size the output to exactly one block, then frame in place, so encode never
     // returns BufferTooSmall. checksum = true: client frames always carry a body
     // checksum.
@@ -130,8 +99,8 @@ pub(crate) fn decode_wal_block_verified(data: &[u8], schema: &Schema) -> Result<
 }
 
 /// `sink` is a well-formed batch of `schema` and so can be appended to: same PK
-/// stride, same column count, and every payload slot carrying the variant its
-/// declared type calls for at the length its row count implies.
+/// stride, same column count, and every payload region at the length its
+/// declared type and row count imply.
 ///
 /// [`ZSetBatch::check_columns`] is the shared column rule, not a second spelling
 /// of it. Not the whole of [`ZSetBatch::validate`]: its NOT NULL sweep walks
@@ -139,11 +108,11 @@ pub(crate) fn decode_wal_block_verified(data: &[u8], schema: &Schema) -> Result<
 /// runs that check anyway.
 fn sink_matches(sink: &ZSetBatch, schema: &Schema) -> Result<(), ProtocolError> {
     let sink_err = |e: String| ProtocolError::DecodeError(format!("decode sink: {e}"));
-    if sink.pks.stride as usize != schema.pk_stride() {
+    if sink.pks.stride() as usize != schema.pk_stride() {
         return Err(sink_err(format!(
             "mismatched PK stride: expected {}, got {}",
             schema.pk_stride(),
-            sink.pks.stride
+            sink.pks.stride()
         )));
     }
     if sink.columns.len() != schema.num_columns() {
@@ -217,51 +186,23 @@ fn decode_wal_block_impl(
     // frame carries as many rows as a 64 MiB reply budget holds.
     sink.reserve(schema, count);
 
-    // The PK region at rest is OPK (order-preserving big-endian). Walk it back
-    // to the native LE bytes the in-memory `PkColumn` holds, so re-encoding the
-    // batch (which OPK-encodes assuming LE input) does not double-encode.
-    //
-    // Decoded in place: a per-row scratch plus an `extend_from_slice` of a
-    // runtime-length row compiles to a `call memcpy` per row. `decode_pk_column`
-    // writes through a `&mut [u8]`, so the rows are zeroed in one bulk memset
-    // first — cheaper than the memcpy it replaces, and the row loop overwrites
-    // every one of those bytes.
-    {
-        let col_info: Vec<(usize, u8)> = schema.pk_col_codes().collect();
-        let rows = super::regions::extend_zeroed(&mut sink.pks.buf, count * pk_stride);
-        // Per-row extent is dominated by the `pk_sz == count * pk_stride` check
-        // above plus the directory's `pk_off + pk_sz <= total_size`, so no
-        // per-row bounds check is needed on the source.
-        for row in 0..count {
-            let src = &data[pk_off + row * pk_stride..pk_off + (row + 1) * pk_stride];
-            let dst = &mut rows[row * pk_stride..(row + 1) * pk_stride];
-            let mut off = 0;
-            for &(cs, tc) in &col_info {
-                gnitz_wire::decode_pk_column(&src[off..off + cs], tc, &mut dst[off..off + cs]);
-                off += cs;
-            }
-        }
-    }
+    // A `PkColumn` holds the same OPK bytes the region carries, so the whole
+    // region moves in one copy — no per-row, per-column transcode.
+    sink.pks.push_region_bytes(&data[pk_off..pk_off + pk_sz]);
     read_64bit_region_into(&mut sink.weights, data, wt_off, wt_sz, count, "weights")?;
-    let nulls_base = sink.nulls.len();
     read_64bit_region_into(&mut sink.nulls, data, null_off, null_sz, count, "nulls")?;
 
-    // Blob region (always last)
+    // Blob region (always last). A German cell's heap offset is relative to the
+    // arena it was encoded against, so an appending decode shifts every cell of
+    // this block by where that arena lands in the sink's.
     let (blob_off, blob_sz) = dir(num_regions - 1);
-    let blob = if blob_sz > 0 {
-        &data[blob_off..blob_off + blob_sz]
-    } else {
-        &[]
-    };
+    let block_blob = &data[blob_off..blob_off + blob_sz];
+    let blob_base = sink.blob.len();
+    sink.blob.extend_from_slice(block_blob);
 
     // Read column regions. The payload iterator supplies the slot, so payload
     // slot `pi` ↔ region `REG_PAYLOAD_START + pi` is stated, not produced as a
-    // side effect of a counter; PK slots keep the empty `Fixed` placeholder
-    // `ZSetBatch::filler_columns` builds.
-    let ZSetBatch { nulls, columns, .. } = sink;
-    // This block's null words alone — `decode_german_col` derives its row count
-    // and its per-row region offset from them.
-    let nulls = &nulls[nulls_base..];
+    // side effect of a counter; PK slots keep their empty placeholder.
     for (pi, ci, col) in schema.payload_columns() {
         let (reg_off, reg_sz) = dir(REG_PAYLOAD_START + pi);
         // One width rule for every column kind: `wire_stride` is 16 for STRING,
@@ -272,32 +213,21 @@ fn decode_wal_block_impl(
                 "column {ci} region size mismatch: expected {expected_sz}, got {reg_sz}"
             )));
         }
-        match (&mut columns[ci], col.type_code) {
-            (ColData::Strings(dst), TypeCode::String) => {
-                // Raw German-string cells, then UTF-8-validate each into a String.
-                dst.reserve(count);
-                for cell in decode_german_col(data, reg_off, blob, nulls, pi)? {
-                    dst.push(match cell {
-                        None => None,
-                        Some(bytes) => Some(
-                            String::from_utf8(bytes)
-                                .map_err(|e| ProtocolError::DecodeError(format!("utf8 in German String: {e}")))?,
-                        ),
-                    });
+        let dst = &mut sink.columns[ci];
+        let at = dst.len();
+        dst.extend_from_slice(&data[reg_off..reg_off + reg_sz]);
+        if gnitz_wire::is_german_string(col.type_code as u8) {
+            for cell in dst[at..].chunks_exact_mut(16) {
+                // The cells arrive verbatim, so this is where a heap extent that
+                // overruns the arena — or a padding/prefix skew that would order
+                // two equal values unequal — is stopped, exactly as the engine's
+                // own passthrough decode stops it.
+                if !gnitz_wire::german_string_cell_ok(cell, block_blob) {
+                    return Err(ProtocolError::DecodeError(format!(
+                        "column {ci}: German string cell is not in canonical form"
+                    )));
                 }
-            }
-            (ColData::Bytes(dst), TypeCode::Blob) => {
-                dst.extend(decode_german_col(data, reg_off, blob, nulls, pi)?);
-            }
-            (ColData::Fixed(dst), _) => dst.extend_from_slice(&data[reg_off..reg_off + reg_sz]),
-            // `sink_matches` already paired every payload slot with its declared
-            // type; an error rather than a panic because the sink is reached
-            // from the wire.
-            _ => {
-                return Err(ProtocolError::DecodeError(format!(
-                    "decode sink: column {ci}: ColData variant contradicts schema type {:?}",
-                    col.type_code
-                )))
+                gnitz_wire::shift_german_string_heap(cell, blob_base);
             }
         }
     }
