@@ -408,3 +408,51 @@ fn fixed_int_packs_and_decodes_its_own_width() {
         }
     }
 }
+
+/// `int_domain_fits` over the sign/width ladder: a rewrite is admitted only when
+/// no value of `src` can fall outside `target`. Also pins that
+/// `is_widening_promotion` narrows it to a ≤8-byte slot.
+#[test]
+fn int_domain_fits_admits_exactly_the_lossless_rewrites() {
+    for (src, target) in [
+        (TypeCode::I32, TypeCode::I64),  // signed widen
+        (TypeCode::U32, TypeCode::I64),  // unsigned into strictly wider signed
+        (TypeCode::U8, TypeCode::U16),   // unsigned widen
+        (TypeCode::I32, TypeCode::I32),  // identity
+        (TypeCode::U64, TypeCode::U64),  // identity
+        (TypeCode::U64, TypeCode::I128), // u64 fits i128
+    ] {
+        assert!(int_domain_fits(src as u8, target as u8), "{src:?} -> {target:?} fits");
+    }
+    for (src, target) in [
+        (TypeCode::U64, TypeCode::I64), // same width, unsigned into signed
+        (TypeCode::U32, TypeCode::I32),
+        (TypeCode::U8, TypeCode::I8),
+        (TypeCode::U128, TypeCode::I128),
+        (TypeCode::I64, TypeCode::U64), // signed into unsigned, at any width
+        (TypeCode::I32, TypeCode::U32),
+        (TypeCode::I64, TypeCode::I32), // narrowing
+    ] {
+        assert!(
+            !int_domain_fits(src as u8, target as u8),
+            "{src:?} -> {target:?} does not fit"
+        );
+    }
+    // No non-integer pair is in the domain — UUID shares U128's width and a
+    // STRING/BLOB FK is admitted by exact equality, never by this rule.
+    for tc in [
+        TypeCode::UUID,
+        TypeCode::F64,
+        TypeCode::F32,
+        TypeCode::String,
+        TypeCode::Blob,
+    ] {
+        assert!(!int_domain_fits(tc as u8, tc as u8), "{tc:?} is in no integer domain");
+        assert!(!int_domain_fits(tc as u8, TypeCode::I128 as u8), "{tc:?} -> I128");
+        assert!(!int_domain_fits(TypeCode::I64 as u8, tc as u8), "I64 -> {tc:?}");
+    }
+    // The column-slot gate is the caller's scope, not part of the rule.
+    assert!(int_domain_fits(TypeCode::U64 as u8, TypeCode::I128 as u8));
+    assert!(!is_widening_promotion(TypeCode::U64 as u8, TypeCode::I128 as u8));
+    assert!(is_widening_promotion(TypeCode::U32 as u8, TypeCode::I64 as u8));
+}

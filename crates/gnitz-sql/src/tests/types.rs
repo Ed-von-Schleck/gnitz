@@ -179,33 +179,3 @@ fn non_serial_types_are_none() {
     assert_eq!(serial_underlying(&DataType::BigInt(None)), None);
     assert_eq!(serial_underlying(&DataType::Text), None);
 }
-
-// --- FK integer-domain compatibility (int_domain_fits) ---
-
-#[test]
-fn int_domain_fits_accepts_lossless_rewrites() {
-    for (c, p) in [
-        (TypeCode::I32, TypeCode::I64),  // signed widen
-        (TypeCode::U32, TypeCode::I64),  // unsigned → strictly wider signed
-        (TypeCode::U8, TypeCode::U16),   // unsigned widen
-        (TypeCode::I32, TypeCode::I32),  // identity
-        (TypeCode::U64, TypeCode::U64),  // identity
-        (TypeCode::U64, TypeCode::I128), // u64 fits i128
-    ] {
-        assert!(int_domain_fits(c, p), "{c:?} → {p:?} should fit");
-    }
-}
-
-#[test]
-fn int_domain_fits_rejects_lossy_rewrites() {
-    for (c, p) in [
-        (TypeCode::U64, TypeCode::I64),   // same width, unsigned → signed
-        (TypeCode::U32, TypeCode::I32),   // same width, unsigned → signed
-        (TypeCode::I64, TypeCode::U64),   // signed → unsigned
-        (TypeCode::I32, TypeCode::U32),   // signed → unsigned
-        (TypeCode::U128, TypeCode::I128), // 16→16, unsigned → signed
-        (TypeCode::U8, TypeCode::I8),     // 1→1, unsigned → signed
-    ] {
-        assert!(!int_domain_fits(c, p), "{c:?} → {p:?} should not fit");
-    }
-}

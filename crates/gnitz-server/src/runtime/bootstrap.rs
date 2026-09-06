@@ -232,14 +232,13 @@ fn recover_from_sal(
             // committed data.
             let effective = catalog
                 .registry_mut()
-                .ingest_returning_effective(tid, owned, true)
+                .ingest_returning_effective(tid, owned)
                 .map_err(|e| {
                     format!(
                         "SAL replay apply failed (table_id={}, lsn={}): {e}",
                         msg.target_id, msg.lsn
                     )
-                })?
-                .expect("asked for the effective batch");
+                })?;
             // Buffer the effective delta for the sweep; viewless bases discard it
             // (nothing to drive).
             if buffered_bases.contains(&tid) {

@@ -307,11 +307,6 @@ impl RelationRegistry {
     /// model below, declining an unselective range before the base cursor is
     /// opened.
     ///
-    /// Index cursor before base cursor: `ingest_store_and_indices` writes
-    /// base-then-index non-atomically, so snapshotting the index no later than
-    /// the base is what makes every entry the walk yields already have its base
-    /// row written.
-    ///
     /// The cost model, and the only one: a bounded scan is not unconditionally
     /// cheaper. For a range matching M of N rows it costs an index walk of M, an
     /// M log M sort, and M galloping base probes, where a full scan is one

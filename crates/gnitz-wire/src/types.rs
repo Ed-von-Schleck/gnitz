@@ -638,18 +638,36 @@ pub(crate) const fn register_image_type(tc: u8) -> u8 {
     }
 }
 
+/// True iff every value of integer type `src` is representable in `target`.
+/// Same sign class: `target` at least as wide. Unsigned into signed: strictly
+/// wider, since a signed type of equal width cannot hold the unsigned range.
+/// Non-integers (floats, strings, UUID) are in no domain — `UUID` shares U128's
+/// width but is not a number.
+///
+/// The value-domain question, kept apart from [`join_key_common_type`]: that
+/// ladder answers for a *reindex key*, whose codomain deliberately collapses
+/// UUID and the german strings onto U128.
+pub const fn int_domain_fits(src: u8, target: u8) -> bool {
+    if !is_int(src) || !is_int(target) {
+        return false;
+    }
+    if is_signed_int(src) == is_signed_int(target) {
+        wire_stride(target) >= wire_stride(src)
+    } else {
+        is_signed_int(target) && wire_stride(target) > wire_stride(src)
+    }
+}
+
 /// True iff `target` is a value-preserving *widening promotion* of `src` — the
 /// only type change a column copy performs (`widen_native_le` sign/zero-extends
 /// a narrower integer into a wider slot; there is no narrowing and no
-/// representation change). Rather than re-deriving the sign/width ladder,
-/// this reads back [`join_key_common_type`]'s contract: the promotion is
-/// idempotent, so `target` is a promotion of `src` iff resolving the pair
-/// `(src, target)` maps back to `target`. Shared by the engine compiler's
-/// carried-target validation and the expression validator's column-sink slot check
-/// so the two cannot drift.
+/// representation change). The `is_fixed_int(target)` gate is this caller's own
+/// scope, not a screen on the rule: a column copy only ever widens into a
+/// ≤8-byte slot. Shared by the engine compiler's carried-target validation and
+/// the expression validator's column-sink slot check so the two cannot drift.
 #[inline]
 pub fn is_widening_promotion(src: u8, target: u8) -> bool {
-    is_fixed_int(target) && join_key_common_type(src, target) == Some(target)
+    is_fixed_int(target) && int_domain_fits(src, target)
 }
 
 /// Whether a raw wire type code is a *signed* fixed-width integer
@@ -684,22 +702,10 @@ pub const fn is_fixed_int(tc: u8) -> bool {
 
 /// Whether a raw wire type code is an **integer** of any width or sign —
 /// [`is_fixed_int`]'s eight codes plus the 128-bit pair. UUID shares U128's
-/// width and is not one. The question FK compatibility asks, where
+/// width and is not one. The domain [`int_domain_fits`] is defined on, where
 /// `is_fixed_int`'s ≤ 8-byte scope would silently exclude a 128-bit column.
-pub const fn is_int(tc: u8) -> bool {
-    matches!(
-        tc,
-        type_code::U8
-            | type_code::I8
-            | type_code::U16
-            | type_code::I16
-            | type_code::U32
-            | type_code::I32
-            | type_code::U64
-            | type_code::I64
-            | type_code::U128
-            | type_code::I128
-    )
+pub(crate) const fn is_int(tc: u8) -> bool {
+    is_fixed_int(tc) || tc == type_code::U128 || tc == type_code::I128
 }
 
 /// A fixed-width integer column type — ≤ 8 bytes, any sign. This is the exact

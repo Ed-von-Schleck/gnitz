@@ -19,14 +19,11 @@ impl RelationRegistry {
             if entry.kind == RelationKind::SystemCatalog {
                 continue;
             }
-            // The delta store goes with it: the pre-fork master builds one at
-            // `Delta { rank: 0 }` and worker 0 homes its own there, so keeping it
-            // would put two live `Table`s on one directory.
-            entry.set_stores(RelationStores::detached());
-            // And every index circuit, which the master would otherwise keep live
-            // and permanently empty — it reads only their metadata.
+            // The delta store and every index circuit go with it: two live
+            // `Table`s on one directory is the hazard this pass exists to prevent.
+            entry.set_stores(RelationStores::elsewhere());
             for ic in &mut entry.index_circuits {
-                ic.handle = StoreHandle::Detached;
+                ic.handle = StoreHandle::Elsewhere;
             }
         }
     }
@@ -74,9 +71,9 @@ impl RelationRegistry {
             if entry.kind == RelationKind::SystemCatalog {
                 continue;
             }
-            let owner_dir = entry.directory.clone();
+            let owner_dir = &entry.directory;
             for ic in &mut entry.index_circuits {
-                let idx_dir = ChildAddr::Index { id: ic.index_id }.dir(&owner_dir);
+                let idx_dir = ChildAddr::Index { id: ic.index_id }.dir(owner_dir);
                 if ic.handle.as_owned().is_none_or(|t| t.directory() == home.dir(&idx_dir)) {
                     continue;
                 }
@@ -93,15 +90,10 @@ impl RelationRegistry {
         Ok(())
     }
 
-    /// Rebuild `tid`'s store handle from its registered `(directory, schema,
-    /// kind)` and install it. `build_relation_store` opens this worker's own
-    /// child, so the rebuilt handle is homed wherever the caller now runs. The
-    /// caller does whatever on-disk preparation its case needs first.
-    ///
-    /// Both stores are rebuilt, and both are installed: a fed view whose delta
-    /// store did not come back here would still carry its `delta_bytes` in the
-    /// catalog and have no delta store on any worker, on every boot, with no error
-    /// anywhere.
+    /// Rebuild `tid`'s store handle from its registered spec and install it, homed
+    /// at whatever slot this process now runs as. The caller does any on-disk
+    /// preparation first. Both stores are rebuilt, so a fed view cannot come back
+    /// declaring a feed it has no store for.
     pub(crate) fn rebuild_relation_store(&mut self, tid: i64, what: &str) -> Result<(), StoreError> {
         let (dir, schema, kind, budgets) = {
             let e = self
@@ -118,14 +110,12 @@ impl RelationRegistry {
     }
 
     /// Reclaim every live relation's child directories that this boot's worker
-    /// count no longer owns — the on-disk counterpart of `rehome`, which then
-    /// opens what this leaves behind. Runs after the boot relayout, so what
-    /// it deletes is a set the relayout has already consumed.
+    /// count no longer owns — the on-disk counterpart of `rehome`. Runs after the
+    /// boot relayout, so what it deletes the relayout has already consumed.
     ///
-    /// Unconditional rather than triggered on "the launched count changed": a
-    /// boot that dies between this sweep and `record_topology` leaves the
-    /// recorded count unchanged, so such a trigger would skip the repair on the
-    /// retry. It is idempotent, so running it every boot converges instead.
+    /// Idempotent and unconditional: a boot dying between this and
+    /// `record_topology` leaves the recorded count unchanged, so a "the count
+    /// changed" trigger would skip the repair on the retry.
     pub fn reconcile_child_dirs(&self) {
         self.assert_pre_fork("reconcile_child_dirs");
         for entry in self.tables.values() {
@@ -140,15 +130,13 @@ impl RelationRegistry {
     }
 
     /// Reset a relation's store and per-worker operator scratch to an empty,
-    /// well-formed state — recovery step-4, run per worker on its own store
-    /// before an invalid view is rebuilt. The caller drops the cached plan.
+    /// well-formed state, before an invalid view is rebuilt. The caller drops the
+    /// cached plan.
     ///
-    /// Unlinks this worker's child manifest first, so the empty rebuild below (a
-    /// `Rederive` open) peeks `None` and *erases* the stale
-    /// generation-`g` shards rather than reloading them — without which a
-    /// transitively-invalid view whose own manifests are still at `g` would reload
-    /// them. Then rebuilds the handle empty via `build_relation_store` and
-    /// removes this worker's scratch operator dirs.
+    /// The manifest is unlinked first so the rebuild's `Rederive` open peeks
+    /// `None` and *erases* the stale shards — without which a transitively-invalid
+    /// view whose own manifests are still at the resume generation would reload
+    /// them.
     pub fn reset_store(&mut self, vid: i64) -> Result<(), StoreError> {
         let dir = self
             .tables

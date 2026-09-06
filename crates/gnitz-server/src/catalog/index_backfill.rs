@@ -104,7 +104,7 @@ impl CatalogEngine {
             for cols in targets {
                 let ic = self
                     .registry
-                    .index_circuit_for_cols(owner_id, cols.as_slice())
+                    .index_circuit_for_cols_mut(owner_id, cols.as_slice())
                     .ok_or_else(|| format!("index circuit on {:?} of {owner_id} vanished", cols.as_slice()))?;
                 let projected = gnitz_store::storage::batch_project_index(&chunk, &ic.key_spec, &ic.index_schema);
                 if projected.is_empty() {

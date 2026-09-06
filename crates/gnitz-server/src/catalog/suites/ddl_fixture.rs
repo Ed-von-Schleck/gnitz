@@ -319,8 +319,7 @@ impl CatalogEngine {
             self.submit(family, batch.clone())
         } else {
             self.registry
-                .ingest_returning_effective(table_id, batch.clone_batch(), false)
-                .map(drop)
+                .ingest(table_id, batch.clone_batch())
                 .map_err(|e| format!("ingest failed for table_id={table_id}: {e}"))
         }
     }

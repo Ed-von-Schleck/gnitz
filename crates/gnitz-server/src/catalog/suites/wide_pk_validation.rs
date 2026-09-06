@@ -51,14 +51,19 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows:
     );
     engine.registry_mut().add_index(tid, tid + 1, &[3], true).unwrap();
 
-    // The index batch is projected through the circuit's own plan; the base
-    // store takes the rows through the white-box door that skips projection.
+    // Write both sides by hand rather than through the registry, which would
+    // project the index itself.
     let bb = wide_val_batch(&schema, base_rows);
-    let registry = engine.registry();
-    let ic = registry.index_circuit_for_cols(tid, &[3]).unwrap();
-    ic.ingest_owned_batch(batch_project_index(&bb, &ic.key_spec, &ic.index_schema))
+    let registry = engine.registry_mut();
+    let ic = registry.index_circuit_for_cols_mut(tid, &[3]).unwrap();
+    let projected = batch_project_index(&bb, &ic.key_spec, &ic.index_schema);
+    ic.ingest_owned_batch(projected).unwrap();
+    registry
+        .entry_mut(tid)
+        .and_then(|e| e.owned_store_mut())
+        .unwrap()
+        .ingest_borrowed_batch(&bb)
         .unwrap();
-    registry.table_entry(tid).unwrap().ingest_borrowed_batch(&bb).unwrap();
     engine.registry_mut().flush(tid).unwrap();
 }
 

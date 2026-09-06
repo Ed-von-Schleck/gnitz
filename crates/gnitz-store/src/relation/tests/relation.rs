@@ -123,7 +123,7 @@ fn ephemeral_flush_includes_index_circuits() {
 
     // Put one row in the index table's memtable.
     {
-        let ic = registry.index_circuit_for_cols(70, &[1]).unwrap();
+        let ic = registry.index_circuit_for_cols_mut(70, &[1]).unwrap();
         let mut batch = Batch::with_capacity(&ic.index_schema, 1);
         batch.extend_pk(1u128);
         batch.extend_weight(&1i64.to_le_bytes());
@@ -192,7 +192,7 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
     }
     assert_eq!(live, 0, "the output store's fold annihilates the pair");
 
-    let feed = entry.delta_feed().expect("a fed view holds a delta store");
+    let feed = entry.delta_feed_or_err(40).expect("a fed view holds a delta store");
     let stride = feed.schema.pk_stride();
     let mut rounds: Vec<(u64, i64)> = Vec::new();
     let mut cur = feed.open_cursor_in_range(&vec![0u8; stride], None);
@@ -248,7 +248,7 @@ fn ingest_apply_error_returned_internal() {
     batch.count += 1;
     assert!(
         matches!(
-            registry.ingest_returning_effective(tid, batch, false),
+            registry.ingest(tid, batch),
             Err(StoreError::Storage {
                 err: crate::storage::StorageError::Io(_),
                 ..

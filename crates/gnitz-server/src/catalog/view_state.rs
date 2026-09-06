@@ -168,10 +168,9 @@ impl CatalogEngine {
     /// not compile, or an unregistered source: DDL_SYNC applies in SAL order, so
     /// a worker that cannot see the source has diverged from the catalog.
     pub(crate) fn open_source_cursor(&mut self, view_id: i64, source: i64) -> Result<SourceCursor, String> {
-        // A store-less handle opens an EMPTY cursor, not an error — right for a
-        // stream, silently wrong for the post-fork master. Hard, not
-        // `debug_assert!`: release is a supported deployment, one compare per
-        // backfill source.
+        // A store-less handle reads empty rather than erroring: correct for a
+        // stream, a wrong answer for a process whose store is elsewhere. Hard, not
+        // `debug_assert!` — release is a supported deployment.
         assert!(
             self.registry.owns_stores(),
             "source cursor in a process owning no base store (view {view_id}, source {source})",

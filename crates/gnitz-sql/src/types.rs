@@ -55,19 +55,10 @@ pub(crate) fn serial_underlying(dt: &DataType) -> Option<TypeCode> {
 // ---------------------------------------------------------------------------
 // TypeCode capability predicates
 //
-// One home for the type-membership tests that the binder (MIN/MAX rejection),
-// the lowerer (ColRef rejection), and DDL (FK numeric compatibility) all query.
-// gnitz_core already owns `is_float` / `is_german_string`; these add the sets
-// it does not.
+// One home for the type-membership tests that the binder (MIN/MAX rejection)
+// and the lowerer (ColRef rejection) query. gnitz_core already owns `is_float`
+// / `is_german_string`; these add the sets it does not.
 // ---------------------------------------------------------------------------
-
-/// Integer column types — signed/unsigned at every width, including the 128-bit
-/// pair. Used for FK compatibility (an integer child column widens to an integer
-/// parent) and the numeric-aggregate check. `gnitz_wire` owns the partition, and
-/// its own drift matrix holds this set against every other type predicate.
-pub(crate) fn is_integer_type(tc: TypeCode) -> bool {
-    gnitz_wire::is_int(tc as u8)
-}
 
 /// Whether a value of this type fits the expression VM's 8-byte *scalar*
 /// register — [`gnitz_core::ScalarKind`], the same classification the engine's
@@ -95,20 +86,6 @@ pub(crate) fn is_cast_target(tc: TypeCode) -> bool {
 /// binder, which cannot produce one.
 pub(crate) fn int_cast_target(tc: TypeCode) -> Result<FixedInt, GnitzSqlError> {
     FixedInt::from_type_code(tc).ok_or_else(|| GnitzSqlError::Unsupported(format!("CAST to {tc:?} is not supported")))
-}
-
-/// True iff every value of integer type `child` is representable in integer type
-/// `parent`, so rewriting an FK child column to the parent's type loses no value
-/// the child could legally hold.
-///
-/// Reads back `join_key_common_type`'s contract rather than re-deriving the
-/// sign/width ladder gnitz-wire owns: `parent` holds `child` exactly when the
-/// pair's common type *is* `parent`. Valid over integer inputs alone (both
-/// `is_integer_type`) — that ladder sends a UUID pair to U128. Not
-/// `is_widening_promotion`, whose `is_fixed_int(target)` gate would reject the
-/// `(U64, I128)` an FK needs.
-pub(crate) fn int_domain_fits(child: TypeCode, parent: TypeCode) -> bool {
-    child.join_key_common_type(parent) == Some(parent)
 }
 
 #[cfg(test)]

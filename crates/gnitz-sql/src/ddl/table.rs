@@ -4,7 +4,7 @@
 use crate::ast_util::{extract_name, index_column_ident, simple_ident_expr};
 use crate::bind::{find_unique_column, Binder};
 use crate::error::GnitzSqlError;
-use crate::types::{int_domain_fits, is_integer_type, serial_underlying, sql_type_to_typecode};
+use crate::types::{serial_underlying, sql_type_to_typecode};
 use crate::validate::{
     canonical_user_name, kv_options, non_key_eligible_error, reject_duplicate_names, reject_unbuildable_index_key,
     reject_unhonored_column_options, reject_unhonored_create_index_clauses, reject_unhonored_create_table_clauses,
@@ -61,14 +61,13 @@ fn constraint_name(ident: &sqlparser::ast::Ident) -> Result<ConstraintName, Gnit
 }
 
 /// FK child/parent type compatibility: an integer child widens to an integer
-/// parent whose domain covers it; otherwise the types must match exactly. Returns
-/// the standard mismatch error so both resolver paths reject identically.
+/// parent whose domain covers it; otherwise the types must match exactly (which
+/// is what keeps a UUID or STRING FK legal — `int_domain_fits` holds for no
+/// non-integer pair). Returns the standard mismatch error so both resolver paths
+/// reject identically.
 fn check_fk_type_compat(fk_col_type: TypeCode, parent_col_type: TypeCode) -> Result<(), GnitzSqlError> {
-    let is_compat = if is_integer_type(fk_col_type) && is_integer_type(parent_col_type) {
-        int_domain_fits(fk_col_type, parent_col_type)
-    } else {
-        fk_col_type == parent_col_type
-    };
+    let is_compat =
+        fk_col_type == parent_col_type || gnitz_wire::int_domain_fits(fk_col_type as u8, parent_col_type as u8);
     if !is_compat {
         return Err(GnitzSqlError::Bind(format!(
             "FK type mismatch: column type {fk_col_type:?} cannot reference column type \

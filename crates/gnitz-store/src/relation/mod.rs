@@ -2,29 +2,19 @@
 //! behind them.
 //!
 //! The registry is the state the DBSP layer *reads*: it owns each relation's
-//! schema, kind, directory, store handle, secondary-index circuits and delta
-//! feed, plus the two resume words (`resume_generation`, `recorded_topology`)
-//! every rederived store opens against. Nothing here compiles a circuit or runs
-//! an epoch — `query` does that, and reaches this rung by taking a registry
-//! reference as a parameter.
+//! schema, kind, directory, store handle, secondary-index circuits, delta feed
+//! and resume policy. Nothing here compiles a circuit or runs an epoch.
 //!
-//! Two hosts drive one registry: `CatalogEngine` (from a TABLE_TAB / VIEW_TAB
-//! row) and `gnitz-mirror` (from its own record file).
-//!
-//! A user relation enters through [`RelationRegistry::register`], the one site
-//! deciding its child address, recovery source, capacity stamp and delta store;
-//! the system families through [`RelationRegistry::register_owned`].
-//!
-//! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
-//! they cover.
+//! A user relation enters through [`RelationRegistry::register`], which is the
+//! one site deciding its child address, recovery source, capacity stamp and
+//! delta store; the system families through
+//! [`RelationRegistry::register_owned`].
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::schema::SchemaDescriptor;
 
-use crate::storage::{
-    subdir_names, Batch, ChildAddr, RamBudgets, RecoverySource, Slot, StorageError, StoreError, Table,
-};
+use crate::storage::{Batch, ChildAddr, RamBudgets, RecoverySource, Slot, StorageError, StoreError, Table};
 use gnitz_wire::PkColList;
 
 mod build;
@@ -33,7 +23,6 @@ mod ingest;
 mod store_handle;
 mod store_lsn;
 
-use dirs::is_table_dir_name;
 pub use dirs::{ensure_dir, lock_data_dir, relation_dir, staged_dir, DIR_LOCK_RETRY_FOR};
 pub(crate) use store_handle::StoreHandle;
 
@@ -80,7 +69,7 @@ impl IndexCircuitEntry {
 
     /// Ingest an owned batch of index rows. The projection path drives this per
     /// push; a detached circuit absorbs nothing.
-    pub fn ingest_owned_batch(&self, batch: Batch) -> Result<(), StorageError> {
+    pub fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
         self.handle.ingest_owned_batch(batch)
     }
 
@@ -215,10 +204,18 @@ impl RelationStores {
         }
     }
 
-    /// No stores at all: a stream, or a user relation on the post-fork master.
-    pub(crate) fn detached() -> Self {
+    /// No store in any process.
+    pub(crate) fn storeless() -> Self {
         RelationStores {
-            handle: StoreHandle::Detached,
+            handle: StoreHandle::Storeless,
+            delta: None,
+        }
+    }
+
+    /// No store in this process; another one holds it.
+    pub(crate) fn elsewhere() -> Self {
+        RelationStores {
+            handle: StoreHandle::Elsewhere,
             delta: None,
         }
     }
@@ -247,21 +244,15 @@ pub struct TableEntry {
 impl TableEntry {
     /// A registry entry with no index circuits yet. Both budgets are `None` for
     /// everything but a bounded or a fed view.
-    pub(crate) fn new(
-        stores: RelationStores,
-        schema: SchemaDescriptor,
-        kind: RelationKind,
-        directory: String,
-        budgets: ViewBudgets,
-    ) -> Self {
+    pub(crate) fn new(spec: RelationSpec, stores: RelationStores) -> Self {
         TableEntry {
             handle: stores.handle,
             delta: stores.delta,
-            schema,
-            kind,
-            directory,
+            schema: spec.schema,
+            kind: spec.kind,
+            directory: spec.directory,
             index_circuits: Vec::new(),
-            budgets,
+            budgets: spec.budgets,
         }
     }
 
@@ -273,16 +264,11 @@ impl TableEntry {
         self.delta = stores.delta;
     }
 
-    /// This relation's delta feed, when this process holds one.
-    pub(crate) fn delta_feed(&self) -> Option<&DeltaFeed> {
-        self.delta.as_deref()
-    }
-
-    /// [`Self::delta_feed`] as a `Result` — the one message for "this process
-    /// holds no delta store", so the ad-hoc read's two lookups (the source
-    /// schema and the cursor) cannot render it two ways.
+    /// This relation's delta feed — the one message for "this process holds no
+    /// delta store", so the ad-hoc read's two lookups (the source schema and the
+    /// cursor) cannot render it two ways.
     pub(crate) fn delta_feed_or_err(&self, id: i64) -> Result<&DeltaFeed, StoreError> {
-        self.delta_feed().ok_or_else(|| {
+        self.delta.as_deref().ok_or_else(|| {
             StoreError::rejected(format!(
                 "scan_spec: this process holds no delta store for relation {id}"
             ))
@@ -347,13 +333,6 @@ impl TableEntry {
             .iter_mut()
             .find(|ic| ic.col_indices.as_slice() == cols)
     }
-
-    /// Durable ingest of a borrowed `Batch` into this relation's own store,
-    /// bypassing index projection. A white-box door for a test that must desync
-    /// the two — ordinary ingestion goes through the registry, which writes both.
-    pub fn ingest_borrowed_batch(&self, batch: &Batch) -> Result<(), StorageError> {
-        self.handle.ingest_borrowed_batch(batch)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -404,11 +383,10 @@ impl Default for StoreConfig {
 /// Which relations this process holds, and the stores behind them.
 ///
 /// **Thread contract.** `!Send + !Sync` by auto-trait: every store holds its
-/// runs behind `Rc`. Nothing beneath a registry is thread-affine (a test-only
-/// statistics counter aside), so a host may move one to another thread while it
-/// has exclusive access to it and no `Rc`-bearing value it handed out — an
-/// `Rc<Batch>` scan, a `ReadCursor`, `SourceCursor` or `PkSetGather` — is alive
-/// outside it: those refcounts are non-atomic.
+/// runs behind `Rc`. Nothing beneath a registry is thread-affine, so a host may
+/// move one to another thread while it has exclusive access to it and no
+/// `Rc`-bearing value it handed out is still alive outside it: those refcounts
+/// are non-atomic.
 pub struct RelationRegistry {
     pub(crate) tables: FxHashMap<i64, TableEntry>,
     /// Which worker this process is, of how many: what names the `w{k}of{n}`
@@ -437,17 +415,18 @@ impl RelationRegistry {
     /// server's environment overrides, `Mirror::open` with [`Slot::SOLO`].
     /// `config.scan_chunk_rows` is clamped to at least one row.
     pub fn new(slot: Slot, config: StoreConfig) -> Self {
-        let mut registry = RelationRegistry {
+        RelationRegistry {
             tables: FxHashMap::default(),
             slot,
-            config,
+            config: StoreConfig {
+                scan_chunk_rows: config.scan_chunk_rows.max(1),
+                ..config
+            },
             owns_stores: true,
             rehomed: false,
             resume_generation: 0,
             recorded_topology: 0,
-        };
-        registry.set_scan_chunk_rows(config.scan_chunk_rows);
-        registry
+        }
     }
 
     // ── Table registry ──────────────────────────────────────────────────
@@ -462,9 +441,7 @@ impl RelationRegistry {
     /// Record `spec` against `stores`. The one insert, so the two entry points
     /// above cannot come to record a registration differently.
     fn enter(&mut self, spec: RelationSpec, stores: RelationStores) {
-        let RelationSpec { id, kind, schema, directory, budgets } = spec;
-        self.tables
-            .insert(id, TableEntry::new(stores, schema, kind, directory, budgets));
+        self.tables.insert(spec.id, TableEntry::new(spec, stores));
     }
 
     /// Drop `table_id`'s entry, and with it its owned `Box<Table>` and fds.
@@ -475,7 +452,7 @@ impl RelationRegistry {
     /// Enter a secondary index on `owner` over `cols` and open this process's
     /// store for it under `<owner dir>/idx_<index_id>/w{rank}of{n}`. The index
     /// directory is created on every process, so the post-fork master — which
-    /// registers `Detached` — still owns the path a later DROP removes.
+    /// registers no store — still owns the path a later DROP removes.
     pub fn add_index(&mut self, owner: i64, index_id: i64, cols: &[u32], is_unique: bool) -> Result<(), StoreError> {
         let (owner_schema, owner_dir) = {
             let e = self.table_entry(owner)?;
@@ -493,7 +470,7 @@ impl RelationRegistry {
         let idx_dir = ChildAddr::Index { id: index_id }.dir(&owner_dir);
         ensure_dir(&idx_dir)?;
         let handle = match self.owns_stores {
-            false => StoreHandle::Detached,
+            false => StoreHandle::Elsewhere,
             true => StoreHandle::owned(Self::open_index_table(
                 self.slot,
                 self.rederive_source(),
@@ -567,17 +544,8 @@ impl RelationRegistry {
     }
 
     /// Publish a new column schema for a registered base table in place (any
-    /// column ALTER). Three of the four are equal-region — RENAME COLUMN, DROP
-    /// COLUMN and DROP NOT NULL change only a column's name, `is_hidden` or
-    /// `is_nullable`, the last of which downgrades the whole-schema payload
-    /// comparator `FixedIntNonnull → Generic` — and move no bytes at all. ADD
-    /// COLUMN grows the region count: resident runs are widened with a NULL tail
-    /// and every registered shard is re-opened so it can pad the appended
-    /// columns (`MappedShard::null_pad_mask`).
-    ///
-    /// Updates the registry copy (`TableEntry.schema`) and pushes the same value
-    /// down into the owned `Table` (memtable, RAM tier, shard index), plus
-    /// dropping `Table::cached_full_scan`.
+    /// column ALTER): update the registry copy and push the same value down into
+    /// the owned `Table`, which re-opens its shards if the region count grew.
     pub fn swap_table_schema(&mut self, table_id: i64, schema: SchemaDescriptor) -> Result<(), StoreError> {
         let entry = self
             .tables
@@ -620,8 +588,7 @@ impl RelationRegistry {
         self.config
     }
 
-    /// `slot().of`; kept because the server reads the count, never the rank, at
-    /// over a dozen sites.
+    /// `slot().of`.
     pub fn num_workers(&self) -> u32 {
         self.slot.of
     }
@@ -635,9 +602,8 @@ impl RelationRegistry {
         self.config.scan_chunk_rows
     }
 
-    /// Set the chunk size, clamped to at least one row — a zero chunk drains
-    /// nothing. Per registry rather than process-wide: the tests that shrink it
-    /// do so per engine, and `cargo test` runs them on threads of one process.
+    /// Set the chunk size, clamped to at least one row. Per registry, not
+    /// process-wide. Production sets it once through [`StoreConfig`].
     pub fn set_scan_chunk_rows(&mut self, rows: usize) {
         self.config.scan_chunk_rows = rows.max(1);
     }
@@ -679,12 +645,7 @@ impl RelationRegistry {
         self.entry(id).is_some_and(|e| e.schema.placement().is_replicated())
     }
 
-    /// True iff at least one registered view carries a delta feed. The master's
-    /// idle-poll bookkeeping — the forward-closure walk and the last-round map —
-    /// is skipped outright when this is false, which is every server that does not
-    /// use the feature. A walk rather than a maintained counter: no-feed is the
-    /// default, so the full `O(|relations|)` walk is the steady state — priced
-    /// once per emitted tick group, beside a SAL write and an eventfd.
+    /// True iff at least one registered relation carries a delta feed.
     pub fn any_delta_feed(&self) -> bool {
         self.tables.values().any(|e| e.budgets.delta_bytes.is_some())
     }
@@ -721,6 +682,11 @@ impl RelationRegistry {
     /// hint without a prior catalog probe), `Some` broadcasts the seek.
     pub fn index_circuit_for_cols(&self, table_id: i64, cols: &[u32]) -> Option<&IndexCircuitEntry> {
         self.entry(table_id)?.index_circuit_on(cols)
+    }
+
+    /// [`Self::index_circuit_for_cols`] as `&mut`.
+    pub fn index_circuit_for_cols_mut(&mut self, table_id: i64, cols: &[u32]) -> Option<&mut IndexCircuitEntry> {
+        self.entry_mut(table_id)?.index_circuit_on_mut(cols)
     }
 
     /// True if the table has at least one unique secondary index circuit.
@@ -764,69 +730,6 @@ impl RelationRegistry {
     /// boot orphan sweep names its live table and index directories from.
     pub fn entries(&self) -> impl Iterator<Item = (i64, &TableEntry)> + '_ {
         self.tables.iter().map(|(&id, e)| (id, e))
-    }
-
-    /// Remove every relation directory under `schema_dirs` that no registered
-    /// relation owns, and every `idx_<id>` child of a live relation that no
-    /// registered index owns. Only `<tag>_<digits>` names are eligible.
-    /// Best-effort: a failure to remove one orphan is logged and never aborts
-    /// the caller.
-    pub fn reclaim_orphan_relation_dirs(&self, schema_dirs: impl IntoIterator<Item = String>) {
-        // An index directory carries its circuit's `index_id`: a promoted circuit
-        // outlives the IDX_TAB row that named it, and this sweep must not delete it.
-        let mut live_tables: FxHashSet<&str> = FxHashSet::default();
-        let mut live_indices: FxHashSet<String> = FxHashSet::default();
-        for (_, entry) in self.entries() {
-            live_tables.insert(entry.directory.as_str());
-            live_indices.extend(
-                entry
-                    .index_circuits
-                    .iter()
-                    .map(|ic| ChildAddr::Index { id: ic.index_id }.dir(&entry.directory)),
-            );
-        }
-
-        for schema_dir in schema_dirs {
-            for name in subdir_names(&schema_dir) {
-                let full = format!("{schema_dir}/{name}");
-
-                if live_tables.contains(full.as_str()) {
-                    // Live table/view: sweep orphaned `idx_<id>` sub-dirs left by
-                    // a standalone DROP INDEX whose gated deletion was lost to a
-                    // crash.
-                    for idx_name in subdir_names(&full) {
-                        if !matches!(ChildAddr::parse(&idx_name), Some(ChildAddr::Index { .. })) {
-                            continue;
-                        }
-                        let idx_full = format!("{full}/{idx_name}");
-                        if live_indices.contains(&idx_full) {
-                            // Its per-worker children are `reconcile_child_dirs`'
-                            // job — the sweep descends into an index dir.
-                            continue;
-                        }
-                        match std::fs::remove_dir_all(&idx_full) {
-                            Ok(()) => gnitz_debug!("recovery: removed orphan index dir {}", idx_full),
-                            Err(e) => gnitz_debug!("recovery: failed to remove orphan index dir {}: {}", idx_full, e),
-                        }
-                    }
-                    continue;
-                }
-
-                // Only `<something>_<digits>` dirs — the shape of table
-                // (`t_<tid>`), view (`v_<vid>`), and the pre-flight's throwaway
-                // root (`_preflight_<vid>`) — are eligible for removal. Never
-                // touch an unexpected entry. Those three are the only writers
-                // directly under a schema dir, so a matching name absent from
-                // `live_tables` is orphaned either way.
-                if !is_table_dir_name(&name) {
-                    continue;
-                }
-                match std::fs::remove_dir_all(&full) {
-                    Ok(()) => gnitz_debug!("recovery: removed orphan table/view dir {}", full),
-                    Err(e) => gnitz_debug!("recovery: failed to remove orphan dir {}: {}", full, e),
-                }
-            }
-        }
     }
 
     // ── The resume fence ────────────────────────────────────────────────

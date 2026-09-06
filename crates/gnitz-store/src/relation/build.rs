@@ -26,27 +26,18 @@ impl RelationRegistry {
     }
 
     /// Build this process's store for a top-level relation: one `Table` under
-    /// this slot's `w{rank}of{n}` child. Only user relations are built here — system
-    /// catalog tables are plain single `Table`s built at bootstrap.
-    ///
-    /// The `match kind` below is the one place a per-kind property is derived,
-    /// which is what makes the nonsense combinations — durable but rebuilt from
-    /// source, ephemeral but never rebuilt — unconstructable.
+    /// this slot's `w{rank}of{n}` child. Only user relations are built here —
+    /// system catalog tables are plain single `Table`s built at bootstrap.
     ///
     /// The child is homed at THIS process's own worker rank, so a live CREATE on
-    /// each worker post-fork builds a distinct dir directly. The post-fork master
-    /// owns no store at all: it registers the relation `Detached` so it and
-    /// worker 0 do not both hold a live `Table` on `w0of{W}`. Both storeless cases
-    /// are decided here rather than at the callers, so a new caller cannot build a
+    /// each worker post-fork builds a distinct dir. Both store-less cases are
+    /// decided here rather than at the callers, so a new caller cannot build a
     /// `Table` for one of them.
     ///
-    /// A fed view's **delta store** is opened here too, and returned with the
-    /// relation's own: every path that opens a relation's store comes through
-    /// here, so a feed cannot come back missing from a rehome or a rebuild — the
-    /// same reason the capacity is stamped here.
-    ///
-    /// Creates `directory` when the kind owns a store; [`staged_dir`] is what
-    /// makes that creation crash-safe.
+    /// A fed view's delta store is opened here too and the capacity stamped here,
+    /// so neither can come back missing from a rehome or a rebuild. Creates
+    /// `directory` when the kind owns a store; [`staged_dir`] makes that creation
+    /// crash-safe.
     pub(crate) fn build_relation_store(
         &self,
         kind: RelationKind,
@@ -73,7 +64,7 @@ impl RelationRegistry {
         // Above `ensure_dir`: a storeless kind owns no store in any process, so no
         // directory is created for one.
         let recovery = match kind {
-            RelationKind::Stream => return Ok(RelationStores::detached()),
+            RelationKind::Stream => return Ok(RelationStores::storeless()),
             // A view's output store and its operator traces resume from the
             // manifest the ephemeral checkpoint round stamped, or are rebuilt.
             RelationKind::View => self.rederive_source(),
@@ -81,7 +72,7 @@ impl RelationRegistry {
         };
         ensure_dir(directory)?;
         if !self.owns_stores {
-            return Ok(RelationStores::detached());
+            return Ok(RelationStores::elsewhere());
         }
 
         // Widen the window where the table dir exists but its child subdir does

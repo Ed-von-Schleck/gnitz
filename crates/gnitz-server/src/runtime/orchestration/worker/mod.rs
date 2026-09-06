@@ -716,12 +716,8 @@ impl WorkerProcess {
         // the durable SAL. Restart + SAL replay re-applies the batch — its zone
         // stays above the flushed-shard watermark — where a fault reply would
         // neither apply nor replay it and the next checkpoint would orphan it.
-        let effective = match self
-            .cat()
-            .registry_mut()
-            .ingest_returning_effective(target_id, batch, true)
-        {
-            Ok(b) => b.expect("asked for the effective batch"),
+        let effective = match self.cat().registry_mut().ingest_returning_effective(target_id, batch) {
+            Ok(b) => b,
             // An ingest never produces `DeltaExpired`; the or-pattern is what
             // keeps the match total without a third arm.
             Err(StoreError::Rejected(msg) | StoreError::DeltaExpired(msg)) => return Err(msg),

@@ -169,9 +169,9 @@ fn absent_pk_mid_chunk_does_not_truncate_the_gather() {
     bb.end_row();
     let retraction = bb.finish();
     engine
-        .registry()
-        .table_entry(tid)
-        .ok()
+        .registry_mut()
+        .entry_mut(tid)
+        .and_then(|e| e.owned_store_mut())
         .unwrap()
         .ingest_borrowed_batch(&retraction)
         .unwrap();
@@ -387,7 +387,9 @@ fn orphaned_index_entry_yields_empty_not_exhaustion() {
 
     let mut ob = Batch::with_capacity(&idx_schema, 1);
     ob.push_key_row(&orphan_key, 1);
-    ic.ingest_owned_batch(ob).unwrap();
+    engine.registry_mut().entry_mut(tid).unwrap().index_circuits[0]
+        .ingest_owned_batch(ob)
+        .unwrap();
 
     // Chunk of 1 puts the orphan in a chunk of its own: were its `None` to escape,
     // the drain would stop there and lose every later id.
