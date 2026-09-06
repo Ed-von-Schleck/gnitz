@@ -75,7 +75,7 @@ type CircuitNode<'a> = (Opcode, Option<i64>, Option<&'a [u8]>);
 /// Write `vid`'s circuit through the applied-delta path: one node per entry of
 /// `nodes`, chained `i → i+1` on the first input slot.
 pub fn write_circuit_chain(engine: &mut CatalogEngine, vid: i64, nodes: &[CircuitNode<'_>]) {
-    let mut bb = BatchBuilder::new(SysFamily::CircuitNodes.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
     for (i, &(opcode, source, params)) in nodes.iter().enumerate() {
         write_circuit_node_row(
             &mut bb,
@@ -150,7 +150,7 @@ pub fn try_register_identity_view(
     engine
         .write_column_records(vid, gnitz_wire::OWNER_KIND_VIEW as i64, cols)
         .unwrap();
-    let mut bb = BatchBuilder::new(SysFamily::View.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::View.schema());
     push_view_tab_row(&mut bb, 1, vid, name, capacity_bytes, delta_bytes, 0);
     engine.submit(SysFamily::View, bb.finish())?;
     Ok(vid)

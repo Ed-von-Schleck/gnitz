@@ -77,7 +77,7 @@ pub(in crate::catalog) fn retract_key_range(
     cursor.seek_range_bytes(start, Some(end));
     // Sized off the positioned walk's own upper bound, so the appends never
     // re-grow (each growth re-copies every live byte).
-    let mut batch = Batch::with_capacity(*schema, cursor.estimated_length());
+    let mut batch = Batch::with_capacity(schema, cursor.estimated_length());
     cursor.for_each_positive(|c| c.copy_current_row_into(&mut batch, -1));
     batch
 }
@@ -106,7 +106,7 @@ pub(in crate::catalog) fn circuit_opk(
 pub(in crate::catalog) fn retract_pk_list(table: &Table, schema: &SchemaDescriptor, mut ids: Vec<u128>) -> Batch {
     ids.sort_unstable();
     ids.dedup();
-    let mut batch = Batch::with_capacity(*schema, ids.len());
+    let mut batch = Batch::with_capacity(schema, ids.len());
     let (Some(&first), Some(&last)) = (ids.first(), ids.last()) else {
         return batch;
     };

@@ -95,7 +95,7 @@ impl ShardIndex {
         start: &[u8],
         end: Option<&[u8]>,
     ) -> impl Iterator<Item = Rc<MappedShard>> + '_ {
-        let stride = self.schema.pk_stride() as usize;
+        let stride = self.schema.pk_stride();
         debug_assert_eq!(start.len(), stride, "shard_arcs_in_range: start is not pk_stride wide");
         debug_assert!(
             end.is_none_or(|e| e.len() == stride),
@@ -447,7 +447,7 @@ impl ShardIndex {
             // merge_and_route rejects an empty guard list; an empty table still
             // needs one bucket.
             if keys.is_empty() {
-                keys.push(PkBuf::zeroed(self.schema.pk_stride() as usize));
+                keys.push(PkBuf::zeroed(self.schema.pk_stride()));
             }
             keys
         }

@@ -20,124 +20,31 @@ use crate::bind::find_unique_column;
 use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
 use crate::exec::batch::RowGather;
-use gnitz_core::{ColumnDef, Schema, TypeCode, ZSetBatch};
-use gnitz_expr::{ColumnLocator, SchemaFacts};
-use gnitz_wire::cmp_typed_le;
+use gnitz_core::{ColumnDef, Schema, ZSetBatch, ZSetBatchView};
+use gnitz_expr::{cmp_order_keys, OrderLocator, RowSource, SchemaFacts};
 use sqlparser::ast::{Expr, OrderBy, OrderByExpr, OrderByKind, OrderByOptions};
 
 // ---------------------------------------------------------------------------
 // One sort key over the full pre-projection schema
 // ---------------------------------------------------------------------------
 
-/// A resolved sort key: a column index into the pre-projection (`actual`)
-/// schema, its direction, its **absolute** NULL placement (not flipped by
-/// DESC), and the per-column accessor facts — type, stride, PK byte offset,
-/// null-bit mask — hoisted out of the comparator (they are invariant per key,
-/// and the comparator runs O(n log n) times).
-struct SortKey {
-    ci: usize,
-    asc: bool,
-    nulls_first: bool,
-    tc: TypeCode,
-    stride: usize,
-    /// The column's byte offset inside the packed PK region; `None` for a
-    /// payload column.
-    pk_offset: Option<usize>,
-    /// Single-bit mask of the column's payload null bit; `0` for a PK column
-    /// (never NULL).
-    null_mask: u64,
-}
-
-impl SortKey {
-    /// Every address the comparator needs comes from the one resolved-addressing
-    /// record, [`ColumnLocator`] — not from four independent `is_pk_col` /
-    /// `pk_byte_offset` / `payload_idx` / `wire_stride` lookups that could
-    /// disagree. It is the same record the engine's worker-side ORDER BY
-    /// comparator resolves through — coordinates and bytes alike, a client
-    /// `PkColumn` holding the same OPK region the engine reads.
-    fn new(schema: &Schema, ci: usize, asc: bool, nulls_first: bool) -> Self {
-        let loc = SchemaFacts::locate(schema, ci);
-        let (pk_offset, null_mask) = match loc {
-            ColumnLocator::Pk { byte_off, .. } => (Some(byte_off as usize), 0),
-            ColumnLocator::Payload { slot, .. } => (None, 1u64 << slot),
-        };
-        SortKey {
-            ci,
-            asc,
-            nulls_first,
-            tc: schema.columns[ci].type_code,
-            stride: loc.size(),
-            pk_offset,
-            null_mask,
-        }
-    }
-}
-
-/// Whether the key's column is SQL NULL at row `i` (a PK column's mask is `0`).
-fn col_is_null(batch: &ZSetBatch, key: &SortKey, i: usize) -> bool {
-    batch.nulls[i] & key.null_mask != 0
-}
-
-/// Compare the **non-null** value of the key's column between rows `ra` and
-/// `rb` in content order (callers null-check first). A PK column compares its
-/// OPK window byte-wise — that order *is* the typed order. STRING/BLOB take the
-/// shared `compare_german_strings`, the engine's own content order; every other
-/// payload column takes `cmp_typed_le`, never `FixedInt::decode_le_i64`, which
-/// bit-reinterprets a full-width `U64` as `i64` and would sort `u64::MAX` first.
-fn cmp_col_value(batch: &ZSetBatch, key: &SortKey, ra: usize, rb: usize) -> Ordering {
-    if let Some(off) = key.pk_offset {
-        let wa = batch.pks.col_window(ra, off, key.stride);
-        let wb = batch.pks.col_window(rb, off, key.stride);
-        return wa.cmp(wb);
-    }
-    let (col, s) = (&batch.columns[key.ci], key.stride);
-    let (a, b) = (&col[ra * s..ra * s + s], &col[rb * s..rb * s + s]);
-    if gnitz_wire::is_german_string(key.tc as u8) {
-        gnitz_wire::compare_german_strings(a, &batch.blob, b, &batch.blob)
-    } else {
-        cmp_typed_le(a, b, key.tc as u8)
-    }
-}
-
-/// Compare rows `ra`/`rb` under one key: absolute NULL placement, then the value
-/// comparison reversed for DESC.
-fn cmp_key(batch: &ZSetBatch, key: &SortKey, ra: usize, rb: usize) -> Ordering {
-    match (col_is_null(batch, key, ra), col_is_null(batch, key, rb)) {
-        (true, true) => Ordering::Equal,
-        (true, false) => {
-            if key.nulls_first {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (false, true) => {
-            if key.nulls_first {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        (false, false) => {
-            let ord = cmp_col_value(batch, key, ra, rb);
-            if key.asc {
-                ord
-            } else {
-                ord.reverse()
-            }
-        }
+/// Resolve one sort key against the pre-projection (`actual`) schema. Every
+/// address the comparator needs comes from the one [`gnitz_expr::ColumnLocator`],
+/// resolved once out of the O(n log n) comparator — the same record the engine's
+/// worker-side ORDER BY resolves through, feeding the same [`cmp_order_keys`].
+fn sort_key(schema: &Schema, ci: usize, asc: bool, nulls_first: bool) -> OrderLocator {
+    OrderLocator {
+        loc: SchemaFacts::locate(schema, ci),
+        desc: !asc,
+        nulls_first,
     }
 }
 
 /// Lexicographic compare over the key list — the permutation's sort comparator.
-fn cmp_rows(batch: &ZSetBatch, keys: &[SortKey], ra: usize, rb: usize) -> Ordering {
-    for key in keys {
-        let ord = cmp_key(batch, key, ra, rb);
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-    Ordering::Equal
+/// [`cmp_order_keys`] is the engine's own; the tiebreak the caller appends
+/// (`push_identity_tiebreak`) is what makes the order total here.
+fn cmp_rows(view: &ZSetBatchView, keys: &[OrderLocator], ra: usize, rb: usize) -> Ordering {
+    cmp_order_keys(keys, view, ra, view.get_null_word(ra), view, rb, view.get_null_word(rb))
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +148,7 @@ fn resolve_position(pos: usize, visible: &[usize]) -> Result<usize, GnitzSqlErro
 /// a non-projected source key (§ the read path sorts server-side over a
 /// superset; the client windows). `col` is the full reply-schema column index —
 /// the worker top-k and [`read_spec_finish`] feed it straight to
-/// `SortKey::new`. Positions resolve against the VISIBLE columns; appends are
+/// `sort_key`. Positions resolve against the VISIBLE columns; appends are
 /// hidden and never shift a visible position. An ORDER BY expression is an
 /// `Unsupported` (the caller routes; the executor rejects it identically); an
 /// unknown column is a `Bind` error.
@@ -317,12 +224,12 @@ pub(crate) fn resolve_read_spec_order(
 /// base-table key, or a synthetic key that is a pure function of row content
 /// (`_group_pk`, `_join_pk`, `_set_pk`). They lead the tiebreak, so a PK carrying
 /// anything else decides every tie before a payload column is ever reached.
-fn push_identity_tiebreak(keys: &mut Vec<SortKey>, schema: &Schema) {
+fn push_identity_tiebreak(keys: &mut Vec<OrderLocator>, schema: &Schema) {
     for &ci in &schema.pk_cols {
-        keys.push(SortKey::new(schema, ci as usize, true, true));
+        keys.push(sort_key(schema, ci as usize, true, true));
     }
     for (_, ci, _) in schema.payload_columns() {
-        keys.push(SortKey::new(schema, ci, true, true));
+        keys.push(sort_key(schema, ci, true, true));
     }
 }
 
@@ -386,7 +293,7 @@ pub(crate) fn resolve_out_schema_order(
 
 /// Sort + window an already-server-projected ScanSpec reply by its wire
 /// `OrderKey`s (whose `col` is a full reply-schema column index — fed straight to
-/// `SortKey::new`, NOT resolved by name, so a projected-column / alias ORDER BY
+/// `sort_key`, NOT resolved by name, so a projected-column / alias ORDER BY
 /// works and a hidden appended key stays addressable), then present under the
 /// identity projection (hidden columns stripped downstream). The worker's per-
 /// worker top-k selects the same order (shared comparators), so this re-sort of
@@ -398,9 +305,9 @@ pub(crate) fn read_spec_finish(
     offset: usize,
     limit: Option<usize>,
 ) -> (Schema, ZSetBatch) {
-    let sort_keys: Vec<SortKey> = order_keys
+    let sort_keys: Vec<OrderLocator> = order_keys
         .iter()
-        .map(|k| SortKey::new(&schema, k.col as usize, !k.desc, k.nulls_first))
+        .map(|k| sort_key(&schema, k.col as usize, !k.desc, k.nulls_first))
         .collect();
     finish_window(schema, batch, sort_keys, offset, limit)
 }
@@ -420,7 +327,7 @@ pub(crate) fn read_spec_finish(
 fn finish_window(
     schema: Schema,
     full: ZSetBatch,
-    mut sort_keys: Vec<SortKey>,
+    mut sort_keys: Vec<OrderLocator>,
     offset: usize,
     limit: Option<usize>,
 ) -> (Schema, ZSetBatch) {
@@ -440,6 +347,9 @@ fn finish_window(
     let n = full.len();
     let mut perm: Vec<usize> = (0..n).collect();
     if !sort_keys.is_empty() {
+        // One region list for the whole sort: every comparison reads through it,
+        // and building it per comparison would dominate the compare itself.
+        let view = ZSetBatchView::new(&full, &schema);
         if has_cut {
             push_identity_tiebreak(&mut sort_keys, &schema);
             if let Some(l) = limit {
@@ -447,13 +357,13 @@ fn finish_window(
                 if k == 0 {
                     perm.clear();
                 } else if k < n {
-                    perm.select_nth_unstable_by(k - 1, |&ra, &rb| cmp_rows(&full, &sort_keys, ra, rb));
+                    perm.select_nth_unstable_by(k - 1, |&ra, &rb| cmp_rows(&view, &sort_keys, ra, rb));
                     perm.truncate(k);
                 }
             }
-            perm.sort_unstable_by(|&ra, &rb| cmp_rows(&full, &sort_keys, ra, rb));
+            perm.sort_unstable_by(|&ra, &rb| cmp_rows(&view, &sort_keys, ra, rb));
         } else {
-            perm.sort_by(|&ra, &rb| cmp_rows(&full, &sort_keys, ra, rb));
+            perm.sort_by(|&ra, &rb| cmp_rows(&view, &sort_keys, ra, rb));
         }
     }
 

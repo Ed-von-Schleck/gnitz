@@ -208,7 +208,7 @@ pub fn op_relay_broadcast(sources: &[Option<&Batch>], schema: &SchemaDescriptor)
     }
     // Concatenate the disjoint slices into the full delta once (append_batch
     // relocates each source's blob, so independent source blobs stay valid).
-    let mut full = Batch::with_capacity(*schema, total);
+    let mut full = Batch::with_capacity(schema, total);
     for src in sources.iter().flatten() {
         if src.count > 0 {
             full.append_batch(src, 0, src.count);

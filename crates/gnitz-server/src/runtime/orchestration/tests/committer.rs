@@ -26,7 +26,7 @@ fn fault(text: &str) -> WireFault {
 }
 
 fn batch_of(rows: usize) -> Batch {
-    Batch::zeroed(make_schema_u64_i64(), rows)
+    Batch::zeroed(&make_schema_u64_i64(), rows)
 }
 
 /// A push of `rows` rows. Its client's receiver is dropped: nothing here reads a

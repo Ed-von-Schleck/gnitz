@@ -55,7 +55,7 @@ impl CatalogEngine {
         for family in SysFamily::ALL {
             let table = Table::with_budgets(
                 &sys_family_dir(base_dir, family.name()),
-                family.schema(),
+                *family.schema(),
                 family.id() as u32,
                 RecoverySource::SalReplay,
                 config.ram,
@@ -128,7 +128,7 @@ impl CatalogEngine {
     fn bootstrap_system_tables(&mut self) -> Result<(), String> {
         // 1. Core schema records
         {
-            let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
+            let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
             for (schema_id, name) in [(SYSTEM_SCHEMA_ID, "_system"), (PUBLIC_SCHEMA_ID, "public")] {
                 write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id: schema_id as u64, name }, 1);
             }
@@ -137,7 +137,7 @@ impl CatalogEngine {
 
         // 2. Table records (self-registration of system tables)
         {
-            let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+            let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
             for family in SysFamily::ALL {
                 let pk = gnitz_wire::pack_pk_cols(family.wire().pk_cols);
                 push_table_tab_row(&mut bb, family.id(), SYSTEM_SCHEMA_ID, family.name(), pk, 0, 1);
@@ -149,7 +149,7 @@ impl CatalogEngine {
         // derived from the same gnitz-wire slices the schemas are built from, so
         // the introspectable shape can never drift from the physical one.
         {
-            let mut bb = BatchBuilder::new(SysFamily::Column.schema());
+            let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
             for family in SysFamily::ALL {
                 for (i, c) in family.wire().cols.iter().enumerate() {
                     let cd = ColumnDef {
@@ -209,7 +209,7 @@ impl CatalogEngine {
             let spec = RelationSpec {
                 id: family.id(),
                 kind: RelationKind::SystemCatalog,
-                schema: family.schema(),
+                schema: *family.schema(),
                 directory: sys_family_dir(&base_dir, family.name()),
                 budgets: ViewBudgets::default(),
             };

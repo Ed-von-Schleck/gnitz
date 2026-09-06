@@ -74,7 +74,7 @@ impl RangeProbe {
         // order columns, so a crafted circuit can spend the whole key on the eq
         // prefix while still naming `n_eq + 1` PK columns.
         let eq_size = trace_schema.leading_key_size(n_eq as usize);
-        if eq_size >= trace_schema.pk_stride() as usize {
+        if eq_size >= trace_schema.pk_stride() {
             return Err("range join: eq prefix covers the whole key");
         }
         Ok(RangeProbe::of(eq_size, rel))
@@ -353,7 +353,7 @@ impl<'s> JoinRowWriter<'s> {
         rows: usize,
     ) -> Self {
         JoinRowWriter {
-            output: Batch::with_capacity(*out_schema, rows),
+            output: Batch::with_capacity(out_schema, rows),
             cache: BlobCacheGuard::acquire(out_schema, rows),
             left_schema,
             right_schema,

@@ -800,12 +800,12 @@ fn test_seek_by_index_orphan_entry_terminates() {
     // Forge an orphan index row directly into the index table, bypassing the
     // source-table ingest: index PK = (promoted indexed value || src_pk),
     // weight +1, but no source row with src_pk=12345 exists.
-    let stride = idx_schema.pk_stride() as usize;
+    let stride = idx_schema.pk_stride();
     let mut pk = vec![0u8; stride];
     pk[..idx_key_size].copy_from_slice(&777u64.to_le_bytes()[..idx_key_size]);
     pk[idx_key_size..idx_key_size + 8].copy_from_slice(&12345u64.to_le_bytes());
 
-    let mut b = Batch::with_capacity(idx_schema, 1);
+    let mut b = Batch::with_capacity(&idx_schema, 1);
     b.push_key_row(&pk, 1);
 
     engine
@@ -1389,7 +1389,7 @@ fn test_make_index_schema_composite_layout() {
     assert_eq!(idx.columns[0].type_code, tc::U64);
     assert_eq!(idx.columns[1].type_code, tc::U128);
     assert_eq!(idx.columns[2].type_code, tc::U64); // src pk column type
-    assert_eq!(idx.pk_stride() as usize, 8 + 16 + 8);
+    assert_eq!(idx.pk_stride(), 8 + 16 + 8);
 }
 
 #[test]
@@ -1637,10 +1637,10 @@ fn write_span_matches_the_oracle_on_compound_null_and_entry_shapes() {
     let null_row = b.len() - 1;
 
     let mb = b.as_mem_batch();
-    let stride = src.pk_stride() as usize;
+    let stride = src.pk_stride();
     // The width `IndexKeySpec::split_entry` splits a stored entry at: the index
     // stride is exactly span + source PK, so the two halves are the whole entry.
-    assert_eq!(idx.pk_stride() as usize, spec.key_size() + stride);
+    assert_eq!(idx.pk_stride(), spec.key_size() + stride);
     for row in 0..b.len() {
         let mut got = [0u8; MAX_PK_BYTES];
         let g = spec.write_span(&mb, row, &mut got);

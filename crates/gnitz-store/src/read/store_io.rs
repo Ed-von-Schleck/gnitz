@@ -62,7 +62,7 @@ impl RelationRegistry {
         hydrator: Option<&mut dyn SkeletonHydrator>,
     ) -> Result<Batch, StoreError> {
         let schema = cursor.schema;
-        let stride = schema.pk_stride() as usize;
+        let stride = schema.pk_stride();
         // Flat OPK images, ascending — every walk below visits keys in that
         // order, so the list is sorted by construction.
         let mut skeleton_keys: Vec<u8> = Vec::new();
@@ -78,7 +78,7 @@ impl RelationRegistry {
             Some(k) => k.len() / stride,
             None => cursor.estimated_length(),
         };
-        let mut out = Batch::with_capacity(schema, cap);
+        let mut out = Batch::with_capacity(&schema, cap);
 
         // Tested *before* any copy: `copy_current_row_into` reads every payload
         // column of the row and relocates its German-string blobs, which a
@@ -200,7 +200,7 @@ impl RelationRegistry {
         );
         // The master SCATTERS the key list, so `pks` is this worker's own sublist
         // and `pks.len()` is a tight bound, not a W× over-allocation.
-        let mut out = Batch::with_capacity(result_schema, pks.len());
+        let mut out = Batch::with_capacity(&result_schema, pks.len());
         let mut cursor = entry.open_cursor();
         for pk in pks {
             // The weight gate rejects a tombstone an uncompacted source holds.
@@ -340,7 +340,7 @@ impl RelationRegistry {
                 "No index on cols {col_indices:?} for table {table_id}"
             )));
         };
-        let (start, end) = match ic.key_spec.range_keys(ic.index_schema.pk_stride() as usize, range) {
+        let (start, end) = match ic.key_spec.range_keys(ic.index_schema.pk_stride(), range) {
             Ok(Some(keys)) => keys,
             Ok(None) => return IndexScan::Empty,
             // Malformed: `n_eq` pins every column with no range column left.

@@ -30,9 +30,9 @@ use crate::expr::{MapPlan, PkSource};
 use crate::ops::AdhocFold;
 use crate::relation::RelationRegistry;
 use crate::schema::key::{compare_pk_bytes, opk_key, pack_pk_be, IndexKeySpec};
-use crate::schema::{ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor};
+use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
 use crate::storage::{compare_rows, Batch, PkSetGather, ReadCursor, SourceCursor, StoreError};
-use gnitz_expr::{Evaluator, LogicalProgram};
+use gnitz_expr::{cmp_order_keys, Evaluator, LogicalProgram, OrderLocator};
 
 impl RelationRegistry {
     /// Execute `spec` against `target_id` on this worker's slice,
@@ -254,7 +254,7 @@ fn range_cursor(
     desc: &RangeDescriptor,
     open: impl FnOnce(&[u8], Option<&[u8]>) -> ReadCursor,
 ) -> Result<Option<ReadCursor>, StoreError> {
-    let range_keys = IndexKeySpec::for_pk(schema).range_keys(schema.pk_stride() as usize, desc);
+    let range_keys = IndexKeySpec::for_pk(schema).range_keys(schema.pk_stride(), desc);
     let Some((start, end_key)) = range_keys.map_err(StoreError::rejected)? else {
         return Ok(None);
     };
@@ -275,7 +275,7 @@ fn range_cursor(
 /// `5 + 2^64` are the same U64 PK — left in, the pair would emit its row twice).
 /// Both are hard rejects; release builds must not clamp.
 fn pk_set_opk_keys(source: i64, keys: &[u128], src_schema: &SchemaDescriptor) -> Result<Vec<u8>, StoreError> {
-    let stride = src_schema.pk_stride() as usize;
+    let stride = src_schema.pk_stride();
     if stride > gnitz_wire::NARROW_PK_MAX_BYTES {
         return Err(StoreError::rejected(format!(
             "scan_spec: PkSet gather requires a PK of at most {} bytes (table {source})",
@@ -585,13 +585,6 @@ fn topk_keep(keeper: Batch, order_locs: &[OrderLocator], window: i64) -> (Batch,
     )
 }
 
-/// One resolved ORDER BY key.
-struct OrderLocator {
-    loc: ColumnLocator,
-    desc: bool,
-    nulls_first: bool,
-}
-
 /// Resolve each ORDER BY key to its reply-schema locator.
 ///
 /// `OrderKey.col` is a raw client `u16` reaching `reply_schema.locate`, whose
@@ -615,47 +608,15 @@ fn resolve_order_locs(order: &[OrderKey], reply_schema: &SchemaDescriptor) -> Re
         .collect()
 }
 
-/// The worker-side ORDER BY comparator over two rows of a reply-schema batch.
-/// Byte-for-byte equivalent to the client's `SortKey` order (the shared
-/// `cmp_typed_le` / `compare_german_strings` / OPK tiebreak) so each worker keeps
-/// a superset of its window contribution: user keys (NULLs placed absolutely per
-/// `nulls_first`, values reversed for `desc`), then the deterministic OPK-then-
-/// payload tiebreak.
+/// [`cmp_order_keys`] over the user keys, then the engine's own deterministic
+/// tiebreak. The client applies an equivalent tiebreak over the same total
+/// order; it cannot share this one, which reads `compare_rows`.
 fn scan_spec_cmp(order_locs: &[OrderLocator], batch: &Batch, ra: usize, rb: usize) -> Ordering {
     let a_null = batch.get_null_word(ra);
     let b_null = batch.get_null_word(rb);
-    for key in order_locs {
-        // NULL placement is absolute — `nulls_first` decides it, and `desc` does
-        // not flip it. A PK locator answers `false` on both sides and falls
-        // through to the value compare.
-        match (key.loc.is_null_word(a_null), key.loc.is_null_word(b_null)) {
-            (true, true) => continue,
-            (true, false) => {
-                return if key.nulls_first {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                }
-            }
-            (false, true) => {
-                return if key.nulls_first {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
-            (false, false) => {}
-        }
-        // The locator carries both the addressing and the order rule: a PK
-        // column's OPK window compares raw (order-preserving), a payload column
-        // through the typed dispatch that routes STRING/BLOB by content.
-        let mut ord = key.loc.cmp_non_null(batch, ra, batch, rb);
-        if key.desc {
-            ord = ord.reverse();
-        }
-        if ord != Ordering::Equal {
-            return ord;
-        }
+    match cmp_order_keys(order_locs, batch, ra, a_null, batch, rb, b_null) {
+        Ordering::Equal => {}
+        ord => return ord,
     }
     // Deterministic tiebreak (never reversed): OPK bytes, then payload columns.
     match compare_pk_bytes(batch.get_pk_bytes(ra), batch.get_pk_bytes(rb)) {

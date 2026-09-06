@@ -239,7 +239,7 @@ impl AdhocFold {
     pub(crate) fn finish(self) -> Batch {
         let n_aggs = self.plan.acc_template.len();
         // The exact output row count is the group count — reserve once.
-        let mut output = Batch::with_capacity(self.plan.output_schema, self.rep_rows.count.max(1));
+        let mut output = Batch::with_capacity(&self.plan.output_schema, self.rep_rows.count.max(1));
         let rep_mb = self.rep_rows.as_mem_batch();
         for ord in 0..self.rep_rows.count {
             // Synthetic `_agg_pk`, off the retained representative row — a pure

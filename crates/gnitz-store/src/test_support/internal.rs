@@ -49,7 +49,7 @@ pub fn pk_u64_two_i64_schema() -> SchemaDescriptor {
 /// allowed (multiset deltas), so only a strictly *decreasing* PK is rejected;
 /// `certify_layout(Consolidated)` then debug-verifies the full (PK, payload) order.
 pub fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i64)]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(c0, c1, c2, w, val) in rows {
         b.extend_pk_opk(schema, &[c0 as u128, c1 as u128, c2 as u128]);
         b.extend_weight(&w.to_le_bytes());
@@ -77,11 +77,7 @@ pub fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i
 pub fn make_batch_opk(schema: &SchemaDescriptor, rows: &[(&[u8], i64, i64)]) -> Batch {
     let mut b = BatchBuilder::new(*schema);
     for &(pk, w, val) in rows {
-        assert_eq!(
-            pk.len(),
-            schema.pk_stride() as usize,
-            "PK bytes must be exactly one stride wide"
-        );
+        assert_eq!(pk.len(), schema.pk_stride(), "PK bytes must be exactly one stride wide");
         b.begin_row_bytes(pk, w);
         b.put_int(val as u128);
         b.end_row();
@@ -105,7 +101,7 @@ pub fn wide_row(schema: &SchemaDescriptor, pk: &[u8], w: i64, val: i64) -> Batch
 /// unsigned value — the read-back twin of `Batch::extend_pk` for tests that
 /// inspect a scatter/merge destination buffer directly.
 pub fn read_pk_opk(region: &[u8], i: usize, stride: usize) -> u128 {
-    gnitz_wire::widen_pk_be(&region[i * stride..(i + 1) * stride], stride)
+    gnitz_wire::widen_pk_be(&region[i * stride..(i + 1) * stride])
 }
 
 /// Decode a single signed I64 PK column from its OPK (big-endian, sign-flipped)
@@ -138,7 +134,7 @@ pub fn make_schema_i64pk_i64() -> SchemaDescriptor {
 /// [`Batch::extend_pk_opk`] (sign-flipped big-endian), so the bytes match an
 /// ingested row; callers must pass OPK-sorted rows.
 pub fn make_batch_i64pk(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(pk, w, val) in rows {
         b.extend_pk_opk(schema, &[(pk as u64) as u128]);
         b.extend_weight(&w.to_le_bytes());
@@ -163,7 +159,7 @@ pub fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
 /// from `(pk, weight, bytes)` rows, already in (PK, payload) order. Values over 12
 /// bytes land in the blob heap, so this is the builder for blob-propagation tests.
 pub fn make_batch_bytes(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(pk, w, val) in rows {
         let cell = gnitz_wire::encode_german_string(val, &mut b.blob);
         b.extend_pk(pk as u128);

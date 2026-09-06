@@ -175,7 +175,7 @@ fn a_union_with_an_empty_left_operand_returns_the_right_one() {
 
     assert_eq!(extract_rows(&result), vec![(3, 2, 30), (4, -1, 40)]);
     assert_eq!(
-        result.pk_stride(),
+        usize::from(result.pk_stride()),
         schema.pk_stride(),
         "the output carries the register's own shape",
     );

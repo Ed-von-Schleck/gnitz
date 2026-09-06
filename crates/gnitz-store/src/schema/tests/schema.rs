@@ -131,7 +131,7 @@ fn default_dist_is_full_pk() {
             &[0, 1, 2],
         ),
     ] {
-        assert_eq!(s.pk_stride() as usize, pk_stride);
+        assert_eq!(s.pk_stride(), pk_stride);
         assert_eq!(s.dist_stride(), s.pk_stride(), "default: dist == full PK");
         assert_eq!(s.placement(), Placement::Keyed { prefix_len: 3 });
     }
@@ -150,12 +150,23 @@ fn dist_stride_sums_leading_prefix_columns() {
 }
 
 #[test]
-fn dist_prefix_clamps_out_of_range() {
-    // A k past |PK| (only reachable from a corrupted catalog flag) clamps to
-    // the full PK rather than overflowing the prefix sum.
-    let s = three_col_pk_schema(99);
-    assert_eq!(s.placement(), Placement::Keyed { prefix_len: 3 });
-    assert_eq!(s.dist_stride(), s.pk_stride());
+fn dist_prefix_out_of_range_is_rejected_at_the_decode_boundary() {
+    // A k past |PK| is only reachable from a corrupted or forged catalog flag,
+    // and is refused where that row can be named — not silently normalized to
+    // the full PK here, which would route a corrupt row as if it were sound.
+    let props = gnitz_wire::TableProps {
+        replicated: false,
+        stream: false,
+        dist_prefix_len: 99,
+    };
+    assert!(props.validate_against_pk(3).is_err(), "k=99 over a 3-column PK");
+    assert!(props.validate_against_pk(99).is_ok(), "k == |PK| is the full-PK route");
+    // The descriptor's own prefix sum stays in range regardless: it walks the PK
+    // columns it has, so a forged k cannot run `dist_stride` past `pk_stride`.
+    assert_eq!(
+        three_col_pk_schema(99).dist_stride(),
+        three_col_pk_schema(0).pk_stride()
+    );
 }
 
 /// A relation the router slices by nothing takes the full-PK width, so every
@@ -335,7 +346,7 @@ fn test_max_pk_columns_boundary() {
     let collected: Vec<(usize, usize)> = s.pk_columns().enumerate().map(|(ord, (ci, _))| (ord, ci)).collect();
     let expected: Vec<(usize, usize)> = (0..MAX_PK_COLUMNS).map(|k| (k, k)).collect();
     assert_eq!(collected, expected);
-    assert_eq!(s.pk_stride() as usize, MAX_PK_COLUMNS * 8);
+    assert_eq!(s.pk_stride(), MAX_PK_COLUMNS * 8);
 }
 
 #[test]

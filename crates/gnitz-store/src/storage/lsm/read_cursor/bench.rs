@@ -314,10 +314,10 @@ fn adv_write_shard(
     weights: &[i64],
     vals: &[i64],
 ) -> Rc<MappedShard> {
-    debug_assert_eq!(pks.len(), weights.len() * schema.pk_stride() as usize);
+    debug_assert_eq!(pks.len(), weights.len() * schema.pk_stride());
     debug_assert_eq!(vals.len(), weights.len());
     let rows: Vec<(Vec<u8>, i64, i64)> = pks
-        .chunks_exact(schema.pk_stride() as usize)
+        .chunks_exact(schema.pk_stride())
         .zip(weights.iter().zip(vals))
         .map(|(pk, (&w, &v))| (pk.to_vec(), w, v))
         .collect();
@@ -342,7 +342,7 @@ fn adv_build_interleaved_shards(
     total: usize,
     n: usize,
 ) -> Vec<Rc<MappedShard>> {
-    let stride = schema.pk_stride() as usize;
+    let stride = schema.pk_stride();
     (0..n)
         .map(|s| {
             let keys: Vec<u64> = (s..total).step_by(n).map(|k| k as u64).collect();
@@ -361,8 +361,8 @@ fn adv_build_interleaved_shards(
 /// One dense in-RAM `Batch` over keys `[0, count)` (row `i` = key `i`) — the RAM
 /// tier of the leaf gallop, whose `get_pk_bytes` leaf differs from the shard mmap.
 fn adv_build_batch_dense(schema: SchemaDescriptor, count: usize) -> Rc<Batch> {
-    let stride = schema.pk_stride() as usize;
-    let mut b = Batch::with_capacity(schema, count.max(1));
+    let stride = schema.pk_stride();
+    let mut b = Batch::with_capacity(&schema, count.max(1));
     for i in 0..count {
         b.extend_pk_bytes(&adv_key(i as u64, stride)[..stride]);
         b.extend_weight(&1i64.to_le_bytes());
@@ -377,8 +377,8 @@ fn adv_build_batch_dense(schema: SchemaDescriptor, count: usize) -> Rc<Batch> {
 /// Build an in-RAM `Batch` from `(pk, weight, val)` tuples (already OPK-sorted by
 /// the caller), OPK-encoding each PK. The delta source of the `Multi` fixture.
 fn adv_build_batch_rows(schema: SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Rc<Batch> {
-    let stride = schema.pk_stride() as usize;
-    let mut b = Batch::with_capacity(schema, rows.len().max(1));
+    let stride = schema.pk_stride();
+    let mut b = Batch::with_capacity(&schema, rows.len().max(1));
     for &(pk, w, v) in rows {
         b.extend_pk_bytes(&adv_key(pk, stride)[..stride]);
         b.extend_weight(&w.to_le_bytes());
@@ -397,7 +397,7 @@ fn adv_write_shard_rows(
     name: &str,
     rows: &[(u64, i64, i64)],
 ) -> Rc<MappedShard> {
-    let stride = schema.pk_stride() as usize;
+    let stride = schema.pk_stride();
     let cnt = rows.len();
     let mut pks = vec![0u8; cnt * stride];
     let mut weights = Vec::with_capacity(cnt);
@@ -693,7 +693,7 @@ fn advance_to_leaf_gallop_bench() {
     for &tier in &[Tier::Hot, Tier::Cold] {
         for &stride in &ADV_STRIDES {
             let schema = adv_bench_schema(stride);
-            assert_eq!(schema.pk_stride() as usize, stride, "schema stride mismatch");
+            assert_eq!(schema.pk_stride(), stride, "schema stride mismatch");
             let count = tier.bytes() / stride;
             let shards = adv_build_interleaved_shards(&dir, &schema, &format!("b1_{}_{stride}", tier.tag()), count, 1);
             let shard = &shards[0];

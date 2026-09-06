@@ -163,7 +163,7 @@ fn reduce_output_folds_to_the_latest_aggregate() {
         &[0],
     );
     let make = |rows: &[(u128, i64, i64, i64)]| {
-        let mut b = Batch::with_capacity(schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(&schema, rows.len().max(1));
         for &(pk, w, gv, av) in rows {
             b.extend_pk(pk);
             b.extend_weight(&w.to_le_bytes());

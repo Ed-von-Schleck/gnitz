@@ -367,10 +367,7 @@ fn continuation_frame_decoded_with_schema_hint() {
     let b = decoded.data_batch.as_ref().expect("data_batch");
     assert_eq!(b.len(), 4);
     for i in 0..4usize {
-        assert_eq!(
-            gnitz_wire::widen_pk_be(b.get_pk_bytes(i), b.pk_stride as usize),
-            i as u128
-        );
+        assert_eq!(gnitz_wire::widen_pk_be(b.get_pk_bytes(i)), i as u128);
         assert_eq!(b.get_weight(i), i as i64 + 1, "row {i} weight");
     }
 }

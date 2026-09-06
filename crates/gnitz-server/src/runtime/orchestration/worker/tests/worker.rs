@@ -402,7 +402,7 @@ fn long_string_batch(schema: &SchemaDescriptor, rows: &[(u64, &str)]) -> Batch {
 /// Row `row`'s PK widened from its OPK bytes — `Batch::get_pk` for a
 /// borrowed `MemBatch`.
 fn mem_pk(b: &gnitz_store::storage::MemBatch<'_>, row: usize) -> u128 {
-    gnitz_wire::widen_pk_be(b.get_pk_bytes(row), b.pk_stride as usize)
+    gnitz_wire::widen_pk_be(b.get_pk_bytes(row))
 }
 
 fn consume_one(ptr: *mut u8) -> Vec<u8> {
@@ -679,7 +679,7 @@ fn pending_streams_drain_two_trains_fifo() {
 fn an_oversized_reply_enqueues_a_train() {
     let schema = make_schema_u64_i64(); // 32 B/row on the wire
     let rows = (ipc::FRAME_CAP / 32) + 4096;
-    let batch = Batch::zeroed(schema, rows);
+    let batch = Batch::zeroed(&schema, rows);
 
     let (region, writer) = make_ring();
     let ptr = region.ptr();
@@ -850,7 +850,7 @@ fn a_projected_reply_carries_a_one_off_block() {
     let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
 
     // Fitting projected reply: one frame carrying the projected schema.
-    let small = Batch::zeroed(projected, 2);
+    let small = Batch::zeroed(&projected, 2);
     wp.send_scan_response(
         route(tid as u64, 5, 0),
         small,
@@ -868,7 +868,7 @@ fn a_projected_reply_carries_a_one_off_block() {
 
     // Oversized projected reply: the queued train holds the one-off block.
     let rows = (ipc::FRAME_CAP / 32) + 4096;
-    let big = Batch::zeroed(projected, rows);
+    let big = Batch::zeroed(&projected, rows);
     wp.send_scan_response(route(tid as u64, 6, 0), big, ReplySchema::OneOff(&projected), 0, false);
     assert_eq!(wp.pending_streams.len(), 1);
     let expected_block = crate::catalog::encode_schema_block_ipc(&projected, tid as u32);

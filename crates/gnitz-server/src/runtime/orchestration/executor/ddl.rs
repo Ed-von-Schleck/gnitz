@@ -134,7 +134,7 @@ fn decode_sys_family(tid: i64, slice: &[u8]) -> Result<(SysFamily, Batch), Strin
             family.name()
         ));
     }
-    let batch = decode_client_batch(slice, &family.schema()).map_err(|e| format!("family {tid} decode error: {e}"))?;
+    let batch = decode_client_batch(slice, family.schema()).map_err(|e| format!("family {tid} decode error: {e}"))?;
     Ok((family, batch))
 }
 

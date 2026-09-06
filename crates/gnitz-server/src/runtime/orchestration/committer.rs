@@ -545,7 +545,7 @@ async fn commit_pushes(
             let total_rows = head.len() + tail.iter().map(|b| b.len()).sum::<usize>();
             let total_blob = head.blob.len() + tail.iter().map(|b| b.blob.len()).sum::<usize>();
             match guard_panic("commit_merge", || {
-                let mut m = Batch::with_capacity_blob(shared.disp().schema_desc_for(tid), total_rows, total_blob);
+                let mut m = Batch::with_capacity_blob(&shared.disp().schema_desc_for(tid), total_rows, total_blob);
                 m.append_batch(&head, 0, head.len());
                 for pb in &tail {
                     m.append_batch(pb, 0, pb.len());

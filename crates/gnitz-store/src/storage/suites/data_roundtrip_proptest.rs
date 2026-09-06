@@ -78,7 +78,7 @@ fn arb_schema() -> impl Strategy<Value = SchemaDescriptor> {
 /// single-column PK), so a caller can synthesize an absent prefix-twin key.
 fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128>) {
     let mut rng = crate::test_rng::Rng::new(seed);
-    let mut batch = Batch::with_capacity(*schema, n);
+    let mut batch = Batch::with_capacity(schema, n);
 
     let pk_count = schema.pk_columns().count();
     // The leading PK columns are fixed once; only the trailing column varies
@@ -252,7 +252,7 @@ proptest! {
         }
 
         // Physical retraction: ingest the same rows negated into the memtable.
-        let mut neg = Batch::with_capacity(schema, half.max(1));
+        let mut neg = Batch::with_capacity(&schema, half.max(1));
         neg.append_batch(&original, 0, half);
         neg.map_weights(|w| -w);
         table.ingest_owned_batch(neg).unwrap();
@@ -289,7 +289,7 @@ proptest! {
         for k in 0..WAVES {
             let start = k * rows / WAVES;
             let end = (k + 1) * rows / WAVES;
-            let mut wave = Batch::with_capacity(schema, end - start);
+            let mut wave = Batch::with_capacity(&schema, end - start);
             wave.append_batch(&original, start, end);
             table.ingest_owned_batch(wave).unwrap();
             table.flush().unwrap();

@@ -163,7 +163,7 @@ fn check_pair_fields(family: SysFamily, batch: &Batch, sig: &PkSignature) -> Res
     let mask = family
         .pair_change_mask()
         .expect("check_pk_multiplicity rejects a pair in a family declaring no mask");
-    if compare_rows_except(&family.schema(), batch, nj, batch, pj, mask) != Ordering::Equal {
+    if compare_rows_except(family.schema(), batch, nj, batch, pj, mask) != Ordering::Equal {
         return Err(format!(
             "a system-catalog rewrite pair on {} {} changes a field it may not",
             family.row_noun(),
@@ -340,7 +340,7 @@ impl CatalogEngine {
                 ));
             };
             let (src, ri) = sr.source();
-            if compare_rows(&family.schema(), src, ri, batch, nj) != Ordering::Equal {
+            if compare_rows(family.schema(), src, ri, batch, nj) != Ordering::Equal {
                 return Err(format!(
                     "catalog changed concurrently: the retracted {noun} differs from the current one"
                 ));

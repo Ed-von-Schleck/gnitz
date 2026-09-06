@@ -21,7 +21,7 @@ struct TableRow {
 
 fn live_table_row(engine: &CatalogEngine, tid: i64) -> TableRow {
     let schema = SysFamily::Table.schema();
-    let key = sys_opk(&schema, tid as u128);
+    let key = sys_opk(schema, tid as u128);
     let store = engine.sys_store(SysFamily::Table);
     let sr = store
         .live_row_at(key.pk_bytes())
@@ -45,7 +45,7 @@ fn push_table_row(bb: &mut BatchBuilder, tid: i64, row: &TableRow, name: &str, w
 /// the CAS accepts it), `+1` differs only in `name`.
 fn table_rename_pair(engine: &CatalogEngine, tid: i64, new_name: &str) -> Batch {
     let row = live_table_row(engine, tid);
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
     for (weight, name) in [(-1i64, row.name.as_str()), (1i64, new_name)] {
         push_table_row(&mut bb, tid, &row, name, weight);
     }
@@ -171,7 +171,7 @@ fn stale_snapshot_rename_rejected_long_name() {
     // The `-1` carries a stale (wrong) old name > 12 bytes that does not match the
     // live row — the CAS must reject it.
     let row = live_table_row(&engine, tid);
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
     for (weight, name) in [(-1i64, "stale_wrong_long_name"), (1i64, "new_desired_long_name")] {
         push_table_row(&mut bb, tid, &row, name, weight);
     }
@@ -195,7 +195,7 @@ fn duplicate_live_head_rejected() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
     // A bare `+1` re-ingest of the live row → net weight 2 (a duplicate live head).
     let row = live_table_row(&engine, tid);
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
     push_table_row(&mut bb, tid, &row, &row.name, 1);
     let err = engine.ingest_to_family(TABLE_TAB_ID, &bb.finish()).unwrap_err();
     assert!(
@@ -216,7 +216,7 @@ fn system_range_mutations_rejected() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     let table_drop = {
-        let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+        let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
         push_table_tab_row(
             &mut bb,
             IDX_TAB_ID,
@@ -229,7 +229,7 @@ fn system_range_mutations_rejected() {
         bb.finish()
     };
     let table_rename = {
-        let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+        let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
         push_table_tab_row(
             &mut bb,
             IDX_TAB_ID,
@@ -251,7 +251,7 @@ fn system_range_mutations_rejected() {
         bb.finish()
     };
     let view_rename = {
-        let mut bb = BatchBuilder::new(SysFamily::View.schema());
+        let mut bb = BatchBuilder::new(*SysFamily::View.schema());
         push_view_tab_row(&mut bb, -1, IDX_TAB_ID, "a", 0, 0, 0);
         push_view_tab_row(&mut bb, 1, IDX_TAB_ID, "b", 0, 0, 0);
         bb.finish()
@@ -297,7 +297,7 @@ fn system_range_schema_mutations_rejected() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
     for sid in [SYSTEM_SCHEMA_ID, PUBLIC_SCHEMA_ID] {
-        let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
+        let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
         bb.begin_row(sid as u128, -1);
         bb.put_string("gone");
         bb.end_row();
@@ -325,7 +325,7 @@ fn stale_column_rename_rejected_and_drop_cascade_passes() {
 
     // A COL_TAB rewrite pair whose `-1` carries a stale (wrong) old column name
     // > 12 bytes — the Column precheck arm must reject it via the CAS.
-    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
     for (weight, name) in [(-1i64, "stale_wrong_column_x"), (1i64, "new_column_name_here")] {
         push_col_tab_row(
             &mut bb,
@@ -448,7 +448,7 @@ fn insert_first_rename_pair_lands_the_new_name() {
     let tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
 
     let row = live_table_row(&engine, tid);
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
     for (weight, name) in [(1i64, "renamed"), (-1i64, row.name.as_str())] {
         push_table_row(&mut bb, tid, &row, name, weight);
     }

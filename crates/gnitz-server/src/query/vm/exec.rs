@@ -286,7 +286,7 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
             "VM output register {}: batch label is not the register's physical layout",
             program.out_reg,
         );
-        batch.set_schema(want);
+        batch.set_schema(&want);
         batch
     }))
 }

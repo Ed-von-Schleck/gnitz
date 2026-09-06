@@ -92,7 +92,7 @@ fn probe_schema(schema: &SchemaDescriptor) -> SchemaDescriptor {
 /// from. The source-PK suffix of an index key is left zero: only the leading
 /// column is prefix-matched.
 fn build_check_batch(schema: &SchemaDescriptor, keys: &[u128], src_type: u8) -> Batch {
-    let mut batch = Batch::with_capacity(*schema, keys.len());
+    let mut batch = Batch::with_capacity(schema, keys.len());
     for &k in keys {
         batch.push_key_row(enc_key(schema, k, src_type).pk_bytes(), 1);
     }
@@ -103,7 +103,7 @@ fn build_check_batch(schema: &SchemaDescriptor, keys: &[u128], src_type: u8) -> 
 /// schema's key layout. Each lands verbatim in the PK region, where
 /// [`build_check_batch`] re-encodes column 0.
 fn build_check_batch_pk_bytes<'k>(schema: &SchemaDescriptor, keys: impl ExactSizeIterator<Item = &'k [u8]>) -> Batch {
-    let mut batch = Batch::with_capacity(*schema, keys.len());
+    let mut batch = Batch::with_capacity(schema, keys.len());
     for k in keys {
         batch.push_key_row(k, 1);
     }
@@ -402,7 +402,7 @@ impl UniquePlan<'_> {
 fn enc_key(schema: &SchemaDescriptor, v: u128, src_type: u8) -> PkBuf {
     let key_col = schema.pk_indices()[0] as usize;
     let idx_key_type = schema.columns[key_col].type_code;
-    gnitz_store::schema::key::index_opk_prefix(v, src_type, idx_key_type).widened(schema.pk_stride() as usize)
+    gnitz_store::schema::key::index_opk_prefix(v, src_type, idx_key_type).widened(schema.pk_stride())
 }
 
 /// Fire every check in `checks` as ONE SAL cut and drain the replies, handing
@@ -689,7 +689,7 @@ fn plan_unique_checks<'a>(
         }
         for (col_indices, idx_schema, spec) in uniques {
             let cols = col_indices.as_slice();
-            let stride = idx_schema.pk_stride() as usize;
+            let stride = idx_schema.pk_stride();
 
             // Surviving span → holder PK as a flat arena plus an order vector:
             // 12 bytes per row against the 104 a `(PkBuf, &[u8])` pair costs,

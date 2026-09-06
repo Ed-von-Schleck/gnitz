@@ -493,7 +493,7 @@ pub(crate) fn execute_create_table(
 
     // A SERIAL column must be the table's sole, single-column PRIMARY KEY. This
     // is load-bearing, not just a simplification: the INSERT path spells the
-    // generated id as `PkTuple::from_u128(stride, id)`, which has no compound
+    // generated id as `PkBuf::from_u128(stride, id)`, which has no compound
     // form. Reject a SERIAL column that is part of a compound PK, is not the PK
     // at all, or shares the table with a second SERIAL column.
     if cols.iter().filter(|c| c.is_serial).count() > 1 {

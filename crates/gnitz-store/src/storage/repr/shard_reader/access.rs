@@ -58,7 +58,7 @@ impl MappedShard {
     #[inline(always)]
     pub(crate) fn get_pk(&self, row: usize) -> u128 {
         let width = self.pk_stride as usize;
-        gnitz_wire::widen_pk_be(self.get_pk_bytes(row), width)
+        gnitz_wire::widen_pk_be(&self.get_pk_bytes(row)[..width])
     }
 
     #[inline]
@@ -194,7 +194,7 @@ impl MappedShard {
         schema: &crate::schema::SchemaDescriptor,
         relocate: bool,
     ) -> super::super::batch::Batch {
-        use super::super::batch::{compute_offsets, strides_from_schema, Batch, Layout};
+        use super::super::batch::{compute_offsets_into, strides_from_schema, Batch, Layout, MAX_BATCH_REGIONS};
 
         // A skeleton shard has no payload bytes to materialize: this path
         // force-NULLs every absent column, dereferences every German-string cell,
@@ -215,7 +215,8 @@ impl MappedShard {
         // Compute the final columnar layout before allocating anything.
         let (strides, nr) = strides_from_schema(schema);
         let nr = nr as usize; // 4 + npc
-        let (offsets, total_size) = compute_offsets(&strides, nr, row_count);
+        let mut offsets = [0usize; MAX_BATCH_REGIONS];
+        let total_size = compute_offsets_into(&strides, nr, row_count, &mut offsets);
 
         // One allocation for all fixed-stride columnar data. Materializing a
         // whole shard is among the largest single allocations the engine makes,

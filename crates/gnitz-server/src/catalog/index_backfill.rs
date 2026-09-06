@@ -135,7 +135,6 @@ impl CatalogEngine {
         let Some(owner_schema) = self.registry.entry(table_id).map(|e| e.schema) else {
             return Ok(());
         };
-        let pk_cols = owner_schema.pk_indices();
         let col_defs = self.read_column_defs(table_id);
 
         for (col_idx, cd) in col_defs.iter().enumerate() {
@@ -144,7 +143,7 @@ impl CatalogEngine {
             }
             // Skip every PK column: the PK region already stores them, so an
             // FK whose column is part of the PK needs no separate auto-index.
-            if pk_cols.contains(&(col_idx as u32)) {
+            if owner_schema.is_pk_col(col_idx) {
                 continue;
             }
             let index_name = make_fk_index_name(table_id, col_idx);

@@ -41,7 +41,7 @@ impl PkSetGather {
         src_schema: SchemaDescriptor,
         open: impl FnOnce(&[u8], Option<&[u8]>) -> ReadCursor,
     ) -> Self {
-        let stride = src_schema.pk_stride() as usize;
+        let stride = src_schema.pk_stride();
         debug_assert!(
             stride > 0 && keys.len().is_multiple_of(stride),
             "key buffer is not a whole key list"
@@ -83,13 +83,13 @@ impl PkSetGather {
     pub fn next_chunk(&mut self, max_rows: usize) -> Option<Batch> {
         debug_assert!(max_rows > 0, "a zero row budget would never consume a key");
         let schema = self.cursor.schema;
-        let stride = schema.pk_stride() as usize;
+        let stride = schema.pk_stride();
         let total = self.keys.len() / stride;
         if self.next >= total {
             return None;
         }
         let cap = (total - self.next).min(max_rows);
-        let mut out = Batch::with_capacity(schema, cap);
+        let mut out = Batch::with_capacity(&schema, cap);
         while self.next < total && out.count < max_rows {
             let off = self.next * stride;
             let key = &self.keys[off..off + stride];

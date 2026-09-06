@@ -1,4 +1,5 @@
-//! SQL type constants, schema descriptor types, and row-format utilities.
+//! SQL type constants, schema descriptor types, and the schema-shaping free
+//! functions derived from them.
 //!
 //! These are shared across the storage, IPC, and query layers.
 //!
@@ -27,9 +28,9 @@ pub(crate) use gnitz_expr::ColumnLocator;
 
 /// Order-preserving primary-key (OPK) primitives — every native→OPK encoder
 /// (whole PK, seek wire pair, index leading span), compare/pack, and the
-/// width-tagged `PkBuf` those encoders return. Sits below both schema and
-/// storage, and is the **one** import path: a second re-export would leave the
-/// byte-order rule spelled two ways in adjacent lines of one call site.
+/// re-export of the width-tagged `PkBuf` those encoders return. Sits below both
+/// schema and storage, and is the **one** import path: a second re-export would
+/// leave the byte-order rule spelled two ways in adjacent lines of one call site.
 pub mod key;
 
 /// The precomputed per-row read/encode plan for an index's OPK leading-key span.
@@ -37,25 +38,6 @@ pub mod key;
 /// contract with; re-exported here because a spec is derived from a pair of
 /// schemas, so call sites keep naming `crate::schema::IndexKeySpec`.
 pub use key::IndexKeySpec;
-
-/// Build a `SchemaDescriptor` from a wire-neutral `WireSysCol` slice (the
-/// canonical system-table column arrays in `gnitz-wire`). The single builder
-/// behind every consumer of those arrays — chiefly the catalog's compile-time
-/// `SCHEMAS` statics — homed here (L1) so they can never drift. `const`: zero
-/// runtime allocation.
-///
-/// Every such family is [`Placement::Replicated`]: DDL is master-broadcast, so
-/// each worker holds an identical full copy.
-pub const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: &[u32]) -> SchemaDescriptor {
-    let mut buf = [SchemaColumn::EMPTY; MAX_COLUMNS];
-    let mut i = 0;
-    while i < cols.len() {
-        buf[i] = SchemaColumn::new(cols[i].type_code as u8, if cols[i].nullable { 1 } else { 0 });
-        i += 1;
-    }
-    let (head, _) = buf.split_at(cols.len());
-    SchemaDescriptor::new_with_placement(head, pk_indices, Placement::Replicated)
-}
 
 /// Accumulator for a derived schema whose PK is its leading `pk_len` columns —
 /// the shape of every schema the compiler and the reduce planner build
@@ -163,6 +145,9 @@ impl SchemaColumn {
     /// validator's `check_col` and the catalog's `check_col_defs` are for.
     pub const fn new(type_code: u8, nullable: u8) -> Self {
         debug_assert!(gnitz_wire::is_valid_type_code(type_code), "invalid column type code");
+        // A flag, not a count: the two parameters are bare integers, so a caller
+        // passing a column ordinal here otherwise builds a silently nullable column.
+        debug_assert!(nullable <= 1, "column nullable flag must be 0 or 1");
         Self::raw(type_code, nullable)
     }
 
@@ -249,10 +234,11 @@ pub enum Placement {
 
 impl Placement {
     /// The persisted "default distribution" sentinel: `prefix_len == 0` means
-    /// the full PK. Constructors normalize it (and any out-of-range value a
-    /// corrupt catalog flag could carry) against the schema's PK arity, so a
+    /// the full PK. Constructors normalize it against the schema's PK arity, so a
     /// `Keyed` prefix read back off a descriptor is never the sentinel — it is
     /// `pk_count` for the default and `1..pk_count` for a `CLUSTER BY` prefix.
+    /// An out-of-range prefix is not normalized here: `TableProps::validate_against_pk`
+    /// rejects it at the decode boundary, where the corrupt row can be named.
     pub const KEYED_DEFAULT: Placement = Placement::Keyed { prefix_len: 0 };
 
     /// True iff a row's owning worker is derived from its key. A relation that
@@ -278,11 +264,7 @@ impl Placement {
     const fn resolve(self, pk_count: usize) -> (Placement, usize) {
         match self {
             Placement::Keyed { prefix_len } => {
-                let k = if prefix_len == 0 || prefix_len as usize > pk_count {
-                    pk_count
-                } else {
-                    prefix_len as usize
-                };
+                let k = if prefix_len == 0 { pk_count } else { prefix_len as usize };
                 (Placement::Keyed { prefix_len: k as u8 }, k)
             }
             other => (other, pk_count),
@@ -334,8 +316,7 @@ pub struct SchemaDescriptor {
 // `SchemaDescriptor` is `Copy` and embedded by value all over the engine
 // (`Batch` among them, which the VM replaces several times per instruction), so
 // a field added here is paid for at every copy — a cost the three fixed-capacity
-// arrays make invisible at the definition. The bound is a boundary, not slack:
-// `4+4+20+1+1+2+65+1+1+260 = 359`, aligned to 360.
+// arrays make invisible at the definition. The bound is a boundary, not slack.
 const _: () = assert!(std::mem::size_of::<SchemaDescriptor>() <= 360);
 
 const fn compute_payload_to_ci(num_columns: usize, pk_indices: &[u32]) -> [u8; MAX_COLUMNS] {
@@ -375,9 +356,10 @@ impl SchemaDescriptor {
     /// sources.
     ///
     /// **A `const fn` whose `assert!`s fire in release and abort the process.**
-    /// Untrusted column lists never reach it directly: `DerivedSchema::push_pk`
-    /// and `build_schema_from_col_defs` are the total front doors that reject
-    /// what this would abort on. A `Keyed` prefix is **normalized**: `0` (the persisted "default"
+    /// Untrusted column lists never reach it directly: `DerivedSchema::push_pk`,
+    /// `build_schema_from_col_defs`, `decode_schema_block`,
+    /// `union_nullability_merge` and `unique_preflight_wire_schema` are the total
+    /// front doors that reject what this would abort on. A `Keyed` prefix is **normalized**: `0` (the persisted "default"
     /// sentinel) and any value past `|PK|` (only reachable from a corrupted
     /// catalog flag) both clamp to the full PK, so `dist_stride == pk_stride` and
     /// routing stays byte-identical to the full-PK default. Every derived schema
@@ -492,14 +474,6 @@ impl SchemaDescriptor {
         Self::new_with_placement(cols, pk, placement)
     }
 
-    /// The narrowest well-formed schema: one non-nullable U64 PK column and no
-    /// payload. The placeholder for a slot that must hold *a* descriptor before
-    /// the real one is known (the emitter's register-meta resize), and the
-    /// default fixture wherever a test needs a schema it does not read.
-    pub const fn minimal_u64() -> Self {
-        Self::new(&[SchemaColumn::new(type_code::U64, 0)], &[0])
-    }
-
     /// Number of logical columns in this schema (PK + payload).
     #[inline]
     pub const fn num_columns(&self) -> usize {
@@ -555,37 +529,36 @@ impl SchemaDescriptor {
     }
 
     /// Total bytes per row of the PK region. Precomputed in `new()`;
-    /// O(1) field load. Returns `u8` to mirror `SchemaColumn::size()`
-    /// and the storage-layer `pk_stride` caches; callers that need
-    /// `usize` for buffer arithmetic cast at the use site.
+    /// O(1) field load. The field stays a `u8` to match `SchemaColumn::size()`
+    /// and the storage-layer `pk_stride` caches; almost every reader wants a
+    /// buffer offset, so the widening happens here rather than at each use site.
     #[inline]
-    pub const fn pk_stride(&self) -> u8 {
-        self.pk_stride
+    pub const fn pk_stride(&self) -> usize {
+        self.pk_stride as usize
     }
 
     /// Byte width of the distribution prefix (the leading PK slice that
     /// `worker_for_pk` hashes); `pk_stride()` for the full-PK default. Prefer
     /// `worker_for_pk` over reading this and slicing by hand.
     #[inline]
-    pub const fn dist_stride(&self) -> u8 {
-        self.dist_stride
+    pub const fn dist_stride(&self) -> usize {
+        self.dist_stride as usize
     }
 
     /// The single **table-key router**: maps a row's full OPK PK bytes to its
     /// owning worker by hashing only the leading distribution prefix
-    /// (`key[..dist_stride()]`). Every write-side scatter, ingest/probe, and seek
-    /// routes a base-table PK through here, so the "slice to the distribution
-    /// prefix" contract — the load-bearing half of the prefix-distribution feature
-    /// — lives in one place and cannot be forgotten by a new caller. For the
-    /// full-PK default `dist_stride() == pk_stride()`, so this is byte-identical to
-    /// hashing the whole PK. `key` is the full PK (`key.len() >= dist_stride()`).
+    /// (`key[..dist_stride()]`), so the slicing rule lives in one place. Its two
+    /// production callers are the write scatter (`storage/repr/scatter.rs`) and
+    /// the master's seek unicast (`master/dispatch.rs`); a constraint probe does
+    /// not appear, because those broadcast. `key` is the full PK, and for the
+    /// full-PK default this is byte-identical to hashing all of it.
     ///
     /// Not for **join-key** routing: the exchange relay scatters route an already
     /// reindexed `_join_pk` over a derived schema and call `worker_for_pk_bytes`
     /// directly (their key is the whole region, never a table prefix).
     #[inline]
     pub fn worker_for_pk(&self, key: &[u8], num_workers: usize) -> usize {
-        gnitz_wire::worker_for_pk_bytes(&key[..self.dist_stride() as usize], num_workers)
+        gnitz_wire::worker_for_pk_bytes(&key[..self.dist_stride()], num_workers)
     }
 
     /// Where this relation's rows live — the one value the store shape
@@ -659,16 +632,14 @@ impl SchemaDescriptor {
     /// Dense payload slot (batch payload region + null-bitmap bit position) for
     /// `col_idx`, or `None` when it names no payload column of this schema —
     /// a PK column, or out of range. Total, so it doubles as the "is this a real
-    /// payload column" test; [`Self::locate`] feeds the result straight to
-    /// `ColumnLocator::Payload`.
+    /// payload column" test. Derived from [`Self::locate`], so "count the PK
+    /// columns below `col_idx`" has one implementation.
     #[inline]
     pub(crate) fn try_payload_idx(&self, col_idx: usize) -> Option<usize> {
-        if col_idx >= self.num_columns() || self.is_pk_col(col_idx) {
-            return None;
+        match (col_idx < self.num_columns()).then(|| self.locate(col_idx))? {
+            ColumnLocator::Payload { slot, .. } => Some(slot as usize),
+            ColumnLocator::Pk { .. } => None,
         }
-        // Count the PK columns below `col_idx`, not `col_idx - pk_count`: the PK
-        // list is in general neither a prefix of the columns nor sorted.
-        Some(col_idx - self.pk_indices().iter().filter(|&&p| (p as usize) < col_idx).count())
     }
 
     /// True iff column `ci` is a PK column. Total: every PK index is in range,
@@ -710,25 +681,10 @@ impl SchemaDescriptor {
         })
     }
 
-    /// Byte offset of `col_idx` within the row's PK region. Walks
-    /// `pk_columns()` in pk-list order; caller must ensure `col_idx` is
-    /// a PK column.
-    pub fn pk_byte_offset(&self, col_idx: usize) -> u8 {
-        debug_assert!(self.is_pk_col(col_idx), "pk_byte_offset: col_idx must be a pk column");
-        let mut off: u16 = 0;
-        for (pk_ci, c) in self.pk_columns() {
-            if pk_ci == col_idx {
-                return off as u8;
-            }
-            off += c.size() as u16;
-        }
-        unreachable!("pk_byte_offset: col_idx is a pk column but not found in pk_columns()");
-    }
-
-    /// Byte width of the leading `n` columns. For an index schema this is the
-    /// OPK leading-key span width (`idx_key_size`) — the sum of every promoted
-    /// column's width, never just `columns[0]` (a composite `UNIQUE (a, b)`
-    /// span can exceed 16 bytes); the source-PK suffix begins there.
+    /// Byte width of the leading `n` columns — the sum, never just `columns[0]`,
+    /// since a multi-column span can exceed 16 bytes. Its one production caller
+    /// takes a join trace schema's equi-key prefix width (`ops/join.rs`); index
+    /// code reads `IndexKeySpec::key_size()` instead.
     #[inline]
     pub fn leading_key_size(&self, n: usize) -> usize {
         self.columns[..n].iter().map(|c| c.size() as usize).sum()
@@ -738,29 +694,34 @@ impl SchemaDescriptor {
     /// for reading a column whose index is not statically a payload column.
     #[inline]
     pub fn locate(&self, col_idx: usize) -> ColumnLocator {
-        // Release-active bound. An out-of-range `col_idx` otherwise resolves to
-        // the PK arm and dies in `pk_byte_offset`'s `unreachable!()` with a
-        // message naming neither `locate` nor the bad index. A `debug_assert`
-        // would let that ship in release, so this is a hard `assert!`. It is a
-        // last-line guard against an internal bug, distinct from untrusted-index
-        // rejection (a client-supplied circuit naming an OOB column). `locate`
-        // runs at extractor/program setup and, at worst, once per group
-        // (`GroupKeyCols::new`) — never per row — so the check and the PK arm's
-        // `pk_byte_offset` walk are both free.
+        // Release-active: an out-of-range `col_idx` otherwise falls through to
+        // the payload arm with a slot no batch region answers for. A last-line
+        // guard against an internal bug — an untrusted column index is rejected
+        // by its own decoder — and free, since this never runs per row.
         assert!(
             col_idx < self.num_columns(),
             "locate: col_idx {col_idx} out of bounds (num_columns = {})",
             self.num_columns(),
         );
-        let size = self.columns[col_idx].size();
-        let type_code = self.columns[col_idx].type_code;
-        match self.try_payload_idx(col_idx) {
-            None => ColumnLocator::Pk {
-                byte_off: self.pk_byte_offset(col_idx),
-                size,
-                type_code,
-            },
-            Some(slot) => ColumnLocator::Payload { slot: slot as u8, size, type_code },
+        let col = self.columns[col_idx];
+        let (mut byte_off, mut pk_below) = (0u8, 0usize);
+        for (ci, c) in self.pk_columns() {
+            if ci == col_idx {
+                return ColumnLocator::Pk {
+                    byte_off,
+                    size: col.size(),
+                    type_code: col.type_code,
+                };
+            }
+            byte_off += c.size();
+            pk_below += usize::from(ci < col_idx);
+        }
+        // `byte_off` has reached `pk_stride` here, which `new_with_placement`
+        // asserts fits `MAX_PK_BYTES` — so the accumulation above cannot wrap.
+        ColumnLocator::Payload {
+            slot: (col_idx - pk_below) as u8,
+            size: col.size(),
+            type_code: col.type_code,
         }
     }
 }
@@ -844,10 +805,6 @@ impl PartialEq for SchemaDescriptor {
 impl Eq for SchemaDescriptor {}
 
 // ---------------------------------------------------------------------------
-// Row-format utilities
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // Schema-shaping free functions
 //
 // Derived purely from a `SchemaDescriptor` (no catalog or storage state), and
@@ -865,6 +822,9 @@ impl Eq for SchemaDescriptor {}
 /// (full or leading-prefix), then reads the source PK bytes directly out of the
 /// index PK suffix. The 1-element list is the single-column index.
 ///
+/// The schema is the [`IndexKeySpec`]'s own, so a caller needing both builds the
+/// spec once and takes the schema off it rather than calling here.
+///
 /// Total: every rejection is an `Err`, never the constructor's abort. An
 /// over-limit schema is reachable only for a *composite* index (a single-column
 /// index — including every FK auto-index — always fits, since
@@ -872,34 +832,9 @@ impl Eq for SchemaDescriptor {}
 /// `gnitz-core` client or a crafted persisted row replayed at boot, neither of
 /// which goes through the SQL planner's pre-check.
 pub fn make_index_schema(source_cols: &[u32], source: &SchemaDescriptor) -> Result<SchemaDescriptor, String> {
-    let mut col_types: Vec<u8> = Vec::with_capacity(source_cols.len());
-    for &c in source_cols {
-        if c as usize >= source.num_columns() {
-            return Err(format!(
-                "Index: column index {} out of bounds (columns={})",
-                c,
-                source.num_columns()
-            ));
-        }
-        col_types.push(source.columns[c as usize].type_code);
-    }
-    let src_pk = source.pk_indices();
-    // Shared with the SQL planner's CREATE INDEX pre-check, so the promotion
-    // rule and the arity/stride limits can never disagree across the layers.
-    let promoted = gnitz_wire::index_key_types(&col_types, src_pk.len(), source.pk_stride() as usize)
-        .map_err(|r| r.to_string())?;
-    let mut b = DerivedSchema::new();
-    // Structural backstop: `index_key_types` above already rejects arity, stride
-    // and ineligible types, so this cannot know which rule the builder tripped.
-    let over = || "Index: composite key is not a valid primary key".to_string();
-    for &t in &promoted {
-        b.push_pk(SchemaColumn::new(t, 0)).ok_or_else(over)?;
-    }
-    for &ci in src_pk {
-        b.push_pk(SchemaColumn::new(source.columns[ci as usize].type_code, 0))
-            .ok_or_else(over)?;
-    }
-    Ok(b.finish())
+    IndexKeySpec::new(source_cols, source)?
+        .output_schema(source)
+        .ok_or_else(|| "Index: composite key is not a valid primary key".to_string())
 }
 
 /// Rebuild a [`SchemaDescriptor`] from a meta-schema block. Every wire rule —
@@ -916,6 +851,14 @@ pub fn decode_schema_block(data: &[u8], verify_checksum: bool) -> Result<SchemaD
     }
     Ok(SchemaDescriptor::new(&cols[..sb.num_columns()], sb.pk_indices()))
 }
+
+/// The delta store's stamp column: the `_tick` round number, leading the delta
+/// schema's PK. Named here so the stamp/strip pair below reads its width off the
+/// column rather than repeating the literal at each offset.
+pub(crate) const DELTA_TICK_COL: SchemaColumn = SchemaColumn::new(type_code::U64, 0);
+// `stamped_with_pk_prefix` writes the stamp as a `u64`'s big-endian image, which
+// is this column's OPK image only at this width.
+const _: () = assert!(DELTA_TICK_COL.size() as usize == 8);
 
 /// The delta store's schema for a fed view: a `_tick` U64 key column, then the
 /// view's PK columns in PK-list order, then the view's payload columns in schema
@@ -951,7 +894,7 @@ pub fn make_delta_schema(view: &SchemaDescriptor) -> Option<SchemaDescriptor> {
     let mut b = DerivedSchema::new();
     for c in gnitz_wire::delta_schema_order(view.pk_indices(), view.num_columns()) {
         match c {
-            DeltaCol::Tick => b.push_pk(SchemaColumn::new(type_code::U64, 0))?,
+            DeltaCol::Tick => b.push_pk(DELTA_TICK_COL)?,
             DeltaCol::Key(i) => b.push_pk(view.columns[i])?,
             DeltaCol::Payload(i) => b.push(view.columns[i])?,
         }

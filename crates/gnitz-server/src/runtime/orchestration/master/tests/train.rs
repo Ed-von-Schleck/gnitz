@@ -220,10 +220,7 @@ fn drain_index_scan_merges_chunked_and_single_frame_trains() {
         |mb, frame_len| {
             assert!(frame_len > 0, "sink receives the raw frame byte length");
             for i in 0..mb.len() {
-                rows.push((
-                    gnitz_wire::widen_pk_be(mb.get_pk_bytes(i), mb.pk_stride as usize),
-                    mb.get_weight(i),
-                ));
+                rows.push((gnitz_wire::widen_pk_be(mb.get_pk_bytes(i)), mb.get_weight(i)));
             }
             Ok(())
         },
@@ -242,7 +239,7 @@ fn drain_index_scan_merges_chunked_and_single_frame_trains() {
 #[test]
 fn drain_index_scan_rejects_first_frame_schema_mismatch() {
     let wire_schema = two_col_schema();
-    let expected = SchemaDescriptor::minimal_u64(); // different column count
+    let expected = crate::test_support::pk_only_schema(&[gnitz_store::schema::type_code::U64]); // different column count
     let batch = make_row_batch(wire_schema, &[(1, 1, Some(10))]);
 
     let (fx, writers) = DrainFixture::new(1);

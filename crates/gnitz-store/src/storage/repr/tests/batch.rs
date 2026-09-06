@@ -15,7 +15,7 @@ fn write_to_batch_narrow_pk_odd_rowcount_round_trips() {
     // U64 = stride 8 (always aligned) as a control.
     for tc in [type_code::U8, type_code::U16, type_code::U32, type_code::U64] {
         let schema = crate::test_support::pk_payload_schema(&[tc]);
-        let stride = schema.pk_stride() as usize;
+        let stride = schema.pk_stride();
 
         let mut src = Batch::empty_with_schema(&schema);
         src.reserve_rows(rows.len());
@@ -69,7 +69,7 @@ fn append_test_row(b: &mut Batch, pk: u128, w: i64, val: i64, null_word: u64) {
 /// (real consolidation) and the debug verifier that rejects a spoofed-flag
 /// version of it.
 fn build_corrupt_batch(schema: &SchemaDescriptor) -> Batch {
-    let mut b = Batch::with_capacity(*schema, 5);
+    let mut b = Batch::with_capacity(schema, 5);
     append_test_row(&mut b, 5, 1, 100, 0); // dup A
     append_test_row(&mut b, 1, 1, 7, 0); // ghost +
     append_test_row(&mut b, 9, 1, -1, 1); // NULL cell over non-zero (0xFF..) bytes
@@ -128,7 +128,7 @@ fn extend_pk_round_trips_at_every_narrow_stride() {
 
     for &(tcs, stride, keys) in cases {
         let schema = pk_payload_schema(tcs);
-        assert_eq!(schema.pk_stride() as usize, stride);
+        assert_eq!(schema.pk_stride(), stride);
         let mut b = Batch::empty_with_schema(&schema);
         b.reserve_rows(keys.len());
         for &pk in keys {
@@ -157,7 +157,7 @@ fn extend_pk_bytes_stores_the_key_verbatim() {
         (&[type_code::U64, type_code::U64, type_code::U64], 24),
     ] {
         let schema = pk_payload_schema(tcs);
-        assert_eq!(schema.pk_stride() as usize, stride);
+        assert_eq!(schema.pk_stride(), stride);
         let keys: [Vec<u8>; 3] = [
             (0..stride as u8).map(|i| i.wrapping_mul(17).wrapping_add(1)).collect(),
             vec![0u8; stride],
@@ -261,7 +261,7 @@ fn append_row_from_source_bytes_copies_pk_weight_and_payload() {
     let schema = pk_payload_schema(&[type_code::U64]);
     let src = crate::test_support::make_batch_opk(&schema, &[(&0xDEAD_BEEFu64.to_be_bytes(), 1, 0x4242)]);
 
-    let mut dst = Batch::with_capacity(schema, 1);
+    let mut dst = Batch::with_capacity(&schema, 1);
     dst.append_row_from_source_bytes(src.get_pk_bytes(0), -1, &src, 0, None);
 
     assert_eq!(dst.count, 1);
@@ -324,7 +324,7 @@ fn honest_sorted_consolidated_batch_passes_verifiers() {
 #[test]
 fn layout_lifecycle_default_raise_and_lower() {
     let schema = crate::test_support::pk_payload_schema(&[type_code::U64]);
-    let mut b = Batch::with_capacity(schema, 4);
+    let mut b = Batch::with_capacity(&schema, 4);
     assert_eq!(b.layout(), Layout::Raw, "constructor defaults Raw");
     append_test_row(&mut b, 1, 1, 10, 0);
     append_test_row(&mut b, 2, 1, 20, 0);
@@ -335,7 +335,7 @@ fn layout_lifecycle_default_raise_and_lower() {
     assert!(b.is_consolidated());
 
     // Any append downgrades all the way to Raw (the W2M-class fail-safe).
-    let mut src = Batch::with_capacity(schema, 1);
+    let mut src = Batch::with_capacity(&schema, 1);
     append_test_row(&mut src, 3, 1, 30, 0);
     b.append_batch(&src, 0, 1);
     assert_eq!(b.layout(), Layout::Raw, "append downgrades to Raw");
@@ -352,7 +352,7 @@ fn layout_lifecycle_default_raise_and_lower() {
 #[test]
 fn empty_and_single_row_batches_read_consolidated() {
     let schema = crate::test_support::pk_payload_schema(&[type_code::U64]);
-    let b = Batch::with_capacity(schema, 4);
+    let b = Batch::with_capacity(&schema, 4);
     assert_eq!(b.count, 0);
     assert_eq!(b.layout(), Layout::Raw);
     assert!(b.is_consolidated(), "empty batch is structurally consolidated");
@@ -383,7 +383,7 @@ fn owned_batch_roundtrip() {
 
     let mb = batch.as_mem_batch();
     assert_eq!(mb.count, 2);
-    assert_eq!(gnitz_wire::widen_pk_be(mb.get_pk_bytes(0), mb.pk_stride as usize), 10);
+    assert_eq!(gnitz_wire::widen_pk_be(mb.get_pk_bytes(0)), 10);
     assert_eq!(mb.get_weight(1), 1);
 }
 
@@ -391,7 +391,7 @@ fn owned_batch_roundtrip() {
 fn batch_append_batch() {
     let schema = crate::test_support::make_schema_u64_i64();
     let src = crate::test_support::make_batch(&schema, &[(10, 1, 100), (20, 1, 200), (30, 1, 300)]);
-    let mut dst = Batch::with_capacity(schema, 8);
+    let mut dst = Batch::with_capacity(&schema, 8);
 
     dst.append_batch(&src, 0, 3);
     assert_eq!(dst.count, 3);
@@ -583,7 +583,7 @@ fn empty_batch_drop_is_noop() {
     use crate::storage::batch_pool::acquire_buf;
     while acquire_buf().capacity() > 0 {}
 
-    let batch = Batch::empty_with_schema(&SchemaDescriptor::minimal_u64());
+    let batch = Batch::empty_with_schema(&crate::test_support::pk_only_schema(&[type_code::U64]));
     assert_eq!(batch.data_capacity(), 0);
     drop(batch);
 
@@ -611,7 +611,7 @@ fn read_payload_string_out_of_bounds_offset_returns_empty() {
         ],
         &[0],
     );
-    let mut batch = Batch::with_capacity(schema, 1);
+    let mut batch = Batch::with_capacity(&schema, 1);
     batch.extend_pk(1);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());

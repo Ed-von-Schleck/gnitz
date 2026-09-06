@@ -258,6 +258,65 @@ impl ColumnLocator {
     }
 }
 
+/// One resolved ORDER BY key: where the column lives, plus the two order rules
+/// that decide its contribution — the direction, and the **absolute** NULL
+/// placement `desc` does not flip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrderLocator {
+    pub loc: ColumnLocator,
+    pub desc: bool,
+    pub nulls_first: bool,
+}
+
+/// The one ORDER BY comparator, read by both the worker's top-k and the client's
+/// ordering sink. Lexicographic over the keys; NULL placement is absolute —
+/// `nulls_first` decides it and `desc` does not flip it. `Equal` means the keys
+/// did not separate the rows, and each caller applies its own tiebreak.
+#[inline]
+pub fn cmp_order_keys<A: RowSource, B: RowSource>(
+    keys: &[OrderLocator],
+    a: &A,
+    ra: usize,
+    na: u64,
+    b: &B,
+    rb: usize,
+    nb: u64,
+) -> Ordering {
+    for key in keys {
+        // A PK locator answers `false` on both sides and falls through to the
+        // value compare.
+        match (key.loc.is_null_word(na), key.loc.is_null_word(nb)) {
+            (true, true) => continue,
+            (true, false) => {
+                return if key.nulls_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, true) => {
+                return if key.nulls_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, false) => {}
+        }
+        // The locator carries both the addressing and the order rule: a PK
+        // column's OPK window compares raw (order-preserving), a payload column
+        // through the typed dispatch that routes STRING/BLOB by content.
+        let mut ord = key.loc.cmp_non_null(a, ra, b, rb);
+        if key.desc {
+            ord = ord.reverse();
+        }
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
 #[cfg(test)]
 #[path = "tests/locator.rs"]
 mod tests;

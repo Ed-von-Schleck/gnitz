@@ -58,7 +58,7 @@ fn count_records(mut c: ReadCursor) -> usize {
 /// A single-row unbounded-VIEW_TAB batch for tests that register a view via the
 /// raw system-table path.
 fn build_view_tab_row(vid: i64, view_name: &str) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::View.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::View.schema());
     push_view_tab_row(&mut bb, 1, vid, view_name, 0, 0, 0);
     bb.finish()
 }
@@ -174,7 +174,7 @@ fn build_table_tab_row(tid: i64, raw_pk_cols: u64, table_name: &str) -> Batch {
 /// builder, so a fixture cannot drift from the layout the engine registers
 /// tables with.
 fn build_table_tab_row_flags(tid: i64, raw_pk_cols: u64, table_name: &str, flags: u64) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
     push_table_tab_row(&mut bb, tid, PUBLIC_SCHEMA_ID, table_name, raw_pk_cols, flags, 1);
     bb.finish()
 }
@@ -224,7 +224,7 @@ fn col_alter_pair(
 ) -> Batch {
     let mut altered = old.clone();
     mutate(&mut altered);
-    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
     push_col_tab_row(&mut bb, owner_id, owner_kind, col_idx, old, -1);
     push_col_tab_row(&mut bb, owner_id, owner_kind, col_idx, &altered, 1);
     bb.finish()

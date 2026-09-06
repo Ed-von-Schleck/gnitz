@@ -193,7 +193,7 @@ fn widen_pk_be_matches_the_general_form() {
             let mut buf = [0u8; 16];
             buf[16 - stride..].copy_from_slice(&bytes[..stride]);
             assert_eq!(
-                widen_pk_be(&bytes, stride),
+                widen_pk_be(&bytes[..stride]),
                 u128::from_be_bytes(buf),
                 "stride {stride} diverges from the general form"
             );
@@ -322,7 +322,7 @@ fn worker_for_pk_bytes_matches_widened_key() {
             for nw in [1usize, 2, 3, 4, 7, 16, MAX_WORKERS] {
                 assert_eq!(
                     worker_for_pk_bytes(&opk[..sz], nw),
-                    worker_for_key(widen_pk_be(&opk[..sz], sz), nw),
+                    worker_for_key(widen_pk_be(&opk[..sz]), nw),
                     "tc={tc} v={v} nw={nw}",
                 );
             }
@@ -379,8 +379,8 @@ fn assert_copartition(v: i128, l: u8, r: u8, t: u8) {
     let (bl, br) = (promote(v, l, t), promote(v, r, t));
     assert_eq!(&bl[..tw], &br[..tw], "byte-identity failed: v={v} L={l} R={r} T={t}");
     assert_eq!(
-        widen_pk_be(&bl[..tw], tw),
-        widen_pk_be(&br[..tw], tw),
+        widen_pk_be(&bl[..tw]),
+        widen_pk_be(&br[..tw]),
         "widen_pk_be disagreement: v={v} T={t}"
     );
 }

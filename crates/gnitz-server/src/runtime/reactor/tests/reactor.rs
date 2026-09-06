@@ -3,8 +3,6 @@
 
 use std::time::Duration;
 
-use gnitz_store::schema::SchemaDescriptor;
-
 use super::test_support::*;
 use super::*;
 
@@ -74,7 +72,9 @@ fn synthetic_exchange_wire(view_id: i64, req_id: u64) -> DecodedWire {
     let mut w = synthetic_decoded_wire(req_id);
     w.control.target_id = view_id as u64;
     w.control.flags = FLAG_EXCHANGE;
-    w.schema = Some(SchemaDescriptor::minimal_u64());
+    w.schema = Some(crate::test_support::pk_only_schema(&[
+        gnitz_store::schema::type_code::U64,
+    ]));
     w
 }
 

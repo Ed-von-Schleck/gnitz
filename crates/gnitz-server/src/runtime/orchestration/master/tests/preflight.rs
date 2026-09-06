@@ -81,7 +81,7 @@ fn probe_schema_carries_the_source_placement() {
     );
     assert_ne!(
         pk_only.dist_stride(),
-        pk_only.pk_stride() as u8,
+        pk_only.pk_stride(),
         "the fixture must actually be CLUSTER BY, or the test proves nothing"
     );
 }

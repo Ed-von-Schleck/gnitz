@@ -16,7 +16,7 @@
 
 use crate::codec::pk_codec::{bound_key_literal, bound_literal, pack_num, BoundLit, NumLit};
 use crate::ir::{BExpr, BinOp, BoundExpr};
-use gnitz_core::{Cut, FixedInt, IndexMeta, PkColList, PkTuple, RangeDescriptor, Schema, TypeCode};
+use gnitz_core::{opk_key_cols, Cut, FixedInt, IndexMeta, PkBuf, PkColList, RangeDescriptor, Schema, TypeCode};
 use std::cmp::Reverse;
 use std::collections::HashSet;
 
@@ -112,7 +112,7 @@ pub(crate) fn try_extract_pk_in<'e>(
 ///
 /// Equality keys and range cuts both pack through `FixedInt::pack`, so the tuple
 /// is byte-identical whichever conjunct spelling produced the point.
-pub(crate) fn pk_point_tuple(desc: &RangeDescriptor, schema: &Schema) -> Option<PkTuple> {
+pub(crate) fn pk_point_tuple(desc: &RangeDescriptor, schema: &Schema) -> Option<PkBuf> {
     if !desc.pins_all(schema.pk_count()) {
         return None;
     }
@@ -121,7 +121,7 @@ pub(crate) fn pk_point_tuple(desc: &RangeDescriptor, schema: &Schema) -> Option<
         .iter()
         .copied()
         .chain(std::iter::once(desc.start.value()));
-    Some(PkTuple::from_columns(schema, vals))
+    Some(opk_key_cols(schema, vals))
 }
 
 /// An **exact-or-superset** PK range for `conjuncts` plus the residual ones —

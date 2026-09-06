@@ -2,6 +2,11 @@ use super::*;
 use gnitz_wire::control::DecodedControl;
 use gnitz_wire::{FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_SCAN_LAST};
 
+/// The one-U64-PK, zero-payload fixture every batch here is built over.
+fn u64_pk_only() -> SchemaDescriptor {
+    crate::test_support::pk_only_schema(&[gnitz_store::schema::type_code::U64])
+}
+
 /// One worker's TERMINAL exchange frame — the whole report when the partition
 /// fits one frame. Only the first worker of a round carries a schema here; `pad`
 /// is the backfill pad bit (steady-state exchanges leave `seek_col_idx` at 0,
@@ -15,16 +20,16 @@ fn make_wire(view_id: i64, source_id: i64, with_schema: bool, pad: bool) -> Deco
             seek_col_idx: if pad { BACKFILL_PAD_BIT } else { 0 },
             ..Default::default()
         },
-        schema: with_schema.then(SchemaDescriptor::minimal_u64),
+        schema: with_schema.then(u64_pk_only),
         data_batch: None,
     }
 }
 
-/// A consolidated batch of `keys` over [`SchemaDescriptor::minimal_u64`], as one
+/// A consolidated batch of `keys` over [`u64_pk_only`], as one
 /// frame of a worker's exchange train carries.
 fn chunk(keys: &[u64]) -> Batch {
-    let schema = SchemaDescriptor::minimal_u64();
-    let mut b = Batch::with_capacity(schema, keys.len());
+    let schema = u64_pk_only();
+    let mut b = Batch::with_capacity(&schema, keys.len());
     for k in keys {
         b.push_key_row(&k.to_be_bytes(), 1);
     }
@@ -46,7 +51,7 @@ fn make_frame(view_id: i64, source_id: i64, keys: &[u64], last: bool) -> Decoded
             seek_pk: source_id as u128,
             ..Default::default()
         },
-        schema: Some(SchemaDescriptor::minimal_u64()),
+        schema: Some(u64_pk_only()),
         data_batch: Some(chunk(keys)),
     }
 }
@@ -152,7 +157,7 @@ fn one_unconsolidated_frame_clears_the_slots_claim() {
     raw.control.flags &= !gnitz_wire::FLAG_BATCH_CONSOLIDATED;
     raw.data_batch = Some({
         let mut b = chunk(&[1]);
-        b.certify_layout(Layout::Raw, &SchemaDescriptor::minimal_u64());
+        b.certify_layout(Layout::Raw, &u64_pk_only());
         b
     });
     assert!(acc.process(0, raw).is_none());

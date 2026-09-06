@@ -12,7 +12,7 @@ fn f64_batch(val: f64) -> Batch {
         ],
         &[0],
     );
-    let mut b = Batch::with_capacity(schema, 1);
+    let mut b = Batch::with_capacity(&schema, 1);
     b.extend_pk(1u128);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&0u64.to_le_bytes());

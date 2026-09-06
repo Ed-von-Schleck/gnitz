@@ -55,7 +55,7 @@ impl ShardIndex {
         // manifest-referenced shard across a restart.
         self.compact_seq = header.compact_seq;
 
-        let stride = self.schema.pk_stride() as usize;
+        let stride = self.schema.pk_stride();
         for raw in &entries {
             // The manifest stores the basename; the shard lives in this table's
             // directory (`entry_to_raw`). Re-prepend it to recover the path.

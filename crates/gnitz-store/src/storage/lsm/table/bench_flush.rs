@@ -32,7 +32,7 @@ fn push_row(b: &mut Batch, pk: u64, payload: i64, weight: i64) {
 /// order for the FLSM tree: every fold lands in fresh key space, so a vertical
 /// overlaps nothing.
 fn distinct_tick(schema: &SchemaDescriptor, t: usize, d: usize) -> Batch {
-    let mut b = Batch::with_capacity(*schema, d.max(1));
+    let mut b = Batch::with_capacity(schema, d.max(1));
     for i in 0..d {
         let k = (t * d + i) as u64;
         push_row(&mut b, k, k as i64, 1);
@@ -55,7 +55,7 @@ fn gen_churn(schema: &SchemaDescriptor, h: usize, d: usize, ticks: usize) -> Vec
     let mut counter: usize = 0;
     (0..ticks)
         .map(|_| {
-            let mut b = Batch::with_capacity(*schema, d.max(1));
+            let mut b = Batch::with_capacity(schema, d.max(1));
             for _ in 0..updates_per_tick {
                 let k = counter % h;
                 let payload = counter as i64;
@@ -79,7 +79,7 @@ fn gen_churn(schema: &SchemaDescriptor, h: usize, d: usize, ticks: usize) -> Vec
 fn scatter_tick(schema: &SchemaDescriptor, rng: &mut crate::test_rng::Rng, d: usize, keyspace: u64) -> Batch {
     let mut keys: Vec<u64> = (0..d).map(|_| rng.gen_range(keyspace)).collect();
     keys.sort_unstable();
-    let mut b = Batch::with_capacity(*schema, d.max(1));
+    let mut b = Batch::with_capacity(schema, d.max(1));
     for k in keys {
         push_row(&mut b, k, k as i64, 1);
     }

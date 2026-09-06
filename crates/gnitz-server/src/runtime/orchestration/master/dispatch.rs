@@ -478,7 +478,24 @@ impl MasterDispatcher {
 
         let (dag, registry) = cat.dag_and_registry_mut();
         let meta = dag.view_meta(registry, view_id);
-        let dest = match meta.relay_route(source_id) {
+        let route = meta.relay_route(source_id);
+        // The route's columns come off a client-pushable `CIRCUIT_NODES` row,
+        // bounded nowhere upstream, and `ScatterKey::new` would resolve them
+        // through `locate`'s release-active `assert!`. Every other reach to those
+        // constructors is bounded by the compiler's own `oob_cols` first.
+        let out_of_range = match &route {
+            RelayRoute::GroupKey(cols) => oob_cols(cols.iter().copied(), &schema),
+            RelayRoute::JoinKey(slots) => oob_cols(slots.iter().map(|&(c, _)| c), &schema),
+            RelayRoute::NoSingleKey | RelayRoute::Broadcast => false,
+        };
+        if out_of_range {
+            return Err(format!(
+                "view {view_id}: source {source_id} relay key names a column outside the source's \
+                 {} columns",
+                schema.num_columns()
+            ));
+        }
+        let dest = match route {
             RelayRoute::NoSingleKey => {
                 return Err(format!(
                     "view {view_id}: source {source_id} feeds several distinct reindex keys; no single \
@@ -710,7 +727,7 @@ impl MasterDispatcher {
                 )
                 .into());
             }
-            let a = acc.get_or_insert_with(|| Batch::with_capacity(expected, mb.len()));
+            let a = acc.get_or_insert_with(|| Batch::with_capacity(&expected, mb.len()));
             a.append_mem_batch(mb);
             Ok(())
         })

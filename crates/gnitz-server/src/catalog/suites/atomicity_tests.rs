@@ -6,7 +6,7 @@ use std::fs;
 // ---------------------------------------------------------------------------
 
 fn build_schema_tab_row(sid: i64, name: &str) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
     bb.begin_row(sid as u128, 1);
     bb.put_string(name);
     bb.end_row();
@@ -42,7 +42,7 @@ fn assert_no_relation_residue(engine: &mut CatalogEngine, family: SysFamily, id:
 /// out-of-order shapes `build_col_batch`, which numbers columns by position,
 /// cannot produce.
 fn write_col_at_index(engine: &mut CatalogEngine, owner_id: i64, col_idx: i64, cd: &ColumnDef) -> Result<(), String> {
-    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
     push_col_tab_row(&mut bb, owner_id, OWNER_KIND_TABLE, col_idx, cd, 1);
     engine.ingest_to_family(COL_TAB_ID, &bb.finish())
 }
@@ -765,7 +765,7 @@ fn two_creates_of_one_name_in_one_batch_rejected() {
     engine.write_column_records(a, OWNER_KIND_TABLE, &cols).unwrap();
     engine.write_column_records(b, OWNER_KIND_TABLE, &cols).unwrap();
 
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
     for tid in [a, b] {
         push_table_tab_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "twins", pack_pk_cols(&[0]), 0, 1);
     }
@@ -869,7 +869,7 @@ fn compensating_a_drop_keeps_the_restored_relation_directory() {
 
     // The failed bundle's DROP: applied and enqueued, so compensation drains it.
     let schema = SysFamily::Table.schema();
-    let drop_batch = retract_pk_list(engine.sys_store(SysFamily::Table), &schema, vec![tid as u128]);
+    let drop_batch = retract_pk_list(engine.sys_store(SysFamily::Table), schema, vec![tid as u128]);
     assert_eq!(
         drop_batch.len(),
         1,
@@ -914,12 +914,12 @@ fn zero_weight_catalog_row_rejected() {
     let (mut engine, tid, dir) = table_fixture("zero_weight_row", &cols);
     let sid = engine.schema_id("public").unwrap();
 
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
     push_table_tab_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "t", pack_pk_cols(&[0]), 0, 0);
     let err = engine.submit(SysFamily::Table, bb.finish()).unwrap_err();
     assert!(err.contains("zero-weight row"), "unexpected error: {err}");
 
-    let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
     bb.begin_row(sid as u128, 0);
     bb.put_string("public");
     bb.end_row();

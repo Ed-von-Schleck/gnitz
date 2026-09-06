@@ -94,7 +94,7 @@ impl CatalogEngine {
             .map(|i| i as u32)
             .collect();
         idx.extend((0..batch.len()).filter(|&i| batch.get_weight(i) > 0).map(|i| i as u32));
-        Some(Batch::from_indexed_rows(&batch.as_mem_batch(), &idx, &family.schema()))
+        Some(Batch::from_indexed_rows(&batch.as_mem_batch(), &idx, family.schema()))
     }
 
     /// Fold a `sys_sequences` advance into the in-memory `user_sequences` map.
@@ -354,7 +354,7 @@ impl CatalogEngine {
         };
         let ids: Vec<u128> = ids.iter().map(|&id| id as u128).collect();
         let schema = SysFamily::View.schema();
-        let batch = retract_pk_list(self.sys_store(SysFamily::View), &schema, ids);
+        let batch = retract_pk_list(self.sys_store(SysFamily::View), schema, ids);
         if !batch.is_empty() {
             self.submit_cascade(SysFamily::View, batch)?;
         }
@@ -369,7 +369,7 @@ impl CatalogEngine {
         };
         let ids: Vec<u128> = ids.iter().map(|&id| id as u128).collect();
         let schema = SysFamily::Index.schema();
-        let batch = retract_pk_list(self.sys_store(SysFamily::Index), &schema, ids);
+        let batch = retract_pk_list(self.sys_store(SysFamily::Index), schema, ids);
         if !batch.is_empty() {
             self.submit_cascade(SysFamily::Index, batch)?;
         }
@@ -379,11 +379,11 @@ impl CatalogEngine {
     fn cascade_retract_columns(&mut self, owner_id: i64) -> Result<(), String> {
         let schema = SysFamily::Column.schema();
         let (start_pk, end_pk) = column_id_band(owner_id);
-        let start = sys_opk(&schema, start_pk as u128);
-        let end = sys_opk(&schema, end_pk as u128);
+        let start = sys_opk(schema, start_pk as u128);
+        let end = sys_opk(schema, end_pk as u128);
         let batch = retract_key_range(
             self.sys_store(SysFamily::Column),
-            &schema,
+            schema,
             start.pk_bytes(),
             end.pk_bytes(),
         );
@@ -458,9 +458,9 @@ impl CatalogEngine {
         let schema = family.schema();
         // The family uses the compound PK `(view_id, node_id)`, so one view's
         // rows are the key band `[(vid, 0), (vid + 1, 0))`.
-        let start = circuit_opk(&schema, vid, 0);
-        let end = circuit_opk(&schema, vid + 1, 0);
-        let batch = retract_key_range(self.sys_store(family), &schema, start.pk_bytes(), end.pk_bytes());
+        let start = circuit_opk(schema, vid, 0);
+        let end = circuit_opk(schema, vid + 1, 0);
+        let batch = retract_key_range(self.sys_store(family), schema, start.pk_bytes(), end.pk_bytes());
         if !batch.is_empty() {
             self.submit_cascade(family, batch)?;
         }

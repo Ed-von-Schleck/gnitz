@@ -18,7 +18,7 @@ fn single_col_group_key_is_the_opk_image_from_either_side() {
     let key = |tc: u8, le: &[u8], col1_is_pk: bool| -> u128 {
         let cols = [SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)];
         let schema = SchemaDescriptor::new(&cols, if col1_is_pk { &[0, 1] } else { &[0] });
-        let mut b = Batch::with_capacity(schema, 1);
+        let mut b = Batch::with_capacity(&schema, 1);
         if col1_is_pk {
             let mut native = [0u8; 16];
             native[..le.len()].copy_from_slice(le);

@@ -149,13 +149,13 @@ pub fn op_reduce(
         // does because the reduce integrates its own output within the epoch.
         if plan.seeds_ground {
             // Batch-free: there is no row to read the key off.
-            let v0 = NarrowPkOpk::new(gnitz_wire::global_group_key(), output_schema.pk_stride() as usize);
+            let v0 = NarrowPkOpk::new(gnitz_wire::global_group_key(), output_schema.pk_stride());
             let out_pk_bytes = v0.bytes();
 
             trace_out_cursor.seek_bytes(out_pk_bytes);
             let has_v0 = trace_out_cursor.valid && trace_out_cursor.current_pk_eq(out_pk_bytes);
             if !has_v0 {
-                let mut raw_output = Batch::with_capacity(*output_schema, 1);
+                let mut raw_output = Batch::with_capacity(output_schema, 1);
                 emit_global_ground(&mut raw_output, out_pk_bytes, plan);
                 return raw_output;
             }
@@ -184,7 +184,7 @@ pub fn op_reduce(
     // one doubling of the worst case and exact when every group is a singleton.
     // An ungrouped reduce is exact at 2 instead: it has one group, which emits at
     // most a retraction and a row.
-    let mut raw_output = Batch::with_capacity(*output_schema, if ungrouped { 2 } else { n });
+    let mut raw_output = Batch::with_capacity(output_schema, if ungrouped { 2 } else { n });
 
     let mut accs: Vec<Accumulator> = plan.acc_template.clone();
 

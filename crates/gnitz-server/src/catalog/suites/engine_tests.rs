@@ -275,7 +275,7 @@ fn test_recover_ignores_sub_user_seq_id() {
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         let schema = SysFamily::Sequence.schema();
-        let mut bb = BatchBuilder::new(schema);
+        let mut bb = BatchBuilder::new(*schema);
         bb.begin_row(stray as u128, 1);
         bb.put_u64(999);
         bb.end_row();
@@ -311,7 +311,7 @@ fn test_sequence_gap_recovery() {
             .unwrap();
 
         // Inject column record for tid=250
-        let mut cbb = BatchBuilder::new(SysFamily::Column.schema());
+        let mut cbb = BatchBuilder::new(*SysFamily::Column.schema());
         push_col_tab_row(&mut cbb, 250, OWNER_KIND_TABLE, 0, &col_def("id", type_code::U64), 1);
         engine
             .sys_store_mut(SysFamily::Column)
@@ -457,7 +457,7 @@ fn test_ddl_sync() {
 
     // Simulate DDL sync: create batch mimicking a schema record
     let schema = SysFamily::Schema.schema();
-    let mut bb = BatchBuilder::new(schema);
+    let mut bb = BatchBuilder::new(*schema);
     bb.begin_row(100u128, 1); // sid=100
     bb.put_string("synced");
     bb.end_row();
@@ -723,7 +723,7 @@ fn test_dep_map_drops_a_retired_views_edges() {
     let v2 = engine.allocate_table_id().unwrap();
     write_identity_circuit(&mut engine, v2, tid, None);
     engine.write_column_records(v2, OWNER_KIND_VIEW, &cols).unwrap();
-    let mut bb = BatchBuilder::new(SysFamily::View.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::View.schema());
     push_view_tab_row(&mut bb, -1, v1, "v1", 0, 0, 0);
     push_view_tab_row(&mut bb, 1, v2, "v1", 0, 0, 0);
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
@@ -760,7 +760,7 @@ fn test_dependent_view_restricts_fire_from_circuit_rows() {
     // DROP NOT NULL on `val` — an `is_nullable 0→1` rewrite pair.
     let mut nullable = cols[1].clone();
     nullable.is_nullable = true;
-    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
     push_col_tab_row(&mut bb, tid, OWNER_KIND_TABLE, 1, &cols[1], -1);
     push_col_tab_row(&mut bb, tid, OWNER_KIND_TABLE, 1, &nullable, 1);
     let err = engine.precheck_family(SysFamily::Column, &bb.finish()).unwrap_err();
@@ -785,7 +785,7 @@ fn test_circuit_table_surface_introspectable() {
     assert_eq!(scan.len(), 1, "scan_family must expose CircuitNodes rows");
 
     // Compound PK: seek by the 16-byte at-rest `(view_id, node_id)` OPK region.
-    let pk_bytes = opk_pk(&SysFamily::CircuitNodes.schema(), &[7, 0]);
+    let pk_bytes = opk_pk(SysFamily::CircuitNodes.schema(), &[7, 0]);
     let found = engine
         .registry_mut()
         .seek_family(CIRCUIT_NODES_TAB_ID, &pk_bytes, None)

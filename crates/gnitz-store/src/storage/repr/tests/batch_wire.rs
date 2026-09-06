@@ -130,7 +130,7 @@ fn wire_chunk_within_counts_a_shared_span_once() {
     let (schema, one) = string_rows(&[(1, &"v".repeat(200))]);
     // One append session, so its blob cache dedups the repeated range: every
     // row of `shared` points at the same span of `shared`'s own heap.
-    let mut shared = Batch::with_capacity(schema, N);
+    let mut shared = Batch::with_capacity(&schema, N);
     shared.append_ranges(&one.as_mem_batch(), &[(0, 1); N]);
 
     let distinct_rows: Vec<(u64, String)> = (0..N as u64).map(|i| (i, format!("{i:-<200}"))).collect();

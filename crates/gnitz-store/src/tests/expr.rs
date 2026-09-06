@@ -8,7 +8,7 @@ use crate::storage::Batch;
 /// `schema` — the engine-side physical batch these tests drive [`MapPlan`]
 /// with, as opposed to the owned-buffer view `gnitz-expr`'s own tests use.
 fn make_int_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u64, &[i64])]) -> Batch {
-    let mut batch = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut batch = Batch::with_capacity(schema, rows.len().max(1));
     for &(pk, weight, null_word, cols) in rows {
         batch.extend_pk(pk as u128);
         batch.extend_weight(&weight.to_le_bytes());
@@ -98,7 +98,7 @@ fn test_map_blob_passthrough_and_fallback() {
     }
     // Input: [U64 PK, STRING s1 (short inline), STRING s2 (long, heap-backed)].
     fn build(schema: &SchemaDescriptor) -> Batch {
-        let mut b = Batch::with_capacity(*schema, 2);
+        let mut b = Batch::with_capacity(schema, 2);
         for (pk, s1, s2) in [
             (1u128, b"ab".as_slice(), b"long-string-one-xyz".as_slice()),
             (2u128, b"cd".as_slice(), b"long-string-two-abcdef".as_slice()),
@@ -188,7 +188,7 @@ fn test_map_pk_copy_col_u128_and_signed_i64() {
 
     let pk0: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
     let pk1: i64 = -5; // negative: exercises the OPK sign-bit flip on decode
-    let mut batch = Batch::with_capacity(in_schema, 1);
+    let mut batch = Batch::with_capacity(&in_schema, 1);
     batch.extend_pk_opk(&in_schema, &[pk0, pk1 as u64 as u128]);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
@@ -251,7 +251,7 @@ fn test_map_copy_col_widens_into_promoted_slot() {
     );
 
     let (c0, c1, c2, c3): (u16, i16, i8, u8) = (0xBEEF, -300, -7, 0xFE);
-    let mut batch = Batch::with_capacity(in_schema, 1);
+    let mut batch = Batch::with_capacity(&in_schema, 1);
     batch.extend_pk_opk(&in_schema, &[c0 as u128, c1 as u16 as u128]);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
@@ -336,7 +336,7 @@ fn test_from_predicate_filter_ranges_over_a_batch() {
 /// A batch of `(pk, string cells)` rows: one STRING payload column per entry
 /// of `cells`, encoded through the blob heap the map must relocate or share.
 fn make_string_batch(schema: &SchemaDescriptor, rows: &[&[&[u8]]]) -> Batch {
-    let mut batch = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut batch = Batch::with_capacity(schema, rows.len().max(1));
     for (row, cells) in rows.iter().enumerate() {
         batch.extend_pk(row as u128 + 1);
         batch.extend_weight(&1i64.to_le_bytes());
@@ -546,7 +546,7 @@ fn a_compound_permuted_pk_decodes_at_every_width() {
         [-1, 40_000, -1, u64::MAX as i128, -1],
         [i8::MAX as i128, u16::MAX as i128, i32::MAX as i128, 1, i128::MAX],
     ];
-    let mut batch = Batch::with_capacity(in_schema, rows.len());
+    let mut batch = Batch::with_capacity(&in_schema, rows.len());
     for vals in &rows {
         let natives: Vec<u128> = pk_order.iter().map(|&ci| vals[ci as usize] as u128).collect();
         batch.extend_pk_opk(&in_schema, &natives);
@@ -602,7 +602,7 @@ fn map_ranges_bench() {
     // Column 0 is what puts a `ColumnLocator::Pk` copy in the loop; the keep-set
     // rules retain the source PK on every one of those.
     let rx_in = make_schema(0, &[type_code::U64, type_code::I64, type_code::I64]);
-    let mut rx_batch = Batch::with_capacity(rx_in, N);
+    let mut rx_batch = Batch::with_capacity(&rx_in, N);
     for i in 0..N as u64 {
         rx_batch.extend_pk(i as u128);
         rx_batch.extend_weight(&1i64.to_le_bytes());
@@ -625,7 +625,7 @@ fn map_ranges_bench() {
     // the shape whose STRING output comes only from `str_emits`.
     let se_in = make_schema(0, &[type_code::U64, type_code::STRING]);
     let se_out = make_schema(0, &[type_code::U64, type_code::STRING]);
-    let mut se_batch = Batch::with_capacity(se_in, N);
+    let mut se_batch = Batch::with_capacity(&se_in, N);
     for i in 0..N {
         se_batch.extend_pk(i as u128);
         se_batch.extend_weight(&1i64.to_le_bytes());

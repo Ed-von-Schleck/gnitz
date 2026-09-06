@@ -15,7 +15,7 @@ fn null_equality_separates_the_two_payload_comparators() {
     let non_null = SchemaDescriptor::new(&[pk, SchemaColumn::new(type_code::I64, 0)], &[0]);
 
     // Same PK, both NULL, different bytes under the null bit.
-    let mut pair = Batch::with_capacity(nullable, 2);
+    let mut pair = Batch::with_capacity(&nullable, 2);
     for garbage in [0x5555_5555_5555_5555u64 as i64, 0xAAAA_AAAA_AAAA_AAAAu64 as i64] {
         pair.extend_pk(0x1234_5678_9abc_def0);
         pair.extend_weight(&1i64.to_le_bytes());

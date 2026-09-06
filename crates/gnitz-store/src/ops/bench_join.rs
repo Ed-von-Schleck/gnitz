@@ -90,7 +90,7 @@ type Row = (Vec<u128>, i64);
 /// in the blob heap and the emit path must relocate rather than copy them
 /// inline. Every fourth nullable cell is NULL.
 fn build(schema: &SchemaDescriptor, p: Payload, rows: &[Row]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for (i, (pk, ord)) in rows.iter().enumerate() {
         b.extend_pk_opk(schema, pk);
         b.extend_weight(&1i64.to_le_bytes());

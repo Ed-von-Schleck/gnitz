@@ -135,7 +135,7 @@ fn batchview_row_matches_region() {
 /// puts the equal-PK payload tiebreak and the group fold on the measured path.
 /// The schema's `pk_stride` selects the width.
 fn bench_sorted_batch(schema: &SchemaDescriptor, n: usize, dup: usize) -> Batch {
-    let mut b = Batch::with_capacity(*schema, n.max(1));
+    let mut b = Batch::with_capacity(schema, n.max(1));
     for i in 0..n {
         b.extend_pk((i / dup) as u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -189,7 +189,7 @@ fn run_merge_dup_pk_bench() {
 /// `key_fn(i)`, weight +1, both I64 payload columns derived from the row
 /// index (payloads are irrelevant when all PKs are distinct).
 fn bench_flush_batch(schema: &SchemaDescriptor, n: usize, key_fn: impl Fn(usize) -> u64) -> Batch {
-    let mut b = Batch::with_capacity(*schema, n.max(1));
+    let mut b = Batch::with_capacity(schema, n.max(1));
     for i in 0..n {
         b.extend_pk(key_fn(i) as u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -265,11 +265,11 @@ fn narrow(rows: Vec<(Vec<u8>, i64, i64)>, pk_stride: usize) -> Vec<(u128, i64, i
 }
 
 fn merge_to_rows(batches: &[Batch], schema: &SchemaDescriptor) -> Vec<(u128, i64, i64)> {
-    narrow(merge_to_rows_wide(batches, schema), schema.pk_stride() as usize)
+    narrow(merge_to_rows_wide(batches, schema), schema.pk_stride())
 }
 
 fn run_consolidate(b: &Batch, schema: &SchemaDescriptor) -> Vec<(u128, i64, i64)> {
-    narrow(run_consolidate_bytes(b, schema), schema.pk_stride() as usize)
+    narrow(run_consolidate_bytes(b, schema), schema.pk_stride())
 }
 
 /// The Z-set fold, as `(inputs, expected output)`. Weights of matching
@@ -460,7 +460,7 @@ fn every_pk_width_orders_by_opk_bytes() {
 
     for (tcs, vals) in cases {
         let schema = pk_payload_schema(tcs);
-        let stride = schema.pk_stride() as usize;
+        let stride = schema.pk_stride();
         let n = vals.len();
         let opk = |i: usize| crate::test_support::opk_pk(&schema, &vals[i]);
         let want: Vec<i64> = (0..n as i64).collect();
@@ -548,7 +548,7 @@ fn writer_run(
     total_rows: usize,
     run: impl FnOnce(&mut DirectWriter),
 ) -> Vec<(Vec<u8>, i64, i64)> {
-    let stride = schema.pk_stride() as usize;
+    let stride = schema.pk_stride();
     let rows = total_rows.max(1);
     let mut out_pk = vec![0u8; rows * stride];
     let mut out_w = vec![0u8; rows * 8];
@@ -624,7 +624,7 @@ fn run_consolidate_bytes(b: &Batch, schema: &SchemaDescriptor) -> Vec<(Vec<u8>, 
 fn wide_nway_merge_ordering_low16_collision() {
     for (tcs, want_stride) in [(WIDE_24, 24usize), (WIDE_64, 64), (WIDE_80, 80)] {
         let s = pk_payload_schema(tcs);
-        assert_eq!(s.pk_stride() as usize, want_stride);
+        assert_eq!(s.pk_stride(), want_stride);
         // A < B < C < D < E by compare_pk_bytes. B,C,D share col0
         // (= the low-16 prefix); only the trailing column distinguishes
         // them, so the packed-prefix reject cannot separate them.
@@ -844,7 +844,7 @@ mod merge_materialize_vs_reference {
         total_blob: usize,
         run: impl FnOnce(&mut DirectWriter),
     ) -> OutBufs {
-        let pk_stride = schema.pk_stride() as usize;
+        let pk_stride = schema.pk_stride();
         let rows = total_rows.max(1);
         let mut pk = vec![0u8; rows * pk_stride];
         let mut wt = vec![0u8; rows * 8];
@@ -916,7 +916,7 @@ mod merge_materialize_vs_reference {
     /// drop the net-zero ones — the same reference shape `consolidate_reference`
     /// uses, decoded to this module's three-payload-column rows.
     fn reference_fold(schema: &SchemaDescriptor, runs: &[Batch]) -> Vec<Row> {
-        let mut all = Batch::with_capacity(*schema, runs.iter().map(|b| b.count).sum());
+        let mut all = Batch::with_capacity(schema, runs.iter().map(|b| b.count).sum());
         for r in runs {
             all.append_batch(r, 0, r.count);
         }
@@ -1318,7 +1318,7 @@ mod opk_consolidate_proptest {
         #[test]
         fn consolidate_matches_reference(
             (si, rows) in (0usize..schemas().len()).prop_flat_map(|si| {
-                let stride = schemas()[si].pk_stride() as usize;
+                let stride = schemas()[si].pk_stride();
                 (Just(si), arb_rows(stride))
             })
         ) {

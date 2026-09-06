@@ -41,7 +41,7 @@ fn test_uuid_pk_string_literal_accepted() {
     let pk = extract_pk_value(&row, &schema).unwrap();
     // UUID PK has stride 16; decoding the key recovers the parsed u128.
     assert_eq!(
-        pk.to_native_packed(&schema),
+        gnitz_core::native_packed_key(&schema, &pk),
         0x550e8400_e29b_41d4_a716_446655440000_u128
     );
 }
@@ -51,11 +51,11 @@ fn compound_pk_extract_pk_value_packs_opk_bytes() {
     let schema = compound_schema_u64_u64();
     let row = vec![num_expr("1"), num_expr("2"), num_expr("99")];
     let pk = extract_pk_value(&row, &schema).unwrap();
-    assert_eq!(pk.stride(), 16);
+    assert_eq!(pk.width(), 16);
     let mut expect = [0u8; 16];
     expect[0..8].copy_from_slice(&1u64.to_be_bytes());
     expect[8..16].copy_from_slice(&2u64.to_be_bytes());
-    assert_eq!(pk.as_bytes(), &expect[..]);
+    assert_eq!(pk.pk_bytes(), &expect[..]);
 }
 
 #[test]
@@ -64,12 +64,12 @@ fn compound_pk_extract_pk_value_wide_region() {
     let row = vec![num_expr("1"), num_expr("2"), num_expr("3"), num_expr("99")];
     let pk = extract_pk_value(&row, &schema).unwrap();
     // pk_stride = 8 + 8 + 16 = 32 → wide-region path.
-    assert_eq!(pk.stride(), 32);
+    assert_eq!(pk.width(), 32);
     let mut expect = [0u8; 32];
     expect[0..8].copy_from_slice(&1u64.to_be_bytes());
     expect[8..16].copy_from_slice(&2u64.to_be_bytes());
     expect[16..32].copy_from_slice(&3u128.to_be_bytes());
-    assert_eq!(pk.as_bytes(), &expect[..]);
+    assert_eq!(pk.pk_bytes(), &expect[..]);
 }
 
 #[test]

@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 use super::ColumnDef;
 use gnitz_expr::RowSource;
 use gnitz_store::relation::{RelationKind, ViewBudgets};
-use gnitz_store::schema::{from_wire_cols, Placement, SchemaDescriptor};
+use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
 use gnitz_store::storage::{payload_string, payload_u64, Batch, BatchBuilder};
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow};
 use gnitz_wire::{
@@ -105,13 +105,19 @@ pub(super) fn read_table_tab_row<S: RowSource>(
     props
         .validate()
         .map_err(|e| format!("catalog invariant violated: table '{name}' {e}"))?;
+    // The PK list is decoded before the placement is built: `dist_prefix_len` is
+    // a leading-prefix length into it, and nothing downstream re-checks it —
+    // `Placement::resolve` normalizes only the `0` sentinel.
+    let pk = unpack_pk_cols(payload_u64(src, row, TABTAB_PAY_PK_COL_IDX))
+        .map_err(|rule| format!("catalog invariant violated: table '{name}' {rule}"))?;
+    props
+        .validate_against_pk(pk.as_slice().len())
+        .map_err(|e| format!("catalog invariant violated: table '{name}' {e}"))?;
     let placement = if props.replicated {
         Placement::Replicated
     } else {
         Placement::Keyed { prefix_len: props.dist_prefix_len as u8 }
     };
-    let pk = unpack_pk_cols(payload_u64(src, row, TABTAB_PAY_PK_COL_IDX))
-        .map_err(|rule| format!("catalog invariant violated: table '{name}' {rule}"))?;
     Ok((
         payload_u64(src, row, RELTAB_PAY_SCHEMA_ID) as i64,
         name,
@@ -391,7 +397,7 @@ pub(super) fn idx_tab_batch(
     props: gnitz_wire::IndexProps,
     weight: i64,
 ) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::Index.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Index.schema());
     gnitz_wire::sys_rows::write_idx_tab_row(
         &mut bb,
         &IdxTabRow {
@@ -414,6 +420,21 @@ pub(super) fn idx_tab_batch(
 // initialised at compile time, never reconstructed. `from_wire_cols`
 // places every family `Replicated`, so a reader single-sources one copy instead of
 // gathering N (`RelationRegistry::relation_is_replicated`).
+/// Build a `SchemaDescriptor` from one of `gnitz-wire`'s canonical system-table
+/// column arrays. `const`, so [`SCHEMAS`] below costs nothing at runtime. Every
+/// such family is [`Placement::Replicated`]: DDL is master-broadcast, so each
+/// worker holds an identical full copy.
+pub(crate) const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: &[u32]) -> SchemaDescriptor {
+    let mut buf = [SchemaColumn::EMPTY; MAX_COLUMNS];
+    let mut i = 0;
+    while i < cols.len() {
+        buf[i] = SchemaColumn::new(cols[i].type_code as u8, if cols[i].nullable { 1 } else { 0 });
+        i += 1;
+    }
+    let (head, _) = buf.split_at(cols.len());
+    SchemaDescriptor::new_with_placement(head, pk_indices, Placement::Replicated)
+}
+
 static SCHEMAS: [SchemaDescriptor; SysFamily::COUNT] = {
     let w = gnitz_wire::SYS_FAMILIES;
     let mut arr = [from_wire_cols(w[0].cols, w[0].pk_cols); SysFamily::COUNT];
@@ -539,10 +560,12 @@ impl SysFamily {
         self.wire().name
     }
 
-    /// This family's fixed schema.
+    /// This family's fixed schema. Borrowed from the `static` that holds it —
+    /// a `SchemaDescriptor` is 360 bytes, so returning it by value put a copy on
+    /// every catalog write.
     #[inline]
-    pub(crate) fn schema(self) -> SchemaDescriptor {
-        SCHEMAS[self.index()]
+    pub(crate) fn schema(self) -> &'static SchemaDescriptor {
+        &SCHEMAS[self.index()]
     }
 
     /// Topological creation priority (see [`TOPO_PRIORITY`]).

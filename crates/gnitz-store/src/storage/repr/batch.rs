@@ -9,7 +9,7 @@ use super::batch_pool::{acquire_arena, debug_poison, Fill};
 use super::columnar::ColumnarSource;
 use super::merge::{self, relocate_german_string_vec, BlobCache, BlobCacheGuard, ColPtr, MemBatch};
 use crate::schema::key::NarrowPkOpk;
-use crate::schema::SchemaDescriptor;
+use crate::schema::{SchemaDescriptor, DELTA_TICK_COL};
 use gnitz_expr::RowSource;
 use gnitz_wire::{align8, read_i64_le, read_u64_le};
 
@@ -56,17 +56,21 @@ pub(crate) fn range_rows(ranges: &[(usize, usize)]) -> usize {
     ranges.iter().map(|&(s, e)| e - s).sum()
 }
 
-/// Compute byte offsets for each region given strides and row capacity.
+/// Write each region's byte offset into `offsets`, returning the total arena
+/// size. Entries past `num_regions` are untouched; every caller passes an
+/// all-zero array. An out-parameter rather than a return because the array is
+/// 544 bytes and this does not inline, so a return was a `memcpy` per batch.
 ///
 /// Region starts pad through `gnitz_wire::align8` — the same primitive
 /// `wal`'s directory walk pads with, which is what makes
 /// `encode_scattered_to_wire` land its regions where the directory it already
 /// wrote names them.
-pub(in crate::storage) fn compute_offsets(
+pub(in crate::storage) fn compute_offsets_into(
     strides: &[u8; MAX_BATCH_REGIONS],
     num_regions: usize,
     capacity: usize,
-) -> ([usize; MAX_BATCH_REGIONS], usize) {
+    offsets: &mut [usize; MAX_BATCH_REGIONS],
+) -> usize {
     // Offsets are `usize`, not `u32`: a single large batch (a wide multi-column
     // join, a bulk full-scan/merge) can have a cumulative offset > 4 GB even
     // though each individual region is still capped at 4 GB by the u32 wire
@@ -74,14 +78,13 @@ pub(in crate::storage) fn compute_offsets(
     // `region_or_blob` aliased an earlier region — silent corruption. Not a wire
     // change: the WAL/exchange encoding serializes region *sizes* and recomputes
     // offsets via this fn on receive, so offsets never cross a process boundary.
-    let mut offsets = [0usize; MAX_BATCH_REGIONS];
     let mut off = 0usize;
     for i in 0..num_regions {
         off = align8(off);
         offsets[i] = off;
         off += capacity * strides[i] as usize;
     }
-    (offsets, off)
+    off
 }
 
 /// Append payload strides from `schema` into `strides` starting at `start`.
@@ -98,7 +101,8 @@ fn fill_payload_strides(schema: &SchemaDescriptor, strides: &mut [u8; MAX_BATCH_
 /// Build a strides array from a SchemaDescriptor.
 pub(in crate::storage) fn strides_from_schema(schema: &SchemaDescriptor) -> ([u8; MAX_BATCH_REGIONS], u8) {
     let mut strides = [0u8; MAX_BATCH_REGIONS];
-    strides[REG_PK] = schema.pk_stride();
+    // Lossless: `SchemaDescriptor::new` asserts `pk_stride <= MAX_PK_BYTES`.
+    strides[REG_PK] = schema.pk_stride() as u8;
     strides[REG_WEIGHT] = FIXED_REGION_STRIDE;
     strides[REG_NULL_BMP] = FIXED_REGION_STRIDE;
     let nr = fill_payload_strides(schema, &mut strides, REG_PAYLOAD_START);
@@ -113,7 +117,7 @@ pub(in crate::storage) fn strides_from_schema(schema: &SchemaDescriptor) -> ([u8
 /// # Safety
 /// `src` and `dst` are distinct allocations; for every region `i < nr`, both
 /// `src_offsets[i] + count * strides[i]` and `dst_offsets[i] + count *
-/// strides[i]` are in bounds (both sides sized by `compute_offsets` for at
+/// strides[i]` are in bounds (both sides sized by `compute_offsets_into` for at
 /// least `count` rows).
 pub(super) unsafe fn copy_regions(
     src: &[u8],
@@ -188,7 +192,7 @@ pub struct Batch {
     data: Vec<u8>,
     pub blob: Vec<u8>,
     // `usize`, not `u32`: a single large batch's cumulative region offset can
-    // exceed 4 GB (see `compute_offsets`). In-memory only — never serialized.
+    // exceed 4 GB (see `compute_offsets_into`). In-memory only — never serialized.
     offsets: [usize; MAX_BATCH_REGIONS],
     strides: [u8; MAX_BATCH_REGIONS],
     capacity: usize,
@@ -214,7 +218,7 @@ impl Batch {
 
     /// The one zero-allocation empty constructor: shape (strides / region
     /// count / schema) supplied by the caller, everything else empty.
-    fn empty_from(strides: [u8; MAX_BATCH_REGIONS], schema: SchemaDescriptor) -> Self {
+    fn empty_from(strides: [u8; MAX_BATCH_REGIONS], schema: &SchemaDescriptor) -> Self {
         Batch {
             data: Vec::new(),
             blob: Vec::new(),
@@ -223,7 +227,7 @@ impl Batch {
             capacity: 0,
             count: 0,
             layout: Layout::Raw,
-            schema,
+            schema: *schema,
             blob_id: next_blob_id(),
         }
     }
@@ -235,14 +239,14 @@ impl Batch {
     /// no one-shot realloc fires on the first column write.
     pub fn empty_with_schema(schema: &SchemaDescriptor) -> Self {
         let (strides, _) = strides_from_schema(schema);
-        Self::empty_from(strides, *schema)
+        Self::empty_from(strides, schema)
     }
 
     /// Zero-allocation empty batch with this batch's exact shape (strides,
     /// region count, schema) — honest for schema-less join-shaped batches too.
     /// The empty return / swap-placeholder constructor.
     fn empty_like(&self) -> Self {
-        Self::empty_from(self.strides, self.schema)
+        Self::empty_from(self.strides, &self.schema)
     }
 
     /// Move this batch out, leaving an `empty_like` placeholder behind — the
@@ -264,31 +268,33 @@ impl Batch {
     /// unwritten is not: it holds recycled bytes, poisoned in debug builds (see
     /// [`debug_poison`]). A writer that wants a cell to read zero writes the
     /// zero.
-    pub fn with_capacity(schema: SchemaDescriptor, rows: usize) -> Self {
+    pub fn with_capacity(schema: &SchemaDescriptor, rows: usize) -> Self {
         let cap = rows.max(1);
-        let (strides, nr) = strides_from_schema(&schema);
-        let (offsets, total_size) = compute_offsets(&strides, nr as usize, cap);
-        let data = acquire_arena(total_size, Fill::Uninit);
-
-        Batch {
-            data,
+        let (strides, nr) = strides_from_schema(schema);
+        // The offsets land in the batch's own array rather than a stack temp the
+        // constructor would then copy in — see [`compute_offsets_into`].
+        let mut b = Batch {
+            data: Vec::new(),
             // No head start: every writer grows the heap on demand, so a fixed
             // reservation charges every string-free batch a malloc.
             blob: Vec::new(),
-            offsets,
+            offsets: [0usize; MAX_BATCH_REGIONS],
             strides,
             capacity: cap,
             count: 0,
             layout: Layout::Raw,
-            schema,
+            schema: *schema,
             blob_id: next_blob_id(),
-        }
+        };
+        let total_size = compute_offsets_into(&strides, nr as usize, cap, &mut b.offsets);
+        b.data = acquire_arena(total_size, Fill::Uninit);
+        b
     }
 
     /// [`Self::with_capacity`] with the blob heap pre-sized. For the callers that
     /// know the byte count up front; `with_capacity` leaves it empty because most
     /// writers do not.
-    pub fn with_capacity_blob(schema: SchemaDescriptor, rows: usize, blob_bytes: usize) -> Self {
+    pub fn with_capacity_blob(schema: &SchemaDescriptor, rows: usize, blob_bytes: usize) -> Self {
         let mut b = Self::with_capacity(schema, rows);
         b.blob = acquire_arena(blob_bytes, Fill::Reserve);
         b
@@ -305,27 +311,29 @@ impl Batch {
     /// Every caller is a test. It carries no `#[cfg(test)]` because the test
     /// helpers also compile inside `gnitz-server` and as `gnitz-store-testkit`,
     /// ordinary dependent crates, which see only what this library publishes.
-    pub fn zeroed(schema: SchemaDescriptor, rows: usize) -> Self {
-        let (strides, nr) = strides_from_schema(&schema);
-        let (offsets, total_size) = compute_offsets(&strides, nr as usize, rows.max(1));
-        Batch {
-            data: vec![0u8; total_size],
+    pub fn zeroed(schema: &SchemaDescriptor, rows: usize) -> Self {
+        let (strides, nr) = strides_from_schema(schema);
+        let mut b = Batch {
+            data: Vec::new(),
             blob: Vec::new(),
-            offsets,
+            offsets: [0usize; MAX_BATCH_REGIONS],
             strides,
             capacity: rows.max(1),
             count: rows,
             layout: Layout::Raw,
-            schema,
+            schema: *schema,
             blob_id: next_blob_id(),
-        }
+        };
+        let total_size = compute_offsets_into(&strides, nr as usize, rows.max(1), &mut b.offsets);
+        b.data = vec![0u8; total_size];
+        b
     }
 
     /// Construct a `Batch` from fully pre-built, correctly-laid-out buffers.
     ///
     /// `data` must be at least `count * strides[i]` bytes starting at
     /// `offsets[i]` for every region of `schema`, as produced by
-    /// `compute_offsets`.  Used by `slice_to_owned_batch` to avoid an
+    /// `compute_offsets_into`.  Used by `slice_to_owned_batch` to avoid an
     /// intermediate copy.
     ///
     /// # Safety
@@ -366,7 +374,7 @@ impl Batch {
     /// shape" bug into a localized panic at the first assignment, instead
     /// of a cryptic OOB slice panic several call-frames later.
     #[inline]
-    pub fn set_schema(&mut self, s: SchemaDescriptor) {
+    pub fn set_schema(&mut self, s: &SchemaDescriptor) {
         // The batch carries one combined PK region (all PK columns
         // concatenated) + one payload region per non-PK column. So the
         // batch's payload-region count must equal the schema's non-PK
@@ -380,7 +388,7 @@ impl Batch {
             s.num_payload_cols(),
             s.pk_indices().len()
         );
-        self.schema = s;
+        self.schema = *s;
     }
 
     // ── Read accessors ──────────────────────────────────────────────────
@@ -495,7 +503,7 @@ impl Batch {
     pub fn get_pk(&self, row: usize) -> u128 {
         let stride = self.strides[REG_PK] as usize;
         let off = self.offsets[REG_PK] + row * stride;
-        gnitz_wire::widen_pk_be(&self.data[off..off + stride], stride)
+        gnitz_wire::widen_pk_be(&self.data[off..off + stride])
     }
 
     /// Owned-`Batch` sibling of `MemBatch::get_pk_bytes`. Returns exactly
@@ -579,7 +587,8 @@ impl Batch {
         }
         let nr = self.num_regions();
         let new_cap = (self.capacity * 2).max(8).max(self.count + n);
-        let (new_offsets, new_total) = compute_offsets(&self.strides, nr, new_cap);
+        let mut new_offsets = [0usize; MAX_BATCH_REGIONS];
+        let new_total = compute_offsets_into(&self.strides, nr, new_cap, &mut new_offsets);
 
         if new_total > self.data.capacity() {
             // Out-of-place grow.  Vec::reserve on a too-small buffer triggers
@@ -589,7 +598,7 @@ impl Batch {
             // Zeroing is not needed (`Uninit`): `copy_regions` fills every live
             // byte, and all accessors are bounded by `count`.
             let mut new_data = acquire_arena(new_total, Fill::Uninit);
-            // SAFETY: distinct allocations; both sides sized per compute_offsets.
+            // SAFETY: distinct allocations; both sides sized per compute_offsets_into.
             unsafe {
                 copy_regions(
                     &self.data,
@@ -1164,7 +1173,7 @@ impl Batch {
             "shell_for copies every payload column of in_schema at its own index",
         );
         let n = self.count;
-        let mut out = Self::with_capacity(*out_schema, n);
+        let mut out = Self::with_capacity(out_schema, n);
         out.count = n;
         // Share the input heap so long (> 12 byte) STRING/BLOB values, whose
         // 16-byte structs are copied verbatim below, still resolve. Sharing an
@@ -1200,9 +1209,10 @@ impl Batch {
         out_schema: &SchemaDescriptor,
         prefix: u64,
     ) -> Self {
-        let in_stride = in_schema.pk_stride() as usize;
-        let out_stride = out_schema.pk_stride() as usize;
-        debug_assert_eq!(out_stride, in_stride + 8);
+        let in_stride = in_schema.pk_stride();
+        let out_stride = out_schema.pk_stride();
+        let stamp_bytes = DELTA_TICK_COL.size() as usize;
+        debug_assert_eq!(out_stride, in_stride + stamp_bytes);
         debug_assert_eq!(out_schema.num_payload_cols(), in_schema.num_payload_cols());
         if self.count == 0 {
             return Self::empty_with_schema(out_schema);
@@ -1218,8 +1228,8 @@ impl Batch {
             .chunks_exact_mut(out_stride)
             .zip(src_pk.chunks_exact(in_stride))
         {
-            dst[..8].copy_from_slice(&stamp);
-            dst[8..].copy_from_slice(src);
+            dst[..stamp_bytes].copy_from_slice(&stamp);
+            dst[stamp_bytes..].copy_from_slice(src);
         }
 
         output.inherit_layout(self);
@@ -1237,9 +1247,10 @@ impl Batch {
     /// `(key, payload)` element legitimately appears under two stamps. The result
     /// claims `Layout::Raw` so the consumer's sort-and-fold runs.
     pub fn stripped_of_pk_prefix(&self, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Self {
-        let in_stride = in_schema.pk_stride() as usize;
-        let out_stride = out_schema.pk_stride() as usize;
-        debug_assert_eq!(in_stride, out_stride + 8);
+        let in_stride = in_schema.pk_stride();
+        let out_stride = out_schema.pk_stride();
+        let stamp_bytes = DELTA_TICK_COL.size() as usize;
+        debug_assert_eq!(in_stride, out_stride + stamp_bytes);
         debug_assert_eq!(out_schema.num_payload_cols(), in_schema.num_payload_cols());
         if self.count == 0 {
             return Self::empty_with_schema(out_schema);
@@ -1254,7 +1265,7 @@ impl Batch {
             .chunks_exact_mut(out_stride)
             .zip(src_pk.chunks_exact(in_stride))
         {
-            dst.copy_from_slice(&src[8..]);
+            dst.copy_from_slice(&src[stamp_bytes..]);
         }
 
         output
@@ -1307,9 +1318,10 @@ impl Batch {
         }
         // Only clone the actually-used portion of data (count-based, not capacity-based).
         let nr = self.num_regions();
-        let (packed_offsets, packed_size) = compute_offsets(&self.strides, nr, self.count);
+        let mut packed_offsets = [0usize; MAX_BATCH_REGIONS];
+        let packed_size = compute_offsets_into(&self.strides, nr, self.count, &mut packed_offsets);
         let mut new_data = acquire_arena(packed_size, Fill::Uninit);
-        // SAFETY: distinct allocations; `new_data` sized per compute_offsets.
+        // SAFETY: distinct allocations; `new_data` sized per compute_offsets_into.
         unsafe {
             copy_regions(
                 &self.data,
@@ -1428,7 +1440,7 @@ impl Batch {
             // tag needs no repair: both layout readers short-circuit on `count == 0`.
             return Batch::empty_with_schema(schema);
         }
-        let mut out = Batch::with_capacity(*schema, rows);
+        let mut out = Batch::with_capacity(schema, rows);
         if !merge::should_relocate_blob(src.blob.len(), src.count, rows) {
             out.share_blob_from(src);
         }
@@ -1758,7 +1770,7 @@ pub(crate) fn write_to_batch(
     max_blob: usize,
     write_fn: impl FnOnce(&mut merge::DirectWriter),
 ) -> Batch {
-    let mut b = Batch::with_capacity_blob(*schema, max_rows, max_blob);
+    let mut b = Batch::with_capacity_blob(schema, max_rows, max_blob);
     let rows = {
         // `b.capacity`, not `max_rows`: the writer must carve at the offsets the
         // batch will read back through.

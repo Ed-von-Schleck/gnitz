@@ -25,7 +25,10 @@ impl CircuitTables {
     const VIEW_ID: u64 = 1;
 
     fn schema() -> SchemaDescriptor {
-        gnitz_store::schema::from_wire_cols(gnitz_wire::CIRCUIT_NODES_COLS, gnitz_wire::CIRCUIT_FAMILY_PK)
+        // The catalog family's own schema, not a rebuild of it: the loader reads
+        // the real CIRCUIT_NODES table, so a fixture that derived its own layout
+        // could drift from the one production writes.
+        *crate::catalog::SysFamily::CircuitNodes.schema()
     }
 
     fn new() -> Self {

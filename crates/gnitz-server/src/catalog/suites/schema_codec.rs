@@ -217,7 +217,7 @@ fn ddl_txn_roundtrip_client_to_server() {
             let schema = crate::catalog::SysFamily::from_id(*got_tid as i64)
                 .expect("bundle family id must be a system family")
                 .schema();
-            let (batch, _) = Batch::decode_from_wal_block(slice, &schema, false).expect("decode family batch");
+            let (batch, _) = Batch::decode_from_wal_block(slice, schema, false).expect("decode family batch");
             assert_eq!(batch.len(), exp_batch.len(), "row count tid {got_tid}");
             for i in 0..batch.len() {
                 assert_eq!(

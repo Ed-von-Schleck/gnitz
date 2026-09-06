@@ -32,7 +32,7 @@ fn cut<'a>(
     // `batch.count` rows, not 2×: a 2× provision puts a bulk push over
     // `POOL_BYPASS_BYTES`, so it mmaps its own arena instead of taking a pooled
     // one, and the arena grows on demand anyway.
-    let eff = effective.get_or_insert_with(|| Batch::with_capacity(*schema, batch.count));
+    let eff = effective.get_or_insert_with(|| Batch::with_capacity(schema, batch.count));
     eff.append_batch(batch, kept_from, end);
     eff
 }
@@ -136,7 +136,7 @@ pub(crate) fn enforce_unique_pk(store: &Table, schema: &SchemaDescriptor, mut ba
             // Nothing diverged, so the input *is* the effective batch. It still
             // needs the caller's descriptor: `effective` would have been built
             // with it, and it may be newer than the store's.
-            batch.set_schema(*schema);
+            batch.set_schema(schema);
             batch
         }
         Some(mut eff) => {

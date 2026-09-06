@@ -823,7 +823,7 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     }
 
     // One VIEW_TAB batch, consumers first — the dependency-reversed row order.
-    let mut bb = BatchBuilder::new(SysFamily::View.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::View.schema());
     for (vid, name) in [
         (r_consumer, "rv2"),
         (p_consumer, "pv2"),

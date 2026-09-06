@@ -14,7 +14,7 @@ fn payload_row(tc: TypeCode, le: &[u8]) -> (Batch, ColumnLocator) {
         &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc as u8, 0)],
         &[0],
     );
-    let mut b = Batch::with_capacity(schema, 1);
+    let mut b = Batch::with_capacity(&schema, 1);
     b.extend_pk(1u128);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&0u64.to_le_bytes());
@@ -123,7 +123,7 @@ fn pk_source_and_payload_source_encode_identically() {
         let width = schema.columns[2].size() as usize;
         let payload_idx = schema.try_payload_idx(2).unwrap();
 
-        let mut batch = Batch::with_capacity(schema, vals.len());
+        let mut batch = Batch::with_capacity(&schema, vals.len());
         for (i, &v) in vals.iter().enumerate() {
             // `extend_pk_opk` truncates each u128 to the column width, so a
             // negative `v as u128` still packs the right two's-complement bytes.

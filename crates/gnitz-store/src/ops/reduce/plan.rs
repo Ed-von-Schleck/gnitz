@@ -98,9 +98,10 @@ pub struct ReducePlan {
 impl ReducePlan {
     /// The one authority over everything derived from `(input_schema,
     /// group_by_cols, agg_descs, out_key)` — the output layout included, so no
-    /// caller derives it a second time to hand back in. `Err` for the two shapes
-    /// an untrusted producer can name and the operator cannot execute: an output
-    /// wider than the schema array, and an unaggregatable column type.
+    /// caller derives it a second time to hand back in. `Err` for the shapes an
+    /// untrusted producer can name and the operator cannot execute: an output
+    /// wider than the schema array, an unaggregatable column type, and a float
+    /// group column, which has no key image.
     pub fn new(
         input_schema: &SchemaDescriptor,
         group_by_cols: &[u32],
@@ -135,11 +136,15 @@ impl ReducePlan {
         // Every group set has a packed key and the accumulator build above
         // already rejected any aggregate the index could not encode, so a
         // non-linear reduce always gets one — there is no eligibility gate and
-        // no trace-replay fallback.
-        let avi = acc_template
-            .iter()
-            .any(|a| !a.is_linear())
-            .then(|| AviBake::new(input_schema, group_by_cols, &acc_template));
+        // no trace-replay fallback. The one refusal is a float group column,
+        // which has no order- and equality-correct key image at all.
+        let avi = match acc_template.iter().any(|a| !a.is_linear()) {
+            true => Some(
+                AviBake::new(input_schema, group_by_cols, &acc_template)
+                    .ok_or("reduce: a float group column has no order-preserving key image")?,
+            ),
+            false => None,
+        };
         // Read off the bake's own aggregate list, so the value-indexed set has one
         // walk rather than a second one that has to keep agreeing with it.
         let track_nonlinear = avi.as_ref().is_some_and(AviBake::any_trace_foldable);
@@ -174,7 +179,7 @@ impl ReducePlan {
         } else {
             OutPk::Narrow(NarrowPkOpk::new(
                 self.group_key.key_row(mb, row),
-                self.output_schema.pk_stride() as usize,
+                self.output_schema.pk_stride(),
             ))
         }
     }

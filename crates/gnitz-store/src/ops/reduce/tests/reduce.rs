@@ -289,7 +289,7 @@ fn grouped_reduce_two_column_digest_key() {
 /// which is the *input's* stride whenever the group set is the PK.
 fn out_pk(b: &Batch, row: usize) -> u128 {
     let bytes = b.get_pk_bytes(row);
-    gnitz_wire::widen_pk_be(bytes, bytes.len())
+    gnitz_wire::widen_pk_be(bytes)
 }
 
 /// Local variant of `test_support::make_batch`: stamps the layout with
@@ -313,7 +313,7 @@ fn make_schema_u64_f32() -> SchemaDescriptor {
 
 fn make_batch_f32(schema: &SchemaDescriptor, rows: &[(u64, i64, f32)]) -> Batch {
     let n = rows.len();
-    let mut b = Batch::with_capacity(*schema, n.max(1));
+    let mut b = Batch::with_capacity(schema, n.max(1));
 
     for &(pk, w, val) in rows {
         b.extend_pk(pk as u128);
@@ -358,7 +358,7 @@ fn test_reduce_sum_retraction() {
 
     // Tick 1: insert 3 rows in group 10: val=100, val=200, val=300
     let delta1 = {
-        let mut b = Batch::with_capacity(in_schema, 3);
+        let mut b = Batch::with_capacity(&in_schema, 3);
         for (pk, val) in [(1u64, 100i64), (2, 200), (3, 300)] {
             b.extend_pk(pk as u128);
             b.extend_weight(&1i64.to_le_bytes());
@@ -384,7 +384,7 @@ fn test_reduce_sum_retraction() {
     let mut to_ch2 = trace_cursor(out1, out_schema);
 
     let delta2 = {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         b.extend_pk(2u128);
         b.extend_weight(&(-1i64).to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -438,7 +438,7 @@ fn linear_sum_only_emptied_group_eliminated() {
     // Tick 1: insert (pk1, grp=10, val=5) → group exists (sum=5, count=1).
     let mut to_ch = empty_trace(out_schema);
     let row = |pk: u128, w: i64| {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         b.extend_pk(pk);
         b.extend_weight(&w.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -540,7 +540,7 @@ fn linear_sum_only_new_all_null_group_present() {
     // New group g=7 whose only row has val=NULL.
     let mut to_ch = empty_trace(out_schema);
     let delta = {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&(1u64 << 1).to_le_bytes()); // val (payload idx 1) NULL
@@ -597,7 +597,7 @@ fn count_star_only_emptied_group_eliminated() {
     };
 
     let row = |pk: u128, w: i64| {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         b.extend_pk(pk);
         b.extend_weight(&w.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -704,7 +704,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     // Tick 1: insert (pk1, grp=10, val=5) and (pk2, grp=10, val=NULL).
     let mut to_ch = empty_trace(out_schema);
     let delta1 = {
-        let mut b = Batch::with_capacity(in_schema, 2);
+        let mut b = Batch::with_capacity(&in_schema, 2);
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -740,7 +740,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     // drops to 1, the last non-null contributor is gone → SUM must become NULL.
     let mut to_ch2 = trace_cursor(raw1, out_schema);
     let delta2 = {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         b.extend_pk(1u128);
         b.extend_weight(&(-1i64).to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -818,7 +818,7 @@ fn null_min_retraction_re_emits_null() {
     // Tick 1: (pk=1, grp=10, val=NULL) → COUNT keeps the group alive, MIN=NULL.
     let mut to_ch = empty_trace(out_schema);
     let delta1 = {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&(1u64 << 1).to_le_bytes()); // val (payload idx 1) NULL
@@ -838,7 +838,7 @@ fn null_min_retraction_re_emits_null() {
     // Tick 2: (pk=2, grp=10, val=7) → MIN=7, retracts the NULL row.
     let mut to_ch2 = trace_cursor(out1, out_schema);
     let delta2 = {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         b.extend_pk(2u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -892,7 +892,7 @@ fn null_sum_fold_stays_null() {
     ];
     let sum_null_bit = 1u64 << 2;
     let null_row = |pk: u128| {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         b.extend_pk(pk);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&(1u64 << 1).to_le_bytes()); // val NULL
@@ -961,7 +961,7 @@ fn reduce_trace_seek_wide_pk() {
     // Tick 1: two rows in one group (7,7,7) — val 100 and 200 → SUM = 300.
     let mut to_ch = empty_trace(out_schema);
     let delta1 = {
-        let mut b = Batch::with_capacity(in_schema, 2);
+        let mut b = Batch::with_capacity(&in_schema, 2);
         for val in [100i64, 200] {
             b.extend_pk_bytes(&pk(7, 7, 7));
             b.extend_weight(&1i64.to_le_bytes());
@@ -981,7 +981,7 @@ fn reduce_trace_seek_wide_pk() {
     // out of trace_out by PK bytes.
     let mut to_ch2 = trace_cursor(out1, out_schema);
     let delta2 = {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         b.extend_pk_bytes(&pk(7, 7, 7));
         b.extend_weight(&(-1i64).to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -1039,7 +1039,7 @@ fn reduce_trace_seek_compound_pk() {
     // Tick 1: insert (1,5)->100 and (2,3)->200 (two distinct groups).
     let mut to_ch = empty_trace(out_schema);
     let delta1 = {
-        let mut b = Batch::with_capacity(in_schema, 2);
+        let mut b = Batch::with_capacity(&in_schema, 2);
         for &(a, c, val) in &[(1u64, 5u64, 100i64), (2, 3, 200)] {
             b.extend_pk_bytes(&pk(a, c));
             b.extend_weight(&1i64.to_le_bytes());
@@ -1061,7 +1061,7 @@ fn reduce_trace_seek_compound_pk() {
     // insert 250. Group (1,5) is untouched.
     let mut to_ch2 = trace_cursor(out1, out_schema);
     let delta2 = {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         b.extend_pk_bytes(&pk(2, 3));
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -1116,7 +1116,7 @@ fn reduce_trace_seek_signed_pk() {
     // Tick 1: insert key=-1 -> 200, key=2 -> 100.
     let mut to_ch = empty_trace(out_schema);
     let delta1 = {
-        let mut b = Batch::with_capacity(in_schema, 2);
+        let mut b = Batch::with_capacity(&in_schema, 2);
         for &(k, val) in &[(-1i64, 200i64), (2, 100)] {
             b.extend_pk_opk(&in_schema, &[(k as u64) as u128]);
             b.extend_weight(&1i64.to_le_bytes());
@@ -1135,7 +1135,7 @@ fn reduce_trace_seek_signed_pk() {
     // Tick 2: insert key=-1 -> 50. SUM goes 200 → 250: retract + insert.
     let mut to_ch2 = trace_cursor(out1, out_schema);
     let delta2 = {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         b.extend_pk_opk(&in_schema, &[((-1i64) as u64) as u128]);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -1370,7 +1370,7 @@ fn make_schema_u64_uuid_i64() -> SchemaDescriptor {
 }
 
 fn build_batch_u64_uuid(schema: &SchemaDescriptor, rows: &[(u64, u128)]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(pk, uuid) in rows {
         b.extend_pk(pk as u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -1383,7 +1383,7 @@ fn build_batch_u64_uuid(schema: &SchemaDescriptor, rows: &[(u64, u128)]) -> Batc
 }
 
 fn build_batch_u64_uuid_i64(schema: &SchemaDescriptor, rows: &[(u64, u128, i64)]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(pk, uuid, val) in rows {
         b.extend_pk(pk as u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -1498,7 +1498,7 @@ fn make_schema_pk1_i64_u64() -> SchemaDescriptor {
 /// Works for either pk_index=0 or pk_index=1 since extend_col(pi, ..) addresses
 /// the dense payload region — the non-PK column always lives at payload index 0.
 fn build_pk_other(schema: &SchemaDescriptor, rows: &[(u64, i64)]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(pk, other) in rows {
         b.extend_pk(pk as u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -1577,7 +1577,7 @@ fn test_argsort_delta_pk_in_group() {
     let indices = argsort_delta(&mb, &GroupKeyCols::new(&schema, &[0, 1]));
     assert_eq!(indices.len(), 5);
     assert_groups_contiguous(&indices, |i| {
-        let pk = gnitz_wire::widen_pk_be(mb.get_pk_bytes(i as usize), mb.pk_stride as usize);
+        let pk = gnitz_wire::widen_pk_be(mb.get_pk_bytes(i as usize));
         let other = i64::from_le_bytes(mb.get_col_ptr(i as usize, 0, 8).try_into().unwrap());
         (pk << 64) | (other as u64 as u128)
     });
@@ -1591,7 +1591,7 @@ fn test_argsort_delta_pk_in_group() {
 /// Build a 2-col batch (pk, nullable_i64). For null rows, payload bytes
 /// are zero (DirectWriter convention) and the null bit at payload pi=0 is set.
 fn build_pk_null_i64(schema: &SchemaDescriptor, rows: &[(u64, Option<i64>)]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(pk, val) in rows {
         b.extend_pk(pk as u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -1680,7 +1680,7 @@ fn test_argsort_delta_nullable_group_col() {
 /// Build a 2×U64 compound-PK batch. Rows: (pk0, pk1, weight, val).
 fn make_batch_compound_2xu64(schema: &SchemaDescriptor, rows: &[(u64, u64, i64, i64)]) -> Batch {
     let n = rows.len();
-    let mut b = Batch::with_capacity(*schema, n.max(1));
+    let mut b = Batch::with_capacity(schema, n.max(1));
     for &(pk0, pk1, w, val) in rows {
         let mut pk_bytes = [0u8; 16];
         // 2×U64 compound PK: both unsigned, OPK == BE per column.
@@ -1719,7 +1719,7 @@ fn test_emit_reduce_row_compound_pk_bytes() {
     let input = make_batch_compound_2xu64(&in_schema, &[(pk0, pk1, 1, 99)]);
     let mb = input.as_mem_batch();
 
-    let mut output = Batch::with_capacity(out_schema, 1);
+    let mut output = Batch::with_capacity(&out_schema, 1);
     let agg = AggDescriptor { col_idx: 2, agg_op: AggFunc::Count };
     // Natural-PK grouping passes the source row's PK bytes; they're copied verbatim.
     let plan = make_plan(&in_schema, &[0u32, 1u32], std::slice::from_ref(&agg), false, false);
@@ -2053,7 +2053,7 @@ fn make_batch_u64pk_i64grp_u64val(
     rows: &[(u64, i64, i64, u64)], // (pk, weight, grp, u64_val)
 ) -> Batch {
     let n = rows.len();
-    let mut b = Batch::with_capacity(*schema, n.max(1));
+    let mut b = Batch::with_capacity(schema, n.max(1));
     for &(pk, w, grp, val) in rows {
         b.extend_pk(pk as u128);
         b.extend_weight(&w.to_le_bytes());
@@ -2268,7 +2268,7 @@ fn test_avi_seed_u64_high_bit() {
 
     // Build a batch with a single row val=10u64, pk=1.
     let batch = {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -2351,7 +2351,7 @@ fn make_batch_raw_pk<T: Copy>(
     pk_encode: impl Fn(T) -> u128,
 ) -> Batch {
     let n = rows.len();
-    let mut b = Batch::with_capacity(*schema, n.max(1));
+    let mut b = Batch::with_capacity(schema, n.max(1));
     for &(pk, w, val) in rows {
         // pk_encode yields the native value; OPK-encode (sign-flip for signed).
         b.extend_pk_opk(schema, &[pk_encode(pk)]);
@@ -2391,8 +2391,8 @@ fn test_reduce_group_by_pk_unsorted_input_linear_sum() {
     assert_eq!(out.count, 2, "one row per distinct PK");
     let pk0 = out.get_pk_bytes(0);
     let pk1 = out.get_pk_bytes(1);
-    let pk0_val = gnitz_wire::widen_pk_be(pk0, pk0.len());
-    let pk1_val = gnitz_wire::widen_pk_be(pk1, pk1.len());
+    let pk0_val = gnitz_wire::widen_pk_be(pk0);
+    let pk1_val = gnitz_wire::widen_pk_be(pk1);
     assert_eq!(pk0_val, 3, "PK-sorted: 3 precedes 5");
     assert_eq!(pk1_val, 5);
     let sum0 = read_i64_le(out.col_data(0), 0);
@@ -2554,7 +2554,7 @@ fn test_reduce_group_by_pk_unsorted_with_retraction() {
     // Build a pre-populated trace_out carrying (pk=5, SUM=100, count=1). The
     // trailing count is the cardinality companion; the old group's one prior row
     // gives count=1, so the group survives the +1 insert delta.
-    let mut prev = Batch::with_capacity(out_schema, 1);
+    let mut prev = Batch::with_capacity(&out_schema, 1);
     prev.extend_pk(5u128);
     prev.extend_weight(&1i64.to_le_bytes());
     prev.extend_null_bmp(&0u64.to_le_bytes());
@@ -2611,7 +2611,7 @@ fn test_reduce_min_group_by_pk_retracts_extreme() {
     let history = make_batch(&in_schema, &[(1, 1, 10), (1, 1, 20)]);
 
     // trace_out: old MIN(pk=1) = 10.
-    let mut prev = Batch::with_capacity(out_schema, 1);
+    let mut prev = Batch::with_capacity(&out_schema, 1);
     prev.extend_pk(1u128);
     prev.extend_weight(&1i64.to_le_bytes());
     prev.extend_null_bmp(&0u64.to_le_bytes());
@@ -2693,7 +2693,7 @@ fn avi_two_groups_distinct_byte_form_keys() {
     // delta: one row per group. The delta values are deliberately NOT each
     // group's minimum, so a correct result can only come from the index.
     let delta = {
-        let mut b = Batch::with_capacity(in_schema, 2);
+        let mut b = Batch::with_capacity(&in_schema, 2);
         for (pk, a, bb, val) in [(1u64, 1u32, 1u32, 50i64), (2, 2, 2, 60)] {
             b.extend_pk(pk as u128);
             b.extend_weight(&1i64.to_le_bytes());
@@ -2711,7 +2711,7 @@ fn avi_two_groups_distinct_byte_form_keys() {
     let avi_schema = avi_schema(&in_schema, &[1u32, 2u32]);
     assert_eq!(avi_schema.pk_stride(), 17, "4 + 4 + 1 + 8");
     let avi_batch = {
-        let mut b = Batch::with_capacity(avi_schema, 2);
+        let mut b = Batch::with_capacity(&avi_schema, 2);
         for (a, bb, min) in [(1u32, 1u32, 10i64), (2, 2, 20)] {
             let mut key = [0u8; 17];
             avi_gcol(&mut key[0..4], &a.to_le_bytes(), type_code::U32);
@@ -2792,7 +2792,7 @@ fn avi_retraction_returns_next_extremum() {
 
     // delta: retract the row holding the current MIN (val=5) of group a=1.
     let delta = {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         b.extend_pk(1u128);
         b.extend_weight(&(-1i64).to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -2808,7 +2808,7 @@ fn avi_retraction_returns_next_extremum() {
     // values are {10, 20}, so the prefix walk must return the smaller, 10.
     let avi_schema = avi_schema(&in_schema, &[1u32]);
     let avi_batch = {
-        let mut b = Batch::with_capacity(avi_schema, 2);
+        let mut b = Batch::with_capacity(&avi_schema, 2);
         for min in [10i64, 20] {
             let mut key = [0u8; 13];
             avi_gcol(&mut key[0..4], &1u32.to_le_bytes(), type_code::U32);
@@ -2826,7 +2826,7 @@ fn avi_retraction_returns_next_extremum() {
 
     // trace_out: previous output for a=1 was MIN=5.
     let to_batch = {
-        let mut b = Batch::with_capacity(out_schema, 1);
+        let mut b = Batch::with_capacity(&out_schema, 1);
         b.extend_pk(group_key);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -2903,7 +2903,7 @@ fn avi_non_power_of_two_stride_drives_cursor() {
 
         let gval: u64 = 7;
         let delta = {
-            let mut b = Batch::with_capacity(in_schema, 1);
+            let mut b = Batch::with_capacity(&in_schema, 1);
             b.extend_pk(1u128);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
@@ -2915,9 +2915,9 @@ fn avi_non_power_of_two_stride_drives_cursor() {
         };
 
         let avi_schema = avi_schema(&in_schema, &[1u32]);
-        assert_eq!(avi_schema.pk_stride() as usize, stride);
+        assert_eq!(avi_schema.pk_stride(), stride);
         let avi_batch = {
-            let mut b = Batch::with_capacity(avi_schema, 1);
+            let mut b = Batch::with_capacity(&avi_schema, 1);
             let mut key = vec![0u8; stride];
             avi_gcol(&mut key[..gsize], &gval.to_le_bytes()[..gsize], gtc);
             let av = i64_av(42i64);
@@ -2996,7 +2996,7 @@ fn min_tie_retract_one_copy_keeps_min() {
 
     // History: group g=1 holds val=5 twice (pk=1, pk=2) and val=10 (pk=3).
     let ti_batch = {
-        let mut b = Batch::with_capacity(in_schema, 3);
+        let mut b = Batch::with_capacity(&in_schema, 3);
         mk_row(&mut b, 1, 1, 1, 5);
         mk_row(&mut b, 2, 1, 1, 5);
         mk_row(&mut b, 3, 1, 1, 10);
@@ -3006,7 +3006,7 @@ fn min_tie_retract_one_copy_keeps_min() {
     let group_key = GroupKeyCols::new(&in_schema, &[1u32]).key_row(&ti_batch.as_mem_batch(), 0);
 
     let to_batch = {
-        let mut b = Batch::with_capacity(out_schema, 1);
+        let mut b = Batch::with_capacity(&out_schema, 1);
         b.extend_pk(group_key);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -3019,7 +3019,7 @@ fn min_tie_retract_one_copy_keeps_min() {
 
     // delta: retract one of the two val=5 rows (pk=1).
     let delta = {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         mk_row(&mut b, 1, -1, 1, 5);
         b.set_layout_unchecked(Layout::Consolidated);
         b
@@ -3091,7 +3091,7 @@ fn min_ignores_null_values() {
 
     // group g=1: NULL, 7, 3 → MIN ignores NULL → 3.
     let delta = {
-        let mut b = Batch::with_capacity(in_schema, 3);
+        let mut b = Batch::with_capacity(&in_schema, 3);
         mk_row(&mut b, 1, 1, 0, true);
         mk_row(&mut b, 2, 1, 7, false);
         mk_row(&mut b, 3, 1, 3, false);
@@ -3140,7 +3140,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
 
     // delta: retract group (3, 4)'s current MIN (val=5).
     let delta = {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         b.extend_pk(1u128);
         b.extend_weight(&(-1i64).to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -3157,7 +3157,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
     // different group (3, 5) sharing the a-byte prefix must NOT be matched.
     let avi_schema = avi_schema(&in_schema, &[1u32, 2u32]);
     let avi_batch = {
-        let mut b = Batch::with_capacity(avi_schema, 2);
+        let mut b = Batch::with_capacity(&avi_schema, 2);
         let put = |b: &mut Batch, a: u32, bb: u32, min: i64| {
             let mut key = [0u8; 17];
             avi_gcol(&mut key[0..4], &a.to_le_bytes(), type_code::U32);
@@ -3177,7 +3177,7 @@ fn avi_multi_col_retraction_returns_next_extremum() {
     };
 
     let to_batch = {
-        let mut b = Batch::with_capacity(out_schema, 1);
+        let mut b = Batch::with_capacity(&out_schema, 1);
         b.extend_pk(group_key);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -3305,7 +3305,7 @@ fn avi_wide_two_u64_groups_match_reference() {
         // the fixture must be in byte order. The group prefix is OPK, so for
         // these unsigned columns that coincides with numeric (a, b) order.
         keys.sort();
-        let mut bt = Batch::with_capacity(avi_schema, keys.len());
+        let mut bt = Batch::with_capacity(&avi_schema, keys.len());
         for key in &keys {
             bt.extend_pk_bytes(key);
             bt.extend_weight(&1i64.to_le_bytes());
@@ -3319,7 +3319,7 @@ fn avi_wide_two_u64_groups_match_reference() {
     // Delta: one representative insert per group. Its val is deliberately the
     // group's MIN + 1000 so a correct result can only come from the index.
     let delta = {
-        let mut bt = Batch::with_capacity(in_schema, group_coords.len());
+        let mut bt = Batch::with_capacity(&in_schema, group_coords.len());
         for (i, &(a, b)) in group_coords.iter().enumerate() {
             bt.extend_pk(i as u128 + 1);
             bt.extend_weight(&1i64.to_le_bytes());
@@ -3395,7 +3395,7 @@ fn avi_wide_single_u128_group_distinct() {
     let groups = [(g1, 10i64), (g2, 20i64)];
 
     let delta = {
-        let mut b = Batch::with_capacity(in_schema, 2);
+        let mut b = Batch::with_capacity(&in_schema, 2);
         for (i, &(g, _)) in groups.iter().enumerate() {
             b.extend_pk(i as u128 + 1);
             b.extend_weight(&1i64.to_le_bytes());
@@ -3408,7 +3408,7 @@ fn avi_wide_single_u128_group_distinct() {
     };
 
     let avi_batch = {
-        let mut b = Batch::with_capacity(avi_schema, 2);
+        let mut b = Batch::with_capacity(&avi_schema, 2);
         // sorted ascending by g (both share high bytes; g1 < g2 by low byte).
         for &(g, m) in &groups {
             let mut key = [0u8; 25];
@@ -3488,7 +3488,7 @@ fn avi_wide_mixed_signed_unsigned_key() {
     let groups: [(i64, u64, i64); 3] = [(-5, 10, 100), (-5, 11, 50), (3, 10, 200)];
 
     let delta = {
-        let mut b = Batch::with_capacity(in_schema, 3);
+        let mut b = Batch::with_capacity(&in_schema, 3);
         for (i, &(a, bb, _)) in groups.iter().enumerate() {
             b.extend_pk(i as u128 + 1);
             b.extend_weight(&1i64.to_le_bytes());
@@ -3505,7 +3505,7 @@ fn avi_wide_mixed_signed_unsigned_key() {
     // production's ingest produces. The group prefix is OPK, so the signed
     // column's byte order is its signed order.
     let avi_batch = {
-        let mut b = Batch::with_capacity(avi_schema, 3);
+        let mut b = Batch::with_capacity(&avi_schema, 3);
         let mut keys: Vec<[u8; 25]> = groups
             .iter()
             .map(|&(a, bb, m)| {
@@ -3596,7 +3596,7 @@ fn avi_wide_prefix_collision_distinct_groups() {
 
     // delta inserts only group (1,2,3); its val is a decoy 999.
     let delta = {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -3609,7 +3609,7 @@ fn avi_wide_prefix_collision_distinct_groups() {
     };
 
     let avi_batch = {
-        let mut b = Batch::with_capacity(avi_schema, 2);
+        let mut b = Batch::with_capacity(&avi_schema, 2);
         // sorted by (a,b,c): (1,2,3) before (1,2,4).
         for &(a, bb, c, m) in &groups {
             let mut key = [0u8; 33];
@@ -3686,7 +3686,7 @@ fn avi_wide_retraction_returns_next_extremum() {
     let ga: u64 = 1 << 40;
     let gb: u64 = 2;
     let delta = {
-        let mut b = Batch::with_capacity(in_schema, 1);
+        let mut b = Batch::with_capacity(&in_schema, 1);
         b.extend_pk(1u128);
         b.extend_weight(&(-1i64).to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -3702,7 +3702,7 @@ fn avi_wide_retraction_returns_next_extremum() {
     // AVI post-state: group (ga, gb) surviving values {9, 15}; a decoy group
     // (ga, gb+1) sharing the first 8 bytes holds a smaller 1 that must not win.
     let avi_batch = {
-        let mut b = Batch::with_capacity(avi_schema, 3);
+        let mut b = Batch::with_capacity(&avi_schema, 3);
         let put = |b: &mut Batch, a: u64, bb: u64, m: i64| {
             let mut key = [0u8; 25];
             avi_gcol(&mut key[0..8], &a.to_le_bytes(), type_code::U64);
@@ -3724,7 +3724,7 @@ fn avi_wide_retraction_returns_next_extremum() {
     };
 
     let to_batch = {
-        let mut b = Batch::with_capacity(out_schema, 1);
+        let mut b = Batch::with_capacity(&out_schema, 1);
         b.extend_pk(group_key);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -3793,7 +3793,7 @@ fn count_accumulator_over_uuid_pk_does_not_panic() {
         ],
         &[0],
     );
-    let mut b = Batch::with_capacity(schema, 2);
+    let mut b = Batch::with_capacity(&schema, 2);
     for pk in [1u128, 2] {
         b.extend_pk(pk);
         b.extend_weight(&1i64.to_le_bytes());
@@ -3871,7 +3871,7 @@ fn avi_full_path_min_max_across_high_byte() {
     );
     // One group g=5 with values {101, 111, -5}.
     let delta = {
-        let mut b = Batch::with_capacity(in_schema, 3);
+        let mut b = Batch::with_capacity(&in_schema, 3);
         for (pk, v) in [(1u128, 101i64), (2, 111), (3, -5)] {
             b.extend_pk(pk);
             b.extend_weight(&1i64.to_le_bytes());
@@ -3900,7 +3900,7 @@ fn avi_full_path_min_max_across_high_byte() {
 /// width, so a negative `b as u128` still packs the correct two's-complement
 /// LE bytes.
 fn pk_ab_delta(schema: &SchemaDescriptor, rows: &[(i128, i64)]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(bv, w) in rows {
         b.extend_pk_opk(schema, &[5u128, bv as u128]);
         b.extend_weight(&w.to_le_bytes());
@@ -4038,7 +4038,7 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
     // re-derives canonical order through the argsort_pk_canonical branch — the
     // wide compound-PK path under test.
     let delta = {
-        let mut b = Batch::with_capacity(in_schema, 2);
+        let mut b = Batch::with_capacity(&in_schema, 2);
         for (a, c, w) in [(1u128, 1u128, 2i64), (1, 2, 1)] {
             b.extend_pk_opk(&in_schema, &[a, c]);
             b.extend_weight(&w.to_le_bytes());
@@ -4295,7 +4295,7 @@ fn min_multi_col_group_resolves_per_group() {
     let pi_val = in_schema.try_payload_idx(3).unwrap();
 
     let make_batch = |rows: &[(u64, i64, i64, i64, i64)]| -> Batch {
-        let mut b = Batch::with_capacity(in_schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(&in_schema, rows.len().max(1));
         for &(pk, w, c1, c2, val) in rows {
             b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
@@ -4400,7 +4400,7 @@ fn test_group_key_128bit_collision_resistance() {
 
     // Sweep many distinct (c1, c2) multi-column keys. Each (i, j) is a distinct
     // group; the 128-bit fold must map them to distinct u128 with no collision.
-    let mut b = Batch::with_capacity(schema, 1);
+    let mut b = Batch::with_capacity(&schema, 1);
     let mut expected = 0usize;
     for i in 0..64i64 {
         for j in 0..64u32 {
@@ -4483,7 +4483,7 @@ fn make_schema_u64_blob_grp_i64() -> SchemaDescriptor {
 fn make_batch_blob_grp_i64(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8], i64)]) -> Batch {
     let pi_grp = schema.try_payload_idx(1).unwrap();
     let pi_val = schema.try_payload_idx(2).unwrap();
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(pk, w, blob, val) in rows {
         let gs = encode_german_string(blob, &mut b.blob);
         b.extend_pk(pk as u128);
@@ -4911,7 +4911,7 @@ fn global_lone_min_avi_empty_prefix() {
     let avi_schema = avi_schema(&in_schema, &[]);
     assert_eq!(avi_schema.pk_stride(), 9, "0 group + 1 ordinal + 8 av");
     let avi_with = |min: i64| {
-        let mut b = Batch::with_capacity(avi_schema, 1);
+        let mut b = Batch::with_capacity(&avi_schema, 1);
         let av = i64_av(min);
         let mut key = [0u8; 9];
         key[0] = 0; // ordinal 0 (single MIN, empty group prefix)
@@ -5013,7 +5013,7 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
     let mut acc = make_acc(&in_schema, &[0], desc);
 
     // Two rows whose payload column (payload slot 0) is NULL.
-    let mut batch = Batch::with_capacity(u64_pk_schema(SchemaColumn::new(type_code::I64, 1)), 2);
+    let mut batch = Batch::with_capacity(&u64_pk_schema(SchemaColumn::new(type_code::I64, 1)), 2);
     for pk in [1u128, 2u128] {
         batch.extend_pk(pk);
         batch.extend_weight(&1i64.to_le_bytes());
@@ -5037,7 +5037,7 @@ fn count_non_null_all_null_group_renders_zero_null_clear() {
         ],
         &[0],
     );
-    let mut output = Batch::with_capacity(out_schema, 1);
+    let mut output = Batch::with_capacity(&out_schema, 1);
     let accs = vec![acc];
     let plan = make_plan(&in_schema, &[0u32], std::slice::from_ref(&desc), false, false);
     emit_reduce_row(&mut output, (&mb, 0), mb.get_pk_bytes(0), &accs, &plan);
@@ -5079,7 +5079,7 @@ fn emit_global_ground_renders_count_family_zero_null_clear() {
             agg_op: AggFunc::CountNonNull,
         },
     ];
-    let mut raw_output = Batch::with_capacity(out_schema, 1);
+    let mut raw_output = Batch::with_capacity(&out_schema, 1);
     let v0 = [0u8; 16]; // U128 ground PK (V₀)
     let plan = make_plan(&in_schema, &[], &descs, true, true);
     emit_global_ground(&mut raw_output, &v0, &plan);
@@ -5121,7 +5121,7 @@ fn combine_partial_schema() -> SchemaDescriptor {
 fn combine_partials(rows: &[(i64, Option<i64>)]) -> Batch {
     let schema = combine_partial_schema();
     let v0 = gnitz_wire::global_group_key();
-    let mut b = Batch::with_capacity(schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(&schema, rows.len().max(1));
     for &(w, val) in rows {
         b.extend_pk(v0);
         b.extend_weight(&w.to_le_bytes());
@@ -5276,7 +5276,7 @@ fn cg_src() -> SchemaDescriptor {
 /// Raw delta over `cg_src()` from `(pk, w, g, a, b)` rows.
 fn cg_delta(rows: &[(u64, i64, i32, i64, i64)]) -> Batch {
     let s = cg_src();
-    let mut b = Batch::with_capacity(s, rows.len().max(1));
+    let mut b = Batch::with_capacity(&s, rows.len().max(1));
     for &(pk, w, g, a, bb) in rows {
         b.extend_pk(pk as u128);
         b.extend_weight(&w.to_le_bytes());
@@ -5386,7 +5386,7 @@ fn cg3_out() -> SchemaDescriptor {
 /// `(pk, w, g, a, a_null)` delta over `cg3_src()`.
 fn cg3_delta(rows: &[(u64, i64, i32, i64, bool)]) -> Batch {
     let s = cg3_src();
-    let mut b = Batch::with_capacity(s, rows.len().max(1));
+    let mut b = Batch::with_capacity(&s, rows.len().max(1));
     for &(pk, w, g, a, a_null) in rows {
         b.extend_pk(pk as u128);
         b.extend_weight(&w.to_le_bytes());
@@ -5543,7 +5543,7 @@ fn reduce_multi_avi_retract_to_all_null() {
 
     // Rebuild tick-2 output row to seed tick-3 trace_out.
     let row2 = {
-        let mut b = Batch::with_capacity(out_schema, 1);
+        let mut b = Batch::with_capacity(&out_schema, 1);
         // copy the +1 row out of out2
         b.extend_pk_bytes(out2.get_pk_bytes(ins));
         b.extend_weight(&1i64.to_le_bytes());
@@ -5640,7 +5640,7 @@ fn reduce_multi_avi_compound_group_key() {
         AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
     ];
     let delta = {
-        let mut b = Batch::with_capacity(in_schema, 4);
+        let mut b = Batch::with_capacity(&in_schema, 4);
         for (pk, g1, g2, a) in [(1u64, 1i32, 1i32, 9i64), (2, 1, 1, 4), (3, 1, 2, 7), (4, 1, 2, 2)] {
             b.extend_pk(pk as u128);
             b.extend_weight(&1i64.to_le_bytes());
@@ -5711,7 +5711,7 @@ fn reduce_multi_avi_global_emptied() {
         AggDescriptor { col_idx: 0, agg_op: AggFunc::Count },
     ];
     let mk = |rows: &[(u64, i64, i64, i64)]| {
-        let mut b = Batch::with_capacity(in_schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(&in_schema, rows.len().max(1));
         for &(pk, w, a, bb) in rows {
             b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
@@ -5792,7 +5792,7 @@ fn sum_count_out_synthetic(grp_col: SchemaColumn) -> SchemaDescriptor {
 fn build_grp_val_delta(schema: &SchemaDescriptor, rows: &[GrpValRow]) -> Batch {
     let g_pi = schema.try_payload_idx(1).unwrap();
     let v_pi = schema.try_payload_idx(2).unwrap();
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(pk, grp, val, w) in rows {
         b.extend_pk(pk as u128);
         b.extend_weight(&w.to_le_bytes());
@@ -6229,7 +6229,7 @@ fn build_mm_delta(rows: &[(u64, i64, i64, i64)]) -> Batch {
     let s = mm_in_schema();
     let g_pi = s.try_payload_idx(1).unwrap();
     let v_pi = s.try_payload_idx(2).unwrap();
-    let mut b = Batch::with_capacity(s, rows.len().max(1));
+    let mut b = Batch::with_capacity(&s, rows.len().max(1));
     for &(pk, grp, val, w) in rows {
         b.extend_pk(pk as u128);
         b.extend_weight(&w.to_le_bytes());
@@ -6453,7 +6453,7 @@ fn avi_skip_new_all_null_group() {
         let s = mm_in_schema();
         let g_pi = s.try_payload_idx(1).unwrap();
         let v_pi = s.try_payload_idx(2).unwrap();
-        let mut b = Batch::with_capacity(s, 2);
+        let mut b = Batch::with_capacity(&s, 2);
         for pk in [1u64, 2] {
             b.extend_pk(pk as u128);
             b.extend_weight(&1i64.to_le_bytes());
@@ -6530,7 +6530,7 @@ fn avi_skip_mixed_int_min_float_max() {
         let g_pi = in_schema.try_payload_idx(1).unwrap();
         let i_pi = in_schema.try_payload_idx(2).unwrap();
         let f_pi = in_schema.try_payload_idx(3).unwrap();
-        let mut b = Batch::with_capacity(in_schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(&in_schema, rows.len().max(1));
         for &(pk, grp, ival, fval, w) in rows {
             b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
@@ -6594,7 +6594,7 @@ fn check_float_minmax_against_oracle(val_tc: TypeCode, epochs_rows: &[Vec<(u64, 
     let build = |rows: &[(u64, i64, f64, i64)]| -> Batch {
         let g_pi = in_schema.try_payload_idx(1).unwrap();
         let v_pi = in_schema.try_payload_idx(2).unwrap();
-        let mut b = Batch::with_capacity(in_schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(&in_schema, rows.len().max(1));
         for &(pk, grp, val, w) in rows {
             b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
@@ -6703,7 +6703,7 @@ fn check_pk_source_max(b_signed: bool) {
     ];
     let build = |rows: &[(u64, i64, i64)]| -> Batch {
         let pad_pi = in_schema.try_payload_idx(2).unwrap();
-        let mut bt = Batch::with_capacity(in_schema, rows.len().max(1));
+        let mut bt = Batch::with_capacity(&in_schema, rows.len().max(1));
         for &(a, b, w) in rows {
             bt.extend_pk_opk(&in_schema, &[a as u128, b as u128]);
             bt.extend_weight(&w.to_le_bytes());
@@ -6781,7 +6781,7 @@ fn avi_skip_global_aggregate() {
     ];
     let build = |rows: &[(u64, i64, i64)]| -> Batch {
         let v_pi = in_schema.try_payload_idx(1).unwrap();
-        let mut b = Batch::with_capacity(in_schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(&in_schema, rows.len().max(1));
         for &(pk, val, w) in rows {
             b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());

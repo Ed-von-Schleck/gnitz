@@ -365,8 +365,8 @@ fn orphaned_index_entry_yields_empty_not_exhaustion() {
     let entry = engine.registry().table_entry(tid).unwrap();
     let ic = &entry.index_circuits[0];
     let idx_schema = ic.index_schema;
-    let src_pk_stride = entry.schema.pk_stride() as usize;
-    let idx_pk_stride = idx_schema.pk_stride() as usize;
+    let src_pk_stride = entry.schema.pk_stride();
+    let idx_pk_stride = idx_schema.pk_stride();
     let idx_key_size = idx_schema.leading_key_size(1);
 
     let mut probe = ic.open_cursor();
@@ -385,7 +385,7 @@ fn orphaned_index_entry_yields_empty_not_exhaustion() {
     // id 9999 exists in no base row — the same val group, an absent source PK.
     orphan_key[idx_key_size..idx_key_size + src_pk_stride].copy_from_slice(&9999u64.to_be_bytes()[8 - src_pk_stride..]);
 
-    let mut ob = Batch::with_capacity(idx_schema, 1);
+    let mut ob = Batch::with_capacity(&idx_schema, 1);
     ob.push_key_row(&orphan_key, 1);
     ic.ingest_owned_batch(ob).unwrap();
 

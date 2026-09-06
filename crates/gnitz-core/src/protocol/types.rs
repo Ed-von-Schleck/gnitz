@@ -1,6 +1,6 @@
 use super::error::ProtocolError;
 
-pub use gnitz_wire::{FixedInt, ReduceOutKey, ScalarKind, TypeCode};
+pub use gnitz_wire::{FixedInt, PkBuf, ReduceOutKey, ScalarKind, TypeCode};
 pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS};
 
 /// Convert a u64 wire value to TypeCode, returning an error for unknown codes.
@@ -164,14 +164,17 @@ impl Schema {
         self.num_columns() - self.pk_cols.len()
     }
 
-    /// True iff column `ci` is a PK column.
+    /// True iff column `ci` is a PK column. Total: every PK index is in range,
+    /// so an out-of-range `ci` matches none of them.
     #[inline]
     pub fn is_pk_col(&self, ci: usize) -> bool {
-        self.pk_cols.contains(&(ci as u32))
+        // Widen the stored index rather than narrowing `ci`: `ci as u32` would
+        // truncate a large index onto a real PK column.
+        self.pk_cols.iter().any(|&p| p as usize == ci)
     }
 
-    /// Byte offset of PK column `col_idx` within the packed PK region.
-    /// Mirrors the engine `SchemaDescriptor::pk_byte_offset` helper.
+    /// Byte offset of PK column `col_idx` within the packed PK region — the
+    /// running sum [`Self::locate`]'s `Pk` arm reports as `byte_off`.
     #[inline]
     pub fn pk_byte_offset(&self, col_idx: usize) -> usize {
         debug_assert!(self.is_pk_col(col_idx));
@@ -365,28 +368,7 @@ impl gnitz_expr::SchemaFacts for Schema {
     }
 }
 
-/// One row's OPK image from the PK columns' native values in PK-list order,
-/// plus its packed width. The one native→OPK column walk on the client.
-fn opk_row(schema: &Schema, natives: impl IntoIterator<Item = u128>) -> ([u8; MAX_PK_BYTES], usize) {
-    let mut buf = [0u8; MAX_PK_BYTES];
-    let mut off = 0;
-    for ((w, tc), v) in schema.pk_col_codes().zip(natives) {
-        gnitz_wire::encode_pk_column(&v.to_le_bytes()[..w], tc, &mut buf[off..off + w]);
-        off += w;
-    }
-    debug_assert_eq!(off, schema.pk_stride(), "opk_row: one value per PK column");
-    (buf, off)
-}
-
-/// [`opk_row`] for a key already packed as its columns' native little-endian
-/// bytes. Valid bytes are `0..native_le.len()`.
-fn opk_row_from_bytes(schema: &Schema, native_le: &[u8]) -> [u8; MAX_PK_BYTES] {
-    let mut buf = [0u8; MAX_PK_BYTES];
-    gnitz_wire::encode_pk_tuple(schema.pk_col_codes(), native_le, &mut buf[..native_le.len()]);
-    buf
-}
-
-/// The inverse of [`opk_row_from_bytes`]: `opk`'s columns decoded back to their
+/// The inverse of [`opk_key_packed`]: `opk`'s columns decoded back to their
 /// native little-endian images, at the same offsets.
 fn native_row(schema: &Schema, opk: &[u8]) -> [u8; MAX_PK_BYTES] {
     let mut buf = [0u8; MAX_PK_BYTES];
@@ -397,6 +379,48 @@ fn native_row(schema: &Schema, opk: &[u8]) -> [u8; MAX_PK_BYTES] {
     }
     debug_assert_eq!(off, opk.len(), "native_row: schema stride != key width");
     buf
+}
+
+/// One row's PK as OPK bytes, from the PK columns' native values in PK-list
+/// order — the one native→OPK column walk on the client, and the same bytes a
+/// [`PkColumn`] row holds. Crossing into the wire's *native* key space is named:
+/// this and [`opk_key_packed`] in, [`native_le_key`] / [`native_packed_key`] out.
+pub fn opk_key_cols(schema: &Schema, natives: impl IntoIterator<Item = u128>) -> PkBuf {
+    let mut key = PkBuf::zeroed(0);
+    for ((w, tc), v) in schema.pk_col_codes().zip(natives) {
+        key.append(w, |dst| gnitz_wire::encode_pk_column(&v.to_le_bytes()[..w], tc, dst));
+    }
+    debug_assert_eq!(key.width(), schema.pk_stride(), "opk_key_cols: one value per PK column");
+    key
+}
+
+/// [`opk_key_cols`] for a key already packed as its columns' native
+/// little-endian bytes.
+pub fn opk_key_native_bytes(schema: &Schema, native_le: &[u8]) -> PkBuf {
+    let mut key = PkBuf::zeroed(0);
+    key.append(native_le.len(), |dst| {
+        gnitz_wire::encode_pk_tuple(schema.pk_col_codes(), native_le, dst)
+    });
+    key
+}
+
+/// [`opk_key_native_bytes`] from a u128 whose low `pk_stride` bytes carry the PK
+/// columns' native images — a parsed PK literal, a `ReadBound::PkSet` key.
+pub fn opk_key_packed(schema: &Schema, v: u128) -> PkBuf {
+    let stride = schema.pk_stride();
+    debug_assert!(stride <= 16);
+    opk_key_native_bytes(schema, &v.to_le_bytes()[..stride])
+}
+
+/// `key` in the wire's native key space; valid bytes are `0..key.len()`.
+pub fn native_le_key(schema: &Schema, key: &PkBuf) -> [u8; MAX_PK_BYTES] {
+    native_row(schema, key.pk_bytes())
+}
+
+/// [`native_le_key`] packed into one word — the form a `ReadBound::PkSet`
+/// ships. Defined for a key of at most `NARROW_PK_MAX_BYTES`.
+pub fn native_packed_key(schema: &Schema, key: &PkBuf) -> u128 {
+    gnitz_wire::control::split_ctrl_key(&native_le_key(schema, key)[..key.width()]).0
 }
 
 /// A batch's PK region: `stride` bytes per row of **order-preserving key** (OPK,
@@ -498,13 +522,12 @@ impl PkColumn {
     /// Append one row given as its `stride` native little-endian column bytes.
     pub fn push_bytes(&mut self, schema: &Schema, native_le: &[u8]) {
         debug_assert_eq!(native_le.len(), self.width());
-        self.push_region_bytes(&opk_row_from_bytes(schema, native_le)[..native_le.len()]);
+        self.push_region_bytes(opk_key_native_bytes(schema, native_le).pk_bytes());
     }
 
     /// Append one row from the PK columns' native values in PK-list order.
     pub fn push_natives(&mut self, schema: &Schema, natives: &[u128]) {
-        let (opk, n) = opk_row(schema, natives.iter().copied());
-        self.push_region_bytes(&opk[..n]);
+        self.push_region_bytes(opk_key_cols(schema, natives.iter().copied()).pk_bytes());
     }
 
     /// Append whole OPK rows verbatim — `opk` is a multiple of `stride` bytes
@@ -529,9 +552,11 @@ impl PkColumn {
         self.buf.truncate(len * self.width());
     }
 
-    /// Read row `i` into a `PkTuple` — a verbatim byte move, both being OPK.
-    pub fn get_tuple(&self, i: usize) -> PkTuple {
-        PkTuple::from_bytes(self.get_bytes(i))
+    /// Read row `i` into a [`PkBuf`] — a verbatim byte move, both being OPK. A
+    /// caller only *looking a key up* passes [`Self::get_bytes`] straight to the
+    /// map instead: `PkBuf` borrows as `[u8]`.
+    pub fn get_tuple(&self, i: usize) -> PkBuf {
+        PkBuf::from_bytes(self.get_bytes(i))
     }
 
     /// Append the row at `src[i]` to `self`. Strides must match.
@@ -541,109 +566,15 @@ impl PkColumn {
     }
 
     /// Append `pk`'s bytes — verbatim, both being OPK.
-    pub fn push_tuple(&mut self, pk: &PkTuple) {
-        debug_assert_eq!(pk.stride, self.stride);
-        self.buf.extend_from_slice(pk.as_bytes());
+    pub fn push_tuple(&mut self, pk: &PkBuf) {
+        debug_assert_eq!(pk.width(), self.width());
+        self.buf.extend_from_slice(pk.pk_bytes());
     }
 
     /// Every key decoded, for `assert_eq!(pks.to_vec_u128(schema), expected)`.
     #[cfg(test)]
     pub fn to_vec_u128(&self, schema: &Schema) -> Vec<u128> {
         (0..self.len()).map(|i| self.get(schema, i)).collect()
-    }
-}
-
-/// One row's PK as **order-preserving key** (OPK) bytes — the same bytes a
-/// [`PkColumn`] row holds, and the row-identity key the transaction buffer and
-/// the DML overlay key their maps on (§1: byte-equal ⟺ key-equal). Crossing
-/// into the wire's *native* key space takes a schema and is named: `from_*` in,
-/// `native_le` / `to_native_packed` out.
-#[derive(Clone, Copy)]
-pub struct PkTuple {
-    stride: u8,
-    buf: [u8; MAX_PK_BYTES],
-}
-
-impl PkTuple {
-    /// From a u128 whose low `pk_stride` bytes carry the PK columns' native
-    /// little-endian images — a parsed PK literal, a `ReadBound::PkSet` key.
-    pub fn from_native_packed(schema: &Schema, v: u128) -> Self {
-        let stride = schema.pk_stride();
-        debug_assert!(stride <= 16);
-        Self::from_native_bytes(schema, &v.to_le_bytes()[..stride])
-    }
-
-    /// From the PK columns' native values in PK-list order.
-    pub fn from_columns(schema: &Schema, natives: impl IntoIterator<Item = u128>) -> Self {
-        let (buf, stride) = opk_row(schema, natives);
-        Self { stride: stride as u8, buf }
-    }
-
-    /// [`Self::from_native_packed`] for a key already packed as bytes.
-    fn from_native_bytes(schema: &Schema, native_le: &[u8]) -> Self {
-        Self {
-            stride: native_le.len() as u8,
-            buf: opk_row_from_bytes(schema, native_le),
-        }
-    }
-
-    /// From raw OPK bytes, whose length becomes the stride.
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        // Hard, not debug-only: `bytes` is an externally-controlled length, and
-        // the cast below would silently truncate a length ≥ 256 into the stride.
-        assert!(
-            bytes.len() <= MAX_PK_BYTES,
-            "PkTuple::from_bytes: length {} exceeds MAX_PK_BYTES {MAX_PK_BYTES}",
-            bytes.len(),
-        );
-        let mut buf = [0u8; MAX_PK_BYTES];
-        buf[..bytes.len()].copy_from_slice(bytes);
-        Self { stride: bytes.len() as u8, buf }
-    }
-
-    /// Bytes per key.
-    #[inline]
-    pub fn stride(&self) -> u8 {
-        self.stride
-    }
-
-    /// The tuple's OPK bytes, `0..stride`.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.buf[..self.stride as usize]
-    }
-
-    /// The key in the wire's native key space; valid bytes are `0..stride`.
-    pub fn native_le(&self, schema: &Schema) -> [u8; MAX_PK_BYTES] {
-        native_row(schema, self.as_bytes())
-    }
-
-    /// [`Self::native_le`] packed into one word — the form a `ReadBound::PkSet`
-    /// ships. Defined for a key of at most `NARROW_PK_MAX_BYTES`.
-    pub fn to_native_packed(&self, schema: &Schema) -> u128 {
-        gnitz_wire::control::split_ctrl_key(&self.native_le(schema)[..self.stride as usize]).0
-    }
-}
-
-impl PartialEq for PkTuple {
-    fn eq(&self, other: &Self) -> bool {
-        self.stride == other.stride && self.as_bytes() == other.as_bytes()
-    }
-}
-impl Eq for PkTuple {}
-
-impl std::hash::Hash for PkTuple {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.stride.hash(state);
-        self.as_bytes().hash(state);
-    }
-}
-
-impl std::fmt::Debug for PkTuple {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PkTuple")
-            .field("stride", &self.stride)
-            .field("bytes", &self.as_bytes())
-            .finish()
     }
 }
 

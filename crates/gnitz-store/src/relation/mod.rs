@@ -486,7 +486,10 @@ impl RelationRegistry {
             }
             (e.schema, e.directory.clone())
         };
-        let index_schema = crate::schema::make_index_schema(cols, &owner_schema).map_err(StoreError::rejected)?;
+        let key_spec = crate::schema::IndexKeySpec::new(cols, &owner_schema).map_err(StoreError::rejected)?;
+        let index_schema = key_spec
+            .output_schema(&owner_schema)
+            .ok_or_else(|| StoreError::rejected("Index: composite key is not a valid primary key".to_string()))?;
         let idx_dir = ChildAddr::Index { id: index_id }.dir(&owner_dir);
         ensure_dir(&idx_dir)?;
         let handle = match self.owns_stores {
@@ -500,7 +503,6 @@ impl RelationRegistry {
                 index_schema,
             )?),
         };
-        let key_spec = crate::schema::IndexKeySpec::new(cols, &owner_schema).map_err(StoreError::rejected)?;
         self.tables
             .get_mut(&owner)
             .expect("resolved above")

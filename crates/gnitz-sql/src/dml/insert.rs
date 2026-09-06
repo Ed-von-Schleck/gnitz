@@ -22,7 +22,7 @@ use crate::ir::BoundExpr;
 use crate::validate::reject_unhonored_insert_clauses;
 use crate::SqlResult;
 use gnitz_core::{
-    push_zero_cell, FixedInt, GnitzClient, PkTuple, RelClass, Schema, WireConflictMode, ZSetBatch, ZSetBatchView,
+    push_zero_cell, FixedInt, GnitzClient, PkBuf, RelClass, Schema, WireConflictMode, ZSetBatch, ZSetBatchView,
 };
 use sqlparser::ast::{
     Assignment, ConflictTarget, Expr, Insert, ObjectName, OnConflict, OnConflictAction, OnInsert, Parens, Query,
@@ -424,12 +424,12 @@ fn client_side_filter_do_nothing(
     schema: &Arc<Schema>,
     batch: &ZSetBatch,
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    let keys: Vec<PkTuple> = (0..batch.pks.len()).map(|i| batch.pks.get_tuple(i)).collect();
+    let keys: Vec<PkBuf> = (0..batch.pks.len()).map(|i| batch.pks.get_tuple(i)).collect();
     // A PK the transaction buffered as live conflicts; one it buffered as deleted
     // does not; an untouched PK falls through to the committed store.
     let (_, existing) = effective_rows(client, tid, schema, &keys)?;
 
-    let mut seen_pks: std::collections::HashSet<PkTuple> = std::collections::HashSet::with_capacity(keys.len());
+    let mut seen_pks: std::collections::HashSet<PkBuf> = std::collections::HashSet::with_capacity(keys.len());
     let mut surviving_indices: Vec<usize> = Vec::with_capacity(batch.pks.len());
     for (i, pk) in keys.iter().enumerate() {
         // Intra-batch duplicate: drop everything after the first.
@@ -467,14 +467,14 @@ fn client_side_merge_do_update(
     batch: &ZSetBatch,
     assignments: &[(usize, BoundUpdateExpr)],
 ) -> Result<ZSetBatch, GnitzSqlError> {
-    let keys: Vec<PkTuple> = (0..batch.pks.len()).map(|i| batch.pks.get_tuple(i)).collect();
+    let keys: Vec<PkBuf> = (0..batch.pks.len()).map(|i| batch.pks.get_tuple(i)).collect();
     // The effective existing rows — a row the transaction buffered is both the
     // merge's carry source AND the `Existing` scope's evaluation base, so
     // `SET x = x + 1` reads the buffered `x`; a buffered delete is no conflict,
     // and an untouched PK falls through to the committed store.
     let (rows, existing) = effective_rows(client, tid, schema, &keys)?;
 
-    let mut seen_pks: std::collections::HashSet<PkTuple> = std::collections::HashSet::with_capacity(keys.len());
+    let mut seen_pks: std::collections::HashSet<PkBuf> = std::collections::HashSet::with_capacity(keys.len());
     let mut out = ZSetBatch::with_capacity(schema, batch.pks.len());
     let gather = RowGather::new(schema);
 

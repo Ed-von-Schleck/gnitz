@@ -174,8 +174,8 @@ impl ReadCursor {
     /// boundary check; the bound only narrows, and `rewind` keeps it.
     pub fn seek_range_bytes(&mut self, start: &[u8], end: Option<&[u8]>) -> usize {
         self.sweep_open = false;
-        debug_assert_eq!(start.len(), self.schema.pk_stride() as usize);
-        debug_assert!(end.is_none_or(|e| e.len() == self.schema.pk_stride() as usize));
+        debug_assert_eq!(start.len(), self.schema.pk_stride());
+        debug_assert!(end.is_none_or(|e| e.len() == self.schema.pk_stride()));
         let mut raw = 0usize;
         for (src, state) in self.sources.iter().zip(self.states.iter_mut()) {
             state.position = src.find_lower_bound_bytes(start);
@@ -385,7 +385,7 @@ impl ReadCursor {
         debug_assert!(self.valid, "current_key_narrow on an invalid cursor");
         let bytes = self.current_pk_bytes();
         assert!(bytes.len() <= 16, "narrow PK cursor");
-        gnitz_wire::widen_pk_be(bytes, bytes.len())
+        gnitz_wire::widen_pk_be(bytes)
     }
 
     /// Whether the current row's PK equals the group's OPK `key_bytes`.
@@ -546,7 +546,7 @@ impl ReadCursor {
     /// for the suffix columns. The post-seek walk steps rather than re-seeks — a
     /// re-seek would re-find the row already consumed and spin forever.
     pub fn seek_first_positive_with_prefix(&mut self, prefix: &[u8]) -> bool {
-        let stride = self.schema.pk_stride() as usize;
+        let stride = self.schema.pk_stride();
         self.advance_to(PkBuf::from_bytes(prefix).padded(stride));
         while self.valid {
             if !self.current_pk_bytes().starts_with(prefix) {

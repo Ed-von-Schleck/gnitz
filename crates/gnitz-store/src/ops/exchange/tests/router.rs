@@ -73,7 +73,7 @@ fn test_scatter_key_packed_matches_legacy_routing() {
             ],
             &[0],
         );
-        let mut b = Batch::with_capacity(schema, 2);
+        let mut b = Batch::with_capacity(&schema, 2);
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -101,7 +101,7 @@ fn test_scatter_key_packed_matches_legacy_routing() {
             ],
             &[0],
         );
-        let mut b = Batch::with_capacity(schema, 2);
+        let mut b = Batch::with_capacity(&schema, 2);
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -134,7 +134,7 @@ fn test_scatter_key_packed_matches_legacy_routing() {
             ],
             &[0],
         );
-        let mut b = Batch::with_capacity(schema, 1);
+        let mut b = Batch::with_capacity(&schema, 1);
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -157,7 +157,7 @@ fn test_scatter_key_packed_matches_legacy_routing() {
             ],
             &[0, 1],
         );
-        let mut b = Batch::with_capacity(schema, 1);
+        let mut b = Batch::with_capacity(&schema, 1);
         let mut pk = [0u8; 8];
         gnitz_wire::encode_pk_column(&7u32.to_le_bytes(), type_code::U32, &mut pk[0..4]);
         gnitz_wire::encode_pk_column(&(-9i32).to_le_bytes(), type_code::I32, &mut pk[4..8]);

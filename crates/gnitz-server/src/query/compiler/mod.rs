@@ -28,8 +28,10 @@ pub(super) use hydration::{Hydration, HydrationSeed};
 
 // Everything here is `pub(super)`: `dag` is the only module that names the
 // compiler, so a `pub(crate)` would publish it to the catalog and runtime rungs
-// too. `RelayRoute` is the exception — the master relay in `gnitz-server`
-// matches on it, so it is re-exported through `query`.
+// too. The two exceptions are what the master relay needs: `RelayRoute`, which
+// it matches on, and `oob_cols`, the one bound it applies to that route's
+// client-supplied columns.
+pub(crate) use emit::oob_cols;
 pub(super) use load::for_each_scan_edge;
 use load::scan_tid_through_filters;
 pub(crate) use routing::RelayRoute;

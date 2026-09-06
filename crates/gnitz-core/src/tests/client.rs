@@ -61,7 +61,7 @@ fn pushes_coalesce_per_tid_into_maximal_same_mode_runs() {
 
     let mut op = |tid, pk: u64| {
         buf.reads(tid)
-            .last_op(&PkTuple::from_native_packed(&kv_schema(), pk as u128))
+            .last_op(&crate::opk_key_packed(&kv_schema(), pk as u128))
             .map(|(b, row)| (b.weights[row], row))
     };
     assert_eq!(op(16, 1), Some((1, 0)), "the last of three ops on pk=1");

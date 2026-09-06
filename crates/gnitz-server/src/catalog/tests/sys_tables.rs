@@ -15,7 +15,7 @@ fn the_circuit_table_has_a_compound_view_id_node_id_pk() {
 /// engine's half of the key layout is spelled twice on purpose.
 #[test]
 fn a_circuit_rows_at_rest_pk_leads_with_the_view_id() {
-    let mut bb = BatchBuilder::new(SysFamily::CircuitNodes.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
     gnitz_wire::sys_rows::write_circuit_node_row(
         &mut bb,
         &gnitz_wire::sys_rows::CircuitNodeRow {
@@ -38,7 +38,7 @@ fn a_circuit_rows_at_rest_pk_leads_with_the_view_id() {
 #[test]
 fn family_pks_by_sign_separates_a_drop_from_a_rename() {
     // A plain `-1` TABLE_TAB row is a DROP.
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
     push_table_tab_row(&mut bb, 42, PUBLIC_SCHEMA_ID, "t", 0, 0, -1);
     let dropped = bb.finish();
     assert_eq!(family_pks_by_sign(&dropped, false), vec![42]);
@@ -46,7 +46,7 @@ fn family_pks_by_sign_separates_a_drop_from_a_rename() {
 
     // A rename is a `(-1, +1)` rewrite pair on one PK: neither a create nor a
     // drop, so DDL paths keyed off these lists leave a renamed table alone.
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
     push_table_tab_row(&mut bb, 42, PUBLIC_SCHEMA_ID, "t", 0, 0, -1);
     push_table_tab_row(&mut bb, 42, PUBLIC_SCHEMA_ID, "t2", 0, 0, 1);
     let renamed = bb.finish();

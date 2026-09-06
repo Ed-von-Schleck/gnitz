@@ -440,8 +440,8 @@ fn preflight_composite_projection_distinguishes_trailing_column() {
     let schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0), // pk
-            SchemaColumn::new(type_code::U64, 1), // a
-            SchemaColumn::new(type_code::U64, 2), // b
+            SchemaColumn::new(type_code::U64, 0), // a
+            SchemaColumn::new(type_code::U64, 0), // b
         ],
         &[0],
     );

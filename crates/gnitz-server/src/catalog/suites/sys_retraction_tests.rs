@@ -15,7 +15,7 @@ use std::path::Path;
 
 /// A one-row SCHEMA_TAB batch (the family's only payload column is the name).
 fn schema_tab_batch(sid: i64, weight: i64, name: &str) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
     bb.begin_row(sid as u128, weight);
     bb.put_string(name);
     bb.end_row();
@@ -35,7 +35,7 @@ struct IdxRow {
 
 fn live_index_row(engine: &CatalogEngine, idx_id: i64) -> IdxRow {
     let schema = SysFamily::Index.schema();
-    let key = sys_opk(&schema, idx_id as u128);
+    let key = sys_opk(schema, idx_id as u128);
     let store = engine.sys_store(SysFamily::Index);
     let sr = store
         .live_row_at(key.pk_bytes())

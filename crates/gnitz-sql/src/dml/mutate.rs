@@ -328,7 +328,7 @@ fn resolve_where_matches(
 ) -> Result<ZSetBatch, GnitzSqlError> {
     let committed = fetch_bound(client, tid, &plan.access, sink, reply_schema)?;
     // In autocommit there is no buffer to overlay, and `buffered_scope`'s gather
-    // can be megabytes of `PkTuple` for a large `pk IN (…)` — so ask only when a
+    // can be megabytes of `PkBuf` for a large `pk IN (…)` — so ask only when a
     // transaction is open, which is the condition its doc already states.
     if !client.txn_active() {
         return Ok(committed);
@@ -347,7 +347,7 @@ fn resolve_where_matches(
     for i in 0..committed.len() {
         // A PK the transaction has written is decided by its buffered version
         // below, whatever the committed row said.
-        if !net.contains_key(&committed.pks.get_tuple(i)) {
+        if !net.contains_key(committed.pks.get_bytes(i)) {
             gather.copy(&committed, i, &mut eff);
         }
     }

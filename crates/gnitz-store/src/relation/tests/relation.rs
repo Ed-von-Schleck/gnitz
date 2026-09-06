@@ -13,7 +13,7 @@ fn relation_test_dir(name: &str) -> String {
 }
 
 fn make_test_table(name: &str) -> Box<Table> {
-    let schema = SchemaDescriptor::minimal_u64();
+    let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
     let dir = relation_test_dir(name);
     Box::new(Table::new(&dir, schema, 99, RecoverySource::Rederive { resume_at: None }).unwrap())
 }
@@ -42,7 +42,7 @@ fn register_entry(
 #[test]
 fn test_register_unregister_table() {
     let mut registry = solo_registry();
-    let schema = SchemaDescriptor::minimal_u64();
+    let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
     let tbl = make_test_table("reg_unreg");
     register_entry(&mut registry, 100, tbl, schema, RelationKind::BaseTable, String::new());
     assert!(registry.has_id(100));
@@ -124,7 +124,7 @@ fn ephemeral_flush_includes_index_circuits() {
     // Put one row in the index table's memtable.
     {
         let ic = registry.index_circuit_for_cols(70, &[1]).unwrap();
-        let mut batch = Batch::with_capacity(ic.index_schema, 1);
+        let mut batch = Batch::with_capacity(&ic.index_schema, 1);
         batch.extend_pk(1u128);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());
@@ -155,7 +155,7 @@ fn ephemeral_flush_includes_index_circuits() {
 #[test]
 fn a_fed_view_retains_each_round_at_its_own_weight() {
     let mut registry = solo_registry();
-    let schema = SchemaDescriptor::minimal_u64();
+    let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
     let vid = gnitz_wire::FIRST_USER_TABLE_ID as i64;
     registry
         .register(RelationSpec {
@@ -171,7 +171,7 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
         .unwrap();
 
     let row = |w: i64| {
-        let mut b = Batch::with_capacity(schema, 1);
+        let mut b = Batch::with_capacity(&schema, 1);
         b.extend_pk(7u128);
         b.extend_weight(&w.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
@@ -193,7 +193,7 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
     assert_eq!(live, 0, "the output store's fold annihilates the pair");
 
     let feed = entry.delta_feed().expect("a fed view holds a delta store");
-    let stride = feed.schema.pk_stride() as usize;
+    let stride = feed.schema.pk_stride();
     let mut rounds: Vec<(u64, i64)> = Vec::new();
     let mut cur = feed.open_cursor_in_range(&vec![0u8; stride], None);
     while cur.valid {
@@ -235,13 +235,13 @@ fn ingest_apply_error_returned_internal() {
         return;
     }
     let mut registry = solo_registry();
-    let schema = SchemaDescriptor::minimal_u64();
+    let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
     let dir = relation_test_dir("seam_abort");
     let tbl = Box::new(Table::new(&dir, schema, 99, RecoverySource::Rederive { resume_at: None }).unwrap());
     // A user id: the public ingest entry rejects the system band outright.
     let tid = gnitz_wire::FIRST_USER_TABLE_ID as i64;
     register_entry(&mut registry, tid, tbl, schema, RelationKind::View, String::new());
-    let mut batch = Batch::with_capacity(schema, 1);
+    let mut batch = Batch::with_capacity(&schema, 1);
     batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());

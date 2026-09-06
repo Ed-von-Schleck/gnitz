@@ -230,7 +230,7 @@ pub fn pk_only_schema(types: &[u8]) -> SchemaDescriptor {
 /// column, in the order given. What the PK-sort and routing tests need, which
 /// read only `pk_stride` and `get_pk_bytes`. Each key must be `pk_stride` bytes.
 pub fn batch_of_pk_bytes(schema: &SchemaDescriptor, pks: &[impl AsRef<[u8]>]) -> Batch {
-    let mut b = Batch::with_capacity(*schema, pks.len().max(1));
+    let mut b = Batch::with_capacity(schema, pks.len().max(1));
     for pk in pks {
         b.push_zero_filled_row(pk.as_ref(), 1, 0);
     }
@@ -245,7 +245,7 @@ pub fn batch_of_pk_bytes(schema: &SchemaDescriptor, pks: &[impl AsRef<[u8]>]) ->
 /// Read back out of a one-row batch rather than encoded here, so the oracle is
 /// [`Batch::extend_pk_opk`] itself and not a second spelling of it.
 pub fn opk_pk(schema: &SchemaDescriptor, vals: &[u128]) -> Vec<u8> {
-    let mut b = Batch::with_capacity(*schema, 1);
+    let mut b = Batch::with_capacity(schema, 1);
     b.extend_pk_opk(schema, vals);
     b.get_pk_bytes(0).to_vec()
 }

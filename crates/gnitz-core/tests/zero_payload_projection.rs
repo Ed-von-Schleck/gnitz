@@ -165,7 +165,7 @@ fn a_permuted_compound_pk_round_trips_verbatim() {
         .expect("three rows match");
 
     let mut got: Vec<Vec<u8>> = (0..reply.pks.len())
-        .map(|i| reply.pks.get_tuple(i).as_bytes().to_vec())
+        .map(|i| reply.pks.get_tuple(i).pk_bytes().to_vec())
         .collect();
     // The OPK image, spelled by hand: a signed I64 is big-endian with the sign
     // bit flipped, an unsigned U32 is plain big-endian.

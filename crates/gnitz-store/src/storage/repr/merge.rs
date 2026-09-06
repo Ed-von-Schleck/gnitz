@@ -539,7 +539,7 @@ pub(crate) struct DirectWriter<'a> {
 
 impl<'a> DirectWriter<'a> {
     /// Open over a contiguous arena of `rows` rows, carving it at the offsets
-    /// [`super::batch::compute_offsets`] gives for `schema` — so the arena's
+    /// [`super::batch::compute_offsets_into`] gives for `schema` — so the arena's
     /// eventual reader addresses each region where this wrote it.
     pub(crate) fn over_arena(
         data: &'a mut [u8],
@@ -547,11 +547,12 @@ impl<'a> DirectWriter<'a> {
         rows: usize,
         blob: &'a mut Vec<u8>,
     ) -> Self {
-        use super::batch::{compute_offsets, strides_from_schema, REG_PAYLOAD_START};
+        use super::batch::{compute_offsets_into, strides_from_schema, MAX_BATCH_REGIONS, REG_PAYLOAD_START};
 
         let (strides, nr) = strides_from_schema(schema);
         let nr = nr as usize;
-        let (offsets, _total) = compute_offsets(&strides, nr, rows);
+        let mut offsets = [0usize; MAX_BATCH_REGIONS];
+        compute_offsets_into(&strides, nr, rows, &mut offsets);
 
         // Walk regions in order, splitting off [alignment pad | region] for each;
         // `base` is the absolute offset of `rest[0]`, so `offsets[r] - base` is
@@ -576,7 +577,7 @@ impl<'a> DirectWriter<'a> {
 
         DirectWriter {
             pk,
-            pk_stride: schema.pk_stride(),
+            pk_stride: schema.pk_stride() as u8,
             weight,
             null_bmp,
             col_bufs,
@@ -599,7 +600,7 @@ impl<'a> DirectWriter<'a> {
         schema: &'a SchemaDescriptor,
         blob_cache_capacity: usize,
     ) -> Self {
-        let pk_stride = schema.pk_stride();
+        let pk_stride = schema.pk_stride() as u8;
         DirectWriter {
             pk,
             pk_stride,
@@ -879,7 +880,7 @@ impl Batch {
         self.append_session(n_b).push_range(&other.as_mem_batch(), 0, n_b);
         // Physically identical to both inputs' (`union_nullability_merge` returns
         // nothing else), so `self`'s region strides still describe it.
-        self.set_schema(*schema);
+        self.set_schema(schema);
         self
     }
 }
@@ -892,7 +893,7 @@ where
     let (n_a, n_b) = (a.count, b.count);
     let (mb_a, mb_b) = (a.as_mem_batch(), b.as_mem_batch());
 
-    let mut out = Batch::with_capacity(*schema, n_a + n_b);
+    let mut out = Batch::with_capacity(schema, n_a + n_b);
     {
         // One session for the whole merge: expected run length is 2 for a set
         // operation's uniform 128-bit PKs, so per-run setup would dominate.

@@ -94,7 +94,7 @@ impl Cut {
 /// | then 16      | end cut value, LE `u128`                                 |
 ///
 /// Maximum encoded size: 82 bytes at the 4-column index-arity cap — past the
-/// 64-byte `PkTuple` extra cap, which is why the descriptor rides an explicit
+/// 64-byte `PkBuf` extra cap, which is why the descriptor rides an explicit
 /// control-block blob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RangeDescriptor {

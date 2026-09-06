@@ -43,7 +43,7 @@ fn only_an_ascii_uppercase_byte_makes_a_name_non_canonical() {
 
 /// A SCHEMA_TAB batch of `(schema_id, name, weight)` rows.
 fn schema_batch(rows: &[(i64, &str, i64)]) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::Schema.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Schema.schema());
     for &(schema_id, name, weight) in rows {
         write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id: schema_id as u64, name }, weight);
     }
@@ -52,7 +52,7 @@ fn schema_batch(rows: &[(i64, &str, i64)]) -> Batch {
 
 /// An IDX_TAB batch of `(index_id, weight)` rows over one owner and column.
 fn idx_batch(rows: &[(i64, i64)]) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::Index.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Index.schema());
     for &(index_id, weight) in rows {
         write_idx_tab_row(
             &mut bb,
@@ -71,7 +71,7 @@ fn idx_batch(rows: &[(i64, i64)]) -> Batch {
 
 /// A CIRCUIT_NODES batch of `(view_id, node_id, weight)` rows.
 fn circuit_batch(rows: &[(i64, u64, i64)]) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::CircuitNodes.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::CircuitNodes.schema());
     for &(view_id, node_id, weight) in rows {
         write_circuit_node_row(
             &mut bb,
@@ -91,7 +91,7 @@ fn circuit_batch(rows: &[(i64, u64, i64)]) -> Batch {
 
 /// A one-row SEQ_TAB batch.
 fn seq_batch(seq_id: i64, value: u64, weight: i64) -> Batch {
-    let mut bb = BatchBuilder::new(SysFamily::Sequence.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Sequence.schema());
     bb.begin_row(seq_id as u128, weight);
     bb.put_u64(value);
     bb.end_row();
@@ -159,7 +159,7 @@ fn a_repeated_sign_on_one_pk_is_rejected_for_a_pair_capable_family() {
     let cols = vec![col_def("id", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
     table_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "a", 1);
     table_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "b", 1);
     let err = contract_err(&engine, SysFamily::Table, &bb.finish());
@@ -226,7 +226,7 @@ fn an_id_below_a_familys_first_user_id_is_rejected_whatever_its_sign() {
         assert!(err.contains("a system schema"), "w={w}: {err}");
     }
 
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
     table_row(&mut bb, IDX_TAB_ID, SYSTEM_SCHEMA_ID, "_indices", 1);
     let err = contract_err(&engine, SysFamily::Table, &bb.finish());
     assert!(err.contains("a system table"), "{err}");
@@ -241,7 +241,7 @@ fn an_id_below_a_familys_first_user_id_is_rejected_whatever_its_sign() {
 
     // COL_TAB packs the owner into its PK, so its floor is the packed word —
     // and the message renders both halves rather than that word.
-    let mut bb = BatchBuilder::new(SysFamily::Column.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
     push_col_tab_row(
         &mut bb,
         IDX_TAB_ID,
@@ -267,7 +267,7 @@ fn an_id_at_or_above_a_familys_ceiling_is_rejected() {
     let ceiling = sys_tables::RELATION_ID_CEILING;
 
     for id in [ceiling, ceiling + 4096] {
-        let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+        let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
         table_row(&mut bb, id, PUBLIC_SCHEMA_ID, "t", 1);
         let err = contract_err(&engine, SysFamily::Table, &bb.finish());
         assert!(err.contains("id ceiling"), "table {id}: {err}");
@@ -326,13 +326,13 @@ fn a_rewrite_pair_may_change_only_the_fields_its_family_declares() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     // A rename is the whole of TABLE_TAB's mask, so it passes.
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
     table_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "t", -1);
     table_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "t2", 1);
     engine.check_family_contract(SysFamily::Table, &bb.finish()).unwrap();
 
     // Re-homing the relation into another schema is not.
-    let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+    let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
     table_row(&mut bb, tid, PUBLIC_SCHEMA_ID, "t", -1);
     table_row(&mut bb, tid, SYSTEM_SCHEMA_ID, "t", 1);
     let err = contract_err(&engine, SysFamily::Table, &bb.finish());

@@ -11,5 +11,5 @@ mod compiler;
 mod dag;
 mod vm;
 
-pub(crate) use compiler::RelayRoute;
+pub(crate) use compiler::{oob_cols, RelayRoute};
 pub(crate) use dag::{DagEngine, ExchangeCallback};

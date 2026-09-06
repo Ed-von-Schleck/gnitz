@@ -89,9 +89,9 @@ pub fn batch_project_index(
     spec: &crate::schema::IndexKeySpec,
     idx_schema: &crate::schema::SchemaDescriptor,
 ) -> Batch {
-    let idx_stride = idx_schema.pk_stride() as usize;
+    let idx_stride = idx_schema.pk_stride();
 
-    let mut out = Batch::with_capacity(*idx_schema, src.count.max(1));
+    let mut out = Batch::with_capacity(idx_schema, src.count.max(1));
     // MAX_PK_BYTES bounds every index schema's pk_stride (asserted in
     // SchemaDescriptor::new), so the scratch PK buffer lives on the stack with no
     // per-batch heap allocation. The used [..idx_stride] prefix is fully

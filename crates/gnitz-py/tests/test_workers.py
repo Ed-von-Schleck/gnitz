@@ -1123,7 +1123,7 @@ def test_range_scan_max_arity_descriptor(client):
     """A composite index at PK_LIST_MAX_COLS = 4 with a two-sided range on the
     last column (`a = .. AND b = .. AND c = .. AND d > .. AND d < ..`, n_eq = 3)
     produces an 82-byte descriptor — over the 64-byte seek_pk_extra / 80-byte
-    PkTuple cap — exercising the explicit-blob send path end-to-end across
+    PkBuf cap — exercising the explicit-blob send path end-to-end across
     workers."""
     sn = "w" + _uid()
     client.create_schema(sn)

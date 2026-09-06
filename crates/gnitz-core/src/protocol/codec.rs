@@ -15,9 +15,8 @@ use gnitz_wire::{col_meta_hidden, col_meta_nullable, col_meta_serial, pack_col_m
 /// the always-schema-bearing `FLAG_PUSH_TXN` per-family block, and the ScanSpec
 /// request's reply schema.
 ///
-/// `pub` for the engine's cross-side wire tests (which take gnitz-core as a
-/// dev-dependency) — the only coverage that the two crates' adapters produce
-/// and accept the same bytes. No production caller outside this crate.
+/// `pub` for `gnitz-mirror`, which encodes a registered view's schema through
+/// it, and for the engine's cross-side wire tests.
 pub fn encode_schema_block(schema: &Schema, tid: u32) -> Vec<u8> {
     let cols: Vec<SchemaBlockCol> = schema
         .columns

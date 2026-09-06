@@ -755,19 +755,19 @@ fn test_appender_then_validate() {
     assert!(batch.validate(&schema).is_ok());
 }
 
-// --- Site C: PkTuple::from_bytes ---
+// --- Site C: PkBuf::from_bytes ---
 
 #[test]
 fn pk_tuple_from_bytes_max_accepts() {
     let bytes = vec![0xabu8; MAX_PK_BYTES];
-    let t = PkTuple::from_bytes(&bytes);
-    assert_eq!(t.stride as usize, MAX_PK_BYTES);
+    let t = PkBuf::from_bytes(&bytes);
+    assert_eq!(t.width(), MAX_PK_BYTES);
 }
 
 #[test]
-#[should_panic(expected = "PkTuple::from_bytes: length")]
+#[should_panic(expected = "PkBuf::from_bytes: length")]
 fn pk_tuple_from_bytes_over_panics() {
-    PkTuple::from_bytes(&[0u8; MAX_PK_BYTES + 1]);
+    PkBuf::from_bytes(&[0u8; MAX_PK_BYTES + 1]);
 }
 
 // --- `null()` sets the null bitmap bit ---

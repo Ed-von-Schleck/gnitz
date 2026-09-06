@@ -53,7 +53,7 @@ fn src_schema() -> SchemaDescriptor {
 }
 
 fn build_input(schema: &SchemaDescriptor) -> Batch {
-    let mut b = Batch::with_capacity(*schema, N_ROWS);
+    let mut b = Batch::with_capacity(schema, N_ROWS);
     for row in 0..N_ROWS as u64 {
         b.extend_pk(row as u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -148,7 +148,7 @@ fn secondary_index_avi_decomposition_bench() {
 /// unsorted (real sort work) with occasional folds.
 fn bench_single_pk_sort(label: &str, pk_schema: SchemaDescriptor, pk_bytes_for: impl Fn(usize) -> [u8; 8]) {
     let build = || {
-        let mut out = Batch::with_capacity(pk_schema, N_ROWS);
+        let mut out = Batch::with_capacity(&pk_schema, N_ROWS);
         for row in 0..N_ROWS {
             out.begin_row(&pk_bytes_for(row), 1);
             out.extend_col(0, &((row as i64).wrapping_mul(2654435761)).to_le_bytes());
@@ -227,7 +227,7 @@ fn index_write_span_bench() {
     // What the identity arm buys, priced directly: the same unpromoted U64 PK
     // column through `promote_opk_column`'s general decode∘encode path. Without
     // this row the four numbers above have nothing to be compared against.
-    let stride = src.pk_stride() as usize;
+    let stride = src.pk_stride();
     for (label, identity) in [("identity (copy)   ", true), ("decode∘encode     ", false)] {
         let elapsed = bench_time(ITERS, || {
             let mut key = [0u8; MAX_PK_BYTES];

@@ -12,7 +12,7 @@
 
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr, UnaryOp};
-use gnitz_core::{FixedInt, PkTuple, Schema, TypeCode};
+use gnitz_core::{opk_key_cols, FixedInt, PkBuf, Schema, TypeCode};
 use sqlparser::ast::{Expr, UnaryOperator, Value};
 
 pub(crate) fn parse_uuid_str(s: &str) -> Result<u128, GnitzSqlError> {
@@ -229,18 +229,18 @@ fn parse_one_pk_literal(pk_expr: &Expr, tc: TypeCode, col_name: &str) -> Result<
     }
 }
 
-/// Extract the primary key from a VALUES row as a `PkTuple`, walking the PK
+/// Extract the primary key from a VALUES row as a `PkBuf`, walking the PK
 /// columns in pk-list order, dispatching each through `parse_one_pk_literal`,
 /// and copying the column's native LE bytes into the tuple buffer. Test-only
 /// convenience over [`extract_pk_value_mapped`] for rows with the identity
 /// slot map; the INSERT path builds a hidden/SERIAL-aware map.
 #[cfg(test)]
-pub(crate) fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<PkTuple, GnitzSqlError> {
+pub(crate) fn extract_pk_value(row: &[Expr], schema: &Schema) -> Result<PkBuf, GnitzSqlError> {
     let slot_of: Vec<Option<usize>> = (0..row.len()).map(Some).collect();
     extract_pk_value_mapped(row, &slot_of, schema)
 }
 
-/// Extract the primary key from a VALUES row as a `PkTuple`. `slot_of` maps each
+/// Extract the primary key from a VALUES row as a `PkBuf`. `slot_of` maps each
 /// **physical** column index to its VALUES slot, with `None` for columns that
 /// carry no user value (SERIAL, or a hidden/dropped column). A PK column is
 /// never SERIAL-in-payload nor hidden, so every `pk_cols` entry maps to
@@ -249,9 +249,9 @@ pub(crate) fn extract_pk_value_mapped(
     row: &[Expr],
     slot_of: &[Option<usize>],
     schema: &Schema,
-) -> Result<PkTuple, GnitzSqlError> {
+) -> Result<PkBuf, GnitzSqlError> {
     // `PK_LIST_MAX_COLS < MAX_PK_COLUMNS`, so every validated PK fits without a
-    // per-row allocation; `PkTuple::from_columns` owns the byte layout.
+    // per-row allocation; `opk_key_cols` owns the byte layout.
     let mut natives = [0u128; gnitz_wire::MAX_PK_COLUMNS];
     for (slot, &pi) in natives.iter_mut().zip(&schema.pk_cols) {
         let pi = pi as usize;
@@ -268,7 +268,7 @@ pub(crate) fn extract_pk_value_mapped(
             })?;
         *slot = parse_one_pk_literal(pk_expr, schema.columns[pi].type_code, &schema.columns[pi].name)?;
     }
-    Ok(PkTuple::from_columns(schema, natives))
+    Ok(opk_key_cols(schema, natives))
 }
 
 pub(crate) fn is_null_expr(expr: &Expr) -> bool {

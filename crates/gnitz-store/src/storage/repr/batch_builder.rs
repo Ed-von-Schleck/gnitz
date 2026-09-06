@@ -42,7 +42,7 @@ impl BatchBuilder {
         BatchBuilder {
             // Uninitialized, like every batch arena: every row writes every
             // column (`put_null` zero-fills rather than skipping).
-            batch: Batch::with_capacity(schema, 8),
+            batch: Batch::with_capacity(&schema, 8),
             curr_null_word: 0,
             curr_col: 0,
         }

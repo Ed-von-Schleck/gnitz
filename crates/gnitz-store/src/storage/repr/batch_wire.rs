@@ -12,7 +12,7 @@ use std::ffi::CStr;
 
 use super::super::error::StorageError;
 use super::batch::{
-    compute_offsets, copy_regions, strides_from_schema, Batch, MAX_BATCH_REGIONS, MAX_WIRE_REGIONS, REG_PK,
+    compute_offsets_into, copy_regions, strides_from_schema, Batch, MAX_BATCH_REGIONS, MAX_WIRE_REGIONS, REG_PK,
 };
 use super::batch_pool::{acquire_arena, Fill};
 use super::merge::{BlobCacheGuard, DirectWriter, MemBatch};
@@ -123,7 +123,7 @@ impl Batch {
     /// `inherit_layout` restores the claim `append_ranges_inner`'s `downgrade()`
     /// drops and the frame encoder ships.
     fn wire_chunk(&self, start: usize, count: usize) -> Batch {
-        let mut out = Batch::with_capacity(self.schema, count);
+        let mut out = Batch::with_capacity(&self.schema, count);
         out.append_batch(self, start, start + count);
         out.inherit_layout(self);
         out
@@ -242,7 +242,7 @@ impl Batch {
     ///
     /// Only valid for a schema with no German-string column, so the row scatter
     /// writes no heap bytes. Padded strides are fine: the destination is sized
-    /// by `wire_block_size` and carved by `compute_offsets`, and both walk the
+    /// by `wire_block_size` and carved by `compute_offsets_into`, and both walk the
     /// same `align8` region layout.
     pub fn encode_scattered_to_wire(
         &self,
@@ -312,7 +312,8 @@ impl Batch {
 
         let (strides, nr) = strides_from_schema(schema);
         let nr_usize = nr as usize;
-        let (offsets, total) = compute_offsets(&strides, nr_usize, mb.count);
+        let mut offsets = [0usize; MAX_BATCH_REGIONS];
+        let total = compute_offsets_into(&strides, nr_usize, mb.count, &mut offsets);
         // Uninit arena sized for exactly `mb.count` rows: every live byte of
         // every region is written by the bulk copies below; only inter-region
         // align8 padding stays uninit, which no reader or re-encoder touches
@@ -321,7 +322,7 @@ impl Batch {
         let mut data_buf = acquire_arena(total, Fill::Uninit);
         // SAFETY: both extents are in bounds — each source region was validated to
         // exactly `count * stride` bytes by the parse above, the destination sized
-        // by `compute_offsets` for `mb.count` rows; distinct allocations.
+        // by `compute_offsets_into` for `mb.count` rows; distinct allocations.
         unsafe {
             copy_regions(
                 mb.data,
@@ -336,7 +337,7 @@ impl Batch {
         let mut blob = acquire_arena(mb.blob.len(), Fill::Reserve);
         blob.extend_from_slice(mb.blob);
 
-        // SAFETY: `data_buf`/`offsets` were laid out by compute_offsets for
+        // SAFETY: `data_buf`/`offsets` were laid out by compute_offsets_into for
         // `mb.count` rows of these strides and every region was filled above.
         let batch = unsafe { Batch::from_prebuilt(data_buf, blob, strides, offsets, mb.count, *schema) };
         Ok((batch, bytes_consumed))

@@ -381,7 +381,7 @@ pub fn decode_wire_ipc(data: &[u8]) -> Result<DecodedWire, &'static str> {
     let mut decoded = decode_frame(data, control, None, false, |block, schema| {
         let mut offsets = [0usize; MAX_BATCH_REGIONS];
         let mb = gnitz_store::storage::decode_mem_batch_from_wal_block(block, schema, &mut offsets)?;
-        let mut owned = Batch::with_capacity(*schema, mb.len());
+        let mut owned = Batch::with_capacity(schema, mb.len());
         owned.append_mem_batch(&mb);
         Ok(owned)
     })?;
@@ -454,8 +454,11 @@ fn decode_frame<'a, B>(
             data_batch: None,
         });
     }
+    // `or_else`, not `or`: `Option::or` evaluates its argument, so the 360-byte
+    // hint copy would run per decoded frame and be discarded by every frame that
+    // carried its own schema block.
     let schema = block_schema
-        .or(hint.copied())
+        .or_else(|| hint.copied())
         .ok_or("FLAG_HAS_DATA without FLAG_HAS_SCHEMA")?;
     let dblock = gnitz_wire::wal::block_slice_at(data, off)?;
     let data_batch = decode(dblock, &schema)?;

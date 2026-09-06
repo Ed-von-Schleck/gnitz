@@ -52,7 +52,7 @@ impl BoundedIndexCursor {
     /// only thing bounding the walk — plus the base cursor its entries resolve
     /// against. `pk_capacity` pre-sizes the per-chunk PK scratch, in keys.
     pub(crate) fn new(idx: ReadCursor, src: ReadCursor, spec: IndexKeySpec, pk_capacity: usize) -> Self {
-        let stride = src.schema.pk_stride() as usize;
+        let stride = src.schema.pk_stride();
         BoundedIndexCursor {
             idx,
             src,
@@ -70,7 +70,7 @@ impl BoundedIndexCursor {
     /// last, and `advance_to` is backward-capable via a binary search, so a chunk
     /// boundary costs O(log N) on the first probe — not a rescan.
     pub(crate) fn drain_chunk(&mut self, n: usize) -> Option<Batch> {
-        let stride = self.src.schema.pk_stride() as usize;
+        let stride = self.src.schema.pk_stride();
         self.pks.clear();
         let mut collected = 0;
         // `new` clamped the cursor at `end`, so exhaustion IS the range bound.
@@ -98,7 +98,7 @@ impl BoundedIndexCursor {
         sort_indices(&self.pks, stride, &mut self.order);
         // One live payload per PK (an index owner is always a base table), so the
         // collected count sizes the result exactly.
-        let mut batch = Batch::with_capacity(self.src.schema, collected);
+        let mut batch = Batch::with_capacity(&self.src.schema, collected);
         // Skipping a record equal to its predecessor IS the dedup, so each PK
         // group is copied once, at its net `current_weight` (never a hardcoded 1,
         // so Z-Set multiplicity survives).

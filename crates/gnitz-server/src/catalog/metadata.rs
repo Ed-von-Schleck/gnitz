@@ -189,7 +189,7 @@ impl CatalogEngine {
         let schema = SysFamily::Index.schema();
         let store = self.sys_store(SysFamily::Index);
         for &idx_id in ids {
-            let key = sys_opk(&schema, idx_id as u128);
+            let key = sys_opk(schema, idx_id as u128);
             let Some(sr) = store.live_row_at(key.pk_bytes()).1 else {
                 continue;
             };

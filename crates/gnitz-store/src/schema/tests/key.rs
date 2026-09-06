@@ -197,7 +197,7 @@ fn pack_pk_be_specialization_matches_naive() {
             if (1..16).contains(&width) {
                 assert_eq!(
                     pack_pk_be(&bytes),
-                    gnitz_wire::widen_pk_be(&bytes, width) << (8 * (16 - width)),
+                    gnitz_wire::widen_pk_be(&bytes[..width]) << (8 * (16 - width)),
                     "width {width} seed {seed}: widen_pk_be identity",
                 );
             }
@@ -350,7 +350,7 @@ fn seek_opk_bytes_wide_reproduces_hand_built_opk() {
     // bytes (a in the low half, b in the high half), `extra` is c's 8 bytes.
     let low = (a as u128) | ((b as u128) << 64);
     let opk = seek_opk_bytes(&s, low, &c.to_le_bytes()).expect("wide seek encodes");
-    assert_eq!(opk.len, 24);
+    assert_eq!(opk.width(), 24);
     let want: Vec<u8> = a
         .to_be_bytes()
         .into_iter()
@@ -389,22 +389,29 @@ fn seek_opk_bytes_four_u128_ceiling() {
     ];
     let extra: Vec<u8> = vals[1..].iter().flat_map(|v| v.to_le_bytes()).collect();
     let opk = seek_opk_bytes(&s, vals[0], &extra).expect("4×U128 encodes");
-    assert_eq!(opk.len, 64);
+    assert_eq!(opk.width(), 64);
     let want: Vec<u8> = vals.iter().flat_map(|v| v.to_be_bytes()).collect();
     assert_eq!(opk.pk_bytes(), want.as_slice());
 }
 
 #[test]
-fn pkbuf_eq_hash_compare_only_len_window() {
+fn pkbuf_reused_buffer_matches_a_fresh_key_of_the_same_width() {
     use std::collections::HashSet;
-    // Same meaningful bytes, different tail → equal and same hash.
-    let mut a = PkBuf::from_bytes(&7u64.to_le_bytes());
+    // A scratch buffer that held a wider key, rewritten narrower: the bytes past
+    // the new width must not survive into eq/hash, or a reused key would stop
+    // matching the fresh one it is supposed to equal.
+    let mut a = PkBuf::from_bytes(&[0xABu8; 12]);
+    a.try_write(8, |dst| {
+        dst.copy_from_slice(&7u64.to_le_bytes());
+        true
+    });
     let b = PkBuf::from_bytes(&7u64.to_le_bytes());
-    a.bytes[8] = 0xAB; // tail garbage past len; eq/hash must ignore it
-    assert!(a == b);
+    assert_eq!(a, b);
     let mut set: HashSet<PkBuf> = HashSet::new();
     set.insert(b);
-    assert!(set.contains(&a), "tail bytes must not affect membership");
+    assert!(set.contains(&a));
+    // And the zero tail is what makes `padded` sound over the reused buffer.
+    assert_eq!(a.padded(12), &[7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 }
 
 #[test]
@@ -677,7 +684,7 @@ fn test_german_string_promote_key_short_and_long() {
     // stored in blob). Both German-string layouts execute, and distinct
     // strings hash to distinct PKs.
     let schema = make_schema_pk_u64_payload_string();
-    let mut b = Batch::with_capacity(schema, 2);
+    let mut b = Batch::with_capacity(&schema, 2);
 
     // Row 0: short string "foo" (3 bytes, inline).
     b.extend_pk(1u128);
@@ -719,7 +726,7 @@ fn test_german_string_promote_key_empty_is_zero() {
     // The hash early-returns 0 for length==0 — assert this is the contract,
     // not an accidental side-effect of xxh on empty input.
     let schema = make_schema_pk_u64_payload_string();
-    let mut b = Batch::with_capacity(schema, 1);
+    let mut b = Batch::with_capacity(&schema, 1);
     b.extend_pk(1u128);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&0u64.to_le_bytes());
@@ -760,7 +767,7 @@ fn hash_fold_one_shot_matches_the_streaming_form() {
         ],
         &[0],
     );
-    let mut b = Batch::with_capacity(schema, 2);
+    let mut b = Batch::with_capacity(&schema, 2);
     // Row 0: nothing NULL. Row 1: the two nullable columns NULL, so both the
     // marker-only arm and the marker+route-key arm run in one row.
     for (pk, null_word) in [(7u128, 0u64), (8u128, (1u64 << 1) | (1u64 << 3))] {
@@ -812,14 +819,13 @@ fn hash_fold_one_shot_matches_the_streaming_form() {
 fn packer_output_schema_pk_width_policy() {
     // (key column type, expected output PK type, expected pk_stride)
     let cases = [
-        (type_code::U64, type_code::U64, 8u8),
+        (type_code::U64, type_code::U64, 8usize),
         (type_code::I32, type_code::I32, 4),
         (type_code::U16, type_code::U16, 2),
         (type_code::STRING, type_code::U128, 16),
         (type_code::BLOB, type_code::U128, 16),
         (type_code::U128, type_code::U128, 16),
         (type_code::UUID, type_code::U128, 16),
-        (type_code::F64, type_code::U128, 16),
     ];
     for (key_tc, want_tc, want_stride) in cases {
         // in_schema: [U64 PK, <key col>]; reindex on the payload col so the
@@ -834,6 +840,23 @@ fn packer_output_schema_pk_width_policy() {
             .unwrap();
         assert_eq!(node_schema.columns[0].type_code, want_tc, "key {key_tc} → PK type");
         assert_eq!(node_schema.pk_stride(), want_stride, "key {key_tc} → pk_stride");
+    }
+    // No float slot exists: the raw bits are equality-incorrect (±0.0) and the
+    // `order_bits` image is not what a self-derived key would land in, so the
+    // packer refuses one outright rather than picking either.
+    for float_tc in [type_code::F32, type_code::F64] {
+        let in_schema = SchemaDescriptor::new(
+            &[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(float_tc, 0)],
+            &[0],
+        );
+        assert!(
+            ReindexPacker::new(&in_schema, &[(1, 0)]).is_none(),
+            "a float reindex key must be refused, not packed"
+        );
+        assert!(
+            ReindexPacker::new_group_key(&in_schema, &[1], &[]).is_none(),
+            "a float group key must be refused, not packed"
+        );
     }
 }
 
@@ -915,15 +938,13 @@ fn packer_output_schema_payload_prune() {
 #[test]
 fn test_reindex_packer_multi_column_bytes() {
     // Compound key spanning every slot shape: a non-leading PK column (offset
-    // 8), a sign-flipped I32 payload, a 16-byte U128 payload, and an F64
-    // whose 8 source bytes zero-pad into a 16-byte slot.
+    // 8), a sign-flipped I32 payload, and a 16-byte U128 payload.
     let schema = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::I32, 0),
             SchemaColumn::new(type_code::U128, 0),
-            SchemaColumn::new(type_code::F64, 0),
         ],
         &[0, 1],
     );
@@ -931,21 +952,19 @@ fn test_reindex_packer_multi_column_bytes() {
     let pk1: u64 = 0xA0B0_C0D0_E0F0_0102;
     let iv: i32 = -3;
     let uv: u128 = 0xdead_beef_cafe_1234_5678_9abc_def0_0001;
-    let fv: f64 = 2.5;
 
-    let mut b = Batch::with_capacity(schema, 1);
+    let mut b = Batch::with_capacity(&schema, 1);
     b.extend_pk_opk(&schema, &[pk0 as u128, pk1 as u128]);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&0u64.to_le_bytes());
     b.extend_col(0, &iv.to_le_bytes()); // I32 payload (pi 0)
     b.extend_col(1, &uv.to_le_bytes()); // U128 payload (pi 1)
-    b.extend_col(2, &fv.to_le_bytes()); // F64 payload (pi 2)
     b.count += 1;
     let mb = b.as_mem_batch();
 
-    let packer = ReindexPacker::new(&schema, &[(1, 0), (2, 0), (3, 0), (4, 0)]).unwrap();
-    // out_stride = 8 (Pk U64) + 4 (I32) + 16 (U128) + 16 (F64→U128) = 44.
-    assert_eq!(packer.out_stride, 8 + 4 + 16 + 16);
+    let packer = ReindexPacker::new(&schema, &[(1, 0), (2, 0), (3, 0)]).unwrap();
+    // out_stride = 8 (Pk U64) + 4 (I32) + 16 (U128) = 28.
+    assert_eq!(packer.out_stride, 8 + 4 + 16);
 
     let mut buf = [0u8; crate::schema::MAX_PK_BYTES];
     packer.pack_into(&mut buf[..packer.out_stride], &mb, 0);
@@ -958,12 +977,7 @@ fn test_reindex_packer_multi_column_bytes() {
     want.extend_from_slice(&i32_opk); // col2: sign-aware OPK
     assert_eq!(i32_opk[0], 0x7F, "I32 -3 OPK leading byte is sign-flipped (0x7F)");
     want.extend_from_slice(&uv.to_be_bytes()); // col3 Wide: BE(u128)
-    let mut f64_slot = [0u8; 16];
-    f64_slot[8..].copy_from_slice(&fv.to_bits().to_be_bytes()); // high 8 zero-pad, low 8 = BE(bits)
-    want.extend_from_slice(&f64_slot); // col4: float, zero-padded
     assert_eq!(&buf[..packer.out_stride], &want[..], "packed compound key bytes");
-    // Float slot high pad is zeroed.
-    assert_eq!(&buf[28..36], &[0u8; 8], "F64 slot high pad zeroed");
 }
 
 #[test]
@@ -976,7 +990,7 @@ fn test_reindex_packer_arity1_byte_identity() {
         // Three rows with distinct content, one of them empty (the zero
         // sentinel), exercising the per-row read.
         let contents: [&[u8]; 3] = [b"abc", b"", b"hello-world-xyz"];
-        let mut b = Batch::with_capacity(schema, 3);
+        let mut b = Batch::with_capacity(&schema, 3);
         for (r, content) in contents.iter().enumerate() {
             b.extend_pk((r + 1) as u128 * 11);
             b.extend_weight(&1i64.to_le_bytes());
@@ -990,7 +1004,7 @@ fn test_reindex_packer_arity1_byte_identity() {
         let out_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U128, 0)], &[0]);
         let packer = ReindexPacker::new(&schema, &[(1, 0)]).unwrap();
         assert_eq!(packer.out_stride, 16, "a content-hash key is a 16-byte U128 slot");
-        let mut out = Batch::zeroed(out_schema, 3);
+        let mut out = Batch::zeroed(&out_schema, 3);
         promote_into(&packer, &mb, &mut out);
 
         for row in 0..3 {
@@ -1008,41 +1022,6 @@ fn test_reindex_packer_arity1_byte_identity() {
         assert_ne!(out.get_pk_bytes(0), out.get_pk_bytes(2));
         assert_ne!(out.get_pk_bytes(0), out.get_pk_bytes(1));
     }
-}
-
-#[test]
-fn test_reindex_packer_float_arity1_zero_pad() {
-    // A float key self-derives to a 16-byte slot from an 8-byte source: the
-    // slot is 8 zero bytes ++ BE(bits).
-    let schema = SchemaDescriptor::new(
-        &[
-            SchemaColumn::new(type_code::U64, 0),
-            SchemaColumn::new(type_code::F64, 0),
-        ],
-        &[0],
-    );
-    let mut b = Batch::with_capacity(schema, 1);
-    b.extend_pk(1u128);
-    b.extend_weight(&1i64.to_le_bytes());
-    b.extend_null_bmp(&0u64.to_le_bytes());
-    let fv: f64 = -7.25;
-    b.extend_col(0, &fv.to_le_bytes());
-    b.count += 1;
-    let mb = b.as_mem_batch();
-
-    let out_schema = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U128, 0)], &[0]);
-    let packer = ReindexPacker::new(&schema, &[(1, 0)]).unwrap();
-    assert_eq!(packer.out_stride, 16);
-    let mut packer_out = Batch::zeroed(out_schema, 1);
-    promote_into(&packer, &mb, &mut packer_out);
-
-    let mut want = [0u8; 16];
-    want[8..].copy_from_slice(&fv.to_bits().to_be_bytes());
-    assert_eq!(
-        packer_out.get_pk_bytes(0),
-        &want[..],
-        "float slot = zero-pad ++ BE(bits)"
-    );
 }
 
 #[test]
@@ -1066,7 +1045,7 @@ fn test_reindex_packer_copartition_contract() {
         (3, -5, 200),
         (4, i32::MIN, 0),
     ];
-    let mut b = Batch::with_capacity(schema, rows.len());
+    let mut b = Batch::with_capacity(&schema, rows.len());
     for &(pk, c1, c2) in rows {
         b.extend_pk(pk as u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -1086,7 +1065,7 @@ fn test_reindex_packer_copartition_contract() {
         ],
         &[0, 1],
     );
-    let mut out = Batch::zeroed(out_schema, rows.len());
+    let mut out = Batch::zeroed(&out_schema, rows.len());
     promote_into(&packer, &mb, &mut out);
 
     for row in 0..rows.len() {
@@ -1123,7 +1102,7 @@ fn test_reindex_packer_copartition_contract_wide() {
     // Non-trivial, high-entropy column values (so a forked hash seed/shift in
     // the wide arm lands on a different bucket with overwhelming probability).
     let key: [u64; 3] = [0x0102_0304_0506_0708, 0xA0B0_C0D0_E0F0_0102, 0xdead_beef_cafe_1234];
-    let mut b = Batch::with_capacity(schema, 1);
+    let mut b = Batch::with_capacity(&schema, 1);
     b.extend_pk(42u128);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&0u64.to_le_bytes());
@@ -1151,7 +1130,7 @@ fn test_reindex_packer_copartition_contract_wide() {
     assert!(out_schema.pk_stride() > 16, "test invariant: 24-byte key is wide");
 
     // PATH 1 — trace store: promote_into stamps the `_join_pk`; read it back.
-    let mut out = Batch::zeroed(out_schema, 1);
+    let mut out = Batch::zeroed(&out_schema, 1);
     promote_into(&packer, &mb, &mut out);
     let consumer = out.get_pk_bytes(0);
 
@@ -1201,7 +1180,7 @@ fn test_reindex_packer_null_key_determinism() {
         ],
         &[0],
     );
-    let mut b = Batch::with_capacity(schema, 2);
+    let mut b = Batch::with_capacity(&schema, 2);
     // Row 0 and row 1: distinct PK, both NULL in col1 (slot zeroed, null bit set).
     for pk in [10u128, 20u128] {
         b.extend_pk(pk);
@@ -1244,7 +1223,7 @@ fn test_group_key_bitmap_bit_positions() {
         &[0],
     );
     // Row 0: B is NULL (payload slot 1 → null-word bit 1). Row 1: B == 0.
-    let mut b = Batch::with_capacity(schema, 2);
+    let mut b = Batch::with_capacity(&schema, 2);
     for (pk, null_word) in [(10u128, 1u64 << 1), (20u128, 0u64)] {
         b.extend_pk(pk);
         b.extend_weight(&1i64.to_le_bytes());
@@ -1255,7 +1234,7 @@ fn test_group_key_bitmap_bit_positions() {
     }
     let mb = b.as_mem_batch();
 
-    let packer = ReindexPacker::new_group_key(&schema, &[1, 2], &[]);
+    let packer = ReindexPacker::new_group_key(&schema, &[1, 2], &[]).expect("integer group columns");
     assert_eq!(packer.out_stride, 1 + 8 + 4, "bitmap ++ I64 slot ++ U32 slot");
 
     let mut null_row = [0u8; crate::schema::MAX_PK_BYTES];
@@ -1326,7 +1305,7 @@ mod pack_proptest {
             let mut cols = vec![SchemaColumn::new(type_code::U64, 0)];
             cols.extend(types.iter().map(|&tc| SchemaColumn::new(tc, 0)));
             let pay_schema = SchemaDescriptor::new(&cols, &[0]);
-            let mut pb = Batch::with_capacity(pay_schema, 1);
+            let mut pb = Batch::with_capacity(&pay_schema, 1);
             pb.extend_pk(1u128);
             pb.extend_weight(&1i64.to_le_bytes());
             pb.extend_null_bmp(&0u64.to_le_bytes());
@@ -1344,7 +1323,7 @@ mod pack_proptest {
                 gnitz_wire::encode_pk_column(v, types[i], &mut slot);
                 opk.extend_from_slice(&slot);
             }
-            let mut kb = Batch::with_capacity(pk_schema, 1);
+            let mut kb = Batch::with_capacity(&pk_schema, 1);
             kb.extend_pk_bytes(&opk);
             kb.extend_weight(&1i64.to_le_bytes());
             kb.extend_null_bmp(&0u64.to_le_bytes());
@@ -1415,7 +1394,7 @@ fn reindex_pack_bench() {
         ],
         &[0],
     );
-    let mut jb = Batch::with_capacity(join_schema, N);
+    let mut jb = Batch::with_capacity(&join_schema, N);
     for i in 0..N as u64 {
         jb.extend_pk(i as u128);
         jb.extend_weight(&1i64.to_le_bytes());
@@ -1438,7 +1417,7 @@ fn reindex_pack_bench() {
         ],
         &[0],
     );
-    let mut gb = Batch::with_capacity(grp_schema, N);
+    let mut gb = Batch::with_capacity(&grp_schema, N);
     for i in 0..N as u64 {
         gb.extend_pk(i as u128);
         gb.extend_weight(&1i64.to_le_bytes());
@@ -1449,7 +1428,7 @@ fn reindex_pack_bench() {
         gb.count += 1;
     }
     let gmb = gb.as_mem_batch();
-    let grp_packer = ReindexPacker::new_group_key(&grp_schema, &[1, 2], &[]);
+    let grp_packer = ReindexPacker::new_group_key(&grp_schema, &[1, 2], &[]).expect("integer group columns");
 
     for (name, packer, mb) in [("join3", &join_packer, &jmb), ("group2-nullable", &grp_packer, &gmb)] {
         let stride = packer.out_stride;
@@ -1500,7 +1479,7 @@ fn probe_key_distinguishes_spans_past_the_narrow_width() {
 /// The base-PK key range, through the degenerate identity-promotion span. The
 /// expected bytes below predate `for_pk`, so they pin its promotion too.
 fn pk_range_keys(schema: &SchemaDescriptor, d: &RangeDescriptor) -> Result<Option<(PkBuf, Option<PkBuf>)>, String> {
-    IndexKeySpec::for_pk(schema).range_keys(schema.pk_stride() as usize, d)
+    IndexKeySpec::for_pk(schema).range_keys(schema.pk_stride(), d)
 }
 
 fn opk_u64(v: u64) -> Vec<u8> {

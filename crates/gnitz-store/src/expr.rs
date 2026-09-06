@@ -390,7 +390,7 @@ pub struct MapPlan {
 fn reindex_hash_row(out_schema: &SchemaDescriptor, output: &mut Batch, branch_id: u8) {
     let n = output.count;
     debug_assert!(
-        out_schema.pk_stride() as usize <= gnitz_wire::NARROW_PK_MAX_BYTES,
+        out_schema.pk_stride() <= gnitz_wire::NARROW_PK_MAX_BYTES,
         "reindex_hash_row: synthetic key stride exceeds NARROW_PK_MAX_BYTES"
     );
     // Hashing borrows the batch immutably and the write-back needs it mutably, so
@@ -501,7 +501,7 @@ impl MapPlan {
         // Uninitialized: `validate` requires every map to write every output
         // payload slot, and `map_rows_into` writes the PK (or [`Self::stamp_pk`]
         // does), weight and null regions of every row.
-        let mut output = Batch::with_capacity(self.out_schema, n);
+        let mut output = Batch::with_capacity(&self.out_schema, n);
         // When no string column is dropped, adopt the input blob wholesale; the
         // shared `blob_id` is then what tells `map_ranges_into` to copy every
         // String/Blob struct verbatim instead of relocating each cell.
@@ -566,7 +566,7 @@ impl MapPlan {
         let compacted;
         let (src, ranges) = if starves_kernel {
             compacted = {
-                let mut c = Batch::with_capacity(src.schema, total);
+                let mut c = Batch::with_capacity(&src.schema, total);
                 c.append_ranges(&src.as_mem_batch(), ranges);
                 c
             };

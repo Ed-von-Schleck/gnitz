@@ -100,7 +100,7 @@ fn expr_reject(what: &'static str) -> impl Fn(ExprValidateErr) -> CompileError {
 /// Bound is `num_columns()`, not `MAX_COLUMNS`, so the silent `[num_columns, 65)`
 /// zeroed-slot zone is rejected too. The recurring guard for a client-controlled
 /// column list that indexes (or slices) the fixed `[_; 65]` schema array.
-pub(super) fn oob_cols(cols: impl IntoIterator<Item = u32>, schema: &SchemaDescriptor) -> bool {
+pub(crate) fn oob_cols(cols: impl IntoIterator<Item = u32>, schema: &SchemaDescriptor) -> bool {
     cols.into_iter().any(|c| c as usize >= schema.num_columns())
 }
 

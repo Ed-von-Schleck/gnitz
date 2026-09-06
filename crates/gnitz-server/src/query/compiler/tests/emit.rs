@@ -1,5 +1,7 @@
 use super::*;
-use crate::test_support::{make_schema_u128_i64, make_schema_u64_i64, pk_payload_schema, u64_pk_schema};
+use crate::test_support::{
+    make_schema_u128_i64, make_schema_u64_i64, pk_only_schema, pk_payload_schema, u64_pk_schema,
+};
 use gnitz_store::schema::{type_code, SchemaColumn};
 
 // ── Fixtures ────────────────────────────────────────────────────────────
@@ -105,7 +107,7 @@ fn union_merges_nullability_and_reclassifies_the_comparator() {
 /// and let `op_union` read `b`'s bytes through it.
 #[test]
 fn union_of_mismatched_input_layouts_is_rejected() {
-    let one = SchemaDescriptor::minimal_u64();
+    let one = pk_only_schema(&[type_code::U64]);
     let loaded = loaded_for_test(
         HashMap::from([(0, scan_delta(10)), (1, scan_delta(11)), (2, gnitz_wire::OpNode::Union)]),
         vec![(0, 2, SLOT_IN), (1, 2, SLOT_TRACE)],
@@ -144,7 +146,7 @@ fn a_subgraph_outputs_the_named_node_and_must_not_hold_the_sink() {
         ]),
         vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
     );
-    let ext: ExtTables = HashMap::from([(10i64, SchemaDescriptor::minimal_u64())]);
+    let ext: ExtTables = HashMap::from([(10i64, pk_only_schema(&[type_code::U64]))]);
     let plan = |ordered: &[i32]| {
         build_plan(
             &loaded,
@@ -172,7 +174,7 @@ fn a_subgraph_outputs_the_named_node_and_must_not_hold_the_sink() {
 /// string descriptor out of 8-byte integer storage.
 #[test]
 fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
-    let view_schema = SchemaDescriptor::minimal_u64();
+    let view_schema = pk_only_schema(&[type_code::U64]);
     let string_payload = SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
@@ -228,7 +230,7 @@ fn a_register_count_over_u16_max_is_rejected() {
         test_site("", 1),
         gnitz_store::schema::Placement::KEYED_DEFAULT,
         PlanTarget::ViewOutput {
-            out_schema: &SchemaDescriptor::minimal_u64(),
+            out_schema: &pk_only_schema(&[type_code::U64]),
             seeds: &[],
         },
     );
@@ -396,7 +398,7 @@ fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
 #[test]
 fn a_corrupt_expression_blob_aborts_the_compile() {
     use gnitz_wire::{MapKind, OpNode};
-    let fixture = MidCircuit::new(SchemaDescriptor::minimal_u64());
+    let fixture = MidCircuit::new(pk_only_schema(&[type_code::U64]));
     for blob in [vec![0xFFu8; 16], Vec::new()] {
         assert!(
             fixture

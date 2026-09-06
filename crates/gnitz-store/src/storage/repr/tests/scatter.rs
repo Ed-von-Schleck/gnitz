@@ -30,7 +30,7 @@ fn keys(stride: usize, n: usize) -> Vec<Vec<u8>> {
 /// destination back. Reading the PK as bytes rather than as a widened `u128` is
 /// what lets one runner serve every stride.
 fn scatter_into(schema: &SchemaDescriptor, n: usize, f: impl FnOnce(&mut DirectWriter)) -> Vec<Row> {
-    let stride = schema.pk_stride() as usize;
+    let stride = schema.pk_stride();
     let mut pk = vec![0u8; n * stride];
     let (mut wt, mut nb, mut col0) = (vec![0u8; n * 8], vec![0u8; n * 8], vec![0u8; n * 8]);
     let mut blob: Vec<u8> = Vec::with_capacity(1);

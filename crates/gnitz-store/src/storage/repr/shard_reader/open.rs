@@ -60,7 +60,7 @@ impl MappedShard {
             return Err(StorageError::InvalidVersion);
         }
 
-        let pk_stride = schema.pk_stride();
+        let pk_stride = schema.pk_stride() as u8;
         // Writer↔reader region-layout contract, shared with
         // `write_shard_streaming`: `strides` holds each fixed-width region's
         // per-element width. The file's own arity below drives the walk, so only

@@ -85,7 +85,7 @@ fn write_dense_shard(dir: &std::path::Path, name: &str, base: u64, n: u64) -> St
 /// lets a guard still be over target after one fold.
 fn write_fat_shard(dir: &std::path::Path, name: &str, base: u64, n: u64, width: usize) -> String {
     let schema = make_schema_pk_u64_payload_string();
-    let mut b = Batch::with_capacity(schema, n as usize);
+    let mut b = Batch::with_capacity(&schema, n as usize);
     for pk in base..base + n {
         b.extend_pk(pk as u128);
         b.extend_weight(&1i64.to_le_bytes());
@@ -860,7 +860,7 @@ fn test_single_pk_probe_and_sort_golden() {
     // pk_min holds OPK bytes; widen_pk_be recovers the native U64 value.
     let pk_min_val = |e: &ShardEntry| {
         let b = e.pk_min.pk_bytes();
-        gnitz_wire::widen_pk_be(b, b.len())
+        gnitz_wire::widen_pk_be(b)
     };
     assert_eq!(pk_min_val(&idx.l0[0]), 10, "lowest pk_min sorts first");
     assert_eq!(pk_min_val(&idx.l0[1]), 30);
@@ -885,7 +885,7 @@ fn test_empty_shard_sentinel() {
     let pc = write_compound_shard(dir.path(), "e_compound.db", &[], &[]);
     let ec = ShardEntry::open(&pc, &compound, 0, true).unwrap();
     assert!(ec.is_empty());
-    assert_eq!(ec.pk_min.len, compound.pk_stride());
+    assert_eq!(ec.pk_min.width(), compound.pk_stride());
     // Short-circuits before the stride assert / pk_in_range.
     assert!(probe(&ec, &opk2(1, 1)).is_none());
 }
@@ -1121,7 +1121,7 @@ fn the_byte_target_bounds_a_guard_at_every_stride() {
     for pk_cols in [1usize, 3, 4] {
         let tmp = tempfile::tempdir().unwrap();
         let schema = stride_schema(pk_cols);
-        assert_eq!(schema.pk_stride() as usize, pk_cols * 8);
+        assert_eq!(schema.pk_stride(), pk_cols * 8);
         let mut idx = ShardIndex::new(1, tmp.path().to_str().unwrap(), schema, false);
         let p = write_trailing_key_shard(tmp.path(), "big.db", pk_cols, 1, OVER_TARGET_ROWS);
         seed_guard(&mut idx, 0, trailing_gk(pk_cols, 1), &p, 1);

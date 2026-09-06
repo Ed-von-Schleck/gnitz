@@ -1,7 +1,7 @@
 use crate::connection::{MultiScanResult, RawBlock, RelTarget, ScanResult, Session};
 use crate::error::ClientError;
 use crate::protocol::{
-    BatchAppender, ColumnDef, PkColumn, PkTuple, ReplySchema, Schema, TypeCode, WireConflictMode, ZSetBatch,
+    BatchAppender, ColumnDef, PkBuf, PkColumn, ReplySchema, Schema, TypeCode, WireConflictMode, ZSetBatch,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -1196,16 +1196,12 @@ impl GnitzClient {
         props
             .validate()
             .map_err(|e| ClientError::ServerError(format!("create_table: {e}")))?;
-        // `dist_prefix_len` is a leading-PK-prefix length (0 = default = full PK);
-        // a value past the PK count is meaningless and the engine would silently
-        // clamp it, so reject it here to catch the caller's mistake.
-        if props.dist_prefix_len > pk_cols.len() {
-            return Err(ClientError::ServerError(format!(
-                "create_table: distribution prefix length {} exceeds PK column count {}",
-                props.dist_prefix_len,
-                pk_cols.len()
-            )));
-        }
+        // `dist_prefix_len` is a leading-PK-prefix length (0 = default = full PK).
+        // Shared with the engine's own TABLE_TAB decoder, which re-checks it: this
+        // one catches the caller's mistake before any id is allocated.
+        props
+            .validate_against_pk(pk_cols.len())
+            .map_err(|e| ClientError::ServerError(format!("create_table: {e}")))?;
 
         let new_tid = self.session.alloc_table_id()?;
         let schema_id = self.lookup_schema_id(&schema_name)?;
@@ -1840,7 +1836,7 @@ pub struct TxnBuffer {
     /// PK. Row indices are stable: `push` only ever extends a family batch or
     /// pushes a new one. Weight-0 rows are not indexed — they are inert, exactly
     /// as the engine's fold treats them.
-    last_op_of: HashMap<u64, HashMap<PkTuple, (usize, usize)>>,
+    last_op_of: HashMap<u64, HashMap<PkBuf, (usize, usize)>>,
     /// The transaction-wide OCC basis, snapshotted from `last_seen_lsn` at BEGIN.
     /// `COMMIT` ships one precondition `(tid, basis)` per read-set tid.
     basis: u64,
@@ -1943,13 +1939,13 @@ impl<'a> TxnReads<'a> {
     /// transaction has not touched that PK. The row's **weight sign** is the net
     /// effect (positive: live row with that payload; negative: deleted),
     /// mirroring the engine's own per-table fold.
-    pub fn last_op(&self, pk: &PkTuple) -> Option<(&'a ZSetBatch, usize)> {
+    pub fn last_op(&self, pk: &PkBuf) -> Option<(&'a ZSetBatch, usize)> {
         let &(fam, row) = self.buf.last_op_of.get(&self.tid)?.get(pk)?;
         Some((&self.buf.families[fam].batch, row))
     }
 
     /// Every PK the transaction has touched, with its last op.
-    pub fn last_ops(&self) -> impl Iterator<Item = (PkTuple, &'a ZSetBatch, usize)> + '_ {
+    pub fn last_ops(&self) -> impl Iterator<Item = (PkBuf, &'a ZSetBatch, usize)> + '_ {
         let buf = self.buf;
         buf.last_op_of
             .get(&self.tid)

@@ -28,7 +28,7 @@ use std::sync::Arc;
 use crate::dml::plan::{fetch_bound, AccessPlan};
 use crate::error::GnitzSqlError;
 use crate::exec::batch::RowGather;
-use gnitz_core::{GnitzClient, PkTuple, Schema, ZSetBatch};
+use gnitz_core::{native_le_key, native_packed_key, GnitzClient, PkBuf, Schema, ZSetBatch};
 use gnitz_wire::{ReadBound, ReadSink};
 use std::collections::{HashMap, HashSet};
 
@@ -40,7 +40,7 @@ pub(super) enum Buffered<'a> {
 }
 
 /// PK → net effect, borrowing the buffer's rows. Empty in autocommit.
-pub(super) type Net<'a> = HashMap<PkTuple, Buffered<'a>>;
+pub(super) type Net<'a> = HashMap<PkBuf, Buffered<'a>>;
 
 /// The rows `keys` currently resolve to, as one owned batch plus a `PK → row`
 /// index; a key that resolves to nothing is absent from the index. Per key the
@@ -55,16 +55,16 @@ pub(crate) fn effective_rows(
     client: &mut GnitzClient,
     tid: u64,
     schema: &Arc<Schema>,
-    keys: &[PkTuple],
-) -> Result<(ZSetBatch, HashMap<PkTuple, usize>), GnitzSqlError> {
+    keys: &[PkBuf],
+) -> Result<(ZSetBatch, HashMap<PkBuf, usize>), GnitzSqlError> {
     let gather = RowGather::new(schema);
     let mut out = ZSetBatch::with_capacity(schema, keys.len());
-    let mut index: HashMap<PkTuple, usize> = HashMap::with_capacity(keys.len());
-    let mut undecided: Vec<PkTuple> = Vec::new();
+    let mut index: HashMap<PkBuf, usize> = HashMap::with_capacity(keys.len());
+    let mut undecided: Vec<PkBuf> = Vec::new();
     // The buffer borrow is confined to this block, so it ends before the fetch.
     {
         let net = buffered_net(client, tid, Some(keys));
-        let mut seen: HashSet<PkTuple> = HashSet::with_capacity(keys.len());
+        let mut seen: HashSet<PkBuf> = HashSet::with_capacity(keys.len());
         for pk in keys {
             if !seen.insert(*pk) {
                 continue;
@@ -98,7 +98,7 @@ fn fetch_committed(
     client: &mut GnitzClient,
     tid: u64,
     schema: &Arc<Schema>,
-    keys: &[PkTuple],
+    keys: &[PkBuf],
 ) -> Result<ZSetBatch, GnitzSqlError> {
     // `PkSet` ships each key in the wire's **native** key space, and `opk_key`
     // encodes a packed key of any arity — so the wire's scalar width, not the
@@ -108,14 +108,14 @@ fn fetch_committed(
         // gather is the whole selection. ON CONFLICT needs the committed rows for
         // a key set it already holds, so it takes this bound directly rather than
         // re-deriving it from a synthetic `pk IN (…)`.
-        let keys = keys.iter().map(|k| k.to_native_packed(schema)).collect();
+        let keys = keys.iter().map(|k| native_packed_key(schema, k)).collect();
         let plan = AccessPlan::new(ReadBound::PkSet(keys), &[], Vec::new(), schema)?;
         return fetch_bound(client, tid, &plan.access, &ReadSink::all_rows(), schema);
     }
     let gather = RowGather::new(schema);
     let mut out = ZSetBatch::with_capacity(schema, keys.len());
     for pk in keys {
-        let native = pk.native_le(schema);
+        let native = native_le_key(schema, pk);
         let (low, extra) = gnitz_wire::control::split_ctrl_key(&native[..schema.pk_stride()]);
         if let Some(b) = client.seek(tid, low, extra)?.1.filter(|b| !b.pks.is_empty()) {
             for i in 0..b.len() {
@@ -132,7 +132,7 @@ fn fetch_committed(
 /// transaction touched.
 ///
 /// **Empty in autocommit**, and in any transaction that has not written `tid`.
-pub(crate) fn buffered_net<'a>(client: &'a mut GnitzClient, tid: u64, keys: Option<&[PkTuple]>) -> Net<'a> {
+pub(crate) fn buffered_net<'a>(client: &'a mut GnitzClient, tid: u64, keys: Option<&[PkBuf]>) -> Net<'a> {
     let Some(buf) = client.txn_reads(tid) else {
         return Net::new();
     };

@@ -990,7 +990,7 @@ fn checksum_catches_corrupted_packed_region() {
 fn write_string_shard(dir: &std::path::Path, name: &str, rows: &[(u64, [u8; 16])], blob: &[u8]) -> String {
     use crate::storage::Batch;
     let schema = make_schema_pk_u64_payload_string();
-    let mut batch = Batch::with_capacity(schema, rows.len().max(1));
+    let mut batch = Batch::with_capacity(&schema, rows.len().max(1));
     batch.blob.extend_from_slice(blob);
     for &(pk, cell) in rows {
         batch.extend_pk(pk as u128);

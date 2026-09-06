@@ -160,7 +160,7 @@ fn reduce_sort_argsort_delta_bench() {
         ("canonical u128", &wide, &[0u32][..]),
         ("digest 2-col", &multi, &[0u32, 1u32][..]),
     ] {
-        let stride = schema.pk_stride() as usize;
+        let stride = schema.pk_stride();
         let rows: Vec<Vec<u8>> = (0..n)
             .map(|i| {
                 let mut v = vec![0u8; stride];

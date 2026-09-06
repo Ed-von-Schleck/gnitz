@@ -573,7 +573,7 @@ fn make_range_schema(n_eq: usize, wide: bool) -> SchemaDescriptor {
 /// layout claim holds over them.
 fn make_range_batch(schema: &SchemaDescriptor, rows: &[(Vec<u64>, u64, i64, i64)]) -> Batch {
     let wide = schema.num_payload_cols() > 1;
-    let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for (eq, range, w, val) in rows {
         let mut vals: Vec<u128> = eq.iter().map(|&x| x as u128).collect();
         vals.push(*range as u128);

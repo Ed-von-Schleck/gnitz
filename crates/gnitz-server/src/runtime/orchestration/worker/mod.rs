@@ -967,13 +967,13 @@ impl WorkerProcess {
         let e = self.cat().registry().table_entry(owner_id)?;
         let (schema, dir, mut handle) = (e.schema, e.directory.clone(), e.open_cursor());
         // The index circuit is not registered until this pre-flight succeeds, so
-        // build its schema from the owner schema + column list — identical inputs
-        // to the master's own build, so the reply frame layout agrees by
-        // construction. `make_index_schema` also bounds-checks the columns (a
-        // protocol-level mismatch rather than a user error) and yields the
-        // promoted per-column types/sizes for the span.
-        let idx_schema = gnitz_store::schema::make_index_schema(col_indices, &schema)?;
+        // the key spec is built from the owner schema + column list — the same
+        // inputs the master builds from, so the reply frame layout agrees. It
+        // also bounds-checks the columns: a protocol mismatch, not a user error.
         let spec = gnitz_store::schema::IndexKeySpec::new(col_indices, &schema)?;
+        let idx_schema = spec
+            .output_schema(&schema)
+            .ok_or_else(|| "Index: composite key is not a valid primary key".to_string())?;
         let frame_schema = crate::runtime::wire::unique_preflight_wire_schema(&idx_schema, col_indices.len());
 
         let stride = spec.key_size();

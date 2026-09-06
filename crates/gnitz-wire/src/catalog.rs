@@ -744,7 +744,7 @@ pub fn unpack_pk_cols(packed: u64) -> Result<PkColList, crate::PkRule> {
 /// Width of one `seek_by_index` key slot on the wire: a native `u128`, LE.
 pub(crate) const INDEX_KEY_SLOT: usize = 16;
 
-/// Pack K native index-key values into the `PkTuple` a `seek_by_index` request
+/// Pack K native index-key values into the `PkBuf` a `seek_by_index` request
 /// carries — one 16-byte LE slot each, which [`crate::control::split_ctrl_key`]
 /// then routes as slot 0 → `seek_pk` and slots 1..K → `seek_pk_extra`. A prefix
 /// seek supplies K < the
@@ -917,6 +917,20 @@ impl TableProps {
             return Err(format!(
                 "REPLICATED and CLUSTER BY are mutually exclusive: a replicated table keeps \
                  a full copy on every worker, so a hash-distribution prefix (k={}) is meaningless",
+                self.dist_prefix_len
+            ));
+        }
+        Ok(())
+    }
+
+    /// The second rule the flags packing cannot make unrepresentable:
+    /// `dist_prefix_len` is a *leading PK prefix* length, so it cannot exceed
+    /// `pk_len`. `TABLE_FLAG_DIST_MASK` is `0xFF`, so a forged flags word can
+    /// carry 255. `0` is the persisted "default distribution" sentinel.
+    pub fn validate_against_pk(&self, pk_len: usize) -> Result<(), String> {
+        if self.dist_prefix_len > pk_len {
+            return Err(format!(
+                "distribution prefix length {} exceeds PK column count {pk_len}",
                 self.dist_prefix_len
             ));
         }

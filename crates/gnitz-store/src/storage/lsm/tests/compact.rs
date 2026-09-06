@@ -51,7 +51,7 @@ fn compact_one_opt(
     schema: &SchemaDescriptor,
     seq: u64,
 ) -> Option<std::ffi::CString> {
-    let anchor = PkBuf::zeroed(schema.pk_stride() as usize);
+    let anchor = PkBuf::zeroed(schema.pk_stride());
     let outs = merge_and_route(
         inputs,
         &[(anchor, false)],
@@ -315,7 +315,7 @@ fn make_3col_schema() -> SchemaDescriptor {
 
 /// Write a shard with 3-column rows: (pk, weight, col1_val, col2_val).
 fn write_3col_shard(path: &str, rows: &[(u64, i64, i64, i64)], schema: &SchemaDescriptor) {
-    let mut batch = Batch::with_capacity(*schema, rows.len());
+    let mut batch = Batch::with_capacity(schema, rows.len());
     for &(pk, w, c1, c2) in rows {
         batch.extend_pk(pk as u128);
         batch.extend_weight(&w.to_le_bytes());
@@ -565,7 +565,7 @@ fn compaction_orders_and_folds_on_opk_bytes_at_every_pk_shape() {
     struct Case {
         name: &'static str,
         pk_types: &'static [u8],
-        stride: u8,
+        stride: usize,
         shards: Vec<Vec<Row>>,
         /// Surviving rows' PK column values, in the order they must come back.
         want: Vec<Vec<u128>>,
@@ -697,7 +697,7 @@ fn diff_schema() -> SchemaDescriptor {
 /// Build a `(PK, payload)`-sorted shard file from `rows`. Long strings (> 12
 /// bytes) spill to the blob heap; `None` cells set the null bit.
 fn write_diff_shard(path: &str, schema: &SchemaDescriptor, rows: &[DiffRow]) {
-    let mut batch = Batch::with_capacity(*schema, rows.len().max(1));
+    let mut batch = Batch::with_capacity(schema, rows.len().max(1));
     for &(pk, w, c0, c1, c2) in rows {
         let mut nw = 0u64;
         let st0 = match c0 {
@@ -768,7 +768,7 @@ fn decode_diff_shard(path: &str, schema: &SchemaDescriptor) -> Vec<DecodedRow> {
 /// the columnar path is checked against.
 fn oracle_compact_row_at_a_time(input_files: &[&CStr], output_file: &CStr, schema: &SchemaDescriptor) {
     let shards = open_shards(input_files, schema).unwrap();
-    let mut batch = Batch::with_capacity(*schema, 1024);
+    let mut batch = Batch::with_capacity(schema, 1024);
     let mut blob_cache = BlobCacheGuard::acquire(schema, 1024);
     run_merge(&shards, schema, |src, row, w| {
         let pk_bytes = shards[src].get_pk_bytes(row);
@@ -884,7 +884,7 @@ fn oracle_merge_and_route_row_at_a_time(
 ) -> Vec<Option<String>> {
     let shards = open_shards(input_files, schema).unwrap();
     let n = guard_keys.len();
-    let mut batches: Vec<Batch> = (0..n).map(|_| Batch::with_capacity(*schema, 256)).collect();
+    let mut batches: Vec<Batch> = (0..n).map(|_| Batch::with_capacity(schema, 256)).collect();
     let mut blob_caches: Vec<BlobCacheGuard> = (0..n).map(|_| BlobCacheGuard::acquire(schema, 256)).collect();
     run_merge(&shards, schema, |src, row, w| {
         let pk = shards[src].get_pk_bytes(row);
@@ -1005,7 +1005,7 @@ fn the_routed_split_agrees_with_guard_slot_at_every_stride() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         let schema = pk_payload_schema(&vec![TYPE_U64; pk_cols]);
-        assert_eq!(schema.pk_stride() as usize, pk_cols * 8);
+        assert_eq!(schema.pk_stride(), pk_cols * 8);
 
         // Keys ascending in the LAST PK column, so every one of them shares its
         // leading `(pk_cols - 1) * 8` bytes with every other.
@@ -1068,7 +1068,7 @@ mod skeleton_tests {
 
     /// A `(PK, weight, payload)` shard, so one PK can carry several payloads.
     fn write_shard(path: &std::path::Path, rows: &[(u64, i64, i64)], schema: &SchemaDescriptor) -> std::ffi::CString {
-        let mut b = Batch::with_capacity(*schema, rows.len().max(1));
+        let mut b = Batch::with_capacity(schema, rows.len().max(1));
         for &(pk, w, v) in rows {
             b.extend_pk(pk as u128);
             b.extend_weight(&w.to_le_bytes());
@@ -1109,7 +1109,7 @@ mod skeleton_tests {
 
         let outs = merge_and_route(
             &[a.as_c_str(), b.as_c_str()],
-            &[(crate::schema::key::PkBuf::zeroed(schema.pk_stride() as usize), true)],
+            &[(crate::schema::key::PkBuf::zeroed(schema.pk_stride()), true)],
             &schema,
             super::out(dir.to_str().unwrap(), 0, 2, 1),
         )
@@ -1139,7 +1139,7 @@ mod skeleton_tests {
         let schema = make_schema_u64_i64();
         let src = write_shard(&dir.join("src.db"), &[(1, 1, 10), (1, 2, 11), (100, 3, 30)], &schema);
         // Guard 0 owns [.., 100), guard 1 owns [100, ..).
-        let g0 = crate::schema::key::PkBuf::zeroed(schema.pk_stride() as usize);
+        let g0 = crate::schema::key::PkBuf::zeroed(schema.pk_stride());
         let g1 = crate::schema::key::PkBuf::from_bytes(&100u64.to_be_bytes());
 
         let mixed = merge_and_route(

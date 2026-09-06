@@ -18,7 +18,7 @@ use gnitz_store::schema::{IndexKeySpec, SchemaDescriptor};
 use gnitz_wire::{payload_native_key, pk_native_key};
 use gnitz_wire::{PkColList, SpecBytes};
 
-use crate::query::RelayRoute;
+use crate::query::{oob_cols, RelayRoute};
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::{AsyncMutex, ScanLease};
 use crate::runtime::sal::{

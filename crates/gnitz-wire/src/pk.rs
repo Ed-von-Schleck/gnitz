@@ -178,6 +178,8 @@ pub fn encode_pk_column_promoted(src: &[u8], src_tc: u8, target_tc: u8, dst: &mu
 /// left-aligning `pack_pk_be`: this one recovers a value, that one builds a sort
 /// key. Never conflate them.
 ///
+/// The width is the slice's own length; every caller holds an exact-width window.
+///
 /// Specialized on the scalar widths, like the left-aligned sort-key packer it
 /// mirrors: the general arm's `copy_from_slice` has a runtime length, so it
 /// lowers to a zeroed 16-byte stack buffer plus a `memcpy` call, while a whole-
@@ -186,7 +188,8 @@ pub fn encode_pk_column_promoted(src: &[u8], src_tc: u8, target_tc: u8, dst: &mu
 /// 9..=15 (e.g. `(U32, U64)` = 12) get two overlapping loads for the same reason;
 /// only 3/5/6/7 still reach the buffer.
 #[inline(always)]
-pub fn widen_pk_be(pk_bytes: &[u8], stride: usize) -> u128 {
+pub fn widen_pk_be(pk_bytes: &[u8]) -> u128 {
+    let stride = pk_bytes.len();
     debug_assert!(
         stride <= NARROW_PK_MAX_BYTES,
         "widen_pk_be: wide PK region (stride {stride})"
@@ -333,7 +336,7 @@ pub fn worker_for_key(pk: u128, num_workers: usize) -> usize {
 #[inline]
 pub fn worker_for_pk_bytes(bytes: &[u8], num_workers: usize) -> usize {
     if bytes.len() <= NARROW_PK_MAX_BYTES {
-        worker_for_key(widen_pk_be(bytes, bytes.len()), num_workers)
+        worker_for_key(widen_pk_be(bytes), num_workers)
     } else {
         bucket(crate::checksum(bytes), num_workers)
     }
@@ -372,7 +375,7 @@ fn cell(data: &[u8], offset: usize, col_size: usize) -> &[u8] {
 /// within the PK region (0 for a lone PK).
 #[inline]
 pub fn pk_route_key(pk_bytes: &[u8], offset: usize, col_size: usize) -> u128 {
-    widen_pk_be(cell(pk_bytes, offset, col_size), col_size)
+    widen_pk_be(cell(pk_bytes, offset, col_size))
 }
 
 /// The OPK↔native sign flip for a `col_size`-byte column of type `tc`: the top
@@ -418,7 +421,7 @@ pub fn payload_route_key(col_data: &[u8], offset: usize, col_size: usize, type_c
 /// mismatched `col_size` slices past the column and panics.
 #[inline]
 pub fn pk_native_key(pk_bytes: &[u8], offset: usize, col_size: usize, type_code_val: u8) -> u128 {
-    widen_pk_be(cell(pk_bytes, offset, col_size), col_size) ^ opk_flip(type_code_val, col_size)
+    widen_pk_be(cell(pk_bytes, offset, col_size)) ^ opk_flip(type_code_val, col_size)
 }
 
 /// INDEX key for one native little-endian payload column: the native value,
@@ -435,6 +438,168 @@ pub fn payload_native_key(col_data: &[u8], offset: usize, col_size: usize, type_
         u128::from_le_bytes(src.try_into().unwrap())
     } else {
         crate::read_unsigned_exact(&src[..col_size.min(8)]) as u128
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Width-tagged PK byte buffer
+// ---------------------------------------------------------------------------
+
+/// Width-tagged PK byte buffer — the one OPK byte container, held by the engine's
+/// key encoders and the client's row-identity maps alike. Only `bytes[..len]` is
+/// meaningful and the tail past it is always zero, which is what lets
+/// [`Self::padded`] widen a key without touching it; every writer below derives
+/// `len` from the span it hands out.
+#[derive(Clone, Copy)]
+pub struct PkBuf {
+    bytes: [u8; crate::MAX_PK_BYTES],
+    len: u8,
+}
+
+/// Prints only `bytes[..len]`, so assertion diffs over keys stay readable.
+impl std::fmt::Debug for PkBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PkBuf({:02x?})", self.pk_bytes())
+    }
+}
+
+// Eq/Hash/Ord all read `bytes[..len]` and nothing else — no width prefix, which
+// the `Borrow<[u8]>` impl below requires and which keeps a `HashSet<PkBuf>`
+// touching `pk_stride` bytes per key. The order is byte-lexicographic, the same
+// `memcmp` order OPK regions are merged and seeked in.
+impl PartialEq for PkBuf {
+    fn eq(&self, other: &Self) -> bool {
+        self.pk_bytes() == other.pk_bytes()
+    }
+}
+impl Eq for PkBuf {}
+
+impl std::hash::Hash for PkBuf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.pk_bytes().hash(state);
+    }
+}
+
+/// Lets a raw `&[u8]` probe a `HashSet<PkBuf>` / `HashMap<PkBuf, _>` with no key
+/// minted.
+impl std::borrow::Borrow<[u8]> for PkBuf {
+    fn borrow(&self) -> &[u8] {
+        self.pk_bytes()
+    }
+}
+
+impl PartialOrd for PkBuf {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for PkBuf {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.pk_bytes().cmp(other.pk_bytes())
+    }
+}
+
+impl PkBuf {
+    /// All-zero key of the given width — the empty-shard / placeholder form, and
+    /// the `zeroed(0)` seed every [`Self::append`] build starts from.
+    #[inline(always)] // per-row across the crate boundary; dev builds inline nothing else
+    pub fn zeroed(len: usize) -> Self {
+        debug_assert!(len <= crate::MAX_PK_BYTES);
+        PkBuf {
+            bytes: [0u8; crate::MAX_PK_BYTES],
+            len: len as u8,
+        }
+    }
+
+    /// All-`0xFF` key of the given width: an OPK region compares as unsigned
+    /// bytes, so no key of that width sorts above it. The upper bound an
+    /// open-ended range takes.
+    #[inline(always)]
+    pub fn max(len: usize) -> Self {
+        let mut k = PkBuf::zeroed(len);
+        k.bytes[..len].fill(0xFF);
+        k
+    }
+
+    /// A key of exactly `slice`'s bytes and width.
+    #[inline(always)]
+    pub fn from_bytes(slice: &[u8]) -> Self {
+        // Hard, not debug-only: `slice` is an externally-controlled length on the
+        // client's decode paths, and the cast below would truncate a length >= 256.
+        assert!(
+            slice.len() <= crate::MAX_PK_BYTES,
+            "PkBuf::from_bytes: length {} exceeds MAX_PK_BYTES {}",
+            slice.len(),
+            crate::MAX_PK_BYTES,
+        );
+        let mut bytes = [0u8; crate::MAX_PK_BYTES];
+        bytes[..slice.len()].copy_from_slice(slice);
+        PkBuf { bytes, len: slice.len() as u8 }
+    }
+
+    /// Extend the key by `n` bytes, written by `f` into exactly that span.
+    #[inline(always)]
+    pub fn append(&mut self, n: usize, f: impl FnOnce(&mut [u8])) {
+        let at = self.len as usize;
+        f(&mut self.bytes[at..at + n]);
+        self.len = (at + n) as u8;
+    }
+
+    /// Rewrite the key's meaningful bytes in place at its current width,
+    /// returning whatever `f` returns.
+    #[inline(always)]
+    pub fn edit<R>(&mut self, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        f(&mut self.bytes[..self.len as usize])
+    }
+
+    /// Overwrite this key as `width` bytes written by `f`, whose `bool` says
+    /// whether it produced one. A `false` key is well-formed — `width` bytes,
+    /// zero tail — but holds no meaningful value.
+    #[inline(always)]
+    pub fn try_write(&mut self, width: usize, f: impl FnOnce(&mut [u8]) -> bool) -> bool {
+        let wrote = f(&mut self.bytes[..width]);
+        self.set_len(width);
+        wrote
+    }
+
+    /// The key's OPK bytes — the single PK accessor.
+    #[inline(always)]
+    pub fn pk_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+
+    /// Bytes per key — what [`Self::padded`] and [`Self::widened`] widen from.
+    #[inline(always)]
+    pub fn width(&self) -> usize {
+        self.len as usize
+    }
+
+    /// The key zero-padded to `width` bytes — sound because the tail past `len`
+    /// is always zero. Widens an index leading-key span to a full PK stride.
+    #[inline]
+    pub fn padded(&self, width: usize) -> &[u8] {
+        debug_assert!(self.len as usize <= width && width <= crate::MAX_PK_BYTES);
+        &self.bytes[..width]
+    }
+
+    /// Owning [`Self::padded`]: a `len` bump, no copy.
+    #[inline]
+    pub fn widened(mut self, width: usize) -> Self {
+        debug_assert!(self.len as usize <= width && width <= crate::MAX_PK_BYTES);
+        self.len = width as u8;
+        self
+    }
+
+    /// Re-tag as `len` bytes, re-zeroing whatever a wider previous key left past
+    /// it. The one writer of `len`, and private: the public writers above derive
+    /// their width from the span they hand out.
+    #[inline(always)]
+    fn set_len(&mut self, len: usize) {
+        debug_assert!(len <= crate::MAX_PK_BYTES);
+        if (self.len as usize) > len {
+            self.bytes[len..self.len as usize].fill(0);
+        }
+        self.len = len as u8;
     }
 }
 

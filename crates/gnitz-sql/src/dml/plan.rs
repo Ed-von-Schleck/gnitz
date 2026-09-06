@@ -15,7 +15,7 @@ use crate::ast_util::expr_usize_literal;
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_wire_conjuncts;
 use crate::ir::BoundExpr;
-use gnitz_core::{GnitzClient, IndexMeta, PkTuple, Schema, ZSetBatch};
+use gnitz_core::{opk_key_packed, GnitzClient, IndexMeta, PkBuf, Schema, ZSetBatch};
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
 use sqlparser::ast::LimitClause;
 
@@ -118,10 +118,10 @@ impl<'e> AccessPlan<'e> {
     ///
     /// The keys are derived here rather than at plan time: only a DML statement
     /// inside an open transaction asks, and a max-size gather is megabytes of
-    /// `PkTuple`.
-    pub(crate) fn buffered_scope(&self, schema: &Schema) -> (Option<Vec<PkTuple>>, &[&'e BoundExpr]) {
+    /// `PkBuf`.
+    pub(crate) fn buffered_scope(&self, schema: &Schema) -> (Option<Vec<PkBuf>>, &[&'e BoundExpr]) {
         let keys = match &self.access.bound {
-            ReadBound::PkSet(keys) => Some(keys.iter().map(|&k| PkTuple::from_native_packed(schema, k)).collect()),
+            ReadBound::PkSet(keys) => Some(keys.iter().map(|&k| opk_key_packed(schema, k)).collect()),
             ReadBound::PkRange(desc) => pk_point_tuple(desc, schema).map(|k| vec![k]),
             _ => None,
         };

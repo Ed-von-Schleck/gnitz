@@ -39,7 +39,7 @@ fn reply_global(n_aggs: usize) -> SchemaDescriptor {
 /// (pk, weight, grp, Option<val>) → a consolidated source batch.
 fn build(rows: &[(u64, i64, i64, Option<i64>)]) -> Batch {
     let s = src_schema();
-    let mut b = Batch::with_capacity(s, rows.len().max(1));
+    let mut b = Batch::with_capacity(&s, rows.len().max(1));
     for &(pk, w, grp, val) in rows {
         b.extend_pk(pk as u128);
         b.extend_weight(&w.to_le_bytes());

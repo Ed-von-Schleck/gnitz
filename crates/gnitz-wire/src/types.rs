@@ -318,7 +318,11 @@ pub fn cmp_typed_le(a: &[u8], b: &[u8], tc: u8) -> Ordering {
 /// be compared by content before the fixed-width dispatch" — a missed site would
 /// mis-order a BLOB key. In `gnitz-wire` because the client-side comparators are
 /// held to the same order as the engine's.
-#[inline]
+///
+/// `#[inline(always)]` for the reason [`crate::promote_opk_column`] carries it:
+/// this is one payload comparison of a sort, monomorphised into crates that
+/// build at opt-level 0, where a plain hint inlines nothing.
+#[inline(always)]
 pub fn cmp_col_window(a: &[u8], a_blob: &[u8], b: &[u8], b_blob: &[u8], type_code: u8) -> Ordering {
     if is_german_string(type_code) {
         crate::compare_german_strings(a, a_blob, b, b_blob)

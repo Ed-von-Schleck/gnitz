@@ -254,7 +254,7 @@ pub(crate) fn pk_column_to_pylist(py: Python<'_>, schema: &Schema, batch: &ZSetB
         let stride = schema.pk_stride();
         let rows: Vec<_> = (0..batch.pks.len())
             .map(|i| {
-                let native = batch.pks.get_tuple(i).native_le(schema);
+                let native = gnitz_core::native_le_key(schema, &batch.pks.get_tuple(i));
                 pyo3::types::PyBytes::new(py, &native[..stride])
             })
             .collect();

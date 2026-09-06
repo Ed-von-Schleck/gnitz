@@ -21,7 +21,7 @@ fn roundtrips_every_shape() {
         assert_eq!(RangeDescriptor::decode(&bytes), Ok(d), "{eq:?} {start:?} {end:?}");
     }
     // The one literal the module's own doc reasons about, against the 64-byte
-    // `PkTuple` cap the descriptor rides a control-block blob to clear.
+    // `PkBuf` cap the descriptor rides a control-block blob to clear.
     assert_eq!(RangeDescriptor::encoded_len(PK_LIST_MAX_COLS - 1), 82);
 }
 

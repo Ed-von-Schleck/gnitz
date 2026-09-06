@@ -99,7 +99,7 @@ impl PreflightKeyStream {
         frame_schema: &SchemaDescriptor,
         reactor: &crate::runtime::reactor::Reactor,
     ) -> Result<Option<PkBuf>, WorkerFault> {
-        let pk_stride = frame_schema.pk_stride() as usize;
+        let pk_stride = frame_schema.pk_stride();
         loop {
             if self.row < self.count {
                 let key = self.key_at(self.row, pk_stride);

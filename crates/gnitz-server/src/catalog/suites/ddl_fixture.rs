@@ -40,7 +40,7 @@ impl CatalogEngine {
     /// retractions arrive as wire deltas.
     pub(super) fn submit_retraction(&mut self, family: SysFamily, pk: u128) -> Result<(), String> {
         let schema = family.schema();
-        let batch = retract_pk_list(self.sys_store(family), &schema, vec![pk]);
+        let batch = retract_pk_list(self.sys_store(family), schema, vec![pk]);
         if batch.is_empty() {
             return Err("Entity does not exist in catalog".into());
         }
@@ -58,7 +58,7 @@ impl CatalogEngine {
 
         // Write schema record
         let schema = SysFamily::Schema.schema();
-        let mut bb = BatchBuilder::new(schema);
+        let mut bb = BatchBuilder::new(*schema);
         write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id: sid as u64, name }, 1);
         let batch = bb.finish();
 
@@ -106,7 +106,7 @@ impl CatalogEngine {
         // The schema is empty now, so the engine's member-count guard accepts
         // this row.
         let schema = SysFamily::Schema.schema();
-        let mut bb = BatchBuilder::new(schema);
+        let mut bb = BatchBuilder::new(*schema);
         write_schema_tab_row(&mut bb, &SchemaTabRow { schema_id: sid as u64, name }, -1);
         let batch = bb.finish();
 
@@ -147,7 +147,7 @@ impl CatalogEngine {
 
         // Write table record (triggers hook)
         {
-            let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+            let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
             push_table_tab_row(&mut bb, tid, sid, table_name, raw_pk_cols, flags, 1);
             let batch = bb.finish();
             self.submit(SysFamily::Table, batch)?;
@@ -292,7 +292,7 @@ impl CatalogEngine {
         col_defs: &[ColumnDef],
         weight: i64,
     ) -> Batch {
-        let mut bb = BatchBuilder::new(SysFamily::Column.schema());
+        let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
         for (i, cd) in col_defs.iter().enumerate() {
             push_col_tab_row(&mut bb, owner_id, kind, i as i64, cd, weight);
         }
@@ -341,7 +341,7 @@ impl CatalogEngine {
         let col_batch = self.build_col_batch(tid, OWNER_KIND_TABLE, cols, 1);
         self.ddl_sync(SysFamily::Column.id(), col_batch)?;
 
-        let mut bb = BatchBuilder::new(SysFamily::Table.schema());
+        let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
         push_table_tab_row(
             &mut bb,
             tid,

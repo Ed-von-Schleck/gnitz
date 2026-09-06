@@ -25,8 +25,8 @@
 use crate::wal;
 use crate::{
     blob_extent, col_meta_nullable, col_meta_pk_pos, encode_german_string, german_string_content, is_pk_eligible,
-    is_valid_type_code, payload_region_in, read_u64_le, write_u64_le, LEADING_COL_PK, MAX_COLUMNS, MAX_PK_COLUMNS,
-    META_SCHEMA_COLS, REG_NULL_BMP, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD,
+    is_valid_type_code, payload_region_in, read_u64_le, wire_stride, write_u64_le, LEADING_COL_PK, MAX_COLUMNS,
+    MAX_PK_COLUMNS, META_SCHEMA_COLS, REG_NULL_BMP, REG_PK, REG_WEIGHT, SHORT_STRING_THRESHOLD,
 };
 
 const REG_TYPE_CODE: usize = payload_region_in(META_SCHEMA_COLS, "type_code");
@@ -258,6 +258,7 @@ impl<'a> SchemaBlock<'a> {
         let blob = &block[blob_off..blob_off + blob_sz];
         let mut pk_pairs = [(0u8, 0u32); MAX_PK_COLUMNS];
         let mut pk_count = 0usize;
+        let mut pk_stride = 0usize;
 
         for i in 0..count {
             let raw_tc = read_u64_le(block, tc_off + i * 8);
@@ -281,8 +282,7 @@ impl<'a> SchemaBlock<'a> {
             if let Some(pos) = col_meta_pk_pos(fl) {
                 // Rejected here rather than at each side's schema constructor,
                 // whose asserts would abort the process on a nullable/STRING/BLOB
-                // key and which accept float keys the byte-equal key contract
-                // rules out.
+                // key.
                 if col_meta_nullable(fl) {
                     return Err("PK column must be non-nullable");
                 }
@@ -291,6 +291,14 @@ impl<'a> SchemaBlock<'a> {
                 }
                 if pk_count >= max_pk {
                     return Err("too many PK columns");
+                }
+                // Same reason: an over-wide PK region is a release-active
+                // `assert!` in every consumer's schema constructor, and the
+                // column cap bounds it only by the coincidence that
+                // `MAX_PK_BYTES == MAX_PK_COLUMNS * 16`.
+                pk_stride += wire_stride(tc);
+                if pk_stride > crate::MAX_PK_BYTES {
+                    return Err("PK region too wide");
                 }
                 pk_pairs[pk_count] = (pos, i as u32);
                 pk_count += 1;

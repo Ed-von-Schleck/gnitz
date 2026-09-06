@@ -82,14 +82,17 @@ impl AviBake {
     /// Applies the value-index selection to the reduce's *whole* accumulator set
     /// itself, so the ordinal order has one spelling. The index schema is the key
     /// packer's own key columns then [`SUFFIX`], all PK, no payload.
-    pub(crate) fn new(src: &SchemaDescriptor, group_by_cols: &[u32], accs: &[Accumulator]) -> Self {
-        let key_packer = ReindexPacker::new_group_key(src, group_by_cols, &SUFFIX);
+    ///
+    /// `None` for a float group column, which `new_group_key` refuses — the
+    /// index's key bytes are the group key's, so it inherits that rejection.
+    pub(crate) fn new(src: &SchemaDescriptor, group_by_cols: &[u32], accs: &[Accumulator]) -> Option<Self> {
+        let key_packer = ReindexPacker::new_group_key(src, group_by_cols, &SUFFIX)?;
         let mut b = crate::schema::DerivedSchema::new();
         for c in key_packer.key_columns().chain(SUFFIX) {
             b.push_pk(c)
                 .expect("a group key packed inside the SUFFIX reservation, plus SUFFIX, is non-null PK-eligible");
         }
-        AviBake {
+        Some(AviBake {
             schema: b.finish(),
             key_packer,
             aggs: accs
@@ -104,7 +107,7 @@ impl AviBake {
                     })
                 })
                 .collect(),
-        }
+        })
     }
 
     /// Whether any ordinal can take the probe-skip path — the gate on
@@ -191,7 +194,7 @@ impl AviBake {
 /// arrives in — the ingest's consolidation is what sorts it.
 pub(super) fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
     let mb = delta.as_mem_batch();
-    let mut out = Batch::with_capacity(bake.schema, (delta.count * bake.aggs.len()).max(1));
+    let mut out = Batch::with_capacity(&bake.schema, (delta.count * bake.aggs.len()).max(1));
 
     let mut key = [0u8; MAX_PK_BYTES];
     for row in 0..delta.count {

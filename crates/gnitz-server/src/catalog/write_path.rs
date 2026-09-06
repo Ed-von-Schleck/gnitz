@@ -346,8 +346,8 @@ impl CatalogEngine {
                 // tag — which the sign-preserving `map_weights` negation below
                 // leaves in place.
                 let schema = family.schema();
-                undo_create.push((family, batch.ascending_subset(&created, &schema)));
-                undo_drop.push((family, batch.ascending_subset(&dropped, &schema)));
+                undo_create.push((family, batch.ascending_subset(&created, schema)));
+                undo_drop.push((family, batch.ascending_subset(&dropped, schema)));
             }
         }
 

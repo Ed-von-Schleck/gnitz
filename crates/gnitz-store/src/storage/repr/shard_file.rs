@@ -389,7 +389,7 @@ pub(in crate::storage) fn write_test_shard(
         1,
         "write_test_shard fills exactly one payload column"
     );
-    let mut b = super::batch::Batch::with_capacity(*schema, rows.len().max(1));
+    let mut b = super::batch::Batch::with_capacity(schema, rows.len().max(1));
     for (pk, w, v) in rows {
         b.begin_row(pk, *w);
         b.extend_col(0, &v.to_le_bytes());
@@ -518,7 +518,7 @@ fn write_shard_streaming_inner(
     // A store nothing point-probes writes no filter: the build, the file bytes
     // and the open-time checksum are all work for a reader that does not exist.
     let pk_filter = if row_count > 0 && !opts.skip_pk_filter {
-        build_shard_filter_from_pk_region(regions[REG_PK], schema.pk_stride() as usize)
+        build_shard_filter_from_pk_region(regions[REG_PK], schema.pk_stride())
     } else {
         None
     };
