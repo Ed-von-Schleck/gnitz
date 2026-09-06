@@ -1,7 +1,9 @@
-use crate::ast_util::{classify_from, extract_table_name_and_alias, is_bare_wildcard_projection, FromShape};
+use crate::ast_util::{
+    classify_from, col_ref_parts, extract_table_name_and_alias, is_bare_wildcard_projection, FromShape,
+};
 use crate::error::GnitzSqlError;
 use gnitz_core::{CatalogSnapshot, ClientError, ColumnDef, GnitzClient, RelClass, RelDescriptor, Schema};
-use sqlparser::ast::{Expr, Ident, Select, SelectItem, TableAliasColumnDef};
+use sqlparser::ast::{Ident, Select, SelectItem, TableAliasColumnDef};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -258,10 +260,10 @@ pub(crate) fn cte_passthrough(
     binder: &mut Binder<'_>,
 ) -> Result<Option<Resolved>, GnitzSqlError> {
     // A single plain table/view FROM, no joins, no derived table.
-    if !matches!(classify_from(&cte_select.from), FromShape::SinglePlainRelation) {
+    let FromShape::SinglePlainRelation(factor) = classify_from(&cte_select.from) else {
         return Ok(None);
-    }
-    let (cte_table_name, cte_alias) = extract_table_name_and_alias(&cte_select.from[0].relation, "CTE")?;
+    };
+    let (cte_table_name, cte_alias) = extract_table_name_and_alias(factor, "CTE")?;
     let (cte_tid, cte_schema, cte_kind) = binder.resolve(cat, &cte_table_name)?;
     // Positional identity projection: a *bare* `*`, or one identifier per source
     // column in order. A qualified identifier (`SELECT t.a FROM t`) is the same
@@ -271,11 +273,17 @@ pub(crate) fn cte_passthrough(
         || (cte_select.projection.len() == cte_schema.columns.len()
             && cte_select.projection.iter().enumerate().all(|(i, item)| {
                 let want = &cte_schema.columns[i].name;
+                // Not `projection_item_expr`: that also yields an aliased item's
+                // expression, so `SELECT a AS b` would take the fast path and the
+                // rename would be dropped.
                 match item {
-                    SelectItem::UnnamedExpr(Expr::Identifier(id)) => id.value.eq_ignore_ascii_case(want),
-                    SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 2 => {
-                        parts[0].value.eq_ignore_ascii_case(&cte_alias) && parts[1].value.eq_ignore_ascii_case(want)
-                    }
+                    SelectItem::UnnamedExpr(e) => match col_ref_parts(e) {
+                        Some((None, name)) => name.eq_ignore_ascii_case(want),
+                        Some((Some(qual), name)) => {
+                            qual.eq_ignore_ascii_case(&cte_alias) && name.eq_ignore_ascii_case(want)
+                        }
+                        None => false,
+                    },
                     _ => false,
                 }
             }));

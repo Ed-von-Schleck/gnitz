@@ -421,8 +421,13 @@ class TestSetOps:
             #  hidden segment the set op re-hashes — so it is no longer a dropped clause.)
             rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t GROUP BY a", "GROUP BY is not supported")
             rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t HAVING a > 0", "HAVING is not supported")
-            # HAVING on a non-grouped (simple) view: no reduce, the predicate never runs.
-            rejects("CREATE VIEW v AS SELECT a FROM t HAVING a > 0", "HAVING is not supported")
+            # A HAVING *without* DISTINCT is not a dropped clause: it groups the
+            # whole relation, so the body binds as a global aggregate and `a` — a
+            # column that is neither a group key nor an aggregate — is what fails.
+            rejects(
+                "CREATE VIEW v AS SELECT a FROM t HAVING a > 0",
+                "column 'a' must appear in GROUP BY or an aggregate function",
+            )
 
             # --- PREWHERE (dropped filter) and TOP (dropped limit), across shapes ---
             rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t PREWHERE a > 5", "PREWHERE is not supported")

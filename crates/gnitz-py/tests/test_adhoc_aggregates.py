@@ -212,6 +212,13 @@ def test_having_parity(client):
         _parity(client, sn, "SELECT category, MIN(note) AS mn FROM orders GROUP BY category HAVING MIN(note) > 10")
         # Global HAVING (grounds then filters).
         _parity(client, sn, "SELECT COUNT(*) AS c FROM orders HAVING COUNT(*) > 0")
+        # A HAVING with no GROUP BY groups the whole relation even when the
+        # projection carries no aggregate — and with no aggregate written at all
+        # the reduce is `Reduce([], [])`, which the two surfaces reach by
+        # different mechanisms (the ad-hoc fold emits no cardinality COUNT and
+        # grounds client-side; the view path mints one).
+        _parity(client, sn, "SELECT 1 AS one FROM orders HAVING SUM(amount) > 1")
+        _parity(client, sn, "SELECT 1 AS one FROM orders HAVING 1 = 1")
     finally:
         _cleanup(client, sn, "orders")
 

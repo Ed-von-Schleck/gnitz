@@ -274,10 +274,7 @@ impl SubqueryRef {
     pub(crate) fn never_null(&self) -> bool {
         match self.kind {
             SubqueryKind::Exists { .. } => true,
-            SubqueryKind::Scalar => matches!(
-                self.scalar_agg().map(|a| a.func),
-                Ok(AggFunc::Count | AggFunc::CountNonNull)
-            ),
+            SubqueryKind::Scalar => matches!(self.scalar_agg().map(|a| a.func), Ok(AggFunc::Count)),
         }
     }
 

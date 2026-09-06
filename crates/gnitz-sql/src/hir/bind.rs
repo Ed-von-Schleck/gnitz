@@ -12,10 +12,10 @@ use super::{
 };
 use crate::agg::default_agg_name;
 use crate::ast_util::{
-    aliased_def, body_is_grouped, classify_agg_call, classify_from, expand_wildcard_item, extract_table_name_and_alias,
-    for_each_agg_call, group_by_exprs, group_by_target, has_exists_in_subquery, has_scalar_subquery, is_agg_call,
-    peel_nested, projection_item_expr, scalar_projection_item, select_has_window, single_relation_col_name,
-    wildcard_name_is_visible, window_spec_keys, FromShape,
+    aliased_def, body_is_grouped, classify_agg_call, classify_from, col_ref_parts, expand_wildcard_item,
+    extract_table_name_and_alias, for_each_agg_call, group_by_exprs, group_by_target, has_exists_in_subquery,
+    has_scalar_subquery, has_visible_column, is_agg_call, peel_nested, projection_item_expr, scalar_projection_item,
+    select_has_window, window_spec_keys, FromShape,
 };
 use crate::bind::apply_positional_aliases;
 use crate::bind::{bind_conjuncts, bind_structural, find_unique_column, single_relation_col_idx, Binder, LeafBinder};
@@ -335,7 +335,7 @@ fn bind_body_suffix(
 /// skipping hidden and merged columns) into pass-through `ProjEntry`s — the one
 /// wildcard expansion, shared by the linear and join projections.
 fn expand_wildcard(
-    item: &SelectItem,
+    o: &sqlparser::ast::WildcardAdditionalOptions,
     cols: &[HirCol],
     ctx: &str,
     ids: &ColIdGen,
@@ -343,7 +343,7 @@ fn expand_wildcard(
     // Merged columns are dropped before the expansion rather than inside it, so
     // the indices it returns address this list.
     let cols: Vec<&HirCol> = cols.iter().filter(|c| !c.merged).collect();
-    Ok(expand_wildcard_item(item, cols.iter().map(|c| &c.def), ctx)?
+    Ok(expand_wildcard_item(o, cols.iter().map(|c| &c.def), ctx)?
         .into_iter()
         .map(|(i, def)| ProjEntry {
             expr: BExpr::ColRef(HirRef::Col(cols[i].id)),
@@ -392,10 +392,13 @@ pub(crate) fn bind_projection<L: ItemLeaf>(
     let mut items = Vec::new();
     for (idx, item) in projection.iter().enumerate() {
         // Only a *bare* `*` expands: a `tbl.*` QualifiedWildcard is not a
-        // single-table projection item, so it falls to the `_` reject arm.
-        if matches!(item, SelectItem::Wildcard(_)) && leaf.expands_wildcard() {
-            items.extend(expand_wildcard(item, leaf.env(), ctx, ids)?);
-            continue;
+        // single-table projection item, so it falls to `scalar_projection_item`,
+        // which names it.
+        if let SelectItem::Wildcard(o) = item {
+            if leaf.expands_wildcard() {
+                items.extend(expand_wildcard(o, leaf.env(), ctx, ids)?);
+                continue;
+            }
         }
         let (expr, alias) = scalar_projection_item(item, ctx)?;
         if let Expr::Function(f) = peel_nested(expr) {
@@ -492,15 +495,11 @@ impl ItemLeaf for ScopeLeaf<'_> {
 
 impl LeafBinder<HirRef> for ScopeLeaf<'_> {
     /// A qualified / unqualified / parenthesized column reference → its `ColId`.
-    /// Peels like `single_relation_col_name`, which it cannot reuse: a qualified
-    /// reference needs both of its parts.
     fn bind_column(&self, e: &Expr) -> Result<HirExpr, GnitzSqlError> {
-        let id = match peel_nested(e) {
-            Expr::Identifier(id) => self.scope.resolve_unqualified(&id.value)?,
-            Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-                self.scope.resolve_qualified(&parts[0].value, &parts[1].value)?
-            }
-            _ => {
+        let id = match col_ref_parts(e) {
+            Some((None, name)) => self.scope.resolve_unqualified(name)?,
+            Some((Some(qual), name)) => self.scope.resolve_qualified(qual, name)?,
+            None => {
                 return Err(GnitzSqlError::Unsupported(format!(
                     "{}: only column references supported",
                     self.clause
@@ -614,12 +613,12 @@ fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_, '_>, subquery: &'e Query) -> Result
     let ctx = "subquery";
     let inner_select = as_plain_select(reject_query_envelope_body(subquery, ctx)?, ctx)?;
     reject_unhonored_select_clauses(inner_select, HonoredClauses::PLAIN, ctx)?;
-    if !matches!(classify_from(&inner_select.from), FromShape::SinglePlainRelation) {
+    let FromShape::SinglePlainRelation(factor) = classify_from(&inner_select.from) else {
         return Err(GnitzSqlError::Unsupported(
             "EXISTS/IN subquery: only a single FROM table without JOINs is supported; compose via views".into(),
         ));
-    }
-    let (inner_name, inner_alias) = extract_table_name_and_alias(&inner_select.from[0].relation, "subquery")?;
+    };
+    let (inner_name, inner_alias) = extract_table_name_and_alias(factor, "subquery")?;
     if outer_alias.eq_ignore_ascii_case(&inner_alias) {
         return Err(GnitzSqlError::Bind(format!(
             "relation alias '{outer_alias}' is used by both the view FROM and its subquery; rename one"
@@ -1097,7 +1096,7 @@ impl JoinScope {
             // A NAME, once. Two like-named visible left columns are one name to
             // pair on, and `merge_pairs` is what reports it as ambiguous; listing
             // it twice would pair and merge the same column twice.
-            if wildcard_name_is_visible(rcols.iter().map(|r| &r.def), &c.def.name)
+            if has_visible_column(rcols.iter().map(|r| &r.def), &c.def.name)
                 && !names.iter().any(|n| n.eq_ignore_ascii_case(&c.def.name))
             {
                 names.push(c.def.name.clone());
@@ -1270,9 +1269,7 @@ fn resolve_group_cols(
 }
 
 /// Collect the aggregate calls referenced in an expression, appending each not
-/// already present (deduped by `(func, arg)`). Recurses through non-aggregate
-/// operands, mirroring the binder's node set — what this walk reaches is exactly
-/// what the reduce materializes.
+/// already present (deduped by `(func, arg)`).
 fn collect_aggs(
     expr: &Expr,
     leaf: &ScopeLeaf<'_>,
@@ -1521,7 +1518,7 @@ impl LeafBinder<HirRef> for GroupedLeaf<'_> {
         let bound = bind_structural(e, self.leaf).map_err(|err| clause_error(self.clause, err))?;
         match find_bound(self.extra, &bound).filter(|id| self.group_cols.contains(id)) {
             Some(id) => Ok(BExpr::ColRef(HirRef::Col(id))),
-            None => Err(match single_relation_col_name(e) {
+            None => Err(match col_ref_parts(e).map(|(_, n)| n) {
                 Some(name) => GnitzSqlError::Plan(format!(
                     "{}: column '{name}' must appear in GROUP BY or an aggregate function",
                     self.clause

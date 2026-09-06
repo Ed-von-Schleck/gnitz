@@ -2,7 +2,7 @@
 //! name the offending column — plus the shared projection-schema rules and the
 //! clause guards.
 //!
-//! **The guard contract**, which `ast_util::reject_unsupported_fn_qualifiers`
+//! **The guard contract**, which `ast_util::reject_fn_qualifiers`
 //! also carries: destructure the node without `..`, classifying every field
 //! consumed / inert / rejected, so an upstream field addition is E0027 rather
 //! than a clause silently dropped; then a table of `reject_if` calls
@@ -535,7 +535,8 @@ pub(crate) fn reject_unhonored_insert_clauses(insert: &sqlparser::ast::Insert) -
 pub(crate) fn reject_unhonored_update_clauses(update: &sqlparser::ast::Update) -> Result<(), GnitzSqlError> {
     const CTX: &str = "UPDATE";
     let sqlparser::ast::Update {
-        // Consumed by `execute_update`.
+        // Consumed by `execute_update` — `table` whole: it classifies the FROM
+        // shape, so a join written there is rejected rather than dropped.
         table: _,
         assignments: _,
         selection: _,

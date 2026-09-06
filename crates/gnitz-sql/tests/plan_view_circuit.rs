@@ -319,3 +319,61 @@ fn indexed_predicates_bound_the_backfill_scan() {
         assert_eq!(bounds, want, "`{body}`");
     }
 }
+
+/// A HAVING with no GROUP BY and no aggregate is still a grouped body: it filters
+/// the one whole-relation group, `Reduce([], [])`. The two surfaces reach that
+/// shape by different mechanisms, so one query pins both.
+#[test]
+fn a_having_without_a_group_by_is_the_whole_relation_group_on_both_surfaces() {
+    let cat = base();
+    const BODY: &str = "SELECT 1 AS one FROM t HAVING 1 = 1";
+
+    // Ad-hoc: the fold sink, over no group columns and no aggregate.
+    assert_eq!(
+        gnitz_sql::explain_lines(&read(&cat, &format!("EXPLAIN {BODY}")).unwrap())[3],
+        "fold: global aggregate: ; HAVING applied client-side"
+    );
+
+    // View: every reduce groups on nothing, one seeds the ground row, and the
+    // only aggregates are the cardinality COUNT and the SUM_ZERO its combine
+    // folds that COUNT with — no user aggregate.
+    let chain = view(&cat, BODY);
+    let reduces: Vec<(Vec<u32>, Vec<gnitz_wire::AggFunc>, bool)> = chain
+        .views
+        .iter()
+        .flat_map(|pv| pv.circuit.nodes.values())
+        .filter_map(|op| match op {
+            OpNode::Reduce { group_cols, agg, global_ground, .. } => Some((
+                group_cols.as_slice().to_vec(),
+                agg.iter().map(|d| d.agg_op).collect(),
+                *global_ground,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert!(!reduces.is_empty(), "the view body compiles to a reduce");
+    for (group_cols, ops, _) in &reduces {
+        assert!(group_cols.is_empty(), "{reduces:?}");
+        for op in ops {
+            assert!(
+                matches!(op, gnitz_wire::AggFunc::Count | gnitz_wire::AggFunc::SumZero),
+                "{reduces:?}"
+            );
+        }
+    }
+    assert_eq!(
+        reduces.iter().filter(|(_, _, ground)| *ground).count(),
+        1,
+        "{reduces:?}"
+    );
+
+    // And the output columns agree with the ad-hoc reply.
+    assert_eq!(
+        output_shape(&chain)
+            .into_iter()
+            .filter(|(_, hidden, _)| !hidden)
+            .map(|(n, _, _)| n)
+            .collect::<Vec<_>>(),
+        ["one"]
+    );
+}

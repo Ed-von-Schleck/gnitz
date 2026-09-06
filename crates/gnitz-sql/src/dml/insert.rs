@@ -354,8 +354,6 @@ fn bind_do_update_assignments(
     let mut seen: Vec<usize> = Vec::with_capacity(raw.len());
     for assignment in raw {
         let col_idx = resolve_set_target(assignment, schema, &mut seen, "ON CONFLICT DO UPDATE SET")?;
-        // Recognize EXCLUDED.col as a special form. sqlparser parses it
-        // as a CompoundIdentifier: `EXCLUDED`.`col`.
         let value = bind_do_update_rhs(&assignment.value, col_idx, schema, alias)?;
         out.push((col_idx, value));
     }
@@ -368,20 +366,16 @@ fn bind_do_update_rhs(
     schema: &Schema,
     alias: &str,
 ) -> Result<BoundUpdateExpr, GnitzSqlError> {
-    // `EXCLUDED.col` — sqlparser produces `CompoundIdentifier`.
-    if let Expr::CompoundIdentifier(parts) = expr {
-        if parts.len() == 2 && parts[0].value.eq_ignore_ascii_case("EXCLUDED") {
-            let col_name = parts[1].value.as_str();
-            let col_idx = find_unique_column(&schema.columns, col_name)?
-                .ok_or_else(|| GnitzSqlError::Bind(format!("EXCLUDED.{col_name}: column not found")))?;
-            // Through the same classifier as a bare RHS, so `SET s = EXCLUDED.s`
-            // on a string column is a `StrCol` rather than an integer compile.
-            return Ok(BoundUpdateExpr::Excluded(classify_set_rhs(
-                &BoundExpr::ColRef(col_idx),
-                target,
-                schema,
-            )?));
-        }
+    if let Some(col_name) = excluded_col(expr) {
+        let col_idx = find_unique_column(&schema.columns, col_name)?
+            .ok_or_else(|| GnitzSqlError::Bind(format!("EXCLUDED.{col_name}: column not found")))?;
+        // Through the same classifier as a bare RHS, so `SET s = EXCLUDED.s`
+        // on a string column is a `StrCol` rather than an integer compile.
+        return Ok(BoundUpdateExpr::Excluded(classify_set_rhs(
+            &BoundExpr::ColRef(col_idx),
+            target,
+            schema,
+        )?));
     }
     // `col + EXCLUDED.col`. The binder already rejects it (`EXCLUDED` names no
     // relation in scope); this says why, which its message cannot.
@@ -399,19 +393,23 @@ fn bind_do_update_rhs(
     )?))
 }
 
-/// Returns true if `expr` contains any `EXCLUDED.<col>` compound identifier —
-/// walking the shared `expr_operands` node set (CASE, BETWEEN, IN lists,
-/// function arguments included), so a reference the binder would reach cannot
-/// hide from this guard and silently bind to the *existing* row's column.
-fn expr_contains_excluded(expr: &Expr) -> bool {
-    match expr {
-        Expr::CompoundIdentifier(parts) => parts.len() == 2 && parts[0].value.eq_ignore_ascii_case("EXCLUDED"),
-        // An unrecognised node answers `true`, so an EXCLUDED reference the
-        // binder would reach can never hide from the guard.
-        _ => crate::ast_util::expr_operands(expr)
-            .into_iter()
-            .any(expr_contains_excluded),
+/// The column an `EXCLUDED.<col>` reference names. Deliberately unpeeled: the
+/// binder resolves `(EXCLUDED.a)` as an ordinary reference, so accepting the
+/// parenthesized form here would bind it to the *existing* row's column.
+fn excluded_col(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::CompoundIdentifier(p) if p.len() == 2 && p[0].value.eq_ignore_ascii_case("EXCLUDED") => {
+            Some(p[1].value.as_str())
+        }
+        _ => None,
     }
+}
+
+/// True when `expr` references `EXCLUDED.<col>` anywhere the binder would reach.
+/// Recognized by [`excluded_col`], the same rule the accept path takes, so the
+/// guard cannot miss a form that path would have bound.
+fn expr_contains_excluded(expr: &Expr) -> bool {
+    crate::ast_util::expr_any(expr, &|e| excluded_col(e).is_some())
 }
 
 /// Drop incoming rows whose PK already exists. Returns the filtered ZSetBatch

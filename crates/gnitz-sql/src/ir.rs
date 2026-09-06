@@ -9,7 +9,6 @@ pub(crate) use gnitz_wire::TrimMode;
 #[derive(Clone, Debug, Copy, PartialEq)]
 pub(crate) enum AggFunc {
     Count,
-    CountNonNull,
     Sum,
     Min,
     Max,

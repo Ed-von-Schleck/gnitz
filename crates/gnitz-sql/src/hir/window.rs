@@ -41,7 +41,9 @@
 use super::bind::{bind_projection, hir_ref_nullable, type_of, ItemLeaf};
 use super::{as_col, col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, JoinType, ProjEntry, RelExpr};
 use crate::agg::default_agg_name;
-use crate::ast_util::{classify_agg_shape, peel_nested, reject_window_fn_qualifiers, single_fn_name, unknown_function};
+use crate::ast_util::{
+    agg_func_from_name, classify_agg_shape, peel_nested, reject_fn_qualifiers, single_fn_name, unknown_function,
+};
 use crate::bind::{bind_structural, LeafBinder};
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr, BinOp};
@@ -343,7 +345,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
         let arg_def = arg.map(|e| ColumnDef::new("_arg", e.infer_type_with(&|r| self.type_of(r)), !self.never_null(e)));
         let typed = HirAgg::with_arg_def(self.ids, agg, None, arg_def.as_ref(), false)?;
         let nullable = match agg {
-            AggFunc::Count | AggFunc::CountNonNull => false,
+            AggFunc::Count => false,
             _ => arg_def.is_some_and(|d| d.is_nullable),
         };
         Ok((typed.view_type(), nullable))
@@ -439,7 +441,7 @@ impl<L: ItemLeaf> ItemLeaf for WindowLeaf<'_, L> {
 /// whether it was written as `ROW_NUMBER` — which is `RANK` plus the row-key
 /// tiebreak the caller appends, so it has no [`WinFunc`] of its own.
 fn classify_window_call(f: &Function) -> Result<(WinFunc, Option<&Expr>, bool), GnitzSqlError> {
-    reject_window_fn_qualifiers(f, "window functions")?;
+    reject_fn_qualifiers(f, "window functions")?;
     let name = single_fn_name(f).ok_or_else(|| unknown_function(f))?;
     let ranking = match name.to_ascii_lowercase().as_str() {
         "rank" => Some((WinFunc::Rank, false)),
@@ -448,6 +450,15 @@ fn classify_window_call(f: &Function) -> Result<(WinFunc, Option<&Expr>, bool), 
         _ => None,
     };
     let Some((func, row_number)) = ranking else {
+        // `bind_structural` routes every windowed call here, scalar names
+        // included, so `classify_agg_shape`'s "function not supported" would be
+        // false for `ABS(x) OVER (…)` — ABS is supported, just not windowed.
+        if agg_func_from_name(name).is_none() {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "{}: not supported as a window function",
+                name.to_ascii_uppercase()
+            )));
+        }
         let (agg, arg) = classify_agg_shape(f)?;
         return Ok((WinFunc::Agg(agg), arg, false));
     };
@@ -893,7 +904,7 @@ fn cumulative(ids: &ColIdGen, w: &WRel, spec: &Spec<ColId>, calls: &[&Call<ColId
                 let x = arg.expect("AVG has an argument");
                 vec![
                     g_aggs.slot(AggFunc::Sum, Some(x))?,
-                    g_aggs.slot(AggFunc::CountNonNull, Some(x))?,
+                    g_aggs.slot(AggFunc::Count, Some(x))?,
                 ]
             }
             WinFunc::Agg(func) => vec![g_aggs.slot(func, arg)?],

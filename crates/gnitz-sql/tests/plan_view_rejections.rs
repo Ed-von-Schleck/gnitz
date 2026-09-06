@@ -248,6 +248,9 @@ fn grouped_body_rules() {
     for body in [
         "SELECT g, COUNT(*) AS cnt FROM t GROUP BY g HAVING SUM(v) > 0",
         "SELECT id, COUNT(*) FROM t GROUP BY id HAVING COUNT(*) > 0",
+        // A HAVING with no GROUP BY groups the whole relation, so an item that
+        // is not a group key or an aggregate is what fails — not the clause.
+        "SELECT 1 AS one FROM t HAVING SUM(v) > 1",
         "SELECT a + 1 AS x FROM m GROUP BY a",
         "SELECT s, COUNT(*) AS n FROM ty GROUP BY s",
     ] {
@@ -275,6 +278,11 @@ fn grouped_body_rules() {
                 "SELECT id, MIN(uid) AS x FROM ty GROUP BY id",
                 "Unsupported",
                 "MIN: not supported on",
+            ),
+            (
+                "SELECT g FROM t HAVING SUM(v) > 1",
+                "Plan",
+                "column 'g' must appear in GROUP BY or an aggregate function",
             ),
             (
                 "SELECT id, COUNT(*) AS c FROM ty GROUP BY id HAVING SUM(big) > 0",

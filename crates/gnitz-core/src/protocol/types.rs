@@ -248,11 +248,10 @@ impl Schema {
         (0..self.columns.len()).any(|i| self.is_hidden_payload(i))
     }
 
-    /// Whether column `i` is a hidden **payload** column — one a wildcard drops.
-    /// A hidden PK column is not dropped: it carries the batch's key, and removing
-    /// it would strip the row of its identity. One home for that distinction, so
-    /// the passthrough decision (`has_hidden_payload`) and the projection that
-    /// implements it cannot disagree.
+    /// Whether column `i` is a hidden **payload** column. A wildcard *expansion*
+    /// drops every hidden column, PK included; the raw passthrough this gates
+    /// keeps a hidden PK column, which carries the batch's key. So the two agree
+    /// on every payload slot, and differ only there.
     #[inline]
     pub fn is_hidden_payload(&self, i: usize) -> bool {
         self.columns[i].is_hidden && !self.is_pk_col(i)

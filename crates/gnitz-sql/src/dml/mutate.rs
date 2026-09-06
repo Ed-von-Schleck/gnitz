@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::ast_util::{extract_name, extract_table_name_and_alias};
+use crate::ast_util::{classify_from, extract_name, extract_table_name_and_alias, FromShape};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_column_value, check_not_null, set_target_admits, ColumnValue};
 use crate::codec::pk_codec::{bound_num_literal, pack_pk_value, NumLit};
@@ -369,7 +369,14 @@ pub(crate) fn execute_update(
     reject_unhonored_update_clauses(update)?;
     let (table, assignments_raw, selection) = (&update.table, &update.assignments, &update.selection);
 
-    let (table_name, table_alias) = extract_table_name_and_alias(&table.relation, "UPDATE")?;
+    // `Update.table` is a `TableWithJoins`: `UPDATE a JOIN b ON … SET v = 1`
+    // parses, and honoring only `.relation` would update every row of `a`.
+    let FromShape::SinglePlainRelation(factor) = classify_from(std::slice::from_ref(table)) else {
+        return Err(GnitzSqlError::Unsupported(
+            "UPDATE: exactly one simple FROM table required".to_string(),
+        ));
+    };
+    let (table_name, table_alias) = extract_table_name_and_alias(factor, "UPDATE")?;
 
     let target = binder.resolve_base_table(client, &table_name)?;
     let (table_id, schema) = (target.tid, &target.schema);
@@ -434,12 +441,12 @@ pub(crate) fn execute_delete(
     let tables = match &del.from {
         FromTable::WithFromKeyword(ts) | FromTable::WithoutKeyword(ts) => ts,
     };
-    if tables.len() != 1 || !tables[0].joins.is_empty() {
+    let FromShape::SinglePlainRelation(factor) = classify_from(tables) else {
         return Err(GnitzSqlError::Unsupported(
             "DELETE: exactly one simple FROM table required".to_string(),
         ));
-    }
-    let (table_name, table_alias) = extract_table_name_and_alias(&tables[0].relation, "DELETE")?;
+    };
+    let (table_name, table_alias) = extract_table_name_and_alias(factor, "DELETE")?;
 
     let target = binder.resolve_base_table(client, &table_name)?;
     let (table_id, schema) = (target.tid, &target.schema);

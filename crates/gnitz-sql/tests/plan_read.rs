@@ -473,6 +473,12 @@ fn a_parenthesized_column_reference_reads_like_a_bare_one() {
             "SELECT (g), COUNT(*) AS n FROM t GROUP BY (g)",
             "SELECT g, COUNT(*) AS n FROM t GROUP BY g",
         ),
+        // The CTE pass-through predicate peels too, so a parenthesized identity
+        // body is inlined rather than derived (which the read path rejects).
+        (
+            "WITH c AS (SELECT (id), (g), (v) FROM t) SELECT id FROM c",
+            "WITH c AS (SELECT id, g, v FROM t) SELECT id FROM c",
+        ),
     ] {
         let p = read(&cat, parens).unwrap_or_else(|e| panic!("`{parens}`: {e:?}"));
         let b = read(&cat, bare).unwrap();
@@ -547,6 +553,9 @@ fn a_read_the_planner_rejects_names_its_rule() {
         ("SELECT *, * FROM t WHERE v > 0", "Plan", "duplicate column name"),
         ("SELECT DISTINCT *, * FROM t", "Plan", "duplicate column name"),
         ("SELECT t.*, t.* FROM t", "Unsupported", "SELECT item"),
+        // `AS d(x, y)` renames the columns positionally; honoring only the
+        // relation alias would answer under `t`'s own column names.
+        ("SELECT * FROM t AS d(x, y)", "Unsupported", "positional column aliases"),
         ("SELECT id FROM jv", "Bind", "is ambiguous"),
         ("SELECT * FROM jv WHERE id = 5", "Bind", "is ambiguous"),
         ("SELECT _join_pk FROM jv", "Bind", "not found"),

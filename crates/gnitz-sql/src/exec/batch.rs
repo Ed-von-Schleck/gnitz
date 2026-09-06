@@ -41,11 +41,9 @@ impl RowGather {
 /// result.
 pub(crate) type Projection = Option<(Schema, Vec<usize>)>;
 
-/// Resolve `projection` against `schema`. This is the whole fallible half of
-/// projecting — it never looks at a batch — so a caller that must not act on an
-/// invalid projection (INSERT ... RETURNING, which writes in between; the
-/// ordering sink, which sorts in between) can resolve first and [`project`]
-/// after, with no batch copy.
+/// Resolve `projection` against `schema` — the whole fallible half of projecting,
+/// so `INSERT … RETURNING` resolves before it writes and [`project`]s after,
+/// never committing a row for a projection that then fails.
 pub(crate) fn resolve_projection(
     projection: &[SelectItem],
     schema: &Schema,
@@ -66,8 +64,8 @@ pub(crate) fn resolve_projection(
     let mut out_defs: Vec<gnitz_core::ColumnDef> = Vec::new();
     for item in projection {
         match item {
-            SelectItem::Wildcard(_) => {
-                for (i, def) in expand_wildcard_item(item, &schema.columns, "SELECT")? {
+            SelectItem::Wildcard(o) => {
+                for (i, def) in expand_wildcard_item(o, &schema.columns, "SELECT")? {
                     col_indices.push(i);
                     out_defs.push(def);
                 }

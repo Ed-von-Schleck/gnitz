@@ -174,10 +174,9 @@ fn projection_line(visible: usize, extra: usize) -> String {
     }
 }
 
-/// What the worker folds. The aggregate list is the PHYSICAL one — the reduce
-/// items the worker accumulates — which is why an AVG shows as its SUM +
-/// COUNT_NON_NULL pair. `ast_util::agg_func_name` gives the SQL spelling instead
-/// (it renders `CountNonNull` as `count`), so it is deliberately not used here.
+/// What the worker folds: the PHYSICAL aggregate list, which is why an AVG shows
+/// as its SUM + COUNT_NON_NULL pair and why the match below is over the *wire*
+/// enum — the one carrying `SumZero` and no `Avg`.
 fn fold_line(shape: &FoldShape, is_distinct: bool) -> String {
     // Named against the reduce input, not the source: with a pre-map the reduce
     // groups and aggregates columns the source does not have, and the hidden

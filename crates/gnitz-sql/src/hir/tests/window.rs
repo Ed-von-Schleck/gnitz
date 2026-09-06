@@ -254,7 +254,17 @@ fn frames_and_functions_outside_the_supported_set_are_rejected() {
     );
     rejects(
         "SELECT id, LAG(a) OVER (ORDER BY a) FROM t",
-        "function 'lag' not supported",
+        "LAG: not supported as a window function",
+    );
+    // A scalar name with an OVER reads the same at an item's top level, which
+    // `call_item` routes, as nested, which `bind_structural` routes.
+    rejects(
+        "SELECT id, ABS(a) OVER (ORDER BY a) FROM t",
+        "ABS: not supported as a window function",
+    );
+    rejects(
+        "SELECT id, ABS(a) OVER (ORDER BY a) + 1 AS x FROM t",
+        "ABS: not supported as a window function",
     );
     rejects(
         "SELECT id, SUM(DISTINCT a) OVER () FROM t",

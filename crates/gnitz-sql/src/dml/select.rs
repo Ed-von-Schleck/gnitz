@@ -163,7 +163,7 @@ fn route_select<'q>(
         // view genuinely serves it (as a hidden segment) — so does any
         // non-pass-through body `cte_passthrough` refuses (a joined / derived
         // FROM, a non-identity projection): the derivation advice is true here.
-        if cte_select.selection.is_some() || cte_select.having.is_some() || body_is_grouped(cte_select) {
+        if cte_select.selection.is_some() || body_is_grouped(cte_select) {
             return reject_derivation("non-pass-through CTE");
         }
         match cte_passthrough(cat, cte_select, &cte.alias.columns, binder)? {
@@ -175,7 +175,7 @@ fn route_select<'q>(
     // Step 3 — FROM shape. Zero FROM is a plain `Unsupported`; every other
     // multi-relation or derived shape derives a new relation, which is what a
     // view is for — one template for all of them.
-    match classify_from(&select.from) {
+    let from_factor = match classify_from(&select.from) {
         FromShape::Empty => {
             return Err(GnitzSqlError::Unsupported(
                 "direct SELECT without FROM is not supported".to_string(),
@@ -184,8 +184,8 @@ fn route_select<'q>(
         FromShape::Join => return reject_derivation("JOIN"),
         FromShape::CommaJoin => return reject_derivation("comma-join FROM"),
         FromShape::DerivedTable => return reject_derivation("derived table in FROM"),
-        FromShape::SinglePlainRelation => {}
-    }
+        FromShape::SinglePlainRelation(f) => f,
+    };
 
     // Step 4 — subquery walk over the selection and projection. A single-relation
     // subquery is detected by no earlier step; without this an EXISTS/IN in the
@@ -202,13 +202,11 @@ fn route_select<'q>(
 
     let limit = extract_limit(query)?;
     let offset = extract_offset(query)?;
-    // Step 3 established that `from[0]` is a plain table/view, so this only
-    // rejects an exotic table qualifier (a table function, AS OF, …).
-    let (table_name, table_alias) = extract_table_name_and_alias(&select.from[0].relation, "FROM")?;
+    let (table_name, table_alias) = extract_table_name_and_alias(from_factor, "FROM")?;
 
     // Step 5 — aggregate / DISTINCT shapes fold via the fold sink. DISTINCT takes
     // precedence over GROUP BY (its arm rejects GROUP BY), matching the view path.
-    if select.distinct.is_some() || select.having.is_some() || body_is_grouped(select) {
+    if select.distinct.is_some() || body_is_grouped(select) {
         let is_distinct = select.distinct.is_some();
         // The routing split sits above the shared clause gate, so invoke it here —
         // `grouping`/`distinct` per query. DISTINCT's arm sets `grouping:false`, so a

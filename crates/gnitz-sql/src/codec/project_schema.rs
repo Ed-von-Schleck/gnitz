@@ -176,13 +176,10 @@ pub(crate) fn build_read_projection(
     let mut out_cols: Vec<ColumnDef> = Vec::new();
 
     for (idx, item) in projection.iter().enumerate() {
-        if matches!(item, SelectItem::Wildcard(_)) {
-            // Hidden key slots are excluded — a `SELECT *` over a view whose key is
-            // synthetic (`_join_pk`, …) must not re-admit that column into the
-            // result. A hidden *source PK* is not lost: it is re-prepended (staying
-            // hidden) below. `EXCEPT`/`EXCLUDE`/`RENAME` rewrite the output column
-            // list per column; `REPLACE`/`ILIKE` are rejected by `for_item`.
-            for (i, out) in expand_wildcard_item(item, &source_schema.columns, "SELECT")? {
+        if let SelectItem::Wildcard(o) = item {
+            // The expansion drops hidden key slots (`_join_pk`, …); a hidden
+            // *source PK* is not lost, being re-prepended (still hidden) below.
+            for (i, out) in expand_wildcard_item(o, &source_schema.columns, "SELECT")? {
                 items.push(ProjItem::PassThrough { src_col: i });
                 out_cols.push(out);
             }

@@ -433,7 +433,7 @@ pub(crate) fn agg_typing(agg_func: AggFunc, arg: Option<&ColumnDef>) -> Result<A
     if let Some(c) = arg {
         let needs_value = match agg_func {
             AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => true,
-            AggFunc::Count | AggFunc::CountNonNull => false,
+            AggFunc::Count => false,
         };
         if needs_value && !has_scalar_register(c.type_code) {
             return Err(GnitzSqlError::Unsupported(format!(
@@ -451,8 +451,10 @@ pub(crate) fn agg_typing(agg_func: AggFunc, arg: Option<&ColumnDef>) -> Result<A
     let src_tc = arg.map(|c| c.type_code as u8).unwrap_or(TypeCode::I64 as u8);
     let op = |o: WireAggFunc| (o, TypeCode::from_validated_u8(gnitz_core::agg_output_type(o, src_tc)));
     let (shape, ops) = match agg_func {
+        // `COUNT(x)` counts the rows where `x` is non-NULL; `COUNT(*)` counts
+        // every row of the group.
+        AggFunc::Count if arg.is_some() => (AggShape::Direct, vec![op(WireAggFunc::CountNonNull)]),
         AggFunc::Count => (AggShape::Direct, vec![op(WireAggFunc::Count)]),
-        AggFunc::CountNonNull => (AggShape::Direct, vec![op(WireAggFunc::CountNonNull)]),
         AggFunc::Min => (AggShape::Direct, vec![op(WireAggFunc::Min)]),
         AggFunc::Max => (AggShape::Direct, vec![op(WireAggFunc::Max)]),
         // A nullable source means the group's non-null count can fall back to

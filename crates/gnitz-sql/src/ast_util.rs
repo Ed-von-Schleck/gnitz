@@ -1,11 +1,14 @@
+//! The planner's shared sqlparser-AST layer. An item lives here because two or
+//! more surfaces must agree on it, so its doc states the rule it enforces —
+//! never who calls it, which rots the moment a caller moves.
+
 use crate::error::{reject_if, GnitzSqlError};
 use crate::ir::AggFunc;
 use gnitz_core::ColumnDef;
 use sqlparser::ast::{ExcludeSelectItem, RenameSelectItem, SelectItem, WildcardAdditionalOptions};
 
 /// The identifier of an `ObjectName`'s last part, or `None` when that part is
-/// not a plain identifier. The single ObjectName→ident unwrap behind
-/// [`extract_name`], the INSERT column list, and SERIAL recognition.
+/// not a plain identifier.
 pub(crate) fn object_name_ident(name: &sqlparser::ast::ObjectName) -> Option<&sqlparser::ast::Ident> {
     name.0.last().and_then(|p| p.as_ident())
 }
@@ -15,18 +18,6 @@ pub(crate) fn extract_name(name: &sqlparser::ast::ObjectName, context: &str) -> 
     object_name_ident(name)
         .map(|i| i.value.clone())
         .ok_or_else(|| GnitzSqlError::Plan(format!("empty name in {context}")))
-}
-
-/// True when the projection is one unqualified wildcard that names no output
-/// column of its own: a bare `*`, or `* EXCEPT/EXCLUDE(…)`, which only drop
-/// columns. The output names are then the source's own, so a duplicate among
-/// them belongs to the source (a join surfacing both sides' `val`) and is
-/// carried through positionally rather than rejected.
-///
-/// `RENAME` does name its output and can collide with a column the same wildcard
-/// passes through, so it is excluded here and gets the duplicate check.
-pub(crate) fn is_name_preserving_wildcard_projection(projection: &[sqlparser::ast::SelectItem]) -> bool {
-    single_wildcard(projection).is_some_and(|o| o.opt_rename.is_none())
 }
 
 /// True when a SELECT carries a GROUP BY — either `GROUP BY ALL` or a non-empty
@@ -42,11 +33,8 @@ pub(crate) fn group_by_is_present(group_by: &sqlparser::ast::GroupByExpr) -> boo
     }
 }
 
-/// Parse `e` as a non-negative integer literal, or error. The single accept
-/// rule for the count-shaped clause positions — LIMIT, OFFSET, an ORDER BY
-/// position — where anything else (an expression like `1+1`, a string, an
-/// out-of-range number) must be a clean error: silently degrading a LIMIT
-/// returns every row. `what` names the clause for the message.
+/// Parse `e` as a non-negative integer literal, or error — silently degrading a
+/// LIMIT returns every row. `what` names the clause for the message.
 pub(crate) fn expr_usize_literal(e: &sqlparser::ast::Expr, what: &str) -> Result<usize, GnitzSqlError> {
     if let sqlparser::ast::Expr::Value(vws) = e {
         if let sqlparser::ast::Value::Number(n, _) = &vws.value {
@@ -70,9 +58,8 @@ pub(crate) fn single_fn_name(f: &sqlparser::ast::Function) -> Option<&str> {
 }
 
 /// The one SQL-name ↔ aggregate map, read in both directions by
-/// [`agg_func_from_name`] and [`agg_func_name`]. `CountNonNull` is absent: it is
-/// not a spelling a user writes, but the `COUNT(x)` argument shape the binder
-/// picks after resolving `count` (see [`agg_func_name`]).
+/// [`agg_func_from_name`] and [`agg_func_name`] — a bijection, so a name can
+/// never drift between the two directions.
 const AGG_NAMES: [(&str, AggFunc); 5] = [
     ("count", AggFunc::Count),
     ("sum", AggFunc::Sum),
@@ -83,40 +70,40 @@ const AGG_NAMES: [(&str, AggFunc); 5] = [
 
 /// The `AggFunc` a function name denotes (`count`, `sum`, `min`, `max`, `avg`),
 /// matched case-insensitively without allocating; `None` for any other name.
-/// The single name→aggregate map: the binder's `bind_function` dispatches the
-/// argument shape from it (COUNT(*) vs COUNT(x)), and the dispatch walkers use
-/// it to detect an aggregate — an aggregate added here reaches them all at once.
-fn agg_func_from_name(name: &str) -> Option<AggFunc> {
+pub(crate) fn agg_func_from_name(name: &str) -> Option<AggFunc> {
     AGG_NAMES
         .into_iter()
         .find_map(|(n, f)| name.eq_ignore_ascii_case(n).then_some(f))
 }
 
 /// The canonical lowercase SQL name of an aggregate — [`agg_func_from_name`]
-/// inverted over the same table, so a name can never drift between the two
-/// directions. `CountNonNull` is the `COUNT(x)` argument shape of `count` and
-/// shares its name: both render `count`, which is what keeps an unaliased
-/// `COUNT(*)` and `COUNT(x)` on the same default output name.
+/// inverted over the same table.
 pub(crate) fn agg_func_name(f: AggFunc) -> &'static str {
-    let spelled = if f == AggFunc::CountNonNull { AggFunc::Count } else { f };
     AGG_NAMES
         .iter()
-        .find_map(|&(n, g)| (g == spelled).then_some(n))
+        .find_map(|&(n, g)| (g == f).then_some(n))
         .expect("every AggFunc spelling is in AGG_NAMES")
 }
 
-/// Classify an aggregate function call into `(func, arg)` — the one
-/// leaf-independent aggregate-call shape dispatch, composed from the name map and
-/// qualifier check above. `COUNT(*)` → `(Count, None)`, `COUNT(x)` →
-/// `(CountNonNull, Some(x))`, `SUM|MIN|MAX|AVG(x)` → `(that, Some(x))`. The
-/// argument expression is returned *unbound* for the caller to resolve against
-/// its own leaf (a schema index for the runtime `SingleTable` binder, a `ColId`
-/// for the HIR binders), so arity and argument-shape validation — and their error
-/// messages — have a single home every aggregate binder shares.
+/// The invariant the two non-window entry points below rest on: `bind_structural`
+/// routes a windowed call to the leaf, so only `classify_window_call` ever sees
+/// one and `over` needs no handling here.
+fn debug_assert_not_windowed(f: &sqlparser::ast::Function) {
+    debug_assert!(
+        f.over.is_none(),
+        "a windowed call is routed by bind_structural, not classified here"
+    );
+}
+
+/// Classify an aggregate call into `(func, arg)`. `COUNT(*)` is the only shape
+/// yielding no argument, so `arg.is_some()` *is* the `COUNT(x)` vs `COUNT(*)`
+/// distinction. The argument comes back unbound, for the caller to resolve
+/// against its own leaf.
 pub(crate) fn classify_agg_call(
     f: &sqlparser::ast::Function,
 ) -> Result<(AggFunc, Option<&sqlparser::ast::Expr>), GnitzSqlError> {
-    reject_unsupported_fn_qualifiers(f, "aggregates")?;
+    debug_assert_not_windowed(f);
+    reject_fn_qualifiers(f, "aggregates")?;
     classify_agg_shape(f)
 }
 
@@ -130,66 +117,110 @@ pub(crate) fn classify_agg_shape(
     let base = single_fn_name(f)
         .and_then(agg_func_from_name)
         .ok_or_else(|| unknown_function(f))?;
-    match base {
-        AggFunc::Count => {
-            if let FunctionArguments::List(list) = &f.args {
-                if list.args.len() == 1 {
-                    match &list.args[0] {
-                        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => return Ok((AggFunc::Count, None)),
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => {
-                            return Ok((AggFunc::CountNonNull, Some(inner)))
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Err(GnitzSqlError::Unsupported("COUNT: unsupported argument form".into()))
-        }
-        AggFunc::Sum | AggFunc::Min | AggFunc::Max | AggFunc::Avg => {
-            if let FunctionArguments::List(list) = &f.args {
-                if list.args.len() == 1 {
-                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) = &list.args[0] {
-                        return Ok((base, Some(inner)));
-                    }
-                }
-            }
-            Err(GnitzSqlError::Unsupported(format!(
-                "{}: requires exactly one column argument",
-                agg_func_name(base)
-            )))
-        }
-        AggFunc::CountNonNull => unreachable!("agg_func_from_name never yields CountNonNull"),
+    let args: &[FunctionArg] = match &f.args {
+        FunctionArguments::List(list) => &list.args,
+        _ => &[],
+    };
+    match (base, args) {
+        (AggFunc::Count, [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]) => Ok((AggFunc::Count, None)),
+        (_, [FunctionArg::Unnamed(FunctionArgExpr::Expr(e))]) => Ok((base, Some(e))),
+        (AggFunc::Count, _) => Err(GnitzSqlError::Unsupported("COUNT: unsupported argument form".into())),
+        _ => Err(GnitzSqlError::Unsupported(format!(
+            "{}: requires exactly one column argument",
+            agg_func_name(base)
+        ))),
     }
 }
 
-/// True when a SELECT body is grouped: it carries a GROUP BY or an aggregate in
-/// its projection — the one disjunction behind every "route this body to the
-/// grouped builder / reject the grouped shape" test (the view-shape classifier,
-/// the hidden-body router, and the EXISTS guard).
-pub(crate) fn body_is_grouped(select: &sqlparser::ast::Select) -> bool {
-    group_by_is_present(&select.group_by) || projection_has_aggregate(select)
+/// Reject any qualifier on a function call the binder does not implement — a
+/// binder reads the name and the argument list, so an unrejected qualifier is
+/// silently dropped and the plain call computed. `on` names the context.
+pub(crate) fn reject_fn_qualifiers(func: &sqlparser::ast::Function, on: &str) -> Result<(), GnitzSqlError> {
+    use sqlparser::ast::{DuplicateTreatment, FunctionArguments};
+    let sqlparser::ast::Function {
+        // Consumed: the name dispatches the call, the argument list is bound.
+        name: _,
+        args,
+        // Inert: ODBC's `{fn NAME(args)}` spells `NAME(args)`, round-trips
+        // through `Display`, and changes no result.
+        uses_odbc_syntax: _,
+        // Consumed elsewhere: `bind_structural` routes a windowed call to the
+        // leaf, and `classify_window_call` consumes the specification. Nothing
+        // reaches this table with an unconsumed `OVER`.
+        over: _,
+        // Rejected below.
+        parameters,
+        filter,
+        null_treatment,
+        within_group,
+    } = func;
+    let unsupported = |what: &str| Err(GnitzSqlError::Unsupported(format!("{what}: not supported on {on}")));
+    if filter.is_some() {
+        return unsupported("FILTER (WHERE …)");
+    }
+    if !within_group.is_empty() {
+        return unsupported("WITHIN GROUP (ORDER BY …)");
+    }
+    if null_treatment.is_some() {
+        return unsupported("IGNORE/RESPECT NULLS");
+    }
+    if !matches!(parameters, FunctionArguments::None) {
+        return unsupported("parametric (ClickHouse) calls");
+    }
+    if let FunctionArguments::List(list) = args {
+        if matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct)) {
+            return unsupported("DISTINCT");
+        }
+        if !list.clauses.is_empty() {
+            return unsupported("in-argument clauses (ORDER BY / LIMIT / SEPARATOR)");
+        }
+    }
+    Ok(())
 }
 
-/// True when any SELECT projection item contains an aggregate function call —
-/// at the top level (`MIN(x)`) or nested inside an arithmetic/comparison
-/// expression (`MIN(x) + 1`). Dispatch uses this to route a no-`GROUP BY`
-/// aggregate to the grouped builder (which compiles the ungrouped global
-/// aggregate, or rejects a computed-over-aggregate via its strict validator)
-/// instead of to the scalar `Simple` builder. The recursion mirrors the binder's
-/// `bind_structural` node set so the two agree on where an aggregate can hide.
-fn projection_has_aggregate(select: &sqlparser::ast::Select) -> bool {
-    // `*` / `tbl.*` (the `None` items) cannot be an aggregate.
-    select
-        .projection
+/// Plain positional argument exprs of a function call, or a clean `Unsupported`
+/// for `*`, named args, or any qualifier [`reject_fn_qualifiers`] refuses.
+pub(crate) fn function_positional_args<'f>(
+    f: &'f sqlparser::ast::Function,
+    name: &str,
+) -> Result<Vec<&'f sqlparser::ast::Expr>, GnitzSqlError> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    debug_assert_not_windowed(f);
+    reject_fn_qualifiers(f, name)?;
+    let FunctionArguments::List(list) = &f.args else {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{name}: requires a parenthesized argument list"
+        )));
+    };
+    list.args
         .iter()
-        .filter_map(projection_item_expr)
-        .any(expr_has_aggregate)
+        .map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
+            _ => Err(GnitzSqlError::Unsupported(format!(
+                "{name}: expects plain positional arguments (no `*`, named args)"
+            ))),
+        })
+        .collect()
+}
+
+/// True when a SELECT body is grouped — the one disjunction every "route this to
+/// the grouped builder" test reads. A HAVING counts even with no aggregate
+/// written: it filters the whole-relation group, which only that builder computes.
+pub(crate) fn body_is_grouped(select: &sqlparser::ast::Select) -> bool {
+    // `*` / `tbl.*` (the `None` items) cannot be an aggregate.
+    group_by_is_present(&select.group_by)
+        || select.having.is_some()
+        || select
+            .projection
+            .iter()
+            .filter_map(projection_item_expr)
+            .any(expr_has_aggregate)
 }
 
 /// Whether `e` or any node beneath it satisfies `p` — the one recursive
 /// existence walk over the [`expr_operands`] node set, so a walker written
 /// against it inherits that set rather than re-spelling the recursion.
-fn expr_any(e: &sqlparser::ast::Expr, p: &impl Fn(&sqlparser::ast::Expr) -> bool) -> bool {
+pub(crate) fn expr_any(e: &sqlparser::ast::Expr, p: &impl Fn(&sqlparser::ast::Expr) -> bool) -> bool {
     p(e) || expr_operands(e).into_iter().any(|o| expr_any(o, p))
 }
 
@@ -217,8 +248,8 @@ pub(crate) fn is_agg_call(f: &sqlparser::ast::Function) -> bool {
 }
 
 /// The expressions a window specification keys on: its PARTITION BY, then its
-/// ORDER BY. The one definition, so the grouped bind, the operand walk and the
-/// window binder cannot disagree on what a specification references.
+/// ORDER BY. The one definition, so no two readers can disagree on what a
+/// specification references.
 pub(crate) fn window_spec_keys(spec: &sqlparser::ast::WindowSpec) -> impl Iterator<Item = &sqlparser::ast::Expr> {
     spec.partition_by.iter().chain(spec.order_by.iter().map(|o| &o.expr))
 }
@@ -333,15 +364,10 @@ pub(crate) fn group_by_target<'a>(
     Ok(peel_nested(target))
 }
 
-/// The direct operand subexpressions of `e` — the node set the structural
-/// binder recurses through (binary/unary ops, parens, BETWEEN, IS [NOT] NULL,
-/// IN lists, CEIL/FLOOR/CAST) plus function-call arguments. Subquery nodes
-/// contribute no operands: no walker may silently descend into a subquery. The
-/// single definition behind the crate's expression walkers
-/// (`expr_has_aggregate`, HAVING aggregate collection, EXISTS correlation
-/// side-counting, the `EXCLUDED` guard), so a node added to the binder's
-/// vocabulary reaches them all at once — and one added to the binder but *not*
-/// here stays invisible to every walker, which is why the two move together.
+/// The direct operand subexpressions of `e`. Subquery nodes contribute none: no
+/// walker may silently descend into a subquery. Must cover every node
+/// `bind_structural` recurses through — only `tests/ast_util.rs` enforces that,
+/// and a node it misses is invisible to every walker, silently.
 pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Expr> {
     use sqlparser::ast::{CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
     match e {
@@ -367,10 +393,6 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
         // so it contributes nothing.
         Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => vec![expr, pattern],
         Expr::InList { expr, list, .. } => std::iter::once(expr.as_ref()).chain(list).collect(),
-        // CASE operands: the optional operand, every WHEN condition + result, and
-        // the optional ELSE — the node set `bind_structural`'s Case arm recurses
-        // through, so a subquery or column ref inside a branch stays visible to
-        // `expr_has_aggregate`, `expr_contains_excluded`, and the mark rewrite.
         Expr::Case {
             operand,
             conditions,
@@ -422,9 +444,8 @@ pub(crate) fn projection_item_expr(item: &sqlparser::ast::SelectItem) -> Option<
 }
 
 /// A non-wildcard SELECT item as `(expr, alias)` — the alias-carrying sibling of
-/// [`projection_item_expr`]. `ctx` names the clause the reject speaks for. A
-/// multi-alias item (`expr AS (a, b)`) is not a scalar projection and rejects
-/// here with the wildcards.
+/// [`projection_item_expr`]. Anything that is not one scalar expression rejects,
+/// naming the shape written; `ctx` names the clause.
 pub(crate) fn scalar_projection_item<'a>(
     item: &'a SelectItem,
     ctx: &str,
@@ -432,7 +453,15 @@ pub(crate) fn scalar_projection_item<'a>(
     match item {
         SelectItem::UnnamedExpr(expr) => Ok((expr, None)),
         SelectItem::ExprWithAlias { expr, alias } => Ok((expr, Some(alias.value.clone()))),
-        _ => Err(GnitzSqlError::Unsupported(format!("{ctx}: unsupported SELECT item"))),
+        SelectItem::ExprWithAliases { .. } => Err(GnitzSqlError::Unsupported(format!(
+            "{ctx}: a multi-alias (`AS (a, b)`) SELECT item is not a supported SELECT item"
+        ))),
+        SelectItem::Wildcard(_) => Err(GnitzSqlError::Unsupported(format!(
+            "{ctx}: SELECT * is not a supported SELECT item"
+        ))),
+        SelectItem::QualifiedWildcard(..) => Err(GnitzSqlError::Unsupported(format!(
+            "{ctx}: SELECT <table>.* is not a supported SELECT item"
+        ))),
     }
 }
 
@@ -483,9 +512,8 @@ fn is_scalar_subquery(e: &sqlparser::ast::Expr) -> bool {
 }
 
 /// The classified shape of a FROM clause — the one definition of "a single plain
-/// table/view FROM", shared by the direct-SELECT derivation gate, the CTE
-/// pass-through predicate, and the subquery / set-op side resolvers.
-pub(crate) enum FromShape {
+/// table/view FROM".
+pub(crate) enum FromShape<'a> {
     /// No FROM item at all.
     Empty,
     /// Multiple comma-separated FROM items (an implicit comma join). A view body
@@ -498,17 +526,17 @@ pub(crate) enum FromShape {
     /// function, …).
     DerivedTable,
     /// Exactly one plain relation name, no joins.
-    SinglePlainRelation,
+    SinglePlainRelation(&'a sqlparser::ast::TableFactor),
 }
 
-pub(crate) fn classify_from(from: &[sqlparser::ast::TableWithJoins]) -> FromShape {
+pub(crate) fn classify_from(from: &[sqlparser::ast::TableWithJoins]) -> FromShape<'_> {
     match from {
         [] => FromShape::Empty,
         [single] => {
             if !single.joins.is_empty() {
                 FromShape::Join
             } else if matches!(single.relation, sqlparser::ast::TableFactor::Table { .. }) {
-                FromShape::SinglePlainRelation
+                FromShape::SinglePlainRelation(&single.relation)
             } else {
                 FromShape::DerivedTable
             }
@@ -517,23 +545,17 @@ pub(crate) fn classify_from(from: &[sqlparser::ast::TableWithJoins]) -> FromShap
     }
 }
 
-/// Extract table name from a TableFactor::Table. Strict — a derived table
-/// (subquery in FROM) is rejected.
-///
-/// The one acceptance point for a base-relation FROM factor, so every semantic
-/// qualifier gnitz does not implement is rejected here (exhaustive destructure,
-/// no `..`: a future `sqlparser` field stops the build until classified) —
-/// otherwise `AS OF`, TABLESAMPLE, PARTITION, WITH ORDINALITY, or table-function
-/// arguments would be silently dropped and the plain table scanned instead.
-/// Advisory-only qualifiers (`with_hints`, `index_hints` — MySQL/T-SQL index and
-/// locking hints that cannot change the result set) are accepted as no-ops.
-pub(crate) fn extract_table_factor_name(
+/// Extract `(relation name, effective alias)` from a plain-table FROM factor —
+/// the declared alias when present, else the name itself. The one acceptance
+/// point for a base-relation FROM factor: a qualifier left unrejected here is
+/// dropped, and the plain table scanned in its place.
+pub(crate) fn extract_table_name_and_alias(
     tf: &sqlparser::ast::TableFactor,
     context: &str,
-) -> Result<String, GnitzSqlError> {
+) -> Result<(String, String), GnitzSqlError> {
     let sqlparser::ast::TableFactor::Table {
         name,
-        alias: _,       // consumed by the callers that honor aliases
+        alias,
         with_hints: _,  // advisory locking hints (T-SQL WITH (NOLOCK)): no result impact
         index_hints: _, // advisory index hints (MySQL USE/FORCE INDEX): no result impact
         args,
@@ -554,114 +576,29 @@ pub(crate) fn extract_table_factor_name(
     reject_if(!partitions.is_empty(), context, "PARTITION selection")?;
     reject_if(json_path.is_some(), context, "a JSON path on a table")?;
     reject_if(sample.is_some(), context, "TABLESAMPLE")?;
-    extract_name(name, context)
-}
-
-/// Extract `(relation name, effective alias)` from a plain-table FROM factor —
-/// the declared alias when present, else the name itself. Every caller has
-/// already routed a derived table elsewhere (the HIR binds it as an inline
-/// subtree), so anything but a table rejects here.
-pub(crate) fn extract_table_name_and_alias(
-    tf: &sqlparser::ast::TableFactor,
-    context: &str,
-) -> Result<(String, String), GnitzSqlError> {
-    let name = extract_table_factor_name(tf, context)?;
-    let alias = match tf {
-        sqlparser::ast::TableFactor::Table { alias: Some(a), .. } => a.name.value.clone(),
-        _ => name.clone(),
-    };
-    Ok((name, alias))
-}
-
-/// Reject any qualifier on a function call the binder does not implement.
-/// Both aggregate-binding leaves (`SingleTable::bind_function` and the HIR
-/// `GroupedLeaf`'s) and the COALESCE/NULLIF desugar read only the argument
-/// list; every other `Function` field would otherwise be silently dropped,
-/// computing the plain call. `on` names the rejecting context ("aggregates",
-/// "COALESCE", …) in the message.
-///
-/// Exhaustive destructure (no `..`): a future `sqlparser` `Function` field stops
-/// the build until it is classified consumed / inert / rejected.
-pub(crate) fn reject_unsupported_fn_qualifiers(func: &sqlparser::ast::Function, on: &str) -> Result<(), GnitzSqlError> {
-    reject_fn_qualifiers(func, on, false)
-}
-
-/// [`reject_unsupported_fn_qualifiers`] for a call whose `OVER` the caller
-/// consumes: every other qualifier is rejected the same way.
-pub(crate) fn reject_window_fn_qualifiers(func: &sqlparser::ast::Function, on: &str) -> Result<(), GnitzSqlError> {
-    reject_fn_qualifiers(func, on, true)
-}
-
-fn reject_fn_qualifiers(func: &sqlparser::ast::Function, on: &str, over_consumed: bool) -> Result<(), GnitzSqlError> {
-    use sqlparser::ast::{DuplicateTreatment, FunctionArguments};
-    let sqlparser::ast::Function {
-        // Consumed: the name dispatches the call, the argument list is bound.
-        name: _,
-        args,
-        // Inert: ODBC's `{fn NAME(args)}` spells `NAME(args)`, round-trips
-        // through `Display`, and changes no result.
-        uses_odbc_syntax: _,
-        // Rejected below.
-        parameters,
-        filter,
-        null_treatment,
-        over,
-        within_group,
-    } = func;
-    // Colon form ("{what}: not supported …") sidesteps subject-verb number
-    // agreement and matches the binder's existing message style
-    // (e.g. "{name}: not supported on {:?} columns").
-    let unsupported = |what: &str| Err(GnitzSqlError::Unsupported(format!("{what}: not supported on {on}")));
-    if filter.is_some() {
-        return unsupported("FILTER (WHERE …)");
-    }
-    if over.is_some() && !over_consumed {
-        return unsupported("window functions (OVER)");
-    }
-    if !within_group.is_empty() {
-        return unsupported("WITHIN GROUP (ORDER BY …)");
-    }
-    if null_treatment.is_some() {
-        return unsupported("IGNORE/RESPECT NULLS");
-    }
-    if !matches!(parameters, FunctionArguments::None) {
-        return unsupported("parametric (ClickHouse) calls");
-    }
-    if let FunctionArguments::List(list) = args {
-        if matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct)) {
-            return unsupported("DISTINCT");
+    let table_name = extract_name(name, context)?;
+    let alias = match alias {
+        Some(a) => {
+            let sqlparser::ast::TableAlias {
+                explicit: _,
+                name: alias_name,
+                columns,
+                at,
+            } = a;
+            // `FROM t AS d(x, y)` renames the columns positionally; honoring only
+            // the relation alias would answer with `t`'s own column names.
+            reject_if(
+                !columns.is_empty(),
+                context,
+                "positional column aliases on a FROM table",
+            )?;
+            // Unreachable under GenericDialect; named so a dialect change is not silent.
+            reject_if(at.is_some(), context, "AT (PartiQL index alias)")?;
+            alias_name.value.clone()
         }
-        if !list.clauses.is_empty() {
-            return unsupported("in-argument clauses (ORDER BY / LIMIT / SEPARATOR)");
-        }
-    }
-    Ok(())
-}
-
-/// Plain positional argument exprs of a function call, or a clean `Unsupported`
-/// for `*`, named args, DISTINCT, or any qualifier (FILTER/OVER/…) — the shared
-/// qualifier inventory (`reject_unsupported_fn_qualifiers`). Backs the scalar
-/// function binder, which needs bare operand exprs.
-pub(crate) fn function_positional_args<'f>(
-    f: &'f sqlparser::ast::Function,
-    name: &str,
-) -> Result<Vec<&'f sqlparser::ast::Expr>, GnitzSqlError> {
-    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
-    reject_unsupported_fn_qualifiers(f, name)?;
-    let FunctionArguments::List(list) = &f.args else {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "{name}: requires a parenthesized argument list"
-        )));
+        None => table_name.clone(),
     };
-    list.args
-        .iter()
-        .map(|arg| match arg {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
-            _ => Err(GnitzSqlError::Unsupported(format!(
-                "{name}: expects plain positional arguments (no `*`, named args)"
-            ))),
-        })
-        .collect()
+    Ok((table_name, alias))
 }
 
 /// A strictly simple identifier expression's name, or the shared
@@ -699,221 +636,170 @@ pub(crate) fn index_column_ident<'a>(
     simple_ident_expr(&c.column.expr, context)
 }
 
-/// Bare column name of a single-relation reference: a plain `Identifier`, or a
-/// two-part `CompoundIdentifier` whose qualifier adds no disambiguation over a
-/// single grouped/base relation. Redundant parentheses are peeled — `(a)` is `a`
-/// at every surface. `None` for any other shape, so each caller raises its own
-/// context-specific error.
-pub(crate) fn single_relation_col_name(e: &sqlparser::ast::Expr) -> Option<&str> {
+/// A column reference as `(written qualifier, column name)`, parentheses peeled
+/// — `(a)` is `a` at every surface. `None` for any other shape, so each caller
+/// raises its own error.
+pub(crate) fn col_ref_parts(e: &sqlparser::ast::Expr) -> Option<(Option<&str>, &str)> {
     use sqlparser::ast::Expr;
     match peel_nested(e) {
-        Expr::Identifier(id) => Some(&id.value),
-        Expr::CompoundIdentifier(p) if p.len() == 2 => Some(&p[1].value),
+        Expr::Identifier(id) => Some((None, id.value.as_str())),
+        Expr::CompoundIdentifier(p) if p.len() == 2 => Some((Some(p[0].value.as_str()), p[1].value.as_str())),
         _ => None,
     }
 }
 
-/// The wildcard modifier options on a `*` / `tbl.*` item, else `None` — the one
-/// place that unifies the two `SelectItem` wildcard variants so a caller never
-/// has to match both.
-fn wildcard_options(item: &SelectItem) -> Option<&WildcardAdditionalOptions> {
-    match item {
-        SelectItem::Wildcard(o) | SelectItem::QualifiedWildcard(_, o) => Some(o),
-        _ => None,
-    }
-}
-
-/// True when a wildcard carries any modifier (`EXCEPT`/`EXCLUDE`/`REPLACE`/
-/// `RENAME`/`ILIKE`) — i.e. it is not a plain `*`. Backs
-/// [`is_bare_wildcard_projection`], which must keep an options-bearing wildcard
-/// out of the no-op identity fast paths.
-fn wildcard_options_present(o: &WildcardAdditionalOptions) -> bool {
-    o.opt_ilike.is_some()
-        || o.opt_exclude.is_some()
-        || o.opt_except.is_some()
-        || o.opt_replace.is_some()
-        || o.opt_rename.is_some()
-}
-
-/// A validated schema-space rewrite for one wildcard's `EXCEPT`/`EXCLUDE` +
-/// `RENAME`. Construction ([`WildcardRewrite::for_item`]):
-///   (a) rejects `REPLACE` and `ILIKE` (`Unsupported` — gnitz honors neither a
-///       value substitution nor a name-pattern filter);
-///   (b) unions `EXCEPT` ∪ `EXCLUDE` names into a drop-set;
-///   (c) collects `RENAME` as (from → to) pairs;
-///   (d) validates every drop name and every rename source names a *visible*
-///       column (via the caller's `is_visible`, so a typo errors instead of
-///       silently dropping/renaming nothing), that no column is both dropped
-///       and renamed, and that no `RENAME` source is named twice.
-/// Then per expanded column: [`excludes`](Self::excludes) (drop-all-matching)
-/// and [`output_name`](Self::output_name) (renamed target, else the original).
-/// Matching is case-insensitive (`eq_ignore_ascii_case`), like
-/// `find_unique_column`. A plain `*` yields an empty rewrite (excludes → false,
-/// output_name → None) and `is_visible` is never called.
-pub(crate) struct WildcardRewrite<'a> {
+/// One wildcard's modifiers, classified. The **only** place a
+/// `WildcardAdditionalOptions` is read, so a field a future sqlparser adds
+/// cannot reach one reader and miss another — the destructure is exhaustive and
+/// every reader goes through this struct.
+struct WildcardMods<'a> {
+    /// A modifier was written, so the item is not a plain `*`.
+    present: bool,
+    /// A modifier gnitz does not honor, spelled for the rejection.
+    refused: Option<&'static str>,
+    /// `EXCEPT` ∪ `EXCLUDE` — synonyms (ClickHouse/BigQuery vs Snowflake).
     drop: Vec<&'a str>,
-    rename: Vec<(&'a str, &'a str)>, // (from, to)
+    /// `RENAME` as (from, to) pairs.
+    rename: Vec<(&'a str, &'a str)>,
 }
 
-impl<'a> WildcardRewrite<'a> {
-    pub(crate) fn for_item(
-        item: &'a SelectItem,
-        mut is_visible: impl FnMut(&str) -> bool,
-        context: &str,
-    ) -> Result<Self, GnitzSqlError> {
-        let Some(o) = wildcard_options(item) else {
-            return Ok(Self::empty());
-        };
-        // gnitz honors neither a computed value substitution (REPLACE) nor a
-        // name-pattern filter (ILIKE); reject rather than silently expand `*`.
-        reject_if(o.opt_replace.is_some(), context, "SELECT * REPLACE")?;
-        reject_if(o.opt_ilike.is_some(), context, "SELECT * ILIKE")?;
-        // EXCEPT and EXCLUDE are synonyms (ClickHouse/BigQuery vs Snowflake) —
-        // union both into one drop-set.
-        let mut drop = Vec::new();
-        if let Some(e) = &o.opt_except {
-            drop.push(e.first_element.value.as_str());
-            drop.extend(e.additional_elements.iter().map(|i| i.value.as_str()));
-        }
-        match &o.opt_exclude {
-            // `EXCLUDE` columns parse as `ObjectName`s (sqlparser 0.62); take each
-            // one's bare identifier — a non-identifier part cannot name a column,
-            // so it drops out of the exclude set.
-            Some(ExcludeSelectItem::Single(i)) => drop.extend(object_name_ident(i).map(|id| id.value.as_str())),
-            Some(ExcludeSelectItem::Multiple(v)) => drop.extend(
-                v.iter()
-                    .filter_map(|i| object_name_ident(i).map(|id| id.value.as_str())),
-            ),
-            None => {}
-        }
-        let mut rename = Vec::new();
-        match &o.opt_rename {
-            Some(RenameSelectItem::Single(a)) => rename.push((a.ident.value.as_str(), a.alias.value.as_str())),
-            Some(RenameSelectItem::Multiple(v)) => {
-                rename.extend(v.iter().map(|a| (a.ident.value.as_str(), a.alias.value.as_str())))
-            }
-            None => {}
-        }
-        let me = Self { drop, rename };
-        // A drop/rename source that names no visible column is a typo: error
-        // rather than silently dropping/renaming nothing.
-        for &n in me.drop.iter().chain(me.rename.iter().map(|(f, _)| f)) {
-            if !is_visible(n) {
-                return Err(GnitzSqlError::Bind(format!(
-                    "{context}: SELECT * EXCEPT/EXCLUDE/RENAME names unknown column '{n}'"
-                )));
-            }
-        }
-        // A column that is both excluded and renamed is a contradiction.
-        if let Some((f, _)) = me.rename.iter().find(|(f, _)| me.excludes(f)) {
-            return Err(GnitzSqlError::Plan(format!(
-                "{context}: SELECT * RENAME names excluded column '{f}'"
-            )));
-        }
-        // Contradictory rename sources (`RENAME (id AS x, id AS y)`) — `output_name`
-        // would silently keep only the first. Reject rather than drop `y`.
-        for (i, (f, _)) in me.rename.iter().enumerate() {
-            if me.rename[i + 1..].iter().any(|(g, _)| g.eq_ignore_ascii_case(f)) {
-                return Err(GnitzSqlError::Plan(format!(
-                    "{context}: SELECT * RENAME names column '{f}' twice"
-                )));
-            }
-        }
-        Ok(me)
+fn wildcard_mods(o: &WildcardAdditionalOptions) -> WildcardMods<'_> {
+    let WildcardAdditionalOptions {
+        wildcard_token: _, // span only
+        opt_ilike,
+        opt_exclude,
+        opt_except,
+        opt_replace,
+        opt_rename,
+        // Redshift `SELECT * AS x`; `GenericDialect` leaves
+        // `supports_select_wildcard_with_alias()` false, so the parser never fills it.
+        opt_alias,
+    } = o;
+    let mut drop: Vec<&str> = Vec::new();
+    if let Some(e) = opt_except {
+        drop.push(e.first_element.value.as_str());
+        drop.extend(e.additional_elements.iter().map(|i| i.value.as_str()));
     }
-
-    /// The no-op rewrite: what [`WildcardRewrite::for_item`] returns for a plain
-    /// `*` carrying no modifier, so every expansion loop runs the same
-    /// drop-then-rename transform whether or not the item had one.
-    fn empty() -> Self {
-        Self { drop: Vec::new(), rename: Vec::new() }
+    match opt_exclude {
+        // `EXCLUDE` columns parse as `ObjectName`s (sqlparser 0.62); take each
+        // one's bare identifier — a non-identifier part cannot name a column,
+        // so it drops out of the exclude set.
+        Some(ExcludeSelectItem::Single(i)) => drop.extend(object_name_ident(i).map(|id| id.value.as_str())),
+        Some(ExcludeSelectItem::Multiple(v)) => drop.extend(
+            v.iter()
+                .filter_map(|i| object_name_ident(i).map(|id| id.value.as_str())),
+        ),
+        None => {}
     }
-
-    /// Whether an expanded column named `name` is dropped (`EXCEPT`/`EXCLUDE`).
-    fn excludes(&self, name: &str) -> bool {
-        self.drop.iter().any(|d| d.eq_ignore_ascii_case(name))
-    }
-
-    /// The renamed output name for an expanded column named `name`, or `None`
-    /// when it keeps its original name.
-    fn output_name(&self, name: &str) -> Option<&'a str> {
-        self.rename
-            .iter()
-            .find(|(f, _)| f.eq_ignore_ascii_case(name))
-            .map(|&(_, t)| t)
-    }
-
-    /// Apply the rewrite to one expanded column: `None` if it is dropped
-    /// (`EXCEPT`/`EXCLUDE`), else the column def with its `RENAME` target name
-    /// applied. The single home for the drop-then-rename per-column transform
-    /// every `ColumnDef`-producing wildcard-expansion loop shares.
-    pub(crate) fn rewrite_column(&self, col: &ColumnDef) -> Option<ColumnDef> {
-        if self.excludes(&col.name) {
-            return None;
+    let mut rename: Vec<(&str, &str)> = Vec::new();
+    match opt_rename {
+        Some(RenameSelectItem::Single(a)) => rename.push((a.ident.value.as_str(), a.alias.value.as_str())),
+        Some(RenameSelectItem::Multiple(v)) => {
+            rename.extend(v.iter().map(|a| (a.ident.value.as_str(), a.alias.value.as_str())))
         }
-        let mut out = col.clone();
-        if let Some(new) = self.output_name(&out.name) {
-            out.name = new.to_string();
-        }
-        Some(out)
+        None => {}
+    }
+    WildcardMods {
+        present: opt_ilike.is_some()
+            || opt_exclude.is_some()
+            || opt_except.is_some()
+            || opt_replace.is_some()
+            || opt_rename.is_some()
+            || opt_alias.is_some(),
+        // gnitz honors neither a computed value substitution nor a name-pattern
+        // filter, so expanding a plain `*` in their place would answer a
+        // different query than the one written.
+        refused: opt_replace
+            .is_some()
+            .then_some("SELECT * REPLACE")
+            .or(opt_ilike.is_some().then_some("SELECT * ILIKE"))
+            .or(opt_alias.is_some().then_some("SELECT * AS")),
+        drop,
+        rename,
     }
 }
 
-/// Expand one `*` item over `cols` into `(source index, output def)` pairs, in
-/// source order. Hidden columns are skipped — a synthetic view key (`_join_pk`,
-/// `_set_pk`, …) must never re-enter a payload or a row identity through a
-/// wildcard — and `EXCEPT`/`EXCLUDE`/`RENAME` are applied per column while
-/// `REPLACE`/`ILIKE` are rejected. The one wildcard expansion every projection
-/// resolver shares; `ctx` names the surface for the messages.
+/// Expand one wildcard over `cols` into `(source index, output def)` pairs, in
+/// source order, dropping and renaming per its modifiers. Hidden columns are
+/// skipped: a synthetic view key (`_join_pk`, `_set_pk`, …) must never re-enter
+/// a payload or a row identity through a wildcard. Matching is case-insensitive,
+/// like `find_unique_column`. `ctx` names the surface for the messages.
 pub(crate) fn expand_wildcard_item<'a, I>(
-    item: &SelectItem,
+    o: &WildcardAdditionalOptions,
     cols: I,
     ctx: &str,
 ) -> Result<Vec<(usize, ColumnDef)>, GnitzSqlError>
 where
     I: IntoIterator<Item = &'a ColumnDef> + Clone,
 {
-    let rw = WildcardRewrite::for_item(item, |n| wildcard_name_is_visible(cols.clone(), n), ctx)?;
+    let WildcardMods { refused, drop, rename, .. } = wildcard_mods(o);
+    if let Some(what) = refused {
+        return Err(crate::error::unsupported_clause(ctx, what));
+    }
+    let excludes = |name: &str| drop.iter().any(|d| d.eq_ignore_ascii_case(name));
+    let output_name = |name: &str| {
+        rename
+            .iter()
+            .find(|(f, _)| f.eq_ignore_ascii_case(name))
+            .map(|&(_, t)| t)
+    };
+    // Each rejection below covers a rewrite that would otherwise do nothing and
+    // say nothing.
+    for &n in drop.iter().chain(rename.iter().map(|(f, _)| f)) {
+        if !has_visible_column(cols.clone(), n) {
+            return Err(GnitzSqlError::Bind(format!(
+                "{ctx}: SELECT * EXCEPT/EXCLUDE/RENAME names unknown column '{n}'"
+            )));
+        }
+    }
+    if let Some((f, _)) = rename.iter().find(|(f, _)| excludes(f)) {
+        return Err(GnitzSqlError::Plan(format!(
+            "{ctx}: SELECT * RENAME names excluded column '{f}'"
+        )));
+    }
+    for (i, (f, _)) in rename.iter().enumerate() {
+        if rename[i + 1..].iter().any(|(g, _)| g.eq_ignore_ascii_case(f)) {
+            return Err(GnitzSqlError::Plan(format!(
+                "{ctx}: SELECT * RENAME names column '{f}' twice"
+            )));
+        }
+    }
     Ok(cols
         .into_iter()
         .enumerate()
-        .filter(|(_, c)| !c.is_hidden)
-        .filter_map(|(i, c)| rw.rewrite_column(c).map(|out| (i, out)))
+        .filter(|(_, c)| !c.is_hidden && !excludes(&c.name))
+        .map(|(i, c)| {
+            let mut out = c.clone();
+            if let Some(new) = output_name(&out.name) {
+                out.name = new.to_string();
+            }
+            (i, out)
+        })
         .collect())
 }
 
-/// Whether `name` matches a *visible* (non-hidden) column of `cols`,
-/// case-insensitively — the visibility test the wildcard-modifier call sites
-/// hand to [`WildcardRewrite::for_item`]. Unlike [`find_unique_column`], a name
-/// shared by two visible columns is not an error here: a `SELECT * EXCEPT (id)`
-/// over a two-`id` join deliberately drops both.
-///
-/// [`find_unique_column`]: crate::bind::find_unique_column
-pub(crate) fn wildcard_name_is_visible<'a>(cols: impl IntoIterator<Item = &'a ColumnDef>, name: &str) -> bool {
+/// Whether `cols` holds a *visible* (non-hidden) column named `name`, matched
+/// case-insensitively. Unlike `bind::find_unique_column`, two matches are not an
+/// error: `SELECT * EXCEPT (id)` over a two-`id` join deliberately drops both.
+pub(crate) fn has_visible_column<'a>(cols: impl IntoIterator<Item = &'a ColumnDef>, name: &str) -> bool {
     cols.into_iter()
         .any(|c| !c.is_hidden && c.name.eq_ignore_ascii_case(name))
 }
 
-/// The options of the projection's single unqualified wildcard, else `None` —
-/// the structural half both wildcard-projection predicates share. Requiring
-/// *exactly one* item is what keeps `SELECT *, *` out of every wildcard rule: it
-/// names each source column twice, which the named form (`SELECT id, a, a`) is
-/// rejected for, so it must reach the duplicate-name gate rather than the
-/// identity fast paths.
-fn single_wildcard(projection: &[SelectItem]) -> Option<&WildcardAdditionalOptions> {
-    match projection {
-        [SelectItem::Wildcard(o)] => Some(o),
-        _ => None,
-    }
+/// True when the projection is one wildcard naming no output column of its own,
+/// so the output names are the source's: a duplicate among them belongs to the
+/// source (a join surfacing both sides' `val`) and is carried through rather than
+/// rejected. `RENAME` names its output, so it gets the duplicate check.
+pub(crate) fn is_name_preserving_wildcard_projection(projection: &[SelectItem]) -> bool {
+    matches!(projection, [SelectItem::Wildcard(o)] if wildcard_mods(o).rename.is_empty())
 }
 
-/// A plain `*` projection (one `Wildcard` item with NO modifiers) — a true
-/// identity expansion. A wildcard carrying any option is excluded, so the
-/// identity fast paths guarded by this fall through to real expansion where the
-/// options are honored (`EXCEPT`/`EXCLUDE`/`RENAME`) or rejected
-/// (`REPLACE`/`ILIKE`).
+/// True when the projection is a plain `*` — the identity expansion the no-op
+/// passthrough fast paths need; anything else falls through to
+/// [`expand_wildcard_item`]. Both predicates match *one* item, so `SELECT *, *`
+/// reaches the duplicate-name gate that `SELECT id, a, a` is rejected by.
 pub(crate) fn is_bare_wildcard_projection(projection: &[SelectItem]) -> bool {
-    single_wildcard(projection).is_some_and(|o| !wildcard_options_present(o))
+    matches!(projection, [SelectItem::Wildcard(o)] if !wildcard_mods(o).present)
 }
 
 #[cfg(test)]

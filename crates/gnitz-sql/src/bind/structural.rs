@@ -1,7 +1,5 @@
 use super::resolve::find_unique_column;
-use crate::ast_util::{
-    classify_agg_call, function_positional_args, peel_nested, single_fn_name, single_relation_col_name,
-};
+use crate::ast_util::{classify_agg_call, col_ref_parts, function_positional_args, peel_nested, single_fn_name};
 use crate::codec::pk_codec::{extract_sql_literal, SqlLiteral};
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, NumFunc, StrFunc, TrimMode, UnaryOp};
@@ -123,13 +121,19 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         // functions) bind here, above the leaf, so all three leaf impls stay
         // untouched. Every other name falls through to the leaf — aggregates, or a
         // context rejection.
-        // Asked here, where every call funnels through, so a scalar call, an
-        // aggregate and an unknown name are refused alike.
-        Expr::Function(f) if f.over.is_some() && !leaf.binds_windows() => Err(GnitzSqlError::Unsupported(
-            "window functions (OVER) are only supported in the SELECT list and QUALIFY of a CREATE VIEW \
-             body, and cannot be nested in another window function's operands"
-                .into(),
-        )),
+        // Above the name dispatch, so `ABS(x) OVER (…)` is a window call the leaf
+        // refuses by name, not a scalar call refused for carrying a qualifier.
+        Expr::Function(f) if f.over.is_some() => {
+            if leaf.binds_windows() {
+                leaf.bind_function(f)
+            } else {
+                Err(GnitzSqlError::Unsupported(
+                    "window functions (OVER) are only supported in the SELECT list and QUALIFY of a CREATE VIEW \
+                     body, and cannot be nested in another window function's operands"
+                        .into(),
+                ))
+            }
+        }
         Expr::Function(f) => match scalar_call(f) {
             Some((name, call)) => bind_scalar_call(name, call, f, leaf),
             None => leaf.bind_function(f),
@@ -855,16 +859,15 @@ pub(crate) fn single_relation_col_idx<'a>(
     alias: &str,
     e: &Expr,
 ) -> Result<usize, GnitzSqlError> {
-    if let Expr::CompoundIdentifier(p) = peel_nested(e) {
-        if p.len() == 2 && !p[0].value.eq_ignore_ascii_case(alias) {
+    let (qual, name) =
+        col_ref_parts(e).ok_or_else(|| GnitzSqlError::Unsupported("expected a column reference".into()))?;
+    if let Some(q) = qual {
+        if !q.eq_ignore_ascii_case(alias) {
             return Err(GnitzSqlError::Bind(format!(
-                "table alias '{}' not found (the relation in scope is '{alias}')",
-                p[0].value
+                "table alias '{q}' not found (the relation in scope is '{alias}')"
             )));
         }
     }
-    let name =
-        single_relation_col_name(e).ok_or_else(|| GnitzSqlError::Unsupported("expected a column reference".into()))?;
     find_unique_column(cols, name)?.ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found")))
 }
 

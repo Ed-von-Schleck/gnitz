@@ -420,6 +420,31 @@ class TestUpdateSQL:
                 pass
             client.drop_schema(sn)
 
+    def test_update_join_rejects(self, client):
+        """`Update.table` is a `TableWithJoins`, so a join parses. Honoring only
+        its relation would drop the join and update every row of the target."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(_CREATE_T3, schema_name=sn)
+            client.execute_sql("CREATE TABLE o (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT)", schema_name=sn)
+            client.execute_sql("INSERT INTO t VALUES (1, 100, 10), (2, 200, 20)", schema_name=sn)
+            client.execute_sql("INSERT INTO o VALUES (1, 7)", schema_name=sn)
+
+            with pytest.raises(gnitz.GnitzError) as e:
+                client.execute_sql("UPDATE t JOIN o ON t.pk = o.pk SET val = 1", schema_name=sn)
+            assert "exactly one simple FROM table" in str(e.value)
+
+            tid, _ = client.resolve_table(sn, "t")
+            assert {r.val for r in _rows_map(client, tid).values()} == {100, 200}
+        finally:
+            for name in ("t", "o"):
+                try:
+                    client.execute_sql(f"DROP TABLE {name}", schema_name=sn)
+                except Exception:
+                    pass
+            client.drop_schema(sn)
+
     def test_update_row_not_found(self, client):
         sn = "s" + _uid()
         client.create_schema(sn)

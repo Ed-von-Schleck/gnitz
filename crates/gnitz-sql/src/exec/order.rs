@@ -15,7 +15,7 @@
 
 use std::cmp::Ordering;
 
-use crate::ast_util::{clause_position, reject_position_out_of_range, single_relation_col_name};
+use crate::ast_util::{clause_position, col_ref_parts, reject_position_out_of_range};
 use crate::bind::find_unique_column;
 use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
@@ -80,7 +80,7 @@ fn order_target(e: &Expr) -> Result<OrderTarget, GnitzSqlError> {
     // Bare or qualified (`t.col`) identifier → its name, which is resolved
     // against the read's *output* columns, not the relation's — so there is no
     // qualifier to check it against and none is read.
-    if let Some(name) = single_relation_col_name(e) {
+    if let Some(name) = col_ref_parts(e).map(|(_, n)| n) {
         return Ok(OrderTarget::Name(name.to_string()));
     }
     Err(GnitzSqlError::Unsupported(

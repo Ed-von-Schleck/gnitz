@@ -38,7 +38,7 @@ fn push_agg_specs_accepts_valid_arg_types() {
     assert!(try_push(AggFunc::Avg, Some(1)).is_ok()); // AVG(i64)
     assert!(try_push(AggFunc::Min, Some(1)).is_ok()); // MIN(i64)
     assert!(try_push(AggFunc::Count, None).is_ok()); // COUNT(*)
-    assert!(try_push(AggFunc::CountNonNull, Some(2)).is_ok()); // COUNT(blob) — presence only
+    assert!(try_push(AggFunc::Count, Some(2)).is_ok()); // COUNT(blob) — presence only
 }
 
 /// SUM over a U64 source is typed U64 (bit pattern is the correct unsigned
@@ -69,11 +69,10 @@ fn agg_result_type_sum_preserves_u64() {
 
 /// The unaliased aggregate column names are user-visible in the view schema
 /// (e2e-pinned), so the derivation from the canonical name table must render
-/// exactly these — in particular both COUNT shapes share `_count`.
+/// exactly these.
 #[test]
 fn default_agg_name_renders_pinned_view_column_names() {
     assert_eq!(default_agg_name(AggFunc::Count, 0), "_count0");
-    assert_eq!(default_agg_name(AggFunc::CountNonNull, 0), "_count0");
     assert_eq!(default_agg_name(AggFunc::Sum, 1), "_sum1");
     assert_eq!(default_agg_name(AggFunc::Min, 2), "_min2");
     assert_eq!(default_agg_name(AggFunc::Max, 3), "_max3");
