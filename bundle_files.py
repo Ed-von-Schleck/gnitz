@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """Concatenate files into one bundle with LLM-friendly boundary markers.
 
-Emits Gemini-style plain-text delimiters (`--- path ---`), the format Google's
-long-context tooling uses, so an LLM served the bundle as a single file can
-still tell the originals apart. Paths are recorded relative to the current
-directory, or absolute where the relative form would climb out of it.
-Originals are never modified.
+Emits Gemini-style plain-text delimiters (`--- path ---`), so an LLM served the
+bundle as a single file can still tell the originals apart. Paths are recorded
+relative to the current directory, or absolute where the relative form would
+climb out of it. Originals are never modified.
 
 A boundary marker is not escaped in the file bodies, so an input line that
 itself reads `--- x ---` is indistinguishable from one.
-
-Usage:
-    bundle_files.py FILE [FILE ...] [-o OUTPUT]
 
 Without -o the bundle is written to stdout.
 """
@@ -19,24 +15,31 @@ Without -o the bundle is written to stdout.
 import argparse
 import os
 import sys
-from pathlib import Path
 
 
 def display_path(p):
     """`p` relative to the current directory, or absolute when the relative
     form would escape it — `../../etc/hosts` names the file by where the
-    bundler happened to run, and across Windows drives `relpath` raises."""
+    bundler happened to run."""
     absolute = os.path.abspath(p)
-    try:
-        rel = os.path.relpath(absolute)
-    except ValueError:
-        return absolute
+    rel = os.path.relpath(absolute)
     return absolute if rel.split(os.sep)[0] == os.pardir else rel
 
 
-def bundle(paths, out):
-    """Write the already-read `(display path, text)` pairs as one bundle."""
-    for i, (rel, text) in enumerate(paths):
+def read_text(path):
+    """The file's text, and whether undecodable bytes were replaced. A non-UTF-8
+    input is still bundled — U+FFFD is the right default for a tool feeding an
+    LLM a single blob — but not silently: the caller names the file on stderr."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    try:
+        return raw.decode("utf-8"), False
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", errors="replace"), True
+
+
+def bundle(entries, out):
+    for i, (rel, text) in enumerate(entries):
         if i:
             out.write("\n")
         out.write(f"--- {rel} ---\n")
@@ -52,10 +55,6 @@ def main():
     ap.add_argument("-o", "--output", help="output file (default: stdout)")
     args = ap.parse_args()
 
-    missing = [f for f in args.files if not Path(f).is_file()]
-    if missing:
-        sys.exit("error: not a file: " + ", ".join(missing))
-
     # Opening the output truncates it, so an output that is also an input would
     # be destroyed before it could be read. `realpath` rather than `samefile`:
     # the output need not exist yet.
@@ -66,18 +65,31 @@ def main():
             sys.exit(f"error: output {args.output} is also an input: " + ", ".join(clashing))
 
     # Read everything before writing anything: a read that fails halfway would
-    # otherwise leave a truncated bundle behind. The `is_file` pass above names
-    # every bad path at once; this catches what it cannot predict — a permission
-    # error, or a file that moved between the two.
+    # otherwise leave a truncated bundle behind. Every bad path is named by the
+    # errno the open raised — a missing file, a directory, a permission error —
+    # rather than by a pre-pass that would call a FIFO or `/dev/stdin` "not a
+    # file".
+    contents = []
+    mangled = []
     try:
-        contents = [(display_path(f), Path(f).read_text(encoding="utf-8", errors="replace"))
-                    for f in args.files]
+        for f in args.files:
+            text, replaced = read_text(f)
+            if replaced:
+                mangled.append(f)
+            contents.append((display_path(f), text))
     except OSError as e:
         sys.exit(f"error: cannot read {e.filename}: {e.strerror}")
 
+    for f in mangled:
+        print(f"warning: {f} is not valid UTF-8; undecodable bytes replaced with U+FFFD",
+              file=sys.stderr)
+
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as out:
-            bundle(contents, out)
+        try:
+            with open(args.output, "w", encoding="utf-8") as out:
+                bundle(contents, out)
+        except OSError as e:
+            sys.exit(f"error: cannot write {e.filename or args.output}: {e.strerror}")
         print(f"wrote {len(contents)} files to {args.output}", file=sys.stderr)
     else:
         bundle(contents, sys.stdout)
