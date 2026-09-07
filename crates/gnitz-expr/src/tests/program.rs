@@ -15,8 +15,8 @@ use crate::test_support::{
     schema_pk_ints, schema_pk_strings, TestSchema, TestView,
 };
 use crate::{
-    CmpOp, ConstIdx, Evaluator, ExprValidateErr, FloatArithOp, Instr, IntArithOp, LogicalInstr, LogicalProgram, Reg,
-    Sink,
+    CmpOp, ColumnLocator, ConstIdx, Evaluator, ExprValidateErr, FloatArithOp, Instr, IntArithOp, LogicalInstr,
+    LogicalProgram, NullPerm, Reg, Sink,
 };
 
 /// The phrase a `ColKindMismatch` renders for `kind`, read from its one source
@@ -2234,4 +2234,54 @@ fn sequential_copy_projection() {
         vec![],
     );
     assert_eq!(computed.sequential_copy_base(), None);
+}
+
+/// The three shapes [`NullPerm`] collapses a copy list to, and the window each
+/// writes. A source that cannot carry a set bit contributes no pair.
+#[test]
+fn null_perm_collapses_a_copy_list_to_three_shapes() {
+    let payload = |slot: u8| ColumnLocator::Payload { slot, size: 8, type_code: type_code::I64 };
+    let pk = ColumnLocator::Pk {
+        byte_off: 0,
+        size: 8,
+        type_code: type_code::U64,
+    };
+    // Payload slots 0 and 2 admit NULL; slot 1 is NOT NULL.
+    let nullable = 0b101;
+
+    // Only sources with no bit of their own: nothing to move.
+    let zero = NullPerm::new(&[(pk, 0, 8), (payload(1), 1, 8)], nullable);
+    assert!(matches!(zero, NullPerm::Zero));
+
+    // Every bit stays in its slot — one AND against the kept slots.
+    let mask = NullPerm::new(&[(payload(0), 0, 8), (payload(1), 1, 8), (payload(2), 2, 8)], nullable);
+    assert!(matches!(mask, NullPerm::Mask(0b101)));
+
+    // Slot 2 -> slot 0 moves a bit, so the whole list permutes.
+    let perm = NullPerm::new(&[(payload(2), 0, 8), (payload(0), 1, 8)], nullable);
+    assert!(matches!(&perm, NullPerm::Permute(p) if p == &[(2u8, 0u8), (0, 1)]));
+
+    // Two source rows, both bits set; the destination starts non-zero, so a
+    // window an arm left alone reads as a stale bit rather than as a zero.
+    let mut src = [0u8; 16];
+    gnitz_wire::write_u64_le(&mut src, 0, 0b101);
+    gnitz_wire::write_u64_le(&mut src, 8, 0b100);
+    for (perm, want) in [
+        (zero, [0u64, 0]),
+        (mask, [0b101, 0b100]),
+        // Row 0: slot 2 -> 0 and slot 0 -> 1. Row 1: only slot 2 is set.
+        (perm, [0b11, 0b1]),
+    ] {
+        let mut dst = [0xAAu8; 24];
+        perm.write_rows(&src, 0, &mut dst, 1, 2);
+        assert_eq!(
+            gnitz_wire::read_u64_le(&dst, 0),
+            u64::from_le_bytes([0xAA; 8]),
+            "row 0 is outside the window"
+        );
+        assert_eq!(
+            [gnitz_wire::read_u64_le(&dst, 8), gnitz_wire::read_u64_le(&dst, 16)],
+            want
+        );
+    }
 }

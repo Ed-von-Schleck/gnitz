@@ -14,7 +14,7 @@ use std::cell::RefCell;
 
 use crate::batch::{eval_batch, scan_filter_bits, with_str_bufs, EvalScratch, MorselOut, StrBufs, MORSEL};
 use crate::program::Role;
-use crate::{BatchView, ColumnLocator, ExprValidateErr, LogicalProgram, ResolvedProgram, SchemaFacts};
+use crate::{BatchView, ColumnLocator, ExprValidateErr, LogicalProgram, NullPerm, ResolvedProgram, SchemaFacts};
 
 /// One program's result for every row of a batch, in the shape its result
 /// register's class fixes. A consumer reads the class off the value it was
@@ -167,11 +167,10 @@ impl Evaluator {
         !self.scalar_emits().is_empty() || !self.str_emits().is_empty()
     }
 
-    /// Bit `N` set iff payload slot `N` of the schema this program was resolved
-    /// against admits NULL — the mask the resolution's own nullability verdict
-    /// rests on, so a columnar consumer reads it rather than recomputing it.
-    pub fn nullable_slots(&self) -> u64 {
-        self.prog.nullable_slots
+    /// How a map moves a copied column's null bit — the copy list and the
+    /// schema's nullable slots, resolved into one permutation.
+    pub fn null_perm(&self) -> &NullPerm {
+        &self.prog.null_perm
     }
 
     /// Run as a filter over all of `mb`'s rows, collecting each maximal

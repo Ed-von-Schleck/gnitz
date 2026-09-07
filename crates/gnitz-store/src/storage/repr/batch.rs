@@ -296,8 +296,18 @@ impl Batch {
     /// writers do not.
     pub fn with_capacity_blob(schema: &SchemaDescriptor, rows: usize, blob_bytes: usize) -> Self {
         let mut b = Self::with_capacity(schema, rows);
-        b.blob = acquire_arena(blob_bytes, Fill::Reserve);
+        b.reserve_blob(blob_bytes);
         b
+    }
+
+    /// Room for `bytes` more blob heap bytes, taken from the arena pool `Drop`
+    /// recycles into — a bare [`Vec::reserve`] would take them from the global
+    /// allocator. A heap already holding bytes has to grow in place.
+    pub fn reserve_blob(&mut self, bytes: usize) {
+        match self.blob.capacity() {
+            0 => self.blob = acquire_arena(bytes, Fill::Reserve),
+            _ => self.blob.reserve(bytes),
+        }
     }
 
     /// `rows` all-zero rows, already published. The one shape [`Self::with_capacity`]

@@ -1649,6 +1649,7 @@ impl LogicalProgram {
             instrs.push(resolved);
         }
         ResolvedProgram {
+            null_perm: NullPerm::new(&copies, nullable_slots),
             copies,
             scalar_emits,
             str_emits,
@@ -2285,6 +2286,81 @@ fn decode_int_set(bytes: &[u8]) -> Vec<i64> {
 }
 
 // ---------------------------------------------------------------------------
+// NullPerm — columnar null bitmap permutation
+// ---------------------------------------------------------------------------
+
+/// How a map derives each output row's null word from its input row's — the
+/// three shapes the `(source slot, destination slot)` pair list collapses to.
+pub enum NullPerm {
+    /// No copied source can carry a set bit, so every output word is zero.
+    Zero,
+    /// Every pair moves a bit to the slot it already occupies, so the whole
+    /// permutation is one AND against the kept slots' mask — any projection of
+    /// a column prefix.
+    Mask(u64),
+    /// Some bit changes slot: one shift-test-shift-or per pair per row.
+    Permute(Vec<(u8, u8)>),
+}
+
+impl NullPerm {
+    /// Build from the column moves. A source contributes a pair only if it can
+    /// carry a set bit: a PK source has none, and a `NOT NULL` payload source is
+    /// masked out by `nullable`.
+    pub(crate) fn new(copies: &[(ColumnLocator, u32, u8)], nullable: u64) -> Self {
+        let pairs: Vec<(u8, u8)> = copies
+            .iter()
+            .filter_map(|&(src, dst_payload, _)| match src {
+                ColumnLocator::Pk { .. } => None,
+                ColumnLocator::Payload { slot, .. } => {
+                    gnitz_wire::null_word_get(nullable, slot as usize).then_some((slot, dst_payload as u8))
+                }
+            })
+            .collect();
+        if pairs.is_empty() {
+            return NullPerm::Zero;
+        }
+        if pairs.iter().all(|&(src, dst)| src == dst) {
+            return NullPerm::Mask(pairs.iter().fold(0u64, |m, &(src, _)| m | 1u64 << src));
+        }
+        NullPerm::Permute(pairs)
+    }
+
+    #[inline]
+    fn permute(pairs: &[(u8, u8)], in_null: u64) -> u64 {
+        let mut out: u64 = 0;
+        for &(src, dst) in pairs {
+            out |= (gnitz_wire::null_word_get(in_null, src as usize) as u64) << dst;
+        }
+        out
+    }
+
+    /// Derive the null words of `out` rows `[dst_base, dst_base + n)` from
+    /// source rows `[src_start, src_start + n)`, one u64 per row. Every arm
+    /// writes the whole window: the destination may be an uninitialized tail.
+    pub fn write_rows(&self, in_null_bmp: &[u8], src_start: usize, out: &mut [u8], dst_base: usize, n: usize) {
+        let dst = &mut out[dst_base * 8..(dst_base + n) * 8];
+        let pairs = match self {
+            NullPerm::Zero => {
+                dst.fill(0);
+                return;
+            }
+            NullPerm::Mask(mask) => {
+                for row in 0..n {
+                    let in_null = gnitz_wire::read_u64_le(in_null_bmp, (src_start + row) * 8);
+                    gnitz_wire::write_u64_le(dst, row * 8, in_null & mask);
+                }
+                return;
+            }
+            NullPerm::Permute(pairs) => pairs.as_slice(),
+        };
+        for row in 0..n {
+            let in_null = gnitz_wire::read_u64_le(in_null_bmp, (src_start + row) * 8);
+            gnitz_wire::write_u64_le(dst, row * 8, Self::permute(pairs, in_null));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ResolvedProgram — the evaluable form
 // ---------------------------------------------------------------------------
 
@@ -2299,6 +2375,9 @@ pub(crate) struct ResolvedProgram {
     /// The width is the *output* column's, wider than the source's only for a
     /// promoted integer column — the widening `check_copy_types` approved.
     pub(crate) copies: Vec<(ColumnLocator, u32, u8)>,
+    /// [`Self::copies`] and [`Self::nullable_slots`] resolved into the null-word
+    /// permutation a map drives, so no consumer rebuilds it.
+    pub(crate) null_perm: NullPerm,
     /// A map's computed columns whose source register holds a scalar, as
     /// `(source register, output payload slot)`.
     pub(crate) scalar_emits: Vec<(u16, u32)>,

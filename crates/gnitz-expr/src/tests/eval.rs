@@ -12,7 +12,7 @@ use crate::test_support::{
     passing_ranges, passing_rows, push_payload_cols, row_value, scalar_prog, schema_pk_ints, schema_pk_strings,
     set_row_pk, FilterShape, TestSchema, TestView,
 };
-use crate::{CmpOp, Evaluator, ExprResults, IntArithOp, LogicalInstr};
+use crate::{CmpOp, Evaluator, ExprResults, IntArithOp, LogicalInstr, NullPerm};
 
 /// True iff `ev`'s predicate passes for `row`, read back as a value. `ev` must be
 /// the *scalar* resolution: `eval_all` refuses a filter-resolved evaluator.
@@ -22,12 +22,12 @@ fn passes(ev: &Evaluator, mb: &TestView, row: usize) -> bool {
 
 /// The map-side surface an engine consumer reads a resolved program through:
 /// which columns are copied verbatim, which are written out of the register
-/// file, and which output slots admit NULL. Every one of these is read by
-/// `gnitz-server`'s columnar map, so a wrong answer here is a wrong output
+/// file, and how a copied column's null bit moves. Every one of these is read by
+/// the engine's columnar map, so a wrong answer here is a wrong output
 /// column there — but none of them is visible through the three drive methods
 /// the rest of this file exercises.
 #[test]
-fn a_resolved_map_reports_its_copies_emits_and_nullable_slots() {
+fn a_resolved_map_reports_its_copies_emits_and_null_perm() {
     // in:  pk U64, 0: I64 nullable, 1: STRING nullable
     // out: pk U64, 0: I64 (copied verbatim), 1: I64 (computed), 2: STRING (computed)
     let in_schema = TestSchema::new(
@@ -58,10 +58,9 @@ fn a_resolved_map_reports_its_copies_emits_and_nullable_slots() {
     // One verbatim move: input column 1 into output slot 0, at the output width.
     let copies: Vec<(u32, u8)> = ev.copies().iter().map(|&(_, out, w)| (out, w)).collect();
     assert_eq!(copies, vec![(0, 8)]);
-    // Bit N set iff *input* payload slot N admits NULL — the schema the program
-    // reads through, not the one it writes. Both input payload columns are
-    // nullable; the output's non-nullable slot 1 does not appear here.
-    assert_eq!(ev.nullable_slots(), 0b11);
+    // The one copy moves nullable *input* slot 0 onto output slot 0, so the null
+    // word passes through one AND; the uncopied string column adds no bit.
+    assert!(matches!(ev.null_perm(), NullPerm::Mask(0b1)));
     assert!(!ev.result_is_str(), "a map's result register is meaningless");
 
     // A pure projection emits nothing, so driving its kernel cannot change the

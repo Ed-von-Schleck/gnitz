@@ -507,6 +507,95 @@ fn map_with_pack_pk_source_promotes_payload_to_pk() {
     assert!(!out.is_consolidated(), "a stamped PK must not be marked consolidated");
 }
 
+/// `PkSource::HashRow` keys a row by its payload *content*, not by its cell
+/// bytes: equal rows must land on one PK, or EXCEPT/INTERSECT cannot cancel
+/// them, and unequal rows must not, or two elements coalesce into one.
+#[test]
+fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
+    const LONG_A: &[u8] = b"the-quick-brown-fox";
+    // Equal in the 4 bytes the cell inlines as its prefix, different past them.
+    const LONG_B: &[u8] = b"the-quick-brown-cat";
+
+    // (payload value, is NULL, STRING content, BLOB content). Each cell is
+    // encoded as its row is built, so equal content lands at unequal offsets.
+    let rows: &[(i64, bool, &[u8], &[u8])] = &[
+        (5, false, LONG_A, b"blob-past-twelve-bytes"),
+        // 1: row 0 again.
+        (5, false, LONG_A, b"blob-past-twelve-bytes"),
+        // 2..=4: one column changed each.
+        (7, false, LONG_A, b"blob-past-twelve-bytes"),
+        (5, false, LONG_B, b"blob-past-twelve-bytes"),
+        (5, false, LONG_A, b"blob-past-twelve-other"),
+        // 5, 6: NULL payload cells whose underlying bytes differ.
+        (111, true, LONG_A, b"blob-past-twelve-bytes"),
+        (222, true, LONG_A, b"blob-past-twelve-bytes"),
+        // 7, 8: inline cells, twice.
+        (5, false, b"abc", b"abc"),
+        (5, false, b"abc", b"abc"),
+        // 9, 10: the two columns' contents swapped.
+        (5, false, b"ab", b"cd"),
+        (5, false, b"cd", b"ab"),
+    ];
+
+    let in_schema = make_schema(0, &[type_code::U64, type_code::I64, type_code::STRING, type_code::BLOB]);
+    let mut batch = Batch::with_capacity(&in_schema, rows.len());
+    for (row, &(v, is_null, s, b)) in rows.iter().enumerate() {
+        batch.extend_pk(row as u128);
+        batch.extend_weight(&1i64.to_le_bytes());
+        // Bit 0 is payload slot 0 — the I64 column.
+        batch.extend_null_bmp(&(is_null as u64).to_le_bytes());
+        batch.extend_col(0, &v.to_le_bytes());
+        for (pi, content) in [(1, s), (2, b)] {
+            let cell = gnitz_wire::encode_german_string(content, &mut batch.blob);
+            batch.extend_col(pi, &cell);
+        }
+        batch.count += 1;
+    }
+
+    // The hash-row output schema: one synthetic U128 PK, then the payload.
+    let out_schema = make_schema(
+        0,
+        &[type_code::U128, type_code::I64, type_code::STRING, type_code::BLOB],
+    );
+    let plan = |branch_id| {
+        MapPlan::from_map(
+            LogicalProgram::copy_cols(&[1, 2, 3]),
+            &in_schema,
+            &out_schema,
+            PkSource::HashRow { branch_id },
+        )
+        .unwrap()
+    };
+    let out = plan(0).evaluate_map_batch(&batch);
+    assert_eq!(out.count, rows.len());
+    let pk = |row: usize| out.get_pk(row);
+
+    assert_eq!(pk(0), pk(1), "equal content must key equally, at whatever heap offset");
+    assert_eq!(
+        pk(5),
+        pk(6),
+        "a NULL cell hashes as its marker, not as the bytes under it"
+    );
+    assert_eq!(pk(7), pk(8), "and so must two rows of inline cells");
+    for (a, b, what) in [
+        (0, 2, "a differing payload value"),
+        (0, 3, "a long string differing only past its inline prefix"),
+        (0, 4, "a differing BLOB beside an equal STRING"),
+        (0, 5, "a NULL cell against a non-NULL one"),
+        (0, 7, "inline cells against heap-backed ones"),
+        (9, 10, "the two string columns' contents swapped"),
+    ] {
+        assert_ne!(pk(a), pk(b), "{what} must move the PK");
+    }
+
+    // The branch discriminator: the same row on the other side of a UNION ALL
+    // must not collide, or the two would consolidate to one element.
+    let other = plan(1).evaluate_map_batch(&batch);
+    assert_ne!(pk(0), other.get_pk(0), "the branch id must reach the digest");
+    // An in-place PK rewrite drops the layout claim.
+    assert!(!out.is_consolidated(), "a stamped PK must not be marked consolidated");
+}
+
 /// Every PK width is its own monomorphization in `copy_column`'s unswitched PK
 /// arm. A compound PK whose list order is not its column order drives all five at
 /// once: each column lands in a payload slot of its own type, as the native
