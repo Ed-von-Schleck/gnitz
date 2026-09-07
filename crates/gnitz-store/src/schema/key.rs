@@ -91,6 +91,15 @@ pub(crate) fn pk_in_range(min: &[u8], max: &[u8], key: &[u8]) -> bool {
     compare_pk_bytes(min, key) != Ordering::Greater && compare_pk_bytes(key, max) != Ordering::Greater
 }
 
+/// The **inclusive** OPK ranges `[min, max]` and `[lo, hi]` intersect — whether a
+/// run or shard holding `[min, max]` can answer about a key the caller's bound
+/// admits. A half-open upper bound passed as `hi` over-approximates, which is
+/// the safe direction.
+#[inline]
+pub(crate) fn pk_ranges_overlap(min: &[u8], max: &[u8], lo: &[u8], hi: &[u8]) -> bool {
+    compare_pk_bytes(max, lo) != Ordering::Less && compare_pk_bytes(min, hi) != Ordering::Greater
+}
+
 // ---------------------------------------------------------------------------
 // Order-preserving PK encoder
 // ---------------------------------------------------------------------------

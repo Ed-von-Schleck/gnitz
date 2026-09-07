@@ -1,6 +1,6 @@
 use super::enforce_unique_pk;
 use crate::schema::type_code;
-use crate::storage::{Batch, RecoverySource, Table};
+use crate::storage::{Batch, RecoverySource, StoreBudgets, Table};
 use crate::test_support::{make_batch_opk, opk_pk, pk_payload_schema, wide_row};
 use gnitz_expr::RowSource;
 
@@ -71,6 +71,7 @@ fn enforce_unique_pk_holds_at_every_pk_shape() {
             schema,
             1234,
             RecoverySource::Rederive { resume_at: None },
+            StoreBudgets::default(),
         )
         .unwrap();
 
@@ -144,6 +145,7 @@ fn enforce_unique_pk_lazy_build_matches_the_row_by_row_oracle() {
         schema,
         4321,
         RecoverySource::Rederive { resume_at: None },
+        StoreBudgets::default(),
     )
     .unwrap();
     let seed = enforce_unique_pk(&pt, &schema, make_batch_opk(&schema, &[(&key(0), 1, 700)]));

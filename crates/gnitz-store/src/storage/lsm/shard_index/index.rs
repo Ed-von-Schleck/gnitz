@@ -12,10 +12,10 @@ use super::super::error::StorageError;
 use super::super::shard_reader::MappedShard;
 use super::super::to_cstrings;
 use super::{
-    Budget, CompactionInputs, CompactionKind, LevelGuard, ShardEntry, ShardIndex, FLSM_LEVELS, GUARD_FILE_THRESHOLD,
-    L0_COMPACT_THRESHOLD, LMAX_FILE_THRESHOLD, MIN_GUARD_BYTES, SWEEP_STEPS, TERMINAL_LEVEL_IDX,
+    CompactionInputs, CompactionKind, LevelGuard, ShardBudget, ShardEntry, ShardIndex, FLSM_LEVELS,
+    GUARD_FILE_THRESHOLD, L0_COMPACT_THRESHOLD, LMAX_FILE_THRESHOLD, MIN_GUARD_BYTES, SWEEP_STEPS, TERMINAL_LEVEL_IDX,
 };
-use crate::schema::key::{leading_u64, pack_pk_be, PkBuf};
+use crate::schema::key::{leading_u64, pack_pk_be, pk_ranges_overlap, PkBuf};
 
 impl ShardIndex {
     pub(super) fn all_entries(&self) -> impl Iterator<Item = &ShardEntry> {
@@ -103,7 +103,10 @@ impl ShardIndex {
         let l0 = self
             .l0
             .iter()
-            .filter(move |e| !e.is_empty() && e.pk_max >= lo && e.pk_min <= hi)
+            .filter(move |e| {
+                !e.is_empty()
+                    && pk_ranges_overlap(e.pk_min.pk_bytes(), e.pk_max.pk_bytes(), lo.pk_bytes(), hi.pk_bytes())
+            })
             .map(|e| Rc::clone(&e.shard));
         let deep = self.levels.iter().flat_map(move |level| {
             let run = level.find_guards_for_range(lo.pk_bytes(), hi.pk_bytes());
@@ -112,6 +115,12 @@ impl ShardIndex {
                 .flat_map(|g| g.entries.iter().map(|e| Rc::clone(&e.shard)))
         });
         l0.chain(deep)
+    }
+
+    /// Registered shards across every tier — one cursor source each, which is
+    /// what an unbounded cursor open sizes its vectors to.
+    pub(crate) fn shard_count(&self) -> usize {
+        self.all_entries().count()
     }
 
     /// Raw rows across every live shard, summed without touching an `Rc`. Raw:
@@ -134,22 +143,12 @@ impl ShardIndex {
     /// Only the whole-relation scan asks this; every other read verb asks its
     /// cursor's own cached `any_skeleton`.
     pub(crate) fn has_skeleton_shard(&self) -> bool {
-        matches!(self.budget, Budget::Dehydrate(_))
+        matches!(self.budget, ShardBudget::Dehydrate(_))
             && self.levels[TERMINAL_LEVEL_IDX]
                 .guards
                 .iter()
                 .flat_map(|g| g.entries.iter())
                 .any(|e| e.shard.is_skeleton())
-    }
-
-    /// Test-only u128 oracle: OPK-encodes a **native** PK value (handling
-    /// signed/compound columns) and delegates to [`find_pk_bytes`], the
-    /// production path. Wide PKs cannot fit a u128.
-    #[cfg(test)]
-    pub(crate) fn find_pk(&self, key: u128, visitor: &mut impl FnMut(Rc<MappedShard>, usize)) {
-        let opk = crate::schema::key::opk_key(&self.schema, &key.to_le_bytes());
-        let filter_key = crate::schema::key::probe_key(opk.pk_bytes());
-        self.find_pk_bytes(opk.pk_bytes(), filter_key, visitor);
     }
 
     /// Point lookup by OPK `key` bytes — universal across all PK widths. L0 is
@@ -273,7 +272,7 @@ impl ShardIndex {
     }
 
     /// Drain `pending_deletions` right here, for a store that publishes no
-    /// manifest (see [`Budget::Drop`]). A no-op for every other store, which
+    /// manifest (see [`ShardBudget::Drop`]). A no-op for every other store, which
     /// defers to the checkpoint barrier's post-publish drain.
     ///
     /// Hung off the *store*, not off the eviction step, so the ordinary
@@ -281,7 +280,7 @@ impl ShardIndex {
     /// than this compaction's share, which is correct here because every entry in
     /// such a store's queue is its own.
     fn unlink_superseded_now(&mut self) {
-        if matches!(self.budget, Budget::Drop(_)) {
+        if matches!(self.budget, ShardBudget::Drop(_)) {
             self.try_cleanup();
         }
     }
@@ -517,7 +516,7 @@ impl ShardIndex {
         )
     }
 
-    /// Evict a guard by **unlinking** it ([`Budget::Drop`]): no output shard is
+    /// Evict a guard by **unlinking** it ([`ShardBudget::Drop`]): no output shard is
     /// written at all, so the sweep costs unlinks where a bounded view's costs a
     /// whole-guard rewrite.
     ///
@@ -589,7 +588,7 @@ impl ShardIndex {
     /// Merge one L1 band with the terminal guards its span overlaps — a run of
     /// exactly one once [`Self::vertical_fold`] has banded the source. The
     /// terminal level is the deepest destination: an L2→L3 fold would serialize a
-    /// level `load_manifest` rejects.
+    /// level `install_manifest` rejects.
     fn fold_band_into_terminal(&mut self, src_guard_idx: usize) -> Result<(), StorageError> {
         const DEST_IDX: usize = TERMINAL_LEVEL_IDX;
 
@@ -643,7 +642,7 @@ impl ShardIndex {
     /// terminal-level guards, oldest-written first — the only recency signal the
     /// tree carries, since nothing records that a row was *read*. An eviction
     /// leaves skeleton rows behind for a capacity-bounded view's output store and
-    /// nothing at all for a delta store ([`Budget::Drop`]).
+    /// nothing at all for a delta store ([`ShardBudget::Drop`]).
     ///
     /// While over `cap`: evict the oldest hydrated terminal guard if there is
     /// one; otherwise push a level's worth of data down to make one — draining L1
@@ -659,9 +658,9 @@ impl ShardIndex {
     /// residue to stop at.
     pub(crate) fn enforce_capacity(&mut self) -> Result<(), StorageError> {
         let (cap, drops) = match self.budget {
-            Budget::Unbounded => return Ok(()),
-            Budget::Dehydrate(cap) => (cap, false),
-            Budget::Drop(cap) => (cap, true),
+            ShardBudget::Unbounded => return Ok(()),
+            ShardBudget::Dehydrate(cap) => (cap, false),
+            ShardBudget::Drop(cap) => (cap, true),
         };
         let mut pushed_down = false;
         while self.resident_bytes() > cap {

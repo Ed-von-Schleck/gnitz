@@ -38,6 +38,7 @@ impl CircuitTables {
             Self::schema(),
             0,
             RecoverySource::Rederive { resume_at: None },
+            StoreBudgets::default(),
         )
         .unwrap();
         Self { nodes, _tmp: tmp }

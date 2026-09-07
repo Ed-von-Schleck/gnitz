@@ -37,8 +37,10 @@ pub(super) struct RunSet {
     /// point-probed — view and operator-trace tables never probe at all — so
     /// hashing every ingested row up front would be pure overhead for the bulk
     /// of ingest volume. Base tables probe once per DML row, so they build once
-    /// per fold window and amortize. Dropped on every fold and rebuilt on the
-    /// next probe, which also clears the stale hashes of weight-cancelled rows.
+    /// per fold window and amortize.
+    ///
+    /// A fold that cancelled rows drops it, so the next probe rebuilds without
+    /// their hashes; one that cancelled none keeps it (see [`Self::fold`]).
     ///
     /// A worker owns its partition single-threaded, so `OnceCell` needs no
     /// synchronization.
@@ -92,7 +94,7 @@ impl RunSet {
         &self.runs
     }
 
-    #[cfg(test)]
+    /// How many runs this set holds — one cursor source each.
     pub(super) fn len(&self) -> usize {
         self.runs.len()
     }
@@ -158,20 +160,26 @@ impl RunSet {
     }
 
     /// Fold every run into one consolidated run, dropping net-zero
-    /// (PK, payload) rows. The bloom is dropped rather than rebuilt: the next
-    /// probe rebuilds it from the survivors alone, so a set that is folded and
-    /// then flushed without being probed never pays for the rebuild at all.
+    /// (PK, payload) rows.
+    ///
+    /// An unchanged row count means nothing cancelled, so the bloom already
+    /// holds exactly the survivors' keys and is kept — rebuilding on every fold
+    /// is quadratic between clears, since fold *j* re-hashes what folds
+    /// 1..*j*−1 hashed.
     pub(super) fn fold(&mut self, schema: &SchemaDescriptor) {
         if self.runs.len() <= 1 {
             return;
         }
         let sorted: Vec<MemBatch> = self.runs.iter().map(|r| r.as_mem_batch()).collect();
+        let input_rows: usize = sorted.iter().map(|b| b.count).sum();
         let merged = consolidate_batches(&sorted, schema);
         drop(sorted); // borrows self.runs; release before the mutable reborrow
         self.runs.clear();
-        self.bloom.take();
-        self.bytes = merged.total_bytes();
+        if merged.count != input_rows {
+            self.bloom.take();
+        }
         if merged.count > 0 {
+            self.bytes = merged.total_bytes();
             self.runs.push(Rc::new(merged));
         } else {
             self.bytes = 0;

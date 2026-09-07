@@ -41,10 +41,7 @@ impl CatalogEngine {
         // environment once. `env_num` refuses a zero and an unparseable value.
         let defaults = StoreConfig::default();
         let config = StoreConfig {
-            ram: RamBudgets {
-                ram_tier_bytes: env_num("GNITZ_RAM_TIER_BYTES", defaults.ram.ram_tier_bytes),
-                ..defaults.ram
-            },
+            ram_tier_bytes: env_num("GNITZ_RAM_TIER_BYTES", defaults.ram_tier_bytes),
             scan_chunk_rows: env_num("GNITZ_SCAN_CHUNK_ROWS", defaults.scan_chunk_rows),
             adhoc_group_cap: env_num("GNITZ_ADHOC_GROUP_CAP", defaults.adhoc_group_cap),
         };
@@ -53,12 +50,12 @@ impl CatalogEngine {
         // kind they are later registered under).
         let mut stores: Vec<Table> = Vec::with_capacity(SysFamily::COUNT);
         for family in SysFamily::ALL {
-            let table = Table::with_budgets(
+            let table = Table::new(
                 &sys_family_dir(base_dir, family.name()),
                 *family.schema(),
                 family.id() as u32,
                 RecoverySource::SalReplay,
-                config.ram,
+                StoreBudgets::new(config.ram_tier_bytes),
             )
             .map_err(|e| format!("Failed to create system table '{}': error {}", family.name(), e))?;
             stores.push(table);

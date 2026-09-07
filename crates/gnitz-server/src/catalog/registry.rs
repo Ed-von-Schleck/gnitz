@@ -348,7 +348,7 @@ impl CatalogEngine {
     /// server's caller (`boot_checkpoint`) bumps the checkpoint generation right
     /// after, and that flush carries this row to the same shard.
     pub(crate) fn record_topology(&mut self, worker_count: u32) -> Result<(), StorageError> {
-        let value = gnitz_store::storage::topology_word(worker_count);
+        let value = gnitz_store::relation::topology_word(worker_count);
         if self.registry.recorded_topology() == value {
             return Ok(());
         }

@@ -28,32 +28,18 @@ use gnitz_wire::{read_u64_le, write_u64_le};
 //   level      u64
 //   guard_key  W_GUARD_KEY OPK bytes
 //
-// The manifest records only what `load_manifest` consumes: which shard files
+// The manifest records only what `install_manifest` consumes: which shard files
 // are live, their tier placement (level, guard) and LSN watermark, plus the
 // two header counters that must survive a restart. PK bounds are re-derived
 // from each shard's mmap at open (`ShardEntry::open`), so they are not
 // serialized. `guard_key` is a whole OPK key — the same key the compaction
 // writer routes by and the read router probes with. It carries no length:
 // every stored guard key is exactly the schema's `pk_stride` wide, and
-// `load_manifest` holds the schema, exactly as `ShardEntry::open` does.
+// `install_manifest` holds the schema, exactly as `ShardEntry::open` does.
 
 const MAGIC: u64 = 0x4D414E49464E5447;
 const VERSION: u64 = 10;
 const HEADER_SIZE: usize = 56;
-
-/// Operator-state format version. Bump on any change to an operator-state
-/// schema; a mismatch (recorded in `_sequences` via `SEQ_ID_TOPOLOGY`) marks
-/// every Rederive view invalid at boot, so its state is rebuilt. Shard and
-/// manifest layout changes are carried by their own version words.
-pub(crate) const STATE_FORMAT: u32 = 8;
-
-/// The durable topology word recorded in `_sequences` (`SEQ_ID_TOPOLOGY`):
-/// `(worker_count << 32) | STATE_FORMAT`. The single packer shared by the
-/// boot-time recorder and the resume-verdict validator, so the two can never
-/// drift on the encoding.
-pub fn topology_word(worker_count: u32) -> u64 {
-    ((worker_count as u64) << 32) | STATE_FORMAT as u64
-}
 
 // Header offsets.
 const OFF_ENTRY_COUNT: usize = 16;
@@ -112,7 +98,7 @@ impl ManifestEntryRaw {
         let mut filename = [0u8; W_FILENAME];
         filename[..bytes.len()].copy_from_slice(bytes);
         // A `PkBuf`'s tail past its width is always zero, so the stored array is
-        // the key zero-padded — which is what `load_manifest` slices back to
+        // the key zero-padded — which is what `install_manifest` slices back to
         // `pk_stride`.
         let mut key = [0u8; W_GUARD_KEY];
         key.copy_from_slice(guard_key.padded(W_GUARD_KEY));

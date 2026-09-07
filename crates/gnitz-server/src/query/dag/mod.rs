@@ -202,7 +202,7 @@ impl DagEngine {
                 .owned_store()
                 .map_or(RecoverySource::Rederive { resume_at: None }, Table::recovery_source),
             slot: registry.slot(),
-            ram: registry.config().ram,
+            budgets: registry.store_budgets(),
         };
         // The compiler layer sees only the circuit system table, never `VIEW_TAB`,
         // so it cannot derive whether the view is capacity-bounded.

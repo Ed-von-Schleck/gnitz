@@ -2434,6 +2434,7 @@ fn test_seek_by_index_range_wide_pk_collect_sort_resolve() {
         schema,
         tid as u32,
         RecoverySource::Rederive { resume_at: None },
+        StoreBudgets::default(),
     )
     .unwrap();
     engine.registry_mut().register_owned(

@@ -408,7 +408,14 @@ fn child_manifest(rel: &str, k: u32, of: u32) -> String {
 /// state a real cluster's checkpoint leaves behind — has to write the other
 /// ranks itself.
 fn open_child(rel: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64) -> gnitz_store::storage::Table {
-    gnitz_store::storage::Table::new(&child_path(rel, k, of), schema, tid as u32, RecoverySource::SalReplay).unwrap()
+    gnitz_store::storage::Table::new(
+        &child_path(rel, k, of),
+        schema,
+        tid as u32,
+        RecoverySource::SalReplay,
+        StoreBudgets::default(),
+    )
+    .unwrap()
 }
 
 /// The subset of `rows` that `worker_for_pk` places on worker `k` of `of` — the

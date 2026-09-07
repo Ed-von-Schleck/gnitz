@@ -14,7 +14,7 @@ use rustc_hash::FxHashMap;
 
 use crate::schema::SchemaDescriptor;
 
-use crate::storage::{Batch, ChildAddr, RamBudgets, RecoverySource, Slot, StorageError, StoreError, Table};
+use crate::storage::{Batch, ChildAddr, RecoverySource, Slot, StorageError, StoreBudgets, StoreError, Table};
 use gnitz_wire::PkColList;
 
 mod build;
@@ -22,6 +22,7 @@ mod dirs;
 mod ingest;
 mod store_handle;
 mod store_lsn;
+mod unique_pk;
 
 pub use dirs::{ensure_dir, lock_data_dir, relation_dir, staged_dir, DIR_LOCK_RETRY_FOR};
 pub(crate) use store_handle::StoreHandle;
@@ -354,6 +355,24 @@ pub struct RelationSpec {
 }
 
 // ---------------------------------------------------------------------------
+// Topology
+// ---------------------------------------------------------------------------
+
+/// Operator-state format version. Bump on any change to an operator-state
+/// schema; a mismatch (recorded in `_sequences` via `SEQ_ID_TOPOLOGY`) marks
+/// every Rederive view invalid at boot, so its state is rebuilt. Shard and
+/// manifest layout changes are carried by their own version words.
+const STATE_FORMAT: u32 = 8;
+
+/// The durable topology word recorded in `_sequences` (`SEQ_ID_TOPOLOGY`):
+/// `(worker_count << 32) | STATE_FORMAT`. The single packer shared by the
+/// boot-time recorder and the resume-verdict validator, so the two can never
+/// drift on the encoding.
+pub fn topology_word(worker_count: u32) -> u64 {
+    ((worker_count as u64) << 32) | STATE_FORMAT as u64
+}
+
+// ---------------------------------------------------------------------------
 // RelationRegistry
 // ---------------------------------------------------------------------------
 
@@ -361,7 +380,8 @@ pub struct RelationSpec {
 /// field; the server overrides fields from its environment before constructing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct StoreConfig {
-    pub ram: RamBudgets,
+    /// The RAM-tier ceiling every store this registry opens is sized to.
+    pub ram_tier_bytes: usize,
     /// Rows per `drain_chunk` on every chunked scan this process drives; bounds
     /// peak scan memory at O(chunk × row_width). Never zero.
     pub scan_chunk_rows: usize,
@@ -373,7 +393,7 @@ pub struct StoreConfig {
 impl Default for StoreConfig {
     fn default() -> Self {
         StoreConfig {
-            ram: RamBudgets::default(),
+            ram_tier_bytes: crate::storage::DEFAULT_RAM_TIER_BYTES,
             scan_chunk_rows: 65_536,
             adhoc_group_cap: 65_536,
         }
@@ -474,7 +494,7 @@ impl RelationRegistry {
             true => StoreHandle::owned(Self::open_index_table(
                 self.slot,
                 self.rederive_source(),
-                self.config.ram,
+                self.store_budgets(),
                 &idx_dir,
                 index_id,
                 index_schema,
@@ -496,23 +516,23 @@ impl RelationRegistry {
     }
 
     /// This process's store of one index: at `slot`'s child of `idx_dir`, under
-    /// the given rederive policy and RAM budgets. An associated function so a
+    /// the given rederive policy and store budgets. An associated function so a
     /// caller holding `&mut` into `tables` can open without a second borrow of
     /// `self`.
     fn open_index_table(
         slot: Slot,
         recovery: RecoverySource,
-        ram: RamBudgets,
+        budgets: StoreBudgets,
         idx_dir: &str,
         index_id: i64,
         schema: SchemaDescriptor,
     ) -> Result<Box<Table>, StoreError> {
-        Table::with_budgets(
+        Table::new(
             &ChildAddr::worker(slot).dir(idx_dir),
             schema,
             index_id as u32,
             recovery,
-            ram,
+            budgets,
         )
         .map(Box::new)
         .map_err(|e| StoreError::storage(format!("open index {index_id} (dir={idx_dir})"), e))
@@ -766,7 +786,7 @@ impl RelationRegistry {
     /// `worker_count << 32 | STATE_FORMAT` for the count this process launched
     /// with — what a persisted record of derived state must carry to be honoured.
     pub fn launched_topology_word(&self) -> u64 {
-        crate::storage::topology_word(self.slot.of)
+        topology_word(self.slot.of)
     }
 
     /// The generation a manifest must carry to be resumed from.
@@ -788,6 +808,12 @@ impl RelationRegistry {
     /// under still holds. The one constructor of a generation-bearing
     /// `RecoverySource`, so no consumer can sample a generation of its own at a
     /// second moment.
+    /// What every store this registry opens starts from; the two bounded kinds
+    /// narrow it.
+    pub fn store_budgets(&self) -> StoreBudgets {
+        StoreBudgets::new(self.config.ram_tier_bytes)
+    }
+
     pub fn rederive_source(&self) -> RecoverySource {
         RecoverySource::Rederive {
             resume_at: self.topology_matches().then_some(self.resume_generation),

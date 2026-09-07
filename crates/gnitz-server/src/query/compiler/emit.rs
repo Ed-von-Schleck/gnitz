@@ -214,12 +214,12 @@ impl EmitCtx<'_> {
         // Track the path before creating so cleanup also removes a partially
         // created directory if the open fails.
         self.scratch.track(child_dir.clone());
-        Table::with_budgets(
+        Table::new(
             &child_dir,
             schema,
             self.site.id as u32,
             self.site.recovery,
-            self.site.ram,
+            self.site.budgets,
         )
         .map_err(|e| CompileError::StorageFailed("child table create failed", e))
     }

@@ -106,7 +106,7 @@ impl StoreHandle {
     /// here there is nothing to retract against, so the batch passes through.
     pub(crate) fn enforce_unique_pk(&self, schema: &SchemaDescriptor, batch: Batch) -> Batch {
         match self.as_owned() {
-            Some(t) => crate::storage::enforce_unique_pk(t, schema, batch),
+            Some(t) => super::unique_pk::enforce_unique_pk(t, schema, batch),
             None => batch,
         }
     }
@@ -115,6 +115,15 @@ impl StoreHandle {
     pub(crate) fn flush(&mut self) -> Result<(), StorageError> {
         match self.owned_mut() {
             Some(t) => t.flush(),
+            None => Ok(()),
+        }
+    }
+
+    /// Dispatched [`Table::flush_to_ram`] — the fold, spill, compaction and
+    /// capacity sweep, with no manifest publish and no barrier.
+    pub(crate) fn flush_to_ram(&mut self) -> Result<(), StorageError> {
+        match self.owned_mut() {
+            Some(t) => t.flush_to_ram(),
             None => Ok(()),
         }
     }

@@ -9,7 +9,7 @@ use gnitz_store::foundation::fault::Seam;
 use gnitz_store::relation::{
     lock_data_dir, relation_dir, RelationKind, RelationRegistry, RelationSpec, StoreConfig, ViewBudgets,
 };
-use gnitz_store::storage::{remove_child, ChildAddr, RamBudgets, Slot, StoreError};
+use gnitz_store::storage::{remove_child, ChildAddr, Slot, StoreError, DEFAULT_RAM_TIER_BYTES};
 
 use crate::state::{encode_records, read_state, write_state, MirrorRecord};
 
@@ -96,10 +96,7 @@ impl Mirror {
         // The mirror's own knobs, read by this entry point and not by a store
         // constructor: it honours none of the server's tuning variables.
         let config = StoreConfig {
-            ram: RamBudgets {
-                ram_tier_bytes: env_num("GNITZ_MIRROR_RAM_TIER_BYTES", RamBudgets::default().ram_tier_bytes),
-                ..Default::default()
-            },
+            ram_tier_bytes: env_num("GNITZ_MIRROR_RAM_TIER_BYTES", DEFAULT_RAM_TIER_BYTES),
             ..Default::default()
         };
         let state = read_state(base_dir);

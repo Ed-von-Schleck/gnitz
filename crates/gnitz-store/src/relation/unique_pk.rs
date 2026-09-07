@@ -3,14 +3,14 @@
 //!
 //! A free function, not an inherent `Table` method, because it does not answer a
 //! question about a `Table`: it returns the *effective batch* the caller feeds
-//! downstream, and the store is only one of its two inputs. Which relations may
-//! run it is settled a layer up, by `RelationKind::is_base_table`.
+//! downstream, and the store is only one of its two inputs. It lives beside the
+//! registry, not the store, because it is DML policy: which relations run it is
+//! `RelationKind::is_base_table`'s to say.
 
 use rustc_hash::FxHashMap;
 
-use super::Table;
 use crate::schema::SchemaDescriptor;
-use crate::storage::{Batch, BlobCacheGuard, MemBatch};
+use crate::storage::{Batch, BlobCacheGuard, MemBatch, Table};
 
 /// Retract input row `prev_pos`. The literal `-1` is exact because the ±1 clamp
 /// below runs before the walk, so a live `last_insert` row weighs exactly `+1`.
@@ -56,11 +56,6 @@ fn cut<'a>(
 /// which is bulk-copied; a push of fresh keys cuts nothing and comes back as it
 /// arrived. Arrival order survives either way — sorting first would turn
 /// intra-batch last-insert-wins into sorted-last-wins.
-///
-/// `schema` is a parameter rather than `store`'s own copy: a column ALTER
-/// publishes the new descriptor through the registry, which reaches a
-/// non-owned store's `Table::schema` not at all, so the field can lag the
-/// caller's.
 pub(crate) fn enforce_unique_pk(store: &Table, schema: &SchemaDescriptor, mut batch: Batch) -> Batch {
     // Empty-batch guard: empty batches reach the engine via the
     // `CatalogStore` ingest wrappers, which — unlike the worker loop — do
@@ -147,5 +142,9 @@ pub(crate) fn enforce_unique_pk(store: &Table, schema: &SchemaDescriptor, mut ba
 }
 
 #[cfg(test)]
-#[path = "../tests/unique_pk.rs"]
+#[path = "tests/unique_pk.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "bench_unique_pk.rs"]
+mod bench;

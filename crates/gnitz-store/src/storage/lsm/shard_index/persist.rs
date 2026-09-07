@@ -11,7 +11,7 @@ use super::{LevelGuard, ShardEntry, ShardIndex, MAX_LEVELS};
 use crate::schema::key::PkBuf;
 
 /// Basename of a shard's full path — its manifest identity. Shard files always
-/// live flat in the table's `output_dir`, which `load_manifest` re-prepends.
+/// live flat in the table's `output_dir`, which `install_manifest` re-prepends.
 ///
 /// The reduction itself is the shard reader's, so the name recorded here is the
 /// name a shard's descriptive digest is seeded with. Splitting UTF-8 at an ASCII
@@ -24,7 +24,7 @@ impl ShardIndex {
     fn build_manifest_entries(&self) -> Vec<ManifestEntryRaw> {
         let mut entries = Vec::new();
         for e in &self.l0 {
-            // An L0 entry has no guard; `load_manifest` reads `guard_key` only
+            // An L0 entry has no guard; `install_manifest` reads `guard_key` only
             // for `level > 0`, so the zero key stored here is never consulted.
             entries.push(ManifestEntryRaw::new(
                 shard_basename(&e.filename),
@@ -48,21 +48,20 @@ impl ShardIndex {
         entries
     }
 
-    /// Load the shard set `path` names, returning the header it carried — the
-    /// only read of that file, so the caller's own header fields come from here
-    /// rather than a second peek. `Ok(None)` when the manifest is absent
-    /// (first-time table boot); other read errors propagate.
-    pub(crate) fn load_manifest(&mut self, path: &str) -> Result<Option<ManifestHeader>, StorageError> {
-        let cpath = super::super::cstr(path)?;
-        let Some((entries, header)) = manifest::read_file(&cpath)? else {
-            return Ok(None);
-        };
+    /// Install the shard set a manifest named, under the header it carried. The
+    /// caller decides which manifest is acceptable; this only installs one.
+    pub(in crate::storage::lsm) fn install_manifest(
+        &mut self,
+        entries: &[ManifestEntryRaw],
+        header: &ManifestHeader,
+    ) -> Result<(), StorageError> {
         // Compaction output names must never reuse a value baked into a live,
         // manifest-referenced shard across a restart.
         self.compact_seq = header.compact_seq;
+        self.layout_seq = header.layout_seq;
 
         let stride = self.schema.pk_stride();
-        for raw in &entries {
+        for raw in entries {
             // The manifest stores the basename; the shard lives in this table's
             // directory (`build_manifest_entries`). Re-prepend it to recover the path.
             let filename = format!("{}/{}", self.output_dir, raw.filename_str());
@@ -101,11 +100,11 @@ impl ShardIndex {
                 .max()
                 .unwrap_or(0),
         );
-        Ok(Some(header))
+        Ok(())
     }
 
     /// Startup GC: removes orphaned shard/compaction files and stale `.tmp`
-    /// artifacts left by crashes.  Must run after a successful load_manifest()
+    /// artifacts left by crashes.  Must run after a successful `install_manifest`
     /// so the live set is populated before files are deleted.
     pub(crate) fn gc_orphans(&self) -> usize {
         let live: HashSet<&str> = self.all_entries().map(|e| shard_basename(&e.filename)).collect();
@@ -126,19 +125,19 @@ impl ShardIndex {
     /// one-shot shard write already registered its shard, so the current index is
     /// authoritative — no pending entry to splice in.
     ///
-    /// The header's two sequence fields come from the publisher: the checkpoint
-    /// generation from the round, the layout sequence from the table's child set.
+    /// The checkpoint generation comes from the round; the layout sequence is
+    /// this store's own, loaded at open and re-stamped here so it survives every
+    /// checkpoint.
     pub(crate) fn prepare_manifest(
         &self,
         manifest_path: &CStr,
         checkpoint_gen: u64,
-        layout_seq: u64,
     ) -> Result<PreparedManifest, StorageError> {
         let entries = self.build_manifest_entries();
         let header = ManifestHeader {
             compact_seq: self.compact_seq,
             checkpoint_gen,
-            layout_seq,
+            layout_seq: self.layout_seq,
         };
         manifest::prepare_file(manifest_path, &entries, header)
     }

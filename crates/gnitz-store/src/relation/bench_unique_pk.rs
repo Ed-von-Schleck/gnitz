@@ -17,15 +17,22 @@
 //! thing production arrival order (`decode_client_wire`, arrival-ordered) does
 //! not do.
 //!
+//! Each arm names its rows per push, because the two batch sizes drain through
+//! different tiers: at 1000 rows (a bulk load) a push is ~32 KiB, so the memtable
+//! passes its 192 KiB budget after ~6 of them and never reaches `FOLD_THRESHOLD`
+//! — every fold is the RAM tier's. At 1 row (a single-statement DML) the
+//! memtable folds every 16 pushes and drains after ~4900 rows, so its own fold
+//! is what the arm prices.
+//!
 //! Report `ns/row`, not the wall clock of the whole run.
 
-use super::super::batch::Batch;
-use super::{enforce_unique_pk, RecoverySource, Table};
+use super::enforce_unique_pk;
+use crate::storage::Batch;
+use crate::storage::{RecoverySource, StoreBudgets, Table};
 use crate::test_support::{make_batch_raw, make_schema_u64_i64};
 
-/// Rows per push — a bulk load's batch, not a single-statement one.
-const ROWS_PER_PUSH: usize = 1_000;
-const PUSHES: usize = 500;
+/// Rows every arm pushes, however it splits them.
+const TOTAL_ROWS: usize = 500_000;
 /// Key set of the update arm. Large enough that the store spills and the probe
 /// crosses tiers, small enough that every push after the first few is an update.
 const HOT_KEYS: u64 = 50_000;
@@ -46,6 +53,7 @@ fn unique_pk_bench() {
             schema,
             1,
             RecoverySource::SalReplay,
+            StoreBudgets::default(),
         )
         .unwrap();
         for p in 0..8u64 {
@@ -60,15 +68,21 @@ fn unique_pk_bench() {
         "arm", "rows", "eff_rows", "ns/row", "ms_total"
     );
 
-    for (id, &(label, hot)) in [("insert", 0u64), ("update", HOT_KEYS)].iter().enumerate() {
+    let arms = [
+        ("insert", 0u64, 1_000usize),
+        ("update", HOT_KEYS, 1_000),
+        ("insert1", 0, 1),
+    ];
+    for (id, &(label, hot, rows_per_push)) in arms.iter().enumerate() {
+        let pushes = TOTAL_ROWS / rows_per_push;
         // Untimed: build every push up front, so the timed region holds only the
         // enforcement walk and the store ingest.
         let mut rng = crate::test_rng::Rng::new(0x5EED_1234);
-        let batches: Vec<Batch> = (0..PUSHES)
+        let batches: Vec<Batch> = (0..pushes)
             .map(|p| {
-                let rows: Vec<(u64, i64, i64)> = (0..ROWS_PER_PUSH)
+                let rows: Vec<(u64, i64, i64)> = (0..rows_per_push)
                     .map(|i| {
-                        let seq = (p * ROWS_PER_PUSH + i) as u64;
+                        let seq = (p * rows_per_push + i) as u64;
                         let pk = if hot == 0 { seq } else { rng.gen_range(hot) };
                         (pk, 1, seq as i64)
                     })
@@ -82,6 +96,7 @@ fn unique_pk_bench() {
             schema,
             100 + id as u32,
             RecoverySource::SalReplay,
+            StoreBudgets::default(),
         )
         .unwrap();
 
@@ -95,7 +110,7 @@ fn unique_pk_bench() {
         let ns = t.elapsed().as_nanos() as f64;
         black_box(&table);
 
-        let rows = (PUSHES * ROWS_PER_PUSH) as f64;
+        let rows = (pushes * rows_per_push) as f64;
         println!(
             "{:>8} {:>10} {:>12} {:>12.1} {:>14.1}",
             label,

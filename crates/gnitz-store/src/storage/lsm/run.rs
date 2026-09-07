@@ -17,7 +17,6 @@ use super::batch::Batch;
 use super::columnar::ColumnarSource;
 use super::merge::{ColPtr, UnifiedSource};
 use super::shard_reader::MappedShard;
-use crate::schema::key::pk_bytes_eq;
 use crate::schema::SchemaDescriptor;
 use gnitz_expr::RowSource;
 
@@ -87,20 +86,6 @@ impl Clone for Run {
             Run::Shard(s) => Run::Shard(Rc::clone(s)),
         }
     }
-}
-
-/// Row indices of `src` in `[start, count)` whose PK equals `key`, stopping at
-/// the first mismatch. The one exact-match scan. Every caller already holds its
-/// own start index — the shard index's gated binary search hands one back, and
-/// the RAM-tier walk derives one from `find_lower_bound_bytes` — so the search
-/// is never repeated here.
-pub(crate) fn pk_match_rows_from<'a, S: RowSource>(
-    src: &'a S,
-    count: usize,
-    start: usize,
-    key: &'a [u8],
-) -> impl Iterator<Item = usize> + 'a {
-    (start..count).take_while(move |&i| pk_bytes_eq(src.get_pk_bytes(i), key))
 }
 
 /// One located row, pinned to the run that holds it. Keeps its backing alive via

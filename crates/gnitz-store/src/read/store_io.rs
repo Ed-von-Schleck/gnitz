@@ -42,8 +42,8 @@ impl RelationRegistry {
 
     /// Every live row `cursor` walks, with each skeleton key recomputed — one
     /// consolidated batch in the walk's own schema. `keys` names the ascending
-    /// OPK key list to visit group by group; `None` sweeps the cursor to its own
-    /// bound, which the open already cut.
+    /// OPK key list to visit group by group; `None` sweeps from where the caller
+    /// positioned the cursor to its own bound, which the open already cut.
     ///
     /// Walks the cursor once, copying each hydrated row verbatim and pushing each
     /// skeleton `(PK, coarse weight)` onto a key list, then hydrates that list and
@@ -96,7 +96,7 @@ impl RelationRegistry {
         };
         match keys {
             // A listed key set walks group by group; anything else is one sweep
-            // from wherever the open left the cursor.
+            // from wherever the caller left the cursor.
             Some(k) => {
                 for key in k.chunks_exact(stride) {
                     if cursor.seek_pk_group_ascending(key) {

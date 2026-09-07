@@ -14,7 +14,7 @@ use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
 use gnitz_expr::{ExprValidateErr, LogicalProgram};
 use gnitz_store::expr::MapPlan;
 use gnitz_store::schema::{project_schema, SchemaDescriptor};
-use gnitz_store::storage::{RamBudgets, ReadCursor, RecoverySource, Slot, StorageError, Table};
+use gnitz_store::storage::{ReadCursor, RecoverySource, Slot, StorageError, StoreBudgets, Table};
 use gnitz_wire::AggDescriptor;
 
 mod emit;
@@ -481,7 +481,7 @@ pub(super) struct ViewSite<'a> {
     /// into every `WorkerFilter` and the global-aggregate owner test.
     pub(in crate::query) slot: Slot,
     /// What every scratch child opens with.
-    pub(in crate::query) ram: RamBudgets,
+    pub(in crate::query) budgets: StoreBudgets,
 }
 
 /// Assemble a compiled view's exchange sides, seeding each from `seed_regs` at

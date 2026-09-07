@@ -37,6 +37,7 @@ fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows:
         schema,
         tid as u32,
         RecoverySource::Rederive { resume_at: None },
+        StoreBudgets::default(),
     )
     .unwrap();
     engine.registry_mut().register_owned(
@@ -117,6 +118,7 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
             parent_schema,
             parent_tid as u32,
             RecoverySource::Rederive { resume_at: None },
+            StoreBudgets::default(),
         )
         .unwrap(),
     );

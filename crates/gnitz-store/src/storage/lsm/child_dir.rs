@@ -215,7 +215,7 @@ pub(super) fn link_child(
     compact_seq: u64,
     layout_seq: u64,
 ) -> Result<(), StorageError> {
-    super::table::ensure_dir(target)?;
+    fs::create_dir_all(target)?;
     for e in entries {
         fs::hard_link(
             format!("{source}/{}", e.filename_str()),

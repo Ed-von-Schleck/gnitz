@@ -1394,20 +1394,6 @@ impl Batch {
         unsafe { super::columnar::seek_advance_to(self.count, stride, cp, key, hint) }
     }
 
-    /// First row index past the equal-PK group beginning at `start`. Requires
-    /// `start < self.count`. A linear step, not a seek: the co-group callers
-    /// reach it having just landed on the group's first row, where the group is
-    /// short and [`advance_to`](Self::advance_to)'s gallop would cost more.
-    #[inline]
-    pub(crate) fn pk_group_end(&self, start: usize) -> usize {
-        let k = self.get_pk_bytes(start);
-        let mut j = start + 1;
-        while j < self.count && crate::schema::key::pk_bytes_eq(self.get_pk_bytes(j), k) {
-            j += 1;
-        }
-        j
-    }
-
     /// Bulk-copy every `[start, end)` range of `src`, in list order, onto this
     /// batch's tail — the one bulk-append entry point, relocating German-string
     /// blob data into `self`'s heap. One capacity reserve, one string-column mask
@@ -1418,7 +1404,14 @@ impl Batch {
     /// (see `append_ranges_inner`); it is a pure optimization, correct either
     /// way.
     pub fn append_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
-        self.append_session(range_rows(ranges)).push_ranges(src, ranges);
+        let rows = range_rows(ranges);
+        // Before the session, which derives a payload string mask and takes a
+        // pooled blob cache to copy nothing. An all-DELETE push emits one empty
+        // range per row.
+        if rows == 0 {
+            return;
+        }
+        self.append_session(rows).push_ranges(src, ranges);
     }
 
     /// All of `src` — the full-range decode/accumulate entry point (W2M ingest,

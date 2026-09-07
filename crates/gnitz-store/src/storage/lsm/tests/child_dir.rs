@@ -118,7 +118,7 @@ fn linked_child_shard_opens_under_its_linked_name() {
     let rel_dir = tmp.path().to_str().unwrap().to_string();
     let schema = make_schema_u64_i64();
     let source = ChildAddr::Worker { rank: 0, of: 2 }.dir(&rel_dir);
-    super::super::table::ensure_dir(&source).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
 
     let name = &super::super::naming::spill_shard_name(42, 1);
     let rows: Vec<(u64, i64, i64)> = (1..=4).map(|i| (i, 1, i as i64 * 10)).collect();

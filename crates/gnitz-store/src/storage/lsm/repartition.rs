@@ -23,7 +23,7 @@ use super::manifest::{self, ManifestEntryRaw, ManifestHeader};
 use super::read_cursor::{self, ReadCursor};
 use super::shard_file::ShardWriteOpts;
 use super::shard_index::{ShardIndex, TERMINAL_LEVEL_IDX};
-use super::table::{RecoverySource, Table};
+use super::table::{RecoverySource, StoreBudgets, Table};
 use crate::schema::SchemaDescriptor;
 
 /// Bytes of rewritten rows a target child buffers before it writes a shard.
@@ -368,9 +368,19 @@ fn rewrite_targets(
 ) -> Result<(), StorageError> {
     let floor = source.floor;
     let sources: Vec<Table> = super::child_dir::cluster_children(source.of)
-        .map(|c| Table::new(&c.dir(rel_dir), *schema, table_id, RecoverySource::SalReplay))
+        .map(|c| {
+            Table::new(
+                &c.dir(rel_dir),
+                *schema,
+                table_id,
+                RecoverySource::SalReplay,
+                StoreBudgets::default(),
+            )
+        })
         .collect::<Result<_, _>>()?;
-    let mut cursor: ReadCursor = read_cursor::from_runs(sources.iter().flat_map(Table::runs), *schema);
+    // Unsized: one boot-time walk over every source child, where the source
+    // vectors' realloc ladder is noise against the rewrite it feeds.
+    let mut cursor: ReadCursor = read_cursor::from_runs(sources.iter().flat_map(Table::runs), *schema, 0);
 
     let mut targets: Vec<TargetChild> = super::child_dir::cluster_children(launched)
         .map(|c| {

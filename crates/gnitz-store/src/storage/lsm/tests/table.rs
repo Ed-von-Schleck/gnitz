@@ -21,17 +21,27 @@ fn make_batch(rows: &[(u64, i64, i64)]) -> Batch {
     make_batch_raw(&make_schema_u64_i64(), rows)
 }
 
-/// A memtable budget of `bytes` at the default RAM-tier ceiling.
-fn memtable(bytes: usize) -> RamBudgets {
-    RamBudgets {
-        memtable_bytes: bytes,
-        ..Default::default()
-    }
+/// `Table::new(...)` at a `budget`-byte memtable, with the per-test boilerplate
+/// folded away.
+fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, id: u32, budget: usize, rs: RecoverySource) -> Table {
+    let mut t = Table::new(dir.to_str().unwrap(), schema, id, rs, StoreBudgets::default()).unwrap();
+    t.set_memtable_budget(budget);
+    t
 }
 
-/// `Table::with_budgets(...)` with the per-test boilerplate folded away.
-fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, id: u32, budget: usize, rs: RecoverySource) -> Table {
-    Table::with_budgets(dir.to_str().unwrap(), schema, id, rs, memtable(budget)).unwrap()
+/// Native-`u128` oracles over the byte-keyed production entry points, which key
+/// on verbatim OPK bytes throughout: these `opk_key` the value first, so feeding
+/// one an already-encoded key would double the sign flip.
+impl Table {
+    fn has_pk(&self, key: u128) -> bool {
+        let opk = crate::schema::key::opk_key(&self.shard_index.schema, &key.to_le_bytes());
+        self.has_pk_bytes(opk.pk_bytes())
+    }
+
+    fn retract_pk(&self, key: u128) -> (i64, Option<StoredRow>) {
+        let opk = crate::schema::key::opk_key(&self.shard_index.schema, &key.to_le_bytes());
+        self.live_row_at(opk.pk_bytes())
+    }
 }
 
 /// Compaction output rather than flat spill? The `_L` level segment separates
@@ -404,7 +414,13 @@ fn table_new_corrupted_manifest_preserves_stray_shard() {
     let stray = tdir.join(super::super::naming::spill_shard_name(200, 1));
     std::fs::write(&stray, b"orphan").unwrap();
 
-    let result = Table::new(tdir.to_str().unwrap(), schema, 200, RecoverySource::SalReplay);
+    let result = Table::new(
+        tdir.to_str().unwrap(),
+        schema,
+        200,
+        RecoverySource::SalReplay,
+        StoreBudgets::default(),
+    );
     assert!(result.is_err(), "Table::new must fail on corrupted manifest");
     assert!(stray.exists(), "stray shard must survive when gc_orphans did not run");
 }
@@ -1412,12 +1428,12 @@ fn rederive_checkpointed_rebuilds_on_a_damaged_manifest() {
         (tdir, manifest)
     };
     let reopen = |tdir: &std::path::Path| {
-        Table::with_budgets(
+        Table::new(
             tdir.to_str().unwrap(),
             schema,
             table_id,
             RecoverySource::Rederive { resume_at: Some(7) },
-            memtable(96),
+            StoreBudgets::default(),
         )
     };
 

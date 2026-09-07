@@ -19,24 +19,14 @@ use super::{FlushWork, Table};
 impl Table {
     /// Synchronous flush of this one table through the shared barrier. It runs a
     /// **base** round, so a `Rederive` table only folds into the RAM tier; a
-    /// `SalReplay` table folds memtable + L0 into one shard, syncs it and the
-    /// staged manifest, renames the manifest into place, fsyncs the directory,
-    /// and drains its deferred compaction cleanup. Its one production caller is
-    /// the post-backfill fold, which does not reach the checkpoint round.
+    /// `SalReplay` table folds memtable + RAM tier into one shard, syncs it and
+    /// the staged manifest, renames the manifest into place, fsyncs the
+    /// directory, and drains its deferred compaction cleanup.
+    ///
+    /// Its one production caller is the post-backfill fold, and that runs on a
+    /// view — so the durable arm is reached from tests alone.
     pub fn flush(&mut self) -> Result<(), StorageError> {
         super::super::flush_barrier::flush_barrier([&mut *self], FlushRound::Base)
-    }
-
-    /// Open the table directory fd on demand (`O_RDONLY|O_DIRECTORY`).
-    /// Opened per flush rather than held for the table's lifetime, so a relation
-    /// pins 0 directory fds at rest.
-    /// The caller owns the returned `OwnedFd`, which closes it on drop — so an
-    /// error `?` anywhere downstream releases it with no manual close.
-    ///
-    /// An absent directory is created here. Nothing else re-creates one: the
-    /// shard write goes by path and `ENOENT`s instead.
-    pub(super) fn open_dirfd(&self) -> Result<OwnedFd, StorageError> {
-        super::open_table_dirfd(&self.directory)
     }
 
     // ------------------------------------------------------------------
@@ -44,10 +34,11 @@ impl Table {
     // ------------------------------------------------------------------
 
     /// Fold the residual memtable into the RAM tier (no spill).
-    fn fold_memtable_into_l0(&mut self) {
-        if let Some(run) = self.memtable.fold_to_single(&self.schema) {
-            self.cached_full_scan.set(None);
-            self.ram_tier.push(run, &self.schema);
+    /// `cached_full_scan` survives it: both tiers are merged and
+    /// ghost-eliminated alike, so the row set does not move.
+    fn fold_memtable_into_ram_tier(&mut self) {
+        if let Some(run) = self.memtable.fold_to_single(&self.shard_index.schema) {
+            self.ram_tier.push(run, &self.shard_index.schema);
         }
         self.memtable.clear();
     }
@@ -67,18 +58,18 @@ impl Table {
     /// two never cancels — the RAM-tier fold is heap-only, `run_compact` is
     /// disk-only. That costs disk footprint, not heap (which stays ≤ the ceiling
     /// by construction), and the disk tier still self-compacts.
-    pub(super) fn flush_to_ram(&mut self) -> Result<(), StorageError> {
-        self.fold_memtable_into_l0();
+    pub fn flush_to_ram(&mut self) -> Result<(), StorageError> {
+        self.fold_memtable_into_ram_tier();
         if !self.ram_tier.is_full() {
             return Ok(());
         }
-        let Some(run) = self.ram_tier.fold_to_single(&self.schema) else {
+        let Some(run) = self.ram_tier.fold_to_single(&self.shard_index.schema) else {
             return Ok(());
         };
         if !self.ram_tier.is_full() {
             return Ok(());
         }
-        self.persist_l0_run(run)
+        self.persist_ram_tier(run)
     }
 
     // ------------------------------------------------------------------
@@ -112,9 +103,9 @@ impl Table {
         }
 
         // Fold-first, then one shard.
-        self.fold_memtable_into_l0();
-        if let Some(run) = self.ram_tier.fold_to_single(&self.schema) {
-            self.persist_l0_run(run)?;
+        self.fold_memtable_into_ram_tier();
+        if let Some(run) = self.ram_tier.fold_to_single(&self.shard_index.schema) {
+            self.persist_ram_tier(run)?;
         }
         // Publish: capture unpublished spills into a durable manifest before the
         // SAL reset (else the global reset drops them), republish over a compacted
@@ -122,9 +113,7 @@ impl Table {
         // re-stamp an unchanged or empty child.
         let sync_paths = super::super::to_cstrings(self.shard_index.unsynced_paths())?;
         let manifest_c = super::super::cstr(self.manifest_full_path())?;
-        let manifest = self
-            .shard_index
-            .prepare_manifest(&manifest_c, round.checkpoint_gen(), self.layout_seq)?;
+        let manifest = self.shard_index.prepare_manifest(&manifest_c, round.checkpoint_gen())?;
         Ok(Some(FlushWork { sync_paths, manifest }))
     }
 
@@ -145,17 +134,17 @@ impl Table {
     /// leaves heap intact for retry with nothing on disk; a registration
     /// failure unlinks the just-written shard before returning. Heap is cleared
     /// only once the shard is written and registered.
-    fn persist_l0_run(&mut self, run: Rc<Batch>) -> Result<(), StorageError> {
-        let shard_name = super::super::naming::spill_shard_name(self.table_id, self.current_lsn);
+    fn persist_ram_tier(&mut self, run: Rc<Batch>) -> Result<(), StorageError> {
+        let shard_name = super::super::naming::spill_shard_name(self.shard_index.table_id, self.current_lsn);
         let lsn_max = self.current_lsn - 1;
         // Real LSNs, so a reopen seeds `current_lsn = max_lsn() + 1`.
-        let final_full = format!("{}/{}", self.directory, shard_name);
+        let final_full = format!("{}/{}", self.shard_index.output_dir, shard_name);
         let full_c = super::super::cstr(final_full.as_str())?;
 
         // Write failed: heap still owns `run`; no on-disk residue.
         run.write_as_shard(
             &full_c,
-            &self.schema,
+            &self.shard_index.schema,
             // L0 spill/checkpoint shards stay plain (no FoR packing), and carry
             // a PK filter only where something point-probes this store.
             shard_file::ShardWriteOpts {
@@ -205,6 +194,6 @@ impl Table {
         // not re-sync already-durable files. No concurrent writer: single-threaded
         // worker, barrier holds sal_writer_excl.
         self.shard_index.clear_unsynced();
-        self.open_dirfd()
+        super::open_table_dirfd(&self.shard_index.output_dir)
     }
 }

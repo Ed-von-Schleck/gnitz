@@ -85,15 +85,20 @@ impl RelationRegistry {
         }
 
         let child = ChildAddr::worker(self.slot);
-        let mut table = Table::with_budgets(&child.dir(directory), schema, id as u32, recovery, self.config.ram)
-            .map_err(|e| StoreError::storage(format!("open relation {id} (dir={directory})"), e))?;
         // Every store this worker opens for a relation comes through here, so a
         // bounded view cannot come back unbounded from a rehome or a rebuild.
-        table.set_capacity(budgets.capacity_bytes);
+        let table = Table::new(
+            &child.dir(directory),
+            schema,
+            id as u32,
+            recovery,
+            self.store_budgets().bounded(budgets.capacity_bytes),
+        )
+        .map_err(|e| StoreError::storage(format!("open relation {id} (dir={directory})"), e))?;
         Ok(RelationStores {
             handle: StoreHandle::owned(Box::new(table)),
             delta: delta
-                .map(|(budget, s)| Self::build_delta_store(self.slot, self.config.ram, directory, id, s, budget))
+                .map(|(budget, s)| Self::build_delta_store(self.store_budgets(), self.slot, directory, id, s, budget))
                 .transpose()?,
         })
     }
@@ -106,23 +111,22 @@ impl RelationRegistry {
     /// view, and a restart mints a fresh boot nonce, so every cursor a client
     /// holds stops matching and it re-reads at `after_tick = 0`.
     fn build_delta_store(
+        budgets: StoreBudgets,
         slot: Slot,
-        ram: RamBudgets,
         directory: &str,
         id: i64,
         delta_schema: SchemaDescriptor,
         budget: u64,
     ) -> Result<Box<DeltaFeed>, StoreError> {
         let child = ChildAddr::delta(slot);
-        let mut table = Table::with_budgets(
+        let table = Table::new(
             &child.dir(directory),
             delta_schema,
             id as u32,
             RecoverySource::Rederive { resume_at: None },
-            ram,
+            budgets.delta(budget),
         )
         .map_err(|e| StoreError::storage(format!("open delta store of view {id} (dir={directory})"), e))?;
-        table.set_delta_budget(budget);
         Ok(Box::new(DeltaFeed {
             schema: delta_schema,
             handle: StoreHandle::owned(Box::new(table)),

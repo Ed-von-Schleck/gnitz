@@ -673,7 +673,8 @@ store: the resume verdict and the boot relayout each decide by "every child
 carries a manifest", which a gated publish would make undecidable.
 
 At open a view is **resumed from its checkpoint when generation-valid, rebuilt
-otherwise; secondary indexes are always rebuilt.** Resume is *incremental*: the
+otherwise; a secondary index resumes on its own generation check alone, outside
+that verdict.** Resume is *incremental*: the
 checkpointed output store and operator traces load from their shards, and only
 the un-checkpointed SAL tail is fed through the circuit — the view is never
 re-derived from the base. A view resumes iff the recorded topology matches the

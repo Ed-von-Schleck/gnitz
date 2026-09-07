@@ -86,7 +86,7 @@ impl ReadCursor {
     /// The one open whose runs did not come through `RunSet::push`, so each batch
     /// is folded to whatever granularity its caller built it at.
     pub(crate) fn over_batches(batches: &[Rc<Batch>], schema: SchemaDescriptor) -> ReadCursor {
-        from_runs(batches.iter().map(|b| Run::Mem(Rc::clone(b))), schema)
+        from_runs(batches.iter().map(|b| Run::Mem(Rc::clone(b))), schema, batches.len())
     }
 
     /// The one live source, or `None` for none or several. Re-derived rather than
@@ -103,7 +103,7 @@ impl ReadCursor {
         }
     }
 
-    fn new(sources: Vec<Run>, states: Vec<PosCursor>, schema: SchemaDescriptor) -> Self {
+    fn new(sources: Vec<Run>, states: Vec<PosCursor>, schema: SchemaDescriptor, position: bool) -> Self {
         debug_assert_eq!(sources.len(), states.len());
         let any_skeleton = sources.iter().any(ColumnarSource::is_skeleton);
         let mut cursor = ReadCursor {
@@ -124,7 +124,9 @@ impl ReadCursor {
             current_entry_idx: 0,
             current_row: 0,
         };
-        cursor.rebuild_and_advance();
+        if position {
+            cursor.rebuild_and_advance();
+        }
         cursor
     }
 
@@ -706,16 +708,32 @@ impl ReadCursor {
     }
 }
 
-/// Build a ReadCursor over `runs`, skipping empty ones. Each `Run` owns its
-/// backing via `Rc`, so the cursor has no borrow lifetime and callers hand it a
-/// lazy iterator rather than materializing a slice per tier.
+/// Build a ReadCursor over `runs`, skipping empty ones, and position it on the
+/// first live PK group. Each `Run` owns its backing via `Rc`, so the cursor has
+/// no borrow lifetime and callers hand it a lazy iterator rather than
+/// materializing a slice per tier. `cap` is an allocation hint for the two
+/// source vectors; a wrong one costs a realloc, never a row.
 ///
 /// A run is folded by whoever produced it — a shard by construction, a memtable
 /// run by `RunSet::push`'s check — which is what lets the single-source mode skip
 /// the fold entirely.
-pub(crate) fn from_runs(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor) -> ReadCursor {
-    let runs = runs.into_iter();
-    let cap = runs.size_hint().0;
+pub(crate) fn from_runs(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, cap: usize) -> ReadCursor {
+    build(runs, schema, cap, true)
+}
+
+/// [`from_runs`] without the initial positioning: the cursor comes back invalid,
+/// for a caller that seeks or probes before reading. Positioning stays the
+/// default because an unpositioned cursor nobody repositions walks nothing,
+/// silently.
+pub(crate) fn from_runs_unpositioned(
+    runs: impl IntoIterator<Item = Run>,
+    schema: SchemaDescriptor,
+    cap: usize,
+) -> ReadCursor {
+    build(runs, schema, cap, false)
+}
+
+fn build(runs: impl IntoIterator<Item = Run>, schema: SchemaDescriptor, cap: usize, position: bool) -> ReadCursor {
     let mut sources = Vec::with_capacity(cap);
     let mut states = Vec::with_capacity(cap);
     for run in runs {
@@ -725,14 +743,14 @@ pub(crate) fn from_runs(runs: impl IntoIterator<Item = Run>, schema: SchemaDescr
             states.push(PosCursor { position: 0, count });
         }
     }
-    ReadCursor::new(sources, states, schema)
+    ReadCursor::new(sources, states, schema, position)
 }
 
 /// A cursor over nothing, in `schema`'s shape — what a relation this process
 /// holds no store for reads as, so a detached handle answers every read the way
 /// a store holding none of the requested rows does.
 pub(crate) fn empty(schema: SchemaDescriptor) -> ReadCursor {
-    from_runs(std::iter::empty(), schema)
+    from_runs(std::iter::empty(), schema, 0)
 }
 
 /// Test-only shorthand for [`from_runs`] over a batch slice and a shard slice.
@@ -749,6 +767,7 @@ pub(crate) fn create_read_cursor(
             .map(Run::Mem)
             .chain(shard_arcs.iter().cloned().map(Run::Shard)),
         schema,
+        batches.len() + shard_arcs.len(),
     )
 }
 

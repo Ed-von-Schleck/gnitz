@@ -1132,9 +1132,6 @@ impl WorkerProcess {
                 let mut result = Batch::empty_with_schema(&schema);
                 if let Some(b) = batch.as_ref() {
                     for i in 0..n {
-                        // Route on verbatim OPK bytes for every PK width: feeding
-                        // `get_pk` (OPK-widened) to `has_pk(u128)` would re-OPK-encode
-                        // it, a double sign-flip that misses signed PKs.
                         let pkb = b.get_pk_bytes(i);
                         if store.is_some_and(|t| t.has_pk_bytes(pkb)) {
                             result.push_key_row(pkb, 1);

@@ -1,7 +1,10 @@
-//! The single owner of the table-directory filename grammar. Every producer
-//! (flush spill/barrier shards, compaction outputs) and the one cleaner
-//! (`gc_orphans`) route through here, so writer and cleaner can never disagree
-//! about which files belong to a table.
+//! The single owner of a shard's **basename** grammar. Every producer (flush
+//! spill/barrier shards, compaction outputs) and the one cleaner (`gc_orphans`)
+//! route through here, so writer and cleaner can never disagree about which
+//! files belong to a table.
+//!
+//! Not the directory half of a full path: each producer prepends its own store's
+//! `output_dir`.
 
 use std::collections::HashSet;
 

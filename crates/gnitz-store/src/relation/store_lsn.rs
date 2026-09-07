@@ -3,7 +3,7 @@
 //! recovery and the DDL zone allocator read.
 
 use super::{RelationKind, RelationRegistry, RelationStores, StoreHandle};
-use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr, Slot, StoreError};
+use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr, Slot, StoreError, Table};
 
 impl RelationRegistry {
     // -- Store management (for multi-worker fork) -----------------------------
@@ -45,43 +45,42 @@ impl RelationRegistry {
     /// there is kept — re-opening it would put two live `Table`s on one
     /// directory — and so is every system family, which is never at a child.
     /// Once per process, post-fork, before any other registry verb.
+    ///
+    /// One test for all of them: every store of a non-system relation opens
+    /// under `ChildAddr::worker` of the registry's slot.
     pub fn rehome(&mut self, slot: Slot) -> Result<(), StoreError> {
         assert!(!self.rehomed, "rehome runs once per process");
-        self.slot = slot;
+        let previous = std::mem::replace(&mut self.slot, slot);
         self.rehomed = true;
-        let home = ChildAddr::worker(slot);
+        if previous == slot {
+            return Ok(());
+        }
         let tids: Vec<i64> = self
             .tables
             .iter()
-            .filter(|(_, e)| {
-                // A system family is single-partition — its store is flat, never
-                // at a `w{k}of{n}` child — so the address test would match it.
-                e.kind != RelationKind::SystemCatalog
-                    && e.handle
-                        .as_owned()
-                        .is_some_and(|t| t.directory() != home.dir(&e.directory))
-            })
+            // A system family is single-partition — its store is flat, never at
+            // a `w{k}of{n}` child — so it is homed nowhere and stays put.
+            .filter(|(_, e)| e.kind != RelationKind::SystemCatalog && e.handle.as_owned().is_some())
             .map(|(&tid, _)| tid)
             .collect();
         for tid in tids {
             self.rebuild_relation_store(tid, "rehome store")?;
         }
-        let (recovery, ram) = (self.rederive_source(), self.config.ram);
+        let (recovery, budgets) = (self.rederive_source(), self.store_budgets());
         for entry in self.tables.values_mut() {
             if entry.kind == RelationKind::SystemCatalog {
                 continue;
             }
             let owner_dir = &entry.directory;
             for ic in &mut entry.index_circuits {
-                let idx_dir = ChildAddr::Index { id: ic.index_id }.dir(owner_dir);
-                if ic.handle.as_owned().is_none_or(|t| t.directory() == home.dir(&idx_dir)) {
+                if ic.handle.as_owned().is_none() {
                     continue;
                 }
                 ic.handle = StoreHandle::owned(Self::open_index_table(
                     slot,
                     recovery,
-                    ram,
-                    &idx_dir,
+                    budgets,
+                    &ChildAddr::Index { id: ic.index_id }.dir(owner_dir),
                     ic.index_id,
                     ic.index_schema,
                 )?);
@@ -138,15 +137,14 @@ impl RelationRegistry {
     /// view whose own manifests are still at the resume generation would reload
     /// them.
     pub fn reset_store(&mut self, vid: i64) -> Result<(), StoreError> {
-        let dir = self
+        let entry = self
             .tables
             .get(&vid)
-            .ok_or_else(|| StoreError::rejected(format!("reset_store: relation {vid} is not registered")))?
-            .directory
-            .clone();
+            .ok_or_else(|| StoreError::rejected(format!("reset_store: relation {vid} is not registered")))?;
+        let dir = entry.directory.clone();
+        entry.handle.as_owned().map(Table::unlink_manifest);
 
         let rank = self.slot.rank;
-        let _ = std::fs::remove_file(ChildAddr::worker(self.slot).manifest(&dir));
 
         // Rebuild empty. `Table::new` erases the stale shards (manifest now
         // absent → `Rederive` peek `None`).

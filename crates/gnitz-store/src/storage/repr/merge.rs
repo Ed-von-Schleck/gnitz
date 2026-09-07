@@ -14,7 +14,7 @@ use std::ops::ControlFlow;
 
 use super::batch::Batch;
 use super::batch_pool::tls_pool;
-use super::columnar::{with_payload_cmp, ColumnarSource};
+use super::columnar::{pk_group_end, with_payload_cmp, ColumnarSource};
 use super::heap::{HeapNode, LoserTree};
 use crate::schema::key::{compare_pk_bytes, compare_pk_ordering, pk_bytes_eq, pk_width_dispatch, PkSortKey};
 use crate::schema::SchemaDescriptor;
@@ -916,7 +916,7 @@ where
                 // by payload. The only arm that folds, and the only one that
                 // reads row by row.
                 Ordering::Equal => {
-                    let (ga, gb) = (a.pk_group_end(ia), b.pk_group_end(jb));
+                    let (ga, gb) = (pk_group_end(a, ia), pk_group_end(b, jb));
                     // The single-source stretch still open, ending at its own
                     // side's live cursor. `flush!` closes it into one push.
                     enum Open {

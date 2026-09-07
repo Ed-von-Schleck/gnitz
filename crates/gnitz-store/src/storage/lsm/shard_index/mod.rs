@@ -124,7 +124,7 @@ impl ShardIndex {
 }
 
 /// Serialized level bound: level numbers run 0 (L0) ..= `FLSM_LEVELS`, and
-/// `load_manifest` rejects anything at or above `MAX_LEVELS`.
+/// `install_manifest` rejects anything at or above `MAX_LEVELS`.
 const MAX_LEVELS: usize = 3;
 /// Guarded levels below L0 — L1 and L2.
 pub(super) const FLSM_LEVELS: usize = MAX_LEVELS - 1;
@@ -398,7 +398,7 @@ impl FLSMLevel {
 /// What bounds this store's registered shard bytes, and what a sweep does to
 /// its victim.
 #[derive(Clone, Copy)]
-enum Budget {
+pub(crate) enum ShardBudget {
     /// Every store but a capacity-bounded view's output store and a delta store.
     Unbounded,
     /// `CREATE VIEW … WITH (capacity = …)`: evict by leaving skeleton rows behind.
@@ -412,20 +412,20 @@ enum Budget {
     Drop(u64),
 }
 
-impl Budget {
+impl ShardBudget {
     /// The ceiling, for the targets that read the number and not the eviction it
     /// implies.
     fn cap(self) -> Option<u64> {
         match self {
-            Budget::Unbounded => None,
-            Budget::Dehydrate(cap) | Budget::Drop(cap) => Some(cap),
+            ShardBudget::Unbounded => None,
+            ShardBudget::Dehydrate(cap) | ShardBudget::Drop(cap) => Some(cap),
         }
     }
 }
 
 pub(super) struct ShardIndex {
-    table_id: u32,
-    output_dir: String,
+    pub(super) table_id: u32,
+    pub(super) output_dir: String,
     pub schema: SchemaDescriptor,
 
     l0: Vec<ShardEntry>,
@@ -442,19 +442,21 @@ pub(super) struct ShardIndex {
     /// from the RAM-tier ceiling, which budgets heap bytes and bounds a spill from
     /// below rather than above.
     ///
-    /// Never below [`MIN_GUARD_BYTES`], and `load_manifest` raises it to the
+    /// Never below [`MIN_GUARD_BYTES`], and `install_manifest` raises it to the
     /// largest guard it reloads, so a resumed store does not shatter guards built
     /// under a larger `R`.
     l0_run_bytes: u64,
+    /// This child set's layout sequence — see `ManifestHeader::layout_seq`.
+    layout_seq: u64,
     /// What bounds this store's registered on-disk shard bytes, and how a sweep
     /// evicts. Unbounded for every store but a capacity-bounded view's output
     /// store and a view's delta store, both of which pay nothing.
-    budget: Budget,
+    budget: ShardBudget,
     /// Running **max** over the leading eight OPK bytes — the `_tick` — of every row
     /// this store has ever dropped. A delta read at `after_tick > dropped_through`
     /// asks only for rows above it, and no such row was ever dropped; a read at or
     /// below it is refused. Zero until the first drop, and always zero for a store
-    /// that does not evict by dropping ([`Budget::Drop`]).
+    /// that does not evict by dropping ([`ShardBudget::Drop`]).
     dropped_through: u64,
     /// Passed to every compaction's write. Held rather than derived from the
     /// input shards: a derivation would let one filterless input turn the filter
@@ -478,7 +480,13 @@ impl ShardIndex {
 
     /// `skip_pk_filter` declares that nothing point-probes this store by PK, so
     /// its shards need no PK filter.
-    pub(crate) fn new(table_id: u32, output_dir: &str, schema: SchemaDescriptor, skip_pk_filter: bool) -> Self {
+    pub(super) fn new(
+        table_id: u32,
+        output_dir: &str,
+        schema: SchemaDescriptor,
+        budget: ShardBudget,
+        skip_pk_filter: bool,
+    ) -> Self {
         ShardIndex {
             table_id,
             output_dir: output_dir.to_string(),
@@ -488,7 +496,8 @@ impl ShardIndex {
             compact_seq: 0,
             pending_deletions: Vec::new(),
             l0_run_bytes: MIN_GUARD_BYTES,
-            budget: Budget::Unbounded,
+            layout_seq: 0,
+            budget,
             dropped_through: 0,
             skip_pk_filter,
         }
@@ -506,30 +515,6 @@ impl ShardIndex {
     #[cfg(test)]
     pub(super) fn set_skip_pk_filter_for_test(&mut self, skip: bool) {
         self.skip_pk_filter = skip;
-    }
-
-    /// Bound this store's registered shard bytes, once, at construction —
-    /// evicting by dehydrating its victim (see [`Budget::Dehydrate`]).
-    pub(super) fn set_capacity(&mut self, capacity_bytes: Option<u64>) {
-        self.budget = capacity_bytes.map_or(Budget::Unbounded, Budget::Dehydrate);
-    }
-
-    /// Configure this index as a view's **delta store**: bounded by `budget`,
-    /// and evicting by dropping rather than by dehydrating (see
-    /// [`Budget::Drop`]).
-    ///
-    /// The budget is bytes and never a subscriber's cursor: the sweep drops the
-    /// oldest-written guard whether or not someone is still reading it, so a slow
-    /// reader falls off the window alone — it is refused at
-    /// [`Self::dropped_through`] and re-reads from scratch — and cannot hold
-    /// bytes against a healthy one.
-    ///
-    /// A drop is destructive, so the guard is the residual granularity: a budget
-    /// under [`MIN_GUARD_BYTES`] retains nothing rather than settling above
-    /// itself. That costs every subscriber a re-read and costs correctness
-    /// nothing.
-    pub(super) fn set_delta_budget(&mut self, budget: u64) {
-        self.budget = Budget::Drop(budget);
     }
 
     /// The highest round this store has dropped; see [`Self::dropped_through`].

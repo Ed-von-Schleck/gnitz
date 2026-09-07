@@ -15,7 +15,16 @@ fn relation_test_dir(name: &str) -> String {
 fn make_test_table(name: &str) -> Box<Table> {
     let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
     let dir = relation_test_dir(name);
-    Box::new(Table::new(&dir, schema, 99, RecoverySource::Rederive { resume_at: None }).unwrap())
+    Box::new(
+        Table::new(
+            &dir,
+            schema,
+            99,
+            RecoverySource::Rederive { resume_at: None },
+            StoreBudgets::default(),
+        )
+        .unwrap(),
+    )
 }
 
 /// Enter `id` over an already-opened table the registry then owns. `directory`
@@ -195,7 +204,10 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
     let feed = entry.delta_feed_or_err(40).expect("a fed view holds a delta store");
     let stride = feed.schema.pk_stride();
     let mut rounds: Vec<(u64, i64)> = Vec::new();
-    let mut cur = feed.open_cursor_in_range(&vec![0u8; stride], None);
+    let floor = vec![0u8; stride];
+    let mut cur = feed.open_cursor_in_range(&floor, None);
+    // A ranged open comes back unpositioned; every reader of one seeks first.
+    cur.seek_range_bytes(&floor, None);
     while cur.valid {
         // The delta PK is `round` big-endian, then the view's own PK.
         let tick = u64::from_be_bytes(cur.current_pk_bytes()[..8].try_into().unwrap());
@@ -237,7 +249,16 @@ fn ingest_apply_error_returned_internal() {
     let mut registry = solo_registry();
     let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
     let dir = relation_test_dir("seam_abort");
-    let tbl = Box::new(Table::new(&dir, schema, 99, RecoverySource::Rederive { resume_at: None }).unwrap());
+    let tbl = Box::new(
+        Table::new(
+            &dir,
+            schema,
+            99,
+            RecoverySource::Rederive { resume_at: None },
+            StoreBudgets::default(),
+        )
+        .unwrap(),
+    );
     // A user id: the public ingest entry rejects the system band outright.
     let tid = gnitz_wire::FIRST_USER_TABLE_ID as i64;
     register_entry(&mut registry, tid, tbl, schema, RelationKind::View, String::new());

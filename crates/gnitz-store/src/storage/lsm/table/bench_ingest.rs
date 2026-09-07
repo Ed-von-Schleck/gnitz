@@ -9,7 +9,7 @@
 //! accumulator cap.
 
 use super::super::batch::Batch;
-use super::{RecoverySource, Table};
+use super::{RecoverySource, StoreBudgets, Table};
 use crate::schema::SchemaDescriptor;
 use crate::test_support::{make_batch_raw, make_schema_u64_i64};
 
@@ -38,6 +38,7 @@ fn delta_ingest_bench() {
             schema,
             1,
             RecoverySource::Rederive { resume_at: None },
+            StoreBudgets::default(),
         )
         .unwrap();
         for k in 0..8 {
@@ -79,6 +80,7 @@ fn delta_ingest_bench() {
             schema,
             100 + id as u32,
             RecoverySource::Rederive { resume_at: None },
+            StoreBudgets::default(),
         )
         .unwrap();
         let t1 = Instant::now();
@@ -128,6 +130,7 @@ fn delta_ingest_bench() {
             schema,
             200 + id as u32,
             RecoverySource::Rederive { resume_at: None },
+            StoreBudgets::default(),
         )
         .unwrap();
         let t = Instant::now();
@@ -186,6 +189,7 @@ fn delta_ingest_bench() {
             schema,
             300 + id as u32,
             RecoverySource::Rederive { resume_at: None },
+            StoreBudgets::default(),
         )
         .unwrap();
         let t = Instant::now();

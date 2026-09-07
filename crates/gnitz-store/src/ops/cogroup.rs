@@ -14,7 +14,7 @@ use std::cmp::Ordering;
 use std::ops::Range;
 
 use crate::schema::key::compare_pk_ordering;
-use crate::storage::{Batch, ReadCursor};
+use crate::storage::{pk_group_end, Batch, ReadCursor};
 
 /// Intersection co-group: emit only at keys present on **both** sides. Both
 /// pointers galloping-skip to catch up, so the cost is bounded by the smaller
@@ -52,7 +52,7 @@ pub(crate) fn cogroup_intersection(
             Ordering::Less => i = delta.advance_to(m.current_pk_bytes(), i), // skip delta
             Ordering::Greater => m.advance_to(dk),                           // skip match side
             Ordering::Equal => {
-                let j = delta.pk_group_end(i); // delta group
+                let j = pk_group_end(delta, i); // delta group
                 on_match(dk, i..j, m); // walks match group
                 i = j;
             }
@@ -77,7 +77,7 @@ pub(crate) fn cogroup_left(
     let mut i = 0;
     while i < n {
         let dk = delta.get_pk_bytes(i);
-        let j = delta.pk_group_end(i);
+        let j = pk_group_end(delta, i);
         // Ascending, so an absent group costs a comparison; the first key
         // positions the cursor, which is what self-positions the whole walk.
         m.seek_pk_group_ascending(dk);

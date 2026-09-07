@@ -47,8 +47,7 @@ pub(crate) use batch::{range_rows, write_to_batch};
 pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use error::{StorageError, StoreError};
 pub use lsm::flush_barrier::{flush_barrier, FlushRound};
-pub(crate) use lsm::table::enforce_unique_pk;
-pub use lsm::table::{RamBudgets, RecoverySource, Table};
+pub use lsm::table::{RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};
 pub use merge::MemBatch;
 pub use scatter::batch_project_index;
 pub use scatter::route_rows_by_pk;
@@ -68,6 +67,8 @@ pub use batch_wire::wire_block_size;
 // every seat is in storage. The macro names the comparator through
 // `crate::storage::columnar`, which resolves only from inside storage.
 pub use columnar::compare_rows;
+// The equal-PK group bracket, reached from `ops` as well as from inside repr.
+pub(crate) use columnar::pk_group_end;
 // The three generic payload-cell readers: one spelling for every `RowSource`,
 // which is what lets a catalog decoder read a `Batch`, a `StoredRow` and a
 // positioned `ReadCursor` through the same call.
@@ -85,7 +86,6 @@ pub use lsm::child_dir::{remove_child, ChildAddr, Slot};
 pub use lsm::child_dir::subdir_names;
 pub(crate) use lsm::index_gather::BoundedIndexCursor;
 pub use lsm::index_gather::SourceCursor;
-pub use lsm::manifest::topology_word;
 pub(crate) use lsm::read_cursor::empty as empty_cursor;
 pub use lsm::read_cursor::{PkSetGather, ReadCursor};
 pub use lsm::repartition::repartition_relation;

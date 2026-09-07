@@ -192,7 +192,7 @@ fn test_user_sequence_durable_roundtrip() {
 #[test]
 fn test_recover_checkpoint_gen_and_topology() {
     let dir = temp_dir("recover_ckpt_records");
-    let expected_topology = gnitz_store::storage::topology_word(4);
+    let expected_topology = gnitz_store::relation::topology_word(4);
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         assert_eq!(engine.durable_generation, 0, "fresh DB starts at generation 0");

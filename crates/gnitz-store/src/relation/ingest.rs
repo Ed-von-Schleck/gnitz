@@ -111,8 +111,10 @@ impl RelationRegistry {
         // A bounded view drains per epoch: its capacity sweep runs off a spill, so
         // the spill cadence is the sweep's granularity. On the memtable's own
         // budget the shards are too few and too large for the sweep to be gradual.
+        // Not through the barrier: a view's store is rederived, so a base round
+        // publishes nothing and folds to RAM anyway.
         if entry.budgets.capacity_bytes.is_some() {
-            entry.handle.flush()?;
+            entry.handle.flush_to_ram()?;
         }
 
         let Some((stamped, round)) = pending else {

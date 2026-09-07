@@ -1,6 +1,7 @@
 //! End-to-end microbenchmark for the RAM-tier drain path at production
-//! thresholds: `fold_memtable_into_l0`, the tier's own fold at `FOLD_THRESHOLD`
-//! (window re-merge + re-materialize) and the ceiling spill in `flush_to_ram`.
+//! thresholds: `fold_memtable_into_ram_tier`, the tier's own fold at
+//! `FOLD_THRESHOLD` (window re-merge + re-materialize) and the ceiling spill in
+//! `flush_to_ram`.
 //!
 //! This is the bench a compaction-policy change must move, and the one whose
 //! `perf` profile must reproduce the e2e worker hot-symbol shape. As a child
@@ -9,7 +10,7 @@
 
 use super::super::batch::Batch;
 use super::super::run_set::FOLD_THRESHOLD;
-use super::{RamBudgets, RecoverySource, Table};
+use super::{RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};
 use crate::schema::SchemaDescriptor;
 use crate::test_support::pk_u64_two_i64_schema;
 
@@ -98,12 +99,11 @@ enum Gen {
 /// The default budgets with `GNITZ_RAM_TIER_BYTES` applied: these benches
 /// measure RAM-tier fold and compaction behaviour, so the tier is what a run
 /// shrinks to reach the disk regime.
-fn bench_budgets() -> RamBudgets {
-    let defaults = RamBudgets::default();
-    RamBudgets {
-        ram_tier_bytes: crate::foundation::env::env_num("GNITZ_RAM_TIER_BYTES", defaults.ram_tier_bytes),
-        ..defaults
-    }
+fn bench_budgets() -> StoreBudgets {
+    StoreBudgets::new(crate::foundation::env::env_num(
+        "GNITZ_RAM_TIER_BYTES",
+        DEFAULT_RAM_TIER_BYTES,
+    ))
 }
 
 fn bench_dir(tmp: &tempfile::TempDir, name: String) -> std::path::PathBuf {
@@ -144,7 +144,7 @@ fn flush_cadence_amplification_bench() {
     // Untimed warmup: warm the thread-local batch pool before the first config.
     {
         let dir = tempfile::tempdir().unwrap();
-        let mut table = Table::with_budgets(
+        let mut table = Table::new(
             dir.path().join("warmup").to_str().unwrap(),
             schema,
             1,
@@ -177,7 +177,7 @@ fn flush_cadence_amplification_bench() {
         let ingested: usize = ticks.iter().map(|b| b.count).sum();
 
         let dir = tempfile::tempdir().unwrap();
-        let mut table = Table::with_budgets(
+        let mut table = Table::new(
             dir.path().join(label).to_str().unwrap(),
             schema,
             100 + id as u32,
@@ -254,7 +254,7 @@ fn compaction_amplification_bench() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = bench_dir(&tmp, format!("wa_{ticks_n}_{keyspace}"));
 
-    let mut table = Table::with_budgets(
+    let mut table = Table::new(
         dir.to_str().unwrap(),
         schema,
         7,
@@ -340,7 +340,7 @@ fn filter_share_of_compaction_bench() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = bench_dir(&tmp, format!("fs_{ticks_n}_{}", filter_off as u8));
 
-    let mut table = Table::with_budgets(
+    let mut table = Table::new(
         dir.to_str().unwrap(),
         schema,
         9,

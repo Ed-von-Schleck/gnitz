@@ -19,7 +19,7 @@
 use proptest::prelude::*;
 
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, BatchBuilder, Layout, RamBudgets, RecoverySource, Table};
+use gnitz_store::storage::{Batch, BatchBuilder, Layout, RecoverySource, StoreBudgets, Table};
 use gnitz_wire::type_code;
 
 /// A schema with one PK column per type code in `tcs`, plus a single trailing
@@ -272,19 +272,16 @@ pub fn make_batch_u128(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> 
     b
 }
 
-/// A rederived table under `dir` with a 1 MiB memtable budget — enough that
-/// nothing spills, for a test that just needs somewhere to put rows. A test
-/// exercising the spill path names its own budget instead.
+/// A rederived table under `dir` at the default budgets — nothing a test puts
+/// here spills, since that needs the whole 32 MiB RAM tier. For a test that just
+/// needs somewhere to put rows.
 pub fn scratch_table(dir: &str, schema: SchemaDescriptor, table_id: u32) -> Table {
-    Table::with_budgets(
+    Table::new(
         dir,
         schema,
         table_id,
         RecoverySource::Rederive { resume_at: None },
-        RamBudgets {
-            memtable_bytes: 1 << 20,
-            ..Default::default()
-        },
+        StoreBudgets::default(),
     )
     .unwrap()
 }

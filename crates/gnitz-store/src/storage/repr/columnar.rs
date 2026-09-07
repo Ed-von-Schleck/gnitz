@@ -406,6 +406,21 @@ macro_rules! with_payload_cmp {
 }
 pub(crate) use with_payload_cmp;
 
+/// First row index past the equal-PK group beginning at `start`, in a PK-sorted
+/// source. Requires `start < src.row_count()`. A linear step, not a seek: every
+/// caller reaches it having just landed on the group's first row, where the
+/// group is short and a gallop would cost more.
+#[inline]
+pub(crate) fn pk_group_end<S: RowSource>(src: &S, start: usize) -> usize {
+    let k = src.get_pk_bytes(start);
+    let count = src.row_count();
+    let mut j = start + 1;
+    while j < count && crate::schema::key::pk_bytes_eq(src.get_pk_bytes(j), k) {
+        j += 1;
+    }
+    j
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

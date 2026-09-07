@@ -16,7 +16,7 @@
 use proptest::prelude::*;
 
 use crate::schema::{SchemaColumn, SchemaDescriptor, MAX_PK_BYTES, MAX_PK_COLUMNS};
-use crate::storage::{Batch, RamBudgets, RecoverySource, Table};
+use crate::storage::{Batch, RecoverySource, StoreBudgets, Table};
 use crate::test_support::{arb_pk_type, arb_type_code, row_key, zset_of};
 
 // ---------------------------------------------------------------------------
@@ -143,9 +143,8 @@ fn arb_string(rng: &mut crate::test_rng::Rng) -> Vec<u8> {
 // Tests
 // ---------------------------------------------------------------------------
 
-// Table::with_budgets(dir, schema, table_id, recovery, ram). The two numerics
-// are table_id = 1 and a 1 MiB memtable budget — large enough that no test
-// here folds — not a row capacity. The constructor creates the not-yet-
+// `Table::new(dir, schema, table_id, recovery, budgets)`. The numeric is
+// table_id = 1, not a row capacity. The constructor creates the not-yet-
 // existing sub-dir. all_shard_arcs returns `Vec<Rc<MappedShard>>`
 // (single-threaded — Rc, not Arc).
 fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, durable: bool) -> Table {
@@ -154,11 +153,7 @@ fn new_table(dir: &std::path::Path, schema: SchemaDescriptor, durable: bool) -> 
     } else {
         RecoverySource::Rederive { resume_at: None }
     };
-    let ram = RamBudgets {
-        memtable_bytes: 1 << 20,
-        ..Default::default()
-    };
-    Table::with_budgets(dir.to_str().unwrap(), schema, 1, p, ram).unwrap()
+    Table::new(dir.to_str().unwrap(), schema, 1, p, StoreBudgets::default()).unwrap()
 }
 
 proptest! {
