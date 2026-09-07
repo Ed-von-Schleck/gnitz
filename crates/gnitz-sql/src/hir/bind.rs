@@ -7,8 +7,8 @@
 //! (`resolve_table_factor`).
 
 use super::{
-    as_col, col_by_id, hircol_of, widen_if, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, InPair, JoinType,
-    ProjEntry, RelExpr, SetOpKind, SubqueryKind, SubqueryRef,
+    as_col, col_by_id, hircol_of, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, InPair, JoinType, ProjEntry,
+    RelExpr, SetOpKind, SubqueryKind, SubqueryRef,
 };
 use crate::agg::default_agg_name;
 use crate::ast_util::{
@@ -160,7 +160,7 @@ fn resolve_relation(cx: &mut BindCx<'_, '_>, name: &str) -> Result<Rc<RelExpr>, 
         return Ok(RelExpr::alias_as(cx.ids, Rc::clone(&cte.rel), &cte.defs));
     }
     let (tid, schema, desc) = cx.binder.resolve(cx.cat, name)?;
-    Ok(RelExpr::get(cx.ids, tid, schema, Some(desc)))
+    Ok(RelExpr::get(cx.ids, tid, schema, desc))
 }
 
 /// Bind one query body — a single SELECT (linear / join / grouped / DISTINCT) or
@@ -313,7 +313,9 @@ fn bind_body_suffix(
         rel = RelExpr::filter(rel, bind_conjuncts(where_expr, leaf)?);
     }
     if grouped && select.distinct.is_none() {
-        return bind_grouped_suffix(ids, select, rel, leaf);
+        // A view body admits window calls; the ad-hoc fold entries below do not,
+        // and reach `bind_grouped_suffix` with `windows: false`.
+        return bind_grouped_suffix(ids, select, rel, leaf, true);
     }
     // The window desugar owns its own projection (it must place the SELECT list
     // over the joined-in window values), so it hands back the projected relation.
@@ -332,17 +334,14 @@ fn bind_body_suffix(
 }
 
 /// Expand a bare `*` item over `cols` (honoring `EXCEPT`/`EXCLUDE`/`RENAME`,
-/// skipping hidden and merged columns) into pass-through `ProjEntry`s — the one
-/// wildcard expansion, shared by the linear and join projections.
+/// skipping hidden columns) into pass-through `ProjEntry`s — the one wildcard
+/// expansion, shared by the linear and join projections.
 fn expand_wildcard(
     o: &sqlparser::ast::WildcardAdditionalOptions,
-    cols: &[HirCol],
+    cols: &[&HirCol],
     ctx: &str,
     ids: &ColIdGen,
 ) -> Result<Vec<ProjEntry>, GnitzSqlError> {
-    // Merged columns are dropped before the expansion rather than inside it, so
-    // the indices it returns address this list.
-    let cols: Vec<&HirCol> = cols.iter().filter(|c| !c.merged).collect();
     Ok(expand_wildcard_item(o, cols.iter().map(|c| &c.def), ctx)?
         .into_iter()
         .map(|(i, def)| ProjEntry {
@@ -365,9 +364,9 @@ pub(crate) trait ItemLeaf: LeafBinder<HirRef> {
     fn type_of(&self, r: &HirRef) -> TypeCode {
         type_of(self.env(), r)
     }
-    /// Whether a bare `*` is an item here — false for a grouped body, where
-    /// every item is a group key or an aggregate.
-    fn expands_wildcard(&self) -> bool;
+    /// The columns a bare `*` expands to here, or `None` where `*` is not an item
+    /// — a grouped body, where every item is a group key or an aggregate.
+    fn wildcard_cols(&self) -> Option<Vec<&HirCol>>;
     /// A top-level function-call item's value and output def — an aggregate in
     /// a grouped body takes its own name, type and nullability, a window call
     /// its placeholder's — or `None` to bind the item as any other expression.
@@ -395,8 +394,8 @@ pub(crate) fn bind_projection<L: ItemLeaf>(
         // single-table projection item, so it falls to `scalar_projection_item`,
         // which names it.
         if let SelectItem::Wildcard(o) = item {
-            if leaf.expands_wildcard() {
-                items.extend(expand_wildcard(o, leaf.env(), ctx, ids)?);
+            if let Some(cols) = leaf.wildcard_cols() {
+                items.extend(expand_wildcard(o, &cols, ctx, ids)?);
                 continue;
             }
         }
@@ -488,8 +487,8 @@ impl ItemLeaf for ScopeLeaf<'_> {
     fn env(&self) -> &[HirCol] {
         &self.scope.combined
     }
-    fn expands_wildcard(&self) -> bool {
-        true
+    fn wildcard_cols(&self) -> Option<Vec<&HirCol>> {
+        Some(self.scope.unmerged())
     }
 }
 
@@ -945,7 +944,7 @@ fn scalar_leaf(
     let agg = HirAgg::new(ids, func, arg, &ir.inner_cols, group_cols.is_empty())?;
     Ok(HirRef::Subquery(Box::new(SubqueryRef {
         kind: SubqueryKind::Scalar,
-        rel: RelExpr::reduce(ir.rel, group_cols, vec![agg]),
+        rel: RelExpr::reduce(ir.rel, Vec::new(), group_cols, vec![agg]),
         correlation: ir.correlation,
         in_pair: None,
     })))
@@ -1018,7 +1017,7 @@ fn fold_join_step(
         scope.merge_away(if kind == JoinType::Right { l } else { r });
     }
 
-    let out = RelExpr::join(left, right_src, kind, on, None);
+    let out = RelExpr::join(left, right_src, kind, on);
     // Reflect this step's null-widening back into the scope so a later ON /
     // the WHERE / the projection resolve against the widened nullability.
     scope.widen_step(kind);
@@ -1060,6 +1059,9 @@ fn merge_pairs(
 /// not-found and ambiguity messages the single-relation binder does.
 struct JoinScope {
     combined: Vec<HirCol>,
+    /// The columns a `USING` / `NATURAL` step merged away. A `Vec` because it is
+    /// empty for every query without one, where `contains` is a length check.
+    merged: Vec<ColId>,
     relations: Vec<(String, Range<usize>)>,
 }
 
@@ -1067,6 +1069,7 @@ impl JoinScope {
     fn new() -> Self {
         JoinScope {
             combined: Vec::new(),
+            merged: Vec::new(),
             relations: Vec::new(),
         }
     }
@@ -1082,9 +1085,12 @@ impl JoinScope {
     /// stops answering an unqualified name and leaves `*`, but stays reachable as
     /// `alias.col`.
     fn merge_away(&mut self, id: ColId) {
-        for c in self.combined.iter_mut().filter(|c| c.id == id) {
-            c.merged = true;
-        }
+        self.merged.push(id);
+    }
+
+    /// The columns still answering an unqualified name and appearing in `*`.
+    fn unmerged(&self) -> Vec<&HirCol> {
+        self.combined.iter().filter(|c| !self.merged.contains(&c.id)).collect()
     }
 
     /// The visible column names this scope currently answers unqualified — what
@@ -1092,7 +1098,7 @@ impl JoinScope {
     /// are not names a user can write, so they pair with nothing.
     fn shared_names(&self, rcols: &[HirCol]) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
-        for c in self.combined.iter().filter(|c| !c.def.is_hidden && !c.merged) {
+        for c in self.unmerged().into_iter().filter(|c| !c.def.is_hidden) {
             // A NAME, once. Two like-named visible left columns are one name to
             // pair on, and `merge_pairs` is what reports it as ambiguous; listing
             // it twice would pair and merge the same column twice.
@@ -1111,22 +1117,20 @@ impl JoinScope {
         self.relations.push((alias.to_string(), start..self.combined.len()));
     }
 
-    /// Apply one join step's outer null-widening to the scope, in place: the
-    /// accumulated left side widens iff the step preserves its right, and the
-    /// just-pushed right relation iff it preserves its left — the same rule, through
-    /// the same [`widen_if`] primitive, that [`RelExpr::cols`] widens the join's
-    /// logical output with.
+    /// Apply one join step's outer null-widening to the scope, in place, through
+    /// the same [`JoinType::widen_sides`] the join's logical output uses.
     ///
     /// In place rather than adopting `join.cols()`: a derived table's `AS d(col…)`
     /// aliases live only on the cols `resolve_table_factor` handed the scope — the
-    /// bound subtree deliberately keeps its own inner names — so rebuilding the scope
-    /// from the tree would drop every positional alias in a join body. Widening
-    /// touches only `is_nullable`, so the aliases (and the `ColId`s) survive.
+    /// bound subtree keeps its own inner names — so rebuilding the scope from the
+    /// tree would drop every positional alias in a join body.
     fn widen_step(&mut self, kind: JoinType) {
         let split = self.relations.last().expect("a right relation was pushed").1.start;
         let (left, right) = self.combined.split_at_mut(split);
-        widen_if(left.iter_mut().map(|c| &mut c.def), kind.preserves_right());
-        widen_if(right.iter_mut().map(|c| &mut c.def), kind.preserves_left());
+        kind.widen_sides(
+            left.iter_mut().map(|c| &mut c.def),
+            right.iter_mut().map(|c| &mut c.def),
+        );
     }
 
     fn rel_cols(&self, span: &Range<usize>) -> &[HirCol] {
@@ -1150,7 +1154,7 @@ impl JoinScope {
     /// it twice. Merged columns are skipped, which is what makes a merged name
     /// resolve rather than collide; absence is `Ok(None)` so a caller can word it.
     fn find_unqualified(&self, name: &str) -> Result<Option<ColId>, GnitzSqlError> {
-        let visible: Vec<&HirCol> = self.combined.iter().filter(|c| !c.merged).collect();
+        let visible = self.unmerged();
         Ok(find_unique_column(visible.iter().map(|c| &c.def), name)?.map(|i| visible[i].id))
     }
 
@@ -1214,15 +1218,15 @@ impl<'a> PreMap<'a> {
         &self.env[..self.env.len() - self.extra.len()]
     }
 
-    /// The reduce's input: `input` when nothing was materialized, else an identity
-    /// `Project` over it carrying the materialized columns as extra items.
-    fn reduce_input(&self, input: Rc<RelExpr>) -> Rc<RelExpr> {
+    /// The reduce's pre-map: the source columns passed through, then the
+    /// materialized ones — empty when nothing was materialized.
+    fn items(&self) -> Vec<ProjEntry> {
         if self.extra.is_empty() {
-            return input;
+            return Vec::new();
         }
         let mut items = RelExpr::passthrough_items(self.source_cols().iter().cloned());
         items.extend(self.extra.iter().cloned());
-        RelExpr::project(input, items)
+        items
     }
 }
 
@@ -1312,7 +1316,7 @@ pub(crate) fn bind_adhoc_grouped(
         clause: "SELECT",
         sub: SubPolicy::PerKind,
     };
-    bind_grouped_suffix(ids, select, source, &leaf)
+    bind_grouped_suffix(ids, select, source, &leaf, false)
 }
 
 /// Bind an ad-hoc single-relation `SELECT DISTINCT` body to `Distinct(Project(Get))`
@@ -1337,23 +1341,24 @@ pub(crate) fn bind_adhoc_distinct(
 }
 
 /// The `Get` an ad-hoc body binds over and the one-relation scope its names
-/// resolve through. `tid` is the lowering's business, not the bind's — an ad-hoc
-/// read names its relation in the `ReadSpec` — so the `Get` is minted without one.
+/// resolve through.
 fn adhoc_source(ids: &ColIdGen, schema: Arc<Schema>, alias: &str) -> (Rc<RelExpr>, JoinScope) {
-    let source = RelExpr::get(ids, 0, schema, None);
+    let source = RelExpr::get_adhoc(ids, schema);
     let scope = JoinScope::single(alias, source.cols());
     (source, scope)
 }
 
-/// Bind the GROUP BY / aggregate / HAVING suffix over `input` (the `Filter?(source)`
-/// tree built by the FROM binder), producing
-/// `Project(Filter_having?(Reduce(PreMap?(input))))` — through the window
-/// desugar when the SELECT list carries a window call.
+/// Bind the GROUP BY / aggregate / HAVING suffix over `input`, producing
+/// `Project(Filter_having?(Reduce(input)))` — through the window desugar when
+/// `windows` admits one and the SELECT list carries it. `windows` is the
+/// caller's, not the AST's: an ad-hoc fold admits none, and a call written there
+/// must reach the leaf's own rejection.
 fn bind_grouped_suffix(
     ids: &ColIdGen,
     select: &Select,
     input: Rc<RelExpr>,
     leaf: &ScopeLeaf<'_>,
+    windows: bool,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let mut pre = PreMap::new(ids, leaf.env().to_vec());
     let group_cols = resolve_group_cols(select, leaf, &mut pre)?;
@@ -1378,7 +1383,7 @@ fn bind_grouped_suffix(
         collect_aggs(expr, leaf, is_global, &mut aggs, &mut pre)?;
     }
 
-    let mut rel = RelExpr::reduce(pre.reduce_input(input), group_cols.clone(), aggs.clone());
+    let mut rel = RelExpr::reduce(input, pre.items(), group_cols.clone(), aggs.clone());
 
     // The pre-map's columns, extended with each aggregate's raw value and
     // companion: everything a `ColId` in an expression over the reduce output can
@@ -1406,7 +1411,7 @@ fn bind_grouped_suffix(
     }
 
     let select_leaf = grouped("GROUP BY SELECT");
-    if select_has_window(select) {
+    if windows && select_has_window(select) {
         return super::window::bind_window_final(ids, select, rel, &select_leaf, "GROUP BY");
     }
     // The dup-name guard is `lower_reduce`'s: its output carries the group
@@ -1473,8 +1478,8 @@ impl ItemLeaf for GroupedLeaf<'_> {
     fn env(&self) -> &[HirCol] {
         self.env
     }
-    fn expands_wildcard(&self) -> bool {
-        false
+    fn wildcard_cols(&self) -> Option<Vec<&HirCol>> {
+        None
     }
     /// An item that *is* an aggregate call takes that aggregate's own name,
     /// type and nullability — kept out of the computed branch, which hardcodes

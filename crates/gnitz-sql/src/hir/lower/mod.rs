@@ -14,9 +14,10 @@
 //!   `Rc::as_ptr` through one compilation-wide [`CutMemo`];
 //! * the **source-collision** rule — [`resolve_collisions`], comparing *resolved*
 //!   tids and wrapping a repeat in a pass-through segment;
-//! * the **reduce-derivation** rule — [`resolve_reduce_specs`] and
-//!   [`reduce_out_layout`], the spec decomposition and output layout both reduce
-//!   shells read, so neither can address an aggregate column the other did not;
+//! * the **reduce-derivation** rule — the pre-map ([`physicalize_pre_map`],
+//!   [`reduce_input_of`], [`pre_map_blob`]), the spec decomposition
+//!   ([`resolve_reduce_specs`]) and the output layout ([`reduce_out_layout`]),
+//!   which both reduce shells read;
 //! * the **keep** rule — [`join_sides`], which decides what a join materializes
 //!   into its traces, and hands both join shells one [`JoinSide`] per side;
 //! * the **addressing** rule — [`Frame`], the `(layout, coldefs)` pair every
@@ -45,7 +46,7 @@ pub(crate) mod setop;
 
 use super::chain::{EmitPieces, ViewChain};
 use super::physical;
-use super::{slot_of, split_filter, ColId, HirAgg, HirExpr, HirRef, ProjEntry, RelExpr};
+use super::{slot_of, split_filter, ColId, GetSource, HirAgg, HirExpr, HirRef, ProjEntry, RelExpr};
 use super::{JoinClass, JoinShape, JoinType};
 use crate::access::ranked_index_bounds;
 use crate::agg::{push_agg_specs, AggSpec};
@@ -129,6 +130,45 @@ pub(crate) fn reduce_out_layout(
         }
     }
     layout
+}
+
+/// The physicalized reduce pre-map, `None` when the reduce groups and aggregates
+/// its source's columns directly — the form both reduce shells resolve their
+/// group and argument positions against.
+pub(crate) fn physicalize_pre_map(
+    pre: &[ProjEntry],
+    source_layout: &[ColId],
+    source_schema: &Schema,
+) -> Result<Option<physical::PhysProjection>, GnitzSqlError> {
+    (!pre.is_empty())
+        .then(|| physical::physicalize_projection(pre, source_layout, source_schema))
+        .transpose()
+}
+
+/// The reduce input a pre-map — or its absence — presents: its schema, and the
+/// `ColId` at each of its slots. `ctx` names the shape if the schema is invalid.
+pub(crate) fn reduce_input_of<'a>(
+    pre: &'a Option<physical::PhysProjection>,
+    source_layout: &'a [ColId],
+    source_schema: &Arc<Schema>,
+    ctx: &str,
+) -> Result<(Arc<Schema>, &'a [ColId]), GnitzSqlError> {
+    match pre {
+        Some(p) => Ok((super::chain::schema_of(&p.out_cols, p.pk_arity, ctx)?, &p.layout)),
+        None => Ok((Arc::clone(source_schema), source_layout)),
+    }
+}
+
+/// The pre-map's wire form. Only the payload slots are written — the PK region
+/// rides through verbatim, as on every other map — so the program compiles
+/// against the source schema.
+pub(crate) fn pre_map_blob(
+    pre: &Option<physical::PhysProjection>,
+    source_schema: &Schema,
+) -> Result<Option<gnitz_wire::ComputeMap>, GnitzSqlError> {
+    pre.as_ref()
+        .map(|p| payload_map(&p.items[p.pk_arity..], &p.out_cols[p.pk_arity..], source_schema))
+        .transpose()
 }
 
 /// The downstream demand on a combine's output: the final projection and the
@@ -242,13 +282,38 @@ impl Frame {
     fn schema(&self) -> Schema {
         Schema {
             columns: self.cols.clone(),
-            pk_cols: (0..self.npk as u32).collect(),
+            pk_cols: super::chain::pk_col_list(self.npk),
         }
     }
 }
 
-/// A combine emit's projection tail: the cheapest node producing
-/// `[key region][projected payload]`, and the output column defs. Every combine
+/// The cheapest node producing `[key region][projected payload]` from `items`,
+/// which lead with the `k` key-region slots the engine carries verbatim: the
+/// input itself, a copy list, or the payload expression map.
+pub(crate) fn emit_projection(
+    cb: &mut gnitz_core::CircuitBuilder,
+    node: gnitz_core::NodeId,
+    items: &[ProjItem],
+    out_cols: &[ColumnDef],
+    schema: &Schema,
+    k: usize,
+) -> Result<gnitz_core::NodeId, GnitzSqlError> {
+    // A payload slot naming a key column is a second copy of a value the key
+    // region already carries; only the expression map can write one.
+    let payload: Option<Vec<usize>> = items[k..]
+        .iter()
+        .map(|i| i.passthrough_src().filter(|&c| !schema.is_pk_col(c)))
+        .collect();
+    let Some(payload) = payload else {
+        return Ok(cb.map_expr(node, payload_map(&items[k..], &out_cols[k..], schema)?));
+    };
+    let identity =
+        items.len() == schema.columns.len() && items.iter().enumerate().all(|(i, it)| it.passthrough_src() == Some(i));
+    Ok(if identity { node } else { cb.map(node, &payload) })
+}
+
+/// A combine emit's projection tail: [`emit_projection`] over the frame's key
+/// region plus the resolved items, and the output column defs. Every combine
 /// shell ends here, so any of them may project a computed expression without a
 /// hidden segment to materialize it in.
 pub(crate) fn project_tail(
@@ -258,30 +323,10 @@ pub(crate) fn project_tail(
     frame: &Frame,
 ) -> Result<(gnitz_core::NodeId, Vec<ColumnDef>), GnitzSqlError> {
     let npk = frame.npk;
+    let mut proj: Vec<ProjItem> = (0..npk).map(|src_col| ProjItem::PassThrough { src_col }).collect();
     let mut out_cols = frame.cols[..npk].to_vec();
-    let mut proj: Vec<ProjItem> = Vec::with_capacity(items.len());
-    for item in items {
-        proj.push(ProjItem::from_bound(physical::resolve_refs(&item.expr, &frame.layout)?));
-        out_cols.push(item.out.def.clone());
-    }
-    // All pass-through: a copy list, or nothing when it already names the payload
-    // in order.
-    let slots: Option<Vec<usize>> = proj
-        .iter()
-        .map(|i| match i {
-            ProjItem::PassThrough { src_col } => Some(*src_col),
-            ProjItem::Computed { .. } => None,
-        })
-        .collect();
-    let out = match slots {
-        Some(slots)
-            if slots.len() == frame.cols.len() - npk && slots.iter().enumerate().all(|(i, &p)| p == i + npk) =>
-        {
-            node
-        }
-        Some(slots) => cb.map(node, &slots),
-        None => cb.map_expr(node, payload_map(&proj, &out_cols[npk..], &frame.schema())?),
-    };
+    physical::resolve_items(items, &frame.layout, &mut proj, &mut out_cols)?;
+    let out = emit_projection(cb, node, &proj, &out_cols, &frame.schema(), npk)?;
     Ok((out, out_cols))
 }
 
@@ -290,14 +335,19 @@ pub(crate) fn project_tail(
 /// (which must instead be cut to a hidden segment). The one home for the
 /// `Get → SegInput` mapping every combine input and linear source shares.
 pub(crate) fn seginput_of_get(rel: &RelExpr) -> Option<SegInput> {
-    let RelExpr::Get { tid, schema, cols, desc } = rel else {
+    let RelExpr::Get {
+        source: GetSource::Catalog { tid, desc },
+        schema,
+        cols,
+    } = rel
+    else {
         return None;
     };
     Some(SegInput {
         tid: *tid,
         schema: Arc::clone(schema),
         layout: cols.iter().map(|c| c.id).collect(),
-        desc: desc.clone(),
+        desc: Some(Arc::clone(desc)),
     })
 }
 
@@ -319,12 +369,9 @@ pub(crate) fn lower(chain: &mut ViewChain, rel: Rc<RelExpr>, bounded: bool) -> R
 ///
 /// One classifier over the bound tree, asked once before lowering, rather than a
 /// rule restated in each `lower_body` arm: a per-arm rule is one a new arm can
-/// forget, and it reads as a whitelist while behaving as a blacklist. The arm
-/// structure here mirrors `lower_body`'s deliberately — same order, same fusion
-/// question first — so the shape named in the error is the shape that would have
-/// been lowered. `build_query_segments` supplies the other half of the rule (the
-/// body must not have cut into hidden segments), which no single-tree walk can
-/// see.
+/// forget, and it reads as a whitelist while behaving as a blacklist.
+/// `build_query_segments` supplies the other half of the rule (the body must not
+/// have cut into hidden segments), which no single-tree walk can see.
 fn reject_ineligible_capacity_body(rel: &RelExpr) -> Result<(), GnitzSqlError> {
     let shape = match rel {
         RelExpr::Project { input, items } => {
@@ -360,7 +407,7 @@ fn reject_ineligible_capacity_body(rel: &RelExpr) -> Result<(), GnitzSqlError> {
                 RelExpr::Join {
                     kind: JoinType::Semi | JoinType::Anti, ..
                 } => "EXISTS / NOT EXISTS / IN",
-                RelExpr::Join { kind: JoinType::Mark, .. } => "a mark join (IN / ANY over a subquery)",
+                RelExpr::Join { kind: JoinType::Mark(_), .. } => "a mark join (IN / ANY over a subquery)",
                 RelExpr::Reduce { .. } => "GROUP BY / an aggregate",
                 _ => "a derived table / DISTINCT / set-operation subquery",
             }
@@ -389,22 +436,14 @@ fn lower_body(
         RelExpr::Project { input, items } => {
             let (fpreds, source) = split_filter(input);
             match source.as_ref() {
-                // The fusion decision, asked once for every source kind rather than
-                // re-answered per arm: a shell that cannot materialize a computed
-                // projection has its source cut to a hidden segment, and the WHERE +
-                // projection are lowered as a linear body over it (the
-                // scalar-decorrelation finalize shape).
-                _ if projection_is_computed(items) && !fuses_computed_projection(source) => {
-                    lower_computed_over_combine(chain, memo, items, fpreds, source)
-                }
                 RelExpr::Get { .. } => {
-                    let src = seginput_of_get(source).expect("Get arm resolves to a SegInput");
+                    let src = seginput_of_get(source).expect("a view body reads a catalog Get");
                     lower_linear(&src, fpreds, items)
                 }
                 RelExpr::Join {
                     kind: JoinType::Semi | JoinType::Anti, ..
                 } => exists::lower_semi_anti_view(chain, memo, items, fpreds, source),
-                RelExpr::Join { kind: JoinType::Mark, .. } => {
+                RelExpr::Join { kind: JoinType::Mark(_), .. } => {
                     exists::lower_mark_view(chain, memo, items, fpreds, source)
                 }
                 RelExpr::Join { .. } => join::lower_join_view(chain, memo, items, fpreds, source),
@@ -432,22 +471,10 @@ fn projection_is_computed(items: &[ProjEntry]) -> bool {
         .any(|it| !matches!(&it.expr, BExpr::ColRef(HirRef::Col(_))))
 }
 
-/// Whether the shell for this source materializes a computed projection itself.
-/// A `Get` (the linear expr-map), a `Reduce` (its finalize map) and every join
-/// (through [`project_tail`]) do. A derived table is not a delta source at all and
-/// cuts instead. One predicate, so a new combine shell cannot silently inherit the
-/// wrong answer.
-fn fuses_computed_projection(source: &RelExpr) -> bool {
-    matches!(
-        source,
-        RelExpr::Get { .. } | RelExpr::Reduce { .. } | RelExpr::Join { .. }
-    )
-}
-
 /// Cut a source to a hidden segment (pruned to the columns the WHERE + projection
 /// read) and lower the projection — with the WHERE applied — as a linear body over
-/// a synthetic `Get` on that segment. Reached by a derived table, and by any source
-/// [`fuses_computed_projection`] answers `false` for.
+/// that segment. Reached by a derived table: every other source is a delta source
+/// its own shell reads in place.
 ///
 /// The general rule it applies: an operator addresses its columns by position, so
 /// an expression it cannot take becomes a column of a `Project` wrapped around
@@ -677,13 +704,13 @@ pub(crate) fn extract_scan_bound(preds: &[crate::ir::BoundExpr], src: &SegInput)
 }
 
 /// One side of a join as [`join_sides`] left it: the resolved input, its
-/// reindex-payload keep list in emission order, those columns' defs, and where
-/// the pinned source PK sits inside the kept payload (empty when unpinned).
+/// reindex-payload keep list in emission order, those columns' defs, and the
+/// pinned source PK's arity (`0` when unpinned).
 pub(crate) struct JoinSide {
     pub(crate) seg: SegInput,
     pub(crate) keep: Vec<u32>,
     pub(crate) coldefs: Vec<ColumnDef>,
-    pub(crate) pk_span: std::ops::Range<usize>,
+    pk_arity: usize,
 }
 
 impl JoinSide {
@@ -695,7 +722,7 @@ impl JoinSide {
     /// The pinned source PK's arity — `0` when this shape packs no PK out of the
     /// payload.
     pub(crate) fn pa(&self) -> usize {
-        self.pk_span.len()
+        self.pk_arity
     }
 
     /// The kept payload's `ColId`s, in keep order.
@@ -710,13 +737,14 @@ impl JoinSide {
 /// refs by bind, so Rule 1 covers `SELECT *`.
 pub(crate) fn join_sides(down: Demand<'_>, class: &JoinClass, kind: JoinType, inputs: [SegInput; 2]) -> [JoinSide; 2] {
     let [left_in, right_in] = inputs;
-    let left_n = left_in.layout.len();
-    let mut keep = vec![false; left_n + right_in.layout.len()];
-    let mark = |keep: &mut Vec<bool>, id: ColId| {
+    // One keep list per side, so a rule cannot write into the region another rule
+    // owns.
+    let mut keep = [vec![false; left_in.layout.len()], vec![false; right_in.layout.len()]];
+    let mark = |keep: &mut [Vec<bool>; 2], id: ColId| {
         if let Some(p) = left_in.layout.iter().position(|c| *c == id) {
-            keep[p] = true;
+            keep[0][p] = true;
         } else if let Some(p) = right_in.layout.iter().position(|c| *c == id) {
-            keep[left_n + p] = true;
+            keep[1][p] = true;
         }
         // An id in neither layout is the mark column, which the mark branch
         // substitutes by its `0/1` constant before resolving anything.
@@ -734,7 +762,7 @@ pub(crate) fn join_sides(down: Demand<'_>, class: &JoinClass, kind: JoinType, in
     // null-fill would cancel against the real row's matched multiplicity. Only the
     // equi shapes need it — the band and pure-range ν key on the source PK, where
     // NULL and 0 cannot collide — so elsewhere it merely over-keeps.
-    for (is_left, base, seg) in [(true, 0, &left_in), (false, left_n, &right_in)] {
+    for (side, is_left, seg) in [(0, true, &left_in), (1, false, &right_in)] {
         if !kind.has_nu(is_left) {
             continue;
         }
@@ -742,38 +770,32 @@ pub(crate) fn join_sides(down: Demand<'_>, class: &JoinClass, kind: JoinType, in
             let id = if is_left { p.left } else { p.right };
             if let Some(pos) = seg.layout.iter().position(|c| *c == id) {
                 if seg.schema.columns[pos].is_nullable {
-                    keep[base + pos] = true;
+                    keep[side][pos] = true;
                 }
             }
         }
     }
-    // Rule 4: a shape that packs its output key out of the payload keeps that
-    // side's `pk_cols`, pinned to the front of the keep list by `one_side`. A
+    // Rule 4: a shape that packs its output key out of the payload pins that
+    // side's `pk_cols` to the front of its keep list, which `one_side` prepends. A
     // range-correlated EXISTS/IN reaches no null-fill tail, so only its outer PK.
     let packs_source_pk = matches!(class.shape(), JoinShape::Range | JoinShape::Cross);
-    let outer_only = matches!(kind, JoinType::Semi | JoinType::Anti | JoinType::Mark);
+    let outer_only = kind.is_decorrelated();
     let pins = [packs_source_pk, packs_source_pk && !outer_only];
-    for (pin, (base, seg)) in pins.into_iter().zip([(0, &left_in), (left_n, &right_in)]) {
-        if pin {
-            for &c in &seg.schema.pk_cols {
-                keep[base + c as usize] = true;
-            }
+    // Rule 5, the fallback: a side with a ν needs an identity to subtract on, and
+    // a pinned side already has one. A side without a ν keeps nothing — column 0
+    // would split one trace element per key into one per row.
+    for (side, is_left) in [(0, true), (1, false)] {
+        if kind.has_nu(is_left) && !pins[side] && !keep[side].iter().any(|&b| b) {
+            keep[side][0] = true;
         }
     }
-    // Rule 5, the fallback: a side with a ν needs an identity to subtract on. A
-    // side without one keeps nothing — column 0 would only split one trace element
-    // per key into one per row, and by ordinal it can pin a whole German string.
-    for (is_left, base, width) in [(true, 0, left_n), (false, left_n, keep.len() - left_n)] {
-        if width > 0 && kind.has_nu(is_left) && !keep[base..base + width].iter().any(|&b| b) {
-            keep[base] = true;
-        }
+    // A join reading nothing from either side still emits rows. `pins[1]` implies
+    // `pins[0]`, so the left pin alone answers for both.
+    if !pins[0] && !keep[0].iter().any(|&b| b) && !keep[1].iter().any(|&b| b) {
+        keep[0][0] = true;
     }
-    // A join reading nothing from either side still emits rows.
-    if !keep.iter().any(|&b| b) && left_n > 0 {
-        keep[0] = true;
-    }
-    let (kl, kr) = keep.split_at(left_n);
-    [one_side(left_in, kl, pins[0]), one_side(right_in, kr, pins[1])]
+    let [kl, kr] = keep;
+    [one_side(left_in, &kl, pins[0]), one_side(right_in, &kr, pins[1])]
 }
 
 /// One side's keep list in emission order: its pinned PK columns first, then every
@@ -785,9 +807,13 @@ fn one_side(seg: SegInput, keep: &[bool], pin_pk: bool) -> JoinSide {
     cols.extend((0..keep.len() as u32).filter(|i| keep[*i as usize] && !pinned.contains(i)));
     let coldefs = cols.iter().map(|&i| seg.schema.columns[i as usize].clone()).collect();
     JoinSide {
-        pk_span: 0..pinned.len(),
+        pk_arity: pinned.len(),
         seg,
         keep: cols,
         coldefs,
     }
 }
+
+#[cfg(test)]
+#[path = "tests/lower.rs"]
+mod tests;

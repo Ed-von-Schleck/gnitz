@@ -189,9 +189,7 @@ pub(crate) fn resolve_read_spec_order(
                     // aliased projection, an earlier ORDER BY append — carries
                     // the same data, so key on that slot; else append a hidden
                     // copy (stripped at presentation).
-                    let existing = items
-                        .iter()
-                        .position(|it| matches!(it, ProjItem::PassThrough { src_col } if *src_col == src_ci));
+                    let existing = items.iter().position(|it| it.passthrough_src() == Some(src_ci));
                     match existing {
                         Some(pos) => pos,
                         None => {

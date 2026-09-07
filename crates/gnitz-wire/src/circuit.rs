@@ -464,9 +464,10 @@ impl OpNode {
 
 const PARAMS_CTX: &str = "circuit params";
 
-/// Write a counted list's length. Asserted, not rejected: every producer is
-/// planner- or engine-side and already width-checked against a schema, and
-/// `len() as u16` would truncate a longer list into a valid shorter one.
+/// Write a counted list's length. Asserted, not rejected: the encode side is the
+/// trusted producer (`read_count` rejects), and `len() as u16` would truncate a
+/// longer list into a valid shorter one. Producers check their own lists — an
+/// output schema does not bound an intermediate node.
 fn write_count(w: &mut Writer, n: usize, what: &str) {
     assert!(
         n <= crate::MAX_COLUMNS,

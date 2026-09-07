@@ -96,7 +96,7 @@ fn place_pk_front_pins_the_full_source_pk_to_the_leading_slots() {
         assert_eq!(perm, *want_perm, "{names:?} {srcs:?}");
         for (slot, &pk) in s.pk_cols.iter().enumerate() {
             assert!(
-                matches!(items[slot], ProjItem::PassThrough { src_col } if src_col == pk as usize),
+                items[slot].passthrough_src() == Some(pk as usize),
                 "{names:?} {srcs:?}: slot {slot} must pass through PK column {pk}"
             );
         }

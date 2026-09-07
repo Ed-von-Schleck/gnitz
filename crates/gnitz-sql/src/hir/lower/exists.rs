@@ -22,30 +22,38 @@ use crate::hir::chain::{EmitPieces, ViewChain};
 use crate::hir::guards::reject_pure_range_threshold_tc;
 use crate::hir::JoinType;
 use crate::ir::BExpr;
-use crate::validate::reject_column_overflow;
 use gnitz_core::{CircuitBuilder, ColumnDef, NodeId};
 use std::collections::HashSet;
 use std::rc::Rc;
 
+/// What an EXISTS/IN circuit hands its tail: one branch for semi/anti, two for a
+/// mark join. The kind decides which, so the tail reads the shape off the type
+/// rather than off an `Option` it must agree with.
+enum ExistsBranches {
+    SemiAnti(NodeId),
+    Mark { matched: NodeId, unmatched: NodeId },
+}
+
 /// The branch(es) an EXISTS/IN view emits, as one composition over the weight-exact
 /// null-fill set `ν = positive_part(A − π_A(inner)) = w_A·[S=0]` — the unmatched
 /// outer rows at their true multiplicity. The three decorrelation kinds are three
-/// compositions of that one ν, so they are stated here together rather than as a
-/// per-kind branch tree at each call site:
+/// compositions of that one ν, stated here together rather than as a per-kind
+/// branch tree at each call site:
 ///
 /// ```text
 /// Anti = ν            Semi = A − ν            Mark = (A − ν, ν)
 /// ```
-///
-/// Returns `(primary, unmatched?)`, `unmatched` being `Some` exactly for `Mark`.
-fn exists_branches(cb: &mut CircuitBuilder, a_all: NodeId, pi_a: NodeId, kind: JoinType) -> (NodeId, Option<NodeId>) {
+fn exists_branches(cb: &mut CircuitBuilder, a_all: NodeId, pi_a: NodeId, kind: JoinType) -> ExistsBranches {
     let nu = cb.positive_diff(a_all, pi_a); // ν, keyed like a_all
     if kind == JoinType::Anti {
-        return (nu, None);
+        return ExistsBranches::SemiAnti(nu);
     }
     let neg = cb.negate(nu);
     let semi = cb.union(neg, a_all); // A − ν
-    (semi, (kind == JoinType::Mark).then_some(nu))
+    match kind {
+        JoinType::Mark(_) => ExistsBranches::Mark { matched: semi, unmatched: nu },
+        _ => ExistsBranches::SemiAnti(semi),
+    }
 }
 
 /// The resolved core of one EXISTS/IN circuit: the two inputs, the tagged deltas
@@ -53,10 +61,7 @@ fn exists_branches(cb: &mut CircuitBuilder, a_all: NodeId, pi_a: NodeId, kind: J
 /// columns and whether an output exchange is needed.
 struct ExistsCircuit {
     cb: CircuitBuilder,
-    /// The semi/anti node (filter) or the matched branch (mark).
-    primary: NodeId,
-    /// The unmatched branch (mark only).
-    unmatched: Option<NodeId>,
+    branches: ExistsBranches,
     out_pk_cols: Vec<ColumnDef>,
     shard: bool,
     /// The outer side under the keep rule — its kept ids and defs are the payload
@@ -81,7 +86,7 @@ fn emit_exists_circuit(
     // a mark view applies it per branch after the mark. Derived from `kind` here,
     // so the two shells cannot hand it to the wrong stage.
     let (left_prefilter, post_mark) = match kind {
-        JoinType::Mark => (&[][..], where_preds),
+        JoinType::Mark(_) => (&[][..], where_preds),
         _ => (where_preds, &[][..]),
     };
 
@@ -111,26 +116,15 @@ fn emit_exists_circuit(
     // the projection in the keep demand.
     let down = Demand { items, where_preds: post_mark };
     let sides = join_sides(down, class, *kind, inputs);
-    let (pl, pr) = (sides[0].n(), sides[1].n());
 
-    match &class.range {
-        // The widest node: `[_join_pk × k, kept-A, kept-B]`.
-        None => reject_column_overflow("EXISTS view intermediate", class.eq.len() + pl + pr)?,
-        Some(range) => {
-            if class.eq.is_empty() {
-                reject_pure_range_threshold_tc(
-                    range.tc,
-                    "EXISTS/IN pure-range correlation",
-                    "use a narrower range column or add an equality conjunct",
-                )?;
-            }
-            // The widest node: the pre-rekey `[_join_pk × (n_eq + 1), kept-A,
-            // kept-B]` or the outer-PK-keyed `[a.pk…, kept-A]` behind it.
-            reject_column_overflow(
-                "EXISTS view intermediate",
-                (class.eq.len() + 1).max(sides[0].pa()) + pl + pr,
-            )?;
-        }
+    // A pure-range correlation (no equality prefix) decides existence from a
+    // MIN/MAX threshold, which has only an 8-byte accumulator.
+    if let Some(range) = class.range.filter(|_| class.eq.is_empty()) {
+        reject_pure_range_threshold_tc(
+            range.tc,
+            "EXISTS/IN pure-range correlation",
+            "use a narrower range column or add an equality conjunct",
+        )?;
     }
 
     // Tagged delta per side with its local / inner-local WHERE fused as a prefilter
@@ -160,25 +154,18 @@ fn emit_exists_circuit(
     };
     // A range correlation re-keys onto the outer source PK and rides the mandatory
     // range output exchange; an equi one is keyed by `_join_pk` and needs none.
-    let (primary, unmatched, out_pk_cols, shard) = match &class.range {
+    let (branches, out_pk_cols, shard) = match &class.range {
         Some(range) => {
-            let (p, u, pk) = core.range(&mut cb, range)?;
-            (p, u, pk, true)
+            let (b, pk) = core.range(&mut cb, range)?;
+            (b, pk, true)
         }
         None => {
-            let (p, u, pk) = core.equi(&mut cb)?;
-            (p, u, pk, false)
+            let (b, pk) = core.equi(&mut cb)?;
+            (b, pk, false)
         }
     };
     let [left, _right] = sides;
-    Ok(ExistsCircuit {
-        cb,
-        primary,
-        unmatched,
-        out_pk_cols,
-        shard,
-        left,
-    })
+    Ok(ExistsCircuit { cb, branches, out_pk_cols, shard, left })
 }
 
 /// The resolved inputs an EXISTS/IN circuit core emits from: both sides (with their
@@ -198,8 +185,8 @@ impl ExistsCore<'_> {
     /// Equi correlation: the symmetric 2-term join over
     /// the NULL-gated sides, `π_A(inner)`, and `a_all` (the full outer re-keyed,
     /// reusing `reindex_a` when the key is NOT NULL). Output keyed by `_join_pk`, no
-    /// output exchange. Returns `(primary, unmatched?, _join_pk cols)`.
-    fn equi(&self, cb: &mut CircuitBuilder) -> Result<(NodeId, Option<NodeId>, Vec<ColumnDef>), GnitzSqlError> {
+    /// output exchange. Returns `(branches, _join_pk cols)`.
+    fn equi(&self, cb: &mut CircuitBuilder) -> Result<(ExistsBranches, Vec<ColumnDef>), GnitzSqlError> {
         let ExistsCore { sides, a_local, b_local, class, kind } = *self;
         let (a_n, b_n) = (sides[0].n(), sides[1].n());
         let terms = equi_prologue(
@@ -219,25 +206,24 @@ impl ExistsCore<'_> {
         // re-keyed — reusing `reindex_a` on a NOT NULL key, where the gate was a
         // no-op.
         let a_all = terms.a_all(cb);
-        let (primary, unmatched) = exists_branches(cb, a_all, pi_a, kind);
-        Ok((primary, unmatched, terms.out_pk_coldefs()))
+        Ok((exists_branches(cb, a_all, pi_a, kind), terms.out_pk_coldefs()))
     }
 
     /// Range correlation — band (`n_eq ≥ 1`) or pure range (`n_eq == 0`). Both re-key
     /// onto the outer source PK and ride the range output exchange. Returns
-    /// `(primary, unmatched?, _src_pk cols)`.
+    /// `(branches, _src_pk cols)`.
     fn range(
         &self,
         cb: &mut CircuitBuilder,
         range: &HirRange,
-    ) -> Result<(NodeId, Option<NodeId>, Vec<ColumnDef>), GnitzSqlError> {
+    ) -> Result<(ExistsBranches, Vec<ColumnDef>), GnitzSqlError> {
         let ExistsCore { sides, a_local, b_local, class, kind } = *self;
         let left = &sides[0];
         let a_n = left.n();
 
         let pro = range_prologue(cb, sides, a_local, b_local, &class.eq, range)?;
 
-        let (primary, unmatched): (NodeId, Option<NodeId>) = if pro.n_eq() == 0 {
+        let branches = if pro.n_eq() == 0 {
             // Pure range: the one-row threshold m = MAX/MIN(b.range) decides existence.
             let int_a = cb.worker_filter(pro.reindex_a);
             let trace_a = cb.integrate_trace(int_a);
@@ -260,9 +246,9 @@ impl ExistsCore<'_> {
             // compositions `exists_branches` states over ν — spelled here against
             // `matched` / `A − matched` because the threshold has no `π_A(inner)`.
             match kind {
-                JoinType::Anti => (unmatched()?, None),
-                JoinType::Mark => (matched, Some(unmatched()?)),
-                _ => (matched, None),
+                JoinType::Anti => ExistsBranches::SemiAnti(unmatched()?),
+                JoinType::Mark(_) => ExistsBranches::Mark { matched, unmatched: unmatched()? },
+                _ => ExistsBranches::SemiAnti(matched),
             }
         } else {
             // Band: the eq-prefix scatter co-locates both sides, so the inner join, its
@@ -278,7 +264,7 @@ impl ExistsCore<'_> {
         };
 
         // View PK = the outer source PK, hidden (it also rides the payload verbatim).
-        Ok((primary, unmatched, src_pk_coldefs(&left.seg.schema)))
+        Ok((branches, src_pk_coldefs(&left.seg.schema)))
     }
 }
 
@@ -292,12 +278,14 @@ pub(crate) fn lower_semi_anti_view(
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
     let ExistsCircuit {
         mut cb,
-        primary,
+        branches,
         out_pk_cols,
         shard,
         left,
-        ..
     } = emit_exists_circuit(chain, memo, source, fpreds, items)?;
+    let ExistsBranches::SemiAnti(primary) = branches else {
+        unreachable!("a Semi/Anti kind composes one branch");
+    };
 
     let npk = out_pk_cols.len();
     let frame = outer_frame(out_pk_cols, &left);
@@ -323,25 +311,23 @@ pub(crate) fn lower_mark_view(
     fpreds: &[HirExpr],
     source: &Rc<RelExpr>,
 ) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
-    let mark_id = {
-        let RelExpr::Join { mark, .. } = source.as_ref() else {
-            unreachable!("lower_mark_view receives a Join");
-        };
-        mark.as_ref().expect("Mark join carries a mark column").id
+    let RelExpr::Join { kind: JoinType::Mark(mark_id), .. } = source.as_ref() else {
+        unreachable!("lower_mark_view receives a Mark Join");
     };
     let ExistsCircuit {
         mut cb,
-        primary: matched,
-        unmatched,
+        branches,
         out_pk_cols,
         shard,
         left,
     } = emit_exists_circuit(chain, memo, source, fpreds, items)?;
-    let unmatched = unmatched.expect("mark core returns an unmatched branch");
+    let ExistsBranches::Mark { matched, unmatched } = branches else {
+        unreachable!("a Mark kind composes two branches");
+    };
 
     let npk = out_pk_cols.len();
     let branch = MarkBranch {
-        mark_id,
+        mark_id: *mark_id,
         where_preds: fpreds,
         items,
         // The same `[out PK][kept outer]` frame the semi/anti tail projects

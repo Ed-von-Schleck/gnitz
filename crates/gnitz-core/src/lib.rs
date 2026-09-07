@@ -22,7 +22,9 @@ pub mod types;
 // module is `pub`, so anything omitted here is still reachable by its own path —
 // this list carries no meaning beyond "spelled often enough to be worth
 // shortening".
-pub use circuit::{agg_output_type, segment_id, Circuit, CircuitBuilder, NodeId, OpNode, RangeRel, ReindexRole};
+pub use circuit::{
+    agg_output_type, segment_id, Circuit, CircuitBuilder, MapKind, NodeId, OpNode, RangeRel, ReindexRole,
+};
 pub use client::{
     delta_reply_schema, qualified_name, retraction_batch, CatalogSnapshot, DeltaCursor, GnitzClient, IndexMeta,
     InlineUniqueIndex, PlannedView, RelDescriptor, TxnBuffer, TxnReads, MAX_CHAIN_SEGMENTS,

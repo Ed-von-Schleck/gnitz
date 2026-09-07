@@ -11,10 +11,13 @@ use super::{
     ProjEntry, RelExpr, SubqueryKind, SubqueryRef,
 };
 use crate::error::GnitzSqlError;
-use crate::hir::guards::{converse_rel, validate_join_key_pair, validate_range_join_key_pair};
+use crate::hir::guards::{
+    converse_rel, reject_join_key_arity, reject_keyless_non_inner, reject_outer_with_residual, validate_join_key_pair,
+    validate_range_join_key_pair,
+};
 use crate::hir::JoinType;
 use crate::ir::{AggFunc, BExpr, BinOp, UnaryOp};
-use gnitz_core::{ColumnDef, RangeRel, TypeCode};
+use gnitz_core::{ColumnDef, RangeRel};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -76,7 +79,7 @@ fn classify_join(rel: &Rc<RelExpr>, extra: &[HirExpr], memo: &mut RewriteMemo) -
     if let Some(done) = key.and_then(|k| memo.get(&k)) {
         return Ok(Rc::clone(done));
     }
-    let RelExpr::Join { left, right, kind, on, mark, .. } = rel.as_ref() else {
+    let RelExpr::Join { left, right, kind, on } = rel.as_ref() else {
         unreachable!("classify_join receives a Join");
     };
     let left_cols = left.cols();
@@ -101,14 +104,13 @@ fn classify_join(rel: &Rc<RelExpr>, extra: &[HirExpr], memo: &mut RewriteMemo) -
         unreachable!("classify visits each join once")
     };
     let class = classify_on(raw, &here, &left_cols, &right_cols)?;
-    crate::hir::guards::reject_keyless_non_inner(*kind, class.shape())?;
-    crate::hir::guards::reject_outer_with_residual(*kind, class.residual.is_empty())?;
+    reject_keyless_non_inner(*kind, class.shape())?;
+    reject_outer_with_residual(*kind, class.residual.is_empty())?;
     let out = Rc::new(RelExpr::Join {
         left: new_left,
         right: new_right,
         kind: *kind,
         on: JoinOn::Class(class),
-        mark: mark.clone(),
     });
     if let Some(k) = key {
         memo.insert(k, Rc::clone(&out));
@@ -146,7 +148,7 @@ fn classify_on(
     };
     absorb_conjuncts(&mut class, on, left_cols, right_cols, KeyDemand::Required)?;
     absorb_conjuncts(&mut class, extra, left_cols, right_cols, KeyDemand::Optional)?;
-    crate::hir::guards::reject_join_key_arity(class.eq.len(), class.range.is_some())?;
+    reject_join_key_arity(class.eq.len(), class.range.is_some())?;
     Ok(class)
 }
 
@@ -205,8 +207,7 @@ fn absorb_conjuncts(
         // stays a residual filter, which computes the same rows.
         let range_after = class.range.is_some() || op != BinOp::Eq;
         let fits = |eq: usize| {
-            demand == KeyDemand::Required
-                || crate::hir::guards::reject_join_key_arity(class.eq.len() + eq, range_after).is_ok()
+            demand == KeyDemand::Required || reject_join_key_arity(class.eq.len() + eq, range_after).is_ok()
         };
         // `binop_to_range_rel` never answers for `Eq`, so the two key arms cannot
         // both match and neither needs to exclude the other.
@@ -339,8 +340,7 @@ fn decorrelate_body(items: &[ProjEntry], input: &Rc<RelExpr>, ids: &ColIdGen) ->
     // consumed conjunct is dropped from `kept_preds` wholesale, so its subquery
     // `rel` never reaches pass 2's scan — no cross-pass dedup is needed.
     for pred in fpreds {
-        if let Some((subref, not_wrap)) = as_bare_exists(&pred) {
-            let negated = exists_negated(subref) ^ not_wrap;
+        if let Some((subref, negated)) = as_bare_exists(&pred) {
             let kind = if negated { JoinType::Anti } else { JoinType::Semi };
             // A NOT IN over a nullable operand diverges from the anti-join (SQL
             // 3VL). The bind-time guard only sees the node's own `negated`; a
@@ -353,7 +353,7 @@ fn decorrelate_body(items: &[ProjEntry], input: &Rc<RelExpr>, ids: &ColIdGen) ->
                         .into(),
                 ));
             }
-            cur = RelExpr::join(cur, Rc::clone(&subref.rel), kind, corr_on(subref), None);
+            cur = RelExpr::join(cur, Rc::clone(&subref.rel), kind, corr_on(subref));
             continue;
         }
         if let Some((outer_col, op, subref)) = as_uncorrelated_scalar_cmp(&pred) {
@@ -443,8 +443,7 @@ fn build_joined_subref(
                 ));
             }
             let mark_id = ids.next();
-            let mark = HirCol::new(mark_id, ColumnDef::new("_mark", TypeCode::I64, false).hidden());
-            let joined = RelExpr::join(cur, Rc::clone(&s.rel), JoinType::Mark, corr_on(s), Some(mark));
+            let joined = RelExpr::join(cur, Rc::clone(&s.rel), JoinType::Mark(mark_id), corr_on(s));
             // The mark column is 1 iff the subquery matched; the node's truth is
             // `matched` (EXISTS) or `!matched` (NOT EXISTS).
             let val = if negated {
@@ -467,7 +466,7 @@ fn build_joined_subref(
                         .into(),
                 ));
             }
-            let joined = RelExpr::join(cur, Rc::clone(&s.rel), JoinType::Left, s.correlation.clone(), None);
+            let joined = RelExpr::join(cur, Rc::clone(&s.rel), JoinType::Left, s.correlation.clone());
             subst.insert(p, scalar_value(s, true)?);
             Ok(joined)
         }
@@ -525,7 +524,7 @@ fn build_uncorrelated_inner(
         op,
         Box::new(BExpr::ColRef(HirRef::Col(key_id))),
     )];
-    Ok(RelExpr::join(cur, right, JoinType::Inner, on, None))
+    Ok(RelExpr::join(cur, right, JoinType::Inner, on))
 }
 
 /// The scalar subquery's substituted value: the aggregate's finalize composite.
@@ -554,21 +553,20 @@ fn scalar_value(s: &SubqueryRef, null_filled: bool) -> Result<HirExpr, GnitzSqlE
     }
 }
 
-/// A bare EXISTS/IN WHERE conjunct (optionally `NOT`-wrapped), returning its
-/// `SubqueryRef` and whether a `NOT` wrapped it (XORed into the `negated` flag).
+/// A bare EXISTS/IN WHERE conjunct (optionally `NOT`-wrapped), with its effective
+/// negation: the node's own `negated` flag XORed with a wrapping `NOT`.
 fn as_bare_exists(pred: &HirExpr) -> Option<(&SubqueryRef, bool)> {
-    match pred {
-        BExpr::ColRef(HirRef::Subquery(s)) if matches!(s.kind, SubqueryKind::Exists { .. }) => Some((s, false)),
-        BExpr::UnaryOp(UnaryOp::Not, inner) => match inner.as_ref() {
-            BExpr::ColRef(HirRef::Subquery(s)) if matches!(s.kind, SubqueryKind::Exists { .. }) => Some((s, true)),
-            _ => None,
+    let (inner, not_wrap) = match pred {
+        BExpr::UnaryOp(UnaryOp::Not, inner) => (inner.as_ref(), true),
+        _ => (pred, false),
+    };
+    match inner {
+        BExpr::ColRef(HirRef::Subquery(s)) => match s.kind {
+            SubqueryKind::Exists { negated } => Some((s, negated ^ not_wrap)),
+            SubqueryKind::Scalar => None,
         },
         _ => None,
     }
-}
-
-fn exists_negated(s: &SubqueryRef) -> bool {
-    matches!(s.kind, SubqueryKind::Exists { negated: true })
 }
 
 /// An uncorrelated scalar comparison `outer_col OP (SELECT agg)` (either operand

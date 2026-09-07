@@ -411,16 +411,15 @@ fn emit_equi_join_terms<'a>(
 
 /// What both range builders carry out of [`range_prologue`]: the two reindexed
 /// sides, the LEFT key's nullability (the NULL-key branch's gate), the left key
-/// slots (re-read by that branch), the per-slot common types, and the §3 term
-/// relations (`rel_ab = converse(op)` for term AB, `rel_ba = op` for term BA).
+/// slots (re-read by that branch), the per-slot common types, and the canonical
+/// (left-to-right) range relation — term BA's rel, term AB's being its converse.
 pub(crate) struct RangePrologue {
     pub(crate) reindex_a: NodeId,
     pub(crate) reindex_b: NodeId,
     pub(crate) left_key_nullable: bool,
     pub(crate) left_reindex_cols: Vec<usize>,
     pub(crate) all_tcs: Vec<TypeCode>,
-    pub(crate) rel_ab: RangeRel,
-    pub(crate) rel_ba: RangeRel,
+    pub(crate) op: RangeRel,
 }
 
 impl RangePrologue {
@@ -454,8 +453,8 @@ impl RangePrologue {
         right_n: usize,
     ) -> NodeId {
         let n_eq = self.n_eq() as u8;
-        let join_ab = cb.join_with_trace_range_node(self.reindex_a, trace_b, n_eq, self.rel_ab);
-        let join_ba = cb.join_with_trace_range_node(self.reindex_b, trace_a, n_eq, self.rel_ba);
+        let join_ab = cb.join_with_trace_range_node(self.reindex_a, trace_b, n_eq, converse_rel(self.op));
+        let join_ba = cb.join_with_trace_range_node(self.reindex_b, trace_a, n_eq, self.op);
         normalize_to_ab(cb, join_ab, join_ba, self.k(), left_n, right_n)
     }
 }
@@ -503,8 +502,7 @@ pub(crate) fn range_prologue(
         left_key_nullable,
         left_reindex_cols,
         all_tcs,
-        rel_ab: converse_rel(range.op),
-        rel_ba: range.op,
+        op: range.op,
     })
 }
 
@@ -522,10 +520,8 @@ pub(crate) fn range_prologue(
 /// false`: a ground row would seed `(m=NULL)` and break `A − 0 = A` over an empty
 /// other side.
 ///
-/// The two terms mirror `join_ab`/`join_ba` exactly, with only the trace swapped.
-/// Both carry `n_eq == 0`, as the shape's other two do, and must:
-/// `circuit_join_relay` reads one arbitrary join node's kind and applies the
-/// relay it derives to every source.
+/// Both terms below must carry `n_eq == 0`, as the shape's other two do: the
+/// engine derives one relay for the whole circuit from a single join node.
 pub(crate) fn build_pure_range_threshold(
     cb: &mut CircuitBuilder,
     left: &JoinSide,
@@ -590,15 +586,6 @@ pub(crate) fn join_pk_coldefs(target_tcs: &[TypeCode]) -> Vec<ColumnDef> {
             ColumnDef::new(name, t, false).hidden()
         })
         .collect()
-}
-
-/// Whether a column name is one this module mints for a synthetic join key.
-/// Such a key identifies a matched *pair*, not a row, and is not unique — so a
-/// relation keyed by one has no row identity. The predicate sits beside the two
-/// producers ([`join_pk_coldefs`] and `pair_pk_coldefs`) so renaming either
-/// cannot silently make a reader believe the key is a row key.
-pub(crate) fn is_join_key_name(name: &str) -> bool {
-    name.starts_with("_join_pk") || name.starts_with("_pair_pk")
 }
 
 /// Union the pure-range NULL-range-key rows into `nf_match` (`A − matched`):

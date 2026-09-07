@@ -10,7 +10,7 @@ use crate::bind::apply_positional_aliases;
 use crate::bind::Binder;
 use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::bind::ViewSurface;
-use crate::hir::chain::{debug_assert_exchange_topology, ViewChain};
+use crate::hir::chain::{debug_assert_exchange_topology, reject_circuit_column_overflow, ViewChain};
 use crate::validate::{
     kv_options, reject_unhonored_create_view_clauses, reject_unhonored_query_clauses, validate_user_name, QueryEnvelope,
 };
@@ -435,6 +435,9 @@ fn build_query_segments(
     let pk_col_list = crate::hir::chain::pk_col_list(pk_cols);
     Schema::validate_parts(&pk_col_list, &out_cols)
         .map_err(|e| GnitzSqlError::Unsupported(format!("view output: {e}")))?;
+    // After the output schema, so a view too wide to register is named by its own
+    // columns; this catches the narrow-output body whose intermediates are wide.
+    reject_circuit_column_overflow(&circuit)?;
     chain.segments.push(PlannedView {
         // The user-named view is always the chain's slot 0.
         seg: 0,

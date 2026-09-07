@@ -90,7 +90,7 @@ fn only_an_inner_step_may_be_keyless() {
         JoinType::Full,
         JoinType::Semi,
         JoinType::Anti,
-        JoinType::Mark,
+        JoinType::Mark(crate::hir::ColId::NONE),
     ] {
         assert!(reject_keyless_non_inner(kind, JoinShape::Cross).is_err(), "{kind:?}");
         reject_keyless_non_inner(kind, JoinShape::Range).unwrap();
@@ -107,7 +107,7 @@ fn outer_with_residual_rejects_per_surface() {
         JoinType::Left,
         JoinType::Full,
         JoinType::Semi,
-        JoinType::Mark,
+        JoinType::Mark(crate::hir::ColId::NONE),
     ] {
         reject_outer_with_residual(k, true).unwrap();
     }
@@ -120,7 +120,7 @@ fn outer_with_residual_rejects_per_surface() {
     assert!(msg(JoinType::Full).contains("LEFT/RIGHT/FULL JOIN"));
     assert!(msg(JoinType::Semi).contains("EXISTS/IN correlation"));
     assert!(msg(JoinType::Anti).contains("EXISTS/IN correlation"));
-    assert!(msg(JoinType::Mark).contains("EXISTS/IN correlation"));
+    assert!(msg(JoinType::Mark(crate::hir::ColId::NONE)).contains("EXISTS/IN correlation"));
 }
 
 /// Set-op columns promote on the same integer ladder, but only to a concrete

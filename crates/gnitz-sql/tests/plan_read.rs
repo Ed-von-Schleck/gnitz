@@ -559,6 +559,19 @@ fn a_read_the_planner_rejects_names_its_rule() {
         ("SELECT id FROM jv", "Bind", "is ambiguous"),
         ("SELECT * FROM jv WHERE id = 5", "Bind", "is ambiguous"),
         ("SELECT _join_pk FROM jv", "Bind", "not found"),
+        // A window call in an ad-hoc grouped SELECT list: windows are a view-body
+        // feature, so the leaf's own rejection answers rather than the fold
+        // lowering's internal error.
+        (
+            "SELECT v, ROW_NUMBER() OVER (ORDER BY v) FROM t GROUP BY v",
+            "Unsupported",
+            "only supported in the SELECT list and QUALIFY of a CREATE VIEW",
+        ),
+        (
+            "SELECT v, SUM(w) OVER (PARTITION BY v) FROM t GROUP BY v",
+            "Unsupported",
+            "only supported in the SELECT list and QUALIFY of a CREATE VIEW",
+        ),
     ] {
         assert_rejects(sql, read(&cat, sql), variant, msg);
     }

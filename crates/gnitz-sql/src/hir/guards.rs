@@ -108,7 +108,7 @@ pub(crate) fn reject_outer_with_residual(kind: JoinType, residual_empty: bool) -
              move the predicate to a WHERE over a wrapping view."
                 .into(),
         )),
-        JoinType::Semi | JoinType::Anti | JoinType::Mark => Err(GnitzSqlError::Unsupported(
+        JoinType::Semi | JoinType::Anti | JoinType::Mark(_) => Err(GnitzSqlError::Unsupported(
             "EXISTS/IN correlation contains a conjunct the semi-join cannot consume \
              (a non-equality/non-range comparison, a second range conjunct, or an OR \
              group spanning both relations); it would have to participate in the \
@@ -244,6 +244,13 @@ pub(crate) fn validate_range_join_key_pair(left: &ColumnDef, right: &ColumnDef) 
         }
     }
     validate_join_key_pair(left, right)
+}
+
+/// Whether a column name is one the join lowering mints for a synthetic join key
+/// (`join_pk_coldefs` / `pair_pk_coldefs`). Such a key identifies a matched
+/// *pair*, not a row, so a relation keyed by one has no row identity.
+pub(crate) fn is_join_key_name(name: &str) -> bool {
+    name.starts_with("_join_pk") || name.starts_with("_pair_pk")
 }
 
 /// The order-reversing converse of a `RangeRel` (`x OP y` ⟺ `y converse(OP) x`).

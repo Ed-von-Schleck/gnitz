@@ -77,7 +77,7 @@ pub(crate) fn bind_and_lower_fold(
     } else {
         bind::bind_adhoc_grouped(&ids, select, Arc::clone(schema), alias)?
     };
-    lower::fold::lower_fold(&rel, schema)
+    lower::fold::lower_fold(&rel)
 }
 
 /// Opaque column identity, unique within one `bind_and_lower` invocation, never
@@ -124,18 +124,11 @@ impl ColIdGen {
 pub(crate) struct HirCol {
     pub id: ColId,
     pub def: ColumnDef,
-    /// A `USING` / `NATURAL` step merged this column into the preserved side's
-    /// copy: it no longer answers an unqualified name or appears in `*`, but
-    /// `alias.col` still reaches it. Weaker than `def.is_hidden`, which also takes
-    /// a column out of qualified resolution.
-    pub merged: bool,
 }
 
 impl HirCol {
-    /// A column no join step has merged — every column outside a `USING` /
-    /// `NATURAL` join scope.
     pub(crate) fn new(id: ColId, def: ColumnDef) -> HirCol {
-        HirCol { id, def, merged: false }
+        HirCol { id, def }
     }
 }
 
@@ -158,27 +151,6 @@ pub(crate) fn as_col(e: &HirExpr) -> Option<ColId> {
         BExpr::ColRef(HirRef::Col(id)) => Some(*id),
         _ => None,
     }
-}
-
-/// Whether `items` is the reduce pre-map over `input`: `input`'s own columns
-/// passed through under their own `ColId`s, then at least one computed column.
-/// The bind inserts one so the reduce can group by, or aggregate, an expression
-/// (`GROUP BY a + b`, `SUM(a * b)`).
-///
-/// Identity is what tells it from a derived table's body, which is also a
-/// `Project` over a `Get` — that one mints a fresh `ColId` per output, so it
-/// never matches here and keeps being cut to a segment.
-///
-/// Read by both reduce lowerings — `lower::reduce`, which emits it as a MAP in
-/// the view's circuit, and `lower::fold`, which ships it as the fold sink's
-/// pre-map — so neither can disagree about what the reduce's input is.
-pub(crate) fn is_pre_map(input: &RelExpr, items: &[ProjEntry]) -> bool {
-    let cols = input.cols();
-    items.len() > cols.len()
-        && cols
-            .iter()
-            .zip(items)
-            .all(|(c, it)| it.out.id == c.id && as_col(&it.expr) == Some(c.id))
 }
 
 /// The physical position of a `ColId` in a layout.
@@ -310,13 +282,9 @@ pub(crate) struct ProjEntry {
 /// output columns are derived on demand by [`RelExpr::cols`].
 pub(crate) enum RelExpr {
     Get {
-        tid: u64,
+        source: GetSource,
         schema: Arc<Schema>,
         cols: Vec<HirCol>,
-        /// The catalog descriptor `tid` resolved to, or `None` for the ad-hoc
-        /// read's source, which names its relation in the `ReadSpec` and so has
-        /// no `tid` here: no index list to bound a scan with, no replication flag.
-        desc: Option<Arc<RelDescriptor>>,
     },
     Filter {
         input: Rc<RelExpr>,
@@ -332,17 +300,11 @@ pub(crate) enum RelExpr {
         kind: JoinType,
         /// The ON predicate, in whichever of its two forms the pipeline has reached.
         on: JoinOn,
-        /// The synthetic `0/1` mark column of a `JoinType::Mark` decorrelation
-        /// (`Some` iff `kind == Mark`, minted at decorrelation). Its `ColId` is the
-        /// `HirRef::Col(mark_id)` leaf the substituted subquery expression reads,
-        /// and it appears in `cols()` after the left side.
-        mark: Option<HirCol>,
     },
-    /// A GROUP BY / aggregate reduce. `group_cols` are `ColId`s of `input`; its
-    /// output carries those same `ColId`s (source names) followed by each
-    /// aggregate's raw value column and, for AVG / nullable SUM, its
-    /// `COUNT_NON_NULL` companion. This is the **raw** reduce output — the
-    /// finalized SELECT shape is the finalize `Project` above.
+    /// A GROUP BY / aggregate reduce over `pre` applied to `input`. Its output is
+    /// the group columns, then each aggregate's raw value and (AVG / nullable SUM)
+    /// its `COUNT_NON_NULL` companion — the **raw** shape the finalize `Project`
+    /// above renders.
     ///
     /// The hidden cardinality COUNT the engine gates group existence on is *not*
     /// modelled here: it is a physical emission artifact with no logical identity
@@ -350,6 +312,11 @@ pub(crate) enum RelExpr {
     /// the layer that owns spec layout.
     Reduce {
         input: Rc<RelExpr>,
+        /// The pre-map bind inserted so the reduce can group by, or aggregate, an
+        /// expression (`GROUP BY a + b`): `input`'s columns passed through, then
+        /// one item per materialized expression. Empty when there is none.
+        pre: Vec<ProjEntry>,
+        /// `ColId`s of the reduce's input — `pre`'s outputs, or `input`'s own.
         group_cols: Vec<ColId>,
         aggs: Vec<HirAgg>,
     },
@@ -384,6 +351,21 @@ pub(crate) enum RelExpr {
     },
 }
 
+/// Where a `Get`'s rows come from: a catalog relation, or the ad-hoc read's
+/// source, which names its relation in the `ReadSpec` instead — so it has no
+/// `tid` and no descriptor here, and never reaches the circuit lowering.
+pub(crate) enum GetSource {
+    Catalog { tid: u64, desc: Arc<RelDescriptor> },
+    AdHoc,
+}
+
+impl GetSource {
+    /// A stream holds no rows, so nothing read from one has a row identity.
+    fn is_stream(&self) -> bool {
+        matches!(self, GetSource::Catalog { desc, .. } if desc.class == gnitz_core::RelClass::Stream)
+    }
+}
+
 /// One raw reduce output. `func`/`arg` are the **logical** aggregate (AVG is
 /// never decomposed here — physicalization expands it to `Sum`+`CountNonNull`).
 /// `out` is the raw value column; `companion` is the hidden `COUNT_NON_NULL`
@@ -403,15 +385,9 @@ pub(crate) struct HirAgg {
 impl HirAgg {
     /// Mint an aggregate's raw output column (and its `COUNT_NON_NULL` companion
     /// when the shape carries one) from the typing `agg::agg_typing` decided.
-    ///
-    /// The raw value column's nullability is the shared
-    /// `AggFunc::raw_output_nullable` — the same rule the engine's physical reduce
-    /// output schema obeys, so the two layers agree on what the reduce can emit.
-    /// It is **not** cosmetic here: `null_gate` emits no NULL filter for a NOT NULL
-    /// key, so a companion-free MIN/MAX keyed directly by an uncorrelated scalar
-    /// subquery would carry its ground row's NULL (zero bytes) into `map_reindex`
-    /// ungated, where it OPK-encodes as the real key `0` and spuriously matches
-    /// `outer = 0`.
+    /// The raw column's nullability is the shared `AggFunc::raw_output_nullable`,
+    /// so the planner and the engine's reduce output schema agree on what the
+    /// reduce can emit: declared NOT NULL, `null_gate` would leave it ungated.
     pub(crate) fn new(
         ids: &ColIdGen,
         func: AggFunc,
@@ -419,20 +395,7 @@ impl HirAgg {
         env: &[HirCol],
         is_global: bool,
     ) -> Result<Self, GnitzSqlError> {
-        Self::with_arg_def(ids, func, arg, arg.map(|id| &hircol_of(env, id).def), is_global)
-    }
-
-    /// [`Self::new`] with the argument's definition supplied rather than looked
-    /// up — for a caller typing an aggregate whose argument is not yet a column
-    /// of any relation (the window desugar, which types the call at bind and
-    /// hoists its argument afterwards).
-    pub(crate) fn with_arg_def(
-        ids: &ColIdGen,
-        func: AggFunc,
-        arg: Option<ColId>,
-        arg_def: Option<&ColumnDef>,
-        is_global: bool,
-    ) -> Result<Self, GnitzSqlError> {
+        let arg_def = arg.map(|id| &hircol_of(env, id).def);
         let typing = crate::agg::agg_typing(func, arg_def)?;
         let arg_nullable = arg_def.map(|d| d.is_nullable).unwrap_or(false);
         Ok(HirAgg {
@@ -468,19 +431,21 @@ impl HirAgg {
         )
     }
 
-    /// AVG divides to F64; every other aggregate renders its raw value type.
+    /// The type this aggregate renders where a view reads it.
     pub(crate) fn view_type(&self) -> TypeCode {
-        if self.func == AggFunc::Avg {
-            TypeCode::F64
-        } else {
-            self.out.def.type_code
-        }
+        crate::agg::agg_view_type(self.func, self.out.def.type_code)
     }
 
     /// A companion carries the null-ness (the finalize renders NULL by
     /// div-by-zero); otherwise the raw column's own.
     pub(crate) fn view_nullable(&self) -> bool {
         self.companion.is_some() || self.out.def.is_nullable
+    }
+
+    /// This aggregate as a view-facing value column: what computes it, and the
+    /// type and nullability that value is declared with.
+    pub(crate) fn as_value(&self) -> (HirExpr, TypeCode, bool) {
+        (self.finalize(), self.view_type(), self.view_nullable())
     }
 }
 
@@ -509,9 +474,8 @@ pub(crate) enum SetOpKind {
 ///
 /// A target is `None` when that side already carries the promoted type (hash it
 /// as it lies), else the promoted type — so both sides hash one physical
-/// representation. Stamped here, where the pair's source types and the promoted
-/// type are all in hand, rather than re-derived at lowering by walking both
-/// sides' whole column lists back out of the tree.
+/// representation. Stamped here rather than at lowering, where `lower_sides`
+/// would have to hand two more values back.
 #[derive(Clone)]
 pub(crate) struct SetOpCol {
     pub left: ColId,
@@ -521,41 +485,38 @@ pub(crate) struct SetOpCol {
     pub right_target: Option<TypeCode>,
 }
 
-/// Which side(s) of a join survive unmatched — the join kind carried in
-/// `RelExpr::Join.kind`, and the driver of both null-fill emission and
-/// output-column nullability. The two predicates:
-///   - `preserves_left()`  (`Left | Full`): a left row survives unmatched ⇒ the
-///     right columns can be NULL, and the null-fill `ν_A = positive_part(A − π_A(inner))`
-///     is emitted.
-///   - `preserves_right()` (`Right | Full`): a right row survives unmatched ⇒ the
-///     left columns can be NULL, and the mirror `ν_B = positive_part(B − π_B(inner))`
-///     is emitted.
-///
-/// `Full` satisfies both. `Inner` neither.
-///
-/// `Semi`, `Anti`, and `Mark` are the decorrelation-only kinds an EXISTS/IN
-/// subquery lowers to (never produced by a FROM-clause JOIN): a semi/anti join
-/// keeps/drops each left row by match existence, and a mark join tags each left
-/// row with a `0/1` match column. All three preserve neither side under the
-/// `preserves_left`/`preserves_right` predicates (they are `matches!`-based, so
-/// the new variants get `false` automatically), and carry only the left columns
-/// (plus, for `Mark`, the mark column) — see `RelExpr::cols`.
+/// Which side(s) of a join survive unmatched: the driver of null-fill emission
+/// and of output-column nullability, read through the predicates below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JoinType {
     Inner,
     Left,
     Right,
     Full,
+    /// EXISTS/IN: keep each left row by match existence.
     Semi,
+    /// NOT EXISTS / NOT IN: drop each left row by match existence.
     Anti,
-    Mark,
+    /// EXISTS/IN in a mark position, carrying the `ColId` of the synthetic `0/1`
+    /// column tagging each left row — the leaf the substituted subquery reads.
+    Mark(ColId),
 }
 
 impl JoinType {
+    /// The mark column a [`JoinType::Mark`] appends after its left columns.
+    /// Hidden: nothing but the substituted subquery expression reaches it, and it
+    /// is addressed by id, never by name.
+    pub(crate) fn mark_col(id: ColId) -> HirCol {
+        HirCol::new(id, ColumnDef::new("_mark", TypeCode::I64, false).hidden())
+    }
+
+    /// A left row survives unmatched ⇒ the right columns can be NULL, and
+    /// `ν_A = positive_part(A − π_A(inner))` is emitted.
     pub(crate) fn preserves_left(self) -> bool {
         matches!(self, JoinType::Left | JoinType::Full)
     }
 
+    /// The mirror: a right row survives unmatched, and `ν_B` is emitted.
     pub(crate) fn preserves_right(self) -> bool {
         matches!(self, JoinType::Right | JoinType::Full)
     }
@@ -571,6 +532,29 @@ impl JoinType {
         }
     }
 
+    /// Widen the two sides of one join step for its null semantics — a preserved
+    /// side forces the *other* side's columns nullable. The one home for that
+    /// cross, and it moves only `is_nullable`, so a resolved reference survives.
+    pub(crate) fn widen_sides<'a>(
+        self,
+        left: impl Iterator<Item = &'a mut ColumnDef>,
+        right: impl Iterator<Item = &'a mut ColumnDef>,
+    ) {
+        if self.preserves_right() {
+            left.for_each(|d| d.is_nullable = true);
+        }
+        if self.preserves_left() {
+            right.for_each(|d| d.is_nullable = true);
+        }
+    }
+
+    /// The three decorrelation-only kinds an EXISTS/IN subquery lowers to, never
+    /// produced by a FROM-clause JOIN: they preserve neither side and carry only
+    /// the left (outer) columns.
+    pub(crate) fn is_decorrelated(self) -> bool {
+        matches!(self, JoinType::Semi | JoinType::Anti | JoinType::Mark(_))
+    }
+
     /// Whether this side gets a **ν** — the unmatched set
     /// `positive_part(P_all − π_P(inner))`. Wider than [`Self::preserves`], which
     /// answers "emit an outer null-fill branch": `Semi`/`Anti`/`Mark` preserve
@@ -578,7 +562,7 @@ impl JoinType {
     /// existence. The reindex keep set protects exactly the ν operands, so it asks
     /// this rather than `preserves`.
     pub(crate) fn has_nu(self, is_left: bool) -> bool {
-        self.preserves(is_left) || (is_left && matches!(self, JoinType::Semi | JoinType::Anti | JoinType::Mark))
+        self.preserves(is_left) || (is_left && self.is_decorrelated())
     }
 }
 
@@ -667,13 +651,22 @@ impl RelExpr {
     /// A base table or committed/hidden-view source: one fresh `ColId` per
     /// registered schema column, in schema order (so a `ColId`'s env position is
     /// its schema position).
-    pub(crate) fn get(ids: &ColIdGen, tid: u64, schema: Arc<Schema>, desc: Option<Arc<RelDescriptor>>) -> Rc<RelExpr> {
+    pub(crate) fn get(ids: &ColIdGen, tid: u64, schema: Arc<Schema>, desc: Arc<RelDescriptor>) -> Rc<RelExpr> {
+        Self::get_of(ids, GetSource::Catalog { tid, desc }, schema)
+    }
+
+    /// The ad-hoc read's source, under the same column minting.
+    pub(crate) fn get_adhoc(ids: &ColIdGen, schema: Arc<Schema>) -> Rc<RelExpr> {
+        Self::get_of(ids, GetSource::AdHoc, schema)
+    }
+
+    fn get_of(ids: &ColIdGen, source: GetSource, schema: Arc<Schema>) -> Rc<RelExpr> {
         let cols = schema
             .columns
             .iter()
             .map(|c| HirCol::new(ids.next(), c.clone()))
             .collect();
-        Rc::new(RelExpr::Get { tid, schema, cols, desc })
+        Rc::new(RelExpr::Get { source, schema, cols })
     }
 
     /// A linear filter: pass-through columns (same ids, same order as `input`).
@@ -698,28 +691,20 @@ impl RelExpr {
         Rc::new(RelExpr::Project { input, items })
     }
 
-    /// A join with its raw (unclassified) ON conjuncts; `mark` is `Some` only for a
-    /// `JoinType::Mark` decorrelation.
-    pub(crate) fn join(
-        left: Rc<RelExpr>,
-        right: Rc<RelExpr>,
-        kind: JoinType,
-        on: Vec<HirExpr>,
-        mark: Option<HirCol>,
-    ) -> Rc<RelExpr> {
-        Rc::new(RelExpr::Join {
-            left,
-            right,
-            kind,
-            on: JoinOn::Raw(on),
-            mark,
-        })
+    /// A join with its raw (unclassified) ON conjuncts.
+    pub(crate) fn join(left: Rc<RelExpr>, right: Rc<RelExpr>, kind: JoinType, on: Vec<HirExpr>) -> Rc<RelExpr> {
+        Rc::new(RelExpr::Join { left, right, kind, on: JoinOn::Raw(on) })
     }
 
     /// A reduce. `aggs` are already validated + nullability-stamped by bind (which
     /// holds the input env), so this is a plain node build — parity by construction.
-    pub(crate) fn reduce(input: Rc<RelExpr>, group_cols: Vec<ColId>, aggs: Vec<HirAgg>) -> Rc<RelExpr> {
-        Rc::new(RelExpr::Reduce { input, group_cols, aggs })
+    pub(crate) fn reduce(
+        input: Rc<RelExpr>,
+        pre: Vec<ProjEntry>,
+        group_cols: Vec<ColId>,
+        aggs: Vec<HirAgg>,
+    ) -> Rc<RelExpr> {
+        Rc::new(RelExpr::Reduce { input, pre, group_cols, aggs })
     }
 
     /// A DISTINCT over its input's visible columns.
@@ -752,14 +737,14 @@ impl RelExpr {
     /// the key iff it passes every key column through.
     pub(crate) fn row_key(&self) -> Option<Vec<ColId>> {
         match self {
-            RelExpr::Get { schema, cols, desc, .. } => {
-                if desc.as_ref().is_some_and(|d| d.class == gnitz_core::RelClass::Stream) {
+            RelExpr::Get { source, schema, cols } => {
+                if source.is_stream() {
                     return None;
                 }
                 let pk = &schema.pk_cols;
                 if pk
                     .iter()
-                    .any(|&i| lower::joincore::is_join_key_name(&schema.columns[i as usize].name))
+                    .any(|&i| guards::is_join_key_name(&schema.columns[i as usize].name))
                 {
                     return None;
                 }
@@ -872,15 +857,19 @@ impl RelExpr {
             RelExpr::Project { input, items } => one!(input, |n| RelExpr::project(n, items.clone())),
             RelExpr::Distinct { input } => one!(input, RelExpr::distinct),
             RelExpr::Alias { input, cols } => one!(input, |n| Rc::new(RelExpr::Alias { input: n, cols: cols.clone() })),
-            RelExpr::Reduce { input, group_cols, aggs } => {
-                one!(input, |n| RelExpr::reduce(n, group_cols.clone(), aggs.clone()))
+            RelExpr::Reduce { input, pre, group_cols, aggs } => {
+                one!(input, |n| RelExpr::reduce(
+                    n,
+                    pre.clone(),
+                    group_cols.clone(),
+                    aggs.clone()
+                ))
             }
-            RelExpr::Join { left, right, kind, on, mark } => two!(left, right, |l, r| Rc::new(RelExpr::Join {
+            RelExpr::Join { left, right, kind, on } => two!(left, right, |l, r| Rc::new(RelExpr::Join {
                 left: l,
                 right: r,
                 kind: *kind,
                 on: on.clone(),
-                mark: mark.clone(),
             })),
             RelExpr::SetOp { op, all, left, right, out } => two!(left, right, |l, r| Rc::new(RelExpr::SetOp {
                 op: *op,
@@ -902,32 +891,38 @@ impl RelExpr {
             RelExpr::Get { cols, .. } => cols.clone(),
             RelExpr::Filter { input, .. } => input.cols(),
             RelExpr::Project { items, .. } => items.iter().map(|e| e.out.clone()).collect(),
-            RelExpr::Join { left, right, kind, mark, .. } => match kind {
+            RelExpr::Join { left, right, kind, .. } => match kind {
                 // A semi/anti join carries only the left (outer) columns; a mark
                 // join appends its synthetic `0/1` column after them. The equi/
                 // outer joins are left ++ right with the null-providing side widened
                 // per `kind` (`combined_payload_coldefs`, applied to the `HirCol`
                 // defs — same `ColId`s, widening changes only nullability).
                 JoinType::Semi | JoinType::Anti => left.cols(),
-                JoinType::Mark => {
+                JoinType::Mark(id) => {
                     let mut cols = left.cols();
-                    cols.push(mark.clone().expect("Mark join carries a mark column"));
+                    cols.push(JoinType::mark_col(*id));
                     cols
                 }
                 _ => {
                     let mut cols = left.cols();
-                    widen_if(cols.iter_mut().map(|c| &mut c.def), kind.preserves_right());
                     let mut rcols = right.cols();
-                    widen_if(rcols.iter_mut().map(|c| &mut c.def), kind.preserves_left());
+                    kind.widen_sides(
+                        cols.iter_mut().map(|c| &mut c.def),
+                        rcols.iter_mut().map(|c| &mut c.def),
+                    );
                     cols.extend(rcols);
                     cols
                 }
             },
-            RelExpr::Reduce { input, group_cols, aggs } => {
-                // Group cols keep their source `HirCol`s (from the input); then
-                // each aggregate's raw value + companion columns. The physical
+            RelExpr::Reduce { input, pre, group_cols, aggs } => {
+                // Group cols keep their source `HirCol`s (from the reduce's input);
+                // then each aggregate's raw value + companion columns. The physical
                 // cardinality COUNT has no logical column and is absent here.
-                let in_cols = input.cols();
+                let in_cols = if pre.is_empty() {
+                    input.cols()
+                } else {
+                    pre.iter().map(|e| e.out.clone()).collect()
+                };
                 let mut cols: Vec<HirCol> = group_cols.iter().map(|id| hircol_of(&in_cols, *id).clone()).collect();
                 for a in aggs {
                     cols.push(a.out.clone());
@@ -941,22 +936,5 @@ impl RelExpr {
             RelExpr::Alias { cols, .. } => cols.clone(),
             RelExpr::SetOp { out, .. } => out.iter().map(|c| c.out.clone()).collect(),
         }
-    }
-}
-
-/// Widen every def to nullable when `make_nullable` — the per-side outer-join
-/// nullability adjustment, and its **one** home. A preserved side forces the
-/// *other* side's columns nullable (`kind.preserves_left()` widens the right,
-/// `preserves_right()` the left), so the logical output columns ([`RelExpr::cols`])
-/// and the physical ones (`lower::join::combined_payload_coldefs`) derive
-/// nullability from the same primitive rather than restating the rule. Widening
-/// touches only `is_nullable`, so a `ColId` survives it and a resolved reference
-/// stays valid.
-pub(crate) fn widen_if<'a>(defs: impl Iterator<Item = &'a mut ColumnDef>, make_nullable: bool) {
-    if !make_nullable {
-        return;
-    }
-    for d in defs {
-        d.is_nullable = true;
     }
 }

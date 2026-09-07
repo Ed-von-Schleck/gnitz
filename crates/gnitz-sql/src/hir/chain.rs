@@ -96,13 +96,52 @@ pub(crate) fn debug_assert_exchange_topology(circuit: &Circuit) {
     }
 }
 
+/// Reject a node whose counted list exceeds `MAX_COLUMNS`, which `write_count`
+/// asserts on rather than rejects. An intermediate node can be wider than the
+/// view it feeds, so the output schema does not bound it.
+pub(crate) fn reject_circuit_column_overflow(circuit: &Circuit) -> Result<(), GnitzSqlError> {
+    use crate::validate::reject_column_overflow as check;
+    use gnitz_core::{MapKind, OpNode};
+    for op in circuit.nodes.values() {
+        match op {
+            OpNode::Map(MapKind::Projection(cols)) => check("a view circuit projection", cols.len())?,
+            OpNode::Map(MapKind::Compute(map)) => check("a view circuit computed projection", map.out_cols.len())?,
+            OpNode::Map(MapKind::Reindex { keep, key, role: _ }) => {
+                check("a view circuit reindex key", key.len())?;
+                check("a view circuit reindex payload", keep.len())?;
+            }
+            OpNode::Map(MapKind::HashRow { cols, branch_id: _ }) => {
+                check("a view circuit content-hash key", cols.len())?
+            }
+            OpNode::Reduce { group_cols, agg, global_ground: _ } => {
+                check("a view circuit group key", group_cols.len())?;
+                check("a view circuit aggregate list", agg.len())?;
+            }
+            OpNode::ExchangeShard { shard_cols } => check("a view circuit shard key", shard_cols.len())?,
+            OpNode::NullExtend { type_codes } => check("a view circuit null-fill region", type_codes.len())?,
+            // No counted list to check.
+            OpNode::ScanDelta { .. }
+            | OpNode::Filter(_)
+            | OpNode::Negate
+            | OpNode::Union
+            | OpNode::Distinct
+            | OpNode::PositivePart
+            | OpNode::Join(_)
+            | OpNode::IntegrateSink
+            | OpNode::IntegrateTrace
+            | OpNode::WorkerFilter => {}
+        }
+    }
+    Ok(())
+}
+
 /// A `Schema` from emitted pieces: the output columns, of which the leading
 /// [`PkArity`] are the PK region. Runs the shared admissibility rules
 /// (`Schema::from_parts`) here, where `what` names the stage, instead of leaving
 /// them to the DDL gateway — whose verdict is identical but names only a segment
 /// index, and which the ad-hoc fold's pre-map never reaches.
 pub(crate) fn schema_of(cols: &[ColumnDef], pk: PkArity, what: &str) -> Result<Arc<Schema>, GnitzSqlError> {
-    Schema::from_parts(cols.to_vec(), (0..pk as u32).collect())
+    Schema::from_parts(cols.to_vec(), pk_col_list(pk))
         .map(Arc::new)
         .map_err(|e| GnitzSqlError::Unsupported(format!("{what}: {e}")))
 }
@@ -151,7 +190,10 @@ impl ViewChain {
         let seg = self.mint();
         let ((circuit, cols, pk), layout) = emit(self)?;
         debug_assert_exchange_topology(&circuit);
+        // After the output schema, so a segment too wide to register is named by
+        // its own columns rather than by whichever node first exceeds the cap.
         let schema = schema_of(&cols, pk, "view segment output")?;
+        reject_circuit_column_overflow(&circuit)?;
         self.push_hidden(seg, cols, pk, circuit);
         Ok(SegInput {
             tid: segment_id(seg as u64),

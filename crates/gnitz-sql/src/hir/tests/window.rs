@@ -292,6 +292,9 @@ fn a_window_call_belongs_to_the_select_list_and_qualify_only() {
         "SELECT id, SUM(a) OVER (PARTITION BY RANK() OVER (ORDER BY a)) FROM t",
         "cannot be nested",
     );
+    // A bare `EXISTS (SELECT …)` ignores its select list by definition, so a
+    // window call written there is never bound — the body still compiles.
+    plan("SELECT t.id FROM t WHERE EXISTS (SELECT ROW_NUMBER() OVER (ORDER BY u.k) FROM u WHERE u.k = t.k)").unwrap();
     rejects("SELECT id, k FROM t QUALIFY a > 1", "QUALIFY needs a window function");
     rejects(
         "SELECT k FROM t GROUP BY k QUALIFY k > 1",

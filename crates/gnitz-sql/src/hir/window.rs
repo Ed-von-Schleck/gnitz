@@ -345,12 +345,12 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
             return Ok((TypeCode::I64, false));
         };
         let arg_def = arg.map(|e| ColumnDef::new("_arg", e.infer_type_with(&|r| self.type_of(r)), !self.never_null(e)));
-        let typed = HirAgg::with_arg_def(self.ids, agg, None, arg_def.as_ref(), false)?;
+        let raw = crate::agg::agg_typing(agg, arg_def.as_ref())?.ops[0].1;
         let nullable = match agg {
             AggFunc::Count => false,
             _ => arg_def.is_some_and(|d| d.is_nullable),
         };
-        Ok((typed.view_type(), nullable))
+        Ok((crate::agg::agg_view_type(agg, raw), nullable))
     }
 }
 
@@ -412,8 +412,8 @@ impl<L: ItemLeaf> ItemLeaf for WindowLeaf<'_, L> {
     fn type_of(&self, r: &HirRef) -> TypeCode {
         self.placeholder(r).map_or_else(|| self.inner.type_of(r), |(tc, _)| tc)
     }
-    fn expands_wildcard(&self) -> bool {
-        self.inner.expands_wildcard()
+    fn wildcard_cols(&self) -> Option<Vec<&HirCol>> {
+        self.inner.wildcard_cols()
     }
     fn call_item(
         &self,
@@ -690,7 +690,7 @@ fn desugar(
                 )
             })
             .collect();
-        cur = RelExpr::join(cur, right, JoinType::Inner, on, None);
+        cur = RelExpr::join(cur, right, JoinType::Inner, on);
         values.extend(vals);
     }
 
@@ -763,8 +763,7 @@ impl Aggs<'_> {
     /// Aggregate `(func, arg)`, registered on first sight, as a value column.
     fn value(&mut self, func: AggFunc, arg: Option<ColId>) -> Result<Value, GnitzSqlError> {
         let slot = self.slot(func, arg)?;
-        let a = &self.list[slot];
-        Ok((a.finalize(), a.view_type(), a.view_nullable()))
+        Ok(self.list[slot].as_value())
     }
 }
 
@@ -861,7 +860,7 @@ fn whole_partition(
             _ => (BExpr::LitInt(1), TypeCode::I64, false),
         });
     }
-    let reduce = RelExpr::reduce(wf.rel, keys.clone(), aggs.list);
+    let reduce = RelExpr::reduce(wf.rel, Vec::new(), keys.clone(), aggs.list);
     Ok(windowed(
         ids,
         reduce,
@@ -911,12 +910,8 @@ fn cumulative(ids: &ColIdGen, w: &WRel, spec: &Spec<ColId>, calls: &[&Call<ColId
             WinFunc::DenseRank => vec![],
         });
     }
-    let g_values = g_aggs
-        .list
-        .iter()
-        .map(|a| (a.finalize(), a.view_type(), a.view_nullable()))
-        .collect();
-    let reduce = RelExpr::reduce(wf.rel, g_keys.clone(), g_aggs.list);
+    let g_values = g_aggs.list.iter().map(HirAgg::as_value).collect();
+    let reduce = RelExpr::reduce(wf.rel, Vec::new(), g_keys.clone(), g_aggs.list);
     let (g, _, _) = present(ids, reduce, &g_keys, "g", g_values);
 
     // The band self-join: g1 is the current peer group, g2 every group of the
@@ -938,7 +933,7 @@ fn cumulative(ids: &ColIdGen, w: &WRel, spec: &Spec<ColId>, calls: &[&Call<ColId
         }
         on.push(lex);
     }
-    let band = RelExpr::join(Rc::clone(&g1.rel), Rc::clone(&g2.rel), JoinType::Inner, on, None);
+    let band = RelExpr::join(Rc::clone(&g1.rel), Rc::clone(&g2.rel), JoinType::Inner, on);
     let band_cols = band.cols();
 
     // R: fold g2's per-group values over the band, keyed by g1's group. RANK
@@ -985,7 +980,7 @@ fn cumulative(ids: &ColIdGen, w: &WRel, spec: &Spec<ColId>, calls: &[&Call<ColId
         });
     }
     let projected_keys: Vec<ColId> = r_keys[..nkeys].to_vec();
-    let reduce = RelExpr::reduce(band, r_keys, r_aggs.list);
+    let reduce = RelExpr::reduce(band, Vec::new(), r_keys, r_aggs.list);
     Ok(windowed(ids, reduce, &projected_keys, w_keys, "r", calls, per_call))
 }
 

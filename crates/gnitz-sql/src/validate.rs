@@ -170,10 +170,8 @@ pub(crate) fn non_key_eligible_error(name: &str, tc: TypeCode, role: &str) -> Gn
     ))
 }
 
-/// Reject a circuit whose widest intermediate batch exceeds the engine's
-/// column limit, before the server's hard schema-build assertion. `what` names
-/// the view kind and stage ("EXISTS view intermediate", …); a segment's output
-/// width is checked by its schema build instead.
+/// Reject a counted column list wider than the engine's column limit, before the
+/// wire encoder's assertion. `what` names the list.
 pub(crate) fn reject_column_overflow(what: &str, cols: usize) -> Result<(), GnitzSqlError> {
     if cols > gnitz_core::MAX_COLUMNS {
         return Err(GnitzSqlError::Unsupported(format!(

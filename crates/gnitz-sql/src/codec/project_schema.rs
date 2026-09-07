@@ -34,6 +34,14 @@ impl ProjItem {
             bound_expr => ProjItem::Computed { bound_expr },
         }
     }
+
+    /// The source column a pass-through copies, `None` for a computed item.
+    pub(crate) fn passthrough_src(&self) -> Option<usize> {
+        match self {
+            ProjItem::PassThrough { src_col } => Some(*src_col),
+            ProjItem::Computed { .. } => None,
+        }
+    }
 }
 
 /// Resolve one *non-wildcard* SELECT item against `source_schema` into a
@@ -133,9 +141,7 @@ pub(crate) fn place_pk_front(
         // First occurrence is the canonical physical-PK slot; any later
         // duplicate (SELECT pk, pk AS x) stays in the payload region and is
         // materialized by the expr-map column-copy path.
-        let cur = items
-            .iter()
-            .position(|i| matches!(i, ProjItem::PassThrough { src_col } if *src_col == pk));
+        let cur = items.iter().position(|i| i.passthrough_src() == Some(pk));
         match cur {
             Some(pos) if pos == target => { /* already in place */ }
             Some(pos) => {

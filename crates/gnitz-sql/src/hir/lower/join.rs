@@ -4,7 +4,7 @@
 //! shells are `exists.rs`, over the same primitives.
 
 use super::super::guards::{reject_pair_pk_overflow, reject_pure_range_outer};
-use super::super::{widen_if, ColId, EqPair, HirExpr, HirRange, JoinClass, JoinShape, JoinType, ProjEntry, RelExpr};
+use super::super::{ColId, EqPair, HirExpr, HirRange, JoinClass, JoinShape, JoinType, ProjEntry, RelExpr};
 use super::joincore::{
     ba_to_ab_cols, band_pi_preserved, build_pure_range_threshold, emit_equi_null_fill, emit_range_null_fill_tail,
     equi_prologue, pair_pk_coldefs, pair_pk_slots, pure_range_unmatched, range_prologue, rekey_pure_range_a, EquiInput,
@@ -146,9 +146,6 @@ fn emit_range(
     let pair_pk = pa + pb;
 
     reject_pair_pk_overflow("range JOIN", pa, pb)?;
-    // The widest node: the pre-rekey `[_join_pk × k, kept-A, kept-B]` or the
-    // post-rekey `[_pair_pk, kept-A, kept-B]`, whichever key region is wider.
-    crate::validate::reject_column_overflow("range JOIN view intermediate", k.max(pair_pk) + pl + pr)?;
 
     if n_eq == 0 {
         reject_pure_range_outer(kind, range.tc)?;
@@ -257,9 +254,6 @@ fn emit_cross(down: Demand<'_>, class: &JoinClass, sides: &[JoinSide; 2]) -> Res
     let pair_pk = pa + pb;
 
     reject_pair_pk_overflow("CROSS JOIN", pa, pb)?;
-    // The widest node: the post-rekey `[_pair_pk, kept-A, kept-B]` (each term's
-    // own key region is one side's PK alone, and so narrower).
-    crate::validate::reject_column_overflow("CROSS JOIN view intermediate", pair_pk + pl + pr)?;
 
     let mut cb = CircuitBuilder::new(0);
     let input_a_raw = cb.input_delta_tagged(left.seg.tid);
@@ -317,16 +311,12 @@ fn class_referenced(class: &JoinClass, live: &mut HashSet<ColId>) {
     collect_live_cols(&class.residual, live);
 }
 
-/// The combined `[A cols, B cols]` output payload of one join step, with the
-/// outer-join nullability adjustment applied through [`widen_if`] — the same
-/// primitive `RelExpr::cols` widens the *logical* join output with, so the physical
-/// and logical schemas cannot disagree (a client decoding a NULL in a NOT NULL
-/// column would panic). Shared by the equi and range join lowering.
+/// The combined `[A cols, B cols]` output payload of one join step, widened
+/// through the same [`JoinType::widen_sides`] the logical join output uses.
 fn combined_payload_coldefs(left: &[ColumnDef], right: &[ColumnDef], join_type: JoinType) -> Vec<ColumnDef> {
     let mut cols = left.to_vec();
-    widen_if(cols.iter_mut(), join_type.preserves_right());
     let mut rcols = right.to_vec();
-    widen_if(rcols.iter_mut(), join_type.preserves_left());
+    join_type.widen_sides(cols.iter_mut(), rcols.iter_mut());
     cols.extend(rcols);
     cols
 }

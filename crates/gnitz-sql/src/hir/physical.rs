@@ -49,6 +49,22 @@ pub(crate) struct PhysProjection {
 /// auto-prepended hidden PK slot is [`ColId::NONE`] — the user never named that
 /// column, so nothing can reference it), so a cut linear segment exposes its layout
 /// exactly like a combine one.
+/// Append each entry's emission item and its output def, keeping the two vectors
+/// parallel — the pairing every projection emit depends on, so it is made once
+/// here rather than by two loops that could fall out of step.
+pub(crate) fn resolve_items(
+    items: &[ProjEntry],
+    layout: &[ColId],
+    out_items: &mut Vec<ProjItem>,
+    out_cols: &mut Vec<ColumnDef>,
+) -> Result<(), GnitzSqlError> {
+    for entry in items {
+        out_items.push(ProjItem::from_bound(resolve_refs(&entry.expr, layout)?));
+        out_cols.push(entry.out.def.clone());
+    }
+    Ok(())
+}
+
 pub(crate) fn physicalize_projection(
     items: &[ProjEntry],
     input_layout: &[ColId],
@@ -56,10 +72,7 @@ pub(crate) fn physicalize_projection(
 ) -> Result<PhysProjection, GnitzSqlError> {
     let mut proj_items: Vec<ProjItem> = Vec::with_capacity(items.len());
     let mut out_cols: Vec<ColumnDef> = Vec::with_capacity(items.len());
-    for entry in items {
-        proj_items.push(ProjItem::from_bound(resolve_refs(&entry.expr, input_layout)?));
-        out_cols.push(entry.out.def.clone());
-    }
+    resolve_items(items, input_layout, &mut proj_items, &mut out_cols)?;
     let perm = place_pk_front(&mut proj_items, &mut out_cols, input_schema);
     let layout = perm
         .into_iter()
