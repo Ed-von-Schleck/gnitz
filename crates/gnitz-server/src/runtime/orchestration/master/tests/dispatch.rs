@@ -1,4 +1,4 @@
-use super::super::fixtures::test_dispatcher;
+use super::super::fixtures::{test_dispatcher, test_dispatcher_with_efds};
 use crate::catalog::{CatalogEngine, SysFamily, FIRST_USER_TABLE_ID};
 use gnitz_store::foundation::posix_io::retry_eintr;
 
@@ -154,4 +154,40 @@ fn a_checkpoint_bumps_the_generation_once_and_restamps_at_it() {
 
     drop(disp);
     engine.close();
+}
+
+/// `signal_reached` wakes exactly the workers a poll's fan-outs reached.
+///
+/// A group written to one worker costs one eventfd write, not W — the whole
+/// point of taking the fan-out list rather than broadcasting. Counted off real
+/// eventfds, so the assertion is on the syscall the master actually makes.
+#[test]
+fn signal_reached_wakes_only_the_workers_a_fanout_reached() {
+    use crate::runtime::m2w::{eventfd_create, eventfd_wait, Wake};
+    use crate::runtime::orchestration::master::Fanout;
+
+    const NW: usize = 4;
+    let efds: Vec<i32> = (0..NW).map(|_| eventfd_create().expect("eventfd")).collect();
+    let disp = test_dispatcher_with_efds(vec![std::process::id() as i32; NW], efds.clone());
+
+    // Drains each counter, so a worker that was signalled reports `Signalled`
+    // exactly once and every other reports `Idle`.
+    let woken = |disp: &super::super::MasterDispatcher, fanouts: Vec<Fanout>| -> Vec<usize> {
+        disp.signal_reached(fanouts);
+        (0..NW)
+            .filter(|&w| eventfd_wait(efds[w], 0) == Wake::Signalled)
+            .collect()
+    };
+
+    assert_eq!(woken(&disp, vec![]), Vec::<usize>::new(), "nothing dispatched, nothing woken");
+    assert_eq!(woken(&disp, vec![Fanout::One(2)]), vec![2]);
+    assert_eq!(woken(&disp, vec![Fanout::One(3), Fanout::One(1)]), vec![1, 3]);
+    // A worker reached twice is still one wake, and a broadcast stops at the
+    // launched worker count rather than at the width of the mask word.
+    assert_eq!(woken(&disp, vec![Fanout::One(1), Fanout::One(1)]), vec![1]);
+    assert_eq!(woken(&disp, vec![Fanout::One(0), Fanout::Broadcast]), vec![0, 1, 2, 3]);
+
+    for fd in efds {
+        unsafe { libc::close(fd) };
+    }
 }

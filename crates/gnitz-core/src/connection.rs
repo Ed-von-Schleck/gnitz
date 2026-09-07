@@ -29,13 +29,14 @@ use crate::protocol::transport::{poll_fd, Next, CONNECT_TIMEOUT};
 use crate::protocol::wal_block::decode_wal_block_into;
 use crate::protocol::ReplySchema;
 use crate::protocol::{
-    encode_control_frame, encode_ddl_txn, encode_push_txn, encode_scan_multi, hello_handshake, parse_response_frame,
+    encode_control_frame, encode_ddl_txn, encode_push_txn, hello_handshake, parse_response_frame,
     wire_flags_get_schema_version, wire_flags_set_conflict_mode, wire_flags_set_schema_version, ClientTransport,
     FkTarget, Message, ProtocolError, Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID,
     FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_PUSH,
     FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_DELTA_EXPIRED, STATUS_ERROR, STATUS_NOT_FOUND,
     STATUS_NO_INDEX, STATUS_OK, STATUS_SAL_FULL, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
+use gnitz_wire::txn_frame;
 use gnitz_wire::RelDescriptorBlob;
 use lru::LruCache;
 
@@ -331,6 +332,9 @@ pub enum Reply {
     /// frame buffer: `scan_spec_raw`, and the mirror's copy-free ingest. It
     /// carries no schema — the server sends no block back for a SCAN_SPEC.
     Raw { blocks: Vec<RawBlock>, terminal: Message },
+    /// A delta poll: the slot is done, and every view's blocks went to the
+    /// poll's own listener as that view's terminal arrived.
+    Polled,
 }
 
 impl Reply {
@@ -344,6 +348,7 @@ impl Reply {
             Reply::Resolve(_) => "Resolve",
             Reply::Train(_) => "Train",
             Reply::Raw { .. } => "Raw",
+            Reply::Polled => "Polled",
         }
     }
 
@@ -444,20 +449,27 @@ enum SlotKind {
     Multi {
         tids: Vec<u64>,
     },
+    /// One position per view, in request order. Its blocks stay raw, so no
+    /// reply schema is needed here; the ids are what correlates each terminal —
+    /// views differing only in a `WHERE` share a schema, so a misdirected block
+    /// would decode cleanly.
+    DeltaPoll {
+        views: Vec<u64>,
+    },
 }
 
 impl SlotKind {
     /// Whether a schema block this slot's reply carries belongs in the cache.
-    /// False for SCAN_SPEC alone: its reply schema is the caller's own
-    /// projection, and keying that under the table id would corrupt a later
-    /// plain scan of the same relation.
+    /// False for the two client-authored verbs: their reply schema is the
+    /// caller's own projection, and keying that under the table id would
+    /// corrupt a later plain scan of the same relation.
     fn absorbs_schema(&self) -> bool {
-        !matches!(self, SlotKind::ScanSpec { .. })
+        !matches!(self, SlotKind::ScanSpec { .. } | SlotKind::DeltaPoll { .. })
     }
 
     /// Whether this slot's data blocks stay undecoded in their frame buffers.
     fn keeps_blocks_raw(&self) -> bool {
-        matches!(self, SlotKind::ScanSpec { raw: true, .. })
+        matches!(self, SlotKind::ScanSpec { raw: true, .. } | SlotKind::DeltaPoll { .. })
     }
 }
 
@@ -472,10 +484,23 @@ struct Accumulator {
     schema: Option<Arc<Schema>>,
     data: Option<ZSetBatch>,
     blocks: Vec<RawBlock>,
-    /// Narrowed results of a `scan_multi`; the next train's index is
-    /// `replies.len()`.
+    /// Narrowed results of a `scan_multi`.
     replies: Vec<ScanReply>,
+    /// The position of a multi-position slot (`Multi`, `DeltaPoll`) this train
+    /// belongs to; `0` for every other kind.
+    at: usize,
 }
+
+/// One view's result, handed over as its terminal arrives — so a poll over M
+/// views holds one train, not M. Positions are filled in request order, and a
+/// terminal naming another view is refused, so the slot's next unanswered
+/// position is the one this belongs to.
+pub(crate) type PolledView = Result<(Vec<RawBlock>, Message), ClientError>;
+
+/// The listener a delta poll's results go to, addressed by the slot that asked
+/// — so a train left behind by an abandoned poll is recognised rather than
+/// matched onto a live view of the same id.
+pub(crate) type PollSink<'a> = dyn FnMut(SlotId, PolledView) + 'a;
 
 /// A protocol session: the transport plus all per-connection protocol state
 /// (client id, the schema LRU, the pending queue and reply accumulator, and
@@ -697,10 +722,32 @@ impl Session {
                 SlotKind::Multi { tids: tids.to_vec() },
             ),
         };
-        // The caps are asymmetric — 256 MB inbound, 64 MB outbound — so a
-        // bundle built from a reply this client accepted can still exceed what
-        // the peer will take. Refused here, it is an error the caller can act
-        // on rather than an ingress rejection and a dropped connection.
+        self.enqueue_slot(parts, kind)
+    }
+
+    /// DELTA_POLL: one frame naming N mirrored views, each with its own encoded
+    /// delta `ReadSpec` and reply-schema block, answered as one train and
+    /// terminal per view in this order. Its results leave through the
+    /// [`PollSink`] a [`Self::step_polling`] drain supplies, not through the
+    /// completion — which is why it is not a [`Request`] a public driver can
+    /// reach: without that sink every view's blocks are dropped.
+    pub(crate) fn submit_delta_poll(&mut self, views: &[(u64, &[u8], &[u8])]) -> Result<SlotId, ClientError> {
+        txn_frame::validate_item_ids("DELTA_POLL", views, |v| v.0)?;
+        let parts = MessageParts::single(txn_frame::encode_delta_poll(self.client_id, views));
+        self.enqueue_slot(
+            parts,
+            SlotKind::DeltaPoll {
+                views: views.iter().map(|(id, _, _)| *id).collect(),
+            },
+        )
+    }
+
+    /// Queue an encoded request and open its slot. The caps are asymmetric —
+    /// 256 MB inbound, 64 MB outbound — so a bundle built from a reply this
+    /// client accepted can still exceed what the peer will take. Refused here,
+    /// it is an error the caller can act on rather than an ingress rejection and
+    /// a dropped connection.
+    fn enqueue_slot(&mut self, parts: MessageParts, kind: SlotKind) -> Result<SlotId, ClientError> {
         let total = parts.byte_len();
         let limit = self.transport.egress_limit();
         if total > limit {
@@ -728,6 +775,19 @@ impl Session {
     /// the byte stream's framing is no longer trustworthy, and the driver's
     /// only move is `close`.
     pub fn step(&mut self, ready: Interest) -> Result<Completions, ClientError> {
+        self.step_inner(ready, None)
+    }
+
+    /// [`Self::step`] for a drain that takes a delta poll's per-view results.
+    pub(crate) fn step_polling(
+        &mut self,
+        ready: Interest,
+        sink: &mut PollSink<'_>,
+    ) -> Result<Completions, ClientError> {
+        self.step_inner(ready, Some(sink))
+    }
+
+    fn step_inner(&mut self, ready: Interest, mut sink: Option<&mut PollSink<'_>>) -> Result<Completions, ClientError> {
         let mut done: Completions = Vec::new();
         if self.closed {
             return Ok(done);
@@ -736,7 +796,15 @@ impl Session {
             self.transport.begin_read();
         }
         while let Next::Frame(buf) = self.transport.next_frame(ready.read)? {
-            self.feed(buf, &mut done)?;
+            // The sink runs after `feed` has returned, so an unwind out of the
+            // caller's code finds the session consistent. No sink is an
+            // abandoned poll — an interrupt, or an unwind past its driver — and
+            // the position is dropped, which is what its caller being gone wants.
+            if let Some((slot, result)) = self.feed(buf, &mut done)? {
+                if let Some(f) = sink.as_deref_mut() {
+                    f(slot, result);
+                }
+            }
         }
         // Last, so that bytes still queued when this returns are ones the fd
         // refused — a read of its own can queue ciphertext, and flushing before
@@ -785,7 +853,9 @@ impl Session {
     /// flags 0, structurally identical to a terminal frame, and a non-OK frame
     /// ends the whole request — a `scan_multi` rejection after k trains sends
     /// one error frame and nothing more.
-    fn feed(&mut self, buf: Vec<u8>, done: &mut Completions) -> Result<(), ClientError> {
+    ///
+    /// Returns the delta-poll position this frame filled, if it filled one.
+    fn feed(&mut self, buf: Vec<u8>, done: &mut Completions) -> Result<Option<(SlotId, PolledView)>, ClientError> {
         // Destructured so the head slot stays borrowed for the whole function
         // while the cache and the accumulator are independent `&mut`s.
         let Session { pending, schema_cache, accum, .. } = self;
@@ -794,38 +864,58 @@ impl Session {
                 "reply frame with no request pending".into(),
             )));
         };
-        // A `scan_multi` slot advances with its train: tids[i] for train i,
-        // never the slot's first tid.
-        let (correlate_tid, hint_owned) = match &head.kind {
-            SlotKind::Read { tid } | SlotKind::Push { tid } => (Some(*tid), cached_hint(schema_cache, *tid)),
-            SlotKind::Uncorrelated | SlotKind::Resolve => (None, None),
-            SlotKind::ScanSpec { reply_schema, .. } => (None, Some((Arc::clone(reply_schema), 0))),
-            SlotKind::Multi { tids } => {
-                let tid = tids[accum.replies.len()];
-                (Some(tid), cached_hint(schema_cache, tid))
-            }
+        // The view a DELTA_POLL slot is on and how many positions it answers,
+        // else `None` — what tells the paths below to fill one position rather
+        // than end the request.
+        let poll = match &head.kind {
+            SlotKind::DeltaPoll { views } => Some((views[accum.at], views.len())),
+            _ => None,
         };
-        let hint = hint_owned.as_ref().map(|(s, v)| (s.as_ref(), *v));
+        // The relation this frame must name, the schema a data block decodes
+        // against, and the cached version the frame must match.
+        let (correlate_tid, hint_owned, version) = match &head.kind {
+            SlotKind::Read { tid } | SlotKind::Push { tid } => {
+                let (schema, v) = cached_hint(schema_cache, *tid).unzip();
+                (Some(*tid), schema, v)
+            }
+            SlotKind::Uncorrelated | SlotKind::Resolve => (None, None, None),
+            // Client-authored: the server sends no schema block, and stamps 0.
+            SlotKind::ScanSpec { reply_schema, .. } => (None, Some(Arc::clone(reply_schema)), Some(0)),
+            SlotKind::Multi { tids } => {
+                let tid = tids[accum.at];
+                let (schema, v) = cached_hint(schema_cache, tid).unzip();
+                (Some(tid), schema, v)
+            }
+            // Client-authored too, and its blocks stay raw, so no schema.
+            SlotKind::DeltaPoll { .. } => (poll.map(|(view, _)| view), None, Some(0)),
+        };
 
-        let mut parsed = parse_response_frame(&buf, hint)?;
+        let mut parsed = parse_response_frame(&buf, version)?;
         if let Err(e) = check_response(&mut parsed.message) {
+            // A DELTA_POLL failure that names a view ends that view's position
+            // alone; only one naming no relation fails the request.
+            if let Some((view, positions)) = poll {
+                if parsed.message.target_id != 0 {
+                    if parsed.message.target_id != view {
+                        return Err(out_of_order(view, parsed.message.target_id));
+                    }
+                    return Ok(Some(fill_poll_position(pending, accum, done, positions, Err(e))));
+                }
+            }
             // A rejected warm stamp, and the mismatch reply carries no block to
             // refresh it with: evict, so the next push is cold.
             if let (ClientError::SchemaMismatch, SlotKind::Push { tid }) = (&e, &head.kind) {
                 schema_cache.pop(tid);
             }
             complete_head(pending, accum, Err(e), done);
-            return Ok(());
+            return Ok(None);
         }
         if let Some(tid) = correlate_tid {
             // Replies arrive in request order and the hint is keyed by
             // `target_id`, so an out-of-order frame would decode under the
             // wrong schema silently; make it loud, before any absorb.
             if parsed.message.target_id != tid {
-                return Err(ClientError::Protocol(ProtocolError::DecodeError(format!(
-                    "reply out of order: expected target {tid}, got {}",
-                    parsed.message.target_id
-                ))));
+                return Err(out_of_order(tid, parsed.message.target_id));
             }
         }
         // Keyed on the tid the *frame* carries, which a correlated slot just
@@ -843,7 +933,7 @@ impl Session {
         match parsed.data_block.take() {
             Some(r) if head.kind.keeps_blocks_raw() => accum.blocks.push(RawBlock { frame: buf, block: r }),
             Some(r) => {
-                let eff = parsed.effective(hint.map(|(sch, _)| sch)).ok_or_else(|| {
+                let eff = parsed.effective(hint_owned.as_deref()).ok_or_else(|| {
                     ClientError::Protocol(ProtocolError::DecodeError("no schema for data block".into()))
                 })?;
                 let sink = accum.data.get_or_insert_with(|| ZSetBatch::new(eff));
@@ -857,15 +947,20 @@ impl Session {
         let terminal = msg;
         accum.schema = accum.schema.take().or(schema);
         if terminal.flags & FLAG_CONTINUATION != 0 {
-            return Ok(());
+            return Ok(None);
         }
 
         // The train terminated.
         let train = ReplyTrain {
             terminal,
-            schema: accum.schema.take().or_else(|| hint_owned.map(|(sch, _)| sch)),
+            schema: accum.schema.take().or(hint_owned),
             data: accum.data.take(),
         };
+        if let Some((_, positions)) = poll {
+            let blocks = std::mem::take(&mut accum.blocks);
+            let filled = Ok((blocks, train.terminal));
+            return Ok(Some(fill_poll_position(pending, accum, done, positions, filled)));
+        }
         let reply = match &head.kind {
             SlotKind::Read { .. } => Ok(Reply::Scan(train.into_scan_reply())),
             SlotKind::Push { .. } => Ok(Reply::Lsn(train.terminal.seek_pk as u64)),
@@ -878,14 +973,17 @@ impl Session {
             SlotKind::ScanSpec { .. } => Ok(Reply::Train(train)),
             SlotKind::Multi { tids } => {
                 accum.replies.push(train.into_scan_reply());
-                if accum.replies.len() < tids.len() {
-                    return Ok(());
+                accum.at += 1;
+                if accum.at < tids.len() {
+                    return Ok(None);
                 }
                 Ok(Reply::Multi(std::mem::take(&mut accum.replies)))
             }
+            // `poll` is `Some` for exactly this kind, and that path returned.
+            SlotKind::DeltaPoll { .. } => unreachable!("a DELTA_POLL position is filled before this match"),
         };
         complete_head(pending, accum, reply, done);
-        Ok(())
+        Ok(None)
     }
 
     // ── The blocking client ────────────────────────────────────────────────
@@ -1166,9 +1264,9 @@ impl Session {
     /// consumes, permanently shifting every later read on this connection by
     /// one frame.
     fn encode_scan_multi_frame(&self, tids: &[u64]) -> Result<Vec<u8>, ClientError> {
-        gnitz_wire::validate_scan_multi_tids(tids)?;
+        txn_frame::validate_item_ids("SCAN_MULTI", tids, |&tid| tid)?;
         let relations: Vec<(u64, u16)> = tids.iter().map(|&tid| (tid, self.cached_schema_version(tid))).collect();
-        Ok(encode_scan_multi(self.client_id, &relations))
+        Ok(txn_frame::encode_scan_multi(self.client_id, &relations))
     }
 
     /// The cached schema version for `target_id` OR'd into the flag word, so a
@@ -1182,6 +1280,31 @@ impl Session {
 /// `get` (not `peek`) so a relation in use refreshes its LRU recency.
 fn cached_hint(cache: &mut LruCache<u64, (Arc<Schema>, u16)>, tid: u64) -> Option<(Arc<Schema>, u16)> {
     cache.get(&tid).map(|(s, v)| (Arc::clone(s), *v))
+}
+
+/// A reply frame naming a relation the head slot's position does not expect.
+fn out_of_order(want: u64, got: u64) -> ClientError {
+    ClientError::Protocol(ProtocolError::DecodeError(format!(
+        "reply out of order: expected target {want}, got {got}"
+    )))
+}
+
+/// Fill the delta-poll position the head slot is on, and complete the slot once
+/// that was its last. Returns what the caller's sink is owed.
+fn fill_poll_position(
+    pending: &mut VecDeque<Slot>,
+    accum: &mut Accumulator,
+    done: &mut Completions,
+    positions: usize,
+    result: PolledView,
+) -> (SlotId, PolledView) {
+    let slot = pending.front().expect("a frame was fed to a pending head").id;
+    // This position's train is over; the next one starts clean.
+    *accum = Accumulator { at: accum.at + 1, ..Default::default() };
+    if accum.at == positions {
+        complete_head(pending, accum, Ok(Reply::Polled), done);
+    }
+    (slot, result)
 }
 
 /// The head slot is done: report it and hand the accumulator to the next.

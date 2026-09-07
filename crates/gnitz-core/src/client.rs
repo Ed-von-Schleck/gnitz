@@ -1,4 +1,4 @@
-use crate::connection::{Interest, MultiScanResult, RawBlock, RelTarget, Request, ScanResult, Session, SlotId};
+use crate::connection::{MultiScanResult, RawBlock, RelTarget, ScanResult, Session};
 use crate::error::ClientError;
 use crate::protocol::{
     BatchAppender, ColumnDef, PkBuf, PkColumn, ReplySchema, Schema, TypeCode, WireConflictMode, ZSetBatch,
@@ -172,7 +172,7 @@ pub struct DeltaCursor {
 impl DeltaCursor {
     /// Split a terminal frame's watermark word: tag in the high half, round in
     /// the low half.
-    fn from_watermark(w: u128) -> Self {
+    pub(crate) fn from_watermark(w: u128) -> Self {
         let (tag, tick) = gnitz_wire::unpack_delta_watermark(w);
         DeltaCursor { tag, tick }
     }
@@ -337,7 +337,7 @@ impl CatalogSnapshot {
 }
 
 pub struct GnitzClient {
-    session: Session,
+    pub(crate) session: Session,
     serial_cache: HashMap<u64, SerialRange>,
     /// What the current statement has resolved and scanned; `None` outside a
     /// statement, so a read issued between statements always hits the wire.
@@ -807,97 +807,9 @@ impl GnitzClient {
         self.delta_read_raw(view_id, 0, view_schema)
     }
 
-    /// One delta request per `(view id, cursor, reply schema)`, all written
-    /// before any reply is read, each handed to `on_reply` with the cursor it
-    /// asked from as its slot completes. The watermark comes back unvalidated —
-    /// the tag rule is the caller's, which holds what to check it against.
-    ///
-    /// **Streamed rather than collected**: one view's train is W workers' frames
-    /// of its retained delta, so M of them held at once would be W × M × budget
-    /// in RAM against the one train resident today.
-    ///
-    /// A request that fails is **that view's** failure, delivered to `on_reply`
-    /// like any other reply: a dead connection must not take down a report whose
-    /// other entries are still worth reading — and neither does the in-flight
-    /// cap, past a view count no host holding one engine store each reaches.
-    /// Only a caller error (a cursor with no round to poll after) and an
-    /// interrupt end the call.
-    ///
-    /// On the client and not the session because `on_reply` writes to the mirror
-    /// while the session drains — disjoint fields, so both borrows hold.
-    pub(crate) fn delta_poll_many(
-        &mut self,
-        views: &[(u64, DeltaCursor, Arc<ReplySchema>)],
-        mut on_reply: impl FnMut(
-            Option<&mut MirrorState>,
-            u64,
-            DeltaCursor,
-            Result<(Vec<RawBlock>, DeltaCursor), ClientError>,
-        ),
-    ) -> Result<(), ClientError> {
-        let Self { session, mirror, .. } = self;
-        // Slot → index in `views`. A SCAN_SPEC slot carries no target id, so the
-        // spine's out-of-order guard cannot cover these: matching a completion
-        // against the `SlotId` it was opened with is what keeps a train abandoned
-        // by an earlier call from shifting every reply onto the wrong view —
-        // where two views over one table decode each other's blocks cleanly.
-        let mut opened: Vec<(SlotId, usize)> = Vec::with_capacity(views.len());
-        for (i, (tid, prev, reply_schema)) in views.iter().enumerate() {
-            // `?`, not a per-view failure: a cursor at round 0 names the
-            // bootstrap bound, and sending it would read the whole view in the
-            // wrong shape. That is the caller's bug, raised here.
-            let spec = Self::delta_spec(prev.poll_after()?);
-            let req = Request::ScanSpec {
-                target_id: *tid,
-                spec: &spec,
-                reply_schema,
-                raw: true,
-            };
-            match session.submit(req) {
-                Ok(slot) => opened.push((slot, i)),
-                Err(e) => on_reply(mirror.as_deref_mut(), *tid, *prev, Err(e)),
-            }
-        }
-        let mut ready = Interest::WRITE;
-        while !opened.is_empty() {
-            let done = match session.step(ready) {
-                Ok(done) => done,
-                // The framing is no longer trustworthy, so the connection goes
-                // and every open request fails with it: the cause to the first,
-                // `Closed` to the rest — which is what the connection answers
-                // from here on, and what a request each would have got.
-                Err(e) => {
-                    session.close();
-                    let mut cause = Some(e);
-                    for (_, i) in std::mem::take(&mut opened) {
-                        let (tid, prev, _) = views[i];
-                        let e = cause.take().unwrap_or(ClientError::Closed);
-                        on_reply(mirror.as_deref_mut(), tid, prev, Err(e));
-                    }
-                    break;
-                }
-            };
-            for (slot, result) in done {
-                let Some(at) = opened.iter().position(|&(s, _)| s == slot) else {
-                    continue; // an earlier call's abandoned train
-                };
-                let (tid, prev, _) = views[opened.remove(at).1];
-                let fetched = result.map(|r| {
-                    let (blocks, terminal) = r.into_raw();
-                    (blocks, DeltaCursor::from_watermark(terminal.seek_pk))
-                });
-                on_reply(mirror.as_deref_mut(), tid, prev, fetched);
-            }
-            if !opened.is_empty() {
-                ready = session.park()?;
-            }
-        }
-        Ok(())
-    }
-
     /// The one request every delta call makes: a `ScanSpec` with a
     /// `ReadBound::Delta` and an identity sink.
-    fn delta_spec(after_tick: u64) -> Vec<u8> {
+    pub(crate) fn delta_spec(after_tick: u64) -> Vec<u8> {
         gnitz_wire::ReadSpec::encode_parts(
             &gnitz_wire::ReadBound::Delta { after_tick },
             &[],

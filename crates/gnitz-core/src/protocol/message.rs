@@ -254,14 +254,6 @@ pub fn encode_push_txn(
     gnitz_wire::txn_frame::encode_push_txn(client_id, &refs, preconditions)
 }
 
-/// Encode a `FLAG_SCAN_MULTI` request frame into wire bytes (without the 4-byte
-/// frame header): a consistent snapshot of N relations at one server-side SAL
-/// cut. The server answers with N reply trains in this exact order; the caller
-/// reads them positionally.
-pub fn encode_scan_multi(client_id: u64, relations: &[(u64, u16)]) -> Vec<u8> {
-    gnitz_wire::txn_frame::encode_scan_multi(client_id, relations)
-}
-
 /// Encode an atomic DDL transaction frame (`FLAG_DDL_TXN`) into wire bytes
 /// (without the 4-byte frame header). Every system-table write — a `CREATE`'s N
 /// family batches, a `DROP`/`CREATE INDEX`/`CREATE SCHEMA`'s single batch — is
@@ -318,7 +310,7 @@ pub fn parse_response(
     buf: &[u8],
     schema_hint: Option<(&Schema, u16)>,
 ) -> Result<(Message, Option<ZSetBatch>), ProtocolError> {
-    let mut parsed = parse_response_frame(buf, schema_hint)?;
+    let mut parsed = parse_response_frame(buf, schema_hint.map(|(_, v)| v))?;
     let data_batch = match parsed.data_block.take() {
         Some(range) => {
             let eff = parsed
@@ -356,10 +348,7 @@ impl ParsedFrame {
 /// and a native→OPK re-encode of every key to rebuild what the socket already
 /// delivered — reaches them through the same validation the decoding entry
 /// runs, rather than a second copy of it that could drift on what it checked.
-pub(crate) fn parse_response_frame(
-    buf: &[u8],
-    schema_hint: Option<(&Schema, u16)>,
-) -> Result<ParsedFrame, ProtocolError> {
+pub(crate) fn parse_response_frame(buf: &[u8], cached_version: Option<u16>) -> Result<ParsedFrame, ProtocolError> {
     if buf.len() < WAL_BLOCK_HEADER_SIZE {
         return Err(ProtocolError::DecodeError("message too small".into()));
     }
@@ -380,21 +369,18 @@ pub(crate) fn parse_response_frame(
         off += block.len();
         wire_schema = Some(schema_from_block(block)?);
     } else if has_data {
-        match schema_hint {
-            None => {
-                return Err(ProtocolError::DecodeError(
-                    "FLAG_HAS_DATA without FLAG_HAS_SCHEMA and no cached schema".into(),
-                ))
-            }
-            Some((_hint_schema, cached_version)) => {
-                let server_version = wire_flags_get_schema_version(flags);
-                if server_version != cached_version {
-                    return Err(ProtocolError::DecodeError(format!(
-                        "schema version mismatch: cached={cached_version} server={server_version}"
-                    )));
-                }
-                // hint-only frame: decode against borrowed hint below; no schema carried in Message
-            }
+        // A hint-only frame: the caller decodes it against the schema it already
+        // holds, so all this leg checks is that the stamp still matches.
+        let Some(cached) = cached_version else {
+            return Err(ProtocolError::DecodeError(
+                "FLAG_HAS_DATA without FLAG_HAS_SCHEMA and no cached schema".into(),
+            ));
+        };
+        let server_version = wire_flags_get_schema_version(flags);
+        if server_version != cached {
+            return Err(ProtocolError::DecodeError(format!(
+                "schema version mismatch: cached={cached} server={server_version}"
+            )));
         }
     }
 

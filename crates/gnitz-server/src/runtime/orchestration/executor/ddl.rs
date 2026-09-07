@@ -195,7 +195,7 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
     // error at insert rather than an assumption: every derived list below reads
     // one block per family, and a second VIEW_TAB block would register both sets
     // of views while the new-view ids came from the first alone. The check belongs
-    // here and not in the decoder, as `validate_scan_multi_tids` does.
+    // here and not in the decoder, as `txn_frame::validate_item_ids` does.
     let mut families: [Option<Batch>; SysFamily::COUNT] = std::array::from_fn(|_| None);
     for &(tid, slice) in &raw_families {
         let (family, batch) = decode_sys_family(tid as i64, slice).map_err(|e| format!("DDL_TXN: {e}"))?;

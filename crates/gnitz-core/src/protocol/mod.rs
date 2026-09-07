@@ -29,7 +29,7 @@ pub use gnitz_wire::{
 pub use message::parse_response;
 pub use message::{
     decode_control_block, encode_ddl_txn, encode_message_noschema_parts, encode_message_parts, encode_push_txn,
-    encode_scan_multi, Message, MessageParts,
+    Message, MessageParts,
 };
 pub(crate) use message::{encode_control_frame, parse_response_frame};
 pub use regions::ZSetBatchView;

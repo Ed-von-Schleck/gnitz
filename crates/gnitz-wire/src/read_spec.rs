@@ -199,9 +199,16 @@ pub fn unpack_delta_watermark(watermark: u128) -> (u64, u64) {
 /// does not travel back: the worker decodes it into the read's output shape,
 /// and the client decodes the reply against its own copy.
 pub fn pack_scan_spec_extra(spec: &[u8], reply_block: &[u8]) -> Vec<u8> {
-    let mut w = Writer::with_capacity(8 + spec.len() + reply_block.len());
+    let mut w = Writer::with_capacity(scan_spec_extra_len(spec, reply_block));
     w.bytes32(spec).bytes32(reply_block);
     w.into_vec()
+}
+
+/// The packed length of [`pack_scan_spec_extra`]'s output: the two `u32` length
+/// prefixes plus both payloads. A frame that packs the pair into itself needs it
+/// twice — for its own length prefix and for the capacity hint.
+pub(crate) fn scan_spec_extra_len(spec: &[u8], reply_block: &[u8]) -> usize {
+    8 + spec.len() + reply_block.len()
 }
 
 /// The bytes of one encoded [`ReadSpec`], distinct from the packed

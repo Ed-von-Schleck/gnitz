@@ -189,10 +189,9 @@ impl WorkerProcess {
         batch: Batch,
         schema: ReplySchema<'_>,
         client_version: u16,
-        force_fifo: bool,
     ) {
         let (block, version) = self.reply_schema_block(route.target_id as i64, schema, client_version);
-        if !force_fifo
+        if !route.fifo
             && emit_whole_if_fits(
                 &self.w2m_writer,
                 route,
@@ -210,18 +209,17 @@ impl WorkerProcess {
     /// [`Self::send_scan_response`] for a batch this worker keeps a handle to —
     /// a cached full-scan snapshot.
     ///
-    /// `force_fifo` queues even a fitting reply so this relation reaches the
-    /// ring in request order (the multi-scan FIFO contract).
+    /// A `route` marked `fifo` queues even a fitting reply so this relation
+    /// reaches the ring in request order (the multi-scan FIFO contract).
     pub(super) fn send_shared_scan_response(
         &mut self,
         route: ReplyRoute,
         batch: Rc<Batch>,
         schema: ReplySchema<'_>,
         client_version: u16,
-        force_fifo: bool,
     ) {
         let (block, version) = self.reply_schema_block(route.target_id as i64, schema, client_version);
-        if !force_fifo
+        if !route.fifo
             && emit_whole_if_fits(
                 &self.w2m_writer,
                 route,

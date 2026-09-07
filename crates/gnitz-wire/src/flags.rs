@@ -20,6 +20,10 @@ pub const FLAG_SEEK_BY_INDEX: u64 = 256;
 /// SCAN_SPEC request flag. The client→master leg of a parameterized bounded
 /// read (`ReadSpec`).
 pub const FLAG_SCAN_SPEC: u64 = 1 << 10;
+/// DELTA_POLL request flag. The batched form of [`FLAG_SCAN_SPEC`]: one frame
+/// naming N mirrored views, each with its own delta-bounded `ReadSpec` and
+/// client-authored reply schema.
+pub const FLAG_DELTA_POLL: u64 = 1 << 11;
 
 pub const FLAG_HAS_SCHEMA: u64 = 1 << 48;
 pub const FLAG_HAS_DATA: u64 = 1 << 49;
@@ -67,49 +71,11 @@ pub const FLAG_PUSH_TXN: u64 = 1 << 61;
 /// written to the SAL.
 pub const FLAG_SCAN_MULTI: u64 = 1 << 62;
 
-/// Maximum relations in one SCAN_MULTI request. A product / master-state limit
-/// (the master holds N `ScanLease`s and N reply trains of bookkeeping); a
-/// handful of related tables covers realistic consistent snapshots. Shared by
-/// the client encoder's shape check and the engine's decode/handler so both
-/// sides agree on the ceiling.
-pub const SCAN_MULTI_MAX_RELATIONS: usize = 16;
-
-/// Validate a `scan_multi` / `scan_many` relation list against the SCAN_MULTI
-/// wire-shape rules: non-empty, at most `SCAN_MULTI_MAX_RELATIONS`, no duplicate
-/// tid. The single source of truth for these checks, shared by every entry point
-/// — the client's `Session::submit`, which every client's `scan_many` funnels
-/// through, and the server's authoritative `scan_multi_body` — so both reject an
-/// identical set with identical wording.
-///
-/// The empty check is load-bearing on the client, not cosmetic: an empty list
-/// encodes a count=0 frame whose single server error frame the positional N-train
-/// read loop (N=0) never consumes, leaving it unread and desyncing the
-/// connection. Over-cap / duplicate are non-empty, so their round-tripped error
-/// frame is always consumed by the slot's own accumulator; validating them
-/// client-side is a fast-fail nicety. The O(n²) duplicate scan is over n ≤ 16.
-pub fn validate_scan_multi_tids(tids: &[u64]) -> Result<(), String> {
-    if tids.is_empty() {
-        return Err("SCAN_MULTI: empty relation list".to_string());
-    }
-    if tids.len() > SCAN_MULTI_MAX_RELATIONS {
-        return Err(format!(
-            "SCAN_MULTI: too many relations ({}, max {SCAN_MULTI_MAX_RELATIONS})",
-            tids.len()
-        ));
-    }
-    for (i, &tid) in tids.iter().enumerate() {
-        if tids[..i].contains(&tid) {
-            return Err(format!("SCAN_MULTI: duplicate relation {tid}"));
-        }
-    }
-    Ok(())
-}
-
 /// FIFO-reply directive on a master→worker scan group. Set by
-/// `dispatch_scan_multi_fanout` on every group of a multi-scan so the worker
-/// routes that relation's reply through `pending_streams` (strict FIFO ring
-/// order) instead of the immediate-emit fast path — the multi-scan drain
-/// requires ring order to equal request order.
+/// `dispatch_scan_multi_fanout` on every group it writes as one of several, so
+/// the worker routes that reply through `pending_streams` (strict FIFO ring
+/// order) instead of the immediate-emit fast path — those drains take one train
+/// at a time and need ring order to equal request order.
 ///
 /// Sits with the other engine-internal booleans, `FLAG_SCAN_LAST` and
 /// `FLAG_RESOLVE`, and is covered by the disjointness guard below like every
@@ -152,6 +118,7 @@ const _: () = {
         FLAG_SEEK,
         FLAG_SEEK_BY_INDEX,
         FLAG_SCAN_SPEC,
+        FLAG_DELTA_POLL,
         FLAG_HAS_SCHEMA,
         FLAG_HAS_DATA,
         FLAG_BATCH_CONSOLIDATED,
@@ -191,6 +158,7 @@ wire_enum! {
         Seek = FLAG_SEEK,
         SeekByIndex = FLAG_SEEK_BY_INDEX,
         ScanSpec = FLAG_SCAN_SPEC,
+        DeltaPoll = FLAG_DELTA_POLL,
         Resolve = FLAG_RESOLVE,
         DdlTxn = FLAG_DDL_TXN,
         PushTxn = FLAG_PUSH_TXN,

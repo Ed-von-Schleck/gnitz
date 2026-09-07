@@ -42,6 +42,7 @@ use crate::runtime::wire::{self as ipc, validate_schema_match, BACKFILL_DECISION
 use gnitz_store::relation::RelationKind;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
+use gnitz_wire::txn_frame::validate_item_ids;
 use gnitz_wire::{WireFault, STATUS_ERROR, STATUS_NOT_FOUND, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH};
 
 const TICK_COALESCE_ROWS: usize = 10_000;
@@ -977,14 +978,12 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     };
 
     match verb {
-        // The three bundle frames carry their families after the control block
-        // rather than in a data block, so each decodes its own body from `data`.
-        // Every system-table write — a CREATE's N family batches or a
-        // DROP/CREATE INDEX/CREATE SCHEMA's single batch — arrives as one
-        // DDL_TXN frame and is ingested under one durable SAL zone.
+        // The bundle frames name no single relation in `target_id`: each carries
+        // its items after the control block and decodes its own body from `data`.
         ClientVerb::DdlTxn => handle_ddl_txn(shared, peer, client_id, data).await,
         ClientVerb::PushTxn => handle_push_txn(shared, peer, client_id, data).await,
         ClientVerb::ScanMulti => handle_scan_multi(shared, peer, client_id, data).await,
+        ClientVerb::DeltaPoll => handle_delta_poll(shared, peer, client_id, data).await,
 
         // `target_id` is the sequence key (= the owning table's id); the range
         // `count` rides in `seek_col_idx`.
@@ -2047,32 +2046,15 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
         return;
     };
 
-    // The steady state of a subscription is a poll that returns nothing, so that
-    // is the case that must be cheap — and a bare fan-out costs a broadcast SAL
-    // group carrying W copies of the request blob, W eventfd writes, W wakeups
-    // and W control-only replies. Since no read path rewinds the SAL cursor, that
-    // alone would drive the checkpoint threshold on an idle database.
-    //
-    // The gate is a gate in front of the store, not a replacement for it: a view
-    // no round has reached reads as round 1, so a bootstrap at `after_tick = 0`
-    // is below it and falls through, which is what makes the whole-history arm
-    // reachable at all. It samples the counter and the map with no await between
-    // them, so it cannot pair a `T` from after a tick with a map from before it.
-    //
-    // The reply goes out through the terminal-frame builder rather than
-    // `send_control_only`: that builds its frame with `..Default::default()`, so
-    // `seek_pk` would be zero — a `tag = 0, T = 0` the client's stored tag never
-    // matches, driving exactly the permanent re-read loop this design avoids.
-    //
-    // Only a fed relation is gated. A `Delta` bound against one with no feed has
-    // to reach the worker, which is the only place that refusal is worded.
-    if let Some(after) = delta_cursor.filter(|&n| n > 0) {
+    // No await between the gate and the round, so the terminal cannot report one
+    // from after a tick the gate was tested against. `terminal_scan_msg` and not
+    // `send_control_only`: the latter leaves `seek_pk` zero, a tag the client
+    // never matches, which is the permanent re-read loop this gate avoids.
+    if delta_cursor.is_some_and(|after| delta_up_to_date(shared, target_id, after)) {
         let disp = shared.disp();
-        if shared.cat().registry().relation_has_delta_feed(target_id) && after >= disp.last_delta_round(target_id) {
-            let seek_pk = delta_terminal_seek_pk(disp, target_id, disp.last_tick_round());
-            send_msg(peer, terminal_scan_msg(target_id, client_id, seek_pk));
-            return;
-        }
+        let seek_pk = delta_terminal_seek_pk(disp, target_id, disp.last_tick_round());
+        send_msg(peer, terminal_scan_msg(target_id, client_id, seek_pk));
+        return;
     }
 
     // A PK range confined to one partition unicasts: one SAL slot instead of W,
@@ -2102,6 +2084,145 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
         _ => shared.last_tick_lsn.get() as u128,
     };
     finish_scan_fanout(peer, target_id, client_id, seek_pk, result.map(|(ok, _)| ok)).await;
+}
+
+/// DELTA_POLL: advance N mirrored views in one request, one catalog lock and —
+/// for however many of them moved — one broadcast.
+///
+/// A fault at `target_id = 0` rejects the frame; a fault naming a view ends that
+/// view's position and no other.
+async fn handle_delta_poll(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) {
+    match delta_poll_body(shared, peer, client_id, data).await {
+        // Every view's train and terminal is already out.
+        Ok(true) => {}
+        // Client disconnected mid-stream: leases dropped in the body.
+        Ok(false) => peer.close(),
+        // A frame-shape rejection, before any group was written.
+        Err(f) => send_fault(peer, 0, client_id, &f),
+    }
+}
+
+/// What one view of a poll is answered with.
+enum PollPosition {
+    /// The view cannot be read at all.
+    Fault(WireFault),
+    /// The view is already at its last round, so its terminal is master-local.
+    UpToDate,
+    /// The view moved, and takes the next dispatch of the poll's cut.
+    Moved,
+}
+
+/// Body of [`handle_delta_poll`]. `Ok(true)` once every view's train and
+/// terminal have been sent; `Ok(false)` on client disconnect; `Err` on a
+/// frame-shape rejection. A per-view failure is not an `Err` — it goes out as
+/// that view's own fault frame and the rest of the poll continues.
+async fn delta_poll_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) -> Result<bool, WireFault> {
+    let views = gnitz_wire::txn_frame::decode_delta_poll(data).map_err(|e| format!("decode error: {e}"))?;
+    validate_item_ids("DELTA_POLL", &views, |v| v.0)?;
+
+    // ── Phase 1: classify under the catalog lock, dispatch one cut ─────────
+    // No await between a view's gate test and the round its terminal reports, so
+    // no tick can land in between. The guard is scoped to this phase: phase 2
+    // reads no catalog state, and holding it across the drain would block DDL.
+    //
+    // A poll with nothing to fetch dispatches nothing, so it takes no SAL hold
+    // and signals no worker — the steady state of a subscription.
+    let (positions, dispatches, up_to_date_round, dispatch_round) = {
+        let _g = shared.catalog_rwlock.read().await;
+        let disp = shared.disp();
+        let up_to_date_round = disp.last_tick_round();
+        let mut positions = Vec::with_capacity(views.len());
+        let mut moved: Vec<(u64, &[u8], Fanout)> = Vec::with_capacity(views.len());
+        for &(view_id, extra) in &views {
+            let tid = view_id as i64;
+            let position = match poll_read_for_view(shared, tid, extra) {
+                Err(f) => PollPosition::Fault(f),
+                Ok(None) => PollPosition::UpToDate,
+                Ok(Some(spec)) => {
+                    moved.push((view_id, extra, read_fanout(disp, tid, Some(spec))));
+                    PollPosition::Moved
+                }
+            };
+            positions.push((tid, position));
+        }
+
+        let fanouts: Vec<Fanout> = moved.iter().map(|&(_, _, f)| f).collect();
+        let (dispatches, dispatch_round) =
+            dispatch_scan_multi_fanout(disp, &shared.reactor, &fanouts, |i, targets, wire_flags, round| {
+                let (view_id, extra, _) = moved[i];
+                disp.write_group(&DirectGroup {
+                    template: ipc::WireMsg {
+                        target_id: view_id,
+                        client_id,
+                        flags: wire_flags,
+                        seek_pk: round as u128,
+                        seek_pk_extra: extra,
+                        ..Default::default()
+                    },
+                    targets,
+                    ..DirectGroup::new(SalMessageKind::DeltaScanSpec)
+                })
+            })
+            .await?;
+        (positions, dispatches, up_to_date_round, dispatch_round)
+    };
+
+    // ── Phase 2: one terminal per view, in request order ───────────────────
+    let disp = shared.disp();
+    let mut dispatches = dispatches.into_iter();
+    for (tid, position) in positions {
+        let watermark = |round| delta_terminal_seek_pk(disp, tid, round);
+        match position {
+            PollPosition::Fault(fault) => send_fault(peer, tid, client_id, &fault),
+            PollPosition::UpToDate => send_msg(peer, terminal_scan_msg(tid, client_id, watermark(up_to_date_round))),
+            // Taken in step with the `Moved`s that were pushed. A dispatch left
+            // undrained — an earlier return dropped it — discards the rest of
+            // its train at the ring boundary.
+            PollPosition::Moved => {
+                let d = dispatches.next().expect("one dispatch per moved view");
+                match d.await_and_forward(&shared.reactor, peer).await {
+                    Ok(true) => send_msg(peer, terminal_scan_msg(tid, client_id, watermark(dispatch_round))),
+                    Ok(false) => return Ok(false),
+                    Err(fault) => send_fault(peer, tid, client_id, &fault),
+                }
+            }
+        }
+        // Carry no more than the budget into the next view, and learn here
+        // rather than at the end if the client is gone.
+        if peer.flush_if_full().await < 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The read this view needs, or `None` where it already sits at its last round
+/// and its terminal is master-local. Takes the caller's catalog read lock.
+///
+/// A blob carrying any bound but `Delta` is a fault: served here it would answer
+/// "what is current" without the drain that owes.
+fn poll_read_for_view<'a>(
+    shared: &Rc<Shared>,
+    tid: i64,
+    extra: &'a [u8],
+) -> Result<Option<gnitz_wire::SpecBytes<'a>>, WireFault> {
+    let fault = |e: String| -> WireFault { format!("delta_poll: {tid}: {e}").into() };
+    target_kind(shared, tid, Access::UserRead)?;
+    let (spec, _block) = gnitz_wire::unpack_scan_spec_extra(extra).map_err(fault)?;
+    let after = gnitz_wire::peek_delta_bound(spec).ok_or_else(|| fault("read carries no delta bound".to_string()))?;
+    Ok((!delta_up_to_date(shared, tid, after)).then_some(spec))
+}
+
+/// Whether a delta read after `after_tick` already sits at the view's last round,
+/// so it can be answered without reaching a worker — the steady state of a
+/// subscription, where a fan-out per poll would cost W wakeups.
+///
+/// `false` at `after_tick = 0` (the bootstrap bound) and for a relation with no
+/// feed: both must reach the store, the second to be refused there.
+fn delta_up_to_date(shared: &Shared, target_id: i64, after_tick: u64) -> bool {
+    after_tick > 0
+        && shared.cat().registry().relation_has_delta_feed(target_id)
+        && after_tick >= shared.disp().last_delta_round(target_id)
 }
 
 /// A delta reply's terminal `seek_pk`: the cursor tag in the high half, `T` in
@@ -2147,20 +2268,17 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, client_id: u64, dat
 /// deregisters every id and discards undrained frames at the ring boundary.
 async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data: &[u8]) -> Result<bool, WireFault> {
     // ── Phase 0: decode + frame-local shape rules ──────────────────────────
-    // The count/duplicate shape rules are the shared client/server validator
-    // (`gnitz_wire::validate_scan_multi_tids`); this is the authoritative check —
-    // a client may skip its own copy. tid legality is resolved in Phase 1 under
-    // the catalog lock.
+    // The authoritative run of the shared shape validator — a client may skip
+    // its own. tid legality is Phase 1's, under the catalog lock.
     let relations = gnitz_wire::txn_frame::decode_scan_multi(data).map_err(|e| format!("decode error: {e}"))?;
-    let tids: Vec<u64> = relations.iter().map(|(tid, _)| *tid).collect();
-    gnitz_wire::validate_scan_multi_tids(&tids)?;
+    validate_item_ids("SCAN_MULTI", &relations, |r| r.0)?;
 
     // Drain once if any target is a stale view — the same test `read_lock` runs
     // for a single target. Phase 1 resolves every tid's kind under the guard
     // handed back, so a DDL during the drain is caught there and an unknown tid
     // is rejected there rather than here.
     let mut cat = shared.catalog_rwlock.read().await;
-    if tids.iter().any(|&t| !read_is_fresh(shared, t as i64)) {
+    if relations.iter().any(|&(tid, _)| !read_is_fresh(shared, tid as i64)) {
         cat = drain_and_relock(shared, cat).await?;
     }
     // The shared LSN stamped into every terminal.
@@ -2191,7 +2309,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             plans.push(ScanMultiRelPlan { tid, server_version, block });
         }
         let disp = shared.disp();
-        let dispatches = dispatch_scan_multi_fanout(disp, &shared.reactor, &fanout, |i, targets, wire_flags| {
+        let (dispatches, _) = dispatch_scan_multi_fanout(disp, &shared.reactor, &fanout, |i, targets, wire_flags, _| {
             let plan = &plans[i];
             disp.write_group(&DirectGroup {
                 template: ipc::WireMsg {

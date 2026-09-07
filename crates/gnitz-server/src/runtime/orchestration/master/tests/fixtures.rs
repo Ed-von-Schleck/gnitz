@@ -45,6 +45,17 @@ pub(super) fn make_row_batch(schema: SchemaDescriptor, rows: &[(u128, i64, Optio
 /// nothing here has a lifetime a caller could get wrong. `catalog` may be null
 /// only where the path under test never calls `cat()`.
 pub(super) fn test_dispatcher(worker_pids: Vec<i32>, catalog: *mut CatalogEngine) -> MasterDispatcher {
+    let nw = worker_pids.len();
+    inert_dispatcher(worker_pids, catalog, vec![-1; nw])
+}
+
+/// [`test_dispatcher`] with real wake descriptors, for the one test that asserts
+/// on which workers were signalled.
+pub(super) fn test_dispatcher_with_efds(worker_pids: Vec<i32>, m2w_efds: Vec<i32>) -> MasterDispatcher {
+    inert_dispatcher(worker_pids, std::ptr::null_mut(), m2w_efds)
+}
+
+fn inert_dispatcher(worker_pids: Vec<i32>, catalog: *mut CatalogEngine, m2w_efds: Vec<i32>) -> MasterDispatcher {
     const RING_CAP: usize = 64 * 1024;
     const SAL_SIZE: usize = 4096;
     let nw = worker_pids.len();
@@ -60,6 +71,6 @@ pub(super) fn test_dispatcher(worker_pids: Vec<i32>, catalog: *mut CatalogEngine
         0,
         SalWriter::new(sal, -1, SAL_SIZE, nw),
         Rc::new(W2mReceiver::new(rings)),
-        vec![-1; nw],
+        m2w_efds,
     )
 }

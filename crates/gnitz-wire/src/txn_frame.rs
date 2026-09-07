@@ -1,7 +1,7 @@
-//! The three **transaction-shaped request frames** — `PUSH_TXN`, `DDL_TXN` and
-//! `SCAN_MULTI` — in both directions.
+//! The four **multi-item request frames** — `PUSH_TXN`, `DDL_TXN`, `SCAN_MULTI`
+//! and `DELTA_POLL` — in both directions.
 //!
-//! All three open the same way: the reused control block (`target_id = 0`, every
+//! All four open the same way: the reused control block (`target_id = 0`, every
 //! seek field zero, the frame's flag bit), then a `u32` item count. They differ
 //! only in what one item is:
 //!
@@ -10,6 +10,7 @@
 //! PUSH_TXN    ctrl | u32 n | n × [u8 mode][schema block][data block]
 //!                          | u32 p | p × [u64 tid][u64 basis_lsn]
 //! SCAN_MULTI  ctrl | u32 n | n × [u64 tid][u16 schema_version]
+//! DELTA_POLL  ctrl | u32 n | n × [u64 view_id][u32 len][spec][reply block]
 //! ```
 //!
 //! Defining them here rather than once per crate is what keeps the item widths —
@@ -20,16 +21,28 @@
 //! contains belongs to `schema_block` and to each side's batch codec, and every
 //! block is self-sizing (its `WAL_OFF_SIZE`), so the frame walk needs nothing
 //! beyond the bytes.
+//!
+//! **In the reply direction `target_id` says what a fault covers.** A fault at
+//! `0` — which [`validate_item_ids`] keeps out of every item list — rejects the
+//! whole frame; one naming an item ends that item's position and no other. Only
+//! `DELTA_POLL` answers per item; the other three fault at `0` alone.
 
 use crate::codec::{Reader, Writer};
 use crate::control::{ctrl_block_size, encode_ctrl_block, peek_control_block, ControlHeader};
+use crate::read_spec::scan_spec_extra_len;
 use crate::wal;
-use crate::{read_u32_le, FLAG_DDL_TXN, FLAG_PUSH_TXN, FLAG_SCAN_MULTI, STATUS_OK, WAL_HEADER_SIZE, WAL_OFF_TID};
+use crate::{
+    read_u32_le, FLAG_DDL_TXN, FLAG_DELTA_POLL, FLAG_PUSH_TXN, FLAG_SCAN_MULTI, STATUS_OK, WAL_HEADER_SIZE, WAL_OFF_TID,
+};
 
 /// Bytes one `SCAN_MULTI` relation record occupies: a `u64` tid and the client's
 /// `u16` cached schema version (`0` = none, so the server sends that relation's
 /// schema block).
 pub(crate) const RELATION_BYTES: usize = 8 + 2;
+
+/// The least one `DELTA_POLL` view record occupies: its `u64` id and the `u32`
+/// length of a (never actually empty) request blob.
+const MIN_POLL_VIEW_BYTES: usize = 8 + 4;
 
 /// Bytes one OCC precondition occupies: `[u64 tid][u64 basis_lsn]`.
 pub(crate) const PRECONDITION_BYTES: usize = 8 + 8;
@@ -38,6 +51,42 @@ pub(crate) const PRECONDITION_BYTES: usize = 8 + 8;
 /// blocks' headers. Bounds a hostile family count against the bytes that
 /// physically remain.
 const MIN_PUSH_FAMILY_BYTES: usize = 1 + 2 * WAL_HEADER_SIZE;
+
+/// Maximum relations in one `SCAN_MULTI`. The master holds one `ScanLease` and
+/// one reply train of bookkeeping per relation; a handful of related tables
+/// covers a realistic consistent snapshot.
+pub const SCAN_MULTI_MAX_RELATIONS: usize = 16;
+
+/// Maximum views in one `DELTA_POLL`: the ceiling on the leases and reply
+/// trains one poll puts on the master. A mirroring host holds tens of views, and
+/// a host past this chunks into a second request.
+pub const DELTA_POLL_MAX_VIEWS: usize = 64;
+
+/// The rules a multi-item frame's id list obeys that need the items themselves:
+/// non-empty, no duplicate — which would answer one position twice — and no id
+/// `0`, which names no relation and is the id a rejection of the frame carries.
+/// Run on the client encoder and again on the server, so both reject an
+/// identical list with identical text. The **count** rule is not here:
+/// [`decode_prologue`] owns it, being the one place that sees a count before it
+/// is trusted with an allocation.
+///
+/// A client that skipped the empty check would desync its connection: a count=0
+/// frame's lone error frame is one the N=0 reply loop never consumes.
+pub fn validate_item_ids<T>(ctx: &str, items: &[T], id: impl Fn(&T) -> u64) -> Result<(), String> {
+    if items.is_empty() {
+        return Err(format!("{ctx}: empty item list"));
+    }
+    for (i, item) in items.iter().enumerate() {
+        let this = id(item);
+        if this == 0 {
+            return Err(format!("{ctx}: id 0 names no relation"));
+        }
+        if items[..i].iter().any(|other| id(other) == this) {
+            return Err(format!("{ctx}: duplicate id {this}"));
+        }
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Encode
@@ -57,12 +106,11 @@ fn prologue(client_id: u64, flags: u64, count: usize, body_hint: usize) -> Write
         request_id: 0,
     };
     let ctrl_len = ctrl_block_size(0, 0);
-    let mut ctrl = vec![0u8; ctrl_len];
-    // A client request frame carries a body checksum, as its WAL blocks do.
-    encode_ctrl_block(&mut ctrl, 0, &hdr, &[], &[], true);
-
     let mut w = Writer::with_capacity(ctrl_len + 4 + body_hint);
-    w.raw(&ctrl).u32(count as u32);
+    // Written into the frame, not into a scratch `Vec` and copied in. A client
+    // request frame carries a body checksum, as its WAL blocks do.
+    encode_ctrl_block(w.reserve(ctrl_len), 0, &hdr, &[], &[], true);
+    w.u32(count as u32);
     w
 }
 
@@ -173,6 +221,25 @@ pub fn encode_scan_multi(client_id: u64, relations: &[(u64, u16)]) -> Vec<u8> {
     w.into_vec()
 }
 
+/// Encode a **delta poll** frame (`FLAG_DELTA_POLL`), without the 4-byte frame
+/// header: N mirrored views answered as one terminal frame each, in this order.
+/// Each view's `(spec, reply block)` pair is written in the `seek_pk_extra` shape
+/// a single-view SCAN_SPEC carries, so the master forwards it verbatim.
+pub fn encode_delta_poll(client_id: u64, views: &[(u64, &[u8], &[u8])]) -> Vec<u8> {
+    let body: usize = views
+        .iter()
+        .map(|(_, spec, block)| MIN_POLL_VIEW_BYTES + scan_spec_extra_len(spec, block))
+        .sum();
+    let mut w = prologue(client_id, FLAG_DELTA_POLL, views.len(), body);
+    for (view_id, spec, block) in views {
+        w.u64(*view_id)
+            .u32(scan_spec_extra_len(spec, block) as u32)
+            .bytes32(spec)
+            .bytes32(block);
+    }
+    w.into_vec()
+}
+
 // ---------------------------------------------------------------------------
 // Decode
 // ---------------------------------------------------------------------------
@@ -185,7 +252,15 @@ pub fn encode_scan_multi(client_id: u64, relations: &[(u64, u16)]) -> Vec<u8> {
 ///
 /// The control block is validated (version, region count, checksum) but not
 /// returned — a caller that needs the routing header already peeked it.
-fn decode_prologue(data: &[u8], ctx: &'static str, min_item_bytes: usize) -> Result<(usize, usize), String> {
+///
+/// `max_items` is the format's own ceiling on the count, or `usize::MAX` where
+/// only the frame bounds it.
+fn decode_prologue(
+    data: &[u8],
+    ctx: &'static str,
+    min_item_bytes: usize,
+    max_items: usize,
+) -> Result<(usize, usize), String> {
     let ctrl = wal::block_slice_at(data, 0).map_err(|e| format!("{ctx}: control block: {e}"))?;
     peek_control_block(ctrl).map_err(|e| format!("{ctx}: {e}"))?;
     let off = ctrl.len();
@@ -194,8 +269,13 @@ fn decode_prologue(data: &[u8], ctx: &'static str, min_item_bytes: usize) -> Res
     }
     let count = read_u32_le(data, off) as usize;
     let off = off + 4;
-    let max_items = data.len().saturating_sub(off) / min_item_bytes + 1;
+    // Both guard the `Vec::with_capacity` the caller is about to make, and they
+    // reject for different reasons: the format permits only so many items, and
+    // this frame is only so long.
     if count > max_items {
+        return Err(format!("{ctx}: too many items ({count}, max {max_items})"));
+    }
+    if count > data.len().saturating_sub(off) / min_item_bytes + 1 {
         return Err(format!("{ctx}: item count {count} exceeds what the frame holds"));
     }
     Ok((count, off))
@@ -218,7 +298,7 @@ fn checked_block_at<'a>(data: &'a [u8], off: usize, ctx: &str, what: &str) -> Re
 /// itself.
 pub fn decode_ddl_txn(data: &[u8]) -> Result<Vec<(u32, &[u8])>, String> {
     const CTX: &str = "DDL_TXN";
-    let (count, mut off) = decode_prologue(data, CTX, WAL_HEADER_SIZE)?;
+    let (count, mut off) = decode_prologue(data, CTX, WAL_HEADER_SIZE, usize::MAX)?;
     let mut families = Vec::with_capacity(count);
     for _ in 0..count {
         let block = checked_block_at(data, off, CTX, "family block")?;
@@ -254,7 +334,7 @@ pub type DecodedPushTxn<'a> = (Vec<TxnFamily<'a>>, Vec<(u64, u64)>);
 /// count, which is what lets the prologue and [`decode_ddl_txn`] stay identical.
 pub fn decode_push_txn(data: &[u8]) -> Result<DecodedPushTxn<'_>, String> {
     const CTX: &str = "PUSH_TXN";
-    let (count, mut off) = decode_prologue(data, CTX, MIN_PUSH_FAMILY_BYTES)?;
+    let (count, mut off) = decode_prologue(data, CTX, MIN_PUSH_FAMILY_BYTES, usize::MAX)?;
     let mut families = Vec::with_capacity(count);
     for _ in 0..count {
         if off + 1 > data.len() {
@@ -296,13 +376,26 @@ pub fn decode_push_txn(data: &[u8]) -> Result<DecodedPushTxn<'_>, String> {
 /// handler's.
 pub fn decode_scan_multi(data: &[u8]) -> Result<Vec<(u64, u16)>, String> {
     const CTX: &str = "SCAN_MULTI";
-    let (count, off) = decode_prologue(data, CTX, RELATION_BYTES)?;
+    let (count, off) = decode_prologue(data, CTX, RELATION_BYTES, SCAN_MULTI_MAX_RELATIONS)?;
     let mut r = Reader::new(&data[off..], CTX);
     let mut relations = Vec::with_capacity(count);
     for _ in 0..count {
         relations.push((r.u64()?, r.u16()?));
     }
     Ok(relations)
+}
+
+/// Decode a `DELTA_POLL` frame into `(view id, request blob)` pairs, each blob
+/// borrowed from `data` and shaped exactly like a SCAN_SPEC's `seek_pk_extra`.
+pub fn decode_delta_poll(data: &[u8]) -> Result<Vec<(u64, &[u8])>, String> {
+    const CTX: &str = "DELTA_POLL";
+    let (count, off) = decode_prologue(data, CTX, MIN_POLL_VIEW_BYTES, DELTA_POLL_MAX_VIEWS)?;
+    let mut r = Reader::new(&data[off..], CTX);
+    let mut views = Vec::with_capacity(count);
+    for _ in 0..count {
+        views.push((r.u64()?, r.bytes32()?));
+    }
+    Ok(views)
 }
 
 #[cfg(test)]

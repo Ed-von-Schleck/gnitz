@@ -70,9 +70,9 @@ pub struct MasterDispatcher {
     worker_pids: RefCell<Vec<i32>>,
     sal: SalWriter,
     /// SAL-writer exclusivity, guarding `sal` above. The rule, not a roster of
-    /// today's holders: hold it across the synchronous write + `signal_all`, drop
-    /// it before awaiting. Without it a `Flush` landing between a `Tick`
-    /// and its `ExchangeRelay` bumps the worker epoch and the relay is
+    /// today's holders: hold it across the synchronous write and the wake that
+    /// follows, drop it before awaiting. Without it a `Flush` landing between a
+    /// `Tick` and its `ExchangeRelay` bumps the worker epoch and the relay is
     /// skipped with no error anywhere.
     ///
     /// **Non-reentrant**: never `.await` anything that re-acquires it.
@@ -366,10 +366,7 @@ where
     {
         let _guard = disp.sal_excl().lock().await;
         submit(scan.targets())?;
-        match unicast {
-            Fanout::One(w) => disp.signal_one(w),
-            Fanout::Broadcast => disp.signal_all(),
-        }
+        disp.signal_reached([unicast]);
     }
     let slots = scan.await_slots(reactor).await;
     Ok((slots, scan))
@@ -389,15 +386,23 @@ where
 /// ring order can differ from request order and the drain deadlocks (see the
 /// worker's `pending_streams`). At N = 1 there is nothing to misorder, so the
 /// flag is not stamped and a fitting reply keeps the inline path.
+///
+/// The **round** the groups are cut at is sampled under the hold and handed to
+/// `submit` to stamp, then returned — so a terminal built from it names the cut
+/// the workers actually read, and no caller has to smuggle it out of the
+/// closure. An empty `fanouts` takes no hold and signals no worker.
 pub(crate) async fn dispatch_scan_multi_fanout<F>(
     disp: &MasterDispatcher,
     reactor: &crate::runtime::reactor::Reactor,
     fanouts: &[Fanout],
     mut submit: F,
-) -> Result<Vec<ScanDispatch>, WorkerFault>
+) -> Result<(Vec<ScanDispatch>, u64), WorkerFault>
 where
-    F: FnMut(usize, GroupTargets<'_>, u64) -> Result<(), WorkerFault>,
+    F: FnMut(usize, GroupTargets<'_>, u64, u64) -> Result<(), WorkerFault>,
 {
+    if fanouts.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
     let nw = disp.num_workers();
     // Allocate ids + register every request's lease BEFORE the lock (no await
     // between here and the write).
@@ -412,17 +417,19 @@ where
     };
 
     // One hold: write every group at a consecutive `write_cursor` position, then
-    // signal once. The reactor is single-threaded and each write has no
-    // `.await`, so the groups land contiguously — the single cut. The lock
-    // releases at block end, before the caller's first await.
-    {
+    // signal. The reactor is single-threaded and each write has no `.await`, so
+    // the groups land contiguously — the single cut. The lock releases at block
+    // end, before the caller's first await.
+    let round = {
         let _guard = disp.sal_excl().lock().await;
+        let round = disp.last_tick_round();
         for (i, d) in dispatches.iter().enumerate() {
-            submit(i, d.targets(), fifo)?;
+            submit(i, d.targets(), fifo, round)?;
         }
-        disp.signal_all();
-    }
-    Ok(dispatches)
+        disp.signal_reached(fanouts.iter().copied());
+        round
+    };
+    Ok((dispatches, round))
 }
 
 /// Fixtures shared by the `master` submodules' unit tests: the batch/schema

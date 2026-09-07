@@ -274,14 +274,19 @@ pub(crate) fn buffer_pending_delta(pending: &mut HashMap<i64, Batch>, tid: i64, 
     }
 }
 
-/// Where one reply goes: the relation it names and the two ids the master
-/// reactor routes it by. `dispatch_inner` resolves all three together, so no
-/// reply helper takes them apart.
+/// Where one reply goes and how: the relation it names, the two ids the master
+/// reactor routes it by, and whether it must reach the ring in request order.
+/// `dispatch_inner` resolves them together, so no reply helper takes them apart
+/// — and no arm can forget the ordering directive its group carried.
 #[derive(Clone, Copy, Default)]
 struct ReplyRoute {
     target_id: u64,
     request_id: u64,
     client_id: u64,
+    /// Set on a group the master wrote as one of several: queue this reply
+    /// through `pending_streams` rather than emitting it inline, so ring order
+    /// equals the request order the master drains in.
+    fifo: bool,
 }
 
 /// Which schema wire block a worker reply carries, declared by the dispatch arm
@@ -522,6 +527,7 @@ impl WorkerProcess {
             target_id: target_id as u64,
             request_id,
             client_id,
+            fifo: ctrl_wire_flags & gnitz_wire::FLAG_SCAN_FIFO_REPLY != 0,
         };
         // Wide-PK seek key tail (bytes 16..stride); empty for narrow PKs. Taken
         // (not cloned) — nothing reads the control block after this point.
@@ -591,14 +597,7 @@ impl WorkerProcess {
                 // defaulted, exactly as the conflict mode is.
                 let mode = gnitz_wire::wire_flags_get_probe_mode(ctrl_wire_flags)
                     .ok_or("has_pk: frame names no probe mode")?;
-                // A multi-check burst carries FLAG_SCAN_FIFO_REPLY, so this
-                // reply is queued and ring order equals request order. That
-                // also puts it on `pending_streams`' queued side inside an
-                // exchange wait, behind whatever train is already there — the
-                // coupling the seek-collect and warm-up fan-outs already have,
-                // and not a deadlock: `relay_loop` takes no table lock.
-                let force_fifo = ctrl_wire_flags & gnitz_wire::FLAG_SCAN_FIFO_REPLY != 0;
-                self.handle_has_pk(route, batch, lookup, mode, seek_pk as usize, force_fifo)
+                self.handle_has_pk(route, batch, lookup, mode, seek_pk as usize)
             }
 
             SalMessageKind::Push => {
@@ -633,7 +632,7 @@ impl WorkerProcess {
                 // still carries the schema block its `validate_schema_match`
                 // guard reads.
                 let batch = result.unwrap_or_else(|| Batch::empty_with_schema(&schema));
-                self.send_scan_response(route, batch, ReplySchema::Table(&schema), 0, false);
+                self.send_scan_response(route, batch, ReplySchema::Table(&schema), 0);
                 Ok(())
             }
 
@@ -657,12 +656,7 @@ impl WorkerProcess {
 
             SalMessageKind::Scan => {
                 let (result, schema) = self.cat().scan_family(target_id)?;
-                // A multi-scan group carries FLAG_SCAN_FIFO_REPLY in its control
-                // block: route this relation's reply through `pending_streams`
-                // so ring order equals request order (the master drains a
-                // multi-scan's relations one train at a time, in request order).
-                let force_fifo = ctrl_wire_flags & gnitz_wire::FLAG_SCAN_FIFO_REPLY != 0;
-                self.send_shared_scan_response(route, result, ReplySchema::Table(&schema), client_version, force_fifo);
+                self.send_shared_scan_response(route, result, ReplySchema::Table(&schema), client_version);
                 Ok(())
             }
 
@@ -794,7 +788,7 @@ impl WorkerProcess {
             "delta reply carries a row above the cut {}",
             seek_pk as u64,
         );
-        self.send_scan_response(route, keeper, ReplySchema::ClientAuthored, 0, false);
+        self.send_scan_response(route, keeper, ReplySchema::ClientAuthored, 0);
         Ok(())
     }
 
@@ -1031,7 +1025,6 @@ impl WorkerProcess {
         lookup: HasPkLookup,
         mode: gnitz_wire::WireProbeMode,
         mode_param: usize,
-        force_fifo: bool,
     ) -> Result<(), gnitz_wire::WireFault> {
         let target_id = route.target_id as i64;
         let n = batch.as_ref().map_or(0, |b| b.len());
@@ -1056,7 +1049,7 @@ impl WorkerProcess {
             };
             // The projected reply schema is synthetic — never the table's
             // cached block.
-            self.send_scan_response(route, result, ReplySchema::OneOff(&schema), 0, force_fifo);
+            self.send_scan_response(route, result, ReplySchema::OneOff(&schema), 0);
             return Ok(());
         }
         match lookup {
@@ -1113,7 +1106,7 @@ impl WorkerProcess {
                     (result, schema)
                 };
                 // The index schema is not table `target_id`'s own — one-off block.
-                self.send_scan_response(route, result, ReplySchema::OneOff(&schema), 0, force_fifo);
+                self.send_scan_response(route, result, ReplySchema::OneOff(&schema), 0);
                 Ok(())
             }
             HasPkLookup::PrimaryKey => {
@@ -1138,7 +1131,7 @@ impl WorkerProcess {
                         }
                     }
                 }
-                self.send_scan_response(route, result, ReplySchema::OneOff(&schema), 0, force_fifo);
+                self.send_scan_response(route, result, ReplySchema::OneOff(&schema), 0);
                 Ok(())
             }
         }

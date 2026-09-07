@@ -17,7 +17,7 @@
 
 mod support;
 
-use gnitz_core::{ClientError, GnitzClient, MirrorError, PollResult, Schema, ZSetBatch};
+use gnitz_core::{ClientError, GnitzClient, MirrorError, PollOutcome, PollResult, Schema, ZSetBatch};
 use gnitz_mirror::Mirror;
 use gnitz_sql::SqlPlanner;
 use gnitz_store::relation::{relation_dir, RelationKind};
@@ -124,16 +124,37 @@ impl Fixture {
     /// Reading first drains, so the rounds exist before the poll that collects
     /// them. `COUNT(*)` because only the drain is wanted: it folds server-side
     /// and replies with one row per worker where `SELECT *` ships the view.
-    fn drain(&mut self, schema: &str, views: &[&str]) {
+    fn drain(&mut self, schema: &str, views: &[impl AsRef<str>]) -> Vec<PollOutcome> {
         for v in views {
-            let _ = query(&mut self.direct, schema, &format!("SELECT COUNT(*) AS n FROM {v}"));
+            let name = v.as_ref();
+            let _ = query(&mut self.direct, schema, &format!("SELECT COUNT(*) AS n FROM {name}"));
         }
-        self.mirror().poll_mirror().expect("poll");
+        self.mirror().poll_mirror().expect("poll")
     }
 
     /// [`Fixture::drain`] over the two views of the shared schema.
     fn quiesce(&mut self) {
         self.drain("s", &["v_keyed", "v_repl"]);
+    }
+
+    /// `m` mirrored delta-fed views of `t`, named `<prefix>0..m`, each selecting
+    /// `cols` where `v >= i` — so they differ only in a `WHERE` and a
+    /// misdirected reply lands rows that are individually plausible. Drained, so
+    /// every copy holds a round.
+    fn many_views(&mut self, prefix: &str, m: usize, cols: &str) -> Vec<String> {
+        let names: Vec<String> = (0..m).map(|i| format!("{prefix}{i}")).collect();
+        for (i, name) in names.iter().enumerate() {
+            sql(
+                &mut self.direct,
+                "s",
+                &format!("CREATE VIEW {name} WITH (delta = '{FEED}') AS SELECT {cols} FROM t WHERE v >= {i}"),
+            );
+        }
+        for name in &names {
+            self.mirror().mirror_view("s", name).expect("mirror");
+        }
+        self.drain("s", &names);
+        names
     }
 
     /// Mirror both views of the shared schema, and return their ids. Nearly
@@ -299,6 +320,35 @@ fn a_multi_round_poll_over_repeated_keys_stays_weight_exact() {
         fx.differential("s", "SELECT * FROM v_keyed");
         fx.differential("s", "SELECT * FROM v_repl");
     }
+}
+
+/// Many views of one table, advanced by one batched poll, stay weight-exact.
+///
+/// They differ only in a `WHERE`, so a misdirected position lands rows that are
+/// individually plausible: only the weights say otherwise.
+#[test]
+fn one_poll_over_many_views_of_one_table_stays_weight_exact() {
+    const M: usize = 6;
+    let _g = serial();
+    let mut fx = Fixture::start();
+
+    churn(&mut fx.direct, 1, 120);
+    let names = fx.many_views("m", M, "a, b, v");
+
+    // A second round, so the poll carries a delta with retractions in it.
+    churn(&mut fx.direct, 121, 240);
+    let report = fx.drain("s", &names);
+    assert_eq!(report.len(), M, "one entry per view: {report:?}");
+    assert!(
+        report.iter().all(|o| matches!(o.result, PollResult::Advanced)),
+        "every view advances: {report:?}",
+    );
+
+    let mut compared = 0;
+    for name in &names {
+        compared += fx.differential("s", &format!("SELECT * FROM {name}"));
+    }
+    assert!(compared > M, "the comparison covered {compared} rows");
 }
 
 /// Integer aggregates match exactly; a float aggregate is compared within
@@ -881,15 +931,12 @@ fn round_trip_cost_bench() {
     }
 }
 
-/// The cost of one idle poll over M views — the steady state of a subscription.
-///
-/// A poll that batched per view would park the client once per view; one that
-/// pipelines parks once for all of them. Voluntary context switches per poll is
-/// that difference measured directly, and instructions retired is the same claim
-/// immune to machine frequency.
+/// The client-side cost of one idle poll over M views — the steady state of a
+/// subscription: one request and one park, whatever M is. Instructions retired
+/// is the same claim, immune to machine frequency.
 #[test]
 #[ignore]
-fn pipelined_poll_syscall_bench() {
+fn idle_poll_client_cost_bench() {
     const M: usize = 16;
     const K: usize = 200;
 
@@ -900,24 +947,9 @@ fn pipelined_poll_syscall_bench() {
         return;
     };
 
-    let names: Vec<String> = (0..M).map(|i| format!("p{i}")).collect();
-    for (i, name) in names.iter().enumerate() {
-        sql(
-            &mut fx.direct,
-            "s",
-            &format!(
-                "CREATE VIEW {name} WITH (delta = '{FEED}') AS \
-                 SELECT a, b, v, f, body FROM t WHERE v >= {i}"
-            ),
-        );
-    }
     churn(&mut fx.direct, 1, 2_000);
-    for name in &names {
-        fx.mirror().mirror_view("s", name).expect("mirror");
-    }
+    fx.many_views("i", M, "a, b, v, f, body");
     // Poll once more after the drain, so the measured run is wholly idle.
-    let view_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    fx.drain("s", &view_refs);
     fx.mirror().poll_mirror().expect("poll");
 
     let before = support::perf::voluntary_ctx_switches();
@@ -1794,8 +1826,7 @@ fn registration_is_idempotent_and_an_empty_poll_moves_nothing() {
         ids.push(out.view_id);
     }
 
-    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    fx.drain("s", &refs);
+    fx.drain("s", &names);
     let mut compared = 0;
     for name in &names {
         compared += fx.differential("s", &format!("SELECT * FROM {name}"));

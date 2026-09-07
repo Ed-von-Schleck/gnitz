@@ -28,12 +28,14 @@
 //! high W is a loss. Narrowing the bound is the lever.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::client::{delta_reply_schema, DeltaCursor, GnitzClient, RelDescriptor};
-use crate::connection::RawBlock;
+use crate::connection::{Interest, PolledView, RawBlock, SlotId};
 use crate::error::ClientError;
 use crate::protocol::{ReplySchema, Schema, ZSetBatch};
+use gnitz_wire::txn_frame::DELTA_POLL_MAX_VIEWS;
 use gnitz_wire::RelClass;
 
 // ---------------------------------------------------------------------------
@@ -295,6 +297,22 @@ impl MirrorState {
 // verbs, and classifies what comes back. The only non-connection steps in it are
 // calls through `MirrorStore` — which is also what makes it exist once for the
 // blocking, async and Python clients alike.
+
+/// A whole request failed: fail every view it never answered — the cause to the
+/// first, `Closed` to the rest, which is what a request each would have got.
+/// Recorded here rather than stashed, because by the time a request is known to
+/// have failed no further reply of it can arrive.
+fn fail_range(
+    applied: &mut Vec<(u64, Result<PollResult, ClientError>)>,
+    views: &[(u64, DeltaCursor, Arc<ReplySchema>)],
+    unanswered: Range<usize>,
+    cause: ClientError,
+) {
+    let mut cause = Some(cause);
+    for i in unanswered {
+        applied.push((views[i].0, Err(cause.take().unwrap_or(ClientError::Closed))));
+    }
+}
 
 impl GnitzClient {
     fn mirror_state(&mut self) -> Result<&mut MirrorState, ClientError> {
@@ -591,6 +609,100 @@ impl GnitzClient {
         Ok(())
     }
 
+    /// Advance every view in `views`, one request per `DELTA_POLL_MAX_VIEWS`,
+    /// ingesting each view's blocks as that view's terminal arrives — so a poll
+    /// over M views holds one train, not M. The watermark comes back
+    /// unvalidated; the tag rule is [`MirrorState::advance_from`]'s.
+    ///
+    /// A view that fails gets **that view's** own entry. Only a caller error (a
+    /// cursor with no round to poll after) and an interrupt end the call.
+    fn delta_poll_many(
+        &mut self,
+        views: &[(u64, DeltaCursor, Arc<ReplySchema>)],
+    ) -> Result<Vec<(u64, Result<PollResult, ClientError>)>, ClientError> {
+        // Split, so the ingest writes to the mirror while the session drains:
+        // disjoint fields, so both borrows hold.
+        let Self { session, mirror, .. } = self;
+        let Some(mirror) = mirror.as_deref_mut() else {
+            return Err(ClientError::NoMirrorStore);
+        };
+        // A cursor at round 0 names the bootstrap bound, which would read the
+        // whole view in the wrong shape: the caller's bug, raised before
+        // anything is encoded.
+        let specs = views
+            .iter()
+            .map(|(_, prev, _)| prev.poll_after().map(Self::delta_spec))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut applied = Vec::with_capacity(views.len());
+        // Per open request, the positions it has yet to answer. They are filled
+        // in order — the session refuses a terminal naming any other view — so
+        // the unanswered set is always this tail, and failing a request is
+        // failing the tail whole.
+        let mut open: Vec<(SlotId, Range<usize>)> = Vec::new();
+        for (chunk_at, chunk) in views.chunks(DELTA_POLL_MAX_VIEWS).enumerate() {
+            let start = chunk_at * DELTA_POLL_MAX_VIEWS;
+            let batch: Vec<(u64, &[u8], &[u8])> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, (tid, _, schema))| (*tid, specs[start + i].as_slice(), schema.block()))
+                .collect();
+            let range = start..start + chunk.len();
+            match session.submit_delta_poll(&batch) {
+                Ok(slot) => open.push((slot, range)),
+                Err(e) => fail_range(&mut applied, views, range, e),
+            }
+        }
+
+        let mut ready = Interest::WRITE;
+        while !open.is_empty() {
+            let stepped = {
+                // Addressed by slot, so a train an earlier call abandoned is
+                // recognised rather than matched onto a live view of the same id.
+                let mut sink = |slot: SlotId, result: PolledView| {
+                    let Some((_, range)) = open.iter_mut().find(|(s, _)| *s == slot) else {
+                        return;
+                    };
+                    let i = range.start;
+                    range.start += 1;
+                    let (tid, prev, _) = views[i];
+                    let fetched = result.map(|(blocks, t)| (blocks, DeltaCursor::from_watermark(t.seek_pk)));
+                    applied.push((tid, mirror.advance_from(tid, prev, fetched)));
+                };
+                session.step_polling(ready, &mut sink)
+            };
+            match stepped {
+                // Every view of a rejected request it had yet to answer fails
+                // with it.
+                Ok(done) => {
+                    for (slot, result) in done {
+                        let Some(at) = open.iter().position(|(s, _)| *s == slot) else {
+                            continue; // an earlier call's abandoned train
+                        };
+                        let (_, range) = open.remove(at);
+                        if let Err(e) = result {
+                            fail_range(&mut applied, views, range, e);
+                        }
+                    }
+                }
+                // The framing is no longer trustworthy, so the connection goes
+                // and every request still open goes with it.
+                Err(e) => {
+                    session.close();
+                    let mut cause = Some(e);
+                    for (_, range) in std::mem::take(&mut open) {
+                        let e = cause.take().unwrap_or(ClientError::Closed);
+                        fail_range(&mut applied, views, range, e);
+                    }
+                }
+            }
+            if !open.is_empty() {
+                ready = session.park()?;
+            }
+        }
+        Ok(applied)
+    }
+
     /// Advance every mirrored view by one poll each, and report **one entry per
     /// mirrored view, whatever happened to it** — keyed by the id each view is
     /// mirrored under *after* the call, so a view that moved is reported once,
@@ -628,14 +740,7 @@ impl GnitzClient {
             }
         }
 
-        let mut applied: Vec<(u64, Result<PollResult, ClientError>)> = Vec::with_capacity(requests.len());
-        self.delta_poll_many(&requests, |mirror, tid, prev, fetched| {
-            let r = match mirror {
-                Some(m) => m.advance_from(tid, prev, fetched),
-                None => Err(ClientError::NoMirrorStore),
-            };
-            applied.push((tid, r));
-        })?;
+        let applied = self.delta_poll_many(&requests)?;
 
         // ── Phase 2: recover, strictly after every phase-1 ingest ──────────
         let mut out: Vec<PollOutcome> = Vec::with_capacity(applied.len() + recoveries.len());

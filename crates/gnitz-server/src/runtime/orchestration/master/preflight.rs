@@ -430,7 +430,7 @@ async fn execute_probe_burst(
     // holds a slice of the key list, a broadcast one because index entries are
     // partitioned independently of the probe key.
     let fanouts = vec![Fanout::Broadcast; checks.len()];
-    let dispatches = dispatch_scan_multi_fanout(disp, reactor, &fanouts, |i, targets, wire_flags| {
+    let (dispatches, _) = dispatch_scan_multi_fanout(disp, reactor, &fanouts, |i, targets, wire_flags, _| {
         let check = &checks[i];
         let g = DirectGroup {
             template: check.schema.frame(wire::WireMsg {

@@ -61,24 +61,3 @@ fn client_verb_rejects_data_on_a_non_push_verb() {
         );
     }
 }
-
-/// The three SCAN_MULTI shape rules, and the accepted lists that bracket them.
-/// The wording is the contract: client and server reject an identical list with
-/// identical text, so a caller reading one message is reading both.
-#[test]
-fn validate_scan_multi_tids_enforces_the_wire_shape_rules() {
-    assert!(validate_scan_multi_tids(&[7]).is_ok());
-    let full: Vec<u64> = (0..SCAN_MULTI_MAX_RELATIONS as u64).collect();
-    assert!(validate_scan_multi_tids(&full).is_ok(), "a full-cap list is valid");
-
-    let over: Vec<u64> = (0..=SCAN_MULTI_MAX_RELATIONS as u64).collect();
-    let cases: &[(Vec<u64>, &str)] = &[
-        (vec![], "empty relation list"),
-        (over, "too many relations"),
-        (vec![7, 8, 7], "duplicate relation 7"),
-    ];
-    for (tids, want) in cases {
-        let err = validate_scan_multi_tids(tids).expect_err(want);
-        assert!(err.contains(want), "{err:?} does not name {want:?}");
-    }
-}

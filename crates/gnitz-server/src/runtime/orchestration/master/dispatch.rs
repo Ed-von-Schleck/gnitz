@@ -8,6 +8,10 @@ use gnitz_store::foundation::fault::Seam;
 use gnitz_store::foundation::posix_io::retry_eintr;
 use gnitz_wire::{low_bits_mask, BitIter};
 
+/// A worker set rides in one word (`signal_reached`, `collect_acks_and_relay`),
+/// so a worker past bit 63 would never be signalled and never be waited on.
+const _: () = assert!(gnitz_wire::MAX_WORKERS <= u64::BITS as usize);
+
 /// Ceiling on the synchronous `W2mReceiver::wait_any` park in the collect loop
 /// below, and so also the loop's `fail_if_worker_dead` cadence: a worker that
 /// dies without publishing is noticed within this long. A publish wakes the loop
@@ -147,8 +151,24 @@ impl MasterDispatcher {
             crate::runtime::m2w::eventfd_signal(efd);
         }
     }
-    pub(super) fn signal_one(&self, worker: usize) {
+    fn signal_one(&self, worker: usize) {
         crate::runtime::m2w::eventfd_signal(self.m2w_efds[worker]);
+    }
+
+    /// Wake every worker these fan-outs reached, and no other: groups written to
+    /// one worker each cost one eventfd write apiece, not W.
+    pub(super) fn signal_reached(&self, fanouts: impl IntoIterator<Item = super::Fanout>) {
+        let all = low_bits_mask(self.num_workers());
+        let mut wake: u64 = 0;
+        for f in fanouts {
+            wake |= match f {
+                super::Fanout::Broadcast => all,
+                super::Fanout::One(w) => 1 << w,
+            };
+        }
+        for w in BitIter(wake & all) {
+            self.signal_one(w);
+        }
     }
 
     pub(crate) fn sal_fd(&self) -> i32 {
