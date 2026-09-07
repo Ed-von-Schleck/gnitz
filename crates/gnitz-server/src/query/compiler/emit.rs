@@ -101,7 +101,7 @@ fn expr_reject(what: &'static str) -> impl Fn(ExprValidateErr) -> CompileError {
 /// Bound is `num_columns()`, not `MAX_COLUMNS`, so the silent `[num_columns, 65)`
 /// zeroed-slot zone is rejected too. The recurring guard for a client-controlled
 /// column list that indexes (or slices) the fixed `[_; 65]` schema array.
-pub(crate) fn oob_cols(cols: impl IntoIterator<Item = u32>, schema: &SchemaDescriptor) -> bool {
+pub(super) fn oob_cols(cols: impl IntoIterator<Item = u32>, schema: &SchemaDescriptor) -> bool {
     cols.into_iter().any(|c| c as usize >= schema.num_columns())
 }
 
@@ -139,7 +139,7 @@ fn key_promotion_invalid(slots: &[gnitz_wire::ReindexSlot], schema: &SchemaDescr
 /// promotion the copy kernel supports. Identical to the rule `check_copy_types`
 /// holds a column sink's destination to — the HashRow payload widen is that same
 /// kernel — so it is narrower than [`key_promotion_invalid`], not a mode of it.
-pub(super) fn payload_promotion_invalid(slots: &[gnitz_wire::ReindexSlot], schema: &SchemaDescriptor) -> bool {
+fn payload_promotion_invalid(slots: &[gnitz_wire::ReindexSlot], schema: &SchemaDescriptor) -> bool {
     promotion_invalid(slots, schema, gnitz_wire::is_widening_promotion)
 }
 
@@ -244,7 +244,7 @@ impl EmitCtx<'_> {
     }
 
     /// The register `src` produced. The one rejection left after `topo_sorted`
-    /// held every edge set to `OpNode::ports()`: a plan covers a *slice* of the
+    /// held every edge set to `OpNode::arity()`: a plan covers a *slice* of the
     /// circuit, so a producer outside this side has no register at all.
     fn reg_of(&self, src: i32) -> Result<u16, CompileError> {
         self.out_reg_of
@@ -272,9 +272,9 @@ impl EmitCtx<'_> {
 
 /// Emit `nid`'s instructions and return the register its output lands in — the
 /// node's own fresh register, or an input's when the node emits nothing and
-/// aliases it (`Filter(None)`, an identity `Map`, an elided `Distinct`, a
-/// `WorkerFilter` this worker cannot narrow, the sink). Returning it is what
-/// keeps a register from being reserved for a node that never writes one.
+/// aliases it (an identity `Map`, a `WorkerFilter` this worker cannot narrow,
+/// the sink). Returning it is what keeps a register from being reserved for a
+/// node that never writes one.
 pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) -> Result<u16, CompileError> {
     match op {
         // `bound` is a backfill-scan hint consumed by the source drive, not by the
@@ -293,11 +293,6 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
 
         gnitz_wire::OpNode::Filter(blob) => {
             let in_reg = ctx.unary_in(nid)?;
-            let Some(blob) = blob else {
-                // Absent blob = no WHERE clause. Pass-through: alias the input
-                // register instead of emitting a clone-the-batch instruction.
-                return Ok(in_reg);
-            };
             let in_schema = ctx.reg_meta[in_reg as usize].schema;
             // A present-but-corrupt blob, or a rejected program, is catalog
             // corruption. Falling back to pass-all would silently turn a WHERE
@@ -334,15 +329,8 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
         gnitz_wire::OpNode::Distinct | gnitz_wire::OpNode::PositivePart => {
             let in_reg = ctx.unary_in(nid)?;
             let in_reg_schema = ctx.reg_meta[in_reg as usize].schema;
-            // `distinct` is the only one the optimizer elides (its input is already
-            // distinct); `positive_part` is never seeded into the skip set, so
-            // this check is simply false for it.
-            if ctx.loaded.skip_nodes.contains(&nid) {
-                return Ok(in_reg);
-            }
-            // Set-membership clamp `[-1, 1]` for distinct; bag clamp `[0, i64::MAX]`
-            // (negative part only) for positive_part. The two presets are the sole
-            // difference between the operators; both emit one `WeightClamp` instr.
+            // The two clamp presets are the sole difference between the
+            // operators; both emit one `WeightClamp` instr.
             let (lo, hi) = if matches!(op, gnitz_wire::OpNode::PositivePart) {
                 (0, i64::MAX)
             } else {
@@ -355,8 +343,8 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
             Ok(out_reg)
         }
 
-        gnitz_wire::OpNode::Reduce { group_cols, agg, global_ground, out_key } => {
-            emit_reduce(ctx, nid, group_cols, agg, *global_ground, *out_key)
+        gnitz_wire::OpNode::Reduce { group_cols, agg, global_ground } => {
+            emit_reduce(ctx, nid, group_cols, agg, *global_ground)
         }
 
         gnitz_wire::OpNode::Join(kind) => {
@@ -374,11 +362,11 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
             // Every kind produces the same output layout — only the probe differs —
             // so the schema, the register meta and the operand registers are shared.
             let probe = match kind {
-                gnitz_wire::JoinKind::DeltaTrace => JoinProbe::Equi,
-                gnitz_wire::JoinKind::DeltaTraceRange { n_eq, rel } => JoinProbe::Range(
+                gnitz_wire::JoinKind::Equi => JoinProbe::Equi,
+                gnitz_wire::JoinKind::Range { n_eq, rel } => JoinProbe::Range(
                     RangeProbe::new(&a_schema, &b_schema, *n_eq, *rel).map_err(CompileError::Rejected)?,
                 ),
-                gnitz_wire::JoinKind::DeltaTraceCross => JoinProbe::Cross,
+                gnitz_wire::JoinKind::Cross => JoinProbe::Cross,
             };
             let out_schema = merge_schemas_for_join(&a_schema, &b_schema)
                 .ok_or(CompileError::Rejected("join: merged schema exceeds MAX_COLUMNS"))?;
@@ -574,7 +562,6 @@ fn emit_reduce(
     group_cols: &[u32],
     agg: &[AggDescriptor],
     global_ground: bool,
-    out_key: gnitz_store::schema::ReduceOutKey,
 ) -> Result<u16, CompileError> {
     let loaded = ctx.loaded;
     let in_reg_id = ctx.unary_in(nid)?;
@@ -592,11 +579,7 @@ fn emit_reduce(
         return Err(CompileError::Rejected("reduce: aggregate column out of range"));
     }
 
-    // The output layout and `op_reduce`'s row keying both obey `out_key`, so a
-    // kind the schema does not warrant would silently scramble the output columns.
-    if out_key != in_reg_schema.reduce_out_key(group_cols) {
-        return Err(CompileError::Rejected("reduce: out_key does not match input schema"));
-    }
+    let out_key = in_reg_schema.reduce_out_key(group_cols);
 
     // A worker owns the global-aggregate ground row when it holds the whole
     // input: the view is replicated (correct-local everywhere, read

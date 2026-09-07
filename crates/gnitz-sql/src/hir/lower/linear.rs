@@ -12,7 +12,7 @@ use crate::expr_lower::compile_filter_program;
 use crate::hir::chain::EmitPieces;
 use crate::ir::BoundExpr;
 use gnitz_core::CircuitBuilder;
-use gnitz_wire::ScanBound;
+use gnitz_wire::IndexBound;
 
 /// Emit a linear segment's circuit from its resolved physical
 /// inputs. Returns `(circuit, output_columns, pk_cols)`; the view's physical PK is
@@ -22,7 +22,7 @@ use gnitz_wire::ScanBound;
 /// redistributes its source, so every row stays on the worker that produced it.
 pub(super) fn emit_linear(
     src: &SegInput,
-    bound: Option<ScanBound>,
+    bound: Option<IndexBound>,
     filter: &[BoundExpr],
     proj: &PhysProjection,
 ) -> Result<EmitPieces, GnitzSqlError> {
@@ -50,7 +50,7 @@ pub(super) fn emit_linear(
     // bound narrows the backfill scan, never the predicate.
     let inp = cb.input_delta_bounded(bound);
     let filtered = match expr_prog {
-        Some(p) => cb.filter(inp, Some(p)),
+        Some(p) => cb.filter(inp, p),
         None => inp,
     };
 

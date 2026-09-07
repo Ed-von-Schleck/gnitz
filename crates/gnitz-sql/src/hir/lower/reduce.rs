@@ -112,7 +112,7 @@ pub(crate) fn lower_reduce(
     // moves the source PK columns to the front, and a PK not already at slot 0
     // makes the two orders disagree.
     let filtered = match compile_filter_program(&where_preds, &source.schema.columns)? {
-        Some(p) => cb.filter(inp, Some(p)),
+        Some(p) => cb.filter(inp, p),
         None => inp,
     };
 

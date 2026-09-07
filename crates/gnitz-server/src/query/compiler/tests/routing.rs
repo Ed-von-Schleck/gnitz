@@ -141,7 +141,7 @@ fn a_source_reached_by_two_scans_routes_by_one_key_or_refuses() {
                 (1, scatter_reindex(key_a)),
                 (2, scan_delta(10)),
                 (3, scatter_reindex(key_b)),
-                (4, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace)),
+                (4, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::Equi)),
                 (5, gnitz_wire::OpNode::IntegrateSink),
             ]),
             vec![
@@ -177,7 +177,7 @@ fn a_source_with_no_reindex_map_takes_the_view_shard_route() {
             (0, scan_delta(10)),
             (1, scan_delta(20)),
             (2, scatter_reindex(&[2])),
-            (3, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace)),
+            (3, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::Equi)),
             (4, gnitz_wire::OpNode::IntegrateSink),
             (5, gnitz_wire::OpNode::IntegrateTrace),
         ]),
@@ -260,7 +260,7 @@ fn join_meta_in(kind: JoinKind, key_cols: &[u32], ext: ExtTables) -> ViewMeta {
 }
 
 fn pure_range(n_eq: u8) -> JoinKind {
-    JoinKind::DeltaTraceRange { n_eq, rel: RangeRel::Lt }
+    JoinKind::Range { n_eq, rel: RangeRel::Lt }
 }
 
 /// The `GroupKey` scatter's columns, or `None` when the route is not one.
@@ -300,7 +300,7 @@ fn only_the_keyed_source_of_a_pure_range_join_broadcasts() {
 /// pure-range join's does.
 #[test]
 fn a_cross_join_broadcasts_like_a_pure_range_join() {
-    let meta = join_meta(JoinKind::DeltaTraceCross, &[1]);
+    let meta = join_meta(JoinKind::Cross, &[1]);
     assert!(
         matches!(meta.relay_route(7), RelayRoute::Broadcast),
         "the keyed input relay of a cross join must broadcast"
@@ -337,7 +337,7 @@ fn a_band_join_routes_by_the_equality_prefix_and_an_equi_join_by_the_whole_key()
         "the trailing range slot must not route"
     );
 
-    let equi = join_meta(JoinKind::DeltaTrace, &[3, 4]);
+    let equi = join_meta(JoinKind::Equi, &[3, 4]);
     assert_eq!(join_cols(equi.relay_route(7)), Some(vec![3, 4]));
 }
 
@@ -351,21 +351,9 @@ fn a_broadcast_join_relays_a_co_partitioned_source_that_an_equi_join_would_skip(
         let ext: ExtTables = HashMap::from([(7i64, make_schema_u64_i64())]);
         join_meta_in(kind, &[0], ext).scatters(7)
     };
-    assert!(!keyed_by_pk(JoinKind::DeltaTrace), "the equi join skips the relay");
+    assert!(!keyed_by_pk(JoinKind::Equi), "the equi join skips the relay");
     assert!(keyed_by_pk(pure_range(0)), "the range join must relay anyway");
-    assert!(
-        keyed_by_pk(JoinKind::DeltaTraceCross),
-        "the cross join must relay anyway"
-    );
-}
-
-/// A circuit that could not be read routes everything by `∅` — every row to
-/// partition 0's owner — rather than by a graph that is not there.
-#[test]
-fn nothing_special_routes_every_source_by_the_empty_key() {
-    let meta = ViewMeta::nothing_special();
-    assert_eq!(group_key_cols(meta.relay_route(0)), Some(vec![]));
-    assert_eq!(group_key_cols(meta.relay_route(42)), Some(vec![]));
+    assert!(keyed_by_pk(JoinKind::Cross), "the cross join must relay anyway");
 }
 
 /// `repartitions` is the single bit `source_placement` reads before letting a
@@ -405,7 +393,7 @@ fn repartitions_covers_the_output_shard_and_a_bare_join() {
                 (0, scan_delta(7)),
                 (1, scatter_reindex(&[1])),
                 (2, scan_delta(9)),
-                (3, OpNode::Join(JoinKind::DeltaTrace)),
+                (3, OpNode::Join(JoinKind::Equi)),
                 (4, OpNode::IntegrateSink),
             ]),
             vec![(0, 1, SLOT_IN), (1, 3, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],

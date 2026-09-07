@@ -281,25 +281,26 @@ impl DagEngine {
         }
         // Last, because it can cost a circuit load where the tests above are map
         // lookups. Its join term is a backstop: a planned join has two distinct
-        // sources, so the destructure above has already returned.
-        if !self.view_meta(registry, view_id).repartitions {
-            placement
-        } else {
-            Placement::KEYED_DEFAULT
+        // sources, so the destructure above has already returned. An unreadable
+        // circuit proves nothing, so it keeps the default.
+        match self.view_meta(registry, view_id) {
+            Some(m) if !m.repartitions => placement,
+            _ => Placement::KEYED_DEFAULT,
         }
     }
 
     // ── ViewMeta (plan-free routing metadata) ───────────────────────────
 
     /// The memoized per-view routing metadata, computed on first touch. Cheaper
-    /// than full compilation: no code emission.
-    pub(crate) fn view_meta(&mut self, registry: &RelationRegistry, view_id: i64) -> Rc<ViewMeta> {
+    /// than full compilation: no code emission. `None` — an unreadable or
+    /// unroutable circuit — is not memoized, so a later touch retries.
+    pub(crate) fn view_meta(&mut self, registry: &RelationRegistry, view_id: i64) -> Option<Rc<ViewMeta>> {
         if let Some(m) = self.meta.get(&view_id) {
-            return m.clone();
+            return Some(m.clone());
         }
-        let meta = Rc::new(ViewMeta::for_view(registry, view_id));
+        let meta = Rc::new(ViewMeta::for_view(registry, view_id)?);
         self.meta.insert(view_id, meta.clone());
-        meta
+        Some(meta)
     }
 
     /// Drop the memoized metadata mentioning `id` — as the owning view, or as a

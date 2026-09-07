@@ -2,12 +2,15 @@
 //!
 //! Single source of truth for what the client (gnitz-core) and the server
 //! (gnitz-server) must agree on: the constants and codecs, the typed forms of
-//! the wire payloads (`OpNode`, `MapKind`, `ScanBound`, `ReadSpec`), and the
+//! the wire payloads (`OpNode`, `MapKind`, `IndexBound`, `ReadSpec`), and the
 //! semantic rules both sides compute with (`agg_output_type`,
 //! `raw_output_nullable`, `merge_func`, `join_key_common_type`,
 //! `is_natural_reduce_key`, `worker_for_key`). It is the only common ancestor of
 //! gnitz-sql, gnitz-store and gnitz-core, so a rule that lands anywhere else can
 //! drift.
+//!
+//! So this is the shared **model**, not only a byte format: a rule both sides
+//! compute belongs here even when it crosses no wire, as `ReduceOutKey` does.
 //!
 //! The crate is organized into topic modules, and most items are re-exported
 //! flat at the crate root (`gnitz_wire::FOO`) so callers need not track which

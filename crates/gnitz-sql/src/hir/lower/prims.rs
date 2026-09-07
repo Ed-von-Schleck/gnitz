@@ -60,7 +60,7 @@ pub(crate) fn null_gate(
 ) -> Result<(NodeId, bool), GnitzSqlError> {
     let nullable = cols.iter().any(|&c| coldefs[c].is_nullable);
     let gated = if nullable {
-        cb.filter(node, Some(multi_null_filter_prog(cols, coldefs, false)?))
+        cb.filter(node, multi_null_filter_prog(cols, coldefs, false)?)
     } else {
         node
     };

@@ -22,9 +22,7 @@ pub mod types;
 // module is `pub`, so anything omitted here is still reachable by its own path —
 // this list carries no meaning beyond "spelled often enough to be worth
 // shortening".
-pub use circuit::{
-    agg_output_type, segment_id, Circuit, CircuitBuilder, NodeId, OpNode, RangeRel, ReduceOutKey, ReindexRole,
-};
+pub use circuit::{agg_output_type, segment_id, Circuit, CircuitBuilder, NodeId, OpNode, RangeRel, ReindexRole};
 pub use client::{
     delta_reply_schema, qualified_name, retraction_batch, CatalogSnapshot, DeltaCursor, GnitzClient, IndexMeta,
     InlineUniqueIndex, PlannedView, RelDescriptor, TxnBuffer, TxnReads, MAX_CHAIN_SEGMENTS,
@@ -42,6 +40,6 @@ pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult, 
 pub use protocol::{
     native_le_key, native_packed_key, opk_key_cols, opk_key_packed, push_zero_cell, wire_flags_get_schema_version,
     wire_flags_set_conflict_mode, BatchAppender, ColumnDef, FixedInt, FkTarget, PkBuf, PkColumn, ProtocolError,
-    ScalarKind, Schema, TypeCode, WireConflictMode, ZSetBatch, ZSetBatchView, FLAG_PUSH, MAX_COLUMNS, MAX_PK_BYTES,
-    PK_LIST_MAX_COLS,
+    ReduceOutKey, ScalarKind, Schema, TypeCode, WireConflictMode, ZSetBatch, ZSetBatchView, FLAG_PUSH, MAX_COLUMNS,
+    MAX_PK_BYTES, PK_LIST_MAX_COLS,
 };

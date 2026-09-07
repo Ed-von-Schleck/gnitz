@@ -257,10 +257,9 @@ impl Schema {
         self.columns[i].is_hidden && !self.is_pk_col(i)
     }
 
-    /// The output-key kind a reduce grouped by `cols` over this schema gets —
-    /// the planner-side decision shipped on the wire and validated (never
-    /// re-decided) by the engine, both through
-    /// [`ReduceOutKey::for_group_cols`].
+    /// The output-key kind a reduce grouped by `cols` over this schema gets.
+    /// The engine derives the same answer off its own `SchemaDescriptor`
+    /// through [`ReduceOutKey::for_group_cols`], so nothing ships.
     pub fn reduce_out_key(&self, cols: &[usize]) -> ReduceOutKey {
         let group: Vec<u32> = cols.iter().map(|&c| c as u32).collect();
         ReduceOutKey::for_group_cols(&self.pk_cols, &group, |c| {

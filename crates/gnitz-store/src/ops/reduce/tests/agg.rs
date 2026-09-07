@@ -68,20 +68,3 @@ fn max_uses_total_order_for_nan() {
     let got = f64::from_bits(acc.get_value_bits());
     assert!(got.is_nan(), "MAX must adopt NaN as the greatest under total order");
 }
-
-/// `Accumulator` resolves the two `AggFunc` classifications the wire owns —
-/// linearity and the zero-identity empty render — off its own `StepKind` rather
-/// than a stored opcode, so both must still answer exactly as `AggFunc` does for
-/// every opcode the wire can name.
-#[test]
-fn step_kind_answers_the_wire_classifications() {
-    for &op in AggFunc::ALL {
-        let acc = f64_acc(op);
-        assert_eq!(acc.is_linear(), op.is_linear(), "{op:?}: linearity");
-        assert_eq!(
-            acc.empty_renders_zero(),
-            op.empty_renders_zero(),
-            "{op:?}: empty render",
-        );
-    }
-}

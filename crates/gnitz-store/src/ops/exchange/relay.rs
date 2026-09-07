@@ -67,12 +67,13 @@ fn worker_rows_to_batches(
         .collect()
 }
 
+/// `None` when `spec` does not route against `schema` — see [`ScatterKey::new`].
 pub fn op_repartition_batches(
     sources: &[Option<&Batch>],
     spec: ScatterSpec<'_>,
     schema: &SchemaDescriptor,
     num_workers: usize,
-) -> Vec<Batch> {
+) -> Option<Vec<Batch>> {
     gnitz_debug!(
         "op_repartition_batches: sources={} spec={:?}",
         sources.iter().filter(|s| matches!(s, Some(sb) if sb.count > 0)).count(),
@@ -82,16 +83,12 @@ pub fn op_repartition_batches(
     let mem_batches = mem_batch_slots(sources, &empty);
 
     let total_blob = mem_batch_blob_cap(&mem_batches);
+    let mut scatter_key = ScatterKey::new(spec, schema, num_workers)?;
 
-    WORKER_ROWS.with(|pool| {
+    Some(WORKER_ROWS.with(|pool| {
         let mut worker_rows = pool.borrow_mut();
         super::reset_slots(&mut worker_rows, num_workers);
 
-        // One `ScatterKey` per scatter, built out of the row loop: native PK
-        // bytes when the key is exactly the PK (so the owner matches the one the
-        // write path routes to), a packed `_join_pk` for a `JoinKey`, the group
-        // fold for a `GroupKey`.
-        let mut scatter_key = ScatterKey::new(spec, schema, num_workers);
         let is_pk_routing = scatter_key.is_pk_routed();
         for (si, mb) in mem_batches.iter().enumerate() {
             for i in 0..mb.count {
@@ -121,15 +118,16 @@ pub fn op_repartition_batches(
             }
         }
         out
-    })
+    }))
 }
 
+/// `None` when `spec` does not route against `schema` — see [`ScatterKey::new`].
 pub fn op_relay_scatter_consolidated(
     sources: &[Option<&Batch>],
     spec: ScatterSpec<'_>,
     schema: &SchemaDescriptor,
     num_workers: usize,
-) -> Vec<Batch> {
+) -> Option<Vec<Batch>> {
     // The dispatch gate selected these on `is_consolidated()`; debug-verify each
     // source's data here before either walk fast-paths on it.
     #[cfg(debug_assertions)]
@@ -148,19 +146,18 @@ pub fn op_relay_scatter_consolidated(
         "op_relay_scatter_consolidated: sources={}",
         mem_batches.iter().filter(|mb| mb.count > 0).count(),
     );
+    // Built before the empty short-circuit, so an unroutable key is refused
+    // whether or not this round carries rows.
+    let mut scatter_key = ScatterKey::new(spec, schema, num_workers)?;
     let Some(first) = first else {
-        return (0..num_workers).map(|_| Batch::empty_with_schema(schema)).collect();
+        return Some((0..num_workers).map(|_| Batch::empty_with_schema(schema)).collect());
     };
     let total_blob: usize = mem_batch_blob_cap(&mem_batches);
 
-    WORKER_ROWS.with(|pool| {
+    Some(WORKER_ROWS.with(|pool| {
         let mut worker_rows = pool.borrow_mut();
         super::reset_slots(&mut worker_rows, num_workers);
 
-        // One `ScatterKey` picked once, never per row. `worker` is a pure function
-        // of `(batch, row)` and a (PK, payload) group's rows are identical, so
-        // routing the group exemplar routes where every member would.
-        let mut scatter_key = ScatterKey::new(spec, schema, num_workers);
         match second {
             // One contributing source: already ordered and folded, so a
             // tournament would compare per row to fold nothing. Reached by every
@@ -173,6 +170,8 @@ pub fn op_relay_scatter_consolidated(
             }
             // Two or more: the shared N-way merge, which folds across sources —
             // one key can carry an insert in one and a retraction in another.
+            // `worker` is pure in `(batch, row)` and a (PK, payload) group's rows
+            // are identical, so the exemplar routes where every member would.
             Some(_) => run_merge(&mem_batches, schema, |si, row, w| {
                 worker_rows[scatter_key.worker(&mem_batches[si], row)].push((si as u32, row as u32, w));
             }),
@@ -188,7 +187,7 @@ pub fn op_relay_scatter_consolidated(
             }
         }
         out
-    })
+    }))
 }
 
 /// Broadcast relay: the FULL delta, delivered to every worker. The per-worker

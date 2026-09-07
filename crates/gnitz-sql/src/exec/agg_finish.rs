@@ -137,8 +137,12 @@ impl ColAcc {
     fn new(spec: &AggSpec) -> ColAcc {
         match spec.op.merge_func() {
             // A count is a sum that starts out non-NULL: its partials are never
-            // null, and an uncontributed group renders 0 rather than NULL.
-            WireAggFunc::SumZero => ColAcc::IntSum { bits: 0, seen: true },
+            // null, and an uncontributed group renders 0 rather than NULL. The
+            // raw counts land here too — `merge_func` maps them to `SumZero`, so
+            // they would take this arm anyway.
+            WireAggFunc::SumZero | WireAggFunc::Count | WireAggFunc::CountNonNull => {
+                ColAcc::IntSum { bits: 0, seen: true }
+            }
             WireAggFunc::Sum if spec.out_type.is_float() => ColAcc::FloatSum { val: 0.0, seen: false },
             WireAggFunc::Sum => ColAcc::IntSum { bits: 0, seen: false },
             WireAggFunc::Min => ColAcc::Extreme {
@@ -151,9 +155,6 @@ impl ColAcc {
                 is_max: true,
                 tc: spec.out_type,
             },
-            WireAggFunc::Count | WireAggFunc::CountNonNull => {
-                unreachable!("merge_func never yields a raw count")
-            }
         }
     }
 }

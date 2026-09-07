@@ -62,11 +62,9 @@ pub(crate) struct ViewMeta {
 }
 
 impl ViewMeta {
-    /// The answer for a circuit that could not be read or is cyclic: no exchange
-    /// skip, no repartition, every source routed by the empty key. Every metadata
-    /// query then takes its conservative branch instead of walking a graph that
-    /// is not there.
-    pub(in crate::query) fn nothing_special() -> ViewMeta {
+    /// An empty fixture, enough to occupy a memo slot.
+    #[cfg(test)]
+    pub(in crate::query) fn empty() -> ViewMeta {
         ViewMeta {
             source_routes: FxHashMap::default(),
             default_route: group_key_route(None),
@@ -75,15 +73,13 @@ impl ViewMeta {
         }
     }
 
-    /// Load `view_id`'s circuit and derive its metadata. A circuit that cannot be
-    /// read, is malformed, or carries an unscatterable source falls back to
-    /// [`ViewMeta::nothing_special`] — the same circuits `compile_view` rejects,
-    /// so no view that runs is metadata-less.
-    pub(in crate::query) fn for_view(host: &dyn SchemaSource, view_id: i64) -> ViewMeta {
-        load::load_circuit(host, view_id as u64)
-            .ok()
-            .and_then(|loaded| ViewMeta::derive(&loaded, host).ok())
-            .unwrap_or_else(ViewMeta::nothing_special)
+    /// Load `view_id`'s circuit and derive its metadata. `None` when the circuit
+    /// cannot be read, is malformed, or carries an unscatterable source — there
+    /// is no default route, since a key nothing was stored under would scatter a
+    /// delta away from the traces it must meet.
+    pub(in crate::query) fn for_view(host: &dyn SchemaSource, view_id: i64) -> Option<ViewMeta> {
+        let loaded = load::load_circuit(host, view_id as u64).ok()?;
+        ViewMeta::derive(&loaded, host).ok()
     }
 
     /// `host` supplies what the circuit alone cannot: co-partitioning and the
@@ -100,8 +96,6 @@ impl ViewMeta {
                 continue;
             };
             let (node_seqs, orphaned) = load::scatter_key_of_scan(loaded, nid);
-            // Not conditioned on the circuit carrying a `Join`: a GROUP BY or
-            // PK-redistribution circuit's group reindex routes just as much.
             if orphaned {
                 return Err(CompileError::Rejected(
                     "a source's reindex maps carry no route key, so its delta cannot be scattered",

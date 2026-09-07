@@ -10,23 +10,24 @@ fn agg(agg_op: AggFunc, col_idx: u32) -> AggDescriptor {
 /// to cut.
 fn sample(op: Opcode) -> OpNode {
     match op {
-        Opcode::Filter => OpNode::Filter(Some(vec![1, 2, 3, 4])),
+        Opcode::Filter => OpNode::Filter(vec![1, 2, 3, 4]),
         Opcode::Negate => OpNode::Negate,
         Opcode::Union => OpNode::Union,
-        Opcode::Join => OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 3, rel: RangeRel::Le }),
-        Opcode::Integrate => OpNode::IntegrateSink,
+        Opcode::JoinEqui => OpNode::Join(JoinKind::Equi),
+        Opcode::JoinRange => OpNode::Join(JoinKind::Range { n_eq: 3, rel: RangeRel::Le }),
+        Opcode::JoinCross => OpNode::Join(JoinKind::Cross),
+        Opcode::IntegrateSink => OpNode::IntegrateSink,
         Opcode::Reduce => OpNode::Reduce {
             group_cols: vec![2, 7],
             agg: vec![agg(AggFunc::Min, 4), agg(AggFunc::Sum, 1)],
             global_ground: false,
-            out_key: ReduceOutKey::PkPermutation,
         },
         Opcode::Distinct => OpNode::Distinct,
         // A non-ascending index column list: `PkColList`'s `PartialEq` spans the
         // whole backing array, so a reordered list fails the round-trip.
         Opcode::ScanDelta => OpNode::ScanDelta {
             source: 42,
-            bound: Some(ScanBound {
+            bound: Some(crate::IndexBound {
                 idx_cols: crate::PkColList::from_slice(&[9, 3, 5]),
                 desc: crate::RangeDescriptor::new(&[7, 11], crate::Cut::After(4), crate::Cut::Before(90)),
             }),
@@ -73,7 +74,6 @@ fn every_op_node_variant_roundtrips() {
     // and the empty lists each counted layout allows.
     nodes.extend([
         OpNode::ScanDelta { source: 7, bound: None },
-        OpNode::Filter(None),
         OpNode::Map(MapKind::Projection(vec![])),
         OpNode::Map(MapKind::Compute(ComputeMap { program: vec![9, 9], out_cols: vec![] })),
         OpNode::Map(MapKind::HashRow { cols: vec![(3, None)], branch_id: 1 }),
@@ -81,7 +81,6 @@ fn every_op_node_variant_roundtrips() {
             group_cols: vec![],
             agg: vec![agg(AggFunc::Count, 0)],
             global_ground: true,
-            out_key: ReduceOutKey::SyntheticFold,
         },
     ]);
     for &role in ReindexRole::ALL {
@@ -91,32 +90,19 @@ fn every_op_node_variant_roundtrips() {
             role,
         }));
     }
-    // One reduce per aggregate, at a distinct source column, and one per output
-    // key kind — the two enums a REDUCE row carries.
+    // One reduce per aggregate, at a distinct source column.
     for (i, &func) in AggFunc::ALL.iter().enumerate() {
         nodes.push(OpNode::Reduce {
             group_cols: vec![2, 7],
             agg: vec![agg(func, i as u32)],
             global_ground: false,
-            out_key: ReduceOutKey::PkPermutation,
-        });
-    }
-    for &out_key in ReduceOutKey::ALL {
-        nodes.push(OpNode::Reduce {
-            group_cols: vec![4],
-            agg: vec![agg(AggFunc::Min, 4), agg(AggFunc::Sum, 1)],
-            global_ground: false,
-            out_key,
         });
     }
     // Every join kind, and every relation the range kind can carry — `Join`'s
     // own sample can only be one of them.
-    nodes.extend([
-        OpNode::Join(JoinKind::DeltaTrace),
-        OpNode::Join(JoinKind::DeltaTraceCross),
-    ]);
+    nodes.extend([OpNode::Join(JoinKind::Equi), OpNode::Join(JoinKind::Cross)]);
     for &rel in RangeRel::ALL {
-        nodes.push(OpNode::Join(JoinKind::DeltaTraceRange { n_eq: 3, rel }));
+        nodes.push(OpNode::Join(JoinKind::Range { n_eq: 3, rel }));
     }
     for node in nodes {
         assert_eq!(roundtrip(node.clone()).unwrap(), node, "round-trip failed for {node:?}");
@@ -134,10 +120,9 @@ fn each_sample_encodes_under_its_own_opcode() {
     }
 }
 
-/// A `params` cell one byte short, or one long, is a layout disagreement. Every
-/// opcode is swept: a layout reading a fixed prefix and ignoring the rest would
-/// pass the round-trip and fail here. `ScanDelta` is the deliberate exception,
-/// asserted the other way — a damaged access hint degrades to `bound: None`.
+/// A `params` cell one byte short, one long, or present and empty, is a layout
+/// disagreement. Every opcode is swept: a layout reading a fixed prefix and
+/// ignoring the rest would pass the round-trip and fail here.
 #[test]
 fn a_truncated_or_over_long_params_cell_is_rejected() {
     for &op in Opcode::ALL {
@@ -145,17 +130,8 @@ fn a_truncated_or_over_long_params_cell_is_rejected() {
         let mut over_long = params.clone().unwrap_or_default();
         over_long.push(0);
         let decode = |bytes: &[u8]| decode_op_node(op.as_wire(), src_tab, Some(bytes));
-        if op == Opcode::ScanDelta {
-            for bytes in [&params.as_ref().unwrap()[..1], over_long.as_slice()] {
-                assert_eq!(
-                    decode(bytes).unwrap(),
-                    OpNode::ScanDelta { source: 42, bound: None },
-                    "a damaged scan bound must degrade, not fail",
-                );
-            }
-            continue;
-        }
         assert!(decode(&over_long).is_err(), "{op:?}: a trailing byte must be rejected");
+        assert!(decode(&[]).is_err(), "{op:?}: an empty cell must be rejected");
         if let Some(p) = &params {
             assert!(
                 decode(&p[..p.len() - 1]).is_err(),
@@ -180,15 +156,15 @@ fn decode_rejects_an_unknown_opcode() {
     assert!(decode_op_node(9999, None, None).unwrap_err().contains("unknown opcode"));
 }
 
-/// A promoted target that is not PK-eligible is rejected at the decode trust
-/// boundary (here: a float code), not silently mis-strided. `MAP_HASH_ROW`
-/// promotes payload rather than key bytes, so its domain is stricter still —
-/// `is_pk_eligible` admits the 16-byte types its `copy_column` widen cannot hold.
+/// A reindex key's promoted target is rejected here when it is not PK-eligible,
+/// since nothing on the master relay path screens it. `MAP_HASH_ROW` has no such
+/// gate (`emit_map` applies the stricter `is_widening_promotion`), so its
+/// out-of-domain target decodes; an undecodable byte is refused on both.
 #[test]
-fn decode_rejects_an_out_of_domain_promotion_target() {
+fn decode_rejects_an_out_of_domain_reindex_target() {
     let reindex = |tc: u8| {
         let mut w = Vec::new();
-        w.push(ReindexRole::ScatterKey.as_wire() as u8);
+        w.push(ReindexRole::ScatterKey.as_wire());
         w.extend(1u16.to_le_bytes()); // one key column
         w.extend(3u32.to_le_bytes());
         w.push(tc);
@@ -210,17 +186,21 @@ fn decode_rejects_an_out_of_domain_promotion_target() {
         w.push(tc);
         w
     };
-    let err = decode_op_node(
-        Opcode::MapHashRow.as_wire(),
-        None,
-        Some(&hash_row(crate::type_code::U128)),
-    )
-    .unwrap_err();
-    assert!(err.contains("fixed-width integer"), "got: {err}");
+    assert!(
+        decode_op_node(
+            Opcode::MapHashRow.as_wire(),
+            None,
+            Some(&hash_row(crate::type_code::U128)),
+        )
+        .is_ok(),
+        "a hash-row target's domain is emit_map's, not this decode's",
+    );
 
-    // An undecodable code is the same refusal, not a decode to "no target".
-    let err = decode_op_node(Opcode::MapReindex.as_wire(), None, Some(&reindex(200))).unwrap_err();
-    assert!(err.contains("not PK-eligible"), "got: {err}");
+    // An undecodable code is a refusal on both, not a decode to "no target".
+    for (op, params) in [(Opcode::MapReindex, reindex(200)), (Opcode::MapHashRow, hash_row(200))] {
+        let err = decode_op_node(op.as_wire(), None, Some(&params)).unwrap_err();
+        assert!(err.contains("unknown promotion type code"), "{op:?}: {err}");
+    }
 }
 
 /// A NULL_EXTEND type code becomes a schema column verbatim. An undecodable
@@ -241,12 +221,7 @@ fn decode_rejects_invalid_null_extend_type_code() {
 #[test]
 fn reduce_rejects_a_ground_group_set_and_an_empty_agg_list() {
     let reduce = |global_ground, group_cols: Vec<u32>, agg: Vec<AggDescriptor>| {
-        let (_, _, params) = encode_op_node(OpNode::Reduce {
-            group_cols,
-            agg,
-            global_ground,
-            out_key: ReduceOutKey::SyntheticFold,
-        });
+        let (_, _, params) = encode_op_node(OpNode::Reduce { group_cols, agg, global_ground });
         decode_op_node(Opcode::Reduce.as_wire(), None, params.as_deref())
     };
     let count = || vec![agg(AggFunc::Count, 0)];
@@ -277,7 +252,7 @@ fn a_map_reindex_whose_role_or_key_is_unusable_is_rejected() {
     };
     let decode = |p: Vec<u8>| decode_op_node(Opcode::MapReindex.as_wire(), None, Some(&p));
     assert!(decode(params(99, 1)).unwrap_err().contains("unknown route-key role"));
-    assert!(decode(params(ReindexRole::Auxiliary.as_wire() as u8, 0))
+    assert!(decode(params(ReindexRole::Auxiliary.as_wire(), 0))
         .unwrap_err()
         .contains("names no key columns"));
 }
@@ -294,11 +269,17 @@ fn unbounded_scan_delta_encodes_identically() {
     );
 }
 
-/// Every malformed-hint shape degrades to `bound: None` — no panic, no `Err`.
-/// An `Err` here would abort the whole view load over a physical access hint.
+/// A malformed backfill hint is catalog corruption, and every other opcode in
+/// the same decoder rejects one — so this one does too, rather than silently
+/// widening the initial scan.
 #[test]
-fn malformed_scan_bound_degrades_to_none() {
-    let desc = crate::RangeDescriptor::new(&[1], crate::Cut::Before(0), crate::Cut::After(9)).encode();
+fn a_malformed_scan_bound_is_rejected() {
+    let mut w = crate::codec::Writer::with_capacity(0);
+    crate::range::write_range_descriptor(
+        &mut w,
+        &crate::RangeDescriptor::new(&[1], crate::Cut::Before(0), crate::Cut::After(9)),
+    );
+    let desc = w.into_vec();
     let with_word = |word: u64, tail: &[u8]| {
         let mut p = word.to_le_bytes().to_vec();
         p.extend_from_slice(tail);
@@ -308,6 +289,8 @@ fn malformed_scan_bound_degrades_to_none() {
         // A column-list word whose count is past the arity cap — `as_slice` would
         // silently truncate it and `from_slice` would panic.
         ("over-long list", with_word(crate::PK_LIST_PACKED_FLAG | 7, &desc)),
+        // A word carrying no packed-list flag at all.
+        ("untagged word", with_word(1, &desc)),
         // A bounded node whose descriptor never arrived.
         ("missing descriptor", with_word(crate::pack_pk_cols(&[1]), &[])),
         // A descriptor that fails `RangeDescriptor::decode`'s validation.
@@ -319,10 +302,9 @@ fn malformed_scan_bound_degrades_to_none() {
         ("empty cell", Vec::new()),
     ];
     for (what, params) in cases {
-        assert_eq!(
-            decode_op_node(Opcode::ScanDelta.as_wire(), Some(3), Some(params)).unwrap(),
-            OpNode::ScanDelta { source: 3, bound: None },
-            "{what} must degrade to an unbounded scan"
+        assert!(
+            decode_op_node(Opcode::ScanDelta.as_wire(), Some(3), Some(params)).is_err(),
+            "{what} must be rejected"
         );
     }
 }

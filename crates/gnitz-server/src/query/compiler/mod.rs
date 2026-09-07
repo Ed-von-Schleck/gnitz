@@ -28,10 +28,7 @@ pub(super) use hydration::{Hydration, HydrationSeed};
 
 // Everything here is `pub(super)`: `dag` is the only module that names the
 // compiler, so a `pub(crate)` would publish it to the catalog and runtime rungs
-// too. The two exceptions are what the master relay needs: `RelayRoute`, which
-// it matches on, and `oob_cols`, the one bound it applies to that route's
-// client-supplied columns.
-pub(crate) use emit::oob_cols;
+// too. The one exception is `RelayRoute`, which the master relay matches on.
 pub(super) use load::for_each_scan_edge;
 use load::scan_tid_through_filters;
 pub(crate) use routing::RelayRoute;
@@ -65,6 +62,10 @@ pub(in crate::query) enum CompileError {
     /// so the rejection says *which* trust-boundary check fired instead of a
     /// bare "build failed".
     Rejected(&'static str),
+    /// `decode_op_node` rejected a stored node. Its rejections are built rather
+    /// than named — most interpolate the offending value — and that value is the
+    /// whole diagnostic at this boundary, so the payload is the string it made.
+    RejectedNode(String),
     /// An expression-program guard rejected the circuit: the payload names the
     /// guard and carries the validator's own reason, so the rejection can state
     /// *which* limit the program exceeded and not only which guard fired.
@@ -78,6 +79,7 @@ impl fmt::Display for CompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CompileError::Rejected(guard) => f.write_str(guard),
+            CompileError::RejectedNode(why) => f.write_str(why),
             CompileError::RejectedExpr(guard, e) => write!(f, "{guard}: {e}"),
             CompileError::StorageFailed(step, e) => write!(f, "{step}: {e}"),
         }
@@ -100,10 +102,6 @@ pub(super) struct LoadedCircuit {
     ordered: Vec<i32>,
     outgoing: HashMap<i32, Vec<i32>>,
     inputs: HashMap<i32, NodeInputs>,
-    /// `Distinct` nodes the elision pass dropped. Derived by the constructor, so
-    /// it cannot disagree with the circuit and a plan built over a slice of the
-    /// circuit reads the same set as every other.
-    skip_nodes: HashSet<i32>,
 }
 
 impl LoadedCircuit {
@@ -225,7 +223,7 @@ pub(super) fn scatter_reindex(cols: &[u32]) -> gnitz_wire::OpNode {
 }
 
 /// An empty but decodable expr-program blob for tests that need a
-/// `Map(Expression { program, .. })` or `Filter(Some(..))` to exist without
+/// `Map(Expression { program, .. })` or `Filter(..)` to exist without
 /// ever executing it. Built through the real encoder rather than spelled as a
 /// byte literal, so it stays decodable when the blob header changes.
 #[cfg(test)]
@@ -378,7 +376,7 @@ pub(super) struct CompileOutput {
     /// drivers (a steady-state delta never opens the source cursor). A **physical
     /// access hint**: `None` means "full-scan", which is always correct, and the
     /// circuit's `Filter` carries the full predicate either way.
-    pub(in crate::query) source_bound: Option<(i64, gnitz_wire::ScanBound)>,
+    pub(in crate::query) source_bound: Option<(i64, gnitz_wire::IndexBound)>,
     /// How a capacity-bounded view recomputes one key's output rows. `None` for
     /// every unbounded view — the walk runs only under a capacity, and any
     /// structural mismatch there is a `Rejected` rather than a silent `None`: a
@@ -414,9 +412,9 @@ pub(super) struct PlanBuildResult {
     // replay that seeds that node's register resumes. See [`Hydration`].
     instr_end: HashMap<i32, usize>,
     // The emitter's resolved node → output register map, after every aliasing
-    // rewrite (an elided identity `Map`, a `Filter(None)` pass-through, a skipped
-    // `Distinct`). Reading it is how `derive_hydration` sees through elision
-    // rather than re-deriving a register from graph position.
+    // rewrite (an elided identity `Map`, a `WorkerFilter` this worker cannot
+    // narrow). Reading it is how `derive_hydration` sees through elision rather
+    // than re-deriving a register from graph position.
     out_reg_of: HashMap<i32, u16>,
 }
 

@@ -310,8 +310,10 @@ const fn fold_family(mut h: u64, cols: &[WireSysCol], pk: &[u32]) -> u64 {
 /// Digest of every system family's stored shape, and of the blob layouts stored
 /// *inside* one. Shards and SAL frames are decoded against the *live* schema, so
 /// a shape change silently reinterprets an existing data directory unless a
-/// format word rejects it first — see the pin in
-/// [`crate::wal::WAL_FORMAT_VERSION`]'s test.
+/// format word rejects it first. Both words do, by different means: the engine
+/// XORs this into its `SHARD_VERSION`, which therefore moves on its own, while
+/// [`crate::wal::WAL_FORMAT_VERSION`] is hand-bumped and its test pins the pair,
+/// so a change reaching only the SAL side fails until that bump happens.
 ///
 /// The column half is folded straight over [`SYS_FAMILIES`], so a family added
 /// there is covered without a second edit. The version consts cover what that

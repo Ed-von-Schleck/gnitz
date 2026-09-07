@@ -251,11 +251,9 @@ fn index_plan<'e>(
     whole_compiles: bool,
     schema: &Schema,
 ) -> Result<AccessPlan<'e>, GnitzSqlError> {
-    let idx_cols = gnitz_wire::pack_pk_cols(c.idx_cols.as_slice());
     let bound = ReadBound::IndexRange {
-        idx_cols,
+        bound: gnitz_wire::IndexBound { idx_cols: c.idx_cols, desc: c.desc },
         exact: !whole_compiles,
-        desc: c.desc,
     };
     let residual = if whole_compiles { all.to_vec() } else { c.residual };
     AccessPlan::new(bound, all, residual, schema)

@@ -68,7 +68,7 @@ pub(super) fn load_circuit(host: &dyn SchemaSource, view_id: u64) -> Result<Load
     // The first malformed row's reason, naming which check fired. Every shape
     // here aborts the WHOLE load — silently skipping a row leaves an input
     // dangling, yielding an invalid topological order or silent output corruption.
-    let mut invalid: Option<&'static str> = None;
+    let mut invalid: Option<String> = None;
 
     nodes_cur.for_each_positive_with_prefix(&prefix, |ch| {
         let (src, row) = ch.current_row_source();
@@ -76,16 +76,15 @@ pub(super) fn load_circuit(host: &dyn SchemaSource, view_id: u64) -> Result<Load
         // 8 bytes of the 16-byte PK region.
         let node_id_raw = u64::from_be_bytes(ch.current_pk_bytes()[8..16].try_into().unwrap()) as i64;
         let Some(node_id) = node_id_i32(node_id_raw) else {
-            invalid.get_or_insert("circuit node id out of range");
+            invalid.get_or_insert_with(|| "circuit node id out of range".to_string());
             return;
         };
         let opcode = payload_u64(src, row, CIRCNODES_PAY_OPCODE);
 
         let nullable_u64 = |pay: usize| (!payload_is_null(src, row, pay)).then(|| payload_u64(src, row, pay));
         let src_tab = nullable_u64(CIRCNODES_PAY_SOURCE_TABLE);
-        // `None` is a NULL cell only. An empty cell is a damaged blob, and each
-        // opcode already judges one: every layout rejects it, and a ScanDelta
-        // bound degrades to `None`.
+        // `None` is a NULL cell only; a present but empty cell is a damaged blob,
+        // which `decode_op_node` rejects.
         let params: Option<&[u8]> =
             (!payload_is_null(src, row, CIRCNODES_PAY_PARAMS)).then(|| payload_bytes(src, row, CIRCNODES_PAY_PARAMS));
 
@@ -94,7 +93,7 @@ pub(super) fn load_circuit(host: &dyn SchemaSource, view_id: u64) -> Result<Load
             let Some(raw) = nullable_u64(pay) else { continue };
             match node_id_i32(raw as i64) {
                 Some(producer) => *slot = Some(producer),
-                None => drop(invalid.get_or_insert("circuit node id out of range")),
+                None => drop(invalid.get_or_insert_with(|| "circuit node id out of range".to_string())),
             }
         }
 
@@ -103,11 +102,14 @@ pub(super) fn load_circuit(host: &dyn SchemaSource, view_id: u64) -> Result<Load
                 nodes.insert(node_id, op);
                 inputs.insert(node_id, slots);
             }
-            Err(_) => drop(invalid.get_or_insert("circuit node failed to decode")),
+            // `decode_op_node` names which trust-boundary check fired and
+            // interpolates the offending value; that string is what
+            // `preflight_compile` renders into the `CREATE VIEW` error.
+            Err(why) => drop(invalid.get_or_insert(why)),
         }
     });
     if let Some(reason) = invalid {
-        return Err(CompileError::Rejected(reason));
+        return Err(CompileError::RejectedNode(reason));
     }
 
     topo_sorted(nodes, inputs)
@@ -118,8 +120,8 @@ pub(super) fn load_circuit(host: &dyn SchemaSource, view_id: u64) -> Result<Load
 // ---------------------------------------------------------------------------
 
 /// Assemble the sorted circuit — the only form a `LoadedCircuit` exists in, so
-/// no caller can read `ordered`, the adjacency maps or the elision set before
-/// they are populated.
+/// no caller can read `ordered` or the adjacency maps before they are
+/// populated.
 pub(super) fn topo_sorted(
     nodes: HashMap<i32, gnitz_wire::OpNode>,
     by_slot: HashMap<i32, [Option<i32>; 2]>,
@@ -186,59 +188,7 @@ pub(super) fn topo_sorted(
     if ordered.len() != nodes.len() {
         return Err(CompileError::Rejected("circuit graph has a cycle"));
     }
-    Ok(LoadedCircuit {
-        skip_nodes: compute_skip_nodes(&nodes, &ordered, &inputs),
-        nodes,
-        ordered,
-        outgoing,
-        inputs,
-    })
-}
-
-/// Distinct nodes elided because their input is already distinct. One forward
-/// pass along the topological order, maintaining the set of nodes whose output
-/// is known distinct: a Reduce or Distinct establishes it; a Filter preserves
-/// it; a Map preserves it unless it re-keys the PK (an equijoin pre-index
-/// reindex or a full-row HashRow), which invalidates upstream distinctness.
-fn compute_skip_nodes(
-    nodes: &HashMap<i32, gnitz_wire::OpNode>,
-    ordered: &[i32],
-    inputs: &HashMap<i32, NodeInputs>,
-) -> HashSet<i32> {
-    let mut distinct_at: HashSet<i32> = HashSet::new();
-    let mut skip = HashSet::new();
-    for &nid in ordered {
-        // Every arm below is a unary operator, so its one input is where the
-        // property it preserves or establishes comes from.
-        let input_distinct = |nid: i32| distinct_at.contains(&inputs[&nid].unary());
-        match &nodes[&nid] {
-            gnitz_wire::OpNode::Reduce { .. } => {
-                distinct_at.insert(nid);
-            }
-            gnitz_wire::OpNode::Distinct => {
-                if input_distinct(nid) {
-                    skip.insert(nid);
-                }
-                distinct_at.insert(nid);
-            }
-            gnitz_wire::OpNode::Filter(_) => {
-                if input_distinct(nid) {
-                    distinct_at.insert(nid);
-                }
-            }
-            gnitz_wire::OpNode::Map(mk) => {
-                let re_keys = matches!(
-                    mk,
-                    gnitz_wire::MapKind::Reindex { .. } | gnitz_wire::MapKind::HashRow { .. }
-                );
-                if !re_keys && input_distinct(nid) {
-                    distinct_at.insert(nid);
-                }
-            }
-            _ => {}
-        }
-    }
-    skip
+    Ok(LoadedCircuit { nodes, ordered, outgoing, inputs })
 }
 
 // ---------------------------------------------------------------------------
@@ -356,9 +306,9 @@ pub(super) fn circuit_join_relay(loaded: &LoadedCircuit) -> JoinRelay {
         .ops()
         .find_map(|(_, op)| match op {
             OpNode::Join(kind) => Some(match kind {
-                JoinKind::DeltaTrace => JoinRelay::WholeKey,
-                JoinKind::DeltaTraceRange { n_eq: 0, .. } | JoinKind::DeltaTraceCross => JoinRelay::Broadcast,
-                JoinKind::DeltaTraceRange { n_eq, .. } => JoinRelay::EqPrefix { n_eq: *n_eq },
+                JoinKind::Equi => JoinRelay::WholeKey,
+                JoinKind::Range { n_eq: 0, .. } | JoinKind::Cross => JoinRelay::Broadcast,
+                JoinKind::Range { n_eq, .. } => JoinRelay::EqPrefix { n_eq: *n_eq },
             }),
             _ => None,
         })
@@ -370,7 +320,7 @@ pub(super) fn circuit_join_relay(loaded: &LoadedCircuit) -> JoinRelay {
 /// can carry a bound. A hint: `None` means "full-scan", which is always correct,
 /// so a hand-crafted circuit with several takes the topologically first and lets
 /// the rest degrade, the same way on every worker.
-pub(super) fn circuit_source_bound(loaded: &LoadedCircuit) -> Option<(i64, gnitz_wire::ScanBound)> {
+pub(super) fn circuit_source_bound(loaded: &LoadedCircuit) -> Option<(i64, gnitz_wire::IndexBound)> {
     loaded.ops().find_map(|(_, op)| match op {
         gnitz_wire::OpNode::ScanDelta { source, bound: Some(b) } => Some((*source as i64, *b)),
         _ => None,

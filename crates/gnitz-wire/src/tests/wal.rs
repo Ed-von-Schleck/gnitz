@@ -1,15 +1,13 @@
 use super::*;
 
-/// A system family's column shape is part of what this word guards, and nothing
-/// else notices it changing — so pin it. If this fails, bump
-/// `WAL_FORMAT_VERSION`, then paste the reported digest here. The engine's
-/// `storage::repr::layout` pins the same digest to `SHARD_VERSION`; bump that
-/// too.
+/// Nothing but this pin notices a system family's column shape changing. On a
+/// failure, bump `WAL_FORMAT_VERSION` and paste the reported digest. The shard
+/// word needs no pin — it carries the digest itself.
 #[test]
 fn stored_shape_is_pinned_to_the_format_words() {
     assert_eq!(
         (crate::SYS_SCHEMA_DIGEST, WAL_FORMAT_VERSION),
-        (2556830436675219726, 13),
+        (2555871662535608959, 14),
         "system-family column shapes changed"
     );
 }

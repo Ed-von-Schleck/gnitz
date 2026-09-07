@@ -23,9 +23,13 @@ pub(crate) struct ExtremeSpec {
 pub struct Accumulator {
     acc: i64,
     has_value: bool,
-    /// [`AggFunc::is_linear`] as `kind` spells it, resolved in `new`: the group
-    /// walk reads it once per row per aggregate.
+    /// [`AggFunc::is_linear`], hoisted in `new`: the group walk reads it once
+    /// per row per aggregate, and `AggFunc::empty_renders_zero` is a
+    /// cross-crate `const fn` that would be a real call at `opt-level=0`.
     linear: bool,
+    /// [`AggFunc::empty_renders_zero`], hoisted for the same reason — read once
+    /// per emitted aggregate column.
+    renders_zero: bool,
     /// The aggregated column in an input row.
     src: ColumnLocator,
     /// This aggregate's own column in a reduce **output** row — where
@@ -81,7 +85,7 @@ impl Accumulator {
                 kind: scalar()?,
             },
         };
-        let linear = !matches!(kind, StepKind::Extreme { .. });
+        let linear = agg_op.is_linear();
         // `fold_stored`'s linear arms read the whole slot as one `u64`, which
         // `agg_output_type` guarantees: I64 for the count family and SumZero,
         // the 8-byte register image for SUM.
@@ -93,6 +97,7 @@ impl Accumulator {
             acc: 0,
             has_value: false,
             linear,
+            renders_zero: agg_op.empty_renders_zero(),
             src,
             out,
             kind,
@@ -125,14 +130,10 @@ impl Accumulator {
         }
     }
 
-    /// The zero-identity family, off the resolved kind — the same partition
-    /// [`AggFunc::empty_renders_zero`] names, and `tests/agg.rs` holds the two
-    /// answers equal for every opcode the wire can name.
+    /// [`AggFunc::empty_renders_zero`] for this accumulator's opcode.
+    #[inline(always)]
     pub(super) fn empty_renders_zero(&self) -> bool {
-        matches!(
-            self.kind,
-            StepKind::Count | StepKind::CountNonNull | StepKind::SumZero(_)
-        )
+        self.renders_zero
     }
 
     /// True iff the accumulator was never stepped (`has_value` is false) — "no

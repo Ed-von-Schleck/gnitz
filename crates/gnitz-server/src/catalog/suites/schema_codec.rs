@@ -276,7 +276,7 @@ fn ddl_txn_roundtrip_client_to_server() {
                 .null();
             // Integrate, fed by node 1.
             a.add_row((vid as u128) | (2u128 << 64), 1)
-                .u64_val(gnitz_wire::Opcode::Integrate.as_wire())
+                .u64_val(gnitz_wire::Opcode::IntegrateSink.as_wire())
                 .null()
                 .u64_val(1)
                 .null()

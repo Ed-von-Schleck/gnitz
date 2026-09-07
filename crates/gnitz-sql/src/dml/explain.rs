@@ -138,18 +138,14 @@ fn access_line(access: &Access, schema: &Schema) -> String {
         // It is reachable through the read verbs, where weights are native, and
         // nowhere else — so no planner ever builds one for EXPLAIN to describe.
         ReadBound::Delta { after_tick } => format!("delta feed after round {after_tick}"),
-        ReadBound::IndexRange { idx_cols, exact, .. } => {
-            let cols = match gnitz_wire::unpack_pk_cols(*idx_cols) {
-                Ok(cols) => cols
-                    .as_slice()
-                    .iter()
-                    .map(|&c| schema.columns[c as usize].name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                // Packed by the planner that built this very plan: render the rule
-                // rather than give the line builder an error channel.
-                Err(rule) => rule.to_string(),
-            };
+        ReadBound::IndexRange { bound, exact } => {
+            let cols = bound
+                .idx_cols
+                .as_slice()
+                .iter()
+                .map(|&c| schema.columns[c as usize].name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             // `exact` means the bounded conjuncts were stripped from the predicate,
             // so the walk alone applies them and the worker runs it un-gated.
             // Otherwise they still ride the predicate and the worker's selectivity

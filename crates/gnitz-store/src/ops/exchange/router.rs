@@ -104,8 +104,12 @@ pub(super) struct ScatterKey {
 }
 
 impl ScatterKey {
+    /// `None` when `schema` cannot route by `spec` — a column it has not got, or
+    /// one a reindex key cannot pack. The route reaches here off a client-pushed
+    /// circuit row, and both fold paths resolve columns through `locate`'s
+    /// release-active assert, so this is where it is rejected.
     #[inline]
-    pub(crate) fn new(spec: ScatterSpec<'_>, schema: &SchemaDescriptor, num_workers: usize) -> Self {
+    pub(crate) fn new(spec: ScatterSpec<'_>, schema: &SchemaDescriptor, num_workers: usize) -> Option<Self> {
         // Sequence equality, not set equality: `worker_for_pk_bytes` hashes OPK
         // bytes in schema order, so a permuted compound PK routes differently.
         // And no carried target throughout: a promoted key packs at the wider
@@ -113,22 +117,21 @@ impl ScatterKey {
         let pk = schema.pk_indices();
         let kind = match spec {
             ScatterSpec::GroupKey(cols) if cols == pk => ScatterKind::PkBytes,
-            ScatterSpec::GroupKey(cols) => ScatterKind::Fold { keys: GroupKeyCols::new(schema, cols) },
+            ScatterSpec::GroupKey(cols) if cols.iter().all(|&c| (c as usize) < schema.num_columns()) => {
+                ScatterKind::Fold { keys: GroupKeyCols::new(schema, cols) }
+            }
+            ScatterSpec::GroupKey(_) => return None,
             ScatterSpec::JoinKey(slots)
                 if slots.len() == pk.len() && slots.iter().zip(pk).all(|(&(c, tc), &p)| c == p && tc.is_none()) =>
             {
                 ScatterKind::PkBytes
             }
-            // `.expect`, not `?`: the scatter path has no compile-time guard, so
-            // an invalid key must fail loudly rather than route rows to the wrong
-            // worker.
             ScatterSpec::JoinKey(slots) => ScatterKind::Packed {
-                packer: ReindexPacker::new(schema, slots)
-                    .expect("ScatterKey: reindex key columns invalid for this schema"),
+                packer: ReindexPacker::new(schema, slots)?,
                 buf: [0u8; crate::schema::MAX_PK_BYTES],
             },
         };
-        ScatterKey { kind, num_workers }
+        Some(ScatterKey { kind, num_workers })
     }
 
     /// Whether this scatter routes by native PK bytes — the callers' gate for

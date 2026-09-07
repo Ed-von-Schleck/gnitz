@@ -235,13 +235,12 @@ fn one_writev_per_burst() {
 // ── Mirroring ─────────────────────────────────────────────────────────────
 
 /// A fed pass-through view over `tid`, built by hand: this crate links no
-/// planner, so the circuit is a `ScanDelta` into a predicate-less `Filter` into
-/// the sink the compiler takes as the plan's output register.
+/// planner, so the circuit is a `ScanDelta` into the sink the compiler takes as
+/// the plan's output register.
 fn fed_view(client: &mut GnitzClient, sn: &str, tid: u64) -> u64 {
     let mut b = gnitz_core::CircuitBuilder::new(tid);
     let src = b.input_delta();
-    let filtered = b.filter(src, None);
-    b.sink(filtered);
+    b.sink(src);
     let vids = client
         .create_view_chain(
             sn,

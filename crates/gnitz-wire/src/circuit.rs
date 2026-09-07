@@ -12,63 +12,50 @@ use crate::TypeCode;
 
 wire_enum! {
     /// The operator space. A wire enum so [`encode_op_node`] and
-    /// [`decode_op_node`] match exhaustively; the discriminants are durable
-    /// catalog state, so the sparse numbering stays as it is.
+    /// [`decode_op_node`] match exhaustively. `0` names no operator, so a zeroed
+    /// `CIRCUIT_NODES` opcode cell fails [`Opcode::from_wire`] rather than
+    /// decoding as one.
     pub enum Opcode: u64 {
-        Filter = 1,
-        Negate = 3,
-        Union = 4,
-        /// Symmetric delta-trace join. Which probe — equal-key seek, ordered
-        /// range walk, or full cross product — is a [`JoinKind`] tag leading the
-        /// params blob, not a second opcode.
-        Join = 5,
-        /// Primary INTEGRATE: writes to view storage.
-        Integrate = 7,
-        Reduce = 9,
-        Distinct = 10,
         /// Delta input source for a base table. The table id lives in the node
         /// row's `source_table` column.
-        ScanDelta = 11,
-        ExchangeShard = 20,
-        NullExtend = 23,
-        /// Discriminates IntegrateTrace from IntegrateSink without a nullable
-        /// column.
-        IntegrateTrace = 25,
+        ScanDelta = 1,
+        Filter = 2,
         /// MAP sub-variant: pure projection (column reorder/drop).
-        MapProj = 26,
+        MapProj = 3,
         /// MAP sub-variant: expression program (compute), inheriting the input PK.
-        MapExpr = 27,
-        /// MAP sub-variant: copy all columns to payload, set PK = hash of full row.
-        MapHashRow = 29,
-        /// Drop trace rows this worker does not own — the trace side of a broadcast
-        /// join input (a **pure** range join and the keyless cross join; a band join
-        /// scatters by its eq prefix and omits this node). Worker identity is a
-        /// compile-time constant, so the node carries no parameters.
-        WorkerFilter = 33,
-        /// Multiplicity-preserving sibling of DISTINCT: clamps each consolidated
-        /// (PK, payload)'s net weight to `[0, i64::MAX]` (vs DISTINCT's `[-1, 1]`).
-        /// The bag preset for EXCEPT ALL / INTERSECT ALL; shares DISTINCT's engine
-        /// body.
-        PositivePart = 34,
+        MapExpr = 4,
+        /// MAP sub-variant: keep the listed columns as payload, set PK = hash of
+        /// those columns' bytes.
+        MapHashRow = 5,
         /// MAP sub-variant: re-key onto a synthetic PK built from the named source
         /// columns, keeping the named columns as payload. A separate opcode rather
         /// than a `MapExpr` carrying an empty key list: the two share no parameter
         /// shape — a compute map has a program blob and declared output columns, a
         /// reindex two column lists and no program.
-        MapReindex = 35,
+        MapReindex = 6,
+        Negate = 7,
+        Union = 8,
+        Distinct = 9,
+        PositivePart = 10,
+        Reduce = 11,
+        /// Symmetric delta-trace join, equal-key seek probe.
+        JoinEqui = 12,
+        /// Symmetric delta-trace join, ordered half-open range walk over the trace.
+        JoinRange = 13,
+        /// Symmetric delta-trace join, full cross product.
+        JoinCross = 14,
+        IntegrateSink = 15,
+        IntegrateTrace = 16,
+        ExchangeShard = 17,
+        NullExtend = 18,
+        WorkerFilter = 19,
     }
 }
 
-/// The `params` blob layout. Folded into [`crate::SYS_SCHEMA_DIGEST`] rather
-/// than written into the blob, so a bump rejects an existing data directory at
-/// boot instead of reinterpreting it.
-pub(crate) const CIRCUIT_PARAMS_VERSION: u8 = 2;
-
-// ---------------------------------------------------------------------------
-// Circuit-layer type aliases
-// ---------------------------------------------------------------------------
-
-pub type TableId = u64;
+/// The `params` blob layout, folded into [`crate::SYS_SCHEMA_DIGEST`] rather
+/// than written into the blob: the digest is what refuses a stored
+/// `CIRCUIT_NODES` blob decoded under a new layout.
+pub(crate) const CIRCUIT_PARAMS_VERSION: u8 = 3;
 
 // ---------------------------------------------------------------------------
 // Typed circuit-node representation (shared between gnitz-core and gnitz-server)
@@ -77,7 +64,7 @@ pub type TableId = u64;
 wire_enum! {
     /// Aggregate function discriminant. The values are durable catalog state
     /// (a `Reduce` node's `params`) and a wire value on the ad-hoc fold path.
-    pub enum AggFunc: u64 {
+    pub enum AggFunc: u8 {
         Count = 1,
         Sum = 2,
         Min = 3,
@@ -172,18 +159,12 @@ pub struct ComputeMap {
 /// Output type code of an aggregate over a source column of type `src_tc` — the
 /// one typing rule both the planner's declared view schema and the engine's
 /// emitted batch read, so neither can scramble the other's column widths.
-///   COUNT, COUNT_NON_NULL → I64 (SUM_ZERO sums integer count/sum columns and
-///   likewise produces I64)
-///   SUM on float → F64, else the source's 8-byte register image
-///   MIN/MAX on float → F64; on a ≤8-byte integer → that source type; else I64
 ///
 /// MIN/MAX *select* an existing row, so a ≤8-byte integer extremum is itself a
 /// value of the source type and always representable in it: `MIN(INT)` is `INT`,
-/// `MAX(SMALLINT UNSIGNED)` is `SMALLINT UNSIGNED`. The engine's row emitters
-/// serialize the accumulator at the output column width, and the width-gated
-/// trace read-back reconstructs the 8-byte accumulator from it. The `I64` arm a
-/// STRING or 16-byte source falls to is a total-function default only — the SQL
-/// binder and the engine's order-encodability guard both reject such a MIN/MAX.
+/// `MAX(SMALLINT UNSIGNED)` is `SMALLINT UNSIGNED`. The `I64` arm a STRING or
+/// 16-byte source falls to is a total-function default only — the SQL binder and
+/// the engine's order-encodability guard both reject such a MIN/MAX.
 ///
 /// SUM over a U64 source is typed **U64**: the i64 `wrapping_add` accumulator's
 /// bit pattern already *is* the true sum mod 2^64 at the same width, so the label
@@ -214,7 +195,7 @@ wire_enum! {
     /// range-join probe (`{ trace_slot REL delta_slot }`). Canonicalized from the
     /// ON clause's `L.x OP R.y`: term AB's rel is the converse of OP, term BA's
     /// rel is OP itself. Wire values are stable.
-    pub enum RangeRel: u64 {
+    pub enum RangeRel: u8 {
         Lt = 0,
         Le = 1,
         Gt = 2,
@@ -222,25 +203,22 @@ wire_enum! {
     }
 }
 
-wire_enum! {
-    /// How a `Reduce` node keys its output. The planner decides it with
-    /// [`Self::for_group_cols`] and ships it; the engine re-derives through that
-    /// same function to *validate* what arrived, and everything downstream —
-    /// [`Self::output_layout`] included — obeys the kind rather than re-deriving
-    /// it. One implementation on both sides is what makes the check compare a
-    /// rule against a transmission rather than two guesses.
-    pub enum ReduceOutKey: u64 {
-        /// Leading synthetic `_group_pk` U128 = null-distinct group fold; the
-        /// group columns ride as payload. What every group set that is neither
-        /// natural kind gets, including the empty (global) group set.
-        SyntheticFold = 0,
-        /// The group set is a permutation of the source PK; the output PK is the
-        /// source PK columns in pk-list order, verbatim.
-        PkPermutation = 1,
-        /// A single non-nullable U64/U128/UUID group column is the output PK
-        /// directly.
-        SingleNaturalCol = 2,
-    }
+/// How a `Reduce` node keys its output. Derived, never transmitted: both sides
+/// call [`Self::for_group_cols`] over facts they already hold — the source PK
+/// column list and the GROUP BY column list — so there is one producer and
+/// nothing to disagree with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReduceOutKey {
+    /// Leading synthetic `_group_pk` U128 = null-distinct group fold; the
+    /// group columns ride as payload. What every group set that is neither
+    /// natural kind gets, including the empty (global) group set.
+    SyntheticFold,
+    /// The group set is a permutation of the source PK; the output PK is the
+    /// source PK columns in pk-list order, verbatim.
+    PkPermutation,
+    /// A single non-nullable U64/U128/UUID group column is the output PK
+    /// directly.
+    SingleNaturalCol,
 }
 
 impl ReduceOutKey {
@@ -272,8 +250,9 @@ impl ReduceOutKey {
     /// types for itself.
     ///
     /// `SingleNaturalCol` names `group_cols[0]`, which [`Self::for_group_cols`]
-    /// only selects for a single-column group set; the engine validates the
-    /// transmitted kind against the input schema before laying anything out.
+    /// only selects for a single-column group set — so the index is in range by
+    /// construction. The ad-hoc fold's hardcoded `SyntheticFold` never reaches
+    /// that arm.
     pub fn output_layout(self, pk_cols: &[u32], group_cols: &[u32]) -> Vec<ReduceOutSlot> {
         match self {
             // The output PK region mirrors the source's PK byte layout, so it
@@ -300,41 +279,31 @@ pub enum ReduceOutSlot {
     Carried(u32),
 }
 
-/// Join physical strategy carried by `OpNode::Join`. `DeltaTraceRange` keeps
-/// `JoinKind: Copy` (its fields are `Copy`).
+/// Join physical strategy carried by `OpNode::Join`, one variant per join
+/// opcode. `Range` keeps `JoinKind: Copy` (its fields are `Copy`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JoinKind {
-    DeltaTrace,
+    Equi,
     /// Non-equi (range) join: the probe is an ordered half-open range walk over
     /// the trace instead of an equal-key seek.
-    DeltaTraceRange {
+    Range {
         n_eq: u8,
         rel: RangeRel,
     },
     /// Keyless (cross) join: the probe pairs every delta row with every trace
     /// row.
-    DeltaTraceCross,
-}
-
-wire_enum! {
-    /// Which probe [`JoinKind`] names, leading `Opcode::Join`'s params blob. A
-    /// separate enum because `JoinKind` carries data, which a wire enum cannot;
-    /// named for the probe rather than mirroring `JoinKind`'s shared
-    /// `DeltaTrace` prefix, which discriminates nothing.
-    pub(crate) enum JoinKindTag: u8 {
-        Equi = 0,
-        Range = 1,
-        Cross = 2,
-    }
+    Cross,
 }
 
 wire_enum! {
     /// What a reindex `Map` re-keys *for*. One scan can fan out into several
-    /// reindex Maps (`t JOIN t1 ON t.a = t1.x JOIN t2 ON t.b = t2.y`) and can also
+    /// reindex Maps on different keys — a band outer join hangs its null-fill's
+    /// source-PK re-key and its scatter-key re-key off the same `ScanDelta`
+    /// (`SELECT * FROM a LEFT JOIN b ON a.k = b.k AND a.v < b.w`) — and can also
     /// carry re-keys that only move already-routed rows, so the two cannot be told
-    /// apart by graph shape — the planner states which is which at the call site,
+    /// apart by graph shape. The planner states which is which at the call site,
     /// where it knows.
-    pub enum ReindexRole: u64 {
+    pub enum ReindexRole: u8 {
         /// A re-key of rows a `ScatterKey` already placed — an outer join's
         /// null-fill putting its preserved side back on that side's own PK so the
         /// set difference stays partition-local, or any re-key of an operator's
@@ -351,10 +320,10 @@ wire_enum! {
     }
 }
 
-/// One slot of a reindex key: a source column, and the promotion target the
-/// planner carried for it — `None` where the engine derives it
-/// ([`resolve_reindex_type`]). The shape every producer and consumer of a
-/// reindex or hash-row key list passes around.
+/// One slot of a reindex or hash-row key list: a source column, and the
+/// promotion target the planner carried for it. What an absent target means is
+/// the field's rule, not this alias's — read [`MapKind::Reindex`] or
+/// [`MapKind::HashRow`].
 pub type ReindexSlot = (u32, Option<TypeCode>);
 
 /// MAP sub-variant discriminant.
@@ -393,23 +362,6 @@ pub enum MapKind {
     HashRow { cols: Vec<ReindexSlot>, branch_id: u8 },
 }
 
-/// A secondary-index range bound for a `ScanDelta`'s backfill scan: the index's
-/// declared column list and the half-open range over its leading columns.
-/// Resolved server-side against the source table's index circuits.
-///
-/// A **physical access hint, never a semantic filter**. The circuit's `Filter`
-/// still carries the full predicate, so a bounded and an unbounded scan produce
-/// the same view — a bound only narrows which rows the initial scan reads. That
-/// is what lets every consumer degrade to a full scan (a dropped index, an
-/// unselective range, a malformed wire row) without changing results, and what
-/// makes a malformed bound decode to `None` rather than `Err`: one node `Err`
-/// aborts the whole view load.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScanBound {
-    pub idx_cols: crate::PkColList,
-    pub desc: crate::RangeDescriptor,
-}
-
 /// Typed operator-node payload. Expression blobs are stored as raw `Vec<u8>` and decoded
 /// with `gnitz_wire::decode_expr_blob`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -417,25 +369,28 @@ pub enum OpNode {
     /// Delta input for `source`.
     ///
     /// `bound` is a **backfill-scan hint only**: steady-state deltas never open
-    /// the source cursor and ignore it entirely. A non-`None` bound narrows the
-    /// initial full-source scan to a secondary-index range, leaving the
-    /// downstream `Filter` — and therefore the view — unchanged.
+    /// the source cursor. It narrows the initial full-source scan, leaves the
+    /// downstream `Filter` and so the view unchanged, and the engine may ignore
+    /// it (`IndexWalk::Optional`). It travels because the engine cannot derive
+    /// it — the planner reads the predicate's `BoundExpr` conjuncts, which the
+    /// compiled program does not carry.
     ScanDelta {
-        source: TableId,
-        bound: Option<ScanBound>,
+        source: u64,
+        bound: Option<crate::IndexBound>,
     },
-    /// Optional expression predicate blob. `None` is "no `WHERE`"; a present but
-    /// undecodable program is the compile's rejection, not this decode's.
-    Filter(Option<Vec<u8>>),
+    /// Expression predicate blob. "No `WHERE`" is spelled by emitting no node at
+    /// all, so no absent cell can decode to a silent `WHERE TRUE`.
+    Filter(Vec<u8>),
     Map(MapKind),
     Negate,
     Union,
     Distinct,
-    /// Multiplicity-preserving counterpart to `Distinct`: per consolidated
-    /// (PK, payload) emits `clamp(w_new, 0, i64::MAX) − clamp(w_old, 0, i64::MAX)`,
-    /// where `Distinct` clamps to `[-1, 1]`. Shares `Distinct`'s engine body; the
-    /// bag preset for `EXCEPT ALL = positive_part(A − B)` and
-    /// `INTERSECT ALL = A − positive_part(A − B)`.
+    /// Multiplicity-preserving counterpart to `Distinct`: both emit
+    /// `clamp(w_new, lo, hi) − clamp(w_old, lo, hi)` per consolidated
+    /// (PK, payload), differing only in the preset — `[0, i64::MAX]` here against
+    /// `Distinct`'s `[-1, 1]`. Two opcodes rather than one node carrying
+    /// `(lo, hi)`, so a forged circuit cannot name `min > max` and abort a worker
+    /// per row inside `Ord::clamp`.
     PositivePart,
     Reduce {
         group_cols: Vec<u32>,
@@ -451,9 +406,6 @@ pub enum OpNode {
         /// seed a ground row, so the flag cannot be derived from
         /// `group_cols.is_empty()` and travels explicitly from the planner.
         global_ground: bool,
-        /// How the output is keyed. Decided by the planner, validated (never
-        /// re-decided) by the engine compiler.
-        out_key: ReduceOutKey,
     },
     Join(JoinKind),
     /// Primary INTEGRATE: writes to view storage.
@@ -503,21 +455,47 @@ impl OpNode {
 // ---------------------------------------------------------------------------
 //
 // One fixed layout per opcode, through the crate's shared `Writer`/`Reader`. The
-// opcode *is* the layout tag, so no field carries a discriminant; counts go
-// through the `*_cols` helpers below (`u16`, bounded by `MAX_COLUMNS`), a
-// program through `bytes32`, and a `wire_enum!` value as one byte.
+// opcode *is* the layout tag, so no field carries a discriminant.
+//
+// `write_cols`, `write_aggs`, `write_compute_map` and their readers are
+// `pub(crate)` because `read_spec` ships the same three shapes in a fold's
+// descriptor: one codec, so the durable catalog blob and the ad-hoc read frame
+// cannot drift on width or on which values they admit.
 
 const PARAMS_CTX: &str = "circuit params";
 
-fn write_cols(w: &mut Writer, cols: &[u32]) {
-    w.u16(cols.len() as u16);
+/// Write a counted list's length. Asserted, not rejected: every producer is
+/// planner- or engine-side and already width-checked against a schema, and
+/// `len() as u16` would truncate a longer list into a valid shorter one.
+fn write_count(w: &mut Writer, n: usize, what: &str) {
+    assert!(
+        n <= crate::MAX_COLUMNS,
+        "{what}: {n} entries exceeds the {}-column cap",
+        crate::MAX_COLUMNS
+    );
+    w.u16(n as u16);
+}
+
+/// Read a counted list's length, bounded before anything sizes a `Vec` off it.
+/// This decoder holds no schema, so [`crate::MAX_COLUMNS`] is the only bound
+/// available; the compiler bounds each index against the register schema.
+fn read_count(r: &mut Reader, what: &str) -> Result<usize, String> {
+    let n = r.u16()? as usize;
+    if n > crate::MAX_COLUMNS {
+        return Err(format!("{what}: {n} entries exceeds cap {}", crate::MAX_COLUMNS));
+    }
+    Ok(n)
+}
+
+pub(crate) fn write_cols(w: &mut Writer, cols: &[u32]) {
+    write_count(w, cols.len(), "column list");
     for &c in cols {
         w.u32(c);
     }
 }
 
-fn read_cols(r: &mut Reader) -> Result<Vec<u32>, String> {
-    let n = r.u16()? as usize;
+pub(crate) fn read_cols(r: &mut Reader) -> Result<Vec<u32>, String> {
+    let n = read_count(r, "column list")?;
     let mut cols = Vec::with_capacity(n);
     for _ in 0..n {
         cols.push(r.u32()?);
@@ -526,25 +504,16 @@ fn read_cols(r: &mut Reader) -> Result<Vec<u32>, String> {
 }
 
 /// A counted `(source column, promoted target type)` list; `0` on the wire is
-/// "no target", and any other code failing `valid` refuses the node rather than
-/// decoding to one, which would pack this slot narrower than its partner. The
-/// master's only gate: `ViewMeta::for_view` feeds these straight into
-/// `ReindexPacker::new(..).expect(..)`.
-fn read_cols_with_tcs(
-    r: &mut Reader,
-    valid: fn(u8) -> bool,
-    err: impl Fn(u8) -> String,
-) -> Result<Vec<ReindexSlot>, String> {
-    let n = r.u16()? as usize;
+/// "no target". `TypeCode::try_from_u8` is the whole domain check here — which
+/// targets a particular node admits is that arm's own business.
+fn read_cols_with_tcs(r: &mut Reader) -> Result<Vec<ReindexSlot>, String> {
+    let n = read_count(r, "slot list")?;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let col = r.u32()?;
         let target = match r.u8()? {
             0 => None,
-            tc => match TypeCode::try_from_u8(tc) {
-                Some(t) if valid(tc) => Some(t),
-                _ => return Err(err(tc)),
-            },
+            tc => Some(TypeCode::try_from_u8(tc).ok_or_else(|| format!("unknown promotion type code {tc}"))?),
         };
         out.push((col, target));
     }
@@ -552,37 +521,73 @@ fn read_cols_with_tcs(
 }
 
 fn write_cols_with_tcs(w: &mut Writer, slots: &[ReindexSlot]) {
-    w.u16(slots.len() as u16);
+    write_count(w, slots.len(), "slot list");
     for &(col, tc) in slots {
         w.u32(col).u8(tc.map_or(0, |t| t as u8));
     }
 }
 
-/// A `ScanDelta`'s bound, or `None` for absent / truncated / malformed. Never an
-/// `Err`: see [`ScanBound`].
-fn read_scan_bound(params: &[u8]) -> Option<ScanBound> {
-    let mut r = Reader::new(params, PARAMS_CTX);
-    let idx_cols = crate::unpack_pk_cols(r.u64().ok()?).ok()?;
-    let desc = crate::range::read_range_descriptor(&mut r).ok()?;
-    r.expect_consumed().ok()?;
-    Some(ScanBound { idx_cols, desc })
+pub(crate) fn write_aggs(w: &mut Writer, aggs: &[AggDescriptor]) {
+    write_count(w, aggs.len(), "aggregate list");
+    for d in aggs {
+        w.u8(d.agg_op.as_wire()).u32(d.col_idx);
+    }
+}
+
+pub(crate) fn read_aggs(r: &mut Reader) -> Result<Vec<AggDescriptor>, String> {
+    let n = read_count(r, "aggregate list")?;
+    let mut aggs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let func_byte = r.u8()?;
+        let agg_op = AggFunc::from_wire(func_byte).ok_or_else(|| format!("unknown agg func id {func_byte}"))?;
+        aggs.push(AggDescriptor { agg_op, col_idx: r.u32()? });
+    }
+    Ok(aggs)
+}
+
+/// The declared payload slots, then the program. Taken as parts rather than as a
+/// `&ComputeMap` because the `ReadSpec` fold spells "no pre-map" as an empty
+/// program and holds no struct to borrow.
+pub(crate) fn write_compute_map(w: &mut Writer, out_cols: &[(u8, bool)], program: &[u8]) {
+    write_count(w, out_cols.len(), "compute map");
+    for &(tc, nullable) in out_cols {
+        w.u8(tc).u8(nullable as u8);
+    }
+    w.bytes32(program);
+}
+
+pub(crate) fn read_compute_map(r: &mut Reader) -> Result<ComputeMap, String> {
+    let n = read_count(r, "compute map")?;
+    let mut out_cols = Vec::with_capacity(n);
+    for _ in 0..n {
+        // These become schema columns verbatim (`is_valid_type_code`).
+        let tc = r.u8()?;
+        if !crate::is_valid_type_code(tc) {
+            return Err(format!("compute map output column type code {tc} is invalid"));
+        }
+        let nullable = r.u8()?;
+        if nullable > 1 {
+            return Err(format!("compute map output column nullable flag is {nullable}"));
+        }
+        out_cols.push((tc, nullable == 1));
+    }
+    Ok(ComputeMap { program: r.bytes32()?.to_vec(), out_cols })
 }
 
 /// Encode a typed `OpNode` into its `CircuitNodes` row fields — the inverse of
 /// [`decode_op_node`]. The expression blob is carried opaquely (each crate
 /// encodes it with its own encoder before building the `OpNode`).
-pub fn encode_op_node(op: OpNode) -> (Opcode, Option<TableId>, Option<Vec<u8>>) {
+pub fn encode_op_node(op: OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
     let mut w = Writer::with_capacity(32);
     match op {
         // An unbounded `ScanDelta` carries no params at all: the common shape
         // costs nothing, and "absent" and "empty" stay distinguishable.
         OpNode::ScanDelta { source, bound: None } => (Opcode::ScanDelta, Some(source), None),
         OpNode::ScanDelta { source, bound: Some(b) } => {
-            w.u64(crate::pack_pk_cols(b.idx_cols.as_slice())).raw(&b.desc.encode());
+            crate::range::write_index_bound(&mut w, &b);
             (Opcode::ScanDelta, Some(source), Some(w.into_vec()))
         }
-        OpNode::Filter(None) => (Opcode::Filter, None, None),
-        OpNode::Filter(Some(program)) => {
+        OpNode::Filter(program) => {
             w.bytes32(&program);
             (Opcode::Filter, None, Some(w.into_vec()))
         }
@@ -591,15 +596,11 @@ pub fn encode_op_node(op: OpNode) -> (Opcode, Option<TableId>, Option<Vec<u8>>) 
             (Opcode::MapProj, None, Some(w.into_vec()))
         }
         OpNode::Map(MapKind::Compute(map)) => {
-            w.u16(map.out_cols.len() as u16);
-            for (tc, nullable) in map.out_cols {
-                w.u8(tc).u8(nullable as u8);
-            }
-            w.bytes32(&map.program);
+            write_compute_map(&mut w, &map.out_cols, &map.program);
             (Opcode::MapExpr, None, Some(w.into_vec()))
         }
         OpNode::Map(MapKind::Reindex { keep, key, role }) => {
-            w.u8(role.as_wire() as u8);
+            w.u8(role.as_wire());
             write_cols_with_tcs(&mut w, &key);
             write_cols(&mut w, &keep);
             (Opcode::MapReindex, None, Some(w.into_vec()))
@@ -613,33 +614,26 @@ pub fn encode_op_node(op: OpNode) -> (Opcode, Option<TableId>, Option<Vec<u8>>) 
         OpNode::Union => (Opcode::Union, None, None),
         OpNode::Distinct => (Opcode::Distinct, None, None),
         OpNode::PositivePart => (Opcode::PositivePart, None, None),
-        OpNode::Reduce { group_cols, agg, global_ground, out_key } => {
-            w.u8(out_key.as_wire() as u8).u8(global_ground as u8);
+        OpNode::Reduce { group_cols, agg, global_ground } => {
+            w.u8(global_ground as u8);
             write_cols(&mut w, &group_cols);
-            w.u16(agg.len() as u16);
-            for d in agg {
-                w.u8(d.agg_op.as_wire() as u8).u32(d.col_idx);
-            }
+            write_aggs(&mut w, &agg);
             (Opcode::Reduce, None, Some(w.into_vec()))
         }
-        OpNode::Join(kind) => {
-            match kind {
-                JoinKind::DeltaTrace => w.u8(JoinKindTag::Equi.as_wire()),
-                JoinKind::DeltaTraceRange { n_eq, rel } => {
-                    w.u8(JoinKindTag::Range.as_wire()).u8(n_eq).u8(rel.as_wire() as u8)
-                }
-                JoinKind::DeltaTraceCross => w.u8(JoinKindTag::Cross.as_wire()),
-            };
-            (Opcode::Join, None, Some(w.into_vec()))
+        OpNode::Join(JoinKind::Equi) => (Opcode::JoinEqui, None, None),
+        OpNode::Join(JoinKind::Range { n_eq, rel }) => {
+            w.u8(n_eq).u8(rel.as_wire());
+            (Opcode::JoinRange, None, Some(w.into_vec()))
         }
-        OpNode::IntegrateSink => (Opcode::Integrate, None, None),
+        OpNode::Join(JoinKind::Cross) => (Opcode::JoinCross, None, None),
+        OpNode::IntegrateSink => (Opcode::IntegrateSink, None, None),
         OpNode::IntegrateTrace => (Opcode::IntegrateTrace, None, None),
         OpNode::ExchangeShard { shard_cols } => {
             write_cols(&mut w, &shard_cols);
             (Opcode::ExchangeShard, None, Some(w.into_vec()))
         }
         OpNode::NullExtend { type_codes } => {
-            w.u16(type_codes.len() as u16);
+            write_count(&mut w, type_codes.len(), "NULL_EXTEND");
             for tc in type_codes {
                 w.u8(tc);
             }
@@ -650,70 +644,55 @@ pub fn encode_op_node(op: OpNode) -> (Opcode, Option<TableId>, Option<Vec<u8>>) 
 }
 
 /// Reconstruct an `OpNode` from one `CircuitNodes` row. `params` is the blob
-/// cell as stored, so `None` (no parameters) and `Some(&[])` (a damaged cell,
-/// which every layout rejects) stay distinct. An expression program is copied
-/// out undecoded — callers do that on their side of the crate boundary.
-pub fn decode_op_node(opcode: u64, src_tab: Option<TableId>, params: Option<&[u8]>) -> Result<OpNode, String> {
+/// cell as stored: `None` is "this opcode carries no parameters", and a present
+/// but empty cell is damaged — no layout here encodes to zero bytes.
+pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) -> Result<OpNode, String> {
     let op = Opcode::from_wire(opcode).ok_or_else(|| format!("unknown opcode {opcode}"))?;
+    if params.is_some_and(<[u8]>::is_empty) {
+        return Err(format!("{op:?} carries an empty parameter cell"));
+    }
     // One reader for every layout. A parameterless opcode reads nothing from it,
     // so a blob it should not carry falls out of `expect_consumed` below.
     let mut r = Reader::new(params.unwrap_or(&[]), PARAMS_CTX);
     let node = match op {
-        // Returns early: a bound degrades where every other layout rejects, and
-        // `read_scan_bound` runs its own reader to the end.
-        Opcode::ScanDelta => {
-            return Ok(OpNode::ScanDelta {
-                source: src_tab.ok_or_else(|| "SCAN_DELTA missing source_table".to_string())?,
-                bound: params.and_then(read_scan_bound),
-            })
-        }
-        Opcode::Filter => OpNode::Filter(match params {
-            Some(_) => Some(r.bytes32()?.to_vec()),
-            None => None,
-        }),
+        Opcode::ScanDelta => OpNode::ScanDelta {
+            source: src_tab.ok_or_else(|| "SCAN_DELTA missing source_table".to_string())?,
+            bound: params.map(|_| crate::range::read_index_bound(&mut r)).transpose()?,
+        },
+        Opcode::Filter => OpNode::Filter(r.bytes32()?.to_vec()),
         Opcode::MapProj => OpNode::Map(MapKind::Projection(read_cols(&mut r)?)),
-        Opcode::MapExpr => {
-            let n = r.u16()? as usize;
-            let mut out_cols = Vec::with_capacity(n);
-            for _ in 0..n {
-                // These become schema columns verbatim (`is_valid_type_code`).
-                let tc = r.u8()?;
-                if !crate::is_valid_type_code(tc) {
-                    return Err(format!("MAP_EXPR output column type code {tc} is invalid"));
-                }
-                out_cols.push((tc, r.u8()? != 0));
-            }
-            OpNode::Map(MapKind::Compute(ComputeMap {
-                program: r.bytes32()?.to_vec(),
-                out_cols,
-            }))
-        }
+        Opcode::MapExpr => OpNode::Map(MapKind::Compute(read_compute_map(&mut r)?)),
         Opcode::MapReindex => {
             // The role decides which worker a row lands on, so an unknown value is
             // a refusal — unlike a `ScanDelta` bound, which only decides scan speed.
             let role_byte = r.u8()?;
-            let role = ReindexRole::from_wire(role_byte as u64)
+            let role = ReindexRole::from_wire(role_byte)
                 .ok_or_else(|| format!("MAP_REINDEX unknown route-key role {role_byte}"))?;
-            // Reject a non-zero target that is not PK-eligible: the reindex
-            // targets flow into the 16-byte-capable OPK promoter
-            // (`encode_pk_column_promoted`), so its trust boundary admits exactly
-            // that domain.
-            let key = read_cols_with_tcs(&mut r, crate::is_pk_eligible, |tc| {
-                format!("MAP_REINDEX target type code {tc} is not PK-eligible")
-            })?;
+            let key = read_cols_with_tcs(&mut r)?;
             if key.is_empty() {
                 return Err("MAP_REINDEX names no key columns".to_string());
+            }
+            // The only target-domain screen on the master relay path, which
+            // passes a carried target straight through `resolve_reindex_type`.
+            // The compiler's `key_promotion_invalid` is stricter, but sees only
+            // the plans it compiles.
+            for (_, tc) in key.iter().filter_map(|&(c, tc)| tc.map(|t| (c, t))) {
+                if !crate::is_pk_eligible(tc as u8) {
+                    return Err(format!("MAP_REINDEX target type code {} is not PK-eligible", tc as u8));
+                }
             }
             OpNode::Map(MapKind::Reindex { keep: read_cols(&mut r)?, key, role })
         }
         Opcode::MapHashRow => {
             let branch_id = r.u8()?;
-            // The promotion domain is a ≤8-byte fixed-width integer — stricter
-            // than the reindex's `is_pk_eligible`, which also admits the 16-byte
-            // U128/UUID/I128 that the payload widen in `copy_column` cannot hold.
-            let cols = read_cols_with_tcs(&mut r, crate::is_fixed_int, |tc| {
-                format!("MAP_HASH_ROW target type code {tc} is not a fixed-width integer")
-            })?;
+            // No target-domain gate here: `emit_map` is the only reader of these
+            // slots and applies `is_widening_promotion`, which is stricter.
+            let cols = read_cols_with_tcs(&mut r)?;
+            // An empty list hashes no bytes, collapsing every row onto one PK —
+            // the same self-consistency refusal `MAP_REINDEX` gets above.
+            if cols.is_empty() {
+                return Err("MAP_HASH_ROW names no columns".to_string());
+            }
             OpNode::Map(MapKind::HashRow { cols, branch_id })
         }
         Opcode::Negate => OpNode::Negate,
@@ -721,19 +700,9 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<TableId>, params: Option<&[u8
         Opcode::Distinct => OpNode::Distinct,
         Opcode::PositivePart => OpNode::PositivePart,
         Opcode::Reduce => {
-            let out_key_byte = r.u8()?;
-            let out_key = ReduceOutKey::from_wire(out_key_byte as u64)
-                .ok_or_else(|| format!("REDUCE unknown out_key kind {out_key_byte}"))?;
             let global_ground = r.u8()? != 0;
             let group_cols = read_cols(&mut r)?;
-            let n_agg = r.u16()? as usize;
-            let mut agg = Vec::with_capacity(n_agg);
-            for _ in 0..n_agg {
-                let func_byte = r.u8()?;
-                let agg_op =
-                    AggFunc::from_wire(func_byte as u64).ok_or_else(|| format!("unknown agg func id {func_byte}"))?;
-                agg.push(AggDescriptor { agg_op, col_idx: r.u32()? });
-            }
+            let agg = read_aggs(&mut r)?;
             if agg.is_empty() {
                 return Err("REDUCE node carries no aggregate spec".to_string());
             }
@@ -744,28 +713,21 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<TableId>, params: Option<&[u8
             if global_ground && !group_cols.is_empty() {
                 return Err("REDUCE is global-ground over a non-empty group set".to_string());
             }
-            OpNode::Reduce { group_cols, agg, global_ground, out_key }
+            OpNode::Reduce { group_cols, agg, global_ground }
         }
-        Opcode::Join => {
-            let tag_byte = r.u8()?;
-            let tag = JoinKindTag::from_wire(tag_byte).ok_or_else(|| format!("JOIN unknown kind {tag_byte}"))?;
-            OpNode::Join(match tag {
-                JoinKindTag::Equi => JoinKind::DeltaTrace,
-                JoinKindTag::Range => {
-                    let n_eq = r.u8()?;
-                    let rel_byte = r.u8()?;
-                    let rel =
-                        RangeRel::from_wire(rel_byte as u64).ok_or_else(|| format!("JOIN unknown rel {rel_byte}"))?;
-                    JoinKind::DeltaTraceRange { n_eq, rel }
-                }
-                JoinKindTag::Cross => JoinKind::DeltaTraceCross,
-            })
+        Opcode::JoinEqui => OpNode::Join(JoinKind::Equi),
+        Opcode::JoinRange => {
+            let n_eq = r.u8()?;
+            let rel_byte = r.u8()?;
+            let rel = RangeRel::from_wire(rel_byte).ok_or_else(|| format!("JOIN unknown rel {rel_byte}"))?;
+            OpNode::Join(JoinKind::Range { n_eq, rel })
         }
-        Opcode::Integrate => OpNode::IntegrateSink,
+        Opcode::JoinCross => OpNode::Join(JoinKind::Cross),
+        Opcode::IntegrateSink => OpNode::IntegrateSink,
         Opcode::IntegrateTrace => OpNode::IntegrateTrace,
         Opcode::ExchangeShard => OpNode::ExchangeShard { shard_cols: read_cols(&mut r)? },
         Opcode::NullExtend => {
-            let n = r.u16()? as usize;
+            let n = read_count(&mut r, "NULL_EXTEND")?;
             let mut type_codes = Vec::with_capacity(n);
             for _ in 0..n {
                 // These become schema columns verbatim (`is_valid_type_code`).

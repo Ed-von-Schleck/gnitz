@@ -6,14 +6,14 @@
 
 use super::*;
 use gnitz_store::storage::SourceCursor;
-use gnitz_wire::{Cut, PkColList, RangeDescriptor, ScanBound};
+use gnitz_wire::{Cut, IndexBound, PkColList, RangeDescriptor};
 
 const NBASE: u64 = 200;
 
 /// `ScanDelta(base, bound?) → Integrate` for `vid`: the shared identity-circuit
 /// writer over the scan node's `params` blob, built by the same encoder the
 /// planner ships through.
-fn write_bounded_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, bound: Option<ScanBound>) {
+fn write_bounded_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, bound: Option<IndexBound>) {
     let (_, _, params) = gnitz_wire::encode_op_node(gnitz_wire::OpNode::ScanDelta { source: base_tid as u64, bound });
     write_identity_circuit(engine, vid, base_tid, params.as_deref());
 }
@@ -21,7 +21,7 @@ fn write_bounded_identity_circuit(engine: &mut CatalogEngine, vid: i64, base_tid
 /// A `(id U64 PK | val I64)` base of `NBASE` rows with `val = val_of(id)`,
 /// indexed on `val`, plus a registered identity view carrying `bound`. Returns
 /// `(engine, base tid, view id)`.
-fn fixture_with(name: &str, bound: Option<ScanBound>, val_of: impl Fn(u64) -> u64) -> (CatalogEngine, i64, i64) {
+fn fixture_with(name: &str, bound: Option<IndexBound>, val_of: impl Fn(u64) -> u64) -> (CatalogEngine, i64, i64) {
     let dir = temp_dir(name);
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
@@ -46,7 +46,7 @@ fn fixture_with(name: &str, bound: Option<ScanBound>, val_of: impl Fn(u64) -> u6
 }
 
 /// [`fixture_with`] at `val = id * 10` — correlated, the default shape.
-fn fixture(name: &str, bound: Option<ScanBound>) -> (CatalogEngine, i64, i64) {
+fn fixture(name: &str, bound: Option<IndexBound>) -> (CatalogEngine, i64, i64) {
     fixture_with(name, bound, |i| i * 10)
 }
 
@@ -57,13 +57,13 @@ fn fixture(name: &str, bound: Option<ScanBound>) -> (CatalogEngine, i64, i64) {
 /// cursor, and the next chunk's first probe is a lower id — a backward re-seek
 /// from an invalid cursor, which `val = id * 10` (strictly monotone in the PK)
 /// can never produce.
-fn anticorrelated_fixture(name: &str, bound: Option<ScanBound>) -> (CatalogEngine, i64, i64) {
+fn anticorrelated_fixture(name: &str, bound: Option<IndexBound>) -> (CatalogEngine, i64, i64) {
     fixture_with(name, bound, |i| (NBASE - i) * 10)
 }
 
 /// A bound on index column 1 (`val`) over the half-open cut interval.
-fn val_bound(start: Cut, end: Cut) -> ScanBound {
-    ScanBound {
+fn val_bound(start: Cut, end: Cut) -> IndexBound {
+    IndexBound {
         idx_cols: PkColList::from_slice(&[1]),
         desc: RangeDescriptor::new(&[], start, end),
     }

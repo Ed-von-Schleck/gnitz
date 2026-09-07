@@ -56,7 +56,7 @@ fn test_scatter_key_packed_matches_legacy_routing() {
     const NW: usize = 4;
     fn packed(schema: &SchemaDescriptor, cols: &[u32], mb: &MemBatch, row: usize) -> usize {
         let key: Vec<gnitz_wire::ReindexSlot> = cols.iter().map(|&c| (c, None)).collect();
-        let mut sk = ScatterKey::new(ScatterSpec::JoinKey(&key), schema, NW);
+        let mut sk = ScatterKey::new(ScatterSpec::JoinKey(&key), schema, NW).expect("the fixture key routes");
         assert!(!sk.is_pk_routed(), "test key shapes must take the packed route");
         sk.worker(mb, row)
     }
@@ -169,4 +169,30 @@ fn test_scatter_key_packed_matches_legacy_routing() {
             assert_eq!(packed(&schema, &[col], &mb, 0), legacy, "compound-PK sub-col {col}");
         }
     }
+}
+
+/// The route arrives off a client-pushed circuit row, so every shape the schema
+/// cannot route is refused rather than panicking inside `locate` or the packer.
+#[test]
+fn scatter_key_refuses_a_key_this_schema_cannot_route() {
+    let schema = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::F64, 1),
+        ],
+        &[0],
+    );
+    let nw = 4;
+    assert!(
+        ScatterKey::new(ScatterSpec::GroupKey(&[7]), &schema, nw).is_none(),
+        "a group key naming a column the schema has not got"
+    );
+    assert!(
+        ScatterKey::new(ScatterSpec::JoinKey(&[(7, None)]), &schema, nw).is_none(),
+        "a reindex key naming a column the schema has not got"
+    );
+    assert!(
+        ScatterKey::new(ScatterSpec::JoinKey(&[(1, None)]), &schema, nw).is_none(),
+        "a reindex key over a float column, which no OPK packs"
+    );
 }

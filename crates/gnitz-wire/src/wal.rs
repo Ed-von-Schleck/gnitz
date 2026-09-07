@@ -42,11 +42,12 @@ pub const fn num_regions(num_payload_cols: usize) -> usize {
 }
 
 pub const WAL_HEADER_SIZE: usize = 32;
-/// WAL/SAL block format version, and the client↔server HELLO version. Bump on a
-/// block-layout change or a system-family column-shape change: a SAL frame
-/// carries its own schema block and replay decodes against that, so nothing but
-/// this word rejects a stale frame — or an old client's catalog writes.
-pub const WAL_FORMAT_VERSION: u32 = 13;
+/// WAL/SAL block format version, and the client↔server HELLO version. Bumped by
+/// hand on a block-layout change, and on a system-family shape change — which
+/// this module's digest pin enforces. A SAL frame carries its own schema block
+/// and replay decodes against that, so nothing but this word rejects a stale
+/// frame, or an old client's catalog writes.
+pub const WAL_FORMAT_VERSION: u32 = 14;
 
 pub const WAL_OFF_TID: usize = 0;
 pub const WAL_OFF_COUNT: usize = 4;

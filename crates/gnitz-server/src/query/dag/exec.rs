@@ -67,7 +67,12 @@ impl DagEngine {
         // Routing comes off the one memoized `ViewMeta` the master relay also
         // reads; the plan supplies only its executable shape. Taken before the
         // plan borrow, so the memo lookup and the cache read do not overlap.
-        let meta = (!registry.relation_is_replicated(view_id)).then(|| self.view_meta(registry, view_id));
+        let meta = match registry.relation_is_replicated(view_id) {
+            true => None,
+            false => Some(self.view_meta(registry, view_id).ok_or_else(|| {
+                format!("view {view_id}: circuit unreadable or unroutable; its delta has no scatter key")
+            })?),
+        };
         let input = match meta.as_ref().is_some_and(|m| m.scatters(src_id)) {
             true => exchange.do_exchange(view_id, &input, src_id),
             false => input,

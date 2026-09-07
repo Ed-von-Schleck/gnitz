@@ -52,9 +52,9 @@ impl Node {
 
     fn matches(self, op: &OpNode) -> bool {
         match self {
-            EquiJoin => matches!(op, OpNode::Join(JoinKind::DeltaTrace)),
-            RangeJoin => matches!(op, OpNode::Join(JoinKind::DeltaTraceRange { .. })),
-            CrossJoin => matches!(op, OpNode::Join(JoinKind::DeltaTraceCross)),
+            EquiJoin => matches!(op, OpNode::Join(JoinKind::Equi)),
+            RangeJoin => matches!(op, OpNode::Join(JoinKind::Range { .. })),
+            CrossJoin => matches!(op, OpNode::Join(JoinKind::Cross)),
             Reduce => matches!(op, OpNode::Reduce { .. }),
             GlobalGround => matches!(op, OpNode::Reduce { global_ground: true, .. }),
             Distinct => matches!(op, OpNode::Distinct),

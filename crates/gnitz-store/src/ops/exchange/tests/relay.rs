@@ -17,6 +17,7 @@ fn scatter_by_group_key(
     num_workers: usize,
 ) -> Vec<Batch> {
     op_relay_scatter_consolidated(sources, ScatterSpec::GroupKey(col_indices), schema, num_workers)
+        .expect("the fixture key routes")
 }
 
 fn total_rows(batches: &[Batch]) -> usize {
@@ -282,7 +283,8 @@ fn test_repartition_batch_pk_routing() {
         b.count += 1;
     }
 
-    let sub_batches = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[0u32]), &schema, num_workers);
+    let sub_batches = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[0u32]), &schema, num_workers)
+        .expect("the fixture key routes");
     assert_eq!(total_rows(&sub_batches), pk_vals.len());
 
     for &pk in pk_vals {
@@ -314,7 +316,8 @@ fn test_repartition_batch_u128_pk() {
         b.count += 1;
     }
 
-    let sub_batches = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[0u32]), &schema, num_workers);
+    let sub_batches = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[0u32]), &schema, num_workers)
+        .expect("the fixture key routes");
     assert_eq!(total_rows(&sub_batches), n);
 
     for &pk in pks {
@@ -340,7 +343,8 @@ fn test_repartition_batch_group_col() {
         b.count += 1;
     }
 
-    let sub_batches = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[1u32]), &schema, num_workers);
+    let sub_batches = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[1u32]), &schema, num_workers)
+        .expect("the fixture key routes");
     assert_eq!(total_rows(&sub_batches), 4);
     let non_empty = sub_batches.iter().filter(|sb| sb.count > 0).count();
     assert_eq!(non_empty, 1, "all rows with same group key must go to one worker");
@@ -353,7 +357,8 @@ fn test_repartition_batch_string_col() {
 
     // Short string "hello" (≤ 12 bytes): two rows must go to same worker
     let b = make_batch_bytes(&schema, &[(1, 1, b"hello"), (2, 1, b"hello"), (3, 1, b"world")]);
-    let sub_batches = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[1u32]), &schema, num_workers);
+    let sub_batches = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[1u32]), &schema, num_workers)
+        .expect("the fixture key routes");
     assert_eq!(total_rows(&sub_batches), 3);
 
     let mut worker_of_1 = None;
@@ -371,7 +376,8 @@ fn test_repartition_batch_string_col() {
     // Long string (> 12 bytes): two rows must go to same worker
     let long_str: &[u8] = b"this is a longer string for heap";
     let b2 = make_batch_bytes(&schema, &[(10, 1, long_str), (11, 1, long_str)]);
-    let sub2 = op_repartition_batches(&[Some(&b2)], ScatterSpec::GroupKey(&[1u32]), &schema, num_workers);
+    let sub2 = op_repartition_batches(&[Some(&b2)], ScatterSpec::GroupKey(&[1u32]), &schema, num_workers)
+        .expect("the fixture key routes");
     assert_eq!(total_rows(&sub2), 2);
 
     let mut worker_of_10 = None;
@@ -394,7 +400,8 @@ fn test_repartition_batch_pk_routing_propagates_flags() {
     assert!(b.is_consolidated());
 
     // PK routing (col 0 == pk_indices()): single source ⇒ the claim propagates.
-    let pk_routed = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[0u32]), &schema, 4);
+    let pk_routed = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[0u32]), &schema, 4)
+        .expect("the fixture key routes");
     for sb in pk_routed.iter().filter(|s| s.count > 0) {
         assert_eq!(
             sb.layout(),
@@ -404,7 +411,8 @@ fn test_repartition_batch_pk_routing_propagates_flags() {
     }
 
     // Non-PK routing (col 1): hash distribution destroys PK order ⇒ no flags.
-    let hash_routed = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[1u32]), &schema, 4);
+    let hash_routed = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[1u32]), &schema, 4)
+        .expect("the fixture key routes");
     for sb in hash_routed.iter().filter(|s| s.count > 0) {
         assert_eq!(sb.layout(), Layout::Raw, "non-PK-routed sub-batch must claim nothing");
     }
@@ -416,7 +424,8 @@ fn test_repartition_batches_pk_routing_single_vs_multi_source() {
     // Single contributing source, PK routing: propagate both flags.
     let b0 = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
     let single: Vec<Option<&Batch>> = vec![Some(&b0)];
-    let out = op_repartition_batches(&single, ScatterSpec::GroupKey(&[0u32]), &schema, 4);
+    let out =
+        op_repartition_batches(&single, ScatterSpec::GroupKey(&[0u32]), &schema, 4).expect("the fixture key routes");
     for sb in out.iter().filter(|s| s.count > 0) {
         assert_eq!(
             sb.layout(),
@@ -429,7 +438,8 @@ fn test_repartition_batches_pk_routing_single_vs_multi_source() {
     // not globally sorted, so nothing propagates.
     let b1 = make_batch(&schema, &[(4, 1, 40), (5, 1, 50), (6, 1, 60)]);
     let multi: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
-    let out = op_repartition_batches(&multi, ScatterSpec::GroupKey(&[0u32]), &schema, 4);
+    let out =
+        op_repartition_batches(&multi, ScatterSpec::GroupKey(&[0u32]), &schema, 4).expect("the fixture key routes");
     for sb in out.iter().filter(|s| s.count > 0) {
         assert_eq!(sb.layout(), Layout::Raw, "multi-source scatter must claim nothing");
     }
@@ -508,7 +518,8 @@ fn test_relay_scatter_fallback_path() {
     let b1 = make_batch(&schema, &[(2, 1, 20)]);
 
     let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
-    let result = op_repartition_batches(&sources, ScatterSpec::GroupKey(&[0u32]), &schema, num_workers);
+    let result = op_repartition_batches(&sources, ScatterSpec::GroupKey(&[0u32]), &schema, num_workers)
+        .expect("the fixture key routes");
 
     assert_eq!(total_rows(&result), 2);
     for sb in &result {
@@ -524,7 +535,8 @@ fn test_repartition_row_count() {
     let rows: Vec<(u64, i64, i64)> = (1u64..=100).map(|i| (i, 1, i as i64 * 10)).collect();
     let b = make_batch(&schema, &rows);
 
-    let sub_batches = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[0u32]), &schema, 4);
+    let sub_batches = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[0u32]), &schema, 4)
+        .expect("the fixture key routes");
     assert_eq!(total_rows(&sub_batches), 100, "total rows must equal input count");
 }
 
@@ -544,7 +556,8 @@ fn test_repartition_routing_contract() {
         b.count += 1;
     }
 
-    let sub_batches = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[1u32]), &schema, num_workers);
+    let sub_batches = op_repartition_batches(&[Some(&b)], ScatterSpec::GroupKey(&[1u32]), &schema, num_workers)
+        .expect("the fixture key routes");
     assert_eq!(total_rows(&sub_batches), vals.len());
 
     for &v in &vals {
@@ -648,7 +661,8 @@ fn test_op_repartition_batches_compound_pk_routes_by_bytes() {
     );
     let sources: Vec<Option<&Batch>> = vec![Some(&b0), Some(&b1)];
     // col_indices = [0, 1] = the full PK set → compound-PK routing.
-    let sub_batches = op_repartition_batches(&sources, ScatterSpec::GroupKey(&[0u32, 1u32]), &schema, num_workers);
+    let sub_batches = op_repartition_batches(&sources, ScatterSpec::GroupKey(&[0u32, 1u32]), &schema, num_workers)
+        .expect("the fixture key routes");
     assert_eq!(total_rows(&sub_batches), 6);
     for (w, sb) in sub_batches.iter().enumerate() {
         for r in 0..sb.count {
@@ -748,11 +762,13 @@ fn test_compound_join_promote_scatter_copartitions_both_functions() {
 
     // (a) Non-consolidated path.
     let key: Vec<gnitz_wire::ReindexSlot> = cols.iter().map(|&c| (c, None)).collect();
-    let repart = op_repartition_batches(&[Some(&cb)], ScatterSpec::JoinKey(&key), &schema, num_workers);
+    let repart = op_repartition_batches(&[Some(&cb)], ScatterSpec::JoinKey(&key), &schema, num_workers)
+        .expect("the fixture key routes");
     check(&repart, "op_repartition_batches");
 
     // (b) Consolidated merge-walk path, single source → bulk-drain `route_group`.
-    let consol = op_relay_scatter_consolidated(&[Some(&cb)], ScatterSpec::JoinKey(&key), &schema, num_workers);
+    let consol = op_relay_scatter_consolidated(&[Some(&cb)], ScatterSpec::JoinKey(&key), &schema, num_workers)
+        .expect("the fixture key routes");
     check(&consol, "op_relay_scatter_consolidated");
 
     // (c) Consolidated merge-walk path, TWO sources → the K-way winner-select
@@ -767,7 +783,8 @@ fn test_compound_join_promote_scatter_copartitions_both_functions() {
         ScatterSpec::JoinKey(&key),
         &schema,
         num_workers,
-    );
+    )
+    .expect("the fixture key routes");
     check(
         &consol_multi,
         "op_relay_scatter_consolidated (2 sources, K-way route_group)",
@@ -831,9 +848,11 @@ fn test_single_key_promote_scatter_copartitions() {
             "{label}: equal promoted keys must co-locate"
         );
     };
-    let repart = op_repartition_batches(&[Some(&cb)], ScatterSpec::JoinKey(&key), &schema, num_workers);
+    let repart = op_repartition_batches(&[Some(&cb)], ScatterSpec::JoinKey(&key), &schema, num_workers)
+        .expect("the fixture key routes");
     check(&repart, "payload-key op_repartition_batches");
-    let consol = op_relay_scatter_consolidated(&[Some(&cb)], ScatterSpec::JoinKey(&key), &schema, num_workers);
+    let consol = op_relay_scatter_consolidated(&[Some(&cb)], ScatterSpec::JoinKey(&key), &schema, num_workers)
+        .expect("the fixture key routes");
     check(&consol, "payload-key op_relay_scatter_consolidated");
 
     // ---- (2) PK key: [I32 PK, U64 payload], reindex col0 → I64. The native
@@ -861,7 +880,8 @@ fn test_single_key_promote_scatter_copartitions() {
     let pk_cb = pb;
     let pk_key = [(0u32, Some(TypeCode::I64))];
     let pk_packer = ReindexPacker::new(&pk_schema, &pk_key).unwrap();
-    let pk_repart = op_repartition_batches(&[Some(&pk_cb)], ScatterSpec::JoinKey(&pk_key), &pk_schema, num_workers);
+    let pk_repart = op_repartition_batches(&[Some(&pk_cb)], ScatterSpec::JoinKey(&pk_key), &pk_schema, num_workers)
+        .expect("the fixture key routes");
     assert_eq!(total_rows(&pk_repart), pk_rows.len(), "PK-key: no dropped rows");
     for (w, sb) in pk_repart.iter().enumerate() {
         for r in 0..sb.count {
@@ -896,13 +916,15 @@ fn scatter_route_bench() {
     let sources = [Some(&cb)];
 
     // Warm up (and pin the invariant: the route must not drop rows).
-    let warm = op_relay_scatter_consolidated(&sources, ScatterSpec::JoinKey(&[(1, None)]), &schema, 4);
+    let warm = op_relay_scatter_consolidated(&sources, ScatterSpec::JoinKey(&[(1, None)]), &schema, 4)
+        .expect("the fixture key routes");
     assert_eq!(total_rows(&warm), N, "scatter dropped rows");
 
     let t = Instant::now();
     let mut acc = 0usize;
     for _ in 0..ITERS {
-        let out = op_relay_scatter_consolidated(&sources, ScatterSpec::JoinKey(&[(1, None)]), &schema, 4);
+        let out = op_relay_scatter_consolidated(&sources, ScatterSpec::JoinKey(&[(1, None)]), &schema, 4)
+            .expect("the fixture key routes");
         acc += black_box(total_rows(&out));
     }
     let secs = t.elapsed().as_secs_f64();
@@ -944,7 +966,8 @@ fn relay_scatter_merge_bench() {
 
         // Warm up, and pin the invariant the timing would otherwise hide: the
         // stripes are PK-disjoint, so nothing folds and no row is dropped.
-        let warm = op_relay_scatter_consolidated(&sources, ScatterSpec::GroupKey(&[0u32]), &schema, WORKERS);
+        let warm = op_relay_scatter_consolidated(&sources, ScatterSpec::GroupKey(&[0u32]), &schema, WORKERS)
+            .expect("the fixture key routes");
         assert_eq!(total_rows(&warm), per * k, "K={k}: scatter dropped rows");
 
         // Two timings: the scatter alone, and the scatter plus the
@@ -956,7 +979,8 @@ fn relay_scatter_merge_bench() {
             let t = Instant::now();
             let mut acc = 0usize;
             for _ in 0..ITERS {
-                let out = op_relay_scatter_consolidated(&sources, ScatterSpec::GroupKey(&[0u32]), &schema, WORKERS);
+                let out = op_relay_scatter_consolidated(&sources, ScatterSpec::GroupKey(&[0u32]), &schema, WORKERS)
+                    .expect("the fixture key routes");
                 acc += if consolidate {
                     black_box(
                         out.into_iter()

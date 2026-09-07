@@ -463,32 +463,22 @@ impl MasterDispatcher {
         // each.
         let num_workers = self.num_workers();
         let scatter = |spec: ScatterSpec<'_>| {
-            RelayDest::PerWorker(if sources.iter().flatten().all(|b| b.is_consolidated()) {
+            if sources.iter().flatten().all(|b| b.is_consolidated()) {
                 op_relay_scatter_consolidated(&sources, spec, &schema, num_workers)
             } else {
                 op_repartition_batches(&sources, spec, &schema, num_workers)
-            })
+            }
+            .map(RelayDest::PerWorker)
         };
 
         let (dag, registry) = cat.dag_and_registry_mut();
-        let meta = dag.view_meta(registry, view_id);
-        let route = meta.relay_route(source_id);
-        // The route's columns come off a client-pushable `CIRCUIT_NODES` row,
-        // bounded nowhere upstream, and `ScatterKey::new` would resolve them
-        // through `locate`'s release-active `assert!`. Every other reach to those
-        // constructors is bounded by the compiler's own `oob_cols` first.
-        let out_of_range = match &route {
-            RelayRoute::GroupKey(cols) => oob_cols(cols.iter().copied(), &schema),
-            RelayRoute::JoinKey(slots) => oob_cols(slots.iter().map(|&(c, _)| c), &schema),
-            RelayRoute::NoSingleKey | RelayRoute::Broadcast => false,
-        };
-        if out_of_range {
+        let Some(meta) = dag.view_meta(registry, view_id) else {
             return Err(format!(
-                "view {view_id}: source {source_id} relay key names a column outside the source's \
-                 {} columns",
-                schema.num_columns()
+                "view {view_id}: circuit unreadable or unroutable; source {source_id}'s delta has no \
+                 scatter key"
             ));
-        }
+        };
+        let route = meta.relay_route(source_id);
         let dest = match route {
             RelayRoute::NoSingleKey => {
                 return Err(format!(
@@ -496,9 +486,16 @@ impl MasterDispatcher {
                      scatter key co-partitions it"
                 ))
             }
-            RelayRoute::Broadcast => RelayDest::Broadcast(Box::new(op_relay_broadcast(&sources, &schema))),
+            RelayRoute::Broadcast => Some(RelayDest::Broadcast(Box::new(op_relay_broadcast(&sources, &schema)))),
             RelayRoute::GroupKey(cols) => scatter(ScatterSpec::GroupKey(cols)),
             RelayRoute::JoinKey(slots) => scatter(ScatterSpec::JoinKey(slots)),
+        };
+        let Some(dest) = dest else {
+            return Err(format!(
+                "view {view_id}: source {source_id} relay key does not route against the source's \
+                 {} columns",
+                schema.num_columns()
+            ));
         };
 
         // Encoded once and carried forward: `emit_relay_with_decision` runs the

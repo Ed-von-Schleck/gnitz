@@ -169,9 +169,7 @@ impl RelationRegistry {
             }
             // Only base tables own index circuits, so an index bound names a base
             // table, which never holds a skeleton row.
-            ReadBound::IndexRange { idx_cols, exact, desc } => {
-                return self.open_index_bound_cursor(source, *idx_cols, *exact, desc)
-            }
+            ReadBound::IndexRange { bound, exact } => return self.open_index_bound_cursor(source, bound, *exact),
             // `capacity` and `delta` are refused together, so a fed view never
             // holds a skeleton row either.
             ReadBound::Delta { after_tick } => return self.open_delta_cursor(source, *after_tick, cut_tick),
@@ -221,26 +219,19 @@ impl RelationRegistry {
     /// is gone (a full cursor would return rows nothing re-filters). Otherwise
     /// the conjuncts ride the predicate and the walk is an access optimization
     /// the selectivity gate may trade away.
-    ///
-    /// The column word is the client's, so it takes the same admission test every
-    /// other frame carrying one takes — on both walk kinds, since a column the
-    /// table has not got is a corrupt frame either way.
     fn open_index_bound_cursor(
         &self,
         source: i64,
-        idx_cols: u64,
+        bound: &gnitz_wire::IndexBound,
         exact: bool,
-        desc: &RangeDescriptor,
     ) -> Result<SourceCursor, StoreError> {
-        let cols = self.index_cols(source, idx_cols, "scan_spec")?;
-        // `exact`: the walk alone imposes the range. Otherwise the conjuncts ride
-        // the residual predicate and the walk may be traded away.
+        let cols = self.bound_cols_against(source, bound.idx_cols, "scan_spec")?;
         let walk = if exact {
             super::IndexWalk::Required
         } else {
             super::IndexWalk::Optional
         };
-        self.open_index_source(source, cols.as_slice(), desc, walk)
+        self.open_index_source(source, cols.as_slice(), &bound.desc, walk)
     }
 }
 

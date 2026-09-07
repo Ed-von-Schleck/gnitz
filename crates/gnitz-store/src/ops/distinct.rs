@@ -10,14 +10,11 @@ use super::cogroup::cogroup_left;
 // ---------------------------------------------------------------------------
 
 /// Shared body for the two weight-clamp operators. Per consolidated (PK, payload)
-/// emits `clamp(w_old + Δw, lo, hi) − clamp(w_old, lo, hi)`; the `(lo, hi)` preset
-/// selects the operator:
+/// emits `clamp(w_old + Δw, lo, hi) − clamp(w_old, lo, hi)` — the DBSP incremental
+/// form of a per-element weight clamp lifted to its delta. The `(lo, hi)` preset
+/// selects the operator; `gnitz_wire::OpNode::PositivePart` states both presets.
 ///
-/// * `(-1, 1)` → `distinct` (set membership — `clamp(w, -1, 1) == signum(w)`),
-/// * `(0, i64::MAX)` → `positive_part` (bag multiplicity, negative part only).
-///
-/// Both are the DBSP incremental form of a per-element weight clamp lifted to its
-/// delta. Returns `(output_batch, consolidated_delta)`; the consolidated delta is
+/// Returns `(output_batch, consolidated_delta)`; the consolidated delta is
 /// returned so the caller can feed it to `ingest_batch`.
 pub fn op_weight_clamp(
     delta: Batch,

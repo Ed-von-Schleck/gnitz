@@ -701,11 +701,22 @@ impl RelationRegistry {
     /// a word: the master applies it as an early client-facing reject, the worker
     /// as its trust boundary, and both render the same error.
     pub fn index_cols(&self, table_id: i64, packed: u64, op: &str) -> Result<PkColList, StoreError> {
-        let reject = || StoreError::rejected(format!("{op}: invalid column list for table {table_id}"));
-        let cols = gnitz_wire::unpack_pk_cols(packed).map_err(|_| reject())?;
+        let cols = gnitz_wire::unpack_pk_cols(packed)
+            .map_err(|_| StoreError::rejected(format!("{op}: invalid column list for table {table_id}")))?;
+        self.bound_cols_against(table_id, cols, op)
+    }
+
+    /// Admit an already-unpacked column list against `table_id`'s schema. The
+    /// client owns the list, and only the registry holds a schema to bound it
+    /// against, so every path taking one takes this test — [`Self::index_cols`]
+    /// for a frame carrying the packed word, this for one whose wire decoder
+    /// (`IndexBound`) already unpacked it.
+    pub fn bound_cols_against(&self, table_id: i64, cols: PkColList, op: &str) -> Result<PkColList, StoreError> {
         match self.entry(table_id) {
             Some(e) if cols.as_slice().iter().all(|&c| (c as usize) < e.schema.num_columns()) => Ok(cols),
-            _ => Err(reject()),
+            _ => Err(StoreError::rejected(format!(
+                "{op}: invalid column list for table {table_id}"
+            ))),
         }
     }
 

@@ -11,9 +11,7 @@ use super::prims::{multi_null_filter_prog, null_gate, rekey_aux_on_source_pk, se
 use super::JoinSide;
 use crate::error::GnitzSqlError;
 
-use gnitz_core::{
-    CircuitBuilder, ColumnDef, NodeId, RangeRel, ReduceOutKey, ReindexRole, ReindexSlot, Schema, TypeCode,
-};
+use gnitz_core::{CircuitBuilder, ColumnDef, NodeId, RangeRel, ReindexRole, ReindexSlot, Schema, TypeCode};
 use gnitz_wire::AggFunc as WireAggFunc;
 
 /// A join's equality pairs resolved against both inputs: each side's key-column
@@ -544,7 +542,7 @@ pub(crate) fn build_pure_range_threshold(
     let mbh = cb.map_hash_row(reindex_b, &[(0, None)], 0);
     // Empty group set (one global threshold over the broadcast other side) -> the
     // synthetic `_group_pk` fold, like every other empty-group reduce.
-    let red = cb.reduce_multi_local(mbh, &[], &[(agg_func, 1)], false, ReduceOutKey::SyntheticFold); // [_group_pk:U128, m:Tc]
+    let red = cb.reduce_multi_local(mbh, &[], &[(agg_func, 1)], false); // [_group_pk:U128, m:Tc]
     let reindex_m = cb.map_reindex(red, &self_derived_key(&[1]), &[], ReindexRole::Auxiliary);
     let trace_m = cb.integrate_trace(reindex_m);
 
@@ -620,7 +618,7 @@ fn union_null_key_rows(
     left: &JoinSide,
 ) -> Result<NodeId, GnitzSqlError> {
     let schema = &left.seg.schema;
-    let anull = cb.filter(source, Some(multi_null_filter_prog(cols, &schema.columns, true)?));
+    let anull = cb.filter(source, multi_null_filter_prog(cols, &schema.columns, true)?);
     let anull_keyed = rekey_aux_on_source_pk(cb, anull, schema, &left.keep);
     let anull_owned = cb.worker_filter(anull_keyed);
     Ok(cb.union(nf_match, anull_owned))

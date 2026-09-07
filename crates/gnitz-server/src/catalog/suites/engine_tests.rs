@@ -664,7 +664,7 @@ fn test_dep_map_is_the_scan_delta_nodes() {
             (gnitz_wire::Opcode::ScanDelta, Some(200), None),
             (gnitz_wire::Opcode::ScanDelta, Some(100), None),
             (gnitz_wire::Opcode::ScanDelta, Some(0), None),
-            (gnitz_wire::Opcode::Integrate, Some(300), None),
+            (gnitz_wire::Opcode::IntegrateSink, Some(300), None),
         ],
     );
 

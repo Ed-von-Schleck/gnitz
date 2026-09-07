@@ -7,6 +7,7 @@ from collections import Counter
 
 import pytest
 import gnitz
+from gnitz import Opcode
 import _oracle as oracle
 from _uid import uid as _uid
 
@@ -3308,12 +3309,12 @@ class TestGlobalAggregate:
 
     @staticmethod
     def _count_reduce_nodes(client, vid):
-        """REDUCE (opcode 9) circuit nodes for view `vid`: 2 for the two-phase
-        shape (reduce_local + reduce_combine), 1 for the single funnel reduce."""
-        OPCODE_REDUCE, CIRCUIT_NODES_TAB = 9, 11
+        """REDUCE circuit nodes for view `vid`: 2 for the two-phase shape
+        (reduce_local + reduce_combine), 1 for the single funnel reduce."""
+        CIRCUIT_NODES_TAB = 11
         return sum(
             1 for r in client.scan(CIRCUIT_NODES_TAB)
-            if r["view_id"] == vid and r["opcode"] == OPCODE_REDUCE
+            if r["view_id"] == vid and r["opcode"] == Opcode.Reduce
         )
 
     def test_two_phase_all_linear_distributed(self, client):

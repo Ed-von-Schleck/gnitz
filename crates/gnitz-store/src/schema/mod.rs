@@ -670,10 +670,7 @@ impl SchemaDescriptor {
         self.payload_to_ci[pi] as usize
     }
 
-    /// The output-key kind a reduce grouped by `cols` over this schema warrants
-    /// — re-derived by the engine compiler only to *validate* the planner's
-    /// shipped [`ReduceOutKey`], through the same [`ReduceOutKey::for_group_cols`]
-    /// the planner decided with.
+    /// The output-key kind a reduce grouped by `cols` over this schema warrants.
     pub fn reduce_out_key(&self, cols: &[u32]) -> ReduceOutKey {
         ReduceOutKey::for_group_cols(self.pk_indices(), cols, |c| {
             let col = &self.columns[c as usize];

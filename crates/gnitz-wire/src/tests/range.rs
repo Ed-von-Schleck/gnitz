@@ -1,6 +1,14 @@
 use super::Cut::{After, Before};
 use super::*;
 
+/// `write_range_descriptor` into a standalone buffer — the descriptor is only
+/// ever spliced into a larger blob, so the tests build that buffer themselves.
+fn enc(d: &RangeDescriptor) -> Vec<u8> {
+    let mut w = crate::codec::Writer::with_capacity(RangeDescriptor::encoded_len(d.eq_vals().len()));
+    write_range_descriptor(&mut w, d);
+    w.into_vec()
+}
+
 #[test]
 fn roundtrips_every_shape() {
     let shapes: [(&[u128], Cut, Cut); 5] = [
@@ -12,11 +20,11 @@ fn roundtrips_every_shape() {
     ];
     for (eq, start, end) in shapes {
         let d = RangeDescriptor::new(eq, start, end);
-        let bytes = d.encode();
+        let bytes = enc(&d);
         assert_eq!(
             bytes.len(),
             RangeDescriptor::encoded_len(eq.len()),
-            "encode must write exactly what encoded_len promises"
+            "the writer must emit exactly what encoded_len promises"
         );
         assert_eq!(RangeDescriptor::decode(&bytes), Ok(d), "{eq:?} {start:?} {end:?}");
     }
@@ -31,15 +39,15 @@ fn decode_rejects_malformed() {
     assert!(RangeDescriptor::decode(&[]).is_err());
     assert!(RangeDescriptor::decode(&[0]).is_err());
     // n_eq with no slot left for the range column.
-    let mut d = RangeDescriptor::new(&[1, 2, 3], Before(0), Before(1)).encode();
+    let mut d = enc(&RangeDescriptor::new(&[1, 2, 3], Before(0), Before(1)));
     d[0] = PK_LIST_MAX_COLS as u8;
     assert!(RangeDescriptor::decode(&d).is_err());
     // Unknown flag bits.
-    let mut stray = RangeDescriptor::new(&[7], Before(1), After(2)).encode();
+    let mut stray = enc(&RangeDescriptor::new(&[7], Before(1), After(2)));
     stray[1] |= 1 << 4;
     assert!(RangeDescriptor::decode(&stray).is_err());
     // Length disagreeing with n_eq — both directions.
-    let good = RangeDescriptor::new(&[7], Before(1), After(2)).encode();
+    let good = enc(&RangeDescriptor::new(&[7], Before(1), After(2)));
     assert!(RangeDescriptor::decode(&good[..good.len() - 1]).is_err());
     let mut long = good.clone();
     long.push(0);

@@ -36,8 +36,8 @@ pub(in crate::query) enum HydrationSeed {
 ///
 /// The walk is over `loaded`, not the emitted instruction list, for the same
 /// reason the five sibling `CompileOutput` annotations are: the instruction
-/// stream elides nodes (`Filter(None)` aliases its input register, an identity
-/// `Map` vanishes, `ScanDelta` and `IntegrateSink` emit nothing) and drops
+/// stream elides nodes (an identity `Map` vanishes, `ScanDelta` and
+/// `IntegrateSink` emit nothing) and drops
 /// `WorkerFilter` at `num_workers <= 1`, so it is worker-count dependent. Split
 /// from [`derive_hydration`] because this half is the drift-prone one and needs
 /// nothing but the circuit, so its rejections are directly testable.
@@ -64,7 +64,7 @@ fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, CompileErro
     }
     let union = cur;
 
-    // 2. Both `Union` inputs must be `Join(DeltaTrace)`, optionally behind the
+    // 2. Both `Union` inputs must be `Join(Equi)`, optionally behind the
     //    per-branch `Map` that restores canonical `[A, B]` column order (an
     //    identity the emitter elides on one branch, a real permutation on the
     //    other — both are in the circuit either way).
@@ -73,7 +73,7 @@ fn hydration_nodes(loaded: &LoadedCircuit) -> Result<HydrationNodes, CompileErro
         if matches!(loaded.op(nid), OpNode::Map(_)) {
             nid = loaded.inputs(nid).unary();
         }
-        matches!(loaded.op(nid), OpNode::Join(JoinKind::DeltaTrace))
+        matches!(loaded.op(nid), OpNode::Join(JoinKind::Equi))
             .then_some(nid)
             .ok_or(CompileError::Rejected(
                 "bounded view: union input is not an inner delta/trace join",
@@ -120,9 +120,9 @@ enum HydrationNodes {
 /// Resolve those nodes against the plan the emitter just produced.
 ///
 /// Registers and offsets come from the emitter's own node-keyed maps, never from a
-/// node's index in `ordered`: the two agree only for a node that emitted —
-/// `Filter(None)` aliases its input's register, an identity `Map` vanishes, a
-/// skipped `Distinct` aliases, and `Reduce` redirects.
+/// node's index in `ordered`: the two agree only for a node that emitted — an
+/// identity `Map` vanishes, a `WorkerFilter` this worker cannot narrow aliases
+/// its input's register, and `Reduce` redirects.
 pub(super) fn derive_hydration(loaded: &LoadedCircuit, plan: &PlanBuildResult) -> Result<Hydration, CompileError> {
     let reg_of = |nid: i32| {
         plan.out_reg_of.get(&nid).copied().ok_or(CompileError::Rejected(

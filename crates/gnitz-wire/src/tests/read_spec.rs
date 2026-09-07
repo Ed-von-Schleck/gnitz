@@ -1,6 +1,7 @@
 use super::*;
 use crate::range::Cut::{After, Before};
 use crate::TypeCode;
+use crate::{AggFunc, MAX_COLUMNS};
 
 /// Encode through the production entry point; the struct is a decode-side
 /// shape, so nothing but tests ever holds one to re-encode.
@@ -32,16 +33,20 @@ fn roundtrips_every_bound_against_every_sink() {
         ReadBound::None,
         ReadBound::PkRange(RangeDescriptor::new(&[], After(10), After(u64::MAX as u128))),
         ReadBound::IndexRange {
-            idx_cols: 0x0000_0002_0000_0001,
+            bound: IndexBound {
+                idx_cols: crate::PkColList::from_slice(&[1, 2]),
+                desc: RangeDescriptor::new(&[7], Before(1), Before(u128::MAX)),
+            },
             exact: false,
-            desc: RangeDescriptor::new(&[7], Before(1), Before(u128::MAX)),
         },
         // The exact form: the client stripped the bounded conjuncts, so the
         // flag must survive the round trip or the walk becomes tradeable.
         ReadBound::IndexRange {
-            idx_cols: 0x0000_0000_0000_0003,
+            bound: IndexBound {
+                idx_cols: crate::PkColList::from_slice(&[3]),
+                desc: RangeDescriptor::point(&[], u128::MAX),
+            },
             exact: true,
-            desc: RangeDescriptor::point(&[], u128::MAX),
         },
         ReadBound::PkSet(vec![5, 10, 3, 99]),
         // The bootstrap sentinel and a saturated cursor, both of which the
@@ -180,7 +185,7 @@ fn each_decode_guard_rejects_its_own_forgery() {
     // The first byte naming no aggregate — not a literal, which the next
     // aggregate added to the enum would quietly turn into a valid opcode.
     let bad_agg = (0u8..=u8::MAX)
-        .find(|&b| AggFunc::from_wire(b as u64).is_none())
+        .find(|&b| AggFunc::from_wire(b).is_none())
         .expect("some byte names no aggregate");
 
     let pk_set_over_cap = {
@@ -206,9 +211,9 @@ fn each_decode_guard_rejects_its_own_forgery() {
     let bad_agg_op = {
         let mut bytes = fold_header();
         bytes.extend_from_slice(&0u16.to_le_bytes()); // n_group_cols = 0
-        bytes.push(1); // n_aggs = 1
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // n_aggs = 1
         bytes.push(bad_agg);
-        bytes.extend_from_slice(&0u16.to_le_bytes()); // src_col
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // src_col
         bytes
     };
     let group_cols_over_cap = {
@@ -219,7 +224,7 @@ fn each_decode_guard_rejects_its_own_forgery() {
     let aggs_over_cap = {
         let mut bytes = fold_header();
         bytes.extend_from_slice(&0u16.to_le_bytes()); // n_group_cols = 0
-        bytes.push((MAX_COLUMNS + 1) as u8);
+        bytes.extend_from_slice(&((MAX_COLUMNS + 1) as u16).to_le_bytes());
         bytes
     };
 
@@ -235,9 +240,13 @@ fn each_decode_guard_rejects_its_own_forgery() {
         ("PkSet cap", pk_set_over_cap, "PkSet count"),
         ("trailing bytes", trailing, "trailing"),
         ("oversized blob", vec![0u8; MAX_READ_SPEC_BYTES + 1], "exceeds cap"),
-        ("unknown aggregate", bad_agg_op, "unknown aggregate op"),
-        ("group col cap", group_cols_over_cap, "group cols exceeds cap"),
-        ("agg item cap", aggs_over_cap, "agg items exceeds cap"),
+        ("unknown aggregate", bad_agg_op, "unknown agg func id"),
+        (
+            "group col cap",
+            group_cols_over_cap,
+            "column list: 66 entries exceeds cap",
+        ),
+        ("agg item cap", aggs_over_cap, "aggregate list: 66 entries exceeds cap"),
     ];
     for (name, bytes, want) in cases {
         let err = ReadSpec::decode(bytes).expect_err(name);

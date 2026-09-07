@@ -36,6 +36,6 @@ pub use regions::ZSetBatchView;
 pub use transport::{hello_handshake, ClientTransport};
 pub use types::{
     native_le_key, native_packed_key, opk_key_cols, opk_key_packed, push_zero_cell, BatchAppender, ColumnDef, FixedInt,
-    FkTarget, PkBuf, PkColumn, ScalarKind, Schema, TypeCode, ZSetBatch, MAX_PK_BYTES, PK_LIST_MAX_COLS,
+    FkTarget, PkBuf, PkColumn, ReduceOutKey, ScalarKind, Schema, TypeCode, ZSetBatch, MAX_PK_BYTES, PK_LIST_MAX_COLS,
 };
 pub use wal_block::decode_wal_block;

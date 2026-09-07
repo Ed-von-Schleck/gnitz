@@ -3,7 +3,7 @@ use gnitz_wire::{JoinKind, MapKind, OpNode};
 
 /// The inner-equi-join shape `emit_equi_join_terms` produces, as node ids:
 /// two `ScanDelta`s, a reindex `Map` and an `IntegrateTrace` per side, the
-/// two cross-wired `Join(DeltaTrace)` terms behind their normalization maps,
+/// two cross-wired `Join(Equi)` terms behind their normalization maps,
 /// a `Union`, a residual `Filter`, a projection `Map`, and the sink.
 ///
 /// ```text
@@ -22,12 +22,12 @@ fn equi_join(mutate: impl FnOnce(&mut HashMap<i32, OpNode>, &mut Vec<(i32, i32, 
         (3, m()),
         (4, OpNode::IntegrateTrace),
         (5, OpNode::IntegrateTrace),
-        (6, OpNode::Join(JoinKind::DeltaTrace)),
-        (7, OpNode::Join(JoinKind::DeltaTrace)),
+        (6, OpNode::Join(JoinKind::Equi)),
+        (7, OpNode::Join(JoinKind::Equi)),
         (8, m()),
         (9, m()),
         (10, OpNode::Union),
-        (11, OpNode::Filter(None)),
+        (11, OpNode::Filter(dummy_expr_blob())),
         (12, m()),
         (13, OpNode::IntegrateSink),
     ]);
@@ -74,7 +74,7 @@ fn hydration_of_a_linear_circuit_names_its_source() {
     let lc = loaded_for_test(
         HashMap::from([
             (0, scan_delta(77)),
-            (1, OpNode::Filter(None)),
+            (1, OpNode::Filter(dummy_expr_blob())),
             (2, OpNode::Map(MapKind::Projection(vec![0]))),
             (3, OpNode::IntegrateSink),
         ]),
@@ -116,7 +116,6 @@ fn a_malformed_circuit_is_rejected_rather_than_guessed_at() {
                             col_idx: 0,
                         }],
                         global_ground: false,
-                        out_key: gnitz_store::schema::ReduceOutKey::SyntheticFold,
                     },
                 ),
                 (2, OpNode::IntegrateSink),
@@ -155,7 +154,7 @@ fn a_malformed_circuit_is_rejected_rather_than_guessed_at() {
         (4, "bounded view: the sibling join's trace port is not an integral"),
     ] {
         rejected(
-            equi_join(|nodes, _| drop(nodes.insert(nid, OpNode::Filter(None)))),
+            equi_join(|nodes, _| drop(nodes.insert(nid, OpNode::Filter(dummy_expr_blob())))),
             want,
         );
     }

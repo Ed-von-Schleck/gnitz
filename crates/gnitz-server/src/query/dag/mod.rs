@@ -169,9 +169,9 @@ impl DagEngine {
     }
 
     /// The backfill-scan bound for `source` under `view_id`, if the compiled plan
-    /// pushed one down. By value (`ScanBound: Copy`) so callers can re-borrow
+    /// pushed one down. By value (`IndexBound: Copy`) so callers can re-borrow
     /// `self` without holding this borrow.
-    pub(crate) fn source_scan_bound(&self, view_id: i64, source: i64) -> Option<gnitz_wire::ScanBound> {
+    pub(crate) fn source_scan_bound(&self, view_id: i64, source: i64) -> Option<gnitz_wire::IndexBound> {
         self.cache
             .get(&view_id)
             .and_then(|co| co.source_bound)

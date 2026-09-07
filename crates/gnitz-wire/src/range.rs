@@ -1,7 +1,6 @@
 // ---------------------------------------------------------------------------
-// Range-bound descriptor — the shared wire form of an ordered range bound:
-// a `ReadSpec` PK / index bound, the circuit `ScanBound`, and the engine's
-// bounded index walks all carry one.
+// Range-bound descriptor — the shared wire form of an ordered range bound, and
+// `IndexBound`, which pairs one with an index's column list.
 //
 // Both client (gnitz-core) and engine (gnitz-server) MUST share this
 // encoder/decoder so they cannot drift on the encoding — the same rule
@@ -162,30 +161,13 @@ impl RangeDescriptor {
         2 + 16 * (n_eq + 2)
     }
 
-    pub fn encode(&self) -> Vec<u8> {
-        let mut flags = 0u8;
-        if self.start.is_after() {
-            flags |= START_AFTER;
-        }
-        if self.end.is_after() {
-            flags |= END_AFTER;
-        }
-        let mut w = Writer::with_capacity(Self::encoded_len(self.n_eq));
-        w.u8(self.n_eq as u8).u8(flags);
-        for v in self.eq_vals() {
-            w.u128(*v);
-        }
-        w.u128(self.start.value()).u128(self.end.value());
-        w.into_vec()
-    }
-
     /// Decode and validate at the trust boundary: the exact length implied by
     /// `n_eq` must match `buf.len()`, `n_eq` must leave a slot for the range
     /// column, and no unknown flag bits may be set — a malformed frame is
     /// rejected, never mis-decoded or allowed to index out of bounds. (The
     /// arity check against the actual column list stays with the engine
     /// method, which holds the list.)
-    pub fn decode(buf: &[u8]) -> Result<Self, String> {
+    pub(crate) fn decode(buf: &[u8]) -> Result<Self, String> {
         let mut r = Reader::new(buf, "range descriptor");
         let n_eq = r.u8()? as usize;
         let flags = r.u8()?;
@@ -219,6 +201,51 @@ pub(crate) fn read_range_descriptor(r: &mut Reader) -> Result<RangeDescriptor, S
     let n_eq = r.peek_u8()? as usize;
     let bytes = r.take(RangeDescriptor::encoded_len(n_eq))?;
     RangeDescriptor::decode(bytes)
+}
+
+/// Splice a `RangeDescriptor` into a larger blob — the writer dual of
+/// [`read_range_descriptor`]. A descriptor is never the outermost thing a caller
+/// builds, so there is no `Vec`-returning encoder to disagree with this one.
+pub(crate) fn write_range_descriptor(w: &mut Writer, d: &RangeDescriptor) {
+    let mut flags = 0u8;
+    if d.start.is_after() {
+        flags |= START_AFTER;
+    }
+    if d.end.is_after() {
+        flags |= END_AFTER;
+    }
+    w.u8(d.n_eq as u8).u8(flags);
+    for v in d.eq_vals() {
+        w.u128(*v);
+    }
+    w.u128(d.start.value()).u128(d.end.value());
+}
+
+/// A bounded walk over a secondary index: the index's declared column list, and
+/// the half-open range over its leading columns. One type for both wire paths —
+/// a `ScanDelta`'s backfill hint and a `ReadSpec`'s `IndexRange` bound.
+///
+/// `idx_cols` is unpacked at decode, so an untagged word or a crafted count is
+/// refused here; admitting the columns against a schema stays with the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexBound {
+    pub idx_cols: crate::PkColList,
+    pub desc: RangeDescriptor,
+}
+
+pub(crate) fn write_index_bound(w: &mut Writer, b: &IndexBound) {
+    w.u64(crate::pack_pk_cols(b.idx_cols.as_slice()));
+    write_range_descriptor(w, &b.desc);
+}
+
+pub(crate) fn read_index_bound(r: &mut Reader) -> Result<IndexBound, String> {
+    let packed = r.u64()?;
+    let idx_cols = crate::unpack_pk_cols(packed)
+        .map_err(|e| format!("index bound: {}", e.for_role(crate::PkListRole::ColumnList)))?;
+    Ok(IndexBound {
+        idx_cols,
+        desc: read_range_descriptor(r)?,
+    })
 }
 
 #[cfg(test)]

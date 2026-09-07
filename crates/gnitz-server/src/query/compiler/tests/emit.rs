@@ -243,70 +243,13 @@ fn a_register_count_over_u16_max_is_rejected() {
 // builds is the crafted field, so a valid build's `Ok` and the crafted build's
 // named rejection are both attributable solely to that field.
 
-/// The planner ships the reduce output-key kind; the engine validates it
-/// against the input schema and hard-rejects any kind the schema does not
-/// warrant — the guard that turns a silent output-column scramble into a
-/// compile failure. Covers all three schema shapes × all three kinds: the three
-/// matching kinds compile, the six cross pairings reject.
-#[test]
-fn a_reduce_out_key_the_schema_does_not_warrant_is_rejected() {
-    use gnitz_store::schema::ReduceOutKey;
-    use gnitz_wire::{AggFunc, OpNode};
-    let reduce = |group: Vec<u32>, out_key: ReduceOutKey| OpNode::Reduce {
-        group_cols: group,
-        // A linear COUNT keeps the MIN/MAX-eligibility guard out of the picture,
-        // isolating the out_key validation.
-        agg: vec![gnitz_wire::AggDescriptor { agg_op: AggFunc::Count, col_idx: 0 }],
-        global_ground: false,
-        out_key,
-    };
-    let with_group_col = |tc: u8| {
-        SchemaDescriptor::new(
-            &[
-                SchemaColumn::new(type_code::U128, 0),
-                SchemaColumn::new(tc, 0),
-                SchemaColumn::new(type_code::I64, 0),
-            ],
-            &[0],
-        )
-    };
-    // (schema, group cols, the ONE kind the schema warrants).
-    let cases = [
-        (make_schema_u64_i64(), vec![0u32], ReduceOutKey::PkPermutation),
-        (with_group_col(type_code::U64), vec![1], ReduceOutKey::SingleNaturalCol),
-        (with_group_col(type_code::STRING), vec![1], ReduceOutKey::SyntheticFold),
-    ];
-    let all_kinds = [
-        ReduceOutKey::SyntheticFold,
-        ReduceOutKey::PkPermutation,
-        ReduceOutKey::SingleNaturalCol,
-    ];
-    for (schema, group, correct) in cases {
-        let fixture = MidCircuit::new(schema);
-        for kind in all_kinds {
-            let mid = reduce(group.clone(), kind);
-            if kind == correct {
-                assert!(fixture.compiles(mid), "{kind:?} is the kind this schema warrants");
-            } else {
-                assert_eq!(
-                    fixture.rejection(mid),
-                    "reduce: out_key does not match input schema",
-                    "out_key {kind:?} against the schema warranting {correct:?}",
-                );
-            }
-        }
-    }
-}
-
 #[test]
 fn reduce_column_indices_out_of_range_are_rejected() {
-    use gnitz_store::schema::ReduceOutKey;
     use gnitz_wire::{AggFunc, OpNode};
     let reduce = |group: Vec<u32>, agg_col: u32| OpNode::Reduce {
         group_cols: group,
         agg: vec![gnitz_wire::AggDescriptor { agg_op: AggFunc::Count, col_idx: agg_col }],
         global_ground: false,
-        out_key: ReduceOutKey::PkPermutation,
     };
     let fixture = MidCircuit::new(make_schema_u64_i64());
     assert_eq!(
@@ -324,7 +267,6 @@ fn reduce_column_indices_out_of_range_are_rejected() {
 /// upstream, so this covers the low-level `CircuitBuilder` path that bypasses it.
 #[test]
 fn a_value_reading_aggregate_over_a_non_scalar_column_is_rejected() {
-    use gnitz_store::schema::ReduceOutKey;
     use gnitz_wire::{AggFunc, OpNode};
     // col 0 = U64 PK and the whole group key (⇒ PkPermutation); col 1 = the
     // aggregate column, whose type is the only thing varying.
@@ -332,7 +274,6 @@ fn a_value_reading_aggregate_over_a_non_scalar_column_is_rejected() {
         group_cols: vec![0],
         agg: vec![gnitz_wire::AggDescriptor { agg_op: func, col_idx: 1 }],
         global_ground: false,
-        out_key: ReduceOutKey::PkPermutation,
     };
     for func in [AggFunc::Sum, AggFunc::SumZero, AggFunc::Min, AggFunc::Max] {
         assert!(
@@ -402,7 +343,7 @@ fn a_corrupt_expression_blob_aborts_the_compile() {
     for blob in [vec![0xFFu8; 16], Vec::new()] {
         assert!(
             fixture
-                .rejection(OpNode::Filter(Some(blob.clone())))
+                .rejection(OpNode::Filter(blob.clone()))
                 .starts_with("filter: invalid predicate program"),
             "a {}-byte Filter blob must abort compilation",
             blob.len()
@@ -502,11 +443,7 @@ fn a_hash_row_map_promotes_within_the_copy_kernel_domain_or_is_rejected() {
 fn range_join_probe_preconditions_are_rejected_at_compile_time() {
     use gnitz_wire::{JoinKind, RangeRel};
     let plan = |delta_schema, trace_schema, n_eq| {
-        plan_two_source_join(
-            JoinKind::DeltaTraceRange { n_eq, rel: RangeRel::Lt },
-            delta_schema,
-            trace_schema,
-        )
+        plan_two_source_join(JoinKind::Range { n_eq, rel: RangeRel::Lt }, delta_schema, trace_schema)
     };
     // The shape the reindex packer produces: `[eq slot, range slot]` PK, then payload.
     let band = |eq_tc: u8| pk_payload_schema(&[eq_tc, type_code::U64]);
@@ -546,7 +483,7 @@ fn range_join_probe_preconditions_are_rejected_at_compile_time() {
 fn a_cross_join_accepts_sides_of_different_pk_strides() {
     let narrow = pk_payload_schema(&[type_code::U32]);
     let wide = pk_payload_schema(&[type_code::U64, type_code::U64]);
-    let plan = plan_two_source_join(gnitz_wire::JoinKind::DeltaTraceCross, narrow, wide);
+    let plan = plan_two_source_join(gnitz_wire::JoinKind::Cross, narrow, wide);
     assert!(plan.is_ok(), "{:?}", plan.err());
 }
 
@@ -598,7 +535,7 @@ fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
                 (0, scan_delta(10)),
                 (1, scan_delta(11)),
                 (2, gnitz_wire::OpNode::IntegrateTrace),
-                (3, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace)),
+                (3, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::Equi)),
             ]),
             vec![(1, 2, SLOT_IN), (0, 3, SLOT_IN), (trace_src, 3, SLOT_TRACE)],
         );
@@ -625,7 +562,7 @@ fn a_wide_pk_join_compiles() {
         HashMap::from([
             (0, scan_delta(10)),
             (1, scan_delta(20)),
-            (2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::DeltaTrace)),
+            (2, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::Equi)),
             (3, gnitz_wire::OpNode::IntegrateSink),
             (4, gnitz_wire::OpNode::IntegrateTrace),
         ]),
@@ -697,7 +634,7 @@ fn a_chained_exchange_is_rejected_instead_of_panicking() {
         HashMap::from([
             (0, scan_delta(10)),
             (1, gnitz_wire::OpNode::ExchangeShard { shard_cols: vec![0] }),
-            (2, gnitz_wire::OpNode::Filter(None)),
+            (2, gnitz_wire::OpNode::Negate),
             (3, gnitz_wire::OpNode::ExchangeShard { shard_cols: vec![0] }),
             (4, gnitz_wire::OpNode::IntegrateSink),
         ]),
@@ -864,50 +801,4 @@ fn a_union_takes_each_unread_operand_but_never_the_sink_register() {
         "operand A is the sink and must not be taken; the Negate's own input is \
          still read by operand B, which has no later reader of its own",
     );
-}
-
-/// `ScanDelta → Reduce → {Distinct, Negate}`: the Distinct schedules before its
-/// co-reader, the destructive-first shape the liveness guard rejects. But a
-/// Reduce's output is already distinct, so the elision pass drops the Distinct —
-/// it aliases the Reduce's register and emits no destructive op at all.
-#[test]
-fn an_elided_distinct_does_not_trip_the_destructive_fanout_guard() {
-    use gnitz_store::schema::ReduceOutKey;
-    let dir = tempfile::tempdir().unwrap();
-    let loaded = loaded_for_test(
-        HashMap::from([
-            (0, scan_delta(10)),
-            (
-                1,
-                gnitz_wire::OpNode::Reduce {
-                    group_cols: vec![],
-                    agg: vec![gnitz_wire::AggDescriptor {
-                        agg_op: gnitz_wire::AggFunc::Count,
-                        col_idx: 0,
-                    }],
-                    global_ground: false,
-                    out_key: ReduceOutKey::SyntheticFold,
-                },
-            ),
-            (2, gnitz_wire::OpNode::Distinct),
-            (3, gnitz_wire::OpNode::Negate),
-        ]),
-        vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (1, 3, SLOT_IN)],
-    );
-    assert!(
-        loaded.skip_nodes.contains(&2),
-        "test precondition: the elision pass must drop the Reduce-fed Distinct"
-    );
-
-    // The plan owns scratch dirs under `dir`, so it must drop first: build it
-    // inside the assert rather than binding it past `dir`'s scope.
-    assert!(build_plan(
-        &loaded,
-        &loaded.ordered,
-        &HashMap::from([(10i64, make_schema_u64_i64())]),
-        test_site(dir.path().to_str().unwrap(), 1),
-        gnitz_store::schema::Placement::KEYED_DEFAULT,
-        PlanTarget::Subgraph { out: 2 }
-    )
-    .is_ok());
 }

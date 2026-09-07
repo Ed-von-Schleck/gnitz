@@ -11,11 +11,11 @@
 // malformed frame.
 // ---------------------------------------------------------------------------
 
-use crate::catalog::MAX_COLUMNS;
-use crate::circuit::{AggDescriptor, AggFunc, ComputeMap};
+use crate::circuit::{read_aggs, read_cols, read_compute_map, write_aggs, write_cols, write_compute_map};
+use crate::circuit::{AggDescriptor, ComputeMap};
 use crate::codec::{Reader, Writer};
-use crate::range::read_range_descriptor;
-use crate::range::RangeDescriptor;
+use crate::range::{read_index_bound, read_range_descriptor, write_index_bound, write_range_descriptor};
+use crate::range::{IndexBound, RangeDescriptor};
 
 /// ORDER BY keys apply in sequence; a spec carries at most this many.
 pub const MAX_ORDER_KEYS: usize = 16;
@@ -25,7 +25,7 @@ pub const MAX_PK_SET_KEYS: usize = 65_536;
 /// Decode-side ceiling on a full encoded `ReadSpec` blob.
 pub(crate) const MAX_READ_SPEC_BYTES: usize = 2 << 20;
 
-const VERSION: u8 = 4;
+const VERSION: u8 = 5;
 
 const BOUND_NONE: u8 = 0;
 const BOUND_PK_RANGE: u8 = 1;
@@ -122,8 +122,7 @@ pub enum ReadBound {
     /// point lookup is `n_eq = pk_count − 1` with degenerate cuts. Exact — no
     /// residual is needed for the bound itself.
     PkRange(RangeDescriptor),
-    /// Secondary-index range: the packed index column list, whether the walk
-    /// must be exact, and the descriptor.
+    /// Secondary-index range walk, and whether it must be exact.
     ///
     /// `exact` is the SQL layer's statement that it **stripped** the bounded
     /// conjuncts from `predicate` — so the walk is the only thing that applies
@@ -132,11 +131,7 @@ pub enum ReadBound {
     /// still in `predicate`, so the walk is only an access optimization and the
     /// worker may fall back to a full cursor when the range covers too much of
     /// the table.
-    IndexRange {
-        idx_cols: u64,
-        exact: bool,
-        desc: RangeDescriptor,
-    },
+    IndexRange { bound: IndexBound, exact: bool },
     /// `pk IN (…)` for a single-column PK. Values are raw native keys widened to
     /// `u128` (`FixedInt::pack`), and must be **distinct after truncation to the
     /// PK's width** — the worker rejects the rest. Wire order is irrelevant: the
@@ -284,7 +279,9 @@ impl ReadSpec {
             + predicate.len()
             + match bound {
                 ReadBound::PkSet(keys) => 16 * keys.len(),
-                _ => 0,
+                ReadBound::PkRange(desc) => RangeDescriptor::encoded_len(desc.eq_vals().len()),
+                ReadBound::IndexRange { bound, .. } => RangeDescriptor::encoded_len(bound.desc.eq_vals().len()),
+                ReadBound::None | ReadBound::Delta { .. } => 0,
             }
             + match sink {
                 ReadSink::Rows { projection, order, .. } => projection.len() + 4 * order.len(),
@@ -294,16 +291,18 @@ impl ReadSpec {
                         + agg.pre.as_ref().map_or(0, |p| p.program.len() + 2 * p.out_cols.len())
                 }
             };
+
         let mut w = Writer::with_capacity(cap);
         w.u8(VERSION).u8(bound.kind()).u8(sink_tag).u8(0);
 
         match bound {
             ReadBound::None => {}
             ReadBound::PkRange(desc) => {
-                w.raw(&desc.encode());
+                write_range_descriptor(&mut w, desc);
             }
-            ReadBound::IndexRange { idx_cols, exact, desc } => {
-                w.u64(*idx_cols).u8(*exact as u8).raw(&desc.encode());
+            ReadBound::IndexRange { bound, exact } => {
+                write_index_bound(&mut w, bound);
+                w.u8(*exact as u8);
             }
             ReadBound::PkSet(keys) => {
                 // One memcpy: on a little-endian target the `u128` slice already
@@ -333,28 +332,15 @@ impl ReadSpec {
                 w.bytes32(projection);
             }
             ReadSink::Fold(agg) => {
-                // Engine-produced state: the SQL layer already width-checks a
-                // legitimate fold's reply schema against `MAX_COLUMNS`, so a count
-                // or index past a `u16` marks a planner bug, not a client one.
-                debug_assert!(agg.group_cols.iter().all(|&c| c <= u16::MAX as u32));
-                debug_assert!(agg.aggs.iter().all(|d| d.col_idx <= u16::MAX as u32));
-                w.u16(agg.group_cols.len() as u16);
-                for &c in &agg.group_cols {
-                    w.u16(c as u16);
-                }
-                w.u8(agg.aggs.len() as u8);
-                for d in &agg.aggs {
-                    w.u8(d.agg_op as u8).u16(d.col_idx as u16);
-                }
+                write_cols(&mut w, &agg.group_cols);
+                write_aggs(&mut w, &agg.aggs);
+                // `None` is spelled as an empty program, so the pre-map section
+                // is unconditional.
                 let (program, out_cols) = match &agg.pre {
                     Some(p) => (p.program.as_slice(), p.out_cols.as_slice()),
                     None => (&[][..], &[][..]),
                 };
-                w.u16(out_cols.len() as u16);
-                for &(tc, nullable) in out_cols {
-                    w.u8(tc).u8(nullable as u8);
-                }
-                w.bytes32(program);
+                write_compute_map(&mut w, out_cols, program);
             }
         }
         w.into_vec()
@@ -386,14 +372,13 @@ impl ReadSpec {
             BOUND_NONE => ReadBound::None,
             BOUND_PK_RANGE => ReadBound::PkRange(read_range_descriptor(&mut r)?),
             BOUND_INDEX_RANGE => {
-                let idx_cols = r.u64()?;
+                let bound = read_index_bound(&mut r).map_err(|e| format!("read_spec: {e}"))?;
                 let exact = match r.u8()? {
                     0 => false,
                     1 => true,
                     other => return Err(format!("read_spec: IndexRange exact flag {other} is not 0 or 1")),
                 };
-                let desc = read_range_descriptor(&mut r)?;
-                ReadBound::IndexRange { idx_cols, exact, desc }
+                ReadBound::IndexRange { bound, exact }
             }
             BOUND_PK_SET => {
                 let count = r.u32()? as usize;
@@ -442,55 +427,22 @@ impl ReadSpec {
                 ReadSink::Rows { projection, order, limit_k }
             }
             SINK_FOLD => {
-                // Trust-boundary caps only: a legitimate fold's reply schema is
-                // width-checked by the SQL layer (`1 + groups + aggs ≤
-                // MAX_COLUMNS`), so either count exceeding one schema's column
-                // cap marks a malformed frame.
-                let n_group_cols = r.u16()? as usize;
-                if n_group_cols > MAX_COLUMNS {
-                    return Err(format!(
-                        "read_spec: {n_group_cols} group cols exceeds cap {MAX_COLUMNS}"
-                    ));
-                }
-                let mut group_cols = Vec::with_capacity(n_group_cols);
-                for _ in 0..n_group_cols {
-                    group_cols.push(r.u16()? as u32);
-                }
-                let n_aggs = r.u8()? as usize;
-                if n_aggs > MAX_COLUMNS {
-                    return Err(format!("read_spec: {n_aggs} agg items exceeds cap {MAX_COLUMNS}"));
-                }
-                let mut aggs = Vec::with_capacity(n_aggs);
-                for _ in 0..n_aggs {
-                    let op_byte = r.u8()?;
-                    let agg_op = AggFunc::from_wire(op_byte as u64)
-                        .ok_or_else(|| format!("read_spec: unknown aggregate op {op_byte}"))?;
-                    aggs.push(AggDescriptor { agg_op, col_idx: r.u16()? as u32 });
-                }
-                let n_pre = r.u16()? as usize;
-                if n_pre > MAX_COLUMNS {
-                    return Err(format!("read_spec: {n_pre} pre-map columns exceeds cap {MAX_COLUMNS}"));
-                }
-                let mut out_cols = Vec::with_capacity(n_pre);
-                for _ in 0..n_pre {
-                    let tc = r.u8()?;
-                    if !crate::is_valid_type_code(tc) {
-                        return Err(format!("read_spec: pre-map column has unknown type code {tc}"));
-                    }
-                    let nullable = r.u8()?;
-                    if nullable > 1 {
-                        return Err(format!("read_spec: pre-map column nullable flag is {nullable}"));
-                    }
-                    out_cols.push((tc, nullable == 1));
-                }
-                let program = r.bytes32()?.to_vec();
+                // The three counted sections take the circuit codec's caps and
+                // domain checks; only the pre-map's `Option` encoding is this
+                // sink's own.
+                let group_cols = read_cols(&mut r).map_err(|e| format!("read_spec: {e}"))?;
+                let aggs = read_aggs(&mut r).map_err(|e| format!("read_spec: {e}"))?;
+                let map = read_compute_map(&mut r).map_err(|e| format!("read_spec: {e}"))?;
                 // The two halves describe one reduce input: a program with no
                 // declared output slots cannot be resolved against a schema, and
                 // declared slots with no program would leave every one unwritten.
-                if program.is_empty() != out_cols.is_empty() {
+                // A circuit `MapKind::Compute` has no such rule — it is
+                // unconditional, and a PK-only projection legitimately declares
+                // no slots — so this stays here rather than in the shared codec.
+                if map.program.is_empty() != map.out_cols.is_empty() {
                     return Err("read_spec: fold pre-map program and column declarations disagree".to_string());
                 }
-                let pre = (!program.is_empty()).then_some(ComputeMap { program, out_cols });
+                let pre = (!map.program.is_empty()).then_some(map);
                 ReadSink::Fold(AggReadSpec { group_cols, aggs, pre })
             }
             other => return Err(format!("read_spec: unknown sink tag {other}")),

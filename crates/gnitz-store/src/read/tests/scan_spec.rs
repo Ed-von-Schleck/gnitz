@@ -132,9 +132,11 @@ fn an_out_of_range_index_column_is_rejected_even_when_inexact() {
     let mut r = rows_fixture("index_oob", 4, 1);
     let spec = ReadSpec {
         bound: ReadBound::IndexRange {
-            idx_cols: gnitz_wire::pack_pk_cols(&[99]),
+            bound: gnitz_wire::IndexBound {
+                idx_cols: gnitz_wire::PkColList::from_slice(&[99]),
+                desc: RangeDescriptor::new(&[], Cut::Before(0), Cut::After(u64::MAX as u128)),
+            },
             exact: false,
-            desc: RangeDescriptor::new(&[], Cut::Before(0), Cut::After(u64::MAX as u128)),
         },
         ..rows_spec(Vec::new(), 0)
     };

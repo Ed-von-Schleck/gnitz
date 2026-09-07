@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn test_invalidation() {
     let mut dag = DagEngine::new();
-    dag.meta.insert(42, Rc::new(ViewMeta::nothing_special()));
+    dag.meta.insert(42, Rc::new(ViewMeta::empty()));
     dag.dep.valid = true;
 
     dag.invalidate(42);
@@ -13,7 +13,7 @@ fn test_invalidation() {
     dag.invalidate_dep_map();
     assert!(!dag.dep.valid);
 
-    dag.meta.insert(99, Rc::new(ViewMeta::nothing_special()));
+    dag.meta.insert(99, Rc::new(ViewMeta::empty()));
     dag.invalidate_all();
     assert!(dag.meta.is_empty());
 }
@@ -26,7 +26,7 @@ fn unregister_table_evicts_the_dropped_relations_meta() {
         gnitz_store::relation::StoreConfig::default(),
     );
     let mut dag = DagEngine::new();
-    dag.meta.insert(43, Rc::new(ViewMeta::nothing_special()));
+    dag.meta.insert(43, Rc::new(ViewMeta::empty()));
     dag.unregister_table(&mut registry, 43);
     assert!(!dag.meta.contains_key(&43), "unregister_table must evict");
 }

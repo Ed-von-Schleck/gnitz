@@ -6,8 +6,7 @@ use crate::error::ClientError;
 use crate::ReindexSlot;
 
 pub use gnitz_wire::{
-    agg_output_type, AggDescriptor, AggFunc, ComputeMap, JoinKind, MapKind, OpNode, RangeRel, ReduceOutKey,
-    ReindexRole, TableId, TypeCode,
+    agg_output_type, AggDescriptor, AggFunc, ComputeMap, JoinKind, MapKind, OpNode, RangeRel, ReindexRole, TypeCode,
 };
 
 pub type NodeId = u64;
@@ -38,11 +37,11 @@ pub(crate) fn is_segment_id(id: u64) -> bool {
 impl Circuit {
     /// Tables this view reads cascading deltas from — every `ScanDelta`
     /// node's `source_table`, deduped.
-    pub fn dependencies(&self) -> Vec<TableId> {
+    pub fn dependencies(&self) -> Vec<u64> {
         // A view's dependency set is 1–4 entries; a linear `Vec::contains` dedup
         // is alloc-free and beats a HashSet at this n (same small-n convention as
         // `Schema::validate_parts`).
-        let mut deps: Vec<TableId> = Vec::new();
+        let mut deps: Vec<u64> = Vec::new();
         for op in self.nodes.values() {
             if let OpNode::ScanDelta { source, .. } = op {
                 if !deps.contains(source) {
@@ -124,7 +123,7 @@ impl CircuitBuilder {
     /// full-source scan reads only the index range; steady-state deltas ignore the
     /// bound entirely. The caller still emits the full `Filter` downstream — the
     /// bound narrows what is read, never what the view contains.
-    pub fn input_delta_bounded(&mut self, bound: Option<gnitz_wire::ScanBound>) -> NodeId {
+    pub fn input_delta_bounded(&mut self, bound: Option<gnitz_wire::IndexBound>) -> NodeId {
         self.alloc_wired(OpNode::ScanDelta { source: self.primary_source_id, bound }, &[])
     }
 
@@ -134,8 +133,10 @@ impl CircuitBuilder {
         self.alloc_wired(OpNode::ScanDelta { source: source_table_id, bound: None }, &[])
     }
 
-    pub fn filter(&mut self, input: NodeId, expr: Option<LogicalProgram>) -> NodeId {
-        self.alloc_wired(OpNode::Filter(expr.map(|e| e.to_blob_bytes())), &[input])
+    /// A predicate node. There is no "no `WHERE`" spelling: a caller with no
+    /// predicate emits no node.
+    pub fn filter(&mut self, input: NodeId, prog: LogicalProgram) -> NodeId {
+        self.alloc_wired(OpNode::Filter(prog.to_blob_bytes()), &[input])
     }
 
     /// A computed projection: the map's program writes one payload slot each, and
@@ -220,26 +221,23 @@ impl CircuitBuilder {
     }
 
     pub fn join_with_trace_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
-        self.alloc_wired(OpNode::Join(JoinKind::DeltaTrace), &[delta, trace_node])
+        self.alloc_wired(OpNode::Join(JoinKind::Equi), &[delta, trace_node])
     }
 
     /// Non-equi (range) join term: the delta probes `trace_node` with an ordered
     /// half-open range walk per the §3 cut-point table. `n_eq` leading key slots
     /// are equality-pinned (the band-join prefix); `rel` is the relation the trace
     /// slot must satisfy versus the delta slot. Mirrors `join_with_trace_node` but
-    /// for `JoinKind::DeltaTraceRange`.
+    /// for `JoinKind::Range`.
     pub fn join_with_trace_range_node(&mut self, delta: NodeId, trace_node: NodeId, n_eq: u8, rel: RangeRel) -> NodeId {
-        self.alloc_wired(
-            OpNode::Join(JoinKind::DeltaTraceRange { n_eq, rel }),
-            &[delta, trace_node],
-        )
+        self.alloc_wired(OpNode::Join(JoinKind::Range { n_eq, rel }), &[delta, trace_node])
     }
 
     /// Keyless (cross) join term: every delta row pairs with every trace row.
     /// Neither side's key is compared, so the two sides need not agree on a key
     /// type or width — each keys on whatever partitions its trace.
     pub fn join_with_trace_cross_node(&mut self, delta: NodeId, trace_node: NodeId) -> NodeId {
-        self.alloc_wired(OpNode::Join(JoinKind::DeltaTraceCross), &[delta, trace_node])
+        self.alloc_wired(OpNode::Join(JoinKind::Cross), &[delta, trace_node])
     }
 
     /// Keep only rows this worker owns (by packed-PK partition) before they
@@ -253,18 +251,15 @@ impl CircuitBuilder {
     /// multi-worker correctness). `agg_specs`: list of (agg func, col_idx).
     /// `global_ground` is `true` only for the user's ungrouped scalar aggregate
     /// (empty `group_cols`); the grouped builder passes `group_cols.is_empty()`.
-    /// `out_key` is the caller's schema-derived output-key decision; the engine
-    /// validates it against the input schema.
     pub fn reduce_multi(
         &mut self,
         input: NodeId,
         group_cols: &[usize],
         agg_specs: &[(AggFunc, usize)],
         global_ground: bool,
-        out_key: ReduceOutKey,
     ) -> NodeId {
         let sharded = self.shard(input, group_cols);
-        self.reduce_multi_local(sharded, group_cols, agg_specs, global_ground, out_key)
+        self.reduce_multi_local(sharded, group_cols, agg_specs, global_ground)
     }
 
     /// Shard-free multi-aggregate reduce: aggregates `input` **locally on every
@@ -292,7 +287,6 @@ impl CircuitBuilder {
         group_cols: &[usize],
         agg_specs: &[(AggFunc, usize)],
         global_ground: bool,
-        out_key: ReduceOutKey,
     ) -> NodeId {
         let group: Vec<u32> = group_cols.iter().map(|&c| c as u32).collect();
         let specs: Vec<AggDescriptor> = agg_specs
@@ -304,7 +298,6 @@ impl CircuitBuilder {
                 group_cols: group,
                 agg: specs,
                 global_ground,
-                out_key,
             },
             &[input],
         )

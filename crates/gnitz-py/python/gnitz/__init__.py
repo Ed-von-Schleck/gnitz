@@ -5,7 +5,7 @@ from gnitz._native import (
     PollResult,
     TABLE_TAB, FIRST_USER_TABLE_ID,
 )
-from gnitz._types import TypeCode
+from gnitz._types import Opcode, TypeCode
 
 
 def connect(socket_path):

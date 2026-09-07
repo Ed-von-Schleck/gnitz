@@ -3,7 +3,7 @@ use gnitz_wire::{MapKind, OpNode, ReindexRole};
 
 #[test]
 fn a_cyclic_circuit_is_rejected() {
-    let nodes = HashMap::from([(0, OpNode::Filter(None)), (1, OpNode::Filter(None))]);
+    let nodes = HashMap::from([(0, OpNode::Negate), (1, OpNode::Negate)]);
     assert!(matches!(
         load::topo_sorted(nodes, wire_slots(&[(0, 1, SLOT_IN), (1, 0, SLOT_IN)])),
         Err(CompileError::Rejected("circuit graph has a cycle"))
@@ -119,13 +119,14 @@ impl SchemaSource for CircuitTables {
 /// topological order.
 #[test]
 fn a_malformed_row_aborts_the_load_and_names_the_check() {
-    // An opcode `decode_op_node` rejects.
+    // An opcode `decode_op_node` rejects. Its own reason is what surfaces —
+    // interpolated value and all — not a bare "failed to decode".
     let mut c = CircuitTables::new();
     c.put_nodes(|bb| CircuitTables::raw_row(bb, CircuitTables::VIEW_ID, 1, 9999, None, None, None));
-    assert!(matches!(
-        c.load(),
-        Err(CompileError::Rejected("circuit node failed to decode"))
-    ));
+    assert!(
+        matches!(c.load(), Err(CompileError::RejectedNode(why)) if why == "unknown opcode 9999"),
+        "the decoder's own rejection must reach the caller",
+    );
 
     // A node naming a producer that is not a node of the circuit: honouring it
     // would create a phantom node.
@@ -150,7 +151,7 @@ fn the_load_takes_one_views_rows_and_keeps_a_damaged_program_present() {
     let mut c = CircuitTables::new();
     c.put_nodes(|bb| {
         CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 0, scan_delta(10), None);
-        CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 1, OpNode::Filter(Some(vec![0xff])), Some(0));
+        CircuitTables::node_row(bb, CircuitTables::VIEW_ID, 1, OpNode::Filter(vec![0xff]), Some(0));
         // A second view's nodes, which this load must not see. An undecodable
         // opcode, so a load that ignored the prefix would fail outright.
         CircuitTables::raw_row(bb, CircuitTables::VIEW_ID + 1, 2, 9999, None, None, None);
@@ -158,7 +159,7 @@ fn the_load_takes_one_views_rows_and_keeps_a_damaged_program_present() {
     let loaded = c.load().expect("a damaged program is not a load failure");
     assert_eq!(loaded.nodes.len(), 2, "only this view's nodes are loaded");
     assert!(
-        matches!(loaded.nodes.get(&1), Some(OpNode::Filter(Some(b))) if b == &[0xff]),
+        matches!(loaded.nodes.get(&1), Some(OpNode::Filter(b)) if b == &[0xff]),
         "an undecodable program must stay present, not collapse to a pass-all filter"
     );
 }
@@ -196,7 +197,7 @@ fn arity_violations_fail_at_load() {
             "{what} must fail at load",
         );
     };
-    assert!(load(OpNode::Filter(None), &[(0, 2, SLOT_IN)]).is_ok(), "control");
+    assert!(load(OpNode::Negate, &[(0, 2, SLOT_IN)]).is_ok(), "control");
 
     rejected(
         load(
@@ -207,7 +208,6 @@ fn arity_violations_fail_at_load() {
                     col_idx: 1,
                 }],
                 global_ground: false,
-                out_key: gnitz_store::schema::ReduceOutKey::PkPermutation,
             },
             &[(0, 2, SLOT_IN), (1, 2, SLOT_TRACE)],
         ),
@@ -241,7 +241,6 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
                         col_idx: 0,
                     }],
                     global_ground: false,
-                    out_key: gnitz_store::schema::ReduceOutKey::SyntheticFold,
                 },
             ),
             (4, OpNode::IntegrateSink),
@@ -262,12 +261,12 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
             vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],
         )
     };
-    let range = |n_eq| gnitz_wire::JoinKind::DeltaTraceRange { n_eq, rel: gnitz_wire::RangeRel::Lt };
+    let range = |n_eq| gnitz_wire::JoinKind::Range { n_eq, rel: gnitz_wire::RangeRel::Lt };
     for (kind, want) in [
-        (gnitz_wire::JoinKind::DeltaTrace, load::JoinRelay::WholeKey),
+        (gnitz_wire::JoinKind::Equi, load::JoinRelay::WholeKey),
         (range(2), load::JoinRelay::EqPrefix { n_eq: 2 }),
         (range(0), load::JoinRelay::Broadcast),
-        (gnitz_wire::JoinKind::DeltaTraceCross, load::JoinRelay::Broadcast),
+        (gnitz_wire::JoinKind::Cross, load::JoinRelay::Broadcast),
     ] {
         assert_eq!(load::circuit_join_relay(&joined(kind)), want, "{kind:?}");
     }
@@ -276,7 +275,7 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
 // ── scatter_key_of_scan: the forward (scan → reindex Map) walk ──────────
 
 /// The pure-range-join shape the planner emits at `n_eq == 0`: the reindex Map
-/// feeds the `Join(DeltaTraceRange)` DIRECTLY as the delta term AND feeds a
+/// feeds the `Join(Range)` DIRECTLY as the delta term AND feeds a
 /// `WorkerFilter → IntegrateTrace` toward the trace term. Its key is collected
 /// once, from the flag — the fan-out is not a second contribution — and the
 /// `WorkerFilter` is not a `Filter`, so the walk never steps through it.
@@ -290,7 +289,7 @@ fn the_scatter_key_is_collected_once_however_the_reindex_map_fans_out() {
             (3, OpNode::IntegrateTrace),
             (
                 4,
-                OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange { n_eq: 0, rel: gnitz_wire::RangeRel::Le }),
+                OpNode::Join(gnitz_wire::JoinKind::Range { n_eq: 0, rel: gnitz_wire::RangeRel::Le }),
             ),
         ]),
         vec![
@@ -314,7 +313,7 @@ fn a_scan_fanning_into_two_reindex_maps_yields_two_sequences() {
         HashMap::from([
             (0, scan_delta(42)),
             (1, scatter_reindex(&[2])),
-            (2, OpNode::Filter(Some(dummy_expr_blob()))),
+            (2, OpNode::Filter(dummy_expr_blob())),
             (3, scatter_reindex(&[5])),
         ]),
         // The second reindex sits behind a Filter, which the walk steps through.
@@ -358,9 +357,9 @@ fn a_key_sequence_survives_verbatim_but_identical_siblings_collapse() {
     let siblings = loaded_for_test(
         HashMap::from([
             (0, scan_delta(7)),
-            (1, OpNode::Filter(Some(dummy_expr_blob()))),
+            (1, OpNode::Filter(dummy_expr_blob())),
             (2, scatter_reindex(&[2])),
-            (3, OpNode::Filter(Some(dummy_expr_blob()))),
+            (3, OpNode::Filter(dummy_expr_blob())),
             (4, scatter_reindex(&[2])),
         ]),
         vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (0, 3, SLOT_IN), (3, 4, SLOT_IN)],
@@ -393,7 +392,7 @@ fn an_auxiliary_reindex_never_contributes_the_scatter_key() {
                 (1, join_reindex),
                 (
                     2,
-                    OpNode::Join(gnitz_wire::JoinKind::DeltaTraceRange { n_eq: 1, rel: gnitz_wire::RangeRel::Le }),
+                    OpNode::Join(gnitz_wire::JoinKind::Range { n_eq: 1, rel: gnitz_wire::RangeRel::Le }),
                 ),
                 (3, OpNode::IntegrateTrace),
                 (4, aux_rekey),
@@ -467,7 +466,7 @@ fn the_shard_walk_crosses_filters_and_nothing_else() {
         let edges = (0..shard).map(|i| (i, i + 1, SLOT_IN)).collect();
         scan_tid_through_filters(&loaded_for_test(nodes, edges), shard)
     };
-    let filter = || OpNode::Filter(Some(dummy_expr_blob()));
+    let filter = || OpNode::Filter(dummy_expr_blob());
     let rekey = || scatter_reindex(&[2]);
     assert_eq!(chain(vec![]), Some(7), "a bare scan resolves on the first hop");
     assert_eq!(chain(vec![filter()]), Some(7));
@@ -507,7 +506,7 @@ fn the_shard_walk_bails_at_a_fan_in() {
     };
     assert_eq!(union_then(vec![]), None, "the Union feeds the shard directly");
     assert_eq!(
-        union_then(vec![OpNode::Filter(Some(dummy_expr_blob()))]),
+        union_then(vec![OpNode::Filter(dummy_expr_blob())]),
         None,
         "a Filter is transparent, so the walk reaches the Union and bails there"
     );

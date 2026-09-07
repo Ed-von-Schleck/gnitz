@@ -14,10 +14,8 @@ use super::avi::AviBake;
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
 
-/// Build the reduce output schema by **obeying** the planner's shipped
-/// `out_key`, which `emit_reduce` has already validated against the input
-/// schema — so the three arms are byte-identical to what the planner laid out.
-/// `None` when the columns would overflow the fixed `[_; 65]` schema array.
+/// Build the reduce output schema from `out_key`. `None` when the columns would
+/// overflow the fixed `[_; 65]` schema array.
 pub(super) fn build_reduce_output_schema(
     input: &SchemaDescriptor,
     group_cols: &[u32],

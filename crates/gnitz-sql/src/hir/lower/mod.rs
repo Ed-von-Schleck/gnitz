@@ -53,7 +53,7 @@ use crate::codec::project_schema::{payload_map, ProjItem};
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
 use gnitz_core::{ColumnDef, RelDescriptor, Schema};
-use gnitz_wire::ScanBound;
+use gnitz_wire::IndexBound;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -657,7 +657,7 @@ pub(crate) fn emit_filter<'a>(
 ) -> Result<gnitz_core::NodeId, GnitzSqlError> {
     let preds = physical::resolve_preds(preds, &frame.layout)?;
     match crate::expr_lower::compile_filter_program(&preds, &frame.cols)? {
-        Some(prog) => Ok(cb.filter(node, Some(prog))),
+        Some(prog) => Ok(cb.filter(node, prog)),
         None => Ok(node),
     }
 }
@@ -666,14 +666,14 @@ pub(crate) fn emit_filter<'a>(
 /// resolved WHERE both in hand). Only a catalog source bounds. Shared by every
 /// primary-position `Get` lowering (`lower_linear` here, `reduce::lower_reduce`'s
 /// inline-source arm).
-pub(crate) fn extract_scan_bound(preds: &[crate::ir::BoundExpr], src: &SegInput) -> Option<ScanBound> {
+pub(crate) fn extract_scan_bound(preds: &[crate::ir::BoundExpr], src: &SegInput) -> Option<IndexBound> {
     // The head candidate outright: this path compiles no residual — the `Filter`
     // is emitted verbatim either way — so there is nothing a later candidate
     // could express that the best-ranked one cannot.
     ranked_index_bounds(preds, &src.schema, &src.desc.as_ref()?.indexes)
         .into_iter()
         .next()
-        .map(|c| ScanBound { idx_cols: c.idx_cols, desc: c.desc })
+        .map(|c| IndexBound { idx_cols: c.idx_cols, desc: c.desc })
 }
 
 /// One side of a join as [`join_sides`] left it: the resolved input, its

@@ -281,7 +281,7 @@ pub(crate) fn emit_reduce(
         // Phase 1 — per-worker local partial. No ExchangeShard, global_ground = false
         // (a worker with no local rows contributes no partial, never a ground row).
         // Output: [_group_pk:U128 (col 0, PK), agg0 (col 1), agg1 (col 2), ...].
-        let local = cb.reduce_multi_local(filtered, &[], &circuit_specs, false, ReduceOutKey::SyntheticFold);
+        let local = cb.reduce_multi_local(filtered, &[], &circuit_specs, false);
         // Phase 2 (exchange) + Phase 3 (combine). reduce_multi inserts the single
         // ExchangeShard(∅) routing every partial (all at PK V₀) to V₀'s owner, then
         // the combine reduce sums each partial column: a COUNT/COUNT_NON_NULL partial
@@ -301,25 +301,13 @@ pub(crate) fn emit_reduce(
             .map(|(i, s)| (s.op.merge_func(), 1 + i))
             .collect();
         combine_specs.push((WireAggFunc::Count, 0)); // COUNT-of-partials existence gate
-        cb.reduce_multi(local, &[], &combine_specs, true, ReduceOutKey::SyntheticFold)
+        cb.reduce_multi(local, &[], &combine_specs, true)
     } else if sh.source_replicated {
         // Shard-free: every worker reduces its full local copy to the same global
         // aggregate (no ExchangeShard ⇒ no gather barrier, no N-fold sum).
-        cb.reduce_multi_local(
-            filtered,
-            &reduce_group_cols,
-            &circuit_specs,
-            sh.global_ground(),
-            sh.out_key,
-        )
+        cb.reduce_multi_local(filtered, &reduce_group_cols, &circuit_specs, sh.global_ground())
     } else {
-        cb.reduce_multi(
-            filtered,
-            &reduce_group_cols,
-            &circuit_specs,
-            sh.global_ground(),
-            sh.out_key,
-        )
+        cb.reduce_multi(filtered, &reduce_group_cols, &circuit_specs, sh.global_ground())
     }
 }
 

@@ -78,7 +78,7 @@ fn circuit_batch(rows: &[(i64, u64, i64)]) -> Batch {
             &CircuitNodeRow {
                 view_id: view_id as u64,
                 node_id,
-                opcode: gnitz_wire::Opcode::Integrate.as_wire(),
+                opcode: gnitz_wire::Opcode::IntegrateSink.as_wire(),
                 source_table: None,
                 inputs: [None; 2],
                 params: None,

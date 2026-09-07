@@ -4,23 +4,15 @@
 use crate::foundation::xxh;
 
 pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
-/// Shard file format version. A shard records only its payload-column count
-/// (`OFF_FILE_NPC`) — every other aspect of a region is derived from the live
-/// `SchemaDescriptor` — so a column-shape change to a system family needs a bump
-/// here too, not just a header/region layout change. The reader's exact region
-/// sizes come from that schema, so they reject most shards written under a
-/// different one; a Constant-encoded region is one element wide under either
-/// schema, and only this word rejects that.
-pub(crate) const SHARD_VERSION: u64 = 18;
+/// Bumped by hand for a header/region layout change.
+pub(crate) const SHARD_EPOCH: u64 = 19;
 
-/// Pin the system-family column shapes to the version word above, the way
-/// `gnitz_wire::wal` pins them to `WAL_FORMAT_VERSION`. Nothing else notices a
-/// shape change. If this fails, bump `SHARD_VERSION` and paste the reported
-/// digest here.
-const _: () = assert!(
-    gnitz_wire::SYS_SCHEMA_DIGEST == 2556830436675219726 && SHARD_VERSION == 18,
-    "system-family column shapes changed: bump SHARD_VERSION"
-);
+/// Shard file format version, written into the header and compared for equality
+/// at open. A shard records only its payload-column count (`OFF_FILE_NPC`) and
+/// sizes every region from the live `SchemaDescriptor`, so a system-family shape
+/// change reinterprets an existing file rather than failing to parse it — hence
+/// the digest. Compared, never parsed, so any mixing function does.
+pub(crate) const SHARD_VERSION: u64 = SHARD_EPOCH ^ gnitz_wire::SYS_SCHEMA_DIGEST;
 pub(crate) const HEADER_SIZE: usize = 64;
 pub(crate) const DIR_ENTRY_SIZE: usize = 32;
 pub(crate) const ALIGNMENT: usize = 64;
@@ -56,10 +48,10 @@ pub(crate) const OFF_SHARD_FILTER_CHECKSUM: usize = 56;
 /// a constant rather than at a framed length — so the dependency's descriptor
 /// width is part of the on-disk format, and a change to it would reinterpret
 /// every fingerprint byte of every existing shard. It has to fail the build
-/// instead: bump `SHARD_VERSION` and paste the new width here.
+/// instead: bump `SHARD_EPOCH` and paste the new width here.
 const _: () = assert!(
     xorf::Descriptor::DMA_LEN == 20,
-    "BinaryFuse8 descriptor width changed: bump SHARD_VERSION",
+    "BinaryFuse8 descriptor width changed: bump SHARD_EPOCH",
 );
 
 /// Byte offset of directory entry `i`. The directory follows the header

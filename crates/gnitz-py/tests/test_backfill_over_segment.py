@@ -20,10 +20,9 @@ Run at GNITZ_WORKERS=4 (the exchange/fanout paths only engage at W>1):
         tests/test_backfill_over_segment.py -v --tb=short
 """
 
-import gnitz  # noqa: F401  (imported for parity with the sibling suites)
+from gnitz import Opcode
 from _uid import uid as _uid
 
-OPCODE_EXCHANGE_SHARD = 20
 CIRCUIT_NODES_TAB = 11
 VIEW_TAB = 3
 
@@ -71,9 +70,9 @@ def _sole_segment_vid(client, owner_vid):
 
 
 def _has_exchange_shard(client, vid):
-    """True iff any `ExchangeShard` (opcode 20) circuit node belongs to `vid`."""
+    """True iff any `ExchangeShard` circuit node belongs to `vid`."""
     return any(
-        r["view_id"] == vid and r["opcode"] == OPCODE_EXCHANGE_SHARD
+        r["view_id"] == vid and r["opcode"] == Opcode.ExchangeShard
         for r in client.scan(CIRCUIT_NODES_TAB)
     )
 

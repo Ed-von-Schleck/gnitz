@@ -102,7 +102,7 @@ pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, source_tid: 
         vid,
         &[
             (Opcode::ScanDelta, Some(source_tid), scan_params),
-            (Opcode::Integrate, None, None),
+            (Opcode::IntegrateSink, None, None),
         ],
     );
 }
