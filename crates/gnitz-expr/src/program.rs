@@ -5,11 +5,13 @@
 //! payload/PK indices — the evaluable form). `LogicalProgram::resolve` consumes
 //! the former and produces the latter. Instruction meaning is carried by the
 //! type: a missing or mis-routed opcode is a compile error, not a silent
-//! miscompute.
+//! miscompute. The wire vocabulary both forms are named in — [`ExprOp`], the
+//! selector families, [`SinkKind`] — is declared here too, beside the
+//! encode/decode pair that is its only reader.
 
 use crate::like::LikeMatcher;
 use crate::{ColumnLocator, SchemaFacts};
-use gnitz_wire::{encode_german_string, ExprOp, FixedInt, SinkKind, TrimMode, TypeCode};
+use gnitz_wire::{encode_german_string, FixedInt, TypeCode};
 use std::fmt;
 use std::num::NonZeroU8;
 
@@ -18,6 +20,14 @@ use std::num::NonZeroU8;
 /// bit in a `u64`. Public for the engine's view pre-flight tests, which build a
 /// program at the limit.
 pub const MAX_REGS: usize = u64::BITS as usize;
+
+/// One wire instruction, `[opcode, selector, a1, a2, a3]`, in bytes.
+const INSTR_BYTES: usize = 5 * 4;
+/// One wire sink pair, `[kind, value]`, in bytes.
+const SINK_BYTES: usize = 2 * 4;
+/// The blob's `output` word for a program that writes output slots. `u32::MAX`,
+/// which no register index can be — the register file is 64 deep.
+const MAP_OUTPUT: u32 = u32::MAX;
 
 /// Why a client-authored expr program was rejected at compile — a diagnostic for
 /// the recovery log. Production consumers only render it (the SQL planner wraps
@@ -78,8 +88,12 @@ pub enum ExprValidateErr {
         sinks: usize,
         num_payload_cols: usize,
     },
-    ResultRegRequired,
-    CorruptBlob(&'static str),
+    /// The program's output is not the shape its consumer reads: a filter or
+    /// scalar writing output slots, or a map naming a result register.
+    OutputRoleMismatch,
+    /// Framing or region bytes that describe no program — the decoder's own
+    /// message, prefixed with the call site that read them.
+    CorruptBlob(String),
     /// An instruction's selector word names no member of its opcode's family —
     /// the one statement covering every family, since that is the only thing a
     /// selector can be wrong about.
@@ -122,6 +136,9 @@ impl fmt::Display for ExprValidateErr {
                     "column {col} is part of the primary key; this operator needs a payload column"
                 )
             }
+            // Already a sentence naming the format and the fault; `Debug` would
+            // quote and escape it inside `CorruptBlob("…")`.
+            ExprValidateErr::CorruptBlob(msg) => write!(f, "{msg}"),
             other => write!(f, "{other:?}"),
         }
     }
@@ -185,10 +202,102 @@ const _: () = {
 };
 
 // ---------------------------------------------------------------------------
+// The wire instruction vocabulary
+// ---------------------------------------------------------------------------
+
+gnitz_wire::wire_enum! {
+    /// One variant per `LogicalInstr` variant, stating **wire identity only** —
+    /// every rule about what an instruction means lives on the `LogicalInstr`
+    /// variant this mirrors. An operator or flag that variant already carries as
+    /// a field rides the selector, never a second opcode.
+    ///
+    /// An instruction is `[opcode, selector, a1, a2, a3]`. The selector names
+    /// which member of the opcode's family this is — a comparison or arithmetic
+    /// operator, a cast target, a TRIM mode, or a 0/1 flag — and is **0** for an
+    /// opcode with no family, which the decoder enforces. The three operand
+    /// words are whole `u32`s, one operand each; unused ones are 0 and ignored.
+    /// The one operand spanning two words is `LoadConst`'s `i64`, through
+    /// [`encode_load_const`] / [`decode_load_const`].
+    ///
+    /// A wire enum so [`LogicalProgram::decode_instr`] matches exhaustively: a
+    /// new opcode is a compile error there until it gets a decode arm — which
+    /// discriminants on `LogicalInstr` itself would lose.
+    pub enum ExprOp: u32 {
+        LoadColInt = 1,
+        LoadColFloat = 2,
+        LoadConst = 3,
+        IntArith = 4,
+        FloatArith = 5,
+        Cmp = 6,
+        FCmp = 7,
+        IntToFloat = 8,
+        FloatUnary = 9,
+        IntUnary = 10,
+        FloatToInt = 11,
+        IntCast = 12,
+        FloatToF32 = 13,
+        IntMinMax2 = 14,
+        FloatMinMax2 = 15,
+        Select = 16,
+        LoadNull = 17,
+        BoolBinary = 18,
+        BoolNot = 19,
+        IsNull = 20,
+        IsNullReg = 21,
+        StrColConst = 22,
+        StrColCol = 23,
+        IntInSet = 24,
+        LoadColStr = 25,
+        LoadConstStr = 26,
+        LoadNullStr = 27,
+        StrSelect = 28,
+        StrCmp = 29,
+        StrLen = 30,
+        StrCase = 31,
+        StrSubstr = 32,
+        StrTrim = 33,
+        StrLike = 34,
+        StrConcat = 35,
+        IntToStr = 36,
+        FloatToStr = 37,
+        StrToInt = 38,
+        StrToFloat = 39,
+        StrSide = 40,
+        StrPos = 41,
+        StrReverse = 42,
+        StrReplace = 43,
+        StrPad = 44,
+        StrSplitPart = 45,
+    }
+}
+
+gnitz_wire::wire_enum! {
+    /// What one sink pair `[kind, value]` names. Sinks ride the blob's own
+    /// region, so this space is disjoint from [`ExprOp`]'s.
+    pub enum SinkKind: u32 {
+        /// Copy input column `value` verbatim.
+        Col = 0,
+        /// Store register `value`.
+        Reg = 1,
+    }
+}
+
+/// `ExprOp::LoadConst`'s `i64` across two operand words (`a1` = low 32 bits,
+/// `a2` = high 32 bits) — the one operand wider than a word.
+#[inline]
+pub const fn encode_load_const(v: i64) -> (u32, u32) {
+    (v as u32, (v >> 32) as u32)
+}
+#[inline]
+pub const fn decode_load_const(a1: u32, a2: u32) -> i64 {
+    ((a2 as i64) << 32) | (a1 as i64 & 0xFFFF_FFFF)
+}
+
+// ---------------------------------------------------------------------------
 // Typed instruction operands
 // ---------------------------------------------------------------------------
 
-// Each of the five is an [`ExprOp`] **selector**: the wire instruction's word 1,
+// Each of the six is an [`ExprOp`] **selector**: the wire instruction's word 1,
 // naming which member of the opcode's family this instruction is. Wire enums, so
 // that word's encode and decode are one call each rather than a match per
 // direction.
@@ -267,6 +376,28 @@ gnitz_wire::wire_enum! {
     }
 }
 
+gnitz_wire::wire_enum! {
+    /// Which end(s) [`ExprOp::StrTrim`] strips — its selector. The one
+    /// definition of that word both the planner and the engine encode against.
+    pub enum TrimMode: u32 {
+        Both = 0,
+        Leading = 1,
+        Trailing = 2,
+    }
+}
+
+impl TrimMode {
+    #[inline]
+    pub fn trims_start(self) -> bool {
+        matches!(self, TrimMode::Both | TrimMode::Leading)
+    }
+
+    #[inline]
+    pub fn trims_end(self) -> bool {
+        matches!(self, TrimMode::Both | TrimMode::Trailing)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LogicalInstr — the wire-mirroring form (logical column indices)
 // ---------------------------------------------------------------------------
@@ -315,6 +446,49 @@ impl Sink {
         match self {
             Sink::Col(_) => None,
             Sink::Reg(r) => Some(r),
+        }
+    }
+}
+
+/// Where a program's result goes: one register for a filter or scalar, one
+/// output payload slot per sink for a map. Exclusive by construction.
+#[derive(Debug)]
+pub enum Output {
+    /// The register a filter's verdict or a scalar's value is read out of.
+    Result(Reg),
+    /// The output payload slots, in slot order; empty for a zero-payload map.
+    Slots(Vec<Sink>),
+}
+
+impl Output {
+    /// The one place a `(result_reg, sinks)` pair becomes an `Output`, so a
+    /// program naming its output twice is rejected once — for
+    /// [`ExprBuilder::build`](crate::ExprBuilder::build) and the wire alike.
+    pub(crate) fn new(result_reg: Option<Reg>, sinks: Vec<Sink>) -> Result<Self, ExprValidateErr> {
+        match result_reg {
+            Some(r) if sinks.is_empty() => Ok(Output::Result(r)),
+            Some(_) => Err(ExprValidateErr::CorruptBlob(format!(
+                "a result register and {} output slots: a program names its output once",
+                sinks.len()
+            ))),
+            None => Ok(Output::Slots(sinks)),
+        }
+    }
+
+    /// The output slots — empty for a result register, so every walk over a
+    /// program's sinks reads one accessor rather than matching.
+    fn slots(&self) -> &[Sink] {
+        match self {
+            Output::Result(_) => &[],
+            Output::Slots(s) => s,
+        }
+    }
+
+    /// The result register, `None` for a map.
+    fn result(&self) -> Option<Reg> {
+        match self {
+            Output::Result(r) => Some(*r),
+            Output::Slots(_) => None,
         }
     }
 }
@@ -706,8 +880,7 @@ pub(crate) enum Instr {
         is_max: bool,
     },
     /// SQL CASE blend (resolved): identical to the logical form — blends raw i64
-    /// bit patterns, so no `signed` flag is needed (the branch producers already
-    /// carry the correct value; §4's float unification is the lowering's job).
+    /// bit patterns; the lowerer lifts integer branches to f64.
     Select {
         dst: u16,
         cond: u16,
@@ -902,7 +1075,7 @@ impl LogicalInstr {
             L::LoadColInt { col: c } => col(ExprOp::LoadColInt, 0, c),
             L::LoadColFloat { col: c } => col(ExprOp::LoadColFloat, 0, c),
             L::LoadConst { val } => {
-                let (lo, hi) = gnitz_wire::encode_load_const(val);
+                let (lo, hi) = encode_load_const(val);
                 [ExprOp::LoadConst.as_wire(), 0, lo, hi, 0]
             }
             L::IntArith { op, a, b } => bin(ExprOp::IntArith, op.as_wire(), a, b),
@@ -1023,12 +1196,8 @@ pub struct LogicalProgram {
     /// The compute instructions. Instruction `i` writes register `i`, so this is
     /// the register file too, and its length is the register count.
     instrs: Vec<LogicalInstr>,
-    /// The output payload slots, in slot order — empty for a filter or scalar,
-    /// which write none.
-    sinks: Vec<Sink>,
-    /// The register a filter or scalar result is read out of. `None` for a map,
-    /// which writes [`Self::sinks`] instead and has no result.
-    result_reg: Option<Reg>,
+    /// Where the result goes: one register, or the output slots — never both.
+    output: Output,
     const_strings: Vec<Vec<u8>>,
     /// Bit `r` set iff register `r` holds a string rather than a scalar, as
     /// [`Self::from_instrs`] finished it.
@@ -1043,13 +1212,8 @@ impl LogicalProgram {
     /// Build from typed instructions. The compiler and test builders trust their
     /// own construction, so a structural failure here is a compiler bug, not
     /// client input — [`Self::from_instrs`] panics rather than returns.
-    pub fn new(
-        instrs: Vec<LogicalInstr>,
-        sinks: Vec<Sink>,
-        result_reg: Option<Reg>,
-        const_strings: Vec<Vec<u8>>,
-    ) -> Self {
-        Self::from_instrs(instrs, sinks, result_reg, const_strings)
+    pub fn new(instrs: Vec<LogicalInstr>, output: Output, const_strings: Vec<Vec<u8>>) -> Self {
+        Self::from_instrs(instrs, output, const_strings)
             .unwrap_or_else(|e| panic!("compiler-built LogicalProgram is invalid: {e:?}"))
     }
 
@@ -1066,8 +1230,7 @@ impl LogicalProgram {
     /// decode back.
     pub(crate) fn from_instrs(
         instrs: Vec<LogicalInstr>,
-        sinks: Vec<Sink>,
-        result_reg: Option<Reg>,
+        output: Output,
         const_strings: Vec<Vec<u8>>,
     ) -> Result<Self, ExprValidateErr> {
         use ExprValidateErr as E;
@@ -1079,7 +1242,7 @@ impl LogicalProgram {
         if instrs.len() > MAX_REGS {
             return Err(E::TooManyRegs(instrs.len() as u32));
         }
-        if let Some(r) = result_reg {
+        if let Some(r) = output.result() {
             if !r.written_before(instrs.len()) {
                 return Err(E::RegOutOfRange { reg: r.0, num_regs: instrs.len() as u32 });
             }
@@ -1111,7 +1274,7 @@ impl LogicalProgram {
         }
         // A sink's source register is bounded but not ordered: sinks run after
         // every instruction, so any of them is readable.
-        for reg in sinks.iter().filter_map(|s| s.reg()) {
+        for reg in output.slots().iter().filter_map(|s| s.reg()) {
             if !reg.written_before(instrs.len()) {
                 return Err(E::RegOutOfRange {
                     reg: reg.0,
@@ -1119,13 +1282,7 @@ impl LogicalProgram {
                 });
             }
         }
-        Ok(LogicalProgram {
-            instrs,
-            sinks,
-            result_reg,
-            const_strings,
-            str_class,
-        })
+        Ok(LogicalProgram { instrs, output, const_strings, str_class })
     }
 
     /// A pure projection: `copies[i] = src_col` copies logical input column
@@ -1137,7 +1294,7 @@ impl LogicalProgram {
     /// hand-written test programs.
     pub fn copy_cols(copies: &[u32]) -> Self {
         let sinks = copies.iter().map(|&src_col| Sink::Col(src_col)).collect();
-        LogicalProgram::new(Vec::new(), sinks, None, Vec::new())
+        LogicalProgram::new(Vec::new(), Output::Slots(sinks), Vec::new())
     }
 
     /// The typed instructions, in emission order — instruction `i` writing
@@ -1151,67 +1308,79 @@ impl LogicalProgram {
         &self.const_strings
     }
 
-    /// Serialise to the self-contained wire blob (magic "EXPR"), for a program
-    /// shipped to the engine — the inverse of [`Self::from_blob`]. The one
-    /// encode: `ExprBuilder` never produces wire words, so a blob can only come
-    /// from a program that has already been validated here.
+    /// Serialise to the wire blob — the inverse of [`Self::from_blob`], and the
+    /// one encode: `ExprBuilder` never produces wire words, so a blob can only
+    /// come from a program already validated here.
     pub fn to_blob_bytes(&self) -> Vec<u8> {
-        let code: Vec<u32> = self.instrs.iter().copied().flat_map(LogicalInstr::to_wire).collect();
-        let sinks: Vec<u32> = self.sinks.iter().copied().flat_map(Sink::to_wire).collect();
         gnitz_wire::encode_expr_blob(
-            self.result_reg.map_or(0, |r| r.0 as u32),
-            &code,
-            &sinks,
+            self.output.result().map_or(MAP_OUTPUT, |r| r.0 as u32),
+            self.instrs.iter().copied().map(LogicalInstr::to_wire),
+            self.output.slots().iter().copied().map(Sink::to_wire),
             &self.const_strings,
         )
     }
 
-    /// A predicate or scalar blob: framing decoded, then lowered. `label` names
-    /// the call site in a `CorruptBlob` — the engine's own wrappers cover the
-    /// *invalid program* path, not corrupt framing.
+    /// A program blob: framing decoded, then lowered. The output word says
+    /// which profile it is, so there is one entry point; `label` names the call
+    /// site in a `CorruptBlob`, ahead of the framing's own message.
     pub fn from_blob(blob: &[u8], label: &'static str) -> Result<Self, ExprValidateErr> {
-        let b = gnitz_wire::decode_expr_blob(blob).ok_or(ExprValidateErr::CorruptBlob(label))?;
-        Self::from_wire(&b.code, &b.sinks, Some(Reg(b.result_reg as u16)), b.const_strings)
+        let corrupt = |msg: String| ExprValidateErr::CorruptBlob(format!("{label}: {msg}"));
+        let b = gnitz_wire::decode_expr_blob(blob).map_err(corrupt)?;
+        // Bounded ahead of the narrowing below, which would fold a forged word
+        // onto a register the bytes do not name.
+        let result_reg = match b.output {
+            MAP_OUTPUT => None,
+            w if w as usize > MAX_REGS => {
+                return Err(corrupt(format!(
+                    "result register {w} exceeds the {MAX_REGS}-register file"
+                )))
+            }
+            w => Some(Reg(w as u16)),
+        };
+        let const_strings = b.const_strings.into_iter().map(<[u8]>::to_vec).collect();
+        Self::from_wire(b.code, b.sinks, result_reg, const_strings)
     }
 
-    /// The same for a **map** blob, which has no result register: a map writes
-    /// output slots, so its result is `None` here rather than at each call site.
-    pub fn from_map_blob(blob: &[u8], label: &'static str) -> Result<Self, ExprValidateErr> {
-        let b = gnitz_wire::decode_expr_blob(blob).ok_or(ExprValidateErr::CorruptBlob(label))?;
-        Self::from_wire(&b.code, &b.sinks, None, b.const_strings)
-    }
-
-    /// Lower a wire expr blob — 5-word instructions plus the sink region's
-    /// `[kind, value]` pairs — into the typed logical form. Client-controlled
-    /// throughout: [`Self::decode_instr`] rejects a forged instruction and
-    /// [`Self::from_instrs`] everything structural, neither by panicking.
+    /// Lower a blob's two regions into the typed logical form. Both lengths and
+    /// both counts are checked before either decode loop reads a word, so a
+    /// forged 64 MB region is rejected without being walked.
     pub fn from_wire(
-        code: &[u32],
-        sinks: &[u32],
+        code: &[u8],
+        sinks: &[u8],
         result_reg: Option<Reg>,
         const_strings: Vec<Vec<u8>>,
     ) -> Result<Self, ExprValidateErr> {
-        if !code.len().is_multiple_of(5) || !sinks.len().is_multiple_of(2) {
-            return Err(ExprValidateErr::CorruptBlob("expr region length"));
+        use ExprValidateErr as E;
+        // Whole entries or nothing: a leftover tail is a truncated instruction
+        // or sink pair, which reads as a different program than the bytes spell.
+        let (code, code_tail) = code.as_chunks::<INSTR_BYTES>();
+        let (sinks, sink_tail) = sinks.as_chunks::<SINK_BYTES>();
+        if !code_tail.is_empty() || !sink_tail.is_empty() {
+            return Err(E::CorruptBlob("expr region length".into()));
         }
-        let instrs = code
-            .chunks_exact(5)
-            .map(Self::decode_instr)
-            .collect::<Result<Vec<_>, _>>()?;
-        let sinks = sinks
-            .chunks_exact(2)
-            .map(Self::decode_sink)
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::from_instrs(instrs, sinks, result_reg, const_strings)
+        if code.len() > MAX_REGS {
+            return Err(E::TooManyRegs(code.len() as u32));
+        }
+        if sinks.len() > gnitz_wire::MAX_COLUMNS {
+            return Err(E::CorruptBlob(format!(
+                "sink count {} exceeds {}",
+                sinks.len(),
+                gnitz_wire::MAX_COLUMNS
+            )));
+        }
+        let instrs = code.iter().map(Self::decode_instr).collect::<Result<Vec<_>, _>>()?;
+        let sinks = sinks.iter().map(Self::decode_sink).collect::<Result<Vec<_>, _>>()?;
+        Self::from_instrs(instrs, Output::new(result_reg, sinks)?, const_strings)
     }
 
     /// Decode one sink pair `[kind, value]` — the inverse of [`Sink::to_wire`].
     /// The sink region is its own space, so a bad kind is its own error rather
     /// than an [`ExprOp`] that does not exist.
-    fn decode_sink(p: &[u32]) -> Result<Sink, ExprValidateErr> {
-        match SinkKind::from_wire(p[0]).ok_or(ExprValidateErr::BadSinkKind(p[0]))? {
-            SinkKind::Col => Ok(Sink::Col(p[1])),
-            SinkKind::Reg => Ok(Sink::Reg(Reg(p[1] as u16))),
+    fn decode_sink(p: &[u8; SINK_BYTES]) -> Result<Sink, ExprValidateErr> {
+        let (kind, value) = (gnitz_wire::read_u32_le(p, 0), gnitz_wire::read_u32_le(p, 4));
+        match SinkKind::from_wire(kind).ok_or(ExprValidateErr::BadSinkKind(kind))? {
+            SinkKind::Col => Ok(Sink::Col(value)),
+            SinkKind::Reg => Ok(Sink::Reg(Reg(value as u16))),
         }
     }
 
@@ -1224,13 +1393,16 @@ impl LogicalProgram {
     /// through `no_sel`. Together that makes the accepted `(op, selector)` set
     /// computable from the enums instead of from a hand-synced table.
     ///
-    /// Not a bijection, and no test should assert one: unused operand words are
-    /// ignored rather than rejected, and a register operand truncates to `u16`.
-    pub(crate) fn decode_instr(t: &[u32]) -> Result<LogicalInstr, ExprValidateErr> {
+    /// Not a bijection: unused operand words are ignored, and a register operand
+    /// truncates to `u16`. Safe because every register is bounded afterwards
+    /// against the register file — an operand by [`operands`] through
+    /// `Reg::written_before`, the result and every sink by [`Self::from_instrs`].
+    pub(crate) fn decode_instr(t: &[u8; INSTR_BYTES]) -> Result<LogicalInstr, ExprValidateErr> {
         use LogicalInstr as L;
-        let op = ExprOp::from_wire(t[0]).ok_or(ExprValidateErr::UnknownOpcode(t[0]))?;
-        let (opw, sel) = (t[0], t[1]);
-        let (a, b, c) = (Reg(t[2] as u16), Reg(t[3] as u16), Reg(t[4] as u16));
+        let w = |i: usize| gnitz_wire::read_u32_le(t, i * 4);
+        let op = ExprOp::from_wire(w(0)).ok_or(ExprValidateErr::UnknownOpcode(w(0)))?;
+        let (opw, sel) = (w(0), w(1));
+        let (a, b, c) = (Reg(w(2) as u16), Reg(w(3) as u16), Reg(w(4) as u16));
         // One statement of the one thing a selector can be wrong about: it names
         // no member of this opcode's family.
         let bad_sel = || ExprValidateErr::BadSelector { op: opw, selector: sel };
@@ -1240,11 +1412,9 @@ impl LogicalProgram {
         // arms below stay one-liners.
         let cmp_op = || CmpOp::from_wire(sel).ok_or_else(bad_sel);
         Ok(match op {
-            ExprOp::LoadColInt => no_sel(L::LoadColInt { col: t[2] })?,
-            ExprOp::LoadColFloat => no_sel(L::LoadColFloat { col: t[2] })?,
-            ExprOp::LoadConst => no_sel(L::LoadConst {
-                val: gnitz_wire::decode_load_const(t[2], t[3]),
-            })?,
+            ExprOp::LoadColInt => no_sel(L::LoadColInt { col: w(2) })?,
+            ExprOp::LoadColFloat => no_sel(L::LoadColFloat { col: w(2) })?,
+            ExprOp::LoadConst => no_sel(L::LoadConst { val: decode_load_const(w(2), w(3)) })?,
             ExprOp::IntArith => L::IntArith {
                 op: IntArithOp::from_wire(sel).ok_or_else(bad_sel)?,
                 a,
@@ -1277,19 +1447,19 @@ impl LogicalProgram {
             ExprOp::LoadNull => no_sel(L::LoadNull)?,
             ExprOp::BoolBinary => L::BoolBinary { a, b, is_or: flag(opw, sel)? },
             ExprOp::BoolNot => no_sel(L::BoolNot { a })?,
-            ExprOp::IsNull => L::IsNull { col: t[2], invert: flag(opw, sel)? },
+            ExprOp::IsNull => L::IsNull { col: w(2), invert: flag(opw, sel)? },
             ExprOp::IsNullReg => L::IsNullReg { a, invert: flag(opw, sel)? },
             ExprOp::StrColConst => L::StrColConst {
                 op: cmp_op()?,
-                col: t[2],
-                const_idx: ConstIdx(t[3]),
+                col: w(2),
+                const_idx: ConstIdx(w(3)),
             },
-            ExprOp::StrColCol => L::StrColCol { op: cmp_op()?, col_a: t[2], col_b: t[3] },
+            ExprOp::StrColCol => L::StrColCol { op: cmp_op()?, col_a: w(2), col_b: w(3) },
             // `set_idx` takes a whole u32 const index, never truncated to a
             // register's u16.
-            ExprOp::IntInSet => no_sel(L::IntInSet { value_reg: a, set_idx: ConstIdx(t[3]) })?,
-            ExprOp::LoadColStr => no_sel(L::LoadColStr { col: t[2] })?,
-            ExprOp::LoadConstStr => no_sel(L::LoadConstStr { const_idx: ConstIdx(t[2]) })?,
+            ExprOp::IntInSet => no_sel(L::IntInSet { value_reg: a, set_idx: ConstIdx(w(3)) })?,
+            ExprOp::LoadColStr => no_sel(L::LoadColStr { col: w(2) })?,
+            ExprOp::LoadConstStr => no_sel(L::LoadConstStr { const_idx: ConstIdx(w(2)) })?,
             ExprOp::LoadNullStr => no_sel(L::LoadNullStr)?,
             ExprOp::StrSelect => no_sel(L::StrSelect { cond: a, a: b, b: c })?,
             ExprOp::StrCmp => L::StrCmp { op: cmp_op()?, a, b },
@@ -1298,18 +1468,18 @@ impl LogicalProgram {
             ExprOp::StrSubstr => no_sel(L::StrSubstr {
                 src: a,
                 start_reg: b,
-                len_reg: (t[4] != u32::MAX).then_some(c),
+                len_reg: (w(4) != u32::MAX).then_some(c),
             })?,
             ExprOp::StrTrim => L::StrTrim {
                 a,
                 mode: TrimMode::from_wire(sel).ok_or_else(bad_sel)?,
-                set_idx: ConstIdx(t[3]),
+                set_idx: ConstIdx(w(3)),
             },
             // `ci` lives in the selector, so nothing downstream re-derives it.
             ExprOp::StrLike => L::StrLike {
                 src: a,
-                escape: like_escape(t[3])?,
-                pat_idx: ConstIdx(t[4]),
+                escape: like_escape(w(3))?,
+                pat_idx: ConstIdx(w(4)),
                 ci: flag(opw, sel)?,
             },
             ExprOp::StrConcat => L::StrConcat { a, b, skip_null: flag(opw, sel)? },
@@ -1339,10 +1509,11 @@ impl LogicalProgram {
         if !self.instrs.is_empty() {
             return None;
         }
-        let Sink::Col(base) = *self.sinks.first()? else {
+        let slots = self.output.slots();
+        let Sink::Col(base) = *slots.first()? else {
             return None;
         };
-        self.sinks
+        slots
             .iter()
             .enumerate()
             .all(|(i, s)| matches!(*s, Sink::Col(c) if c == base + i as u32))
@@ -1399,7 +1570,7 @@ impl LogicalProgram {
         // const-pool index to the cell it was encoded into.
         let mut const_cells: Vec<[u8; 16]> = Vec::new();
         let mut cell_slots: Vec<Option<u32>> = vec![None; self.const_strings.len()];
-        let mut copies: Vec<(ColumnLocator, u32, u8)> = Vec::with_capacity(self.sinks.len());
+        let mut copies: Vec<(ColumnLocator, u32, u8)> = Vec::with_capacity(self.output.slots().len());
         // Split where the class is in hand, so nothing later re-tests it.
         let mut scalar_emits: Vec<(u16, u32)> = Vec::new();
         let mut str_emits: Vec<(u16, u32)> = Vec::new();
@@ -1431,7 +1602,7 @@ impl LogicalProgram {
         // Sinks name an output slot, not a computation, and the map materializes
         // them columnar-side off `copies`/`emits`, so they never reach the
         // kernel dispatch. Slot order is their position.
-        for (out, sink) in self.sinks.iter().enumerate() {
+        for (out, sink) in self.output.slots().iter().enumerate() {
             let out = out as u32;
             match *sink {
                 Sink::Col(src_col) => {
@@ -1661,7 +1832,7 @@ impl LogicalProgram {
             const_regs,
             const_str_regs,
             num_regs,
-            result_reg: self.result_reg.map_or(0, |r| r.0 as u32),
+            result_reg: self.output.result().map_or(0, |r| r.0 as u32),
             const_cells,
             int_sets,
             trim_sets,
@@ -1677,37 +1848,27 @@ impl LogicalProgram {
                 .find(|&r| (str_class >> r) & 1 == 0)
                 .map_or(0, |r| r + 1),
             str_cols,
-            result_is_str: self.result_reg.is_some_and(|r| (str_class >> r.0) & 1 != 0),
+            result_is_str: self.output.result().is_some_and(|r| (str_class >> r.0) & 1 != 0),
             is_filter: matches!(role, Role::Filter),
         }
     }
 
-    /// [`Self::validate`] plus the extra rules the [`Role`] fixes: a filter and a
-    /// scalar read their result back out of a register and must own one, and a
-    /// filter's must not be a string register — it consumes the result as a
-    /// packed truth bit, where `resolve_scalar` *wants* a string and reads it
-    /// back as [`crate::ExprResults::Str`].
+    /// [`Self::validate`] plus the rule the [`Role`] fixes: the output must be
+    /// the shape this consumer reads, and a filter's result register must not be
+    /// a string one — a filter reads the verdict as a packed truth bit, where
+    /// `resolve_scalar` wants the string back.
     pub(crate) fn validate_for(&self, schema: &dyn SchemaFacts, role: Role<'_>) -> Result<(), ExprValidateErr> {
         self.validate(schema, role.out_schema())?;
-        match role {
-            Role::Map(_) => Ok(()),
-            Role::Filter | Role::Scalar => {
-                // Neither role writes an output slot, so a sink has no
-                // destination to resolve.
-                if !self.sinks.is_empty() {
-                    return Err(ExprValidateErr::OutputSlotCountMismatch {
-                        sinks: self.sinks.len(),
-                        num_payload_cols: 0,
-                    });
-                }
-                let Some(r) = self.result_reg else {
-                    return Err(ExprValidateErr::ResultRegRequired);
-                };
-                if matches!(role, Role::Filter) && (self.str_class >> r.0) & 1 != 0 {
-                    return Err(ExprValidateErr::RegClassMismatch { reg: r.0 });
-                }
-                Ok(())
+        match (role, &self.output) {
+            (Role::Map(_), Output::Slots(_)) => Ok(()),
+            (Role::Filter, Output::Result(r)) if (self.str_class >> r.0) & 1 != 0 => {
+                Err(ExprValidateErr::RegClassMismatch { reg: r.0 })
             }
+            (Role::Filter | Role::Scalar, Output::Result(_)) => Ok(()),
+            // A filter or scalar handed output slots, or a map handed a result
+            // register. Both directions matter: a zero-payload map is the one
+            // `validate`'s slot-count check cannot separate from a predicate.
+            _ => Err(ExprValidateErr::OutputRoleMismatch),
         }
     }
 
@@ -1729,19 +1890,18 @@ impl LogicalProgram {
                 check_col(in_schema, col, kind)?;
             }
         }
-        // Ahead of the per-sink rules, which address `out_schema` by sink
-        // position: covering the output exactly is what keeps every position in
-        // range.
         if let Some(os) = out_schema {
-            if self.sinks.len() != os.num_payload_cols() {
+            // Ahead of the per-sink rules, which address `out_schema` by sink
+            // position: covering the output exactly is what keeps every position
+            // in range.
+            let sinks = self.output.slots();
+            if sinks.len() != os.num_payload_cols() {
                 return Err(ExprValidateErr::OutputSlotCountMismatch {
-                    sinks: self.sinks.len(),
+                    sinks: sinks.len(),
                     num_payload_cols: os.num_payload_cols(),
                 });
             }
-        }
-        if let Some(os) = out_schema {
-            for (out, sink) in self.sinks.iter().enumerate() {
+            for (out, sink) in sinks.iter().enumerate() {
                 let out = out as u32;
                 match *sink {
                     // Columnar, bypassing the register file, so any source
@@ -1806,14 +1966,14 @@ impl LogicalProgram {
         // A sink stores a register's **value**, never its truth bit: that is what
         // keeps an emitted boolean out of `bit_only`, where its producer would skip
         // the unpack and the map would ship the previous morsel's lane.
-        for reg in self.sinks.iter().filter_map(|s| s.reg()) {
+        for reg in self.output.slots().iter().filter_map(|s| s.reg()) {
             non_bool_read |= 1u64 << reg.0;
         }
         // A filter's `result_reg` is forced to be a bool input: the filter's
         // nullable arm consumes the result as packed bits, so its producer must
         // populate `bool_bits` whatever opcode it is. A scalar's is read as a value
         // (`reg_values`), so a boolean producer there must unpack into the lane.
-        if let Some(r) = self.result_reg {
+        if let Some(r) = self.output.result() {
             if matches!(role, Role::Filter) {
                 bool_input |= 1u64 << r.0;
             } else {
@@ -2179,7 +2339,7 @@ fn cast_target(op: u32, selector: u32) -> Result<FixedInt, ExprValidateErr> {
 }
 
 /// A two-member family's selector as the boolean field the instruction carries
-/// it in — the eleven flag pairs that used to be an opcode each.
+/// it in.
 fn flag(op: u32, selector: u32) -> Result<bool, ExprValidateErr> {
     match selector {
         0 => Ok(false),
@@ -2271,7 +2431,7 @@ fn check_emit_slot(out_schema: &dyn SchemaFacts, out: u32, is_str: bool) -> Resu
 
 /// The `ExprOp::IntInSet` const-pool layout, `N × 8-byte LE`, stated once for
 /// [`LogicalProgram::from_instrs`] and the decoder below.
-/// `gnitz_wire::ExprOp::IntInSet` owns the wire contract; the emitter writes it
+/// [`ExprOp::IntInSet`] owns the wire contract; the emitter writes it
 /// with `gnitz_wire::as_le_bytes`.
 fn int_set_len_ok(len: usize) -> bool {
     len.is_multiple_of(8)

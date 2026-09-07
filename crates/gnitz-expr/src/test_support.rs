@@ -10,7 +10,8 @@
 use gnitz_wire::type_code as tc;
 
 use crate::{
-    BatchView, ColumnLocator, Evaluator, ExprResults, LogicalInstr, LogicalProgram, Reg, RowSource, SchemaFacts, Sink,
+    BatchView, ColumnLocator, Evaluator, ExprResults, LogicalInstr, LogicalProgram, Output, Reg, RowSource,
+    SchemaFacts, Sink,
 };
 
 /// A [`BatchView`] over owned buffers, laid out region-wise like the physical
@@ -306,7 +307,7 @@ pub fn scalar_prog(
     result_reg: Reg,
     const_strings: Vec<Vec<u8>>,
 ) -> Evaluator {
-    LogicalProgram::new(instrs, Vec::new(), Some(result_reg), const_strings)
+    LogicalProgram::new(instrs, Output::Result(result_reg), const_strings)
         .resolve_scalar(schema)
         .expect("test program must validate")
 }
@@ -322,7 +323,7 @@ pub fn filter_prog(
     result_reg: Reg,
     const_strings: Vec<Vec<u8>>,
 ) -> Evaluator {
-    LogicalProgram::new(instrs, Vec::new(), Some(result_reg), const_strings)
+    LogicalProgram::new(instrs, Output::Result(result_reg), const_strings)
         .resolve_filter(schema)
         .expect("test predicate must validate")
 }
@@ -351,7 +352,7 @@ pub fn map_prog(
     sinks: Vec<Sink>,
     const_strings: Vec<Vec<u8>>,
 ) -> Evaluator {
-    LogicalProgram::new(instrs, sinks, None, const_strings)
+    LogicalProgram::new(instrs, Output::Slots(sinks), const_strings)
         .resolve_map(in_schema, out_schema)
         .expect("test map must validate")
 }

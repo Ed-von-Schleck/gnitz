@@ -10,9 +10,9 @@ fn the_blob_round_trips_through_the_wire_decoder() {
     let c = b.emit(L::LoadConst { val: 1_234_567_890_123 });
     let col = b.emit(L::LoadColInt { col: 0 });
     let cond = b.emit(L::Cmp { op: CmpOp::Gt, a: col, b: c });
-    let s_idx = b.add_const_string("längre sträng".to_string());
+    let s_idx = b.add_const_string("längre sträng");
     let _ = b.emit(L::StrColConst { op: CmpOp::Eq, col: 1, const_idx: s_idx });
-    let _ = b.add_const_string(String::new());
+    let _ = b.add_const_string("");
     let sel = b.emit(L::Select { cond, a: col, b: c });
     let prog = b.build(Some(sel)).expect("a well-formed program");
 
@@ -32,8 +32,8 @@ fn the_builder_folds_identical_instructions_and_pool_entries() {
     assert_ne!(c, a);
     let sum = b.emit(L::IntArith { op: IntArithOp::Add, a, b: c });
     assert_eq!(b.emit(L::IntArith { op: IntArithOp::Add, a, b: c }), sum);
-    let s1 = b.add_const_string("x".to_string());
-    assert_eq!(b.add_const_string("x".to_string()), s1);
+    let s1 = b.add_const_string("x");
+    assert_eq!(b.add_const_string("x"), s1);
     let l1 = b.emit(L::LoadConstStr { const_idx: s1 });
     assert_eq!(b.emit(L::LoadConstStr { const_idx: s1 }), l1);
     let prog = b.build(Some(sum)).expect("a well-formed program");

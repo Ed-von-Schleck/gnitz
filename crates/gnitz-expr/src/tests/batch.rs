@@ -5,8 +5,8 @@
 
 use std::ops::Neg;
 
-use crate::{ConstIdx, FloatArithOp, IntArithOp, Reg};
-use gnitz_wire::{type_code, FixedInt, TrimMode};
+use crate::{ConstIdx, FloatArithOp, IntArithOp, Reg, TrimMode};
+use gnitz_wire::{type_code, FixedInt};
 use std::num::NonZeroU8;
 
 use super::{decode_f64, encode_f64, eval_batch, with_str_bufs, EvalScratch, MORSEL, NULL_WORDS_PER_REG};

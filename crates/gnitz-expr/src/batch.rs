@@ -1506,7 +1506,7 @@ impl<'a> StrOperand<'a> {
 /// The one string-compare kernel. The compare runs unconditionally, including on
 /// rows where either operand's column is null, keeping the loop branch-free.
 ///
-/// `#[inline(always)]` here and on [`str_cmp`] is load-bearing, not a hint: only
+/// `#[inline(always)]` here and on [`str_cmp`]: only
 /// at the call site is a constant operand's `stride` the literal 0, and only
 /// then does the row loop fold `row * stride` away instead of bounds-checking
 /// both cell windows per row. Left to the inliner's own judgement each predicate

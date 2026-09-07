@@ -2,7 +2,7 @@ use super::*;
 use crate::protocol::types::{ColumnDef, PkColumn, TypeCode};
 use crate::protocol::wal_block::{decode_wal_block_verified, encode_wal_block};
 use gnitz_expr::{
-    BatchView, CmpOp, Evaluator, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Reg, SchemaFacts,
+    BatchView, CmpOp, Evaluator, ExprResults, IntArithOp, LogicalInstr, LogicalProgram, Output, Reg, SchemaFacts,
 };
 
 /// One row's scalar result. `Evaluator` drives whole batches, and these tests
@@ -223,8 +223,7 @@ fn the_shared_evaluator_reads_a_client_batch() {
                 b: Reg(1),
             },
         ],
-        Vec::new(),
-        Some(Reg(2)),
+        Output::Result(Reg(2)),
         vec![],
     )
     .resolve_scalar(&schema)
@@ -256,8 +255,7 @@ fn nullable_payload_null_bits_reach_the_evaluator() {
                 b: Reg(1),
             },
         ],
-        Vec::new(),
-        Some(Reg(2)),
+        Output::Result(Reg(2)),
         vec![],
     )
     .resolve_scalar(&schema)
@@ -282,8 +280,7 @@ fn filter_over_the_region_path() {
             LogicalInstr::LoadConst { val: 0 },
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         ],
-        Vec::new(),
-        Some(Reg(2)),
+        Output::Result(Reg(2)),
         vec![],
     )
     .resolve_filter(&schema)
@@ -303,8 +300,7 @@ fn string_columns_compare_through_the_shared_blob_heap() {
     // STRING (ci4) vs BLOB (ci5): both pass `check_col(GermanString)`.
     let ev = LogicalProgram::new(
         vec![LogicalInstr::StrColCol { op: CmpOp::Lt, col_a: 4, col_b: 5 }],
-        Vec::new(),
-        Some(Reg(0)),
+        Output::Result(Reg(0)),
         vec![],
     )
     .resolve_scalar(&schema)

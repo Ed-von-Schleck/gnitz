@@ -17,10 +17,8 @@ use super::*;
 /// circuit can carry one — which is the input the pre-flight exists to catch.
 fn over_cap_pred_blob() -> Vec<u8> {
     let n = gnitz_expr::MAX_REGS as u32 + 1;
-    let code: Vec<u32> = (0..n)
-        .flat_map(|dst| gnitz_expr::LogicalInstr::LoadConst { val: dst as i64 }.to_wire())
-        .collect();
-    gnitz_wire::encode_expr_blob(n - 1, &code, &[], &[] as &[&[u8]])
+    let code = (0..n).map(|dst| gnitz_expr::LogicalInstr::LoadConst { val: dst as i64 }.to_wire());
+    gnitz_wire::encode_expr_blob(n - 1, code, std::iter::empty(), &[] as &[&[u8]])
 }
 
 /// `ScanDelta(base_tid) → IntegrateTrace → Filter(pred) → Integrate` for `vid`.

@@ -186,7 +186,7 @@ fn union_concatenates_unconsolidated_inputs_and_leaves_them_raw() {
 /// is linear, so a consolidated input stays consolidated.
 #[test]
 fn filter_keeps_exactly_the_matching_rows() {
-    use gnitz_expr::{CmpOp, LogicalInstr, LogicalProgram, Reg};
+    use gnitz_expr::{CmpOp, LogicalInstr, LogicalProgram, Output, Reg};
 
     let schema = make_schema_u64_i64();
     let rows: &[(u64, i64, i64)] = &[
@@ -207,7 +207,7 @@ fn filter_keeps_exactly_the_matching_rows() {
         LogicalInstr::LoadConst { val: 10 },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
     ];
-    let func = LogicalProgram::new(instrs, Vec::new(), Some(Reg(2)), vec![])
+    let func = LogicalProgram::new(instrs, Output::Result(Reg(2)), vec![])
         .resolve_filter(&schema)
         .unwrap();
 
@@ -225,8 +225,7 @@ fn filter_keeps_exactly_the_matching_rows() {
             LogicalInstr::LoadConst { val: -1 },
             LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
         ],
-        Vec::new(),
-        Some(Reg(2)),
+        Output::Result(Reg(2)),
         vec![],
     )
     .resolve_filter(&schema)

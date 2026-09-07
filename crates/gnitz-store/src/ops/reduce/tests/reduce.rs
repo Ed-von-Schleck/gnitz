@@ -464,7 +464,7 @@ fn linear_sum_only_emptied_group_eliminated() {
 #[test]
 fn linear_sum_only_new_all_null_group_present() {
     use crate::schema::{type_code, SchemaColumn};
-    use gnitz_expr::{CmpOp, IntArithOp, LogicalInstr, LogicalProgram, Reg, Sink};
+    use gnitz_expr::{CmpOp, IntArithOp, LogicalInstr, LogicalProgram, Output, Reg, Sink};
 
     // Input: pk(U64), grp(I64), val(I64 nullable).
     let in_schema = SchemaDescriptor::new(
@@ -513,7 +513,7 @@ fn linear_sum_only_new_all_null_group_present() {
     // fin payload 0 = grp; fin payload 1 = the gated sum.
     let sinks = vec![Sink::Col(1), Sink::Reg(Reg(4))];
     let fin_func = crate::expr::MapPlan::from_map(
-        LogicalProgram::new(instrs, sinks, None, vec![]),
+        LogicalProgram::new(instrs, Output::Slots(sinks), vec![]),
         &out_schema,
         &fin_schema,
         PkSource::Inherit,
@@ -623,7 +623,7 @@ fn count_star_only_emptied_group_eliminated() {
 #[test]
 fn test_reduce_nullable_sum_retraction_becomes_null() {
     use crate::schema::{type_code, SchemaColumn};
-    use gnitz_expr::{CmpOp, IntArithOp, LogicalInstr, LogicalProgram, Reg, Sink};
+    use gnitz_expr::{CmpOp, IntArithOp, LogicalInstr, LogicalProgram, Output, Reg, Sink};
 
     // Input: pk(U64), grp(I64), val(I64, NULLABLE).
     let in_schema = SchemaDescriptor::new(
@@ -677,7 +677,7 @@ fn test_reduce_nullable_sum_retraction_becomes_null() {
     // fin payload 0 = grp, 1 = count, 2 = the gated sum.
     let sinks = vec![Sink::Col(1), Sink::Col(2), Sink::Reg(Reg(4))];
     let fin_func = crate::expr::MapPlan::from_map(
-        LogicalProgram::new(instrs, sinks, None, vec![]),
+        LogicalProgram::new(instrs, Output::Slots(sinks), vec![]),
         &out_schema,
         &fin_schema,
         PkSource::Inherit,

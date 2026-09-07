@@ -415,7 +415,7 @@ impl MapPlan {
         // The only map whose program is client bytes; every other kind builds
         // one from a column list. Rejected, not skipped: skipping a corrupt blob
         // would leave the output at the default empty schema.
-        let prog = LogicalProgram::from_map_blob(&map.program, "map")
+        let prog = LogicalProgram::from_blob(&map.program, "map")
             .map_err(|e| OpBuildErr::Program("map: invalid program", e))?;
         Self::from_map(prog, in_schema, &out_schema, PkSource::Inherit)
             .map_err(|e| OpBuildErr::Program("map: program/schema mismatch", e))

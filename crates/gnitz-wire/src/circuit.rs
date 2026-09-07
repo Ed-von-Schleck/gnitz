@@ -363,7 +363,8 @@ pub enum MapKind {
 }
 
 /// Typed operator-node payload. Expression blobs are stored as raw `Vec<u8>` and decoded
-/// with `gnitz_wire::decode_expr_blob`.
+/// with `gnitz_expr::LogicalProgram::from_blob`, which validates the program the
+/// framing here only frames.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpNode {
     /// Delta input for `source`.

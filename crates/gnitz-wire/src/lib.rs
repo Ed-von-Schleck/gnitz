@@ -70,9 +70,8 @@ macro_rules! wire_enum {
             /// Resolved against the discriminants themselves rather than a
             /// second table of arms, which is what makes a decode/declaration
             /// disagreement unrepresentable. A scan is not a table lookup worth
-            /// writing twice: over a dense discriminant run — `ExprOp`'s
-            /// `1..=45`, the widest set here — LLVM folds this to a branchless
-            /// range check with no `.rodata` table at all.
+            /// writing twice: over a dense discriminant run LLVM folds this to a
+            /// branchless range check with no `.rodata` table at all.
             #[inline]
             pub const fn from_wire(v: $repr) -> Option<Self> {
                 let mut i = 0;

@@ -204,11 +204,6 @@ fn lit_eq(a: &[u8], b: &[u8], ci: bool) -> bool {
 /// where eight costs `str_like` 9 % — `memcmp` does eight bytes in one word.
 const SHORT_LIT: usize = 4;
 
-/// The byte offset of the first occurrence of `needle` in `h`, `Some(0)` for an
-/// empty needle: a candidate scan on the needle's first byte, then a window
-/// compare, ASCII-case-insensitively under `ci`. LIKE's `%x%` shape reads it as
-/// a verdict; STRPOS, REPLACE and SPLIT_PART read the offset.
-///
 /// Candidate-start count at or below which [`find`] scans byte by byte. `memchr`'s
 /// runtime dispatch and vector prologue are a fixed ~33 retired instructions, and
 /// short is not a corner: an inline German string, and the haystack `fields`,

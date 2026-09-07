@@ -609,7 +609,7 @@ fn compile_projection(
     in_schema: &SchemaDescriptor,
     out_schema: &SchemaDescriptor,
 ) -> Result<MapPlan, StoreError> {
-    LogicalProgram::from_map_blob(blob, "scan_spec projection")
+    LogicalProgram::from_blob(blob, "scan_spec projection")
         .and_then(|p| MapPlan::from_map(p, in_schema, out_schema, PkSource::Inherit))
         .map_err(|e| StoreError::rejected(format!("scan_spec: invalid projection program: {e}")))
 }

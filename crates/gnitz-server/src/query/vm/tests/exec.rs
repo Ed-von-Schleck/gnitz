@@ -124,7 +124,7 @@ fn test_filter_negate_pipeline() {
             b: Reg(1),
         }, // r2 = r0 > r1
     ];
-    let pred_prog = gnitz_expr::LogicalProgram::new(pred_instrs, Vec::new(), Some(Reg(2)), vec![]);
+    let pred_prog = gnitz_expr::LogicalProgram::new(pred_instrs, gnitz_expr::Output::Result(Reg(2)), vec![]);
     let mut builder = ProgramBuilder::new();
     let pred_idx = builder.push_predicate(pred_prog.resolve_filter(&schema).unwrap());
     builder.push(Instr::Filter {

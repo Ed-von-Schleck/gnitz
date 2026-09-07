@@ -1,10 +1,9 @@
 use crate::error::GnitzSqlError;
 use gnitz_core::{ColumnDef, TypeCode};
 
-/// TRIM's mode is a wire operand, so the wire crate owns its definition; the IR
-/// carries it verbatim.
-pub(crate) use gnitz_expr::FloatUnaryOp;
-pub(crate) use gnitz_wire::TrimMode;
+/// Both are instruction selectors, so the evaluator crate owns their
+/// definitions; the IR carries each verbatim rather than restating it.
+pub(crate) use gnitz_expr::{FloatUnaryOp, TrimMode};
 
 #[derive(Clone, Debug, Copy, PartialEq)]
 pub(crate) enum AggFunc {

@@ -7,7 +7,7 @@
 //! structural rules (register limit, operand order, const-pool bounds) are
 //! decided there, so a caller emits first and is told what is unsupported once.
 
-use crate::{ConstIdx, ExprValidateErr, LogicalInstr, LogicalProgram, Reg, Sink, MAX_REGS};
+use crate::{ConstIdx, ExprValidateErr, LogicalInstr, LogicalProgram, Output, Reg, Sink, MAX_REGS};
 
 /// Accumulates the instructions, sinks and constants of one expression program.
 #[derive(Default)]
@@ -20,6 +20,13 @@ pub struct ExprBuilder {
 impl ExprBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// False once the program is past the register cap, where `build` rejects it
+    /// whatever follows — so both dedup scans below stop paying there, and
+    /// lowering a huge expression stays linear rather than quadratic in its size.
+    fn within_reg_cap(&self) -> bool {
+        self.instrs.len() <= MAX_REGS
     }
 
     /// The register holding `instr`'s value: the one an identical instruction
@@ -40,10 +47,7 @@ impl ExprBuilder {
             },
             _ => instr,
         };
-        // The fold scan stops paying once the program is already past the
-        // register cap — `build` rejects it whatever follows — so lowering a
-        // huge expression stays linear instead of quadratic in its size.
-        if self.instrs.len() <= MAX_REGS {
+        if self.within_reg_cap() {
             if let Some(i) = self.instrs.iter().position(|e| *e == instr) {
                 return Reg(i as u16);
             }
@@ -61,18 +65,20 @@ impl ExprBuilder {
 
     /// The const-pool index of `bytes`, shared with an earlier equal entry. The
     /// pool is byte-transparent — german-string cells and packed i64 sets share
-    /// it, each read by the opcode that indexes it.
-    fn add_const_bytes(&mut self, bytes: Vec<u8>) -> ConstIdx {
-        if let Some(i) = self.const_strings.iter().position(|c| *c == bytes) {
-            return ConstIdx(i as u32);
+    /// it, each read by the opcode that indexes it. Only a miss allocates.
+    fn add_const_bytes(&mut self, bytes: &[u8]) -> ConstIdx {
+        if self.within_reg_cap() {
+            if let Some(i) = self.const_strings.iter().position(|c| c.as_slice() == bytes) {
+                return ConstIdx(i as u32);
+            }
         }
         let idx = ConstIdx(self.const_strings.len() as u32);
-        self.const_strings.push(bytes);
+        self.const_strings.push(bytes.to_vec());
         idx
     }
 
-    pub fn add_const_string(&mut self, s: String) -> ConstIdx {
-        self.add_const_bytes(s.into_bytes())
+    pub fn add_const_string(&mut self, s: &str) -> ConstIdx {
+        self.add_const_bytes(s.as_bytes())
     }
 
     /// The register holding `v`'s f64 image. A float register *is* an i64 slot
@@ -90,7 +96,7 @@ impl ExprBuilder {
     /// turn a skewed pool into a wrong answer. Callers still sort (and dedup) to
     /// keep the pool small.
     pub fn add_const_int_set(&mut self, values: &[i64]) -> ConstIdx {
-        self.add_const_bytes(gnitz_wire::as_le_bytes(values).to_vec())
+        self.add_const_bytes(gnitz_wire::as_le_bytes(values))
     }
 
     /// The builder's one exit: the typed program, held to every structural rule
@@ -100,8 +106,11 @@ impl ExprBuilder {
     /// wire round trip to be validated.
     ///
     /// `result_reg` is `None` for a map, which reads its output off the sinks.
+    /// The two are exclusive, and [`Output::new`] is where a caller that named
+    /// both is told so.
     pub fn build(self, result_reg: Option<Reg>) -> Result<LogicalProgram, ExprValidateErr> {
-        LogicalProgram::from_instrs(self.instrs, self.sinks, result_reg, self.const_strings)
+        let output = Output::new(result_reg, self.sinks)?;
+        LogicalProgram::from_instrs(self.instrs, output, self.const_strings)
     }
 }
 

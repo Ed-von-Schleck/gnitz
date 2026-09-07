@@ -44,7 +44,7 @@ fn try_compile_string_cmp(
         }
         _ => return None,
     };
-    let const_idx = eb.add_const_string(s.clone());
+    let const_idx = eb.add_const_string(s);
     Some(eb.emit(L::StrColConst { op: cmp, col: col as u32, const_idx }))
 }
 
@@ -94,7 +94,7 @@ impl OpcodeBackend<'_> {
             BoundExpr::LitInt(v) => Ok((self.eb.emit(L::LoadConst { val: *v }), ExprKind::Int)),
             BoundExpr::LitFloat(v) => Ok((self.eb.const_f64(*v), ExprKind::Float)),
             BoundExpr::LitStr(s) => {
-                let idx = self.eb.add_const_string(s.clone());
+                let idx = self.eb.add_const_string(s);
                 Ok((self.eb.emit(L::LoadConstStr { const_idx: idx }), ExprKind::Str))
             }
             // The register file is 8 bytes wide, so a wide literal has no slot.
@@ -318,7 +318,7 @@ impl OpcodeBackend<'_> {
 
     fn trim_call(&mut self, s: &BoundExpr, mode: TrimMode, set: &str) -> Result<(Reg, ExprKind), GnitzSqlError> {
         let src = self.str_operand(s, false)?;
-        let set_idx = self.eb.add_const_string(set.to_string());
+        let set_idx = self.eb.add_const_string(set);
         Ok((self.eb.emit(L::StrTrim { a: src, mode, set_idx }), ExprKind::Str))
     }
 
@@ -332,7 +332,7 @@ impl OpcodeBackend<'_> {
         ci: bool,
     ) -> Result<(Reg, ExprKind), GnitzSqlError> {
         let src = self.str_operand(s, false)?;
-        let pat_idx = self.eb.add_const_string(pattern.to_string());
+        let pat_idx = self.eb.add_const_string(pattern);
         // A NUL escape is `ESCAPE ''` — no escape at all — which the binder has
         // already rejected as a literal, so nothing is lost by the narrowing.
         let escape = escape.and_then(std::num::NonZeroU8::new);
@@ -345,7 +345,7 @@ impl OpcodeBackend<'_> {
     /// string; only the accumulator's own NULL (from `str_concat_nn`)
     /// propagates.
     fn concat_n(&mut self, args: &[BoundExpr]) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        let empty = self.eb.add_const_string(String::new());
+        let empty = self.eb.add_const_string("");
         let mut acc = self.eb.emit(L::LoadConstStr { const_idx: empty });
         for a in args {
             let r = self.str_operand(a, true)?;

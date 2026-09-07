@@ -1,4 +1,4 @@
-use gnitz_expr::{ExprValidateErr, LogicalProgram, Reg, Sink};
+use gnitz_expr::{ExprValidateErr, LogicalProgram, Output, Reg, Sink};
 
 use super::{MapPlan, PkSource};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
@@ -67,7 +67,7 @@ fn test_map_copy_and_emit() {
         },
     ];
     let sinks = vec![Sink::Col(1), Sink::Reg(Reg(2))];
-    let prog = LogicalProgram::new(instrs, sinks, None, vec![]);
+    let prog = LogicalProgram::new(instrs, Output::Slots(sinks), vec![]);
 
     let func = MapPlan::from_map(prog, &in_schema, &out_schema, PkSource::Inherit).unwrap();
     let result = func.evaluate_map_batch(&batch);
@@ -277,19 +277,17 @@ fn test_map_copy_col_widens_into_promoted_slot() {
     assert_eq!(widened(3), c3 as i64, "U8 payload zero-extends");
 }
 
-/// An instruction-free program has no result register — framing accepts it,
-/// and `validate` cannot reject it outright because that is exactly the shape
-/// every `copy_cols` map has. The *filter* and *scalar* roles are the
-/// ones that read a result register back, so each rejects it rather than letting
-/// it masquerade as a filter that passes nothing (which a client would read as
-/// an empty table).
+/// An instruction-free program writes output slots — the shape every `copy_cols`
+/// map has, so `validate` cannot reject it outright. The filter role reads a
+/// result register back, so it rejects rather than letting the program pass as a
+/// filter matching nothing (which a client would read as an empty table).
 #[test]
 fn test_register_free_predicate_is_rejected() {
     let schema = make_schema(0, &[8, 9]);
-    let prog = LogicalProgram::from_wire(&[], &[], None, vec![]).unwrap();
+    let prog = LogicalProgram::copy_cols(&[]);
     assert_eq!(
         prog.resolve_filter(&schema).err(),
-        Some(ExprValidateErr::ResultRegRequired)
+        Some(ExprValidateErr::OutputRoleMismatch)
     );
     // The same shape is legitimate as a map: `copy_cols` builds it.
     assert!(MapPlan::from_map(LogicalProgram::copy_cols(&[1]), &schema, &schema, PkSource::Inherit).is_ok());
@@ -319,7 +317,7 @@ fn test_from_predicate_filter_ranges_over_a_batch() {
         LogicalInstr::LoadConst { val: 15 },
         LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
     ];
-    let func = LogicalProgram::new(instrs, Vec::new(), Some(Reg(2)), vec![])
+    let func = LogicalProgram::new(instrs, Output::Result(Reg(2)), vec![])
         .resolve_filter(&schema)
         .unwrap();
 
@@ -372,7 +370,7 @@ fn map_whose_only_computed_column_is_a_string_still_runs_the_kernel() {
     ];
     let sinks = vec![Sink::Col(0), Sink::Reg(Reg(1))];
     let func = MapPlan::from_map(
-        LogicalProgram::new(instrs, sinks, None, vec![]),
+        LogicalProgram::new(instrs, Output::Slots(sinks), vec![]),
         &in_schema,
         &out_schema,
         PkSource::Inherit,
@@ -405,7 +403,7 @@ fn string_emit_composes_with_blob_passthrough() {
     ];
     let sinks = vec![Sink::Col(1), Sink::Reg(Reg(1))];
     let func = MapPlan::from_map(
-        LogicalProgram::new(instrs, sinks, None, vec![]),
+        LogicalProgram::new(instrs, Output::Slots(sinks), vec![]),
         &in_schema,
         &out_schema,
         PkSource::Inherit,
@@ -447,7 +445,7 @@ fn null_string_emit_zeroes_the_cell_and_sets_the_bit() {
     ];
     let sinks = vec![Sink::Col(0), Sink::Reg(Reg(1))];
     let func = MapPlan::from_map(
-        LogicalProgram::new(instrs, sinks, None, vec![]),
+        LogicalProgram::new(instrs, Output::Slots(sinks), vec![]),
         &in_schema,
         &out_schema,
         PkSource::Inherit,
@@ -732,8 +730,7 @@ fn map_ranges_bench() {
                 LogicalInstr::LoadColStr { col: 1 },
                 LogicalInstr::StrCase { a: Reg(0), upper: true },
             ],
-            vec![Sink::Reg(Reg(1))],
-            None,
+            Output::Slots(vec![Sink::Reg(Reg(1))]),
             vec![],
         ),
         &se_in,

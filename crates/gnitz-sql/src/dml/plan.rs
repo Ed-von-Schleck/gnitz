@@ -84,10 +84,9 @@ pub(crate) struct AccessPlan<'e> {
 }
 
 impl<'e> AccessPlan<'e> {
-    /// The plan for `bound`, its predicate compiled from `residual`. The only
-    /// constructor, and the only producer of an [`Access`], so a plan cannot carry
-    /// a predicate that is not its own residual's. Every rung of the ladder below
-    /// relies on that.
+    /// The plan for `bound`, its predicate compiled from `residual`. With
+    /// [`Self::whole`], the only two producers of an [`Access`] — so a plan's
+    /// predicate is always its own residual's, which every rung below relies on.
     pub(super) fn new(
         bound: ReadBound,
         all: &[&'e BoundExpr],
@@ -102,6 +101,17 @@ impl<'e> AccessPlan<'e> {
             all: all.to_vec(),
             residual,
         })
+    }
+
+    /// The plan whose predicate is the whole WHERE, already compiled: the
+    /// residual *is* `all`, so the walk re-imposes nothing. Takes the blob the
+    /// ladder already holds, where [`Self::new`] would compile it a second time.
+    pub(super) fn whole(bound: ReadBound, all: &[&'e BoundExpr], predicate: Vec<u8>) -> Self {
+        AccessPlan {
+            access: Access { bound, predicate },
+            all: all.to_vec(),
+            residual: all.to_vec(),
+        }
     }
 
     /// What a DML verb must do about the transaction's own buffered rows, which
@@ -179,10 +189,10 @@ pub(crate) fn bound_and_predicate<'e>(
         return AccessPlan::new(ReadBound::PkSet(keys), &all, residual, schema);
     }
 
-    // Whether the VM can carry the whole WHERE is a property of the WHERE, not
-    // of the walk under it, so it is decided once and picks every index rung's
-    // form.
-    let whole_compiles = if_supported(compile_wire_conjuncts(all.iter().copied(), &schema.columns))?.is_some();
+    // The whole WHERE compiled once for the ladder below (never for the `PkSet`
+    // rung above, whose residual is narrower): `Ok` is the predicate every rung
+    // keeping it ships, `Err` the verdict that makes an index rung strip instead.
+    let whole = compile_wire_conjuncts(all.iter().copied(), &schema.columns);
 
     // A PK equality / range → a byte-exact bounded PK walk; the residual (the WHERE
     // minus every conjunct the walk applies exactly) is the predicate. Exactness at
@@ -203,7 +213,7 @@ pub(crate) fn bound_and_predicate<'e>(
                 .next()
                 .filter(|c| c.is_unique_point())
             {
-                if let Some(p) = if_supported(index_plan(c, &all, whole_compiles, schema))? {
+                if let Some(p) = if_supported(index_plan(c, &all, whole.as_deref().ok(), schema))? {
                     return Ok(p);
                 }
             }
@@ -215,12 +225,12 @@ pub(crate) fn bound_and_predicate<'e>(
     // bound is not servable if its leftover conjunct has no compiled form, where a
     // looser candidate consumes that same conjunct byte-exactly.
     for c in ranked_index_bounds(conjuncts, schema, indexes) {
-        if let Some(p) = if_supported(index_plan(c, &all, whole_compiles, schema))? {
+        if let Some(p) = if_supported(index_plan(c, &all, whole.as_deref().ok(), schema))? {
             return Ok(p);
         }
     }
 
-    AccessPlan::new(ReadBound::None, &all, all.clone(), schema)
+    Ok(AccessPlan::whole(ReadBound::None, &all, whole?))
 }
 
 /// `Ok(None)` for the one error a ladder rung may be abandoned on — `Unsupported`
@@ -245,18 +255,22 @@ fn if_supported<T>(r: Result<T, GnitzSqlError>) -> Result<Option<T>, GnitzSqlErr
 /// residual that still cannot compile abandons this rung like any other.
 /// Stripping and exactness are set together, so a conjunct the predicate drops
 /// is always one the walk applies.
+///
+/// `whole` is the compiled whole WHERE, `None` when the VM cannot express it.
 fn index_plan<'e>(
     c: IndexRangeCandidate<'e>,
     all: &[&'e BoundExpr],
-    whole_compiles: bool,
+    whole: Option<&[u8]>,
     schema: &Schema,
 ) -> Result<AccessPlan<'e>, GnitzSqlError> {
     let bound = ReadBound::IndexRange {
         bound: gnitz_wire::IndexBound { idx_cols: c.idx_cols, desc: c.desc },
-        exact: !whole_compiles,
+        exact: whole.is_none(),
     };
-    let residual = if whole_compiles { all.to_vec() } else { c.residual };
-    AccessPlan::new(bound, all, residual, schema)
+    match whole {
+        Some(predicate) => Ok(AccessPlan::whole(bound, all, predicate.to_vec())),
+        None => AccessPlan::new(bound, all, c.residual, schema),
+    }
 }
 
 // ---------------------------------------------------------------------------

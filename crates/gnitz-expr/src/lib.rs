@@ -22,8 +22,9 @@
 //! *what the schema says about it*.
 //!
 //! `LogicalInstr::to_wire` and `LogicalProgram::decode_instr` are two tables over
-//! `gnitz_wire::ExprOp`; both live in `program.rs`, and `tests/program.rs`'s
-//! drift tests are what check them against each other.
+//! [`ExprOp`]; the vocabulary and both tables live in `program.rs`, and
+//! `tests/program.rs`'s drift tests check them against each other. `gnitz-wire`
+//! keeps only the framing, which counts those words without interpreting one.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
@@ -42,13 +43,14 @@
 //! > opt-level — 0 for gnitz-store and gnitz-server in dev.
 //!
 //! So moving a body out of a generic function into a non-generic one *improves*
-//! the debug build, and the reverse costs. `nm` on the rlibs is what shows
+//! the debug build, and the reverse costs. `nm -C` on the rlibs is what shows
 //! which: a generic body appears as a local (`t`) symbol in each consuming
-//! crate's. The drive methods on [`Evaluator`] take `&dyn BatchView` for that
-//! reason, so only [`Evaluator::eval_morsels`]' callback is still monomorphized
-//! in its caller. Anything reached from another crate per row is annotated
-//! `#[inline(always)]` regardless, since its caller is an opt-0 codegen unit:
-//! [`ColumnLocator`]'s methods and [`MorselOut`]'s, and `RowSource::row_count`.
+//! crate's. `&dyn BatchView` on [`Evaluator`]'s drive methods shrinks that set
+//! but does not empty it: `Evaluator::drive`, its closure,
+//! [`Evaluator::eval_morsels`] and `batch::with_str_bufs` are all defined in
+//! `libgnitz_store` at its opt-level 0. Anything reached per row from another
+//! crate is `#[inline(always)]` regardless — [`ColumnLocator`]'s methods and
+//! [`MorselOut`]'s, and `RowSource::row_count`.
 //!
 //! Judge an inlining or kernel change on retired instructions
 //! (`perf stat -e instructions:u`), never on wall-clock: timings on the
