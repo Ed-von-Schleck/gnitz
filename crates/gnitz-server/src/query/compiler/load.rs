@@ -59,8 +59,8 @@ pub(super) fn load_circuit(host: &dyn SchemaSource, view_id: u64) -> Result<Load
     let mut nodes_cur = host
         .open_sys_cursor(gnitz_wire::CIRCUIT_NODES_TAB as i64)
         .ok_or(CompileError::Rejected("the circuit system table is not open"))?;
-    let mut nodes: HashMap<i32, gnitz_wire::OpNode> = HashMap::new();
-    let mut inputs: HashMap<i32, [Option<i32>; 2]> = HashMap::new();
+    let mut nodes: FxHashMap<i32, gnitz_wire::OpNode> = FxHashMap::default();
+    let mut inputs: FxHashMap<i32, [Option<i32>; 2]> = FxHashMap::default();
 
     // The circuit table has a compound `(view_id, node_id)` PK; the OPK image of
     // the leading unsigned view_id column is its big-endian bytes.
@@ -123,11 +123,16 @@ pub(super) fn load_circuit(host: &dyn SchemaSource, view_id: u64) -> Result<Load
 /// no caller can read `ordered` or the adjacency maps before they are
 /// populated.
 pub(super) fn topo_sorted(
-    nodes: HashMap<i32, gnitz_wire::OpNode>,
-    by_slot: HashMap<i32, [Option<i32>; 2]>,
+    nodes: FxHashMap<i32, gnitz_wire::OpNode>,
+    by_slot: FxHashMap<i32, [Option<i32>; 2]>,
 ) -> Result<LoadedCircuit, CompileError> {
+    // The only constructor every plan passes through, so the one place the cap
+    // has to hold.
+    if nodes.len() > MAX_CIRCUIT_NODES {
+        return Err(CompileError::Rejected("circuit exceeds the node limit"));
+    }
     let malformed = || CompileError::Rejected("node's inputs do not match its operator's arity");
-    let mut outgoing: HashMap<i32, Vec<i32>> = HashMap::new();
+    let mut outgoing: FxHashMap<i32, Vec<i32>> = FxHashMap::default();
     for &nid in nodes.keys() {
         outgoing.entry(nid).or_default();
     }
@@ -136,7 +141,7 @@ pub(super) fn topo_sorted(
     // constructor, is what lets the emit layer destructure an operand instead of
     // asking whether it exists. A duplicate or out-of-range port needs no reject:
     // the slot index *is* the port.
-    let mut inputs: HashMap<i32, NodeInputs> = HashMap::with_capacity(nodes.len());
+    let mut inputs: FxHashMap<i32, NodeInputs> = FxHashMap::default();
     for (&nid, op) in &nodes {
         let slots = by_slot.get(&nid).copied().unwrap_or([None; 2]);
         for producer in slots.into_iter().flatten() {
@@ -162,7 +167,7 @@ pub(super) fn topo_sorted(
         outs.sort_unstable();
     }
 
-    let mut in_degree: HashMap<i32, i32> = inputs.iter().map(|(&nid, i)| (nid, i.iter().count() as i32)).collect();
+    let mut in_degree: FxHashMap<i32, i32> = inputs.iter().map(|(&nid, i)| (nid, i.iter().count() as i32)).collect();
 
     let mut init: Vec<i32> = nodes.keys().filter(|nid| in_degree[nid] == 0).copied().collect();
     init.sort_unstable(); // deterministic order for tied sources
@@ -211,7 +216,7 @@ pub(super) fn scatter_key_of_scan(loaded: &LoadedCircuit, scan_nid: i32) -> (Vec
     let mut queue = VecDeque::from([scan_nid]);
     // `visited` bounds the walk to O(nodes): without it a Filter diamond (two
     // edge paths reaching the same Filter) would re-push and re-expand nodes.
-    let mut visited = HashSet::new();
+    let mut visited = FxHashSet::default();
     // One entry per distinct key sequence — an identical one reached again (the
     // null/not-null sibling Maps of a nullable LEFT-join key) is added once.
     // Duplicate columns WITHIN a sequence are preserved, so the result mirrors the
@@ -271,11 +276,8 @@ pub(super) fn scan_tid_through_filters(loaded: &LoadedCircuit, enid: i32) -> Opt
 /// The sink-nearest `ExchangeShard`'s `(node id, shard columns)`, or `None` when
 /// the circuit carries none. A two-sided set-op emits one shard per side, and
 /// every caller wants the one whose key the output carries.
-pub(super) fn output_exchange_shard(loaded: &LoadedCircuit) -> Option<(i32, Vec<u32>)> {
-    loaded.ops().rev().find_map(|(nid, op)| match op {
-        gnitz_wire::OpNode::ExchangeShard { shard_cols } => Some((nid, shard_cols.clone())),
-        _ => None,
-    })
+pub(super) fn output_exchange_shard(loaded: &LoadedCircuit) -> Option<(i32, &[u32])> {
+    loaded.exchange_shards().next_back()
 }
 
 /// How a view's join, if it has one, needs its inputs placed — what the master

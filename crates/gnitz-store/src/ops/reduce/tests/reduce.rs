@@ -20,7 +20,7 @@ use crate::schema::ColumnLocator;
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
 
-/// Resolve `cols` to the baked group-column locators — what `ReducePlan::new`
+/// Resolve `cols` to the baked group-column locators — what `ReducePlan::build`
 /// stores in `group_key.cols`.
 fn locate_cols(schema: &SchemaDescriptor, cols: &[u32]) -> Vec<ColumnLocator> {
     cols.iter().map(|&c| schema.locate(c as usize)).collect()
@@ -114,15 +114,7 @@ fn make_plan(
     global_ground: bool,
     i_am_owner: bool,
 ) -> ReducePlan {
-    ReducePlan::new(
-        input_schema,
-        group_by_cols,
-        agg_descs,
-        input_schema.reduce_out_key(group_by_cols),
-        global_ground,
-        i_am_owner,
-    )
-    .unwrap()
+    ReducePlan::from_wire(input_schema, group_by_cols, agg_descs, global_ground, i_am_owner).unwrap()
 }
 
 /// The baked AVI of a value-indexed reduce, reached through the plan that owns
@@ -7006,4 +6998,58 @@ fn build_reduce_output_schema_agg_nullability_matrix() {
             }
         }
     }
+}
+
+// ── ReducePlan::from_wire — the circuit-node trust boundary ─────────────
+
+/// The guard that refused a REDUCE node's parameters.
+fn plan_rejection(schema: &SchemaDescriptor, group: &[u32], aggs: &[AggDescriptor]) -> String {
+    ReducePlan::from_wire(schema, group, aggs, false, false)
+        .map(|_| "a plan")
+        .expect_err("expected a rejection")
+        .to_string()
+}
+
+/// Every derivation a reduce runs — the output key, the output schema, the
+/// accumulators — indexes the fixed `[_; 65]` schema array raw, so an
+/// out-of-range column has to be refused ahead of all three.
+#[test]
+fn reduce_column_indices_out_of_range_are_rejected() {
+    let schema = make_schema_u64_i64();
+    let count = |col| vec![AggDescriptor { agg_op: AggFunc::Count, col_idx: col }];
+    assert_eq!(
+        plan_rejection(&schema, &[200], &count(0)),
+        "reduce: group column 200 out of range (2 cols)"
+    );
+    assert_eq!(
+        plan_rejection(&schema, &[0], &count(200)),
+        "reduce: aggregate column 200 out of range (2 cols)"
+    );
+}
+
+/// Every aggregate that decodes its column value needs a scalar register image
+/// (`ScalarKind`) — the ≤8-byte int/float set. The SQL binder rejects the rest
+/// upstream, so this covers the low-level `CircuitBuilder` path that bypasses it.
+#[test]
+fn a_value_reading_aggregate_over_a_non_scalar_column_is_rejected() {
+    // col 0 = U64 PK and the whole group key (⇒ PkPermutation); col 1 = the
+    // aggregate column, whose type is the only thing varying.
+    let over = |tc| SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)], &[0]);
+    for agg_op in [AggFunc::Sum, AggFunc::SumZero, AggFunc::Min, AggFunc::Max] {
+        let aggs = [AggDescriptor { agg_op, col_idx: 1 }];
+        assert!(
+            ReducePlan::from_wire(&over(type_code::I64), &[0], &aggs, false, false).is_ok(),
+            "{agg_op:?} over I64"
+        );
+        for tc in [type_code::U128, type_code::STRING] {
+            assert_eq!(
+                plan_rejection(&over(tc), &[0], &aggs),
+                "reduce: aggregate column type has no scalar register image",
+                "{agg_op:?} over type code {tc}",
+            );
+        }
+    }
+    // COUNT never reads the value, so no type excludes it.
+    let count = [AggDescriptor { agg_op: AggFunc::Count, col_idx: 1 }];
+    assert!(ReducePlan::from_wire(&over(type_code::STRING), &[0], &count, false, false).is_ok());
 }

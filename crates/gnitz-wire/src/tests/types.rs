@@ -284,7 +284,7 @@ fn carried_reindex_tc_round_trips_with_resolve() {
             "round-trip for {src:?} → {t:?}"
         );
         // A carried target re-derives to itself, which is how the compiler's
-        // `key_promotion_invalid` validates one without re-implementing the
+        // `ReindexPacker::new` validates one without re-implementing the
         // ladder. (A self-deriving slot carries nothing and is not validated
         // this way.)
         if carried.is_some() {

@@ -356,8 +356,9 @@ fn index_rebuild_forced_by_topology_change() {
 /// its output store and its operator traces both published at one generation and
 /// the engine closed — the state a worker reopens into, plan cache empty.
 ///
-/// The `IntegrateTrace` node is what makes the compile create a scratch child at
-/// all; an identity circuit would leave nothing for either test to catch on.
+/// The `Distinct` node is what makes the compile create a scratch child at all
+/// (its clamp history); an identity circuit would leave nothing for either test
+/// to catch on.
 fn checkpointed_traced_view(dir: &str) -> i64 {
     let mut engine = CatalogEngine::open(dir, 1).unwrap();
     let (tid, cols) = seed_base(&mut engine, "public.vbase");
@@ -368,7 +369,7 @@ fn checkpointed_traced_view(dir: &str) -> i64 {
         vid,
         &[
             (gnitz_wire::Opcode::ScanDelta, Some(tid), None),
-            (gnitz_wire::Opcode::IntegrateTrace, None, None),
+            (gnitz_wire::Opcode::Distinct, None, None),
             (gnitz_wire::Opcode::IntegrateSink, None, None),
         ],
     );

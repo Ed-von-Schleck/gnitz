@@ -30,7 +30,7 @@ pub(crate) enum RelayRoute {
 }
 
 /// source table id → the join/group reindex key its scans feed.
-type JoinShardMap = HashMap<i64, load::ReindexKey>;
+type JoinShardMap = FxHashMap<i64, load::ReindexKey>;
 
 /// What one source gets: how the master routes its delta, and whether the worker
 /// must send it through the scatter at all.
@@ -90,7 +90,7 @@ impl ViewMeta {
         // source → the distinct key sequences its scans feed. Deduped across scan
         // nodes as well as within one, so two scans on a source carrying the same
         // key resolve to one sequence rather than tripping the pack-key gate below.
-        let mut seqs: HashMap<i64, Vec<load::ReindexKey>> = HashMap::new();
+        let mut seqs: FxHashMap<i64, Vec<load::ReindexKey>> = FxHashMap::default();
         for (nid, op) in loaded.ops() {
             let gnitz_wire::OpNode::ScanDelta { source, .. } = op else {
                 continue;
@@ -131,13 +131,11 @@ impl ViewMeta {
         // source relays.
         let co_partitioned = match join_relay {
             load::JoinRelay::WholeKey => compute_co_partitioned(&concatenated, host),
-            load::JoinRelay::EqPrefix { .. } | load::JoinRelay::Broadcast => HashSet::new(),
+            load::JoinRelay::EqPrefix { .. } | load::JoinRelay::Broadcast => FxHashSet::default(),
         };
 
         let shard = load::output_exchange_shard(loaded);
-        let skips_exchange = shard
-            .as_ref()
-            .is_some_and(|(enid, cols)| skips_output_exchange(loaded, *enid, cols, host));
+        let skips_exchange = shard.is_some_and(|(enid, cols)| skips_output_exchange(loaded, enid, cols, host));
         let shard_cols: Option<Rc<[u32]>> = shard.map(|(_, cols)| Rc::from(cols));
         let repartitions =
             shard_cols.is_some() || loaded.ops().any(|(_, op)| matches!(op, gnitz_wire::OpNode::Join(_)));
@@ -230,7 +228,7 @@ fn shard_cols_match_dist_key(schema: &SchemaDescriptor, cols: &[u32]) -> bool {
     cols.len() == k && cols == &schema.pk_indices()[..k]
 }
 
-fn compute_co_partitioned(join_shard_map: &JoinShardMap, host: &dyn SchemaSource) -> HashSet<i64> {
+fn compute_co_partitioned(join_shard_map: &JoinShardMap, host: &dyn SchemaSource) -> FxHashSet<i64> {
     // One replicated participant makes every participant skip: the replicated
     // side already has every row on every worker, and its partner can therefore
     // stay in its own PK partitioning and `cogroup` against the full local copy.
@@ -239,7 +237,7 @@ fn compute_co_partitioned(join_shard_map: &JoinShardMap, host: &dyn SchemaSource
     let any_replicated = join_shard_map
         .keys()
         .any(|&tid| host.schema_of(tid).is_some_and(|s| s.placement().is_replicated()));
-    let mut co_partitioned = HashSet::new();
+    let mut co_partitioned = FxHashSet::default();
     for (&tid, cols) in join_shard_map {
         let Some(ext_schema) = host.schema_of(tid) else {
             continue;

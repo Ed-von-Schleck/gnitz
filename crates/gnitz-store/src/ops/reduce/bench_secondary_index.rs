@@ -69,7 +69,7 @@ fn build_input(schema: &SchemaDescriptor) -> Batch {
 fn min_bake(schema: &SchemaDescriptor) -> AviBake {
     let group = [1u32];
     let aggs = [AggDescriptor { col_idx: 2, agg_op: AggFunc::Min }];
-    ReducePlan::new(schema, &group, &aggs, schema.reduce_out_key(&group), false, false)
+    ReducePlan::from_wire(schema, &group, &aggs, false, false)
         .unwrap()
         .avi
         .expect("a MIN reduce is value-indexed")

@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 
-use crate::schema::SchemaDescriptor;
+use crate::schema::{OpBuildErr, SchemaDescriptor};
 use crate::storage::{
     mem_batch_to_unified, prorated_blob_cap, run_merge, scatter_unified_sources, write_to_batch, Batch, Layout,
     MemBatch,
@@ -67,13 +67,14 @@ fn worker_rows_to_batches(
         .collect()
 }
 
-/// `None` when `spec` does not route against `schema` — see [`ScatterKey::new`].
+/// Refused when `spec` does not route against `schema` — see [`ScatterKey::new`],
+/// which owns the reason.
 pub fn op_repartition_batches(
     sources: &[Option<&Batch>],
     spec: ScatterSpec<'_>,
     schema: &SchemaDescriptor,
     num_workers: usize,
-) -> Option<Vec<Batch>> {
+) -> Result<Vec<Batch>, OpBuildErr> {
     gnitz_debug!(
         "op_repartition_batches: sources={} spec={:?}",
         sources.iter().filter(|s| matches!(s, Some(sb) if sb.count > 0)).count(),
@@ -85,7 +86,7 @@ pub fn op_repartition_batches(
     let total_blob = mem_batch_blob_cap(&mem_batches);
     let mut scatter_key = ScatterKey::new(spec, schema, num_workers)?;
 
-    Some(WORKER_ROWS.with(|pool| {
+    Ok(WORKER_ROWS.with(|pool| {
         let mut worker_rows = pool.borrow_mut();
         super::reset_slots(&mut worker_rows, num_workers);
 
@@ -121,13 +122,14 @@ pub fn op_repartition_batches(
     }))
 }
 
-/// `None` when `spec` does not route against `schema` — see [`ScatterKey::new`].
+/// Refused when `spec` does not route against `schema` — see [`ScatterKey::new`],
+/// which owns the reason.
 pub fn op_relay_scatter_consolidated(
     sources: &[Option<&Batch>],
     spec: ScatterSpec<'_>,
     schema: &SchemaDescriptor,
     num_workers: usize,
-) -> Option<Vec<Batch>> {
+) -> Result<Vec<Batch>, OpBuildErr> {
     // The dispatch gate selected these on `is_consolidated()`; debug-verify each
     // source's data here before either walk fast-paths on it.
     #[cfg(debug_assertions)]
@@ -150,11 +152,11 @@ pub fn op_relay_scatter_consolidated(
     // whether or not this round carries rows.
     let mut scatter_key = ScatterKey::new(spec, schema, num_workers)?;
     let Some(first) = first else {
-        return Some((0..num_workers).map(|_| Batch::empty_with_schema(schema)).collect());
+        return Ok((0..num_workers).map(|_| Batch::empty_with_schema(schema)).collect());
     };
     let total_blob: usize = mem_batch_blob_cap(&mem_batches);
 
-    Some(WORKER_ROWS.with(|pool| {
+    Ok(WORKER_ROWS.with(|pool| {
         let mut worker_rows = pool.borrow_mut();
         super::reset_slots(&mut worker_rows, num_workers);
 

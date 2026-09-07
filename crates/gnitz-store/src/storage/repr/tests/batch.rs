@@ -624,3 +624,38 @@ fn read_payload_string_out_of_bounds_offset_returns_empty() {
     // payload_col 0 is the STRING column; the corrupt offset must decode to "".
     assert_eq!(payload_string(&batch, 0, 0), String::new());
 }
+
+/// `release_buffers` against `drop(take())` on the case that dominates: clearing
+/// a register that is already free. The VM does that for every register of every
+/// plan once per epoch, so the per-call constant is the whole comparison.
+#[test]
+#[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+fn batch_release_bench() {
+    use std::time::Instant;
+    const ITERS: usize = 2_000_000;
+    let schema = pk_payload_schema(&[type_code::U64]);
+
+    let mut regs: Vec<Batch> = (0..64).map(|_| Batch::empty_with_schema(&schema)).collect();
+    let t = Instant::now();
+    for _ in 0..ITERS / 64 {
+        for b in &mut regs {
+            std::hint::black_box(&mut *b).release_buffers();
+        }
+    }
+    let release = t.elapsed();
+
+    let mut regs: Vec<Batch> = (0..64).map(|_| Batch::empty_with_schema(&schema)).collect();
+    let t = Instant::now();
+    for _ in 0..ITERS / 64 {
+        for b in &mut regs {
+            drop(std::hint::black_box(&mut *b).take());
+        }
+    }
+    let take = t.elapsed();
+
+    println!(
+        "already-empty register clear: release_buffers {:.1} ns, drop(take()) {:.1} ns",
+        release.as_nanos() as f64 / ITERS as f64,
+        take.as_nanos() as f64 / ITERS as f64,
+    );
+}

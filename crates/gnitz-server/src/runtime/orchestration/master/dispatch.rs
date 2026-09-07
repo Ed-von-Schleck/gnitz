@@ -486,17 +486,13 @@ impl MasterDispatcher {
                      scatter key co-partitions it"
                 ))
             }
-            RelayRoute::Broadcast => Some(RelayDest::Broadcast(Box::new(op_relay_broadcast(&sources, &schema)))),
+            RelayRoute::Broadcast => Ok(RelayDest::Broadcast(Box::new(op_relay_broadcast(&sources, &schema)))),
             RelayRoute::GroupKey(cols) => scatter(ScatterSpec::GroupKey(cols)),
             RelayRoute::JoinKey(slots) => scatter(ScatterSpec::JoinKey(slots)),
         };
-        let Some(dest) = dest else {
-            return Err(format!(
-                "view {view_id}: source {source_id} relay key does not route against the source's \
-                 {} columns",
-                schema.num_columns()
-            ));
-        };
+        // The scatter key's own reason, not a restatement: it names the column
+        // and the bound it missed.
+        let dest = dest.map_err(|e| format!("view {view_id}: source {source_id} relay key: {e}"))?;
 
         // Encoded once and carried forward: `emit_relay_with_decision` runs the
         // same group again — twice more when a reclaim barrier forces a retry —

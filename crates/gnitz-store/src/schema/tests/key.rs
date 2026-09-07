@@ -869,11 +869,11 @@ fn packer_output_schema_pk_width_policy() {
             &[0],
         );
         assert!(
-            ReindexPacker::new(&in_schema, &[(1, None)]).is_none(),
+            ReindexPacker::new(&in_schema, &[(1, None)]).is_err(),
             "a float reindex key must be refused, not packed"
         );
         assert!(
-            ReindexPacker::new_group_key(&in_schema, &[1], &[]).is_none(),
+            ReindexPacker::new_group_key(&in_schema, &[1], &[]).is_err(),
             "a float group key must be refused, not packed"
         );
     }

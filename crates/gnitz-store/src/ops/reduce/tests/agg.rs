@@ -29,16 +29,10 @@ fn f64_acc(agg_op: AggFunc) -> Accumulator {
         ],
         &[0],
     );
-    let mut accs = super::super::plan::ReducePlan::new(
-        &schema,
-        &[0],
-        &[AggDescriptor { col_idx: 1, agg_op }],
-        schema.reduce_out_key(&[0]),
-        false,
-        false,
-    )
-    .unwrap()
-    .acc_template;
+    let mut accs =
+        super::super::plan::ReducePlan::from_wire(&schema, &[0], &[AggDescriptor { col_idx: 1, agg_op }], false, false)
+            .unwrap()
+            .acc_template;
     accs.pop().unwrap()
 }
 

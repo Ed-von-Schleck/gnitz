@@ -142,7 +142,7 @@ impl DagEngine {
         src_id: i64,
         key: RelayKey,
         relay: &mut Relay<'_>,
-    ) -> Result<(u16, Batch), StorageError> {
+    ) -> Result<(vm::DeltaReg, Batch), StorageError> {
         // `exchange_schema()` IS the side's out-register schema, which the VM
         // stamps on what it returns — so the wire encode sees the side's
         // pre-exchange schema, never the view's combine-widened final one.
@@ -391,7 +391,7 @@ impl Emit {
 /// The `(register, batch)` that seeds a sub-pipeline with `source_id`'s delta:
 /// the register that source routes to, or the plan's single input where it
 /// routes no source of that id.
-fn sub_seed(sub: &SubPlan, input: Batch, source_id: i64) -> (u16, Batch) {
+fn sub_seed(sub: &SubPlan, input: Batch, source_id: i64) -> (vm::DeltaReg, Batch) {
     let in_reg = sub.source_reg_map.get(&source_id).copied().unwrap_or(sub.in_reg);
     (in_reg, input)
 }

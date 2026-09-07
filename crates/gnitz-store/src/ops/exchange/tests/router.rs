@@ -184,15 +184,15 @@ fn scatter_key_refuses_a_key_this_schema_cannot_route() {
     );
     let nw = 4;
     assert!(
-        ScatterKey::new(ScatterSpec::GroupKey(&[7]), &schema, nw).is_none(),
+        ScatterKey::new(ScatterSpec::GroupKey(&[7]), &schema, nw).is_err(),
         "a group key naming a column the schema has not got"
     );
     assert!(
-        ScatterKey::new(ScatterSpec::JoinKey(&[(7, None)]), &schema, nw).is_none(),
+        ScatterKey::new(ScatterSpec::JoinKey(&[(7, None)]), &schema, nw).is_err(),
         "a reindex key naming a column the schema has not got"
     );
     assert!(
-        ScatterKey::new(ScatterSpec::JoinKey(&[(1, None)]), &schema, nw).is_none(),
+        ScatterKey::new(ScatterSpec::JoinKey(&[(1, None)]), &schema, nw).is_err(),
         "a reindex key over a float column, which no OPK packs"
     );
 }

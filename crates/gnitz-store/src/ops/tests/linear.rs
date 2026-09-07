@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::type_code;
+use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::storage::payload_string;
 use crate::test_support::{
     make_batch, make_batch_bytes, make_batch_opk, make_batch_raw, make_schema_pk_u64_payload_string,
@@ -211,11 +211,27 @@ fn filter_keeps_exactly_the_matching_rows() {
         .resolve_filter(&schema)
         .unwrap();
 
-    let out = op_filter(&make_batch(&schema, rows), &func, &schema);
+    let out = op_filter(&make_batch(&schema, rows), &func, &schema).expect("a selective filter copies");
     let got: Vec<u64> = (0..out.count).map(|r| out.get_pk(r) as u64).collect();
     let want: Vec<u64> = rows.iter().filter(|&&(_, _, v)| v > 10).map(|&(pk, ..)| pk).collect();
     assert_eq!(got, want);
     assert!(out.is_consolidated());
+
+    // Every row passing is answered with `None`, so the caller hands its own
+    // input through rather than paying a whole-batch copy for a no-op.
+    let all_pass = LogicalProgram::new(
+        vec![
+            LogicalInstr::LoadColInt { col: 1 },
+            LogicalInstr::LoadConst { val: -1 },
+            LogicalInstr::Cmp { op: CmpOp::Gt, a: Reg(0), b: Reg(1) },
+        ],
+        Vec::new(),
+        Some(Reg(2)),
+        vec![],
+    )
+    .resolve_filter(&schema)
+    .unwrap();
+    assert!(op_filter(&make_batch(&schema, rows), &all_pass, &schema).is_none());
 }
 
 /// Negate is the Z-Set group inverse: every weight flips sign and nothing else
@@ -298,4 +314,78 @@ fn union_merge_bench() {
             acc / ITERS,
         );
     }
+}
+
+// ── Derived output schemas ──────────────────────────────────────────────
+
+/// `union_nullability_merge` ORs the two inputs' per-column nullability, so a
+/// null-carrying side reclassifies the output from the null-blind
+/// `FixedIntNonnull` fast comparator to the null-aware `Generic` one.
+#[test]
+fn union_merges_nullability_and_reclassifies_the_comparator() {
+    use crate::schema::PayloadCmpKind;
+    let nonnull = pk_payload_schema(&[type_code::U128]);
+    let nullable = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U128, 0),
+            SchemaColumn::new(type_code::I64, 1),
+        ],
+        &[0],
+    );
+
+    // Both non-nullable stays on the fast path; either side nullable forces
+    // `Generic`, and the OR is symmetric.
+    for (a, b, want_nullable) in [(nonnull, nonnull, 0u8), (nonnull, nullable, 1), (nullable, nonnull, 1)] {
+        let m = union_nullability_merge(&a, &b).expect("shared layout");
+        assert_eq!(m.columns[1].nullable, want_nullable);
+        assert_eq!(
+            m.payload_cmp,
+            if want_nullable == 1 {
+                PayloadCmpKind::Generic
+            } else {
+                PayloadCmpKind::FixedIntNonnull
+            }
+        );
+    }
+}
+
+/// A mismatched pair is the whole layout contract, and in release there is
+/// nothing else: adopting `a`'s schema would let `op_union` read `b`'s bytes
+/// through it.
+#[test]
+fn union_of_mismatched_input_layouts_is_rejected() {
+    let a = pk_payload_schema(&[type_code::U128]);
+    assert_eq!(
+        union_nullability_merge(&a, &make_schema_u64_i64())
+            .expect_err("mismatched layouts")
+            .to_string(),
+        "union: inputs do not share a physical layout"
+    );
+}
+
+/// The null-extend output is the input schema plus one nullable column per
+/// fill slot, so the bound is on the *merged* width — a list-length bound alone
+/// would miss a near-max-width input taking a short extension over the limit.
+#[test]
+fn a_null_extend_overflowing_the_merged_schema_is_rejected() {
+    const GUARD: &str = "null-extend: merged schema exceeds MAX_COLUMNS";
+    let extend = |s: &SchemaDescriptor, n: usize| null_extend_output_schema(s, &vec![type_code::I64; n]);
+    let narrow = make_schema_u64_i64();
+    let out = extend(&narrow, 1).expect("a short type_codes list extends cleanly");
+    assert_eq!(out.num_columns(), narrow.num_columns() + 1);
+    assert_eq!(out.columns[out.num_columns() - 1].nullable, 1);
+    // MAX_COLUMNS type_codes overflow the fixed schema array on their own.
+    assert_eq!(
+        extend(&narrow, crate::schema::MAX_COLUMNS)
+            .expect_err("overflow")
+            .to_string(),
+        GUARD
+    );
+    // 64 + 2 > 65: the merged width, which a bound on the list length misses.
+    let wide = {
+        let mut cols = [SchemaColumn::new(type_code::I64, 0); 64];
+        cols[0] = SchemaColumn::new(type_code::U64, 0);
+        SchemaDescriptor::new(&cols, &[0])
+    };
+    assert_eq!(extend(&wide, 2).expect_err("overflow").to_string(), GUARD);
 }

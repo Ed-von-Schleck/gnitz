@@ -38,8 +38,11 @@ fn write_filtered_circuit(engine: &mut CatalogEngine, vid: i64, base_tid: i64, p
         vid,
         &[
             (gnitz_wire::Opcode::ScanDelta, Some(base_tid), None),
-            (gnitz_wire::Opcode::IntegrateTrace, None, None),
             (gnitz_wire::Opcode::Filter, None, filter_params.as_deref()),
+            // `SELECT DISTINCT … WHERE …`. The `Distinct` is what makes the
+            // compile create a scratch child, which the I/O rejection below
+            // needs something to fail on.
+            (gnitz_wire::Opcode::Distinct, None, None),
             (gnitz_wire::Opcode::IntegrateSink, None, None),
         ],
     );

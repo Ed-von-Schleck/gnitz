@@ -9,10 +9,32 @@ use super::cogroup::cogroup_left;
 // Distinct
 // ---------------------------------------------------------------------------
 
+/// Which weight clamp a [`op_weight_clamp`] call is. The bounds live beside the
+/// kernel rather than travelling as a `(lo, hi)` pair, which a forged circuit
+/// could name `min > max` and abort a worker inside `Ord::clamp`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClampPreset {
+    /// Set membership: `[-1, 1]`.
+    Distinct,
+    /// Bag multiplicity: `[0, i64::MAX]`.
+    PositivePart,
+}
+
+impl ClampPreset {
+    /// The `(lo, hi)` this preset clamps to.
+    #[inline]
+    fn bounds(self) -> (i64, i64) {
+        match self {
+            ClampPreset::Distinct => (-1, 1),
+            ClampPreset::PositivePart => (0, i64::MAX),
+        }
+    }
+}
+
 /// Shared body for the two weight-clamp operators. Per consolidated (PK, payload)
 /// emits `clamp(w_old + Δw, lo, hi) − clamp(w_old, lo, hi)` — the DBSP incremental
-/// form of a per-element weight clamp lifted to its delta. The `(lo, hi)` preset
-/// selects the operator; `gnitz_wire::OpNode::PositivePart` states both presets.
+/// form of a per-element weight clamp lifted to its delta. [`ClampPreset`]
+/// selects the operator.
 ///
 /// Returns `(output_batch, consolidated_delta)`; the consolidated delta is
 /// returned so the caller can feed it to `ingest_batch`.
@@ -20,9 +42,9 @@ pub fn op_weight_clamp(
     delta: Batch,
     cursor: &mut ReadCursor,
     schema: &SchemaDescriptor,
-    lo: i64,
-    hi: i64,
+    preset: ClampPreset,
 ) -> (Batch, Batch) {
+    let (lo, hi) = preset.bounds();
     // 1. Consolidate delta
     let consolidated = delta.into_consolidated(schema);
     let n = consolidated.count;

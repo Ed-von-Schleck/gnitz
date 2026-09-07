@@ -187,7 +187,7 @@ fn fold_group_cap_aborts() {
 
 /// A structurally valid reply schema that is not the derived SyntheticFold
 /// layout (here: missing the agg column) is a malformed frame — rejected,
-/// never fed to `ReducePlan::new` (whose `cbase` arithmetic would panic).
+/// never fed to `ReducePlan::build` (whose `cbase` arithmetic would panic).
 #[test]
 fn fold_rejects_mismatched_reply_schema() {
     let spec = AggReadSpec::direct(vec![1], vec![agg(AggFunc::Count, 0)]);

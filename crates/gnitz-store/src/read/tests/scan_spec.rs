@@ -275,7 +275,7 @@ fn fold_pre_map_refuses_an_over_wide_declaration() {
         .collect();
     let err = premap_err(&premap_spec(vec![1, 2, 3], wide));
     assert!(
-        err.contains("not a legal reduce input"),
+        err.contains("compute map: output exceeds MAX_COLUMNS"),
         "an over-wide pre-map must be refused by the derivation, got: {err}"
     );
 }
@@ -286,7 +286,7 @@ fn fold_pre_map_refuses_an_over_wide_declaration() {
 fn fold_pre_map_refuses_a_corrupt_program() {
     let err = premap_err(&premap_spec(vec![0xff; 8], vec![(type_code::I64, false)]));
     assert!(
-        err.contains("projection program"),
+        err.contains("map: invalid program"),
         "a corrupt pre-map blob must be refused by the program decoder, got: {err}"
     );
 }

@@ -757,3 +757,135 @@ fn map_ranges_bench() {
         );
     }
 }
+
+// ── MapPlan::from_wire — the circuit-node trust boundary ────────────────
+//
+// Every kind's column lists are client-supplied catalog data: each way they can
+// overrun a schema array, address an unnumbered copy slot, or promote outside the
+// copy kernel's domain must be a named rejection, not a panic or a truncated key.
+
+/// The guard that refused `mk` over `in_schema`.
+fn wire_rejection(in_schema: &SchemaDescriptor, mk: gnitz_wire::MapKind) -> String {
+    MapPlan::from_wire(in_schema, &mk)
+        .map(|_| "a plan")
+        .expect_err("expected a rejection")
+        .to_string()
+}
+
+/// `(U64 pk, I64)` — the narrow fixture every bounds case indexes past.
+fn u64_i64() -> SchemaDescriptor {
+    SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    )
+}
+
+#[test]
+fn a_projection_must_name_payload_columns_that_fit_one_schema() {
+    let s = u64_i64();
+    let proj = |cols: Vec<u32>| wire_rejection(&s, gnitz_wire::MapKind::Projection(cols));
+    assert_eq!(
+        proj(vec![200]),
+        "projection map: column 200 is not a payload column of a 2-column schema"
+    );
+    // A PK source: `project_schema` drops it while `copy_cols` numbers
+    // destinations densely, so the copy would address a slot that does not exist.
+    assert_eq!(
+        proj(vec![0]),
+        "projection map: column 0 is not a payload column of a 2-column schema"
+    );
+    // Each index is bounded but the list length is not, and duplicates are legal.
+    // Exactly MAX_COLUMNS payload sources already overflow — the output also
+    // carries the input's PK column, which a length-only bound misses.
+    assert_eq!(proj(vec![1; MAX_COLUMNS]), "projection map: output exceeds MAX_COLUMNS");
+}
+
+#[test]
+fn reindex_key_and_kept_column_lists_are_bounds_checked() {
+    let reindex = |keep: Vec<u32>, key_cols: Vec<u32>| gnitz_wire::MapKind::Reindex {
+        keep,
+        key: key_cols.into_iter().map(|c| (c, None)).collect(),
+        role: gnitz_wire::ReindexRole::ScatterKey,
+    };
+    let three = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U32, 0),
+            SchemaColumn::new(type_code::I64, 0),
+        ],
+        &[0],
+    );
+    // A compound key and a pruned payload both build — and neither is an
+    // identity, since a reindex overwrites every row's PK.
+    for (s, keep, key) in [(u64_i64(), vec![0, 1], vec![0, 1]), (three, vec![2], vec![0])] {
+        let plan = MapPlan::from_wire(&s, &reindex(keep, key)).expect("a well-formed reindex");
+        assert!(!plan.is_identity(), "a reindex is never an identity");
+    }
+
+    let s = u64_i64();
+    assert_eq!(
+        wire_rejection(&s, reindex(vec![9], vec![0])),
+        "reindex map: payload column 9 out of range (2 cols)"
+    );
+    assert_eq!(
+        wire_rejection(&s, reindex(vec![0], vec![9])),
+        "reindex key: column 9 out of range (2 cols)"
+    );
+    // A key longer than MAX_PK_COLUMNS overflows the output schema's fixed PK array.
+    let n = crate::schema::MAX_PK_COLUMNS + 1;
+    let wide = SchemaDescriptor::new(&vec![SchemaColumn::new(type_code::U64, 0); n], &[0]);
+    assert_eq!(
+        wire_rejection(&wide, reindex(vec![0], (0..n as u32).collect())),
+        format!("reindex key: {n} columns exceeds the {}-column PK limit", n - 1)
+    );
+}
+
+/// The set-op full-row identity map: a synthetic U128 PK over the projected
+/// payload, each slot optionally promoted to a wider fixed-int type so a
+/// cross-width pair (`I32 UNION I64`) hashes one physical layout.
+#[test]
+fn a_hash_row_map_promotes_within_the_copy_kernel_domain_or_is_rejected() {
+    let hash_row = |cols: Vec<u32>, tcs: Vec<Option<gnitz_wire::TypeCode>>| gnitz_wire::MapKind::HashRow {
+        cols: cols.into_iter().zip(tcs).collect(),
+        branch_id: 0,
+    };
+    let s = SchemaDescriptor::new(
+        &[
+            SchemaColumn::new(type_code::U64, 0),
+            SchemaColumn::new(type_code::U32, 0),
+        ],
+        &[0],
+    );
+    assert!(
+        MapPlan::from_wire(&s, &hash_row(vec![1], vec![None])).is_ok(),
+        "no promotion"
+    );
+    assert!(
+        MapPlan::from_wire(&s, &hash_row(vec![1], vec![Some(gnitz_wire::TypeCode::I64)])).is_ok(),
+        "U32 → I64 is the ≤8-byte widen the copy kernel supports"
+    );
+    assert_eq!(
+        wire_rejection(&s, hash_row(vec![9], vec![None])),
+        "hash-row map: column 9 out of range (2 cols)"
+    );
+    assert!(
+        wire_rejection(&s, hash_row(vec![1], vec![Some(gnitz_wire::TypeCode::String)]))
+            .starts_with("map: program/schema mismatch"),
+        "a German string is not a fixed-int widen"
+    );
+}
+
+/// A corrupt computed-map blob is refused, not decoded into a plan that maps
+/// garbage — and the rejection names the decode, not the schema.
+#[test]
+fn a_corrupt_compute_map_program_is_rejected() {
+    let s = u64_i64();
+    let mk = gnitz_wire::MapKind::Compute(gnitz_wire::ComputeMap {
+        program: vec![0xff; 8],
+        out_cols: vec![(type_code::I64, false)],
+    });
+    assert!(wire_rejection(&s, mk).starts_with("map: invalid program"));
+}

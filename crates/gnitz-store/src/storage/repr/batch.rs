@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::batch_pool::{acquire_arena, debug_poison, Fill};
+use super::batch_pool::{acquire_arena, debug_poison, recycle_buf, Fill};
 use super::columnar::ColumnarSource;
 use super::merge::{self, relocate_german_string_vec, BlobCache, BlobCacheGuard, ColPtr, MemBatch};
 use crate::schema::key::NarrowPkOpk;
@@ -1460,6 +1460,24 @@ impl Batch {
     #[inline]
     fn holds_nothing(&self) -> bool {
         self.count == 0 && self.blob.is_empty()
+    }
+
+    /// Reset to empty and return both buffers to the pool, in place. Leaves what
+    /// [`Self::empty_like`] would build, without `take`'s two moves of a 1 KiB
+    /// struct — and returns immediately when the batch is already free, which is
+    /// what the VM's per-epoch register clear mostly does (`batch_release_bench`).
+    pub fn release_buffers(&mut self) {
+        if self.data.capacity() == 0 && self.blob.capacity() == 0 {
+            return;
+        }
+        let nr = self.num_regions();
+        self.offsets[..nr].fill(0);
+        recycle_buf(std::mem::take(&mut self.data));
+        recycle_buf(std::mem::take(&mut self.blob));
+        self.capacity = 0;
+        self.count = 0;
+        self.downgrade();
+        self.blob_id = next_blob_id();
     }
 
     /// Reset to empty without freeing buffer allocations.

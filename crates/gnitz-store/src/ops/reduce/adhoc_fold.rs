@@ -32,7 +32,7 @@ use super::agg::Accumulator;
 use super::emit::emit_reduce_row;
 use super::plan::ReducePlan;
 use super::sort::compare_by_group_cols;
-use crate::schema::{ReduceOutKey, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
 use crate::storage::{Batch, StoreError};
 
 /// The request-scoped fold state. `pub(crate)` so `read::scan_spec` can drive
@@ -41,7 +41,8 @@ use crate::storage::{Batch, StoreError};
 pub(crate) struct AdhocFold {
     /// The baked reduce plan — the single home of the schemas, group columns,
     /// the group keyer and comparator locators, the accumulator template, and
-    /// the emission roles the fold reads (`ReducePlan::new` derives them once).
+    /// the emission roles the fold reads (`ReducePlan::for_adhoc_fold` derives them
+    /// once).
     plan: ReducePlan,
     /// One representative source row per group, in group-discovery order; the
     /// row index IS the group ordinal (and `rep_rows.count` the group count).
@@ -66,9 +67,9 @@ pub(crate) struct AdhocFold {
 
 impl AdhocFold {
     /// Build the fold state from a decoded fold spec. The spec and the client's
-    /// reply schema are a trust boundary: the column indices are range-checked
-    /// here, the aggregate types and output width by `ReducePlan::new`, and the
-    /// reply schema against the plan's own layout. (Aggregate-op validity is
+    /// reply schema are the trust boundary, and [`ReducePlan::for_adhoc_fold`]
+    /// is all of it: column ranges, aggregate types, output width, and the reply
+    /// schema against the layout the plan derived. (Aggregate-op validity is
     /// already decode-enforced — `AggDescriptor.agg_op` is typed.)
     pub(crate) fn new(
         src_schema: &SchemaDescriptor,
@@ -76,48 +77,8 @@ impl AdhocFold {
         agg: &AggReadSpec,
         group_cap: usize,
     ) -> Result<Self, StoreError> {
-        let n_cols = src_schema.num_columns();
-
-        // `ReadSpec`'s decoder carries no schema, so this is the only place a
-        // client-supplied column index meets a column count — and downstream
-        // `build_reduce_output_schema` indexes a fixed array, reading a zeroed
-        // slot rather than panicking.
-        for &c in &agg.group_cols {
-            if c as usize >= n_cols {
-                return Err(StoreError::rejected(format!(
-                    "scan_spec fold: group column {c} out of range ({n_cols} cols)"
-                )));
-            }
-        }
-        for d in &agg.aggs {
-            if d.col_idx as usize >= n_cols {
-                return Err(StoreError::rejected(format!(
-                    "scan_spec fold: agg column {} out of range ({n_cols} cols)",
-                    d.col_idx
-                )));
-            }
-        }
-
-        // The ad-hoc partial layout is ALWAYS synthetic-fold: `_agg_pk` U128 PK,
-        // group cols as payload, then the agg partial columns — a pure function
-        // of `(src_schema, agg)`, laid out by the same authority the compiler
-        // lays every reduce output with. The client's reply schema must match it
-        // physically (types + PK region; nullability is presentation) or the
-        // frame is malformed.
-        let plan = ReducePlan::new(
-            src_schema,
-            &agg.group_cols,
-            &agg.aggs,
-            ReduceOutKey::SyntheticFold,
-            false, // global_ground — the client synthesizes the empty-input ground row
-            false, // i_am_owner
-        )
-        .map_err(StoreError::rejected)?;
-        if !reply_schema.same_physical_layout(&plan.output_schema) {
-            return Err(StoreError::rejected(
-                "scan_spec fold: reply schema does not match the derived fold layout",
-            ));
-        }
+        let plan = ReducePlan::for_adhoc_fold(src_schema, reply_schema, agg)
+            .map_err(|e| StoreError::rejected(format!("scan_spec fold: {e}")))?;
 
         Ok(AdhocFold {
             plan,

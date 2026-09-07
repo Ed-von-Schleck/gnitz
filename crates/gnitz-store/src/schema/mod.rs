@@ -1,5 +1,6 @@
-//! SQL type constants, schema descriptor types, and the schema-shaping free
-//! functions derived from them.
+//! SQL type constants, schema descriptor types, the schema-shaping free
+//! functions derived from them, and [`OpBuildErr`] — the one vocabulary every
+//! store-side operator constructor rejects untrusted parameters through.
 //!
 //! These are shared across the storage, IPC, and query layers.
 //!
@@ -7,7 +8,48 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
+use std::borrow::Cow;
+
 use gnitz_wire::{is_fixed_int, is_signed_int};
+
+/// Why a store-side operator constructor refused the parameters it was handed —
+/// one vocabulary for all of them, so the constructor rather than each caller
+/// owns the wording of its own trust boundary.
+#[derive(Debug)]
+pub enum OpBuildErr {
+    /// The parameters do not fit the schema: an out-of-range column, an arity or
+    /// byte-budget overrun, a column type the operator has no image for. `Cow`
+    /// because most of these interpolate the offending value.
+    Shape(Cow<'static, str>),
+    /// An expression program was refused. The phrase names the guard and the
+    /// payload carries the validator's own reason, so the rejection says which
+    /// limit the program exceeded and not only which guard fired.
+    Program(&'static str, gnitz_expr::ExprValidateErr),
+}
+
+impl OpBuildErr {
+    /// A [`OpBuildErr::Shape`] from either a literal or an interpolated reason.
+    pub(crate) fn shape(why: impl Into<Cow<'static, str>>) -> Self {
+        OpBuildErr::Shape(why.into())
+    }
+
+    /// A client-supplied column index out of range for the schema it indexes;
+    /// `what` names the list it came from. The bound is always `num_columns()`,
+    /// never `MAX_COLUMNS`: the slots between read back as an undecodable
+    /// [`SchemaColumn::EMPTY`].
+    pub fn oob_col(what: &str, c: u32, schema: &SchemaDescriptor) -> Self {
+        OpBuildErr::shape(format!("{what} {c} out of range ({} cols)", schema.num_columns()))
+    }
+}
+
+impl std::fmt::Display for OpBuildErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpBuildErr::Shape(why) => f.write_str(why),
+            OpBuildErr::Program(guard, e) => write!(f, "{guard}: {e}"),
+        }
+    }
+}
 
 // One rule for what this module re-exports: a *schema fact* — what a column's
 // type is, how many of them there can be, how a key is shaped — comes through
@@ -636,10 +678,26 @@ impl SchemaDescriptor {
     /// columns below `col_idx`" has one implementation.
     #[inline]
     pub(crate) fn try_payload_idx(&self, col_idx: usize) -> Option<usize> {
-        match (col_idx < self.num_columns()).then(|| self.locate(col_idx))? {
+        match self.try_locate(col_idx)? {
             ColumnLocator::Payload { slot, .. } => Some(slot as usize),
             ColumnLocator::Pk { .. } => None,
         }
+    }
+
+    /// The column at `ci`, or `None` when it is out of range. The bounded read
+    /// for a client-supplied index: `columns[ci]` and `columns.get(ci)` both
+    /// answer for the `[num_columns, MAX_COLUMNS)` slots, which hold
+    /// [`SchemaColumn::EMPTY`].
+    #[inline]
+    pub fn column(&self, ci: usize) -> Option<SchemaColumn> {
+        (ci < self.num_columns()).then(|| self.columns[ci])
+    }
+
+    /// Where column `ci` lives, or `None` when it is out of range — the total
+    /// [`Self::locate`], whose own bound is a release-active panic.
+    #[inline]
+    pub(crate) fn try_locate(&self, ci: usize) -> Option<ColumnLocator> {
+        (ci < self.num_columns()).then(|| self.locate(ci))
     }
 
     /// True iff column `ci` is a PK column. Total: every PK index is in range,
@@ -693,8 +751,8 @@ impl SchemaDescriptor {
     pub fn locate(&self, col_idx: usize) -> ColumnLocator {
         // Release-active: an out-of-range `col_idx` otherwise falls through to
         // the payload arm with a slot no batch region answers for. A last-line
-        // guard against an internal bug — an untrusted column index is rejected
-        // by its own decoder — and free, since this never runs per row.
+        // guard against an internal bug — an untrusted index is bounded by the
+        // operator constructor that took it — and free, never running per row.
         assert!(
             col_idx < self.num_columns(),
             "locate: col_idx {col_idx} out of bounds (num_columns = {})",

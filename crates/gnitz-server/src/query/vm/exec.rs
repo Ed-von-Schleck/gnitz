@@ -34,7 +34,7 @@ fn log_tick_ingest_err(op: &str, table_idx: TableIdx, r: Result<(), StorageError
 /// gets a delta back with no prologue of its own to order.
 pub(in crate::query) fn execute_epoch_multi(
     vm: &mut VmHandle,
-    inputs: impl IntoIterator<Item = (u16, Batch)>,
+    inputs: impl IntoIterator<Item = (DeltaReg, Batch)>,
 ) -> Result<Option<Batch>, StorageError> {
     let all_empty = seed_inputs(vm, inputs);
     // A global-ground reduce mints its V₀ row on one empty epoch; every other
@@ -67,7 +67,7 @@ impl<'a> Replay<'a> {
     /// Seed one register out of a store and dispatch from `start_pc`, past the
     /// prologue that seed replaces. Read-only-ness is `reject_state_writers`'s to
     /// enforce; the one writer it admits is handled by [`IntegrateMode::Skip`].
-    pub(in crate::query) fn chunk(&mut self, seed: (u16, Batch)) -> Result<Option<Batch>, StorageError> {
+    pub(in crate::query) fn chunk(&mut self, seed: (DeltaReg, Batch)) -> Result<Option<Batch>, StorageError> {
         seed_inputs(self.vm, std::iter::once(seed));
         dispatch(self.vm, self.start_pc, IntegrateMode::Skip)
     }
@@ -85,7 +85,7 @@ enum IntegrateMode {
 /// Clear the registers and move each seed into its own, reporting whether every
 /// seed was empty. Split from [`dispatch`] so only these lines are generic over
 /// the seed iterator, not the whole loop below.
-fn seed_inputs(vm: &mut VmHandle, inputs: impl IntoIterator<Item = (u16, Batch)>) -> bool {
+fn seed_inputs(vm: &mut VmHandle, inputs: impl IntoIterator<Item = (DeltaReg, Batch)>) -> bool {
     vm.regfile.clear();
 
     let mut all_empty = true;
@@ -97,11 +97,12 @@ fn seed_inputs(vm: &mut VmHandle, inputs: impl IntoIterator<Item = (u16, Batch)>
         if !input_batch.is_empty() {
             assert_eq!(
                 input_batch.schema.num_columns(),
-                vm.program.reg_meta[input_reg as usize].schema.num_columns(),
-                "VM register {input_reg} schema/batch column-count mismatch",
+                vm.program.schema_of(input_reg).num_columns(),
+                "VM register {} schema/batch column-count mismatch",
+                input_reg.0,
             );
         }
-        vm.regfile.batches[input_reg as usize] = input_batch;
+        vm.regfile.batches[input_reg.at()] = input_batch;
     }
     all_empty
 }
@@ -112,9 +113,9 @@ fn seed_inputs(vm: &mut VmHandle, inputs: impl IntoIterator<Item = (u16, Batch)>
 /// `#[inline]`: it returns a 1 KiB `Batch` by value, so a call would cost an
 /// extra sret move at every site.
 #[inline]
-fn take_or_clone(batches: &mut [Batch], last_read: &[u32], reg: u16, pc: usize) -> Batch {
-    let batch = &mut batches[reg as usize];
-    match last_read[reg as usize] == pc as u32 {
+fn take_or_clone(batches: &mut [Batch], last_read: &[u32], reg: DeltaReg, pc: usize) -> Batch {
+    let batch = &mut batches[reg.at()];
+    match last_read[reg.at()] == pc as u32 {
         true => batch.take(),
         false => batch.clone_batch(),
     }
@@ -131,42 +132,46 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
 
     gnitz_debug!(
         "vm: dispatch out_reg={} instrs={}",
-        program.out_reg,
+        program.out_reg.0,
         program.instructions.len()
     );
 
     // Indexed, so `pc` is the absolute offset `last_read` is keyed by.
     for pc in start_pc..program.instructions.len() {
-        match &program.instructions[pc] {
+        let instr = &program.instructions[pc];
+        match instr {
             Instr::Filter { in_reg, out_reg, pred_idx } => {
                 let pred = &program.predicates[pred_idx.at()];
-                let schema = &program.reg_meta[*in_reg as usize].schema;
-                let result = ops::op_filter(&batches[*in_reg as usize], pred, schema);
-                batches[*out_reg as usize] = result;
+                let schema = program.schema_of(*in_reg);
+                let result = match ops::op_filter(&batches[in_reg.at()], pred, schema) {
+                    Some(kept) => kept,
+                    None => take_or_clone(batches, last_read, *in_reg, pc),
+                };
+                batches[out_reg.at()] = result;
             }
 
             Instr::Map { in_reg, out_reg, map_idx } => {
-                let result = program.maps[map_idx.at()].evaluate_map_batch(&batches[*in_reg as usize]);
-                batches[*out_reg as usize] = result;
+                let result = program.maps[map_idx.at()].evaluate_map_batch(&batches[in_reg.at()]);
+                batches[out_reg.at()] = result;
             }
 
             Instr::Negate { in_reg, out_reg } => {
                 let result = ops::op_negate(take_or_clone(batches, last_read, *in_reg, pc));
-                batches[*out_reg as usize] = result;
+                batches[out_reg.at()] = result;
             }
 
             Instr::Union { in_a, in_b, out_reg } => {
                 // The union's own (nullability-merged) schema, not the left
                 // input's — see `op_union` for why a narrower one mis-sorts
                 // nulls.
-                let out_schema = &program.reg_meta[*out_reg as usize].schema;
+                let out_schema = program.schema_of(*out_reg);
                 let result = if in_a == in_b {
                     // Z + Z doubles every weight. Delegating would take `in_a` and
                     // then add the emptied `in_b` to it, yielding Z.
                     let mut batch = take_or_clone(batches, last_read, *in_a, pc);
                     batch.map_weights(|w| w.wrapping_mul(2));
                     batch
-                } else if batches[*in_a as usize].is_empty() {
+                } else if batches[in_a.at()].is_empty() {
                     // `0 + B = B`. Here rather than in `op_union`, which can only
                     // clone B; taking an operand is the VM's decision. The mirror
                     // needs no arm — `op_union` hands `batch_a`, already taken,
@@ -175,19 +180,19 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
                 } else {
                     ops::op_union(
                         take_or_clone(batches, last_read, *in_a, pc),
-                        &batches[*in_b as usize],
+                        &batches[in_b.at()],
                         out_schema,
                     )
                 };
-                batches[*out_reg as usize] = result;
+                batches[out_reg.at()] = result;
             }
 
-            Instr::WeightClamp { in_reg, hist_reg, out_reg, lo, hi } => {
+            Instr::WeightClamp { in_reg, hist_reg, out_reg, preset } => {
                 let cursor = bound_cursor(cursors, *hist_reg);
-                let schema = &program.reg_meta[*in_reg as usize].schema;
+                let schema = program.schema_of(*in_reg);
                 let delta = take_or_clone(batches, last_read, *in_reg, pc);
-                let (output, consolidated) = ops::op_weight_clamp(delta, cursor, schema, *lo, *hi);
-                batches[*out_reg as usize] = output;
+                let (output, consolidated) = ops::op_weight_clamp(delta, cursor, schema, *preset);
+                batches[out_reg.at()] = output;
                 // Ingest consolidated delta into history table
                 let hist_table = program.trace_table_idx(*hist_reg);
                 let res = tables[hist_table.at()].ingest_owned_batch(consolidated);
@@ -195,44 +200,45 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
             }
 
             Instr::JoinDT { delta_reg, trace_reg, out_reg, probe } => {
-                let left_schema = &program.reg_meta[*delta_reg as usize].schema;
-                let right_schema = &program.reg_meta[*trace_reg as usize].schema;
-                let out_schema = &program.reg_meta[*out_reg as usize].schema;
+                let left_schema = program.schema_of(*delta_reg);
+                let right_schema = program.schema_of(*trace_reg);
+                let out_schema = program.schema_of(*out_reg);
                 let result = ops::op_join_delta_trace(
-                    &batches[*delta_reg as usize],
+                    &batches[delta_reg.at()],
                     bound_cursor(cursors, *trace_reg),
                     left_schema,
                     right_schema,
                     out_schema,
                     *probe,
                 );
-                batches[*out_reg as usize] = result;
+                batches[out_reg.at()] = result;
             }
 
             Instr::WorkerFilter { in_reg, out_reg, worker_id, num_workers } => {
-                let schema = &program.reg_meta[*in_reg as usize].schema;
-                let result = ops::op_worker_filter(&batches[*in_reg as usize], schema, *worker_id, *num_workers);
-                batches[*out_reg as usize] = result;
+                let schema = program.schema_of(*in_reg);
+                let result = ops::op_worker_filter(&batches[in_reg.at()], schema, *worker_id, *num_workers);
+                batches[out_reg.at()] = result;
             }
 
             Instr::NullExtend { in_reg, out_reg } => {
-                let in_schema = &program.reg_meta[*in_reg as usize].schema;
-                let out_schema = &program.reg_meta[*out_reg as usize].schema;
-                let result = batches[*in_reg as usize].widened_with_null_tail(in_schema, out_schema);
-                batches[*out_reg as usize] = result;
+                let in_schema = program.schema_of(*in_reg);
+                let out_schema = program.schema_of(*out_reg);
+                let result = batches[in_reg.at()].widened_with_null_tail(in_schema, out_schema);
+                batches[out_reg.at()] = result;
             }
 
             Instr::Integrate { in_reg, trace_reg } => {
                 if integrate == IntegrateMode::Skip {
+                    // Skips the release below too: an unread register is unfreed.
                     continue;
                 }
-                gnitz_debug!("vm: INTEGRATE in_count={}", batches[*in_reg as usize].len());
+                gnitz_debug!("vm: INTEGRATE in_count={}", batches[in_reg.at()].len());
                 let trace_table = program.trace_table_idx(*trace_reg);
                 // Not `take_or_clone`: for a `Raw` register its clone arm would cost
                 // a clone plus the trace's own consolidate, where moving costs one.
-                let res = match last_read[*in_reg as usize] == pc as u32 {
-                    true => tables[trace_table.at()].ingest_owned_batch(batches[*in_reg as usize].take()),
-                    false => tables[trace_table.at()].ingest_borrowed_batch(&batches[*in_reg as usize]),
+                let res = match last_read[in_reg.at()] == pc as u32 {
+                    true => tables[trace_table.at()].ingest_owned_batch(batches[in_reg.at()].take()),
+                    false => tables[trace_table.at()].ingest_borrowed_batch(&batches[in_reg.at()]),
                 };
                 log_tick_ingest_err("integrate", trace_table, res)?;
             }
@@ -247,7 +253,7 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
                 let mut avi_cursor = match baked.avi_table.zip(baked.plan.avi.as_ref()) {
                     Some((idx, bake)) => {
                         let table = &mut tables[idx.at()];
-                        let res = ops::op_populate_avi(&batches[*in_reg as usize], table, bake);
+                        let res = ops::op_populate_avi(&batches[in_reg.at()], table, bake);
                         log_tick_ingest_err("avi", idx, res)?;
                         let _ = table.compact_if_needed();
                         Some(table.open_cursor())
@@ -257,13 +263,23 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
 
                 gnitz_debug!(
                     "vm: REDUCE in_count={} avi={} aggs={}",
-                    batches[*in_reg as usize].len(),
+                    batches[in_reg.at()].len(),
                     avi_cursor.is_some(),
                     baked.plan.acc_template.len()
                 );
 
-                let raw_out = ops::op_reduce(&batches[*in_reg as usize], to_cursor, avi_cursor.as_mut(), &baked.plan);
-                batches[*out_reg as usize] = raw_out;
+                let raw_out = ops::op_reduce(&batches[in_reg.at()], to_cursor, avi_cursor.as_mut(), &baked.plan);
+                batches[out_reg.at()] = raw_out;
+            }
+        }
+
+        // Free every operand this instruction was the last reader of, here
+        // rather than per arm — so a register's lifetime follows the dataflow
+        // instead of whether some kernel happens to take `Batch` by value.
+        // Idempotent: releasing an already-emptied batch returns immediately.
+        for r in reads(instr).into_iter().flatten() {
+            if last_read[r.at()] == pc as u32 {
+                batches[r.at()].release_buffers();
             }
         }
     }
@@ -274,7 +290,7 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
     // operator's identity path can hand an input batch straight back (see
     // `op_union`), so the label on it may be an operand's; downstream — the
     // exchange wire, `prepare_relay`, the dag driver's fan-out — cannot re-derive it.
-    let out = &mut batches[program.out_reg as usize];
+    let out = &mut batches[program.out_reg.at()];
     Ok((!out.is_empty()).then(|| {
         let mut batch = out.take();
         let want = program.out_schema();
@@ -284,7 +300,7 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
         debug_assert!(
             batch.schema.same_physical_layout(&want),
             "VM output register {}: batch label is not the register's physical layout",
-            program.out_reg,
+            program.out_reg.0,
         );
         batch.set_schema(&want);
         batch
@@ -295,8 +311,8 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
 /// first, and `build_plan` rejects a trace port naming a register with no owned
 /// table — so a missing cursor is a VM bug, not a state a circuit can reach.
 #[inline]
-fn bound_cursor(cursors: &mut [Option<Box<ReadCursor>>], reg: u16) -> &mut ReadCursor {
-    cursors[reg as usize]
+fn bound_cursor(cursors: &mut [Option<Box<ReadCursor>>], reg: TraceReg) -> &mut ReadCursor {
+    cursors[reg.at()]
         .as_deref_mut()
         .expect("every dispatch binds its trace cursors first")
 }

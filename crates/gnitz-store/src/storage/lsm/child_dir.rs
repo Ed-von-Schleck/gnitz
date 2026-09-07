@@ -233,6 +233,25 @@ pub(super) fn link_child(
     )
 }
 
+/// Create a child directory, answering whether **this call** created it. A child
+/// that was already there carries checkpointed state, whose loss
+/// [`state_child_manifests`] cannot see: it enumerates the scratch children, so
+/// the survivors alone answer the resume verdict.
+#[must_use = "only a child this call created may be removed again"]
+pub fn create_child(dir: &str) -> Result<bool, StorageError> {
+    match fs::create_dir(dir) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        // A missing ancestor — the compile's throwaway pre-flight root. Retried
+        // whole so a non-directory in the path still reports its own ENOTDIR.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(dir)?;
+            Ok(true)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Unlink a child's manifest, make that durable, then remove the directory.
 /// `remove_dir_all` deletes in readdir order, so unlinking the manifest first
 /// is what keeps a crash from leaving a manifest whose shards are gone — a

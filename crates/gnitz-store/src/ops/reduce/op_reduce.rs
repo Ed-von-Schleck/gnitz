@@ -113,7 +113,7 @@ fn walk_group_rows(
 /// Everything that is a pure function of compile-time facts — schemas, group
 /// columns, aggregate descriptors, linearity, key kind, the group-exemplar
 /// locators, the global-ground flags — arrives baked in `plan` (one construction
-/// site, `ReducePlan::new`).
+/// site, `ReducePlan::build`).
 pub fn op_reduce(
     delta: &Batch,
     trace_out_cursor: &mut ReadCursor,
@@ -189,7 +189,7 @@ pub fn op_reduce(
     let mut accs: Vec<Accumulator> = plan.acc_template.clone();
 
     // A group exists iff its net cardinality (row weight) is positive; the unique
-    // AggFunc::Count accumulator carries that signal (baked by `ReducePlan::new`;
+    // AggFunc::Count accumulator carries that signal (baked by `ReducePlan::build`;
     // `None` degrades a count-less reduce to the touched-ness test below).
     let cardinality_idx: Option<usize> = plan.cardinality_idx.map(|i| i as usize);
 

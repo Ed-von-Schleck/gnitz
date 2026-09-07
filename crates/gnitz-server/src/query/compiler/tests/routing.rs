@@ -2,6 +2,7 @@ use super::*;
 use crate::test_support::{make_schema_u64_i64, pk_payload_schema};
 use gnitz_store::schema::type_code;
 use gnitz_wire::{JoinKind, OpNode, RangeRel, TypeCode};
+use std::collections::HashMap;
 
 /// 3-column compound PK `(U32, U64, U64)` + one payload, so a `CLUSTER BY`
 /// prefix has more than one proper-prefix width to be tested at.
@@ -48,13 +49,13 @@ fn shard_cols_match_dist_key_is_exact_prefix() {
 fn the_output_exchange_skips_only_at_the_two_ends_of_the_prefix() {
     let skips = |schema: SchemaDescriptor, shard_cols: Vec<u32>| {
         let loaded = loaded_for_test(
-            HashMap::from([
+            [
                 (0, scan_delta(7)),
                 (1, gnitz_wire::OpNode::ExchangeShard { shard_cols }),
-            ]),
+            ],
             vec![(0, 1, SLOT_IN)],
         );
-        let ext: ExtTables = HashMap::from([(7, schema)]);
+        let ext = ext_tables([(7, schema)]);
         ViewMeta::derive(&loaded, &ext).unwrap().skips_exchange
     };
     assert!(
@@ -77,9 +78,10 @@ fn the_output_exchange_skips_only_at_the_two_ends_of_the_prefix() {
 fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
     // Compound PK (a, b) at columns 0, 1; column 2 is payload.
     let compound = pk_payload_schema(&[type_code::U64; 2]);
-    let ext: ExtTables = HashMap::from([(7, compound)]);
-    let co =
-        |cols: Vec<gnitz_wire::ReindexSlot>| compute_co_partitioned(&HashMap::from([(7i64, cols)]), &ext).contains(&7);
+    let ext = ext_tables([(7, compound)]);
+    let co = |cols: Vec<gnitz_wire::ReindexSlot>| {
+        compute_co_partitioned(&JoinShardMap::from_iter([(7i64, cols)]), &ext).contains(&7)
+    };
     assert!(co(vec![(0, None), (1, None)]), "shard [pk0, pk1] equals pk_indices()");
     assert!(
         !co(vec![(1, None), (0, None)]),
@@ -97,34 +99,38 @@ fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
     // replication.
     let base = make_schema_u64_i64;
     let replicated = base().with_placement(Placement::Replicated);
-    let join_on_payload = HashMap::from([(7i64, vec![(1u32, None)]), (8i64, vec![(1u32, None)])]);
+    let join_on_payload = JoinShardMap::from_iter([(7i64, vec![(1u32, None)]), (8i64, vec![(1u32, None)])]);
     let both_skip = |ext: ExtTables| {
         let co = compute_co_partitioned(&join_on_payload, &ext);
         (co.contains(&7), co.contains(&8))
     };
     assert_eq!(
-        both_skip(HashMap::from([(7, base()), (8, base())])),
+        both_skip(ext_tables([(7, base()), (8, base())])),
         (false, false),
         "two partitioned sides on a non-PK key both go through the exchange"
     );
     // A partitioned fact skips too when its partner is replicated: it stays in
     // its own PK partitioning and joins the full local dim copy.
     assert_eq!(
-        both_skip(HashMap::from([(7, replicated), (8, base())])),
+        both_skip(ext_tables([(7, replicated), (8, base())])),
         (true, true),
         "a replicated dim lets both sides skip"
     );
     assert_eq!(
-        both_skip(HashMap::from([(7, replicated), (8, replicated)])),
+        both_skip(ext_tables([(7, replicated), (8, replicated)])),
         (true, true),
         "replicated ⋈ replicated"
     );
     // The write broadcast already put a replicated source's full trace on every
     // worker, so the promotion gate that blocks a partitioned source does not
     // apply to it.
-    let ext_r: ExtTables = HashMap::from([(7, replicated)]);
+    let ext_r = ext_tables([(7, replicated)]);
     assert!(
-        compute_co_partitioned(&HashMap::from([(7i64, vec![(0u32, Some(TypeCode::I64))])]), &ext_r).contains(&7),
+        compute_co_partitioned(
+            &JoinShardMap::from_iter([(7i64, vec![(0u32, Some(TypeCode::I64))])]),
+            &ext_r
+        )
+        .contains(&7),
         "replicated source skips regardless of carried type-promotion"
     );
 }
@@ -136,14 +142,14 @@ fn co_partitioning_needs_the_exact_pk_sequence_or_a_replicated_participant() {
 fn a_source_reached_by_two_scans_routes_by_one_key_or_refuses() {
     let two_scans = |key_a: &[u32], key_b: &[u32]| -> ViewMeta {
         let loaded = loaded_for_test(
-            HashMap::from([
+            [
                 (0, scan_delta(10)),
                 (1, scatter_reindex(key_a)),
                 (2, scan_delta(10)),
                 (3, scatter_reindex(key_b)),
                 (4, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::Equi)),
                 (5, gnitz_wire::OpNode::IntegrateSink),
-            ]),
+            ],
             vec![
                 (0, 1, SLOT_IN),
                 (2, 3, SLOT_IN),
@@ -173,14 +179,14 @@ fn a_source_reached_by_two_scans_routes_by_one_key_or_refuses() {
 #[test]
 fn a_source_with_no_reindex_map_takes_the_view_shard_route() {
     let loaded = loaded_for_test(
-        HashMap::from([
+        [
             (0, scan_delta(10)),
             (1, scan_delta(20)),
             (2, scatter_reindex(&[2])),
             (3, gnitz_wire::OpNode::Join(gnitz_wire::JoinKind::Equi)),
             (4, gnitz_wire::OpNode::IntegrateSink),
             (5, gnitz_wire::OpNode::IntegrateTrace),
-        ]),
+        ],
         vec![
             (0, 2, SLOT_IN),
             (1, 5, SLOT_IN), // ScanDelta(20) → IntegrateTrace, no reindex
@@ -214,7 +220,7 @@ fn a_scan_whose_reindex_maps_are_all_auxiliary_is_rejected() {
         role: gnitz_wire::ReindexRole::Auxiliary,
     });
     let loaded = loaded_for_test(
-        HashMap::from([(0, scan_delta(10)), (1, aux), (2, gnitz_wire::OpNode::IntegrateSink)]),
+        [(0, scan_delta(10)), (1, aux), (2, gnitz_wire::OpNode::IntegrateSink)],
         vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
     );
     assert!(
@@ -348,7 +354,7 @@ fn a_band_join_routes_by_the_equality_prefix_and_an_equi_join_by_the_whole_key()
 #[test]
 fn a_broadcast_join_relays_a_co_partitioned_source_that_an_equi_join_would_skip() {
     let keyed_by_pk = |kind| {
-        let ext: ExtTables = HashMap::from([(7i64, make_schema_u64_i64())]);
+        let ext = ext_tables([(7i64, make_schema_u64_i64())]);
         join_meta_in(kind, &[0], ext).scatters(7)
     };
     assert!(!keyed_by_pk(JoinKind::Equi), "the equi join skips the relay");

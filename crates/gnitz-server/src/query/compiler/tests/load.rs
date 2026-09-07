@@ -1,11 +1,15 @@
 use super::*;
 use gnitz_wire::{MapKind, OpNode, ReindexRole};
+use std::collections::HashMap;
 
 #[test]
 fn a_cyclic_circuit_is_rejected() {
     let nodes = HashMap::from([(0, OpNode::Negate), (1, OpNode::Negate)]);
     assert!(matches!(
-        load::topo_sorted(nodes, wire_slots(&[(0, 1, SLOT_IN), (1, 0, SLOT_IN)])),
+        load::topo_sorted(
+            nodes.into_iter().collect(),
+            wire_slots(&[(0, 1, SLOT_IN), (1, 0, SLOT_IN)])
+        ),
         Err(CompileError::Rejected("circuit graph has a cycle"))
     ));
 }
@@ -171,7 +175,7 @@ fn the_load_takes_one_views_rows_and_keeps_a_damaged_program_present() {
 #[test]
 fn a_load_from_unopened_system_tables_fails() {
     assert!(matches!(
-        load_circuit(&ExtTables::new(), 0),
+        load_circuit(&ext_tables([]), 0),
         Err(CompileError::Rejected("the circuit system table is not open"))
     ));
 }
@@ -185,7 +189,7 @@ fn a_load_from_unopened_system_tables_fails() {
 fn arity_violations_fail_at_load() {
     let load = |dst: OpNode, edges: &[(i32, i32, usize)]| {
         let nodes = HashMap::from([(0, scan_delta(10)), (1, scan_delta(11)), (2, dst)]);
-        load::topo_sorted(nodes, wire_slots(edges))
+        load::topo_sorted(nodes.into_iter().collect(), wire_slots(edges))
     };
     let rejected = |r: Result<LoadedCircuit, CompileError>, what: &str| {
         assert!(
@@ -229,7 +233,7 @@ fn arity_violations_fail_at_load() {
 #[test]
 fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key() {
     let loaded = loaded_for_test(
-        HashMap::from([
+        [
             (0, scan_delta(7)),
             (1, scatter_reindex(&[1])),
             (2, OpNode::ExchangeShard { shard_cols: vec![1] }),
@@ -245,20 +249,20 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
                 },
             ),
             (4, OpNode::IntegrateSink),
-        ]),
+        ],
         vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_IN), (3, 4, SLOT_IN)],
     );
     assert_eq!(load::circuit_join_relay(&loaded), load::JoinRelay::WholeKey);
 
     let joined = |kind: gnitz_wire::JoinKind| {
         loaded_for_test(
-            HashMap::from([
+            [
                 (0, scan_delta(7)),
                 (1, scan_delta(9)),
                 (2, OpNode::IntegrateTrace),
                 (3, OpNode::Join(kind)),
                 (4, OpNode::IntegrateSink),
-            ]),
+            ],
             vec![(0, 3, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_TRACE), (3, 4, SLOT_IN)],
         )
     };
@@ -283,7 +287,7 @@ fn the_join_relay_follows_the_join_kind_and_a_group_by_routes_by_the_whole_key()
 #[test]
 fn the_scatter_key_is_collected_once_however_the_reindex_map_fans_out() {
     let loaded = loaded_for_test(
-        HashMap::from([
+        [
             (0, scan_delta(99)),
             (1, scatter_reindex(&[2])),
             (2, OpNode::WorkerFilter),
@@ -292,7 +296,7 @@ fn the_scatter_key_is_collected_once_however_the_reindex_map_fans_out() {
                 4,
                 OpNode::Join(gnitz_wire::JoinKind::Range { n_eq: 0, rel: gnitz_wire::RangeRel::Le }),
             ),
-        ]),
+        ],
         vec![
             (0, 1, SLOT_IN),
             (1, 4, SLOT_IN), // reindex Map → Join (delta term, DIRECT edge)
@@ -311,12 +315,12 @@ fn the_scatter_key_is_collected_once_however_the_reindex_map_fans_out() {
 #[test]
 fn a_scan_fanning_into_two_reindex_maps_yields_two_sequences() {
     let loaded = loaded_for_test(
-        HashMap::from([
+        [
             (0, scan_delta(42)),
             (1, scatter_reindex(&[2])),
             (2, OpNode::Filter(dummy_expr_blob())),
             (3, scatter_reindex(&[5])),
-        ]),
+        ],
         // The second reindex sits behind a Filter, which the walk steps through.
         vec![(0, 1, SLOT_IN), (0, 2, SLOT_IN), (2, 3, SLOT_IN)],
     );
@@ -336,7 +340,7 @@ fn a_scan_fanning_into_two_reindex_maps_yields_two_sequences() {
 #[test]
 fn a_key_sequence_survives_verbatim_but_identical_siblings_collapse() {
     let overlapping = loaded_for_test(
-        HashMap::from([
+        [
             (0, scan_delta(42)),
             (
                 1,
@@ -346,7 +350,7 @@ fn a_key_sequence_survives_verbatim_but_identical_siblings_collapse() {
                     role: ReindexRole::ScatterKey,
                 }),
             ),
-        ]),
+        ],
         vec![(0, 1, SLOT_IN)],
     );
     assert_eq!(
@@ -356,13 +360,13 @@ fn a_key_sequence_survives_verbatim_but_identical_siblings_collapse() {
     );
 
     let siblings = loaded_for_test(
-        HashMap::from([
+        [
             (0, scan_delta(7)),
             (1, OpNode::Filter(dummy_expr_blob())),
             (2, scatter_reindex(&[2])),
             (3, OpNode::Filter(dummy_expr_blob())),
             (4, scatter_reindex(&[2])),
-        ]),
+        ],
         vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (0, 3, SLOT_IN), (3, 4, SLOT_IN)],
     );
     assert_eq!(
@@ -388,7 +392,7 @@ fn an_auxiliary_reindex_never_contributes_the_scatter_key() {
     };
     let circuit = |join_reindex: OpNode, aux_rekey: OpNode| {
         loaded_for_test(
-            HashMap::from([
+            [
                 (0, scan_delta(10)),
                 (1, join_reindex),
                 (
@@ -399,7 +403,7 @@ fn an_auxiliary_reindex_never_contributes_the_scatter_key() {
                 (4, aux_rekey),
                 (5, OpNode::Map(MapKind::Projection(vec![]))),
                 (6, OpNode::Distinct),
-            ]),
+            ],
             vec![
                 (0, 1, SLOT_IN),
                 (1, 2, SLOT_IN),
@@ -427,7 +431,7 @@ fn an_auxiliary_reindex_never_contributes_the_scatter_key() {
 #[test]
 fn a_non_reindex_map_contributes_no_scatter_key() {
     let loaded = loaded_for_test(
-        HashMap::from([
+        [
             (0, scan_delta(7)),
             (
                 1,
@@ -436,7 +440,7 @@ fn a_non_reindex_map_contributes_no_scatter_key() {
                     out_cols: vec![],
                 })),
             ),
-        ]),
+        ],
         vec![(0, 1, SLOT_IN)],
     );
     assert!(load::scatter_key_of_scan(&loaded, 0).0.is_empty());
@@ -510,5 +514,32 @@ fn the_shard_walk_bails_at_a_fan_in() {
         union_then(vec![OpNode::Filter(dummy_expr_blob())]),
         None,
         "a Filter is transparent, so the walk reaches the Union and bails there"
+    );
+}
+
+/// The node cap is what keeps every downstream `u16` id — registers, tables —
+/// in range without any per-plan arithmetic, so it is enforced in the one
+/// constructor every plan passes through rather than at each plan build.
+#[test]
+fn a_circuit_over_the_node_limit_is_rejected() {
+    let n = MAX_CIRCUIT_NODES as i32 + 1;
+    let mut nodes = HashMap::from([(0, scan_delta(10))]);
+    let mut edges = Vec::new();
+    for nid in 1..n {
+        nodes.insert(nid, OpNode::Negate);
+        edges.push((nid - 1, nid, SLOT_IN));
+    }
+    assert_eq!(
+        load::topo_sorted(nodes.clone().into_iter().collect(), wire_slots(&edges))
+            .map(|_| "a circuit")
+            .expect_err("over the limit")
+            .to_string(),
+        "circuit exceeds the node limit"
+    );
+    nodes.remove(&(n - 1));
+    edges.pop();
+    assert!(
+        load::topo_sorted(nodes.into_iter().collect(), wire_slots(&edges)).is_ok(),
+        "exactly MAX_CIRCUIT_NODES is accepted"
     );
 }

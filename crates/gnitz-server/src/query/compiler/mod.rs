@@ -5,15 +5,15 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt;
 
-use crate::query::vm::{ProgramBuilder, RegisterMeta, VmHandle};
+use crate::query::vm::{DeltaReg, ProgramBuilder, RegisterMeta, TraceReg, VmHandle};
 use gnitz_expr::{ExprValidateErr, LogicalProgram};
 use gnitz_store::expr::MapPlan;
-use gnitz_store::schema::{project_schema, SchemaDescriptor};
+use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::{ReadCursor, RecoverySource, Slot, StorageError, StoreBudgets, Table};
 use gnitz_wire::AggDescriptor;
 
@@ -26,13 +26,17 @@ use emit::*;
 use hydration::derive_hydration;
 pub(super) use hydration::{Hydration, HydrationSeed};
 
-// Everything here is `pub(super)`: `dag` is the only module that names the
-// compiler, so a `pub(crate)` would publish it to the catalog and runtime rungs
-// too. The one exception is `RelayRoute`, which the master relay matches on.
+// `pub(super)` by default: `dag` is the only module that names the compiler, so
+// a `pub(crate)` would publish it to the catalog and runtime rungs too.
 pub(super) use load::for_each_scan_edge;
 use load::scan_tid_through_filters;
 pub(crate) use routing::RelayRoute;
 pub(super) use routing::ViewMeta;
+
+/// The most nodes one view's circuit may hold. A real circuit is 15–40 nodes;
+/// the headroom is what makes the `u16` register and table ids safe under any
+/// future node kind minting up to three of each (`3 × 16_384 + 2 < u16::MAX`).
+pub(in crate::query) const MAX_CIRCUIT_NODES: usize = 16_384;
 
 // Input slots reach the compiler only in hand-written fixtures; every production
 // read of an operand goes through [`NodeInputs`]. Slot 0 is a unary operator's
@@ -45,8 +49,8 @@ pub(super) const SLOT_TRACE: usize = 1;
 /// Fixture wiring: `(producer, consumer, slot)` triples into the per-node input
 /// slots `load_circuit` reads out of a node row's `input_0`/`input_1` columns.
 #[cfg(test)]
-pub(super) fn wire_slots(edges: &[(i32, i32, usize)]) -> HashMap<i32, [Option<i32>; 2]> {
-    let mut by_node: HashMap<i32, [Option<i32>; 2]> = HashMap::new();
+pub(super) fn wire_slots(edges: &[(i32, i32, usize)]) -> FxHashMap<i32, [Option<i32>; 2]> {
+    let mut by_node: FxHashMap<i32, [Option<i32>; 2]> = FxHashMap::default();
     for &(src, dst, slot) in edges {
         by_node.entry(dst).or_default()[slot] = Some(src);
     }
@@ -70,6 +74,9 @@ pub(in crate::query) enum CompileError {
     /// guard and carries the validator's own reason, so the rejection can state
     /// *which* limit the program exceeded and not only which guard fired.
     RejectedExpr(&'static str, ExprValidateErr),
+    /// A store-side operator constructor refused this circuit's parameters for
+    /// it. Its own diagnostic is the whole message.
+    RejectedOp(gnitz_store::schema::OpBuildErr),
     /// The machine failed, not the circuit: a storage step the compile needs
     /// returned an error. The payload names the step and carries the errno.
     StorageFailed(&'static str, StorageError),
@@ -81,6 +88,7 @@ impl fmt::Display for CompileError {
             CompileError::Rejected(guard) => f.write_str(guard),
             CompileError::RejectedNode(why) => f.write_str(why),
             CompileError::RejectedExpr(guard, e) => write!(f, "{guard}: {e}"),
+            CompileError::RejectedOp(e) => write!(f, "{e}"),
             CompileError::StorageFailed(step, e) => write!(f, "{step}: {e}"),
         }
     }
@@ -98,10 +106,10 @@ impl fmt::Display for CompileError {
 /// circuit is derived once into [`ViewMeta`], so nothing else can read a
 /// second answer out of the graph.
 pub(super) struct LoadedCircuit {
-    nodes: HashMap<i32, gnitz_wire::OpNode>,
+    nodes: FxHashMap<i32, gnitz_wire::OpNode>,
     ordered: Vec<i32>,
-    outgoing: HashMap<i32, Vec<i32>>,
-    inputs: HashMap<i32, NodeInputs>,
+    outgoing: FxHashMap<i32, Vec<i32>>,
+    inputs: FxHashMap<i32, NodeInputs>,
 }
 
 impl LoadedCircuit {
@@ -124,6 +132,15 @@ impl LoadedCircuit {
         self.inputs.get(&nid).expect("topo_sorted builds one entry per node")
     }
 
+    /// Every `ExchangeShard` and its key, in topological order — so the last is
+    /// the sink-nearest, the one whose key the view's output carries.
+    fn exchange_shards(&self) -> impl DoubleEndedIterator<Item = (i32, &[u32])> {
+        self.ops().filter_map(|(nid, op)| match op {
+            gnitz_wire::OpNode::ExchangeShard { shard_cols } => Some((nid, shard_cols.as_slice())),
+            _ => None,
+        })
+    }
+
     /// `ordered`, restricted to `keep`. Every node list a plan is built over is
     /// produced this way, so a plan always sees the circuit's own topological
     /// order rather than whatever order the caller's set iterates in.
@@ -133,8 +150,8 @@ impl LoadedCircuit {
 
     /// Every node reachable backwards from `start` (inclusive) — the
     /// sub-pipeline that produces its value.
-    fn ancestors_inclusive(&self, start: i32) -> HashSet<i32> {
-        let mut set = HashSet::new();
+    fn ancestors_inclusive(&self, start: i32) -> FxHashSet<i32> {
+        let mut set = FxHashSet::default();
         let mut queue = VecDeque::from([start]);
         while let Some(cur) = queue.pop_front() {
             if set.insert(cur) {
@@ -144,8 +161,10 @@ impl LoadedCircuit {
         set
     }
 
-    /// The sub-pipeline producing `out`'s value — the carve `compile_view`
-    /// plans each exchange side over.
+    /// The sub-pipeline producing `out`'s value. `compile_view` needs the
+    /// ancestor set itself (to exclude it from the post phase), so it runs the
+    /// two halves separately rather than through this.
+    #[cfg(test)]
     fn subgraph_ordered(&self, out: i32) -> Vec<i32> {
         let set = self.ancestors_inclusive(out);
         self.ordered_where(|n| set.contains(&n))
@@ -200,8 +219,17 @@ impl NodeInputs {
 /// Build a `LoadedCircuit` from raw nodes/edges. Test-only: the struct's fields
 /// are module-private, so a test outside this module cannot construct one.
 #[cfg(test)]
-pub(super) fn loaded_for_test(nodes: HashMap<i32, gnitz_wire::OpNode>, edges: Vec<(i32, i32, usize)>) -> LoadedCircuit {
-    load::topo_sorted(nodes, wire_slots(&edges)).expect("test circuit must be a well-formed DAG")
+pub(super) fn loaded_for_test(
+    nodes: impl IntoIterator<Item = (i32, gnitz_wire::OpNode)>,
+    edges: Vec<(i32, i32, usize)>,
+) -> LoadedCircuit {
+    load::topo_sorted(nodes.into_iter().collect(), wire_slots(&edges)).expect("test circuit must be a well-formed DAG")
+}
+
+/// The relation set a compiler test plans against.
+#[cfg(test)]
+pub(super) fn ext_tables(rows: impl IntoIterator<Item = (i64, SchemaDescriptor)>) -> ExtTables {
+    rows.into_iter().collect()
 }
 
 /// An unbounded delta scan — every fixture circuit's source shape.
@@ -248,9 +276,12 @@ pub(super) trait SchemaSource {
 }
 
 /// A standalone relation set — what the compiler's own tests build. It holds no
-/// circuit table, so every load against one is refused.
-pub(super) type ExtTables = HashMap<i64, SchemaDescriptor>;
+/// circuit table, so every load against one is refused. `cfg(test)` with its
+/// impl: `dead_code` never fires on a trait impl, so an ungated one would ship.
+#[cfg(test)]
+pub(super) type ExtTables = FxHashMap<i64, SchemaDescriptor>;
 
+#[cfg(test)]
 impl SchemaSource for ExtTables {
     fn schema_of(&self, tid: i64) -> Option<SchemaDescriptor> {
         self.get(&tid).copied()
@@ -280,17 +311,27 @@ impl SchemaSource for gnitz_store::relation::RelationRegistry {
 // ---------------------------------------------------------------------------
 
 /// A compiled sub-pipeline: the VM program, its register layout, and its
-/// source-to-input-register map.
-/// Used for: (a) the pre-exchange phase of every view, (b) each side of a
-/// binary set-op, and (c) the post-combine phase (single- and two-exchange
-/// views). All three are structurally identical; the difference is only which
-/// part of the plan graph they cover.
+/// source-to-input-register map. One per `build_plan` call — an exchange side,
+/// or the post-combine phase, which for an exchange-free circuit is the whole
+/// plan.
 pub(super) struct SubPlan {
     pub(in crate::query) vm: Box<VmHandle>,
-    pub(in crate::query) in_reg: u16,
+    pub(in crate::query) in_reg: DeltaReg,
     /// Maps a source table id to the input register that receives its delta.
     /// Empty for the post-combine phase (which has no source-level routing).
-    pub(in crate::query) source_reg_map: FxHashMap<i64, u16>,
+    pub(in crate::query) source_reg_map: FxHashMap<i64, DeltaReg>,
+}
+
+impl SubPlan {
+    /// The one source table this plan scans, or `None` where it scans none or
+    /// several. A set-op side's exchange key, so each side's IPC rounds key
+    /// distinctly.
+    fn single_source(&self) -> Option<i64> {
+        match self.source_reg_map.len() {
+            1 => self.source_reg_map.keys().next().copied(),
+            _ => None,
+        }
+    }
 }
 
 /// One exchanged side of a [`Sides`] plan: a sub-pipeline whose output is
@@ -298,7 +339,7 @@ pub(super) struct SubPlan {
 pub(super) struct Side {
     pub(in crate::query) plan: SubPlan,
     /// Register in the post VM seeded with this side's relayed batch.
-    pub(in crate::query) seed_reg: u16,
+    pub(in crate::query) seed_reg: DeltaReg,
 }
 
 impl Side {
@@ -396,70 +437,19 @@ impl CompileOutput {
 // Build a single plan (pre or post exchange)
 // ---------------------------------------------------------------------------
 
-pub(super) struct PlanBuildResult {
-    vm: Box<VmHandle>,
-    in_reg: u16,
-    source_reg_map: FxHashMap<i64, u16>,
-    // The seed register of each exchange input this plan was built with, in the
-    // order the input list named them — so `compile_view` reads a side's seed at
-    // the side's own index rather than searching for it.
-    exchange_input_regs: Vec<u16>,
-    // Scratch dirs created for this plan. Dropping the result (a failed sibling
-    // plan, an `Err` return from `compile_view`) removes them; `into_sub_plan`
-    // defuses the guard — from then on the VM's owned tables keep them alive.
-    scratch: emit::ScratchGuard,
-    // Program offset just past each node's own instructions — where a hydration
-    // replay that seeds that node's register resumes. See [`Hydration`].
-    instr_end: HashMap<i32, usize>,
-    // The emitter's resolved node → output register map, after every aliasing
-    // rewrite (an elided identity `Map`, a `WorkerFilter` this worker cannot
-    // narrow). Reading it is how `derive_hydration` sees through elision rather
-    // than re-deriving a register from graph position.
-    out_reg_of: HashMap<i32, u16>,
-}
-
-impl PlanBuildResult {
-    /// Convert into the runtime `SubPlan`, defusing the scratch guard.
-    fn into_sub_plan(mut self) -> SubPlan {
-        self.scratch.defuse();
-        SubPlan {
-            in_reg: self.in_reg,
-            source_reg_map: self.source_reg_map,
-            vm: self.vm,
-        }
-    }
-
-    /// The one source table this plan scans, or `None` where it scans none or
-    /// several. A set-op side's exchange key, so each side's IPC rounds key
-    /// distinctly.
-    fn single_source(&self) -> Option<i64> {
-        match self.source_reg_map.len() {
-            1 => self.source_reg_map.keys().next().copied(),
-            _ => None,
-        }
-    }
-}
-
-/// Validate an exchange-input sub-plan and return its output schema. An
-/// `ExchangeShard` emits no instruction, so nothing else checks its
-/// `shard_cols`: the shard key is read at runtime as `schema.columns[c]`, so a
-/// crafted/corrupt node is rejected here rather than aborting at the first push.
-/// On `Err`, dropping the plan removes its scratch dirs.
-fn finalize_side(plan: &PlanBuildResult, shard_cols: &[u32]) -> Result<SchemaDescriptor, CompileError> {
+/// Validate an exchange-input sub-plan and return its output schema.
+/// `ScatterKey::new` bounds the same columns, but only mid-round in the master
+/// relay; here the corrupt node is a `CREATE VIEW` rejection instead.
+fn finalize_side(plan: &SubPlan, shard_cols: &[u32]) -> Result<SchemaDescriptor, CompileError> {
     let schema = plan.vm.program.out_schema();
-    if oob_cols(shard_cols.iter().copied(), &schema) {
-        return Err(CompileError::Rejected("exchange shard columns out of range"));
+    match shard_cols.iter().find(|&&c| schema.column(c as usize).is_none()) {
+        Some(&c) => Err(CompileError::RejectedOp(gnitz_store::schema::OpBuildErr::oob_col(
+            "exchange shard: column",
+            c,
+            &schema,
+        ))),
+        None => Ok(schema),
     }
-    Ok(schema)
-}
-
-/// One exchange boundary's carve: the shard node with its key, the node feeding
-/// it, and the ancestor set that becomes that side's own plan.
-struct Carve<'a> {
-    ex_nid: i32,
-    shard_cols: &'a [u32],
-    ex_in: i32,
-    ancestors: HashSet<i32>,
 }
 
 /// One compile's two products: the plan the dag caches, and the plan-free
@@ -485,38 +475,25 @@ pub(super) struct ViewSite<'a> {
 }
 
 /// Assemble a compiled view's exchange sides, seeding each from `seed_regs` at
-/// its own index. Every refusal precedes the first `into_sub_plan()` — that is
-/// what still leaves the `Err` its `ScratchGuard`s to run.
-fn build_sides(mut plans: Vec<PlanBuildResult>, seed_regs: &[u16]) -> Result<Sides, CompileError> {
-    let side = |plan: PlanBuildResult, i: usize| Side {
-        seed_reg: seed_regs[i],
-        plan: plan.into_sub_plan(),
-    };
+/// its own index.
+fn build_sides(mut plans: Vec<SubPlan>, seed_regs: &[DeltaReg]) -> Result<Sides, CompileError> {
+    let side = |plan: SubPlan, i: usize| Side { seed_reg: seed_regs[i], plan };
     match plans.len() {
         0 => Ok(Sides::Unexchanged),
         1 => Ok(Sides::Unary(side(plans.pop().expect("one side"), 0))),
-        // A side scanning no single source matches no delta at all. Only the raw
-        // `CircuitBuilder` wire path can build one; three or more sides are
-        // already refused above.
+        // Exactly two: three or more sides are already refused above. A side
+        // scanning no single source matches no delta at all, and only the raw
+        // `CircuitBuilder` wire path can build one.
         _ => {
-            let Some(keys) = plans
-                .iter()
-                .map(PlanBuildResult::single_source)
-                .collect::<Option<Vec<_>>>()
-            else {
+            let [a, b] = <[SubPlan; 2]>::try_from(plans)
+                .ok()
+                .expect("at most two exchange nodes");
+            let (Some(ka), Some(kb)) = (a.single_source(), b.single_source()) else {
                 return Err(CompileError::Rejected(
                     "a two-sided plan has a side scanning no single source, so no delta can reach it",
                 ));
             };
-            let mut keyed = plans
-                .into_iter()
-                .zip(keys)
-                .enumerate()
-                .map(|(i, (plan, key))| (key, side(plan, i)));
-            Ok(Sides::Pair([
-                keyed.next().expect("two sides"),
-                keyed.next().expect("two sides"),
-            ]))
+            Ok(Sides::Pair([(ka, side(a, 0)), (kb, side(b, 1))]))
         }
     }
 }
@@ -539,13 +516,7 @@ pub(super) fn compile_view(
     // cross-sub-plan merge.
     let meta = ViewMeta::derive(&loaded, host)?;
 
-    let exchanges: Vec<(i32, &[u32])> = loaded
-        .ops()
-        .filter_map(|(nid, op)| match op {
-            gnitz_wire::OpNode::ExchangeShard { shard_cols } => Some((nid, shard_cols.as_slice())),
-            _ => None,
-        })
-        .collect();
+    let exchanges: Vec<(i32, &[u32])> = loaded.exchange_shards().collect();
     if exchanges.len() > 2 {
         // No planner path emits this: set-ops are binary, GROUP BY/DISTINCT unary.
         gnitz_warn!(
@@ -565,46 +536,48 @@ pub(super) fn compile_view(
         ));
     }
 
+    // One guard for every scratch directory this compile creates: the sides', the
+    // post phase's, and any a `?` below abandons. Declared before `side_plans`
+    // and `post`, so it still drops last and their tables are gone by then.
+    let mut scratch = ScratchGuard::new();
+    let mut side_plans: Vec<SubPlan> = Vec::with_capacity(exchanges.len());
+    let mut exchange_inputs: Vec<(i32, SchemaDescriptor)> = Vec::with_capacity(exchanges.len());
     // Each side is the ancestors of its own exchange input; everything else is
-    // the post phase, which for an exchange-free circuit is the whole plan. On
-    // any `?` below the finished `PlanBuildResult`s drop, and their ScratchGuards
-    // take every scratch directory with them.
-    let carves: Vec<Carve> = exchanges
-        .iter()
-        .map(|&(ex_nid, shard_cols)| {
-            let ex_in = loaded.inputs(ex_nid).unary();
-            Carve {
-                ex_nid,
-                shard_cols,
-                ex_in,
-                ancestors: loaded.ancestors_inclusive(ex_in),
-            }
-        })
-        .collect();
-
-    let mut side_plans: Vec<PlanBuildResult> = Vec::with_capacity(carves.len());
-    let mut exchange_inputs: Vec<(i32, SchemaDescriptor)> = Vec::with_capacity(carves.len());
-    for carve in &carves {
-        let plan = build_plan(
+    // the post phase, which for an exchange-free circuit is the whole plan.
+    let mut excluded: FxHashSet<i32> = FxHashSet::default();
+    for &(ex_nid, shard_cols) in &exchanges {
+        let ex_in = loaded.inputs(ex_nid).unary();
+        let ancestors = loaded.ancestors_inclusive(ex_in);
+        let ordered = loaded.ordered_where(|n| ancestors.contains(&n));
+        let (plan, _) = build_plan(
             &loaded,
-            &loaded.subgraph_ordered(carve.ex_in),
+            &ordered,
             host,
             site,
             view_schema.placement(),
-            PlanTarget::Subgraph { out: carve.ex_in },
+            &mut scratch,
+            PlanTarget::Subgraph { out: ex_in },
         )?;
-        exchange_inputs.push((carve.ex_nid, finalize_side(&plan, carve.shard_cols)?));
+        exchange_inputs.push((ex_nid, finalize_side(&plan, shard_cols)?));
         side_plans.push(plan);
+        for n in ancestors {
+            // A shared stateful ancestor would open one scratch directory twice
+            // — same view, nid and rank — under two unsynchronized shard indexes.
+            if !excluded.insert(n) {
+                return Err(CompileError::Rejected("exchange sides share a node"));
+            }
+        }
+        excluded.insert(ex_nid);
     }
 
-    let post_ordered =
-        loaded.ordered_where(|nid| !carves.iter().any(|c| c.ex_nid == nid || c.ancestors.contains(&nid)));
-    let post = build_plan(
+    let post_ordered = loaded.ordered_where(|nid| !excluded.contains(&nid));
+    let (post, post_out_regs) = build_plan(
         &loaded,
         &post_ordered,
         host,
         site,
         view_schema.placement(),
+        &mut scratch,
         PlanTarget::ViewOutput {
             out_schema: view_schema,
             seeds: &exchange_inputs,
@@ -614,20 +587,32 @@ pub(super) fn compile_view(
     // A delta is routed to the side scanning its source, so a post-phase scan
     // reaches nothing: its rows are dropped (two-sided) or seeded to the wrong
     // register (unary). Only the raw `CircuitBuilder` wire path can build one.
-    if !carves.is_empty() && !post.source_reg_map.is_empty() {
+    if !exchanges.is_empty() && !post.source_reg_map.is_empty() {
         return Err(CompileError::Rejected(
             "an exchanged plan scans a relation outside every exchange side",
         ));
     }
 
-    // `bounded` forced `carves` empty above, so `post` is the whole plan here.
-    let hydration = bounded.then(|| derive_hydration(&loaded, &post)).transpose()?;
-    let sides = build_sides(side_plans, &post.exchange_input_regs)?;
+    // `bounded` forced `exchanges` empty above, so `post` is the whole plan here.
+    let hydration = bounded
+        .then(|| derive_hydration(&loaded, &post, &post_out_regs))
+        .transpose()?;
+    // Each side's seed is the register the post phase allocated for its exchange
+    // node, in the order `exchange_inputs` named them.
+    let seed_regs: Vec<DeltaReg> = exchange_inputs
+        .iter()
+        .map(|(ex_nid, _)| post_out_regs[ex_nid].delta())
+        .collect::<Result<_, _>>()?;
+    let sides = build_sides(side_plans, &seed_regs)?;
+
+    // Past every fallible step: from here the VM's owned tables keep the scratch
+    // directories alive.
+    scratch.defuse();
 
     Ok(CompiledView {
         output: CompileOutput {
             sides,
-            post: post.into_sub_plan(),
+            post,
             source_bound: load::circuit_source_bound(&loaded),
             hydration,
         },

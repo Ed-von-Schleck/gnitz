@@ -30,7 +30,7 @@ use crate::expr::{MapPlan, PkSource};
 use crate::ops::AdhocFold;
 use crate::relation::RelationRegistry;
 use crate::schema::key::{compare_pk_bytes, opk_key, pack_pk_be, IndexKeySpec};
-use crate::schema::{DerivedSchema, SchemaColumn, SchemaDescriptor};
+use crate::schema::SchemaDescriptor;
 use crate::storage::{compare_rows, Batch, PkSetGather, ReadCursor, SourceCursor, StoreError};
 use gnitz_expr::{cmp_order_keys, Evaluator, LogicalProgram, OrderLocator};
 
@@ -340,13 +340,9 @@ struct ScanSinkCtx<'a> {
 }
 
 /// The fold's reduce-input schema and the pre-map producing it, or `None` when
-/// the spec carries no pre-map and the source *is* the reduce input.
-///
-/// The schema is derived, not shipped: the map inherits the source PK region
-/// verbatim ([`PkSource::Inherit`]), so the reduce input is the source's PK
-/// columns followed by the payload slots the client declared. Deriving it here
-/// is what keeps the PK half unforgeable — a client cannot describe a PK region
-/// the map does not actually produce.
+/// the spec carries no pre-map and the source *is* the reduce input. The same
+/// [`MapPlan::from_compute_map`] a circuit's computed `Map` node goes through, so
+/// the two paths cannot disagree on what a declared slot list means.
 fn compile_fold_pre_map(
     agg: &AggReadSpec,
     src_schema: &SchemaDescriptor,
@@ -354,31 +350,9 @@ fn compile_fold_pre_map(
     let Some(pre) = &agg.pre else {
         return Ok(None);
     };
-    // Through `DerivedSchema`, the front door that *rejects* what
-    // `SchemaDescriptor::new` asserts on: the declared column count is the
-    // client's, and an over-wide one has to be a malformed frame rather than an
-    // abort inside a `const fn`. `push_pk_of` is the same
-    // inherit-the-input's-key prologue every other derived schema uses.
-    let mut out = DerivedSchema::new();
-    let built = out.push_pk_of(src_schema).is_some()
-        && pre
-            .out_cols
-            .iter()
-            .all(|&(tc, nullable)| out.push(SchemaColumn::new(tc, nullable as u8)).is_some());
-    if !built {
-        return Err(StoreError::rejected(format!(
-            "scan_spec fold: a pre-map declaring {} payload columns over a {}-column key \
-             is not a legal reduce input",
-            pre.out_cols.len(),
-            src_schema.pk_indices().len()
-        )));
-    }
-    let out_schema = out.finish();
-    // `compile_projection` requires the program to write every declared payload
-    // slot, so a program disagreeing with the declarations is rejected here
-    // rather than folding over an unwritten column.
-    let plan = compile_projection(&pre.program, src_schema, &out_schema)?;
-    Ok(Some((out_schema, plan)))
+    let plan = MapPlan::from_compute_map(src_schema, pre)
+        .map_err(|e| StoreError::rejected(format!("scan_spec fold pre-map: {e}")))?;
+    Ok(Some((*plan.out_schema(), plan)))
 }
 
 /// Run the fold sink over `source`: fold every surviving chunk into `fold`'s

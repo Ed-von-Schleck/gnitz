@@ -5,7 +5,9 @@
 //! instruction operands; the per-epoch call re-derives nothing.
 
 use crate::schema::key::NarrowPkOpk;
-use crate::schema::{type_code, ColumnLocator, DerivedSchema, ReduceOutKey, SchemaColumn, SchemaDescriptor};
+use crate::schema::{
+    type_code, ColumnLocator, DerivedSchema, OpBuildErr, ReduceOutKey, SchemaColumn, SchemaDescriptor,
+};
 use crate::storage::MemBatch;
 
 use super::super::group_key::GroupKeyCols;
@@ -13,6 +15,22 @@ use super::agg::Accumulator;
 use super::avi::AviBake;
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
+
+/// Every column index a reduce reads, bounded against the schema it indexes.
+/// Ahead of every derivation below, each of which indexes the fixed column array
+/// raw.
+fn check_cols(schema: &SchemaDescriptor, group_cols: &[u32], agg_descs: &[AggDescriptor]) -> Result<(), OpBuildErr> {
+    let cols = group_cols
+        .iter()
+        .map(|&c| ("reduce: group column", c))
+        .chain(agg_descs.iter().map(|d| ("reduce: aggregate column", d.col_idx)));
+    for (what, c) in cols {
+        if schema.column(c as usize).is_none() {
+            return Err(OpBuildErr::oob_col(what, c, schema));
+        }
+    }
+    Ok(())
+}
 
 /// Build the reduce output schema from `out_key`. `None` when the columns would
 /// overflow the fixed `[_; 65]` schema array.
@@ -47,7 +65,8 @@ pub(super) fn build_reduce_output_schema(
 
 /// The baked per-instruction reduce plan. Input facts (schemas, group columns,
 /// aggregate descriptors) plus every derived gate `op_reduce` previously
-/// recomputed per epoch. Built by [`ReducePlan::new`] only.
+/// recomputed per epoch. Built by [`ReducePlan::from_wire`] and
+/// [`ReducePlan::for_adhoc_fold`] only.
 pub struct ReducePlan {
     pub(super) input_schema: SchemaDescriptor,
     /// The output layout, derived here so no caller derives it a second time to
@@ -100,16 +119,65 @@ impl ReducePlan {
     /// untrusted producer can name and the operator cannot execute: an output
     /// wider than the schema array, an unaggregatable column type, and a float
     /// group column, which has no key image.
-    pub fn new(
+    /// A REDUCE node off a circuit: the out-key follows from the input schema and
+    /// the group set, which is the derivation `emit_reduce` would otherwise make
+    /// and hand back in.
+    pub fn from_wire(
+        input_schema: &SchemaDescriptor,
+        group_by_cols: &[u32],
+        agg_descs: &[AggDescriptor],
+        global_ground: bool,
+        i_am_owner: bool,
+    ) -> Result<Self, OpBuildErr> {
+        // Ahead of `reduce_out_key`, which reads `columns[c]` raw.
+        check_cols(input_schema, group_by_cols, agg_descs)?;
+        let out_key = input_schema.reduce_out_key(group_by_cols);
+        Self::build(
+            input_schema,
+            group_by_cols,
+            agg_descs,
+            out_key,
+            global_ground,
+            i_am_owner,
+        )
+    }
+
+    /// The ad-hoc `ReadSpec` fold's partial layout, checked against the reply
+    /// schema the client declared for it. Always `SyntheticFold`, and derived
+    /// here, so the client cannot describe a partial the fold does not produce.
+    /// The client synthesizes the empty-input ground row, so there is no owner.
+    pub(crate) fn for_adhoc_fold(
+        src_schema: &SchemaDescriptor,
+        reply_schema: &SchemaDescriptor,
+        agg: &gnitz_wire::AggReadSpec,
+    ) -> Result<Self, OpBuildErr> {
+        check_cols(src_schema, &agg.group_cols, &agg.aggs)?;
+        let plan = Self::build(
+            src_schema,
+            &agg.group_cols,
+            &agg.aggs,
+            ReduceOutKey::SyntheticFold,
+            false,
+            false,
+        )?;
+        if !reply_schema.same_physical_layout(&plan.output_schema) {
+            return Err(OpBuildErr::shape(
+                "reduce: reply schema does not match the derived fold layout",
+            ));
+        }
+        Ok(plan)
+    }
+
+    fn build(
         input_schema: &SchemaDescriptor,
         group_by_cols: &[u32],
         agg_descs: &[AggDescriptor],
         out_key: ReduceOutKey,
         global_ground: bool,
         i_am_owner: bool,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, OpBuildErr> {
         let output_schema = build_reduce_output_schema(input_schema, group_by_cols, agg_descs, out_key)
-            .ok_or("reduce: output exceeds MAX_COLUMNS")?;
+            .ok_or_else(|| OpBuildErr::shape("reduce: output exceeds MAX_COLUMNS"))?;
 
         // The aggregates are the trailing output columns, so aggregate `k` owns
         // logical column `cbase + k` at any PK arity — pairing each accumulator
@@ -129,7 +197,7 @@ impl ReducePlan {
                 )
             })
             .collect::<Option<Vec<_>>>()
-            .ok_or("reduce: aggregate column type has no scalar register image")?;
+            .ok_or_else(|| OpBuildErr::shape("reduce: aggregate column type has no scalar register image"))?;
 
         // Every group set has a packed key and the accumulator build above
         // already rejected any aggregate the index could not encode, so a
@@ -137,10 +205,7 @@ impl ReducePlan {
         // no trace-replay fallback. The one refusal is a float group column,
         // which has no order- and equality-correct key image at all.
         let avi = match acc_template.iter().any(|a| !a.is_linear()) {
-            true => Some(
-                AviBake::new(input_schema, group_by_cols, &acc_template)
-                    .ok_or("reduce: a float group column has no order-preserving key image")?,
-            ),
+            true => Some(AviBake::new(input_schema, group_by_cols, &acc_template)?),
             false => None,
         };
         // Read off the bake's own aggregate list, so the value-indexed set has one

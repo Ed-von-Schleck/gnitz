@@ -80,7 +80,7 @@ pub use columnar::{payload_bytes, payload_is_null, payload_string, payload_u64};
 // `read/scan_spec.rs` each imported from both in adjacent lines.
 pub(crate) use lsm::child_dir::reclaim_retired_children;
 pub use lsm::child_dir::{children_at_generation, fsync_dir};
-pub use lsm::child_dir::{remove_child, ChildAddr, Slot};
+pub use lsm::child_dir::{create_child, remove_child, ChildAddr, Slot};
 // A directory sweep is the one child-dir primitive a `gnitz-store` consumer runs
 // itself: the mirror reclaims the copies its own record file no longer names.
 pub use lsm::child_dir::subdir_names;

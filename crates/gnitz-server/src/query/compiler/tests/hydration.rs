@@ -1,5 +1,6 @@
 use super::*;
 use gnitz_wire::{JoinKind, MapKind, OpNode};
+use std::collections::HashMap;
 
 /// The inner-equi-join shape `emit_equi_join_terms` produces, as node ids:
 /// two `ScanDelta`s, a reindex `Map` and an `IntegrateTrace` per side, the
@@ -72,12 +73,12 @@ fn hydration_seeds_from_the_cross_wired_trace() {
 #[test]
 fn hydration_of_a_linear_circuit_names_its_source() {
     let lc = loaded_for_test(
-        HashMap::from([
+        [
             (0, scan_delta(77)),
             (1, OpNode::Filter(dummy_expr_blob())),
             (2, OpNode::Map(MapKind::Projection(vec![0]))),
             (3, OpNode::IntegrateSink),
-        ]),
+        ],
         vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN), (2, 3, SLOT_IN)],
     );
     assert_eq!(
@@ -99,13 +100,13 @@ fn a_malformed_circuit_is_rejected_rather_than_guessed_at() {
     };
 
     rejected(
-        loaded_for_test(HashMap::from([(0, scan_delta(1))]), vec![]),
+        loaded_for_test([(0, scan_delta(1))], vec![]),
         "bounded view: circuit has no IntegrateSink",
     );
     // A shape the walk cannot replay (a Reduce under the sink).
     rejected(
         loaded_for_test(
-            HashMap::from([
+            [
                 (0, scan_delta(1)),
                 (
                     1,
@@ -119,7 +120,7 @@ fn a_malformed_circuit_is_rejected_rather_than_guessed_at() {
                     },
                 ),
                 (2, OpNode::IntegrateSink),
-            ]),
+            ],
             vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
         ),
         "bounded view: unsupported circuit shape",
@@ -127,12 +128,12 @@ fn a_malformed_circuit_is_rejected_rather_than_guessed_at() {
     // A union whose inputs are not delta/trace joins.
     rejected(
         loaded_for_test(
-            HashMap::from([
+            [
                 (0, scan_delta(1)),
                 (1, scan_delta(2)),
                 (2, OpNode::Union),
                 (3, OpNode::IntegrateSink),
-            ]),
+            ],
             vec![(0, 2, SLOT_IN), (1, 2, SLOT_TRACE), (2, 3, SLOT_IN)],
         ),
         "bounded view: union input is not an inner delta/trace join",

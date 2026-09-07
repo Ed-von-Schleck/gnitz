@@ -5,6 +5,7 @@
 //! private items.
 
 use gnitz_store::expr::MapPlan;
+use gnitz_store::ops;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::{Batch, ReadCursor, Table};
 
@@ -18,13 +19,13 @@ pub(in crate::query) use exec::{execute_epoch_multi, Replay};
 // Instruction set
 // ---------------------------------------------------------------------------
 
-/// The resource pools a `Program` owns are unrelated index spaces, all naturally
-/// `u16`. An instruction can name two of them on adjacent lines, where a swap
-/// would mis-dispatch into a live table with no panic — so each gets its own type
-/// and the compiler does the checking.
-macro_rules! resource_idx {
-    ($($name:ident => $pool:literal;)*) => {$(
-        #[doc = concat!("Index into `", $pool, "`.")]
+/// A `u16` instruction operand. The resource pools a `Program` owns and its
+/// register file are unrelated index spaces; an instruction names two of them on
+/// adjacent lines, where a swap would mis-dispatch with no panic — so each gets
+/// its own type and the compiler does the checking.
+macro_rules! operand_idx {
+    ($($(#[$doc:meta])* $name:ident;)*) => {$(
+        $(#[$doc])*
         #[derive(Clone, Copy, PartialEq, Eq, Debug)]
         pub(in crate::query) struct $name(pub u16);
 
@@ -37,11 +38,39 @@ macro_rules! resource_idx {
     )*};
 }
 
-resource_idx! {
-    TableIdx => "VmHandle::tables";
-    PredIdx => "Program::predicates";
-    MapIdx => "Program::maps";
-    PlanIdx => "Program::reduce_plans";
+operand_idx! {
+    /// Index into `VmHandle::tables`.
+    TableIdx;
+    /// Index into `Program::predicates`.
+    PredIdx;
+    /// Index into `Program::maps`.
+    MapIdx;
+    /// Index into `Program::reduce_plans`.
+    PlanIdx;
+    /// A register whose **batch** an instruction reads or writes. Minted only by
+    /// `push_delta_reg`.
+    ///
+    /// A trace register's batch is never written and is cleared each epoch, so
+    /// reading one as a delta reads permanent emptiness — silently, with no
+    /// panic. Keeping the kinds apart is what makes that unrepresentable.
+    DeltaReg;
+    /// A register that owns a trace table, read through the cursor
+    /// `bind_trace_cursors` opens on it each epoch. Minted only by
+    /// `push_trace_reg`, which always creates the table.
+    TraceReg;
+}
+
+/// Only the two register kinds convert back: `Program::schema_of` reads either.
+impl From<DeltaReg> for u16 {
+    fn from(r: DeltaReg) -> u16 {
+        r.0
+    }
+}
+
+impl From<TraceReg> for u16 {
+    fn from(r: TraceReg) -> u16 {
+        r.0
+    }
 }
 
 /// One VM instruction with all operator-specific data pre-resolved. No variant
@@ -49,49 +78,46 @@ resource_idx! {
 /// ([`Program::trace_table_idx`]).
 pub(in crate::query) enum Instr {
     Filter {
-        in_reg: u16,
-        out_reg: u16,
+        in_reg: DeltaReg,
+        out_reg: DeltaReg,
         pred_idx: PredIdx,
     },
     Map {
-        in_reg: u16,
-        out_reg: u16,
+        in_reg: DeltaReg,
+        out_reg: DeltaReg,
         map_idx: MapIdx,
     },
     Negate {
-        in_reg: u16,
-        out_reg: u16,
+        in_reg: DeltaReg,
+        out_reg: DeltaReg,
     },
     Union {
-        in_a: u16,
-        in_b: u16,
-        out_reg: u16,
+        in_a: DeltaReg,
+        in_b: DeltaReg,
+        out_reg: DeltaReg,
     },
     /// Shared instruction for `distinct` and `positive_part`: per consolidated
-    /// (PK, payload), emit `clamp(w_new, lo, hi) − clamp(w_old, lo, hi)`. Bounds
-    /// `(-1, 1)` ⇒ `distinct` (set membership); `(0, i64::MAX)` ⇒ `positive_part`
-    /// (bag multiplicity).
+    /// (PK, payload), emit `clamp(w_new) − clamp(w_old)` at `preset`'s bounds.
     WeightClamp {
-        in_reg: u16,
+        in_reg: DeltaReg,
         /// The history trace: read through its cursor, and written through the
         /// table it owns.
-        hist_reg: u16,
-        out_reg: u16,
-        lo: i64,
-        hi: i64,
+        hist_reg: TraceReg,
+        out_reg: DeltaReg,
+        preset: ops::ClampPreset,
     },
     /// The delta-trace inner join, equi and range alike: the probe is baked by
     /// the compiler from the wire's `JoinKind`, so the wire's relation spelling
     /// never reaches the instruction set.
     JoinDT {
-        delta_reg: u16,
-        trace_reg: u16,
-        out_reg: u16,
+        delta_reg: DeltaReg,
+        trace_reg: TraceReg,
+        out_reg: DeltaReg,
         probe: gnitz_store::ops::JoinProbe,
     },
     WorkerFilter {
-        in_reg: u16,
-        out_reg: u16,
+        in_reg: DeltaReg,
+        out_reg: DeltaReg,
         worker_id: u32,
         num_workers: u32,
     },
@@ -99,18 +125,18 @@ pub(in crate::query) enum Instr {
     /// null-fill's unmatched preserved rows. The appended column count is the
     /// difference between the two registers' schemas, which the compiler built.
     NullExtend {
-        in_reg: u16,
-        out_reg: u16,
+        in_reg: DeltaReg,
+        out_reg: DeltaReg,
     },
     Integrate {
-        in_reg: u16,
+        in_reg: DeltaReg,
         /// The trace this delta accumulates into, named by its register.
-        trace_reg: u16,
+        trace_reg: TraceReg,
     },
     Reduce {
-        in_reg: u16,
-        trace_out_reg: u16,
-        out_reg: u16,
+        in_reg: DeltaReg,
+        trace_out_reg: TraceReg,
+        out_reg: DeltaReg,
         /// The baked [`BakedReduce`] carrying the schemas, group columns,
         /// aggregate descriptors, every derived gate (linearity, key kind,
         /// emission roles, ground flags), and the value-index table.
@@ -122,7 +148,7 @@ pub(in crate::query) enum Instr {
 /// a table, never a batch, so it is not one. Every field of every variant is
 /// spelled out, no `..`: a future opcode's second delta input must be a compile
 /// error here, not a register the liveness pass then lets someone take mid-read.
-pub(in crate::query) fn reads(instr: &Instr) -> [Option<u16>; 2] {
+pub(in crate::query) fn reads(instr: &Instr) -> [Option<DeltaReg>; 2] {
     match instr {
         Instr::Filter { in_reg, out_reg: _, pred_idx: _ } => [Some(*in_reg), None],
         Instr::Map { in_reg, out_reg: _, map_idx: _ } => [Some(*in_reg), None],
@@ -132,8 +158,7 @@ pub(in crate::query) fn reads(instr: &Instr) -> [Option<u16>; 2] {
             in_reg,
             hist_reg: _,
             out_reg: _,
-            lo: _,
-            hi: _,
+            preset: _,
         } => [Some(*in_reg), None],
         Instr::JoinDT {
             delta_reg,
@@ -191,7 +216,7 @@ pub(in crate::query) struct VmHandle {
     /// `program.reg_meta` so the per-epoch cursor bind walks only the trace
     /// registers instead of the whole register file — whose stride is a
     /// `RegisterMeta`, i.e. a whole `SchemaDescriptor`.
-    trace_regs: Vec<(u16, TableIdx)>,
+    trace_regs: Vec<(TraceReg, TableIdx)>,
     /// The program carries a global-ground `Reduce` this worker owns whose ground
     /// row has not been minted yet — the one reason an empty epoch is worth
     /// dispatching.
@@ -228,7 +253,7 @@ impl VmHandle {
         let VmHandle { regfile, tables, trace_regs, .. } = self;
         for &(reg_id, table_idx) in trace_regs.iter() {
             let cursor = tables[table_idx.at()].open_cursor();
-            match &mut regfile.cursors[reg_id as usize] {
+            match &mut regfile.cursors[reg_id.at()] {
                 Some(held) => **held = cursor,
                 slot => *slot = Some(Box::new(cursor)),
             }
@@ -247,7 +272,7 @@ impl VmHandle {
     /// the runs it pins. For the end of a backfill, whose last chunk would
     /// otherwise stay resident for the cached plan's lifetime.
     pub(super) fn release(&mut self) {
-        self.regfile.release();
+        self.regfile.clear();
         self.reset_trace_cursors();
     }
 }
@@ -304,19 +329,37 @@ pub(in crate::query) struct Program {
     /// The register the epoch's output is extracted from. Here rather than passed
     /// in, because `last_read` bakes "the sink is never takeable" against it: two
     /// spellings could disagree and nothing would catch it.
-    pub(in crate::query) out_reg: u16,
+    pub(in crate::query) out_reg: DeltaReg,
 }
 
 impl Program {
+    /// The schema register `reg` is labelled with. By reference: the dispatch
+    /// loop hands it straight to kernels, and a `SchemaDescriptor` is 360 bytes.
+    pub(in crate::query) fn schema_of(&self, reg: impl Into<u16>) -> &SchemaDescriptor {
+        &self.reg_meta[reg.into() as usize].schema
+    }
+
+    /// The pc of the first instruction reading `reg`, or the program length when
+    /// none does. Each register has exactly one writer, strictly before this —
+    /// `push_delta_reg` mints a fresh one per emitting node — so a replay that
+    /// seeds `reg` may enter here and find its value intact.
+    pub(in crate::query) fn first_read(&self, reg: DeltaReg) -> usize {
+        self.instructions
+            .iter()
+            .position(|i| reads(i).into_iter().flatten().any(|r| r == reg))
+            .unwrap_or(self.instructions.len())
+    }
+
     /// The schema of the register this program's output leaves in.
     pub(in crate::query) fn out_schema(&self) -> SchemaDescriptor {
-        self.reg_meta[self.out_reg as usize].schema
+        *self.schema_of(self.out_reg)
     }
 
     /// The table backing trace register `reg` — how a state-writing instruction
     /// reaches the table it writes, having named only the register that owns it.
-    pub(in crate::query) fn trace_table_idx(&self, reg: u16) -> TableIdx {
-        self.reg_meta[reg as usize]
+    /// A [`TraceReg`] proves the kind, not that it indexes *this* program.
+    pub(in crate::query) fn trace_table_idx(&self, reg: TraceReg) -> TableIdx {
+        self.reg_meta[reg.at()]
             .owned_table
             .expect("a state-writing instruction names a register `push_trace_reg` allocated")
     }
@@ -350,19 +393,12 @@ impl RegisterFile {
         }
     }
 
-    /// Clear every register's batch, keeping its buffer: the next epoch either
-    /// seeds the register or writes it whole. A trace register is reached through
-    /// its cursor, so its batch is already empty (`test_join_delta_trace`).
+    /// Empty every register and return its buffers to the pool. Keeping them
+    /// buys nothing — every dispatch arm assigns `batches[out] = result`, so a
+    /// retained capacity is dropped at the next write anyway.
     pub(super) fn clear(&mut self) {
         for batch in &mut self.batches {
-            batch.clear();
-        }
-    }
-
-    /// [`Self::clear`], releasing the buffers too.
-    pub(super) fn release(&mut self) {
-        for batch in &mut self.batches {
-            drop(batch.take());
+            batch.release_buffers();
         }
     }
 }

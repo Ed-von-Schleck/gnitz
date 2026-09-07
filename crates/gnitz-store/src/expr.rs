@@ -14,7 +14,7 @@ use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram};
 
 use crate::foundation::xxh::RowHasher;
 use crate::schema::key::ReindexPacker;
-use crate::schema::{ColumnLocator, SchemaDescriptor};
+use crate::schema::{ColumnLocator, DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor};
 use crate::storage::Batch;
 
 /// One verbatim column move: `(source locator, output payload slot, destination
@@ -227,6 +227,9 @@ pub struct MapPlan {
     /// The input has German-string columns and every one is carried by a copy,
     /// so its heap holds no bytes the output would adopt dead.
     keeps_every_string: bool,
+    /// This map reproduces its input row unchanged, so a caller holding the input
+    /// can hand it on instead of running the plan.
+    is_identity: bool,
     out_schema: SchemaDescriptor,
 }
 
@@ -302,7 +305,122 @@ fn reindex_hash_row(output: &mut Batch, branch_id: u8) {
     output.downgrade();
 }
 
+/// Output schema of a computed-projection `Map`: the input's PK region (the map
+/// inherits it verbatim, [`PkSource::Inherit`]), then one payload column per
+/// declared `(type_code, nullable)` slot. The declared slots ARE the layout;
+/// `MapPlan::from_map` is what catches a program disagreeing with them.
+fn compute_map_output_schema(
+    in_schema: &SchemaDescriptor,
+    out_cols: &[(u8, bool)],
+) -> Result<SchemaDescriptor, OpBuildErr> {
+    let over = || OpBuildErr::shape("compute map: output exceeds MAX_COLUMNS");
+    let mut b = DerivedSchema::new();
+    b.push_pk_of(in_schema).ok_or_else(over)?;
+    for &(tc, nullable) in out_cols {
+        b.push(SchemaColumn::new(tc, nullable as u8)).ok_or_else(over)?;
+    }
+    Ok(b.finish())
+}
+
+/// Output schema of a HashRow (set-op full-row identity) Map: a synthetic U128
+/// PK at slot 0, then the projected payload columns, each promoted to its
+/// carried target but keeping THIS SIDE's nullability. Per-side, not the
+/// operator-merged view nullability: an INTERSECT/EXCEPT leaf is `distinct`-ed
+/// before the tuple-tightening combine, so its row comparator must classify by
+/// what this side can actually emit.
+///
+/// An absent target keeps the SOURCE type — not `gnitz_wire::resolve_reindex_type`,
+/// which would derive a *key* type and land a payload column on U128. Typing the
+/// output column at the target is what puts the promotion in front of
+/// `check_copy_types`, inside `from_map`.
+fn hashrow_output_schema(
+    in_schema: &SchemaDescriptor,
+    cols: &[gnitz_wire::ReindexSlot],
+) -> Result<SchemaDescriptor, OpBuildErr> {
+    let over = || OpBuildErr::shape("hash-row map: output exceeds MAX_COLUMNS");
+    let mut b = DerivedSchema::new();
+    b.push_pk(SchemaColumn::new(crate::schema::type_code::U128, 0))
+        .ok_or_else(over)?;
+    for &(c, tgt) in cols {
+        let src = in_schema
+            .column(c as usize)
+            .ok_or_else(|| OpBuildErr::oob_col("hash-row map: column", c, in_schema))?;
+        b.push(SchemaColumn::new(tgt.map_or(src.type_code, |t| t as u8), src.nullable))
+            .ok_or_else(over)?;
+    }
+    Ok(b.finish())
+}
+
 impl MapPlan {
+    /// The plan for a circuit's MAP node: one derivation of its `(output schema,
+    /// map program, PK source)` triple, and the trust boundary each kind's
+    /// client-supplied column list clears. Every kind ends in the same
+    /// [`Self::from_map`], so an elided map is validated like any other.
+    pub fn from_wire(in_schema: &SchemaDescriptor, mk: &gnitz_wire::MapKind) -> Result<Self, OpBuildErr> {
+        let (out_schema, prog, pk_source) = match mk {
+            gnitz_wire::MapKind::Compute(map) => return Self::from_compute_map(in_schema, map),
+
+            gnitz_wire::MapKind::Reindex { keep, key, .. } => {
+                // The packer is built first because it *is* the layout: its output
+                // schema reads the promoters the per-row pack writes through, so
+                // the reindexed `_join_pk` and the delta scatter co-partition by
+                // construction. Same packer the exchange scatter builds from the
+                // circuit's own slots.
+                let packer = ReindexPacker::new(in_schema, key)?;
+                let out_schema = packer.output_schema(in_schema, keep)?;
+                (out_schema, LogicalProgram::copy_cols(keep), PkSource::Pack(packer))
+            }
+
+            gnitz_wire::MapKind::HashRow { cols, branch_id } => {
+                let out_schema = hashrow_output_schema(in_schema, cols)?;
+                let proj: Vec<u32> = cols.iter().map(|&(c, _)| c).collect();
+                (
+                    out_schema,
+                    LogicalProgram::copy_cols(&proj),
+                    PkSource::HashRow { branch_id: *branch_id },
+                )
+            }
+
+            gnitz_wire::MapKind::Projection(cols) => {
+                // A *payload* column, not merely an in-range one: `project_schema`
+                // skips a PK index while `copy_cols` still numbers a sink for it.
+                for &c in cols {
+                    if in_schema.try_payload_idx(c as usize).is_none() {
+                        return Err(OpBuildErr::shape(format!(
+                            "projection map: column {c} is not a payload column of a {}-column schema",
+                            in_schema.num_columns()
+                        )));
+                    }
+                }
+                // `cols` is bounded per entry but not in length, and duplicates
+                // are legal, so a long list still overruns the fixed schema array.
+                let out_schema = crate::schema::project_schema(in_schema, cols)
+                    .ok_or_else(|| OpBuildErr::shape("projection map: output exceeds MAX_COLUMNS"))?;
+                (out_schema, LogicalProgram::copy_cols(cols), PkSource::Inherit)
+            }
+        };
+        Self::from_map(prog, in_schema, &out_schema, pk_source)
+            .map_err(|e| OpBuildErr::Program("map: program/schema mismatch", e))
+    }
+
+    /// A computed projection: [`gnitz_wire::MapKind::Compute`]'s whole body, and
+    /// also a read spec's pre-map. The output schema is derived, never shipped —
+    /// the map inherits the input's PK region verbatim ([`PkSource::Inherit`]),
+    /// so no caller can describe a PK region the map does not produce.
+    pub(crate) fn from_compute_map(
+        in_schema: &SchemaDescriptor,
+        map: &gnitz_wire::ComputeMap,
+    ) -> Result<Self, OpBuildErr> {
+        let out_schema = compute_map_output_schema(in_schema, &map.out_cols)?;
+        // The only map whose program is client bytes; every other kind builds
+        // one from a column list. Rejected, not skipped: skipping a corrupt blob
+        // would leave the output at the default empty schema.
+        let prog = LogicalProgram::from_map_blob(&map.program, "map")
+            .map_err(|e| OpBuildErr::Program("map: invalid program", e))?;
+        Self::from_map(prog, in_schema, &out_schema, PkSource::Inherit)
+            .map_err(|e| OpBuildErr::Program("map: program/schema mismatch", e))
+    }
+
     /// Map plan from a logical expression program. A pure projection is the
     /// special case where the program computes nothing and every sink is a
     /// column copy (see [`LogicalProgram::copy_cols`]): the plan reduces to the
@@ -313,6 +431,11 @@ impl MapPlan {
         out_schema: &SchemaDescriptor,
         pk_source: PkSource,
     ) -> Result<Self, ExprValidateErr> {
+        // Read before `resolve_map` consumes the logical form. Only under
+        // `Inherit`: a reindex or hash-row overwrites every row's PK.
+        let is_identity = matches!(pk_source, PkSource::Inherit)
+            && in_schema.same_physical_layout(out_schema)
+            && logical.sequential_copy_base() == Some(in_schema.pk_indices().len());
         let ev = logical.resolve_map(in_schema, out_schema)?;
         let copies_a_string = ev
             .copies()
@@ -330,8 +453,20 @@ impl MapPlan {
             pk_source,
             copies_a_string,
             keeps_every_string,
+            is_identity,
             out_schema: *out_schema,
         })
+    }
+
+    /// The schema this plan stamps on its output.
+    pub fn out_schema(&self) -> &SchemaDescriptor {
+        &self.out_schema
+    }
+
+    /// True iff running this map would reproduce its input batch. A compiler
+    /// elides such a node entirely and lets its consumers read the input.
+    pub fn is_identity(&self) -> bool {
+        self.is_identity
     }
 
     /// Map every `[start, end)` range of `src`, in list order, onto `keeper`'s

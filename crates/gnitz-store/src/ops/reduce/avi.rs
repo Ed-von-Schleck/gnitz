@@ -83,16 +83,20 @@ impl AviBake {
     /// itself, so the ordinal order has one spelling. The index schema is the key
     /// packer's own key columns then [`SUFFIX`], all PK, no payload.
     ///
-    /// `None` for a float group column, which `new_group_key` refuses — the
-    /// index's key bytes are the group key's, so it inherits that rejection.
-    pub(crate) fn new(src: &SchemaDescriptor, group_by_cols: &[u32], accs: &[Accumulator]) -> Option<Self> {
+    /// The index's key bytes are the group key's, so it inherits
+    /// `new_group_key`'s rejections verbatim.
+    pub(crate) fn new(
+        src: &SchemaDescriptor,
+        group_by_cols: &[u32],
+        accs: &[Accumulator],
+    ) -> Result<Self, crate::schema::OpBuildErr> {
         let key_packer = ReindexPacker::new_group_key(src, group_by_cols, &SUFFIX)?;
         let mut b = crate::schema::DerivedSchema::new();
         for c in key_packer.key_columns().chain(SUFFIX) {
             b.push_pk(c)
                 .expect("a group key packed inside the SUFFIX reservation, plus SUFFIX, is non-null PK-eligible");
         }
-        Some(AviBake {
+        Ok(AviBake {
             schema: b.finish(),
             key_packer,
             aggs: accs

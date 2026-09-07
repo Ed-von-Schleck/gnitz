@@ -9,38 +9,39 @@ use crate::test_support::{
 /// preset for the unit tests. Production dispatches `Instr::WeightClamp`
 /// straight to [`op_weight_clamp`].
 fn op_distinct(delta: Batch, cursor: &mut ReadCursor, schema: &SchemaDescriptor) -> (Batch, Batch) {
-    op_weight_clamp(delta, cursor, schema, -1, 1)
+    op_weight_clamp(delta, cursor, schema, ClampPreset::Distinct)
 }
 
 /// The clamp's per-element arithmetic, `clamp(w_old + Δw, lo, hi) − clamp(w_old,
-/// lo, hi)`, at both presets: `(-1, 1)` is `distinct`, `(0, i64::MAX)` is
-/// `positive_part`. Only the latter ever sees a net-negative pre-image.
+/// lo, hi)`, at both presets — and the bounds each resolves to. Only
+/// `positive_part` ever sees a net-negative pre-image.
 #[test]
 fn weight_clamp_emits_the_clamped_transition_at_both_presets() {
     let schema = make_schema_u64_i64();
-    // (lo, hi, integral weight, delta weight, emitted weight; 0 = no row).
+    use ClampPreset::{Distinct, PositivePart};
+    // (preset, integral weight, delta weight, emitted weight; 0 = no row).
     let cases = [
-        (-1i64, 1i64, 0i64, 3i64, 1i64), // 0 → positive: the element enters
-        (-1, 1, 3, -2, 0),               // positive → positive: no transition
-        (-1, 1, 1, -1, -1),              // positive → 0: the element leaves
-        (-1, 1, 1, 1, 0),                // already a member
-        (-1, 1, 0, -2, -1),              // 0 → negative
-        (0, i64::MAX, 5, 3, 3),          // max(0,8) − max(0,5)
-        (0, i64::MAX, 8, -10, -8),       // max(0,−2) − max(0,8)
-        (0, i64::MAX, -2, 4, 2),         // a negative pre-image clamps to 0
+        (Distinct, 0i64, 3i64, 1i64), // 0 → positive: the element enters
+        (Distinct, 3, -2, 0),         // positive → positive: no transition
+        (Distinct, 1, -1, -1),        // positive → 0: the element leaves
+        (Distinct, 1, 1, 0),          // already a member
+        (Distinct, 0, -2, -1),        // 0 → negative
+        (PositivePart, 5, 3, 3),      // max(0,8) − max(0,5)
+        (PositivePart, 8, -10, -8),   // max(0,−2) − max(0,8)
+        (PositivePart, -2, 4, 2),     // a negative pre-image clamps to 0
     ];
-    for (lo, hi, w_old, w_delta, want) in cases {
+    for (preset, w_old, w_delta, want) in cases {
         let mut ch = if w_old == 0 {
             crate::storage::empty_cursor(schema)
         } else {
             trace_cursor(make_batch(&schema, &[(1, w_old, 10)]), schema)
         };
         let delta = make_batch(&schema, &[(1, w_delta, 10)]);
-        let (out, consolidated) = op_weight_clamp(delta, &mut ch, &schema, lo, hi);
+        let (out, consolidated) = op_weight_clamp(delta, &mut ch, &schema, preset);
 
         let got: Vec<i64> = (0..out.count).map(|r| out.get_weight(r)).collect();
         let want: Vec<i64> = if want == 0 { vec![] } else { vec![want] };
-        assert_eq!(got, want, "({lo},{hi}) w_old={w_old} Δ={w_delta}");
+        assert_eq!(got, want, "{preset:?} w_old={w_old} Δ={w_delta}");
         assert!(out.is_consolidated());
         assert!(consolidated.is_consolidated());
     }

@@ -156,10 +156,11 @@ fn decode_rejects_an_unknown_opcode() {
     assert!(decode_op_node(9999, None, None).unwrap_err().contains("unknown opcode"));
 }
 
-/// A reindex key's promoted target is rejected here when it is not PK-eligible,
-/// since nothing on the master relay path screens it. `MAP_HASH_ROW` has no such
-/// gate (`emit_map` applies the stricter `is_widening_promotion`), so its
-/// out-of-domain target decodes; an undecodable byte is refused on both.
+/// A reindex key's promoted target is rejected here when it is not PK-eligible —
+/// the screen a decode with no schema can make. `MAP_HASH_ROW` has no such gate
+/// (`MapPlan::from_wire` types the output column at the target, so
+/// `check_copy_types` is stricter), so its out-of-domain target decodes; an
+/// undecodable byte is refused on both.
 #[test]
 fn decode_rejects_an_out_of_domain_reindex_target() {
     let reindex = |tc: u8| {
@@ -193,7 +194,7 @@ fn decode_rejects_an_out_of_domain_reindex_target() {
             Some(&hash_row(crate::type_code::U128)),
         )
         .is_ok(),
-        "a hash-row target's domain is emit_map's, not this decode's",
+        "a hash-row target's domain is the copy kernel's, not this decode's",
     );
 
     // An undecodable code is a refusal on both, not a decode to "no target".

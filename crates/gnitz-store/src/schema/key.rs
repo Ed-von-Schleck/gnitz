@@ -27,7 +27,7 @@ use gnitz_wire::{Cut, RangeDescriptor, NARROW_PK_MAX_BYTES};
 
 use crate::foundation::xxh::{self, RowHasher};
 use crate::schema::{
-    type_code, ColumnLocator, DerivedSchema, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES, MAX_PK_COLUMNS,
+    type_code, ColumnLocator, DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES, MAX_PK_COLUMNS,
 };
 
 // ---------------------------------------------------------------------------
@@ -1041,26 +1041,38 @@ impl ReindexPacker {
     /// two cannot disagree per slot while still agreeing on the total stride —
     /// which would silently stop equal keys co-partitioning.
     ///
-    /// `None` on arity over `MAX_PK_COLUMNS`, an out-of-range column, a **float**
-    /// source column, or a stride over `MAX_PK_BYTES` — a forged circuit is
+    /// The whole trust boundary for a key list off the wire: a forged circuit is
     /// rejected, never panicked on.
     ///
     /// A float has no key image: OPK bytes are compared raw, and `+0.0`/`-0.0`
     /// differ byte-wise while comparing equal. The SQL planner refuses one
     /// already; this is the boundary for a raw `gnitz-core` client.
-    pub fn new(schema: &SchemaDescriptor, key: &[gnitz_wire::ReindexSlot]) -> Option<Self> {
+    ///
+    /// A carried target's domain is `join_key_common_type`'s codomain — the
+    /// *key* domain, whose collapse to U128 is what a `_join_pk` slot does to a
+    /// UUID pair, not the value domain `gnitz_wire::int_domain_fits` answers.
+    pub(crate) fn new(schema: &SchemaDescriptor, key: &[gnitz_wire::ReindexSlot]) -> Result<Self, OpBuildErr> {
         if key.len() > MAX_PK_COLUMNS {
-            return None;
+            return Err(OpBuildErr::shape(format!(
+                "reindex key: {} columns exceeds the {MAX_PK_COLUMNS}-column PK limit",
+                key.len()
+            )));
         }
         let mut cols = [ColPromoter::PLACEHOLDER; MAX_PK_COLUMNS];
         let mut stride = 0usize;
         for (i, &(c, carried)) in key.iter().enumerate() {
-            // `locate`'s own out-of-range guard is a release-active panic, so the
-            // rejection has to happen here — bound to the call, not merely ahead
-            // of it.
-            let loc = ((c as usize) < schema.num_columns()).then(|| schema.locate(c as usize))?;
+            let loc = schema
+                .try_locate(c as usize)
+                .ok_or_else(|| OpBuildErr::oob_col("reindex key: column", c, schema))?;
             if gnitz_wire::is_float(loc.type_code()) {
-                return None;
+                return Err(OpBuildErr::shape(format!(
+                    "reindex key: column {c} is a float, which has no order-preserving key image"
+                )));
+            }
+            if carried.is_some_and(|t| gnitz_wire::join_key_common_type(loc.type_code(), t as u8) != Some(t as u8)) {
+                return Err(OpBuildErr::shape(format!(
+                    "reindex key: column {c} does not promote to the carried target"
+                )));
             }
             let kind = classify_promote(loc);
             // Carried promotion target (`None` = self-derive); the slot type and
@@ -1078,9 +1090,11 @@ impl ReindexPacker {
             cols[i] = cp;
         }
         if stride > MAX_PK_BYTES {
-            return None;
+            return Err(OpBuildErr::shape(format!(
+                "reindex key: {stride} PK bytes exceeds the {MAX_PK_BYTES}-byte limit"
+            )));
         }
-        Some(ReindexPacker {
+        Ok(ReindexPacker {
             cols,
             num_cols: key.len(),
             out_stride: stride,
@@ -1107,16 +1121,24 @@ impl ReindexPacker {
     /// `in_schema.columns[payload_cols[i]]`. `payload_cols` is what the reindex
     /// program copies, so a join side skipping a dead column stops persisting it.
     ///
-    /// `None` iff the result exceeds `MAX_COLUMNS`; the PK-side bounds are `new`'s.
-    pub fn output_schema(&self, in_schema: &SchemaDescriptor, payload_cols: &[u32]) -> Option<SchemaDescriptor> {
+    /// The PK-side bounds are `new`'s; `payload_cols` is bounded here.
+    pub(crate) fn output_schema(
+        &self,
+        in_schema: &SchemaDescriptor,
+        payload_cols: &[u32],
+    ) -> Result<SchemaDescriptor, OpBuildErr> {
+        const OVERFLOW: &str = "reindex map: output exceeds MAX_COLUMNS";
         let mut b = DerivedSchema::new();
         for c in self.key_columns() {
-            b.push_pk(c)?;
+            b.push_pk(c).ok_or_else(|| OpBuildErr::shape(OVERFLOW))?;
         }
         for &c in payload_cols {
-            b.push(in_schema.columns[c as usize])?;
+            let col = in_schema
+                .column(c as usize)
+                .ok_or_else(|| OpBuildErr::oob_col("reindex map: payload column", c, in_schema))?;
+            b.push(col).ok_or_else(|| OpBuildErr::shape(OVERFLOW))?;
         }
-        Some(b.finish())
+        Ok(b.finish())
     }
 
     /// Build the packer for a **group** key over `group_cols`, leaving the PK
@@ -1127,13 +1149,14 @@ impl ReindexPacker {
     /// Greedy: pack leading columns while the budget still leaves room for the
     /// fold slot the rest would need. Unlike a join key this is total over
     /// *arity* — the overflow folds into one hash slot — so no group set is
-    /// refused for being wide. `None` only for a float column, which keys on
-    /// bytes here exactly as in [`Self::new`], and for the same reason.
+    /// refused for being wide. It refuses only an out-of-range column and a float
+    /// one, which keys on bytes here exactly as in [`Self::new`], and for the
+    /// same reason.
     pub(crate) fn new_group_key(
         schema: &SchemaDescriptor,
         group_cols: &[u32],
         reserve: &[SchemaColumn],
-    ) -> Option<Self> {
+    ) -> Result<Self, OpBuildErr> {
         // The reservation is the suffix columns themselves, so their count and
         // their width are one fact rather than two that can drift.
         let max_cols = MAX_PK_COLUMNS - reserve.len();
@@ -1147,11 +1170,17 @@ impl ReindexPacker {
         assert!(max_cols <= 9, "the one bitmap byte addresses at most 8 packed columns");
         // Over *all* group columns: narrowing it to the packed prefix would be
         // circular, since the reservation is an input to the budget deciding it.
-        if group_cols
-            .iter()
-            .any(|&c| gnitz_wire::is_float(schema.columns[c as usize].type_code))
-        {
-            return None;
+        // The range test precedes it — every read below indexes the fixed array
+        // raw, where `[num_columns, 65)` reads back as a lying 8-byte column.
+        for &c in group_cols {
+            let col = schema
+                .column(c as usize)
+                .ok_or_else(|| OpBuildErr::oob_col("group key: column", c, schema))?;
+            if gnitz_wire::is_float(col.type_code) {
+                return Err(OpBuildErr::shape(format!(
+                    "group key: column {c} is a float, which has no order-preserving key image"
+                )));
+            }
         }
         let has_bitmap = group_cols.iter().any(|&c| schema.columns[c as usize].nullable != 0);
 
@@ -1185,7 +1214,7 @@ impl ReindexPacker {
         );
         stride += if fold.is_empty() { 0 } else { FOLD_BYTES };
 
-        Some(ReindexPacker {
+        Ok(ReindexPacker {
             cols,
             num_cols: n_packed,
             out_stride: stride,

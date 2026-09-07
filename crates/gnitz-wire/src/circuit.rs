@@ -138,7 +138,7 @@ impl AggFunc {
 /// input. Carries no column *type* — that is `schema.columns[col_idx]`, which
 /// every consumer already holds. The one spelling on both wire paths: a
 /// `Reduce` node's parameters and an ad-hoc fold's `ReadSpec` ship this, and
-/// `ReducePlan::new` consumes it.
+/// `ReducePlan::from_wire` consumes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AggDescriptor {
     pub col_idx: u32,
@@ -387,10 +387,9 @@ pub enum OpNode {
     Distinct,
     /// Multiplicity-preserving counterpart to `Distinct`: both emit
     /// `clamp(w_new, lo, hi) − clamp(w_old, lo, hi)` per consolidated
-    /// (PK, payload), differing only in the preset — `[0, i64::MAX]` here against
-    /// `Distinct`'s `[-1, 1]`. Two opcodes rather than one node carrying
-    /// `(lo, hi)`, so a forged circuit cannot name `min > max` and abort a worker
-    /// per row inside `Ord::clamp`.
+    /// (PK, payload), differing only in the preset the engine's `ClampPreset`
+    /// resolves. Two opcodes rather than one node carrying `(lo, hi)`, so a
+    /// forged circuit cannot name `min > max`.
     PositivePart,
     Reduce {
         group_cols: Vec<u32>,
@@ -673,10 +672,9 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
             if key.is_empty() {
                 return Err("MAP_REINDEX names no key columns".to_string());
             }
-            // The only target-domain screen on the master relay path, which
-            // passes a carried target straight through `resolve_reindex_type`.
-            // The compiler's `key_promotion_invalid` is stricter, but sees only
-            // the plans it compiles.
+            // The decode-time screen, which has no schema: `ReindexPacker::new`
+            // holds the target to its source column's promotion domain, which is
+            // stricter and subsumes this.
             for (_, tc) in key.iter().filter_map(|&(c, tc)| tc.map(|t| (c, t))) {
                 if !crate::is_pk_eligible(tc as u8) {
                     return Err(format!("MAP_REINDEX target type code {} is not PK-eligible", tc as u8));
@@ -686,8 +684,8 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
         }
         Opcode::MapHashRow => {
             let branch_id = r.u8()?;
-            // No target-domain gate here: `emit_map` is the only reader of these
-            // slots and applies `is_widening_promotion`, which is stricter.
+            // No target-domain gate here: `MapPlan::from_wire` types the output
+            // column at the target, so `check_copy_types` sees the promotion.
             let cols = read_cols_with_tcs(&mut r)?;
             // An empty list hashes no bytes, collapsing every row onto one PK —
             // the same self-consistency refusal `MAP_REINDEX` gets above.

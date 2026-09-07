@@ -74,7 +74,7 @@ impl SkeletonHydrator for DagEngine {
             )));
         }
         let sub = &mut plan.post;
-        let seed_schema = sub.vm.program.reg_meta[hydration.in_reg as usize].schema;
+        let seed_schema = *sub.vm.program.schema_of(hydration.in_reg);
         // The gather opens over the range its own key list spans.
         let mut gather = match hydration.seed {
             HydrationSeed::Relation(source) => {

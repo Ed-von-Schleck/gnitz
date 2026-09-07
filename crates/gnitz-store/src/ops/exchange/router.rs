@@ -1,7 +1,7 @@
 //! Exchange worker routing: `ScatterSpec`, `ScatterKey`, and the per-row
 //! routing-key helpers.
 
-use crate::schema::SchemaDescriptor;
+use crate::schema::{OpBuildErr, SchemaDescriptor};
 use crate::storage::{Batch, MemBatch};
 use gnitz_wire::{worker_for_key, worker_for_pk_bytes};
 
@@ -104,12 +104,17 @@ pub(super) struct ScatterKey {
 }
 
 impl ScatterKey {
-    /// `None` when `schema` cannot route by `spec` — a column it has not got, or
+    /// Refused when `schema` cannot route by `spec` — a column it has not got, or
     /// one a reindex key cannot pack. The route reaches here off a client-pushed
     /// circuit row, and both fold paths resolve columns through `locate`'s
-    /// release-active assert, so this is where it is rejected.
+    /// release-active assert, so this is where it is rejected. The reason travels
+    /// because the master relay renders it to the client.
     #[inline]
-    pub(crate) fn new(spec: ScatterSpec<'_>, schema: &SchemaDescriptor, num_workers: usize) -> Option<Self> {
+    pub(crate) fn new(
+        spec: ScatterSpec<'_>,
+        schema: &SchemaDescriptor,
+        num_workers: usize,
+    ) -> Result<Self, OpBuildErr> {
         // Sequence equality, not set equality: `worker_for_pk_bytes` hashes OPK
         // bytes in schema order, so a permuted compound PK routes differently.
         // And no carried target throughout: a promoted key packs at the wider
@@ -117,10 +122,12 @@ impl ScatterKey {
         let pk = schema.pk_indices();
         let kind = match spec {
             ScatterSpec::GroupKey(cols) if cols == pk => ScatterKind::PkBytes,
-            ScatterSpec::GroupKey(cols) if cols.iter().all(|&c| (c as usize) < schema.num_columns()) => {
+            ScatterSpec::GroupKey(cols) => {
+                if let Some(&c) = cols.iter().find(|&&c| schema.column(c as usize).is_none()) {
+                    return Err(OpBuildErr::oob_col("scatter group key: column", c, schema));
+                }
                 ScatterKind::Fold { keys: GroupKeyCols::new(schema, cols) }
             }
-            ScatterSpec::GroupKey(_) => return None,
             ScatterSpec::JoinKey(slots)
                 if slots.len() == pk.len() && slots.iter().zip(pk).all(|(&(c, tc), &p)| c == p && tc.is_none()) =>
             {
@@ -131,7 +138,7 @@ impl ScatterKey {
                 buf: [0u8; crate::schema::MAX_PK_BYTES],
             },
         };
-        Some(ScatterKey { kind, num_workers })
+        Ok(ScatterKey { kind, num_workers })
     }
 
     /// Whether this scatter routes by native PK bytes — the callers' gate for
