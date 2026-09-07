@@ -5,11 +5,31 @@ use std::time::Duration;
 
 use super::super::test_support::*;
 use super::*;
+use crate::runtime::orchestration::peer::Peer;
+use crate::runtime::wire::COALESCE_MAX_BYTES;
 
 /// One whole-payload client send, with nothing racing it.
 async fn owned_send(r: &Reactor, fd: i32, payload: Vec<u8>) -> i32 {
     r.send_owned(fd, Rc::new(gnitz_store::storage::batch_pool::PooledSendBuf(payload)))
         .await
+}
+
+/// A pooled send buffer holding `bytes`.
+fn pooled(bytes: &[u8]) -> gnitz_store::storage::batch_pool::PooledSendBuf {
+    let mut b = gnitz_store::storage::batch_pool::acquire_buf();
+    b.extend_from_slice(bytes);
+    gnitz_store::storage::batch_pool::PooledSendBuf(b)
+}
+
+/// Everything readable on `fd` right now, without blocking.
+fn read_available(fd: i32, cap: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; cap];
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+        let n = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, cap);
+        buf.truncate(n.max(0) as usize);
+    }
+    buf
 }
 
 /// The same send the way `Peer::send` runs it: under the egress deadline. Only
@@ -253,12 +273,7 @@ fn fanout_coalesced_egress_bench() {
                         // Source buffers are filled outside the timed region
                         // on both arms except the concatenation itself,
                         // which is the copy under test.
-                        let mut bufs = Vec::with_capacity(w);
-                        for _ in 0..w {
-                            let mut buf = acquire_buf();
-                            buf.extend_from_slice(&frame);
-                            bufs.push(PooledSendBuf(buf));
-                        }
+                        let bufs: Vec<PooledSendBuf> = (0..w).map(|_| pooled(&frame)).collect();
                         let run_per_frame = async |bufs: Vec<PooledSendBuf>| {
                             let t = Instant::now();
                             for buf in bufs {
@@ -459,5 +474,125 @@ fn both_listeners_rearm_after_an_fd_exhaustion_backoff() {
     unsafe {
         libc::close(a);
         libc::close(b);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Corked egress: what waits in `Peer`'s accumulator, and what it leaves behind.
+// ─────────────────────────────────────────────────────────────────
+
+/// Corked replies put nothing on the wire until something flushes, and then
+/// leave as one send: the far end reads the whole concatenation in one `read`.
+#[test]
+fn corked_replies_leave_as_one_send() {
+    unsafe {
+        let (r, sender, receiver) = egress_pair(None);
+        let peer = Peer::unix(sender, Rc::clone(&r));
+        let frames: Vec<Vec<u8>> = (0..8u8).map(|i| vec![0xD0 | i; 200]).collect();
+        let expected: Vec<u8> = frames.iter().flatten().copied().collect();
+
+        let f = frames.clone();
+        r.block_on(async move {
+            for frame in &f {
+                peer.cork(frame);
+            }
+            assert!(
+                read_available(receiver, 4096).is_empty(),
+                "corking must put nothing on the wire before a flush",
+            );
+            assert!(peer.flush_egress().await > 0, "the flush must send");
+        });
+
+        assert_eq!(
+            read_available(receiver, 4096),
+            expected,
+            "one flush is one send carrying every corked frame in order",
+        );
+        libc::close(sender);
+        libc::close(receiver);
+    }
+}
+
+/// A `send_slot` issued with bytes corked puts the corked bytes on the wire
+/// first: a ring-slot forward may not overtake a reply already written.
+#[test]
+fn a_slot_forward_cannot_overtake_a_corked_reply() {
+    unsafe {
+        let (receiver_w2m, _region) = make_scan_ring(1, 1);
+        let slot = receiver_w2m.try_read_slot(0).expect("a frame");
+        let slot_bytes = slot.frame_bytes().to_vec();
+
+        let (r, sender, receiver) = egress_pair(None);
+        let peer = Peer::unix(sender, Rc::clone(&r));
+        let corked = vec![0x5Au8; 128];
+
+        let c = corked.clone();
+        r.block_on(async move {
+            peer.cork(&c);
+            assert!(peer.send_slot(slot).await > 0, "the slot forward must send");
+        });
+
+        let seen = read_available(receiver, 64 * 1024);
+        let mut expected = corked;
+        expected.extend_from_slice(&slot_bytes);
+        assert_eq!(seen, expected, "the corked bytes precede the forwarded slot");
+        libc::close(sender);
+        libc::close(receiver);
+    }
+}
+
+/// N frames written in one `write` are all queued off a single recv completion:
+/// a pipelined run costs one read, not one per frame.
+#[test]
+fn one_recv_completion_queues_a_whole_pipelined_run() {
+    unsafe {
+        let (read_fd, write_fd) = stream_pair();
+        let r = make_reactor();
+        r.register_conn(read_fd);
+        r.set_max_payload_len(read_fd, 1 << 20);
+
+        const N: usize = 12;
+        let wire: Vec<u8> = (0..N).flat_map(|i| framed(&vec![i as u8; 600])).collect();
+        gnitz_store::foundation::posix_io::write_all_fd(write_fd, &wire).expect("write");
+
+        let queued = |r: &Reactor| r.inner.conns.borrow().get(&read_fd).map_or(0, |c| c.q.queued());
+        assert!(poll_until(&r, 10_000, || queued(&r) > 0), "the run must be deframed",);
+        assert_eq!(
+            queued(&r),
+            N,
+            "the first completion must queue every frame the read carried, not one",
+        );
+        assert_eq!(r.try_recv(read_fd).map(|b| b.as_slice()[0]), Some(0), "in order");
+
+        libc::close(read_fd);
+        libc::close(write_fd);
+    }
+}
+
+/// Corking is unbounded on its own; `flush_if_full` is what ships a long run,
+/// and it leaves nothing behind once it does.
+#[test]
+fn a_full_accumulator_ships_between_messages() {
+    unsafe {
+        let (r, sender, receiver) = egress_pair(None);
+        let peer = Peer::unix(sender, Rc::clone(&r));
+        let drain = spawn_drain(receiver, COALESCE_MAX_BYTES);
+        let frame = vec![0x3Cu8; 4096];
+
+        r.block_on(async move {
+            let mut shipped = 0;
+            while shipped == 0 {
+                peer.cork(&frame);
+                shipped = peer.flush_if_full().await;
+            }
+            assert!(
+                shipped as usize >= COALESCE_MAX_BYTES,
+                "the flush ships everything corked, got {shipped}"
+            );
+            assert_eq!(peer.flush_if_full().await, 0, "and leaves nothing pending");
+        });
+
+        assert!(drain.join().expect("drain") >= COALESCE_MAX_BYTES);
+        libc::close(sender);
     }
 }

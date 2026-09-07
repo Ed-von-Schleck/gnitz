@@ -155,9 +155,9 @@ pub(super) fn spawn_drain(fd: i32, expect: usize) -> std::thread::JoinHandle<usi
     })
 }
 
-/// Build a length-prefixed wire frame: 4-byte LE payload length + payload.
+/// Build a length-prefixed wire frame: LE payload length + payload.
 pub(super) fn framed(payload: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(4 + payload.len());
+    let mut v = Vec::with_capacity(gnitz_wire::FRAME_LEN_PREFIX_BYTES + payload.len());
     v.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     v.extend_from_slice(payload);
     v

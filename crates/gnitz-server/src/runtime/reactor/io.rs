@@ -125,86 +125,46 @@ impl Drop for RecvBuf {
     }
 }
 
-enum RecvPhase {
-    Header { pos: usize },
-    Payload { buf: RecvBuf, pos: usize },
-}
+/// Size of the per-connection read staging buffer.
+const CARRY_BYTES: usize = 32 * 1024;
 
-enum RecvAdvance {
-    NeedMore,
-    HeaderDone,
-    MessageDone,
-    Disconnect,
-}
-
+/// The deframer. One read fills the carry; every length prefix found in it
+/// allocates its own payload buffer and the bytes behind it move straight
+/// across, so a pipelined run costs one read rather than one per frame.
 struct RecvState {
-    hdr_buf: [u8; FRAME_LEN_PREFIX_BYTES],
-    phase: RecvPhase,
+    carry: Box<[u8]>,
+    /// Bytes at the front of `carry` the parse has not consumed. At most a split
+    /// length prefix: [`RecvQueue::deliver`] compacts before it returns.
+    filled: usize,
+    /// The payload a length prefix has been parsed for, and how much of it has
+    /// arrived. `None` between frames, and while it is `Some` the carry is empty.
+    pending: Option<(RecvBuf, usize)>,
 }
 
 impl RecvState {
     fn new() -> Self {
         RecvState {
-            hdr_buf: [0; FRAME_LEN_PREFIX_BYTES],
-            phase: RecvPhase::Header { pos: 0 },
+            carry: vec![0u8; CARRY_BYTES].into_boxed_slice(),
+            filled: 0,
+            pending: None,
         }
     }
 
-    fn advance(&mut self, bytes_received: usize) -> RecvAdvance {
-        match &mut self.phase {
-            RecvPhase::Header { pos } => {
-                *pos += bytes_received;
-                if *pos < FRAME_LEN_PREFIX_BYTES {
-                    return RecvAdvance::NeedMore;
-                }
-                if u32::from_le_bytes(self.hdr_buf) == 0 {
-                    return RecvAdvance::Disconnect;
-                }
-                RecvAdvance::HeaderDone
-            }
-            RecvPhase::Payload { buf, pos } => {
-                *pos += bytes_received;
-                if *pos < buf.len {
-                    return RecvAdvance::NeedMore;
-                }
-                RecvAdvance::MessageDone
-            }
-        }
-    }
-
+    /// The window the next bytes must land in. A payload whose unfilled tail
+    /// would take a whole read on its own is read into directly, so a large frame
+    /// is not copied through the carry a carry at a time.
     fn remaining(&mut self) -> (*mut u8, u32) {
-        match &mut self.phase {
-            RecvPhase::Header { pos } => {
-                let ptr = unsafe { self.hdr_buf.as_mut_ptr().add(*pos) };
-                (ptr, (FRAME_LEN_PREFIX_BYTES - *pos) as u32)
-            }
-            RecvPhase::Payload { buf, pos } => {
-                let ptr = unsafe { buf.ptr.add(*pos) };
-                (ptr, (buf.len - *pos) as u32)
+        if let Some((buf, pos)) = &self.pending {
+            if buf.len - *pos >= self.carry.len() {
+                // SAFETY: `pos <= buf.len`, and the buffer is exclusively ours.
+                return (unsafe { buf.ptr.add(*pos) }, (buf.len - *pos) as u32);
             }
         }
-    }
-
-    fn payload_len(&self) -> usize {
-        u32::from_le_bytes(self.hdr_buf) as usize
-    }
-
-    fn start_payload(&mut self, buf: RecvBuf) {
-        self.phase = RecvPhase::Payload { buf, pos: 0 };
-    }
-
-    fn take_message(&mut self) -> RecvBuf {
-        match std::mem::replace(&mut self.phase, RecvPhase::Header { pos: 0 }) {
-            RecvPhase::Payload { buf, .. } => buf,
-            _ => unreachable!("take_message called outside Payload phase"),
-        }
-    }
-
-    /// Seed the length prefix as if it had just been received, so a
-    /// payload-phase test can start there.
-    #[cfg(test)]
-    fn seed_header(&mut self, payload_len: u32) {
-        self.hdr_buf = payload_len.to_le_bytes();
+        // `filled` is at most a split prefix, so this is never empty.
+        (
+            unsafe { self.carry.as_mut_ptr().add(self.filled) },
+            (self.carry.len() - self.filled) as u32,
+        )
     }
 }
 
@@ -237,8 +197,7 @@ impl RecvQueue {
         }
     }
 
-    /// The window the next bytes must be written into: the unfilled tail of the
-    /// 4-byte length header, or of the in-flight payload buffer.
+    /// The window the next bytes must be written into.
     pub(crate) fn remaining(&mut self) -> (*mut u8, u32) {
         self.state.remaining()
     }
@@ -251,39 +210,75 @@ impl RecvQueue {
         self.frames.is_closed()
     }
 
-    /// Advance by `n` bytes just written into the window, applying the per-frame
-    /// ceiling and the inbound charge and queueing a frame once one completes.
-    /// Returns the window the *next* bytes must land in. `Err` ⇒ the recv side
-    /// must close: oversize frame, cap breach, or the zero-length sentinel;
-    /// `fd` names the connection in the cap-breach log.
+    /// Advance by `n` bytes just written into the window, queueing every frame
+    /// they complete — one read can carry a whole pipelined run. Returns the
+    /// window the *next* bytes must land in. `Err` ⇒ the recv side must close:
+    /// oversize frame, cap breach, or the zero-length sentinel; `fd` names the
+    /// connection in the cap-breach log.
     pub(crate) fn deliver(&mut self, n: usize, fd: i32) -> Result<(*mut u8, u32), ()> {
-        match self.state.advance(n) {
-            RecvAdvance::NeedMore => {}
-            RecvAdvance::HeaderDone => {
-                let plen = self.state.payload_len();
-                if plen > self.max_payload_len {
-                    return Err(());
+        let RecvState { carry, filled, pending } = &mut self.state;
+        // Where the bytes landed — the same test `remaining` chose the window by.
+        match pending {
+            Some((buf, pos)) if buf.len - *pos >= carry.len() => *pos += n,
+            _ => *filled += n,
+        }
+        // How much of the carry the parse has consumed.
+        let mut cur = 0;
+        loop {
+            if let Some((buf, mut pos)) = pending.take() {
+                // Whatever the read carried past this frame's length prefix; a
+                // direct read landed the rest in `buf` already.
+                let take = (buf.len - pos).min(*filled - cur);
+                // SAFETY: `take` is bounded by both the carry's unconsumed span
+                // and the payload's unfilled tail; the two allocations are
+                // distinct.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(carry.as_ptr().add(cur), buf.ptr.add(pos), take);
                 }
-                let Some(buf) = self.budget.alloc(plen) else {
-                    gnitz_warn!(
-                        "reactor: inbound cap would be exceeded, closing fd={} (held={} B + {} B, cap={} B)",
-                        fd,
-                        self.budget.held.get(),
-                        frame_weight(plen),
-                        self.budget.cap.get(),
-                    );
-                    return Err(());
-                };
-                self.state.start_payload(buf);
-            }
-            RecvAdvance::MessageDone => {
+                pos += take;
+                cur += take;
+                if pos < buf.len {
+                    *pending = Some((buf, pos));
+                    break;
+                }
                 // The charged `RecvBuf` moves from the deframer into the
                 // delivery queue; its accounting rides along untouched.
-                self.frames.push(self.state.take_message());
+                self.frames.push(buf);
+                continue;
             }
-            RecvAdvance::Disconnect => return Err(()),
+            if *filled - cur < FRAME_LEN_PREFIX_BYTES {
+                break;
+            }
+            let hdr: [u8; FRAME_LEN_PREFIX_BYTES] = carry[cur..cur + FRAME_LEN_PREFIX_BYTES].try_into().unwrap();
+            let plen = u32::from_le_bytes(hdr) as usize;
+            // Zero is the close sentinel, not a frame.
+            if plen == 0 || plen > self.max_payload_len {
+                return Err(());
+            }
+            let Some(buf) = self.budget.alloc(plen) else {
+                gnitz_warn!(
+                    "reactor: inbound cap would be exceeded, closing fd={} (held={} B + {} B, cap={} B)",
+                    fd,
+                    self.budget.held.get(),
+                    frame_weight(plen),
+                    self.budget.cap.get(),
+                );
+                return Err(());
+            };
+            cur += FRAME_LEN_PREFIX_BYTES;
+            *pending = Some((buf, 0));
         }
+        // Only a split length prefix can be left — every other exit consumed the
+        // carry whole — so this moves at most three bytes to the front, and the
+        // next window is the rest of the carry.
+        carry.copy_within(cur..*filled, 0);
+        *filled -= cur;
         Ok(self.state.remaining())
+    }
+
+    /// Take a completed frame without parking, beside [`Self::poll_recv`].
+    pub(crate) fn try_recv(&mut self) -> Option<RecvBuf> {
+        self.frames.pop()
     }
 
     /// Hand the next completed frame to the awaiting task. Ownership of the

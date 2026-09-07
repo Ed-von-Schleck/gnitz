@@ -362,6 +362,59 @@ def test_one_poll_reports_every_view(client, mirror):
     assert mirror.cursor(unknown) is None, "a view with no valid copy has no cursor"
 
 
+def test_one_poll_mixes_a_moved_view_with_idle_ones(client, mirror):
+    """A poll over many views where exactly one has moved.
+
+    The all-idle and all-moved polls are covered above and in the mirror crate;
+    this is the mixed batch, the only one where the two reply shapes interleave
+    on one connection — the moved view's rows arrive as a train the workers
+    produced, every idle one's terminal is answered master-locally.
+    """
+    sn = "s" + _uid()
+    _base_tables(client, sn)
+
+    idle = {}
+    for i in range(7):
+        name = f"g{i}"
+        _mk_feed(client, sn, name, f"SELECT id, w FROM u WHERE w > {i}")
+        idle[name] = mirror.mirror_view(sn, name).view_id
+    _mk_feed(client, sn, "f", "SELECT id, v, body FROM t WHERE v > 5")
+    moved = mirror.mirror_view(sn, "f").view_id
+
+    _churn(client, sn, 1, 60)
+    for name in list(idle) + ["f"]:
+        client.execute_sql(f"SELECT COUNT(*) AS n FROM {name}", schema_name=sn)
+    mirror.poll()
+    before = {vid: mirror.cursor(vid) for vid in list(idle.values()) + [moved]}
+    idle_before = {vid: _zset(_local(mirror, sn, vid, f"SELECT * FROM {n}")) for n, vid in idle.items()}
+
+    # Only `t` is written, so only `f` has a round to carry; `u`'s views are
+    # up-to-date and answered by the master-local gate.
+    client.execute_sql(
+        "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 3}, 'late-{i:0>20}')" for i in range(9001, 9040)),
+        schema_name=sn,
+    )
+    client.execute_sql("SELECT COUNT(*) AS n FROM f", schema_name=sn)
+
+    report = {r.view_id: r for r in mirror.poll()}
+    assert set(report) == set(before), "one poll reports every registration, moved or not"
+
+    # The claim this test exists for: each report carries its *own* view's tag.
+    # A poll correlating replies by arrival rather than by request would hand a
+    # view another's cursor, and only a mixed batch can catch it.
+    for vid, prev in before.items():
+        assert report[vid].cursor[0] == prev[0], f"{vid}: a report carrying another view's tag is a mis-correlation"
+        assert report[vid].cursor[1] >= prev[1], f"{vid}: the round never goes backwards"
+
+    q = "SELECT * FROM f"
+    _same_zset(q, _local(mirror, sn, moved, q), _rows(client.execute_sql(q, schema_name=sn)))
+    for name, vid in idle.items():
+        q = f"SELECT * FROM {name}"
+        local = _local(mirror, sn, vid, q)
+        assert _zset(local) == idle_before[vid], f"{name}: nothing was pushed to it, so its copy must be unchanged"
+        _same_zset(q, local, _rows(client.execute_sql(q, schema_name=sn)))
+
+
 def test_a_dead_view_fails_its_own_entry_and_stops_nothing_else(client, mirror):
     """A view dropped upstream fails forever, and the poll still reports every
     other one.

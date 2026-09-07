@@ -12,6 +12,7 @@
 //! `parse_train_header` too.
 
 use super::*;
+use crate::runtime::wire::COALESCE_MAX_BYTES;
 use gnitz_wire::MAX_WORKERS;
 
 /// A decode failure on one frame of a reply train, named after the verb `what`.
@@ -135,15 +136,6 @@ pub(super) async fn drain_index_scan(
     Ok(())
 }
 
-/// Ceiling on the coalesced head buffer, bounding the copy a scan pays to save
-/// its per-frame `OP_SEND`/`OP_TIMEOUT`/`OP_ASYNC_CANCEL` triples.
-///
-/// `fanout_coalesced_egress_bench` (reactor tests) sweeps the tradeoff: the win
-/// grows with worker count and shrinks with total size, reaching break-even
-/// around 128 KiB at two workers but still large there at eight. 32 KiB sits
-/// well inside the winning region at every worker count.
-const COALESCE_MAX_BYTES: usize = 32 * 1024;
-
 /// One awaited scan-train head, classified.
 #[derive(Clone, Copy, Default)]
 struct TrainHead {
@@ -171,10 +163,10 @@ fn classify_head(slot: &W2mSlot, worker: usize) -> Result<TrainHead, WorkerFault
 /// `Ok(false)` on client disconnect, `Err` on a worker fault / malformed train.
 ///
 /// When every train is a single frame and the heads together stay under
-/// [`COALESCE_MAX_BYTES`], they are concatenated into one pooled buffer and
-/// leave in one egress operation instead of W. Each frame carries its own
-/// `[len | payload]` prefix inside the ring mapping, so the concatenation is a
-/// valid wire stream with nothing synthesized between frames. Anything else
+/// [`COALESCE_MAX_BYTES`], they are corked rather than sent, so they and the
+/// terminal frame behind them leave in one egress operation instead of W+1. Each
+/// frame carries its own `[len | payload]` prefix inside the ring mapping, so
+/// the concatenation needs nothing synthesized between frames. Anything else
 /// falls back to [`drain_scan_train`] per worker.
 pub(super) async fn forward_scan_slots(
     reactor: &crate::runtime::reactor::Reactor,
@@ -200,8 +192,8 @@ pub(super) async fn forward_scan_slots(
     }
     if any_tail || observable < 2 || total > COALESCE_MAX_BYTES {
         // Coalescing a multi-frame train would land its continuations behind the
-        // next worker's head, reordering the client's rows. Below two frames
-        // there is no kernel op to save.
+        // next worker's head, reordering the client's rows. A lone frame goes
+        // zero-copy from the ring instead of being copied to join the terminal.
         for (i, slot) in slots.into_iter().enumerate() {
             let (w, req_id) = scan.reply(i);
             if !drain_scan_train(reactor, peer, slot, heads[i], req_id as u32, w).await? {
@@ -212,21 +204,16 @@ pub(super) async fn forward_scan_slots(
     }
     // Every train is one frame, so the heads in worker order ARE the whole
     // reply, in exactly the order the per-worker drain would have produced.
-    let mut buf = gnitz_store::storage::batch_pool::acquire_buf();
-    buf.reserve(total);
+    // `cork` copies synchronously, so every ring slot is released before any SQE
+    // exists — a client that stalls the send cannot pin a slot and fill the
+    // worker's W2M ring. A disconnect surfaces at whichever flush ships them.
     for (i, slot) in slots.iter().enumerate() {
         if heads[i].observable {
-            buf.extend_from_slice(slot.frame_bytes());
+            peer.cork(slot.frame_bytes());
         }
     }
-    // The copy is synchronous, so every ring slot is released before the SQE
-    // exists — a client that stalls this send cannot pin a slot and fill the
-    // worker's W2M ring.
     drop(slots);
-    Ok(peer
-        .send_buffer(gnitz_store::storage::batch_pool::PooledSendBuf(buf))
-        .await
-        >= 0)
+    Ok(true)
 }
 
 /// Forward one worker's train to the client: send each frame to `peer` (dropping

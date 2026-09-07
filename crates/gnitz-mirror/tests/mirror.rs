@@ -881,6 +881,65 @@ fn round_trip_cost_bench() {
     }
 }
 
+/// The cost of one idle poll over M views — the steady state of a subscription.
+///
+/// A poll that batched per view would park the client once per view; one that
+/// pipelines parks once for all of them. Voluntary context switches per poll is
+/// that difference measured directly, and instructions retired is the same claim
+/// immune to machine frequency.
+#[test]
+#[ignore]
+fn pipelined_poll_syscall_bench() {
+    const M: usize = 16;
+    const K: usize = 200;
+
+    let _g = serial();
+    let mut fx = Fixture::start();
+    let Some(counter) = support::perf::Instructions::open() else {
+        println!("perf_event_open refused; skipping the instruction count");
+        return;
+    };
+
+    let names: Vec<String> = (0..M).map(|i| format!("p{i}")).collect();
+    for (i, name) in names.iter().enumerate() {
+        sql(
+            &mut fx.direct,
+            "s",
+            &format!(
+                "CREATE VIEW {name} WITH (delta = '{FEED}') AS \
+                 SELECT a, b, v, f, body FROM t WHERE v >= {i}"
+            ),
+        );
+    }
+    churn(&mut fx.direct, 1, 2_000);
+    for name in &names {
+        fx.mirror().mirror_view("s", name).expect("mirror");
+    }
+    // Poll once more after the drain, so the measured run is wholly idle.
+    let view_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    fx.drain("s", &view_refs);
+    fx.mirror().poll_mirror().expect("poll");
+
+    let before = support::perf::voluntary_ctx_switches();
+    let (_, insns) = counter.measure(|| {
+        for _ in 0..K {
+            fx.mirror().poll_mirror().expect("poll");
+        }
+    });
+    let switches = support::perf::voluntary_ctx_switches() - before;
+
+    println!(
+        "idle poll over M={M} K={K}: {:.0} instr/poll ({}), {:.2} voluntary ctx switches/poll",
+        insns as f64 / K as f64,
+        if counter.counts_kernel {
+            "kernel included"
+        } else {
+            "user-space only"
+        },
+        switches as f64 / K as f64,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Persistence and recovery
 // ---------------------------------------------------------------------------

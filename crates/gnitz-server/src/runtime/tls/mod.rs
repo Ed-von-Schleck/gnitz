@@ -20,8 +20,8 @@
 //! and two independent `OP_SEND` SQEs on one fd can complete in either
 //! order — so `send_mutex` is held across extraction AND transmission,
 //! making it the "at most one `OP_SEND` in flight per fd" guarantee. That
-//! in turn means no TLS send may be unbounded: `Peer::send` wraps the
-//! per-frame eviction deadline around [`TlsShared::send_bytes`], and the
+//! in turn means no TLS send may be unbounded: `Peer` wraps the eviction
+//! deadline around each [`TlsShared::send_bytes`] it makes, and the
 //! flusher wraps the same one around its own control-byte send. The deadline
 //! covers the `lock().await` too, so it fires even while merely blocked on a
 //! mutex a stalled peer is holding: its expiry runs the lock-free `shutdown`,
@@ -106,8 +106,8 @@ impl TlsConn {
     fn feed_decrypted(&mut self, fd: i32) -> Result<(), ()> {
         let (mut ptr, mut len) = self.q.remaining();
         loop {
-            // SAFETY: ptr/len are the queue's own write window (header buf or
-            // in-flight RecvBuf payload), exclusively ours.
+            // SAFETY: ptr/len are the queue's own write window (its carry, or
+            // an in-flight RecvBuf payload), exclusively ours.
             let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len as usize) };
             // Collapsing WouldBlock into close would kill every live
             // connection; collapsing close into WouldBlock would spin.
@@ -240,6 +240,12 @@ impl TlsShared {
     /// and the queue is drained.
     pub(crate) fn recv(self: &Rc<Self>) -> TlsRecvFuture {
         TlsRecvFuture { conn: Rc::clone(self) }
+    }
+
+    /// The next already-deframed frame without parking; `None` means nothing is
+    /// queued right now, never that the peer is gone.
+    pub(crate) fn try_recv(&self) -> Option<RecvBuf> {
+        self.state.borrow_mut().q.try_recv()
     }
 
     /// Take the shared ciphertext scratch and fill it with everything

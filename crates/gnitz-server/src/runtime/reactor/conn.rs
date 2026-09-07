@@ -45,9 +45,9 @@ impl SendPayload for Vec<u8> {
     }
 }
 
-/// Per-frame wall-clock deadline for client egress, read from
+/// Per-send wall-clock deadline for client egress, read from
 /// `GNITZ_CLIENT_SEND_TIMEOUT_MS` (default 30 s) once per reactor. The deadline
-/// is per-frame, so a client making steady progress across a large train is
+/// is per-send, so a client making steady progress across a large train is
 /// never penalised — only one that makes zero progress for the full window (a
 /// stalled or maliciously zero-window peer) is evicted. Generous by default so
 /// ordinary transient congestion never sheds a healthy client; e2e tests shrink
@@ -59,8 +59,8 @@ pub(super) fn resolve_client_send_timeout() -> std::time::Duration {
     ))
 }
 
-/// Run one client-bound send under [`client_send_timeout`]. `Peer::send` applies
-/// this once, around both transports, so no egress park anywhere is unbounded.
+/// Run one client-bound send under [`client_send_timeout`]. `Peer` applies this
+/// around both transports, so no egress park anywhere is unbounded.
 ///
 /// Why the deadline exists: a client that stops draining its socket pins
 /// whatever the send holds — for a `W2mSlot`, its ring space — and enough
@@ -182,13 +182,10 @@ impl Reactor {
         RawRecvFuture { id, inner: Rc::clone(&self.inner) }
     }
 
-    /// Elevate `fd`'s per-connection payload ceiling. Called after the
-    /// HELLO handshake validates a connection. Must run synchronously
-    /// before any `.await` inside `connection_loop`: the reactor re-arms
-    /// `recv` immediately after the HELLO `MessageDone`, so a pipelined
-    /// frame's length prefix can arrive while the handshake task is
-    /// still parked. If `max_payload_len` is left at the pre-handshake
-    /// 8-byte value, `handle_recv_cqe` would disconnect the second frame.
+    /// Elevate `fd`'s per-connection payload ceiling, after HELLO validates the
+    /// connection. Must run before any `.await` in the handshake task: the recv
+    /// is re-armed as soon as HELLO is deframed, so a later frame arriving first
+    /// would be disconnected under [`io::HELLO_PRE_HANDSHAKE_LEN`].
     pub fn set_max_payload_len(&self, fd: i32, limit: usize) {
         if let Some(conn) = self.inner.conns.borrow_mut().get_mut(&fd) {
             conn.q.set_max_payload_len(limit);
@@ -212,7 +209,7 @@ impl Reactor {
         let conn = conns
             .entry(fd)
             .or_insert_with(|| Box::new(io::Conn::new(Rc::clone(&self.inner.inbound))));
-        let (ptr, len) = conn.q.remaining(); // a fresh queue's window is the 4-byte header
+        let (ptr, len) = conn.q.remaining(); // a fresh queue's window is the whole carry
         arm_recv(&mut self.inner.ring(), conn, fd, ptr, len);
     }
 
@@ -221,6 +218,12 @@ impl Reactor {
     /// disconnected.  Each call drains at most one message.
     pub fn recv(&self, fd: i32) -> RecvFuture {
         RecvFuture { fd, inner: Rc::clone(&self.inner) }
+    }
+
+    /// The next already-deframed message on `fd` without parking. `None` means
+    /// nothing is queued right now, not that the peer is gone.
+    pub fn try_recv(&self, fd: i32) -> Option<io::RecvBuf> {
+        self.inner.conns.borrow_mut().get_mut(&fd)?.q.try_recv()
     }
 
     /// Send `payload`'s whole byte range, returning total bytes sent (>= 0) or

@@ -507,14 +507,27 @@ enum HelloOutcome {
     Reject,
 }
 
-/// `first_frame_deadline` bounds the arrival of the first (HELLO) frame:
-/// `Some` for TLS (pre-auth reap), `None` for AF_UNIX (unchanged). Only the
-/// first recv is raced against the deadline; everything after HELLO uses a
-/// plain `peer.recv().await`.
+/// `first_frame_deadline` bounds the arrival of the first (HELLO) frame: `Some`
+/// for TLS (pre-auth reap), `None` for AF_UNIX. Only the first recv is raced
+/// against it.
 async fn connection_loop(peer: Peer, shared: Rc<Shared>, first_frame_deadline: Option<Instant>) {
-    // No HELLO in time (`Either::B`) → `None`, funnelling into the single close
-    // site below. `select2` drops the losing recv (clears its waker) and the
-    // losing timer (cancels its SQE), so the happy path leaves no timer behind.
+    serve_connection(&peer, &shared, first_frame_deadline).await;
+    // The one exit: ship what is corked — a rejection is a corked reply like any
+    // other — then retire the fd.
+    peer.flush_egress().await;
+    peer.close();
+}
+
+/// One message handled to completion before the next is received, so replies
+/// leave in request order — which is how clients correlate them (`gnitz.aio`
+/// gathers a mixed group onto one round-trip and rejects an out-of-order
+/// `target_id`). Spawning `handle_message` to overlap requests would break that.
+///
+/// Returns when the peer is gone or refused; the caller closes.
+async fn serve_connection(peer: &Peer, shared: &Rc<Shared>, first_frame_deadline: Option<Instant>) {
+    // No HELLO in time (`Either::B`) → `None`. `select2` drops the losing recv
+    // (clears its waker) and the losing timer (cancels its SQE), so the happy
+    // path leaves no timer behind.
     let first = match first_frame_deadline {
         Some(deadline) => match select2(peer.recv(), shared.reactor.timer(deadline)).await {
             Either::A(opt) => opt,
@@ -522,27 +535,27 @@ async fn connection_loop(peer: Peer, shared: Rc<Shared>, first_frame_deadline: O
         },
         None => peer.recv().await,
     };
-    let Some(buf) = first else {
-        peer.close();
-        return;
-    };
-    if let HelloOutcome::Reject = run_hello_handshake(&peer, &shared, buf.as_slice()).await {
-        peer.close();
+    let Some(buf) = first else { return };
+    if let HelloOutcome::Reject = run_hello_handshake(peer, shared, buf.as_slice()).await {
         return;
     }
 
-    // One message handled to completion before the next is received, and every
-    // client-peer write in this file happens inside that awaited chain — so
-    // replies leave this connection in request order, unconditionally. Clients
-    // correlate pipelined replies positionally on exactly that (`gnitz.aio`
-    // gathers a mixed group onto one round-trip, and the client's reply
-    // accumulator rejects an out-of-order `target_id` as a protocol error).
-    // Spawning `handle_message` to overlap requests would break both.
     loop {
-        let Some(buf) = peer.recv().await else { break };
-        handle_message(&peer, buf.as_slice(), &shared).await;
+        // Never wait on the client holding corked bytes, and never hold more
+        // than the budget: between them these are the whole shipping rule.
+        let mut next = peer.try_recv();
+        if next.is_none() {
+            if peer.flush_egress().await < 0 {
+                return;
+            }
+            next = peer.recv().await;
+        }
+        let Some(buf) = next else { return };
+        handle_message(peer, buf.as_slice(), shared).await;
+        if peer.flush_if_full().await < 0 {
+            return;
+        }
     }
-    peer.close();
 }
 
 /// Validate a HELLO frame, elevate the connection's payload limit, and
@@ -566,7 +579,7 @@ async fn run_hello_handshake(peer: &Peer, shared: &Rc<Shared>, data: &[u8]) -> H
             "unsupported wire version: peer={}, server={}",
             hello.version, server_version,
         );
-        send_error(peer, 0, 0, msg.as_bytes()).await;
+        send_error(peer, 0, 0, msg.as_bytes());
         return HelloOutcome::Reject;
     }
 
@@ -943,7 +956,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("decode error: {e}");
-            send_error(peer, 0, 0, msg.as_bytes()).await;
+            send_error(peer, 0, 0, msg.as_bytes());
             return;
         }
     };
@@ -958,7 +971,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
     let verb = match ClientVerb::from_flags(ctrl.flags) {
         Ok(v) => v,
         Err(e) => {
-            send_error(peer, target_id, client_id, e.as_bytes()).await;
+            send_error(peer, target_id, client_id, e.as_bytes());
             return;
         }
     };
@@ -978,8 +991,8 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
         ClientVerb::AllocSerialRange => {
             let count = ctrl.seek_col_idx.max(1) as i64;
             match commit_serial_range_durable(shared, target_id, count).await {
-                Ok(base) => send_control_only(peer, base, client_id, STATUS_OK).await,
-                Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
+                Ok(base) => send_control_only(peer, base, client_id, STATUS_OK),
+                Err(e) => send_error(peer, target_id, client_id, e.as_bytes()),
             }
         }
 
@@ -1015,7 +1028,7 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
             };
             match reply {
                 Ok(buf) => peer.send_or_close(buf).await,
-                Err(msg) => send_error(peer, target_id, client_id, msg.as_bytes()).await,
+                Err(msg) => send_error(peer, target_id, client_id, msg.as_bytes()),
             }
         }
 
@@ -1032,10 +1045,10 @@ async fn handle_message(peer: &Peer, data: &[u8], shared: &Rc<Shared>) {
 /// that id is the whole answer, so the frame carries no schema and no data.
 async fn reply_allocation<E: std::fmt::Display>(peer: &Peer, client_id: u64, alloc: Result<i64, E>) {
     match alloc {
-        Ok(new_id) => send_control_only(peer, new_id, client_id, STATUS_OK).await,
+        Ok(new_id) => send_control_only(peer, new_id, client_id, STATUS_OK),
         Err(e) => {
             let msg = format!("id allocation failed: {e}");
-            send_error(peer, 0, client_id, msg.as_bytes()).await;
+            send_error(peer, 0, client_id, msg.as_bytes());
         }
     }
 }
@@ -1107,11 +1120,11 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
     let decoded = match decode_push_frame(shared, data, ctrl) {
         Ok(d) => d,
         Err(PushReject::SchemaMismatch) => {
-            send_control_only(peer, target_id, client_id, STATUS_SCHEMA_MISMATCH).await;
+            send_control_only(peer, target_id, client_id, STATUS_SCHEMA_MISMATCH);
             return;
         }
         Err(PushReject::Error(msg)) => {
-            send_error(peer, target_id, client_id, msg.as_bytes()).await;
+            send_error(peer, target_id, client_id, msg.as_bytes());
             return;
         }
     };
@@ -1129,7 +1142,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
         Some(b) if !b.is_empty() => b,
         _ => {
             drop(_cat);
-            send_ok_response(shared, peer, target_id, None, client_id, 0, client_version).await;
+            send_ok_response(shared, peer, target_id, None, client_id, 0, client_version);
             return;
         }
     };
@@ -1144,16 +1157,16 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
             // a warm one is told to evict its cache entry and retry cold, where
             // that wording is reachable.
             if has_schema {
-                send_error(peer, target_id, client_id, e.as_bytes()).await;
+                send_error(peer, target_id, client_id, e.as_bytes());
             } else {
-                send_control_only(peer, target_id, client_id, STATUS_SCHEMA_MISMATCH).await;
+                send_control_only(peer, target_id, client_id, STATUS_SCHEMA_MISMATCH);
             }
             return;
         }
     }
 
     let Some(mode) = gnitz_wire::wire_flags_get_conflict_mode(flags) else {
-        send_error(peer, target_id, client_id, b"push: unknown conflict mode").await;
+        send_error(peer, target_id, client_id, b"push: unknown conflict mode");
         return;
     };
 
@@ -1161,7 +1174,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
     // relation kind, and must keep admitting a base table's retractions.
     if kind == RelationKind::Stream {
         if let Some(e) = stream_push_error(target_id, &batch, mode) {
-            send_error(peer, target_id, client_id, e.as_bytes()).await;
+            send_error(peer, target_id, client_id, e.as_bytes());
             return;
         }
     }
@@ -1189,7 +1202,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
         .validate_txn_distributed(&shared.reactor, std::slice::from_ref(&family))
         .await
     {
-        send_fault(peer, target_id, client_id, &e).await;
+        send_fault(peer, target_id, client_id, &e);
         return;
     }
     let TxnFamily { batch, .. } = family;
@@ -1207,7 +1220,7 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
         done: tx,
     }));
     if let Err(e) = queued {
-        send_error(peer, target_id, client_id, e.as_bytes()).await;
+        send_error(peer, target_id, client_id, e.as_bytes());
         return;
     }
     match rx.await {
@@ -1237,11 +1250,10 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
                 client_id,
                 reply_lsn as u128,
                 client_version,
-            )
-            .await;
+            );
         }
-        Some(Err(fault)) => send_fault(peer, target_id, client_id, &fault).await,
-        None => send_error(peer, target_id, client_id, b"committer shut down").await,
+        Some(Err(fault)) => send_fault(peer, target_id, client_id, &fault),
+        None => send_error(peer, target_id, client_id, b"committer shut down"),
     }
 }
 
@@ -1269,10 +1281,8 @@ async fn serve_seek(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::control
         // in the arms — one of which mints a second borrow of its own.
         let found = guard_panic("seek", || shared.cat_mut().seek_family(target_id, pk, seek_pk_extra));
         match found {
-            Ok((batch, _)) => {
-                send_ok_response(shared, peer, target_id, batch.as_ref(), client_id, pk, client_version).await
-            }
-            Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
+            Ok((batch, _)) => send_ok_response(shared, peer, target_id, batch.as_ref(), client_id, pk, client_version),
+            Err(e) => send_error(peer, target_id, client_id, e.as_bytes()),
         }
     } else {
         match shared
@@ -1281,7 +1291,7 @@ async fn serve_seek(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::control
             .await
         {
             Ok(slot) => peer.send_or_close(slot).await,
-            Err(f) => send_fault(peer, target_id, client_id, &f).await,
+            Err(f) => send_fault(peer, target_id, client_id, &f),
         }
     }
 }
@@ -1325,10 +1335,9 @@ async fn handle_push_txn(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
                     status,
                     ..Default::default()
                 },
-            )
-            .await;
+            );
         }
-        Err(fault) => send_fault(peer, 0, client_id, &fault).await,
+        Err(fault) => send_fault(peer, 0, client_id, &fault),
     }
 }
 
@@ -1573,7 +1582,7 @@ async fn target_kind_or_reject(
     match target_kind(shared, target_id, access) {
         Ok(kind) => Some(kind),
         Err(f) => {
-            send_fault(peer, target_id, client_id, &f).await;
+            send_fault(peer, target_id, client_id, &f);
             None
         }
     }
@@ -1616,7 +1625,7 @@ async fn handle_seek_by_index(
     let cols = match admitted {
         Ok(cols) => cols,
         Err(e) => {
-            send_error(peer, target_id, client_id, e.to_string().as_bytes()).await;
+            send_error(peer, target_id, client_id, e.to_string().as_bytes());
             return;
         }
     };
@@ -1632,7 +1641,7 @@ async fn handle_seek_by_index(
         // No secondary index for this column list: a dedicated control-only
         // status, caught here with zero worker dispatch, so the SQL planner falls
         // back to a scan or a CREATE INDEX hint without a prior catalog probe.
-        send_control_only(peer, target_id, client_id, STATUS_NO_INDEX).await;
+        send_control_only(peer, target_id, client_id, STATUS_NO_INDEX);
         return;
     }
     // Forward the wire frame verbatim (packed seek_col_idx, seek_pk +
@@ -1651,10 +1660,9 @@ async fn handle_seek_by_index(
                 client_id,
                 seek_pk,
                 client_version,
-            )
-            .await;
+            );
         }
-        Err(f) => send_fault(peer, target_id, client_id, &f).await,
+        Err(f) => send_fault(peer, target_id, client_id, &f),
     }
 }
 
@@ -1883,7 +1891,7 @@ async fn read_lock(
     let g = match drain_and_relock(shared, g).await {
         Ok(g) => g,
         Err(f) => {
-            send_fault(peer, target_id, client_id, &f).await;
+            send_fault(peer, target_id, client_id, &f);
             return None;
         }
     };
@@ -1907,20 +1915,18 @@ fn schema_block_for_reply(shared: &Rc<Shared>, tid: i64, client_version: u16) ->
     (server_version, block)
 }
 
-/// Build the preliminary schema-only frame — carrying `FLAG_CONTINUATION`, the
+/// The preliminary schema-only frame — carrying `FLAG_CONTINUATION`, the
 /// `server_version`, and the captured wire block — that precedes a scan's data
-/// frames on a schema-cache miss. The caller chooses when to send it: inline for
-/// a single scan, deferred to the one-cut Phase 2 for a multi-scan.
-fn build_prelim_schema_frame(tid: i64, client_id: u64, server_version: u16, block: &[u8]) -> PooledSendBuf {
-    let prelim_flags = gnitz_wire::wire_flags_set_schema_version(gnitz_wire::FLAG_CONTINUATION, server_version);
-    encode_response_buffer(ipc::WireMsg {
+/// frames on a schema-cache miss, in place of one schema block per worker.
+fn prelim_schema_msg(tid: i64, client_id: u64, server_version: u16, block: &[u8]) -> ipc::WireMsg<'_> {
+    ipc::WireMsg {
         target_id: tid as u64,
         client_id,
-        flags: prelim_flags,
+        flags: gnitz_wire::wire_flags_set_schema_version(gnitz_wire::FLAG_CONTINUATION, server_version),
         status: STATUS_OK,
         schema_block: Some(block),
         ..Default::default()
-    })
+    }
 }
 
 /// SCAN: a catalog family is served master-locally, everything else fans out to
@@ -1938,15 +1944,12 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id
     }
     let lsn = shared.last_tick_lsn.get();
 
-    // On a schema-cache miss, master sends one preliminary schema-only frame
-    // before dispatching workers, eliminating the N per-worker schema blocks.
     let (server_version, prelim) = schema_block_for_reply(shared, target_id, client_version);
     if let Some(block) = prelim {
-        let frame = build_prelim_schema_frame(target_id, client_id, server_version, block.as_slice());
-        if peer.send_buffer(frame).await < 0 {
-            peer.close();
-            return;
-        }
+        send_msg(
+            peer,
+            prelim_schema_msg(target_id, client_id, server_version, block.as_slice()),
+        );
     }
 
     let unicast = read_fanout(shared.disp(), target_id, None);
@@ -1976,14 +1979,14 @@ async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id
 /// scan puts the last-committed LSN there; a delta read puts the pair
 /// `(cursor tag, T)`, tag in the high half — so the whole cursor a subscriber
 /// stores costs no wire bytes.
-fn make_terminal_scan_frame(target_id: i64, client_id: u64, seek_pk: u128) -> PooledSendBuf {
-    encode_response_buffer(ipc::WireMsg {
+fn terminal_scan_msg(target_id: i64, client_id: u64, seek_pk: u128) -> ipc::WireMsg<'static> {
+    ipc::WireMsg {
         target_id: target_id as u64,
         client_id,
         seek_pk,
         status: STATUS_OK,
         ..Default::default()
-    })
+    }
 }
 
 /// Finish one scan-shaped fan-out: `Ok(true)` → the terminal frame (stamped
@@ -1998,12 +2001,13 @@ async fn finish_scan_fanout(
     result: Result<bool, WorkerFault>,
 ) {
     match result {
+        // Corked, not sent: `forward_scan_slots` corked the heads it coalesced
+        // and nothing parked in between, so the whole reply leaves as one send.
         Ok(true) => {
-            let terminal = make_terminal_scan_frame(target_id, client_id, seek_pk);
-            peer.send_or_close(terminal).await;
+            send_msg(peer, terminal_scan_msg(target_id, client_id, seek_pk));
         }
         Ok(false) => peer.close(),
-        Err(f) => send_fault(peer, target_id, client_id, &f).await,
+        Err(f) => send_fault(peer, target_id, client_id, &f),
     }
 }
 
@@ -2067,8 +2071,7 @@ async fn handle_scan_spec(shared: &Rc<Shared>, peer: &Peer, client_id: u64, targ
         let disp = shared.disp();
         if shared.cat().registry().relation_has_delta_feed(target_id) && after >= disp.last_delta_round(target_id) {
             let seek_pk = delta_terminal_seek_pk(disp, target_id, disp.last_tick_round());
-            let frame = make_terminal_scan_frame(target_id, client_id, seek_pk);
-            peer.send_or_close(frame).await;
+            send_msg(peer, terminal_scan_msg(target_id, client_id, seek_pk));
             return;
         }
     }
@@ -2134,7 +2137,7 @@ async fn handle_scan_multi(shared: &Rc<Shared>, peer: &Peer, client_id: u64, dat
         // Shape/tid rejection (before any group is written) or a worker fault
         // mid-stream (leases already dropped in the body): one error frame. The
         // client discards any partial results it read.
-        Err(f) => send_fault(peer, 0, client_id, &f).await,
+        Err(f) => send_fault(peer, 0, client_id, &f),
     }
 }
 
@@ -2213,10 +2216,10 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
     for (plan, d) in plans.iter().zip(&dispatches) {
         // Preliminary schema-only frame first, when captured in Phase 1.
         if let Some(block) = plan.block.as_ref() {
-            let frame = build_prelim_schema_frame(plan.tid, client_id, plan.server_version, block.as_slice());
-            if peer.send_buffer(frame).await < 0 {
-                return Ok(false);
-            }
+            send_msg(
+                peer,
+                prelim_schema_msg(plan.tid, client_id, plan.server_version, block.as_slice()),
+            );
         }
         // Drain this relation's train (all workers, ascending) before the next —
         // the FIFO reply contract makes request order == ring order.
@@ -2226,8 +2229,10 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             Err(f) => return Err(f),
         }
         // Terminal frame for this relation (tid + the shared LSN).
-        let terminal = make_terminal_scan_frame(plan.tid, client_id, lsn as u128);
-        if peer.send_buffer(terminal).await < 0 {
+        send_msg(peer, terminal_scan_msg(plan.tid, client_id, lsn as u128));
+        // This relation's reply is complete: carry no more than the budget into
+        // the next, and learn here rather than at the end if the client is gone.
+        if peer.flush_if_full().await < 0 {
             return Ok(false);
         }
     }
@@ -2252,10 +2257,9 @@ async fn scan_system_family(shared: &Rc<Shared>, peer: &Peer, client_id: u64, ta
                 client_id,
                 shared.last_tick_lsn.get() as u128,
                 client_version,
-            )
-            .await;
+            );
         }
-        Err(e) => send_error(peer, target_id, client_id, e.as_bytes()).await,
+        Err(e) => send_error(peer, target_id, client_id, e.as_bytes()),
     }
 }
 
@@ -2266,32 +2270,44 @@ async fn scan_system_family(shared: &Rc<Shared>, peer: &Peer, client_id: u64, ta
 /// Frame one reply into a pooled send buffer. Callers build the [`ipc::WireMsg`]
 /// with the fields they actually set and leave the rest at `Default`.
 fn encode_response_buffer(msg: ipc::WireMsg<'_>) -> PooledSendBuf {
-    const PFX: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES;
-    let sz = msg.size();
-    let total = PFX + sz;
     let mut inner = gnitz_store::storage::batch_pool::acquire_buf();
-    inner.reserve(total.max(8192));
-    // SAFETY: `encode_ipc` writes every byte [0, sz). The frame length prefix is
-    // written immediately below. wal::encode zeros inter-region padding (Step 1),
-    // so no byte is left uninitialised regardless of column type.
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        inner.set_len(total);
-    }
-    inner[0..PFX].copy_from_slice(&(sz as u32).to_le_bytes());
-    let written = msg.encode_ipc(&mut inner[PFX..total], 0);
-    debug_assert_eq!(written, sz);
-    inner.truncate(PFX + written);
+    inner.reserve(8192);
+    encode_response_into(&mut inner, msg);
     PooledSendBuf(inner)
 }
 
-/// Encode `msg` and send it, closing the peer if the write fails — and the one
-/// place a master-authored reply meets [`ipc::FRAME_CAP`]. The master-local
-/// system-family scan and seek have no other bound; the builders that encode
-/// without coming through here are structurally bounded (a schema block by
-/// `MAX_COLS`, terminal and prelim frames by carrying no data, a resolve
-/// descriptor by the relation's FK and index counts).
-async fn send_msg(peer: &Peer, msg: ipc::WireMsg<'_>) {
+/// Append `msg`'s framed bytes to `out`. The corking replies encode straight
+/// into the peer's accumulator through this, so a reply that will be batched
+/// never passes through a buffer of its own.
+fn encode_response_into(out: &mut Vec<u8>, msg: ipc::WireMsg<'_>) {
+    const PFX: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES;
+    let sz = msg.size();
+    let base = out.len();
+    let total = base + PFX + sz;
+    out.reserve(PFX + sz);
+    // SAFETY: `encode_ipc` writes every byte of the payload and the frame length
+    // prefix is written immediately below. wal::encode zeros inter-region padding
+    // (Step 1), so no byte is left uninitialised regardless of column type.
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        out.set_len(total);
+    }
+    out[base..base + PFX].copy_from_slice(&(sz as u32).to_le_bytes());
+    let written = msg.encode_ipc(&mut out[base + PFX..total], 0);
+    debug_assert_eq!(written, sz);
+    out.truncate(base + PFX + written);
+}
+
+/// Cork `msg` for the client — and the one place a master-authored reply meets
+/// [`ipc::FRAME_CAP`]. The master-local system-family scan and seek have no other
+/// bound; the builders that encode without coming through here are structurally
+/// bounded (a schema block by `MAX_COLS`, prelim frames by carrying no data, a
+/// resolve descriptor by the relation's FK and index counts).
+///
+/// Corking rather than sending is what lets a pipelined run of these leave
+/// together, and is sound because every reply through here is the last thing its
+/// handler writes. Nothing is awaited: the connection loop ships it.
+fn send_msg(peer: &Peer, msg: ipc::WireMsg<'_>) {
     let sz = msg.size();
     if sz > ipc::FRAME_CAP {
         let text = ipc::oversized_frame_message(sz);
@@ -2302,13 +2318,13 @@ async fn send_msg(peer: &Peer, msg: ipc::WireMsg<'_>) {
             error_msg: text.as_bytes(),
             ..Default::default()
         };
-        peer.send_or_close(encode_response_buffer(fallback)).await;
+        peer.cork_with(|out| encode_response_into(out, fallback));
         return;
     }
-    peer.send_or_close(encode_response_buffer(msg)).await
+    peer.cork_with(|out| encode_response_into(out, msg));
 }
 
-async fn send_ok_response(
+fn send_ok_response(
     shared: &Rc<Shared>,
     peer: &Peer,
     target_id: i64,
@@ -2331,24 +2347,23 @@ async fn send_ok_response(
             schema_block: schema_arg,
             ..Default::default()
         },
-    )
-    .await;
+    );
 }
 
 /// Control-only reply carrying just a status code and a target id: no schema,
 /// no data, no error text. The named wrapper for the *signal* replies — the
 /// schema-mismatch and no-index statuses, and an id allocation, whose answer *is*
 /// the target id. Not every header-only frame goes out through here:
-/// `make_terminal_scan_frame` and the DDL/TXN ACKs build their own, because each
+/// `terminal_scan_msg` and the DDL/TXN ACKs build their own, because each
 /// carries a meaning in `seek_pk` this wrapper has no parameter for.
-async fn send_control_only(peer: &Peer, target_id: i64, client_id: u64, status: u32) {
-    send_status_frame(peer, target_id, client_id, status, &[]).await
+fn send_control_only(peer: &Peer, target_id: i64, client_id: u64, status: u32) {
+    send_status_frame(peer, target_id, client_id, status, &[])
 }
 
 /// One control-only reply frame carrying `status` verbatim. No schema block: the
 /// client ignores both it and the schema version on a failure, so `flags` stays 0
 /// and the cache lookup is skipped.
-async fn send_status_frame(peer: &Peer, target_id: i64, client_id: u64, status: u32, error_msg: &[u8]) {
+fn send_status_frame(peer: &Peer, target_id: i64, client_id: u64, status: u32, error_msg: &[u8]) {
     send_msg(
         peer,
         ipc::WireMsg {
@@ -2359,7 +2374,6 @@ async fn send_status_frame(peer: &Peer, target_id: i64, client_id: u64, status: 
             ..Default::default()
         },
     )
-    .await
 }
 
 /// Every failure that names its own status, master-minted or forwarded. A worker
@@ -2367,13 +2381,13 @@ async fn send_status_frame(peer: &Peer, target_id: i64, client_id: u64, status: 
 /// `worker_error` down to here — so a typed refusal (a delta cursor past its
 /// retention floor; a full SAL a client should retry) arrives as itself rather
 /// than flattened to `STATUS_ERROR` plus prose.
-async fn send_fault(peer: &Peer, target_id: i64, client_id: u64, fault: &WireFault) {
-    send_status_frame(peer, target_id, client_id, fault.status, fault.text.as_bytes()).await
+fn send_fault(peer: &Peer, target_id: i64, client_id: u64, fault: &WireFault) {
+    send_status_frame(peer, target_id, client_id, fault.status, fault.text.as_bytes())
 }
 
 /// A rejection that carries no status of its own, and so is `STATUS_ERROR`.
-async fn send_error(peer: &Peer, target_id: i64, client_id: u64, error_msg: &[u8]) {
-    send_status_frame(peer, target_id, client_id, STATUS_ERROR, error_msg).await
+fn send_error(peer: &Peer, target_id: i64, client_id: u64, error_msg: &[u8]) {
+    send_status_frame(peer, target_id, client_id, STATUS_ERROR, error_msg)
 }
 
 /// Why a stream cannot accept this push, or `None` if it can. Both rules restate

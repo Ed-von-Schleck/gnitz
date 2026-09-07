@@ -160,8 +160,7 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: 
                     status: STATUS_OK,
                     ..Default::default()
                 },
-            )
-            .await;
+            );
             let total = t_ddl_start.elapsed();
             if total > Duration::from_millis(20) {
                 gnitz_debug!("DDL_TXN SLOW total={:?} families={}", total, family_count);
@@ -169,7 +168,7 @@ pub(super) async fn handle_ddl_txn(shared: &Rc<Shared>, peer: &Peer, client_id: 
         }
         // `validate_unique_index_create`'s refusal keeps its own status; every
         // other failure in the body is the untyped `STATUS_ERROR` it already was.
-        Err(f) => send_fault(peer, 0, client_id, &f).await,
+        Err(f) => send_fault(peer, 0, client_id, &f),
     }
 }
 

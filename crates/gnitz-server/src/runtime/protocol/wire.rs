@@ -17,6 +17,15 @@ use gnitz_wire::{FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
 /// The server's *ingress* limit is the wire constant itself.
 pub(crate) const FRAME_CAP: usize = gnitz_wire::MAX_FRAME_PAYLOAD_SERVER;
 
+/// Ceiling on a concatenation of client-bound frames — the scan heads a fan-out
+/// coalesces, and the replies `Peer` holds corked — bounding the copy paid to
+/// save their per-frame `OP_SEND`/`OP_TIMEOUT`/`OP_ASYNC_CANCEL` triples.
+///
+/// `fanout_coalesced_egress_bench` (reactor tests) sweeps it: the win grows with
+/// worker count and shrinks with total size, breaking even around 128 KiB at two
+/// workers and still large there at eight.
+pub(crate) const COALESCE_MAX_BYTES: usize = 32 * 1024;
+
 /// The one text for a reply that cannot be framed, shared by the two producers
 /// that check [`FRAME_CAP`].
 pub(crate) fn oversized_frame_message(sz: usize) -> String {

@@ -1,5 +1,6 @@
-//! A thread-local instructions-retired counter, for the one claim in this suite
-//! that is about cost rather than about answers.
+//! Thread-local cost counters, for the claims in this suite that are about cost
+//! rather than about answers: instructions retired, and voluntary context
+//! switches — one per park, so a removed round trip shows up as one fewer.
 //!
 //! Wall clock is not evidence here: the number that would falsify "the round
 //! trip is gone" is retired instructions, which is immune to the frequency and
@@ -90,5 +91,16 @@ impl Instructions {
 impl Drop for Instructions {
     fn drop(&mut self) {
         unsafe { libc::close(self.fd) };
+    }
+}
+
+/// This thread's voluntary context switches — one per park. Same scope as
+/// [`Instructions`].
+pub fn voluntary_ctx_switches() -> i64 {
+    // SAFETY: `getrusage` writes a plain POD struct this call owns.
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_THREAD, &mut ru);
+        ru.ru_nvcsw
     }
 }

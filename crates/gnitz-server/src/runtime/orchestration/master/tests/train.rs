@@ -327,15 +327,10 @@ fn drain_scan_train_drops_a_frame_with_neither_data_nor_schema() {
     );
 }
 
-/// When every train is one frame, `forward_scan_slots` concatenates the
-/// observable heads into one pooled buffer and issues a single send.
-///
-/// The copy is synchronous, so every ring slot is released before the send is
-/// submitted — the per-worker fallback would instead pin worker 0's slot in
-/// `send_slot` until a CQE that never comes here. All three cursors advancing
-/// on an unfinished poll is therefore only possible on the coalesced arm.
-/// Worker 1 contributes nothing observable and must be dropped, not
-/// concatenated.
+/// Corking the observable heads copies each out and releases its ring slot
+/// without parking, so the forward finishes in one poll. The per-worker fallback
+/// would instead pin worker 0's slot awaiting a CQE this reader-less peer never
+/// produces, which is what makes the one poll decisive.
 #[test]
 fn forward_scan_slots_coalesces_single_frame_heads() {
     let schema = two_col_schema();
@@ -349,16 +344,23 @@ fn forward_scan_slots_coalesces_single_frame_heads() {
     frame(&writers[2], reqs[2], 0, Some(&schema), Some(&rows_c));
 
     let slots = fx.initial_slots();
+    let observable_bytes = slots[0].frame_bytes().len() + slots[2].frame_bytes().len();
     let before: Vec<u64> = (0..3).map(|w| fx.receiver.release_cursor(w)).collect();
 
-    // The fixture's peer has no reader, so the send parks and the forward
-    // cannot finish in one poll — the cursors are what carry the verdict.
     let done = try_poll_once(forward_scan_slots(&fx.reactor, &fx.peer, slots, &fx.scan));
-    assert!(done.is_none(), "the coalesced send parks on a peer nobody reads");
+    assert!(
+        matches!(done, Some(Ok(true))),
+        "corking sends nothing, so the forward finishes in one poll"
+    );
     for (w, &was) in before.iter().enumerate() {
         assert!(
             fx.receiver.release_cursor(w) > was,
-            "worker {w}'s slot must be released before the send is submitted",
+            "worker {w}'s slot must be released by the copy",
         );
     }
+    assert_eq!(
+        fx.peer.corked_len(),
+        observable_bytes,
+        "the two observable heads are corked; worker 1's unobservable frame is not"
+    );
 }
