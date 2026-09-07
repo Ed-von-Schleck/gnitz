@@ -4,16 +4,16 @@
 //! `crate::hir::create` (it recompiles a query). Every supported op is one
 //! catalog-only `push_ddl` through the `gnitz-core` client.
 
-use crate::ast_util::extract_name;
-use crate::bind::{find_unique_column, Binder};
-use crate::error::{reject_if, GnitzSqlError};
+use crate::ast_util::extract_object_name;
+use crate::bind::find_unique_column;
+use crate::error::{missing_relation as missing, reject_if, GnitzSqlError};
 use crate::types::{serial_underlying, sql_type_to_typecode};
 use crate::validate::{
     reject_unhonored_alter_table_clauses, reject_unhonored_column_options, reject_unhonored_unique_fields,
-    validate_user_name, ColumnOptionSite,
+    require_class, validate_user_name, ClassWant, ColumnOptionSite,
 };
 use crate::SqlResult;
-use gnitz_core::{GnitzClient, RelClass, RelDescriptor};
+use gnitz_core::{GnitzClient, RelDescriptor};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTable, AlterTableOperation, DropBehavior, Ident, ObjectName, RenameTableNameKind,
     TableConstraint,
@@ -24,35 +24,39 @@ pub(crate) fn execute_alter_table(
     client: &mut GnitzClient,
     schema_name: &str,
     alter: &AlterTable,
-    binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     // First, so the index below is total: the guard is what rejects the multi-op
     // comma form, and a clause rejection outranks a bad name or missing relation.
     reject_unhonored_alter_table_clauses(alter)?;
+    // The target name is the statement's, not the operation's. Only the name is
+    // hoisted — each arm resolves behind its own clause rejections, so a clause
+    // rejection still outranks a missing relation.
+    let source_name = extract_object_name(&alter.name, schema_name, "ALTER TABLE")?;
+    validate_user_name(&source_name)?;
     match &alter.operations[0] {
         AlterTableOperation::RenameTable { table_name } => {
             // `RENAME TO` and (some dialects') `RENAME AS` both mean rename-to.
             let target = match table_name {
                 RenameTableNameKind::To(n) | RenameTableNameKind::As(n) => n,
             };
-            rename_relation(client, schema_name, &alter.name, alter.if_exists, target)
+            rename_relation(client, schema_name, &source_name, alter.if_exists, target)
         }
         AlterTableOperation::RenameColumn { old_column_name, new_column_name } => rename_column(
             client,
             schema_name,
-            &alter.name,
+            &source_name,
             alter.if_exists,
             &old_column_name.value,
             &new_column_name.value,
         ),
         AlterTableOperation::AddConstraint { constraint, not_valid } => {
             reject_if(*not_valid, "ALTER TABLE ADD CONSTRAINT", "NOT VALID")?;
-            add_constraint(client, schema_name, &alter.name, alter.if_exists, constraint, binder)
+            add_constraint(client, schema_name, &source_name, alter.if_exists, constraint)
         }
         AlterTableOperation::DropConstraint { if_exists, name, drop_behavior: _ } => drop_constraint(
             client,
             schema_name,
-            &alter.name,
+            &source_name,
             alter.if_exists,
             &name.value,
             *if_exists,
@@ -66,7 +70,7 @@ pub(crate) fn execute_alter_table(
         } => drop_column(
             client,
             schema_name,
-            &alter.name,
+            &source_name,
             alter.if_exists,
             *col_if_exists,
             column_names,
@@ -85,7 +89,7 @@ pub(crate) fn execute_alter_table(
                 "ALTER TABLE ADD COLUMN",
                 "FIRST/AFTER (a column is always appended last)",
             )?;
-            add_column(client, schema_name, &alter.name, alter.if_exists, column_def)
+            add_column(client, schema_name, &source_name, alter.if_exists, column_def)
         }
         // Destructured per-variant so a newly supported operation is an additive
         // arm split, and with no plan path in any message.
@@ -93,7 +97,7 @@ pub(crate) fn execute_alter_table(
             use AlterColumnOperation as Op;
             let msg = match op {
                 Op::DropNotNull => {
-                    return drop_not_null(client, schema_name, &alter.name, alter.if_exists, &column_name.value)
+                    return drop_not_null(client, schema_name, &source_name, alter.if_exists, &column_name.value)
                 }
                 Op::SetNotNull => "ALTER COLUMN SET NOT NULL is not supported (needs a full-table validation scan)",
                 Op::SetDataType { .. } => "ALTER COLUMN SET DATA TYPE is not supported",
@@ -118,29 +122,22 @@ pub(crate) fn execute_alter_table(
 /// `ALTER TABLE <t> RENAME TO <n>` — `t` may be a table OR a view (Postgres
 /// accepts `ALTER TABLE <view> RENAME TO`, and sqlparser parses both as
 /// `RenameTable`). Views bind sources by id and columns by ordinal, so a rename
-/// is always safe with dependents (no dependent-view guard).
+/// is always safe with dependents (no dependent-view guard). No class assertion
+/// for the same reason.
 fn rename_relation(
     client: &mut GnitzClient,
     schema_name: &str,
-    source: &ObjectName,
+    source_name: &str,
     if_exists: bool,
     target: &ObjectName,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let source_name = extract_name(source, "ALTER TABLE")?;
-    validate_user_name(&source_name)?;
-
-    let Some(rel) = client.resolve(schema_name, &source_name)? else {
-        if if_exists {
-            return Ok(altered("table", extract_name(target, "ALTER TABLE")?));
-        }
-        return Err(missing("relation", schema_name, &source_name));
+    let new_name = extract_object_name(target, schema_name, "ALTER TABLE")?;
+    let Some(rel) = resolve_alter_target(client, schema_name, source_name, if_exists)? else {
+        return Ok(altered("table", new_name));
     };
-    reject_system_relation(rel.tid)?;
-
-    let new_name = rename_target_name(target, schema_name)?;
     validate_user_name(&new_name)?;
 
-    client.alter_rename_relation(schema_name, &source_name, &new_name)?;
+    client.alter_rename_relation(schema_name, source_name, &new_name)?;
     Ok(altered(rel.class.noun(), new_name))
 }
 
@@ -149,13 +146,12 @@ fn rename_relation(
 fn rename_column(
     client: &mut GnitzClient,
     schema_name: &str,
-    source: &ObjectName,
+    source_name: &str,
     if_exists: bool,
     old_col: &str,
     new_col: &str,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let source_name = extract_name(source, "ALTER TABLE")?;
-    let Some(rel) = resolve_alter_base_table(client, schema_name, &source_name, if_exists, "RENAME COLUMN")? else {
+    let Some(rel) = resolve_alter_base_table(client, schema_name, source_name, if_exists, "RENAME COLUMN")? else {
         return Ok(altered("column", new_col.to_string()));
     };
     let Some(col_idx) = find_unique_column(&rel.schema.columns, old_col)? else {
@@ -173,12 +169,12 @@ fn rename_column(
 ///
 /// Everything that would need a value for the existing rows or a second catalog
 /// object is rejected: NOT NULL (it would need a full-table validation scan),
-/// SERIAL, the options `execute_create_table` already rejects (DEFAULT, CHECK,
+/// SERIAL, the options `plan_create_table` already rejects (DEFAULT, CHECK,
 /// GENERATED, IDENTITY, COLLATE, …), and inline PRIMARY KEY / UNIQUE / REFERENCES.
 fn add_column(
     client: &mut GnitzClient,
     schema_name: &str,
-    source: &ObjectName,
+    source_name: &str,
     tbl_if_exists: bool,
     column_def: &sqlparser::ast::ColumnDef,
 ) -> Result<SqlResult, GnitzSqlError> {
@@ -192,10 +188,10 @@ fn add_column(
     }
 
     let col_name = &column_def.name.value;
-    let source_name = extract_name(source, "ALTER TABLE")?;
-    // No identifier validation: `validate_user_name` guards *relation* names
-    // only, and neither CREATE TABLE nor RENAME COLUMN validates a column one.
-    let Some(rel) = resolve_alter_base_table(client, schema_name, &source_name, tbl_if_exists, "ADD COLUMN")? else {
+    // No identifier validation on the column: `validate_user_name` guards
+    // *relation* names only, and neither CREATE TABLE nor RENAME COLUMN
+    // validates a column one.
+    let Some(rel) = resolve_alter_base_table(client, schema_name, source_name, tbl_if_exists, "ADD COLUMN")? else {
         return Ok(altered("column", col_name.clone()));
     };
     let tid = rel.tid;
@@ -215,7 +211,7 @@ fn add_column(
 fn drop_column(
     client: &mut GnitzClient,
     schema_name: &str,
-    source: &ObjectName,
+    source_name: &str,
     tbl_if_exists: bool,
     col_if_exists: bool,
     column_names: &[Ident],
@@ -234,8 +230,7 @@ fn drop_column(
         )));
     };
     let col_name = &col.value;
-    let source_name = extract_name(source, "ALTER TABLE")?;
-    let Some(rel) = resolve_alter_base_table(client, schema_name, &source_name, tbl_if_exists, "DROP COLUMN")? else {
+    let Some(rel) = resolve_alter_base_table(client, schema_name, source_name, tbl_if_exists, "DROP COLUMN")? else {
         return Ok(altered("column", col_name.clone()));
     };
     let (tid, schema) = (rel.tid, &rel.schema);
@@ -291,12 +286,11 @@ fn drop_column(
 fn drop_not_null(
     client: &mut GnitzClient,
     schema_name: &str,
-    source: &ObjectName,
+    source_name: &str,
     tbl_if_exists: bool,
     col_name: &str,
 ) -> Result<SqlResult, GnitzSqlError> {
-    let source_name = extract_name(source, "ALTER TABLE")?;
-    let Some(rel) = resolve_alter_base_table(client, schema_name, &source_name, tbl_if_exists, "DROP NOT NULL")? else {
+    let Some(rel) = resolve_alter_base_table(client, schema_name, source_name, tbl_if_exists, "DROP NOT NULL")? else {
         return Ok(altered("column", col_name.to_string()));
     };
     let (tid, schema) = (rel.tid, &rel.schema);
@@ -318,10 +312,9 @@ fn drop_not_null(
 fn add_constraint(
     client: &mut GnitzClient,
     schema_name: &str,
-    source: &ObjectName,
+    source_name: &str,
     if_exists: bool,
     constraint: &TableConstraint,
-    binder: &mut Binder<'_>,
 ) -> Result<SqlResult, GnitzSqlError> {
     let TableConstraint::Unique(u) = constraint else {
         return Err(GnitzSqlError::Unsupported(
@@ -333,26 +326,23 @@ fn add_constraint(
     // constraint-derived name); NULLS NOT DISTINCT / DEFERRABLE are unimplemented.
     reject_unhonored_unique_fields(u, "ADD CONSTRAINT")?;
 
-    let source_name = extract_name(source, "ALTER TABLE")?;
     // `u.name` (the CONSTRAINT name) becomes the created index's name; `None`
     // auto-generates one (`create_index_core` via default_index_name).
     let explicit_name = u.name.as_ref().map(|n| n.value.clone());
-    if resolve_alter_base_table(client, schema_name, &source_name, if_exists, "ADD CONSTRAINT")?.is_none() {
+    let Some(target) = resolve_alter_base_table(client, schema_name, source_name, if_exists, "ADD CONSTRAINT")? else {
         return Ok(altered("constraint", explicit_name.unwrap_or_default()));
-    }
+    };
 
     super::table::create_index_core(
         client,
         schema_name,
-        binder,
-        &source_name,
-        &u.columns,
-        true,
-        explicit_name,
-        // `ADD CONSTRAINT` has no IF NOT EXISTS spelling of its own — `if_exists`
-        // above is the ALTER TABLE target's, already resolved.
-        false,
-        "ADD CONSTRAINT",
+        &target,
+        &super::table::IndexRequest {
+            table_name: source_name,
+            columns: &u.columns,
+            explicit_name,
+            site: super::table::IndexSite::AddConstraint,
+        },
     )
 }
 
@@ -361,27 +351,43 @@ fn add_constraint(
 fn drop_constraint(
     client: &mut GnitzClient,
     schema_name: &str,
-    source: &ObjectName,
+    source_name: &str,
     tbl_if_exists: bool,
     name: &str,
     constraint_if_exists: bool,
 ) -> Result<SqlResult, GnitzSqlError> {
     validate_user_name(name)?;
-    let source_name = extract_name(source, "ALTER TABLE")?;
-    if resolve_alter_base_table(client, schema_name, &source_name, tbl_if_exists, "DROP CONSTRAINT")?.is_none() {
+    if resolve_alter_base_table(client, schema_name, source_name, tbl_if_exists, "DROP CONSTRAINT")?.is_none() {
         return Ok(altered("constraint", name.to_string()));
     }
-    client.drop_index_by_name(name, constraint_if_exists)?;
+    client.drop_indexes_by_name(&[name], constraint_if_exists)?;
     Ok(altered("constraint", name.to_string()))
 }
 
 // --- shared helpers ---
 
-/// The ALTER target as a writable base table (validated name, view and system
-/// relation rejected). `Ok(None)` is the `IF EXISTS` no-op — the target does not
-/// exist and the caller returns its success result untouched. The descriptor's
-/// schema is the physical one the column-level guards index into: hidden
-/// (dropped) slots included, `pk_cols` physical.
+/// The ALTER target: resolved, and refused if it is a system relation. Held to no
+/// class rule — `RENAME TO` accepts a view. `Ok(None)` is the `IF EXISTS` no-op.
+fn resolve_alter_target(
+    client: &mut GnitzClient,
+    schema_name: &str,
+    source_name: &str,
+    if_exists: bool,
+) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
+    let Some(rel) = client.resolve(schema_name, source_name)? else {
+        return if if_exists {
+            Ok(None)
+        } else {
+            Err(missing("Table", schema_name, source_name))
+        };
+    };
+    reject_system_relation(rel.tid)?;
+    Ok(Some(rel))
+}
+
+/// [`resolve_alter_target`] restricted to a base table: no other class has a
+/// column shape to ALTER. The descriptor's schema is the physical one the column
+/// guards index into — hidden (dropped) slots included, `pk_cols` physical.
 fn resolve_alter_base_table(
     client: &mut GnitzClient,
     schema_name: &str,
@@ -389,24 +395,11 @@ fn resolve_alter_base_table(
     if_exists: bool,
     op: &str,
 ) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
-    validate_user_name(source_name)?;
-    match client.resolve(schema_name, source_name)? {
-        None if if_exists => Ok(None),
-        None => Err(missing("Table", schema_name, source_name)),
-        // No class but a base table has a column shape to ALTER: a view is
-        // column-bound by ordinal, and a stream holds no rows (it is RESTRICTed while
-        // dependent views exist, so DROP + CREATE is equivalent). The engine precheck
-        // refuses both too, before any DDL is written; this is here for the message.
-        // RENAME TO is a separate path.
-        Some(rel) if rel.class != RelClass::Table => Err(GnitzSqlError::Unsupported(format!(
-            "'{source_name}' is a {}; ALTER TABLE {op} requires a base table",
-            rel.class.noun()
-        ))),
-        Some(rel) => {
-            reject_system_relation(rel.tid)?;
-            Ok(Some(rel))
-        }
-    }
+    let Some(rel) = resolve_alter_target(client, schema_name, source_name, if_exists)? else {
+        return Ok(None);
+    };
+    require_class(&rel, source_name, ClassWant::BaseTable, &format!("ALTER TABLE {op}"))?;
+    Ok(Some(rel))
 }
 
 /// Reject an ALTER of a system relation (id below the user band). The engine's
@@ -420,38 +413,8 @@ fn reject_system_relation(id: u64) -> Result<(), GnitzSqlError> {
     Ok(())
 }
 
-/// The RENAME target's new name (last part). A schema qualifier that differs from
-/// the source's schema is a cross-schema move — rejected (it would break qname
-/// bookkeeping and hidden-segment scoping).
-fn rename_target_name(target: &ObjectName, source_schema: &str) -> Result<String, GnitzSqlError> {
-    let parts: Vec<&str> = target
-        .0
-        .iter()
-        .filter_map(|p| p.as_ident())
-        .map(|i| i.value.as_str())
-        .collect();
-    match parts.as_slice() {
-        [n] => Ok((*n).to_string()),
-        [s, n] => {
-            if !s.eq_ignore_ascii_case(source_schema) {
-                return Err(GnitzSqlError::Unsupported(format!(
-                    "cross-schema RENAME is not supported (target schema '{s}' differs from '{source_schema}')"
-                )));
-            }
-            Ok((*n).to_string())
-        }
-        _ => Err(GnitzSqlError::Unsupported(
-            "RENAME TO: unsupported qualified name".to_string(),
-        )),
-    }
-}
-
 /// The `Altered` result — also the IF-EXISTS no-op success (nothing to alter,
 /// but the statement succeeds), carrying the intended name.
 fn altered(object: &str, name: String) -> SqlResult {
     SqlResult::Altered { object: object.to_string(), name }
-}
-
-fn missing(what: &str, schema: &str, name: &str) -> GnitzSqlError {
-    GnitzSqlError::Bind(format!("{what} '{schema}.{name}' does not exist"))
 }

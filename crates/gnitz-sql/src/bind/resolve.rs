@@ -2,7 +2,7 @@ use crate::ast_util::{
     classify_from, col_ref_parts, extract_table_name_and_alias, is_bare_wildcard_projection, FromShape,
 };
 use crate::error::GnitzSqlError;
-use gnitz_core::{CatalogSnapshot, ClientError, ColumnDef, GnitzClient, RelClass, RelDescriptor, Schema};
+use gnitz_core::{CatalogSnapshot, ColumnDef, GnitzClient, RelClass, RelDescriptor, Schema};
 use sqlparser::ast::{Ident, Select, SelectItem, TableAliasColumnDef};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -78,6 +78,13 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// The session schema every name this binder resolves is scoped to. Returned
+    /// at the binder's own lifetime, so a caller needing `&mut self` in the same
+    /// expression is not blocked by the borrow.
+    pub(crate) fn schema_name(&self) -> &'a str {
+        self.schema_name
+    }
+
     /// Bind in view-body mode: every relation this binder resolves becomes a
     /// source of a new view, so the leaf rule in [`Self::resolve`] applies. Set by
     /// `plan_view` for CREATE VIEW / ALTER VIEW.
@@ -119,15 +126,9 @@ impl<'a> Binder<'a> {
         let rel = cat
             .get(self.schema_name, name)
             .ok_or_else(|| GnitzSqlError::CatalogMiss(name.to_string()))?
-            .ok_or_else(|| {
-                // The classified variant, not prose: a binding raises a catchable
-                // class for an absent relation, and `resolve_relation` reports the
-                // same one for the same miss.
-                GnitzSqlError::Exec(ClientError::NotFound {
-                    noun: "table or view",
-                    name: gnitz_core::qualified_name(self.schema_name, name),
-                })
-            })?;
+            // Nothing server-side failed — the statement names a relation the
+            // catalog does not hold, which is the `Bind` class.
+            .ok_or_else(|| crate::error::missing_relation("Table or view", self.schema_name, name))?;
         let schema = Arc::clone(&rel.schema);
         // Leaf rule. A bounded view's store keeps only skeleton rows past its
         // capacity, and hydrating them replays *sources* — so a view over one
@@ -155,7 +156,8 @@ impl<'a> Binder<'a> {
     /// Resolve a write/index target that must be a base table: UPDATE, DELETE and
     /// CREATE INDEX all read stored rows back before writing, and a view's store is
     /// maintained solely by its circuit while a stream has none at all. `resolve`
-    /// (used by SELECT and view definitions) still accepts views.
+    /// (used by SELECT and view definitions) still accepts views. `op` is the
+    /// surface asking, so each names itself rather than listing all three.
     ///
     /// Same reserved-prefix rule as the read funnel, for the same reason: a write
     /// target naming a leading-`_` relation can only be a user reaching for system
@@ -167,15 +169,11 @@ impl<'a> Binder<'a> {
         &mut self,
         client: &mut GnitzClient,
         name: &str,
+        op: &str,
     ) -> Result<Arc<RelDescriptor>, GnitzSqlError> {
         crate::validate::validate_user_name(name)?;
         let rel = client.resolve_relation(self.schema_name, name)?;
-        if rel.class != RelClass::Table {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "'{name}' is a {}; UPDATE, DELETE and CREATE INDEX require a base table",
-                rel.class.noun()
-            )));
-        }
+        crate::validate::require_class(&rel, name, crate::validate::ClassWant::BaseTable, op)?;
         self.cache_relation(name, rel.tid, Arc::clone(&rel.schema), Arc::clone(&rel));
         Ok(rel)
     }
@@ -192,12 +190,7 @@ impl<'a> Binder<'a> {
     ) -> Result<Arc<RelDescriptor>, GnitzSqlError> {
         crate::validate::validate_user_name(name)?;
         let rel = client.resolve_relation(self.schema_name, name)?;
-        if rel.class.is_view() {
-            return Err(GnitzSqlError::Unsupported(format!(
-                "'{name}' is a {}; INSERT requires a base table or a stream",
-                rel.class.noun()
-            )));
-        }
+        crate::validate::require_class(&rel, name, crate::validate::ClassWant::BaseTableOrStream, "INSERT")?;
         Ok(rel)
     }
 
@@ -215,6 +208,18 @@ impl<'a> Binder<'a> {
         self.cache_relation(name, table_id, schema, desc);
         Ok(())
     }
+}
+
+/// The relation `name` resolves to in the statement's snapshot, `None` for a free
+/// name, and [`GnitzSqlError::CatalogMiss`] for one the snapshot has not probed —
+/// the signal `dispatch::plan_resolving` answers by resolving and re-running.
+pub(crate) fn probe(
+    cat: &CatalogSnapshot,
+    schema_name: &str,
+    name: &str,
+) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
+    cat.get(schema_name, name)
+        .ok_or_else(|| GnitzSqlError::CatalogMiss(name.to_string()))
 }
 
 /// Apply positional column aliases (`WITH d(a, b) AS …` / `(subquery) AS d(a, b)`
@@ -266,7 +271,7 @@ pub(crate) fn cte_passthrough(
     let FromShape::SinglePlainRelation(factor) = classify_from(&cte_select.from) else {
         return Ok(None);
     };
-    let (cte_table_name, cte_alias) = extract_table_name_and_alias(factor, "CTE")?;
+    let (cte_table_name, cte_alias) = extract_table_name_and_alias(factor, binder.schema_name(), "CTE")?;
     let (cte_tid, cte_schema, cte_kind) = binder.resolve(cat, &cte_table_name)?;
     // Positional identity projection: a *bare* `*`, or one identifier per source
     // column in order. A qualified identifier (`SELECT t.a FROM t`) is the same

@@ -102,6 +102,13 @@ pub(crate) fn unsupported_clause(context: &str, clause: &str) -> GnitzSqlError {
     GnitzSqlError::Unsupported(format!("{context}: {clause} is not supported"))
 }
 
+/// The one "this relation is not there" rejection — a disagreement with the
+/// catalog, hence [`GnitzSqlError::Bind`]. The name is reported **raw**: someone
+/// who wrote `MyTable` must be told about `MyTable`, not its folded spelling.
+pub(crate) fn missing_relation(noun: &str, schema: &str, name: &str) -> GnitzSqlError {
+    GnitzSqlError::Bind(format!("{noun} '{schema}.{name}' does not exist"))
+}
+
 /// [`unsupported_clause`] when `present`. A run of these reads as the table of
 /// clauses a statement does not honor, short-circuiting on the first present one.
 pub(crate) fn reject_if(present: bool, context: &str, clause: &str) -> Result<(), GnitzSqlError> {

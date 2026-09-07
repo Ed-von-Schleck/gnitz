@@ -22,6 +22,7 @@ mod test_support;
 mod types;
 mod validate;
 
+pub use ddl::{plan_create_table, TablePlan};
 pub use dml::{explain_lines, plan_read, ReadKind, ReadPlan};
 pub use error::GnitzSqlError;
 pub use hir::{plan_view, PlannedChain, ViewPlan};
@@ -91,13 +92,10 @@ impl<'a> SqlPlanner<'a> {
 
     /// Parse `sql` and execute each statement, returning one `SqlResult` per statement.
     ///
-    /// Each statement's catalog reads run against a **statement-scoped
-    /// snapshot**: the first read of each system table scans it over the wire
-    /// once, and every later read within the same statement's planning is
-    /// served from that in-memory copy (one relation resolution otherwise costs
-    /// 3-4 full-system-table wire scans, repeated per relation). The snapshot is
-    /// dropped at the end of each statement — one statement, one snapshot, no
-    /// cross-statement state — so the next statement sees this one's DDL writes.
+    /// Each statement plans against a **statement-scoped snapshot** memoising
+    /// relation resolves by qualified name, absent verdicts included. It is
+    /// dropped at the end of each statement, so the next one sees this one's DDL
+    /// writes.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<SqlResult>, GnitzSqlError> {
         let dialect = GenericDialect {};
         let stmts = Parser::parse_sql(&dialect, sql)?;

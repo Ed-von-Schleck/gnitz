@@ -77,14 +77,15 @@ pub fn ncol(name: &str, tc: TypeCode) -> ColumnDef {
     ColumnDef::new(name, tc, true)
 }
 
-/// A relation descriptor. `indexes` lists secondary indexes by column index.
-pub fn rel(
+/// A relation descriptor. `indexes` lists secondary indexes as
+/// `(column indices, is_unique)`.
+pub fn rel_with(
     tid: u64,
     class: RelClass,
     replicated: bool,
     columns: Vec<ColumnDef>,
     pk_cols: Vec<u32>,
-    indexes: &[&[u32]],
+    indexes: &[(&[u32], bool)],
 ) -> Arc<RelDescriptor> {
     Arc::new(RelDescriptor {
         tid,
@@ -95,13 +96,26 @@ pub fn rel(
         indexes: Arc::new(
             indexes
                 .iter()
-                .map(|cols| IndexMeta {
+                .map(|&(cols, is_unique)| IndexMeta {
                     cols: PkColList::from_slice(cols),
-                    is_unique: false,
+                    is_unique,
                 })
                 .collect(),
         ),
     })
+}
+
+/// [`rel_with`], every index non-unique — what a read plan cares about.
+pub fn rel(
+    tid: u64,
+    class: RelClass,
+    replicated: bool,
+    columns: Vec<ColumnDef>,
+    pk_cols: Vec<u32>,
+    indexes: &[&[u32]],
+) -> Arc<RelDescriptor> {
+    let indexes: Vec<(&[u32], bool)> = indexes.iter().map(|&c| (c, false)).collect();
+    rel_with(tid, class, replicated, columns, pk_cols, &indexes)
 }
 
 /// A plain, partitioned, unindexed base table.

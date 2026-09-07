@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::ast_util::{bind_constant, extract_name, object_name_ident, Constant};
+use crate::ast_util::{bind_constant, extract_object_name, object_name_ident, Constant};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_value_to_col, check_not_null};
 use crate::codec::pk_codec::PkPlan;
@@ -120,7 +120,7 @@ pub(crate) fn execute_insert(
 ) -> Result<SqlResult, GnitzSqlError> {
     reject_unhonored_insert_clauses(insert)?;
     // Extract table name, row source, ON CONFLICT action, and RETURNING clause.
-    let (table_name_str, rows, columns, on_insert, returning) = extract_insert_parts(insert)?;
+    let (table_name_str, rows, columns, on_insert, returning) = extract_insert_parts(insert, binder.schema_name())?;
 
     let target = binder.resolve_push_target(client, &table_name_str)?;
     let (tid, schema) = (target.tid, &target.schema);
@@ -609,9 +609,9 @@ type InsertParts<'a> = (
     Option<&'a [SelectItem]>,
 );
 
-fn extract_insert_parts(insert: &Insert) -> Result<InsertParts<'_>, GnitzSqlError> {
+fn extract_insert_parts<'a>(insert: &'a Insert, session_schema: &str) -> Result<InsertParts<'a>, GnitzSqlError> {
     let table_name = match &insert.table {
-        TableObject::TableName(obj_name) => extract_name(obj_name, "INSERT")?,
+        TableObject::TableName(obj_name) => extract_object_name(obj_name, session_schema, "INSERT")?,
         _ => {
             return Err(GnitzSqlError::Unsupported(
                 "INSERT with table function not supported".to_string(),

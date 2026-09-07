@@ -671,7 +671,7 @@ impl Session {
             Request::SeekByIndex { table_id, col_indices, key_vals } => {
                 // Both packers below assert their contracts, so the list and
                 // the arity are admitted here, in every build profile.
-                gnitz_wire::validate_pk_col_list(col_indices)
+                gnitz_wire::validate_pk_col_list(col_indices, gnitz_wire::PK_LIST_COL_LIMIT)
                     .map_err(|e| ClientError::ServerError(format!("seek_by_index: {e}")))?;
                 // K rides as the wire byte count, so an empty `key_vals` reads
                 // at the worker as one value `0`.

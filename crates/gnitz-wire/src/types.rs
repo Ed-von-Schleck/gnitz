@@ -590,6 +590,14 @@ pub const fn int_domain_fits(src: u8, target: u8) -> bool {
     }
 }
 
+/// Whether an FK child of type `child` may reference a parent of type `parent`:
+/// the same type, or a domain that fits inside it — exactly the precondition
+/// [`encode_pk_column_promoted`] needs, the parent slot never narrower than the
+/// value it must hold.
+pub const fn fk_child_fits(child: u8, parent: u8) -> bool {
+    child == parent || int_domain_fits(child, parent)
+}
+
 /// True iff `target` is a value-preserving *widening promotion* of `src` — the
 /// only type change a column copy performs (`widen_native_le` sign/zero-extends
 /// a narrower integer into a wider slot; there is no narrowing and no

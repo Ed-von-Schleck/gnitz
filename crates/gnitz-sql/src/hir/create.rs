@@ -6,8 +6,7 @@
 //! statement's clauses decided about a name already in use: create it, supersede
 //! what stands there, or leave it alone.
 
-use crate::bind::apply_positional_aliases;
-use crate::bind::Binder;
+use crate::bind::{apply_positional_aliases, probe, Binder};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::bind::ViewSurface;
 use crate::hir::chain::{debug_assert_exchange_topology, reject_circuit_column_overflow, ViewChain};
@@ -15,9 +14,8 @@ use crate::validate::{
     kv_options, reject_unhonored_create_view_clauses, reject_unhonored_query_clauses, validate_user_name, QueryEnvelope,
 };
 use crate::SqlResult;
-use gnitz_core::{CatalogSnapshot, GnitzClient, PlannedView, RelClass, RelDescriptor, Schema};
+use gnitz_core::{CatalogSnapshot, GnitzClient, PlannedView, RelClass, Schema};
 use sqlparser::ast::{CreateTableOptions, Ident, ObjectName, Query, Statement, Value, ValueWithSpan};
-use std::sync::Arc;
 
 /// Binary units accepted by a `WITH (<option> = '<uint><unit>')` size string.
 const SIZE_UNITS: [(&str, u64); 3] = [("KB", 1 << 10), ("MB", 1 << 20), ("GB", 1 << 30)];
@@ -166,14 +164,6 @@ pub struct PlannedChain {
     pub views: Vec<PlannedView>,
 }
 
-/// The relation `name` resolves to in the statement's snapshot, or `None` for a
-/// free name. Raises `CatalogMiss` for a name the snapshot has not probed, which
-/// is what drives `plan_resolving`'s resolve-and-re-run loop.
-fn probe(cat: &CatalogSnapshot, schema_name: &str, name: &str) -> Result<Option<Arc<RelDescriptor>>, GnitzSqlError> {
-    cat.get(schema_name, name)
-        .ok_or_else(|| GnitzSqlError::CatalogMiss(name.to_string()))
-}
-
 fn plan_create_view(
     cat: &CatalogSnapshot,
     schema_name: &str,
@@ -182,7 +172,7 @@ fn plan_create_view(
 ) -> Result<ViewPlan, GnitzSqlError> {
     reject_unhonored_create_view_clauses(cv)?;
     let query: &Query = &cv.query;
-    let view_name = crate::ast_util::extract_name(&cv.name, "CREATE VIEW")?;
+    let view_name = crate::ast_util::extract_object_name(&cv.name, schema_name, "CREATE VIEW")?;
     validate_user_name(&view_name)?;
 
     // Both clauses test the NAME, not the standing definition — a view's catalog
@@ -196,13 +186,16 @@ fn plan_create_view(
         None
     } else if cv.or_replace {
         match probe(cat, schema_name, &view_name)? {
-            Some(rel) if rel.class.is_view() => Some(rel.tid),
-            // Replacing a table would destroy its rows; `DROP TABLE` says that out loud.
             Some(rel) => {
-                return Err(GnitzSqlError::Unsupported(format!(
-                    "'{schema_name}.{view_name}' is a {}; CREATE OR REPLACE VIEW requires a view",
-                    rel.class.noun()
-                )))
+                // Replacing a table would destroy its rows; `DROP TABLE` says that
+                // out loud.
+                crate::validate::require_class(
+                    &rel,
+                    &format!("{schema_name}.{view_name}"),
+                    crate::validate::ClassWant::View,
+                    "CREATE OR REPLACE VIEW",
+                )?;
+                Some(rel.tid)
             }
             // A free name: `OR REPLACE` degenerates to a plain create.
             None => None,
@@ -245,7 +238,7 @@ fn plan_alter_view(
     query: &Query,
     binder: &mut Binder<'_>,
 ) -> Result<ViewPlan, GnitzSqlError> {
-    let view_name = crate::ast_util::extract_name(name, "ALTER VIEW")?;
+    let view_name = crate::ast_util::extract_object_name(name, schema_name, "ALTER VIEW")?;
     validate_user_name(&view_name)?;
 
     // Resolve the old vid; reject `ALTER VIEW <table>` and a missing relation.
@@ -375,14 +368,11 @@ fn resolve_view_id(cat: &CatalogSnapshot, schema_name: &str, name: &str) -> Resu
         Some(rel) if rel.delta => Err(GnitzSqlError::Unsupported(format!(
             "ALTER VIEW cannot retarget a view with a delta feed; DROP and CREATE '{name}' instead"
         ))),
-        Some(rel) if rel.class.is_view() => Ok(rel.tid),
-        Some(rel) => Err(GnitzSqlError::Unsupported(format!(
-            "'{name}' is a {}; ALTER VIEW requires a view (use ALTER TABLE)",
-            rel.class.noun()
-        ))),
-        None => Err(GnitzSqlError::Bind(format!(
-            "View '{schema_name}.{name}' does not exist"
-        ))),
+        Some(rel) => {
+            crate::validate::require_class(&rel, name, crate::validate::ClassWant::View, "ALTER VIEW")?;
+            Ok(rel.tid)
+        }
+        None => Err(crate::error::missing_relation("View", schema_name, name)),
     }
 }
 

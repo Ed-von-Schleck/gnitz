@@ -87,13 +87,33 @@ fn ident(name: &str) -> sqlparser::ast::Ident {
     sqlparser::ast::Ident::new(name)
 }
 
+/// An `ObjectName` for the target of a `REFERENCES` clause. The self-FK resolver
+/// never reads it — it takes the already-extracted name — but the site carries it.
+fn obj(name: &str) -> sqlparser::ast::ObjectName {
+    sqlparser::ast::ObjectName::from(vec![ident(name)])
+}
+
+/// The `REFERENCES` site `col_idx` declares against `tree`'s `referred`.
+fn site<'a>(
+    foreign_table: &'a sqlparser::ast::ObjectName,
+    referred: &'a [sqlparser::ast::Ident],
+    col_idx: usize,
+) -> FkSite<'a> {
+    FkSite {
+        col_idx,
+        foreign_table,
+        referred_columns: referred,
+    }
+}
+
 #[test]
 fn self_fk_resolves_to_the_self_target_not_a_table_id() {
     let cols = tree_cols();
     // `parent_id BIGINT REFERENCES tree(id)`. The table has no id yet, so the
     // planner names the target as the table being created; `col_tab_row`
     // substitutes the owner id.
-    let (fk, parent_type) = resolve_fk_target_inline(&cols, &[0], "tree", &[ident("id")], 1).unwrap();
+    let (fk, parent_type) =
+        resolve_fk_target_inline(&cols, &[0], "tree", &site(&obj("tree"), &[ident("id")], 1)).unwrap();
     assert_eq!(fk, FkTarget::SelfTable { col: 0 });
     assert_eq!(parent_type, TypeCode::I64);
 }
@@ -101,7 +121,7 @@ fn self_fk_resolves_to_the_self_target_not_a_table_id() {
 #[test]
 fn self_fk_omitted_column_list_defaults_to_the_lone_pk() {
     let cols = tree_cols();
-    let (fk, _) = resolve_fk_target_inline(&cols, &[0], "tree", &[], 1).unwrap();
+    let (fk, _) = resolve_fk_target_inline(&cols, &[0], "tree", &site(&obj("tree"), &[], 1)).unwrap();
     assert_eq!(fk, FkTarget::SelfTable { col: 0 });
 }
 
@@ -110,7 +130,7 @@ fn self_fk_column_referencing_itself_rejected() {
     let cols = tree_cols();
     // `id BIGINT PRIMARY KEY REFERENCES tree(id)` — a tautology, and its
     // child column would be a PK column, which the FK auto-index skips.
-    let err = resolve_fk_target_inline(&cols, &[0], "tree", &[ident("id")], 0).unwrap_err();
+    let err = resolve_fk_target_inline(&cols, &[0], "tree", &site(&obj("tree"), &[ident("id")], 0)).unwrap_err();
     match err {
         GnitzSqlError::Bind(m) => assert!(m.contains("must not be the referenced column itself"), "got: {m}"),
         e => panic!("expected Bind, got {e:?}"),
@@ -120,7 +140,7 @@ fn self_fk_column_referencing_itself_rejected() {
 #[test]
 fn self_fk_against_non_pk_column_rejected() {
     let cols = tree_cols();
-    let err = resolve_fk_target_inline(&cols, &[0], "tree", &[ident("tag")], 1).unwrap_err();
+    let err = resolve_fk_target_inline(&cols, &[0], "tree", &site(&obj("tree"), &[ident("tag")], 1)).unwrap_err();
     assert!(matches!(err, GnitzSqlError::Unsupported(_)), "got: {err:?}");
 }
 
@@ -128,10 +148,10 @@ fn self_fk_against_non_pk_column_rejected() {
 fn self_fk_against_compound_pk_rejected() {
     let cols = tree_cols();
     // Named column: it is a PK member, but not the *lone* PK.
-    let err = resolve_fk_target_inline(&cols, &[0, 1], "tree", &[ident("id")], 2).unwrap_err();
+    let err = resolve_fk_target_inline(&cols, &[0, 1], "tree", &site(&obj("tree"), &[ident("id")], 2)).unwrap_err();
     assert!(matches!(err, GnitzSqlError::Unsupported(_)), "got: {err:?}");
     // Omitted column list: there is no single default target.
-    let err = resolve_fk_target_inline(&cols, &[0, 1], "tree", &[], 2).unwrap_err();
+    let err = resolve_fk_target_inline(&cols, &[0, 1], "tree", &site(&obj("tree"), &[], 2)).unwrap_err();
     assert!(matches!(err, GnitzSqlError::Bind(_)), "got: {err:?}");
 }
 

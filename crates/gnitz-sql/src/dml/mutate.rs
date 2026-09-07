@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::ast_util::{classify_from, extract_name, extract_table_name_and_alias, FromShape};
+use crate::ast_util::{classify_from, extract_ident_name, extract_table_name_and_alias, FromShape};
 use crate::bind::{bind_single_table, find_unique_column, Binder};
 use crate::codec::colwrite::{append_column_value, check_not_null, set_target_admits, ColumnValue};
 use crate::codec::pk_codec::{bound_num_literal, pack_pk_value, NumLit};
@@ -165,7 +165,7 @@ pub(crate) fn eval_set_value(v: &SetValues<'_>, view: &ZSetBatchView<'_>, row: u
 
 fn extract_assignment_col_name(assignment: &Assignment, clause: &str) -> Result<String, GnitzSqlError> {
     match &assignment.target {
-        AssignmentTarget::ColumnName(obj_name) => extract_name(obj_name, clause),
+        AssignmentTarget::ColumnName(obj_name) => extract_ident_name(obj_name, clause),
         _ => Err(GnitzSqlError::Unsupported(format!(
             "only simple column assignments supported in {clause}"
         ))),
@@ -376,9 +376,9 @@ pub(crate) fn execute_update(
             "UPDATE: exactly one simple FROM table required".to_string(),
         ));
     };
-    let (table_name, table_alias) = extract_table_name_and_alias(factor, "UPDATE")?;
+    let (table_name, table_alias) = extract_table_name_and_alias(factor, binder.schema_name(), "UPDATE")?;
 
-    let target = binder.resolve_base_table(client, &table_name)?;
+    let target = binder.resolve_base_table(client, &table_name, "UPDATE")?;
     let (table_id, schema) = (target.tid, &target.schema);
 
     // Bind SET assignments; reject PK writes and duplicate columns.
@@ -446,9 +446,9 @@ pub(crate) fn execute_delete(
             "DELETE: exactly one simple FROM table required".to_string(),
         ));
     };
-    let (table_name, table_alias) = extract_table_name_and_alias(factor, "DELETE")?;
+    let (table_name, table_alias) = extract_table_name_and_alias(factor, binder.schema_name(), "DELETE")?;
 
-    let target = binder.resolve_base_table(client, &table_name)?;
+    let target = binder.resolve_base_table(client, &table_name, "DELETE")?;
     let (table_id, schema) = (target.tid, &target.schema);
 
     let where_expr = bind_where(schema, &table_alias, del.selection.as_ref())?;

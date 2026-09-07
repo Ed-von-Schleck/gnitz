@@ -272,17 +272,13 @@ impl CatalogEngine {
             entry.schema.columns[col.fk_col_idx as usize].type_code
         };
 
-        // Promote BOTH sides before comparing. `index_key_type` maps each
-        // ≤8-byte int to its index-key code (signed I8..I64 → I64, unsigned
-        // U8..U64 → U64) and is idempotent on the already-promoted widths.
-        // Comparing the promoted child against the parent's raw type_code would
-        // wrongly reject identical-type FKs once a narrower signed column
-        // promotes to I64.
-        let promoted = gnitz_wire::index_key_type(col.type_code)?;
-        let target_promoted = gnitz_wire::index_key_type(target_type)?;
-        if promoted != target_promoted {
+        // Domain fit, not promoted equality: the lone-PK probe encodes the child
+        // value into a slot of the parent's *raw* width, so an I64 child and an
+        // I32 parent promote alike and still have no slot to encode into.
+        if !gnitz_wire::fk_child_fits(col.type_code, target_type) {
             return Err(format!(
-                "FK type mismatch: promoted code {promoted} vs target {target_promoted}"
+                "FK type mismatch: child type code {} cannot reference target type code {target_type}",
+                col.type_code
             ));
         }
         Ok(())

@@ -214,7 +214,7 @@ fn resolve_table_factor(
         )?;
         return Ok((subtree, alias.name.value.clone(), cols));
     }
-    let (name, alias) = extract_table_name_and_alias(factor, cx.surface.stmt)?;
+    let (name, alias) = extract_table_name_and_alias(factor, cx.binder.schema_name(), cx.surface.stmt)?;
     let rel = resolve_relation(cx, &name)?;
     let cols = rel.cols();
     Ok((rel, alias, cols))
@@ -617,7 +617,7 @@ fn resolve_inner<'e>(cx: &mut SubCtx<'_, '_, '_>, subquery: &'e Query) -> Result
             "EXISTS/IN subquery: only a single FROM table without JOINs is supported; compose via views".into(),
         ));
     };
-    let (inner_name, inner_alias) = extract_table_name_and_alias(factor, "subquery")?;
+    let (inner_name, inner_alias) = extract_table_name_and_alias(factor, cx.cx.binder.schema_name(), "subquery")?;
     if outer_alias.eq_ignore_ascii_case(&inner_alias) {
         return Err(GnitzSqlError::Bind(format!(
             "relation alias '{outer_alias}' is used by both the view FROM and its subquery; rename one"
@@ -971,7 +971,7 @@ fn fold_join_step(
         JoinKeys::Using(cols) => {
             let mut names = Vec::with_capacity(cols.len());
             for c in *cols {
-                names.push(crate::ast_util::extract_name(c, "JOIN USING")?);
+                names.push(crate::ast_util::extract_ident_name(c, "JOIN USING")?);
             }
             crate::validate::reject_duplicate_names(names.iter().map(String::as_str), "JOIN USING")?;
             merge_pairs(scope, &rcols, &names, "USING")?

@@ -59,6 +59,17 @@ fn not_found(noun: &'static str, schema_name: &str, name: &str) -> ClientError {
     }
 }
 
+/// The row of `idx_batch` holding the live index named `name` (already canonical).
+/// Takes the scanned batch rather than owning the scan, so N names cost one scan.
+fn index_retraction(idx_batch: &ZSetBatch, name: &str) -> Result<Option<usize>, ClientError> {
+    for i in idx_batch.live_rows() {
+        if col_str(idx_batch, sys_schema(IDX_TAB), IDXTAB_COL_NAME, i)? == name {
+            return Ok(Some(i));
+        }
+    }
+    Ok(None)
+}
+
 /// Build the `-1` retraction batch for `pks`: the server's `retract_pk` matches
 /// by PK alone, so the payload columns are inert filler. Built directly rather
 /// than through `BatchAppender`, which has no way to take a whole `PkColumn`.
@@ -945,22 +956,6 @@ impl GnitzClient {
         self.session.seek_by_index(table_id, col_indices, key_vals)
     }
 
-    /// The secondary-index descriptor for `col_idx` of `table_id`, read off the
-    /// statement's resolved descriptor. The column list is unique per entry (the
-    /// server dedups circuits by list), so a plain `find` is exact.
-    ///
-    /// The reported uniqueness matches the server's authoritative pre-create FK
-    /// gate `validate_fk_column` exactly — both read `is_unique` off the same
-    /// `index_circuits` — so this check can never accept an FK the server would
-    /// reject, nor reject one it would accept.
-    pub fn index_for_column(&mut self, table_id: u64, col_idx: usize) -> Result<Option<IndexMeta>, ClientError> {
-        let list = Arc::clone(&self.describe_by_id(table_id)?.indexes);
-        // Exact single-element match: a composite index does NOT answer a
-        // single-column FK/uniqueness query (a `(a, b)` index does not guarantee
-        // uniqueness of `a` alone).
-        Ok(list.iter().find(|m| m.cols.as_slice() == [col_idx as u32]).copied())
-    }
-
     /// The statement's descriptor for `tid` — the by-id twin of [`Self::resolve`].
     /// A tid usually comes from resolving the same relation by name earlier in the
     /// statement, which makes this a scope hit; a tid from anywhere else falls back
@@ -995,7 +990,7 @@ impl GnitzClient {
         let index_name = gnitz_wire::canonical_identifier(index_name)?;
         // Arity, 7-bit column range, duplicates — the Err form of the
         // pack_pk_cols contract, so the pack below can never panic.
-        gnitz_wire::validate_pk_col_list(col_indices)
+        gnitz_wire::validate_pk_col_list(col_indices, gnitz_wire::PK_LIST_COL_LIMIT)
             .map_err(|e| ClientError::ServerError(format!("create_index: {e}")))?;
         if col_types.len() != col_indices.len() {
             return Err(ClientError::ServerError(
@@ -1035,40 +1030,44 @@ impl GnitzClient {
         Ok(index_id)
     }
 
-    /// Drop an index by name. `if_exists` is answered at this verb's own not-found
-    /// path — never by a pre-check, which would leave a window a concurrent DROP
-    /// could land in and resurface the "not found" it must suppress. Every drop
-    /// verb follows that rule. A DROP racing the push below still surfaces the
-    /// engine's retraction-contract rejection, `if_exists` or not.
-    pub fn drop_index_by_name(&mut self, index_name: &str, if_exists: bool) -> Result<(), ClientError> {
-        let index_name = gnitz_wire::canonical_identifier(index_name)?;
-        let missing = || -> Result<(), ClientError> {
-            if if_exists {
-                Ok(())
-            } else {
-                Err(ClientError::NotFound { noun: "index", name: index_name.clone() })
+    /// Drop indexes by name as **one** DDL zone: the whole set retires or none of
+    /// it does, and a name repeated in `index_names` retires once.
+    ///
+    /// `if_exists` is answered at this verb's own not-found path, never by a
+    /// pre-check: a pre-check leaves a window a concurrent DROP can land in and
+    /// resurface the "not found" it must suppress.
+    pub fn drop_indexes_by_name(&mut self, index_names: &[&str], if_exists: bool) -> Result<(), ClientError> {
+        let scanned = checked_sys_rows(IDX_TAB, self.session.scan(IDX_TAB)?)?;
+        let idx_schema = sys_schema(IDX_TAB);
+        let mut batch = ZSetBatch::new(idx_schema);
+        let mut retired: Vec<usize> = Vec::with_capacity(index_names.len());
+        for name in index_names {
+            let name = gnitz_wire::canonical_identifier(name)?;
+            let found = match &scanned {
+                Some(b) => index_retraction(b, &name)?.map(|i| (b, i)),
+                None => None,
+            };
+            match found {
+                Some((b, i)) => {
+                    // A repeated name retires once: the row is already in the batch.
+                    if !retired.contains(&i) {
+                        retired.push(i);
+                        batch.copy_row_at(b, i, -1, idx_schema);
+                    }
+                }
+                None if if_exists => {}
+                None => return Err(ClientError::NotFound { noun: "index", name }),
             }
-        };
-        let Some(idx_batch) = checked_sys_rows(IDX_TAB, self.session.scan(IDX_TAB)?)? else {
-            return missing();
-        };
-        for i in idx_batch.live_rows() {
-            if col_str(&idx_batch, sys_schema(IDX_TAB), IDXTAB_COL_NAME, i)? != index_name.as_str() {
-                continue;
-            }
-            let idx_schema = sys_schema(IDX_TAB);
-            let mut batch = ZSetBatch::new(idx_schema);
-            batch.copy_row_at(&idx_batch, i, -1, idx_schema);
-            self.push_ddl_txn(&[(IDX_TAB, batch)])?;
+        }
+        // Every name skipped: no zone, so no barrier and no fdatasync.
+        if batch.is_empty() {
             return Ok(());
         }
-        missing()
+        self.push_ddl_txn(&[(IDX_TAB, batch)])
     }
 
     /// `(id, name, indexed columns)` of every live secondary index. Names come back
-    /// canonical (lowercase), since `create_index`/`create_table` fold them at store
-    /// time. Reads the same slots `create_index` writes and `drop_index_by_name`
-    /// reads.
+    /// canonical (lowercase): every writer folds them at store time.
     pub fn index_rows(&mut self) -> Result<Vec<(u64, String, gnitz_wire::PkColList)>, ClientError> {
         let Some(idx_batch) = checked_sys_rows(IDX_TAB, self.session.scan(IDX_TAB)?)? else {
             return Ok(Vec::new());
@@ -1291,8 +1290,9 @@ impl GnitzClient {
     /// `unique_indexes` are the table's inline `UNIQUE` constraints, folded into
     /// the same atomic DDL bundle as `[COL_TAB, TABLE_TAB, IDX_TAB]` so a failure
     /// rolls the whole `CREATE` back — never a table left missing its unique
-    /// constraint. Pass an empty slice for a table with no inline UNIQUE — and always
-    /// for a stream, which only a base table's index owner check would admit.
+    /// constraint. Pass an empty slice for a table with no inline UNIQUE. A
+    /// stream owns no index: an IDX_TAB row naming one is refused by the engine's
+    /// index owner check, and the whole bundle with it.
     pub fn create_table(
         &mut self,
         schema_name: &str,
@@ -1366,8 +1366,7 @@ impl GnitzClient {
             // Structural rules only (arity, in-range, no duplicates) — unlike a
             // PK, an indexed column may be nullable. In-range against the actual
             // column list also keeps the `columns[c]` read below panic-free.
-            gnitz_wire::validate_pk_indices(spec.col_indices, columns.len()).map_err(|rule| {
-                let msg = rule.for_role(gnitz_wire::PkListRole::ColumnList);
+            gnitz_wire::validate_pk_col_list(spec.col_indices, columns.len()).map_err(|msg| {
                 ClientError::ServerError(format!("create_table: unique index '{}': {msg}", spec.name))
             })?;
             for &c in spec.col_indices {
@@ -1402,23 +1401,10 @@ impl GnitzClient {
         Ok(new_tid)
     }
 
-    pub fn drop_table(&mut self, schema_name: &str, table_name: &str, if_exists: bool) -> Result<(), ClientError> {
-        let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
-        let table_name = gnitz_wire::canonical_identifier(table_name)?;
-        let missing = || not_found("table", &schema_name, &table_name);
-        let Some(desc) = self.resolve(&schema_name, &table_name)? else {
-            return if if_exists { Ok(()) } else { Err(missing()) };
-        };
-        let tid = desc.tid;
-        let scanned = self.seek_sys_row(TABLE_TAB, tid)?.ok_or_else(missing)?;
-        let tbl_schema = sys_schema(TABLE_TAB);
-        let i = scanned.live_row_with_pk(tbl_schema, tid).ok_or_else(missing)?;
-
-        let mut tb = ZSetBatch::new(tbl_schema);
-        tb.copy_row_at(&scanned, i, -1, tbl_schema);
-        self.push_ddl_txn(&[(TABLE_TAB, tb)])?;
-
-        Ok(())
+    /// Drop tables as one DDL zone; the engine cascades each one's indexes off
+    /// their owner. See [`Self::drop_relations`] for the batch rules.
+    pub fn drop_table(&mut self, schema_name: &str, table_names: &[&str], if_exists: bool) -> Result<(), ClientError> {
+        self.drop_relations(TABLE_TAB, "table", schema_name, table_names, if_exists)
     }
 
     pub fn create_view(
@@ -1511,7 +1497,7 @@ impl GnitzClient {
         // engine cascades its segments off `owner_view_id`.
         let replaced = replace
             .then(|| {
-                self.view_retraction(&schema_name, &view_name)?
+                self.relation_retraction(VIEW_TAB, "view", &schema_name, &view_name)?
                     .ok_or_else(|| not_found("view", &schema_name, &view_name))
             })
             .transpose()?;
@@ -1601,28 +1587,50 @@ impl GnitzClient {
         Ok(vids)
     }
 
-    /// Drop a view. One `-1` on the user-named view; the internal segments it
-    /// owns are retracted by the engine's own cascade off `owner_view_id`, in the
-    /// same DDL zone, so the chain still retires atomically and the client never
-    /// names a segment.
-    ///
-    /// `if_exists` makes a missing view a no-op, under the same rule as
-    /// [`Self::drop_index_by_name`].
-    pub fn drop_view(&mut self, schema_name: &str, view_name: &str, if_exists: bool) -> Result<(), ClientError> {
-        let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
-        let view_name = gnitz_wire::canonical_identifier(view_name)?;
-        let Some((scanned, i)) = self.view_retraction(&schema_name, &view_name)? else {
-            return if if_exists {
-                Ok(())
-            } else {
-                Err(not_found("view", &schema_name, &view_name))
-            };
-        };
+    /// Drop views as one DDL zone; the engine cascades each one's hidden segments
+    /// off `owner_view_id`, so the client never names a segment. See
+    /// [`Self::drop_relations`] for the batch rules.
+    pub fn drop_view(&mut self, schema_name: &str, view_names: &[&str], if_exists: bool) -> Result<(), ClientError> {
+        self.drop_relations(VIEW_TAB, "view", schema_name, view_names, if_exists)
+    }
 
-        let view_s = sys_schema(VIEW_TAB);
-        let mut vb = ZSetBatch::new(view_s);
-        vb.copy_row_at(&scanned, i, -1, view_s);
-        self.push_ddl_txn(&[(VIEW_TAB, vb)])
+    /// Retire every named relation of `family` in **one** DDL zone: the whole set
+    /// goes or none does, and a name repeated in `names` retires once.
+    ///
+    /// `if_exists` answers a name that does not resolve, and nothing else: a name
+    /// that resolves to another family, a dependent view and an FK child outside
+    /// the batch all still fail the statement.
+    fn drop_relations(
+        &mut self,
+        family: u64,
+        noun: &'static str,
+        schema_name: &str,
+        names: &[&str],
+        if_exists: bool,
+    ) -> Result<(), ClientError> {
+        let schema_name = gnitz_wire::canonical_identifier(schema_name)?;
+        let s = sys_schema(family);
+        let mut batch = ZSetBatch::new(s);
+        let mut retired: Vec<u64> = Vec::with_capacity(names.len());
+        for name in names {
+            let name = gnitz_wire::canonical_identifier(name)?;
+            let Some((scanned, i)) = self.relation_retraction(family, noun, &schema_name, &name)? else {
+                if if_exists {
+                    continue;
+                }
+                return Err(not_found(noun, &schema_name, &name));
+            };
+            let id = scanned.pks.get(s, i) as u64;
+            if !retired.contains(&id) {
+                retired.push(id);
+                batch.copy_row_at(&scanned, i, -1, s);
+            }
+        }
+        // Every name skipped: no zone, so no barrier and no fdatasync.
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.push_ddl_txn(&[(family, batch)])
     }
 
     /// The `-1` batch retiring every live row of system family `family` whose
@@ -1642,22 +1650,23 @@ impl GnitzClient {
         Ok(out)
     }
 
-    /// The live VIEW_TAB row of `view_name` — the whole of what retiring it
-    /// retracts, since the engine cascades the segments off [`segment_name`]'s
-    /// ownership column. One master-local seek, not a scan; `Ok(None)` for a free
-    /// name, so no caller probes first.
-    fn view_retraction(
+    /// The live `family` row of `name`, by one master-local seek. `Ok(None)` is the
+    /// *resolve* miss alone; a name that resolves but holds no row in `family` —
+    /// `DROP TABLE <view>` — is the hard `not_found`.
+    fn relation_retraction(
         &mut self,
+        family: u64,
+        noun: &'static str,
         schema_name: &str,
-        view_name: &str,
+        name: &str,
     ) -> Result<Option<(ZSetBatch, usize)>, ClientError> {
-        let missing = || not_found("view", schema_name, view_name);
-        let Some(desc) = self.resolve(schema_name, view_name)? else {
+        let missing = || not_found(noun, schema_name, name);
+        let Some(desc) = self.resolve(schema_name, name)? else {
             return Ok(None);
         };
-        let scanned = self.seek_sys_row(VIEW_TAB, desc.tid)?.ok_or_else(missing)?;
+        let scanned = self.seek_sys_row(family, desc.tid)?.ok_or_else(missing)?;
         let i = scanned
-            .live_row_with_pk(sys_schema(VIEW_TAB), desc.tid)
+            .live_row_with_pk(sys_schema(family), desc.tid)
             .ok_or_else(missing)?;
         Ok(Some((scanned, i)))
     }

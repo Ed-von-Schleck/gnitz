@@ -171,7 +171,7 @@ impl PyGnitzClient {
     }
 
     pub fn drop_table(&mut self, py: Python<'_>, schema_name: &str, table_name: &str) -> PyResult<()> {
-        self.call(py, |c| c.drop_table(schema_name, table_name, false))
+        self.call(py, |c| c.drop_table(schema_name, &[table_name], false))
     }
 
     // ----- DML -----
@@ -237,7 +237,7 @@ impl PyGnitzClient {
     }
 
     pub fn drop_view(&mut self, py: Python<'_>, schema_name: &str, view_name: &str) -> PyResult<()> {
-        self.call(py, |c| c.drop_view(schema_name, view_name, false))
+        self.call(py, |c| c.drop_view(schema_name, &[view_name], false))
     }
 
     /// resolve_table(schema_name, table_name) -> (tid: int, schema: Schema)

@@ -17,8 +17,59 @@ pub(crate) fn object_name_ident(name: &sqlparser::ast::ObjectName) -> Option<&sq
     name.0.last().and_then(|p| p.as_ident())
 }
 
-/// Extract the last identifier name from an ObjectName.
-pub(crate) fn extract_name(name: &sqlparser::ast::ObjectName, context: &str) -> Result<String, GnitzSqlError> {
+/// An `ObjectName`'s parts as plain identifiers. `Err` when the name is empty or
+/// any part is not a plain identifier — the shape every extractor below rejects
+/// identically, before it classifies what a qualifier would have meant.
+fn object_name_parts<'a>(name: &'a sqlparser::ast::ObjectName, context: &str) -> Result<Vec<&'a str>, GnitzSqlError> {
+    let parts: Vec<&str> = name
+        .0
+        .iter()
+        .filter_map(|p| p.as_ident())
+        .map(|i| i.value.as_str())
+        .collect();
+    if parts.is_empty() || parts.len() != name.0.len() {
+        return Err(GnitzSqlError::Plan(format!("empty name in {context}")));
+    }
+    Ok(parts)
+}
+
+/// A schema-scoped catalog object (table, view). The active schema is a session
+/// parameter, never part of the statement, so a qualifier is accepted only when
+/// it names `session_schema`; anything else names a relation no gnitz statement
+/// can reach.
+pub(crate) fn extract_object_name(
+    name: &sqlparser::ast::ObjectName,
+    session_schema: &str,
+    context: &str,
+) -> Result<String, GnitzSqlError> {
+    match object_name_parts(name, context)?.as_slice() {
+        [n] => Ok((*n).to_string()),
+        [s, n] if s.eq_ignore_ascii_case(session_schema) => Ok((*n).to_string()),
+        [s, ..] => Err(GnitzSqlError::Unsupported(format!(
+            "{context}: cross-schema names are not supported \
+             (qualifier '{s}' is not the session schema '{session_schema}')"
+        ))),
+        // `object_name_parts` rejects the empty name, so this is 3+ parts.
+        _ => Err(GnitzSqlError::Unsupported(format!(
+            "{context}: '{name}' has too many name parts"
+        ))),
+    }
+}
+
+/// An index name, which is global rather than schema-scoped — so a qualifier
+/// would read as a scoping that does not exist, and is rejected.
+pub(crate) fn extract_index_name(name: &sqlparser::ast::ObjectName, context: &str) -> Result<String, GnitzSqlError> {
+    match object_name_parts(name, context)?.as_slice() {
+        [n] => Ok((*n).to_string()),
+        _ => Err(GnitzSqlError::Unsupported(format!(
+            "{context}: an index name takes no qualifier (index names are global, not schema-scoped)"
+        ))),
+    }
+}
+
+/// A column reference the parser handed over as an `ObjectName`: a qualifier here
+/// is `table.col`, so the column is the last part.
+pub(crate) fn extract_ident_name(name: &sqlparser::ast::ObjectName, context: &str) -> Result<String, GnitzSqlError> {
     object_name_ident(name)
         .map(|i| i.value.clone())
         .ok_or_else(|| GnitzSqlError::Plan(format!("empty name in {context}")))
@@ -629,10 +680,11 @@ pub(crate) fn classify_from(from: &[sqlparser::ast::TableWithJoins]) -> FromShap
 
 /// Extract `(relation name, effective alias)` from a plain-table FROM factor —
 /// the declared alias when present, else the name itself. The one acceptance
-/// point for a base-relation FROM factor: a qualifier left unrejected here is
-/// dropped, and the plain table scanned in its place.
+/// point for a base-relation FROM factor, so its name goes through
+/// [`extract_object_name`] like every other.
 pub(crate) fn extract_table_name_and_alias(
     tf: &sqlparser::ast::TableFactor,
+    session_schema: &str,
     context: &str,
 ) -> Result<(String, String), GnitzSqlError> {
     let sqlparser::ast::TableFactor::Table {
@@ -658,7 +710,7 @@ pub(crate) fn extract_table_name_and_alias(
     reject_if(!partitions.is_empty(), context, "PARTITION selection")?;
     reject_if(json_path.is_some(), context, "a JSON path on a table")?;
     reject_if(sample.is_some(), context, "TABLESAMPLE")?;
-    let table_name = extract_name(name, context)?;
+    let table_name = extract_object_name(name, session_schema, context)?;
     let alias = match alias {
         Some(a) => {
             let sqlparser::ast::TableAlias {

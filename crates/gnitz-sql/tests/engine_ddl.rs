@@ -13,9 +13,13 @@ use gnitz_sql::SqlResult;
 /// column carries no index.
 fn unique_on(client: &mut GnitzClient, sn: &str, table: &str, col: &str) -> Option<bool> {
     let (tid, schema) = client.resolve_table_id(sn, table).unwrap();
+    let want = [col_idx(&schema, col) as u32];
     client
-        .index_for_column(tid, col_idx(&schema, col))
+        .describe_by_id(tid)
         .unwrap()
+        .indexes
+        .iter()
+        .find(|m| m.cols.as_slice() == want)
         .map(|m| m.is_unique)
 }
 
@@ -389,7 +393,7 @@ fn alter_results_and_if_exists_no_ops() {
     exec(&mut client, &sn, "CREATE VIEW vw AS SELECT id, v FROM t WHERE v >= 20");
 
     assert_altered(&mut client, &sn, "ALTER TABLE t RENAME TO t2", "table", "t2");
-    assert_rejects_variant(&mut client, &sn, "SELECT * FROM t", "Exec", "not found");
+    assert_rejects_variant(&mut client, &sn, "SELECT * FROM t", "Bind", "does not exist");
     assert_eq!(
         view_rows(&mut client, &sn, "t2", &["id", "v"]),
         at_weight_one(&[vec![1, 10], vec![2, 20], vec![3, 30]])
@@ -573,6 +577,85 @@ fn alter_rejection_matrix() {
         ("ALTER TABLE t DROP COLUMN b", "Exec", "dependent view"),
         ("ALTER TABLE t ALTER COLUMN a DROP NOT NULL", "Exec", "dependent view"),
         ("INSERT INTO t VALUES (1, NULL, 1, 1)", "Bind", "NOT NULL"),
+    ] {
+        assert_rejects_variant(&mut client, &sn, sql, variant, needle);
+    }
+}
+
+// ── DROP ─────────────────────────────────────────────────────────────────────
+
+/// One `DROP` statement is one DDL zone: every name goes or none does, and the
+/// dependency guards see the whole batch.
+#[test]
+fn a_multi_name_drop_is_one_atomic_zone() {
+    let (_srv, mut client, sn) = boot(1);
+    for sql in [
+        "CREATE TABLE a (id BIGINT PRIMARY KEY)",
+        "CREATE TABLE b (id BIGINT PRIMARY KEY)",
+        "CREATE TABLE parent (id BIGINT PRIMARY KEY)",
+        "CREATE TABLE child (id BIGINT PRIMARY KEY, p BIGINT REFERENCES parent(id))",
+        "CREATE VIEW keeper AS SELECT id FROM b",
+    ] {
+        exec(&mut client, &sn, sql);
+    }
+
+    // `b` is read by a view, so its drop refuses — and `a` survives with it.
+    assert_rejects_variant(&mut client, &sn, "DROP TABLE a, b", "Exec", "View dependency");
+    assert!(client.resolve_table_id(&sn, "a").is_ok(), "a is untouched");
+
+    // Two `-1`s on one catalog PK is not a retraction the engine accepts.
+    assert_rejects_variant(&mut client, &sn, "DROP TABLE a, A", "Plan", "named more than once");
+
+    // A FK child co-dropped in the same batch is self-resolving, so the pair
+    // drops in either written order.
+    exec(&mut client, &sn, "DROP TABLE parent, child");
+    assert!(client.resolve_table_id(&sn, "parent").is_err());
+    assert!(client.resolve_table_id(&sn, "child").is_err());
+
+    exec(&mut client, &sn, "DROP VIEW keeper");
+    exec(&mut client, &sn, "DROP TABLE a, b");
+    assert!(client.resolve_table_id(&sn, "a").is_err());
+    assert!(client.resolve_table_id(&sn, "b").is_err());
+}
+
+/// A qualifier naming the session schema is accepted; any other is a cross-schema
+/// reference, and an index name — being global — takes none at all.
+#[test]
+fn a_name_qualifier_is_matched_not_dropped() {
+    let (_srv, mut client, sn) = boot(1);
+    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
+    // The same-schema spelling works on every name surface.
+    exec(&mut client, &sn, &format!("INSERT INTO {sn}.t VALUES (1, 10)"));
+    assert_eq!(
+        rows(&mut client, &sn, &format!("SELECT id FROM {sn}.t"), &["id"]),
+        vec![vec![1, 1]]
+    );
+    exec(
+        &mut client,
+        &sn,
+        &format!("CREATE VIEW {sn}.vw AS SELECT id FROM {sn}.t"),
+    );
+    exec(&mut client, &sn, &format!("DROP VIEW {sn}.vw"));
+
+    for (sql, variant, needle) in [
+        (
+            "CREATE TABLE other.x (id BIGINT PRIMARY KEY)",
+            "Unsupported",
+            "cross-schema",
+        ),
+        (
+            "CREATE TABLE fk (id BIGINT PRIMARY KEY, r BIGINT REFERENCES other.t(id))",
+            "Unsupported",
+            "cross-schema",
+        ),
+        ("SELECT id FROM other.t", "Unsupported", "cross-schema"),
+        ("INSERT INTO other.t VALUES (2, 20)", "Unsupported", "cross-schema"),
+        ("DROP TABLE other.t", "Unsupported", "cross-schema"),
+        ("CREATE INDEX ON other.t (v)", "Unsupported", "cross-schema"),
+        // An index name is global, so a qualifier on one scopes nothing.
+        ("CREATE INDEX other.ix ON t (v)", "Unsupported", "no qualifier"),
+        ("DROP INDEX other.ix", "Unsupported", "no qualifier"),
+        (&format!("DROP INDEX {sn}.ix"), "Unsupported", "no qualifier"),
     ] {
         assert_rejects_variant(&mut client, &sn, sql, variant, needle);
     }

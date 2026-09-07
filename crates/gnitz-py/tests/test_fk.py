@@ -291,7 +291,9 @@ class TestFkErrorCases:
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
-            with pytest.raises(gnitz.GnitzError, match="(?i)not found"):
+            # An unresolvable name is one rejection with one wording, whichever
+            # surface names it.
+            with pytest.raises(gnitz.GnitzError, match="(?i)does not exist"):
                 client.execute_sql(
                     "CREATE TABLE child ("
                     "  cid BIGINT NOT NULL PRIMARY KEY,"

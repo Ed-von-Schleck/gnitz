@@ -152,8 +152,9 @@ fn the_index_list_is_exact_across_create_and_drop() {
     assert!(!list[0].is_unique);
 
     exec(&mut client, &sn, "CREATE UNIQUE INDEX ix_a ON t(a)");
+    let list = Arc::clone(&client.describe_by_id(tid).unwrap().indexes);
     assert_eq!(
-        client.index_for_column(tid, 1).unwrap().map(|m| m.is_unique),
+        list.iter().find(|m| m.cols.as_slice() == [1]).map(|m| m.is_unique),
         Some(true)
     );
 

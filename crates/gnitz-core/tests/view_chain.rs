@@ -124,7 +124,7 @@ fn a_misordered_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
         assert_eq!(weighted_rows(&mut client, vid), base_at_weight_one(), "view {vid}");
     }
 
-    let err = client.drop_table(&sn, "base", false).unwrap_err().to_string();
+    let err = client.drop_table(&sn, &["base"], false).unwrap_err().to_string();
     assert!(err.contains("View dependency"), "got: {err}");
 
     // A rename is a net-live rewrite of the owner's row: the cascade must not fire.
@@ -134,11 +134,11 @@ fn a_misordered_bundle_backfills_cascades_on_drop_and_survives_a_rename() {
     assert_eq!(segs, vec![vids[0], vids[1]], "a rename keeps the owner's segments");
     assert_eq!(weighted_rows(&mut client, owner), base_at_weight_one());
 
-    client.drop_view(&sn, "renamed", false).unwrap();
+    client.drop_view(&sn, &["renamed"], false).unwrap();
     for &vid in &vids {
         assert!(client.describe_by_id(vid).is_err(), "view {vid} must be gone");
     }
-    client.drop_table(&sn, "base", false).unwrap();
+    client.drop_table(&sn, &["base"], false).unwrap();
 }
 
 #[test]

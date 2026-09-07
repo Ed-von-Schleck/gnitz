@@ -202,7 +202,7 @@ fn route_select<'q>(
 
     let limit = extract_limit(query)?;
     let offset = extract_offset(query)?;
-    let (table_name, table_alias) = extract_table_name_and_alias(from_factor, "FROM")?;
+    let (table_name, table_alias) = extract_table_name_and_alias(from_factor, binder.schema_name(), "FROM")?;
 
     // Step 5 — aggregate / DISTINCT shapes fold via the fold sink. DISTINCT takes
     // precedence over GROUP BY (its arm rejects GROUP BY), matching the view path.

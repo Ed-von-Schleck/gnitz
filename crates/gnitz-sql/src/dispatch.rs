@@ -170,7 +170,12 @@ pub(crate) fn execute_statement(
             client.txn_rollback()?;
             Ok(SqlResult::TransactionRolledBack)
         }
-        Statement::CreateTable(create) => ddl::execute_create_table(client, schema_name, create),
+        Statement::CreateTable(create) => {
+            let plan = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {
+                crate::plan_create_table(create, cat, schema_name)
+            })?;
+            ddl::execute_create_table(client, schema_name, plan)
+        }
         // The one statement whose clause rejections live in the router: sqlparser
         // gives `Drop` no payload struct, so `execute_drop` could destructure it
         // only by taking the whole `Statement` back.
@@ -202,7 +207,7 @@ pub(crate) fn execute_statement(
         Statement::CreateIndex(ci) => ddl::execute_create_index(client, schema_name, ci, &mut binder),
         Statement::Update(update) => dml::execute_update(client, update, &mut binder),
         Statement::Delete(del) => dml::execute_delete(client, del, &mut binder),
-        Statement::AlterTable(a) => ddl::execute_alter_table(client, schema_name, a, &mut binder),
+        Statement::AlterTable(a) => ddl::execute_alter_table(client, schema_name, a),
         Statement::AlterView { .. } => {
             let plan = plan_resolving(client, GnitzClient::resolve, schema_name, |cat| {
                 crate::plan_view(stmt, cat, schema_name)

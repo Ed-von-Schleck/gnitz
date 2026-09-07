@@ -524,7 +524,7 @@ fn a_circuit_row_naming_a_view_the_bundle_does_not_create_is_refused() {
     assert!(err.contains("does not create"), "{err}");
 
     // The table it named is still droppable, which is the whole point.
-    client.drop_table("phantomview", "t", false).unwrap();
+    client.drop_table("phantomview", &["t"], false).unwrap();
 }
 
 /// Two `+1` rows under one schema name both pass the cache check and both apply:

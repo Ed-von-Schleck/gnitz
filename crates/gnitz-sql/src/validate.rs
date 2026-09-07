@@ -17,7 +17,7 @@
 //! What a *surface* consumes is passed in — `HonoredClauses`, `QueryEnvelope`.
 
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
-use gnitz_core::{ColumnDef, TypeCode};
+use gnitz_core::{ColumnDef, RelClass, RelDescriptor, TypeCode};
 
 /// The column def of a *computed* projection item, from the expression's
 /// nominal type. One home for the three rules every computed column obeys, so
@@ -63,6 +63,13 @@ pub(crate) fn reject_duplicate_projection_names<'a>(
     reject_duplicate_column_names(cols, context)
 }
 
+/// The first name `names` repeats, folded case-insensitively as SQL identifiers
+/// are, and returned as the user spelled it at the repeat.
+fn first_duplicate<'a>(names: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    names.into_iter().find(|n| !seen.insert(n.to_ascii_lowercase()))
+}
+
 /// Raw-name form of [`reject_duplicate_column_names`], for surfaces that have
 /// only parser-AST names (CREATE TABLE — a freshly created column is never
 /// hidden; a base table gains a hidden slot only later, via DROP COLUMN).
@@ -70,28 +77,36 @@ pub(crate) fn reject_duplicate_names<'a>(
     names: impl Iterator<Item = &'a str>,
     context: &str,
 ) -> Result<(), GnitzSqlError> {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for name in names {
-        if !seen.insert(name.to_ascii_lowercase()) {
-            return Err(GnitzSqlError::Plan(format!(
-                "duplicate column name '{name}' in {context}"
-            )));
-        }
+    match first_duplicate(names) {
+        Some(name) => Err(GnitzSqlError::Plan(format!(
+            "duplicate column name '{name}' in {context}"
+        ))),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// Reject a statement naming the same catalog object twice — `DROP TABLE a, a`.
+/// The two retractions would land on one catalog PK, which the engine refuses in
+/// terms of the catalog rather than of the SQL the user wrote.
+pub(crate) fn reject_repeated_object<'a>(
+    names: impl Iterator<Item = &'a str>,
+    context: &str,
+) -> Result<(), GnitzSqlError> {
+    match first_duplicate(names) {
+        Some(name) => Err(GnitzSqlError::Plan(format!(
+            "{context}: '{name}' is named more than once"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Validate a user-supplied table/view/schema/index/constraint name: reject the
 /// empty string, a leading `_` (reserved for the engine's own internal relation
-/// and index names), and any character outside `[A-Za-z0-9_]`. CREATE
-/// TABLE/VIEW and DROP TABLE/VIEW all funnel through it right after
-/// `extract_name`, as do CREATE/DROP INDEX and the UNIQUE constraint names that
-/// become index names.
+/// and index names), and any character outside `[A-Za-z0-9_]`.
 ///
 /// The leading-`_` reservation is *policy* the engine cannot enforce for a
 /// relation or index name — it must accept exactly the rows it synthesizes
-/// itself (`_seg<vid>`, `make_fk_index_name`). It does enforce it for a schema
-/// name, which nothing synthesizes.
+/// itself. It does enforce it for a schema name, which nothing synthesizes.
 pub(crate) fn validate_user_name(name: &str) -> Result<(), GnitzSqlError> {
     gnitz_wire::validate_user_identifier(name).map_err(GnitzSqlError::Plan)
 }
@@ -168,6 +183,52 @@ pub(crate) fn non_key_eligible_error(name: &str, tc: TypeCode, role: &str) -> Gn
          ({role} must be a fixed-width integer, U128, or UUID column; \
          String, Blob, and float columns cannot be a {role} key)"
     ))
+}
+
+/// What a surface requires of the relation a name resolved to. The wording rides
+/// the variant, for the reason [`ColumnOptionSite`] gives.
+#[derive(Clone, Copy)]
+pub(crate) enum ClassWant {
+    /// A stored, writable base table.
+    BaseTable,
+    /// A base table or a stream — the INSERT target rule, the one surface a
+    /// storeless relation is a legal write target for.
+    BaseTableOrStream,
+    /// Any view, bounded or fed included.
+    View,
+}
+
+impl ClassWant {
+    fn accepts(self, class: RelClass) -> bool {
+        match self {
+            ClassWant::BaseTable => class == RelClass::Table,
+            ClassWant::BaseTableOrStream => !class.is_view(),
+            ClassWant::View => class.is_view(),
+        }
+    }
+
+    /// How the requirement names itself in a rejection.
+    fn noun(self) -> &'static str {
+        match self {
+            ClassWant::BaseTable => "a base table",
+            ClassWant::BaseTableOrStream => "a base table or a stream",
+            ClassWant::View => "a view",
+        }
+    }
+}
+
+/// Reject a relation of the wrong class for `op`. Takes the descriptor rather
+/// than resolving one: the resolve is surface-specific, the verdict on what came
+/// back is not.
+pub(crate) fn require_class(rel: &RelDescriptor, name: &str, want: ClassWant, op: &str) -> Result<(), GnitzSqlError> {
+    if want.accepts(rel.class) {
+        return Ok(());
+    }
+    Err(GnitzSqlError::Unsupported(format!(
+        "'{name}' is a {}; {op} requires {}",
+        rel.class.noun(),
+        want.noun()
+    )))
 }
 
 /// Reject a counted column list wider than the engine's column limit, before the

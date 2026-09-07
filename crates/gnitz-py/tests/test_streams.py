@@ -573,9 +573,9 @@ def test_the_ddl_and_dml_rejections_name_the_stream(client):
             "CREATE INDEX s_kind ON s (kind)",
             "CREATE UNIQUE INDEX s_kind_u ON s (kind)",
             "ALTER TABLE s ADD CONSTRAINT s_u UNIQUE (kind)",
-            # An inline UNIQUE reaches the engine as an IDX_TAB row in the CREATE
-            # bundle, so it is refused by the index owner check rather than by any
-            # stream-specific rule — and the whole bundle rolls back.
+            # An inline UNIQUE is refused by the planner's stream rule, which names
+            # the column; the engine's index owner check is the backstop, and
+            # rejects the whole CREATE bundle.
             "CREATE TABLE su (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, k BIGINT NOT NULL UNIQUE) "
             "WITH (stream = true)",
             "ALTER TABLE s ADD COLUMN extra BIGINT",

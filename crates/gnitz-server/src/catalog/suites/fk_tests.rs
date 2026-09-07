@@ -112,6 +112,41 @@ fn test_fk_invalid_targets() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// ── test_fk_narrowing_child_rejected ─────────────────────────────────
+
+/// I64 and I32 promote to the same index-key code, so a promoted-equality gate
+/// admitted the pair and the lone-PK probe then wrote 8 bytes into a 4-byte slot.
+#[test]
+fn test_fk_narrowing_child_rejected() {
+    let dir = temp_dir("fk_narrowing");
+    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+
+    let parent_tid = engine
+        .create_table("public.p", &[col_def("id", type_code::I32)], &[0])
+        .unwrap();
+
+    // I64 child → I32 parent: `index_key_type` maps both to I64, but the child's
+    // domain does not fit the parent's.
+    let narrowing = vec![
+        col_def("cid", type_code::I64),
+        fk_def("pid", type_code::I64, parent_tid, 0),
+    ];
+    let err = engine
+        .create_table("public.c_narrow", &narrowing, &[0])
+        .expect_err("a narrowing FK child must be refused");
+    assert!(err.contains("FK type mismatch"), "got: {err}");
+
+    // The widening direction the encoder handles correctly stays admitted.
+    let widening = vec![
+        col_def("cid", type_code::I64),
+        fk_def("pid", type_code::I16, parent_tid, 0),
+    ];
+    engine.create_table("public.c_wide", &widening, &[0]).unwrap();
+
+    engine.close();
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ── test_fk_self_reference ───────────────────────────────────────────
 
 #[test]

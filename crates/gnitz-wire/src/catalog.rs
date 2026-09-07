@@ -581,6 +581,9 @@ const PK_LIST_COUNT_BITS: u32 = 4;
 /// exclusive ceiling on a column index the list can carry.
 const PK_LIST_COL_BITS: u32 = 7;
 const PK_LIST_COL_MAX: u32 = (1 << PK_LIST_COL_BITS) - 1;
+/// The exclusive ceiling on a column index a packed list can carry — the bound a
+/// [`validate_pk_col_list`] caller passes when it holds no column count of its own.
+pub const PK_LIST_COL_LIMIT: usize = 1 << PK_LIST_COL_BITS;
 
 /// The PK-list arity rule: `1..=PK_LIST_MAX_COLS` columns. One predicate behind
 /// every spelling of it — the panicking constructors, the fallible decode, and
@@ -667,14 +670,17 @@ impl PkColList {
 
 /// The `Err`-returning form of [`pack_pk_cols`]' panicking contract, plus the
 /// no-duplicates rule both consumers (table PKs and index column lists) share:
-/// count in `1..=PK_LIST_MAX_COLS`, every index within the 7-bit field, no
-/// repeated column. Call this at user-input boundaries so `pack_pk_cols` and
+/// count in `1..=PK_LIST_MAX_COLS`, every index below `ncols`, no repeated
+/// column. Call this at user-input boundaries so `pack_pk_cols` and
 /// `PkColList::from_slice` can never panic downstream.
-pub fn validate_pk_col_list(cols: &[u32]) -> Result<(), String> {
-    // The rule itself is `validate_pk_indices`; the packed 7-bit field is this
-    // list's column-count bound. Only the wording differs — these lists are also
-    // secondary-index column lists, which "primary key ..." would misname.
-    crate::validate_pk_indices(cols, 1 << PK_LIST_COL_BITS).map_err(|rule| rule.for_role(crate::PkListRole::ColumnList))
+///
+/// `ncols` is the source relation's column count, or [`PK_LIST_COL_LIMIT`] — the
+/// packed field's own bound — for a caller that holds no column count.
+pub fn validate_pk_col_list(cols: &[u32], ncols: usize) -> Result<(), String> {
+    // The rule itself is `validate_pk_indices`. Only the wording differs — these
+    // lists are also secondary-index column lists, which "primary key ..." would
+    // misname.
+    crate::validate_pk_indices(cols, ncols).map_err(|rule| rule.for_role(crate::PkListRole::ColumnList))
 }
 
 /// Validate a `CLUSTER BY` column list against the table's PK, returning the
