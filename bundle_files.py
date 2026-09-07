@@ -13,8 +13,10 @@ Without -o the bundle is written to stdout.
 """
 
 import argparse
+import contextlib
 import os
 import sys
+import tempfile
 
 
 def display_path(p):
@@ -38,6 +40,29 @@ def read_text(path):
         return raw.decode("utf-8", errors="replace"), True
 
 
+def default_file_mode():
+    """The mode `open(path, "w")` would create — which `mkstemp`'s 0600 is not."""
+    mask = os.umask(0o077)
+    os.umask(mask)
+    return 0o666 & ~mask
+
+
+def write_atomically(path, write_body):
+    """Run `write_body(f)` into a temp file beside `path`, then rename over it, so
+    a write that dies partway leaves `path` as it was."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)),
+                               prefix=".bundle-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            write_body(f)
+        os.chmod(tmp, default_file_mode())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def bundle(entries, out):
     for i, (rel, text) in enumerate(entries):
         if i:
@@ -55,9 +80,8 @@ def main():
     ap.add_argument("-o", "--output", help="output file (default: stdout)")
     args = ap.parse_args()
 
-    # Opening the output truncates it, so an output that is also an input would
-    # be destroyed before it could be read. `realpath` rather than `samefile`:
-    # the output need not exist yet.
+    # Refuse to replace a file with a bundle of itself. `realpath` rather than
+    # `samefile`: the output need not exist yet.
     if args.output:
         out_real = os.path.realpath(args.output)
         clashing = [f for f in args.files if os.path.realpath(f) == out_real]
@@ -86,10 +110,9 @@ def main():
 
     if args.output:
         try:
-            with open(args.output, "w", encoding="utf-8") as out:
-                bundle(contents, out)
+            write_atomically(args.output, lambda f: bundle(contents, f))
         except OSError as e:
-            sys.exit(f"error: cannot write {e.filename or args.output}: {e.strerror}")
+            sys.exit(f"error: cannot write {args.output}: {e.strerror}")
         print(f"wrote {len(contents)} files to {args.output}", file=sys.stderr)
     else:
         bundle(contents, sys.stdout)
