@@ -2,8 +2,10 @@ use super::*;
 use crate::connection::{Interest, Reply, Request, Session};
 use crate::protocol::transport::{hello_handshake, poll_fd};
 use crate::test_support::{framed, reply_ctrl};
+use std::io::Read;
 use std::net::TcpListener;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 /// A `rustls::ServerConnection` over a loopback `TcpStream` on a helper
 /// thread: mints a self-signed cert, answers the HELLO with a real ACK so
@@ -93,7 +95,7 @@ impl Loopback {
 
     fn connect(&self) -> ClientTransport {
         let mut t = ClientTransport::connect(&self.target).unwrap();
-        hello_handshake(&mut t).unwrap();
+        hello_handshake(&mut t, Some(CONNECT_TIMEOUT)).unwrap();
         assert_eq!(t.max_payload_len(), gnitz_wire::MAX_FRAME_PAYLOAD_SERVER);
         t
     }
@@ -126,7 +128,7 @@ fn loopback_frame_split_across_two_records() {
         end.flush().unwrap();
     });
     let mut t = lb.connect();
-    assert_eq!(t.recv_framed().unwrap(), payload);
+    assert_eq!(t.recv_framed(None).unwrap(), payload);
     lb.join();
 }
 
@@ -201,7 +203,7 @@ fn loopback_large_reply_spanning_many_records_is_intact() {
     let lb = Loopback::start(move |mut end| write_frame(&mut end, &p));
     let mut t = lb.connect();
     set_sockopt_int(t.as_raw_fd(), libc::SO_RCVBUF, 256 * 1024);
-    assert_eq!(t.recv_framed().unwrap(), payload);
+    assert_eq!(t.recv_framed(None).unwrap(), payload);
     lb.join();
 }
 
@@ -260,17 +262,17 @@ fn loopback_deadline_over_tls_never_tears_a_frame() {
     });
     let mut t = lb.connect();
     set_sockopt_int(t.as_raw_fd(), libc::SO_SNDBUF, 16 * 1024);
-    t.set_deadline(Some(Duration::from_millis(100)));
+    let deadline = || Some(Instant::now() + Duration::from_millis(100));
     // The big frame is sent once; on expiry its remainder is queue state,
     // and the small frame that follows queues behind it.
-    let expired = match t.send_framed(&big) {
+    let expired = match t.send_framed(&big, deadline()) {
         Ok(()) => false,
         Err(ProtocolError::IoError(e)) if e.kind() == std::io::ErrorKind::WouldBlock => true,
         Err(e) => panic!("{e}"),
     };
     assert!(expired, "the deadline must have fired");
     loop {
-        match t.send_framed(b"after") {
+        match t.send_framed(b"after", deadline()) {
             Ok(()) => break,
             Err(ProtocolError::IoError(e)) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) => panic!("{e}"),
@@ -286,7 +288,7 @@ fn loopback_established_connection_idle_past_connect_timeout_still_reads() {
         write_frame(&mut end, b"still here");
     });
     let mut t = lb.connect();
-    assert_eq!(t.recv_framed().unwrap(), b"still here");
+    assert_eq!(t.recv_framed(None).unwrap(), b"still here");
     lb.join();
 }
 
@@ -299,7 +301,7 @@ fn loopback_silent_peer_fails_the_hello_at_the_deadline_once() {
     let mut t = ClientTransport::connect(&lb.target).unwrap();
     let t0 = std::time::Instant::now();
     assert!(matches!(
-        hello_handshake(&mut t),
+        hello_handshake(&mut t, Some(CONNECT_TIMEOUT)),
         Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock
     ));
     let took = t0.elapsed();
@@ -319,9 +321,9 @@ fn loopback_clean_close_notify_surfaces_as_eof() {
         end.flush().unwrap();
     });
     let mut t = lb.connect();
-    assert_eq!(t.recv_framed().unwrap(), b"last");
+    assert_eq!(t.recv_framed(None).unwrap(), b"last");
     assert!(
-        matches!(t.recv_framed(), Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof)
+        matches!(t.recv_framed(None), Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof)
     );
     lb.join();
 }

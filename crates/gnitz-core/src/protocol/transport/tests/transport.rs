@@ -8,19 +8,20 @@ fn set_nonblocking(fd: &OwnedFd) {
 }
 
 fn parts(bytes: &[u8]) -> MessageParts {
-    MessageParts {
-        ctrl: bytes.to_vec(),
-        schema: None,
-        data: Vec::new(),
-    }
+    MessageParts::single(bytes.to_vec())
+}
+
+/// A deadline `d` from now, for the blocking wrappers.
+fn deadline(d: Duration) -> Option<Instant> {
+    Some(Instant::now() + d)
 }
 
 #[test]
 fn test_transport_loopback() {
     let (mut a, mut b) = make_transport_pair();
     let data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
-    a.send_framed_iov(&[&data]).unwrap();
-    let received = b.recv_framed().unwrap();
+    a.send_parts(parts(&data), None).unwrap();
+    let received = b.recv_framed(None).unwrap();
     assert_eq!(&received[..], &data[..]);
 }
 
@@ -28,19 +29,27 @@ fn test_transport_loopback() {
 fn test_transport_medium() {
     let (mut a, mut b) = make_transport_pair();
     let data: Vec<u8> = (0u8..=255).cycle().take(64 * 1024).collect();
-    let reader = std::thread::spawn(move || b.recv_framed().unwrap());
-    a.send_framed_iov(&[&data]).unwrap();
+    let reader = std::thread::spawn(move || b.recv_framed(None).unwrap());
+    a.send_parts(parts(&data), None).unwrap();
     assert_eq!(reader.join().unwrap(), data);
 }
 
 #[test]
-fn test_send_framed_iov_multi_buf() {
+fn test_send_parts_multi_segment() {
     let (mut a, mut b) = make_transport_pair();
     let part1 = b"hello ";
     let part2 = b"world";
     let part3: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
-    a.send_framed_iov(&[&part1[..], &part2[..], &part3]).unwrap();
-    let received = b.recv_framed().unwrap();
+    a.send_parts(
+        MessageParts {
+            ctrl: part1.to_vec(),
+            schema: part2.to_vec(),
+            data: part3.clone(),
+        },
+        None,
+    )
+    .unwrap();
+    let received = b.recv_framed(None).unwrap();
     let mut expected = Vec::new();
     expected.extend_from_slice(part1);
     expected.extend_from_slice(part2);
@@ -49,11 +58,19 @@ fn test_send_framed_iov_multi_buf() {
 }
 
 #[test]
-fn test_send_framed_iov_empty_bufs_skipped() {
+fn test_send_parts_empty_segments_skipped() {
     let (mut a, mut b) = make_transport_pair();
     let data = b"payload";
-    a.send_framed_iov(&[&[], &data[..], &[]]).unwrap();
-    assert_eq!(&b.recv_framed().unwrap()[..], &data[..]);
+    a.send_parts(
+        MessageParts {
+            ctrl: Vec::new(),
+            schema: data.to_vec(),
+            data: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(&b.recv_framed(None).unwrap()[..], &data[..]);
 }
 
 #[test]
@@ -62,7 +79,7 @@ fn test_recv_framed_payload_too_large() {
     let mut b = ClientTransport::from_unix_fd(fd_b);
     let huge: u32 = (gnitz_wire::MAX_FRAME_PAYLOAD_PRE_HANDSHAKE + 1) as u32;
     raw_send(&a, &huge.to_le_bytes());
-    let result = b.recv_framed();
+    let result = b.recv_framed(None);
     assert!(matches!(result, Err(ProtocolError::DecodeError(ref s)) if s.contains("exceeds maximum")));
 }
 
@@ -76,7 +93,7 @@ fn test_recv_framed_enforces_negotiated_limit() {
     assert_eq!(b.max_payload_len(), small_limit);
     raw_send(&a, &((small_limit + 1) as u32).to_le_bytes());
     // The header is refused before any payload is asked for.
-    let result = b.recv_framed();
+    let result = b.recv_framed(None);
     assert!(matches!(result, Err(ProtocolError::DecodeError(ref s)) if s.contains("exceeds maximum")));
 }
 
@@ -94,29 +111,27 @@ fn test_pre_handshake_ceiling_admits_status_error_and_refuses_above() {
         super::super::message::encode_control_block(&hdr, "unsupported wire version: peer=65535, server=65535", &[]);
     assert!(err.len() <= gnitz_wire::MAX_FRAME_PAYLOAD_PRE_HANDSHAKE);
     raw_send(&a, &framed(&err));
-    assert_eq!(b.recv_framed().unwrap(), err);
+    assert_eq!(b.recv_framed(None).unwrap(), err);
     raw_send(
         &a,
         &((gnitz_wire::MAX_FRAME_PAYLOAD_PRE_HANDSHAKE + 1) as u32).to_le_bytes(),
     );
-    assert!(matches!(b.recv_framed(), Err(ProtocolError::DecodeError(_))));
+    assert!(matches!(b.recv_framed(None), Err(ProtocolError::DecodeError(_))));
 }
 
 /// Spawn a reader thread that pulls exactly `count` frames off `t`.
 fn spawn_reader(mut t: ClientTransport, count: usize) -> std::thread::JoinHandle<Vec<Vec<u8>>> {
-    std::thread::spawn(move || (0..count).map(|_| t.recv_framed().unwrap()).collect())
+    std::thread::spawn(move || (0..count).map(|_| t.recv_framed(None).unwrap()).collect())
 }
 
 #[test]
-fn test_send_framed_iov_empty_returns_invalid_input() {
-    // No slices, and all-empty slices, both sum to 0 → rejected so the
-    // close sentinel can never be emitted by this path.
+fn test_send_parts_empty_returns_invalid_input() {
+    // Every segment empty sums to 0 → rejected so the close sentinel can never
+    // be emitted by this path.
     let (mut a, _b) = make_transport_pair();
-    let r0 = a.send_framed_iov(&[]);
-    let r1 = a.send_framed_iov(&[&[][..], &[][..]]);
-    assert!(matches!(r0, Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput));
-    assert!(matches!(r1, Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput));
-    assert_eq!(a.frames_sent(), 0, "a rejected frame is not counted");
+    let r = a.send_parts(MessageParts::single(Vec::new()), None);
+    assert!(matches!(r, Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::InvalidInput));
+    assert!(!a.wants_write(), "a rejected frame leaves nothing queued");
 }
 
 #[test]
@@ -158,7 +173,7 @@ fn test_queue_single_frame() {
     let data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
     let reader = spawn_reader(b, 1);
     a.enqueue(parts(&data)).unwrap();
-    a.flush_blocking().unwrap();
+    a.flush_blocking(None).unwrap();
     drop(a);
     let frames = reader.join().unwrap();
     assert_eq!(frames, vec![data]);
@@ -173,8 +188,7 @@ fn test_queue_many_small_frames_in_order() {
     for f in &expected {
         a.enqueue(parts(f)).unwrap();
     }
-    assert_eq!(a.frames_sent(), n as u64, "counted on enqueue, once per frame");
-    a.flush_blocking().unwrap();
+    a.flush_blocking(None).unwrap();
     drop(a);
     assert_eq!(reader.join().unwrap(), expected);
 }
@@ -190,7 +204,7 @@ fn test_queue_forces_multiple_writev() {
     for f in &expected {
         a.enqueue(parts(f)).unwrap();
     }
-    a.flush_blocking().unwrap();
+    a.flush_blocking(None).unwrap();
     drop(a);
     assert_eq!(reader.join().unwrap(), expected);
 }
@@ -232,10 +246,9 @@ fn test_send_timeout_leaves_cursor_and_resumes_mid_frame() {
     // parses — that frame and the one sent after it, both intact.
     let (mut a, b) = make_transport_pair();
     set_sockopt_int(a.as_raw_fd(), libc::SO_SNDBUF, 4096);
-    a.set_deadline(Some(Duration::from_millis(100)));
     let big: Vec<u8> = (0u8..=255).cycle().take(300 * 1024).collect();
     a.enqueue(parts(&big)).unwrap();
-    let r = a.flush_blocking();
+    let r = a.flush_blocking(deadline(Duration::from_millis(100)));
     assert!(
         matches!(r, Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock),
         "expiry must surface as WouldBlock"
@@ -248,7 +261,7 @@ fn test_send_timeout_leaves_cursor_and_resumes_mid_frame() {
     // Now the peer drains; the caller re-enters exactly as
     // `eviction_observed_within` does.
     loop {
-        match a.flush_blocking() {
+        match a.flush_blocking(deadline(Duration::from_millis(100))) {
             Ok(()) => break,
             Err(ProtocolError::IoError(e)) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) => panic!("{e}"),
@@ -264,14 +277,13 @@ fn test_send_framed_timeout_keeps_the_tail_queued() {
     // tail stays queue state, and the next send finishes it first.
     let (mut a, b) = make_transport_pair();
     set_sockopt_int(a.as_raw_fd(), libc::SO_SNDBUF, 4096);
-    a.set_deadline(Some(Duration::from_millis(100)));
     let big: Vec<u8> = (0u8..=255).cycle().take(200 * 1024).collect();
-    let r = a.send_framed_iov(&[&big]);
+    let r = a.send_parts(parts(&big), deadline(Duration::from_millis(100)));
     assert!(matches!(r, Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock));
     assert!(a.wants_write());
     let reader = spawn_reader(b, 2);
     loop {
-        match a.send_framed(b"probe") {
+        match a.send_framed(b"probe", deadline(Duration::from_millis(100))) {
             Ok(()) => break,
             Err(ProtocolError::IoError(e)) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) => panic!("{e}"),
@@ -288,15 +300,14 @@ fn test_send_timeout_peer_never_drains_parses_no_torn_frame() {
     // then EOF, never a frame whose length swallowed a later one.
     let (mut a, b) = make_transport_pair();
     set_sockopt_int(a.as_raw_fd(), libc::SO_SNDBUF, 4096);
-    a.set_deadline(Some(Duration::from_millis(50)));
     let big: Vec<u8> = vec![7u8; 400 * 1024];
     a.enqueue(parts(&big)).unwrap();
-    assert!(a.flush_blocking().is_err());
-    assert!(a.flush_blocking().is_err());
+    assert!(a.flush_blocking(deadline(Duration::from_millis(50))).is_err());
+    assert!(a.flush_blocking(deadline(Duration::from_millis(50))).is_err());
     drop(a);
     let mut b = b;
     assert!(
-        matches!(b.recv_framed(), Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof)
+        matches!(b.recv_framed(None), Err(ProtocolError::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof)
     );
 }
 
@@ -309,7 +320,7 @@ fn test_hello_handshake_clamps_server_limit() {
     raw_send(&b, &ack);
     let mut t = ClientTransport::from_unix_fd(a);
     assert_eq!(t.max_payload_len(), gnitz_wire::MAX_FRAME_PAYLOAD_PRE_HANDSHAKE);
-    hello_handshake(&mut t).unwrap();
+    hello_handshake(&mut t, None).unwrap();
     assert_eq!(t.max_payload_len(), gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT);
 }
 
@@ -321,7 +332,7 @@ fn test_hello_handshake_preserves_smaller_limit() {
     let ack = gnitz_wire::encode_hello_ack(small, 7);
     raw_send(&b, &ack);
     let mut t = ClientTransport::from_unix_fd(a);
-    let lsn = hello_handshake(&mut t).unwrap();
+    let lsn = hello_handshake(&mut t, None).unwrap();
     assert_eq!(t.max_payload_len(), small as usize);
     assert_eq!(lsn, 7, "the ACK's published_lsn seeds the client basis");
 }
@@ -330,10 +341,10 @@ fn test_hello_handshake_preserves_smaller_limit() {
 fn test_client_transport_unix_roundtrip() {
     let (mut a, mut b) = make_transport_pair();
     let data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
-    a.send_framed(&data).unwrap();
-    assert_eq!(b.recv_framed().unwrap(), data);
-    b.send_framed_iov(&[&data]).unwrap();
-    assert_eq!(a.recv_framed().unwrap(), data);
+    a.send_framed(&data, None).unwrap();
+    assert_eq!(b.recv_framed(None).unwrap(), data);
+    b.send_parts(parts(&data), None).unwrap();
+    assert_eq!(a.recv_framed(None).unwrap(), data);
 }
 
 #[test]
@@ -504,6 +515,6 @@ fn test_nonblocking_established_transport_reads_after_idle() {
         raw_send(&peer, &framed(b"late"));
         peer
     });
-    assert_eq!(t.recv_framed().unwrap(), b"late");
+    assert_eq!(t.recv_framed(None).unwrap(), b"late");
     drop(h.join().unwrap());
 }

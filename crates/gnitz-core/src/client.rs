@@ -422,7 +422,7 @@ impl GnitzClient {
         }
     }
 
-    /// Request frames this connection has written. Exposed for the
+    /// Requests this connection has submitted. Exposed for the
     /// round-trip-count assertions; see [`Session::requests_sent`].
     pub fn requests_sent(&self) -> u64 {
         self.session.requests_sent()

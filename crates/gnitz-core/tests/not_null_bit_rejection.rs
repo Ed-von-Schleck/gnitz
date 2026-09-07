@@ -27,8 +27,8 @@ use gnitz_test_harness::{unique_schema, ServerHandle};
 /// peer, so it needs no spine at all.
 fn hostile_push(t: &mut ClientTransport, tid: u64, schema: &Schema, batch: &ZSetBatch) -> Result<u64, String> {
     let parts = encode_message_parts(tid, 0xB0BA, FLAG_PUSH, 0, &[], 0, Some((schema, batch)));
-    t.send_framed_iov(&parts.segments()).map_err(|e| e.to_string())?;
-    let buf = t.recv_framed().map_err(|e| e.to_string())?;
+    t.send_parts(parts, None).map_err(|e| e.to_string())?;
+    let buf = t.recv_framed(None).map_err(|e| e.to_string())?;
     let (msg, _) = parse_response(&buf, None).map_err(|e| e.to_string())?;
     match msg.error_text {
         Some(text) => Err(text),
@@ -68,7 +68,7 @@ fn a_null_bit_on_a_not_null_column_is_rejected_at_the_client_boundary() {
     // pre-encoded frame written straight to the socket is what walks past the
     // validator.
     let mut raw = ClientTransport::connect(srv.sock_path()).unwrap();
-    hello_handshake(&mut raw).unwrap();
+    hello_handshake(&mut raw, None).unwrap();
 
     // The same rows, unmodified, are accepted — so the rejection below is about
     // the bit and nothing else.

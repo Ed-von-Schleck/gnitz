@@ -25,6 +25,9 @@ pub const MAX_FRAME_PAYLOAD_PRE_HANDSHAKE: usize = 4 * 1024;
 /// that carries one: the client socket stream (`recv_framed` and its senders),
 /// the reactor's header recv, and the W2M ring slot the master forwards to a
 /// client verbatim. A `u32` LE count of the payload bytes that follow.
+///
+/// Zero is the **close sentinel**, never an empty frame: a reader that decodes
+/// one treats the stream as closed, so no sender may emit one.
 pub const FRAME_LEN_PREFIX_BYTES: usize = 4;
 
 // ---------------------------------------------------------------------------

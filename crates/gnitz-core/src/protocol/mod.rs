@@ -6,7 +6,7 @@ pub mod codec;
 pub mod error;
 pub mod message;
 pub mod regions;
-pub mod transport;
+pub(crate) mod transport;
 pub mod types;
 pub mod wal_block;
 
@@ -33,7 +33,13 @@ pub use message::{
 };
 pub(crate) use message::{encode_control_frame, parse_response_frame};
 pub use regions::ZSetBatchView;
+// Only the `integration` suite drives a raw transport from outside; a shipped
+// build keeps it crate-private. The cfgs are complementary because two `use`
+// statements binding one name is `E0252` whatever their visibility.
+#[cfg(any(test, feature = "integration"))]
 pub use transport::{hello_handshake, ClientTransport};
+#[cfg(not(any(test, feature = "integration")))]
+pub(crate) use transport::{hello_handshake, ClientTransport};
 pub use types::{
     native_le_key, native_packed_key, opk_key_cols, opk_key_packed, push_zero_cell, BatchAppender, ColumnDef, FixedInt,
     FkTarget, PkBuf, PkColumn, ReduceOutKey, ScalarKind, Schema, TypeCode, ZSetBatch, MAX_PK_BYTES, PK_LIST_MAX_COLS,

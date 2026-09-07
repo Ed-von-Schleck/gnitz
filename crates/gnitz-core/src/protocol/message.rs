@@ -88,26 +88,42 @@ pub fn decode_control_block(data: &[u8]) -> Result<(Header, String, Vec<u8>), Pr
 /// instead of flattening into one contiguous buffer.
 pub struct MessageParts {
     pub ctrl: Vec<u8>,
-    pub schema: Option<Vec<u8>>,
+    /// Empty when the frame carries no schema block, as for `data`. A block
+    /// that is present is never empty: it always carries a WAL header.
+    pub schema: Vec<u8>,
     pub data: Vec<u8>,
 }
 
 impl MessageParts {
+    /// One block as a whole frame: no schema, no data. What a control-only
+    /// verb and every pre-encoded transaction payload are queued as.
+    pub fn single(ctrl: Vec<u8>) -> Self {
+        MessageParts {
+            ctrl,
+            schema: Vec::new(),
+            data: Vec::new(),
+        }
+    }
+
     /// The blocks in wire order, for a vectored send. Empty segments are
     /// skipped by the transport.
     pub fn segments(&self) -> [&[u8]; 3] {
-        [&self.ctrl, self.schema.as_deref().unwrap_or(&[]), &self.data]
+        [&self.ctrl, &self.schema, &self.data]
+    }
+
+    /// The frame's payload length: the segments summed.
+    pub fn byte_len(&self) -> usize {
+        self.segments().iter().map(|s| s.len()).sum()
     }
 
     /// Flatten into one contiguous payload. Tests use this to inspect a frame
     /// the send path would hand to a vectored write unflattened.
     #[cfg(test)]
     pub fn to_vec(&self) -> Vec<u8> {
-        let [a, b, c] = self.segments();
-        let mut out = Vec::with_capacity(a.len() + b.len() + c.len());
-        out.extend_from_slice(a);
-        out.extend_from_slice(b);
-        out.extend_from_slice(c);
+        let mut out = Vec::with_capacity(self.byte_len());
+        for s in self.segments() {
+            out.extend_from_slice(s);
+        }
         out
     }
 }
@@ -128,12 +144,12 @@ fn encode_parts(
     seek_pk: u128,
     seek_col_idx: u64,
     seek_pk_extra: &[u8],
-    schema_block: Option<Vec<u8>>,
+    schema_block: Vec<u8>,
     data: Option<(&Schema, &ZSetBatch)>,
 ) -> MessageParts {
     let data = data.filter(|(_, b)| !b.is_empty());
     let mut flags_out = flags;
-    if schema_block.is_some() {
+    if !schema_block.is_empty() {
         flags_out |= FLAG_HAS_SCHEMA;
     }
     if data.is_some() {
@@ -156,7 +172,8 @@ fn encode_parts(
 }
 
 /// Encode a request/response carrying `schema` in the frame. Pass the parts to
-/// `send_framed_iov`, or hand them to the outbound queue, for framing.
+/// `ClientTransport::send_parts`, or hand them to the outbound queue, for
+/// framing.
 ///
 /// `seek_pk` / `seek_pk_extra` carry the seek key for `FLAG_SEEK` /
 /// `FLAG_SEEK_BY_INDEX` frames, already in the wire's two-field form
@@ -181,7 +198,7 @@ pub fn encode_message_parts(
         seek_pk,
         seek_col_idx,
         seek_pk_extra,
-        data.map(|(s, _)| encode_schema_block(s, target_id as u32)),
+        data.map_or_else(Vec::new, |(s, _)| encode_schema_block(s, target_id as u32)),
         data,
     )
 }
@@ -205,7 +222,7 @@ pub fn encode_message_noschema_parts(
         0,
         0,
         &[],
-        None,
+        Vec::new(),
         Some((data_schema, data_batch)),
     )
 }
@@ -275,7 +292,7 @@ pub(crate) fn encode_control_frame(
     seek_pk: u128,
     seek_col_idx: u64,
     seek_pk_extra: &[u8],
-) -> Vec<u8> {
+) -> MessageParts {
     encode_parts(
         target_id,
         client_id,
@@ -283,10 +300,9 @@ pub(crate) fn encode_control_frame(
         seek_pk,
         seek_col_idx,
         seek_pk_extra,
-        None,
+        Vec::new(),
         None,
     )
-    .ctrl
 }
 
 /// Parse a wire payload (without 4-byte frame header) into a `Message`.

@@ -18,7 +18,7 @@ use gnitz_wire::RelDescriptorBlob;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The feed tag every cursor here carries; a reply must echo it or the cursor
 /// stops continuing.
@@ -140,7 +140,7 @@ impl Peer {
     /// Whether another request frame arrives within `d`. An expired timeout is
     /// `WouldBlock`, which is the "nothing came" answer rather than a failure.
     fn waits(&self, d: Duration) -> bool {
-        match poll_fd(self.0.as_raw_fd(), libc::POLLIN, Some(d), true) {
+        match poll_fd(self.0.as_raw_fd(), libc::POLLIN, Some(Instant::now() + d), true) {
             Ok(revents) => revents & libc::POLLIN != 0,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
             Err(e) => panic!("poll on the peer fd: {e}"),

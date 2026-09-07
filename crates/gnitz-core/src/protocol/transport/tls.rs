@@ -6,25 +6,19 @@
 //! desync the stream. The wire protocol rides verbatim inside the TLS stream
 //! ("ZSets over the wire").
 
-use std::io::{IoSlice, Read, Write};
+use std::io::{BufRead, IoSlice, Write};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::ops::Range;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::Arc;
 
 use gnitz_wire::ALPN_GNITZ;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::ClientConnection;
 
 use super::super::error::ProtocolError;
-use super::{set_sockopt_int, ClientTransport, Inner, ReadOutcome, WriteOutcome};
-
-/// Connect + TLS-handshake + HELLO-exchange deadline: the per-address connect
-/// timeout, the handshake's kernel read timeout, then the transport deadline
-/// `mark_established` clears after the ACK.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+use super::{set_sockopt_int, ClientTransport, Inner, ReadOutcome, WriteOutcome, CONNECT_TIMEOUT};
 
 fn decode_err(msg: impl Into<String>) -> ProtocolError {
     ProtocolError::DecodeError(msg.into())
@@ -194,112 +188,74 @@ impl rustls::client::danger::ServerCertVerifier for SkipVerify {
     }
 }
 
-/// Build a verification-mode-specific `ClientConfig` (TLS 1.3 + ring +
-/// `gnitz/1` ALPN). Fallible `OnceLock` caching: `get_or_init` alone cannot
-/// propagate a builder error, so a miss builds first and publishes after
-/// (the benign race loser drops its copy).
-fn cached_config(
-    cell: &OnceLock<Arc<rustls::ClientConfig>>,
-    build: impl FnOnce() -> Result<rustls::ClientConfig, ProtocolError>,
-) -> Result<Arc<rustls::ClientConfig>, ProtocolError> {
-    if let Some(cfg) = cell.get() {
-        return Ok(Arc::clone(cfg));
-    }
-    // The `build` closure sets ALPN (via `finish`), so there is nothing to add.
-    let cfg = build()?;
-    Ok(Arc::clone(cell.get_or_init(|| Arc::new(cfg))))
-}
-
 fn config_builder() -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, ProtocolError> {
     rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| decode_err(format!("tls config: {e}")))
 }
 
-/// Resolve the immutable `ClientConfig` for a verification mode + optional
-/// client-auth cert. The `Default` and `Insecure` configs with NO client
-/// cert are pure values (the webpki root store alone is ~150 anchors), so
-/// they are built once per process and shared — connection-churny callers
-/// (one connection per test) skip the rebuild. `?ca=PATH` reads a file and a
-/// client cert is per-connection, so those stay per-connect (a per-connection
-/// cert must never be baked into a shared process-global config).
-///
-/// `client_auth` is taken by reference: a by-value `Option<(String, String)>`
-/// would be moved by the `match` below and break the `finish` closure's reads.
+/// Installs client auth (or not) and always sets ALPN, from the
+/// `WantsClientCert` state every verifier arm below lands in.
+fn finish(
+    b: rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>,
+    client_auth: Option<&(String, String)>,
+) -> Result<rustls::ClientConfig, ProtocolError> {
+    let mut cfg = match client_auth {
+        Some((cert, key)) => {
+            use rustls::pki_types::pem::PemObject;
+            let chain = CertificateDer::pem_file_iter(cert)
+                .map_err(|e| decode_err(format!("tls client cert {cert:?}: {e}")))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| decode_err(format!("tls client cert {cert:?}: {e}")))?;
+            if chain.is_empty() {
+                return Err(decode_err(format!("tls client cert {cert:?}: empty")));
+            }
+            let key_der = rustls::pki_types::PrivateKeyDer::from_pem_file(key)
+                .map_err(|e| decode_err(format!("tls client key {key:?}: {e}")))?;
+            b.with_client_auth_cert(chain, key_der)
+                .map_err(|e| decode_err(format!("tls client cert/key rejected: {e}")))?
+        }
+        None => b.with_no_client_auth(),
+    };
+    cfg.alpn_protocols = vec![ALPN_GNITZ.to_vec()];
+    Ok(cfg)
+}
+
+/// The verify-mode-specific builder, up to the shared `WantsClientCert` state.
+fn verifier_stage(
+    v: &Verify,
+) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>, ProtocolError> {
+    Ok(match v {
+        Verify::Default => config_builder()?.with_root_certificates(rustls::RootCertStore::from_iter(
+            webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+        )),
+        Verify::Insecure => config_builder()?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(SkipVerify(Arc::new(rustls::crypto::ring::default_provider())))),
+        Verify::Ca(path) => {
+            use rustls::pki_types::pem::PemObject;
+            let mut store = rustls::RootCertStore::empty();
+            let (added, _skipped) = store.add_parsable_certificates(
+                CertificateDer::pem_file_iter(path)
+                    .map_err(|e| decode_err(format!("tls ca bundle {path:?}: {e}")))?
+                    .filter_map(Result::ok),
+            );
+            if added == 0 {
+                return Err(decode_err(format!("tls ca bundle {path:?}: no usable certificates")));
+            }
+            config_builder()?.with_root_certificates(store)
+        }
+    })
+}
+
+/// The `ClientConfig` for one connection. Never share one: its session store is
+/// keyed by `ServerName` alone, so a ticket cached under `?insecure` would let
+/// a verifying connection resume without a certificate.
 fn build_client_config(
     verify: &Verify,
     client_auth: Option<&(String, String)>,
 ) -> Result<Arc<rustls::ClientConfig>, ProtocolError> {
-    static DEFAULT_CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
-    static INSECURE_CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
-
-    // Installs client auth (or not) and always sets ALPN. Reached from the
-    // `WantsClientCert` state that BOTH `.with_root_certificates(roots)` and
-    // `.dangerous().with_custom_certificate_verifier(..)` return.
-    let finish = |b: rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>|
-     -> Result<rustls::ClientConfig, ProtocolError> {
-        let mut cfg = match client_auth {
-            Some((cert, key)) => {
-                use rustls::pki_types::pem::PemObject;
-                let chain = CertificateDer::pem_file_iter(cert)
-                    .map_err(|e| decode_err(format!("tls client cert {cert:?}: {e}")))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| decode_err(format!("tls client cert {cert:?}: {e}")))?;
-                if chain.is_empty() {
-                    return Err(decode_err(format!("tls client cert {cert:?}: empty")));
-                }
-                let key_der = rustls::pki_types::PrivateKeyDer::from_pem_file(key)
-                    .map_err(|e| decode_err(format!("tls client key {key:?}: {e}")))?;
-                b.with_client_auth_cert(chain, key_der)
-                    .map_err(|e| decode_err(format!("tls client cert/key rejected: {e}")))?
-            }
-            None => b.with_no_client_auth(),
-        };
-        cfg.alpn_protocols = vec![ALPN_GNITZ.to_vec()];
-        Ok(cfg)
-    };
-
-    // Verify-mode-specific builder, up to the shared `WantsClientCert` state
-    // that both `.with_root_certificates` and the dangerous verifier setter
-    // return — so each verifier is constructed exactly once.
-    let verifier_stage = |v: &Verify| -> Result<
-        rustls::ConfigBuilder<rustls::ClientConfig, rustls::client::WantsClientCert>,
-        ProtocolError,
-    > {
-        Ok(match v {
-            Verify::Default => config_builder()?.with_root_certificates(rustls::RootCertStore::from_iter(
-                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-            )),
-            Verify::Insecure => config_builder()?
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(SkipVerify(Arc::new(
-                    rustls::crypto::ring::default_provider(),
-                )))),
-            Verify::Ca(path) => {
-                use rustls::pki_types::pem::PemObject;
-                let mut store = rustls::RootCertStore::empty();
-                let (added, _skipped) = store.add_parsable_certificates(
-                    CertificateDer::pem_file_iter(path)
-                        .map_err(|e| decode_err(format!("tls ca bundle {path:?}: {e}")))?
-                        .filter_map(Result::ok),
-                );
-                if added == 0 {
-                    return Err(decode_err(format!("tls ca bundle {path:?}: no usable certificates")));
-                }
-                config_builder()?.with_root_certificates(store)
-            }
-        })
-    };
-
-    // Share the immutable Default/Insecure configs only when there is no
-    // per-connection client cert; `?ca=PATH` and any client-auth config are
-    // built fresh (a per-connection cert must never be baked into a shared
-    // process-global config).
-    match (verify, client_auth) {
-        (Verify::Default, None) => cached_config(&DEFAULT_CFG, || finish(verifier_stage(verify)?)),
-        (Verify::Insecure, None) => cached_config(&INSECURE_CFG, || finish(verifier_stage(verify)?)),
-        _ => Ok(Arc::new(finish(verifier_stage(verify)?)?)),
-    }
+    Ok(Arc::new(finish(verifier_stage(verify)?, client_auth)?))
 }
 
 /// Connect to `rest` (the target after the `tls://` prefix): TCP with a
@@ -379,11 +335,11 @@ pub(super) fn connect_tls(rest: &str) -> Result<ClientTransport, ProtocolError> 
         conn.complete_io(&mut sock)
             .map_err(|e| decode_err(format!("tls handshake with {}:{}: {e}", target.host, target.port)))?;
     }
-    // From here the transport's own deadline bounds the HELLO exchange over
+    // From here the caller's own deadline bounds each blocking wrapper over
     // the non-blocking fd; the kernel timeout has done its job.
     sock.set_read_timeout(None).map_err(ProtocolError::IoError)?;
 
-    let mut t = ClientTransport::new(Inner::Tls(Box::new(TlsInner {
+    ClientTransport::new(Inner::Tls(Box::new(TlsInner {
         conn,
         sock,
         cipher: Box::new_uninit_slice(CIPHER_BYTES),
@@ -391,9 +347,7 @@ pub(super) fn connect_tls(rest: &str) -> Result<ClientTransport, ProtocolError> 
         plain_avail: 0,
         eof: false,
         sock_drained: false,
-    })))?;
-    t.set_deadline(Some(CONNECT_TIMEOUT));
-    Ok(t)
+    })))
 }
 
 /// One socket read's worth of ciphertext. rustls's own `read_tls` asks the
@@ -481,12 +435,13 @@ impl TlsInner {
         loop {
             self.ship_nonblocking()?;
             if self.plain_avail > 0 {
-                let want = buf.len().min(self.plain_avail);
-                let dst = &mut buf[..want];
-                dst.fill(MaybeUninit::new(0));
-                // SAFETY: just zeroed, so the slice is initialised.
-                let dst = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, want) };
-                let n = self.conn.reader().read(dst).map_err(ProtocolError::IoError)?;
+                // `plain_avail > 0` keeps `fill_buf` in its buffered branch: the
+                // chunk is non-empty, so rustls's close/EOF tests stay unreached.
+                let mut r = self.conn.reader();
+                let chunk = r.fill_buf().map_err(ProtocolError::IoError)?;
+                let n = chunk.len().min(buf.len());
+                buf[..n].write_copy_of_slice(&chunk[..n]);
+                r.consume(n);
                 self.plain_avail -= n;
                 return Ok(ReadOutcome::Data {
                     n,
@@ -494,9 +449,8 @@ impl TlsInner {
                 });
             }
             if !self.unread.is_empty() {
-                let raw = &self.cipher[self.unread.clone()];
                 // SAFETY: `unread` covers exactly the bytes a socket read initialised.
-                let mut src = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u8, raw.len()) };
+                let mut src = unsafe { self.cipher[self.unread.clone()].assume_init_ref() };
                 let taken = self.conn.read_tls(&mut src).map_err(ProtocolError::IoError)?;
                 self.unread.start += taken;
                 match self.conn.process_new_packets() {

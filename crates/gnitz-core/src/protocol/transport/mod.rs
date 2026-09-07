@@ -7,13 +7,13 @@
 //! [`Inner::write_slices`] — and everything above them is transport-blind:
 //! the [`FrameReader`] that turns reads into frames, the owned outbound queue
 //! that [`ClientTransport::flush`] drains through a partial-write cursor, and
-//! the blocking wrappers (`send_framed*`, `recv_framed`) that park in
-//! `poll(2)` around those cores. Nothing beneath the wrappers ever waits.
+//! the blocking wrappers ([`ClientTransport::send_parts`],
+//! [`ClientTransport::recv_framed`]) that park in `poll(2)` around those
+//! cores. Nothing beneath the wrappers ever waits.
 //!
-//! The fd is `O_NONBLOCK` from the moment a transport exists; the wrappers
-//! emulate blocking, bounded by the transport's own [`ClientTransport::set_deadline`]
-//! rather than a socket option — the TLS connect arms it for the HELLO
-//! exchange and `mark_established` clears it.
+//! The fd is `O_NONBLOCK` always; the wrappers emulate blocking under an
+//! `until` instant the caller passes, so one deadline covers a whole call
+//! however many parks it takes.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
@@ -28,12 +28,16 @@ use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::error::ProtocolError;
 use super::message::MessageParts;
 
-pub mod tls;
+mod tls;
+
+/// One bound over everything a connect does: the TCP connect, the TLS
+/// handshake, and the HELLO exchange after it.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One connected client transport. All framed I/O goes through these
 /// methods; the wire bytes are identical across transports ("ZSets over the
@@ -44,14 +48,6 @@ pub struct ClientTransport {
     inner: Inner,
     reader: FrameReader,
     queue: OutQueue,
-    /// Frames written to this connection since it was opened. Every frame
-    /// passes through `enqueue`, which bumps this once, so the count is
-    /// one-per-frame however the bytes are batched. Read through
-    /// `Session::requests_sent`, which the round-trip-count tests assert on.
-    frames_sent: u64,
-    /// How long a blocking wrapper may park before it fails with
-    /// `WouldBlock`; `None` waits untimed.
-    deadline: Option<Duration>,
     /// The largest payload this peer accepts, from the HELLO ACK — the server's
     /// own ingress cap until `mark_established` reads the negotiated one.
     /// `Session::submit` refuses past it.
@@ -65,7 +61,7 @@ enum Inner {
 
 /// What one non-blocking read of the source produced.
 #[derive(Clone, Copy)]
-pub(crate) enum ReadOutcome {
+enum ReadOutcome {
     /// `n` bytes landed; `drained` says the read returned less than it asked
     /// for, which on a stream socket proves the receive queue is empty.
     Data { n: usize, drained: bool },
@@ -185,21 +181,28 @@ fn unix_read_into(fd: RawFd, buf: &mut [MaybeUninit<u8>]) -> Result<ReadOutcome,
     }
 }
 
-/// `poll(2)` on one fd for `events`. `None` waits untimed; an expired timeout
-/// returns `WouldBlock`, what a blocking socket call under a deadline would
-/// have returned. `retry_eintr` is the wrappers' choice; the blocking
-/// client's park passes `false` so a signal returns to its hook.
+/// `poll(2)` on one fd for `events` until `until`; `None` waits untimed.
+/// Expiry surfaces as `WouldBlock`, as a deadlined blocking call would.
 pub(crate) fn poll_fd(
     fd: RawFd,
     events: libc::c_short,
-    timeout: Option<Duration>,
+    until: Option<Instant>,
     retry_eintr: bool,
 ) -> std::io::Result<libc::c_short> {
-    let timeout_ms: libc::c_int = match timeout {
-        None => -1,
-        Some(d) => d.as_millis().min(i32::MAX as u128).max(1) as libc::c_int,
-    };
+    let timed_out = || std::io::Error::new(std::io::ErrorKind::WouldBlock, "socket operation timed out");
     loop {
+        let timeout_ms: libc::c_int = match until {
+            None => -1,
+            Some(t) => {
+                let left = t.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(timed_out());
+                }
+                // Rounded up: `poll` takes whole milliseconds, and truncating
+                // would let it time out before the deadline it was given.
+                left.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as libc::c_int
+            }
+        };
         let mut pfd = libc::pollfd { fd, events, revents: 0 };
         // SAFETY: one valid pollfd, count 1.
         let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
@@ -211,22 +214,11 @@ pub(crate) fn poll_fd(
             return Err(e);
         }
         if rc == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "socket operation timed out",
-            ));
+            return Err(timed_out());
         }
         return Ok(pfd.revents);
     }
 }
-
-// Every async driver needs the transport to be Send: the asyncio executor steps
-// its `Session` inside `Python::detach`, whose `Ungil` bound is `Send`, and the
-// tokio `Connection` future is spawned onto a multi-thread runtime. `Sync`
-// because a `Session` holds one and must stay `Sync` itself — `gnitz-py`
-// exposes a bare `Session` as a `#[pyclass]`.
-const fn assert_send_sync<T: Send + Sync>() {}
-const _: () = assert_send_sync::<ClientTransport>();
 
 impl ClientTransport {
     fn new(inner: Inner) -> Result<Self, ProtocolError> {
@@ -235,15 +227,8 @@ impl ClientTransport {
             inner,
             reader: FrameReader::new(gnitz_wire::MAX_FRAME_PAYLOAD_PRE_HANDSHAKE),
             queue: OutQueue::default(),
-            frames_sent: 0,
-            deadline: None,
             egress_limit: gnitz_wire::MAX_FRAME_PAYLOAD_SERVER,
         })
-    }
-
-    /// Frames written to this connection since it was opened.
-    pub fn frames_sent(&self) -> u64 {
-        self.frames_sent
     }
 
     /// A `dup` of the underlying stream socket — the AF_UNIX socket, or the
@@ -276,9 +261,8 @@ impl ClientTransport {
         ClientTransport::new(Inner::Unix(UnixStream::from(fd))).expect("O_NONBLOCK on a fresh socket")
     }
 
-    /// The underlying stream socket fd (AF_UNIX socket, or the TcpStream
-    /// under TLS). For `poll(2)` and socket-option tweaks in tests; never
-    /// used for framed I/O on the TLS variant.
+    /// The stream socket every driver polls: the AF_UNIX socket, or the
+    /// `TcpStream` under TLS. Never used for framed I/O on the TLS variant.
     pub fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
     }
@@ -290,35 +274,26 @@ impl ClientTransport {
         self.reader.max_payload_len
     }
 
-    /// Bound every later park of the blocking wrappers: past `deadline` a
-    /// `send_framed*` / `recv_framed` fails with `WouldBlock`, a send with its
-    /// unwritten tail still queued — never a torn frame. `None` waits untimed.
-    pub fn set_deadline(&mut self, deadline: Option<Duration>) {
-        self.deadline = deadline;
-    }
-
     /// Send a length-prefixed frame: `[u32 LE payload_length][payload]`.
-    pub fn send_framed(&mut self, data: &[u8]) -> Result<(), ProtocolError> {
-        self.send_framed_iov(&[data])
+    /// Scripted-peer scaffolding: production paths hand the parts they already
+    /// hold to [`Self::send_parts`] instead of flattening into one buffer.
+    #[cfg(any(test, feature = "integration"))]
+    pub fn send_framed(&mut self, data: &[u8], until: Option<Instant>) -> Result<(), ProtocolError> {
+        self.send_parts(MessageParts::single(data.to_vec()), until)
     }
 
-    /// Send multiple buffers as a single logical frame (one length prefix
-    /// over the concatenation), blocking until it is on the wire, behind
-    /// anything still queued. Rejects an empty frame so this path can never
-    /// emit the close sentinel.
-    pub fn send_framed_iov(&mut self, bufs: &[&[u8]]) -> Result<(), ProtocolError> {
-        self.enqueue(MessageParts {
-            ctrl: bufs.concat(),
-            schema: None,
-            data: Vec::new(),
-        })?;
-        self.flush_blocking()
+    /// Send one owned frame — a single length prefix over the concatenation of
+    /// its parts — blocking behind anything still queued, and no longer than
+    /// `until`.
+    pub fn send_parts(&mut self, parts: MessageParts, until: Option<Instant>) -> Result<(), ProtocolError> {
+        self.enqueue(parts)?;
+        self.flush_blocking(until)
     }
 
-    /// Park until the fd reports `events`, under the deadline: expiry
+    /// Park until the fd reports `events`, no longer than `until`: expiry
     /// surfaces as `WouldBlock`.
-    fn park(&self, events: libc::c_short) -> Result<(), ProtocolError> {
-        poll_fd(self.as_raw_fd(), events, self.deadline, true)
+    fn park(&self, events: libc::c_short, until: Option<Instant>) -> Result<(), ProtocolError> {
+        poll_fd(self.as_raw_fd(), events, until, true)
             .map(|_| ())
             .map_err(ProtocolError::IoError)
     }
@@ -326,10 +301,10 @@ impl ClientTransport {
     /// Queue an owned frame behind everything already queued. Nothing is
     /// written here; `flush` / `flush_blocking` ship the queue.
     pub(crate) fn enqueue(&mut self, parts: MessageParts) -> Result<(), ProtocolError> {
-        let total: usize = parts.segments().iter().map(|s| s.len()).sum();
-        let prefix = frame_len_prefix(total)?;
-        self.frames_sent += 1;
-        self.queue.push(prefix, parts);
+        let payload = parts.byte_len();
+        let prefix = frame_len_prefix(payload)?;
+        self.queue
+            .push(prefix, parts, payload + gnitz_wire::FRAME_LEN_PREFIX_BYTES);
         Ok(())
     }
 
@@ -357,11 +332,10 @@ impl ClientTransport {
     }
 
     /// `flush` inside the `POLLOUT` park-and-retry loop: returns once nothing
-    /// is pending, or with `WouldBlock` at the deadline with the cursor
-    /// intact.
-    pub(crate) fn flush_blocking(&mut self) -> Result<(), ProtocolError> {
+    /// is pending, or with `WouldBlock` at `until` with the cursor intact.
+    pub(crate) fn flush_blocking(&mut self, until: Option<Instant>) -> Result<(), ProtocolError> {
         while self.flush()? {
-            self.park(libc::POLLOUT)?;
+            self.park(libc::POLLOUT, until)?;
         }
         Ok(())
     }
@@ -395,15 +369,14 @@ impl ClientTransport {
         reader.next_frame(inner, may_read)
     }
 
-    /// Receive one length-prefixed frame, blocking until it is whole. The
-    /// per-connection ceiling is enforced on the length prefix before any
-    /// payload allocation; the zero-length close sentinel is rejected.
-    pub fn recv_framed(&mut self) -> Result<Vec<u8>, ProtocolError> {
+    /// Receive one frame, blocking until it is whole and no longer than
+    /// `until`. The ceiling is enforced on the prefix, before any allocation.
+    pub fn recv_framed(&mut self, until: Option<Instant>) -> Result<Vec<u8>, ProtocolError> {
         loop {
             match self.next_frame(true)? {
                 Next::Frame(f) => return Ok(f),
                 Next::Pending => {
-                    self.park(libc::POLLIN)?;
+                    self.park(libc::POLLIN, until)?;
                     self.begin_read();
                 }
             }
@@ -418,15 +391,11 @@ impl ClientTransport {
         self.reader.drained = false;
     }
 
-    /// The connection is validated (HELLO ACK in hand): the connect deadline is
-    /// cleared, the inbound payload ceiling narrows from the pre-handshake bound
-    /// to the ACK's — clamped to the client's own hard maximum, so a misbehaving
-    /// server cannot raise the allocation bound — and the ACK's figure becomes
-    /// what this end may send.
+    /// The HELLO ACK is in hand: its figure replaces the pre-handshake bound in
+    /// both directions, clamped — the peer does not get to raise our ceilings.
     pub(crate) fn mark_established(&mut self, server_limit: usize) {
-        self.deadline = None;
         self.reader.max_payload_len = server_limit.min(gnitz_wire::MAX_FRAME_PAYLOAD_CLIENT);
-        self.egress_limit = server_limit;
+        self.egress_limit = server_limit.min(gnitz_wire::MAX_FRAME_PAYLOAD_SERVER);
     }
 }
 
@@ -445,13 +414,6 @@ pub(crate) enum Next {
     Pending,
 }
 
-/// A payload being filled to exactly its declared length.
-struct Partial {
-    /// `capacity() == payload_len`; `filled` bytes of it are initialised.
-    buf: Vec<u8>,
-    filled: usize,
-}
-
 /// Turns reads into frames without copying a payload out of a scratch buffer.
 /// The header is read into a scratch that may over-read (surplus kept in
 /// `carry`); once the length is known the payload is allocated at exactly
@@ -461,7 +423,9 @@ struct FrameReader {
     scratch: Box<[MaybeUninit<u8>]>,
     /// The initialised, not-yet-consumed bytes of `scratch`.
     carry: Range<usize>,
-    partial: Option<Partial>,
+    /// The payload being filled: `len()` of `capacity()` bytes, where the
+    /// capacity *is* the frame's declared length — allocated exactly, never grown.
+    partial: Option<Vec<u8>>,
     max_payload_len: usize,
     /// A read returned 0. Raised once nothing buffered can advance a frame,
     /// so the frame delivered by the same read is not lost.
@@ -524,32 +488,29 @@ impl FrameReader {
         loop {
             match self.partial.as_mut() {
                 Some(p) => {
-                    let take = (p.buf.capacity() - p.filled).min(self.carry.len());
-                    let src = &self.scratch[self.carry.start..self.carry.start + take];
-                    p.buf.spare_capacity_mut()[p.filled..p.filled + take].copy_from_slice(src);
-                    p.filled += take;
+                    let take = (p.capacity() - p.len()).min(self.carry.len());
+                    // SAFETY: `carry` covers exactly the bytes a read initialised.
+                    let src = unsafe { self.scratch[self.carry.start..self.carry.start + take].assume_init_ref() };
+                    p.spare_capacity_mut()[..take].write_copy_of_slice(src);
+                    // SAFETY: the copy above initialised `take` bytes at the
+                    // head of the spare capacity.
+                    unsafe { p.set_len(p.len() + take) };
                     self.carry.start += take;
-                    if p.filled < p.buf.capacity() {
+                    if p.len() < p.capacity() {
                         return Ok(None);
                     }
-                    let Partial { mut buf, filled } = self.partial.take().unwrap();
-                    // SAFETY: exactly `filled == capacity` bytes were written
-                    // into the spare capacity, here or by `read_more`.
-                    unsafe { buf.set_len(filled) };
-                    return Ok(Some(buf));
+                    return Ok(Some(self.partial.take().unwrap()));
                 }
                 None => {
                     if self.carry.len() < gnitz_wire::FRAME_LEN_PREFIX_BYTES {
                         return Ok(None);
                     }
-                    let mut hdr = [0u8; 4];
-                    hdr.copy_from_slice(&self.initialised()[..4]);
-                    let payload_len = parse_frame_len(hdr, self.max_payload_len)?;
-                    self.carry.start += 4;
-                    self.partial = Some(Partial {
-                        buf: Vec::with_capacity(payload_len),
-                        filled: 0,
-                    });
+                    let hdr = &self.scratch[self.carry.start..self.carry.start + gnitz_wire::FRAME_LEN_PREFIX_BYTES];
+                    // SAFETY: `carry` covers exactly the bytes a read initialised.
+                    let hdr = unsafe { hdr.assume_init_ref() };
+                    let payload_len = parse_frame_len(hdr.try_into().unwrap(), self.max_payload_len)?;
+                    self.carry.start += gnitz_wire::FRAME_LEN_PREFIX_BYTES;
+                    self.partial = Some(Vec::with_capacity(payload_len));
                 }
             }
         }
@@ -562,9 +523,11 @@ impl FrameReader {
     fn read_more(&mut self, inner: &mut Inner) -> Result<ReadOutcome, ProtocolError> {
         let outcome = match self.partial.as_mut() {
             Some(p) => {
-                let outcome = inner.read_into(&mut p.buf.spare_capacity_mut()[p.filled..])?;
+                let outcome = inner.read_into(p.spare_capacity_mut())?;
                 if let ReadOutcome::Data { n, .. } = outcome {
-                    p.filled += n;
+                    // SAFETY: the read initialised `n` bytes at the head of the
+                    // spare capacity.
+                    unsafe { p.set_len(p.len() + n) };
                 }
                 outcome
             }
@@ -586,13 +549,6 @@ impl FrameReader {
         }
         Ok(outcome)
     }
-
-    /// The carried bytes as initialised memory.
-    fn initialised(&self) -> &[u8] {
-        let raw = &self.scratch[self.carry.clone()];
-        // SAFETY: `carry` covers exactly the bytes a read initialised.
-        unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u8, raw.len()) }
-    }
 }
 
 // ── Framing: the outbound queue ──────────────────────────────────────────────
@@ -605,38 +561,38 @@ impl FrameReader {
 /// cold one. A driver's own request-channel depth does not enter it.
 const IOV_MAX_CHUNK: usize = 1024;
 
-/// One queue entry: a frame with its own length prefix.
+/// One queue entry: a frame with its own length prefix, and the byte count of
+/// the two together.
 struct QueuedFrame {
-    prefix: [u8; 4],
+    prefix: [u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES],
     parts: MessageParts,
+    total: usize,
 }
 
 impl QueuedFrame {
-    /// The non-empty segments in wire order.
-    fn segments(&self) -> impl Iterator<Item = &[u8]> {
-        std::iter::once(&self.prefix[..])
-            .chain(self.parts.segments())
-            .filter(|s| !s.is_empty())
+    /// The segments in wire order, empty ones included: `build_slices` skips
+    /// them with the same test that advances its cursor.
+    fn segments(&self) -> [&[u8]; 4] {
+        let [ctrl, schema, data] = self.parts.segments();
+        [&self.prefix, ctrl, schema, data]
     }
 }
 
-/// The owned outbound queue with its partial-write cursor: `(segment index,
-/// byte offset)` into the front entry. The unwritten tail of a frame whose
-/// send hit its deadline stays here, so a later send queues behind it.
+/// The owned outbound queue and its partial-write cursor: one byte offset into
+/// the front entry, so a send that hit its deadline resumes where it stopped.
 #[derive(Default)]
 struct OutQueue {
     frames: VecDeque<QueuedFrame>,
-    seg: usize,
+    /// Bytes of the front frame already written.
     off: usize,
     /// Bytes queued and not yet written, prefixes included.
     bytes: usize,
 }
 
 impl OutQueue {
-    fn push(&mut self, prefix: [u8; 4], parts: MessageParts) {
-        let frame = QueuedFrame { prefix, parts };
-        self.bytes += frame.segments().map(<[u8]>::len).sum::<usize>();
-        self.frames.push_back(frame);
+    fn push(&mut self, prefix: [u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES], parts: MessageParts, total: usize) {
+        self.bytes += total;
+        self.frames.push_back(QueuedFrame { prefix, parts, total });
     }
 
     fn is_empty(&self) -> bool {
@@ -649,18 +605,21 @@ impl OutQueue {
 
     fn clear(&mut self) {
         self.frames.clear();
-        self.seg = 0;
         self.off = 0;
         self.bytes = 0;
     }
 
     /// Slices from the cursor forward, at most `IOV_MAX_CHUNK` of them.
     fn build_slices<'a>(&'a self, out: &mut Vec<IoSlice<'a>>) {
-        for (i, f) in self.frames.iter().enumerate() {
-            let skip = if i == 0 { self.seg } else { 0 };
-            for (j, s) in f.segments().enumerate().skip(skip) {
-                let s = if i == 0 && j == self.seg { &s[self.off..] } else { s };
-                out.push(IoSlice::new(s));
+        let mut skip = self.off;
+        for f in &self.frames {
+            for s in f.segments() {
+                if skip >= s.len() {
+                    skip -= s.len();
+                    continue;
+                }
+                out.push(IoSlice::new(&s[skip..]));
+                skip = 0;
                 if out.len() == IOV_MAX_CHUNK {
                     return;
                 }
@@ -669,32 +628,30 @@ impl OutQueue {
     }
 
     /// Advance the cursor by `n` written bytes, popping fully-sent frames.
-    fn advance(&mut self, mut n: usize) {
+    fn advance(&mut self, n: usize) {
+        // Total by construction: `n` is what the sink took from our own slices.
+        // Release checks no subtraction, and a wrap here tears the next frame.
+        debug_assert!(n <= self.bytes);
         self.bytes -= n;
-        while n > 0 {
-            let front = self.frames.front().expect("advance past the queue");
-            let seg_len = front.segments().nth(self.seg).map_or(0, |s| s.len());
-            let left = seg_len - self.off;
-            if n < left {
-                self.off += n;
-                return;
+        self.off += n;
+        while let Some(f) = self.frames.front() {
+            // Ends the borrow before the pop.
+            let total = f.total;
+            if self.off < total {
+                break;
             }
-            n -= left;
-            self.seg += 1;
-            self.off = 0;
-            if front.segments().nth(self.seg).is_none() {
-                self.frames.pop_front();
-                self.seg = 0;
-            }
+            self.off -= total;
+            self.frames.pop_front();
         }
     }
 }
 
-/// Decode and validate a received 4-byte LE length prefix against the
-/// per-connection ceiling, rejecting the zero-length close sentinel.
-/// Single enforcement point for every framed recv — the recv mirror of
-/// `frame_len_prefix`.
-pub(crate) fn parse_frame_len(hdr: [u8; 4], max_payload_len: usize) -> Result<usize, ProtocolError> {
+/// Decode a received length prefix against the per-connection ceiling, refusing
+/// the close sentinel. The one enforcement point for every framed recv.
+pub(crate) fn parse_frame_len(
+    hdr: [u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES],
+    max_payload_len: usize,
+) -> Result<usize, ProtocolError> {
     let payload_len = u32::from_le_bytes(hdr) as usize;
     if payload_len == 0 {
         return Err(ProtocolError::IoError(std::io::Error::new(
@@ -710,10 +667,8 @@ pub(crate) fn parse_frame_len(hdr: [u8; 4], max_payload_len: usize) -> Result<us
     Ok(payload_len)
 }
 
-/// Encode the LE length prefix for a frame, rejecting the two lengths that would
-/// corrupt the wire stream: zero (collides with the `recv_framed` close
-/// sentinel) and anything above `u32::MAX` (would silently truncate the prefix).
-/// Single enforcement point shared by every framed-send path.
+/// Encode a frame's length prefix, refusing the close sentinel and anything
+/// past `u32::MAX`. The one enforcement point for every framed send.
 pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; gnitz_wire::FRAME_LEN_PREFIX_BYTES], ProtocolError> {
     if len == 0 {
         return Err(ProtocolError::IoError(std::io::Error::new(
@@ -730,23 +685,15 @@ pub(crate) fn frame_len_prefix(len: usize) -> Result<[u8; gnitz_wire::FRAME_LEN_
     Ok((len as u32).to_le_bytes())
 }
 
-/// Send the HELLO frame and parse the server's ACK, then mark the transport
-/// established under the ACK's payload limit. Returns the server's
-/// durability watermark at connect (`published_lsn`), which seeds the
-/// client's OCC basis; the negotiated ceiling is read through
-/// [`ClientTransport::max_payload_len`].
-///
-/// On version mismatch / auth failure the server replies with a
-/// length-prefixed STATUS_ERROR control block (≥ 248 bytes) and closes
-/// the connection; this function detects that path via the payload
-/// length (`!= HELLO_ACK_PAYLOAD_LEN`) and surfaces the embedded error
-/// string as [`ProtocolError::ServerRejected`]. Both frames fit the
-/// pre-handshake ceiling the reader opens at.
-pub fn hello_handshake(t: &mut ClientTransport) -> Result<u64, ProtocolError> {
+/// Send HELLO, parse the ACK, and mark the transport established under its
+/// payload limit. Returns the server's `published_lsn`, which seeds the client's
+/// OCC basis. `timeout` bounds the exchange as a whole, not each leg.
+pub fn hello_handshake(t: &mut ClientTransport, timeout: Option<Duration>) -> Result<u64, ProtocolError> {
+    let until = timeout.map(|d| Instant::now() + d);
     let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION as u16);
-    t.send_framed(&payload)?;
+    t.send_parts(MessageParts::single(payload.to_vec()), until)?;
 
-    let buf = t.recv_framed()?;
+    let buf = t.recv_framed(until)?;
     if buf.len() == gnitz_wire::HELLO_ACK_PAYLOAD_LEN as usize {
         let ack = gnitz_wire::decode_hello_ack(&buf).map_err(|e| ProtocolError::DecodeError(e.into()))?;
         if ack.magic != gnitz_wire::HELLO_MAGIC {

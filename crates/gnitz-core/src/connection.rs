@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use crate::error::ClientError;
 use crate::protocol::message::{encode_message_noschema_parts, encode_message_parts, MessageParts};
-use crate::protocol::transport::{poll_fd, Next};
+use crate::protocol::transport::{poll_fd, Next, CONNECT_TIMEOUT};
 use crate::protocol::wal_block::decode_wal_block_into;
 use crate::protocol::ReplySchema;
 use crate::protocol::{
@@ -513,7 +513,7 @@ impl Session {
         // Run the HELLO handshake before any data flows. The server
         // accepts the first frame at an 8-byte limit, so this must
         // happen before a control block would be emitted.
-        let published_lsn = hello_handshake(&mut transport)?;
+        let published_lsn = hello_handshake(&mut transport, Some(CONNECT_TIMEOUT))?;
         Ok((Self::over(transport), published_lsn))
     }
 
@@ -537,12 +537,10 @@ impl Session {
         Self::over(transport)
     }
 
-    /// Request frames this session has written since it connected. Counted in
-    /// the transport as a request is enqueued, so it covers every verb without
-    /// a per-path bump and batching cannot move it. Tests assert on it to pin
-    /// the per-statement round-trip count.
+    /// Requests submitted since this session connected — one per `submit`,
+    /// however the bytes were batched. HELLO predates the session, uncounted.
     pub fn requests_sent(&self) -> u64 {
-        self.transport.frames_sent()
+        self.next_slot - 1
     }
 
     /// The fd a driver polls. Borrowed: it lives exactly as long as the
@@ -601,21 +599,21 @@ impl Session {
                 seek_pk_extra,
             } => {
                 let flags = self.versioned_flags(target_id, flags);
-                let ctrl = encode_control_frame(target_id, client_id, flags, seek_pk, seek_col_idx, seek_pk_extra);
-                (control_parts(ctrl), SlotKind::Read { tid: target_id })
+                let parts = encode_control_frame(target_id, client_id, flags, seek_pk, seek_col_idx, seek_pk_extra);
+                (parts, SlotKind::Read { tid: target_id })
             }
             Request::Alloc { target_id, flag, count } => {
                 // The run length rides in `seek_col_idx`, the field
                 // `alloc_serial_range` already uses for it.
-                let ctrl = encode_control_frame(target_id, client_id, flag, 0, count, &[]);
-                (control_parts(ctrl), SlotKind::Uncorrelated)
+                let parts = encode_control_frame(target_id, client_id, flag, 0, count, &[]);
+                (parts, SlotKind::Uncorrelated)
             }
             Request::DdlTxn(families) => {
                 for (tid, batch) in families {
                     batch.validate(crate::types::sys_schema(*tid))?;
                 }
                 (
-                    control_parts(encode_ddl_txn(client_id, families)),
+                    MessageParts::single(encode_ddl_txn(client_id, families)),
                     SlotKind::Uncorrelated,
                 )
             }
@@ -624,13 +622,13 @@ impl Session {
                     batch.validate(schema)?;
                 }
                 (
-                    control_parts(encode_push_txn(client_id, families, preconditions)),
+                    MessageParts::single(encode_push_txn(client_id, families, preconditions)),
                     SlotKind::Uncorrelated,
                 )
             }
             #[cfg(test)]
-            Request::RawFrame(frame) => (control_parts(frame), SlotKind::Uncorrelated),
-            Request::Resolve(target) => (control_parts(self.resolve_request(target)), SlotKind::Resolve),
+            Request::RawFrame(frame) => (MessageParts::single(frame), SlotKind::Uncorrelated),
+            Request::Resolve(target) => (self.resolve_request(target), SlotKind::Resolve),
             Request::Push { target_id, schema, batch, mode } => {
                 // In-process, so a convenience and never a trust boundary; the
                 // server checks the same things. Here so no driver has to
@@ -662,11 +660,8 @@ impl Session {
                 // The reply schema rides the request blob (the master forwards it
                 // verbatim) and stays with the slot as the decode hint.
                 let extra = gnitz_wire::pack_scan_spec_extra(spec, reply_schema.block());
-                let ctrl = encode_control_frame(target_id, client_id, FLAG_SCAN_SPEC, 0, 0, &extra);
-                (
-                    control_parts(ctrl),
-                    SlotKind::ScanSpec { reply_schema: reply_schema.schema(), raw },
-                )
+                let parts = encode_control_frame(target_id, client_id, FLAG_SCAN_SPEC, 0, 0, &extra);
+                (parts, SlotKind::ScanSpec { reply_schema: reply_schema.schema(), raw })
             }
             Request::SeekByIndex { table_id, col_indices, key_vals } => {
                 // Both packers below assert their contracts, so the list and
@@ -687,7 +682,7 @@ impl Session {
                 let (kbuf, klen) = gnitz_wire::pack_index_key_slots(key_vals);
                 let (seek_pk, seek_pk_extra) = gnitz_wire::control::split_ctrl_key(&kbuf[..klen]);
                 let flags = self.versioned_flags(table_id, FLAG_SEEK_BY_INDEX);
-                let ctrl = encode_control_frame(
+                let parts = encode_control_frame(
                     table_id,
                     client_id,
                     flags,
@@ -695,10 +690,10 @@ impl Session {
                     gnitz_wire::pack_pk_cols(col_indices),
                     seek_pk_extra,
                 );
-                (control_parts(ctrl), SlotKind::Read { tid: table_id })
+                (parts, SlotKind::Read { tid: table_id })
             }
             Request::ScanMulti(tids) => (
-                control_parts(self.encode_scan_multi_frame(tids)?),
+                MessageParts::single(self.encode_scan_multi_frame(tids)?),
                 SlotKind::Multi { tids: tids.to_vec() },
             ),
         };
@@ -706,7 +701,7 @@ impl Session {
         // bundle built from a reply this client accepted can still exceed what
         // the peer will take. Refused here, it is an error the caller can act
         // on rather than an ingress rejection and a dropped connection.
-        let total: usize = parts.segments().iter().map(|s| s.len()).sum();
+        let total = parts.byte_len();
         let limit = self.transport.egress_limit();
         if total > limit {
             return Err(ClientError::ServerError(format!(
@@ -1109,7 +1104,7 @@ impl Session {
     /// wins, else id" encoding is spelled: the name rides an explicit extra
     /// blob rather than the seek-key channel, whose split would leave the first
     /// 16 bytes in a `u128` field the server reads as a key.
-    fn resolve_request(&self, target: RelTarget<'_>) -> Vec<u8> {
+    fn resolve_request(&self, target: RelTarget<'_>) -> MessageParts {
         let (target_id, qname) = match target {
             RelTarget::Name(q) => (0, q),
             RelTarget::Id(tid) => (tid, ""),
@@ -1181,11 +1176,6 @@ impl Session {
     fn versioned_flags(&self, target_id: u64, base: u64) -> u64 {
         wire_flags_set_schema_version(base, self.cached_schema_version(target_id))
     }
-}
-
-/// A control-only frame as queue parts.
-fn control_parts(ctrl: Vec<u8>) -> MessageParts {
-    MessageParts { ctrl, schema: None, data: Vec::new() }
 }
 
 /// The cached `(schema, version)` for `tid` as an owned decode hint.

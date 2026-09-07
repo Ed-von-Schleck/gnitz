@@ -142,7 +142,7 @@ fn test_request_id_roundtrip_reserved_values() {
 /// Ship one cold PUSH frame, the shape `Session::roundtrip_push` builds.
 fn send_push(t: &mut ClientTransport, schema: &Schema, batch: &ZSetBatch) {
     let parts = encode_message_parts(0, 0, FLAG_PUSH, 0, &[], 0, Some((schema, batch)));
-    t.send_framed_iov(&parts.segments()).unwrap();
+    t.send_parts(parts, None).unwrap();
 }
 
 #[test]
@@ -159,7 +159,7 @@ fn test_message_roundtrip_empty() {
     let empty_batch = ZSetBatch::new(&schema);
     let (mut a, mut b) = make_transport_pair();
     send_push(&mut a, &schema, &empty_batch);
-    let (msg, data) = parse_response(&b.recv_framed().unwrap(), None).unwrap();
+    let (msg, data) = parse_response(&b.recv_framed(None).unwrap(), None).unwrap();
 
     // Schema was sent, data was not (empty batch)
     assert!(msg.schema.is_some());
@@ -204,7 +204,7 @@ fn test_message_roundtrip_data() {
 
     let (mut a, mut b) = make_transport_pair();
     send_push(&mut a, &schema, &batch);
-    let (_, data) = parse_response(&b.recv_framed().unwrap(), None).unwrap();
+    let (_, data) = parse_response(&b.recv_framed(None).unwrap(), None).unwrap();
 
     let data = data.unwrap();
     assert_eq!(data.pks.to_vec_u128(&schema), pks);
@@ -259,7 +259,7 @@ fn test_message_roundtrip_strings() {
 
     let (mut a, mut b) = make_transport_pair();
     send_push(&mut a, &schema, &batch);
-    let (_, data) = parse_response(&b.recv_framed().unwrap(), None).unwrap();
+    let (_, data) = parse_response(&b.recv_framed(None).unwrap(), None).unwrap();
 
     let data = data.unwrap();
     assert_eq!(data.nulls, nulls);
@@ -294,9 +294,9 @@ fn german_vals(batch: &ZSetBatch, ci: usize, pi: usize) -> Vec<Option<String>> {
 fn test_message_no_schema_no_data() {
     // Control-only message (scan/alloc style)
     let (mut a, mut b) = make_transport_pair();
-    a.send_framed(&encode_control_frame(0, 0, FLAG_PUSH, 0, 0, &[]))
+    a.send_parts(encode_control_frame(0, 0, FLAG_PUSH, 0, 0, &[]), None)
         .unwrap();
-    let (msg, data) = parse_response(&b.recv_framed().unwrap(), None).unwrap();
+    let (msg, data) = parse_response(&b.recv_framed(None).unwrap(), None).unwrap();
     assert!(msg.schema.is_none());
     assert!(data.is_none());
 }
@@ -306,16 +306,12 @@ fn test_message_no_schema_no_data() {
 fn test_message_recv_control_fields() {
     let seek_pk = 0xAAAA_BBBB_CCCC_DDDD_u128 | (0x1111_2222_3333_4444_u128 << 64);
     let (mut a, mut b) = make_transport_pair();
-    a.send_framed(&encode_control_frame(
-        0xDEAD_BEEF_1234_5678,
-        0xCAFE_BABE_0000_0001,
-        FLAG_PUSH,
-        seek_pk,
-        7,
-        &[],
-    ))
+    a.send_parts(
+        encode_control_frame(0xDEAD_BEEF_1234_5678, 0xCAFE_BABE_0000_0001, FLAG_PUSH, seek_pk, 7, &[]),
+        None,
+    )
     .unwrap();
-    let (msg, _) = parse_response(&b.recv_framed().unwrap(), None).unwrap();
+    let (msg, _) = parse_response(&b.recv_framed(None).unwrap(), None).unwrap();
     assert_eq!(msg.target_id, 0xDEAD_BEEF_1234_5678);
     assert_eq!(msg.seek_pk, seek_pk);
 }
@@ -329,8 +325,8 @@ fn test_message_error_response() {
         ..Header::default()
     };
     let encoded = encode_control_block(&err_hdr, "something broke", &[]);
-    a.send_framed(&encoded).unwrap();
-    let (msg, _) = parse_response(&b.recv_framed().unwrap(), None).unwrap();
+    a.send_framed(&encoded, None).unwrap();
+    let (msg, _) = parse_response(&b.recv_framed(None).unwrap(), None).unwrap();
     assert_eq!(msg.status, STATUS_ERROR);
     assert!(msg.error_text.is_some());
 }
@@ -440,10 +436,10 @@ fn hint_only_frame_returns_data_schema_none() {
     // Embed version=1 in flags; no schema block in the frame.
     let flags = wire_flags_set_schema_version(0, 1);
     let parts = encode_message_noschema_parts(42, 0, flags, &schema, &batch);
-    a.send_framed_iov(&parts.segments()).unwrap();
+    a.send_parts(parts, None).unwrap();
 
     // Parse with a matching hint (same schema, version 1).
-    let (msg, data) = parse_response(&b.recv_framed().unwrap(), Some((&schema, 1))).unwrap();
+    let (msg, data) = parse_response(&b.recv_framed(None).unwrap(), Some((&schema, 1))).unwrap();
 
     // The hint was not physically in the frame.
     assert!(msg.schema.is_none(), "schema must be None for hint-only frame");

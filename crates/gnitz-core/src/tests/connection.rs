@@ -180,7 +180,7 @@ mod spine_tests {
             let rev = poll_fd(
                 s.as_raw_fd(),
                 interest.poll_events(),
-                Some(std::time::Duration::from_secs(5)),
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
                 true,
             )
             .expect("poll");
@@ -350,7 +350,7 @@ mod spine_tests {
         let rev = poll_fd(
             s.as_raw_fd(),
             Interest::READ.poll_events(),
-            Some(std::time::Duration::from_secs(5)),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
             true,
         )
         .expect("poll");

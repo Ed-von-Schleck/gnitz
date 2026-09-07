@@ -25,7 +25,7 @@ fn send_control(
     client_id: u64,
     flags: u64,
 ) -> Result<(), gnitz_core::ProtocolError> {
-    t.send_framed(&encode_message_parts(target_id, client_id, flags, 0, &[], 0, None).ctrl)
+    t.send_parts(encode_message_parts(target_id, client_id, flags, 0, &[], 0, None), None)
 }
 use gnitz_core::TableProps;
 use gnitz_core::{
@@ -63,7 +63,7 @@ fn send_push(
     batch: &ZSetBatch,
 ) -> Result<(), gnitz_core::protocol::ProtocolError> {
     let parts = encode_message_parts(tid, client_id, flags, 0, &[], 0, Some((schema, batch)));
-    t.send_framed_iov(&parts.segments())
+    t.send_parts(parts, None)
 }
 
 /// Rows `(start + i, (start + i) * 3, 7)` for `count` rows.
@@ -127,11 +127,10 @@ fn set_small_bufs(fd: RawFd) {
 /// send errors. Probe writes are deadline-bounded so a full send buffer
 /// surfaces as WouldBlock (keep probing) instead of hanging.
 fn eviction_observed_within(t: &mut ClientTransport, ms: u64) -> bool {
-    t.set_deadline(Some(Duration::from_secs(1)));
     let deadline = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
-        match t.send_framed(&[0u8; 8]) {
+        match t.send_framed(&[0u8; 8], Some(Instant::now() + Duration::from_secs(1))) {
             Err(gnitz_core::ProtocolError::IoError(e)) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(_) => return true,
             Ok(()) => continue,
@@ -300,8 +299,8 @@ fn wire_version_mismatch_hello_gets_status_error() {
     let srv = ServerHandle::start_tls(1);
     let mut t = ClientTransport::connect(&srv.tls_target()).unwrap();
     let payload = gnitz_wire::encode_hello_payload(gnitz_wire::WAL_FORMAT_VERSION as u16 + 1);
-    t.send_framed(&payload).unwrap();
-    let buf = t.recv_framed().unwrap();
+    t.send_framed(&payload, None).unwrap();
+    let buf = t.recv_framed(None).unwrap();
     let (msg, _) = parse_response(&buf, None).unwrap();
     assert_eq!(msg.status, STATUS_ERROR);
     let text = msg.error_text.unwrap_or_default();
@@ -310,7 +309,7 @@ fn wire_version_mismatch_hello_gets_status_error() {
         "STATUS_ERROR must name the version mismatch, got: {text}"
     );
     // Clean close follows the error frame.
-    assert!(t.recv_framed().is_err());
+    assert!(t.recv_framed(None).is_err());
 }
 
 // ── 7. restart: fail fast, same port, fresh connect works ─────────────────
@@ -352,7 +351,7 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
         // false-green the test).
         let mut t = ClientTransport::connect(&target).unwrap();
         set_small_bufs(t.as_raw_fd());
-        hello_handshake(&mut t).unwrap();
+        hello_handshake(&mut t, None).unwrap();
 
         // >16 MB of pushes pipelined ahead of a scan, before reading ANY
         // response. The server's ACK sends stall against our unread socket
@@ -369,14 +368,14 @@ fn pipelined_pushes_ahead_of_scan_do_not_deadlock() {
 
         // Now read everything: n ACKs, then the scan train.
         for _ in 0..n_pushes {
-            let buf = t.recv_framed().unwrap();
+            let buf = t.recv_framed(None).unwrap();
             let (ack, _) = parse_response(&buf, None).unwrap();
             assert_eq!(ack.status, 0, "push ACK must be OK");
         }
         let mut rows = 0usize;
         let mut schema_seen: Option<(std::sync::Arc<Schema>, u16)> = None;
         loop {
-            let buf = t.recv_framed().unwrap();
+            let buf = t.recv_framed(None).unwrap();
             let hint = schema_seen.as_ref().map(|(s, v)| (s.as_ref(), *v));
             let (msg, data) = parse_response(&buf, hint).unwrap();
             assert_eq!(msg.status, 0, "scan frame must be OK");
@@ -431,7 +430,7 @@ fn inbound_cap_breach_closes_stalled_connection() {
 
         let mut t = ClientTransport::connect(&target).unwrap();
         set_small_bufs(t.as_raw_fd());
-        hello_handshake(&mut t).unwrap();
+        hello_handshake(&mut t, None).unwrap();
         // Ask for the scan, then never read: the train stalls, pinning
         // connection_loop in its guarded send.
         send_control(&mut t, tid, 0xB0BA, 0).unwrap();
@@ -489,7 +488,7 @@ fn stalled_scan_client_is_evicted_by_send_deadline() {
 
         let mut t = ClientTransport::connect(&target).unwrap();
         set_small_bufs(t.as_raw_fd());
-        hello_handshake(&mut t).unwrap();
+        hello_handshake(&mut t, None).unwrap();
         send_control(&mut t, tid, 0xB0BA, 0).unwrap();
         // Never read. Allow a few deadlines of slack.
         assert!(
