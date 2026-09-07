@@ -13,7 +13,7 @@
 //! [`present_rows`] materializes them exactly once, all before the caller's next
 //! `&mut client`.
 //!
-//! - [`effective_rows`] — a key set: buffered ops, then one gather for the rest
+//! - [`effective_rows`] — a PK column: buffered ops, then one gather for the rest
 //!   (INSERT's ON CONFLICT paths).
 //! - [`buffered_net`] — the net map, over a known key set or over every PK the
 //!   transaction touched (UPDATE/DELETE's key-pinned and unpinned bounds).
@@ -28,7 +28,7 @@ use std::sync::Arc;
 use crate::dml::plan::{fetch_bound, AccessPlan};
 use crate::error::GnitzSqlError;
 use crate::exec::batch::RowGather;
-use gnitz_core::{native_le_key, native_packed_key, GnitzClient, PkBuf, Schema, ZSetBatch};
+use gnitz_core::{native_le_key, native_packed_key, GnitzClient, PkBuf, PkColumn, Schema, ZSetBatch};
 use gnitz_wire::{ReadBound, ReadSink};
 use std::collections::{HashMap, HashSet};
 
@@ -42,58 +42,80 @@ pub(super) enum Buffered<'a> {
 /// PK → net effect, borrowing the buffer's rows. Empty in autocommit.
 pub(super) type Net<'a> = HashMap<PkBuf, Buffered<'a>>;
 
-/// The rows `keys` currently resolve to, as one owned batch plus a `PK → row`
-/// index; a key that resolves to nothing is absent from the index. Per key the
-/// rule is the transaction's last buffered op wins (`Present` → that row,
-/// `Deleted` → absent), else the committed store decides.
-///
-/// Resolved for the whole set at once, which is what keeps a multi-row
-/// `ON CONFLICT` at one round trip rather than one per row: every key the buffer
-/// does not decide goes into a single `PkSet` gather. Duplicate keys resolve to
-/// the same row, so the caller need not pre-deduplicate.
+/// One incoming row's verdict against the effective state.
+pub(crate) enum Conflict {
+    /// An earlier row of the same batch already claimed this PK.
+    Repeat,
+    /// Nothing holds this PK: absent from the store, or buffered as deleted.
+    Fresh,
+    /// Row `usize` of the returned batch holds it.
+    Existing(usize),
+}
+
+/// One [`Conflict`] per row of `pks`, plus the rows that exist as one owned batch.
+/// The transaction's last buffered op on a key wins; every key it leaves undecided
+/// goes into a single `PkSet` gather, one round trip for the whole column.
 pub(crate) fn effective_rows(
     client: &mut GnitzClient,
     tid: u64,
     schema: &Arc<Schema>,
-    keys: &[PkBuf],
-) -> Result<(ZSetBatch, HashMap<PkBuf, usize>), GnitzSqlError> {
+    pks: &PkColumn,
+) -> Result<(ZSetBatch, Vec<Conflict>), GnitzSqlError> {
     let gather = RowGather::new(schema);
-    let mut out = ZSetBatch::with_capacity(schema, keys.len());
-    let mut index: HashMap<PkBuf, usize> = HashMap::with_capacity(keys.len());
+    let mut out = ZSetBatch::with_capacity(schema, pks.len());
+    let mut verdicts: Vec<Conflict> = Vec::with_capacity(pks.len());
     let mut undecided: Vec<PkBuf> = Vec::new();
     // The buffer borrow is confined to this block, so it ends before the fetch.
     {
-        let net = buffered_net(client, tid, Some(keys));
-        let mut seen: HashSet<PkBuf> = HashSet::with_capacity(keys.len());
-        for pk in keys {
-            if !seen.insert(*pk) {
+        let buf = client.txn_reads(tid);
+        let mut seen: HashSet<&[u8]> = HashSet::with_capacity(pks.len());
+        for i in 0..pks.len() {
+            let key = pks.get_bytes(i);
+            if !seen.insert(key) {
+                verdicts.push(Conflict::Repeat);
                 continue;
             }
-            match net.get(pk) {
+            match buf.as_ref().and_then(|b| b.last_op(key)).map(|(b, r)| op_of(b, r)) {
                 Some(Buffered::Present(batch, row)) => {
-                    index.insert(*pk, out.len());
-                    gather.copy(batch, *row, &mut out);
+                    verdicts.push(Conflict::Existing(out.len()));
+                    gather.copy(batch, row, &mut out);
                 }
                 // A buffered delete is absent whatever the store holds.
-                Some(Buffered::Deleted) => {}
-                None => undecided.push(*pk),
+                Some(Buffered::Deleted) => verdicts.push(Conflict::Fresh),
+                None => {
+                    undecided.push(pks.get_tuple(i));
+                    verdicts.push(Conflict::Fresh);
+                }
             }
         }
     }
     if !undecided.is_empty() {
         let committed = fetch_committed(client, tid, schema, &undecided)?;
+        let base = out.len();
         for i in 0..committed.len() {
-            index.insert(committed.pks.get_tuple(i), out.len());
             gather.copy(&committed, i, &mut out);
         }
+        let found: HashMap<&[u8], usize> = (0..committed.len())
+            .map(|i| (committed.pks.get_bytes(i), base + i))
+            .collect();
+        // Only an undecided key was fetched, so a buffered delete stays `Fresh`
+        // and a `Repeat` keeps its verdict whatever the store answered.
+        for (i, verdict) in verdicts.iter_mut().enumerate() {
+            if let (Conflict::Fresh, Some(&row)) = (&*verdict, found.get(pks.get_bytes(i))) {
+                *verdict = Conflict::Existing(row);
+            }
+        }
     }
-    Ok((out, index))
+    Ok((out, verdicts))
 }
 
 /// The committed rows for `keys`. A single-column PK has a `PkSet` wire form, so
 /// the whole set is one gather (chunked by `fetch_bound` past the per-gather
 /// cap). Only a PK too wide for the wire's 16-byte scalar key has none, and
 /// falls back to a seek per key.
+///
+/// The reply is read back under the caller's own `schema`: a stored row is
+/// *assumed* to match the catalog, never checked against a server-echoed schema.
 fn fetch_committed(
     client: &mut GnitzClient,
     tid: u64,
@@ -108,14 +130,14 @@ fn fetch_committed(
         // gather is the whole selection. ON CONFLICT needs the committed rows for
         // a key set it already holds, so it takes this bound directly rather than
         // re-deriving it from a synthetic `pk IN (…)`.
-        let keys = keys.iter().map(|k| native_packed_key(schema, k)).collect();
+        let keys = keys.iter().map(|k| native_packed_key(schema, k.pk_bytes())).collect();
         let plan = AccessPlan::new(ReadBound::PkSet(keys), &[], Vec::new(), schema)?;
         return fetch_bound(client, tid, &plan.access, &ReadSink::all_rows(), schema);
     }
     let gather = RowGather::new(schema);
     let mut out = ZSetBatch::with_capacity(schema, keys.len());
     for pk in keys {
-        let native = native_le_key(schema, pk);
+        let native = native_le_key(schema, pk.pk_bytes());
         let (low, extra) = gnitz_wire::control::split_ctrl_key(&native[..schema.pk_stride()]);
         if let Some(b) = client.seek(tid, low, extra)?.1.filter(|b| !b.pks.is_empty()) {
             for i in 0..b.len() {
@@ -139,7 +161,7 @@ pub(crate) fn buffered_net<'a>(client: &'a mut GnitzClient, tid: u64, keys: Opti
     match keys {
         Some(keys) => keys
             .iter()
-            .filter_map(|pk| buf.last_op(pk).map(|(b, r)| (*pk, op_of(b, r))))
+            .filter_map(|pk| buf.last_op(pk.pk_bytes()).map(|(b, r)| (*pk, op_of(b, r))))
             .collect(),
         None => buf.last_ops().map(|(pk, b, r)| (pk, op_of(b, r))).collect(),
     }

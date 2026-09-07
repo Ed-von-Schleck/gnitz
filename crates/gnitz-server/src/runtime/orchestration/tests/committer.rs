@@ -7,7 +7,7 @@
 use super::*;
 use crate::runtime::reactor::{Limits, Reactor};
 use crate::test_support::make_schema_u64_i64;
-use gnitz_wire::STATUS_ERROR;
+use gnitz_wire::{WireConflictMode, STATUS_ERROR};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
@@ -36,7 +36,6 @@ fn push_of(rows: usize) -> CommitRequest {
     CommitRequest::Push(PendingPush {
         tid: 7,
         batch: batch_of(rows),
-        mode: WireConflictMode::Update,
         recoverable: true,
         done,
     })
@@ -147,7 +146,6 @@ fn test_reactor() -> Reactor {
 fn group_of(reactor: &Reactor, tid: i64, write_err: Option<WireFault>) -> GroupInfo {
     GroupInfo {
         tid,
-        mode: WireConflictMode::Update,
         recoverable: true,
         req_ids: reactor.alloc_replies(1),
         merged: Batch::empty_with_schema(&make_schema_u64_i64()),

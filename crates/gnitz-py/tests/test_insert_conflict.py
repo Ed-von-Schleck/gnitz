@@ -5,6 +5,7 @@ Covers:
  - Intra-batch PK duplicates are rejected atomically.
  - ON CONFLICT (pk) DO NOTHING skips conflicting rows.
  - ON CONFLICT (pk) DO UPDATE SET col = EXCLUDED.col upserts rows.
+ - An explicit column list may be partial and reordered; omitted columns are NULL.
  - Unsupported ON CONFLICT variants return clear error messages.
 """
 
@@ -206,6 +207,45 @@ def test_insert_on_conflict_do_update_literal_assignment(client):
 
 
 # ---------------------------------------------------------------------------
+# Explicit column lists
+# ---------------------------------------------------------------------------
+
+
+def test_insert_partial_column_list_omits_a_nullable_column(client):
+    """A column list may name a subset, in any order; every column it omits is
+    written NULL (gnitz has no column DEFAULTs)."""
+    sn = "c" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE p (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b TEXT)",
+            schema_name=sn,
+        )
+        # Reordered as well as partial: the slot map, not the position, decides
+        # which column each VALUES element lands in.
+        client.execute_sql("INSERT INTO p (b, pk) VALUES ('x', 1)", schema_name=sn)
+        client.execute_sql("INSERT INTO p (pk, a, b) VALUES (2, 20, 'y')", schema_name=sn)
+        tid, _ = client.resolve_table(sn, "p")
+        rows = sorted((r.pk, r.a, r.b) for r in client.scan(tid))
+        assert rows == [(1, None, "x"), (2, 20, "y")]
+    finally:
+        _cleanup(client, sn, "p")
+
+
+def test_insert_partial_column_list_omitting_a_not_null_column_is_rejected(client):
+    """An omitted column is NULL, so omitting a NOT NULL one is the NOT NULL
+    violation — raised before anything is written."""
+    sn, tid = _make_table(client)
+    try:
+        with pytest.raises(gnitz.GnitzError) as exc:
+            client.execute_sql("INSERT INTO t (pk) VALUES (1)", schema_name=sn)
+        assert "not null" in str(exc.value).lower()
+        assert _scan_rows(client, tid) == []
+    finally:
+        _cleanup(client, sn)
+
+
+# ---------------------------------------------------------------------------
 # Unsupported ON CONFLICT variants
 # ---------------------------------------------------------------------------
 
@@ -226,8 +266,9 @@ def test_insert_on_conflict_non_pk_target_unsupported(client):
         _cleanup(client, sn)
 
 
-def test_insert_composite_on_conflict_target_not_supported(client):
-    """Composite ON CONFLICT targets are v1 unsupported."""
+def test_insert_on_conflict_target_wider_than_the_pk_not_supported(client):
+    """A conflict target must name exactly the primary key; `(pk, val)` on a
+    single-column PK names more than it."""
     sn, tid = _make_table(client)
     try:
         with pytest.raises(gnitz.GnitzError) as exc:
@@ -235,7 +276,7 @@ def test_insert_composite_on_conflict_target_not_supported(client):
                 "INSERT INTO t VALUES (1, 10) ON CONFLICT (pk, val) DO NOTHING",
                 schema_name=sn,
             )
-        assert "composite" in str(exc.value).lower() or "unsupported" in str(exc.value).lower()
+        assert "primary key" in str(exc.value).lower()
     finally:
         _cleanup(client, sn)
 

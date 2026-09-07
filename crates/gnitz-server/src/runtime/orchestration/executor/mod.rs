@@ -1215,7 +1215,6 @@ async fn handle_push(shared: &Rc<Shared>, peer: &Peer, data: &[u8], ctrl: gnitz_
     let queued = shared.enqueue_commit(CommitRequest::Push(PendingPush {
         tid: target_id,
         batch,
-        mode,
         recoverable: !is_stream,
         done: tx,
     }));

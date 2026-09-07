@@ -1083,10 +1083,9 @@ def test_fk_referenced_unique_index_drop_protected(client):
         _cleanup(client, sn, "p", "c")
 
 
-def test_on_conflict_target_column_rejected_on_compound_pk(client):
-    """`ON CONFLICT (a) DO NOTHING` against PK(a, b) hits the
-    `validate_conflict_target` guard before any `pk_index_single()`
-    access — a clean SQL error, not a server-side panic."""
+def test_on_conflict_partial_target_rejected_on_compound_pk(client):
+    """`ON CONFLICT (a)` against PK(a, b) is a partial target: rejected, as
+    PostgreSQL rejects it, with a clean SQL error and no server-side panic."""
     sn = "cpk" + _uid()
     client.create_schema(sn)
     try:
@@ -1097,9 +1096,66 @@ def test_on_conflict_target_column_rejected_on_compound_pk(client):
                 "ON CONFLICT (a) DO NOTHING",
                 schema_name=sn,
             )
-        assert "compound" in str(exc.value).lower()
+        assert "primary key" in str(exc.value).lower()
     finally:
         _cleanup(client, sn, "conf_t")
+
+
+def test_compound_pk_on_conflict_target_do_update(client):
+    """`ON CONFLICT (a, b) DO UPDATE` against PK(a, b). The merged row takes the
+    assigned payload; unassigned `note` carries through from the stored row, null
+    bit included — the bit renumbering a compound PK does not close-form."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, payload BIGINT, "
+            "note BIGINT, PRIMARY KEY (a, b))",
+            schema_name=sn,
+        )
+        # Two stored rows whose carried column differs in null bit.
+        client.execute_sql("INSERT INTO t (a, b, payload) VALUES (1, 2, 10)", schema_name=sn)
+        client.execute_sql(
+            "INSERT INTO t (a, b, payload, note) VALUES (5, 6, 50, 42)", schema_name=sn
+        )
+        client.execute_sql(
+            "INSERT INTO t (a, b, payload) VALUES (1, 2, 99), (5, 6, 55), (3, 4, 7) "
+            "ON CONFLICT (a, b) DO UPDATE SET payload = EXCLUDED.payload",
+            schema_name=sn,
+        )
+        tid, _ = client.resolve_table(sn, "t")
+        rows = sorted((r.a, r.b, r.payload, r.note) for r in client.scan(tid))
+        assert rows == [(1, 2, 99, None), (3, 4, 7, None), (5, 6, 55, 42)]
+    finally:
+        _cleanup(client, sn, "t")
+
+
+def test_three_column_pk_on_conflict_target_do_update(client):
+    """The same, on a 3-column PK: stride 24 is past the wire's scalar key, so the
+    undecided keys resolve through the per-key `seek` fallback rather than one
+    `PkSet` gather. Target columns are written out of PK order, which is legal."""
+    sn = "cpk" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (a BIGINT UNSIGNED, b BIGINT UNSIGNED, c BIGINT UNSIGNED, "
+            "payload BIGINT, note BIGINT, PRIMARY KEY (a, b, c))",
+            schema_name=sn,
+        )
+        client.execute_sql("INSERT INTO t (a, b, c, payload) VALUES (1, 2, 3, 10)", schema_name=sn)
+        client.execute_sql(
+            "INSERT INTO t (a, b, c, payload, note) VALUES (4, 5, 6, 50, 42)", schema_name=sn
+        )
+        client.execute_sql(
+            "INSERT INTO t (a, b, c, payload) VALUES (1, 2, 3, 99), (4, 5, 6, 55), (7, 8, 9, 7) "
+            "ON CONFLICT (c, a, b) DO UPDATE SET payload = EXCLUDED.payload",
+            schema_name=sn,
+        )
+        tid, _ = client.resolve_table(sn, "t")
+        rows = sorted((r.a, r.b, r.c, r.payload, r.note) for r in client.scan(tid))
+        assert rows == [(1, 2, 3, 99, None), (4, 5, 6, 55, 42), (7, 8, 9, 7, None)]
+    finally:
+        _cleanup(client, sn, "t")
 
 
 # ---------------------------------------------------------------------------
@@ -1321,8 +1377,8 @@ def test_compound_pk_insert_duplicate_tuple_rejected(client):
 
 
 def test_compound_pk_on_conflict_no_target_do_nothing(client):
-    """No-target arms (`ON CONFLICT DO NOTHING` / `DO UPDATE`) don't
-    touch `pk_index_single()` — should accept compound-PK tables."""
+    """A targetless `ON CONFLICT DO NOTHING` means the primary key, whatever its
+    arity — accepted on a compound-PK table."""
     sn = "cpk" + _uid()
     client.create_schema(sn)
     try:
@@ -1496,9 +1552,9 @@ def test_compound_pk_scalars_on_pk_columns(client):
 
 
 def test_delete_single_pk_u64_accepts_int(client):
-    """`client.delete(...)` on a single-PK U64 table accepts plain int PKs.
-    The binding must adopt the schema's PK stride so the resulting tuple
-    matches the `PkColumn::U64s` variant in `push_tuple`."""
+    """`client.delete(...)` on a single-PK U64 table accepts plain int PKs: the
+    binding adopts the schema's PK stride, so the key it builds is one whole row
+    of the retraction's PK region."""
     sn = "s" + _uid()
     client.create_schema(sn)
     try:

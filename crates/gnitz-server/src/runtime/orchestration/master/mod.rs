@@ -32,9 +32,7 @@ use gnitz_store::ops::{op_relay_broadcast, op_relay_scatter_consolidated, op_rep
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::storage::Batch;
 use gnitz_wire::control::peek_control_block_ipc;
-use gnitz_wire::{
-    wire_flags_set_conflict_mode, WireConflictMode, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_HAS_DATA, FLAG_HAS_SCHEMA,
-};
+use gnitz_wire::{WireConflictMode, FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_HAS_DATA, FLAG_HAS_SCHEMA};
 use scatter::{with_commit_indices, with_group, with_worker_indices};
 
 // ---------------------------------------------------------------------------

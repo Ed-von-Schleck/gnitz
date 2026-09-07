@@ -32,7 +32,7 @@ use crate::runtime::reactor::{chan, join_into, oneshot, select2, Either, ReplyFu
 use crate::runtime::sal::{GroupTargets, SalMessageKind, SalScope};
 use crate::runtime::wire::DecodedWire;
 use gnitz_store::storage::Batch;
-use gnitz_wire::{WireConflictMode, WireFault};
+use gnitz_wire::WireFault;
 use std::rc::Rc;
 
 /// Row ceiling on one committer batch. Tested before the receive, so a batch is
@@ -98,7 +98,6 @@ pub enum BarrierKind {
 pub struct PendingPush {
     pub tid: i64,
     pub batch: Batch,
-    pub mode: WireConflictMode,
     /// Whether these rows are something a restart must recover, i.e. whether this
     /// group may open the zone the sentinel and fdatasync close. False only for a
     /// stream. Decided by the executor, which has already resolved the target's kind,
@@ -408,13 +407,12 @@ async fn await_servicing<T>(
     }
 }
 
-/// One homogeneous (tid, mode) SAL group: a merged run of single pushes, or one
-/// transaction family.
+/// One single-tid SAL group: a merged run of single pushes, or one transaction
+/// family.
 struct GroupInfo {
     tid: i64,
-    mode: WireConflictMode,
     /// See `CommitRequest::Push::recoverable`. A merged run is homogeneous in
-    /// `(tid, mode)`, so one flag per group is exact.
+    /// `tid`, so one flag per group is exact.
     recoverable: bool,
     req_ids: ReplyLease,
     merged: Batch,
@@ -487,9 +485,9 @@ async fn commit_pushes(
     fut_slots: &mut Vec<ReplyFuture>,
     ack_slots: &mut Vec<Option<DecodedWire>>,
 ) {
-    // Sort by (tid, mode) so runs are homogeneous. Stable: arrival order within a
-    // run is what makes intra-batch last-insert-wins mean last *inserted*.
-    pushes.sort_by_key(|p| (p.tid, p.mode.as_wire()));
+    // Sort by tid so runs are homogeneous. Stable: arrival order within a run is
+    // what makes intra-batch last-insert-wins mean last *inserted*.
+    pushes.sort_by_key(|p| p.tid);
 
     let nw = shared.disp().num_workers();
     let mut units: Vec<CommitUnit> = Vec::with_capacity(txns.len());
@@ -506,7 +504,6 @@ async fn commit_pushes(
                 .into_iter()
                 .map(|fam| GroupInfo {
                     tid: fam.tid,
-                    mode: fam.mode,
                     recoverable: true,
                     req_ids: alloc_req_ids(),
                     merged: fam.batch,
@@ -517,11 +514,11 @@ async fn commit_pushes(
         });
     }
 
-    // Single-push runs: walk the sorted pushes, draining each maximal (tid, mode)
-    // run into one merged group.
+    // Single-push runs: walk the sorted pushes, draining each maximal tid run
+    // into one merged group.
     let mut remaining = pushes.into_iter().peekable();
     while let Some(first) = remaining.next() {
-        let (tid, mode, recoverable) = (first.tid, first.mode, first.recoverable);
+        let (tid, recoverable) = (first.tid, first.recoverable);
         // Split the run into its two independent halves as it is drained: the
         // batches the merge consumes, and the `done` senders the unit resolves.
         // The run's first batch is held apart, so the dominant single-push case
@@ -529,7 +526,7 @@ async fn commit_pushes(
         let head = first.batch;
         let mut tail: Vec<Batch> = Vec::new();
         let mut dones = vec![first.done];
-        while remaining.peek().is_some_and(|p| p.tid == tid && p.mode == mode) {
+        while remaining.peek().is_some_and(|p| p.tid == tid) {
             let p = remaining.next().unwrap();
             tail.push(p.batch);
             dones.push(p.done);
@@ -569,7 +566,6 @@ async fn commit_pushes(
         units.push(CommitUnit {
             groups: vec![GroupInfo {
                 tid,
-                mode,
                 recoverable,
                 req_ids: alloc_req_ids(),
                 merged,
@@ -744,7 +740,7 @@ fn lay_out_group(shared: &Rc<Shared>, scope: &SalScope, g: &GroupInfo) -> Result
     guard_panic("commit_write", || {
         Ok(shared
             .disp()
-            .write_commit_group(scope, g.tid, &g.merged, g.mode, &g.req_ids, g.recoverable)
+            .write_commit_group(scope, g.tid, &g.merged, &g.req_ids, g.recoverable)
             .err())
     })?
     .map_or(Ok(()), Err)

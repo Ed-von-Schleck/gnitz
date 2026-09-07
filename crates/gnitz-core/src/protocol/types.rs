@@ -410,15 +410,16 @@ pub fn opk_key_packed(schema: &Schema, v: u128) -> PkBuf {
     opk_key_native_bytes(schema, &v.to_le_bytes()[..stride])
 }
 
-/// `key` in the wire's native key space; valid bytes are `0..key.len()`.
-pub fn native_le_key(schema: &Schema, key: &PkBuf) -> [u8; MAX_PK_BYTES] {
-    native_row(schema, key.pk_bytes())
+/// `key`, one row of OPK bytes, in the wire's native key space; valid bytes are
+/// `0..key.len()`.
+pub fn native_le_key(schema: &Schema, key: &[u8]) -> [u8; MAX_PK_BYTES] {
+    native_row(schema, key)
 }
 
 /// [`native_le_key`] packed into one word — the form a `ReadBound::PkSet`
 /// ships. Defined for a key of at most `NARROW_PK_MAX_BYTES`.
-pub fn native_packed_key(schema: &Schema, key: &PkBuf) -> u128 {
-    gnitz_wire::control::split_ctrl_key(&native_le_key(schema, key)[..key.width()]).0
+pub fn native_packed_key(schema: &Schema, key: &[u8]) -> u128 {
+    gnitz_wire::control::split_ctrl_key(&native_le_key(schema, key)[..key.len()]).0
 }
 
 /// A batch's PK region: `stride` bytes per row of **order-preserving key** (OPK,
@@ -561,12 +562,6 @@ impl PkColumn {
     pub fn push_from(&mut self, src: &PkColumn, i: usize) {
         debug_assert_eq!(self.stride, src.stride);
         self.buf.extend_from_slice(src.get_bytes(i));
-    }
-
-    /// Append `pk`'s bytes — verbatim, both being OPK.
-    pub fn push_tuple(&mut self, pk: &PkBuf) {
-        debug_assert_eq!(pk.width(), self.width());
-        self.buf.extend_from_slice(pk.pk_bytes());
     }
 
     /// Every key decoded, for `assert_eq!(pks.to_vec_u128(schema), expected)`.

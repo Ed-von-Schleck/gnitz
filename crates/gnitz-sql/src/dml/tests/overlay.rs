@@ -155,7 +155,7 @@ fn net_restricted_to_keys_excludes_untouched_and_unlisted() {
     let reads = buf.reads(tid);
     let only_1: Net = [key(1)]
         .iter()
-        .filter_map(|pk| reads.last_op(pk).map(|(b, r)| (*pk, op_of(b, r))))
+        .filter_map(|pk| reads.last_op(pk.pk_bytes()).map(|(b, r)| (*pk, op_of(b, r))))
         .collect();
     assert_eq!(full_len, 2);
     assert_eq!(only_1.len(), 1);

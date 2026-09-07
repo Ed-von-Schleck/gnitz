@@ -512,9 +512,9 @@ pub(crate) fn cte_body<'a>(
     reject_query_envelope_body(query, ctx)
 }
 
-/// Reject every `Insert`-statement clause the INSERT planner does not consume. `extract_insert_parts`
-/// reads only `table`, `source`, `columns`, and `on` (ON CONFLICT, fully resolved there); every other
-/// field is a conflict / overwrite / partition / RETURNING clause parsed under `GenericDialect` and
+/// Reject every `Insert`-statement clause the INSERT planner does not consume. It reads only
+/// `table`, `source`, `columns`, `on` (ON CONFLICT) and `returning`; every other field is a
+/// conflict / overwrite / partition clause parsed under `GenericDialect` and
 /// silently reinterpreted as a plain append. The `source` is a full `Query` whose envelope (LIMIT,
 /// ORDER BY, FETCH, a `WITH`, …) an INSERT equally cannot honor, so it is routed through
 /// `reject_unhonored_query_clauses` here too — every INSERT-clause rejection lives in this one guard.
@@ -523,7 +523,7 @@ pub(crate) fn cte_body<'a>(
 pub(crate) fn reject_unhonored_insert_clauses(insert: &sqlparser::ast::Insert) -> Result<(), GnitzSqlError> {
     const CTX: &str = "INSERT";
     let sqlparser::ast::Insert {
-        // Consumed by `extract_insert_parts`; `source`'s `Query` envelope is additionally checked below.
+        // Consumed by `execute_insert`; `source`'s `Query` envelope is additionally checked below.
         table: _,
         source,
         columns: _,

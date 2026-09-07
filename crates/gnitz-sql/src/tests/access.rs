@@ -397,7 +397,7 @@ fn check_pk_parity(pk_tc: TypeCode, literal: Expr, expected: u128) {
     let row = vec![literal.clone(), num_expr("0")];
     let got_insert = extract_pk_value(&row, &schema).unwrap_or_else(|e| panic!("extract_pk_value({pk_tc:?}): {e}"));
     assert_eq!(
-        gnitz_core::native_packed_key(&schema, &got_insert),
+        gnitz_core::native_packed_key(&schema, got_insert.pk_bytes()),
         expected,
         "extract_pk_value"
     );

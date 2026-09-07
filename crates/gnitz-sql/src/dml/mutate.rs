@@ -120,16 +120,22 @@ pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema)
 /// per-row drive would pay `eval_batch`'s prologue for one row.
 pub(crate) enum SetValues<'a> {
     Const(&'a ColumnValue),
-    /// A `TypeCode::String` payload slot of the bound batch, read verbatim.
-    StrCol(usize),
+    /// A `TypeCode::String` payload slot of the bound batch, read verbatim
+    /// through the view it was bound against.
+    StrCol {
+        view: &'a ZSetBatchView<'a>,
+        pi: usize,
+    },
     Computed(ExprResults),
 }
 
-/// Bind `p` to `view`, driving its computed arm over every row up front.
-pub(crate) fn bind_set_program<'a>(p: &'a SetProgram, view: &ZSetBatchView<'_>) -> SetValues<'a> {
+/// Bind `p` to `view`, driving its computed arm over every row up front. The
+/// view rides in the bound value, so a caller with two candidate scopes in scope
+/// at once cannot read a value back through the wrong one.
+pub(crate) fn bind_set_program<'a>(p: &'a SetProgram, view: &'a ZSetBatchView<'a>) -> SetValues<'a> {
     match p {
         SetProgram::Const(cv) => SetValues::Const(cv),
-        SetProgram::StrCol(c) => SetValues::StrCol(*c),
+        SetProgram::StrCol(c) => SetValues::StrCol { view, pi: *c },
         SetProgram::Expr(ev) => SetValues::Computed(ev.eval_all(view)),
     }
 }
@@ -138,10 +144,10 @@ pub(crate) fn bind_set_program<'a>(p: &'a SetProgram, view: &ZSetBatchView<'_>) 
 /// every *kind* rejection happened at [`classify_set_rhs`]. A computed value's
 /// range is the one verdict that cannot be reached until the value exists, so it
 /// is taken where the value is written (`append_column_value`).
-pub(crate) fn eval_set_value(v: &SetValues<'_>, view: &ZSetBatchView<'_>, row: usize) -> ColumnValue {
+pub(crate) fn eval_set_value(v: &SetValues<'_>, row: usize) -> ColumnValue {
     match v {
         SetValues::Const(cv) => (*cv).clone(),
-        SetValues::StrCol(pi) => {
+        SetValues::StrCol { view, pi } => {
             if gnitz_wire::null_word_get(view.get_null_word(row), *pi) {
                 ColumnValue::Null
             } else {
@@ -282,7 +288,7 @@ fn write_set_rows(
     let payload = merge_payload_plan(schema);
     for row_idx in 0..current.len() {
         build_merged_row(current, row_idx, current, row_idx, &payload, dst, |ci| {
-            asn_by_col[ci].map(|v| eval_set_value(v, &view, row_idx))
+            asn_by_col[ci].map(|v| eval_set_value(v, row_idx))
         })?;
     }
     Ok(())

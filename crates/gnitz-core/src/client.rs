@@ -2069,7 +2069,7 @@ impl<'a> TxnReads<'a> {
     /// transaction has not touched that PK. The row's **weight sign** is the net
     /// effect (positive: live row with that payload; negative: deleted),
     /// mirroring the engine's own per-table fold.
-    pub fn last_op(&self, pk: &PkBuf) -> Option<(&'a ZSetBatch, usize)> {
+    pub fn last_op(&self, pk: &[u8]) -> Option<(&'a ZSetBatch, usize)> {
         let &(fam, row) = self.buf.last_op_of.get(&self.tid)?.get(pk)?;
         Some((&self.buf.families[fam].batch, row))
     }

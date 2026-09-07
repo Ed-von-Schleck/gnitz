@@ -983,7 +983,6 @@ impl MasterDispatcher {
         scope: &SalScope,
         target_id: i64,
         batch: &Batch,
-        mode: WireConflictMode,
         req_ids: &[u64],
         recoverable: bool,
     ) -> Result<(), WorkerFault> {
@@ -993,10 +992,6 @@ impl MasterDispatcher {
         // keeps the atomic-zone framing, LSN, ACK accounting, and the committer's
         // single `fdatasync` shared between them.
         let base = DirectGroup {
-            template: wire::WireMsg {
-                flags: wire_flags_set_conflict_mode(0, mode),
-                ..Default::default()
-            },
             targets: GroupTargets::All(req_ids),
             ..DirectGroup::new(SalMessageKind::Push)
         };

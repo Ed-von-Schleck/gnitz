@@ -2,7 +2,7 @@
 //! truth.
 //!
 //! `parse_pk_literal_packed` is the single helper through which every INSERT and
-//! SEEK PK literal flows ([`PkPlan::extract`], plus `try_col_eq_literal` /
+//! SEEK PK literal flows ([`PkPlan::push`], plus `try_col_eq_literal` /
 //! `try_extract_pk_in` in the WHERE planner), so the master cannot route an
 //! INSERT and a DELETE for the same key to different workers.
 //!
@@ -13,7 +13,9 @@
 use crate::ast_util::Constant;
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr, UnaryOp};
-use gnitz_core::{opk_key_cols, FixedInt, PkBuf, Schema, TypeCode};
+#[cfg(test)]
+use gnitz_core::PkBuf;
+use gnitz_core::{FixedInt, PkColumn, Schema, TypeCode};
 
 pub(crate) fn parse_uuid_str(s: &str) -> Result<u128, GnitzSqlError> {
     gnitz_wire::parse_uuid(s).ok_or_else(|| GnitzSqlError::Bind(format!("invalid UUID literal: {s:?}")))
@@ -44,7 +46,7 @@ pub(crate) fn parse_literal_i128(n_str: &str, negated: bool) -> Option<i128> {
 /// wrong rows — the cff7c58-class trap).
 ///
 /// This helper is the single source of truth for INSERT/SEEK PK routing —
-/// [`PkPlan::extract`], `try_col_eq_literal`, and `try_extract_pk_in` all
+/// [`PkPlan::push`], `try_col_eq_literal`, and `try_extract_pk_in` all
 /// dispatch through it so the master cannot send INSERT and DELETE for the
 /// same key to different workers.
 pub(crate) fn parse_pk_literal_packed(tc: TypeCode, n_str: &str, negated: bool) -> Option<u128> {
@@ -226,18 +228,24 @@ fn parse_one_pk_literal(c: &Constant, tc: TypeCode, col_name: &str) -> Result<u1
     })
 }
 
-/// The row-invariant half of PK extraction from a VALUES list: per PK column,
-/// in pk-list order, the VALUES slot it reads and the column it names. Resolved
-/// once per statement rather than per row.
-pub(crate) struct PkPlan<'s> {
-    schema: &'s Schema,
-    cols: Vec<(usize, TypeCode, &'s str)>,
+/// Where each INSERT row's PK comes from, resolved once per statement: drawn
+/// from the sequence, or read out of the VALUES slots the row-invariant column
+/// plan names.
+pub(crate) enum PkPlan<'s> {
+    /// A SERIAL PK: `base + row_i`, bounded by `max`, the column type's maximum.
+    Serial { schema: &'s Schema, base: u64, max: i128 },
+    /// A written PK: per PK column, in pk-list order, the VALUES slot it reads
+    /// and the column it names.
+    Written {
+        schema: &'s Schema,
+        cols: Vec<(usize, TypeCode, &'s str)>,
+    },
 }
 
 impl<'s> PkPlan<'s> {
     /// `slot_of` is the INSERT's physical-column → VALUES-slot map, `None` where
-    /// a column takes no user value. A PK column always takes one.
-    pub(crate) fn new(slot_of: &[Option<usize>], schema: &'s Schema) -> Result<Self, GnitzSqlError> {
+    /// a column takes no user value. A written PK column always takes one.
+    pub(crate) fn written(slot_of: &[Option<usize>], schema: &'s Schema) -> Result<Self, GnitzSqlError> {
         let cols = schema
             .pk_cols
             .iter()
@@ -250,22 +258,52 @@ impl<'s> PkPlan<'s> {
                 Ok((slot, c.type_code, c.name.as_str()))
             })
             .collect::<Result<Vec<_>, GnitzSqlError>>()?;
-        Ok(PkPlan { schema, cols })
+        Ok(PkPlan::Written { schema, cols })
     }
 
-    /// The primary key of one bound VALUES row as a `PkBuf`, each column's
-    /// native LE bytes copied into the tuple buffer.
-    pub(crate) fn extract(&self, row: &[Constant]) -> Result<PkBuf, GnitzSqlError> {
-        // `PK_LIST_MAX_COLS < MAX_PK_COLUMNS`, so every validated PK fits without
-        // a per-row allocation; `opk_key_cols` owns the byte layout.
-        let mut natives = [0u128; gnitz_wire::MAX_PK_COLUMNS];
-        for (native, &(slot, tc, name)) in natives.iter_mut().zip(&self.cols) {
-            let c = row
-                .get(slot)
-                .ok_or_else(|| GnitzSqlError::Bind(format!("PK column '{name}' missing from INSERT row")))?;
-            *native = parse_one_pk_literal(c, tc, name)?;
+    /// A SERIAL PK drawn from `base`. The column type's maximum is resolved here,
+    /// once per statement, rather than per row at the exhaustion check.
+    pub(crate) fn serial(schema: &'s Schema, base: u64, tc: TypeCode) -> Self {
+        let max = FixedInt::from_type_code(tc)
+            .expect("SERIAL underlying is a fixed int")
+            .range()
+            .1;
+        PkPlan::Serial { schema, base, max }
+    }
+
+    /// Whether this statement's PKs are auto-assigned, which is what the arity
+    /// error names when a row supplies one value too many.
+    pub(crate) fn is_serial(&self) -> bool {
+        matches!(self, PkPlan::Serial { .. })
+    }
+
+    /// Append row `row_i`'s primary key to `dst`: the next sequence value, or the
+    /// written cells' native LE bytes copied into the tuple buffer.
+    pub(crate) fn push(&self, row_i: usize, cells: &[Constant], dst: &mut PkColumn) -> Result<(), GnitzSqlError> {
+        match self {
+            PkPlan::Serial { schema, base, max } => {
+                // An exhausted sequence is rejected client-side, so `Bind` like the
+                // arity guard. The addition wraps only after ~1.8·10¹⁹ reserved ids.
+                let id = base + row_i as u64;
+                if id as i128 > *max {
+                    return Err(GnitzSqlError::Bind(format!(
+                        "SERIAL primary key exhausted: next value {id} exceeds the column type maximum {max}"
+                    )));
+                }
+                dst.push_u128(schema, id as u128);
+            }
+            PkPlan::Written { schema, cols } => {
+                // `PK_LIST_MAX_COLS < MAX_PK_COLUMNS`, so no per-row allocation; every
+                // slot is in range because the arity guard pins `cells.len()` to the
+                // same map these slots came from.
+                let mut natives = [0u128; gnitz_wire::MAX_PK_COLUMNS];
+                for (native, &(slot, tc, name)) in natives.iter_mut().zip(cols) {
+                    *native = parse_one_pk_literal(&cells[slot], tc, name)?;
+                }
+                dst.push_natives(schema, &natives[..cols.len()]);
+            }
         }
-        Ok(opk_key_cols(self.schema, natives))
+        Ok(())
     }
 }
 
@@ -279,7 +317,9 @@ pub(crate) fn extract_pk_value(row: &[sqlparser::ast::Expr], schema: &Schema) ->
         .iter()
         .map(crate::ast_util::bind_constant)
         .collect::<Result<Vec<_>, _>>()?;
-    PkPlan::new(&slot_of, schema)?.extract(&cells)
+    let mut pks = PkColumn::empty_for_schema(schema);
+    PkPlan::written(&slot_of, schema)?.push(0, &cells, &mut pks)?;
+    Ok(pks.get_tuple(0))
 }
 
 #[cfg(test)]

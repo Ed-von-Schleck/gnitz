@@ -378,7 +378,7 @@ fn a_computed_string_rhs_routes_to_the_string_arm_and_evaluates() {
     let cell = gnitz_wire::encode_german_string(b"hello", &mut batch.blob);
     batch.columns[1].extend_from_slice(&cell);
     let view = ZSetBatchView::new(&batch, &schema);
-    match eval_set_value(&bind_set_program(&p, &view), &view, 0) {
+    match eval_set_value(&bind_set_program(&p, &view), 0) {
         ColumnValue::Str(s) => assert_eq!(s, b"HELLO"),
         _ => panic!("expected a string value"),
     }

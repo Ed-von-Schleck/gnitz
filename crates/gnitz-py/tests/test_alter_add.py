@@ -48,8 +48,7 @@ def test_add_column_reads_null_for_pre_alter_rows(client):
         assert "c" in rows[0]._fields
         assert all(r["c"] is None for r in rows)
 
-        # A new INSERT supplies it; an explicit NULL leaves it unset. (gnitz has
-        # no partial column lists, so the NULL is spelled out.)
+        # A new INSERT supplies it; an explicit NULL leaves it unset.
         client.execute_sql("INSERT INTO t VALUES (21, 210, 2100)", schema_name=sn)
         client.execute_sql("INSERT INTO t VALUES (22, 220, NULL)", schema_name=sn)
 
