@@ -6,8 +6,15 @@ use std::time::Duration;
 use super::super::test_support::*;
 use super::*;
 
-/// One whole-payload client send the way `Peer::send` runs it: the owned send
-/// under the egress deadline.
+/// One whole-payload client send, with nothing racing it.
+async fn owned_send(r: &Reactor, fd: i32, payload: Vec<u8>) -> i32 {
+    r.send_owned(fd, Rc::new(gnitz_store::storage::batch_pool::PooledSendBuf(payload)))
+        .await
+}
+
+/// The same send the way `Peer::send` runs it: under the egress deadline. Only
+/// for the tests whose subject *is* that deadline — `Limits::TEST` sets it to
+/// 10 ms, so any send racing it is a send racing the machine's scheduler.
 async fn guarded_send(r: &Reactor, fd: i32, payload: Vec<u8>) -> i32 {
     let buf = Rc::new(gnitz_store::storage::batch_pool::PooledSendBuf(payload));
     let what = buf.what();
@@ -139,7 +146,9 @@ fn reaped_conn_leaves_no_state_for_the_next_connection() {
 /// Concrete test of the partial-send contract: io_uring's OP_SEND on a
 /// stream socket can return `rc < len`. A 200 KB payload over ~8 KB socket
 /// buffers forces `send_buffer`'s loop to resubmit the remaining slice until
-/// the full buffer drains.
+/// the full buffer drains. Deliberately unguarded: ~25 socket-buffer round
+/// trips do not fit `Limits::TEST`'s 10 ms egress deadline on a loaded box,
+/// and the eviction it would trigger is the next test's subject, not this one's.
 #[test]
 fn send_buffer_loops_until_full_payload_sent_over_socketpair() {
     unsafe {
@@ -149,7 +158,7 @@ fn send_buffer_loops_until_full_payload_sent_over_socketpair() {
         let drain_t = spawn_drain(receiver, payload_len);
 
         let r2 = Rc::clone(&r);
-        let sent = r.block_on(async move { guarded_send(&r2, sender, payload).await });
+        let sent = r.block_on(async move { owned_send(&r2, sender, payload).await });
         // Close before joining: on the truncated send this test exists to
         // catch, the drain's blocking `read` would otherwise never return and
         // the whole binary would hang instead of failing.
