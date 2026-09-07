@@ -109,7 +109,7 @@ fn futex_waitv_wakes_on_any_word() {
 /// protocol needs, so these tests model the production retirement.
 unsafe fn consume_one(recv: &W2mReceiver) -> Option<&'static [u8]> {
     let slot = recv.try_read_slot(0)?;
-    let bytes = slot.bytes;
+    let bytes = &slot.frame[SLOT_LEN_PREFIX_BYTES..];
     drop(slot);
     Some(bytes)
 }
@@ -216,14 +216,15 @@ fn a_full_ring_blocks_the_writer() {
     }
 }
 
-/// Publishing past `MAX_W2M_MSG` is a caller bug, and the ring says so
+/// A message this ring cannot hold is a caller bug, and the ring says so
 /// rather than reporting a full ring the caller would park on forever.
 #[test]
-#[should_panic(expected = "outside (0,")]
+#[should_panic(expected = "exceeds this ring's")]
 fn an_oversized_publish_panics() {
     unsafe {
         let region = make_ring(64, 4, 8);
-        let _ = publish(region.ptr(), (MAX_W2M_MSG + 1) as usize, 0, |_| {});
+        let dcap = RingCursor::producer(region.ptr()).dcap();
+        let _ = publish(region.ptr(), dcap as usize + 1, 0, |_| {});
     }
 }
 
@@ -307,11 +308,10 @@ fn release_follows_front_consecutive_prefix(order: Vec<usize>) {
     unsafe {
         let region = make_ring(8, n, 8);
         let ptr = region.ptr();
-        let writer = W2mWriter::new(ptr);
         let receiver = W2mReceiver::new(vec![ptr]);
 
         for i in 0..n {
-            writer.send_encoded(8, 0, |s| s[0] = i as u8);
+            publish(ptr, 8, 0, |s| s[0] = i as u8).unwrap_or_else(|| panic!("publish #{i}"));
         }
         let mut slots: Vec<Option<W2mSlot>> = Vec::with_capacity(n);
         let mut vrcs = Vec::with_capacity(n);
@@ -367,11 +367,11 @@ fn release_out_of_order() {
 #[test]
 fn a_retired_slot_unparks_the_writer() {
     unsafe {
-        let msg_sz = 64usize;
-        // Ring holds exactly 1 message.
-        let region = make_ring(msg_sz, 1, 8);
+        // Ring holds exactly 1 status frame, which is what the parked writer
+        // below publishes — so the two must be sized the same.
+        let region = make_ring(CTRL_BLOCK_SIZE_NO_BLOB, 1, 8);
         let ptr = region.ptr();
-        publish(ptr, msg_sz, 0, |s| s[0] = 1).expect("ring should have room for the first message");
+        publish(ptr, CTRL_BLOCK_SIZE_NO_BLOB, 0, |s| s[0] = 1).expect("ring should have room for the first message");
 
         let receiver = W2mReceiver::new(vec![ptr]);
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -379,7 +379,7 @@ fn a_retired_slot_unparks_the_writer() {
         // This second publish cannot fit; it blocks until a slot retires.
         let region_addr = ptr as usize;
         let handle = std::thread::spawn(move || {
-            W2mWriter::new(region_addr as *mut u8).send_encoded(msg_sz, 0, |s| s[0] = 2);
+            W2mWriter::new(region_addr as *mut u8).send_status(0, 1, STATUS_OK, &[]);
             let _ = done_tx.send(());
         });
 
@@ -417,7 +417,7 @@ fn wait_any_is_woken_by_a_publish_on_another_ring() {
             while hdr.master_park.flags.load(Ordering::Acquire) & FLAG_MASTER_SYNC == 0 {
                 std::hint::spin_loop();
             }
-            W2mWriter::new(pub_ptr as *mut u8).send_encoded(64, 0, |s| s[0] = 7);
+            publish(pub_ptr as *mut u8, 64, 0, |s| s[0] = 7).expect("ring 3 has room");
         });
         let start = std::time::Instant::now();
         receiver.wait_any(0b1111, 5000); // any ring's wake reaches it
@@ -476,7 +476,7 @@ fn publish_takes_the_master_gate() {
         assert!(receiver.arm_waitv(&mut out).is_some(), "an empty ring must arm");
         assert_ne!(hdr.master_park.flags.load(Ordering::Acquire) & FLAG_MASTER_WAITV, 0);
 
-        W2mWriter::new(ptr).send_encoded(64, 0, |s| s[0] = 1);
+        publish(ptr, 64, 0, |s| s[0] = 1).expect("an empty ring has room");
         assert_eq!(
             hdr.master_park.flags.load(Ordering::Acquire) & FLAG_MASTER_ANY,
             0,

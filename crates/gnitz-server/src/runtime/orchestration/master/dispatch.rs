@@ -4,9 +4,9 @@
 //! counter and worker reaping.
 
 use super::*;
-use crate::runtime::w2m::{worker_mask, BitIter};
 use gnitz_store::foundation::fault::Seam;
 use gnitz_store::foundation::posix_io::retry_eintr;
+use gnitz_wire::{low_bits_mask, BitIter};
 
 /// Ceiling on the synchronous `W2mReceiver::wait_any` park in the collect loop
 /// below, and so also the loop's `fail_if_worker_dead` cadence: a worker that
@@ -201,7 +201,7 @@ impl MasterDispatcher {
     pub(crate) fn collect_acks_and_relay(&self, ctx: &str, checkpoint_allowed: bool) -> Result<(), String> {
         let nw = self.num_workers();
         // One bit per worker still owing its ACK.
-        let mut pending_mask: u64 = worker_mask(nw);
+        let mut pending_mask: u64 = low_bits_mask(nw);
         let mut acc = super::exchange::ExchangeAccumulator::new(nw);
         // Armed when a round is stamped CHECKPOINT; the actual SAL reset is
         // deferred to the next round barrier (see the decision block below).

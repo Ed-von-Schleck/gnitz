@@ -317,8 +317,8 @@ pub(crate) fn preflight_frame_overhead(frame_schema: &SchemaDescriptor, schema_b
 
 /// Keys one pre-flight frame may carry: [`unique_preflight_keys_per_frame`]
 /// clamped so the whole frame — `overhead` included — stays inside `budget`.
-/// Unclamped, that test-only override reaches `w2m::try_reserve`'s
-/// `MAX_W2M_MSG` assertion, which aborts in release.
+/// Unclamped, that test-only override builds a frame the W2M ring cannot hold,
+/// which `w2m::try_reserve` asserts against and which aborts in release.
 ///
 /// Charging per key over-counts the region alignment `block_size_from` does
 /// once, so the count is conservative; `send_unique_preflight_keys` asserts the

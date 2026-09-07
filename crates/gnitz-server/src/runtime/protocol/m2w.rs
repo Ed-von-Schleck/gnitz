@@ -46,23 +46,18 @@ pub(crate) fn eventfd_wait(efd: i32, timeout_ms: i32) -> Wake {
         events: libc::POLLIN,
         revents: 0,
     };
-    let r = loop {
-        let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        break r;
-    };
-    match r {
-        0 => Wake::Idle,
-        r if r < 0 => Wake::Failed,
-        _ => {
+    // A signal restarts `poll` with its full relative timeout, so a storm of
+    // them can outlast `timeout_ms`.
+    match posix_io::retry_eintr(|| unsafe { libc::poll(&mut pfd, 1, timeout_ms) }) {
+        Ok(0) => Wake::Idle,
+        Ok(_) => {
             let mut v: u64 = 0;
             unsafe {
                 libc::read(efd, &mut v as *mut u64 as *mut libc::c_void, 8);
             }
             Wake::Signalled
         }
+        Err(_) => Wake::Failed,
     }
 }
 

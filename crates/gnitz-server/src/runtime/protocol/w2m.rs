@@ -38,9 +38,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use io_uring::types::FutexWaitV;
 
-use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg};
+use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg, FRAME_CAP};
 use gnitz_store::foundation::posix_io;
-use gnitz_wire::align8;
+use gnitz_wire::{align8, BitIter};
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -49,33 +49,28 @@ use gnitz_wire::align8;
 /// Fixed header size at the start of every W2M mmap region.
 const W2M_HEADER_SIZE: usize = 128;
 
-/// Upper bound on a single W2M wire message (256 MiB). Large enough for any
-/// real query response, small enough that `u64::MAX` is an unambiguous
-/// SKIP-marker sentinel in the size prefix.
-pub(crate) const MAX_W2M_MSG: u64 = 1 << 28;
+/// [`FRAME_CAP`]-sized frames the ring holds at once: how far a worker streams
+/// ahead while the master drains another ring. The one policy choice here.
+const W2M_WINDOW_FRAMES: u64 = 16;
 
 /// Capacity (header + data) of each per-worker W2M mmap region.
 ///
-/// The region is mapped whole, so a ring that sweeps all of `DCAP`
-/// every lap holds ~1 GiB of resident shmem per worker for a transport whose
-/// live occupancy is a few KiB. The lever is `MAX_W2M_MSG` — the geometry assert
-/// below makes the region a function of it, so the two move together.
-///
-/// Nothing needs either this large any more: every producer bounds its frames at
-/// `FRAME_CAP`. Lowering them buys resident shared memory, unmeasured so far,
-/// against a capacity that is also the flow-control window (`InFlightState`
-/// releases only a front-consecutive prefix).
-pub(crate) const W2M_REGION_SIZE: usize = 1 << 30;
-// One maximum-size message must always fit past its own SKIP pad: the wrap
-// branch fires only when `total > room_to_end`, so `pad < total <= slot_stride(MAX)`.
+/// Mapped whole, so a ring sweeping all of `DCAP` every lap holds ~1 GiB of
+/// resident shmem per worker for a transport whose live occupancy is a few KiB.
+/// Both factors above are levers on that; the trade is unmeasured.
+const W2M_REGION_SIZE: usize = (W2M_HEADER_SIZE as u64 + W2M_WINDOW_FRAMES * slot_stride(FRAME_CAP)) as usize;
 const _: () = assert!(
-    W2M_REGION_SIZE as u64 >= W2M_HEADER_SIZE as u64 + 2 * slot_stride(MAX_W2M_MSG as usize),
-    "the region must hold a maximum-size message plus its worst-case SKIP pad",
+    W2M_WINDOW_FRAMES >= 2,
+    "a FRAME_CAP message must fit past a SKIP pad of nearly a whole slot, or `try_reserve` \
+     accepts a reservation `publish_at` can never place and the writer parks forever",
 );
-// A parked side value-compares a cursor's low 32 bits (see `futex_word`). One
-// advance is bounded by `DCAP`, so it always changes those bits and can never
-// alias a stale snapshot by `k * 2^32`.
-const _: () = assert!(W2M_REGION_SIZE < u32::MAX as usize);
+// A peer's advance is capped by `publish_at`'s `used + total <= dcap` gate, not
+// by one publish: a parked side issues no releases, so `used` cannot fall under
+// it between `ParkWord::arm`'s snapshot and the kernel's value-compare.
+const _: () = assert!(
+    W2M_REGION_SIZE < u32::MAX as usize,
+    "a cursor advance must always move its low 32 bits — the futex word (see `futex_word`)",
+);
 
 // `arm_park` builds a `futex_waitv` word list of at most `num_workers` entries.
 // The kernel's `FUTEX_WAITV_MAX` is 128; past it the syscall returns EINVAL,
@@ -88,10 +83,6 @@ const SLOT_LEN_PREFIX_BYTES: usize = gnitz_wire::FRAME_LEN_PREFIX_BYTES;
 const _: () = assert!(
     2 * SLOT_LEN_PREFIX_BYTES as u64 == RING_PREFIX_BYTES,
     "the packed slot prefix is two client-prefix-sized halves"
-);
-const _: () = assert!(
-    MAX_W2M_MSG <= u32::MAX as u64,
-    "sz must survive the u32 half it is packed into"
 );
 const _: () = assert!(
     cfg!(target_endian = "little"),
@@ -492,29 +483,6 @@ fn wake_master(park: &ParkWord, flags: u32) {
     futex_wake_u32(futex_word(&park.cursor), FLAG_MASTER_ANY.count_ones(), "wake_master");
 }
 
-/// The mask naming workers `0..n`. Named here beside [`BitIter`] because the
-/// call sites read it as a domain fact ("one bit per worker"); the shift guard
-/// it is spelled through is `gnitz_wire`'s.
-#[inline]
-pub(crate) fn worker_mask(n: usize) -> u64 {
-    gnitz_wire::low_bits_mask(n)
-}
-
-/// Yields the set bit positions of a worker mask, lowest first.
-pub(crate) struct BitIter(pub(crate) u64);
-
-impl Iterator for BitIter {
-    type Item = usize;
-    fn next(&mut self) -> Option<usize> {
-        if self.0 == 0 {
-            return None;
-        }
-        let w = self.0.trailing_zeros() as usize;
-        self.0 &= self.0 - 1;
-        Some(w)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // init / reserve / commit
 // ---------------------------------------------------------------------------
@@ -547,6 +515,11 @@ unsafe fn init_region(ptr: *mut u8, capacity: u64) {
         capacity.is_multiple_of(RING_PREFIX_BYTES),
         "W2M capacity={capacity} must be {RING_PREFIX_BYTES}-byte aligned, or the SKIP path's \
          prefix-word writes at the physical end cross the mapping",
+    );
+    assert!(
+        capacity < u32::MAX as u64,
+        "W2M capacity={capacity} must stay under 2^32, or a cursor's low half can alias a \
+         parked side's snapshot — see the assert beside W2M_REGION_SIZE",
     );
     // Zero first so re-init of a previously-live region clears every byte,
     // padding included.
@@ -612,11 +585,17 @@ impl Reservation {
 /// # Safety
 /// The caller must be the sole producer on `wc`'s ring.
 unsafe fn try_reserve(wc: &RingCursor, sz: usize, internal_req_id: u32) -> Option<Reservation> {
-    assert!(
-        sz > 0 && (sz as u64) <= MAX_W2M_MSG,
-        "w2m::try_reserve: sz={sz} outside (0, {MAX_W2M_MSG}]",
-    );
     let total = slot_stride(sz);
+    assert!(
+        sz > 0,
+        "w2m::try_reserve: an empty message reserves a slot `take_next` aborts on"
+    );
+    assert!(
+        total <= wc.dcap(),
+        "w2m::try_reserve: sz={sz} exceeds this ring's {}-byte capacity — `publish_at` would \
+         refuse it forever and `park_for_room` sleep forever",
+        wc.dcap(),
+    );
     let vrel = wc.header().writer_park.cursor.load(Ordering::Acquire);
     let (write_at, pad) = publish_at(wc, vrel, total)?;
 
@@ -688,8 +667,8 @@ pub struct W2mWriter {
 unsafe impl Send for W2mWriter {}
 
 impl W2mWriter {
-    /// The ring's capacity and cursor are read from the header the region was
-    /// initialized with, so neither is a parameter.
+    /// Capacity and cursor come from the header [`init_region`] wrote, so this
+    /// ring — not a global — is what [`try_reserve`] bounds a message against.
     pub fn new(region_ptr: *mut u8) -> Self {
         W2mWriter {
             // SAFETY: every W2M region is initialized before the fork that
@@ -711,28 +690,20 @@ impl W2mWriter {
         self.send_msg(request_id, &msg);
     }
 
-    /// Encode `msg` into one ring slot tagged `ring_req`. The master reactor
-    /// routes a reply by that ring prefix, not by the payload's `request_id`
-    /// (chunked-train frames leave that field 0). `encode_ipc` writes no
-    /// checksum: the ring is a trusted shared mapping, unlike the SAL.
+    /// Encode `msg` into one ring slot, parking on `release_cursor` while the
+    /// ring is full. `ring_req` narrows to the slot's 32-bit prefix, which is
+    /// what the master routes the reply by. `encode_ipc` writes no checksum:
+    /// the ring is a trusted mapping, unlike the SAL.
     pub fn send_msg(&self, ring_req: u64, msg: &WireMsg<'_>) {
-        self.send_encoded(msg.size(), ring_req as u32, |buf| {
-            msg.encode_ipc(buf, 0);
-        });
-    }
-
-    /// Encode one message into the ring and publish it, blocking on
-    /// `release_cursor` while the ring is full. `internal_req_id` rides the slot
-    /// prefix so the master can route the reply without decoding the frame.
-    fn send_encoded(&self, sz: usize, internal_req_id: u32, encode_fn: impl FnOnce(&mut [u8])) {
+        let (sz, req) = (msg.size(), ring_req as u32);
         // SAFETY: a worker process is the sole producer on its own ring.
         unsafe {
             let mut wc = self.cursor.get();
-            let mut reservation = match try_reserve(&wc, sz, internal_req_id) {
+            let mut reservation = match try_reserve(&wc, sz, req) {
                 Some(r) => r,
-                None => park_for_room(&wc, sz, internal_req_id),
+                None => park_for_room(&wc, sz, req),
             };
-            encode_fn(reservation.slot());
+            msg.encode_ipc(reservation.slot(), 0);
             commit(&mut wc, reservation);
             self.cursor.set(wc);
         }
@@ -803,8 +774,8 @@ impl InFlightState {
 /// Dropping advances `release_cursor` (possibly past multiple slots when
 /// out-of-order slots complete a contiguous prefix) and wakes a parked writer.
 pub struct W2mSlot {
-    bytes: &'static [u8],
-    /// Borrowed directly from the ring prefix to forward to `send_buffer` without re-encoding.
+    /// Length prefix and payload, borrowed in place: `frame_bytes` hands it to
+    /// `send_buffer` unchanged, and [`Self::bytes`] is its tail.
     frame: &'static [u8],
     push_idx: u64,
     /// `internal_req_id` from the slot prefix, set by the worker via
@@ -819,8 +790,9 @@ pub struct W2mSlot {
 }
 
 impl W2mSlot {
+    /// The wire message alone, without the length prefix in front of it.
     pub fn bytes(&self) -> &[u8] {
-        self.bytes
+        &self.frame[SLOT_LEN_PREFIX_BYTES..]
     }
     /// The framed bytes ready for `send_buffer`: `[sz_as_u32_le | payload]`.
     pub(crate) fn frame_bytes(&self) -> &[u8] {
@@ -830,7 +802,7 @@ impl W2mSlot {
     /// Decode the slot's frame, aborting on failure: the ring is a trusted
     /// mapping, so a malformed slot is corruption. `worker` names the ring.
     pub(crate) fn decode(&self, worker: usize) -> DecodedWire {
-        match decode_wire_ipc(self.bytes) {
+        match decode_wire_ipc(self.bytes()) {
             Ok(decoded) => decoded,
             Err(e) => gnitz_fatal_abort!("w2m: worker={} slot decode failed: {:?} — ring corrupt", worker, e),
         }
@@ -901,16 +873,16 @@ impl WorkerRing {
             prefix = st.read.load_prefix(st.read.phys);
         }
         let (sz, internal_req_id) = unpack_prefix(prefix);
-        if sz == 0 || sz as u64 > MAX_W2M_MSG {
+        // `slot_stride(0)` is 8, so a zero-size slot would pass the span test.
+        if sz == 0 || st.read.virt + slot_stride(sz as usize) > vwc {
             gnitz_fatal_abort!(
-                "w2m::take_next: size={} at phys={} outside (0, {}] — ring corrupt",
+                "w2m::take_next: size={} at phys={} overruns the write cursor {} — ring corrupt",
                 sz,
                 st.read.phys,
-                MAX_W2M_MSG,
+                vwc,
             );
         }
         let payload_at = (st.read.phys + RING_PREFIX_BYTES) as usize;
-        let bytes = std::slice::from_raw_parts(base.add(payload_at), sz as usize);
         let frame = std::slice::from_raw_parts(
             base.add(payload_at - SLOT_LEN_PREFIX_BYTES),
             sz as usize + SLOT_LEN_PREFIX_BYTES,
@@ -919,13 +891,7 @@ impl WorkerRing {
 
         let push_idx = st.front_idx + st.queue.len() as u64;
         st.queue.push_back((st.read.virt, false));
-        Some(W2mSlot {
-            bytes,
-            frame,
-            push_idx,
-            internal_req_id,
-            state,
-        })
+        Some(W2mSlot { frame, push_idx, internal_req_id, state })
     }
 }
 
@@ -992,7 +958,7 @@ impl W2mReceiver {
     }
 
     fn all_rings(&self) -> u64 {
-        worker_mask(self.rings.len())
+        gnitz_wire::low_bits_mask(self.rings.len())
     }
 
     /// Arm the reactor's persistent `FUTEX_WAITV` park on every ring, filling

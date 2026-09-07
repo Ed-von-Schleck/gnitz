@@ -1170,8 +1170,8 @@ class TestCreateUniqueIndexValidation:
         and a failing CREATE UNIQUE INDEX; the cluster must stay alive either
         way. (The drain-all-frames-per-worker wedge safety on a multi-frame scan
         train is exercised directly by the drain_index_scan Rust unit test; the
-        256 MiB W2M frame ceiling makes a true multi-frame scan impractical to
-        provoke from E2E, so this guards the realistic large-table path.)"""
+        server's frame cap makes a true multi-frame scan impractical to provoke
+        from E2E, so this guards the realistic large-table path.)"""
         sn = _sn()
         client.create_schema(sn)
         n = 3000

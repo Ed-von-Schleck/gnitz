@@ -652,11 +652,10 @@ impl Reactor {
     /// into the exchange queue before that id's awaiter can complete. What a
     /// round is belongs to the task draining that queue.
     ///
-    /// Routes on `prefix` — the ring slot's `internal_req_id` — which is the
-    /// key `send_msg` documents as the reply's identity. The payload's
-    /// `request_id` agrees with it for every reply that reaches here; only the
-    /// prefix is obligatory, and the chunked-train frames leave the payload
-    /// field 0.
+    /// Routes on `prefix` — the ring slot's `internal_req_id` — before anything
+    /// decodes the frame, which is what drops an abandoned scan's continuations
+    /// at the ring boundary. The payload's `request_id` is the same identity at
+    /// full width; the train producers omit it and go to `route_scan_slot`.
     ///
     /// Unrouted replies are logged and dropped.
     fn route_reply(&self, w: usize, prefix: u32, decoded: DecodedWire) {

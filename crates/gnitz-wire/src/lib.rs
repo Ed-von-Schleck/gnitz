@@ -288,6 +288,24 @@ pub const fn low_bits_mask(n: usize) -> u64 {
     }
 }
 
+/// Yields the set bit positions of a mask, lowest first — the iterator form of
+/// [`low_bits_mask`]'s bits.
+pub struct BitIter(pub u64);
+
+impl Iterator for BitIter {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        if self.0 == 0 {
+            return None;
+        }
+        let i = self.0.trailing_zeros() as usize;
+        self.0 &= self.0 - 1;
+        Some(i)
+    }
+}
+
 /// Null word with the low `npc` payload bits set — "all `npc` payload columns
 /// are null". `npc` reaches the row-major cap of 64 only when a schema has
 /// exactly 64 payload columns.

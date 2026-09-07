@@ -13,13 +13,13 @@
 //!   col  4: flags         U64
 //!   col  5: seek_pk       U128
 //!   col  6: seek_col_idx  U64
-//!   col  7: request_id    U64    -- reactor reply-routing key
+//!   col  7: request_id    U64    -- the master's per-request identity
 //!   col  8: error_msg     STRING (nullable)
 //!   col  9: seek_pk_extra BLOB   (nullable) -- PK region bytes 16.. for a wide PK
 //!
 //! Reserved request_id values:
 //!   0          -- "unsolicited"/"untagged" (pre-reactor reply path)
-//!   u64::MAX   -- broadcast reply (one reply per worker per broadcast)
+//!   u64::MAX   -- unused; master->worker only, a reply's ring prefix being 32-bit
 //!   other      -- master-allocated, monotonic per request
 
 use crate::catalog::col;
@@ -300,10 +300,10 @@ pub struct ControlHeader {
     pub flags: u64,
     pub seek_pk: u128,
     pub seek_col_idx: u64,
-    /// Master-allocated reply-routing key. Clients send 0; the master sets a
-    /// per-request value when fanning out to workers, and workers echo it back
-    /// in their W2M reply. Reserved: `0` — unsolicited / untagged;
-    /// `u64::MAX` — broadcast reply.
+    /// The master's per-request identity. Clients send 0; the master sets a
+    /// value when fanning out to workers, and workers echo it back — though a
+    /// W2M reply is routed by the slot's 32-bit ring prefix, not by this field.
+    /// Reserved: `0` unsolicited / untagged, `u64::MAX` unused.
     pub request_id: u64,
 }
 

@@ -44,6 +44,16 @@ fn all_payload_null_mask_covers_the_full_word() {
     assert_eq!(all_payload_null_mask(64), u64::MAX);
 }
 
+/// `BitIter` yields lowest-first and stops at the empty mask — including for
+/// bit 63, where `low_bits_mask`'s widest word ends.
+#[test]
+fn bit_iter_yields_set_bits_lowest_first() {
+    assert_eq!(BitIter(0).next(), None);
+    assert_eq!(BitIter(0b1011).collect::<Vec<_>>(), vec![0, 1, 3]);
+    assert_eq!(BitIter(1u64 << 63).collect::<Vec<_>>(), vec![63]);
+    assert_eq!(BitIter(low_bits_mask(64)).count(), 64);
+}
+
 /// `left_npc == 64` is the row-major cap, where the naive
 /// `left | (right << left_npc)` would shift by the word width. It is
 /// reachable only with an empty right side, so dropping the shift is exact.

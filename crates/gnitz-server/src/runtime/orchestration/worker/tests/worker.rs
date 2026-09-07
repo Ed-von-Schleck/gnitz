@@ -31,7 +31,7 @@ fn pending_deltas_accumulate_per_relation() {
 #[test]
 fn send_helpers_echo_the_request_id() {
     use crate::runtime::wire as ipc;
-    let (region, w2m_writer) = make_ring();
+    let (region, w2m_writer) = ring_and_writer();
     let region_ptr = region.ptr();
 
     let mut wp = make_test_worker(std::ptr::null_mut(), w2m_writer);
@@ -277,7 +277,7 @@ fn flush_and_push_run_inline_inside_exchange() {
     let mut engine = CatalogEngine::open(&dir, 1).expect("open catalog");
     // `Flush` rewinds the reader before flushing, so it needs a real log.
     let sal = TestLog::new(SAL_SIZE, 1, 1);
-    let (region, writer) = make_ring();
+    let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(&mut engine, writer);
     wp.sal_reader = SalReader::new(sal.log(), 0, 0);
@@ -351,10 +351,10 @@ fn next_sal_message_gates_on_the_epoch() {
 
 // -- pending stream chunking tests -----------------------------------------------
 
-/// A production-sized ring and its writer. The mmap reservation is
-/// lazily populated, so the 1 GiB backing costs address space, not RAM.
-fn make_ring() -> (crate::runtime::test_support::SharedRegion, W2mWriter) {
-    let region = unsafe { w2m::fixtures::test_ring(w2m::W2M_REGION_SIZE) };
+/// A ring and its writer, sized well past anything these tests publish — the
+/// largest is a few KiB.
+fn ring_and_writer() -> (crate::runtime::test_support::SharedRegion, W2mWriter) {
+    let region = unsafe { w2m::fixtures::test_ring(1 << 22) };
     let writer = W2mWriter::new(region.ptr());
     (region, writer)
 }
@@ -436,7 +436,7 @@ fn train_frames_fill_the_budget_to_within_one_row() {
         // Room for four rows beside the schema block on the first frame.
         let budget = frame_size(schema, 4, Some(block.as_slice()));
 
-        let (region, writer) = make_ring();
+        let (region, writer) = ring_and_writer();
         let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
         wp.reply_frame_budget = budget;
@@ -482,7 +482,7 @@ fn train_frames_fill_the_budget_to_within_one_row() {
 fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
     let schema = make_schema_u64_i64();
     for force_fifo in [false, true] {
-        let (region, writer) = make_ring();
+        let (region, writer) = ring_and_writer();
         let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
 
@@ -535,7 +535,7 @@ fn force_fifo_emits_a_fitting_reply_over_the_source_batch() {
         "the fixture must have a dedupable heap for the size test to discriminate"
     );
 
-    let (region, writer) = make_ring();
+    let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.send_shared_scan_response(route(1, 5, 0), Rc::clone(&batch), ReplySchema::ClientAuthored, 0, true);
@@ -601,7 +601,7 @@ fn pending_streams_drain_two_trains_fifo() {
     // included), so train A's 10 rows span at least two frames.
     let budget = frame_size(schema_a, 4, Some(block_a.as_slice()));
 
-    let (region, writer) = make_ring();
+    let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.pending_streams.push_back(PendingScan {
@@ -681,7 +681,7 @@ fn an_oversized_reply_enqueues_a_train() {
     let rows = (ipc::FRAME_CAP / 32) + 4096;
     let batch = Batch::zeroed(&schema, rows);
 
-    let (region, writer) = make_ring();
+    let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.send_scan_response(route(3, 5, 9), batch, ReplySchema::ClientAuthored, 0, false);
@@ -705,7 +705,7 @@ fn a_row_wider_than_the_budget_ships_one_over_budget_frame() {
     let schema = string_schema();
     let batch = long_string_batch(&schema, &[(1, &"x".repeat(4096)), (2, &"y".repeat(4096))]);
 
-    let (region, writer) = make_ring();
+    let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.reply_frame_budget = 512;
@@ -738,7 +738,7 @@ fn a_row_wider_than_the_frame_cap_faults() {
     // One row whose string alone exceeds what a client can read in one frame.
     let batch = long_string_batch(&schema, &[(1, &"z".repeat(ipc::FRAME_CAP + 4096))]);
 
-    let (region, writer) = make_ring();
+    let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.send_scan_response(route(1, 5, 0), batch, ReplySchema::ClientAuthored, 0, false);
@@ -779,7 +779,7 @@ fn a_long_string_train_reassembles_with_its_weights() {
     // ~230 B per row, so a 2 KiB budget puts a handful of rows in each frame.
     let budget = 2048;
 
-    let (region, writer) = make_ring();
+    let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(std::ptr::null_mut(), writer);
     wp.reply_frame_budget = budget;
@@ -845,7 +845,7 @@ fn a_projected_reply_carries_a_one_off_block() {
     let projected = gnitz_store::schema::project_schema(&table_schema, &[1]).unwrap();
     assert_ne!(projected.num_columns(), table_schema.num_columns());
 
-    let (region, writer) = make_ring();
+    let (region, writer) = ring_and_writer();
     let ptr = region.ptr();
     let mut wp = make_test_worker(&mut engine as *mut CatalogEngine, writer);
 

@@ -19,11 +19,10 @@
 use rustc_hash::FxHashMap;
 
 use super::train::train_has_more;
-use crate::runtime::w2m::worker_mask;
 use crate::runtime::wire::{DecodedWire, BACKFILL_PAD_BIT};
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::{Batch, Layout};
-use gnitz_wire::MAX_WORKERS;
+use gnitz_wire::{low_bits_mask, MAX_WORKERS};
 
 /// Per-view accumulator for `FLAG_EXCHANGE` replies, keyed by
 /// `(view_id, source_id)`.
@@ -127,7 +126,7 @@ impl ExchangeAccumulator {
         round.all_pad &= (decoded.control.seek_col_idx & BACKFILL_PAD_BIT) != 0;
         round.reported |= 1 << w;
 
-        if round.reported != worker_mask(nw) {
+        if round.reported != low_bits_mask(nw) {
             return None;
         }
         let mut round = self.rounds.remove(&key).unwrap();
