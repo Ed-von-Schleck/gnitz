@@ -1,9 +1,9 @@
 //! Answering a read off a copy.
 //!
 //! The store takes an **encoded `ReadSpec` plus a reply schema** — the wire read
-//! verbs, not SQL. The engine has no parser, the client core never constructs a
-//! `ReadSpec` and the SQL crate does, and the crate graph runs
-//! `gnitz-sql → gnitz-core`; SQL at this seam would invert that.
+//! verbs, not SQL. The engine has no parser and the SQL crate is where a query
+//! becomes a spec, and the crate graph runs `gnitz-sql → gnitz-core`; SQL at this
+//! seam would invert that.
 //!
 //! A local reply is a **single-worker** reply, and the existing client-side
 //! finishing accepts it unchanged: neither the rows finisher nor the aggregate
@@ -11,13 +11,11 @@
 //! establishes that by concatenating every frame's batch before returning one; a
 //! local reply is already one.
 //!
-//! **The read path encodes and decodes; the ingest path does not, and the
-//! asymmetry is not an oversight.** A read has to end in a `ZSetBatch` whatever
-//! happens, because that is what the finishers consume, so the engine→wire→client
-//! conversion is work the remote path pays too and the copy merely relocates. An
-//! applied delta ends in an engine `Batch`, so a detour through `ZSetBatch` would
-//! be a conversion *added* by mirroring. A full scan holds the keeper, its wire
-//! block and the decoded batch at once; narrow the bound and it is nothing.
+//! **The read path encodes and decodes; the ingest path does not.** A read ends
+//! in a `ZSetBatch` whatever happens — that is what the finishers consume — so
+//! the copy only relocates work the remote path pays too. An applied delta ends
+//! in an engine `Batch`, where a detour through `ZSetBatch` would be a second
+//! conversion on a path that already pays one (`apply.rs`'s strip).
 
 use gnitz_core::protocol::decode_wal_block;
 use gnitz_core::{MirrorError, Schema, ZSetBatch};

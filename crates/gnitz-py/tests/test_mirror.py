@@ -693,10 +693,11 @@ def test_the_copy_answers_with_the_server_stopped(own_server, mirror_on, mirror_
 
 def test_replacing_a_mirrored_view_invalidates_the_copy(client, mirror):
     """`CREATE OR REPLACE VIEW` retires the view a copy was built from and puts a
-    different one under the same name. The replacing client drops its own copy on
-    the way out (`invalidate_own_copy`), so it cannot go on serving rows from a
-    view that no longer exists — a name lookup would not tell it, since the name
-    still resolves."""
+    different one under the same name. The replacing client drops its own copy
+    because the DDL bundle it just pushed says which view ids it retired — a
+    negative VIEW_TAB weight with no positive one at the same id — so it cannot
+    go on serving rows from a view that no longer exists. A name lookup would not
+    tell it, since the name still resolves."""
     sn = "s" + _uid()
     _base_tables(client, sn)
     _mk_feed(client, sn, "f", LINEAR)

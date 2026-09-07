@@ -107,15 +107,15 @@ pub(crate) fn read_state(base_dir: &str) -> Option<PersistedState> {
     })
 }
 
-/// Replace the state file atomically: write a temp, `fdatasync` it, rename it
-/// into place, then fsync the directory so the rename itself is durable.
-pub(crate) fn write_state(
-    base_dir: &str,
-    generation: u64,
-    records: &HashMap<u64, MirrorRecord>,
-) -> Result<(), MirrorError> {
+/// The records as the file's body: one [`STATE_SCHEMA`] row per relation, as a
+/// checksummed wire block. **Tid-sorted**, so the bytes are a function of the
+/// content alone and a checkpoint can decide by comparing them.
+pub(crate) fn encode_records(records: &HashMap<u64, MirrorRecord>) -> Vec<u8> {
+    let mut ids: Vec<u64> = records.keys().copied().collect();
+    ids.sort_unstable();
     let mut bb = BatchBuilder::new(STATE_SCHEMA);
-    for (&tid, r) in records {
+    for tid in ids {
+        let r = &records[&tid];
         bb.begin_row(tid as u128, 1);
         match r.cursor {
             Some(c) => {
@@ -132,8 +132,15 @@ pub(crate) fn write_state(
         bb.put_blob(&r.block);
         bb.end_row();
     }
+    bb.finish().encode_to_wire_vec(0, true)
+}
+
+/// Replace the state file atomically: write a temp, `fdatasync` it, rename it
+/// into place, then fsync the directory so the rename itself is durable.
+/// `block` is [`encode_records`]'s output.
+pub(crate) fn write_state(base_dir: &str, generation: u64, block: &[u8]) -> Result<(), MirrorError> {
     let mut buf = generation.to_le_bytes().to_vec();
-    buf.extend_from_slice(&bb.finish().encode_to_wire_vec(0, true));
+    buf.extend_from_slice(block);
 
     let final_path = path(base_dir);
     let tmp_path = format!("{final_path}.tmp");

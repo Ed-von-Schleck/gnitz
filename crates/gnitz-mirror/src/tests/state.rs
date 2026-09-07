@@ -16,7 +16,7 @@ use super::*;
 fn written(name: &str, cursor: Option<DeltaCursor>) -> (String, Vec<u8>) {
     let dir = scratch_dir("mirror_state", name);
     std::fs::create_dir_all(&dir).unwrap();
-    write_state(&dir, 9, &records(cursor)).expect("the file is written");
+    write_state(&dir, 9, &encode_records(&records(cursor))).expect("the file is written");
     let bytes = std::fs::read(path(&dir)).unwrap();
     (dir, bytes)
 }

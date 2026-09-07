@@ -14,8 +14,8 @@
 //! reconciliation state machine and every ordering rule its correctness rests on
 //! exist once and this crate runs that code instead of a second copy of it.
 //! Driving the feed here instead would mean rewriting that state machine as
-//! async: it interleaves round trips with blocking store calls, and the cursor
-//! protocol under `delta_poll_raw` is `gnitz-core`-private. The crate still
+//! async: it interleaves round trips with blocking store calls, and the raw
+//! delta verbs the cursor protocol runs on are `gnitz-core`-private. The crate still
 //! links no engine: it takes an opened store, as the blocking client does.
 
 use std::collections::VecDeque;

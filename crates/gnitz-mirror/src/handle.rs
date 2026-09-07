@@ -11,7 +11,7 @@ use gnitz_store::relation::{
 };
 use gnitz_store::storage::{remove_child, ChildAddr, RamBudgets, Slot, StoreError};
 
-use crate::state::{read_state, write_state, MirrorRecord};
+use crate::state::{encode_records, read_state, write_state, MirrorRecord};
 
 /// Applied delta bytes after which an apply drives a checkpoint of its own.
 /// `GNITZ_MIRROR_CHECKPOINT_BYTES` overrides it.
@@ -65,9 +65,11 @@ pub struct Mirror {
     /// succeed.
     _dir_lock: std::fs::File,
     poison: Option<String>,
-    /// The records as the state file last held them; a checkpoint that would
-    /// rewrite them unchanged is skipped.
-    published: HashMap<u64, MirrorRecord>,
+    /// The state file's body as it was last written; a checkpoint that would
+    /// rewrite it unchanged is skipped. The bytes and not a dirty bit, so no
+    /// mutation site has to remember to set one — and a bit stuck false would
+    /// stop the store checkpointing for good.
+    published_block: Vec<u8>,
     applied_bytes: usize,
     checkpoint_bytes: usize,
 }
@@ -116,7 +118,7 @@ impl Mirror {
             base_dir: base_dir.to_string(),
             _dir_lock: dir_lock,
             poison: None,
-            published: HashMap::new(),
+            published_block: Vec::new(),
             applied_bytes: 0,
             checkpoint_bytes: env_num("GNITZ_MIRROR_CHECKPOINT_BYTES", DEFAULT_CHECKPOINT_BYTES),
         };
@@ -129,7 +131,9 @@ impl Mirror {
             for (tid, rec) in state.records.iter() {
                 mirror.enter(*tid, rec.clone())?;
             }
-            mirror.published = state.records;
+            // Through the encoder a checkpoint compares against, and before the
+            // sweep below, which does change the records.
+            mirror.published_block = encode_records(&state.records);
             // A cursor naming a copy that did not come back is dropped, which
             // makes its view bootstrap.
             for (tid, r) in &mut mirror.records {
@@ -240,7 +244,8 @@ impl Mirror {
     /// neither mutates what a store holds, so every copy is intact in the RAM
     /// tier and retrying is sound.
     fn checkpoint_inner(&mut self) -> Result<(), MirrorError> {
-        if self.records == self.published {
+        let block = encode_records(&self.records);
+        if block == self.published_block {
             return Ok(());
         }
         if CHECKPOINT_ERROR.take_once() {
@@ -249,8 +254,8 @@ impl Mirror {
         let generation = self.registry.resume_generation() + 1;
         self.registry.set_resume_generation(generation);
         self.registry.flush_ephemeral_outputs(generation).map_err(engine)?;
-        write_state(&self.base_dir, generation, &self.records)?;
-        self.published = self.records.clone();
+        write_state(&self.base_dir, generation, &block)?;
+        self.published_block = block;
         self.applied_bytes = 0;
         Ok(())
     }

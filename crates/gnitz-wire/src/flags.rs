@@ -382,6 +382,12 @@ pub const STATUS_DELTA_EXPIRED: u32 = 5;
 /// refused read or push is therefore retryable, unlike every other server error
 /// — which is why it is a code rather than a phrase in a message.
 pub const STATUS_SAL_FULL: u32 = 6;
+/// The relation a request names does not exist — minted where the catalog probe
+/// comes back empty and nowhere else, so it says *gone* rather than *refused*.
+/// A code for the same reason [`STATUS_NO_INDEX`] is one: a subscriber whose
+/// view vanished takes a recovery no other refusal calls for, and prose is all
+/// it could otherwise branch on.
+pub const STATUS_NOT_FOUND: u32 = 7;
 
 /// A failure as the reply frame carries it: one of the `STATUS_*` words above
 /// plus its message. The decoded form of a control block's `(status, error_msg)`

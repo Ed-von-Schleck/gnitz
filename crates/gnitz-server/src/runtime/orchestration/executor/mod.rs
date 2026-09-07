@@ -42,7 +42,7 @@ use crate::runtime::wire::{self as ipc, validate_schema_match, BACKFILL_DECISION
 use gnitz_store::relation::RelationKind;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
-use gnitz_wire::{WireFault, STATUS_ERROR, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH};
+use gnitz_wire::{WireFault, STATUS_ERROR, STATUS_NOT_FOUND, STATUS_NO_INDEX, STATUS_OK, STATUS_SCHEMA_MISMATCH};
 
 const TICK_COALESCE_ROWS: usize = 10_000;
 const WORKER_WATCH_MS: u64 = 100;
@@ -1356,7 +1356,9 @@ async fn push_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<PushTxnOutcom
         // Same existence + writability gate the plain-push arm applies, so a view
         // target is rejected identically. Refusing a stream keeps every transaction
         // family `recoverable`, so a transaction always opens a zone.
-        if target_kind(shared, tid, Access::Write)? == RelationKind::Stream {
+        // The status is dropped on purpose: this reply names no relation, so only
+        // the text identifies the tid.
+        if target_kind(shared, tid, Access::Write).map_err(|f| f.text)? == RelationKind::Stream {
             return Err(format!("table {tid} is a stream: a stream cannot be written inside a transaction").into());
         }
         // The schema block is always present; validate it against the catalog
@@ -1534,20 +1536,27 @@ enum Access {
 /// Enforced here even though the SQL binder refuses both: the C and Python bindings
 /// reach the engine directly. Every caller addresses a relation by id and owns its
 /// own reply path.
-fn target_kind(shared: &Shared, target_id: i64, access: Access) -> Result<RelationKind, String> {
+///
+/// **Only the absent-relation arm carries a status of its own**
+/// ([`STATUS_NOT_FOUND`]): the arms below name a relation that exists, which a
+/// client must not recover from the way it recovers from a vanished one.
+fn target_kind(shared: &Shared, target_id: i64, access: Access) -> Result<RelationKind, WireFault> {
     let Some(kind) = shared.cat().registry().relation_kind(target_id) else {
-        return Err(format!("table {target_id} not found"));
+        return Err(WireFault {
+            status: STATUS_NOT_FOUND,
+            text: format!("table {target_id} not found"),
+        });
     };
     match access {
-        Access::Read | Access::UserRead if kind == RelationKind::Stream => Err(format!(
-            "table {target_id} is a stream: a stream holds no rows and cannot be read"
-        )),
-        Access::UserRead if kind == RelationKind::SystemCatalog => Err(format!(
-            "table {target_id} is a system catalog family: this read has only a fan-out form"
-        )),
-        Access::Write if !kind.is_ingestion_point() => Err(format!(
-            "table {target_id} is not writable: pushes must target a base table or a stream"
-        )),
+        Access::Read | Access::UserRead if kind == RelationKind::Stream => {
+            Err(format!("table {target_id} is a stream: a stream holds no rows and cannot be read").into())
+        }
+        Access::UserRead if kind == RelationKind::SystemCatalog => {
+            Err(format!("table {target_id} is a system catalog family: this read has only a fan-out form").into())
+        }
+        Access::Write if !kind.is_ingestion_point() => {
+            Err(format!("table {target_id} is not writable: pushes must target a base table or a stream").into())
+        }
         _ => Ok(kind),
     }
 }
@@ -1563,8 +1572,8 @@ async fn target_kind_or_reject(
 ) -> Option<RelationKind> {
     match target_kind(shared, target_id, access) {
         Ok(kind) => Some(kind),
-        Err(msg) => {
-            send_error(peer, target_id, client_id, msg.as_bytes()).await;
+        Err(f) => {
+            send_fault(peer, target_id, client_id, &f).await;
             None
         }
     }
@@ -2171,7 +2180,8 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             // Base tables AND views are legal; `UserRead` refuses a catalog
             // family, which stays on the plain path that serves it
             // master-locally.
-            target_kind(shared, tid, Access::UserRead)?;
+            // Status dropped for the reason `push_txn_body`'s is.
+            target_kind(shared, tid, Access::UserRead).map_err(|f| f.text)?;
             fanout.push(read_fanout(shared.disp(), tid, None));
             // Capture (not emit) each relation's preliminary schema frame here so
             // Phase 2 can send it after the one-cut dispatch, in request order.

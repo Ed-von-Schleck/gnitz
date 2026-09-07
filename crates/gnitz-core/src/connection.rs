@@ -33,8 +33,8 @@ use crate::protocol::{
     wire_flags_get_schema_version, wire_flags_set_conflict_mode, wire_flags_set_schema_version, ClientTransport,
     FkTarget, Message, ProtocolError, Schema, WireConflictMode, ZSetBatch, FLAG_ALLOCATE_INDEX_ID,
     FLAG_ALLOCATE_SCHEMA_ID, FLAG_ALLOCATE_SERIAL_RANGE, FLAG_ALLOCATE_TABLE_ID, FLAG_CONTINUATION, FLAG_PUSH,
-    FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_DELTA_EXPIRED, STATUS_ERROR, STATUS_NO_INDEX,
-    STATUS_OK, STATUS_SAL_FULL, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
+    FLAG_RESOLVE, FLAG_SCAN_SPEC, FLAG_SEEK, FLAG_SEEK_BY_INDEX, STATUS_DELTA_EXPIRED, STATUS_ERROR, STATUS_NOT_FOUND,
+    STATUS_NO_INDEX, STATUS_OK, STATUS_SAL_FULL, STATUS_SCHEMA_MISMATCH, STATUS_TXN_CONFLICT,
 };
 use gnitz_wire::RelDescriptorBlob;
 use lru::LruCache;
@@ -116,6 +116,12 @@ fn check_response(msg: &mut Message) -> Result<(), ClientError> {
         STATUS_SCHEMA_MISMATCH => Err(ClientError::SchemaMismatch),
         STATUS_NO_INDEX => Err(ClientError::ServerError("no index on requested column".into())),
         STATUS_DELTA_EXPIRED => Err(ClientError::DeltaExpired),
+        // The frame's `target_id` is the relation the request named, so the id is
+        // the whole of what there is to say.
+        STATUS_NOT_FOUND => Err(ClientError::NotFound {
+            noun: "relation",
+            name: msg.target_id.to_string(),
+        }),
         STATUS_SAL_FULL => Err(ClientError::SalFull(msg.error_text.take().unwrap_or_default())),
         // Control-only frame: the fresh basis rides in `seek_pk`.
         STATUS_TXN_CONFLICT => Err(ClientError::TxnConflict { fresh_basis: msg.seek_pk as u64 }),
@@ -910,7 +916,7 @@ impl Session {
                     return Err(e);
                 }
             }
-            ready = self.park(self.interest())?;
+            ready = self.park()?;
         }
     }
 
@@ -920,7 +926,8 @@ impl Session {
     /// hook runs — a signal arriving anywhere else is delivered when the call
     /// returns to its host, which is where the hot path stays free of the
     /// hook's cost (a GIL acquisition, for the Python binding).
-    fn park(&mut self, interest: Interest) -> Result<Interest, ClientError> {
+    pub(crate) fn park(&mut self) -> Result<Interest, ClientError> {
+        let interest = self.interest();
         if interest.is_empty() {
             return Err(ClientError::Closed);
         }

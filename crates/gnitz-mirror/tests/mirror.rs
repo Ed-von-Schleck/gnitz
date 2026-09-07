@@ -2034,61 +2034,342 @@ fn attaching_a_store_is_once_and_a_mirror_verb_needs_one() {
     Mirror::open(&second_path).expect("a refused attach must release the store it was passed");
 }
 
-/// `DROP VIEW` and a rename **through the mirroring client** stop that view
-/// answering locally, and `ALTER VIEW … AS` cannot reach one at all.
+/// `DROP VIEW` **through the mirroring client** stops that view answering
+/// locally, and `ALTER VIEW … AS` cannot reach one at all.
 ///
-/// The copy and the DDL path share one object now, so without the hook a
+/// The copy and the DDL path share one object, so without the derivation a
 /// `SELECT` after a `DROP VIEW` on this same client answers rows off a view it
-/// just dropped, and a rename leaves the old name reading the copy while the new
-/// name goes upstream. The third case is closed one layer up: retargeting a view
-/// that carries a delta feed is refused, and a feed is what makes a view
-/// mirrorable at all.
+/// just dropped. The second case is closed one layer up: retargeting a view that
+/// carries a delta feed is refused, and a feed is what makes a view mirrorable
+/// at all.
 #[test]
 fn ddl_through_the_mirroring_client_retires_its_own_copy() {
     let _g = serial();
     let mut fx = Fixture::start();
     churn(&mut fx.direct, 1, 40);
-    for name in ["v_drop", "v_rename"] {
-        sql(
-            &mut fx.direct,
-            "s",
-            &format!("CREATE VIEW {name} WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE v >= 0"),
-        );
-    }
-    let mut ids = Vec::new();
-    for name in ["v_drop", "v_rename"] {
-        ids.push(fx.mirror().mirror_view("s", name).expect(name).view_id);
-    }
-    fx.drain("s", &["v_drop", "v_rename"]);
-    for &tid in &ids {
-        assert!(fx.mirror().mirrors(tid), "each copy answers before the DDL");
-    }
+    sql(
+        &mut fx.direct,
+        "s",
+        &format!("CREATE VIEW v_drop WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE v >= 0"),
+    );
+    let tid = fx.mirror().mirror_view("s", "v_drop").expect("v_drop").view_id;
+    fx.drain("s", &["v_drop"]);
+    assert!(fx.mirror().mirrors(tid), "the copy answers before the DDL");
 
     sql(fx.mirror(), "s", "DROP VIEW v_drop");
+    assert!(
+        !fx.mirror().mirrors(tid),
+        "the copy must stop answering once this client retired it",
+    );
+    assert!(
+        !fx.mirror().mirrored_ids().contains(&tid),
+        "and the registration goes with it",
+    );
+
+    // A mirrored view cannot be retargeted, so no copy is ever left behind one.
+    fx.mirror().mirror_view("s", "v_keyed").expect("mirror v_keyed");
+    let e = SqlPlanner::new(fx.mirror(), "s")
+        .execute("ALTER VIEW v_keyed AS SELECT a, b, v FROM t WHERE v > 1")
+        .expect_err("a fed view cannot be retargeted");
+    assert!(e.to_string().contains("delta feed"), "{e}");
+}
+
+/// A rename **through the mirroring client** renames the copy rather than
+/// destroying it.
+///
+/// A rename keeps the id, the layout and the rows, so the store's registration
+/// takes its in-place arm — the same one a rename by *another* client takes
+/// (`a_view_renamed_upstream_survives_a_new_view_under_its_old_name`). The same
+/// upstream event must not cost a full re-bootstrap merely because this
+/// connection is the one that issued it.
+#[test]
+fn a_rename_through_the_mirroring_client_keeps_the_copy() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    let tid = fx.mirror().mirror_view("s", "v_keyed").expect("mirror").view_id;
+    fx.drain("s", &["v_keyed"]);
+    let before = fx.mirror().cursor_of(tid).expect("a round to answer at");
+
     fx.mirror()
-        .alter_rename_relation("s", "v_rename", "v_renamed")
+        .alter_rename_relation("s", "v_keyed", "v_moved")
         .expect("rename");
 
-    for (name, &tid) in ["v_drop", "v_rename"].iter().zip(ids.iter()) {
-        assert!(
-            !fx.mirror().mirrors(tid),
-            "{name}: the copy must stop answering once this client retired it",
-        );
-    }
-    // The one that still exists upstream reads correctly — delegated now.
-    fx.differential("s", "SELECT * FROM v_renamed");
-    // And the old name is gone rather than answering off the copy.
+    assert!(
+        fx.mirror().mirrors(tid),
+        "the copy survives a rename this client issued",
+    );
+    assert_eq!(
+        fx.mirror().cursor_of(tid),
+        Some(before),
+        "and keeps the feed position it had",
+    );
+    fx.differential("s", "SELECT * FROM v_moved");
+    // The old name is gone rather than answering off the copy.
     assert!(
         SqlPlanner::new(fx.mirror(), "s")
-            .execute("SELECT * FROM v_rename")
+            .execute("SELECT * FROM v_keyed")
             .is_err(),
         "a renamed view must not keep answering under its old name",
     );
-    // A mirrored view cannot be retargeted, so no copy is ever left behind one.
-    let e = SqlPlanner::new(fx.mirror(), "s")
-        .execute("ALTER VIEW v_renamed AS SELECT a, b, v FROM t WHERE v > 1")
-        .expect_err("a fed view cannot be retargeted");
-    assert!(e.to_string().contains("delta feed"), "{e}");
+
+    // The feed continues under the new name — the rename moved the binding, not
+    // just the label.
+    churn(&mut fx.direct, 41, 80);
+    fx.drain("s", &["v_moved"]);
+    assert!(
+        fx.mirror().cursor_of(tid).is_some_and(|c| c.tick > before.tick),
+        "the copy advances after the rename",
+    );
+    fx.differential("s", "SELECT * FROM v_moved");
+}
+
+/// A rename through a client that has **not** claimed the copy retracts the
+/// record instead of binding it.
+///
+/// After a reopen the store holds every copy a previous session left and this
+/// session has registered none of them. Binding one here would mirror a view the
+/// host never asked for; leaving it would leave a stale name in the store's
+/// record, which a later registration's name scan would match against a
+/// different view created under it.
+#[test]
+fn a_rename_by_a_client_that_never_claimed_the_copy_retracts_the_record() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    let tid = fx.mirror().mirror_view("s", "v_keyed").expect("mirror").view_id;
+    fx.drain("s", &["v_keyed"]);
+
+    fx.reopen();
+    assert!(
+        !fx.mirror().mirrored_ids().contains(&tid),
+        "the new session claimed nothing",
+    );
+    let dir = copy_dir(&fx.base_dir(), tid);
+    assert!(
+        std::path::Path::new(&dir).exists(),
+        "but the store still holds the replayed copy",
+    );
+
+    fx.mirror()
+        .alter_rename_relation("s", "v_keyed", "v_moved")
+        .expect("rename");
+    assert!(
+        !std::path::Path::new(&dir).exists(),
+        "an unclaimed record is retracted with its directory, not left naming the old name",
+    );
+
+    // The freed name is now genuinely free: a new view under it mirrors clean.
+    sql(
+        &mut fx.direct,
+        "s",
+        &format!("CREATE VIEW v_keyed WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE b = 3"),
+    );
+    let fresh = fx
+        .mirror()
+        .mirror_view("s", "v_keyed")
+        .expect("mirror the new view")
+        .view_id;
+    assert_ne!(fresh, tid);
+    fx.drain("s", &["v_keyed"]);
+    fx.differential("s", "SELECT * FROM v_keyed");
+}
+
+/// Every DDL bundle that retires a view retires its copy, whatever verb built
+/// it — the VIEW_TAB batch the statement pushed is what says so, so no verb
+/// carries a teardown of its own.
+#[test]
+fn a_bundle_that_retires_a_view_retires_its_copy() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+
+    // `CREATE OR REPLACE VIEW`: the retired view's lone `-1` rides the same
+    // batch as the replacement's `+1`s, which take a fresh id.
+    sql(
+        &mut fx.direct,
+        "s",
+        &format!("CREATE VIEW v_rep WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE b = 1"),
+    );
+    let replaced = fx.mirror().mirror_view("s", "v_rep").expect("mirror v_rep").view_id;
+    fx.drain("s", &["v_rep"]);
+    assert!(fx.mirror().mirrors(replaced));
+    sql(
+        fx.mirror(),
+        "s",
+        &format!("CREATE OR REPLACE VIEW v_rep WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE b = 2"),
+    );
+    assert!(
+        !fx.mirror().mirrors(replaced),
+        "the replaced view's copy must stop answering",
+    );
+    fx.differential("s", "SELECT * FROM v_rep");
+
+    // `DROP SCHEMA`: one `-1` per member view, all in one bundle.
+    fx.mirror().create_schema("s2").expect("a second schema");
+    sql(
+        &mut fx.direct,
+        "s2",
+        "CREATE TABLE u (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+    );
+    sql(&mut fx.direct, "s2", "INSERT INTO u VALUES (1, 10), (2, 20), (3, 30)");
+    sql(
+        &mut fx.direct,
+        "s2",
+        &format!("CREATE VIEW v_u WITH (delta = '{FEED}') AS SELECT id, v FROM u WHERE v > 0"),
+    );
+    let dropped = fx.mirror().mirror_view("s2", "v_u").expect("mirror v_u").view_id;
+    fx.drain("s2", &["v_u"]);
+    assert!(fx.mirror().mirrors(dropped));
+    fx.mirror().drop_schema("s2").expect("drop the schema");
+    assert!(
+        !fx.mirror().mirrors(dropped),
+        "a DROP SCHEMA must retire every copy it retired upstream",
+    );
+    assert!(!fx.mirror().mirrored_ids().contains(&dropped));
+}
+
+/// `DROP VIEW v_a; ALTER VIEW v_b RENAME TO v_a` upstream, with both mirrored.
+///
+/// Phase one holds `B`'s reply for `(prev_B, T]` while `A`'s poll is refused.
+/// Recovering `A` inside that loop would re-point its registration at `B` —
+/// whose copy and cursor are live — and re-fetch an interval `B`'s reply already
+/// carries; applying both leaves the **row set identical** and every weight in
+/// the overlap doubled, which is why the check here is a weight-exact
+/// differential rather than a shape assertion.
+#[test]
+fn a_drop_and_a_rename_into_the_freed_name_report_once_each() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 60);
+    for (name, pred) in [("v_a", "b = 1"), ("v_b", "b = 2")] {
+        sql(
+            &mut fx.direct,
+            "s",
+            &format!("CREATE VIEW {name} WITH (delta = '{FEED}') AS SELECT a, b, v FROM t WHERE {pred}"),
+        );
+    }
+    let a = fx.mirror().mirror_view("s", "v_a").expect("mirror v_a").view_id;
+    let b = fx.mirror().mirror_view("s", "v_b").expect("mirror v_b").view_id;
+    fx.drain("s", &["v_a", "v_b"]);
+    let b_dir = copy_dir(&fx.base_dir(), b);
+
+    // Rounds both copies are behind on, so phase one really does hold `B`'s
+    // reply when `A`'s poll comes back refused.
+    churn(&mut fx.direct, 61, 120);
+    sql(&mut fx.direct, "s", "DROP VIEW v_a");
+    fx.direct
+        .alter_rename_relation("s", "v_b", "v_a")
+        .expect("rename into the freed name");
+    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_a");
+
+    let report = fx
+        .mirror()
+        .poll_mirror()
+        .expect("a recovered view is not the call's failure");
+    assert_eq!(
+        report.len(),
+        1,
+        "one entry per mirrored view, at the id it ended up under: {report:?}",
+    );
+    assert_eq!(report[0].view_id, b, "the survivor is reported under its own id");
+    assert!(
+        !fx.mirror().mirrored_ids().contains(&a),
+        "the dropped view's registration moved rather than staying beside it",
+    );
+    assert!(
+        std::path::Path::new(&b_dir).exists(),
+        "the survivor's copy must not be erased by the other view's recovery",
+    );
+    fx.drain("s", &["v_a"]);
+    fx.differential("s", "SELECT * FROM v_a");
+}
+
+/// A cursor the retention sweep has rolled past is recovered inside the poll.
+///
+/// The server refuses it with its own status; the handle discards the copy and
+/// re-reads it whole, and the host sees a `Reseeded` rather than an error whose
+/// advice it has no way to act on.
+#[test]
+fn an_expired_cursor_reseeds_inside_the_poll() {
+    let _g = serial();
+    // A delta store spills once its RAM tier crosses this ceiling; shrinking it
+    // is how the capacity sweep is reached on modest data.
+    let mut fx = Fixture::start_with(
+        WORKERS,
+        &[("GNITZ_RAM_TIER_BYTES", "1024"), ("GNITZ_CHECKPOINT_BYTES", "32768")],
+    );
+    sql(
+        &mut fx.direct,
+        "s",
+        "CREATE VIEW v_tiny WITH (delta = '1 KB') AS SELECT a, b, v, body FROM t WHERE v >= 0",
+    );
+    churn(&mut fx.direct, 1, 60);
+    let tid = fx.mirror().mirror_view("s", "v_tiny").expect("mirror v_tiny").view_id;
+    fx.drain("s", &["v_tiny"]);
+
+    // Push the workers' retention floor past the copy's cursor, without polling.
+    // Wide rows and many rounds, so what the sweep drops is measured in hundreds
+    // of kilobytes against a one-kilobyte budget.
+    let body = "x".repeat(200);
+    for k in 0..20 {
+        let lo = 1_000 + k * 200;
+        let rows: Vec<String> = (lo..lo + 200)
+            .map(|i| format!("({i}, {}, {i}, 0.5, '{body}')", i % 7))
+            .collect();
+        sql(&mut fx.direct, "s", &format!("INSERT INTO t VALUES {}", rows.join(",")));
+    }
+    let _ = query(&mut fx.direct, "s", "SELECT COUNT(*) AS n FROM v_tiny");
+
+    let report = fx.mirror().poll_mirror().expect("the handle owns this recovery");
+    assert!(
+        report.iter().any(|o| o.view_id == tid && o.result.reseeded()),
+        "an expired cursor is recovered by reseeding: {report:?}",
+    );
+    fx.drain("s", &["v_tiny"]);
+    fx.differential("s", "SELECT * FROM v_tiny");
+    fx.differential("s", "SELECT a, v FROM v_tiny WHERE a > 4000");
+}
+
+/// A reopen that changes nothing rewrites nothing.
+///
+/// The checkpoint decides by comparing the bytes it would write against the ones
+/// the file holds, so nothing has to be enumerated and no mutation site has to
+/// remember to mark anything dirty. The generation word is the observable: only a
+/// write advances it.
+#[test]
+fn a_reopen_that_changes_nothing_elides_its_checkpoint() {
+    let _g = serial();
+    let mut fx = Fixture::start();
+    churn(&mut fx.direct, 1, 40);
+    fx.mirror_both();
+    fx.quiesce();
+    fx.mirror().checkpoint_mirror().expect("checkpoint");
+    let published = state_generation(&fx.base_dir());
+
+    // `reopen` is an exit checkpoint plus a fresh open on the same directory.
+    fx.reopen();
+    assert_eq!(
+        state_generation(&fx.base_dir()),
+        published,
+        "closing a store whose records did not move must write nothing",
+    );
+    fx.mirror().checkpoint_mirror().expect("an idle checkpoint");
+    assert_eq!(
+        state_generation(&fx.base_dir()),
+        published,
+        "and neither does an explicit one right after the open",
+    );
+
+    fx.mirror_both();
+    fx.quiesce();
+    fx.differential("s", "SELECT * FROM v_keyed");
+}
+
+/// The generation word the state file's header carries.
+fn state_generation(base_dir: &str) -> u64 {
+    let bytes = std::fs::read(state_file(base_dir)).expect("a written state file");
+    u64::from_le_bytes(bytes[..8].try_into().unwrap())
 }
 
 /// A view another client renamed keeps its copy when this client re-mirrors it
@@ -2372,6 +2653,14 @@ fn poisoned_read_child() {
         (&remote.0, &remote.1),
     );
 
+    // A DDL that retires the mirrored view must not fail because the store
+    // refuses the teardown: the client-side gate is what stops the copy
+    // answering, and everything past it is reclamation.
+    SqlPlanner::new(&mut mirror, "s")
+        .execute("DROP VIEW v_keyed")
+        .expect("a poisoned store must not fail a DDL that already committed");
+    assert!(!mirror.mirrors(tid), "and the copy stops answering all the same");
+
     // `close_mirror` publishes no checkpoint, releases the directory, and leaves
     // the connection usable — the only recovery a poisoned copy has.
     mirror.close_mirror().expect("closing a poisoned store is not an error");
@@ -2385,7 +2674,7 @@ fn poisoned_read_child() {
     mirror
         .attach_mirror(Mirror::open(&dir).expect("the directory came back"))
         .expect("a later attach on the same connection is legal");
-    let recovered = mirror.mirror_view("s", "v_keyed").expect("and it bootstraps again");
+    let recovered = mirror.mirror_view("s", "v_repl").expect("and it bootstraps again");
     assert!(recovered.result.reseeded());
     println!("{CHILD_OK}");
 }
