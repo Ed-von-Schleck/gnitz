@@ -642,7 +642,7 @@ async def test_enqueue_after_close_raises(server):
 async def test_distinct_client_ids(server):
     """Two transports from the same process must have distinct client_ids."""
     async with aio.connect(server) as c1, aio.connect(server) as c2:
-        assert c1._transport.client_id != c2._transport.client_id
+        assert c1.client_id != c2.client_id
 
 
 # ---------------------------------------------------------------------------

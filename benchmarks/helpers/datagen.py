@@ -185,14 +185,12 @@ _NARROW = {
 }
 
 
-def gen_value(rng, col, i, pools=None, skew=None):
-    """A single deterministic value for a payload/FK column of `col`.
+def gen_value(rng, name, tc, pools=None, skew=None):
+    """A single deterministic value for the payload/FK column `name` of type `tc`.
 
     pools: {col_name: [str, ...]} for STRING columns (default: NATIONS).
     skew: {col_name: (n, s)} draws that column via zipf_choice in [1, n].
     """
-    name = col.name
-    tc = col.type_code
     if skew and name in skew:
         n, s = skew[name]
         return zipf_choice(rng, n, s)
@@ -229,9 +227,9 @@ def bulk_load(
     """
     tid, schema = conn.resolve_table(schema_name, table_name)
     rng = random.Random(seed)
-    # Hoisted: `c.type_code` crosses into Rust on every read, and the tuple
-    # unpack below is one bytecode where the attribute walk is three.
-    spec = [(c.name, getattr(c, "is_nullable", False), c) for c in columns if c.name != "pk"]
+    # Name and type code read once per column, not once per cell: both are pyo3
+    # getters, and the row loop below runs one per (row x column).
+    spec = [(c.name, getattr(c, "is_nullable", False), c.type_code) for c in columns if c.name != "pk"]
     pks = []
     i = 1
 
@@ -240,11 +238,11 @@ def bulk_load(
         # at a time where a materialized list would hold the whole chunk.
         for k in range(lo, hi):
             row = {"pk": k}
-            for name, nullable, col in spec:
+            for name, nullable, tc in spec:
                 if nullable and rng.random() < null_rate:
                     row[name] = None
                 else:
-                    row[name] = gen_value(rng, col, k, pools, skew)
+                    row[name] = gen_value(rng, name, tc, pools, skew)
             yield row
 
     while i <= num_rows:

@@ -33,27 +33,24 @@ class Subscriber:
         self.vid, self.schema = client.resolve_table(sn, name)
         self.delta_schema = gnitz.delta_reply_schema(self.schema)
         self.copy = {}
-        self.tag = None
-        self.tick = 0
+        self.cursor = (0, 0)
 
     def bootstrap(self):
         reply = self.client.delta_bootstrap(self.vid, self.schema, include_hidden=True)
         # A bootstrap replaces state; it does not add to it.
         self.copy = _zset(reply.rows)
-        self.tag, self.tick = reply.tag, reply.tick
+        self.cursor = reply.cursor
         return reply
 
     def poll(self):
         # No hand-written tag check: `delta_poll` refuses a foreign cursor
         # itself, so a reply that arrives here is one this copy may apply.
-        reply = self.client.delta_poll(
-            self.vid, self.delta_schema, self.tag, self.tick, include_hidden=True
-        )
+        reply = self.client.delta_poll(self.vid, self.delta_schema, self.cursor, include_hidden=True)
         for k, w in _zset(reply.rows).items():
             self.copy[k] = self.copy.get(k, 0) + w
             if self.copy[k] == 0:
                 del self.copy[k]
-        self.tag, self.tick = reply.tag, reply.tick
+        self.cursor = reply.cursor
         return reply
 
     def drain(self, rounds=12):
@@ -357,7 +354,7 @@ def test_a_cursor_below_the_floor_is_refused_as_a_code(sweeping_server):
         sub = Subscriber(client, sn, "f")
         sub.bootstrap()
         sub.drain()
-        stale_tick = sub.tick
+        stale = sub.cursor
 
         # Enough volume that the delta store folds, spills, pushes down and
         # drops its oldest terminal guard — which is what raises the floor past
@@ -365,7 +362,7 @@ def test_a_cursor_below_the_floor_is_refused_as_a_code(sweeping_server):
         _flood(client, sn, 1, 20_000)
 
         with pytest.raises(gnitz.GnitzDeltaExpiredError):
-            client.delta_poll(sub.vid, sub.delta_schema, sub.tag, stale_tick, include_hidden=True)
+            client.delta_poll(sub.vid, sub.delta_schema, stale, include_hidden=True)
 
         # And the recovery is exact: re-read at 0 and the copy is the view.
         #
@@ -464,7 +461,7 @@ def test_a_delta_read_of_a_relation_with_no_feed_is_an_error(client):
     with pytest.raises(gnitz.GnitzError):
         client.delta_bootstrap(vid, schema)
     with pytest.raises(gnitz.GnitzError):
-        client.delta_poll(vid, gnitz.delta_reply_schema(schema), 0, 1)
+        client.delta_poll(vid, gnitz.delta_reply_schema(schema), (0, 1))
 
 
 def test_a_cursor_across_drop_and_recreate_is_rejected(client):
@@ -481,7 +478,7 @@ def test_a_cursor_across_drop_and_recreate_is_rejected(client):
     client.execute_sql("INSERT INTO t VALUES (1, 100, 'a')", schema_name=sn)
     sub.bootstrap()
     sub.drain()
-    old_tag, old_tick = sub.tag, sub.tick
+    old = sub.cursor
 
     client.execute_sql("DROP VIEW f", schema_name=sn)
     _mk_feed(client, sn, "f", LINEAR)
@@ -490,7 +487,7 @@ def test_a_cursor_across_drop_and_recreate_is_rejected(client):
     fresh = Subscriber(client, sn, "f")
     assert fresh.vid != sub.vid, "a recreated view takes a fresh id"
     with pytest.raises(gnitz.GnitzDeltaExpiredError):
-        client.delta_poll(fresh.vid, fresh.delta_schema, old_tag, old_tick, include_hidden=True)
+        client.delta_poll(fresh.vid, fresh.delta_schema, old, include_hidden=True)
 
     fresh.bootstrap()
     fresh.assert_converged("after re-resolving and bootstrapping")
@@ -557,7 +554,7 @@ def test_a_feed_survives_a_restart_on_every_worker(own_server):
         _churn(client, sn, 1, 120)
         sub.bootstrap()
         sub.drain()
-        stale_tag, stale_tick = sub.tag, sub.tick
+        stale = sub.cursor
         vid = sub.vid
 
     own_server.restart()
@@ -565,7 +562,7 @@ def test_a_feed_survives_a_restart_on_every_worker(own_server):
         sub = Subscriber(client, sn, "f")
         assert sub.vid == vid, "the view keeps its id across a restart"
         with pytest.raises(gnitz.GnitzDeltaExpiredError):
-            client.delta_poll(sub.vid, sub.delta_schema, stale_tag, stale_tick, include_hidden=True)
+            client.delta_poll(sub.vid, sub.delta_schema, stale, include_hidden=True)
 
         sub.bootstrap()
         sub.assert_converged("after the restart's bootstrap")
@@ -622,7 +619,7 @@ def test_a_cursor_across_or_replace_is_rejected(client):
     client.execute_sql("INSERT INTO t VALUES (1, 100, 'a')", schema_name=sn)
     sub.bootstrap()
     sub.drain()
-    old_tag, old_tick = sub.tag, sub.tick
+    old = sub.cursor
 
     client.execute_sql(
         f"CREATE OR REPLACE VIEW f WITH (delta = '{FEED}') AS {LINEAR}", schema_name=sn
@@ -632,7 +629,7 @@ def test_a_cursor_across_or_replace_is_rejected(client):
     fresh = Subscriber(client, sn, "f")
     assert fresh.vid != sub.vid, "a replaced view takes a fresh id"
     with pytest.raises(gnitz.GnitzDeltaExpiredError):
-        client.delta_poll(fresh.vid, fresh.delta_schema, old_tag, old_tick, include_hidden=True)
+        client.delta_poll(fresh.vid, fresh.delta_schema, old, include_hidden=True)
 
     fresh.bootstrap()
     fresh.assert_converged("after re-resolving and bootstrapping")

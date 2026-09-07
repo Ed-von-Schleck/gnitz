@@ -20,23 +20,16 @@ use gnitz_sql::{SqlPlanner, SqlResult};
 use crate::read::{batch_to_lazy, delta_reply_to_py, triple_to_lazy, PyDeltaReply, PyScanResult};
 use crate::schema::{resolve_py_schema, rust_schema_to_py};
 use crate::write::{extract_uuid_or_u128, pk_key_from_py, py_pks_to_column, PyZSetBatch};
-use crate::{client_err, connect_client, gnitz_err, sql_err, to_py_err, GnitzError};
+use crate::{build_pylist, client_err, connect_client, gnitz_err, sql_err, GnitzError};
 
-/// What one view's poll did. The round its copy now answers at is `cursor`; the
-/// `reseeded` flag is the discontinuity a subscriber has to react to, and no
-/// cursor carries it — an expiry-driven reseed inside one boot keeps the tag and
-/// moves the tick forward, exactly as an ordinary advance does.
-///
-/// The flattening is this pyclass's, not the Rust type's: `PollResult` stays an
-/// enum where its invariant matters.
+/// What one view's poll did. `PollOutcome` flattened for Python, which has no
+/// cheap payload-carrying enum.
 #[pyclass(name = "PollResult", frozen, get_all)]
 pub struct PyPollResult {
     /// The relation's server id, which a recreated view moves.
     view_id: u64,
-    /// The copy was discarded and re-read whole. True for a first registration
-    /// and for every recovery; false for a poll that applied deltas, for a reopen
-    /// that resumed from its persisted cursor, and for a view whose poll failed —
-    /// which is the right answer to "did this view reseed".
+    /// The copy was discarded and re-read whole — the discontinuity a subscriber
+    /// has to react to, which no cursor carries.
     reseeded: bool,
     /// Why this one view's poll failed, or `None`. The other views went on; the
     /// recovery is `forget_view(view_id)`.
@@ -77,46 +70,33 @@ impl PyPollResult {
 
 #[pyclass(name = "GnitzClient")]
 pub struct PyGnitzClient {
-    /// `#[pyclass]` demands `Sync`; a client that mirrors holds a live engine and
-    /// is `Send` only, and `Mutex<T>: Sync` needs just `T: Send`. The lock is what
-    /// makes that sound — it is the only way to reach the client from a `&self`.
-    /// Nothing takes it: every user here holds `&mut self` and goes through
-    /// `get_mut`, and what refuses a second caller is pyo3's borrow flag, with a
-    /// `RuntimeError` rather than by queueing.
+    /// A `Sync` shim: `#[pyclass]` demands `Sync` and a mirroring client is
+    /// `Send` only. Never locked — [`Self::slot`] is the only way in.
     inner: Mutex<Option<GnitzClient>>,
 }
 
 impl PyGnitzClient {
+    /// The client slot, empty once `close()` has run.
+    fn slot(&mut self) -> &mut Option<GnitzClient> {
+        self.inner.get_mut().expect("the mutex is never locked")
+    }
+
     /// The still-open client, or a `GnitzError` if `close()` already ran.
     fn live(&mut self) -> PyResult<&mut GnitzClient> {
-        self.inner
-            .get_mut()
-            .expect("nothing locks this mutex, so it cannot be poisoned")
+        self.slot()
             .as_mut()
             .ok_or_else(|| GnitzError::new_err("client already closed"))
     }
 
-    /// Run one blocking client call: check the client is open, drop the GIL
-    /// across it, and map the failure with `map` — [`client_err`] unless the
-    /// path raises a class of its own.
-    fn call_with<T: Send, E: Send>(
-        &mut self,
-        py: Python<'_>,
-        map: impl FnOnce(E) -> PyErr,
-        f: impl FnOnce(&mut GnitzClient) -> Result<T, E> + Send,
-    ) -> PyResult<T> {
-        let c = self.live()?;
-        py.detach(move || f(c)).map_err(map)
-    }
-
-    /// [`Self::call_with`] under the default error mapping (a retryable OCC
-    /// conflict to `GnitzConflictError`). What a blocking method takes.
+    /// Run one blocking client call: check the client is open, and drop the GIL
+    /// across it. What every blocking method takes.
     fn call<T: Send>(
         &mut self,
         py: Python<'_>,
         f: impl FnOnce(&mut GnitzClient) -> Result<T, ClientError> + Send,
     ) -> PyResult<T> {
-        self.call_with(py, client_err, f)
+        let c = self.live()?;
+        py.detach(move || f(c)).map_err(client_err)
     }
 }
 
@@ -143,17 +123,10 @@ impl PyGnitzClient {
         Ok(self.live()?.requests_sent())
     }
 
-    /// Close the connection: closing checkpoints the mirror store, then releases
-    /// it. Calling it twice is fine.
-    ///
-    /// The GIL goes down for it: the checkpoint is fsync-bound and unbounded in
-    /// the copy's size, and the drop is what releases the store's directory lock.
+    /// Close the connection, checkpointing and releasing the mirror store first.
+    /// Idempotent. The GIL goes down for it: the checkpoint is fsync-bound.
     pub fn close(&mut self, py: Python<'_>) {
-        let taken = self
-            .inner
-            .get_mut()
-            .expect("nothing locks this mutex, so it cannot be poisoned")
-            .take();
+        let taken = self.slot().take();
         py.detach(move || {
             if let Some(mut client) = taken {
                 // A `NoMirrorStore` error is the no-store case.
@@ -181,11 +154,9 @@ impl PyGnitzClient {
         self.call(py, |c| c.drop_schema(name))
     }
 
-    /// create_table(schema_name, table_name, columns).
-    /// `columns` may be a `Schema` or a list of `ColumnDef` — resolved at the
-    /// parameter through [`resolve_py_schema`], so the PK columns come from the
-    /// same rule every other schema surface applies.
-    /// Partitioned, default distribution; no inline UNIQUE surface.
+    /// create_table(schema_name, table_name, columns) — `columns` is a `Schema`
+    /// or a list of `ColumnDef`. Partitioned, default distribution; no inline
+    /// UNIQUE surface.
     pub fn create_table(
         &mut self,
         py: Python<'_>,
@@ -193,16 +164,9 @@ impl PyGnitzClient {
         table_name: &str,
         #[pyo3(from_py_with = resolve_py_schema)] columns: Arc<Schema>,
     ) -> PyResult<u64> {
-        let pk = columns.pk_cols.clone();
+        let (cols, pk) = (&columns.columns, &columns.pk_cols);
         self.call(py, move |c| {
-            c.create_table(
-                schema_name,
-                table_name,
-                &columns.columns,
-                &pk,
-                TableProps::default(),
-                &[],
-            )
+            c.create_table(schema_name, table_name, cols, pk, TableProps::default(), &[])
         })
     }
 
@@ -212,16 +176,19 @@ impl PyGnitzClient {
 
     // ----- DML -----
 
-    /// push(target_id, batch) -> ingest_lsn: int. Silent-upsert on PK conflict
-    /// (DBSP z-set retraction semantics); SQL-standard rejection is reached via
-    /// `INSERT` through `execute_sql`.
-    pub fn push(&mut self, py: Python<'_>, target_id: u64, batch: PyRef<'_, PyZSetBatch>) -> PyResult<u64> {
+    /// push(target_id, batch, mode="update") -> ingest_lsn: int.
+    ///
+    /// `"update"` silently upserts on a PK conflict (DBSP z-set retraction
+    /// semantics); `"error"` rejects the batch, as SQL `INSERT` does.
+    #[pyo3(signature = (target_id, batch, mode = "update"))]
+    pub fn push(&mut self, py: Python<'_>, target_id: u64, batch: PyRef<'_, PyZSetBatch>, mode: &str) -> PyResult<u64> {
+        let m: WireConflictMode = mode.parse().map_err(gnitz_err)?;
         // Hold the `PyRef` guard here (it is `!Ungil`) and pass only the plain
         // `&Schema`/`&ZSetBatch` into the closure, so the GIL is free during
         // the blocking push without cloning the batch.
         let schema = batch.schema.as_ref();
         let b = &batch.batch;
-        self.call(py, move |c| c.push(target_id, schema, b))
+        self.call(py, move |c| c.push_with_mode(target_id, schema, b, m))
     }
 
     /// delete(target_id, schema, pks) — `schema` may be a `Schema` or a list of
@@ -238,10 +205,9 @@ impl PyGnitzClient {
         self.call(py, move |c| c.delete(target_id, &schema, pk_col))
     }
 
-    /// Open an atomic write-batch transaction as a context manager. Buffer
-    /// writes with `txn.push` / `txn.delete`; a clean `with`-block exit commits
-    /// the whole bundle atomically under one durable zone LSN, while an
-    /// exception discards it (rollback — nothing was sent).
+    /// Open an atomic write-batch transaction as a context manager. A clean
+    /// `with`-block exit commits the bundle under one durable zone LSN; an
+    /// exception discards it, and nothing was sent.
     ///
     /// ```python
     /// with client.transaction() as txn:
@@ -249,7 +215,7 @@ impl PyGnitzClient {
     ///     txn.delete(carts_tid, cart_schema, [pk])
     /// ```
     pub fn transaction(slf: Bound<'_, PyGnitzClient>) -> PyResult<PyTxn> {
-        to_py_err(slf.borrow_mut().live()?.txn_begin())?;
+        slf.borrow_mut().live()?.txn_begin().map_err(client_err)?;
         Ok(PyTxn { open: true, client: slf.unbind() })
     }
 
@@ -285,9 +251,8 @@ impl PyGnitzClient {
     /// scan(target_id, include_hidden=False) -> ScanResult
     ///
     /// Every row of the relation, off this client's local copy if it mirrors one
-    /// and from the server if it does not. `lsn` is `None` for a local answer: a
-    /// served LSN is a server-side counter, and a copy's freshness is a feed
-    /// round — `cursor(view_id)` is where a host reads it.
+    /// and from the server if it does not. `lsn` is `None` for a local answer;
+    /// a copy's freshness is `cursor(view_id)`.
     #[pyo3(signature = (target_id, include_hidden = false))]
     pub fn scan(&mut self, py: Python<'_>, target_id: u64, include_hidden: bool) -> PyResult<Py<PyScanResult>> {
         let (schema, batch, lsn) = self.call(py, |c| c.scan_local_first(target_id))?;
@@ -297,10 +262,8 @@ impl PyGnitzClient {
     /// delta_bootstrap(view_id, view_schema, include_hidden=False) -> DeltaReply
     ///
     /// The view's whole current value, in the view's own schema, plus the cursor
-    /// to poll from. `Delta { after_tick: 0 }` is the sum of every delta after
-    /// round 0 — the view's entire history — which is precisely what its output
-    /// store holds, so this costs exactly what a scan of the view costs. Apply it
-    /// to a fresh copy: it replaces state, it does not add to it.
+    /// to poll from. Costs what a scan of the view costs. Apply it to a fresh
+    /// copy: it replaces state, it does not add to it.
     #[pyo3(signature = (view_id, view_schema, include_hidden = false))]
     pub fn delta_bootstrap(
         &mut self,
@@ -313,41 +276,34 @@ impl PyGnitzClient {
         delta_reply_to_py(py, view_schema, out, include_hidden)
     }
 
-    /// delta_poll(view_id, reply_schema, tag, tick, include_hidden=False) -> DeltaReply
+    /// delta_poll(view_id, reply_schema, cursor, include_hidden=False) -> DeltaReply
     ///
-    /// Every delta the view emitted in `(tick, T]`, in `delta_reply_schema`'s
-    /// shape. Apply what comes back and store the returned cursor; there is
-    /// nothing to filter and nothing to reconcile.
+    /// Every delta the view emitted since `cursor`, in `delta_reply_schema`'s
+    /// shape. `cursor` is the `(tag, tick)` a previous reply handed back. Apply
+    /// what comes back and keep the new cursor; there is nothing to filter and
+    /// nothing to reconcile.
     ///
-    /// A `tag` that does not match the one the reply carries names a different
-    /// boot or a different relation — a restart, or a `DROP VIEW` /
-    /// `CREATE VIEW` of the same name. That is refused with
-    /// `GnitzDeltaExpiredError`, not answered with rows: a foreign cursor draws
-    /// the other relation's recent deltas, which are unsafe to apply. The
-    /// recovery is the one that error always calls for — bootstrap again.
-    /// A `tick` of 0 gets the same error for the same reason: it names no copy to
-    /// continue, and a bootstrap comes back in the view's schema rather than in
-    /// this one.
-    #[pyo3(signature = (view_id, reply_schema, tag, tick, include_hidden = false))]
+    /// A cursor whose rounds are gone, or that names a different boot or
+    /// relation, is refused with `GnitzDeltaExpiredError` rather than answered
+    /// with the wrong relation's rows. Bootstrap again.
+    #[pyo3(signature = (view_id, reply_schema, cursor, include_hidden = false))]
     pub fn delta_poll(
         &mut self,
         py: Python<'_>,
         view_id: u64,
         #[pyo3(from_py_with = resolve_py_schema)] reply_schema: Arc<Schema>,
-        tag: u64,
-        tick: u64,
+        cursor: (u64, u64),
         include_hidden: bool,
     ) -> PyResult<Py<PyDeltaReply>> {
-        let cursor = gnitz_core::DeltaCursor { tag, tick };
+        let cursor = DeltaCursor { tag: cursor.0, tick: cursor.1 };
         let out = self.call(py, |c| c.delta_poll(view_id, cursor, &reply_schema))?;
         delta_reply_to_py(py, reply_schema, out, include_hidden)
     }
 
     /// scan_many(target_ids, include_hidden=False) -> list[ScanResult]
     ///
-    /// Consistent snapshot of N relations at one server-side SAL cut, returned
-    /// in request order. An atomic multi-table transaction is never observed
-    /// torn across the result list. Same row decoding as `scan`.
+    /// Consistent snapshot of N relations at one server-side SAL cut, in request
+    /// order: an atomic multi-table transaction is never observed torn across it.
     #[pyo3(signature = (target_ids, include_hidden = false))]
     pub fn scan_many(
         &mut self,
@@ -384,12 +340,8 @@ impl PyGnitzClient {
     /// seek_by_index(table_id, col_indices, key_vals, include_hidden=False) -> ScanResult.
     ///
     /// `col_indices` is the index's FULL declared column list (the server matches
-    /// the circuit by exact list); `key_vals` supplies the leading native key
-    /// values (`len(key_vals)` may be `< len(col_indices)` for a leading-prefix
-    /// seek). Arity is validated once inside `GnitzClient::seek_by_index` (the
-    /// single choke point for every binding), so no validation is duplicated here.
-    /// Key values are decoded through `extract_uuid_or_u128`, so a UUID-keyed seek
-    /// accepts the same `uuid.UUID` / hex-string forms the insert paths do.
+    /// the circuit by exact list); `key_vals` supplies the leading key values, and
+    /// may be shorter for a leading-prefix seek.
     #[pyo3(signature = (table_id, col_indices, key_vals, include_hidden = false))]
     pub fn seek_by_index(
         &mut self,
@@ -415,25 +367,21 @@ impl PyGnitzClient {
     #[pyo3(signature = (sql, schema_name = "public"))]
     pub fn execute_sql(&mut self, py: Python<'_>, sql: &str, schema_name: &str) -> PyResult<Py<PyAny>> {
         // Plan + execute (all wire I/O, no Python) with the GIL released.
-        let results = self.call_with(py, sql_err, |c| SqlPlanner::new(c, schema_name).execute(sql))?;
+        let c = self.live()?;
+        let results = py
+            .detach(|| SqlPlanner::new(c, schema_name).execute(sql))
+            .map_err(sql_err)?;
         sql_results_to_py(py, results)
     }
 
     // ----- Mirroring -----
-    //
-    // Every method that does work drops the GIL for all of it — the round trips,
-    // and the engine and disk work between them. Only the metadata getters, which
-    // answer out of memory, hold it.
 
     /// mirror_at(base_dir)
     ///
-    /// Open (or resume) a local copy directory at `base_dir` and read this
-    /// client's mirrored views through it. The directory is this client's alone —
-    /// **one store per directory**, in this process or any other, and the engine's
-    /// own lock on it refuses a second.
-    ///
-    /// A second call on the same client is refused, naming the path it holds.
-    /// `close_mirror()` releases one; so does closing the client.
+    /// Open (or resume) the local copy directory at `base_dir` and read this
+    /// client's mirrored views through it. One store per directory, and one per
+    /// client: a second call is refused. `close_mirror()` releases it, and so
+    /// does closing the client.
     pub fn mirror_at(&mut self, py: Python<'_>, base_dir: &str) -> PyResult<()> {
         let base_dir = base_dir.to_string();
         self.call(py, move |c| c.attach_mirror(Mirror::open(&base_dir)?))
@@ -441,41 +389,32 @@ impl PyGnitzClient {
 
     /// mirror_view(schema_name, name) -> PollResult
     ///
-    /// Register the view and bring its copy up to date. Idempotent, and the same
-    /// call whether this is a first registration or a reopen: the result says
-    /// which it was.
+    /// Register the view and bring its copy up to date; idempotent, and the
+    /// result says whether this was a first registration or a reopen. Only a
+    /// view created `WITH (delta = '<size>')` can be mirrored.
     ///
-    /// Only a view with a delta feed can be mirrored — create it
-    /// `WITH (delta = '<size>')`.
-    ///
-    /// **A mirrored read answers at the last poll**, not at what the server holds
-    /// now: not read-your-own-writes, and two mirrored views are no consistent
-    /// cut.
+    /// A mirrored read answers at the last poll, not at what the server holds
+    /// now.
     pub fn mirror_view(&mut self, py: Python<'_>, schema_name: &str, name: &str) -> PyResult<Py<PyPollResult>> {
         let outcome = self.call(py, |c| c.mirror_view(schema_name, name))?;
         Py::new(py, PyPollResult::from(outcome))
     }
 
-    /// forget_view(view_id)
-    ///
-    /// Stop mirroring the relation: the copy and its directory go, and a later
-    /// read of it is delegated upstream.
+    /// forget_view(view_id) — stop mirroring the relation. The copy goes, and a
+    /// later read of it is delegated upstream.
     pub fn forget_view(&mut self, py: Python<'_>, view_id: u64) -> PyResult<()> {
         self.call(py, |c| c.forget_view(view_id))
     }
 
     /// poll() -> list[PollResult]
     ///
-    /// Advance every registered view by one poll each, and report what each one
-    /// did — **one entry per view, whatever happened to it**. A view that failed
-    /// carries its message in `error`; the others went on.
+    /// Advance every registered view by one poll each — one entry per view,
+    /// whatever happened to it. A view that failed carries its message in
+    /// `error`; the others went on. It raises only for a failure of the call
+    /// itself: no store attached, a poisoned one, or a `KeyboardInterrupt`.
     ///
     /// A poll drives no tick server-side, so a drain is "read the view against
     /// the server, then poll once".
-    ///
-    /// It raises only for a failure of the call rather than of a view: no store
-    /// attached, a poisoned one, and a `KeyboardInterrupt`, which stops at the
-    /// view it interrupted.
     pub fn poll(&mut self, py: Python<'_>) -> PyResult<Vec<Py<PyPollResult>>> {
         let outcomes = self.call(py, GnitzClient::poll_mirror)?;
         outcomes
@@ -484,11 +423,8 @@ impl PyGnitzClient {
             .collect()
     }
 
-    /// Make every copy and its cursor durable.
-    ///
-    /// A failure is reported, not fatal: the flush writes shards and publishes
-    /// manifests, neither of which mutates what a copy holds, so the store stays
-    /// usable and a retry is sound.
+    /// Make every copy and its cursor durable. A failure leaves the store
+    /// usable, so a retry is sound.
     pub fn checkpoint(&mut self, py: Python<'_>) -> PyResult<()> {
         self.call(py, GnitzClient::checkpoint_mirror)
     }
@@ -497,10 +433,8 @@ impl PyGnitzClient {
     ///
     /// Checkpoint (unless poisoned) and release the store, reporting the final
     /// checkpoint rather than letting the destructor swallow it. The connection
-    /// stays open and `mirror_at` may be called again.
-    ///
-    /// It is also the **only** recovery from a poisoned copy, which refuses every
-    /// call that touches it and cannot be cleared.
+    /// stays open and `mirror_at` may be called again. It is also the only
+    /// recovery from a poisoned copy.
     pub fn close_mirror(&mut self, py: Python<'_>) -> PyResult<()> {
         self.call(py, GnitzClient::close_mirror)
     }
@@ -511,8 +445,8 @@ impl PyGnitzClient {
         Ok(self.live()?.mirrors(view_id))
     }
 
-    /// Every registration this client holds, whether or not the copy behind it is
-    /// valid — wider than `mirrors` by the ones a poll has yet to seed.
+    /// Every registration this client holds, valid copy or not — wider than
+    /// `mirrors` by the ones a poll has yet to seed.
     pub fn mirrored_ids(&mut self) -> PyResult<Vec<u64>> {
         Ok(self.live()?.mirrored_ids())
     }
@@ -520,11 +454,9 @@ impl PyGnitzClient {
     /// cursor(view_id) -> (tag, tick) | None
     ///
     /// The round a local read of `view_id` answers at, or `None` when there is no
-    /// valid copy to read one off.
-    ///
-    /// The tick is the master's global round counter, shared by every relation,
-    /// so it advances over rounds that carried this view nothing. Whether a copy
-    /// changed is `PollResult.reseeded`, not this.
+    /// valid copy. The tick is the master's global round counter, shared by every
+    /// relation, so it advances over rounds that carried this view nothing —
+    /// whether a copy changed is `PollResult.reseeded`, not this.
     pub fn cursor(&mut self, py: Python<'_>, view_id: u64) -> PyResult<Py<PyAny>> {
         match self.live()?.cursor_of(view_id) {
             None => Ok(py.None()),
@@ -544,85 +476,74 @@ impl PyGnitzClient {
 
     /// reconnect(target)
     ///
-    /// Replace the connection, keeping every mirrored copy. What a host does
-    /// after a server restart: the restart kills the socket, while the copies —
-    /// durable, and resumable — survive it. Refused inside a transaction.
-    ///
-    /// Every cursor is dropped, so a read between the reconnect and the next poll
-    /// goes upstream; the poll that follows reports a reseed for every view. A
-    /// client that mirrors nothing gains the same recovery.
+    /// Replace the connection, keeping every mirrored copy — what a host does
+    /// after a server restart. Refused inside a transaction. Every cursor is
+    /// dropped, so a read before the next poll goes upstream and that poll
+    /// reports a reseed for every view.
     pub fn reconnect(&mut self, py: Python<'_>, target: &str) -> PyResult<()> {
-        self.call(py, |c| c.reconnect(target))?;
-        // The park hook rides along with the reconnect, so a Ctrl-C still
-        // interrupts; nothing is reinstalled here.
-        Ok(())
+        self.call(py, |c| c.reconnect(target))
     }
 }
 
-/// One `SqlResult` per statement as the list of dicts every SQL entry point
-/// hands back — the client's and the mirror's alike, so a statement run through
-/// either comes back in the same shape.
+/// One `SqlResult` per statement as a dict — the shape every SQL entry point
+/// hands back.
 fn sql_results_to_py(py: Python<'_>, results: Vec<SqlResult>) -> PyResult<Py<PyAny>> {
-    let py_list = PyList::empty(py);
-    // Interned keys: `r["type"]` on the Python side hits on pointer identity
-    // against its own source literal, where a `PyUnicode` freshly built per
-    // key per result makes every lookup a string compare.
+    // Interned throughout: `r["type"] == "Rows"` on the Python side then settles
+    // on pointer identity rather than a string compare.
     let k_type = pyo3::intern!(py, "type");
-    for r in results {
+    let dicts = results.into_iter().map(|r| {
         let d = PyDict::new(py);
         match r {
             SqlResult::TableCreated { table_id } => {
-                d.set_item(k_type, "TableCreated")?;
+                d.set_item(k_type, pyo3::intern!(py, "TableCreated"))?;
                 d.set_item(pyo3::intern!(py, "table_id"), table_id)?;
             }
             SqlResult::ViewCreated { view_id } => {
-                d.set_item(k_type, "ViewCreated")?;
+                d.set_item(k_type, pyo3::intern!(py, "ViewCreated"))?;
                 d.set_item(pyo3::intern!(py, "view_id"), view_id)?;
             }
             SqlResult::IndexCreated { index_id } => {
-                d.set_item(k_type, "IndexCreated")?;
+                d.set_item(k_type, pyo3::intern!(py, "IndexCreated"))?;
                 d.set_item(pyo3::intern!(py, "index_id"), index_id)?;
             }
             SqlResult::Dropped => {
-                d.set_item(k_type, "Dropped")?;
+                d.set_item(k_type, pyo3::intern!(py, "Dropped"))?;
             }
             SqlResult::Altered { object, name } => {
-                d.set_item(k_type, "Altered")?;
+                d.set_item(k_type, pyo3::intern!(py, "Altered"))?;
                 d.set_item(pyo3::intern!(py, "object"), object)?;
                 d.set_item(pyo3::intern!(py, "name"), name)?;
             }
             SqlResult::RowsAffected { count } => {
-                d.set_item(k_type, "RowsAffected")?;
+                d.set_item(k_type, pyo3::intern!(py, "RowsAffected"))?;
                 d.set_item(pyo3::intern!(py, "count"), count)?;
             }
             SqlResult::Rows { schema, batch } => {
-                d.set_item(k_type, "Rows")?;
+                d.set_item(k_type, pyo3::intern!(py, "Rows"))?;
                 d.set_item(
                     pyo3::intern!(py, "rows"),
                     batch_to_lazy(py, Some(Arc::new(schema)), Some(batch), None, false)?,
                 )?;
             }
             SqlResult::TransactionStarted => {
-                d.set_item(k_type, "TransactionStarted")?;
+                d.set_item(k_type, pyo3::intern!(py, "TransactionStarted"))?;
             }
             SqlResult::TransactionCommitted { lsn } => {
-                d.set_item(k_type, "TransactionCommitted")?;
+                d.set_item(k_type, pyo3::intern!(py, "TransactionCommitted"))?;
                 d.set_item(pyo3::intern!(py, "lsn"), lsn)?;
             }
             SqlResult::TransactionRolledBack => {
-                d.set_item(k_type, "TransactionRolledBack")?;
+                d.set_item(k_type, pyo3::intern!(py, "TransactionRolledBack"))?;
             }
         }
-        py_list.append(d)?;
-    }
-    Ok(py_list.into_any().unbind())
+        Ok(d)
+    });
+    Ok(build_pylist(py, dicts)?.into_any().unbind())
 }
 
-/// Atomic write-batch transaction context manager: an RAII handle on the
-/// client's open transaction. `push`/`delete` are the client's own write methods
-/// — they buffer because a transaction is open, exactly as a SQL `INSERT` between
-/// `BEGIN` and `COMMIT` does. Nothing reaches the server until the `with`-block
-/// exits cleanly.
+/// An RAII handle on the client's open transaction. Its `push`/`delete` are the
+/// client's own, which buffer while a transaction is open — as a SQL `INSERT`
+/// between `BEGIN` and `COMMIT` does.
 #[pyclass(name = "Txn")]
 pub struct PyTxn {
     /// False once `__exit__` has committed or discarded the transaction.
@@ -636,18 +557,14 @@ impl PyTxn {
         slf
     }
 
-    /// Buffer a push of `batch` into `target_id` under conflict mode `mode`
-    /// (`"update"` — the default — or `"error"`).
+    /// Buffer a push of `batch` into `target_id` — the client's own `push`,
+    /// which buffers because this transaction is open.
     #[pyo3(signature = (target_id, batch, mode = "update"))]
     pub fn push(&mut self, py: Python<'_>, target_id: u64, batch: PyRef<'_, PyZSetBatch>, mode: &str) -> PyResult<()> {
-        let m: WireConflictMode = mode.parse().map_err(gnitz_err)?;
-        let schema = batch.schema.as_ref();
-        let b = &batch.batch;
-        self.with_client(py, move |c| c.push_with_mode(target_id, schema, b, m).map(|_| ()))
+        self.client(py)?.push(py, target_id, batch, mode).map(|_| ())
     }
 
-    /// Buffer a delete of `pks` from `target_id` (same schema and PK forms as
-    /// `GnitzClient.delete`).
+    /// Buffer a delete of `pks` from `target_id` — the client's own `delete`.
     pub fn delete(
         &mut self,
         py: Python<'_>,
@@ -655,8 +572,7 @@ impl PyTxn {
         #[pyo3(from_py_with = resolve_py_schema)] schema: Arc<Schema>,
         pks: Vec<Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        let pk_col = py_pks_to_column(&schema, &pks)?;
-        self.with_client(py, move |c| c.delete(target_id, &schema, pk_col))
+        self.client(py)?.delete(py, target_id, schema, pks)
     }
 
     /// Commit the bundle on a clean exit; discard it (rollback) if the block
@@ -672,7 +588,7 @@ impl PyTxn {
             return Ok(false);
         }
         let clean = exc_type.is_none(py);
-        let r = self.with_client(py, |c| {
+        let r = self.client(py)?.call(py, |c| {
             if clean {
                 c.txn_commit().map(|_| ())
             } else {
@@ -687,19 +603,12 @@ impl PyTxn {
 }
 
 impl PyTxn {
-    /// Run `f` against the transaction's client, once the transaction is known
-    /// to still be open. The call itself goes through the client's own
-    /// [`PyGnitzClient::call`], so a buffered write and a `txn_commit` release
-    /// the GIL and classify their errors exactly as the non-transactional
-    /// writes do.
-    fn with_client(
-        &self,
-        py: Python<'_>,
-        f: impl FnOnce(&mut GnitzClient) -> Result<(), ClientError> + Send,
-    ) -> PyResult<()> {
+    /// The client this transaction is open on, or an error if `__exit__` has
+    /// already committed or discarded it.
+    fn client<'py>(&self, py: Python<'py>) -> PyResult<PyRefMut<'py, PyGnitzClient>> {
         if !self.open {
             return Err(GnitzError::new_err("transaction already committed or discarded"));
         }
-        self.client.bind(py).borrow_mut().call(py, f)
+        Ok(self.client.bind(py).borrow_mut())
     }
 }

@@ -14,16 +14,7 @@ use gnitz_core::{ClientError, WireConflictMode};
 
 use crate::read::triple_to_lazy;
 use crate::write::{pk_key_from_py, PyZSetBatch};
-use crate::{build_pylist, client_err, to_py_err};
-
-// resolve directly: no thread, no channel, no cross-thread wake.
-
-/// One outstanding operation. `include_hidden` is how the *result* is surfaced,
-/// not part of the request, so it travels with the future.
-struct Outstanding {
-    future: Py<PyAny>,
-    include_hidden: bool,
-}
+use crate::{build_pylist, client_err};
 
 #[pyclass(name = "AsyncTransport")]
 pub(crate) struct PyAsyncTransport {
@@ -32,7 +23,8 @@ pub(crate) struct PyAsyncTransport {
     /// operation, and resolving the attribute by name each time would build
     /// its name string every call.
     create_future: Py<PyAny>,
-    slots: std::collections::HashMap<gnitz_core::SlotId, Outstanding>,
+    /// The loop future each in-flight slot resolves.
+    slots: std::collections::HashMap<gnitz_core::SlotId, Py<PyAny>>,
     /// Set by `close` and by a failed step; every later step is a no-op.
     closed: bool,
     /// The loop this transport is registered on, and the fd it is registered
@@ -42,24 +34,23 @@ pub(crate) struct PyAsyncTransport {
     fd: i32,
     /// Exactly "the loop owes us an `on_writable`".
     writer_armed: bool,
-    /// The two bound methods the loop holds, built by [`Self::install`] because
-    /// `arm` has only a `&mut self` to build one from. They point back at this
-    /// transport, so [`Self::shutdown`] drops them rather than leaving a cycle
-    /// for the collector.
+    /// The two bound methods the loop holds, built by [`Self::install`]. They
+    /// point back at this transport, so [`Self::shutdown`] drops them rather
+    /// than leaving a cycle for the collector.
     on_readable: Option<Py<PyAny>>,
     on_writable: Option<Py<PyAny>>,
 }
 
 /// The Python value one reply resolves its future to. The spine already
 /// narrowed it against the request, so nothing here needs the session.
-fn narrow(py: Python<'_>, reply: gnitz_core::Reply, include_hidden: bool) -> PyResult<Py<PyAny>> {
+fn narrow(py: Python<'_>, reply: gnitz_core::Reply) -> PyResult<Py<PyAny>> {
     match reply {
         gnitz_core::Reply::Lsn(lsn) => Ok(lsn.into_pyobject(py)?.into_any().unbind()),
-        gnitz_core::Reply::Scan(r) => Ok(triple_to_lazy(py, r, include_hidden)?.into_any()),
+        gnitz_core::Reply::Scan(r) => Ok(triple_to_lazy(py, r, false)?.into_any()),
         // One PyScanResult per relation, in request order → a Python list,
         // resolving the single scan_many future.
         gnitz_core::Reply::Multi(replies) => {
-            let per_rel = replies.into_iter().map(|r| triple_to_lazy(py, r, include_hidden));
+            let per_rel = replies.into_iter().map(|r| triple_to_lazy(py, r, false));
             Ok(build_pylist(py, per_rel)?.into_any().unbind())
         }
         _ => unreachable!("this transport submits no verb with another reply shape"),
@@ -83,20 +74,20 @@ fn settle(py: Python<'_>, future: &Py<PyAny>, value: PyResult<Py<PyAny>>) {
 }
 
 impl PyAsyncTransport {
-    /// Register a submitted slot against a fresh loop future, and ask the loop
-    /// for a writer — a submitted frame is only queued, and deferring the flush
-    /// to that callback keeps a whole turn's submits in one `writev`. Built
-    /// after the submit, so a request the spine refuses raises where the caller
-    /// made it.
-    fn register(&mut self, py: Python<'_>, slot: gnitz_core::SlotId, include_hidden: bool) -> PyResult<Py<PyAny>> {
+    /// Submit one request and hand back the loop future it will resolve. Every
+    /// verb goes through here, so the in-flight cap and the deferred flush are
+    /// the same for all of them.
+    fn submit(&mut self, py: Python<'_>, req: gnitz_core::Request<'_>) -> PyResult<Py<PyAny>> {
+        // There is no await to back-pressure on, so at the cap flush and retire
+        // first — `BOTH`, since only the read half relieves it.
+        if self.session.at_capacity() {
+            self.drive(py, gnitz_core::Interest::BOTH)?;
+        }
+        let session = &mut self.session;
+        let slot = py.detach(|| session.submit(req)).map_err(client_err)?;
         let future = self.create_future.call0(py)?;
-        self.slots.insert(
-            slot,
-            Outstanding {
-                future: future.clone_ref(py),
-                include_hidden,
-            },
-        );
+        self.slots.insert(slot, future.clone_ref(py));
+        // Ask for a writer rather than flushing here: one `writev` per loop turn.
         self.arm(py, true)?;
         Ok(future)
     }
@@ -147,14 +138,14 @@ impl PyAsyncTransport {
     }
 
     fn resolve(&mut self, py: Python<'_>, slot: gnitz_core::SlotId, result: Result<gnitz_core::Reply, ClientError>) {
-        let Some(o) = self.slots.remove(&slot) else {
+        let Some(future) = self.slots.remove(&slot) else {
             return;
         };
         let value = match result {
-            Ok(reply) => narrow(py, reply, o.include_hidden),
+            Ok(reply) => narrow(py, reply),
             Err(e) => Err(client_err(e)),
         };
-        settle(py, &o.future, value);
+        settle(py, &future, value);
     }
 
     /// Deregister both callbacks and drop them, so the selector never holds a
@@ -180,8 +171,8 @@ impl PyAsyncTransport {
         self.deregister(py);
         self.session.close();
         let err = client_err(cause);
-        for (_, o) in std::mem::take(&mut self.slots) {
-            settle(py, &o.future, Err(err.clone_ref(py)));
+        for (_, future) in std::mem::take(&mut self.slots) {
+            settle(py, &future, Err(err.clone_ref(py)));
         }
     }
 }
@@ -193,7 +184,9 @@ impl PyAsyncTransport {
         // Connect + HELLO run on the calling (loop) thread, GIL dropped across
         // the blocking syscalls. A bare `Session`, not a `GnitzClient`: no OCC
         // basis to track, so the HELLO ACK's `published_lsn` is discarded.
-        let (session, _published_lsn) = to_py_err(py.detach(|| gnitz_core::Session::connect(socket_path)))?;
+        let (session, _published_lsn) = py
+            .detach(|| gnitz_core::Session::connect(socket_path))
+            .map_err(client_err)?;
         let fd = session.as_raw_fd();
         let create_future = event_loop.getattr(py, "create_future")?;
         Ok(PyAsyncTransport {
@@ -211,9 +204,7 @@ impl PyAsyncTransport {
 
     /// Bind the two loop callbacks and register the reader — a second step
     /// because binding them needs a `Bound<Self>`, which `#[new]` cannot
-    /// produce. The reader stays armed for the connection's life: on a quiet
-    /// socket it costs nothing, where arming per operation costs two
-    /// `epoll_ctl`.
+    /// produce. The reader stays armed for the connection's life.
     fn install(slf: Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         let on_readable = slf.getattr(pyo3::intern!(py, "on_readable"))?.unbind();
@@ -231,57 +222,38 @@ impl PyAsyncTransport {
         Ok(())
     }
 
+    /// The batch packs warm against the session's own cache; a stale stamp's
+    /// mismatch fails this slot and the caller re-issues.
     fn push(&mut self, py: Python<'_>, target_id: u64, batch: PyRef<'_, PyZSetBatch>) -> PyResult<Py<PyAny>> {
-        // `submit` packs warm against the session's own cache; a stale stamp's
-        // mismatch fails this slot and the caller re-issues. No await here to
-        // back-pressure on, so at either cap flush and retire first — `BOTH`,
-        // since only the read half relieves the in-flight cap.
-        if self.session.at_capacity() {
-            self.drive(py, gnitz_core::Interest::BOTH)?;
-        }
         let schema = batch.schema.as_ref();
         let b = &batch.batch;
-        let session = &mut self.session;
-        let slot = py.detach(|| {
-            session.submit(gnitz_core::Request::Push {
+        self.submit(
+            py,
+            gnitz_core::Request::Push {
                 target_id,
                 schema,
                 batch: b,
                 mode: WireConflictMode::Update,
-            })
-        });
-        let slot = to_py_err(slot)?;
-        self.register(py, slot, false)
+            },
+        )
     }
 
-    #[pyo3(signature = (target_id, include_hidden = false))]
-    fn scan(&mut self, py: Python<'_>, target_id: u64, include_hidden: bool) -> PyResult<Py<PyAny>> {
-        let slot = to_py_err(self.session.submit(gnitz_core::Request::scan(target_id)))?;
-        self.register(py, slot, include_hidden)
+    fn scan(&mut self, py: Python<'_>, target_id: u64) -> PyResult<Py<PyAny>> {
+        self.submit(py, gnitz_core::Request::scan(target_id))
     }
 
-    /// scan_many(target_ids, include_hidden=False) -> awaitable[list[ScanResult]]
+    /// scan_many(target_ids) -> awaitable[list[ScanResult]]
     ///
     /// Consistent snapshot of N relations at one server-side SAL cut, resolved
     /// as a list in request order. A malformed list (empty, over-cap, duplicate
     /// tid) is rejected before any frame is written, and raises here.
-    #[pyo3(signature = (target_ids, include_hidden = false))]
-    fn scan_many(&mut self, py: Python<'_>, target_ids: Vec<u64>, include_hidden: bool) -> PyResult<Py<PyAny>> {
-        let slot = to_py_err(self.session.submit(gnitz_core::Request::ScanMulti(&target_ids)))?;
-        self.register(py, slot, include_hidden)
+    fn scan_many(&mut self, py: Python<'_>, target_ids: Vec<u64>) -> PyResult<Py<PyAny>> {
+        self.submit(py, gnitz_core::Request::ScanMulti(&target_ids))
     }
 
-    #[pyo3(signature = (target_id, pk, include_hidden = false))]
-    fn seek(
-        &mut self,
-        py: Python<'_>,
-        target_id: u64,
-        pk: Bound<'_, PyAny>,
-        include_hidden: bool,
-    ) -> PyResult<Py<PyAny>> {
+    fn seek(&mut self, py: Python<'_>, target_id: u64, pk: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let (low, extra) = pk_key_from_py(&pk)?;
-        let slot = to_py_err(self.session.submit(gnitz_core::Request::seek(target_id, low, &extra)))?;
-        self.register(py, slot, include_hidden)
+        self.submit(py, gnitz_core::Request::seek(target_id, low, &extra))
     }
 
     /// One pyo3 crossing per readable event. It flushes as well as reads, so a

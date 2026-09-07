@@ -33,7 +33,7 @@ pub use connection::{
     Completions, Interest, LocalScanReply, ParkHook, RawBlock, RelTarget, Reply, ReplyTrain, Request, ScanReply,
     Session, SlotId, MAX_IN_FLIGHT, MAX_QUEUED_BYTES,
 };
-pub use error::{ClientError, ConflictClass};
+pub use error::ClientError;
 pub use gnitz_wire::{
     validate_dist_prefix, validate_user_identifier, Cut, PkColList, RangeDescriptor, ReindexSlot, RelClass, TableProps,
     FIRST_USER_TABLE_ID, TABLE_TAB,

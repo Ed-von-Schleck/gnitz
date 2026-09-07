@@ -120,10 +120,13 @@ impl<'a> Binder<'a> {
             .get(self.schema_name, name)
             .ok_or_else(|| GnitzSqlError::CatalogMiss(name.to_string()))?
             .ok_or_else(|| {
-                GnitzSqlError::Exec(ClientError::ServerError(format!(
-                    "Table or view '{}' not found",
-                    gnitz_core::qualified_name(self.schema_name, name)
-                )))
+                // The classified variant, not prose: a binding raises a catchable
+                // class for an absent relation, and `resolve_relation` reports the
+                // same one for the same miss.
+                GnitzSqlError::Exec(ClientError::NotFound {
+                    noun: "table or view",
+                    name: gnitz_core::qualified_name(self.schema_name, name),
+                })
             })?;
         let schema = Arc::clone(&rel.schema);
         // Leaf rule. A bounded view's store keeps only skeleton rows past its

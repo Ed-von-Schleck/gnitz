@@ -88,23 +88,28 @@ class AsyncConnection:
         """Push a batch to a table.  Awaits to the ingest LSN (int)."""
         return self._transport.push(target_id, batch)
 
-    def scan(self, target_id, include_hidden=False):
+    def scan(self, target_id):
         """Scan a table/view.  Awaits to a ``ScanResult``."""
-        return self._transport.scan(target_id, include_hidden)
+        return self._transport.scan(target_id)
 
-    def scan_many(self, target_ids, include_hidden=False):
+    def scan_many(self, target_ids):
         """Consistent snapshot of N relations at one server-side SAL cut.
 
         Awaits to a ``list`` of ``ScanResult`` in request order.  An atomic
         multi-table transaction is never observed torn across the list.
         """
-        return self._transport.scan_many(target_ids, include_hidden)
+        return self._transport.scan_many(target_ids)
 
-    def seek(self, table_id, pk=0, include_hidden=False):
+    def seek(self, table_id, pk=0):
         """Point-lookup by primary key.  Awaits to a ``ScanResult``."""
-        return self._transport.seek(table_id, pk, include_hidden)
+        return self._transport.seek(table_id, pk)
 
     # -- lifecycle ---------------------------------------------------------
+
+    @property
+    def client_id(self):
+        """The server-assigned id of this connection."""
+        return self._transport.client_id
 
     def __await__(self):
         # `connect()` serves both `await connect(p)` and `async with

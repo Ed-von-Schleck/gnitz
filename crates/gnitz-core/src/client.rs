@@ -1994,9 +1994,11 @@ impl TxnBuffer {
         let last = self.families_of.get(&tid).and_then(|v| v.last().copied());
         match last.filter(|&i| self.families[i].mode == mode) {
             Some(i) => {
-                let f = &mut self.families[i];
-                let schema = f.schema.clone();
-                f.batch.extend_from_owned(batch, &schema);
+                // Destructured, not cloned: `extend_from_owned` wants the
+                // schema by reference and the batch by `&mut`, and they are
+                // distinct fields of the same family.
+                let BufferedFamily { schema, batch: run, .. } = &mut self.families[i];
+                run.extend_from_owned(batch, schema);
             }
             None => {
                 self.families_of.entry(tid).or_default().push(self.families.len());

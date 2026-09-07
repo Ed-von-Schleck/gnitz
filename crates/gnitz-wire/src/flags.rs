@@ -305,7 +305,7 @@ wire_enum! {
     pub enum WireConflictMode: u8 {
         /// Retract-and-insert on PK conflict. Used for SQL `UPDATE`,
         /// `INSERT ... ON CONFLICT ... DO UPDATE` (after client-side
-        /// merging), and explicit Python `push(conflict_mode="update")`.
+        /// merging), and explicit Python `push(mode="update")`.
         Update = 0,
         /// Reject the batch on any PK conflict. The master runs both an
         /// intra-batch duplicate check and an against-store PK existence
@@ -340,9 +340,8 @@ impl std::str::FromStr for WireConflictMode {
     type Err = String;
 
     /// The two modes' user-facing names, for the bindings that let a caller
-    /// choose one (the blocking `push(conflict_mode=...)`; the async clients
-    /// always push `Update`). Owned here, next to the discriminants, so no
-    /// binding gets to invent a third spelling.
+    /// choose one (Python's `push(mode=...)`; the async clients always push
+    /// `Update`). Owned here, so no binding invents a third spelling.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "update" => Ok(WireConflictMode::Update),

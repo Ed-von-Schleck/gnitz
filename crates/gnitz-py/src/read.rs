@@ -20,8 +20,7 @@ use crate::schema::rust_schema_to_py;
 
 /// `subclass` because a result presents its rows as a synthesised subclass
 /// carrying one [`ColumnDescriptor`] per column ([`row_type_for`]). `frozen`
-/// because no method takes `&mut self`, which drops the borrow flag from every
-/// row and inlines away the two atomic RMWs a `&self` method would otherwise run.
+/// drops the borrow flag, and with it two atomic RMWs per `&self` method.
 #[pyclass(name = "Row", frozen, subclass)]
 pub struct PyRow {
     fields: Py<PyTuple>,
@@ -29,10 +28,9 @@ pub struct PyRow {
     weight: i64,
 }
 
-/// One presented column, as a descriptor in a row subclass's type dict. `row.col`
-/// therefore resolves through `PyObject_GenericGetAttr` → `_PyType_Lookup`, which
-/// CPython's type-attribute cache serves — no scan of the field names, and no
-/// raised-and-caught `AttributeError` on the way to a `__getattr__` fallback.
+/// One presented column, as a descriptor in a row subclass's type dict, so
+/// `row.col` is served by CPython's type-attribute cache rather than a field
+/// scan behind a raised-and-caught `AttributeError`.
 #[pyclass(frozen)]
 struct ColumnDescriptor {
     pos: usize,
@@ -52,17 +50,13 @@ impl ColumnDescriptor {
 }
 
 /// The row subclass for one presented-field tuple, built once per result and
-/// cached for every later result with the same column names.
+/// cached for every later result with the same column names. Process-global and
+/// never evicted; it grows with the program's distinct column-name tuples, not
+/// with the data.
 ///
-/// Process-global and never evicted: the key set is the distinct column-name
-/// tuples a program reads, which its query set bounds — so it grows with the
-/// source, not with the data.
-///
-/// Keyed by the tuple's *contents*, never by the `Arc<Schema>` address: an `Arc`
-/// can be freed and a later allocation reuse the address, which would hand a
-/// result someone else's descriptors. Interned names make the tuple's hash a
-/// read of each element's cached hash, and it is paid once per result rather
-/// than once per row.
+/// Keyed by the tuple's *contents*, never by the `Arc<Schema>` address: a freed
+/// `Arc`'s address can be reused, which would hand a result someone else's
+/// descriptors.
 fn row_type_for<'py>(py: Python<'py>, fields: &Bound<'py, PyTuple>) -> PyResult<Bound<'py, pyo3::types::PyType>> {
     static CACHE: pyo3::sync::PyOnceLock<Py<PyDict>> = pyo3::sync::PyOnceLock::new();
     let cache = CACHE
@@ -76,12 +70,9 @@ fn row_type_for<'py>(py: Python<'py>, fields: &Bound<'py, PyTuple>) -> PyResult<
     ns.set_item(pyo3::intern!(py, "__slots__"), PyTuple::empty(py))?;
     for (pos, name) in fields.as_slice().iter().enumerate() {
         let name = name.cast::<PyString>()?;
-        // The underscore namespace belongs to the row object itself (`_fields`,
-        // `_asdict`, `_weight`), so such a column gets no descriptor and reaches
-        // `PyRow::__getattr__` instead. Everything else is plain MRO: a column
-        // named `weight` shadows the base accessor with no bookkeeping here, and
-        // a hidden column sharing a visible one's name resolves to the first
-        // position, as `field_pos` does.
+        // The underscore namespace is the row object's own (`_fields`, `_asdict`,
+        // `_weight`), so such a column gets no descriptor and reaches
+        // `PyRow::__getattr__`. Everything else is plain MRO.
         if name.to_cow()?.starts_with('_') || ns.contains(name)? {
             continue;
         }
@@ -96,19 +87,38 @@ fn row_type_for<'py>(py: Python<'py>, fields: &Bound<'py, PyTuple>) -> PyResult<
     Ok(ty)
 }
 
-/// Position of `name` among `fields`, or `None`. Both the field names
-/// (`make_shared_batch_data`) and Python's own attribute/literal names are
-/// interned, so the common case settles on the pointer compare; the string
-/// compare covers a computed name. Linear over at most `MAX_COLUMNS` entries,
-/// which is cheaper than keeping a side index in step with the tuple — this is
-/// `row["name"]`, `scalars("name")` and the underscore-column fallback, never
-/// `row.name`, which resolves through the subclass's own descriptors.
+/// Resolve an `int`-or-`str` key against `fields` into a position, normalizing a
+/// negative index the way a Python sequence does. Shared by `row[k]` and
+/// `result.scalars(k)`, so both name a column the same way; `what` is the
+/// argument's name, for the `TypeError`.
+fn key_pos(fields: &Bound<'_, PyTuple>, key: &Bound<'_, PyAny>, what: &str) -> PyResult<usize> {
+    if key.cast::<pyo3::types::PyInt>().is_ok() {
+        let len = fields.len() as isize;
+        let idx = key.extract::<isize>()?;
+        let idx = if idx < 0 { idx + len } else { idx };
+        if idx < 0 || idx >= len {
+            return Err(pyo3::exceptions::PyIndexError::new_err("index out of range"));
+        }
+        return Ok(idx as usize);
+    }
+    if let Ok(name) = key.cast::<PyString>() {
+        return match field_pos(fields, name)? {
+            Some(i) => Ok(i),
+            None => Err(pyo3::exceptions::PyKeyError::new_err(name.to_cow()?.into_owned())),
+        };
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "{what} must be int or str"
+    )))
+}
+
+/// Position of `name` among `fields`, or `None`. Field names are interned, so
+/// the common case settles on the pointer compare and the string compare covers
+/// a computed name. Linear over at most `MAX_COLUMNS`; this serves `row["name"]`
+/// and `scalars("name")`, never `row.name`, which goes through the descriptors.
 fn field_pos(fields: &Bound<'_, PyTuple>, name: &Bound<'_, PyString>) -> PyResult<Option<usize>> {
-    // `as_slice` borrows the tuple's `ob_item` directly: no call and no refcount
-    // traffic per element, where an indexed read is a bounds-checked
-    // `PyTuple_GetItem` apiece. The identity pass stays separate from the
-    // compare pass — fusing them would run a rich-compare on every field
-    // *before* the interned hit, which is the work the identity pass skips.
+    // The identity pass stays separate from the compare pass: fusing them would
+    // rich-compare every field before the interned hit.
     let items = fields.as_slice();
     if let Some(i) = items.iter().position(|f| f.is(name)) {
         return Ok(Some(i));
@@ -125,7 +135,7 @@ fn field_pos(fields: &Bound<'_, PyTuple>, name: &Bound<'_, PyString>) -> PyResul
 impl PyRow {
     #[new]
     #[pyo3(signature = (fields, values, weight=1))]
-    pub fn new(_py: Python<'_>, fields: Bound<'_, PyTuple>, values: Bound<'_, PyTuple>, weight: i64) -> PyResult<Self> {
+    pub fn new(fields: Bound<'_, PyTuple>, values: Bound<'_, PyTuple>, weight: i64) -> PyResult<Self> {
         Ok(PyRow {
             fields: fields.unbind(),
             values: values.unbind(),
@@ -133,12 +143,10 @@ impl PyRow {
         })
     }
 
-    /// The row's Z-set weight, always. The row object owns its underscore
-    /// names, so a column spelled `_weight` — which the write surface does
-    /// permit, letting the schema take the name back there — is shadowed on
-    /// attribute access here exactly as a column named `_fields` or `_asdict`
-    /// is, and is read through `_asdict()` or by position. A column *may* be
-    /// named `weight`, and its descriptor then shadows the alias below.
+    /// The row's Z-set weight, always: the row object owns its underscore names,
+    /// so a *column* named `_weight` is shadowed here and read through
+    /// `_asdict()` or by position. A column named `weight` shadows the alias
+    /// below, since that name is not the row's own.
     #[getter(_weight)]
     pub fn weight_(&self) -> i64 {
         self.weight
@@ -151,20 +159,16 @@ impl PyRow {
     }
 
     /// The presented column names, positionally aligned with the values —
-    /// `namedtuple`'s spelling. The tuple is the row's own field table, shared
-    /// by every row of a result, so this is a borrow rather than a rebuild;
-    /// deriving the names from `_asdict().keys()` instead materializes a dict
-    /// per row.
+    /// `namedtuple`'s spelling. Shared by every row of a result, so this borrows
+    /// rather than rebuilds.
     #[getter]
     pub fn _fields(&self, py: Python<'_>) -> Py<PyTuple> {
         self.fields.clone_ref(py)
     }
 
     /// The cold fallback: an underscore-prefixed *column* name, the one kind
-    /// [`row_type_for`] installs no descriptor for. Reaching here costs a raised,
-    /// fetched and normalized `AttributeError` from the generic-getattr miss that
-    /// pyo3's `tp_getattro` runs first — which is why every other column is a
-    /// descriptor instead.
+    /// [`row_type_for`] installs no descriptor for. Reaching here costs a
+    /// raised-and-caught `AttributeError` from the generic-getattr miss first.
     pub fn __getattr__(&self, py: Python<'_>, name: &Bound<'_, PyString>) -> PyResult<Py<PyAny>> {
         match field_pos(self.fields.bind(py), name)? {
             Some(i) => Ok(self.values.bind(py).get_item(i)?.unbind()),
@@ -176,23 +180,8 @@ impl PyRow {
     }
 
     pub fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        let values = self.values.bind(py);
-        if key.cast::<pyo3::types::PyInt>().is_ok() {
-            let idx = key.extract::<isize>()?;
-            let len = values.len() as isize;
-            let idx = if idx < 0 { idx + len } else { idx };
-            if idx < 0 || idx >= len {
-                return Err(pyo3::exceptions::PyIndexError::new_err("index out of range"));
-            }
-            return Ok(values.get_item(idx as usize)?.unbind());
-        }
-        if let Ok(name) = key.cast::<PyString>() {
-            return match field_pos(self.fields.bind(py), name)? {
-                Some(i) => Ok(values.get_item(i)?.unbind()),
-                None => Err(pyo3::exceptions::PyKeyError::new_err(name.to_cow()?.into_owned())),
-            };
-        }
-        Err(pyo3::exceptions::PyTypeError::new_err("key must be int or str"))
+        let i = key_pos(self.fields.bind(py), key, "key")?;
+        Ok(self.values.bind(py).get_item(i)?.unbind())
     }
 
     pub fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -244,11 +233,9 @@ impl PyRow {
 // Batch conversion helpers
 // ---------------------------------------------------------------------------
 
-/// Materialize a `PkColumn` as a Python list. A single-column key surfaces as
-/// that column's own Python type — decoded through the same address the row
-/// path uses, so `batch.pks[i]` and `row[pk_col]` can never disagree about sign
-/// or UUID rendering. A compound key surfaces as `bytes` in the native key
-/// space, the form `py_pks_to_column` accepts back.
+/// Materialize a `PkColumn` as a Python list: a single-column key as that
+/// column's own Python type, a compound key as native-space `bytes` — the form
+/// `py_pks_to_column` accepts back.
 pub(crate) fn pk_column_to_pylist(py: Python<'_>, schema: &Schema, batch: &ZSetBatch) -> PyResult<Py<PyList>> {
     if schema.pk_count() >= 2 {
         let stride = schema.pk_stride();
@@ -300,11 +287,8 @@ fn read_fixed_le(py: Python<'_>, tc: TypeCode, slice: &[u8]) -> Py<PyAny> {
     }
 }
 
-/// Surface one 16-byte integer as the Python object its column type
-/// dictates. The three 16-byte integer types share u128 storage but differ at
-/// the surface: UUID → canonical string, I128 → signed int, everything else
-/// (U128) → unsigned int. Single source of truth for that decision across every
-/// read path (row build, batch columns, scan columns).
+/// Surface one 16-byte integer as its column type dictates: UUID → canonical
+/// string, I128 → signed int, U128 → unsigned int. The one place that decides.
 fn u128_value_to_py(py: Python<'_>, x: u128, tc: TypeCode) -> PyResult<Py<PyAny>> {
     Ok(match tc {
         TypeCode::UUID => format_uuid(x).into_pyobject(py)?.into_any().unbind(),
@@ -313,11 +297,9 @@ fn u128_value_to_py(py: Python<'_>, x: u128, tc: TypeCode) -> PyResult<Py<PyAny>
     })
 }
 
-/// Decode one payload cell into a Python object, null bit first: a set bit is
-/// `None` regardless of the stored value. Shared by the row build and the
-/// `scalars` column loop. STRING surfaces as `str` — UTF-8 is validated here,
-/// the region carrying bytes — BLOB as `bytes`, everything else through
-/// [`fixed_value_to_py`].
+/// Decode one payload cell, null bit first: a set bit is `None` whatever the
+/// stored value. STRING surfaces as `str` (UTF-8 is validated here), BLOB as
+/// `bytes`, everything else through [`fixed_value_to_py`].
 fn cell_to_py(
     py: Python<'_>,
     batch: &ZSetBatch,
@@ -351,10 +333,9 @@ fn cell_to_py(
 // Lazy batch infrastructure
 // ---------------------------------------------------------------------------
 
-/// Decode one presented column: its physical column index plus the resolved
-/// address (PK byte offset or payload slot, width, and type code) the row build
-/// reads through. `ColumnLocator` already carries the type code, so the per-row
-/// loop never touches the schema.
+/// One presented column: its physical index plus the resolved address the row
+/// build reads through. The locator carries the type code, so the per-row loop
+/// never touches the schema.
 type PresentedCol = (usize, ColumnLocator);
 
 struct SharedBatchData {
@@ -384,10 +365,8 @@ fn make_shared_batch_data(
     } else {
         s.visible_columns().map(|(ci, _)| locate(ci)).collect()
     };
-    // Interned: each `mappings()` dict insert then hits on identity instead of
-    // hashing the name, `row["col"]` settles on a pointer compare inside
-    // `field_pos`, and the field tuple's own hash — the key `row_type_for`
-    // caches on — is a read of each element's cached hash.
+    // Interned: `mappings()` inserts hit on identity, `field_pos` settles on a
+    // pointer compare, and the tuple's own hash reads each element's cached one.
     let names = present
         .iter()
         .map(|&(ci, _)| PyString::intern(py, &s.columns[ci].name))
@@ -403,10 +382,8 @@ fn make_shared_batch_data(
     }))
 }
 
-/// Decode one cell at `loc` in `row`, for either a PK or a payload column.
-/// The single per-cell decode, shared by the row build, `scalars`, the PK list
-/// and the per-column lists. A PK column reads its own bytes straight out of
-/// the PK region — no whole-tuple copy, so a one-column read costs one column.
+/// Decode one cell at `loc` in `row`, PK or payload — the single per-cell decode,
+/// shared by the row build, `scalars`, the PK list and the per-column lists.
 fn value_at(py: Python<'_>, batch: &ZSetBatch, ci: usize, loc: ColumnLocator, row: usize) -> PyResult<Py<PyAny>> {
     let tc = TypeCode::from_validated_u8(loc.type_code());
     match loc {
@@ -415,10 +392,15 @@ fn value_at(py: Python<'_>, batch: &ZSetBatch, ci: usize, loc: ColumnLocator, ro
             let native = gnitz_wire::decode_pk_column_owned(opk, loc.type_code());
             fixed_value_to_py(py, tc, &native[..size as usize])
         }
-        ColumnLocator::Payload { slot, size, .. } => {
-            let is_null = gnitz_wire::null_word_get(batch.nulls[row], slot as usize);
-            cell_to_py(py, batch, ci, row, is_null, tc, size as usize)
-        }
+        ColumnLocator::Payload { size, .. } => cell_to_py(
+            py,
+            batch,
+            ci,
+            row,
+            loc.is_null_word(batch.nulls[row]),
+            tc,
+            size as usize,
+        ),
     }
 }
 
@@ -435,13 +417,10 @@ fn make_row(py: Python<'_>, data: &Arc<SharedBatchData>, row: usize, buf: &mut V
     buf.clear();
     build_row_values_into(py, data, row, buf)?;
     // `drain` hands the values over already-owned, so the tuple build costs no
-    // refcount traffic — and the Vec keeps its capacity for the next row.
+    // refcount traffic, and the Vec keeps its capacity for the next row.
     let values = PyTuple::new(py, buf.drain(..))?;
-    // Through the subclass's own `tp_call` rather than `Py::new`: pyo3 gives Rust
-    // no way to instantiate a pyclass subtype, so the row is built through the
-    // subclass's own constructor. One extra call per row built, against
-    // a per-row decode that already allocates one Python object per column — and
-    // it is what buys every attribute read on the row a `_PyType_Lookup` hit.
+    // Through the subclass's own `tp_call`: pyo3 gives Rust no way to instantiate
+    // a pyclass subtype.
     data.row_type
         .bind(py)
         .call1((data.fields.bind(py), values, data.batch.weights[row]))
@@ -449,9 +428,7 @@ fn make_row(py: Python<'_>, data: &Arc<SharedBatchData>, row: usize, buf: &mut V
 }
 
 /// Materialize per-column value lists, indexed by *physical* column. A PK column
-/// holds an empty list — the PK region is surfaced through `.pks`. Decoding runs
-/// through [`cell_to_py`] under the column's resolved address, so a NULL reads
-/// back as `None` here exactly as it does through a `Row` or `scalars()`.
+/// holds an empty list — the PK region is surfaced through `.pks`.
 pub(crate) fn rust_batch_columns_to_py(py: Python<'_>, schema: &Schema, batch: &ZSetBatch) -> PyResult<Py<PyList>> {
     let n = batch.len();
     let mut col_lists: Vec<Py<PyAny>> = Vec::with_capacity(schema.columns.len());
@@ -471,10 +448,8 @@ pub(crate) fn rust_batch_columns_to_py(py: Python<'_>, schema: &Schema, batch: &
 #[pyclass(name = "ScanResult", frozen)]
 pub struct PyScanResult {
     data: Option<Arc<SharedBatchData>>,
-    /// The server-side LSN this result was read at, or `None` where the result
-    /// carries no LSN at all — a SQL `Rows` payload, which `SqlResult::Rows`
-    /// does not carry one for. Reporting 0 there was indistinguishable from a
-    /// genuine LSN 0.
+    /// The server-side LSN this result was read at, or `None` where there is
+    /// none — a SQL `Rows` payload. Reporting 0 would collide with a real LSN 0.
     #[pyo3(get)]
     lsn: Option<u64>,
 }
@@ -542,8 +517,6 @@ impl PyScanResult {
         let Some(data) = &self.data else {
             return Ok(PyList::empty(py).unbind());
         };
-        // `as_slice`, as `field_pos` and `_asdict` read it: an indexed walk
-        // increfs every name and allocates a Vec per call.
         let fields = data.fields.bind(py);
         let mut row_buf = Vec::with_capacity(fields.len());
         Ok(build_pylist(
@@ -566,30 +539,16 @@ impl PyScanResult {
         let Some(data) = &self.data else {
             return Ok(PyList::empty(py).unbind());
         };
-        // Resolve col: None→first presented column, int→presented position
-        // (consistent with row indexing), str→presented-name lookup.
+        // None → the first presented column; otherwise the same int-or-str
+        // resolution a row subscript takes, so `res.scalars(k)` and `row[k]`
+        // name the same column.
         let pos = match col {
             None => 0usize,
-            Some(ref obj) => {
-                let obj = obj.bind(py);
-                if obj.cast::<pyo3::types::PyInt>().is_ok() {
-                    obj.extract::<usize>()?
-                } else if let Ok(name) = obj.cast::<PyString>() {
-                    match field_pos(data.fields.bind(py), name)? {
-                        Some(i) => i,
-                        None => return Err(pyo3::exceptions::PyKeyError::new_err(name.to_cow()?.into_owned())),
-                    }
-                } else {
-                    return Err(pyo3::exceptions::PyTypeError::new_err("col must be int or str"));
-                }
-            }
+            Some(ref obj) => key_pos(data.fields.bind(py), obj.bind(py), "col")?,
         };
         // The presented-column table already holds this column's resolved
         // address, so the row loop below does no schema lookups.
-        let (ci, loc) = *data
-            .present
-            .get(pos)
-            .ok_or_else(|| pyo3::exceptions::PyIndexError::new_err("column index out of range"))?;
+        let (ci, loc) = data.present[pos];
         Ok(build_pylist(py, (0..data.batch.len()).map(|i| value_at(py, &data.batch, ci, loc, i)))?.unbind())
     }
 }
@@ -640,20 +599,16 @@ pub(crate) fn triple_to_lazy(
     batch_to_lazy(py, opt_schema, opt_batch, Some(view_lsn), include_hidden)
 }
 
-/// One delta read's answer: the rows, and the cursor to poll from next. The two
-/// travel together because a subscriber that kept one without the other would
-/// either re-apply rounds it already has or step over rounds it never received.
+/// One delta read's answer: the rows, and the cursor the next poll takes.
 #[pyclass(name = "DeltaReply", frozen)]
 pub struct PyDeltaReply {
     /// The delta rows, weights included — a retraction arrives at weight −1.
     #[pyo3(get)]
     rows: Py<PyScanResult>,
-    /// Identifies the boot and the relation this cursor belongs to.
+    /// `(tag, tick)`: the boot and relation this reply belongs to, and the last
+    /// round it covers. Hand it straight back to `delta_poll`.
     #[pyo3(get)]
-    tag: u64,
-    /// The last tick round the reply covers.
-    #[pyo3(get)]
-    tick: u64,
+    cursor: (u64, u64),
 }
 
 /// Build a [`PyDeltaReply`] from a delta read's `(rows, cursor)` pair. The reply
@@ -667,7 +622,7 @@ pub(crate) fn delta_reply_to_py(
 ) -> PyResult<Py<PyDeltaReply>> {
     let (batch, cursor) = out;
     let rows = batch_to_lazy(py, Some(schema), batch, None, include_hidden)?;
-    Py::new(py, PyDeltaReply { rows, tag: cursor.tag, tick: cursor.tick })
+    Py::new(py, PyDeltaReply { rows, cursor: (cursor.tag, cursor.tick) })
 }
 
 /// The `PyScanResult` build shared by the read paths and the SQL path, which

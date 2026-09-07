@@ -1,4 +1,3 @@
-use gnitz_core::ConflictClass;
 use std::fmt;
 
 #[derive(Debug)]
@@ -33,18 +32,6 @@ pub enum GnitzSqlError {
     Conflict {
         table: Option<String>,
     },
-}
-
-/// `Exec` delegates to the client error it wraps, so a conflict stays classified
-/// as one however deep it surfaced.
-impl ConflictClass for GnitzSqlError {
-    fn is_conflict(&self) -> bool {
-        match self {
-            GnitzSqlError::Conflict { .. } => true,
-            GnitzSqlError::Exec(e) => e.is_conflict(),
-            _ => false,
-        }
-    }
 }
 
 impl fmt::Display for GnitzSqlError {

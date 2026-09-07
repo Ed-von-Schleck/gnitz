@@ -31,7 +31,7 @@ def _key(row):
     it. No view column can collide with the name: a user identifier may not start
     with `_`.
     """
-    return tuple(sorted((f, row[f]) for f in row._fields if f != "_tick"))
+    return tuple(sorted((f, v) for f, v in row._asdict().items() if f != "_tick"))
 
 
 def _zset(rows):

@@ -60,21 +60,6 @@ pub enum ClientError {
     Interrupted(Box<dyn std::error::Error + Send + Sync>),
 }
 
-/// Whether a failure is a retryable OCC conflict rather than a hard error. The
-/// Python binding surfaces one as a dedicated, catchable `GnitzConflictError`;
-/// its error mapper is generic over this trait, so one mapper covers every
-/// classified error type and nothing re-derives the rule from a `match` of its
-/// own.
-pub trait ConflictClass {
-    fn is_conflict(&self) -> bool;
-}
-
-impl ConflictClass for ClientError {
-    fn is_conflict(&self) -> bool {
-        matches!(self, ClientError::TxnConflict { .. })
-    }
-}
-
 impl From<ProtocolError> for ClientError {
     fn from(e: ProtocolError) -> Self {
         ClientError::Protocol(e)
