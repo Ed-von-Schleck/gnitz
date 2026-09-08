@@ -324,7 +324,8 @@ pub(crate) enum RelExpr {
         group_cols: Vec<ColId>,
         aggs: Vec<HirAgg>,
     },
-    /// SELECT DISTINCT: dedup over the input's (visible) columns via a synthetic
+    /// SELECT DISTINCT — and the set a DISTINCT aggregate reduces over: dedup over
+    /// every one of the input's columns, hidden ones included, via a synthetic
     /// content-hash key.
     Distinct {
         input: Rc<RelExpr>,
@@ -678,15 +679,19 @@ impl RelExpr {
         Rc::new(RelExpr::Filter { input, preds })
     }
 
+    /// A projection item passing one column through to itself, keeping its
+    /// identity.
+    pub(crate) fn passthrough_item(c: HirCol) -> ProjEntry {
+        ProjEntry {
+            expr: BExpr::ColRef(HirRef::Col(c.id)),
+            out: c,
+        }
+    }
+
     /// Projection items passing each column through to itself, keeping its
     /// identity — the item half of `SELECT <cols>`.
     pub(crate) fn passthrough_items(cols: impl IntoIterator<Item = HirCol>) -> Vec<ProjEntry> {
-        cols.into_iter()
-            .map(|c| ProjEntry {
-                expr: BExpr::ColRef(HirRef::Col(c.id)),
-                out: c,
-            })
-            .collect()
+        cols.into_iter().map(RelExpr::passthrough_item).collect()
     }
 
     /// A projection: its output columns are the `ProjEntry.out`s (SELECT order —

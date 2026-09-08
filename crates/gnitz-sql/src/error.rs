@@ -96,8 +96,8 @@ impl From<gnitz_expr::ExprValidateErr> for GnitzSqlError {
 }
 
 /// The `"{context}: {clause} is not supported"` spelling, shared by every
-/// statement guard. `ast_util::reject_fn_qualifiers` has its own inverted
-/// template, for a qualifier on a call rather than a clause on a statement.
+/// statement guard. `ast_util::unsupported_on` is the inverted template, for a
+/// qualifier on a call rather than a clause on a statement.
 pub(crate) fn unsupported_clause(context: &str, clause: &str) -> GnitzSqlError {
     GnitzSqlError::Unsupported(format!("{context}: {clause} is not supported"))
 }

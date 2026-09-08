@@ -2464,10 +2464,10 @@ class TestAggregateDifferential:
 
 
 class TestAggregateQualifierRejection:
-    """Aggregate-call qualifiers the binder does not implement (DISTINCT, FILTER,
-    OVER, …) must be rejected loudly, never silently dropped to the plain
-    aggregate — the durable-wrong-result class. Both binding sites are guarded:
-    the GROUP BY SELECT list and HAVING."""
+    """Aggregate-call qualifiers the binder does not implement (FILTER, OVER, …)
+    must be rejected loudly, never silently dropped to the plain aggregate — the
+    durable-wrong-result class. Both binding sites are guarded: the GROUP BY
+    SELECT list and HAVING."""
 
     def _setup(self, client, sn):
         client.execute_sql(
@@ -2479,46 +2479,9 @@ class TestAggregateQualifierRejection:
             schema_name=sn,
         )
 
-    @pytest.mark.parametrize("fn", ["COUNT", "SUM", "AVG", "MIN", "MAX"])
-    def test_select_list_distinct_rejected(self, client, fn):
-        """SELECT-list `agg(DISTINCT x)` binds to the plain aggregate today; the
-        guard must reject it so the view is never created. MIN/MAX(DISTINCT x) is
-        a no-op distinct but is rejected by the blanket rule for a uniform surface."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql(
-                    f"CREATE VIEW v AS SELECT g, {fn}(DISTINCT x) AS a FROM t GROUP BY g",
-                    schema_name=sn,
-                )
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_distinct_rejected(self, client):
-        """`HAVING COUNT(DISTINCT x) > 1`. HAVING resolves its aggregate calls
-        through the grouped leaf, not the SELECT list's own path, so a rejection
-        added only to the latter would miss this and silently evaluate
-        COUNT(x) > 1."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql(
-                    "CREATE VIEW v AS SELECT g, SUM(x) AS s FROM t GROUP BY g "
-                    "HAVING COUNT(DISTINCT x) > 1",
-                    schema_name=sn,
-                )
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
     def test_filter_clause_rejected(self, client):
-        """`SUM(x) FILTER (WHERE x > 0)` is the same silent-drop class as DISTINCT
-        — the FILTER would be dropped and a plain SUM(x) computed."""
+        """`SUM(x) FILTER (WHERE x > 0)`: the FILTER would be dropped and a plain
+        SUM(x) computed."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -3837,5 +3800,191 @@ class TestFinalizeMapShapes:
 
             client.execute_sql("DROP VIEW v", schema_name=sn)
             client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+
+class TestDistinctAggregates:
+    """`COUNT(DISTINCT x)` and friends: the plain aggregate over a hidden
+    `DISTINCT (group cols, x)` segment. Weights are the observable, so the churn
+    case is checked against the oracle's weight-multiset."""
+
+    def _create(self, client, sn):
+        client.execute_sql(
+            "CREATE TABLE ev ("
+            "  pk BIGINT NOT NULL PRIMARY KEY,"
+            "  k BIGINT NOT NULL,"
+            "  u BIGINT NULL,"
+            "  s TEXT NOT NULL"
+            ")",
+            schema_name=sn,
+        )
+
+    _ROWS = [
+        {"pk": 1, "k": 10, "u": 7, "s": "a"}, {"pk": 2, "k": 10, "u": 7, "s": "b"},
+        {"pk": 3, "k": 10, "u": 8, "s": "a"}, {"pk": 4, "k": 20, "u": 7, "s": "a"},
+        {"pk": 5, "k": 20, "u": None, "s": "a"}, {"pk": 6, "k": 30, "u": None, "s": "c"},
+    ]
+
+    def _setup(self, client, sn):
+        """The table plus `_ROWS`, mirrored into the oracle state it returns."""
+        self._create(client, sn)
+        client.execute_sql(
+            "INSERT INTO ev VALUES (1, 10, 7, 'a'), (2, 10, 7, 'b'), (3, 10, 8, 'a'),"
+            " (4, 20, 7, 'a'), (5, 20, NULL, 'a'), (6, 30, NULL, 'c')",
+            schema_name=sn,
+        )
+        state = {}
+        oracle.apply_insert(state, "pk", self._ROWS)
+        return state
+
+    def test_count_distinct_grouped_incremental(self, client):
+        """Churn a grouped `COUNT(DISTINCT u)`, checked weight-exactly against
+        `distinct` composed into `groupby_aggregate` — the composition the feature
+        lowers to."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            state = self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT k, COUNT(DISTINCT u) AS n FROM ev GROUP BY k",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            project = ["k", "n"]
+
+            def check(ctx):
+                d = oracle.oracle_distinct(
+                    oracle.oracle_filter_project(state, None, ["k", "u"]))
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    d, ["k", "u"], ["k"], [("n", "COUNT", "u")])
+                assert cols == project
+                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
+
+            # NULL is not a distinct value: group 30 counts 0 but still exists.
+            check("after-insert")
+
+            # Retracting one of two carriers of u=7 in group 10 leaves it present.
+            client.execute_sql("DELETE FROM ev WHERE pk = 1", schema_name=sn)
+            oracle.apply_delete(state, "pk", [1])
+            check("after-delete-one-carrier")
+
+            # Retracting the last carrier drops the value.
+            client.execute_sql("DELETE FROM ev WHERE pk = 2", schema_name=sn)
+            oracle.apply_delete(state, "pk", [2])
+            check("after-delete-last-carrier")
+
+            # A key UPDATE moves a distinct value between groups in one epoch.
+            client.execute_sql("UPDATE ev SET k = 10 WHERE pk = 4", schema_name=sn)
+            oracle.apply_update(state, "pk", 4, {"k": 10})
+            check("after-cross-group-move")
+
+            # Emptying a group retracts its row.
+            client.execute_sql("DELETE FROM ev WHERE pk = 6", schema_name=sn)
+            oracle.apply_delete(state, "pk", [6])
+            check("after-group-emptied")
+        finally:
+            client.drop_schema(sn)
+
+    def test_count_distinct_global_and_having(self, client):
+        """A global `COUNT(DISTINCT s)` over a string column; and the same
+        aggregate in HAVING, which resolves through the grouped leaf rather than
+        the SELECT list."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            state = self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW g AS SELECT COUNT(DISTINCT s) AS n FROM ev",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW h AS SELECT k, COUNT(DISTINCT s) AS n FROM ev GROUP BY k "
+                "HAVING COUNT(DISTINCT s) > 1",
+                schema_name=sn,
+            )
+            gid = client.resolve_table(sn, "g")[0]
+            hid = client.resolve_table(sn, "h")[0]
+
+            def check_global(ctx):
+                d = oracle.oracle_distinct(
+                    oracle.oracle_filter_project(state, None, ["s"]))
+                exp, cols = oracle.oracle_groupby_aggregate(
+                    d, ["s"], [], [("n", "COUNT", "s")])
+                assert cols == ["n"]
+                oracle.assert_view_matches(client, gid, ["n"], exp, ctx=ctx)
+
+            # The oracle models no HAVING, so `h` is checked directly.
+            check_global("after-insert")
+            assert {r["k"]: r["n"] for r in client.scan(hid)} == {10: 2}
+
+            client.execute_sql("DELETE FROM ev WHERE pk = 6", schema_name=sn)
+            oracle.apply_delete(state, "pk", [6])
+            check_global("after-delete")
+
+            # A second distinct `s` in group 20 crosses the HAVING threshold.
+            client.execute_sql("INSERT INTO ev VALUES (7, 20, 1, 'z')", schema_name=sn)
+            oracle.apply_insert(state, "pk", [{"pk": 7, "k": 20, "u": 1, "s": "z"}])
+            check_global("after-insert-crossing-having")
+            assert {r["k"]: r["n"] for r in client.scan(hid)} == {10: 2, 20: 2}
+        finally:
+            client.drop_schema(sn)
+
+    def test_distinct_aggregates_share_one_distinct_set(self, client):
+        """Every DISTINCT aggregate of one argument rides the same DISTINCT
+        segment; a computed argument or group key is materialized below it."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT k, SUM(DISTINCT u) AS s, MAX(DISTINCT u) AS m, "
+                "COUNT(DISTINCT u) AS n FROM ev WHERE k < 30 GROUP BY k",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW w AS SELECT COUNT(DISTINCT u % 2) AS n FROM ev GROUP BY k * 2",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            wid = client.resolve_table(sn, "w")[0]
+            rows = {r["k"]: (r["s"], r["m"], r["n"]) for r in client.scan(vid)}
+            # Group 10 dedups u=7 (two carriers) → SUM 7+8, MAX 8, COUNT 2.
+            assert rows == {10: (15, 8, 2), 20: (7, 7, 1)}
+            assert sorted(r["n"] for r in client.scan(wid)) == [0, 1, 2]
+        finally:
+            client.drop_schema(sn)
+
+    def test_min_max_distinct_is_the_plain_aggregate(self, client):
+        """`MIN`/`MAX(DISTINCT x)` is `MIN`/`MAX(x)`, so the binder drops the
+        qualifier — letting such a call keep company (here a plain `COUNT(*)` and a
+        second DISTINCT argument) the all-or-nothing DISTINCT rule refuses."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT k, MAX(DISTINCT u) AS m, MIN(DISTINCT pk) AS lo, "
+                "COUNT(*) AS c FROM ev GROUP BY k",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            assert {r["k"]: (r["m"], r["lo"], r["c"]) for r in client.scan(vid)} == {
+                10: (8, 1, 3), 20: (7, 4, 2), 30: (None, 6, 1),
+            }
+        finally:
+            client.drop_schema(sn)
+
+    def test_distinct_aggregate_on_an_adhoc_read_is_rejected(self, client):
+        """The ad-hoc read path lowers a grouped body to one stateless fold over
+        one scan, with nowhere to put the DISTINCT segment — and is the one
+        DISTINCT-aggregate surface the binder's own tests cannot reach."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            self._create(client, sn)
+            with pytest.raises(Exception, match="CREATE VIEW body only"):
+                client.execute_sql(
+                    "SELECT k, COUNT(DISTINCT u) AS n FROM ev GROUP BY k", schema_name=sn)
         finally:
             client.drop_schema(sn)

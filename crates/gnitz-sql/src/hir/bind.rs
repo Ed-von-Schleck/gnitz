@@ -15,7 +15,7 @@ use crate::ast_util::{
     aliased_def, body_is_grouped, classify_agg_call, classify_from, col_ref_parts, expand_wildcard_item,
     extract_table_name_and_alias, for_each_agg_call, group_by_exprs, group_by_target, has_exists_in_subquery,
     has_scalar_subquery, has_visible_column, is_agg_call, peel_nested, projection_item_expr, scalar_projection_item,
-    select_has_window, window_spec_keys, FromShape,
+    select_has_window, window_spec_keys, AggArg, FromShape,
 };
 use crate::bind::apply_positional_aliases;
 use crate::bind::{
@@ -891,7 +891,7 @@ fn classify_scalar_agg(
         return Err(GnitzSqlError::Unsupported(non_agg.into()));
     }
     let (func, arg_expr) = classify_agg_call(f)?;
-    let arg = match arg_expr {
+    let arg = match arg_expr.reject_distinct("a scalar subquery aggregate")? {
         Some(a) => Some(bind_plain_col(
             a,
             inner_cols,
@@ -1242,6 +1242,17 @@ impl<'a> PreMap<'a> {
         items.extend(self.extra.iter().cloned());
         items
     }
+
+    /// The projection computing exactly `ids`: a materialized column by its
+    /// expression, a source column passed through.
+    fn items_for(&self, ids: &[ColId]) -> Vec<ProjEntry> {
+        ids.iter()
+            .map(|id| match self.extra.iter().find(|x| x.out.id == *id) {
+                Some(e) => e.clone(),
+                None => RelExpr::passthrough_item(hircol_of(self.source_cols(), *id).clone()),
+            })
+            .collect()
+    }
 }
 
 /// A rejection raised while binding one clause, named with it. The message already
@@ -1286,27 +1297,77 @@ fn resolve_group_cols(
     Ok(cols)
 }
 
+/// One aggregate call a grouped body computes, with its argument resolved to a
+/// reduce-input column.
+#[derive(PartialEq)]
+struct AggKey {
+    func: AggFunc,
+    arg: AggArg<ColId>,
+}
+
+/// Whether dedup cannot move this aggregate's value: `MIN`/`MAX` read the same
+/// extremum from a set as from the multiset it collapses.
+fn dedup_is_inert(func: AggFunc) -> bool {
+    matches!(func, AggFunc::Min | AggFunc::Max)
+}
+
 /// Collect the aggregate calls referenced in an expression, appending each not
-/// already present (deduped by `(func, arg)`).
+/// already present.
 fn collect_aggs(
     expr: &Expr,
     leaf: &ScopeLeaf<'_>,
-    is_global: bool,
-    aggs: &mut Vec<HirAgg>,
+    calls: &mut Vec<AggKey>,
     pre: &mut PreMap<'_>,
 ) -> Result<(), GnitzSqlError> {
     for_each_agg_call(expr, &mut |f| -> Result<(), GnitzSqlError> {
-        let (func, arg_expr) = classify_agg_call(f)?;
-        let arg = match arg_expr {
-            Some(e) => Some(pre.column_for(e, leaf)?),
-            None => None,
-        };
-        if !aggs.iter().any(|a| a.func == func && a.arg == arg) {
-            aggs.push(HirAgg::new(pre.ids, func, arg, &pre.env, is_global)?);
+        let (func, arg) = classify_agg_call(f)?;
+        let mut arg = arg.try_map(|e| pre.column_for(e, leaf))?;
+        if dedup_is_inert(func) {
+            arg = arg.without_distinct();
+        }
+        let key = AggKey { func, arg };
+        if !calls.contains(&key) {
+            calls.push(key);
         }
         Ok(())
     })?;
     Ok(())
+}
+
+/// Whether `call` reads the same value from `Distinct(group cols, arg)` as from
+/// the raw input — which every aggregate of the reduce must, since that set is
+/// its only input.
+fn survives_dedup(call: &AggKey, arg: ColId) -> bool {
+    match call.arg {
+        AggArg::Distinct(a) => a == arg,
+        AggArg::All(a) => a == arg && dedup_is_inert(call.func),
+        AggArg::Star => false,
+    }
+}
+
+/// The column a body's DISTINCT aggregates all read, or `None` when it has none.
+/// A DISTINCT aggregate is the plain aggregate over `Distinct(group cols, arg)`,
+/// so every aggregate of the reduce reads that one set.
+fn distinct_arg(calls: &[AggKey]) -> Result<Option<ColId>, GnitzSqlError> {
+    let Some(arg) = calls.iter().find_map(|c| match c.arg {
+        AggArg::Distinct(a) => Some(a),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    if calls.iter().any(|c| matches!(c.arg, AggArg::Distinct(a) if a != arg)) {
+        return Err(GnitzSqlError::Unsupported(
+            "DISTINCT aggregates: every DISTINCT aggregate of one query must read the same argument".into(),
+        ));
+    }
+    if calls.iter().any(|c| !survives_dedup(c, arg)) {
+        return Err(GnitzSqlError::Unsupported(
+            "DISTINCT aggregates: a plain aggregate cannot be mixed with them, except MIN/MAX of the \
+             DISTINCT argument"
+                .into(),
+        ));
+    }
+    Ok(Some(arg))
 }
 
 /// Bind an ad-hoc single-relation grouped body to
@@ -1375,8 +1436,9 @@ fn adhoc_source(ids: &ColIdGen, schema: Arc<Schema>, alias: &str) -> (Rc<RelExpr
     (source, scope)
 }
 
-/// What a calling surface adds to a grouped body. One or the other, never both
-/// — a view body admits window calls, an ad-hoc read brings ORDER BY keys.
+/// What a calling surface adds to — and withholds from — a grouped body. One or
+/// the other, never both: a view body admits window calls and DISTINCT
+/// aggregates, an ad-hoc read brings ORDER BY keys and admits neither.
 enum GroupedSurface<'a> {
     ViewBody,
     AdhocRead(&'a [&'a Expr]),
@@ -1400,10 +1462,10 @@ fn bind_grouped_suffix(
     let group_cols = resolve_group_cols(select, leaf, &mut pre)?;
     let is_global = group_cols.is_empty();
 
-    // Aggregates from the projection ∪ HAVING ∪ QUALIFY ∪ the WINDOW clause,
-    // deduped by `(func, arg)`. An inline window specification's keys are
-    // operands of the call, which the walk reaches on its own.
-    let mut aggs: Vec<HirAgg> = Vec::new();
+    // Aggregates from the projection ∪ HAVING ∪ QUALIFY ∪ the WINDOW clause. An
+    // inline window specification's keys are operands of the call, which the
+    // walk reaches on its own.
+    let mut calls: Vec<AggKey> = Vec::new();
     let named_keys = select.named_window.iter().flat_map(|d| match &d.1 {
         NamedWindowExpr::WindowSpec(s) => window_spec_keys(s).collect::<Vec<_>>(),
         NamedWindowExpr::NamedWindow(_) => Vec::new(),
@@ -1417,10 +1479,37 @@ fn bind_grouped_suffix(
         .chain(named_keys)
         .chain(order_exprs.iter().copied())
     {
-        collect_aggs(expr, leaf, is_global, &mut aggs, &mut pre)?;
+        collect_aggs(expr, leaf, &mut calls, &mut pre)?;
     }
+    // An ad-hoc read lowers to one stateless fold over one scan, which has no room
+    // for the `Distinct` below the reduce.
+    if matches!(surface, GroupedSurface::AdhocRead(_)) && calls.iter().any(|c| matches!(c.arg, AggArg::Distinct(_))) {
+        return Err(GnitzSqlError::Unsupported(
+            "DISTINCT aggregates are supported in a CREATE VIEW body only".into(),
+        ));
+    }
+    // A DISTINCT aggregate reduces over `Distinct(Project(group cols ∪ {arg}))`,
+    // which absorbs the pre-map — hence the reduce's own is empty.
+    let (input, pre_items) = match distinct_arg(&calls)? {
+        Some(arg) => {
+            reject_float_key(&hircol_of(&pre.env, arg).def, "DISTINCT aggregate")?;
+            let mut keys = group_cols.clone();
+            if !keys.contains(&arg) {
+                keys.push(arg);
+            }
+            (
+                RelExpr::distinct(RelExpr::project(input, pre.items_for(&keys))),
+                Vec::new(),
+            )
+        }
+        None => (input, pre.items()),
+    };
+    let aggs = calls
+        .iter()
+        .map(|c| HirAgg::new(ids, c.func, c.arg.ignoring_distinct(), &pre.env, is_global))
+        .collect::<Result<Vec<HirAgg>, _>>()?;
 
-    let mut rel = RelExpr::reduce(input, pre.items(), group_cols.clone(), aggs.clone());
+    let mut rel = RelExpr::reduce(input, pre_items, group_cols.clone(), aggs.clone());
 
     // The pre-map's columns, extended with each aggregate's raw value and
     // companion: everything a `ColId` in an expression over the reduce output can
@@ -1495,7 +1584,8 @@ struct GroupedLeaf<'a> {
     group_cols: &'a [ColId],
     aggs: &'a [HirAgg],
     /// The pre-map's materialized columns, so a written expression matches the
-    /// column the reduce already computes for it.
+    /// column already computed for it — by the reduce's own pre-map, or, under a
+    /// DISTINCT aggregate, by the projection below the `Distinct`.
     extra: &'a [ProjEntry],
     /// The clause being bound — this leaf serves HAVING and the SELECT list, and
     /// every rejection below names it.
@@ -1513,10 +1603,12 @@ impl GroupedLeaf<'_> {
     }
 
     fn find_agg(&self, f: &Function) -> Result<&HirAgg, GnitzSqlError> {
+        // `distinct_arg` admitted one distinct set for the whole reduce, so the
+        // qualifier no longer distinguishes two calls: `(func, arg)` names one.
         let (func, arg_expr) = classify_agg_call(f)?;
         // Through the pre-map, so `SUM(a * b)` here names the column the reduce
         // already aggregates rather than a second one.
-        let arg = match arg_expr {
+        let arg = match arg_expr.ignoring_distinct() {
             Some(e) => Some(find_bound(self.extra, &bind_structural(e, self.leaf)?).ok_or_else(|| {
                 GnitzSqlError::Unsupported(format!("{}: unsupported aggregate argument {e}", self.clause))
             })?),

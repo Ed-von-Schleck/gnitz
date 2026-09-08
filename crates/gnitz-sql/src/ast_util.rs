@@ -263,16 +263,70 @@ fn debug_assert_not_windowed(f: &sqlparser::ast::Function) {
     );
 }
 
-/// Classify an aggregate call into `(func, arg)`. `COUNT(*)` is the only shape
-/// yielding no argument, so `arg.is_some()` *is* the `COUNT(x)` vs `COUNT(*)`
-/// distinction. The argument comes back unbound, for the caller to resolve
-/// against its own leaf.
+/// An aggregate call's argument. `COUNT(*)` is the only argument-less shape and
+/// `COUNT(DISTINCT *)` is not a shape at all, so a `Distinct` always carries one.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum AggArg<T> {
+    Star,
+    All(T),
+    Distinct(T),
+}
+
+impl<T> AggArg<T> {
+    /// The argument of a call whose DISTINCT the caller honours, or has refused.
+    pub(crate) fn ignoring_distinct(self) -> Option<T> {
+        match self {
+            AggArg::Star => None,
+            AggArg::All(a) | AggArg::Distinct(a) => Some(a),
+        }
+    }
+
+    /// The argument of a call on a surface that does not implement DISTINCT and
+    /// would otherwise compute the plain aggregate. `on` names that surface.
+    pub(crate) fn reject_distinct(self, on: &str) -> Result<Option<T>, GnitzSqlError> {
+        match self {
+            AggArg::Distinct(_) => Err(unsupported_on("DISTINCT", on)),
+            other => Ok(other.ignoring_distinct()),
+        }
+    }
+
+    /// Resolve the argument through `f`, keeping the qualifier.
+    pub(crate) fn try_map<U, E>(self, f: impl FnOnce(T) -> Result<U, E>) -> Result<AggArg<U>, E> {
+        Ok(match self {
+            AggArg::Star => AggArg::Star,
+            AggArg::All(a) => AggArg::All(f(a)?),
+            AggArg::Distinct(a) => AggArg::Distinct(f(a)?),
+        })
+    }
+
+    /// Drop a DISTINCT the aggregate is indifferent to.
+    pub(crate) fn without_distinct(self) -> Self {
+        match self {
+            AggArg::Distinct(a) => AggArg::All(a),
+            other => other,
+        }
+    }
+}
+
+/// Classify an aggregate call into its function and argument. The argument comes
+/// back unbound, for the caller to resolve against its own leaf.
 pub(crate) fn classify_agg_call(
     f: &sqlparser::ast::Function,
-) -> Result<(AggFunc, Option<&sqlparser::ast::Expr>), GnitzSqlError> {
+) -> Result<(AggFunc, AggArg<&sqlparser::ast::Expr>), GnitzSqlError> {
     debug_assert_not_windowed(f);
-    reject_fn_qualifiers(f, "aggregates")?;
-    classify_agg_shape(f)
+    reject_fn_qualifiers(f, "aggregates", Distinct::Consumed)?;
+    let (func, arg) = classify_agg_shape(f)?;
+    let arg = match (is_distinct_call(f), arg) {
+        (false, None) => AggArg::Star,
+        (false, Some(e)) => AggArg::All(e),
+        (true, Some(e)) => AggArg::Distinct(e),
+        (true, None) => {
+            return Err(GnitzSqlError::Unsupported(
+                "COUNT(DISTINCT *): DISTINCT needs a column argument".into(),
+            ))
+        }
+    };
+    Ok((func, arg))
 }
 
 /// The argument-shape half of [`classify_agg_call`], with the qualifiers
@@ -300,11 +354,36 @@ pub(crate) fn classify_agg_shape(
     }
 }
 
+/// Who consumes the `f(DISTINCT x)` qualifier. Rejecting is the safe default: a
+/// binder that reads only the name and the argument list drops it silently.
+pub(crate) enum Distinct {
+    Rejected,
+    Consumed,
+}
+
+/// True for `f(DISTINCT x)`.
+fn is_distinct_call(func: &sqlparser::ast::Function) -> bool {
+    use sqlparser::ast::{DuplicateTreatment, FunctionArguments};
+    matches!(&func.args, FunctionArguments::List(l)
+        if matches!(l.duplicate_treatment, Some(DuplicateTreatment::Distinct)))
+}
+
+/// The rejection every unimplemented qualifier takes: `"{what}: not supported on
+/// {on}"` — `error::unsupported_clause`'s template inverted, for a qualifier on
+/// a call rather than a clause on a statement.
+pub(crate) fn unsupported_on(what: &str, on: &str) -> GnitzSqlError {
+    GnitzSqlError::Unsupported(format!("{what}: not supported on {on}"))
+}
+
 /// Reject any qualifier on a function call the binder does not implement — a
 /// binder reads the name and the argument list, so an unrejected qualifier is
 /// silently dropped and the plain call computed. `on` names the context.
-pub(crate) fn reject_fn_qualifiers(func: &sqlparser::ast::Function, on: &str) -> Result<(), GnitzSqlError> {
-    use sqlparser::ast::{DuplicateTreatment, FunctionArguments};
+pub(crate) fn reject_fn_qualifiers(
+    func: &sqlparser::ast::Function,
+    on: &str,
+    distinct: Distinct,
+) -> Result<(), GnitzSqlError> {
+    use sqlparser::ast::FunctionArguments;
     let sqlparser::ast::Function {
         // Consumed: the name dispatches the call, the argument list is bound.
         name: _,
@@ -322,7 +401,10 @@ pub(crate) fn reject_fn_qualifiers(func: &sqlparser::ast::Function, on: &str) ->
         null_treatment,
         within_group,
     } = func;
-    let unsupported = |what: &str| Err(GnitzSqlError::Unsupported(format!("{what}: not supported on {on}")));
+    let unsupported = |what: &str| Err(unsupported_on(what, on));
+    if matches!(distinct, Distinct::Rejected) && is_distinct_call(func) {
+        return unsupported("DISTINCT");
+    }
     if filter.is_some() {
         return unsupported("FILTER (WHERE …)");
     }
@@ -336,9 +418,6 @@ pub(crate) fn reject_fn_qualifiers(func: &sqlparser::ast::Function, on: &str) ->
         return unsupported("parametric (ClickHouse) calls");
     }
     if let FunctionArguments::List(list) = args {
-        if matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct)) {
-            return unsupported("DISTINCT");
-        }
         if !list.clauses.is_empty() {
             return unsupported("in-argument clauses (ORDER BY / LIMIT / SEPARATOR)");
         }
@@ -354,7 +433,7 @@ pub(crate) fn function_positional_args<'f>(
 ) -> Result<Vec<&'f sqlparser::ast::Expr>, GnitzSqlError> {
     use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
     debug_assert_not_windowed(f);
-    reject_fn_qualifiers(f, name)?;
+    reject_fn_qualifiers(f, name, Distinct::Rejected)?;
     let FunctionArguments::List(list) = &f.args else {
         return Err(GnitzSqlError::Unsupported(format!(
             "{name}: requires a parenthesized argument list"

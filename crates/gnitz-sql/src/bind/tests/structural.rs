@@ -101,14 +101,13 @@ fn test_compound_identifier_null_test_binds() {
 /// Every aggregate qualifier the binder does not implement must be rejected,
 /// not silently dropped to the plain aggregate. Exercised through
 /// `bind_single_table` so the guard's wiring into `bind_function` is covered,
-/// not just the helper in isolation.
+/// not just the helper in isolation. DISTINCT is a qualifier the grouped binder
+/// honours, so here it is the aggregate itself that is out of place.
 #[test]
 fn test_binder_rejects_aggregate_qualifiers() {
     let schema = schema_with_val(TypeCode::I64); // (pk U64, c I64)
     for (src, want) in [
-        ("COUNT(DISTINCT c)", "DISTINCT"),
-        ("SUM(DISTINCT c)", "DISTINCT"),
-        ("MIN(DISTINCT c)", "DISTINCT"), // no-op distinct, rejected for a uniform surface
+        ("COUNT(DISTINCT c)", "aggregate function not allowed"),
         ("SUM(c) FILTER (WHERE c > 0)", "FILTER"),
         ("SUM(c) OVER (PARTITION BY pk)", "OVER"),
     ] {

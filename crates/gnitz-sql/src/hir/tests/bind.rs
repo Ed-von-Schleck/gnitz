@@ -2,6 +2,7 @@ use super::*;
 use crate::test_support::{col_def, parse_stmt};
 use gnitz_core::{RelClass, RelDescriptor};
 use sqlparser::ast::Statement;
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// `t(id BIGINT PK, a BIGINT, b BIGINT NULL, f DOUBLE NULL)` and
@@ -42,8 +43,8 @@ fn catalog() -> CatalogSnapshot {
     cat
 }
 
-/// Bind one `CREATE VIEW` body and return its output columns.
-fn bound_cols(sql: &str) -> Result<Vec<HirCol>, GnitzSqlError> {
+/// Bind one `CREATE VIEW` body.
+fn bound(sql: &str) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let Statement::CreateView(cv) = parse_stmt(&format!("CREATE VIEW v AS {sql}")) else {
         panic!("not a CREATE VIEW");
     };
@@ -52,7 +53,12 @@ fn bound_cols(sql: &str) -> Result<Vec<HirCol>, GnitzSqlError> {
     let ids = ColIdGen::new();
     let body = crate::validate::reject_query_envelope_body(&cv.query, "view body")?;
     let mut cx = BindCx::new(&cat, &mut binder, &ids, crate::hir::bind::ViewSurface::CREATE);
-    bind_body(&mut cx, body).map(|r| r.cols())
+    bind_body(&mut cx, body)
+}
+
+/// Bind one `CREATE VIEW` body and return its output columns.
+fn bound_cols(sql: &str) -> Result<Vec<HirCol>, GnitzSqlError> {
+    bound(sql).map(|r| r.cols())
 }
 
 /// `(name, type, nullable)` of every output column — what a projection item's
@@ -177,5 +183,117 @@ fn a_mismatched_qualifier_is_rejected() {
         "SELECT a FROM t AS x WHERE t.a = 1",
     ] {
         assert!(bound_cols(sql).is_err(), "{sql} should not bind");
+    }
+}
+
+/// The projection under the reduce's `Distinct`, naming a materialized column
+/// `<computed>`, or `None` when the reduce reads its input directly.
+fn reduce_over_distinct(sql: &str) -> Option<Vec<String>> {
+    let rel = bound(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    let RelExpr::Project { input, .. } = rel.as_ref() else {
+        panic!("{sql}: no projection")
+    };
+    let RelExpr::Reduce { input, pre, .. } = input.as_ref() else {
+        panic!("{sql}: no reduce")
+    };
+    let RelExpr::Distinct { input } = input.as_ref() else {
+        return None;
+    };
+    assert!(
+        pre.is_empty(),
+        "{sql}: the reduce kept a pre-map beside its distinct input"
+    );
+    let RelExpr::Project { items, .. } = input.as_ref() else {
+        panic!("{sql}: no distinct projection")
+    };
+    Some(
+        items
+            .iter()
+            .map(|e| match e.out.def.is_hidden {
+                true => "<computed>".to_string(),
+                false => e.out.def.name.clone(),
+            })
+            .collect(),
+    )
+}
+
+/// A DISTINCT aggregate is the plain aggregate over `Distinct(group cols, arg)`,
+/// whose projection carries exactly the group columns and the argument.
+#[test]
+fn a_distinct_aggregate_reduces_over_a_distinct_input() {
+    let names = |sql: &str| reduce_over_distinct(sql).unwrap_or_else(|| panic!("{sql}: no distinct"));
+    assert_eq!(names("SELECT a, COUNT(DISTINCT b) FROM t GROUP BY a"), ["a", "b"]);
+    assert_eq!(names("SELECT COUNT(DISTINCT b) FROM t"), ["b"]);
+    assert_eq!(
+        names("SELECT COUNT(DISTINCT a + 1) FROM t GROUP BY b"),
+        ["b", "<computed>"]
+    );
+    // A group column that is also the argument is carried once.
+    assert_eq!(names("SELECT a, COUNT(DISTINCT a) FROM t GROUP BY a"), ["a"]);
+}
+
+/// Every DISTINCT aggregate of one body rides that one distinct set, and a
+/// MIN/MAX of its argument may ride it too.
+#[test]
+fn distinct_aggregates_of_one_argument_share_the_set() {
+    assert_eq!(
+        reduce_over_distinct("SELECT a, COUNT(DISTINCT b), SUM(DISTINCT b), MAX(DISTINCT b) FROM t GROUP BY a"),
+        Some(vec!["a".to_string(), "b".to_string()])
+    );
+    assert_eq!(
+        shape(
+            "SELECT a, COUNT(DISTINCT b) AS n, SUM(DISTINCT b) AS s, MAX(DISTINCT b) AS m FROM t GROUP BY a \
+             HAVING COUNT(DISTINCT b) > 1"
+        ),
+        vec![
+            s("a", TypeCode::I64, false),
+            s("n", TypeCode::I64, false),
+            s("s", TypeCode::I64, true),
+            s("m", TypeCode::I64, true),
+        ]
+    );
+}
+
+/// `MIN`/`MAX(DISTINCT x)` is `MIN`/`MAX(x)`, so the binder drops the qualifier:
+/// such a body plans as its unqualified twin, and keeps company the
+/// all-or-nothing DISTINCT rule would otherwise refuse.
+#[test]
+fn an_inert_distinct_on_min_max_is_dropped() {
+    for sql in [
+        "SELECT a, MAX(DISTINCT b) FROM t GROUP BY a",
+        "SELECT MIN(DISTINCT b), MAX(DISTINCT a) FROM t",
+        "SELECT a, MAX(DISTINCT b), COUNT(*) FROM t GROUP BY a",
+        // A float argument is no key here, because nothing hashes it.
+        "SELECT MIN(DISTINCT f) FROM t",
+    ] {
+        assert_eq!(reduce_over_distinct(sql), None, "{sql} should need no distinct set");
+    }
+    // The qualified and unqualified spellings are one aggregate, not two.
+    assert_eq!(
+        shape("SELECT a, MAX(DISTINCT b) AS m1, MAX(b) AS m2 FROM t GROUP BY a"),
+        vec![
+            s("a", TypeCode::I64, false),
+            s("m1", TypeCode::I64, true),
+            s("m2", TypeCode::I64, true),
+        ]
+    );
+}
+
+#[test]
+fn a_distinct_aggregate_that_cannot_share_one_distinct_set_is_rejected() {
+    for (sql, needle) in [
+        ("SELECT COUNT(DISTINCT a), COUNT(DISTINCT b) FROM t", "same argument"),
+        ("SELECT COUNT(DISTINCT a), COUNT(*) FROM t", "plain aggregate"),
+        ("SELECT COUNT(DISTINCT a), SUM(a) FROM t", "plain aggregate"),
+        ("SELECT COUNT(DISTINCT a), COUNT(a) FROM t", "plain aggregate"),
+        // MIN/MAX rides the set only for the argument the set is built from.
+        ("SELECT COUNT(DISTINCT a), MAX(b) FROM t", "plain aggregate"),
+        ("SELECT COUNT(DISTINCT f) FROM t", "cannot be a key"),
+        ("SELECT COUNT(DISTINCT *) FROM t", "needs a column argument"),
+    ] {
+        match bound_cols(sql).map(|_| ()) {
+            Err(GnitzSqlError::Unsupported(m)) => assert!(m.contains(needle), "{sql}: {m}"),
+            other => panic!("{sql}: {other:?}"),
+        }
     }
 }
