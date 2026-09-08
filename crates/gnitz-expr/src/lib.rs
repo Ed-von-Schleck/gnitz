@@ -58,6 +58,7 @@
 
 mod batch;
 mod builder;
+pub mod calendar;
 mod chars;
 mod eval;
 mod like;
@@ -68,6 +69,7 @@ mod view;
 
 pub use batch::MorselOut;
 pub use builder::*;
+pub use calendar::CalendarOp;
 pub use eval::*;
 pub use like::*;
 pub use locator::*;

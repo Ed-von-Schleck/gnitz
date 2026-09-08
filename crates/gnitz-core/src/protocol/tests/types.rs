@@ -847,7 +847,9 @@ fn a_fresh_appender_writes_onto_a_populated_batch() {
 /// Every cell of a STRING column region, as content strings.
 fn german_strings(batch: &ZSetBatch, ci: usize) -> Vec<String> {
     batch.columns[ci]
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .map(|cell| String::from_utf8(gnitz_wire::german_string_content(cell, &batch.blob).to_vec()).unwrap())
         .collect()
 }

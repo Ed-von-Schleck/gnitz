@@ -134,7 +134,9 @@ fn a_copied_catalog_row_differs_only_where_it_is_patched() {
     let flags = &pair.columns[gnitz_wire::TABTAB_COL_FLAGS];
     assert_eq!(flags[..], [9u64.to_le_bytes(), 9u64.to_le_bytes()].concat()[..]);
     let names: Vec<&[u8]> = pair.columns[RELTAB_COL_NAME]
-        .chunks_exact(16)
+        .as_chunks::<16>()
+        .0
+        .iter()
         .map(|cell| gnitz_wire::german_string_content(cell, &pair.blob))
         .collect();
     assert_eq!(names, [b"t".as_slice(), b"t2".as_slice()]);

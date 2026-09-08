@@ -89,12 +89,10 @@ fn test_unknown_type_code_zero() {
 }
 
 #[test]
-fn test_unknown_type_code_16() {
-    // 16 is the first unassigned type-code value after I128 (15).
-    assert!(matches!(
-        type_code_from_u64(16),
-        Err(ProtocolError::UnknownTypeCode(16))
-    ));
+fn test_unknown_type_code_after_last() {
+    let next = TypeCode::ALL.len() as u64 + 1;
+    assert!(!TypeCode::ALL.iter().any(|&tc| tc as u64 == next));
+    assert!(matches!(type_code_from_u64(next), Err(ProtocolError::UnknownTypeCode(n)) if n == next));
 }
 
 #[test]

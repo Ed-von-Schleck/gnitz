@@ -132,7 +132,7 @@ fn a_text_table_past_one_frame_reads_back_whole_where_a_whole_table_update_still
     assert_eq!(batch.len(), ROWS as usize);
     let (id_ci, v_ci, s_ci) = (col_idx(&rschema, "id"), col_idx(&rschema, "v"), col_idx(&rschema, "s"));
     let mut seen = vec![false; ROWS as usize];
-    for (row, cell) in batch.columns[s_ci].chunks_exact(16).enumerate() {
+    for (row, cell) in batch.columns[s_ci].as_chunks::<16>().0.iter().enumerate() {
         let id = cell_i64(&rschema, &batch, id_ci, row) as u64;
         assert!(
             id < ROWS && !std::mem::replace(&mut seen[id as usize], true),

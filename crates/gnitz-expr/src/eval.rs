@@ -150,8 +150,9 @@ impl Evaluator {
         &self.prog.copies
     }
 
-    /// The scalar-register emits: one bulk copy of the register image each.
-    pub fn scalar_emits(&self) -> &[(u16, u32)] {
+    /// The scalar-register emits: one bulk copy of the register image each,
+    /// or its low bytes into a narrower slot.
+    pub fn scalar_emits(&self) -> &[(u16, u32, u8)] {
         &self.prog.scalar_emits
     }
 

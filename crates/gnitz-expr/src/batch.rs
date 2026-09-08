@@ -12,7 +12,7 @@ use std::fmt::{self, Write as _};
 use crate::chars::{char_count, char_offset, char_offset_back, reverse_chars};
 use crate::like::{fields, find};
 use crate::program::{FloatUnaryOp, IntArithOp, IntReg, IntUnaryOp};
-use crate::{BatchView, CmpOp, FloatArithOp, Instr, ResolvedProgram};
+use crate::{calendar, BatchView, CalendarOp, CmpOp, FloatArithOp, Instr, ResolvedProgram};
 use gnitz_wire::{
     compare_german_strings, german_string_heap, german_string_inline, low_bits_mask, null_word_get, read_u64_le,
     FixedInt,
@@ -332,13 +332,42 @@ impl MorselOut<'_> {
     }
 
     /// Emit scalar register `reg` into output payload column `col`, whose rows
-    /// start at `row0`: the register image blitted in, then each NULL row's slot
-    /// zeroed and its bit set at `out_payload` in the row-major bitmap `nb`. The
-    /// 8-byte slot width is stated here and nowhere else.
-    pub fn emit_scalar_cells(&self, reg: usize, col: &mut [u8], nb: &mut [u8], row0: usize, out_payload: usize) {
-        let win = &mut col[row0 * 8..(row0 + self.m) * 8];
-        win.copy_from_slice(self.reg_bytes(reg));
-        self.write_null_rows(reg, win, 8, nb, row0, out_payload);
+    /// start at `row0`: the register image blitted in at `stride` 8, or its low
+    /// `stride` bytes per row into a narrower slot (`check_emit_slot` admits one
+    /// only behind a cast to that width), then each NULL row's slot zeroed and
+    /// its bit set at `out_payload` in the row-major bitmap `nb`.
+    ///
+    /// The narrow widths are unswitched rather than written once against a
+    /// runtime `stride`: a runtime width makes each row's store an indirect
+    /// `memcpy` call, where a constant one is a move the loop vectorizes.
+    pub fn emit_scalar_cells(
+        &self,
+        reg: usize,
+        col: &mut [u8],
+        nb: &mut [u8],
+        row0: usize,
+        out_payload: usize,
+        stride: usize,
+    ) {
+        let win = &mut col[row0 * stride..(row0 + self.m) * stride];
+        // `stride` is `wire_stride` of a slot `check_emit_slot` passed, so it is
+        // a fixed-int width; a 16-byte string slot goes to `emit_str_cells`.
+        match stride {
+            8 => win.copy_from_slice(self.reg_bytes(reg)),
+            4 => Self::narrow_cells(win, self.reg_values(reg), |v| (v as u32).to_le_bytes()),
+            2 => Self::narrow_cells(win, self.reg_values(reg), |v| (v as u16).to_le_bytes()),
+            1 => Self::narrow_cells(win, self.reg_values(reg), |v| (v as u8).to_le_bytes()),
+            _ => unreachable!("a scalar emit slot is 1, 2, 4 or 8 bytes, not {stride}"),
+        }
+        self.write_null_rows(reg, win, stride, nb, row0, out_payload);
+    }
+
+    /// [`MorselOut::emit_scalar_cells`]'s narrow half: each value's low `W`
+    /// bytes, as `to_bytes` truncates them, into its own slot.
+    fn narrow_cells<const W: usize>(win: &mut [u8], vals: &[i64], to_bytes: impl Fn(i64) -> [u8; W]) {
+        for (dst, v) in win.as_chunks_mut::<W>().0.iter_mut().zip(vals) {
+            *dst = to_bytes(*v);
+        }
     }
 
     /// [`Self::emit_scalar_cells`] over a string register: one German-string
@@ -373,8 +402,8 @@ impl MorselOut<'_> {
     /// [`Self::write_null_rows`] zeroes those after.
     fn write_str_cells(&self, reg: usize, win: &mut [u8], blob: &mut Vec<u8>) {
         debug_assert_eq!(win.len(), self.m * 16, "a string emit window is 16 bytes per row");
-        for (i, cell) in win.chunks_exact_mut(16).enumerate() {
-            cell.copy_from_slice(&gnitz_wire::encode_german_string(self.str_bytes(reg, i), blob));
+        for (i, cell) in win.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+            *cell = gnitz_wire::encode_german_string(self.str_bytes(reg, i), blob);
         }
     }
 
@@ -1747,13 +1776,13 @@ pub(crate) fn eval_batch(
                 let dst_reg = scratch.reg_mut(dst, m);
                 // Widen `m` rows of a `SZ`-byte little-endian column into i64
                 // registers. `SZ` is a compile-time constant per instantiation,
-                // which is what `chunks_exact` needs to vectorize.
+                // which is what `as_chunks` needs to vectorize.
                 macro_rules! load_int {
                     ($ty:ty) => {{
                         const SZ: usize = std::mem::size_of::<$ty>();
                         let b = &col_data[morsel_start * SZ..(morsel_start + m) * SZ];
-                        for (i, c) in b.chunks_exact(SZ).enumerate() {
-                            dst_reg[i] = <$ty>::from_le_bytes(c.try_into().unwrap()) as i64;
+                        for (i, c) in b.as_chunks::<SZ>().0.iter().enumerate() {
+                            dst_reg[i] = <$ty>::from_le_bytes(*c) as i64;
                         }
                     }};
                 }
@@ -1766,8 +1795,8 @@ pub(crate) fn eval_batch(
                     // so `load_int!` (which appends `as i64`) never emits a vacuous `i64 as i64`.
                     FixedInt::U64 | FixedInt::I64 => {
                         let b = &col_data[morsel_start * 8..(morsel_start + m) * 8];
-                        for (i, c) in b.chunks_exact(8).enumerate() {
-                            dst_reg[i] = i64::from_le_bytes(c.try_into().unwrap());
+                        for (i, c) in b.as_chunks::<8>().0.iter().enumerate() {
+                            dst_reg[i] = i64::from_le_bytes(*c);
                         }
                     }
                     FixedInt::I32 => load_int!(i32),
@@ -1787,8 +1816,8 @@ pub(crate) fn eval_batch(
                 let col_data = mb.col_data(pi as usize, 4);
                 let dst_reg = scratch.reg_mut(dst, m);
                 let b = &col_data[morsel_start * 4..(morsel_start + m) * 4];
-                for (i, c) in b.chunks_exact(4).enumerate() {
-                    let bits = u32::from_le_bytes(c.try_into().unwrap());
+                for (i, c) in b.as_chunks::<4>().0.iter().enumerate() {
+                    let bits = u32::from_le_bytes(*c);
                     dst_reg[i] = encode_f64(f32::from_bits(bits) as f64);
                 }
                 fill_null_bits_mask(scratch, dst, &mo, 1u64 << pi);
@@ -1844,6 +1873,16 @@ pub(crate) fn eval_batch(
                 IntUnaryOp::Abs => un_op(scratch, &mo, dst, a, |x| x.wrapping_abs()),
                 IntUnaryOp::Sign if signed => un_op(scratch, &mo, dst, a, |x| x.signum()),
                 IntUnaryOp::Sign => un_op(scratch, &mo, dst, a, |x| (x != 0) as i64),
+            },
+            // `micros` is loop-invariant, so it is unswitched out of the kernel
+            // like every neighbouring selector: each arm folds the unused half of
+            // the day/time split, and the day arm folds its zero time-of-day
+            // through the hour/minute/second ops. The one op that can NULL is the
+            // only one that pays for the fail mask.
+            Instr::Calendar { op, dst, a, micros } => match (op, micros) {
+                (CalendarOp::ToMicros, _) => unary_null_like(scratch, &mo, dst, a, calendar::days_to_micros),
+                (op, true) => un_op(scratch, &mo, dst, a, |x| calendar::eval(op, x, true)),
+                (op, false) => un_op(scratch, &mo, dst, a, |x| calendar::eval(op, x, false)),
             },
             Instr::FloatUnary { op, dst, a } => match op {
                 FloatUnaryOp::Neg => un_op(scratch, &mo, dst, a, |x| encode_f64(-decode_f64(x))),

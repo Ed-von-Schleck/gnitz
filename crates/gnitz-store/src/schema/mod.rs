@@ -628,7 +628,9 @@ impl SchemaDescriptor {
             // Decode OPK back to native before reading the scalar: read as native
             // LE, a signed column's flipped sign bit renders garbage.
             let v = gnitz_wire::pk_native_key(pk_bytes, off, size, col.type_code);
-            parts.push(match col.type_code {
+            // Through the storage type: a calendar column renders as the signed
+            // integer it is, not as the unsigned fallthrough.
+            parts.push(match gnitz_wire::storage_type_code(col.type_code) {
                 type_code::UUID => gnitz_wire::format_uuid(v),
                 type_code::U128 => format!("{v}"),
                 type_code::I64 => format!("{}", v as u64 as i64),

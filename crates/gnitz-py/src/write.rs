@@ -12,7 +12,7 @@ use std::sync::Arc;
 use pyo3::ffi;
 use pyo3::impl_::extract_argument::argument_extraction_error;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString, PyTuple};
+use pyo3::types::{PyDate, PyDateAccess, PyDateTime, PyDict, PyList, PyString, PyTimeAccess, PyTuple, PyTzInfoAccess};
 use pyo3::Borrowed;
 
 use gnitz_core::{push_zero_cell, PkColumn, Schema, TypeCode, ZSetBatch};
@@ -611,6 +611,42 @@ pub(crate) fn extract_uuid_or_u128(val: &Bound<'_, PyAny>) -> PyResult<u128> {
     ))
 }
 
+/// Days since the epoch of a `datetime.date` (or the date of a `datetime`).
+fn py_days(d: &impl PyDateAccess) -> i64 {
+    gnitz_expr::calendar::days_from_civil(d.get_year() as i64, d.get_month() as u32, d.get_day() as u32)
+}
+
+/// A DATE value: a `datetime.date` (a `datetime.datetime` is one too, and
+/// contributes its date), or the day count as an int.
+fn extract_days(item: &Bound<'_, PyAny>) -> PyResult<i32> {
+    match item.cast::<PyDate>() {
+        Ok(d) => Ok(py_days(d) as i32),
+        Err(_) => item.extract::<i32>(),
+    }
+}
+
+/// A TIMESTAMP value: a naive `datetime.datetime`, a `datetime.date` at
+/// midnight, or microseconds since the epoch as an int.
+fn extract_micros(item: &Bound<'_, PyAny>) -> PyResult<i64> {
+    use gnitz_expr::calendar::{MICROS_PER_DAY, MICROS_PER_HOUR, MICROS_PER_MIN, MICROS_PER_SEC};
+    if let Ok(dt) = item.cast::<PyDateTime>() {
+        if dt.get_tzinfo().is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "a TIMESTAMP takes a naive datetime; convert to UTC and drop tzinfo",
+            ));
+        }
+        return Ok(py_days(dt) * MICROS_PER_DAY
+            + dt.get_hour() as i64 * MICROS_PER_HOUR
+            + dt.get_minute() as i64 * MICROS_PER_MIN
+            + dt.get_second() as i64 * MICROS_PER_SEC
+            + dt.get_microsecond() as i64);
+    }
+    match item.cast::<PyDate>() {
+        Ok(d) => Ok(py_days(d) * MICROS_PER_DAY),
+        Err(_) => item.extract::<i64>(),
+    }
+}
+
 /// Append one non-null fixed-width value to `buf` as its native little-endian
 /// bytes — the one typed encoder, serving the PK buffer and every `Fixed`
 /// payload column alike, so a key packs the same way whichever surface
@@ -636,6 +672,8 @@ fn push_fixed_le(buf: &mut Vec<u8>, tc: TypeCode, item: &Bound<'_, PyAny>) -> Py
         TypeCode::U128 => buf.extend_from_slice(&item.extract::<u128>()?.to_le_bytes()),
         TypeCode::I128 => buf.extend_from_slice(&item.extract::<i128>()?.to_le_bytes()),
         TypeCode::UUID => buf.extend_from_slice(&extract_uuid_or_u128(item)?.to_le_bytes()),
+        TypeCode::Date => buf.extend_from_slice(&extract_days(item)?.to_le_bytes()),
+        TypeCode::Timestamp => buf.extend_from_slice(&extract_micros(item)?.to_le_bytes()),
         TypeCode::String | TypeCode::Blob => {
             unreachable!("a German-string column is never a Fixed column or a PK column")
         }
@@ -668,6 +706,15 @@ pub(crate) fn pk_key_from_py(pk: &Bound<'_, PyAny>) -> PyResult<(u128, Vec<u8>)>
     // `uuid.UUID` and UUID text all fall to the second.
     if let Ok(val) = pk.extract::<i128>() {
         return Ok((val as u128, Vec::new()));
+    }
+    // A `datetime` keys a TIMESTAMP relation and a `date` a DATE one; the
+    // server reads only the relation's own stride, which is what tells them
+    // apart from a plain integer key.
+    if pk.is_instance_of::<PyDateTime>() {
+        return Ok((extract_micros(pk)? as i128 as u128, Vec::new()));
+    }
+    if pk.is_instance_of::<PyDate>() {
+        return Ok((extract_days(pk)? as i128 as u128, Vec::new()));
     }
     extract_uuid_or_u128(pk).map(|v| (v, Vec::new()))
 }

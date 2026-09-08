@@ -10,7 +10,7 @@ use crate::error::GnitzSqlError;
 use crate::ir::{BinOp, BoundExpr, NumFunc, StrArg, StrFunc, TrimMode, UnaryOp};
 use gnitz_core::{ColumnDef, FixedInt, Schema, TypeCode};
 use gnitz_expr::{
-    Evaluator, ExprBuilder, FloatArithOp, FloatUnaryOp, IntUnaryOp, LogicalInstr as L, LogicalProgram, Reg,
+    CalendarOp, Evaluator, ExprBuilder, FloatArithOp, FloatUnaryOp, IntUnaryOp, LogicalInstr as L, LogicalProgram, Reg,
 };
 
 /// Compile a comparison between two German-string columns, or a column and a
@@ -112,6 +112,7 @@ impl OpcodeBackend<'_> {
             BoundExpr::Case { branches, else_ } => self.case(branches, else_.as_deref()),
             BoundExpr::InList { inner, items } => self.in_list(inner, items),
             BoundExpr::Func { f, arg } => self.func(*f, arg),
+            BoundExpr::Calendar { op, arg } => self.calendar(*op, arg),
             BoundExpr::MinMaxN { is_max, args } => self.min_max_n(*is_max, args),
             BoundExpr::Cast { expr, to } => self.cast(expr, *to),
             BoundExpr::StrCall { f, args } => self.str_call(*f, args),
@@ -271,6 +272,37 @@ impl OpcodeBackend<'_> {
         self.eb.emit(L::FloatArith { op: undo, a: v, b: scale })
     }
 
+    /// The typed literal of `other`'s temporal type that `e` spells, when `e` is
+    /// a string literal and `other` a DATE/TIMESTAMP; `None` when the pair is
+    /// anything else, which is every comparison that needs no coercion.
+    fn temporal_str_lit(&self, e: &BoundExpr, other: &BoundExpr) -> Result<Option<BoundExpr>, GnitzSqlError> {
+        let BoundExpr::LitStr(s) = e else { return Ok(None) };
+        let to = other.infer_type(self.cols);
+        match to.is_temporal() {
+            true => Ok(Some(BoundExpr::temporal_lit(
+                to,
+                crate::types::temporal_literal(to, s)?,
+            ))),
+            false => Ok(None),
+        }
+    }
+
+    fn calendar(&mut self, op: CalendarOp, arg: &BoundExpr) -> Result<(Reg, ExprKind), GnitzSqlError> {
+        let micros = match arg.infer_type(self.cols) {
+            TypeCode::Timestamp => true,
+            TypeCode::Date => false,
+            t => {
+                return Err(GnitzSqlError::Unsupported(format!(
+                    "a calendar function takes a DATE or TIMESTAMP; {} is {}",
+                    self.describe(arg),
+                    t.wire_name()
+                )))
+            }
+        };
+        let (r, _) = self.lower_num(arg)?;
+        Ok((self.eb.emit(L::Calendar { op, a: r, micros }), ExprKind::Int))
+    }
+
     fn str_call(&mut self, f: StrFunc, args: &[BoundExpr]) -> Result<(Reg, ExprKind), GnitzSqlError> {
         let mut regs = Vec::with_capacity(args.len());
         for (k, (kind, a)) in f.signature().iter().zip(args).enumerate() {
@@ -387,6 +419,30 @@ impl OpcodeBackend<'_> {
     /// CAST, dispatched on the target class, then the source kind.
     fn cast(&mut self, expr: &BoundExpr, to: TypeCode) -> Result<(Reg, ExprKind), GnitzSqlError> {
         let (r, kind) = self.lower(expr)?;
+        if to.is_temporal() {
+            let from = expr.infer_type(self.cols);
+            match (kind, from, to) {
+                (ExprKind::Str, _, _) => {
+                    return Err(GnitzSqlError::Unsupported(format!(
+                        "CAST of a string to {} is supported for a literal only",
+                        to.wire_name()
+                    )))
+                }
+                (ExprKind::Int, TypeCode::Timestamp, TypeCode::Date)
+                | (ExprKind::Int, TypeCode::Date, TypeCode::Timestamp) => {
+                    let micros = from == TypeCode::Timestamp;
+                    let op = if micros {
+                        CalendarOp::ToDays
+                    } else {
+                        CalendarOp::ToMicros
+                    };
+                    return Ok((self.eb.emit(L::Calendar { op, a: r, micros }), ExprKind::Int));
+                }
+                // An integer is already the storage value: the fixed-int path
+                // below range-checks it.
+                _ => {}
+            }
+        }
         if to == TypeCode::String {
             let reg = match kind {
                 ExprKind::Str => r,
@@ -422,8 +478,13 @@ impl OpcodeBackend<'_> {
                 // change that bit. Only a bare column load qualifies for the
                 // exact-type half — `infer_type` types `-i32col` as I32, but the
                 // VM negate wraps on the i64 image, so `-(-2^31)` leaves I32.
+                let in_range = |v: i64| {
+                    let (lo, hi) = fi.range();
+                    (lo..=hi).contains(&(v as i128))
+                };
                 let elide = to == expr.infer_type(self.cols).register_image()
-                    || matches!(expr, BoundExpr::ColRef(i) if self.cols[*i].type_code == to);
+                    || matches!(expr, BoundExpr::ColRef(i) if self.cols[*i].type_code == to)
+                    || matches!(expr, BoundExpr::LitInt(v) if in_range(*v));
                 if elide {
                     r
                 } else {
@@ -491,11 +552,7 @@ impl OpcodeBackend<'_> {
     /// for a HAVING over the reduce output as much as for a table filter.
     fn in_list(&mut self, inner: &BoundExpr, items: &[BoundExpr]) -> Result<(Reg, ExprKind), GnitzSqlError> {
         if gnitz_wire::is_fixed_int(inner.infer_type(self.cols) as u8) {
-            let literal = |e: &BoundExpr| match e {
-                BoundExpr::LitInt(v) => Some(*v),
-                _ => None,
-            };
-            if let Some(mut values) = items.iter().map(literal).collect::<Option<Vec<i64>>>() {
+            if let Some(mut values) = items.iter().map(BoundExpr::int_literal).collect::<Option<Vec<i64>>>() {
                 values.sort_unstable();
                 values.dedup();
                 let value_reg = self.lower_num(inner)?.0;
@@ -514,6 +571,14 @@ impl OpcodeBackend<'_> {
     }
 
     fn binop(&mut self, left: &BoundExpr, op: BinOp, right: &BoundExpr) -> Result<(Reg, ExprKind), GnitzSqlError> {
+        // `d < '2024-01-01'`: a string literal compared against a temporal
+        // operand is that operand's literal, as it is in a seek key or a
+        // written cell.
+        let (lo, ro) = match op.as_cmp() {
+            Some(_) => (self.temporal_str_lit(left, right)?, self.temporal_str_lit(right, left)?),
+            None => (None, None),
+        };
+        let (left, right) = (lo.as_ref().unwrap_or(left), ro.as_ref().unwrap_or(right));
         if let Some(reg) = try_compile_string_cmp(left, op, right, self.cols, self.eb) {
             return Ok((reg, ExprKind::Int));
         }

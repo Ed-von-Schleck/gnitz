@@ -34,8 +34,10 @@ fn wide_col(vals: &[u128]) -> Vec<u8> {
 
 /// Read a 16-byte-int payload column back out as values.
 fn wide_vals(col: &[u8]) -> Vec<u128> {
-    col.chunks_exact(16)
-        .map(|c| u128::from_le_bytes(c.try_into().unwrap()))
+    col.as_chunks::<16>()
+        .0
+        .iter()
+        .map(|c| u128::from_le_bytes(*c))
         .collect()
 }
 

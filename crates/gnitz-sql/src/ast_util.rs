@@ -6,7 +6,7 @@ use std::convert::Infallible;
 
 use crate::error::{reject_if, GnitzSqlError};
 use crate::ir::{AggFunc, BExpr};
-use gnitz_core::ColumnDef;
+use gnitz_core::{ColumnDef, TypeCode};
 use sqlparser::ast::{
     ExcludeSelectItem, Expr, RenameSelectItem, SelectItem, UnaryOperator, Value, WildcardAdditionalOptions,
 };
@@ -112,6 +112,37 @@ pub(crate) fn bind_literal<R>(v: &Value) -> Result<BExpr<R>, GnitzSqlError> {
     }
 }
 
+/// `DATE '…'`, `TIMESTAMP '…'` and `CAST('…' AS DATE)`: the literal spellings of
+/// a temporal value, as its type and storage integer. `None` for every other
+/// expression, a typed string or cast of a non-temporal type included.
+pub(crate) fn temporal_constant(e: &Expr) -> Result<Option<(TypeCode, i64)>, GnitzSqlError> {
+    let (dt, v) = match peel_nested(e) {
+        Expr::TypedString(ts) => (&ts.data_type, &ts.value.value),
+        // The qualifiers the general CAST arm rejects are left to it: an
+        // `ARRAY`/`FORMAT` cast is not a literal spelling and must not be
+        // claimed here, or it would ride through unchecked.
+        Expr::Cast {
+            expr,
+            data_type,
+            array: false,
+            format: None,
+            ..
+        } => match peel_nested(expr) {
+            Expr::Value(vws) => (data_type, &vws.value),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let tc = crate::types::sql_type_to_typecode(dt)?;
+    match v {
+        _ if !tc.is_temporal() => Ok(None),
+        Value::SingleQuotedString(s) => Ok(Some((tc, crate::types::temporal_literal(tc, s)?))),
+        v => Err(GnitzSqlError::Unsupported(format!(
+            "{dt} literal must be a single-quoted string, got {v}"
+        ))),
+    }
+}
+
 /// A constant as written: the literal's magnitude, and its sign kept apart from
 /// it — folding the sign in would destroy `-0`, whose sign a float column keeps.
 /// A *written* sign implies a numeric literal or NULL; [`bind_constant`] is the
@@ -151,6 +182,11 @@ pub(crate) fn bind_constant(e: &Expr) -> Result<Constant, GnitzSqlError> {
         } => (peel_nested(expr), Some(matches!(op, UnaryOperator::Minus))),
         e => (e, None),
     };
+    // A temporal literal is already the integer its column stores; a sign over
+    // one is refused below like a sign over a string.
+    if let (None, Some((_, v))) = (sign, temporal_constant(inner)?) {
+        return Ok(Constant { lit: BExpr::LitInt(v), negated: false });
+    }
     let Expr::Value(vws) = inner else {
         return Err(GnitzSqlError::Unsupported(format!(
             "expected a constant, got the expression: {e}"

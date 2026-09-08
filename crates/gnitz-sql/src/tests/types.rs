@@ -1,5 +1,5 @@
 use super::*;
-use sqlparser::ast::{DataType, ExactNumberInfo};
+use sqlparser::ast::{DataType, ExactNumberInfo, TimezoneInfo};
 
 fn ok(dt: DataType) -> TypeCode {
     sql_type_to_typecode(&dt).expect("expected Ok")
@@ -144,9 +144,39 @@ fn boolean_gives_helpful_error() {
 
 #[test]
 fn unknown_type_gives_unsupported_error() {
-    // Date is not supported, and the type is echoed as written, not as a parser dump.
-    let msg = err(DataType::Date);
-    assert!(msg.contains("unsupported SQL type: DATE"), "unexpected error: {msg}");
+    // The type is echoed as written, not as a parser dump.
+    let msg = err(DataType::Interval { fields: None, precision: None });
+    assert!(
+        msg.contains("unsupported SQL type: INTERVAL"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn temporal_types_map_to_their_codes() {
+    assert_eq!(ok(DataType::Date), TypeCode::Date);
+    assert_eq!(ok(DataType::Timestamp(None, TimezoneInfo::None)), TypeCode::Timestamp);
+    // The spellings that mean "no zone" all land on the one TIMESTAMP; only a
+    // zoned one is refused.
+    assert_eq!(ok(DataType::Datetime(None)), TypeCode::Timestamp);
+    assert_eq!(ok(DataType::TimestampNtz(None)), TypeCode::Timestamp);
+    assert!(err(DataType::Timestamp(None, TimezoneInfo::WithTimeZone)).contains("time zone"));
+}
+
+/// The parsers themselves are `gnitz-expr`'s; what is this crate's is that each
+/// type reaches its own one and that a bad literal surfaces as a bind error.
+#[test]
+fn a_temporal_literal_routes_to_its_parser() {
+    assert_eq!(
+        temporal_literal(TypeCode::Date, "2024-02-29").unwrap(),
+        i64::from(gnitz_expr::calendar::parse_date("2024-02-29").unwrap())
+    );
+    assert_eq!(
+        temporal_literal(TypeCode::Timestamp, "2024-02-29 13:45:07").unwrap(),
+        gnitz_expr::calendar::parse_timestamp("2024-02-29 13:45:07").unwrap()
+    );
+    let e = temporal_literal(TypeCode::Date, "2024-02-30").expect_err("2024 has no 30th of February");
+    assert!(matches!(e, GnitzSqlError::Bind(_)), "unexpected error: {e:?}");
 }
 
 // --- SERIAL recognition (serial_underlying) ---

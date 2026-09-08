@@ -1293,7 +1293,12 @@ mod pack_proptest {
         use gnitz_wire::TypeCode as T;
         match tc {
             type_code::U8 | type_code::U16 | type_code::U32 | type_code::U64 => T::U64,
-            type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64 => T::I64,
+            type_code::I8
+            | type_code::I16
+            | type_code::I32
+            | type_code::I64
+            | type_code::DATE
+            | type_code::TIMESTAMP => T::I64,
             type_code::I128 => T::I128,
             _ => T::U128, // U128, UUID
         }

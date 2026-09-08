@@ -1,5 +1,6 @@
 use crate::error::GnitzSqlError;
 use gnitz_core::{ColumnDef, TypeCode};
+use gnitz_expr::CalendarOp;
 
 /// Both are instruction selectors, so the evaluator crate owns their
 /// definitions; the IR carries each verbatim rather than restating it.
@@ -43,6 +44,12 @@ pub(crate) enum BExpr<R> {
     LitNull,
     BinOp(Box<BExpr<R>>, BinOp, Box<BExpr<R>>),
     UnaryOp(UnaryOp, Box<BExpr<R>>),
+    /// `EXTRACT` / `DATE_PART` / `DATE_TRUNC` over a DATE or TIMESTAMP
+    /// argument; lowering checks the argument's type, the binder is schema-free.
+    Calendar {
+        op: CalendarOp,
+        arg: Box<BExpr<R>>,
+    },
     /// `inner IS NULL` (`IS NOT NULL` when `want_null` is false). One node for
     /// every operand: a bare nullable column lowers to the column-bitmap opcode,
     /// anything else to a null test over the register it computes into.
@@ -244,16 +251,54 @@ pub(crate) type BoundExpr = BExpr<usize>;
 /// this one fold instead of a second pass beside it.
 pub(crate) fn unify_blend_type(a: TypeCode, b: TypeCode) -> TypeCode {
     // Per-operand this is exactly `register_image`; unifying a pair is the
-    // String > F64 > U64 > I64 join of the two images.
+    // String > F64 > U64 > I64 join of the two images. Past the first three
+    // arms only {I64, DATE, TIMESTAMP} are left, so the two below read: a
+    // temporal image absorbs the neutral I64, an equal pair is itself (which is
+    // reachable for a temporal pair alone), and DATE with TIMESTAMP falls to the
+    // integer both of them are.
     match (a.register_image(), b.register_image()) {
         (TypeCode::String, _) | (_, TypeCode::String) => TypeCode::String,
         (TypeCode::F64, _) | (_, TypeCode::F64) => TypeCode::F64,
         (TypeCode::U64, _) | (_, TypeCode::U64) => TypeCode::U64,
+        (x, TypeCode::I64) | (TypeCode::I64, x) => x,
+        (x, y) if x == y => x,
         _ => TypeCode::I64,
     }
 }
 
+/// `+` / `-` with a temporal operand: a date or timestamp shifted by an integer
+/// keeps its type, the difference of two of the same type is an integer, and
+/// anything else takes the plain blend.
+fn temporal_arith_type(op: BinOp, lt: TypeCode, rt: TypeCode) -> TypeCode {
+    let is_int = |t: TypeCode| matches!(t.register_image(), TypeCode::I64 | TypeCode::U64);
+    match (lt.is_temporal(), rt.is_temporal(), op) {
+        (true, true, BinOp::Sub) if lt == rt => TypeCode::I64,
+        (true, false, BinOp::Add | BinOp::Sub) if is_int(rt) => lt,
+        (false, true, BinOp::Add) if is_int(lt) => rt,
+        _ => unify_blend_type(lt, rt),
+    }
+}
+
 impl<R> BExpr<R> {
+    /// A `DATE '…'` / `TIMESTAMP '…'` literal: its storage integer under a cast
+    /// to its type, so it types as a DATE/TIMESTAMP where a bare integer would
+    /// not (a difference of two dates is an integer, a date shifted by one is
+    /// a date). [`Self::int_literal`] is the inverse.
+    pub(crate) fn temporal_lit(to: TypeCode, v: i64) -> Self {
+        BExpr::Cast { expr: Box::new(BExpr::LitInt(v)), to }
+    }
+
+    /// The integer a literal spells: a plain `LitInt`, or one under the typed
+    /// cast a `DATE '…'` / `TIMESTAMP '…'` literal binds to — which is why the
+    /// seek and IN-set recognizers read literals through here.
+    pub(crate) fn int_literal(&self) -> Option<i64> {
+        match self {
+            BExpr::LitInt(v) => Some(*v),
+            BExpr::Cast { expr, to } if to.is_temporal() => expr.int_literal(),
+            _ => None,
+        }
+    }
+
     /// Infer the result type, parameterized over how a leaf reference is typed.
     /// `ColRef` is the only leaf-typed arm — it consults `leaf_ty`; every other
     /// arm is structural (literals fix a type, comparisons/tests are `I64`,
@@ -280,6 +325,7 @@ impl<R> BExpr<R> {
                     BinOp::And | BinOp::Or => TypeCode::I64,
                     BinOp::Concat => TypeCode::String,
                     BinOp::Pow => TypeCode::F64,
+                    BinOp::Add | BinOp::Sub if lt.is_temporal() || rt.is_temporal() => temporal_arith_type(*op, lt, rt),
                     // Arithmetic preserves U64 (and floats), mirroring the engine's
                     // `reg_u64`: a materialized `u64 + u64` column must stay
                     // U64 so a downstream compare re-seeds the unsigned variant.
@@ -294,6 +340,12 @@ impl<R> BExpr<R> {
             // `BinOp` arm.
             BExpr::InList { .. } | BExpr::Like { .. } => TypeCode::I64,
             BExpr::Func { f, arg } => f.result_type(arg.infer_type_with(leaf_ty)),
+            BExpr::Calendar { op, arg } => match op {
+                CalendarOp::ToMicros => TypeCode::Timestamp,
+                CalendarOp::ToDays => TypeCode::Date,
+                op if op.keeps_type() => arg.infer_type_with(leaf_ty),
+                _ => TypeCode::I64,
+            },
             // Seeded with `unify_blend_type`'s neutral element, so a one-argument
             // list types as its own register image and an empty one as I64.
             BExpr::MinMaxN { args, .. } => args
@@ -378,6 +430,7 @@ impl<R> BExpr<R> {
             BExpr::BinOp(l, op, r) => BExpr::BinOp(boxed(l)?, *op, boxed(r)?),
             BExpr::UnaryOp(op, inner) => BExpr::UnaryOp(*op, boxed(inner)?),
             BExpr::Func { f, arg } => BExpr::Func { f: *f, arg: boxed(arg)? },
+            BExpr::Calendar { op, arg } => BExpr::Calendar { op: *op, arg: boxed(arg)? },
             BExpr::MinMaxN { is_max, args } => BExpr::MinMaxN { is_max: *is_max, args: all(args)? },
             BExpr::Cast { expr, to } => BExpr::Cast { expr: boxed(expr)?, to: *to },
             BExpr::Case { branches, else_ } => BExpr::Case {
@@ -421,7 +474,7 @@ impl<R> BExpr<R> {
                 r.for_each_ref(f);
             }
             BExpr::UnaryOp(_, inner) => inner.for_each_ref(f),
-            BExpr::Func { arg, .. } => arg.for_each_ref(f),
+            BExpr::Func { arg, .. } | BExpr::Calendar { arg, .. } => arg.for_each_ref(f),
             BExpr::MinMaxN { args, .. } => args.iter().for_each(|a| a.for_each_ref(f)),
             BExpr::Cast { expr, .. } => expr.for_each_ref(f),
             BExpr::Case { branches, else_ } => {

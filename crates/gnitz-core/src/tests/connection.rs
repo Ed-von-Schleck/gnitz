@@ -247,7 +247,9 @@ mod spine_tests {
         assert_eq!(d1.columns.len(), 3);
         assert_eq!(d1.pks.to_vec_u128(&sb), vec![20, 21]);
         let strs: Vec<&[u8]> = d1.columns[1]
-            .chunks_exact(16)
+            .as_chunks::<16>()
+            .0
+            .iter()
             .map(|cell| gnitz_wire::german_string_content(cell, &d1.blob))
             .collect();
         assert_eq!(strs, [b"s20".as_slice(), b"s21".as_slice()]);

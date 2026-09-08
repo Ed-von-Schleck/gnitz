@@ -12,8 +12,8 @@ use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_bound_expr;
 use crate::ir::BoundExpr;
 use crate::validate::reject_duplicate_projection_names;
-use gnitz_core::{ColumnDef, Schema};
-use gnitz_expr::{ExprBuilder, LogicalProgram, Sink};
+use gnitz_core::{ColumnDef, FixedInt, Schema};
+use gnitz_expr::{ExprBuilder, LogicalInstr, LogicalProgram, Sink};
 use gnitz_wire::ComputeMap;
 use sqlparser::ast::SelectItem;
 
@@ -91,7 +91,7 @@ pub(crate) fn payload_map(
     schema: &Schema,
 ) -> Result<ComputeMap, GnitzSqlError> {
     Ok(ComputeMap {
-        program: compile_projection_map(items, schema)?.to_blob_bytes(),
+        program: compile_projection_map(items, cols, schema)?.to_blob_bytes(),
         out_cols: cols.iter().map(|c| (c.type_code as u8, c.is_nullable)).collect(),
     })
 }
@@ -102,13 +102,25 @@ pub(crate) fn payload_map(
 /// class-agnostic here — the engine splits it by the source register's class,
 /// storing the raw 8-byte image for a scalar and a German-string cell for a
 /// string.
-pub(crate) fn compile_projection_map(items: &[ProjItem], schema: &Schema) -> Result<LogicalProgram, GnitzSqlError> {
+pub(crate) fn compile_projection_map(
+    items: &[ProjItem],
+    out_cols: &[ColumnDef],
+    schema: &Schema,
+) -> Result<LogicalProgram, GnitzSqlError> {
+    debug_assert_eq!(items.len(), out_cols.len(), "one declared column per projection item");
     let mut eb = ExprBuilder::new();
-    for item in items {
+    for (item, col) in items.iter().zip(out_cols) {
         match item {
             ProjItem::PassThrough { src_col } => eb.sink(Sink::Col(*src_col as u32)),
             ProjItem::Computed { bound_expr } => {
-                let reg = compile_bound_expr(bound_expr, &schema.columns, &mut eb)?;
+                let mut reg = compile_bound_expr(bound_expr, &schema.columns, &mut eb)?;
+                // A DATE slot is narrower than the 8-byte register it is emitted
+                // from, so the value is range-checked into those low bytes
+                // first. The width comes from the declaration this program is
+                // paired with, never re-inferred: the two must not drift.
+                if let Some(fi) = FixedInt::from_type_code(col.type_code).filter(|fi| fi.width() < 8) {
+                    reg = eb.emit(LogicalInstr::IntCast { a: reg, fi });
+                }
                 eb.sink(Sink::Reg(reg));
             }
         }
@@ -225,12 +237,10 @@ pub(crate) fn read_reply_shape(
     source_schema: &Schema,
 ) -> Result<(Schema, Vec<u8>), GnitzSqlError> {
     let k = source_schema.pk_cols.len();
+    let program = compile_projection_map(&items[k..], &out_cols[k..], source_schema)?.to_blob_bytes();
     let reply_schema = Schema::from_parts(out_cols, (0..k as u32).collect())
         .map_err(|e| GnitzSqlError::Unsupported(format!("read-spec reply schema is invalid: {e}")))?;
-    Ok((
-        reply_schema,
-        compile_projection_map(&items[k..], source_schema)?.to_blob_bytes(),
-    ))
+    Ok((reply_schema, program))
 }
 
 #[cfg(test)]

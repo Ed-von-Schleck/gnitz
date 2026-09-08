@@ -298,12 +298,15 @@ impl MirrorState {
 // calls through `MirrorStore` — which is also what makes it exist once for the
 // blocking, async and Python clients alike.
 
+/// One poll's per-view outcomes, `(view id, that view's own result)`.
+type ViewPollResults = Vec<(u64, Result<PollResult, ClientError>)>;
+
 /// A whole request failed: fail every view it never answered — the cause to the
 /// first, `Closed` to the rest, which is what a request each would have got.
 /// Recorded here rather than stashed, because by the time a request is known to
 /// have failed no further reply of it can arrive.
 fn fail_range(
-    applied: &mut Vec<(u64, Result<PollResult, ClientError>)>,
+    applied: &mut ViewPollResults,
     views: &[(u64, DeltaCursor, Arc<ReplySchema>)],
     unanswered: Range<usize>,
     cause: ClientError,
@@ -619,7 +622,7 @@ impl GnitzClient {
     fn delta_poll_many(
         &mut self,
         views: &[(u64, DeltaCursor, Arc<ReplySchema>)],
-    ) -> Result<Vec<(u64, Result<PollResult, ClientError>)>, ClientError> {
+    ) -> Result<ViewPollResults, ClientError> {
         // Split, so the ingest writes to the mirror while the session drains:
         // disjoint fields, so both borrows hold.
         let Self { session, mirror, .. } = self;

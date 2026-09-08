@@ -179,7 +179,11 @@ fn signal_reached_wakes_only_the_workers_a_fanout_reached() {
             .collect()
     };
 
-    assert_eq!(woken(&disp, vec![]), Vec::<usize>::new(), "nothing dispatched, nothing woken");
+    assert_eq!(
+        woken(&disp, vec![]),
+        Vec::<usize>::new(),
+        "nothing dispatched, nothing woken"
+    );
     assert_eq!(woken(&disp, vec![Fanout::One(2)]), vec![2]);
     assert_eq!(woken(&disp, vec![Fanout::One(3), Fanout::One(1)]), vec![1, 3]);
     // A worker reached twice is still one wake, and a broadcast stops at the

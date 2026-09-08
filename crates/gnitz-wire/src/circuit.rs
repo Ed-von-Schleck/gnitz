@@ -176,8 +176,14 @@ pub const fn agg_output_type(func: AggFunc, src_tc: u8) -> u8 {
     let is_float = crate::types::is_float(src_tc);
     match func {
         AggFunc::Count | AggFunc::CountNonNull | AggFunc::SumZero => type_code::I64,
-        // Exactly the 8-byte register image the accumulator holds.
-        AggFunc::Sum => crate::types::register_image_type(src_tc),
+        // Exactly the 8-byte register image the accumulator holds. A temporal
+        // image names a narrower slot than that image, and a sum of calendar
+        // values is not one — the planner rejects SUM over a temporal column
+        // before it gets here, so this is what a forged circuit lands on.
+        AggFunc::Sum => match crate::types::register_image_type(src_tc) {
+            t if crate::is_temporal(t) => type_code::I64,
+            t => t,
+        },
         AggFunc::Min | AggFunc::Max => {
             if is_float {
                 type_code::F64

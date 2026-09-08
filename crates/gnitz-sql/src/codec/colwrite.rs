@@ -80,6 +80,7 @@ pub(crate) fn append_value_to_col(
                 GnitzSqlError::Bind(match e {
                     KeyLitError::NotNumeric => "string literal for non-string column".to_string(),
                     KeyLitError::BadUuid => format!("invalid UUID literal: {c}"),
+                    KeyLitError::BadTemporal => format!("invalid {} literal: {c}", tc.wire_name()),
                     KeyLitError::NegativeIntoUnsigned | KeyLitError::OutOfRange => {
                         format!("{tc:?} value out of range: {c}")
                     }

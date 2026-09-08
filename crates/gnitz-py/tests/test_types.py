@@ -1276,19 +1276,6 @@ class TestTypeErrors:
         finally:
             _cleanup(client, sn)
 
-    def test_date_type_rejected(self, client):
-        """DATE type is not supported."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql(
-                    "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, d DATE NOT NULL)",
-                    schema_name=sn,
-                )
-        finally:
-            _cleanup(client, sn)
-
     def test_decimal_nonzero_scale_rejected(self, client):
         """DECIMAL(38,2) (non-zero scale) is not supported."""
         sn = "s" + _uid()

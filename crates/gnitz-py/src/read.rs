@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString, PyTuple};
+use pyo3::types::{PyDate, PyDateTime, PyDict, PyList, PyString, PyTuple};
 
 use gnitz_core::{Schema, TypeCode, ZSetBatch};
 use gnitz_expr::{ColumnLocator, SchemaFacts};
@@ -266,25 +266,37 @@ fn fixed_value_to_py(py: Python<'_>, tc: TypeCode, bytes: &[u8]) -> PyResult<Py<
     if tc.is_wide_int() {
         return u128_value_to_py(py, u128::from_le_bytes(bytes.try_into().unwrap()), tc);
     }
-    Ok(read_fixed_le(py, tc, bytes))
+    read_fixed_le(py, tc, bytes)
 }
 
 /// Read one fixed-width value as a Python object (integers as int, floats as
-/// float). Widths come from `slice.len()` via the shared
+/// float, DATE as `datetime.date`, TIMESTAMP as a naive `datetime.datetime`).
+/// Widths come from `slice.len()` via the shared
 /// `read_signed_exact`/`read_unsigned_exact` pair, so the 1/2/4/8-byte table is
 /// not restated here; only the sign and float distinctions are type-directed.
-fn read_fixed_le(py: Python<'_>, tc: TypeCode, slice: &[u8]) -> Py<PyAny> {
+fn read_fixed_le(py: Python<'_>, tc: TypeCode, slice: &[u8]) -> PyResult<Py<PyAny>> {
     macro_rules! obj {
         ($v:expr) => {
             $v.into_pyobject(py).unwrap().into_any().unbind()
         };
     }
-    match tc {
+    Ok(match tc {
         TypeCode::F32 => obj!(f32::from_le_bytes(slice.try_into().unwrap())),
         TypeCode::F64 => obj!(f64::from_le_bytes(slice.try_into().unwrap())),
+        TypeCode::Date => {
+            let (y, m, d) = gnitz_expr::calendar::civil_from_days(gnitz_wire::read_signed_exact(slice));
+            PyDate::new(py, y as i32, m as u8, d as u8)?.into_any().unbind()
+        }
+        TypeCode::Timestamp => {
+            let (days, h, mi, s, us) = gnitz_expr::calendar::split_micros(gnitz_wire::read_signed_exact(slice));
+            let (y, m, d) = gnitz_expr::calendar::civil_from_days(days);
+            PyDateTime::new(py, y as i32, m as u8, d as u8, h as u8, mi as u8, s as u8, us, None)?
+                .into_any()
+                .unbind()
+        }
         _ if tc.is_signed_int() => obj!(gnitz_wire::read_signed_exact(slice)),
         _ => obj!(gnitz_wire::read_unsigned_exact(slice)),
-    }
+    })
 }
 
 /// Surface one 16-byte integer as its column type dictates: UUID → canonical

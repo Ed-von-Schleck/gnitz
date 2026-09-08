@@ -434,7 +434,10 @@ pub(crate) fn agg_typing(agg_func: AggFunc, arg: Option<&ColumnDef>) -> Result<A
             AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => true,
             AggFunc::Count => false,
         };
-        if needs_value && !has_scalar_register(c.type_code) {
+        // A calendar value has no sum: adding two dates is meaningless, and the
+        // accumulator would be typed as the plain integer either way.
+        let unsummable = matches!(agg_func, AggFunc::Sum | AggFunc::Avg) && c.type_code.is_temporal();
+        if needs_value && (!has_scalar_register(c.type_code) || unsummable) {
             return Err(GnitzSqlError::Unsupported(format!(
                 "{}: not supported on {:?} column '{}'",
                 agg_func_name(agg_func).to_ascii_uppercase(),

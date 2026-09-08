@@ -142,14 +142,20 @@ fn a_frame_past_its_cap_is_refused_by_the_decoder() {
     let views: Vec<(u64, &[u8], &[u8])> = (1..=DELTA_POLL_MAX_VIEWS as u64)
         .map(|id| (id, &b"s"[..], &b"b"[..]))
         .collect();
-    assert_eq!(decode_delta_poll(&encode_delta_poll(1, &views)).unwrap().len(), views.len());
+    assert_eq!(
+        decode_delta_poll(&encode_delta_poll(1, &views)).unwrap().len(),
+        views.len()
+    );
     let mut over = views.clone();
     over.push((u64::MAX, &b"s"[..], &b"b"[..]));
     let err = decode_delta_poll(&encode_delta_poll(1, &over)).expect_err("past the cap");
     assert!(err.contains("too many items"), "{err:?}");
 
     let rels: Vec<(u64, u16)> = (1..=SCAN_MULTI_MAX_RELATIONS as u64).map(|id| (id, 0)).collect();
-    assert_eq!(decode_scan_multi(&encode_scan_multi(1, &rels)).unwrap().len(), rels.len());
+    assert_eq!(
+        decode_scan_multi(&encode_scan_multi(1, &rels)).unwrap().len(),
+        rels.len()
+    );
     let mut over = rels.clone();
     over.push((u64::MAX, 0));
     let err = decode_scan_multi(&encode_scan_multi(1, &over)).expect_err("past the cap");

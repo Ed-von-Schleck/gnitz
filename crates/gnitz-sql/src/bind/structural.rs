@@ -2,12 +2,14 @@ use std::convert::Infallible;
 
 use super::resolve::find_unique_column;
 use crate::ast_util::{
-    bind_constant, bind_literal, classify_agg_call, col_ref_parts, function_positional_args, single_fn_name, Constant,
+    bind_constant, bind_literal, classify_agg_call, col_ref_parts, function_positional_args, single_fn_name,
+    temporal_constant, Constant,
 };
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, NumFunc, StrFunc, TrimMode, UnaryOp};
 use crate::types::{is_cast_target, sql_type_to_typecode};
 use gnitz_core::{ColumnDef, Schema};
+use gnitz_expr::CalendarOp;
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, CeilFloorKind, DateTimeField, Expr, Function, TrimWhereField, UnaryOperator,
     ValueWithSpan,
@@ -118,6 +120,11 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
     if let Some(claimed) = leaf.bind_node(expr) {
         return Ok(claimed);
     }
+    // The VM parses no calendar text, so a temporal literal is folded here and
+    // a non-literal string cast to DATE/TIMESTAMP is refused at lowering.
+    if let Some((to, v)) = temporal_constant(expr)? {
+        return Ok(BExpr::temporal_lit(to, v));
+    }
     match expr {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => leaf.bind_column(expr),
         // The context-independent names (the CASE desugars and the numeric scalar
@@ -129,7 +136,15 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
         Expr::Function(f) if f.over.is_some() => leaf.bind_window(f),
         Expr::Function(f) => match scalar_call(f) {
             Some((name, call)) => bind_scalar_call(name, call, f, leaf),
-            None => leaf.bind_function(f),
+            None => match single_fn_name(f) {
+                Some(n) if VOLATILE_FNS.iter().any(|v| n.eq_ignore_ascii_case(v)) => {
+                    Err(GnitzSqlError::Unsupported(format!(
+                        "{}: a non-deterministic function is not supported",
+                        n.to_ascii_uppercase()
+                    )))
+                }
+                _ => leaf.bind_function(f),
+            },
         },
         // CEIL/FLOOR are keyword-dispatched by sqlparser into their own AST nodes
         // and never arrive as `Expr::Function` (CEILING, which is not, does).
@@ -164,6 +179,11 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
                 to,
             })
         }
+        Expr::Extract { field, syntax: _, expr: e } => Ok(BExpr::Calendar {
+            op: calendar_field(&field.to_string())
+                .ok_or_else(|| GnitzSqlError::Unsupported(format!("EXTRACT: field {field} is not supported")))?,
+            arg: Box::new(bind_structural(e, leaf)?),
+        }),
         // SUBSTR and SUBSTRING, the `FROM/FOR` form and the comma form, all
         // arrive as this one keyword-dispatched node; `special`/`shorthand` only
         // record which spelling was written. An absent FROM starts at 1.
@@ -483,6 +503,10 @@ enum Call {
     /// `LTRIM`/`RTRIM`: one argument, or two with a literal trim set.
     Trim1(TrimMode),
     Concat,
+    /// `DATE_TRUNC('unit', x)` and `DATE_PART('field', x)`: a literal unit
+    /// name, then the temporal operand.
+    DateTrunc,
+    DatePart,
 }
 
 impl Call {
@@ -492,7 +516,7 @@ impl Call {
     fn arity(self) -> (usize, Option<usize>) {
         match self {
             Call::Coalesce | Call::MinMax(_) | Call::Concat => (1, None),
-            Call::Ifnull | Call::Nullif | Call::Binary(_) => (2, Some(2)),
+            Call::Ifnull | Call::Nullif | Call::Binary(_) | Call::DateTrunc | Call::DatePart => (2, Some(2)),
             Call::If => (3, Some(3)),
             Call::Unary(_) => (1, Some(1)),
             Call::Round | Call::Trim1(_) => (1, Some(2)),
@@ -546,7 +570,48 @@ const SCALAR_CALLS: &[(&str, Call)] = &[
     ("LTRIM", Call::Trim1(TrimMode::Leading)),
     ("RTRIM", Call::Trim1(TrimMode::Trailing)),
     ("CONCAT", Call::Concat),
+    ("DATE_TRUNC", Call::DateTrunc),
+    ("DATE_PART", Call::DatePart),
 ];
+
+/// The clock and random functions, beside [`SCALAR_CALLS`] so the two name
+/// tables live together. Listed to say *why* they are refused, which the
+/// unknown-name error they would otherwise take cannot: nothing re-evaluates a
+/// clock or a coin flip off an input delta, so they are not pending support.
+const VOLATILE_FNS: &[&str] = &[
+    "NOW",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "LOCALTIME",
+    "LOCALTIMESTAMP",
+    "RANDOM",
+    "RAND",
+];
+
+/// The calendar field a unit name selects, as `EXTRACT` (which is how
+/// sqlparser spells its field) and `DATE_PART` write it. Case and a plural `s`
+/// are ignored. `DATE_TRUNC`'s units are this same vocabulary read through
+/// [`CalendarOp::trunc_of`], so they are not spelled a second time.
+fn calendar_field(name: &str) -> Option<CalendarOp> {
+    use CalendarOp as C;
+    let n = name.trim().to_ascii_lowercase();
+    match n.strip_suffix('s').filter(|s| !s.is_empty()).unwrap_or(&n) {
+        "year" => Some(C::Year),
+        "quarter" => Some(C::Quarter),
+        "month" => Some(C::Month),
+        "week" | "isoweek" => Some(C::Week),
+        "day" => Some(C::Day),
+        "dow" | "dayofweek" => Some(C::Dow),
+        "isodow" => Some(C::Isodow),
+        "doy" | "dayofyear" => Some(C::Doy),
+        "hour" => Some(C::Hour),
+        "minute" => Some(C::Minute),
+        "second" => Some(C::Second),
+        "epoch" => Some(C::Epoch),
+        _ => None,
+    }
+}
 
 /// The SQL spelling of a string function, read back out of [`SCALAR_CALLS`] —
 /// its first entry, for the names with aliases — so an error names the
@@ -657,6 +722,21 @@ fn bind_scalar_call<R: Clone, L: LeafBinder<R>>(
             set: trim_set(args.get(1).copied())?,
         }),
         Call::Concat => Ok(BExpr::ConcatN { args: bind_all(&args, leaf)? }),
+        Call::DateTrunc | Call::DatePart => {
+            let unit = literal_expr_string(args[0])
+                .ok_or_else(|| GnitzSqlError::Unsupported(format!("{name}: the unit must be a string literal")))?;
+            // DATE_TRUNC takes the truncating half of the same vocabulary, so
+            // the fields with no truncation (DOW, EPOCH, …) fall out as
+            // unsupported units here rather than needing a second table.
+            let op = calendar_field(&unit).and_then(|op| match call {
+                Call::DateTrunc => op.trunc_of(),
+                _ => Some(op),
+            });
+            Ok(BExpr::Calendar {
+                op: op.ok_or_else(|| GnitzSqlError::Unsupported(format!("{name}: unit {unit:?} is not supported")))?,
+                arg: Box::new(bind_structural(args[1], leaf)?),
+            })
+        }
     }
 }
 

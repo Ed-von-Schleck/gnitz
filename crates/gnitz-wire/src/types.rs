@@ -18,6 +18,8 @@ pub mod type_code {
     pub const UUID: u8 = 13;
     pub const BLOB: u8 = 14;
     pub const I128: u8 = 15;
+    pub const DATE: u8 = 16;
+    pub const TIMESTAMP: u8 = 17;
 }
 
 /// Typed column type code enum, mirroring the `type_code::*` constants.
@@ -43,6 +45,10 @@ pub enum TypeCode {
     UUID = type_code::UUID,
     Blob = type_code::BLOB,
     I128 = type_code::I128,
+    /// Days since 1970-01-01, physically an `I32`.
+    Date = type_code::DATE,
+    /// Microseconds since 1970-01-01T00:00:00, physically an `I64`.
+    Timestamp = type_code::TIMESTAMP,
 }
 
 impl TypeCode {
@@ -50,7 +56,7 @@ impl TypeCode {
     /// table. Clients that must reproduce the table (the Python `TypeCode`
     /// IntEnum) build it from here rather than re-typing the constants, so a
     /// new variant reaches them without an edit on their side.
-    pub const ALL: [TypeCode; 15] = [
+    pub const ALL: [TypeCode; 17] = [
         TypeCode::U8,
         TypeCode::I8,
         TypeCode::U16,
@@ -66,6 +72,8 @@ impl TypeCode {
         TypeCode::UUID,
         TypeCode::Blob,
         TypeCode::I128,
+        TypeCode::Date,
+        TypeCode::Timestamp,
     ];
 
     /// The type's name in the wire vocabulary — the spelling the
@@ -88,6 +96,8 @@ impl TypeCode {
             TypeCode::UUID => "UUID",
             TypeCode::Blob => "BLOB",
             TypeCode::I128 => "I128",
+            TypeCode::Date => "DATE",
+            TypeCode::Timestamp => "TIMESTAMP",
         }
     }
 
@@ -117,7 +127,27 @@ impl TypeCode {
             tc::UUID => Some(TypeCode::UUID),
             tc::BLOB => Some(TypeCode::Blob),
             tc::I128 => Some(TypeCode::I128),
+            tc::DATE => Some(TypeCode::Date),
+            tc::TIMESTAMP => Some(TypeCode::Timestamp),
             _ => None,
+        }
+    }
+
+    /// The two calendar types. Each is an integer of a fixed width under a
+    /// different name: every storage, ordering and VM path treats it as
+    /// [`Self::storage_type`], and only the SQL surface and the clients see the
+    /// name. Typed counterpart of the free [`is_temporal`].
+    pub const fn is_temporal(self) -> bool {
+        is_temporal(self as u8)
+    }
+
+    /// The integer type a value of this type is stored and computed as:
+    /// `I32` for `Date`, `I64` for `Timestamp`, and the type itself otherwise.
+    /// Typed counterpart of the free [`storage_type_code`], which owns the map.
+    pub const fn storage_type(self) -> TypeCode {
+        match TypeCode::try_from_u8(storage_type_code(self as u8)) {
+            Some(t) => t,
+            None => self,
         }
     }
 
@@ -184,8 +214,8 @@ impl TypeCode {
         match self {
             TypeCode::U8 | TypeCode::I8 => 1,
             TypeCode::U16 | TypeCode::I16 => 2,
-            TypeCode::F32 | TypeCode::U32 | TypeCode::I32 => 4,
-            TypeCode::F64 | TypeCode::U64 | TypeCode::I64 => 8,
+            TypeCode::F32 | TypeCode::U32 | TypeCode::I32 | TypeCode::Date => 4,
+            TypeCode::F64 | TypeCode::U64 | TypeCode::I64 | TypeCode::Timestamp => 8,
             TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob | TypeCode::I128 => 16,
         }
     }
@@ -290,8 +320,9 @@ pub const fn is_pk_eligible(tc: u8) -> bool {
 
 /// Promote a base-table column's type to the leading-key type its secondary
 /// index stores: an unsigned ≤8-byte integer (U8..U64) promotes to `U64`, a
-/// signed ≤8-byte integer (I8..I64) to `I64`; `U128`/`UUID` keep their 16-byte
-/// width; STRING/BLOB/float (and any unknown code) are index-ineligible and
+/// signed ≤8-byte integer (I8..I64) to `I64`, and a temporal code as its storage
+/// integer does — so a `DATE` index key is the exercised 8-byte signed one, not
+/// the only 4-byte key in the system; `U128`/`UUID` keep their 16-byte width; STRING/BLOB/float (and any unknown code) are index-ineligible and
 /// return `Err`. Signed columns keep a *signed* promoted code so the OPK leading
 /// key is order-preserving (`encode_pk_column` sign-flips only signed codes);
 /// `wire_stride(I64) == wire_stride(U64) == 8`, so the sign the promotion picks
@@ -306,6 +337,7 @@ pub fn index_key_type(field_type_code: u8) -> Result<u8, String> {
         tc::UUID => Ok(tc::UUID),
         tc::U64 | tc::U32 | tc::U16 | tc::U8 => Ok(tc::U64),
         tc::I64 | tc::I32 | tc::I16 | tc::I8 => Ok(tc::I64),
+        tc::DATE | tc::TIMESTAMP => Ok(tc::I64),
         tc::F32 | tc::F64 | tc::STRING | tc::BLOB => Err(format!(
             "Secondary index on column type {field_type_code} not supported"
         )),
@@ -533,6 +565,28 @@ pub const fn is_float(tc: u8) -> bool {
     matches!(tc, type_code::F32 | type_code::F64)
 }
 
+/// True iff `tc` is one of the two calendar types. The `u8` counterpart of
+/// [`TypeCode::is_temporal`], for the raw-type-code paths.
+#[inline(always)]
+pub const fn is_temporal(tc: u8) -> bool {
+    matches!(tc, type_code::DATE | type_code::TIMESTAMP)
+}
+
+/// The integer type code a value of type `tc` is stored, ordered and computed
+/// as — `I32` for `DATE`, `I64` for `TIMESTAMP`, `tc` itself for everything
+/// else. The one place that map is written: the predicates a temporal code must
+/// answer like its storage type ([`is_signed_int`], [`is_fixed_int`]) and the
+/// promotions it must follow ([`index_key_type`], [`join_key_common_type`]) all
+/// read it, so a further calendar type needs no arm of its own in any of them.
+#[inline(always)]
+pub const fn storage_type_code(tc: u8) -> u8 {
+    match tc {
+        type_code::DATE => type_code::I32,
+        type_code::TIMESTAMP => type_code::I64,
+        t => t,
+    }
+}
+
 /// True iff `tc` is a 16-byte integer type (U128/UUID/I128). The `u8`
 /// counterpart of [`TypeCode::is_wide_int`], for the raw-type-code paths.
 #[inline(always)]
@@ -561,14 +615,22 @@ pub const fn is_valid_type_code(tc: u8) -> bool {
 /// scalar one — which is what makes the rule total enough for expression typing
 /// to read it unconditionally; `BLOB` has a register of neither class and falls
 /// in with the rest.
+///
+/// A temporal code also maps to itself, and is the one image whose *slot* is
+/// narrower than the register: the register holds the 8-byte integer, while the
+/// declared column keeps the calendar name and its own width. A sink into one
+/// is admitted only behind a cast that range-checks the value into that width
+/// (`check_emit_slot`), and a consumer that wants the accumulator's width
+/// rather than the declaration's — `agg_output_type` — reads through
+/// [`storage_type_code`].
 #[inline]
 pub(crate) const fn register_image_type(tc: u8) -> u8 {
     if is_float(tc) {
         type_code::F64
     } else if tc == type_code::U64 {
         type_code::U64
-    } else if tc == type_code::STRING {
-        type_code::STRING
+    } else if tc == type_code::STRING || is_temporal(tc) {
+        tc
     } else {
         type_code::I64
     }
@@ -617,7 +679,7 @@ pub fn is_widening_promotion(src: u8, target: u8) -> bool {
 #[inline(always)]
 pub const fn is_signed_int(tc: u8) -> bool {
     matches!(
-        tc,
+        storage_type_code(tc),
         type_code::I8 | type_code::I16 | type_code::I32 | type_code::I64 | type_code::I128
     )
 }
@@ -629,7 +691,7 @@ pub const fn is_signed_int(tc: u8) -> bool {
 #[inline(always)]
 pub const fn is_fixed_int(tc: u8) -> bool {
     matches!(
-        tc,
+        storage_type_code(tc),
         type_code::U8
             | type_code::I8
             | type_code::U16
@@ -678,6 +740,8 @@ impl FixedInt {
             TypeCode::I32 => Some(Self::I32),
             TypeCode::U64 => Some(Self::U64),
             TypeCode::I64 => Some(Self::I64),
+            TypeCode::Date => Some(Self::I32),
+            TypeCode::Timestamp => Some(Self::I64),
             TypeCode::F32
             | TypeCode::F64
             | TypeCode::U128
@@ -801,6 +865,8 @@ impl ScalarKind {
             TypeCode::I32 => Some(Self::Int(FixedInt::I32)),
             TypeCode::U64 => Some(Self::Int(FixedInt::U64)),
             TypeCode::I64 => Some(Self::Int(FixedInt::I64)),
+            TypeCode::Date => Some(Self::Int(FixedInt::I32)),
+            TypeCode::Timestamp => Some(Self::Int(FixedInt::I64)),
             TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob | TypeCode::I128 => None,
         }
     }
@@ -886,8 +952,8 @@ const _: () = {
             Some(fi) => {
                 assert!(matches!(kind, Some(ScalarKind::Int(_))), "a FixedInt has an Int image");
                 assert!(
-                    fi.type_code() as u8 == tc as u8,
-                    "FixedInt::type_code must invert from_type_code"
+                    fi.type_code() as u8 == tc.storage_type() as u8,
+                    "FixedInt::type_code must invert from_type_code up to the storage type"
                 );
                 assert!(
                     fi.is_signed() == is_signed_int(tc as u8),
@@ -942,8 +1008,12 @@ pub fn join_key_common_type(l: u8, r: u8) -> Option<u8> {
     if is_german_string(l) && is_german_string(r) {
         return Some(type_code::U128);
     }
-    // Both signed ≤8-byte integers → the wider signed type.
+    // Both signed integers of at most 8 bytes → the wider signed type. Read
+    // through the storage type: an unequal pair with a temporal side
+    // co-partitions as the integer both sides really are, never under one
+    // side's calendar name.
     if is_signed_int(l) && is_signed_int(r) {
+        let (l, r) = (storage_type_code(l), storage_type_code(r));
         return Some(if wire_stride(l) >= wire_stride(r) { l } else { r });
     }
     // Both unsigned (U8..U64 and the 16-byte U128/UUID) → the wider unsigned
@@ -1044,10 +1114,21 @@ const _: () = {
             !is_fixed_int(v as u8) || (w == 1 || w == 2 || w == 4 || w == 8),
             "is_fixed_int must imply a 1/2/4/8-byte width"
         );
+        // A temporal code is its storage integer under another name, so the two
+        // must lay out identically — `wire_stride` and `is_signed_int` spell the
+        // width and sign tables separately from `storage_type_code`'s map.
+        assert!(
+            w == wire_stride(storage_type_code(v as u8)),
+            "a type must have its storage type's width"
+        );
+        assert!(
+            is_signed_int(v as u8) == is_signed_int(storage_type_code(v as u8)),
+            "a type must have its storage type's sign"
+        );
         v += 1;
     }
     assert!(
-        wire_stride(0) == 8 && wire_stride(16) == 8,
+        wire_stride(0) == 8 && wire_stride(200) == 8,
         "an unknown code must get a non-zero survival width, not a colliding 0"
     );
 };

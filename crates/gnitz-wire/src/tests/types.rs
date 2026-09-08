@@ -25,6 +25,8 @@ fn type_predicates_partition_the_type_table() {
         (TypeCode::UUID, false, false, false, false, false, true, true),
         (TypeCode::Blob, false, false, false, false, true, false, false),
         (TypeCode::I128, false, true, true, false, false, true, true),
+        (TypeCode::Date, true, true, true, false, false, false, true),
+        (TypeCode::Timestamp, true, true, true, false, false, false, true),
     ];
     assert_eq!(table.len(), TypeCode::ALL.len(), "a TypeCode variant is unclassified");
 
@@ -83,15 +85,19 @@ fn index_key_type_pins_the_whole_promotion_map() {
         (tc::I64, tc::I64),
         (tc::U128, tc::U128),
         (tc::UUID, tc::UUID),
+        // A temporal column indexes on its storage integer's promoted key.
+        (tc::DATE, tc::I64),
+        (tc::TIMESTAMP, tc::I64),
     ];
     for raw in 0u8..=u8::MAX {
         match map.iter().find(|&&(src, _)| src == raw) {
             Some(&(_, want)) => {
                 assert_eq!(index_key_type(raw), Ok(want), "tc={raw}");
-                assert_eq!(
-                    wire_stride(raw) == wire_stride(want),
-                    raw == want,
-                    "tc={raw}: width equality must coincide with type identity",
+                // The promoted slot must hold every value of the source: a
+                // promotion may widen or rename, never narrow or cross sign.
+                assert!(
+                    raw == want || int_domain_fits(raw, want),
+                    "tc={raw}: the promoted key {want} cannot hold it",
                 );
             }
             None => assert!(index_key_type(raw).is_err(), "tc={raw} must be index-ineligible"),
@@ -139,6 +145,8 @@ fn reindex_output_type_policy() {
         (TypeCode::UUID, TypeCode::U128),
         // The one 16-byte type that keeps its sign instead.
         (TypeCode::I128, TypeCode::I128),
+        (TypeCode::Date, TypeCode::Date),
+        (TypeCode::Timestamp, TypeCode::Timestamp),
     ];
     assert_eq!(
         policy.len(),
@@ -157,6 +165,11 @@ fn reindex_output_type_policy() {
 fn join_key_common_type_accepts_ladders() {
     use type_code::*;
     let cases: &[(u8, u8, u8)] = &[
+        // a temporal code joins its storage type's ladder as that integer
+        (DATE, I32, I32),
+        (DATE, I64, I64),
+        (TIMESTAMP, I64, I64),
+        (DATE, TIMESTAMP, I64),
         // signed ladder → wider signed
         (I8, I16, I16),
         (I8, I32, I32),

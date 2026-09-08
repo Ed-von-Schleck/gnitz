@@ -788,8 +788,8 @@ pub fn unpack_index_key_slots(seek_pk: u128, extra: &[u8], arity: usize) -> Resu
     }
     let mut vals = [0u128; PK_LIST_MAX_COLS];
     vals[0] = seek_pk;
-    for (i, slot) in extra.chunks_exact(INDEX_KEY_SLOT).enumerate() {
-        vals[i + 1] = u128::from_le_bytes(slot.try_into().expect("chunks_exact yields 16 bytes"));
+    for (i, slot) in extra.as_chunks::<INDEX_KEY_SLOT>().0.iter().enumerate() {
+        vals[i + 1] = u128::from_le_bytes(*slot);
     }
     Ok(PkKeyVals { vals, len })
 }

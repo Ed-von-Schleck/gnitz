@@ -536,17 +536,25 @@ impl Batch {
     #[inline]
     pub fn map_weights(&mut self, f: impl Fn(i64) -> i64) {
         let off = self.offsets[REG_WEIGHT];
-        for chunk in self.data[off..off + self.count * FIXED_REGION_BYTES].chunks_exact_mut(FIXED_REGION_BYTES) {
-            let w = i64::from_le_bytes(chunk.try_into().unwrap());
-            chunk.copy_from_slice(&f(w).to_le_bytes());
+        for chunk in self.data[off..off + self.count * FIXED_REGION_BYTES]
+            .as_chunks_mut::<FIXED_REGION_BYTES>()
+            .0
+        {
+            *chunk = f(i64::from_le_bytes(*chunk)).to_le_bytes();
         }
     }
     /// Overwrite every row's weight with `weights`, one per row in row order.
     /// Arbitrary weights can mint ghosts, so the layout claim is dropped.
     pub(crate) fn overwrite_weights(&mut self, weights: &[i64]) {
         debug_assert_eq!(weights.len(), self.count, "overwrite_weights: one weight per row");
-        for (dst, w) in self.weight_data_mut().chunks_exact_mut(FIXED_REGION_BYTES).zip(weights) {
-            dst.copy_from_slice(&w.to_le_bytes());
+        for (dst, w) in self
+            .weight_data_mut()
+            .as_chunks_mut::<FIXED_REGION_BYTES>()
+            .0
+            .iter_mut()
+            .zip(weights)
+        {
+            *dst = w.to_le_bytes();
         }
         self.downgrade();
     }
@@ -555,8 +563,10 @@ impl Batch {
     #[inline]
     pub(crate) fn sum_weights(&self, start: usize, end: usize) -> i64 {
         self.weight_data()[start * FIXED_REGION_BYTES..end * FIXED_REGION_BYTES]
-            .chunks_exact(FIXED_REGION_BYTES)
-            .map(|w| i64::from_le_bytes(w.try_into().unwrap()))
+            .as_chunks::<FIXED_REGION_BYTES>()
+            .0
+            .iter()
+            .map(|w| i64::from_le_bytes(*w))
             .sum()
     }
     /// True iff every row's weight is `> 0` — vacuously true for an empty batch.
@@ -566,8 +576,10 @@ impl Batch {
     pub fn all_weights_positive(&self) -> bool {
         !self
             .weight_data()
-            .chunks_exact(FIXED_REGION_BYTES)
-            .fold(false, |bad, w| bad | (i64::from_le_bytes(w.try_into().unwrap()) <= 0))
+            .as_chunks::<FIXED_REGION_BYTES>()
+            .0
+            .iter()
+            .fold(false, |bad, w| bad | (i64::from_le_bytes(*w) <= 0))
     }
     #[inline(always)]
     pub fn get_null_word(&self, row: usize) -> u64 {

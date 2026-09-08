@@ -398,8 +398,10 @@ impl ReadSpec {
                 // schema-aware gather.
                 let raw = r.take(count * 16)?;
                 let keys = raw
-                    .chunks_exact(16)
-                    .map(|c| u128::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
+                    .map(|c| u128::from_le_bytes(*c))
                     .collect();
                 ReadBound::PkSet(keys)
             }

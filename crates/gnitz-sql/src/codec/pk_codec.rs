@@ -123,8 +123,10 @@ impl NumLit<'_> {
 
 /// The one seam from a bound numeric literal to a [`NumLit`].
 pub(crate) fn bound_num_literal(e: &BoundExpr) -> Option<NumLit<'_>> {
+    if let Some(v) = e.int_literal() {
+        return Some(NumLit::Small(v as i128));
+    }
     match e {
-        BExpr::LitInt(v) => Some(NumLit::Small(*v as i128)),
         BExpr::LitWide(s) => Some(NumLit::Wide(s, false)),
         BExpr::UnaryOp(UnaryOp::Neg, inner) => match inner.as_ref() {
             BExpr::LitWide(s) => Some(NumLit::Wide(s, true)),
@@ -169,6 +171,8 @@ pub(crate) enum KeyLitError {
     OutOfRange,
     /// A string literal against a UUID column that does not spell a UUID.
     BadUuid,
+    /// A string literal against a DATE/TIMESTAMP column that does not spell one.
+    BadTemporal,
     /// A literal of a kind no key is ever spelled by (a string outside UUID).
     NotNumeric,
 }
@@ -181,6 +185,10 @@ pub(crate) enum KeyLitError {
 pub(crate) fn bound_key_literal(lit: BoundLit<'_>, tc: TypeCode) -> Result<u128, KeyLitError> {
     match lit {
         BoundLit::Str(s) if tc == TypeCode::UUID => parse_uuid_str(s).map_err(|_| KeyLitError::BadUuid),
+        BoundLit::Str(s) if tc.is_temporal() => crate::types::temporal_literal(tc, s)
+            .ok()
+            .and_then(|v| pack_pk_value(tc, v as i128))
+            .ok_or(KeyLitError::BadTemporal),
         BoundLit::Str(_) => Err(KeyLitError::NotNumeric),
         BoundLit::Num(n) => pack_num(tc, n).ok_or_else(|| {
             // A PK column's type is PK-eligible: an integer scalar at some
@@ -223,6 +231,7 @@ fn parse_one_pk_literal(c: &Constant, tc: TypeCode, col_name: &str) -> Result<u1
             }
             KeyLitError::OutOfRange => format!("PK column '{col_name}' value is not a valid {tc:?}: {c}"),
             KeyLitError::BadUuid => format!("PK column '{col_name}' value is not a valid UUID: {c}"),
+            KeyLitError::BadTemporal => format!("PK column '{col_name}' value is not a valid date or timestamp: {c}"),
             KeyLitError::NotNumeric => format!("PK column '{col_name}' value must be a numeric literal"),
         })
     })

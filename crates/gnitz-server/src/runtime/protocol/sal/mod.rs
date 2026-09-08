@@ -120,7 +120,10 @@ fn group_total_size(slots: usize, sizes: impl Iterator<Item = u32>) -> usize {
 
 /// A group's directory bytes read back as slot sizes.
 fn dir_sizes(dir: &[u8]) -> impl Iterator<Item = u32> + '_ {
-    dir.chunks_exact(DIR_ENTRY_BYTES).map(|c| read_u32_le(c, 0))
+    dir.as_chunks::<DIR_ENTRY_BYTES>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
 }
 
 /// Which of a group's slots are written, and the request id each answers on.

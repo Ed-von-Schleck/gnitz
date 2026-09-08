@@ -217,7 +217,7 @@ fn decode_wal_block_impl(
         let at = dst.len();
         dst.extend_from_slice(&data[reg_off..reg_off + reg_sz]);
         if gnitz_wire::is_german_string(col.type_code as u8) {
-            for cell in dst[at..].chunks_exact_mut(16) {
+            for cell in dst[at..].as_chunks_mut::<16>().0 {
                 // The cells arrive verbatim, so this is where a heap extent that
                 // overruns the arena — or a padding/prefix skew that would order
                 // two equal values unequal — is stopped, exactly as the engine's

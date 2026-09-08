@@ -9,6 +9,7 @@
 //! selector families, [`SinkKind`] — is declared here too, beside the
 //! encode/decode pair that is its only reader.
 
+use crate::calendar::CalendarOp;
 use crate::like::LikeMatcher;
 use crate::{ColumnLocator, SchemaFacts};
 use gnitz_wire::{encode_german_string, FixedInt, TypeCode};
@@ -76,7 +77,7 @@ pub enum ExprValidateErr {
         out: u32,
         out_tc: u8,
     },
-    EmitSlotNotEightBytes {
+    EmitSlotWidth {
         out: u32,
         type_code: u8,
     },
@@ -268,6 +269,7 @@ gnitz_wire::wire_enum! {
         StrReplace = 43,
         StrPad = 44,
         StrSplitPart = 45,
+        Calendar = 46,
     }
 }
 
@@ -539,6 +541,13 @@ pub enum LogicalInstr {
     IntUnary {
         op: IntUnaryOp,
         a: Reg,
+    },
+    /// A calendar transform of a temporal register, read as microseconds when
+    /// `micros` and as days otherwise. The two conversion ops may yield NULL.
+    Calendar {
+        op: CalendarOp,
+        a: Reg,
+        micros: bool,
     },
     /// Truncate-toward-zero float→int cast with a range check against `fi`.
     /// NaN, ±∞ and an out-of-range truncated value all produce NULL.
@@ -849,6 +858,12 @@ pub(crate) enum Instr {
         a: u16,
         signed: bool,
     },
+    Calendar {
+        op: CalendarOp,
+        dst: u16,
+        a: u16,
+        micros: bool,
+    },
     /// `fi` is the fixed-int target `decode_instr` narrowed the wire selector
     /// to, so the kernel's bounds lookup is total.
     FloatToInt {
@@ -1060,6 +1075,20 @@ pub(crate) struct IntReg {
 }
 
 impl LogicalInstr {
+    /// The width this instruction range-checks its result into, for the casts
+    /// that do — a value they produce is whole in that many low bytes, which is
+    /// what lets [`check_emit_slot`] admit a slot narrower than the register.
+    /// `None` for every other instruction: a register is otherwise the full
+    /// 8-byte image and narrowing it would truncate.
+    fn range_checked_width(&self) -> Option<usize> {
+        match *self {
+            LogicalInstr::IntCast { fi, .. }
+            | LogicalInstr::FloatToInt { fi, .. }
+            | LogicalInstr::StrToInt { fi, .. } => Some(fi.width()),
+            _ => None,
+        }
+    }
+
     /// Serialise to the wire instruction `[op, selector, a1, a2, a3]`, the exact
     /// inverse of [`LogicalProgram::decode_instr`] — the two are the only
     /// statements of the word layout, held together by the round-trip test.
@@ -1085,6 +1114,7 @@ impl LogicalInstr {
             L::IntToFloat { a } => un(ExprOp::IntToFloat, 0, a),
             L::FloatUnary { op, a } => un(ExprOp::FloatUnary, op.as_wire(), a),
             L::IntUnary { op, a } => un(ExprOp::IntUnary, op.as_wire(), a),
+            L::Calendar { op, a, micros } => [ExprOp::Calendar.as_wire(), op.as_wire(), a.0 as u32, micros as u32, 0],
             L::FloatToInt { a, fi } => un(ExprOp::FloatToInt, fi.type_code() as u32, a),
             L::IntCast { a, fi } => un(ExprOp::IntCast, fi.type_code() as u32, a),
             L::FloatToF32 { a } => un(ExprOp::FloatToF32, 0, a),
@@ -1436,6 +1466,11 @@ impl LogicalProgram {
                 op: IntUnaryOp::from_wire(sel).ok_or_else(bad_sel)?,
                 a,
             },
+            ExprOp::Calendar => L::Calendar {
+                op: CalendarOp::from_wire(sel).ok_or_else(bad_sel)?,
+                a,
+                micros: flag(opw, w(3))?,
+            },
             // `cast_target` sees the full u32: a forged high-bit selector must be
             // rejected, not silently truncated into a valid type code.
             ExprOp::FloatToInt => L::FloatToInt { a, fi: cast_target(opw, sel)? },
@@ -1572,7 +1607,7 @@ impl LogicalProgram {
         let mut cell_slots: Vec<Option<u32>> = vec![None; self.const_strings.len()];
         let mut copies: Vec<(ColumnLocator, u32, u8)> = Vec::with_capacity(self.output.slots().len());
         // Split where the class is in hand, so nothing later re-tests it.
-        let mut scalar_emits: Vec<(u16, u32)> = Vec::new();
+        let mut scalar_emits: Vec<(u16, u32, u8)> = Vec::new();
         let mut str_emits: Vec<(u16, u32)> = Vec::new();
         // Off the instruction stream for the reason `copies` is: a constant
         // register names no computation, and each stream entry would cost the
@@ -1608,14 +1643,14 @@ impl LogicalProgram {
                 Sink::Col(src_col) => {
                     // The same destination type code `check_copy_types` approved
                     // the widening against; its `wire_stride` is the copy width.
-                    let stride = out_schema.map_or(0, |os| {
-                        gnitz_wire::wire_stride(os.col_type_code(os.payload_col_idx(out as usize))) as u8
-                    });
+                    // No output schema means no copy runs, so the width is unread.
+                    let stride = out_schema.map_or(0, |os| slot_stride(os, out));
                     copies.push((schema.locate(src_col as usize), out, stride));
                 }
                 Sink::Reg(r) => match (str_class >> r.0) & 1 != 0 {
                     true => str_emits.push((r.0, out)),
-                    false => scalar_emits.push((r.0, out)),
+                    // The register image's own width, absent a schema to narrow it.
+                    false => scalar_emits.push((r.0, out, out_schema.map_or(8, |os| slot_stride(os, out)))),
                 },
             }
         }
@@ -1671,6 +1706,7 @@ impl LogicalProgram {
                 L::FCmp { op, a: Reg(a), b: Reg(b) } => I::FCmp { op, dst, a, b },
                 L::FloatUnary { op, a: Reg(a) } => I::FloatUnary { op, dst, a },
                 L::IntUnary { op, a: Reg(a) } => I::IntUnary { op, dst, a, signed: !is_u64(a) },
+                L::Calendar { op, a: Reg(a), micros } => I::Calendar { op, dst, a, micros },
                 L::FloatToF32 { a: Reg(a) } => I::FloatToF32 { dst, a },
                 // Total on a validated program, the `LoadColInt` shape above:
                 L::FloatToInt { a: Reg(a), fi } => I::FloatToInt { dst, a, fi },
@@ -1912,7 +1948,9 @@ impl LogicalProgram {
                         check_copy_types(in_schema, os, src_col, out)?;
                     }
                     // The source register's class picks which slot rule applies.
-                    Sink::Reg(r) => check_emit_slot(os, out, (self.str_class >> r.0) & 1 != 0)?,
+                    Sink::Reg(r) => {
+                        check_emit_slot(os, out, (self.str_class >> r.0) & 1 != 0, &self.instrs[r.0 as usize])?
+                    }
                 }
             }
         }
@@ -2220,6 +2258,14 @@ fn operands(li: &LogicalInstr) -> Operands {
             IntUnaryOp::Neg | IntUnaryOp::Abs => writes(WVal(FromOperands)).reading(a, RVal),
         },
         L::FloatUnary { op: _, a } | L::IntToFloat { a } => writes(WVal(Fixed(false))).reading(a, RVal),
+        L::Calendar { op, a, micros: _ } => {
+            let ops = writes(WVal(Fixed(false))).reading(a, RVal);
+            if op.may_null() {
+                ops.may_null()
+            } else {
+                ops
+            }
+        }
         // The three narrowing casts yield NULL on an out-of-range value.
         L::FloatToF32 { a } => writes(WVal(Fixed(false))).reading(a, RVal).may_null(),
         L::FloatToInt { a, fi } | L::IntCast { a, fi } => {
@@ -2334,7 +2380,9 @@ fn cast_target(op: u32, selector: u32) -> Result<FixedInt, ExprValidateErr> {
     u8::try_from(selector)
         .ok()
         .and_then(TypeCode::try_from_u8)
-        .and_then(FixedInt::from_type_code)
+        // A temporal code names no cast target of its own: the encoder spells
+        // the storage type, so a decoded selector must be one too.
+        .and_then(|tc| FixedInt::from_type_code(tc).filter(|fi| fi.type_code() == tc))
         .ok_or(ExprValidateErr::BadSelector { op, selector })
 }
 
@@ -2410,23 +2458,48 @@ fn check_copy_types(
 /// 8-byte image.
 ///
 /// Within the scalar half this stays a *stride* rule rather than a type rule —
-/// `I64`, `U64` and `F64` are all legal targets, and no narrowing (which
-/// truncates an i64 and shears an f64) or widening (which runs off the end of
-/// `to_le_bytes()`) is admitted. Both scalar tests are needed and their order
-/// does not matter: `wire_stride` reports 8 for an undecodable type code, so the
-/// width test alone would admit one.
-fn check_emit_slot(out_schema: &dyn SchemaFacts, out: u32, is_str: bool) -> Result<(), ExprValidateErr> {
-    // `col_type_code`, like its two sibling checks — not `locate`, whose extra
-    // work (a release-active bound assert, plus an O(pk_count) OPK-offset walk
-    // for a PK column) buys nothing here: `size()` IS `wire_stride(type_code)`.
-    let type_code = out_schema.col_type_code(out_schema.payload_col_idx(out as usize));
+/// `I64`, `U64` and `F64` are all legal targets, and widening (which runs off
+/// the end of `to_le_bytes()`) is never admitted. Narrowing is admitted for one
+/// shape only: a fixed-int slot whose source register is a range-checking cast
+/// to exactly that width, so the low bytes stored are the whole value. Both
+/// scalar tests are needed and their order does not matter: `wire_stride`
+/// reports 8 for an undecodable type code, so the width test alone would admit
+/// one.
+fn check_emit_slot(
+    out_schema: &dyn SchemaFacts,
+    out: u32,
+    is_str: bool,
+    src: &LogicalInstr,
+) -> Result<(), ExprValidateErr> {
+    let type_code = slot_type_code(out_schema, out);
     if is_str != gnitz_wire::is_german_string(type_code) {
         return Err(ExprValidateErr::EmitClassMismatch { out, type_code });
     }
-    if !is_str && (!gnitz_wire::is_valid_type_code(type_code) || gnitz_wire::wire_stride(type_code) != 8) {
-        return Err(ExprValidateErr::EmitSlotNotEightBytes { out, type_code });
+    if is_str {
+        return Ok(());
+    }
+    let stride = gnitz_wire::wire_stride(type_code);
+    // A narrower slot takes the register's low bytes, which are the whole value
+    // exactly when the producer range-checked it to that width and the slot
+    // holds an integer — a float or a wide code would be sheared.
+    let narrowed = gnitz_wire::is_fixed_int(type_code) && src.range_checked_width() == Some(stride);
+    if !gnitz_wire::is_valid_type_code(type_code) || (stride != 8 && !narrowed) {
+        return Err(ExprValidateErr::EmitSlotWidth { out, type_code });
     }
     Ok(())
+}
+
+/// The type code of output payload slot `out`. `col_type_code`, like the emit
+/// and copy checks — not `locate`, whose extra work (a release-active bound
+/// assert, plus an O(pk_count) OPK-offset walk for a PK column) buys nothing
+/// here: `size()` IS `wire_stride(type_code)`.
+fn slot_type_code(os: &dyn SchemaFacts, out: u32) -> u8 {
+    os.col_type_code(os.payload_col_idx(out as usize))
+}
+
+/// The byte width output payload slot `out` is written at.
+fn slot_stride(os: &dyn SchemaFacts, out: u32) -> u8 {
+    gnitz_wire::wire_stride(slot_type_code(os, out)) as u8
 }
 
 /// The `ExprOp::IntInSet` const-pool layout, `N × 8-byte LE`, stated once for
@@ -2440,8 +2513,10 @@ fn int_set_len_ok(len: usize) -> bool {
 fn decode_int_set(bytes: &[u8]) -> Vec<i64> {
     debug_assert!(int_set_len_ok(bytes.len()), "construction rejects a misaligned pool");
     bytes
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
         .collect()
 }
 
@@ -2539,8 +2614,8 @@ pub(crate) struct ResolvedProgram {
     /// permutation a map drives, so no consumer rebuilds it.
     pub(crate) null_perm: NullPerm,
     /// A map's computed columns whose source register holds a scalar, as
-    /// `(source register, output payload slot)`.
-    pub(crate) scalar_emits: Vec<(u16, u32)>,
+    /// `(source register, output payload slot, slot stride)`.
+    pub(crate) scalar_emits: Vec<(u16, u32, u8)>,
     /// The same for the string-register sinks. Two lists rather than one plus a
     /// seam: the class is in hand where the sinks are walked, and each writer
     /// wants only its own half.

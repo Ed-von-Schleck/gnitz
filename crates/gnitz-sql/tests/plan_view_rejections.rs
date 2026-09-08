@@ -491,12 +491,6 @@ fn projection_and_envelope_rules() {
             ("SELECT * RENAME (g AS v) FROM t", "Plan", "duplicate column name"),
             ("SELECT * REPLACE (g + 1 AS g) FROM t", "Unsupported", "REPLACE"),
             ("SELECT * ILIKE 'g%' FROM t", "Unsupported", "ILIKE"),
-            // an unbound form is echoed as the SQL written, not a parser dump
-            (
-                "SELECT id FROM t WHERE EXTRACT(YEAR FROM g) = 1",
-                "Unsupported",
-                "EXTRACT(YEAR FROM g)",
-            ),
             (
                 "WITH c AS (SELECT * REPLACE (g + 1 AS g) FROM t) SELECT * FROM c",
                 "Unsupported",

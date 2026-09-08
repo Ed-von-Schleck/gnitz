@@ -14,6 +14,7 @@ use crate::test_support::{
     filter_prog, is_not_null_op, is_null_op, make_int_view, make_string_view, map_prog, row_value, scalar_prog,
     schema_pk_ints, schema_pk_strings, TestSchema, TestView,
 };
+use crate::CalendarOp;
 use crate::{
     CmpOp, ColumnLocator, ConstIdx, Evaluator, ExprValidateErr, FloatArithOp, Instr, IntArithOp, LogicalInstr,
     LogicalProgram, NullPerm, Output, Reg, Sink,
@@ -33,7 +34,7 @@ fn eval_with_emit(ev: &Evaluator, mb: &TestView, row: usize) -> (u64, Vec<i64>) 
     let mut emit_vals: Vec<i64> = Vec::new();
     let mut emit_null_mask: u64 = 0;
     ev.eval_morsels(mb, row, 1, |_, out| {
-        for &(src, payload) in ev.scalar_emits() {
+        for &(src, payload, _) in ev.scalar_emits() {
             let mut is_null = false;
             out.for_each_null_row(src as usize, |_| is_null = true);
             if is_null {
@@ -1015,7 +1016,7 @@ fn a_register_sink_slot_must_be_eight_bytes() {
     for tc in [type_code::U128, type_code::F32] {
         assert_eq!(
             case(tc),
-            Err(ExprValidateErr::EmitSlotNotEightBytes { out: 0, type_code: tc }),
+            Err(ExprValidateErr::EmitSlotWidth { out: 0, type_code: tc }),
             "type code {tc}"
         );
     }
@@ -1821,7 +1822,7 @@ fn string_nullability_classification() {
 /// carries no per-variant data, so there is no index bookkeeping to keep dense;
 /// `mem::discriminant` does the counting.
 impl LogicalInstr {
-    pub(crate) const VARIANT_COUNT: usize = 45;
+    pub(crate) const VARIANT_COUNT: usize = 46;
 
     /// Exhaustive by construction — the compile error on a new variant is the
     /// whole point, so this must never gain a `_` arm.
@@ -1839,6 +1840,7 @@ impl LogicalInstr {
             | L::IntToFloat { .. }
             | L::FloatUnary { .. }
             | L::IntUnary { .. }
+            | L::Calendar { .. }
             | L::FloatToInt { .. }
             | L::IntCast { .. }
             | L::FloatToF32 { .. }
@@ -2015,6 +2017,10 @@ fn every_variant() -> Vec<LogicalInstr> {
     for op in [IntUnaryOp::Neg, IntUnaryOp::Abs, IntUnaryOp::Sign] {
         v.push(L::IntUnary { op, a: Reg(116) });
     }
+    for op in CalendarOp::ALL {
+        v.push(L::Calendar { op: *op, a: Reg(117), micros: false });
+        v.push(L::Calendar { op: *op, a: Reg(118), micros: true });
+    }
     for op in [
         FloatUnaryOp::Neg,
         FloatUnaryOp::Abs,
@@ -2086,8 +2092,10 @@ fn every_instruction_round_trips_through_the_wire_form() {
     // `from_wire` runs the structure-only validation, which this deliberately
     // ill-formed fixture cannot pass — so decode the instructions directly.
     let got: Vec<LogicalInstr> = gnitz_wire::as_le_bytes(&words)
-        .chunks_exact(20)
-        .map(|t| LogicalProgram::decode_instr(t.try_into().unwrap()).expect("to_wire emits a decodable opcode"))
+        .as_chunks::<20>()
+        .0
+        .iter()
+        .map(|t| LogicalProgram::decode_instr(t).expect("to_wire emits a decodable opcode"))
         .collect();
     assert_eq!(got, want);
 }

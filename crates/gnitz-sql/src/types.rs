@@ -1,6 +1,6 @@
 use crate::error::GnitzSqlError;
 use gnitz_core::TypeCode;
-use sqlparser::ast::{DataType, ExactNumberInfo};
+use sqlparser::ast::{DataType, ExactNumberInfo, TimezoneInfo};
 
 pub(crate) fn sql_type_to_typecode(dt: &DataType) -> Result<TypeCode, GnitzSqlError> {
     match dt {
@@ -16,6 +16,14 @@ pub(crate) fn sql_type_to_typecode(dt: &DataType) -> Result<TypeCode, GnitzSqlEr
         DataType::Double(_) | DataType::DoublePrecision | DataType::Real => Ok(TypeCode::F64),
         DataType::Varchar(_) | DataType::Text | DataType::Char(_) => Ok(TypeCode::String),
         DataType::Uuid => Ok(TypeCode::UUID),
+        DataType::Date => Ok(TypeCode::Date),
+        // `TIMESTAMP_NTZ` says "no time zone", which is the one form supported.
+        DataType::Timestamp(_, TimezoneInfo::None) | DataType::Datetime(_) | DataType::TimestampNtz(_) => {
+            Ok(TypeCode::Timestamp)
+        }
+        DataType::Timestamp(..) => Err(GnitzSqlError::Unsupported(
+            "a TIMESTAMP carries no time zone here; write TIMESTAMP without one".to_string(),
+        )),
         // DECIMAL(p,0) with p in {38,39} maps to U128.
         // DECIMAL(38,0) is the common idiom for 128-bit integers (used by Spark, etc.).
         // DECIMAL(39,0) covers the full u128 range (u128::MAX has 39 decimal digits).
@@ -59,6 +67,17 @@ pub(crate) fn serial_underlying(dt: &DataType) -> Option<TypeCode> {
 // and the lowerer (ColRef rejection) query. gnitz_core already owns `is_float`
 // / `is_german_string`; these add the sets it does not.
 // ---------------------------------------------------------------------------
+
+/// A `DATE '…'` / `TIMESTAMP '…'` literal, or a string written into a
+/// temporal column, as the integer the column stores.
+pub(crate) fn temporal_literal(tc: TypeCode, s: &str) -> Result<i64, GnitzSqlError> {
+    let v = match tc {
+        TypeCode::Date => gnitz_expr::calendar::parse_date(s).map(i64::from),
+        TypeCode::Timestamp => gnitz_expr::calendar::parse_timestamp(s),
+        _ => unreachable!("temporal_literal over a non-temporal type"),
+    };
+    v.ok_or_else(|| GnitzSqlError::Bind(format!("invalid {} literal: {s:?}", tc.wire_name())))
+}
 
 /// Whether a value of this type fits the expression VM's 8-byte *scalar*
 /// register — [`gnitz_core::ScalarKind`], the same classification the engine's

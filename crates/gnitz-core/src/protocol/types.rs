@@ -729,7 +729,7 @@ impl ZSetBatch {
             let at = self.columns[ci].len();
             self.columns[ci].append(&mut other.columns[ci]);
             if gnitz_wire::is_german_string(col.type_code as u8) && delta != 0 {
-                for cell in self.columns[ci][at..].chunks_exact_mut(16) {
+                for cell in self.columns[ci][at..].as_chunks_mut::<16>().0 {
                     gnitz_wire::shift_german_string_heap(cell, delta);
                 }
             }

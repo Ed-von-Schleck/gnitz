@@ -70,12 +70,20 @@ fn make_test_worker(catalog: *mut CatalogEngine, writer: W2mWriter) -> WorkerPro
 /// The reply route every helper below takes, in the order `dispatch_inner`
 /// resolves it. Inline-emitting; [`fifo_route`] is the queued twin.
 fn route(target_id: u64, request_id: u64, client_id: u64) -> ReplyRoute {
-    ReplyRoute { target_id, request_id, client_id, fifo: false }
+    ReplyRoute {
+        target_id,
+        request_id,
+        client_id,
+        fifo: false,
+    }
 }
 
 /// [`route`] for a group the master wrote as one of several.
 fn fifo_route(target_id: u64, request_id: u64, client_id: u64) -> ReplyRoute {
-    ReplyRoute { fifo: true, ..route(target_id, request_id, client_id) }
+    ReplyRoute {
+        fifo: true,
+        ..route(target_id, request_id, client_id)
+    }
 }
 
 /// One SAL group as the matrix tests hand it to `dispatch`: a kind, a
@@ -491,7 +499,11 @@ fn force_fifo_decides_whether_a_fitting_reply_emits_inline_or_queues() {
         let ptr = region.ptr();
         let mut wp = make_test_worker(std::ptr::null_mut(), writer);
 
-        let r = if force_fifo { fifo_route(1, 3, 0) } else { route(1, 3, 0) };
+        let r = if force_fifo {
+            fifo_route(1, 3, 0)
+        } else {
+            route(1, 3, 0)
+        };
         wp.send_shared_scan_response(r, Rc::new(make_n_row_batch(schema, 5)), ReplySchema::ClientAuthored, 0);
 
         if force_fifo {

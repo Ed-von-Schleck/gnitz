@@ -1511,8 +1511,10 @@ fn reject_not_null_bits(b: &Batch, schema: &SchemaDescriptor) -> Result<(), &'st
     // same contiguous count-bounded region as `Batch::all_weights_positive`.
     let acc = b
         .null_bmp_data()
-        .chunks_exact(8)
-        .fold(0u64, |a, w| a | u64::from_le_bytes(w.try_into().unwrap()));
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .fold(0u64, |a, w| a | u64::from_le_bytes(*w));
     if acc & not_null != 0 {
         return Err("client batch sets a null bit on a NOT NULL column");
     }
@@ -2309,20 +2311,21 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
             plans.push(ScanMultiRelPlan { tid, server_version, block });
         }
         let disp = shared.disp();
-        let (dispatches, _) = dispatch_scan_multi_fanout(disp, &shared.reactor, &fanout, |i, targets, wire_flags, _| {
-            let plan = &plans[i];
-            disp.write_group(&DirectGroup {
-                template: ipc::WireMsg {
-                    target_id: plan.tid as u64,
-                    client_id,
-                    flags: gnitz_wire::wire_flags_set_schema_version(wire_flags, plan.server_version),
-                    ..Default::default()
-                },
-                targets,
-                ..DirectGroup::new(SalMessageKind::Scan)
+        let (dispatches, _) =
+            dispatch_scan_multi_fanout(disp, &shared.reactor, &fanout, |i, targets, wire_flags, _| {
+                let plan = &plans[i];
+                disp.write_group(&DirectGroup {
+                    template: ipc::WireMsg {
+                        target_id: plan.tid as u64,
+                        client_id,
+                        flags: gnitz_wire::wire_flags_set_schema_version(wire_flags, plan.server_version),
+                        ..Default::default()
+                    },
+                    targets,
+                    ..DirectGroup::new(SalMessageKind::Scan)
+                })
             })
-        })
-        .await?;
+            .await?;
         // Release the catalog read lock here: Phase 2 touches no catalog state
         // (the snapshot is worker-frozen and the schemas are captured), so
         // holding it across the whole bulk read would needlessly block DDL.

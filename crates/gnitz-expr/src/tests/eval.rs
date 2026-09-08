@@ -53,7 +53,7 @@ fn a_resolved_map_reports_its_copies_emits_and_null_perm() {
 
     assert!(ev.emits_anything(), "this map writes two slots out of the registers");
     // The scalar and string emits are two halves of one list, split by class.
-    assert_eq!(ev.scalar_emits(), &[(0, 1)]);
+    assert_eq!(ev.scalar_emits(), &[(0, 1, 8)]);
     assert_eq!(ev.str_emits(), &[(1, 2)]);
     // One verbatim move: input column 1 into output slot 0, at the output width.
     let copies: Vec<(u32, u8)> = ev.copies().iter().map(|&(_, out, w)| (out, w)).collect();
@@ -802,7 +802,7 @@ fn not_null_load_arms_agree_and_report_no_null() {
                 if is_str {
                     vals.extend((0..out.rows()).map(|i| out.str_bytes(reg, i).to_vec()));
                 } else {
-                    vals.extend(out.reg_bytes(reg).chunks_exact(8).map(<[u8]>::to_vec));
+                    vals.extend(out.reg_bytes(reg).as_chunks::<8>().0.iter().map(|c| c.to_vec()));
                 }
                 out.for_each_null_row(reg, |i| {
                     panic!("{name}: row {i} of a NOT NULL load must never report NULL")

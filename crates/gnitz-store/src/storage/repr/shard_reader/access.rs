@@ -286,9 +286,8 @@ impl MappedShard {
         // Force every payload column this file predates to NULL, the same way
         // `get_null_word` does for the per-row path. No-op for a full-width shard.
         if self.null_pad_mask != 0 {
-            for word in null_dst.chunks_exact_mut(8) {
-                let padded = read_u64_le(word, 0) | self.null_pad_mask;
-                word.copy_from_slice(&padded.to_le_bytes());
+            for word in null_dst.as_chunks_mut::<8>().0 {
+                *word = (u64::from_le_bytes(*word) | self.null_pad_mask).to_le_bytes();
             }
         }
 
@@ -319,7 +318,7 @@ impl MappedShard {
                 }
                 let off = offsets[REG_PAYLOAD_START + pi];
                 let dst = &mut data[off..off + row_count * 16];
-                for (i, cell) in dst.chunks_exact_mut(16).enumerate() {
+                for (i, cell) in dst.as_chunks_mut::<16>().0.iter_mut().enumerate() {
                     // Read through `get_col_ptr` so every `PayloadRegion` form —
                     // `Direct` (per-row or constant-stride), `Packed`, `Absent` —
                     // is handled the same way the bulk fill handles them.

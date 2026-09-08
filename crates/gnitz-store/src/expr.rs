@@ -296,8 +296,8 @@ fn reindex_hash_row(output: &mut Batch, branch_id: u8) {
         // Straight into the PK region, hoisted once per chunk: the borrow dance
         // above is what forces the chunking, not a per-row accessor.
         let pk = &mut output.pk_data_mut()[start * KEY_BYTES..end * KEY_BYTES];
-        for (key, dst) in keys.iter().zip(pk.chunks_exact_mut(KEY_BYTES)) {
-            dst.copy_from_slice(&key.to_be_bytes());
+        for (key, dst) in keys.iter().zip(pk.as_chunks_mut::<KEY_BYTES>().0) {
+            *dst = key.to_be_bytes();
         }
         start = end;
     }
@@ -644,13 +644,13 @@ impl MapPlan {
                 // to 2 KiB — unlike `NullPerm`'s per-row loop, where the call
                 // would land per (row × pair).
                 let row0 = dst_base + morsel_start;
-                for &(reg, out_payload) in self.ev.scalar_emits() {
+                for &(reg, out_payload, stride) in self.ev.scalar_emits() {
                     let (reg, out_payload) = (reg as usize, out_payload as usize);
                     // One split borrow: the value slots and this column's bit in
                     // the row-major NULL bitmap are written in the same pass over
                     // the null rows.
                     let (col, nb, _) = output.col_null_and_blob_mut(out_payload);
-                    out.emit_scalar_cells(reg, col, nb, row0, out_payload);
+                    out.emit_scalar_cells(reg, col, nb, row0, out_payload, stride as usize);
                 }
 
                 // String emits. Two passes inside the emit rather than a per-row
