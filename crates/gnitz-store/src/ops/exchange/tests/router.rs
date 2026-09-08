@@ -102,8 +102,7 @@ fn test_scatter_key_packed_matches_legacy_routing() {
         b.extend_pk(1u128);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        let gs = gnitz_wire::encode_german_string(b"abc", &mut b.blob);
-        b.extend_col(0, &gs);
+        b.extend_col_blob(0, b"abc");
         b.count += 1;
         b.extend_pk(2u128);
         b.extend_weight(&1i64.to_le_bytes());

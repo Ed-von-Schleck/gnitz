@@ -585,8 +585,7 @@ fn make_range_batch(schema: &SchemaDescriptor, rows: &[(Vec<u64>, u64, i64, i64)
         if wide {
             b.extend_col(1, &val.wrapping_mul(3).to_le_bytes());
             let s = FIXTURE_STRINGS[val.rem_euclid(FIXTURE_STRINGS.len() as i64) as usize];
-            let cell = gnitz_wire::encode_german_string(s, &mut b.blob);
-            b.extend_col(2, &cell);
+            b.extend_col_blob(2, s);
         }
         b.count += 1;
     }

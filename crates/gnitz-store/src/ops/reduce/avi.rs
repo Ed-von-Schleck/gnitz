@@ -6,23 +6,74 @@
 //! ingest — that batch's own sort-and-consolidate plus a memtable push — on top
 //! of the reduce's own group sort. `MIN(a), MAX(a), MIN(b)` triples it.
 
-use crate::schema::key::ReindexPacker;
-use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
-use crate::storage::{Batch, ReadCursor, Table};
+use crate::schema::key::{leading_u64, ReindexPacker};
+use crate::schema::{type_code, ColumnLocator, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
+use crate::storage::{payload_bytes, Batch, ReadCursor, Table};
 use gnitz_expr::RowSource;
+use gnitz_wire::{ScalarKind, WideKind};
 
-use super::agg::{Accumulator, ExtremeSpec};
+use super::agg::{wide_native, Accumulator, ExtremeKind, ExtremeSpec};
 
 /// The index's value image for one aggregate's column in `row`: the column's
 /// order-preserving image, inverted for a MAX ordinal so the index's ascending
 /// walk yields that ordinal's extreme first.
 #[inline]
-fn av_encode(spec: &ExtremeSpec, src: &impl RowSource, row: usize) -> u64 {
-    let v = spec.loc.order_bits(src, row, spec.kind);
-    if spec.for_max {
+fn av_encode(loc: &ColumnLocator, kind: ScalarKind, for_max: bool, src: &impl RowSource, row: usize) -> u64 {
+    let v = loc.order_bits(src, row, kind);
+    if for_max {
         !v
     } else {
         v
+    }
+}
+
+/// The order image of one wide value: the OPK bytes of a 16-byte integer, or a
+/// **prefix-free** byte string (`0x00` escaped to `0x00 0xFF`, `0x00 0x00`
+/// appended). Prefix-freeness is what lets the MAX complement reverse the order
+/// exactly and a truncated [`leading_u64`] window still order.
+fn wide_image(kind: WideKind, for_max: bool, native: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    match kind {
+        WideKind::Fixed(tc) => {
+            out.resize(16, 0);
+            gnitz_wire::encode_pk_column(native, tc as u8, out);
+        }
+        WideKind::Bytes => {
+            for &b in native {
+                out.push(b);
+                if b == 0 {
+                    out.push(0xFF);
+                }
+            }
+            out.extend_from_slice(&[0, 0]);
+        }
+    }
+    if for_max {
+        out.iter_mut().for_each(|b| *b = !*b);
+    }
+}
+
+/// [`wide_image`]'s inverse: the native bytes back out of an index image.
+fn wide_native_of_image(kind: WideKind, for_max: bool, image: &[u8]) -> Vec<u8> {
+    let mut v = image.to_vec();
+    if for_max {
+        v.iter_mut().for_each(|b| *b = !*b);
+    }
+    match kind {
+        WideKind::Fixed(tc) => gnitz_wire::decode_pk_column_owned(&v, tc as u8).to_vec(),
+        WideKind::Bytes => {
+            debug_assert!(v.ends_with(&[0, 0]), "a byte-string image ends in its terminator");
+            let n = v.len() - 2;
+            let (mut r, mut w) = (0, 0);
+            while r < n {
+                let b = v[r];
+                v[w] = b;
+                w += 1;
+                r += if b == 0 { 2 } else { 1 };
+            }
+            v.truncate(w);
+            v
+        }
     }
 }
 
@@ -35,8 +86,13 @@ fn av_encode(spec: &ExtremeSpec, src: &impl RowSource, row: usize) -> u64 {
 /// `MIN(a)` and `MAX(a)` coexist with no collision, and within an ordinal the
 /// `for_max` encoding sorts the extreme first.
 const ORDINAL_COL: SchemaColumn = SchemaColumn::new(type_code::U8, 0);
-/// The order-encoded aggregate value: [`av_encode`] always emits a `u64`.
+/// The order-encoded aggregate value: [`av_encode`]'s `u64`, or a wide
+/// ordinal's leading image bytes — never read back there, but spreading one
+/// ordinal's entries over many PKs so the linear equal-PK walks stay short.
 const VALUE_COL: SchemaColumn = SchemaColumn::new(type_code::U64, 0);
+/// A wide ordinal's whole image, and the order the seek follows: a BLOB payload
+/// sorts by content. Pushed only when a wide ordinal exists.
+const WIDE_COL: SchemaColumn = SchemaColumn::new(type_code::BLOB, 0);
 /// What the AVI appends behind a group key. The schema pushes exactly this, and
 /// it is also the reservation `new_group_key` packs the group key inside — so
 /// the suffix's width and column count have one definition, not two.
@@ -62,8 +118,8 @@ struct AviAgg {
     /// (row × aggregate) loop.
     spec: ExtremeSpec,
     /// Whether this ordinal's extreme may be folded off the stored output column
-    /// instead of probed. Integer sources only — a float always probes, its
-    /// pre-step cost never having been weighed against the seek it would save.
+    /// instead of probed. A float never is, its pre-step cost never having been
+    /// weighed against the seek it would save.
     trace_foldable: bool,
 }
 
@@ -81,7 +137,8 @@ pub struct AviBake {
 impl AviBake {
     /// Applies the value-index selection to the reduce's *whole* accumulator set
     /// itself, so the ordinal order has one spelling. The index schema is the key
-    /// packer's own key columns then [`SUFFIX`], all PK, no payload.
+    /// packer's own key columns then [`SUFFIX`], all PK, plus [`WIDE_COL`] when
+    /// a wide ordinal needs it.
     ///
     /// The index's key bytes are the group key's, so it inherits
     /// `new_group_key`'s rejections verbatim.
@@ -91,27 +148,28 @@ impl AviBake {
         accs: &[Accumulator],
     ) -> Result<Self, crate::schema::OpBuildErr> {
         let key_packer = ReindexPacker::new_group_key(src, group_by_cols, &SUFFIX)?;
+        let aggs: Vec<AviAgg> = accs
+            .iter()
+            .enumerate()
+            .filter_map(|(k, acc)| {
+                let spec = acc.extreme_index_spec()?;
+                Some(AviAgg {
+                    acc_idx: k as u8,
+                    trace_foldable: !matches!(spec.kind, ExtremeKind::Scalar(k) if k.is_float()),
+                    spec,
+                })
+            })
+            .collect();
         let mut b = crate::schema::DerivedSchema::new();
         for c in key_packer.key_columns().chain(SUFFIX) {
             b.push_pk(c)
                 .expect("a group key packed inside the SUFFIX reservation, plus SUFFIX, is non-null PK-eligible");
         }
-        Ok(AviBake {
-            schema: b.finish(),
-            key_packer,
-            aggs: accs
-                .iter()
-                .enumerate()
-                .filter_map(|(k, acc)| {
-                    let spec = acc.extreme_index_spec()?;
-                    Some(AviAgg {
-                        acc_idx: k as u8,
-                        trace_foldable: !spec.kind.is_float(),
-                        spec,
-                    })
-                })
-                .collect(),
-        })
+        if aggs.iter().any(|a| matches!(a.spec.kind, ExtremeKind::Wide(_))) {
+            b.push(WIDE_COL)
+                .expect("one payload column fits behind a PK-only schema");
+        }
+        Ok(AviBake { schema: b.finish(), key_packer, aggs })
     }
 
     /// Whether any ordinal can take the probe-skip path — the gate on
@@ -161,15 +219,24 @@ impl AviBake {
     pub(super) fn seed_extreme(&self, cur: &mut ReadCursor, key: &mut [u8], ord: usize, acc: &mut Accumulator) {
         let spec = &self.aggs[ord].spec;
         let prefix = self.prefix(key, ord as u8);
-        if cur.seek_first_positive_with_prefix(prefix) {
-            // Entries sort by (group, ordinal, av) and `av_encode` puts this
-            // ordinal's extreme first, so the first positive entry under the
-            // prefix is it — un-invert back to the MIN-oriented image the
-            // accumulator holds.
-            let av = Self::av_of(cur.current_pk_bytes(), prefix.len());
-            acc.seed_encoded_extreme(if spec.for_max { !av } else { av });
-        } else {
+        if !cur.seek_first_positive_with_prefix(prefix) {
             acc.reset();
+            return;
+        }
+        // Entries sort by (group, ordinal, av, image) with the MAX complement
+        // putting this ordinal's extreme first, so the first positive entry
+        // under the prefix is it — undo the complement to get what `acc` holds.
+        match spec.kind {
+            ExtremeKind::Scalar(_) => {
+                let av = Self::av_of(cur.current_pk_bytes(), prefix.len());
+                acc.seed_encoded_extreme(if spec.for_max { !av } else { av });
+            }
+            ExtremeKind::Wide(kind) => {
+                // Every key column is PK, so [`WIDE_COL`] is payload slot 0.
+                let (src, row) = cur.current_row_source();
+                let image = payload_bytes(src, row, 0);
+                acc.seed_wide(&wide_native_of_image(kind, spec.for_max, image));
+            }
         }
     }
 
@@ -201,6 +268,7 @@ pub(super) fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
     let mut out = Batch::with_capacity(&bake.schema, (delta.count * bake.aggs.len()).max(1));
 
     let mut key = [0u8; MAX_PK_BYTES];
+    let (mut image, mut scratch) = (Vec::new(), [0u8; 16]);
     for row in 0..delta.count {
         let weight = mb.get_weight(row);
         // A weight-0 row contributes nothing: consolidation drops the entry it
@@ -218,8 +286,24 @@ pub(super) fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
             if a.spec.loc.is_null(&mb, row) {
                 continue;
             }
-            let av = av_encode(&a.spec, &mb, row);
-            out.push_key_row(bake.entry(&mut key, j as u8, av), weight);
+            let ExtremeSpec { loc, kind, for_max } = a.spec;
+            match kind {
+                ExtremeKind::Scalar(kind) => {
+                    let av = av_encode(&loc, kind, for_max, &mb, row);
+                    out.push_zero_filled_row(bake.entry(&mut key, j as u8, av), weight, 0);
+                }
+                ExtremeKind::Wide(kind) => {
+                    wide_image(
+                        kind,
+                        for_max,
+                        wide_native(&loc, kind, &mb, row, &mut scratch),
+                        &mut image,
+                    );
+                    out.begin_row(bake.entry(&mut key, j as u8, leading_u64(&image)), weight);
+                    out.extend_col_blob(0, &image);
+                    out.commit_row(0);
+                }
+            }
         }
     }
     out

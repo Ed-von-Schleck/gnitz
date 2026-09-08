@@ -2,29 +2,34 @@
 
 use crate::schema::ColumnLocator;
 use crate::storage::{Batch, MemBatch};
+use gnitz_wire::WideKind;
 
-use super::agg::Accumulator;
+use super::agg::{Accumulator, AggValue};
 use super::plan::ReducePlan;
 
-/// Emit one aggregate column: its value bits truncated to the column width when
-/// the accumulator holds a value, else its empty-render. An untouched accumulator
-/// renders a concrete `0` (null bit clear) for the zero-identity family — COUNT /
-/// COUNT_NON_NULL / SumZero (`empty_renders_zero`) — and NULL for SUM/MIN/MAX. So
-/// `COUNT(col)` over an all-NULL group renders `0`, not NULL. Used by
-/// `emit_reduce_row`.
+/// Emit one aggregate column: the value truncated to the column width, or the
+/// empty-render when no row contributed — so `COUNT(col)` over an all-NULL group
+/// renders `0`, not NULL.
 #[inline]
 fn emit_agg_col(output: &mut Batch, acc: &Accumulator, out_pi: usize, null_word: &mut u64) {
     let cs = acc.out_size();
-    if acc.is_untouched() {
-        // Never stepped: zero bytes either way. The zero-identity family (COUNT
-        // family / SumZero) leaves the null bit clear so it renders a concrete
-        // `0`; SUM/MIN/MAX flag NULL.
+    let Some(value) = acc.value() else {
+        // Zero bytes either way. The zero-identity family (COUNT family /
+        // SumZero) leaves the null bit clear so it renders a concrete `0`;
+        // SUM/MIN/MAX flag NULL.
         if !acc.empty_renders_zero() {
             gnitz_wire::null_word_set(null_word, out_pi, true);
         }
         output.fill_col_zero(out_pi, cs);
-    } else {
-        output.extend_col(out_pi, &acc.get_value_bits().to_le_bytes()[..cs]);
+        return;
+    };
+    match value {
+        AggValue::Bits(bits) => output.extend_col(out_pi, &bits.to_le_bytes()[..cs]),
+        AggValue::Wide(WideKind::Bytes, v) => output.extend_col_blob(out_pi, v),
+        AggValue::Wide(WideKind::Fixed(_), v) => {
+            debug_assert_eq!(v.len(), cs, "a 16-byte extreme fills its output column");
+            output.extend_col(out_pi, v);
+        }
     }
 }
 

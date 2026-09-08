@@ -120,8 +120,7 @@ fn write_fat_shard(dir: &std::path::Path, name: &str, base: u64, n: u64, width: 
         b.extend_null_bmp(&0u64.to_le_bytes());
         // Vary the body per row so the text carries no run the writer can fold.
         let body: Vec<u8> = (0..width).map(|i| b'a' + ((pk as usize + i) % 26) as u8).collect();
-        let s = gnitz_wire::encode_german_string(&body, &mut b.blob);
-        b.extend_col(0, &s);
+        b.extend_col_blob(0, &body);
         b.count += 1;
     }
     let path = dir.join(name);

@@ -107,8 +107,7 @@ fn build(schema: &SchemaDescriptor, p: Payload, rows: &[Row]) -> Batch {
                 // has repeated spans to collapse — the shape a fan-out join
                 // actually presents it.
                 let s = format!("join-bench-payload-{:05}", ord % 8);
-                let cell = gnitz_wire::encode_german_string(s.as_bytes(), &mut b.blob);
-                b.extend_col(1, &cell);
+                b.extend_col_blob(1, s.as_bytes());
             }
         }
         b.commit_row(null_word);

@@ -118,7 +118,7 @@ fn emit_exists_circuit(
     let sides = join_sides(down, class, *kind, inputs);
 
     // A pure-range correlation (no equality prefix) decides existence from a
-    // MIN/MAX threshold, which has only an 8-byte accumulator.
+    // MIN/MAX threshold row, which is carried only at a ≤8-byte width.
     if let Some(range) = class.range.filter(|_| class.eq.is_empty()) {
         reject_pure_range_threshold_tc(
             range.tc,

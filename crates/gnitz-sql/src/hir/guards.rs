@@ -144,12 +144,9 @@ pub(crate) fn reject_pair_pk_overflow(surface: &str, pa: usize, pb: usize) -> Re
 /// threshold. A RIGHT/FULL pure-range null-fill would need a full second
 /// threshold pipeline (a B-side `m_A = MAX/MIN(a.range)`), a standalone effort.
 ///
-/// LEFT: the inline threshold null-fill reduces the range column with MIN/MAX (an
-/// 8-byte accumulator), then reindexes the result onto the range slot type.
-/// MIN/MAX preserves the source integer type, so any ≤8-byte integer range column
-/// yields a result the reindex consumes directly. A 16-byte U128/UUID/I128 range
-/// column has no 8-byte accumulator — reject up front rather than failing the
-/// compile.
+/// LEFT: the inline threshold null-fill reduces the range column with MIN/MAX,
+/// then reindexes the result onto the range slot type — a pipeline carried end
+/// to end only at ≤8 bytes, see [`reject_pure_range_threshold_tc`].
 pub(crate) fn reject_pure_range_outer(kind: JoinType, range_tc: TypeCode) -> Result<(), GnitzSqlError> {
     if kind.preserves_right() {
         return Err(GnitzSqlError::Unsupported(
@@ -171,12 +168,9 @@ pub(crate) fn reject_pure_range_outer(kind: JoinType, range_tc: TypeCode) -> Res
 }
 
 /// The threshold null-fill's range-column type rule, shared by every pure-range
-/// (`n_eq == 0`) shape that builds one: the threshold `m = MAX/MIN(other.range)` is
-/// an inline MIN/MAX reduce, which has only an 8-byte accumulator, so a 16-byte
-/// U128/UUID/I128 range column has no reduce that can produce it — reject up front
-/// rather than failing the compile. `surface` names the SQL shape and `remedy` the
-/// way out; the rule itself has one home, so a change to the accumulator width is
-/// one edit rather than three.
+/// (`n_eq == 0`) shape that builds one: `m = MAX/MIN(other.range)` is an inline
+/// reduce whose one-row result is reindexed back onto the range slot and probed
+/// as OPK bytes — a chain carried only at ≤8 bytes.
 pub(crate) fn reject_pure_range_threshold_tc(
     range_tc: TypeCode,
     surface: &str,
@@ -185,8 +179,8 @@ pub(crate) fn reject_pure_range_threshold_tc(
     if !gnitz_wire::is_fixed_int(range_tc as u8) {
         return Err(GnitzSqlError::Unsupported(format!(
             "{surface} needs a ≤8-byte integer range column (got {range_tc:?}); its threshold \
-             null-fill reduces the range column with MIN/MAX, which has no 16-byte accumulator \
-             — {remedy}"
+             null-fill reduces the range column with MIN/MAX and reindexes the result back onto \
+             the range slot, which is carried only at that width — {remedy}"
         )));
     }
     Ok(())

@@ -93,8 +93,7 @@ fn test_empty_batch() {
 fn test_map_blob_passthrough_and_fallback() {
     // German-string struct: short (≤12 bytes) inline, else heap-backed.
     fn push_gs(b: &mut Batch, pi: usize, s: &[u8]) {
-        let gs = gnitz_wire::encode_german_string(s, &mut b.blob);
-        b.extend_col(pi, &gs);
+        b.extend_col_blob(pi, s);
     }
     // Input: [U64 PK, STRING s1 (short inline), STRING s2 (long, heap-backed)].
     fn build(schema: &SchemaDescriptor) -> Batch {
@@ -340,8 +339,7 @@ fn make_string_batch(schema: &SchemaDescriptor, rows: &[&[&[u8]]]) -> Batch {
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());
         for (pi, _col) in schema.payload_columns() {
-            let cell = gnitz_wire::encode_german_string(cells[pi], &mut batch.blob);
-            batch.extend_col(pi, &cell);
+            batch.extend_col_blob(pi, cells[pi]);
         }
         batch.count += 1;
     }
@@ -544,8 +542,7 @@ fn hash_row_keys_a_row_by_its_content_across_nulls_strings_and_blobs() {
         batch.extend_null_bmp(&(is_null as u64).to_le_bytes());
         batch.extend_col(0, &v.to_le_bytes());
         for (pi, content) in [(1, s), (2, b)] {
-            let cell = gnitz_wire::encode_german_string(content, &mut batch.blob);
-            batch.extend_col(pi, &cell);
+            batch.extend_col_blob(pi, content);
         }
         batch.count += 1;
     }
@@ -720,8 +717,7 @@ fn map_ranges_bench() {
         // Past SHORT_STRING_THRESHOLD, so every cell is heap-backed and the
         // emit grows the output blob.
         let v = format!("row-{i:012}-payload");
-        let cell = gnitz_wire::encode_german_string(v.as_bytes(), &mut se_batch.blob);
-        se_batch.extend_col(0, &cell);
+        se_batch.extend_col_blob(0, v.as_bytes());
         se_batch.count += 1;
     }
     let se_plan = MapPlan::from_map(

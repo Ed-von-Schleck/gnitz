@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use gnitz_core::{push_zero_cell, ColumnDef, PkColumn, Schema, TypeCode, ZSetBatch, ZSetBatchView};
 use gnitz_expr::{ColumnLocator, Evaluator, ExprResults, SchemaFacts};
-use gnitz_wire::{cmp_typed_le, AggFunc as WireAggFunc, ComputeMap};
+use gnitz_wire::{AggFunc as WireAggFunc, ComputeMap};
 
 use crate::agg::AggSpec;
 use crate::error::GnitzSqlError;
@@ -123,14 +123,10 @@ enum ColAcc {
     /// fold is not shipping rows, so the per-worker split is inherent here. Use an
     /// integer type where exactness matters.
     FloatSum { val: f64, seen: bool },
-    /// MIN / MAX — the winning cell's raw LE bytes (first `wire_stride(tc)` of
-    /// `best`), ordered by the shared `cmp_typed_le` — the same typed order the
-    /// engine accumulator and the client sort sink use.
-    Extreme {
-        best: Option<[u8; 8]>,
-        is_max: bool,
-        tc: TypeCode,
-    },
+    /// MIN / MAX — the row of `partial` holding the winner, ordered by
+    /// `cmp_col_window`. A row index, not a copy: `partial` outlives the fold,
+    /// so a variable-width STRING/BLOB extreme needs no per-group buffer.
+    Extreme { best: Option<usize>, is_max: bool },
 }
 
 impl ColAcc {
@@ -145,16 +141,8 @@ impl ColAcc {
             }
             WireAggFunc::Sum if spec.out_type.is_float() => ColAcc::FloatSum { val: 0.0, seen: false },
             WireAggFunc::Sum => ColAcc::IntSum { bits: 0, seen: false },
-            WireAggFunc::Min => ColAcc::Extreme {
-                best: None,
-                is_max: false,
-                tc: spec.out_type,
-            },
-            WireAggFunc::Max => ColAcc::Extreme {
-                best: None,
-                is_max: true,
-                tc: spec.out_type,
-            },
+            WireAggFunc::Min => ColAcc::Extreme { best: None, is_max: false },
+            WireAggFunc::Max => ColAcc::Extreme { best: None, is_max: true },
         }
     }
 }
@@ -278,7 +266,7 @@ fn fill_group_batch(spec: &FoldShape, partial: &ZSetBatch, reps: &[Option<usize>
     // `pi` is also the column's position in this layout: slots `0..n_group` are
     // the group columns, the rest the agg partials.
     for (pi, ci, col) in schema.payload_columns() {
-        let (tc, w) = (col.type_code, col.type_code.wire_stride());
+        let tc = col.type_code;
         if pi < n_group {
             // A group column keeps its source type, so its cell is copied whole.
             let loc = SchemaFacts::locate(schema, ci);
@@ -295,10 +283,7 @@ fn fill_group_batch(spec: &FoldShape, partial: &ZSetBatch, reps: &[Option<usize>
             // a time), so this column's cells are `n_aggs` apart.
             let k = pi - n_group;
             for g in 0..n {
-                match acc_bits(&accs[g * n_aggs + k]) {
-                    None => push_null_cell(&mut dst.columns[ci], &mut dst.nulls[g], tc, pi),
-                    Some(bits) => push_fixed_bits(&mut dst.columns[ci], bits, w),
-                }
+                push_acc_cell(&mut dst, ci, pi, g, &accs[g * n_aggs + k], partial, tc);
             }
         }
     }
@@ -370,17 +355,16 @@ fn combine(acc: &mut ColAcc, partial: &ZSetBatch, loc: &ColumnLocator, ci: usize
             *val += (w as f64) * f64::from_le_bytes(read_le8(partial, ci, row));
             *seen = true;
         }
-        ColAcc::Extreme { best, is_max, tc } => {
-            let s = tc.wire_stride();
-            let cand = fixed_slice(partial, ci, row, s);
-            let replace = match best {
-                None => true,
-                Some(b) => (cmp_typed_le(cand, &b[..s], *tc as u8) == Ordering::Greater) == *is_max,
-            };
+        ColAcc::Extreme { best, is_max } => {
+            let wanted = if *is_max { Ordering::Greater } else { Ordering::Less };
+            let cell = |row| fixed_slice(partial, ci, row, loc.size());
+            // Both operands live in the same batch, so one blob heap backs both
+            // sides of a German-string comparison.
+            let replace = best.is_none_or(|b| {
+                gnitz_wire::cmp_col_window(cell(row), &partial.blob, cell(b), &partial.blob, loc.type_code()) == wanted
+            });
             if replace {
-                let mut b = [0u8; 8];
-                b[..s].copy_from_slice(cand);
-                *best = Some(b);
+                *best = Some(row);
             }
         }
     }
@@ -389,7 +373,7 @@ fn combine(acc: &mut ColAcc, partial: &ZSetBatch, loc: &ColumnLocator, ci: usize
 fn fixed_slice(partial: &ZSetBatch, ci: usize, row: usize, stride: usize) -> &[u8] {
     partial
         .cell(ci, row, stride)
-        .expect("ad-hoc numeric agg partial column is fixed-width and in range")
+        .expect("ad-hoc agg partial column is fixed-width and in range")
 }
 
 /// One 8-byte partial-aggregate cell; the caller picks how to read it.
@@ -397,19 +381,19 @@ fn read_le8(partial: &ZSetBatch, ci: usize, row: usize) -> [u8; 8] {
     fixed_slice(partial, ci, row, 8).try_into().unwrap()
 }
 
-/// The combined accumulator's register image, or `None` for SQL NULL. NULL for
-/// an uncontributed SUM / MIN / MAX (the global ground row, or an all-NULL
-/// group); counts are always concrete.
-///
-/// Every aggregate column is a Fixed of width `wire_stride(tc)`, and both writers
-/// keep only that many low bytes, so an accumulator's bytes pass through
-/// unchanged — the value never has to be decoded to a number to be re-emitted.
-fn acc_bits(acc: &ColAcc) -> Option<u64> {
-    match acc {
-        ColAcc::IntSum { bits, seen } => seen.then_some(*bits as u64),
-        ColAcc::FloatSum { val, seen } => seen.then(|| val.to_bits()),
-        // `combine` zero-fills above the winning cell's `wire_stride(tc)` bytes.
-        ColAcc::Extreme { best, .. } => best.map(u64::from_le_bytes),
+/// Append group `g`'s cell for `acc` to column `ci`. An accumulator nothing
+/// contributed to is the global ground row, or an all-NULL group.
+fn push_acc_cell(dst: &mut ZSetBatch, ci: usize, pi: usize, g: usize, acc: &ColAcc, partial: &ZSetBatch, tc: TypeCode) {
+    match *acc {
+        ColAcc::IntSum { seen: false, .. }
+        | ColAcc::FloatSum { seen: false, .. }
+        | ColAcc::Extreme { best: None, .. } => push_null_cell(&mut dst.columns[ci], &mut dst.nulls[g], tc, pi),
+        ColAcc::IntSum { bits, .. } => push_fixed_bits(&mut dst.columns[ci], bits as u64, tc.wire_stride()),
+        ColAcc::FloatSum { val, .. } => push_fixed_bits(&mut dst.columns[ci], val.to_bits(), tc.wire_stride()),
+        // The partial column and this one are the same column of the same
+        // schema, so the winner is copied exactly as a group column is — blob
+        // relocation included.
+        ColAcc::Extreme { best: Some(row), .. } => dst.push_cell_from(ci, partial, ci, tc, row),
     }
 }
 
@@ -538,11 +522,9 @@ fn project_groups(spec: &FoldShape, view: &ZSetBatchView<'_>, ranges: &[(usize, 
     out
 }
 
-/// Push the low `stride` bytes of `bits` into a Fixed output column. Every
-/// non-string finalize result is a register image: an aggregate column is a
-/// `Fixed` of width ≤ 8 (`agg_output_type` routes float SUM/MIN/MAX to F64 and
-/// SUM through `register_image_type`, and preserves a ≤8-byte integer source's
-/// own width for MIN/MAX), and a computed one is the evaluator's own register.
+/// Push the low `stride` bytes of `bits` into a Fixed output column — the
+/// results that *are* a register image: an accumulated SUM / COUNT
+/// (`agg_output_type` keeps both ≤ 8 bytes) and the evaluator's own register.
 fn push_fixed_bits(col: &mut Vec<u8>, bits: u64, stride: usize) {
     col.extend_from_slice(&bits.to_le_bytes()[..stride]);
 }

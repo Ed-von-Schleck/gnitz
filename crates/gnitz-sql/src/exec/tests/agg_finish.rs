@@ -81,34 +81,26 @@ fn fill_group_batch_lays_out_values_and_null_bits() {
     let spec = fill_only_shape(&src, vec![1], agg_specs());
 
     // Two representative partial rows: group 0 has g = 10, group 1 has g NULL
-    // (payload slot 0). The agg columns are never read from `partial`. The
-    // keys are deliberately not `0, 1`, so a staging batch that stamped the
-    // group ordinal instead of copying the key would not coincide.
+    // (payload slot 0). Row 0 also carries the MIN winner an `Extreme` names by
+    // row index. The keys are deliberately not `0, 1`, so a staging batch that
+    // stamped the group ordinal instead of copying the key would not coincide.
     let mut partial = ZSetBatch::new(&spec.partial_schema);
-    for (row, (key, g)) in [(0x77u128, 10i64), (0x33, 0)].into_iter().enumerate() {
+    for (row, (key, g, sm)) in [(0x77u128, 10i64, -5i16), (0x33, 0, 0)].into_iter().enumerate() {
         partial.pks.push_u128(&spec.partial_schema, key);
         partial.weights.push(1);
         partial.nulls.push(if row == 1 { 0b1 } else { 0 });
         push_fixed_bits(&mut partial.columns[1], g as u64, 8);
-        push_fixed_bits(&mut partial.columns[2], 0, 2);
+        push_fixed_bits(&mut partial.columns[2], sm as u16 as u64, 2);
         push_fixed_bits(&mut partial.columns[3], 0, 8);
     }
 
     let reps = [Some(0usize), Some(1usize)];
     let accs = vec![
-        // Group 0: MIN(sm) = -5, COUNT = 2.
-        ColAcc::Extreme {
-            best: Some([0xfb, 0xff, 0, 0, 0, 0, 0, 0]),
-            is_max: false,
-            tc: TypeCode::I16,
-        },
+        // Group 0: MIN(sm) = -5 (partial row 0), COUNT = 2.
+        ColAcc::Extreme { best: Some(0), is_max: false },
         count_acc(2),
         // Group 1: an all-NULL MIN group, COUNT = 1.
-        ColAcc::Extreme {
-            best: None,
-            is_max: false,
-            tc: TypeCode::I16,
-        },
+        ColAcc::Extreme { best: None, is_max: false },
         count_acc(1),
     ];
 
@@ -145,14 +137,7 @@ fn fill_group_batch_handles_the_global_ground_row() {
     let src = source_schema();
     let spec = fill_only_shape(&src, vec![], agg_specs());
     let empty = ZSetBatch::new(&spec.partial_schema);
-    let accs = vec![
-        ColAcc::Extreme {
-            best: None,
-            is_max: false,
-            tc: TypeCode::I16,
-        },
-        count_acc(0),
-    ];
+    let accs = vec![ColAcc::Extreme { best: None, is_max: false }, count_acc(0)];
     let got = fill_group_batch(&spec, &empty, &[None], &accs);
 
     assert_eq!(got.len(), 1);

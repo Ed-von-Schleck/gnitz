@@ -185,7 +185,7 @@ impl ReducePlan {
         // caller to get wrong.
         let cbase = output_schema.num_columns() - agg_descs.len();
         // Building the accumulators *is* the eligibility test, so no caller can
-        // skip it: every value-reading aggregate needs a scalar register image.
+        // skip it: a summing aggregate needs a scalar register image.
         let acc_template: Vec<Accumulator> = agg_descs
             .iter()
             .enumerate()
@@ -197,7 +197,7 @@ impl ReducePlan {
                 )
             })
             .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| OpBuildErr::shape("reduce: aggregate column type has no scalar register image"))?;
+            .ok_or_else(|| OpBuildErr::shape("reduce: summed column type has no scalar register image"))?;
 
         // Every group set has a packed key and the accumulator build above
         // already rejected any aggregate the index could not encode, so a

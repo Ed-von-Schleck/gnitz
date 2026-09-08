@@ -63,7 +63,7 @@ pub(crate) fn serial_underlying(dt: &DataType) -> Option<TypeCode> {
 // ---------------------------------------------------------------------------
 // TypeCode capability predicates
 //
-// One home for the type-membership tests that the binder (MIN/MAX rejection)
+// One home for the type-membership tests that the binder (SUM/AVG rejection)
 // and the lowerer (ColRef rejection) query. gnitz_core already owns `is_float`
 // / `is_german_string`; these add the sets it does not.
 // ---------------------------------------------------------------------------
@@ -81,8 +81,8 @@ pub(crate) fn temporal_literal(tc: TypeCode, s: &str) -> Result<i64, GnitzSqlErr
 
 /// Whether a value of this type fits the expression VM's 8-byte *scalar*
 /// register — [`gnitz_core::ScalarKind`], the same classification the engine's
-/// reduce kernel and aggregate-value index resolve their columns through, so the
-/// binder cannot admit an aggregate the engine then refuses.
+/// reduce kernel resolves a summed column through, so the binder cannot admit a
+/// SUM the engine then refuses.
 ///
 /// Not the same question as `register_image`, which is total over *both*
 /// register classes and maps STRING to itself.

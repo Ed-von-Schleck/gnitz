@@ -2,13 +2,14 @@
 //! file rather than a shared `common.rs` so the tests file stays self-contained.
 
 use crate::expr::PkSource;
+use crate::ops::op_negate;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, TypeCode};
 use crate::storage::{Batch, BatchBuilder, Layout, ReadCursor};
 use crate::test_support::{
     make_batch_raw, make_schema_i64pk_i64, make_schema_u64_i64, opk_pk_i64, pk_payload_schema, scratch_table,
     trace_cursor, u64_pk_schema,
 };
-use gnitz_wire::{encode_german_string, read_i64_le, read_u64_le};
+use gnitz_wire::{read_i64_le, read_u64_le};
 
 use super::super::group_key::GroupKeyCols;
 use super::agg::Accumulator;
@@ -1388,6 +1389,46 @@ fn build_batch_u64_uuid_i64(schema: &SchemaDescriptor, rows: &[(u64, u128, i64)]
     b
 }
 
+/// MIN/MAX over a UUID payload column: the first row of a group seeds the
+/// accumulator without a compare against its empty slot, later rows order on
+/// all 16 bytes, and a retraction recedes through the value index.
+#[test]
+fn uuid_min_max_recede_through_the_value_index() {
+    let in_schema = make_schema_u64_uuid_i64();
+    let aggs = [
+        AggDescriptor { col_idx: 2, agg_op: AggFunc::Count },
+        AggDescriptor { col_idx: 1, agg_op: AggFunc::Min },
+        AggDescriptor { col_idx: 1, agg_op: AggFunc::Max },
+    ];
+    let out_schema = out_schema_for(&in_schema, &[2u32], &aggs);
+    let (lo, mid, hi) = (1u128, 1u128 << 64, u128::MAX - 1);
+    let uuid_at = |b: &Batch, row: usize, pi: usize| {
+        u128::from_le_bytes(b.col_data(pi)[row * 16..row * 16 + 16].try_into().unwrap())
+    };
+
+    let t1 = build_batch_u64_uuid_i64(&in_schema, &[(1, mid, 7), (2, hi, 7), (3, lo, 7)]);
+    let mut trace = empty_trace(out_schema);
+    let out1 = op_reduce(&t1, &mut trace, &in_schema, &[2u32], &aggs, None, false, false);
+    assert_eq!(out1.count, 1);
+    assert_eq!((uuid_at(&out1, 0, 2), uuid_at(&out1, 0, 3)), (lo, hi));
+
+    let t2 = op_negate(build_batch_u64_uuid_i64(&in_schema, &[(2, hi, 7), (3, lo, 7)]));
+    let mut avi = Avi::new(&in_schema, &[2u32], &aggs, &[&t1, &t2]);
+    let mut trace2 = trace_cursor(out1, out_schema);
+    let out2 = op_reduce(
+        &t2,
+        &mut trace2,
+        &in_schema,
+        &[2u32],
+        &aggs,
+        Some(&mut avi.cursor()),
+        false,
+        false,
+    );
+    let new_row = (0..out2.count).find(|&i| out2.get_weight(i) > 0).expect("new row");
+    assert_eq!((uuid_at(&out2, new_row, 2), uuid_at(&out2, new_row, 3)), (mid, mid));
+}
+
 #[test]
 fn test_compare_by_group_cols_uuid_non_pk() {
     // UUID non-PK column used as GROUP BY column. Before the fix, compare_by_group_cols
@@ -2256,7 +2297,7 @@ fn test_avi_seed_u64_high_bit() {
     // AVI seeds the accumulator with 1u64<<63 (high bit set); a U64's order
     // image is the value itself.
     acc.seed_encoded_extreme(1u64 << 63);
-    assert_eq!(acc.get_value_bits(), 1u64 << 63);
+    assert_eq!(acc.value_bits(), 1u64 << 63);
 
     // Build a batch with a single row val=10u64, pk=1.
     let batch = {
@@ -2275,7 +2316,7 @@ fn test_avi_seed_u64_high_bit() {
     // 10u64 < (1u64<<63) under unsigned: MIN updates to 10.
     // Under buggy signed comparison: 10i64 > i64::MIN, MIN stays at i64::MIN.
     assert_eq!(
-        acc.get_value_bits(),
+        acc.value_bits(),
         10u64,
         "unsigned MIN against AVI-seeded U64 high-bit value"
     );
@@ -3799,7 +3840,7 @@ fn count_accumulator_over_uuid_pk_does_not_panic() {
     acc.step_from_batch(&mb, 0, 1);
     acc.step_from_batch(&mb, 1, 1);
     assert_eq!(
-        acc.get_value_bits() as i64,
+        acc.value_bits() as i64,
         2,
         "COUNT over a UUID PK column must count rows"
     );
@@ -3843,7 +3884,7 @@ fn avi_read_extreme(
     // Ordinal 0: the single aggregate.
     bake.seed_extreme(&mut ch, &mut gk, 0, &mut acc);
     assert!(!acc.is_untouched(), "AVI seek must find the probed group");
-    acc.get_value_bits() as i64
+    acc.value_bits() as i64
 }
 
 // Bug 3: the order-encoded aggregate value must be serialized big-endian so the
@@ -3989,7 +4030,7 @@ fn avi_f32_seed_promotes_to_f64_bits() {
     for v in [1.5f32, -2.25, 0.0, 1.0e30] {
         let mut acc = make_acc(&in_schema, &[0], desc);
         acc.seed_encoded_extreme(gnitz_wire::ieee_order_bits_f32(v.to_bits()));
-        let bits = acc.get_value_bits();
+        let bits = acc.value_bits();
         assert_eq!(
             bits,
             f64::to_bits(v as f64),
@@ -4400,8 +4441,7 @@ fn test_group_key_128bit_collision_resistance() {
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(pi_c1, &i.to_le_bytes());
-            let gs = encode_german_string(format!("k{j}").as_bytes(), &mut b.blob);
-            b.extend_col(pi_c2, &gs);
+            b.extend_col_blob(pi_c2, format!("k{j}").as_bytes());
             b.count += 1;
             expected += 1;
         }
@@ -4477,11 +4517,10 @@ fn make_batch_blob_grp_i64(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8], 
     let pi_val = schema.try_payload_idx(2).unwrap();
     let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(pk, w, blob, val) in rows {
-        let gs = encode_german_string(blob, &mut b.blob);
         b.extend_pk(pk as u128);
         b.extend_weight(&w.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
-        b.extend_col(pi_grp, &gs);
+        b.extend_col_blob(pi_grp, blob);
         b.extend_col(pi_val, &val.to_le_bytes());
         b.count += 1;
     }
@@ -4594,6 +4633,64 @@ fn test_reduce_max_blob_group_retraction() {
         .map(|i| read_i64_le(out2.col_data(1), i * 8));
     assert_eq!(retract, Some(30), "retract old MAX(blob_a)=30");
     assert_eq!(insert, Some(10), "insert new MAX(blob_a)=10 after the 30 row is gone");
+}
+
+/// MIN/MAX over a German-string column. Every value shares the index key's
+/// 8-byte value slot and spills past the inline cell, so only content order can
+/// pick the extreme; one carries a NUL, which the image escapes. Retracting both
+/// extremes recedes them through the value index, MAX's complement included.
+#[test]
+fn german_string_min_max_recede_through_the_value_index() {
+    let in_schema = make_schema_u64_blob_grp_i64();
+    let aggs = [
+        AggDescriptor { col_idx: 1, agg_op: AggFunc::Count },
+        AggDescriptor { col_idx: 1, agg_op: AggFunc::Min },
+        AggDescriptor { col_idx: 1, agg_op: AggFunc::Max },
+    ];
+    let out_schema = out_schema_for(&in_schema, &[2u32], &aggs);
+    // Payload: grp exemplar, count, min, max.
+    let (pi_min, pi_max) = (2usize, 3usize);
+    let content = |b: &Batch, row: usize, pi: usize| -> Vec<u8> {
+        let mb = b.as_mem_batch();
+        crate::storage::payload_bytes(&mb, row, pi).to_vec()
+    };
+
+    // All four share the 8 bytes the key's value slot holds, so the ordering the
+    // seek lands on is the BLOB payload's, not the key's.
+    let (lo, mid, hi, top): (&[u8], &[u8], &[u8], &[u8]) = (
+        b"prefix-shared/aa",
+        b"prefix-shared/aaa",
+        b"prefix-shared/aab",
+        b"prefix-shared/aab\0",
+    );
+    let t1 = make_batch_blob_grp_i64(
+        &in_schema,
+        &[(1, 1, mid, 10), (2, 1, hi, 10), (3, 1, lo, 10), (4, 1, top, 10)],
+    );
+    let mut trace = empty_trace(out_schema);
+    let out1 = op_reduce(&t1, &mut trace, &in_schema, &[2u32], &aggs, None, false, false);
+    assert_eq!(out1.count, 1);
+    assert_eq!(content(&out1, 0, pi_min), lo);
+    assert_eq!(content(&out1, 0, pi_max), top);
+
+    // Retract both extremes; the index holds t1 and t2 and the seek lands on the
+    // next value each side.
+    let t2 = op_negate(make_batch_blob_grp_i64(&in_schema, &[(3, 1, lo, 10), (4, 1, top, 10)]));
+    let mut avi = Avi::new(&in_schema, &[2u32], &aggs, &[&t1, &t2]);
+    let mut trace2 = trace_cursor(out1, out_schema);
+    let out2 = op_reduce(
+        &t2,
+        &mut trace2,
+        &in_schema,
+        &[2u32],
+        &aggs,
+        Some(&mut avi.cursor()),
+        false,
+        false,
+    );
+    let new_row = (0..out2.count).find(|&i| out2.get_weight(i) > 0).expect("new row");
+    assert_eq!(content(&out2, new_row, pi_min), mid);
+    assert_eq!(content(&out2, new_row, pi_max), hi);
 }
 
 // ---------------------------------------------------------------------------
@@ -4984,7 +5081,7 @@ fn sumzero_folds_like_sum_and_empty_renders_zero() {
     }
     assert!(!acc.is_untouched(), "SumZero with input is touched");
     assert_eq!(
-        acc.get_value_bits() as i64,
+        acc.value_bits() as i64,
         8,
         "SumZero sums its source values (5 + 10 − 7)"
     );
@@ -6863,19 +6960,14 @@ fn test_agg_output_type() {
         gnitz_wire::agg_output_type(AggFunc::Sum, type_code::U64),
         type_code::U64
     );
-    // Non-fixed-int sources (STRING / 16-byte) fall to the I64 arm as a
-    // total-function default. MIN/MAX over them is rejected at compile (the
-    // SQL binder, and emit_reduce's order-encodability guard — see
-    // test_build_plan_min_max_over_non_encodable_rejected), so this result only
-    // types a discarded schema and never reaches execution; agg_output_type
-    // stays total, hence these asserts still hold.
+    // A wide source keeps its type: MIN/MAX select one of its rows.
     assert_eq!(
         gnitz_wire::agg_output_type(AggFunc::Max, type_code::STRING),
-        type_code::I64
+        type_code::STRING
     );
     assert_eq!(
         gnitz_wire::agg_output_type(AggFunc::Min, type_code::U128),
-        type_code::I64
+        type_code::U128
     );
 }
 
@@ -7027,29 +7119,41 @@ fn reduce_column_indices_out_of_range_are_rejected() {
     );
 }
 
-/// Every aggregate that decodes its column value needs a scalar register image
-/// (`ScalarKind`) — the ≤8-byte int/float set. The SQL binder rejects the rest
-/// upstream, so this covers the low-level `CircuitBuilder` path that bypasses it.
+/// col 0 = U64 PK and the whole group key (⇒ PkPermutation); col 1 = the
+/// aggregate column, whose type is the only thing the two tests below vary.
+fn agg_over(tc: u8) -> SchemaDescriptor {
+    SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)], &[0])
+}
+
+/// A summing aggregate adds its argument in a scalar register (`ScalarKind`) —
+/// the ≤8-byte int/float set — so a wide column has no accumulator for it.
+/// Covers the low-level `CircuitBuilder` path that bypasses the SQL binder.
 #[test]
-fn a_value_reading_aggregate_over_a_non_scalar_column_is_rejected() {
-    // col 0 = U64 PK and the whole group key (⇒ PkPermutation); col 1 = the
-    // aggregate column, whose type is the only thing varying.
-    let over = |tc| SchemaDescriptor::new(&[SchemaColumn::new(type_code::U64, 0), SchemaColumn::new(tc, 0)], &[0]);
-    for agg_op in [AggFunc::Sum, AggFunc::SumZero, AggFunc::Min, AggFunc::Max] {
+fn a_summing_aggregate_over_a_non_scalar_column_is_rejected() {
+    for agg_op in [AggFunc::Sum, AggFunc::SumZero] {
         let aggs = [AggDescriptor { agg_op, col_idx: 1 }];
-        assert!(
-            ReducePlan::from_wire(&over(type_code::I64), &[0], &aggs, false, false).is_ok(),
-            "{agg_op:?} over I64"
-        );
         for tc in [type_code::U128, type_code::STRING] {
             assert_eq!(
-                plan_rejection(&over(tc), &[0], &aggs),
-                "reduce: aggregate column type has no scalar register image",
+                plan_rejection(&agg_over(tc), &[0], &aggs),
+                "reduce: summed column type has no scalar register image",
                 "{agg_op:?} over type code {tc}",
             );
         }
     }
-    // COUNT never reads the value, so no type excludes it.
-    let count = [AggDescriptor { agg_op: AggFunc::Count, col_idx: 1 }];
-    assert!(ReducePlan::from_wire(&over(type_code::STRING), &[0], &count, false, false).is_ok());
+}
+
+/// The aggregates that read no value (COUNT) or select a whole row (MIN/MAX)
+/// take every column type, wide ones included — the other half of the
+/// eligibility rule.
+#[test]
+fn a_row_selecting_aggregate_takes_every_column_type() {
+    for agg_op in [AggFunc::Count, AggFunc::Min, AggFunc::Max] {
+        let aggs = [AggDescriptor { agg_op, col_idx: 1 }];
+        for tc in [type_code::I64, type_code::U128, type_code::UUID, type_code::STRING] {
+            assert!(
+                ReducePlan::from_wire(&agg_over(tc), &[0], &aggs, false, false).is_ok(),
+                "{agg_op:?} over type code {tc}"
+            );
+        }
+    }
 }

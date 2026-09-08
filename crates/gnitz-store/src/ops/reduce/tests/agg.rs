@@ -45,7 +45,7 @@ fn min_nan_first_does_not_poison() {
     let mut acc = f64_acc(AggFunc::Min);
     acc.step_from_batch(&nan.as_mem_batch(), 0, 1);
     acc.step_from_batch(&finite.as_mem_batch(), 0, 1);
-    let got = f64::from_bits(acc.get_value_bits());
+    let got = f64::from_bits(acc.value_bits());
     assert_eq!(got, 5.0, "finite value must displace a leading NaN in MIN");
 }
 
@@ -59,6 +59,6 @@ fn max_uses_total_order_for_nan() {
     let mut acc = f64_acc(AggFunc::Max);
     acc.step_from_batch(&finite.as_mem_batch(), 0, 1);
     acc.step_from_batch(&nan.as_mem_batch(), 0, 1);
-    let got = f64::from_bits(acc.get_value_bits());
+    let got = f64::from_bits(acc.value_bits());
     assert!(got.is_nan(), "MAX must adopt NaN as the greatest under total order");
 }

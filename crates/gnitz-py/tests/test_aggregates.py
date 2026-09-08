@@ -424,6 +424,132 @@ class TestGroupBy:
         finally:
             client.drop_schema(sn)
 
+    def test_min_max_text_recedes_on_delete(self, client):
+        """MIN/MAX over a TEXT column: the extremes are chosen by content order
+        over strings that share a long prefix and spill past the inline cell,
+        and deleting the row holding an extreme recedes it to the next value —
+        which the reduce reads off the value index, whose MAX ordinal stores a
+        complemented, prefix-free image."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  g BIGINT NOT NULL,"
+                "  s TEXT NOT NULL,"
+                "  sn TEXT"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT g, MIN(s) AS lo, MAX(s) AS hi, MIN(sn) AS lon, MAX(sn) AS hin "
+                "FROM t GROUP BY g",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            rows = [
+                (1, 10, "shared/prefix/ab", "x"),
+                (2, 10, "shared/prefix/abc", None),
+                (3, 10, "shared/prefix/a", None),
+                (4, 10, "shared/prefix/abd", "y"),
+                (5, 20, "z", None),
+                (6, 20, "", None),
+            ]
+            client.execute_sql(
+                "INSERT INTO t VALUES "
+                + ", ".join(
+                    f"({pk}, {g}, '{s}', {'NULL' if sn_ is None else repr(sn_)})"
+                    for pk, g, s, sn_ in rows
+                ),
+                schema_name=sn,
+            )
+
+            def expect(want):
+                by_g = {r["g"]: (r["lo"], r["hi"], r["lon"], r["hin"]) for r in client.scan(vid)}
+                assert by_g == want, by_g
+
+            expect({10: ("shared/prefix/a", "shared/prefix/abd", "x", "y"), 20: ("", "z", None, None)})
+            client.execute_sql("DELETE FROM t WHERE pk IN (3, 4)", schema_name=sn)
+            expect({10: ("shared/prefix/ab", "shared/prefix/abc", "x", "x"), 20: ("", "z", None, None)})
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            expect({10: ("shared/prefix/abc", "shared/prefix/abc", None, None), 20: ("", "z", None, None)})
+            client.execute_sql("DELETE FROM t WHERE pk = 6", schema_name=sn)
+            expect({10: ("shared/prefix/abc", "shared/prefix/abc", None, None), 20: ("z", "z", None, None)})
+            client.execute_sql("UPDATE t SET s = 'shared/prefix/aa' WHERE pk = 2", schema_name=sn)
+            expect({10: ("shared/prefix/aa", "shared/prefix/aa", None, None), 20: ("z", "z", None, None)})
+
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_min_max_global_text_ground_row(self, client):
+        """A global MIN/MAX over TEXT renders NULL over an empty source and
+        after every row is gone."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL)",
+                schema_name=sn,
+            )
+            client.execute_sql("CREATE VIEW v AS SELECT MIN(s) AS lo, MAX(s) AS hi FROM t", schema_name=sn)
+            vid = client.resolve_table(sn, "v")[0]
+            rows = lambda: [(r["lo"], r["hi"]) for r in client.scan(vid)]
+            assert rows() == [(None, None)]
+            client.execute_sql("INSERT INTO t VALUES (1, 'm'), (2, 'a long value past the inline cell')", schema_name=sn)
+            assert rows() == [("a long value past the inline cell", "m")]
+            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+            assert rows() == [("a long value past the inline cell", "a long value past the inline cell")]
+            client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
+            assert rows() == [(None, None)]
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_min_max_over_16_byte_columns_recede_on_delete(self, client):
+        """MIN/MAX over UUID and DECIMAL(38,0) columns order on all 16 bytes and
+        recede through the value index like any other extreme."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t ("
+                "  pk BIGINT NOT NULL PRIMARY KEY,"
+                "  g BIGINT NOT NULL,"
+                "  u UUID NOT NULL,"
+                "  big DECIMAL(38,0) NOT NULL"
+                ")",
+                schema_name=sn,
+            )
+            client.execute_sql(
+                "CREATE VIEW v AS SELECT g, MIN(u) AS ulo, MAX(u) AS uhi, MIN(big) AS blo, MAX(big) AS bhi "
+                "FROM t GROUP BY g",
+                schema_name=sn,
+            )
+            vid = client.resolve_table(sn, "v")[0]
+            # The UUIDs differ only past their eighth byte; the decimals straddle u64::MAX.
+            ua = "550e8400-e29b-41d4-a716-446655440000"
+            ub = "550e8400-e29b-41d4-a716-446655440001"
+            uc = "550e8400-e29b-41d4-a716-446655430000"
+            small, mid, huge = 5, 2**64 + 1, 99999999999999999999999999999999999999
+            client.execute_sql(
+                f"INSERT INTO t VALUES (1, 1, '{ua}', {mid}), (2, 1, '{ub}', {small}), (3, 1, '{uc}', {huge})",
+                schema_name=sn,
+            )
+            row = lambda: next((r["ulo"], r["uhi"], r["blo"], r["bhi"]) for r in client.scan(vid))
+            assert row() == (uc, ub, small, huge)
+            client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
+            assert row() == (ua, ub, small, mid)
+            client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
+            assert row() == (ua, ua, mid, mid)
+            client.execute_sql("DROP VIEW v", schema_name=sn)
+            client.execute_sql("DROP TABLE t", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
     def test_pk_source_min_group_by_full_pk(self, client):
         """The aggregate source is a PRIMARY KEY column: `SELECT a, b, MIN(b) ...
         GROUP BY a, b` over PK (a, b). Each (a, b) is its own group so MIN(b) is

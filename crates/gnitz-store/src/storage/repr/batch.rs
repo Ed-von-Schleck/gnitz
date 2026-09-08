@@ -706,6 +706,14 @@ impl Batch {
         self.extend_region(REG_PAYLOAD_START + pi, d);
     }
 
+    /// [`Self::extend_col`] for a STRING/BLOB column: `content` is encoded into
+    /// this batch's own blob heap, whose offsets no other batch's cell can name.
+    #[inline]
+    pub(crate) fn extend_col_blob(&mut self, pi: usize, content: &[u8]) {
+        let cell = gnitz_wire::encode_german_string(content, &mut self.blob);
+        self.extend_col(pi, &cell);
+    }
+
     /// Append a narrow PK from a `u128` — the [`NarrowPkOpk`] image (right-aligned
     /// big-endian) appended through [`Self::extend_pk_bytes`]. Valid for an
     /// **all-unsigned** PK only: OPK == BE there, so `widen_pk_be(extend_pk(v))`

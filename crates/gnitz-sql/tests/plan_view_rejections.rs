@@ -215,12 +215,12 @@ fn outer_and_range_join_rules() {
             (
                 "SELECT ty.id AS aid, w.id AS bid FROM ty LEFT JOIN w ON ty.big < w.big",
                 "Unsupported",
-                "16-byte accumulator",
+                "needs a ≤8-byte integer range column",
             ),
             (
                 "SELECT w.id AS aid, a.id AS bid FROM w LEFT JOIN a ON w.x < a.k",
                 "Unsupported",
-                "16-byte accumulator",
+                "needs a ≤8-byte integer range column",
             ),
         ],
     );
@@ -274,6 +274,8 @@ fn grouped_body_rules() {
         "SELECT 1 AS one FROM t HAVING SUM(v) > 1",
         "SELECT a + 1 AS x FROM m GROUP BY a",
         "SELECT s, COUNT(*) AS n FROM ty GROUP BY s",
+        "SELECT id, MIN(uid) AS x, MAX(s) AS y, MIN(big) AS z FROM ty GROUP BY id",
+        "SELECT id, COUNT(*) AS c FROM ty GROUP BY id HAVING MIN(s) > 'a'",
     ] {
         view(&cat, body);
     }
@@ -296,11 +298,6 @@ fn grouped_body_rules() {
                 "SUM: not supported on",
             ),
             (
-                "SELECT id, MIN(uid) AS x FROM ty GROUP BY id",
-                "Unsupported",
-                "MIN: not supported on",
-            ),
-            (
                 "SELECT g FROM t HAVING SUM(v) > 1",
                 "Plan",
                 "column 'g' must appear in GROUP BY or an aggregate function",
@@ -309,11 +306,6 @@ fn grouped_body_rules() {
                 "SELECT id, COUNT(*) AS c FROM ty GROUP BY id HAVING SUM(big) > 0",
                 "Unsupported",
                 "SUM: not supported on",
-            ),
-            (
-                "SELECT id, COUNT(*) AS c FROM ty GROUP BY id HAVING MIN(s) > 'a'",
-                "Unsupported",
-                "MIN: not supported on",
             ),
             (
                 "SELECT id, SUM(v) FROM t GROUP BY id HAVING SUM(*) > 0",

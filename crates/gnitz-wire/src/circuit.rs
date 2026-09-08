@@ -160,11 +160,9 @@ pub struct ComputeMap {
 /// one typing rule both the planner's declared view schema and the engine's
 /// emitted batch read, so neither can scramble the other's column widths.
 ///
-/// MIN/MAX *select* an existing row, so a ≤8-byte integer extremum is itself a
-/// value of the source type and always representable in it: `MIN(INT)` is `INT`,
-/// `MAX(SMALLINT UNSIGNED)` is `SMALLINT UNSIGNED`. The `I64` arm a STRING or
-/// 16-byte source falls to is a total-function default only — the SQL binder and
-/// the engine's order-encodability guard both reject such a MIN/MAX.
+/// MIN/MAX *select* an existing row, so the extremum is itself a value of the
+/// source type: `MIN(INT)` is `INT`, `MAX(TEXT)` is `TEXT`. A float widens to
+/// F64, the width the accumulator holds it at.
 ///
 /// SUM over a U64 source is typed **U64**: the i64 `wrapping_add` accumulator's
 /// bit pattern already *is* the true sum mod 2^64 at the same width, so the label
@@ -187,10 +185,8 @@ pub const fn agg_output_type(func: AggFunc, src_tc: u8) -> u8 {
         AggFunc::Min | AggFunc::Max => {
             if is_float {
                 type_code::F64
-            } else if crate::types::is_fixed_int(src_tc) {
-                src_tc
             } else {
-                type_code::I64
+                src_tc
             }
         }
     }

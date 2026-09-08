@@ -271,7 +271,7 @@ fn frames_and_functions_outside_the_supported_set_are_rejected() {
         "DISTINCT: not supported on window functions",
     );
     rejects("SELECT id, SUM(a) FILTER (WHERE a > 1) OVER () FROM t", "FILTER");
-    rejects("SELECT id, MIN(s) OVER () FROM t", "MIN: not supported on String");
+    rejects("SELECT id, SUM(s) OVER () FROM t", "SUM: not supported on String");
 }
 
 #[test]
@@ -337,4 +337,26 @@ fn a_subquery_body_and_a_cte_pass_through_keep_their_own_rules() {
     )
     .unwrap();
     assert!(n >= 3);
+}
+
+/// A windowed MIN/MAX selects a row, so a TEXT argument survives the desugar's
+/// join and reduce at its source type: the join-key rules bind the partition and
+/// order keys, not the aggregate's own argument.
+#[test]
+fn a_windowed_extreme_carries_a_string_argument() {
+    for sql in [
+        "SELECT id, MIN(s) OVER () AS m FROM t",
+        "SELECT id, MIN(s) OVER (PARTITION BY k) AS m FROM t",
+        "SELECT id, MAX(s) OVER (PARTITION BY k) AS m FROM t",
+    ] {
+        let (_, cols) = plan(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        assert_eq!(
+            visible(&cols),
+            vec![
+                ("id".to_string(), TypeCode::I64, false),
+                ("m".to_string(), TypeCode::String, false)
+            ],
+            "{sql}"
+        );
+    }
 }

@@ -111,9 +111,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
             if gnitz_wire::null_word_get(nw, pi) {
                 batch.fill_col_zero(pi, cs); // null cell; zset_of won't read it
             } else if gnitz_wire::is_german_string(col.type_code) {
-                let val = arb_string(&mut rng);
-                let gs = gnitz_wire::encode_german_string(&val, &mut batch.blob);
-                batch.extend_col(pi, &gs);
+                batch.extend_col_blob(pi, &arb_string(&mut rng));
             } else {
                 let v = rng.gen_u128();
                 batch.extend_col(pi, &v.to_le_bytes()[..cs]);

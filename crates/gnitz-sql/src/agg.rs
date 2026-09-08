@@ -428,7 +428,8 @@ pub(crate) struct AggTyping {
 /// [`push_agg_specs`], split out so a caller that needs the typing facts (the HIR
 /// bind, deciding whether to mint a companion and how to type the finalize
 /// projection) does not have to materialize a physical spec list at fabricated
-/// column positions to read them back.
+/// column positions to read them back. The one type gate every surface that
+/// binds an aggregate call goes through.
 pub(crate) fn agg_typing(agg_func: AggFunc, arg: Option<&ColumnDef>) -> Result<AggTyping, GnitzSqlError> {
     // `classify_agg_call` admits a wildcard only for COUNT(*).
     if !matches!(agg_func, AggFunc::Count) && arg.is_none() {
@@ -436,19 +437,12 @@ pub(crate) fn agg_typing(agg_func: AggFunc, arg: Option<&ColumnDef>) -> Result<A
             "{agg_func:?} reached agg_typing without an argument column"
         )));
     }
-    // Every value-reading aggregate needs its argument in a scalar register,
-    // which excludes the wide integer-ish types and the german-string pair
-    // alike: MIN/MAX have no accumulator for them and SUM/AVG cannot add them.
-    // The one gate for every surface that binds an aggregate call.
+    // A summing aggregate adds its argument in a scalar register, which excludes
+    // the wide integers, the german-string pair, and a calendar value (adding two
+    // dates is meaningless). MIN/MAX select a row and take any type.
     if let Some(c) = arg {
-        let needs_value = match agg_func {
-            AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => true,
-            AggFunc::Count => false,
-        };
-        // A calendar value has no sum: adding two dates is meaningless, and the
-        // accumulator would be typed as the plain integer either way.
-        let unsummable = matches!(agg_func, AggFunc::Sum | AggFunc::Avg) && c.type_code.is_temporal();
-        if needs_value && (!has_scalar_register(c.type_code) || unsummable) {
+        let summing = matches!(agg_func, AggFunc::Sum | AggFunc::Avg);
+        if summing && (!has_scalar_register(c.type_code) || c.type_code.is_temporal()) {
             return Err(GnitzSqlError::Unsupported(format!(
                 "{}: not supported on {:?} column '{}'",
                 agg_func_name(agg_func).to_ascii_uppercase(),

@@ -1237,6 +1237,38 @@ def test_index_plan_keeps_the_exact_answer_and_a_repeatable_float_sum(tiny_ddl_c
         _cleanup(client, sn, "f")
 
 
+@pytest.mark.parametrize("agg", ["MIN(label) AS m", "MAX(label) AS m", "MIN(u) AS m", "MAX(u) AS m"])
+def test_wide_extreme_parity(client, agg):
+    """MIN/MAX over a TEXT or UUID column: every worker's partial carries the
+    value itself, and the client's combine orders them as the engine does —
+    strings by content, past the inline bound and across a shared prefix."""
+    sn = "we" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE labelled (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, label TEXT NOT NULL, u UUID NOT NULL)",
+            schema_name=sn,
+        )
+        labels = ["shared/prefix/aa", "shared/prefix/a", "shared/prefix/ab", "b", ""]
+        rows = [
+            (i, i % 3, labels[i % 5], f"550e8400-e29b-41d4-a716-4466554400{i:02d}")
+            for i in range(20)
+        ]
+        client.execute_sql(
+            "INSERT INTO labelled VALUES " + ",".join(f"({pk}, {g}, '{label}', '{u}')" for pk, g, label, u in rows),
+            schema_name=sn,
+        )
+        got = _as_dict(_parity(client, sn, f"SELECT g, {agg} FROM labelled GROUP BY g"), "g", "m")
+        col = 2 if "label" in agg else 3
+        pick = min if agg.startswith("MIN") else max
+        want = {g: pick(r[col] for r in rows if r[1] == g) for g in range(3)}
+        assert got == want
+        _parity(client, sn, f"SELECT {agg} FROM labelled")
+        _parity(client, sn, f"SELECT {agg} FROM labelled WHERE pk > 100")
+    finally:
+        _cleanup(client, sn, "labelled")
+
+
 def test_a_spilling_string_group_column_survives_the_finalize(client):
     """A GROUP BY over a TEXT column longer than the German-string inline bound.
 

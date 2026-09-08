@@ -25,8 +25,7 @@ fn push_agg_specs_rejects_unevaluatable_arg_types() {
     for (func, ci) in [
         (AggFunc::Sum, 2), // SUM(blob)
         (AggFunc::Avg, 3), // AVG(uuid)
-        (AggFunc::Min, 4), // MIN(str)
-        (AggFunc::Max, 2), // MAX(blob)
+        (AggFunc::Sum, 4), // SUM(str)
     ] {
         assert!(matches!(try_push(func, Some(ci)), Err(GnitzSqlError::Unsupported(_))));
     }
@@ -39,6 +38,11 @@ fn push_agg_specs_accepts_valid_arg_types() {
     assert!(try_push(AggFunc::Min, Some(1)).is_ok()); // MIN(i64)
     assert!(try_push(AggFunc::Count, None).is_ok()); // COUNT(*)
     assert!(try_push(AggFunc::Count, Some(2)).is_ok()); // COUNT(blob) — presence only
+                                                        // MIN/MAX select a row, so a wide type is as good as a narrow one — the
+                                                        // very types SUM/AVG are refused over above.
+    assert!(try_push(AggFunc::Min, Some(4)).is_ok()); // MIN(str)
+    assert!(try_push(AggFunc::Max, Some(2)).is_ok()); // MAX(blob)
+    assert!(try_push(AggFunc::Max, Some(3)).is_ok()); // MAX(uuid)
 }
 
 /// SUM over a U64 source is typed U64 (bit pattern is the correct unsigned

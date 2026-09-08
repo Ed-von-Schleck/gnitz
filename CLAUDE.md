@@ -231,7 +231,8 @@ matches, `ν(x) = w_A · [S = 0]`. Two contracts bind every realization:
 
 Equi and band joins implement all three orientations. Pure range (`n_eq == 0`)
 supports LEFT only — RIGHT/FULL is rejected at plan time — and derives from a
-MIN/MAX threshold row, so its range column must be a ≤8-byte integer.
+MIN/MAX threshold row that is reindexed back onto the range slot, a chain
+carried only at ≤8 bytes, so its range column must be a ≤8-byte integer.
 
 ### Non-linear operators
 

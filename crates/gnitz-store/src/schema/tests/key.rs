@@ -709,8 +709,7 @@ fn test_german_string_promote_key_short_and_long() {
     b.extend_pk(1u128);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&0u64.to_le_bytes());
-    let gs0 = gnitz_wire::encode_german_string(b"foo", &mut b.blob);
-    b.extend_col(0, &gs0);
+    b.extend_col_blob(0, b"foo");
     b.count += 1;
 
     // Row 1: long string (15 bytes > SHORT_STRING_THRESHOLD=12), heap-allocated.
@@ -718,8 +717,7 @@ fn test_german_string_promote_key_short_and_long() {
     b.extend_pk(2u128);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&0u64.to_le_bytes());
-    let gs1 = gnitz_wire::encode_german_string(long_str, &mut b.blob);
-    b.extend_col(0, &gs1);
+    b.extend_col_blob(0, long_str);
     b.count += 1;
 
     let mb = b.as_mem_batch();
@@ -1014,8 +1012,7 @@ fn test_reindex_packer_arity1_byte_identity() {
             b.extend_pk((r + 1) as u128 * 11);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
-            let gs = gnitz_wire::encode_german_string(content, &mut b.blob);
-            b.extend_col(0, &gs);
+            b.extend_col_blob(0, content);
             b.count += 1;
         }
         let mb = b.as_mem_batch();

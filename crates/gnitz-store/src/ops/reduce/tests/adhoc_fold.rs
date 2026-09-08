@@ -211,32 +211,50 @@ fn fold_rejects_mismatched_reply_schema() {
     assert!(AdhocFold::new(&src, &wrong_type, &spec, 1000).is_err());
 }
 
-/// The spec is a trust boundary and the accumulator is not defensive: SUM over a
-/// STRING and MIN over a U128 have no scalar register image, and a U128 MIN would
-/// slip past the reply-schema check too (`agg_output_type(Min, U128)` is I64).
-#[test]
-fn fold_rejects_aggregates_with_no_encoding() {
-    // pk(U64), s(STRING), w(U128).
-    let src = SchemaDescriptor::new(
+/// pk(U64), s(STRING), w(U128) — the wide-column source both tests below read.
+fn wide_src_schema() -> SchemaDescriptor {
+    SchemaDescriptor::new(
         &[
             SchemaColumn::new(type_code::U64, 0),
             SchemaColumn::new(type_code::STRING, 0),
             SchemaColumn::new(type_code::U128, 0),
         ],
         &[0],
-    );
-    let reply = reply_schema(1);
-    for (op, col) in [(AggFunc::Sum, 1u32), (AggFunc::Min, 2)] {
-        let spec = AggReadSpec::direct(vec![], vec![agg(op, col)]);
+    )
+}
+
+/// The spec is a trust boundary and the accumulator is not defensive: SUM over
+/// a STRING or a U128 has no scalar register image to add in.
+#[test]
+fn fold_rejects_a_sum_with_no_encoding() {
+    let (src, reply) = (wide_src_schema(), reply_schema(1));
+    for col in [1u32, 2] {
+        let spec = AggReadSpec::direct(vec![], vec![agg(AggFunc::Sum, col)]);
         let Err(err) = AdhocFold::new(&src, &reply, &spec, 1000) else {
-            panic!("{op:?} over column {col} must be rejected");
+            panic!("SUM over column {col} must be rejected");
         };
         assert!(err.to_string().contains("no scalar register image"), "{err}");
     }
-    // COUNT reads no value, so the same columns are countable.
-    for col in [1u32, 2] {
+}
+
+/// MIN selects a row of any type and COUNT reads no value at all, so both take
+/// the same wide columns SUM is refused over — MIN's partial column being the
+/// source type, which the reply schema has to declare.
+#[test]
+fn fold_accepts_a_row_selecting_aggregate_over_a_wide_column() {
+    let src = wide_src_schema();
+    for (col, tc) in [(1u32, type_code::STRING), (2, type_code::U128)] {
+        let spec = AggReadSpec::direct(vec![], vec![agg(AggFunc::Min, col)]);
+        let reply = SchemaDescriptor::new(&[SchemaColumn::new(type_code::U128, 0), SchemaColumn::new(tc, 1)], &[0]);
+        assert!(
+            AdhocFold::new(&src, &reply, &spec, 1000).is_ok(),
+            "MIN over column {col}"
+        );
         let spec = AggReadSpec::direct(vec![], vec![agg(AggFunc::Count, col)]);
-        assert!(AdhocFold::new(&src, &reply_global(1), &spec, 1000).is_ok());
+        assert!(
+            AdhocFold::new(&src, &reply_global(1), &spec, 1000).is_ok(),
+            "COUNT over column {col}"
+        );
     }
 }
 

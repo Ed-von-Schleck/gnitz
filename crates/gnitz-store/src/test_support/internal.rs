@@ -161,10 +161,9 @@ pub fn make_schema_pk_u64_payload_blob() -> SchemaDescriptor {
 pub fn make_batch_bytes(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -> Batch {
     let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(pk, w, val) in rows {
-        let cell = gnitz_wire::encode_german_string(val, &mut b.blob);
         b.extend_pk(pk as u128);
         b.extend_weight(&w.to_le_bytes());
-        b.extend_col(0, &cell);
+        b.extend_col_blob(0, val);
         b.commit_row(0);
     }
     b.certify_layout(Layout::Consolidated, schema);

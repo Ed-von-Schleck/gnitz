@@ -891,6 +891,39 @@ impl ScalarKind {
     }
 }
 
+/// The column types outside [`ScalarKind`] that MIN/MAX still select over: the
+/// 16-byte integers and the German-string pair. A `const` assert holds every
+/// `TypeCode` to exactly one of a `ScalarKind` and a `WideKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WideKind {
+    Fixed(TypeCode),
+    Bytes,
+}
+
+impl WideKind {
+    /// Reads the same two allow-lists [`TypeCode::is_wide_int`] and
+    /// [`TypeCode::is_german_string`] define, so the wide set has one spelling.
+    pub const fn from_type_code(tc: TypeCode) -> Option<Self> {
+        if tc.is_wide_int() {
+            Some(Self::Fixed(tc))
+        } else if tc.is_german_string() {
+            Some(Self::Bytes)
+        } else {
+            None
+        }
+    }
+
+    /// Order two values by their **native** bytes — a string's content, already
+    /// resolved out of its blob heap, not its 16-byte cell.
+    #[inline(always)]
+    pub fn cmp_native(self, a: &[u8], b: &[u8]) -> Ordering {
+        match self {
+            Self::Fixed(tc) => cmp_typed_le(a, b, tc as u8),
+            Self::Bytes => a.cmp(b),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Order-preserving float image: `ColumnLocator::order_bits` encodes a float
 // through the forward half, `ScalarKind::order_inverse` undoes it with the reverse.
@@ -948,6 +981,10 @@ const _: () = {
     while i < TypeCode::ALL.len() {
         let tc = TypeCode::ALL[i];
         let kind = ScalarKind::from_type_code(tc);
+        assert!(
+            kind.is_some() != WideKind::from_type_code(tc).is_some(),
+            "every type has exactly one of a scalar and a wide kind"
+        );
         match FixedInt::from_type_code(tc) {
             Some(fi) => {
                 assert!(matches!(kind, Some(ScalarKind::Int(_))), "a FixedInt has an Int image");
