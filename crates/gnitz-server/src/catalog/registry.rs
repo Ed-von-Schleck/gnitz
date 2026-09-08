@@ -146,47 +146,36 @@ impl CatalogEngine {
     /// Allocate the next durable relation id (tables and views share this
     /// counter; indices have their own).
     #[cfg(test)]
-    pub(crate) fn allocate_table_id(&mut self) -> Result<i64, StorageError> {
+    pub(crate) fn allocate_table_id(&mut self) -> Result<i64, String> {
         self.allocate_table_ids(1)
     }
 
-    /// Allocate a contiguous run of `count` relation ids, returning its base: the
-    /// caller owns `[base, base + count)`. One durable sequence advance for the
-    /// whole run, which is what lets a view chain draw every segment's id in one
-    /// round trip instead of one per segment.
-    ///
-    /// `count` is clamped to at least 1 — the run length is a client-supplied
-    /// wire field, and a `0` would move the durable sequence *backwards*.
-    ///
-    /// Panics on reaching `RELATION_ID_CEILING` rather than issuing an id at or
-    /// above it. Reaching it needs 2^31 durable CREATEs, so this is a tripwire,
-    /// not a live limit — and it is the *secondary* guard: `precheck_family`
-    /// rejects a ceiling id at the point one enters the registry, which covers the
-    /// caller-chosen ids the register hooks `raise_id_counter` from and which
-    /// never pass through here.
-    pub(crate) fn allocate_table_ids(&mut self, count: u64) -> Result<i64, StorageError> {
+    /// Allocate a contiguous run of `count` relation ids, returning its base:
+    /// the caller owns `[base, base + count)`. `count` is untrusted — see
+    /// [`validated_run_last`] for what makes a run valid.
+    pub(crate) fn allocate_table_ids(&mut self, count: u64) -> Result<i64, String> {
         let base = self.next_table_id;
-        let last = base + count.max(1) as i64 - 1;
-        assert!(
-            last < sys_tables::RELATION_ID_CEILING,
-            "durable relation ids exhausted: {last} would reach the relation-id ceiling"
-        );
+        let last = validated_run_last(base, count, sys_tables::RELATION_ID_CEILING)
+            .ok_or_else(|| format!("relation id run length {count} is invalid (base {base})"))?;
         self.next_table_id = last + 1;
-        self.advance_sequence(SEQ_ID_TABLES, last)?;
+        self.advance_sequence(SEQ_ID_TABLES, last)
+            .map_err(|e| format!("sys_sequences ingest (table id run) failed: {e}"))?;
         Ok(base)
     }
 
-    pub(in crate::catalog) fn allocate_index_id(&mut self) -> Result<i64, StorageError> {
+    pub(in crate::catalog) fn allocate_index_id(&mut self) -> Result<i64, String> {
         self.allocate_index_ids(1)
     }
 
-    /// [`Self::allocate_table_ids`] for the index-id counter, under the same
-    /// clamp.
-    pub(crate) fn allocate_index_ids(&mut self, count: u64) -> Result<i64, StorageError> {
+    /// [`Self::allocate_table_ids`] for the index-id counter. No ceiling here:
+    /// the index-id space is bounded downstream, in `SysFamily::id_ceiling`.
+    pub(crate) fn allocate_index_ids(&mut self, count: u64) -> Result<i64, String> {
         let base = self.next_index_id;
-        let last = base + count.max(1) as i64 - 1;
+        let last = validated_run_last(base, count, i64::MAX)
+            .ok_or_else(|| format!("index id run length {count} is invalid (base {base})"))?;
         self.next_index_id = last + 1;
-        self.advance_sequence(SEQ_ID_INDICES, last)?;
+        self.advance_sequence(SEQ_ID_INDICES, last)
+            .map_err(|e| format!("sys_sequences ingest (index id run) failed: {e}"))?;
         Ok(base)
     }
 
@@ -358,6 +347,15 @@ impl CatalogEngine {
     }
 }
 
+/// The last id of a `count`-long run starting at `base`, or `None` if `count`
+/// is zero, doesn't fit an `i64`, overflows against `base`, or reaches `ceiling`.
+#[inline]
+fn validated_run_last(base: i64, count: u64, ceiling: i64) -> Option<i64> {
+    let count = i64::try_from(count).ok().filter(|&c| c > 0)?;
+    let last = base.checked_add(count)?.checked_sub(1)?;
+    (last < ceiling).then_some(last)
+}
+
 /// Raise a monotonic catalog id counter so the next allocation lands strictly
 /// past `allocated`, the largest id known to be in use. Monotone and idempotent,
 /// so a retract+reinsert replay is a no-op.
@@ -371,3 +369,7 @@ impl CatalogEngine {
 pub(super) fn raise_id_counter(counter: &mut i64, allocated: i64) {
     *counter = (*counter).max(allocated + 1);
 }
+
+#[cfg(test)]
+#[path = "tests/registry.rs"]
+mod tests;
