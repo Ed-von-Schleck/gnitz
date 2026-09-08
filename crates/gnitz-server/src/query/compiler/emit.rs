@@ -255,6 +255,27 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
             emit_reduce(ctx, nid, group_cols, agg, *global_ground)
         }
 
+        gnitz_wire::OpNode::TopN { group_cols, order, limit, offset } => {
+            let in_reg = ctx.unary_delta_in(nid)?;
+            let plan =
+                gnitz_store::ops::TopNPlan::from_wire(&ctx.reg_schema(in_reg), group_cols, order, *limit, *offset)
+                    .map_err(CompileError::RejectedOp)?;
+            let out_schema = plan.output_schema;
+            let trace_out_reg = ctx.push_trace_reg(&format!("_topn_{}_{nid}", ctx.site.id), out_schema)?;
+            let out_reg = ctx.push_delta_reg(out_schema);
+            // The ordered index of every input row — the operator's whole
+            // history, so a failed create fails the compile as a reduce's does.
+            let index = ctx.add_registerless_table(&format!("_topnidx_{}_{nid}", ctx.site.id), plan.index.schema)?;
+            let plan_idx = ctx.builder.add_topn_plan(plan, index);
+            ctx.builder
+                .push(Instr::TopN { in_reg, trace_out_reg, out_reg, plan_idx });
+            ctx.builder.push(Instr::Integrate {
+                in_reg: out_reg,
+                trace_reg: trace_out_reg,
+            });
+            Ok(OutReg::Delta(out_reg))
+        }
+
         gnitz_wire::OpNode::Join(kind) => {
             let (delta_reg, trace_reg) = ctx.join_in(nid)?;
             let a_schema = ctx.reg_schema(delta_reg);

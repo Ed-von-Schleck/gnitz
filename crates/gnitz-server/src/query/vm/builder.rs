@@ -17,6 +17,7 @@ pub(in crate::query) struct ProgramBuilder {
     maps: Vec<MapPlan>,
     tables: Vec<Table>,
     reduce_plans: Vec<BakedReduce>,
+    topn_plans: Vec<BakedTopN>,
 }
 
 impl ProgramBuilder {
@@ -27,6 +28,7 @@ impl ProgramBuilder {
             maps: Vec::new(),
             tables: Vec::new(),
             reduce_plans: Vec::new(),
+            topn_plans: Vec::new(),
         }
     }
 
@@ -76,6 +78,18 @@ impl ProgramBuilder {
         idx
     }
 
+    /// Store a baked top-N plan with the table its ordered index lives in,
+    /// returning its `Instr::TopN::plan_idx`.
+    pub(in crate::query) fn add_topn_plan(
+        &mut self,
+        plan: gnitz_store::ops::TopNPlan,
+        index_table: TableIdx,
+    ) -> TopNIdx {
+        let idx = TopNIdx(self.topn_plans.len() as u16);
+        self.topn_plans.push(BakedTopN { plan, index_table });
+        idx
+    }
+
     // ── Build ────────────────────────────────────────────────────────────
 
     /// Consume the builder into a runnable `VmHandle`, `out_reg` being the
@@ -122,6 +136,7 @@ impl ProgramBuilder {
             predicates: self.predicates,
             maps: self.maps,
             reduce_plans: self.reduce_plans,
+            topn_plans: self.topn_plans,
             last_read,
             out_reg,
         };

@@ -6,7 +6,8 @@ use crate::error::ClientError;
 use crate::ReindexSlot;
 
 pub use gnitz_wire::{
-    agg_output_type, AggDescriptor, AggFunc, ComputeMap, JoinKind, MapKind, OpNode, RangeRel, ReindexRole, TypeCode,
+    agg_output_type, AggDescriptor, AggFunc, ComputeMap, JoinKind, MapKind, OpNode, OrderKey, RangeRel, ReindexRole,
+    TypeCode,
 };
 
 pub type NodeId = u64;
@@ -298,6 +299,48 @@ impl CircuitBuilder {
                 group_cols: group,
                 agg: specs,
                 global_ground,
+            },
+            &[input],
+        )
+    }
+
+    /// Per-group top-N with automatic shard insertion: every group lands on one
+    /// worker, whose index holds the group whole. See [`Self::top_n_local`].
+    pub fn top_n(
+        &mut self,
+        input: NodeId,
+        group_cols: &[usize],
+        order: &[OrderKey],
+        limit: u64,
+        offset: u64,
+    ) -> NodeId {
+        let sharded = self.shard(input, group_cols);
+        self.top_n_local(sharded, group_cols, order, limit, offset)
+    }
+
+    /// Shard-free top-N: the window of each group **as this worker holds it**,
+    /// with no upstream `ExchangeShard`. Correct over a replicated input, and
+    /// the local phase of the two-phase global top-N — whose windows a
+    /// downstream [`Self::top_n`] exchanges and reduces to the one global window,
+    /// exact because the global window's slots lie inside the union of every
+    /// worker's local `limit + offset` slots.
+    ///
+    /// `limit` must not be `0` (the engine rejects a zero limit at decode).
+    pub fn top_n_local(
+        &mut self,
+        input: NodeId,
+        group_cols: &[usize],
+        order: &[OrderKey],
+        limit: u64,
+        offset: u64,
+    ) -> NodeId {
+        let group: Vec<u32> = group_cols.iter().map(|&c| c as u32).collect();
+        self.alloc_wired(
+            OpNode::TopN {
+                group_cols: group,
+                order: order.to_vec(),
+                limit,
+                offset,
             },
             &[input],
         )

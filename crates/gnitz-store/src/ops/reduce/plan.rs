@@ -4,13 +4,10 @@
 //! coherence the old 13-parameter `op_reduce` signature spread across the
 //! instruction operands; the per-epoch call re-derives nothing.
 
-use crate::schema::key::NarrowPkOpk;
-use crate::schema::{
-    type_code, ColumnLocator, DerivedSchema, OpBuildErr, ReduceOutKey, SchemaColumn, SchemaDescriptor,
-};
+use crate::schema::{ColumnLocator, DerivedSchema, OpBuildErr, ReduceOutKey, SchemaColumn, SchemaDescriptor};
 use crate::storage::MemBatch;
 
-use super::super::group_key::GroupKeyCols;
+use super::super::group_key::{group_out_pk, GroupKeyCols, OutPk};
 use super::agg::Accumulator;
 use super::avi::AviBake;
 use gnitz_wire::AggDescriptor;
@@ -20,16 +17,12 @@ use gnitz_wire::AggFunc;
 /// Ahead of every derivation below, each of which indexes the fixed column array
 /// raw.
 fn check_cols(schema: &SchemaDescriptor, group_cols: &[u32], agg_descs: &[AggDescriptor]) -> Result<(), OpBuildErr> {
-    let cols = group_cols
-        .iter()
-        .map(|&c| ("reduce: group column", c))
-        .chain(agg_descs.iter().map(|d| ("reduce: aggregate column", d.col_idx)));
-    for (what, c) in cols {
-        if schema.column(c as usize).is_none() {
-            return Err(OpBuildErr::oob_col(what, c, schema));
-        }
-    }
-    Ok(())
+    schema.check_cols(
+        group_cols
+            .iter()
+            .map(|&c| ("reduce: group column", c))
+            .chain(agg_descs.iter().map(|d| ("reduce: aggregate column", d.col_idx))),
+    )
 }
 
 /// Build the reduce output schema from `out_key`. `None` when the columns would
@@ -43,7 +36,7 @@ pub(super) fn build_reduce_output_schema(
     let mut b = DerivedSchema::new();
     for slot in out_key.output_layout(input.pk_indices(), group_cols) {
         match slot {
-            gnitz_wire::ReduceOutSlot::SyntheticKey => b.push_pk(SchemaColumn::new(type_code::U128, 0))?,
+            gnitz_wire::ReduceOutSlot::SyntheticKey => b.push_pk(super::super::group_key::GROUP_PK_COL)?,
             gnitz_wire::ReduceOutSlot::Key(c) => b.push_pk(input.columns[c as usize])?,
             gnitz_wire::ReduceOutSlot::Carried(c) => b.push(input.columns[c as usize])?,
         }
@@ -231,20 +224,11 @@ impl ReducePlan {
         })
     }
 
-    /// The output PK of the group `row` of `mb` belongs to — the one derivation,
-    /// read by the group walk's retraction seek and emitted row and by the
-    /// ad-hoc fold's reply row. `PkPermutation` borrows the input PK region;
-    /// every other kind keys by a value it does not carry.
+    /// The output PK of the group `row` of `mb` belongs to — read by the group
+    /// walk's retraction seek and emitted row and by the ad-hoc fold's reply row.
     #[inline]
     pub(super) fn out_pk<'a>(&self, mb: &'a MemBatch, row: usize) -> OutPk<'a> {
-        if self.out_key == ReduceOutKey::PkPermutation {
-            OutPk::Borrowed(mb.get_pk_bytes(row))
-        } else {
-            OutPk::Narrow(NarrowPkOpk::new(
-                self.group_key.key_row(mb, row),
-                self.output_schema.pk_stride(),
-            ))
-        }
+        group_out_pk(self.out_key, &self.group_key, self.output_schema.pk_stride(), mb, row)
     }
 
     /// Group-exemplar output columns, in payload order — the *leading* payload
@@ -258,25 +242,6 @@ impl ReducePlan {
             self.group_key.cols.locs()
         } else {
             &[]
-        }
-    }
-}
-
-/// One row's reduce output PK: borrowed out of the batch, or held inline. A
-/// returned value rather than a caller's scratch, so the borrowed arm copies
-/// nothing.
-pub(super) enum OutPk<'a> {
-    Borrowed(&'a [u8]),
-    Narrow(NarrowPkOpk),
-}
-
-impl OutPk<'_> {
-    /// The `pk_stride` OPK bytes of the key.
-    #[inline]
-    pub(super) fn bytes(&self) -> &[u8] {
-        match self {
-            OutPk::Borrowed(b) => b,
-            OutPk::Narrow(k) => k.bytes(),
         }
     }
 }

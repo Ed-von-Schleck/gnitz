@@ -47,6 +47,8 @@ operand_idx! {
     MapIdx;
     /// Index into `Program::reduce_plans`.
     PlanIdx;
+    /// Index into `Program::topn_plans`.
+    TopNIdx;
     /// A register whose **batch** an instruction reads or writes. Minted only by
     /// `push_delta_reg`.
     ///
@@ -142,6 +144,15 @@ pub(in crate::query) enum Instr {
         /// emission roles, ground flags), and the value-index table.
         plan_idx: PlanIdx,
     },
+    /// Per-group top-N: the ordered index of every input row is populated with
+    /// the delta before the walk, and the output integrates into `trace_out_reg`
+    /// through the `Integrate` the emitter puts behind it.
+    TopN {
+        in_reg: DeltaReg,
+        trace_out_reg: TraceReg,
+        out_reg: DeltaReg,
+        plan_idx: TopNIdx,
+    },
 }
 
 /// The registers whose **batch** `instr` reads — a trace port names a cursor and
@@ -180,6 +191,12 @@ pub(in crate::query) fn reads(instr: &Instr) -> [Option<DeltaReg>; 2] {
             out_reg: _,
             plan_idx: _,
         } => [Some(*in_reg), None],
+        Instr::TopN {
+            in_reg,
+            trace_out_reg: _,
+            out_reg: _,
+            plan_idx: _,
+        } => [Some(*in_reg), None],
     }
 }
 
@@ -188,10 +205,10 @@ pub(in crate::query) fn reads(instr: &Instr) -> [Option<DeltaReg>; 2] {
 /// replay skips it — stated here, beside the dispatch, so the two cannot drift.
 pub(in crate::query) fn writes_state_during_replay(instr: &Instr) -> bool {
     match instr {
-        // `WeightClamp` writes its history table, `Reduce` its value index. A
-        // `Reduce`'s output trace is written by the `Integrate` the emitter puts
-        // behind it, not here.
-        Instr::WeightClamp { .. } | Instr::Reduce { .. } => true,
+        // `WeightClamp` writes its history table, `Reduce` its value index,
+        // `TopN` its ordered index. A `Reduce`'s or `TopN`'s output trace is
+        // written by the `Integrate` the emitter puts behind it, not here.
+        Instr::WeightClamp { .. } | Instr::Reduce { .. } | Instr::TopN { .. } => true,
         Instr::Integrate { .. }
         | Instr::Filter { .. }
         | Instr::Map { .. }
@@ -309,6 +326,13 @@ pub(in crate::query) struct BakedReduce {
     pub(in crate::query) avi_table: Option<TableIdx>,
 }
 
+/// One `Instr::TopN`'s baked operator data: the plan and the table its ordered
+/// index lives in.
+pub(in crate::query) struct BakedTopN {
+    pub(in crate::query) plan: gnitz_store::ops::TopNPlan,
+    pub(in crate::query) index_table: TableIdx,
+}
+
 /// A compiled DBSP program: immutable once built, owning every resource its
 /// instructions name except the mutable tables ([`VmHandle`]) — each in the index
 /// space its own operand is a position in, so nothing is numbered twice.
@@ -321,6 +345,8 @@ pub(in crate::query) struct Program {
     pub(in crate::query) maps: Vec<MapPlan>,
     /// Baked per-`Instr::Reduce` plans, the reduce's value-index bake included.
     pub(in crate::query) reduce_plans: Vec<BakedReduce>,
+    /// Baked per-`Instr::TopN` plans, each with its index table.
+    pub(in crate::query) topn_plans: Vec<BakedTopN>,
     /// For each register, the pc of the last instruction that reads it — so an
     /// instruction may empty a register in place exactly when it is that reader.
     /// `u32::MAX` marks a register no instruction may take: the sink (read by the

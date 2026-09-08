@@ -11,10 +11,11 @@
 
 use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::{build_agg_out_schema, FinalizeItem, FoldShape};
-use crate::exec::order::{order_exprs, wire_order, OrderKey};
+use crate::exec::order::wire_order;
 use crate::expr_lower::{compile_conjuncts_evaluator, compile_scalar_evaluator};
 use crate::hir::bind_and_lower_fold;
 use crate::ir::BoundExpr;
+use crate::tail::{order_exprs, OrderKey};
 use crate::validate::reject_duplicate_projection_names;
 use gnitz_core::{ColumnDef, Schema};
 use sqlparser::ast::Select;

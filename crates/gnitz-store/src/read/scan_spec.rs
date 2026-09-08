@@ -559,11 +559,7 @@ fn resolve_order_locs(order: &[OrderKey], reply_schema: &SchemaDescriptor) -> Re
     order
         .iter()
         .map(|k| match (k.col as usize) < reply_schema.num_columns() {
-            true => Ok(OrderLocator {
-                loc: reply_schema.locate(k.col as usize),
-                desc: k.desc,
-                nulls_first: k.nulls_first,
-            }),
+            true => Ok(OrderLocator::of(reply_schema.locate(k.col as usize), k)),
             false => Err(StoreError::rejected(format!(
                 "scan_spec: order key column {} out of range ({} cols)",
                 k.col,

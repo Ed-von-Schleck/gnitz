@@ -17,6 +17,7 @@ mod exec;
 mod expr_lower;
 mod hir;
 mod ir;
+mod tail;
 #[cfg(test)]
 mod test_support;
 mod types;

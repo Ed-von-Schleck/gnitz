@@ -34,7 +34,7 @@ pub(crate) fn lower_join_view(
     let pieces = emit_step(chain, memo, down, join)?;
     // The emitted pk-list is the synthetic key region; its width is the number of
     // identity-free slots the layout leads with.
-    let layout = key_region_layout(pieces.2, project_items.iter().map(|i| i.out.id));
+    let layout = key_region_layout(pieces.pk_arity, project_items.iter().map(|i| i.out.id));
     Ok((pieces, layout))
 }
 
@@ -124,7 +124,11 @@ fn emit_equi(
     let (sink_input, final_cols) = project_tail(&mut cb, merged, down.items, &frame)?;
     cb.sink(sink_input);
     let circuit = cb.build();
-    Ok((circuit, final_cols, k))
+    Ok(EmitPieces {
+        circuit,
+        out_cols: final_cols,
+        pk_arity: k,
+    })
 }
 
 // ── Range / band emission ───────────────────────────────────────────────────────
@@ -239,7 +243,11 @@ fn emit_range(
     let sharded = cb.shard(sink_input, &(0..pair_pk).collect::<Vec<_>>());
     cb.sink(sharded);
     let circuit = cb.build();
-    Ok((circuit, final_cols, pair_pk))
+    Ok(EmitPieces {
+        circuit,
+        out_cols: final_cols,
+        pk_arity: pair_pk,
+    })
 }
 
 // ── Cross emission ──────────────────────────────────────────────────────────────
@@ -299,7 +307,11 @@ fn emit_cross(down: Demand<'_>, class: &JoinClass, sides: &[JoinSide; 2]) -> Res
 
     let sharded = cb.shard(sink_input, &(0..pair_pk).collect::<Vec<_>>());
     cb.sink(sharded);
-    Ok((cb.build(), final_cols, pair_pk))
+    Ok(EmitPieces {
+        circuit: cb.build(),
+        out_cols: final_cols,
+        pk_arity: pair_pk,
+    })
 }
 
 // ── keep-set + shared helpers ───────────────────────────────────────────────────

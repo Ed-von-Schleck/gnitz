@@ -1,9 +1,10 @@
 use super::*;
 use crate::exec::batch::{project, resolve_projection};
+use crate::tail::{order_exprs, parse_order_by};
 use crate::test_support::{col_def, parse_query};
 use gnitz_core::TypeCode;
 use gnitz_expr::ColumnLocator;
-use sqlparser::ast::{SelectItem, SetExpr};
+use sqlparser::ast::{Expr, OrderBy, SelectItem, SetExpr};
 
 // The per-type window comparison itself (`cmp_typed_le`) is pinned by
 // gnitz-wire's own tests; the tests here cover the sink built on it.
@@ -507,45 +508,4 @@ fn sink_rejects_unsupported_order_by_forms() {
     // Positional out of range → error (position 9 > 2 output cols; position 0).
     assert!(mk("SELECT id, v FROM t ORDER BY 9").is_err());
     assert!(mk("SELECT id, v FROM t ORDER BY 0").is_err());
-}
-
-#[test]
-fn resolve_order_by_rejects_clickhouse_duckdb_extensions() {
-    // `ORDER BY ALL` / `WITH FILL` / `INTERPOLATE` only reach `resolve_order_by`
-    // as their typed AST forms under a dialect that parses them (GenericDialect
-    // parses `ALL` as an identifier), so drive the arms directly.
-    use sqlparser::ast::{Ident, Interpolate, OrderByExpr, OrderByOptions, WithFill};
-    let ident_key = || OrderByExpr {
-        expr: Expr::Identifier(Ident::new("v")),
-        options: OrderByOptions::default(),
-        with_fill: None,
-    };
-
-    let all = OrderBy {
-        kind: OrderByKind::All(OrderByOptions::default()),
-        interpolate: None,
-    };
-    assert!(matches!(resolve_order_by(&all), Err(GnitzSqlError::Unsupported(_))));
-
-    let interpolate = OrderBy {
-        kind: OrderByKind::Expressions(vec![ident_key()]),
-        interpolate: Some(Interpolate { exprs: None }),
-    };
-    assert!(matches!(
-        resolve_order_by(&interpolate),
-        Err(GnitzSqlError::Unsupported(_))
-    ));
-
-    let with_fill = OrderBy {
-        kind: OrderByKind::Expressions(vec![OrderByExpr {
-            expr: Expr::Identifier(Ident::new("v")),
-            options: OrderByOptions::default(),
-            with_fill: Some(WithFill { from: None, to: None, step: None }),
-        }]),
-        interpolate: None,
-    };
-    assert!(matches!(
-        resolve_order_by(&with_fill),
-        Err(GnitzSqlError::Unsupported(_))
-    ));
 }

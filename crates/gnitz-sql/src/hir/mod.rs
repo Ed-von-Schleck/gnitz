@@ -51,7 +51,7 @@ pub(crate) fn bind_and_lower(
     let ids = ColIdGen::new();
     let mut cx = bind::BindCx::new(cat, binder, &ids, surface);
     bind::bind_ctes(&mut cx, query)?;
-    let rel = bind::bind_body(&mut cx, query.body.as_ref())?;
+    let rel = bind::bind_query(&mut cx, query)?;
     let rel = rewrite::decorrelate(rel, &ids)?;
     let rel = rewrite::classify(rel)?;
     lower::lower(chain, rel, bounded)
@@ -354,6 +354,28 @@ pub(crate) enum RelExpr {
         right: Rc<RelExpr>,
         out: Vec<SetOpCol>,
     },
+    /// Per-partition top-N: the rows of `input` filling weight slots
+    /// `offset .. offset + limit` of each `partition` value in `order` (then the
+    /// input's row key, then the whole row — a total order, so the result is a
+    /// function of the Z-set). Its output is `input`'s columns. `ORDER BY …
+    /// LIMIT` on a view body is the empty partition; `QUALIFY ROW_NUMBER() OVER
+    /// (…) <= n` names one.
+    TopN {
+        input: Rc<RelExpr>,
+        partition: Vec<ColId>,
+        order: Vec<TopNKey>,
+        limit: u64,
+        offset: u64,
+    },
+}
+
+/// One ORDER BY key of a [`RelExpr::TopN`]: a column of its input, its
+/// direction, and where NULLs go.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TopNKey {
+    pub col: ColId,
+    pub desc: bool,
+    pub nulls_first: bool,
 }
 
 /// Where a `Get`'s rows come from: a catalog relation, or the ad-hoc read's
@@ -721,6 +743,18 @@ impl RelExpr {
         Rc::new(RelExpr::Distinct { input })
     }
 
+    /// A top-N over `input`. `limit ≥ 1`, and every key names an input column.
+    pub(crate) fn top_n(
+        input: Rc<RelExpr>,
+        partition: Vec<ColId>,
+        order: Vec<TopNKey>,
+        limit: u64,
+        offset: u64,
+    ) -> Rc<RelExpr> {
+        debug_assert!(limit >= 1, "a top-N selects at least one slot");
+        Rc::new(RelExpr::TopN { input, partition, order, limit, offset })
+    }
+
     /// A fresh read of `input`: every column under a newly minted id.
     pub(crate) fn alias(ids: &ColIdGen, input: Rc<RelExpr>) -> Rc<RelExpr> {
         let cols = input
@@ -776,6 +810,8 @@ impl RelExpr {
             RelExpr::Reduce { group_cols, .. } => Some(group_cols.clone()),
             RelExpr::Distinct { input } => Some(input.cols().iter().map(|c| c.id).collect()),
             RelExpr::SetOp { out, .. } => Some(out.iter().map(|c| c.out.id).collect()),
+            // A subset of its input's rows under its input's identities.
+            RelExpr::TopN { input, .. } => input.row_key(),
             RelExpr::Join { .. } => None,
         }
     }
@@ -889,6 +925,13 @@ impl RelExpr {
                 right: r,
                 out: out.clone(),
             })),
+            RelExpr::TopN { input, partition, order, limit, offset } => one!(input, |n| RelExpr::top_n(
+                n,
+                partition.clone(),
+                order.clone(),
+                *limit,
+                *offset
+            )),
         })
     }
 
@@ -943,7 +986,7 @@ impl RelExpr {
                 }
                 cols
             }
-            RelExpr::Distinct { input } => input.cols(),
+            RelExpr::Distinct { input } | RelExpr::TopN { input, .. } => input.cols(),
             RelExpr::Alias { cols, .. } => cols.clone(),
             RelExpr::SetOp { out, .. } => out.iter().map(|c| c.out.clone()).collect(),
         }

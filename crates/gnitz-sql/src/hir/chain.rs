@@ -10,8 +10,6 @@ use crate::error::GnitzSqlError;
 use gnitz_core::{segment_id, Circuit, ColumnDef, PlannedView, Schema};
 use std::sync::Arc;
 
-/// Circuit + output columns + pk-list — the pieces every view emitter returns
-/// for a pre-allocated view id; the caller wraps them into a `PlannedView`.
 /// How many leading output columns are the PK region. Every emitter puts the PK
 /// at the front, so the arity is the whole pk-list — `pk_col_list` spells it out
 /// at the wire boundary, and nothing in between carries the redundant vector.
@@ -22,7 +20,13 @@ pub(crate) fn pk_col_list(pk: PkArity) -> Vec<u32> {
     (0..pk as u32).collect()
 }
 
-pub(crate) type EmitPieces = (Circuit, Vec<ColumnDef>, PkArity);
+/// What every view emitter returns for a pre-allocated view id; the caller wraps
+/// it into a `PlannedView`.
+pub(crate) struct EmitPieces {
+    pub circuit: Circuit,
+    pub out_cols: Vec<ColumnDef>,
+    pub pk_arity: PkArity,
+}
 
 /// Structural check of every emitted circuit's exchange topology, catching a
 /// planner regression at the emitter rather than as a `CREATE VIEW` rejection
@@ -118,6 +122,10 @@ pub(crate) fn reject_circuit_column_overflow(circuit: &Circuit) -> Result<(), Gn
                 check("a view circuit aggregate list", agg.len())?;
             }
             OpNode::ExchangeShard { shard_cols } => check("a view circuit shard key", shard_cols.len())?,
+            OpNode::TopN { group_cols, order, limit: _, offset: _ } => {
+                check("a view circuit top-N group key", group_cols.len())?;
+                check("a view circuit top-N order key", order.len())?;
+            }
             OpNode::NullExtend { type_codes } => check("a view circuit null-fill region", type_codes.len())?,
             // No counted list to check.
             OpNode::ScanDelta { .. }
@@ -188,13 +196,13 @@ impl ViewChain {
         emit: impl FnOnce(&mut ViewChain) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError>,
     ) -> Result<SegInput, GnitzSqlError> {
         let seg = self.mint();
-        let ((circuit, cols, pk), layout) = emit(self)?;
-        debug_assert_exchange_topology(&circuit);
+        let (pieces, layout) = emit(self)?;
+        debug_assert_exchange_topology(&pieces.circuit);
         // After the output schema, so a segment too wide to register is named by
         // its own columns rather than by whichever node first exceeds the cap.
-        let schema = schema_of(&cols, pk, "view segment output")?;
-        reject_circuit_column_overflow(&circuit)?;
-        self.push_hidden(seg, cols, pk, circuit);
+        let schema = schema_of(&pieces.out_cols, pieces.pk_arity, "view segment output")?;
+        reject_circuit_column_overflow(&pieces.circuit)?;
+        self.push_hidden(seg, pieces.out_cols, pieces.pk_arity, pieces.circuit);
         Ok(SegInput {
             tid: segment_id(seg as u64),
             schema,

@@ -26,6 +26,20 @@ fn log_tick_ingest_err(op: &str, table_idx: TableIdx, r: Result<(), StorageError
     })
 }
 
+/// A cursor over an operator's own index right after this epoch's rows went in:
+/// opened last, so a prefix seek sees them; compacted first, as
+/// `compact_owned_traces` does before any other operator-state read.
+fn index_cursor(
+    op: &str,
+    idx: TableIdx,
+    table: &mut Table,
+    res: Result<(), StorageError>,
+) -> Result<ReadCursor, StorageError> {
+    log_tick_ingest_err(op, idx, res)?;
+    let _ = table.compact_if_needed();
+    Ok(table.open_cursor())
+}
+
 /// Execute one epoch over `inputs`, one `(register, batch)` per seeded input —
 /// two for a set-op post phase, one everywhere else. Returns the output
 /// register's batch, or `None` when the epoch produced nothing.
@@ -247,16 +261,11 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
                 let baked = &program.reduce_plans[plan_idx.at()];
                 let to_cursor = bound_cursor(cursors, *trace_out_reg);
 
-                // Opened last, so the prefix seek sees this epoch's own entries;
-                // compacted first, as `compact_owned_traces` does before any other
-                // operator-state read.
                 let mut avi_cursor = match baked.avi_table.zip(baked.plan.avi.as_ref()) {
                     Some((idx, bake)) => {
                         let table = &mut tables[idx.at()];
                         let res = ops::op_populate_avi(&batches[in_reg.at()], table, bake);
-                        log_tick_ingest_err("avi", idx, res)?;
-                        let _ = table.compact_if_needed();
-                        Some(table.open_cursor())
+                        Some(index_cursor("avi", idx, table, res)?)
                     }
                     None => None,
                 };
@@ -270,6 +279,24 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
 
                 let raw_out = ops::op_reduce(&batches[in_reg.at()], to_cursor, avi_cursor.as_mut(), &baked.plan);
                 batches[out_reg.at()] = raw_out;
+            }
+
+            Instr::TopN { in_reg, trace_out_reg, out_reg, plan_idx } => {
+                let baked = &program.topn_plans[plan_idx.at()];
+                gnitz_debug!("vm: TOPN in_count={}", batches[in_reg.at()].len());
+                // An empty delta touches no group, so opening a cursor over the
+                // index — which holds every row the operator has seen — buys
+                // nothing. Reachable whenever an upstream filter empties it.
+                batches[out_reg.at()] = if batches[in_reg.at()].is_empty() {
+                    Batch::empty_with_schema(&baked.plan.output_schema)
+                } else {
+                    let to_cursor = bound_cursor(cursors, *trace_out_reg);
+                    let idx = baked.index_table;
+                    let table = &mut tables[idx.at()];
+                    let res = ops::op_populate_topn(&batches[in_reg.at()], table, &baked.plan.index);
+                    let mut history = index_cursor("topn index", idx, table, res)?;
+                    ops::op_topn(&batches[in_reg.at()], to_cursor, &mut history, &baked.plan)
+                };
             }
         }
 

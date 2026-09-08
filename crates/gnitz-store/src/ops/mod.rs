@@ -4,6 +4,8 @@
 //!   - `linear`    — filter, negate, union (Theorem 3.3: no state added)
 //!   - `join`      — the bilinear operator, equi and range, over one probe
 //!   - `reduce`    — the aggregates and their combined value index (`avi`)
+//!   - `topn`      — per-group top-N over an ordered index of every input row
+//!   - `order_image` — the byte images both indexes order by
 //!   - `distinct`  — the weight clamps every set operation is built from
 //!   - `exchange`  — repartition, relay and broadcast across workers
 //!   - `cogroup` / `group_key` — the shared grouping and key machinery
@@ -25,7 +27,9 @@ mod exchange;
 mod group_key;
 mod join;
 mod linear;
+mod order_image;
 mod reduce;
+mod topn;
 
 #[cfg(test)]
 mod bench_join;
@@ -40,3 +44,4 @@ pub use linear::{null_extend_output_schema, op_union, union_nullability_merge};
 pub use linear::{op_filter, op_negate};
 pub(crate) use reduce::AdhocFold;
 pub use reduce::{op_populate_avi, op_reduce, ReducePlan};
+pub use topn::{op_populate_topn, op_topn, TopNPlan};

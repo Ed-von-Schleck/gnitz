@@ -1,6 +1,5 @@
 //! Output row emitters: raw reduce rows and the global-aggregate ground row.
 
-use crate::schema::ColumnLocator;
 use crate::storage::{Batch, MemBatch};
 use gnitz_wire::WideKind;
 
@@ -60,25 +59,7 @@ pub(super) fn emit_reduce_row(
     let mut null_word: u64 = 0;
 
     for (out_pi, loc) in plan.exemplar_locs().iter().enumerate() {
-        match *loc {
-            ColumnLocator::Pk { .. } => {
-                // PK lives in the OPK region; decode the addressed column back to
-                // native LE before copying into the payload region (a raw copy
-                // keeps the flipped sign bit / big-endian order for signed and
-                // wide columns).
-                let mut scratch = [0u8; 16];
-                output.extend_col(out_pi, loc.native_le_bytes(input_mb, exemplar_row, &mut scratch));
-            }
-            ColumnLocator::Payload { slot, size, type_code } => {
-                let cs = size as usize;
-                let is_null = loc.is_null(input_mb, exemplar_row);
-                if is_null {
-                    gnitz_wire::null_word_set(&mut null_word, out_pi, true);
-                }
-                let cell = (!is_null).then(|| input_mb.get_col_ptr(exemplar_row, slot as usize, cs));
-                output.append_payload_cell(out_pi, type_code, cs, cell, input_mb.blob, None);
-            }
-        }
+        output.append_cell_from(out_pi, loc, input_mb, exemplar_row, &mut null_word);
     }
     emit_agg_cols(output, accs, plan.exemplar_locs().len(), &mut null_word);
 

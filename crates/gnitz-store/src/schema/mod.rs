@@ -695,6 +695,18 @@ impl SchemaDescriptor {
         (ci < self.num_columns()).then(|| self.columns[ci])
     }
 
+    /// Bound every `(what, column)` of `cols` against this schema. Ahead of the
+    /// derivations an operator's `from_wire` runs, each of which indexes the
+    /// fixed column array raw; `what` names the list the index came from.
+    pub(crate) fn check_cols<'a>(&self, cols: impl IntoIterator<Item = (&'a str, u32)>) -> Result<(), OpBuildErr> {
+        for (what, c) in cols {
+            if self.column(c as usize).is_none() {
+                return Err(OpBuildErr::oob_col(what, c, self));
+            }
+        }
+        Ok(())
+    }
+
     /// Where column `ci` lives, or `None` when it is out of range — the total
     /// [`Self::locate`], whose own bound is a release-active panic.
     #[inline]

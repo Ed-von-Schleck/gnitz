@@ -396,8 +396,7 @@ fn build_query_segments(
     // then lower to circuit(s) — nested combine segments, shared CTE subtrees and
     // self-collision pass-through wrappers land on `chain`, and the final step
     // becomes the chain's slot-0 view.
-    let (circuit, out_cols, pk_cols) =
-        crate::hir::bind_and_lower(cat, binder, chain, query, capacity.is_some(), surface)?;
+    let pieces = crate::hir::bind_and_lower(cat, binder, chain, query, capacity.is_some(), surface)?;
 
     // Structural eligibility, over what the body actually compiled to rather than
     // over the shapes it was written in: both bounded shapes are a single segment,
@@ -419,20 +418,20 @@ fn build_query_segments(
     // dependency order; append the (user-named or synthetic) final view. The
     // hidden ones were checked inside `add_segment`; this is the other of the two
     // paths every emitted circuit reaches.
-    debug_assert_exchange_topology(&circuit);
+    debug_assert_exchange_topology(&pieces.circuit);
     // The admissibility rules only — not `schema_of`, whose `Schema::from_parts`
     // deep-clones every `ColumnDef` for a value nothing here reads.
-    let pk_col_list = crate::hir::chain::pk_col_list(pk_cols);
-    Schema::validate_parts(&pk_col_list, &out_cols)
+    let pk_col_list = crate::hir::chain::pk_col_list(pieces.pk_arity);
+    Schema::validate_parts(&pk_col_list, &pieces.out_cols)
         .map_err(|e| GnitzSqlError::Unsupported(format!("view output: {e}")))?;
     // After the output schema, so a view too wide to register is named by its own
     // columns; this catches the narrow-output body whose intermediates are wide.
-    reject_circuit_column_overflow(&circuit)?;
+    reject_circuit_column_overflow(&pieces.circuit)?;
     chain.segments.push(PlannedView {
         // The user-named view is always the chain's slot 0.
         seg: 0,
-        circuit,
-        output_columns: out_cols,
+        circuit: pieces.circuit,
+        output_columns: pieces.out_cols,
         pk_cols: pk_col_list,
         capacity_bytes: capacity,
         delta_bytes: options.delta,

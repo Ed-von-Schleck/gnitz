@@ -2,8 +2,9 @@
 //! set has a canonical (order-preserving, injective) single-column key, and the
 //! 128-bit key of a row either way.
 
-use crate::schema::key::FoldCols;
-use crate::schema::{ColumnLocator, SchemaDescriptor};
+use crate::schema::key::{FoldCols, NarrowPkOpk, ReindexPacker};
+use crate::schema::{type_code, ColumnLocator, DerivedSchema, ReduceOutKey, SchemaColumn, SchemaDescriptor};
+use crate::storage::MemBatch;
 use gnitz_expr::RowSource;
 
 /// Whether the group key of `group_by_cols` can be emitted through the
@@ -82,6 +83,61 @@ impl GroupKeyCols {
             return col.route_key(src, row);
         }
         self.cols.key_row(src, row, src.get_null_word(row))
+    }
+}
+
+/// The synthetic `_group_pk` key — the whole PK region of an output whose group
+/// set has no natural key. One definition, so every operator keyed like a reduce
+/// keys its output at the same width.
+pub(super) const GROUP_PK_COL: SchemaColumn = SchemaColumn::new(type_code::U128, 0);
+
+/// Push a group-keyed secondary index's PK region — the packed group key, then
+/// the `suffix` columns the packer reserved room for — onto `b`. Infallible by
+/// construction: `ReindexPacker::new_group_key` accepted this exact suffix, so
+/// every column it hands back is non-null and PK-eligible and the whole region
+/// fits.
+pub(super) fn push_group_index_key(b: &mut DerivedSchema, packer: &ReindexPacker, suffix: &[SchemaColumn]) {
+    for c in packer.key_columns().chain(suffix.iter().copied()) {
+        b.push_pk(c)
+            .expect("a group key packed inside the suffix reservation, plus the suffix, is non-null PK-eligible");
+    }
+}
+
+/// One row's group output PK: borrowed out of the batch, or held inline. A
+/// returned value rather than a caller's scratch, so the borrowed arm copies
+/// nothing.
+pub(super) enum OutPk<'a> {
+    Borrowed(&'a [u8]),
+    Narrow(NarrowPkOpk),
+}
+
+impl OutPk<'_> {
+    /// The `pk_stride` OPK bytes of the key.
+    #[inline]
+    pub(super) fn bytes(&self) -> &[u8] {
+        match self {
+            OutPk::Borrowed(b) => b,
+            OutPk::Narrow(k) => k.bytes(),
+        }
+    }
+}
+
+/// The output PK of the group `row` of `mb` belongs to, under `out_key` — the
+/// one derivation for every operator keyed like a reduce (the reduce itself and
+/// the top-N). `PkPermutation` borrows the input PK region; every other kind
+/// keys by a value it does not carry, at the output's `out_stride`.
+#[inline]
+pub(super) fn group_out_pk<'a>(
+    out_key: ReduceOutKey,
+    group_key: &GroupKeyCols,
+    out_stride: usize,
+    mb: &'a MemBatch,
+    row: usize,
+) -> OutPk<'a> {
+    if out_key == ReduceOutKey::PkPermutation {
+        OutPk::Borrowed(mb.get_pk_bytes(row))
+    } else {
+        OutPk::Narrow(NarrowPkOpk::new(group_key.key_row(mb, row), out_stride))
     }
 }
 

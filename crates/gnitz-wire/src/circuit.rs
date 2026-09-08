@@ -49,13 +49,16 @@ wire_enum! {
         ExchangeShard = 17,
         NullExtend = 18,
         WorkerFilter = 19,
+        /// Per-group top-N: the rows filling the first `limit` weight slots past
+        /// `offset` of each group in ORDER BY order.
+        TopN = 20,
     }
 }
 
 /// The `params` blob layout, folded into [`crate::SYS_SCHEMA_DIGEST`] rather
 /// than written into the blob: the digest is what refuses a stored
 /// `CIRCUIT_NODES` blob decoded under a new layout.
-pub(crate) const CIRCUIT_PARAMS_VERSION: u8 = 3;
+pub(crate) const CIRCUIT_PARAMS_VERSION: u8 = 4;
 
 // ---------------------------------------------------------------------------
 // Typed circuit-node representation (shared between gnitz-core and gnitz-server)
@@ -248,23 +251,44 @@ impl ReduceOutKey {
         }
     }
 
-    /// The output layout this kind selects, up to the aggregate columns each side
-    /// types for itself.
+    /// The source columns spelling the output's PK region, in output PK order, or
+    /// `None` for the synthetic fold key. Borrowed from the caller's own lists —
+    /// no kind builds a region of its own.
     ///
     /// `SingleNaturalCol` names `group_cols[0]`, which [`Self::for_group_cols`]
     /// only selects for a single-column group set — so the index is in range by
     /// construction. The ad-hoc fold's hardcoded `SyntheticFold` never reaches
     /// that arm.
-    pub fn output_layout(self, pk_cols: &[u32], group_cols: &[u32]) -> Vec<ReduceOutSlot> {
+    pub fn key_region<'a>(self, pk_cols: &'a [u32], group_cols: &'a [u32]) -> Option<&'a [u32]> {
         match self {
             // The output PK region mirrors the source's PK byte layout, so it
             // walks the PK list in order rather than `group_cols` order.
-            ReduceOutKey::PkPermutation => pk_cols.iter().map(|&c| ReduceOutSlot::Key(c)).collect(),
-            ReduceOutKey::SingleNaturalCol => vec![ReduceOutSlot::Key(group_cols[0])],
-            ReduceOutKey::SyntheticFold => std::iter::once(ReduceOutSlot::SyntheticKey)
+            ReduceOutKey::PkPermutation => Some(pk_cols),
+            ReduceOutKey::SingleNaturalCol => Some(&group_cols[..1]),
+            ReduceOutKey::SyntheticFold => None,
+        }
+    }
+
+    /// The output layout this kind selects, up to the aggregate columns each side
+    /// types for itself: the key region ([`Self::key_region`]), then — the fold
+    /// arm only — the group columns its synthetic key does not spell.
+    pub fn output_layout(self, pk_cols: &[u32], group_cols: &[u32]) -> Vec<ReduceOutSlot> {
+        match self.key_region(pk_cols, group_cols) {
+            Some(keys) => keys.iter().map(|&c| ReduceOutSlot::Key(c)).collect(),
+            None => std::iter::once(ReduceOutSlot::SyntheticKey)
                 .chain(group_cols.iter().map(|&c| ReduceOutSlot::Carried(c)))
                 .collect(),
         }
+    }
+
+    /// The input columns an output carries *behind* the key region when it keeps
+    /// the whole input row (`OpNode::TopN`): every column the PK region does not
+    /// already spell, in input schema order. The rule the planner's declared
+    /// schema and the engine's emitted batch must agree on, so it lives here
+    /// rather than once on each side.
+    pub fn carried_columns(self, pk_cols: &[u32], group_cols: &[u32], num_columns: u32) -> Vec<u32> {
+        let keys = self.key_region(pk_cols, group_cols).unwrap_or_default();
+        (0..num_columns).filter(|c| !keys.contains(c)).collect()
     }
 }
 
@@ -425,6 +449,19 @@ pub enum OpNode {
     /// this node). Worker identity is a compile-time constant, so no payload
     /// travels on the wire.
     WorkerFilter,
+    /// Per-group top-N over the input: for each `group_cols` value, the rows
+    /// occupying weight slots `offset .. offset + limit` of the group sorted by
+    /// `order` (then by the whole row, so the order is total over Z-set
+    /// elements), each at the weight of the slots it fills. The output is keyed
+    /// like a `Reduce` over the same group set ([`ReduceOutKey`]) and carries
+    /// every input column behind that key. `order` columns index the input
+    /// schema. `limit` is never `0`.
+    TopN {
+        group_cols: Vec<u32>,
+        order: Vec<crate::OrderKey>,
+        limit: u64,
+        offset: u64,
+    },
 }
 
 impl OpNode {
@@ -447,7 +484,8 @@ impl OpNode {
             | OpNode::IntegrateTrace
             | OpNode::ExchangeShard { .. }
             | OpNode::NullExtend { .. }
-            | OpNode::WorkerFilter => 1,
+            | OpNode::WorkerFilter
+            | OpNode::TopN { .. } => 1,
         }
     }
 }
@@ -643,6 +681,15 @@ pub fn encode_op_node(op: OpNode) -> (Opcode, Option<u64>, Option<Vec<u8>>) {
             (Opcode::NullExtend, None, Some(w.into_vec()))
         }
         OpNode::WorkerFilter => (Opcode::WorkerFilter, None, None),
+        OpNode::TopN { group_cols, order, limit, offset } => {
+            w.u64(limit).u64(offset);
+            write_cols(&mut w, &group_cols);
+            write_count(&mut w, order.len(), "TOP_N order keys");
+            for key in &order {
+                crate::read_spec::write_order_key(&mut w, key);
+            }
+            (Opcode::TopN, None, Some(w.into_vec()))
+        }
     }
 }
 
@@ -742,6 +789,23 @@ pub fn decode_op_node(opcode: u64, src_tab: Option<u64>, params: Option<&[u8]>) 
             OpNode::NullExtend { type_codes }
         }
         Opcode::WorkerFilter => OpNode::WorkerFilter,
+        Opcode::TopN => {
+            let limit = r.u64()?;
+            let offset = r.u64()?;
+            if limit == 0 {
+                return Err("TOP_N carries a zero limit".to_string());
+            }
+            let group_cols = read_cols(&mut r)?;
+            let n = read_count(&mut r, "TOP_N order keys")?;
+            if n > crate::MAX_ORDER_KEYS {
+                return Err(format!("TOP_N: {n} order keys exceeds cap {}", crate::MAX_ORDER_KEYS));
+            }
+            let mut order = Vec::with_capacity(n);
+            for _ in 0..n {
+                order.push(crate::read_spec::read_order_key(&mut r)?);
+            }
+            OpNode::TopN { group_cols, order, limit, offset }
+        }
     };
     r.expect_consumed()?;
     Ok(node)

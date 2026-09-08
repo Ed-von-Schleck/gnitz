@@ -124,7 +124,7 @@ fn synthetic_fold_cols(
     (r.cols, r.group_slots)
 }
 
-fn group_pk_def() -> ColumnDef {
+pub(crate) fn group_pk_def() -> ColumnDef {
     ColumnDef::new("_group_pk", TypeCode::U128, false).hidden()
 }
 
@@ -239,36 +239,41 @@ pub(crate) fn reduce_output_schema(sh: &ReduceShape<'_>) -> Result<ReduceLayout,
     })
 }
 
+/// The group columns a group-keyed operator (a reduce, a top-N) shards and keys
+/// by, given the output key its group set selects.
+///
+/// For `PkPermutation`, that is the group columns in source-PK (schema) order,
+/// not the user's GROUP BY / PARTITION BY order. The groups are identical under
+/// any permutation of the PK (each group is a PK singleton), and the output
+/// schema emits the PK in source-PK order regardless — so this only normalizes
+/// the shard key. Without it a permuted grouping (e.g. `GROUP BY pk1, pk0`)
+/// shards by a non-PK-order key: the co-partition analyzer (correctly) declines
+/// to skip the exchange, the shuffle hash-routes by `[pk1, pk0]`, and the output
+/// lands partitioned by `hash(pk1, pk0)` rather than by the view's declared PK
+/// `(pk0, pk1)` — so the multi-worker gather drops the rows that hashed to a
+/// different worker. Sharding in PK order keeps the operator co-partitioned with
+/// the source (the exchange is skipped, or routes by `worker_for_pk_bytes`), so
+/// the view stays partitioned by its real PK. The other kinds keep the user
+/// order: their synthetic/single-natural PK and output layout depend on it (the
+/// fold arm carries the group columns in group-set order).
+pub(crate) fn shard_group_cols(out_key: ReduceOutKey, source_schema: &Schema, group_cols: &[usize]) -> Vec<usize> {
+    if out_key == ReduceOutKey::PkPermutation {
+        source_schema.pk_cols.iter().map(|&c| c as usize).collect()
+    } else {
+        group_cols.to_vec()
+    }
+}
+
 /// Emit the reduce operator(s) for a group set — the two-phase / replicated /
 /// sharded strategy selection. One home for the view path and the HIR reduce
 /// shell; `filtered` is the (already WHERE-filtered) input node.
-///
-/// For `PkPermutation`, shard/reindex the reduce by the group columns in
-/// source-PK (schema) order, not the user's GROUP BY order. The groups are
-/// identical under any permutation of the PK (each group is a PK singleton),
-/// and `build_reduce_output_schema` emits the output PK in source-PK order
-/// regardless — so this only normalizes the shard key. Without it a permuted
-/// grouping (e.g. `GROUP BY pk1, pk0`) shards by a non-PK-order key: the
-/// co-partition analyzer (correctly) declines to skip the exchange, the shuffle
-/// hash-routes by `[pk1, pk0]`, and the reduce output lands partitioned by
-/// `hash(pk1, pk0)` rather than by the view's declared PK `(pk0, pk1)` — so the
-/// multi-worker gather drops the rows that hashed to a different worker.
-/// Sharding in PK order keeps the reduce co-partitioned with the source (the
-/// exchange is skipped, or routes by `worker_for_pk_bytes`), so the view
-/// stays partitioned by its real PK. The other kinds keep the user order: their
-/// synthetic/single-natural PK and reduce layout depend on it (the fold arm
-/// carries the group columns in GROUP BY order).
 pub(crate) fn emit_reduce(
     cb: &mut gnitz_core::CircuitBuilder,
     filtered: gnitz_core::NodeId,
     sh: &ReduceShape<'_>,
 ) -> gnitz_core::NodeId {
     let agg_specs = sh.specs;
-    let reduce_group_cols: Vec<usize> = if sh.out_key == ReduceOutKey::PkPermutation {
-        sh.source_schema.pk_cols.iter().map(|&c| c as usize).collect()
-    } else {
-        sh.group_cols.to_vec()
-    };
+    let reduce_group_cols = shard_group_cols(sh.out_key, sh.source_schema, sh.group_cols);
     // The circuit builder needs only (op, col) per spec; out_type is the
     // planner's concern and already shaped the reduce schema above.
     let circuit_specs: Vec<(WireAggFunc, usize)> = agg_specs.iter().map(|s| (s.op, s.col)).collect();

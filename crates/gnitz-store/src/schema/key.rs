@@ -1228,6 +1228,16 @@ impl ReindexPacker {
     /// One pass over the source columns, between the two key-level slots a
     /// group key carries: the leading presence bitmap, whose bits are the NULL
     /// tests the packed slots already perform, and the trailing fold.
+    /// [`Self::pack_into`] over the leading `out_stride` bytes of `buf`,
+    /// returning them — the prefix a group-keyed secondary index seeks by, so the
+    /// key's width is read off the packer rather than re-sliced per index.
+    #[inline]
+    pub(crate) fn pack_prefix<'a, R: RowSource>(&self, buf: &'a mut [u8], batch: &R, row: usize) -> &'a [u8] {
+        let n = self.out_stride;
+        self.pack_into(&mut buf[..n], batch, row);
+        &buf[..n]
+    }
+
     #[inline]
     pub(crate) fn pack_into<R: RowSource>(&self, dst: &mut [u8], batch: &R, row: usize) {
         let null_word = batch.get_null_word(row);

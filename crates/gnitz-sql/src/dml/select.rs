@@ -27,14 +27,13 @@ use crate::bind::{bind_single_table, output_column, Binder};
 use crate::codec::project_schema::{build_read_projection, read_reply_shape};
 use crate::dml::cte::inline_ctes;
 use crate::dml::group_by::build_fold_shape;
-use crate::dml::plan::{
-    bind_where, bound_and_predicate, extract_limit, extract_offset, fetch_bound, Access, ReadBudget,
-};
+use crate::dml::plan::{bind_where, bound_and_predicate, fetch_bound, Access, ReadBudget};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::exec::agg_finish::{agg_finish, build_agg_out_schema, FinalizeItem, FoldShape};
-use crate::exec::order::{order_exprs, parse_order_by, read_spec_finish, resolve_read_spec_order, wire_order, Window};
+use crate::exec::order::{read_spec_finish, resolve_read_spec_order, wire_order, Window};
 use crate::expr_lower::compile_scalar_evaluator;
 use crate::ir::BoundExpr;
+use crate::tail::{extract_limit, extract_offset, order_exprs, parse_order_by};
 use crate::validate::{
     computed_column, order_column, reject_duplicate_projection_names, reject_unhonored_query_clauses,
     reject_unhonored_select_clauses, HonoredClauses, QueryEnvelope,
@@ -42,7 +41,7 @@ use crate::validate::{
 use crate::SqlResult;
 use gnitz_core::{CatalogSnapshot, GnitzClient, RelDescriptor, Schema, ZSetBatch};
 use gnitz_wire::{AggDescriptor, AggReadSpec, ReadSink};
-use sqlparser::ast::{LimitClause, Query, Select, SetExpr, Statement};
+use sqlparser::ast::{Query, Select, SetExpr, Statement};
 use std::sync::Arc;
 
 /// The single derivation-rejection: an ad-hoc SELECT reads one relation, but this
@@ -135,16 +134,6 @@ fn route_select<'q>(
     // ordering sink over the fetched batch, and WITH was expanded before routing.
     // Everything else is rejected up front so nothing is silently dropped.
     reject_unhonored_query_clauses(query, QueryEnvelope::DirectSelect, "direct SELECT")?;
-    // The `LIMIT … BY` (ClickHouse per-group) sub-form has no operator here, so
-    // reject it rather than silently accept-and-ignore it.
-    if let Some(LimitClause::LimitOffset { limit_by, .. }) = &query.limit_clause {
-        if !limit_by.is_empty() {
-            return Err(GnitzSqlError::Unsupported(
-                "LIMIT ... BY is not supported in direct SELECT".to_string(),
-            ));
-        }
-    }
-
     // Step 1 — body kind. A set-op body derives; a plain SELECT continues; every
     // other body (VALUES, a parenthesized query, TABLE t) is a plain `Unsupported`
     // naming the shape — NOT the derivation template, because CREATE VIEW rejects

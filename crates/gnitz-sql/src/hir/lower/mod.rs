@@ -43,6 +43,7 @@ mod linear;
 pub(crate) mod prims;
 pub(crate) mod reduce;
 pub(crate) mod setop;
+pub(crate) mod topn;
 
 use super::chain::{EmitPieces, ViewChain};
 use super::physical;
@@ -414,6 +415,7 @@ fn reject_ineligible_capacity_body(rel: &RelExpr) -> Result<(), GnitzSqlError> {
         }
         RelExpr::Distinct { .. } => "a root DISTINCT",
         RelExpr::SetOp { .. } => "a root set operation",
+        RelExpr::TopN { .. } => "ORDER BY … LIMIT",
         _ => "this body",
     };
     Err(GnitzSqlError::Unsupported(format!(
@@ -438,7 +440,7 @@ fn lower_body(
             match source.as_ref() {
                 RelExpr::Get { .. } => {
                     let src = seginput_of_get(source).expect("a view body reads a catalog Get");
-                    lower_linear(&src, fpreds, items)
+                    linear::emit_linear(&src, fpreds, items)
                 }
                 RelExpr::Join {
                     kind: JoinType::Semi | JoinType::Anti, ..
@@ -451,14 +453,17 @@ fn lower_body(
                 // A derived table (a projection, DISTINCT, or set operation) is not a
                 // delta source the linear path can read in place, so it cuts even for
                 // a bare-column projection; an alias resolves to whatever it reads.
-                RelExpr::Project { .. } | RelExpr::Distinct { .. } | RelExpr::SetOp { .. } | RelExpr::Alias { .. } => {
-                    lower_computed_over_combine(chain, memo, items, fpreds, source)
-                }
+                RelExpr::Project { .. }
+                | RelExpr::Distinct { .. }
+                | RelExpr::SetOp { .. }
+                | RelExpr::Alias { .. }
+                | RelExpr::TopN { .. } => lower_computed_over_combine(chain, memo, items, fpreds, source),
                 _ => Err(unsupported_body()),
             }
         }
         RelExpr::Distinct { input } => setop::lower_distinct(chain, memo, input),
         RelExpr::SetOp { .. } => setop::lower_setop(chain, memo, rel),
+        RelExpr::TopN { .. } => topn::lower_topn(chain, memo, rel),
         _ => Err(unsupported_body()),
     }
 }
@@ -489,7 +494,7 @@ fn lower_computed_over_combine(
     let mut live: HashSet<ColId> = HashSet::new();
     Demand { items, where_preds }.refs(&mut live);
     let seg = resolve_input(chain, memo, source, &live)?;
-    lower_linear(&seg, where_preds, items)
+    linear::emit_linear(&seg, where_preds, items)
 }
 
 /// A body shape the driver has no arm for. Every shape bind can produce is
@@ -590,7 +595,7 @@ fn as_body(subtree: &Rc<RelExpr>, live: &HashSet<ColId>) -> Rc<RelExpr> {
                 RelExpr::project(Rc::clone(input), narrowed)
             }
         }
-        RelExpr::Distinct { .. } | RelExpr::SetOp { .. } => Rc::clone(subtree),
+        RelExpr::Distinct { .. } | RelExpr::SetOp { .. } | RelExpr::TopN { .. } => Rc::clone(subtree),
         // The HIR spelling of `SELECT <live cols> FROM <subtree>`.
         _ => {
             let items = RelExpr::passthrough_items(subtree.cols().into_iter().filter(|c| live.contains(&c.id)));
@@ -634,7 +639,7 @@ pub(crate) fn resolve_collisions(
 /// `SegInput` over it — the collision-resolution device shared by the self-join
 /// wrapper and the same-relation set-op/DISTINCT wrapper. Being a second
 /// materialized relation, it carries only what `live` demands of *this* side,
-/// exactly as a cut segment does, and it is lowered through `lower_linear` so the
+/// exactly as a cut segment does, and it is lowered through `linear::emit_linear` so the
 /// PK-front convention comes from `physicalize_projection`.
 fn wrap_passthrough_segment(
     chain: &mut ViewChain,
@@ -651,23 +656,7 @@ fn wrap_passthrough_segment(
             .filter(|(def, id)| !def.is_hidden && live.contains(id))
             .map(|(def, id)| super::HirCol::new(*id, def.clone())),
     );
-    chain.add_segment(|_chain| lower_linear(src, &[], &items))
-}
-
-/// Lower a linear body over a resolved source `SegInput` (a base/segment `Get`, or
-/// a combine subtree already cut to a hidden segment): resolve the WHERE against
-/// the source layout, extract the scan bound, physicalize the projection, and hand
-/// the physical inputs to `linear::emit_linear`.
-fn lower_linear(
-    src: &SegInput,
-    filter_preds: &[HirExpr],
-    proj_items: &[ProjEntry],
-) -> Result<(EmitPieces, Vec<ColId>), GnitzSqlError> {
-    let preds = physical::resolve_preds(filter_preds, &src.layout)?;
-    let bound = extract_scan_bound(&preds, src);
-    let proj = physical::physicalize_projection(proj_items, &src.layout, &src.schema)?;
-    let pieces = linear::emit_linear(src, bound, &preds, &proj)?;
-    Ok((pieces, proj.layout))
+    chain.add_segment(|_chain| linear::emit_linear(src, &[], &items))
 }
 
 /// Resolve `preds` against `layout`, compile their AND, and emit the filter —
@@ -691,7 +680,7 @@ pub(crate) fn emit_filter<'a>(
 
 /// Scan-bound extraction — a primary-position lowering decision (source and the
 /// resolved WHERE both in hand). Only a catalog source bounds. Shared by every
-/// primary-position `Get` lowering (`lower_linear` here, `reduce::lower_reduce`'s
+/// primary-position `Get` lowering (`linear::emit_linear` here, `reduce::lower_reduce`'s
 /// inline-source arm).
 pub(crate) fn extract_scan_bound(preds: &[crate::ir::BoundExpr], src: &SegInput) -> Option<IndexBound> {
     // The head candidate outright: this path compiles no residual — the `Filter`

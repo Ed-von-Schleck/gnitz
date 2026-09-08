@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{bind_where, col_def, idx_metas_flagged, parse_query, pk_schema, two_col};
+use crate::test_support::{bind_where, col_def, idx_metas_flagged, pk_schema, two_col};
 use gnitz_core::TypeCode;
 
 /// The plan for `where_expr` against `lists` (the table's indexes).
@@ -205,39 +205,4 @@ fn an_unpinned_pk_range_yields_to_a_full_unique_point() {
         plan.buffered_scope(&schema).0.is_none(),
         "an index bound never pins a PK key"
     );
-}
-
-#[test]
-fn extract_limit_offset_literals_and_errors() {
-    let q = parse_query("SELECT * FROM t LIMIT 3 OFFSET 2");
-    assert_eq!(extract_limit(&q).unwrap(), Some(3));
-    assert_eq!(extract_offset(&q).unwrap(), 2);
-    // MySQL `LIMIT off, lim`.
-    let q = parse_query("SELECT * FROM t LIMIT 2, 3");
-    assert_eq!(extract_limit(&q).unwrap(), Some(3));
-    assert_eq!(extract_offset(&q).unwrap(), 2);
-    // Absent → None / 0.
-    let q = parse_query("SELECT * FROM t");
-    assert_eq!(extract_limit(&q).unwrap(), None);
-    assert_eq!(extract_offset(&q).unwrap(), 0);
-    // A non-integer-literal errors instead of silently degrading.
-    for sql in [
-        "SELECT * FROM t LIMIT 1+1",
-        "SELECT * FROM t LIMIT 'x'",
-        "SELECT * FROM t LIMIT -1",
-    ] {
-        assert!(
-            matches!(extract_limit(&parse_query(sql)), Err(GnitzSqlError::Unsupported(_))),
-            "{sql} must error"
-        );
-    }
-    for sql in [
-        "SELECT * FROM t LIMIT 1 OFFSET 1+1",
-        "SELECT * FROM t LIMIT 1 OFFSET 'x'",
-    ] {
-        assert!(
-            matches!(extract_offset(&parse_query(sql)), Err(GnitzSqlError::Unsupported(_))),
-            "{sql} must error"
-        );
-    }
 }

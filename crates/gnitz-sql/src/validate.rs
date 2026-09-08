@@ -412,8 +412,10 @@ pub(crate) enum QueryEnvelope {
     /// a parenthesized set-op side.
     Bare,
     /// A view body, shared by CREATE VIEW and `ALTER VIEW … AS`: a `WITH` (CTE)
-    /// clause is compiled by the `bind_ctes` phase, and no other tail clause has
-    /// incremental-view semantics.
+    /// clause is compiled by the `bind_ctes` phase, and `ORDER BY` + `LIMIT` are
+    /// maintained as a top-N. No other tail clause has incremental-view
+    /// semantics. The sink pair's own rules, a leftover `OFFSET` included, are
+    /// the body binder's.
     ViewBody,
     /// Direct SELECT: a `WITH` (expanded by `dml::cte`), plus the
     /// client-side ordering sink — `ORDER BY` and `LIMIT`/`OFFSET` are applied
@@ -436,7 +438,7 @@ pub(crate) fn reject_unhonored_query_clauses(
     context: &str,
 ) -> Result<(), GnitzSqlError> {
     let with_ok = !matches!(honored, QueryEnvelope::Bare);
-    let sink_ok = matches!(honored, QueryEnvelope::DirectSelect);
+    let sink_ok = matches!(honored, QueryEnvelope::DirectSelect | QueryEnvelope::ViewBody);
     let sqlparser::ast::Query {
         // Dispatched on by the caller (the SELECT / set-op / VALUES / CTE body).
         body: _,

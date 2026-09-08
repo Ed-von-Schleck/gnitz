@@ -268,6 +268,20 @@ pub struct OrderLocator {
     pub nulls_first: bool,
 }
 
+impl OrderLocator {
+    /// The key `wire` names, over a column already located. Direction and NULL
+    /// placement ride through unchanged: the wire spells them in the same sense
+    /// this does, so no reader of a wire key re-flips them.
+    #[inline]
+    pub fn of(loc: ColumnLocator, wire: &gnitz_wire::OrderKey) -> Self {
+        OrderLocator {
+            loc,
+            desc: wire.desc,
+            nulls_first: wire.nulls_first,
+        }
+    }
+}
+
 /// The one ORDER BY comparator, read by both the worker's top-k and the client's
 /// ordering sink. Lexicographic over the keys; NULL placement is absolute —
 /// `nulls_first` decides it and `desc` does not flip it. `Equal` means the keys

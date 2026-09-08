@@ -9,7 +9,7 @@ use super::batch_pool::{acquire_arena, debug_poison, recycle_buf, Fill};
 use super::columnar::ColumnarSource;
 use super::merge::{self, relocate_german_string_vec, BlobCache, BlobCacheGuard, ColPtr, MemBatch};
 use crate::schema::key::NarrowPkOpk;
-use crate::schema::{SchemaDescriptor, DELTA_TICK_COL};
+use crate::schema::{ColumnLocator, SchemaDescriptor, DELTA_TICK_COL};
 use gnitz_expr::RowSource;
 use gnitz_wire::{align8, read_i64_le, read_u64_le};
 
@@ -1691,6 +1691,36 @@ impl Batch {
                 self.extend_col(out_pi, &dest);
             }
             Some(cell) => self.extend_col(out_pi, cell),
+        }
+    }
+
+    /// Append the column at `loc` of `src`'s row into output slot `out_pi`,
+    /// setting its bit in `null_word` when NULL. A PK source is *decoded* out of
+    /// its OPK window: a raw copy would carry the flipped sign bit and
+    /// big-endian order into the payload region.
+    #[inline]
+    pub(crate) fn append_cell_from<S: RowSource>(
+        &mut self,
+        out_pi: usize,
+        loc: &ColumnLocator,
+        src: &S,
+        row: usize,
+        null_word: &mut u64,
+    ) {
+        match *loc {
+            ColumnLocator::Pk { .. } => {
+                let mut scratch = [0u8; 16];
+                self.extend_col(out_pi, loc.native_le_bytes(src, row, &mut scratch));
+            }
+            ColumnLocator::Payload { slot, size, type_code } => {
+                let cs = size as usize;
+                let is_null = loc.is_null(src, row);
+                if is_null {
+                    gnitz_wire::null_word_set(null_word, out_pi, true);
+                }
+                let cell = (!is_null).then(|| src.get_col_ptr(row, slot as usize, cs));
+                self.append_payload_cell(out_pi, type_code, cs, cell, src.blob(), None);
+            }
         }
     }
 

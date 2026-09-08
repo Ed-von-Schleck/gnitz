@@ -296,7 +296,11 @@ pub(crate) fn lower_semi_anti_view(
     cb.sink(sink_input);
     let circuit = cb.build();
     Ok((
-        (circuit, final_cols, npk),
+        EmitPieces {
+            circuit,
+            out_cols: final_cols,
+            pk_arity: npk,
+        },
         key_region_layout(npk, items.iter().map(|i| i.out.id)),
     ))
 }
@@ -343,7 +347,7 @@ pub(crate) fn lower_mark_view(
     cb.sink(out);
     let circuit = cb.build();
     Ok((
-        (circuit, out_cols, npk),
+        EmitPieces { circuit, out_cols, pk_arity: npk },
         key_region_layout(npk, items.iter().map(|i| i.out.id)),
     ))
 }

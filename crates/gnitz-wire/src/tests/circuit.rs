@@ -53,6 +53,15 @@ fn sample(op: Opcode) -> OpNode {
             key: vec![(2, None), (5, Some(TypeCode::I64))],
             role: ReindexRole::ScatterKey,
         }),
+        Opcode::TopN => OpNode::TopN {
+            group_cols: vec![1],
+            order: vec![
+                crate::OrderKey { col: 3, desc: true, nulls_first: false },
+                crate::OrderKey { col: 0, desc: false, nulls_first: true },
+            ],
+            limit: 10,
+            offset: 5,
+        },
     }
 }
 
@@ -83,6 +92,13 @@ fn every_op_node_variant_roundtrips() {
             global_ground: true,
         },
     ]);
+    // The global shape: no group, one key, no offset.
+    nodes.push(OpNode::TopN {
+        group_cols: vec![],
+        order: vec![crate::OrderKey { col: 2, desc: false, nulls_first: false }],
+        limit: 1,
+        offset: 0,
+    });
     for &role in ReindexRole::ALL {
         nodes.push(OpNode::Map(MapKind::Reindex {
             keep: vec![0],
@@ -344,4 +360,46 @@ fn for_group_cols_picks_the_output_key() {
             "{pk:?} {group:?} {col:?}"
         );
     }
+}
+
+/// A top-N that selects nothing, or orders by more keys than a read may, is a
+/// forged circuit — the planner never emits either.
+#[test]
+fn top_n_rejects_a_zero_limit_and_too_many_keys() {
+    let decode = |limit, n_keys| {
+        let order = (0..n_keys)
+            .map(|i| crate::OrderKey {
+                col: i as u16,
+                desc: false,
+                nulls_first: false,
+            })
+            .collect();
+        let (_, _, params) = encode_op_node(OpNode::TopN {
+            group_cols: vec![],
+            order,
+            limit,
+            offset: 0,
+        });
+        decode_op_node(Opcode::TopN.as_wire(), None, params.as_deref())
+    };
+    assert!(decode(0, 1).unwrap_err().contains("zero limit"));
+    assert!(decode(1, crate::MAX_ORDER_KEYS + 1).unwrap_err().contains("order keys"));
+    assert!(decode(1, crate::MAX_ORDER_KEYS).is_ok());
+}
+
+/// The columns a whole-row output carries behind its key region: exactly the
+/// ones the key region does not already spell, in schema order. Both the
+/// planner's declared schema and the engine's emitted batch are built from this,
+/// so it is the rule they agree by rather than mirror.
+#[test]
+fn carried_columns_are_the_input_minus_the_key_region() {
+    use ReduceOutKey::*;
+    // The fold key spells no input column, so the whole input rides behind it —
+    // group columns included, since the synthetic key is not one of them.
+    assert_eq!(SyntheticFold.carried_columns(&[0], &[2], 4), vec![0, 1, 2, 3]);
+    assert_eq!(SyntheticFold.carried_columns(&[0], &[], 3), vec![0, 1, 2]);
+    // A natural key column is in the PK region, so it is not carried again.
+    assert_eq!(SingleNaturalCol.carried_columns(&[0], &[2], 4), vec![0, 1, 3]);
+    // A permuted PK keys on every PK column whatever order the group set lists.
+    assert_eq!(PkPermutation.carried_columns(&[0, 2], &[2, 0], 4), vec![1, 3]);
 }

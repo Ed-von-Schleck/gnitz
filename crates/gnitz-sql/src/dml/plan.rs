@@ -11,13 +11,11 @@ use std::sync::Arc;
 use crate::access::{
     pk_point_tuple, ranked_index_bounds, try_extract_pk_in, try_extract_pk_range, IndexRangeCandidate,
 };
-use crate::ast_util::expr_usize_literal;
 use crate::error::GnitzSqlError;
 use crate::expr_lower::compile_wire_conjuncts;
 use crate::ir::BoundExpr;
 use gnitz_core::{opk_key_packed, GnitzClient, IndexMeta, PkBuf, Schema, ZSetBatch};
 use gnitz_wire::{ReadBound, ReadSink, ReadSpec};
-use sqlparser::ast::LimitClause;
 
 // ---------------------------------------------------------------------------
 // The access-path ladder
@@ -323,32 +321,6 @@ pub(crate) fn fetch_bound(
 // ---------------------------------------------------------------------------
 // LIMIT / OFFSET
 // ---------------------------------------------------------------------------
-
-/// The `LIMIT n` value, or `None` when absent. A non-integer-literal LIMIT
-/// (`LIMIT 1+1`, `LIMIT 'x'`) is a clean error — silently degrading it would
-/// return every row, violating the unhonored-clause contract.
-pub(crate) fn extract_limit(query: &sqlparser::ast::Query) -> Result<Option<usize>, GnitzSqlError> {
-    let limit = match &query.limit_clause {
-        // Exhaustive (no `..`): `limit_by` is the ClickHouse per-group sub-form,
-        // rejected in `route_select`; a future `sqlparser` field stops the build.
-        Some(LimitClause::LimitOffset { limit: Some(e), offset: _, limit_by: _ }) => e,
-        Some(LimitClause::OffsetCommaLimit { limit: e, offset: _ }) => e,
-        _ => return Ok(None),
-    };
-    expr_usize_literal(limit, "LIMIT").map(Some)
-}
-
-/// The `OFFSET n` value (both `LIMIT … OFFSET n` and the MySQL `LIMIT off, lim`
-/// form), or `0` when absent. Mirrors [`extract_limit`]: a non-integer-literal
-/// value errors rather than silently skipping nothing.
-pub(crate) fn extract_offset(query: &sqlparser::ast::Query) -> Result<usize, GnitzSqlError> {
-    let offset = match &query.limit_clause {
-        Some(LimitClause::LimitOffset { offset: Some(o), limit: _, limit_by: _ }) => &o.value,
-        Some(LimitClause::OffsetCommaLimit { offset, limit: _ }) => offset,
-        _ => return Ok(0),
-    };
-    expr_usize_literal(offset, "OFFSET")
-}
 
 // ---------------------------------------------------------------------------
 // Unit tests

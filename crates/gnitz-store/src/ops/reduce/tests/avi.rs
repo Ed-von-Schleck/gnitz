@@ -4,7 +4,7 @@
 use super::*;
 use crate::schema::{ColumnLocator, TypeCode};
 use crate::storage::MemBatch;
-use gnitz_wire::{ScalarKind, WideKind};
+use gnitz_wire::ScalarKind;
 
 /// One-row batch holding `le` (the value's native little-endian bytes) in a
 /// nullable payload column of type `tc`, plus the locator addressing it. The
@@ -145,71 +145,16 @@ fn pk_source_and_payload_source_encode_identically() {
     }
 }
 
-/// The AVI's own convention on top of the value image: a MAX ordinal stores the
-/// bitwise complement, so the index's ascending walk yields that ordinal's
-/// extreme first. Checked against the MIN image of the same row.
+/// The AVI's own convention on top of the shared value image: a MAX ordinal
+/// stores the bitwise complement, so the index's ascending walk yields that
+/// ordinal's extreme first. Checked against the MIN image of the same row.
 #[test]
 fn for_max_inverts_the_value_image() {
     let (b, loc) = payload_row(TypeCode::I64, &(-7i64).to_le_bytes());
     let mb: MemBatch = b.as_mem_batch();
     let kind = ScalarKind::Int(gnitz_wire::FixedInt::I64);
     assert_eq!(
-        av_encode(&loc, kind, true, &mb, 0),
-        !av_encode(&loc, kind, false, &mb, 0)
+        scalar_image(&loc, kind, true, &mb, 0),
+        !scalar_image(&loc, kind, false, &mb, 0)
     );
-}
-
-/// A wide image orders as the native value does — reversed for a MAX ordinal —
-/// on the whole image and on the key's [`leading_u64`] slot wherever that
-/// differs, and decodes back. Byte strings cover NULs, prefixes, and values
-/// longer than the slot.
-#[test]
-fn wide_image_orders_and_round_trips() {
-    let strings: Vec<&[u8]> = vec![
-        b"",
-        b"\0",
-        b"\0\0",
-        b"a",
-        b"a\0",
-        b"a\0b",
-        b"ab",
-        b"abc",
-        b"b",
-        b"shared-prefix-1",
-        b"shared-prefix-10",
-        b"shared-prefix-2",
-    ];
-    let ints: Vec<[u8; 16]> = [i128::MIN, -1, 0, 1, i128::MAX, u64::MAX as i128 + 1]
-        .into_iter()
-        .map(i128::to_le_bytes)
-        .collect();
-    let cases: Vec<(WideKind, Vec<&[u8]>)> = vec![
-        (WideKind::Bytes, strings),
-        (WideKind::Fixed(TypeCode::I128), ints.iter().map(|b| &b[..]).collect()),
-        (WideKind::Fixed(TypeCode::U128), ints.iter().map(|b| &b[..]).collect()),
-    ];
-    let mut ia = Vec::new();
-    let mut ib = Vec::new();
-    for (kind, vals) in cases {
-        for for_max in [false, true] {
-            for a in &vals {
-                wide_image(kind, for_max, a, &mut ia);
-                assert_eq!(&*wide_native_of_image(kind, for_max, &ia), *a, "{kind:?} {a:?}");
-                for b in &vals {
-                    wide_image(kind, for_max, b, &mut ib);
-                    let want = if for_max {
-                        kind.cmp_native(b, a)
-                    } else {
-                        kind.cmp_native(a, b)
-                    };
-                    assert_eq!(ia.cmp(&ib), want, "{kind:?} max={for_max} {a:?} vs {b:?}");
-                    let slot = leading_u64(&ia).cmp(&leading_u64(&ib));
-                    assert!(
-                        slot == want || slot.is_eq(),
-                        "{kind:?} max={for_max} slot {a:?} vs {b:?}"
-                    );
-                }
-            }
-        }
-    }
 }

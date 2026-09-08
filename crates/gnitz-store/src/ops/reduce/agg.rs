@@ -4,37 +4,15 @@ use crate::schema::{ColumnLocator, TypeCode};
 use gnitz_expr::RowSource;
 use gnitz_wire::{AggFunc, ScalarKind, WideKind};
 
-/// How a MIN/MAX aggregate's column is held and ordered: as its 8-byte order
-/// image, or as the native bytes of a value too wide for one.
-#[derive(Clone, Copy)]
-pub(crate) enum ExtremeKind {
-    Scalar(ScalarKind),
-    Wide(WideKind),
-}
+use super::super::order_image::{wide_native, ImageKind};
 
 /// The value-index parameters of one MIN/MAX aggregate: the column the index
 /// reads, how to encode it, and which end of the order the index puts first.
 #[derive(Clone, Copy)]
 pub(crate) struct ExtremeSpec {
     pub loc: ColumnLocator,
-    pub kind: ExtremeKind,
+    pub kind: ImageKind,
     pub for_max: bool,
-}
-
-/// The native bytes of the wide column at `loc` in `row`: a string's content,
-/// or the 16-byte little-endian integer.
-#[inline(always)]
-pub(super) fn wide_native<'a>(
-    loc: &ColumnLocator,
-    kind: WideKind,
-    mb: &'a impl RowSource,
-    row: usize,
-    scratch: &'a mut [u8; 16],
-) -> &'a [u8] {
-    match kind {
-        WideKind::Bytes => gnitz_wire::german_string_content(loc.bytes(mb, row), mb.blob()),
-        WideKind::Fixed(_) => loc.native_le_bytes(mb, row, scratch),
-    }
 }
 
 /// A stepped accumulator's value: a register image, or a wide extreme's native
@@ -87,7 +65,7 @@ enum StepKind {
     SumZero(ScalarKind),
     /// Keep the extreme: a scalar as its MIN-oriented order image in `acc`, a
     /// wide value as its native bytes in `wide`. `max` picks the direction.
-    Extreme { max: bool, kind: ExtremeKind },
+    Extreme { max: bool, kind: ImageKind },
 }
 
 /// `AdhocFold` holds `groups × aggregates` of these, with `groups` bounded by
@@ -114,10 +92,7 @@ impl Accumulator {
             AggFunc::SumZero => StepKind::SumZero(scalar()?),
             AggFunc::Min | AggFunc::Max => StepKind::Extreme {
                 max: agg_op == AggFunc::Max,
-                kind: match scalar() {
-                    Some(kind) => ExtremeKind::Scalar(kind),
-                    None => ExtremeKind::Wide(WideKind::from_type_code(tc)?),
-                },
+                kind: ImageKind::of(tc)?,
             },
         };
         let linear = agg_op.is_linear();
@@ -197,8 +172,8 @@ impl Accumulator {
             return None;
         }
         Some(match self.kind {
-            StepKind::Extreme { kind: ExtremeKind::Wide(kind), .. } => AggValue::Wide(kind, &self.wide),
-            StepKind::Extreme { kind: ExtremeKind::Scalar(kind), .. } => {
+            StepKind::Extreme { kind: ImageKind::Wide(kind), .. } => AggValue::Wide(kind, &self.wide),
+            StepKind::Extreme { kind: ImageKind::Scalar(kind), .. } => {
                 let bits = kind.order_inverse(self.acc as u64);
                 AggValue::Bits(match kind {
                     ScalarKind::F32 => f64::to_bits(f32::from_bits(bits as u32) as f64),
@@ -230,7 +205,7 @@ impl Accumulator {
     pub(super) fn seed_encoded_extreme(&mut self, enc: u64) {
         debug_assert!(matches!(
             self.kind,
-            StepKind::Extreme { kind: ExtremeKind::Scalar(_), .. }
+            StepKind::Extreme { kind: ImageKind::Scalar(_), .. }
         ));
         self.acc = enc as i64;
         self.has_value = true;
@@ -260,10 +235,7 @@ impl Accumulator {
     /// Seed a wide MIN/MAX accumulator with the native bytes the AVI probe
     /// decoded out of the index.
     pub(super) fn seed_wide(&mut self, v: &[u8]) {
-        debug_assert!(matches!(
-            self.kind,
-            StepKind::Extreme { kind: ExtremeKind::Wide(_), .. }
-        ));
+        debug_assert!(matches!(self.kind, StepKind::Extreme { kind: ImageKind::Wide(_), .. }));
         self.store_wide(v);
     }
 
@@ -298,10 +270,10 @@ impl Accumulator {
     /// the input-row step and the stored-output fold reach, so the scalar and
     /// wide arms have one spelling.
     #[inline(always)]
-    fn fold_extreme_at(&mut self, loc: ColumnLocator, rows: &impl RowSource, row: usize, max: bool, kind: ExtremeKind) {
+    fn fold_extreme_at(&mut self, loc: ColumnLocator, rows: &impl RowSource, row: usize, max: bool, kind: ImageKind) {
         match kind {
-            ExtremeKind::Scalar(kind) => self.fold_extreme(max, loc.order_bits(rows, row, kind)),
-            ExtremeKind::Wide(kind) => {
+            ImageKind::Scalar(kind) => self.fold_extreme(max, loc.order_bits(rows, row, kind)),
+            ImageKind::Wide(kind) => {
                 let mut scratch = [0u8; 16];
                 self.fold_wide(max, kind, wide_native(&loc, kind, rows, row, &mut scratch));
             }
@@ -380,7 +352,7 @@ impl Accumulator {
                 // domain and re-encoding it is exact. A float source's output
                 // widens to F64 and always probes instead.
                 debug_assert!(
-                    !matches!(kind, ExtremeKind::Scalar(k) if k.is_float()),
+                    !matches!(kind, ImageKind::Scalar(k) if k.is_float()),
                     "a float extreme is never folded from its output column"
                 );
                 self.fold_extreme_at(self.out, out_row, row, max, kind);

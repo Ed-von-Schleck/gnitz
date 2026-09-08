@@ -158,5 +158,5 @@ pub(crate) fn lower_reduce(
     let circuit = cb.build();
 
     reject_duplicate_column_names(out_cols.iter(), "GROUP BY view")?;
-    Ok(((circuit, out_cols, pk_len), out_layout))
+    Ok((EmitPieces { circuit, out_cols, pk_arity: pk_len }, out_layout))
 }

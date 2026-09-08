@@ -39,7 +39,9 @@
 //! holds the band self-join's traces over `G`, one row per peer group.
 
 use super::bind::{bind_projection, hir_ref_nullable, type_of, ItemLeaf};
-use super::{as_col, col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, JoinType, ProjEntry, RelExpr};
+use super::{
+    as_col, col_by_id, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, JoinType, ProjEntry, RelExpr, TopNKey,
+};
 use crate::agg::default_agg_name;
 use crate::ast_util::{
     agg_func_from_name, classify_agg_shape, peel_nested, reject_fn_qualifiers, single_fn_name, unknown_function,
@@ -67,7 +69,8 @@ pub(crate) fn bind_window_final<L: ItemLeaf>(
     rel: Rc<RelExpr>,
     leaf: &L,
     ctx: &str,
-) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    order_exprs: &[&Expr],
+) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
     let wleaf = WindowLeaf {
         inner: leaf,
         ids,
@@ -76,8 +79,11 @@ pub(crate) fn bind_window_final<L: ItemLeaf>(
         state: RefCell::new(Windows::default()),
         aliases: RefCell::new(Vec::new()),
     };
-    let items = bind_projection(&select.projection, &wleaf, ids, ctx)?;
+    let mut items = bind_projection(&select.projection, &wleaf, ids, ctx)?;
     reject_duplicate_projection_names(&select.projection, items.iter().map(|e| &e.out.def), ctx)?;
+    // The body's `ORDER BY … LIMIT` keys, placed like any other body's — a
+    // window call among them binds to its placeholder like a SELECT item does.
+    let placed = super::bind::place_order_keys(order_exprs, &mut items, ids, &wleaf)?;
     // The table exists so `QUALIFY rn = 1` can reach `… AS rn`, and the QUALIFY
     // bind below is the only read of it — published only now, so the SELECT list
     // itself does not see its own names.
@@ -92,7 +98,94 @@ pub(crate) fn bind_window_final<L: ItemLeaf>(
         None => None,
     };
     let win = wleaf.state.into_inner();
-    desugar(ids, rel, leaf.env(), items, qualify, win)
+    if let Some(q) = &qualify {
+        if let Some(top_n) = top_n_of_qualify(ids, &rel, leaf.env(), &items, q, &win)? {
+            return Ok((top_n, placed));
+        }
+    }
+    Ok((desugar(ids, rel, leaf.env(), items, qualify, win)?, placed))
+}
+
+/// `QUALIFY ROW_NUMBER() OVER (PARTITION BY p… ORDER BY o…) <= n` (also `< n`
+/// and `= 1`, with the literal on either side), the row number itself not
+/// projected: a per-partition top-N, which the operator maintains in
+/// `O(n)` per touched partition where the desugar's band self-join re-emits
+/// the whole partition. `None` for every other shape, which keeps the desugar.
+fn top_n_of_qualify(
+    ids: &ColIdGen,
+    input: &Rc<RelExpr>,
+    env: &[HirCol],
+    items: &[ProjEntry],
+    qualify: &HirExpr,
+    win: &Windows,
+) -> Result<Option<Rc<RelExpr>>, GnitzSqlError> {
+    let [call] = win.calls.as_slice() else {
+        return Ok(None);
+    };
+    if !call.row_number {
+        return Ok(None);
+    }
+    let mut referenced = false;
+    for it in items {
+        it.expr
+            .for_each_ref(&mut |r| referenced |= matches!(r, HirRef::Col(id) if *id == call.out.id));
+    }
+    if referenced {
+        return Ok(None);
+    }
+    let Some(limit) = row_number_bound(qualify, call.out.id) else {
+        return Ok(None);
+    };
+    let spec = &win.specs[call.spec];
+    // The SELECT list and the keys read `W`, the input narrowed to what they
+    // reference plus what the keys compute, exactly as the desugar hoists it.
+    let mut h = Hoist::new(ids, env, &[]);
+    let items = items
+        .iter()
+        .map(|it| {
+            Ok(ProjEntry {
+                expr: h.refs(&it.expr)?,
+                out: it.out.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, GnitzSqlError>>()?;
+    let partition: Vec<ColId> = spec.partition.iter().map(|e| h.hoist(e)).collect();
+    // A window key is provably NOT NULL, so its NULL placement never applies.
+    let order: Vec<TopNKey> = spec
+        .order
+        .iter()
+        .map(|(e, asc)| TopNKey {
+            col: h.hoist(e),
+            desc: !asc,
+            nulls_first: !asc,
+        })
+        .collect();
+    let w = RelExpr::project(Rc::clone(input), h.items);
+    let top_n = RelExpr::top_n(w, partition, order, limit, 0);
+    Ok(Some(RelExpr::project(top_n, items)))
+}
+
+/// The `n` of a `rn <= n` / `rn < n` / `rn = 1` QUALIFY over placeholder `rn`,
+/// as a top-N limit; `None` for any other predicate, or a bound selecting
+/// nothing.
+fn row_number_bound(qualify: &HirExpr, rn: ColId) -> Option<u64> {
+    let BExpr::BinOp(l, op, r) = qualify else {
+        return None;
+    };
+    let is_rn = |e: &HirExpr| matches!(e, BExpr::ColRef(HirRef::Col(id)) if *id == rn);
+    // Normalize to `rn OP n`; `x OP y` ⟺ `y OP.converse() x`.
+    let (op, n) = match (l.as_ref(), r.as_ref()) {
+        (lhs, BExpr::LitInt(n)) if is_rn(lhs) => (*op, *n),
+        (BExpr::LitInt(n), rhs) if is_rn(rhs) => (op.converse(), *n),
+        _ => return None,
+    };
+    let limit = match op {
+        BinOp::Le => n,
+        BinOp::Lt => n.saturating_sub(1),
+        BinOp::Eq if n == 1 => 1,
+        _ => return None,
+    };
+    (limit >= 1).then_some(limit as u64)
 }
 
 // ── Binding ─────────────────────────────────────────────────────────────────────
@@ -123,6 +216,9 @@ struct Spec<K> {
 struct Call<K> {
     spec: usize,
     func: WinFunc,
+    /// Written as `ROW_NUMBER()`: `func` is `Rank` over an order the row key
+    /// makes total, so the two agree on every value.
+    row_number: bool,
     arg: Option<K>,
     out: HirCol,
 }
@@ -309,6 +405,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
         st.calls.push(Call {
             spec: spec_idx,
             func,
+            row_number,
             arg,
             out: out.clone(),
         });
@@ -522,7 +619,21 @@ struct Hoist<'a> {
     by_col: HashMap<ColId, ColId>,
 }
 
-impl Hoist<'_> {
+impl<'a> Hoist<'a> {
+    /// A hoist over `env`, with nothing hoisted yet. `placeholders` are the
+    /// window-call outputs a rebuilt expression may still name (empty where the
+    /// calls are gone).
+    fn new(ids: &'a ColIdGen, env: &'a [HirCol], placeholders: &'a [HirCol]) -> Self {
+        Hoist {
+            ids,
+            env,
+            placeholders,
+            items: Vec::new(),
+            by_sub: HashMap::new(),
+            by_col: HashMap::new(),
+        }
+    }
+
     /// The `W` column holding `e` — a pass-through when `e` is a bare source
     /// column, else a computed column evaluating it over the body's scope. One
     /// per distinct expression, found by scanning what is already hoisted.
@@ -614,14 +725,7 @@ fn desugar(
     win: Windows,
 ) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let placeholders: Vec<HirCol> = win.calls.iter().map(|c| c.out.clone()).collect();
-    let mut h = Hoist {
-        ids,
-        env,
-        placeholders: &placeholders,
-        items: Vec::new(),
-        by_sub: HashMap::new(),
-        by_col: HashMap::new(),
-    };
+    let mut h = Hoist::new(ids, env, &placeholders);
     let items = items
         .into_iter()
         .map(|it| Ok(ProjEntry { expr: h.refs(&it.expr)?, out: it.out }))
@@ -633,6 +737,7 @@ fn desugar(
         .map(|c| Call {
             spec: c.spec,
             func: c.func,
+            row_number: c.row_number,
             arg: c.arg.as_ref().map(|a| h.hoist(a)),
             out: c.out.clone(),
         })

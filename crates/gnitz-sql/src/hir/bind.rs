@@ -8,7 +8,7 @@
 
 use super::{
     as_col, col_by_id, hircol_of, ColId, ColIdGen, HirAgg, HirCol, HirExpr, HirRef, InPair, JoinType, ProjEntry,
-    RelExpr, SetOpKind, SubqueryKind, SubqueryRef,
+    RelExpr, SetOpKind, SubqueryKind, SubqueryRef, TopNKey,
 };
 use crate::agg::default_agg_name;
 use crate::ast_util::{
@@ -24,6 +24,7 @@ use crate::bind::{
 use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::guards::{join_keys_and_type, JoinKeys};
 use crate::ir::{AggFunc, BExpr, BinOp};
+use crate::tail::{extract_limit, extract_offset, key_slots, order_exprs, parse_order_by, OrderKey};
 use crate::validate::{
     as_plain_select, cte_body, non_recursive_ctes, reject_duplicate_projection_names, reject_float_key,
     reject_query_envelope_body, reject_unhonored_select_clauses, validate_user_name, HonoredClauses,
@@ -165,12 +166,111 @@ fn resolve_relation(cx: &mut BindCx<'_, '_>, name: &str) -> Result<Rc<RelExpr>, 
     Ok(RelExpr::get(cx.ids, tid, schema, desc))
 }
 
+/// A view body's `ORDER BY … LIMIT n [OFFSET m]` tail — the top-N the body
+/// maintains. Parsed once here so every body shape reads one rule: the two
+/// clauses need each other (a view is unordered, and a LIMIT with no order names
+/// no rows), and the counts are literals.
+pub(crate) struct QueryTail<'a> {
+    keys: Vec<OrderKey<'a>>,
+    limit: u64,
+    offset: u64,
+}
+
+impl<'a> QueryTail<'a> {
+    fn parse(query: &'a Query, stmt: &str) -> Result<Option<Self>, GnitzSqlError> {
+        let keys = parse_order_by(query.order_by.as_ref())?;
+        let limit = extract_limit(query)?;
+        match (keys.is_empty(), limit) {
+            // The envelope guard waves the whole sink through to this parse, so
+            // what this parse does not consume it must refuse — a bare `OFFSET`.
+            (true, None) => {
+                reject_if(query.limit_clause.is_some(), stmt, "OFFSET without ORDER BY … LIMIT")?;
+                Ok(None)
+            }
+            (false, None) => Err(GnitzSqlError::Unsupported(format!(
+                "{stmt}: ORDER BY without LIMIT — a view holds an unordered set, so an order alone \
+                 maintains nothing; add LIMIT n to maintain the top n rows"
+            ))),
+            (true, Some(_)) => Err(GnitzSqlError::Unsupported(format!(
+                "{stmt}: LIMIT without ORDER BY names no rows in particular; add ORDER BY"
+            ))),
+            (false, Some(0)) => Err(GnitzSqlError::Plan(format!("{stmt}: LIMIT 0 selects nothing"))),
+            (false, Some(limit)) => Ok(Some(QueryTail {
+                keys,
+                limit: limit as u64,
+                offset: extract_offset(query)? as u64,
+            })),
+        }
+    }
+
+    /// The expression keys, in key order — what a body's projection places one
+    /// hidden item each for.
+    fn exprs(&self) -> Vec<&'a Expr> {
+        order_exprs(&self.keys)
+    }
+
+    /// Wrap `rel` in the top-N this tail names. `placed` is the output slot of
+    /// each *expression* key, parallel to [`Self::exprs`]; a positional key
+    /// names a visible output column.
+    fn wrap(&self, rel: Rc<RelExpr>, placed: &[usize]) -> Result<Rc<RelExpr>, GnitzSqlError> {
+        let cols = rel.cols();
+        let visible: Vec<usize> = cols
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.def.is_hidden)
+            .map(|(i, _)| i)
+            .collect();
+        let order = key_slots(&self.keys, &visible, placed)?
+            .into_iter()
+            .zip(&self.keys)
+            .map(|(at, key)| {
+                let (desc, nulls_first) = key.dir();
+                TopNKey { col: cols[at].id, desc, nulls_first }
+            })
+            .collect();
+        Ok(RelExpr::top_n(rel, Vec::new(), order, self.limit, self.offset))
+    }
+
+    /// [`Self::wrap`] over a body whose keys can only be its output columns — a
+    /// set operation or a parenthesized query, which has no scope of its own.
+    fn wrap_by_output(&self, rel: Rc<RelExpr>, stmt: &str) -> Result<Rc<RelExpr>, GnitzSqlError> {
+        let cols = rel.cols();
+        let mut placed = Vec::new();
+        for e in self.exprs() {
+            match output_column(e, cols.iter().map(|c| &c.def))? {
+                Some(at) => placed.push(at),
+                None => {
+                    return Err(GnitzSqlError::Unsupported(format!(
+                        "{stmt}: ORDER BY over a set operation names an output column or position"
+                    )))
+                }
+            }
+        }
+        self.wrap(rel, &placed)
+    }
+}
+
+/// Bind a whole query: its body, then the `ORDER BY … LIMIT` tail as a top-N over
+/// it. A SELECT body places the keys in its own scope; any other body orders by
+/// its output columns.
+pub(crate) fn bind_query(cx: &mut BindCx<'_, '_>, query: &Query) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    let tail = QueryTail::parse(query, cx.surface.stmt)?;
+    match (query.body.as_ref(), tail) {
+        (SetExpr::Select(select), tail) => bind_select(cx, select, tail.as_ref()),
+        (body, None) => bind_body(cx, body),
+        (body, Some(tail)) => {
+            let rel = bind_body(cx, body)?;
+            tail.wrap_by_output(rel, cx.surface.stmt)
+        }
+    }
+}
+
 /// Bind one query body — a single SELECT (linear / join / grouped / DISTINCT) or
 /// a set operation whose sides bind recursively. A parenthesized side is a whole
 /// `Query`, whose envelope is rejected before its body binds.
 pub(crate) fn bind_body(cx: &mut BindCx<'_, '_>, body: &SetExpr) -> Result<Rc<RelExpr>, GnitzSqlError> {
     match body {
-        SetExpr::Select(select) => bind_select(cx, select),
+        SetExpr::Select(select) => bind_select(cx, select, None),
         SetExpr::SetOperation { op, set_quantifier, left, right } => bind_set_op(cx, *op, *set_quantifier, left, right),
         SetExpr::Query(q) => bind_body(cx, reject_query_envelope_body(q, "parenthesized query")?),
         _ => Err(GnitzSqlError::Unsupported(format!(
@@ -230,7 +330,11 @@ fn resolve_table_factor(
 ///
 /// Conjuncts bind raw — into `Join.on` from the step, into a `Filter` from the
 /// WHERE. `hir::rewrite` is what classifies them into keys.
-fn bind_select(cx: &mut BindCx<'_, '_>, select: &Select) -> Result<Rc<RelExpr>, GnitzSqlError> {
+fn bind_select(
+    cx: &mut BindCx<'_, '_>,
+    select: &Select,
+    tail: Option<&QueryTail<'_>>,
+) -> Result<Rc<RelExpr>, GnitzSqlError> {
     let Some(first) = select.from.first() else {
         return Err(GnitzSqlError::Unsupported(format!(
             "{}: a view body reads at least one relation; this one has no FROM clause",
@@ -239,6 +343,10 @@ fn bind_select(cx: &mut BindCx<'_, '_>, select: &Select) -> Result<Rc<RelExpr>, 
     };
     let grouped = body_is_grouped(select);
     let distinct = select.distinct.is_some();
+    // Below here the tail is only its expression keys, which every body shape
+    // places like any other projection item; the wrap is this function's, at
+    // whichever exit the body took.
+    let order_exprs: Vec<&Expr> = tail.map(QueryTail::exprs).unwrap_or_default();
     reject_unhonored_select_clauses(
         select,
         HonoredClauses::for_body(grouped, distinct).with_windows(),
@@ -281,7 +389,8 @@ fn bind_select(cx: &mut BindCx<'_, '_>, select: &Select) -> Result<Rc<RelExpr>, 
             )));
         }
         if !grouped && !distinct && (has_exists_in || has_scalar_subquery(select)) {
-            return bind_linear_subquery_body(cx, select, left, &scope, &alias);
+            let (rel, placed) = bind_linear_subquery_body(cx, select, left, &scope, &alias, &order_exprs)?;
+            return wrap_tail(tail, rel, &placed);
         }
     }
 
@@ -293,7 +402,25 @@ fn bind_select(cx: &mut BindCx<'_, '_>, select: &Select) -> Result<Rc<RelExpr>, 
         clause: cx.surface.stmt,
         sub: SubPolicy::PerKind,
     };
-    bind_body_suffix(cx.ids, select, left, &leaf, cx.surface.projection, grouped)
+    let (rel, placed) = bind_body_suffix(
+        cx.ids,
+        select,
+        left,
+        &leaf,
+        cx.surface.projection,
+        grouped,
+        &order_exprs,
+    )?;
+    wrap_tail(tail, rel, &placed)
+}
+
+/// Wrap `rel` in `tail`'s top-N, `placed` being the output slot of each of its
+/// expression keys. The one place a bound body becomes a maintained window.
+fn wrap_tail(tail: Option<&QueryTail<'_>>, rel: Rc<RelExpr>, placed: &[usize]) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    match tail {
+        Some(t) => t.wrap(rel, placed),
+        None => Ok(rel),
+    }
 }
 
 /// WHERE, then the projection in whichever shape the body carries — the tail
@@ -309,7 +436,8 @@ fn bind_body_suffix(
     leaf: &ScopeLeaf<'_>,
     ctx: &'static str,
     grouped: bool,
-) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    order_exprs: &[&Expr],
+) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
     let mut rel = source;
     if let Some(where_expr) = &select.selection {
         rel = RelExpr::filter(rel, bind_conjuncts(where_expr, leaf)?);
@@ -317,22 +445,30 @@ fn bind_body_suffix(
     if grouped && select.distinct.is_none() {
         // A view body admits window calls; the ad-hoc fold entries below do not,
         // and reach `bind_grouped_suffix` with `windows: false`.
-        return bind_grouped_suffix(ids, select, rel, leaf, GroupedSurface::ViewBody).map(|(rel, _)| rel);
+        return bind_grouped_suffix(ids, select, rel, leaf, GroupedSurface::ViewBody, order_exprs);
     }
     // The window desugar owns its own projection (it must place the SELECT list
     // over the joined-in window values), so it hands back the projected relation.
-    let projected = if select_has_window(select) {
-        super::window::bind_window_final(ids, select, rel, leaf, ctx)?
+    let (projected, placed) = if select_has_window(select) {
+        super::window::bind_window_final(ids, select, rel, leaf, ctx, order_exprs)?
     } else {
-        let items = bind_projection(&select.projection, leaf, ids, ctx)?;
+        let mut items = bind_projection(&select.projection, leaf, ids, ctx)?;
         reject_duplicate_projection_names(&select.projection, items.iter().map(|e| &e.out.def), ctx)?;
-        RelExpr::project(rel, items)
+        let placed = place_order_keys(order_exprs, &mut items, ids, leaf)?;
+        (RelExpr::project(rel, items), placed)
     };
-    Ok(if select.distinct.is_some() {
-        RelExpr::distinct(projected)
-    } else {
-        projected
-    })
+    if select.distinct.is_none() {
+        return Ok((projected, placed));
+    }
+    // DISTINCT dedups the selected columns, so a key that is not one of them —
+    // a hidden item `place_order_keys` appended — would change the set it orders.
+    let cols = projected.cols();
+    if placed.iter().any(|&at| cols[at].def.is_hidden) {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "{ctx}: an ORDER BY key under SELECT DISTINCT must be a selected column"
+        )));
+    }
+    Ok((RelExpr::distinct(projected), placed))
 }
 
 /// Expand a bare `*` item over `cols` (honoring `EXCEPT`/`EXCLUDE`/`RENAME`,
@@ -587,7 +723,8 @@ fn bind_linear_subquery_body(
     get: Rc<RelExpr>,
     scope: &JoinScope,
     outer_alias: &str,
-) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    order_exprs: &[&Expr],
+) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
     let (ids, surface) = (cx.ids, cx.surface);
     let sub = RefCell::new(SubCtx {
         cx,
@@ -601,7 +738,7 @@ fn bind_linear_subquery_body(
         sub: SubPolicy::Bind(&bind_sub),
     };
     // The `!grouped && !distinct` guard is what routed the body here.
-    bind_body_suffix(ids, select, get, &leaf, surface.projection, false)
+    bind_body_suffix(ids, select, get, &leaf, surface.projection, false, order_exprs)
 }
 
 /// The resolved inner relation of a subquery: `Filter?(Get)` with the inner-local
@@ -1392,7 +1529,7 @@ pub(crate) fn bind_adhoc_grouped(
         clause: "SELECT",
         sub: SubPolicy::PerKind,
     };
-    bind_grouped_suffix(ids, select, source, &leaf, GroupedSurface::AdhocRead(order_exprs))
+    bind_grouped_suffix(ids, select, source, &leaf, GroupedSurface::AdhocRead, order_exprs)
 }
 
 /// Bind an ad-hoc single-relation `SELECT DISTINCT` body to `Distinct(Project(Get))`
@@ -1438,10 +1575,12 @@ fn adhoc_source(ids: &ColIdGen, schema: Arc<Schema>, alias: &str) -> (Rc<RelExpr
 
 /// What a calling surface adds to — and withholds from — a grouped body. One or
 /// the other, never both: a view body admits window calls and DISTINCT
-/// aggregates, an ad-hoc read brings ORDER BY keys and admits neither.
-enum GroupedSurface<'a> {
+/// aggregates, an ad-hoc read admits neither. Both bring ORDER BY keys, which
+/// ride as their own parameter.
+#[derive(PartialEq, Eq)]
+enum GroupedSurface {
     ViewBody,
-    AdhocRead(&'a [&'a Expr]),
+    AdhocRead,
 }
 
 /// Bind the GROUP BY / aggregate / HAVING suffix over `input`, producing
@@ -1452,12 +1591,9 @@ fn bind_grouped_suffix(
     select: &Select,
     input: Rc<RelExpr>,
     leaf: &ScopeLeaf<'_>,
-    surface: GroupedSurface<'_>,
+    surface: GroupedSurface,
+    order_exprs: &[&Expr],
 ) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
-    let order_exprs = match surface {
-        GroupedSurface::AdhocRead(keys) => keys,
-        GroupedSurface::ViewBody => &[],
-    };
     let mut pre = PreMap::new(ids, leaf.env().to_vec());
     let group_cols = resolve_group_cols(select, leaf, &mut pre)?;
     let is_global = group_cols.is_empty();
@@ -1483,7 +1619,7 @@ fn bind_grouped_suffix(
     }
     // An ad-hoc read lowers to one stateless fold over one scan, which has no room
     // for the `Distinct` below the reduce.
-    if matches!(surface, GroupedSurface::AdhocRead(_)) && calls.iter().any(|c| matches!(c.arg, AggArg::Distinct(_))) {
+    if surface == GroupedSurface::AdhocRead && calls.iter().any(|c| matches!(c.arg, AggArg::Distinct(_))) {
         return Err(GnitzSqlError::Unsupported(
             "DISTINCT aggregates are supported in a CREATE VIEW body only".into(),
         ));
@@ -1537,10 +1673,9 @@ fn bind_grouped_suffix(
     }
 
     let select_leaf = grouped("GROUP BY SELECT");
-    if matches!(surface, GroupedSurface::ViewBody) && select_has_window(select) {
-        // The desugar owns its own projection, and a view body carries no keys.
-        let rel = super::window::bind_window_final(ids, select, rel, &select_leaf, "GROUP BY")?;
-        return Ok((rel, Vec::new()));
+    if surface == GroupedSurface::ViewBody && select_has_window(select) {
+        // The desugar owns its own projection.
+        return super::window::bind_window_final(ids, select, rel, &select_leaf, "GROUP BY", order_exprs);
     }
     // The dup-name guard is `lower_reduce`'s: its output carries the group
     // columns, including ones this projection never named.
@@ -1551,7 +1686,7 @@ fn bind_grouped_suffix(
 
 /// The projection item each key of `order_exprs` sorts on: the SELECT item that
 /// already computes it, else a hidden one appended here.
-fn place_order_keys<L: ItemLeaf>(
+pub(super) fn place_order_keys<L: ItemLeaf>(
     order_exprs: &[&Expr],
     items: &mut Vec<ProjEntry>,
     ids: &ColIdGen,

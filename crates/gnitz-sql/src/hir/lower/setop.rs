@@ -131,7 +131,7 @@ fn hashed_out<'a>(
         out_cols.push(c.def.clone());
         layout.push(c.id);
     }
-    Ok(((circuit, out_cols, 1), layout))
+    Ok((EmitPieces { circuit, out_cols, pk_arity: 1 }, layout))
 }
 
 /// Lower both sides of a set operation, then apply the source-collision rule over

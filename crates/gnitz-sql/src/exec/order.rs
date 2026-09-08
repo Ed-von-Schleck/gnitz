@@ -15,15 +15,14 @@
 
 use std::cmp::Ordering;
 
-use crate::ast_util::{clause_position, reject_position_out_of_range};
 use crate::bind::{bind_single_table, output_column};
 use crate::codec::project_schema::ProjItem;
 use crate::error::GnitzSqlError;
 use crate::exec::batch::RowGather;
+use crate::tail::{key_slots, resolve_position, OrderKey, OrderTarget};
 use crate::validate::order_column;
 use gnitz_core::{ColumnDef, Schema, ZSetBatch, ZSetBatchView};
 use gnitz_expr::{cmp_order_keys, OrderLocator, RowSource, SchemaFacts};
-use sqlparser::ast::{Expr, OrderBy, OrderByExpr, OrderByKind, OrderByOptions};
 
 // ---------------------------------------------------------------------------
 // One sort key over the full pre-projection schema
@@ -54,113 +53,6 @@ pub(crate) struct Window {
 /// (`push_identity_tiebreak`) is what makes the order total here.
 fn cmp_rows(view: &ZSetBatchView, keys: &[OrderLocator], ra: usize, rb: usize) -> Ordering {
     cmp_order_keys(keys, view, ra, view.get_null_word(ra), view, rb, view.get_null_word(rb))
-}
-
-// ---------------------------------------------------------------------------
-// ORDER BY key parsing & resolution
-// ---------------------------------------------------------------------------
-
-/// What an ORDER BY key names: a 1-based visible-output position, or an
-/// expression — a bare or qualified name resolving output-first, anything else
-/// bound in the SELECT list's own scope and carried as a hidden column.
-pub(crate) enum OrderTarget<'a> {
-    Position(usize),
-    Expr(&'a Expr),
-}
-
-/// A parsed ORDER BY key: its target plus resolved direction and absolute NULL
-/// placement (default NULLS LAST for ASC, FIRST for DESC).
-pub(crate) struct OrderKey<'a> {
-    pub(crate) target: OrderTarget<'a>,
-    asc: bool,
-    nulls_first: bool,
-}
-
-impl OrderKey<'_> {
-    fn wire(&self, col: usize) -> gnitz_wire::OrderKey {
-        gnitz_wire::OrderKey {
-            col: col as u16,
-            desc: !self.asc,
-            nulls_first: self.nulls_first,
-        }
-    }
-}
-
-/// The expression keys of `keys`, in key order — the list a SELECT list's binder
-/// places one projection item each for, and [`wire_order`] reads back.
-pub(crate) fn order_exprs<'a>(keys: &[OrderKey<'a>]) -> Vec<&'a Expr> {
-    keys.iter()
-        .filter_map(|k| match k.target {
-            OrderTarget::Expr(e) => Some(e),
-            OrderTarget::Position(_) => None,
-        })
-        .collect()
-}
-
-fn unsupported(what: &str) -> GnitzSqlError {
-    GnitzSqlError::Unsupported(format!("{what} is not supported in direct SELECT ORDER BY"))
-}
-
-/// Classify one ORDER BY expression: an integer literal is positional, by the
-/// same rule GROUP BY reads; everything else is an expression.
-fn order_target(e: &Expr) -> Result<OrderTarget<'_>, GnitzSqlError> {
-    Ok(match clause_position(e, "ORDER BY position")? {
-        Some(pos) => OrderTarget::Position(pos),
-        None => OrderTarget::Expr(e),
-    })
-}
-
-/// The ORDER BY clause as key specs, or none for an absent clause.
-pub(crate) fn parse_order_by(order_by: Option<&OrderBy>) -> Result<Vec<OrderKey<'_>>, GnitzSqlError> {
-    let Some(ob) = order_by else {
-        return Ok(Vec::new());
-    };
-    let keys = resolve_order_by(ob)?;
-    if keys.len() > gnitz_wire::MAX_ORDER_KEYS {
-        return Err(GnitzSqlError::Unsupported(format!(
-            "ORDER BY has more than {} keys",
-            gnitz_wire::MAX_ORDER_KEYS
-        )));
-    }
-    Ok(keys)
-}
-
-/// Parse the whole ORDER BY clause into resolved key specs, rejecting the
-/// unsupported ClickHouse/DuckDB extensions as a clean `Unsupported` error.
-fn resolve_order_by(ob: &OrderBy) -> Result<Vec<OrderKey<'_>>, GnitzSqlError> {
-    // Exhaustive (no `..`) at each of the three levels: a dropped ORDER BY
-    // modifier is a wrong result, so a future `sqlparser` field stops the build.
-    let OrderBy { kind, interpolate } = ob;
-    if interpolate.is_some() {
-        return Err(unsupported("ORDER BY ... INTERPOLATE"));
-    }
-    let exprs = match kind {
-        OrderByKind::Expressions(e) => e,
-        OrderByKind::All(_) => return Err(unsupported("ORDER BY ALL")),
-    };
-    let mut keys = Vec::with_capacity(exprs.len());
-    for obe in exprs {
-        let OrderByExpr { expr, options, with_fill } = obe;
-        if with_fill.is_some() {
-            return Err(unsupported("ORDER BY ... WITH FILL"));
-        }
-        let OrderByOptions { asc, nulls_first } = options;
-        let asc = asc.unwrap_or(true);
-        keys.push(OrderKey {
-            target: order_target(expr)?,
-            asc,
-            // Absolute default: ASC → NULLS LAST, DESC → NULLS FIRST.
-            nulls_first: nulls_first.unwrap_or(!asc),
-        });
-    }
-    Ok(keys)
-}
-
-/// The physical column index a 1-based ORDER BY position names, given the
-/// physical indices of the visible columns.
-fn resolve_position(pos: usize, visible: &[usize]) -> Result<usize, GnitzSqlError> {
-    reject_position_out_of_range(pos, visible.len(), "ORDER BY")?;
-    Ok(visible[pos - 1])
 }
 
 /// The ORDER BY keys as wire `OrderKey`s over the (server-projected) ScanSpec
@@ -273,9 +165,8 @@ fn paginate(weights: &[i64], offset: u64, hi: u64) -> Vec<(usize, i64)> {
 // ---------------------------------------------------------------------------
 
 /// The wire `OrderKey`s [`read_spec_finish`] windows an already-projected result
-/// by. A position resolves against the visible columns; an expression key takes
-/// the item `placed` records for it — one per [`order_exprs`] entry, in that
-/// order — shifted past the `base` hidden columns the schema leads with.
+/// by. `placed` is relative to the projection, which starts `base` columns into
+/// the schema the keys index.
 pub(crate) fn wire_order(
     keys: &[OrderKey<'_>],
     schema: &Schema,
@@ -283,21 +174,9 @@ pub(crate) fn wire_order(
     base: usize,
 ) -> Result<Vec<gnitz_wire::OrderKey>, GnitzSqlError> {
     let visible: Vec<usize> = schema.visible_columns().map(|(i, _)| i).collect();
-    let mut placed = placed.iter();
-    keys.iter()
-        .map(|k| {
-            let col = match k.target {
-                OrderTarget::Position(pos) => resolve_position(pos, &visible)?,
-                OrderTarget::Expr(_) => {
-                    let at = placed
-                        .next()
-                        .ok_or_else(|| GnitzSqlError::Internal("ORDER BY placements do not match the keys".into()))?;
-                    base + at
-                }
-            };
-            Ok(k.wire(col))
-        })
-        .collect()
+    let placed: Vec<usize> = placed.iter().map(|at| base + at).collect();
+    let slots = key_slots(keys, &visible, &placed)?;
+    Ok(keys.iter().zip(slots).map(|(k, col)| k.wire(col)).collect())
 }
 
 /// Sort + window an already-server-projected ScanSpec reply by its wire
@@ -315,7 +194,7 @@ pub(crate) fn read_spec_finish(
 ) -> (Schema, ZSetBatch) {
     let sort_keys: Vec<OrderLocator> = order_keys
         .iter()
-        .map(|k| sort_key(&schema, k.col as usize, !k.desc, k.nulls_first))
+        .map(|k| OrderLocator::of(SchemaFacts::locate(&schema, k.col as usize), k))
         .collect();
     finish_window(schema, batch, sort_keys, window)
 }

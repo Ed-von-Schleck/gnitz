@@ -50,6 +50,34 @@ pub struct OrderKey {
     pub nulls_first: bool,
 }
 
+/// One order key's four wire bytes: column, flags, one reserved byte. Shared by
+/// the rows sink and a circuit's `TopN` node, so the two cannot drift.
+pub(crate) fn write_order_key(w: &mut Writer, key: &OrderKey) {
+    let mut flags = 0u8;
+    if key.desc {
+        flags |= ORDER_DESC;
+    }
+    if key.nulls_first {
+        flags |= ORDER_NULLS_FIRST;
+    }
+    w.u16(key.col).u8(flags).u8(0);
+}
+
+/// [`write_order_key`]'s inverse; an unknown flag bit is a refusal.
+pub(crate) fn read_order_key(r: &mut Reader) -> Result<OrderKey, String> {
+    let col = r.u16()?;
+    let flags = r.u8()?;
+    if flags & !(ORDER_DESC | ORDER_NULLS_FIRST) != 0 {
+        return Err(format!("order key has unknown flag bits {flags:#04x}"));
+    }
+    let _rsv = r.u8()?;
+    Ok(OrderKey {
+        col,
+        desc: flags & ORDER_DESC != 0,
+        nulls_first: flags & ORDER_NULLS_FIRST != 0,
+    })
+}
+
 /// The fold sink's aggregate spec: a per-worker hash-fold over the scanned rows.
 /// `group_cols` and `aggs[].col_idx` index the **reduce input** — `pre`'s output
 /// when one is present, else the source schema (empty `group_cols` = a global
@@ -327,14 +355,7 @@ impl ReadSpec {
             ReadSink::Rows { projection, order, limit_k } => {
                 w.u8(order.len() as u8).u64(*limit_k);
                 for key in order {
-                    let mut flags = 0u8;
-                    if key.desc {
-                        flags |= ORDER_DESC;
-                    }
-                    if key.nulls_first {
-                        flags |= ORDER_NULLS_FIRST;
-                    }
-                    w.u16(key.col).u8(flags).u8(0); // trailing byte reserved
+                    write_order_key(&mut w, key);
                 }
                 w.bytes32(projection);
             }
@@ -420,17 +441,7 @@ impl ReadSpec {
                 let limit_k = r.u64()?;
                 let mut order = Vec::with_capacity(n_order);
                 for _ in 0..n_order {
-                    let col = r.u16()?;
-                    let flags = r.u8()?;
-                    if flags & !(ORDER_DESC | ORDER_NULLS_FIRST) != 0 {
-                        return Err(format!("read_spec: order key has unknown flag bits {flags:#04x}"));
-                    }
-                    let _rsv = r.u8()?;
-                    order.push(OrderKey {
-                        col,
-                        desc: flags & ORDER_DESC != 0,
-                        nulls_first: flags & ORDER_NULLS_FIRST != 0,
-                    });
+                    order.push(read_order_key(&mut r)?);
                 }
                 let projection = r.bytes32()?.to_vec();
                 ReadSink::Rows { projection, order, limit_k }
