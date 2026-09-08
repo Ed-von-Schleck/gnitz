@@ -7,7 +7,7 @@ use super::*;
 fn stored_shape_is_pinned_to_the_format_words() {
     assert_eq!(
         (crate::SYS_SCHEMA_DIGEST, WAL_FORMAT_VERSION),
-        (2555868364000724326, 15),
+        (11664279838215688264, 16),
         "system-family column shapes changed"
     );
 }

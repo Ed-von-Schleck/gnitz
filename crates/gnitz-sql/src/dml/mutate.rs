@@ -25,6 +25,7 @@ use gnitz_core::{
     retraction_batch, ColumnDef, GnitzClient, Schema, TypeCode, WireConflictMode, ZSetBatch, ZSetBatchView,
 };
 use gnitz_expr::{BatchView, Evaluator, ExprResults, RowSource};
+use gnitz_wire::decimal::rescale;
 use gnitz_wire::ReadSink;
 use sqlparser::ast::{Assignment, AssignmentTarget, FromTable};
 
@@ -68,7 +69,18 @@ pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema)
     // the wide ones the VM cannot lower — so a literal past `i64::MAX` writes
     // (SET reaches the upper half of U64) and an out-of-range one is caught by
     // the range check below, before any row is read.
-    let p = if let Some(v) = bound_num_literal(expr).and_then(NumLit::to_i128) {
+    let target_ty = schema.columns[target].ty();
+    // A DECIMAL target takes a numeric literal at its own scale (a longer
+    // fraction rounded, as an INSERT cell is) and every other value through a
+    // cast to it, so the register written holds the stored integer.
+    let literal = if target_ty.is_decimal() {
+        expr.decimal_literal()
+            .and_then(|(v, s)| rescale(v as i128, s, target_ty.scale))
+            .map(i128::from)
+    } else {
+        bound_num_literal(expr).and_then(NumLit::to_i128)
+    };
+    let p = if let Some(v) = literal {
         SetProgram::Const(ColumnValue::Int(v))
     } else {
         match expr {
@@ -76,6 +88,13 @@ pub(crate) fn classify_set_rhs(expr: &BoundExpr, target: usize, schema: &Schema)
             BoundExpr::LitNull => SetProgram::Const(ColumnValue::Null),
             BoundExpr::ColRef(c) if schema.columns[*c].type_code == TypeCode::String => {
                 SetProgram::StrCol(schema.payload_idx(*c))
+            }
+            _ if target_ty.is_decimal() => {
+                let cast = BoundExpr::Cast {
+                    expr: Box::new(expr.clone()),
+                    to: target_ty,
+                };
+                SetProgram::Expr(Box::new(compile_scalar_evaluator(&cast, schema)?))
             }
             // A SET value is written into a fixed-width integer or a string
             // column; an f64 register has no destination, and nothing downstream

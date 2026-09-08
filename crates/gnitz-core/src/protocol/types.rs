@@ -1,6 +1,6 @@
 use super::error::ProtocolError;
 
-pub use gnitz_wire::{FixedInt, PkBuf, ReduceOutKey, ScalarKind, TypeCode};
+pub use gnitz_wire::{ColType, FixedInt, PkBuf, ReduceOutKey, ScalarKind, TypeCode};
 pub use gnitz_wire::{MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS};
 
 /// Convert a u64 wire value to TypeCode, returning an error for unknown codes.
@@ -47,6 +47,11 @@ pub struct ColumnDef {
     /// present and zero-filled NOT NULL, and is excluded from every name-facing
     /// surface.
     pub is_hidden: bool,
+    /// A DECIMAL column's scale — the power of ten its stored `I64` is
+    /// multiplied by — and zero for every other type. Round-trips through the
+    /// wire meta-schema's scale bits and `COL_TAB.scale`; the engine stores it
+    /// and never branches on it.
+    pub scale: u8,
 }
 
 impl ColumnDef {
@@ -55,14 +60,32 @@ impl ColumnDef {
     /// planner's FK path fills `fk` once the referenced table resolves, and a
     /// SERIAL column chains [`ColumnDef::serial`].
     pub fn new(name: impl Into<String>, type_code: TypeCode, is_nullable: bool) -> Self {
+        Self::typed(name, ColType::of(type_code), is_nullable)
+    }
+
+    /// [`ColumnDef::new`] from a logical type, which is how a DECIMAL column,
+    /// or a column declared from a computed expression, states its scale.
+    pub fn typed(name: impl Into<String>, ty: ColType, is_nullable: bool) -> Self {
         Self {
             name: name.into(),
-            type_code,
+            type_code: ty.tc,
             is_nullable,
             fk: None,
             is_serial: false,
             is_hidden: false,
+            scale: ty.scale,
         }
+    }
+
+    /// The column's logical type: its code and scale together.
+    pub fn ty(&self) -> ColType {
+        ColType { tc: self.type_code, scale: self.scale }
+    }
+
+    /// Retype a column in place, keeping every other fact about it.
+    pub fn set_ty(&mut self, ty: ColType) {
+        self.type_code = ty.tc;
+        self.scale = ty.scale;
     }
 
     /// This column as the `COL_TAB` row recording it: column `col_idx` of
@@ -91,6 +114,7 @@ impl ColumnDef {
             fk_col_idx,
             is_serial: self.is_serial,
             is_hidden: self.is_hidden,
+            scale: self.scale,
         }
     }
 
@@ -286,6 +310,14 @@ impl Schema {
             return Err(format!(
                 "column count {} exceeds MAX_COLUMNS ({MAX_COLUMNS})",
                 columns.len()
+            ));
+        }
+        if let Some(cd) = columns.iter().find(|cd| {
+            cd.scale > gnitz_wire::decimal::MAX_DECIMAL_SCALE || (cd.scale != 0 && cd.type_code != TypeCode::Decimal)
+        }) {
+            return Err(format!(
+                "column '{}' ({:?}) carries scale {}",
+                cd.name, cd.type_code, cd.scale
             ));
         }
         gnitz_wire::validate_pk_tuple(pk_cols, columns.len(), |c| {

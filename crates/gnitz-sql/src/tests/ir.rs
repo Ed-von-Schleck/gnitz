@@ -16,14 +16,14 @@ fn schema(cols: &[TypeCode]) -> Schema {
 fn unify_blend_type_rule() {
     use TypeCode::*;
     // Any float → F64.
-    assert_eq!(unify_blend_type(U64, F64), F64);
-    assert_eq!(unify_blend_type(F32, I64), F64);
+    assert_eq!(unify_blend_type(U64.into(), F64.into()), F64.into());
+    assert_eq!(unify_blend_type(F32.into(), I64.into()), F64.into());
     // Else any U64 → U64.
-    assert_eq!(unify_blend_type(U64, I64), U64);
-    assert_eq!(unify_blend_type(I64, U64), U64);
+    assert_eq!(unify_blend_type(U64.into(), I64.into()), U64.into());
+    assert_eq!(unify_blend_type(I64.into(), U64.into()), U64.into());
     // Else I64 — narrow unsigned stays I64 (its value stays < 2^63).
-    assert_eq!(unify_blend_type(I64, I64), I64);
-    assert_eq!(unify_blend_type(U32, U16), I64);
+    assert_eq!(unify_blend_type(I64.into(), I64.into()), I64.into());
+    assert_eq!(unify_blend_type(U32.into(), U16.into()), I64.into());
 }
 
 #[test]
@@ -174,31 +174,34 @@ fn num_func_result_types() {
         NumFunc::Unary(FloatUnaryOp::Trunc),
         NumFunc::Round(2),
     ] {
-        assert_eq!(f.result_type(TypeCode::U64), TypeCode::U64, "{f:?}");
-        assert_eq!(f.result_type(TypeCode::I32), TypeCode::I64, "{f:?}");
-        assert_eq!(f.result_type(TypeCode::F32), TypeCode::F64, "{f:?}");
+        assert_eq!(f.result_type(TypeCode::U64.into()), TypeCode::U64.into(), "{f:?}");
+        assert_eq!(f.result_type(TypeCode::I32.into()), TypeCode::I64.into(), "{f:?}");
+        assert_eq!(f.result_type(TypeCode::F32.into()), TypeCode::F64.into(), "{f:?}");
     }
-    assert_eq!(NumFunc::Round(-1).result_type(TypeCode::I64), TypeCode::F64);
+    assert_eq!(
+        NumFunc::Round(-1).result_type(TypeCode::I64.into()),
+        TypeCode::F64.into()
+    );
     for f in [
         NumFunc::Unary(FloatUnaryOp::Sqrt),
         NumFunc::Unary(FloatUnaryOp::Ln),
         NumFunc::Unary(FloatUnaryOp::Log10),
         NumFunc::Unary(FloatUnaryOp::Exp),
     ] {
-        assert_eq!(f.result_type(TypeCode::I64), TypeCode::F64, "{f:?}");
-        assert_eq!(f.result_type(TypeCode::F64), TypeCode::F64, "{f:?}");
+        assert_eq!(f.result_type(TypeCode::I64.into()), TypeCode::F64.into(), "{f:?}");
+        assert_eq!(f.result_type(TypeCode::F64.into()), TypeCode::F64.into(), "{f:?}");
     }
     assert_eq!(
-        NumFunc::Unary(FloatUnaryOp::Sign).result_type(TypeCode::U64),
-        TypeCode::I64
+        NumFunc::Unary(FloatUnaryOp::Sign).result_type(TypeCode::U64.into()),
+        TypeCode::I64.into()
     );
     assert_eq!(
-        NumFunc::Unary(FloatUnaryOp::Sign).result_type(TypeCode::I8),
-        TypeCode::I64
+        NumFunc::Unary(FloatUnaryOp::Sign).result_type(TypeCode::I8.into()),
+        TypeCode::I64.into()
     );
     assert_eq!(
-        NumFunc::Unary(FloatUnaryOp::Sign).result_type(TypeCode::F32),
-        TypeCode::F64
+        NumFunc::Unary(FloatUnaryOp::Sign).result_type(TypeCode::F32.into()),
+        TypeCode::F64.into()
     );
     // POWER is float over any operands.
     let s = schema(&[TypeCode::U64, TypeCode::I64]);
@@ -241,4 +244,60 @@ fn str_func_result_types_and_signatures() {
     for f in [StrFunc::Pos, StrFunc::Replace, StrFunc::Reverse] {
         assert_eq!(f.signature()[0], StrArg::Str);
     }
+}
+
+/// DECIMAL typing: a float literal is adopted at its own scale beside a
+/// DECIMAL operand and stays a float elsewhere; `*` adds scales, `+`/`-` take
+/// the wider, `/` and a float operand lift to F64, and the rounding family
+/// lands on the scale it names.
+#[test]
+fn decimal_arithmetic_and_blend_typing() {
+    let cols = vec![
+        ColumnDef::new("pk", TypeCode::U64, false),
+        ColumnDef::typed("p", ColType::decimal(2), true),
+        ColumnDef::typed("q", ColType::decimal(3), true),
+        ColumnDef::new("i", TypeCode::I64, true),
+        ColumnDef::new("f", TypeCode::F64, true),
+    ];
+    let bin = |l: BoundExpr, op, r: BoundExpr| BoundExpr::BinOp(Box::new(l), op, Box::new(r));
+    let c = |i: usize| BoundExpr::ColRef(i);
+    let ty = |e: &BoundExpr| e.infer_ty(&cols);
+    let dec = ColType::decimal;
+    let f64 = ColType::of(TypeCode::F64);
+    assert_eq!(ty(&bin(c(1), BinOp::Add, c(2))), dec(3));
+    assert_eq!(ty(&bin(c(1), BinOp::Sub, c(3))), dec(2));
+    assert_eq!(ty(&bin(c(1), BinOp::Mul, c(2))), dec(5));
+    assert_eq!(ty(&bin(c(1), BinOp::Mul, c(3))), dec(2));
+    assert_eq!(ty(&bin(c(1), BinOp::Mod, c(2))), dec(3));
+    assert_eq!(ty(&bin(c(1), BinOp::Div, c(2))), f64);
+    assert_eq!(ty(&bin(c(1), BinOp::Div, BoundExpr::LitInt(3))), f64);
+    assert_eq!(ty(&bin(c(1), BinOp::Add, c(4))), f64);
+    assert_eq!(ty(&bin(c(1), BinOp::Gt, c(2))), ColType::of(TypeCode::I64));
+    // `price * 1.1` is exact at three places; `i * 1.1` is the float it was.
+    assert_eq!(ty(&bin(c(1), BinOp::Mul, BoundExpr::LitFloat(1.1))), dec(3));
+    assert_eq!(ty(&bin(c(1), BinOp::Add, BoundExpr::LitFloat(1.255))), dec(3));
+    assert_eq!(ty(&bin(c(3), BinOp::Mul, BoundExpr::LitFloat(1.1))), f64);
+    // CASE / GREATEST blend to the wider scale, adopting a literal the same way.
+    let case = BoundExpr::Case {
+        branches: vec![(BoundExpr::LitInt(1), c(1))],
+        else_: Some(Box::new(BoundExpr::LitFloat(0.5))),
+    };
+    assert_eq!(ty(&case), dec(2));
+    assert_eq!(
+        ty(&BoundExpr::MinMaxN {
+            is_max: true,
+            args: vec![c(1), c(2), c(3)]
+        }),
+        dec(3)
+    );
+    let func = |f, e: BoundExpr| BoundExpr::Func { f, arg: Box::new(e) };
+    assert_eq!(ty(&func(NumFunc::Round(1), c(2))), dec(1));
+    assert_eq!(ty(&func(NumFunc::Round(5), c(2))), dec(3));
+    assert_eq!(ty(&func(NumFunc::Unary(FloatUnaryOp::Floor), c(2))), dec(0));
+    assert_eq!(ty(&func(NumFunc::Unary(FloatUnaryOp::Abs), c(2))), dec(3));
+    assert_eq!(ty(&func(NumFunc::Unary(FloatUnaryOp::Sqrt), c(2))), f64);
+    assert_eq!(
+        ty(&func(NumFunc::Unary(FloatUnaryOp::Sign), c(2))),
+        ColType::of(TypeCode::I64)
+    );
 }

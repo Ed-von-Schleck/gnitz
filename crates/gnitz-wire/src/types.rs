@@ -20,6 +20,7 @@ pub mod type_code {
     pub const I128: u8 = 15;
     pub const DATE: u8 = 16;
     pub const TIMESTAMP: u8 = 17;
+    pub const DECIMAL: u8 = 18;
 }
 
 /// Typed column type code enum, mirroring the `type_code::*` constants.
@@ -49,6 +50,11 @@ pub enum TypeCode {
     Date = type_code::DATE,
     /// Microseconds since 1970-01-01T00:00:00, physically an `I64`.
     Timestamp = type_code::TIMESTAMP,
+    /// A fixed-point number: physically an `I64` holding the value times
+    /// `10^scale`. The scale is a per-column fact carried beside the code
+    /// ([`ColType`], `META_FLAG` scale bits, `COL_TAB.scale`); storage, ordering,
+    /// routing and the VM see the integer alone.
+    Decimal = type_code::DECIMAL,
 }
 
 impl TypeCode {
@@ -56,7 +62,7 @@ impl TypeCode {
     /// table. Clients that must reproduce the table (the Python `TypeCode`
     /// IntEnum) build it from here rather than re-typing the constants, so a
     /// new variant reaches them without an edit on their side.
-    pub const ALL: [TypeCode; 17] = [
+    pub const ALL: [TypeCode; 18] = [
         TypeCode::U8,
         TypeCode::I8,
         TypeCode::U16,
@@ -74,6 +80,7 @@ impl TypeCode {
         TypeCode::I128,
         TypeCode::Date,
         TypeCode::Timestamp,
+        TypeCode::Decimal,
     ];
 
     /// The type's name in the wire vocabulary — the spelling the
@@ -98,6 +105,7 @@ impl TypeCode {
             TypeCode::I128 => "I128",
             TypeCode::Date => "DATE",
             TypeCode::Timestamp => "TIMESTAMP",
+            TypeCode::Decimal => "DECIMAL",
         }
     }
 
@@ -129,6 +137,7 @@ impl TypeCode {
             tc::I128 => Some(TypeCode::I128),
             tc::DATE => Some(TypeCode::Date),
             tc::TIMESTAMP => Some(TypeCode::Timestamp),
+            tc::DECIMAL => Some(TypeCode::Decimal),
             _ => None,
         }
     }
@@ -142,7 +151,8 @@ impl TypeCode {
     }
 
     /// The integer type a value of this type is stored and computed as:
-    /// `I32` for `Date`, `I64` for `Timestamp`, and the type itself otherwise.
+    /// `I32` for `Date`, `I64` for `Timestamp` and `Decimal`, and the type
+    /// itself otherwise.
     /// Typed counterpart of the free [`storage_type_code`], which owns the map.
     pub const fn storage_type(self) -> TypeCode {
         match TypeCode::try_from_u8(storage_type_code(self as u8)) {
@@ -215,7 +225,7 @@ impl TypeCode {
             TypeCode::U8 | TypeCode::I8 => 1,
             TypeCode::U16 | TypeCode::I16 => 2,
             TypeCode::F32 | TypeCode::U32 | TypeCode::I32 | TypeCode::Date => 4,
-            TypeCode::F64 | TypeCode::U64 | TypeCode::I64 | TypeCode::Timestamp => 8,
+            TypeCode::F64 | TypeCode::U64 | TypeCode::I64 | TypeCode::Timestamp | TypeCode::Decimal => 8,
             TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob | TypeCode::I128 => 16,
         }
     }
@@ -248,6 +258,67 @@ impl TypeCode {
     #[inline]
     pub fn carried_reindex_tc(self, common: TypeCode) -> Option<TypeCode> {
         (reindex_output_type_code(self as u8) != common as u8).then_some(common)
+    }
+}
+
+/// A column's logical type: the wire code and, for `DECIMAL`, the scale — the
+/// power of ten the stored `I64` is multiplied by. Zero for every other type,
+/// so two `ColType`s compare equal exactly when a value of one is a value of the
+/// other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColType {
+    pub tc: TypeCode,
+    pub scale: u8,
+}
+
+impl ColType {
+    pub const fn of(tc: TypeCode) -> Self {
+        ColType { tc, scale: 0 }
+    }
+
+    pub const fn decimal(scale: u8) -> Self {
+        ColType { tc: TypeCode::Decimal, scale }
+    }
+
+    pub const fn is_decimal(self) -> bool {
+        matches!(self.tc, TypeCode::Decimal)
+    }
+
+    /// Whether a DECIMAL may be matched with `other` across relations. Only the
+    /// identical DECIMAL: the stored integers of two scales never mean the same
+    /// number.
+    pub const fn decimal_domains_match(self, other: Self) -> bool {
+        if !self.is_decimal() && !other.is_decimal() {
+            return true;
+        }
+        self.tc as u8 == other.tc as u8 && self.scale == other.scale
+    }
+
+    /// [`TypeCode::register_image`] with the scale kept: a computed DECIMAL is
+    /// still the same DECIMAL.
+    pub fn register_image(self) -> Self {
+        ColType {
+            tc: self.tc.register_image(),
+            scale: self.scale,
+        }
+    }
+}
+
+impl From<TypeCode> for ColType {
+    fn from(tc: TypeCode) -> Self {
+        ColType::of(tc)
+    }
+}
+
+impl core::fmt::Display for ColType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.tc {
+            // The precision is the `i64`'s own digit count, not what the column
+            // was declared with: a DECIMAL's value is bounded by the integer
+            // behind its scale, and `ColType` carries no declared precision.
+            TypeCode::Decimal => write!(f, "DECIMAL({}, {})", crate::decimal::MAX_DECIMAL_SCALE, self.scale),
+            tc => f.write_str(tc.wire_name()),
+        }
     }
 }
 
@@ -320,9 +391,9 @@ pub const fn is_pk_eligible(tc: u8) -> bool {
 
 /// Promote a base-table column's type to the leading-key type its secondary
 /// index stores: an unsigned ≤8-byte integer (U8..U64) promotes to `U64`, a
-/// signed ≤8-byte integer (I8..I64) to `I64`, and a temporal code as its storage
-/// integer does — so a `DATE` index key is the exercised 8-byte signed one, not
-/// the only 4-byte key in the system; `U128`/`UUID` keep their 16-byte width; STRING/BLOB/float (and any unknown code) are index-ineligible and
+/// signed ≤8-byte integer (I8..I64) to `I64`, and a temporal or decimal code as
+/// its storage integer does — so a `DATE` index key is the exercised 8-byte
+/// signed one, not the only 4-byte key in the system; `U128`/`UUID` keep their 16-byte width; STRING/BLOB/float (and any unknown code) are index-ineligible and
 /// return `Err`. Signed columns keep a *signed* promoted code so the OPK leading
 /// key is order-preserving (`encode_pk_column` sign-flips only signed codes);
 /// `wire_stride(I64) == wire_stride(U64) == 8`, so the sign the promotion picks
@@ -332,12 +403,11 @@ pub const fn is_pk_eligible(tc: u8) -> bool {
 /// engine backstop can never disagree on a column's promoted width.
 pub fn index_key_type(field_type_code: u8) -> Result<u8, String> {
     use type_code as tc;
-    match field_type_code {
+    match storage_type_code(field_type_code) {
         tc::U128 => Ok(tc::U128),
         tc::UUID => Ok(tc::UUID),
         tc::U64 | tc::U32 | tc::U16 | tc::U8 => Ok(tc::U64),
         tc::I64 | tc::I32 | tc::I16 | tc::I8 => Ok(tc::I64),
-        tc::DATE | tc::TIMESTAMP => Ok(tc::I64),
         tc::F32 | tc::F64 | tc::STRING | tc::BLOB => Err(format!(
             "Secondary index on column type {field_type_code} not supported"
         )),
@@ -573,16 +643,17 @@ pub const fn is_temporal(tc: u8) -> bool {
 }
 
 /// The integer type code a value of type `tc` is stored, ordered and computed
-/// as — `I32` for `DATE`, `I64` for `TIMESTAMP`, `tc` itself for everything
-/// else. The one place that map is written: the predicates a temporal code must
-/// answer like its storage type ([`is_signed_int`], [`is_fixed_int`]) and the
-/// promotions it must follow ([`index_key_type`], [`join_key_common_type`]) all
-/// read it, so a further calendar type needs no arm of its own in any of them.
+/// as — `I32` for `DATE`, `I64` for `TIMESTAMP` and `DECIMAL`, `tc` itself for
+/// everything else. The one place that map is written: the predicates such a
+/// code must answer like its storage type ([`is_signed_int`], [`is_fixed_int`])
+/// and the promotions it must follow ([`index_key_type`],
+/// [`join_key_common_type`]) all read it, so a further named integer needs no
+/// arm of its own in any of them.
 #[inline(always)]
 pub const fn storage_type_code(tc: u8) -> u8 {
     match tc {
         type_code::DATE => type_code::I32,
-        type_code::TIMESTAMP => type_code::I64,
+        type_code::TIMESTAMP | type_code::DECIMAL => type_code::I64,
         t => t,
     }
 }
@@ -616,20 +687,19 @@ pub const fn is_valid_type_code(tc: u8) -> bool {
 /// to read it unconditionally; `BLOB` has a register of neither class and falls
 /// in with the rest.
 ///
-/// A temporal code also maps to itself, and is the one image whose *slot* is
-/// narrower than the register: the register holds the 8-byte integer, while the
-/// declared column keeps the calendar name and its own width. A sink into one
-/// is admitted only behind a cast that range-checks the value into that width
-/// (`check_emit_slot`), and a consumer that wants the accumulator's width
-/// rather than the declaration's — `agg_output_type` — reads through
-/// [`storage_type_code`].
+/// A temporal or decimal code also maps to itself: the register holds the
+/// 8-byte integer while the declared column keeps its name. A `DATE` slot is
+/// narrower than that register, so a sink into one is admitted only behind a
+/// cast that range-checks the value into that width (`check_emit_slot`), and a
+/// consumer that wants the accumulator's width rather than the declaration's —
+/// `agg_output_type` — reads through [`storage_type_code`].
 #[inline]
 pub(crate) const fn register_image_type(tc: u8) -> u8 {
     if is_float(tc) {
         type_code::F64
     } else if tc == type_code::U64 {
         type_code::U64
-    } else if tc == type_code::STRING || is_temporal(tc) {
+    } else if tc == type_code::STRING || is_temporal(tc) || tc == type_code::DECIMAL {
         tc
     } else {
         type_code::I64
@@ -741,7 +811,7 @@ impl FixedInt {
             TypeCode::U64 => Some(Self::U64),
             TypeCode::I64 => Some(Self::I64),
             TypeCode::Date => Some(Self::I32),
-            TypeCode::Timestamp => Some(Self::I64),
+            TypeCode::Timestamp | TypeCode::Decimal => Some(Self::I64),
             TypeCode::F32
             | TypeCode::F64
             | TypeCode::U128
@@ -866,7 +936,7 @@ impl ScalarKind {
             TypeCode::U64 => Some(Self::Int(FixedInt::U64)),
             TypeCode::I64 => Some(Self::Int(FixedInt::I64)),
             TypeCode::Date => Some(Self::Int(FixedInt::I32)),
-            TypeCode::Timestamp => Some(Self::Int(FixedInt::I64)),
+            TypeCode::Timestamp | TypeCode::Decimal => Some(Self::Int(FixedInt::I64)),
             TypeCode::U128 | TypeCode::UUID | TypeCode::String | TypeCode::Blob | TypeCode::I128 => None,
         }
     }
@@ -1151,8 +1221,8 @@ const _: () = {
             !is_fixed_int(v as u8) || (w == 1 || w == 2 || w == 4 || w == 8),
             "is_fixed_int must imply a 1/2/4/8-byte width"
         );
-        // A temporal code is its storage integer under another name, so the two
-        // must lay out identically — `wire_stride` and `is_signed_int` spell the
+        // A temporal or decimal code is its storage integer under another name,
+        // so the two must lay out identically — `wire_stride` and `is_signed_int` spell the
         // width and sign tables separately from `storage_type_code`'s map.
         assert!(
             w == wire_stride(storage_type_code(v as u8)),

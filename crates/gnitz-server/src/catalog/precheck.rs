@@ -62,6 +62,15 @@ pub(super) fn check_col_defs(kind: RelationKind, col_defs: &[ColumnDef]) -> Resu
     if let Some(cd) = col_defs.iter().find(|cd| !gnitz_wire::is_valid_type_code(cd.type_code)) {
         return Err(format!("column '{}' has invalid type code {}", cd.name, cd.type_code));
     }
+    if let Some(cd) = col_defs.iter().find(|cd| {
+        cd.scale > gnitz_wire::decimal::MAX_DECIMAL_SCALE
+            || (cd.scale != 0 && cd.type_code != gnitz_wire::type_code::DECIMAL)
+    }) {
+        return Err(format!(
+            "column '{}' has type code {} and cannot carry scale {}",
+            cd.name, cd.type_code, cd.scale
+        ));
+    }
     if kind.is_ingestion_point() {
         let mut seen = FxHashSet::default();
         if let Some(cd) = col_defs

@@ -87,6 +87,7 @@ pub fn arb_type_code() -> impl Strategy<Value = u8> {
         Just(type_code::I128),
         Just(type_code::DATE),
         Just(type_code::TIMESTAMP),
+        Just(type_code::DECIMAL),
         Just(type_code::UUID),
         Just(type_code::F32),
         Just(type_code::F64),

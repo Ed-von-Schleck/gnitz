@@ -127,11 +127,20 @@ fn outer_with_residual_rejects_per_surface() {
 /// ≤ 8-byte integer — the widening path loads through one i64 register.
 #[test]
 fn set_op_common_type_caps_at_eight_bytes() {
-    assert_eq!(set_op_common_type(TypeCode::U64, TypeCode::U64), Some(TypeCode::U64));
-    assert_eq!(set_op_common_type(TypeCode::U32, TypeCode::I32), Some(TypeCode::I64));
-    assert_eq!(set_op_common_type(TypeCode::I32, TypeCode::I64), Some(TypeCode::I64));
+    let common = |l: TypeCode, r: TypeCode| set_op_common_type(l.into(), r.into()).map(|t| t.tc);
+    assert_eq!(common(TypeCode::U64, TypeCode::U64), Some(TypeCode::U64));
+    assert_eq!(common(TypeCode::U32, TypeCode::I32), Some(TypeCode::I64));
+    assert_eq!(common(TypeCode::I32, TypeCode::I64), Some(TypeCode::I64));
     // The I128 collapse and every 16-byte / non-integer pair are rejected.
-    assert_eq!(set_op_common_type(TypeCode::U64, TypeCode::I64), None);
-    assert_eq!(set_op_common_type(TypeCode::U128, TypeCode::I64), None);
-    assert_eq!(set_op_common_type(TypeCode::String, TypeCode::U64), None);
+    assert_eq!(common(TypeCode::U64, TypeCode::I64), None);
+    assert_eq!(common(TypeCode::U128, TypeCode::I64), None);
+    assert_eq!(common(TypeCode::String, TypeCode::U64), None);
+    // A DECIMAL unions only with the same DECIMAL: the stored integers of two
+    // scales, or of a scale and an integer column, never mean the same value.
+    assert_eq!(
+        set_op_common_type(ColType::decimal(2), ColType::decimal(2)),
+        Some(ColType::decimal(2))
+    );
+    assert_eq!(set_op_common_type(ColType::decimal(2), ColType::decimal(3)), None);
+    assert_eq!(set_op_common_type(ColType::decimal(0), TypeCode::I64.into()), None);
 }

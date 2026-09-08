@@ -14,10 +14,10 @@ use gnitz_store::storage::{payload_string, payload_u64, Batch, BatchBuilder};
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow};
 use gnitz_wire::{
     COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE,
-    COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND, COLTAB_PAY_TYPE_CODE,
-    IDXTAB_PAY_FLAGS, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID,
-    TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_OWNER_VIEW_ID,
-    VIEWTAB_PAY_PK_COL_IDX,
+    COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND, COLTAB_PAY_SCALE,
+    COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_FLAGS, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, RELTAB_PAY_NAME,
+    RELTAB_PAY_SCHEMA_ID, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA,
+    VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX,
 };
 
 // ---------------------------------------------------------------------------
@@ -176,6 +176,7 @@ pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> ColumnDef {
         fk_col_idx: payload_u64(src, row, COLTAB_PAY_FK_COL_IDX) as u32,
         is_serial: payload_u64(src, row, COLTAB_PAY_IS_SERIAL) != 0,
         is_hidden: payload_u64(src, row, COLTAB_PAY_IS_HIDDEN) != 0,
+        scale: payload_u64(src, row, COLTAB_PAY_SCALE) as u8,
     }
 }
 
@@ -355,6 +356,7 @@ pub(super) fn push_col_tab_row(
             fk_col_idx: cd.fk_col_idx as u64,
             is_serial: cd.is_serial,
             is_hidden: cd.is_hidden,
+            scale: cd.scale,
         },
         weight,
     )

@@ -214,7 +214,7 @@ fn emit_slot(
     }
     out_cols.push(match &item {
         ProjItem::PassThrough { src_col } => source_schema.columns[*src_col].clone().hidden(),
-        ProjItem::Computed { bound_expr } => order_column(key, bound_expr.infer_type(&source_schema.columns)),
+        ProjItem::Computed { bound_expr } => order_column(key, bound_expr.infer_ty(&source_schema.columns)),
     });
     items.push(item);
     out_cols.len() - 1

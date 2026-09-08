@@ -32,11 +32,11 @@ fn a_computed_string_projection_declares_a_string_column() {
         f: StrFunc::Upper,
         args: vec![BoundExpr::ColRef(1)],
     };
-    let nominal = e.infer_type(&schema.columns);
-    assert_eq!(nominal, TypeCode::String);
+    let nominal = e.infer_ty(&schema.columns);
+    assert_eq!(nominal.tc, TypeCode::String);
     let def = computed_column(None, 0, nominal);
     assert_eq!(def.type_code, TypeCode::String);
     assert!(def.is_nullable);
     // A numeric expression still takes its register image.
-    assert_eq!(computed_column(None, 0, TypeCode::F32).type_code, TypeCode::F64);
+    assert_eq!(computed_column(None, 0, TypeCode::F32.into()).type_code, TypeCode::F64);
 }

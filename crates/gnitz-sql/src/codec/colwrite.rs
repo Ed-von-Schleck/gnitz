@@ -14,7 +14,7 @@ use crate::ast_util::Constant;
 use crate::codec::pk_codec::{pack_pk_value, KeyLitError};
 use crate::error::GnitzSqlError;
 use crate::ir::BExpr;
-use gnitz_core::{push_zero_cell, ColumnDef, FixedInt, TypeCode};
+use gnitz_core::{push_zero_cell, ColType, ColumnDef, FixedInt, TypeCode};
 
 /// A computed SET / `DO UPDATE` value.
 ///
@@ -36,9 +36,10 @@ pub(crate) enum ColumnValue {
 pub(crate) fn append_value_to_col(
     col: &mut Vec<u8>,
     blob: &mut Vec<u8>,
-    tc: TypeCode,
+    ty: ColType,
     c: &Constant,
 ) -> Result<(), GnitzSqlError> {
+    let tc = ty.tc;
     // NULL is the one value every column type encodes alike: a zeroed cell of
     // the type's own stride, with the null bit set by the caller.
     if matches!(c.lit, BExpr::LitNull) {
@@ -72,17 +73,16 @@ pub(crate) fn append_value_to_col(
             BExpr::LitStr(_) => "string literal for non-string column".to_string(),
             _ => "number literal for blob column".to_string(),
         })),
-        // Every integer column, narrow and wide alike, plus a UUID column's
-        // single-quoted spelling — through `pk_codec`, so an INSERT cell and a
-        // PK seek accept and reject identically.
+        // Every integer column, narrow and wide alike, a DECIMAL column, plus a
+        // UUID column's single-quoted spelling — one literal grammar, through
+        // `pk_codec`.
         _ => {
-            let packed = c.key_packed(tc).map_err(|e| {
+            let packed = c.key_packed(ty).map_err(|e| {
                 GnitzSqlError::Bind(match e {
                     KeyLitError::NotNumeric => "string literal for non-string column".to_string(),
-                    KeyLitError::BadUuid => format!("invalid UUID literal: {c}"),
-                    KeyLitError::BadTemporal => format!("invalid {} literal: {c}", tc.wire_name()),
+                    KeyLitError::NotOfType => format!("invalid {} literal: {c}", tc.wire_name()),
                     KeyLitError::NegativeIntoUnsigned | KeyLitError::OutOfRange => {
-                        format!("{tc:?} value out of range: {c}")
+                        format!("{ty} value out of range: {c}")
                     }
                 })
             })?;

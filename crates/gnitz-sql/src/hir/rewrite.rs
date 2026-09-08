@@ -507,7 +507,7 @@ fn build_uncorrelated_inner(
         Some(_) => {
             // Hidden like every other synthetic slot: the finalized value exists
             // to be a join key, and no name reaches it.
-            let key = HirCol::new(ids.next(), ColumnDef::new("_agg", agg.out.def.type_code, true).hidden());
+            let key = HirCol::new(ids.next(), ColumnDef::typed("_agg", agg.out.def.ty(), true).hidden());
             let key_id = key.id;
             let proj = RelExpr::project(
                 Rc::clone(&subref.rel),

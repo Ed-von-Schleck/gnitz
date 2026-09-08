@@ -91,6 +91,7 @@ fn col_tab_row(
         fk_col_idx: 0,
         is_serial: false,
         is_hidden,
+        scale: 0,
     }
 }
 

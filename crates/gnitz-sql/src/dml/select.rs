@@ -537,7 +537,7 @@ fn plan_const_read(query: &Query, select: &Select, window: Window) -> Result<Con
     for (idx, item) in select.projection.iter().enumerate() {
         let (expr, alias) = scalar_projection_item(item, CTX)?;
         let bound = bind(expr)?;
-        let def = computed_column(alias, idx, bound.infer_type(&ground.columns));
+        let def = computed_column(alias, idx, bound.infer_ty(&ground.columns));
         items.push((bound, def));
     }
     // A key that is not an output item is bound and appended as a hidden one.
@@ -548,7 +548,7 @@ fn plan_const_read(query: &Query, select: &Select, window: Window) -> Result<Con
             Some(at) => at,
             None => {
                 let bound = bind(e)?;
-                let def = order_column(i, bound.infer_type(&ground.columns));
+                let def = order_column(i, bound.infer_ty(&ground.columns));
                 items.push((bound, def));
                 items.len() - 1
             }

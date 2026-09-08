@@ -12,7 +12,7 @@ use crate::ast_util::agg_func_name;
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr, BinOp};
 use crate::types::has_scalar_register;
-use gnitz_core::{ColumnDef, ReduceOutKey, Schema, TypeCode};
+use gnitz_core::{ColType, ColumnDef, ReduceOutKey, Schema, TypeCode};
 use gnitz_wire::{AggFunc as WireAggFunc, ReduceOutSlot};
 
 /// How an aggregate's value column is finalized — which also fixes how many
@@ -44,7 +44,7 @@ impl AggShape {
 pub(crate) struct AggSpec {
     pub(crate) op: WireAggFunc,
     pub(crate) col: usize,
-    pub(crate) out_type: TypeCode,
+    pub(crate) out_type: ColType,
 }
 
 /// A reduce's output layout: the columns ahead of the aggregates, the PK
@@ -120,7 +120,7 @@ fn synthetic_fold_cols(
 ) -> (Vec<ColumnDef>, Vec<usize>) {
     let mut r = reduce_out_key_region(ReduceOutKey::SyntheticFold, source_schema, group_col_indices);
     r.cols
-        .extend(agg_specs.iter().map(|s| ColumnDef::new("_agg", s.out_type, true)));
+        .extend(agg_specs.iter().map(|s| ColumnDef::typed("_agg", s.out_type, true)));
     (r.cols, r.group_slots)
 }
 
@@ -227,7 +227,7 @@ pub(crate) fn reduce_output_schema(sh: &ReduceShape<'_>) -> Result<ReduceLayout,
     r.cols.extend(
         agg_specs
             .iter()
-            .map(|s| ColumnDef::new("_agg", s.out_type, agg_raw_nullable(source_schema, s, is_global))),
+            .map(|s| ColumnDef::typed("_agg", s.out_type, agg_raw_nullable(source_schema, s, is_global))),
     );
     let agg_col_offset = r.cols.len() - agg_specs.len();
     let schema = Schema::from_parts(r.cols, r.pk_cols)
@@ -287,7 +287,7 @@ pub(crate) fn emit_reduce(
         && all_linear
         && !agg_specs
             .iter()
-            .any(|s| s.op == WireAggFunc::Sum && s.out_type.is_float());
+            .any(|s| s.op == WireAggFunc::Sum && s.out_type.tc.is_float());
     if two_phase {
         // Phase 1 — per-worker local partial. No ExchangeShard, global_ground = false
         // (a worker with no local rows contributes no partial, never a ground row).
@@ -367,12 +367,12 @@ pub(crate) fn default_agg_name(func: AggFunc, idx: usize) -> String {
 ///   forces float division, which an int-source SUM/COUNT would otherwise
 ///   truncate; a zero count divides by zero, which renders NULL — exactly AVG's
 ///   empty/all-NULL-group result.
-/// * **Nullable SUM** (`companion`, any other func) — `sum / (cnt != 0)`. The raw
-///   SUM column saturates to a concrete 0 once its last non-null contributor is
-///   retracted, so null-ness comes from the COUNT_NON_NULL companion instead: the
-///   divisor is an exact identity (1) while the count is positive and 0 when it
-///   hits zero (div-by-zero → NULL). Type-preserving — unlike AVG, SUM keeps its
-///   own output type, since the divide dispatches on the SUM column's type.
+/// * **Nullable SUM** (`companion`, any other func) — `CASE WHEN cnt <> 0 THEN
+///   sum END`. The raw SUM column saturates to a concrete 0 once its last
+///   non-null contributor is retracted, so null-ness comes from the
+///   COUNT_NON_NULL companion instead: the missing ELSE renders NULL when the
+///   count hits zero. Type-preserving — unlike AVG, SUM keeps its own output
+///   type, a DECIMAL's scale included, which a divide would lift to float.
 /// * **Direct** (no companion) — the value column itself, raw null bit included.
 ///
 /// So a null test over the composite is exact in every shape, which is what
@@ -394,22 +394,22 @@ pub(crate) fn finalize_agg_bexpr<R>(value: R, companion: Option<R>, func: AggFun
             Box::new(cnt),
         )
     } else {
-        BExpr::BinOp(
-            Box::new(value),
-            BinOp::Div,
-            Box::new(BExpr::BinOp(Box::new(cnt), BinOp::Ne, Box::new(BExpr::LitInt(0)))),
-        )
+        let present = BExpr::BinOp(Box::new(cnt), BinOp::Ne, Box::new(BExpr::LitInt(0)));
+        BExpr::Case {
+            branches: vec![(present, value)],
+            else_: None,
+        }
     }
 }
 
 /// AVG divides to F64; every other aggregate renders its raw value type. The one
 /// home for the rule, read by [`crate::hir::HirAgg::view_type`] and by the window
 /// desugar, which types a call before it has a `HirAgg` to ask.
-pub(crate) fn agg_view_type(func: AggFunc, raw_tc: TypeCode) -> TypeCode {
+pub(crate) fn agg_view_type(func: AggFunc, raw: ColType) -> ColType {
     if func == AggFunc::Avg {
-        TypeCode::F64
+        ColType::of(TypeCode::F64)
     } else {
-        raw_tc
+        raw
     }
 }
 
@@ -420,7 +420,7 @@ pub(crate) struct AggTyping {
     /// The physical ops and their output types, in spec order. `ops[0].1` is the
     /// aggregate's **raw** reduce value type (for AVG, the SUM component's — not
     /// the F64 the finalize renders; `HirAgg::view_type` is what renders it).
-    pub(crate) ops: Vec<(WireAggFunc, TypeCode)>,
+    pub(crate) ops: Vec<(WireAggFunc, ColType)>,
 }
 
 /// Decide an aggregate's shape, physical op sequence, and output types from its
@@ -454,9 +454,19 @@ pub(crate) fn agg_typing(agg_func: AggFunc, arg: Option<&ColumnDef>) -> Result<A
     // An op's output type comes straight from the shared wire typing rule over
     // its own (op, source type) — the typed `op` IS the wire selector, so no
     // parallel planner-enum representation rides along. A source-less COUNT
-    // passes I64, which the rule maps to its own default arm.
-    let src_tc = arg.map(|c| c.type_code as u8).unwrap_or(TypeCode::I64 as u8);
-    let op = |o: WireAggFunc| (o, TypeCode::from_validated_u8(gnitz_core::agg_output_type(o, src_tc)));
+    // passes I64, which the rule maps to its own default arm. The rule keeps a
+    // DECIMAL source's code exactly where the value keeps its scale.
+    let src = arg.map_or(ColType::of(TypeCode::I64), ColumnDef::ty);
+    let op = |o: WireAggFunc| {
+        let tc = TypeCode::from_validated_u8(gnitz_core::agg_output_type(o, src.tc as u8));
+        (
+            o,
+            ColType {
+                tc,
+                scale: if tc == TypeCode::Decimal { src.scale } else { 0 },
+            },
+        )
+    };
     let (shape, ops) = match agg_func {
         // `COUNT(x)` counts the rows where `x` is non-NULL; `COUNT(*)` counts
         // every row of the group.

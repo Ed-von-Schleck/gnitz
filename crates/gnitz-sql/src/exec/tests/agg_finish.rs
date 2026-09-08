@@ -27,12 +27,12 @@ fn agg_specs() -> Vec<AggSpec> {
         AggSpec {
             op: WireAggFunc::Min,
             col: 2,
-            out_type: TypeCode::I16,
+            out_type: TypeCode::I16.into(),
         },
         AggSpec {
             op: WireAggFunc::Count,
             col: 0,
-            out_type: TypeCode::I64,
+            out_type: TypeCode::I64.into(),
         },
     ]
 }
@@ -155,7 +155,7 @@ fn count_shape(src: &Schema, group_positions: Vec<usize>) -> FoldShape {
     let agg_specs = vec![AggSpec {
         op: WireAggFunc::Count,
         col: 0,
-        out_type: TypeCode::I64,
+        out_type: TypeCode::I64.into(),
     }];
     let partial_schema = partial_schema(src, &group_positions, &agg_specs);
     // `[_group_pk | g? | COUNT]` — the aggregate trails the group columns.

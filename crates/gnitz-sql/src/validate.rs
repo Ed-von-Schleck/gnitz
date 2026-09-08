@@ -17,7 +17,7 @@
 //! What a *surface* consumes is passed in — `HonoredClauses`, `QueryEnvelope`.
 
 use crate::error::{reject_if, unsupported_clause, GnitzSqlError};
-use gnitz_core::{ColumnDef, RelClass, RelDescriptor, TypeCode};
+use gnitz_core::{ColType, ColumnDef, RelClass, RelDescriptor, TypeCode};
 
 /// The column def of a *computed* projection item, from the expression's
 /// nominal type. One home for the three rules every computed column obeys, so
@@ -30,8 +30,8 @@ use gnitz_core::{ColumnDef, RelClass, RelDescriptor, TypeCode};
 ///   the nominal type: `-f32col` computes in f64, so declaring the column `F32`
 ///   would ship the low half of the double. STRING maps to itself, which
 ///   `register_image` already accounts for.
-pub(crate) fn computed_column(alias: Option<String>, idx: usize, nominal: TypeCode) -> ColumnDef {
-    ColumnDef::new(
+pub(crate) fn computed_column(alias: Option<String>, idx: usize, nominal: ColType) -> ColumnDef {
+    ColumnDef::typed(
         alias.unwrap_or_else(|| computed_column_name(idx)),
         nominal.register_image(),
         true,
@@ -45,8 +45,8 @@ pub(crate) fn computed_column_name(idx: usize) -> String {
 
 /// The hidden column ORDER BY key `i` rides as when it is an expression over the
 /// SELECT list's scope rather than an output column.
-pub(crate) fn order_column(i: usize, nominal: TypeCode) -> ColumnDef {
-    ColumnDef::new(order_column_name(i), nominal.register_image(), true).hidden()
+pub(crate) fn order_column(i: usize, nominal: ColType) -> ColumnDef {
+    ColumnDef::typed(order_column_name(i), nominal.register_image(), true).hidden()
 }
 
 /// A hidden ordering column's label, for dumps and EXPLAIN. Placement travels

@@ -11,9 +11,11 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::{PyDate, PyDateTime, PyDict, PyList, PyString, PyTuple};
 
-use gnitz_core::{Schema, TypeCode, ZSetBatch};
+use gnitz_core::{ColType, Schema, TypeCode, ZSetBatch};
 use gnitz_expr::{ColumnLocator, SchemaFacts};
+use gnitz_wire::decimal::format_decimal;
 use gnitz_wire::format_uuid;
+use pyo3::sync::PyOnceLock;
 
 use crate::build_pylist;
 use crate::schema::rust_schema_to_py;
@@ -252,34 +254,47 @@ pub(crate) fn pk_column_to_pylist(py: Python<'_>, schema: &Schema, batch: &ZSetB
     // second derivation from `pk_stride` here.
     let ci = schema.pk_cols[0] as usize;
     let loc = SchemaFacts::locate(schema, ci);
-    Ok(build_pylist(py, (0..batch.pks.len()).map(|i| value_at(py, batch, ci, loc, i)))?.unbind())
+    let ty = schema.columns[ci].ty();
+    Ok(build_pylist(py, (0..batch.pks.len()).map(|i| value_at(py, batch, ci, loc, ty, i)))?.unbind())
 }
 
 /// Decode one fixed-width column's native-LE bytes into a Python value —
 /// serving PK and payload alike, so a column renders the same wherever it is
 /// read. The 16-byte integer types route through [`u128_value_to_py`];
 /// everything else is a fixed-width read.
-fn fixed_value_to_py(py: Python<'_>, tc: TypeCode, bytes: &[u8]) -> PyResult<Py<PyAny>> {
+fn fixed_value_to_py(py: Python<'_>, ty: ColType, bytes: &[u8]) -> PyResult<Py<PyAny>> {
     // `is_wide_int`, not a hand-listed set: the write path keys off the same
     // predicate, so a newly added 16-byte type cannot fall through to the
     // fixed-width arm on one side only.
-    if tc.is_wide_int() {
-        return u128_value_to_py(py, u128::from_le_bytes(bytes.try_into().unwrap()), tc);
+    if ty.tc.is_wide_int() {
+        return u128_value_to_py(py, u128::from_le_bytes(bytes.try_into().unwrap()), ty.tc);
     }
-    read_fixed_le(py, tc, bytes)
+    read_fixed_le(py, ty, bytes)
+}
+
+/// `decimal.Decimal`, imported once.
+fn py_decimal(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    static DECIMAL: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    DECIMAL
+        .get_or_try_init(py, || {
+            Ok::<_, PyErr>(py.import("decimal")?.getattr("Decimal")?.unbind())
+        })
+        .map(|d| d.bind(py))
 }
 
 /// Read one fixed-width value as a Python object (integers as int, floats as
-/// float, DATE as `datetime.date`, TIMESTAMP as a naive `datetime.datetime`).
-/// Widths come from `slice.len()` via the shared
-/// `read_signed_exact`/`read_unsigned_exact` pair, so the 1/2/4/8-byte table is
-/// not restated here; only the sign and float distinctions are type-directed.
-fn read_fixed_le(py: Python<'_>, tc: TypeCode, slice: &[u8]) -> PyResult<Py<PyAny>> {
+/// float, DATE as `datetime.date`, TIMESTAMP as a naive `datetime.datetime`,
+/// DECIMAL as `decimal.Decimal` at the column's scale). Widths come from
+/// `slice.len()` via the shared `read_signed_exact`/`read_unsigned_exact` pair,
+/// so the 1/2/4/8-byte table is not restated here; only the sign and float
+/// distinctions are type-directed.
+fn read_fixed_le(py: Python<'_>, ty: ColType, slice: &[u8]) -> PyResult<Py<PyAny>> {
     macro_rules! obj {
         ($v:expr) => {
             $v.into_pyobject(py).unwrap().into_any().unbind()
         };
     }
+    let tc = ty.tc;
     Ok(match tc {
         TypeCode::F32 => obj!(f32::from_le_bytes(slice.try_into().unwrap())),
         TypeCode::F64 => obj!(f64::from_le_bytes(slice.try_into().unwrap())),
@@ -294,6 +309,9 @@ fn read_fixed_le(py: Python<'_>, tc: TypeCode, slice: &[u8]) -> PyResult<Py<PyAn
                 .into_any()
                 .unbind()
         }
+        TypeCode::Decimal => py_decimal(py)?
+            .call1((format_decimal(gnitz_wire::read_signed_exact(slice), ty.scale),))?
+            .unbind(),
         _ if tc.is_signed_int() => obj!(gnitz_wire::read_signed_exact(slice)),
         _ => obj!(gnitz_wire::read_unsigned_exact(slice)),
     })
@@ -318,14 +336,14 @@ fn cell_to_py(
     ci: usize,
     row: usize,
     is_null: bool,
-    tc: TypeCode,
+    ty: ColType,
     stride: usize,
 ) -> PyResult<Py<PyAny>> {
     if is_null {
         return Ok(py.None());
     }
     let cell = &batch.columns[ci][row * stride..(row + 1) * stride];
-    Ok(match tc {
+    Ok(match ty.tc {
         TypeCode::String => {
             let bytes = gnitz_wire::german_string_content(cell, &batch.blob);
             std::str::from_utf8(bytes)
@@ -337,7 +355,7 @@ fn cell_to_py(
         TypeCode::Blob => pyo3::types::PyBytes::new(py, gnitz_wire::german_string_content(cell, &batch.blob))
             .into_any()
             .unbind(),
-        _ => fixed_value_to_py(py, tc, cell)?,
+        _ => fixed_value_to_py(py, ty, cell)?,
     })
 }
 
@@ -345,10 +363,10 @@ fn cell_to_py(
 // Lazy batch infrastructure
 // ---------------------------------------------------------------------------
 
-/// One presented column: its physical index plus the resolved address the row
-/// build reads through. The locator carries the type code, so the per-row loop
-/// never touches the schema.
-type PresentedCol = (usize, ColumnLocator);
+/// One presented column: its physical index, the resolved address the row build
+/// reads through, and the type that address decodes as — so the per-row decode
+/// needs no schema.
+type PresentedCol = (usize, ColumnLocator, ColType);
 
 struct SharedBatchData {
     schema: Arc<Schema>,
@@ -371,7 +389,7 @@ fn make_shared_batch_data(
     b: ZSetBatch,
     include_hidden: bool,
 ) -> PyResult<Arc<SharedBatchData>> {
-    let locate = |ci: usize| (ci, SchemaFacts::locate(s.as_ref(), ci));
+    let locate = |ci: usize| (ci, SchemaFacts::locate(s.as_ref(), ci), s.columns[ci].ty());
     let present: Vec<PresentedCol> = if include_hidden {
         (0..s.columns.len()).map(locate).collect()
     } else {
@@ -381,7 +399,7 @@ fn make_shared_batch_data(
     // pointer compare, and the tuple's own hash reads each element's cached one.
     let names = present
         .iter()
-        .map(|&(ci, _)| PyString::intern(py, &s.columns[ci].name))
+        .map(|&(ci, ..)| PyString::intern(py, &s.columns[ci].name))
         .collect::<Vec<_>>();
     let fields = PyTuple::new(py, names)?;
     let row_type = row_type_for(py, &fields)?.unbind();
@@ -396,13 +414,19 @@ fn make_shared_batch_data(
 
 /// Decode one cell at `loc` in `row`, PK or payload — the single per-cell decode,
 /// shared by the row build, `scalars`, the PK list and the per-column lists.
-fn value_at(py: Python<'_>, batch: &ZSetBatch, ci: usize, loc: ColumnLocator, row: usize) -> PyResult<Py<PyAny>> {
-    let tc = TypeCode::from_validated_u8(loc.type_code());
+fn value_at(
+    py: Python<'_>,
+    batch: &ZSetBatch,
+    ci: usize,
+    loc: ColumnLocator,
+    ty: ColType,
+    row: usize,
+) -> PyResult<Py<PyAny>> {
     match loc {
         ColumnLocator::Pk { byte_off, size, .. } => {
             let opk = batch.pks.col_window(row, byte_off as usize, size as usize);
             let native = gnitz_wire::decode_pk_column_owned(opk, loc.type_code());
-            fixed_value_to_py(py, tc, &native[..size as usize])
+            fixed_value_to_py(py, ty, &native[..size as usize])
         }
         ColumnLocator::Payload { size, .. } => cell_to_py(
             py,
@@ -410,7 +434,7 @@ fn value_at(py: Python<'_>, batch: &ZSetBatch, ci: usize, loc: ColumnLocator, ro
             ci,
             row,
             loc.is_null_word(batch.nulls[row]),
-            tc,
+            ty,
             size as usize,
         ),
     }
@@ -418,8 +442,8 @@ fn value_at(py: Python<'_>, batch: &ZSetBatch, ci: usize, loc: ColumnLocator, ro
 
 /// Build Python values for a single row from Rust data, appending to `out`.
 fn build_row_values_into(py: Python<'_>, data: &SharedBatchData, row: usize, out: &mut Vec<Py<PyAny>>) -> PyResult<()> {
-    for &(ci, loc) in &data.present {
-        out.push(value_at(py, &data.batch, ci, loc, row)?);
+    for &(ci, loc, ty) in &data.present {
+        out.push(value_at(py, &data.batch, ci, loc, ty, row)?);
     }
     Ok(())
 }
@@ -447,7 +471,8 @@ pub(crate) fn rust_batch_columns_to_py(py: Python<'_>, schema: &Schema, batch: &
     for ci in 0..schema.columns.len() {
         let loc = SchemaFacts::locate(schema, ci);
         let rows = if matches!(loc, ColumnLocator::Pk { .. }) { 0 } else { n };
-        let col = build_pylist(py, (0..rows).map(|i| value_at(py, batch, ci, loc, i)))?;
+        let ty = schema.columns[ci].ty();
+        let col = build_pylist(py, (0..rows).map(|i| value_at(py, batch, ci, loc, ty, i)))?;
         col_lists.push(col.into_any().unbind());
     }
     Ok(PyList::new(py, col_lists)?.unbind())
@@ -560,8 +585,12 @@ impl PyScanResult {
         };
         // The presented-column table already holds this column's resolved
         // address, so the row loop below does no schema lookups.
-        let (ci, loc) = data.present[pos];
-        Ok(build_pylist(py, (0..data.batch.len()).map(|i| value_at(py, &data.batch, ci, loc, i)))?.unbind())
+        let (ci, loc, ty) = data.present[pos];
+        Ok(build_pylist(
+            py,
+            (0..data.batch.len()).map(|i| value_at(py, &data.batch, ci, loc, ty, i)),
+        )?
+        .unbind())
     }
 }
 

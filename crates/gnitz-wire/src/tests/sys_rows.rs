@@ -3,10 +3,10 @@ use crate::{
     CIRCNODES_PAY_INPUT_0, CIRCNODES_PAY_INPUT_1, CIRCNODES_PAY_OPCODE, CIRCNODES_PAY_PARAMS,
     CIRCNODES_PAY_SOURCE_TABLE, CIRCUIT_NODES_COLS, COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID,
     COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID,
-    COLTAB_PAY_OWNER_KIND, COLTAB_PAY_TYPE_CODE, COL_TAB_COLS, IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID,
-    IDXTAB_PAY_SOURCE_COLS, IDX_TAB_COLS, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB_COLS, TABLE_TAB_COLS,
-    TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_OWNER_VIEW_ID,
-    VIEWTAB_PAY_PK_COL_IDX, VIEW_TAB_COLS,
+    COLTAB_PAY_OWNER_KIND, COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, COL_TAB_COLS, IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME,
+    IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB_COLS, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB_COLS,
+    TABLE_TAB_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA,
+    VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX, VIEW_TAB_COLS,
 };
 
 /// A sink that records what a writer emitted, so the tests below read the
@@ -80,6 +80,7 @@ fn assert_col_tab_slots(r: &ColTabRow, weight: i64) {
     assert_eq!(v[COLTAB_PAY_FK_COL_IDX], Val::U64(r.fk_col_idx));
     assert_eq!(v[COLTAB_PAY_IS_SERIAL], Val::U64(r.is_serial as u64));
     assert_eq!(v[COLTAB_PAY_IS_HIDDEN], Val::U64(r.is_hidden as u64));
+    assert_eq!(v[COLTAB_PAY_SCALE], Val::U64(r.scale as u64));
 }
 
 /// Each value must land in the payload slot the readers look for it in.
@@ -98,6 +99,7 @@ fn values_land_in_their_named_payload_slots() {
         fk_col_idx: 3,
         is_serial: true,
         is_hidden: false,
+        scale: 5,
     };
     assert_col_tab_slots(&witness, -1);
     // A second row for the booleans alone: one row cannot separate three
@@ -246,6 +248,7 @@ fn a_col_idx_that_would_alias_another_record_is_rejected() {
             fk_col_idx: 0,
             is_serial: false,
             is_hidden: false,
+            scale: 0,
         },
         1,
     )

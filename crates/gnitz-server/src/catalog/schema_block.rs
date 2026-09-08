@@ -15,7 +15,8 @@ use gnitz_wire::schema_block::SchemaBlockCol;
 use std::rc::Rc;
 
 /// One [`SchemaBlockCol`] per column: the physical shape from `schema`, and the
-/// per-column catalog facts (name, `META_FLAG_HIDDEN`, `META_FLAG_SERIAL`) from
+/// per-column catalog facts (name, `META_FLAG_HIDDEN`, `META_FLAG_SERIAL`, the
+/// DECIMAL scale) from
 /// `defs`.
 ///
 /// `defs` is all-or-nothing, not per-column: a relation either has one COL_TAB
@@ -38,6 +39,7 @@ fn schema_block_cols<'a>(schema: &SchemaDescriptor, defs: Option<&'a [ColumnDef]
                     col.nullable != 0,
                     def.is_some_and(|d| d.is_hidden),
                     def.is_some_and(|d| d.is_serial),
+                    def.map_or(0, |d| d.scale),
                     schema
                         .pk_indices()
                         .iter()

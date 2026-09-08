@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{col_def, parse_stmt};
-use gnitz_core::{RelClass, RelDescriptor};
+use gnitz_core::{RelClass, RelDescriptor, TypeCode};
 use sqlparser::ast::Statement;
 use std::rc::Rc;
 use std::sync::Arc;

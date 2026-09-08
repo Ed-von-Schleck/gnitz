@@ -1,4 +1,5 @@
 use super::*;
+use gnitz_core::ColType;
 
 /// The `table_options` of a parsed `CREATE TABLE`, so the option tests below
 /// exercise the same AST shape `execute_create_table` receives.
@@ -44,15 +45,30 @@ fn a_non_with_option_form_is_rejected_by_form() {
     assert!(format!("{e:?}").contains("OPTIONS"), "must name the form: {e:?}");
 }
 
+fn fk_ok(child: ColType, parent: ColType) -> bool {
+    check_fk_type_compat(
+        &ColumnDef::typed("c", child, false),
+        &ColumnDef::typed("p", parent, false),
+    )
+    .is_ok()
+}
+
 #[test]
 fn fk_widening_and_identity_accepted() {
-    assert!(check_fk_type_compat(TypeCode::I32, TypeCode::I64).is_ok()); // safe widen
-    assert!(check_fk_type_compat(TypeCode::U32, TypeCode::I64).is_ok()); // unsigned → wider signed
-    assert!(check_fk_type_compat(TypeCode::I32, TypeCode::I32).is_ok()); // identity
-    assert!(check_fk_type_compat(TypeCode::U64, TypeCode::U64).is_ok()); // identity
-    assert!(check_fk_type_compat(TypeCode::UUID, TypeCode::UUID).is_ok()); // non-integer exact match
-    assert!(check_fk_type_compat(TypeCode::String, TypeCode::String).is_ok()); // ditto
-    assert!(check_fk_type_compat(TypeCode::F64, TypeCode::F64).is_ok()); // ditto
+    let tc = ColType::of;
+    assert!(fk_ok(tc(TypeCode::I32), tc(TypeCode::I64))); // safe widen
+    assert!(fk_ok(tc(TypeCode::U32), tc(TypeCode::I64))); // unsigned → wider signed
+    assert!(fk_ok(tc(TypeCode::I32), tc(TypeCode::I32))); // identity
+    assert!(fk_ok(tc(TypeCode::U64), tc(TypeCode::U64))); // identity
+    assert!(fk_ok(tc(TypeCode::UUID), tc(TypeCode::UUID))); // non-integer exact match
+    assert!(fk_ok(tc(TypeCode::String), tc(TypeCode::String))); // ditto
+    assert!(fk_ok(tc(TypeCode::F64), tc(TypeCode::F64))); // ditto
+
+    // A DECIMAL is its own domain: the same scale only, never an integer.
+    assert!(fk_ok(ColType::decimal(2), ColType::decimal(2)));
+    assert!(!fk_ok(ColType::decimal(2), ColType::decimal(3)));
+    assert!(!fk_ok(ColType::decimal(0), tc(TypeCode::I64)));
+    assert!(!fk_ok(tc(TypeCode::I64), ColType::decimal(0)));
 }
 
 #[test]
@@ -66,8 +82,9 @@ fn fk_narrowing_resigning_or_cross_type_rejected() {
         (TypeCode::UUID, TypeCode::U128), // UUID is in no integer domain, U128's width notwithstanding
         (TypeCode::F64, TypeCode::I64),   // float child → integer parent
     ] {
+        let (c, p) = (ColumnDef::new("c", child, false), ColumnDef::new("p", parent, false));
         assert!(
-            matches!(check_fk_type_compat(child, parent), Err(GnitzSqlError::Bind(_))),
+            matches!(check_fk_type_compat(&c, &p), Err(GnitzSqlError::Bind(_))),
             "{child:?} → {parent:?} must be rejected"
         );
     }
@@ -115,7 +132,7 @@ fn self_fk_resolves_to_the_self_target_not_a_table_id() {
     let (fk, parent_type) =
         resolve_fk_target_inline(&cols, &[0], "tree", &site(&obj("tree"), &[ident("id")], 1)).unwrap();
     assert_eq!(fk, FkTarget::SelfTable { col: 0 });
-    assert_eq!(parent_type, TypeCode::I64);
+    assert_eq!(parent_type, TypeCode::I64.into());
 }
 
 #[test]

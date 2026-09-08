@@ -10,7 +10,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyString};
 
 use gnitz_core::protocol::types::type_code_from_u64;
-use gnitz_core::{ColumnDef, Schema};
+use gnitz_core::{ColType, ColumnDef, Schema};
 
 use crate::build_pylist;
 
@@ -26,12 +26,14 @@ pub struct PyColumnDef {
     pub is_nullable: bool,
     pub primary_key: bool,
     pub is_hidden: bool,
+    /// A DECIMAL column's scale; 0 for every other type.
+    pub scale: u8,
 }
 
 #[pymethods]
 impl PyColumnDef {
     #[new]
-    #[pyo3(signature = (name, type_code, is_nullable = false, primary_key = false, is_hidden = false))]
+    #[pyo3(signature = (name, type_code, is_nullable = false, primary_key = false, is_hidden = false, scale = 0))]
     pub fn new(
         py: Python<'_>,
         name: &str,
@@ -39,6 +41,7 @@ impl PyColumnDef {
         is_nullable: bool,
         primary_key: bool,
         is_hidden: bool,
+        scale: u8,
     ) -> Self {
         PyColumnDef {
             name: PyString::intern(py, name).unbind(),
@@ -46,17 +49,19 @@ impl PyColumnDef {
             is_nullable,
             primary_key,
             is_hidden,
+            scale,
         }
     }
 
     pub fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "ColumnDef(name={:?}, type_code={}, is_nullable={}, primary_key={}, is_hidden={})",
+            "ColumnDef(name={:?}, type_code={}, is_nullable={}, primary_key={}, is_hidden={}, scale={})",
             self.name.bind(py).to_cow()?,
             self.type_code,
             self.is_nullable,
             self.primary_key,
-            self.is_hidden
+            self.is_hidden,
+            self.scale
         ))
     }
 }
@@ -65,7 +70,7 @@ fn py_col_to_rust(py: Python<'_>, c: &PyColumnDef) -> PyResult<ColumnDef> {
     let name = c.name.bind(py).to_cow()?.into_owned();
     type_code_from_u64(c.type_code as u64)
         .map(|tc| {
-            let cd = ColumnDef::new(name, tc, c.is_nullable);
+            let cd = ColumnDef::typed(name, ColType { tc, scale: c.scale }, c.is_nullable);
             if c.is_hidden {
                 cd.hidden()
             } else {
@@ -84,6 +89,7 @@ fn rust_col_to_py(py: Python<'_>, c: &ColumnDef, primary_key: bool) -> PyResult<
             is_nullable: c.is_nullable,
             primary_key,
             is_hidden: c.is_hidden,
+            scale: c.scale,
         },
     )?
     .into_any())

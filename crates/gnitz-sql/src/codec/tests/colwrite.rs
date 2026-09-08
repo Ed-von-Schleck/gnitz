@@ -11,7 +11,7 @@ fn uuid_cell(col: &[u8]) -> u128 {
 /// Encode one written constant into a fresh column region, the way INSERT does.
 fn encoded(tc: TypeCode, e: &Expr) -> Result<Vec<u8>, GnitzSqlError> {
     let mut col = Vec::new();
-    append_value_to_col(&mut col, &mut Vec::new(), tc, &bind_constant(e)?)?;
+    append_value_to_col(&mut col, &mut Vec::new(), ColType::of(tc), &bind_constant(e)?)?;
     Ok(col)
 }
 
@@ -33,7 +33,13 @@ fn test_null_append_insert_update_identical_all_variants() {
     for (tc, expected) in cases {
         let mut blob = Vec::new();
         let mut via_insert = Vec::new();
-        append_value_to_col(&mut via_insert, &mut blob, tc, &bind_constant(&expr("NULL")).unwrap()).unwrap();
+        append_value_to_col(
+            &mut via_insert,
+            &mut blob,
+            ColType::of(tc),
+            &bind_constant(&expr("NULL")).unwrap(),
+        )
+        .unwrap();
         let mut via_update = Vec::new();
         append_column_value(&mut via_update, &mut blob, ColumnValue::Null, tc).unwrap();
         assert_eq!(via_insert, expected, "INSERT NULL encoding for {tc:?}");
@@ -128,7 +134,7 @@ fn test_uuid_non_pk_string_literal_accepted() {
     // col 1 is UUID
     let c = bind_constant(&uuid_str_expr("550e8400-e29b-41d4-a716-446655440000")).unwrap();
     let gnitz_core::ZSetBatch { columns, blob, .. } = &mut batch;
-    append_value_to_col(&mut columns[1], blob, TypeCode::UUID, &c).unwrap();
+    append_value_to_col(&mut columns[1], blob, ColType::of(TypeCode::UUID), &c).unwrap();
     assert_eq!(
         uuid_cell(&batch.columns[1]),
         0x550e8400_e29b_41d4_a716_446655440000_u128

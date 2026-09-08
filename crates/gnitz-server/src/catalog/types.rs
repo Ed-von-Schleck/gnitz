@@ -21,6 +21,9 @@ pub(crate) struct ColumnDef {
     /// it is echoed verbatim into reply schema blocks (`META_FLAG_HIDDEN`) so
     /// clients can suppress the column in presentation.
     pub(crate) is_hidden: bool,
+    /// A DECIMAL column's scale (COL_TAB `scale`), else 0. Echoed verbatim into
+    /// reply schema blocks; the engine never branches on it.
+    pub(crate) scale: u8,
 }
 
 // ---------------------------------------------------------------------------

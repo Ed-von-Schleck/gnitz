@@ -115,7 +115,10 @@ fn is_round(instrs: &[LogicalInstr]) -> bool {
 }
 
 fn cast_emits(expr: &BoundExpr, to: TypeCode, schema: &Schema) -> bool {
-    let cast = BoundExpr::Cast { expr: Box::new(expr.clone()), to };
+    let cast = BoundExpr::Cast {
+        expr: Box::new(expr.clone()),
+        to: to.into(),
+    };
     has(&lower_instrs(&cast, schema), |i| matches!(i, L::IntCast { .. }))
 }
 
@@ -374,7 +377,7 @@ fn min_max_n_arity_is_bounded_by_the_register_file() {
 #[test]
 fn cast_picks_the_conversion_opcode_from_the_source_domain() {
     let s = cast_schema();
-    let cast = |e: BoundExpr, to| BoundExpr::Cast { expr: Box::new(e), to };
+    let cast = |e: BoundExpr, to: TypeCode| BoundExpr::Cast { expr: Box::new(e), to: to.into() };
     let f = BoundExpr::LitFloat(2.7);
 
     let to_f32 = |i: &LogicalInstr| matches!(i, L::FloatToF32 { .. });
@@ -1073,7 +1076,10 @@ fn blob_columns_stay_outside_the_string_surface() {
 #[test]
 fn cast_from_a_string_emits_a_parse_and_is_never_elided() {
     let schema = str_schema();
-    let to = |tc| BoundExpr::Cast { expr: Box::new(str_col(1)), to: tc };
+    let to = |tc: TypeCode| BoundExpr::Cast {
+        expr: Box::new(str_col(1)),
+        to: tc.into(),
+    };
     assert!(matches!(
         lower_instrs(&to(TypeCode::I64), &schema)[..],
         [L::LoadColStr { .. }, L::StrToInt { .. }]
@@ -1098,7 +1104,7 @@ fn cast_to_text_emits_the_numeric_to_text_opcode_for_its_source_domain() {
     let schema = cast_schema();
     let to_text = |c| BoundExpr::Cast {
         expr: Box::new(BoundExpr::ColRef(c)),
-        to: TypeCode::String,
+        to: TypeCode::String.into(),
     };
     assert!(has(&lower_instrs(&to_text(1), &schema), |i| matches!(
         i,
@@ -1106,7 +1112,7 @@ fn cast_to_text_emits_the_numeric_to_text_opcode_for_its_source_domain() {
     )));
     let f = BoundExpr::Cast {
         expr: Box::new(BoundExpr::LitFloat(1.5)),
-        to: TypeCode::String,
+        to: TypeCode::String.into(),
     };
     assert!(has(&lower_instrs(&f, &schema), |i| matches!(i, L::FloatToStr { .. })));
     assert_str_program(&to_text(1), &schema);
@@ -1396,4 +1402,177 @@ fn a_lone_string_conjunct_is_rejected_by_lowering() {
     let schema = str_schema();
     let err = compile_filter_program([&str_col(1)], &schema.columns).expect_err("a string is not a predicate");
     assert!(err.to_string().contains("strings"), "{err}");
+}
+
+/// col 0 = pk (U64), col 1 = p DECIMAL(·,2), col 2 = q DECIMAL(·,3), col 3 = i (I64).
+fn decimal_schema() -> Schema {
+    Schema {
+        columns: vec![
+            col("pk", TypeCode::U64),
+            ColumnDef::typed("p", gnitz_core::ColType::decimal(2), true),
+            ColumnDef::typed("q", gnitz_core::ColType::decimal(3), true),
+            col("i", TypeCode::I64),
+        ],
+        pk_cols: vec![0],
+    }
+}
+
+/// Evaluate `expr` over one row `(p, q, i)` of the decimal schema, as the
+/// stored integers.
+fn eval_decimal_row(expr: &BoundExpr, p: i64, q: i64, i: i64) -> Option<i64> {
+    let schema = decimal_schema();
+    let mut batch = gnitz_core::ZSetBatch::new(&schema);
+    gnitz_core::BatchAppender::new(&mut batch, &schema)
+        .add_row(1u128, 1)
+        .i64_val(p)
+        .i64_val(q)
+        .i64_val(i);
+    let ev = compile_scalar_evaluator(expr, &schema).expect("lowers");
+    let view = gnitz_core::ZSetBatchView::new(&batch, &schema);
+    match ev.eval_all(&view) {
+        gnitz_expr::ExprResults::Scalar(vals) => vals[0],
+        gnitz_expr::ExprResults::Str { .. } => panic!("a scalar expression"),
+    }
+}
+
+/// DECIMAL lowering is integer arithmetic on the stored values: operands are
+/// brought to the wider scale, a product keeps both scales, a literal is
+/// folded exactly at the scale it is compared at, and the rounding family is
+/// exact half-away-from-zero integer division.
+#[test]
+fn decimal_arithmetic_lowers_to_scaled_integer_ops() {
+    let bin = |l: BoundExpr, op, r: BoundExpr| BoundExpr::BinOp(Box::new(l), op, Box::new(r));
+    let c = |i: usize| BoundExpr::ColRef(i);
+    // p = 1.25, q = 0.005, i = 3
+    let (p, q, i) = (125, 5, 3);
+    assert_eq!(eval_decimal_row(&bin(c(1), BinOp::Add, c(2)), p, q, i), Some(1255)); // 1.255
+    assert_eq!(eval_decimal_row(&bin(c(1), BinOp::Mul, c(2)), p, q, i), Some(625)); // 0.00625
+    assert_eq!(eval_decimal_row(&bin(c(1), BinOp::Mul, c(3)), p, q, i), Some(375)); // 3.75
+    assert_eq!(
+        eval_decimal_row(&bin(c(1), BinOp::Sub, BoundExpr::LitInt(1)), p, q, i),
+        Some(25)
+    ); // 0.25
+    assert_eq!(
+        eval_decimal_row(&bin(c(1), BinOp::Add, BoundExpr::LitFloat(0.1)), p, q, i),
+        Some(135)
+    );
+    // A comparison against a longer literal widens the column, never rounds
+    // the literal: 1.25 = 1.250 holds, 1.25 = 1.251 does not.
+    assert_eq!(
+        eval_decimal_row(&bin(c(1), BinOp::Eq, BoundExpr::LitFloat(1.250)), p, q, i),
+        Some(1)
+    );
+    assert_eq!(
+        eval_decimal_row(&bin(c(1), BinOp::Eq, BoundExpr::LitFloat(1.251)), p, q, i),
+        Some(0)
+    );
+    assert_eq!(eval_decimal_row(&bin(c(1), BinOp::Gt, c(2)), p, q, i), Some(1));
+    // Division is a float: 1.25 / 0.005 = 250.0.
+    let div = bin(c(1), BinOp::Div, c(2));
+    assert_eq!(
+        eval_decimal_row(&div, p, q, i).map(|b| f64::from_bits(b as u64)),
+        Some(250.0)
+    );
+}
+
+/// Over a DECIMAL the rounding family is integer arithmetic on the scale, not a
+/// float detour: ROUND is half away from zero in both signs, FLOOR/CEIL move
+/// toward and away from -∞, and TRUNC drops the fraction.
+#[test]
+fn decimal_rounding_family_is_exact_integer_division() {
+    let (_p, q, i) = (125, 5, 3);
+    let c = |i: usize| BoundExpr::ColRef(i);
+    let func = |f, e: BoundExpr| BoundExpr::Func { f, arg: Box::new(e) };
+    for (f, v, want) in [
+        (NumFunc::Round(1), 125, 13),
+        (NumFunc::Round(1), -125, -13),
+        (NumFunc::Round(1), 124, 12),
+        (NumFunc::Unary(FloatUnaryOp::Round), 150, 2),
+        (NumFunc::Unary(FloatUnaryOp::Round), -150, -2),
+        (NumFunc::Unary(FloatUnaryOp::Floor), -101, -2),
+        (NumFunc::Unary(FloatUnaryOp::Floor), 199, 1),
+        (NumFunc::Unary(FloatUnaryOp::Ceil), 101, 2),
+        (NumFunc::Unary(FloatUnaryOp::Ceil), -199, -1),
+        (NumFunc::Unary(FloatUnaryOp::Trunc), -199, -1),
+        (NumFunc::Unary(FloatUnaryOp::Abs), -199, 199),
+        (NumFunc::Unary(FloatUnaryOp::Neg), 199, -199),
+        (NumFunc::Unary(FloatUnaryOp::Sign), -199, -1),
+    ] {
+        assert_eq!(eval_decimal_row(&func(f, c(1)), v, q, i), Some(want), "{f:?} over {v}");
+    }
+}
+
+/// CAST to and from a DECIMAL: widening is exact, narrowing rounds half away
+/// from zero, and a literal — numeric or the one string form — folds to the
+/// constant it is at the target scale.
+#[test]
+fn decimal_casts_round_at_the_target_scale() {
+    let (p, q, i) = (125, 5, 3);
+    let c = |i: usize| BoundExpr::ColRef(i);
+    let cast = |e: BoundExpr, to| BoundExpr::Cast { expr: Box::new(e), to };
+    let dec = gnitz_core::ColType::decimal;
+    assert_eq!(eval_decimal_row(&cast(c(3), dec(2)), p, q, i), Some(300));
+    assert_eq!(eval_decimal_row(&cast(c(2), dec(2)), p, 5, i), Some(1)); // 0.005 → 0.01
+    assert_eq!(eval_decimal_row(&cast(c(2), dec(2)), p, 4, i), Some(0));
+    assert_eq!(eval_decimal_row(&cast(c(1), dec(3)), p, q, i), Some(1250));
+    assert_eq!(eval_decimal_row(&cast(c(1), TypeCode::I64.into()), 150, q, i), Some(2));
+    assert_eq!(
+        eval_decimal_row(&cast(BoundExpr::LitFloat(1.005), dec(2)), p, q, i),
+        Some(101)
+    );
+    assert_eq!(
+        eval_decimal_row(&cast(BoundExpr::LitStr("2.5".into()), dec(2)), p, q, i),
+        Some(250)
+    );
+    assert_eq!(
+        eval_decimal_row(&cast(c(1), TypeCode::F64.into()), p, q, i).map(|b| f64::from_bits(b as u64)),
+        Some(1.25)
+    );
+}
+
+/// The `IN` fast path takes a DECIMAL's literals exact at the column's scale —
+/// so it stays one `IntInSet` — and a product past the scale cap has no
+/// register, so it is refused at plan time.
+#[test]
+fn decimal_in_set_is_exact_and_a_wide_product_is_refused() {
+    let (p, q, i) = (125, 5, 3);
+    let c = |i: usize| BoundExpr::ColRef(i);
+    let bin = |l: BoundExpr, op, r: BoundExpr| BoundExpr::BinOp(Box::new(l), op, Box::new(r));
+    let in_list = BoundExpr::InList {
+        inner: Box::new(c(1)),
+        items: vec![BoundExpr::LitFloat(1.25), BoundExpr::LitInt(2)],
+    };
+    assert!(has(&lower_instrs(&in_list, &decimal_schema()), |i| matches!(
+        i,
+        L::IntInSet { .. }
+    )));
+    assert_eq!(eval_decimal_row(&in_list, p, q, i), Some(1));
+    assert_eq!(eval_decimal_row(&in_list, 200, q, i), Some(1));
+    assert_eq!(eval_decimal_row(&in_list, 201, q, i), Some(0));
+    // A product past the scale cap is refused at plan time.
+    let wide = bin(bin(c(2), BinOp::Mul, c(2)), BinOp::Mul, bin(c(2), BinOp::Mul, c(2)));
+    let err = compile_bound_expr_to_program(&bin(wide.clone(), BinOp::Mul, wide), &decimal_schema().columns);
+    assert!(err.unwrap_err().to_string().contains("scale"));
+}
+
+/// A blend can name a scale no register can hold — `price + q*q*…` widens the
+/// left operand to the product's scale — so the cap belongs on every coercion,
+/// not on the product alone. Past it the plan is refused, never scaled by a
+/// `10^n` that overflows `i64`.
+#[test]
+fn a_blend_past_the_scale_cap_is_refused_not_scaled() {
+    let s = decimal_schema();
+    let bin = |l: BoundExpr, op, r: BoundExpr| BoundExpr::BinOp(Box::new(l), op, Box::new(r));
+    let c = |i: usize| BoundExpr::ColRef(i);
+    // q is scale 3, so q^7 types as scale 21 and p (scale 2) would widen by 19.
+    let q7 = (0..6).fold(c(2), |acc, _| bin(acc, BinOp::Mul, c(2)));
+    let err = compile_bound_expr_to_program(&bin(c(1), BinOp::Add, q7.clone()), &s.columns)
+        .expect_err("a scale past the cap has no register");
+    assert!(err.to_string().contains("scale"), "{err}");
+    let case = BoundExpr::Case {
+        branches: vec![(BoundExpr::LitInt(1), c(1))],
+        else_: Some(Box::new(q7)),
+    };
+    let err = compile_bound_expr_to_program(&case, &s.columns).expect_err("same cap through a CASE blend");
+    assert!(err.to_string().contains("scale"), "{err}");
 }

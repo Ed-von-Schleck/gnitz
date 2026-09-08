@@ -1,6 +1,7 @@
 use crate::error::GnitzSqlError;
-use gnitz_core::{ColumnDef, TypeCode};
+use gnitz_core::{ColType, ColumnDef, TypeCode};
 use gnitz_expr::CalendarOp;
+use gnitz_wire::decimal::{decimal_of_f64, rescale};
 
 /// Both are instruction selectors, so the evaluator crate owns their
 /// definitions; the IR carries each verbatim rather than restating it.
@@ -85,7 +86,7 @@ pub(crate) enum BExpr<R> {
     },
     Cast {
         expr: Box<BExpr<R>>,
-        to: TypeCode,
+        to: ColType,
     },
     StrCall {
         f: StrFunc,
@@ -164,7 +165,7 @@ impl StrArg {
 }
 
 impl StrFunc {
-    /// What this function produces. Read both by `infer_type_with`, to type the
+    /// What this function produces. Read both by `infer_ty_with`, to type the
     /// column a view declares, and by lowering, to class the register it writes
     /// — so a declared STRING column and a scalar register cannot disagree.
     pub(crate) fn result_type(self) -> TypeCode {
@@ -213,17 +214,22 @@ pub(crate) enum NumFunc {
 
 impl NumFunc {
     /// What this function produces over an argument of type `arg`. Read both by
-    /// `infer_type_with`, to type the column a view declares, and by lowering,
+    /// `infer_ty_with`, to type the column a view declares, and by lowering,
     /// to class the register it writes — so the two cannot disagree.
-    pub(crate) fn result_type(self, arg: TypeCode) -> TypeCode {
+    pub(crate) fn result_type(self, arg: ColType) -> ColType {
         use FloatUnaryOp as F;
         match self {
             // The transcendentals and a negative scale always lift to float.
-            NumFunc::Unary(F::Sqrt | F::Ln | F::Log10 | F::Exp) => TypeCode::F64,
-            NumFunc::Round(n) if n < 0 => TypeCode::F64,
+            NumFunc::Unary(F::Sqrt | F::Ln | F::Log10 | F::Exp) => ColType::of(TypeCode::F64),
+            NumFunc::Round(n) if n < 0 => ColType::of(TypeCode::F64),
             // SIGN's -1/0/1 is signed whatever integer it reads.
-            NumFunc::Unary(F::Sign) if arg.is_float() => TypeCode::F64,
-            NumFunc::Unary(F::Sign) => TypeCode::I64,
+            NumFunc::Unary(F::Sign) if arg.tc.is_float() => ColType::of(TypeCode::F64),
+            NumFunc::Unary(F::Sign) => ColType::of(TypeCode::I64),
+            // A DECIMAL keeps its scale under the sign kernels; rounding to `n`
+            // places is a DECIMAL of `n` places, never wider than the argument.
+            NumFunc::Unary(F::Neg | F::Abs) if arg.is_decimal() => arg,
+            NumFunc::Round(n) if arg.is_decimal() => ColType::decimal((n as u8).min(arg.scale)),
+            NumFunc::Unary(F::Floor | F::Ceil | F::Round | F::Trunc) if arg.is_decimal() => ColType::decimal(0),
             // The identity or an integer kernel over an integer register, the
             // IEEE result over a float one: the argument's own register image.
             NumFunc::Unary(F::Neg | F::Abs | F::Floor | F::Ceil | F::Round | F::Trunc) | NumFunc::Round(_) => {
@@ -239,43 +245,97 @@ impl NumFunc {
 pub(crate) type BoundExpr = BExpr<usize>;
 
 /// Common type for arithmetic and conditional blends, matching the engine's
-/// runtime register rule (`reg_u64`): any float operand → F64; else any U64
-/// operand → U64 (so the materialized column re-seeds a downstream unsigned
-/// compare); else I64. Those three are 8-byte slots — a pure type-label decision
-/// (the integer arithmetic itself is bit-identical either way).
+/// runtime register rule (`reg_u64`): any float operand → F64; else any DECIMAL
+/// operand → the DECIMAL of the wider scale; else any U64 operand → U64 (so the
+/// materialized column re-seeds a downstream unsigned compare); else I64. Those
+/// are all 8-byte slots — a pure type-label decision (the integer arithmetic
+/// itself is bit-identical either way).
 ///
 /// A STRING operand wins outright, because the two are different register
 /// classes rather than two widths of one: a CASE with any string branch is a
 /// string CASE, and lowering rejects the genuinely mixed shapes when it reads
 /// the branches. Ranking it above F64 is what lets a string CASE be typed by
 /// this one fold instead of a second pass beside it.
-pub(crate) fn unify_blend_type(a: TypeCode, b: TypeCode) -> TypeCode {
+pub(crate) fn unify_blend_type(a: ColType, b: ColType) -> ColType {
     // Per-operand this is exactly `register_image`; unifying a pair is the
-    // String > F64 > U64 > I64 join of the two images. Past the first three
-    // arms only {I64, DATE, TIMESTAMP} are left, so the two below read: a
+    // String > F64 > DECIMAL > U64 > I64 join of the two images. Past the
+    // String, F64, DECIMAL and U64 arms only {I64, DATE, TIMESTAMP} are left,
+    // so the two below read: a
     // temporal image absorbs the neutral I64, an equal pair is itself (which is
     // reachable for a temporal pair alone), and DATE with TIMESTAMP falls to the
     // integer both of them are.
-    match (a.register_image(), b.register_image()) {
-        (TypeCode::String, _) | (_, TypeCode::String) => TypeCode::String,
-        (TypeCode::F64, _) | (_, TypeCode::F64) => TypeCode::F64,
-        (TypeCode::U64, _) | (_, TypeCode::U64) => TypeCode::U64,
-        (x, TypeCode::I64) | (TypeCode::I64, x) => x,
-        (x, y) if x == y => x,
-        _ => TypeCode::I64,
+    let (a, b) = (a.register_image(), b.register_image());
+    match (a.tc, b.tc) {
+        (TypeCode::String, _) | (_, TypeCode::String) => ColType::of(TypeCode::String),
+        (TypeCode::F64, _) | (_, TypeCode::F64) => ColType::of(TypeCode::F64),
+        (TypeCode::Decimal, TypeCode::Decimal) => ColType::decimal(a.scale.max(b.scale)),
+        (TypeCode::Decimal, _) => a,
+        (_, TypeCode::Decimal) => b,
+        (TypeCode::U64, _) | (_, TypeCode::U64) => ColType::of(TypeCode::U64),
+        (x, TypeCode::I64) | (TypeCode::I64, x) => ColType::of(x),
+        (x, y) if x == y => ColType::of(x),
+        _ => ColType::of(TypeCode::I64),
     }
 }
 
 /// `+` / `-` with a temporal operand: a date or timestamp shifted by an integer
 /// keeps its type, the difference of two of the same type is an integer, and
 /// anything else takes the plain blend.
-fn temporal_arith_type(op: BinOp, lt: TypeCode, rt: TypeCode) -> TypeCode {
-    let is_int = |t: TypeCode| matches!(t.register_image(), TypeCode::I64 | TypeCode::U64);
-    match (lt.is_temporal(), rt.is_temporal(), op) {
-        (true, true, BinOp::Sub) if lt == rt => TypeCode::I64,
+fn temporal_arith_type(op: BinOp, lt: ColType, rt: ColType) -> ColType {
+    let is_int = |t: ColType| matches!(t.register_image().tc, TypeCode::I64 | TypeCode::U64);
+    match (lt.tc.is_temporal(), rt.tc.is_temporal(), op) {
+        (true, true, BinOp::Sub) if lt == rt => ColType::of(TypeCode::I64),
         (true, false, BinOp::Add | BinOp::Sub) if is_int(rt) => lt,
         (false, true, BinOp::Add) if is_int(lt) => rt,
         _ => unify_blend_type(lt, rt),
+    }
+}
+
+/// The type a binary node with a DECIMAL operand computes in — arithmetic's
+/// result, and the scale a comparison's operands meet at.
+pub(crate) fn decimal_compute_type(op: BinOp, lt: ColType, rt: ColType) -> ColType {
+    let blend = unify_blend_type(lt, rt);
+    match op {
+        _ if !blend.is_decimal() => blend,
+        // Neither has a scale of its own: truncating a quotient to one would
+        // make `1 / 3.0` read `0.3`.
+        BinOp::Div | BinOp::Pow => ColType::of(TypeCode::F64),
+        BinOp::Mul => ColType::decimal(lt.scale + rt.scale),
+        _ => blend,
+    }
+}
+
+/// The types of a node's operands as it combines them: each its own, except a
+/// float literal beside a DECIMAL operand, which is read as the exact decimal
+/// it spells — so `price * 1.1` stays exact over a DECIMAL column where it
+/// stays a float over a DOUBLE one. Typing and lowering both read operands
+/// through here, so they cannot disagree on which literal was adopted.
+pub(crate) fn operand_tys<R, F: Fn(&R) -> ColType>(items: &[&BExpr<R>], leaf_ty: &F) -> Vec<ColType> {
+    let mut tys: Vec<ColType> = items.iter().map(|e| e.infer_ty_with(leaf_ty)).collect();
+    adopt_decimal_literals(items, &mut tys);
+    tys
+}
+
+/// [`operand_tys`] for a binary node's two operands, which needs no heap — the
+/// shape every `BinOp` reads, in typing and in lowering alike.
+pub(crate) fn operand_ty_pair<R, F: Fn(&R) -> ColType>(l: &BExpr<R>, r: &BExpr<R>, leaf_ty: &F) -> (ColType, ColType) {
+    let mut tys = [l.infer_ty_with(leaf_ty), r.infer_ty_with(leaf_ty)];
+    adopt_decimal_literals(&[l, r], &mut tys);
+    (tys[0], tys[1])
+}
+
+/// Re-read each float literal of `items` as the exact decimal it spells, where
+/// any operand is a DECIMAL. The adoption both [`operand_tys`] shapes share.
+fn adopt_decimal_literals<R>(items: &[&BExpr<R>], tys: &mut [ColType]) {
+    if !tys.iter().any(|t| t.is_decimal()) {
+        return;
+    }
+    for (e, ty) in items.iter().zip(tys) {
+        if let BExpr::LitFloat(v) = e {
+            if let Some((_, scale)) = decimal_of_f64(*v) {
+                *ty = ColType::decimal(scale);
+            }
+        }
     }
 }
 
@@ -285,7 +345,10 @@ impl<R> BExpr<R> {
     /// not (a difference of two dates is an integer, a date shifted by one is
     /// a date). [`Self::int_literal`] is the inverse.
     pub(crate) fn temporal_lit(to: TypeCode, v: i64) -> Self {
-        BExpr::Cast { expr: Box::new(BExpr::LitInt(v)), to }
+        BExpr::Cast {
+            expr: Box::new(BExpr::LitInt(v)),
+            to: ColType::of(to),
+        }
     }
 
     /// The integer a literal spells: a plain `LitInt`, or one under the typed
@@ -294,9 +357,30 @@ impl<R> BExpr<R> {
     pub(crate) fn int_literal(&self) -> Option<i64> {
         match self {
             BExpr::LitInt(v) => Some(*v),
-            BExpr::Cast { expr, to } if to.is_temporal() => expr.int_literal(),
+            BExpr::Cast { expr, to } if to.tc.is_temporal() => expr.int_literal(),
             _ => None,
         }
+    }
+
+    /// The decimal a numeric literal spells, as `(unscaled, scale)` — an integer
+    /// at scale 0, a float at the scale it was written with. The consumer
+    /// re-expresses it at a column's scale, exactly or by rounding as its own
+    /// contract says.
+    pub(crate) fn decimal_literal(&self) -> Option<(i64, u8)> {
+        match self {
+            BExpr::LitInt(v) => Some((*v, 0)),
+            BExpr::LitFloat(v) => decimal_of_f64(*v),
+            _ => None,
+        }
+    }
+
+    /// The `i64` this literal is at DECIMAL scale `scale` when it is exactly
+    /// representable there — an integer, or a float written with no more
+    /// fractional digits than the scale holds. A longer literal is not rounded:
+    /// a key or a membership test against it must not match a neighbour.
+    pub(crate) fn exact_decimal(&self, scale: u8) -> Option<i64> {
+        let (v, s) = self.decimal_literal()?;
+        (s <= scale).then(|| rescale(v as i128, s, scale)).flatten()
     }
 
     /// Infer the result type, parameterized over how a leaf reference is typed.
@@ -305,55 +389,58 @@ impl<R> BExpr<R> {
     /// arithmetic/CASE fold via `unify_blend_type`). `NullTest`/`InList` are
     /// boolean and never consult `leaf_ty`. The runtime `usize` entry point
     /// is [`BExpr::infer_type`].
-    pub(crate) fn infer_type_with<F: Fn(&R) -> TypeCode>(&self, leaf_ty: &F) -> TypeCode {
+    pub(crate) fn infer_ty_with<F: Fn(&R) -> ColType>(&self, leaf_ty: &F) -> ColType {
+        let int = ColType::of(TypeCode::I64);
         match self {
             BExpr::ColRef(r) => leaf_ty(r),
-            BExpr::LitInt(_) => TypeCode::I64,
-            BExpr::LitFloat(_) => TypeCode::F64,
-            BExpr::LitStr(_) => TypeCode::String,
+            BExpr::LitInt(_) => int,
+            BExpr::LitFloat(_) => ColType::of(TypeCode::F64),
+            BExpr::LitStr(_) => ColType::of(TypeCode::String),
             // A wide literal only ever appears in `col OP wide` (the `BinOp`
             // comparison arm returns `I64` regardless), and no caller consults a
             // wide *literal*'s type — so I64 is inert here, uniform with `LitInt`.
-            BExpr::LitWide(_) => TypeCode::I64,
-            BExpr::LitNull => TypeCode::I64,
+            BExpr::LitWide(_) => int,
+            BExpr::LitNull => int,
             BExpr::BinOp(l, op, r) => {
-                let lt = l.infer_type_with(leaf_ty);
-                let rt = r.infer_type_with(leaf_ty);
+                let (lt, rt) = operand_ty_pair(l, r, leaf_ty);
                 match op {
                     // Comparisons and the connectives are boolean.
-                    o if o.as_cmp().is_some() => TypeCode::I64,
-                    BinOp::And | BinOp::Or => TypeCode::I64,
-                    BinOp::Concat => TypeCode::String,
-                    BinOp::Pow => TypeCode::F64,
-                    BinOp::Add | BinOp::Sub if lt.is_temporal() || rt.is_temporal() => temporal_arith_type(*op, lt, rt),
+                    o if o.as_cmp().is_some() => int,
+                    BinOp::And | BinOp::Or => int,
+                    BinOp::Concat => ColType::of(TypeCode::String),
+                    BinOp::Pow => ColType::of(TypeCode::F64),
+                    BinOp::Add | BinOp::Sub if lt.tc.is_temporal() || rt.tc.is_temporal() => {
+                        temporal_arith_type(*op, lt, rt)
+                    }
+                    _ if lt.is_decimal() || rt.is_decimal() => decimal_compute_type(*op, lt, rt),
                     // Arithmetic preserves U64 (and floats), mirroring the engine's
                     // `reg_u64`: a materialized `u64 + u64` column must stay
                     // U64 so a downstream compare re-seeds the unsigned variant.
                     _ => unify_blend_type(lt, rt),
                 }
             }
-            BExpr::UnaryOp(UnaryOp::Neg, inner) => inner.infer_type_with(leaf_ty),
-            BExpr::UnaryOp(UnaryOp::Not, _) => TypeCode::I64,
-            BExpr::NullTest { .. } => TypeCode::I64,
+            BExpr::UnaryOp(UnaryOp::Neg, inner) => inner.infer_ty_with(leaf_ty),
+            BExpr::UnaryOp(UnaryOp::Not, _) => int,
+            BExpr::NullTest { .. } => int,
             BExpr::Case { branches, else_ } => Self::case_type(branches, else_.as_deref(), leaf_ty),
             // The membership and pattern tests are booleans, like the comparison
             // `BinOp` arm.
-            BExpr::InList { .. } | BExpr::Like { .. } => TypeCode::I64,
-            BExpr::Func { f, arg } => f.result_type(arg.infer_type_with(leaf_ty)),
+            BExpr::InList { .. } | BExpr::Like { .. } => int,
+            BExpr::Func { f, arg } => f.result_type(arg.infer_ty_with(leaf_ty)),
             BExpr::Calendar { op, arg } => match op {
-                CalendarOp::ToMicros => TypeCode::Timestamp,
-                CalendarOp::ToDays => TypeCode::Date,
-                op if op.keeps_type() => arg.infer_type_with(leaf_ty),
-                _ => TypeCode::I64,
+                CalendarOp::ToMicros => ColType::of(TypeCode::Timestamp),
+                CalendarOp::ToDays => ColType::of(TypeCode::Date),
+                op if op.keeps_type() => arg.infer_ty_with(leaf_ty),
+                _ => int,
             },
             // Seeded with `unify_blend_type`'s neutral element, so a one-argument
             // list types as its own register image and an empty one as I64.
-            BExpr::MinMaxN { args, .. } => args
-                .iter()
-                .fold(TypeCode::I64, |ty, a| unify_blend_type(ty, a.infer_type_with(leaf_ty))),
+            BExpr::MinMaxN { args, .. } => operand_tys(&args.iter().collect::<Vec<_>>(), leaf_ty)
+                .into_iter()
+                .fold(int, unify_blend_type),
             BExpr::Cast { to, .. } => *to,
-            BExpr::StrCall { f, .. } => f.result_type(),
-            BExpr::Substr { .. } | BExpr::TrimCall { .. } | BExpr::ConcatN { .. } => TypeCode::String,
+            BExpr::StrCall { f, .. } => ColType::of(f.result_type()),
+            BExpr::Substr { .. } | BExpr::TrimCall { .. } | BExpr::ConcatN { .. } => ColType::of(TypeCode::String),
         }
     }
 
@@ -381,35 +468,34 @@ impl<R> BExpr<R> {
     }
 
     /// A CASE's result type, from its result branches and its else — the one
-    /// walk both `infer_type_with` and lowering read it out of. Each branch is
+    /// walk both `infer_ty_with` and lowering read it out of. Each branch is
     /// inferred exactly once, which matters because a CASE nested in a CASE would
     /// otherwise double per level.
     ///
-    /// `unify_blend_type` over every branch and the else, seeded from the else (I64
-    /// when implicit), so a U64/float branch is preserved and any string branch
+    /// `unify_blend_type` over every branch and the else, seeded with I64 (the
+    /// implicit else), so a U64/float branch is preserved and any string branch
     /// wins outright.
     ///
     /// `LitNull` carries no type signal — it infers as a hardcoded I64 — so it is
     /// polymorphic here. The consequence is that an all-NULL CASE still types
     /// I64 and so declares an I64 column, exactly as an all-NULL numeric CASE
     /// does today.
-    pub(crate) fn case_type<F: Fn(&R) -> TypeCode>(
+    pub(crate) fn case_type<F: Fn(&R) -> ColType>(
         branches: &[(BExpr<R>, BExpr<R>)],
         else_: Option<&BExpr<R>>,
         leaf_ty: &F,
-    ) -> TypeCode {
-        let mut ty = else_.map_or(TypeCode::I64, |e| e.infer_type_with(leaf_ty));
-        for (_cond, result) in branches {
-            ty = unify_blend_type(ty, result.infer_type_with(leaf_ty));
-        }
-        ty
+    ) -> ColType {
+        let results: Vec<&BExpr<R>> = branches.iter().map(|(_, r)| r).chain(else_).collect();
+        operand_tys(&results, leaf_ty)
+            .into_iter()
+            .fold(ColType::of(TypeCode::I64), unify_blend_type)
     }
 }
 
 impl<R> BExpr<R> {
     /// Rebuild the expression structurally, replacing each `ColRef` by whatever
     /// `leaf` returns for it — another leaf, or a whole sub-expression. The one
-    /// rebuilding walk (`for_each_ref` reads, `infer_type_with` types), so a new
+    /// rebuilding walk (`for_each_ref` reads, `infer_ty_with` types), so a new
     /// variant is added in three places and fails to compile until it is.
     pub(crate) fn try_rebuild<S, E>(&self, leaf: &impl Fn(&R) -> Result<BExpr<S>, E>) -> Result<BExpr<S>, E> {
         let go = |e: &BExpr<R>| e.try_rebuild(leaf);
@@ -508,9 +594,15 @@ impl<R> BExpr<R> {
 
 impl BExpr<usize> {
     /// The runtime entry point: type a `ColRef(idx)` leaf as the schema column's
-    /// declared type (`cols[idx].type_code`, panicking on an out-of-bounds index).
+    /// declared type (`cols[idx].ty()`, panicking on an out-of-bounds index).
+    pub(crate) fn infer_ty(&self, cols: &[ColumnDef]) -> ColType {
+        self.infer_ty_with(&|idx: &usize| cols[*idx].ty())
+    }
+
+    /// [`Self::infer_ty`]'s type code, for the consumers a DECIMAL's scale does
+    /// not concern.
     pub(crate) fn infer_type(&self, cols: &[ColumnDef]) -> TypeCode {
-        self.infer_type_with(&|idx: &usize| cols[*idx].type_code)
+        self.infer_ty(cols).tc
     }
 }
 

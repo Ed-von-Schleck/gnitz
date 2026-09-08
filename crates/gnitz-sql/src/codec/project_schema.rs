@@ -67,14 +67,14 @@ fn resolve_proj_col(
     let bound = bind_single_table(expr, source_schema, rel_alias)?;
     // The output `ColumnDef` follows the same split: a pass-through keeps the
     // source column's declaration under the written alias — which only renames
-    // it — and a computed column is declared from its `infer_type`.
+    // it — and a computed column is declared from its `infer_ty`.
     Ok(match ProjItem::from_bound(bound) {
         ProjItem::PassThrough { src_col } => (
             ProjItem::PassThrough { src_col },
             aliased_def(&source_schema.columns[src_col], alias),
         ),
         ProjItem::Computed { bound_expr } => {
-            let nominal = bound_expr.infer_type(&source_schema.columns);
+            let nominal = bound_expr.infer_ty(&source_schema.columns);
             (
                 ProjItem::Computed { bound_expr },
                 crate::validate::computed_column(alias, idx, nominal),

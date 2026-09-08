@@ -69,6 +69,7 @@ pub struct ColTabRow<'a> {
     pub fk_col_idx: u64,
     pub is_serial: bool,
     pub is_hidden: bool,
+    pub scale: u8,
 }
 
 /// Write one `COL_TAB` row. The key is `pack_col_id(owner_id, col_idx)`, which
@@ -87,6 +88,7 @@ pub fn write_col_tab_row(sink: &mut impl SysRowSink, r: &ColTabRow, weight: i64)
     sink.put_u64(r.fk_col_idx);
     sink.put_u64(r.is_serial as u64);
     sink.put_u64(r.is_hidden as u64);
+    sink.put_u64(r.scale as u64);
     sink.end_row();
     Ok(())
 }

@@ -4,11 +4,13 @@
 //! live in `gnitz-wire`, so the engine cannot enforce a different set.
 
 use super::error::ProtocolError;
-use super::types::{type_code_from_u64, ColumnDef, Schema};
+use super::types::{type_code_from_u64, ColType, ColumnDef, Schema};
 use gnitz_wire::schema_block::{SchemaBlock, SchemaBlockCol};
 use std::sync::Arc;
 
-use gnitz_wire::{col_meta_hidden, col_meta_nullable, col_meta_serial, pack_col_meta_flags, PK_LIST_MAX_COLS};
+use gnitz_wire::{
+    col_meta_hidden, col_meta_nullable, col_meta_scale, col_meta_serial, pack_col_meta_flags, PK_LIST_MAX_COLS,
+};
 
 /// Encode the meta-schema WAL block for `schema` under table id `tid` — the
 /// exact bytes a schema-bearing push embeds. Shared by the plain-push encoder,
@@ -30,6 +32,7 @@ pub fn encode_schema_block(schema: &Schema, tid: u32) -> Vec<u8> {
                 col.is_nullable,
                 col.is_hidden,
                 col.is_serial,
+                col.scale,
                 schema.pk_cols.iter().position(|&p| p as usize == ci).map(|p| p as u8),
             ),
             name: col.name.as_bytes(),
@@ -79,11 +82,11 @@ pub fn schema_from_block(block: &[u8]) -> Result<Schema, ProtocolError> {
             std::str::from_utf8(c.name).map_err(|e| ProtocolError::DecodeError(format!("utf8 in column name: {e}")))?;
         // The shared decoder already rejected an unknown code; this re-reads it
         // as the client's typed `TypeCode` rather than trusting a cast.
-        let mut col = ColumnDef::new(
-            name,
-            type_code_from_u64(c.type_code as u64)?,
-            col_meta_nullable(c.flags),
-        );
+        let ty = ColType {
+            tc: type_code_from_u64(c.type_code as u64)?,
+            scale: col_meta_scale(c.flags),
+        };
+        let mut col = ColumnDef::typed(name, ty, col_meta_nullable(c.flags));
         if col_meta_hidden(c.flags) {
             col = col.hidden();
         }

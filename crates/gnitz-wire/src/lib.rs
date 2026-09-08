@@ -103,6 +103,7 @@ mod types;
 mod uuid;
 
 pub mod control;
+pub mod decimal;
 pub mod schema_block;
 pub mod sys_rows;
 pub mod txn_frame;

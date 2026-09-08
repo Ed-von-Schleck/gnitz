@@ -31,7 +31,7 @@ use crate::bind::Binder;
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr};
 use chain::{EmitPieces, ViewChain};
-use gnitz_core::{CatalogSnapshot, ColumnDef, RangeRel, RelDescriptor, Schema, TypeCode};
+use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, RangeRel, RelDescriptor, Schema, TypeCode};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -232,12 +232,12 @@ impl SubqueryRef {
     /// its finalize type (AVG divides to `F64`, every other aggregate keeps its
     /// raw output type). Used to type a computed projection column that embeds the
     /// subquery leaf, before decorrelation substitutes the real expression.
-    pub(crate) fn value_type(&self) -> TypeCode {
+    pub(crate) fn value_type(&self) -> ColType {
         match self.kind {
-            SubqueryKind::Exists { .. } => TypeCode::I64,
+            SubqueryKind::Exists { .. } => ColType::of(TypeCode::I64),
             SubqueryKind::Scalar => match self.scalar_agg() {
                 Ok(agg) => agg.view_type(),
-                Err(_) => TypeCode::I64,
+                Err(_) => ColType::of(TypeCode::I64),
             },
         }
     }
@@ -410,7 +410,7 @@ impl HirAgg {
             // by name — the finalize composite is built for it, not looked up.
             out: HirCol::new(
                 ids.next(),
-                ColumnDef::new(
+                ColumnDef::typed(
                     "_agg",
                     typing.ops[0].1,
                     typing.ops[0].0.raw_output_nullable(arg_nullable, is_global),
@@ -437,8 +437,8 @@ impl HirAgg {
     }
 
     /// The type this aggregate renders where a view reads it.
-    pub(crate) fn view_type(&self) -> TypeCode {
-        crate::agg::agg_view_type(self.func, self.out.def.type_code)
+    pub(crate) fn view_type(&self) -> ColType {
+        crate::agg::agg_view_type(self.func, self.out.def.ty())
     }
 
     /// A companion carries the null-ness (the finalize renders NULL by
@@ -449,7 +449,7 @@ impl HirAgg {
 
     /// This aggregate as a view-facing value column: what computes it, and the
     /// type and nullability that value is declared with.
-    pub(crate) fn as_value(&self) -> (HirExpr, TypeCode, bool) {
+    pub(crate) fn as_value(&self) -> (HirExpr, ColType, bool) {
         (self.finalize(), self.view_type(), self.view_nullable())
     }
 }
@@ -802,10 +802,12 @@ impl RelExpr {
         }
         let mut out = Vec::with_capacity(lcols.len());
         for (i, (l, r)) in lcols.iter().zip(&rcols).enumerate() {
-            let tc = guards::set_op_common_type(l.def.type_code, r.def.type_code).ok_or_else(|| {
+            let ty = guards::set_op_common_type(l.def.ty(), r.def.ty()).ok_or_else(|| {
                 GnitzSqlError::Plan(format!(
-                    "set operation: column {} type mismatch ({:?} vs {:?})",
-                    i, l.def.type_code, r.def.type_code
+                    "set operation: column {} type mismatch ({} vs {})",
+                    i,
+                    l.def.ty(),
+                    r.def.ty()
                 ))
             })?;
             // Output name comes from the left side (SQL takes output names from
@@ -816,9 +818,9 @@ impl RelExpr {
                 SetOpKind::Union => l.def.is_nullable || r.def.is_nullable,
             };
             let mut def = l.def.clone();
-            def.type_code = tc;
+            def.set_ty(ty);
             def.is_nullable = is_nullable;
-            let target = |src: TypeCode| (src != tc).then_some(tc);
+            let target = |src: TypeCode| (src != ty.tc).then_some(ty.tc);
             out.push(SetOpCol {
                 left: l.id,
                 right: r.id,

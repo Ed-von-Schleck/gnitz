@@ -4,7 +4,7 @@ use crate::{pack_col_meta_flags, TypeCode, PK_LIST_MAX_COLS};
 fn col(tc: TypeCode, name: &str, pk_pos: Option<u8>, nullable: bool) -> SchemaBlockCol<'_> {
     SchemaBlockCol {
         type_code: tc as u8,
-        flags: pack_col_meta_flags(nullable, false, false, pk_pos),
+        flags: pack_col_meta_flags(nullable, false, false, 0, pk_pos),
         name: name.as_bytes(),
     }
 }
@@ -80,7 +80,7 @@ fn pk_arity_is_bounded_by_the_caller_not_a_shared_cap() {
     let cols: Vec<SchemaBlockCol> = (0..MAX_PK_COLUMNS)
         .map(|i| SchemaBlockCol {
             type_code: TypeCode::U64 as u8,
-            flags: pack_col_meta_flags(false, false, false, Some(i as u8)),
+            flags: pack_col_meta_flags(false, false, false, 0, Some(i as u8)),
             name: b"k",
         })
         .collect();

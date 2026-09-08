@@ -139,7 +139,7 @@ impl ColAcc {
             WireAggFunc::SumZero | WireAggFunc::Count | WireAggFunc::CountNonNull => {
                 ColAcc::IntSum { bits: 0, seen: true }
             }
-            WireAggFunc::Sum if spec.out_type.is_float() => ColAcc::FloatSum { val: 0.0, seen: false },
+            WireAggFunc::Sum if spec.out_type.tc.is_float() => ColAcc::FloatSum { val: 0.0, seen: false },
             WireAggFunc::Sum => ColAcc::IntSum { bits: 0, seen: false },
             WireAggFunc::Min => ColAcc::Extreme { best: None, is_max: false },
             WireAggFunc::Max => ColAcc::Extreme { best: None, is_max: true },

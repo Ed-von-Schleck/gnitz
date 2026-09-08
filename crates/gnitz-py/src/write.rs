@@ -15,7 +15,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDate, PyDateAccess, PyDateTime, PyDict, PyList, PyString, PyTimeAccess, PyTuple, PyTzInfoAccess};
 use pyo3::Borrowed;
 
-use gnitz_core::{push_zero_cell, PkColumn, Schema, TypeCode, ZSetBatch};
+use gnitz_core::{push_zero_cell, ColType, PkColumn, Schema, TypeCode, ZSetBatch};
+use gnitz_wire::decimal::{decimal_of_f64, parse_decimal, rescale};
 
 use crate::read::{pk_column_to_pylist, rust_batch_columns_to_py};
 use crate::schema::resolve_py_schema;
@@ -46,7 +47,7 @@ pub(crate) fn py_pks_to_column(schema: &Schema, pks: &[Bound<'_, PyAny>]) -> PyR
             if pk_val.is_none() {
                 return Err(not_nullable_err(&col.name));
             }
-            push_fixed_le(&mut native, col.type_code, pk_val)?;
+            push_fixed_le(&mut native, col.ty(), pk_val)?;
         } else {
             return Err(pyo3::exceptions::PyTypeError::new_err(
                 "a compound pk must be passed as packed bytes",
@@ -99,8 +100,8 @@ impl PyZSetBatch {
 /// Append one non-null payload cell of type `tc`, spilling a German string into
 /// `blob`. STRING extracts a `str` and BLOB arbitrary bytes: the region carries
 /// both alike, so this extraction is where TEXT stays valid UTF-8.
-fn push_column_value(col: &mut Vec<u8>, blob: &mut Vec<u8>, tc: TypeCode, val: &Bound<'_, PyAny>) -> PyResult<()> {
-    match tc {
+fn push_column_value(col: &mut Vec<u8>, blob: &mut Vec<u8>, ty: ColType, val: &Bound<'_, PyAny>) -> PyResult<()> {
+    match ty.tc {
         TypeCode::String => {
             let s = val.extract::<String>()?;
             col.extend_from_slice(&gnitz_wire::encode_german_string(s.as_bytes(), blob));
@@ -109,7 +110,7 @@ fn push_column_value(col: &mut Vec<u8>, blob: &mut Vec<u8>, tc: TypeCode, val: &
             let b = val.extract::<Vec<u8>>()?;
             col.extend_from_slice(&gnitz_wire::encode_german_string(&b, blob));
         }
-        _ => push_fixed_le(col, tc, val)?,
+        _ => push_fixed_le(col, ty, val)?,
     }
     Ok(())
 }
@@ -165,7 +166,7 @@ struct KwPlan {
 struct PkPlan {
     pos: usize,
     ci: usize,
-    tc: TypeCode,
+    ty: ColType,
 }
 
 /// A payload column of the plan, with what the row loop needs of its
@@ -173,7 +174,7 @@ struct PkPlan {
 #[derive(Clone, Copy)]
 struct PayloadPlan {
     ci: usize,
-    tc: TypeCode,
+    ty: ColType,
     nullable: bool,
     src: PayloadSrc,
 }
@@ -249,11 +250,7 @@ fn build_kw_plan(schema: &Schema, weight_is_column: bool, kwnames: &Bound<'_, Py
             return Err(missing_pk_err(schema, ci));
         };
         consumed[i] = true;
-        pks.push(PkPlan {
-            pos: i,
-            ci,
-            tc: schema.columns[ci].type_code,
-        });
+        pks.push(PkPlan { pos: i, ci, ty: schema.columns[ci].ty() });
     }
     let mut payload = Vec::with_capacity(names.len());
     for (_, ci, col) in schema.payload_columns() {
@@ -267,7 +264,7 @@ fn build_kw_plan(schema: &Schema, weight_is_column: bool, kwnames: &Bound<'_, Py
         };
         payload.push(PayloadPlan {
             ci,
-            tc: col.type_code,
+            ty: col.ty(),
             nullable: col.is_nullable,
             src,
         });
@@ -329,21 +326,21 @@ impl PyZSetBatch {
         // Into the reused scratch first: a failed extraction must leave no
         // half-written key behind.
         pk_scratch.clear();
-        for &PkPlan { pos, ci, tc } in &plan.pks {
+        for &PkPlan { pos, ci, ty } in &plan.pks {
             let v = arg(pos);
             if v.is_none() {
                 return Err(not_nullable_err(&schema.columns[ci].name));
             }
-            push_fixed_le(pk_scratch, tc, &v)?;
+            push_fixed_le(pk_scratch, ty, &v)?;
         }
         batch.pks.push_bytes(schema, pk_scratch);
         let mut nulls = 0u64;
         // `enumerate`, because the dense payload index is the null-bitmap bit
         // position.
-        for (payload_idx, &PayloadPlan { ci, tc, nullable, src }) in plan.payload.iter().enumerate() {
+        for (payload_idx, &PayloadPlan { ci, ty, nullable, src }) in plan.payload.iter().enumerate() {
             let v = match src {
                 PayloadSrc::Filler => {
-                    push_zero_cell(&mut batch.columns[ci], tc);
+                    push_zero_cell(&mut batch.columns[ci], ty.tc);
                     continue;
                 }
                 PayloadSrc::Arg(i) => Some(arg(i)),
@@ -352,14 +349,14 @@ impl PyZSetBatch {
             match v {
                 Some(v) if !v.is_none() => {
                     let ZSetBatch { columns, blob, .. } = &mut *batch;
-                    push_column_value(&mut columns[ci], blob, tc, &v)?
+                    push_column_value(&mut columns[ci], blob, ty, &v)?
                 }
                 _ => {
                     if !nullable {
                         return Err(not_nullable_err(&schema.columns[ci].name));
                     }
                     gnitz_wire::null_word_set(&mut nulls, payload_idx, true);
-                    push_zero_cell(&mut batch.columns[ci], tc);
+                    push_zero_cell(&mut batch.columns[ci], ty.tc);
                 }
             }
         }
@@ -647,6 +644,34 @@ fn extract_micros(item: &Bound<'_, PyAny>) -> PyResult<i64> {
     }
 }
 
+/// A DECIMAL value at the column's `scale`: a `decimal.Decimal` (or anything
+/// that formats as one with `format(x, 'f')`), a `str` of the same spelling, an
+/// `int`, or a `float` read at the digits it prints with — a longer fraction
+/// rounds half away from zero, as an SQL INSERT does.
+fn extract_decimal(item: &Bound<'_, PyAny>, scale: u8) -> PyResult<i64> {
+    let overflow =
+        || pyo3::exceptions::PyOverflowError::new_err(format!("{item} does not fit a DECIMAL of scale {scale}"));
+    if item.cast::<pyo3::types::PyInt>().is_ok() {
+        return rescale(item.extract::<i128>()?, 0, scale).ok_or_else(overflow);
+    }
+    if let Ok(f) = item.cast::<pyo3::types::PyFloat>() {
+        let (v, s) = decimal_of_f64(f.value()).ok_or_else(overflow)?;
+        return rescale(v as i128, s, scale).ok_or_else(overflow);
+    }
+    // Borrowed on both branches: `to_cow` hands back CPython's own UTF-8 where
+    // it has one, so a row costs no copy of the spelling it already holds.
+    let formatted;
+    let text = match item.cast::<PyString>() {
+        Ok(s) => s.to_cow()?,
+        Err(_) => {
+            formatted = item.call_method1(pyo3::intern!(item.py(), "__format__"), ("f",))?;
+            formatted.cast::<PyString>()?.to_cow()?
+        }
+    };
+    parse_decimal(&text, scale)
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("{text:?} is not a DECIMAL of scale {scale}")))
+}
+
 /// Append one non-null fixed-width value to `buf` as its native little-endian
 /// bytes — the one typed encoder, serving the PK buffer and every `Fixed`
 /// payload column alike, so a key packs the same way whichever surface
@@ -657,8 +682,8 @@ fn extract_micros(item: &Bound<'_, PyAny>) -> PyResult<i64> {
 /// width-generic pack would silently truncate. Text is accepted for UUID alone,
 /// so a `U128` column takes an integer and nothing else; it extracts as `u128`
 /// because a value above `i128::MAX` is legal there.
-fn push_fixed_le(buf: &mut Vec<u8>, tc: TypeCode, item: &Bound<'_, PyAny>) -> PyResult<()> {
-    match tc {
+fn push_fixed_le(buf: &mut Vec<u8>, ty: ColType, item: &Bound<'_, PyAny>) -> PyResult<()> {
+    match ty.tc {
         TypeCode::U8 => buf.push(item.extract::<u8>()?),
         TypeCode::I8 => buf.push(item.extract::<i8>()? as u8),
         TypeCode::U16 => buf.extend_from_slice(&item.extract::<u16>()?.to_le_bytes()),
@@ -674,6 +699,7 @@ fn push_fixed_le(buf: &mut Vec<u8>, tc: TypeCode, item: &Bound<'_, PyAny>) -> Py
         TypeCode::UUID => buf.extend_from_slice(&extract_uuid_or_u128(item)?.to_le_bytes()),
         TypeCode::Date => buf.extend_from_slice(&extract_days(item)?.to_le_bytes()),
         TypeCode::Timestamp => buf.extend_from_slice(&extract_micros(item)?.to_le_bytes()),
+        TypeCode::Decimal => buf.extend_from_slice(&extract_decimal(item, ty.scale)?.to_le_bytes()),
         TypeCode::String | TypeCode::Blob => {
             unreachable!("a German-string column is never a Fixed column or a PK column")
         }

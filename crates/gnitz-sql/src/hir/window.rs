@@ -49,7 +49,7 @@ use crate::bind::{bind_structural, LeafBinder};
 use crate::error::GnitzSqlError;
 use crate::ir::{AggFunc, BExpr, BinOp};
 use crate::validate::{reject_duplicate_projection_names, reject_float_key_of};
-use gnitz_core::{ColumnDef, TypeCode};
+use gnitz_core::{ColType, ColumnDef, TypeCode};
 use sqlparser::ast::{
     Expr, Function, FunctionArguments, Ident, NamedWindowDefinition, NamedWindowExpr, OrderByExpr, OrderByOptions,
     Select, WindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType,
@@ -152,14 +152,14 @@ struct WindowLeaf<'a, L> {
 impl<L: ItemLeaf> WindowLeaf<'_, L> {
     /// The `(type, nullable)` of the placeholder `r` names, when it names one —
     /// a window value's declaration, which the body's own leaf does not know.
-    fn placeholder(&self, r: &HirRef) -> Option<(TypeCode, bool)> {
+    fn placeholder(&self, r: &HirRef) -> Option<(ColType, bool)> {
         let HirRef::Col(id) = r else { return None };
         self.state
             .borrow()
             .calls
             .iter()
             .find(|c| c.out.id == *id)
-            .map(|c| (c.out.def.type_code, c.out.def.is_nullable))
+            .map(|c| (c.out.def.ty(), c.out.def.is_nullable))
     }
 
     /// The function the call behind placeholder `id` computes.
@@ -287,7 +287,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
             };
             self.check_key(e, role, if i == 0 { KeySlot::Band } else { KeySlot::Residual })?;
         }
-        let (type_code, is_nullable) = self.call_typing(func, arg.as_ref())?;
+        let (ty, is_nullable) = self.call_typing(func, arg.as_ref())?;
 
         let mut st = self.state.borrow_mut();
         let spec_idx = match st
@@ -304,7 +304,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
         // Addressed by id only: the desugar replaces every reference to it.
         let out = HirCol::new(
             self.ids.next(),
-            ColumnDef::new(format!("_win{}", st.calls.len()), type_code, is_nullable).hidden(),
+            ColumnDef::typed(format!("_win{}", st.calls.len()), ty, is_nullable).hidden(),
         );
         st.calls.push(Call {
             spec: spec_idx,
@@ -319,7 +319,7 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
     /// with the clause named, rather than surfacing later as a rejection of a
     /// join the user never wrote.
     fn check_key(&self, e: &HirExpr, role: &str, slot: KeySlot) -> Result<(), GnitzSqlError> {
-        let tc = e.infer_type_with(&|r| self.type_of(r));
+        let tc = e.infer_ty_with(&|r| self.type_of(r)).tc;
         if tc.is_float() {
             return Err(reject_float_key_of("a float-valued expression", role));
         }
@@ -341,11 +341,11 @@ impl<L: ItemLeaf> WindowLeaf<'_, L> {
     /// A call's output type and nullability. The type is the aggregate's own;
     /// the nullability is not, because a window frame always contains the
     /// current row, so an aggregate over a NOT NULL argument is never NULL.
-    fn call_typing(&self, func: WinFunc, arg: Option<&HirExpr>) -> Result<(TypeCode, bool), GnitzSqlError> {
+    fn call_typing(&self, func: WinFunc, arg: Option<&HirExpr>) -> Result<(ColType, bool), GnitzSqlError> {
         let WinFunc::Agg(agg) = func else {
-            return Ok((TypeCode::I64, false));
+            return Ok((ColType::of(TypeCode::I64), false));
         };
-        let arg_def = arg.map(|e| ColumnDef::new("_arg", e.infer_type_with(&|r| self.type_of(r)), !self.never_null(e)));
+        let arg_def = arg.map(|e| ColumnDef::typed("_arg", e.infer_ty_with(&|r| self.type_of(r)), !self.never_null(e)));
         let raw = crate::agg::agg_typing(agg, arg_def.as_ref())?.ops[0].1;
         let nullable = match agg {
             AggFunc::Count => false,
@@ -410,8 +410,8 @@ impl<L: ItemLeaf> ItemLeaf for WindowLeaf<'_, L> {
     fn env(&self) -> &[HirCol] {
         self.inner.env()
     }
-    fn type_of(&self, r: &HirRef) -> TypeCode {
-        self.placeholder(r).map_or_else(|| self.inner.type_of(r), |(tc, _)| tc)
+    fn type_of(&self, r: &HirRef) -> ColType {
+        self.placeholder(r).map_or_else(|| self.inner.type_of(r), |(ty, _)| ty)
     }
     fn wildcard_cols(&self) -> Option<Vec<&HirCol>> {
         self.inner.wildcard_cols()
@@ -432,7 +432,7 @@ impl<L: ItemLeaf> ItemLeaf for WindowLeaf<'_, L> {
                 Some(WinFunc::Agg(agg)) => default_agg_name(agg, idx),
                 _ => format!("_{}{idx}", single_fn_name(f).unwrap_or("window").to_ascii_lowercase()),
             });
-            let def = ColumnDef::new(name, out.def.type_code, out.def.is_nullable);
+            let def = ColumnDef::typed(name, out.def.ty(), out.def.is_nullable);
             (BExpr::ColRef(HirRef::Col(out.id)), def)
         }))
     }
@@ -530,11 +530,11 @@ impl Hoist<'_> {
         if let Some(it) = self.items.iter().find(|it| it.expr == *e) {
             return it.out.id;
         }
-        let tc = e.infer_type_with(&|r| type_of(self.env, r));
+        let ty = e.infer_ty_with(&|r| type_of(self.env, r));
         let nullable = !e.never_null_with(&|r| hir_ref_nullable(self.env, r));
         let out = HirCol::new(
             self.ids.next(),
-            ColumnDef::new(format!("_w{}", self.items.len()), tc, nullable),
+            ColumnDef::typed(format!("_w{}", self.items.len()), ty, nullable),
         );
         let id = out.id;
         self.items.push(ProjEntry { expr: e.clone(), out });
@@ -740,7 +740,7 @@ struct Windowed {
 }
 
 /// A value column of a reduce's projection: its expression, type, nullability.
-type Value = (HirExpr, TypeCode, bool);
+type Value = (HirExpr, ColType, bool);
 
 /// A reduce's aggregate list, deduplicated by `(function, argument)`, with each
 /// aggregate's index handed back so a value can address it.
@@ -789,7 +789,7 @@ fn present(
             let def = &col_by_id(&in_cols, k).expect("a reduce carries its group keys").def;
             let out = HirCol::new(
                 ids.next(),
-                ColumnDef::new(format!("_k{i}"), def.type_code, def.is_nullable),
+                ColumnDef::typed(format!("_k{i}"), def.ty(), def.is_nullable),
             );
             let id = out.id;
             items.push(ProjEntry { expr: BExpr::ColRef(HirRef::Col(k)), out });
@@ -798,13 +798,13 @@ fn present(
         .collect();
     let nkeys = items.len();
     let mut value_ids = Vec::with_capacity(values.len());
-    for (expr, tc, nullable) in values {
+    for (expr, ty, nullable) in values {
         value_ids.push(match items[nkeys..].iter().find(|it| it.expr == expr) {
             Some(it) => it.out.id,
             None => {
                 let out = HirCol::new(
                     ids.next(),
-                    ColumnDef::new(format!("_{prefix}{}", items.len() - nkeys), tc, nullable),
+                    ColumnDef::typed(format!("_{prefix}{}", items.len() - nkeys), ty, nullable),
                 );
                 let id = out.id;
                 items.push(ProjEntry { expr, out });
@@ -858,7 +858,7 @@ fn whole_partition(
             WinFunc::Agg(func) => aggs.value(func, c.arg.map(wid))?,
             // Nothing to order by, so every row of the partition is first. (A
             // written RANK / DENSE_RANK without an ORDER BY is rejected at bind.)
-            _ => (BExpr::LitInt(1), TypeCode::I64, false),
+            _ => (BExpr::LitInt(1), ColType::of(TypeCode::I64), false),
         });
     }
     let reduce = RelExpr::reduce(wf.rel, Vec::new(), keys.clone(), aggs.list);
@@ -958,7 +958,7 @@ fn cumulative(ids: &ColIdGen, w: &WRel, spec: &Spec<ColId>, calls: &[&Call<ColId
                 let scaled = BExpr::BinOp(Box::new(sum), BinOp::Mul, Box::new(BExpr::LitFloat(1.0)));
                 (
                     BExpr::BinOp(Box::new(scaled), BinOp::Div, Box::new(cnt)),
-                    TypeCode::F64,
+                    ColType::of(TypeCode::F64),
                     nullable,
                 )
             }
@@ -973,7 +973,7 @@ fn cumulative(ids: &ColIdGen, w: &WRel, spec: &Spec<ColId>, calls: &[&Call<ColId
                 let before = BExpr::BinOp(Box::new(folded), BinOp::Sub, Box::new(g1.col(nkeys + gs[0])));
                 (
                     BExpr::BinOp(Box::new(before), BinOp::Add, Box::new(BExpr::LitInt(1))),
-                    TypeCode::I64,
+                    ColType::of(TypeCode::I64),
                     false,
                 )
             }

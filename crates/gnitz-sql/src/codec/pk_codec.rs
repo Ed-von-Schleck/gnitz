@@ -15,7 +15,8 @@ use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BoundExpr, UnaryOp};
 #[cfg(test)]
 use gnitz_core::PkBuf;
-use gnitz_core::{FixedInt, PkColumn, Schema, TypeCode};
+use gnitz_core::{ColType, ColumnDef, FixedInt, PkColumn, Schema, TypeCode};
+use gnitz_wire::decimal::{parse_decimal_text, rescale};
 
 pub(crate) fn parse_uuid_str(s: &str) -> Result<u128, GnitzSqlError> {
     gnitz_wire::parse_uuid(s).ok_or_else(|| GnitzSqlError::Bind(format!("invalid UUID literal: {s:?}")))
@@ -152,7 +153,7 @@ pub(crate) enum BoundLit<'e> {
     Str(&'e str),
 }
 
-pub(crate) fn bound_literal(e: &BoundExpr) -> Option<BoundLit<'_>> {
+fn bound_literal(e: &BoundExpr) -> Option<BoundLit<'_>> {
     if let Some(n) = bound_num_literal(e) {
         return Some(BoundLit::Num(n));
     }
@@ -162,6 +163,17 @@ pub(crate) fn bound_literal(e: &BoundExpr) -> Option<BoundLit<'_>> {
     None
 }
 
+/// [`bound_literal`] as a key of column `col`: a DECIMAL column reads an
+/// integer or float literal as the integer it stores, when the literal is exact
+/// at the column's scale — `d = 1.005` on a scale-2 column names no stored
+/// value, so it is no key and stays a filter.
+pub(crate) fn col_key_literal<'e>(e: &'e BoundExpr, col: &ColumnDef) -> Option<BoundLit<'e>> {
+    if col.type_code != TypeCode::Decimal {
+        return bound_literal(e);
+    }
+    Some(BoundLit::Num(NumLit::Small(e.exact_decimal(col.scale)? as i128)))
+}
+
 /// Why a bound literal is not a key for a column of a given type — classified
 /// rather than swallowed, so the INSERT path can name the column and the offence.
 pub(crate) enum KeyLitError {
@@ -169,10 +181,8 @@ pub(crate) enum KeyLitError {
     NegativeIntoUnsigned,
     /// A numeric literal outside the column type's range.
     OutOfRange,
-    /// A string literal against a UUID column that does not spell a UUID.
-    BadUuid,
-    /// A string literal against a DATE/TIMESTAMP column that does not spell one.
-    BadTemporal,
+    /// A string literal that does not spell a value of the column's type.
+    NotOfType,
     /// A literal of a kind no key is ever spelled by (a string outside UUID).
     NotNumeric,
 }
@@ -184,11 +194,11 @@ pub(crate) enum KeyLitError {
 /// can route differently.
 pub(crate) fn bound_key_literal(lit: BoundLit<'_>, tc: TypeCode) -> Result<u128, KeyLitError> {
     match lit {
-        BoundLit::Str(s) if tc == TypeCode::UUID => parse_uuid_str(s).map_err(|_| KeyLitError::BadUuid),
+        BoundLit::Str(s) if tc == TypeCode::UUID => parse_uuid_str(s).map_err(|_| KeyLitError::NotOfType),
         BoundLit::Str(s) if tc.is_temporal() => crate::types::temporal_literal(tc, s)
             .ok()
             .and_then(|v| pack_pk_value(tc, v as i128))
-            .ok_or(KeyLitError::BadTemporal),
+            .ok_or(KeyLitError::NotOfType),
         BoundLit::Str(_) => Err(KeyLitError::NotNumeric),
         BoundLit::Num(n) => pack_num(tc, n).ok_or_else(|| {
             // A PK column's type is PK-eligible: an integer scalar at some
@@ -215,23 +225,43 @@ impl Constant {
         })
     }
 
-    /// This constant as the packed key/cell of a column of type `tc`: the low
-    /// `tc.wire_stride()` bytes are the column's native LE image.
-    pub(crate) fn key_packed(&self, tc: TypeCode) -> Result<u128, KeyLitError> {
-        bound_key_literal(self.bound_lit().ok_or(KeyLitError::NotNumeric)?, tc)
+    /// This constant as the packed key/cell of a column of type `ty`: the low
+    /// `wire_stride` bytes are the column's native LE image. A DECIMAL column
+    /// stores the constant at its scale, a longer fraction rounded — the
+    /// written-cell rule, where a seek key must be exact.
+    pub(crate) fn key_packed(&self, ty: ColType) -> Result<u128, KeyLitError> {
+        if ty.is_decimal() {
+            let sign = if self.negated { -1 } else { 1 };
+            let (v, s) = match &self.lit {
+                // `LitWide` is a digit run the parser already validated, so only
+                // its length can defeat the read; a written string can be
+                // anything.
+                BExpr::LitWide(digits) => parse_decimal_text(digits).ok_or(KeyLitError::OutOfRange)?,
+                BExpr::LitStr(text) => parse_decimal_text(text).ok_or(KeyLitError::NotOfType)?,
+                BExpr::LitInt(_) | BExpr::LitFloat(_) => self
+                    .lit
+                    .decimal_literal()
+                    .map(|(v, s)| (v as i128, s))
+                    .ok_or(KeyLitError::OutOfRange)?,
+                _ => return Err(KeyLitError::NotNumeric),
+            };
+            let v = rescale(sign * v, s, ty.scale).ok_or(KeyLitError::OutOfRange)?;
+            return Ok(FixedInt::I64.pack(v as i128));
+        }
+        bound_key_literal(self.bound_lit().ok_or(KeyLitError::NotNumeric)?, ty.tc)
     }
 }
 
 /// One PK column constant packed, under the PK slot's own error wording.
-fn parse_one_pk_literal(c: &Constant, tc: TypeCode, col_name: &str) -> Result<u128, GnitzSqlError> {
-    c.key_packed(tc).map_err(|e| {
+fn parse_one_pk_literal(c: &Constant, ty: ColType, col_name: &str) -> Result<u128, GnitzSqlError> {
+    c.key_packed(ty).map_err(|e| {
         GnitzSqlError::Bind(match e {
             KeyLitError::NegativeIntoUnsigned => {
-                format!("PK column '{col_name}' of type {tc:?} does not accept negative literals")
+                format!("PK column '{col_name}' of type {ty} does not accept negative literals")
             }
-            KeyLitError::OutOfRange => format!("PK column '{col_name}' value is not a valid {tc:?}: {c}"),
-            KeyLitError::BadUuid => format!("PK column '{col_name}' value is not a valid UUID: {c}"),
-            KeyLitError::BadTemporal => format!("PK column '{col_name}' value is not a valid date or timestamp: {c}"),
+            KeyLitError::OutOfRange | KeyLitError::NotOfType => {
+                format!("PK column '{col_name}' value is not a valid {ty}: {c}")
+            }
             KeyLitError::NotNumeric => format!("PK column '{col_name}' value must be a numeric literal"),
         })
     })
@@ -247,7 +277,7 @@ pub(crate) enum PkPlan<'s> {
     /// and the column it names.
     Written {
         schema: &'s Schema,
-        cols: Vec<(usize, TypeCode, &'s str)>,
+        cols: Vec<(usize, ColType, &'s str)>,
     },
 }
 
@@ -264,7 +294,7 @@ impl<'s> PkPlan<'s> {
                     slot_of.get(pi as usize).copied().flatten().ok_or_else(|| {
                         GnitzSqlError::Bind(format!("PK column '{}' missing from INSERT row", c.name))
                     })?;
-                Ok((slot, c.type_code, c.name.as_str()))
+                Ok((slot, c.ty(), c.name.as_str()))
             })
             .collect::<Result<Vec<_>, GnitzSqlError>>()?;
         Ok(PkPlan::Written { schema, cols })
@@ -306,8 +336,8 @@ impl<'s> PkPlan<'s> {
                 // slot is in range because the arity guard pins `cells.len()` to the
                 // same map these slots came from.
                 let mut natives = [0u128; gnitz_wire::MAX_PK_COLUMNS];
-                for (native, &(slot, tc, name)) in natives.iter_mut().zip(cols) {
-                    *native = parse_one_pk_literal(&cells[slot], tc, name)?;
+                for (native, &(slot, ty, name)) in natives.iter_mut().zip(cols) {
+                    *native = parse_one_pk_literal(&cells[slot], ty, name)?;
                 }
                 dst.push_natives(schema, &natives[..cols.len()]);
             }

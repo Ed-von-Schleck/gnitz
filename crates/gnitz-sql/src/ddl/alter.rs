@@ -7,7 +7,7 @@
 use crate::ast_util::extract_object_name;
 use crate::bind::find_unique_column;
 use crate::error::{missing_relation as missing, reject_if, GnitzSqlError};
-use crate::types::{serial_underlying, sql_type_to_typecode};
+use crate::types::{serial_underlying, sql_col_type};
 use crate::validate::{
     reject_unhonored_alter_table_clauses, reject_unhonored_column_options, reject_unhonored_unique_fields,
     require_class, validate_user_name, ClassWant, ColumnOptionSite,
@@ -196,8 +196,8 @@ fn add_column(
     };
     let tid = rel.tid;
 
-    let type_code = sql_type_to_typecode(&column_def.data_type)?;
-    let def = gnitz_core::ColumnDef::new(col_name, type_code, /* is_nullable */ true);
+    let ty = sql_col_type(&column_def.data_type)?;
+    let def = gnitz_core::ColumnDef::typed(col_name, ty, /* is_nullable */ true);
     client.alter_add_column(tid, &def)?;
     Ok(altered("column", col_name.clone()))
 }

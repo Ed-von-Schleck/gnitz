@@ -151,6 +151,9 @@ pub(crate) const COL_TAB_COLS: &[WireSysCol] = &[
     // unprojected passthrough PKs), else 0. Echoed into reply schema blocks as
     // META_FLAG_HIDDEN; the engine never branches on it.
     col("is_hidden", TypeCode::U64, false),
+    // A DECIMAL column's scale, else 0. Echoed into reply schema blocks' scale
+    // bits; the engine never branches on it.
+    col("scale", TypeCode::U64, false),
 ];
 
 pub(crate) const IDX_TAB_COLS: &[WireSysCol] = &[
@@ -263,6 +266,7 @@ pub const COLTAB_PAY_FK_TABLE_ID: usize = pay_index_in(COL_TAB_COLS, "fk_table_i
 pub const COLTAB_PAY_FK_COL_IDX: usize = pay_index_in(COL_TAB_COLS, "fk_col_idx");
 pub const COLTAB_PAY_IS_NULLABLE: usize = pay_index_in(COL_TAB_COLS, "is_nullable");
 pub const COLTAB_PAY_IS_HIDDEN: usize = pay_index_in(COL_TAB_COLS, "is_hidden");
+pub const COLTAB_PAY_SCALE: usize = pay_index_in(COL_TAB_COLS, "scale");
 
 pub const CIRCNODES_PAY_OPCODE: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "opcode", CIRCUIT_FAMILY_PK);
 pub const CIRCNODES_PAY_SOURCE_TABLE: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "source_table", CIRCUIT_FAMILY_PK);

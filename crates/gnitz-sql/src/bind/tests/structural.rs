@@ -562,7 +562,7 @@ fn every_cast_kind_binds_to_one_node() {
     ] {
         match bind_num(src).unwrap() {
             BoundExpr::Cast { expr, to } => {
-                assert_eq!(to, TypeCode::I64, "{src}");
+                assert_eq!(to, TypeCode::I64.into(), "{src}");
                 assert!(matches!(*expr, BoundExpr::ColRef(1)), "{src}");
             }
             other => panic!("{src}: expected Cast, got {other:?}"),
@@ -584,14 +584,14 @@ fn cast_accepts_every_numeric_target_and_rejects_the_rest() {
         ("CAST(c AS REAL)", TypeCode::F64),
     ] {
         match bind_num(src).unwrap() {
-            BoundExpr::Cast { to, .. } => assert_eq!(to, want, "{src}"),
+            BoundExpr::Cast { to, .. } => assert_eq!(to, want.into(), "{src}"),
             other => panic!("{src}: expected Cast, got {other:?}"),
         }
     }
     // STRING is a cast target too — the VM has a string register class.
     for src in ["CAST(c AS TEXT)", "CAST(c AS VARCHAR(10))", "CAST(c AS CHAR(4))"] {
         match bind_num(src).unwrap() {
-            BoundExpr::Cast { to, .. } => assert_eq!(to, TypeCode::String, "{src}"),
+            BoundExpr::Cast { to, .. } => assert_eq!(to, TypeCode::String.into(), "{src}"),
             other => panic!("{src}: expected Cast, got {other:?}"),
         }
     }

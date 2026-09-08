@@ -1295,7 +1295,8 @@ mod pack_proptest {
             | type_code::I32
             | type_code::I64
             | type_code::DATE
-            | type_code::TIMESTAMP => T::I64,
+            | type_code::TIMESTAMP
+            | type_code::DECIMAL => T::I64,
             type_code::I128 => T::I128,
             _ => T::U128, // U128, UUID
         }

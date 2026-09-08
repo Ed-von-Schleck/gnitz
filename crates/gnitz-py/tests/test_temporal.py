@@ -116,7 +116,7 @@ class TestTemporalColumns:
             rows = sorted((r["d"], r["v"]) for r in client.scan(tid).mappings())
             want = [(x, i + (100 if x >= date(2024, 3, 9) else 0)) for i, x in enumerate(days) if x not in (date(2024, 3, 5), date(2024, 3, 6))]
             assert rows == want
-            with pytest.raises(Exception, match="not a valid date"):
+            with pytest.raises(Exception, match="not a valid DATE"):
                 client.execute_sql("INSERT INTO t VALUES ('2024-02-30', 1)", schema_name=sn)
         finally:
             _cleanup(client, sn, "t")

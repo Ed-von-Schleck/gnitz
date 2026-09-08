@@ -7,7 +7,7 @@ use crate::ast_util::{
 };
 use crate::error::GnitzSqlError;
 use crate::ir::{BExpr, BinOp, BoundExpr, FloatUnaryOp, NumFunc, StrFunc, TrimMode, UnaryOp};
-use crate::types::{is_cast_target, sql_type_to_typecode};
+use crate::types::{is_cast_target, sql_col_type};
 use gnitz_core::{ColumnDef, Schema};
 use gnitz_expr::CalendarOp;
 use sqlparser::ast::{
@@ -169,10 +169,10 @@ pub(crate) fn bind_structural<R: Clone, L: LeafBinder<R>>(expr: &Expr, leaf: &L)
             if format.is_some() {
                 return Err(GnitzSqlError::Unsupported("CAST … FORMAT is not supported".into()));
             }
-            let to = sql_type_to_typecode(data_type)?;
+            let to = sql_col_type(data_type)?;
             // The 16-byte wide integer types have no register at all.
-            if !is_cast_target(to) {
-                return Err(GnitzSqlError::Unsupported(format!("CAST to {to:?} is not supported")));
+            if !is_cast_target(to.tc) {
+                return Err(GnitzSqlError::Unsupported(format!("CAST to {to} is not supported")));
             }
             Ok(BExpr::Cast {
                 expr: Box::new(bind_structural(e, leaf)?),

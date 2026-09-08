@@ -1,43 +1,72 @@
 use crate::error::GnitzSqlError;
-use gnitz_core::TypeCode;
+use gnitz_core::{ColType, TypeCode};
+use gnitz_wire::decimal::MAX_DECIMAL_SCALE;
 use sqlparser::ast::{DataType, ExactNumberInfo, TimezoneInfo};
 
-pub(crate) fn sql_type_to_typecode(dt: &DataType) -> Result<TypeCode, GnitzSqlError> {
-    match dt {
-        DataType::BigInt(_) => Ok(TypeCode::I64),
-        DataType::Int(_) | DataType::Integer(_) => Ok(TypeCode::I32),
-        DataType::SmallInt(_) => Ok(TypeCode::I16),
-        DataType::TinyInt(_) => Ok(TypeCode::I8),
-        DataType::BigIntUnsigned(_) => Ok(TypeCode::U64),
-        DataType::IntUnsigned(_) | DataType::IntegerUnsigned(_) | DataType::UnsignedInteger => Ok(TypeCode::U32),
-        DataType::SmallIntUnsigned(_) => Ok(TypeCode::U16),
-        DataType::TinyIntUnsigned(_) => Ok(TypeCode::U8),
-        DataType::Float(_) => Ok(TypeCode::F32),
-        DataType::Double(_) | DataType::DoublePrecision | DataType::Real => Ok(TypeCode::F64),
-        DataType::Varchar(_) | DataType::Text | DataType::Char(_) => Ok(TypeCode::String),
-        DataType::Uuid => Ok(TypeCode::UUID),
-        DataType::Date => Ok(TypeCode::Date),
+pub(crate) fn sql_col_type(dt: &DataType) -> Result<ColType, GnitzSqlError> {
+    let tc = match dt {
+        DataType::BigInt(_) => TypeCode::I64,
+        DataType::Int(_) | DataType::Integer(_) => TypeCode::I32,
+        DataType::SmallInt(_) => TypeCode::I16,
+        DataType::TinyInt(_) => TypeCode::I8,
+        DataType::BigIntUnsigned(_) => TypeCode::U64,
+        DataType::IntUnsigned(_) | DataType::IntegerUnsigned(_) | DataType::UnsignedInteger => TypeCode::U32,
+        DataType::SmallIntUnsigned(_) => TypeCode::U16,
+        DataType::TinyIntUnsigned(_) => TypeCode::U8,
+        DataType::Float(_) => TypeCode::F32,
+        DataType::Double(_) | DataType::DoublePrecision | DataType::Real => TypeCode::F64,
+        DataType::Varchar(_) | DataType::Text | DataType::Char(_) => TypeCode::String,
+        DataType::Uuid => TypeCode::UUID,
+        DataType::Date => TypeCode::Date,
         // `TIMESTAMP_NTZ` says "no time zone", which is the one form supported.
         DataType::Timestamp(_, TimezoneInfo::None) | DataType::Datetime(_) | DataType::TimestampNtz(_) => {
-            Ok(TypeCode::Timestamp)
+            TypeCode::Timestamp
         }
-        DataType::Timestamp(..) => Err(GnitzSqlError::Unsupported(
-            "a TIMESTAMP carries no time zone here; write TIMESTAMP without one".to_string(),
-        )),
-        // DECIMAL(p,0) with p in {38,39} maps to U128.
-        // DECIMAL(38,0) is the common idiom for 128-bit integers (used by Spark, etc.).
-        // DECIMAL(39,0) covers the full u128 range (u128::MAX has 39 decimal digits).
-        DataType::Decimal(ExactNumberInfo::PrecisionAndScale(p, 0))
-        | DataType::Numeric(ExactNumberInfo::PrecisionAndScale(p, 0))
-            if *p == 38 || *p == 39 =>
-        {
-            Ok(TypeCode::U128)
+        DataType::Timestamp(..) => {
+            return Err(GnitzSqlError::Unsupported(
+                "a TIMESTAMP carries no time zone here; write TIMESTAMP without one".to_string(),
+            ))
         }
-        DataType::Boolean => Err(GnitzSqlError::Unsupported(
-            "BOOLEAN has no gnitz type; use TINYINT(1)".to_string(),
-        )),
-        _ => Err(GnitzSqlError::Unsupported(format!("unsupported SQL type: {dt}"))),
+        DataType::Decimal(info) | DataType::Numeric(info) | DataType::Dec(info) => return decimal_type(info),
+        DataType::Boolean => {
+            return Err(GnitzSqlError::Unsupported(
+                "BOOLEAN has no gnitz type; use TINYINT(1)".to_string(),
+            ))
+        }
+        _ => return Err(GnitzSqlError::Unsupported(format!("unsupported SQL type: {dt}"))),
+    };
+    Ok(ColType::of(tc))
+}
+
+/// `DECIMAL(p, s)` / `NUMERIC(p, s)`. Up to 18 digits of precision the column
+/// is a fixed-point `DECIMAL` of scale `s` (`DECIMAL(p)` is scale 0); the
+/// precision picks nothing finer than that — a value is bounded by the `i64`
+/// behind the scale, not by `p` digits. `DECIMAL(38,0)` and `(39,0)` keep
+/// their meaning as the SQL spelling of a 128-bit unsigned integer.
+fn decimal_type(info: &ExactNumberInfo) -> Result<ColType, GnitzSqlError> {
+    let (p, s) = match *info {
+        ExactNumberInfo::PrecisionAndScale(p, s) => (p, s),
+        ExactNumberInfo::Precision(p) => (p, 0),
+        ExactNumberInfo::None => {
+            return Err(GnitzSqlError::Unsupported(
+                "DECIMAL needs a precision and scale, e.g. DECIMAL(18, 2)".to_string(),
+            ))
+        }
+    };
+    if (p == 38 || p == 39) && s == 0 {
+        return Ok(ColType::of(TypeCode::U128));
     }
+    if p == 0 || p > MAX_DECIMAL_SCALE as u64 {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "DECIMAL({p}, {s}): the precision must be 1..={MAX_DECIMAL_SCALE} (DECIMAL(38, 0) is the 128-bit integer)"
+        )));
+    }
+    if s < 0 || s as u64 > p {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "DECIMAL({p}, {s}): the scale must be 0..={p}"
+        )));
+    }
+    Ok(ColType::decimal(s as u8))
 }
 
 /// Postgres SERIAL family → the underlying signed integer type, case-insensitive.
@@ -45,7 +74,7 @@ pub(crate) fn sql_type_to_typecode(dt: &DataType) -> Result<TypeCode, GnitzSqlEr
 /// keywords, so 0.56 tokenizes them as words and parses them as
 /// `DataType::Custom(ObjectName, Vec<String>)`; `SERIAL4`/`SERIAL8`/`SERIAL2` are
 /// accepted aliases via the same fallthrough. Kept separate from
-/// `sql_type_to_typecode` (which stays pure real-types) — a SERIAL column carries
+/// `sql_col_type` (which stays pure real-types) — a SERIAL column carries
 /// the underlying type plus the `is_serial` marker.
 pub(crate) fn serial_underlying(dt: &DataType) -> Option<TypeCode> {
     let DataType::Custom(name, _mods) = dt else {
@@ -92,7 +121,7 @@ pub(crate) fn has_scalar_register(tc: TypeCode) -> bool {
 
 /// Whether `CAST(… AS tc)` has a form the VM can compute. STRING joins the
 /// scalar-register types because the VM has a string register class of its own;
-/// BLOB does not, and is not expressible anyway — `sql_type_to_typecode`
+/// BLOB does not, and is not expressible anyway — `sql_col_type`
 /// produces `TypeCode::Blob` for no SQL type. This is the codebase's only
 /// cast-target gate.
 pub(crate) fn is_cast_target(tc: TypeCode) -> bool {

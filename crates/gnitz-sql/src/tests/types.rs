@@ -2,11 +2,11 @@ use super::*;
 use sqlparser::ast::{DataType, ExactNumberInfo, TimezoneInfo};
 
 fn ok(dt: DataType) -> TypeCode {
-    sql_type_to_typecode(&dt).expect("expected Ok")
+    sql_col_type(&dt).expect("expected Ok").tc
 }
 
 fn err(dt: DataType) -> String {
-    sql_type_to_typecode(&dt).expect_err("expected Err").to_string()
+    sql_col_type(&dt).expect_err("expected Err").to_string()
 }
 
 // --- signed integers ---
@@ -118,13 +118,39 @@ fn numeric_39_0_maps_to_u128() {
 // DECIMAL with non-zero scale must NOT map to U128
 #[test]
 fn decimal_38_2_does_not_map_to_u128() {
-    assert!(sql_type_to_typecode(&DataType::Decimal(ExactNumberInfo::PrecisionAndScale(38, 2))).is_err());
+    assert!(sql_col_type(&DataType::Decimal(ExactNumberInfo::PrecisionAndScale(38, 2))).is_err());
 }
 
 // DECIMAL with no precision must NOT map to U128
 #[test]
 fn decimal_bare_is_unsupported() {
-    assert!(sql_type_to_typecode(&DataType::Decimal(ExactNumberInfo::None)).is_err());
+    assert!(sql_col_type(&DataType::Decimal(ExactNumberInfo::None)).is_err());
+}
+
+/// Up to 18 digits a DECIMAL is the fixed-point type at the written scale,
+/// under every spelling; past that only the 128-bit integer idiom survives.
+#[test]
+fn decimal_up_to_18_digits_is_fixed_point() {
+    let ty = |dt: DataType| sql_col_type(&dt).expect("expected Ok");
+    assert_eq!(
+        ty(DataType::Decimal(ExactNumberInfo::PrecisionAndScale(10, 2))),
+        ColType::decimal(2)
+    );
+    assert_eq!(
+        ty(DataType::Numeric(ExactNumberInfo::PrecisionAndScale(18, 18))),
+        ColType::decimal(18)
+    );
+    assert_eq!(
+        ty(DataType::Decimal(ExactNumberInfo::Precision(5))),
+        ColType::decimal(0)
+    );
+    assert_eq!(
+        ty(DataType::Decimal(ExactNumberInfo::PrecisionAndScale(18, 0))),
+        ColType::decimal(0)
+    );
+    assert!(err(DataType::Decimal(ExactNumberInfo::PrecisionAndScale(19, 2))).contains("precision"));
+    assert!(err(DataType::Decimal(ExactNumberInfo::PrecisionAndScale(5, 6))).contains("scale"));
+    assert!(err(DataType::Decimal(ExactNumberInfo::PrecisionAndScale(0, 0))).contains("precision"));
 }
 
 // --- UUID ---

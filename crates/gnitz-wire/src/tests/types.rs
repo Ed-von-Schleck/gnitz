@@ -27,6 +27,7 @@ fn type_predicates_partition_the_type_table() {
         (TypeCode::I128, false, true, true, false, false, true, true),
         (TypeCode::Date, true, true, true, false, false, false, true),
         (TypeCode::Timestamp, true, true, true, false, false, false, true),
+        (TypeCode::Decimal, true, true, true, false, false, false, true),
     ];
     assert_eq!(table.len(), TypeCode::ALL.len(), "a TypeCode variant is unclassified");
 
@@ -85,9 +86,11 @@ fn index_key_type_pins_the_whole_promotion_map() {
         (tc::I64, tc::I64),
         (tc::U128, tc::U128),
         (tc::UUID, tc::UUID),
-        // A temporal column indexes on its storage integer's promoted key.
+        // A temporal or decimal column indexes on its storage integer's
+        // promoted key.
         (tc::DATE, tc::I64),
         (tc::TIMESTAMP, tc::I64),
+        (tc::DECIMAL, tc::I64),
     ];
     for raw in 0u8..=u8::MAX {
         match map.iter().find(|&&(src, _)| src == raw) {
@@ -147,6 +150,7 @@ fn reindex_output_type_policy() {
         (TypeCode::I128, TypeCode::I128),
         (TypeCode::Date, TypeCode::Date),
         (TypeCode::Timestamp, TypeCode::Timestamp),
+        (TypeCode::Decimal, TypeCode::Decimal),
     ];
     assert_eq!(
         policy.len(),

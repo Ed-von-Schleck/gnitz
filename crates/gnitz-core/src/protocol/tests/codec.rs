@@ -61,7 +61,7 @@ fn a_pk_wider_than_the_client_codec_is_rejected() {
     let cols: Vec<SchemaBlockCol> = (0..n)
         .map(|i| SchemaBlockCol {
             type_code: TypeCode::U64 as u8,
-            flags: pack_col_meta_flags(false, false, false, Some(i as u8)),
+            flags: pack_col_meta_flags(false, false, false, 0, Some(i as u8)),
             name: b"k",
         })
         .collect();

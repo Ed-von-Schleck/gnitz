@@ -410,6 +410,11 @@ pub const META_FLAG_SERIAL: u64 = 8;
 /// with `a` at column 1 and `b` at column 2 must decode to `[2, 1]`).
 const META_FLAG_PK_POS_SHIFT: u32 = 8;
 const META_FLAG_PK_POS_MASK: u64 = 0xFF << META_FLAG_PK_POS_SHIFT;
+/// A DECIMAL column's scale, bits 16..24; zero for every other type. Like the
+/// SERIAL and hidden markers a fact only the block's decoders read — the
+/// storage layer sees the `I64` the column physically is.
+const META_FLAG_SCALE_SHIFT: u32 = 16;
+const META_FLAG_SCALE_MASK: u64 = 0xFF << META_FLAG_SCALE_SHIFT;
 
 /// Pack a schema block's per-column metadata flags word from its logical
 /// fields. `pk_pos` is the column's 0-indexed position in the PK tuple, or
@@ -420,12 +425,13 @@ const META_FLAG_PK_POS_MASK: u64 = 0xFF << META_FLAG_PK_POS_SHIFT;
 /// layout lives here with its accessors rather than being re-spelled per codec —
 /// the same rule [`crate::TableProps::pack`] follows for `TABLE_TAB.flags`.
 #[inline]
-pub fn pack_col_meta_flags(nullable: bool, hidden: bool, serial: bool, pk_pos: Option<u8>) -> u64 {
+pub fn pack_col_meta_flags(nullable: bool, hidden: bool, serial: bool, scale: u8, pk_pos: Option<u8>) -> u64 {
     let pk = match pk_pos {
         Some(p) => META_FLAG_IS_PK | ((p as u64) << META_FLAG_PK_POS_SHIFT),
         None => 0,
     };
-    pk | if nullable { META_FLAG_NULLABLE } else { 0 }
+    pk | ((scale as u64) << META_FLAG_SCALE_SHIFT)
+        | if nullable { META_FLAG_NULLABLE } else { 0 }
         | if hidden { META_FLAG_HIDDEN } else { 0 }
         | if serial { META_FLAG_SERIAL } else { 0 }
 }
@@ -446,6 +452,12 @@ pub fn col_meta_hidden(flags: u64) -> bool {
 #[inline]
 pub fn col_meta_serial(flags: u64) -> bool {
     flags & META_FLAG_SERIAL != 0
+}
+
+/// Decode a DECIMAL column's scale; zero for every other type.
+#[inline]
+pub fn col_meta_scale(flags: u64) -> u8 {
+    ((flags & META_FLAG_SCALE_MASK) >> META_FLAG_SCALE_SHIFT) as u8
 }
 
 /// The column's 0-indexed position within the PK tuple, or `None` when it is

@@ -9,11 +9,16 @@ fn col_meta_flags_roundtrip() {
         for &hidden in &[false, true] {
             for &serial in &[false, true] {
                 for pk_pos in [None, Some(0u8), Some(1), Some(3), Some(u8::MAX)] {
-                    let f = pack_col_meta_flags(nullable, hidden, serial, pk_pos);
-                    assert_eq!(col_meta_nullable(f), nullable);
-                    assert_eq!(col_meta_hidden(f), hidden);
-                    assert_eq!(col_meta_serial(f), serial);
-                    assert_eq!(col_meta_pk_pos(f), pk_pos);
+                    // Scale 0 is every non-DECIMAL column, and `u8::MAX` fills
+                    // the field — so neither edge may bleed into a neighbour.
+                    for scale in [0u8, 7, u8::MAX] {
+                        let f = pack_col_meta_flags(nullable, hidden, serial, scale, pk_pos);
+                        assert_eq!(col_meta_nullable(f), nullable);
+                        assert_eq!(col_meta_hidden(f), hidden);
+                        assert_eq!(col_meta_serial(f), serial);
+                        assert_eq!(col_meta_scale(f), scale);
+                        assert_eq!(col_meta_pk_pos(f), pk_pos);
+                    }
                 }
             }
         }

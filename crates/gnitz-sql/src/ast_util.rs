@@ -133,7 +133,7 @@ pub(crate) fn temporal_constant(e: &Expr) -> Result<Option<(TypeCode, i64)>, Gni
         },
         _ => return Ok(None),
     };
-    let tc = crate::types::sql_type_to_typecode(dt)?;
+    let tc = crate::types::sql_col_type(dt)?.tc;
     match v {
         _ if !tc.is_temporal() => Ok(None),
         Value::SingleQuotedString(s) => Ok(Some((tc, crate::types::temporal_literal(tc, s)?))),

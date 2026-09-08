@@ -14,7 +14,7 @@
 //! Residuals are **borrows** of the caller's bound WHERE — at most one candidate
 //! is ever used, so only the winner's residual is cloned or compiled.
 
-use crate::codec::pk_codec::{bound_key_literal, bound_literal, pack_num, BoundLit, NumLit};
+use crate::codec::pk_codec::{bound_key_literal, col_key_literal, pack_num, BoundLit, NumLit};
 use crate::ir::{BExpr, BinOp, BoundExpr};
 use gnitz_core::{opk_key_cols, Cut, FixedInt, IndexMeta, PkBuf, PkColList, RangeDescriptor, Schema, TypeCode};
 use std::cmp::Reverse;
@@ -22,18 +22,20 @@ use std::collections::HashSet;
 
 /// Classify a bound binary op as `col OP literal`, the `ColRef` on either side.
 /// The returned operator always reads `col OP lit` — a literal on the left is
-/// mirrored through [`BinOp::converse`] here — so no caller handles sides.
-fn bound_col_vs_literal(expr: &BoundExpr) -> Option<(usize, BoundLit<'_>, BinOp)> {
+/// mirrored through [`BinOp::converse`] here — so no caller handles sides. The
+/// literal is read as a key of that column (`col_key_literal`), so a DECIMAL
+/// column's literal arrives already at the column's scale.
+fn bound_col_vs_literal<'e>(expr: &'e BoundExpr, schema: &Schema) -> Option<(usize, BoundLit<'e>, BinOp)> {
     let BExpr::BinOp(left, op, right) = expr else {
         return None;
     };
     if let BExpr::ColRef(idx) = left.as_ref() {
-        if let Some(l) = bound_literal(right) {
+        if let Some(l) = col_key_literal(right, &schema.columns[*idx]) {
             return Some((*idx, l, *op));
         }
     }
     if let BExpr::ColRef(idx) = right.as_ref() {
-        if let Some(l) = bound_literal(left) {
+        if let Some(l) = col_key_literal(left, &schema.columns[*idx]) {
             return Some((*idx, l, op.converse()));
         }
     }
@@ -47,7 +49,7 @@ fn bound_col_vs_literal(expr: &BoundExpr) -> Option<(usize, BoundLit<'_>, BinOp)
 /// Extract `(col_idx, packed_key)` from a bound `col = literal`. Does NOT check
 /// index existence.
 fn try_col_eq_literal(expr: &BoundExpr, schema: &Schema) -> Option<(usize, u128)> {
-    let (col_idx, lit, op) = bound_col_vs_literal(expr)?;
+    let (col_idx, lit, op) = bound_col_vs_literal(expr, schema)?;
     if !matches!(op, BinOp::Eq) {
         return None;
     }
@@ -75,14 +77,14 @@ fn pk_in_keys(conjunct: &BoundExpr, schema: &Schema) -> Option<Vec<u128>> {
     if *col_idx != pk_idx {
         return None;
     }
-    let pk_tc = schema.columns[pk_idx].type_code;
+    let pk_col = &schema.columns[pk_idx];
     let mut seen = HashSet::with_capacity(items.len());
     let mut pks = Vec::with_capacity(items.len());
     for item in items {
         // `bound_key_literal` is the same rule `try_col_eq_literal` applies, so
         // `IN (…)` and `= …` route identically. A NULL/float/non-literal or an
         // unparseable UUID aborts to the slow scan.
-        let v = bound_key_literal(bound_literal(item)?, pk_tc).ok()?;
+        let v = bound_key_literal(col_key_literal(item, pk_col)?, pk_col.type_code).ok()?;
         if seen.insert(v) {
             pks.push(v);
         }
@@ -257,7 +259,7 @@ fn parse_range_cut(tc: TypeCode, lit: NumLit<'_>, mk: fn(u128) -> Cut) -> Option
 /// `None` for anything else. A `BETWEEN` never reaches here — binding desugars it
 /// into `>= AND <=`, two ordinary range-end conjuncts.
 fn try_col_range_literal(expr: &BoundExpr, schema: &Schema) -> Option<(usize, RangeEnd)> {
-    let (col_idx, lit, op) = bound_col_vs_literal(expr)?;
+    let (col_idx, lit, op) = bound_col_vs_literal(expr, schema)?;
     let (side, mk): (RangeSide, fn(u128) -> Cut) = match op {
         BinOp::Gt => (RangeSide::Start, Cut::After),
         BinOp::Ge => (RangeSide::Start, Cut::Before),

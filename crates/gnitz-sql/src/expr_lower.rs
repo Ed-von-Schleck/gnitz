@@ -7,11 +7,27 @@
 
 use crate::bind::structural::str_func_name;
 use crate::error::GnitzSqlError;
-use crate::ir::{BinOp, BoundExpr, NumFunc, StrArg, StrFunc, TrimMode, UnaryOp};
-use gnitz_core::{ColumnDef, FixedInt, Schema, TypeCode};
-use gnitz_expr::{
-    CalendarOp, Evaluator, ExprBuilder, FloatArithOp, FloatUnaryOp, IntUnaryOp, LogicalInstr as L, LogicalProgram, Reg,
+use crate::ir::{
+    decimal_compute_type, operand_ty_pair, operand_tys, unify_blend_type, BinOp, BoundExpr, NumFunc, StrArg, StrFunc,
+    TrimMode, UnaryOp,
 };
+use gnitz_core::{ColType, ColumnDef, FixedInt, Schema, TypeCode};
+use gnitz_expr::{
+    CalendarOp, CmpOp, Evaluator, ExprBuilder, FloatArithOp, FloatUnaryOp, IntArithOp, IntUnaryOp, LogicalInstr as L,
+    LogicalProgram, Reg,
+};
+use gnitz_wire::decimal::{format_decimal, parse_decimal, pow10, rescale, MAX_DECIMAL_SCALE};
+
+/// A scale a DECIMAL register can hold: past `MAX_DECIMAL_SCALE`, `10^scale`
+/// overflows `i64`.
+fn check_decimal_scale(scale: u8) -> Result<(), GnitzSqlError> {
+    if scale > MAX_DECIMAL_SCALE {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "DECIMAL scale {scale} exceeds {MAX_DECIMAL_SCALE}; CAST an operand to a narrower scale"
+        )));
+    }
+    Ok(())
+}
 
 /// Compile a comparison between two German-string columns, or a column and a
 /// string literal, to the `StrCol*` opcodes, which read the 16-byte cells
@@ -48,23 +64,31 @@ fn try_compile_string_cmp(
     Some(eb.emit(L::StrColConst { op: cmp, col: col as u32, const_idx }))
 }
 
-/// Which register class a lowered node produced. `Int` and `Float` are the two
-/// scalar shapes — `Float` means the 8-byte register holds an f64 bit pattern —
-/// and `Str` is the string register class.
+/// Which register class a lowered node produced. `Int`, `Dec` and `Float` are
+/// the scalar shapes — `Dec(s)` an integer holding a DECIMAL times `10^s`,
+/// `Float` an f64 bit pattern — and `Str` is the string register class.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ExprKind {
     Int,
+    Dec(u8),
     Float,
     Str,
 }
 
 impl ExprKind {
-    fn num(is_float: bool) -> Self {
-        if is_float {
-            ExprKind::Float
-        } else {
-            ExprKind::Int
+    /// The class a value of type `ty` lowers to, as `infer_ty` and the
+    /// lowering agree on it.
+    fn of(ty: ColType) -> Self {
+        match ty.tc {
+            TypeCode::String => ExprKind::Str,
+            TypeCode::Decimal => ExprKind::Dec(ty.scale),
+            t if t.is_float() => ExprKind::Float,
+            _ => ExprKind::Int,
         }
+    }
+
+    fn is_float(self) -> bool {
+        self == ExprKind::Float
     }
 }
 
@@ -78,7 +102,7 @@ impl ExprKind {
 /// string comparison before recursing, so that shape keeps the fused opcodes
 /// instead of building string registers.
 ///
-/// Numeric operands are read through [`Self::lower_num`] / [`Self::lower_as`]
+/// Numeric operands are read through [`Self::lower_num`] / [`Self::lower_to`]
 /// and string operands through [`Self::str_operand`], so each turns a
 /// wrong-class operand into a SQL error instead of an engine-side
 /// `RegClassMismatch`.
@@ -144,7 +168,7 @@ impl OpcodeBackend<'_> {
             }
             TypeCode::String => (self.eb.emit(L::LoadColStr { col }), ExprKind::Str),
             _ if tc.is_float() => (self.eb.emit(L::LoadColFloat { col }), ExprKind::Float),
-            _ => (self.eb.emit(L::LoadColInt { col }), ExprKind::Int),
+            _ => (self.eb.emit(L::LoadColInt { col }), ExprKind::of(self.cols[idx].ty())),
         })
     }
 
@@ -163,16 +187,118 @@ impl OpcodeBackend<'_> {
         Ok((reg, ExprKind::Int))
     }
 
-    /// Lower `expr` into a scalar register, reporting whether it holds an f64.
-    fn lower_num(&mut self, expr: &BoundExpr) -> Result<(Reg, bool), GnitzSqlError> {
+    /// Lower `expr` into a scalar register, with its scalar class.
+    fn lower_num(&mut self, expr: &BoundExpr) -> Result<(Reg, ExprKind), GnitzSqlError> {
         match self.lower(expr)? {
-            (r, ExprKind::Int) => Ok((r, false)),
-            (r, ExprKind::Float) => Ok((r, true)),
             (_, ExprKind::Str) => Err(GnitzSqlError::Unsupported(format!(
                 "{} is a string; strings support comparison, LIKE/ILIKE, CONCAT/||, \
                  CASE/COALESCE/NULLIF, the string functions and CAST — not this",
                 self.describe(expr)
             ))),
+            scalar => Ok(scalar),
+        }
+    }
+
+    /// A scalar register's value as an f64 register: a DECIMAL is divided back
+    /// by its scale, which is exact for every power of ten an `i64` scale names.
+    fn as_float(&mut self, r: Reg, kind: ExprKind) -> Reg {
+        match kind {
+            ExprKind::Float => r,
+            ExprKind::Int | ExprKind::Dec(0) => self.eb.emit(L::IntToFloat { a: r }),
+            ExprKind::Dec(s) => {
+                let f = self.eb.emit(L::IntToFloat { a: r });
+                let scale = self.eb.const_f64(pow10(s) as f64);
+                self.eb.emit(L::FloatArith { op: FloatArithOp::Div, a: f, b: scale })
+            }
+            ExprKind::Str => unreachable!("a string register never reaches a numeric coercion"),
+        }
+    }
+
+    /// A scalar register's value as a DECIMAL of scale `to`: widened exactly,
+    /// narrowed by rounding half away from zero, and a float rounded at that
+    /// scale.
+    fn as_decimal(&mut self, r: Reg, kind: ExprKind, to: u8) -> Reg {
+        match kind {
+            ExprKind::Int => self.scale_up(r, to),
+            ExprKind::Dec(s) if s <= to => self.scale_up(r, to - s),
+            ExprKind::Dec(s) => self.round_div(r, s - to),
+            ExprKind::Float => {
+                let scale = self.eb.const_f64(pow10(to) as f64);
+                let v = self.eb.emit(L::FloatArith { op: FloatArithOp::Mul, a: r, b: scale });
+                let v = self.eb.emit(L::FloatUnary { op: FloatUnaryOp::Round, a: v });
+                self.eb.emit(L::FloatToInt { a: v, fi: FixedInt::I64 })
+            }
+            ExprKind::Str => unreachable!("a string register never reaches a numeric coercion"),
+        }
+    }
+
+    /// `r · 10^by`.
+    fn scale_up(&mut self, r: Reg, by: u8) -> Reg {
+        if by == 0 {
+            return r;
+        }
+        let m = self.eb.emit(L::LoadConst { val: pow10(by) });
+        self.eb.emit(L::IntArith { op: IntArithOp::Mul, a: r, b: m })
+    }
+
+    /// `r / 10^by` rounded half away from zero: `(r + sign(r)·⌊q/2⌋) / q`, the
+    /// VM's division truncating toward zero.
+    fn round_div(&mut self, r: Reg, by: u8) -> Reg {
+        if by == 0 {
+            return r;
+        }
+        let q = pow10(by);
+        let sign = self.eb.emit(L::IntUnary { op: IntUnaryOp::Sign, a: r });
+        let half = self.eb.emit(L::LoadConst { val: q / 2 });
+        let bias = self.eb.emit(L::IntArith { op: IntArithOp::Mul, a: sign, b: half });
+        let v = self.eb.emit(L::IntArith { op: IntArithOp::Add, a: r, b: bias });
+        let q = self.eb.emit(L::LoadConst { val: q });
+        self.eb.emit(L::IntArith { op: IntArithOp::Div, a: v, b: q })
+    }
+
+    /// `⌊r / 10^by⌋` (`is_ceil` false) or `⌈r / 10^by⌉`: the truncating
+    /// quotient, moved one off it where a remainder's sign says truncation went
+    /// the other way.
+    fn floor_ceil_div(&mut self, r: Reg, by: u8, is_ceil: bool) -> Reg {
+        let q = self.eb.emit(L::LoadConst { val: pow10(by) });
+        let t = self.eb.emit(L::IntArith { op: IntArithOp::Div, a: r, b: q });
+        let m = self.eb.emit(L::IntArith { op: IntArithOp::Mod, a: r, b: q });
+        let zero = self.eb.emit(L::LoadConst { val: 0 });
+        let (cmp, fix) = if is_ceil {
+            (CmpOp::Gt, IntArithOp::Add)
+        } else {
+            (CmpOp::Lt, IntArithOp::Sub)
+        };
+        let off = self.eb.emit(L::Cmp { op: cmp, a: m, b: zero });
+        self.eb.emit(L::IntArith { op: fix, a: t, b: off })
+    }
+
+    /// Lower `e` as a DECIMAL of scale `to`. A numeric literal is folded to the
+    /// constant it is at that scale — or refused where it has none, rather than
+    /// wrapped at run time; anything else is computed and re-expressed.
+    fn lower_dec(&mut self, e: &BoundExpr, to: u8) -> Result<Reg, GnitzSqlError> {
+        check_decimal_scale(to)?;
+        if let Some((v, s)) = e.decimal_literal() {
+            let val = rescale(v as i128, s, to).ok_or_else(|| {
+                GnitzSqlError::Bind(format!("{} does not fit a DECIMAL of scale {to}", format_decimal(v, s)))
+            })?;
+            return Ok(self.eb.emit(L::LoadConst { val }));
+        }
+        let (r, kind) = self.lower_num(e)?;
+        Ok(self.as_decimal(r, kind, to))
+    }
+
+    /// Lower `e` into the register class of `target` — the blend a CASE, a
+    /// GREATEST or an IN list settled on — so every branch lands in one class.
+    fn lower_to(&mut self, e: &BoundExpr, target: ColType) -> Result<Reg, GnitzSqlError> {
+        match ExprKind::of(target) {
+            ExprKind::Str => self.str_operand(e, false),
+            ExprKind::Dec(s) => self.lower_dec(e, s),
+            ExprKind::Float => {
+                let (r, kind) = self.lower_num(e)?;
+                Ok(self.as_float(r, kind))
+            }
+            ExprKind::Int => Ok(self.lower_num(e)?.0),
         }
     }
 
@@ -186,16 +312,6 @@ impl OpcodeBackend<'_> {
         }
     }
 
-    /// Lower `expr` and, if `want_float`, lift an integer register to f64.
-    fn lower_as(&mut self, expr: &BoundExpr, want_float: bool) -> Result<Reg, GnitzSqlError> {
-        let (r, is_float) = self.lower_num(expr)?;
-        Ok(if want_float && !is_float {
-            self.eb.emit(L::IntToFloat { a: r })
-        } else {
-            r
-        })
-    }
-
     /// The string channel's operand read. Lowering is eager, so a string
     /// context must intercept `LitNull` *before* recursing into it and emit the
     /// string-class NULL rather than the scalar one. `coerce_numeric` is
@@ -207,7 +323,10 @@ impl OpcodeBackend<'_> {
         match self.lower(expr)? {
             (r, ExprKind::Str) => Ok(r),
             (r, ExprKind::Int) if coerce_numeric => Ok(self.eb.emit(L::IntToStr { a: r })),
-            (r, ExprKind::Float) if coerce_numeric => Ok(self.eb.emit(L::FloatToStr { a: r })),
+            (r, kind @ (ExprKind::Float | ExprKind::Dec(_))) if coerce_numeric => {
+                let f = self.as_float(r, kind);
+                Ok(self.eb.emit(L::FloatToStr { a: f }))
+            }
             _ => Err(GnitzSqlError::Unsupported("expected a string value here".to_string())),
         }
     }
@@ -217,8 +336,8 @@ impl OpcodeBackend<'_> {
     /// register as an integer. `what` names the position the error reports.
     fn int_operand(&mut self, e: &BoundExpr, what: impl FnOnce() -> String) -> Result<Reg, GnitzSqlError> {
         match self.lower_num(e)? {
-            (r, false) => Ok(r),
-            (_, true) => Err(GnitzSqlError::Unsupported(format!(
+            (r, ExprKind::Int) => Ok(r),
+            _ => Err(GnitzSqlError::Unsupported(format!(
                 "{} must be an integer expression",
                 what()
             ))),
@@ -228,32 +347,51 @@ impl OpcodeBackend<'_> {
     /// The numeric functions, unary NEG included. Over an integer register the
     /// rounding family and `ROUND(x, n >= 0)` are the identity, ABS of an
     /// unsigned register likewise, and only NEG, signed ABS and SIGN compute;
+    /// over a DECIMAL the rounding family is integer arithmetic on the scale;
     /// everything else lifts to f64. `NumFunc::result_type` states that split
     /// and this reads it, so the declared column and the register cannot
     /// disagree.
     fn func(&mut self, f: NumFunc, arg: &BoundExpr) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        let (r, is_float) = self.lower_num(arg)?;
-        let arg_ty = arg.infer_type(self.cols);
-        if f.result_type(arg_ty) != TypeCode::F64 {
-            let int_op = match f {
-                NumFunc::Unary(FloatUnaryOp::Neg) => Some(IntUnaryOp::Neg),
-                NumFunc::Unary(FloatUnaryOp::Abs) if arg_ty.is_signed_int() => Some(IntUnaryOp::Abs),
-                NumFunc::Unary(FloatUnaryOp::Sign) => Some(IntUnaryOp::Sign),
-                _ => None,
+        use FloatUnaryOp as F;
+        let (r, kind) = self.lower_num(arg)?;
+        let arg_ty = arg.infer_ty(self.cols);
+        let out = f.result_type(arg_ty);
+        if out.tc == TypeCode::F64 {
+            let a = self.as_float(r, kind);
+            let reg = match f {
+                NumFunc::Unary(op) => self.eb.emit(L::FloatUnary { op, a }),
+                NumFunc::Round(n) => self.scaled_round(a, n),
             };
-            let reg = int_op.map_or(r, |op| self.eb.emit(L::IntUnary { op, a: r }));
-            return Ok((reg, ExprKind::Int));
+            return Ok((reg, ExprKind::Float));
         }
-        let a = if is_float {
-            r
-        } else {
-            self.eb.emit(L::IntToFloat { a: r })
+        if let ExprKind::Dec(s) = kind {
+            let by = s - out.scale;
+            let reg = match f {
+                NumFunc::Unary(F::Neg) => self.eb.emit(L::IntUnary { op: IntUnaryOp::Neg, a: r }),
+                NumFunc::Unary(F::Abs) => self.eb.emit(L::IntUnary { op: IntUnaryOp::Abs, a: r }),
+                NumFunc::Unary(F::Sign) => {
+                    return Ok((self.eb.emit(L::IntUnary { op: IntUnaryOp::Sign, a: r }), ExprKind::Int))
+                }
+                _ if by == 0 => r,
+                NumFunc::Unary(F::Round) | NumFunc::Round(_) => self.round_div(r, by),
+                NumFunc::Unary(F::Floor) => self.floor_ceil_div(r, by, false),
+                NumFunc::Unary(F::Ceil) => self.floor_ceil_div(r, by, true),
+                NumFunc::Unary(F::Trunc) => {
+                    let q = self.eb.emit(L::LoadConst { val: pow10(by) });
+                    self.eb.emit(L::IntArith { op: IntArithOp::Div, a: r, b: q })
+                }
+                NumFunc::Unary(F::Sqrt | F::Ln | F::Log10 | F::Exp) => unreachable!("typed as F64 above"),
+            };
+            return Ok((reg, ExprKind::Dec(out.scale)));
+        }
+        let int_op = match f {
+            NumFunc::Unary(F::Neg) => Some(IntUnaryOp::Neg),
+            NumFunc::Unary(F::Abs) if arg_ty.tc.is_signed_int() => Some(IntUnaryOp::Abs),
+            NumFunc::Unary(F::Sign) => Some(IntUnaryOp::Sign),
+            _ => None,
         };
-        let reg = match f {
-            NumFunc::Unary(op) => self.eb.emit(L::FloatUnary { op, a }),
-            NumFunc::Round(n) => self.scaled_round(a, n),
-        };
-        Ok((reg, ExprKind::Float))
+        let reg = int_op.map_or(r, |op| self.eb.emit(L::IntUnary { op, a: r }));
+        Ok((reg, ExprKind::Int))
     }
 
     /// `ROUND(x, n)` over an f64 register: scale by `10^|n|`, round, scale
@@ -388,36 +526,48 @@ impl OpcodeBackend<'_> {
 
     /// GREATEST/LEAST as a left fold of 2-ary extremum opcodes.
     fn min_max_n(&mut self, is_max: bool, args: &[BoundExpr]) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        let types: Vec<TypeCode> = args.iter().map(|a| a.infer_type(self.cols)).collect();
-        let any_float = types
+        let types = operand_tys(&args.iter().collect::<Vec<_>>(), &|i: &usize| self.cols[*i].ty());
+        let ty = types
             .iter()
-            .fold(TypeCode::I64, |acc, &t| crate::ir::unify_blend_type(acc, t))
-            .is_float();
+            .fold(ColType::of(TypeCode::I64), |acc, &t| unify_blend_type(acc, t));
+        // Every argument is a numeric operand: a string one is refused by the
+        // numeric read, which names the column where the blend cannot.
+        if ty.tc == TypeCode::String {
+            for (a, t) in args.iter().zip(&types) {
+                if t.tc == TypeCode::String {
+                    self.lower_num(a)?;
+                }
+            }
+        }
         // The engine taints a register unsigned only from the first U64 operand
         // onward, so a U64 argument must head the fold — otherwise an earlier
         // signed pair would compare signed and the answer would depend on the
         // order the arguments were written in.
         let head = types
             .iter()
-            .position(|t| t.register_image() == TypeCode::U64)
+            .position(|t| t.register_image().tc == TypeCode::U64)
             .unwrap_or(0);
-        let mut acc = self.lower_as(&args[head], any_float)?;
+        let mut acc = self.lower_to(&args[head], ty)?;
         for (i, a) in args.iter().enumerate() {
             if i == head {
                 continue;
             }
-            let b = self.lower_as(a, any_float)?;
-            acc = if any_float {
+            let b = self.lower_to(a, ty)?;
+            acc = if ty.tc.is_float() {
                 self.eb.emit(L::FloatMinMax2 { a: acc, b, is_max })
             } else {
                 self.eb.emit(L::IntMinMax2 { a: acc, b, is_max })
             };
         }
-        Ok((acc, ExprKind::num(any_float)))
+        Ok((acc, ExprKind::of(ty)))
     }
 
     /// CAST, dispatched on the target class, then the source kind.
-    fn cast(&mut self, expr: &BoundExpr, to: TypeCode) -> Result<(Reg, ExprKind), GnitzSqlError> {
+    fn cast(&mut self, expr: &BoundExpr, to: ColType) -> Result<(Reg, ExprKind), GnitzSqlError> {
+        if to.is_decimal() {
+            return self.cast_to_decimal(expr, to.scale);
+        }
+        let to = to.tc;
         let (r, kind) = self.lower(expr)?;
         if to.is_temporal() {
             let from = expr.infer_type(self.cols);
@@ -446,24 +596,20 @@ impl OpcodeBackend<'_> {
         if to == TypeCode::String {
             let reg = match kind {
                 ExprKind::Str => r,
-                ExprKind::Float => self.eb.emit(L::FloatToStr { a: r }),
                 ExprKind::Int => self.eb.emit(L::IntToStr { a: r }),
+                ExprKind::Float | ExprKind::Dec(_) => {
+                    let f = self.as_float(r, kind);
+                    self.eb.emit(L::FloatToStr { a: f })
+                }
             };
             return Ok((reg, ExprKind::Str));
         }
         if to.is_float() {
             let f = match kind {
                 ExprKind::Str => self.eb.emit(L::StrToFloat { a: r }),
-                ExprKind::Int => self.eb.emit(L::IntToFloat { a: r }),
-                ExprKind::Float => r,
+                scalar => self.as_float(r, scalar),
             };
-            // F64 needs nothing more: the register already holds an f64.
-            let reg = if to == TypeCode::F32 {
-                self.eb.emit(L::FloatToF32 { a: f })
-            } else {
-                f
-            };
-            return Ok((reg, ExprKind::Float));
+            return Ok((self.cast_float(f, to), ExprKind::Float));
         }
         // Every remaining target is a `FixedInt`: the float and String branches
         // above peeled the rest, and `is_cast_target` admits nothing else.
@@ -471,6 +617,16 @@ impl OpcodeBackend<'_> {
         let reg = match kind {
             ExprKind::Str => self.eb.emit(L::StrToInt { a: r, fi }),
             ExprKind::Float => self.eb.emit(L::FloatToInt { a: r, fi }),
+            // Rounded to a whole number, then range-checked into the target
+            // like any other i64.
+            ExprKind::Dec(s) => {
+                let whole = self.round_div(r, s);
+                if fi == FixedInt::I64 {
+                    whole
+                } else {
+                    self.eb.emit(L::IntCast { a: whole, fi })
+                }
+            }
             ExprKind::Int => {
                 // Elide iff the register provably already holds a value inside
                 // `to`'s domain *with* `to`'s register image: the engine tracks a
@@ -495,6 +651,29 @@ impl OpcodeBackend<'_> {
         Ok((reg, ExprKind::Int))
     }
 
+    /// An f64 register as the float type `to`: F64 needs nothing more.
+    fn cast_float(&mut self, f: Reg, to: TypeCode) -> Reg {
+        if to == TypeCode::F32 {
+            self.eb.emit(L::FloatToF32 { a: f })
+        } else {
+            f
+        }
+    }
+
+    /// `CAST(… AS DECIMAL(p, s))`.
+    fn cast_to_decimal(&mut self, expr: &BoundExpr, scale: u8) -> Result<(Reg, ExprKind), GnitzSqlError> {
+        let reg = match expr {
+            BoundExpr::LitStr(text) => {
+                check_decimal_scale(scale)?;
+                let val = parse_decimal(text, scale)
+                    .ok_or_else(|| GnitzSqlError::Bind(format!("invalid DECIMAL literal: {text:?}")))?;
+                self.eb.emit(L::LoadConst { val })
+            }
+            _ => self.lower_dec(expr, scale)?,
+        };
+        Ok((reg, ExprKind::Dec(scale)))
+    }
+
     /// Searched CASE as a right-to-left fold of selects, so the first truthy
     /// WHEN wins. The result class is decided from the branch types before any
     /// result is lowered — lowering is eager, and a `LitNull` branch must be
@@ -507,17 +686,16 @@ impl OpcodeBackend<'_> {
         branches: &[(BoundExpr, BoundExpr)],
         else_: Option<&BoundExpr>,
     ) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        let case_ty = BoundExpr::case_type(branches, else_, &|idx: &usize| self.cols[*idx].type_code);
-        let is_str = case_ty == TypeCode::String;
-        let any_float = case_ty.is_float();
+        let case_ty = BoundExpr::case_type(branches, else_, &|idx: &usize| self.cols[*idx].ty());
+        let is_str = case_ty.tc == TypeCode::String;
         let mut conds = Vec::with_capacity(branches.len());
         let mut results = Vec::with_capacity(branches.len());
         for (cond, result) in branches {
             conds.push(self.lower_num(cond)?.0);
-            results.push(self.case_value(result, is_str, any_float)?);
+            results.push(self.lower_to(result, case_ty)?);
         }
         let mut acc = match else_ {
-            Some(e) => self.case_value(e, is_str, any_float)?,
+            Some(e) => self.lower_to(e, case_ty)?,
             None if is_str => self.eb.emit(L::LoadNullStr),
             None => self.eb.emit(L::LoadNull),
         };
@@ -528,31 +706,22 @@ impl OpcodeBackend<'_> {
                 self.eb.emit(L::Select { cond, a, b: acc })
             };
         }
-        Ok((
-            acc,
-            if is_str {
-                ExprKind::Str
-            } else {
-                ExprKind::num(any_float)
-            },
-        ))
-    }
-
-    fn case_value(&mut self, e: &BoundExpr, is_str: bool, any_float: bool) -> Result<Reg, GnitzSqlError> {
-        if is_str {
-            self.str_operand(e, false)
-        } else {
-            self.lower_as(e, any_float)
-        }
+        Ok((acc, ExprKind::of(case_ty)))
     }
 
     /// `inner IN (items…)`. A ≤8-byte-integer operand with all-integer-literal
-    /// items is one `IntInSet`; anything else is the `inner = item` OR chain.
+    /// items is one `IntInSet` — a DECIMAL operand with literals that are exact
+    /// at its scale likewise; anything else is the `inner = item` OR chain.
     /// `self.cols` is the schema `inner` was bound against, so the gate holds
     /// for a HAVING over the reduce output as much as for a table filter.
     fn in_list(&mut self, inner: &BoundExpr, items: &[BoundExpr]) -> Result<(Reg, ExprKind), GnitzSqlError> {
-        if gnitz_wire::is_fixed_int(inner.infer_type(self.cols) as u8) {
-            if let Some(mut values) = items.iter().map(BoundExpr::int_literal).collect::<Option<Vec<i64>>>() {
+        let ty = inner.infer_ty(self.cols);
+        let literal = |e: &BoundExpr| match ty.is_decimal() {
+            true => e.exact_decimal(ty.scale),
+            false => e.int_literal(),
+        };
+        if gnitz_wire::is_fixed_int(ty.tc as u8) {
+            if let Some(mut values) = items.iter().map(literal).collect::<Option<Vec<i64>>>() {
                 values.sort_unstable();
                 values.dedup();
                 let value_reg = self.lower_num(inner)?.0;
@@ -590,6 +759,10 @@ impl OpcodeBackend<'_> {
             let b = self.str_operand(right, false)?;
             return Ok((self.eb.emit(L::StrConcat { a, b, skip_null: false }), ExprKind::Str));
         }
+        let (lt, rt) = operand_ty_pair(left, right, &|i: &usize| self.cols[*i].ty());
+        if (lt.is_decimal() || rt.is_decimal()) && !matches!(op, BinOp::And | BinOp::Or) {
+            return self.decimal_binop(left, op, right, lt, rt);
+        }
         let (mut l, l_kind) = self.lower(left)?;
         let (mut r, r_kind) = self.lower(right)?;
         if l_kind == ExprKind::Str || r_kind == ExprKind::Str {
@@ -599,7 +772,7 @@ impl OpcodeBackend<'_> {
             let reg = self.eb.emit(L::BoolBinary { a: l, b: r, is_or: op == BinOp::Or });
             return Ok((reg, ExprKind::Int));
         }
-        let (l_float, r_float) = (l_kind == ExprKind::Float, r_kind == ExprKind::Float);
+        let (l_float, r_float) = (l_kind.is_float(), r_kind.is_float());
         // POWER has no integer form: both operands lift.
         let is_float = l_float || r_float || op == BinOp::Pow;
         if is_float && !l_float {
@@ -608,11 +781,62 @@ impl OpcodeBackend<'_> {
         if is_float && !r_float {
             r = self.eb.emit(L::IntToFloat { a: r });
         }
+        let out = match is_float {
+            true => ExprKind::Float,
+            false => ExprKind::Int,
+        };
+        self.emit_scalar_binop(l, op, r, out)
+    }
+
+    /// A comparison or arithmetic with a DECIMAL operand: both sides are brought
+    /// to the scale [`decimal_compute_type`] names, so `d = 1.005` compares
+    /// exactly rather than after rounding the literal.
+    fn decimal_binop(
+        &mut self,
+        left: &BoundExpr,
+        op: BinOp,
+        right: &BoundExpr,
+        lt: ColType,
+        rt: ColType,
+    ) -> Result<(Reg, ExprKind), GnitzSqlError> {
+        let out = decimal_compute_type(op, lt, rt);
+        if out.tc == TypeCode::String {
+            return Err(GnitzSqlError::Unsupported(format!(
+                "operator {op:?} is not supported between a DECIMAL and a string"
+            )));
+        }
+        if out.tc == TypeCode::F64 {
+            let f64 = ColType::of(TypeCode::F64);
+            let l = self.lower_to(left, f64)?;
+            let r = self.lower_to(right, f64)?;
+            return self.emit_scalar_binop(l, op, r, ExprKind::Float);
+        }
+        // A product's operands keep their own scales — the multiply adds them.
+        let (ls, rs) = match op {
+            BinOp::Mul => (lt.scale, rt.scale),
+            _ => (out.scale, out.scale),
+        };
+        check_decimal_scale(out.scale)?;
+        let l = self.lower_dec(left, ls)?;
+        let r = self.lower_dec(right, rs)?;
+        self.emit_scalar_binop(l, op, r, ExprKind::Dec(out.scale))
+    }
+
+    /// The comparison-or-arithmetic tail both binop paths end in: `out` is the
+    /// class the arithmetic result carries, and picks the float or integer
+    /// opcode; a comparison is `Int` whichever class its operands are.
+    fn emit_scalar_binop(
+        &mut self,
+        l: Reg,
+        op: BinOp,
+        r: Reg,
+        out: ExprKind,
+    ) -> Result<(Reg, ExprKind), GnitzSqlError> {
+        let is_float = out.is_float();
         if let Some(cmp) = op.as_cmp() {
-            let reg = if is_float {
-                self.eb.emit(L::FCmp { op: cmp, a: l, b: r })
-            } else {
-                self.eb.emit(L::Cmp { op: cmp, a: l, b: r })
+            let reg = match is_float {
+                true => self.eb.emit(L::FCmp { op: cmp, a: l, b: r }),
+                false => self.eb.emit(L::Cmp { op: cmp, a: l, b: r }),
             };
             return Ok((reg, ExprKind::Int));
         }
@@ -620,13 +844,12 @@ impl OpcodeBackend<'_> {
             let op = op
                 .as_float_arith()
                 .ok_or_else(|| GnitzSqlError::Unsupported("float modulo not supported".to_string()))?;
-            Ok((self.eb.emit(L::FloatArith { op, a: l, b: r }), ExprKind::Float))
-        } else {
-            let op = op
-                .as_int_arith()
-                .expect("every scalar operator that is not a comparison has an integer form");
-            Ok((self.eb.emit(L::IntArith { op, a: l, b: r }), ExprKind::Int))
+            return Ok((self.eb.emit(L::FloatArith { op, a: l, b: r }), out));
         }
+        let op = op
+            .as_int_arith()
+            .expect("every scalar operator that is not a comparison has an integer form");
+        Ok((self.eb.emit(L::IntArith { op, a: l, b: r }), out))
     }
 
     /// A binary operator with at least one string operand in a register. Only

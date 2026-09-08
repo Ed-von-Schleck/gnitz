@@ -4,7 +4,7 @@
 use crate::ast_util::{extract_index_name, extract_object_name, index_column_ident, simple_ident_expr};
 use crate::bind::{find_unique_column, probe, Binder};
 use crate::error::GnitzSqlError;
-use crate::types::{serial_underlying, sql_type_to_typecode};
+use crate::types::{serial_underlying, sql_col_type};
 use crate::validate::{
     canonical_user_name, kv_options, non_key_eligible_error, reject_column_overflow, reject_duplicate_names,
     reject_repeated_object, reject_unbuildable_index_key, reject_unhonored_column_options,
@@ -12,7 +12,7 @@ use crate::validate::{
     require_class, validate_user_name, ClassWant, ColumnOptionSite,
 };
 use crate::SqlResult;
-use gnitz_core::{CatalogSnapshot, ColumnDef, FkTarget, GnitzClient, InlineUniqueIndex, TableProps, TypeCode};
+use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, FkTarget, GnitzClient, InlineUniqueIndex, TableProps, TypeCode};
 use sqlparser::ast::{
     ColumnOption, CreateTableOptions, Expr, ForeignKeyConstraint, ObjectType, PrimaryKeyConstraint, TableConstraint,
     UniqueConstraint, Value, ValueWithSpan, WrappedCollection,
@@ -44,15 +44,19 @@ fn disambiguate_index_name(base: String, taken: &HashSet<String>) -> String {
     unreachable!("u32 range exhausted")
 }
 
-/// [`gnitz_wire::fk_child_fits`]'s rejection message. The engine's own pre-create
-/// gate reads the same predicate, so the two cannot disagree on what is legal.
-fn check_fk_type_compat(fk_col_type: TypeCode, parent_col_type: TypeCode) -> Result<(), GnitzSqlError> {
-    if !gnitz_wire::fk_child_fits(fk_col_type as u8, parent_col_type as u8) {
+/// [`gnitz_wire::fk_child_fits`]'s rejection message, under the DECIMAL rule:
+/// a child adopts the referenced type, and adopting another scale would restate
+/// its values.
+fn check_fk_type_compat(fk_col: &ColumnDef, parent_col: &ColumnDef) -> Result<(), GnitzSqlError> {
+    let (fk_col_type, parent_col_type) = (fk_col.ty(), parent_col.ty());
+    let fits = fk_col_type.decimal_domains_match(parent_col_type)
+        && gnitz_wire::fk_child_fits(fk_col_type.tc as u8, parent_col_type.tc as u8);
+    if !fits {
         return Err(GnitzSqlError::Bind(format!(
-            "FK type mismatch: column type {fk_col_type:?} cannot reference column type \
-             {parent_col_type:?} — the child column adopts the referenced type, which would \
-             narrow or re-sign {fk_col_type:?}; declare the child with a type whose range \
-             fits within {parent_col_type:?}",
+            "FK type mismatch: column type {fk_col_type} cannot reference column type \
+             {parent_col_type} — the child column adopts the referenced type, which would \
+             narrow or re-sign {fk_col_type}; declare the child with a type whose range \
+             fits within {parent_col_type}",
         )));
     }
     Ok(())
@@ -127,7 +131,7 @@ fn resolve_fk_target_inline(
     current_pk_cols: &[u32],
     ref_table: &str,
     site: &FkSite<'_>,
-) -> Result<(FkTarget, TypeCode), GnitzSqlError> {
+) -> Result<(FkTarget, ColType), GnitzSqlError> {
     let pk_single = (current_pk_cols.len() == 1).then(|| current_pk_cols[0] as usize);
     let ref_col_idx = resolve_referred_column(site.referred_columns, ref_table, current_cols, pk_single)?;
 
@@ -151,9 +155,11 @@ fn resolve_fk_target_inline(
         ));
     }
 
-    let parent_col_type = current_cols[ref_col_idx].type_code;
-    check_fk_type_compat(current_cols[site.col_idx].type_code, parent_col_type)?;
-    Ok((FkTarget::SelfTable { col: ref_col_idx as u32 }, parent_col_type))
+    check_fk_type_compat(&current_cols[site.col_idx], &current_cols[ref_col_idx])?;
+    Ok((
+        FkTarget::SelfTable { col: ref_col_idx as u32 },
+        current_cols[ref_col_idx].ty(),
+    ))
 }
 
 /// Resolve a REFERENCES clause to its target and the parent column's type.
@@ -168,7 +174,7 @@ fn resolve_fk_target(
     current_table_name: &str,
     current_cols: &[ColumnDef],
     current_pk_cols: &[u32],
-) -> Result<(FkTarget, TypeCode), GnitzSqlError> {
+) -> Result<(FkTarget, ColType), GnitzSqlError> {
     let ref_table = extract_object_name(site.foreign_table, schema_name, "REFERENCES")?;
 
     // Self-referencing FK: the table being created is not yet in the catalog,
@@ -210,12 +216,11 @@ fn resolve_fk_target(
     }
 
     // Child column widens to the referenced parent column's type.
-    let parent_col_type = ref_schema.columns[ref_col_idx].type_code;
-    check_fk_type_compat(current_cols[site.col_idx].type_code, parent_col_type)?;
+    check_fk_type_compat(&current_cols[site.col_idx], &ref_schema.columns[ref_col_idx])?;
 
     Ok((
         FkTarget::Table { id: ref_tid, col: ref_col_idx as u32 },
-        parent_col_type,
+        ref_schema.columns[ref_col_idx].ty(),
     ))
 }
 
@@ -297,9 +302,9 @@ fn collect_declarations(create: &sqlparser::ast::CreateTable) -> Result<Declared
         cols.push(if let Some(tc) = serial_underlying(&col.data_type) {
             ColumnDef::new(col.name.value.clone(), tc, false).serial() // NOT NULL
         } else {
-            ColumnDef::new(
+            ColumnDef::typed(
                 col.name.value.clone(),
-                sql_type_to_typecode(&col.data_type)?,
+                sql_col_type(&col.data_type)?,
                 !col.options.iter().any(|o| matches!(o.option, ColumnOption::NotNull)),
             )
         });
@@ -557,7 +562,7 @@ pub fn plan_create_table(
         }
         let (fk, parent_pk_type) = resolve_fk_target(cat, schema_name, site, &table_name, &cols, &pk_indices)?;
         cols[site.col_idx].fk = Some(fk);
-        cols[site.col_idx].type_code = parent_pk_type;
+        cols[site.col_idx].set_ty(parent_pk_type);
     }
 
     // The null bitmap excludes the PK region, so a nullable PK has no place to

@@ -290,7 +290,7 @@ pub(crate) fn execute_insert(
             }
             let ZSetBatch { columns, blob, .. } = &mut batch;
             match cell {
-                Some(c) => append_value_to_col(&mut columns[ci], blob, col_def.type_code, c)?,
+                Some(c) => append_value_to_col(&mut columns[ci], blob, col_def.ty(), c)?,
                 // `append_value_to_col` encodes a written NULL as exactly this.
                 None => push_zero_cell(&mut columns[ci], col_def.type_code),
             }

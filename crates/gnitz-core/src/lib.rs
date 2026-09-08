@@ -41,7 +41,7 @@ pub use gnitz_wire::{
 pub use mirror::{Invalidate, MirrorError, MirrorStore, PollOutcome, PollResult, Shape};
 pub use protocol::{
     native_le_key, native_packed_key, opk_key_cols, opk_key_packed, push_zero_cell, wire_flags_get_schema_version,
-    wire_flags_set_conflict_mode, BatchAppender, ColumnDef, FixedInt, FkTarget, PkBuf, PkColumn, ProtocolError,
-    ReduceOutKey, ScalarKind, Schema, TypeCode, WireConflictMode, ZSetBatch, ZSetBatchView, FLAG_PUSH, MAX_COLUMNS,
-    MAX_PK_BYTES, PK_LIST_MAX_COLS,
+    wire_flags_set_conflict_mode, BatchAppender, ColType, ColumnDef, FixedInt, FkTarget, PkBuf, PkColumn,
+    ProtocolError, ReduceOutKey, ScalarKind, Schema, TypeCode, WireConflictMode, ZSetBatch, ZSetBatchView, FLAG_PUSH,
+    MAX_COLUMNS, MAX_PK_BYTES, PK_LIST_MAX_COLS,
 };

@@ -28,7 +28,7 @@ use crate::validate::{
     as_plain_select, cte_body, non_recursive_ctes, reject_duplicate_projection_names, reject_float_key,
     reject_query_envelope_body, reject_unhonored_select_clauses, validate_user_name, HonoredClauses,
 };
-use gnitz_core::{CatalogSnapshot, ColumnDef, Schema, TypeCode};
+use gnitz_core::{CatalogSnapshot, ColType, ColumnDef, Schema};
 use sqlparser::ast::{
     BinaryOperator, Expr, Function, NamedWindowExpr, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier,
     TableFactor,
@@ -363,7 +363,7 @@ pub(crate) trait ItemLeaf: LeafBinder<HirRef> {
     fn env(&self) -> &[HirCol];
     /// The declared type of a leaf reference. A leaf minting columns of its own
     /// (a window placeholder) answers for those; everything else is the env's.
-    fn type_of(&self, r: &HirRef) -> TypeCode {
+    fn type_of(&self, r: &HirRef) -> ColType {
         type_of(self.env(), r)
     }
     /// The columns a bare `*` expands to here, or `None` where `*` is not an item
@@ -452,7 +452,7 @@ fn bind_proj_expr<L: ItemLeaf>(
         .filter(|d| !d.is_hidden);
     let out_def = match src_def {
         Some(d) => aliased_def(d, alias),
-        None => crate::validate::computed_column(alias, idx, bound.infer_type_with(&|r| leaf.type_of(r))),
+        None => crate::validate::computed_column(alias, idx, bound.infer_ty_with(&|r| leaf.type_of(r))),
     };
     Ok(ProjEntry {
         expr: bound,
@@ -463,9 +463,9 @@ fn bind_proj_expr<L: ItemLeaf>(
 /// The declared type of a leaf reference — the env column's type code, or the
 /// bound subquery's contributed value type (a computed projection may embed a
 /// subquery leaf before decorrelation substitutes it).
-pub(crate) fn type_of(env: &[HirCol], r: &HirRef) -> TypeCode {
+pub(crate) fn type_of(env: &[HirCol], r: &HirRef) -> ColType {
     match r {
-        HirRef::Col(id) => hircol_of(env, *id).def.type_code,
+        HirRef::Col(id) => hircol_of(env, *id).def.ty(),
         HirRef::Subquery(sq) => sq.value_type(),
     }
 }
@@ -1211,13 +1211,13 @@ impl<'a> PreMap<'a> {
         if let Some(id) = find_bound(&self.extra, &bound) {
             return Ok(id);
         }
-        let ty = bound.infer_type_with(&|r: &HirRef| type_of(&self.env, r));
+        let ty = bound.infer_ty_with(&|r: &HirRef| type_of(&self.env, r));
         // Declared nullable unconditionally (a computed value can be NULL: `a / 0`),
         // so an aggregate over one takes the null-skipping shape. Hidden because
         // only the expression that minted it may reach it.
         let out = HirCol::new(
             self.ids.next(),
-            ColumnDef::new(format!("_pre{}", self.extra.len()), ty, true).hidden(),
+            ColumnDef::typed(format!("_pre{}", self.extra.len()), ty, true).hidden(),
         );
         let id = out.id;
         self.env.push(out.clone());
@@ -1652,7 +1652,7 @@ impl ItemLeaf for GroupedLeaf<'_> {
             let name = alias.clone().unwrap_or_else(|| default_agg_name(agg.func, idx));
             (
                 agg.finalize(),
-                ColumnDef::new(name, agg.view_type(), agg.view_nullable()),
+                ColumnDef::typed(name, agg.view_type(), agg.view_nullable()),
             )
         }))
     }

@@ -7,7 +7,7 @@
 use super::{JoinShape, JoinType};
 use crate::error::GnitzSqlError;
 use crate::validate::reject_float_keys;
-use gnitz_core::{ColumnDef, RangeRel, TypeCode};
+use gnitz_core::{ColType, ColumnDef, RangeRel, TypeCode};
 use sqlparser::ast::{Expr, JoinConstraint, JoinOperator};
 
 /// What supplies one join step's key columns, and the step's type — orthogonal in
@@ -200,6 +200,16 @@ pub(crate) fn reject_pure_range_threshold_tc(
 /// rejected — its faithful common type is a signed-256 type that does not exist.
 pub(crate) fn validate_join_key_pair(left: &ColumnDef, right: &ColumnDef) -> Result<TypeCode, GnitzSqlError> {
     reject_float_keys([left, right], "JOIN ON")?;
+    if !left.ty().decimal_domains_match(right.ty()) {
+        return Err(GnitzSqlError::Unsupported(format!(
+            "JOIN ON: join key columns '{}' ({}) and '{}' ({}) differ; a DECIMAL joins only a \
+             DECIMAL of the same scale",
+            left.name,
+            left.ty(),
+            right.name,
+            right.ty()
+        )));
+    }
     // STRING/BLOB reindex to a 16-byte XXH3 content hash; U128/UUID reindex to the
     // 16-byte native value. Both collapse to the U128 output type, so
     // `join_key_common_type` cannot tell them apart — but a content hash never
@@ -306,12 +316,15 @@ pub(crate) fn reject_join_key_arity(n_eq: usize, has_range: bool) -> Result<(), 
 /// concrete ≤8-byte integer. `None`, the `I128` collapse (`U64` vs `I64`), and
 /// every 16-byte / non-integer / string pair are rejected: the widening path
 /// loads a value into one i64 register and cannot represent a 16-byte extremum.
-pub(crate) fn set_op_common_type(l: TypeCode, r: TypeCode) -> Option<TypeCode> {
+pub(crate) fn set_op_common_type(l: ColType, r: ColType) -> Option<ColType> {
     if l == r {
         return Some(l);
     }
-    let t = l.join_key_common_type(r)?;
-    gnitz_wire::is_fixed_int(t as u8).then_some(t)
+    if !l.decimal_domains_match(r) {
+        return None;
+    }
+    let t = l.tc.join_key_common_type(r.tc)?;
+    gnitz_wire::is_fixed_int(t as u8).then_some(ColType::of(t))
 }
 
 #[cfg(test)]
