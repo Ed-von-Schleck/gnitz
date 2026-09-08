@@ -5,12 +5,12 @@ fn col(name: &str, tc: TypeCode) -> ColumnDef {
     ColumnDef::new(name, tc, false)
 }
 
-/// The index-bound gate: a cached alias reports back the descriptor it was
+/// The index-bound gate: a cached name reports back the descriptor it was
 /// cached with, keyed case-insensitively, and an unseen name resolves to
 /// nothing. Shadowing replaces id and descriptor together, so a scan is never
 /// bounded against the shadowed relation's indexes.
 #[test]
-fn catalog_provenance_tracks_the_cache_alias_kind() {
+fn catalog_provenance_tracks_the_cached_kind() {
     let schema = Arc::new(Schema {
         columns: vec![col("a", TypeCode::U64)],
         pk_cols: vec![0],
@@ -30,10 +30,8 @@ fn catalog_provenance_tracks_the_cache_alias_kind() {
     };
     let class = |b: &Binder<'_>, n: &str| b.cache.get(&n.to_ascii_lowercase()).map(|e| e.desc.class);
     let mut b = Binder::new("public");
-    b.cache_alias("real", (16, Arc::clone(&schema), desc(16, RelClass::Table)))
-        .unwrap();
-    b.cache_alias("aview", (17, Arc::clone(&schema), desc(17, RelClass::View)))
-        .unwrap();
+    b.cache_relation("real", 16, Arc::clone(&schema), desc(16, RelClass::Table));
+    b.cache_relation("aview", 17, Arc::clone(&schema), desc(17, RelClass::View));
 
     assert_eq!(class(&b, "real"), Some(RelClass::Table));
     assert_eq!(class(&b, "aview"), Some(RelClass::View));
@@ -42,8 +40,7 @@ fn catalog_provenance_tracks_the_cache_alias_kind() {
     assert_eq!(class(&b, "REAL"), Some(RelClass::Table));
 
     // Shadowing replaces id and descriptor together.
-    b.cache_alias("real", (17, Arc::clone(&schema), desc(17, RelClass::View)))
-        .unwrap();
+    b.cache_relation("real", 17, Arc::clone(&schema), desc(17, RelClass::View));
     assert_eq!(class(&b, "real"), Some(RelClass::View));
 }
 

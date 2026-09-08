@@ -78,7 +78,7 @@ fn reduce_out_key_region(out_key: ReduceOutKey, source_schema: &Schema, group_co
             // so `SELECT *` shows the grouping values and aggregates, not the hash.
             ReduceOutSlot::SyntheticKey => {
                 r.pk_cols.push(at as u32);
-                r.cols.push(ColumnDef::new("_group_pk", TypeCode::U128, false).hidden());
+                r.cols.push(group_pk_def());
                 continue;
             }
             ReduceOutSlot::Key(c) => {
@@ -122,6 +122,17 @@ fn synthetic_fold_cols(
     r.cols
         .extend(agg_specs.iter().map(|s| ColumnDef::new("_agg", s.out_type, true)));
     (r.cols, r.group_slots)
+}
+
+fn group_pk_def() -> ColumnDef {
+    ColumnDef::new("_group_pk", TypeCode::U128, false).hidden()
+}
+
+/// The fold's partial layout with no group columns and no aggregates: the one
+/// hidden `_group_pk`. A FROM-less SELECT finalizes its constant row over it,
+/// through the same client finish a global aggregate takes.
+pub(crate) fn ground_partial_schema() -> Schema {
+    Schema::from_parts(vec![group_pk_def()], vec![0]).expect("one hidden U128 key is a valid schema")
 }
 
 /// The ad-hoc fold's partial reply schema — the one home for "what the workers

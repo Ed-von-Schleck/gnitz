@@ -32,10 +32,27 @@ use gnitz_core::{ColumnDef, RelClass, RelDescriptor, TypeCode};
 ///   `register_image` already accounts for.
 pub(crate) fn computed_column(alias: Option<String>, idx: usize, nominal: TypeCode) -> ColumnDef {
     ColumnDef::new(
-        alias.unwrap_or_else(|| format!("_expr{idx}")),
+        alias.unwrap_or_else(|| computed_column_name(idx)),
         nominal.register_image(),
         true,
     )
+}
+
+/// The name of the unaliased computed item at SELECT position `idx`.
+pub(crate) fn computed_column_name(idx: usize) -> String {
+    format!("_expr{idx}")
+}
+
+/// The hidden column ORDER BY key `i` rides as when it is an expression over the
+/// SELECT list's scope rather than an output column.
+pub(crate) fn order_column(i: usize, nominal: TypeCode) -> ColumnDef {
+    ColumnDef::new(order_column_name(i), nominal.register_image(), true).hidden()
+}
+
+/// A hidden ordering column's label, for dumps and EXPLAIN. Placement travels
+/// as a column index, not by this name.
+pub(crate) fn order_column_name(i: usize) -> String {
+    format!("_order{i}")
 }
 
 /// Reject an output column list that names the same *visible* column twice.
@@ -260,8 +277,8 @@ pub(crate) struct HonoredClauses {
 }
 
 impl HonoredClauses {
-    /// A shape consuming neither GROUP BY nor DISTINCT: a subquery body, a CTE
-    /// pass-through alias, a plain ungrouped SELECT.
+    /// A shape consuming neither GROUP BY nor DISTINCT: a subquery body, a
+    /// FROM-less SELECT, a plain ungrouped SELECT.
     pub(crate) const PLAIN: HonoredClauses = HonoredClauses {
         grouping: false,
         distinct: false,
@@ -398,7 +415,7 @@ pub(crate) enum QueryEnvelope {
     /// clause is compiled by the `bind_ctes` phase, and no other tail clause has
     /// incremental-view semantics.
     ViewBody,
-    /// Direct SELECT: a `WITH` (inlined by `cte_passthrough`), plus the
+    /// Direct SELECT: a `WITH` (expanded by `dml::cte`), plus the
     /// client-side ordering sink — `ORDER BY` and `LIMIT`/`OFFSET` are applied
     /// to the fetched batch, so this guard leaves them to the caller.
     DirectSelect,

@@ -960,9 +960,14 @@ def test_rejections(client):
     client.create_schema(sn)
     try:
         _setup_orders(client, sn)
-        # ORDER BY <aggregate function> stays rejected (alias/position only).
-        with pytest.raises(Exception):
-            _rows(client, sn, "SELECT category, COUNT(*) FROM orders GROUP BY category ORDER BY COUNT(*)")
+        # ORDER BY an aggregate or an expression over the grouped relation binds
+        # like a SELECT item; a column the grouping does not cover is rejected.
+        by_call = _rows(client, sn, "SELECT category, COUNT(*) FROM orders GROUP BY category ORDER BY COUNT(*) DESC, category")
+        by_alias = _rows(client, sn, "SELECT category, COUNT(*) AS c FROM orders GROUP BY category ORDER BY c DESC, category")
+        assert [r["category"] for r in by_call] == [r["category"] for r in by_alias], (by_call, by_alias)
+        assert tuple(by_call[0]._fields) == ("category", "_count1"), by_call[0]
+        with pytest.raises(Exception, match="must appear in GROUP BY"):
+            _rows(client, sn, "SELECT category, COUNT(*) FROM orders GROUP BY category ORDER BY amount")
         # DISTINCT over a float key is rejected (parity with the view path).
         client.execute_sql("CREATE TABLE fp (pk BIGINT PRIMARY KEY, price DOUBLE)", schema_name=sn)
         client.execute_sql("INSERT INTO fp VALUES (1, 1.5), (2, 2.5)", schema_name=sn)

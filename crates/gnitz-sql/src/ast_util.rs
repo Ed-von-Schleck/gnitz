@@ -392,6 +392,11 @@ pub(crate) fn expr_any(e: &sqlparser::ast::Expr, p: &impl Fn(&sqlparser::ast::Ex
     p(e) || expr_operands(e).into_iter().any(|o| expr_any(o, p))
 }
 
+/// The node count of `e` over the same node set.
+pub(crate) fn expr_node_count(e: &sqlparser::ast::Expr) -> usize {
+    1 + expr_operands(e).into_iter().map(expr_node_count).sum::<usize>()
+}
+
 /// Recursively test whether an expression contains an aggregate function call:
 /// the call itself, or — for a non-aggregate wrapper over one (`abs(SUM(x))`,
 /// still a grouped shape) — any of its operands.
@@ -547,9 +552,11 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
         Expr::Between { expr, low, high, .. } => vec![expr, low, high],
         Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => vec![a, b],
         Expr::Position { expr, r#in } => vec![expr, r#in],
-        // CEIL/FLOOR/CAST reach the binder as their own AST nodes rather than as
-        // function calls, so their operand needs naming here explicitly.
-        Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } | Expr::Cast { expr, .. } => vec![expr],
+        // Keyword-dispatched: sqlparser gives these their own node rather than an
+        // `Expr::Function`, so their operand is named here explicitly.
+        Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } | Expr::Cast { expr, .. } | Expr::Extract { expr, .. } => {
+            vec![expr]
+        }
         // SUBSTRING and TRIM are keyword-dispatched too. TRIM's `trim_what` is a
         // literal by the time the binder accepts it, but it is a bound operand
         // position and belongs in the walk regardless.
@@ -594,6 +601,66 @@ pub(crate) fn expr_operands(e: &sqlparser::ast::Expr) -> Vec<&sqlparser::ast::Ex
             };
             if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &f.over {
                 ops.extend(window_spec_keys(spec));
+            }
+            ops
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// [`expr_operands`] over `&mut`, for a rewriter: the same node set, so a
+/// substitution reaches exactly the positions the binder reads.
+pub(crate) fn expr_operands_mut(e: &mut sqlparser::ast::Expr) -> Vec<&mut sqlparser::ast::Expr> {
+    use sqlparser::ast::{CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+    match e {
+        Expr::BinaryOp { left, right, .. } => vec![left, right],
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
+            vec![expr]
+        }
+        Expr::Between { expr, low, high, .. } => vec![expr, low, high],
+        Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => vec![a, b],
+        Expr::Position { expr, r#in } => vec![expr, r#in],
+        Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } | Expr::Cast { expr, .. } | Expr::Extract { expr, .. } => {
+            vec![expr]
+        }
+        Expr::Substring { expr, substring_from, substring_for, .. } => std::iter::once(expr.as_mut())
+            .chain(substring_from.as_deref_mut())
+            .chain(substring_for.as_deref_mut())
+            .collect(),
+        Expr::Trim { expr, trim_what, .. } => std::iter::once(expr.as_mut()).chain(trim_what.as_deref_mut()).collect(),
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => vec![expr, pattern],
+        Expr::InList { expr, list, .. } => std::iter::once(expr.as_mut()).chain(list).collect(),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            case_token: _,
+            end_token: _,
+        } => {
+            let mut ops: Vec<&mut Expr> = Vec::new();
+            ops.extend(operand.as_deref_mut());
+            for CaseWhen { condition, result } in conditions {
+                ops.push(condition);
+                ops.push(result);
+            }
+            ops.extend(else_result.as_deref_mut());
+            ops
+        }
+        Expr::Function(f) => {
+            let mut ops: Vec<&mut Expr> = match &mut f.args {
+                FunctionArguments::List(list) => list
+                    .args
+                    .iter_mut()
+                    .filter_map(|a| match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(inner)) => Some(inner),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &mut f.over {
+                ops.extend(spec.partition_by.iter_mut());
+                ops.extend(spec.order_by.iter_mut().map(|o| &mut o.expr));
             }
             ops
         }
@@ -685,17 +752,24 @@ fn is_scalar_subquery(e: &sqlparser::ast::Expr) -> bool {
 pub(crate) enum FromShape<'a> {
     /// No FROM item at all.
     Empty,
+    /// Exactly one plain relation name, no joins.
+    SinglePlainRelation(&'a sqlparser::ast::TableFactor),
+    /// A FROM that derives a relation rather than naming one.
+    Derived(DerivedFrom),
+}
+
+/// The FROM shapes that derive a relation, kept apart so a rejection can name
+/// the shape the user actually wrote.
+#[derive(Clone, Copy)]
+pub(crate) enum DerivedFrom {
     /// Multiple comma-separated FROM items (an implicit comma join). A view body
-    /// serves it as an INNER join keyed from the WHERE; distinct from `Join` only
-    /// so a rejection can name the shape the user actually wrote.
+    /// serves it as an INNER join keyed from the WHERE.
     CommaJoin,
     /// One FROM item carrying an explicit JOIN chain.
     Join,
     /// One FROM item that is not a plain relation name (a derived table, a table
     /// function, …).
     DerivedTable,
-    /// Exactly one plain relation name, no joins.
-    SinglePlainRelation(&'a sqlparser::ast::TableFactor),
 }
 
 pub(crate) fn classify_from(from: &[sqlparser::ast::TableWithJoins]) -> FromShape<'_> {
@@ -703,14 +777,14 @@ pub(crate) fn classify_from(from: &[sqlparser::ast::TableWithJoins]) -> FromShap
         [] => FromShape::Empty,
         [single] => {
             if !single.joins.is_empty() {
-                FromShape::Join
+                FromShape::Derived(DerivedFrom::Join)
             } else if matches!(single.relation, sqlparser::ast::TableFactor::Table { .. }) {
                 FromShape::SinglePlainRelation(&single.relation)
             } else {
-                FromShape::DerivedTable
+                FromShape::Derived(DerivedFrom::DerivedTable)
             }
         }
-        _ => FromShape::CommaJoin,
+        _ => FromShape::Derived(DerivedFrom::CommaJoin),
     }
 }
 

@@ -423,10 +423,15 @@ fn acc_bits(acc: &ColAcc) -> Option<u64> {
 ///
 /// The duplicate-name guard is `build_fold_shape`'s: only there is the projection
 /// in hand, and a wildcard that names nothing of its own must stay exempt.
-pub(crate) fn build_agg_out_schema(out_cols: &[ColumnDef]) -> Result<Schema, GnitzSqlError> {
+/// Returns the schema and the index the projection starts at — the hidden key
+/// slots prepended ahead of it, which a caller addressing an item by its
+/// position in `out_cols` shifts past.
+pub(crate) fn build_agg_out_schema(out_cols: Vec<ColumnDef>) -> Result<(Schema, usize), GnitzSqlError> {
     let mut cols = vec![ColumnDef::new("_agg_pk", TypeCode::U128, false).hidden()];
-    cols.extend(out_cols.iter().cloned());
+    let base = cols.len();
+    cols.extend(out_cols);
     Schema::from_parts(cols, vec![0])
+        .map(|s| (s, base))
         .map_err(|e| GnitzSqlError::Unsupported(format!("ad-hoc aggregate output schema is invalid: {e}")))
 }
 

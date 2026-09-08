@@ -213,6 +213,22 @@ class TestSortBeforeProjection:
         finally:
             _cleanup(client, sn, "t")
 
+    def test_order_by_expression(self, client):
+        """An ORDER BY expression binds over the source like a SELECT item and
+        rides as a hidden column: the result shows the SELECT list alone, and
+        the worker top-k under LIMIT selects by the same expression."""
+        sn = "sp" + _uid()
+        client.create_schema(sn)
+        try:
+            self._setup(client, sn)  # (1,30), (2,10), (3,20)
+            rows = _rows(client, sn, "SELECT id FROM t ORDER BY 0 - v")
+            assert [r.id for r in rows] == [1, 3, 2]
+            assert list(rows[0]._fields) == ["id"], rows[0]
+            rows = _rows(client, sn, "SELECT id FROM t ORDER BY v % 20, id DESC LIMIT 2")
+            assert [r.id for r in rows] == [3, 2]
+        finally:
+            _cleanup(client, sn, "t")
+
 
 # ---------------------------------------------------------------------------
 # Views: multiplicity-correct LIMIT and determinism of the summed-weight bag

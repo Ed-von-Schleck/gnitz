@@ -11,6 +11,7 @@
 
 use crate::error::GnitzSqlError;
 use crate::exec::agg_finish::{build_agg_out_schema, FinalizeItem, FoldShape};
+use crate::exec::order::{order_exprs, wire_order, OrderKey};
 use crate::expr_lower::{compile_conjuncts_evaluator, compile_scalar_evaluator};
 use crate::hir::bind_and_lower_fold;
 use crate::ir::BoundExpr;
@@ -20,14 +21,18 @@ use sqlparser::ast::Select;
 use std::sync::Arc;
 
 /// The physical layout and reply schemas a GROUP BY / global aggregate / HAVING /
-/// DISTINCT read folds under — a pure function of the AST and the source schema.
-/// A shape the fold cannot express (a partial reply wider than the column limit,
-/// a HAVING or finalize the shared expression compiler rejects) is a
-/// feature-named `Unsupported`; a binder's own `Unsupported`/`Bind` propagates.
-pub(crate) fn build_fold_shape(select: &Select, schema: &Arc<Schema>, alias: &str) -> Result<FoldShape, GnitzSqlError> {
+/// DISTINCT read folds under, plus its ORDER BY resolved over that layout — a
+/// pure function of the AST and the source schema. A shape the fold cannot
+/// express is a feature-named `Unsupported`; a binder's own propagates.
+pub(crate) fn build_fold_shape(
+    select: &Select,
+    schema: &Arc<Schema>,
+    alias: &str,
+    keys: &[OrderKey<'_>],
+) -> Result<(FoldShape, Vec<gnitz_wire::OrderKey>), GnitzSqlError> {
     // The partial reply's width gate ran in the lowering, which is where the
     // schema it bounds is built.
-    let pieces = bind_and_lower_fold(select, schema, alias)?;
+    let (pieces, order_cols) = bind_and_lower_fold(select, schema, alias, &order_exprs(keys))?;
 
     // HAVING and the finalize items are both expressions over the raw reduce
     // output, compiled against the partial reply schema with the same
@@ -56,16 +61,22 @@ pub(crate) fn build_fold_shape(select: &Select, schema: &Arc<Schema>, alias: &st
     };
     reject_duplicate_projection_names(&select.projection, out_cols.iter(), ctx)?;
 
-    Ok(FoldShape {
-        reduce_schema: pieces.reduce_schema,
-        group_positions: pieces.group_positions,
-        agg_specs: pieces.agg_specs,
-        pre: pieces.pre,
-        out_schema: build_agg_out_schema(&out_cols)?,
-        partial_schema: Arc::new(pieces.partial_schema),
-        having,
-        finalize,
-    })
+    let (out_schema, base) = build_agg_out_schema(out_cols)?;
+    let order = wire_order(keys, &out_schema, &order_cols, base)?;
+
+    Ok((
+        FoldShape {
+            reduce_schema: pieces.reduce_schema,
+            group_positions: pieces.group_positions,
+            agg_specs: pieces.agg_specs,
+            pre: pieces.pre,
+            out_schema,
+            partial_schema: Arc::new(pieces.partial_schema),
+            having,
+            finalize,
+        },
+        order,
+    ))
 }
 
 /// Classify one finalize item. A bare reference to a reduce-output column of the

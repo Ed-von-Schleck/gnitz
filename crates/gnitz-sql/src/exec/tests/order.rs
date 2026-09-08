@@ -86,8 +86,17 @@ fn passthrough(
     offset: usize,
     limit: Option<usize>,
 ) -> Result<(Schema, ZSetBatch), GnitzSqlError> {
-    let keys = resolve_out_schema_order(order_by, &schema)?;
-    Ok(read_spec_finish(schema, batch, &keys, offset, limit))
+    let parsed = parse_order_by(order_by)?;
+    // Standing in for the SELECT-list binder: over an already-projected result
+    // every expression key names an output column.
+    let placed = order_exprs(&parsed)
+        .into_iter()
+        .map(|e| {
+            output_column(e, &schema.columns)?.ok_or_else(|| GnitzSqlError::Bind("ORDER BY column not found".into()))
+        })
+        .collect::<Result<Vec<_>, GnitzSqlError>>()?;
+    let keys = wire_order(&parsed, &schema, &placed, 0)?;
+    Ok(read_spec_finish(schema, batch, &keys, Window { offset, limit }))
 }
 
 /// Test-only sort → window → project: the production sinks window an
@@ -491,11 +500,10 @@ fn sink_rejects_unsupported_order_by_forms() {
         )
         .map(|_| ())
     };
-    // A non-column-ref expression key → Unsupported.
-    assert!(matches!(
-        mk("SELECT id, v FROM t ORDER BY v + 1"),
-        Err(GnitzSqlError::Unsupported(_))
-    ));
+    // An expression key is the SELECT list binder's to append; over an
+    // already-projected result with no hidden column for it, it is an error,
+    // never a silent drop.
+    assert!(mk("SELECT id, v FROM t ORDER BY v + 1").is_err());
     // Positional out of range → error (position 9 > 2 output cols; position 0).
     assert!(mk("SELECT id, v FROM t ORDER BY 9").is_err());
     assert!(mk("SELECT id, v FROM t ORDER BY 0").is_err());

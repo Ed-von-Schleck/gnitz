@@ -19,6 +19,10 @@ use sqlparser::ast::SelectItem;
 
 /// One output column of a projection: a verbatim source column
 /// (`PassThrough`) or a value derived by an expression (`Computed`).
+///
+/// Equality is "these two slots emit the same value" — `BoundExpr` compares
+/// after names resolve, so `t.a + b` and `a + b` are one item.
+#[derive(PartialEq)]
 pub(crate) enum ProjItem {
     PassThrough { src_col: usize },
     Computed { bound_expr: BoundExpr },

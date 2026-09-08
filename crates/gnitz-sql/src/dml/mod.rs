@@ -9,7 +9,7 @@
 //! body uses, lowered to the fold sink instead of to a circuit — so one written
 //! statement means one thing on both surfaces. `dml::group_by` turns the layout
 //! that comes back into the executable fold shape and owns the `SELECT DISTINCT`
-//! resolver; pass-through-CTE inlining reuses `bind::cte_passthrough`. What `dml`
+//! resolver; `dml::cte` expands an ad-hoc `WITH` into its body. What `dml`
 //! never reaches for is a view *emitter*: it consumes the shared validation
 //! leaves (`crate::validate`) and access-path recognizers (`crate::access`), and
 //! from `hir` only that one entry point.
@@ -23,6 +23,7 @@
 //! they cover, so each stays that module's own `tests` child and reaches its
 //! private items.
 
+mod cte;
 mod explain;
 pub(crate) mod group_by;
 mod insert;

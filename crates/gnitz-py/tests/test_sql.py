@@ -336,8 +336,8 @@ class TestSqlSelect:
 
     def test_derivation_shapes_rejected_with_create_view_advice(self, client):
         """An ad-hoc SELECT reads one relation; a query that derives a new one
-        (JOIN, set-op, EXISTS/IN or scalar subquery, derived table, non-pass-through
-        CTE) is rejected from the AST alone with one template naming the construct
+        (JOIN, set-op, EXISTS/IN or scalar subquery, derived table, grouped CTE)
+        is rejected from the AST alone with one template naming the construct
         and pointing at CREATE VIEW."""
         sn = "s" + _uid()
         client.create_schema(sn)
@@ -357,7 +357,7 @@ class TestSqlSelect:
                 ("SELECT pk FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.k = t.val)", "EXISTS/IN subquery"),
                 ("SELECT pk, (SELECT MAX(k) FROM u) FROM t", "scalar subquery"),
                 ("SELECT x FROM (SELECT val AS x FROM t) d", "derived table in FROM"),
-                ("WITH c AS (SELECT pk FROM t WHERE val > 20) SELECT pk FROM c", "non-pass-through CTE"),
+                ("WITH c AS (SELECT val, COUNT(*) AS n FROM t GROUP BY val) SELECT val FROM c", "grouped CTE"),
                 ("SELECT t.pk FROM t, u WHERE t.val = u.k", "comma-join FROM"),
             ]
             for sql, construct in cases:
@@ -379,11 +379,11 @@ class TestSqlSelect:
 
     def test_direct_path_feature_limits_are_not_derivation_errors(self, client):
         """A single-relation read using a feature the direct path cannot express
-        (a LIKE whose pattern is not a literal, an ORDER BY expression) is a
-        feature-named error — never the derivation template. A string HAVING is
-        not one of them: it compiles through the same expression compiler a
-        grouped view's post-reduce FILTER uses, so it is served — and so is a
-        LIKE against a literal pattern."""
+        (a LIKE whose pattern is not a literal) is a feature-named error — never
+        the derivation template. A string HAVING is not one of them: it compiles
+        through the same expression compiler a grouped view's post-reduce FILTER
+        uses, so it is served — and so are a LIKE against a literal pattern and
+        an ORDER BY expression."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -392,12 +392,14 @@ class TestSqlSelect:
                 schema_name=sn,
             )
             client.execute_sql("INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b')", schema_name=sn)
-            for sql in ["SELECT pk FROM t WHERE s LIKE s", "SELECT pk FROM t ORDER BY pk + 1"]:
-                with pytest.raises(gnitz.GnitzError) as ei:
-                    client.execute_sql(sql, schema_name=sn)
-                assert "this query derives a new one" not in str(ei.value), (
-                    f"{sql!r} is a feature limit, not a derivation: {ei.value}"
-                )
+            sql = "SELECT pk FROM t WHERE s LIKE s"
+            with pytest.raises(gnitz.GnitzError) as ei:
+                client.execute_sql(sql, schema_name=sn)
+            assert "this query derives a new one" not in str(ei.value), (
+                f"{sql!r} is a feature limit, not a derivation: {ei.value}"
+            )
+            res = client.execute_sql("SELECT pk FROM t ORDER BY 0 - pk", schema_name=sn)
+            assert [r.pk for r in res[0]["rows"]] == [2, 1], res[0]
             # A string HAVING is served on the direct path.
             res = client.execute_sql(
                 "SELECT s, COUNT(*) AS c FROM t GROUP BY s HAVING s = 'a'", schema_name=sn
@@ -412,9 +414,12 @@ class TestSqlSelect:
         finally:
             client.drop_schema(sn)
 
-    def test_passthrough_cte_reads_through_the_direct_path(self, client):
-        """A pass-through CTE over one relation inlines to it and reads via the
-        direct path — WHERE over the aliased CTE still filters."""
+    def test_cte_expands_into_the_direct_path(self, client):
+        """A CTE over one relation is a macro expanded into the body, so every
+        single-relation shape reads via the direct path — an identity, a
+        narrowing or computed projection, a WHERE in the CTE conjoined with the
+        outer one, a chain, and a fold over it — and reads exactly what the
+        flat query reads."""
         sn = "s" + _uid()
         client.create_schema(sn)
         try:
@@ -433,6 +438,41 @@ class TestSqlSelect:
             )
             pks = sorted(r.pk for r in res[0]["rows"])
             assert pks == [5], f"the CTE inlines to the view and the WHERE filters val = 50, got {pks}"
+
+            for cte, flat in [
+                ("WITH x AS (SELECT pk, val AS q FROM t) SELECT pk, q FROM x ORDER BY q DESC", "SELECT pk, val AS q FROM t ORDER BY val DESC"),
+                ("WITH x AS (SELECT pk, val * 2 AS d FROM t WHERE val > 10) SELECT d FROM x WHERE d < 100 ORDER BY d", "SELECT val * 2 AS d FROM t WHERE val > 10 AND val * 2 < 100 ORDER BY d"),
+                ("WITH x(i, j) AS (SELECT pk, val FROM t), y AS (SELECT j FROM x WHERE i > 3) SELECT SUM(j) AS s FROM y", "SELECT SUM(val) AS s FROM t WHERE pk > 3"),
+                ("WITH x AS (SELECT val + 1 AS q FROM t) SELECT q, COUNT(*) AS n FROM x GROUP BY q ORDER BY q", "SELECT val + 1 AS q, COUNT(*) AS n FROM t GROUP BY val + 1 ORDER BY q"),
+                ("WITH x AS (SELECT * EXCEPT (val) FROM t) SELECT * FROM x ORDER BY pk", "SELECT pk FROM t ORDER BY pk"),
+            ]:
+                got = [(tuple(r), r.weight) for r in client.execute_sql(cte, schema_name=sn)[0]["rows"]]
+                want = [(tuple(r), r.weight) for r in client.execute_sql(flat, schema_name=sn)[0]["rows"]]
+                assert got == want and got, f"{cte!r}: {got} != {want}"
+            # A CTE exposes only what it projects, whatever the source holds.
+            with pytest.raises(gnitz.GnitzError, match="column 'val' not found"):
+                client.execute_sql("WITH x AS (SELECT pk FROM t) SELECT val FROM x", schema_name=sn)
+        finally:
+            client.drop_schema(sn)
+
+    def test_select_without_from(self, client):
+        """A FROM-less SELECT reads nothing and answers one constant row — the
+        probe a driver or health check sends — under the computed-column names,
+        with ORDER BY / LIMIT honored."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            res = client.execute_sql("SELECT 1", schema_name=sn)
+            assert res[0]["type"] == "Rows", res[0]
+            rows = list(res[0]["rows"])
+            assert len(rows) == 1 and rows[0].weight == 1, rows
+            assert tuple(rows[0]) == (1,), rows
+            res = client.execute_sql("SELECT 1 + 2 AS three, 'x' AS s, 2.5 AS f", schema_name=sn)
+            r = list(res[0]["rows"])[0]
+            assert (r.three, r.s, r.f) == (3, "x", 2.5), r
+            assert list(client.execute_sql("SELECT 1 AS a LIMIT 0", schema_name=sn)[0]["rows"]) == []
+            with pytest.raises(gnitz.GnitzError, match="column 'x' not found"):
+                client.execute_sql("SELECT x", schema_name=sn)
         finally:
             client.drop_schema(sn)
 

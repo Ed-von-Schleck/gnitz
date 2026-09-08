@@ -873,7 +873,9 @@ fn null_test<R, L: LeafBinder<R>>(value: BExpr<R>, want_null: bool, leaf: &L) ->
 /// The position of an `Identifier` / two-part `CompoundIdentifier` within one
 /// relation's columns. A written qualifier must name `alias`, the relation's
 /// effective alias, so `SELECT b.val FROM a` is a rejection rather than a read of
-/// `a.val`; it disambiguates nothing beyond that.
+/// `a.val`; it disambiguates nothing beyond that. An empty `alias` means no
+/// relation is in scope: there is no alias a qualifier could name, so such a
+/// reference is reported whole.
 ///
 /// The one home for the single-relation resolve contract — the "expected a column
 /// reference" / "column not found" pair and `find_unique_column`'s ambiguity
@@ -885,14 +887,25 @@ pub(crate) fn single_relation_col_idx<'a>(
 ) -> Result<usize, GnitzSqlError> {
     let (qual, name) =
         col_ref_parts(e).ok_or_else(|| GnitzSqlError::Unsupported("expected a column reference".into()))?;
-    if let Some(q) = qual {
-        if !q.eq_ignore_ascii_case(alias) {
-            return Err(GnitzSqlError::Bind(format!(
-                "table alias '{q}' not found (the relation in scope is '{alias}')"
-            )));
-        }
-    }
+    reject_foreign_qualifier(qual, name, alias)?;
     find_unique_column(cols, name)?.ok_or_else(|| GnitzSqlError::Bind(format!("column '{name}' not found")))
+}
+
+/// The qualifier half of [`single_relation_col_idx`], for a resolver that carries
+/// its own name lookup.
+pub(crate) fn reject_foreign_qualifier(qual: Option<&str>, name: &str, alias: &str) -> Result<(), GnitzSqlError> {
+    let Some(q) = qual else { return Ok(()) };
+    if alias.is_empty() {
+        return Err(GnitzSqlError::Bind(format!(
+            "column '{q}.{name}' not found (no relation is in scope)"
+        )));
+    }
+    if !q.eq_ignore_ascii_case(alias) {
+        return Err(GnitzSqlError::Bind(format!(
+            "table alias '{q}' not found (the relation in scope is '{alias}')"
+        )));
+    }
+    Ok(())
 }
 
 /// Leaf for a single-relation schema (WHERE, projections, set-ops, DML).

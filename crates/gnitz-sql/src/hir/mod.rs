@@ -63,6 +63,9 @@ pub(crate) fn bind_and_lower(
 /// and `CREATE VIEW AS SELECT … GROUP BY …` accept the same statements and
 /// compute them the same way, DISTINCT included.
 ///
+/// Returns the fold's pieces and the finalize item each key of `order_exprs`
+/// sorts on.
+///
 /// There is no decorrelate/classify step: the ad-hoc router rejects every
 /// subquery and join shape before a body reaches here, so the bound tree is
 /// already one of the two shapes `lower_fold` expects.
@@ -70,14 +73,15 @@ pub(crate) fn bind_and_lower_fold(
     select: &sqlparser::ast::Select,
     schema: &Arc<Schema>,
     alias: &str,
-) -> Result<lower::fold::FoldPieces, GnitzSqlError> {
+    order_exprs: &[&sqlparser::ast::Expr],
+) -> Result<(lower::fold::FoldPieces, Vec<usize>), GnitzSqlError> {
     let ids = ColIdGen::new();
-    let rel = if select.distinct.is_some() {
-        bind::bind_adhoc_distinct(&ids, select, Arc::clone(schema), alias)?
+    let (rel, order_cols) = if select.distinct.is_some() {
+        bind::bind_adhoc_distinct(&ids, select, Arc::clone(schema), alias, order_exprs)?
     } else {
-        bind::bind_adhoc_grouped(&ids, select, Arc::clone(schema), alias)?
+        bind::bind_adhoc_grouped(&ids, select, Arc::clone(schema), alias, order_exprs)?
     };
-    lower::fold::lower_fold(&rel)
+    Ok((lower::fold::lower_fold(&rel)?, order_cols))
 }
 
 /// Opaque column identity, unique within one `bind_and_lower` invocation, never

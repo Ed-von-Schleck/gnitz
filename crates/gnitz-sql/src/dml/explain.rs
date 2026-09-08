@@ -9,6 +9,7 @@ use crate::access::pk_point_tuple;
 use crate::dml::plan::Access;
 use crate::dml::select::{ReadCase, ReadPlan, SinkTail, SpecRead, Target};
 use crate::exec::agg_finish::FoldShape;
+use crate::exec::order::Window;
 use crate::SqlResult;
 use gnitz_core::{BatchAppender, ColumnDef, Schema, TypeCode, ZSetBatch};
 use gnitz_wire::sys_rows::SysRowSink;
@@ -22,40 +23,51 @@ pub(crate) fn execute_explain(plan: &ReadPlan) -> SqlResult {
 /// The five lines EXPLAIN renders for `plan`: what is read, the access path,
 /// where the predicate runs, the sink's shape, and the ORDER BY / LIMIT tail.
 pub fn explain_lines(plan: &ReadPlan) -> Vec<String> {
-    let target = &plan.target;
-    let schema = &*target.schema;
-
-    // The bare-`*` scan ships no `ReadSpec`, so it reads through a different
-    // request kind than any other full scan. It projects nothing and orders by
-    // nothing, so the reply is the source's own visible width.
-    let ReadCase::Spec(spec) = &plan.case else {
-        return vec![
-            read_line(target),
-            "access: full scan (unprojected)".to_string(),
-            "predicate: none".to_string(),
-            projection_line(schema.visible_columns().count(), 0),
-            "order/limit: none".to_string(),
-        ];
+    let spec = match &plan.case {
+        // The bare-`*` scan ships no `ReadSpec`, so it reads through a different
+        // request kind than any other full scan. It projects nothing and orders by
+        // nothing, so the reply is the source's own visible width.
+        ReadCase::PlainScan(target) => {
+            return vec![
+                read_line(target),
+                "access: full scan (unprojected)".to_string(),
+                "predicate: none".to_string(),
+                projection_line(target.schema.visible_columns().count(), 0),
+                "order/limit: none".to_string(),
+            ];
+        }
+        ReadCase::Constant(c) => {
+            let facts = window_facts(&c.order, c.window);
+            return vec![
+                "read nothing (constant row)".to_string(),
+                "access: none".to_string(),
+                "predicate: none".to_string(),
+                projection_line(
+                    c.shape.out_schema.visible_columns().count(),
+                    hidden_payload(&c.shape.out_schema),
+                ),
+                order_limit_line(facts),
+            ];
+        }
+        ReadCase::Spec(spec) => spec,
     };
+    let schema = &*spec.target.schema;
 
     // Line 4 is the sink's own shape: what the fold accumulates, or how wide the
     // projected reply is.
     let shape_line = match &spec.tail {
+        // The hidden columns `resolve_read_spec_order` appended for an ORDER BY
+        // key that is not an output column. The prepended source PK is hidden
+        // too, but is a PK column rather than a payload one.
         SinkTail::Rows { reply_schema } => {
-            // The hidden columns `resolve_read_spec_order` appended to order by a
-            // non-projected source column. The prepended source PK is hidden too,
-            // but is a PK column rather than a payload one.
-            let extra = (0..reply_schema.columns.len())
-                .filter(|&i| reply_schema.is_hidden_payload(i))
-                .count();
-            projection_line(reply_schema.visible_columns().count(), extra)
+            projection_line(reply_schema.visible_columns().count(), hidden_payload(reply_schema))
         }
         SinkTail::Fold { shape, is_distinct } => fold_line(shape, *is_distinct),
     };
 
     let facts = order_limit_facts(spec);
     vec![
-        read_line(target),
+        read_line(&spec.target),
         format!("access: {}", access_line(&spec.access, schema)),
         format!(
             "predicate: {}",
@@ -66,39 +78,54 @@ pub fn explain_lines(plan: &ReadPlan) -> Vec<String> {
             }
         ),
         shape_line,
-        if facts.is_empty() {
-            "order/limit: none".to_string()
-        } else {
-            format!("order/limit: {}", facts.join(", "))
-        },
+        order_limit_line(facts),
     ]
+}
+
+fn hidden_payload(schema: &Schema) -> usize {
+    (0..schema.columns.len())
+        .filter(|&i| schema.is_hidden_payload(i))
+        .count()
+}
+
+fn order_limit_line(facts: Vec<String>) -> String {
+    if facts.is_empty() {
+        "order/limit: none".to_string()
+    } else {
+        format!("order/limit: {}", facts.join(", "))
+    }
 }
 
 /// Where the ORDER BY / LIMIT / OFFSET work happens. Only the rows sink pushes
 /// anything down; all fold finishing is client-side.
 fn order_limit_facts(spec: &SpecRead) -> Vec<String> {
     // Both tails short-circuit `LIMIT 0` to an empty result before dispatching.
-    if spec.limit == Some(0) {
+    if spec.window.limit == Some(0) {
         return vec!["no request (LIMIT 0)".to_string()];
     }
-    let has_order = !spec.order.is_empty();
     let mut facts = Vec::new();
     // The per-worker cut is OFFSET+LIMIT deep, because the client windows. With no
     // ORDER BY keys the same wire field just stops the worker early.
-    if let (SinkTail::Rows { .. }, Some(l)) = (&spec.tail, spec.limit) {
-        let limit_k = l.saturating_add(spec.offset);
-        facts.push(if has_order {
-            format!("server top-{limit_k}")
-        } else {
+    if let (SinkTail::Rows { .. }, Some(l)) = (&spec.tail, spec.window.limit) {
+        let limit_k = l.saturating_add(spec.window.offset);
+        facts.push(if spec.order.is_empty() {
             format!("server early-stop {limit_k}")
+        } else {
+            format!("server top-{limit_k}")
         });
     }
-    // The client sorts the union of the per-worker replies, which no per-worker
-    // cut orders.
-    if has_order {
+    facts.extend(window_facts(&spec.order, spec.window));
+    facts
+}
+
+/// The client's share: it sorts the union of the per-worker replies, which no
+/// per-worker cut orders, and windows it.
+fn window_facts(order: &[gnitz_wire::OrderKey], window: Window) -> Vec<String> {
+    let mut facts = Vec::new();
+    if !order.is_empty() {
         facts.push("client sort".to_string());
     }
-    if spec.offset > 0 || spec.limit.is_some() {
+    if window.offset > 0 || window.limit.is_some() {
         facts.push("client window".to_string());
     }
     facts

@@ -18,7 +18,9 @@ use crate::ast_util::{
     select_has_window, window_spec_keys, FromShape,
 };
 use crate::bind::apply_positional_aliases;
-use crate::bind::{bind_conjuncts, bind_structural, find_unique_column, single_relation_col_idx, Binder, LeafBinder};
+use crate::bind::{
+    bind_conjuncts, bind_structural, find_unique_column, output_column, single_relation_col_idx, Binder, LeafBinder,
+};
 use crate::error::{reject_if, GnitzSqlError};
 use crate::hir::guards::{join_keys_and_type, JoinKeys};
 use crate::ir::{AggFunc, BExpr, BinOp};
@@ -315,7 +317,7 @@ fn bind_body_suffix(
     if grouped && select.distinct.is_none() {
         // A view body admits window calls; the ad-hoc fold entries below do not,
         // and reach `bind_grouped_suffix` with `windows: false`.
-        return bind_grouped_suffix(ids, select, rel, leaf, true);
+        return bind_grouped_suffix(ids, select, rel, leaf, GroupedSurface::ViewBody).map(|(rel, _)| rel);
     }
     // The window desugar owns its own projection (it must place the SELECT list
     // over the joined-in window values), so it hands back the projected relation.
@@ -400,16 +402,28 @@ pub(crate) fn bind_projection<L: ItemLeaf>(
             }
         }
         let (expr, alias) = scalar_projection_item(item, ctx)?;
-        if let Expr::Function(f) = peel_nested(expr) {
-            if let Some(call) = leaf.call_item(f, &alias, idx) {
-                let (expr, def) = call?;
-                items.push(ProjEntry { expr, out: HirCol::new(ids.next(), def) });
-                continue;
-            }
-        }
-        items.push(bind_proj_expr(expr, alias, idx, leaf, ids)?);
+        items.push(bind_scalar_item(expr, alias, idx, leaf, ids)?);
     }
     Ok(items)
+}
+
+/// Bind one scalar item: a top-level call the leaf claims (an aggregate in a
+/// grouped body) takes the leaf's own value and def; anything else binds as an
+/// expression.
+fn bind_scalar_item<L: ItemLeaf>(
+    expr: &Expr,
+    alias: Option<String>,
+    idx: usize,
+    leaf: &L,
+    ids: &ColIdGen,
+) -> Result<ProjEntry, GnitzSqlError> {
+    if let Expr::Function(f) = peel_nested(expr) {
+        if let Some(call) = leaf.call_item(f, &alias, idx) {
+            let (expr, def) = call?;
+            return Ok(ProjEntry { expr, out: HirCol::new(ids.next(), def) });
+        }
+    }
+    bind_proj_expr(expr, alias, idx, leaf, ids)
 }
 
 /// Bind one non-wildcard SELECT expression into a `ProjEntry`. A bare (possibly
@@ -1309,27 +1323,30 @@ pub(crate) fn bind_adhoc_grouped(
     select: &Select,
     schema: Arc<Schema>,
     alias: &str,
-) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    order_exprs: &[&Expr],
+) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
     let (source, scope) = adhoc_source(ids, schema, alias);
     let leaf = ScopeLeaf {
         scope: &scope,
         clause: "SELECT",
         sub: SubPolicy::PerKind,
     };
-    bind_grouped_suffix(ids, select, source, &leaf, false)
+    bind_grouped_suffix(ids, select, source, &leaf, GroupedSurface::AdhocRead(order_exprs))
 }
 
 /// Bind an ad-hoc single-relation `SELECT DISTINCT` body to `Distinct(Project(Get))`
 /// — the same tree, over the same leaf, that a `SELECT DISTINCT` `CREATE VIEW`
 /// body binds, so one written projection means one thing on both paths (a
 /// computed item included). The WHERE is not bound here, for the reason
-/// [`bind_adhoc_grouped`] states.
+/// [`bind_adhoc_grouped`] states. An ORDER BY key must be an output column: a
+/// hidden item would widen the set identity.
 pub(crate) fn bind_adhoc_distinct(
     ids: &ColIdGen,
     select: &Select,
     schema: Arc<Schema>,
     alias: &str,
-) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    order_exprs: &[&Expr],
+) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
     let (source, scope) = adhoc_source(ids, schema, alias);
     let leaf = ScopeLeaf {
         scope: &scope,
@@ -1337,7 +1354,17 @@ pub(crate) fn bind_adhoc_distinct(
         sub: SubPolicy::PerKind,
     };
     let items = bind_projection(&select.projection, &leaf, ids, "SELECT DISTINCT")?;
-    Ok(RelExpr::distinct(RelExpr::project(source, items)))
+    let order_cols = order_exprs
+        .iter()
+        .map(|e| {
+            output_column(e, items.iter().map(|it| &it.out.def))?.ok_or_else(|| {
+                GnitzSqlError::Unsupported(
+                    "SELECT DISTINCT: ORDER BY expressions must appear in the select list".into(),
+                )
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok((RelExpr::distinct(RelExpr::project(source, items)), order_cols))
 }
 
 /// The `Get` an ad-hoc body binds over and the one-relation scope its names
@@ -1348,18 +1375,27 @@ fn adhoc_source(ids: &ColIdGen, schema: Arc<Schema>, alias: &str) -> (Rc<RelExpr
     (source, scope)
 }
 
+/// What a calling surface adds to a grouped body. One or the other, never both
+/// — a view body admits window calls, an ad-hoc read brings ORDER BY keys.
+enum GroupedSurface<'a> {
+    ViewBody,
+    AdhocRead(&'a [&'a Expr]),
+}
+
 /// Bind the GROUP BY / aggregate / HAVING suffix over `input`, producing
-/// `Project(Filter_having?(Reduce(input)))` — through the window desugar when
-/// `windows` admits one and the SELECT list carries it. `windows` is the
-/// caller's, not the AST's: an ad-hoc fold admits none, and a call written there
-/// must reach the leaf's own rejection.
+/// `Project(Filter_having?(Reduce(input)))`, plus the projection item each
+/// ORDER BY key of `surface` sorts on.
 fn bind_grouped_suffix(
     ids: &ColIdGen,
     select: &Select,
     input: Rc<RelExpr>,
     leaf: &ScopeLeaf<'_>,
-    windows: bool,
-) -> Result<Rc<RelExpr>, GnitzSqlError> {
+    surface: GroupedSurface<'_>,
+) -> Result<(Rc<RelExpr>, Vec<usize>), GnitzSqlError> {
+    let order_exprs = match surface {
+        GroupedSurface::AdhocRead(keys) => keys,
+        GroupedSurface::ViewBody => &[],
+    };
     let mut pre = PreMap::new(ids, leaf.env().to_vec());
     let group_cols = resolve_group_cols(select, leaf, &mut pre)?;
     let is_global = group_cols.is_empty();
@@ -1379,6 +1415,7 @@ fn bind_grouped_suffix(
         .chain(select.having.iter())
         .chain(select.qualify.iter())
         .chain(named_keys)
+        .chain(order_exprs.iter().copied())
     {
         collect_aggs(expr, leaf, is_global, &mut aggs, &mut pre)?;
     }
@@ -1411,13 +1448,39 @@ fn bind_grouped_suffix(
     }
 
     let select_leaf = grouped("GROUP BY SELECT");
-    if windows && select_has_window(select) {
-        return super::window::bind_window_final(ids, select, rel, &select_leaf, "GROUP BY");
+    if matches!(surface, GroupedSurface::ViewBody) && select_has_window(select) {
+        // The desugar owns its own projection, and a view body carries no keys.
+        let rel = super::window::bind_window_final(ids, select, rel, &select_leaf, "GROUP BY")?;
+        return Ok((rel, Vec::new()));
     }
     // The dup-name guard is `lower_reduce`'s: its output carries the group
     // columns, including ones this projection never named.
-    let items = bind_projection(&select.projection, &select_leaf, ids, "GROUP BY")?;
-    Ok(RelExpr::project(rel, items))
+    let mut items = bind_projection(&select.projection, &select_leaf, ids, "GROUP BY")?;
+    let order_cols = place_order_keys(order_exprs, &mut items, ids, &grouped("ORDER BY"))?;
+    Ok((RelExpr::project(rel, items), order_cols))
+}
+
+/// The projection item each key of `order_exprs` sorts on: the SELECT item that
+/// already computes it, else a hidden one appended here.
+fn place_order_keys<L: ItemLeaf>(
+    order_exprs: &[&Expr],
+    items: &mut Vec<ProjEntry>,
+    ids: &ColIdGen,
+    leaf: &L,
+) -> Result<Vec<usize>, GnitzSqlError> {
+    let mut cols = Vec::with_capacity(order_exprs.len());
+    for (i, e) in order_exprs.iter().enumerate() {
+        cols.push(match output_column(e, items.iter().map(|it| &it.out.def))? {
+            Some(at) => at,
+            None => {
+                let mut entry = bind_scalar_item(e, Some(crate::validate::order_column_name(i)), i, leaf, ids)?;
+                entry.out.def.is_hidden = true;
+                items.push(entry);
+                items.len() - 1
+            }
+        });
+    }
+    Ok(cols)
 }
 
 /// The leaf for an expression over the grouped relation — HAVING and the finalize

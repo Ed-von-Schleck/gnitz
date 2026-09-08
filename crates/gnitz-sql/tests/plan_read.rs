@@ -316,8 +316,8 @@ fn explain_names_every_decision() {
                 "order/limit: no request (LIMIT 0)",
             ],
         ),
-        // A view read may drain pending ticks; a pass-through CTE reports its
-        // source's kind under the alias.
+        // A view read may drain pending ticks; a CTE expands into its source, so
+        // the read names the source.
         (
             "SELECT * FROM tv",
             [
@@ -331,7 +331,7 @@ fn explain_names_every_decision() {
         (
             "WITH c AS (SELECT * FROM tv) SELECT * FROM c",
             [
-                "read view c (drains pending ticks when stale)",
+                "read view tv (drains pending ticks when stale)",
                 "access: full scan (unprojected)",
                 "predicate: none",
                 "projection: 3 columns",
@@ -341,7 +341,7 @@ fn explain_names_every_decision() {
         (
             "WITH c AS (SELECT * FROM t) SELECT id FROM c",
             [
-                "read table c",
+                "read table t",
                 "access: full scan",
                 "predicate: none",
                 "projection: 1 columns",
@@ -444,7 +444,7 @@ fn every_read_shape_plans_to_its_sink() {
     ] {
         let plan = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
         assert_eq!(plan.kind(), kind, "`{sql}`");
-        assert_eq!(plan.target_id(), 16, "`{sql}`: the relation it reads");
+        assert_eq!(plan.target_id(), Some(16), "`{sql}`: the relation it reads");
         assert_eq!(plan.dispatches(), dispatches, "`{sql}`");
         let plain = kind == ReadKind::PlainScan;
         assert_eq!(
@@ -473,8 +473,7 @@ fn a_parenthesized_column_reference_reads_like_a_bare_one() {
             "SELECT (g), COUNT(*) AS n FROM t GROUP BY (g)",
             "SELECT g, COUNT(*) AS n FROM t GROUP BY g",
         ),
-        // The CTE pass-through predicate peels too, so a parenthesized identity
-        // body is inlined rather than derived (which the read path rejects).
+        // A CTE expands by column name, which peels too.
         (
             "WITH c AS (SELECT (id), (g), (v) FROM t) SELECT id FROM c",
             "WITH c AS (SELECT id, g, v FROM t) SELECT id FROM c",
@@ -581,6 +580,278 @@ fn a_read_the_planner_rejects_names_its_rule() {
         "WITH x AS (SELECT DISTINCT v FROM t) SELECT v FROM x",
     )));
     assert!(m.contains("DISTINCT"), "got {m}");
+}
+
+// ── Parity inside the single-relation scope ──────────────────────────────────
+
+/// Whatever the flat query plans, the CTE plans; and a name the CTE does not
+/// expose is not found, however the source spells it.
+#[test]
+fn a_cte_expands_to_the_flat_query() {
+    let cat = base();
+    for (cte, flat) in [
+        ("WITH x AS (SELECT id, v FROM t) SELECT id FROM x", "SELECT id FROM t"),
+        ("WITH x AS (SELECT v, id FROM t) SELECT * FROM x", "SELECT v, id FROM t"),
+        (
+            "WITH x AS (SELECT id, v AS q FROM t) SELECT q FROM x",
+            "SELECT v AS q FROM t",
+        ),
+        (
+            "WITH x AS (SELECT id, v + 1 AS q FROM t) SELECT q * 2 AS r FROM x WHERE q > 3",
+            "SELECT (v + 1) * 2 AS r FROM t WHERE (v + 1) > 3",
+        ),
+        (
+            "WITH x AS (SELECT id FROM t WHERE v > 1) SELECT id FROM x WHERE id = 5",
+            "SELECT id FROM t WHERE (v > 1) AND (id = 5)",
+        ),
+        (
+            "WITH x(i, j) AS (SELECT id, v FROM t) SELECT j FROM x ORDER BY i",
+            "SELECT v AS j FROM t ORDER BY id",
+        ),
+        (
+            "WITH x AS (SELECT id, v FROM t), y AS (SELECT v AS w FROM x WHERE id > 2) SELECT w FROM y",
+            "SELECT v AS w FROM t WHERE id > 2",
+        ),
+        (
+            "WITH x AS (SELECT g, v + 1 AS q FROM t) SELECT g, SUM(q) AS s FROM x GROUP BY g ORDER BY s",
+            "SELECT g, SUM(v + 1) AS s FROM t GROUP BY g ORDER BY s",
+        ),
+        (
+            "WITH x AS (SELECT * FROM t) SELECT y.id FROM x AS y ORDER BY y.v",
+            "SELECT id FROM t ORDER BY v",
+        ),
+        (
+            "WITH x AS (SELECT * EXCEPT (g) FROM t) SELECT * FROM x",
+            "SELECT id, v FROM t",
+        ),
+    ] {
+        let c = read(&cat, cte).unwrap_or_else(|e| panic!("`{cte}`: {e:?}"));
+        let f = read(&cat, flat).unwrap_or_else(|e| panic!("`{flat}`: {e:?}"));
+        assert_eq!(c.kind(), f.kind(), "`{cte}`");
+        assert_eq!(c.encoded_spec(), f.encoded_spec(), "`{cte}`");
+        assert_eq!(c.reply_schema().map(visible), f.reply_schema().map(visible), "`{cte}`");
+    }
+    for (sql, variant, msg) in [
+        (
+            "WITH x AS (SELECT id FROM t) SELECT v FROM x",
+            "Bind",
+            "column 'v' not found",
+        ),
+        (
+            "WITH x AS (SELECT id FROM t) SELECT t.id FROM x",
+            "Bind",
+            "table alias 't' not found",
+        ),
+        (
+            "WITH x AS (SELECT id, v FROM t) SELECT id FROM x ORDER BY g",
+            "Bind",
+            "column 'g' not found",
+        ),
+        (
+            "WITH x(i) AS (SELECT id, v FROM t) SELECT i FROM x",
+            "Plan",
+            "1 column aliases but body returns 2",
+        ),
+        (
+            "WITH x AS (SELECT v, v FROM t) SELECT v FROM x",
+            "Plan",
+            "duplicate column name 'v'",
+        ),
+        (
+            "WITH x AS (SELECT g, COUNT(*) AS n FROM t GROUP BY g) SELECT g FROM x",
+            "Unsupported",
+            "derives a new one (grouped CTE)",
+        ),
+        (
+            "WITH x AS (SELECT t.id FROM t JOIN u ON t.g = u.g) SELECT id FROM x",
+            "Unsupported",
+            "derives a new one (JOIN)",
+        ),
+    ] {
+        assert_rejects(sql, read(&cat, sql), variant, msg);
+    }
+
+    // A join view surfaces both sides' `v`: a wildcard carries the duplicate
+    // through positionally, and only naming it is ambiguous.
+    let i = TypeCode::I64;
+    let jv = catalog(vec![(
+        "jv",
+        rel(
+            30,
+            RelClass::View,
+            false,
+            vec![col("id", i), col("v", i), col("v", i)],
+            vec![0],
+            &[],
+        ),
+    )]);
+    let (cte, flat) = ("WITH x AS (SELECT * FROM jv) SELECT * FROM x", "SELECT * FROM jv");
+    let c = read(&jv, cte).unwrap_or_else(|e| panic!("`{cte}`: {e:?}"));
+    let f = read(&jv, flat).unwrap_or_else(|e| panic!("`{flat}`: {e:?}"));
+    assert_eq!(c.encoded_spec(), f.encoded_spec(), "`{cte}`");
+    // Defining one over the duplicate is fine — the CTE names no output column
+    // of its own, so nothing is duplicated until something reads it by name.
+    let ok = "WITH x AS (SELECT * EXCEPT (id) FROM jv) SELECT 1 AS one FROM x";
+    read(&jv, ok).unwrap_or_else(|e| panic!("`{ok}`: {e:?}"));
+    for sql in [
+        "SELECT v FROM jv",
+        "WITH x AS (SELECT * EXCEPT (id) FROM jv) SELECT v FROM x",
+        // `*` over such a CTE is the one shape a macro cannot carry: expansion
+        // has to write the names down, so it reaches the same ambiguity the flat
+        // wildcard passes positionally — a rejection, never a silent first match.
+        "WITH x AS (SELECT * EXCEPT (id) FROM jv) SELECT * FROM x",
+    ] {
+        assert_rejects(sql, read(&jv, sql), "Bind", "'v' is ambiguous");
+    }
+}
+
+/// A chain naming its predecessor's column twice doubles per level, so the
+/// planner refuses it rather than allocating it in the caller's own process.
+#[test]
+fn a_cte_chain_that_doubles_each_level_is_refused() {
+    let cat = base();
+    let chain = |levels: usize| {
+        let mut sql = "WITH c0 AS (SELECT v + v AS a FROM t)".to_string();
+        for i in 1..levels {
+            sql += &format!(", c{i} AS (SELECT a + a AS a FROM c{})", i - 1);
+        }
+        sql + &format!(" SELECT a FROM c{}", levels - 1)
+    };
+    // A chain is not suspicious for being long: only the expansion's size counts.
+    let ok = chain(10);
+    read(&cat, &ok).unwrap_or_else(|e| panic!("`{ok}`: {e:?}"));
+    let big = chain(30);
+    assert_rejects(&big, read(&cat, &big), "Unsupported", "expression nodes");
+}
+
+/// An ORDER BY key that is not an output column binds in the SELECT list's own
+/// scope on every sink and rides as a hidden column. DISTINCT is the exception:
+/// a hidden item would widen the set, so its keys must be output columns.
+#[test]
+fn an_order_by_key_binds_where_the_select_list_does() {
+    let cat = base();
+    for (sql, line) in [
+        (
+            "SELECT id FROM t ORDER BY v + 1",
+            "projection: 1 columns (+1 for ordering)",
+        ),
+        (
+            "SELECT id FROM t ORDER BY v, g + v DESC",
+            "projection: 1 columns (+2 for ordering)",
+        ),
+        // One appended column per *distinct* key program — a duplicate would be
+        // evaluated by the worker and shipped per row.
+        (
+            "SELECT id FROM t ORDER BY v + 1, v + 1",
+            "projection: 1 columns (+1 for ordering)",
+        ),
+        ("SELECT id, v + 1 AS w FROM t ORDER BY v + 1", "projection: 2 columns"),
+        ("SELECT id, v + 1 AS w FROM t ORDER BY w", "projection: 2 columns"),
+        ("SELECT id FROM t ORDER BY t.id", "projection: 1 columns"),
+    ] {
+        assert!(
+            explain(&cat, sql).contains(&line.to_string()),
+            "`{sql}`: {:?}",
+            explain(&cat, sql)
+        );
+    }
+    for sql in [
+        "SELECT g FROM t GROUP BY g ORDER BY COUNT(*) DESC",
+        "SELECT COUNT(*) AS n FROM t GROUP BY g ORDER BY g",
+        "SELECT g, SUM(v) AS s FROM t GROUP BY g ORDER BY SUM(v) + g, MAX(v)",
+        "SELECT g + 1 AS h FROM t GROUP BY g + 1 ORDER BY (g + 1) * 2",
+        "SELECT DISTINCT v AS w FROM t ORDER BY w DESC, 1",
+    ] {
+        let plan = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+        assert_eq!(plan.kind(), ReadKind::Fold, "`{sql}`");
+    }
+    // An aggregate named only in ORDER BY is collected into the reduce: the
+    // partial reply carries its accumulator beside the group column.
+    let plan = read(&cat, "SELECT g FROM t GROUP BY g ORDER BY COUNT(*)").unwrap();
+    assert_eq!(visible(plan.reply_schema().unwrap()), ["g", "_agg"]);
+    // A hidden ordering column is tied to its key by the key's position in the
+    // whole ORDER BY, so a positional key ahead of an expression one does not
+    // shift the tie: both spellings of one order plan the same output shape.
+    for (sql, named) in [
+        (
+            "SELECT g, SUM(v) AS s FROM t GROUP BY g ORDER BY 1, MAX(v)",
+            "SELECT g, SUM(v) AS s FROM t GROUP BY g ORDER BY g, MAX(v)",
+        ),
+        (
+            "SELECT g, SUM(v) AS s FROM t GROUP BY g ORDER BY MAX(v), 1, MIN(v)",
+            "SELECT g, SUM(v) AS s FROM t GROUP BY g ORDER BY MAX(v), g, MIN(v)",
+        ),
+    ] {
+        let plan = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+        let twin = read(&cat, named).unwrap_or_else(|e| panic!("`{named}`: {e:?}"));
+        assert_eq!(
+            visible(plan.reply_schema().unwrap()),
+            visible(twin.reply_schema().unwrap()),
+            "`{sql}`"
+        );
+        assert_eq!(explain(&cat, sql), explain(&cat, named), "`{sql}`");
+    }
+    for (sql, variant, msg) in [
+        (
+            "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY v",
+            "Plan",
+            "ORDER BY: column 'v' must appear in GROUP BY or an aggregate function",
+        ),
+        (
+            "SELECT DISTINCT v FROM t ORDER BY v + 1",
+            "Unsupported",
+            "SELECT DISTINCT: ORDER BY expressions must appear in the select list",
+        ),
+        ("SELECT id FROM t ORDER BY nope + 1", "Bind", "column 'nope' not found"),
+    ] {
+        assert_rejects(sql, read(&cat, sql), variant, msg);
+    }
+}
+
+/// A FROM-less SELECT reads nothing: it plans to a constant row with no request,
+/// its items are constant expressions under the computed-column naming, and the
+/// clauses that need a relation are refused.
+#[test]
+fn a_from_less_select_plans_a_constant_row() {
+    let cat = base();
+    for (sql, cols) in [
+        ("SELECT 1", vec!["_expr0"]),
+        ("SELECT 1 AS one, 'x' AS s, 2 + 3", vec!["one", "s", "_expr2"]),
+        ("SELECT 1 AS a ORDER BY a DESC LIMIT 1", vec!["a"]),
+        ("SELECT 1 AS a ORDER BY 1 + 1", vec!["a"]),
+    ] {
+        let plan = read(&cat, sql).unwrap_or_else(|e| panic!("`{sql}`: {e:?}"));
+        assert_eq!(plan.kind(), ReadKind::Constant, "`{sql}`");
+        assert_eq!(plan.target_id(), None, "`{sql}`");
+        assert!(!plan.dispatches(), "`{sql}`");
+        assert!(plan.encoded_spec().is_none(), "`{sql}`");
+        assert_eq!(visible(plan.reply_schema().unwrap()), cols, "`{sql}`");
+    }
+    assert_eq!(
+        explain(&cat, "SELECT 1 AS a ORDER BY 1 + 1 LIMIT 1"),
+        [
+            "read nothing (constant row)",
+            "access: none",
+            "predicate: none",
+            "projection: 1 columns (+1 for ordering)",
+            "order/limit: client sort, client window",
+        ]
+    );
+    for (sql, variant, msg) in [
+        ("SELECT x", "Bind", "column 'x' not found"),
+        ("SELECT 1 + t.x", "Bind", "column 't.x' not found"),
+        ("SELECT *", "Unsupported", "SELECT * is not a supported SELECT item"),
+        (
+            "SELECT 1 WHERE 1 = 1",
+            "Unsupported",
+            "SELECT without FROM: WHERE is not supported",
+        ),
+        ("SELECT COUNT(*)", "Unsupported", "aggregate"),
+        ("SELECT 1 AS a, 2 AS a", "Plan", "duplicate column name 'a'"),
+        ("SELECT (SELECT 1)", "Unsupported", "scalar subquery"),
+    ] {
+        assert_rejects(sql, read(&cat, sql), variant, msg);
+    }
 }
 
 // ── The resolve loop ─────────────────────────────────────────────────────────

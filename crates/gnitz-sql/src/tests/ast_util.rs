@@ -12,9 +12,10 @@ use gnitz_core::TypeCode;
 #[test]
 fn expr_operands_reaches_every_position_the_binder_recurses_into() {
     for src in [
-        // The dedicated AST nodes — CEIL/FLOOR/CAST/SUBSTRING/POSITION are
-        // keyword-dispatched and never arrive as `Expr::Function`.
+        // The dedicated AST nodes — CEIL/FLOOR/CAST/EXTRACT/SUBSTRING/POSITION
+        // are keyword-dispatched and never arrive as `Expr::Function`.
         "CAST(SUM(x) AS INT)",
+        "EXTRACT(YEAR FROM MAX(d))",
         "SUM(x)::INT",
         "TRY_CAST(SUM(x) AS INT)",
         "CEIL(SUM(x))",
@@ -51,6 +52,12 @@ fn expr_operands_reaches_every_position_the_binder_recurses_into() {
         "COUNT(*) OVER (ORDER BY SUM(x))",
     ] {
         assert!(expr_has_aggregate(&parse_expr_sql(src)), "{src}");
+        // By value, not by count: a rewriter substitutes through the mutable
+        // twin, so walkers agreeing only on arity is a silent wrong column.
+        let mut owned = parse_expr_sql(src);
+        let by_ref: Vec<_> = expr_operands(&parse_expr_sql(src)).into_iter().cloned().collect();
+        let by_mut: Vec<_> = expr_operands_mut(&mut owned).into_iter().map(|e| e.clone()).collect();
+        assert_eq!(by_ref, by_mut, "{src}: the two walkers disagree");
         let mut seen = 0usize;
         for_each_agg_call::<()>(&parse_expr_sql(src), &mut |_| {
             seen += 1;

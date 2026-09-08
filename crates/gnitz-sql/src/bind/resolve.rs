@@ -1,9 +1,7 @@
-use crate::ast_util::{
-    classify_from, col_ref_parts, extract_table_name_and_alias, is_bare_wildcard_projection, FromShape,
-};
+use crate::ast_util::col_ref_parts;
 use crate::error::GnitzSqlError;
 use gnitz_core::{CatalogSnapshot, ColumnDef, GnitzClient, RelClass, RelDescriptor, Schema};
-use sqlparser::ast::{Ident, Select, SelectItem, TableAliasColumnDef};
+use sqlparser::ast::{Expr, Ident};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -45,12 +43,20 @@ pub(crate) fn find_unique_column<'a>(
     Ok(found)
 }
 
+/// The output column `e` names, if it names one. Matched by name alone: an
+/// output column carries no qualifier to check against.
+pub(crate) fn output_column<'a>(
+    e: &Expr,
+    cols: impl IntoIterator<Item = &'a ColumnDef>,
+) -> Result<Option<usize>, GnitzSqlError> {
+    match col_ref_parts(e) {
+        Some((_, name)) => find_unique_column(cols, name),
+        None => Ok(None),
+    }
+}
+
 /// One Binder cache entry: a name's resolved id and schema, plus the catalog
 /// descriptor the id came from.
-///
-/// The schema rides beside the descriptor rather than being read out of it: a
-/// CTE's positional column aliases rename the schema the alias resolves through,
-/// while the descriptor keeps the source relation's own names.
 struct CachedRelation {
     table_id: u64,
     schema: Arc<Schema>,
@@ -110,8 +116,7 @@ impl<'a> Binder<'a> {
     /// which `dispatch::plan_resolving` answers by resolving it and re-running the
     /// pass. A name it holds as a recorded absence is the ordinary "not found".
     pub(crate) fn resolve(&mut self, cat: &CatalogSnapshot, name: &str) -> Result<Resolved, GnitzSqlError> {
-        // Probe with the canonical key — the cache holds base-table resolutions
-        // *and* the ad-hoc read's pass-through CTE aliases.
+        // Probe with the canonical key.
         if let Some(entry) = self.cache.get(&name.to_ascii_lowercase()) {
             return Ok((entry.table_id, Arc::clone(&entry.schema), entry.desc.clone()));
         }
@@ -120,8 +125,8 @@ impl<'a> Binder<'a> {
         // naming internal plumbing (a chain segment), and honoring it leaks a
         // dependency that makes the owner view undroppable. Placed after the
         // cache check — every cached name passed the same rule on insert
-        // (`cache_alias` validates; `cache_relation` is fed from these
-        // already-validated probes), never a raw internal catalog name.
+        // (`cache_relation` is fed from these already-validated probes), never
+        // a raw internal catalog name.
         crate::validate::validate_user_name(name)?;
         let rel = cat
             .get(self.schema_name, name)
@@ -193,21 +198,6 @@ impl<'a> Binder<'a> {
         crate::validate::require_class(&rel, name, crate::validate::ClassWant::BaseTableOrStream, "INSERT")?;
         Ok(rel)
     }
-
-    /// Cache a CTE / derived-table alias as resolving to the given
-    /// (table_id, schema). The alias is a user-chosen relation name that later
-    /// references resolve *ahead of* the funnel guard in `resolve` (the cache is
-    /// probed before validation), so it is held to the same reserved-prefix rule
-    /// here — the one gate every alias passes to become resolvable.
-    ///
-    /// The descriptor is the caller's: a pass-through CTE passes its source's
-    /// (see [`CachedRelation`]).
-    pub(crate) fn cache_alias(&mut self, name: &str, resolved: Resolved) -> Result<(), GnitzSqlError> {
-        crate::validate::validate_user_name(name)?;
-        let (table_id, schema, desc) = resolved;
-        self.cache_relation(name, table_id, schema, desc);
-        Ok(())
-    }
 }
 
 /// The relation `name` resolves to in the statement's snapshot, `None` for a free
@@ -250,67 +240,6 @@ pub(crate) fn apply_positional_aliases<'a>(
         col.name = alias.value.clone();
     }
     crate::validate::reject_duplicate_column_names(visible.iter().map(|c| &**c), &format!("{ctx} column aliases"))
-}
-
-/// The ad-hoc read route's (`dml::select`) pass-through predicate: a CTE body that is a bare single-table (or
-/// view) identity/positional projection resolves directly to its source relation,
-/// with any column aliases applied. Returns `Some(resolved)` for such an aliasable
-/// pass-through, `None` for everything else (a joined / multi-FROM / derived-table
-/// FROM or a non-identity projection), which the read route rejects as a
-/// derivation; `Err` only on a hard bind failure (unknown source relation). The
-/// caller rejects a WHERE'd / grouped / DISTINCT / exotic-clause body BEFORE
-/// calling, so such a body never reaches this predicate. A view body's CTEs do
-/// not come through here: they bind to shared subtrees (`hir::bind::bind_ctes`).
-pub(crate) fn cte_passthrough(
-    cat: &CatalogSnapshot,
-    cte_select: &Select,
-    column_aliases: &[TableAliasColumnDef],
-    binder: &mut Binder<'_>,
-) -> Result<Option<Resolved>, GnitzSqlError> {
-    // A single plain table/view FROM, no joins, no derived table.
-    let FromShape::SinglePlainRelation(factor) = classify_from(&cte_select.from) else {
-        return Ok(None);
-    };
-    let (cte_table_name, cte_alias) = extract_table_name_and_alias(factor, binder.schema_name(), "CTE")?;
-    let (cte_tid, cte_schema, cte_kind) = binder.resolve(cat, &cte_table_name)?;
-    // Positional identity projection: a *bare* `*`, or one identifier per source
-    // column in order. A qualified identifier (`SELECT t.a FROM t`) is the same
-    // pass-through, but only under the source's own alias — the compiled path
-    // rejects any other qualifier, so this fast path must too.
-    let proj_is_identity = is_bare_wildcard_projection(&cte_select.projection)
-        || (cte_select.projection.len() == cte_schema.columns.len()
-            && cte_select.projection.iter().enumerate().all(|(i, item)| {
-                let want = &cte_schema.columns[i].name;
-                // Not `projection_item_expr`: that also yields an aliased item's
-                // expression, so `SELECT a AS b` would take the fast path and the
-                // rename would be dropped.
-                match item {
-                    SelectItem::UnnamedExpr(e) => match col_ref_parts(e) {
-                        Some((None, name)) => name.eq_ignore_ascii_case(want),
-                        Some((Some(qual), name)) => {
-                            qual.eq_ignore_ascii_case(&cte_alias) && name.eq_ignore_ascii_case(want)
-                        }
-                        None => false,
-                    },
-                    _ => false,
-                }
-            }));
-    if !proj_is_identity {
-        return Ok(None);
-    }
-    // Apply CTE column aliases (`WITH cte(a, b) AS ...`).
-    let cte_schema = if !column_aliases.is_empty() {
-        let mut s = (*cte_schema).clone();
-        apply_positional_aliases(
-            column_aliases.iter().map(|a| &a.name),
-            s.columns.iter_mut().collect(),
-            "CTE",
-        )?;
-        Arc::new(s)
-    } else {
-        cte_schema
-    };
-    Ok(Some((cte_tid, cte_schema, cte_kind)))
 }
 
 #[cfg(test)]
