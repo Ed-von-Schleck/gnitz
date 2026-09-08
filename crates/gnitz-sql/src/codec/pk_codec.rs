@@ -195,10 +195,10 @@ pub(crate) enum KeyLitError {
 pub(crate) fn bound_key_literal(lit: BoundLit<'_>, tc: TypeCode) -> Result<u128, KeyLitError> {
     match lit {
         BoundLit::Str(s) if tc == TypeCode::UUID => parse_uuid_str(s).map_err(|_| KeyLitError::NotOfType),
-        BoundLit::Str(s) if tc.is_temporal() => crate::types::temporal_literal(tc, s)
-            .ok()
-            .and_then(|v| pack_pk_value(tc, v as i128))
-            .ok_or(KeyLitError::NotOfType),
+        BoundLit::Str(s) if tc.is_temporal() => {
+            let v = crate::types::temporal_literal(tc, s).map_err(|_| KeyLitError::NotOfType)?;
+            Ok(pack_pk_value(tc, v as i128).expect("temporal_literal's value always fits tc's storage width"))
+        }
         BoundLit::Str(_) => Err(KeyLitError::NotNumeric),
         BoundLit::Num(n) => pack_num(tc, n).ok_or_else(|| {
             // A PK column's type is PK-eligible: an integer scalar at some
