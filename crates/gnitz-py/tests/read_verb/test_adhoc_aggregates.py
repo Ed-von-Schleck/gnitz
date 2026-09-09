@@ -19,7 +19,7 @@ import random
 
 import gnitz
 import pytest
-from _caps import first_rejected
+from _caps import conjunct_ladder, first_rejected
 from _read import access, bag, rows
 from _uid import uid as _uid
 
@@ -476,6 +476,9 @@ def test_a_grouped_guard_fires_on_both_paths(client, schema_name, query):
     ("SELECT cat, MIN(v) AS m FROM hg GROUP BY cat HAVING MIN(v) IN (1, 7)", "cat", [1, 2]),
     ("SELECT cat, COUNT(*) AS c FROM hg GROUP BY cat "
      "HAVING CASE WHEN COUNT(*) > 1 THEN 1 ELSE 0 END = 1", "cat", [1, 2, 3]),
+    # A scalar function wrapping the aggregate: consumed above the leaf on both
+    # paths, and its aggregate resolves through the leaf on the recursion.
+    ("SELECT cat, SUM(nn) AS t FROM hg GROUP BY cat HAVING ABS(SUM(nn)) > 0", "cat", [1, 2, 3]),
     # Constant predicates: NULL is UNKNOWN and never truthy, a statically-true
     # one folds away, and a bare float evaluating to -0.0 is KEPT because the
     # engine filter bit-tests rather than comparing to 0.0.
@@ -514,13 +517,16 @@ def test_the_register_cap_is_located_not_pinned(client, hg):
     over distinct odd `k` is true exactly for `cat = 1`. Only the direct path is
     asserted: CREATE VIEW ships the same over-cap program to the engine, which
     rejects it, but the DDL still succeeds and the view is silently empty."""
-    conj = lambda k: " AND ".join(f"cat * {2 * i + 1} < {2 * i + 2}" for i in range(k))
-    having = lambda k: f"SELECT cat FROM hg GROUP BY cat HAVING {conj(k)}"
+    def having(k):
+        return f"SELECT cat FROM hg GROUP BY cat HAVING {conjunct_ladder('cat', k)}"
+
     k = first_rejected(lambda k: rows(client, hg, having(k)), range(1, 64))
     assert _keys(_parity(client, hg, having(k - 1)), "cat") == [1]
 
-    having_in = lambda n: (f"SELECT s FROM hg GROUP BY s HAVING s IN "
-                           f"({', '.join(repr(f'v{i}') for i in range(n))})")
+    def having_in(n):
+        items = ", ".join(repr(f"v{i}") for i in range(n))
+        return f"SELECT s FROM hg GROUP BY s HAVING s IN ({items})"
+
     n = first_rejected(lambda n: rows(client, hg, having_in(n)), range(1, 64))
     assert _parity(client, hg, having_in(n - 1)) == []
 

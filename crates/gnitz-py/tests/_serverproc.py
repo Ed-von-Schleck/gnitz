@@ -28,6 +28,10 @@ import signal
 import subprocess
 import time
 
+import pytest
+
+from _paths import REPO_ROOT
+
 # Boot-to-socket is ~36 ms, so a 50 ms poll spends most of a spawn asleep past
 # the event it is waiting for. Every loop using this is bounded by its own
 # deadline, so the interval buys nothing but granularity.
@@ -36,10 +40,6 @@ _READY_POLL_S = 0.002
 # What the server prints once its listeners are up — the last line of boot.
 # See `ServerProc.start` for why the socket file is not the readiness signal.
 _READY_MARKER = "GnitzDB ready"
-
-import pytest
-
-from _paths import REPO_ROOT
 
 _PR_SET_PDEATHSIG = 1
 _libc = ctypes.CDLL("libc.so.6", use_errno=True)

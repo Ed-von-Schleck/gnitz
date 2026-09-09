@@ -159,123 +159,17 @@ class TestNarrowTypeViewOps:
 
 
 # ---------------------------------------------------------------------------
-# TestSqlThreeValuedLogic
+# TestNullLogicAcrossNarrowTypes
 # ---------------------------------------------------------------------------
 
-class TestSqlThreeValuedLogic:
-    """Validates SQL 3-valued logic for OR and AND in view WHERE clauses.
+class TestNullLogicAcrossNarrowTypes:
+    """3VL holds for a nullable payload column of every narrow width.
 
-    Before the fix, ``BoolBinary`` propagated NULL whenever either
-    operand was NULL, violating:
-      - NULL OR  TRUE  = TRUE   (must include row)
-      - TRUE  OR NULL  = TRUE   (must include row)
-      - NULL AND FALSE = FALSE  (excluded either way, but correct reason)
-    The most observable gap: rows that should appear in a view (NULL OR TRUE)
-    were silently dropped.
+    The connectives themselves are one per-row program whatever the column type,
+    and they are stated once in `scalar_expression/test_three_valued_logic.py`.
+    What varies here is the *type*: each width has its own load and its own null
+    bit, and a width-specific path could obey 3VL for BIGINT and not for TINYINT.
     """
-
-    def _make_or_view(self, client, sn):
-        # Caller owns schema creation + cleanup; creating it here too would
-        # trip the CREATE SCHEMA duplicate precheck.
-        client.execute_sql(
-            "CREATE TABLE t "
-            "(pk BIGINT UNSIGNED NOT NULL PRIMARY KEY, a BIGINT NULL, b BIGINT NULL)",
-            schema_name=sn,
-        )
-        client.execute_sql(
-            "CREATE VIEW vw AS SELECT * FROM t WHERE a > 0 OR b > 0",
-            schema_name=sn,
-        )
-        vid, _ = client.resolve_table(sn, "vw")
-        return vid
-
-    def test_null_or_true_includes_row(self, client):
-        """NULL OR TRUE = TRUE: row with a=NULL, b=5 must appear in the view."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            vid = self._make_or_view(client, sn)
-            # pk=1: a=NULL, b=5  → NULL  OR TRUE  = TRUE  → included
-            # pk=2: a=NULL, b=-1 → NULL  OR FALSE = NULL  → excluded
-            # pk=3: a=1, b=1     → TRUE  OR TRUE  = TRUE  → included (control)
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, NULL, 5), (2, NULL, -1), (3, 1, 1)",
-                schema_name=sn,
-            )
-            rows = _scan_map(client, vid)
-            assert 1 in rows, "pk=1 (a=NULL, b=5): NULL OR TRUE must = TRUE → row included"
-            assert 2 not in rows, "pk=2 (a=NULL, b=-1): NULL OR FALSE must = NULL → row excluded"
-            assert 3 in rows, "pk=3 (a=1, b=1): TRUE OR TRUE control"
-        finally:
-            _cleanup(client, sn, "vw", "t")
-
-    def test_true_or_null_includes_row(self, client):
-        """TRUE OR NULL = TRUE: row with a=1, b=NULL must appear in the view."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            vid = self._make_or_view(client, sn)
-            # pk=1: a=1,  b=NULL → TRUE  OR NULL  = TRUE  → included
-            # pk=2: a=-1, b=NULL → FALSE OR NULL  = NULL  → excluded
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 1, NULL), (2, -1, NULL)",
-                schema_name=sn,
-            )
-            rows = _scan_map(client, vid)
-            assert 1 in rows, "pk=1 (a=1, b=NULL): TRUE OR NULL must = TRUE → row included"
-            assert 2 not in rows, "pk=2 (a=-1, b=NULL): FALSE OR NULL must = NULL → row excluded"
-        finally:
-            _cleanup(client, sn, "vw", "t")
-
-    def test_all_null_excluded(self, client):
-        """NULL OR NULL = NULL: row with both columns NULL must not appear."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            vid = self._make_or_view(client, sn)
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, NULL, NULL), (2, 1, 1)",
-                schema_name=sn,
-            )
-            rows = _scan_map(client, vid)
-            assert 1 not in rows, "pk=1 (a=NULL, b=NULL): NULL OR NULL must = NULL → excluded"
-            assert 2 in rows, "pk=2 (a=1, b=1): TRUE OR TRUE control"
-        finally:
-            _cleanup(client, sn, "vw", "t")
-
-    def test_and_all_combinations(self, client):
-        """AND 3VL: only TRUE AND TRUE includes a row; all other combos exclude."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t "
-                "(pk BIGINT UNSIGNED NOT NULL PRIMARY KEY, a BIGINT NULL, b BIGINT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW vw AS SELECT * FROM t WHERE a > 0 AND b > 0",
-                schema_name=sn,
-            )
-            vid, _ = client.resolve_table(sn, "vw")
-            # pk=1: TRUE  AND TRUE  = TRUE  → included
-            # pk=2: NULL  AND TRUE  = NULL  → excluded
-            # pk=3: FALSE AND NULL  = FALSE → excluded (key 3VL case: not NULL)
-            # pk=4: NULL  AND NULL  = NULL  → excluded
-            # pk=5: TRUE  AND NULL  = NULL  → excluded
-            # pk=6: FALSE AND FALSE = FALSE → excluded
-            client.execute_sql(
-                "INSERT INTO t VALUES "
-                "(1, 1, 1), (2, NULL, 1), (3, -1, NULL), "
-                "(4, NULL, NULL), (5, 1, NULL), (6, -1, -1)",
-                schema_name=sn,
-            )
-            rows = _scan_map(client, vid)
-            assert set(rows.keys()) == {1}, (
-                f"only pk=1 (TRUE AND TRUE) must pass; got {set(rows.keys())}"
-            )
-        finally:
-            _cleanup(client, sn, "vw", "t")
 
     @pytest.mark.parametrize("col_type,lo,mid,hi", ALL_NARROW)
     def test_null_or_true_narrow_nullable(self, client, col_type, lo, mid, hi):

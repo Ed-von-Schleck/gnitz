@@ -155,6 +155,18 @@ _UNHONOURED = [
      "column definition: DEFAULT is not supported"),
     ("CREATE TABLE f (pk BIGINT PRIMARY KEY, c BIGINT REFERENCES p(k) ON DELETE CASCADE)",
      "FOREIGN KEY ON DELETE/ON UPDATE action"),
+    # A wildcard modifier that would answer a different query than the one
+    # written: gnitz honours the column-dropping and renaming ones (EXCEPT,
+    # EXCLUDE, RENAME) but neither a computed substitution nor a name-pattern
+    # filter, so expanding `*` in their place has to be refused rather than
+    # silently ignored. Every surface that expands a wildcard shares one guard.
+    ("SELECT * REPLACE (val + 1 AS val) FROM t", "SELECT \\* REPLACE is not supported"),
+    ("SELECT * ILIKE 'v%' FROM t", "SELECT \\* ILIKE is not supported"),
+    ("CREATE VIEW vrep AS SELECT * REPLACE (val + 1 AS val) FROM t",
+     "SELECT \\* REPLACE is not supported"),
+    ("CREATE VIEW vilk AS SELECT * ILIKE 'v%' FROM t", "SELECT \\* ILIKE is not supported"),
+    ("INSERT INTO t VALUES (200, 300) RETURNING * REPLACE (val + 1 AS val)",
+     "SELECT \\* REPLACE is not supported"),
 ]
 
 

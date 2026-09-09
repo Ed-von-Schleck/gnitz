@@ -209,7 +209,9 @@ def test_residual_conjuncts_bind_and_filter(client, schema_name):
         "x BIGINT NOT NULL, y BIGINT NOT NULL)", schema_name=sn)
     _insert(client, sn, "t", [(1, 10, 5), (2, 20, 50), (3, 30, 1)])
     client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
-    q = lambda s: bag(rows(client, sn, f"SELECT pk FROM t WHERE {s}"))
+    def q(s):
+        return bag(rows(client, sn, f"SELECT pk FROM t WHERE {s}"))
+
     assert q("x > 5 AND y = 5") == {(1,): 1}
     assert q("x > 5 AND y BETWEEN 1 AND 9") == {(1,): 1, (3,): 1}
     assert q("x > 5 AND y NOT BETWEEN 1 AND 9") == {(2,): 1}
@@ -237,7 +239,9 @@ def test_nonunique_collect_matches_the_scan_reference(client, schema_name):
     tid, _ = client.resolve_table(sn, "t")
     ref = bag(client.scan(tid))
     assert len(ref) == 200
-    q = lambda s: bag(rows(client, sn, f"SELECT * FROM t WHERE {s}"))
+    def q(s):
+        return bag(rows(client, sn, f"SELECT * FROM t WHERE {s}"))
+
     assert q("x = 7") == {r: w for r, w in ref.items() if r[1] == 7}
     assert q("x > 15") == {r: w for r, w in ref.items() if r[1] > 15}
 

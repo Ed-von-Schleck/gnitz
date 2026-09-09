@@ -21,21 +21,8 @@ import os
 
 import pytest
 import gnitz
+from _caps import conjunct_ladder, first_rejected, names_a_cap
 from _uid import uid as _uid
-
-
-def _cat_is_one_ladder(n: int) -> str:
-    """`n` conjuncts, each true exactly for `cat = 1` and none sharing an
-    instruction the builder could fold: `cat * k < k + 1` over distinct odd `k`."""
-    return " AND ".join(f"cat * {2 * i + 1} < {2 * i + 2}" for i in range(n))
-
-
-def _cap_error(exc) -> bool:
-    """The rejection names the register limit or the column limit — the two caps
-    a view definition can cross. A bare guard name, or a Rust enum leaking
-    through as `TooManyRegs(66)`, does not tell the author what to change."""
-    msg = str(exc)
-    return "registers" in msg or "MAX_COLUMNS" in msg
 
 
 @pytest.fixture
@@ -81,7 +68,7 @@ def caps(client, schema_name):
 _SWEEPS = [
     # N equality conjuncts in HAVING; the answer is the single cat=1 group.
     ("having_conjunct", range(10, 16),
-     lambda n: "SELECT cat FROM hg GROUP BY cat HAVING " + _cat_is_one_ladder(n), 1),
+     lambda n: "SELECT cat FROM hg GROUP BY cat HAVING " + conjunct_ladder("cat", n), 1),
     # An N-item string IN inside a view's WHERE.
     ("in_list", range(30, 37),
      lambda n: "SELECT pk, s FROM ts WHERE s IN (" + ", ".join(f"'a{i}'" for i in range(n)) + ")", 5),
@@ -122,7 +109,7 @@ def test_a_view_never_compiles_to_silently_empty(client, caps, ns, sql_for, expe
         try:
             client.execute_sql(f"CREATE VIEW {name} AS {sql_for(n)}", schema_name=caps)
         except gnitz.GnitzError as e:
-            assert _cap_error(e), f"n={n}: rejection must name a limit, got: {e}"
+            assert names_a_cap(e), f"n={n}: rejection must name a limit, got: {e}"
             with pytest.raises(gnitz.GnitzError):
                 client.resolve_table(caps, name)
             outcomes.add("error")
@@ -149,12 +136,12 @@ def test_uncompilable_hidden_segment_leaves_nothing(client, caps):
     """A chain whose *hidden* segment is the uncompilable one. The bundle is
     atomic, so neither the hidden segment nor the named view survives — and the
     name is free afterwards, which a leaked segment would deny."""
-    pred = _cat_is_one_ladder(20)
+    pred = conjunct_ladder("cat", 20)
     with pytest.raises(gnitz.GnitzError) as e:
         client.execute_sql(
             f"CREATE VIEW vh AS WITH g AS (SELECT cat FROM hg GROUP BY cat HAVING {pred}) "
             "SELECT cat FROM g", schema_name=caps)
-    assert _cap_error(e.value), f"got: {e.value}"
+    assert names_a_cap(e.value), f"got: {e.value}"
     with pytest.raises(gnitz.GnitzError):
         client.resolve_table(caps, "vh")
 
@@ -173,9 +160,9 @@ def test_alter_view_rejection_keeps_the_old_view(client, caps):
 
     with pytest.raises(gnitz.GnitzError) as e:
         client.execute_sql(
-            f"ALTER VIEW va AS SELECT cat FROM hg GROUP BY cat HAVING {_cat_is_one_ladder(20)}",
+            f"ALTER VIEW va AS SELECT cat FROM hg GROUP BY cat HAVING {conjunct_ladder("cat", 20)}",
             schema_name=caps)
-    assert _cap_error(e.value), f"got: {e.value}"
+    assert names_a_cap(e.value), f"got: {e.value}"
 
     # Untouched: same id, same rows.
     assert client.resolve_table(caps, "va")[0] == vid
@@ -203,7 +190,7 @@ def test_rejected_ddl_leaves_no_directory(own_server):
         schema_dir = os.path.join(own_server.data_dir, "resid")
         before = sorted(os.listdir(schema_dir))
 
-        pred = _cat_is_one_ladder(20)
+        pred = conjunct_ladder("cat", 20)
         for i in range(3):
             for stmt in (f"CREATE VIEW bad{i} AS SELECT cat FROM hg GROUP BY cat HAVING {pred}",
                          f"ALTER VIEW keep AS SELECT cat FROM hg GROUP BY cat HAVING {pred}"):
@@ -214,3 +201,23 @@ def test_rejected_ddl_leaves_no_directory(own_server):
             "rejected CREATE/ALTER VIEW must leave no directory behind")
         # And the view they tried to replace still works.
         assert len(list(conn.scan(conn.resolve_table("resid", "keep")[0]))) == 1
+
+
+def test_a_dml_residual_crosses_the_same_cap_and_says_so(client, caps):
+    """A residual is compiled by the client and shipped as a blob, not built
+    into a circuit, so it is a second path to the one cap. Both shapes are
+    located rather than pinned: every size below the boundary is served, and the
+    first one past it names the limit."""
+    sn = caps
+
+    def update(n):
+        res = client.execute_sql(
+            f"UPDATE hg SET cat = 1 WHERE {conjunct_ladder('cat', n)}", schema_name=sn)
+        assert res[0]["count"] == 2, f"n={n}: both cat=1 rows satisfy every conjunct"
+
+    def delete_in(n):
+        items = ", ".join(f"'x{i}'" for i in range(n))
+        client.execute_sql(f"DELETE FROM ts WHERE s IN ({items})", schema_name=sn)
+
+    first_rejected(update, range(12, 20))
+    first_rejected(delete_in, range(28, 40))

@@ -157,3 +157,29 @@ def test_duplicate_on_a_replicated_table_is_rejected(client, schema_name):
 
     tid, _ = client.resolve_table(schema_name, "r")
     assert sorted((r.pk, r.val) for r in client.scan(tid)) == [(1, 100)]
+
+
+def test_do_update_over_a_string_column_and_a_rejected_null(client, schema_name):
+    """`SET s = EXCLUDED.s` takes the string classifier arm, which the integer
+    tables above never reach. A NULL under a NOT NULL column has to be refused
+    before the merge reads it: the merged batch is the only thing this plan
+    pushes, so an unvalidated NULL would be read back as a real 0 and committed
+    silently."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE s (pk BIGINT NOT NULL PRIMARY KEY, txt TEXT NOT NULL, "
+        "v BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql("INSERT INTO s VALUES (1, 'old', 10)", schema_name=sn)
+
+    client.execute_sql(
+        "INSERT INTO s VALUES (1, 'new', 11), (2, 'fresh', 22) "
+        "ON CONFLICT (pk) DO UPDATE SET txt = EXCLUDED.txt", schema_name=sn)
+    tid = client.resolve_table(sn, "s")[0]
+    assert sorted((r.pk, r.txt) for r in client.scan(tid)) == [(1, "new"), (2, "fresh")]
+
+    with pytest.raises(gnitz.GnitzError):
+        client.execute_sql(
+            "INSERT INTO s VALUES (1, NULL, 0) ON CONFLICT (pk) DO UPDATE SET txt = EXCLUDED.txt",
+            schema_name=sn)
+    assert sorted((r.pk, r.txt) for r in client.scan(tid)) == [(1, "new"), (2, "fresh")], \
+        "no silent write survived the refusal"

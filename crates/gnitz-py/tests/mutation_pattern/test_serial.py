@@ -137,6 +137,13 @@ def test_returning_projections(client, schema_name, serial_t):
                              schema_name=schema_name)
     assert sorted((r.id, r.name) for r in _returned_rows(res)) == [(4, "d"), (5, "e")]
 
+    # A wildcard modifier reduces the returned column set exactly as it reduces
+    # a SELECT's: RETURNING expands through the same helper.
+    res = client.execute_sql("INSERT INTO t (name) VALUES ('f') RETURNING * EXCEPT (name)",
+                             schema_name=schema_name)
+    row = _returned_rows(res)[0]
+    assert row.id == 6 and not hasattr(row, "name")
+
 
 def test_returning_rejections(client, schema_name, serial_t):
     """An expression, a non-PK projection, an UPDATE, and a combination with ON

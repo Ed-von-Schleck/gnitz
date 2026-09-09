@@ -792,6 +792,8 @@ def test_a_narrow_min_max_is_read_at_its_own_width_by_having_and_the_projection(
     ("NOT (COUNT(*) = 1)", {10, 30}),
     ("SUM(amount) * 2 > 10", {10, 30}),
     ("SUM(amount) BETWEEN 5 AND 20", {10}),
+    ("CASE WHEN COUNT(*) > 1 THEN 1 ELSE 0 END = 1", {10, 30}),
+    ("COUNT(*) IN (1, 3)", {20, 30}),
 ])
 def test_a_having_predicate_binds_the_whole_expression_grammar(
         client, schema_name, pred, expected):
@@ -826,6 +828,12 @@ def test_a_having_predicate_binds_the_whole_expression_grammar(
     ("(k + SUM(v)) IS NULL", {20}, {10, 20}),
     ("COUNT(*) IS NOT NULL", {10, 20, 30, 40}, {10, 20, 30, 40}),
     ("COUNT(*) IS NULL", set(), set()),
+    # A scalar wrapper over the aggregate: the value and its null test come from
+    # one bind, so a NULL sum is distinct from every value and coalesces.
+    ("SUM(v) IS DISTINCT FROM 5", {20, 30, 40}, {10, 20, 30, 40}),
+    ("COALESCE(SUM(v), -1) = -1", {20}, {10, 20}),
+    ("ABS(SUM(v)) > 3", {10}, set()),
+    ("SUM(v) IN (0, 5)", {10, 30, 40}, {30, 40}),
 ])
 def test_a_null_aggregate_in_having_is_unknown_not_zero(
         client, schema_name, having, before, after):

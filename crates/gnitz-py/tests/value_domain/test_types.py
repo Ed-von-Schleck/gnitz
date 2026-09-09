@@ -1184,7 +1184,7 @@ class TestUUID:
             client.execute_sql(
                 "CREATE TABLE child ("
                 "  cid BIGINT UNSIGNED NOT NULL PRIMARY KEY,"
-                f"  uid UUID NOT NULL REFERENCES parent(id)"
+                "  uid UUID NOT NULL REFERENCES parent(id)"
                 ")",
                 schema_name=sn,
             )

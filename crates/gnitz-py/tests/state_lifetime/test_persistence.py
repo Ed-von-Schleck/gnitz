@@ -1858,8 +1858,8 @@ def _assert_reslice_ran(srv):
         with open(os.path.join(srv.data_dir, f"worker_{w}.log")) as f:
             texts.append(f.read())
     assert any("re-sliced from" in t for t in texts), (
-        f"restart at a changed worker count must replay every written slot; "
-        f"worker logs were:\n" + "\n".join(texts)
+        "restart at a changed worker count must replay every written slot; "
+        "worker logs were:\n" + "\n".join(texts)
     )
 
 

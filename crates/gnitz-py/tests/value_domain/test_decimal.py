@@ -139,10 +139,10 @@ class TestDecimalColumns:
             # rule, asserted per node in `decimal_arithmetic_and_blend_typing`;
             # here one column of each declared class is what a server can add.
             scales = {c.name: (c.type_code, c.scale) for c in vs.columns}
-            D, F, I = gnitz.TypeCode.DECIMAL, gnitz.TypeCode.F64, gnitz.TypeCode.I64
-            assert scales["total"] == (D, 5)
-            assert scales["quarter"] == (F, 0)
-            assert scales["whole"] == (I, 0)
+            DEC, F64, I64 = gnitz.TypeCode.DECIMAL, gnitz.TypeCode.F64, gnitz.TypeCode.I64
+            assert scales["total"] == (DEC, 5)
+            assert scales["quarter"] == (F64, 0)
+            assert scales["whole"] == (I64, 0)
             rows = {r["id"]: r for r in client.scan(vid).mappings()}
             r1, r2, r3, r4 = rows[1], rows[2], rows[3], rows[4]
             assert r1["total"] == Decimal("37.50000") and r2["total"] == Decimal("0.35000")
@@ -212,7 +212,8 @@ class TestDecimalColumns:
         client.create_schema(sn)
         try:
             _seed(client, sn)
-            q = lambda sql: sorted(r.id for r in _rows(client, sn, sql))
+            def q(sql):
+                return sorted(r.id for r in _rows(client, sn, sql))
             assert q("SELECT id FROM t WHERE price > 9.99") == [1]
             assert q("SELECT id FROM t WHERE price = 12.5") == [1]
             assert q("SELECT id FROM t WHERE price = 12.501") == []
