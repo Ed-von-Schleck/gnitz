@@ -8,6 +8,7 @@ Ports compile_graph_test.py::test_persistence_and_recovery.
 import os
 import pytest
 import gnitz
+from _oracle import assert_view_matches
 from _serverproc import NUM_WORKERS as _NUM_WORKERS, is_debug_build
 
 
@@ -2143,4 +2144,110 @@ def test_a_replaced_view_survives_restart(own_server):
         vid, _ = conn.resolve_table(sn, name)
         rows = {r["pk"]: r for r in conn.scan(vid)}
         assert rows[2]["b"] == 200, f"{name}: not maintained after restart, got {rows}"
+    conn.close()
+
+
+def _alter_add_base(conn, sn, rows):
+    conn.create_schema(sn)
+    conn.execute_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+        schema_name=sn)
+    conn.execute_sql(
+        "INSERT INTO t VALUES " + ", ".join(f"({k}, {k * 10})" for k in rows),
+        schema_name=sn)
+
+
+def _wide(conn, sn):
+    """`{id: (a, c)}` over the widened table."""
+    got = conn.execute_sql("SELECT * FROM t", schema_name=sn)[0]["rows"]
+    return {r["id"]: (r["a"], r["c"]) for r in got}
+
+
+def test_add_column_then_crash_replays_the_pre_alter_sal_tail(own_server):
+    """The ALTER and the pushes it postdates are all in the un-checkpointed SAL
+    tail. On recovery the master applies the catalog tail pre-fork, so the table
+    is already at its final width when the workers replay pushes embedded at the
+    *old* width — each of which must be widened with a NULL tail exactly once."""
+    sn = "aadd_crash"
+    own_server.start()
+    conn = gnitz.connect(own_server.sock_path)
+    _alter_add_base(conn, sn, range(1, 11))
+    conn.execute_sql("ALTER TABLE t ADD COLUMN c BIGINT", schema_name=sn)
+    conn.execute_sql("INSERT INTO t VALUES (11, 110, 1100)", schema_name=sn)
+    before = _wide(conn, sn)
+    assert before[1] == (10, None) and before[11] == (110, 1100)
+    conn.close()
+
+    # SIGKILL: no checkpoint, so everything is recovered from the SAL.
+    own_server.stop()
+    own_server.start()
+
+    conn = gnitz.connect(own_server.sock_path)
+    assert _wide(conn, sn) == before
+    conn.close()
+
+
+def test_add_column_over_shards_written_at_the_old_arity(own_server):
+    """A graceful stop checkpoints, so the pre-ALTER rows land in shards written
+    at the *old* arity. The next boot opens them under the wider schema and pads
+    the appended column to NULL; rewriting them (compaction / a later flush)
+    materializes it at full width and the pad decays.
+
+    Both stops go through `restart(graceful=True)`, which asserts the master
+    exited 0 — a failed shutdown checkpoint would leave the rows in the SAL and
+    the replay path, not the pad path, would answer every assertion below.
+    """
+    sn = "aadd_ckpt"
+    own_server.start()
+    conn = gnitz.connect(own_server.sock_path)
+    _alter_add_base(conn, sn, range(1, 21))
+    conn.close()
+
+    # Checkpoint the narrow rows to disk, then ALTER against those shards.
+    own_server.restart(graceful=True)
+
+    conn = gnitz.connect(own_server.sock_path)
+    conn.execute_sql("ALTER TABLE t ADD COLUMN c BIGINT", schema_name=sn)
+    assert _wide(conn, sn) == {k: (k * 10, None) for k in range(1, 21)}
+
+    # Write across the padded shards: a new row, and an UPDATE of a padded one
+    # (whose retraction must match the stored NULL, not a non-null zero).
+    conn.execute_sql("INSERT INTO t VALUES (21, 210, 2100)", schema_name=sn)
+    conn.execute_sql("UPDATE t SET c = 7 WHERE id = 5", schema_name=sn)
+    conn.close()
+
+    # Checkpoint again — this rewrites the padded shards at the new width — and
+    # restart, so the reads below come off full-width files.
+    own_server.restart(graceful=True)
+
+    conn = gnitz.connect(own_server.sock_path)
+    want = {k: (k * 10, None) for k in range(1, 21)}
+    want[5] = (50, 7)
+    want[21] = (210, 2100)
+    assert _wide(conn, sn) == want
+    conn.close()
+
+
+def test_a_view_created_over_committed_data_survives_a_checkpoint_window(own_server):
+    """Enough rows to cross a low SAL checkpoint threshold (draining
+    pending_deltas), then a CREATE of an exchange GROUP BY view. The committed
+    store is the only driver — a flushed-snapshot under-count or a
+    checkpoint-strands-exchange regression both surface as a wrong result."""
+    own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": "65536"})
+    conn = gnitz.connect(own_server.sock_path)
+    conn.create_schema("ck")
+    conn.execute_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, n BIGINT NOT NULL)",
+        schema_name="ck")
+    n, chunk = 4000, 1000
+    for base in range(0, n, chunk):
+        conn.execute_sql(
+            "INSERT INTO t VALUES " + ", ".join(
+                f"({i}, {i % 10}, {i})" for i in range(base, min(base + chunk, n))),
+            schema_name="ck")
+    conn.execute_sql("CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM t GROUP BY g",
+                     schema_name="ck")
+
+    vid, _ = conn.resolve_table("ck", "v")
+    assert_view_matches(conn, vid, ["g", "c"], {(g, n // 10): 1 for g in range(10)})
     conn.close()

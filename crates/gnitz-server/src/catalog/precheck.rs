@@ -467,12 +467,22 @@ impl CatalogEngine {
     /// descriptor and its operator traces hold re-keyed base rows at the old
     /// shape.
     fn reject_if_dependent_views(&mut self, owner_id: i64, op: &str) -> Result<(), String> {
-        if self.dag.has_dependents(&self.registry, owner_id) {
-            return Err(format!(
-                "cannot {op} on table {owner_id}: it has dependent views (drop them first)"
-            ));
-        }
-        Ok(())
+        // Name the table and one blocking view: the recovery is to drop that
+        // view, which a bare id leaves the author to go and look up.
+        let blockers = self.dag.get_dep_map(&self.registry).get(&owner_id).cloned();
+        let Some(blockers) = blockers else { return Ok(()) };
+        let name = |id: i64| {
+            self.caches
+                .entity_by_id
+                .get(&id)
+                .map_or_else(|| id.to_string(), |(sn, en)| format!("{sn}.{en}"))
+        };
+        let named: Vec<String> = blockers.iter().map(|id| name(*id)).collect();
+        Err(format!(
+            "cannot {op} on '{}': it has dependent views ({}) — drop them first",
+            name(owner_id),
+            named.join(", ")
+        ))
     }
 
     /// `owner_id`'s column records as this batch's `+1` row for `col_idx` leaves

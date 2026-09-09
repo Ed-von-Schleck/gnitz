@@ -10,6 +10,8 @@ before or after the DDL window — never interleaved, never wedged.
 import threading
 
 import gnitz
+import pytest
+from _oracle import assert_view_matches
 from _serverproc import HANG_TIMEOUT, NEEDS_MULTI
 
 pytestmark = NEEDS_MULTI
@@ -91,3 +93,63 @@ def test_create_view_under_concurrent_adhoc_reads(client, server, schema_name):
     view = _zset(client.execute_sql("SELECT * FROM mid", schema_name=schema_name))
     assert view == _zset(client.execute_sql(_GROUPS, schema_name=schema_name))
     assert set(view.values()) == {1}, f"view holds a non-unit weight: {view}"
+
+
+@pytest.mark.parametrize("body, cols, want", [
+    ("SELECT a.id AS aid, b.bv AS bv FROM a JOIN b ON a.k = b.id", ("aid", "bv"),
+     lambda n: {(i, (i % 5) * 100): 1 for i in range(n)}),
+    ("SELECT a.id AS aid, a.av + 1 AS bv FROM a", ("aid", "bv"),
+     lambda n: {(i, i * 10 + 1): 1 for i in range(n)}),
+], ids=["exchange", "linear"])
+def test_a_view_created_over_a_table_being_written_holds_every_row(
+        client, schema_name, server, body, cols, want):
+    """Rows land in the sources from a second connection WHILE the CREATE VIEW
+    runs. The finished view must equal brute force over the whole base — the
+    snapshot rows plus every post-create delta — at weight 1 each.
+
+    The write lock serialises the interleave, so the result must be correct
+    whichever order the two land in; both an exchange body and a partition-local
+    one are run, because only the first pays a shuffle for its backfill.
+    """
+    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
+        "av BIGINT NOT NULL)", schema_name=schema_name)
+    client.execute_sql(
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, bv BIGINT NOT NULL)",
+        schema_name=schema_name)
+    client.execute_sql(
+        "INSERT INTO b VALUES " + ", ".join(f"({j}, {j * 100})" for j in range(5)),
+        schema_name=schema_name)
+    # Snapshot rows present before the CREATE.
+    client.execute_sql(
+        "INSERT INTO a VALUES " + ", ".join(f"({i}, {i % 5}, {i * 10})" for i in range(30)),
+        schema_name=schema_name)
+
+    errors = []
+    writing = threading.Event()
+
+    def inserter():
+        try:
+            with gnitz.connect(server) as c2:
+                for i in range(30, 60):
+                    c2.execute_sql(
+                        f"INSERT INTO a VALUES ({i}, {i % 5}, {i * 10})",
+                        schema_name=schema_name)
+                    writing.set()
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+            writing.set()
+
+    t = threading.Thread(target=inserter)
+    t.start()
+    try:
+        # The DDL goes in once the writer is provably in its loop.
+        assert writing.wait(timeout=HANG_TIMEOUT), "the write thread never issued a write"
+        client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=schema_name)
+    finally:
+        t.join(timeout=HANG_TIMEOUT)
+    assert not t.is_alive(), "the inserter hung — possible wedge"
+    assert not errors, f"concurrent inserter failed: {errors}"
+
+    assert_view_matches(client, client.resolve_table(schema_name, "v")[0],
+                        list(cols), want(60))

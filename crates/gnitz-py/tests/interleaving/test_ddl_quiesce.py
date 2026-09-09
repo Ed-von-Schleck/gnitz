@@ -87,3 +87,25 @@ def test_create_table_then_transactional_insert(relay_hold_server):
 
     assert _scalar(c, sn, "SELECT COUNT(*) FROM t2") == 64
     _assert_view_intact(c, sn)
+
+
+def test_create_view_over_a_parked_source(relay_hold_server):
+    """CREATE VIEW while an exchange tick is already in flight: the DDL's own
+    quiesce has to drain the parked epoch before it registers a second view over
+    the same source.
+
+    A view that read the source mid-epoch would double-count the parked rows or
+    miss them, so both views are asserted — the one that was already maintaining
+    across the park, and the one built during it.
+    """
+    c = relay_hold_server
+    sn = "s" + _uid()
+    c.create_schema(sn)
+    _park_workers(c, sn)
+
+    c.execute_sql("CREATE VIEW v2 AS SELECT a, COUNT(*) AS n FROM src GROUP BY a",
+                  schema_name=sn)
+
+    _assert_view_intact(c, sn)
+    assert _scalar(c, sn, "SELECT COUNT(*) FROM v2") == PARKED_GROUPS
+    assert _scalar(c, sn, "SELECT SUM(n) FROM v2") == PARKED_ROWS

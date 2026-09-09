@@ -4,7 +4,7 @@ from gnitz._native import (
     ColumnDef, Schema, ZSetBatch, GnitzClient, DeltaReply, delta_reply_schema,
     PollResult,
     SCHEMA_TAB, TABLE_TAB, VIEW_TAB, COL_TAB, IDX_TAB, CIRCUIT_NODES_TAB,
-    FIRST_USER_TABLE_ID,
+    FIRST_USER_TABLE_ID, MAX_COLUMNS,
     unpack_pk_cols, debug_assertions,
 )
 from gnitz._types import Opcode, TypeCode

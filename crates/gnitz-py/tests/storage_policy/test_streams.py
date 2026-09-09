@@ -145,8 +145,7 @@ def test_a_stream_fed_view_is_empty_after_restart(own_server):
     assert len(_totals(conn, sn, "hot")) == 3
     conn.close()
 
-    own_server.stop_graceful()
-    own_server.start()
+    own_server.restart(graceful=True)
 
     conn = gnitz.connect(own_server.sock_path)
     assert _totals(conn, sn, "hot") == [], "a stream-fed view must not resume"
@@ -186,8 +185,7 @@ def test_a_stream_join_view_returns_to_its_no_rows_value_after_restart(own_serve
     assert left_before == [(1, 100), (2, 200), (3, None)]
     conn.close()
 
-    own_server.stop_graceful()
-    own_server.start()
+    own_server.restart(graceful=True)
 
     conn = gnitz.connect(own_server.sock_path)
     assert _rows(conn, sn, "SELECT * FROM inner_v") == []
@@ -261,8 +259,7 @@ def test_alter_view_onto_a_stream_makes_it_ephemeral(own_server):
     assert _totals(conn, sn, "hot") == [(8, 80)]
     conn.close()
 
-    own_server.stop_graceful()
-    own_server.start()
+    own_server.restart(graceful=True)
 
     conn = gnitz.connect(own_server.sock_path)
     assert _totals(conn, sn, "hot") == [], "a retargeted view is stream-fed from that point on"

@@ -1,202 +1,170 @@
-"""End-to-end ALTER TABLE DROP COLUMN / ALTER COLUMN DROP NOT NULL tests.
+"""ALTER TABLE DROP COLUMN and ALTER COLUMN DROP NOT NULL: a column leaves the
+visible schema, or gains NULL as a value, while the rows underneath stay put.
 
-Run with GNITZ_WORKERS=4 so the DROP NOT NULL comparator swap must reach every
-partition and the wildcard/positional-remap fixes exercise the distributed read
-and write paths, not just a single worker.
+DROP COLUMN is logical — the column is flagged hidden and kept physically
+present — so what is asserted is that nothing names it and that the *positional*
+forms (a shortened INSERT, `RETURNING *`) address the remaining columns.
 
-    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/schema_lifetime/test_alter_drop.py -v --tb=short
+Run at GNITZ_WORKERS=4: the DROP NOT NULL comparator swap must reach every
+partition, or one left on the fixed-int comparator sorts a NULL as a real 0.
 """
 
 import pytest
-from _uid import uid as _uid
+from _read import access, bag, rows
+from _serverproc import NEEDS_MULTI
 
-
-
-
-def _rows(client, sn, sql):
-    res = client.execute_sql(sql, schema_name=sn)
-    assert res[0]["type"] == "Rows", f"expected Rows, got {res[0]['type']}"
-    # `rows` is a lazy ScanResult (iterable, not indexable) — materialize it so
-    # tests can index and re-scan it.
-    return list(res[0]["rows"])
+_T3 = ("CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, "
+       "a BIGINT NOT NULL, b BIGINT NOT NULL)")
 
 
 # ── DROP COLUMN ─────────────────────────────────────────────────────────────
 
 
-def test_drop_middle_column_wildcards_and_positional_remap(client):
-    sn = "adrop" + _uid()
-    client.create_schema(sn)
-    try:
-        client.execute_sql(
-            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        client.execute_sql("INSERT INTO t VALUES (1, 10, 100)", schema_name=sn)
+def test_drop_middle_column_wildcards_and_positional_remap(client, schema_name):
+    """Every wildcard stops projecting the dropped middle column, a shortened
+    INSERT lands its value in `b` rather than in the vacated slot, and the name
+    is unusable from either side of a statement."""
+    client.execute_sql(_T3, schema_name=schema_name)
+    client.execute_sql("INSERT INTO t VALUES (1, 10, 100)", schema_name=schema_name)
 
-        client.execute_sql("ALTER TABLE t DROP COLUMN a", schema_name=sn)
+    client.execute_sql("ALTER TABLE t DROP COLUMN a", schema_name=schema_name)
 
-        # `SELECT *` excludes the dropped middle column, and the pre-DROP row reads
-        # back unchanged on the visible columns.
-        rows = _rows(client, sn, "SELECT * FROM t")
-        assert len(rows) == 1
-        assert "a" not in rows[0]._fields
-        assert (rows[0]["id"], rows[0]["b"]) == (1, 100)
+    got = rows(client, schema_name, "SELECT * FROM t")
+    assert "a" not in got[0]._fields
+    assert bag(got, "id", "b") == {(1, 100): 1}
 
-        # A new INSERT supplies only the visible columns; the value lands in `b`,
-        # not the dropped slot (positional-remap regression).
-        client.execute_sql("INSERT INTO t VALUES (2, 200)", schema_name=sn)
-        got = {r["id"]: r["b"] for r in _rows(client, sn, "SELECT * FROM t")}
-        assert got == {1: 100, 2: 200}
+    # Positional remap: two visible columns, so the second value is `b`.
+    client.execute_sql("INSERT INTO t VALUES (2, 200)", schema_name=schema_name)
 
-        # `RETURNING *` also excludes the dropped column (the other wildcard leak).
-        ret = client.execute_sql("INSERT INTO t VALUES (3, 300) RETURNING *", schema_name=sn)
-        assert ret[0]["type"] == "Rows"
-        ret_rows = list(ret[0]["rows"])
-        assert "a" not in ret_rows[0]._fields
-        assert (ret_rows[0]["id"], ret_rows[0]["b"]) == (3, 300)
+    # `RETURNING *` is the other wildcard, and must agree.
+    ret = client.execute_sql("INSERT INTO t VALUES (3, 300) RETURNING *", schema_name=schema_name)
+    assert ret[0]["type"] == "Rows"
+    ret_rows = list(ret[0]["rows"])
+    assert "a" not in ret_rows[0]._fields
+    assert bag(ret_rows, "id", "b") == {(3, 300): 1}
 
-        # The dropped column is unnameable: an explicit-list INSERT and a projection
-        # that reference it both error.
-        with pytest.raises(Exception):
-            client.execute_sql("INSERT INTO t (id, a, b) VALUES (4, 1, 2)", schema_name=sn)
-        with pytest.raises(Exception):
-            client.execute_sql("SELECT a FROM t", schema_name=sn)
-    finally:
-        client.drop_schema(sn)
+    assert bag(rows(client, schema_name, "SELECT * FROM t"), "id", "b") == {
+        (1, 100): 1, (2, 200): 1, (3, 300): 1}
+
+    # Unnameable from an explicit column list and from a projection.
+    with pytest.raises(Exception):
+        client.execute_sql("INSERT INTO t (id, a, b) VALUES (4, 1, 2)", schema_name=schema_name)
+    with pytest.raises(Exception):
+        client.execute_sql("SELECT a FROM t", schema_name=schema_name)
 
 
-def test_drop_column_index_covered_then_dropped(client):
-    sn = "adrop" + _uid()
-    client.create_schema(sn)
-    try:
-        client.execute_sql(
-            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        client.execute_sql("INSERT INTO t VALUES (1, 10, 100)", schema_name=sn)
-        client.execute_sql("CREATE INDEX ON t (a)", schema_name=sn)
+def test_update_and_delete_address_rows_across_a_logical_drop(client, schema_name):
+    """UPDATE's retraction has to match the row as *stored* — hidden slot and
+    all — and DELETE has to retract the row it named and no other."""
+    client.execute_sql(_T3, schema_name=schema_name)
+    client.execute_sql("INSERT INTO t VALUES (1, 10, 100), (2, 20, 200)", schema_name=schema_name)
+    client.execute_sql("ALTER TABLE t DROP COLUMN a", schema_name=schema_name)
 
-        # DROP COLUMN of an index-covered column errors until the index is dropped.
-        with pytest.raises(Exception):
-            client.execute_sql("ALTER TABLE t DROP COLUMN a", schema_name=sn)
-
-        client.execute_sql(f"DROP INDEX {sn}__t__idx_a", schema_name=sn)
-        client.execute_sql("ALTER TABLE t DROP COLUMN a", schema_name=sn)
-        rows = _rows(client, sn, "SELECT * FROM t")
-        assert "a" not in rows[0]._fields
-        assert (rows[0]["id"], rows[0]["b"]) == (1, 100)
-    finally:
-        client.drop_schema(sn)
+    client.execute_sql("UPDATE t SET b = 999 WHERE id = 1", schema_name=schema_name)
+    client.execute_sql("DELETE FROM t WHERE id = 2", schema_name=schema_name)
+    assert bag(rows(client, schema_name, "SELECT * FROM t"), "id", "b") == {(1, 999): 1}
 
 
-def test_drop_column_update_carries_hidden_value(client):
-    sn = "adrop" + _uid()
-    client.create_schema(sn)
-    try:
-        client.execute_sql(
-            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        client.execute_sql("INSERT INTO t VALUES (1, 10, 100), (2, 20, 200)", schema_name=sn)
-        client.execute_sql("ALTER TABLE t DROP COLUMN a", schema_name=sn)
+@pytest.mark.parametrize(
+    "column, message",
+    [("id", "part of the primary key"),
+     ("ref", "it carries a foreign key"),
+     ("ix", "covered by a secondary index")],
+)
+def test_drop_column_refuses_a_column_something_else_binds(
+        client, schema_name, column, message):
+    """Three rungs of one ladder. Each names what binds the column, so the author
+    knows which thing to undo — a bare refusal would leave them guessing which of
+    the three fired. The column survives every refusal.
 
-        # UPDATE and DELETE address rows by PK / visible columns; the hidden slot
-        # rides through UPDATE verbatim and DELETE retracts the right row.
-        client.execute_sql("UPDATE t SET b = 999 WHERE id = 1", schema_name=sn)
-        client.execute_sql("DELETE FROM t WHERE id = 2", schema_name=sn)
-        got = {r["id"]: r["b"] for r in _rows(client, sn, "SELECT * FROM t")}
-        assert got == {1: 999}
-    finally:
-        client.drop_schema(sn)
+    The ladder's fourth rung, a SERIAL column, is unreachable from SQL: a SERIAL
+    column must be the table's single-column PRIMARY KEY, so `is_pk_col` above it
+    always answers first.
+    """
+    client.execute_sql(
+        "CREATE TABLE p (id BIGINT NOT NULL PRIMARY KEY)", schema_name=schema_name)
+    client.execute_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, "
+        "ref BIGINT NOT NULL REFERENCES p(id), ix BIGINT NOT NULL)",
+        schema_name=schema_name)
+    client.execute_sql("CREATE INDEX iix ON t (ix)", schema_name=schema_name)
+
+    with pytest.raises(Exception, match=message):
+        client.execute_sql(f"ALTER TABLE t DROP COLUMN {column}", schema_name=schema_name)
+
+    names = [c.name for c in client.resolve_table(schema_name, "t")[1].columns]
+    assert column in names, f"the refused DROP COLUMN retired '{column}' anyway: {names}"
+
+
+def test_drop_column_is_allowed_once_the_index_covering_it_goes(client, schema_name):
+    """The index rung is the one an author can clear inside the same statement
+    sequence: dropping the index makes the column droppable."""
+    client.execute_sql(_T3, schema_name=schema_name)
+    client.execute_sql("INSERT INTO t VALUES (1, 10, 100)", schema_name=schema_name)
+    client.execute_sql("CREATE INDEX ia ON t (a)", schema_name=schema_name)
+
+    with pytest.raises(Exception, match="covered by a secondary index"):
+        client.execute_sql("ALTER TABLE t DROP COLUMN a", schema_name=schema_name)
+
+    client.execute_sql("DROP INDEX ia", schema_name=schema_name)
+    client.execute_sql("ALTER TABLE t DROP COLUMN a", schema_name=schema_name)
+    got = rows(client, schema_name, "SELECT * FROM t")
+    assert "a" not in got[0]._fields
+    assert bag(got, "id", "b") == {(1, 100): 1}
 
 
 # ── DROP NOT NULL ───────────────────────────────────────────────────────────
 
 
-def test_drop_not_null_null_after_multiworker(client):
-    sn = "adrop" + _uid()
-    client.create_schema(sn)
-    try:
-        # All-fixed-int NOT NULL → the table is on the FixedIntNonnull fast
-        # comparator; DROP NOT NULL forces the Generic swap that must reach every
-        # partition (W=4).
-        client.execute_sql(
-            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        # Spread rows across partitions.
-        vals = ", ".join(f"({i}, {i * 10})" for i in range(1, 41))
-        client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
+@NEEDS_MULTI
+def test_drop_not_null_makes_null_a_value_distinct_from_zero(client, schema_name):
+    """All-fixed-int NOT NULL puts the table on the FixedIntNonnull comparator;
+    DROP NOT NULL forces the Generic swap, which must reach every partition.
 
-        # NULL rejected before the ALTER.
-        with pytest.raises(Exception):
-            client.execute_sql("INSERT INTO t VALUES (100, NULL)", schema_name=sn)
+    A NULL and an explicit 0 then coexist on distinct PKs as *distinct* values.
+    Asserted as a weighted bag: a partition on the stale comparator sorts the
+    NULL as a real 0 and consolidates the two, which moves a weight rather than
+    a row count.
+    """
+    client.execute_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+        schema_name=schema_name)
+    vals = ", ".join(f"({i}, {i * 10})" for i in range(1, 41))
+    client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=schema_name)
 
-        client.execute_sql("ALTER TABLE t ALTER COLUMN v DROP NOT NULL", schema_name=sn)
+    with pytest.raises(Exception):
+        client.execute_sql("INSERT INTO t VALUES (100, NULL)", schema_name=schema_name)
 
-        # After the swap: a NULL and an explicit 0 coexist as *distinct* values on
-        # distinct PKs — if any partition kept the stale FixedIntNonnull comparator
-        # the NULL would sort/merge as a real 0 and corrupt weights.
-        client.execute_sql("INSERT INTO t VALUES (100, NULL), (101, 0)", schema_name=sn)
-        by_id = {r["id"]: r["v"] for r in _rows(client, sn, "SELECT * FROM t")}
-        assert by_id[100] is None, "NULL must read back as NULL, not 0"
-        assert by_id[101] == 0
-        assert by_id[1] == 10, "pre-ALTER non-null rows unchanged"
-        assert len(by_id) == 42
+    client.execute_sql("ALTER TABLE t ALTER COLUMN v DROP NOT NULL", schema_name=schema_name)
 
-        # Total weight is exactly one per PK (no NULL-vs-0 consolidation error).
-        tid = client.resolve_table(sn, "t")[0]
-        assert all(r.weight == 1 for r in client.scan(tid))
-    finally:
-        client.drop_schema(sn)
+    client.execute_sql("INSERT INTO t VALUES (100, NULL), (101, 0)", schema_name=schema_name)
+    want = {(i, i * 10): 1 for i in range(1, 41)}
+    want[(100, None)] = 1
+    want[(101, 0)] = 1
+    assert bag(rows(client, schema_name, "SELECT * FROM t"), "id", "v") == want
 
 
-def test_drop_not_null_secondary_indexed_column(client):
-    sn = "adrop" + _uid()
-    client.create_schema(sn)
-    try:
-        client.execute_sql(
-            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", schema_name=sn)
-        client.execute_sql("CREATE INDEX ix ON t (v)", schema_name=sn)
+def test_drop_not_null_keeps_the_index_serving_and_omits_the_null(client, schema_name):
+    """The index survives the swap and still *serves* the seek — a plan that
+    lost it answers the same rows by full scan, so the access line is what tells
+    them apart. A later NULL is absent from the index and present in the table.
+    """
+    client.execute_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+        schema_name=schema_name)
+    vals = ", ".join(f"({i}, {i * 10})" for i in range(1, 41))
+    client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=schema_name)
+    client.execute_sql("CREATE INDEX iv ON t (v)", schema_name=schema_name)
 
-        client.execute_sql("ALTER TABLE t ALTER COLUMN v DROP NOT NULL", schema_name=sn)
+    client.execute_sql("ALTER TABLE t ALTER COLUMN v DROP NOT NULL", schema_name=schema_name)
+    client.execute_sql("INSERT INTO t VALUES (41, NULL)", schema_name=schema_name)
 
-        # Existing rows still seek by the indexed column; a later NULL is simply
-        # absent from the index but present in the table.
-        assert [r["id"] for r in _rows(client, sn, "SELECT id FROM t WHERE v = 20")] == [2]
-        client.execute_sql("INSERT INTO t VALUES (4, NULL)", schema_name=sn)
-        ids = sorted(r["id"] for r in _rows(client, sn, "SELECT * FROM t"))
-        assert ids == [1, 2, 3, 4]
-    finally:
-        client.drop_schema(sn)
+    seek = "SELECT id FROM t WHERE v = 200"
+    assert "index" in access(client, schema_name, seek), access(client, schema_name, seek)
+    assert bag(rows(client, schema_name, seek), "id") == {(20,): 1}
 
-
-# ── RESTRICT on a dependent view ────────────────────────────────────────────
-
-
-def test_drop_restrict_dependent_view_leaves_catalog_intact(client):
-    sn = "adrop" + _uid()
-    client.create_schema(sn)
-    try:
-        client.execute_sql(
-            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        client.execute_sql("INSERT INTO t VALUES (1, 10, 100)", schema_name=sn)
-        client.execute_sql("CREATE VIEW v AS SELECT id, b FROM t", schema_name=sn)
-
-        with pytest.raises(Exception):
-            client.execute_sql("ALTER TABLE t DROP COLUMN a", schema_name=sn)
-        with pytest.raises(Exception):
-            client.execute_sql("ALTER TABLE t ALTER COLUMN a DROP NOT NULL", schema_name=sn)
-
-        # The catalog is unchanged: `a` is still visible/usable and the view works.
-        rows = _rows(client, sn, "SELECT * FROM t")
-        assert set(rows[0]._fields) == {"id", "a", "b"}
-        assert [r["b"] for r in _rows(client, sn, "SELECT * FROM v")] == [100]
-    finally:
-        client.drop_schema(sn)
+    # An index-bounded range never yields the NULL row; a full scan holds it.
+    span = "SELECT id FROM t WHERE v >= 0"
+    assert "index" in access(client, schema_name, span), access(client, schema_name, span)
+    assert (41,) not in bag(rows(client, schema_name, span), "id")
+    assert (41, None) in bag(rows(client, schema_name, "SELECT * FROM t"), "id", "v")

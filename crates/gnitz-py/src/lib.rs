@@ -182,6 +182,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("IDX_TAB", gnitz_wire::IDX_TAB)?;
     m.add("CIRCUIT_NODES_TAB", gnitz_wire::CIRCUIT_NODES_TAB)?;
     m.add("FIRST_USER_TABLE_ID", gnitz_wire::FIRST_USER_TABLE_ID)?;
+    // The schema-width cap, so a test locates the boundary instead of naming it.
+    m.add("MAX_COLUMNS", gnitz_wire::MAX_COLUMNS)?;
     // Whether *this extension* keeps its `#[cfg(debug_assertions)]` fault seams.
     // The seams a mirroring test arms live in gnitz-mirror and gnitz-store, which
     // are linked here and not into the server, so the server's build says nothing

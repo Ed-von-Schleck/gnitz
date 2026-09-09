@@ -19,7 +19,8 @@ _ROWS = "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)"
 @pytest.fixture(scope="module")
 def rejected(server):
     """`(conn, schema)` holding `p(k)`, `t(pk, val)` with five rows, and
-    `u(pk, k)` with two — for the rejection cases only.
+    `u(pk, k)` with two, plus a view `vok` over `t` — for the rejection cases
+    only.
 
     Module-scoped, and its own connection off the session server rather than the
     function-scoped `client`: every test sharing it asserts a *refusal*, so none
@@ -34,6 +35,9 @@ def rejected(server):
         conn.execute_sql(_ROWS, schema_name=sn)
         conn.execute_sql(_U, schema_name=sn)
         conn.execute_sql("INSERT INTO u VALUES (1, 10), (2, 20)", schema_name=sn)
+        # A view, so a statement that requires a base table has a wrong-kind
+        # name to be refused on.
+        conn.execute_sql("CREATE VIEW vok AS SELECT pk, val FROM t", schema_name=sn)
         yield conn, sn
         conn.drop_schema(sn)
 
@@ -166,6 +170,33 @@ _UNHONOURED = [
     ("CREATE VIEW vilk AS SELECT * ILIKE 'v%' FROM t", "SELECT \\* ILIKE is not supported"),
     ("INSERT INTO t VALUES (200, 300) RETURNING * REPLACE (val + 1 AS val)",
      "SELECT \\* REPLACE is not supported"),
+    # ALTER TABLE ADD COLUMN honours a bare nullable append and nothing else.
+    # Each refused clause would need a value for the rows already there, a
+    # second catalog object, or a physical move — so each names which of those
+    # it is, and what to write instead where there is an alternative.
+    ("ALTER TABLE t ADD COLUMN c BIGINT NOT NULL",
+     "NOT NULL .a new column over existing rows is nullable."),
+    ("ALTER TABLE t ADD COLUMN c SERIAL", "SERIAL is not supported"),
+    ("ALTER TABLE t ADD COLUMN c BIGINT DEFAULT 0", "ADD COLUMN: DEFAULT is not supported"),
+    ("ALTER TABLE t ADD COLUMN c BIGINT PRIMARY KEY",
+     "PRIMARY KEY .a new column cannot join the primary key."),
+    ("ALTER TABLE t ADD COLUMN c BIGINT UNIQUE",
+     "UNIQUE .add the column, then CREATE UNIQUE INDEX."),
+    ("ALTER TABLE t ADD COLUMN c BIGINT REFERENCES p (k)",
+     "REFERENCES .add the column, then ALTER TABLE . ADD CONSTRAINT."),
+    ("ALTER TABLE t ADD COLUMN c BIGINT CHECK (c > 0)", "ADD COLUMN: CHECK is not supported"),
+    ("ALTER TABLE t ADD COLUMN c BIGINT COLLATE utf8", "ADD COLUMN: COLLATE is not supported"),
+    ("ALTER TABLE t ADD COLUMN IF NOT EXISTS c BIGINT", "IF NOT EXISTS is not supported"),
+    ("ALTER TABLE t ADD COLUMN c BIGINT FIRST",
+     "FIRST/AFTER .a column is always appended last."),
+    ("ALTER TABLE t ADD COLUMN c BIGINT AFTER val",
+     "FIRST/AFTER .a column is always appended last."),
+    # The name is taken, by a visible column and by the PK.
+    ("ALTER TABLE t ADD COLUMN val BIGINT", "already exists"),
+    ("ALTER TABLE t ADD COLUMN pk BIGINT", "already exists"),
+    # ALTER TABLE's column family requires a base table.
+    ("ALTER TABLE vok ADD COLUMN c BIGINT",
+     "is a view; ALTER TABLE ADD COLUMN requires a base table"),
 ]
 
 

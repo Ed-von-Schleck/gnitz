@@ -1,543 +1,301 @@
-"""The catalog's own lifecycle: schema and table ids, CREATE/DROP/recreate of a
-schema, a table and a view, cascade, and the name isolation two schemas give
-the same table name.
+"""The catalog's own object lifecycle: creating, dropping and recreating a
+schema, a table, a view and an index, the CASCADE a schema drop runs, and the
+name isolation two schemas give one table name.
 
-The verdicts the catalog refuses are in `admissibility/test_catalog_guards.py`.
+Ids are asserted **never reused**, not monotone: non-reuse is what keeps a stale
+descriptor from resolving to a new relation, while the allocator's ordering is
+its own business. The verdicts the catalog refuses live in
+`admissibility/test_catalog_guards.py`.
 """
 
-import pytest
 import gnitz
+import pytest
+from _read import bag, rows, scanned
 from _uid import uid as _uid
 
+_KV = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+       gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
 
-# ===========================================================================
-# Schema DDL
-# ===========================================================================
 
-class TestSchemaDDL:
+def _push(client, tid, *pairs):
+    batch = gnitz.ZSetBatch(gnitz.Schema(_KV))
+    for pk, val in pairs:
+        batch.append(pk=pk, val=val)
+    client.push(tid, batch)
 
-    def test_create_multiple_schemas_distinct_ids(self, client):
-        n1, n2 = "s" + _uid(), "s" + _uid()
-        s1 = client.create_schema(n1)
-        s2 = client.create_schema(n2)
-        assert s1 != s2
-        client.drop_schema(n1)
-        client.drop_schema(n2)
 
-    def test_schema_ids_monotonic(self, client):
-        names = ["s" + _uid() for _ in range(3)]
-        ids = [client.create_schema(n) for n in names]
-        assert ids[0] < ids[1] < ids[2]
-        for n in names:
-            client.drop_schema(n)
+# ── Schemas ─────────────────────────────────────────────────────────────────
 
-    def test_drop_nonempty_schema_cascades(self, client):
-        """Dropping a non-empty schema cascades (PostgreSQL DROP SCHEMA ... CASCADE
-        semantics): every contained table, secondary index, view, and view-on-view
-        is dropped first, then the schema itself. Crucially the members are
-        *removed*, not orphaned — proven by recreating the same schema.table /
-        schema.view afterwards (pre-fix this raised "Table or view already exists"
-        because the orphaned rows kept entity_by_qname["sn.mt"])."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        # A table, a secondary index on it, a view over it, and a view-on-view.
-        # The cascade must drop views before tables and retry across the
-        # view-on-view chain; the table drop cascade-removes the index.
-        client.execute_sql(
-            "CREATE TABLE mt (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name=sn)
-        client.execute_sql("CREATE INDEX ON mt (val)", schema_name=sn)
-        client.execute_sql("CREATE VIEW v1 AS SELECT * FROM mt WHERE val > 0",
-                           schema_name=sn)
-        client.execute_sql("CREATE VIEW v2 AS SELECT * FROM v1 WHERE val > 10",
-                           schema_name=sn)
 
-        # Cascade: succeeds without dropping any member explicitly first.
-        client.drop_schema(sn)
+def test_schema_ids_are_distinct_and_never_reused(client):
+    """Three live schemas take three ids, and a recreated name takes an id none
+    of them held — a stale descriptor must never resolve to a new relation."""
+    names = ["s" + _uid() for _ in range(3)]
+    ids = [client.create_schema(n) for n in names]
+    assert len(set(ids)) == 3
+    for n in names:
+        client.drop_schema(n)
 
-        # The members are gone, not orphaned: recreate the schema and the SAME
-        # schema.table + schema.view names. Both must succeed cleanly.
-        client.create_schema(sn)
-        client.execute_sql(
-            "CREATE TABLE mt (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name=sn)
-        client.execute_sql("CREATE VIEW v1 AS SELECT * FROM mt WHERE val > 0",
-                           schema_name=sn)
-        client.drop_schema(sn)
+    again = client.create_schema(names[0])
+    assert again not in ids
+    client.drop_schema(names[0])
 
-    def test_drop_and_recreate_schema(self, client):
-        """Recreated schema gets a strictly higher ID."""
-        sn = "s" + _uid()
-        s1 = client.create_schema(sn)
-        client.drop_schema(sn)
-        s2 = client.create_schema(sn)
-        assert s2 > s1
-        client.drop_schema(sn)
 
-    def test_drop_schema_restrict_external_dependent(self, client):
-        """A member referenced from OUTSIDE the schema blocks the cascade
-        (RESTRICT): drop_schema errors, the still-referenced member and the s1
-        schema row stay intact, and the external dependent view is untouched."""
-        s1 = "s" + _uid()
-        s2 = "s" + _uid()
-        client.create_schema(s1)
-        client.create_schema(s2)
-        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-        tid = client.create_table(s1, "t", cols)
-        # A view in s2 reading s1.t (by tid) — a cross-schema dependent. Its
-        # circuit scans s1.t, so dropping s1.t is blocked.
-        client.create_view(s2, "v", tid, gnitz.Schema(cols))
+def test_drop_nonempty_schema_cascades(client):
+    """`drop_schema` is one atomic CASCADE bundle: it retracts every view, then
+    every table (each cascading its own indexes), then the schema row — views
+    before tables, and across a view-on-view chain.
 
-        # The cascade tries to drop s1.t, which the engine precheck blocks
-        # because s2.v depends on it; the drain makes no progress and errors.
-        with pytest.raises(gnitz.GnitzError):
-            client.drop_schema(s1)
+    The members are *removed*, not orphaned, which only recreating the same
+    qualified names can show: an orphaned row keeps the name taken.
+    """
+    sn = "s" + _uid()
+    client.create_schema(sn)
+    client.execute_sql(
+        "CREATE TABLE mt (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql("CREATE INDEX ON mt (val)", schema_name=sn)
+    client.execute_sql("CREATE VIEW v1 AS SELECT * FROM mt WHERE val > 0", schema_name=sn)
+    client.execute_sql("CREATE VIEW v2 AS SELECT * FROM v1 WHERE val > 10", schema_name=sn)
 
-        # s1.t survives (member intact), s1 still exists, and s2.v is untouched.
-        rtid, _ = client.resolve_table(s1, "t")
-        assert rtid == tid
-        client.resolve_table(s2, "v")
+    client.drop_schema(sn)
 
-        # Clean up in dependency order: external view first, then both schemas.
-        client.drop_view(s2, "v")
+    client.create_schema(sn)
+    client.execute_sql(
+        "CREATE TABLE mt (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql("CREATE VIEW v1 AS SELECT * FROM mt WHERE val > 0", schema_name=sn)
+    client.drop_schema(sn)
+
+
+def test_drop_schema_restrict_external_dependent(client):
+    """A member referenced from OUTSIDE the schema blocks the cascade: the drop
+    errors, and it retracted nothing on the way to the row it failed on — the
+    still-referenced table, its schema row and the foreign dependent all stand.
+    """
+    s1, s2 = "s" + _uid(), "s" + _uid()
+    client.create_schema(s1)
+    client.create_schema(s2)
+    tid = client.create_table(s1, "t", _KV)
+    # A view in s2 whose circuit scans s1.t, so dropping s1.t is blocked.
+    client.create_view(s2, "v", tid, gnitz.Schema(_KV))
+
+    with pytest.raises(gnitz.GnitzError):
         client.drop_schema(s1)
-        client.drop_schema(s2)
+
+    assert client.resolve_table(s1, "t")[0] == tid
+    client.resolve_table(s2, "v")
+
+    client.drop_view(s2, "v")
+    client.drop_schema(s1)
+    client.drop_schema(s2)
 
 
-# ===========================================================================
-# Table DDL
-# ===========================================================================
+def test_two_schemas_isolate_one_table_name(client, schema_name):
+    """The same table name in two schemas addresses two relations."""
+    other = "s" + _uid()
+    client.create_schema(other)
+    try:
+        a = client.create_table(schema_name, "items", _KV)
+        b = client.create_table(other, "items", _KV)
+        _push(client, a, (1, 100))
+        _push(client, b, (1, 200))
+        assert bag(client.scan(a), "pk", "val") == {(1, 100): 1}
+        assert bag(client.scan(b), "pk", "val") == {(1, 200): 1}
+    finally:
+        client.drop_schema(other)
 
-class TestTableDDL:
 
-    def test_create_table_all_types(self, client):
-        """Create a table with every supported TypeCode."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        cols = [
-            gnitz.ColumnDef("pk",    gnitz.TypeCode.U64,    primary_key=True),
-            gnitz.ColumnDef("c_u8",  gnitz.TypeCode.U8),
-            gnitz.ColumnDef("c_i8",  gnitz.TypeCode.I8),
-            gnitz.ColumnDef("c_u16", gnitz.TypeCode.U16),
-            gnitz.ColumnDef("c_i16", gnitz.TypeCode.I16),
-            gnitz.ColumnDef("c_u32", gnitz.TypeCode.U32),
-            gnitz.ColumnDef("c_i32", gnitz.TypeCode.I32),
-            gnitz.ColumnDef("c_f32", gnitz.TypeCode.F32),
-            gnitz.ColumnDef("c_u64", gnitz.TypeCode.U64),
-            gnitz.ColumnDef("c_i64", gnitz.TypeCode.I64),
-            gnitz.ColumnDef("c_f64", gnitz.TypeCode.F64),
-            gnitz.ColumnDef("c_str", gnitz.TypeCode.STRING, is_nullable=True),
-        ]
-        tn = "t" + _uid()
-        try:
-            tid = client.create_table(sn, tn, cols)
-            resolved_tid, schema = client.resolve_table(sn, tn)
-            assert resolved_tid == tid
-            assert len(schema.columns) == len(cols)
-        finally:
-            try:
-                client.drop_table(sn, tn)
-            except Exception:
-                pass
-            client.drop_schema(sn)
+# ── Tables ──────────────────────────────────────────────────────────────────
 
-    def test_create_table_nondefault_pk(self, client):
-        """PK column at index 1 (not column 0)."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        cols = [
-            gnitz.ColumnDef("val", gnitz.TypeCode.I64),
-            gnitz.ColumnDef("pk",  gnitz.TypeCode.U64, primary_key=True),
-        ]
-        tn = "t" + _uid()
-        try:
-            client.create_table(sn, tn, cols)
-            _, schema = client.resolve_table(sn, tn)
-            assert schema.pk_indices[0] == 1
-        finally:
-            try:
-                client.drop_table(sn, tn)
-            except Exception:
-                pass
-            client.drop_schema(sn)
 
-    def test_create_table_max_columns(self, client):
-        """64 columns (the server maximum) is accepted."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)]
-        for i in range(63):
-            cols.append(gnitz.ColumnDef(f"c{i}", gnitz.TypeCode.I64))
-        tn = "t" + _uid()
-        try:
-            client.create_table(sn, tn, cols)
-            _, schema = client.resolve_table(sn, tn)
-            assert len(schema.columns) == 64
-        finally:
-            try:
-                client.drop_table(sn, tn)
-            except Exception:
-                pass
-            client.drop_schema(sn)
+def test_create_table_carries_every_type_and_the_declared_pk(client, schema_name):
+    """`create_table` accepts every `TypeCode` and hands each one back unchanged,
+    with the PK at the index the caller declared rather than at column 0.
 
-    def test_table_ids_monotonic(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-        names = ["t" + _uid() for _ in range(3)]
-        try:
-            tids = [client.create_table(sn, n, cols) for n in names]
-            assert tids[0] < tids[1] < tids[2]
-        finally:
-            for n in names:
-                try:
-                    client.drop_table(sn, n)
-                except Exception:
-                    pass
-            client.drop_schema(sn)
+    The per-type value round trip is `value_domain/test_types.py`'s; what this
+    asserts is that the catalog does not silently retype or re-key a column.
+    """
+    cols = [gnitz.ColumnDef("val", gnitz.TypeCode.I64),
+            gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)]
+    cols += [gnitz.ColumnDef(f"c_{tc.name.lower()}", tc, is_nullable=True)
+             for tc in (gnitz.TypeCode.U8, gnitz.TypeCode.I8, gnitz.TypeCode.U16,
+                        gnitz.TypeCode.I16, gnitz.TypeCode.U32, gnitz.TypeCode.I32,
+                        gnitz.TypeCode.F32, gnitz.TypeCode.U64, gnitz.TypeCode.F64,
+                        gnitz.TypeCode.STRING)]
+    tid = client.create_table(schema_name, "orders_archive_2024", cols)
 
-    def test_drop_and_recreate_table(self, client):
-        """Recreated table gets a strictly higher ID."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-        tn = "t" + _uid()
-        try:
-            tid1 = client.create_table(sn, tn, cols)
-            client.drop_table(sn, tn)
-            tid2 = client.create_table(sn, tn, cols)
-            assert tid2 > tid1
-            client.drop_table(sn, tn)
-        finally:
-            client.drop_schema(sn)
+    # Resolved by a name past the 12-byte German-string inline prefix.
+    resolved, schema = client.resolve_table(schema_name, "orders_archive_2024")
+    assert resolved == tid
+    assert [c.type_code for c in schema.columns] == [c.type_code for c in cols]
+    assert schema.pk_indices == [1]
 
-    def test_drop_table_with_data(self, client):
-        """Dropping a table that contains data does not raise an error."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-        schema = gnitz.Schema(cols)
-        tn = "t" + _uid()
-        try:
-            tid = client.create_table(sn, tn, cols)
-            batch = gnitz.ZSetBatch(schema)
-            batch.append(pk=1, val=10)
-            batch.append(pk=2, val=20)
-            client.push(tid, batch)
-            client.drop_table(sn, tn)  # must not raise
-        finally:
-            client.drop_schema(sn)
 
-    def test_scan_after_drop(self, client):
-        """Scanning a dropped table raises GnitzError."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-        tn = "t" + _uid()
-        try:
-            tid = client.create_table(sn, tn, cols)
-            client.drop_table(sn, tn)
-            with pytest.raises(gnitz.GnitzError):
-                client.scan(tid)
-        finally:
-            client.drop_schema(sn)
+def test_a_schema_fills_the_column_cap_but_not_one_past_it(client, schema_name):
+    """`MAX_COLUMNS` counts the PK and the payload together. The cap is located
+    rather than named, so moving it moves this test with it."""
+    def build(n):
+        return [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)] + [
+            gnitz.ColumnDef(f"c{i}", gnitz.TypeCode.I64, is_nullable=True)
+            for i in range(n - 1)]
 
-    def test_drop_schema_after_table_cleared(self, client):
-        """Schema can be dropped once all its tables are removed."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-        tn = "t" + _uid()
-        client.create_table(sn, tn, cols)
-        client.drop_table(sn, tn)
-        client.drop_schema(sn)  # must not raise
+    client.create_table(schema_name, "wide", build(gnitz.MAX_COLUMNS))
+    assert len(client.resolve_table(schema_name, "wide")[1].columns) == gnitz.MAX_COLUMNS
 
-class TestSchemaIsolation:
+    with pytest.raises(Exception, match="MAX_COLUMNS"):
+        client.create_table(schema_name, "wider", build(gnitz.MAX_COLUMNS + 1))
 
-    def test_isolated_tables_in_different_schemas(self, client):
-        """Same table name in two schemas keeps data isolated."""
-        sn1, sn2 = "s" + _uid(), "s" + _uid()
-        client.create_schema(sn1)
-        client.create_schema(sn2)
-        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-        schema = gnitz.Schema(cols)
-        try:
-            tid1 = client.create_table(sn1, "items", cols)
-            tid2 = client.create_table(sn2, "items", cols)
-            b1 = gnitz.ZSetBatch(schema)
-            b1.append(pk=1, val=100)
-            client.push(tid1, b1)
-            b2 = gnitz.ZSetBatch(schema)
-            b2.append(pk=1, val=200)
-            client.push(tid2, b2)
-            rows1 = list(client.scan(tid1))
-            rows2 = list(client.scan(tid2))
-            assert rows1[0].val == 100
-            assert rows2[0].val == 200
-        finally:
-            for sn in (sn1, sn2):
-                try:
-                    client.drop_table(sn, "items")
-                except Exception:
-                    pass
-                client.drop_schema(sn)
 
-# ===========================================================================
+def test_table_ids_are_never_reused_and_a_dropped_table_is_unscannable(client, schema_name):
+    """Dropping a populated table succeeds, its id stops answering scans, and
+    recreating the name takes an id the old one never held."""
+    tid = client.create_table(schema_name, "t", _KV)
+    _push(client, tid, (1, 10), (2, 20))
+    client.drop_table(schema_name, "t")
 
-class TestViewLifecycle:
+    with pytest.raises(gnitz.GnitzError):
+        client.scan(tid)
 
-    def _setup(self, client, sn):
-        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-        tn = "t" + _uid()
-        tid = client.create_table(sn, tn, cols)
-        return tid, tn, cols, gnitz.Schema(cols)
+    again = client.create_table(schema_name, "t", _KV)
+    assert again != tid
 
-    def test_view_starts_empty(self, client):
-        """Newly created passthrough view is scannable with no rows."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        tid, tn, cols, schema = self._setup(client, sn)
-        vn = "v" + _uid()
-        try:
-            vid = client.create_view(sn, vn, tid, schema)
-            assert len(list(client.scan(vid))) == 0
-        finally:
-            try:
-                client.drop_view(sn, vn)
-            except Exception:
-                pass
-            client.drop_table(sn, tn)
-            client.drop_schema(sn)
 
-    def test_view_receives_deletes(self, client):
-        """Retraction in source table propagates through passthrough view."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        tid, tn, cols, schema = self._setup(client, sn)
-        vn = "v" + _uid()
-        try:
-            vid = client.create_view(sn, vn, tid, schema)
-            ins = gnitz.ZSetBatch(schema)
-            for i in range(1, 4):
-                ins.append(pk=i, val=i * 10)
-            client.push(tid, ins)
-            ret = gnitz.ZSetBatch(schema)
-            ret.append(pk=2, val=20, _weight=-1)
-            client.push(tid, ret)
-            rows = list(client.scan(vid))
-            pks = {r.pk for r in rows}
-            assert len(rows) == 2
-            assert 2 not in pks
-        finally:
-            try:
-                client.drop_view(sn, vn)
-            except Exception:
-                pass
-            client.drop_table(sn, tn)
-            client.drop_schema(sn)
+# ── Views ───────────────────────────────────────────────────────────────────
 
-    def test_multiple_views_on_same_table(self, client):
-        """Two passthrough views on the same source both receive all inserts."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        tid, tn, cols, schema = self._setup(client, sn)
-        vn1, vn2 = "va" + _uid(), "vb" + _uid()
-        try:
-            vid1 = client.create_view(sn, vn1, tid, schema)
-            vid2 = client.create_view(sn, vn2, tid, schema)
-            batch = gnitz.ZSetBatch(schema)
-            batch.append(pk=1, val=10)
-            batch.append(pk=2, val=20)
-            client.push(tid, batch)
-            assert len(list(client.scan(vid1))) == 2
-            assert len(list(client.scan(vid2))) == 2
-        finally:
-            for vn in (vn1, vn2):
-                try:
-                    client.drop_view(sn, vn)
-                except Exception:
-                    pass
-            client.drop_table(sn, tn)
-            client.drop_schema(sn)
 
-    def test_view_data_matches_source(self, client):
-        """View contains exactly the same rows as its source table."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        tid, tn, cols, schema = self._setup(client, sn)
-        vn = "v" + _uid()
-        try:
-            vid = client.create_view(sn, vn, tid, schema)
-            batch = gnitz.ZSetBatch(schema)
-            for pk, val in [(10, 100), (20, 200), (30, 300)]:
-                batch.append(pk=pk, val=val)
-            client.push(tid, batch)
-            src  = sorted((r.pk, r.val) for r in list(client.scan(tid)))
-            view = sorted((r.pk, r.val) for r in list(client.scan(vid)))
-            assert src == view
-        finally:
-            try:
-                client.drop_view(sn, vn)
-            except Exception:
-                pass
-            client.drop_table(sn, tn)
-            client.drop_schema(sn)
+def test_a_passthrough_view_carries_its_sources_zset(client, schema_name):
+    """A binary passthrough view holds exactly its source's Z-set — weights
+    included, so a delta applied twice is a divergence and not a matching row
+    set — and a retraction reaches it as a retraction.
 
-    def test_view_independent_from_other_tables(self, client):
-        """A view on table A is not affected by pushes to table B."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-        schema = gnitz.Schema(cols)
-        tn_a, tn_b = "ta" + _uid(), "tb" + _uid()
-        tid_a = client.create_table(sn, tn_a, cols)
-        tid_b = client.create_table(sn, tn_b, cols)
-        vn = "v" + _uid()
-        try:
-            vid = client.create_view(sn, vn, tid_a, schema)
-            ba = gnitz.ZSetBatch(schema)
-            ba.append(pk=1, val=10)
-            client.push(tid_a, ba)
-            bb = gnitz.ZSetBatch(schema)
-            bb.append(pk=2, val=20)
-            client.push(tid_b, bb)
-            rows = list(client.scan(vid))
-            assert len(rows) == 1
-            assert rows[0].pk == 1
-        finally:
-            try:
-                client.drop_view(sn, vn)
-            except Exception:
-                pass
-            for tn in (tn_a, tn_b):
-                try:
-                    client.drop_table(sn, tn)
-                except Exception:
-                    pass
-            client.drop_schema(sn)
+    Also the negative: a second table's pushes do not reach it.
+    """
+    tid = client.create_table(schema_name, "src", _KV)
+    other = client.create_table(schema_name, "other", _KV)
+    vid = client.create_view(schema_name, "v", tid, gnitz.Schema(_KV))
+    assert bag(client.scan(vid)) == {}
 
-    def test_drop_view_makes_scan_fail(self, client):
-        """Scanning a dropped view raises GnitzError."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        tid, tn, cols, schema = self._setup(client, sn)
-        vn = "v" + _uid()
-        vid = client.create_view(sn, vn, tid, schema)
-        client.drop_view(sn, vn)
-        try:
-            with pytest.raises(gnitz.GnitzError):
-                client.scan(vid)
-        finally:
-            client.drop_table(sn, tn)
-            client.drop_schema(sn)
+    _push(client, tid, (1, 10), (2, 20), (3, 30))
+    _push(client, other, (4, 40))
+    assert bag(client.scan(vid), "pk", "val") == bag(client.scan(tid), "pk", "val")
+    assert bag(client.scan(vid), "pk", "val") == {(1, 10): 1, (2, 20): 1, (3, 30): 1}
 
-    def test_drop_and_recreate_view(self, client):
-        """Recreated view gets a higher ID and receives data from source."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        tid, tn, cols, schema = self._setup(client, sn)
-        vn = "v" + _uid()
-        try:
-            vid1 = client.create_view(sn, vn, tid, schema)
-            client.drop_view(sn, vn)
-            vid2 = client.create_view(sn, vn, tid, schema)
-            assert vid2 > vid1
-            batch = gnitz.ZSetBatch(schema)
-            batch.append(pk=1, val=10)
-            client.push(tid, batch)
-            assert len(list(client.scan(vid2))) == 1
-        finally:
-            try:
-                client.drop_view(sn, vn)
-            except Exception:
-                pass
-            client.drop_table(sn, tn)
-            client.drop_schema(sn)
+    batch = gnitz.ZSetBatch(gnitz.Schema(_KV))
+    batch.append(pk=2, val=20, _weight=-1)
+    client.push(tid, batch)
+    assert bag(client.scan(vid), "pk", "val") == {(1, 10): 1, (3, 30): 1}
 
-    def test_drop_one_of_two_views(self, client):
-        """Dropping one view leaves the other intact and working."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        tid, tn, cols, schema = self._setup(client, sn)
-        vn1, vn2 = "va" + _uid(), "vb" + _uid()
-        try:
-            vid1 = client.create_view(sn, vn1, tid, schema)
-            vid2 = client.create_view(sn, vn2, tid, schema)
-            batch = gnitz.ZSetBatch(schema)
-            batch.append(pk=1, val=10)
-            client.push(tid, batch)
-            client.drop_view(sn, vn1)
-            assert len(list(client.scan(vid2))) == 1
-            with pytest.raises(gnitz.GnitzError):
-                client.scan(vid1)
-        finally:
-            try:
-                client.drop_view(sn, vn2)
-            except Exception:
-                pass
-            client.drop_table(sn, tn)
-            client.drop_schema(sn)
 
-    def test_drop_table_after_view_dropped(self, client):
-        """Dropping a view and then its source table both succeed."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        tid, tn, cols, schema = self._setup(client, sn)
-        vn = "v" + _uid()
-        try:
-            client.create_view(sn, vn, tid, schema)
-            client.drop_view(sn, vn)
-            client.drop_table(sn, tn)
-        finally:
-            client.drop_schema(sn)
+def test_dropping_one_of_two_views_leaves_the_other_serving(client, schema_name):
+    """Two views over one source both receive every push; dropping one retires
+    exactly that id and leaves the other maintained."""
+    tid = client.create_table(schema_name, "src", _KV)
+    schema = gnitz.Schema(_KV)
+    v1 = client.create_view(schema_name, "va", tid, schema)
+    v2 = client.create_view(schema_name, "vb", tid, schema)
 
-    def test_drop_view_no_ghost_records(self, client):
-        """CREATE+DROP VIEW leaves no phantom rows in the VIEW system table."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        tid, tn, cols, schema = self._setup(client, sn)
-        vn = "v" + _uid()
-        try:
-            before = len(list(client.scan(gnitz.VIEW_TAB)))
-            client.create_view(sn, vn, tid, schema)
-            assert len(list(client.scan(gnitz.VIEW_TAB))) == before + 1
-            client.drop_view(sn, vn)
-            after = len(list(client.scan(gnitz.VIEW_TAB)))
-            assert after == before, (
-                f"Ghost rows: expected {before}, got {after} after DROP VIEW"
-            )
-        finally:
-            try:
-                client.drop_view(sn, vn)
-            except Exception:
-                pass
-            client.drop_table(sn, tn)
-            client.drop_schema(sn)
+    _push(client, tid, (1, 10))
+    assert bag(client.scan(v1), "pk", "val") == {(1, 10): 1}
+    assert bag(client.scan(v2), "pk", "val") == {(1, 10): 1}
 
-    def test_repeated_view_lifecycle(self, client):
-        """CREATE+DROP VIEW 10 times leaves no accumulated rows."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        tid, tn, cols, schema = self._setup(client, sn)
-        try:
-            baseline = len(list(client.scan(gnitz.VIEW_TAB)))
-            for i in range(10):
-                vn = f"rv{_uid()}"
-                client.create_view(sn, vn, tid, schema)
-                client.drop_view(sn, vn)
-            final = len(list(client.scan(gnitz.VIEW_TAB)))
-            assert final == baseline, (
-                f"Row count grew: {baseline} -> {final} after 10 create+drop cycles"
-            )
-        finally:
-            client.drop_table(sn, tn)
-            client.drop_schema(sn)
+    client.drop_view(schema_name, "va")
+    with pytest.raises(gnitz.GnitzError):
+        client.scan(v1)
+    _push(client, tid, (2, 20))
+    assert bag(client.scan(v2), "pk", "val") == {(1, 10): 1, (2, 20): 1}
+
+
+def test_a_dropped_views_catalog_row_is_retracted_not_shadowed(client, schema_name):
+    """`VIEW_TAB` returns to its exact prior height after ten create/drop cycles.
+
+    A scan drops ghosts and keeps only positive weights, so a weight-0 leftover
+    is invisible here by construction — what this catches is a row surviving the
+    DROP at *positive* weight, which accumulates one entry per cycle.
+    """
+    tid = client.create_table(schema_name, "src", _KV)
+    schema = gnitz.Schema(_KV)
+    baseline = len(list(client.scan(gnitz.VIEW_TAB)))
+    for _ in range(10):
+        vn = "rv" + _uid()
+        client.create_view(schema_name, vn, tid, schema)
+        client.drop_view(schema_name, vn)
+    assert len(list(client.scan(gnitz.VIEW_TAB))) == baseline
+
+
+def test_a_view_id_is_never_reused(client, schema_name):
+    """A recreated view name takes a fresh id, and the fresh id is maintained."""
+    tid = client.create_table(schema_name, "src", _KV)
+    schema = gnitz.Schema(_KV)
+    first = client.create_view(schema_name, "v", tid, schema)
+    client.drop_view(schema_name, "v")
+    second = client.create_view(schema_name, "v", tid, schema)
+    assert second != first
+
+    _push(client, tid, (1, 10))
+    assert bag(client.scan(second), "pk", "val") == {(1, 10): 1}
+
+
+# ── One DDL_TXN frame per catalog write ─────────────────────────────────────
+
+
+def test_every_single_family_catalog_write_rides_one_ddl_txn_frame(client, schema_name):
+    """CREATE and DROP of each of schema, table, index and view in sequence, so
+    every single-family path through the frame is exercised once. The view is
+    read between them: incremental maintenance has to survive the bundle."""
+    client.execute_sql(
+        "CREATE TABLE t (a BIGINT NOT NULL PRIMARY KEY, b BIGINT NOT NULL)", schema_name=schema_name)
+    client.execute_sql("CREATE INDEX ib ON t(b)", schema_name=schema_name)
+    client.execute_sql("CREATE VIEW v AS SELECT a FROM t", schema_name=schema_name)
+    client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=schema_name)
+    assert bag(scanned(client, schema_name, "v"), "a") == {(1,): 1}
+
+    client.execute_sql("DROP VIEW v", schema_name=schema_name)
+    client.execute_sql("DROP INDEX ib", schema_name=schema_name)
+    client.execute_sql("DROP TABLE t", schema_name=schema_name)
+
+
+# ── A DDL is visible to the next statement on another connection ────────────
+
+
+def test_drop_index_is_seen_by_the_next_statement(client, schema_name, server):
+    """A drops the index B's last plan used; B's very next statement must be
+    planned against the *absence* of that index.
+
+    A UUID equality makes the two outcomes distinguishable, because it has no
+    index-free plan at all: the predicate VM has no register for a 128-bit
+    column, so the WHERE only becomes servable when an index bound can consume
+    it byte-exactly (the `exact` arm).
+
+      * fresh (now empty) index list -> the planner's own
+        "128-bit columns cannot be used in expressions";
+      * stale index list -> an `exact` bound against a dropped index, which the
+        engine answers with "No index on cols ... for table ...".
+
+    Both are errors, so asserting on *which* error is what actually pins
+    freshness — a bare `raises` would pass either way.
+    """
+    client.execute_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, wide UUID NOT NULL)",
+        schema_name=schema_name)
+    u1 = "11111111-1111-1111-1111-111111111111"
+    u2 = "22222222-2222-2222-2222-222222222222"
+    client.execute_sql(f"INSERT INTO t VALUES (1, '{u1}'), (2, '{u2}')", schema_name=schema_name)
+    client.execute_sql("CREATE INDEX ix_wide ON t(wide)", schema_name=schema_name)
+
+    with gnitz.connect(server) as b:
+        # B plans against the index.
+        assert bag(rows(b, schema_name, f"SELECT id FROM t WHERE wide = '{u1}'"), "id") == {(1,): 1}
+
+        client.execute_sql("DROP INDEX ix_wide", schema_name=schema_name)
+
+        with pytest.raises(Exception) as ei:
+            rows(b, schema_name, f"SELECT id FROM t WHERE wide = '{u1}'")
+        msg = str(ei.value)
+        assert "128-bit columns cannot be used in expressions" in msg, (
+            f"B planned against a stale index list: {msg}")
+        assert "No index on cols" not in msg
+
+        # The relation itself is unaffected, and recreating the index makes the
+        # bounded read servable again at once.
+        assert bag(rows(b, schema_name, "SELECT id FROM t"), "id") == {(1,): 1, (2,): 1}
+        client.execute_sql("CREATE INDEX ix_wide ON t(wide)", schema_name=schema_name)
+        assert bag(rows(b, schema_name, f"SELECT id FROM t WHERE wide = '{u2}'"), "id") == {(2,): 1}

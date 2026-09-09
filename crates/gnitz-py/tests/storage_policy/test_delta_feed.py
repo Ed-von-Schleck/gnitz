@@ -448,9 +448,10 @@ def test_alter_view_on_a_fed_view_is_refused(client):
     sn = "s" + _uid()
     _base_tables(client, sn)
     _mk_feed(client, sn, "f", LINEAR)
-    with pytest.raises(gnitz.GnitzError) as e:
+    # The feed arm by name: "DROP and CREATE" alone is the tail both this and
+    # the capacity-bounded refusal share, so it cannot say which one fired.
+    with pytest.raises(gnitz.GnitzError, match="cannot retarget a view with a delta feed"):
         client.execute_sql("ALTER VIEW f AS SELECT id, v, body FROM t WHERE v > 20", schema_name=sn)
-    assert "DROP and CREATE" in str(e.value)
 
 
 def test_a_delta_read_of_a_relation_with_no_feed_is_an_error(client):
