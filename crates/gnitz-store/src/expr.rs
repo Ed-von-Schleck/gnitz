@@ -276,7 +276,7 @@ fn reindex_hash_row(output: &mut Batch, branch_id: u8) {
                 // to a single PK (which would collapse their +2 weight to +1).
                 hasher.update(&[branch_id]);
                 let null_word = mb.get_null_word(row);
-                for (pi, col) in output.schema.payload_columns() {
+                for (pi, col) in output.schema().payload_columns() {
                     let is_null = gnitz_wire::null_word_get(null_word, pi);
                     hasher.update(&[is_null as u8]);
                     if is_null {
@@ -539,7 +539,7 @@ impl MapPlan {
         let compacted;
         let (src, ranges) = if starves_kernel {
             compacted = {
-                let mut c = Batch::with_capacity(&src.schema, total);
+                let mut c = Batch::with_capacity(src.schema(), total);
                 c.append_ranges(&src.as_mem_batch(), ranges);
                 c
             };
@@ -557,14 +557,14 @@ impl MapPlan {
         let shares_blob = out.shares_blob_with(&src.as_mem_batch());
         // Worth a TLS pool pop only when some *copy* relocates a cell.
         let mut cache = match self.copies_a_string && !shares_blob {
-            true => crate::storage::BlobCacheGuard::acquire(&out.schema, total),
+            true => crate::storage::BlobCacheGuard::acquire(out.schema(), total),
             false => crate::storage::BlobCacheGuard::empty(),
         };
         // A different question: does this plan grow the output heap at all — a
         // string emit does, with no cache entry to its name. This is the only
         // presize `out.blob` ever gets, so dropping it trades one malloc for
         // geometric regrowth.
-        if out.schema.has_german_string() && !shares_blob && !src.blob.is_empty() {
+        if out.schema().has_german_string() && !shares_blob && !src.blob.is_empty() {
             out.reserve_blob(crate::storage::prorated_blob_cap(src.blob.len(), src.count, total));
         }
         let mut dst = old;

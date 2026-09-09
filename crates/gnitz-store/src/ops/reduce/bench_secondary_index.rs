@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use super::avi::{avi_batch, op_populate_avi, AviBake};
+use super::avi::{avi_batch, AviBake};
 use super::plan::ReducePlan;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
 use crate::storage::{Batch, RecoverySource, StoreBudgets, Table};
@@ -89,7 +89,7 @@ fn report(index: &str, population: Duration, sort: Duration, full: Duration) {
     // the decomposition rather than a restatement of it.
     println!("  layer sum                {:7.2} ns/row", p + s);
     println!(
-        "  op_populate_avi (full)   {f:7.2} ns/row   ({:.2} Mrows/s)",
+        "  avi_batch + ingest (full)   {f:7.2} ns/row   ({:.2} Mrows/s)",
         1000.0 / f
     );
 }
@@ -133,7 +133,7 @@ fn secondary_index_avi_decomposition_bench() {
             t
         },
         |mut t| {
-            op_populate_avi(&input, &mut t, &bake).unwrap();
+            t.ingest_owned_batch(avi_batch(&input, &bake)).unwrap();
             std::hint::black_box(&t);
         },
     );

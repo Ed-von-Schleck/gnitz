@@ -9,13 +9,12 @@
 
 use super::*;
 use gnitz_store::expr::MapPlan;
-use gnitz_store::storage::Table;
 
 pub(in crate::query) struct ProgramBuilder {
     instructions: Vec<Instr>,
     predicates: Vec<gnitz_expr::Evaluator>,
     maps: Vec<MapPlan>,
-    tables: Vec<Table>,
+    pub(in crate::query) state: CircuitState,
     reduce_plans: Vec<BakedReduce>,
     topn_plans: Vec<BakedTopN>,
 }
@@ -26,7 +25,7 @@ impl ProgramBuilder {
             instructions: Vec::with_capacity(16),
             predicates: Vec::new(),
             maps: Vec::new(),
-            tables: Vec::new(),
+            state: CircuitState::new(),
             reduce_plans: Vec::new(),
             topn_plans: Vec::new(),
         }
@@ -52,21 +51,12 @@ impl ProgramBuilder {
         idx
     }
 
-    /// Take ownership of `table`, returning the index `RegisterMeta::trace` names
-    /// it by. The `u16` holds under `compiler::MAX_CIRCUIT_NODES`.
-    pub(in crate::query) fn push_table(&mut self, table: Table) -> TableIdx {
-        debug_assert!(self.tables.len() < u16::MAX as usize);
-        let idx = TableIdx(self.tables.len() as u16);
-        self.tables.push(table);
-        idx
-    }
-
     /// Store a baked reduce plan with the table its value index lives in,
     /// returning its `Instr::Reduce::plan_idx`.
     pub(in crate::query) fn add_reduce_plan(
         &mut self,
         plan: gnitz_store::ops::ReducePlan,
-        avi_table: Option<TableIdx>,
+        avi_table: Option<StateIdx>,
     ) -> PlanIdx {
         debug_assert_eq!(
             plan.avi.is_some(),
@@ -83,7 +73,7 @@ impl ProgramBuilder {
     pub(in crate::query) fn add_topn_plan(
         &mut self,
         plan: gnitz_store::ops::TopNPlan,
-        index_table: TableIdx,
+        index_table: StateIdx,
     ) -> TopNIdx {
         let idx = TopNIdx(self.topn_plans.len() as u16);
         self.topn_plans.push(BakedTopN { plan, index_table });
@@ -102,12 +92,11 @@ impl ProgramBuilder {
         self.instructions.shrink_to_fit();
         self.predicates.shrink_to_fit();
         self.maps.shrink_to_fit();
-        self.tables.shrink_to_fit();
 
         let regfile = RegisterFile::new(&reg_meta);
         // The trace registers name their own backing tables, so the bind list is
         // read off the metas rather than tracked alongside them.
-        let trace_regs: Vec<(TraceReg, TableIdx)> = reg_meta
+        let trace_regs: Vec<(TraceReg, StateIdx)> = reg_meta
             .iter()
             .enumerate()
             .filter_map(|(reg, m)| m.owned_table.map(|t| (TraceReg(reg as u16), t)))
@@ -144,7 +133,7 @@ impl ProgramBuilder {
         Box::new(VmHandle {
             program,
             regfile,
-            tables: self.tables,
+            state: self.state,
             trace_regs,
             pending_ground_row,
         })

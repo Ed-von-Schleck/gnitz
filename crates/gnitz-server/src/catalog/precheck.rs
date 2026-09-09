@@ -12,8 +12,9 @@ use std::cmp::Ordering;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::*;
-use gnitz_store::schema::{make_index_schema, MAX_COLUMNS};
+use gnitz_store::schema::make_index_schema;
 use gnitz_store::storage::{compare_rows, compare_rows_except};
+use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME};
 
 /// The name rules a relation or index row must satisfy to be *stored*: non-empty
@@ -257,28 +258,28 @@ impl CatalogEngine {
         } else {
             let entry = self
                 .registry
-                .entry(col.fk_table_id)
+                .relation(col.fk_table_id)
                 .ok_or_else(|| format!("FK references unknown table_id {}", col.fk_table_id))?;
             // Not covered by the PK/UNIQUE tests below, which read only the schema:
             // a stream and a view both have a PK that looks exactly like a base
             // table's without being the unique, stored key the parent probe reads.
-            if !entry.kind.is_base_table() {
+            if !entry.kind().is_base_table() {
                 return Err(format!(
                     "FK references relation {}, which is a {}; a FOREIGN KEY must reference a base table",
                     col.fk_table_id,
-                    entry.kind.noun()
+                    entry.kind().noun()
                 ));
             }
-            if !entry.schema.is_lone_pk_col(col.fk_col_idx as usize) {
+            if !entry.schema().is_lone_pk_col(col.fk_col_idx as usize) {
                 // A composite index does not satisfy a single-column FK: a
                 // unique (a, b) does not guarantee uniqueness of `a` alone, so
                 // match only a single-column unique index on the referenced col.
-                let has_unique = entry.index_circuit_on(&[col.fk_col_idx]).is_some_and(|ic| ic.is_unique);
+                let has_unique = entry.index_on(&[col.fk_col_idx]).is_some_and(|ic| ic.is_unique());
                 if !has_unique {
                     return Err("FK must reference the primary key or a UNIQUE-indexed column".into());
                 }
             }
-            entry.schema.columns[col.fk_col_idx as usize].type_code
+            entry.schema().columns[col.fk_col_idx as usize].type_code
         };
 
         // Domain fit, not promoted equality: the lone-PK probe encodes the child
@@ -337,7 +338,7 @@ impl CatalogEngine {
     /// where a raw region `memcmp` would false-reject a valid rename.
     fn check_cas_and_net(&self, family: SysFamily, batch: &Batch, sig: &PkSignature) -> Result<i64, String> {
         let noun = family.row_noun();
-        let (live_weight, live) = self.sys_store(family).live_row_at(batch.get_pk_bytes(sig.row));
+        let (live_weight, live) = self.sys_relation(family).live_row_at(batch.get_pk_bytes(sig.row));
         if let Some(nj) = sig.neg {
             let Some(sr) = live.as_ref() else {
                 return Err(format!(
@@ -400,8 +401,8 @@ impl CatalogEngine {
 
             let Some((is_base, owner_schema)) = self
                 .registry
-                .entry(owner_id)
-                .map(|e| (e.kind.is_base_table(), e.schema))
+                .relation(owner_id)
+                .map(|e| (e.kind().is_base_table(), e.schema()))
             else {
                 if sig.neg.is_some() {
                     return Err(format!(
@@ -583,16 +584,16 @@ impl CatalogEngine {
         // nothing to recompute from. `ScanDelta` is the only external-source
         // opcode, so `source_ids` covers every circuit's every source.
         for &src in source_ids {
-            let Some(e) = self.registry.entry(src) else {
+            let Some(e) = self.registry.relation(src) else {
                 continue;
             };
-            if e.budgets.capacity_bytes.is_some() {
+            if e.is_bounded() {
                 return Err(format!(
                     "view '{name}' (vid={vid}) reads relation {src}, which is a \
                      capacity-bounded view; views cannot be created over one"
                 ));
             }
-            if budgets.capacity_bytes.is_some() && e.kind == RelationKind::Stream {
+            if budgets.capacity_bytes.is_some() && e.kind() == RelationKind::Stream {
                 return Err(format!(
                     "view '{name}' (vid={vid}) reads relation {src}, which is a stream; \
                      a capacity-bounded view cannot be created over one"
@@ -608,20 +609,20 @@ impl CatalogEngine {
     /// Only base tables can own a secondary index: index projection runs on the
     /// base-table DML paths (`ingest_store_and_indices`) alone, and view deltas
     /// land via the circuit-evaluation terminal-view moves, which never project
-    /// into `index_circuits`. The SQL binder rejects this by name resolution;
+    /// into a secondary index. The SQL binder rejects this by name resolution;
     /// this rejects a raw wire push before the row is persisted or broadcast.
     pub(in crate::catalog) fn validate_index_registration(
         &self,
         owner_id: i64,
-    ) -> Result<&gnitz_store::relation::TableEntry, String> {
+    ) -> Result<&gnitz_store::relation::Relation, String> {
         let entry = self
             .registry
-            .entry(owner_id)
+            .relation(owner_id)
             .ok_or_else(|| format!("Index: owner table {owner_id} not found"))?;
-        if !entry.kind.is_base_table() {
+        if !entry.kind().is_base_table() {
             return Err(format!(
                 "Index: owner {owner_id} is a {}; only a base table can be indexed",
-                entry.kind.noun()
+                entry.kind().noun()
             ));
         }
         Ok(entry)
@@ -688,9 +689,9 @@ impl CatalogEngine {
             // transaction is making it.
             let owner_kind = self
                 .registry
-                .entry(owner_id)
+                .relation(owner_id)
                 .map(|e| {
-                    if e.kind.is_view() {
+                    if e.kind().is_view() {
                         OWNER_KIND_VIEW
                     } else {
                         OWNER_KIND_TABLE
@@ -876,7 +877,7 @@ impl CatalogEngine {
             // Bounds, per-column eligibility (STRING/BLOB/float), and
             // arity/stride limits, identical to what registration will enforce —
             // only the table-name context is added here.
-            make_index_schema(cols.as_slice(), &entry.schema).map_err(|e| {
+            make_index_schema(cols.as_slice(), &entry.schema()).map_err(|e| {
                 format!(
                     "{e} for table '{}' (tid={owner_id})",
                     self.qualified_name_or_unknown(owner_id).1
@@ -918,8 +919,8 @@ impl CatalogEngine {
             // index survives the drop.
             let is_lone_pk = self
                 .registry
-                .entry(owner_id)
-                .is_some_and(|e| e.schema.is_lone_pk_col(src_col));
+                .relation(owner_id)
+                .is_some_and(|e| e.schema().is_lone_pk_col(src_col));
             if is_lone_pk {
                 continue;
             }

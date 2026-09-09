@@ -28,7 +28,7 @@ pub(in crate::query) enum HydrationSeed {
     /// Inner equi-join: one branch's trace. The seed enters mid-program because
     /// the join key is not the source PK, so a key-restricted feed at the
     /// `ScanDelta` register would mean scanning the whole source.
-    Trace(crate::query::vm::TableIdx),
+    Trace(gnitz_store::relation::StateIdx),
 }
 
 /// The graph half of a bounded view's hydration plan: which relation a linear

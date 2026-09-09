@@ -179,7 +179,7 @@ pub(crate) use unique_filter::UniqueFilter;
 /// a worker may mint its own typed status (`STATUS_DELTA_EXPIRED`) and the
 /// client reacts to the code rather than to the text.
 ///
-/// The type is `gnitz-wire`'s, not this module's: the engine's `scan_spec_family`
+/// The type is `gnitz-wire`'s, not this module's: the engine's `scan_spec`
 /// mints exactly this pair, the worker splits it onto the wire, and
 /// [`worker_error`] reassembles it here, so all three name one definition.
 pub(crate) use gnitz_wire::WireFault as WorkerFault;
@@ -244,14 +244,14 @@ pub(crate) enum Fanout {
 /// `fan_out_seek_by_index_collect` merges into `nw` duplicates for the client and
 /// `PreflightAccumulator::offer` reads as a duplicate key.
 pub(crate) fn read_fanout(disp: &MasterDispatcher, target_id: i64, spec: Option<SpecBytes<'_>>) -> Fanout {
-    let Some(entry) = disp.cat().registry().entry(target_id) else {
+    let Some(entry) = disp.cat().registry().relation(target_id) else {
         return Fanout::Broadcast;
     };
-    if entry.schema.placement().is_replicated() {
+    if entry.is_replicated() {
         return Fanout::One(0);
     }
     spec.and_then(gnitz_wire::peek_pk_range)
-        .and_then(|r| entry.schema.confined_worker(&r, disp.num_workers()))
+        .and_then(|r| entry.schema().confined_worker(&r, disp.num_workers()))
         .map_or(Fanout::Broadcast, Fanout::One)
 }
 

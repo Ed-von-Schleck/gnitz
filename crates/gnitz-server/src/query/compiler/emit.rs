@@ -8,47 +8,8 @@
 //! read them.
 
 use super::*;
-use crate::query::vm::{Instr, TableIdx};
+use crate::query::vm::Instr;
 use gnitz_store::ops::{merge_schemas_for_join, ClampPreset, JoinProbe, RangeProbe};
-
-// ---------------------------------------------------------------------------
-// ScratchGuard — drop-based cleanup of a failed compile's scratch directories
-// ---------------------------------------------------------------------------
-
-/// Scratch directories **this** plan build created, removed on drop — so any
-/// failed compile path leaks no inodes. On success the guard is `defuse`d and
-/// the directories stay alive under the VM's owned tables.
-pub(super) struct ScratchGuard(Vec<String>);
-
-impl ScratchGuard {
-    pub(super) fn new() -> Self {
-        ScratchGuard(Vec::new())
-    }
-    /// Create `dir`, and take responsibility for removing it iff the `mkdir`
-    /// created it — the guard's only way in.
-    fn create_dir(&mut self, dir: &str) -> Result<(), StorageError> {
-        if gnitz_store::storage::create_child(dir)? {
-            self.0.push(dir.to_string());
-        }
-        Ok(())
-    }
-    pub(super) fn defuse(&mut self) {
-        self.0.clear();
-    }
-}
-
-impl Drop for ScratchGuard {
-    fn drop(&mut self) {
-        for d in &self.0 {
-            // `remove_child`, not a bare `remove_dir_all`: a scratch child that
-            // resumed a checkpointed manifest at the current generation is trusted
-            // by the next open, and `remove_dir_all` deletes in readdir order — so
-            // a crash mid-removal could leave that manifest pointing at shards
-            // that are already gone.
-            gnitz_store::storage::remove_child(d);
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // EmitCtx — the per-plan build state every emit arm works against
@@ -71,7 +32,6 @@ pub(super) struct EmitCtx<'a> {
     pub(in crate::query) reg_meta: Vec<RegisterMeta>,
     pub(in crate::query) source_reg_map: FxHashMap<i64, DeltaReg>,
     pub(in crate::query) sink_reg_id: Option<DeltaReg>,
-    pub(in crate::query) scratch: &'a mut ScratchGuard,
 }
 
 /// What a node's emission left its value in — the one place the two register
@@ -99,44 +59,30 @@ impl OutReg {
 }
 
 impl EmitCtx<'_> {
-    /// Create a child table in a [`gnitz_store::storage::ChildAddr::Scratch`]
-    /// subdirectory of the view's directory.
-    fn create_child_table(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<Table, CompileError> {
-        let child_dir = gnitz_store::storage::ChildAddr::Scratch {
-            child: child_name,
-            rank: self.site.slot.rank,
-        }
-        .dir(self.site.dir);
-        self.scratch
-            .create_dir(&child_dir)
-            .map_err(|e| CompileError::StorageFailed("child table create failed", e))?;
-        Table::new(
-            &child_dir,
-            schema,
-            self.site.id as u32,
-            self.site.recovery,
-            self.site.budgets,
-        )
-        .map_err(|e| CompileError::StorageFailed("child table create failed", e))
+    /// Open one child store of this plan's operator state. The returned
+    /// [`StateIdx`] is the only way to reach it.
+    fn create_child_table(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<StateIdx, CompileError> {
+        self.builder
+            .state
+            .open_child(
+                self.site.registry,
+                self.site.id as i64,
+                self.site.dir,
+                child_name,
+                schema,
+            )
+            .map_err(|e| CompileError::StorageFailed("child table create failed", e))
     }
 
-    /// Allocate a trace register and the child table backing it
+    /// Allocate a trace register and the child store backing it
     /// (`bind_trace_cursors` opens a cursor on it each epoch). Returns the
     /// register and no index: the register is how every instruction reaches the
-    /// table ([`crate::query::vm::Program::trace_table_idx`]).
+    /// store ([`crate::query::vm::Program::trace_table_idx`]).
     fn push_trace_reg(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<TraceReg, CompileError> {
-        let idx = self.add_registerless_table(child_name, schema)?;
+        let idx = self.create_child_table(child_name, schema)?;
         let id = TraceReg(self.mint_reg());
         self.reg_meta.push(RegisterMeta::trace(schema, idx));
         Ok(id)
-    }
-
-    /// Create a child table that **no** register names: only the baked reduce
-    /// plan holding the returned `TableIdx` can reach it, so nothing else in the
-    /// program can read or write it and no cursor is bound to it per epoch.
-    fn add_registerless_table(&mut self, child_name: &str, schema: SchemaDescriptor) -> Result<TableIdx, CompileError> {
-        let t = self.create_child_table(child_name, schema)?;
-        Ok(self.builder.push_table(t))
     }
 
     /// The register `src` produced. The one rejection left after `topo_sorted`
@@ -265,7 +211,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
             let out_reg = ctx.push_delta_reg(out_schema);
             // The ordered index of every input row — the operator's whole
             // history, so a failed create fails the compile as a reduce's does.
-            let index = ctx.add_registerless_table(&format!("_topnidx_{}_{nid}", ctx.site.id), plan.index.schema)?;
+            let index = ctx.create_child_table(&format!("_topnidx_{}_{nid}", ctx.site.id), plan.index.schema)?;
             let plan_idx = ctx.builder.add_topn_plan(plan, index);
             ctx.builder
                 .push(Instr::TopN { in_reg, trace_out_reg, out_reg, plan_idx });
@@ -327,7 +273,7 @@ pub(super) fn emit_node(ctx: &mut EmitCtx, nid: i32, op: &gnitz_wire::OpNode) ->
             // Drops the rows this worker does not own before they reach
             // `integrate_trace`, by the compile-time slot.
             let in_reg = ctx.unary_delta_in(nid)?;
-            let slot = ctx.site.slot;
+            let slot = ctx.site.registry.slot();
             // A replicated view runs correct-local over the full broadcast, and at
             // one worker every partition is owned here — the filter is the identity
             // either way, and executing it would clone the whole delta each epoch.
@@ -431,7 +377,7 @@ fn emit_reduce(
         ));
     }
     let unsharded = shard_cols.is_none();
-    let slot = ctx.site.slot;
+    let slot = ctx.site.registry.slot();
     let i_am_owner = ctx.placement.is_replicated()
         || unsharded
         || slot.rank as usize == gnitz_wire::worker_for_key(gnitz_wire::global_group_key(), slot.of as usize);
@@ -449,7 +395,7 @@ fn emit_reduce(
     // has no other history, and would otherwise compute MIN/MAX from the delta
     // alone while still retracting the old row.
     let avi = match &plan.avi {
-        Some(bake) => Some(ctx.add_registerless_table(&format!("_avidx_{}_{nid}", ctx.site.id), bake.schema)?),
+        Some(bake) => Some(ctx.create_child_table(&format!("_avidx_{}_{nid}", ctx.site.id), bake.schema)?),
         None => None,
     };
 
@@ -476,7 +422,6 @@ pub(super) fn build_plan(
     ext_tables: &dyn SchemaSource,
     site: super::ViewSite<'_>,
     placement: gnitz_store::schema::Placement,
-    scratch: &mut ScratchGuard,
     target: PlanTarget,
 ) -> Result<(SubPlan, FxHashMap<i32, OutReg>), CompileError> {
     let exchange_inputs: &[(i32, SchemaDescriptor)] = match target {
@@ -506,7 +451,6 @@ pub(super) fn build_plan(
         reg_meta,
         source_reg_map: FxHashMap::default(),
         sink_reg_id: None,
-        scratch,
     };
 
     for &nid in ordered {

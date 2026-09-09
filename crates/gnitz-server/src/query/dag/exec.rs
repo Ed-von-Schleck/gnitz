@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::query::compiler::{Side, Sides};
+use gnitz_store::relation::Relation;
 use gnitz_store::storage::StorageError;
 
 /// One edge of a tick's schedule: `producer`'s output feeds `view`, and `depth`
@@ -67,7 +68,7 @@ impl DagEngine {
         // Routing comes off the one memoized `ViewMeta` the master relay also
         // reads; the plan supplies only its executable shape. Taken before the
         // plan borrow, so the memo lookup and the cache read do not overlap.
-        let meta = match registry.relation_is_replicated(view_id) {
+        let meta = match registry.relation(view_id).is_some_and(Relation::is_replicated) {
             true => None,
             false => Some(self.view_meta(registry, view_id).ok_or_else(|| {
                 format!("view {view_id}: circuit unreadable or unroutable; its delta has no scatter key")
@@ -247,8 +248,10 @@ impl DagEngine {
             // exchange-dependent consumer runs and collective rounds stay in
             // lockstep.
             let out = echo.unwrap_or_else(|| {
-                let entry = registry.entry(step.view).expect("the schedule names registered views");
-                Batch::empty_with_schema(&entry.schema)
+                let entry = registry
+                    .relation(step.view)
+                    .expect("the schedule names registered views");
+                Batch::empty_with_schema(&entry.schema())
             });
             Self::fan_out(&mut inputs, fed, out);
         }
@@ -276,7 +279,7 @@ impl DagEngine {
             Some(held) => {
                 // The held batch's schema, not the incoming one: it selects
                 // `payload_cmp` and is what the union's result is certified under.
-                let schema = held.schema;
+                let schema = *held.schema();
                 *slot = Some(ops::op_union(held, &delta, &schema));
             }
             None => *slot = Some(delta),
@@ -328,7 +331,10 @@ impl DagEngine {
         // manifest at open. Here as well as in the ingest verb, which a chunk
         // producing no rows never reaches.
         debug_assert!(
-            registry.relation_kind(view_id).is_none_or(|k| k.is_view()),
+            registry
+                .relation(view_id)
+                .map(Relation::kind)
+                .is_none_or(|k| k.is_view()),
             "distributed backfill into durable relation {view_id}: \
              would double-count loaded shards",
         );

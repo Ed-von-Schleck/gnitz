@@ -39,7 +39,7 @@ use crate::runtime::reactor::{
 };
 use crate::runtime::sal::{DirectGroup, GroupTargets, SalFit, SalMessageKind};
 use crate::runtime::wire::{self as ipc, validate_schema_match, BACKFILL_DECISION_CONTINUE};
-use gnitz_store::relation::RelationKind;
+use gnitz_store::relation::{Relation, RelationKind};
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::Batch;
 use gnitz_wire::txn_frame::validate_item_ids;
@@ -182,7 +182,7 @@ pub struct Shared {
     /// is ever held across an `.await`.
     table_commit_lsn: RefCell<FxHashMap<i64, u64>>,
     /// The default for a `table_commit_lsn` miss (a table not written this boot),
-    /// seeded to `max_table_current_lsn()` — the value `lsn_alloc.published()`
+    /// seeded to `max_current_lsn()` — the value `lsn_alloc.published()`
     /// also starts at. Within a boot every live OCC basis is ≥ it and every
     /// commit's zone exceeds it, so a miss cannot false-pass. That rests on no
     /// basis surviving a restart (`gnitz-core`'s `last_seen_lsn`), not on this
@@ -382,7 +382,7 @@ impl ServerExecutor {
         // Seed the zone-LSN allocator above every table's current_lsn so each
         // new zone LSN is strictly greater, keeping the `submit` path's direct
         // current_lsn assignment monotonic across restarts.
-        let initial_lsn = dispatcher.cat().registry().max_table_current_lsn();
+        let initial_lsn = dispatcher.cat().registry().max_current_lsn();
 
         let (committer_tx, committer_rx) = chan::unbounded::<CommitRequest>();
         let (tick_tx, tick_rx) = chan::unbounded::<TickTrigger>();
@@ -1087,7 +1087,8 @@ fn decode_push_frame(
             shared
                 .cat()
                 .registry()
-                .get_schema_desc(target_id)
+                .relation(target_id)
+                .map(Relation::schema)
                 .ok_or(PushReject::SchemaMismatch)?,
         )
     } else {
@@ -1274,7 +1275,7 @@ async fn serve_seek(shared: &Rc<Shared>, peer: &Peer, ctrl: &gnitz_wire::control
         // Bound before the match: a scrutinee's temporaries live to the end of
         // the match, so the `&mut CatalogEngine` would be held across the awaits
         // in the arms — one of which mints a second borrow of its own.
-        let found = guard_panic("seek", || shared.cat_mut().seek_family(target_id, pk, seek_pk_extra));
+        let found = guard_panic("seek", || shared.cat_mut().seek(target_id, pk, seek_pk_extra));
         match found {
             Ok((batch, _)) => send_ok_response(shared, peer, target_id, batch.as_ref(), client_id, pk, client_version),
             Err(e) => send_error(peer, target_id, client_id, e.as_bytes()),
@@ -1447,7 +1448,8 @@ fn validate_client_schema(shared: &Shared, tid: i64, client: &SchemaDescriptor) 
     let expected = shared
         .cat()
         .registry()
-        .get_schema_desc(tid)
+        .relation(tid)
+        .map(Relation::schema)
         .ok_or_else(|| format!("table {tid} has no registered schema"))?;
     validate_schema_match(client, &expected)?;
     Ok(expected)
@@ -1547,7 +1549,7 @@ enum Access {
 /// ([`STATUS_NOT_FOUND`]): the arms below name a relation that exists, which a
 /// client must not recover from the way it recovers from a vanished one.
 fn target_kind(shared: &Shared, target_id: i64, access: Access) -> Result<RelationKind, WireFault> {
-    let Some(kind) = shared.cat().registry().relation_kind(target_id) else {
+    let Some(kind) = shared.cat().registry().relation(target_id).map(Relation::kind) else {
         return Err(WireFault {
             status: STATUS_NOT_FOUND,
             text: format!("table {target_id} not found"),
@@ -1632,7 +1634,8 @@ async fn handle_seek_by_index(
     if shared
         .cat()
         .registry()
-        .index_circuit_for_cols(target_id, cols.as_slice())
+        .relation(target_id)
+        .and_then(|r| r.index_on(cols.as_slice()))
         .is_none()
     {
         // No secondary index for this column list: a dedicated control-only
@@ -1706,8 +1709,8 @@ fn resolve_request_target(
     Ok(shared
         .cat()
         .registry()
-        .entry(candidate)
-        .map(|e| (candidate, e.kind, e.class())))
+        .relation(candidate)
+        .map(|e| (candidate, e.kind(), e.class())))
 }
 
 /// Build the RESOLVE reply: the schema block plus the [`gnitz_wire::RelDescriptorBlob`]
@@ -1739,7 +1742,12 @@ fn build_resolve_reply(
     // re-plan an aggregate over a view on a second authority. A misreport either way
     // is a silent W-fold overcount: a replicated relation read as non-replicated has
     // every worker holding a full copy *and* its partials summed.
-    let replicated = kind.is_ingestion_point() && shared.cat().registry().relation_is_replicated(tid);
+    let replicated = kind.is_ingestion_point()
+        && shared
+            .cat()
+            .registry()
+            .relation(tid)
+            .is_some_and(Relation::is_replicated);
 
     // Off the FK edge cache the catalog maintains from the same COL_TAB delta as
     // the column defs, one edge per (child, child column) — so this needs no band
@@ -1759,11 +1767,12 @@ fn build_resolve_reply(
     let indexes: Vec<gnitz_wire::RelIndex> = shared
         .cat()
         .registry()
-        .index_circuits(tid)
+        .relation(tid)
+        .map_or(&[][..], Relation::indexes)
         .iter()
         .map(|ic| gnitz_wire::RelIndex {
-            cols: ic.col_indices,
-            is_unique: ic.is_unique,
+            cols: ic.cols(),
+            is_unique: ic.is_unique(),
         })
         .collect();
     let blob = gnitz_wire::RelDescriptorBlob {
@@ -1771,7 +1780,11 @@ fn build_resolve_reply(
         replicated,
         // Answered off the registry's own `delta_bytes`, so a subscriber discovers
         // the capability here instead of probing for it with a read that errors.
-        delta: shared.cat().registry().relation_has_delta_feed(tid),
+        delta: shared
+            .cat()
+            .registry()
+            .relation(tid)
+            .is_some_and(Relation::has_delta_feed),
         fks,
         indexes,
     }
@@ -1783,7 +1796,8 @@ fn build_resolve_reply(
     let schema = shared
         .cat()
         .registry()
-        .get_schema_desc(tid)
+        .relation(tid)
+        .map(Relation::schema)
         .ok_or_else(|| format!("table {tid} not found"))?;
     let entry = shared.cat_mut().schema_wire_entry(tid, &schema);
     let (schema_block, server_version) = (entry.block, entry.version);
@@ -1814,7 +1828,8 @@ fn read_is_fresh(shared: &Rc<Shared>, target: i64) -> bool {
     if !shared
         .cat()
         .registry()
-        .relation_kind(target)
+        .relation(target)
+        .map(Relation::kind)
         .is_some_and(|k| k.is_view())
     {
         return true;
@@ -1906,9 +1921,9 @@ async fn read_lock(
 /// handed to the workers is `server_version` either way, a cache hit meaning the
 /// client's already equals it.
 fn schema_block_for_reply(shared: &Rc<Shared>, tid: i64, client_version: u16) -> (u16, Option<Rc<Vec<u8>>>) {
-    let (block, server_version) = shared
-        .cat_mut()
-        .negotiated_schema_block(tid, client_version, |c| c.registry().get_schema_desc(tid));
+    let (block, server_version) = shared.cat_mut().negotiated_schema_block(tid, client_version, |c| {
+        c.registry().relation(tid).map(Relation::schema)
+    });
     (server_version, block)
 }
 
@@ -1929,7 +1944,7 @@ fn prelim_schema_msg(tid: i64, client_id: u64, server_version: u16, block: &[u8]
 /// SCAN: a catalog family is served master-locally, everything else fans out to
 /// the workers. The split is decided by the kind `read_lock` resolved, not by the
 /// id — so a scan of an id below the user floor that names no family is rejected
-/// by the same "not found" the other verbs give, rather than by `scan_family`.
+/// by the same "not found" the other verbs give, rather than by `scan`.
 async fn handle_scan(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, client_version: u16) {
     let Some((_g, kind)) = read_lock(shared, peer, client_id, target_id, Access::Read, ReadFreshness::Current).await
     else {
@@ -2220,7 +2235,11 @@ fn poll_read_for_view<'a>(
 /// feed: both must reach the store, the second to be refused there.
 fn delta_up_to_date(shared: &Shared, target_id: i64, after_tick: u64) -> bool {
     after_tick > 0
-        && shared.cat().registry().relation_has_delta_feed(target_id)
+        && shared
+            .cat()
+            .registry()
+            .relation(target_id)
+            .is_some_and(Relation::has_delta_feed)
         && after_tick >= shared.disp().last_delta_round(target_id)
 }
 
@@ -2363,7 +2382,7 @@ async fn scan_multi_body(shared: &Rc<Shared>, peer: &Peer, client_id: u64, data:
 /// `!has_writer && writers_waiting == 0`, so a nested read parks forever the
 /// moment a DDL writer queues.
 async fn scan_system_family(shared: &Rc<Shared>, peer: &Peer, client_id: u64, target_id: i64, client_version: u16) {
-    match guard_panic("scan", || shared.cat_mut().scan_family(target_id)) {
+    match guard_panic("scan", || shared.cat_mut().scan(target_id)) {
         Ok((b, _)) => {
             let batch_ref = if !b.is_empty() { Some(b) } else { None };
             send_ok_response(

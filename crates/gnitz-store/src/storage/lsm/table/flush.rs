@@ -25,7 +25,7 @@ impl Table {
     ///
     /// Its one production caller is the post-backfill fold, and that runs on a
     /// view — so the durable arm is reached from tests alone.
-    pub fn flush(&mut self) -> Result<(), StorageError> {
+    pub(crate) fn flush(&mut self) -> Result<(), StorageError> {
         super::super::flush_barrier::flush_barrier([&mut *self], FlushRound::Base)
     }
 
@@ -58,7 +58,7 @@ impl Table {
     /// two never cancels — the RAM-tier fold is heap-only, `run_compact` is
     /// disk-only. That costs disk footprint, not heap (which stays ≤ the ceiling
     /// by construction), and the disk tier still self-compacts.
-    pub fn flush_to_ram(&mut self) -> Result<(), StorageError> {
+    pub(crate) fn flush_to_ram(&mut self) -> Result<(), StorageError> {
         self.fold_memtable_into_ram_tier();
         if !self.ram_tier.is_full() {
             return Ok(());

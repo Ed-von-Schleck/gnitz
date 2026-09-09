@@ -14,7 +14,7 @@ fn test_worker_filter_keeps_only_this_workers_rows() {
     // union across workers is the whole batch with no duplication.
     let mut total_kept = 0usize;
     for wid in 0..num_workers {
-        let out = op_worker_filter(&batch, &schema, wid, num_workers);
+        let out = op_worker_filter(&batch, wid, num_workers);
         total_kept += out.count;
         for r in 0..out.count {
             let pk = out.get_pk_bytes(r);
@@ -29,7 +29,7 @@ fn test_worker_filter_keeps_only_this_workers_rows() {
 fn test_worker_filter_single_worker_keeps_all() {
     let schema = make_schema_u64_i64();
     let batch = make_batch(&schema, &[(1, 1, 10), (2, 1, 20), (3, 1, 30)]);
-    let out = op_worker_filter(&batch, &schema, 0, 1);
+    let out = op_worker_filter(&batch, 0, 1);
     assert_eq!(out.count, 3, "(0, 1) must keep every row");
 }
 
@@ -37,7 +37,7 @@ fn test_worker_filter_single_worker_keeps_all() {
 fn test_worker_filter_empty_in_empty_out() {
     let schema = make_schema_u64_i64();
     let batch = make_batch(&schema, &[]);
-    let out = op_worker_filter(&batch, &schema, 1, 4);
+    let out = op_worker_filter(&batch, 1, 4);
     assert_eq!(out.count, 0);
 }
 

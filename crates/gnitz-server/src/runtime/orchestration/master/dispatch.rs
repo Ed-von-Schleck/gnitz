@@ -6,6 +6,7 @@
 use super::*;
 use gnitz_foundation::fault::Seam;
 use gnitz_foundation::posix_io::retry_eintr;
+use gnitz_store::relation::Relation;
 use gnitz_wire::{low_bits_mask, BitIter};
 
 /// A worker set rides in one word (`signal_reached`, `collect_acks_and_relay`),
@@ -470,7 +471,7 @@ impl MasterDispatcher {
         // that cannot hit, and such a view needs no rule anyway: one whose
         // sources are all replicated is itself stamped replicated and computes
         // locally without ever reaching an exchange.
-        let n_src = if source_id > 0 && cat.registry().relation_is_replicated(source_id) {
+        let n_src = if source_id > 0 && cat.registry().relation(source_id).is_some_and(Relation::is_replicated) {
             1
         } else {
             payloads.len()
@@ -884,7 +885,7 @@ impl MasterDispatcher {
         };
         let mut map = self.last_delta_round.borrow_mut();
         for vid in reached {
-            if cat.registry().relation_has_delta_feed(vid) {
+            if cat.registry().relation(vid).is_some_and(Relation::has_delta_feed) {
                 map.insert(vid, round);
             }
         }
@@ -1101,7 +1102,8 @@ impl MasterDispatcher {
     pub(crate) fn schema_desc_for(&self, target_id: i64) -> SchemaDescriptor {
         self.cat()
             .registry()
-            .get_schema_desc(target_id)
+            .relation(target_id)
+            .map(Relation::schema)
             .unwrap_or_else(|| panic!("master: no schema for target_id={target_id}"))
     }
 }

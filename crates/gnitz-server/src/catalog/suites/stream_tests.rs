@@ -15,24 +15,24 @@ fn stream_flag_registers_storeless_with_no_directory() {
     let sid = create_flagged_table(&mut engine, "s", &cols, &[0], stream_flags());
     let tid = create_flagged_table(&mut engine, "t", &cols, &[0], 0);
 
-    let entry = engine.registry().table_entry(sid).expect("stream registered");
-    assert_eq!(entry.kind, RelationKind::Stream);
-    assert!(entry.owned_store().is_none(), "a stream holds no store");
+    let entry = engine.registry().relation_or_err(sid).expect("stream registered");
+    assert_eq!(entry.kind(), RelationKind::Stream);
+    // No directory is what says it holds no store: `build_relation_store`
+    // creates one for every kind that opens one.
     assert!(
-        !std::path::Path::new(&entry.directory).exists(),
+        !std::path::Path::new(entry.directory()).exists(),
         "a stream gets no directory: {}",
-        entry.directory
+        entry.directory()
     );
     // Its reads are empty rather than erroring, and its LSN never advances.
     assert_eq!(entry.full_scan().len(), 0);
-    assert_eq!(entry.owned_store().map_or(0, Table::current_lsn), 0);
+    assert_eq!(entry.current_lsn(), 0);
 
     // The same word with the bit clear is still an ordinary base table with a
     // directory, so the assertions above are about the flag and not the fixture.
-    let base = engine.registry().table_entry(tid).expect("table registered");
-    assert_eq!(base.kind, RelationKind::BaseTable);
-    assert!(base.owned_store().is_some());
-    assert!(std::path::Path::new(&base.directory).exists());
+    let base = engine.registry().relation_or_err(tid).expect("table registered");
+    assert_eq!(base.kind(), RelationKind::BaseTable);
+    assert!(std::path::Path::new(base.directory()).exists());
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -149,7 +149,7 @@ fn stream_fed_views_are_invalid_at_boot() {
     // generation — a completed checkpoint.
     engine.record_topology(1).unwrap();
     let g = engine.bump_checkpoint_generation().unwrap();
-    engine.registry_mut().flush_ephemeral_outputs(g).unwrap();
+    engine.registry_mut().checkpoint_ephemeral(g, []).unwrap();
 
     engine.compute_invalid_views();
     assert!(engine.view_is_invalid(direct), "a direct stream source invalidates");

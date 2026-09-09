@@ -90,7 +90,7 @@ impl ReadCursor {
             });
             // The merge walk emits in (PK, payload) order with consolidated
             // weights; `write_to_batch` returns `Raw`, so certify `Consolidated`.
-            batch.certify_layout(Layout::Consolidated, &self.schema);
+            batch.certify_layout(Layout::Consolidated);
             batch
         });
         self.merge_order = order;

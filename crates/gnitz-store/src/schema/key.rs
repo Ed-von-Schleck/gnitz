@@ -155,7 +155,7 @@ pub fn opk_key_cols(schema: &SchemaDescriptor, natives: &[u128]) -> PkBuf {
 
 /// [`gnitz_wire::control::join_ctrl_key`] then [`opk_key`]: the shared seek-key
 /// encoder for the master partition router (`fan_out_seek`) and the worker SEEK
-/// handler (`seek_family`) at every PK width. The seek frame carries native LE
+/// handler (`seek`) at every PK width. The seek frame carries native LE
 /// column bytes, not the OPK a PK region holds.
 pub fn seek_opk_bytes(schema: &SchemaDescriptor, low: u128, extra: &[u8]) -> Result<PkBuf, String> {
     let stride = schema.pk_stride();

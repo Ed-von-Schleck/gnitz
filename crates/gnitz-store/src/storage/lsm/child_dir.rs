@@ -29,13 +29,11 @@ pub enum ChildAddr<'a> {
     /// is one store per launched worker and nothing repartitions it.
     ///
     /// A grammar of its own rather than a `Scratch` child, even though that would
-    /// give the reclaim sweep and the ownership rule for free:
-    /// `RelationRegistry::reset_store` blanket-removes **every** `Scratch` child
-    /// at this rank, and does so *after* the store handles have been reopened —
-    /// so the delta store's directory would be unlinked out from under a live
-    /// `Table`. It also keeps a catalog-owned store out of a grammar the compiler
-    /// owns (`EmitCtx::create_child_table` and its `ScratchGuard` create and clean up
-    /// `Scratch` children).
+    /// give the reclaim sweep and the ownership rule for free: a view reset
+    /// blanket-removes **every** `Scratch` child at this rank, *after* its stores
+    /// have been reopened — so a delta store's directory would be unlinked out
+    /// from under a live `Table`. It also keeps a relation's own store out of the
+    /// grammar a compiled circuit's operator state owns.
     Delta { rank: u32 },
     /// `idx_{id}` — a secondary index's own directory. Not a store of the owner
     /// relation: never repartitioned, and owned at every worker count (each
@@ -164,7 +162,7 @@ pub(crate) fn state_child_manifests(rel_dir: &str, num_workers: u32) -> Vec<Stri
 /// A failed read answers `false`, which is safe here because the verdict's only
 /// consequence is a rebuild — `manifest::at_generation` keeps the `Err` for
 /// `Table::new`, whose consequence is erasing shards.
-pub fn children_at_generation(rel_dir: &str, num_workers: u32, generation: u64) -> bool {
+pub(crate) fn children_at_generation(rel_dir: &str, num_workers: u32, generation: u64) -> bool {
     state_child_manifests(rel_dir, num_workers)
         .iter()
         .all(|m| manifest::at_generation(m, generation).unwrap_or(false))
@@ -177,7 +175,7 @@ pub fn children_at_generation(rel_dir: &str, num_workers: u32, generation: u64) 
 /// Materialized rather than streamed: callers unlink entries from the directory
 /// they are walking, and `readdir` may skip entries when the directory is
 /// modified mid-iteration.
-pub fn subdir_names(path: &str) -> Vec<String> {
+pub(crate) fn subdir_names(path: &str) -> Vec<String> {
     let Ok(entries) = fs::read_dir(path) else {
         return Vec::new();
     };
@@ -238,7 +236,7 @@ pub(super) fn link_child(
 /// [`state_child_manifests`] cannot see: it enumerates the scratch children, so
 /// the survivors alone answer the resume verdict.
 #[must_use = "only a child this call created may be removed again"]
-pub fn create_child(dir: &str) -> Result<bool, StorageError> {
+pub(crate) fn create_child(dir: &str) -> Result<bool, StorageError> {
     match fs::create_dir(dir) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -257,7 +255,7 @@ pub fn create_child(dir: &str) -> Result<bool, StorageError> {
 /// is what keeps a crash from leaving a manifest whose shards are gone — a
 /// state a `SalReplay` open cannot recover from. Best-effort: failing to
 /// reclaim costs disk space, not correctness.
-pub fn remove_child(dir: &str) {
+pub(crate) fn remove_child(dir: &str) {
     let _ = fs::remove_file(manifest::path(dir));
     let _ = fsync_dir(dir);
     let _ = fs::remove_dir_all(dir);

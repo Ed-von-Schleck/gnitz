@@ -51,16 +51,11 @@ impl std::fmt::Display for OpBuildErr {
     }
 }
 
-// One rule for what this module re-exports: a *schema fact* — what a column's
-// type is, how many of them there can be, how a key is shaped — comes through
-// `crate::schema::X` at every engine call site. A *byte primitive* — how a value
-// is encoded, decoded, or hashed to a partition — never does; those are named
-// `gnitz_wire::X` directly, including inside this file.
-pub use gnitz_wire::type_code;
-pub use gnitz_wire::ReduceOutKey;
+pub(crate) use gnitz_wire::type_code;
+pub(crate) use gnitz_wire::ReduceOutKey;
 pub(crate) use gnitz_wire::TypeCode;
-pub use gnitz_wire::MAX_COLUMNS;
-pub use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
+pub(crate) use gnitz_wire::MAX_COLUMNS;
+pub(crate) use gnitz_wire::{MAX_PK_BYTES, MAX_PK_COLUMNS};
 
 /// Resolved column addressing, homed in the leaf `gnitz-expr` crate so the
 /// expression evaluator (and, through it, the SQL client) shares one definition
@@ -91,7 +86,7 @@ pub use key::IndexKeySpec;
 /// bound lives with the array instead of being re-derived — differently, and
 /// PK-inclusively — at each caller. Node/column lists are client-supplied
 /// catalog data, so an overflowing one must fail the compile, not abort.
-pub struct DerivedSchema {
+pub(crate) struct DerivedSchema {
     cols: [SchemaColumn; MAX_COLUMNS],
     n: usize,
     pk_len: usize,
@@ -105,7 +100,7 @@ impl Default for DerivedSchema {
 }
 
 impl DerivedSchema {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         DerivedSchema {
             cols: [SchemaColumn::EMPTY; MAX_COLUMNS],
             n: 0,
@@ -115,7 +110,7 @@ impl DerivedSchema {
     }
 
     /// Append one payload column.
-    pub fn push(&mut self, col: SchemaColumn) -> Option<()> {
+    pub(crate) fn push(&mut self, col: SchemaColumn) -> Option<()> {
         *self.cols.get_mut(self.n)? = col;
         self.n += 1;
         Some(())
@@ -128,7 +123,7 @@ impl DerivedSchema {
     /// Rejects everything `SchemaDescriptor::new` *asserts* (see
     /// [`SchemaDescriptor::new_with_placement`]), so a caller passing an unvetted
     /// column type gets a `None` rather than an abort inside `finish()`.
-    pub fn push_pk(&mut self, col: SchemaColumn) -> Option<()> {
+    pub(crate) fn push_pk(&mut self, col: SchemaColumn) -> Option<()> {
         if self.pk_len != self.n
             || self.pk_len == MAX_PK_COLUMNS
             || self.pk_bytes + col.size() as usize > MAX_PK_BYTES
@@ -145,14 +140,14 @@ impl DerivedSchema {
 
     /// Append `schema`'s PK columns in PK-list order — the shared prologue of
     /// every builder that inherits its input's key.
-    pub fn push_pk_of(&mut self, schema: &SchemaDescriptor) -> Option<()> {
+    pub(crate) fn push_pk_of(&mut self, schema: &SchemaDescriptor) -> Option<()> {
         for (_, c) in schema.pk_columns() {
             self.push_pk(*c)?;
         }
         Some(())
     }
 
-    pub fn finish(&self) -> SchemaDescriptor {
+    pub(crate) fn finish(&self) -> SchemaDescriptor {
         let pk_idx: [u32; MAX_PK_COLUMNS] = std::array::from_fn(|i| i as u32);
         SchemaDescriptor::new(&self.cols[..self.n], &pk_idx[..self.pk_len])
     }
@@ -533,7 +528,7 @@ impl SchemaDescriptor {
     /// True when `self` is `prev` with zero or more columns appended — every
     /// column `prev` had keeping its position, `type_code` and PK membership.
     /// What leaves a baked span-encode plan's offsets and payload slots valid.
-    pub fn is_trailing_append_of(&self, prev: &SchemaDescriptor) -> bool {
+    pub(crate) fn is_trailing_append_of(&self, prev: &SchemaDescriptor) -> bool {
         self.pk_indices() == prev.pk_indices()
             && self.num_columns() >= prev.num_columns()
             && (0..prev.num_columns()).all(|i| self.columns[i].type_code == prev.columns[i].type_code)
@@ -743,7 +738,7 @@ impl SchemaDescriptor {
     }
 
     /// The output-key kind a reduce grouped by `cols` over this schema warrants.
-    pub fn reduce_out_key(&self, cols: &[u32]) -> ReduceOutKey {
+    pub(crate) fn reduce_out_key(&self, cols: &[u32]) -> ReduceOutKey {
         ReduceOutKey::for_group_cols(self.pk_indices(), cols, |c| {
             let col = &self.columns[c as usize];
             (col.type_code, col.nullable != 0)

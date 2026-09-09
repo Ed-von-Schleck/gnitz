@@ -21,7 +21,7 @@ const FD_CHUNK_THRESHOLD: usize = 256;
 
 /// Which checkpoint round a barrier publishes.
 #[derive(Clone, Copy)]
-pub enum FlushRound {
+pub(crate) enum FlushRound {
     /// Base tables: a `SalReplay` store publishes a manifest, a rederived one
     /// folds to RAM inline and publishes nothing.
     Base,
@@ -43,7 +43,7 @@ impl FlushRound {
 }
 
 /// Flush every table in `tables` through the two-phase publish for `round`.
-pub fn flush_barrier<'a>(
+pub(crate) fn flush_barrier<'a>(
     tables: impl IntoIterator<Item = &'a mut Table>,
     round: FlushRound,
 ) -> Result<(), StorageError> {

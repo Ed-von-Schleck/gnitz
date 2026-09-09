@@ -89,7 +89,7 @@ impl StoreError {
 
     /// Prefix a `Storage` context with what the caller was doing; the other
     /// variants are the callee's whole answer and pass through unchanged.
-    pub fn in_context(self, what: &str) -> Self {
+    pub(crate) fn in_context(self, what: &str) -> Self {
         match self {
             StoreError::Storage { context, err } => StoreError::Storage {
                 context: format!("{what}: {context}"),

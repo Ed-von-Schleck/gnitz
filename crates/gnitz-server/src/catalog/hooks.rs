@@ -166,18 +166,17 @@ impl CatalogEngine {
             directory,
             name,
             id,
-            self.registry.num_workers()
+            self.registry.slot().of
         );
-        // Bound to this open because it needs the previous child set, which the
-        // open would shadow and `reconcile_child_dirs` then deletes. Views are
-        // exempt: a worker-count change invalidates every one, so
-        // `rebuild_invalid_views` refills them from base.
-        if self.ctx.mode() == ApplyMode::Replay && kind.is_base_table() {
-            gnitz_store::storage::repartition_relation(&directory, &schema, id as u32, self.registry.num_workers())?;
-        }
-        // `register` owns the staged-directory reclaim and the parent fsync.
-        self.registry
-            .register(RelationSpec { id, kind, schema, directory, budgets })?;
+        // `register` owns the boot relayout, the staged-directory reclaim and the
+        // parent fsync.
+        self.registry.register(
+            RelationSpec { id, kind, schema, directory, budgets },
+            match self.ctx.mode() {
+                ApplyMode::Replay => OnRegister::BootReplay,
+                _ => OnRegister::Live,
+            },
+        )?;
         raise_id_counter(&mut self.next_table_id, id);
         Ok(())
     }
@@ -191,7 +190,7 @@ impl CatalogEngine {
     /// `apply_index_caches` / `invalidate_col_names` bumps would otherwise
     /// `or_insert` them straight back.
     fn drop_relation(&mut self, id: i64, cascade: impl FnOnce(&mut Self) -> Result<(), String>) -> Result<(), String> {
-        let Some(directory) = self.registry.entry(id).map(|e| e.directory.clone()) else {
+        let Some(directory) = self.registry.relation(id).map(|e| e.directory().to_string()) else {
             return Ok(());
         };
         cascade(self)?;
@@ -215,12 +214,12 @@ impl CatalogEngine {
             // Storage is applied before hooks fire, so a rename pair reads
             // net-live and a genuine drop reads net-dead — including at boot
             // replay, where the pair has already folded to `+1`.
-            let net_live = self.sys_store(family).has_pk_bytes(batch.get_pk_bytes(i));
+            let net_live = self.sys_relation(family).has_pk(batch.get_pk_bytes(i));
 
             if weight > 0 {
-                // System tables are pre-registered by `register_system_table_families`
-                // before `replay_catalog` fires hooks, so their rows show up here
-                // with the DAG already populated; a rename pair's `+1` likewise
+                // System tables are registered by `CatalogEngine::open` before
+                // `replay_catalog` fires hooks, so their rows show up here with
+                // the DAG already populated; a rename pair's `+1` likewise
                 // finds the id already registered. Skip to avoid double-register.
                 // A `+1` whose net folds to dead (a create cancelled within its
                 // own bundle) registers nothing.
@@ -353,8 +352,7 @@ impl CatalogEngine {
             return Ok(());
         };
         let ids: Vec<u128> = ids.iter().map(|&id| id as u128).collect();
-        let schema = SysFamily::View.schema();
-        let batch = retract_pk_list(self.sys_store(SysFamily::View), schema, ids);
+        let batch = retract_pk_list(self.sys_relation(SysFamily::View), ids);
         if !batch.is_empty() {
             self.submit_cascade(SysFamily::View, batch)?;
         }
@@ -368,8 +366,7 @@ impl CatalogEngine {
             return Ok(());
         };
         let ids: Vec<u128> = ids.iter().map(|&id| id as u128).collect();
-        let schema = SysFamily::Index.schema();
-        let batch = retract_pk_list(self.sys_store(SysFamily::Index), schema, ids);
+        let batch = retract_pk_list(self.sys_relation(SysFamily::Index), ids);
         if !batch.is_empty() {
             self.submit_cascade(SysFamily::Index, batch)?;
         }
@@ -381,12 +378,7 @@ impl CatalogEngine {
         let (start_pk, end_pk) = column_id_band(owner_id);
         let start = sys_opk(schema, start_pk as u128);
         let end = sys_opk(schema, end_pk as u128);
-        let batch = retract_key_range(
-            self.sys_store(SysFamily::Column),
-            schema,
-            start.pk_bytes(),
-            end.pk_bytes(),
-        );
+        let batch = retract_key_range(self.sys_relation(SysFamily::Column), start.pk_bytes(), end.pk_bytes());
         if !batch.is_empty() {
             self.submit_cascade(SysFamily::Column, batch)?;
         }
@@ -400,8 +392,8 @@ impl CatalogEngine {
     /// exactly what the master admitted.
     pub(super) fn is_trailing_col_append(&self, owner_id: i64, col_idx: u64) -> bool {
         self.registry
-            .entry(owner_id)
-            .is_some_and(|e| col_idx as usize == e.schema.num_columns())
+            .relation(owner_id)
+            .is_some_and(|e| col_idx as usize == e.schema().num_columns())
     }
 
     /// Column-ALTER side effect: rebuild the owner's descriptor from the
@@ -430,9 +422,9 @@ impl CatalogEngine {
             }
             let Some(cur) = self
                 .registry
-                .entry(owner)
-                .filter(|e| e.kind.is_base_table())
-                .map(|e| e.schema)
+                .relation(owner)
+                .filter(|e| e.kind().is_base_table())
+                .map(|e| e.schema())
             else {
                 continue;
             };
@@ -447,7 +439,7 @@ impl CatalogEngine {
                     .map_err(|e| format!("column ALTER on table id={owner}: {e}"))?;
             if rebuilt != cur {
                 let CatalogEngine { registry, dag, .. } = self;
-                dag.swap_table_schema(registry, owner, rebuilt)?;
+                dag.swap_schema(registry, owner, rebuilt)?;
             }
         }
         Ok(())
@@ -460,7 +452,7 @@ impl CatalogEngine {
         // rows are the key band `[(vid, 0), (vid + 1, 0))`.
         let start = circuit_opk(schema, vid, 0);
         let end = circuit_opk(schema, vid + 1, 0);
-        let batch = retract_key_range(self.sys_store(family), schema, start.pk_bytes(), end.pk_bytes());
+        let batch = retract_key_range(self.sys_relation(family), start.pk_bytes(), end.pk_bytes());
         if !batch.is_empty() {
             self.submit_cascade(family, batch)?;
         }
@@ -505,16 +497,18 @@ impl CatalogEngine {
         // `validate_index_registration`). Resolve the owner entry once for
         // everything below.
         let entry = self.validate_index_registration(owner_id)?;
-        let owner_dir = entry.directory.clone();
 
-        if let Some(was_unique) = entry.index_circuit_on(cols.as_slice()).map(|ic| ic.is_unique) {
+        if let Some(was_unique) = entry.index_on(cols.as_slice()).map(|ic| ic.is_unique()) {
             if is_unique && !was_unique {
                 self.promote_index_to_unique(owner_id, cols.as_slice());
             }
             return Ok(());
         }
 
-        let idx_dir = index_dir(&owner_dir, idx_id);
+        let idx_dir = self
+            .registry
+            .index_dir(owner_id, idx_id)
+            .expect("the owner resolved above");
         let cols = *cols;
 
         // A failed CREATE INDEX must leave nothing on disk: the stage removes
@@ -528,8 +522,9 @@ impl CatalogEngine {
             self.registry.add_index(owner_id, idx_id, cols.as_slice(), is_unique)?;
             let resumed = self
                 .registry
-                .index_circuit_for_cols(owner_id, cols.as_slice())
-                .is_some_and(IndexCircuitEntry::resumed_from_checkpoint);
+                .relation(owner_id)
+                .and_then(|r| r.index_on(cols.as_slice()))
+                .is_some_and(SecondaryIndex::resumed);
             // The master never populates its index copies (they stay permanently
             // empty; distributed HAS_PK/seek probes union the workers' slice-local
             // copies). Workers and standalone backfill from their local base slice
@@ -540,7 +535,7 @@ impl CatalogEngine {
                     // The circuit was entered before the backfill so the
                     // projection could ingest through it; a failed CREATE INDEX
                     // leaves no circuit.
-                    self.registry.remove_index_circuit(owner_id, cols.as_slice());
+                    self.registry.remove_index(owner_id, cols.as_slice());
                     return Err(e);
                 }
             }
@@ -560,8 +555,7 @@ impl CatalogEngine {
         if let Some(remains_unique) = remains {
             // Another index (e.g. the FK auto-index) still covers this column
             // list. Demote the circuit rather than destroying it.
-            self.registry
-                .set_index_circuit_uniqueness(owner_id, cols, remains_unique);
+            self.registry.set_index_unique(owner_id, cols, remains_unique);
             return;
         }
         // No index remains on the column list — drop the circuit. The directory
@@ -570,11 +564,13 @@ impl CatalogEngine {
         // the first registrant's id.
         let creating = self
             .registry
-            .entry(owner_id)
-            .and_then(|e| e.index_circuit_on(cols).map(|ic| (e.directory.clone(), ic.index_id)));
-        if let Some((owner_dir, creating_idx_id)) = creating {
-            self.registry.remove_index_circuit(owner_id, cols);
-            self.pending_dir_deletions.push(index_dir(&owner_dir, creating_idx_id));
+            .relation(owner_id)
+            .and_then(|e| e.index_on(cols))
+            .map(SecondaryIndex::id)
+            .and_then(|id| self.registry.index_dir(owner_id, id));
+        if let Some(idx_dir) = creating {
+            self.registry.remove_index(owner_id, cols);
+            self.pending_dir_deletions.push(idx_dir);
         }
     }
 

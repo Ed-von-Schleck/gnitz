@@ -17,7 +17,7 @@
 
 use crate::schema::key::{leading_u64, ReindexPacker};
 use crate::schema::{type_code, ColumnLocator, OpBuildErr, SchemaColumn, SchemaDescriptor, TypeCode, MAX_PK_BYTES};
-use crate::storage::{Batch, Table};
+use crate::storage::Batch;
 use gnitz_expr::{OrderLocator, RowSource};
 use gnitz_wire::OrderKey;
 
@@ -120,9 +120,12 @@ impl TopNIndex {
         self.key_packer.pack_prefix(buf, src, row)
     }
 
-    /// The index entries `delta` contributes, one per row, at the row's weight.
-    /// Left `Raw`: the ingest's consolidation is what sorts it.
-    fn batch(&self, delta: &Batch) -> Batch {
+    /// The index entries `delta` contributes, one per row, at the row's weight —
+    /// for the caller to put into the operator's own index store. Left `Raw`:
+    /// the ingest's consolidation is what sorts it. The *shape* rule is here;
+    /// the ordering rule — ingest, then compact, then open the cursor — is the
+    /// store's.
+    pub fn batch(&self, delta: &Batch) -> Batch {
         let mb = delta.as_mem_batch();
         // One entry per row, and every carried string plus every wide image lands
         // in this heap — so the source's own heap is the presize the crate's
@@ -159,15 +162,4 @@ impl TopNIndex {
         }
         out
     }
-}
-
-/// Accumulate `delta`'s index entries into the operator's index table. Runs
-/// before the operator reads the table, so a prefix walk visits the post-delta
-/// group.
-pub fn op_populate_topn(
-    delta: &Batch,
-    table: &mut Table,
-    index: &TopNIndex,
-) -> Result<(), crate::storage::StorageError> {
-    table.ingest_owned_batch(index.batch(delta))
 }

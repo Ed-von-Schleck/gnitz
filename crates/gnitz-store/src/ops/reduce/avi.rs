@@ -8,7 +8,7 @@
 
 use crate::schema::key::{leading_u64, ReindexPacker};
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES};
-use crate::storage::{payload_bytes, Batch, ReadCursor, Table};
+use crate::storage::{payload_bytes, Batch, ReadCursor};
 use gnitz_expr::RowSource;
 
 use super::super::order_image::{append_wide_image, scalar_image, wide_native, wide_native_of_image, ImageKind};
@@ -196,7 +196,7 @@ impl AviBake {
 /// Left `Raw`: the entry's trailing bytes are the aggregate *value* in row
 /// order, so any group with ≥2 rows breaks ascension whatever order the delta
 /// arrives in — the ingest's consolidation is what sorts it.
-pub(super) fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
+pub fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
     let mb = delta.as_mem_batch();
     let mut out = Batch::with_capacity(&bake.schema, (delta.count * bake.aggs.len()).max(1));
 
@@ -241,13 +241,6 @@ pub(super) fn avi_batch(delta: &Batch, bake: &AviBake) -> Batch {
         }
     }
     out
-}
-
-/// Accumulate `delta`'s index entries into the reduce's value-index table. Runs
-/// before the reduce reads the table, so a prefix seek returns the post-delta
-/// extreme.
-pub fn op_populate_avi(delta: &Batch, table: &mut Table, bake: &AviBake) -> Result<(), crate::storage::StorageError> {
-    table.ingest_owned_batch(avi_batch(delta, bake))
 }
 
 #[cfg(test)]

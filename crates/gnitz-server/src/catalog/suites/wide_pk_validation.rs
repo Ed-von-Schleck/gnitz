@@ -2,13 +2,13 @@
 //! (`pk_stride > 16`). A wide PK is always compound (e.g. three U64 columns =
 //! 24 bytes). These tests seed the DAG tables and index circuits directly so a
 //! wide PK can be written with byte-level control, and drive
-//! `index_circuit_for_cols` / the byte-keyed `seek_family` on the wide path. Unique-index
+//! `Relation::index_on` / the byte-keyed `seek` on the wide path. Unique-index
 //! enforcement over a wide PK runs distributed and is covered end-to-end.
 
 use super::*;
-use gnitz_store::relation::RelationKind;
+use gnitz_store::relation::{OnRegister, Relation, RelationKind};
 use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::storage::{batch_project_index, BatchBuilder, RecoverySource, Table};
+use gnitz_store::storage::BatchBuilder;
 
 /// `pk_stride` = 24 (wide): three U64 PK columns + one U64 payload `val`.
 fn wide_unique_schema() -> SchemaDescriptor {
@@ -27,43 +27,30 @@ fn wide_val_batch(schema: &SchemaDescriptor, rows: &[([u8; 24], u64, i64)]) -> B
 }
 
 /// Register a wide-PK table owning a UNIQUE secondary index on col 3, seeded
-/// with `base_rows` in both stores. Bypasses `create_table`'s stride gate and
-/// `ingest_to_family`, so it does not exercise the enforcement path. The index
-/// lands at `<dir>/idx_<tid+1>/w0of1`, a sibling of the hand-placed base.
+/// with `base_rows`. Bypasses `create_table`'s stride gate and
+/// `ingest_to_family`, so it does not exercise the enforcement path. The base
+/// store lands at `<dir>/w0of1` and the index at `<dir>/idx_<tid+1>/w0of1`.
 fn setup_wide_unique(engine: &mut CatalogEngine, tid: i64, dir: &str, base_rows: &[([u8; 24], u64, i64)]) {
     let schema = wide_unique_schema();
-    let base = Table::new(
-        &format!("{dir}/base"),
-        schema,
-        tid as u32,
-        RecoverySource::Rederive { resume_at: None },
-        StoreBudgets::default(),
-    )
-    .unwrap();
-    engine.registry_mut().register_owned(
-        RelationSpec {
-            id: tid,
-            kind: RelationKind::BaseTable,
-            schema,
-            directory: dir.to_string(),
-            budgets: ViewBudgets::default(),
-        },
-        Box::new(base),
-    );
+    engine
+        .registry_mut()
+        .register(
+            RelationSpec {
+                id: tid,
+                kind: RelationKind::BaseTable,
+                schema,
+                directory: dir.to_string(),
+                budgets: ViewBudgets::default(),
+            },
+            OnRegister::Live,
+        )
+        .unwrap();
     engine.registry_mut().add_index(tid, tid + 1, &[3], true).unwrap();
-
-    // Write both sides by hand rather than through the registry, which would
-    // project the index itself.
-    let bb = wide_val_batch(&schema, base_rows);
-    let registry = engine.registry_mut();
-    let ic = registry.index_circuit_for_cols_mut(tid, &[3]).unwrap();
-    let projected = batch_project_index(&bb, &ic.key_spec, &ic.index_schema);
-    ic.ingest_owned_batch(projected).unwrap();
-    registry
-        .entry_mut(tid)
-        .and_then(|e| e.owned_store_mut())
-        .unwrap()
-        .ingest_borrowed_batch(&bb)
+    // The registry projects the index itself, from the same `key_spec` and index
+    // schema a hand-written projection would use.
+    engine
+        .registry_mut()
+        .ingest(tid, wide_val_batch(&schema, base_rows))
         .unwrap();
     engine.registry_mut().flush(tid).unwrap();
 }
@@ -82,17 +69,22 @@ fn index_circuit_for_col_finds_index_and_uniqueness() {
     // The indexed column resolves to its circuit, carrying the uniqueness flag.
     let ic = engine
         .registry()
-        .index_circuit_for_cols(tid, &[3])
+        .relation(tid)
+        .and_then(|r| r.index_on(&[3]))
         .expect("indexed column must resolve");
-    assert!(ic.is_unique, "col 3 was created UNIQUE");
+    assert!(ic.is_unique(), "col 3 was created UNIQUE");
     // An unindexed column resolves to nothing …
     assert!(
-        engine.registry().index_circuit_for_cols(tid, &[0]).is_none(),
+        engine.registry().relation(tid).and_then(|r| r.index_on(&[0])).is_none(),
         "unindexed column has no circuit"
     );
     // … and so does an unknown table.
     assert!(
-        engine.registry().index_circuit_for_cols(tid + 9999, &[3]).is_none(),
+        engine
+            .registry()
+            .relation(tid + 9999)
+            .and_then(|r| r.index_on(&[3]))
+            .is_none(),
         "unknown table has no circuit"
     );
 
@@ -107,37 +99,30 @@ fn wide_pk_seek_family_resolves_non_pk_col() {
 
     // Parent: wide PK (cols 0..3) + non-PK column `email` (col 3). This is the
     // only test that resolves a genuinely wide (24-byte) PK via the byte-keyed
-    // `seek_family` and reads back a committed non-PK column value.
+    // `seek` and reads back a committed non-PK column value.
     let parent_tid = engine.next_table_id;
     let parent_schema = wide_unique_schema(); // [u64;4], pk [0,1,2], col 3 = email
     let parent_pk = pk24(100, 200, 300);
     let pb = wide_val_batch(&parent_schema, &[(parent_pk, 555, 1)]);
-    let mut pbase = Box::new(
-        Table::new(
-            &format!("{dir}/p_base"),
-            parent_schema,
-            parent_tid as u32,
-            RecoverySource::Rederive { resume_at: None },
-            StoreBudgets::default(),
+    engine
+        .registry_mut()
+        .register(
+            RelationSpec {
+                id: parent_tid,
+                kind: RelationKind::BaseTable,
+                schema: parent_schema,
+                directory: dir.clone(),
+                budgets: ViewBudgets::default(),
+            },
+            OnRegister::Live,
         )
-        .unwrap(),
-    );
-    pbase.ingest_owned_batch(pb).unwrap();
-    pbase.flush().unwrap();
-    engine.registry_mut().register_owned(
-        RelationSpec {
-            id: parent_tid,
-            kind: RelationKind::BaseTable,
-            schema: parent_schema,
-            directory: dir.clone(),
-            budgets: ViewBudgets::default(),
-        },
-        pbase,
-    );
+        .unwrap();
+    engine.registry_mut().ingest(parent_tid, pb).unwrap();
+    engine.registry_mut().flush(parent_tid).unwrap();
 
     // The byte-keyed seek must resolve the committed parent row by full PK bytes.
-    let seen = engine.registry_mut().seek_family(parent_tid, &parent_pk, None).unwrap();
-    assert!(seen.is_some(), "seek_family must find the live wide-PK parent row");
+    let seen = engine.registry_mut().seek(parent_tid, &parent_pk, None).unwrap();
+    assert!(seen.is_some(), "seek must find the live wide-PK parent row");
     assert_eq!(
         read_u64_col(&seen.unwrap(), 0),
         555,
@@ -163,7 +148,7 @@ fn byte_seek_matches_wire_pair_seek_narrow() {
     // Plain narrow U64-PK table created through the normal path.
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
+    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
 
     let mut bb = BatchBuilder::new(schema);
     for i in 1..=3u64 {
@@ -188,8 +173,8 @@ fn byte_seek_matches_wire_pair_seek_narrow() {
         // PK that is big-endian. The catalog's takes the native u128 and
         // OPK-encodes.
         let bytes = key.to_be_bytes();
-        let via_u128 = engine.seek_family(tid, key as u128, &[]).unwrap().0;
-        let via_bytes = engine.registry_mut().seek_family(tid, &bytes, None).unwrap();
+        let via_u128 = engine.seek(tid, key as u128, &[]).unwrap().0;
+        let via_bytes = engine.registry_mut().seek(tid, &bytes, None).unwrap();
         assert_eq!(
             via_u128.is_some(),
             via_bytes.is_some(),

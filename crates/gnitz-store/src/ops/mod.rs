@@ -43,5 +43,5 @@ pub use join::{merge_schemas_for_join, op_join_delta_trace, JoinProbe, RangeProb
 pub use linear::{null_extend_output_schema, op_union, union_nullability_merge};
 pub use linear::{op_filter, op_negate};
 pub(crate) use reduce::AdhocFold;
-pub use reduce::{op_populate_avi, op_reduce, ReducePlan};
-pub use topn::{op_populate_topn, op_topn, TopNPlan};
+pub use reduce::{avi_batch, op_reduce, ReducePlan};
+pub use topn::{op_topn, TopNPlan};

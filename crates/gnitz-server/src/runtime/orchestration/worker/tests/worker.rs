@@ -2,6 +2,7 @@ use super::*;
 use crate::catalog::PUBLIC_SCHEMA_ID;
 use crate::runtime::w2m::{self, W2mReceiver};
 use crate::test_support::{col_def, make_batch_raw, make_schema_u64_i64, u64_pk_schema};
+use gnitz_store::relation::Relation;
 use gnitz_store::schema::SchemaColumn;
 use gnitz_store::schema::SchemaDescriptor;
 use gnitz_store::storage::BatchBuilder;
@@ -443,7 +444,7 @@ fn train_frames_fill_the_budget_to_within_one_row() {
         ("8-aligned", make_n_row_batch(make_schema_u64_i64(), 40)),
         ("padded", make_n_row_batch(padded_schema(), 40)),
     ] {
-        let schema = batch.schema;
+        let schema = *batch.schema();
         let block = Rc::new(crate::catalog::encode_schema_block(&schema, 1));
         let per_row = frame_size(schema, 2, None) - frame_size(schema, 1, None);
         // Room for four rows beside the schema block on the first frame.
@@ -853,7 +854,7 @@ fn a_projected_reply_carries_a_one_off_block() {
     engine
         .register_table(tid, PUBLIC_SCHEMA_ID, "tproj", &cols, &[0])
         .unwrap();
-    let table_schema = engine.registry().get_schema_desc(tid).unwrap();
+    let table_schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
     let projected = gnitz_store::schema::project_schema(&table_schema, &[1]).unwrap();
     assert_ne!(projected.num_columns(), table_schema.num_columns());
 

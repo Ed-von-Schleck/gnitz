@@ -1732,3 +1732,23 @@ fn pk_filter_follows_whether_the_store_is_probed() {
         "and still reject absent keys"
     );
 }
+
+/// Each flush writes an L0 shard; without the `compact_if_needed` call they
+/// accumulate unbounded. Drive many flushes and assert the shard count stays
+/// bounded. A `SalReplay` store, which is what the durable ingest path opens.
+#[test]
+fn repeated_flushes_compact_l0() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = make_schema_u64_i64();
+    let mut t = new_table(dir.path(), schema, 8200, 96, RecoverySource::SalReplay);
+    let flushes = 40u64;
+    for i in 0..flushes {
+        t.ingest_owned_batch(make_batch(&[(i, i as i64, 1)])).unwrap();
+        t.flush().unwrap();
+    }
+    let (shards, _) = t.pk_filter_census();
+    assert!(
+        (shards as u64) < flushes / 2,
+        "L0 must be compacted: {shards} shards after {flushes} flushes"
+    );
+}

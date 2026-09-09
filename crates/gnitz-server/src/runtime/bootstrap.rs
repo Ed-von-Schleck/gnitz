@@ -25,6 +25,7 @@ use crate::runtime::tls::{setup_tls_listener, TlsCli};
 use crate::runtime::w2m::{self, W2mReceiver, W2mWriter};
 use crate::runtime::wire as ipc;
 use crate::runtime::worker::{buffer_pending_delta, WorkerProcess};
+use gnitz_store::relation::Relation;
 use gnitz_store::storage::Batch;
 
 /// One boot-progress line, raw and untagged, on stderr — the master's own, or
@@ -177,7 +178,8 @@ fn recover_from_sal(
         // this holds no borrow on `catalog` across the `&mut` ingest.
         let schema = catalog
             .registry()
-            .get_schema_desc(tid)
+            .relation(tid)
+            .map(Relation::schema)
             .ok_or_else(|| format!("SAL replay: no schema for table_id={tid} (lsn={})", msg.lsn))?;
         // Broadcast, not sliced: every slot holds the whole copy, so a second slot
         // would re-ingest the same rows and add their weights again. Never re-sliced
@@ -208,7 +210,7 @@ fn recover_from_sal(
                 .schema
                 .ok_or_else(|| format!("SAL replay: push frame carries no schema (lsn={})", msg.lsn))?;
             if in_schema.num_payload_cols() < schema.num_payload_cols() {
-                batch = batch.widened_with_null_tail(&in_schema, &schema);
+                batch = batch.widened_with_null_tail(&schema);
             }
             let owned = if reslice && !replicated {
                 // Re-cut with the write path's own router, so what survives is exactly
@@ -670,7 +672,7 @@ fn run_server(
     // Before the workers get anywhere: each is re-homing the very stores this
     // process inherited handles to, and two live `Table`s on one directory is the
     // hazard. Only constructors ran between the fork and here.
-    dispatcher.cat().registry_mut().detach_user_stores();
+    dispatcher.cat().registry_mut().detach();
     let dispatcher_rc = std::rc::Rc::new(dispatcher);
 
     // Wait for all workers to complete recovery and signal readiness

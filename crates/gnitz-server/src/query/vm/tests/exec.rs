@@ -1,9 +1,13 @@
 //! Dispatch-loop tests: one epoch of a hand-built program per opcode path.
 
 use super::*;
-use crate::test_support::{make_batch_u128, make_schema_u128_i64, opk_pk, scratch_table, zset_of};
-use gnitz_store::schema::{type_code, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, BatchBuilder, Layout, StorageError};
+use crate::test_support::{make_batch_u128, make_schema_u128_i64, opk_pk, zset_of};
+use gnitz_store::relation::{
+    OnRegister, RelationKind, RelationRegistry, RelationSpec, StateIdx, StoreConfig, ViewBudgets,
+};
+use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
+use gnitz_store::storage::{Batch, BatchBuilder, Layout, Slot, StorageError};
+use gnitz_wire::type_code;
 use gnitz_wire::AggDescriptor;
 use gnitz_wire::AggFunc;
 
@@ -15,10 +19,40 @@ fn execute_epoch(vm: &mut VmHandle, input: Batch, input_reg: u16) -> Result<Opti
     execute_epoch_multi(vm, std::iter::once((DeltaReg(input_reg), input)))
 }
 
-/// A table under `dir` backing a trace register; the caller hands it to
-/// `ProgramBuilder::push_table`, which owns it from then on.
-fn owned_table(dir: &std::path::Path, name: &str, schema: SchemaDescriptor) -> gnitz_store::storage::Table {
-    scratch_table(dir.join(name).to_str().unwrap(), schema, 0)
+/// The view id every plan below is compiled for.
+const VIEW_ID: i64 = gnitz_wire::FIRST_USER_TABLE_ID as i64;
+
+/// A registry holding one view homed under `dir` — the shape the VM actually
+/// runs, and what `CircuitState::open_child` reads its recovery policy from.
+fn vm_registry(dir: &std::path::Path) -> RelationRegistry {
+    let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
+    registry
+        .register(
+            RelationSpec {
+                id: VIEW_ID,
+                kind: RelationKind::View,
+                schema: make_schema_u128_i64(),
+                directory: dir.to_str().unwrap().to_string(),
+                budgets: ViewBudgets::default(),
+            },
+            OnRegister::Live,
+        )
+        .unwrap();
+    registry
+}
+
+/// One child store backing a trace register, opened the way a compile opens one.
+fn owned_table(
+    builder: &mut ProgramBuilder,
+    registry: &RelationRegistry,
+    dir: &std::path::Path,
+    name: &str,
+    schema: SchemaDescriptor,
+) -> StateIdx {
+    builder
+        .state
+        .open_child(registry, VIEW_ID, dir.to_str().unwrap(), name, schema)
+        .unwrap()
 }
 
 /// A reduce with no value index, over the register convention every test reduce
@@ -48,7 +82,7 @@ fn push_reduce(
 /// the multi-column tests need. The one-payload shape is
 /// [`make_schema_u128_i64`].
 fn make_schema(col_types: &[u8]) -> SchemaDescriptor {
-    let mut columns = [SchemaColumn::EMPTY; gnitz_store::schema::MAX_COLUMNS];
+    let mut columns = [SchemaColumn::EMPTY; gnitz_wire::MAX_COLUMNS];
     columns[0] = SchemaColumn::new(type_code::U128, 0);
     for (i, &tc) in col_types.iter().enumerate() {
         columns[i + 1] = SchemaColumn::new(tc, 0);
@@ -67,7 +101,7 @@ fn make_batch_2col(schema: SchemaDescriptor, rows: &[(u128, i64, i64, i64)]) -> 
         bb.end_row();
     }
     let mut b = bb.finish();
-    b.certify_layout(Layout::Consolidated, &schema);
+    b.certify_layout(Layout::Consolidated);
     b
 }
 
@@ -207,14 +241,14 @@ fn test_union_runs_under_the_merged_output_schema() {
     // Both rows on the same PK, so the merge resolves them against each
     // other: left is a negative value, right a canonical zero-filled NULL.
     let mut left = make_batch_u128(&schema_a, &[(1, 1, -3)]);
-    left.certify_layout(Layout::Consolidated, &schema_a);
+    left.certify_layout(Layout::Consolidated);
 
     let mut rb = BatchBuilder::new(schema_b);
     rb.begin_row(1u128, 1);
     rb.put_null();
     rb.end_row();
     let mut right = rb.finish();
-    right.certify_layout(Layout::Consolidated, &schema_b);
+    right.certify_layout(Layout::Consolidated);
 
     let mut builder = ProgramBuilder::new();
     builder.push(Instr::Union {
@@ -267,7 +301,8 @@ fn test_union_identity_path_output_carries_out_register_schema() {
     let result = execute_epoch_multi(&mut vm, [(DeltaReg(0), left)]).unwrap().unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(
-        result.schema, merged,
+        *result.schema(),
+        merged,
         "a batch leaving the VM carries its output register's schema, not the operand's",
     );
 }
@@ -400,10 +435,10 @@ fn test_distinct_multi_tick() {
     let schema = make_schema_u128_i64();
 
     let dir = tempfile::tempdir().unwrap();
-    let table = owned_table(dir.path(), "dist_test", schema);
+    let registry = vm_registry(dir.path());
     let mut builder = ProgramBuilder::new();
     // reg 0 = input delta, reg 1 = history trace, reg 2 = output delta
-    builder.push_table(table);
+    let table = owned_table(&mut builder, &registry, dir.path(), "dist_test", schema);
     builder.push(Instr::WeightClamp {
         in_reg: DeltaReg(0),
         hist_reg: TraceReg(1),
@@ -413,7 +448,7 @@ fn test_distinct_multi_tick() {
 
     let reg_meta = vec![
         RegisterMeta::delta(schema),
-        RegisterMeta::trace(schema, TableIdx(0)),
+        RegisterMeta::trace(schema, table),
         RegisterMeta::delta(schema),
     ];
 
@@ -449,13 +484,12 @@ fn test_join_delta_trace() {
     let join_schema = make_schema(&[type_code::I64, type_code::I64]);
 
     let dir = tempfile::tempdir().unwrap();
-    let mut table = owned_table(dir.path(), "join_test", right_schema);
+    let registry = vm_registry(dir.path());
+    let mut builder = ProgramBuilder::new();
+    let table = owned_table(&mut builder, &registry, dir.path(), "join_test", right_schema);
     // Three trace rows on one PK, differing in payload.
     let trace_batch = make_batch_u128(&right_schema, &[(10, 1, 100), (10, 1, 200), (10, 1, 300)]);
-    table.ingest_owned_batch(trace_batch).unwrap();
-
-    let mut builder = ProgramBuilder::new();
-    builder.push_table(table);
+    builder.state.ingest_owned(table, trace_batch).unwrap();
     // reg 0 = left delta, reg 1 = right trace, reg 2 = output
     builder.push(Instr::JoinDT {
         probe: gnitz_store::ops::JoinProbe::Equi,
@@ -466,7 +500,7 @@ fn test_join_delta_trace() {
 
     let reg_meta = vec![
         RegisterMeta::delta(left_schema),
-        RegisterMeta::trace(right_schema, TableIdx(0)),
+        RegisterMeta::trace(right_schema, table),
         RegisterMeta::delta(join_schema),
     ];
     let mut vm = builder.build(reg_meta, DeltaReg(2));
@@ -506,7 +540,9 @@ fn test_reduce_groups_by_a_payload_column() {
     let out_schema = make_schema(&[type_code::I64, type_code::I64, type_code::I64]);
 
     let dir = tempfile::tempdir().unwrap();
-    let trace_out_table = owned_table(dir.path(), "tr_out", out_schema);
+    let registry = vm_registry(dir.path());
+    let mut builder = ProgramBuilder::new();
+    let trace_out_table = owned_table(&mut builder, &registry, dir.path(), "tr_out", out_schema);
     // SUM of payload col 1 (schema col 2), plus the trailing Count cardinality
     // companion every all-linear reduce carries.
     let agg_descs = [
@@ -515,8 +551,6 @@ fn test_reduce_groups_by_a_payload_column() {
     ];
     let group_cols = [1u32]; // schema col 1 = payload col 0 (group key)
 
-    let mut builder = ProgramBuilder::new();
-    builder.push_table(trace_out_table);
     push_reduce(&mut builder, &agg_descs, &group_cols, in_schema, false, false);
     builder.push(Instr::Integrate {
         in_reg: DeltaReg(2),
@@ -525,7 +559,7 @@ fn test_reduce_groups_by_a_payload_column() {
 
     let reg_meta = vec![
         RegisterMeta::delta(in_schema),
-        RegisterMeta::trace(out_schema, TableIdx(0)),
+        RegisterMeta::trace(out_schema, trace_out_table),
         RegisterMeta::delta(out_schema),
     ];
     let mut vm = builder.build(reg_meta, DeltaReg(2));
@@ -548,7 +582,9 @@ fn test_reduce_multi_agg() {
     let out_schema = make_schema(&[type_code::I64, type_code::I64]);
 
     let dir = tempfile::tempdir().unwrap();
-    let trace_out_table = owned_table(dir.path(), "ma_tr_out", out_schema);
+    let registry = vm_registry(dir.path());
+    let mut builder = ProgramBuilder::new();
+    let trace_out_table = owned_table(&mut builder, &registry, dir.path(), "ma_tr_out", out_schema);
     let agg_descs = [
         AggDescriptor {
             col_idx: 1, // schema col index for the val column
@@ -559,8 +595,6 @@ fn test_reduce_multi_agg() {
     // GROUP BY col 0 (= pk, schema col index 0)
     let group_cols = [0u32];
 
-    let mut builder = ProgramBuilder::new();
-    builder.push_table(trace_out_table);
     push_reduce(&mut builder, &agg_descs, &group_cols, in_schema, false, false);
     builder.push(Instr::Integrate {
         in_reg: DeltaReg(2),
@@ -569,7 +603,7 @@ fn test_reduce_multi_agg() {
 
     let reg_meta = vec![
         RegisterMeta::delta(in_schema),
-        RegisterMeta::trace(out_schema, TableIdx(0)),
+        RegisterMeta::trace(out_schema, trace_out_table),
         RegisterMeta::delta(out_schema),
     ];
     let mut vm = builder.build(reg_meta, DeltaReg(2));
@@ -594,16 +628,17 @@ fn an_empty_epoch_mints_the_ground_row_once() {
     let in_schema = make_schema_u128_i64();
     let aggs = [AggDescriptor { col_idx: 1, agg_op: AggFunc::Count }];
     let dir = tempfile::tempdir().unwrap();
+    let registry = vm_registry(dir.path());
     let mut builder = ProgramBuilder::new();
     let out_schema = push_reduce(&mut builder, &aggs, &[], in_schema, true, true);
-    builder.push_table(owned_table(dir.path(), "ground_tr", out_schema));
+    let trace_table = owned_table(&mut builder, &registry, dir.path(), "ground_tr", out_schema);
     builder.push(Instr::Integrate {
         in_reg: DeltaReg(2),
         trace_reg: TraceReg(1),
     });
     let reg_meta = vec![
         RegisterMeta::delta(in_schema),
-        RegisterMeta::trace(out_schema, TableIdx(0)),
+        RegisterMeta::trace(out_schema, trace_table),
         RegisterMeta::delta(out_schema),
     ];
     let mut vm = builder.build(reg_meta, DeltaReg(2));
@@ -633,12 +668,13 @@ fn a_ground_reduce_this_worker_does_not_own_leaves_the_latch_clear() {
     let in_schema = make_schema_u128_i64();
     let aggs = [AggDescriptor { col_idx: 1, agg_op: AggFunc::Count }];
     let dir = tempfile::tempdir().unwrap();
+    let registry = vm_registry(dir.path());
     let mut builder = ProgramBuilder::new();
     let out_schema = push_reduce(&mut builder, &aggs, &[], in_schema, true, false);
-    builder.push_table(owned_table(dir.path(), "unowned_tr", out_schema));
+    let trace_table = owned_table(&mut builder, &registry, dir.path(), "unowned_tr", out_schema);
     let reg_meta = vec![
         RegisterMeta::delta(in_schema),
-        RegisterMeta::trace(out_schema, TableIdx(0)),
+        RegisterMeta::trace(out_schema, trace_table),
         RegisterMeta::delta(out_schema),
     ];
     let mut vm = builder.build(reg_meta, DeltaReg(2));

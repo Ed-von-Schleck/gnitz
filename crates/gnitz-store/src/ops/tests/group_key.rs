@@ -22,7 +22,7 @@ fn single_col_group_key_is_the_opk_image_from_either_side() {
         if col1_is_pk {
             let mut native = [0u8; 16];
             native[..le.len()].copy_from_slice(le);
-            b.extend_pk_opk(&schema, &[0, u128::from_le_bytes(native)]);
+            b.extend_pk_opk(&[0, u128::from_le_bytes(native)]);
         } else {
             b.extend_pk(0u128);
         }

@@ -92,13 +92,13 @@ fn string_rows(rows: &[(u64, &str)]) -> (SchemaDescriptor, Batch) {
 /// layout claim — which is what the frame encoder stamps into the wire flags.
 #[test]
 fn wire_chunk_compacts_the_heap_and_inherits_the_layout() {
-    let (schema, mut src) = string_rows(&[
+    let (_schema, mut src) = string_rows(&[
         (1, "the first long value"),
         (2, "the second long value"),
         (3, "the third long value"),
         (4, "the fourth long value"),
     ]);
-    src.certify_layout(super::super::batch::Layout::Consolidated, &schema);
+    src.certify_layout(super::super::batch::Layout::Consolidated);
 
     let chunk = src.wire_chunk(1, 2);
     assert_eq!(chunk.len(), 2);

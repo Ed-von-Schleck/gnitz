@@ -36,7 +36,7 @@ struct IdxRow {
 fn live_index_row(engine: &CatalogEngine, idx_id: i64) -> IdxRow {
     let schema = SysFamily::Index.schema();
     let key = sys_opk(schema, idx_id as u128);
-    let store = engine.sys_store(SysFamily::Index);
+    let store = engine.sys_relation(SysFamily::Index);
     let sr = store
         .live_row_at(key.pk_bytes())
         .1
@@ -66,7 +66,7 @@ fn idx_row_batch(idx_id: i64, weight: i64, row: &IdxRow) -> Batch {
 /// has cancelled (the cursor skips a net-zero PK), `[1]` for a live index,
 /// `[-1]` for a durable ghost.
 fn idx_weights_for(engine: &CatalogEngine, idx_id: i64) -> Vec<i64> {
-    let mut c = engine.sys_store(SysFamily::Index).open_cursor();
+    let mut c = engine.sys_relation(SysFamily::Index).cursor();
     let mut v = Vec::new();
     while c.valid {
         if c.current_key_narrow() as i64 == idx_id {

@@ -22,7 +22,7 @@ impl CatalogEngine {
     }
 
     /// Which relations exist, and the stores behind them. There are no thin
-    /// delegators beside it: a `CatalogEngine::relation_kind` would hide the rung
+    /// delegators beside it: a `CatalogEngine::kind` would hide the rung
     /// its answer came from, and every call site has to be rewritten either way.
     pub(crate) fn registry(&self) -> &RelationRegistry {
         &self.registry
@@ -149,7 +149,7 @@ impl CatalogEngine {
     pub(crate) fn has_row_constraints(&self, table_id: i64) -> bool {
         !self.fk_constraints_of(table_id).is_empty()
             || !self.fk_children_of(table_id).is_empty()
-            || self.registry.has_any_unique_index(table_id)
+            || self.registry.relation(table_id).is_some_and(Relation::has_unique_index)
     }
 
     /// Does validating a write of `mode` to `table_id` read committed state?
@@ -187,10 +187,10 @@ impl CatalogEngine {
             return;
         };
         let schema = SysFamily::Index.schema();
-        let store = self.sys_store(SysFamily::Index);
+        let rel = self.sys_relation(SysFamily::Index);
         for &idx_id in ids {
             let key = sys_opk(schema, idx_id as u128);
-            let Some(sr) = store.live_row_at(key.pk_bytes()).1 else {
+            let Some(sr) = rel.live_row_at(key.pk_bytes()).1 else {
                 continue;
             };
             let (src, ri) = sr.source();

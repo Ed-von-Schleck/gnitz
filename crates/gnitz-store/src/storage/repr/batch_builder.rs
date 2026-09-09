@@ -61,8 +61,7 @@ impl BatchBuilder {
     /// protocol — and a native-LE concatenation into `extend_pk_bytes` (the
     /// obvious wrong spelling) is not the at-rest form at all.
     pub fn begin_row_opk(&mut self, natives: &[u128], weight: i64) {
-        let schema = *self.schema();
-        self.batch.extend_pk_opk(&schema, natives);
+        self.batch.extend_pk_opk(natives);
         self.begin_row_tail(weight);
     }
 
@@ -166,7 +165,7 @@ impl BatchBuilder {
     }
 
     fn schema(&self) -> &SchemaDescriptor {
-        &self.batch.schema
+        self.batch.schema()
     }
 
     fn physical_col_idx(&self) -> usize {

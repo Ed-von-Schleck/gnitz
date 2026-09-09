@@ -277,12 +277,12 @@ thread_local! {
 
 /// RAII wrapper that returns a pooled blob cache only when the schema has at
 /// least one STRING column, and recycles it on drop.
-pub struct BlobCacheGuard(Option<BlobCache>);
+pub(crate) struct BlobCacheGuard(Option<BlobCache>);
 
 impl BlobCacheGuard {
     /// `max_rows` is a sizing hint, clamped to [`BLOB_CACHE_RESERVE_CAP`] here so
     /// no caller has to remember to bound it.
-    pub fn acquire(schema: &SchemaDescriptor, max_rows: usize) -> Self {
+    pub(crate) fn acquire(schema: &SchemaDescriptor, max_rows: usize) -> Self {
         if schema.has_german_string() {
             let mut cache = tls_pool::acquire(&BLOB_CACHE_POOL);
             cache.reserve(max_rows.min(BLOB_CACHE_RESERVE_CAP));
@@ -298,7 +298,7 @@ impl BlobCacheGuard {
         Self(None)
     }
 
-    pub fn get_mut(&mut self) -> Option<&mut BlobCache> {
+    pub(crate) fn get_mut(&mut self) -> Option<&mut BlobCache> {
         self.0.as_mut()
     }
 }

@@ -149,7 +149,7 @@ impl RunSet {
         let mut bytes = 0;
         for run in &mut self.runs {
             if run.num_payload_cols() < out_npc {
-                let widened = run.widened_with_null_tail(in_schema, out_schema);
+                let widened = run.widened_with_null_tail(out_schema);
                 *run = Rc::new(widened);
             }
             bytes += run.total_bytes();
@@ -259,7 +259,7 @@ fn consolidate_batches(batches: &[MemBatch], schema: &SchemaDescriptor) -> Batch
     let mut result = write_to_batch(schema, survivors.len(), total_blob, |writer| {
         scatter_unified_sources(&unified, &cols, &survivors, writer);
     });
-    result.certify_layout(Layout::Consolidated, schema);
+    result.certify_layout(Layout::Consolidated);
     result
 }
 

@@ -12,7 +12,7 @@ use proptest::prelude::*;
 
 use crate::schema::key::compare_pk_bytes;
 use crate::schema::{SchemaColumn, SchemaDescriptor};
-use crate::storage::{Batch, BatchBuilder, Layout, ReadCursor};
+use crate::storage::{Batch, BatchBuilder, Layout, ReadCursor, RecoverySource, StoreBudgets, Table};
 use gnitz_wire::type_code;
 
 use super::shared::{arb_type_code, pk_payload_schema, u64_pk_schema};
@@ -51,7 +51,7 @@ pub fn pk_u64_two_i64_schema() -> SchemaDescriptor {
 pub fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i64)]) -> Batch {
     let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(c0, c1, c2, w, val) in rows {
-        b.extend_pk_opk(schema, &[c0 as u128, c1 as u128, c2 as u128]);
+        b.extend_pk_opk(&[c0 as u128, c1 as u128, c2 as u128]);
         b.extend_weight(&w.to_le_bytes());
         b.extend_col(0, &val.to_le_bytes());
         b.commit_row(0);
@@ -63,7 +63,7 @@ pub fn make_wide_batch(schema: &SchemaDescriptor, rows: &[(u64, u64, u64, i64, i
             "make_wide_batch row {r}: non-OPK-sorted PK (encoder regression?)",
         );
     }
-    b.certify_layout(Layout::Consolidated, schema);
+    b.certify_layout(Layout::Consolidated);
     b
 }
 
@@ -136,12 +136,12 @@ pub fn make_schema_i64pk_i64() -> SchemaDescriptor {
 pub fn make_batch_i64pk(schema: &SchemaDescriptor, rows: &[(i64, i64, i64)]) -> Batch {
     let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(pk, w, val) in rows {
-        b.extend_pk_opk(schema, &[(pk as u64) as u128]);
+        b.extend_pk_opk(&[(pk as u64) as u128]);
         b.extend_weight(&w.to_le_bytes());
         b.extend_col(0, &val.to_le_bytes());
         b.commit_row(0);
     }
-    b.certify_layout(Layout::Consolidated, schema);
+    b.certify_layout(Layout::Consolidated);
     b
 }
 
@@ -166,7 +166,7 @@ pub fn make_batch_bytes(schema: &SchemaDescriptor, rows: &[(u64, i64, &[u8])]) -
         b.extend_col_blob(0, val);
         b.commit_row(0);
     }
-    b.certify_layout(Layout::Consolidated, schema);
+    b.certify_layout(Layout::Consolidated);
     b
 }
 
@@ -235,4 +235,18 @@ pub fn rs_files_under(
         }
     }
     out
+}
+
+/// A rederived table under `dir` at the default budgets — nothing a test puts
+/// here spills, since that needs the whole 32 MiB RAM tier. For a test that just
+/// needs somewhere to put rows.
+pub(crate) fn scratch_table(dir: &str, schema: SchemaDescriptor, table_id: u32) -> Table {
+    Table::new(
+        dir,
+        schema,
+        table_id,
+        RecoverySource::Rederive { resume_at: None },
+        StoreBudgets::default(),
+    )
+    .unwrap()
 }

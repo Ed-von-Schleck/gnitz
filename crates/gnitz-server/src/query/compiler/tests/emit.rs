@@ -1,6 +1,9 @@
 use super::*;
 use crate::test_support::{make_batch, make_schema_u64_i64, pk_only_schema, pk_payload_schema, sum_weights};
-use gnitz_store::schema::{type_code, SchemaColumn};
+use gnitz_store::relation::{CircuitState, OnRegister, RelationKind, RelationSpec, StoreConfig, ViewBudgets};
+use gnitz_store::schema::SchemaColumn;
+use gnitz_store::storage::Slot;
+use gnitz_wire::type_code;
 use std::collections::HashMap;
 
 // ── Fixtures ────────────────────────────────────────────────────────────
@@ -34,9 +37,8 @@ impl MidCircuit {
             &loaded,
             &loaded.subgraph_ordered(1),
             &ext_tables([(10i64, self.in_schema)]),
-            test_site(self.tmp.path().to_str().unwrap(), 1),
+            home(self.tmp.path().to_str().unwrap(), 1).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            &mut ScratchGuard::new(),
             PlanTarget::Subgraph { out: 1 },
         )
     }
@@ -53,15 +55,52 @@ fn rejection<T>(r: Result<T, CompileError>) -> String {
     r.map(|_| "a plan").expect_err("expected a rejection").to_string()
 }
 
-/// A view site over a throwaway directory: nothing under it was ever
-/// checkpointed, so the children it opens resume nothing.
-fn test_site(dir: &str, id: u64) -> ViewSite<'_> {
-    ViewSite {
-        dir,
+/// Where one test's compile is homed: the throwaway root its scratch children
+/// live under, and the registry they are opened through. A `ViewSite` borrows
+/// both, so a `Home` temporary lives as long as the build it feeds.
+struct Home {
+    dir: String,
+    id: u64,
+    registry: RelationRegistry,
+}
+
+impl Home {
+    fn site(&self) -> ViewSite<'_> {
+        ViewSite {
+            dir: &self.dir,
+            id: self.id,
+            registry: &self.registry,
+        }
+    }
+}
+
+/// A home whose view is registered under `dir`, so the emit arms open their
+/// children at the policy production gives them. Nothing under `dir` was ever
+/// checkpointed, so they resume nothing.
+fn home(dir: &str, id: u64) -> Home {
+    let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
+    registry
+        .register(
+            RelationSpec {
+                id: id as i64,
+                kind: RelationKind::View,
+                schema: make_schema_u64_i64(),
+                directory: dir.to_string(),
+                budgets: ViewBudgets::default(),
+            },
+            OnRegister::Live,
+        )
+        .unwrap();
+    Home { dir: dir.to_string(), id, registry }
+}
+
+/// A home with no view registered and no root — what a guard rejected before any
+/// child opens needs.
+fn bare_home(id: u64) -> Home {
+    Home {
+        dir: String::new(),
         id,
-        recovery: RecoverySource::Rederive { resume_at: None },
-        slot: Slot::SOLO,
-        budgets: StoreBudgets::default(),
+        registry: RelationRegistry::new(Slot::SOLO, StoreConfig::default()),
     }
 }
 
@@ -86,9 +125,8 @@ fn a_subgraph_outputs_the_named_node_and_must_not_hold_the_sink() {
             &loaded,
             ordered,
             &ext,
-            test_site("", 1),
+            bare_home(1).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            &mut ScratchGuard::new(),
             PlanTarget::Subgraph { out: 1 },
         )
     };
@@ -126,9 +164,8 @@ fn a_sink_schema_unequal_to_the_view_schema_is_rejected() {
             &loaded,
             &loaded.ordered,
             &ext_tables([(10i64, source)]),
-            test_site("", 1),
+            bare_home(1).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            &mut ScratchGuard::new(),
             PlanTarget::ViewOutput { out_schema: view_schema, seeds: &[] },
         )
     };
@@ -168,9 +205,8 @@ fn a_trace_register_reaching_a_delta_port_is_rejected() {
             &loaded,
             &loaded.ordered,
             &ext_tables([(10i64, one)]),
-            test_site(dir.path().to_str().unwrap(), 1),
+            home(dir.path().to_str().unwrap(), 1).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            &mut ScratchGuard::new(),
             PlanTarget::Subgraph { out: 2 },
         )
         .map(drop)
@@ -205,9 +241,8 @@ fn a_plan_whose_output_is_an_integral_is_rejected() {
         &loaded,
         &loaded.ordered,
         &ext_tables([(10i64, make_schema_u64_i64())]),
-        test_site(dir.path().to_str().unwrap(), 1),
+        home(dir.path().to_str().unwrap(), 1).site(),
         gnitz_store::schema::Placement::KEYED_DEFAULT,
-        &mut ScratchGuard::new(),
         PlanTarget::Subgraph { out: 1 },
     );
     assert_eq!(rejection(result), "operand port takes a delta, not an integral");
@@ -249,9 +284,8 @@ fn a_global_aggregate_under_a_keyed_shard_is_rejected() {
             &loaded,
             &loaded.ordered_where(|n| n >= 2),
             &ext_tables([(10i64, schema)]),
-            test_site(dir.path().to_str().unwrap(), 1),
+            home(dir.path().to_str().unwrap(), 1).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            &mut ScratchGuard::new(),
             PlanTarget::ViewOutput {
                 out_schema: &out_schema,
                 seeds: &[(1, schema)],
@@ -379,9 +413,8 @@ fn plan_two_source_join(
         &loaded,
         &loaded.subgraph_ordered(3),
         &ext_tables([(10i64, delta_schema), (11, trace_schema)]),
-        test_site(dir.path().to_str().unwrap(), 1),
+        home(dir.path().to_str().unwrap(), 1).site(),
         gnitz_store::schema::Placement::KEYED_DEFAULT,
-        &mut ScratchGuard::new(),
         PlanTarget::Subgraph { out: 3 },
     )
     .map(drop)
@@ -411,9 +444,8 @@ fn a_join_whose_trace_port_is_not_an_integral_is_rejected() {
             &loaded,
             &loaded.ordered,
             &ext_tables([(10i64, two_col), (11, two_col)]),
-            test_site(dir.path().to_str().unwrap(), 1),
+            home(dir.path().to_str().unwrap(), 1).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            &mut ScratchGuard::new(),
             PlanTarget::Subgraph { out: 3 },
         )
         .map(drop)
@@ -443,18 +475,16 @@ fn a_wide_pk_join_compiles() {
         &loaded,
         &loaded.subgraph_ordered(2),
         &ext_tables([(10i64, schema), (20, schema)]),
-        test_site(dir.path().to_str().unwrap(), 1),
+        home(dir.path().to_str().unwrap(), 1).site(),
         gnitz_store::schema::Placement::KEYED_DEFAULT,
-        &mut ScratchGuard::new(),
         PlanTarget::Subgraph { out: 2 }
     )
     .is_ok());
 }
 
-/// A failing node after one that already created scratch: `ScratchGuard`'s drop
-/// must remove the directory, so probing unsupported queries cannot leak inodes.
-/// The failing node must come *after* a scratch-creating one, otherwise there is
-/// nothing to remove and the assertion holds vacuously.
+/// A failing node after one that already created scratch: an uncommitted
+/// `CircuitState`'s drop must remove the directory. The failing node comes
+/// *after* the scratch-creating one, or the assertion holds vacuously.
 #[test]
 fn a_failed_compile_removes_the_scratch_dirs_it_created() {
     let dir = tempfile::tempdir().unwrap();
@@ -474,9 +504,8 @@ fn a_failed_compile_removes_the_scratch_dirs_it_created() {
         &loaded,
         &loaded.subgraph_ordered(2),
         &ext_tables([(10i64, make_schema_u64_i64())]),
-        test_site(view_dir.to_str().unwrap(), 1),
+        home(view_dir.to_str().unwrap(), 1).site(),
         gnitz_store::schema::Placement::KEYED_DEFAULT,
-        &mut ScratchGuard::new(),
         PlanTarget::Subgraph { out: 2 },
     );
     assert_eq!(
@@ -529,9 +558,8 @@ fn a_chained_exchange_is_rejected_instead_of_panicking() {
         &loaded,
         &side_ordered,
         &ext_tables([(10i64, make_schema_u64_i64())]),
-        test_site(dir.path().to_str().unwrap(), 1),
+        home(dir.path().to_str().unwrap(), 1).site(),
         gnitz_store::schema::Placement::KEYED_DEFAULT,
-        &mut ScratchGuard::new(),
         PlanTarget::Subgraph { out: ex_in },
     );
     assert_eq!(rejection(result), "chained exchange nodes");
@@ -615,9 +643,8 @@ fn a_destructive_op_takes_its_input_only_when_it_is_the_last_reader() {
             &loaded,
             &loaded.ordered,
             &ext,
-            test_site(dir.path().to_str().unwrap(), 1),
+            home(dir.path().to_str().unwrap(), 1).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            &mut ScratchGuard::new(),
             PlanTarget::Subgraph { out: distinct_id },
         )
         .expect("both orderings compile")
@@ -650,9 +677,8 @@ fn a_union_takes_each_unread_operand_but_never_the_sink_register() {
             &loaded,
             &loaded.ordered,
             &ext_tables([(10i64, two_col), (11, two_col)]),
-            test_site("", 1),
+            bare_home(1).site(),
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            &mut ScratchGuard::new(),
             PlanTarget::Subgraph { out },
         )
         .expect("a union plan compiles")
@@ -693,7 +719,6 @@ fn a_union_takes_each_unread_operand_but_never_the_sink_register() {
 /// that operator's history emptied.
 #[test]
 fn a_failed_compile_keeps_a_pre_existing_scratch_child() {
-    use gnitz_store::storage::{flush_barrier, ChildAddr, FlushRound};
     const G: u64 = 7;
     const VIEW_ID: u64 = 1;
 
@@ -701,15 +726,36 @@ fn a_failed_compile_keeps_a_pre_existing_scratch_child() {
     let dir = tmp.path().to_str().unwrap();
     let schema = make_schema_u64_i64();
     // The name `emit_node`'s `Distinct` arm derives for node 1 of view 1.
-    let child_dir = ChildAddr::Scratch { child: "_hist_1_1", rank: 0 }.dir(dir);
-    // `Some(G)`, not `None`: under `None` the open unlinks the manifest and
-    // erases the store anyway, so the test would pass without the fix.
-    let recovery = RecoverySource::Rederive { resume_at: Some(G) };
+    const CHILD: &str = "_hist_1_1";
+
+    // Set *before* the view is registered, so its output store opens at
+    // `Rederive { resume_at: Some(G) }` and `open_child` inherits that policy.
+    // Under `None` the open erases the store anyway and the test passes for the
+    // wrong reason.
+    let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
+    registry.set_resume_generation(G);
+    registry.set_recorded_topology(registry.launched_topology());
+    registry
+        .register(
+            RelationSpec {
+                id: VIEW_ID as i64,
+                kind: RelationKind::View,
+                schema,
+                directory: dir.to_string(),
+                budgets: ViewBudgets::default(),
+            },
+            OnRegister::Live,
+        )
+        .unwrap();
 
     // A checkpointed operator trace: one row, published at generation G.
-    let mut committed = Table::new(&child_dir, schema, 1, recovery, StoreBudgets::default()).unwrap();
-    committed.ingest_owned_batch(make_batch(&schema, &[(1, 1, 5)])).unwrap();
-    flush_barrier([&mut committed], FlushRound::Ephemeral(G)).unwrap();
+    let mut committed = CircuitState::new();
+    let idx = committed
+        .open_child(&registry, VIEW_ID as i64, dir, CHILD, schema)
+        .unwrap();
+    committed.ingest_owned(idx, make_batch(&schema, &[(1, 1, 5)])).unwrap();
+    registry.checkpoint_ephemeral(G, [&mut committed]).unwrap();
+    committed.commit();
     drop(committed);
 
     // Node 1 reopens that child; node 2 then fails the compile.
@@ -721,13 +767,7 @@ fn a_failed_compile_keeps_a_pre_existing_scratch_child() {
         ],
         vec![(0, 1, SLOT_IN), (1, 2, SLOT_IN)],
     );
-    let site = ViewSite {
-        dir,
-        id: VIEW_ID,
-        recovery,
-        slot: Slot::SOLO,
-        budgets: StoreBudgets::default(),
-    };
+    let site = ViewSite { dir, id: VIEW_ID, registry: &registry };
     assert_eq!(
         rejection(build_plan(
             &loaded,
@@ -735,16 +775,19 @@ fn a_failed_compile_keeps_a_pre_existing_scratch_child() {
             &ext_tables([(10i64, schema)]),
             site,
             gnitz_store::schema::Placement::KEYED_DEFAULT,
-            &mut ScratchGuard::new(),
             PlanTarget::Subgraph { out: 2 },
         )),
         "projection map: column 200 is not a payload column of a 2-column schema"
     );
 
-    let reopened = Table::new(&child_dir, schema, 1, recovery, StoreBudgets::default()).unwrap();
+    let mut reopened = CircuitState::new();
+    let idx = reopened
+        .open_child(&registry, VIEW_ID as i64, dir, CHILD, schema)
+        .unwrap();
     assert_eq!(
-        sum_weights(reopened.open_cursor()),
+        sum_weights(reopened.cursor(idx)),
         1,
         "the committed trace row must survive a failed compile"
     );
+    reopened.commit();
 }

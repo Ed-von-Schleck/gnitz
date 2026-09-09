@@ -50,10 +50,10 @@ use std::rc::Rc;
 
 use crate::query::DagEngine;
 use gnitz_store::relation::{
-    IndexCircuitEntry, RelationKind, RelationRegistry, RelationSpec, StoreConfig, ViewBudgets,
+    OnRegister, Relation, RelationKind, RelationRegistry, RelationSpec, SecondaryIndex, StoreConfig, ViewBudgets,
 };
 use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, ReadCursor, RecoverySource, Slot, StorageError, StoreBudgets, StoreError, Table};
+use gnitz_store::storage::{Batch, ReadCursor, Slot, StoreError};
 
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 // The DDL_TXN driver's bundle decoders: it resolves each family once, carries
@@ -80,12 +80,12 @@ pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
 pub(in crate::catalog) use registry::raise_id_counter;
 // The child-directory grammar and the directory primitives are storage's; the
 // catalog only consumes them.
+pub(in crate::catalog) use gnitz_store::storage::fsync_dir;
 #[cfg(test)]
-pub(in crate::catalog) use gnitz_store::storage::subdir_names;
-pub(in crate::catalog) use gnitz_store::storage::{children_at_generation, fsync_dir, ChildAddr};
+pub(in crate::catalog) use gnitz_store::storage::ChildAddr;
 pub(in crate::catalog) use utils::{
-    circuit_opk, index_dir, make_fk_index_name, preflight_dir, retract_key_range, retract_pk_list, schema_dir,
-    sys_catalog_dir, sys_family_dir, sys_opk,
+    circuit_opk, make_fk_index_name, preflight_dir, retract_key_range, retract_pk_list, schema_dir, sys_catalog_dir,
+    sys_family_dir, sys_opk,
 };
 // The relation rung's directory primitives; the catalog only consumes them.
 pub(in crate::catalog) use gnitz_store::relation::{

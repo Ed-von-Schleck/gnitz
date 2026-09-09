@@ -17,9 +17,13 @@
 //! everything else is `pub(crate)`.
 //!
 //! There is no crate-root re-export façade: a type's rung is part of what its
-//! path says, and the root itself holds no name. Nothing this crate exports
-//! ends the calling process: every fallible path returns its error, and the
-//! decision to fail-stop belongs to the process that owns a restart contract.
+//! path says, and the root itself holds no name.
+//!
+//! A public function panics only on a violation of its own contract by the
+//! caller: an out-of-range column index, a malformed slot, a lifecycle verb
+//! called from the wrong [`Residency`](relation::Residency). Every *runtime*
+//! failure returns its error, because the decision to fail-stop belongs to the
+//! process that owns a restart contract.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its

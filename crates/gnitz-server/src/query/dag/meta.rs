@@ -7,6 +7,7 @@
 //! it redirects to a throwaway root; anything else the master needs routes here.
 
 use super::*;
+use gnitz_store::relation::Relation;
 use std::rc::Rc;
 
 /// The bidirectional view-dependency index with its validity flag bundled in, so
@@ -205,7 +206,12 @@ impl DagEngine {
         let mut bases: Vec<i64> = self
             .source_closure(registry, seeds)
             .into_iter()
-            .filter(|&s| registry.relation_kind(s).is_some_and(|k| k.is_base_table()))
+            .filter(|&s| {
+                registry
+                    .relation(s)
+                    .map(Relation::kind)
+                    .is_some_and(|k| k.is_base_table())
+            })
             .collect();
         bases.sort_unstable();
         bases
@@ -220,7 +226,7 @@ impl DagEngine {
         self.dep.depth.get(&id).copied().unwrap_or(0)
     }
 
-    /// Where a view's rows live — the value `TableEntry` stamps — folded from
+    /// Where a view's rows live — the value `Relation` stamps — folded from
     /// its `sources`' **stamped** placements. `pk_arity` is the view's own
     /// declared PK column count (it is not registered yet, so the arity cannot
     /// be read back off the registry).
@@ -248,8 +254,8 @@ impl DagEngine {
         // anywhere and keeps that default too.
         let placement_of = |&t: &i64| {
             registry
-                .entry(t)
-                .map_or(Placement::KEYED_DEFAULT, |e| e.schema.placement())
+                .relation(t)
+                .map_or(Placement::KEYED_DEFAULT, |e| e.schema().placement())
         };
         if sources.is_empty() {
             return Placement::KEYED_DEFAULT;
@@ -274,7 +280,8 @@ impl DagEngine {
             return Placement::KEYED_DEFAULT;
         };
         let (placement, n) = registry
-            .get_schema_desc(*src)
+            .relation(*src)
+            .map(Relation::schema)
             .map_or((Placement::KEYED_DEFAULT, 0), |s| (s.placement(), s.pk_indices().len()));
         if pk_arity != n {
             return Placement::KEYED_DEFAULT;

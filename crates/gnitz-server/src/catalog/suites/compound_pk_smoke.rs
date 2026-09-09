@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_store::schema::type_code;
+use gnitz_wire::type_code;
 
 // The routing-symmetry tests (master `compute_worker_indices` vs worker
 // `worker_for_pk_bytes`) live next to the code they exercise, in
@@ -22,7 +22,7 @@ fn schema_roundtrip_catalog_preserves_pk_order() {
     {
         let engine = CatalogEngine::open(&dir, 1).unwrap();
         let tid = engine.get_by_name("public", "cpk_order").unwrap();
-        let schema = engine.registry().get_schema_desc(tid).unwrap();
+        let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
         assert_eq!(
             schema.pk_indices(),
             &[2, 1],

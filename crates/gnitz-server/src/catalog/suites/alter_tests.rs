@@ -22,7 +22,7 @@ struct TableRow {
 fn live_table_row(engine: &CatalogEngine, tid: i64) -> TableRow {
     let schema = SysFamily::Table.schema();
     let key = sys_opk(schema, tid as u128);
-    let store = engine.sys_store(SysFamily::Table);
+    let store = engine.sys_relation(SysFamily::Table);
     let sr = store
         .live_row_at(key.pk_bytes())
         .1
@@ -55,7 +55,7 @@ fn table_rename_pair(engine: &CatalogEngine, tid: i64, new_name: &str) -> Batch 
 /// Count live positive-weight rows for `tid` in the TABLE_TAB store — 1 for a
 /// clean rename, 2+ for a persistent ghost.
 fn live_rows_for(engine: &CatalogEngine, tid: i64) -> usize {
-    let mut c = engine.sys_store(SysFamily::Table).open_cursor();
+    let mut c = engine.sys_relation(SysFamily::Table).cursor();
     let mut n = 0;
     while c.valid {
         if c.current_key_narrow() as u64 == tid as u64 && c.current_weight > 0 {
@@ -111,7 +111,7 @@ fn rename_then_reopen_resolves_flushed_data() {
         let cols = vec![col_def("id", type_code::U64), col_def("v", type_code::U64)];
         tid = engine.create_table("public.orig", &cols, &[0]).unwrap();
         // Flush a row so only the on-disk (id-only) path can serve it after reopen.
-        let schema = engine.registry().get_schema_desc(tid).unwrap();
+        let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
         let mut bb = BatchBuilder::new(schema);
         bb.begin_row(7u128, 1);
         bb.put_u64(70);
@@ -133,7 +133,7 @@ fn rename_then_reopen_resolves_flushed_data() {
         "renamed relation must resolve after reopen"
     );
     assert!(
-        engine.seek_family(tid, 7u128, &[]).unwrap().0.is_some(),
+        engine.seek(tid, 7u128, &[]).unwrap().0.is_some(),
         "flushed row must resolve after rename + reopen (id-only dir was untouched)"
     );
 
@@ -344,9 +344,9 @@ fn stale_column_rename_rejected_and_drop_cascade_passes() {
 
     // A DROP TABLE cascade (unpaired COL `-1`s with the full live payload) still
     // passes the Column arm — the drop succeeds and removes the columns.
-    let cols_before = count_records(engine.sys_store_mut(SysFamily::Column).open_cursor());
+    let cols_before = count_records(engine.sys_relation(SysFamily::Column).cursor());
     engine.drop_table("public.t").unwrap();
-    let cols_after = count_records(engine.sys_store_mut(SysFamily::Column).open_cursor());
+    let cols_after = count_records(engine.sys_relation(SysFamily::Column).cursor());
     assert_eq!(
         cols_after,
         cols_before - 2,

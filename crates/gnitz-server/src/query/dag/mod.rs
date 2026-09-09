@@ -17,9 +17,9 @@ use std::rc::Rc;
 use crate::query::compiler::{self, CompileOutput, SubPlan, ViewMeta};
 use crate::query::vm;
 use gnitz_store::ops;
-use gnitz_store::relation::{RelationRegistry, TableEntry};
+use gnitz_store::relation::{CircuitState, Relation, RelationRegistry};
 use gnitz_store::schema::{Placement, SchemaDescriptor};
-use gnitz_store::storage::{Batch, RecoverySource, Table};
+use gnitz_store::storage::Batch;
 
 mod exec;
 mod hydrate;
@@ -83,12 +83,12 @@ impl DagEngine {
         registry: &mut RelationRegistry,
         view_id: i64,
     ) -> Result<(), String> {
-        registry.reset_store(view_id)?;
+        registry.reset_view(view_id)?;
         self.invalidate(view_id);
         Ok(())
     }
 
-    /// [`RelationRegistry::swap_table_schema`] under the RESTRICT check, which
+    /// [`RelationRegistry::swap_schema`] under the RESTRICT check, which
     /// needs the dependency map this layer owns and is what lets the swap leave
     /// the plan cache alone.
     ///
@@ -96,7 +96,7 @@ impl DagEngine {
     /// alter hook with the precheck bypassed, and a violation there leaves a
     /// cached VM scanning a store whose region count moved under it. Boot never
     /// trips it, so the `Err` is a fail-stop taken over serving wrong reads.
-    pub(crate) fn swap_table_schema(
+    pub(crate) fn swap_schema(
         &mut self,
         registry: &mut RelationRegistry,
         table_id: i64,
@@ -104,10 +104,10 @@ impl DagEngine {
     ) -> Result<(), String> {
         if self.has_dependents(registry, table_id) {
             return Err(format!(
-                "swap_table_schema: table {table_id} has dependent views;                  RESTRICT should have rejected the ALTER"
+                "swap_schema: table {table_id} has dependent views;                  RESTRICT should have rejected the ALTER"
             ));
         }
-        registry.swap_table_schema(table_id, schema).map_err(String::from)
+        registry.swap_schema(table_id, schema).map_err(String::from)
     }
 
     // ── Cache management ────────────────────────────────────────────────
@@ -147,11 +147,11 @@ impl DagEngine {
         if self.cache.contains_key(&view_id) {
             return Ok(true);
         }
-        let Some(entry) = registry.entry(view_id) else {
+        let Some(entry) = registry.relation(view_id) else {
             return Ok(false);
         };
         let compiled = self
-            .compile_circuit(registry, view_id, &entry.directory, entry)
+            .compile_circuit(registry, view_id, entry.directory(), entry)
             .map_err(|err| {
                 format!(
                     "view_id={view_id} does not compile from its durable circuit — this build no \
@@ -182,31 +182,17 @@ impl DagEngine {
     /// Read `view_id`'s circuit out of the system tables and compile it, homing
     /// every scratch child under `dir`. The directory is a parameter and not read
     /// off `entry` because the pre-flight compiles into a throwaway root.
-    ///
-    /// The scratch children open under the policy `entry`'s own output store was
-    /// opened with, so a view's operator traces cannot end up looking for a
-    /// different manifest generation than its output. An entry holding no owned
-    /// store — the post-fork master's, and the pre-flight's — resumes nothing,
-    /// which is what a compile into a directory with no manifest concludes anyway.
     fn compile_circuit(
         &self,
         registry: &RelationRegistry,
         view_id: i64,
         dir: &str,
-        entry: &TableEntry,
+        entry: &Relation,
     ) -> Result<compiler::CompiledView, compiler::CompileError> {
-        let site = compiler::ViewSite {
-            dir,
-            id: view_id as u64,
-            recovery: entry
-                .owned_store()
-                .map_or(RecoverySource::Rederive { resume_at: None }, Table::recovery_source),
-            slot: registry.slot(),
-            budgets: registry.store_budgets(),
-        };
+        let site = compiler::ViewSite { dir, id: view_id as u64, registry };
         // The compiler layer sees only the circuit system table, never `VIEW_TAB`,
         // so it cannot derive whether the view is capacity-bounded.
-        compiler::compile_view(site, &entry.schema, registry, entry.budgets.capacity_bytes.is_some())
+        compiler::compile_view(site, &entry.schema(), entry.is_bounded())
     }
 
     /// Decide whether a just-registered view's circuit compiles, keeping nothing.
@@ -217,8 +203,8 @@ impl DagEngine {
     ///
     /// `root` is a throwaway directory the caller creates the path for and
     /// removes again — see `catalog::utils::preflight_dir` for why it is not the
-    /// view's own. The plan is dropped here, so the `Table`s it holds open under
-    /// `root` are closed before this returns.
+    /// view's own. The plan is dropped here, so the child stores it opened under
+    /// `root` are closed — and their directories removed — before this returns.
     ///
     /// The verdict is worker-independent: it compiles under the master's slot,
     /// `root` overrides the one path component the slot contributes, and no
@@ -232,8 +218,10 @@ impl DagEngine {
         // `hook_relation_register` ran earlier in this bundle's ingest loop, so a
         // registered `+1` VIEW_TAB row is always in the registry; a miss is an
         // engine bug, surfaced as a DDL rejection rather than an unchecked compile.
-        let entry = registry.table_entry(view_id).map_err(|e| format!("pre-flight: {e}"))?;
-        // `map(drop)` closes the plan — and the `Table`s it holds open under
+        let entry = registry
+            .relation_or_err(view_id)
+            .map_err(|e| format!("pre-flight: {e}"))?;
+        // `map(drop)` closes the plan — and the child stores it opened under
         // `root` — before the caller removes the directory.
         self.compile_circuit(registry, view_id, root, entry)
             .map(drop)
@@ -248,33 +236,30 @@ impl DagEngine {
         self.invalidate_all();
     }
 
-    /// The operator-trace tables the ephemeral checkpoint round force-persists:
-    /// every compiled view plan's own. The registry's half of the round is
-    /// [`RelationRegistry::collect_ephemeral_output_tables`], and traces go fully
-    /// durable first, so any output manifest at generation `G` implies that
-    /// view's traces are durable at `G`.
+    /// Every compiled view plan's operator state, for the ephemeral checkpoint
+    /// round to force-persist ahead of the registry's own output stores.
     ///
     /// The registry is read only for the `is_view` filter on each cached plan;
     /// the explicit lifetime is what ends that borrow at the call, so the caller
     /// can take `&mut` on the registry while this vector is still alive.
-    pub(crate) fn collect_ephemeral_trace_tables<'a>(&'a mut self, registry: &RelationRegistry) -> Vec<&'a mut Table> {
+    pub(crate) fn collect_ephemeral_state<'a>(&'a mut self, registry: &RelationRegistry) -> Vec<&'a mut CircuitState> {
         // Iterate the (smaller) plan cache and consult the registry for each
         // plan's kind. Every `cache` entry has a matching registry entry
         // (`ensure_compiled` requires it first; `unregister_table` removes both),
-        // so this misses no view trace.
-        let mut traces: Vec<&mut Table> = Vec::new();
+        // so this misses no view's state.
+        let mut state: Vec<&mut CircuitState> = Vec::new();
         for (tid, plan) in self.cache.iter_mut() {
-            if !registry.relation_kind(*tid).is_some_and(|k| k.is_view()) {
+            if !registry.relation(*tid).map(Relation::kind).is_some_and(|k| k.is_view()) {
                 continue;
             }
             for sub in plan.sub_plans_mut() {
                 // Drop the bound cursors before the fold so none holds a stale
                 // snapshot.
                 sub.vm.reset_trace_cursors();
-                traces.extend(sub.vm.tables.iter_mut());
+                state.push(&mut sub.vm.state);
             }
         }
-        traces
+        state
     }
 }
 

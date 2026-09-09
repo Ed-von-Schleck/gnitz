@@ -204,7 +204,10 @@ pub struct Batch {
     /// Fresh batches default to `Raw` — a forgotten raise degrades to a safe
     /// re-fold, never a lie.
     layout: Layout,
-    pub schema: SchemaDescriptor,
+    /// The schema this batch's rows were laid out under. Moved only through
+    /// [`Self::set_schema`]; a consumer whose own descriptor governs instead
+    /// passes it explicitly (see [`Self::into_consolidated`]).
+    schema: SchemaDescriptor,
     /// Identity token for blob-sharing: two batches with equal `blob_id` have
     /// identical blob content, making verbatim 16-byte German String struct
     /// copies safe.  Set by `share_blob_from` and read by
@@ -303,7 +306,7 @@ impl Batch {
     /// Room for `bytes` more blob heap bytes, taken from the arena pool `Drop`
     /// recycles into — a bare [`Vec::reserve`] would take them from the global
     /// allocator. A heap already holding bytes has to grow in place.
-    pub fn reserve_blob(&mut self, bytes: usize) {
+    pub(crate) fn reserve_blob(&mut self, bytes: usize) {
         match self.blob.capacity() {
             0 => self.blob = acquire_arena(bytes, Fill::Reserve),
             _ => self.blob.reserve(bytes),
@@ -377,9 +380,15 @@ impl Batch {
 
     // ── Schema installation ─────────────────────────────────────────────
 
+    /// The schema this batch's rows were laid out under.
+    #[inline]
+    pub fn schema(&self) -> &SchemaDescriptor {
+        &self.schema
+    }
+
     /// Install a schema on this batch after verifying its column count
     /// matches the batch's physical payload regions. Every code path that
-    /// wants to mutate `batch.schema` from outside the constructors MUST go
+    /// wants to move a batch's schema after construction MUST go
     /// through this helper: it turns a latent "batch shape != declared
     /// shape" bug into a localized panic at the first assignment, instead
     /// of a cryptic OOB slice panic several call-frames later.
@@ -603,7 +612,7 @@ impl Batch {
     /// `#[inline]` for the already-has-room test, which is the whole call on
     /// every append but the growing one.
     #[inline]
-    pub fn reserve_rows(&mut self, n: usize) {
+    pub(crate) fn reserve_rows(&mut self, n: usize) {
         if self.count + n <= self.capacity {
             return;
         }
@@ -796,8 +805,8 @@ impl Batch {
     /// storage — so this stays a downward edge. Not test-only: it is what
     /// `BatchBuilder::begin_row_opk`, and through it the `SysRowSink` the
     /// catalog writes rows with, dispatches to.
-    pub fn extend_pk_opk(&mut self, schema: &SchemaDescriptor, native_col_vals: &[u128]) {
-        let cols = schema.pk_columns().map(|(_, col)| (col.type_code, *col));
+    pub fn extend_pk_opk(&mut self, native_col_vals: &[u128]) {
+        let cols = self.schema.pk_columns().map(|(_, col)| (col.type_code, *col));
         self.extend_pk_bytes(crate::schema::key::encode_leading_opk(cols, native_col_vals).pk_bytes());
     }
 
@@ -1039,13 +1048,13 @@ impl Batch {
     /// where the code just produced the property it names.
     #[cfg_attr(not(debug_assertions), allow(unused_variables))]
     #[inline]
-    pub fn certify_layout(&mut self, layout: Layout, schema: &SchemaDescriptor) {
+    pub fn certify_layout(&mut self, layout: Layout) {
         #[cfg(debug_assertions)]
-        self.debug_verify_null_bits(schema);
+        self.debug_verify_null_bits(&self.schema);
         #[cfg(debug_assertions)]
         match layout {
             Layout::Raw => {}
-            Layout::Consolidated => self.debug_verify_consolidated(schema),
+            Layout::Consolidated => self.debug_verify_consolidated(&self.schema),
         }
         self.layout = layout;
     }
@@ -1152,7 +1161,7 @@ impl Batch {
     /// Live row bytes: each region bounded to `count`, plus the blob. Excludes
     /// unused capacity and inter-region padding, so a caller sizing a RAM budget
     /// against it is measuring rows held, not bytes allocated.
-    pub fn total_bytes(&self) -> usize {
+    pub(crate) fn total_bytes(&self) -> usize {
         let nr = self.num_regions();
         let mut total = self.blob.len();
         for i in 0..nr {
@@ -1180,12 +1189,12 @@ impl Batch {
     /// leaves weights untouched, so a consolidated source yields a consolidated
     /// subset. A reordering caller wants
     /// [`from_indexed_rows`](Self::from_indexed_rows).
-    pub fn ascending_subset(&self, indices: &[u32], schema: &SchemaDescriptor) -> Self {
+    pub fn ascending_subset(&self, indices: &[u32]) -> Self {
         debug_assert!(
             indices.windows(2).all(|w| w[0] < w[1]),
             "ascending_subset requires a strictly ascending index list",
         );
-        let mut out = Self::from_indexed_rows(&self.as_mem_batch(), indices, schema);
+        let mut out = Self::from_indexed_rows(&self.as_mem_batch(), indices, &self.schema);
         out.inherit_layout(self);
         out
     }
@@ -1233,12 +1242,8 @@ impl Batch {
     /// eight bytes. The NULL words copy whole here because the payload space is
     /// identical — the delta schema is a reordering of the view's columns, not a
     /// shift of them.
-    pub fn stamped_with_pk_prefix(
-        &self,
-        in_schema: &SchemaDescriptor,
-        out_schema: &SchemaDescriptor,
-        prefix: u64,
-    ) -> Self {
+    pub fn stamped_with_pk_prefix(&self, out_schema: &SchemaDescriptor, prefix: u64) -> Self {
+        let in_schema = &self.schema;
         let in_stride = in_schema.pk_stride();
         let out_stride = out_schema.pk_stride();
         let stamp_bytes = DELTA_TICK_COL.size() as usize;
@@ -1276,7 +1281,8 @@ impl Batch {
     /// round 5's key 100 sits before round 6's key 3, and the same
     /// `(key, payload)` element legitimately appears under two stamps. The result
     /// claims `Layout::Raw` so the consumer's sort-and-fold runs.
-    pub fn stripped_of_pk_prefix(&self, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Self {
+    pub fn stripped_of_pk_prefix(&self, out_schema: &SchemaDescriptor) -> Self {
+        let in_schema = &self.schema;
         let in_stride = in_schema.pk_stride();
         let out_stride = out_schema.pk_stride();
         let stamp_bytes = DELTA_TICK_COL.size() as usize;
@@ -1309,7 +1315,8 @@ impl Batch {
     /// `out_schema` must share this batch's PK stride and have at least as many
     /// payload columns; the caller states the input schema because a `Batch`
     /// carries only its region strides.
-    pub fn widened_with_null_tail(&self, in_schema: &SchemaDescriptor, out_schema: &SchemaDescriptor) -> Self {
+    pub fn widened_with_null_tail(&self, out_schema: &SchemaDescriptor) -> Self {
+        let in_schema = &self.schema;
         debug_assert_eq!(out_schema.pk_stride(), in_schema.pk_stride());
         let in_npc = in_schema.num_payload_cols();
         let out_npc = out_schema.num_payload_cols();
@@ -1423,7 +1430,7 @@ impl Batch {
     /// Call [`Self::share_blob_from`] first to skip per-cell string relocation
     /// (see `append_ranges_inner`); it is a pure optimization, correct either
     /// way.
-    pub fn append_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
+    pub(crate) fn append_ranges(&mut self, src: &MemBatch<'_>, ranges: &[(usize, usize)]) {
         let rows = range_rows(ranges);
         // Before the session, which derives a payload string mask and takes a
         // pooled blob cache to copy nothing. An all-DELETE push emits one empty
@@ -1597,7 +1604,7 @@ impl Batch {
     /// exactly `pk_stride` bytes (asserted by `extend_pk_bytes`). Also valid for
     /// narrow PKs — the only difference from the `u128` entry point is how the
     /// PK region is written.
-    pub fn append_row_from_source_bytes<S: RowSource>(
+    pub(crate) fn append_row_from_source_bytes<S: RowSource>(
         &mut self,
         pk_bytes: &[u8],
         weight: i64,
@@ -1771,7 +1778,7 @@ impl Batch {
         let mut result = write_to_batch(schema, survivors.len(), mb.blob.len(), |writer| {
             super::scatter::scatter_unified_sources(&unified, &cols, &survivors, writer);
         });
-        result.certify_layout(Layout::Consolidated, schema);
+        result.certify_layout(Layout::Consolidated);
         result
     }
 

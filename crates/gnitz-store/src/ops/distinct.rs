@@ -83,7 +83,7 @@ pub fn op_weight_clamp(
     output.overwrite_weights(&emit_weights);
     // Emitting rows are scattered in consolidated-delta order (ascending indices),
     // one per transitioning element ⇒ (PK, payload)-sorted and ghost-free.
-    output.certify_layout(Layout::Consolidated, schema);
+    output.certify_layout(Layout::Consolidated);
 
     (output, consolidated)
 }

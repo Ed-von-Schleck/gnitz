@@ -112,7 +112,7 @@ impl BoundedIndexCursor {
         // at sub-group granularity over strictly-ascending PKs, at nonzero net
         // weights. Certifying it spares the ingest tail an O(chunk log chunk)
         // re-sort, as the full-scan drain path does.
-        batch.certify_layout(Layout::Consolidated, &self.src.schema);
+        batch.certify_layout(Layout::Consolidated);
         Some(batch)
     }
 }

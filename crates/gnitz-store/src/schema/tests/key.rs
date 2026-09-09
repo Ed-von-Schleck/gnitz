@@ -971,7 +971,7 @@ fn test_reindex_packer_multi_column_bytes() {
     let uv: u128 = 0xdead_beef_cafe_1234_5678_9abc_def0_0001;
 
     let mut b = Batch::with_capacity(&schema, 1);
-    b.extend_pk_opk(&schema, &[pk0 as u128, pk1 as u128]);
+    b.extend_pk_opk(&[pk0 as u128, pk1 as u128]);
     b.extend_weight(&1i64.to_le_bytes());
     b.extend_null_bmp(&0u64.to_le_bytes());
     b.extend_col(0, &iv.to_le_bytes()); // I32 payload (pi 0)

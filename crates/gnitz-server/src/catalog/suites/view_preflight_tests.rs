@@ -63,7 +63,12 @@ fn register_filtered_view(engine: &mut CatalogEngine, base_tid: i64, name: &str,
 /// Names of the entries directly under `public`'s schema directory — where the
 /// pre-flight's throwaway root lives.
 fn schema_entries(dir: &str) -> Vec<String> {
-    let mut names = gnitz_store::storage::subdir_names(&format!("{dir}/public"));
+    let mut names: Vec<String> = fs::read_dir(format!("{dir}/public"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
     names.sort();
     names
 }
@@ -195,7 +200,12 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     let base_cols = vec![col_def("id", type_code::U64), col_def("v", type_code::I64)];
     let base_tid = engine.create_table("public.base", &base_cols, &[0]).unwrap();
     let old_vid = register_filtered_view(&mut engine, base_tid, "vw", &pred_lt_blob(1, 100));
-    let old_dir = engine.registry().table_entry(old_vid).unwrap().directory.clone();
+    let old_dir = engine
+        .registry()
+        .relation_or_err(old_vid)
+        .unwrap()
+        .directory()
+        .to_string();
 
     // The handler discards stale queue entries before the bundle it is about to
     // apply; the setup above is not part of that bundle.
@@ -211,7 +221,12 @@ fn test_rollback_of_a_replacing_bundle_restores_the_incumbent() {
     push_view_tab_row(&mut bb, -1, old_vid, "vw", 0, 0, 0);
     push_view_tab_row(&mut bb, 1, new_vid, "vw", 0, 0, 0);
     engine.ingest_to_family(VIEW_TAB_ID, &bb.finish()).unwrap();
-    let new_dir = engine.registry().table_entry(new_vid).unwrap().directory.clone();
+    let new_dir = engine
+        .registry()
+        .relation_or_err(new_vid)
+        .unwrap()
+        .directory()
+        .to_string();
     assert!(!engine.registry().has_id(old_vid), "the bundle retires the incumbent");
 
     // The pre-flight rejects the replacement's circuit — the bundle fails after

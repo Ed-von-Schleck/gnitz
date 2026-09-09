@@ -145,7 +145,7 @@ impl ExchangeAccumulator {
         // fact consolidated fails here rather than silently costing the scatter.
         for (payload, ok) in round.payloads.iter_mut().zip(&round.consolidated) {
             if let (Some(b), true) = (payload.as_mut(), *ok) {
-                b.certify_layout(Layout::Consolidated, &schema);
+                b.certify_layout(Layout::Consolidated);
             }
         }
         Some(PendingRelay {

@@ -1,10 +1,11 @@
-//! Storage subsystem: WAL, shards, run sets, merge, cursors, and tables.
+//! Storage subsystem: a Z-set as bytes — in memory, on the wire, on disk — plus
+//! the address that says which Z-set.
 //!
-//! Engine code imports from `crate::storage::{Type, fn}`. What a consumer can
-//! *name* is what the two lists below spell `pub use`, plus `batch_pool`; a
-//! `pub(crate) use` is the storage facade for this crate's own rungs and nothing
-//! more. The submodules stay private, so a `pub` item inside one is still
-//! dead-code checked.
+//! What a consumer outside this crate can *name* is what the re-exports below
+//! spell `pub use`: rows, and the address that says which store holds them. The
+//! store behind that address is not nameable — `relation` owns every one. A
+//! `pub(crate) use` is this crate's own facade; the submodules stay private, so
+//! a `pub` item inside one is still dead-code checked.
 //!
 //! Naming is not the whole surface: a type reached through a published signature
 //! or variant is reachable without being nameable, so a `pub(crate)` re-export
@@ -46,8 +47,8 @@ pub use batch::MAX_BATCH_REGIONS;
 pub(crate) use batch::{range_rows, write_to_batch};
 pub use batch_wire::decode_mem_batch_from_wal_block;
 pub use error::{StorageError, StoreError};
-pub use lsm::flush_barrier::{flush_barrier, FlushRound};
-pub use lsm::table::{RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};
+pub(crate) use lsm::flush_barrier::{flush_barrier, FlushRound};
+pub(crate) use lsm::table::{RecoverySource, StoreBudgets, Table, DEFAULT_RAM_TIER_BYTES};
 pub use merge::MemBatch;
 pub use scatter::batch_project_index;
 pub use scatter::route_rows_by_pk;
@@ -78,19 +79,21 @@ pub use columnar::{payload_bytes, payload_is_null, payload_string, payload_u64};
 // caller names `crate::schema::key::X`. Re-exporting it split one byte-order
 // rule across two import paths, visibly — `ops/reduce/sort.rs` and
 // `read/scan_spec.rs` each imported from both in adjacent lines.
+pub(crate) use lsm::child_dir::children_at_generation;
+pub use lsm::child_dir::fsync_dir;
 pub(crate) use lsm::child_dir::reclaim_retired_children;
-pub use lsm::child_dir::{children_at_generation, fsync_dir};
-pub use lsm::child_dir::{create_child, remove_child, ChildAddr, Slot};
-// A directory sweep is the one child-dir primitive a `gnitz-store` consumer runs
-// itself: the mirror reclaims the copies its own record file no longer names.
-pub use lsm::child_dir::subdir_names;
+pub(crate) use lsm::child_dir::{create_child, remove_child};
+// `ChildAddr` and `Slot` are *names*, not stores: the crash-fixture and relayout
+// tests assert on the on-disk shape through them.
+pub(crate) use lsm::child_dir::subdir_names;
+pub use lsm::child_dir::{ChildAddr, Slot};
 pub(crate) use lsm::index_gather::BoundedIndexCursor;
 pub use lsm::index_gather::SourceCursor;
 pub(crate) use lsm::read_cursor::empty as empty_cursor;
 pub use lsm::read_cursor::{PkSetGather, ReadCursor};
-pub use lsm::repartition::repartition_relation;
+pub(crate) use lsm::repartition::repartition_relation;
 pub use lsm::run::StoredRow;
-pub use merge::BlobCacheGuard;
+pub(crate) use merge::BlobCacheGuard;
 pub(crate) use merge::{mem_batch_to_unified, prorated_blob_cap, relocate_german_string_vec, run_merge, BlobCache};
 pub use spill::{KeyProducer, SpillSort};
 

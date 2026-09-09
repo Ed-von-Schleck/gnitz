@@ -31,7 +31,7 @@ impl CatalogEngine {
     /// copy it with weight −1, and submit it through the one applied-delta path.
     /// The drop cascade is the applier's reaction to that −1 (fired from
     /// `fire_hooks`), not the caller's concern. Reads through the immutable
-    /// `sys_store` accessor; the `submit` move comes after.
+    /// `sys_relation` accessor; the `submit` move comes after.
     /// `retract_pk_list` returns an empty batch when the PK is absent
     /// or already retracted; emitters resolve the friendly "does not exist"
     /// message from the caches before calling, so the `count == 0` arm only
@@ -39,8 +39,7 @@ impl CatalogEngine {
     /// Only these fixture drop paths retract engine-side; production
     /// retractions arrive as wire deltas.
     pub(super) fn submit_retraction(&mut self, family: SysFamily, pk: u128) -> Result<(), String> {
-        let schema = family.schema();
-        let batch = retract_pk_list(self.sys_store(family), schema, vec![pk]);
+        let batch = retract_pk_list(self.sys_relation(family), vec![pk]);
         if batch.is_empty() {
             return Err("Entity does not exist in catalog".into());
         }
@@ -92,7 +91,7 @@ impl CatalogEngine {
             .unwrap_or_default();
         let (views, tables): (Vec<i64>, Vec<i64>) = members
             .into_iter()
-            .partition(|id| self.registry().entry(*id).is_some_and(|e| e.kind.is_view()));
+            .partition(|id| self.registry().relation(*id).is_some_and(|e| e.kind().is_view()));
         for vid in views {
             // Clears the plan caches only — the view stays registered, so the
             // drop cascade's the registry guard still resolves it.

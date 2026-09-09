@@ -200,7 +200,7 @@ fn classify(rel_dir: &str, launched: u32, replicated: bool) -> Result<Layout, St
 
 /// Bring `rel_dir`'s children onto `launched` workers — see [`Layout`] for the
 /// three states its children can be in.
-pub fn repartition_relation(
+pub(crate) fn repartition_relation(
     rel_dir: &str,
     schema: &SchemaDescriptor,
     table_id: u32,
@@ -403,7 +403,7 @@ fn rewrite_targets(
             if idx.is_empty() {
                 continue;
             }
-            let slice = chunk.ascending_subset(idx, schema);
+            let slice = chunk.ascending_subset(idx);
             targets[w].buffer.append_batch(&slice, 0, slice.count);
             if targets[w].buffer.total_bytes() >= REWRITE_SHARD_BYTES {
                 targets[w].flush_shard(schema, table_id, floor)?;
@@ -417,3 +417,7 @@ fn rewrite_targets(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tests/repartition.rs"]
+mod tests;

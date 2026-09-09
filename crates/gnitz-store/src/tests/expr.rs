@@ -188,7 +188,7 @@ fn test_map_pk_copy_col_u128_and_signed_i64() {
     let pk0: u128 = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210;
     let pk1: i64 = -5; // negative: exercises the OPK sign-bit flip on decode
     let mut batch = Batch::with_capacity(&in_schema, 1);
-    batch.extend_pk_opk(&in_schema, &[pk0, pk1 as u64 as u128]);
+    batch.extend_pk_opk(&[pk0, pk1 as u64 as u128]);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
     batch.extend_col(0, &42i64.to_le_bytes());
@@ -251,7 +251,7 @@ fn test_map_copy_col_widens_into_promoted_slot() {
 
     let (c0, c1, c2, c3): (u16, i16, i8, u8) = (0xBEEF, -300, -7, 0xFE);
     let mut batch = Batch::with_capacity(&in_schema, 1);
-    batch.extend_pk_opk(&in_schema, &[c0 as u128, c1 as u16 as u128]);
+    batch.extend_pk_opk(&[c0 as u128, c1 as u16 as u128]);
     batch.extend_weight(&1i64.to_le_bytes());
     batch.extend_null_bmp(&0u64.to_le_bytes());
     batch.extend_col(0, &c2.to_le_bytes());
@@ -633,7 +633,7 @@ fn a_compound_permuted_pk_decodes_at_every_width() {
     let mut batch = Batch::with_capacity(&in_schema, rows.len());
     for vals in &rows {
         let natives: Vec<u128> = pk_order.iter().map(|&ci| vals[ci as usize] as u128).collect();
-        batch.extend_pk_opk(&in_schema, &natives);
+        batch.extend_pk_opk(&natives);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());
         batch.count += 1;

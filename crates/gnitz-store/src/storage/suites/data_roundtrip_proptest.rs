@@ -92,7 +92,7 @@ fn arb_batch(schema: &SchemaDescriptor, n: usize, seed: u64) -> (Batch, Vec<u128
         // (big-endian, sign-flip for signed columns) via the production encoder.
         let mut pk_vals = leading.clone();
         pk_vals.push(i as u128);
-        batch.extend_pk_opk(schema, &pk_vals);
+        batch.extend_pk_opk(&pk_vals);
 
         // Positive weight (base-table positivity, §1).
         let w = 1 + rng.gen_range(4) as i64;

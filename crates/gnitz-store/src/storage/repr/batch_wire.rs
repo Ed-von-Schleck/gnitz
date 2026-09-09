@@ -118,7 +118,7 @@ impl Batch {
     /// `inherit_layout` restores the claim `append_ranges_inner`'s `downgrade()`
     /// drops and the frame encoder ships.
     fn wire_chunk(&self, start: usize, count: usize) -> Batch {
-        let mut out = Batch::with_capacity(&self.schema, count);
+        let mut out = Batch::with_capacity(self.schema(), count);
         out.append_batch(self, start, start + count);
         out.inherit_layout(self);
         out
@@ -153,7 +153,7 @@ impl Batch {
         // `relocate_german_string_vec` dedups — which is what will build the
         // chunk. A join fans one row's string out across many, and counting it
         // per row would emit orders of magnitude too many frames.
-        let mut guard = BlobCacheGuard::acquire(&self.schema, remaining);
+        let mut guard = BlobCacheGuard::acquire(self.schema(), remaining);
         let seen = guard
             .get_mut()
             .expect("a non-empty heap implies a German-string column");
@@ -176,7 +176,7 @@ impl Batch {
     /// does. `wire_chunk_within`'s retry is what covers the two drifting apart.
     fn row_heap_cost(&self, row: usize, seen: &mut super::merge::BlobCache) -> usize {
         let mut cost = 0;
-        for (pi, col) in self.schema.payload_columns() {
+        for (pi, col) in self.schema().payload_columns() {
             if !gnitz_wire::is_german_string(col.type_code) {
                 continue;
             }

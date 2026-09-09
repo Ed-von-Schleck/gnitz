@@ -29,6 +29,7 @@ use crate::runtime::peer::Peer;
 use crate::runtime::reactor::FsyncFuture;
 use crate::runtime::wire as ipc;
 use gnitz_foundation::fault::Seam;
+use gnitz_store::relation::Relation;
 use gnitz_store::storage::Batch;
 use gnitz_wire::{PkColList, WireFault, STATUS_OK};
 
@@ -290,10 +291,10 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
 
     // Reserve the zone LSN but do NOT publish it until fsync confirms
     // durability. A DDL bundle writes arbitrary system families, so the floor is
-    // `max_table_current_lsn` — the zone must dominate EVERY family's counter
+    // `max_current_lsn` — the zone must dominate EVERY family's counter
     // (see `ZoneLsnAllocator::reserve` for why a drifted counter would dedup-drop
     // the zone on recovery).
-    let zone_lsn = shared.open_zone(shared.cat().registry().max_table_current_lsn());
+    let zone_lsn = shared.open_zone(shared.cat().registry().max_current_lsn());
 
     // The post-fsync reclamation needs the durably-dropped relation ids and
     // (owner, column-list) pairs (the -1 rows); the ingest loop consumes
@@ -529,7 +530,8 @@ pub(super) async fn commit_serial_range_durable(shared: &Rc<Shared>, seq_id: i64
         if !shared
             .cat()
             .registry()
-            .relation_kind(seq_id)
+            .relation(seq_id)
+            .map(Relation::kind)
             .is_some_and(|k| k.is_base_table())
         {
             return Err(format!("sequence {seq_id} is not a base table"));

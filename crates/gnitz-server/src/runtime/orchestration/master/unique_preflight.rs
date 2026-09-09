@@ -9,6 +9,7 @@
 use super::*;
 
 use super::unique_filter::UNIQUE_FILTER_CAP;
+use gnitz_store::relation::Relation;
 
 /// The `what` every unique pre-flight frame error is prefixed with.
 const OP_UNIQUE_PREFLIGHT: &str = "unique pre-flight";
@@ -254,7 +255,7 @@ impl MasterDispatcher {
     ) -> Result<UniqueFilter, WorkerFault> {
         let (idx_schema, packed) = {
             let cat = self.cat();
-            let owner_schema = match cat.registry().get_schema_desc(owner_id) {
+            let owner_schema = match cat.registry().relation(owner_id).map(Relation::schema) {
                 Some(s) => s,
                 None => return Ok(UniqueFilter::new()),
             };

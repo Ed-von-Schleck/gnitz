@@ -18,6 +18,7 @@
 use super::*;
 use crate::query::compiler::{HydrationSeed, Sides};
 use gnitz_store::read::SkeletonHydrator;
+use gnitz_store::relation::Relation;
 use gnitz_store::storage::{PkSetGather, StoreError};
 
 /// Recompute the output rows of the capacity-bounded view `view_id` for `keys`
@@ -38,7 +39,7 @@ impl SkeletonHydrator for DagEngine {
         keys: Vec<u8>,
         coarse: &[i64],
     ) -> Result<Batch, StoreError> {
-        let Some(view_schema) = registry.get_schema_desc(view_id) else {
+        let Some(view_schema) = registry.relation(view_id).map(Relation::schema) else {
             return Err(StoreError::rejected(format!(
                 "hydrate: view {view_id} is not a registered relation"
             )));
@@ -78,17 +79,17 @@ impl SkeletonHydrator for DagEngine {
         // The gather opens over the range its own key list spans.
         let mut gather = match hydration.seed {
             HydrationSeed::Relation(source) => {
-                let entry = registry.table_entry(source).map_err(|_| {
+                let entry = registry.relation_or_err(source).map_err(|_| {
                     StoreError::rejected(format!("hydrate: view {view_id} source {source} is unregistered"))
                 })?;
                 // A linear view's physical PK is the leading source-PK columns,
                 // byte-identical to the source PK, so the store's own keys index
                 // the source directly.
-                PkSetGather::open(keys, seed_schema, |s, e| entry.open_cursor_in_range(s, e))
+                PkSetGather::open(keys, seed_schema, |s, e| entry.cursor_in_range(s, e))
             }
             HydrationSeed::Trace(seed_table) => {
-                let trace = sub.vm.table(seed_table);
-                PkSetGather::open(keys, seed_schema, |s, e| trace.open_cursor_in_range(s, e))
+                let state = &sub.vm.state;
+                PkSetGather::open(keys, seed_schema, |s, e| state.cursor_in_range(seed_table, s, e))
             }
         };
         let mut replay = vm::Replay::start(&mut sub.vm, hydration.start_pc);
@@ -98,7 +99,7 @@ impl SkeletonHydrator for DagEngine {
                 .map_err(|e| StoreError::rejected(format!("hydrate: view {view_id} replay failed: {e}")))?;
             if let Some(b) = produced {
                 debug_assert!(
-                    b.schema.same_physical_layout(&view_schema),
+                    b.schema().same_physical_layout(&view_schema),
                     "hydration produced a batch that is not in the view's schema",
                 );
                 out.append_batch(&b, 0, b.len());

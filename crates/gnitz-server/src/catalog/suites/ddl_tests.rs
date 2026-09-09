@@ -38,26 +38,26 @@ fn test_identifiers() {
 #[test]
 fn test_bootstrap() {
     let dir = temp_dir("bootstrap");
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
+    let engine = CatalogEngine::open(&dir, 1).unwrap();
 
     assert!(engine.has_schema("_system"));
     assert!(engine.has_schema("public"));
     assert_eq!(engine.next_table_id, FIRST_USER_TABLE_ID);
     assert_eq!(engine.next_schema_id, FIRST_USER_SCHEMA_ID);
 
-    let schemas_before = count_records(engine.sys_store_mut(SysFamily::Schema).open_cursor());
-    let tables_before = count_records(engine.sys_store_mut(SysFamily::Table).open_cursor());
+    let schemas_before = count_records(engine.sys_relation(SysFamily::Schema).cursor());
+    let tables_before = count_records(engine.sys_relation(SysFamily::Table).cursor());
 
     engine.close();
 
     // Idempotent re-open: bootstrap must not duplicate records
-    let mut engine2 = CatalogEngine::open(&dir, 1).unwrap();
+    let engine2 = CatalogEngine::open(&dir, 1).unwrap();
     assert_eq!(
-        count_records(engine2.sys_store_mut(SysFamily::Schema).open_cursor()),
+        count_records(engine2.sys_relation(SysFamily::Schema).cursor()),
         schemas_before
     );
     assert_eq!(
-        count_records(engine2.sys_store_mut(SysFamily::Table).open_cursor()),
+        count_records(engine2.sys_relation(SysFamily::Table).cursor()),
         tables_before
     );
     engine2.close();
@@ -79,7 +79,7 @@ fn bootstrap_self_description_matches_the_wire_column_lists() {
 
     // Every live COL_TAB row, grouped by the table it describes.
     let mut described: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
-    let mut c = engine.sys_store(SysFamily::Column).open_cursor();
+    let mut c = engine.sys_relation(SysFamily::Column).cursor();
     while c.valid {
         if c.current_weight > 0 {
             let (src, row) = c.current_row_source();
@@ -126,15 +126,15 @@ fn test_ddl() {
     let dir = temp_dir("ddl");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
 
-    let init_schemas = count_records(engine.sys_store_mut(SysFamily::Schema).open_cursor());
-    let init_tables = count_records(engine.sys_store_mut(SysFamily::Table).open_cursor());
-    let init_cols = count_records(engine.sys_store_mut(SysFamily::Column).open_cursor());
+    let init_schemas = count_records(engine.sys_relation(SysFamily::Schema).cursor());
+    let init_tables = count_records(engine.sys_relation(SysFamily::Table).cursor());
+    let init_cols = count_records(engine.sys_relation(SysFamily::Column).cursor());
 
     // Schema creation
     engine.create_schema("sales").unwrap();
     assert!(engine.has_schema("sales"));
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Schema).open_cursor()),
+        count_records(engine.sys_relation(SysFamily::Schema).cursor()),
         init_schemas + 1
     );
     assert!(engine.create_schema("sales").is_err()); // duplicate
@@ -144,11 +144,11 @@ fn test_ddl() {
     let tid = engine.create_table("sales.orders", &cols, &[0]).unwrap();
     assert!(engine.registry().has_id(tid));
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Table).open_cursor()),
+        count_records(engine.sys_relation(SysFamily::Table).cursor()),
         init_tables + 1
     );
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Column).open_cursor()),
+        count_records(engine.sys_relation(SysFamily::Column).cursor()),
         init_cols + 2
     );
 
@@ -156,11 +156,11 @@ fn test_ddl() {
     engine.drop_table("sales.orders").unwrap();
     assert!(!engine.registry().has_id(tid));
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Table).open_cursor()),
+        count_records(engine.sys_relation(SysFamily::Table).cursor()),
         init_tables
     );
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Column).open_cursor()),
+        count_records(engine.sys_relation(SysFamily::Column).cursor()),
         init_cols
     );
 
@@ -254,7 +254,7 @@ fn test_edge_cases() {
             &[0],
         )
         .unwrap();
-    let s15 = engine.registry().get_schema_desc(tid15).unwrap();
+    let s15 = engine.registry().relation(tid15).map(Relation::schema).unwrap();
     assert_eq!(s15.columns[0].type_code, type_code::U128);
     engine.drop_table("public.u128t").unwrap();
 
@@ -362,7 +362,7 @@ fn test_restart_full() {
         assert!(engine.get_by_name("trash", "items").is_none());
         // Schema layout rebuilt correctly
         let tid = engine.get_by_name("marketing", "products").unwrap();
-        let schema = engine.registry().get_schema_desc(tid).unwrap();
+        let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
         assert_eq!(schema.num_columns(), 2);
         // Sequence recovery: new table should get higher ID
         let new_tid = engine.create_table("marketing.other", &cols, &[0]).unwrap();
@@ -421,9 +421,9 @@ fn test_edge_cases_extended() {
     // #20. has_id / get_schema for valid and invalid IDs
     let tid = engine.create_table("public.reg_test", &cols, &[0]).unwrap();
     assert!(engine.registry().has_id(tid));
-    assert!(engine.registry().get_schema_desc(tid).is_some());
+    assert!(engine.registry().relation(tid).map(Relation::schema).is_some());
     assert!(!engine.registry().has_id(999999));
-    assert!(engine.registry().get_schema_desc(999999).is_none());
+    assert!(engine.registry().relation(999999).map(Relation::schema).is_none());
     engine.drop_table("public.reg_test").unwrap();
 
     // #26. A relation in a schema the catalog does not hold is rejected. The
@@ -528,10 +528,26 @@ fn test_pk_list_round_trips_into_registered_schema() {
     // Single-column PK, and a recreate under a different PK column: the
     // reconstructed schema reflects the new list, not the old one.
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    assert_eq!(engine.registry().get_schema_desc(tid).unwrap().pk_indices(), &[0]);
+    assert_eq!(
+        engine
+            .registry()
+            .relation(tid)
+            .map(Relation::schema)
+            .unwrap()
+            .pk_indices(),
+        &[0]
+    );
     engine.drop_table("public.t").unwrap();
     let tid2 = engine.create_table("public.t", &cols, &[1]).unwrap();
-    assert_eq!(engine.registry().get_schema_desc(tid2).unwrap().pk_indices(), &[1]);
+    assert_eq!(
+        engine
+            .registry()
+            .relation(tid2)
+            .map(Relation::schema)
+            .unwrap()
+            .pk_indices(),
+        &[1]
+    );
 
     // Compound PK lists round-trip in full.
     let wide: Vec<_> = (0..8).map(|i| col_def(&format!("c{i}"), type_code::U64)).collect();
@@ -542,7 +558,12 @@ fn test_pk_list_round_trips_into_registered_schema() {
         let name = format!("public.w{n}");
         let tid = engine.create_table(&name, &wide, &pk_cols).unwrap();
         assert_eq!(
-            engine.registry().get_schema_desc(tid).unwrap().pk_indices(),
+            engine
+                .registry()
+                .relation(tid)
+                .map(Relation::schema)
+                .unwrap()
+                .pk_indices(),
             pk_cols.as_slice(),
             "compound PK list must round-trip in full (input={pk_cols:?})"
         );
@@ -578,10 +599,10 @@ fn test_drop_view_removes_directory() {
     // The register hook created the physical view directory on disk.
     let view_dir = engine
         .registry()
-        .table_entry(vid)
+        .relation_or_err(vid)
         .expect("view registered in dag")
-        .directory
-        .clone();
+        .directory()
+        .to_string();
     assert!(
         std::path::Path::new(&view_dir).exists(),
         "view dir should exist after create: {view_dir}"
@@ -622,8 +643,8 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
         .unwrap();
 
     // Baseline: system + base-table column rows; no circuit rows yet.
-    let base_cols = count_records(engine.sys_store_mut(SysFamily::Column).open_cursor());
-    let base_nodes = count_records(engine.sys_store_mut(SysFamily::CircuitNodes).open_cursor());
+    let base_cols = count_records(engine.sys_relation(SysFamily::Column).cursor());
+    let base_nodes = count_records(engine.sys_relation(SysFamily::CircuitNodes).cursor());
 
     // Register a view (column and circuit records precede the VIEW_TAB row).
     let vid = engine.next_table_id;
@@ -635,11 +656,11 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
     engine.ingest_to_family(VIEW_TAB_ID, &batch).unwrap();
 
     assert!(
-        count_records(engine.sys_store_mut(SysFamily::Column).open_cursor()) > base_cols,
+        count_records(engine.sys_relation(SysFamily::Column).cursor()) > base_cols,
         "view column rows must be present before drop"
     );
     assert!(
-        count_records(engine.sys_store_mut(SysFamily::CircuitNodes).open_cursor()) > base_nodes,
+        count_records(engine.sys_relation(SysFamily::CircuitNodes).cursor()) > base_nodes,
         "circuit node rows must be present before drop"
     );
 
@@ -648,12 +669,12 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
     engine.drain_pending_dir_deletions();
 
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::Column).open_cursor()),
+        count_records(engine.sys_relation(SysFamily::Column).cursor()),
         base_cols,
         "sys_columns must return to baseline after drop_view (column cascade)"
     );
     assert_eq!(
-        count_records(engine.sys_store_mut(SysFamily::CircuitNodes).open_cursor()),
+        count_records(engine.sys_relation(SysFamily::CircuitNodes).cursor()),
         base_nodes,
         "circuit rows must return to baseline after drop_view (circuit cascade)"
     );
@@ -666,14 +687,18 @@ fn test_drop_view_cascades_columns_and_circuit_rows() {
 // Capability guard: a DDL emitter mutates catalog state only by submitting a
 // delta (submit / submit_local / submit_retraction). It may READ a family's
 // store — `submit_retraction` copies the live row it is about to negate — but it
-// must never reach a mutable handle and ingest into it, which would skip the
-// precheck, the hooks and the broadcast queue in one line. Pinned as source text
-// because no runtime assertion can observe the absence of a call.
+// must never write one directly, which would skip the precheck, the hooks and
+// the broadcast queue in one line. Pinned as source text because no runtime
+// assertion can observe the absence of a call.
+//
+// Each forbidden name is one the fixture could write and must not:
+// `registry.ingest` is deliberately absent, since `ingest_to_family` calls it
+// for a user table and routes every system id to `submit`.
 
 #[test]
 fn ddl_emitters_use_no_raw_handle_capability() {
     let src = include_str!("ddl_fixture.rs");
-    for forbidden in ["sys_store_mut", "ingest_borrowed_batch", "ingest_owned_batch"] {
+    for forbidden in ["ingest_owned_batch", "ingest_borrowed", "apply_local"] {
         assert!(
             !src.contains(forbidden),
             "a DDL emitter must not call {forbidden} — emit a delta via submit instead"
@@ -837,8 +862,8 @@ fn replicated_bit_is_transitive_and_survives_replay() {
     // (replicated, depth) for a registered relation.
     let stamp = |e: &mut CatalogEngine, id: i64| {
         let CatalogEngine { registry, dag, .. } = e;
-        let t = registry.table_entry(id).expect("registered");
-        (t.schema.placement().is_replicated(), dag.depth_of(registry, id))
+        let t = registry.relation_or_err(id).expect("registered");
+        (t.is_replicated(), dag.depth_of(registry, id))
     };
     let assert_stamps = |e: &mut CatalogEngine, when: &str| {
         assert!(stamp(e, rt).0, "replicated base table ({when})");

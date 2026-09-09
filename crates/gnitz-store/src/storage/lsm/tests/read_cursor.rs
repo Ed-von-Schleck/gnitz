@@ -117,7 +117,7 @@ fn test_seek_compound_pk_lands_on_exact_row() {
         b.extend_col(0, &v.to_le_bytes());
         b.count += 1;
     }
-    b.certify_layout(Layout::Consolidated, &schema);
+    b.certify_layout(Layout::Consolidated);
     let mut cursor = create_read_cursor(&[Rc::new(b)], &[], schema);
 
     cursor.seek_bytes(&compound_pk_bytes(2, 3));
@@ -152,7 +152,7 @@ fn test_seek_signed_pk_lands_on_negative_row() {
         b.extend_col(0, &v.to_le_bytes());
         b.count += 1;
     }
-    b.certify_layout(Layout::Consolidated, &schema);
+    b.certify_layout(Layout::Consolidated);
     let mut cursor = create_read_cursor(&[Rc::new(b)], &[], schema);
 
     cursor.seek_bytes(&i64_opk(-1));
@@ -407,7 +407,7 @@ fn test_compound_pk_multi_source_merge_order() {
         bt.extend_null_bmp(&0u64.to_le_bytes());
         bt.extend_col(0, &val.to_le_bytes());
         bt.count += 1;
-        bt.certify_layout(Layout::Consolidated, &schema);
+        bt.certify_layout(Layout::Consolidated);
         Rc::new(bt)
     };
     // (1,2) precedes (2,1) by (col_A, col_B); the raw-u128 order is reversed.
@@ -448,7 +448,7 @@ fn make_wide_batch(rows: &[([u8; 24], i64, i64)]) -> Rc<Batch> {
         bt.extend_col(0, &val.to_le_bytes());
         bt.count += 1;
     }
-    bt.certify_layout(Layout::Consolidated, &schema);
+    bt.certify_layout(Layout::Consolidated);
     Rc::new(bt)
 }
 
@@ -529,7 +529,7 @@ fn seek_first_positive_with_prefix_includes_negative_suffix() {
         b.extend_col(0, &val.to_le_bytes());
         b.count += 1;
     }
-    b.certify_layout(Layout::Consolidated, &schema);
+    b.certify_layout(Layout::Consolidated);
     let batch = Rc::new(b);
     let mut cursor = create_read_cursor(&[batch], &[], schema);
 
@@ -757,7 +757,7 @@ fn a_long_string_whose_offset_overruns_the_blob_reads_back_empty() {
     st[8..16].copy_from_slice(&0u64.to_le_bytes());
     b.extend_col(0, &st);
     b.count += 1;
-    b.certify_layout(Layout::Consolidated, &schema);
+    b.certify_layout(Layout::Consolidated);
     let cursor = create_read_cursor(&[Rc::new(b)], &[], schema);
     assert!(cursor.valid, "cursor must position on the single row");
     // Logical column 1 is the STRING; the U128 PK occupies no payload slot, so

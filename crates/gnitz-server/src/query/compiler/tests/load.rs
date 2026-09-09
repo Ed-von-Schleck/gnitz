@@ -1,4 +1,6 @@
 use super::*;
+use gnitz_store::relation::{OnRegister, RelationKind, RelationSpec, StoreConfig, ViewBudgets};
+use gnitz_store::storage::Slot;
 use gnitz_wire::{MapKind, OpNode, ReindexRole};
 use std::collections::HashMap;
 
@@ -21,7 +23,7 @@ fn a_cyclic_circuit_is_rejected() {
 /// one, which would pass these assertions vacuously.
 struct CircuitTables {
     _tmp: tempfile::TempDir,
-    nodes: Table,
+    registry: RelationRegistry,
 }
 
 impl CircuitTables {
@@ -36,22 +38,30 @@ impl CircuitTables {
 
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        // The `Table` owns its path, so it outlives the `TempDir` binding.
-        let nodes = Table::new(
-            &format!("{}/nodes", tmp.path().to_str().unwrap()),
-            Self::schema(),
-            0,
-            RecoverySource::Rederive { resume_at: None },
-            StoreBudgets::default(),
-        )
-        .unwrap();
-        Self { nodes, _tmp: tmp }
+        let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
+        // A `SystemCatalog` registration homes the store flat under its own
+        // directory, the shape `bootstrap.rs` gives every family.
+        registry
+            .register(
+                RelationSpec {
+                    id: gnitz_wire::CIRCUIT_NODES_TAB as i64,
+                    kind: RelationKind::SystemCatalog,
+                    schema: Self::schema(),
+                    directory: format!("{}/nodes", tmp.path().to_str().unwrap()),
+                    budgets: ViewBudgets::default(),
+                },
+                OnRegister::Live,
+            )
+            .unwrap();
+        Self { registry, _tmp: tmp }
     }
 
     fn put_nodes(&mut self, f: impl FnOnce(&mut gnitz_store::storage::BatchBuilder)) -> &mut Self {
         let mut bb = gnitz_store::storage::BatchBuilder::new(Self::schema());
         f(&mut bb);
-        self.nodes.ingest_owned_batch(bb.finish()).unwrap();
+        self.registry
+            .ingest(gnitz_wire::CIRCUIT_NODES_TAB as i64, bb.finish())
+            .unwrap();
         self
     }
 
@@ -102,20 +112,10 @@ impl CircuitTables {
         );
     }
 
+    /// Loaded straight off the registry: it is the `SchemaSource` the engine
+    /// loads through, so the fixture exercises the same lookup production does.
     fn load(&mut self) -> Result<LoadedCircuit, CompileError> {
-        load_circuit(self, Self::VIEW_ID)
-    }
-}
-
-/// The circuit table answers a load in place, the way the registry does for the
-/// engine. No relation schemas — nothing under test here resolves one.
-impl SchemaSource for CircuitTables {
-    fn schema_of(&self, _tid: i64) -> Option<SchemaDescriptor> {
-        None
-    }
-
-    fn open_sys_cursor(&self, tid: i64) -> Option<ReadCursor> {
-        (tid as u64 == gnitz_wire::CIRCUIT_NODES_TAB).then(|| self.nodes.open_cursor())
+        load_circuit(&self.registry, Self::VIEW_ID)
     }
 }
 

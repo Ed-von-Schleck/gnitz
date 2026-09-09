@@ -67,7 +67,7 @@ fn plain(rows: &[(u64, i64, i64)]) -> Vec<RawBlock> {
 fn stamped(tick: u64, rows: &[(u64, i64, i64)]) -> Vec<RawBlock> {
     let view = make_schema_u64_i64();
     let delta = make_delta_schema(&view).expect("the stamped shape fits");
-    let batch = make_batch(&view, rows).stamped_with_pk_prefix(&view, &delta, tick);
+    let batch = make_batch(&view, rows).stamped_with_pk_prefix(&delta, tick);
     vec![block_of(&batch)]
 }
 

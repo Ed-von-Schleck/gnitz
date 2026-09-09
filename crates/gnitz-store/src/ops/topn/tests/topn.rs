@@ -9,7 +9,6 @@ use crate::storage::{payload_is_null, payload_string, Batch, BatchBuilder, Table
 use crate::test_support::scratch_table;
 use gnitz_wire::{read_i64_le, OrderKey};
 
-use super::index::op_populate_topn;
 use super::op_topn::op_topn;
 use super::plan::TopNPlan;
 
@@ -67,7 +66,7 @@ impl Harness {
 
     /// One epoch: populate, run, integrate the output. Returns the raw delta.
     fn tick(&mut self, delta: &Batch) -> Batch {
-        op_populate_topn(delta, &mut self.index, &self.plan.index).unwrap();
+        self.index.ingest_owned_batch(self.plan.index.batch(delta)).unwrap();
         let mut history = self.index.open_cursor();
         let mut trace_out = self.trace_out.open_cursor();
         let out = op_topn(delta, &mut trace_out, &mut history, &self.plan);

@@ -52,7 +52,7 @@ impl RelationRegistry {
     /// `cut_tick` is the last tick round the master had emitted when it wrote
     /// this read's group, and bounds an incremental delta read above. Every other
     /// bound ignores it.
-    pub fn scan_spec_family(
+    pub fn scan_spec(
         &self,
         target_id: i64,
         spec: &ReadSpec,
@@ -114,20 +114,20 @@ impl RelationRegistry {
     /// `after_tick`, zero included: the reply would otherwise promise a
     /// continuation the server cannot serve.
     fn scan_spec_source_schema(&self, target: i64, bound: &ReadBound) -> Result<SchemaDescriptor, StoreError> {
-        let entry = self.table_entry(target)?;
+        let entry = self.relation_or_err(target)?;
         let ReadBound::Delta { after_tick } = bound else {
-            return Ok(entry.schema);
+            return Ok(entry.schema());
         };
-        if entry.budgets.delta_bytes.is_none() {
+        if entry.budgets().delta_bytes.is_none() {
             return Err(StoreError::rejected(format!(
                 "scan_spec: relation {target} carries no delta feed; \
                  create the view WITH (delta = '<size>') to subscribe to it"
             )));
         }
         if *after_tick == 0 {
-            return Ok(entry.schema);
+            return Ok(entry.schema());
         }
-        Ok(entry.delta_feed_or_err(target)?.schema)
+        Ok(entry.delta_or_err()?.schema())
     }
 
     /// Open the source cursor for `bound` over `source`, bounded within this
@@ -147,20 +147,20 @@ impl RelationRegistry {
         let (cursor, keys) = match bound {
             // The delta bootstrap arm reads the view's own store, which is what
             // `scan_spec_source_schema` already told the caller.
-            ReadBound::None | ReadBound::Delta { after_tick: 0 } => (self.table_entry(source)?.open_cursor(), None),
+            ReadBound::None | ReadBound::Delta { after_tick: 0 } => (self.relation_or_err(source)?.cursor(), None),
             ReadBound::PkRange(desc) => {
-                let entry = self.table_entry(source)?;
-                match range_cursor(src_schema, desc, |s, e| entry.open_cursor_in_range(s, e))? {
+                let entry = self.relation_or_err(source)?;
+                match range_cursor(src_schema, desc, |s, e| entry.cursor_in_range(s, e))? {
                     Some(c) => (c, None),
                     None => return Ok(SourceCursor::Empty),
                 }
             }
             ReadBound::PkSet(keys) => {
                 let opk = pk_set_opk_keys(source, keys, src_schema)?;
-                let entry = self.table_entry(source)?;
+                let entry = self.relation_or_err(source)?;
                 // A key this worker holds no row for copies nothing — the request
                 // is broadcast, so at W workers most of the list belongs elsewhere.
-                let gather = PkSetGather::open(opk, *src_schema, |s, e| entry.open_cursor_in_range(s, e));
+                let gather = PkSetGather::open(opk, *src_schema, |s, e| entry.cursor_in_range(s, e));
                 if !gather.any_skeleton() {
                     return Ok(SourceCursor::PkSet(Box::new(gather)));
                 }
@@ -196,7 +196,7 @@ impl RelationRegistry {
     /// `dropped_through > after_tick` — a cursor sitting *at* the floor is served
     /// in full rather than being told to re-read at 0 forever.
     fn open_delta_cursor(&self, source: i64, after_tick: u64, cut_tick: u64) -> Result<SourceCursor, StoreError> {
-        let feed = self.table_entry(source)?.delta_feed_or_err(source)?;
+        let feed = self.relation_or_err(source)?.delta_or_err()?;
         let dropped_through = feed.dropped_through();
         if after_tick < dropped_through {
             return Err(StoreError::DeltaExpired(format!(
@@ -206,7 +206,7 @@ impl RelationRegistry {
         }
         let desc = RangeDescriptor::new(&[], Cut::After(after_tick as u128), Cut::After(cut_tick as u128));
         Ok(
-            match range_cursor(&feed.schema, &desc, |s, e| feed.open_cursor_in_range(s, e))? {
+            match range_cursor(&feed.schema(), &desc, |s, e| feed.cursor_in_range(s, e))? {
                 Some(c) => SourceCursor::Full(Box::new(c)),
                 None => SourceCursor::Empty,
             },
@@ -543,9 +543,8 @@ fn topk_keep(keeper: Batch, order_locs: &[OrderLocator], window: i64) -> (Batch,
             break;
         }
     }
-    let schema = keeper.schema;
     (
-        Batch::from_indexed_rows(&keeper.as_mem_batch(), &perm[..cut], &schema),
+        Batch::from_indexed_rows(&keeper.as_mem_batch(), &perm[..cut], keeper.schema()),
         acc,
     )
 }
@@ -581,7 +580,7 @@ fn scan_spec_cmp(order_locs: &[OrderLocator], batch: &Batch, ra: usize, rb: usiz
     }
     // Deterministic tiebreak (never reversed): OPK bytes, then payload columns.
     match compare_pk_bytes(batch.get_pk_bytes(ra), batch.get_pk_bytes(rb)) {
-        Ordering::Equal => compare_rows(&batch.schema, batch, ra, batch, rb),
+        Ordering::Equal => compare_rows(batch.schema(), batch, ra, batch, rb),
         ord => ord,
     }
 }

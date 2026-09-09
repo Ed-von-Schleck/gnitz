@@ -36,13 +36,13 @@ const MEMTABLE_BYTES: usize = 192 << 10;
 /// 4 MiB ceiling wrote 98.7 MB of spill per 4M rows and this 32 MiB none, for
 /// +45 MB of cluster RSS; shrinking it is how a test reaches the disk regime on
 /// small data.
-pub const DEFAULT_RAM_TIER_BYTES: usize = 32 << 20;
+pub(crate) const DEFAULT_RAM_TIER_BYTES: usize = 32 << 20;
 
 /// What one `Table` opens with: its RAM-tier ceiling, and what bounds its
 /// registered on-disk shard bytes. Outside this crate only [`Self::new`] is
 /// reachable, so no external caller can mint a store that evicts.
 #[derive(Clone, Copy)]
-pub struct StoreBudgets {
+pub(crate) struct StoreBudgets {
     ram_tier_bytes: usize,
     shard: ShardBudget,
 }
@@ -55,7 +55,7 @@ impl Default for StoreBudgets {
 
 impl StoreBudgets {
     /// An unbounded store at `ram_tier_bytes`.
-    pub fn new(ram_tier_bytes: usize) -> Self {
+    pub(crate) fn new(ram_tier_bytes: usize) -> Self {
         StoreBudgets {
             ram_tier_bytes,
             shard: ShardBudget::Unbounded,
@@ -88,7 +88,7 @@ impl StoreBudgets {
 /// keeps its overflow in the RAM tier, and the checkpoint barrier folds it into a
 /// durable shard only for `SalReplay` tables.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RecoverySource {
+pub(crate) enum RecoverySource {
     /// The tail is recovered by replaying the fsynced SAL over the shards loaded
     /// from the manifest at open. Base tables and master system tables.
     SalReplay,
@@ -148,7 +148,7 @@ fn first_live_payload_group(
 // Table
 // ---------------------------------------------------------------------------
 
-pub struct Table {
+pub(crate) struct Table {
     /// Ingest runs, folded into `ram_tier` once they pass its byte budget.
     memtable: RunSet,
     /// Flushed runs held in heap instead of on disk. Populated for **every**
@@ -194,7 +194,7 @@ mod bench_ingest;
 impl Table {
     /// Open a table at `dir`. `recovery_source` decides what this does with
     /// whatever is already on disk; `budgets` binds for the store's whole life.
-    pub fn new(
+    pub(crate) fn new(
         dir: &str,
         schema: SchemaDescriptor,
         table_id: u32,
@@ -286,7 +286,7 @@ impl Table {
     /// The policy this open accepted its on-disk state under — a frozen fact of
     /// this open, not the engine's current verdict, which every later checkpoint
     /// moves.
-    pub fn recovery_source(&self) -> RecoverySource {
+    pub(crate) fn recovery_source(&self) -> RecoverySource {
         self.recovery_source
     }
 
@@ -302,14 +302,14 @@ impl Table {
     }
 
     /// Whether this open reloaded checkpointed state rather than starting empty.
-    pub fn resumed_from_checkpoint(&self) -> bool {
+    pub(crate) fn resumed_from_checkpoint(&self) -> bool {
         self.resumed_from_checkpoint
     }
 
     /// Unlink this store's manifest, so the next `Rederive` open
     /// peeks `None` and erases the shards instead of reloading them — how a
     /// caller rejects state it must not resume from.
-    pub fn unlink_manifest(&self) {
+    pub(crate) fn unlink_manifest(&self) {
         let _ = std::fs::remove_file(self.manifest_full_path());
     }
 
@@ -338,7 +338,7 @@ impl Table {
 
     /// Ingest an already-constructed Batch into the memtable.
     /// The relation-store ingest entry point.
-    pub fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
+    pub(crate) fn ingest_owned_batch(&mut self, batch: Batch) -> Result<(), StorageError> {
         if batch.count == 0 {
             return Ok(());
         }
@@ -364,7 +364,7 @@ impl Table {
     /// cloned verbatim. The borrow-based twin of [`Self::ingest_owned_batch`]
     /// for callers that keep reading `batch` afterwards — `clone_batch()` +
     /// `ingest_owned_batch()` would copy an unconsolidated batch twice.
-    pub fn ingest_borrowed_batch(&mut self, batch: &Batch) -> Result<(), StorageError> {
+    pub(crate) fn ingest_borrowed_batch(&mut self, batch: &Batch) -> Result<(), StorageError> {
         if batch.count == 0 {
             return Ok(());
         }
@@ -380,7 +380,7 @@ impl Table {
     /// The next-shard LSN counter. Seeded `max_lsn + 1` at open, bumped on every
     /// ingest; feeds spill/barrier shard naming and the master's zone-LSN
     /// allocator floor.
-    pub fn current_lsn(&self) -> u64 {
+    pub(crate) fn current_lsn(&self) -> u64 {
         self.current_lsn
     }
 
@@ -388,7 +388,7 @@ impl Table {
     /// only ever moves forward. Idempotent SAL re-replay legitimately presents
     /// an older zone LSN (the dedupe filter under-dedupes by design), and
     /// regressing the counter would let a later spill reuse a live shard name.
-    pub fn pin_lsn(&mut self, lsn: std::num::NonZeroU64) {
+    pub(crate) fn pin_lsn(&mut self, lsn: std::num::NonZeroU64) {
         self.current_lsn = self.current_lsn.max(lsn.get());
     }
 
@@ -456,7 +456,7 @@ impl Table {
     ///
     /// Opening is Θ(sources), so a read that knows its key bound beforehand
     /// should take [`Self::open_cursor_in_range`].
-    pub fn open_cursor(&self) -> ReadCursor {
+    pub(crate) fn open_cursor(&self) -> ReadCursor {
         let cap = self.mem_run_count() + self.shard_index.shard_count();
         read_cursor::from_runs(self.runs(), self.shard_index.schema, cap)
     }
@@ -467,7 +467,7 @@ impl Table {
     ///
     /// The gather over-approximates on both tiers (a whole guard for one key, a
     /// whole run for one key it straddles), so a half-open `end` is safe to pass.
-    pub fn open_cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> ReadCursor {
+    pub(crate) fn open_cursor_in_range(&self, start: &[u8], end: Option<&[u8]>) -> ReadCursor {
         let runs = self
             .mem_runs(Some((start, end)))
             .chain(self.shard_index.shard_arcs_in_range(start, end).map(Run::Shard));
@@ -479,7 +479,7 @@ impl Table {
     /// `swap_schema`, the RAM-tier fold and the spill commit in `flush.rs`.
     /// Cheap on repeated calls: returns `Rc::clone` of the cached batch.
     /// Infallible: delegates to `open_cursor`.
-    pub fn full_scan(&self) -> Rc<Batch> {
+    pub(crate) fn full_scan(&self) -> Rc<Batch> {
         let rc = self
             .cached_full_scan
             .take()
@@ -493,14 +493,15 @@ impl Table {
     /// built, nothing is repositioned. Raw, so cross-run duplicates and ghosts
     /// are counted; that is an upper bound on what a walk would emit, which is
     /// what the index selectivity gate compares its measured range size against.
-    pub fn estimated_rows(&self) -> usize {
+    pub(crate) fn estimated_rows(&self) -> usize {
         self.ram_tiers().iter().map(|s| s.row_count()).sum::<usize>() + self.shard_index.total_rows()
     }
 
     /// `(registered shards, how many carry a PK filter)`. What an assertion asks
     /// this store about its shard set, in counts — so neither the shard type nor
     /// the index behind it has to be reachable to ask it.
-    pub fn pk_filter_census(&self) -> (usize, usize) {
+    #[cfg(test)]
+    pub(crate) fn pk_filter_census(&self) -> (usize, usize) {
         self.shard_index.all_shard_arcs_iter().fold((0, 0), |(n, filtered), s| {
             (n + 1, filtered + usize::from(s.has_shard_filter()))
         })
@@ -515,7 +516,8 @@ impl Table {
 
     /// Test helper: `(L0 shard count, per-level guard count)`. Same reach as
     /// [`Self::all_shard_arcs`].
-    pub fn level_shape(&self) -> (usize, [usize; super::shard_index::FLSM_LEVELS]) {
+    #[cfg(test)]
+    pub(crate) fn level_shape(&self) -> (usize, [usize; super::shard_index::FLSM_LEVELS]) {
         self.shard_index.level_shape()
     }
 
@@ -526,7 +528,7 @@ impl Table {
     /// Byte-keyed PK existence check: the net weight across every tier is
     /// positive.
     #[inline]
-    pub fn has_pk_bytes(&self, key: &[u8]) -> bool {
+    pub(crate) fn has_pk_bytes(&self, key: &[u8]) -> bool {
         let mut w: i64 = 0;
         self.for_each_pk_candidate(key, |run, row| w += run.get_weight(row));
         w > 0
@@ -581,7 +583,7 @@ impl Table {
     /// single row's own weight is what makes the answer right: a candidate whose
     /// weight is positive but whose full group nets ≤ 0 has been retracted by a
     /// later tier and must not be returned.
-    pub fn live_row_at(&self, key: &[u8]) -> (i64, Option<StoredRow>) {
+    pub(crate) fn live_row_at(&self, key: &[u8]) -> (i64, Option<StoredRow>) {
         let mut pool = self.retract_scratch.take();
 
         let mut total_w: i64 = 0;
@@ -622,7 +624,7 @@ impl Table {
     /// the compacted index. A fed view's delta store publishes none and is in
     /// neither checkpoint round, so it unlinks at the end of each compaction
     /// instead — see the shard index's own `ShardBudget::Drop`.
-    pub fn compact_if_needed(&mut self) -> Result<(), StorageError> {
+    pub(crate) fn compact_if_needed(&mut self) -> Result<(), StorageError> {
         if !self.shard_index.should_compact() {
             return Ok(());
         }

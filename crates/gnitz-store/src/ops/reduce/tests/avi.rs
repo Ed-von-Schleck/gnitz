@@ -127,7 +127,7 @@ fn pk_source_and_payload_source_encode_identically() {
         for (i, &v) in vals.iter().enumerate() {
             // `extend_pk_opk` truncates each u128 to the column width, so a
             // negative `v as u128` still packs the right two's-complement bytes.
-            batch.extend_pk_opk(&schema, &[i as u128, v as u128]);
+            batch.extend_pk_opk(&[i as u128, v as u128]);
             batch.extend_weight(&1i64.to_le_bytes());
             batch.extend_null_bmp(&0u64.to_le_bytes());
             batch.extend_col(payload_idx, &(v as u128).to_le_bytes()[..width]);

@@ -51,13 +51,6 @@ pub(in crate::catalog) fn preflight_dir(base_dir: &str, schema_name: &str, vid: 
     format!("{base_dir}/{schema_name}/_preflight_{vid}")
 }
 
-/// `<owner_dir>/idx_<idx_id>` — an index's directory, nested in its owner.
-/// `ChildAddr` owns the name so the boot sweeps that walk a relation directory
-/// classify it instead of tripping over it.
-pub(in crate::catalog) fn index_dir(owner_dir: &str, idx_id: i64) -> String {
-    ChildAddr::Index { id: idx_id }.dir(owner_dir)
-}
-
 // ---------------------------------------------------------------------------
 // Copy/retract helpers
 // ---------------------------------------------------------------------------
@@ -67,17 +60,14 @@ pub(in crate::catalog) fn index_dir(owner_dir: &str, idx_id: i64) -> String {
 /// catalog's retraction pair — one owner's packed column ids, or one view's
 /// `view_id` prefix; [`retract_pk_list`] is the key-list half. Both take
 /// their bounds through `schema::key`, so no call site re-derives the OPK layout.
-pub(in crate::catalog) fn retract_key_range(
-    table: &Table,
-    schema: &SchemaDescriptor,
-    start: &[u8],
-    end: &[u8],
-) -> Batch {
-    let mut cursor = table.open_cursor_in_range(start, Some(end));
+/// The output batch is in `rel`'s own schema — a caller cannot hand it one the
+/// rows it copies are not laid out in.
+pub(in crate::catalog) fn retract_key_range(rel: &Relation, start: &[u8], end: &[u8]) -> Batch {
+    let mut cursor = rel.cursor_in_range(start, Some(end));
     cursor.seek_range_bytes(start, Some(end));
     // Sized off the positioned walk's own upper bound, so the appends never
     // re-grow (each growth re-copies every live byte).
-    let mut batch = Batch::with_capacity(schema, cursor.estimated_length());
+    let mut batch = Batch::with_capacity(&rel.schema(), cursor.estimated_length());
     cursor.for_each_positive(|c| c.copy_current_row_into(&mut batch, -1));
     batch
 }
@@ -103,7 +93,8 @@ pub(in crate::catalog) fn circuit_opk(
 /// or return an empty batch" case. Takes `ids` by value and sorts and dedups
 /// them, because the whole list rides one forward-only cursor: strictly ascending
 /// is what lets an id with no live row be settled without repositioning.
-pub(in crate::catalog) fn retract_pk_list(table: &Table, schema: &SchemaDescriptor, mut ids: Vec<u128>) -> Batch {
+pub(in crate::catalog) fn retract_pk_list(rel: &Relation, mut ids: Vec<u128>) -> Batch {
+    let schema = &rel.schema();
     ids.sort_unstable();
     ids.dedup();
     let mut batch = Batch::with_capacity(schema, ids.len());
@@ -111,7 +102,7 @@ pub(in crate::catalog) fn retract_pk_list(table: &Table, schema: &SchemaDescript
         return batch;
     };
     let (lo, hi) = (sys_opk(schema, first), sys_opk(schema, last));
-    let mut cursor = table.open_cursor_in_range(lo.pk_bytes(), Some(hi.pk_bytes()));
+    let mut cursor = rel.cursor_in_range(lo.pk_bytes(), Some(hi.pk_bytes()));
     for pk in ids {
         let key = sys_opk(schema, pk);
         // The weight gate rejects a tombstone an uncompacted source still holds.

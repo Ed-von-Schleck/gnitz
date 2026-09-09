@@ -13,8 +13,9 @@ use std::fmt;
 use crate::query::vm::{DeltaReg, ProgramBuilder, RegisterMeta, TraceReg, VmHandle};
 use gnitz_expr::{ExprValidateErr, LogicalProgram};
 use gnitz_store::expr::MapPlan;
+use gnitz_store::relation::{Relation, RelationRegistry, StateIdx};
 use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::storage::{ReadCursor, RecoverySource, Slot, StorageError, StoreBudgets, Table};
+use gnitz_store::storage::ReadCursor;
 use gnitz_wire::AggDescriptor;
 
 mod emit;
@@ -79,7 +80,7 @@ pub(in crate::query) enum CompileError {
     RejectedOp(gnitz_store::schema::OpBuildErr),
     /// The machine failed, not the circuit: a storage step the compile needs
     /// returned an error. The payload names the step and carries the errno.
-    StorageFailed(&'static str, StorageError),
+    StorageFailed(&'static str, gnitz_store::storage::StoreError),
 }
 
 impl fmt::Display for CompileError {
@@ -298,11 +299,11 @@ impl SchemaSource for ExtTables {
 /// is below `query` and could only name the trait upward.
 impl SchemaSource for gnitz_store::relation::RelationRegistry {
     fn schema_of(&self, tid: i64) -> Option<SchemaDescriptor> {
-        self.get_schema_desc(tid)
+        self.relation(tid).map(Relation::schema)
     }
 
     fn open_sys_cursor(&self, tid: i64) -> Option<ReadCursor> {
-        self.open_store_cursor(tid)
+        self.relation(tid).map(|r| r.cursor())
     }
 }
 
@@ -464,14 +465,11 @@ pub(super) struct CompiledView {
 pub(super) struct ViewSite<'a> {
     pub(in crate::query) dir: &'a str,
     pub(in crate::query) id: u64,
-    /// The policy the view's *output store* was opened under, handed down so its
-    /// operator traces cannot end up looking for a different manifest generation.
-    pub(in crate::query) recovery: RecoverySource,
-    /// Which worker compiles: names the scratch children's rank and is baked
-    /// into every `WorkerFilter` and the global-aggregate owner test.
-    pub(in crate::query) slot: Slot,
-    /// What every scratch child opens with.
-    pub(in crate::query) budgets: StoreBudgets,
+    /// Opens every scratch child of this compile, answers the slot it runs at,
+    /// and is the [`SchemaSource`] the circuit is loaded through — one object,
+    /// so a compile cannot read a schema from one host and open a child under
+    /// another.
+    pub(in crate::query) registry: &'a RelationRegistry,
 }
 
 /// Assemble a compiled view's exchange sides, seeding each from `seed_regs` at
@@ -503,9 +501,9 @@ fn build_sides(mut plans: Vec<SubPlan>, seed_regs: &[DeltaReg]) -> Result<Sides,
 pub(super) fn compile_view(
     site: ViewSite<'_>,
     view_schema: &SchemaDescriptor,
-    host: &dyn SchemaSource,
     bounded: bool,
 ) -> Result<CompiledView, CompileError> {
+    let host = site.registry;
     let loaded = load::load_circuit(host, site.id)?;
     if loaded.nodes.is_empty() {
         return Err(CompileError::Rejected("circuit has no nodes"));
@@ -536,10 +534,6 @@ pub(super) fn compile_view(
         ));
     }
 
-    // One guard for every scratch directory this compile creates: the sides', the
-    // post phase's, and any a `?` below abandons. Declared before `side_plans`
-    // and `post`, so it still drops last and their tables are gone by then.
-    let mut scratch = ScratchGuard::new();
     let mut side_plans: Vec<SubPlan> = Vec::with_capacity(exchanges.len());
     let mut exchange_inputs: Vec<(i32, SchemaDescriptor)> = Vec::with_capacity(exchanges.len());
     // Each side is the ancestors of its own exchange input; everything else is
@@ -555,7 +549,6 @@ pub(super) fn compile_view(
             host,
             site,
             view_schema.placement(),
-            &mut scratch,
             PlanTarget::Subgraph { out: ex_in },
         )?;
         exchange_inputs.push((ex_nid, finalize_side(&plan, shard_cols)?));
@@ -577,7 +570,6 @@ pub(super) fn compile_view(
         host,
         site,
         view_schema.placement(),
-        &mut scratch,
         PlanTarget::ViewOutput {
             out_schema: view_schema,
             seeds: &exchange_inputs,
@@ -605,17 +597,18 @@ pub(super) fn compile_view(
         .collect::<Result<_, _>>()?;
     let sides = build_sides(side_plans, &seed_regs)?;
 
-    // Past every fallible step: from here the VM's owned tables keep the scratch
-    // directories alive.
-    scratch.defuse();
+    let mut output = CompileOutput {
+        sides,
+        post,
+        source_bound: load::circuit_source_bound(&loaded),
+        hydration,
+    };
+    // Past every fallible step: from here the plan owns its child stores. Every
+    // other exit leaves each sub-plan's state armed, so a later side failing
+    // after an earlier one built still erases both.
+    for sub in output.sub_plans_mut() {
+        sub.vm.state.commit();
+    }
 
-    Ok(CompiledView {
-        output: CompileOutput {
-            sides,
-            post,
-            source_bound: load::circuit_source_bound(&loaded),
-            hydration,
-        },
-        meta,
-    })
+    Ok(CompiledView { output, meta })
 }

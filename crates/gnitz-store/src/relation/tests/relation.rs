@@ -1,5 +1,4 @@
 use super::*;
-use crate::storage::RecoverySource;
 
 fn solo_registry() -> RelationRegistry {
     RelationRegistry::new(Slot::SOLO, StoreConfig::default())
@@ -12,28 +11,11 @@ fn relation_test_dir(name: &str) -> String {
     crate::test_support::scratch_dir("relation", name)
 }
 
-fn make_test_table(name: &str) -> Box<Table> {
-    let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
-    let dir = relation_test_dir(name);
-    Box::new(
-        Table::new(
-            &dir,
-            schema,
-            99,
-            RecoverySource::Rederive { resume_at: None },
-            StoreBudgets::default(),
-        )
-        .unwrap(),
-    )
-}
-
-/// Enter `id` over an already-opened table the registry then owns. `directory`
-/// is what an `add_index` on it creates `idx_<id>` under; every other caller
-/// passes an empty one.
+/// Enter `id`, opening its store under `directory` — which `add_index` also
+/// creates `idx_<id>` under.
 fn register_entry(
     registry: &mut RelationRegistry,
     id: i64,
-    table: Box<Table>,
     schema: SchemaDescriptor,
     kind: RelationKind,
     directory: String,
@@ -45,15 +27,20 @@ fn register_entry(
         directory,
         budgets: ViewBudgets::default(),
     };
-    registry.register_owned(spec, table);
+    registry.register(spec, OnRegister::Live).unwrap();
 }
 
 #[test]
 fn test_register_unregister_table() {
     let mut registry = solo_registry();
     let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
-    let tbl = make_test_table("reg_unreg");
-    register_entry(&mut registry, 100, tbl, schema, RelationKind::BaseTable, String::new());
+    register_entry(
+        &mut registry,
+        100,
+        schema,
+        RelationKind::BaseTable,
+        relation_test_dir("reg_unreg"),
+    );
     assert!(registry.has_id(100));
 
     registry.unregister(100);
@@ -69,14 +56,13 @@ fn test_add_remove_index_circuit() {
         &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 3],
         &[0],
     );
-    let tbl = make_test_table("idx_parent");
     let owner_dir = relation_test_dir("idx_parent_owner");
-    register_entry(&mut registry, 50, tbl, schema, RelationKind::BaseTable, owner_dir);
+    register_entry(&mut registry, 50, schema, RelationKind::BaseTable, owner_dir);
     registry.add_index(50, 999, &[2], false).unwrap();
-    assert_eq!(registry.index_circuits(50).len(), 1);
+    assert_eq!(registry.relation(50).unwrap().indexes().len(), 1);
 
-    registry.remove_index_circuit(50, &[2]);
-    assert_eq!(registry.index_circuits(50).len(), 0);
+    registry.remove_index(50, &[2]);
+    assert_eq!(registry.relation(50).unwrap().indexes().len(), 0);
     registry.close();
 }
 
@@ -90,9 +76,8 @@ fn a_flag_clear_seek_col_idx_names_no_index() {
         &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 3],
         &[0],
     );
-    let tbl = make_test_table("seek_col_idx_zero");
     let owner_dir = relation_test_dir("seek_col_idx_zero_owner");
-    register_entry(&mut registry, 50, tbl, schema, RelationKind::BaseTable, owner_dir);
+    register_entry(&mut registry, 50, schema, RelationKind::BaseTable, owner_dir);
     registry.add_index(50, 999, &[2], false).unwrap();
 
     assert!(registry
@@ -118,12 +103,10 @@ fn ephemeral_flush_includes_index_circuits() {
         &[crate::schema::SchemaColumn::new(crate::schema::type_code::U64, 0); 2],
         &[0],
     );
-    let tbl = make_test_table("flush_ic_parent");
     let owner_dir = relation_test_dir("flush_ic_owner");
     register_entry(
         &mut registry,
         70,
-        tbl,
         parent_schema,
         RelationKind::BaseTable,
         owner_dir.clone(),
@@ -132,8 +115,9 @@ fn ephemeral_flush_includes_index_circuits() {
 
     // Put one row in the index table's memtable.
     {
-        let ic = registry.index_circuit_for_cols_mut(70, &[1]).unwrap();
-        let mut batch = Batch::with_capacity(&ic.index_schema, 1);
+        let ic = registry.relation_mut(70).and_then(|r| r.index_on_mut(&[1])).unwrap();
+        let index_schema = ic.schema();
+        let mut batch = Batch::with_capacity(&index_schema, 1);
         batch.extend_pk(1u128);
         batch.extend_weight(&1i64.to_le_bytes());
         batch.extend_null_bmp(&0u64.to_le_bytes());
@@ -141,7 +125,7 @@ fn ephemeral_flush_includes_index_circuits() {
         ic.ingest_owned_batch(batch).unwrap();
     }
 
-    registry.flush_ephemeral_outputs(1).unwrap();
+    registry.checkpoint_ephemeral(1, []).unwrap();
     let idx_dir = ChildAddr::Index { id: 999 }.dir(&owner_dir);
     let store_dir = ChildAddr::worker(Slot::SOLO).dir(&idx_dir);
     let shard_count = std::fs::read_dir(&store_dir)
@@ -167,16 +151,19 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
     let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
     let vid = gnitz_wire::FIRST_USER_TABLE_ID as i64;
     registry
-        .register(RelationSpec {
-            id: vid,
-            kind: RelationKind::View,
-            schema,
-            directory: relation_test_dir("fed_view_delta"),
-            budgets: ViewBudgets {
-                capacity_bytes: None,
-                delta_bytes: Some(1 << 20),
+        .register(
+            RelationSpec {
+                id: vid,
+                kind: RelationKind::View,
+                schema,
+                directory: relation_test_dir("fed_view_delta"),
+                budgets: ViewBudgets {
+                    capacity_bytes: None,
+                    delta_bytes: Some(1 << 20),
+                },
             },
-        })
+            OnRegister::Live,
+        )
         .unwrap();
 
     let row = |w: i64| {
@@ -192,20 +179,20 @@ fn a_fed_view_retains_each_round_at_its_own_weight() {
 
     // The output store folded the pair away — which is exactly why the feed has
     // to have kept both.
-    let entry = registry.table_entry(vid).unwrap();
+    let entry = registry.relation_or_err(vid).unwrap();
     let mut live = 0i64;
-    let mut cur = entry.open_cursor();
+    let mut cur = entry.cursor();
     while cur.valid {
         live += cur.current_weight;
         cur.advance();
     }
     assert_eq!(live, 0, "the output store's fold annihilates the pair");
 
-    let feed = entry.delta_feed_or_err(40).expect("a fed view holds a delta store");
-    let stride = feed.schema.pk_stride();
+    let feed = entry.delta_or_err().expect("a fed view holds a delta store");
+    let stride = feed.schema().pk_stride();
     let mut rounds: Vec<(u64, i64)> = Vec::new();
     let floor = vec![0u8; stride];
-    let mut cur = feed.open_cursor_in_range(&floor, None);
+    let mut cur = feed.cursor_in_range(&floor, None);
     // A ranged open comes back unpositioned; every reader of one seeks first.
     cur.seek_range_bytes(&floor, None);
     while cur.valid {
@@ -248,20 +235,14 @@ fn ingest_apply_error_returned_internal() {
     }
     let mut registry = solo_registry();
     let schema = crate::test_support::pk_only_schema(&[crate::schema::type_code::U64]);
-    let dir = relation_test_dir("seam_abort");
-    let tbl = Box::new(
-        Table::new(
-            &dir,
-            schema,
-            99,
-            RecoverySource::Rederive { resume_at: None },
-            StoreBudgets::default(),
-        )
-        .unwrap(),
-    );
-    // A user id: the public ingest entry rejects the system band outright.
     let tid = gnitz_wire::FIRST_USER_TABLE_ID as i64;
-    register_entry(&mut registry, tid, tbl, schema, RelationKind::View, String::new());
+    register_entry(
+        &mut registry,
+        tid,
+        schema,
+        RelationKind::View,
+        relation_test_dir("seam_abort"),
+    );
     let mut batch = Batch::with_capacity(&schema, 1);
     batch.extend_pk(1u128);
     batch.extend_weight(&1i64.to_le_bytes());

@@ -125,13 +125,13 @@ fn make_narrow_compound_batch(schema: &SchemaDescriptor, rows: &[(u128, i64, i64
         // the raw u128 (which would byte-reverse the column order).
         let c0 = pk as u64 as u128;
         let c1 = (pk >> 64) as u64 as u128;
-        b.extend_pk_opk(schema, &[c0, c1]);
+        b.extend_pk_opk(&[c0, c1]);
         b.extend_weight(&w.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &val.to_le_bytes());
         b.count += 1;
     }
-    b.certify_layout(Layout::Consolidated, schema);
+    b.certify_layout(Layout::Consolidated);
     b
 }
 
@@ -701,7 +701,7 @@ fn make_join_key_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, u128)]) -> 
         b.extend_col(1, &c2.to_le_bytes()); // U128 payload (pi 1)
         b.count += 1;
     }
-    b.certify_layout(Layout::Consolidated, schema);
+    b.certify_layout(Layout::Consolidated);
     b
 }
 
@@ -819,7 +819,7 @@ fn test_single_key_promote_scatter_copartitions() {
         b.extend_col(0, &key.to_le_bytes());
         b.count += 1;
     }
-    b.certify_layout(Layout::Consolidated, &schema);
+    b.certify_layout(Layout::Consolidated);
     let cb = b;
     let key = [(1u32, Some(TypeCode::I64))];
 
@@ -876,7 +876,7 @@ fn test_single_key_promote_scatter_copartitions() {
         pb.extend_col(0, &v.to_le_bytes());
         pb.count += 1;
     }
-    pb.certify_layout(Layout::Consolidated, &pk_schema);
+    pb.certify_layout(Layout::Consolidated);
     let pk_cb = pb;
     let pk_key = [(0u32, Some(TypeCode::I64))];
     let pk_packer = ReindexPacker::new(&pk_schema, &pk_key).unwrap();

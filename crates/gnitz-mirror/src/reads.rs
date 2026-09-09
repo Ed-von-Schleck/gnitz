@@ -29,7 +29,7 @@ impl Mirror {
     /// Every row of the copy, decoded under `schema` — the client-side schema
     /// its registration resolved.
     pub(crate) fn scan_inner(&mut self, table_id: u64, schema: &Schema) -> Result<ZSetBatch, MirrorError> {
-        let (batch, desc) = self.registry.scan_family(table_id as i64, None).map_err(engine)?;
+        let (batch, desc) = self.registry.scan(table_id as i64, None).map_err(engine)?;
         reply_batch(&batch, &desc, table_id, schema)
     }
 
@@ -54,7 +54,7 @@ impl Mirror {
         let reply_desc = descriptor_of(reply_schema)?;
         let keeper = self
             .registry
-            .scan_spec_family(table_id as i64, &spec, &reply_desc, 0, None)
+            .scan_spec(table_id as i64, &spec, &reply_desc, 0, None)
             .map_err(engine)?;
         reply_batch(&keeper, &reply_desc, table_id, reply_schema)
     }

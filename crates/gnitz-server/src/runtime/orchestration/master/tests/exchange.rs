@@ -4,7 +4,7 @@ use gnitz_wire::{FLAG_CONTINUATION, FLAG_EXCHANGE, FLAG_SCAN_LAST};
 
 /// The one-U64-PK, zero-payload fixture every batch here is built over.
 fn u64_pk_only() -> SchemaDescriptor {
-    crate::test_support::pk_only_schema(&[gnitz_store::schema::type_code::U64])
+    crate::test_support::pk_only_schema(&[gnitz_wire::type_code::U64])
 }
 
 /// One worker's TERMINAL exchange frame — the whole report when the partition
@@ -33,7 +33,7 @@ fn chunk(keys: &[u64]) -> Batch {
     for k in keys {
         b.push_key_row(&k.to_be_bytes(), 1);
     }
-    b.certify_layout(Layout::Consolidated, &schema);
+    b.certify_layout(Layout::Consolidated);
     b
 }
 
@@ -157,7 +157,7 @@ fn one_unconsolidated_frame_clears_the_slots_claim() {
     raw.control.flags &= !gnitz_wire::FLAG_BATCH_CONSOLIDATED;
     raw.data_batch = Some({
         let mut b = chunk(&[1]);
-        b.certify_layout(Layout::Raw, &u64_pk_only());
+        b.certify_layout(Layout::Raw);
         b
     });
     assert!(acc.process(0, raw).is_none());

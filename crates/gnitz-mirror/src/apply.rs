@@ -2,6 +2,7 @@
 
 use gnitz_core::{MirrorError, RawBlock, Shape};
 use gnitz_foundation::fault::Seam;
+use gnitz_store::relation::Relation;
 use gnitz_store::schema::make_delta_schema;
 use gnitz_store::storage::Batch;
 
@@ -40,7 +41,8 @@ impl Mirror {
         }
         let view_desc = self
             .registry
-            .get_schema_desc(table_id as i64)
+            .relation(table_id as i64)
+            .map(Relation::schema)
             .ok_or_else(|| MirrorError::Engine(format!("relation {table_id} is not mirrored")))?;
         let in_desc = match shape {
             Shape::Plain => view_desc,
@@ -59,7 +61,7 @@ impl Mirror {
                 .map_err(|e| self.poison(format!("decoding a delta for {table_id} failed: {e}")))?;
             let batch = match shape {
                 Shape::Plain => batch,
-                Shape::Stamped => batch.stripped_of_pk_prefix(&in_desc, &view_desc),
+                Shape::Stamped => batch.stripped_of_pk_prefix(&view_desc),
             };
             if batch.is_empty() {
                 continue;

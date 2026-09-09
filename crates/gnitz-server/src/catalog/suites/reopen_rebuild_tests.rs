@@ -27,7 +27,7 @@ const N: i64 = 7;
 fn seed_base(engine: &mut CatalogEngine, name: &str) -> (i64, Vec<ColumnDef>) {
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table(name, &cols, &[0]).unwrap();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
+    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
     let mut bb = BatchBuilder::new(schema);
     for i in 0..N as u64 {
         bb.begin_row(i as u128, 1);
@@ -49,9 +49,9 @@ fn base_with_index(engine: &mut CatalogEngine) -> i64 {
 
 /// Net weight of `tid`'s single index circuit.
 fn index_weight(engine: &mut CatalogEngine, tid: i64) -> i64 {
-    let entry = engine.registry().table_entry(tid).unwrap();
-    assert_eq!(entry.index_circuits.len(), 1, "index circuit replayed");
-    sum_weights(entry.index_circuits[0].open_cursor())
+    let entry = engine.registry().relation_or_err(tid).unwrap();
+    assert_eq!(entry.indexes().len(), 1, "index circuit replayed");
+    sum_weights(entry.indexes()[0].cursor())
 }
 
 // ── index_rebuilds_once_view_defers_on_reopen ───────────────────────────
@@ -76,7 +76,7 @@ fn index_rebuilds_once_view_defers_on_reopen() {
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
+    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
     let mut bb = BatchBuilder::new(schema);
     for i in 0..N as u64 {
         bb.begin_row(i as u128, 1);
@@ -95,16 +95,16 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     // Registration alone materialises nothing — the server's distributed
     // backfill is the sole driver, and a catalog-layer fill here would
     // double-count against it.
-    let view_entry = engine.registry().table_entry(vid).expect("view registered");
+    let view_entry = engine.registry().relation_or_err(vid).expect("view registered");
     assert_eq!(
-        sum_weights(view_entry.open_cursor()),
+        sum_weights(view_entry.cursor()),
         0,
         "hook_relation_register must leave the view empty"
     );
-    let base_entry = engine.registry().table_entry(tid).unwrap();
-    assert_eq!(base_entry.index_circuits.len(), 1);
+    let base_entry = engine.registry().relation_or_err(tid).unwrap();
+    assert_eq!(base_entry.indexes().len(), 1);
     assert_eq!(
-        sum_weights(base_entry.index_circuits[0].open_cursor()),
+        sum_weights(base_entry.indexes()[0].cursor()),
         N,
         "live CREATE INDEX must backfill the base rows exactly once"
     );
@@ -116,9 +116,9 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     // The base table must be non-empty after reopen: it came back from its
     // durable shards. Without this guard an empty base would rebuild an empty
     // index and the equality below would pass vacuously.
-    let base_entry = engine2.registry().table_entry(tid).expect("base table replayed");
+    let base_entry = engine2.registry().relation_or_err(tid).expect("base table replayed");
     assert_eq!(
-        sum_weights(base_entry.open_cursor()),
+        sum_weights(base_entry.cursor()),
         N,
         "base table must survive close() → open() from its durable shards"
     );
@@ -126,18 +126,18 @@ fn index_rebuilds_once_view_defers_on_reopen() {
     // The view's ephemeral storage was erased at open and is NOT rebuilt at the
     // catalog layer: boot view state is the server's (checkpoint resume,
     // else the master-driven rebuild), covered by the E2E suite.
-    let view_entry = engine2.registry().table_entry(vid).expect("view replayed");
+    let view_entry = engine2.registry().relation_or_err(vid).expect("view replayed");
     assert_eq!(
-        sum_weights(view_entry.open_cursor()),
+        sum_weights(view_entry.cursor()),
         0,
         "view must come back empty at catalog open — rebuild deferred to the server"
     );
 
     // Same invariant for the secondary index.
-    let base_entry = engine2.registry().table_entry(tid).unwrap();
-    assert_eq!(base_entry.index_circuits.len(), 1, "index circuit replayed");
+    let base_entry = engine2.registry().relation_or_err(tid).unwrap();
+    assert_eq!(base_entry.indexes().len(), 1, "index circuit replayed");
     assert_eq!(
-        sum_weights(base_entry.index_circuits[0].open_cursor()),
+        sum_weights(base_entry.indexes()[0].cursor()),
         N,
         "index must rebuild from source exactly once on reopen, not double"
     );
@@ -164,7 +164,7 @@ fn index_rebuilds_across_chunk_boundary() {
 
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::I64)];
     let tid = engine.create_table("public.base", &cols, &[0]).unwrap();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
+    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
     let mut next = 0usize;
     while next < n {
         let mut bb = BatchBuilder::new(schema);
@@ -185,17 +185,17 @@ fn index_rebuilds_across_chunk_boundary() {
 
     let engine2 = CatalogEngine::open(&dir, 1).unwrap();
 
-    let base_entry = engine2.registry().table_entry(tid).expect("base table replayed");
+    let base_entry = engine2.registry().relation_or_err(tid).expect("base table replayed");
     assert_eq!(
-        sum_weights(base_entry.open_cursor()),
+        sum_weights(base_entry.cursor()),
         n as i64,
         "base table must survive close() → open() from its durable shards"
     );
 
-    let base_entry = engine2.registry().table_entry(tid).unwrap();
-    assert_eq!(base_entry.index_circuits.len(), 1, "index circuit replayed");
+    let base_entry = engine2.registry().relation_or_err(tid).unwrap();
+    assert_eq!(base_entry.indexes().len(), 1, "index circuit replayed");
     assert_eq!(
-        sum_weights(base_entry.index_circuits[0].open_cursor()),
+        sum_weights(base_entry.indexes()[0].cursor()),
         n as i64,
         "index must rebuild across the chunk boundary exactly once"
     );
@@ -269,7 +269,7 @@ fn checkpointed_table_with_index(dir: &str, recorded_workers: u32) -> (i64, u64)
 
     // The index is the only rederived store this table owns, so the ephemeral
     // round publishes exactly it.
-    engine.registry_mut().flush_ephemeral_outputs(g).unwrap();
+    engine.registry_mut().checkpoint_ephemeral(g, []).unwrap();
 
     engine.close();
     (tid, g)
@@ -287,9 +287,8 @@ fn index_rebuild_is_skipped_after_resume() {
     let (tid, g) = checkpointed_table_with_index(&dir, 1);
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert_eq!(
-        engine.registry().rederive_source(),
-        RecoverySource::Rederive { resume_at: Some(g) },
+    assert!(
+        engine.registry().topology_matches() && engine.registry().resume_generation() == g,
         "a matching topology leaves the recovered generation as the whole verdict"
     );
     assert_eq!(
@@ -317,17 +316,17 @@ fn index_rebuild_forced_by_topology_change() {
     let (tid, _g) = checkpointed_table_with_index(&dir, 4);
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    assert_eq!(
-        engine.registry().rederive_source(),
-        RecoverySource::Rederive { resume_at: None },
+    assert!(
+        !engine.registry().topology_matches(),
         "a foreign topology must refuse every manifest"
     );
     assert!(
         !engine
             .registry()
-            .index_circuit_for_cols(tid, &[1])
+            .relation(tid)
+            .and_then(|r| r.index_on(&[1]))
             .unwrap()
-            .resumed_from_checkpoint(),
+            .resumed(),
         "a topology change must erase the index despite a matching generation"
     );
     assert_eq!(
@@ -406,22 +405,21 @@ fn view_traces_resume_with_their_output_store() {
 
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     assert!(
-        engine.registry().store_resumed(vid),
+        engine.registry().relation(vid).is_some_and(Relation::resumed),
         "the fixture must leave a resumable output store"
     );
     engine.bump_checkpoint_generation().unwrap();
     assert!(engine.dag.ensure_compiled(&engine.registry, vid).unwrap());
 
-    // The compiled plan's own tables — both the set the next ephemeral round
-    // would publish and the integral this view reads through.
-    let traces = engine.dag.collect_ephemeral_trace_tables(&engine.registry);
-    assert!(!traces.is_empty(), "a trace-bearing view must contribute trace tables");
-    for t in traces {
-        assert!(
-            t.resumed_from_checkpoint(),
-            "a trace opened against a generation its manifest never carried is erased"
-        );
-    }
+    // The compiled plan's own operator state — both the set the next ephemeral
+    // round would publish and the integral this view reads through. `resumed()`
+    // answers `false` for a state holding no child, so this also proves the
+    // fixture's view creates one.
+    let state = engine.dag.collect_ephemeral_state(&engine.registry);
+    assert!(
+        state.iter().all(|s| s.resumed()),
+        "a trace opened against a generation its manifest never carried is erased"
+    );
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);

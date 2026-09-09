@@ -17,27 +17,24 @@ impl RelationRegistry {
     /// every id — a system family is an ordinary entry, so the CIRCUIT_* tables
     /// are SQL-introspectable like any other relation. Returns the scan plus the
     /// schema descriptor the entry already holds, so the reply never re-resolves it.
-    pub fn scan_family(
+    pub fn scan(
         &self,
-        table_id: i64,
+        id: i64,
         hydrator: Option<&mut dyn SkeletonHydrator>,
     ) -> Result<(Rc<Batch>, SchemaDescriptor), StoreError> {
-        let entry = self.table_entry(table_id)?;
+        let entry = self.relation_or_err(id)?;
         // Asked of the store, not of a cursor: the non-hydrating answer is
         // `full_scan`'s cached `Rc` snapshot, and opening a cursor to ask
         // whether this walk meets a skeleton row would defeat that cache.
-        if entry.handle.has_skeleton_rows() {
-            let schema = entry.schema;
-            let cursor = entry.open_cursor();
+        if entry.store().has_skeleton_rows() {
+            let schema = entry.schema();
+            let cursor = entry.cursor();
             // The hydrated scan is not cached: `full_scan`'s snapshot is
             // invalidated on every ingest, so under live churn it would hold at
             // most one scan and cost a full hydrated copy of the store to do so.
-            return Ok((
-                Rc::new(self.materialize_hydrated(table_id, cursor, None, hydrator)?),
-                schema,
-            ));
+            return Ok((Rc::new(self.materialize_hydrated(id, cursor, None, hydrator)?), schema));
         }
-        Ok((entry.full_scan(), entry.schema))
+        Ok((entry.full_scan(), entry.schema()))
     }
 
     /// Every live row `cursor` walks, with each skeleton key recomputed — one
@@ -114,7 +111,7 @@ impl RelationRegistry {
         // drops ghosts, and `visit` keeps only positive ones — so the walk's output
         // is consolidated as built, and saying so is what lets the union below take
         // its O(n) merge instead of a full sort of the hydrated relation.
-        out.certify_layout(crate::storage::Layout::Consolidated, &schema);
+        out.certify_layout(crate::storage::Layout::Consolidated);
         if coarse.is_empty() {
             return Ok(out);
         }
@@ -142,21 +139,21 @@ impl RelationRegistry {
     /// Point lookup by OPK bytes: every live row of `pk`'s group, or `None` for
     /// a miss. The skeleton test is the opened cursor's, so a point lookup that
     /// misses every skeleton shard reads without hydrating.
-    pub fn seek_family(
+    pub fn seek(
         &self,
-        table_id: i64,
+        id: i64,
         pk: &[u8],
         hydrator: Option<&mut dyn SkeletonHydrator>,
     ) -> Result<Option<Batch>, StoreError> {
-        let entry = self.table_entry(table_id)?;
-        let mut cursor = entry.open_cursor_in_range(pk, Some(pk));
+        let entry = self.relation_or_err(id)?;
+        let mut cursor = entry.cursor_in_range(pk, Some(pk));
         if !cursor.any_skeleton() {
             return Ok(live_pk_group(&mut cursor, pk));
         }
         // One key is a one-element key list, so the hydrating read is the same
         // walk every other one takes — it just hydrates at most one key rather
         // than the store.
-        let b = self.materialize_hydrated(table_id, cursor, Some(pk), hydrator)?;
+        let b = self.materialize_hydrated(id, cursor, Some(pk), hydrator)?;
         Ok((b.count > 0).then_some(b))
     }
 
@@ -178,14 +175,14 @@ impl RelationRegistry {
     /// Ascending is a producer guarantee: the master sorts before scattering and
     /// `scatter::with_group` preserves per-worker order, which is what lets an
     /// absent key — most of a broadcast list, at W workers — cost a comparison.
-    pub fn gather_family_bytes<'k>(
+    pub fn gather_bytes<'k>(
         &self,
-        table_id: i64,
+        id: i64,
         pks: impl ExactSizeIterator<Item = &'k [u8]>,
         ref_col: u8,
     ) -> Result<(Batch, SchemaDescriptor), StoreError> {
-        let entry = self.table_entry(table_id)?;
-        let schema = entry.schema;
+        let entry = self.relation_or_err(id)?;
+        let schema = entry.schema();
         let result_schema =
             project_schema(&schema, &[ref_col as u32]).expect("a one-column projection fits MAX_COLUMNS");
         // The column is master-picked and is never a PK column (the FK rules
@@ -201,7 +198,7 @@ impl RelationRegistry {
         // The master SCATTERS the key list, so `pks` is this worker's own sublist
         // and `pks.len()` is a tight bound, not a W× over-allocation.
         let mut out = Batch::with_capacity(&result_schema, pks.len());
-        let mut cursor = entry.open_cursor();
+        let mut cursor = entry.cursor();
         for pk in pks {
             // The weight gate rejects a tombstone an uncompacted source holds.
             if cursor.seek_pk_group_ascending(pk) && cursor.current_weight > 0 {
@@ -229,7 +226,7 @@ impl RelationRegistry {
     /// that gate; see `BoundedIndexCursor::drain_chunk`.)
     pub fn seek_by_index(
         &self,
-        table_id: i64,
+        id: i64,
         col_indices: &[u32],
         natives: &[u128],
     ) -> Result<(Option<Batch>, SchemaDescriptor), StoreError> {
@@ -237,7 +234,7 @@ impl RelationRegistry {
             .split_last()
             .ok_or_else(|| StoreError::rejected("seek_by_index: no key values supplied"))?;
         let range = gnitz_wire::RangeDescriptor::point(eq, last);
-        self.seek_by_index_range(table_id, col_indices, &range)
+        self.seek_by_index_range(id, col_indices, &range)
     }
 
     /// Ordered range scan over a secondary index: the leading
@@ -254,30 +251,18 @@ impl RelationRegistry {
     /// range's matches scatter across workers).
     pub fn seek_by_index_range(
         &self,
-        table_id: i64,
+        id: i64,
         col_indices: &[u32],
         range: &gnitz_wire::RangeDescriptor,
     ) -> Result<(Option<Batch>, SchemaDescriptor), StoreError> {
-        let src_schema = self.table_entry(table_id)?.schema;
+        let src_schema = self.relation_or_err(id)?.schema();
         // The wire seek IS one unchunked drain of the bounded cursor — the same
         // walk/gather the backfill scan drives chunk-wise, so the two paths
         // cannot diverge on the weight-consolidation subtleties. A provably-empty
         // range drains `None`; the `.filter` maps the cursor's `Some(empty)`
         // ("in-range entries, none resolved") back to this API's `None` too.
-        let mut cur = self.open_index_source(table_id, col_indices, range, IndexWalk::Required)?;
+        let mut cur = self.open_index_source(id, col_indices, range, IndexWalk::Required)?;
         Ok((cur.drain_chunk(usize::MAX).filter(|b| b.count > 0), src_schema))
-    }
-
-    /// Cursor-returning sibling of `scan_family` for callers that stream a
-    /// relation chunk-wise (`drain_chunk`), or seek into it, instead of
-    /// materializing it whole. `None` when the table is unregistered — callers
-    /// treat that as empty.
-    ///
-    /// The handle owns its sources via `Rc`, so it stays valid while the
-    /// caller mutates OTHER relations (index table, view family) between
-    /// chunks; the scanned relation itself must not be written mid-loop.
-    pub fn open_store_cursor(&self, table_id: i64) -> Option<ReadCursor> {
-        self.entry(table_id).map(|e| e.open_cursor())
     }
 
     /// The one index-bounded source cursor opener: the walk over `desc` on `cols`
@@ -295,7 +280,7 @@ impl RelationRegistry {
             IndexScan::Cursor(c) => Ok(SourceCursor::Bounded(c)),
             IndexScan::Empty => Ok(SourceCursor::Empty),
             IndexScan::Decline(_) if walk == IndexWalk::Optional => {
-                Ok(SourceCursor::Full(Box::new(self.table_entry(source)?.open_cursor())))
+                Ok(SourceCursor::Full(Box::new(self.relation_or_err(source)?.cursor())))
             }
             IndexScan::Decline(e) => Err(e),
         }
@@ -320,38 +305,38 @@ impl RelationRegistry {
     /// either way.
     fn open_index_range(
         &self,
-        table_id: i64,
+        id: i64,
         col_indices: &[u32],
         range: &gnitz_wire::RangeDescriptor,
         walk: IndexWalk,
     ) -> IndexScan {
-        let entry = match self.table_entry(table_id) {
+        let entry = match self.relation_or_err(id) {
             Ok(e) => e,
             Err(e) => return IndexScan::Decline(e),
         };
         // The index was dropped since the plan compiled.
-        let Some(ic) = entry.index_circuit_on(col_indices) else {
+        let Some(ic) = entry.index_on(col_indices) else {
             return IndexScan::Decline(StoreError::rejected(format!(
-                "No index on cols {col_indices:?} for table {table_id}"
+                "No index on cols {col_indices:?} for table {id}"
             )));
         };
-        let (start, end) = match ic.key_spec.range_keys(ic.index_schema.pk_stride(), range) {
+        let (start, end) = match ic.key_spec().range_keys(ic.schema().pk_stride(), range) {
             Ok(Some(keys)) => keys,
             Ok(None) => return IndexScan::Empty,
             // Malformed: `n_eq` pins every column with no range column left.
             Err(e) => return IndexScan::Decline(StoreError::rejected(e)),
         };
         let end_bytes = end.as_ref().map(|e| e.pk_bytes());
-        let mut idx = ic.open_cursor_in_range(start.pk_bytes(), end_bytes);
+        let mut idx = ic.cursor_in_range(start.pk_bytes(), end_bytes);
         let matches = idx.seek_range_bytes(start.pk_bytes(), end_bytes);
         if walk == IndexWalk::Optional {
             // Only user base tables own index circuits, so a resolved index
             // implies a base store unless this process detached it (the post-fork
             // master), which degrades to the full scan like any other decline.
-            let Some(store) = entry.owned_store() else {
+            let Some(base) = entry.store().table() else {
                 return IndexScan::Decline(StoreError::rejected("index owner holds no local base store"));
             };
-            if matches > store.estimated_rows() / INDEX_SCAN_RATIO {
+            if matches > base.estimated_rows() / INDEX_SCAN_RATIO {
                 return IndexScan::Decline(StoreError::rejected(
                     "index range is not selective enough to pay for the walk",
                 ));
@@ -359,8 +344,8 @@ impl RelationRegistry {
         }
         IndexScan::Cursor(Box::new(BoundedIndexCursor::new(
             idx,
-            entry.open_cursor(),
-            ic.key_spec,
+            entry.cursor(),
+            ic.key_spec(),
             matches.min(self.config.scan_chunk_rows),
         )))
     }

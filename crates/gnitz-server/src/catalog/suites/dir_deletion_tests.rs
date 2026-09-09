@@ -94,7 +94,7 @@ fn gc_reclaims_orphan_table_dir() {
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
 
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
+    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(10);
@@ -114,7 +114,7 @@ fn gc_reclaims_orphan_table_dir() {
     assert!(!Path::new(&ghost).exists(), "orphan table dir must be reclaimed");
     assert!(Path::new(&live_dir).exists(), "live table dir must survive");
     assert!(
-        engine.seek_family(tid, 1u128, &[]).unwrap().0.is_some(),
+        engine.seek(tid, 1u128, &[]).unwrap().0.is_some(),
         "live table must still read back after the sweep"
     );
 
@@ -191,7 +191,7 @@ fn gc_leaves_live_entities_untouched() {
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
 
     let t1 = engine.create_table("public.flushed", &cols, &[0]).unwrap();
-    let schema = engine.registry().get_schema_desc(t1).unwrap();
+    let schema = engine.registry().relation(t1).map(Relation::schema).unwrap();
     let mut bb = BatchBuilder::new(schema);
     bb.begin_row(1u128, 1);
     bb.put_u64(7);
@@ -223,7 +223,7 @@ fn gc_leaves_live_entities_untouched() {
     }
     assert!(engine.pending_dir_deletions.is_empty());
     assert_eq!(
-        engine.scan_family(t1).unwrap().0.len(),
+        engine.scan(t1).unwrap().0.len(),
         1,
         "flushed table must still read back after the sweep"
     );
@@ -364,8 +364,8 @@ fn replicated_table_with_a_shard(engine: &mut CatalogEngine, flush: bool) -> (i6
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let rt = create_flagged_table(engine, "rt", &cols, &[0], replicated_flags());
 
-    let rel_dir = engine.registry().table_entry(rt).unwrap().directory.clone();
-    let mut bb = BatchBuilder::new(engine.registry().get_schema_desc(rt).unwrap());
+    let rel_dir = engine.registry().relation_or_err(rt).unwrap().directory().to_string();
+    let mut bb = BatchBuilder::new(engine.registry().relation(rt).map(Relation::schema).unwrap());
     bb.begin_row(1u128, 1);
     bb.put_int(7);
     bb.end_row();
@@ -403,19 +403,33 @@ fn child_manifest(rel: &str, k: u32, of: u32) -> String {
     ChildAddr::Worker { rank: k, of }.manifest(rel)
 }
 
-/// Open one child directly, outside any catalog. A `CatalogEngine` is one
-/// process at rank 0, so a test that needs a *complete* `w{k}of{n}` set — the
-/// state a real cluster's checkpoint leaves behind — has to write the other
-/// ranks itself.
-fn open_child(rel: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64) -> gnitz_store::storage::Table {
-    gnitz_store::storage::Table::new(
-        &child_path(rel, k, of),
-        schema,
-        tid as u32,
-        RecoverySource::SalReplay,
-        StoreBudgets::default(),
-    )
-    .unwrap()
+/// A registry at rank `k` of `of` holding `tid` under `rel`. A `CatalogEngine`
+/// is one process at rank 0, so a test needing a *complete* `w{k}of{n}` set has
+/// to stand up the other ranks itself.
+fn child_registry(rel: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64) -> RelationRegistry {
+    let mut registry = RelationRegistry::new(Slot::new(k, of), StoreConfig::default());
+    registry
+        .register(
+            RelationSpec {
+                id: tid,
+                kind: RelationKind::BaseTable,
+                schema,
+                directory: rel.to_string(),
+                budgets: ViewBudgets::default(),
+            },
+            OnRegister::Live,
+        )
+        .unwrap();
+    registry
+}
+
+/// Every row of one child, as `(pk, weight)`.
+fn child_rows(rel: &str, k: u32, of: u32, schema: SchemaDescriptor, tid: i64) -> Vec<(u128, i64)> {
+    let registry = child_registry(rel, k, of, schema, tid);
+    let batch = registry.relation_or_err(tid).unwrap().cursor().materialize();
+    (0..batch.len())
+        .map(|i| (batch.get_pk(i), batch.get_weight(i)))
+        .collect()
 }
 
 /// The subset of `rows` that `worker_for_pk` places on worker `k` of `of` — the
@@ -444,8 +458,10 @@ fn expected_placement(schema: &SchemaDescriptor, rows: &[(u128, i64)], of: u32) 
     want
 }
 
-/// Ingest `rows` into one already-open child and publish it.
-fn fill_child(t: &mut gnitz_store::storage::Table, schema: SchemaDescriptor, rows: &[(u128, i64)]) {
+/// Ingest `rows` into one child's registry and publish it. The base-table PK rule
+/// runs, which changes nothing here: every seed writes distinct keys into a child
+/// the same call just created, so the rule finds nothing to retract.
+fn fill_child(registry: &mut RelationRegistry, tid: i64, schema: SchemaDescriptor, rows: &[(u128, i64)]) {
     if !rows.is_empty() {
         let mut bb = BatchBuilder::new(schema);
         for &(pk, x) in rows {
@@ -453,20 +469,20 @@ fn fill_child(t: &mut gnitz_store::storage::Table, schema: SchemaDescriptor, row
             bb.put_int(x as u128);
             bb.end_row();
         }
-        t.ingest_borrowed_batch(&bb.finish()).unwrap();
+        registry.ingest(tid, bb.finish()).unwrap();
     }
-    t.flush().unwrap();
+    registry.checkpoint_base().unwrap();
 }
 
 /// Sorted `(worker, pk, weight)` triples across every child of the `of`-worker set.
 fn set_rows(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64) -> Vec<(u32, u128, i64)> {
     let mut v = Vec::new();
     for k in 0..of {
-        let t = open_child(rel, k, of, schema, tid);
-        let batch = t.open_cursor().materialize();
-        for i in 0..batch.len() {
-            v.push((k, batch.get_pk(i), batch.get_weight(i)));
-        }
+        v.extend(
+            child_rows(rel, k, of, schema, tid)
+                .into_iter()
+                .map(|(pk, w)| (k, pk, w)),
+        );
     }
     v.sort_unstable();
     v
@@ -478,9 +494,9 @@ fn set_rows(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64) -> Vec<(u32,
 /// that count is discarded first, so the result is the set and nothing else.
 fn seed_child_set(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64, rows: &[(u128, i64)]) {
     for k in 0..of {
-        gnitz_store::storage::remove_child(&child_path(rel, k, of));
-        let mut t = open_child(rel, k, of, schema, tid);
-        fill_child(&mut t, schema, &rows_for_worker(&schema, rows, of, k));
+        fs::remove_dir_all(child_path(rel, k, of)).ok();
+        let mut registry = child_registry(rel, k, of, schema, tid);
+        fill_child(&mut registry, tid, schema, &rows_for_worker(&schema, rows, of, k));
     }
 }
 
@@ -490,7 +506,7 @@ fn retired_children_are_reclaimed() {
     let mut engine = CatalogEngine::open(&dir, 3).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
+    let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
 
     // A set laid out for another count, a rank above the launched count, and a
     // scratch dir from a rank that no longer exists.
@@ -530,7 +546,7 @@ fn replicated_table_is_relinked_at_a_new_worker_count() {
     let dir = temp_dir("repartition_replicated");
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let (rt, rel) = replicated_table_with_a_shard(&mut engine, true);
-    let schema = engine.registry().get_schema_desc(rt).unwrap();
+    let schema = engine.registry().relation(rt).map(Relation::schema).unwrap();
     let source_files = file_names(&child_path(&rel, 0, 1));
     assert!(source_files.contains(&"manifest.bin".to_string()));
     engine.close();
@@ -570,8 +586,8 @@ fn keyed_table_round_trips_across_worker_counts() {
 
         let mut engine = CatalogEngine::open(&dir, w_old).unwrap();
         let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-        let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
-        let schema = engine.registry().get_schema_desc(tid).unwrap();
+        let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
+        let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
         engine.close();
 
         let rows: Vec<(u128, i64)> = (0..N).map(|id| (id, id as i64 * 10)).collect();
@@ -607,8 +623,8 @@ fn repartition_handles_a_relation_with_empty_children() {
     let mut engine = CatalogEngine::open(&dir, 3).unwrap();
     // CLUSTER BY (a): every row shares `a = 1`, so all of them hash alike.
     let tid = create_flagged_table(&mut engine, "cb", &cols, &[0, 1], clustered_flags(1));
-    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
+    let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
+    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
     // `opk_key` reads the packed native value in PK-list order, so PK column 0
@@ -616,12 +632,7 @@ fn repartition_handles_a_relation_with_empty_children() {
     let rows: Vec<(u128, i64)> = (0..20u128).map(|b| (1u128 | (b << 64), b as i64)).collect();
     seed_child_set(&rel, 3, schema, tid, &rows);
     let occupied = (0..3)
-        .filter(|&k| {
-            !open_child(&rel, k, 3, schema, tid)
-                .open_cursor()
-                .materialize()
-                .is_empty()
-        })
+        .filter(|&k| !child_rows(&rel, k, 3, schema, tid).is_empty())
         .count();
     assert_eq!(occupied, 1, "a shared distribution prefix puts every row on one worker");
     for k in 0..3 {
@@ -634,16 +645,6 @@ fn repartition_handles_a_relation_with_empty_children() {
     let engine = CatalogEngine::open(&dir, 2).unwrap();
     let got = set_rows(&rel, 2, schema, tid);
     assert_eq!(got.len(), 20, "every row survives a relayout off a skewed set");
-    // The relayout is a second shard writer, and it writes *base* shards — the
-    // one kind that is point-probed, so its output must carry a PK filter.
-    let census: Vec<(usize, usize)> = (0..2)
-        .map(|k| open_child(&rel, k, 2, schema, tid).pk_filter_census())
-        .collect();
-    assert!(census.iter().any(|&(n, _)| n > 0), "the relayout wrote shards");
-    assert!(
-        census.iter().all(|&(n, filtered)| filtered == n),
-        "a relayout writes probed base shards",
-    );
     assert!(got.iter().all(|&(_, _, w)| w == 1), "no row may double");
     let mut pks: Vec<u128> = got.iter().map(|&(_, pk, _)| pk).collect();
     pks.sort_unstable();
@@ -662,8 +663,8 @@ fn two_complete_sets_resolve_by_layout_sequence() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
+    let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
+    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
     // A 2-set holding the current content, relayed to a 4-set — which the
@@ -685,8 +686,8 @@ fn two_complete_sets_resolve_by_layout_sequence() {
     let got = set_rows(&rel, 3, schema, tid);
     assert_eq!(got.len(), 40);
     for k in 0..3 {
-        let t = open_child(&rel, k, 3, schema, tid);
-        let batch = t.open_cursor().materialize();
+        let registry = child_registry(&rel, k, 3, schema, tid);
+        let batch = registry.relation_or_err(tid).unwrap().cursor().materialize();
         for i in 0..batch.len() {
             assert!(
                 payload_u64(&*batch, i, 0) >= 1000,
@@ -709,16 +710,16 @@ fn a_partial_target_is_cleared_rather_than_merged() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
+    let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
+    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
     let rows: Vec<(u128, i64)> = (0..40u128).map(|id| (id, id as i64)).collect();
     seed_child_set(&rel, 2, schema, tid, &rows);
 
     // Attempt 1 got as far as `w0of4`, holding rows it had already placed.
-    let mut torn = open_child(&rel, 0, 4, schema, tid);
-    fill_child(&mut torn, schema, &rows_for_worker(&schema, &rows, 4, 0));
+    let mut torn = child_registry(&rel, 0, 4, schema, tid);
+    fill_child(&mut torn, tid, schema, &rows_for_worker(&schema, &rows, 4, 0));
     drop(torn);
 
     let engine = CatalogEngine::open(&dir, 4).unwrap();
@@ -739,8 +740,8 @@ fn a_torn_set_at_the_launched_count_is_not_a_relayout() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 3).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
+    let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
+    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
     let rows: Vec<(u128, i64)> = (0..60u128).map(|id| (id, id as i64)).collect();
@@ -768,7 +769,7 @@ fn repartition_refuses_an_unreadable_child_grammar() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
+    let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
     engine.close();
 
     fabricate_dir(&format!("{rel}/part_7"), "manifest.bin");
@@ -787,8 +788,8 @@ fn repartition_refuses_a_torn_set_at_a_foreign_count() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 4).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
+    let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
+    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
     seed_child_set(
@@ -821,9 +822,9 @@ fn expected_replication(rows: &[(u128, i64)], of: u32) -> Vec<(u32, u128, i64)> 
 /// would leave each replica holding a slice.
 fn seed_replicated_set(rel: &str, of: u32, schema: SchemaDescriptor, tid: i64, rows: &[(u128, i64)]) {
     for k in 0..of {
-        gnitz_store::storage::remove_child(&child_path(rel, k, of));
-        let mut t = open_child(rel, k, of, schema, tid);
-        fill_child(&mut t, schema, rows);
+        fs::remove_dir_all(child_path(rel, k, of)).ok();
+        let mut registry = child_registry(rel, k, of, schema, tid);
+        fill_child(&mut registry, tid, schema, rows);
     }
 }
 
@@ -839,8 +840,8 @@ fn a_replicated_set_relays_from_one_surviving_rank() {
         let mut engine = CatalogEngine::open(&dir, 3).unwrap();
         let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
         let rt = create_flagged_table(&mut engine, "rt", &cols, &[0], replicated_flags());
-        let rel = engine.registry().table_entry(rt).unwrap().directory.clone();
-        let schema = engine.registry().get_schema_desc(rt).unwrap();
+        let rel = engine.registry().relation_or_err(rt).unwrap().directory().to_string();
+        let schema = engine.registry().relation(rt).map(Relation::schema).unwrap();
         engine.close();
 
         let rows: Vec<(u128, i64)> = (0..30u128).map(|id| (id, id as i64)).collect();
@@ -875,8 +876,8 @@ fn a_partial_target_at_the_launched_count_is_not_current() {
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let rt = create_flagged_table(&mut engine, "rt", &cols, &[0], replicated_flags());
-    let rel = engine.registry().table_entry(rt).unwrap().directory.clone();
-    let schema = engine.registry().get_schema_desc(rt).unwrap();
+    let rel = engine.registry().relation_or_err(rt).unwrap().directory().to_string();
+    let schema = engine.registry().relation(rt).map(Relation::schema).unwrap();
     engine.close();
 
     // A 2-set relayed to 4, so the 4-set carries layout sequence 1.
@@ -891,7 +892,7 @@ fn a_partial_target_at_the_launched_count_is_not_current() {
     // Tear two ranks out of it and put a fresh 2-set (sequence 0) back beside
     // it: the torn 4-set now outranks the complete 2-set on sequence alone.
     for k in 2..4 {
-        gnitz_store::storage::remove_child(&child_path(&rel, k, 4));
+        fs::remove_dir_all(child_path(&rel, k, 4)).ok();
     }
     seed_replicated_set(&rel, 2, schema, rt, &rows);
 
@@ -905,39 +906,6 @@ fn a_partial_target_at_the_launched_count_is_not_current() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A relayout's output is already what a guard-partitioned level requires —
-/// globally ascending, non-overlapping, consolidated, one guard key per shard —
-/// so it registers at the terminal level. At L0 it would instead sit as a run
-/// nothing compacts until the next spill, whose single fold would then mint an
-/// `l0_run_bytes` the size of the whole child: a running max that never decays,
-/// leaving the store one guard for the rest of its life.
-#[test]
-fn a_relayout_registers_its_shards_at_the_terminal_level() {
-    let dir = temp_dir("repartition_terminal_level");
-    let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
-    let mut engine = CatalogEngine::open(&dir, 1).unwrap();
-    let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
-    engine.close();
-
-    let rows: Vec<(u128, i64)> = (0..400u128).map(|id| (id, id as i64)).collect();
-    seed_child_set(&rel, 1, schema, tid, &rows);
-
-    let engine = CatalogEngine::open(&dir, 2).unwrap();
-    assert_eq!(set_rows(&rel, 2, schema, tid), expected_placement(&schema, &rows, 2));
-    for k in 0..2 {
-        let t = open_child(&rel, k, 2, schema, tid);
-        let (shards, _) = t.pk_filter_census();
-        assert!(shards > 0, "child {k} holds no shard");
-        // Levels are 0-based in memory, so the relayout's output is the last:
-        // nothing in L0 or L1, one terminal guard per shard.
-        assert_eq!(t.level_shape(), (0, [0, shards]), "child {k}: terminal placement");
-    }
-    drop(engine);
-    let _ = fs::remove_dir_all(&dir);
-}
-
 /// Rebooting at the same count moves no data: the live set is already at the
 /// launched count, so no shard is rewritten.
 #[test]
@@ -946,8 +914,8 @@ fn repartition_is_not_run_on_an_unchanged_restart() {
     let cols = vec![col_def("id", type_code::U64), col_def("x", type_code::I64)];
     let mut engine = CatalogEngine::open(&dir, 2).unwrap();
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let rel = engine.registry().table_entry(tid).unwrap().directory.clone();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
+    let rel = engine.registry().relation_or_err(tid).unwrap().directory().to_string();
+    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
     engine.close();
 
     seed_child_set(

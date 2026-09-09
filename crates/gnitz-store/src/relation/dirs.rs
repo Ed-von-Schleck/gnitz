@@ -8,7 +8,7 @@
 
 use std::fs;
 
-use super::{RelationKind, RelationRegistry, TableEntry};
+use super::{Relation, RelationKind, RelationRegistry};
 use crate::storage::{subdir_names, ChildAddr, StoreError};
 
 /// `<base_dir>/LOCK` — the file whose `flock` makes a data directory
@@ -114,14 +114,39 @@ pub fn lock_data_dir(base_dir: &str, retry: std::time::Duration) -> Result<fs::F
 }
 
 impl RelationRegistry {
+    /// `<owner's directory>/idx_<index_id>` — the one name this registry gives an
+    /// index's directory. `None` for an unregistered owner.
+    ///
+    /// By id and not by column list, because the directory is named before the
+    /// index it belongs to is entered — and because a promoted index outlives the
+    /// row that named it, so only the *creating* id spells the path on disk.
+    pub fn index_dir(&self, owner: i64, index_id: i64) -> Option<String> {
+        self.relation(owner)
+            .map(|e| ChildAddr::Index { id: index_id }.dir(e.directory()))
+    }
+
+    /// Drop `id`'s entry and erase this process's store directory for it. Its own
+    /// child goes through [`remove_child`](crate::storage) first, so a crash
+    /// mid-removal leaves no manifest whose shards are gone.
+    pub fn unregister_and_erase(&mut self, id: i64) {
+        let Some(dir) = self.relation(id).map(|e| e.directory().to_string()) else {
+            return;
+        };
+        self.unregister(id);
+        crate::storage::remove_child(&ChildAddr::worker(self.slot).dir(&dir));
+        if let Err(e) = fs::remove_dir_all(&dir) {
+            gnitz_debug!("relation: failed to erase relation dir {}: {}", dir, e);
+        }
+    }
+
     /// Remove every relation directory under `schema_dirs` that no registered
     /// relation owns, and every `idx_<id>` child of a live relation that no
     /// registered index owns. Only `<tag>_<digits>` names are eligible.
     /// Best-effort: a failure to remove one orphan is logged and never aborts
     /// the caller.
     pub fn reclaim_orphan_relation_dirs(&self, schema_dirs: impl IntoIterator<Item = String>) {
-        let live: rustc_hash::FxHashMap<&str, &TableEntry> =
-            self.entries().map(|(_, e)| (e.directory.as_str(), e)).collect();
+        self.assert_origin("reclaim_orphan_relation_dirs");
+        let live: rustc_hash::FxHashMap<&str, &Relation> = self.relations().map(|e| (e.directory(), e)).collect();
 
         for schema_dir in schema_dirs {
             for name in subdir_names(&schema_dir) {
@@ -136,7 +161,7 @@ impl RelationRegistry {
                         let Some(ChildAddr::Index { id }) = ChildAddr::parse(&idx_name) else {
                             continue;
                         };
-                        if entry.index_circuits.iter().any(|ic| ic.index_id == id) {
+                        if entry.indexes().iter().any(|ix| ix.id() == id) {
                             // Its per-worker children are `reconcile_child_dirs`'
                             // job — the sweep descends into an index dir.
                             continue;

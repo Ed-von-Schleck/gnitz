@@ -331,7 +331,7 @@ fn layout_lifecycle_default_raise_and_lower() {
     assert_eq!(b.layout(), Layout::Raw, "extend_* never raises the layout");
 
     // Genuinely (PK, payload)-sorted, ghost-free → certify Consolidated.
-    b.certify_layout(Layout::Consolidated, &schema);
+    b.certify_layout(Layout::Consolidated);
     assert!(b.is_consolidated());
 
     // Any append downgrades all the way to Raw (the W2M-class fail-safe).
@@ -547,7 +547,7 @@ fn widened_with_null_tail_carries_the_blob() {
         ],
         &[0],
     );
-    let out = b.widened_with_null_tail(&in_schema, &out_schema);
+    let out = b.widened_with_null_tail(&out_schema);
 
     assert_eq!(out.count, 1);
     assert!(!out.blob.is_empty(), "output blob must be propagated");

@@ -6,8 +6,9 @@
 
 use gnitz_store::expr::MapPlan;
 use gnitz_store::ops;
+use gnitz_store::relation::{CircuitState, StateIdx};
 use gnitz_store::schema::SchemaDescriptor;
-use gnitz_store::storage::{Batch, ReadCursor, Table};
+use gnitz_store::storage::{Batch, ReadCursor};
 
 mod builder;
 mod exec;
@@ -39,8 +40,6 @@ macro_rules! operand_idx {
 }
 
 operand_idx! {
-    /// Index into `VmHandle::tables`.
-    TableIdx;
     /// Index into `Program::predicates`.
     PredIdx;
     /// Index into `Program::maps`.
@@ -76,8 +75,8 @@ impl From<TraceReg> for u16 {
 }
 
 /// One VM instruction with all operator-specific data pre-resolved. No variant
-/// names a `TableIdx`: a table is reached through the register that owns it
-/// ([`Program::trace_table_idx`]).
+/// names a [`StateIdx`]: a child store is reached through the register that owns
+/// it ([`Program::trace_table_idx`]).
 pub(in crate::query) enum Instr {
     Filter {
         in_reg: DeltaReg,
@@ -224,16 +223,15 @@ pub(in crate::query) fn writes_state_during_replay(instr: &Instr) -> bool {
 pub(in crate::query) struct VmHandle {
     pub(in crate::query) program: Program,
     pub(in crate::query) regfile: RegisterFile,
-    /// Child tables created during compilation (integrate, history, reduce, AVI),
-    /// in the index space `TableIdx` names. Mutable state, so it lives here and
-    /// not on the immutable `Program`: the dispatch destructures the handle and
-    /// holds `&Program` and `&mut [Table]` as the disjoint borrows they are.
-    pub(in crate::query) tables: Vec<Table>,
+    /// The child stores created during compilation, in the index space
+    /// [`StateIdx`] names. Here and not on the immutable `Program` so the
+    /// dispatch can hold `&Program` and `&mut CircuitState` at once.
+    pub(in crate::query) state: CircuitState,
     /// `(reg_id, backing table)` for every trace register, derived once from
     /// `program.reg_meta` so the per-epoch cursor bind walks only the trace
     /// registers instead of the whole register file — whose stride is a
     /// `RegisterMeta`, i.e. a whole `SchemaDescriptor`.
-    trace_regs: Vec<(TraceReg, TableIdx)>,
+    trace_regs: Vec<(TraceReg, StateIdx)>,
     /// The program carries a global-ground `Reduce` this worker owns whose ground
     /// row has not been minted yet — the one reason an empty epoch is worth
     /// dispatching.
@@ -246,30 +244,14 @@ pub(in crate::query) struct VmHandle {
 unsafe impl Send for VmHandle {}
 
 impl VmHandle {
-    /// The table at `idx`, for a caller that only reads it (a cursor open).
-    pub(in crate::query) fn table(&self, idx: TableIdx) -> &Table {
-        &self.tables[idx.at()]
-    }
-
-    /// Compact every owned trace table, keeping its L0 fan-in bounded — there is
-    /// no background compactor. The epoch path's job, not a read's: a compaction
-    /// mutates shard state. An `Err` leaves the shard index unchanged, so a
-    /// cursor opened afterwards still sees a consistent snapshot.
-    fn compact_owned_traces(&mut self) {
-        let VmHandle { tables, trace_regs, .. } = self;
-        for &(_reg, idx) in trace_regs.iter() {
-            let _ = tables[idx.at()].compact_if_needed();
-        }
-    }
-
-    /// Open a fresh cursor on every trace register's backing table. Eager rather
+    /// Open a fresh cursor on every trace register's backing store. Eager rather
     /// than per-instruction, so an operator sees `z⁻¹(I(X))` — the integral
     /// before this tick's delta — by construction.
     fn bind_trace_cursors(&mut self) {
         gnitz_debug!("vm: bind_trace_cursors, {} trace regs", self.trace_regs.len());
-        let VmHandle { regfile, tables, trace_regs, .. } = self;
+        let VmHandle { regfile, state, trace_regs, .. } = self;
         for &(reg_id, table_idx) in trace_regs.iter() {
-            let cursor = tables[table_idx.at()].open_cursor();
+            let cursor = state.cursor(table_idx);
             match &mut regfile.cursors[reg_id.at()] {
                 Some(held) => **held = cursor,
                 slot => *slot = Some(Box::new(cursor)),
@@ -306,14 +288,14 @@ pub(in crate::query) struct RegisterMeta {
     /// table here rather than in a side list is what lets `bind_trace_cursors`
     /// guarantee every trace register holds a live cursor at dispatch, and what
     /// keeps an instruction from naming a table its register disagrees with.
-    pub(in crate::query) owned_table: Option<TableIdx>,
+    pub(in crate::query) owned_table: Option<StateIdx>,
 }
 
 impl RegisterMeta {
     pub(super) const fn delta(schema: SchemaDescriptor) -> Self {
         Self { schema, owned_table: None }
     }
-    pub(super) const fn trace(schema: SchemaDescriptor, owned_table: TableIdx) -> Self {
+    pub(super) const fn trace(schema: SchemaDescriptor, owned_table: StateIdx) -> Self {
         Self { schema, owned_table: Some(owned_table) }
     }
 }
@@ -323,18 +305,18 @@ impl RegisterMeta {
 /// "the plan carries a bake" against "the instruction names a table".
 pub(in crate::query) struct BakedReduce {
     pub(in crate::query) plan: gnitz_store::ops::ReducePlan,
-    pub(in crate::query) avi_table: Option<TableIdx>,
+    pub(in crate::query) avi_table: Option<StateIdx>,
 }
 
 /// One `Instr::TopN`'s baked operator data: the plan and the table its ordered
 /// index lives in.
 pub(in crate::query) struct BakedTopN {
     pub(in crate::query) plan: gnitz_store::ops::TopNPlan,
-    pub(in crate::query) index_table: TableIdx,
+    pub(in crate::query) index_table: StateIdx,
 }
 
 /// A compiled DBSP program: immutable once built, owning every resource its
-/// instructions name except the mutable tables ([`VmHandle`]) — each in the index
+/// instructions name except the mutable child stores ([`VmHandle`]) — each in the index
 /// space its own operand is a position in, so nothing is numbered twice.
 pub(in crate::query) struct Program {
     pub(in crate::query) instructions: Vec<Instr>,
@@ -384,7 +366,7 @@ impl Program {
     /// The table backing trace register `reg` — how a state-writing instruction
     /// reaches the table it writes, having named only the register that owns it.
     /// A [`TraceReg`] proves the kind, not that it indexes *this* program.
-    pub(in crate::query) fn trace_table_idx(&self, reg: TraceReg) -> TableIdx {
+    pub(in crate::query) fn trace_table_idx(&self, reg: TraceReg) -> StateIdx {
         self.reg_meta[reg.at()]
             .owned_table
             .expect("a state-writing instruction names a register `push_trace_reg` allocated")

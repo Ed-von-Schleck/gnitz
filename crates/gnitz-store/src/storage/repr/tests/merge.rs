@@ -881,7 +881,7 @@ mod merge_materialize_vs_reference {
             b.extend_col(2, &ic);
             b.count += 1;
         }
-        b.certify_layout(Layout::Consolidated, schema);
+        b.certify_layout(Layout::Consolidated);
         b
     }
 

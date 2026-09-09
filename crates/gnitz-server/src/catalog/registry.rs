@@ -40,9 +40,7 @@ impl CatalogEngine {
     fn open_column_band(&self, owner_id: i64) -> ReadCursor {
         let (start_pk, end_pk) = column_id_band(owner_id);
         let (start, end) = (start_pk.to_be_bytes(), end_pk.to_be_bytes());
-        let mut cursor = self
-            .sys_store(SysFamily::Column)
-            .open_cursor_in_range(&start, Some(&end));
+        let mut cursor = self.sys_relation(SysFamily::Column).cursor_in_range(&start, Some(&end));
         cursor.seek_range_bytes(&start, Some(&end));
         cursor
     }
@@ -136,7 +134,7 @@ impl CatalogEngine {
     // caller can take an id without the advance. A create that later fails
     // burns the id — harmless, since recovery maxes over positive rows and gaps
     // are fine.
-    pub(crate) fn allocate_schema_id(&mut self) -> Result<i64, StorageError> {
+    pub(crate) fn allocate_schema_id(&mut self) -> Result<i64, StoreError> {
         let sid = self.next_schema_id;
         self.next_schema_id += 1;
         self.advance_sequence(SEQ_ID_SCHEMAS, sid)?;
@@ -214,9 +212,9 @@ impl CatalogEngine {
     /// reissue whatever this call allocated. The caller must not go on to use it:
     /// every allocator above propagates, and the id it burned is harmless because
     /// recovery maxes over the live rows and gaps are fine.
-    pub(in crate::catalog) fn advance_sequence(&mut self, seq_id: i64, new_val: i64) -> Result<(), StorageError> {
+    pub(in crate::catalog) fn advance_sequence(&mut self, seq_id: i64, new_val: i64) -> Result<(), StoreError> {
         let batch = self.build_seq_delta(seq_id, new_val);
-        self.sys_store_mut(SysFamily::Sequence).ingest_owned_batch(batch)
+        self.registry.ingest(SysFamily::Sequence.id(), batch)
     }
 
     /// Reserve `count` ids for a user-table SERIAL sequence. Returns
@@ -245,7 +243,7 @@ impl CatalogEngine {
         let new_hw = hw.saturating_add(count);
         let delta = self.build_seq_delta(seq_id, new_hw);
         self.user_sequences.insert(seq_id, new_hw);
-        (hw + 1, delta, self.sys_store(SysFamily::Sequence).current_lsn())
+        (hw + 1, delta, self.sys_relation(SysFamily::Sequence).current_lsn())
     }
 
     /// Fold an observed `sys_sequences` high-water into `user_sequences`,
@@ -321,7 +319,7 @@ impl CatalogEngine {
     /// (returns it for the durable commit).
     fn build_seq_delta(&self, seq_id: i64, new_val: i64) -> Batch {
         let schema = SysFamily::Sequence.schema();
-        let mut batch = retract_pk_list(self.sys_store(SysFamily::Sequence), schema, vec![seq_id as u128]);
+        let mut batch = retract_pk_list(self.sys_relation(SysFamily::Sequence), vec![seq_id as u128]);
         let mut bb = BatchBuilder::new(*schema);
         bb.begin_row(seq_id as u128, 1);
         bb.put_u64(new_val as u64);
@@ -336,7 +334,7 @@ impl CatalogEngine {
     /// holds the current value, so the write is skipped. Does not flush — the
     /// server's caller (`boot_checkpoint`) bumps the checkpoint generation right
     /// after, and that flush carries this row to the same shard.
-    pub(crate) fn record_topology(&mut self, worker_count: u32) -> Result<(), StorageError> {
+    pub(crate) fn record_topology(&mut self, worker_count: u32) -> Result<(), StoreError> {
         let value = gnitz_store::relation::topology_word(worker_count);
         if self.registry.recorded_topology() == value {
             return Ok(());

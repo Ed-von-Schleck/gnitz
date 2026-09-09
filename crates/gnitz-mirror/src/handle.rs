@@ -7,9 +7,10 @@ use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Sc
 use gnitz_foundation::env::env_num;
 use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::{
-    lock_data_dir, relation_dir, RelationKind, RelationRegistry, RelationSpec, StoreConfig, ViewBudgets,
+    lock_data_dir, relation_dir, OnRegister, Relation, RelationKind, RelationRegistry, RelationSpec, StoreConfig,
+    ViewBudgets,
 };
-use gnitz_store::storage::{remove_child, ChildAddr, Slot, StoreError, DEFAULT_RAM_TIER_BYTES};
+use gnitz_store::storage::{Slot, StoreError};
 
 use crate::state::{encode_records, read_state, write_state, MirrorRecord};
 
@@ -95,16 +96,17 @@ impl Mirror {
 
         // The mirror's own knobs, read by this entry point and not by a store
         // constructor: it honours none of the server's tuning variables.
+        let defaults = StoreConfig::default();
         let config = StoreConfig {
-            ram_tier_bytes: env_num("GNITZ_MIRROR_RAM_TIER_BYTES", DEFAULT_RAM_TIER_BYTES),
-            ..Default::default()
+            ram_tier_bytes: env_num("GNITZ_MIRROR_RAM_TIER_BYTES", defaults.ram_tier_bytes),
+            ..defaults
         };
         let state = read_state(base_dir);
         let mut registry = RelationRegistry::new(Slot::SOLO, config);
         // A copy is Z-set rows in the view's own schema with no operator state,
         // opened at one worker: neither axis of the topology verdict can move
         // under it, so the generation alone decides a resume.
-        registry.set_recorded_topology(registry.launched_topology_word());
+        registry.set_recorded_topology(registry.launched_topology());
         if let Some(s) = &state {
             registry.set_resume_generation(s.generation);
         }
@@ -134,7 +136,7 @@ impl Mirror {
             // A cursor naming a copy that did not come back is dropped, which
             // makes its view bootstrap.
             for (tid, r) in &mut mirror.records {
-                if !mirror.registry.store_resumed(*tid as i64) {
+                if !mirror.registry.relation(*tid as i64).is_some_and(Relation::resumed) {
                     r.cursor = None;
                 }
             }
@@ -155,17 +157,21 @@ impl Mirror {
         let schema = gnitz_store::schema::decode_schema_block(&rec.block, false)
             .map_err(|e| MirrorError::Engine(format!("mirror: schema block: {e}")))?;
         self.registry
-            .register(RelationSpec {
-                id: tid as i64,
-                // `View` is what maps to `Rederive`: the ephemeral round is the
-                // only one that publishes a copy, and the only round a mirror runs.
-                kind: RelationKind::View,
-                schema,
-                directory: relation_dir(&self.base_dir, COPIES_DIRNAME, RelationKind::View, tid as i64),
-                // No skeleton row is ever written, so nothing can ask this store
-                // to hydrate; and the store maintains no feed of its own.
-                budgets: ViewBudgets::default(),
-            })
+            .register(
+                RelationSpec {
+                    id: tid as i64,
+                    // `View` is what maps to `Rederive`: the ephemeral round is
+                    // the only one that publishes a copy, and the only round a
+                    // mirror runs.
+                    kind: RelationKind::View,
+                    schema,
+                    directory: relation_dir(&self.base_dir, COPIES_DIRNAME, RelationKind::View, tid as i64),
+                    // No skeleton row is ever written, so nothing can ask this
+                    // store to hydrate; and the store maintains no feed of its own.
+                    budgets: ViewBudgets::default(),
+                },
+                OnRegister::Live,
+            )
             .map_err(engine)?;
         self.records.insert(tid, rec);
         Ok(())
@@ -175,14 +181,9 @@ impl Mirror {
     /// store does not hold is a no-op.
     pub(crate) fn retract(&mut self, tid: u64) {
         self.records.remove(&tid);
-        let Some(dir) = self.registry.entry(tid as i64).map(|e| e.directory.clone()) else {
-            return;
-        };
-        self.registry.unregister(tid as i64);
         // The state file still names this id until the next checkpoint, so the
-        // child goes manifest-first.
-        remove_child(&ChildAddr::worker(self.registry.slot()).dir(&dir));
-        let _ = std::fs::remove_dir_all(&dir);
+        // registry's erase takes the child manifest-first.
+        self.registry.unregister_and_erase(tid as i64);
     }
 
     // -- Poison ------------------------------------------------------------
@@ -250,7 +251,7 @@ impl Mirror {
         }
         let generation = self.registry.resume_generation() + 1;
         self.registry.set_resume_generation(generation);
-        self.registry.flush_ephemeral_outputs(generation).map_err(engine)?;
+        self.registry.checkpoint_ephemeral(generation, []).map_err(engine)?;
         write_state(&self.base_dir, generation, &block)?;
         self.published_block = block;
         self.applied_bytes = 0;
@@ -279,7 +280,7 @@ impl Mirror {
                 // shards rather than reloading them, then rebuilds the handle
                 // empty. It is exactly the state transition a bootstrap needs.
                 self.registry
-                    .reset_store(tid as i64)
+                    .reset_view(tid as i64)
                     .map_err(|e| self.poison(format!("erasing the copy of {tid} failed: {e}")))?;
                 if BOOTSTRAP_ERROR.take_once() {
                     return Err(MirrorError::Engine("injected bootstrap failure".to_string()));

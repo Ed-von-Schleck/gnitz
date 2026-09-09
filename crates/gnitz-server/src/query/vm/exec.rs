@@ -8,36 +8,21 @@ use gnitz_store::storage::{Batch, ReadCursor, StorageError};
 // Execution
 // ---------------------------------------------------------------------------
 
-/// Storage failure while integrating a tick's delta into an owned table: the
+/// Storage failure while integrating a tick's delta into a child store: the
 /// view/history state has diverged from its durable inputs and there is no
 /// sound continue (dropping the delta permanently desyncs the integral). The
 /// error is returned so the process that owns the recovery decision makes it —
 /// for a server, restart + SAL replay. This only logs; every call site applies
 /// `?` to what it hands back.
-fn log_tick_ingest_err(op: &str, table_idx: TableIdx, r: Result<(), StorageError>) -> Result<(), StorageError> {
-    r.inspect_err(|e| {
-        gnitz_error!(
-            "vm: {} ingest failed (table_idx={}): {} — tick state diverged \
-             from durable inputs",
-            op,
-            table_idx.0,
-            e,
-        );
-    })
-}
-
-/// A cursor over an operator's own index right after this epoch's rows went in:
-/// opened last, so a prefix seek sees them; compacted first, as
-/// `compact_owned_traces` does before any other operator-state read.
-fn index_cursor(
-    op: &str,
-    idx: TableIdx,
-    table: &mut Table,
-    res: Result<(), StorageError>,
-) -> Result<ReadCursor, StorageError> {
-    log_tick_ingest_err(op, idx, res)?;
-    let _ = table.compact_if_needed();
-    Ok(table.open_cursor())
+fn tick_ingest_err(op: &str, idx: StateIdx, e: StorageError) -> StorageError {
+    gnitz_error!(
+        "vm: {} ingest failed (state_idx={:?}): {} — tick state diverged \
+         from durable inputs",
+        op,
+        idx,
+        e,
+    );
+    e
 }
 
 /// Execute one epoch over `inputs`, one `(register, batch)` per seeded input —
@@ -57,7 +42,7 @@ pub(in crate::query) fn execute_epoch_multi(
     if all_empty && !std::mem::take(&mut vm.pending_ground_row) {
         return Ok(None);
     }
-    vm.compact_owned_traces();
+    vm.state.compact_all();
     vm.bind_trace_cursors();
     dispatch(vm, 0, IntegrateMode::Write)
 }
@@ -71,8 +56,8 @@ pub(in crate::query) struct Replay<'a> {
 }
 
 impl<'a> Replay<'a> {
-    /// Cursors only — no `compact_owned_traces`, because a read must not mutate
-    /// shard state.
+    /// Cursors only — no `CircuitState::compact_all`, because a read must not
+    /// mutate shard state.
     pub(in crate::query) fn start(vm: &'a mut VmHandle, start_pc: usize) -> Self {
         vm.bind_trace_cursors();
         Replay { vm, start_pc }
@@ -110,7 +95,7 @@ fn seed_inputs(vm: &mut VmHandle, inputs: impl IntoIterator<Item = (DeltaReg, Ba
         // schema (a dep_map view with no matching rows), so it is exempt.
         if !input_batch.is_empty() {
             assert_eq!(
-                input_batch.schema.num_columns(),
+                input_batch.schema().num_columns(),
                 vm.program.schema_of(input_reg).num_columns(),
                 "VM register {} schema/batch column-count mismatch",
                 input_reg.0,
@@ -140,7 +125,7 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
     // Destructured because the three are disjoint fields: that is what lets an
     // operator hold a batch and a cursor (or a table) at once, with no interior
     // mutability and no raw pointer.
-    let VmHandle { program, regfile, tables, .. } = vm;
+    let VmHandle { program, regfile, state, .. } = vm;
     let RegisterFile { batches, cursors } = regfile;
     let last_read = &program.last_read[..];
 
@@ -209,8 +194,9 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
                 batches[out_reg.at()] = output;
                 // Ingest consolidated delta into history table
                 let hist_table = program.trace_table_idx(*hist_reg);
-                let res = tables[hist_table.at()].ingest_owned_batch(consolidated);
-                log_tick_ingest_err("weight-clamp history", hist_table, res)?;
+                state
+                    .ingest_owned(hist_table, consolidated)
+                    .map_err(|e| tick_ingest_err("weight-clamp history", hist_table, e))?;
             }
 
             Instr::JoinDT { delta_reg, trace_reg, out_reg, probe } => {
@@ -229,15 +215,13 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
             }
 
             Instr::WorkerFilter { in_reg, out_reg, worker_id, num_workers } => {
-                let schema = program.schema_of(*in_reg);
-                let result = ops::op_worker_filter(&batches[in_reg.at()], schema, *worker_id, *num_workers);
+                let result = ops::op_worker_filter(&batches[in_reg.at()], *worker_id, *num_workers);
                 batches[out_reg.at()] = result;
             }
 
             Instr::NullExtend { in_reg, out_reg } => {
-                let in_schema = program.schema_of(*in_reg);
                 let out_schema = program.schema_of(*out_reg);
-                let result = batches[in_reg.at()].widened_with_null_tail(in_schema, out_schema);
+                let result = batches[in_reg.at()].widened_with_null_tail(out_schema);
                 batches[out_reg.at()] = result;
             }
 
@@ -251,10 +235,10 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
                 // Not `take_or_clone`: for a `Raw` register its clone arm would cost
                 // a clone plus the trace's own consolidate, where moving costs one.
                 let res = match last_read[in_reg.at()] == pc as u32 {
-                    true => tables[trace_table.at()].ingest_owned_batch(batches[in_reg.at()].take()),
-                    false => tables[trace_table.at()].ingest_borrowed_batch(&batches[in_reg.at()]),
+                    true => state.ingest_owned(trace_table, batches[in_reg.at()].take()),
+                    false => state.ingest_borrowed(trace_table, &batches[in_reg.at()]),
                 };
-                log_tick_ingest_err("integrate", trace_table, res)?;
+                res.map_err(|e| tick_ingest_err("integrate", trace_table, e))?;
             }
 
             Instr::Reduce { in_reg, trace_out_reg, out_reg, plan_idx } => {
@@ -262,11 +246,11 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
                 let to_cursor = bound_cursor(cursors, *trace_out_reg);
 
                 let mut avi_cursor = match baked.avi_table.zip(baked.plan.avi.as_ref()) {
-                    Some((idx, bake)) => {
-                        let table = &mut tables[idx.at()];
-                        let res = ops::op_populate_avi(&batches[in_reg.at()], table, bake);
-                        Some(index_cursor("avi", idx, table, res)?)
-                    }
+                    Some((idx, bake)) => Some(
+                        state
+                            .ingest_then_cursor(idx, ops::avi_batch(&batches[in_reg.at()], bake))
+                            .map_err(|e| tick_ingest_err("avi", idx, e))?,
+                    ),
                     None => None,
                 };
 
@@ -292,9 +276,9 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
                 } else {
                     let to_cursor = bound_cursor(cursors, *trace_out_reg);
                     let idx = baked.index_table;
-                    let table = &mut tables[idx.at()];
-                    let res = ops::op_populate_topn(&batches[in_reg.at()], table, &baked.plan.index);
-                    let mut history = index_cursor("topn index", idx, table, res)?;
+                    let mut history = state
+                        .ingest_then_cursor(idx, baked.plan.index.batch(&batches[in_reg.at()]))
+                        .map_err(|e| tick_ingest_err("topn index", idx, e))?;
                     ops::op_topn(&batches[in_reg.at()], to_cursor, &mut history, &baked.plan)
                 };
             }
@@ -325,7 +309,7 @@ fn dispatch(vm: &mut VmHandle, start_pc: usize, integrate: IntegrateMode) -> Res
         // physical layout means the batch was built against another schema
         // entirely, which the stamp would hide from the wire encode.
         debug_assert!(
-            batch.schema.same_physical_layout(&want),
+            batch.schema().same_physical_layout(&want),
             "VM output register {}: batch label is not the register's physical layout",
             program.out_reg.0,
         );

@@ -42,7 +42,7 @@ fn batch(schema: &SchemaDescriptor, keys: &[i128; 8], rows: Rows) -> Batch {
     let pks: Vec<Vec<u8>> = rows.iter().map(|&(i, ..)| key_of(schema, keys, i)).collect();
     let opk: Vec<(&[u8], i64, i64)> = pks.iter().zip(rows).map(|(k, &(_, w, v))| (&k[..], w, v)).collect();
     let mut b = make_batch_opk(schema, &opk);
-    b.certify_layout(Layout::Consolidated, schema);
+    b.certify_layout(Layout::Consolidated);
     b
 }
 

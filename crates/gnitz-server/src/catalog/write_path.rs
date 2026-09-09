@@ -79,18 +79,10 @@ impl CatalogEngine {
 
     // -- System table accessors ------------------------------------------------
 
-    /// This family's store, from the registry that owns it.
-    pub(in crate::catalog) fn sys_store(&self, family: SysFamily) -> &Table {
+    /// This family's relation, from the registry that owns it.
+    pub(in crate::catalog) fn sys_relation(&self, family: SysFamily) -> &Relation {
         self.registry
-            .entry(family.id())
-            .and_then(|e| e.owned_store())
-            .expect("every system family is registered at open")
-    }
-
-    pub(in crate::catalog) fn sys_store_mut(&mut self, family: SysFamily) -> &mut Table {
-        self.registry
-            .entry_mut(family.id())
-            .and_then(|e| e.owned_store_mut())
+            .relation(family.id())
             .expect("every system family is registered at open")
     }
 
@@ -110,16 +102,12 @@ impl CatalogEngine {
         pin_lsn: Option<NonZeroU64>,
     ) -> Result<(), String> {
         let id = family.id();
-        let table = self.sys_store_mut(family);
         // Live DDL's one sound non-fatal exit: a failure here is pre-broadcast
         // (nothing durable, nothing broadcast, client not ACKed), so Stage-A
         // compensation can unwind it. Propagate rather than abort.
-        table
-            .ingest_borrowed_batch(batch)
+        self.registry
+            .ingest_borrowed(id, batch, pin_lsn)
             .map_err(|e| format!("apply_local: sys-table ingest failed (family={id}): {e}"))?;
-        if let Some(lsn) = pin_lsn {
-            table.pin_lsn(lsn);
-        }
         batch.set_schema(family.schema());
         self.fire_hooks(family, batch)
     }
@@ -345,9 +333,8 @@ impl CatalogEngine {
                 // range), so each subset keeps the source's sorted/consolidated
                 // tag — which the sign-preserving `map_weights` negation below
                 // leaves in place.
-                let schema = family.schema();
-                undo_create.push((family, batch.ascending_subset(&created, schema)));
-                undo_drop.push((family, batch.ascending_subset(&dropped, schema)));
+                undo_create.push((family, batch.ascending_subset(&created)));
+                undo_drop.push((family, batch.ascending_subset(&dropped)));
             }
         }
 

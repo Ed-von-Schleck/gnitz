@@ -2,7 +2,7 @@
 //! reclamation, invalid-view reset — and the flushed-LSN bookkeeping that
 //! recovery and the DDL zone allocator read.
 
-use super::{RelationKind, RelationRegistry, RelationStores, StoreHandle};
+use super::{RelationKind, RelationRegistry, Residency, Store};
 use crate::storage::{reclaim_retired_children, remove_child, subdir_names, ChildAddr, Slot, StoreError, Table};
 
 impl RelationRegistry {
@@ -11,32 +11,39 @@ impl RelationRegistry {
     /// Detach every user relation's store (master after fork), so master and
     /// worker 0 do not both hold a live `Table` on `w0of{W}`: two processes
     /// writing one directory is the hazard `naming.rs` exists to prevent. The
-    /// system families are single-partition and are the catalog the master goes
-    /// on serving from, so they are excluded — by kind, which is what says so.
-    pub fn detach_user_stores(&mut self) {
-        self.owns_stores = false;
+    /// system families are excluded because the master goes on serving the
+    /// catalog out of them after the fork.
+    ///
+    /// The fork's two exits from [`Residency::Origin`], this and
+    /// [`Self::rehome`], are mutually exclusive and each runs once, so both
+    /// assert the residency they leave rather than trusting the caller.
+    pub fn detach(&mut self) {
+        assert!(
+            self.residency == Residency::Origin,
+            "detach runs once per process, on a process that still owns its stores",
+        );
+        self.residency = Residency::Detached;
         for entry in self.tables.values_mut() {
-            if entry.kind == RelationKind::SystemCatalog {
+            if entry.kind() == RelationKind::SystemCatalog {
                 continue;
             }
-            // The delta store and every index circuit go with it: two live
-            // `Table`s on one directory is the hazard this pass exists to prevent.
-            entry.set_stores(RelationStores::elsewhere());
-            for ic in &mut entry.index_circuits {
-                ic.handle = StoreHandle::Elsewhere;
+            // The delta store and every index go with it: two live `Table`s on
+            // one directory is the hazard this pass exists to prevent.
+            let schema = entry.schema();
+            entry.set_stores((Store::detached(schema), None));
+            for ix in &mut entry.indexes {
+                ix.store = Store::detached(ix.store.schema());
             }
         }
     }
 
-    /// Panic unless this is the pre-fork master. Both boot passes below reach
-    /// across the whole cluster — one reclaims every relation's retired children,
-    /// the other peeks every launched rank's manifest — which only that one
-    /// process may do: the workers do not exist yet and the post-fork master owns
-    /// no store to speak for them.
-    pub fn assert_pre_fork(&self, who: &str) {
+    /// Panic unless this process is [`Residency::Origin`] — the only one that may
+    /// read or delete across ranks, because the workers do not exist yet and the
+    /// post-fork master owns no store to speak for them.
+    pub(crate) fn assert_origin(&self, who: &str) {
         assert!(
-            self.owns_stores && !self.rehomed,
-            "{who} must run pre-fork on the master, which still owns its stores",
+            self.residency == Residency::Origin,
+            "{who} must run at Residency::Origin, on a process that still owns its stores",
         );
     }
 
@@ -49,18 +56,22 @@ impl RelationRegistry {
     /// One test for all of them: every store of a non-system relation opens
     /// under `ChildAddr::worker` of the registry's slot.
     pub fn rehome(&mut self, slot: Slot) -> Result<(), StoreError> {
-        assert!(!self.rehomed, "rehome runs once per process");
+        assert!(
+            self.residency == Residency::Origin,
+            "rehome runs once per process, on a process that still owns its stores",
+        );
         let previous = std::mem::replace(&mut self.slot, slot);
-        self.rehomed = true;
+        self.residency = Residency::Worker;
         if previous == slot {
             return Ok(());
         }
         let tids: Vec<i64> = self
             .tables
             .iter()
-            // A system family is single-partition — its store is flat, never at
-            // a `w{k}of{n}` child — so it is homed nowhere and stays put.
-            .filter(|(_, e)| e.kind != RelationKind::SystemCatalog && e.handle.as_owned().is_some())
+            // A system family's store is flat, so it is homed nowhere and stays
+            // put — and re-opening one would put two live `Table`s on its
+            // directory, since the rebuild opens before it drops the old store.
+            .filter(|(_, e)| e.kind() != RelationKind::SystemCatalog && e.store.table().is_some())
             .map(|(&tid, _)| tid)
             .collect();
         for tid in tids {
@@ -68,22 +79,26 @@ impl RelationRegistry {
         }
         let (recovery, budgets) = (self.rederive_source(), self.store_budgets());
         for entry in self.tables.values_mut() {
-            if entry.kind == RelationKind::SystemCatalog {
+            if entry.kind() == RelationKind::SystemCatalog {
                 continue;
             }
-            let owner_dir = &entry.directory;
-            for ic in &mut entry.index_circuits {
-                if ic.handle.as_owned().is_none() {
+            let owner_dir = entry.directory().to_string();
+            for ix in &mut entry.indexes {
+                if ix.store.table().is_none() {
                     continue;
                 }
-                ic.handle = StoreHandle::owned(Self::open_index_table(
-                    slot,
-                    recovery,
-                    budgets,
-                    &ChildAddr::Index { id: ic.index_id }.dir(owner_dir),
-                    ic.index_id,
-                    ic.index_schema,
-                )?);
+                let (index_id, index_schema) = (ix.index_id, ix.store.schema());
+                ix.store = Store::owned(
+                    Self::open_index_table(
+                        slot,
+                        recovery,
+                        budgets,
+                        &ChildAddr::Index { id: index_id }.dir(&owner_dir),
+                        index_id,
+                        index_schema,
+                    )?,
+                    index_schema,
+                );
             }
         }
         Ok(())
@@ -99,7 +114,7 @@ impl RelationRegistry {
                 .tables
                 .get(&tid)
                 .ok_or_else(|| StoreError::rejected(format!("{what}: relation {tid} is not registered")))?;
-            (e.directory.clone(), e.schema, e.kind, e.budgets)
+            (e.directory().to_string(), e.schema(), e.kind(), e.budgets())
         };
         let stores = self
             .build_relation_store(kind, &dir, tid, schema, budgets)
@@ -116,15 +131,15 @@ impl RelationRegistry {
     /// `record_topology` leaves the recorded count unchanged, so a "the count
     /// changed" trigger would skip the repair on the retry.
     pub fn reconcile_child_dirs(&self) {
-        self.assert_pre_fork("reconcile_child_dirs");
+        self.assert_origin("reconcile_child_dirs");
         for entry in self.tables.values() {
             // System tables are single-partition `Table`s with no children.
-            if entry.kind == RelationKind::SystemCatalog {
+            if entry.kind() == RelationKind::SystemCatalog {
                 continue;
             }
             // A storeless relation's `directory` names a path that was never created;
             // `reclaim_retired_children` reads it as having no children and returns.
-            reclaim_retired_children(&entry.directory, self.slot.of);
+            reclaim_retired_children(entry.directory(), self.slot.of);
         }
     }
 
@@ -136,13 +151,13 @@ impl RelationRegistry {
     /// `None` and *erases* the stale shards — without which a transitively-invalid
     /// view whose own manifests are still at the resume generation would reload
     /// them.
-    pub fn reset_store(&mut self, vid: i64) -> Result<(), StoreError> {
+    pub fn reset_view(&mut self, vid: i64) -> Result<(), StoreError> {
         let entry = self
             .tables
             .get(&vid)
-            .ok_or_else(|| StoreError::rejected(format!("reset_store: relation {vid} is not registered")))?;
-        let dir = entry.directory.clone();
-        entry.handle.as_owned().map(Table::unlink_manifest);
+            .ok_or_else(|| StoreError::rejected(format!("reset_view: relation {vid} is not registered")))?;
+        let dir = entry.directory().to_string();
+        entry.store().table().map(Table::unlink_manifest);
 
         let rank = self.slot.rank;
 
@@ -161,6 +176,20 @@ impl RelationRegistry {
         Ok(())
     }
 
+    /// Whether every rederived child of `view_id`, on **every launched rank**,
+    /// carries a manifest at this registry's resume generation — the store half
+    /// of the resume verdict. It reads the operator scratch alongside the output
+    /// store, which is what rejects an output store one generation ahead of the
+    /// integral beneath it: the ephemeral round stamps every output store but
+    /// only a *compiled* view's traces. `false` for an id this registry does not
+    /// hold.
+    pub fn view_children_resumable(&self, view_id: i64) -> bool {
+        self.assert_origin("view_children_resumable");
+        self.relation(view_id).is_some_and(|e| {
+            crate::storage::children_at_generation(e.directory(), self.slot.of, self.resume_generation)
+        })
+    }
+
     /// Every registered relation's `(table id, kind, current_lsn)` — the one walk
     /// behind both the recovery dedup maps and the zone-allocator floor. The
     /// registry owns a system family's store exactly as it owns a user
@@ -168,7 +197,7 @@ impl RelationRegistry {
     fn all_store_lsns(&self) -> impl Iterator<Item = (i64, RelationKind, u64)> + '_ {
         self.tables
             .iter()
-            .map(|(&tid, entry)| (tid, entry.kind, entry.handle.current_lsn()))
+            .map(|(&tid, entry)| (tid, entry.kind(), entry.current_lsn()))
     }
 
     /// The system families' `table id → max flushed LSN`: the dedup filter for the
@@ -199,7 +228,7 @@ impl RelationRegistry {
     /// strictly greater than each table's current counter: no recovery
     /// watermark a checkpoint persisted can cover a committed-but-unflushed
     /// zone, and a failed zone's pinned LSN is never reused.
-    pub fn max_table_current_lsn(&self) -> u64 {
+    pub fn max_current_lsn(&self) -> u64 {
         self.all_store_lsns().map(|(_, _, lsn)| lsn).max().unwrap_or(0)
     }
 }

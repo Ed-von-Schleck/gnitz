@@ -3,7 +3,8 @@
 use super::*;
 use crate::catalog::{CatalogEngine, ColumnDef};
 use crate::test_support::{col_def, make_batch, make_schema_u64_i64, register_identity_view, scratch_dir, sum_weights};
-use gnitz_store::schema::type_code;
+use gnitz_store::relation::Relation;
+use gnitz_wire::type_code;
 
 /// The exchange transport of the driver tests below. They register only identity
 /// circuits, which repartition nothing — a call here means the premise changed,
@@ -40,13 +41,23 @@ fn engine_with_fanout(name: &str) -> (CatalogEngine, i64, i64, i64, i64) {
 
 /// `(pk, weight, payload)` rows in `tid`'s own registered schema.
 fn delta_for(engine: &CatalogEngine, tid: i64, rows: &[(u64, i64, i64)]) -> Batch {
-    let schema = engine.registry().get_schema_desc(tid).expect("a registered relation");
+    let schema = engine
+        .registry()
+        .relation(tid)
+        .map(Relation::schema)
+        .expect("a registered relation");
     make_batch(&schema, rows)
 }
 
 /// The net weight a relation's own store holds.
 fn live_weight(engine: &CatalogEngine, tid: i64) -> i64 {
-    sum_weights(engine.registry().open_store_cursor(tid).expect("an owned store"))
+    sum_weights(
+        engine
+            .registry()
+            .relation(tid)
+            .map(|r| r.cursor())
+            .expect("an owned store"),
+    )
 }
 
 // ── The schedule ────────────────────────────────────────────────────────────
@@ -145,7 +156,7 @@ fn an_empty_tick_produces_nothing() {
     let (mut engine, base) = engine_with_base("empty_tick");
     let a = register_identity_view(&mut engine, base, "va", &view_cols());
 
-    let schema = engine.registry().get_schema_desc(base).unwrap();
+    let schema = engine.registry().relation(base).map(Relation::schema).unwrap();
     let (dag, registry) = engine.dag_and_registry_mut();
     dag.evaluate_dag(registry, base, Batch::empty_with_schema(&schema), 1, &mut NoExchange)
         .unwrap();
@@ -173,7 +184,7 @@ fn backfill_chunk_runs_only_the_named_view() {
         "the source's other dependents are untouched"
     );
 
-    let empty = Batch::empty_with_schema(&engine.registry().get_schema_desc(base).unwrap());
+    let empty = Batch::empty_with_schema(&engine.registry().relation(base).map(Relation::schema).unwrap());
     let (dag, registry) = engine.dag_and_registry_mut();
     assert!(
         !dag.backfill_chunk(registry, a, base, empty, &mut NoExchange).unwrap(),
@@ -182,7 +193,7 @@ fn backfill_chunk_runs_only_the_named_view() {
 
     // An unregistered view is not a driver error; it is a relation that went away.
     let (dag, registry) = engine.dag_and_registry_mut();
-    let empty = Batch::empty_with_schema(&registry.get_schema_desc(base).unwrap());
+    let empty = Batch::empty_with_schema(&registry.relation(base).map(Relation::schema).unwrap());
     assert!(!dag
         .backfill_chunk(registry, 999_999, base, empty, &mut NoExchange)
         .unwrap());

@@ -4,7 +4,7 @@
 //!
 //! Those three are the only wrappers the catalog keeps over the read rung.
 //! Every other registry name a caller reaches is spelled `registry()` at its
-//! site: a `CatalogEngine::relation_kind` would hide the rung its answer came
+//! site: a `CatalogEngine::kind` would hide the rung its answer came
 //! from, and a delegator layer would be a dozen functions that can drift from
 //! what they forward to. These three earn their place by supplying something a
 //! caller cannot — the hydrator, which is the catalog's *other* field.
@@ -16,33 +16,33 @@ use gnitz_wire::{ReadSpec, WireFault};
 use rustc_hash::FxHashSet;
 
 impl CatalogEngine {
-    /// [`RelationRegistry::scan_family`] with this engine's own circuit layer as
+    /// [`RelationRegistry::scan`] with this engine's own circuit layer as
     /// the hydrator.
-    pub(crate) fn scan_family(&mut self, table_id: i64) -> Result<(Rc<Batch>, SchemaDescriptor), String> {
+    pub(crate) fn scan(&mut self, table_id: i64) -> Result<(Rc<Batch>, SchemaDescriptor), String> {
         let (dag, registry) = self.dag_and_registry_mut();
-        registry.scan_family(table_id, Some(dag)).map_err(String::from)
+        registry.scan(table_id, Some(dag)).map_err(String::from)
     }
 
     /// Point lookup by the wire seek pair, hydrating: the pair decoded to OPK
-    /// bytes, then [`RelationRegistry::seek_family`]. The schema comes back with
+    /// bytes, then [`RelationRegistry::seek`]. The schema comes back with
     /// a miss too — its STATUS_OK reply block needs it.
-    pub(crate) fn seek_family(
+    pub(crate) fn seek(
         &mut self,
         table_id: i64,
         seek_pk: u128,
         seek_pk_extra: &[u8],
     ) -> Result<(Option<Batch>, SchemaDescriptor), String> {
-        let schema = self.registry.table_entry(table_id)?.schema;
+        let schema = self.registry.relation_or_err(table_id)?.schema();
         let opk = gnitz_store::schema::key::seek_opk_bytes(&schema, seek_pk, seek_pk_extra)
             .map_err(|e| format!("seek: table {table_id}: {e}"))?;
         let (dag, registry) = self.dag_and_registry_mut();
-        Ok((registry.seek_family(table_id, opk.pk_bytes(), Some(dag))?, schema))
+        Ok((registry.seek(table_id, opk.pk_bytes(), Some(dag))?, schema))
     }
 
-    /// [`RelationRegistry::scan_spec_family`], hydrating. The one site where a
+    /// [`RelationRegistry::scan_spec`], hydrating. The one site where a
     /// store error becomes a wire fault: an expired delta cursor keeps its own
     /// status, everything else is `STATUS_ERROR`.
-    pub(crate) fn scan_spec_family(
+    pub(crate) fn scan_spec(
         &mut self,
         target_id: i64,
         spec: &ReadSpec,
@@ -51,7 +51,7 @@ impl CatalogEngine {
     ) -> Result<Batch, WireFault> {
         let (dag, registry) = self.dag_and_registry_mut();
         registry
-            .scan_spec_family(target_id, spec, reply_schema, cut_tick, Some(dag))
+            .scan_spec(target_id, spec, reply_schema, cut_tick, Some(dag))
             .map_err(|e| match e {
                 StoreError::DeltaExpired(text) => WireFault {
                     status: gnitz_wire::STATUS_DELTA_EXPIRED,
@@ -68,11 +68,10 @@ impl CatalogEngine {
     /// A view is **valid** (resumed) iff:
     ///   * the recorded topology matches the launched `(worker_count, STATE_FORMAT)`
     ///     — a different worker count re-shapes every keyed store's row placement;
-    ///   * every child that carries its state — its output-store children and its
-    ///     owned operator scratch — is stamped with the committed checkpoint
-    ///     generation — `resume_generation`, the in-memory recovered `G`, NOT the
-    ///     recovery-start-bumped durable `G+1` — matching what `Table::new`'s
-    ///     conditional load peeks; and
+    ///   * every child that carries its state is stamped with the committed
+    ///     checkpoint generation — `resume_generation`, the in-memory recovered
+    ///     `G`, NOT the recovery-start-bumped durable `G+1` — which
+    ///     [`RelationRegistry::view_children_resumable`] answers; and
     ///   * every VIEW it scans is itself valid — else it could read a rebuilt
     ///     sibling's freshly-emptied output store; and
     ///   * none of its sources is a STREAM — a stream-fed view's manifests are
@@ -83,17 +82,7 @@ impl CatalogEngine {
     /// each view's **local** validity (direct sources + child manifests), and
     /// phase 2 propagates invalidity to any view scanning an invalid source,
     /// walking the views in dependency order so one pass reaches the whole cascade.
-    ///
-    /// Which children carry that state is [`children_at_generation`]'s to say.
-    /// Reading the operator scratch alongside the output stores is what rejects an
-    /// output store one generation ahead of the integral beneath it — the ephemeral
-    /// round stamps every output store but only a *compiled* view's traces.
     pub(crate) fn compute_invalid_views(&mut self) {
-        self.registry.assert_pre_fork("compute_invalid_views");
-        let launched_workers = self.registry.num_workers();
-        // The same value `rederive_source` reads for the store-open half of the
-        // verdict, so both halves answer from one number.
-        let g = self.registry.resume_generation();
         let topo_valid = self.registry.topology_matches();
 
         let view_ids = self.registry.view_ids();
@@ -117,17 +106,12 @@ impl CatalogEngine {
                 .dag
                 .get_source_ids(&self.registry, vid)
                 .iter()
-                .any(|s| self.registry.relation_kind(*s) == Some(RelationKind::Stream));
+                .any(|s| self.registry.relation(*s).map(Relation::kind) == Some(RelationKind::Stream));
             if stream_fed {
                 invalid.insert(vid);
                 continue;
             }
-            let dir = &self
-                .registry
-                .entry(vid)
-                .expect("vid taken from the registry's own view list")
-                .directory;
-            if !children_at_generation(dir, launched_workers, g) {
+            if !self.registry.view_children_resumable(vid) {
                 invalid.insert(vid);
             }
         }
@@ -172,7 +156,7 @@ impl CatalogEngine {
         // stream, a wrong answer for a process whose store is elsewhere. Hard, not
         // `debug_assert!` — release is a supported deployment.
         assert!(
-            self.registry.owns_stores(),
+            self.registry.residency().owns_stores(),
             "source cursor in a process owning no base store (view {view_id}, source {source})",
         );
         // Must precede `source_scan_bound`: `handle_backfill` reaches here before
@@ -185,9 +169,7 @@ impl CatalogEngine {
             .then(|| dag.source_scan_bound(view_id, source))
             .flatten();
         let Some(bound) = bound else {
-            return Ok(SourceCursor::Full(Box::new(
-                registry.table_entry(source)?.open_cursor(),
-            )));
+            return Ok(SourceCursor::Full(Box::new(registry.relation_or_err(source)?.cursor())));
         };
         registry
             .open_index_source(source, bound.idx_cols.as_slice(), &bound.desc, IndexWalk::Optional)

@@ -469,6 +469,7 @@ impl ShardIndex {
     /// test asserts a placement against, where `tree_report` is for reading —
     /// outside the `cfg(test)` block above because `gnitz-server`'s tests
     /// reach it through [`Table::level_shape`], across the crate seam.
+    #[cfg(test)]
     pub(crate) fn level_shape(&self) -> (usize, [usize; FLSM_LEVELS]) {
         (self.l0.len(), std::array::from_fn(|i| self.levels[i].guards.len()))
     }

@@ -370,7 +370,7 @@ fn adv_build_batch_dense(schema: SchemaDescriptor, count: usize) -> Rc<Batch> {
         b.extend_col(0, &0i64.to_le_bytes());
         b.count += 1;
     }
-    b.certify_layout(Layout::Consolidated, &schema);
+    b.certify_layout(Layout::Consolidated);
     Rc::new(b)
 }
 
@@ -386,7 +386,7 @@ fn adv_build_batch_rows(schema: SchemaDescriptor, rows: &[(u64, i64, i64)]) -> R
         b.extend_col(0, &v.to_le_bytes());
         b.count += 1;
     }
-    b.certify_layout(Layout::Consolidated, &schema);
+    b.certify_layout(Layout::Consolidated);
     Rc::new(b)
 }
 

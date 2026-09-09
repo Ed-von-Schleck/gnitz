@@ -5,9 +5,9 @@
 
 use super::*;
 use crate::test_support::{col_def, scratch_dir};
-use gnitz_store::schema::type_code;
 use gnitz_wire::sys_rows::{write_circuit_node_row, write_idx_tab_row, write_schema_tab_row};
 use gnitz_wire::sys_rows::{CircuitNodeRow, IdxTabRow, SchemaTabRow};
+use gnitz_wire::type_code;
 use std::fs;
 
 // ── The name rules ──────────────────────────────────────────────────────────

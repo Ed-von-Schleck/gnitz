@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::{make_schema_u64_i64, pk_payload_schema};
-use gnitz_store::schema::type_code;
+use gnitz_wire::type_code;
 use gnitz_wire::{JoinKind, OpNode, RangeRel, TypeCode};
 use std::collections::HashMap;
 

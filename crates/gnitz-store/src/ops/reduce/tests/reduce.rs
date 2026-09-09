@@ -89,14 +89,14 @@ impl Avi {
         agg_descs: &[AggDescriptor],
         history: &[&Batch],
     ) -> Self {
-        use super::avi::op_populate_avi;
         // The bake applies the value-index selection itself, so ordinal `j` is
         // position `j` in that subset exactly as production has it.
         let bake = make_bake(in_schema, group_cols, agg_descs);
         let dir = tempfile::tempdir().unwrap();
         let mut table = scratch_table(dir.path().to_str().unwrap(), bake.schema, 0);
         for b in history {
-            op_populate_avi(b, &mut table, &bake).unwrap();
+            use super::avi::avi_batch;
+            table.ingest_owned_batch(avi_batch(b, &bake)).unwrap();
         }
         Avi { _dir: dir, table }
     }
@@ -1111,7 +1111,7 @@ fn reduce_trace_seek_signed_pk() {
     let delta1 = {
         let mut b = Batch::with_capacity(&in_schema, 2);
         for &(k, val) in &[(-1i64, 200i64), (2, 100)] {
-            b.extend_pk_opk(&in_schema, &[(k as u64) as u128]);
+            b.extend_pk_opk(&[(k as u64) as u128]);
             b.extend_weight(&1i64.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.extend_col(0, &val.to_le_bytes());
@@ -1129,7 +1129,7 @@ fn reduce_trace_seek_signed_pk() {
     let mut to_ch2 = trace_cursor(out1, out_schema);
     let delta2 = {
         let mut b = Batch::with_capacity(&in_schema, 1);
-        b.extend_pk_opk(&in_schema, &[((-1i64) as u64) as u128]);
+        b.extend_pk_opk(&[((-1i64) as u64) as u128]);
         b.extend_weight(&1i64.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &50i64.to_le_bytes());
@@ -2387,7 +2387,7 @@ fn make_batch_raw_pk<T: Copy>(
     let mut b = Batch::with_capacity(schema, n.max(1));
     for &(pk, w, val) in rows {
         // pk_encode yields the native value; OPK-encode (sign-flip for signed).
-        b.extend_pk_opk(schema, &[pk_encode(pk)]);
+        b.extend_pk_opk(&[pk_encode(pk)]);
         b.extend_weight(&w.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.extend_col(0, &val.to_le_bytes());
@@ -2470,7 +2470,7 @@ fn test_reduce_group_by_pk_unsorted_sorted_input_equivalence() {
     // consolidated-`working` branch, which skips the argsort, must produce
     // identical output.
     let mut delta = make_batch_raw_pk(&in_schema, &[(3, 1, 20), (5, 1, 10), (5, 1, 30)], |pk: u64| pk as u128);
-    delta.certify_layout(Layout::Consolidated, &in_schema);
+    delta.certify_layout(Layout::Consolidated);
 
     let out = op_reduce(&delta, &mut to_ch, &in_schema, &[0u32], &aggs, None, false, false);
 
@@ -3847,7 +3847,7 @@ fn count_accumulator_over_uuid_pk_does_not_panic() {
 }
 
 // Populate a fresh ephemeral AVI table from `deltas` through the production
-// `op_populate_avi`, then read the extreme of delta[0]-row-0's group back
+// `avi_batch` + ingest, then read the extreme of delta[0]-row-0's group back
 // through the production `AviBake::seed_extreme` seek. `col_idx` is the
 // aggregate source column (PK or payload). Shared by the AVI full-path tests
 // below.
@@ -3858,8 +3858,6 @@ fn avi_read_extreme(
     deltas: &[&Batch],
     for_max: bool,
 ) -> i64 {
-    use super::avi::op_populate_avi;
-
     // The aggregate's type is the source column's type.
     let avi_schema = avi_schema(in_schema, group_by);
     let tmp = tempfile::tempdir().unwrap();
@@ -3870,11 +3868,12 @@ fn avi_read_extreme(
     };
     let bake = make_bake(in_schema, group_by, &[agg]);
 
-    // Each op_populate_avi call is a separate AVI ingest; the cursor's
+    // Each avi_batch ingest is a separate AVI ingest; the cursor's
     // two-tier consolidation sums weights across ingests, so a retracted extreme
     // (net-zero) is skipped by seek_first_positive_with_prefix.
     for d in deltas {
-        op_populate_avi(d, &mut avi_t, &bake).unwrap();
+        use super::avi::avi_batch;
+        avi_t.ingest_owned_batch(avi_batch(d, &bake)).unwrap();
     }
 
     let mut ch = avi_t.open_cursor();
@@ -3935,7 +3934,7 @@ fn avi_full_path_min_max_across_high_byte() {
 fn pk_ab_delta(schema: &SchemaDescriptor, rows: &[(i128, i64)]) -> Batch {
     let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for &(bv, w) in rows {
-        b.extend_pk_opk(schema, &[5u128, bv as u128]);
+        b.extend_pk_opk(&[5u128, bv as u128]);
         b.extend_weight(&w.to_le_bytes());
         b.extend_null_bmp(&0u64.to_le_bytes());
         b.count += 1;
@@ -4073,7 +4072,7 @@ fn reduce_wide_compound_pk_group_by_pk_counts_per_pk() {
     let delta = {
         let mut b = Batch::with_capacity(&in_schema, 2);
         for (a, c, w) in [(1u128, 1u128, 2i64), (1, 2, 1)] {
-            b.extend_pk_opk(&in_schema, &[a, c]);
+            b.extend_pk_opk(&[a, c]);
             b.extend_weight(&w.to_le_bytes());
             b.extend_null_bmp(&0u64.to_le_bytes());
             b.count += 1;
@@ -5324,13 +5323,13 @@ fn combine_full_retraction_sheds_to_ground() {
 // Combined AggValueIndex: one table per reduce, keyed `group ‖ ordinal ‖ av`,
 // serving every MIN/MAX aggregate (grouped or global). These drive op_reduce
 // through a real combined index populated by the production
-// `op_populate_avi` flow, so the per-ordinal write and read sides
+// `avi_batch` + ingest flow, so the per-ordinal write and read sides
 // agree with no hand-built keys.
 // ===========================================================================
 
 /// Create an ephemeral combined-AVI table and populate it by integrating each
 /// delta in `deltas` (the accumulated integral the index must reflect at read
-/// time) through the real `op_populate_avi`. The caller opens a cursor
+/// time) through the real `avi_batch` + ingest. The caller opens a cursor
 /// on the returned table.
 fn build_combined_avi(
     dir: &std::path::Path,
@@ -5339,12 +5338,12 @@ fn build_combined_avi(
     agg_descs: &[AggDescriptor],
     deltas: &[&Batch],
 ) -> crate::storage::Table {
-    use super::avi::op_populate_avi;
     let avi_schema = avi_schema(in_schema, group_cols);
     let mut t = scratch_table(dir.to_str().unwrap(), avi_schema, 0);
     let bake = make_bake(in_schema, group_cols, agg_descs);
     for d in deltas {
-        op_populate_avi(d, &mut t, &bake).unwrap();
+        use super::avi::avi_batch;
+        t.ingest_owned_batch(avi_batch(d, &bake)).unwrap();
     }
     t
 }
@@ -6241,7 +6240,7 @@ fn reduce_monotone_probe_many_groups_multi_source() {
 // from the reduce's own accumulator and the stored trace_out extreme instead of
 // probing the value index; a group with any retraction (or a float source, or a
 // group past the pre-step cap) still probes. These tests drive the *real* AVI
-// path — the value index is populated per epoch by `op_populate_avi`
+// path — the value index is populated per epoch by `avi_batch` + ingest
 // (post-delta, as the compiler wires it: AVI Integrate precedes Reduce) and the
 // reduce reads it — and check the skip path against both the unchanged trace-scan
 // (`avi = None`) path and a from-scratch oracle.
@@ -6263,8 +6262,6 @@ fn run_minmax_epochs(
     epochs: &[Batch],
     global_ground: bool,
 ) -> Vec<std::rc::Rc<Batch>> {
-    use super::avi::op_populate_avi;
-
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_str().unwrap();
 
@@ -6276,7 +6273,8 @@ fn run_minmax_epochs(
     let mut states = Vec::with_capacity(epochs.len());
     for d in epochs {
         // AVI Integrate precedes Reduce: post-delta `I(input)` before the read.
-        op_populate_avi(d, &mut avi_t, &avi_bake).unwrap();
+        use super::avi::avi_batch;
+        avi_t.ingest_owned_batch(avi_batch(d, &avi_bake)).unwrap();
         let out = {
             let mut to_ch = trace_out.open_cursor();
             let mut avi_ch = avi_t.open_cursor();
@@ -6794,7 +6792,7 @@ fn check_pk_source_max(b_signed: bool) {
         let pad_pi = in_schema.try_payload_idx(2).unwrap();
         let mut bt = Batch::with_capacity(&in_schema, rows.len().max(1));
         for &(a, b, w) in rows {
-            bt.extend_pk_opk(&in_schema, &[a as u128, b as u128]);
+            bt.extend_pk_opk(&[a as u128, b as u128]);
             bt.extend_weight(&w.to_le_bytes());
             bt.extend_null_bmp(&0u64.to_le_bytes());
             bt.extend_col(pad_pi, &0i64.to_le_bytes());

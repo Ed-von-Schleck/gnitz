@@ -639,9 +639,9 @@ impl WorkerProcess {
             SalMessageKind::Seek => {
                 // The full seek key arrives as the wire pair seek_pk (low ≤16
                 // native bytes) + seek_pk_extra (the 16..stride suffix, empty for
-                // narrow PKs). `seek_family` decodes it through `seek_opk_bytes`
+                // narrow PKs). `seek` decodes it through `seek_opk_bytes`
                 // at every width — user and system tables alike, no width fork.
-                let (result, schema) = self.cat().seek_family(target_id, seek_pk, &seek_pk_extra)?;
+                let (result, schema) = self.cat().seek(target_id, seek_pk, &seek_pk_extra)?;
                 // One frame, and a view key names its whole PK group — so this
                 // reply has no size bound of its own. `send_response` rejects one
                 // too large for the client rather than emitting it.
@@ -655,7 +655,7 @@ impl WorkerProcess {
             }
 
             SalMessageKind::Scan => {
-                let (result, schema) = self.cat().scan_family(target_id)?;
+                let (result, schema) = self.cat().scan(target_id)?;
                 self.send_shared_scan_response(route, result, ReplySchema::Table(&schema), client_version);
                 Ok(())
             }
@@ -737,7 +737,7 @@ impl WorkerProcess {
             if !self.cat().registry().has_id(target_id) {
                 return Ok(());
             }
-            let schema = self.cat().registry().table_entry(target_id)?.schema;
+            let schema = self.cat().registry().relation_or_err(target_id)?.schema();
             Batch::empty_with_schema(&schema)
         };
         self.evaluate_dag(target_id, delta, round, request_id);
@@ -772,9 +772,7 @@ impl WorkerProcess {
         let spec = gnitz_wire::ReadSpec::decode(spec_bytes.0).map_err(|e| format!("scan_spec: {e}"))?;
         let reply_schema = gnitz_store::schema::decode_schema_block(reply_block, true)
             .map_err(|e| format!("scan_spec: reply schema block: {e}"))?;
-        let keeper = self
-            .cat()
-            .scan_spec_family(target_id, &spec, &reply_schema, seek_pk as u64)?;
+        let keeper = self.cat().scan_spec(target_id, &spec, &reply_schema, seek_pk as u64)?;
         // No row of an incremental reply may exceed the cut: the interval is
         // closed by construction there, and a below-bound regression — a round
         // landing after the read group — is what this makes loud in the debug
@@ -831,7 +829,7 @@ impl WorkerProcess {
         // Needed to synthesize empty pad chunks. An unregistered source is a
         // fail-stop: DDL_SYNC applies in SAL order, so a worker that cannot see
         // the source has diverged from the catalog.
-        let schema = self.cat().registry().table_entry(source_tid)?.schema;
+        let schema = self.cat().registry().relation_or_err(source_tid)?.schema();
         let mut handle = self.cat().open_source_cursor(view_id, source_tid)?;
         let mut produced_any = false;
 
@@ -954,8 +952,8 @@ impl WorkerProcess {
         }
         // One resolve for all three — the cursor owns its sources by `Rc`, so it
         // outlives the entry borrow and pins the snapshot the DDL section froze.
-        let e = self.cat().registry().table_entry(owner_id)?;
-        let (schema, dir, mut handle) = (e.schema, e.directory.clone(), e.open_cursor());
+        let e = self.cat().registry().relation_or_err(owner_id)?;
+        let (schema, dir, mut handle) = (e.schema(), e.directory().to_string(), e.cursor());
         // The index circuit is not registered until this pre-flight succeeds, so
         // the key spec is built from the owner schema + column list — the same
         // inputs the master builds from, so the reply frame layout agrees. It
@@ -1038,14 +1036,12 @@ impl WorkerProcess {
             let (result, schema) = match batch.as_ref() {
                 Some(b) => {
                     let keys = (0..b.len()).map(|i| b.get_pk_bytes(i));
-                    self.cat()
-                        .registry_mut()
-                        .gather_family_bytes(target_id, keys, ref_col)?
+                    self.cat().registry_mut().gather_bytes(target_id, keys, ref_col)?
                 }
                 None => self
                     .cat()
                     .registry_mut()
-                    .gather_family_bytes(target_id, std::iter::empty(), ref_col)?,
+                    .gather_bytes(target_id, std::iter::empty(), ref_col)?,
             };
             // The projected reply schema is synthetic — never the table's
             // cached block.
@@ -1060,21 +1056,22 @@ impl WorkerProcess {
                     let ic = self
                         .cat()
                         .registry()
-                        .index_circuit_for_cols(target_id, cols.as_slice())
+                        .relation(target_id)
+                        .and_then(|r| r.index_on(cols.as_slice()))
                         .ok_or_else(|| format!("No index on columns {:?} for table {}", cols.as_slice(), target_id))?;
                     // The check target is the unique INDEX table, whose schema is
                     // `(indexed_col, src_pk…)` — NOT the owner table's schema.
-                    let schema = batch.as_ref().map_or(ic.index_schema, |b| b.schema);
+                    let schema = batch.as_ref().map_or(ic.schema(), |b| *b.schema());
                     // Index layout: PK = (indexed-key span, src_pk_cols). Any
                     // positive-weight match means the value is already in the
                     // index. `open_cursor` keeps a compaction Io/InvalidShard
                     // failure from silently turning a present key into "absent".
-                    let mut cursor = ic.open_cursor();
+                    let mut cursor = ic.cursor();
                     // Prefix-match the WHOLE indexed-value span: OPK puts the
                     // distinguishing bytes last, so a source-width prefix would
                     // match only the zero high bytes. Width off the circuit's own
                     // key spec, so no width crosses the process boundary.
-                    let idx_key_size = ic.key_spec.key_size();
+                    let idx_key_size = ic.key_spec().key_size();
                     // Grown on demand, not reserved at the probe count: the
                     // expected hit count on a fresh-key insert is zero, and
                     // `with_capacity` bypasses the batch arena above 2 MiB.
@@ -1114,19 +1111,20 @@ impl WorkerProcess {
                 // empty sublist still replies, and derives the same key-only
                 // image from its own catalog schema.
                 let schema = match batch.as_ref() {
-                    Some(b) => b.schema,
+                    Some(b) => *b.schema(),
                     None => {
-                        let table = self.cat().registry().table_entry(target_id)?.schema;
+                        let table = self.cat().registry().relation_or_err(target_id)?.schema();
                         gnitz_store::schema::project_schema(&table, &[]).expect("a PK-only projection fits MAX_COLUMNS")
                     }
                 };
-                let store = self.cat().registry().entry(target_id).and_then(|e| e.owned_store());
+                let relation = self.cat().registry().relation(target_id);
                 // Grown on demand — see the index arm above.
                 let mut result = Batch::empty_with_schema(&schema);
                 if let Some(b) = batch.as_ref() {
                     for i in 0..n {
                         let pkb = b.get_pk_bytes(i);
-                        if store.is_some_and(|t| t.has_pk_bytes(pkb)) {
+                        // `false` where this process holds no store.
+                        if relation.is_some_and(|r| r.has_pk(pkb)) {
                             result.push_key_row(pkb, 1);
                         }
                     }

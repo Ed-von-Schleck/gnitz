@@ -239,7 +239,7 @@ fn drain_index_scan_merges_chunked_and_single_frame_trains() {
 #[test]
 fn drain_index_scan_rejects_first_frame_schema_mismatch() {
     let wire_schema = two_col_schema();
-    let expected = crate::test_support::pk_only_schema(&[gnitz_store::schema::type_code::U64]); // different column count
+    let expected = crate::test_support::pk_only_schema(&[gnitz_wire::type_code::U64]); // different column count
     let batch = make_row_batch(wire_schema, &[(1, 1, Some(10))]);
 
     let (fx, writers) = DrainFixture::new(1);

@@ -16,6 +16,5 @@ mod plan;
 #[path = "tests/topn.rs"]
 mod tests;
 
-pub use index::op_populate_topn;
 pub use op_topn::op_topn;
 pub use plan::TopNPlan;

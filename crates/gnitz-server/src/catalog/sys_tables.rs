@@ -9,9 +9,10 @@ use rustc_hash::FxHashMap;
 use super::ColumnDef;
 use gnitz_expr::RowSource;
 use gnitz_store::relation::{RelationKind, ViewBudgets};
-use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor, MAX_COLUMNS};
+use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
 use gnitz_store::storage::{payload_string, payload_u64, Batch, BatchBuilder};
 use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow};
+use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{
     COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE,
     COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND, COLTAB_PAY_SCALE,
@@ -421,7 +422,7 @@ pub(super) fn idx_tab_batch(
 // Pre-computed schema statics, one per family, indexed by `SysFamily::index` —
 // initialised at compile time, never reconstructed. `from_wire_cols`
 // places every family `Replicated`, so a reader single-sources one copy instead of
-// gathering N (`RelationRegistry::relation_is_replicated`).
+// gathering N (the relation's own `Placement`).
 /// Build a `SchemaDescriptor` from one of `gnitz-wire`'s canonical system-table
 /// column arrays. `const`, so [`SCHEMAS`] below costs nothing at runtime. Every
 /// such family is [`Placement::Replicated`]: DDL is master-broadcast, so each

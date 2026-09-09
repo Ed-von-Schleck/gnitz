@@ -19,7 +19,7 @@
 use proptest::prelude::*;
 
 use gnitz_store::schema::{SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{Batch, BatchBuilder, Layout, RecoverySource, StoreBudgets, Table};
+use gnitz_store::storage::{Batch, BatchBuilder, Layout};
 use gnitz_wire::type_code;
 
 /// A schema with one PK column per type code in `tcs`, plus a single trailing
@@ -46,7 +46,7 @@ pub fn make_schema_u64_i64() -> SchemaDescriptor {
 /// mis-fold weights.
 pub fn make_batch(schema: &SchemaDescriptor, rows: &[(u64, i64, i64)]) -> Batch {
     let mut b = make_batch_raw(schema, rows);
-    b.certify_layout(Layout::Consolidated, schema);
+    b.certify_layout(Layout::Consolidated);
     b
 }
 
@@ -249,7 +249,7 @@ pub fn batch_of_pk_bytes(schema: &SchemaDescriptor, pks: &[impl AsRef<[u8]>]) ->
 /// [`Batch::extend_pk_opk`] itself and not a second spelling of it.
 pub fn opk_pk(schema: &SchemaDescriptor, vals: &[u128]) -> Vec<u8> {
     let mut b = Batch::with_capacity(schema, 1);
-    b.extend_pk_opk(schema, vals);
+    b.extend_pk_opk(vals);
     b.get_pk_bytes(0).to_vec()
 }
 
@@ -271,22 +271,8 @@ pub fn make_batch_u128_raw(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)])
 /// debug-verifies it.
 pub fn make_batch_u128(schema: &SchemaDescriptor, rows: &[(u128, i64, i64)]) -> Batch {
     let mut b = make_batch_u128_raw(schema, rows);
-    b.certify_layout(Layout::Consolidated, schema);
+    b.certify_layout(Layout::Consolidated);
     b
-}
-
-/// A rederived table under `dir` at the default budgets — nothing a test puts
-/// here spills, since that needs the whole 32 MiB RAM tier. For a test that just
-/// needs somewhere to put rows.
-pub fn scratch_table(dir: &str, schema: SchemaDescriptor, table_id: u32) -> Table {
-    Table::new(
-        dir,
-        schema,
-        table_id,
-        RecoverySource::Rederive { resume_at: None },
-        StoreBudgets::default(),
-    )
-    .unwrap()
 }
 
 /// U128 pk + a single I64 payload column — the 16-byte-PK sibling of

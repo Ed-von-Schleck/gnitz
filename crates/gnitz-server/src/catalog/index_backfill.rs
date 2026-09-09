@@ -43,7 +43,8 @@ impl CatalogEngine {
         // so a store the hook just filled reads non-empty with no flush.
         let held = self
             .registry
-            .index_circuit_for_cols(owner_id, cols)
+            .relation(owner_id)
+            .and_then(|r| r.index_on(cols))
             .ok_or_else(|| format!("backfill_index: no circuit on {cols:?} of {owner_id}"))?
             .estimated_rows();
         if held != 0 {
@@ -63,15 +64,15 @@ impl CatalogEngine {
         // Snapshotted: the projection mutably borrows `self`.
         let worklist: Vec<(i64, Vec<PkColList>)> = self
             .registry
-            .entries()
-            .map(|(owner_id, entry)| {
+            .relations()
+            .map(|entry| {
                 let targets: Vec<PkColList> = entry
-                    .index_circuits
+                    .indexes()
                     .iter()
-                    .filter(|ic| !ic.resumed_from_checkpoint() && ic.estimated_rows() == 0)
-                    .map(|ic| ic.col_indices)
+                    .filter(|ic| !ic.resumed() && ic.estimated_rows() == 0)
+                    .map(|ic| ic.cols())
                     .collect();
-                (owner_id, targets)
+                (entry.id(), targets)
             })
             .filter(|(_, targets)| !targets.is_empty())
             .collect();
@@ -97,16 +98,17 @@ impl CatalogEngine {
             return Ok(());
         }
         let chunk_rows = self.registry.scan_chunk_rows();
-        let Some(mut handle) = self.registry.open_store_cursor(owner_id) else {
+        let Some(mut handle) = self.registry.relation(owner_id).map(|r| r.cursor()) else {
             return Ok(());
         };
         while let Some(chunk) = handle.drain_chunk(chunk_rows) {
             for cols in targets {
                 let ic = self
                     .registry
-                    .index_circuit_for_cols_mut(owner_id, cols.as_slice())
+                    .relation_mut(owner_id)
+                    .and_then(|r| r.index_on_mut(cols.as_slice()))
                     .ok_or_else(|| format!("index circuit on {:?} of {owner_id} vanished", cols.as_slice()))?;
-                let projected = gnitz_store::storage::batch_project_index(&chunk, &ic.key_spec, &ic.index_schema);
+                let projected = gnitz_store::storage::batch_project_index(&chunk, &ic.key_spec(), &ic.schema());
                 if projected.is_empty() {
                     continue;
                 }
@@ -122,7 +124,7 @@ impl CatalogEngine {
     /// second store: the index schema does not depend on `is_unique`, and the
     /// duplicate check is the master's pre-flight, already run.
     pub(in crate::catalog) fn promote_index_to_unique(&mut self, owner_id: i64, col_indices: &[u32]) {
-        self.registry.set_index_circuit_uniqueness(owner_id, col_indices, true);
+        self.registry.set_index_unique(owner_id, col_indices, true);
     }
 
     // -- FK auto-index creation -------------------------------------------
@@ -132,7 +134,7 @@ impl CatalogEngine {
         // COL_TAB read so the miss costs nothing. The registered schema is where
         // the PK list lives: `register_relation` builds it from the same
         // `TABLE_TAB.pk_col_idx` the row persisted.
-        let Some(owner_schema) = self.registry.entry(table_id).map(|e| e.schema) else {
+        let Some(owner_schema) = self.registry.relation(table_id).map(|e| e.schema()) else {
             return Ok(());
         };
         let col_defs = self.read_column_defs(table_id);

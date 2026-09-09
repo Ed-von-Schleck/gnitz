@@ -21,7 +21,7 @@ mod wide_pk_validation;
 
 use super::sys_tables::*;
 use super::*;
-use gnitz_store::schema::type_code;
+use gnitz_wire::type_code;
 
 use std::fs;
 
@@ -148,7 +148,7 @@ fn ingest_fixture(
     mut put_row: impl FnMut(&mut BatchBuilder, u64),
 ) -> (CatalogEngine, i64) {
     let (mut engine, tid, _dir) = table_fixture(name, cols);
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
+    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
     for round in 0..rounds {
         let mut bb = BatchBuilder::new(schema);
         let mut id = round;

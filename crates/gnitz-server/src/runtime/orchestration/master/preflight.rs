@@ -13,6 +13,7 @@ use super::*;
 use super::unique_filter::ensure_unique_filters_warm;
 use crate::catalog::FkEdge;
 use gnitz_expr::{ColumnLocator, SchemaFacts};
+use gnitz_store::relation::Relation;
 use gnitz_store::storage::MemBatch;
 
 // ---------------------------------------------------------------------------
@@ -230,7 +231,7 @@ impl<'a> TxnBundle<'a> {
                 Some(t) => t.family_indices.push(fi),
                 None => tables.push(TxnTable {
                     tid: fam.tid,
-                    schema: disp.cat().registry().table_entry(fam.tid)?.schema,
+                    schema: disp.cat().registry().relation_or_err(fam.tid)?.schema(),
                     family_indices: vec![fi],
                     fold: None,
                 }),
@@ -500,7 +501,13 @@ impl MasterDispatcher {
         // warm one returns before awaiting anything. A write that will fail
         // U-PK therefore pays the warm-up scan first, once per table per boot.
         for t in &b.tables {
-            if self.cat().registry().has_any_unique_index(t.tid) && b.surviving(t.tid).next().is_some() {
+            if self
+                .cat()
+                .registry()
+                .relation(t.tid)
+                .is_some_and(Relation::has_unique_index)
+                && b.surviving(t.tid).next().is_some()
+            {
                 ensure_unique_filters_warm(self, reactor, t.tid).await?;
             }
         }
@@ -683,10 +690,11 @@ fn plan_unique_checks<'a>(
         let uniques: Vec<(PkColList, SchemaDescriptor, IndexKeySpec)> = disp
             .cat()
             .registry()
-            .index_circuits(tid)
+            .relation(tid)
+            .map_or(&[][..], Relation::indexes)
             .iter()
-            .filter(|ic| ic.is_unique)
-            .map(|ic| (ic.col_indices, ic.index_schema, ic.key_spec))
+            .filter(|ic| ic.is_unique())
+            .map(|ic| (ic.cols(), ic.schema(), ic.key_spec()))
             .collect();
         if uniques.is_empty() || b.surviving(tid).next().is_none() {
             continue;
@@ -849,7 +857,7 @@ fn plan_fk_existence(
         // PK; otherwise probe the parent's UNIQUE index, which the keyspace
         // selector routes by broadcast since index entries are distributed
         // independently of the PK.
-        let parent_schema = disp.cat().registry().table_entry(parent_tid)?.schema;
+        let parent_schema = disp.cat().registry().relation_or_err(parent_tid)?.schema();
         let src_type = loc.type_code();
         let (key_schema, keyspace) = if parent_schema.is_lone_pk_col(parent_col) {
             (probe_schema(&parent_schema), Keyspace::OwnPk)
@@ -857,8 +865,9 @@ fn plan_fk_existence(
             let idx_schema = disp
                 .cat()
                 .registry()
-                .index_circuit_for_cols(parent_tid, &[parent_col as u32])
-                .map(|ic| ic.index_schema)
+                .relation(parent_tid)
+                .and_then(|r| r.index_on(&[parent_col as u32]))
+                .map(|ic| ic.schema())
                 .ok_or_else(|| format!("FK check: no unique index on parent {parent_tid} col {parent_col}"))?;
             (idx_schema, Keyspace::index(&[parent_col as u32]))
         };
@@ -1116,8 +1125,9 @@ async fn txn_check_fk_restrict(
         let (idx_schema, spec) = disp
             .cat()
             .registry()
-            .index_circuit_for_cols(child_tid, &[fk_col as u32])
-            .map(|ic| (ic.index_schema, ic.key_spec))
+            .relation(child_tid)
+            .and_then(|r| r.index_on(&[fk_col as u32]))
+            .map(|ic| (ic.schema(), ic.key_spec()))
             .ok_or_else(|| format!("FK RESTRICT: no index on child {child_tid} col {fk_col}"))?;
         // `enc_key`, not `IndexKeySpec::seek_prefix`: `v` comes from the
         // PARENT's column while the index belongs to the child, and the index

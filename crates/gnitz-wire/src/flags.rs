@@ -359,7 +359,7 @@ pub const STATUS_NOT_FOUND: u32 = 7;
 /// A failure as the reply frame carries it: one of the `STATUS_*` words above
 /// plus its message. The decoded form of a control block's `(status, error_msg)`
 /// pair, defined here because both halves of that hop need to name it — the
-/// engine's `scan_spec_family` mints one, the worker splits it onto the wire,
+/// engine's `scan_spec` mints one, the worker splits it onto the wire,
 /// and the master's `worker_error` puts it back together.
 ///
 /// `From<S: Into<String>>` defaults the status to [`STATUS_ERROR`], which is what

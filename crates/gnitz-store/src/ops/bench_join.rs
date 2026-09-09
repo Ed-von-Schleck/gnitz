@@ -92,7 +92,7 @@ type Row = (Vec<u128>, i64);
 fn build(schema: &SchemaDescriptor, p: Payload, rows: &[Row]) -> Batch {
     let mut b = Batch::with_capacity(schema, rows.len().max(1));
     for (i, (pk, ord)) in rows.iter().enumerate() {
-        b.extend_pk_opk(schema, pk);
+        b.extend_pk_opk(pk);
         b.extend_weight(&1i64.to_le_bytes());
         let null_word = match p {
             Payload::Nullable if i % 4 == 0 => 1u64 << 1,
@@ -112,7 +112,7 @@ fn build(schema: &SchemaDescriptor, p: Payload, rows: &[Row]) -> Batch {
         }
         b.commit_row(null_word);
     }
-    b.certify_layout(Layout::Consolidated, schema);
+    b.certify_layout(Layout::Consolidated);
     b
 }
 

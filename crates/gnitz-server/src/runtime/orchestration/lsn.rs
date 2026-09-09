@@ -18,7 +18,7 @@ pub struct ZoneLsnAllocator {
 }
 
 impl ZoneLsnAllocator {
-    /// Seed both watermarks; boot passes `max_table_current_lsn()` so every
+    /// Seed both watermarks; boot passes `max_current_lsn()` so every
     /// zone LSN stays strictly greater than each table's counter across
     /// restarts.
     pub fn new(seed: u64) -> Self {

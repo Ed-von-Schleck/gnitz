@@ -423,8 +423,8 @@ pub(crate) fn decode_wire_ipc_zero_copy_with_ctrl<'a>(
 /// must be answered with an error, not a debug-build abort.
 fn certify_engine_frame(decoded: &mut DecodedWire) {
     let flags = decoded.control.flags;
-    if let (Some(b), Some(schema)) = (decoded.data_batch.as_mut(), decoded.schema.as_ref()) {
-        b.certify_layout(Layout::from_wire_flags(flags), schema);
+    if let Some(b) = decoded.data_batch.as_mut() {
+        b.certify_layout(Layout::from_wire_flags(flags));
     }
 }
 

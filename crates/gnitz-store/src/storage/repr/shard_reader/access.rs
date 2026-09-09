@@ -126,6 +126,7 @@ impl MappedShard {
     /// from "filter admits it", which
     /// [`shard_filter_may_contain`](Self::shard_filter_may_contain) deliberately
     /// cannot. An assertion's question, not a read path's.
+    #[cfg(test)]
     pub(crate) fn has_shard_filter(&self) -> bool {
         self.shard_filter.is_some()
     }
@@ -339,7 +340,7 @@ impl MappedShard {
         let mut batch = unsafe { Batch::from_prebuilt(data, blob, strides, offsets, row_count, *schema) };
         // Shards are written consolidated; a contiguous slice stays (PK, payload)-
         // sorted and ghost-free (shards are ghost-free by construction). Certify it.
-        batch.certify_layout(Layout::Consolidated, schema);
+        batch.certify_layout(Layout::Consolidated);
         batch
     }
 

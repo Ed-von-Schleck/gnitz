@@ -20,7 +20,7 @@ use crate::schema::key::ReindexPacker;
 /// identically to a scattered equi-join trace — no trace replicates, no match
 /// duplicates. Worker identity is a compile-time constant baked into the emitted
 /// instruction; `num_workers <= 1` (single process) keeps every row.
-pub fn op_worker_filter(batch: &Batch, schema: &SchemaDescriptor, worker_id: u32, num_workers: u32) -> Batch {
+pub fn op_worker_filter(batch: &Batch, worker_id: u32, num_workers: u32) -> Batch {
     let n = batch.count;
     if num_workers <= 1 || n == 0 {
         // Single process owns every row; degenerate to identity (preserving
@@ -39,7 +39,7 @@ pub fn op_worker_filter(batch: &Batch, schema: &SchemaDescriptor, worker_id: u32
             indices.push(i as u32);
         }
     }
-    batch.ascending_subset(&indices, schema)
+    batch.ascending_subset(&indices)
 }
 
 /// Which routing key a scatter uses, and the columns it reads. The two keys

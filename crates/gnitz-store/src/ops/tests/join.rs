@@ -166,14 +166,14 @@ fn equi_join_products_the_trace_group_at_every_pk_shape() {
         let (held, absent) = (opk_pk(&schema, held), opk_pk(&schema, absent));
 
         let mut trace = make_batch_opk(&schema, &[(&held, 1, 100), (&held, 2, 200)]);
-        trace.certify_layout(Layout::Consolidated, &schema);
+        trace.certify_layout(Layout::Consolidated);
         let mut ch = trace_cursor(trace, schema);
 
         let mut delta = make_batch_opk(
             &schema,
             &[(&held, 1, 10), (&held, 1, 20), (&held, 1, 30), (&absent, 1, 40)],
         );
-        delta.certify_layout(Layout::Consolidated, &schema);
+        delta.certify_layout(Layout::Consolidated);
 
         let out = equi_join(&schema, &delta, &mut ch);
         // (left payload, right payload, weight) — trace-major: each trace row is
@@ -213,7 +213,7 @@ fn cross_join_products_every_delta_row_with_every_trace_row() {
     );
 
     let mut trace = make_batch_opk(&right, &[(&r1, 1, 100), (&r2, 2, 200), (&r3, 1, 300)]);
-    trace.certify_layout(Layout::Consolidated, &right);
+    trace.certify_layout(Layout::Consolidated);
     let mut ch = trace_cursor(trace, right);
     // The probe states its own start, so an exhausted cursor still yields the
     // whole product.
@@ -221,7 +221,7 @@ fn cross_join_products_every_delta_row_with_every_trace_row() {
     assert!(!ch.valid, "the fixture must start with an exhausted cursor");
 
     let mut delta = make_batch_opk(&left, &[(&l1, 3, 10), (&l2, -1, 20)]);
-    delta.certify_layout(Layout::Consolidated, &left);
+    delta.certify_layout(Layout::Consolidated);
 
     let out = cross_join(&left, &right, &delta, &mut ch);
     let got = out_triples(&out);
@@ -577,7 +577,7 @@ fn make_range_batch(schema: &SchemaDescriptor, rows: &[(Vec<u64>, u64, i64, i64)
     for (eq, range, w, val) in rows {
         let mut vals: Vec<u128> = eq.iter().map(|&x| x as u128).collect();
         vals.push(*range as u128);
-        b.extend_pk_opk(schema, &vals);
+        b.extend_pk_opk(&vals);
         b.extend_weight(&w.to_le_bytes());
         let null_word = u64::from(wide && *val < 0) << 1;
         b.extend_null_bmp(&null_word.to_le_bytes());

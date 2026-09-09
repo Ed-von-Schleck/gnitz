@@ -1,10 +1,10 @@
 use super::*;
-use crate::relation::{RelationKind, RelationSpec, StoreConfig, ViewBudgets};
+use crate::relation::{OnRegister, RelationKind, RelationSpec, StoreConfig, ViewBudgets};
 use crate::schema::{type_code, SchemaColumn};
 use crate::storage::{BatchBuilder, Slot, StoreError};
 use gnitz_wire::Cut;
 
-// ── The executor — `scan_spec_family` over a registry built in-crate ────────
+// ── The executor — `scan_spec` over a registry built in-crate ────────
 //
 // `hydrator: None`, as `gnitz-mirror` calls it: nothing here holds a skeleton
 // row. These drive the sink reduction, which needs no expression compiler; the
@@ -33,13 +33,16 @@ fn rows_fixture(name: &str, n: u64, weight: i64) -> RelationRegistry {
     let schema = id_val_schema();
     let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
     registry
-        .register(RelationSpec {
-            id: TID,
-            kind: RelationKind::View,
-            schema,
-            directory: crate::test_support::scratch_dir("read", name),
-            budgets: ViewBudgets { capacity_bytes: None, delta_bytes: None },
-        })
+        .register(
+            RelationSpec {
+                id: TID,
+                kind: RelationKind::View,
+                schema,
+                directory: crate::test_support::scratch_dir("read", name),
+                budgets: ViewBudgets { capacity_bytes: None, delta_bytes: None },
+            },
+            OnRegister::Live,
+        )
         .unwrap();
     let mut bb = BatchBuilder::new(schema);
     for id in 0..n {
@@ -73,7 +76,7 @@ fn ids(b: &Batch) -> Vec<(u128, i64)> {
 
 fn run(registry: &mut RelationRegistry, spec: &ReadSpec) -> Result<Batch, StoreError> {
     let schema = id_val_schema();
-    registry.scan_spec_family(TID, spec, &schema, 0, None)
+    registry.scan_spec(TID, spec, &schema, 0, None)
 }
 
 /// The reply is trimmed to the window, not to the mid-scan residency cap: five
@@ -153,21 +156,24 @@ fn dehydrated_fixture(name: &str, on_disk: std::ops::Range<u64>, in_ram: std::op
     let schema = id_val_schema();
     let mut registry = RelationRegistry::new(Slot::SOLO, StoreConfig::default());
     registry
-        .register(RelationSpec {
-            id: TID,
-            kind: RelationKind::View,
-            schema,
-            directory: crate::test_support::scratch_dir("read", name),
-            budgets: ViewBudgets {
-                capacity_bytes: Some(1),
-                delta_bytes: None,
+        .register(
+            RelationSpec {
+                id: TID,
+                kind: RelationKind::View,
+                schema,
+                directory: crate::test_support::scratch_dir("read", name),
+                budgets: ViewBudgets {
+                    capacity_bytes: Some(1),
+                    delta_bytes: None,
+                },
             },
-        })
+            OnRegister::Live,
+        )
         .unwrap();
     ingest(&mut registry, on_disk);
-    registry.flush_ephemeral_outputs(1).unwrap();
+    registry.checkpoint_ephemeral(1, []).unwrap();
     assert!(
-        registry.table_entry(TID).unwrap().handle.has_skeleton_rows(),
+        registry.relation_or_err(TID).unwrap().store().has_skeleton_rows(),
         "premise: the capacity sweep must have dehydrated the flushed shard",
     );
     ingest(&mut registry, in_ram);

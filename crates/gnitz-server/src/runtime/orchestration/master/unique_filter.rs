@@ -4,6 +4,7 @@
 //! preflight seed path shares the types).
 
 use super::*;
+use gnitz_store::relation::Relation;
 use gnitz_store::schema::key::probe_key;
 
 // For each `(table_id, col_indices)` we keep a set of the OPK spans known to
@@ -191,17 +192,17 @@ impl MasterDispatcher {
     /// the circuit list in place: this runs per live group per commit.
     pub(crate) fn unique_filter_ingest_batch(&self, table_id: i64, batch: &Batch) {
         let registry = self.cat().registry();
-        if !registry.has_any_unique_index(table_id) {
+        if !registry.relation(table_id).is_some_and(Relation::has_unique_index) {
             return;
         }
-        let circuits = registry.index_circuits(table_id);
+        let circuits = registry.relation(table_id).map_or(&[][..], Relation::indexes);
         let mb = batch.as_mem_batch();
         let mut filters = self.unique_filters.borrow_mut();
-        for ic in circuits.iter().filter(|ic| ic.is_unique) {
-            let Some(filter) = filters.get_mut(&(table_id, ic.col_indices)) else {
+        for ic in circuits.iter().filter(|ic| ic.is_unique()) {
+            let Some(filter) = filters.get_mut(&(table_id, ic.cols())) else {
                 continue; // not warm — warmup will pick this up
             };
-            extract_into_filter(filter, &mb, &ic.key_spec);
+            extract_into_filter(filter, &mb, &ic.key_spec());
         }
     }
 
@@ -246,17 +247,21 @@ pub(super) async fn ensure_unique_filters_warm(
         let mut filters = disp.unique_filters.borrow_mut();
         // Tested before it is built: the steady state is that every filter is
         // already warm, and that answer costs no allocation.
-        let cold = |ic: &gnitz_store::relation::IndexCircuitEntry| {
-            ic.is_unique && !filters.contains_key(&(table_id, ic.col_indices))
+        let cold = |ic: &gnitz_store::relation::SecondaryIndex| {
+            ic.is_unique() && !filters.contains_key(&(table_id, ic.cols()))
         };
-        let circuits = disp.cat().registry().index_circuits(table_id);
+        let circuits = disp
+            .cat()
+            .registry()
+            .relation(table_id)
+            .map_or(&[][..], Relation::indexes);
         if !circuits.iter().any(&cold) {
             return Ok(());
         }
         let missing: Vec<UniqueIndexDesc> = circuits
             .iter()
             .filter(|ic| cold(ic))
-            .map(|ic| UniqueIndexDesc { cols: ic.col_indices, spec: ic.key_spec })
+            .map(|ic| UniqueIndexDesc { cols: ic.cols(), spec: ic.key_spec() })
             .collect();
         for d in &missing {
             filters.insert((table_id, d.cols), UniqueFilter::new());

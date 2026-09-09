@@ -185,7 +185,7 @@ pub fn op_relay_scatter_consolidated(
         // whatever the routing key was.
         for b in out.iter_mut() {
             if b.count > 0 {
-                b.certify_layout(Layout::Consolidated, schema);
+                b.certify_layout(Layout::Consolidated);
             }
         }
         out

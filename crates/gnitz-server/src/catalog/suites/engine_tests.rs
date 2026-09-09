@@ -12,7 +12,7 @@ fn test_enforce_unique_pk() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
+    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
 
     let make_row = |pk: u64, val: u64, w: i64| -> Batch {
         let mut bb = BatchBuilder::new(schema);
@@ -23,7 +23,7 @@ fn test_enforce_unique_pk() {
     };
     let live = |engine: &mut CatalogEngine| -> usize {
         engine.registry_mut().flush(tid).unwrap();
-        engine.scan_family(tid).unwrap().0.len()
+        engine.scan(tid).unwrap().0.len()
     };
 
     // ST1: insert a new PK.
@@ -84,17 +84,20 @@ fn test_orphaned_metadata_recovery() {
     {
         let mut engine = CatalogEngine::open(&dir, 1).unwrap();
         engine
-            .sys_store_mut(SysFamily::Index)
-            .ingest_borrowed_batch(&idx_tab_batch(
-                888,
-                99999,
-                1,
-                "orphaned_idx",
-                gnitz_wire::IndexProps { is_unique: false, is_internal: false },
-                1,
-            ))
+            .registry
+            .ingest(
+                SysFamily::Index.id(),
+                idx_tab_batch(
+                    888,
+                    99999,
+                    1,
+                    "orphaned_idx",
+                    gnitz_wire::IndexProps { is_unique: false, is_internal: false },
+                    1,
+                ),
+            )
             .unwrap();
-        let _ = engine.sys_store_mut(SysFamily::Index).flush();
+        let _ = engine.registry.flush(SysFamily::Index.id());
         engine.close();
     }
 
@@ -175,7 +178,7 @@ fn test_user_sequence_durable_roundtrip() {
         engine.user_sequences.remove(&user_seq);
         engine.ingest_to_family(SEQ_TAB_ID, &delta).unwrap();
         assert_eq!(engine.user_sequences.get(&user_seq).copied(), Some(64));
-        let _ = engine.sys_store_mut(SysFamily::Sequence).flush();
+        let _ = engine.registry.flush(SysFamily::Sequence.id());
         engine.close();
     }
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -279,11 +282,8 @@ fn test_recover_ignores_sub_user_seq_id() {
         bb.begin_row(stray as u128, 1);
         bb.put_u64(999);
         bb.end_row();
-        engine
-            .sys_store_mut(SysFamily::Sequence)
-            .ingest_borrowed_batch(&bb.finish())
-            .unwrap();
-        let _ = engine.sys_store_mut(SysFamily::Sequence).flush();
+        engine.registry.ingest(SysFamily::Sequence.id(), bb.finish()).unwrap();
+        let _ = engine.registry.flush(SysFamily::Sequence.id());
         engine.close();
     }
     let engine = CatalogEngine::open(&dir, 1).unwrap();
@@ -306,20 +306,20 @@ fn test_sequence_gap_recovery() {
 
         // Inject table record for tid=250 directly into sys_tables
         engine
-            .sys_store_mut(SysFamily::Table)
-            .ingest_borrowed_batch(&build_table_tab_row(250, pack_pk_cols(&[0]), "gap_table"))
+            .registry
+            .ingest(
+                SysFamily::Table.id(),
+                build_table_tab_row(250, pack_pk_cols(&[0]), "gap_table"),
+            )
             .unwrap();
 
         // Inject column record for tid=250
         let mut cbb = BatchBuilder::new(*SysFamily::Column.schema());
         push_col_tab_row(&mut cbb, 250, OWNER_KIND_TABLE, 0, &col_def("id", type_code::U64), 1);
-        engine
-            .sys_store_mut(SysFamily::Column)
-            .ingest_borrowed_batch(&cbb.finish())
-            .unwrap();
+        engine.registry.ingest(SysFamily::Column.id(), cbb.finish()).unwrap();
 
-        let _ = engine.sys_store_mut(SysFamily::Table).flush();
-        let _ = engine.sys_store_mut(SysFamily::Column).flush();
+        let _ = engine.registry.flush(SysFamily::Table.id());
+        let _ = engine.registry.flush(SysFamily::Column.id());
         engine.close();
     }
 
@@ -342,7 +342,7 @@ fn test_ingest_scan_seek_family() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
+    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
 
     // Ingest via CatalogEngine (user table path)
     let mut bb = BatchBuilder::new(schema);
@@ -359,29 +359,29 @@ fn test_ingest_scan_seek_family() {
     engine.registry_mut().flush(tid).unwrap();
 
     // Scan
-    let scan_batch = engine.scan_family(tid).unwrap().0;
+    let scan_batch = engine.scan(tid).unwrap().0;
     assert_eq!(scan_batch.len(), 3);
 
     // Seek existing
-    let found = engine.seek_family(tid, 2u128, &[]).unwrap().0;
+    let found = engine.seek(tid, 2u128, &[]).unwrap().0;
     assert!(found.is_some());
     let row = found.unwrap();
     assert_eq!(row.len(), 1);
     assert_eq!(row.get_pk(0), 2);
 
     // Seek missing
-    let not_found = engine.seek_family(tid, 99u128, &[]).unwrap().0;
+    let not_found = engine.seek(tid, 99u128, &[]).unwrap().0;
     assert!(not_found.is_none());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
 }
 
-// ── seek_family resolves a system-table row (post-collapse) ───────────
+// ── seek resolves a system-table row (post-collapse) ───────────
 
 /// After the FLAG_SEEK collapse there is no system-table fast path: a
 /// `table_id < FIRST_USER_TABLE_ID` seek flows through the same
-/// `seek_family → seek_opk_bytes → RelationRegistry::seek_family` chain as user tables,
+/// `seek → seek_opk_bytes → RelationRegistry::seek` chain as user tables,
 /// resolving its schema through the registry entry. `create_table` writes a TABLE_TAB
 /// row keyed by the new table-id — a single narrow U64 PK, stride 8 — so seeking
 /// TABLE_TAB by that id drives the empty-`extra` narrow path end to end.
@@ -393,15 +393,15 @@ fn seek_family_resolves_system_table_row() {
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
 
     // System-table point seek (narrow stride 8, empty extra).
-    let found = engine.seek_family(TABLE_TAB_ID, tid as u128, &[]).unwrap().0;
+    let found = engine.seek(TABLE_TAB_ID, tid as u128, &[]).unwrap().0;
     assert!(
         found.is_some(),
-        "seek_family must resolve the TABLE_TAB row for the created table",
+        "seek must resolve the TABLE_TAB row for the created table",
     );
     assert_eq!(found.unwrap().len(), 1);
 
     // A missing system-table key returns None — not an error, not a panic.
-    let missing = engine.seek_family(TABLE_TAB_ID, 9_999_999u128, &[]).unwrap().0;
+    let missing = engine.seek(TABLE_TAB_ID, 9_999_999u128, &[]).unwrap().0;
     assert!(missing.is_none(), "absent system-table key seeks to None");
 
     engine.close();
@@ -416,7 +416,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    let schema = engine.registry().get_schema_desc(tid).unwrap();
+    let schema = engine.registry().relation(tid).map(Relation::schema).unwrap();
 
     // Insert row with PK=1, val=100
     let mut bb = BatchBuilder::new(schema);
@@ -435,7 +435,7 @@ fn test_ingest_pk_enforced_through_the_store() {
     engine.registry_mut().flush(tid).unwrap();
 
     // Scan — should have exactly 1 row with val=200
-    let scan = engine.scan_family(tid).unwrap().0;
+    let scan = engine.scan(tid).unwrap().0;
     assert_eq!(scan.len(), 1);
     assert_eq!(scan.get_pk(0), 1);
     assert_eq!(payload_u64(&*scan, 0, 0), 200, "the later write must win the PK");
@@ -491,8 +491,8 @@ fn test_ddl_sync_zone_lsn_tracking() {
     assert_eq!(
         engine
             .registry()
-            .table_entry(SCHEMA_TAB_ID)
-            .map_or(0, |e| e.owned_store().map_or(0, Table::current_lsn)),
+            .relation_or_err(SCHEMA_TAB_ID)
+            .map_or(0, Relation::current_lsn),
         5
     );
 
@@ -504,22 +504,22 @@ fn test_ddl_sync_zone_lsn_tracking() {
     assert_eq!(
         engine
             .registry()
-            .table_entry(TABLE_TAB_ID)
-            .map_or(0, |e| e.owned_store().map_or(0, Table::current_lsn)),
+            .relation_or_err(TABLE_TAB_ID)
+            .map_or(0, Relation::current_lsn),
         7
     );
     assert_eq!(
         engine
             .registry()
-            .table_entry(COL_TAB_ID)
-            .map_or(0, |e| e.owned_store().map_or(0, Table::current_lsn)),
+            .relation_or_err(COL_TAB_ID)
+            .map_or(0, Relation::current_lsn),
         7
     );
     assert_eq!(
         engine
             .registry()
-            .table_entry(SCHEMA_TAB_ID)
-            .map_or(0, |e| e.owned_store().map_or(0, Table::current_lsn)),
+            .relation_or_err(SCHEMA_TAB_ID)
+            .map_or(0, Relation::current_lsn),
         5,
         "SCHEMA_TAB stays at the most recent zone that touched it"
     );
@@ -530,15 +530,15 @@ fn test_ddl_sync_zone_lsn_tracking() {
     assert_eq!(
         engine
             .registry()
-            .table_entry(TABLE_TAB_ID)
-            .map_or(0, |e| e.owned_store().map_or(0, Table::current_lsn)),
+            .relation_or_err(TABLE_TAB_ID)
+            .map_or(0, Relation::current_lsn),
         9
     );
     assert_eq!(
         engine
             .registry()
-            .table_entry(COL_TAB_ID)
-            .map_or(0, |e| e.owned_store().map_or(0, Table::current_lsn)),
+            .relation_or_err(COL_TAB_ID)
+            .map_or(0, Relation::current_lsn),
         9
     );
 
@@ -553,8 +553,8 @@ fn test_ddl_sync_zone_lsn_tracking() {
     assert!(users.contains_key(&tid) && users.contains_key(&tid2));
     assert!(users.keys().all(|&t| t >= FIRST_USER_TABLE_ID));
 
-    // max_table_current_lsn is at least the highest zone LSN observed.
-    assert!(engine.registry().max_table_current_lsn() >= 9);
+    // max_current_lsn is at least the highest zone LSN observed.
+    assert!(engine.registry().max_current_lsn() >= 9);
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -571,14 +571,13 @@ fn test_store_detach() {
     let mut engine = CatalogEngine::open(&dir, 1).unwrap();
     let cols = vec![col_def("id", type_code::U64), col_def("val", type_code::U64)];
     let tid = engine.create_table("public.t", &cols, &[0]).unwrap();
-    assert!(engine.registry().owns_stores());
+    assert!(engine.registry().residency().owns_stores());
 
-    engine.registry_mut().detach_user_stores();
-    assert!(!engine.registry().owns_stores());
-    let entry = engine.registry().table_entry(tid).unwrap();
-    assert!(entry.owned_store().is_none());
-    assert!(!entry.open_cursor().valid, "a detached store reads empty");
-    assert_eq!(entry.owned_store().map_or(0, Table::current_lsn), 0);
+    engine.registry_mut().detach();
+    assert!(!engine.registry().residency().owns_stores());
+    let entry = engine.registry().relation_or_err(tid).unwrap();
+    assert!(!entry.cursor().valid, "a detached store reads empty");
+    assert_eq!(entry.current_lsn(), 0);
     engine.dag_mut().invalidate_all();
 
     engine.close();
@@ -598,7 +597,7 @@ fn test_fk_index_metadata_queries() {
     // Create child table with FK to parent
     let child_cols = vec![
         col_def("id", type_code::U64),
-        fk_def("parent_id", gnitz_store::schema::type_code::U64, tid, 0),
+        fk_def("parent_id", gnitz_wire::type_code::U64, tid, 0),
     ];
     let child_tid = engine.create_table("public.child", &child_cols, &[0]).unwrap();
 
@@ -610,12 +609,16 @@ fn test_fk_index_metadata_queries() {
     // Create an explicit index
     let _iid = engine.create_index("public.parent", &["val"], false).unwrap();
 
-    assert!(!engine.registry().index_circuits(tid).is_empty());
-    let ic_cols = engine.registry().index_circuits(tid)[0].col_indices;
+    assert!(!engine
+        .registry()
+        .relation(tid)
+        .map_or(&[][..], Relation::indexes)
+        .is_empty());
+    let ic_cols = engine.registry().relation(tid).map_or(&[][..], Relation::indexes)[0].cols();
     assert_eq!(ic_cols.as_slice(), [1]); // val is column 1
 
     // The index circuit resolves, so its store is reachable.
-    assert!(engine.registry().index_circuit_for_cols(tid, &[1]).is_some());
+    assert!(engine.registry().relation(tid).and_then(|r| r.index_on(&[1])).is_some());
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
@@ -781,18 +784,18 @@ fn test_circuit_table_surface_introspectable() {
 
     // The new schema is SQL-introspectable — `SELECT * FROM CircuitNodes`
     // must return what we just inserted (full-scan path, used by SQL planner).
-    let scan = engine.scan_family(CIRCUIT_NODES_TAB_ID).unwrap().0;
-    assert_eq!(scan.len(), 1, "scan_family must expose CircuitNodes rows");
+    let scan = engine.scan(CIRCUIT_NODES_TAB_ID).unwrap().0;
+    assert_eq!(scan.len(), 1, "scan must expose CircuitNodes rows");
 
     // Compound PK: seek by the 16-byte at-rest `(view_id, node_id)` OPK region.
     let pk_bytes = opk_pk(SysFamily::CircuitNodes.schema(), &[7, 0]);
     let found = engine
         .registry_mut()
-        .seek_family(CIRCUIT_NODES_TAB_ID, &pk_bytes, None)
+        .seek(CIRCUIT_NODES_TAB_ID, &pk_bytes, None)
         .unwrap();
-    assert!(found.is_some(), "seek_family must find CircuitNodes row by PK");
+    assert!(found.is_some(), "seek must find CircuitNodes row by PK");
     let found = found.unwrap();
-    assert_eq!(found.len(), 1, "seek_family must return exactly one row");
+    assert_eq!(found.len(), 1, "seek must return exactly one row");
 
     engine.close();
     let _ = fs::remove_dir_all(&dir);
