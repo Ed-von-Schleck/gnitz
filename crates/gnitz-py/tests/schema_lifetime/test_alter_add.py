@@ -6,7 +6,7 @@ runs and re-opens its shards, so a pre-ALTER shard is read back through the
 per-shard NULL pad on every worker, not just one.
 
 The clause refusals are `admissibility/test_sql_rejections.py`'s; the crash and
-checkpoint replays are `state_lifetime/test_persistence.py`'s; the ALTER racing
+checkpoint replays are `state_lifetime/test_durability.py`'s; the ALTER racing
 live traffic is `interleaving/test_alter_under_traffic.py`'s.
 """
 

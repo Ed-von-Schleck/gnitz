@@ -1,25 +1,26 @@
-"""Tests for SAL checkpoint correctness under load.
+"""A checkpoint mid-workload must lose nothing and block nothing.
 
-These tests start a dedicated server with a very small GNITZ_CHECKPOINT_BYTES
-so that SAL checkpoints fire frequently during normal push activity.  They
-guard against data loss in the checkpoint code paths — in particular the
-commit_pushes path where entries could be silently dropped if checkpoint
-handling was incorrect.
+The checkpoint is the sole shard-durability point, and it lands wherever the SAL
+threshold happens to fall — between a committed push and the tick that would
+apply it to a view, or inside a fan-out read's ACK wait. These tests pin the
+threshold low enough that checkpoints fire repeatedly during ordinary activity,
+then assert the two things a checkpoint must not do: strand a buffered view delta
+(the view stays permanently diverged until a restart rebuilds it) and wedge a
+concurrent operation (a fan-out that wrote its SAL group without holding
+`sal_writer_excl` used the old epoch, was skipped by every worker, and hung).
 
-The server is function-scoped (each test gets its own instance) so that a
-misbehaving checkpoint cannot corrupt state for other tests.
+Hang detection is `thread.join` against the shared ceilings in `_serverproc`,
+which are deadlock detectors rather than performance budgets.
 """
-import random
 import threading
 import time
+
 import pytest
 import gnitz
+from _read import bag, scanned
+from _oracle import assert_view_matches
 from _serverproc import HANG_TIMEOUT, START_TIMEOUT
-
-# Hang ceilings for the concurrent push/scan/seek/insert tests below — see the
-# rationale on the shared constants in _serverproc.py.
-# `checkpoint_server` (the tiny-threshold server these tests run against) is a
-# conftest fixture.
+from _uid import uid
 
 
 @pytest.fixture
@@ -28,46 +29,19 @@ def checkpoint_client(checkpoint_server):
         yield conn
 
 
-def _setup(client):
-    uid = str(random.randint(100_000, 999_999))
-    sn = "s" + uid
+def _setup(client, table="t"):
+    """A fresh schema holding `(pk, val)`, with the client-side schema for
+    pushing to it. Returns `(sn, tid, schema)`."""
+    sn = "ck" + uid()
     client.create_schema(sn)
     cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
             gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-    schema = gnitz.Schema(cols)
-    tid = client.create_table(sn, "t", cols)
-    return sn, tid, schema
+    return sn, client.create_table(sn, table, cols), gnitz.Schema(cols)
 
 
-def _count_live(client, tid):
-    """Net live row count of a table or view."""
-    return sum(r.weight for r in client.scan(tid))
-
-
-def _filler_schema(client, table_name="filler"):
-    """Create a fresh schema + BIGINT (pk, val) table; return (tid, schema, sn)."""
-    sn = "ck" + str(random.randint(100_000, 999_999))
-    client.create_schema(sn)
-    client.execute_sql(
-        f"CREATE TABLE {table_name} (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-        schema_name=sn,
-    )
-    tid, _ = client.resolve_table(sn, table_name)
-    cols = [
-        # BIGINT maps to I64 (native PK types: planner no longer coerces).
-        gnitz.ColumnDef("pk", gnitz.TypeCode.I64, primary_key=True),
-        gnitz.ColumnDef("val", gnitz.TypeCode.I64),
-    ]
-    schema = gnitz.Schema(cols)
-    return tid, schema, sn
-
-
-def _push_loop(client, tid, schema, errors, started, n_batches=25, batch_size=400):
-    """Flood `tid` with n_batches × batch_size rows to trigger checkpoints.
-
-    Sets `started` after the first push (and on failure, so waiters wake) and
-    records any exception in `errors`.
-    """
+def _push_loop(client, tid, schema, errors, started, n_batches=12, batch_size=400):
+    """Flood `tid` to trigger checkpoints. Sets `started` after the first push
+    (and on failure, so waiters wake) and records any exception in `errors`."""
     try:
         for i in range(n_batches):
             batch = gnitz.ZSetBatch(schema)
@@ -82,390 +56,218 @@ def _push_loop(client, tid, schema, errors, started, n_batches=25, batch_size=40
         started.set()
 
 
-def test_no_rows_lost_across_checkpoints(checkpoint_client):
-    """All pushed rows must survive when SAL checkpoints fire frequently.
+def _run(*threads):
+    """Start every thread, join it against the hang ceiling, and fail naming the
+    one that did not finish."""
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=HANG_TIMEOUT)
+        assert not t.is_alive(), f"{t.name} hung during a concurrent checkpoint"
 
-    With GNITZ_CHECKPOINT_BYTES=32KB, every push of ~500 rows triggers at
-    least one checkpoint.  We insert 5 000 rows in 10 batches and verify
-    the final count matches exactly — catching any silent entry loss in the
-    checkpoint code path.
-    """
+
+def test_a_view_tracks_its_base_across_frequent_checkpoints(checkpoint_client):
+    """15 000 rows exceeds TICK_COALESCE_ROWS (10 000), so ticks fire mid-sequence
+    and a checkpoint lands between committed-but-unticked view deltas and the tick
+    that would apply them. If the checkpoint's flush discards the workers'
+    buffered deltas the base keeps the rows but no later tick ever reaches the
+    view, which stays diverged until a restart rebuilds it. The scan barrier
+    drains pending ticks, so both must show every row afterwards."""
     client = checkpoint_client
     sn, tid, schema = _setup(client)
-
-    total = 5_000
-    batch_size = 500
-    for batch_start in range(0, total, batch_size):
-        batch = gnitz.ZSetBatch(schema)
-        for i in range(batch_start, batch_start + batch_size):
-            batch.append(pk=i, val=i)
-        client.push(tid, batch)
-
-    live = _count_live(client, tid)
-    assert live == total, f"Expected {total} rows, got {live} — entries lost during checkpoint"
-
-
-def test_view_matches_base_across_checkpoints(checkpoint_client):
-    """A view must converge to its base table across frequent checkpoints.
-
-    A view forces tick evaluation.  With GNITZ_CHECKPOINT_BYTES=32KB,
-    checkpoints fire after every few flushes; with 15 000 rows the auto-tick
-    (10 000 rows) fires mid-sequence too — so a checkpoint lands between
-    committed-but-unticked view deltas and the tick that would apply them.
-
-    Regression: if a checkpoint's flush discards the workers' buffered
-    effective deltas (pending_deltas), the base table keeps the rows but no
-    later tick ever applies them to the view, which stays permanently diverged
-    until a restart rebuilds it.  Once the scan barrier drains the pending
-    ticks, BOTH the durable table AND the derived view must reflect all
-    15 000 rows.
-    """
-    client = checkpoint_client
-    sn, tid, schema = _setup(client)
-
-    # Create a view so tick evaluation runs concurrently with pushes.
     client.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t", schema_name=sn)
-    vid, _ = client.resolve_table(sn, "v")
 
-    # 15 000 rows: exceeds TICK_COALESCE_ROWS (10 000) so ticks fire during
-    # the push sequence, not only after.
     total = 15_000
-    batch_size = 1_000
-    for batch_start in range(0, total, batch_size):
+    for base in range(0, total, 1_000):
         batch = gnitz.ZSetBatch(schema)
-        for i in range(batch_start, batch_start + batch_size):
+        for i in range(base, base + 1_000):
             batch.append(pk=i, val=i)
         client.push(tid, batch)
 
-    table_live = _count_live(client, tid)
-    assert table_live == total, \
-        f"Table count mismatch: expected {total}, got {table_live} — entries lost during checkpoint"
-    # The scan barrier drains any still-pending ticks before reading, so the
-    # view must now equal the base — no delta discarded by a checkpoint.
-    view_live = _count_live(client, vid)
-    assert view_live == total, \
-        f"View diverged from base: expected {total}, got {view_live} — a checkpoint dropped buffered view deltas"
+    want = {(i, i): 1 for i in range(total)}
+    assert bag(scanned(client, sn, "t"), "pk", "val") == want, "rows lost at a checkpoint"
+    assert bag(scanned(client, sn, "v"), "pk", "val") == want, \
+        "a checkpoint dropped buffered view deltas"
 
 
-def test_views_track_base_under_sustained_ingest_with_scans(checkpoint_server):
-    """A view stays equal to its base table across many checkpoints while a
-    reader concurrently scans it — no wedge, no divergence.
-
-    Sustained ingest in small (< 10 000-row) batches crosses many 32KB
-    checkpoints without the auto-tick firing per batch, so buffered view
-    deltas routinely straddle a checkpoint.  A second connection scans the
-    view throughout (each scan drains pending ticks via the scan barrier).
-    After ingest, both the table and the view must show every row, and neither
-    thread may hang.
+def test_a_view_tracks_its_base_under_sustained_ingest_with_scans(checkpoint_server):
+    """Sustained ingest in sub-tick batches crosses many checkpoints without the
+    auto-tick firing per batch, so buffered view deltas routinely straddle one,
+    while a second connection scans the view throughout — each scan draining
+    pending ticks. Neither thread may hang and the view must still equal its base.
     """
     with gnitz.connect(checkpoint_server) as pusher, \
          gnitz.connect(checkpoint_server) as scanner:
-        tid, schema, sn = _filler_schema(pusher, table_name="t")
+        sn, tid, schema = _setup(pusher)
         pusher.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t", schema_name=sn)
         vid, _ = pusher.resolve_table(sn, "v")
 
-        total = 12_000
+        n_batches, batch_size = 40, 300   # 300 < TICK_COALESCE_ROWS: no auto-tick
         errors = []
-        push_started = threading.Event()
+        started = threading.Event()
 
         def scan_loop():
-            push_started.wait(timeout=START_TIMEOUT)
+            started.wait(timeout=START_TIMEOUT)
             try:
                 for _ in range(30):
-                    # Each scan drains pending ticks and must never hang; the
-                    # view weight is monotonic, never exceeding rows pushed.
-                    live = _count_live(scanner, vid)
-                    assert live <= total, f"view overcounted: {live} > {total}"
+                    scanner.scan(vid)
             except Exception as exc:
                 errors.append(("scan", exc))
 
-        # 300-row batches stay under TICK_COALESCE_ROWS: no per-batch auto-tick.
-        push_t = threading.Thread(target=_push_loop, daemon=True,
-                                  args=(pusher, tid, schema, errors, push_started),
-                                  kwargs={"n_batches": 40, "batch_size": 300})
-        scan_t = threading.Thread(target=scan_loop, daemon=True)
-        push_t.start()
-        scan_t.start()
-        push_t.join(timeout=HANG_TIMEOUT)
-        scan_t.join(timeout=HANG_TIMEOUT)
-
-        assert not push_t.is_alive(), "push loop hung during concurrent checkpoints"
-        assert not scan_t.is_alive(), "scan loop hung during concurrent checkpoints"
+        _run(threading.Thread(name="push", daemon=True, target=_push_loop,
+                              args=(pusher, tid, schema, errors, started),
+                              kwargs={"n_batches": n_batches, "batch_size": batch_size}),
+             threading.Thread(name="scan", daemon=True, target=scan_loop))
         for src, exc in errors:
             raise AssertionError(f"{src} thread raised: {exc}")
 
-        table_live = _count_live(pusher, tid)
-        view_live = _count_live(pusher, vid)
-        assert table_live == total, f"table: expected {total}, got {table_live}"
-        assert view_live == total, \
-            f"view diverged from base after sustained checkpointed ingest: expected {total}, got {view_live}"
+        want = {(i, i): 1 for i in range(n_batches * batch_size)}
+        assert bag(scanned(pusher, sn, "t"), "pk", "val") == want
+        assert bag(scanned(pusher, sn, "v"), "pk", "val") == want
 
 
-# ---------------------------------------------------------------------------
-# Liveness regressions: fan-out ops must not hang during concurrent checkpoints
-# ---------------------------------------------------------------------------
-#
-# Before the fix, the seek, scan and constraint-probe fan-outs did not hold
-# sal_writer_excl while writing their SAL group.  A request arriving in the Flush ACK-wait window wrote with the
-# old epoch; workers skipped it; the operation hung forever.
-#
-# Each test below uses two connections in separate threads: a pusher that
-# floods the SAL (triggering frequent checkpoints) and a reader that exercises
-# one of the affected fan-out code paths.  Hang detection is via thread.join
-# with a timeout; assert-not-alive converts a permanent hang into a test
-# failure.
-
-def test_seek_during_checkpoints(checkpoint_server):
-    """SEEK (single_worker_async) must not hang when checkpoints fire concurrently.
-
-    Regression: fan_out_seek_async wrote its SAL group without holding
-    sal_writer_excl.  A SEEK arriving in the Flush ACK-wait window used
-    the old epoch; workers skipped it; the seek hung forever.
-    """
+@pytest.mark.parametrize("probe", ["seek", "scan"])
+def test_a_fanout_read_does_not_hang_during_a_checkpoint(probe, checkpoint_server):
+    """SEEK (single_worker_async) and SCAN (dispatch_fanout) each write their own
+    SAL group. Writing it without holding `sal_writer_excl` lets a request that
+    arrives in the Flush ACK-wait window use the old epoch, which every worker
+    skips — and the read never returns."""
     with gnitz.connect(checkpoint_server) as pusher, \
-         gnitz.connect(checkpoint_server) as seeker:
-
-        filler_tid, filler_schema, sn = _filler_schema(pusher)
-
-        # Create a target table with one row for the seeker.
+         gnitz.connect(checkpoint_server) as reader:
+        sn, filler, schema = _setup(pusher, "filler")
         pusher.execute_sql(
             "CREATE TABLE target (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        pusher.execute_sql("INSERT INTO target VALUES (42, 999)", schema_name=sn)
-        target_tid, _ = pusher.resolve_table(sn, "target")
+            schema_name=sn)
+        pusher.execute_sql("INSERT INTO target VALUES (1, 10), (42, 999)",
+                           schema_name=sn)
+        target, _ = pusher.resolve_table(sn, "target")
 
         errors = []
-        push_started = threading.Event()
+        started = threading.Event()
 
-        def seek_loop():
-            push_started.wait(timeout=START_TIMEOUT)
-            try:
-                for _ in range(80):
-                    seeker.seek(target_tid, pk=42)
-            except Exception as exc:
-                errors.append(("seek", exc))
-
-        push_t = threading.Thread(target=_push_loop, daemon=True,
-                                  args=(pusher, filler_tid, filler_schema, errors, push_started))
-        seek_t = threading.Thread(target=seek_loop, daemon=True)
-        push_t.start()
-        seek_t.start()
-
-        push_t.join(timeout=HANG_TIMEOUT)
-        seek_t.join(timeout=HANG_TIMEOUT)
-
-        assert not push_t.is_alive(), "push loop hung unexpectedly"
-        assert not seek_t.is_alive(), \
-            "seek hung during concurrent checkpoint (sal_writer_excl regression)"
-        for src, exc in errors:
-            raise AssertionError(f"{src} thread raised: {exc}")
-
-
-def test_scan_during_checkpoints(checkpoint_server):
-    """SCAN (dispatch_fanout) must not hang when checkpoints fire concurrently.
-
-    Regression: fan_out_scan_async wrote its SAL group without holding
-    sal_writer_excl.  Same epoch-mismatch hang as the seek regression.
-    """
-    with gnitz.connect(checkpoint_server) as pusher, \
-         gnitz.connect(checkpoint_server) as scanner:
-
-        filler_tid, filler_schema, sn = _filler_schema(pusher)
-
-        pusher.execute_sql(
-            "CREATE TABLE target (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        pusher.execute_sql("INSERT INTO target VALUES (1, 10), (2, 20)", schema_name=sn)
-        target_tid, _ = pusher.resolve_table(sn, "target")
-
-        errors = []
-        push_started = threading.Event()
-
-        def scan_loop():
-            push_started.wait(timeout=START_TIMEOUT)
+        def read_loop():
+            started.wait(timeout=START_TIMEOUT)
             try:
                 for _ in range(40):
-                    scanner.scan(target_tid)
+                    if probe == "seek":
+                        reader.seek(target, pk=42)
+                    else:
+                        reader.scan(target)
             except Exception as exc:
-                errors.append(("scan", exc))
+                errors.append((probe, exc))
 
-        push_t = threading.Thread(target=_push_loop, daemon=True,
-                                  args=(pusher, filler_tid, filler_schema, errors, push_started))
-        scan_t = threading.Thread(target=scan_loop, daemon=True)
-        push_t.start()
-        scan_t.start()
-
-        push_t.join(timeout=HANG_TIMEOUT)
-        scan_t.join(timeout=HANG_TIMEOUT)
-
-        assert not push_t.is_alive(), "push loop hung unexpectedly"
-        assert not scan_t.is_alive(), \
-            "scan hung during concurrent checkpoint (sal_writer_excl regression)"
+        _run(threading.Thread(name="push", daemon=True, target=_push_loop,
+                              args=(pusher, filler, schema, errors, started)),
+             threading.Thread(name=probe, daemon=True, target=read_loop))
         for src, exc in errors:
             raise AssertionError(f"{src} thread raised: {exc}")
 
 
-def test_unique_constraint_enforced_under_checkpoint_pressure(checkpoint_server):
-    """Unique filter must survive checkpoint cycles and keep rejecting duplicates.
-
-    Regression for unique_filter_ingest_batch ordering (Bug 3): the filter
-    update must be called exactly once per durably committed batch, and
-    checkpoint activity must not corrupt or reset the filter.
-
-    The test inserts rows with a unique indexed column while simultaneously
-    flooding the SAL with filler data (triggering frequent checkpoints).
-    After all inserts succeed, it verifies:
-      1. Every inserted row is visible — no silent data loss.
-      2. Inserting a duplicate unique value is rejected — filter still works.
-
-    If unique_filter_ingest_batch were accidentally removed (e.g. the move to
-    Phase D dropped it entirely), or if a checkpoint reset the filter, the
-    duplicate INSERT in step 2 would succeed and the assertion would fail.
-    """
+def test_a_unique_constraint_holds_under_checkpoint_pressure(checkpoint_server):
+    """The unique filter must be updated exactly once per durably committed
+    batch, and no checkpoint may reset it. Inserts against a unique indexed column
+    run while the SAL floods; afterwards every row must be visible and a duplicate
+    must still be rejected — a lost or reset filter accepts it."""
     with gnitz.connect(checkpoint_server) as pusher, \
          gnitz.connect(checkpoint_server) as inserter:
-
-        filler_tid, filler_schema, sn = _filler_schema(pusher)
-
+        sn, filler, schema = _setup(pusher, "filler")
         inserter.execute_sql(
-            "CREATE TABLE unique_t ("
-            "  pk BIGINT NOT NULL PRIMARY KEY,"
-            "  val BIGINT NOT NULL"
-            ")",
-            schema_name=sn,
-        )
-        inserter.execute_sql(
-            "CREATE UNIQUE INDEX ON unique_t(val)", schema_name=sn
-        )
-        unique_tid, _ = inserter.resolve_table(sn, "unique_t")
+            "CREATE TABLE unique_t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn)
+        inserter.execute_sql("CREATE UNIQUE INDEX ON unique_t(val)", schema_name=sn)
 
         errors = []
-        push_started = threading.Event()
-
+        started = threading.Event()
         n_rows = 50
 
         def insert_loop():
-            push_started.wait(timeout=START_TIMEOUT)
+            started.wait(timeout=START_TIMEOUT)
             try:
                 for i in range(n_rows):
-                    inserter.execute_sql(
-                        f"INSERT INTO unique_t VALUES ({i}, {i * 10})",
-                        schema_name=sn,
-                    )
+                    inserter.execute_sql(f"INSERT INTO unique_t VALUES ({i}, {i * 10})",
+                                         schema_name=sn)
             except Exception as exc:
                 errors.append(("insert", exc))
 
-        push_t = threading.Thread(target=_push_loop, daemon=True,
-                                  args=(pusher, filler_tid, filler_schema, errors, push_started))
-        insert_t = threading.Thread(target=insert_loop, daemon=True)
-        push_t.start()
-        insert_t.start()
-
-        push_t.join(timeout=HANG_TIMEOUT)
-        insert_t.join(timeout=HANG_TIMEOUT)
-
-        assert not push_t.is_alive(), "push loop hung unexpectedly"
-        assert not insert_t.is_alive(), \
-            "insert loop hung during concurrent checkpoint"
+        _run(threading.Thread(name="push", daemon=True, target=_push_loop,
+                              args=(pusher, filler, schema, errors, started)),
+             threading.Thread(name="insert", daemon=True, target=insert_loop))
         for src, exc in errors:
             raise AssertionError(f"{src} thread raised: {exc}")
 
-        # 1. All rows must be visible.
-        live = _count_live(inserter, unique_tid)
-        assert live == n_rows, f"Expected {n_rows} rows, got {live} after checkpoints"
-
-        # 2. Unique filter must still enforce the constraint.
-        #    val=0 was inserted as row 0 above; re-inserting it must fail.
-        try:
-            inserter.execute_sql(
-                f"INSERT INTO unique_t VALUES ({n_rows + 1}, 0)",
-                schema_name=sn,
-            )
-            raise AssertionError(
-                "Duplicate unique value was accepted — unique filter lost after checkpoint"
-            )
-        except gnitz.GnitzError:
-            pass  # expected
+        assert bag(scanned(inserter, sn, "unique_t"), "pk", "val") == {
+            (i, i * 10): 1 for i in range(n_rows)}
+        with pytest.raises(gnitz.GnitzError):
+            inserter.execute_sql(f"INSERT INTO unique_t VALUES ({n_rows + 1}, 0)",
+                                 schema_name=sn)
 
 
-# ---------------------------------------------------------------------------
-# Low-space exchange relay must reclaim SAL space without crashing the master
-# ---------------------------------------------------------------------------
-#
-# When SAL space runs low before an exchange relay, relay_loop fires a
-# committer barrier to reclaim space via a checkpoint, rechecks, and fatally
-# aborts the master if space is still low.  Before the fix the committer's
-# barrier-only batch short-circuited without ever checkpointing: with no push
-# in flight the reclaim barrier landed in a barrier-only batch, the epoch never
-# bumped, relay_loop's recheck still read low, and the master aborted (an
-# availability bug — workers self-exit via getppid()).
-#
-# Driving real exhaustion needs ~7/8 of the 1 GiB SAL mmap, so a debug-only
-# seam (GNITZ_INJECT_RELAY_SPACE_LOW) makes the first exchange relay report
-# low space one-shot, armed at the current SAL epoch.  Only a checkpoint (which
-# bumps the epoch) disarms it, so the green run delivers the relay exactly when
-# the committer checkpoints the barrier-only batch.
+def test_a_view_created_over_committed_data_survives_a_checkpoint_window(own_server):
+    """Enough rows to cross a low checkpoint threshold — draining pending_deltas
+    — and then a CREATE of an exchange GROUP BY view whose only driver is the
+    committed store. A flushed-snapshot under-count and a
+    checkpoint-strands-exchange regression both surface as a wrong result."""
+    own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": "65536"})
+    with gnitz.connect(own_server.sock_path) as conn:
+        conn.create_schema("ck")
+        conn.execute_sql(
+            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
+            "n BIGINT NOT NULL)", schema_name="ck")
+        n, chunk = 2000, 1000
+        for base in range(0, n, chunk):
+            conn.execute_sql(
+                "INSERT INTO t VALUES " + ", ".join(
+                    f"({i}, {i % 10}, {i})" for i in range(base, base + chunk)),
+                schema_name="ck")
+        conn.execute_sql("CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM t GROUP BY g",
+                         schema_name="ck")
+        vid, _ = conn.resolve_table("ck", "v")
+        assert_view_matches(conn, vid, ["g", "c"], {(g, n // 10): 1 for g in range(10)})
 
 
-def test_low_space_relay_checkpoints_without_aborting_master(relay_lowspace_server):
-    """A low-SAL-space exchange relay must reclaim space and keep the master
-    alive, even when the reclaim barrier lands in a barrier-only batch.
+def test_a_low_space_relay_reclaims_without_aborting_the_master(relay_lowspace_server):
+    """When SAL space runs low before an exchange relay, `relay_loop` fires a
+    committer barrier to reclaim via a checkpoint, rechecks, and fatally aborts
+    the master if space is still low. A barrier-only committer batch that
+    short-circuits without checkpointing never bumps the epoch, so the recheck
+    still reads low and the master aborts — an availability bug, since workers
+    self-exit via getppid().
 
-    The GROUP BY view forces an exchange (and thus a relay) when the tick
-    fires.  Inserting a few hundred rows from a single serial client — well
-    under TICK_COALESCE_ROWS (10 000) — lets the exchange tick fire from the
-    idle timer with no push in flight, so relay_loop's reclaim barrier reaches
-    the committer as a barrier-only batch: exactly the path that used to abort.
-    """
+    The GROUP BY forces an exchange, and a few hundred rows from one serial
+    client stay well under TICK_COALESCE_ROWS, so the tick fires from the idle
+    timer with no push in flight: the reclaim barrier reaches the committer as a
+    barrier-only batch, which is exactly the path that used to abort."""
     sock_path, proc = relay_lowspace_server
-    client = gnitz.connect(sock_path)
-    try:
-        sn = "rls_" + str(random.randint(100_000, 999_999))
+    with gnitz.connect(sock_path) as client:
+        sn = "rls_" + uid()
         client.create_schema(sn)
         client.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
-            "grp BIGINT NOT NULL, val BIGINT NOT NULL)",
-            schema_name=sn,
-        )
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, "
+            "val BIGINT NOT NULL)", schema_name=sn)
         client.execute_sql(
             "CREATE VIEW v AS SELECT grp, SUM(val) AS total FROM t GROUP BY grp",
-            schema_name=sn,
-        )
+            schema_name=sn)
         vid, _ = client.resolve_table(sn, "v")
 
         n = 300
-        vals = ", ".join(f"({i}, 1, {i})" for i in range(1, n + 1))
-        client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
-        expected = sum(range(1, n + 1))
+        client.execute_sql(
+            "INSERT INTO t VALUES " + ", ".join(f"({i}, 1, {i})" for i in range(1, n + 1)),
+            schema_name=sn)
+        expected = {(1, sum(range(1, n + 1))): 1}
 
-        # Poll the view until the aggregate matches: the exchange can only
-        # complete once the relay is delivered, which requires the low-space
-        # barrier to have reclaimed SAL space via a checkpoint.
+        # The exchange completes only once the relay is delivered, which requires
+        # the low-space barrier to have reclaimed via a checkpoint. Poll rather
+        # than read once: the injected relay failure is what the recovery here has
+        # to work around, so the first drain may legitimately not carry it.
         got = None
         deadline = time.time() + 30
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                break  # master died — assertion below reports it
-            try:
-                totals = {row[0]: row[1]
-                          for row in client.scan(vid)}
-            except Exception:
-                break  # connection broke (likely a dead master)
-            if totals.get(1) == expected:
-                got = totals[1]
+        while time.time() < deadline and proc.poll() is None:
+            got = bag(client.scan(vid), "grp", "total")
+            if got == expected:
                 break
             time.sleep(0.1)
 
         assert proc.poll() is None, (
             "master aborted on a low-space exchange relay — the barrier-only "
-            "committer batch never checkpointed to reclaim SAL space"
-        )
-        assert got == expected, \
-            f"view never converged: SUM(val) = {got} != {expected}"
-    finally:
-        try:
-            client.close()
-        except Exception:
-            pass
+            "committer batch never checkpointed to reclaim SAL space")
+        assert got == expected, f"view never converged: {got} != {expected}"

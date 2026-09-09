@@ -175,6 +175,13 @@ class ServerProc:
         env = test_server_env()
         env.update(self.extra_env)     # config of this server, every boot
         env.update(spawn_env or {})    # this boot only
+        # A `GNITZ_INJECT_*` var names a `#[cfg(debug_assertions)]` seam a release
+        # build folds away, leaving the test asserting against an ordinary healthy
+        # run. Read off the prefix here rather than at the call site, so no boot
+        # that arms a seam can forget it — the same rule `dedicated_server` applies.
+        seams = [k for k in env if k.startswith("GNITZ_INJECT_")]
+        if seams and not is_debug_build():
+            pytest.skip(f"injection seam requires a debug build: {', '.join(seams)}")
         # A killed server leaves its socket behind and the next bind would fail.
         self.clear_socket()
         # Where this boot's output starts, so `log_text` can exclude the last.
@@ -314,25 +321,39 @@ class ServerProc:
     def log_tail(self, max_bytes=4096):
         return self.log_text()[-max_bytes:]
 
-    def rebuilt_view_count(self):
-        """N from the most recent `recovery: rebuilding N invalid view(s)`
-        marker the master printed at boot, or None if it never printed one.
-        0 means every view resumed from its checkpoint."""
-        matches = re.findall(r"recovery: rebuilding (\d+) invalid view", self.log_text())
-        return int(matches[-1]) if matches else None
-
-    def rebuilt_index_counts(self):
-        """The sibling index marker, per launched worker. Worker-side because the
-        boot index rebuild runs after the child redirected fd 1 to its own log,
-        so the master log never sees it. Worker logs are truncated per boot, so
-        the last marker in each is this boot's."""
-        counts = []
+    def worker_log_texts(self):
+        """Each launched worker's log. Worker-side markers exist because a child
+        redirects fd 1 to its own log before it prints them, so the master log
+        never sees them. Worker logs are truncated per boot, so the last marker
+        in each is this boot's."""
+        texts = []
         for w in range(self.workers):
             with open(os.path.join(self.data_dir, f"worker_{w}.log")) as f:
-                markers = re.findall(r"recovery: rebuilding (\d+) index\(es\)", f.read())
+                texts.append(f.read())
+        return texts
+
+    def rebuilt_view_count(self):
+        """N from the most recent `recovery: rebuilding N invalid view(s)` marker
+        the master printed at boot. 0 means every view resumed from its
+        checkpoint. The marker is unconditional, so its absence is a harness
+        fault rather than a count of zero."""
+        matches = re.findall(r"recovery: rebuilding (\d+) invalid view", self.log_text())
+        assert matches, f"master printed no view-rebuild marker\n{self.log_tail()}"
+        return int(matches[-1])
+
+    def rebuilt_index_counts(self):
+        """The sibling index marker, per launched worker."""
+        counts = []
+        for w, text in enumerate(self.worker_log_texts()):
+            markers = re.findall(r"recovery: rebuilding (\d+) index\(es\)", text)
             assert markers, f"worker {w} printed no index-rebuild marker"
             counts.append(int(markers[-1]))
         return counts
+
+    def sal_checkpoints(self):
+        """How many SAL checkpoint resets this boot has logged. Only visible at
+        `GNITZ_LOG_LEVEL=normal`, so a test reading it must set that."""
+        return self.log_text().count("SAL checkpoint epoch=")
 
 
 # Deadlock ceilings for concurrent-thread tests, NOT performance budgets. The
