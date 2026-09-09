@@ -1,7 +1,7 @@
 """The fed views two suites share, and the weight-exact comparison over them.
 
-`test_delta_feed.py` drives the feed by hand — bootstrap, poll, apply — and
-`test_mirror.py` drives the same views through a mirroring client, which does
+`storage_policy/test_delta_feed.py` drives the feed by hand — bootstrap, poll, apply — and
+`client_surface/test_mirror.py` drives the same views through a mirroring client, which does
 that for it. Both need the same base tables, the same churn (inserts, an UPDATE
 and a DELETE, so a round carries retractions and not just insertions), the same four
 view bodies, and the same `{row → net weight}` comparison. Keeping one copy here

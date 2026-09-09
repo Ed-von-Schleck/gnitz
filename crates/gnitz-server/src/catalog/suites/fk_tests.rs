@@ -268,7 +268,7 @@ fn test_push_reads_committed_state() {
 
 // (test_fk_parent_restrict_blocks_delete removed: it existed only to exercise
 // a deleted test-only inline parent-restrict check. FK
-// RESTRICT-on-DELETE is covered end-to-end by gnitz-py/tests/test_fk.py.)
+// RESTRICT-on-DELETE is covered end-to-end by gnitz-py/tests/admissibility/test_fk.py.)
 
 // ── test_fk_multiple_children_same_parent ───────────────────────────
 
