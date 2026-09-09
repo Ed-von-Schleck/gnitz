@@ -1,165 +1,49 @@
-"""Upsert, delete-by-PK and retraction across a partitioned table.
+"""Upsert and delete-by-PK across a partitioned table.
 
-Which worker owns a PK is the engine's business, so a write addressed by PK
-has to reach that worker and only that one — and a passthrough view over the
-table has to show the retraction, not just the insert.
+Which worker owns a PK is the engine's business, so a write addressed by PK has
+to reach that worker and only that one. At one worker the routing is a no-op and
+these pass without having checked it, which is what the module-level skip
+records.
 """
 
-import os
-import pytest
-from _uid import uid as _uid
+from _serverproc import NEEDS_MULTI
 
-_NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
-_NEEDS_MULTI = pytest.mark.skipif(
-    _NUM_WORKERS < 2, reason="requires GNITZ_WORKERS >= 2"
-)
+pytestmark = NEEDS_MULTI
+
+_CREATE = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
 
 
-def _drop_all(client, sn, tables=(), views=(), indices=()):
-    for idx in indices:
-        try:
-            client.execute_sql(f"DROP INDEX {idx}", schema_name=sn)
-        except Exception:
-            pass
-    for v in views:
-        try:
-            client.execute_sql(f"DROP VIEW {v}", schema_name=sn)
-        except Exception:
-            pass
-    for t in tables:
-        try:
-            client.execute_sql(f"DROP TABLE {t}", schema_name=sn)
-        except Exception:
-            pass
-    client.drop_schema(sn)
+def test_upsert_reaches_the_owning_worker(client, schema_name):
+    """`ON CONFLICT DO UPDATE` on a committed PK replaces that row wherever it
+    lives: one row survives, at the new value and weight 1. A conflict resolved
+    on the wrong worker would leave the original beside the new one."""
+    client.execute_sql(_CREATE, schema_name=schema_name)
+    client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=schema_name)
+    client.execute_sql(
+        "INSERT INTO t VALUES (1, 200) ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
+        schema_name=schema_name,
+    )
+
+    tid = client.resolve_table(schema_name, "t")[0]
+    rows = list(client.scan(tid))
+    assert [(r.pk, r.val, r.weight) for r in rows] == [(1, 200, 1)]
 
 
+def test_delete_by_pk_retracts_on_the_owning_worker_and_in_a_view(client, schema_name):
+    """A DELETE addressed by PK retracts on exactly the worker holding it, and
+    the retraction reaches a passthrough view fanned out over every worker —
+    which is where a delete routed to the wrong partition would show up as a row
+    the base table has lost but the view still carries."""
+    client.execute_sql(_CREATE, schema_name=schema_name)
+    client.execute_sql("CREATE VIEW v AS SELECT * FROM t", schema_name=schema_name)
+    client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+                       schema_name=schema_name)
+    client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=schema_name)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-@_NEEDS_MULTI
-def test_unique_pk_across_workers(client):
-    """
-    SQL-standard ON CONFLICT DO UPDATE works correctly across workers:
-    re-inserting the same PK via explicit UPSERT replaces the row.
-    Scan must return exactly 1 row with the updated value.
-    """
-    sn = "w" + _uid()
-    client.create_schema(sn)
-    try:
-        client.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
-        client.execute_sql(
-            "INSERT INTO t VALUES (1, 200) "
-            "ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
-            schema_name=sn,
-        )
-
-        tid, _ = client.resolve_table(sn, "t")
-        result = client.scan(tid)
-        rows = list(result)
-        assert len(rows) == 1, f"expected 1 row after upsert, got {len(rows)}"
-        assert rows[0].pk == 1
-        assert rows[0].val == 200
-    finally:
-        _drop_all(client, sn, tables=["t"])
-
-@_NEEDS_MULTI
-def test_workers_view_passthrough(client):
-    """SQL passthrough view; push rows; scan view → all rows."""
-    sn = "w" + _uid()
-    client.create_schema(sn)
-    try:
-        client.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        client.execute_sql("CREATE VIEW v AS SELECT * FROM t", schema_name=sn)
-        client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", schema_name=sn)
-
-        vid, _ = client.resolve_table(sn, "v")
-        pks = sorted(r.pk for r in client.scan(vid))
-        assert pks == [1, 2, 3]
-    finally:
-        _drop_all(client, sn, views=["v"], tables=["t"])
-
-@_NEEDS_MULTI
-def test_workers_view_deletes(client):
-    """Push inserts then retractions; passthrough view shows only non-retracted rows."""
-    sn = "w" + _uid()
-    client.create_schema(sn)
-    try:
-        client.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        client.execute_sql("CREATE VIEW v AS SELECT * FROM t", schema_name=sn)
-        client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", schema_name=sn)
-        client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
-
-        vid, _ = client.resolve_table(sn, "v")
-        pks = sorted(r.pk for r in client.scan(vid))
-        assert pks == [1, 3]
-    finally:
-        _drop_all(client, sn, views=["v"], tables=["t"])
-
-@_NEEDS_MULTI
-def test_workers_upsert(client):
-    """Insert PK=1 val=10, then UPSERT PK=1 val=99; scan → one row with val=99."""
-    sn = "w" + _uid()
-    client.create_schema(sn)
-    try:
-        client.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
-        client.execute_sql(
-            "INSERT INTO t VALUES (1, 99) "
-            "ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
-            schema_name=sn,
-        )
-
-        tid, _ = client.resolve_table(sn, "t")
-        rows = list(client.scan(tid))
-        assert len(rows) == 1
-        assert rows[0].pk == 1
-        assert rows[0].val == 99
-    finally:
-        _drop_all(client, sn, tables=["t"])
-
-@_NEEDS_MULTI
-def test_workers_delete_by_pk(client):
-    """Push 3 rows; delete PK=2; scan → 2 rows (PK=1,3)."""
-    sn = "w" + _uid()
-    client.create_schema(sn)
-    try:
-        client.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", schema_name=sn)
-        client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
-
-        tid, _ = client.resolve_table(sn, "t")
-        pks = sorted(r.pk for r in client.scan(tid))
-        assert pks == [1, 3]
-    finally:
-        _drop_all(client, sn, tables=["t"])
+    tid = client.resolve_table(schema_name, "t")[0]
+    vid = client.resolve_table(schema_name, "v")[0]
+    expected = [(1, 10, 1), (3, 30, 1)]
+    assert sorted((r.pk, r.val, r.weight) for r in client.scan(tid)) == expected
+    # A view runs no `enforce_unique_pk`, so a doubly-applied tick would keep
+    # this row set and double the weights.
+    assert sorted((r.pk, r.val, r.weight) for r in client.scan(vid)) == expected

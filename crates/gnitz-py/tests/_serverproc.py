@@ -33,6 +33,10 @@ import time
 # deadline, so the interval buys nothing but granularity.
 _READY_POLL_S = 0.002
 
+# What the server prints once its listeners are up — the last line of boot.
+# See `ServerProc.start` for why the socket file is not the readiness signal.
+_READY_MARKER = "GnitzDB ready"
+
 import pytest
 
 from _paths import REPO_ROOT
@@ -186,7 +190,15 @@ class ServerProc:
             log.close()
 
     def start(self, *, workers=None, extra_env=None, timeout=10.0):
-        """Spawn and wait until the socket exists. Returns self.
+        """Spawn and wait until the server declares itself ready. Returns self.
+
+        Readiness is the server's own `GnitzDB ready`, not the socket file:
+        `UnixListener::bind` publishes that file several steps earlier, so a
+        server that binds and then dies leaves one behind. Waiting on the file
+        would return here successfully and hand the test a bare `ECONNREFUSED`
+        at its first connect, with the crash that caused it only in the log.
+        Liveness is therefore checked before readiness on every pass, so such a
+        boot fails here naming the exit code and the log.
 
         `workers` sticks — a later `restart()` reboots at the same count.
         `extra_env` applies to *this boot only*, which is what a fault injected
@@ -197,16 +209,16 @@ class ServerProc:
         self.proc = self._popen(extra_env)
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if os.path.exists(self.sock_path):
-                return self
             if self.proc.poll() is not None:
                 raise RuntimeError(
-                    f"server exited rc={self.proc.returncode} before binding "
-                    f"{self.sock_path}\n{self.log_tail()}"
+                    f"server exited rc={self.proc.returncode} before becoming ready "
+                    f"on {self.sock_path}\n{self.log_tail()}"
                 )
+            if _READY_MARKER in self.log_text():
+                return self
             time.sleep(_READY_POLL_S)
         self.stop()
-        raise RuntimeError(f"server did not start (no socket)\n{self.log_tail()}")
+        raise RuntimeError(f"server did not start (never reported ready)\n{self.log_tail()}")
 
     def start_expecting_exit(self, *, workers=None, extra_env=None, timeout=20.0):
         """Spawn a server expected to die during boot. Returns its non-zero exit

@@ -24,7 +24,6 @@ workers, and a single-worker run skips the concatenation entirely.
 
 import pytest
 import gnitz
-from _uid import uid as _uid
 
 
 # `ReadSpec`'s wire cap on a `pk IN (…)` gather; DML chunks past it.
@@ -38,30 +37,18 @@ UUID_B = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 
 
 
-@pytest.fixture
-def sn(client):
-    """A private schema, dropped however the test leaves it."""
-    name = "wp" + _uid()
-    client.create_schema(name)
-    yield name
-    try:
-        client.drop_schema(name)
-    except Exception:
-        pass
+def _sql(client, schema_name, *statements):
+    return client.execute_sql("; ".join(statements), schema_name=schema_name)
 
 
-def _sql(client, sn, *statements):
-    return client.execute_sql("; ".join(statements), schema_name=sn)
-
-
-def _rows(client, sn, sql):
-    res = client.execute_sql(sql, schema_name=sn)
+def _rows(client, schema_name, sql):
+    res = client.execute_sql(sql, schema_name=schema_name)
     assert res[0]["type"] == "Rows", f"expected Rows, got {res[0]['type']}"
     return list(res[0]["rows"])
 
 
-def _count(client, sn, table="t"):
-    return _rows(client, sn, f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
+def _count(client, schema_name, table="t"):
+    return _rows(client, schema_name, f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
 
 
 # ---------------------------------------------------------------------------
@@ -70,55 +57,58 @@ def _count(client, sn, table="t"):
 # ---------------------------------------------------------------------------
 
 
-def test_delete_by_predicate_leaves_a_text_payload_untouched(client, sn):
+def test_delete_by_predicate_leaves_a_text_payload_untouched(client, schema_name):
     """DELETE reads keys only, so the TEXT column is never fetched — and every
     surviving row must still carry it verbatim."""
     client.execute_sql(
         "CREATE TABLE t (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, v BIGINT NOT NULL, s TEXT NOT NULL)",
-        schema_name=sn,
+        schema_name=schema_name,
     )
     want = {i: ("kept" if i % 3 else "doomed") + "-" * i for i in range(1, 40)}
-    for i, s in want.items():
-        client.execute_sql(f"INSERT INTO t VALUES ({i}, {i % 3}, '{s}')", schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO t VALUES " + ", ".join(f"({i}, {i % 3}, '{v}')" for i, v in want.items()),
+        schema_name=schema_name)
 
-    res = client.execute_sql("DELETE FROM t WHERE v = 0", schema_name=sn)
+    res = client.execute_sql("DELETE FROM t WHERE v = 0", schema_name=schema_name)
     assert res[0]["count"] == len([i for i in want if i % 3 == 0])
 
-    survivors = {r["id"]: r["s"] for r in _rows(client, sn, "SELECT id, s FROM t")}
+    survivors = {r["id"]: r["s"] for r in _rows(client, schema_name, "SELECT id, s FROM t")}
     assert survivors == {i: s for i, s in want.items() if i % 3}
 
 
-def test_delete_by_predicate_on_a_compound_pk_table(client, sn):
+def test_delete_by_predicate_on_a_compound_pk_table(client, schema_name):
     """The PK-only reply carries both key columns, at their own byte offsets."""
     client.execute_sql(
         "CREATE TABLE t (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL, "
         "v BIGINT NOT NULL, s TEXT NOT NULL, PRIMARY KEY (a, b))",
-        schema_name=sn,
+        schema_name=schema_name,
     )
     rows = [(a, b, a * 10 + b) for a in range(1, 4) for b in range(1, 4)]
-    for a, b, v in rows:
-        client.execute_sql(f"INSERT INTO t VALUES ({a}, {b}, {v}, 'p{a}{b}')", schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO t VALUES " + ", ".join(f"({a}, {b}, {v}, 'p{a}{b}')" for a, b, v in rows),
+        schema_name=schema_name)
 
-    res = client.execute_sql("DELETE FROM t WHERE v = 22", schema_name=sn)
+    res = client.execute_sql("DELETE FROM t WHERE v = 22", schema_name=schema_name)
     assert res[0]["count"] == 1
-    got = sorted((r["a"], r["b"]) for r in _rows(client, sn, "SELECT a, b FROM t"))
+    got = sorted((r["a"], r["b"]) for r in _rows(client, schema_name, "SELECT a, b FROM t"))
     assert got == sorted((a, b) for a, b, v in rows if v != 22)
 
 
-def test_delete_by_predicate_after_drop_column(client, sn):
+def test_delete_by_predicate_after_drop_column(client, schema_name):
     """A dropped column leaves a hidden physical slot. The key reply names only
     the PK columns, so the hidden slot cannot leak into it or shift it."""
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, gone BIGINT NOT NULL, v BIGINT NOT NULL)",
-        schema_name=sn,
+        schema_name=schema_name,
     )
-    for i in range(1, 7):
-        client.execute_sql(f"INSERT INTO t VALUES ({i}, {i * 100}, {i % 2})", schema_name=sn)
-    client.execute_sql("ALTER TABLE t DROP COLUMN gone", schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO t VALUES " + ", ".join(f"({i}, {i * 100}, {i % 2})" for i in range(1, 7)),
+        schema_name=schema_name)
+    client.execute_sql("ALTER TABLE t DROP COLUMN gone", schema_name=schema_name)
 
-    res = client.execute_sql("DELETE FROM t WHERE v = 1", schema_name=sn)
+    res = client.execute_sql("DELETE FROM t WHERE v = 1", schema_name=schema_name)
     assert res[0]["count"] == 3
-    got = sorted((r["id"], r["v"]) for r in _rows(client, sn, "SELECT * FROM t"))
+    got = sorted((r["id"], r["v"]) for r in _rows(client, schema_name, "SELECT * FROM t"))
     assert got == [(2, 0), (4, 0), (6, 0)]
 
 
@@ -137,60 +127,60 @@ def test_delete_by_predicate_after_drop_column(client, sn):
         ("UUID", f"'{UUID_A}'", f"'{UUID_B}'"),
     ],
 )
-def test_wide_key_equality_in_a_written_transaction(client, sn, pk_sql, key, other):
+def test_wide_key_equality_in_a_written_transaction(client, schema_name, pk_sql, key, other):
     """A key literal no compiled predicate can carry: the bound applies it
     byte-exactly, and the buffered candidates are restricted to that key, so
     nothing reaches the VM's wide-literal gate."""
     client.execute_sql(
         f"CREATE TABLE t (id {pk_sql} NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-        schema_name=sn,
+        schema_name=schema_name,
     )
-    client.execute_sql(f"INSERT INTO t VALUES ({key}, 1), ({other}, 2)", schema_name=sn)
+    client.execute_sql(f"INSERT INTO t VALUES ({key}, 1), ({other}, 2)", schema_name=schema_name)
 
     # The transaction writes the table first, so the net map is non-empty for
     # every statement that follows.
     res = _sql(
         client,
-        sn,
+        schema_name,
         "BEGIN",
         f"UPDATE t SET v = 7 WHERE id = {other}",
         f"UPDATE t SET v = 9 WHERE id = {key}",
         "COMMIT",
     )
     assert res[2]["count"] == 1, "the wide-key UPDATE must find its row"
-    assert sorted(r["v"] for r in _rows(client, sn, "SELECT v FROM t")) == [7, 9]
+    assert sorted(r["v"] for r in _rows(client, schema_name, "SELECT v FROM t")) == [7, 9]
 
     res = _sql(
         client,
-        sn,
+        schema_name,
         "BEGIN",
         f"UPDATE t SET v = 8 WHERE id = {other}",
         f"DELETE FROM t WHERE id = {key}",
         "COMMIT",
     )
     assert res[2]["count"] == 1, "the wide-key DELETE must find its row"
-    assert _count(client, sn) == 1
+    assert _count(client, schema_name) == 1
 
 
-def test_uuid_in_list_in_a_written_transaction(client, sn):
+def test_uuid_in_list_in_a_written_transaction(client, schema_name):
     """The gather form of the same shape: a UUID `IN (…)` list is consumed into
     an exact key set, and its residual is empty."""
     client.execute_sql(
         "CREATE TABLE t (id UUID NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-        schema_name=sn,
+        schema_name=schema_name,
     )
-    client.execute_sql(f"INSERT INTO t VALUES ('{UUID_A}', 1), ('{UUID_B}', 2)", schema_name=sn)
+    client.execute_sql(f"INSERT INTO t VALUES ('{UUID_A}', 1), ('{UUID_B}', 2)", schema_name=schema_name)
 
     res = _sql(
         client,
-        sn,
+        schema_name,
         "BEGIN",
         f"UPDATE t SET v = 5 WHERE id IN ('{UUID_B}')",
         f"DELETE FROM t WHERE id IN ('{UUID_A}')",
         "COMMIT",
     )
     assert res[2]["count"] == 1
-    rows = _rows(client, sn, "SELECT v FROM t")
+    rows = _rows(client, schema_name, "SELECT v FROM t")
     assert [r["v"] for r in rows] == [5]
 
 
@@ -199,60 +189,62 @@ def test_uuid_in_list_in_a_written_transaction(client, sn):
 # ---------------------------------------------------------------------------
 
 
-def _u128_table(client, sn):
+def _u128_table(client, schema_name):
     client.execute_sql(
         "CREATE TABLE t (id DECIMAL(38,0) NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-        schema_name=sn,
+        schema_name=schema_name,
     )
-    for i in range(1, 11):
-        client.execute_sql(f"INSERT INTO t VALUES ({i}, {i})", schema_name=sn)
+    client.execute_sql("INSERT INTO t VALUES " + ", ".join(f"({i}, {i})" for i in range(1, 11)),
+                       schema_name=schema_name)
 
 
-def test_wide_pk_range_delete_in_autocommit(client, sn):
+def test_wide_pk_range_delete_in_autocommit(client, schema_name):
     """`WHERE u128_pk > 5` is a byte-exact PK walk with an empty residual, so in
     autocommit nothing is compiled client-side at all."""
-    _u128_table(client, sn)
-    res = client.execute_sql("DELETE FROM t WHERE id > 5", schema_name=sn)
+    _u128_table(client, schema_name)
+    res = client.execute_sql("DELETE FROM t WHERE id > 5", schema_name=schema_name)
     assert res[0]["count"] == 5
-    assert sorted(int(r["id"]) for r in _rows(client, sn, "SELECT id FROM t")) == [1, 2, 3, 4, 5]
+    assert sorted(int(r["id"]) for r in _rows(client, schema_name, "SELECT id FROM t")) == [1, 2, 3, 4, 5]
 
 
-def test_wide_pk_range_delete_over_a_tombstone_only_transaction(client, sn):
+def test_wide_pk_range_delete_over_a_tombstone_only_transaction(client, schema_name):
     """The range pins no single key, so a buffered row would have to face the
     FULL WHERE — which the VM cannot compile for a 128-bit column. A transaction
     holding only a tombstone has no such row, and must not pay for one."""
-    _u128_table(client, sn)
+    _u128_table(client, schema_name)
     res = _sql(
         client,
-        sn,
+        schema_name,
         "BEGIN",
         "DELETE FROM t WHERE id = 1",  # a tombstone, no Present row
         "DELETE FROM t WHERE id > 5",
         "COMMIT",
     )
     assert res[2]["count"] == 5
-    assert sorted(int(r["id"]) for r in _rows(client, sn, "SELECT id FROM t")) == [2, 3, 4, 5]
+    assert sorted(int(r["id"]) for r in _rows(client, schema_name, "SELECT id FROM t")) == [2, 3, 4, 5]
 
 
-def test_wide_pk_range_still_rejects_over_a_buffered_row(client, sn):
+def test_wide_pk_range_still_rejects_over_a_buffered_row(client, schema_name):
     """The exposure shrinks; it does not vanish. A buffered `Present` row under an
     unpinned wide-PK bound genuinely needs the whole WHERE compiled, and that is
     the shape the expression VM refuses."""
-    _u128_table(client, sn)
-    with pytest.raises(Exception) as e:
+    _u128_table(client, schema_name)
+    with pytest.raises(gnitz.GnitzError) as e:
         _sql(
             client,
-            sn,
+            schema_name,
             "BEGIN",
             "INSERT INTO t VALUES (99, 99)",
             "DELETE FROM t WHERE id > 5",
             "COMMIT",
         )
-    assert "U128" in str(e.value) or "128" in str(e.value), str(e.value)
-    try:
-        client.execute_sql("ROLLBACK", schema_name=sn)
-    except Exception:
-        pass
+    assert "128" in str(e.value), str(e.value)
+    # The BEGIN opened in this same call, so the refusal auto-rolled it back:
+    # nothing was committed and no buffer is left stranded.
+    assert sorted(int(r["id"]) for r in _rows(client, schema_name, "SELECT id FROM t")) == \
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    with pytest.raises(gnitz.GnitzError):
+        client.execute_sql("ROLLBACK", schema_name=schema_name)
 
 
 # ---------------------------------------------------------------------------
@@ -260,97 +252,97 @@ def test_wide_pk_range_still_rejects_over_a_buffered_row(client, sn):
 # ---------------------------------------------------------------------------
 
 
-def test_pk_range_with_buffered_rows_straddling_the_cut(client, sn):
+def test_pk_range_with_buffered_rows_straddling_the_cut(client, schema_name):
     """`id > 5 AND flag = 1`: the walk applies the PK cut and the predicate the
     flag, but a buffered row saw neither — so both conjuncts are re-imposed on
     it, and the one below the cut must not be swept in."""
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, flag BIGINT NOT NULL)",
-        schema_name=sn,
+        schema_name=schema_name,
     )
-    client.execute_sql("INSERT INTO t VALUES (1, 1), (7, 1), (8, 0)", schema_name=sn)
+    client.execute_sql("INSERT INTO t VALUES (1, 1), (7, 1), (8, 0)", schema_name=schema_name)
 
     res = _sql(
         client,
-        sn,
+        schema_name,
         "BEGIN",
         "INSERT INTO t VALUES (4, 1), (9, 1)",  # one below the cut, one above
         "DELETE FROM t WHERE id > 5 AND flag = 1",
         "COMMIT",
     )
     assert res[2]["count"] == 2, "committed id=7 and buffered id=9; NOT buffered id=4"
-    got = sorted((r["id"], r["flag"]) for r in _rows(client, sn, "SELECT * FROM t"))
+    got = sorted((r["id"], r["flag"]) for r in _rows(client, schema_name, "SELECT * FROM t"))
     assert got == [(1, 1), (4, 1), (8, 0)]
 
 
-def test_compound_pk_prefix_and_range_bounds(client, sn):
+def test_compound_pk_prefix_and_range_bounds(client, schema_name):
     """A bare compound-PK prefix names a key *group*, not a key: it bounds the
     walk but must not restrict the buffered candidates to one key."""
     client.execute_sql(
         "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT NOT NULL, v BIGINT NOT NULL, PRIMARY KEY (a, b))",
-        schema_name=sn,
+        schema_name=schema_name,
     )
-    client.execute_sql("INSERT INTO t VALUES (1, 1, 0), (1, 9, 0), (2, 9, 0)", schema_name=sn)
+    client.execute_sql("INSERT INTO t VALUES (1, 1, 0), (1, 9, 0), (2, 9, 0)", schema_name=schema_name)
 
     # `a = 1 AND b > 5` — an equality prefix plus a range on the next PK column.
     res = _sql(
         client,
-        sn,
+        schema_name,
         "BEGIN",
         "INSERT INTO t VALUES (1, 7, 0)",
         "DELETE FROM t WHERE a = 1 AND b > 5",
         "COMMIT",
     )
     assert res[2]["count"] == 2, "committed (1,9) and buffered (1,7)"
-    assert sorted((r["a"], r["b"]) for r in _rows(client, sn, "SELECT a, b FROM t")) == [(1, 1), (2, 9)]
+    assert sorted((r["a"], r["b"]) for r in _rows(client, schema_name, "SELECT a, b FROM t")) == [(1, 1), (2, 9)]
 
     # `a > 1` — a range on the leading PK column, no equality at all.
     res = _sql(
         client,
-        sn,
+        schema_name,
         "BEGIN",
         "INSERT INTO t VALUES (5, 5, 0)",
         "DELETE FROM t WHERE a > 1",
         "COMMIT",
     )
     assert res[2]["count"] == 2, "committed (2,9) and buffered (5,5)"
-    assert sorted((r["a"], r["b"]) for r in _rows(client, sn, "SELECT a, b FROM t")) == [(1, 1)]
+    assert sorted((r["a"], r["b"]) for r in _rows(client, schema_name, "SELECT a, b FROM t")) == [(1, 1)]
 
 
-def test_an_empty_residual_does_not_sweep_an_unrelated_buffered_row(client, sn):
+def test_an_empty_residual_does_not_sweep_an_unrelated_buffered_row(client, schema_name):
     """`WHERE id = 5` pins one key and leaves nothing residual. The key
     restriction — not the (empty) residual — is what keeps an unrelated
     transaction-born row out of the retraction."""
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-        schema_name=sn,
+        schema_name=schema_name,
     )
-    client.execute_sql("INSERT INTO t VALUES (5, 50)", schema_name=sn)
+    client.execute_sql("INSERT INTO t VALUES (5, 50)", schema_name=schema_name)
 
     res = _sql(
         client,
-        sn,
+        schema_name,
         "BEGIN",
         "INSERT INTO t VALUES (11, 110)",
         "DELETE FROM t WHERE id = 5",
         "COMMIT",
     )
     assert res[2]["count"] == 1
-    assert sorted((r["id"], r["v"]) for r in _rows(client, sn, "SELECT * FROM t")) == [(11, 110)]
+    assert sorted((r["id"], r["v"]) for r in _rows(client, schema_name, "SELECT * FROM t")) == [(11, 110)]
 
 
-def test_transaction_mixed_buffered_and_committed_delete(client, sn):
+def test_transaction_mixed_buffered_and_committed_delete(client, schema_name):
     """One DELETE over all three kinds of row: a buffered override, a
     buffered-then-deleted row, and an untouched committed one."""
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-        schema_name=sn,
+        schema_name=schema_name,
     )
-    client.execute_sql("INSERT INTO t VALUES (1, 7), (2, 7), (3, 0)", schema_name=sn)
+    client.execute_sql("INSERT INTO t VALUES (1, 7), (2, 7), (3, 0)", schema_name=schema_name)
 
     res = _sql(
         client,
-        sn,
+        schema_name,
         "BEGIN",
         "INSERT INTO t VALUES (4, 7)",       # transaction-born, matches
         "UPDATE t SET v = 7 WHERE id = 3",   # buffered into the match set
@@ -359,21 +351,21 @@ def test_transaction_mixed_buffered_and_committed_delete(client, sn):
         "COMMIT",
     )
     assert res[4]["count"] == 3, "the tombstoned row is already gone, not re-retracted"
-    assert _count(client, sn) == 0
+    assert _count(client, schema_name) == 0
 
 
-def test_update_read_your_own_writes_is_unchanged(client, sn):
+def test_update_read_your_own_writes_is_unchanged(client, schema_name):
     """The buffered payload, not the committed one, decides what an UPDATE
     matches and what it carries through."""
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL, w BIGINT NOT NULL)",
-        schema_name=sn,
+        schema_name=schema_name,
     )
-    client.execute_sql("INSERT INTO t VALUES (1, 10, 100)", schema_name=sn)
+    client.execute_sql("INSERT INTO t VALUES (1, 10, 100)", schema_name=schema_name)
 
     res = _sql(
         client,
-        sn,
+        schema_name,
         "BEGIN",
         "UPDATE t SET v = 5 WHERE id = 1",
         "UPDATE t SET w = 1 WHERE v = 10",  # the committed value: matches nothing
@@ -381,7 +373,7 @@ def test_update_read_your_own_writes_is_unchanged(client, sn):
         "COMMIT",
     )
     assert (res[2]["count"], res[3]["count"]) == (0, 1)
-    row = _rows(client, sn, "SELECT * FROM t")[0]
+    row = _rows(client, schema_name, "SELECT * FROM t")[0]
     assert (row["id"], row["v"], row["w"]) == (1, 5, 2)
 
 
@@ -390,21 +382,21 @@ def test_update_read_your_own_writes_is_unchanged(client, sn):
 # ---------------------------------------------------------------------------
 
 
-def test_delete_pk_in_past_the_wire_key_cap(client, sn):
+def test_delete_pk_in_past_the_wire_key_cap(client, schema_name):
     """Longer than one `ReadSpec` can carry: DML chunks the gather across
     requests rather than declining to a full scan. Absent keys contribute
     nothing, so the count is the rows actually touched."""
     client.execute_sql(
         "CREATE TABLE t (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-        schema_name=sn,
+        schema_name=schema_name,
     )
     present = [1, 2, 3, MAX_PK_SET_KEYS, MAX_PK_SET_KEYS + 1]
     client.execute_sql(
         "INSERT INTO t VALUES " + ", ".join(f"({i}, {i})" for i in present),
-        schema_name=sn,
+        schema_name=schema_name,
     )
 
     keys = ", ".join(str(i) for i in range(1, MAX_PK_SET_KEYS + 2))
-    res = client.execute_sql(f"DELETE FROM t WHERE id IN ({keys})", schema_name=sn)
+    res = client.execute_sql(f"DELETE FROM t WHERE id IN ({keys})", schema_name=schema_name)
     assert res[0]["count"] == len(present)
-    assert _count(client, sn) == 0
+    assert _count(client, schema_name) == 0

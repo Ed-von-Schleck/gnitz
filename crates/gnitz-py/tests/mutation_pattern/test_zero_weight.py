@@ -1,109 +1,84 @@
-"""E2E tests for weight-0 push rows: not Z-set elements, dropped before the SAL
-emission (so the workers never see them)."""
+"""Weight-0 push rows: not Z-set elements, dropped before the SAL emission, so
+the workers never see them.
 
+Varied across an integer-only table and a STRING one, whose SAL group takes the
+sub-batch path rather than the scatter.
+"""
+
+import pytest
 import gnitz
-from _uid import uid as _uid
+
+_INT_COLS = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+             gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+_STR_COLS = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+             gnitz.ColumnDef("s", gnitz.TypeCode.STRING, is_nullable=True)]
 
 
+@pytest.fixture
+def table(client, schema_name):
+    """Factory: `table(cols)` → `(tid, schema)` for a table over `cols`."""
+    def make(cols):
+        return client.create_table(schema_name, "t", cols), gnitz.Schema(cols)
+    return make
 
 
-def _make_table(client, cols, name="t"):
-    """Create a schema + table from `cols`. Returns (tid, schema, sn)."""
-    sn = "s" + _uid()
-    client.create_schema(sn)
-    schema = gnitz.Schema(cols)
-    tid = client.create_table(sn, name, cols)
-    return tid, schema, sn
+def _live(client, tid, payload):
+    """Live rows as `(pk, <payload>, weight)`, sorted."""
+    return sorted((r.pk, getattr(r, payload), r.weight) for r in client.scan(tid))
 
 
-def _int_cols():
-    return [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-            gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-
-
-def _str_cols():
-    """A STRING column makes the SAL group take the sub-batch path, not the scatter."""
-    return [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-            gnitz.ColumnDef("s", gnitz.TypeCode.STRING, is_nullable=True)]
-
-
-def _live(client, tid, *cols):
-    return sorted(tuple(getattr(r, c) for c in cols) for r in client.scan(tid))
-
-
-def _drop(client, sn):
-    client.drop_table(sn, "t")
-    client.drop_schema(sn)
-
-
-def test_zero_weight_push_is_dropped(client):
-    """A weight-0 row is not stored, and the server stays up."""
-    tid, schema, sn = _make_table(client, _int_cols())
+@pytest.mark.parametrize("cols,payload,ghost,live", [
+    (_INT_COLS, "val", 10, 20),
+    (_STR_COLS, "s", "ghost", "live"),
+], ids=["int", "string"])
+def test_zero_weight_push_is_dropped(client, table, cols, payload, ghost, live):
+    """A weight-0 row is not stored, and the next real push still lands."""
+    tid, schema = table(cols)
     batch = gnitz.ZSetBatch(schema)
-    batch.append(pk=1, val=10, _weight=0)
+    batch.append(pk=1, _weight=0, **{payload: ghost})
     client.push(tid, batch)
-    assert _live(client, tid, "pk", "val") == []
+    assert _live(client, tid, payload) == []
 
     batch = gnitz.ZSetBatch(schema)
-    batch.append(pk=2, val=20)
+    batch.append(pk=2, **{payload: live})
     client.push(tid, batch)
-    assert _live(client, tid, "pk", "val") == [(2, 20)]
-    _drop(client, sn)
+    assert _live(client, tid, payload) == [(2, live, 1)]
 
 
-def test_zero_weight_push_string_column(client):
-    """Same on a STRING-column table, whose group takes the sub-batch path."""
-    tid, schema, sn = _make_table(client, _str_cols())
-    batch = gnitz.ZSetBatch(schema)
-    batch.append(pk=1, s="ghost", _weight=0)
-    client.push(tid, batch)
-    assert _live(client, tid, "pk", "s") == []
-
-    batch = gnitz.ZSetBatch(schema)
-    batch.append(pk=2, s="live")
-    client.push(tid, batch)
-    assert _live(client, tid, "pk", "s") == [(2, "live")]
-    _drop(client, sn)
-
-
-def test_zero_weight_row_in_transaction(client):
-    """A weight-0 row inside a transaction on a STRING table commits cleanly."""
-    tid, schema, sn = _make_table(client, _str_cols())
-    with client.transaction() as txn:
-        b = gnitz.ZSetBatch(schema)
-        b.append(pk=1, s="live")
-        b.append(pk=2, s="ghost", _weight=0)
-        txn.push(tid, b)
-    assert _live(client, tid, "pk", "s") == [(1, "live")]
-    _drop(client, sn)
-
-
-def test_all_zero_weight_push_is_a_noop(client):
+def test_all_zero_weight_push_is_a_noop(client, table):
     """An all-zero batch ACKs at a real zone LSN; the next push still lands."""
-    tid, schema, sn = _make_table(client, _int_cols())
+    tid, schema = table(_INT_COLS)
     batch = gnitz.ZSetBatch(schema)
     batch.append(pk=1, val=10, _weight=0)
     batch.append(pk=2, val=20, _weight=0)
     assert client.push(tid, batch) > 0
-    assert _live(client, tid, "pk", "val") == []
+    assert _live(client, tid, "val") == []
 
     batch = gnitz.ZSetBatch(schema)
     batch.append(pk=3, val=30)
     client.push(tid, batch)
-    assert _live(client, tid, "pk", "val") == [(3, 30)]
-    _drop(client, sn)
+    assert _live(client, tid, "val") == [(3, 30, 1)]
 
 
-def test_zero_weight_mixed_with_live_rows(client):
-    """Only the nonzero rows are stored, each at the weight enforcement gives it."""
-    tid, schema, sn = _make_table(client, _int_cols())
+def test_zero_weight_mixed_with_live_rows(client, table):
+    """Only the nonzero rows are stored, each at the weight enforcement gives
+    it: every accumulated PK weight on a base table is clamped to 1."""
+    tid, schema = table(_INT_COLS)
     batch = gnitz.ZSetBatch(schema)
     batch.append(pk=1, val=10, _weight=0)
     batch.append(pk=2, val=20, _weight=3)
     batch.append(pk=3, val=30, _weight=0)
     batch.append(pk=4, val=40, _weight=1)
     client.push(tid, batch)
-    rows = sorted((r.pk, r.val, r.weight) for r in client.scan(tid))
-    # Every accumulated PK weight on a base table is clamped to 1.
-    assert rows == [(2, 20, 1), (4, 40, 1)]
-    _drop(client, sn)
+    assert _live(client, tid, "val") == [(2, 20, 1), (4, 40, 1)]
+
+
+def test_zero_weight_row_in_transaction(client, table):
+    """A weight-0 row inside a transaction on a STRING table commits cleanly."""
+    tid, schema = table(_STR_COLS)
+    with client.transaction() as txn:
+        b = gnitz.ZSetBatch(schema)
+        b.append(pk=1, s="live")
+        b.append(pk=2, s="ghost", _weight=0)
+        txn.push(tid, b)
+    assert _live(client, tid, "s") == [(1, "live", 1)]
