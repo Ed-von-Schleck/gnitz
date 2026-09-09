@@ -9,15 +9,15 @@ integration = []
 [dependencies]
 gnitz-expr  = { path = "../gnitz-expr" }
 gnitz-wire  = { path = "../gnitz-wire" }
-libc        = "0.2"
+libc.workspace = true
 lru         = "0.12"
-# default-features = false pins the ring backend explicitly (aws-lc-rs
-# needs a C/cmake toolchain).
-rustls       = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls.workspace = true
 webpki-roots = "1"
 
 [dev-dependencies]
 gnitz-test-harness = { path = "../gnitz-test-harness" }
-# The loopback TLS peer the framing tests drive a real `connect_tls` against;
-# ring pinned to match the rustls provider above.
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+# The loopback TLS peer the framing tests drive a real `connect_tls` against.
+rcgen.workspace = true
+
+[lints]
+workspace = true

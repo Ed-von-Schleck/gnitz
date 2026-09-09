@@ -101,6 +101,7 @@ mod read_spec;
 mod rel_descriptor;
 mod types;
 mod uuid;
+mod xxh;
 
 pub mod control;
 pub mod decimal;
@@ -122,6 +123,7 @@ pub use read_spec::*;
 pub use rel_descriptor::*;
 pub use types::*;
 pub use uuid::*;
+pub use xxh::*;
 // Flat-export `wal`'s constants (referenced everywhere) but not its framer
 // functions (`encode`/`block_size`/… stay `gnitz_wire::wal::`-qualified).
 pub use wal::{
@@ -149,22 +151,6 @@ pub use wal::{
 /// Align `n` up to an 8-byte boundary.
 pub const fn align8(n: usize) -> usize {
     (n + 7) & !7
-}
-
-/// XXH3-64 over `b` — the WAL body checksum. The one hash both ends compute;
-/// the engine's `foundation::xxh::checksum` re-exports this.
-#[inline]
-pub fn checksum(b: &[u8]) -> u64 {
-    xxhash_rust::xxh3::xxh3_64(b)
-}
-
-/// `V₀` — the group key of the ungrouped (global) aggregate: the XXH3-128
-/// digest over no group columns at all. The single definition both ends share,
-/// so the engine's emitted ground row and the client's synthesized one carry the
-/// same key with no literal embedded on either side.
-#[inline]
-pub fn global_group_key() -> u128 {
-    xxhash_rust::xxh3::xxh3_128(b"")
 }
 
 #[inline]

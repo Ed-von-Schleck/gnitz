@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use io_uring::types::FutexWaitV;
 
 use crate::runtime::wire::{decode_wire_ipc, DecodedWire, WireMsg, FRAME_CAP};
-use gnitz_store::foundation::posix_io;
+use gnitz_foundation::posix_io;
 use gnitz_wire::{align8, BitIter};
 
 // ---------------------------------------------------------------------------

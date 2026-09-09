@@ -14,4 +14,7 @@ gnitz-wire = { path = "../gnitz-wire" }
 
 [dev-dependencies]
 gnitz-test-harness = { path = "../gnitz-test-harness" }
-libc = "0.2"
+libc.workspace = true
+
+[lints]
+workspace = true

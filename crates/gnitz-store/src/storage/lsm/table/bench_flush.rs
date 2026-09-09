@@ -100,7 +100,7 @@ enum Gen {
 /// measure RAM-tier fold and compaction behaviour, so the tier is what a run
 /// shrinks to reach the disk regime.
 fn bench_budgets() -> StoreBudgets {
-    StoreBudgets::new(crate::foundation::env::env_num(
+    StoreBudgets::new(gnitz_foundation::env::env_num(
         "GNITZ_RAM_TIER_BYTES",
         DEFAULT_RAM_TIER_BYTES,
     ))
@@ -138,7 +138,7 @@ fn flush_cadence_amplification_bench() {
     use std::hint::black_box;
     use std::time::Instant;
 
-    let per_tick_flush = crate::foundation::env::env_flag("GNITZ_BENCH_FLUSH", true);
+    let per_tick_flush = gnitz_foundation::env::env_flag("GNITZ_BENCH_FLUSH", true);
     let schema = pk_u64_two_i64_schema();
 
     // Untimed warmup: warm the thread-local batch pool before the first config.
@@ -243,7 +243,7 @@ fn flush_cadence_amplification_bench() {
 fn compaction_amplification_bench() {
     const ROWS_PER_TICK: usize = 4096;
 
-    use crate::foundation::env::{env_flag, env_num};
+    use gnitz_foundation::env::{env_flag, env_num};
     let ticks_n: usize = env_num("GNITZ_BENCH_TICKS", 2000);
     let keyspace: u64 = env_num("GNITZ_BENCH_KEYSPACE", 200_000_000);
     // Both arrival orders: a monotone stream never makes a vertical overlap
@@ -331,7 +331,7 @@ fn compaction_amplification_bench() {
 fn filter_share_of_compaction_bench() {
     const ROWS_PER_TICK: usize = 4096;
 
-    use crate::foundation::env::{env_flag, env_num};
+    use gnitz_foundation::env::{env_flag, env_num};
     let ticks_n: usize = env_num("GNITZ_BENCH_TICKS", 4000);
     let keyspace: u64 = env_num("GNITZ_BENCH_KEYSPACE", 200_000_000);
     let filter_off = env_flag("GNITZ_NO_PK_FILTER", false);

@@ -11,8 +11,8 @@ use crate::storage::{Batch, StorageError, StoreError, Table};
 ///
 /// On the push-apply/replay path only (VM integration bypasses it), so a
 /// seam-armed server still boots on a pushless data dir.
-static INGEST_APPLY_ERROR: crate::foundation::fault::Seam =
-    crate::foundation::fault::Seam::new("GNITZ_INJECT_INGEST_APPLY_ERROR");
+static INGEST_APPLY_ERROR: gnitz_foundation::fault::Seam =
+    gnitz_foundation::fault::Seam::new("GNITZ_INJECT_INGEST_APPLY_ERROR");
 
 fn inject_ingest_apply_error(
     which: &str,

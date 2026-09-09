@@ -20,7 +20,7 @@ impl crate::runtime::wire::WireMsg<'_> {
 /// broken child and a green test.
 pub(crate) unsafe fn assert_child_exited_ok(pid: libc::pid_t) {
     let mut status = 0i32;
-    gnitz_store::foundation::posix_io::retry_eintr(|| libc::waitpid(pid, &mut status, 0))
+    gnitz_foundation::posix_io::retry_eintr(|| libc::waitpid(pid, &mut status, 0))
         .unwrap_or_else(|e| panic!("waitpid failed on child {pid}: {e}"));
     assert!(
         libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
@@ -50,7 +50,7 @@ pub(crate) struct SharedRegion {
 
 impl SharedRegion {
     pub(crate) fn new(size: usize) -> Self {
-        let ptr = gnitz_store::foundation::posix_io::map_anon_shared(size).expect("SharedRegion mmap failed");
+        let ptr = gnitz_foundation::posix_io::map_anon_shared(size).expect("SharedRegion mmap failed");
         SharedRegion { ptr, size }
     }
 

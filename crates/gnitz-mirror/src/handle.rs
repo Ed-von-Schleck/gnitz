@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 
 use gnitz_core::{DeltaCursor, Invalidate, MirrorError, MirrorStore, RawBlock, Schema, Shape, ZSetBatch};
-use gnitz_store::foundation::env::env_num;
-use gnitz_store::foundation::fault::Seam;
+use gnitz_foundation::env::env_num;
+use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::{
     lock_data_dir, relation_dir, RelationKind, RelationRegistry, RelationSpec, StoreConfig, ViewBudgets,
 };

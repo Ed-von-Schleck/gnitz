@@ -36,7 +36,7 @@ const ITERS: usize = 40;
 /// the production-representative path, where the real budget (a few hundred KiB)
 /// flushes shards to disk mid-population.
 fn memtable_budget() -> usize {
-    crate::foundation::env::env_num("GNITZ_BENCH_MEMTABLE_KB", 1 << 20) * 1024
+    gnitz_foundation::env::env_num("GNITZ_BENCH_MEMTABLE_KB", 1 << 20) * 1024
 }
 
 /// Source schema: U64 pk (col 0) | U32 grp (col 1) | I64 val (col 2).

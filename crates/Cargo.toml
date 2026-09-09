@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "gnitz-foundation",
     "gnitz-wire",
     "gnitz-expr",
     "gnitz-core",
@@ -13,6 +14,31 @@ members = [
     "gnitz-store-testkit",
     "gnitz-test-harness",
 ]
+
+# One lint policy for the workspace, taken by every crate with
+# `[lints] workspace = true`. `gnitz-store` is the exception: it spells its own
+# table out so it can add `unreachable_pub`, which cargo does not let a crate
+# layer on top of the shared one.
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
+# One version per third-party crate used by more than one member, so a bump is
+# one edit rather than an N-file sweep that can be done partially with no
+# diagnostic. Single-consumer dependencies stay in the crate that has them.
+[workspace.dependencies]
+io-uring = "0.7"
+libc = "0.2"
+proptest = "1"
+rustc-hash = "2"
+tempfile = "3"
+# `default-features = false` pins the ring backend: the default is aws-lc-rs,
+# which needs a C/cmake toolchain and would break the "no C++ toolchain"
+# promise. rcgen's "pem" is required for `Certificate::pem()`.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 # Release: panic aborts the process so reactor-task panics surface as a
 # backtrace on stderr instead of being silently dropped.  Dev keeps unwind

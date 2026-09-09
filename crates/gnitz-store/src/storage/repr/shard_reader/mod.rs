@@ -15,7 +15,7 @@ use super::shard_file::DecodedRegion;
 mod access;
 mod open;
 
-pub(super) use crate::foundation::posix_io::{Advice, Mmap};
+use gnitz_foundation::posix_io::Mmap;
 
 // ---------------------------------------------------------------------------
 // Region views — every fixed-width region as one (offset, stride) pair
@@ -131,7 +131,7 @@ impl MappedShard {
     /// quantity a capacity-bounded store sums to decide whether it is over budget.
     #[inline]
     pub(crate) fn file_len(&self) -> u64 {
-        self.mmap.len() as u64
+        self.mmap.as_slice().len() as u64
     }
 }
 

@@ -4,8 +4,8 @@
 //! counter and worker reaping.
 
 use super::*;
-use gnitz_store::foundation::fault::Seam;
-use gnitz_store::foundation::posix_io::retry_eintr;
+use gnitz_foundation::fault::Seam;
+use gnitz_foundation::posix_io::retry_eintr;
 use gnitz_wire::{low_bits_mask, BitIter};
 
 /// A worker set rides in one word (`signal_reached`, `collect_acks_and_relay`),
@@ -24,8 +24,8 @@ const W2M_SYNC_WAIT_MS: i32 = 10;
 /// `RELAY_SPACE_LOW`, beside the loop it perturbs.
 static BACKFILL_RELAY_SPACE_LOW: Seam = Seam::new("GNITZ_INJECT_BACKFILL_RELAY_SPACE_LOW");
 
-/// `GNITZ_INJECT_TICK_EMIT_ERROR=<table>`: fail the named table's next tick
-/// emit, once, as a full SAL would.
+/// `GNITZ_INJECT_TICK_EMIT_ERROR`: fail the next replied tick emit, once, as a
+/// full SAL would.
 static TICK_EMIT_ERROR: Seam = Seam::new("GNITZ_INJECT_TICK_EMIT_ERROR");
 
 /// A `u64` from the OS entropy pool for [`MasterDispatcher::delta_cursor_tag`],

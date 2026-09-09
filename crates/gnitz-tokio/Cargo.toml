@@ -23,5 +23,8 @@ gnitz-wire = { path = "../gnitz-wire" }
 # crate itself stays engine-free — which is the whole point of taking an opened
 # store rather than a directory.
 gnitz-mirror = { path = "../gnitz-mirror" }
-libc = "0.2"
-tempfile = "3"
+libc.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

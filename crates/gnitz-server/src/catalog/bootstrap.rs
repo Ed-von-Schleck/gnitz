@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_store::foundation::env::env_num;
+use gnitz_foundation::env::env_num;
 use gnitz_wire::sys_rows::{write_schema_tab_row, SchemaTabRow};
 
 impl CatalogEngine {

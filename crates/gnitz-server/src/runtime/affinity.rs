@@ -214,7 +214,7 @@ fn assign(nodes: &[Vec<Core>], allowed: &[u32], workers: usize) -> Result<Placem
 /// Plan the whole server's placement — one sysfs walk, one decision — or say
 /// why there is none, in the words the boot record prints.
 pub fn plan(workers: usize) -> Result<Placement, String> {
-    if !gnitz_store::foundation::env::env_flag("GNITZ_CPU_AFFINITY", true) {
+    if !gnitz_foundation::env::env_flag("GNITZ_CPU_AFFINITY", true) {
         return Err("GNITZ_CPU_AFFINITY=0".to_string());
     }
     let allowed = allowed_cpus();

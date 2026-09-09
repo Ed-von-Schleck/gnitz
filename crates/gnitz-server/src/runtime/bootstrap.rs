@@ -12,8 +12,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::catalog::CatalogEngine;
-use gnitz_store::foundation::fault::Seam;
-use gnitz_store::foundation::posix_io;
+use gnitz_foundation::fault::Seam;
+use gnitz_foundation::posix_io;
 
 use crate::runtime::affinity;
 use crate::runtime::executor::ServerExecutor;
@@ -443,7 +443,7 @@ fn run_worker_child(
 
     // Re-tag logging as this worker before any boot work, so every line the
     // recovery below emits carries `W{w}` rather than the inherited master tag.
-    gnitz_store::foundation::log::init(log_level, format!("W{w}").as_bytes());
+    gnitz_foundation::log::init(log_level, format!("W{w}").as_bytes());
 
     // Pin after the log re-tag, so a failed pin is recorded in this worker's own
     // `worker_N.log` rather than the master's stdout, and before every

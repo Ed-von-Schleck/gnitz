@@ -1,8 +1,6 @@
 //! Shared shard file format constants, and the digest over the bytes that
 //! decide how the rest of a shard is read.
 
-use crate::foundation::xxh;
-
 pub(crate) const SHARD_MAGIC: u64 = 0x31305F5A54494E47;
 /// Bumped by hand for a header/region layout change.
 pub(crate) const SHARD_EPOCH: u64 = 19;
@@ -129,7 +127,7 @@ pub(crate) const fn desc_len(num_regions: usize) -> usize {
 /// child of a partitioned table shares the `table_id`, so the same name in two
 /// sibling partition directories seeds identically.
 pub(crate) fn desc_digest(basename: &[u8], data: &[u8], num_regions: usize) -> u64 {
-    xxh::digest_with_hole(basename, &data[..desc_len(num_regions)], OFF_DESC_CHECKSUM)
+    gnitz_wire::digest_with_hole(basename, &data[..desc_len(num_regions)], OFF_DESC_CHECKSUM)
 }
 
 /// A shard's manifest identity: the last component of its path. The L0 spill

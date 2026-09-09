@@ -3,7 +3,6 @@ use super::super::error::StorageError;
 use super::super::layout::*;
 use super::super::shard_file::{region_dir, ShardWriteOpts};
 use super::*;
-use crate::foundation::xxh;
 use crate::schema::{type_code, SchemaColumn, SchemaDescriptor};
 use crate::test_support::{make_schema_pk_u64_payload_string, make_schema_u64_i64, read_german_string};
 use gnitz_wire::as_le_bytes;
@@ -1247,7 +1246,7 @@ fn forged_shard_filter_rejected() {
     assert_eq!(
         open_patched(&path, &schema, &base, |d| {
             d[xoff + 4] ^= 0x01;
-            let cs = xxh::checksum(&d[xoff..xoff + xsz]);
+            let cs = gnitz_wire::checksum(&d[xoff..xoff + xsz]);
             write_u64_le(d, OFF_SHARD_FILTER_CHECKSUM, cs);
         })
         .err(),
@@ -1277,7 +1276,7 @@ fn a_structurally_invalid_filter_fails_the_open() {
             // `segment_length_mask` (descriptor bytes 12..16) no longer
             // agrees with `segment_length`.
             d[xoff + 12] ^= 0x01;
-            let cs = xxh::checksum(&d[xoff..xoff + xsz]);
+            let cs = gnitz_wire::checksum(&d[xoff..xoff + xsz]);
             write_u64_le(d, OFF_SHARD_FILTER_CHECKSUM, cs);
         })
         .err(),

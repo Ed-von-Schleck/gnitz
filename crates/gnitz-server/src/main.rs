@@ -23,11 +23,10 @@
 #[cfg(not(target_endian = "little"))]
 compile_error!("GnitzDB requires a little-endian target; the wire format is LE-only.");
 
-// FIRST, and before any module: `#[macro_use]` reaches only code that follows
-// it, and it is what puts `gnitz_warn!` and its siblings — defined in
-// `gnitz-store` — into textual scope for the rest of this crate.
+// Crate-wide scope for `gnitz_warn!` and its siblings; a plain `use` would
+// reach this module only.
 #[macro_use]
-extern crate gnitz_store;
+extern crate gnitz_foundation;
 
 // Declared *above* `#[macro_use] mod fatal;`, and that ordering is the whole
 // enforcement: `gnitz_fatal_abort!` is not in scope for anything before it, so
@@ -36,8 +35,8 @@ extern crate gnitz_store;
 mod catalog;
 mod query;
 
-// Before `mod runtime;`: `#[macro_use]` reaches only code that follows the
-// item, and `gnitz_fatal_abort!` is invoked unqualified throughout it.
+// Before `mod runtime;`, which invokes `gnitz_fatal_abort!` unqualified:
+// `#[macro_use] mod` reaches only the code that follows the item.
 #[macro_use]
 mod fatal;
 
@@ -95,10 +94,10 @@ Environment:
 
 fn parse_level(s: &str) -> u32 {
     match s.to_ascii_lowercase().as_str() {
-        "quiet" | "0" => gnitz_store::foundation::log::QUIET,
-        "normal" | "1" => gnitz_store::foundation::log::NORMAL,
-        "verbose" | "debug" | "2" => gnitz_store::foundation::log::DEBUG,
-        _ => gnitz_store::foundation::log::QUIET,
+        "quiet" | "0" => gnitz_foundation::log::QUIET,
+        "normal" | "1" => gnitz_foundation::log::NORMAL,
+        "verbose" | "debug" | "2" => gnitz_foundation::log::DEBUG,
+        _ => gnitz_foundation::log::QUIET,
     }
 }
 
@@ -122,7 +121,7 @@ fn parse_workers(val: &str) -> Result<u32, String> {
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    let mut level = gnitz_store::foundation::log::QUIET;
+    let mut level = gnitz_foundation::log::QUIET;
     if let Ok(env_level) = env::var("GNITZ_LOG_LEVEL") {
         level = parse_level(&env_level);
     }
@@ -228,7 +227,7 @@ fn main() {
         }
     };
 
-    gnitz_store::foundation::log::init(level, b"M");
+    gnitz_foundation::log::init(level, b"M");
     let rc = runtime::server_main(&data_dir, &socket_path, num_workers, level, tls_cli);
     process::exit(rc);
 }

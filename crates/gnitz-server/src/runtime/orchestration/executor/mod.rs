@@ -22,7 +22,7 @@ use rustc_hash::FxHashMap;
 
 use super::guard_panic;
 use crate::runtime::tls::{TlsListener, TlsShared};
-use gnitz_store::foundation::fault::Seam;
+use gnitz_foundation::fault::Seam;
 
 use self::ddl::{commit_serial_range_durable, handle_ddl_txn, hold_relay_for_ddl, RELAY_HOLD_FOR_DDL};
 use super::TxnFamily;
@@ -494,10 +494,7 @@ async fn accept_loop(shared: Rc<Shared>, ctx: AcceptCtx) {
 fn tls_hello_timeout() -> std::time::Duration {
     static T: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
-        std::time::Duration::from_millis(gnitz_store::foundation::env::env_num(
-            "GNITZ_TLS_HELLO_TIMEOUT_MS",
-            15_000,
-        ))
+        std::time::Duration::from_millis(gnitz_foundation::env::env_num("GNITZ_TLS_HELLO_TIMEOUT_MS", 15_000))
     })
 }
 

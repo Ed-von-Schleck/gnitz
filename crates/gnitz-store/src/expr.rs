@@ -12,10 +12,10 @@
 
 use gnitz_expr::{Evaluator, ExprValidateErr, LogicalProgram};
 
-use crate::foundation::xxh::RowHasher;
 use crate::schema::key::ReindexPacker;
 use crate::schema::{ColumnLocator, DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor};
 use crate::storage::Batch;
+use gnitz_wire::RowHasher;
 
 /// One verbatim column move: `(source locator, output payload slot, destination
 /// write width)`, as `gnitz-expr` resolved it.

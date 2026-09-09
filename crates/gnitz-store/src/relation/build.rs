@@ -3,7 +3,7 @@
 //! whether a delta store is opened.
 
 use super::*;
-use crate::foundation::fault::Seam;
+use gnitz_foundation::fault::Seam;
 
 /// `GNITZ_INJECT_TABLE_CREATE_DELAY_MS`: stall a user table's create between its
 /// directory and its child subdir, so a concurrent DROP races it.

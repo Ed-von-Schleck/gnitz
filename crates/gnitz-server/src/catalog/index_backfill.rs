@@ -4,7 +4,7 @@
 //! store itself is the registry's — opened by `add_index`, rehomed by `rehome`.
 
 use super::*;
-use gnitz_store::foundation::fault::Seam;
+use gnitz_foundation::fault::Seam;
 
 /// `GNITZ_INJECT_INDEX_BACKFILL_ERROR`: fail a live index registration inside its
 /// staged directory, for the rollback tests. One-shot, so the retry that proves

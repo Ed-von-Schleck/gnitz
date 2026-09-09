@@ -9,10 +9,7 @@ gnitz-wire   = { path = "../gnitz-wire" }
 # A normal dependency, not a dev one: the shared file this crate compiles builds
 # its strategies with it, and `arb_type_code` returns `impl Strategy` in a
 # published signature.
-proptest = "1"
+proptest.workspace = true
 
-[lints.rust]
-warnings = "deny"
-
-[lints.clippy]
-all = { level = "deny", priority = -1 }
+[lints]
+workspace = true

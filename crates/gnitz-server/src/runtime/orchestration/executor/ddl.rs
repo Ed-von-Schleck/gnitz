@@ -28,7 +28,7 @@ use crate::runtime::master::UniqueFilter;
 use crate::runtime::peer::Peer;
 use crate::runtime::reactor::FsyncFuture;
 use crate::runtime::wire as ipc;
-use gnitz_store::foundation::fault::Seam;
+use gnitz_foundation::fault::Seam;
 use gnitz_store::storage::Batch;
 use gnitz_wire::{PkColList, WireFault, STATUS_OK};
 

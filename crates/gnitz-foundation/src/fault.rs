@@ -9,10 +9,10 @@
 //! paths where a fresh `std::env::var` would allocate every call.
 //!
 //! Which build decides is *this* crate's: the `cfg!(debug_assertions)` below is
-//! evaluated in `gnitz-store`'s compilation unit, while most `Seam` declarations
-//! live in `gnitz-server`. The three profiles agree in this
+//! evaluated in `gnitz-foundation`'s compilation unit, while most `Seam`
+//! declarations live in `gnitz-server`. The three profiles agree in this
 //! workspace, so a debug server arms its seams — but a profile that optimized
-//! only the store would disarm every one of them, with no diagnostic.
+//! only this crate would disarm every one of them, with no diagnostic.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -52,16 +52,10 @@ impl Seam {
         self.setting() == Some(stage)
     }
 
-    /// The seam's setting as a name the caller matches against its own state
-    /// (a table name, a pipeline stage).
-    pub fn names(&self) -> Option<&str> {
-        self.setting()
-    }
-
     /// The seam's setting as a positive count (milliseconds, rows, bytes —
     /// whatever the caller's unit is). A zero or unparseable value reads as
     /// unset, matching `env`'s rule that an override never zeroes a knob.
-    pub(crate) fn count(&self) -> Option<u64> {
+    pub fn count(&self) -> Option<u64> {
         self.setting()?.parse::<u64>().ok().filter(|&n| n > 0)
     }
 

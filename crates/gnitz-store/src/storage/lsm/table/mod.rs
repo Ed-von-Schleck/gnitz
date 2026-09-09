@@ -661,7 +661,7 @@ fn pk_match_start(run: &Batch, key: &[u8]) -> Option<usize> {
 /// covers directories the catalog's layout staging pre-created.
 pub(super) fn open_table_dirfd(dir: &str) -> Result<OwnedFd, StorageError> {
     use std::os::fd::AsRawFd;
-    let open = |c: &CStr| crate::foundation::posix_io::open_owned(c, libc::O_RDONLY | libc::O_DIRECTORY);
+    let open = |c: &CStr| gnitz_foundation::posix_io::open_owned(c, libc::O_RDONLY | libc::O_DIRECTORY);
     let dir_c = super::super::cstr(dir)?;
     let fd = match open(&dir_c) {
         Ok(fd) => fd,
@@ -670,7 +670,7 @@ pub(super) fn open_table_dirfd(dir: &str) -> Result<OwnedFd, StorageError> {
             open(&dir_c)?
         }
     };
-    crate::foundation::posix_io::try_set_nocow(fd.as_raw_fd());
+    gnitz_foundation::posix_io::try_set_nocow(fd.as_raw_fd());
     Ok(fd)
 }
 

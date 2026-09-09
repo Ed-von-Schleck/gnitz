@@ -53,10 +53,7 @@ impl SendPayload for Vec<u8> {
 /// ordinary transient congestion never sheds a healthy client; e2e tests shrink
 /// it to bound the freeze window they assert on.
 pub(super) fn resolve_client_send_timeout() -> std::time::Duration {
-    std::time::Duration::from_millis(gnitz_store::foundation::env::env_num(
-        "GNITZ_CLIENT_SEND_TIMEOUT_MS",
-        30_000,
-    ))
+    std::time::Duration::from_millis(gnitz_foundation::env::env_num("GNITZ_CLIENT_SEND_TIMEOUT_MS", 30_000))
 }
 
 /// Run one client-bound send under [`client_send_timeout`]. `Peer` applies this
@@ -94,7 +91,7 @@ pub(crate) async fn guard_egress_deadline<F: Future<Output = i32>>(
 /// alone does not do while data is queued. Never closes the fd. A peer already
 /// gone (`ENOTCONN`) is the goal state, so every failure but `EINTR` is dropped.
 pub(crate) fn shutdown(fd: i32) {
-    let _ = gnitz_store::foundation::posix_io::retry_eintr(|| unsafe { libc::shutdown(fd, libc::SHUT_RDWR) });
+    let _ = gnitz_foundation::posix_io::retry_eintr(|| unsafe { libc::shutdown(fd, libc::SHUT_RDWR) });
 }
 
 /// Arm (or re-arm) `listener`'s multishot accept. The listener fd rides the

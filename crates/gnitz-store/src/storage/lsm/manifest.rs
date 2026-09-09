@@ -3,10 +3,9 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 
 use super::error::StorageError;
-use crate::foundation::posix_io::{self, open_owned};
-use crate::foundation::xxh;
 use crate::schema::key::PkBuf;
 use crate::schema::MAX_PK_BYTES;
+use gnitz_foundation::posix_io::{self, open_owned};
 use gnitz_wire::{read_u64_le, write_u64_le};
 
 // ---------------------------------------------------------------------------
@@ -160,7 +159,7 @@ fn serialize(out_buf: &mut [u8], entries: &[ManifestEntryRaw], header: ManifestH
     write_u64_le(
         out_buf,
         OFF_CHECKSUM,
-        xxh::digest_with_hole(&[], &out_buf[..total], OFF_CHECKSUM),
+        gnitz_wire::digest_with_hole(&[], &out_buf[..total], OFF_CHECKSUM),
     );
 
     Ok(total)
@@ -197,7 +196,7 @@ fn verify(buf: &[u8]) -> Result<(ManifestHeader, usize), StorageError> {
     // Over the whole buffer rather than the expected length: guard keys, LSNs
     // and the header counters have no other check, and hashing past the entries
     // also rejects bytes appended to an otherwise honest manifest.
-    if xxh::digest_with_hole(&[], buf, OFF_CHECKSUM) != read_u64_le(buf, OFF_CHECKSUM) {
+    if gnitz_wire::digest_with_hole(&[], buf, OFF_CHECKSUM) != read_u64_le(buf, OFF_CHECKSUM) {
         return Err(StorageError::ChecksumMismatch);
     }
     Ok((

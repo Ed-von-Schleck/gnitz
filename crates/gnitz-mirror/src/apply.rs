@@ -1,7 +1,7 @@
 //! Applying a delta to a copy.
 
 use gnitz_core::{MirrorError, RawBlock, Shape};
-use gnitz_store::foundation::fault::Seam;
+use gnitz_foundation::fault::Seam;
 use gnitz_store::schema::make_delta_schema;
 use gnitz_store::storage::Batch;
 

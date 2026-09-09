@@ -553,7 +553,7 @@ fn one_recv_completion_queues_a_whole_pipelined_run() {
 
         const N: usize = 12;
         let wire: Vec<u8> = (0..N).flat_map(|i| framed(&vec![i as u8; 600])).collect();
-        gnitz_store::foundation::posix_io::write_all_fd(write_fd, &wire).expect("write");
+        gnitz_foundation::posix_io::write_all_fd(write_fd, &wire).expect("write");
 
         let queued = |r: &Reactor| r.inner.conns.borrow().get(&read_fd).map_or(0, |c| c.q.queued());
         assert!(poll_until(&r, 10_000, || queued(&r) > 0), "the run must be deframed",);

@@ -15,7 +15,7 @@ use crate::runtime::w2m::W2mWriter;
 use crate::runtime::wire::{
     self as ipc, BACKFILL_DECISION_CHECKPOINT, BACKFILL_DECISION_STOP, BACKFILL_PAD_BIT, FLAG_SCAN_LAST,
 };
-use gnitz_store::foundation::fault::Seam;
+use gnitz_foundation::fault::Seam;
 use gnitz_store::relation::RelationRegistry;
 use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::SchemaDescriptor;
@@ -337,7 +337,7 @@ impl WorkerProcess {
             },
             pending_deltas,
             pending_streams: VecDeque::new(),
-            reply_frame_budget: gnitz_store::foundation::env::env_num("GNITZ_REPLY_FRAME_BUDGET", ipc::FRAME_CAP)
+            reply_frame_budget: gnitz_foundation::env::env_num("GNITZ_REPLY_FRAME_BUDGET", ipc::FRAME_CAP)
                 .min(ipc::FRAME_CAP),
         }
     }
@@ -1233,7 +1233,7 @@ const UNIQUE_PREFLIGHT_KEYS_PER_FRAME: usize = 1 << 20;
 /// `GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME` so tests exercise multi-frame trains
 /// with small tables. Read only through `preflight_keys_per_frame`.
 fn unique_preflight_keys_per_frame() -> usize {
-    gnitz_store::foundation::env::env_num("GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME", UNIQUE_PREFLIGHT_KEYS_PER_FRAME)
+    gnitz_foundation::env::env_num("GNITZ_UNIQUE_PREFLIGHT_KEYS_PER_FRAME", UNIQUE_PREFLIGHT_KEYS_PER_FRAME)
 }
 
 /// Default in-RAM key-byte budget before the pre-flight sort spills a run (128 MiB).
@@ -1245,7 +1245,7 @@ const UNIQUE_PREFLIGHT_SPILL_BYTES: usize = 128 * 1024 * 1024;
 /// worker RAM during the pre-flight is roughly this budget plus the sort index
 /// and one reorder buffer — bounded regardless of partition size.
 fn unique_preflight_spill_bytes() -> usize {
-    gnitz_store::foundation::env::env_num("GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES", UNIQUE_PREFLIGHT_SPILL_BYTES)
+    gnitz_foundation::env::env_num("GNITZ_UNIQUE_PREFLIGHT_SPILL_BYTES", UNIQUE_PREFLIGHT_SPILL_BYTES)
 }
 
 #[cfg(test)]

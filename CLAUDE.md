@@ -353,22 +353,23 @@ alone, and `gnitz-server` is a binary nothing can link.
 
 | Crate | Role | Depends on |
 |-------|------|------------|
-| `gnitz-wire` | Wire-protocol constants + codecs — the one definition client and engine must agree on | — |
+| `gnitz-foundation` | The process and the OS under it: logging, `GNITZ_*` env overrides, fault-injection seams, host RAM and POSIX file-I/O — independent leaves every other crate may name | — |
+| `gnitz-wire` | Wire-protocol constants + codecs — the one definition client and engine must agree on. Also the one owner of XXH3, since a client computes some of the same digests | — |
 | `gnitz-expr` | The one expression evaluator, and the resolved column addressing it reads through | `wire` |
 | `gnitz-core` | Client core: connection, protocol, the logical type / expression / circuit model, and the mirror state machine | `wire`, `expr` |
 | `gnitz-sql` | SQL front end: parser, binder, query planner | `core`, `expr`, `wire` |
 | `gnitz-tokio` | The Rust async client: a `Connection` future over tokio's reactor, and the `AsyncClient` handle | `core` |
 | `gnitz-py` | Python extension (pyo3) — the driver + planner the test/benchmark suites run against | `core`, `expr`, `mirror`, `sql`, `wire` |
-| `gnitz-store` | The Z-set store: columnar batches, the LSM, the DBSP operators, the relation registry, the `ReadSpec` executor | `wire`, `expr` |
-| `gnitz-server` | The multi-process server binary: the DBSP layer — circuit compiler, bytecode VM, epoch execution, system-table catalog — under the `runtime` rung that drives it | `store`, `wire`, `expr` |
-| `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides, and a leaf. Drives `gnitz-store` directly and links no DBSP layer | `core`, `store`, `wire` |
+| `gnitz-store` | The Z-set store: columnar batches, the LSM, the DBSP operators, the relation registry, the `ReadSpec` executor | `foundation`, `wire`, `expr` |
+| `gnitz-server` | The multi-process server binary: the DBSP layer — circuit compiler, bytecode VM, epoch execution, system-table catalog — under the `runtime` rung that drives it | `foundation`, `store`, `wire`, `expr` |
+| `gnitz-mirror` | The mirror store: the local copy a client reads through, and the one implementor of `gnitz-core`'s `MirrorStore` — the one crate on both sides, and a leaf. Drives `gnitz-store` directly and links no DBSP layer | `foundation`, `core`, `store`, `wire` |
 | `gnitz-store-testkit` | Dev-only: `gnitz-store`'s test helpers, compiled as a library so other crates' tests reach them | `store`, `wire` |
 | `gnitz-test-harness` | Spawns a `gnitz-server` subprocess in a private tmpdir for integration tests | — |
 
 ### The engine (`gnitz-store` + `gnitz-server`)
 
-Strictly layered — every module depends only on those beneath it (and all of them
-on `foundation`). The crate seam sits between `query` and `read`:
+Strictly layered — every module depends only on those beneath it. The crate seam
+sits between `query` and `read`:
 
 ```
 runtime (L7)   → catalog, query, read, ops, storage, schema   orchestration · protocol · reactor
@@ -380,8 +381,7 @@ relation (L4)  → storage, schema                              registry · stor
 ops            → expr, storage, schema                        join · reduce · exchange · …
 expr           → storage, schema
 storage        → schema                                       repr (L2) · lsm (L3)
-schema         → foundation
-foundation (L0)  — independent leaves; depends on nothing
+schema           — the bottom rung; names none of the others
 ```
 
 `read` sits *above* `ops` and so above `relation`, but below the seam: it hangs
@@ -398,10 +398,10 @@ the crate root enforces by declaring them before the module that defines it.
 Each subsystem's `mod.rs` header states its own surface, its internal split, and
 what is deliberately closed off. Read that rather than a summary here.
 
-`gnitz-wire` and `gnitz-expr` sit **below this whole table**, like `foundation`:
-they are separate crates, so a `storage`-layer `use gnitz_expr::RowSource` is not
-an up-edge into the engine's own `expr` module. Read `expr` in the ladder above as
-the engine-local expression layer only.
+`gnitz-foundation`, `gnitz-wire` and `gnitz-expr` sit **below this whole
+table**: they are separate crates, so a `storage`-layer `use
+gnitz_expr::RowSource` is not an up-edge into the engine's own `expr` module.
+Read `expr` in the ladder above as the engine-local expression layer only.
 
 A relation is stored as one `Table` per worker. Test scaffolding lives in
 `test_support` / `test_rng` and per-module `tests/`. Each of the two crates has

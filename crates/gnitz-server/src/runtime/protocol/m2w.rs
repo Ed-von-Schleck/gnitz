@@ -5,7 +5,7 @@
 //! The reverse direction is [`super::w2m`], which parks on a futex in the ring
 //! itself and needs no descriptor.
 
-use gnitz_store::foundation::posix_io;
+use gnitz_foundation::posix_io;
 
 /// Create a non-blocking, close-on-exec eventfd. Raw rather than an `OwnedFd`
 /// because the master makes one per worker before the fork and each child then

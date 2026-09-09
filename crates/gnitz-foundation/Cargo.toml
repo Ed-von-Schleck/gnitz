@@ -1,12 +1,13 @@
 [package]
-name    = "gnitz-test-harness"
+name = "gnitz-foundation"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+libc.workspace = true
+
+[dev-dependencies]
 tempfile.workspace = true
-# `start_mtls` mints a client CA + a CA-signed leaf.
-rcgen.workspace = true
 
 [lints]
 workspace = true

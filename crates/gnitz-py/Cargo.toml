@@ -17,3 +17,6 @@ gnitz-expr     = { path = "../gnitz-expr" }
 gnitz-mirror   = { path = "../gnitz-mirror" }
 gnitz-sql      = { path = "../gnitz-sql" }
 gnitz-wire     = { path = "../gnitz-wire" }
+
+[lints]
+workspace = true

@@ -1,8 +1,7 @@
-//! Environment-variable overrides — the one parse rule for every `GNITZ_*`
-//! knob: a missing or unparseable value falls back to the `default` the reader
-//! names. `env_num` additionally refuses a zero, because its consumers require
-//! a positive value. Call-site-specific clamps and `OnceLock` caching stay
-//! local to the consumer.
+//! Numeric and boolean `GNITZ_*` overrides, under one parse rule: a missing or
+//! unparseable value falls back to the `default` the reader names. `env_num`
+//! additionally refuses a zero, because its consumers require a positive value.
+//! Call-site-specific clamps and `OnceLock` caching stay local to the consumer.
 
 /// A positive-integer env override: a 0 or unparseable value falls back to
 /// `default`.

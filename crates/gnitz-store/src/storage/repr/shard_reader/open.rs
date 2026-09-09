@@ -20,8 +20,8 @@ use super::super::batch::{
 use super::super::error::StorageError;
 use super::super::layout::*;
 use super::super::shard_filter;
-use super::{Advice, MappedShard, Mmap, PackedRegion, PayloadRegion, RegionView, WeightRegion};
-use crate::foundation::xxh;
+use super::{MappedShard, PackedRegion, PayloadRegion, RegionView, WeightRegion};
+use gnitz_foundation::posix_io::{Advice, Mmap};
 use gnitz_wire::{read_i64_le, read_u64_le};
 
 impl MappedShard {
@@ -46,11 +46,11 @@ impl MappedShard {
             // same "shorter than the header" verdict as the check below.
             None => StorageError::Truncated,
         })?;
-        let file_size = mmap.len();
+        let data = mmap.as_slice();
+        let file_size = data.len();
         if file_size < HEADER_SIZE {
             return Err(StorageError::Truncated);
         }
-        let data = mmap.as_slice();
 
         if read_u64_le(data, OFF_MAGIC) != SHARD_MAGIC {
             return Err(StorageError::InvalidMagic);
@@ -115,7 +115,7 @@ impl MappedShard {
         // Validate checksums
         if validate_checksums {
             for e in &entries {
-                if e.size > 0 && xxh::checksum(&data[e.offset..e.offset + e.size]) != e.checksum {
+                if e.size > 0 && gnitz_wire::checksum(&data[e.offset..e.offset + e.size]) != e.checksum {
                     return Err(StorageError::ChecksumMismatch);
                 }
             }
@@ -249,7 +249,7 @@ impl MappedShard {
                 return Err(StorageError::InvalidShard);
             }
             let bytes = &data[off..end];
-            if xxh::checksum(bytes) != read_u64_le(data, OFF_SHARD_FILTER_CHECKSUM) {
+            if gnitz_wire::checksum(bytes) != read_u64_le(data, OFF_SHARD_FILTER_CHECKSUM) {
                 return Err(StorageError::ChecksumMismatch);
             }
             Some(shard_filter::ShardFilter::parse(bytes, off).ok_or(StorageError::InvalidShard)?)

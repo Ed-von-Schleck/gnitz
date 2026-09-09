@@ -11,7 +11,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use super::super::error::StorageError;
 use super::table::{FlushWork, Table};
-use crate::foundation::posix_io::open_owned;
+use gnitz_foundation::posix_io::open_owned;
 
 /// Concurrent-fd budget for one barrier chunk. Bounds both the per-table
 /// accumulation before a chunk publishes and the sub-chunk its by-path sweep
@@ -159,9 +159,8 @@ impl LazyRing {
     /// several `submit_and_wait` calls.
     ///
     /// Where io_uring is unavailable this loops the fds through blocking
-    /// `fsync`/`fdatasync` instead. This is the engine's only io_uring user, so
-    /// the fallback here is what lets the whole flush path run on a host that
-    /// denies the syscall.
+    /// `fsync`/`fdatasync` instead, so the flush path runs on a host that denies
+    /// the syscall.
     fn batch_sync(&mut self, fds: &[libc::c_int], flags: io_uring::types::FsyncFlags) -> Result<(), StorageError> {
         self.batch_sync_with(fds, flags, |r, want| r.submit_and_wait(want))
     }
@@ -232,7 +231,7 @@ fn new_ring() -> Result<Option<io_uring::IoUring>, StorageError> {
         Some(false) => return Ok(None),
         Some(true) => {}
         // Undecided, so the env override gets its say before the first attempt.
-        None if crate::foundation::env::env_flag("GNITZ_DISABLE_IO_URING", false) => {
+        None if gnitz_foundation::env::env_flag("GNITZ_DISABLE_IO_URING", false) => {
             let _ = IO_URING_USABLE.set(false);
             return Ok(None);
         }
@@ -267,7 +266,7 @@ fn blocking_sync(fds: &[libc::c_int], flags: io_uring::types::FsyncFlags) -> Res
                 libc::fsync(fd)
             }
         };
-        if let Err(err) = crate::foundation::posix_io::retry_eintr(sync) {
+        if let Err(err) = gnitz_foundation::posix_io::retry_eintr(sync) {
             gnitz_warn!("blocking fsync failed: {}", err);
             return Err(StorageError::from(err));
         }

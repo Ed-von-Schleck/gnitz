@@ -35,9 +35,8 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use super::error::StoreError;
 use super::repr::heap::{HeapNode, LoserTree};
-use crate::foundation::posix_io;
-use crate::foundation::posix_io::{Advice, Mmap};
 use crate::schema::key::compare_pk_bytes;
+use gnitz_foundation::posix_io::{self, Advice, Mmap};
 
 /// Sort `idx` (rebuilt as `0..flat.len()/stride`) by the byte-lexicographic
 /// order of the fixed-`stride` records of `flat` — the same `compare_pk_bytes`

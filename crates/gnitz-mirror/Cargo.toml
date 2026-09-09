@@ -4,20 +4,18 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-gnitz-core   = { path = "../gnitz-core" }
-gnitz-store  = { path = "../gnitz-store" }
-gnitz-wire   = { path = "../gnitz-wire" }
+gnitz-foundation = { path = "../gnitz-foundation" }
+gnitz-core = { path = "../gnitz-core" }
+gnitz-store = { path = "../gnitz-store" }
+gnitz-wire = { path = "../gnitz-wire" }
 
 [dev-dependencies]
 gnitz-store-testkit = { path = "../gnitz-store-testkit" }
 gnitz-sql = { path = "../gnitz-sql" }
 gnitz-test-harness = { path = "../gnitz-test-harness" }
-libc = "0.2"
-proptest = "1"
-tempfile = "3"
+libc.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
 
-[lints.rust]
-warnings = "deny"
-
-[lints.clippy]
-all = { level = "deny", priority = -1 }
+[lints]
+workspace = true

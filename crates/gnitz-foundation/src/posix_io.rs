@@ -46,9 +46,8 @@ pub fn write_all_fd(fd: c_int, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `libc::openat` returning an `OwnedFd`. The errno is captured here, at the
-/// syscall, so no caller has to read it back out of ambient state.
-pub(crate) fn openat_owned(dirfd: c_int, name: &std::ffi::CStr, flags: c_int) -> std::io::Result<OwnedFd> {
+/// `libc::openat` returning an `OwnedFd`.
+pub fn openat_owned(dirfd: c_int, name: &std::ffi::CStr, flags: c_int) -> std::io::Result<OwnedFd> {
     let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags, 0o644 as libc::mode_t) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
@@ -58,18 +57,13 @@ pub(crate) fn openat_owned(dirfd: c_int, name: &std::ffi::CStr, flags: c_int) ->
 }
 
 /// `libc::open` returning an `OwnedFd`, the `AT_FDCWD` case of [`openat_owned`].
-pub(crate) fn open_owned(path: &std::ffi::CStr, flags: c_int) -> std::io::Result<OwnedFd> {
+pub fn open_owned(path: &std::ffi::CStr, flags: c_int) -> std::io::Result<OwnedFd> {
     openat_owned(libc::AT_FDCWD, path, flags)
 }
 
 /// `libc::renameat`, with the errno captured before any cleanup the caller
 /// runs on the failure path can overwrite it.
-pub(crate) fn renameat(
-    olddirfd: c_int,
-    old: &std::ffi::CStr,
-    newdirfd: c_int,
-    new: &std::ffi::CStr,
-) -> std::io::Result<()> {
+pub fn renameat(olddirfd: c_int, old: &std::ffi::CStr, newdirfd: c_int, new: &std::ffi::CStr) -> std::io::Result<()> {
     let rc = unsafe { libc::renameat(olddirfd, old.as_ptr(), newdirfd, new.as_ptr()) };
     if rc < 0 {
         return Err(std::io::Error::last_os_error());
@@ -91,7 +85,7 @@ pub(crate) fn renameat(
 /// `O_TMPFILE` (ext4 / xfs / btrfs / tmpfs — every filesystem gnitz stores data
 /// on). `O_TMPFILE` already implies `O_DIRECTORY`, so the path is validated as a
 /// directory by the kernel.
-pub(crate) fn open_tmpfile(dir: &str) -> std::io::Result<OwnedFd> {
+pub fn open_tmpfile(dir: &str) -> std::io::Result<OwnedFd> {
     let dir_c = std::ffi::CString::new(dir).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let fd = unsafe { libc::open(dir_c.as_ptr(), libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC, 0o600) };
     if fd < 0 {
@@ -202,14 +196,14 @@ pub fn map_file_reserved(fd: c_int, size: usize) -> std::io::Result<*mut u8> {
 /// single front-to-back pass, wasted I/O for a mapping probed at unpredictable
 /// offsets.
 #[derive(Clone, Copy)]
-pub(crate) enum Advice {
+pub enum Advice {
     Sequential,
     Default,
 }
 
 /// RAII handle for a read-only mmap'd file region, so the unmap path lives in
 /// exactly one place — no consumer's error return or Drop repeats the `munmap`.
-pub(crate) struct Mmap {
+pub struct Mmap {
     ptr: *mut u8,
     len: usize,
 }
@@ -218,7 +212,7 @@ impl Mmap {
     /// mmap `[0, len)` of `fd` read-only. `len` must be `> 0`. The mapping holds
     /// its own reference to the inode, so the caller may close `fd` immediately
     /// after.
-    pub(crate) fn from_fd(fd: c_int, len: usize, advice: Advice) -> std::io::Result<Self> {
+    pub fn from_fd(fd: c_int, len: usize, advice: Advice) -> std::io::Result<Self> {
         debug_assert!(len > 0);
         let raw = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, fd, 0) };
         if raw == libc::MAP_FAILED {
@@ -234,7 +228,7 @@ impl Mmap {
     }
 
     /// Open `path` read-only and mmap the whole (non-empty) file.
-    pub(crate) fn open_ro(path: &std::ffi::CStr, advice: Advice) -> std::io::Result<Self> {
+    pub fn open_ro(path: &std::ffi::CStr, advice: Advice) -> std::io::Result<Self> {
         let fd = open_owned(path, libc::O_RDONLY)?;
         let len = fd_size(std::os::fd::AsRawFd::as_raw_fd(&fd))?;
         if len == 0 {
@@ -245,13 +239,11 @@ impl Mmap {
         Ok(map)
     }
 
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline]
-    pub(crate) fn as_slice(&self) -> &[u8] {
+    /// The mapped bytes. Never empty: `from_fd` requires a non-zero length and
+    /// `open_ro` refuses an empty file, so a caller after the length reads
+    /// `as_slice().len()` rather than a second accessor.
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }

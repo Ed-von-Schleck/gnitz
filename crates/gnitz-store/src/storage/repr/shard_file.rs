@@ -13,10 +13,9 @@ use super::super::error::StorageError;
 use super::batch::{strides_from_schema, REG_PAYLOAD_START, REG_PK, REG_WEIGHT};
 use super::layout::*;
 use super::shard_filter;
-use crate::foundation::posix_io;
-use crate::foundation::xxh;
 use crate::schema::key::probe_key;
 use crate::schema::SchemaDescriptor;
+use gnitz_foundation::posix_io;
 use gnitz_wire::{
     is_fixed_int, is_signed_int, read_i64_le, read_signed_exact, read_u64_le, read_unsigned_exact, write_u64_le,
 };
@@ -551,7 +550,7 @@ fn write_shard_streaming_inner(
         // Empty regions short-circuit to checksum 0 — never encode an empty
         // region. Non-Raw encodings are only chosen for non-empty regions.
         let cs = if actual_sizes[i] > 0 && !src.is_empty() {
-            xxh::checksum(encodings[i].encoded_bytes(src))
+            gnitz_wire::checksum(encodings[i].encoded_bytes(src))
         } else {
             0
         };
@@ -594,7 +593,7 @@ fn write_shard_streaming_inner(
     write_u64_le(
         &mut hdr_buf,
         OFF_SHARD_FILTER_CHECKSUM,
-        filter_data.as_ref().map_or(0, |d| xxh::checksum(d)),
+        filter_data.as_ref().map_or(0, |d| gnitz_wire::checksum(d)),
     );
 
     // Last, over every other field. `basename` is the *final* name — the `.tmp`

@@ -17,7 +17,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::runtime::wire::{WireData, WireMsg};
-use gnitz_store::foundation::fault::Seam;
+use gnitz_foundation::fault::Seam;
 use gnitz_wire::{align8, read_u32_le, read_u64_le, write_u32_le, write_u64_le};
 use gnitz_wire::{WireFault, MAX_WORKERS, STATUS_SAL_FULL};
 
@@ -247,7 +247,7 @@ impl<'a> DirectGroup<'a> {
 /// published. The epoch is not a seed: it sits in the hashed span, so verifying a
 /// header also authenticates the generation it claims.
 fn group_digest(base: u64, hdr: &[u8]) -> u64 {
-    gnitz_store::foundation::xxh::digest_with_hole(&base.to_le_bytes(), hdr, OFF_DIGEST)
+    gnitz_wire::digest_with_hole(&base.to_le_bytes(), hdr, OFF_DIGEST)
 }
 
 const SAL_MMAP_SIZE: usize = 1 << 30;
@@ -338,7 +338,7 @@ const MIN_SAL_BYTES: usize = 16 << 20;
 /// dozens of test servers sharing a tmpfs would exhaust it. Called once, by the
 /// boot that maps the SAL; every consumer carries the length beside the pointer.
 pub(in crate::runtime) fn sal_mmap_size() -> usize {
-    let asked = gnitz_store::foundation::env::env_num("GNITZ_SAL_BYTES", SAL_MMAP_SIZE);
+    let asked = gnitz_foundation::env::env_num("GNITZ_SAL_BYTES", SAL_MMAP_SIZE);
     let size = asked.clamp(MIN_SAL_BYTES, SAL_MMAP_SIZE);
     if size != asked {
         gnitz_info!("GNITZ_SAL_BYTES={asked} is outside [{MIN_SAL_BYTES}, {SAL_MMAP_SIZE}]; using {size}");
@@ -768,7 +768,7 @@ impl SalWriter {
     /// written before the boot [`Self::rewind`] sets the live epoch.
     pub(crate) fn new(ptr: *mut u8, fd: i32, mmap_size: usize, num_workers: usize) -> Self {
         let checkpoint_threshold =
-            gnitz_store::foundation::env::env_num("GNITZ_CHECKPOINT_BYTES", (mmap_size as u64 * 3) >> 2);
+            gnitz_foundation::env::env_num("GNITZ_CHECKPOINT_BYTES", (mmap_size as u64 * 3) >> 2);
         SalWriter {
             ptr,
             fd,

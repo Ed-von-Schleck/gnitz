@@ -1,6 +1,6 @@
 use super::super::fixtures::{test_dispatcher, test_dispatcher_with_efds};
 use crate::catalog::{CatalogEngine, SysFamily, FIRST_USER_TABLE_ID};
-use gnitz_store::foundation::posix_io::retry_eintr;
+use gnitz_foundation::posix_io::retry_eintr;
 
 /// Fork a child that exits immediately and block until it is a zombie *without*
 /// reaping it, so the probe's own `waitpid(WNOHANG)` is guaranteed to find it on

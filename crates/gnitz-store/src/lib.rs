@@ -8,19 +8,18 @@
 //! graph, not a comment: nothing here can name anything there, and nothing links
 //! what is there.
 //!
-//! The seven public module roots below are the API, in the order of the layer
-//! ladder they form — each depends only on those beneath it, and all of them on
-//! `foundation`. The submodules under each root are private; what a root
-//! re-exports is what it publishes, plus the seven submodules named as modules
-//! (`foundation::{posix_io, log, env, fault, xxh}`, `schema::key` and
+//! The six public module roots below are the API. They form a layer ladder,
+//! each naming only those beneath it — `tests/rungs.rs` states that table and
+//! enforces it. The submodules under each root are private; what a root
+//! re-exports is what it publishes, plus the two named as modules
+//! (`schema::key` and
 //! `storage::batch_pool`). An item is `pub` because another crate names it;
 //! everything else is `pub(crate)`.
 //!
 //! There is no crate-root re-export façade: a type's rung is part of what its
-//! path says. The only names at the root are the four `gnitz_*!` logging
-//! macros, which have no other export site. Nothing this crate exports ends the
-//! calling process: every fallible path returns its error, and the decision to
-//! fail-stop belongs to the process that owns a restart contract.
+//! path says, and the root itself holds no name. Nothing this crate exports
+//! ends the calling process: every fallible path returns its error, and the
+//! decision to fail-stop belongs to the process that owns a restart contract.
 //!
 //! Unit tests live in `tests/<module>.rs`, attached with `#[path]` to the module
 //! they cover, so each stays that module's own `tests` child and reaches its
@@ -29,11 +28,10 @@
 #[cfg(not(target_endian = "little"))]
 compile_error!("GnitzDB requires a little-endian target; the wire format is LE-only.");
 
-// FIRST, and `#[macro_use]`: the attribute reaches only code that follows this
-// item, and it — not `#[macro_export]` — is what puts `gnitz_warn!` and its
-// siblings into textual scope for the rest of the crate.
+// Crate-wide scope for `gnitz_warn!` and its siblings; a plain `use` would
+// reach this module only.
 #[macro_use]
-pub mod foundation;
+extern crate gnitz_foundation;
 
 pub mod ops;
 pub mod read;

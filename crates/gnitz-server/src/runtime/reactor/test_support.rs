@@ -142,7 +142,7 @@ pub(super) fn spawn_drain(fd: i32, expect: usize) -> std::thread::JoinHandle<usi
         while seen < expect {
             // EINTR is not EOF: breaking on it would close `fd` early and fail
             // the sender under test with EPIPE.
-            let n = gnitz_store::foundation::posix_io::retry_eintr(|| {
+            let n = gnitz_foundation::posix_io::retry_eintr(|| {
                 libc::read(fd, scratch.as_mut_ptr() as *mut libc::c_void, scratch.len()) as libc::c_int
             });
             match n {

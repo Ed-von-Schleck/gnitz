@@ -1178,7 +1178,7 @@ fn test_reindex_packer_copartition_contract_wide() {
     // of XXH3-64 over the OPK bytes, recomputed here. A forked seed or shift
     // would still keep producer == consumer — both call the same function —
     // so only an independent reference catches it.
-    let expected = ((crate::foundation::xxh::checksum(consumer) as u128 * NW as u128) >> 64) as usize;
+    let expected = ((gnitz_wire::checksum(consumer) as u128 * NW as u128) >> 64) as usize;
     assert_eq!(p_consumer, expected, "wide owner == ((xxh3_64(opk) * W) >> 64)");
     assert!(expected < NW, "the owner is a launched worker");
 }

@@ -23,9 +23,8 @@
 use std::cmp::Ordering;
 
 use gnitz_expr::RowSource;
-use gnitz_wire::{Cut, RangeDescriptor, NARROW_PK_MAX_BYTES};
+use gnitz_wire::{Cut, RangeDescriptor, RowHasher, NARROW_PK_MAX_BYTES};
 
-use crate::foundation::xxh::{self, RowHasher};
 use crate::schema::{
     type_code, ColumnLocator, DerivedSchema, OpBuildErr, SchemaColumn, SchemaDescriptor, MAX_PK_BYTES, MAX_PK_COLUMNS,
 };
@@ -416,11 +415,11 @@ impl PkSortKey for [u128; 2] {
 #[inline]
 pub fn probe_key(opk: &[u8]) -> u64 {
     let fingerprint = if opk.len() > NARROW_PK_MAX_BYTES {
-        xxh::checksum(opk) as u128
+        gnitz_wire::checksum(opk) as u128
     } else {
         gnitz_wire::widen_pk_be(opk)
     };
-    xxh::checksum(&fingerprint.to_le_bytes())
+    gnitz_wire::checksum(&fingerprint.to_le_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -904,7 +903,7 @@ impl FoldCols {
                 buf[n + 1..n + 17].copy_from_slice(&loc.route_key(src, row).to_le_bytes());
                 n += 17;
             }
-            return xxh::checksum_128(&buf[..n]);
+            return gnitz_wire::checksum_128(&buf[..n]);
         }
         let mut hasher = RowHasher::new();
         for &loc in &self.locs {
@@ -933,7 +932,7 @@ pub(crate) fn german_string_promote_key(struct_bytes: &[u8], blob: &[u8]) -> u12
     // only 2^64 of entropy — a ~2^32-row birthday bound past which two distinct
     // strings collide to one `_join_pk` and the join's OPK byte-compare silently
     // equijoins them.
-    xxh::checksum_128(content)
+    gnitz_wire::checksum_128(content)
 }
 
 // ---------------------------------------------------------------------------

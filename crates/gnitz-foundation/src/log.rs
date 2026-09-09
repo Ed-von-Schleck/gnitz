@@ -1,4 +1,4 @@
-//! Logging module for the GnitzDB engine.
+//! Process-wide logging.
 //!
 //! Log format: `secs.millis tag LEVEL msg` on stderr (fd 2).
 //! Log levels:
@@ -21,10 +21,9 @@ pub const QUIET: u32 = 0;
 pub const NORMAL: u32 = 1;
 pub const DEBUG: u32 = 2;
 
-/// Set the log level and process tag. A tag is at most three bytes: `MAX_WORKERS`
-/// is 64 and `main.rs` validates the count into `1..=64`, so the longest one a
-/// worker forms is `"W63"` — exactly what fits. The clamp below is what keeps a
-/// release build from panicking rather than a supported way to pass more.
+/// Set the log level and process tag. A tag is at most three bytes — the clamp
+/// keeps a release build from panicking rather than being a supported way to
+/// pass more; the caller's crate is where a longer tag would be ruled out.
 pub fn init(level: u32, tag: &[u8]) {
     debug_assert!(tag.len() <= 3);
     LEVEL.store(level.min(DEBUG), Ordering::Relaxed);
@@ -105,7 +104,7 @@ fn format_line(buf: &mut [u8; LINE_MAX], level_tag: &str, args: core::fmt::Argum
 #[macro_export]
 macro_rules! gnitz_error {
     ($($arg:tt)*) => {
-        $crate::foundation::log::_emit("ERROR", format_args!($($arg)*));
+        $crate::log::_emit("ERROR", format_args!($($arg)*));
     };
 }
 
@@ -113,7 +112,7 @@ macro_rules! gnitz_error {
 #[macro_export]
 macro_rules! gnitz_warn {
     ($($arg:tt)*) => {
-        $crate::foundation::log::_emit("WARN", format_args!($($arg)*));
+        $crate::log::_emit("WARN", format_args!($($arg)*));
     };
 }
 
@@ -121,8 +120,8 @@ macro_rules! gnitz_warn {
 #[macro_export]
 macro_rules! gnitz_info {
     ($($arg:tt)*) => {
-        if $crate::foundation::log::is_info() {
-            $crate::foundation::log::_emit("INFO", format_args!($($arg)*));
+        if $crate::log::is_info() {
+            $crate::log::_emit("INFO", format_args!($($arg)*));
         }
     };
 }
@@ -131,8 +130,8 @@ macro_rules! gnitz_info {
 #[macro_export]
 macro_rules! gnitz_debug {
     ($($arg:tt)*) => {
-        if $crate::foundation::log::is_debug() {
-            $crate::foundation::log::_emit("DEBUG", format_args!($($arg)*));
+        if $crate::log::is_debug() {
+            $crate::log::_emit("DEBUG", format_args!($($arg)*));
         }
     };
 }

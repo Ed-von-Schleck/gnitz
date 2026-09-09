@@ -4,22 +4,24 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-gnitz-wire  = { path = "../gnitz-wire" }
-gnitz-expr  = { path = "../gnitz-expr" }
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+gnitz-foundation = { path = "../gnitz-foundation" }
+gnitz-wire = { path = "../gnitz-wire" }
+gnitz-expr = { path = "../gnitz-expr" }
 xorf = { version = "0.13", default-features = false, features = ["binary-fuse"] }
-libc = "0.2"
-io-uring = "0.7"
-rustc-hash = "2"
+libc.workspace = true
+io-uring.workspace = true
+rustc-hash.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
-proptest = "1"
+tempfile.workspace = true
+proptest.workspace = true
 
+# Spelled out rather than `workspace = true`, which cannot be extended: this
+# crate publishes an API across the engine seam, so it also wants
+# `unreachable_pub` — allow-by-default, so `warnings = "deny"` does not imply it
+# — to make an over-wide `pub` inside a private module a compile error.
 [lints.rust]
 warnings = "deny"
-# Allow-by-default, so `warnings = "deny"` alone does not turn it on: this entry
-# is what makes an over-wide `pub` inside a private module a compile error.
 unreachable_pub = "warn"
 
 [lints.clippy]
