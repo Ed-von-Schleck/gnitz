@@ -12,6 +12,7 @@ import pytest
 import gnitz
 
 _T = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
+_U = "CREATE TABLE u (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)"
 _ROWS = "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)"
 
 
@@ -31,9 +32,7 @@ def rejected(server):
         conn.execute_sql("CREATE TABLE p (k BIGINT PRIMARY KEY)", schema_name=sn)
         conn.execute_sql(_T, schema_name=sn)
         conn.execute_sql(_ROWS, schema_name=sn)
-        conn.execute_sql(
-            "CREATE TABLE u (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)",
-            schema_name=sn)
+        conn.execute_sql(_U, schema_name=sn)
         conn.execute_sql("INSERT INTO u VALUES (1, 10), (2, 20)", schema_name=sn)
         yield conn, sn
         conn.drop_schema(sn)
@@ -177,12 +176,54 @@ def test_an_unhonoured_clause_names_itself(rejected, sql, message):
         conn.execute_sql(sql, schema_name=sn)
 
 
+# A CREATE VIEW body reads a hand-picked subset of the SELECT, and which subset
+# depends on the shape (simple, grouped, join, set-op, DISTINCT). A clause a
+# shape does not consume is refused by name rather than dropped — a dropped
+# clause runs a different query than the caller wrote.
+_UNHONOURED_VIEW_BODY = [
+    # DISTINCT ON: a single SELECT, a set-op branch, and the degenerate
+    # `DISTINCT ON (val) val` — refused on purpose rather than folded to DISTINCT.
+    ("SELECT DISTINCT ON (val) val, pk FROM t", "DISTINCT ON is not supported"),
+    ("SELECT DISTINCT ON (val) val FROM t UNION SELECT pk FROM t",
+     "DISTINCT ON is not supported"),
+    ("SELECT DISTINCT ON (val) val FROM t", "DISTINCT ON is not supported"),
+    ("SELECT DISTINCT val FROM t GROUP BY val", "GROUP BY is not supported"),
+    ("SELECT DISTINCT val FROM t HAVING val > 0", "HAVING is not supported"),
+    # A HAVING without DISTINCT drops nothing: it groups the whole relation, so
+    # the body binds as a global aggregate and `val` — neither a group key nor an
+    # aggregate — is what fails.
+    ("SELECT val FROM t HAVING val > 0",
+     "column 'val' must appear in GROUP BY or an aggregate function"),
+    ("SELECT val FROM t GROUP BY ALL", "GROUP BY"),
+    ("SELECT DISTINCT val FROM t PREWHERE val > 5", "PREWHERE is not supported"),
+    ("SELECT val FROM t PREWHERE val > 5", "PREWHERE is not supported"),
+    ("SELECT val, COUNT(*) FROM t PREWHERE val > 5 GROUP BY val", "PREWHERE is not supported"),
+    ("SELECT DISTINCT TOP 5 val FROM t", "TOP is not supported"),
+    ("SELECT val FROM t FETCH FIRST 5 ROWS ONLY", "FETCH is not supported"),
+    ("SELECT val FROM t SORT BY val", "SORT BY is not supported"),
+    # QUALIFY filters on window values, ahead of a DISTINCT: one with no window
+    # function to filter on is refused, not dropped.
+    ("SELECT DISTINCT val FROM t QUALIFY val > 1", "QUALIFY needs a window function"),
+    ("SELECT pk FROM t FOR UPDATE", "FOR UPDATE/SHARE is not supported"),
+    ("SELECT pk FROM t SETTINGS max_threads = 1", "SETTINGS is not supported"),
+    ("SELECT pk FROM t FORMAT JSON", "FORMAT is not supported"),
+]
+
+
+@pytest.mark.parametrize("body,message", _UNHONOURED_VIEW_BODY)
+def test_a_view_body_refuses_the_clauses_its_shape_would_drop(rejected, body, message):
+    conn, sn = rejected
+    with pytest.raises(gnitz.GnitzError, match=message):
+        conn.execute_sql(f"CREATE VIEW v AS {body}", schema_name=sn)
+
+
 def test_the_neighbouring_spellings_are_unaffected(client, schema_name):
     """Every clause above sits beside one that is served; rejecting the envelope
     must not take the ordinary statement with it."""
     client.execute_sql("CREATE TABLE p (k BIGINT PRIMARY KEY)", schema_name=schema_name)
     client.execute_sql(_T, schema_name=schema_name)
     client.execute_sql(_ROWS, schema_name=schema_name)
+    client.execute_sql(_U, schema_name=schema_name)
 
     assert len(client.execute_sql("SELECT pk FROM t", schema_name=schema_name)[0]["rows"]) == 5
     assert len(client.execute_sql("SELECT * FROM t LIMIT 2", schema_name=schema_name)[0]["rows"]) == 2
@@ -202,6 +243,21 @@ def test_the_neighbouring_spellings_are_unaffected(client, schema_name):
     client.execute_sql("CREATE INDEX ixb ON t USING BTREE (val)", schema_name=schema_name)
     client.execute_sql(
         "CREATE TABLE f2 (pk BIGINT PRIMARY KEY, c BIGINT REFERENCES p(k))", schema_name=schema_name)
+    # Every honoured view shape still compiles, including the ones whose clauses
+    # `_UNHONOURED_VIEW_BODY` refuses elsewhere — a grouped or DISTINCT set-op
+    # side becomes a hidden segment, and an OUTER range join consumes its own
+    # WHERE as a post-null-fill 3VL filter.
+    for name, body in {
+        "vsimple": "SELECT pk, val FROM t WHERE val > 0",
+        "vdistinct": "SELECT DISTINCT pk, val FROM t",
+        "vgroup": "SELECT val, COUNT(*) FROM t GROUP BY val",
+        "vjoin": "SELECT t.val, u.k FROM t JOIN u ON t.pk = u.pk",
+        "vsetop": "SELECT val FROM t UNION ALL SELECT pk FROM t",
+        "vsetop_side": "SELECT DISTINCT val FROM t UNION ALL SELECT k FROM u GROUP BY k",
+        "vrangeleft": "SELECT t.val FROM t LEFT JOIN u ON t.val < u.k WHERE t.val > 5",
+    }.items():
+        client.execute_sql(f"CREATE VIEW {name} AS {body}", schema_name=schema_name)
+        client.resolve_table(schema_name, name)
 
 
 def test_replicated_and_cluster_by_are_mutually_exclusive(client, schema_name):

@@ -124,6 +124,31 @@ def test_an_aggregate_over_a_replicated_source_is_not_w_folded(client, schema_na
                                {(10, 2, 300): 1, (20, 1, 350): 1})
 
 
+@NEEDS_MULTI
+def test_a_replicated_source_grounds_exactly_once(client, schema_name):
+    """A global aggregate's ground row is where a backfill over an *empty*
+    replicated source can go wrong in both directions: drop the owner disjunct
+    and it emits none, forget the disjunct is exclusive and it emits one per
+    worker. The linear view alongside is the control — the same empty backfill
+    must produce no row at all there."""
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)" + _REPL,
+        schema_name=schema_name)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM t",
+        schema_name=schema_name)
+    client.execute_sql(
+        "CREATE VIEW f AS SELECT pk, a * 2 AS d FROM t WHERE a > 0", schema_name=schema_name)
+    vid, _ = client.resolve_table(schema_name, "v")
+    fid, _ = client.resolve_table(schema_name, "f")
+
+    oracle.assert_view_matches(client, vid, ["cnt", "total"], {(0, None): 1}, "empty")
+    oracle.assert_view_matches(client, fid, ["pk", "d"], {}, "empty")
+    client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 7)", schema_name=schema_name)
+    oracle.assert_view_matches(client, vid, ["cnt", "total"], {(2, 12): 1}, "filled")
+    oracle.assert_view_matches(client, fid, ["pk", "d"], {(1, 10): 1, (2, 14): 1}, "filled")
+
+
 # ── Writes reach every copy ──────────────────────────────────────────────────
 
 _NFACT = 40
@@ -439,6 +464,41 @@ def test_replicated_pure_range_join_inner_and_left(client, schema_name):
     oracle.assert_view_matches(
         client, client.resolve_table(schema_name, "vleft")[0], ["aid", "bid"],
         {**matched, (3, None): 1, (4, None): 1}, "left")
+
+
+@NEEDS_MULTI
+def test_replicated_keyless_join_sides(client, schema_name):
+    """The keyless (cross) product with a replicated side. Its delta relays
+    single-sourced and the trace filter partitions it like a keyed side, so the
+    product carries no W× duplication — for one replicated side, and for two,
+    where the view itself is replicated and runs correct-local."""
+    for name in ("r", "r2"):
+        client.execute_sql(
+            f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)" + _REPL,
+            schema_name=schema_name)
+    client.execute_sql(
+        "CREATE TABLE k (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+        schema_name=schema_name)
+    for name, body in (("rk", "SELECT r.id AS a, k.id AS b FROM r CROSS JOIN k"),
+                       ("kr", "SELECT k.id AS a, r.id AS b FROM k CROSS JOIN r"),
+                       ("rr", "SELECT r.id AS a, r2.id AS b FROM r, r2")):
+        client.execute_sql(f"CREATE VIEW {name} AS {body}", schema_name=schema_name)
+    ids_r, ids_r2, ids_k = list(range(1, 6)), list(range(50, 53)), list(range(10, 17))
+    for name, ids in (("r", ids_r), ("r2", ids_r2), ("k", ids_k)):
+        client.execute_sql(
+            f"INSERT INTO {name} VALUES " + ",".join(f"({i},0)" for i in ids),
+            schema_name=schema_name)
+
+    def check(ctx, ids_r):
+        for name, left, right in (("rk", ids_r, ids_k), ("kr", ids_k, ids_r),
+                                  ("rr", ids_r, ids_r2)):
+            oracle.assert_view_matches(
+                client, client.resolve_table(schema_name, name)[0], ["a", "b"],
+                {(x, y): 1 for x in left for y in right}, f"{name} {ctx}")
+
+    check("initial", ids_r)
+    client.execute_sql("DELETE FROM r WHERE id = 3", schema_name=schema_name)
+    check("after delete", [i for i in ids_r if i != 3])
 
 
 @NEEDS_MULTI

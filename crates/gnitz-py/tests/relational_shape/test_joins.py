@@ -11,9 +11,6 @@ count reads both as correct.
 INNER only. LEFT/RIGHT/FULL, CROSS and range/band shapes have their own files;
 they appear here only where a spelling's rule differs by orientation (the USING
 merge keeps the *preserved* side's copy).
-
-Run:
-    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/relational_shape/test_joins.py
 """
 from collections import Counter
 
@@ -46,30 +43,6 @@ _TU_PAIRS = {(1, 10): 1, (3, 10): 1, (2, 11): 1, (2, 12): 1}
 
 
 # ── the join itself ────────────────────────────────────────────────────────
-
-
-def test_only_matching_pairs_reach_the_output(client, schema_name):
-    """An equijoin emits one row per (left, right) pair agreeing on the key and
-    nothing for a key with no counterpart. The right side's VARCHAR payload
-    crosses the join through the blob heap and arrives verbatim."""
-    sn = schema_name
-    client.execute_sql(
-        "CREATE TABLE orders (id BIGINT PRIMARY KEY, cid BIGINT NOT NULL, amount BIGINT NOT NULL)",
-        schema_name=sn)
-    client.execute_sql(
-        "CREATE TABLE customers (id BIGINT PRIMARY KEY, name VARCHAR(100) NOT NULL)",
-        schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT orders.id AS oid, orders.amount, customers.name "
-        "FROM orders JOIN customers ON orders.cid = customers.id", schema_name=sn)
-    client.execute_sql("INSERT INTO customers VALUES (10, 'Alice'), (20, 'Bob')", schema_name=sn)
-    client.execute_sql(
-        "INSERT INTO orders VALUES (1, 10, 100), (2, 20, 200), (3, 10, 300), (4, 99, 400)",
-        schema_name=sn)
-
-    assert bag(scanned(client, sn, "v"), "oid", "amount", "name") == {
-        (1, 100, "Alice"): 1, (2, 200, "Bob"): 1, (3, 300, "Alice"): 1,
-    }, "order 4's key 99 has no customer, so it emits nothing"
 
 
 def test_output_weight_is_the_product_of_the_input_weights(client, schema_name):
@@ -109,7 +82,8 @@ def test_a_delta_on_either_side_joins_the_other_sides_trace(client, schema_name)
         "CREATE TABLE orders (id BIGINT PRIMARY KEY, cid BIGINT NOT NULL, amount BIGINT NOT NULL)",
         schema_name=sn)
     client.execute_sql(
-        "CREATE TABLE customers (id BIGINT PRIMARY KEY, cname BIGINT NOT NULL)", schema_name=sn)
+        "CREATE TABLE customers (id BIGINT PRIMARY KEY, cname VARCHAR(100) NOT NULL)",
+        schema_name=sn)
     client.execute_sql(
         "CREATE VIEW v AS SELECT orders.id AS oid, orders.amount AS amt, "
         "customers.id AS cid, customers.cname AS cname "
@@ -125,15 +99,21 @@ def test_a_delta_on_either_side_joins_the_other_sides_trace(client, schema_name)
             right=customers, rwhere=None, rkey="id", rproj=["id", "cname"],
             out_cols=project), ctx=ctx)
 
-    client.execute_sql("INSERT INTO customers VALUES (10, 111), (20, 222)", schema_name=sn)
-    oracle.apply_insert(customers, "id", [{"id": 10, "cname": 111}, {"id": 20, "cname": 222}])
+    client.execute_sql(
+        "INSERT INTO customers VALUES (10, 'Alice'), (20, 'Bob')", schema_name=sn)
+    oracle.apply_insert(customers, "id",
+                        [{"id": 10, "cname": "Alice"}, {"id": 20, "cname": "Bob"}])
     check("right side alone")
 
+    # Order 4's key 99 has no customer, so it must emit nothing; the VARCHAR
+    # payload crosses the join through the blob heap and arrives verbatim.
     client.execute_sql(
-        "INSERT INTO orders VALUES (1, 10, 100), (2, 20, 200), (3, 10, 300)", schema_name=sn)
+        "INSERT INTO orders VALUES (1, 10, 100), (2, 20, 200), (3, 10, 300), (4, 99, 400)",
+        schema_name=sn)
     oracle.apply_insert(orders, "id", [{"id": 1, "cid": 10, "amount": 100},
                                        {"id": 2, "cid": 20, "amount": 200},
-                                       {"id": 3, "cid": 10, "amount": 300}])
+                                       {"id": 3, "cid": 10, "amount": 300},
+                                       {"id": 4, "cid": 99, "amount": 400}])
     check("left delta against the right trace")
 
     client.execute_sql("UPDATE orders SET amount = 999 WHERE id = 1", schema_name=sn)
@@ -144,8 +124,8 @@ def test_a_delta_on_either_side_joins_the_other_sides_trace(client, schema_name)
     oracle.apply_update(orders, "id", 3, {"cid": 20})
     check("left re-key moves the row to another group")
 
-    client.execute_sql("UPDATE customers SET cname = 333 WHERE id = 20", schema_name=sn)
-    oracle.apply_update(customers, "id", 20, {"cname": 333})
+    client.execute_sql("UPDATE customers SET cname = 'Bobby' WHERE id = 20", schema_name=sn)
+    oracle.apply_update(customers, "id", 20, {"cname": "Bobby"})
     check("right payload update retracts and re-emits every matched row")
 
     client.execute_sql("DELETE FROM customers WHERE id = 10", schema_name=sn)
@@ -493,20 +473,6 @@ def test_a_where_equality_becomes_a_key_and_one_that_cannot_stays_a_residual(
     assert bag(scanned(client, sn, "floats"), "tid", "uid") == {(1, 10): 1}
 
 
-def test_a_conjunct_naming_one_side_is_pushed_below_the_join(client, schema_name):
-    """A WHERE conjunct naming only one input is pushed to the step below it, so
-    the rows it removes have to be gone from the result all the same."""
-    sn = schema_name
-    _tu(client, sn)
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT t.id AS tid, u.id AS uid FROM t, u "
-        "WHERE t.k = u.k AND t.id > 1", schema_name=sn)
-    _fill_tu(client, sn)
-
-    assert bag(scanned(client, sn, "v"), "tid", "uid") == \
-        {k: w for k, w in _TU_PAIRS.items() if k[0] > 1}
-
-
 def test_the_comma_spine_folds_left_deep_under_one_where(client, schema_name):
     """A comma-separated FROM folds left-deep, so every step's key has to be
     found in the one WHERE sitting above the whole spine — including the inner
@@ -542,18 +508,15 @@ def test_the_comma_spine_folds_left_deep_under_one_where(client, schema_name):
 
 
 def test_a_desugared_join_binds_at_every_nested_site(client, schema_name):
-    """A derived table, a CTE and a set-operation branch all bind their body
-    through the one relational binder, so the comma form and the USING merge
-    reach them with no rule of their own — and none needed."""
+    """A derived table and a set-operation branch bind their body through the one
+    relational binder, so the comma form and the USING merge reach them with no
+    rule of their own — and none needed."""
     sn = schema_name
     _tu(client, sn)
     client.execute_sql("CREATE VIEW tv AS SELECT id, k FROM t", schema_name=sn)
     client.execute_sql(
         "CREATE VIEW derived AS SELECT tid, uid FROM "
         "(SELECT t.id AS tid, u.id AS uid FROM t, u WHERE t.k = u.k) x", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW cte AS WITH x AS (SELECT t.id AS tid, u.id AS uid FROM t, u WHERE t.k = u.k) "
-        "SELECT tid, uid FROM x", schema_name=sn)
     client.execute_sql(
         "CREATE VIEW branch AS SELECT t.id AS x FROM t, u WHERE t.k = u.k "
         "UNION ALL SELECT id AS x FROM u", schema_name=sn)
@@ -562,7 +525,7 @@ def test_a_desugared_join_binds_at_every_nested_site(client, schema_name):
         "SELECT tv.id AS tid, cu.uid AS uid FROM tv JOIN cu USING (k)", schema_name=sn)
     _fill_tu(client, sn)
 
-    for name in ("derived", "cte", "merged"):
+    for name in ("derived", "merged"):
         assert bag(scanned(client, sn, name), "tid", "uid") == _TU_PAIRS, name
     # The join branch contributes one x per pair (so t(2) arrives at weight 2);
     # the plain branch contributes every u row once.

@@ -1,26 +1,12 @@
-"""A secondary index is derived state the checkpoint persists: it resumes on its
-own generation check across a clean restart, and is rehomed across a restart
-at a different worker count.
+"""An index is derived state the checkpoint persists: a secondary index resumes
+on its own generation check across a clean restart and is rehomed across a
+restart at a different worker count, and a top-N view's ordered index — which
+sits below the cut, inside the view's own bundle — resumes with the view.
 """
 
 import os
 import gnitz
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+from _read import bag, scanned
 
 
 def test_index_resumes_across_clean_restart(own_server):
@@ -106,3 +92,30 @@ def test_index_rebuilds_across_worker_count_change(own_server):
         assert children == ["w0of2", "w1of2"], (
             f"only the launched ranks' children may remain under {idx}, got {children}"
         )
+
+
+def test_the_ordered_index_of_a_top_n_view_survives_a_restart(own_server):
+    """The index below a top-N view's cut is checkpointed with the view, not
+    rebuilt from the base on demand: after a restart the window keeps moving
+    under new writes, promotion included. A rebuilt-on-demand index would answer
+    the first read correctly and then fail to promote."""
+    own_server.start()
+    conn = gnitz.connect(own_server.sock_path)
+    conn.create_schema("tn")
+    conn.execute_sql(
+        "CREATE TABLE scores (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, "
+        "score BIGINT, name VARCHAR(30) NOT NULL)", schema_name="tn")
+    conn.execute_sql(
+        "CREATE VIEW top2 AS SELECT id, score FROM scores ORDER BY score DESC LIMIT 2",
+        schema_name="tn")
+    conn.execute_sql(
+        "INSERT INTO scores VALUES (1, 0, 10, 'a'), (2, 0, 30, 'b'), (3, 0, 20, 'c')",
+        schema_name="tn")
+    assert bag(scanned(conn, "tn", "top2"), "id") == {(2,): 1, (3,): 1}
+    conn.close()
+
+    own_server.restart()
+    conn = gnitz.connect(own_server.sock_path)
+    assert bag(scanned(conn, "tn", "top2"), "id") == {(2,): 1, (3,): 1}
+    conn.execute_sql("DELETE FROM scores WHERE id = 2", schema_name="tn")
+    assert bag(scanned(conn, "tn", "top2"), "id") == {(3,): 1, (1,): 1}

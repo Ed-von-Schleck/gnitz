@@ -16,21 +16,16 @@ from _read import bag, scanned
 
 
 def _sources(client, sn):
-    """Three sources and their rows — one pair for the join/set shapes, one TEXT
-    grouping key for the shape whose group key cannot be a PK column."""
+    """The two sources every shape below reads. `a` carries the TEXT column the
+    shape whose group key cannot be a PK column needs."""
     client.execute_sql(
-        "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL)",
-        schema_name=sn)
+        "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
+        "av BIGINT NOT NULL, cat TEXT NOT NULL)", schema_name=sn)
     client.execute_sql(
         "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, bv BIGINT NOT NULL)",
         schema_name=sn)
-    client.execute_sql(
-        "CREATE TABLE cat (pk BIGINT NOT NULL PRIMARY KEY, category TEXT NOT NULL, "
-        "amount BIGINT NOT NULL)", schema_name=sn)
-    client.execute_sql("INSERT INTO a VALUES (1, 7, 100), (2, 5, 100)", schema_name=sn)
+    client.execute_sql("INSERT INTO a VALUES (1, 7, 100, 'x'), (2, 5, 100, 'y')", schema_name=sn)
     client.execute_sql("INSERT INTO b VALUES (1, 7, 200), (2, 9, 200)", schema_name=sn)
-    client.execute_sql(
-        "INSERT INTO cat VALUES (1, 'x', 10), (2, 'x', 20), (3, 'y', 30)", schema_name=sn)
 
 
 _SHAPES = [
@@ -52,8 +47,8 @@ _SHAPES = [
         "SELECT DISTINCT av FROM a",
         {"av"}, ("av",), {(100,): 1}, id="distinct"),
     pytest.param(
-        "SELECT category, COUNT(*) AS cnt FROM cat GROUP BY category",
-        {"category", "cnt"}, ("category", "cnt"), {("x", 2): 1, ("y", 1): 1}, id="group-by-text"),
+        "SELECT cat, COUNT(*) AS cnt FROM a GROUP BY cat",
+        {"cat", "cnt"}, ("cat", "cnt"), {("x", 1): 1, ("y", 1): 1}, id="group-by-text"),
     pytest.param(
         # No synthetic key: the source PK the projection drops rides hidden, and
         # is what keeps two rows sharing `av` two elements.

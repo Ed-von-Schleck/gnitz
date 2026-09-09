@@ -16,9 +16,7 @@ keep the product from multiplying.
 from collections import Counter
 
 import pytest
-import gnitz
 import _oracle as oracle
-from _serverproc import NEEDS_MULTI
 
 ROWS_T = [(i, i % 3) for i in range(1, 8)]        # (id, v)
 ROWS_U = [(10 * i, i % 2) for i in range(1, 6)]   # (id, w)
@@ -271,80 +269,3 @@ def test_a_grouped_view_over_the_product(client, tu):
     client.execute_sql("DELETE FROM u WHERE id = 10", schema_name=tu)
     oracle.assert_view_matches(client, gid, ["tid", "n", "s"],
                                want([r for r in ROWS_U if r[0] != 10]), "after delete")
-
-
-@NEEDS_MULTI
-def test_replicated_sides(client, schema_name):
-    """A replicated side holds every row on every worker. Its delta relays
-    single-sourced and the trace filter partitions it like a keyed side, so the
-    product carries no W× duplication — for one replicated side, and for two, where
-    the view itself is replicated and runs correct-local."""
-    sn = schema_name
-    for name in ("r", "r2"):
-        client.execute_sql(
-            f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL) "
-            f"WITH (replicated = true)", schema_name=sn)
-    client.execute_sql(
-        "CREATE TABLE k (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-        schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW rk AS SELECT r.id AS a, k.id AS b FROM r CROSS JOIN k", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW kr AS SELECT k.id AS a, r.id AS b FROM k CROSS JOIN r", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW rr AS SELECT r.id AS a, r2.id AS b FROM r, r2", schema_name=sn)
-    rows_r = [(i, 0) for i in range(1, 6)]
-    rows_r2 = [(i, 0) for i in range(50, 53)]
-    rows_k = [(i, 0) for i in range(10, 17)]
-    for name, rows in (("r", rows_r), ("r2", rows_r2), ("k", rows_k)):
-        _fill(client, sn, name, rows)
-
-    def check(ctx, rows_r):
-        for name, exp in (("rk", _product(rows_r, rows_k)),
-                          ("kr", _product(rows_k, rows_r)),
-                          ("rr", _product(rows_r, rows_r2))):
-            oracle.assert_view_matches(client, _vid(client, sn, name), ["a", "b"],
-                                       exp, f"{name} {ctx}")
-
-    check("initial", rows_r)
-    client.execute_sql("DELETE FROM r WHERE id = 3", schema_name=sn)
-    check("after delete", [r for r in rows_r if r[0] != 3])
-
-
-def test_cross_view_survives_restart(own_server):
-    """The two traces checkpoint like any join's: after a restart the view resumes
-    and a delta on either side pairs against the recovered other side."""
-    sock_path = own_server.sock_path
-    own_server.start()
-    conn = gnitz.connect(sock_path)
-    sn = "cross_persist"
-    conn.create_schema(sn)
-    for name, col in (("t", "v"), ("u", "w")):
-        conn.execute_sql(
-            f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, {col} BIGINT NOT NULL)",
-            schema_name=sn)
-    conn.execute_sql(
-        "CREATE VIEW v AS SELECT t.id AS tid, u.id AS uid FROM t CROSS JOIN u",
-        schema_name=sn)
-    vid = _vid(conn, sn, "v")
-    rows_t = [(i, 0) for i in range(1, 5)]
-    rows_u = [(i, 0) for i in range(10, 13)]
-    _fill(conn, sn, "t", rows_t)
-    _fill(conn, sn, "u", rows_u)
-    oracle.assert_view_matches(conn, vid, ["tid", "uid"],
-                               _product(rows_t, rows_u), "before restart")
-    conn.close()
-
-    own_server.restart()
-    conn = gnitz.connect(sock_path)
-    assert _vid(conn, sn, "v") == vid
-    oracle.assert_view_matches(conn, vid, ["tid", "uid"],
-                               _product(rows_t, rows_u), "after restart")
-
-    conn.execute_sql("INSERT INTO u VALUES (13, 0)", schema_name=sn)
-    conn.execute_sql("DELETE FROM t WHERE id = 2", schema_name=sn)
-    rows_u.append((13, 0))
-    rows_t = [r for r in rows_t if r[0] != 2]
-    oracle.assert_view_matches(conn, vid, ["tid", "uid"],
-                               _product(rows_t, rows_u), "after restart deltas")
-    conn.close()

@@ -13,9 +13,6 @@ UNKNOWN), and `IS NULL` selects exactly the unmatched ones.
 
 Ground truth is recomputed in Python from state the test maintains, never
 scanned back from the engine, and compared as a weighted bag.
-
-Run:
-    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/relational_shape/test_join_residual.py
 """
 import gnitz
 import pytest

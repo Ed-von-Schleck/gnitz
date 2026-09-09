@@ -242,45 +242,33 @@ def test_rank_dense_rank_row_number_with_ties_in_both_directions(client, schema_
     check()
 
 
-def test_top_n_per_group_through_qualify(client, schema_name):
-    """QUALIFY filters on the window value, so the surviving rows follow the
-    data: a newer event displaces the leader of its partition and deleting it
-    restores the previous one. A tie on the ORDER BY key is broken by the row
-    key, so which row wins is a function of the data alone."""
+def test_a_projected_rank_in_qualify_keeps_the_desugar(client, schema_name):
+    """QUALIFY over a *projected* RANK is a filter on the desugar's window value —
+    the top-N recognizer reads only an unprojected ROW_NUMBER — so the surviving
+    rows follow the data through the band self-join: a newer event displaces the
+    leader of its partition and deleting it restores the previous one, and a tie
+    on the ORDER BY key is broken by the row key."""
     sn = schema_name
     ev = _Table(client, sn, "ev", _EV)
-    client.execute_sql(
-        "CREATE VIEW latest AS SELECT id, k, ts, a FROM ev "
-        "QUALIFY ROW_NUMBER() OVER (PARTITION BY k ORDER BY ts DESC) = 1",
-        schema_name=sn,
-    )
     client.execute_sql(
         "CREATE VIEW top2 AS SELECT id, k, RANK() OVER (PARTITION BY k ORDER BY a DESC) AS r FROM ev "
         "QUALIFY r <= 2",
         schema_name=sn,
     )
-    latest = client.resolve_table(sn, "latest")[0]
     top2 = client.resolve_table(sn, "top2")[0]
 
     def check():
-        rows = list(ev.rows.values())
-        rn = oracle_row_number(rows, ["k"], [("ts", False)])
-        exp_latest = Counter((i, x["k"], x["ts"], x["a"]) for i, x in ev.rows.items() if rn[i] == 1)
-        _oracle.assert_view_matches(client, latest, ["id", "k", "ts", "a"], exp_latest)
-        r = oracle_rank(rows, ["k"], [("a", False)])
+        r = oracle_rank(list(ev.rows.values()), ["k"], [("a", False)])
         exp_top = Counter((i, x["k"], r[i]) for i, x in ev.rows.items() if r[i] <= 2)
         _oracle.assert_view_matches(client, top2, ["id", "k", "r"], exp_top)
 
     ev.insert(*_ROWS)
     check()
-    # A newer event replaces the latest of its partition …
     ev.insert(dict(id=7, k=2, ts=100, a=1, b=None))
     check()
-    # … and deleting it restores the previous one.
     ev.delete(7)
     check()
-    # A tie on ts is broken by the primary key: id 3 wins over id 2 in
-    # partition 1 (both ts=20); updating 2 to a later ts makes it win.
+    # A tie on `a` is broken by the primary key.
     ev.update(2, ts=21)
     check()
     ev.update(2, a=50)
@@ -341,8 +329,7 @@ def test_running_aggregates_include_peers(client, schema_name):
 def test_a_window_over_a_grouped_body_ranks_its_groups(client, schema_name):
     """A window over a GROUP BY body reads groups, not rows: the ORDER BY and the
     aggregate argument are themselves aggregates, so `RANK() OVER (ORDER BY
-    SUM(a) DESC)` ranks the groups and `SUM(SUM(a)) OVER ()` totals them. QUALIFY
-    over the same body cuts groups rather than rows."""
+    SUM(a) DESC)` ranks the groups and `SUM(SUM(a)) OVER ()` totals them."""
     sn = schema_name
     ev = _Table(client, sn, "ev", _EV)
     client.execute_sql(
@@ -350,17 +337,11 @@ def test_a_window_over_a_grouped_body_ranks_its_groups(client, schema_name):
         "SUM(a) * 100 / SUM(SUM(a)) OVER () AS pct FROM ev GROUP BY k",
         schema_name=sn,
     )
-    client.execute_sql(
-        "CREATE VIEW top AS SELECT k, COUNT(*) AS n FROM ev GROUP BY k "
-        "QUALIFY ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC, k) <= 2",
-        schema_name=sn,
-    )
     vid = client.resolve_table(sn, "v")[0]
-    top = client.resolve_table(sn, "top")[0]
 
     def check():
         groups = [
-            dict(id=k, k=k, total=sum(r["a"] for r in part), n=len(part))
+            dict(id=k, k=k, total=sum(r["a"] for r in part))
             for k, part in sorted(_partition(ev.rows.values(), ["k"]).items(), key=lambda kv: kv[0][0])
             for k in [k[0]]
         ]
@@ -368,9 +349,6 @@ def test_a_window_over_a_grouped_body_ranks_its_groups(client, schema_name):
         r = oracle_rank(groups, [], [("total", False)])
         exp = Counter((g["k"], g["total"], r[g["k"]], g["total"] * 100 // grand) for g in groups)
         _oracle.assert_view_matches(client, vid, ["k", "total", "r", "pct"], exp)
-        rn = oracle_rank(groups, [], [("n", False), ("k", True)])
-        exp_top = Counter((g["k"], g["n"]) for g in groups if rn[g["k"]] <= 2)
-        _oracle.assert_view_matches(client, top, ["k", "n"], exp_top)
 
     ev.insert(*_ROWS)
     check()

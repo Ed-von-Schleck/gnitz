@@ -376,7 +376,6 @@ def test_many_distinct_group_keys_each_get_their_own_group(client, schema_name):
                 {(a, b, n, total): 1 for (a, b), (n, total) in by_ab.items()})
 
     want_s, want_ab = expected(rows)
-    assert len(want_s) == 64 and len(want_ab) == 64
     assert bag(scanned(client, sn, "vs"), "s", "n", "total") == want_s
     assert bag(scanned(client, sn, "vab"), "a", "b", "n", "total") == want_ab
 
@@ -675,16 +674,23 @@ _NARROW_CASES = [
     ("INT UNSIGNED", gnitz.TypeCode.U32,
      {10: [0, 4_000_000_000, 2_147_483_648, 100],
       20: [2_147_483_647, 2_147_483_649, 1, 4_294_967_295], 30: [10, 20, 30, 40]}),
+    # F32 is the one source that does NOT keep its width: MIN/MAX widen it to F64,
+    # so the read-back must take the 8-byte `f64::to_bits` verbatim instead of
+    # decoding it as an F32 pattern. Values are dyadic and F32-exact, so the
+    # widening is exact and `bag` compares bit-for-bit.
+    ("FLOAT", gnitz.TypeCode.F64,
+     {10: [-2.25, 1.5, 4.0, 0.5], 20: [-1.5, 0.0, 2.25, 8.5], 30: [3.0, -6.75, 0.25, 7.5]}),
 ]
 
 
 @pytest.mark.parametrize("sql_type,py_tc,groups", _NARROW_CASES,
                          ids=[c[0].lower().replace(" ", "_") for c in _NARROW_CASES])
-def test_a_narrow_min_max_keeps_the_source_width_through_combine_and_retraction(
+def test_a_narrow_min_max_reads_back_at_the_width_it_declares(
         client, schema_name, sql_type, py_tc, groups):
-    """MIN/MAX emit at the source column's width rather than widening to BIGINT —
-    the extremum is one of the input rows, so it always fits. The trace read-backs
-    reconstruct the 8-byte accumulator from that width, so a wrong-width or
+    """An integer MIN/MAX emits at the source column's width rather than widening
+    to BIGINT — the extremum is one of the input rows, so it always fits — while a
+    float one widens to F64. Either way the trace read-backs reconstruct the
+    8-byte accumulator from the *declared* output width, so a wrong-width or
     sign-extended read corrupts the gather combine and, worse, the retraction that
     drops the row holding an extremum. Each group's values are replicated across
     distinct PKs so a group spreads over the workers."""
@@ -720,42 +726,6 @@ def test_a_narrow_min_max_keeps_the_source_width_through_combine_and_retraction(
         client.execute_sql(f"DELETE FROM t WHERE k = 10 AND v = {extreme}", schema_name=sn)
         trimmed[10] = [v for v in trimmed[10] if v != extreme]
         expect(trimmed)
-
-
-def test_an_f32_min_max_widens_to_f64_and_reads_back_verbatim(client, schema_name):
-    """MIN/MAX over an F32 column widen to F64: the output column is 8 bytes
-    holding `f64::to_bits`, so the width-gated read-back must take it verbatim
-    instead of mis-decoding it as an F32 bit pattern. Many groups plus an
-    incremental new extremum exercise the gather combine and its retraction on
-    that 8-byte-but-float-source column."""
-    sn = schema_name
-    client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v FLOAT NOT NULL)",
-        schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT k, MIN(v) AS lo, MAX(v) AS hi FROM t GROUP BY k",
-        schema_name=sn)
-    _vid, vschema = client.resolve_table(sn, "v")
-    assert _col_type(vschema, "lo") == gnitz.TypeCode.F64
-    assert _col_type(vschema, "hi") == gnitz.TypeCode.F64
-
-    # F32-exact values (dyadic, small), so the F32 → F64 widening is exact and the
-    # expectation can compare bit-for-bit through `bag`.
-    pk, vals_sql, want = 0, [], {}
-    for g in range(8):
-        vals = [-2.25 + g, 1.5 + g, 4.0 + g, 0.5 + g]
-        for _rep in range(3):
-            for val in vals:
-                pk += 1
-                vals_sql.append(f"({pk}, {g}, {val})")
-        want[(g, min(vals), max(vals))] = 1
-    client.execute_sql("INSERT INTO t VALUES " + ", ".join(vals_sql), schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "k", "lo", "hi") == want
-
-    client.execute_sql(f"INSERT INTO t VALUES ({pk + 1}, 0, 99.5)", schema_name=sn)
-    want.pop((0, -2.25, 4.0))
-    want[(0, -2.25, 99.5)] = 1
-    assert bag(scanned(client, sn, "v"), "k", "lo", "hi") == want
 
 
 def test_a_narrow_min_max_is_read_at_its_own_width_by_having_and_the_projection(
@@ -986,34 +956,6 @@ def test_a_lone_global_aggregate_grounds_over_empty_and_all_null_sources(client,
     expect((0, None, None, None, None), None)
 
 
-def test_a_global_min_max_pair_replays_the_whole_table(client, schema_name):
-    """`SELECT MIN(x), MAX(x)` in one view is neither value-index-eligible (two
-    aggregates) nor all-linear, so it takes the whole-table replay path. The
-    churn — insert, delete an extremum, empty, refill — checks that path against
-    the recompute oracle."""
-    sn = schema_name
-    client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)", schema_name=sn)
-    client.execute_sql("CREATE VIEW v AS SELECT MIN(a) AS lo, MAX(a) AS hi FROM t", schema_name=sn)
-    vid = client.resolve_table(sn, "v")[0]
-    state = {}
-    check = _oracle_check(client, vid, state, ["a"], [], [("lo", "MIN", "a"), ("hi", "MAX", "a")])
-
-    check("empty")
-    client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 9), (3, 2)", schema_name=sn)
-    oracle.apply_insert(state, "pk", [{"pk": 1, "a": 5}, {"pk": 2, "a": 9}, {"pk": 3, "a": 2}])
-    check("after-insert")
-    client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
-    oracle.apply_delete(state, "pk", [2])
-    check("after-delete-max")
-    client.execute_sql("DELETE FROM t", schema_name=sn)
-    oracle.apply_delete(state, "pk", [1, 3])
-    check("after-empty")
-    client.execute_sql("INSERT INTO t VALUES (4, 7)", schema_name=sn)
-    oracle.apply_insert(state, "pk", [{"pk": 4, "a": 7}])
-    check("after-refill")
-
-
 def test_having_over_a_global_aggregate_filters_the_ground_row(client, schema_name):
     """HAVING is a post-reduce filter, so the ground row is in the trace at V0 and
     the predicate decides whether the view shows it. `SUM(x) = 0` is the sharp
@@ -1063,33 +1005,10 @@ def test_a_computed_projection_keeps_the_ground_row(client, schema_name):
     expect((1, None, "x"))
 
 
-def test_a_replicated_source_grounds_exactly_once(client, schema_name):
-    """Every worker holds every row of a replicated source, so the ground row is
-    where a backfill over an empty source can go wrong in both directions: drop
-    the owner disjunct and it emits none, forget the disjunct is exclusive and it
-    emits one per worker. The non-aggregate view alongside is the control — the
-    same empty backfill must produce no row at all there."""
-    sn = schema_name
-    client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL) "
-        "WITH (replicated = true)", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM t", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW f AS SELECT pk, a * 2 AS d FROM t WHERE a > 0", schema_name=sn)
-
-    assert bag(scanned(client, sn, "v"), "cnt", "total") == {(0, None): 1}
-    assert bag(scanned(client, sn, "f"), "pk", "d") == {}
-    client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 7)", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "cnt", "total") == {(2, 12): 1}
-    assert bag(scanned(client, sn, "f"), "pk", "d") == {(1, 10): 1, (2, 14): 1}
-
-
 def _count_reduce_nodes(client, vid):
     """REDUCE circuit nodes of view `vid`: 2 for the two-phase shape
     (reduce_local + reduce_combine), 1 for the single funnel reduce."""
-    CIRCUIT_NODES_TAB = 11
-    return sum(1 for r in client.scan(CIRCUIT_NODES_TAB)
+    return sum(1 for r in client.scan(gnitz.CIRCUIT_NODES_TAB)
                if r["view_id"] == vid and r["opcode"] == Opcode.Reduce)
 
 

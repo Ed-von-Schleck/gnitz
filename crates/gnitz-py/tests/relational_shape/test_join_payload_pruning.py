@@ -15,9 +15,6 @@ Three of those cases are where the prune could change the answer:
     row would then cancel the NULL-keyed row's unmatched weight;
   * range, band and cross joins pack their output PK out of the payload, so each
     side's PK columns are pinned there even when the SELECT names none of them.
-
-Run:
-    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/relational_shape/test_join_payload_pruning.py
 """
 import pytest
 from _read import bag, scanned
@@ -46,29 +43,6 @@ def test_an_inner_join_drops_the_keys_and_the_columns_nothing_reads(client, sche
     want = {(5, 111): 1, (8, 222): 1, (50, 111): 1}
     for name in ("maintained", "backfilled"):
         assert bag(scanned(client, sn, name), "a", "name") == want, name
-
-
-@pytest.mark.parametrize("side", ["LEFT", "RIGHT", "FULL"])
-def test_an_outer_join_still_null_fills_with_its_keys_dropped(client, schema_name, side):
-    """The null-fill is decided from the key, which the prune removed from the
-    output — so it has to be decided before the prune, not read back out of it."""
-    sn = schema_name
-    for name, payload in (("l", "x"), ("r", "y")):
-        client.execute_sql(
-            f"CREATE TABLE {name} (pk BIGINT PRIMARY KEY, k BIGINT NOT NULL, "
-            f"{payload} BIGINT NOT NULL)", schema_name=sn)
-    client.execute_sql(f"CREATE VIEW v AS SELECT l.x, r.y FROM l {side} JOIN r ON l.k = r.k",
-                       schema_name=sn)
-    # l(k=1) matches r(k=1); l(k=2) and r(k=3) are unmatched.
-    client.execute_sql("INSERT INTO l VALUES (1, 1, 100), (2, 2, 200)", schema_name=sn)
-    client.execute_sql("INSERT INTO r VALUES (10, 1, 900), (11, 3, 300)", schema_name=sn)
-
-    want = {(100, 900): 1}
-    if side in ("LEFT", "FULL"):
-        want[(200, None)] = 1
-    if side in ("RIGHT", "FULL"):
-        want[(None, 300)] = 1
-    assert bag(scanned(client, sn, "v"), "x", "y") == want
 
 
 def test_preserved_rows_that_coincide_under_the_prune_null_fill_at_their_bag_weight(

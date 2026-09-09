@@ -376,6 +376,50 @@ def test_bare_two_base_join_after_restart(own_server):
     conn.close()
 
 
+def test_keyless_two_base_join_after_restart(own_server):
+    """The keyless (cross) join's boot recovery. Unlike the equi and range shapes
+    above, a keyless step broadcasts its delta instead of exchanging it, so the
+    boot backfill has to drive both bases without an `ExchangeShard` to classify
+    on. Asserted on weights: a broadcast replayed per worker comes back as a W×
+    duplication, which a row-set comparison reads as correct.
+    """
+    sock_path = own_server.sock_path
+    own_server.start()
+    conn = gnitz.connect(sock_path)
+    sn = "cross_persist"
+    conn.create_schema(sn)
+    for name, col in (("t", "v"), ("u", "w")):
+        conn.execute_sql(
+            f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, {col} BIGINT NOT NULL)",
+            schema_name=sn)
+    conn.execute_sql(
+        "CREATE VIEW v AS SELECT t.id AS tid, u.id AS uid FROM t CROSS JOIN u",
+        schema_name=sn)
+    vid = conn.resolve_table(sn, "v")[0]
+    rows_t = [(i, 0) for i in range(1, 5)]
+    rows_u = [(i, 0) for i in range(10, 13)]
+
+    def product():
+        return Counter({(t[0], u[0]): 1 for t in rows_t for u in rows_u})
+
+    conn.execute_sql(f"INSERT INTO t VALUES {_values(rows_t)}", schema_name=sn)
+    conn.execute_sql(f"INSERT INTO u VALUES {_values(rows_u)}", schema_name=sn)
+    oracle.assert_view_matches(conn, vid, ["tid", "uid"], product(), "before restart")
+    conn.close()
+
+    own_server.restart()
+    conn = gnitz.connect(sock_path)
+    assert conn.resolve_table(sn, "v")[0] == vid
+    oracle.assert_view_matches(conn, vid, ["tid", "uid"], product(), "after restart")
+
+    conn.execute_sql("INSERT INTO u VALUES (13, 0)", schema_name=sn)
+    conn.execute_sql("DELETE FROM t WHERE id = 2", schema_name=sn)
+    rows_u.append((13, 0))
+    rows_t = [r for r in rows_t if r[0] != 2]
+    oracle.assert_view_matches(conn, vid, ["tid", "uid"], product(), "after restart deltas")
+    conn.close()
+
+
 def test_range_two_base_join_after_restart(own_server):
     """Range two-base join `r = ra JOIN rb ON ra.x < rb.y`. Regression guard that
     a two-base range join still recovers correctly across a restart: its relay

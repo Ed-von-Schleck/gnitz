@@ -56,18 +56,27 @@ def test_an_operator_tracks_its_weight_algebra_through_every_mutation(client, sc
     the min and `EXCEPT ALL` the clamped difference, while the deduplicating
     three collapse the same input to weight 1. The right-only value 30 (cR=2,
     cL=0) drives the clamp's pre-image integral net-negative, which no
-    base-positive input reaches."""
+    base-positive input reaches.
+
+    The right branch is populated first, so every left delta below meets a full
+    right trace rather than an empty one — an incremental circuit's fixpoint
+    cannot depend on which source ticked first."""
     sn = schema_name
     _ab(client, sn)
     vid = _setop_view(client, sn, "v", op)
     a_state, b_state = {}, {}
+
+    # A branch may arrive before the other exists: the right side alone.
+    client.execute_sql("INSERT INTO b VALUES (8,40)", schema_name=sn)
+    oracle.apply_insert(b_state, "pk", [{"pk": 8, "val": 40}])
+    _expect(client, vid, op, a_state, b_state, "right only")
 
     # Left {10:3, 20:1} — three rows carry one value, so a DISTINCT/ALL split shows.
     client.execute_sql("INSERT INTO a VALUES (1,10),(2,10),(3,10),(4,20)", schema_name=sn)
     oracle.apply_insert(a_state, "pk", [
         {"pk": 1, "val": 10}, {"pk": 2, "val": 10},
         {"pk": 3, "val": 10}, {"pk": 4, "val": 20}])
-    _expect(client, vid, op, a_state, b_state, "left only")
+    _expect(client, vid, op, a_state, b_state, "left against a non-empty right")
 
     # Right {10:1, 30:2}: 10 overlaps at unequal multiplicity, 30 is right-only.
     client.execute_sql("INSERT INTO b VALUES (5,10),(6,30),(7,30)", schema_name=sn)
@@ -89,29 +98,6 @@ def test_an_operator_tracks_its_weight_algebra_through_every_mutation(client, sc
     client.execute_sql("DELETE FROM a WHERE pk IN (1, 2, 3)", schema_name=sn)
     oracle.apply_delete(a_state, "pk", [1, 2, 3])
     _expect(client, vid, op, a_state, b_state, "left reduced to one value")
-
-
-def test_a_branch_may_arrive_before_the_other_exists(client, schema_name):
-    """The right branch populated first, so each left delta meets a full right
-    trace instead of an empty one. All six operators reach the same value as the
-    opposite arrival order — an incremental circuit's fixpoint cannot depend on
-    which source ticked first."""
-    sn = schema_name
-    _ab(client, sn)
-    vids = {op: _setop_view(client, sn, f"v{i}", op) for i, op in enumerate(_SIX_OPS)}
-    a_state, b_state = {}, {}
-
-    client.execute_sql("INSERT INTO b VALUES (5,20),(6,20),(7,30)", schema_name=sn)
-    oracle.apply_insert(b_state, "pk", [
-        {"pk": 5, "val": 20}, {"pk": 6, "val": 20}, {"pk": 7, "val": 30}])
-    for op, vid in vids.items():
-        _expect(client, vid, op, a_state, b_state, f"{op} right only")
-
-    client.execute_sql("INSERT INTO a VALUES (1,10),(2,20),(3,30)", schema_name=sn)
-    oracle.apply_insert(a_state, "pk", [
-        {"pk": 1, "val": 10}, {"pk": 2, "val": 20}, {"pk": 3, "val": 30}])
-    for op, vid in vids.items():
-        _expect(client, vid, op, a_state, b_state, f"{op} left after right")
 
 
 @pytest.mark.parametrize("op", ["EXCEPT", "INTERSECT"])
@@ -452,70 +438,3 @@ def test_by_name_set_operations_are_refused_rather_than_aligned_positionally(cli
                 schema_name=sn)
         with pytest.raises(gnitz.GnitzError):
             client.resolve_table(sn, f"rej{i}")
-
-
-def test_a_view_body_refuses_the_clauses_its_shape_would_drop(client, schema_name):
-    """Every CREATE VIEW shape (simple, grouped, join, set-op, DISTINCT) reads
-    only a hand-picked subset of the SELECT. A clause a shape does not consume is
-    refused by name, not dropped — a dropped clause runs a different query than
-    the caller wrote."""
-    sn = schema_name
-    client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
-        schema_name=sn)
-    client.execute_sql(
-        "CREATE TABLE u (pk BIGINT NOT NULL PRIMARY KEY, c BIGINT NOT NULL)", schema_name=sn)
-
-    def rejects(sql, msg):
-        with pytest.raises(gnitz.GnitzError, match=msg):
-            client.execute_sql(sql, schema_name=sn)
-
-    # DISTINCT ON: a single SELECT, a set-op branch, and the degenerate
-    # `DISTINCT ON (a) a` — refused on purpose rather than folded to `DISTINCT a`.
-    for sql in (
-        "CREATE VIEW v AS SELECT DISTINCT ON (a) a, b FROM t",
-        "CREATE VIEW v AS SELECT DISTINCT ON (a) a FROM t UNION SELECT b FROM t",
-        "CREATE VIEW v AS SELECT DISTINCT ON (a) a FROM t",
-    ):
-        rejects(sql, "DISTINCT ON is not supported")
-
-    rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t GROUP BY a", "GROUP BY is not supported")
-    rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t HAVING a > 0", "HAVING is not supported")
-    # A HAVING without DISTINCT drops nothing: it groups the whole relation, so
-    # the body binds as a global aggregate and `a` — neither a group key nor an
-    # aggregate — is what fails.
-    rejects("CREATE VIEW v AS SELECT a FROM t HAVING a > 0",
-            "column 'a' must appear in GROUP BY or an aggregate function")
-    rejects("CREATE VIEW v AS SELECT a FROM t GROUP BY ALL", "GROUP BY")
-
-    rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t PREWHERE a > 5", "PREWHERE is not supported")
-    rejects("CREATE VIEW v AS SELECT a FROM t PREWHERE a > 5", "PREWHERE is not supported")
-    rejects("CREATE VIEW v AS SELECT a, COUNT(*) FROM t PREWHERE a > 5 GROUP BY a",
-            "PREWHERE is not supported")
-    rejects("CREATE VIEW v AS SELECT DISTINCT TOP 5 a FROM t", "TOP is not supported")
-    rejects("CREATE VIEW v AS SELECT a FROM t FETCH FIRST 5 ROWS ONLY", "FETCH is not supported")
-    rejects("CREATE VIEW v AS SELECT a FROM t SORT BY a", "SORT BY is not supported")
-    # QUALIFY filters on window values, ahead of a DISTINCT: one with no window
-    # function to filter on is refused, not dropped.
-    rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t QUALIFY a > 1",
-            "QUALIFY needs a window function")
-    rejects("CREATE VIEW v AS SELECT pk FROM t FOR UPDATE", "FOR UPDATE/SHARE is not supported")
-    rejects("CREATE VIEW v AS SELECT pk FROM t SETTINGS max_threads = 1",
-            "SETTINGS is not supported")
-    rejects("CREATE VIEW v AS SELECT pk FROM t FORMAT JSON", "FORMAT is not supported")
-
-    # Positive controls: every honoured shape still compiles, including the ones
-    # whose clauses the list above refuses elsewhere — a grouped or DISTINCT
-    # set-op side becomes a hidden segment, and an OUTER range join consumes its
-    # own WHERE as a post-null-fill 3VL filter.
-    for name, body in {
-        "vsimple": "SELECT a, b FROM t WHERE a > 0",
-        "vdistinct": "SELECT DISTINCT a, b FROM t",
-        "vgroup": "SELECT a, COUNT(*) FROM t GROUP BY a",
-        "vjoin": "SELECT t.a, u.c FROM t JOIN u ON t.pk = u.pk",
-        "vsetop": "SELECT a FROM t UNION ALL SELECT b FROM t",
-        "vsetop_side": "SELECT DISTINCT a FROM t UNION ALL SELECT b FROM t GROUP BY b",
-        "vrangeleft": "SELECT t.a FROM t LEFT JOIN u ON t.a < u.c WHERE t.a > 5",
-    }.items():
-        client.execute_sql(f"CREATE VIEW {name} AS {body}", schema_name=sn)
-        client.resolve_table(sn, name)

@@ -180,6 +180,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("VIEW_TAB", gnitz_wire::VIEW_TAB)?;
     m.add("COL_TAB", gnitz_wire::COL_TAB)?;
     m.add("IDX_TAB", gnitz_wire::IDX_TAB)?;
+    m.add("CIRCUIT_NODES_TAB", gnitz_wire::CIRCUIT_NODES_TAB)?;
     m.add("FIRST_USER_TABLE_ID", gnitz_wire::FIRST_USER_TABLE_ID)?;
     // Whether *this extension* keeps its `#[cfg(debug_assertions)]` fault seams.
     // The seams a mirroring test arms live in gnitz-mirror and gnitz-store, which

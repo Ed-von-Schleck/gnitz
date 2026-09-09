@@ -20,11 +20,8 @@ Run at GNITZ_WORKERS=4 (the exchange/fanout paths only engage at W>1):
         tests/schema_lifetime/test_backfill_over_segment.py -v --tb=short
 """
 
-from gnitz import Opcode
+from gnitz import Opcode, CIRCUIT_NODES_TAB, VIEW_TAB
 from _uid import uid as _uid
-
-CIRCUIT_NODES_TAB = 11
-VIEW_TAB = 3
 
 
 

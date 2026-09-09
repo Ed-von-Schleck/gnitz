@@ -13,9 +13,6 @@ invisible in the result by construction, so the tests here drive it through the
 cases where it could stop being invisible: a column only a later step reads, a
 chain wide enough that pruning is what keeps it under the column cap, and an
 outer step whose null-fill sits inside a hidden segment.
-
-Run:
-    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/relational_shape/test_multiway_join.py
 """
 import pytest
 from _read import bag, scanned
@@ -29,14 +26,13 @@ def _abc(client, sn, names=("a", "b", "c")):
             schema_name=sn)
 
 
+# A hand-written segment against the direct form. The three spellings of the
+# segment itself (CTE, derived table, inline) are one bound tree, stated once in
+# the cut-rule suite, so only one of them needs to appear here.
 _THREE_WAY = {
     "nested_cte":
         "WITH h0 AS (SELECT a.id AS aid, b.k AS bk FROM a JOIN b ON a.k = b.id) "
         "SELECT h0.aid AS aid, c.v AS cv FROM h0 JOIN c ON h0.bk = c.id",
-    "derived_table":
-        "SELECT h0.aid AS aid, c.v AS cv "
-        "FROM (SELECT a.id AS aid, b.k AS bk FROM a JOIN b ON a.k = b.id) h0 "
-        "JOIN c ON h0.bk = c.id",
     "direct":
         "SELECT a.id AS aid, c.v AS cv FROM a JOIN b ON a.k = b.id JOIN c ON b.k = c.id",
 }
@@ -44,8 +40,7 @@ _THREE_WAY = {
 
 @pytest.mark.parametrize("body", list(_THREE_WAY.values()), ids=list(_THREE_WAY))
 def test_every_spelling_of_a_three_way_join_is_one_left_deep_chain(client, schema_name, body):
-    """Hand-written segments (a CTE, a derived table) and the direct form compile
-    to the same chain: a delta at the head flows through both steps, and
+    """A hand-written segment and the direct form compile to the same chain: a delta at the head flows through both steps, and
     retracting the bridge row in the middle relation retracts everything the
     chain derived from it. A view created over the populated tables backfills to
     the value the maintained one holds."""
@@ -291,20 +286,3 @@ def test_pruning_is_what_keeps_a_wide_chain_under_the_column_cap(client, schema_
     client.execute_sql(f"INSERT INTO c VALUES (20, 30, {padvals})", schema_name=sn)
     client.execute_sql("UPDATE d SET val = 99 WHERE id = 30", schema_name=sn)
     assert bag(scanned(client, sn, "v"), "aid", "dval") == {(1, 99): 1}
-
-
-def test_the_hidden_segments_are_real_relations_in_the_dependency_graph(client, schema_name):
-    """A segment depends on its inputs like any view, so a base table under a
-    live chain cannot be dropped; DROP VIEW retires every segment, and an
-    orphaned one would keep RESTRICTing the base afterwards."""
-    sn = schema_name
-    _abc(client, sn)
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT a.id AS aid FROM a JOIN b ON a.k = b.id JOIN c ON b.k = c.id",
-        schema_name=sn)
-    with pytest.raises(Exception):
-        client.execute_sql("DROP TABLE b", schema_name=sn)
-
-    client.execute_sql("DROP VIEW v", schema_name=sn)
-    for name in ("a", "b", "c"):
-        client.execute_sql(f"DROP TABLE {name}", schema_name=sn)

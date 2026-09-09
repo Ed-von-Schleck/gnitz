@@ -13,7 +13,6 @@ worker, exchanged and cut once), and the guarantee is that which rows are
 selected is a function of the data alone.
 """
 
-import gnitz
 import pytest
 from _read import bag, scanned
 
@@ -130,13 +129,20 @@ def test_the_window_cuts_a_grouped_or_set_op_body(client, schema_name):
     client.execute_sql(
         "CREATE VIEW leaders AS SELECT grp, SUM(score) AS total FROM scores "
         "GROUP BY grp ORDER BY total DESC LIMIT 2", schema_name=sn)
+    # QUALIFY reaches the same cut over a grouped body, with an aggregate as the
+    # order key — the recognizer runs after the body binds, so it sees groups.
+    client.execute_sql(
+        "CREATE VIEW busiest AS SELECT grp, COUNT(*) AS n FROM scores GROUP BY grp "
+        "QUALIFY ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC, grp) <= 2", schema_name=sn)
     client.execute_sql(
         "INSERT INTO scores VALUES (1, 1, 10, 'a'), (2, 1, 12, 'b'), (3, 2, 15, 'c'), "
         "(4, 3, 30, 'd'), (5, 4, 1, 'e')", schema_name=sn)
     assert bag(scanned(client, sn, "leaders"), "grp", "total") == {(3, 30): 1, (1, 22): 1}
+    assert bag(scanned(client, sn, "busiest"), "grp", "n") == {(1, 2): 1, (2, 1): 1}
 
     client.execute_sql("INSERT INTO scores VALUES (6, 4, 100, 'f')", schema_name=sn)
     assert bag(scanned(client, sn, "leaders"), "grp", "total") == {(4, 101): 1, (3, 30): 1}
+    assert bag(scanned(client, sn, "busiest"), "grp", "n") == {(1, 2): 1, (4, 2): 1}
 
     client.execute_sql(
         "CREATE VIEW u AS SELECT id, score FROM scores WHERE grp = 1 "
@@ -145,9 +151,9 @@ def test_the_window_cuts_a_grouped_or_set_op_body(client, schema_name):
 
 
 def test_qualify_recognizes_every_spelling_of_one_window(client, schema_name):
-    """`rn <= n` and `n > rn` name the same window, so both take the top-N rows
-    of each partition; a partition emptied loses its rows and a new one gains
-    them, without the window being rebuilt."""
+    """`rn <= n`, `n > rn` and `rn = 1` are the three bounds the recognizer reads,
+    so each takes the top-N rows of each partition; a partition emptied loses its
+    rows and a new one gains them, without the window being rebuilt."""
     sn = schema_name
     # A window key must be provably NOT NULL — the desugar's rule, checked before
     # the top-N rewrite is chosen.
@@ -158,6 +164,9 @@ def test_qualify_recognizes_every_spelling_of_one_window(client, schema_name):
     client.execute_sql(
         "CREATE VIEW gt AS SELECT grp, id FROM scores "
         "QUALIFY 3 > ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW eq AS SELECT grp, id FROM scores "
+        "QUALIFY ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score) = 1", schema_name=sn)
 
     client.execute_sql(
         "INSERT INTO scores VALUES (1, 1, 10, 'a'), (2, 1, 30, 'b'), (3, 1, 20, 'c'), "
@@ -165,13 +174,18 @@ def test_qualify_recognizes_every_spelling_of_one_window(client, schema_name):
     want = {(1, 1): 1, (1, 3): 1, (2, 4): 1}
     assert bag(scanned(client, sn, "le"), "grp", "id") == want
     assert bag(scanned(client, sn, "gt"), "grp", "id") == want
+    assert bag(scanned(client, sn, "eq"), "grp", "id") == {(1, 1): 1, (2, 4): 1}
 
-    # Partition 2 empties and partition 3 appears in the same epoch.
-    client.execute_sql("DELETE FROM scores WHERE id = 4", schema_name=sn)
-    client.execute_sql("INSERT INTO scores VALUES (5, 3, 1, 'e')", schema_name=sn)
+    # Partition 2 empties and partition 3 appears in one epoch: a transaction is
+    # one commit batch, where two autocommit statements would be two ticks and
+    # the operator would never see the pair together.
+    client.execute_sql(
+        "BEGIN; DELETE FROM scores WHERE id = 4; "
+        "INSERT INTO scores VALUES (5, 3, 1, 'e'); COMMIT", schema_name=sn)
     want = {(1, 1): 1, (1, 3): 1, (3, 5): 1}
     assert bag(scanned(client, sn, "le"), "grp", "id") == want
     assert bag(scanned(client, sn, "gt"), "grp", "id") == want
+    assert bag(scanned(client, sn, "eq"), "grp", "id") == {(1, 1): 1, (3, 5): 1}
 
 
 def test_a_projected_row_number_falls_back_to_the_desugar(client, schema_name):
@@ -221,31 +235,6 @@ def test_a_partition_key_that_permutes_the_pk_shards_in_pk_order(client, schema_
     client.execute_sql("DELETE FROM pairs WHERE a = 2", schema_name=sn)
     assert bag(scanned(client, sn, "p"), "a", "b") == \
         {(a, b): 1 for a in range(4) if a != 2 for b in range(4)}
-
-
-def test_the_ordered_index_survives_a_restart(own_server):
-    """The index below the cut is checkpointed with the view, not rebuilt from
-    the base on demand: after a restart the window keeps moving under new
-    writes, promotion included."""
-    own_server.start()
-    conn = gnitz.connect(own_server.sock_path)
-    conn.create_schema("tn")
-    _scores(conn, "tn")
-    conn.execute_sql(
-        "CREATE VIEW top2 AS SELECT id, score FROM scores ORDER BY score DESC LIMIT 2",
-        schema_name="tn")
-    conn.execute_sql(
-        "INSERT INTO scores VALUES (1, 0, 10, 'a'), (2, 0, 30, 'b'), (3, 0, 20, 'c')",
-        schema_name="tn")
-    assert bag(scanned(conn, "tn", "top2"), "id") == {(2,): 1, (3,): 1}
-    conn.close()
-
-    own_server.restart()
-    conn = gnitz.connect(own_server.sock_path)
-    assert bag(scanned(conn, "tn", "top2"), "id") == {(2,): 1, (3,): 1}
-    conn.execute_sql("DELETE FROM scores WHERE id = 2", schema_name="tn")
-    assert bag(scanned(conn, "tn", "top2"), "id") == {(3,): 1, (1,): 1}
-    conn.close()
 
 
 @pytest.mark.parametrize("body, needle", [

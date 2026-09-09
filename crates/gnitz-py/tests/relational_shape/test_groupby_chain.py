@@ -29,18 +29,11 @@ def _orders_customers(client, sn, dim="name VARCHAR(50) NOT NULL"):
 # ── The aggregate below the join ──────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("body", [
-    "WITH agg AS (SELECT cid, SUM(amt) AS total FROM orders GROUP BY cid) "
-    "SELECT c.name AS nm, agg.total AS tot FROM agg JOIN customers c ON agg.cid = c.id",
-    "SELECT c.name AS nm, a.total AS tot "
-    "FROM (SELECT cid, SUM(amt) AS total FROM orders GROUP BY cid) a "
-    "JOIN customers c ON a.cid = c.id",
-], ids=["cte", "derived"])
 @pytest.mark.parametrize("prepopulate", [False, True], ids=["incremental", "backfill"])
 def test_a_sum_per_group_joined_to_a_dimension_is_maintained(
-        client, schema_name, body, prepopulate):
-    """The aggregate is the CTE or derived-table body and the join runs over its
-    output, so a new fact row must re-aggregate its group and re-join it, and
+        client, schema_name, prepopulate):
+    """The aggregate is the CTE body and the join runs over its output, so a new
+    fact row must re-aggregate its group and re-join it, and
     retracting a group's last row must drop the joined row entirely. The grouping
     key here is the reduce's natural PK, so no synthetic key is involved."""
     sn = schema_name
@@ -53,7 +46,10 @@ def test_a_sum_per_group_joined_to_a_dimension_is_maintained(
 
     if prepopulate:
         fill()
-    client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS WITH agg AS (SELECT cid, SUM(amt) AS total FROM orders GROUP BY cid) "
+        "SELECT c.name AS nm, agg.total AS tot FROM agg JOIN customers c ON agg.cid = c.id",
+        schema_name=sn)
     if not prepopulate:
         fill()
 
@@ -84,42 +80,6 @@ def test_two_aggregate_ctes_join_on_their_group_keys(client, schema_name):
     client.execute_sql("INSERT INTO a VALUES (1, 7, 10), (2, 7, 20), (3, 9, 5)", schema_name=sn)
     client.execute_sql("INSERT INTO b VALUES (1, 7, 100), (2, 8, 200)", schema_name=sn)
     assert bag(scanned(client, sn, "v"), "sx", "sy") == {(30, 100): 1}
-
-
-def test_a_filter_cte_feeds_the_group_by(client, schema_name):
-    """The reduce's input is a hidden filter view rather than a base table, so
-    rows the CTE drops never reach the fold."""
-    sn = schema_name
-    client.execute_sql(
-        "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, "
-        "amt BIGINT NOT NULL)", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v AS WITH big AS (SELECT id, cid, amt FROM orders WHERE amt > 50) "
-        "SELECT cid, COUNT(*) AS n FROM big GROUP BY cid", schema_name=sn)
-    client.execute_sql(
-        "INSERT INTO orders VALUES (1, 1, 100), (2, 1, 30), (3, 2, 200), (4, 2, 60)",
-        schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "cid", "n") == {(1, 1): 1, (2, 2): 1}
-
-
-def test_dropping_the_chained_view_retires_its_hidden_reduce(client, schema_name):
-    """The bundle's hidden reduce segment is retired with the user-named view, so
-    both source tables are free to drop straight after. `orders` is reached only
-    through that hidden segment, and a table under a live view refuses to
-    drop — which is what makes the refusal beforehand the precondition and the
-    success afterwards the fact."""
-    sn = schema_name
-    _orders_customers(client, sn)
-    client.execute_sql(
-        "CREATE VIEW v AS WITH agg AS (SELECT cid, SUM(amt) AS total FROM orders GROUP BY cid) "
-        "SELECT c.name AS nm, agg.total AS tot FROM agg JOIN customers c ON agg.cid = c.id",
-        schema_name=sn)
-    with pytest.raises(Exception, match="dependency"):
-        client.execute_sql("DROP TABLE orders", schema_name=sn)
-
-    client.execute_sql("DROP VIEW v", schema_name=sn)
-    client.execute_sql("DROP TABLE orders", schema_name=sn)
-    client.execute_sql("DROP TABLE customers", schema_name=sn)
 
 
 # ── The aggregate or DISTINCT above the join ──────────────────────────────────
@@ -280,28 +240,6 @@ def test_a_distinct_over_a_join_dedups_the_projection(client, schema_name, prepo
     assert bag(scanned(client, sn, "v"), "reg") == {(200,): 1, (300,): 1}
 
 
-def test_a_distinct_over_a_filtered_join_dedups_what_survives_the_where(client, schema_name):
-    """The WHERE runs inside H and the distinct over its output, so a second
-    above-threshold row for a value adds no row and retracting a value's only
-    carrier removes it."""
-    sn = schema_name
-    _orders_customers(client, sn, dim="region BIGINT NOT NULL")
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT DISTINCT region AS reg "
-        "FROM orders JOIN customers ON orders.cid = customers.id WHERE amt > 40",
-        schema_name=sn)
-    client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200)", schema_name=sn)
-    client.execute_sql(
-        "INSERT INTO orders VALUES (1, 1, 50), (2, 1, 30), (3, 2, 70)", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "reg") == {(100,): 1, (200,): 1}
-
-    client.execute_sql("INSERT INTO orders VALUES (4, 1, 90)", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "reg") == {(100,): 1, (200,): 1}
-
-    client.execute_sql("DELETE FROM orders WHERE id = 3", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "reg") == {(100,): 1}
-
-
 def test_min_max_over_a_joined_column_is_retained_in_the_pruned_hidden_view(
         client, schema_name):
     """H keeps exactly the names the outer operator evaluates, so an aggregate
@@ -390,12 +328,23 @@ def test_a_group_by_over_a_left_join_groups_the_null_fills_by_where_placement(
     assert bag(scanned(client, sn, "vn"), "n") == {(3,): 1}                 # a2, a4, a5
 
 
-def test_a_group_by_over_a_band_left_join_groups_the_range_misses_as_null(
-        client, schema_name):
-    """A band LEFT JOIN matches on an equality prefix and then a range, so a row
-    whose key matches but whose range does not is unmatched and null-fills like
-    any other. Under a preserved-side WHERE, and under the retraction of the only
-    matched row."""
+# `a1` matches under both shapes; `a2` misses the band's equality prefix but is
+# inside the pure range; `a3` is filtered out by the preserved-side WHERE before
+# the join is consulted; `a4` misses under both.
+@pytest.mark.parametrize("on,grouped,grouped_after,distinct_after", [
+    ("a.k = b.k AND a.lo < b.hi",
+     {(500, 1): 1, (None, 2): 1}, {(None, 2): 1}, {(None,): 1}),
+    ("a.lo < b.hi",
+     {(500, 2): 1, (None, 1): 1}, {(500, 1): 1, (None, 1): 1}, {(500,): 1, (None,): 1}),
+], ids=["band", "pure-range"])
+def test_a_reduce_over_a_range_outer_join_groups_the_range_misses_as_null(
+        client, schema_name, on, grouped, grouped_after, distinct_after):
+    """A range LEFT JOIN — band (an equality prefix then a range) or pure range —
+    null-fills a row the range does not admit exactly as an equi join null-fills
+    one whose key has no partner, so the reduce above it folds those rows into a
+    NULL group and the DISTINCT above it holds one NULL entry that leaves with its
+    last unmatched carrier. The physical shape underneath changes which rows are
+    unmatched, never how the operator above treats them."""
     sn = schema_name
     client.execute_sql(
         "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL, "
@@ -404,43 +353,18 @@ def test_a_group_by_over_a_band_left_join_groups_the_range_misses_as_null(
         "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, hi BIGINT NOT NULL, "
         "region BIGINT NOT NULL)", schema_name=sn)
     client.execute_sql(
-        "CREATE VIEW v AS SELECT region AS reg, COUNT(*) AS n "
-        "FROM a LEFT JOIN b ON a.k = b.k AND a.lo < b.hi WHERE amt > 40 GROUP BY region",
-        schema_name=sn)
-    client.execute_sql("INSERT INTO b VALUES (10, 1, 100, 500)", schema_name=sn)
-    # a1 matches (k=1, 50<100); a2 misses on the key; a3 is filtered out by amt.
+        f"CREATE VIEW vg AS SELECT region AS reg, COUNT(*) AS n "
+        f"FROM a LEFT JOIN b ON {on} WHERE amt > 40 GROUP BY region", schema_name=sn)
     client.execute_sql(
-        "INSERT INTO a VALUES (1, 1, 50, 70), (2, 2, 10, 80), (3, 1, 50, 30)", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "reg", "n") == {(500, 1): 1, (None, 1): 1}
-
-    client.execute_sql("INSERT INTO a VALUES (4, 3, 5, 100)", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "reg", "n") == {(500, 1): 1, (None, 2): 1}
+        f"CREATE VIEW vd AS SELECT DISTINCT region AS reg "
+        f"FROM a LEFT JOIN b ON {on} WHERE amt > 40", schema_name=sn)
+    client.execute_sql("INSERT INTO b VALUES (10, 1, 100, 500)", schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO a VALUES (1, 1, 50, 70), (2, 2, 10, 80), (3, 1, 50, 30), (4, 3, 200, 100)",
+        schema_name=sn)
+    assert bag(scanned(client, sn, "vg"), "reg", "n") == grouped
+    assert bag(scanned(client, sn, "vd"), "reg") == {k[:1]: 1 for k in grouped}
 
     client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "reg", "n") == {(None, 2): 1}
-
-
-def test_a_distinct_over_a_pure_range_left_join_dedups_matches_and_null_fills(
-        client, schema_name):
-    """A pure-range LEFT JOIN has no equality prefix at all. Matched rows carry
-    the right value and unmatched ones carry NULL, so the distinct over them holds
-    one entry per distinct value plus one for NULL, which leaves when its last
-    unmatched carrier does."""
-    sn = schema_name
-    client.execute_sql(
-        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, lo BIGINT NOT NULL, amt BIGINT NOT NULL)",
-        schema_name=sn)
-    client.execute_sql(
-        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, hi BIGINT NOT NULL, "
-        "region BIGINT NOT NULL)", schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW v AS SELECT DISTINCT region AS reg "
-        "FROM a LEFT JOIN b ON a.lo < b.hi WHERE amt > 40", schema_name=sn)
-    client.execute_sql("INSERT INTO b VALUES (10, 100, 500)", schema_name=sn)
-    # a1 and a3 match (lo < 100); a2 does not.
-    client.execute_sql(
-        "INSERT INTO a VALUES (1, 50, 70), (2, 200, 80), (3, 60, 90)", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "reg") == {(500,): 1, (None,): 1}
-
-    client.execute_sql("DELETE FROM a WHERE id = 2", schema_name=sn)
-    assert bag(scanned(client, sn, "v"), "reg") == {(500,): 1}
+    assert bag(scanned(client, sn, "vg"), "reg", "n") == grouped_after
+    assert bag(scanned(client, sn, "vd"), "reg") == distinct_after

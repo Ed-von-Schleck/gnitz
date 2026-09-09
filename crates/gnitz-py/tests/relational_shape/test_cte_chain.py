@@ -24,12 +24,6 @@ def _tu(client, sn):
             schema_name=sn)
 
 
-def _bags(client, sn, *views, cols):
-    """`{view: bag}` over one column list, for the cases whose views are
-    interchangeable spellings of one body."""
-    return {v: bag(scanned(client, sn, v), *cols) for v in views}
-
-
 def test_a_cut_body_answers_the_same_as_the_uncut_one(client, schema_name):
     """The filter feeding a join, spelled as a CTE, a derived table, a
     pass-through CTE with the predicate in the final, and one inline body. The
@@ -52,7 +46,8 @@ def test_a_cut_body_answers_the_same_as_the_uncut_one(client, schema_name):
     names = ("v_cte", "v_derived", "v_passthrough", "v_inline")
 
     def agree(want):
-        assert _bags(client, sn, *names, cols=("did", "ub")) == {v: want for v in names}
+        for v in names:
+            assert bag(scanned(client, sn, v), "did", "ub") == want, v
 
     client.execute_sql("INSERT INTO u VALUES (1, 0, 10), (2, 0, 20), (3, 0, 30)", schema_name=sn)
     client.execute_sql("INSERT INTO t VALUES (1, 200, 0), (2, 50, 0)", schema_name=sn)
@@ -299,6 +294,37 @@ def test_an_outer_join_inside_a_cut_segment_null_fills(client, schema_name):
         (2, None): 1, (3, None): 1, (4, None): 1}
     assert bag(scanned(client, sn, "v_range"), "did", "ub") == {
         (2, 100): 1, (3, 100): 1, (3, 50): 1, (4, None): 1}
+
+
+@pytest.mark.parametrize("body,base", [
+    ("SELECT x.a AS xa, y.b AS yb FROM t x JOIN t y ON x.b = y.id", "t"),
+    ("SELECT t.a AS ta, w.b AS wb FROM t JOIN u ON t.b = u.id JOIN w ON u.b = w.id", "u"),
+    ("WITH agg AS (SELECT a, SUM(b) AS s FROM t GROUP BY a) "
+     "SELECT u.b AS ub, agg.s AS s FROM agg JOIN u ON agg.a = u.id", "t"),
+], ids=["self-join-passthrough", "join-segment", "reduce-segment"])
+def test_a_generated_relation_is_a_real_node_in_the_dependency_graph(
+        client, schema_name, body, base):
+    """Whatever the lowering generates — a collision pass-through, a join segment,
+    a reduce segment — is a relation in the dependency graph like any other: it
+    holds a reference on its source, which is why the base refuses to drop under
+    a live view; and `DROP VIEW` retires the whole bundle, so the base is free
+    straight after. An orphaned generated relation would keep RESTRICTing it.
+
+    `base` is reached only through the generated relation in each case, so the
+    refusal is the segment's and not the final view's.
+    """
+    sn = schema_name
+    _tu(client, sn)
+    client.execute_sql(
+        "CREATE TABLE w (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=sn)
+
+    with pytest.raises(Exception, match="dependency"):
+        client.execute_sql(f"DROP TABLE {base}", schema_name=sn)
+
+    client.execute_sql("DROP VIEW v", schema_name=sn)
+    client.execute_sql(f"DROP TABLE {base}", schema_name=sn)
 
 
 def test_a_derived_table_without_an_alias_is_refused(client, schema_name):

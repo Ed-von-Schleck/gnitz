@@ -396,7 +396,9 @@ def test_band_left_null_fills_a_row_until_it_has_a_match(client, band):
     retracts the null-fill in the same epoch the pair appears, and deleting that b
     restores it. A row matched twice stays matched until the LAST match retracts —
     ν sums the matched weight, it does not count matches. Deleting a *matched* left
-    row leaves no `(a, NULL)` tombstone: `ΔA = −a` and `Δinner = −a` cancel."""
+    row leaves no `(a, NULL)` tombstone: `ΔA = −a` and `Δinner = −a` cancel. b is
+    seeded first throughout, so every a's match is decided in the epoch it
+    arrives, alongside a non-matching a in the same batch that still fills."""
     vid = _pair_view(client, band, "a.k = b.k AND a.lo <= b.t", "LEFT")
     _fill(client, band, "b", [(1, 1, 50)])
     # a1 matches b1; a2's group has no b; a3's lo is above every t in its group.
@@ -420,18 +422,6 @@ def test_band_left_null_fills_a_row_until_it_has_a_match(client, band):
     _fill(client, band, "b", [(4, 1, 30)])
     client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=band)
     assert _live(client, vid) == {(2, None): 1, (3, None): 1}
-
-
-def test_band_left_decides_a_match_in_the_epoch_the_row_arrives(client, band):
-    """b's match is already in the trace when a is inserted, so a's match is
-    decided in the same epoch as its insertion: exactly one pair and no net
-    `(a, NULL)`. A non-matching a in the same batch still null-fills, so the epoch
-    handles a mixed delta rather than suppressing every fill."""
-    vid = _pair_view(client, band, "a.k = b.k AND a.lo <= b.t", "LEFT")
-    _fill(client, band, "b", [(1, 1, 50)])
-    _fill(client, band, "a", [(1, 1, 10), (2, 7, 10)])
-
-    assert _live(client, vid) == {(1, 1): 1, (2, None): 1}
 
 
 def test_band_left_null_fills_correctly_across_eq_groups_on_every_worker(client, band):
@@ -550,7 +540,9 @@ def test_pure_range_left_null_fill_follows_the_extremum(client, rng):
     Deleting the EXTREME b raises the threshold, so an untouched a between the old
     and new extremum flips to null-filled; deleting a non-extreme b moves no
     threshold and must flip nothing. Deleting a matched a retracts its pairs and
-    leaves no tombstone."""
+    leaves no tombstone. b is seeded first, so a matched a's passthrough `+a` and
+    the `A ⋈ {m}` term's `−a` are byte-identical and cancel in the epoch a
+    arrives — never a transient `(a, NULL)`."""
     vid = _pair_view(client, rng, "a.x < b.y", "LEFT")
     b_rows = [(1, 20), (2, 40), (3, 60), (4, 80), (5, 100)]
     a_rows = [(1, 10), (2, 50), (3, 90), (4, 100), (5, 150)]
@@ -576,18 +568,6 @@ def test_pure_range_left_null_fill_follows_the_extremum(client, rng):
     client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=rng)
     a_rows = [r for r in a_rows if r[0] != 1]
     check(a_rows, b_rows, "a matched left row leaves no null-fill tombstone")
-
-
-def test_pure_range_left_decides_a_match_in_the_epoch_the_row_arrives(client, rng):
-    """The threshold already covers a's match before a is inserted, so the matched
-    a's passthrough `+a` and the `A ⋈ {m}` term's `−a` are byte-identical and
-    cancel in-epoch: exactly one pair, never a transient `(a, NULL)`. A
-    non-matching a in the same batch still null-fills."""
-    vid = _pair_view(client, rng, "a.x < b.y", "LEFT")
-    _fill(client, rng, "b", [(1, 50)])
-    _fill(client, rng, "a", [(1, 10), (2, 80)])
-
-    assert _live(client, vid) == {(1, 1): 1, (2, None): 1}
 
 
 def test_pure_range_left_null_fills_each_row_once_under_the_broadcast(client, schema_name):

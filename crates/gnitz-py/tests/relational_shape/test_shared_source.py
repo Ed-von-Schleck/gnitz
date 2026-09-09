@@ -1,20 +1,24 @@
 """Two operands of one combine node that resolve to the same source.
 
-Two lowering rules meet here.
+One rule, in three shapes. The planner wraps the *repeated* occurrence in an
+auto-generated pass-through hidden view under a fresh id, so the combine sees two
+distinct sources and the shared base reaches them in two separate epochs. The
+discriminator is source-id equality, not base-table overlap — two *distinct*
+views over one base must not be wrapped, and must not be refused either.
 
-A join whose inputs both trace to one relation (`t ⋈ view-over-t`) is reached by
-one push in two separate epochs, so the bilinear cross-term `dA ⋈ dB` is emitted
-exactly once. That is a claim about weights: the failure is a doubled weight or a
-missing product row, and a row-set comparison sees neither.
+A join whose inputs both trace to one relation (`t ⋈ view-over-t`, or the same
+table twice in one FROM) is reached by one push in two separate epochs, so the
+bilinear cross-term `dA ⋈ dB` is emitted exactly once. That is a claim about
+weights: the failure is a doubled weight or a missing product row, and a row-set
+comparison sees neither. Three occurrences means two pass-throughs.
 
 A set operation whose branches resolve to the same tid cannot be driven by the
-clamp algebra in one epoch, so the repeat is wrapped in a pass-through segment
-and one push becomes two cascade epochs. The discriminator is source-id
-equality, not base-table overlap — two *distinct* views over one base must not be
-wrapped, and must not be refused either.
+clamp algebra in one epoch, so the repeat is wrapped and one push becomes two
+cascade epochs.
 
 Every case compares against `_oracle`'s from-scratch recompute over base state
-the test maintains itself, after each epoch (one `execute_sql` is one epoch).
+the test maintains itself, after each epoch (one `execute_sql` is one epoch), or
+through `bag`, which sums the weights the same way.
 """
 
 import _oracle as oracle
@@ -34,6 +38,12 @@ def _c(state, pred):
     """The weight-multiset of `c` over the rows of `state` satisfying `pred`."""
     return oracle.oracle_filter_project(state, pred, ["c"])
 
+
+# The four operators whose two branches may resolve to one source, as
+# `(view-name prefix, SQL)`. INTERSECT ALL / EXCEPT ALL add no shape: their
+# branches route through the same wrapper as the deduplicating pair.
+_ONE_SOURCE_OPS = [("ex", "EXCEPT"), ("inr", "INTERSECT"),
+                   ("ua", "UNION ALL"), ("ud", "UNION")]
 
 _JOIN_COLS = ["lid", "lk", "lv", "rid", "rk", "rv"]
 
@@ -122,15 +132,18 @@ def test_two_views_over_one_base_join_at_full_multiplicity(client, schema_name):
     check("after-delete")
 
 
-def test_a_set_op_whose_branches_resolve_to_one_source_is_wrapped(client, schema_name):
+def test_a_set_op_whose_branches_resolve_to_one_source_converges(client, schema_name):
     """Identical branches, differing branches, and branches over one view: every
-    shape whose two operands resolve to one tid compiles and converges. `A EXCEPT
-    A` is empty and `A INTERSECT A` is `distinct(A)` at every stage — one push
-    driving two cascade epochs, not one epoch the clamp algebra cannot settle."""
+    shape whose two operands resolve to one tid compiles and converges, for every
+    operator. The clamping pair needs the wrapper — `A EXCEPT A` is empty and
+    `A INTERSECT A` is `distinct(A)` at every stage, one push driving two cascade
+    epochs rather than one epoch the clamp algebra cannot settle. The linear pair
+    needs no correction term at all: a value both branches admit reaches UNION ALL
+    at weight 2 and UNION at weight 1."""
     sn = schema_name
     _t(client, sn, cols="c BIGINT NOT NULL")
     client.execute_sql("CREATE VIEW vt AS SELECT id, c FROM t WHERE c > 0", schema_name=sn)
-    for name, op in (("ex", "EXCEPT"), ("inr", "INTERSECT")):
+    for name, op in _ONE_SOURCE_OPS:
         client.execute_sql(
             f"CREATE VIEW {name}_split AS SELECT c FROM t WHERE c > 0 {op} SELECT c FROM t WHERE c < 10",
             schema_name=sn)
@@ -146,7 +159,7 @@ def test_a_set_op_whose_branches_resolve_to_one_source_is_wrapped(client, schema
         branches = {"split": (positive, _c(state, lambda r: r["c"] < 10)),
                     "same": (whole, whole),
                     "view": (positive, positive)}
-        for prefix, op in (("ex", "EXCEPT"), ("inr", "INTERSECT")):
+        for prefix, op in _ONE_SOURCE_OPS:
             for suffix, (left, right) in branches.items():
                 oracle.assert_view_matches(
                     client, _vid(client, sn, f"{prefix}_{suffix}"), ["c"],
@@ -206,72 +219,123 @@ def test_two_views_over_one_base_are_distinct_sources(client, schema_name):
     check("after-delete")
 
 
-def test_a_union_over_one_source_needs_no_wrapper(client, schema_name):
-    """UNION and UNION ALL are linear, so overlapping branches over one table
-    carry no correction term: a value both predicates admit reaches UNION ALL at
-    weight 2 and UNION at weight 1."""
-    sn = schema_name
-    _t(client, sn, cols="c BIGINT NOT NULL")
+# ── the same relation twice in one FROM ───────────────────────────────────────
+
+
+def _emp(client, sn, extra="nm BIGINT NOT NULL"):
     client.execute_sql(
-        "CREATE VIEW ua AS SELECT c FROM t WHERE c > 0 UNION ALL SELECT c FROM t WHERE c < 100",
+        f"CREATE TABLE emp (id BIGINT PRIMARY KEY, mgr BIGINT NOT NULL, {extra})",
         schema_name=sn)
-    client.execute_sql(
-        "CREATE VIEW ud AS SELECT c FROM t WHERE c > 0 UNION SELECT c FROM t WHERE c < 100",
-        schema_name=sn)
-    state = {}
-
-    def check(ctx):
-        left, right = _c(state, lambda r: r["c"] > 0), _c(state, lambda r: r["c"] < 100)
-        for name, op in (("ua", "UNION ALL"), ("ud", "UNION")):
-            oracle.assert_view_matches(client, _vid(client, sn, name), ["c"],
-                                       oracle.oracle_setop(op, left, right), ctx=f"{name} {ctx}")
-
-    # c=50 satisfies both predicates; c=150 and c=-5 only one each.
-    client.execute_sql("INSERT INTO t VALUES (1, 50), (2, 150), (3, -5)", schema_name=sn)
-    oracle.apply_insert(state, "id", [{"id": 1, "c": 50}, {"id": 2, "c": 150}, {"id": 3, "c": -5}])
-    check("after-insert")
-
-    client.execute_sql("DELETE FROM t WHERE id = 1", schema_name=sn)
-    oracle.apply_delete(state, "id", [1])
-    check("after-delete-of-the-doubled-value")
 
 
-def test_a_branch_with_duplicate_projected_values_contributes_weight_one(client, schema_name):
-    """Two source rows projecting to one value consolidate to a single tuple at
-    weight 2, so a deduplicating set operation must lift each branch through
-    distinct before subtracting. Without it a right-side cover retracts weight 1
-    and leaves the value surviving at weight 1 instead of nothing."""
+def test_one_push_reaches_both_occurrences_exactly_once(client, schema_name):
+    """The classic employee-to-manager join. One INSERT is one push into `emp`,
+    which both occurrences read; each new row must appear on the employee side
+    and on the manager side without being counted twice, and retracting a manager
+    must retract every report's row. Weights, not row presence: a cross-term
+    emitted in both epochs would show up as weight 2."""
     sn = schema_name
-    for name in ("a", "b"):
-        client.execute_sql(
-            f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, c BIGINT NOT NULL)",
-            schema_name=sn)
-    client.execute_sql("CREATE VIEW ex AS SELECT c FROM a EXCEPT SELECT c FROM b", schema_name=sn)
-    client.execute_sql("CREATE VIEW inr AS SELECT c FROM a INTERSECT SELECT c FROM b", schema_name=sn)
-    a_state, b_state = {}, {}
+    _emp(client, sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT e.nm AS emp, m.nm AS boss FROM emp e JOIN emp m ON e.mgr = m.id",
+        schema_name=sn)
+    client.execute_sql("INSERT INTO emp VALUES (1, 0, 100), (2, 1, 200), (3, 1, 300)",
+                       schema_name=sn)
+    # 2 and 3 report to 1; 1's own mgr 0 has no row.
+    assert bag(scanned(client, sn, "v"), "emp", "boss") == {(200, 100): 1, (300, 100): 1}
 
-    def check(ctx):
-        left, right = _c(a_state, None), _c(b_state, None)
-        for name, op in (("ex", "EXCEPT"), ("inr", "INTERSECT")):
-            oracle.assert_view_matches(client, _vid(client, sn, name), ["c"],
-                                       oracle.oracle_setop(op, left, right), ctx=f"{name} {ctx}")
+    client.execute_sql("INSERT INTO emp VALUES (4, 2, 400)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "emp", "boss") == \
+        {(200, 100): 1, (300, 100): 1, (400, 200): 1}
 
-    client.execute_sql("INSERT INTO a VALUES (1, 5), (2, 5)", schema_name=sn)
-    oracle.apply_insert(a_state, "id", [{"id": 1, "c": 5}, {"id": 2, "c": 5}])
-    check("left-duplicate-right-empty")
+    client.execute_sql("DELETE FROM emp WHERE id = 1", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "emp", "boss") == {(400, 200): 1}
 
-    client.execute_sql("INSERT INTO b VALUES (10, 5), (11, 5)", schema_name=sn)
-    oracle.apply_insert(b_state, "id", [{"id": 10, "c": 5}, {"id": 11, "c": 5}])
-    check("both-sides-duplicate")
 
-    client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=sn)
-    oracle.apply_delete(a_state, "id", [1])
-    check("one-of-the-two-left-rows-removed")
+def test_the_pass_through_backfills_with_the_join(client, schema_name):
+    """Data already in the base when the view is created: the pass-through has to
+    be seeded before the join reads it, and the backfilled value must equal what
+    incremental maintenance then continues from."""
+    sn = schema_name
+    _emp(client, sn)
+    client.execute_sql("INSERT INTO emp VALUES (1, 0, 100), (2, 1, 200), (3, 1, 300)",
+                       schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT e.nm AS emp, m.nm AS boss FROM emp e JOIN emp m ON e.mgr = m.id",
+        schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "emp", "boss") == {(200, 100): 1, (300, 100): 1}
 
-    client.execute_sql("DELETE FROM b WHERE id = 10", schema_name=sn)
-    oracle.apply_delete(b_state, "id", [10])
-    check("one-of-the-two-right-rows-removed")
+    client.execute_sql("INSERT INTO emp VALUES (4, 2, 400)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "emp", "boss") == \
+        {(200, 100): 1, (300, 100): 1, (400, 200): 1}
 
-    client.execute_sql("DELETE FROM b WHERE id = 11", schema_name=sn)
-    oracle.apply_delete(b_state, "id", [11])
-    check("right-empty")
+
+def test_a_residual_reads_both_occurrences(client, schema_name):
+    """Employees earning more than their manager: the residual compares a column
+    of the base against the same column of its pass-through copy, so both have to
+    survive into the join output under their own provenance."""
+    sn = schema_name
+    _emp(client, sn, "sal BIGINT NOT NULL")
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT e.id AS eid FROM emp e JOIN emp m ON e.mgr = m.id "
+        "WHERE e.sal > m.sal", schema_name=sn)
+    client.execute_sql("INSERT INTO emp VALUES (1, 0, 500), (2, 1, 600), (3, 1, 400)",
+                       schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "eid") == {(2,): 1}
+
+    client.execute_sql("UPDATE emp SET sal = 700 WHERE id = 3", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "eid") == {(2,): 1, (3,): 1}
+
+
+def test_three_occurrences_chain_through_two_pass_throughs(client, schema_name):
+    """Employee, manager and grand-manager: the same base three times, so the
+    left-deep chain stacks two pass-throughs, and the narrow projection prunes
+    each occurrence to its join keys and the one name it contributes."""
+    sn = schema_name
+    _emp(client, sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT e.nm AS emp, g.nm AS grand "
+        "FROM emp e JOIN emp m ON e.mgr = m.id JOIN emp g ON m.mgr = g.id", schema_name=sn)
+    # 1 is top (mgr 0); 2 reports to 1; 3 to 2. Only e=3 has a full chain.
+    client.execute_sql("INSERT INTO emp VALUES (1, 0, 100), (2, 1, 200), (3, 2, 300)",
+                       schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "emp", "grand") == {(300, 100): 1}
+
+    client.execute_sql("INSERT INTO emp VALUES (4, 3, 400)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "emp", "grand") == {(300, 100): 1, (400, 200): 1}
+
+    client.execute_sql("DELETE FROM emp WHERE id = 1", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "emp", "grand") == {(400, 200): 1}
+
+
+def test_a_self_join_composes_with_a_distinct_third_relation(client, schema_name):
+    """A repeated occurrence and an ordinary one in the same chain: only the
+    repeat is wrapped, and the unwrapped relation joins as it always would."""
+    sn = schema_name
+    _emp(client, sn, "dept BIGINT NOT NULL")
+    client.execute_sql("CREATE TABLE dept (id BIGINT PRIMARY KEY, budget BIGINT NOT NULL)",
+                       schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT e.id AS eid, m.id AS mid, d.budget AS bud "
+        "FROM emp e JOIN emp m ON e.mgr = m.id JOIN dept d ON e.dept = d.id", schema_name=sn)
+    client.execute_sql("INSERT INTO dept VALUES (10, 999)", schema_name=sn)
+    client.execute_sql("INSERT INTO emp VALUES (1, 0, 10), (2, 1, 10)", schema_name=sn)
+
+    assert bag(scanned(client, sn, "v"), "eid", "mid", "bud") == {(2, 1, 999): 1}
+
+
+def test_a_self_join_spelled_with_using(client, schema_name):
+    """`USING (k)` resolves its names before the right alias enters the scope,
+    and the wrapper still has to see two distinct sources afterwards — the one
+    order in which the merge and the self-collision rewrite could disagree."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT x.id AS xid, y.id AS yid FROM t x JOIN t y USING (k)",
+        schema_name=sn)
+    client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 5), (3, 6)", schema_name=sn)
+
+    rows = [(1, 5), (2, 5), (3, 6)]
+    assert bag(scanned(client, sn, "v"), "xid", "yid") == \
+        {(xi, yi): 1 for (xi, xk) in rows for (yi, yk) in rows if xk == yk}
