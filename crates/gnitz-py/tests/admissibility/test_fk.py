@@ -5,9 +5,6 @@ state row by row: a child the same write removes exempts its parent, and a
 referenced value the write re-adds under another row never leaves. That holds on
 the transaction path (INSERT/UPDATE/DELETE) and the plain path (binary
 push/delete) alike, and across workers — the suite runs at GNITZ_WORKERS=4.
-
-Run:
-    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/admissibility/test_fk.py -v --tb=short
 """
 import threading
 
@@ -660,3 +657,89 @@ def test_restrict_over_more_values_than_one_write_carries(client, fk_pair):
                        schema_name=fk_pair)
     assert len(client.scan(child_tid)) == 0
     assert len(client.scan(parent_tid)) == 0
+
+
+# ── Targets and key shapes the declaration refuses ───────────────────────────
+
+def test_a_compound_pk_offers_no_lone_column_to_reference(client, schema_name):
+    """A compound PK has no single PK column, so a member of it qualifies as an
+    FK target only through a UNIQUE index of its own — a plain member and a plain
+    payload column fail alike. The rule is "unique", not "part of the key"."""
+    client.execute_sql(
+        "CREATE TABLE parent (a BIGINT UNSIGNED, b BIGINT UNSIGNED, payload BIGINT, "
+        "PRIMARY KEY (a, b))", schema_name=schema_name)
+    for col in ("a", "payload"):
+        with pytest.raises(gnitz.GnitzError, match="(?i)unique"):
+            client.execute_sql(
+                f"CREATE TABLE chi (cid BIGINT PRIMARY KEY, "
+                f"ref BIGINT UNSIGNED REFERENCES parent({col}))", schema_name=schema_name)
+
+
+def test_a_multi_column_foreign_key_is_refused(client, schema_name):
+    """One reference resolves one value through one gather, so a two-column FK
+    has no runtime form and is refused where it is declared."""
+    client.execute_sql(
+        "CREATE TABLE parent (a BIGINT UNSIGNED, b BIGINT UNSIGNED, payload BIGINT, "
+        "PRIMARY KEY (a, b))", schema_name=schema_name)
+    with pytest.raises(gnitz.GnitzError, match="(?i)multi-column"):
+        client.execute_sql(
+            "CREATE TABLE chi (x BIGINT UNSIGNED, y BIGINT UNSIGNED, "
+            "cid BIGINT PRIMARY KEY, FOREIGN KEY (x, y) REFERENCES parent (a, b))",
+            schema_name=schema_name)
+
+
+def test_a_child_whose_fk_column_is_its_own_key_is_enforced(client, schema_name):
+    """An FK column that is also a PK column has no payload slot, so the
+    existence check has to read the value out of the key region. Reading it
+    through the payload index instead finds another column's bytes — or none."""
+    client.execute_sql("CREATE TABLE p (pid BIGINT UNSIGNED PRIMARY KEY)",
+                       schema_name=schema_name)
+    client.execute_sql(
+        "CREATE TABLE c (cid BIGINT UNSIGNED PRIMARY KEY REFERENCES p(pid))",
+        schema_name=schema_name)
+    client.execute_sql("INSERT INTO p (pid) VALUES (1)", schema_name=schema_name)
+    client.execute_sql("INSERT INTO c (cid) VALUES (1)", schema_name=schema_name)
+    with pytest.raises(gnitz.GnitzError):
+        client.execute_sql("INSERT INTO c (cid) VALUES (99)", schema_name=schema_name)
+
+
+def test_restrict_sees_a_child_whose_own_key_is_negative(client, schema_name):
+    """RESTRICT finds the referencing children by seeking the child relation, so
+    a child at a negative PK has to be reachable by that seek. One the seek
+    missed would leave the parent deletable and the reference dangling — a
+    silent loss of the constraint rather than an error."""
+    client.execute_sql("CREATE TABLE parent (pid BIGINT UNSIGNED PRIMARY KEY)",
+                       schema_name=schema_name)
+    client.execute_sql(
+        "CREATE TABLE child (cid BIGINT PRIMARY KEY, fk_val BIGINT UNSIGNED NOT NULL, "
+        "FOREIGN KEY (fk_val) REFERENCES parent(pid))", schema_name=schema_name)
+    client.execute_sql("INSERT INTO parent (pid) VALUES (1)", schema_name=schema_name)
+    client.execute_sql("INSERT INTO child (cid, fk_val) VALUES (-5, 1), (-1, 1)",
+                       schema_name=schema_name)
+
+    with pytest.raises(gnitz.GnitzError):
+        client.execute_sql("DELETE FROM parent WHERE pid = 1", schema_name=schema_name)
+
+
+def test_the_unique_index_an_fk_resolves_through_cannot_be_dropped(client, code_pair):
+    """The index is how the referenced value is resolved, so dropping it would
+    leave the constraint with no way to answer. `DROP TABLE` on the parent is
+    gated by the child; this is the same gate one level down, on the structure
+    rather than the relation.
+
+    The index name is read from the catalog rather than spelled out: the
+    generated name is an internal convention, and pinning it would fail the test
+    on a rename that changed no behaviour.
+    """
+    sn = code_pair
+    idx = client.scan(gnitz.IDX_TAB)
+    pid, _ = client.resolve_table(sn, "p")
+    names = [n for w, o, n in zip(idx.weights, idx.scalars("owner_id"), idx.scalars("name"))
+             if w > 0 and o == pid]
+    assert len(names) == 1, names
+
+    with pytest.raises(gnitz.GnitzError, match="(?i)integrity"):
+        client.execute_sql(f"DROP INDEX {names[0]}", schema_name=sn)
+    # With the referencing table gone the index is droppable again.
+    client.execute_sql("DROP TABLE c", schema_name=sn)
+    client.execute_sql(f"DROP INDEX {names[0]}", schema_name=sn)

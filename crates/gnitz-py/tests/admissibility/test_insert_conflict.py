@@ -183,3 +183,46 @@ def test_do_update_over_a_string_column_and_a_rejected_null(client, schema_name)
             schema_name=sn)
     assert sorted((r.pk, r.txt) for r in client.scan(tid)) == [(1, "new"), (2, "fresh")], \
         "no silent write survived the refusal"
+
+
+@pytest.mark.parametrize("pk_ddl,pk_list,target,seed,upsert,final", [
+    pytest.param(
+        "a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL", "(a, b)", "(a, b)",
+        "(1, 1, 10), (2, 2, 20)",
+        "(1, 1, 111), (3, 3, 30)", [(1, 1, 111), (2, 2, 20), (3, 3, 30)], id="arity-2"),
+    pytest.param(
+        "a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL, "
+        "c BIGINT UNSIGNED NOT NULL", "(a, b, c)", "(a, b, c)",
+        "(1, 1, 1, 10), (2, 2, 2, 20)",
+        "(1, 1, 1, 111), (3, 3, 3, 30)",
+        [(1, 1, 1, 111), (2, 2, 2, 20), (3, 3, 3, 30)], id="arity-3"),
+])
+def test_a_conflict_target_may_name_a_whole_compound_key(
+        client, schema_name, pk_ddl, pk_list, target, seed, upsert, final):
+    """The target is the primary key whatever its arity, so the probe resolving
+    which rows conflict has to compare the whole packed key. A probe that
+    compared a prefix would report the new key as a conflict and update the wrong
+    row; one that compared nothing would insert a duplicate."""
+    sn = schema_name
+    client.execute_sql(
+        f"CREATE TABLE c ({pk_ddl}, v BIGINT NOT NULL, PRIMARY KEY {pk_list})",
+        schema_name=sn)
+    client.execute_sql(f"INSERT INTO c VALUES {seed}", schema_name=sn)
+    client.execute_sql(
+        f"INSERT INTO c VALUES {upsert} ON CONFLICT {target} DO UPDATE SET v = EXCLUDED.v",
+        schema_name=sn)
+    tid, _ = client.resolve_table(sn, "c")
+    assert sorted(tuple(r)[:len(final[0])] for r in client.scan(tid)) == sorted(final)
+
+
+def test_a_conflict_target_naming_part_of_a_compound_key_is_refused(client, schema_name):
+    """`(a)` is a proper prefix of the key, not the key. Accepting it would make
+    the upsert resolve against a set of rows rather than one, with no rule for
+    which to update."""
+    client.execute_sql(
+        "CREATE TABLE c (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL, "
+        "v BIGINT NOT NULL, PRIMARY KEY (a, b))", schema_name=schema_name)
+    with pytest.raises(gnitz.GnitzError, match="primary key"):
+        client.execute_sql(
+            "INSERT INTO c VALUES (1, 1, 10) ON CONFLICT (a) DO NOTHING",
+            schema_name=schema_name)

@@ -205,24 +205,33 @@ def test_pk_column_unique_index_short_circuits(client, schema_name):
     assert _has_index(client, schema_name)
 
 
-@pytest.mark.parametrize("rows,ok", [
-    ("(1, 1, 10), (1, 2, 20), (3, 1, 30)", False),   # `a` repeats across rows
-    ("(1, 1, 10), (2, 2, 20), (3, 1, 30)", True),
-], ids=["duplicate-member", "distinct-member"])
-def test_compound_pk_member_is_not_trivially_unique(client, schema_name, rows, ok):
-    """A member of a compound PK is not the PK, so it takes the full-path scan."""
+@pytest.mark.parametrize("rows,dup", [
+    ("(1, 1, 10), (1, 2, 20), (3, 1, 30)", None),   # `a` repeats across rows
+    ("(1, 1, 10), (2, 2, 20), (3, 1, 30)", 2),
+    # The index key is the member's bytes copied out of the PK region verbatim,
+    # so values straddling 2^63 are where a lost sign flip or byte-order slip in
+    # that span would either misorder them or collide two distinct ones. The
+    # re-insert lands on the widest of them, which is the one such a slip moves.
+    (f"(0, 1, 10), ({2**63 - 1}, 1, 20), ({2**63}, 1, 30), ({2**64 - 1}, 1, 40)",
+     2**64 - 1),
+], ids=["duplicate-member", "distinct-member", "distinct-across-the-midpoint"])
+def test_compound_pk_member_is_not_trivially_unique(client, schema_name, rows, dup):
+    """A member of a compound PK is not the PK, so it takes the full-path scan.
+    `dup` is a value the seeded rows already carry, so re-inserting it under a
+    fresh `b` is a distinct PK that still violates UNIQUE on the member; `None`
+    means the seed itself already holds a duplicate and the create must refuse."""
     client.execute_sql(
         "CREATE TABLE t (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL,"
         " payload BIGINT, PRIMARY KEY (a, b))", schema_name=schema_name)
     client.execute_sql(f"INSERT INTO t VALUES {rows}", schema_name=schema_name)
-    if not ok:
+    if dup is None:
         with pytest.raises(gnitz.GnitzError, match=_CREATE_DUP):
             client.execute_sql("CREATE UNIQUE INDEX ON t(a)", schema_name=schema_name)
         assert not _has_index(client, schema_name)
         return
     client.execute_sql("CREATE UNIQUE INDEX ON t(a)", schema_name=schema_name)
     with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
-        client.execute_sql("INSERT INTO t VALUES (2, 9, 90)", schema_name=schema_name)
+        client.execute_sql(f"INSERT INTO t VALUES ({dup}, 9, 90)", schema_name=schema_name)
 
 
 def test_concurrent_inserts_during_create(client, server, schema_name):

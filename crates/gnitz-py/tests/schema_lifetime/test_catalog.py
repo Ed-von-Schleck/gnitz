@@ -111,8 +111,9 @@ def test_create_table_carries_every_type_and_the_declared_pk(client, schema_name
     """`create_table` accepts every `TypeCode` and hands each one back unchanged,
     with the PK at the index the caller declared rather than at column 0.
 
-    The per-type value round trip is `value_domain/test_types.py`'s; what this
-    asserts is that the catalog does not silently retype or re-key a column.
+    The per-type value round trip is `value_domain/test_value_round_trip.py`'s;
+    what this asserts is that the catalog does not silently retype or re-key a
+    column.
     """
     cols = [gnitz.ColumnDef("val", gnitz.TypeCode.I64),
             gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)]

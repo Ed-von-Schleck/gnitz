@@ -9,6 +9,8 @@ plan, and how Python values become column bytes.
 import inspect
 import random
 import uuid
+from datetime import date, datetime
+from decimal import Decimal
 
 import pytest
 
@@ -547,3 +549,58 @@ class TestValueCoercion:
             assert len(batch) == 0
             batch.append(a=1, b=2, v=3)        # the scratch is clean
             assert batch.pks == [(1).to_bytes(8, "little") + (2).to_bytes(4, "little")]
+
+    def test_a_decimal_column_takes_every_spelling_of_one_value(self):
+        """A DECIMAL is a scaled integer, so the binding has to scale whatever it
+        is handed: a `Decimal`, an `int`, a `float`, a string, and a `Decimal` in
+        exponent form all name a value at the column's scale. A longer fraction
+        rounds half away from zero rather than truncating, which is the rule the
+        SQL literal path also follows.
+
+        The refusals are the two ways a value has no scaled image: text that is
+        not a number, and a magnitude past the `i64` behind the scale.
+        """
+        schema = Schema([ColumnDef("id", TypeCode.I64, primary_key=True),
+                         ColumnDef("v", TypeCode.DECIMAL, scale=3)])
+        assert schema.columns[1].scale == 3, "a client-authored schema carries the scale"
+
+        batch = ZSetBatch(schema)
+        for i, v in enumerate([Decimal("12.5"), 3, 1.1, "2.2505", Decimal("1E+2")], 1):
+            batch.append(id=i, v=v)
+        assert batch.columns[1] == [Decimal("12.500"), Decimal("3.000"),
+                                    Decimal("1.100"), Decimal("2.251"),
+                                    Decimal("100.000")]
+
+        with pytest.raises(ValueError):
+            ZSetBatch(schema).append(id=9, v="abc")
+        with pytest.raises(OverflowError):
+            ZSetBatch(schema).append(id=9, v=10**16)
+
+    def test_a_temporal_column_takes_an_object_or_its_stored_integer(self):
+        """DATE and TIMESTAMP are a day count and a microsecond count, so the
+        binding accepts either the calendar object or the integer itself, and the
+        two must land on the same value. A `datetime` reaching a DATE column
+        keeps its date, and a `date` reaching a TIMESTAMP column starts its day.
+
+        Both refusals are about a value that looks convertible and is not: an
+        aware `datetime` carries an offset the column cannot store, and a string
+        is the SQL literal grammar rather than the builder's.
+        """
+        d = date(2024, 2, 29)
+        ts = datetime(2024, 2, 29, 13, 45, 7, 250_000)
+        epoch_days = (d - date(1970, 1, 1)).days
+        schema = Schema([ColumnDef("id", TypeCode.I64, primary_key=True),
+                         ColumnDef("d", TypeCode.DATE),
+                         ColumnDef("ts", TypeCode.TIMESTAMP)])
+
+        batch = ZSetBatch(schema)
+        batch.append(id=1, d=d, ts=ts)
+        batch.append(id=2, d=epoch_days, ts=epoch_days * 86_400_000_000)
+        batch.append(id=3, d=ts, ts=d)
+        assert batch.columns[1] == [d, d, d]
+        assert batch.columns[2] == [ts, datetime(2024, 2, 29), datetime(2024, 2, 29)]
+
+        with pytest.raises(ValueError, match="naive"):
+            ZSetBatch(schema).append(id=9, d=d, ts=datetime.now().astimezone())
+        with pytest.raises(TypeError):
+            ZSetBatch(schema).append(id=9, d="2024-02-29", ts=ts)

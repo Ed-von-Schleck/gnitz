@@ -152,3 +152,73 @@ def test_a_set_right_hand_side_of_the_wrong_class_is_refused(client, schema_name
     client.execute_sql("INSERT INTO t VALUES (1, 0, 1.5, 'abc')", schema_name=sn)
     with pytest.raises(gnitz.GnitzError, match=why):
         client.execute_sql(stmt, schema_name=sn)
+
+
+# ---------------------------------------------------------------------------
+# A literal with no register slot, in the lazily-interpreted mutate positions
+# ---------------------------------------------------------------------------
+
+_U64_MAX = 18446744073709551615
+
+
+@pytest.fixture
+def wide(client, schema_name):
+    """`t (pk, v)` both `BIGINT UNSIGNED`, holding one row — so a statement that
+    should reject has a row it would otherwise have touched."""
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT UNSIGNED NOT NULL PRIMARY KEY, "
+        "v BIGINT UNSIGNED NOT NULL)", schema_name=schema_name)
+    client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=schema_name)
+    return schema_name
+
+
+def test_a_wide_literal_the_register_file_cannot_hold_is_refused_not_ignored(
+        client, wide):
+    """An integer past `i64` has no register slot, so a residual naming one
+    cannot be compiled at all. The failure to avoid is silence: a predicate that
+    quietly matched nothing would report a successful zero-row DELETE, which is
+    indistinguishable from a row that legitimately was not there.
+
+    The row must survive, so the refusal is not a partial apply either.
+    """
+    with pytest.raises(gnitz.GnitzError):
+        client.execute_sql(f"DELETE FROM t WHERE v = {_U64_MAX}", schema_name=wide)
+    assert bag(scanned(client, wide, "t"), "pk", "v") == {(1, 100): 1}
+
+
+def test_a_set_right_hand_side_reaches_the_target_columns_whole_domain(client, wide):
+    """SET parses its literal against the *target's* type rather than against the
+    register file, so the full unsigned range is writable — the same seam the key
+    codec uses, which is what makes the write and the seek accept one set of
+    values."""
+    client.execute_sql(f"UPDATE t SET v = {_U64_MAX}", schema_name=wide)
+    assert bag(scanned(client, wide, "t"), "pk", "v") == {(1, _U64_MAX): 1}
+
+
+@pytest.mark.parametrize("stmt", [
+    # The WHERE matches nothing and the ON CONFLICT target does not conflict, so
+    # in both the guard is the only thing that can fire.
+    f"UPDATE t SET v = {_U64_MAX + 1} WHERE pk = 999",
+    "UPDATE t SET v = -1 WHERE pk = 999",
+    f"INSERT INTO t VALUES (2, 1) ON CONFLICT (pk) DO UPDATE SET v = {_U64_MAX + 1}",
+], ids=["update-over", "update-under", "on-conflict-over"])
+def test_an_out_of_range_assignment_is_refused_even_when_it_would_touch_no_row(
+        client, wide, stmt):
+    """The value is checked at plan time, not when a row reaches it. Deferring it
+    would make the statement succeed silently whenever the match set is empty,
+    and wrap two's-complement whenever it is not — so an empty match is exactly
+    the case that has to reject."""
+    with pytest.raises(gnitz.GnitzError):
+        client.execute_sql(stmt, schema_name=wide)
+    # Nothing was written: no wrapped value, and no row inserted by the upsert.
+    assert bag(scanned(client, wide, "t"), "pk", "v") == {(1, 100): 1}
+
+
+def test_the_guard_admits_the_in_range_wide_literal_on_the_same_surface(client, wide):
+    """The rejection above is about the range, not about the width: the same
+    upsert with a literal at the top of the target's domain is served, and its
+    DO UPDATE applies when the key does conflict."""
+    client.execute_sql(
+        f"INSERT INTO t VALUES (1, 1) ON CONFLICT (pk) DO UPDATE SET v = {_U64_MAX}",
+        schema_name=wide)
+    assert bag(scanned(client, wide, "t"), "pk", "v") == {(1, _U64_MAX): 1}

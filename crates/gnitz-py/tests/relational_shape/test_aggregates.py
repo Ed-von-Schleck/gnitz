@@ -1380,3 +1380,60 @@ def test_a_distinct_aggregate_on_an_adhoc_read_is_rejected(client, schema_name):
     with pytest.raises(Exception, match="CREATE VIEW body only"):
         client.execute_sql(
             "SELECT k, COUNT(DISTINCT u) AS n FROM ev GROUP BY k", schema_name=sn)
+
+
+def test_a_group_by_over_a_compound_key_emits_it_in_source_order_at_any_arity(
+        client, schema_name):
+    """The grouping *list* is not the output key order: a reduce over the whole
+    source key emits it in the key's own declared order, whatever order the
+    GROUP BY named its columns. Values are chosen so a transposed mapping is
+    observable — `ka` must carry `a`'s values, not `b`'s.
+
+    HAVING binds by source name against the same output, so a filter on the
+    leading column and one on the trailing column select different groups; a
+    mis-binding would silently answer with the other column's verdict. The
+    four-column case is the widest key a reduce can carry, and drives the
+    non-linear aggregates' value index at that width.
+    """
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t2 (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL, "
+        "v BIGINT NOT NULL, PRIMARY KEY (a, b))", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW perm AS SELECT a AS ka, b AS kb, SUM(v) AS s FROM t2 GROUP BY b, a",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW hav AS SELECT a AS ka, b AS kb, SUM(v) AS s FROM t2 "
+        "GROUP BY a, b HAVING a > 1", schema_name=sn)
+    _, ps = client.resolve_table(sn, "perm")
+    assert ps.pk_indices == [0, 1], "a permuted grouping list keeps source-order key"
+
+    client.execute_sql("INSERT INTO t2 VALUES (1, 7, 100), (2, 8, 200), (3, 1, 300)",
+                       schema_name=sn)
+    assert bag(scanned(client, sn, "perm"), "ka", "kb", "s") == {
+        (1, 7, 100): 1, (2, 8, 200): 1, (3, 1, 300): 1}
+    # `a > 1` keeps (2,8) and (3,1); a `b > 1` mis-binding would keep (1,7) and
+    # (2,8) instead — a different pair, not a different count.
+    assert bag(scanned(client, sn, "hav"), "ka", "kb", "s") == {
+        (2, 8, 200): 1, (3, 1, 300): 1}
+
+    client.execute_sql(
+        "CREATE TABLE t4 (a INT UNSIGNED NOT NULL, b INT UNSIGNED NOT NULL, "
+        "c INT UNSIGNED NOT NULL, d INT UNSIGNED NOT NULL, v BIGINT NOT NULL, "
+        "PRIMARY KEY (a, b, c, d))", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW g4 AS SELECT a, b, c, d, COUNT(*) AS n, MIN(v) AS lo, MAX(v) AS hi "
+        "FROM t4 GROUP BY a, b, c, d", schema_name=sn)
+    quads = [(1, 1, 1, 1, 10), (1, 1, 1, 2, 20), (1, 2, 3, 4, 30), (2, 1, 1, 1, 40)]
+    client.execute_sql(
+        "INSERT INTO t4 VALUES " + ", ".join(str(q) for q in quads), schema_name=sn)
+
+    cols = ("a", "b", "c", "d", "n", "lo", "hi")
+    assert bag(scanned(client, sn, "g4"), *cols) == \
+        {(a, b, c, d, 1, v, v): 1 for a, b, c, d, v in quads}
+    # Retracting a singleton group's only row retracts its extremes with it,
+    # rather than leaving the value index holding a group with no rows.
+    client.execute_sql("DELETE FROM t4 WHERE a = 1 AND b = 1 AND c = 1 AND d = 2",
+                       schema_name=sn)
+    assert bag(scanned(client, sn, "g4"), *cols) == \
+        {(a, b, c, d, 1, v, v): 1 for a, b, c, d, v in quads if (a, b, c, d) != (1, 1, 1, 2)}

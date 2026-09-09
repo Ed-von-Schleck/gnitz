@@ -207,3 +207,45 @@ def test_a_wide_literal_on_an_indexed_pk_column_is_servable(client, pk_indexed):
     q = f"SELECT * FROM t WHERE b = {_U64_MAX}"
     assert access(client, sn, q) == "access: index range on (b) — exact walk, never traded"
     assert bag(rows(client, sn, q)) == {(1, _U64_MAX, 100): 1}
+
+
+@pytest.mark.parametrize("pk_ddl,pk_list,keys", [
+    pytest.param("a INT UNSIGNED NOT NULL, b INT UNSIGNED NOT NULL", "(a, b)",
+                 [(1, 1), (1, 2), (3, 4)], id="source-8"),
+    pytest.param("a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL, "
+                 "c BIGINT UNSIGNED NOT NULL", "(a, b, c)",
+                 [(1, 1, 1), (1, 1, 2), (3, 4, 5)], id="source-24"),
+    pytest.param("a UUID NOT NULL", "(a)",
+                 [("00000000-0000-0000-0000-000000000001",),
+                  ("00000000-0000-0000-0000-000000000002",),
+                  ("ffffffff-ffff-ffff-ffff-ffffffffffff",)], id="source-16"),
+])
+def test_an_index_key_grows_with_its_sources_key_and_stays_exact(
+        client, schema_name, pk_ddl, pk_list, keys):
+    """An index row is keyed by the indexed column followed by the whole source
+    key, so the index's own key width is 8 + the source's. A 24-byte source puts
+    it at 32 and a 16-byte one at 24 — both past the width that a single packed
+    compare covers, so the index table itself takes the byte-walk path.
+
+    Two rows share an indexed value and a third does not, so the lookup has to
+    return exactly the sources that carry it: an index key truncated at the
+    narrow width would fold the two sharers into one entry and lose a row.
+    """
+    sn = schema_name
+    cols = ", ".join(pk_list.strip("()").split(", "))
+    client.execute_sql(
+        f"CREATE TABLE src ({pk_ddl}, payload BIGINT NOT NULL, PRIMARY KEY {pk_list})",
+        schema_name=sn)
+    client.execute_sql("CREATE INDEX ON src (payload)", schema_name=sn)
+    # The first two rows share payload 100; the third carries 200.
+    payloads = [100, 100, 200]
+    client.execute_sql(
+        "INSERT INTO src VALUES " + ", ".join(
+            "(" + ", ".join(repr(x) if isinstance(x, str) else str(x) for x in k)
+            + f", {p})" for k, p in zip(keys, payloads)),
+        schema_name=sn)
+
+    assert bag(rows(client, sn, f"SELECT {cols} FROM src WHERE payload = 200")) == \
+        {keys[2]: 1}
+    assert bag(rows(client, sn, f"SELECT {cols} FROM src WHERE payload = 100")) == \
+        {keys[0]: 1, keys[1]: 1}
