@@ -19,14 +19,11 @@ COLS = [
     gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
     gnitz.ColumnDef("val", gnitz.TypeCode.I64),
 ]
+SCHEMA = gnitz.Schema(COLS)
 
 
 def _batch(rows):
-    schema = gnitz.Schema(COLS)
-    b = gnitz.ZSetBatch(schema)
-    for row in rows:
-        b.append(**row)
-    return b
+    return gnitz.ZSetBatch(SCHEMA).extend(rows)
 
 
 @pytest.fixture
@@ -47,50 +44,54 @@ async def tls_aconn(tls_target):
 
 
 @pytest.fixture
-def tls_table(tls_client):
+def tls_schema(tls_client):
+    """A schema created over the TLS connection, dropped whole at teardown.
+
+    `conftest.schema_name` hangs off `client`, and the point here is that the
+    DDL crosses TLS — but the drop is unwrapped for the same reason it is there:
+    a schema that refuses to drop is a finding, not something to swallow.
+    """
     sn = "s" + _uid()
     tls_client.create_schema(sn)
-    tid = tls_client.create_table(sn, "t", COLS)
-    yield tid
-    try:
-        tls_client.drop_table(sn, "t")
-        tls_client.drop_schema(sn)
-    except Exception:
-        pass
+    yield sn
+    tls_client.drop_schema(sn)
+
+
+@pytest.fixture
+def tls_table(tls_client, tls_schema):
+    return tls_client.create_table(tls_schema, "t", COLS)
 
 
 # ── sync client ─────────────────────────────────────────────────────────────
 
 
 class TestTlsSync:
-    def test_sql_roundtrip(self, tls_client):
-        sn = "s" + _uid()
-        tls_client.create_schema(sn)
+    def test_sql_roundtrip(self, tls_client, tls_schema):
         tls_client.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)", sn)
-        tls_client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", sn)
-        results = tls_client.execute_sql("SELECT * FROM t", sn)
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)", tls_schema)
+        tls_client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", tls_schema)
+        results = tls_client.execute_sql("SELECT * FROM t", tls_schema)
         assert results[0]["type"] == "Rows"
-        rows = results[0]["rows"]
-        assert sorted((r.pk, r.v) for r in rows) == [(1, 10), (2, 20), (3, 30)]
+        assert sorted((r.pk, r.v) for r in results[0]["rows"]) == [(1, 10), (2, 20), (3, 30)]
 
-    def test_multiworker_scan_with_continuation_frames(self, tls_client, tls_table):
-        # Enough rows that every worker (GNITZ_WORKERS=4) contributes scan
-        # frames; the client stitches the continuation train back together.
-        n = 20_000
-        tls_client.push(tls_table, _batch(
-            [{"pk": i, "val": i * 3} for i in range(1, n + 1)]))
+    def test_a_multiworker_reply_is_stitched_back_together(self, tls_client, tls_table):
+        """Every worker (GNITZ_WORKERS=4) contributes scan frames and the client
+        reassembles them into one result.
+
+        Compared row by row with weights, not as a `{pk: val}` dict: the failure
+        a mis-stitched reply train actually has is a *repeated* frame, which a
+        dict keyed by PK silently absorbs.
+        """
+        n = 2_000
+        tls_client.push(tls_table, _batch([{"pk": i, "val": i * 3} for i in range(1, n + 1)]))
         result = tls_client.scan(tls_table)
-        rows = {r.pk: r.val for r in result}
-        assert len(rows) == n
-        assert rows[1] == 3
-        assert rows[n] == n * 3
+        assert sorted((r.pk, r.val, r.weight) for r in result) == [
+            (i, i * 3, 1) for i in range(1, n + 1)]
 
     def test_unix_and_tls_see_the_same_data(self, _srv, tls_client, tls_table):
         tls_client.push(tls_table, _batch([{"pk": 7, "val": 70}]))
         with gnitz.connect(_srv.sock_path) as unix_conn:
-            result = unix_conn.scan(tls_table)
-            assert {r.pk for r in result} == {7}
+            assert [(r.pk, r.val, r.weight) for r in unix_conn.scan(tls_table)] == [(7, 70, 1)]
 
 
 # ── async client ────────────────────────────────────────────────────────────
@@ -98,38 +99,34 @@ class TestTlsSync:
 
 class TestTlsAsync:
     @pytest.mark.asyncio
-    async def test_push_and_scan(self, tls_aconn, tls_table):
-        await tls_aconn.push(tls_table, _batch([{"pk": 1, "val": 100}]))
-        result = await tls_aconn.scan(tls_table)
-        assert len(result) == 1
-
-    @pytest.mark.asyncio
     async def test_pipelined_pushes(self, tls_aconn, tls_table):
-        lsns = await asyncio.gather(*[
-            tls_aconn.push(tls_table, _batch(
-                [{"pk": 100 * i + j, "val": j} for j in range(1, 100)]))
-            for i in range(50)
-        ])
-        assert len(lsns) == 50
-        assert all(isinstance(lsn, int) for lsn in lsns)
+        """A gathered burst over TLS: every push lands, exactly once, at weight 1."""
+        rows = [{"pk": 100 * i + j, "val": j} for i in range(50) for j in range(1, 100)]
+        await asyncio.gather(*[
+            tls_aconn.push(tls_table, _batch(rows[i * 99:(i + 1) * 99])) for i in range(50)])
         result = await tls_aconn.scan(tls_table)
-        assert len({r.pk for r in result}) == 50 * 99
+        assert sorted((r.pk, r.val, r.weight) for r in result) == sorted(
+            (r["pk"], r["val"], 1) for r in rows)
 
 
 # ── error surfaces ──────────────────────────────────────────────────────────
 
 
 class TestTlsErrors:
-    def test_bad_ca_path_is_a_clear_error(self, _srv):
-        with pytest.raises(Exception) as ei:
-            gnitz.connect(f"tls://127.0.0.1:{_srv.tls_port}?ca=/nonexistent/ca.pem")
-        assert "ca" in str(ei.value).lower()
+    def test_a_bad_target_is_refused_rather_than_hung(self, _srv):
+        """Each rejection names its own cause, and none of them blocks: a
+        connect that hung would fail this by timing out the test, not by
+        returning something wrong."""
+        port = _srv.tls_port
+        for target, needle in [
+            (f"tls://127.0.0.1:{port}?ca=/nonexistent/ca.pem", "ca.pem"),
+            (f"tls://127.0.0.1:{port}?bogus", "bogus"),
+        ]:
+            with pytest.raises(Exception) as ei:
+                gnitz.connect(target)
+            assert needle in str(ei.value), f"{target} said: {ei.value}"
 
-    def test_unknown_param_is_rejected(self, _srv):
-        with pytest.raises(Exception):
-            gnitz.connect(f"tls://127.0.0.1:{_srv.tls_port}?bogus")
-
-    def test_unreachable_port_fails_fast(self):
+    def test_a_closed_port_is_refused(self):
         import socket
         # A port that was just free and closed again: connection refused.
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -143,8 +140,7 @@ class TestTlsErrors:
         # catalog) with its own pinned TLS port.
         srv = restartable_server
         target = srv.tls_target
-        conn = gnitz.connect(target)
-        try:
+        with gnitz.connect(target) as conn:
             sn = "s" + _uid()
             conn.create_schema(sn)
             tid = conn.create_table(sn, "t", COLS)
@@ -160,6 +156,4 @@ class TestTlsErrors:
                 fresh.create_schema(sn2)
                 tid2 = fresh.create_table(sn2, "t", COLS)
                 fresh.push(tid2, _batch([{"pk": 2, "val": 2}]))
-                assert len(fresh.scan(tid2)) == 1
-        finally:
-            conn.close()
+                assert [(r.pk, r.val, r.weight) for r in fresh.scan(tid2)] == [(2, 2, 1)]

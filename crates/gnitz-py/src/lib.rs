@@ -175,10 +175,16 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // a re-typed copy), as are the tables behind `type_codes()` and
     // `circuit_opcodes()`.
     // Only the ids something addresses a relation by are exported.
+    m.add("SCHEMA_TAB", gnitz_wire::SCHEMA_TAB)?;
     m.add("TABLE_TAB", gnitz_wire::TABLE_TAB)?;
     m.add("COL_TAB", gnitz_wire::COL_TAB)?;
     m.add("IDX_TAB", gnitz_wire::IDX_TAB)?;
     m.add("FIRST_USER_TABLE_ID", gnitz_wire::FIRST_USER_TABLE_ID)?;
+    // Whether *this extension* keeps its `#[cfg(debug_assertions)]` fault seams.
+    // The seams a mirroring test arms live in gnitz-mirror and gnitz-store, which
+    // are linked here and not into the server, so the server's build says nothing
+    // about them: `e2e-release` pairs a release server with a debug extension.
+    m.add("debug_assertions", cfg!(debug_assertions))?;
     m.add_class::<PyDeltaReply>()?;
     m.add_function(wrap_pyfunction!(delta_reply_schema, m)?)?;
     m.add_function(wrap_pyfunction!(unpack_pk_cols, m)?)?;

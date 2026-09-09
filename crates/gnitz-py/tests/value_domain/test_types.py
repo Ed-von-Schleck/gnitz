@@ -9,6 +9,7 @@ Covers:
 """
 
 import math
+import uuid
 import pytest
 import gnitz
 from _uid import uid as _uid
@@ -983,6 +984,26 @@ class TestUUID:
     UUID_B = '6ba7b810-9dad-11d1-80b4-00c04fd430c8'
     UUID_V7_EARLY = '01935000-0000-7000-8000-000000000001'
     UUID_V7_LATE  = '01935001-0000-7000-8000-000000000001'
+
+    # --- binding value coercion on the key ---
+
+    def test_seek_accepts_a_uuid_object(self, client):
+        """A `uuid.UUID` reaches `seek` through the same value coercion `append`
+        uses, so a key that can be written can also look the row up."""
+        sn = "s" + _uid()
+        client.create_schema(sn)
+        try:
+            uid_val = uuid.uuid4()
+            cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.UUID, primary_key=True),
+                    gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
+            tid = client.create_table(sn, "t", cols)
+            batch = gnitz.ZSetBatch(gnitz.Schema(cols))
+            batch.append(pk=uid_val, val=42)
+            client.push(tid, batch)
+            result = client.seek(tid, uid_val)
+            assert [(r.pk, r.val, r.weight) for r in result] == [(str(uid_val), 42, 1)]
+        finally:
+            _cleanup(client, sn, "t")
 
     # --- TypeCode constant ---
 

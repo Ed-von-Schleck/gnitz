@@ -85,8 +85,11 @@ def _churn(client, sn, lo, hi):
     )
     span = hi - lo + 1
     client.execute_sql(f"UPDATE t SET v = v + 1 WHERE id >= {lo} AND id < {lo + span // 3}", schema_name=sn)
-    client.execute_sql(f"DELETE FROM t WHERE id > {hi - span // 4}", schema_name=sn)
-    client.execute_sql(f"DELETE FROM u WHERE id > {hi - span // 5}", schema_name=sn)
+    # `u` loses the longer tail, so `t.id` is never a subset of `u.tid` and the
+    # SETOP body (`t EXCEPT u`) holds rows. The other way round it is empty, and
+    # a copy-versus-view comparison over it then agrees about nothing.
+    client.execute_sql(f"DELETE FROM t WHERE id > {hi - span // 5}", schema_name=sn)
+    client.execute_sql(f"DELETE FROM u WHERE id > {hi - span // 4}", schema_name=sn)
 
 
 # The delta store is in neither checkpoint round and nothing flushes it, so it

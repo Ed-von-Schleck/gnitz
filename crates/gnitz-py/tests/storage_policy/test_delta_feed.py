@@ -74,6 +74,7 @@ class Subscriber:
         """
         live = self.scan()
         self.drain()
+        assert live or self.copy, f"{what}: both sides are empty, so they agree about nothing"
         assert self.copy == live, what
 
 

@@ -24,7 +24,6 @@ from _feedviews import (
     _base_tables, _churn, _flood, _key, _mk_feed, _rows, _uid, _zset,
 )
 import _mirrorproc
-from _serverproc import is_debug_build
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -71,21 +70,6 @@ def _quiesce(client, mirror, sn, view="f"):
     """
     client.execute_sql(f"SELECT COUNT(*) AS n FROM {view}", schema_name=sn)
     return mirror.poll()
-
-
-def _t_rows_outside_u(client, sn, lo=9001, hi=9020):
-    """Rows in `t` whose ids `u` never carries.
-
-    `_churn` deletes a longer tail from `t` than from `u`, so `t.id` ends up a
-    subset of `u.tid` and the `EXCEPT` body is empty — which the weight-exact
-    comparison refuses as a pass that agrees about nothing. These rows are what
-    give it something to compare; the other three bodies are unaffected by them
-    except through their own predicates.
-    """
-    client.execute_sql(
-        "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 3}, 'solo-{i:0>20}')" for i in range(lo, hi + 1)),
-        schema_name=sn,
-    )
 
 
 # One read of each shape per body, in the body's own columns. The bodies differ
@@ -149,7 +133,6 @@ def test_a_mirrored_read_equals_the_server_read(client, mirror, kind):
     vid = mirror.mirror_view(sn, "f").view_id
 
     _churn(client, sn, 1, 200)
-    _t_rows_outside_u(client, sn)
     _quiesce(client, mirror, sn)
 
     for q in _READS[kind]["plain"]:
@@ -268,52 +251,39 @@ def test_every_refusal_names_why(client, mirror):
         mirror.mirror_view("s" + _uid(), "f")
 
 
-def test_a_storage_fault_poisons_the_copy_and_the_process_lives(client, server, mirror_dir):
-    """The host process surviving a storage fault is the whole reason the crate
-    is safe to link into someone's application.
+@pytest.mark.parametrize("case,env,why", [
+    ("poison", {"GNITZ_INJECT_INGEST_APPLY_ERROR": "store"},
+     "a storage fault during the bootstrap ingest, which leaves no cursor"),
+    ("panic", {"GNITZ_INJECT_MIRROR_INGEST_PANIC": "1"},
+     "a panic inside the guarded apply of a poll, which leaves the copy gated in "
+     "— cursor and registration both stand — so the reads it refuses are exactly "
+     "the ones it would otherwise have answered off a copy silently missing rows, "
+     "and the exception class a poison raised through the SQL layer must arrive as"),
+], ids=["storage-fault", "panicking-apply"])
+def test_a_fault_poisons_the_copy_and_the_process_lives(client, server, mirror_dir, case, env, why):
+    """The host process surviving a fault is the whole reason the crate is safe
+    to link into someone's application.
 
     In a fresh interpreter because a fault seam is a per-process latch that would
-    contaminate every sibling test. **The seam variable goes to the mirror child
-    and nowhere else**: a server that inherited it would fail its own ingest and
-    drop the connection, and the test would then report a protocol error instead
-    of a poisoning.
+    contaminate every sibling test, and because a Rust panic crossing pyo3 raises
+    a `BaseException` the suite should not have to step around. **The seam
+    variable goes to the mirror child and nowhere else**: a server that inherited
+    it would fail its own ingest and drop the connection, and the test would then
+    report a protocol error instead of a poisoning.
+
+    Gated on the *extension's* build, not the server's: these seams live in
+    gnitz-mirror and gnitz-store, which the extension links and the server does
+    not — `e2e-release` pairs a release server with a debug extension, and
+    reading the server's build there would skip a test whose seam is armed.
     """
-    if not is_debug_build():
-        pytest.skip("the ingest fault seam requires a debug build")
+    if not gnitz.debug_assertions:
+        pytest.skip(f"{why} — requires a debug extension")
     sn = "s" + _uid()
     _fed_view(client, sn, LINEAR)
     _churn(client, sn, 1, 40)
     client.execute_sql("SELECT COUNT(*) AS n FROM f", schema_name=sn)
 
-    _mirrorproc.run(
-        "poison", mirror_dir, server, sn, env={"GNITZ_INJECT_INGEST_APPLY_ERROR": "store"}
-    )
-
-
-def test_a_panicking_apply_poisons_the_copy_and_refuses_its_reads(client, server, mirror_dir):
-    """The panic guard, and the exception class a poison raised **through the SQL
-    layer** must arrive as.
-
-    A poll that panics leaves the copy gated in — cursor and registration both
-    stand — so the reads it refuses are exactly the ones it would otherwise have
-    answered off a copy that is silently missing rows. Reached only here: the
-    storage-fault case above poisons during a bootstrap, which leaves no cursor
-    and so no read to refuse.
-
-    In a fresh interpreter because the seam is a per-process latch, and because a
-    Rust panic crossing pyo3 raises a `BaseException` the suite should not have
-    to step around.
-    """
-    if not is_debug_build():
-        pytest.skip("the ingest panic seam requires a debug build")
-    sn = "s" + _uid()
-    _fed_view(client, sn, LINEAR)
-    _churn(client, sn, 1, 40)
-    client.execute_sql("SELECT COUNT(*) AS n FROM f", schema_name=sn)
-
-    _mirrorproc.run(
-        "panic", mirror_dir, server, sn, env={"GNITZ_INJECT_MIRROR_INGEST_PANIC": "1"}
-    )
+    _mirrorproc.run(case, mirror_dir, server, sn, env=env)
 
 
 # ── P5 · the poll report ─────────────────────────────────────────────────────
@@ -337,8 +307,7 @@ def test_one_poll_reports_every_view(client, mirror):
         ids[name] = r.view_id
 
     _churn(client, sn, 1, 60)
-    client.execute_sql("SELECT COUNT(*) AS n FROM f0", schema_name=sn)
-    first = mirror.poll()
+    first = _quiesce(client, mirror, sn, "f0")
     assert {r.view_id for r in first} == set(ids.values()), "one poll advances every registration"
     assert not any(r.reseeded for r in first), "an ordinary advance is not a reseed"
     assert all(r.error is None for r in first), "nothing failed, so nothing carries a message"
@@ -394,9 +363,7 @@ def test_one_poll_mixes_a_moved_view_with_idle_ones(client, mirror):
         "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 3}, 'late-{i:0>20}')" for i in range(9001, 9040)),
         schema_name=sn,
     )
-    client.execute_sql("SELECT COUNT(*) AS n FROM f", schema_name=sn)
-
-    report = {r.view_id: r for r in mirror.poll()}
+    report = {r.view_id: r for r in _quiesce(client, mirror, sn)}
     assert set(report) == set(before), "one poll reports every registration, moved or not"
 
     # The claim this test exists for: each report carries its *own* view's tag.
@@ -433,9 +400,7 @@ def test_a_dead_view_fails_its_own_entry_and_stops_nothing_else(client, mirror):
 
     client.execute_sql("DROP VIEW g", schema_name=sn)
     _churn(client, sn, 41, 80)
-    client.execute_sql("SELECT COUNT(*) AS n FROM f", schema_name=sn)
-
-    report = {r.view_id: r for r in mirror.poll()}
+    report = {r.view_id: r for r in _quiesce(client, mirror, sn)}
     assert report[dead].error is not None, "the dropped view carries its own failure"
     assert report[dead].reseeded is False, "a failed view did not reseed"
     assert report[alive].error is None and report[alive].cursor is not None, (
@@ -467,8 +432,7 @@ def test_a_reconnect_after_a_restart_reseeds_and_converges(own_server, mirror_on
     m.reconnect(own_server.sock_path)
     with gnitz.connect(own_server.sock_path) as client:
         _churn(client, sn, 61, 120)
-        client.execute_sql("SELECT COUNT(*) AS n FROM f", schema_name=sn)
-        assert any(r.view_id == vid and r.reseeded for r in m.poll()), (
+        assert any(r.view_id == vid and r.reseeded for r in _quiesce(client, m, sn)), (
             "a tag that stopped continuing is a reseed"
         )
         _quiesce(client, m, sn)
@@ -514,40 +478,43 @@ def test_an_expired_cursor_recovers_inside_the_poll(sweeping_server, mirror_on, 
     sn = "s" + _uid()
     with gnitz.connect(sweeping_server.sock_path) as client:
         _fed_view(client, sn, LINEAR, feed="1 KB")
-        _flood(client, sn, 1, 2_000)
+        _churn(client, sn, 1, 60)
         m = mirror_on(mirror_dir, sweeping_server.sock_path)
         vid = m.mirror_view(sn, "f").view_id
         _quiesce(client, m, sn)
 
-        # Push the worker's retention floor past the mirror's cursor.
-        _flood(client, sn, 2_001, 40_000)
+        # Push the worker's retention floor past the mirror's cursor. The floor
+        # is crossed an order of magnitude below this; the margin is what keeps
+        # it a reseed test rather than a threshold test.
+        _flood(client, sn, 61, 5_000)
         client.execute_sql("SELECT COUNT(*) AS n FROM f", schema_name=sn)
         assert any(r.view_id == vid and r.reseeded for r in m.poll()), (
             "an expired cursor is recovered by reseeding"
         )
 
         _quiesce(client, m, sn)
-        q = "SELECT id, v FROM f WHERE id > 39000"
+        q = "SELECT id, v FROM f WHERE id > 4000"
         _same_zset(q, _local(m, sn, vid, q), _rows(client.execute_sql(q, schema_name=sn)))
 
 
 # ── P8 · a host crash ────────────────────────────────────────────────────────
 
 
-def test_a_killed_host_reopens_at_its_last_checkpoint(own_server, mirror_on, mirror_dir):
+def test_a_killed_host_reopens_at_its_last_checkpoint(client, server, mirror_on, mirror_dir):
     """`SIGKILL` means no destructor and so no exit checkpoint.
 
     The reopen must land on the last checkpoint and converge from there without
     doubling a weight — which is what a cursor file written out of step with the
     copies produces, and it leaves the row set identical.
-    """
-    own_server.start()
-    sn = "s" + _uid()
-    with gnitz.connect(own_server.sock_path) as client:
-        _fed_view(client, sn, LINEAR)
-        _churn(client, sn, 1, 60)
 
-    child = _mirrorproc.spawn("crash", mirror_dir, own_server.sock_path, sn)
+    The signal goes to the mirror child, not the server, so the session server
+    serves: nothing here kills, stops or restarts one.
+    """
+    sn = "s" + _uid()
+    _fed_view(client, sn, LINEAR)
+    _churn(client, sn, 1, 60)
+
+    child = _mirrorproc.spawn("crash", mirror_dir, server, sn)
     try:
         _mirrorproc.wait_for_ready(child)
         os.kill(child.pid, signal.SIGKILL)
@@ -556,12 +523,11 @@ def test_a_killed_host_reopens_at_its_last_checkpoint(own_server, mirror_on, mir
         child.stdout.close()
         child.stderr.close()
 
-    with gnitz.connect(own_server.sock_path) as client:
-        m = mirror_on(mirror_dir, own_server.sock_path)
-        vid = m.mirror_view(sn, "f").view_id
-        _quiesce(client, m, sn)
-        for q in ("SELECT * FROM f", "SELECT COUNT(*) AS n, SUM(v) AS total FROM f"):
-            _same_zset(q, _local(m, sn, vid, q), _rows(client.execute_sql(q, schema_name=sn)))
+    m = mirror_on(mirror_dir, server)
+    vid = m.mirror_view(sn, "f").view_id
+    _quiesce(client, m, sn)
+    for q in ("SELECT * FROM f", "SELECT COUNT(*) AS n, SUM(v) AS total FROM f"):
+        _same_zset(q, _local(m, sn, vid, q), _rows(client.execute_sql(q, schema_name=sn)))
 
 
 # ── P9 · the mirror does not disturb the process ─────────────────────────────
@@ -582,13 +548,14 @@ def test_the_mirrors_own_connection_serves_every_other_statement(client, mirror)
     mirror.execute_sql("COMMIT", schema_name=sn)
     mirror.execute_sql("UPDATE k SET v = 99 WHERE id = 1", schema_name=sn)
 
-    seen = _zset(_rows(client.execute_sql("SELECT * FROM k", schema_name=sn)))
-    assert len(seen) == 3
-    _same_zset(
-        "written through the mirror's connection",
-        _rows(mirror.execute_sql("SELECT * FROM k", schema_name=sn)),
-        _rows(client.execute_sql("SELECT * FROM k", schema_name=sn)),
-    )
+    # Against the literal Z-set, not against the server: `k` is a table, which
+    # the copy does not hold, so a mirror-versus-server comparison here would be
+    # the server compared with itself and would pass however the writes landed.
+    assert _zset(_rows(client.execute_sql("SELECT * FROM k", schema_name=sn))) == {
+        (("id", 1), ("v", 99)): 1,
+        (("id", 2), ("v", 20)): 1,
+        (("id", 3), ("v", 30)): 1,
+    }
 
 
 @pytest.mark.asyncio

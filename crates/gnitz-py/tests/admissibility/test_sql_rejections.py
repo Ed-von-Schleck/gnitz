@@ -206,3 +206,16 @@ def test_replicated_and_cluster_by_are_mutually_exclusive(client, schema_name):
             "CREATE TABLE bad (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL) "
             "WITH (replicated = true) CLUSTER BY id",
             schema_name=schema_name)
+
+
+def test_a_string_literal_is_refused_by_a_blob_column(client, schema_name):
+    """`sql_type_to_typecode` names no BLOB, but the driver creates BLOB columns
+    freely and SQL can then INSERT into them — so the INSERT literal path must
+    refuse text for a column that takes bytes, rather than writing the string's
+    own bytes into a column whose values are not text."""
+    client.create_table(schema_name, "t", [
+        gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
+        gnitz.ColumnDef("b", gnitz.TypeCode.BLOB),
+    ])
+    with pytest.raises(gnitz.GnitzError, match="string literal for non-string column"):
+        client.execute_sql("INSERT INTO t (pk, b) VALUES (1, 'x')", schema_name=schema_name)

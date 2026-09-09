@@ -179,7 +179,7 @@ class _Server:
         # Readiness = socket file + TLS endpoint published (the endpoint file
         # is rename-published after the TCP bind, just before "GnitzDB ready").
         tls_endpoint = os.path.join(data_dir, "tls_endpoint")
-        for _ in range(100):
+        for _ in range(10_000):
             if os.path.exists(self.sock_path) and os.path.exists(tls_endpoint):
                 break
             # Fail fast on a dead process (e.g. the pre-allocated port was
@@ -193,7 +193,7 @@ class _Server:
                     f"Server exited during startup (rc={self.proc.returncode}).\n"
                     f"stderr tail:\n{tail}"
                 )
-            time.sleep(0.1)
+            time.sleep(0.001)
         else:
             self.proc.kill()
             self.proc.communicate()
@@ -454,13 +454,6 @@ def tiny_ddl_chunk_server(seamed_server):
     alike. At the 65 536-row default a test table is one chunk and pins nothing
     about chunk boundaries."""
     return seamed_server({"GNITZ_SCAN_CHUNK_ROWS": "3"})
-
-
-@pytest.fixture
-def two_worker_server(seamed_server):
-    """Server pinned to exactly 2 workers, for cases whose expected values depend
-    on the worker count."""
-    return seamed_server({"GNITZ_WORKERS": "2"})
 
 
 @pytest.fixture

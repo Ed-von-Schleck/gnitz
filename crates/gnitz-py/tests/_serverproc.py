@@ -28,6 +28,11 @@ import signal
 import subprocess
 import time
 
+# Boot-to-socket is ~36 ms, so a 50 ms poll spends most of a spawn asleep past
+# the event it is waiting for. Every loop using this is bounded by its own
+# deadline, so the interval buys nothing but granularity.
+_READY_POLL_S = 0.002
+
 import pytest
 
 from _paths import REPO_ROOT
@@ -199,7 +204,7 @@ class ServerProc:
                     f"server exited rc={self.proc.returncode} before binding "
                     f"{self.sock_path}\n{self.log_tail()}"
                 )
-            time.sleep(0.05)
+            time.sleep(_READY_POLL_S)
         self.stop()
         raise RuntimeError(f"server did not start (no socket)\n{self.log_tail()}")
 
@@ -217,7 +222,7 @@ class ServerProc:
             if os.path.exists(self.sock_path):
                 self.stop()
                 raise RuntimeError("server became ready; expected a boot crash")
-            time.sleep(0.05)
+            time.sleep(_READY_POLL_S)
         self.stop()
         raise RuntimeError(f"server did not exit within {timeout}s\n{self.log_tail()}")
 
