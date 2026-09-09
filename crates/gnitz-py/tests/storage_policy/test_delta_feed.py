@@ -18,8 +18,9 @@ import pytest
 import gnitz
 from _feedviews import (
     FEED, GROUPBY, JOIN, LINEAR, SETOP,
-    _base_tables, _churn, _flood, _key, _mk_feed, _uid, _zset,
+    _base_tables, _churn, _flood, _mk_feed, _zset,
 )
+from _uid import uid as _uid
 from _serverproc import NUM_WORKERS, ServerProc
 
 

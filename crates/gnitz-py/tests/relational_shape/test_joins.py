@@ -7,18 +7,12 @@ import os
 from collections import Counter
 
 import pytest
+from _serverproc import NEEDS_MULTI
 import gnitz
 import _oracle as oracle
 from _uid import uid as _uid
 
 _NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
-_NEEDS_MULTI = pytest.mark.skipif(
-    _NUM_WORKERS < 2, reason="requires GNITZ_WORKERS >= 2"
-)
-
-
-
-
 def _cleanup(client, sn, tables=None, views=None):
     for name in (views or []):
         try:
@@ -392,7 +386,7 @@ class TestJoins:
         finally:
             _cleanup(client, sn, tables=["orders", "customers"], views=["v"])
 
-    @_NEEDS_MULTI
+    @NEEDS_MULTI
     def test_inner_join_wide_u64_pks_multiworker(self, client):
         """Inner join on BIGINT PK columns distributed across multiple workers.
 
@@ -485,7 +479,7 @@ class TestJoins:
         finally:
             _cleanup(client, sn, tables=["a", "b"], views=["v"])
 
-    @_NEEDS_MULTI
+    @NEEDS_MULTI
     def test_inner_join_composite_key_multiworker(self, client):
         """Composite (k=2) equijoin across multiple workers: the k-wide reindex
         and exchange must co-locate rows that agree on the full (x, y) key. Both
@@ -531,7 +525,7 @@ class TestJoins:
         finally:
             _cleanup(client, sn, tables=["a", "b"], views=["v"])
 
-    @_NEEDS_MULTI
+    @NEEDS_MULTI
     def test_inner_join_cross_width_int_bigint(self, client):
         """Cross-width SAME-SIGN equijoin: INT (I32) key = BIGINT (I64) key. The
         planner promotes the pair to the wider type I64, OPK-encodes both sides'
@@ -596,7 +590,7 @@ class TestJoins:
         finally:
             _cleanup(client, sn, tables=["lt", "rt"], views=["v"])
 
-    @_NEEDS_MULTI
+    @NEEDS_MULTI
     def test_inner_join_cross_width_u32_u64(self, client):
         """Cross-width unsigned equijoin: INT UNSIGNED (U32) = BIGINT UNSIGNED
         (U64), promoted to U64. Exercises large values near the U32 ceiling so
@@ -636,7 +630,7 @@ class TestJoins:
         finally:
             _cleanup(client, sn, tables=["lt", "rt"], views=["v"])
 
-    @_NEEDS_MULTI
+    @NEEDS_MULTI
     def test_inner_join_overlapping_key_cross_width(self, client):
         """Overlapping key `ON a.x = b.p AND a.x = b.q`: the `a` side reindexes
         `[x, x]` into two _join_pk slots. With a cross-width promotion on one slot,
@@ -678,7 +672,7 @@ class TestJoins:
         finally:
             _cleanup(client, sn, tables=["a", "b"], views=["v"])
 
-    @_NEEDS_MULTI
+    @NEEDS_MULTI
     def test_left_join_cross_width_nullable_key(self, client):
         """LEFT JOIN with a NULLABLE cross-width key exercises the sibling-Map path
         (null-key bypass + not-null match side both reindex at the promoted width).

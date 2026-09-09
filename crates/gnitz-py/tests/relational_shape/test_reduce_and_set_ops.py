@@ -5,14 +5,10 @@ what drives the view store's L0 compaction rather than only its first batch.
 """
 
 import os
-import pytest
+from _serverproc import NEEDS_MULTI
 from _uid import uid as _uid
 
 _NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
-_NEEDS_MULTI = pytest.mark.skipif(
-    _NUM_WORKERS < 2, reason="requires GNITZ_WORKERS >= 2"
-)
-
 def _reduce_totals(client, vid):
     """Scan a reduce view -> {group_val: agg_val} over the visible [grp, agg] layout."""
     return {r[0]: r[1] for r in client.scan(vid)}
@@ -53,7 +49,7 @@ def _drop_all(client, sn, tables=(), views=(), indices=()):
 
 
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_workers_reduce_sum(client):
     """SQL SUM GROUP BY across partitions produces correct per-group sums."""
     sn = "w" + _uid()
@@ -86,7 +82,7 @@ def test_workers_reduce_sum(client):
     finally:
         _drop_all(client, sn, views=["v"], tables=["t"])
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_workers_reduce_incremental(client):
     """7 ticks of inserts/deletes through reduce SUM view: exercises view store L0 compaction."""
     sn = "w" + _uid()
@@ -135,7 +131,7 @@ def test_workers_reduce_incremental(client):
     finally:
         _drop_all(client, sn, views=["v"], tables=["t"])
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_workers_distinct_view(client):
     """SELECT DISTINCT view with GNITZ_WORKERS=4."""
     sn = "s" + _uid()
@@ -164,7 +160,7 @@ def test_workers_distinct_view(client):
     finally:
         _drop_all(client, sn, tables=["t"], views=["v"])
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_workers_except_multiworker(client):
     """EXCEPT (anti-join) with multi-worker distribution."""
     sn = "s" + _uid()

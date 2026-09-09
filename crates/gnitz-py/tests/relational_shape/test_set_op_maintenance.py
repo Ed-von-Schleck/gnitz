@@ -9,17 +9,10 @@ value after the update, not over the first tick.
 
 import os
 
-import pytest
+from _serverproc import NEEDS_MULTI
 from _uid import uid as _uid
 
 _NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
-_NEEDS_MULTI = pytest.mark.skipif(
-    _NUM_WORKERS < 2, reason="requires GNITZ_WORKERS >= 2"
-)
-
-
-
-
 def _drop_all(client, sn, tables=(), views=()):
     for v in views:
         try:
@@ -43,7 +36,7 @@ def _scan_reduce_map(client, vid):
     return {row[0]: row[1] for row in client.scan(vid)}
 
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_except_stable_after_update(client):
     """UPDATE on a UNIQUE PK table generates a retraction + insertion with the
     same PK in one delta.  The anti-join DT cursor must re-seek for the second
@@ -88,7 +81,7 @@ def test_except_stable_after_update(client):
         _drop_all(client, sn, views=["v"], tables=["a", "b"])
 
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_intersect_stable_after_update(client):
     """UPDATE through INTERSECT: the join-free min(da,db) arithmetic must track
     membership per full-row identity so the new row (same PK, different payload)
@@ -135,7 +128,7 @@ def test_intersect_stable_after_update(client):
 # -----------------------------------------------------------------------
 
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_intersect_no_weight_inflation(client):
     """INTERSECT must not duplicate rows when one side has multiple entries for
     the same projected value. The leaf distinct caps each side's multiplicity at
@@ -175,7 +168,7 @@ def test_intersect_no_weight_inflation(client):
 # Exchange merge consolidated flag
 # -----------------------------------------------------------------------
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_except_update_non_excluded_row(client):
     """UPDATE a row that is NOT excluded by b.  The delta has same-PK
     retraction + insertion; the anti-join DT must process both correctly."""
@@ -215,7 +208,7 @@ def test_except_update_non_excluded_row(client):
         _drop_all(client, sn, views=["v"], tables=["a", "b"])
 
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_except_multi_tick_exclusion(client):
     """EXCEPT across multiple ticks: insert b, then a in separate epochs.
     Verifies correct PK-based exclusion with 20 rows across workers."""

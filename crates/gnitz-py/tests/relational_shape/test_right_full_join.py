@@ -11,7 +11,6 @@ correctness lives in the weights).
 Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/relational_shape/test_right_full_join.py -v --tb=short
 """
-import gnitz
 from _uid import uid as _uid
 
 

@@ -9,17 +9,10 @@ and the global (no GROUP BY) funnel.
 
 import os
 
-import pytest
+from _serverproc import NEEDS_MULTI
 from _uid import uid as _uid
 
 _NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
-_NEEDS_MULTI = pytest.mark.skipif(
-    _NUM_WORKERS < 2, reason="requires GNITZ_WORKERS >= 2"
-)
-
-
-
-
 def _drop_all(client, sn, tables=(), views=()):
     for v in views:
         try:
@@ -43,7 +36,7 @@ def _scan_reduce_map(client, vid):
     return {row[0]: row[1] for row in client.scan(vid)}
 
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_min_multiworker_incremental(client):
     """Multi-worker MIN with incremental updates.  The gather-reduce must
     correctly fold the old global MIN when a new partial arrives."""
@@ -80,7 +73,7 @@ def test_min_multiworker_incremental(client):
         _drop_all(client, sn, views=["v"], tables=["t"])
 
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_max_multiworker_incremental(client):
     """Multi-worker MAX with incremental updates."""
     sn = "xmi_" + _uid()
@@ -123,7 +116,7 @@ def test_max_multiworker_incremental(client):
 # -----------------------------------------------------------------------
 
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_grouped_min_multiworker_retract_current_min(client):
     sn = "gmin_" + _uid()
     client.create_schema(sn)
@@ -158,7 +151,7 @@ def test_grouped_min_multiworker_retract_current_min(client):
         _drop_all(client, sn, views=["v"], tables=["t"])
 
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_grouped_max_multiworker_retract_current_max(client):
     sn = "gmax_" + _uid()
     client.create_schema(sn)
@@ -210,7 +203,7 @@ def _scan_global_agg(client, vid):
     return rows[0]["m"]
 
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_global_min_multiworker_retract_current_min(client):
     sn = "gmr_" + _uid()
     client.create_schema(sn)
@@ -237,7 +230,7 @@ def test_global_min_multiworker_retract_current_min(client):
         _drop_all(client, sn, views=["v"], tables=["t"])
 
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_global_max_multiworker_retract_current_max(client):
     sn = "gxr_" + _uid()
     client.create_schema(sn)

@@ -3,782 +3,430 @@ lookups, the bound pushed into the walk, the per-partition collect/merge, and
 a reply train that spans more than one frame.
 
 The failure mode is silent under-reporting — a key the walk never opens comes
-back as "no such row" — so each case asserts the full result set, and the
-bounded build is compared against the unbounded one.
+back as "no such row" — so each case asserts the full result set with its
+weights, and the bounded build is compared against the unbounded one. A key
+answered by two workers is a doubled weight, which a PK list cannot see.
 """
 
 import pytest
-from uuid import uuid4
+from _read import access, bag, rows
+from _uid import uid as _uid
 
 
-
-def _sn():
-    """Unique schema name for test isolation."""
-    return "idx" + uuid4().hex[:8]
-
-
-def _drop_all(client, sn, tables=(), views=(), indices=()):
-    """Drop tables, views, and indices before dropping schema."""
-    for idx in indices:
-        try:
-            client.execute_sql(f"DROP INDEX {idx}", schema_name=sn)
-        except Exception:
-            pass
-    for v in views:
-        try:
-            client.execute_sql(f"DROP VIEW {v}", schema_name=sn)
-        except Exception:
-            pass
-    for t in tables:
-        try:
-            client.execute_sql(f"DROP TABLE {t}", schema_name=sn)
-        except Exception:
-            pass
-    client.drop_schema(sn)
+def _insert(client, sn, table, values, chunk=1000):
+    """Multi-row INSERT of same-width value tuples, split into at-most-`chunk`-row
+    statements; a literal 'NULL' passes through."""
+    for i in range(0, len(values), chunk):
+        vals = ", ".join(
+            f"({', '.join(str(v) for v in r)})" for r in values[i:i + chunk])
+        client.execute_sql(f"INSERT INTO {table} VALUES {vals}", schema_name=sn)
 
 
+# ---------------------------------------------------------------------------
+# Index seek (the binary verb)
+# ---------------------------------------------------------------------------
 
 
-def _insert_rows(client, sn, rows, chunk=500):
-    """Multi-row INSERT into table `t` of same-width value tuples, split into
-    at-most-`chunk`-row statements; a literal 'NULL' passes through."""
-    for i in range(0, len(rows), chunk):
-        values = ", ".join(
-            f"({', '.join(str(v) for v in r)})" for r in rows[i:i + chunk])
-        client.execute_sql(f"INSERT INTO t VALUES {values}", schema_name=sn)
+@pytest.mark.parametrize("index_first", [False, True], ids=["backfill", "maintained"])
+def test_index_seek_finds_every_key(client, schema_name, index_first):
+    """Every indexed value resolves to its own row, whether the index was built
+    over existing rows (backfill) or maintained as they arrived.
+
+    The keys span every partition, so the projection maintaining the index has
+    to have run on every worker rather than only the one a seed landed on.
+    """
+    sn = schema_name
+    n = 32
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, cust_id BIGINT NOT NULL)",
+        schema_name=sn)
+    tid, _ = client.resolve_table(sn, "t")
+    if index_first:
+        client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
+    _insert(client, sn, "t", [(i, i * 100) for i in range(1, n + 1)])
+    if not index_first:
+        client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
+
+    for i in range(1, n + 1):
+        got = client.seek_by_index(tid, [1], [i * 100])
+        assert list(zip(got.pks, got.weights)) == [(i, 1)], f"cust_id={i * 100}"
+    # An absent value is an empty answer, not an error.
+    assert len(client.seek_by_index(tid, [1], [n * 100 + 1]).pks) == 0
 
 
+# ---------------------------------------------------------------------------
+# Equality through SQL
+# ---------------------------------------------------------------------------
 
 
-def _result_pks(result):
-    """Sorted list of PKs from a SELECT Rows result (positive weight only)."""
-    assert result[0]["type"] == "Rows"
-    return sorted(row.pk for row in result[0]["rows"])
+@pytest.mark.parametrize("coltype,vals", [
+    ("BIGINT", [-5, -1, 0, 10]),
+    ("INT", [-100, -1, 0, 100]),
+    ("SMALLINT", [-32768, -1, 0, 32767]),
+    ("BIGINT UNSIGNED", [0, 1, 9223372036854775808, 18446744073709551615]),
+])
+def test_indexed_equality_over_the_width_and_sign_range(client, schema_name, coltype, vals):
+    """`WHERE col = v` resolves through the index at every width and on both
+    sides of zero. The sign-flip in the OPK encoding is what a signed column
+    exercises, and a value past i64::MAX what an unsigned one does — a column
+    read at the wrong signedness lands on the wrong side of the walk and misses.
+    """
+    sn = schema_name
+    client.execute_sql(
+        f"CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v {coltype} NOT NULL)",
+        schema_name=sn)
+    _insert(client, sn, "t", [(i, v) for i, v in enumerate(vals, 1)])
+    client.execute_sql("CREATE INDEX ON t(v)", schema_name=sn)
+
+    for pk, v in enumerate(vals, 1):
+        assert bag(rows(client, sn, f"SELECT pk, v FROM t WHERE v = {v}")) == {(pk, v): 1}
+    # A value no row carries answers empty rather than the nearest neighbour.
+    assert rows(client, sn, "SELECT pk FROM t WHERE v = 7777") == []
 
 
-def _result_rows(result):
-    """Sorted list of full-row value tuples (schema order, PK first) from a
-    SELECT Rows result (positive weight only)."""
-    assert result[0]["type"] == "Rows"
-    return sorted(tuple(row) for row in result[0]["rows"])
+def test_pk_equality_needs_no_index(client, schema_name):
+    """A PK point is served by the PK walk itself, with an unrelated index
+    present — the two access paths must not be confused for one another."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+        schema_name=sn)
+    _insert(client, sn, "t", [(1, 5), (2, 6), (3, 5)])
+    client.execute_sql("CREATE INDEX ON t(val)", schema_name=sn)
+    assert bag(rows(client, sn, "SELECT pk, val FROM t WHERE pk = 2")) == {(2, 6): 1}
+    # A non-indexed column has no seek key, so the bounded read degrades to a
+    # full cursor and the predicate runs server-side — served, not rejected.
+    assert bag(rows(client, sn, "SELECT pk FROM t WHERE val = 5")) == {(1,): 1, (3,): 1}
 
-def _grouped(client, sn, sql):
-    """Sorted (group, aggregate) tuples from a grouped SELECT."""
-    return _result_rows(client.execute_sql(sql, schema_name=sn))
+
+def test_indexed_equality_with_a_residual(client, schema_name):
+    """An index seek combined with a residual AND predicate filters correctly."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, cust_id BIGINT NOT NULL, "
+        "region BIGINT NOT NULL)", schema_name=sn)
+    _insert(client, sn, "t", [(1, 42, 100), (2, 99, 200), (3, 42, 200)])
+    client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
+    assert bag(rows(client, sn,
+                    "SELECT pk FROM t WHERE cust_id = 42 AND region = 100")) == {(1,): 1}
 
 
-class TestIndexSeek:
-    def _setup(self, client, sn):
-        """Create schema and table t(pk BIGINT PK, cust_id BIGINT). Returns tid."""
-        client.create_schema(sn)
+# ---------------------------------------------------------------------------
+# Ranges through SQL
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ranged(client, schema_name):
+    """`t (pk, x INT)` with `x = (pk - 8) * 5` over pks 1..15 — x from -35 to 35,
+    so a range spans zero and the rows scatter over every partition. Read-only:
+    every case below is a SELECT."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x INT NOT NULL)",
+        schema_name=sn)
+    _insert(client, sn, "t", [(pk, (pk - 8) * 5) for pk in range(1, 16)])
+    client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
+    return sn
+
+
+@pytest.mark.parametrize("predicate,keep", [
+    ("x > 0", lambda x: x > 0),
+    ("x >= 0", lambda x: x >= 0),
+    ("x < 0", lambda x: x < 0),
+    ("x <= 0", lambda x: x <= 0),
+    ("0 < x", lambda x: x > 0),                      # flipped orientation
+    ("x BETWEEN -10 AND 10", lambda x: -10 <= x <= 10),
+    ("x NOT BETWEEN -10 AND 10", lambda x: not -10 <= x <= 10),
+    ("x > -10 AND x < 10", lambda x: -10 < x < 10),
+    ("x >= -35 AND x <= -35", lambda x: x == -35),   # single-value inclusive band
+    # Both ends on the same side: the tighter one binds, whichever is written
+    # first — order-independence is what proves no packed-native compare.
+    ("x > -10 AND x > 10", lambda x: x > 10),
+    ("x > 10 AND x > -10", lambda x: x > 10),
+    # An out-of-type-range bound saturates rather than wrapping: provably empty
+    # above I32::MAX, unbounded below it.
+    ("x > 3000000000", lambda x: False),
+    ("x < 3000000000", lambda x: True),
+])
+def test_index_range_walks_the_signed_interval(client, ranged, predicate, keep):
+    """A range over a signed indexed column returns exactly the contiguous
+    interval, boundary inclusivity and all. Signed values are the discriminating
+    case: the OPK sign-flip is what makes `OPK(-5) < OPK(5)`, so a raw unsigned
+    read of the key inverts the interval and answers an empty or complementary
+    set."""
+    want = {(pk,): 1 for pk in range(1, 16) if keep((pk - 8) * 5)}
+    assert bag(rows(client, ranged, f"SELECT pk FROM t WHERE {predicate}")) == want
+
+
+def test_range_over_a_composite_index(client, schema_name):
+    """On index (a, b), `a = 5 AND b > 10` is served by the composite range scan,
+    NOT a bare `a = 5` prefix seek + residual: a row at (5, 0) must be absent,
+    and an (8, 11) row never enters the candidate set (the scan stops < a=8)."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+        "a BIGINT NOT NULL, b BIGINT NOT NULL)", schema_name=sn)
+    _insert(client, sn, "t", [(1, 5, 0), (2, 5, 20), (3, 5, 11), (4, 8, 11)])
+    client.execute_sql("CREATE INDEX ON t(a, b)", schema_name=sn)
+    assert bag(rows(client, sn, "SELECT * FROM t WHERE a = 5 AND b > 10")) == \
+        {(2, 5, 20): 1, (3, 5, 11): 1}
+
+
+def test_max_arity_composite_descriptor_crosses_the_inline_cap(client, schema_name):
+    """A composite index at PK_LIST_MAX_COLS = 4 carrying a two-sided range on
+    the last column (n_eq = 3) produces an 82-byte descriptor — over the 64-byte
+    `seek_pk_extra` and 80-byte `PkBuf` caps — so the request must travel by the
+    explicit-blob send path rather than inline, and still reach every worker.
+
+    The EXPLAIN check is what makes this a descriptor test: without it a
+    fallback to a full scan would answer the same rows and pass silently.
+    """
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+        "a BIGINT NOT NULL, b BIGINT NOT NULL, c BIGINT NOT NULL, d BIGINT NOT NULL)",
+        schema_name=sn)
+    values = [(pk, 1, 2, 3, d) for pk, d in enumerate(range(60), 1)]
+    values += [(61, 1, 2, 4, 30), (62, 2, 2, 3, 30)]   # decoys on c and on a
+    _insert(client, sn, "t", values)
+    client.execute_sql("CREATE INDEX ON t(a, b, c, d)", schema_name=sn)
+
+    q = "SELECT pk FROM t WHERE a = 1 AND b = 2 AND c = 3 AND d > 10 AND d < 50"
+    assert access(client, sn, q).startswith("access: index range on (a, b, c, d)"), \
+        access(client, sn, q)
+    assert bag(rows(client, sn, q)) == \
+        {(pk,): 1 for pk, _, _, _, d in values[:60] if 10 < d < 50}
+
+
+def test_residual_conjuncts_bind_and_filter(client, schema_name):
+    """Conjuncts the range cannot absorb are applied after the walk. `BETWEEN`
+    and `NOT BETWEEN` in that position are the regression guard for the
+    `Expr::Between` binder arm, which used to fail to bind rather than filter."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+        "x BIGINT NOT NULL, y BIGINT NOT NULL)", schema_name=sn)
+    _insert(client, sn, "t", [(1, 10, 5), (2, 20, 50), (3, 30, 1)])
+    client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
+    q = lambda s: bag(rows(client, sn, f"SELECT pk FROM t WHERE {s}"))
+    assert q("x > 5 AND y = 5") == {(1,): 1}
+    assert q("x > 5 AND y BETWEEN 1 AND 9") == {(1,): 1, (3,): 1}
+    assert q("x > 5 AND y NOT BETWEEN 1 AND 9") == {(2,): 1}
+    # No index on y at all: no seek key, so the whole predicate is the residual.
+    assert q("y > 5") == {(2,): 1}
+
+
+# ---------------------------------------------------------------------------
+# Per-partition collect / merge
+# ---------------------------------------------------------------------------
+
+
+def test_nonunique_collect_matches_the_scan_reference(client, schema_name):
+    """The merged index result equals a scan-and-filter reference over the same
+    data, and reflects net weights after a retraction — mandatory for any index
+    access path, since consolidation is what the merge owes its caller."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+        "x BIGINT NOT NULL, y BIGINT NOT NULL)", schema_name=sn)
+    # 200 rows scattered across workers; 10 rows per x value.
+    _insert(client, sn, "t", [(i, i % 20, i * 3) for i in range(200)])
+    client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
+
+    tid, _ = client.resolve_table(sn, "t")
+    ref = bag(client.scan(tid))
+    assert len(ref) == 200
+    q = lambda s: bag(rows(client, sn, f"SELECT * FROM t WHERE {s}"))
+    assert q("x = 7") == {r: w for r, w in ref.items() if r[1] == 7}
+    assert q("x > 15") == {r: w for r, w in ref.items() if r[1] > 15}
+
+    client.execute_sql("DELETE FROM t WHERE pk IN (7, 27, 47)", schema_name=sn)
+    assert q("x = 7") == {r: w for r, w in ref.items() if r[1] == 7 and r[0] not in (7, 27, 47)}
+
+
+def test_anticorrelated_runs_merge_by_value_then_src_pk(client, schema_name):
+    """A secondary index's PK is the pair ``(indexed_value, src_pk)``, and the
+    read cursor's N-way merge must order runs the way storage sorted each one —
+    by column order — not by a raw u128 view of the key bytes, which orders by
+    ``(src_pk, value)`` because src_pk lands in the high half.
+
+    Correlated data sorts identically under both orders and so proves nothing.
+    Here value falls as pk rises, which is what makes the two orders disagree:
+    under the wrong one the merge seeks the wrong run's head and the lookup
+    misses. One INSERT per row, so each row is its own run.
+    """
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql("CREATE INDEX ON t(val)", schema_name=sn)
+    n = 6
+    want = [(pk, (n + 1 - pk) * 100) for pk in range(1, n + 1)]
+    for pk, val in want:
+        client.execute_sql(f"INSERT INTO t VALUES ({pk}, {val})", schema_name=sn)
+    for pk, val in want:
+        assert bag(rows(client, sn, f"SELECT * FROM t WHERE val = {val}")) == {(pk, val): 1}
+
+
+# ---------------------------------------------------------------------------
+# Reply trains that span more than one frame
+# ---------------------------------------------------------------------------
+
+
+def test_chunked_seek_and_range_replies_return_full_set(reply_frame_budget_server):
+    """A per-worker reply that spans several 16 KiB frames (see the fixture)
+    still returns every row, with payload intact across the chunk boundaries and
+    net weights after a retraction."""
+    client = reply_frame_budget_server
+    sn = "cx" + _uid()
+    client.create_schema(sn)
+    try:
         client.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, cust_id BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        tid, _ = client.resolve_table(sn, "t")
-        return tid
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+            "x BIGINT NOT NULL, y BIGINT NOT NULL)", schema_name=sn)
+        # ~32 KB of matching rows per worker per value at 4 workers: every
+        # worker's train is several frames past the 16 KiB budget.
+        n = 4_000
+        _insert(client, sn, "t", [(i, i % 2, i * 7) for i in range(n)])
+        client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
 
-    def test_seek_hit(self, client):
-        sn = _sn()
-        try:
-            tid = self._setup(client, sn)
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 42), (2, 99)",
-                schema_name=sn,
-            )
-            client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
+        # Full-row values, so payload integrity through the boundaries is
+        # asserted rather than just the key set.
+        assert bag(rows(client, sn, "SELECT * FROM t WHERE x = 0")) == \
+            {(i, 0, i * 7): 1 for i in range(0, n, 2)}
+        assert bag(rows(client, sn, "SELECT pk FROM t WHERE x >= 0")) == \
+            {(i,): 1 for i in range(n)}
 
-            result = client.seek_by_index(tid, [1], [42])
-            assert result.schema is not None
-            assert len(result.pks) == 1
-            assert result.pks[0] == 1
-        finally:
-            _drop_all(client, sn,
-                      indices=[f"{sn}__t__idx_cust_id"],
-                      tables=["t"])
-
-    def test_seek_miss(self, client):
-        sn = _sn()
-        try:
-            tid = self._setup(client, sn)
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 42), (2, 99)",
-                schema_name=sn,
-            )
-            client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
-
-            result = client.seek_by_index(tid, [1], [999])
-            assert result.schema is None or len(result.pks) == 0
-        finally:
-            _drop_all(client, sn,
-                      indices=[f"{sn}__t__idx_cust_id"],
-                      tables=["t"])
-
-    def test_seek_backfill(self, client):
-        """Index created after rows exist — must backfill correctly."""
-        sn = _sn()
-        try:
-            tid = self._setup(client, sn)
-            client.execute_sql(
-                "INSERT INTO t VALUES (10, 77), (20, 88)",
-                schema_name=sn,
-            )
-            client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
-
-            result = client.seek_by_index(tid, [1], [77])
-            assert result.schema is not None
-            assert len(result.pks) == 1
-            assert result.pks[0] == 10
-        finally:
-            _drop_all(client, sn,
-                      indices=[f"{sn}__t__idx_cust_id"],
-                      tables=["t"])
-
-    def test_seek_after_insert(self, client):
-        """Rows inserted after index creation are visible via seek — for keys
-        spanning every partition, so the projection that maintains the index has
-        to have run on every worker rather than only the one the seed landed on.
-        """
-        sn = _sn()
-        try:
-            tid = self._setup(client, sn)
-            client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
-            n = 32
-            client.execute_sql(
-                "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 100})" for i in range(1, n + 1)),
-                schema_name=sn)
-
-            for i in range(1, n + 1):
-                result = client.seek_by_index(tid, [1], [i * 100])
-                assert list(result.pks) == [i], f"cust_id={i * 100} not found via index"
-        finally:
-            _drop_all(client, sn,
-                      indices=[f"{sn}__t__idx_cust_id"],
-                      tables=["t"])
-
-class TestIndexSql:
-    def test_select_where_indexed_col(self, client):
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, cust_id BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO t VALUES (1, 42), (2, 99)", schema_name=sn)
-            client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
-
-            results = client.execute_sql(
-                "SELECT * FROM t WHERE cust_id = 42", schema_name=sn
-            )
-            assert results[0]["type"] == "Rows"
-            rows = results[0]["rows"]
-            assert len(rows.pks) == 1
-            assert rows.pks[0] == 1
-        finally:
-            _drop_all(client, sn,
-                      indices=[f"{sn}__t__idx_cust_id"],
-                      tables=["t"])
-
-    def test_select_where_pk(self, client):
-        """PK-based seek still works after index infrastructure is present."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO t VALUES (7, 100)", schema_name=sn)
-
-            results = client.execute_sql(
-                "SELECT * FROM t WHERE pk = 7", schema_name=sn
-            )
-            assert results[0]["type"] == "Rows"
-            assert results[0]["rows"].pks[0] == 7
-        finally:
-            _drop_all(client, sn, tables=["t"])
-
-    def test_select_nonindexed_col_served_by_read_path(self, client):
-        """WHERE on a column with no index is SERVED, not rejected.
-
-        No index means no seek key, so the bounded read degrades to a full cursor
-        and the predicate runs server-side. Served directly — no circuit.
-        """
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 6), (3, 5)", schema_name=sn)
-            assert _result_pks(client.execute_sql(
-                "SELECT * FROM t WHERE val = 5", schema_name=sn)) == [1, 3]
-        finally:
-            _drop_all(client, sn, tables=["t"])
-
-    def test_select_indexed_with_residual_filter(self, client):
-        """Index seek combined with a residual AND predicate filters correctly."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, cust_id BIGINT NOT NULL, region BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            # Only pk=1 has cust_id=42; pk=2 has a different cust_id
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 42, 100), (2, 99, 200)",
-                schema_name=sn,
-            )
-            client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
-
-            results = client.execute_sql(
-                "SELECT * FROM t WHERE cust_id = 42 AND region = 100",
-                schema_name=sn,
-            )
-            assert results[0]["type"] == "Rows"
-            rows = results[0]["rows"]
-            assert len(rows.pks) == 1
-            assert rows.pks[0] == 1
-        finally:
-            _drop_all(client, sn,
-                      indices=[f"{sn}__t__idx_cust_id"],
-                      tables=["t"])
-
-    def test_select_indexed_no_match(self, client):
-        """Seek on an indexed column returns empty Rows when key is absent."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
-            client.execute_sql("CREATE INDEX ON t(val)", schema_name=sn)
-
-            results = client.execute_sql(
-                "SELECT * FROM t WHERE val = 999", schema_name=sn
-            )
-            assert results[0]["type"] == "Rows"
-            assert len(results[0]["rows"].pks) == 0
-        finally:
-            _drop_all(client, sn,
-                      indices=[f"{sn}__t__idx_val"],
-                      tables=["t"])
-
-    def test_select_where_indexed_col_negative_i64(self, client):
-        """WHERE bigint_col = -N must use the index and find the correct row."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, score BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, -5), (2, -1), (3, 0), (4, 10)",
-                schema_name=sn,
-            )
-            client.execute_sql("CREATE INDEX ON t(score)", schema_name=sn)
-
-            for pk, val in [(1, -5), (2, -1), (3, 0), (4, 10)]:
-                results = client.execute_sql(
-                    f"SELECT * FROM t WHERE score = {val}", schema_name=sn
-                )
-                assert results[0]["type"] == "Rows", f"expected Rows for score={val}"
-                rows = results[0]["rows"]
-                assert len(rows.pks) == 1, f"expected 1 row for score={val}"
-                assert rows.pks[0] == pk, f"wrong pk for score={val}"
-        finally:
-            _drop_all(client, sn,
-                      indices=[f"{sn}__t__idx_score"],
-                      tables=["t"])
-
-    def test_select_where_indexed_col_negative_i32(self, client):
-        """WHERE int_col = -N must use the index and find the correct row (I32)."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, score INT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, -100), (2, -1), (3, 0), (4, 100)",
-                schema_name=sn,
-            )
-            client.execute_sql("CREATE INDEX ON t(score)", schema_name=sn)
-
-            for pk, val in [(1, -100), (2, -1), (3, 0), (4, 100)]:
-                results = client.execute_sql(
-                    f"SELECT * FROM t WHERE score = {val}", schema_name=sn
-                )
-                assert results[0]["type"] == "Rows", f"expected Rows for score={val}"
-                rows = results[0]["rows"]
-                assert len(rows.pks) == 1, f"expected 1 row for score={val}"
-                assert rows.pks[0] == pk, f"wrong pk for score={val}"
-        finally:
-            _drop_all(client, sn,
-                      indices=[f"{sn}__t__idx_score"],
-                      tables=["t"])
-
-    def test_select_where_indexed_col_negative_miss(self, client):
-        """WHERE bigint_col = -N returns empty when the value is absent."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
-            client.execute_sql("CREATE INDEX ON t(val)", schema_name=sn)
-
-            results = client.execute_sql(
-                "SELECT * FROM t WHERE val = -99", schema_name=sn
-            )
-            assert results[0]["type"] == "Rows"
-            assert len(results[0]["rows"].pks) == 0
-        finally:
-            _drop_all(client, sn,
-                      indices=[f"{sn}__t__idx_val"],
-                      tables=["t"])
-
-class TestIndexRangeSql:
-    def test_range_open_ended(self, client):
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql("INSERT INTO t VALUES (1, 0), (2, 10), (3, 20), (4, 30)",
-                               schema_name=sn)
-            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
-            q = lambda s: _result_pks(client.execute_sql(s, schema_name=sn))
-            assert q("SELECT * FROM t WHERE x > 10") == [3, 4]
-            assert q("SELECT * FROM t WHERE x >= 10") == [2, 3, 4]
-            assert q("SELECT * FROM t WHERE x < 20") == [1, 2]
-            assert q("SELECT * FROM t WHERE x <= 20") == [1, 2, 3]
-            assert q("SELECT * FROM t WHERE 10 < x") == [3, 4]   # flipped orientation
-        finally:
-            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
-
-    def test_range_between(self, client):
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql("INSERT INTO t VALUES (1, 0), (2, 10), (3, 20), (4, 30)",
-                               schema_name=sn)
-            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
-            q = lambda s: _result_pks(client.execute_sql(s, schema_name=sn))
-            assert q("SELECT * FROM t WHERE x BETWEEN 10 AND 20") == [2, 3]
-            # NOT BETWEEN is not a contiguous interval, so no index seek serves it.
-            # The on-demand executor does, and must get the complement exactly
-            # right (it used to be a clean error rather than mis-served).
-            assert q("SELECT * FROM t WHERE x NOT BETWEEN 10 AND 20") == [1, 4]
-        finally:
-            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
-
-    def test_range_signed_between(self, client):
-        """The cff7c58 payoff: a signed range returns the contiguous signed
-        interval (OPK(-5) < OPK(5)), not an inverted/empty set."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x INT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, -10), (2, -5), (3, 0), (4, 5), (5, 10)",
-                schema_name=sn)
-            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
-            q = lambda s: _result_pks(client.execute_sql(s, schema_name=sn))
-            assert q("SELECT * FROM t WHERE x BETWEEN -5 AND 5") == [2, 3, 4]
-            assert q("SELECT * FROM t WHERE x > -5") == [3, 4, 5]
-            assert q("SELECT * FROM t WHERE x < 0") == [1, 2]
-        finally:
-            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
-
-    def test_range_composite_served_by_range(self, client):
-        """On index (a, b), `a = 5 AND b > 10` is served by the composite range
-        scan, NOT a bare `a = 5` prefix seek + residual: a row at (5, 0) must be
-        absent, and an (8, 11) row never enters the candidate (scan stops < a=8)."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
-                "a BIGINT NOT NULL, b BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 5, 0), (2, 5, 20), (3, 5, 11), (4, 8, 11)",
-                schema_name=sn)
-            client.execute_sql("CREATE INDEX ON t(a, b)", schema_name=sn)
-            assert _result_rows(client.execute_sql(
-                "SELECT * FROM t WHERE a = 5 AND b > 10", schema_name=sn)) == \
-                [(2, 5, 20), (3, 5, 11)]
-        finally:
-            _drop_all(client, sn, indices=[f"{sn}__t__idx_a_b"], tables=["t"])
-
-    def test_range_nonindexed_served_by_read_path(self, client):
-        """A range predicate on a non-indexed column has no seek key, so it is
-        served by the read-spec predicate (full cursor + predicate), not rejected."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 6), (3, 4)", schema_name=sn)
-            assert _result_pks(client.execute_sql(
-                "SELECT * FROM t WHERE x > 5", schema_name=sn)) == [2]
-        finally:
-            _drop_all(client, sn, tables=["t"])
-
-    def test_range_residual_conjunct(self, client):
-        """A non-range residual conjunct is applied after the range scan."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
-                "x BIGINT NOT NULL, y BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 100)",
-                schema_name=sn)
-            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
-            # x > 5 (range) AND y = 100 (residual) → pks 1 and 3.
-            assert _result_pks(client.execute_sql(
-                "SELECT * FROM t WHERE x > 5 AND y = 100", schema_name=sn)) == [1, 3]
-        finally:
-            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
-
-    def test_residual_between_binds(self, client):
-        """`x > 5 AND y BETWEEN 1 AND 9` (only x indexed): the y BETWEEN residual
-        now binds and filters (regression guard for the Expr::Between binder arm)
-        instead of failing to bind. NOT BETWEEN likewise filters."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
-                "x BIGINT NOT NULL, y BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 5), (2, 20, 50), (3, 30, 1)",
-                schema_name=sn)
-            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
-            q = lambda s: _result_pks(client.execute_sql(s, schema_name=sn))
-            assert q("SELECT * FROM t WHERE x > 5 AND y BETWEEN 1 AND 9") == [1, 3]
-            assert q("SELECT * FROM t WHERE x > 5 AND y NOT BETWEEN 1 AND 9") == [2]
-        finally:
-            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
-
-    def test_range_redundant_same_side(self, client):
-        """`x > 5 AND x > 10` keeps the first end as the bound and trims the slack
-        via the residual; order-independent (proves no packed-native compare)."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
-                schema_name=sn)
-            vals = ",".join(f"({i}, {i})" for i in range(1, 16))
-            client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
-            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
-            q = lambda s: _result_pks(client.execute_sql(s, schema_name=sn))
-            assert q("SELECT * FROM t WHERE x > 5 AND x > 10") == list(range(11, 16))
-            assert q("SELECT * FROM t WHERE x > 10 AND x > 5") == list(range(11, 16))
-        finally:
-            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
-
-    def test_range_out_of_range_saturation(self, client):
-        """An out-of-type-range bound saturates: `x > 3e9` on an INT (I32) column
-        is provably empty; `x < 3e9` saturates to unbounded and returns all rows."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x INT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql("INSERT INTO t VALUES (1, 1), (2, 100), (3, 1000)",
-                               schema_name=sn)
-            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
-            q = lambda s: _result_pks(client.execute_sql(s, schema_name=sn))
-            assert q("SELECT * FROM t WHERE x > 3000000000") == []
-            assert q("SELECT * FROM t WHERE x < 3000000000") == [1, 2, 3]
-        finally:
-            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
-
-class TestIndexCollectMerge:
-    def test_nonunique_collect_matches_scan_reference_with_retraction(self, client):
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
-                "x BIGINT NOT NULL, y BIGINT NOT NULL)", schema_name=sn)
-            # 200 rows scattered across workers; 10 rows per x value.
-            vals = ",".join(f"({i}, {i % 20}, {i * 3})" for i in range(200))
-            client.execute_sql(f"INSERT INTO t VALUES {vals}", schema_name=sn)
-            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
-
-            # Scan-and-filter reference from the full table scan.
-            tid, _ = client.resolve_table(sn, "t")
-            ref = {r.pk: (r.x, r.y) for r in client.scan(tid)}
-            assert len(ref) == 200
-            q = lambda s: _result_rows(client.execute_sql(s, schema_name=sn))
-
-            eq_expect = sorted((pk, x, y) for pk, (x, y) in ref.items() if x == 7)
-            assert q("SELECT * FROM t WHERE x = 7") == eq_expect
-            rng_expect = sorted((pk, x, y) for pk, (x, y) in ref.items() if x > 15)
-            assert q("SELECT * FROM t WHERE x > 15") == rng_expect
-
-            # Retract part of the result set; the merged reply must reflect
-            # net weights (mandatory for any index access path).
-            client.execute_sql("DELETE FROM t WHERE pk IN (7, 27, 47)", schema_name=sn)
-            eq_after = [t for t in eq_expect if t[0] not in (7, 27, 47)]
-            assert q("SELECT * FROM t WHERE x = 7") == eq_after
-        finally:
-            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
-
-    def test_anticorrelated_runs_merge_by_value_then_src_pk(self, client):
-        """A secondary index's PK is the pair ``(indexed_value, src_pk)``, and the
-        read cursor's N-way merge must order runs the way storage sorted each one
-        — by column order — not by a raw u128 view of the key bytes, which orders
-        by ``(src_pk, value)`` because src_pk lands in the high half.
-
-        Correlated data sorts identically under both orders and so proves
-        nothing. Here value falls as pk rises, which is what makes the two orders
-        disagree: under the wrong one the merge seeks the wrong run's head and
-        the lookup misses. One INSERT per row, so each row is its own run.
-        """
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY,"
-                " val BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql("CREATE INDEX ON t(val)", schema_name=sn)
-            n = 6
-            want = [(pk, (n + 1 - pk) * 100) for pk in range(1, n + 1)]
-            for pk, val in want:
-                client.execute_sql(
-                    f"INSERT INTO t VALUES ({pk}, {val})", schema_name=sn)
-            for pk, val in want:
-                got = _result_rows(
-                    client.execute_sql(
-                        f"SELECT * FROM t WHERE val = {val}", schema_name=sn))
-                assert got == [(pk, val)], \
-                    f"val={val} resolved to {got}, expected [({pk}, {val})]"
-        finally:
-            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+        client.execute_sql("DELETE FROM t WHERE pk IN (1, 3, 5)", schema_name=sn)
+        assert bag(rows(client, sn, "SELECT pk FROM t WHERE x = 1")) == \
+            {(i,): 1 for i in range(7, n, 2)}
+    finally:
+        client.drop_schema(sn)
 
 
-class TestChunkedReplyTrains:
-    def test_chunked_seek_and_range_replies_return_full_set(self, reply_frame_budget_server):
-        client = reply_frame_budget_server
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
-                "x BIGINT NOT NULL, y BIGINT NOT NULL)", schema_name=sn)
-            # ~100 KB of matching base rows per worker per value: each worker's
-            # reply spans several 16 KiB frames (byte-back-pressured by the ring,
-            # not capped by any frame count — see the fixture).
-            n = 20_000
-            _insert_rows(client, sn, [(i, i % 2, i * 7) for i in range(n)], chunk=1000)
-            client.execute_sql("CREATE INDEX ON t(x)", schema_name=sn)
-            q = lambda s: _result_pks(client.execute_sql(s, schema_name=sn))
+def test_unique_index_over_a_long_text_table_past_one_frame(reply_frame_budget_server):
+    """CREATE UNIQUE INDEX warms its cold filters from a whole-table scan, so a
+    table with a long TEXT column reaches that scan's frame budget on rows the
+    user never asked to read. Every frame carries a heap compacted to its own
+    rows, so the DDL completes and the index it builds enforces uniqueness."""
+    client = reply_frame_budget_server
+    sn = "ux" + _uid()
+    client.create_schema(sn)
+    try:
+        client.execute_sql(
+            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
+            "u BIGINT NOT NULL, body TEXT NOT NULL)", schema_name=sn)
+        # 200 bytes of heap per row: 4 000 rows is ~800 KB, far past the
+        # 16 KiB budget on every worker.
+        body = "z" * 200
+        n = 4_000
+        _insert(client, sn, "t", [(i, i, f"'row-{i}-{body}'") for i in range(n)])
 
-            # Non-unique point seek over a chunked train per worker.
-            assert q("SELECT * FROM t WHERE x = 1") == list(range(1, n, 2))
-            # Ordered range scan returning every row.
-            assert q("SELECT * FROM t WHERE x >= 0") == list(range(n))
+        client.execute_sql("CREATE UNIQUE INDEX ON t(u)", schema_name=sn)
+        with pytest.raises(Exception):
+            client.execute_sql("INSERT INTO t VALUES (99999, 7, 'dup')", schema_name=sn)
+        client.execute_sql(f"INSERT INTO t VALUES (99999, {n}, 'new')", schema_name=sn)
+        assert bag(rows(client, sn, "SELECT pk, u FROM t WHERE u = 17")) == {(17, 17): 1}
+    finally:
+        client.drop_schema(sn)
 
-            # Payload integrity through chunk boundaries: full-row values.
-            rows = _result_rows(client.execute_sql(
-                "SELECT * FROM t WHERE x = 0", schema_name=sn))
-            assert rows == [(i, 0, i * 7) for i in range(0, n, 2)]
 
-            # Retraction across a chunked result reflects net weights.
-            client.execute_sql("DELETE FROM t WHERE pk IN (1, 3, 5)", schema_name=sn)
-            assert q("SELECT * FROM t WHERE x = 1") == list(range(7, n, 2))
-        finally:
-            _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
+# ---------------------------------------------------------------------------
+# The bound pushed into a backfill
+# ---------------------------------------------------------------------------
 
-    def test_unique_index_over_a_long_text_table_past_one_frame(
-            self, reply_frame_budget_server):
-        """CREATE UNIQUE INDEX warms its cold filters from an UNPROJECTED
-        whole-table scan, so a table with a long TEXT column reaches that scan's
-        frame budget on rows the user never asked to read. Every frame carries a
-        heap compacted to its own rows, so the DDL completes and the index it
-        builds enforces uniqueness."""
-        client = reply_frame_budget_server
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, "
-                "u BIGINT NOT NULL, body TEXT NOT NULL)", schema_name=sn)
-            # 200 bytes of heap per row: 4 000 rows is ~800 KB, far past the
-            # 16 KiB budget on every worker.
-            body = "z" * 200
-            n = 4_000
-            _insert_rows(client, sn,
-                         [(i, i, f"'row-{i}-{body}'") for i in range(n)], chunk=500)
 
-            client.execute_sql("CREATE UNIQUE INDEX ON t(u)", schema_name=sn)
-            # The index is live: a duplicate is refused, a fresh value accepted.
-            with pytest.raises(Exception):
-                client.execute_sql("INSERT INTO t VALUES (99999, 7, 'dup')",
-                                   schema_name=sn)
-            client.execute_sql(f"INSERT INTO t VALUES (99999, {n}, 'new')",
-                               schema_name=sn)
-            # And it still serves reads over the long-TEXT rows it indexes.
-            rows = _result_rows(client.execute_sql(
-                "SELECT pk, u FROM t WHERE u = 17", schema_name=sn))
-            assert rows == [(17, 17)]
-        finally:
-            _drop_all(client, sn, indices=[f"{sn}__t__idx_u"], tables=["t"])
+@pytest.fixture
+def bounded(client, schema_name):
+    """`t (pk, g, v, ind)` over 2000 rows: `ind` takes 11 values, so `ind = 4` is
+    ~9% of the table and `ind < 2` ~18% — both inside the selectivity gate that
+    decides whether a bound is worth opening. Read-only across the cases that
+    share it."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL,"
+        " v BIGINT NOT NULL, ind BIGINT NOT NULL)", schema_name=sn)
+    _insert(client, sn, "t", [(i, i % 7, i * 3, i % 11) for i in range(2000)])
+    return sn
 
-class TestIndexBoundPushdown:
-    def test_groupby_bounded_matches_unbounded(self, client):
-        """An ad-hoc GROUP BY over an indexed WHERE returns exactly what the
-        same query returns with no index to bound on."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL,"
-                " v BIGINT NOT NULL, ind BIGINT NOT NULL)", schema_name=sn)
-            n = 2000
-            _insert_rows(client, sn,
-                         [(i, i % 7, i * 3, i % 11) for i in range(n)], chunk=500)
-            q = "SELECT g, SUM(v) AS s FROM t WHERE ind = 4 GROUP BY g"
-            unbounded = _grouped(client, sn, q)
-            assert unbounded, "the fixture must match some rows"
 
-            client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
-            assert _grouped(client, sn, q) == unbounded, \
-                "a bounded backfill scan must not change the aggregate"
+@pytest.mark.parametrize("q", [
+    "SELECT g, SUM(v) AS s FROM t WHERE ind = 4 GROUP BY g",
+    "SELECT g, COUNT(*) AS c FROM t WHERE ind < 2 GROUP BY g",
+])
+def test_a_bounded_walk_returns_what_the_unbounded_one_returns(client, bounded, q):
+    """An index changes which walk the planner picks, never the answer. The
+    expectation is the same query run before the index existed, so it is the
+    engine's own unbounded answer rather than a hand-written constant."""
+    sn = bounded
+    unbounded = bag(rows(client, sn, q))
+    assert unbounded, "the fixture must match some rows"
+    client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
+    assert bag(rows(client, sn, q)) == unbounded
 
-            # A range bound, likewise. 1/11 of rows per `ind` value, so
-            # `ind < 2` is ~2/11 — inside the selectivity gate.
-            qr = "SELECT g, COUNT(*) AS c FROM t WHERE ind < 2 GROUP BY g"
-            assert _grouped(client, sn, qr) == sorted(
-                (i % 7, sum(1 for k in range(n) if k % 7 == i % 7 and k % 11 < 2))
-                for i in range(7))
-        finally:
-            _drop_all(client, sn, indices=[f"{sn}__t__idx_ind"], tables=["t"])
 
-    def test_create_view_bounded_matches_unbounded(self, client):
-        """A CREATE VIEW backfill over an indexed WHERE materialises exactly
-        what the unindexed build materialises."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL,"
-                " v BIGINT NOT NULL, ind BIGINT NOT NULL)", schema_name=sn)
-            n = 2000
-            _insert_rows(client, sn,
-                         [(i, i % 7, i * 3, i % 11) for i in range(n)], chunk=500)
-            # Built BEFORE the index exists: no bound.
-            client.execute_sql(
-                "CREATE VIEW v_plain AS SELECT g, SUM(v) AS s FROM t"
-                " WHERE ind = 4 GROUP BY g", schema_name=sn)
-            plain = _grouped(client, sn, "SELECT * FROM v_plain")
+def test_a_bounded_view_backfill_matches_and_then_maintains(client, bounded):
+    """The bound is consulted only at backfill, so a view built over an indexed
+    WHERE materialises what the unindexed build did and then maintains
+    identically: a push failing the predicate is dropped by the Filter, one
+    passing it lands."""
+    sn = bounded
+    body = "SELECT g, SUM(v) AS s FROM t WHERE ind = 4 GROUP BY g"
+    client.execute_sql(f"CREATE VIEW v_plain AS {body}", schema_name=sn)
+    plain = bag(rows(client, sn, "SELECT * FROM v_plain"))
 
-            client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
-            # Built AFTER: its backfill takes the bounded scan.
-            client.execute_sql(
-                "CREATE VIEW v_bound AS SELECT g, SUM(v) AS s FROM t"
-                " WHERE ind = 4 GROUP BY g", schema_name=sn)
-            assert _grouped(client, sn, "SELECT * FROM v_bound") == plain
+    client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
+    client.execute_sql(f"CREATE VIEW v_bound AS {body}", schema_name=sn)
+    assert bag(rows(client, sn, "SELECT * FROM v_bound")) == plain
 
-            # Steady state: a push FAILING the index predicate must be dropped by
-            # the Filter, and one PASSING it must land — the bound is consulted
-            # only at backfill, so maintenance is unchanged.
-            _insert_rows(client, sn, [(n, 0, 100, 5), (n + 1, 0, 1000, 4)])
-            after = dict(_grouped(client, sn, "SELECT * FROM v_bound"))
-            assert after[0] == dict(plain)[0] + 1000, \
-                "the matching push must maintain the bounded view; the other must not"
-        finally:
-            _drop_all(client, sn, views=["v_bound", "v_plain"],
-                      indices=[f"{sn}__t__idx_ind"], tables=["t"])
+    _insert(client, sn, "t", [(2000, 0, 100, 5), (2001, 0, 1000, 4)])
+    after = {g: s for (g, s), _ in bag(rows(client, sn, "SELECT * FROM v_bound")).items()}
+    before = {g: s for (g, s), _ in plain.items()}
+    assert after[0] == before[0] + 1000, \
+        "the matching push must maintain the bounded view; the other must not"
+    assert {g: s for g, s in after.items() if g != 0} == \
+        {g: s for g, s in before.items() if g != 0}
 
-    def test_null_indexed_column_returned_by_neither_build(self, client):
-        """A NULL-valued row is absent from the index, so a bounded scan can
-        never return it — and under 3VL the Filter drops it too. Both builds
-        must agree."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL,"
-                " ind BIGINT)", schema_name=sn)
-            rows = [(i, i % 3, i % 5) for i in range(300)]
-            rows += [(300 + i, i % 3, "NULL") for i in range(30)]
-            _insert_rows(client, sn, rows)
-            q = "SELECT g, COUNT(*) AS c FROM t WHERE ind >= 0 GROUP BY g"
-            unbounded = _grouped(client, sn, q)
 
-            client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
-            assert _grouped(client, sn, q) == unbounded
-            # The NULL rows are in neither: 300 non-NULL rows over 3 groups.
-            assert sum(c for _, c in unbounded) == 300
-        finally:
-            _drop_all(client, sn, indices=[f"{sn}__t__idx_ind"], tables=["t"])
+def test_a_dropped_index_falls_back_to_a_full_scan(client, bounded):
+    """A plan that named an index which is later dropped still answers — the
+    engine degrades to a full scan rather than losing rows."""
+    sn = bounded
+    q = "SELECT g, COUNT(*) AS c FROM t WHERE ind = 3 GROUP BY g"
+    client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
+    bounded_answer = bag(rows(client, sn, q))
+    client.execute_sql(f"DROP INDEX {sn}__t__idx_ind", schema_name=sn)
+    assert bag(rows(client, sn, q)) == bounded_answer
 
-    def test_dropped_index_falls_back_to_full_scan(self, client):
-        """A view whose plan named an index that is later dropped still builds
-        correctly — the engine degrades to a full scan."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL,"
-                " ind BIGINT NOT NULL)", schema_name=sn)
-            _insert_rows(client, sn, [(i, i % 4, i % 9) for i in range(400)])
-            client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
-            q = "SELECT g, COUNT(*) AS c FROM t WHERE ind = 3 GROUP BY g"
-            bounded = _grouped(client, sn, q)
 
-            client.execute_sql(f"DROP INDEX {sn}__t__idx_ind", schema_name=sn)
-            assert _grouped(client, sn, q) == bounded, \
-                "dropping the index must fall back to a full scan, not lose rows"
-        finally:
-            _drop_all(client, sn, tables=["t"])
+def test_a_null_indexed_value_is_returned_by_neither_build(client, schema_name):
+    """A NULL-valued row is absent from the index, so a bounded scan can never
+    return it — and under 3VL the Filter drops it too. Both builds must agree."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL,"
+        " ind BIGINT)", schema_name=sn)
+    _insert(client, sn, "t", [(i, i % 3, i % 5) for i in range(300)]
+            + [(300 + i, i % 3, "NULL") for i in range(30)])
+    q = "SELECT g, COUNT(*) AS c FROM t WHERE ind >= 0 GROUP BY g"
+    unbounded = bag(rows(client, sn, q))
 
-    def test_replicated_global_aggregate_grounds_on_empty_range(self, client):
-        """A replicated base's global COUNT(*) is the shape that reaches
-        `backfill_view`, and an unmatched WHERE makes its range provably empty.
-        The ground row must still be minted: COUNT(*) = 0, one row."""
-        sn = _sn()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, ind BIGINT NOT NULL)"
-                " WITH (replicated = true)", schema_name=sn)
-            _insert_rows(client, sn, [(i, i % 5) for i in range(100)])
-            client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW mv AS SELECT COUNT(*) AS c FROM t WHERE ind = 999",
-                schema_name=sn)
-            res = client.execute_sql("SELECT * FROM mv", schema_name=sn)
-            rows = list(res[0]["rows"])
-            assert len(rows) == 1, "an empty range must still seed the ground row"
-            assert rows[0][0] == 0
-        finally:
-            _drop_all(client, sn, views=["mv"],
-                      indices=[f"{sn}__t__idx_ind"], tables=["t"])
+    client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
+    assert bag(rows(client, sn, q)) == unbounded
+    assert sum(c for _, c in unbounded) == 300, "the 30 NULL rows are in neither"
+
+
+def test_a_replicated_global_aggregate_grounds_on_an_empty_range(client, schema_name):
+    """A replicated base's global COUNT(*) is the shape that reaches
+    `backfill_view`, and an unmatched WHERE makes its range provably empty. The
+    ground row must still be minted: COUNT(*) = 0, at weight 1, one row."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, ind BIGINT NOT NULL)"
+        " WITH (replicated = true)", schema_name=sn)
+    _insert(client, sn, "t", [(i, i % 5) for i in range(100)])
+    client.execute_sql("CREATE INDEX ON t(ind)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW mv AS SELECT COUNT(*) AS c FROM t WHERE ind = 999", schema_name=sn)
+    assert bag(rows(client, sn, "SELECT * FROM mv")) == {(0,): 1}

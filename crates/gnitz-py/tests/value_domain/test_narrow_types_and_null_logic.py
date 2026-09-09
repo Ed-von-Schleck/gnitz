@@ -9,7 +9,6 @@ Two gap areas covered:
      in WHERE clauses (SQL 3VL correctness for ``BoolBinary``).
 """
 import pytest
-import gnitz
 from _uid import uid as _uid
 
 

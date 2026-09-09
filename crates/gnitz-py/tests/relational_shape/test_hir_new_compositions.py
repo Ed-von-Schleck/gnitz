@@ -5,6 +5,7 @@ same-relation INTERSECT/EXCEPT (the uniform collision wrapper). Maintained
 incrementally under inserts *and* deletes, and under the data-before-view
 (backfill) order — asserted on **weights**, not row presence."""
 
+from _read import bag, scanned
 from _uid import uid as _uid
 
 
@@ -14,15 +15,6 @@ def _rows(client, sn, view, keys):
     return sorted(rows)
 
 
-def _weights(client, sn, view, keys):
-    """Net weight per row — the Z-set observable. A row present at the wrong
-    multiplicity, or a ghost at weight 0, is invisible to `_rows` but not here."""
-    vid = client.resolve_table(sn, view)[0]
-    acc = {}
-    for r in client.scan(vid):
-        k = tuple(r._asdict()[c] for c in keys)
-        acc[k] = acc.get(k, 0) + r.weight
-    return {k: w for k, w in sorted(acc.items()) if w != 0}
 
 
 def _tu(client, sn):
@@ -129,11 +121,11 @@ def test_same_relation_except(client):
         client.execute_sql("CREATE VIEW v_ex AS SELECT a FROM t EXCEPT SELECT a FROM t", schema_name=sn)
         client.execute_sql("CREATE VIEW v_in AS SELECT a FROM t INTERSECT SELECT a FROM t", schema_name=sn)
         client.execute_sql("INSERT INTO t VALUES (1, 5, 0), (2, 6, 0)", schema_name=sn)
-        assert _weights(client, sn, "v_ex", ["a"]) == {}
-        assert _weights(client, sn, "v_in", ["a"]) == {(5,): 1, (6,): 1}
+        assert bag(scanned(client, sn, "v_ex"), "a") == {}
+        assert bag(scanned(client, sn, "v_in"), "a") == {(5,): 1, (6,): 1}
         client.execute_sql("DELETE FROM t WHERE id = 1", schema_name=sn)
-        assert _weights(client, sn, "v_ex", ["a"]) == {}
-        assert _weights(client, sn, "v_in", ["a"]) == {(6,): 1}
+        assert bag(scanned(client, sn, "v_ex"), "a") == {}
+        assert bag(scanned(client, sn, "v_in"), "a") == {(6,): 1}
     finally:
         client.drop_schema(sn)
 
@@ -149,8 +141,8 @@ def test_same_relation_setop_backfill(client):
         client.execute_sql("INSERT INTO t VALUES (1, 5, 0), (2, 6, 0)", schema_name=sn)
         client.execute_sql("CREATE VIEW v_ex AS SELECT a FROM t EXCEPT SELECT a FROM t", schema_name=sn)
         client.execute_sql("CREATE VIEW v_in AS SELECT a FROM t INTERSECT SELECT a FROM t", schema_name=sn)
-        assert _weights(client, sn, "v_ex", ["a"]) == {}
-        assert _weights(client, sn, "v_in", ["a"]) == {(5,): 1, (6,): 1}
+        assert bag(scanned(client, sn, "v_ex"), "a") == {}
+        assert bag(scanned(client, sn, "v_in"), "a") == {(5,): 1, (6,): 1}
     finally:
         client.drop_schema(sn)
 
@@ -166,7 +158,7 @@ def test_nested_setop_chain_backfill(client):
         client.execute_sql("INSERT INTO u VALUES (1, 5, 6)", schema_name=sn)
         client.execute_sql(
             "CREATE VIEW v AS SELECT a FROM t UNION SELECT a FROM u UNION SELECT b FROM t", schema_name=sn)
-        assert _weights(client, sn, "v", ["a"]) == {(1,): 1, (2,): 1, (3,): 1, (4,): 1, (5,): 1}
+        assert bag(scanned(client, sn, "v"), "a") == {(1,): 1, (2,): 1, (3,): 1, (4,): 1, (5,): 1}
     finally:
         client.drop_schema(sn)
 
@@ -183,9 +175,9 @@ def test_join_setop_side(client):
         client.execute_sql("INSERT INTO u VALUES (7, 40, 50), (8, 41, 51)", schema_name=sn)
         client.execute_sql("INSERT INTO t VALUES (1, 11, 7), (2, 12, 8)", schema_name=sn)
         # join side: t.b=7→a=11, t.b=8→a=12; right side: u.b = {50, 51}
-        assert _weights(client, sn, "v", ["a"]) == {(11,): 1, (12,): 1, (50,): 1, (51,): 1}
+        assert bag(scanned(client, sn, "v"), "a") == {(11,): 1, (12,): 1, (50,): 1, (51,): 1}
         client.execute_sql("DELETE FROM t WHERE id = 1", schema_name=sn)
-        assert _weights(client, sn, "v", ["a"]) == {(12,): 1, (50,): 1, (51,): 1}
+        assert bag(scanned(client, sn, "v"), "a") == {(12,): 1, (50,): 1, (51,): 1}
     finally:
         client.drop_schema(sn)
 
@@ -200,9 +192,9 @@ def test_union_all_weights(client):
         client.execute_sql("CREATE VIEW v AS SELECT a FROM t UNION ALL SELECT a FROM u", schema_name=sn)
         client.execute_sql("INSERT INTO t VALUES (1, 9, 0)", schema_name=sn)
         client.execute_sql("INSERT INTO u VALUES (1, 9, 0)", schema_name=sn)
-        assert _weights(client, sn, "v", ["a"]) == {(9,): 2}
+        assert bag(scanned(client, sn, "v"), "a") == {(9,): 2}
         client.execute_sql("DELETE FROM u WHERE id = 1", schema_name=sn)
-        assert _weights(client, sn, "v", ["a"]) == {(9,): 1}
+        assert bag(scanned(client, sn, "v"), "a") == {(9,): 1}
     finally:
         client.drop_schema(sn)
 
@@ -219,6 +211,6 @@ def test_grouped_setop_side_backfill(client):
         client.execute_sql(
             "CREATE VIEW v AS SELECT a AS k, SUM(b) AS s FROM t GROUP BY a UNION ALL SELECT id, a FROM u",
             schema_name=sn)
-        assert _weights(client, sn, "v", ["k", "s"]) == {(7, 99): 1, (10, 5): 1, (20, 5): 1}
+        assert bag(scanned(client, sn, "v"), "k", "s") == {(7, 99): 1, (10, 5): 1, (20, 5): 1}
     finally:
         client.drop_schema(sn)

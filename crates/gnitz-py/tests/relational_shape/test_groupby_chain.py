@@ -10,7 +10,6 @@ Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/relational_shape/test_groupby_chain.py -v --tb=short
 """
 
-import pytest
 from _uid import uid as _uid
 
 

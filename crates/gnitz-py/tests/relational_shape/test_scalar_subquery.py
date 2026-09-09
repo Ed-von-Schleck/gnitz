@@ -7,7 +7,6 @@ Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/relational_shape/test_scalar_subquery.py -v --tb=short
 """
 import pytest
-import gnitz
 from _uid import uid as _uid
 
 

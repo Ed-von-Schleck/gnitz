@@ -12,7 +12,6 @@ Run:
 from collections import Counter
 
 import pytest
-import gnitz
 import _oracle
 from _uid import uid as _uid
 

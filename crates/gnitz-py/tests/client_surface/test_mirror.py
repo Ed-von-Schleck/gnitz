@@ -21,8 +21,9 @@ import pytest
 import gnitz
 from _feedviews import (
     FEED, GROUPBY, JOIN, LINEAR, SETOP,
-    _base_tables, _churn, _flood, _key, _mk_feed, _rows, _uid, _zset,
+    _base_tables, _churn, _flood, _key, _mk_feed, _rows, _zset,
 )
+from _uid import uid as _uid
 import _mirrorproc
 
 

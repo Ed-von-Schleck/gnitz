@@ -177,6 +177,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Only the ids something addresses a relation by are exported.
     m.add("SCHEMA_TAB", gnitz_wire::SCHEMA_TAB)?;
     m.add("TABLE_TAB", gnitz_wire::TABLE_TAB)?;
+    m.add("VIEW_TAB", gnitz_wire::VIEW_TAB)?;
     m.add("COL_TAB", gnitz_wire::COL_TAB)?;
     m.add("IDX_TAB", gnitz_wire::IDX_TAB)?;
     m.add("FIRST_USER_TABLE_ID", gnitz_wire::FIRST_USER_TABLE_ID)?;

@@ -13,9 +13,7 @@ Run (both worker counts matter — the bug was deterministic at each):
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/relational_shape/test_shared_source_incremental.py -v --tb=short
 """
 
-import pytest
 
-import gnitz
 import _oracle as oracle
 from _uid import uid as _uid
 

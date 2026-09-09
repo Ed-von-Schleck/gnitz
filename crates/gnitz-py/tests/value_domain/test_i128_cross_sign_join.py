@@ -23,8 +23,6 @@ Two surfaces are tested:
    (the wide-PK OPK sign round-trip).
 """
 
-import pytest
-import gnitz
 from gnitz import ColumnDef, Schema, TypeCode, ZSetBatch
 from _uid import uid as _uid
 

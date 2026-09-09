@@ -257,7 +257,7 @@ def test_where_reeval_indexed_column(client, schema_name):
 
 
 def test_select_is_committed_only(client, schema_name):
-    t = _table(client, schema_name, "t")
+    _table(client, schema_name, "t")
     client.execute_sql("BEGIN", schema_name=schema_name)
     client.execute_sql("INSERT INTO t VALUES (5, 50)", schema_name=schema_name)
     # Buffered insert is invisible to SELECT until COMMIT.
@@ -525,7 +525,7 @@ def test_ddl_rejected_inside_transaction(client, schema_name):
 
 
 def test_committed_transaction_visible_in_view(client, schema_name):
-    t = _table(client, schema_name, "t")
+    _table(client, schema_name, "t")
     client.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t WHERE val > 0", schema_name=schema_name)
     _sql(client, schema_name,
          "BEGIN",

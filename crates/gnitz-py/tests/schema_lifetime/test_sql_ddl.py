@@ -2,18 +2,10 @@
 record each statement hands back.
 """
 
-import os
 
-import pytest
 from _uid import uid as _uid
 
 
-
-
-_NEEDS_MULTI = pytest.mark.skipif(
-    int(os.environ.get("GNITZ_WORKERS", "1")) < 2,
-    reason="the read/DDL concurrency path only exercises exchange/fanout at W >= 2",
-)
 
 
 class TestSqlDdl:

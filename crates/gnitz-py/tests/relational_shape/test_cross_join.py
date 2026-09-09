@@ -9,14 +9,10 @@ comparison: a row-set check would pass a W× duplication silently.
 """
 from collections import Counter
 
-import pytest
 import gnitz
 import _oracle as oracle
-from _serverproc import NUM_WORKERS
+from _serverproc import NEEDS_MULTI
 from _uid import uid as _uid
-
-_NEEDS_MULTI = pytest.mark.skipif(NUM_WORKERS < 2, reason="requires GNITZ_WORKERS >= 2")
-
 
 def _cleanup(client, sn):
     try:
@@ -320,7 +316,7 @@ class TestCrossJoin:
         finally:
             _cleanup(client, sn)
 
-    @_NEEDS_MULTI
+    @NEEDS_MULTI
     def test_replicated_sides(self, client):
         """A replicated side holds every row on every worker. Its delta relays
         single-sourced and the trace filter partitions it like a keyed side, so

@@ -10,7 +10,6 @@ cross) or drop the inner side entirely (EXISTS / IN).
 Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/relational_shape/test_join_payload_pruning.py -v --tb=short
 """
-import gnitz
 from _uid import uid as _uid
 
 

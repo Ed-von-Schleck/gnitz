@@ -8,7 +8,6 @@ Covers:
   - PK coercion: signed integer PK columns get coerced to unsigned
 """
 
-import math
 import uuid
 import pytest
 import gnitz

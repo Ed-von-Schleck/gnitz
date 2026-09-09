@@ -13,19 +13,11 @@ U64/I64; 16 for U128/UUID). This file exercises:
     regardless of stride or signedness).
 """
 
-import os
 
 import pytest
+from _serverproc import NEEDS_MULTI
 import gnitz
 from _uid import uid as _uid
-
-
-_NEEDS_MULTI = pytest.mark.skipif(
-    int(os.environ.get("GNITZ_WORKERS", "1")) < 2,
-    reason="requires GNITZ_WORKERS>=2",
-)
-
-
 
 
 def _cleanup(client, sn, *tables):
@@ -255,7 +247,7 @@ class TestNativePkDml:
 # Multi-worker partition routing parity
 # ---------------------------------------------------------------------------
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 class TestNativePkMultiWorker:
     """Master routes SEEK via worker_for_key(pk). INSERT and SEEK must
     produce the same u128 for the same logical literal — otherwise they land

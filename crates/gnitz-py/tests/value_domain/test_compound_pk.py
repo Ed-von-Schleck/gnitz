@@ -9,18 +9,10 @@ The Python `Schema` shim still exposes a single `pk_index` (it calls
 exercised here — the tests interact through SQL DDL/DML only.
 """
 
-import os
 import pytest
+from _serverproc import NEEDS_MULTI
 import gnitz
 from _uid import uid as _uid
-
-
-_NEEDS_MULTI = pytest.mark.skipif(
-    int(os.environ.get("GNITZ_WORKERS", "1")) < 2,
-    reason="requires GNITZ_WORKERS>=2",
-)
-
-
 
 
 def _cleanup(client, sn, *tables):
@@ -498,7 +490,7 @@ def test_view_group_by_compound_pk_having(client):
         _cleanup(client, sn, "src")
 
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_view_group_by_compound_pk_multiworker(client):
     """Change-C regression: a reduce sharding by ONE component of a compound PK
     must run the in-circuit exchange (the source is partitioned by the FULL PK, so
@@ -1424,7 +1416,7 @@ def test_compound_pk_on_conflict_batches_its_probe(client):
         _cleanup(client, sn, "t")
 
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_compound_pk_multi_worker_partition_routing(client):
     """Multi-worker correctness: 20 rows distributed across workers
     via compound-PK partition routing must all survive a scan, in
@@ -1445,7 +1437,7 @@ def test_compound_pk_multi_worker_partition_routing(client):
         _cleanup(client, sn, "t")
 
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_compound_pk_stride24_multi_worker_partition_routing(client):
     """Multi-worker correctness for a wide (stride-24) PK: 20 rows distributed
     across workers via the byte-path partition routing must all survive a scan

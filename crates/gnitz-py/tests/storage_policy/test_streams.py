@@ -12,15 +12,8 @@ Run:
 
 import pytest
 import gnitz
-from _serverproc import NUM_WORKERS as _NUM_WORKERS
+from _serverproc import NEEDS_MULTI
 from _uid import uid as _uid
-
-_NEEDS_MULTI = pytest.mark.skipif(
-    _NUM_WORKERS < 2, reason="placement and exchange only matter with GNITZ_WORKERS >= 2"
-)
-
-
-
 
 def _rows(conn, sn, q):
     res = conn.execute_sql(q, schema_name=sn)[0]
@@ -402,7 +395,7 @@ def test_insert_on_conflict_is_rejected_on_a_stream(client):
 # ---------------------------------------------------------------------------
 
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_a_replicated_stream_aggregates_without_a_w_fold_overcount(client):
     """A replicated stream must report `replicated = true` in its resolve reply.
     Reported as non-replicated, the client's two-phase reduce becomes eligible and
@@ -427,7 +420,7 @@ def test_a_replicated_stream_aggregates_without_a_w_fold_overcount(client):
         client.drop_schema(sn)
 
 
-@_NEEDS_MULTI
+@NEEDS_MULTI
 def test_a_cluster_by_stream_routes_by_its_prefix(client):
     sn = "x" + _uid()
     client.create_schema(sn)

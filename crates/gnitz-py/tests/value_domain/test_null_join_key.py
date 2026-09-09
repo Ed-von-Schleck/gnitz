@@ -10,7 +10,6 @@ Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/value_domain/test_null_join_key.py -v --tb=short
 """
 import os
-import gnitz
 from _uid import uid as _uid
 
 _NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))

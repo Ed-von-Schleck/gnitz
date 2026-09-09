@@ -8,7 +8,6 @@ view bodies, and the same `{row → net weight}` comparison. Keeping one copy he
 is what makes "the mirror agrees with the feed" a comparison of two mechanisms
 rather than of two setups.
 """
-from _uid import uid as _uid
 
 # Big enough that nothing built on these helpers falls off the window; a test
 # about retention sets its own.

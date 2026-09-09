@@ -1174,7 +1174,6 @@ class TestRangeJoin:
         try:
             vid, _ = self._mk_pure_range_left(client, sn, "<", b_y="INT UNSIGNED NOT NULL")
             # b EMPTY. a's include a negative x (below b.y's unsigned domain).
-            a_rows = [(1, -5), (2, 0), (3, 1000)]
             client.execute_sql("INSERT INTO a VALUES (1,-5), (2,0), (3,1000)", schema_name=sn)
             assert _band_left_rows(client, vid) == {(1, None), (2, None), (3, None)}, \
                 "empty b must null-fill every a, incl a.x below b.y's type min"
