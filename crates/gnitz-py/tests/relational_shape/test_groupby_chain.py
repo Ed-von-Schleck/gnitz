@@ -1,650 +1,446 @@
-"""E2E tests: a GROUP BY / aggregate subquery compiles into a hidden reduce view
-chained to the final view — the aggregate-then-join analytics pattern.
+"""An aggregate or DISTINCT chained to a join: the analytics shape where one
+compiled bundle holds a hidden view plus a user-named one.
 
-`WITH agg AS (SELECT cid, SUM(amt) FROM orders GROUP BY cid) SELECT c.name, agg.total
-FROM agg JOIN customers c ON agg.cid = c.id` becomes an atomic bundle: a hidden reduce
-view over `orders` (group key = natural PK, so no synthetic-PK machinery) feeding the
-user-named join. The aggregate may be the CTE/derived body or the final view.
+Two directions, and the file is split along them:
 
-Run:
-    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/relational_shape/test_groupby_chain.py -v --tb=short
+  * the aggregate is the *inner* body — a CTE or a derived table — and the join
+    runs over it, so the bundle is `reduce → join`;
+  * the aggregate is the *outer* body over a join, so the join compiles to a
+    hidden view H and the reduce or distinct runs over it, `join → reduce`. The
+    group, aggregate and WHERE columns then resolve against H, and H is pruned to
+    the names that outer operator evaluates.
+
+Every assertion is a weighted bag: a chain that emitted a group twice, or left a
+retracted row behind at weight 0, would pass a row-set comparison.
 """
 
-from _uid import uid as _uid
+import pytest
+from _read import bag, scanned
 
 
-
-
-def _cleanup(client, sn):
-    try:
-        client.drop_schema(sn)
-    except Exception:
-        pass
-
-
-def _rows(client, sn, view, keys):
-    """Positive-weight rows as key tuples, NULL-safe sorted (NULLs last — outer joins)."""
-    vid = client.resolve_table(sn, view)[0]
-    rows = [tuple(r._asdict()[k] for k in keys) for r in client.scan(vid)]
-    return sorted(rows, key=lambda t: tuple((x is None, x) for x in t))
-
-
-def _orders_customers(client, sn):
+def _orders_customers(client, sn, dim="name VARCHAR(50) NOT NULL"):
     client.execute_sql(
-        "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, amt BIGINT NOT NULL)",
-        schema_name=sn,
-    )
+        "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, "
+        "amt BIGINT NOT NULL)", schema_name=sn)
     client.execute_sql(
-        "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, name VARCHAR(50) NOT NULL)", schema_name=sn
-    )
+        f"CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, {dim})", schema_name=sn)
 
 
-class TestGroupByChain:
-    def test_aggregate_cte_joined_incremental(self, client):
-        """A SUM-per-group CTE joined with a dimension table, maintained incrementally."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            _orders_customers(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS WITH agg AS (SELECT cid, SUM(amt) AS total FROM orders GROUP BY cid) "
-                "SELECT c.name AS nm, agg.total AS tot FROM agg JOIN customers c ON agg.cid = c.id",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob')", schema_name=sn)
-            client.execute_sql("INSERT INTO orders VALUES (1, 1, 100), (2, 1, 50), (3, 2, 200)", schema_name=sn)
-            # agg: cid1 -> 150, cid2 -> 200.
-            assert _rows(client, sn, "v", ["nm", "tot"]) == [("Alice", 150), ("Bob", 200)]
-
-            # New order for Alice re-aggregates and re-joins.
-            client.execute_sql("INSERT INTO orders VALUES (4, 1, 25)", schema_name=sn)
-            assert _rows(client, sn, "v", ["nm", "tot"]) == [("Alice", 175), ("Bob", 200)]
-
-            # Retract an order.
-            client.execute_sql("DELETE FROM orders WHERE id = 3", schema_name=sn)
-            assert _rows(client, sn, "v", ["nm", "tot"]) == [("Alice", 175)]
-        finally:
-            _cleanup(client, sn)
-
-    def test_groupby_final_over_filter_cte(self, client):
-        """A filter CTE feeding a GROUP BY final (reduce over a hidden filter view)."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, amt BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS WITH big AS (SELECT id, cid, amt FROM orders WHERE amt > 50) "
-                "SELECT cid, COUNT(*) AS n FROM big GROUP BY cid",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 1, 100), (2, 1, 30), (3, 2, 200), (4, 2, 60)", schema_name=sn
-            )
-            # big keeps o1 (cid1), o3 (cid2), o4 (cid2); count by cid -> cid1:1, cid2:2.
-            assert _rows(client, sn, "v", ["cid", "n"]) == [(1, 1), (2, 2)]
-        finally:
-            _cleanup(client, sn)
-
-    def test_aggregate_derived_joined(self, client):
-        """The aggregate as a derived table (FROM-clause form) joined with a dimension."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            _orders_customers(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT c.name AS nm, a.total AS tot "
-                "FROM (SELECT cid, SUM(amt) AS total FROM orders GROUP BY cid) a "
-                "JOIN customers c ON a.cid = c.id",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO customers VALUES (1, 'Alice')", schema_name=sn)
-            client.execute_sql("INSERT INTO orders VALUES (1, 1, 100), (2, 1, 50)", schema_name=sn)
-            assert _rows(client, sn, "v", ["nm", "tot"]) == [("Alice", 150)]
-        finally:
-            _cleanup(client, sn)
-
-    def test_two_aggregate_ctes_joined(self, client):
-        """Two aggregate CTEs over different tables, joined on their group keys."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, x BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, y BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS WITH sa AS (SELECT k, SUM(x) AS sx FROM a GROUP BY k), "
-                "sb AS (SELECT k, SUM(y) AS sy FROM b GROUP BY k) "
-                "SELECT sa.sx AS sx, sb.sy AS sy FROM sa JOIN sb ON sa.k = sb.k",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO a VALUES (1, 7, 10), (2, 7, 20), (3, 9, 5)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (1, 7, 100), (2, 8, 200)", schema_name=sn)
-            # sa: k7 -> 30, k9 -> 5. sb: k7 -> 100, k8 -> 200. join on k -> k7: (30, 100).
-            assert _rows(client, sn, "v", ["sx", "sy"]) == [(30, 100)]
-        finally:
-            _cleanup(client, sn)
+# ── The aggregate below the join ──────────────────────────────────────────────
 
 
-class TestGroupByChainLifecycle:
-    def test_aggregate_chain_backfill(self, client):
-        """Orders/customers exist before the aggregate-joined view — the reduce + join
-        must backfill from the accumulated base state."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            _orders_customers(client, sn)
-            client.execute_sql("INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob')", schema_name=sn)
-            client.execute_sql("INSERT INTO orders VALUES (1, 1, 100), (2, 1, 50), (3, 2, 200)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS WITH agg AS (SELECT cid, SUM(amt) AS total FROM orders GROUP BY cid) "
-                "SELECT c.name AS nm, agg.total AS tot FROM agg JOIN customers c ON agg.cid = c.id",
-                schema_name=sn,
-            )
-            assert _rows(client, sn, "v", ["nm", "tot"]) == [("Alice", 150), ("Bob", 200)]
-            # Still incremental after backfill.
-            client.execute_sql("INSERT INTO orders VALUES (4, 2, 5)", schema_name=sn)
-            assert _rows(client, sn, "v", ["nm", "tot"]) == [("Alice", 150), ("Bob", 205)]
-        finally:
-            _cleanup(client, sn)
+@pytest.mark.parametrize("body", [
+    "WITH agg AS (SELECT cid, SUM(amt) AS total FROM orders GROUP BY cid) "
+    "SELECT c.name AS nm, agg.total AS tot FROM agg JOIN customers c ON agg.cid = c.id",
+    "SELECT c.name AS nm, a.total AS tot "
+    "FROM (SELECT cid, SUM(amt) AS total FROM orders GROUP BY cid) a "
+    "JOIN customers c ON a.cid = c.id",
+], ids=["cte", "derived"])
+@pytest.mark.parametrize("prepopulate", [False, True], ids=["incremental", "backfill"])
+def test_a_sum_per_group_joined_to_a_dimension_is_maintained(
+        client, schema_name, body, prepopulate):
+    """The aggregate is the CTE or derived-table body and the join runs over its
+    output, so a new fact row must re-aggregate its group and re-join it, and
+    retracting a group's last row must drop the joined row entirely. The grouping
+    key here is the reduce's natural PK, so no synthetic key is involved."""
+    sn = schema_name
+    _orders_customers(client, sn)
 
-    def test_aggregate_chain_drop_cascade(self, client):
-        """DROP VIEW retires the hidden reduce segment, freeing orders and customers."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            _orders_customers(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS WITH agg AS (SELECT cid, SUM(amt) AS total FROM orders GROUP BY cid) "
-                "SELECT c.name AS nm, agg.total AS tot FROM agg JOIN customers c ON agg.cid = c.id",
-                schema_name=sn,
-            )
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-            client.execute_sql("DROP TABLE customers", schema_name=sn)
-        finally:
-            _cleanup(client, sn)
+    def fill():
+        client.execute_sql("INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob')", schema_name=sn)
+        client.execute_sql(
+            "INSERT INTO orders VALUES (1, 1, 100), (2, 1, 50), (3, 2, 200)", schema_name=sn)
+
+    if prepopulate:
+        fill()
+    client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=sn)
+    if not prepopulate:
+        fill()
+
+    assert bag(scanned(client, sn, "v"), "nm", "tot") == {("Alice", 150): 1, ("Bob", 200): 1}
+
+    client.execute_sql("INSERT INTO orders VALUES (4, 1, 25)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "nm", "tot") == {("Alice", 175): 1, ("Bob", 200): 1}
+
+    client.execute_sql("DELETE FROM orders WHERE id = 3", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "nm", "tot") == {("Alice", 175): 1}
 
 
-class TestGroupByOverJoin:
-    """`SELECT k, agg(x) FROM <join> [WHERE …] GROUP BY k` — a GROUP BY directly over a
-    join (no explicit CTE). The join compiles to a hidden view H and the reduce runs over
-    it; group/aggregate/WHERE columns resolve against H by name (unqualified)."""
-
-    def test_fact_dimension_sum(self, client):
-        """orders ⋈ customers, SUM by the dimension's region — the classic analytics shape."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, amt BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL)", schema_name=sn
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT region AS reg, SUM(amt) AS total "
-                "FROM orders JOIN customers ON orders.cid = customers.id GROUP BY region",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200)", schema_name=sn)
-            client.execute_sql("INSERT INTO orders VALUES (1, 1, 50), (2, 1, 30), (3, 2, 70)", schema_name=sn)
-            assert _rows(client, sn, "v", ["reg", "total"]) == [(100, 80), (200, 70)]
-
-            # Incremental + retraction re-aggregate correctly.
-            client.execute_sql("INSERT INTO orders VALUES (4, 2, 5)", schema_name=sn)
-            assert _rows(client, sn, "v", ["reg", "total"]) == [(100, 80), (200, 75)]
-            client.execute_sql("DELETE FROM orders WHERE id = 1", schema_name=sn)
-            assert _rows(client, sn, "v", ["reg", "total"]) == [(100, 30), (200, 75)]
-        finally:
-            _cleanup(client, sn)
-
-    def test_group_by_over_join_with_where(self, client):
-        """A WHERE (now consumed inside the hidden join circuit) filters rows before
-        grouping — incrementally: inserts below/above the threshold flow through, and
-        retracting a contributing row re-aggregates its group."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, amt BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL)", schema_name=sn
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT region AS reg, COUNT(*) AS n, SUM(amt) AS s "
-                "FROM orders JOIN customers ON orders.cid = customers.id WHERE amt > 40 GROUP BY region",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200)", schema_name=sn)
-            client.execute_sql("INSERT INTO orders VALUES (1, 1, 50), (2, 1, 30), (3, 2, 70)", schema_name=sn)
-            # amt>40 keeps o1(reg100,50), o3(reg200,70); o2(amt30) filtered.
-            assert _rows(client, sn, "v", ["reg", "n", "s"]) == [(100, 1, 50), (200, 1, 70)]
-
-            # Insert below threshold (no effect) and above (adds to region 100).
-            client.execute_sql("INSERT INTO orders VALUES (4, 1, 10), (5, 1, 60)", schema_name=sn)
-            assert _rows(client, sn, "v", ["reg", "n", "s"]) == [(100, 2, 110), (200, 1, 70)]
-
-            # Retract a contributing row (o1, amt 50, reg 100).
-            client.execute_sql("DELETE FROM orders WHERE id = 1", schema_name=sn)
-            assert _rows(client, sn, "v", ["reg", "n", "s"]) == [(100, 1, 60), (200, 1, 70)]
-        finally:
-            _cleanup(client, sn)
-
-    def test_distinct_over_join_with_where(self, client):
-        """SELECT DISTINCT over an INNER join + WHERE: the WHERE runs inside the hidden
-        join circuit; DISTINCT dedups the filtered projection, incrementally."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, amt BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL)", schema_name=sn
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT DISTINCT region AS reg "
-                "FROM orders JOIN customers ON orders.cid = customers.id WHERE amt > 40",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200)", schema_name=sn)
-            client.execute_sql("INSERT INTO orders VALUES (1, 1, 50), (2, 1, 30), (3, 2, 70)", schema_name=sn)
-            # amt>40: o1(reg100), o3(reg200). DISTINCT regions {100, 200}.
-            assert _rows(client, sn, "v", ["reg"]) == [(100,), (200,)]
-
-            # A second above-threshold order into region 100 — DISTINCT keeps one 100.
-            client.execute_sql("INSERT INTO orders VALUES (4, 1, 90)", schema_name=sn)
-            assert _rows(client, sn, "v", ["reg"]) == [(100,), (200,)]
-
-            # Retract the sole region-200 contributor -> 200 drops.
-            client.execute_sql("DELETE FROM orders WHERE id = 3", schema_name=sn)
-            assert _rows(client, sn, "v", ["reg"]) == [(100,)]
-        finally:
-            _cleanup(client, sn)
-
-    def test_group_by_left_join_where_nullfill(self, client):
-        """GROUP BY over an OUTER (equi) LEFT JOIN with the WHERE inside the join
-        circuit: a preserved-side predicate keeps null-filled groups; a right-side
-        predicate drops them; `right IS NULL` keeps exactly the unmatched rows.
-        Maintained under churn on the preserved side."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, amt BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL)", schema_name=sn
-            )
-            # Preserved-side WHERE keeps null-filled rows (region = NULL group).
-            client.execute_sql(
-                "CREATE VIEW vp AS SELECT region AS reg, COUNT(*) AS n "
-                "FROM a LEFT JOIN b ON a.k = b.id WHERE a.amt > 40 GROUP BY region",
-                schema_name=sn,
-            )
-            # Right-side WHERE drops null-filled rows (NULL cmp = UNKNOWN).
-            client.execute_sql(
-                "CREATE VIEW vr AS SELECT region AS reg, COUNT(*) AS n "
-                "FROM a LEFT JOIN b ON a.k = b.id WHERE region > 0 GROUP BY region",
-                schema_name=sn,
-            )
-            # `b.id IS NULL` keeps exactly the unmatched rows (anti-join; `id` is carried
-            # by both sides, so the qualifier must resolve through the join alias map).
-            client.execute_sql(
-                "CREATE VIEW vn AS SELECT COUNT(*) AS n "
-                "FROM a LEFT JOIN b ON a.k = b.id WHERE b.id IS NULL",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO b VALUES (10, 500)", schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO a VALUES (1, 10, 50), (2, 99, 70), (3, 10, 30), (4, 88, 20)",
-                schema_name=sn,
-            )
-            # vp: amt>40 keeps a1(reg500), a2(reg NULL); groups {500:1, None:1}.
-            assert _rows(client, sn, "vp", ["reg", "n"]) == [(500, 1), (None, 1)]
-            # vr: region>0 keeps only the matched rows a1, a3 (both k=10); null-fills drop.
-            assert _rows(client, sn, "vr", ["reg", "n"]) == [(500, 2)]
-            # vn: unmatched a = {a2, a4} -> count 2.
-            assert _rows(client, sn, "vn", ["n"]) == [(2,)]
-
-            # Churn: delete matched a1, insert unmatched a5 amt 80 (passes preserved WHERE).
-            client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=sn)
-            client.execute_sql("INSERT INTO a VALUES (5, 77, 80)", schema_name=sn)
-            assert _rows(client, sn, "vp", ["reg", "n"]) == [(None, 2)]  # a2, a5 (NULL)
-            assert _rows(client, sn, "vr", ["reg", "n"]) == [(500, 1)]  # a1 gone, a3 remains
-            assert _rows(client, sn, "vn", ["n"]) == [(3,)]  # a2, a4, a5 unmatched
-        finally:
-            _cleanup(client, sn)
-
-    def test_group_by_band_left_join_where(self, client):
-        """GROUP BY over a band LEFT JOIN (eq prefix + range) + preserved-side WHERE —
-        the `[(500,1),(None,1)]` shape under updates and retractions."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL, "
-                "amt BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, hi BIGINT NOT NULL, "
-                "region BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT region AS reg, COUNT(*) AS n "
-                "FROM a LEFT JOIN b ON a.k = b.k AND a.lo < b.hi WHERE amt > 40 GROUP BY region",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO b VALUES (10, 1, 100, 500)", schema_name=sn)
-            # a1 matched (k=1, 50<100) reg500; a2 unmatched (k=2) regNULL; a3 range-fail (200<100) drop by amt? no,
-            # a3 amt=30 filtered by WHERE.
-            client.execute_sql(
-                "INSERT INTO a VALUES (1, 1, 50, 70), (2, 2, 10, 80), (3, 1, 50, 30)",
-                schema_name=sn,
-            )
-            assert _rows(client, sn, "v", ["reg", "n"]) == [(500, 1), (None, 1)]
-
-            # Insert another unmatched above-threshold row -> None group grows.
-            client.execute_sql("INSERT INTO a VALUES (4, 3, 5, 100)", schema_name=sn)
-            assert _rows(client, sn, "v", ["reg", "n"]) == [(500, 1), (None, 2)]
-
-            # Retract the matched a1 -> region 500 empties.
-            client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=sn)
-            assert _rows(client, sn, "v", ["reg", "n"]) == [(None, 2)]
-        finally:
-            _cleanup(client, sn)
-
-    def test_distinct_pure_range_left_join_where(self, client):
-        """SELECT DISTINCT over a pure-range LEFT JOIN + preserved-side WHERE: matched
-        rows carry the right value, unmatched carry NULL; DISTINCT dedups. Under churn."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, lo BIGINT NOT NULL, amt BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, hi BIGINT NOT NULL, region BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT DISTINCT region AS reg "
-                "FROM a LEFT JOIN b ON a.lo < b.hi WHERE amt > 40",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO b VALUES (10, 100, 500)", schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO a VALUES (1, 50, 70), (2, 200, 80), (3, 60, 90)",
-                schema_name=sn,
-            )
-            # a1,a3 matched (lo<100) reg=500; a2 unmatched reg=NULL. DISTINCT {500, None}.
-            assert _rows(client, sn, "v", ["reg"]) == [(500,), (None,)]
-
-            # Retract a2 (the only unmatched) -> None drops.
-            client.execute_sql("DELETE FROM a WHERE id = 2", schema_name=sn)
-            assert _rows(client, sn, "v", ["reg"]) == [(500,)]
-        finally:
-            _cleanup(client, sn)
-
-    def test_group_by_join_where_backfill_parity(self, client):
-        """The filtered grouped-join view over pre-populated tables (backfill) equals
-        the fresh-insert run — WHERE-in-circuit is order-independent."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, amt BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL)", schema_name=sn
-            )
-            # Populate BEFORE the view exists.
-            client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200)", schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 1, 50), (2, 1, 30), (3, 2, 70), (4, 1, 60)", schema_name=sn
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT region AS reg, COUNT(*) AS n, SUM(amt) AS s "
-                "FROM orders JOIN customers ON orders.cid = customers.id WHERE amt > 40 GROUP BY region",
-                schema_name=sn,
-            )
-            # amt>40 keeps o1(50), o4(60) -> reg100 {n2, s110}; o3(70) -> reg200 {n1, s70}.
-            assert _rows(client, sn, "v", ["reg", "n", "s"]) == [(100, 2, 110), (200, 1, 70)]
-        finally:
-            _cleanup(client, sn)
-
-    def test_group_by_join_qualified_dup_name_where(self, client):
-        """A WHERE qualifying a column both sides carry (`orders.id`) resolves through
-        the join's alias map — formerly 'ambiguous' when bound by bare name over H."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, amt BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            # customers ALSO carries `id` (the PK) — so a bare `id` in WHERE is ambiguous.
-            client.execute_sql(
-                "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL)", schema_name=sn
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT region AS reg, COUNT(*) AS n "
-                "FROM orders JOIN customers ON orders.cid = customers.id WHERE orders.id > 1 GROUP BY region",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200)", schema_name=sn)
-            client.execute_sql("INSERT INTO orders VALUES (1, 1, 50), (2, 1, 30), (3, 2, 70)", schema_name=sn)
-            # orders.id>1 keeps o2(cid1->reg100), o3(cid2->reg200) -> {100:1, 200:1}.
-            assert _rows(client, sn, "v", ["reg", "n"]) == [(100, 1), (200, 1)]
-        finally:
-            _cleanup(client, sn)
-
-    def test_group_by_over_three_way_join(self, client):
-        """A star-schema shape: fact ⋈ dim ⋈ dim, SUM by the far dimension's group."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, amt BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, c BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql("CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT grp, SUM(amt) AS total "
-                "FROM a JOIN b ON a.cid = b.id JOIN c ON b.c = c.id GROUP BY grp",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO b VALUES (10, 500)", schema_name=sn)
-            client.execute_sql("INSERT INTO c VALUES (500, 7)", schema_name=sn)
-            client.execute_sql("INSERT INTO a VALUES (1, 10, 100), (2, 10, 50)", schema_name=sn)
-            assert _rows(client, sn, "v", ["grp", "total"]) == [(7, 150)]
-            client.execute_sql("INSERT INTO a VALUES (3, 10, 25)", schema_name=sn)
-            assert _rows(client, sn, "v", ["grp", "total"]) == [(7, 175)]
-        finally:
-            _cleanup(client, sn)
+def test_two_aggregate_ctes_join_on_their_group_keys(client, schema_name):
+    """Both join inputs are reduce outputs, so the join key is each side's group
+    key and a key present in only one side contributes nothing."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, x BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, y BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS WITH sa AS (SELECT k, SUM(x) AS sx FROM a GROUP BY k), "
+        "sb AS (SELECT k, SUM(y) AS sy FROM b GROUP BY k) "
+        "SELECT sa.sx AS sx, sb.sy AS sy FROM sa JOIN sb ON sa.k = sb.k", schema_name=sn)
+    # sa: k7 → 30, k9 → 5. sb: k7 → 100, k8 → 200. Only k7 is in both.
+    client.execute_sql("INSERT INTO a VALUES (1, 7, 10), (2, 7, 20), (3, 9, 5)", schema_name=sn)
+    client.execute_sql("INSERT INTO b VALUES (1, 7, 100), (2, 8, 200)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "sx", "sy") == {(30, 100): 1}
 
 
-class TestDistinctOverJoin:
-    """`SELECT DISTINCT … FROM <join>` — a DISTINCT directly over a join. The join
-    compiles to a hidden view H and the distinct runs over H."""
-
-    def test_distinct_dimension_of_joined_facts(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL)", schema_name=sn
-            )
-            client.execute_sql(
-                "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL)", schema_name=sn
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT DISTINCT region FROM orders JOIN customers ON orders.cid = customers.id",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200), (3, 300)", schema_name=sn)
-            client.execute_sql("INSERT INTO orders VALUES (1, 1), (2, 1), (3, 2)", schema_name=sn)  # 300 unordered
-            assert _rows(client, sn, "v", ["region"]) == [(100,), (200,)]
-
-            client.execute_sql("INSERT INTO orders VALUES (4, 3)", schema_name=sn)  # region 300 now appears
-            assert _rows(client, sn, "v", ["region"]) == [(100,), (200,), (300,)]
-            client.execute_sql("DELETE FROM orders WHERE cid = 1", schema_name=sn)  # both 100-orders gone
-            assert _rows(client, sn, "v", ["region"]) == [(200,), (300,)]
-        finally:
-            _cleanup(client, sn)
-
-    def test_distinct_over_three_way_join(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, c BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql("CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT DISTINCT grp FROM a JOIN b ON a.cid = b.id JOIN c ON b.c = c.id",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO b VALUES (10, 500)", schema_name=sn)
-            client.execute_sql("INSERT INTO c VALUES (500, 7)", schema_name=sn)
-            client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 10)", schema_name=sn)
-            assert _rows(client, sn, "v", ["grp"]) == [(7,)]
-        finally:
-            _cleanup(client, sn)
+def test_a_filter_cte_feeds_the_group_by(client, schema_name):
+    """The reduce's input is a hidden filter view rather than a base table, so
+    rows the CTE drops never reach the fold."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, "
+        "amt BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS WITH big AS (SELECT id, cid, amt FROM orders WHERE amt > 50) "
+        "SELECT cid, COUNT(*) AS n FROM big GROUP BY cid", schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO orders VALUES (1, 1, 100), (2, 1, 30), (3, 2, 200), (4, 2, 60)",
+        schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "cid", "n") == {(1, 1): 1, (2, 2): 1}
 
 
-class TestPrunedHiddenJoin:
-    """The hidden join view H under GROUP BY / DISTINCT projects only
-    the names the outer operator evaluates over it (group cols, aggregate arguments,
-    HAVING refs, or the DISTINCT items). Bare-name collection keeps every same-named
-    candidate, so ambiguity behavior is unchanged; an empty set keeps the wildcard H."""
+def test_dropping_the_chained_view_retires_its_hidden_reduce(client, schema_name):
+    """The bundle's hidden reduce segment is retired with the user-named view, so
+    both source tables are free to drop straight after. `orders` is reached only
+    through that hidden segment, and a table under a live view refuses to
+    drop — which is what makes the refusal beforehand the precondition and the
+    success afterwards the fact."""
+    sn = schema_name
+    _orders_customers(client, sn)
+    client.execute_sql(
+        "CREATE VIEW v AS WITH agg AS (SELECT cid, SUM(amt) AS total FROM orders GROUP BY cid) "
+        "SELECT c.name AS nm, agg.total AS tot FROM agg JOIN customers c ON agg.cid = c.id",
+        schema_name=sn)
+    with pytest.raises(Exception, match="dependency"):
+        client.execute_sql("DROP TABLE orders", schema_name=sn)
 
-    def test_group_by_join_min_max_pruned_h(self, client):
-        """MIN/MAX over a joined value column: the aggregate argument is retained in H.
-        Non-linear MIN/MAX track correctly under insert and retraction."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, amt BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL)", schema_name=sn
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT region AS reg, MIN(amt) AS lo, MAX(amt) AS hi "
-                "FROM orders JOIN customers ON orders.cid = customers.id GROUP BY region",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200)", schema_name=sn)
-            client.execute_sql("INSERT INTO orders VALUES (1, 1, 50), (2, 1, 80), (3, 2, 30)", schema_name=sn)
-            assert _rows(client, sn, "v", ["reg", "lo", "hi"]) == [(100, 50, 80), (200, 30, 30)]
+    client.execute_sql("DROP VIEW v", schema_name=sn)
+    client.execute_sql("DROP TABLE orders", schema_name=sn)
+    client.execute_sql("DROP TABLE customers", schema_name=sn)
 
-            # Insert a new low into region 100 -> MIN moves.
-            client.execute_sql("INSERT INTO orders VALUES (4, 1, 20)", schema_name=sn)
-            assert _rows(client, sn, "v", ["reg", "lo", "hi"]) == [(100, 20, 80), (200, 30, 30)]
 
-            # Retract the region-100 max (amt 80) -> MAX moves down (non-linear).
-            client.execute_sql("DELETE FROM orders WHERE id = 2", schema_name=sn)
-            assert _rows(client, sn, "v", ["reg", "lo", "hi"]) == [(100, 20, 50), (200, 30, 30)]
-        finally:
-            _cleanup(client, sn)
+# ── The aggregate or DISTINCT above the join ──────────────────────────────────
 
-    def test_count_star_join_wildcard_h(self, client):
-        """`SELECT COUNT(*) FROM a JOIN b ON …` collects no operator names, so H keeps
-        the wildcard (degenerate no-pruning). It registers and counts correctly."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, amt BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL)", schema_name=sn
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT COUNT(*) AS n FROM orders JOIN customers ON orders.cid = customers.id",
-                schema_name=sn,
-            )
-            client.resolve_table(sn, "v")  # registered
-            client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200)", schema_name=sn)
-            client.execute_sql("INSERT INTO orders VALUES (1, 1, 50), (2, 1, 80), (3, 2, 30)", schema_name=sn)
-            assert _rows(client, sn, "v", ["n"]) == [(3,)]
-            client.execute_sql("DELETE FROM orders WHERE id = 1", schema_name=sn)
-            assert _rows(client, sn, "v", ["n"]) == [(2,)]
-        finally:
-            _cleanup(client, sn)
 
-    def test_qualified_agg_arg_dup_name_resolves(self, client):
-        """`SUM(orders.amt)` where BOTH sides carry `amt`: the HIR binder resolves
-        the *qualified* aggregate argument against the join scope directly (no
-        bare-name H pruning), so it is unambiguous — a correctness improvement over
-        the old bare-name-collision rejection. It sums only `orders.amt`."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, amt BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            # customers ALSO carries `amt` (which the qualified arg must NOT sum).
-            client.execute_sql(
-                "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, amt BIGINT NOT NULL)", schema_name=sn
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT SUM(orders.amt) AS s "
-                "FROM orders JOIN customers ON orders.cid = customers.id",
-                schema_name=sn,
-            )
-            client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200)", schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 1, 50), (2, 1, 80), (3, 2, 30)", schema_name=sn)
-            # Every order matches a customer; SUM(orders.amt) = 50+80+30 = 160
-            # (the customers' amt 100/200 must not contribute).
-            assert _rows(client, sn, "v", ["s"]) == [(160,)]
-        finally:
-            _cleanup(client, sn)
+@pytest.mark.parametrize("prepopulate", [False, True], ids=["incremental", "backfill"])
+def test_a_group_by_over_a_join_aggregates_the_dimensions_column(
+        client, schema_name, prepopulate):
+    """`SELECT k, agg(x) FROM <join> GROUP BY k` with no explicit CTE: the join
+    compiles to a hidden view H and the reduce runs over it, resolving the group
+    and aggregate columns against H by unqualified name. Derived from scratch over
+    a populated join and maintained per tick, both."""
+    sn = schema_name
+    _orders_customers(client, sn, dim="region BIGINT NOT NULL")
 
-    def test_distinct_join_pruned_h_backfill(self, client):
-        """SELECT DISTINCT of a subset of join columns: H is pruned to those names.
-        Backfill (data before view) equals the incremental run."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, amt BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL)", schema_name=sn
-            )
-            client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200)", schema_name=sn)
-            client.execute_sql("INSERT INTO orders VALUES (1, 1, 50), (2, 1, 80), (3, 2, 30)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT DISTINCT region AS reg "
-                "FROM orders JOIN customers ON orders.cid = customers.id",
-                schema_name=sn,
-            )
-            # regions of orders' customers: {100 (cid1), 200 (cid2)}.
-            assert _rows(client, sn, "v", ["reg"]) == [(100,), (200,)]
-        finally:
-            _cleanup(client, sn)
+    def fill():
+        client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200)", schema_name=sn)
+        client.execute_sql(
+            "INSERT INTO orders VALUES (1, 1, 50), (2, 1, 30), (3, 2, 70)", schema_name=sn)
+
+    if prepopulate:
+        fill()
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT region AS reg, SUM(amt) AS total "
+        "FROM orders JOIN customers ON orders.cid = customers.id GROUP BY region",
+        schema_name=sn)
+    if not prepopulate:
+        fill()
+
+    assert bag(scanned(client, sn, "v"), "reg", "total") == {(100, 80): 1, (200, 70): 1}
+
+    client.execute_sql("INSERT INTO orders VALUES (4, 2, 5)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg", "total") == {(100, 80): 1, (200, 75): 1}
+
+    client.execute_sql("DELETE FROM orders WHERE id = 1", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg", "total") == {(100, 30): 1, (200, 75): 1}
+
+
+def test_a_where_over_a_join_is_consumed_inside_the_hidden_circuit(client, schema_name):
+    """The WHERE of a grouped-join body runs inside H, so rows it drops never
+    reach the fold — under a fresh insert below and above the threshold, and under
+    a retraction of a row that was contributing."""
+    sn = schema_name
+    _orders_customers(client, sn, dim="region BIGINT NOT NULL")
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT region AS reg, COUNT(*) AS n, SUM(amt) AS s "
+        "FROM orders JOIN customers ON orders.cid = customers.id WHERE amt > 40 GROUP BY region",
+        schema_name=sn)
+    client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200)", schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO orders VALUES (1, 1, 50), (2, 1, 30), (3, 2, 70)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg", "n", "s") == {
+        (100, 1, 50): 1, (200, 1, 70): 1}
+
+    client.execute_sql("INSERT INTO orders VALUES (4, 1, 10), (5, 1, 60)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg", "n", "s") == {
+        (100, 2, 110): 1, (200, 1, 70): 1}
+
+    client.execute_sql("DELETE FROM orders WHERE id = 1", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg", "n", "s") == {
+        (100, 1, 60): 1, (200, 1, 70): 1}
+
+
+def test_a_qualified_where_column_over_a_join_resolves_through_the_alias_map(
+        client, schema_name):
+    """`orders.id` is carried by both join inputs, so a WHERE bound by bare name
+    over H would be ambiguous; the qualifier has to resolve through the join's
+    alias map instead. The same holds for a qualified aggregate argument, which
+    binds against the join scope directly rather than through H's pruned names."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, "
+        "amt BIGINT NOT NULL)", schema_name=sn)
+    # customers carries `id` and `amt` too, so both bare names are ambiguous.
+    client.execute_sql(
+        "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL, "
+        "amt BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW vw AS SELECT region AS reg, COUNT(*) AS n "
+        "FROM orders JOIN customers ON orders.cid = customers.id WHERE orders.id > 1 "
+        "GROUP BY region", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW va AS SELECT SUM(orders.amt) AS s "
+        "FROM orders JOIN customers ON orders.cid = customers.id", schema_name=sn)
+    client.execute_sql("INSERT INTO customers VALUES (1, 100, 1000), (2, 200, 2000)",
+                       schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO orders VALUES (1, 1, 50), (2, 1, 80), (3, 2, 30)", schema_name=sn)
+    # orders.id > 1 keeps o2 (region 100) and o3 (region 200).
+    assert bag(scanned(client, sn, "vw"), "reg", "n") == {(100, 1): 1, (200, 1): 1}
+    # 50 + 80 + 30; the customers' 1000/2000 must not contribute.
+    assert bag(scanned(client, sn, "va"), "s") == {(160,): 1}
+
+
+def test_a_group_by_and_a_distinct_over_a_three_way_join(client, schema_name):
+    """The hidden view H is the whole join tree, not just its last node, so an
+    outer reduce or distinct over a fact ⋈ dim ⋈ dim star reads the far
+    dimension's column."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL, "
+        "amt BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, c BIGINT NOT NULL)",
+                       schema_name=sn)
+    client.execute_sql("CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL)",
+                       schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT grp, SUM(amt) AS total "
+        "FROM a JOIN b ON a.cid = b.id JOIN c ON b.c = c.id GROUP BY grp", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW d AS SELECT DISTINCT grp FROM a JOIN b ON a.cid = b.id JOIN c ON b.c = c.id",
+        schema_name=sn)
+    client.execute_sql("INSERT INTO b VALUES (10, 500)", schema_name=sn)
+    client.execute_sql("INSERT INTO c VALUES (500, 7)", schema_name=sn)
+    client.execute_sql("INSERT INTO a VALUES (1, 10, 100), (2, 10, 50)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "grp", "total") == {(7, 150): 1}
+    assert bag(scanned(client, sn, "d"), "grp") == {(7,): 1}
+
+    client.execute_sql("INSERT INTO a VALUES (3, 10, 25)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "grp", "total") == {(7, 175): 1}
+    assert bag(scanned(client, sn, "d"), "grp") == {(7,): 1}
+
+
+@pytest.mark.parametrize("prepopulate", [False, True], ids=["incremental", "backfill"])
+def test_a_distinct_over_a_join_dedups_the_projection(client, schema_name, prepopulate):
+    """`SELECT DISTINCT … FROM <join>` runs the distinct over H, so several joined
+    rows carrying one value collapse to one — and the value leaves only when its
+    last carrier does. H is pruned to the projected name."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE orders (id BIGINT NOT NULL PRIMARY KEY, cid BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE customers (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL)",
+        schema_name=sn)
+
+    def fill():
+        client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200), (3, 300)",
+                           schema_name=sn)
+        # No order references customer 3, so region 300 is absent at first.
+        client.execute_sql("INSERT INTO orders VALUES (1, 1), (2, 1), (3, 2)", schema_name=sn)
+
+    if prepopulate:
+        fill()
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT DISTINCT region AS reg "
+        "FROM orders JOIN customers ON orders.cid = customers.id", schema_name=sn)
+    if not prepopulate:
+        fill()
+
+    assert bag(scanned(client, sn, "v"), "reg") == {(100,): 1, (200,): 1}
+
+    client.execute_sql("INSERT INTO orders VALUES (4, 3)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg") == {(100,): 1, (200,): 1, (300,): 1}
+
+    # Both carriers of region 100 go at once.
+    client.execute_sql("DELETE FROM orders WHERE cid = 1", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg") == {(200,): 1, (300,): 1}
+
+
+def test_a_distinct_over_a_filtered_join_dedups_what_survives_the_where(client, schema_name):
+    """The WHERE runs inside H and the distinct over its output, so a second
+    above-threshold row for a value adds no row and retracting a value's only
+    carrier removes it."""
+    sn = schema_name
+    _orders_customers(client, sn, dim="region BIGINT NOT NULL")
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT DISTINCT region AS reg "
+        "FROM orders JOIN customers ON orders.cid = customers.id WHERE amt > 40",
+        schema_name=sn)
+    client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200)", schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO orders VALUES (1, 1, 50), (2, 1, 30), (3, 2, 70)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg") == {(100,): 1, (200,): 1}
+
+    client.execute_sql("INSERT INTO orders VALUES (4, 1, 90)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg") == {(100,): 1, (200,): 1}
+
+    client.execute_sql("DELETE FROM orders WHERE id = 3", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg") == {(100,): 1}
+
+
+def test_min_max_over_a_joined_column_is_retained_in_the_pruned_hidden_view(
+        client, schema_name):
+    """H keeps exactly the names the outer operator evaluates, so an aggregate
+    argument survives the pruning — and MIN/MAX, being non-linear, then have to
+    track a new extreme and recede when the row holding one is retracted."""
+    sn = schema_name
+    _orders_customers(client, sn, dim="region BIGINT NOT NULL")
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT region AS reg, MIN(amt) AS lo, MAX(amt) AS hi "
+        "FROM orders JOIN customers ON orders.cid = customers.id GROUP BY region",
+        schema_name=sn)
+    client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200)", schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO orders VALUES (1, 1, 50), (2, 1, 80), (3, 2, 30)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg", "lo", "hi") == {
+        (100, 50, 80): 1, (200, 30, 30): 1}
+
+    client.execute_sql("INSERT INTO orders VALUES (4, 1, 20)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg", "lo", "hi") == {
+        (100, 20, 80): 1, (200, 30, 30): 1}
+
+    client.execute_sql("DELETE FROM orders WHERE id = 2", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg", "lo", "hi") == {
+        (100, 20, 50): 1, (200, 30, 30): 1}
+
+
+def test_a_count_star_over_a_join_collects_no_names_and_keeps_the_wildcard(
+        client, schema_name):
+    """`COUNT(*)` names no column, so the pruning has an empty set to work from
+    and H keeps its wildcard projection — the degenerate case, which must still
+    register and count."""
+    sn = schema_name
+    _orders_customers(client, sn, dim="region BIGINT NOT NULL")
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT COUNT(*) AS n "
+        "FROM orders JOIN customers ON orders.cid = customers.id", schema_name=sn)
+    client.execute_sql("INSERT INTO customers VALUES (1, 100), (2, 200)", schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO orders VALUES (1, 1, 50), (2, 1, 80), (3, 2, 30)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "n") == {(3,): 1}
+
+    client.execute_sql("DELETE FROM orders WHERE id = 1", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "n") == {(2,): 1}
+
+
+# ── The aggregate or DISTINCT above an OUTER join ─────────────────────────────
+
+
+def test_a_group_by_over_a_left_join_groups_the_null_fills_by_where_placement(
+        client, schema_name):
+    """Over a LEFT JOIN the WHERE decides what happens to the null-filled rows: a
+    preserved-side predicate keeps them and they form a NULL group, a right-side
+    predicate drops them (a comparison against NULL is UNKNOWN), and
+    `right.col IS NULL` keeps exactly the unmatched ones. `id` is carried by both
+    sides, so that last qualifier must resolve through the join's alias map.
+    Maintained under churn on the preserved side."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, amt BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, region BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW vp AS SELECT region AS reg, COUNT(*) AS n "
+        "FROM a LEFT JOIN b ON a.k = b.id WHERE a.amt > 40 GROUP BY region", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW vr AS SELECT region AS reg, COUNT(*) AS n "
+        "FROM a LEFT JOIN b ON a.k = b.id WHERE region > 0 GROUP BY region", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW vn AS SELECT COUNT(*) AS n "
+        "FROM a LEFT JOIN b ON a.k = b.id WHERE b.id IS NULL", schema_name=sn)
+    client.execute_sql("INSERT INTO b VALUES (10, 500)", schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO a VALUES (1, 10, 50), (2, 99, 70), (3, 10, 30), (4, 88, 20)",
+        schema_name=sn)
+    # amt > 40 keeps a1 (matched, region 500) and a2 (unmatched, region NULL).
+    assert bag(scanned(client, sn, "vp"), "reg", "n") == {(500, 1): 1, (None, 1): 1}
+    # region > 0 keeps only the matched a1 and a3.
+    assert bag(scanned(client, sn, "vr"), "reg", "n") == {(500, 2): 1}
+    assert bag(scanned(client, sn, "vn"), "n") == {(2,): 1}
+
+    client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=sn)
+    client.execute_sql("INSERT INTO a VALUES (5, 77, 80)", schema_name=sn)
+    assert bag(scanned(client, sn, "vp"), "reg", "n") == {(None, 2): 1}     # a2, a5
+    assert bag(scanned(client, sn, "vr"), "reg", "n") == {(500, 1): 1}      # a3 alone
+    assert bag(scanned(client, sn, "vn"), "n") == {(3,): 1}                 # a2, a4, a5
+
+
+def test_a_group_by_over_a_band_left_join_groups_the_range_misses_as_null(
+        client, schema_name):
+    """A band LEFT JOIN matches on an equality prefix and then a range, so a row
+    whose key matches but whose range does not is unmatched and null-fills like
+    any other. Under a preserved-side WHERE, and under the retraction of the only
+    matched row."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL, "
+        "amt BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, hi BIGINT NOT NULL, "
+        "region BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT region AS reg, COUNT(*) AS n "
+        "FROM a LEFT JOIN b ON a.k = b.k AND a.lo < b.hi WHERE amt > 40 GROUP BY region",
+        schema_name=sn)
+    client.execute_sql("INSERT INTO b VALUES (10, 1, 100, 500)", schema_name=sn)
+    # a1 matches (k=1, 50<100); a2 misses on the key; a3 is filtered out by amt.
+    client.execute_sql(
+        "INSERT INTO a VALUES (1, 1, 50, 70), (2, 2, 10, 80), (3, 1, 50, 30)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg", "n") == {(500, 1): 1, (None, 1): 1}
+
+    client.execute_sql("INSERT INTO a VALUES (4, 3, 5, 100)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg", "n") == {(500, 1): 1, (None, 2): 1}
+
+    client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg", "n") == {(None, 2): 1}
+
+
+def test_a_distinct_over_a_pure_range_left_join_dedups_matches_and_null_fills(
+        client, schema_name):
+    """A pure-range LEFT JOIN has no equality prefix at all. Matched rows carry
+    the right value and unmatched ones carry NULL, so the distinct over them holds
+    one entry per distinct value plus one for NULL, which leaves when its last
+    unmatched carrier does."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, lo BIGINT NOT NULL, amt BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, hi BIGINT NOT NULL, "
+        "region BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT DISTINCT region AS reg "
+        "FROM a LEFT JOIN b ON a.lo < b.hi WHERE amt > 40", schema_name=sn)
+    client.execute_sql("INSERT INTO b VALUES (10, 100, 500)", schema_name=sn)
+    # a1 and a3 match (lo < 100); a2 does not.
+    client.execute_sql(
+        "INSERT INTO a VALUES (1, 50, 70), (2, 200, 80), (3, 60, 90)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg") == {(500,): 1, (None,): 1}
+
+    client.execute_sql("DELETE FROM a WHERE id = 2", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "reg") == {(500,): 1}

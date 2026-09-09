@@ -1,1148 +1,521 @@
-"""E2E tests for UNION ALL, UNION, SELECT DISTINCT.
+"""The set-operation graph: UNION / INTERSECT / EXCEPT in both quantifiers,
+`MINUS`, and SELECT DISTINCT.
 
-Run:
-    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/relational_shape/test_set_ops.py -v --tb=short
+A set op is join-free — a linear combination of `{union, negate}` and the
+weight-clamp primitive over content-hashed leaves — so what it computes is a
+weight, never a row set. An `ALL` branch overlap legitimately carries weight 2,
+and a tuple that should net to 0 surviving at weight 1 is invisible to a row
+count, so every assertion here is a weighted bag against the from-scratch
+oracle.
+
+Run with GNITZ_WORKERS=4: each side is repartitioned by its content hash, so
+both branches of a tuple land on one worker only if the hash is a pure function
+of the logical value.
 """
 from collections import Counter
 
 import pytest
 import gnitz
 import _oracle as oracle
-from _uid import uid as _uid
+from _read import bag, scanned
 
+_SIX_OPS = ["UNION ALL", "UNION", "INTERSECT ALL", "INTERSECT", "EXCEPT ALL", "EXCEPT"]
 
 
-def _create_ab_tables(client, sn):
-    """Create the two single-PK `a`/`b` tables every set-op test runs against."""
-    client.execute_sql(
-        "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
-    client.execute_sql(
-        "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
-
-
-class TestSetOps:
-    def _setup_two_tables(self, client, sn):
-        _create_ab_tables(client, sn)
-
-    def test_union_all(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup_two_tables(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT * FROM a UNION ALL SELECT * FROM b",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO a VALUES (1, 10), (2, 20)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "INSERT INTO b VALUES (3, 30), (4, 40)",
-                schema_name=sn,
-            )
-
-            rows = client.scan(vid)
-            assert len(rows) == 4
-            vals = sorted(r["val"] for r in rows)
-            assert vals == [10, 20, 30, 40]
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE a", schema_name=sn)
-            client.execute_sql("DROP TABLE b", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_union_all_identical_rows_keep_both(self, client):
-        """UNION ALL of two tables that each hold the same (pk, val) row keeps
-        both copies (weight +2). The per-side branch discriminator in the
-        synthetic hash PK is what stops the two identical rows from collapsing
-        to one under unique-PK enforcement at the view sink."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup_two_tables(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT * FROM a UNION ALL SELECT * FROM b",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # Same content on both sides.
-            client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 20)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (1, 10), (2, 20)", schema_name=sn)
-
-            rows = list(client.scan(vid))
-            total_weight = sum(r.weight for r in rows)
-            assert total_weight == 4, f"expected total weight 4, got {total_weight}"
-            vals = sorted(r["val"] for r in rows for _ in range(r.weight))
-            assert vals == [10, 10, 20, 20], f"got {vals}"
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE a", schema_name=sn)
-            client.execute_sql("DROP TABLE b", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_union_distinct(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup_two_tables(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT * FROM a UNION SELECT * FROM b",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # Insert rows with overlapping values but different PKs.
-            # NOTE: This test does not truly exercise UNION vs UNION ALL dedup
-            # because dedup is by (PK, payload) — since all 4 rows have different
-            # PKs, they are all distinct regardless. A true dedup test would require
-            # projection-based UNION (e.g., SELECT val FROM a UNION SELECT val FROM b)
-            # which is not yet supported.
-            client.execute_sql(
-                "INSERT INTO a VALUES (1, 10), (2, 20)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "INSERT INTO b VALUES (3, 10), (4, 30)",
-                schema_name=sn,
-            )
-
-            rows = client.scan(vid)
-            assert len(rows) == 4
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE a", schema_name=sn)
-            client.execute_sql("DROP TABLE b", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_union_distinct_nullable_right_coalesces_null(self, client):
-        """Projection UNION whose LEFT column is `BIGINT NOT NULL` and RIGHT is
-        nullable `BIGINT`: the union output column is nullable, so the compiled
-        view schema must classify its row comparator as null-aware (`Generic`),
-        not the null-blind fixed-int fast path. Multiple NULL rows from the right
-        coalesce to a single NULL row (weight 1) under UNION DISTINCT, and a NULL
-        must never coincide with a genuine non-null 0. Confirms the null-aware
-        view schema end to end."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t_nonnull (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE TABLE t_nullable (pk BIGINT NOT NULL PRIMARY KEY, b BIGINT)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a FROM t_nonnull UNION SELECT b FROM t_nullable",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # Left: 10, 20, and a genuine 0 (must stay distinct from NULL).
-            client.execute_sql(
-                "INSERT INTO t_nonnull VALUES (1, 10), (2, 20), (3, 0)", schema_name=sn)
-            # Right: two NULL b rows (distinct PKs, same NULL content) plus 30.
-            client.execute_sql(
-                "INSERT INTO t_nullable VALUES (10, NULL), (11, NULL), (12, 30)", schema_name=sn)
-
-            # UNION DISTINCT: one row per distinct value. The two NULLs coalesce to
-            # a single NULL row of weight 1; 0 and NULL are separate rows.
-            oracle.assert_view_matches(
-                client, vid, ["a"],
-                {(0,): 1, (10,): 1, (20,): 1, (30,): 1, (None,): 1},
-                ctx="union_distinct_nullable_right",
-            )
-        finally:
-            client.drop_schema(sn)
-
-    def test_union_all_retraction(self, client):
-        """Deleting a row from one source retracts it from the UNION ALL view."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup_two_tables(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT * FROM a UNION ALL SELECT * FROM b",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO a VALUES (1, 10), (2, 20)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "INSERT INTO b VALUES (3, 30)",
-                schema_name=sn,
-            )
-            rows = client.scan(vid)
-            assert len(rows) == 3
-
-            client.execute_sql("DELETE FROM a WHERE pk = 1", schema_name=sn)
-            rows = client.scan(vid)
-            assert len(rows) == 2, f"expected 2 rows after delete, got {rows}"
-            vals = sorted(r["val"] for r in rows)
-            assert vals == [20, 30]
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE a", schema_name=sn)
-            client.execute_sql("DROP TABLE b", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    @pytest.mark.parametrize("b_first", [True, False])
-    def test_except_basic(self, client, b_first):
-        """EXCEPT view excludes rows whose PK is present in the right table.
-
-        Both insertion orders must give the same view: with ``b_first=False``
-        ΔA is processed against an empty b-side trace, and the row that later
-        arrives in b must still cancel it.
-        """
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup_two_tables(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT * FROM a EXCEPT SELECT * FROM b",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            insert_a = ("INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)", sn)
-            insert_b = ("INSERT INTO b VALUES (2, 20)", sn)
-            for sql, schema in ([insert_b, insert_a] if b_first else [insert_a, insert_b]):
-                client.execute_sql(sql, schema_name=schema)
-
-            rows = client.scan(vid)
-            vals = sorted(r["val"] for r in rows)
-            assert vals == [10, 30], f"expected [10, 30], got {vals}"
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE a", schema_name=sn)
-            client.execute_sql("DROP TABLE b", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_except_retraction(self, client):
-        """Deleting a row from b adds it back to the EXCEPT view."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup_two_tables(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT * FROM a EXCEPT SELECT * FROM b",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # Insert b first so I(B) is populated when ΔA arrives
-            client.execute_sql(
-                "INSERT INTO b VALUES (2, 20)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "INSERT INTO a VALUES (1, 10), (2, 20)",
-                schema_name=sn,
-            )
-            rows = client.scan(vid)
-            vals = sorted(r["val"] for r in rows)
-            assert vals == [10], f"expected [10], got {vals}"
-
-            # Delete the exclusion row — (2, 20) should now appear in v
-            client.execute_sql("DELETE FROM b WHERE pk = 2", schema_name=sn)
-            rows = client.scan(vid)
-            vals = sorted(r["val"] for r in rows)
-            assert vals == [10, 20], f"expected [10, 20] after delete, got {vals}"
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE a", schema_name=sn)
-            client.execute_sql("DROP TABLE b", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_intersect_basic(self, client):
-        """INTERSECT view contains only rows present in both tables."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup_two_tables(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT * FROM a INTERSECT SELECT * FROM b",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)",
-                schema_name=sn,
-            )
-            # Only (2, 20) is shared (same pk AND same val)
-            client.execute_sql(
-                "INSERT INTO b VALUES (2, 20), (4, 40)",
-                schema_name=sn,
-            )
-
-            rows = client.scan(vid)
-            vals = sorted(r["val"] for r in rows)
-            assert vals == [20], f"expected [20], got {vals}"
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE a", schema_name=sn)
-            client.execute_sql("DROP TABLE b", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_select_distinct_view(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT DISTINCT * FROM t",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
-                schema_name=sn,
-            )
-
-            rows = client.scan(vid)
-            assert len(rows) == 3
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_distinct_retraction(self, client):
-        """DISTINCT view retracts correctly when a row is deleted."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT DISTINCT * FROM t",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
-                schema_name=sn,
-            )
-            rows = client.scan(vid)
-            assert len(rows) == 3
-
-            # Delete one row — DISTINCT view should drop it
-            client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
-            rows = client.scan(vid)
-            vals = sorted(r["val"] for r in rows)
-            assert vals == [10, 30], f"expected [10, 30] after delete, got {vals}"
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_distinct_update_view(self, client):
-        """UPDATE on a table with a SELECT DISTINCT view reflects the new value."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT DISTINCT * FROM t",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20)", schema_name=sn)
-            rows = client.scan(vid)
-            assert len(rows) == 2
-
-            # Update pk=1: old value should retract, new value should appear
-            client.execute_sql("UPDATE t SET val = 99 WHERE pk = 1", schema_name=sn)
-            rows = client.scan(vid)
-            vals = sorted(r["val"] for r in rows)
-            assert vals == [20, 99], f"expected [20, 99] after update, got {vals}"
-        finally:
-            client.drop_schema(sn)
-
-    def test_view_rejects_silently_dropped_clauses(self, client):
-        """Every CREATE VIEW shape (simple, grouped, join, set-op, DISTINCT) reads only a
-        hand-picked subset of the SELECT. A clause a shape does not consume must be rejected,
-        not silently dropped — a dropped clause runs a different query than the caller wrote."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE TABLE u (pk BIGINT NOT NULL PRIMARY KEY, c BIGINT NOT NULL)", schema_name=sn
-            )
-
-            def rejects(sql, msg):
-                with pytest.raises(gnitz.GnitzError, match=msg):
-                    client.execute_sql(sql, schema_name=sn)
-
-            # --- DISTINCT ON: single SELECT, set-op branch, and the degenerate shape ---
-            # (degenerate `DISTINCT ON (a) a` == `DISTINCT a` but is rejected ON PURPOSE —
-            # not worth an ON-list/projection equivalence check.)
-            for sql in (
-                "CREATE VIEW v AS SELECT DISTINCT ON (a) a, b FROM t",
-                "CREATE VIEW v AS SELECT DISTINCT ON (a) a FROM t UNION SELECT b FROM t",
-                "CREATE VIEW v AS SELECT DISTINCT ON (a) a FROM t",
-            ):
-                rejects(sql, "DISTINCT ON is not supported")
-
-            # --- GROUP BY / HAVING dropped in the DISTINCT-view path ---
-            # (A GROUP BY set-op *side* is now honored — a grouped side compiles to a
-            #  hidden segment the set op re-hashes — so it is no longer a dropped clause.)
-            rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t GROUP BY a", "GROUP BY is not supported")
-            rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t HAVING a > 0", "HAVING is not supported")
-            # A HAVING *without* DISTINCT is not a dropped clause: it groups the
-            # whole relation, so the body binds as a global aggregate and `a` — a
-            # column that is neither a group key nor an aggregate — is what fails.
-            rejects(
-                "CREATE VIEW v AS SELECT a FROM t HAVING a > 0",
-                "column 'a' must appear in GROUP BY or an aggregate function",
-            )
-
-            # --- PREWHERE (dropped filter) and TOP (dropped limit), across shapes ---
-            rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t PREWHERE a > 5", "PREWHERE is not supported")
-            rejects("CREATE VIEW v AS SELECT a FROM t PREWHERE a > 5", "PREWHERE is not supported")
-            rejects(
-                "CREATE VIEW v AS SELECT a, COUNT(*) FROM t PREWHERE a > 5 GROUP BY a",
-                "PREWHERE is not supported",
-            )
-            rejects("CREATE VIEW v AS SELECT DISTINCT TOP 5 a FROM t", "TOP is not supported")
-
-            # --- exotic clauses now each report by name (QUALIFY on DISTINCT, SORT BY on simple) ---
-            # QUALIFY is honored by every view body (it filters on window values,
-            # before a DISTINCT dedups); one with nothing to filter on is refused,
-            # not dropped.
-            rejects(
-                "CREATE VIEW v AS SELECT DISTINCT a FROM t QUALIFY a > 1",
-                "QUALIFY needs a window function",
-            )
-            rejects("CREATE VIEW v AS SELECT a FROM t SORT BY a", "SORT BY is not supported")
-
-            # (A top-level WHERE on any JOIN — INNER, OUTER equi, or OUTER range/band — is
-            #  consumed inside the join circuit, never dropped; the OUTER range/band form is a
-            #  positive control below, no longer rejected.)
-
-            # --- GROUP BY ALL must be classified, never routed to the simple path and dropped ---
-            rejects("CREATE VIEW v AS SELECT a FROM t GROUP BY ALL", "GROUP BY")
-
-            # --- FETCH dropped at the view front door (Query-level row-limit) ---
-            rejects("CREATE VIEW v AS SELECT a FROM t FETCH FIRST 5 ROWS ONLY", "FETCH is not supported")
-
-            # --- Query-envelope tail clauses GenericDialect parses and the view front door dropped ---
-            rejects("CREATE VIEW v AS SELECT pk FROM t FOR UPDATE", "FOR UPDATE/SHARE is not supported")
-            rejects("CREATE VIEW v AS SELECT pk FROM t SETTINGS max_threads = 1", "SETTINGS is not supported")
-            rejects("CREATE VIEW v AS SELECT pk FROM t FORMAT JSON", "FORMAT is not supported")
-
-            # (A DISTINCT set-op side is now honored — the side compiles to a hidden
-            #  segment that deduplicates before the UNION ALL, so it no longer leaks
-            #  duplicates and is no longer a dropped clause.)
-
-            # --- every honored shape still compiles (positive controls) ---
-            ok = {
-                "vsimple": "SELECT a, b FROM t WHERE a > 0",
-                "vdistinct": "SELECT DISTINCT a, b FROM t",
-                "vgroup": "SELECT a, COUNT(*) FROM t GROUP BY a",
-                "vjoin": "SELECT t.a, u.c FROM t JOIN u ON t.pk = u.pk",
-                "vsetop": "SELECT a FROM t UNION ALL SELECT b FROM t",
-                # OUTER range/band + WHERE now compiles (post-null-fill 3VL filter).
-                "vrangeleft": "SELECT t.a FROM t LEFT JOIN u ON t.a < u.c WHERE t.a > 5",
-            }
-            for name, body in ok.items():
-                client.execute_sql(f"CREATE VIEW {name} AS {body}", schema_name=sn)
-                client.resolve_table(sn, name)  # registered (raises if absent)
-                client.execute_sql(f"DROP VIEW {name}", schema_name=sn)
-
-            client.execute_sql("DROP TABLE u", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-
-class TestBagSetOps:
-    """EXCEPT ALL / INTERSECT ALL preserve bag multiplicity: per row
-    max(0, cL−cR) and min(cL, cR), vs the deduplicating EXCEPT/INTERSECT.
-    Multiplicity comes from distinct-PK base rows projected onto a shared value
-    column. Expected multisets are hand-computed (independent of the oracle)."""
-
-    def _two_tables(self, client, sn):
-        _create_ab_tables(client, sn)
-
-    def test_except_all_arithmetic(self, client):
-        """left {10:3, 20:1}, right {10:1, 30:2} ⇒ EXCEPT ALL ⇒ {10:2, 20:1}.
-        Row 30 (cL=0, cR=2) drives positive_part's integral net-NEGATIVE (A−B=−2)
-        and must still be absent — the one behavior no set-op `distinct` exercises
-        (every existing `distinct` input is base-positive)."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._two_tables(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT val FROM a EXCEPT ALL SELECT val FROM b", schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql("INSERT INTO a VALUES (1,10),(2,10),(3,10),(4,20)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (5,10),(6,30),(7,30)", schema_name=sn)
-
-            oracle.assert_view_matches(
-                client, vid, ["val"], {(10,): 2, (20,): 1}, ctx="except_all_arith")
-        finally:
-            client.drop_schema(sn)
-
-    def test_intersect_all_arithmetic(self, client):
-        """left {10:3, 20:1}, right {10:1, 30:2} ⇒ INTERSECT ALL ⇒ {10:1}.
-        20 (cR=0) and 30 (cL=0) both drop out; 10 carries min(3,1)=1."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._two_tables(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT val FROM a INTERSECT ALL SELECT val FROM b", schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql("INSERT INTO a VALUES (1,10),(2,10),(3,10),(4,20)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (5,10),(6,30),(7,30)", schema_name=sn)
-
-            oracle.assert_view_matches(
-                client, vid, ["val"], {(10,): 1}, ctx="intersect_all_arith")
-        finally:
-            client.drop_schema(sn)
-
-    def test_bag_retraction(self, client):
-        """Delete the single right '10': EXCEPT ALL's 10-count rises 2→3,
-        INTERSECT ALL's 10-count falls 1→0. Pins positive_part's boundary emit
-        under a negative delta on both bag operators at once."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._two_tables(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v_exc AS SELECT val FROM a EXCEPT ALL SELECT val FROM b", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v_int AS SELECT val FROM a INTERSECT ALL SELECT val FROM b", schema_name=sn)
-            exc = client.resolve_table(sn, "v_exc")[0]
-            inter = client.resolve_table(sn, "v_int")[0]
-
-            client.execute_sql("INSERT INTO a VALUES (1,10),(2,10),(3,10),(4,20)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (5,10),(6,30),(7,30)", schema_name=sn)
-            oracle.assert_view_matches(client, exc, ["val"], {(10,): 2, (20,): 1}, ctx="exc-before")
-            oracle.assert_view_matches(client, inter, ["val"], {(10,): 1}, ctx="int-before")
-
-            # Delete the lone right-side 10 (pk=5): right 10-count 1→0.
-            client.execute_sql("DELETE FROM b WHERE pk = 5", schema_name=sn)
-            oracle.assert_view_matches(client, exc, ["val"], {(10,): 3, (20,): 1}, ctx="exc-after")
-            oracle.assert_view_matches(client, inter, ["val"], {}, ctx="int-after")
-        finally:
-            client.drop_schema(sn)
-
-    def test_set_vs_bag_divergence(self, client):
-        """cL=2, cR=1 for value 10: set EXCEPT removes it entirely (→ absent);
-        bag EXCEPT ALL keeps max(0, 2−1)=1. The two views are now distinct code
-        paths over the same inputs."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._two_tables(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v_set AS SELECT val FROM a EXCEPT SELECT val FROM b", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v_bag AS SELECT val FROM a EXCEPT ALL SELECT val FROM b", schema_name=sn)
-            v_set = client.resolve_table(sn, "v_set")[0]
-            v_bag = client.resolve_table(sn, "v_bag")[0]
-
-            client.execute_sql("INSERT INTO a VALUES (1,10),(2,10)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (3,10)", schema_name=sn)
-
-            oracle.assert_view_matches(client, v_set, ["val"], {}, ctx="set EXCEPT (10 fully removed)")
-            oracle.assert_view_matches(client, v_bag, ["val"], {(10,): 1}, ctx="bag EXCEPT ALL (one 10 survives)")
-        finally:
-            client.drop_schema(sn)
-
-    def test_quantifier_dispatch(self, client):
-        """EXCEPT ALL / INTERSECT ALL now compile (bag semantics); BY NAME set
-        operations are rejected, not silently aligned positionally. A rejected
-        CREATE registers no view."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._two_tables(client, sn)
-
-            # BY NAME (any operator/quantifier) is unimplemented → rejected.
-            rejected = {
-                "union_all_by_name": "SELECT val FROM a UNION ALL BY NAME SELECT val FROM b",
-                "intersect_by_name": "SELECT val FROM a INTERSECT BY NAME SELECT val FROM b",
-                "except_by_name": "SELECT val FROM a EXCEPT BY NAME SELECT val FROM b",
-            }
-            for name, body in rejected.items():
-                with pytest.raises(Exception):
-                    client.execute_sql(f"CREATE VIEW rej_{name} AS {body}", schema_name=sn)
-                with pytest.raises(Exception):
-                    client.resolve_table(sn, f"rej_{name}")  # no view registered
-
-            # Bag ALL forms and the deduplicating forms all create successfully.
-            ok = {
-                "ok_except_all": "SELECT val FROM a EXCEPT ALL SELECT val FROM b",
-                "ok_intersect_all": "SELECT val FROM a INTERSECT ALL SELECT val FROM b",
-                "ok_union_all": "SELECT val FROM a UNION ALL SELECT val FROM b",
-                "ok_except": "SELECT val FROM a EXCEPT SELECT val FROM b",
-                "ok_intersect": "SELECT val FROM a INTERSECT SELECT val FROM b",
-            }
-            for name, body in ok.items():
-                client.execute_sql(f"CREATE VIEW {name} AS {body}", schema_name=sn)
-                client.resolve_table(sn, name)  # registered (raises if absent)
-                client.execute_sql(f"DROP VIEW {name}", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-
-class TestSetOpsDifferential:
-    """Lock-in: the two-distinct-table set-ops, projected on `val` so dedup and
-    weight actually matter, checked against the from-scratch oracle after each
-    epoch (validates the oracle against the known-good two-table path)."""
-
-    def _setup(self, client, sn, op):
-        _create_ab_tables(client, sn)
+def _ab(client, sn):
+    """The two single-PK `a`/`b` tables the projected set-op views read."""
+    for name in ("a", "b"):
         client.execute_sql(
-            f"CREATE VIEW v AS SELECT val FROM a {op} SELECT val FROM b", schema_name=sn)
-        return client.resolve_table(sn, "v")[0]
-
-    def _assert_setop(self, client, vid, op, a_state, b_state, ctx):
-        left = oracle.oracle_filter_project(a_state, None, ["val"])
-        right = oracle.oracle_filter_project(b_state, None, ["val"])
-        exp = oracle.oracle_setop(op, left, right)
-        oracle.assert_view_matches(client, vid, ["val"], exp, ctx=ctx)
-
-    def _run(self, client, op):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            vid = self._setup(client, sn, op)
-            a_state, b_state = {}, {}
-
-            def check(ctx):
-                self._assert_setop(client, vid, op, a_state, b_state, ctx)
-
-            # Overlapping values across the two tables so dedup/weight matters.
-            client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)", schema_name=sn)
-            oracle.apply_insert(a_state, "pk", [
-                {"pk": 1, "val": 10}, {"pk": 2, "val": 20}, {"pk": 3, "val": 30}])
-            check(f"{op} after-a")
-
-            client.execute_sql("INSERT INTO b VALUES (4, 20), (5, 30), (6, 40)", schema_name=sn)
-            oracle.apply_insert(b_state, "pk", [
-                {"pk": 4, "val": 20}, {"pk": 5, "val": 30}, {"pk": 6, "val": 40}])
-            check(f"{op} after-b")
-
-            client.execute_sql("DELETE FROM b WHERE pk = 4", schema_name=sn)
-            oracle.apply_delete(b_state, "pk", [4])
-            check(f"{op} after-delete-b")
-
-            client.execute_sql("UPDATE a SET val = 99 WHERE pk = 1", schema_name=sn)
-            oracle.apply_update(a_state, "pk", 1, {"val": 99})
-            check(f"{op} after-update-a")
-        finally:
-            client.drop_schema(sn)
-
-    def test_except_differential(self, client):
-        self._run(client, "EXCEPT")
-
-    def test_intersect_differential(self, client):
-        self._run(client, "INTERSECT")
-
-    def test_union_differential(self, client):
-        self._run(client, "UNION")
-
-    def test_union_all_differential(self, client):
-        self._run(client, "UNION ALL")
-
-    def test_except_all_differential(self, client):
-        self._run(client, "EXCEPT ALL")
-
-    def test_intersect_all_differential(self, client):
-        self._run(client, "INTERSECT ALL")
-
-    def _run_membership_flip(self, client, op):
-        """Drive a single projected value across the set-membership boundary in
-        BOTH directions, including the tick where positive_part's pre-image
-        integral goes negative (da − db = −1 while it stays clamped at 0). Both
-        EXCEPT and INTERSECT DISTINCT route through positive_part, so its
-        boundary emits must net exactly per the from-scratch oracle each tick."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            vid = self._setup(client, sn, op)
-            a_state, b_state = {}, {}
-
-            def check(ctx):
-                self._assert_setop(client, vid, op, a_state, b_state, ctx)
-
-            # a has val=10 (da=1), b empty (db=0): da − db = 1.
-            client.execute_sql("INSERT INTO a VALUES (1, 10)", schema_name=sn)
-            oracle.apply_insert(a_state, "pk", [{"pk": 1, "val": 10}])
-            check(f"{op} a-only")
-
-            # b gains val=10 (db=1): da − db = 0.
-            client.execute_sql("INSERT INTO b VALUES (2, 10)", schema_name=sn)
-            oracle.apply_insert(b_state, "pk", [{"pk": 2, "val": 10}])
-            check(f"{op} both")
-
-            # Retract a's only val=10 (da=0) while b still has it (db=1): the
-            # positive_part input integral for val=10 is now da − db = −1.
-            client.execute_sql("DELETE FROM a WHERE pk = 1", schema_name=sn)
-            oracle.apply_delete(a_state, "pk", [1])
-            check(f"{op} a-empty-negative-integral")
-
-            # Retract b's val=10 too (db=0): da − db back to 0.
-            client.execute_sql("DELETE FROM b WHERE pk = 2", schema_name=sn)
-            oracle.apply_delete(b_state, "pk", [2])
-            check(f"{op} both-empty")
-
-            # Re-introduce val=10 on a only (da=1, db=0): da − db = 1 again.
-            client.execute_sql("INSERT INTO a VALUES (3, 10)", schema_name=sn)
-            oracle.apply_insert(a_state, "pk", [{"pk": 3, "val": 10}])
-            check(f"{op} a-only-again")
-        finally:
-            client.drop_schema(sn)
-
-    def test_except_membership_flip(self, client):
-        self._run_membership_flip(client, "EXCEPT")
-
-    def test_intersect_membership_flip(self, client):
-        self._run_membership_flip(client, "INTERSECT")
+            f"CREATE TABLE {name} (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+            schema_name=sn)
 
 
-class TestDistinctDifferential:
-    """SELECT DISTINCT projected so real dedup happens (many rows share one value),
-    checked against the from-scratch oracle after every epoch. DISTINCT is the
-    non-linear boundary-crossing operator (DBSP Prop 4.7) and had no differential
-    test: a value stays at weight 1 while any row carries it, vanishes only when
-    the last is retracted, and an UPDATE that moves a row's value crosses an exit
-    and an entry boundary in a single epoch."""
-
-    def test_distinct_single_col_churn(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql("CREATE VIEW v AS SELECT DISTINCT g FROM t", schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            t_state = {}
-
-            def check(ctx):
-                exp = oracle.oracle_distinct(
-                    oracle.oracle_filter_project(t_state, None, ["g"]))
-                oracle.assert_view_matches(client, vid, ["g"], exp, ctx=ctx)
-
-            # g=1 and g=2 each carried by two rows; g=3 by one.
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 1), (2, 1), (3, 2), (4, 2), (5, 3)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [
-                {"pk": 1, "g": 1}, {"pk": 2, "g": 1}, {"pk": 3, "g": 2},
-                {"pk": 4, "g": 2}, {"pk": 5, "g": 3}])
-            check("after-insert")
-
-            # Drop one of g=1's two carriers: g=1 stays (boundary NOT crossed).
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [1])
-            check("after-delete-one-of-two")
-
-            # Drop g=3's only carrier: g=3 vanishes (exit boundary crossed).
-            client.execute_sql("DELETE FROM t WHERE pk = 5", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [5])
-            check("after-delete-last-carrier")
-
-            # Move g=1's last carrier (pk=2) to a brand-new g=4: g=1 exits and g=4
-            # enters in one epoch — both boundaries cross simultaneously.
-            client.execute_sql("UPDATE t SET g = 4 WHERE pk = 2", schema_name=sn)
-            oracle.apply_update(t_state, "pk", 2, {"g": 4})
-            check("after-update-cross-both-boundaries")
-
-            # Re-introduce g=3.
-            client.execute_sql("INSERT INTO t VALUES (6, 3)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [{"pk": 6, "g": 3}])
-            check("after-reinsert")
-        finally:
-            client.drop_schema(sn)
-
-    def test_distinct_two_col_churn(self, client):
-        """DISTINCT over two columns: dedup keys on the whole (a, b) pair. An
-        UPDATE to one component moves the pair, and the pair survives only while a
-        carrier remains."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql("CREATE VIEW v AS SELECT DISTINCT a, b FROM t", schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            t_state = {}
-
-            def check(ctx):
-                exp = oracle.oracle_distinct(
-                    oracle.oracle_filter_project(t_state, None, ["a", "b"]))
-                oracle.assert_view_matches(client, vid, ["a", "b"], exp, ctx=ctx)
-
-            # (1,1) carried twice; (1,2) and (2,1) once each. (1,1) and (1,2) share
-            # `a`, (1,1) and (2,1) share `b` — so dedup must key on the pair.
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 1, 1), (2, 1, 1), (3, 1, 2), (4, 2, 1)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [
-                {"pk": 1, "a": 1, "b": 1}, {"pk": 2, "a": 1, "b": 1},
-                {"pk": 3, "a": 1, "b": 2}, {"pk": 4, "a": 2, "b": 1}])
-            check("after-insert")
-
-            # Drop one carrier of (1,1): pair stays.
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [1])
-            check("after-delete-one-carrier")
-
-            # Move (1,2)'s carrier to (2,1): (1,2) exits, (2,1) already present so
-            # its weight stays 1 (a second carrier, not a second row).
-            client.execute_sql("UPDATE t SET b = 1, a = 2 WHERE pk = 3", schema_name=sn)
-            oracle.apply_update(t_state, "pk", 3, {"a": 2, "b": 1})
-            check("after-update-onto-existing-pair")
-
-            # Remove pk=4 — (2,1) still carried by pk=3 → stays.
-            client.execute_sql("DELETE FROM t WHERE pk = 4", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [4])
-            check("after-delete-other-carrier")
-        finally:
-            client.drop_schema(sn)
+def _setop_view(client, sn, name, op):
+    """`SELECT val FROM a <op> SELECT val FROM b` — projected onto `val` so a
+    value's multiplicity, not its PK, is what the operator sees."""
+    client.execute_sql(
+        f"CREATE VIEW {name} AS SELECT val FROM a {op} SELECT val FROM b", schema_name=sn)
+    return client.resolve_table(sn, name)[0]
 
 
-class TestSetOpNullability:
-    """Set-op output column nullability is the union of both inputs. A NOT NULL
-    left paired with a nullable right that emits NULL must produce a nullable
-    output column, so the reader checks the null bitmap instead of reading 0."""
-
-    def test_union_all_right_null_reads_back_null(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            # Left val NOT NULL; right val nullable.
-            client.execute_sql(
-                "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT * FROM a UNION ALL SELECT * FROM b",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql("INSERT INTO a VALUES (1, 10)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (2, NULL)", schema_name=sn)
-
-            rows = list(client.scan(vid))
-            vals = sorted((r["val"] is None, r["val"]) for r in rows)
-            # One concrete 10 from the left, one NULL (not 0) from the right.
-            assert (False, 10) in vals, f"left value missing: {vals}"
-            assert any(r["val"] is None for r in rows), \
-                f"right NULL must read back as NULL, not 0: {[r['val'] for r in rows]}"
-            assert 0 not in [r["val"] for r in rows], "NULL must not be read as 0"
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE a", schema_name=sn)
-            client.execute_sql("DROP TABLE b", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
+def _expect(client, vid, op, a_state, b_state, ctx):
+    """Assert the view equals the oracle's `op` over the two base states."""
+    oracle.assert_view_matches(
+        client, vid, ["val"],
+        oracle.oracle_setop(op,
+                            oracle.oracle_filter_project(a_state, None, ["val"]),
+                            oracle.oracle_filter_project(b_state, None, ["val"])),
+        ctx=ctx)
 
 
-class TestSetOpIntegerPromotion:
-    """Cross-width / cross-sign integer set operations. The narrower side is
-    widened to the join-key common type so equal logical values share one physical
-    representation; the content hash then coalesces them and the union /
-    positive_part merge reads one width. Distinct values (and wide-only values that
-    exceed the narrow type's range) stay distinct."""
+@pytest.mark.parametrize("op", _SIX_OPS)
+def test_an_operator_tracks_its_weight_algebra_through_every_mutation(client, schema_name, op):
+    """Each of the six operators equals its Z-set definition after every epoch of
+    an insert / delete / update churn, over branches that carry a value more than
+    once. Multiplicity is the point: `UNION ALL` sums it, `INTERSECT ALL` takes
+    the min and `EXCEPT ALL` the clamped difference, while the deduplicating
+    three collapse the same input to weight 1. The right-only value 30 (cR=2,
+    cL=0) drives the clamp's pre-image integral net-negative, which no
+    base-positive input reaches."""
+    sn = schema_name
+    _ab(client, sn)
+    vid = _setop_view(client, sn, "v", op)
+    a_state, b_state = {}, {}
 
-    # (label, left_type, right_type, shared, left_only, right_only). `shared` fits
-    # both types. The two `*_only` values live on only one side; at least one
-    # exceeds the other side's type range, pinning that wide values survive and
-    # never falsely coalesce.
-    _WIDTH_CASES = [
-        ("i32_i64", "INT", "BIGINT", 5, 7, 8_000_000_000),                 # I32 vs I64 → I64
-        ("u16_u32", "SMALLINT UNSIGNED", "INT UNSIGNED", 5, 7, 200_000),   # U16 vs U32 → U32
-        ("u32_i32", "INT UNSIGNED", "INT", 5, 3_000_000_000, 9),           # U32 vs I32 → I64
-    ]
+    # Left {10:3, 20:1} — three rows carry one value, so a DISTINCT/ALL split shows.
+    client.execute_sql("INSERT INTO a VALUES (1,10),(2,10),(3,10),(4,20)", schema_name=sn)
+    oracle.apply_insert(a_state, "pk", [
+        {"pk": 1, "val": 10}, {"pk": 2, "val": 10},
+        {"pk": 3, "val": 10}, {"pk": 4, "val": 20}])
+    _expect(client, vid, op, a_state, b_state, "left only")
 
-    @pytest.mark.parametrize("label,lt,rt,shared,left_only,right_only", _WIDTH_CASES)
-    def test_cross_width_union_intersect_except(
-        self, client, label, lt, rt, shared, left_only, right_only
+    # Right {10:1, 30:2}: 10 overlaps at unequal multiplicity, 30 is right-only.
+    client.execute_sql("INSERT INTO b VALUES (5,10),(6,30),(7,30)", schema_name=sn)
+    oracle.apply_insert(b_state, "pk", [
+        {"pk": 5, "val": 10}, {"pk": 6, "val": 30}, {"pk": 7, "val": 30}])
+    _expect(client, vid, op, a_state, b_state, "both")
+
+    # Retract the lone right 10: the overlap lapses entirely.
+    client.execute_sql("DELETE FROM b WHERE pk = 5", schema_name=sn)
+    oracle.apply_delete(b_state, "pk", [5])
+    _expect(client, vid, op, a_state, b_state, "right 10 retracted")
+
+    # An UPDATE is a retraction and an insertion in one epoch, moving 20 onto the
+    # right-only value 30 — an exit and an entry crossing together.
+    client.execute_sql("UPDATE a SET val = 30 WHERE pk = 4", schema_name=sn)
+    oracle.apply_update(a_state, "pk", 4, {"val": 30})
+    _expect(client, vid, op, a_state, b_state, "left 20 moved onto 30")
+
+    client.execute_sql("DELETE FROM a WHERE pk IN (1, 2, 3)", schema_name=sn)
+    oracle.apply_delete(a_state, "pk", [1, 2, 3])
+    _expect(client, vid, op, a_state, b_state, "left reduced to one value")
+
+
+def test_a_branch_may_arrive_before_the_other_exists(client, schema_name):
+    """The right branch populated first, so each left delta meets a full right
+    trace instead of an empty one. All six operators reach the same value as the
+    opposite arrival order — an incremental circuit's fixpoint cannot depend on
+    which source ticked first."""
+    sn = schema_name
+    _ab(client, sn)
+    vids = {op: _setop_view(client, sn, f"v{i}", op) for i, op in enumerate(_SIX_OPS)}
+    a_state, b_state = {}, {}
+
+    client.execute_sql("INSERT INTO b VALUES (5,20),(6,20),(7,30)", schema_name=sn)
+    oracle.apply_insert(b_state, "pk", [
+        {"pk": 5, "val": 20}, {"pk": 6, "val": 20}, {"pk": 7, "val": 30}])
+    for op, vid in vids.items():
+        _expect(client, vid, op, a_state, b_state, f"{op} right only")
+
+    client.execute_sql("INSERT INTO a VALUES (1,10),(2,20),(3,30)", schema_name=sn)
+    oracle.apply_insert(a_state, "pk", [
+        {"pk": 1, "val": 10}, {"pk": 2, "val": 20}, {"pk": 3, "val": 30}])
+    for op, vid in vids.items():
+        _expect(client, vid, op, a_state, b_state, f"{op} left after right")
+
+
+@pytest.mark.parametrize("op", ["EXCEPT", "INTERSECT"])
+def test_a_value_crosses_the_clamp_boundary_in_both_directions(client, schema_name, op):
+    """The deduplicating EXCEPT and INTERSECT both route through
+    `positive_part`, so one value driven back and forth across set membership —
+    including the tick where its pre-image integral is −1 while the output stays
+    clamped at 0 — pins the boundary emit in each direction."""
+    sn = schema_name
+    _ab(client, sn)
+    vid = _setop_view(client, sn, "v", op)
+    a_state, b_state = {}, {}
+
+    client.execute_sql("INSERT INTO a VALUES (1, 10)", schema_name=sn)
+    oracle.apply_insert(a_state, "pk", [{"pk": 1, "val": 10}])
+    _expect(client, vid, op, a_state, b_state, "left only: da − db = 1")
+
+    client.execute_sql("INSERT INTO b VALUES (2, 10)", schema_name=sn)
+    oracle.apply_insert(b_state, "pk", [{"pk": 2, "val": 10}])
+    _expect(client, vid, op, a_state, b_state, "both: da − db = 0")
+
+    client.execute_sql("DELETE FROM a WHERE pk = 1", schema_name=sn)
+    oracle.apply_delete(a_state, "pk", [1])
+    _expect(client, vid, op, a_state, b_state, "right only: da − db = −1")
+
+    client.execute_sql("DELETE FROM b WHERE pk = 2", schema_name=sn)
+    oracle.apply_delete(b_state, "pk", [2])
+    _expect(client, vid, op, a_state, b_state, "neither: da − db = 0")
+
+    client.execute_sql("INSERT INTO a VALUES (3, 10)", schema_name=sn)
+    oracle.apply_insert(a_state, "pk", [{"pk": 3, "val": 10}])
+    _expect(client, vid, op, a_state, b_state, "left only again")
+
+
+def test_identity_is_the_whole_row_under_select_star(client, schema_name):
+    """An unprojected set op compares (PK, payload), not the PK: b's (1, 999)
+    does not exclude a's (1, 100) from the EXCEPT, and an UPDATE — one PK
+    carrying a retraction and an insertion in the same delta — moves two distinct
+    elements rather than one key. `UNION ALL` of the identical row on both sides
+    keeps both copies — only that operator gives the right branch its own hash
+    id, so the view sink never sees one synthetic key twice."""
+    sn = schema_name
+    _ab(client, sn)
+    for name, op in (("exc", "EXCEPT"), ("inter", "INTERSECT"), ("ua", "UNION ALL")):
+        client.execute_sql(
+            f"CREATE VIEW {name} AS SELECT * FROM a {op} SELECT * FROM b", schema_name=sn)
+
+    client.execute_sql("INSERT INTO b VALUES (1, 999), (2, 200)", schema_name=sn)
+    client.execute_sql("INSERT INTO a VALUES (1, 100), (2, 200)", schema_name=sn)
+    # (1, 999) and (1, 100) share a PK and differ in payload: two elements.
+    assert bag(scanned(client, sn, "exc"), "pk", "val") == {(1, 100): 1}
+    assert bag(scanned(client, sn, "inter"), "pk", "val") == {(2, 200): 1}
+    assert bag(scanned(client, sn, "ua"), "pk", "val") == \
+        {(1, 100): 1, (1, 999): 1, (2, 200): 2}
+
+    # The UPDATE retracts (2, 200) and inserts (2, 300); only the first was
+    # excluded by b, so the row re-enters EXCEPT and leaves INTERSECT.
+    client.execute_sql("UPDATE a SET val = 300 WHERE pk = 2", schema_name=sn)
+    assert bag(scanned(client, sn, "exc"), "pk", "val") == {(1, 100): 1, (2, 300): 1}
+    assert bag(scanned(client, sn, "inter"), "pk", "val") == {}
+    assert bag(scanned(client, sn, "ua"), "pk", "val") == \
+        {(1, 100): 1, (1, 999): 1, (2, 200): 1, (2, 300): 1}
+
+
+def test_a_distinct_tuple_lives_exactly_while_a_row_carries_it(client, schema_name):
+    """DISTINCT is the non-linear boundary operator (DBSP Prop 4.7): a projected
+    tuple sits at weight 1 while its accumulated weight is positive, whatever
+    number of rows carry it, and leaves only when the last one is retracted. Its
+    identity is the whole tuple, so two rows sharing one component are two
+    tuples, and an UPDATE that moves the last carrier crosses an exit and an
+    entry boundary in one epoch."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql("CREATE VIEW v AS SELECT DISTINCT a, b FROM t", schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
+    state = {}
+
+    def check(ctx):
+        oracle.assert_view_matches(
+            client, vid, ["a", "b"],
+            oracle.oracle_distinct(oracle.oracle_filter_project(state, None, ["a", "b"])),
+            ctx=ctx)
+
+    # (1,1) carried twice; (1,2) shares `a` with it and (2,1) shares `b`.
+    client.execute_sql(
+        "INSERT INTO t VALUES (1,1,1), (2,1,1), (3,1,2), (4,2,1), (5,3,3)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [
+        {"pk": 1, "a": 1, "b": 1}, {"pk": 2, "a": 1, "b": 1}, {"pk": 3, "a": 1, "b": 2},
+        {"pk": 4, "a": 2, "b": 1}, {"pk": 5, "a": 3, "b": 3}])
+    check("after insert")
+
+    client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+    oracle.apply_delete(state, "pk", [1])
+    check("one of two carriers gone: boundary not crossed")
+
+    client.execute_sql("DELETE FROM t WHERE pk = 5", schema_name=sn)
+    oracle.apply_delete(state, "pk", [5])
+    check("last carrier gone: exit boundary crossed")
+
+    client.execute_sql("UPDATE t SET a = 4 WHERE pk = 2", schema_name=sn)
+    oracle.apply_update(state, "pk", 2, {"a": 4})
+    check("last carrier moved: exit and entry in one epoch")
+
+    # Onto a tuple that already exists: a second carrier, not a second row.
+    client.execute_sql("UPDATE t SET a = 2, b = 1 WHERE pk = 3", schema_name=sn)
+    oracle.apply_update(state, "pk", 3, {"a": 2, "b": 1})
+    check("moved onto an existing tuple")
+
+    client.execute_sql("DELETE FROM t WHERE pk = 4", schema_name=sn)
+    oracle.apply_delete(state, "pk", [4])
+    check("other carrier of that tuple gone")
+
+    client.execute_sql("INSERT INTO t VALUES (6, 3, 3)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [{"pk": 6, "a": 3, "b": 3}])
+    check("re-entry")
+
+
+def test_a_nullable_branch_makes_the_output_nullable(client, schema_name):
+    """Output nullability is the union of both inputs, so a NOT NULL left paired
+    with a nullable right yields a nullable column and the reader consults the
+    null bitmap instead of reading 0. NULL is its own value throughout: it never
+    coincides with a genuine 0, several NULLs coalesce to one under a
+    deduplicating op and keep their multiplicity under `ALL`."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT)", schema_name=sn)
+    views = {}
+    for op in ("UNION ALL", "UNION", "INTERSECT", "EXCEPT"):
+        name = "v" + op.replace(" ", "_").lower()
+        client.execute_sql(
+            f"CREATE VIEW {name} AS SELECT val FROM t1 {op} SELECT val FROM t2", schema_name=sn)
+        views[op] = client.resolve_table(sn, name)[0]
+
+    client.execute_sql("INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 0)", schema_name=sn)
+    client.execute_sql("INSERT INTO t2 VALUES (10, NULL), (11, NULL), (12, 0)", schema_name=sn)
+
+    for op, expected in (
+        ("UNION ALL", {(10,): 1, (20,): 1, (0,): 2, (None,): 2}),
+        ("UNION", {(10,): 1, (20,): 1, (0,): 1, (None,): 1}),
+        ("INTERSECT", {(0,): 1}),
+        ("EXCEPT", {(10,): 1, (20,): 1}),
     ):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                f"CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, val {lt} NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                f"CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val {rt} NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v_union AS SELECT val FROM t1 UNION SELECT val FROM t2", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v_isect AS SELECT val FROM t1 INTERSECT SELECT val FROM t2", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v_except AS SELECT val FROM t1 EXCEPT SELECT val FROM t2", schema_name=sn)
-            vu = client.resolve_table(sn, "v_union")[0]
-            vi = client.resolve_table(sn, "v_isect")[0]
-            ve = client.resolve_table(sn, "v_except")[0]
+        oracle.assert_view_matches(client, views[op], ["val"], expected, ctx=op)
 
-            client.execute_sql(f"INSERT INTO t2 VALUES (1, {shared}), (2, {right_only})", schema_name=sn)
-            client.execute_sql(f"INSERT INTO t1 VALUES (1, {shared}), (2, {left_only})", schema_name=sn)
 
-            # UNION DISTINCT: `shared` coalesces to ONE row (weight 1, not 2);
-            # both `*_only` values stay distinct.
-            oracle.assert_view_matches(
-                client, vu, ["val"],
-                {(shared,): 1, (left_only,): 1, (right_only,): 1}, ctx=f"{label} UNION")
-            # INTERSECT: only `shared` — proves the two widths hash-match.
-            oracle.assert_view_matches(client, vi, ["val"], {(shared,): 1}, ctx=f"{label} INTERSECT")
-            # EXCEPT: only the left-only value — `shared` cancels across widths.
-            oracle.assert_view_matches(client, ve, ["val"], {(left_only,): 1}, ctx=f"{label} EXCEPT")
-        finally:
-            client.drop_schema(sn)
+# ---------------------------------------------------------------------------
+# Cross-width / cross-sign branches
+#
+# The narrower side is widened to the pair's common type before hashing, so
+# equal logical values reach one physical representation and coalesce; a value
+# outside the narrow type's range must survive the widening unchanged.
+# ---------------------------------------------------------------------------
 
-    def test_widened_pk_source_compound_pk_sign_extend(self, client):
-        """A set-op side projects a narrow PK column (INT, the 2nd column of a
-        compound PK so its OPK byte offset is non-zero) that widens to BIGINT to
-        match the other side. Exercises copy_column's PK branch: decode the OPK at
-        the SOURCE width, then sign-extend into the wider slot. A negative id pins
-        the sign-extension — zero-extension would turn -3 into 4294967293 and break
-        the coalesce."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t1 (a BIGINT NOT NULL, id INT NOT NULL, filler BIGINT NOT NULL, "
-                "PRIMARY KEY (a, id))",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v_union AS SELECT id FROM t1 UNION SELECT val FROM t2", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v_isect AS SELECT id FROM t1 INTERSECT SELECT val FROM t2", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v_except AS SELECT id FROM t1 EXCEPT SELECT val FROM t2", schema_name=sn)
-            vu = client.resolve_table(sn, "v_union")[0]
-            vi = client.resolve_table(sn, "v_isect")[0]
-            ve = client.resolve_table(sn, "v_except")[0]
+# (label, left type, right type, shared, left-only, right-only). One `*_only`
+# value always exceeds the other side's range.
+_WIDTH_CASES = [
+    ("i32_i64", "INT", "BIGINT", 5, 7, 8_000_000_000),                 # → I64
+    ("u16_u32", "SMALLINT UNSIGNED", "INT UNSIGNED", 5, 7, 200_000),   # → U32
+    ("u32_i32", "INT UNSIGNED", "INT", 5, 3_000_000_000, 9),           # → I64
+]
 
-            client.execute_sql("INSERT INTO t2 VALUES (1, 5), (2, -3), (3, 100)", schema_name=sn)
-            client.execute_sql("INSERT INTO t1 VALUES (1, 5, 0), (2, -3, 0), (3, 7, 0)", schema_name=sn)
 
-            # id 5 and -3 coalesce with val 5 and -3 (negative pins sign-extension).
-            oracle.assert_view_matches(
-                client, vu, ["id"],
-                {(5,): 1, (-3,): 1, (7,): 1, (100,): 1}, ctx="widened-pk UNION")
-            oracle.assert_view_matches(
-                client, vi, ["id"], {(5,): 1, (-3,): 1}, ctx="widened-pk INTERSECT")
-            oracle.assert_view_matches(client, ve, ["id"], {(7,): 1}, ctx="widened-pk EXCEPT")
-        finally:
-            client.drop_schema(sn)
+def _promotion_views(client, sn, lt, rt, lnull="NOT NULL", rnull="NOT NULL"):
+    """`t1(val lt)` / `t2(val rt)` plus the three deduplicating set-op views over
+    their projected `val`. Returns `(union, intersect, except)` tids."""
+    client.execute_sql(
+        f"CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, val {lt} {lnull})", schema_name=sn)
+    client.execute_sql(
+        f"CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val {rt} {rnull})", schema_name=sn)
+    out = []
+    for name, op in (("vu", "UNION"), ("vi", "INTERSECT"), ("ve", "EXCEPT")):
+        client.execute_sql(
+            f"CREATE VIEW {name} AS SELECT val FROM t1 {op} SELECT val FROM t2", schema_name=sn)
+        out.append(client.resolve_table(sn, name)[0])
+    return out
 
-    def test_nullable_cross_width_pair(self, client):
-        """A NULL on the widened (INT) side coalesces with a NULL on the native
-        (BIGINT) side under UNION/INTERSECT and cancels under EXCEPT; a NULL never
-        collides with a non-null 0 (the value bytes are skipped when a row is
-        null)."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, val INT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v_union AS SELECT val FROM t1 UNION SELECT val FROM t2", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v_isect AS SELECT val FROM t1 INTERSECT SELECT val FROM t2", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v_except AS SELECT val FROM t1 EXCEPT SELECT val FROM t2", schema_name=sn)
-            vu = client.resolve_table(sn, "v_union")[0]
-            vi = client.resolve_table(sn, "v_isect")[0]
-            ve = client.resolve_table(sn, "v_except")[0]
 
-            # t1: NULL, 5, 0 (a non-null zero).  t2: NULL, 5, big (wide-only).
-            client.execute_sql("INSERT INTO t2 VALUES (1, NULL), (2, 5), (3, 8000000000)", schema_name=sn)
-            client.execute_sql("INSERT INTO t1 VALUES (1, NULL), (2, 5), (3, 0)", schema_name=sn)
+@pytest.mark.parametrize("label,lt,rt,shared,left_only,right_only", _WIDTH_CASES)
+def test_a_narrower_branch_widens_to_the_common_type(
+        client, schema_name, label, lt, rt, shared, left_only, right_only):
+    """Equal values of different declared width hash to one content key, so the
+    shared value coalesces under UNION, is the whole INTERSECT and cancels under
+    EXCEPT — while a value that only the wider type can hold stays distinct."""
+    sn = schema_name
+    vu, vi, ve = _promotion_views(client, sn, lt, rt)
+    client.execute_sql(f"INSERT INTO t2 VALUES (1, {shared}), (2, {right_only})", schema_name=sn)
+    client.execute_sql(f"INSERT INTO t1 VALUES (1, {shared}), (2, {left_only})", schema_name=sn)
 
-            # UNION: NULL and 5 coalesce; 0 and the wide-only value stay distinct.
-            oracle.assert_view_matches(
-                client, vu, ["val"],
-                {(None,): 1, (5,): 1, (0,): 1, (8000000000,): 1}, ctx="nullable UNION")
-            # INTERSECT: NULL matches NULL, 5 matches 5; 0 is left-only, big is right-only.
-            oracle.assert_view_matches(
-                client, vi, ["val"], {(None,): 1, (5,): 1}, ctx="nullable INTERSECT")
-            # EXCEPT: NULL and 5 cancel; only the non-null 0 survives (NULL != 0).
-            oracle.assert_view_matches(client, ve, ["val"], {(0,): 1}, ctx="nullable EXCEPT")
-        finally:
-            client.drop_schema(sn)
+    oracle.assert_view_matches(
+        client, vu, ["val"],
+        {(shared,): 1, (left_only,): 1, (right_only,): 1}, ctx=f"{label} UNION")
+    oracle.assert_view_matches(client, vi, ["val"], {(shared,): 1}, ctx=f"{label} INTERSECT")
+    oracle.assert_view_matches(client, ve, ["val"], {(left_only,): 1}, ctx=f"{label} EXCEPT")
 
-    def test_incremental_membership_flip_promoted_and_plain_cols(self, client):
-        """Incremental insert then retraction flips INTERSECT membership over a
-        two-column projection where `k` is cross-width (INT vs BIGINT, promoted) and
-        `tag` is BIGINT on both (not promoted). Both columns must participate in the
-        row identity."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
+
+def test_a_widened_null_coalesces_and_never_collides_with_zero(client, schema_name):
+    """A NULL on the widened (INT) side matches a NULL on the native (BIGINT)
+    side and cancels under EXCEPT, while a non-null 0 stays its own value — the
+    value bytes are skipped when the row's null bit is set, so the two can never
+    hash together."""
+    sn = schema_name
+    vu, vi, ve = _promotion_views(client, sn, "INT", "BIGINT", lnull="NULL", rnull="NULL")
+    client.execute_sql(
+        "INSERT INTO t2 VALUES (1, NULL), (2, 5), (3, 8000000000)", schema_name=sn)
+    client.execute_sql("INSERT INTO t1 VALUES (1, NULL), (2, 5), (3, 0)", schema_name=sn)
+
+    oracle.assert_view_matches(
+        client, vu, ["val"],
+        {(None,): 1, (5,): 1, (0,): 1, (8000000000,): 1}, ctx="UNION")
+    oracle.assert_view_matches(client, vi, ["val"], {(None,): 1, (5,): 1}, ctx="INTERSECT")
+    oracle.assert_view_matches(client, ve, ["val"], {(0,): 1}, ctx="EXCEPT")
+
+
+def test_a_widened_pk_column_sign_extends_from_its_source_width(client, schema_name):
+    """A branch that projects a narrow PK column — INT, second in a compound PK,
+    so its OPK offset is non-zero — decodes at the source width and
+    sign-extends into the wider slot. A negative id is what discriminates:
+    zero-extension would read -3 as 4294967293 and break the coalesce."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t1 (a BIGINT NOT NULL, id INT NOT NULL, filler BIGINT NOT NULL, "
+        "PRIMARY KEY (a, id))", schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
+    out = []
+    for name, op in (("vu", "UNION"), ("vi", "INTERSECT"), ("ve", "EXCEPT")):
+        client.execute_sql(
+            f"CREATE VIEW {name} AS SELECT id FROM t1 {op} SELECT val FROM t2", schema_name=sn)
+        out.append(client.resolve_table(sn, name)[0])
+    vu, vi, ve = out
+
+    client.execute_sql("INSERT INTO t2 VALUES (1, 5), (2, -3), (3, 100)", schema_name=sn)
+    client.execute_sql("INSERT INTO t1 VALUES (1, 5, 0), (2, -3, 0), (3, 7, 0)", schema_name=sn)
+
+    oracle.assert_view_matches(
+        client, vu, ["id"], {(5,): 1, (-3,): 1, (7,): 1, (100,): 1}, ctx="UNION")
+    oracle.assert_view_matches(client, vi, ["id"], {(5,): 1, (-3,): 1}, ctx="INTERSECT")
+    oracle.assert_view_matches(client, ve, ["id"], {(7,): 1}, ctx="EXCEPT")
+
+
+def test_every_projected_column_is_part_of_the_promoted_identity(client, schema_name):
+    """A two-column projection where one column is promoted (INT vs BIGINT) and
+    the other is not: membership flips only on the full pair, so a row agreeing
+    in one column alone is not a match, and retracting the sole match empties the
+    view."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, k INT NOT NULL, tag BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, tag BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT k, tag FROM t1 INTERSECT SELECT k, tag FROM t2", schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
+
+    client.execute_sql("INSERT INTO t1 VALUES (1, 5, 100)", schema_name=sn)
+    oracle.assert_view_matches(client, vid, ["k", "tag"], {}, ctx="left only")
+
+    client.execute_sql("INSERT INTO t2 VALUES (1, 5, 100)", schema_name=sn)
+    oracle.assert_view_matches(client, vid, ["k", "tag"], {(5, 100): 1}, ctx="INT 5 meets BIGINT 5")
+
+    # Same k with another tag, and another k with the same tag: neither matches.
+    client.execute_sql("INSERT INTO t2 VALUES (2, 5, 200), (3, 6, 100)", schema_name=sn)
+    oracle.assert_view_matches(client, vid, ["k", "tag"], {(5, 100): 1}, ctx="both columns count")
+
+    client.execute_sql("DELETE FROM t2 WHERE pk = 1", schema_name=sn)
+    oracle.assert_view_matches(client, vid, ["k", "tag"], {}, ctx="sole match retracted")
+
+
+# (label, left type, right type, error substring) — a pair with no common
+# ≤8-byte integer layout must error rather than read the bytes at one width.
+_REJECT_CASES = [
+    ("string_vs_int", "TEXT", "BIGINT", "type mismatch"),
+    ("u64_vs_i64", "BIGINT UNSIGNED", "BIGINT", "type mismatch"),   # → I128
+    ("float", "DOUBLE", "DOUBLE", "float column"),                  # no byte-equal key
+]
+
+
+@pytest.mark.parametrize("label,lt,rt,err", _REJECT_CASES)
+def test_branches_with_no_common_key_layout_are_refused(client, schema_name, label, lt, rt, err):
+    sn = schema_name
+    client.execute_sql(
+        f"CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, val {lt} NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        f"CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val {rt} NOT NULL)", schema_name=sn)
+    with pytest.raises(gnitz.GnitzError, match=err):
+        client.execute_sql(
+            "CREATE VIEW v AS SELECT val FROM t1 UNION ALL SELECT val FROM t2", schema_name=sn)
+
+
+def test_minus_is_except_down_to_the_quantifier_and_precedence(client, schema_name):
+    """`MINUS` is Oracle's spelling of `EXCEPT`: the same operator, taking the
+    same `ALL` / `DISTINCT` quantifier and binding at the same precedence, so a
+    mixed chain associates identically. `a` carries 20 twice, so the ALL /
+    DISTINCT split is a weight rather than a matching row set."""
+    sn = schema_name
+    _ab(client, sn)
+    client.execute_sql(
+        "CREATE TABLE c (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
+    pairs = {q: (_setop_view(client, sn, f"m{i}", f"MINUS{q}"),
+                 _setop_view(client, sn, f"e{i}", f"EXCEPT{q}"))
+             for i, q in enumerate(["", " ALL", " DISTINCT"])}
+    chain = "SELECT val FROM a UNION SELECT val FROM b {} SELECT val FROM c"
+    client.execute_sql(f"CREATE VIEW mc AS {chain.format('MINUS')}", schema_name=sn)
+    client.execute_sql(f"CREATE VIEW ec AS {chain.format('EXCEPT')}", schema_name=sn)
+
+    client.execute_sql("INSERT INTO a VALUES (1,10), (2,20), (3,20), (4,30)", schema_name=sn)
+    client.execute_sql("INSERT INTO b VALUES (1,30), (2,40)", schema_name=sn)
+    client.execute_sql("INSERT INTO c VALUES (1,30)", schema_name=sn)
+
+    for q, (mid, eid) in pairs.items():
+        got = oracle.scan_multiset(client, mid, ["val"])
+        assert got == oracle.scan_multiset(client, eid, ["val"]), f"MINUS{q} != EXCEPT{q}: {got}"
+        # 30 is in b, so it leaves; 20 keeps weight 2 only under ALL.
+        assert got == Counter({(10,): 1, (20,): 2 if q == " ALL" else 1}), f"MINUS{q}: {got}"
+
+    # `(a ∪ b) − c` associates left to right: {10,20,30,40} − {30}.
+    got = oracle.scan_multiset(client, client.resolve_table(sn, "mc")[0], ["val"])
+    assert got == oracle.scan_multiset(client, client.resolve_table(sn, "ec")[0], ["val"])
+    assert got == Counter({(10,): 1, (20,): 1, (40,): 1}), got
+
+
+def test_by_name_set_operations_are_refused_rather_than_aligned_positionally(client, schema_name):
+    """`BY NAME` pairs branch columns by name; nothing implements that, so
+    accepting it would silently run the positional pairing instead. A refused
+    CREATE registers no view."""
+    sn = schema_name
+    _ab(client, sn)
+    for i, op in enumerate(["UNION ALL", "INTERSECT", "EXCEPT"]):
+        with pytest.raises(gnitz.GnitzError):
             client.execute_sql(
-                "CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, k INT NOT NULL, tag BIGINT NOT NULL)",
+                f"CREATE VIEW rej{i} AS SELECT val FROM a {op} BY NAME SELECT val FROM b",
                 schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, tag BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT k, tag FROM t1 INTERSECT SELECT k, tag FROM t2", schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql("INSERT INTO t1 VALUES (1, 5, 100)", schema_name=sn)
-            # No match yet.
-            oracle.assert_view_matches(client, vid, ["k", "tag"], {}, ctx="flip: t1 only")
-
-            client.execute_sql("INSERT INTO t2 VALUES (1, 5, 100)", schema_name=sn)
-            # (5,100) now in both — INT 5 coalesces with BIGINT 5.
-            oracle.assert_view_matches(client, vid, ["k", "tag"], {(5, 100): 1}, ctx="flip: matched")
-
-            # Non-matching rows: same k, different tag; and different k, same tag.
-            client.execute_sql("INSERT INTO t2 VALUES (2, 5, 200), (3, 6, 100)", schema_name=sn)
-            oracle.assert_view_matches(
-                client, vid, ["k", "tag"], {(5, 100): 1}, ctx="flip: both cols identity")
-
-            # Retract the sole match — membership flips back to empty (delta weight -1).
-            client.execute_sql("DELETE FROM t2 WHERE pk = 1", schema_name=sn)
-            oracle.assert_view_matches(client, vid, ["k", "tag"], {}, ctx="flip: retracted")
-        finally:
-            client.drop_schema(sn)
-
-    # (label, left_type, right_type, error_substring) — pairs with no common
-    # ≤8-byte integer layout must error cleanly rather than read garbage.
-    _REJECT_CASES = [
-        ("string_vs_int", "TEXT", "BIGINT", "type mismatch"),          # string vs int
-        ("u64_vs_i64", "BIGINT UNSIGNED", "BIGINT", "type mismatch"),  # → I128, rejected
-        ("float", "DOUBLE", "DOUBLE", "float column"),                 # rejected by reject_float_keys
-    ]
-
-    @pytest.mark.parametrize("label,lt,rt,err", _REJECT_CASES)
-    def test_cross_width_rejected(self, client, label, lt, rt, err):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                f"CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, val {lt} NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                f"CREATE TABLE t2 (pk BIGINT NOT NULL PRIMARY KEY, val {rt} NOT NULL)", schema_name=sn)
-            with pytest.raises(gnitz.GnitzError, match=err):
-                client.execute_sql(
-                    "CREATE VIEW v AS SELECT val FROM t1 UNION ALL SELECT val FROM t2", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
+        with pytest.raises(gnitz.GnitzError):
+            client.resolve_table(sn, f"rej{i}")
 
 
-class TestMinus:
-    """`MINUS` is Oracle's spelling of `EXCEPT`, and `parse_set_quantifier`
-    accepts `ALL` / `DISTINCT` after it exactly as after `EXCEPT` — so the two
-    spellings compile to one operator, quantifier included."""
+def test_a_view_body_refuses_the_clauses_its_shape_would_drop(client, schema_name):
+    """Every CREATE VIEW shape (simple, grouped, join, set-op, DISTINCT) reads
+    only a hand-picked subset of the SELECT. A clause a shape does not consume is
+    refused by name, not dropped — a dropped clause runs a different query than
+    the caller wrote."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE u (pk BIGINT NOT NULL PRIMARY KEY, c BIGINT NOT NULL)", schema_name=sn)
 
-    def _setup(self, client, sn):
-        _create_ab_tables(client, sn)
-        # `a` carries 20 twice (two PKs, same val) so a DISTINCT-vs-ALL difference
-        # shows up as a weight, which a row-set comparison would miss.
-        client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 20), (3, 20), (4, 30)", schema_name=sn)
-        client.execute_sql("INSERT INTO b VALUES (1, 30), (2, 40)", schema_name=sn)
+    def rejects(sql, msg):
+        with pytest.raises(gnitz.GnitzError, match=msg):
+            client.execute_sql(sql, schema_name=sn)
 
-    @pytest.mark.parametrize("quantifier", ["", " ALL", " DISTINCT"])
-    def test_minus_is_except(self, client, quantifier):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            _create_ab_tables(client, sn)
-            client.execute_sql(
-                f"CREATE VIEW m AS SELECT val FROM a MINUS{quantifier} SELECT val FROM b", schema_name=sn
-            )
-            client.execute_sql(
-                f"CREATE VIEW e AS SELECT val FROM a EXCEPT{quantifier} SELECT val FROM b", schema_name=sn
-            )
-            mid = client.resolve_table(sn, "m")[0]
-            eid = client.resolve_table(sn, "e")[0]
-            client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 20), (3, 20), (4, 30)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (1, 30), (2, 40)", schema_name=sn)
+    # DISTINCT ON: a single SELECT, a set-op branch, and the degenerate
+    # `DISTINCT ON (a) a` — refused on purpose rather than folded to `DISTINCT a`.
+    for sql in (
+        "CREATE VIEW v AS SELECT DISTINCT ON (a) a, b FROM t",
+        "CREATE VIEW v AS SELECT DISTINCT ON (a) a FROM t UNION SELECT b FROM t",
+        "CREATE VIEW v AS SELECT DISTINCT ON (a) a FROM t",
+    ):
+        rejects(sql, "DISTINCT ON is not supported")
 
-            got = oracle.scan_multiset(client, mid, ["val"])
-            want = oracle.scan_multiset(client, eid, ["val"])
-            assert got == want, f"MINUS{quantifier} must equal EXCEPT{quantifier}: {got} vs {want}"
-            # And the weights are the operator's, not merely a matching row set:
-            # ALL keeps 20 at weight 2, DISTINCT collapses it to 1.
-            expect_20 = 2 if quantifier == " ALL" else 1
-            assert got[(20,)] == expect_20, f"MINUS{quantifier} weight for 20: {got}"
-            assert (30,) not in got, f"30 is in b, so MINUS must remove it: {got}"
-        finally:
-            client.drop_schema(sn)
+    rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t GROUP BY a", "GROUP BY is not supported")
+    rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t HAVING a > 0", "HAVING is not supported")
+    # A HAVING without DISTINCT drops nothing: it groups the whole relation, so
+    # the body binds as a global aggregate and `a` — neither a group key nor an
+    # aggregate — is what fails.
+    rejects("CREATE VIEW v AS SELECT a FROM t HAVING a > 0",
+            "column 'a' must appear in GROUP BY or an aggregate function")
+    rejects("CREATE VIEW v AS SELECT a FROM t GROUP BY ALL", "GROUP BY")
 
-    def test_minus_chains_with_union_and_except(self, client):
-        """MINUS binds at UNION/EXCEPT's precedence, so a mixed chain associates
-        identically to the same chain written with EXCEPT throughout."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            _create_ab_tables(client, sn)
-            client.execute_sql(
-                "CREATE TABLE c (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn
-            )
-            body = "SELECT val FROM a UNION SELECT val FROM b {} SELECT val FROM c"
-            client.execute_sql(f"CREATE VIEW m AS {body.format('MINUS')}", schema_name=sn)
-            client.execute_sql(f"CREATE VIEW e AS {body.format('EXCEPT')}", schema_name=sn)
-            mid = client.resolve_table(sn, "m")[0]
-            eid = client.resolve_table(sn, "e")[0]
-            client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 20)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (1, 20), (2, 30)", schema_name=sn)
-            client.execute_sql("INSERT INTO c VALUES (1, 30)", schema_name=sn)
-            got = oracle.scan_multiset(client, mid, ["val"])
-            assert got == oracle.scan_multiset(client, eid, ["val"]), got
-            # `(a ∪ b) − c` left to right: {10,20,30} − {30}.
-            assert got == Counter({(10,): 1, (20,): 1}), got
-        finally:
-            client.drop_schema(sn)
+    rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t PREWHERE a > 5", "PREWHERE is not supported")
+    rejects("CREATE VIEW v AS SELECT a FROM t PREWHERE a > 5", "PREWHERE is not supported")
+    rejects("CREATE VIEW v AS SELECT a, COUNT(*) FROM t PREWHERE a > 5 GROUP BY a",
+            "PREWHERE is not supported")
+    rejects("CREATE VIEW v AS SELECT DISTINCT TOP 5 a FROM t", "TOP is not supported")
+    rejects("CREATE VIEW v AS SELECT a FROM t FETCH FIRST 5 ROWS ONLY", "FETCH is not supported")
+    rejects("CREATE VIEW v AS SELECT a FROM t SORT BY a", "SORT BY is not supported")
+    # QUALIFY filters on window values, ahead of a DISTINCT: one with no window
+    # function to filter on is refused, not dropped.
+    rejects("CREATE VIEW v AS SELECT DISTINCT a FROM t QUALIFY a > 1",
+            "QUALIFY needs a window function")
+    rejects("CREATE VIEW v AS SELECT pk FROM t FOR UPDATE", "FOR UPDATE/SHARE is not supported")
+    rejects("CREATE VIEW v AS SELECT pk FROM t SETTINGS max_threads = 1",
+            "SETTINGS is not supported")
+    rejects("CREATE VIEW v AS SELECT pk FROM t FORMAT JSON", "FORMAT is not supported")
+
+    # Positive controls: every honoured shape still compiles, including the ones
+    # whose clauses the list above refuses elsewhere — a grouped or DISTINCT
+    # set-op side becomes a hidden segment, and an OUTER range join consumes its
+    # own WHERE as a post-null-fill 3VL filter.
+    for name, body in {
+        "vsimple": "SELECT a, b FROM t WHERE a > 0",
+        "vdistinct": "SELECT DISTINCT a, b FROM t",
+        "vgroup": "SELECT a, COUNT(*) FROM t GROUP BY a",
+        "vjoin": "SELECT t.a, u.c FROM t JOIN u ON t.pk = u.pk",
+        "vsetop": "SELECT a FROM t UNION ALL SELECT b FROM t",
+        "vsetop_side": "SELECT DISTINCT a FROM t UNION ALL SELECT b FROM t GROUP BY b",
+        "vrangeleft": "SELECT t.a FROM t LEFT JOIN u ON t.a < u.c WHERE t.a > 5",
+    }.items():
+        client.execute_sql(f"CREATE VIEW {name} AS {body}", schema_name=sn)
+        client.resolve_table(sn, name)

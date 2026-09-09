@@ -1,4116 +1,1455 @@
-"""E2E tests for GROUP BY with COUNT/SUM/MIN/MAX/AVG, HAVING.
+"""GROUP BY and the ungrouped (global) aggregate as dataflow shapes: the reduce
+node, the value index its non-linear aggregates read, the finalize map above it,
+and the HAVING filter above that.
 
-Run:
-    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/relational_shape/test_aggregates.py -v --tb=short
+Correctness is a weight-multiset. Every churn test recomputes its expectation in
+pure Python (`_oracle`) from base state it maintains itself, so a reduce bug
+cannot hide behind a hand-written expectation; the value-pinned tests compare
+through `bag`, which sums weights, so a ghost or a doubled delta is a mismatch
+rather than a plausible row set.
+
+Run with GNITZ_WORKERS=4: a GROUP BY shards each group whole onto one worker and
+a global aggregate funnels every row onto V0's owner, so both routing decisions
+are only real at W > 1.
 """
-from collections import Counter
-
 import pytest
 import gnitz
 from gnitz import Opcode
 import _oracle as oracle
-from _uid import uid as _uid
+from _read import bag, scanned
 
 
+def _oracle_check(client, vid, state, cols, groups, aggs):
+    """Build `check(ctx)`: assert the view's weight-multiset equals the aggregate
+    recomputed in Python from `state`, which the caller maintains in lockstep
+    with the SQL it sends.
 
-
-class TestGroupBy:
-    def _setup(self, client, sn):
-        client.execute_sql(
-            "CREATE TABLE orders ("
-            "  pk BIGINT NOT NULL PRIMARY KEY,"
-            "  category BIGINT NOT NULL,"
-            "  amount BIGINT NOT NULL,"
-            "  price BIGINT NOT NULL"
-            ")",
-            schema_name=sn,
-        )
-
-    def test_count_star(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT category, COUNT(*) AS cnt FROM orders GROUP BY category",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 10, 100, 50), (2, 10, 200, 60), (3, 20, 300, 70)",
-                schema_name=sn,
-            )
-
-            rows = client.scan(vid)
-            assert len(rows) == 2
-            # Find rows by category
-            by_cat = {}
-            for r in rows:
-                cat = r["category"]
-                by_cat[cat] = r
-            assert by_cat[10]["cnt"] == 2
-            assert by_cat[20]["cnt"] == 1
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_sum(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT category, SUM(amount) AS total FROM orders GROUP BY category",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 10, 100, 50), (2, 10, 200, 60), (3, 20, 300, 70)",
-                schema_name=sn,
-            )
-
-            rows = client.scan(vid)
-            by_cat = {}
-            for r in rows:
-                by_cat[r["category"]] = r
-            assert by_cat[10]["total"] == 300  # 100+200
-            assert by_cat[20]["total"] == 300
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_multi_agg(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT category, COUNT(*) AS cnt, SUM(amount) AS total "
-                "FROM orders GROUP BY category",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 10, 100, 50), (2, 10, 200, 60), (3, 20, 300, 70)",
-                schema_name=sn,
-            )
-
-            rows = client.scan(vid)
-            by_cat = {}
-            for r in rows:
-                by_cat[r["category"]] = r
-            assert by_cat[10]["cnt"] == 2
-            assert by_cat[10]["total"] == 300
-            assert by_cat[20]["cnt"] == 1
-            assert by_cat[20]["total"] == 300
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_min_max(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT category, MIN(amount) AS lo, MAX(amount) AS hi "
-                "FROM orders GROUP BY category",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 10, 100, 50), (2, 10, 200, 60), (3, 10, 50, 70)",
-                schema_name=sn,
-            )
-
-            rows = client.scan(vid)
-            assert len(rows) == 1
-            row = next(iter(rows))
-            assert row["lo"] == 50
-            assert row["hi"] == 200
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_multi_col_group_by_min_distinct_groups(self, client):
-        """Single MIN over a two-column GROUP BY routes through the byte-form
-        AVI (group key = a ++ b ++ encoded value). Each distinct (a, b) must
-        resolve its own minimum — the index carries the full group key, so two
-        groups can never share a bucket."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  a INT NOT NULL,"
-                "  b INT NOT NULL,"
-                "  val BIGINT NOT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a, b, MIN(val) AS lo "
-                "FROM t GROUP BY a, b",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # 9 distinct (a, b) groups, each with several rows. The expected
-            # MIN per group is a*100 + b (the smallest val inserted for it).
-            pk = 0
-            expected = {}
-            rows_sql = []
-            for a in range(3):
-                for b in range(3):
-                    base = a * 100 + b
-                    expected[(a, b)] = base
-                    for k in range(3):
-                        pk += 1
-                        rows_sql.append(f"({pk}, {a}, {b}, {base + k * 10})")
-            client.execute_sql(
-                "INSERT INTO t VALUES " + ", ".join(rows_sql),
-                schema_name=sn,
-            )
-
-            rows = client.scan(vid)
-            assert len(rows) == len(expected)
-            for r in rows:
-                key = (r["a"], r["b"])
-                assert r["lo"] == expected[key], (
-                    f"group {key}: expected MIN {expected[key]}, got {r['lo']}"
-                )
-
-            # Incremental update: push a value below group (1,1)'s current MIN.
-            client.execute_sql(
-                f"INSERT INTO t VALUES ({pk + 1}, 1, 1, -5)",
-                schema_name=sn,
-            )
-            rows = client.scan(vid)
-            by_key = {(r["a"], r["b"]): r["lo"] for r in rows}
-            assert by_key[(1, 1)] == -5, "pushing a smaller value must lower the MIN"
-            # Other groups unchanged.
-            assert by_key[(2, 2)] == expected[(2, 2)]
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_wide_multi_col_group_by_min_max(self, client):
-        """A two-column GROUP BY over two BIGINT columns gives a composite AVI
-        key of a(8) ++ b(8) ++ encoded value(8) = 24 bytes, past the 16-byte
-        narrow cap — so this exercises the wide byte-form AVI seek. Inserting in
-        several batches forces memtable flushes (multi-source + on-disk shard
-        reads), and MIN/MAX must stay correct per group across incremental
-        inserts and a retraction."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  a BIGINT NOT NULL,"
-                "  b BIGINT NOT NULL,"
-                "  val BIGINT NOT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a, b, MIN(val) AS lo, MAX(val) AS hi "
-                "FROM t GROUP BY a, b",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # 6 distinct (a, b) groups; values chosen so the per-group MIN/MAX
-            # are unambiguous. Use large group coordinates to span >32 bits.
-            groups = [
-                (1_000_000_001, 2_000_000_001),
-                (1_000_000_001, 2_000_000_002),  # shares `a` with the first
-                (1_000_000_002, 2_000_000_001),
-                (5, 7),
-                (5, 8),
-                (9_999_999_999, 9_999_999_998),
-            ]
-            expected_lo = {}
-            expected_hi = {}
-            pk = 0
-            # Insert in several batches so the source table flushes between
-            # them — drives multi-source consolidation of the wide AVI key.
-            for batch_no in range(3):
-                rows_sql = []
-                for gi, (a, b) in enumerate(groups):
-                    for k in range(2):
-                        pk += 1
-                        v = (gi + 1) * 1000 + batch_no * 100 + k
-                        rows_sql.append(f"({pk}, {a}, {b}, {v})")
-                        expected_lo[(a, b)] = min(expected_lo.get((a, b), v), v)
-                        expected_hi[(a, b)] = max(expected_hi.get((a, b), v), v)
-                client.execute_sql(
-                    "INSERT INTO t VALUES " + ", ".join(rows_sql),
-                    schema_name=sn,
-                )
-
-            rows = client.scan(vid)
-            assert len(rows) == len(groups)
-            for r in rows:
-                key = (r["a"], r["b"])
-                assert r["lo"] == expected_lo[key], (
-                    f"group {key}: MIN expected {expected_lo[key]}, got {r['lo']}"
-                )
-                assert r["hi"] == expected_hi[key], (
-                    f"group {key}: MAX expected {expected_hi[key]}, got {r['hi']}"
-                )
-
-            # Incremental insert below the current MIN of group (5, 7).
-            client.execute_sql(
-                f"INSERT INTO t VALUES ({pk + 1}, 5, 7, -42)",
-                schema_name=sn,
-            )
-            by_lo = {(r["a"], r["b"]): r["lo"] for r in client.scan(vid)}
-            assert by_lo[(5, 7)] == -42, "smaller value must lower the group MIN"
-
-            # Retract the new extremum: MIN of (5, 7) must recover its prior value.
-            client.execute_sql(
-                f"DELETE FROM t WHERE pk = {pk + 1}",
-                schema_name=sn,
-            )
-            by_lo = {(r["a"], r["b"]): r["lo"] for r in client.scan(vid)}
-            assert by_lo[(5, 7)] == expected_lo[(5, 7)], (
-                "retracting the extremum must restore the next-best MIN"
-            )
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_signed_group_key_negative_values_byte_form(self, client):
-        """A single MIN over a two-column GROUP BY whose group columns are
-        SIGNED and hold NEGATIVE values. The byte-form AVI key concatenates each
-        group column's raw two's-complement bytes (a negative INT has its high
-        bit set, e.g. -5 -> 0xFFFFFFFB), so the prefix seek must still isolate
-        the exact group and keep a negative group distinct from its positive
-        twin. The existing byte-form AVI suites only use non-negative group
-        coordinates, so this guards the signed gather + exact-prefix lookup."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  a INT NOT NULL,"
-                "  b INT NOT NULL,"
-                "  val BIGINT NOT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a, b, MIN(val) AS lo "
-                "FROM t GROUP BY a, b",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # Sign twins: (-5,-7) vs (5,7) vs (-5,7) vs (5,-7) must never share a
-            # bucket. (0,0) anchors the all-zero key. Each group gets several
-            # vals; the expected MIN is the smallest inserted.
-            groups = [(-5, -7), (5, 7), (-5, 7), (5, -7), (0, 0)]
-            expected = {}
-            pk = 0
-            rows_sql = []
-            for gi, (a, b) in enumerate(groups):
-                base = (gi + 1) * 1000
-                for k in range(3):
-                    pk += 1
-                    v = base + (2 - k) * 10  # smallest is base (k=2)
-                    rows_sql.append(f"({pk}, {a}, {b}, {v})")
-                expected[(a, b)] = base
-            client.execute_sql(
-                "INSERT INTO t VALUES " + ", ".join(rows_sql),
-                schema_name=sn,
-            )
-
-            rows = client.scan(vid)
-            by_key = {(r["a"], r["b"]): r["lo"] for r in rows}
-            assert len(by_key) == len(groups), f"expected {len(groups)} groups, got {by_key}"
-            for key, lo in expected.items():
-                assert by_key[key] == lo, f"group {key}: expected MIN {lo}, got {by_key[key]}"
-
-            # Push a value below the current MIN of a negative group, then retract
-            # it: the byte-form AVI must lower the MIN and then recover the prior
-            # extremum from the remaining entries of that exact (negative) group.
-            client.execute_sql(f"INSERT INTO t VALUES ({pk + 1}, -5, -7, -999)", schema_name=sn)
-            by_key = {(r["a"], r["b"]): r["lo"] for r in client.scan(vid)}
-            assert by_key[(-5, -7)] == -999, "smaller value must lower the negative group's MIN"
-            assert by_key[(5, 7)] == expected[(5, 7)], "positive twin must be unaffected"
-
-            client.execute_sql(f"DELETE FROM t WHERE pk = {pk + 1}", schema_name=sn)
-            by_key = {(r["a"], r["b"]): r["lo"] for r in client.scan(vid)}
-            assert by_key[(-5, -7)] == expected[(-5, -7)], (
-                "retracting the extremum must restore the negative group's next-best MIN"
-            )
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_wide_group_by_min_max_u128_pk_source(self, client):
-        """GROUP BY MIN/MAX over a table with a 16-byte PRIMARY KEY
-        (DECIMAL(38,0) = U128). The two MIN/MAX aggregates over a non-PK group key
-        resolve through the combined value index (keyed `g ‖ ordinal ‖ av`), which
-        never re-reads the source trace by PK — so the wide U128 source PK (big ids
-        > u64::MAX occupying all 16 bytes) is irrelevant to the read path. Deleting
-        the row holding a group's MIN/MAX forces an incremental recompute that
-        seeks the index's post-delta extreme directly."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  id DECIMAL(38,0) NOT NULL PRIMARY KEY,"
-                "  g BIGINT NOT NULL,"
-                "  amount BIGINT NOT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT g, MIN(amount) AS lo, MAX(amount) AS hi "
-                "FROM t GROUP BY g",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            # 38-nine id is ~1e38 (well beyond u64::MAX ~1.8e19): the U128 source
-            # PK uses its upper 8 bytes, exercising the wide OPK prefix.
-            big = 99999999999999999999999999999999999999
-            client.execute_sql(
-                f"INSERT INTO t VALUES "
-                f"(1, 10, 100), (2, 10, 50), ({big}, 10, 200), "
-                f"(3, 20, 70), (4, 20, 30)",
-                schema_name=sn,
-            )
-            by_g = {r["g"]: r for r in client.scan(vid)}
-            assert by_g[10]["lo"] == 50 and by_g[10]["hi"] == 200, by_g
-            assert by_g[20]["lo"] == 30 and by_g[20]["hi"] == 70, by_g
-
-            # Delete group 10's MIN holder (id=2) → MIN recomputes to 100 from the
-            # combined value index's post-delta extreme for group 10.
-            client.execute_sql("DELETE FROM t WHERE id = 2", schema_name=sn)
-            by_g = {r["g"]: r for r in client.scan(vid)}
-            assert by_g[10]["lo"] == 100 and by_g[10]["hi"] == 200, by_g
-
-            # Delete group 10's MAX holder (the huge id) → MAX recomputes to 100.
-            client.execute_sql(f"DELETE FROM t WHERE id = {big}", schema_name=sn)
-            by_g = {r["g"]: r for r in client.scan(vid)}
-            assert by_g[10]["lo"] == 100 and by_g[10]["hi"] == 100, by_g
-            assert by_g[20]["lo"] == 30 and by_g[20]["hi"] == 70, by_g
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_min_max_text_recedes_on_delete(self, client):
-        """MIN/MAX over a TEXT column: the extremes are chosen by content order
-        over strings that share a long prefix and spill past the inline cell,
-        and deleting the row holding an extreme recedes it to the next value —
-        which the reduce reads off the value index, whose MAX ordinal stores a
-        complemented, prefix-free image."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  g BIGINT NOT NULL,"
-                "  s TEXT NOT NULL,"
-                "  sn TEXT"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT g, MIN(s) AS lo, MAX(s) AS hi, MIN(sn) AS lon, MAX(sn) AS hin "
-                "FROM t GROUP BY g",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            rows = [
-                (1, 10, "shared/prefix/ab", "x"),
-                (2, 10, "shared/prefix/abc", None),
-                (3, 10, "shared/prefix/a", None),
-                (4, 10, "shared/prefix/abd", "y"),
-                (5, 20, "z", None),
-                (6, 20, "", None),
-            ]
-            client.execute_sql(
-                "INSERT INTO t VALUES "
-                + ", ".join(
-                    f"({pk}, {g}, '{s}', {'NULL' if sn_ is None else repr(sn_)})"
-                    for pk, g, s, sn_ in rows
-                ),
-                schema_name=sn,
-            )
-
-            def expect(want):
-                by_g = {r["g"]: (r["lo"], r["hi"], r["lon"], r["hin"]) for r in client.scan(vid)}
-                assert by_g == want, by_g
-
-            expect({10: ("shared/prefix/a", "shared/prefix/abd", "x", "y"), 20: ("", "z", None, None)})
-            client.execute_sql("DELETE FROM t WHERE pk IN (3, 4)", schema_name=sn)
-            expect({10: ("shared/prefix/ab", "shared/prefix/abc", "x", "x"), 20: ("", "z", None, None)})
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            expect({10: ("shared/prefix/abc", "shared/prefix/abc", None, None), 20: ("", "z", None, None)})
-            client.execute_sql("DELETE FROM t WHERE pk = 6", schema_name=sn)
-            expect({10: ("shared/prefix/abc", "shared/prefix/abc", None, None), 20: ("z", "z", None, None)})
-            client.execute_sql("UPDATE t SET s = 'shared/prefix/aa' WHERE pk = 2", schema_name=sn)
-            expect({10: ("shared/prefix/aa", "shared/prefix/aa", None, None), 20: ("z", "z", None, None)})
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_min_max_global_text_ground_row(self, client):
-        """A global MIN/MAX over TEXT renders NULL over an empty source and
-        after every row is gone."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql("CREATE VIEW v AS SELECT MIN(s) AS lo, MAX(s) AS hi FROM t", schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            rows = lambda: [(r["lo"], r["hi"]) for r in client.scan(vid)]
-            assert rows() == [(None, None)]
-            client.execute_sql("INSERT INTO t VALUES (1, 'm'), (2, 'a long value past the inline cell')", schema_name=sn)
-            assert rows() == [("a long value past the inline cell", "m")]
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            assert rows() == [("a long value past the inline cell", "a long value past the inline cell")]
-            client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
-            assert rows() == [(None, None)]
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_min_max_over_16_byte_columns_recede_on_delete(self, client):
-        """MIN/MAX over UUID and DECIMAL(38,0) columns order on all 16 bytes and
-        recede through the value index like any other extreme."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  g BIGINT NOT NULL,"
-                "  u UUID NOT NULL,"
-                "  big DECIMAL(38,0) NOT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT g, MIN(u) AS ulo, MAX(u) AS uhi, MIN(big) AS blo, MAX(big) AS bhi "
-                "FROM t GROUP BY g",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            # The UUIDs differ only past their eighth byte; the decimals straddle u64::MAX.
-            ua = "550e8400-e29b-41d4-a716-446655440000"
-            ub = "550e8400-e29b-41d4-a716-446655440001"
-            uc = "550e8400-e29b-41d4-a716-446655430000"
-            small, mid, huge = 5, 2**64 + 1, 99999999999999999999999999999999999999
-            client.execute_sql(
-                f"INSERT INTO t VALUES (1, 1, '{ua}', {mid}), (2, 1, '{ub}', {small}), (3, 1, '{uc}', {huge})",
-                schema_name=sn,
-            )
-            row = lambda: next((r["ulo"], r["uhi"], r["blo"], r["bhi"]) for r in client.scan(vid))
-            assert row() == (uc, ub, small, huge)
-            client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
-            assert row() == (ua, ub, small, mid)
-            client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
-            assert row() == (ua, ua, mid, mid)
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_pk_source_min_group_by_full_pk(self, client):
-        """The aggregate source is a PRIMARY KEY column: `SELECT a, b, MIN(b) ...
-        GROUP BY a, b` over PK (a, b). Each (a, b) is its own group so MIN(b) is
-        just b — but the value-index population must OPK-decode b's at-rest bytes
-        before order-encoding, or the round-tripped MIN(b) is byte-swapped (256 ->
-        1). b straddles the high byte and the sign."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT NOT NULL, PRIMARY KEY (a, b))",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a, b, MIN(b) AS mb FROM t GROUP BY a, b",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # b straddles the high byte (1=0x0001 and 256=0x0100 are byte-swap
-            # twins) and the sign (-5); MIN(b) must round-trip to b for every row.
-            rows = [(1, 1), (1, 256), (1, 100), (2, 65536), (2, -5), (2, 300)]
-            client.execute_sql(
-                "INSERT INTO t VALUES " + ", ".join(f"({a}, {b})" for a, b in rows),
-                schema_name=sn,
-            )
-            got = {(r["a"], r["b"]): r["mb"] for r in client.scan(vid)}
-            assert len(got) == len(rows), f"expected {len(rows)} groups, got {got}"
-            for a, b in rows:
-                assert got[(a, b)] == b, f"MIN(b) for ({a},{b}) must round-trip to {b}, got {got[(a, b)]}"
-
-            # Delete the row at a byte-swap-sensitive value: its group vanishes,
-            # the others are untouched.
-            client.execute_sql("DELETE FROM t WHERE a = 1 AND b = 256", schema_name=sn)
-            got = {(r["a"], r["b"]): r["mb"] for r in client.scan(vid)}
-            assert (1, 256) not in got, "deleted group must vanish"
-            assert got[(1, 1)] == 1 and got[(2, 65536)] == 65536, got
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_pk_source_min_max_group_by_partial_pk(self, client):
-        """MIN/MAX over a PRIMARY KEY column with multi-row groups: `SELECT a,
-        MIN(b), MAX(b) ... GROUP BY a` over PK (a, b). A group holds several `b`
-        that straddle the high byte, so the value index must OPK-decode `b` to keep
-        its order — else the extreme walk (and its retract-at-extreme recovery)
-        selects a byte-swapped value."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT NOT NULL, PRIMARY KEY (a, b))",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a, MIN(b) AS lo, MAX(b) AS hi FROM t GROUP BY a",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # Group 100: b straddles the high byte {1, 256, 100, 65536} (MIN=1,
-            # MAX=65536). Group 300: negatives {-5, 4, 10} (MIN=-5, MAX=10).
-            groups = {100: [1, 256, 100, 65536], 300: [-5, 4, 10]}
-            rows = [(a, b) for a, bs in groups.items() for b in bs]
-            client.execute_sql(
-                "INSERT INTO t VALUES " + ", ".join(f"({a}, {b})" for a, b in rows),
-                schema_name=sn,
-            )
-            by_a = {r["a"]: r for r in client.scan(vid)}
-            assert by_a[100]["lo"] == 1 and by_a[100]["hi"] == 65536, by_a
-            assert by_a[300]["lo"] == -5 and by_a[300]["hi"] == 10, by_a
-
-            # Delete group 100's MAX holder (b=65536) → MAX falls to 256 (the
-            # byte-swap twin of 1: order must survive the decode).
-            client.execute_sql("DELETE FROM t WHERE a = 100 AND b = 65536", schema_name=sn)
-            by_a = {r["a"]: r for r in client.scan(vid)}
-            assert by_a[100]["lo"] == 1 and by_a[100]["hi"] == 256, by_a
-
-            # Delete group 100's MIN holder (b=1) → MIN rises to 100.
-            client.execute_sql("DELETE FROM t WHERE a = 100 AND b = 1", schema_name=sn)
-            by_a = {r["a"]: r for r in client.scan(vid)}
-            assert by_a[100]["lo"] == 100 and by_a[100]["hi"] == 256, by_a
-
-            # Delete group 300's MIN holder (b=-5) → MIN rises to 4.
-            client.execute_sql("DELETE FROM t WHERE a = 300 AND b = -5", schema_name=sn)
-            by_a = {r["a"]: r for r in client.scan(vid)}
-            assert by_a[300]["lo"] == 4 and by_a[300]["hi"] == 10, by_a
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_having(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT category, COUNT(*) AS cnt "
-                "FROM orders GROUP BY category HAVING COUNT(*) > 1",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 10, 100, 50), (2, 10, 200, 60), (3, 20, 300, 70)",
-                schema_name=sn,
-            )
-
-            rows = client.scan(vid)
-            # Only category 10 has count > 1
-            assert len(rows) == 1
-            row = next(iter(rows))
-            assert row["category"] == 10
-            assert row["cnt"] == 2
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_sum_times_two(self, client):
-        """HAVING SUM(amount) * 2 > 10 — `Mul` in HAVING, which the grouped leaf
-        inherits from the shared structural core rather than listing itself. SUM
-        appears only in HAVING, so the aggregate collector has to materialise a
-        reduce column the SELECT list never asked for."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT category FROM orders "
-                "GROUP BY category HAVING SUM(amount) * 2 > 10",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            # cat 10: SUM=8 → *2=16 > 10 PASS (SUM=8 alone would fail > 10, so the
-            #         `* 2` is load-bearing); cat 20: SUM=2 → *2=4 < 10 FAIL.
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 10, 4, 0), (2, 10, 4, 0), (3, 20, 2, 0)",
-                schema_name=sn,
-            )
-            cats = sorted(r["category"] for r in client.scan(vid))
-            assert cats == [10], f"only category 10 (SUM*2=16>10) passes, got {cats}"
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_not_count(self, client):
-        """HAVING NOT (COUNT(*) = 1) — the `UnaryOp` (NOT) the old HAVING binder
-        lacked now binds via the unified core."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT category, COUNT(*) AS cnt FROM orders "
-                "GROUP BY category HAVING NOT (COUNT(*) = 1)",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            # cat 10: 2 rows → NOT(2=1)=true PASS; cat 20: 1 row → NOT(1=1)=false
-            #         FAIL; cat 30: 3 rows → PASS.
-            client.execute_sql(
-                "INSERT INTO orders VALUES "
-                "(1, 10, 1, 0), (2, 10, 1, 0), (3, 20, 1, 0), "
-                "(4, 30, 1, 0), (5, 30, 1, 0), (6, 30, 1, 0)",
-                schema_name=sn,
-            )
-            cats = sorted(r["category"] for r in client.scan(vid))
-            assert cats == [10, 30], f"categories with COUNT != 1, got {cats}"
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_sum_between(self, client):
-        """HAVING SUM(amount) BETWEEN 5 AND 20 — the `BETWEEN` desugar in HAVING,
-        and the collector's lockstep with it: the aggregate buried inside BETWEEN
-        must be materialised, or binding cannot resolve it to a reduce column."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT category FROM orders "
-                "GROUP BY category HAVING SUM(amount) BETWEEN 5 AND 20",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            # cat 10: SUM=8 in [5,20] PASS; cat 20: SUM=2 < 5 FAIL;
-            # cat 30: SUM=100 > 20 FAIL.
-            client.execute_sql(
-                "INSERT INTO orders VALUES "
-                "(1, 10, 4, 0), (2, 10, 4, 0), (3, 20, 2, 0), (4, 30, 100, 0)",
-                schema_name=sn,
-            )
-            cats = sorted(r["category"] for r in client.scan(vid))
-            assert cats == [10], f"only category 10 (SUM=8 in [5,20]) passes, got {cats}"
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_avg(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT category, AVG(amount) AS avg_amt "
-                "FROM orders GROUP BY category",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 10, 100, 50), (2, 10, 200, 60)",
-                schema_name=sn,
-            )
-
-            rows = client.scan(vid)
-            assert len(rows) == 1
-            row = next(iter(rows))
-            # AVG(100, 200) = 150.0
-            assert abs(row["avg_amt"] - 150.0) < 0.001
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_avg_delete_to_all_null_emits_null(self, client):
-        """A group that loses its only non-NULL value (via DELETE) is re-emitted
-        with AVG = NULL (COUNT_NON_NULL drops to 0), and the group stays present
-        because it still has the NULL row. The AVG column must therefore be
-        nullable and expose the value as Python None."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  category BIGINT NOT NULL,"
-                "  amount BIGINT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT category, AVG(amount) AS avg_amt "
-                "FROM t GROUP BY category",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # category 10: one non-NULL (5) and one NULL → AVG ignores NULL → 5.0
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL)",
-                schema_name=sn,
-            )
-            rows = list(client.scan(vid))
-            assert len(rows) == 1
-            assert abs(rows[0]["avg_amt"] - 5.0) < 0.001
-
-            # Delete the only non-NULL contributor; the NULL row keeps the group.
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            rows = list(client.scan(vid))
-            assert len(rows) == 1, f"group must persist, got {rows}"
-            assert rows[0]["category"] == 10
-            assert rows[0]["avg_amt"] is None, (
-                f"AVG of an all-NULL group must be NULL, got {rows[0]['avg_amt']}")
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_sum_delete_to_all_null_emits_null(self, client):
-        """SUM over a nullable column must become NULL when a retraction removes
-        the last non-NULL contributor from a still-surviving group — the SUM
-        analog of test_avg_delete_to_all_null_emits_null. On the linear fold the
-        accumulator tracked presence as a saturating has_value bool, so a SUM that
-        netted back to 0 emitted a concrete 0 where SQL wants NULL. The fix adds a
-        hidden COUNT_NON_NULL companion and null-gates the SUM on it in the reduce
-        finalize. Runs under GNITZ_WORKERS=1 and =4: GROUP BY shards each group
-        onto one worker, so the 4-worker run confirms the fix on the sharded path.
-        """
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  k BIGINT NOT NULL,"
-                "  v BIGINT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT k, SUM(v) AS sm, COUNT(*) AS c "
-                "FROM t GROUP BY k",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # Group k=10: one non-NULL (v=5) and one NULL contributor.
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL)",
-                schema_name=sn,
-            )
-            rows = list(client.scan(vid))
-            assert len(rows) == 1
-            assert rows[0]["k"] == 10
-            assert rows[0]["sm"] == 5, f"SUM(5, NULL) = 5, got {rows[0]['sm']}"
-            assert rows[0]["c"] == 2
-
-            # Retract the last non-NULL contributor. The NULL row keeps the group
-            # alive (c=1), so SUM over {NULL} must be NULL, not 0.
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            rows = list(client.scan(vid))
-            assert len(rows) == 1, f"group must persist via its NULL row, got {rows}"
-            assert rows[0]["k"] == 10
-            assert rows[0]["c"] == 1
-            assert rows[0]["sm"] is None, (
-                f"SUM of a group with no non-NULL values must be NULL, got {rows[0]['sm']}")
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_sum_all_null_group_emits_null(self, client):
-        """The stays-NULL direction: a group that is all-NULL from the start has
-        SUM = NULL while still reporting its true COUNT(*). A non-NULL group
-        alongside it confirms only the all-NULL group is NULL (and is unaffected
-        by sharding onto a different worker)."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  k BIGINT NOT NULL,"
-                "  v BIGINT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT k, SUM(v) AS sm, COUNT(*) AS c "
-                "FROM t GROUP BY k",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # k=10: two NULL rows (SUM NULL, c=2). k=20: a non-NULL row (SUM=7).
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, NULL), (2, 10, NULL), (3, 20, 7)",
-                schema_name=sn,
-            )
-            rows = {r["k"]: r for r in client.scan(vid)}
-            assert rows[10]["c"] == 2
-            assert rows[10]["sm"] is None, (
-                f"SUM of an all-NULL group must be NULL, got {rows[10]['sm']}")
-            assert rows[20]["c"] == 1
-            assert rows[20]["sm"] == 7
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_min_retraction_to_and_from_null(self, client):
-        """A nullable MIN that is NULL (every contributor NULL) is a live state, kept
-        alive by COUNT(*). MIN is a Direct passthrough, so its raw null bit is
-        user-visible — a retraction must reproduce that NULL exactly. The old code
-        re-emitted the retracted MIN as a concrete 0, which does not cancel the prior
-        NULL row (compare_rows ranks null < non-null) and leaks a stale ghost. Insert
-        an all-NULL group, add a non-NULL row (the prior MIN=NULL row must retract as
-        NULL → exactly one clean view row), then retract the non-NULL row (MIN returns
-        to NULL, no ghost). No existing E2E retracts a nullable MIN to NULL. Runs under
-        GNITZ_WORKERS=1 and =4: GROUP BY shards each group whole onto one worker, so
-        the 4-worker run confirms the per-worker fix on the sharded path."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  k BIGINT NOT NULL,"
-                "  v BIGINT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT k, COUNT(*) AS c, MIN(v) AS mn "
-                "FROM t GROUP BY k",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # Tick 1: an all-NULL group. COUNT(*) keeps it alive; MIN = NULL.
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, NULL), (2, 10, NULL)",
-                schema_name=sn,
-            )
-            rows = list(client.scan(vid))
-            assert len(rows) == 1
-            assert rows[0]["k"] == 10
-            assert rows[0]["c"] == 2
-            assert rows[0]["mn"] is None, (
-                f"all-NULL group MIN must be NULL, got {rows[0]['mn']}")
-
-            # Tick 2: a non-NULL row → MIN = 5. The prior (MIN=NULL) row must be
-            # retracted *as NULL* to cancel tick 1 byte-for-byte; a bad retraction
-            # (MIN re-emitted as 0) leaves the stale NULL row live → two rows here.
-            client.execute_sql("INSERT INTO t VALUES (3, 10, 5)", schema_name=sn)
-            rows = list(client.scan(vid))
-            assert len(rows) == 1, f"stale MIN=NULL ghost not cancelled: {rows}"
-            assert rows[0]["c"] == 3
-            assert rows[0]["mn"] == 5, f"MIN must be 5, got {rows[0]['mn']}"
-            assert rows[0].weight == 1, f"live row must be weight 1, got {rows[0].weight}"
-
-            # Tick 3: retract the only non-NULL row → MIN returns to NULL, c=2.
-            client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
-            rows = list(client.scan(vid))
-            assert len(rows) == 1, f"group must persist via its NULL rows: {rows}"
-            assert rows[0]["c"] == 2
-            assert rows[0]["mn"] is None, (
-                f"MIN must return to NULL once the non-NULL row is gone, got {rows[0]['mn']}")
-            assert rows[0].weight == 1, f"no ghost: live row must be weight 1, got {rows[0].weight}"
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_sum_is_null(self, client):
-        """HAVING SUM(v) IS NULL admits exactly the groups with no non-NULL
-        contributor, agreeing with the companion-gated projection rather than the
-        raw SUM column's saturating has_value bit. SUM(v) appears only in HAVING
-        (not the SELECT list), so the planner must materialise it — and its hidden
-        COUNT_NON_NULL companion — from the predicate alone. Membership updates
-        incrementally as the last non-NULL value is retracted."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  k BIGINT NOT NULL,"
-                "  v BIGINT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT k, COUNT(*) AS c "
-                "FROM t GROUP BY k HAVING SUM(v) IS NULL",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # k=10 has a non-NULL value (SUM=5) → excluded.
-            # k=20 is all-NULL (SUM=NULL) → admitted.
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL), (3, 20, NULL)",
-                schema_name=sn,
-            )
-            rows = {r["k"]: r for r in client.scan(vid)}
-            assert set(rows) == {20}, f"only the all-NULL group passes HAVING, got {set(rows)}"
-            assert rows[20]["c"] == 1
-
-            # Retract k=10's last non-NULL value → its SUM becomes NULL → admitted.
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            rows = {r["k"]: r for r in client.scan(vid)}
-            assert set(rows) == {10, 20}, (
-                f"k=10 enters HAVING once its SUM becomes NULL, got {set(rows)}")
-            assert rows[10]["c"] == 1
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_sum_value_gates_on_null(self, client):
-        """HAVING SUM(v) = 0 — SUM in *value* position, not IS NULL — must admit a
-        genuine-zero group {5, -5} yet exclude a group whose SUM became NULL when
-        its last non-NULL contributor was retracted. The value binds through the
-        same COUNT_NON_NULL companion gate the SELECT projection uses; binding the
-        raw SUM column instead would read the saturated 0 and wrongly admit the
-        all-NULL group (NULL = 0 is UNKNOWN, so it must not pass)."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  k BIGINT NOT NULL,"
-                "  v BIGINT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT k, COUNT(*) AS c "
-                "FROM t GROUP BY k HAVING SUM(v) = 0",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # k=10: {5, -5} → SUM = 0, a genuine zero → admitted.
-            # k=20: {5, NULL} → SUM = 5 → excluded for now.
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 5), (2, 10, -5), (3, 20, 5), (4, 20, NULL)",
-                schema_name=sn,
-            )
-            rows = {r["k"]: r for r in client.scan(vid)}
-            assert set(rows) == {10}, f"only the genuine-zero group passes, got {set(rows)}"
-            assert rows[10]["c"] == 2
-
-            # Retract k=20's last non-NULL value. Its raw SUM nets to 0, but with no
-            # non-NULL contributor the SUM is NULL → SUM(v) = 0 is UNKNOWN → still
-            # excluded. A raw (un-gated) SUM column would read 0 and wrongly admit it.
-            client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
-            rows = {r["k"]: r for r in client.scan(vid)}
-            assert set(rows) == {10}, (
-                f"a group whose SUM became NULL must not satisfy SUM(v) = 0, got {set(rows)}")
-            assert rows[10]["c"] == 2
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_group_by_with_where(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT category, COUNT(*) AS cnt "
-                "FROM orders WHERE amount > 100 GROUP BY category",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 10, 50, 50), (2, 10, 200, 60), (3, 10, 300, 70)",
-                schema_name=sn,
-            )
-
-            rows = client.scan(vid)
-            # Only 2 rows have amount > 100
-            assert len(rows) == 1
-            row = next(iter(rows))
-            assert row["cnt"] == 2
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_count_retraction(self, client):
-        """Deleting a row decrements the group count."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT category, COUNT(*) AS cnt FROM orders GROUP BY category",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 10, 100, 50), (2, 10, 200, 60), (3, 10, 300, 70)",
-                schema_name=sn,
-            )
-            rows = client.scan(vid)
-            assert len(rows) == 1
-            assert next(iter(rows))["cnt"] == 3
-
-            client.execute_sql("DELETE FROM orders WHERE pk = 1", schema_name=sn)
-            rows = client.scan(vid)
-            assert len(rows) == 1
-            assert next(iter(rows))["cnt"] == 2, f"expected cnt=2 after delete, got {rows}"
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_sum_retraction(self, client):
-        """Deleting a row decrements the group sum."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT category, SUM(amount) AS total FROM orders GROUP BY category",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 10, 100, 50), (2, 10, 200, 60)",
-                schema_name=sn,
-            )
-            rows = client.scan(vid)
-            assert next(iter(rows))["total"] == 300
-
-            client.execute_sql("DELETE FROM orders WHERE pk = 1", schema_name=sn)
-            rows = client.scan(vid)
-            assert len(rows) == 1
-            assert next(iter(rows))["total"] == 200, f"expected total=200, got {rows}"
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_incremental_group_by(self, client):
-        """Insert in two batches; verify the view updates incrementally."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT category, COUNT(*) AS cnt, SUM(amount) AS total "
-                "FROM orders GROUP BY category",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # Batch 1
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 10, 100, 50)",
-                schema_name=sn,
-            )
-            rows = client.scan(vid)
-            assert len(rows) == 1
-            row = next(iter(rows))
-            assert row["cnt"] == 1
-            assert row["total"] == 100
-
-            # Batch 2
-            client.execute_sql(
-                "INSERT INTO orders VALUES (2, 10, 200, 60)",
-                schema_name=sn,
-            )
-            rows = client.scan(vid)
-            assert len(rows) == 1
-            row = next(iter(rows))
-            assert row["cnt"] == 2
-            assert row["total"] == 300
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_group_elimination(self, client):
-        """Insert rows in 2 groups, delete all rows from group A,
-        verify group A vanishes while group B remains."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT category, COUNT(*) AS cnt FROM orders GROUP BY category",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 10, 100, 50), (2, 10, 200, 60), (3, 20, 300, 70)",
-                schema_name=sn,
-            )
-            rows = client.scan(vid)
-            assert len(rows) == 2
-
-            # Delete all rows from category 10
-            client.execute_sql("DELETE FROM orders WHERE pk = 1", schema_name=sn)
-            client.execute_sql("DELETE FROM orders WHERE pk = 2", schema_name=sn)
-
-            by_cat = {r["category"]: r["cnt"] for r in client.scan(vid)}
-            # Category 10 is emptied → the group must VANISH (cardinality 0), not
-            # survive as a cnt=0 zombie. Category 20 stays at cnt=1.
-            assert 10 not in by_cat, f"emptied group must be absent, got {by_cat}"
-            assert by_cat[20] == 1
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_reinsertion_after_deletion(self, client):
-        """Insert row, delete it, re-insert it, verify aggregate restores."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT category, SUM(amount) AS total FROM orders GROUP BY category",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 10, 100, 50)",
-                schema_name=sn,
-            )
-            rows = client.scan(vid)
-            assert next(iter(rows))["total"] == 100
-
-            client.execute_sql("DELETE FROM orders WHERE pk = 1", schema_name=sn)
-            totals = {r["category"]: r["total"] for r in client.scan(vid)}
-            # Emptied SUM-only group must VANISH, not survive as a total=0 zombie.
-            assert 10 not in totals, f"emptied group must be absent, got {totals}"
-
-            # Re-insert and verify aggregate restores
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 10, 100, 50)",
-                schema_name=sn,
-            )
-            totals = {r["category"]: r["total"] for r in client.scan(vid)}
-            assert totals[10] == 100
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    @pytest.mark.parametrize(
-        "pred, expected",
-        # `<=`, `>=`, `<` and `=` all lower to the same LoadPayloadInt/LoadConst/Cmp
-        # shape, so one comparison per extremum is the whole decision: `MIN(v) = 0`
-        # is the tightest (it also excludes the non-zero k=10), `MAX(v)` covers the
-        # mirror aggregate.
-        [
-            ("MIN(v) = 0", {30}),
-            ("MAX(v) <= 10", {10, 30}),
-        ],
-    )
-    def test_having_extremum_over_nullable_col_is_not_zero(self, client, pred, expected):
-        """A raw MIN/MAX column over a nullable source renders NULL as zero bytes
-        under a set null bit. If the reduce output declared that column NOT NULL,
-        the HAVING program (LoadPayloadInt + LoadConst + Cmp) would classify as
-        null-free and take the filter's `no_nulls` arm, which never reads the null
-        bitmap — comparing the NULL group as the value 0. Only a predicate that is
-        true at 0 discriminates, so both cases are; k=30 is the genuine-zero control
-        that must survive while the all-NULL k=20 is excluded."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  k BIGINT NOT NULL,"
-                "  v BIGINT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                f"CREATE VIEW vw AS SELECT k, COUNT(*) AS c FROM t GROUP BY k HAVING {pred}",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "vw")[0]
-
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 5), (2, 20, NULL), (3, 30, 0)",
-                schema_name=sn,
-            )
-            groups = {r["k"] for r in client.scan(vid)}
-            assert groups == expected, (
-                f"HAVING {pred}: expected groups {expected}, got {groups} "
-                "(a NULL aggregate compared as 0?)")
-
-            client.execute_sql("DROP VIEW vw", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_min_null_to_zero_transition_leaves_one_group(self, client):
-        """A NULL → 0 transition of a nullable MIN changes only the null bit: the
-        payload bytes are zero either way. If the owned reduce trace declared the
-        aggregate column NOT NULL its rows would compare under the null-blind
-        fixed-int comparator, so the `old @ -1` / `new @ +1` pair would net to zero
-        and the trace would keep the stale NULL row. The damage surfaces on the
-        *next* transition, whose retraction is byte-copied from that stale row —
-        leaving two positive-weight rows for one group. GROUP BY shards each group
-        whole onto one worker, so this reproduces at any worker count."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  k BIGINT NOT NULL,"
-                "  v BIGINT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW vw AS SELECT k, MIN(v) AS m FROM t GROUP BY k",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "vw")[0]
-
-            def one_row(step):
-                rows = list(client.scan(vid))
-                assert all(r.weight > 0 for r in rows), f"{step}: ghost weights: {rows}"
-                assert len(rows) == 1, f"{step}: expected exactly one group row, got {rows}"
-                return rows[0]
-
-            client.execute_sql("INSERT INTO t VALUES (1, 10, NULL)", schema_name=sn)
-            r = one_row("insert NULL")
-            assert r["k"] == 10 and r["m"] is None
-
-            # Correct even on the unfixed build — only the trace goes stale here.
-            client.execute_sql("UPDATE t SET v = 0 WHERE pk = 1", schema_name=sn)
-            r = one_row("NULL -> 0")
-            assert r["m"] == 0, f"MIN must be 0, got {r['m']}"
-
-            # The stale trace bites here: the retraction is byte-copied from it.
-            client.execute_sql("UPDATE t SET v = 7 WHERE pk = 1", schema_name=sn)
-            r = one_row("0 -> 7")
-            assert r["m"] == 7, f"MIN must be 7, got {r['m']}"
-
-            client.execute_sql("DROP VIEW vw", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-
-class TestGroupByPkAndNullable:
-    """`GROUP BY` containing the PK column or a nullable column."""
-
-    def test_group_by_pk_and_other_col(self, client):
-        """`GROUP BY pk, other_col` must produce one group per PK (since PKs
-        are unique)."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE orders ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  category BIGINT NOT NULL,"
-                "  amount BIGINT NOT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS "
-                "SELECT pk, category, COUNT(*) AS cnt "
-                "FROM orders GROUP BY pk, category",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 10, 100), (2, 10, 200), (3, 20, 300)",
-                schema_name=sn,
-            )
-            rows = list(client.scan(vid))
-            assert len(rows) == 3
-            by_pk = {r["pk"]: r for r in rows}
-            assert by_pk[1]["category"] == 10 and by_pk[1]["cnt"] == 1
-            assert by_pk[2]["category"] == 10 and by_pk[2]["cnt"] == 1
-            assert by_pk[3]["category"] == 20 and by_pk[3]["cnt"] == 1
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE orders", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_group_by_pk_and_other_col_uuid_pk(self, client):
-        """`GROUP BY pk, other_col` with a 16-byte UUID PK projection."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE items ("
-                "  pk UUID NOT NULL PRIMARY KEY,"
-                "  category BIGINT NOT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS "
-                "SELECT pk, category, COUNT(*) AS cnt "
-                "FROM items GROUP BY pk, category",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            uuid_a = '550e8400-e29b-41d4-a716-446655440000'
-            uuid_b = '6ba7b810-9dad-11d1-80b4-00c04fd430c8'
-            client.execute_sql(
-                f"INSERT INTO items VALUES ('{uuid_a}', 10), ('{uuid_b}', 20)",
-                schema_name=sn,
-            )
-            rows = list(client.scan(vid))
-            assert len(rows) == 2
-            by_pk = {r["pk"]: r for r in rows}
-            assert by_pk[uuid_a]["category"] == 10 and by_pk[uuid_a]["cnt"] == 1
-            assert by_pk[uuid_b]["category"] == 20 and by_pk[uuid_b]["cnt"] == 1
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE items", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_group_by_nullable_int_distinguishes_null_from_zero(self, client):
-        """`GROUP BY nullable_int` must form a distinct group for NULL,
-        not merge it with the integer-zero group (NULL stores as zero bytes)."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  grp BIGINT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT grp, COUNT(*) AS cnt FROM t GROUP BY grp",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # Two rows with grp=NULL, one with grp=0, one with grp=7.
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, NULL), (2, 0), (3, NULL), (4, 7)",
-                schema_name=sn,
-            )
-            rows = list(client.scan(vid))
-            # Three distinct groups: NULL, 0, 7
-            assert len(rows) == 3, f"expected 3 groups, got {len(rows)}: {rows}"
-            counts = {r["grp"]: r["cnt"] for r in rows}
-            assert counts.get(None) == 2, f"NULL group must have 2 rows; got {counts}"
-            assert counts.get(0) == 1, f"0-group must have 1 row; got {counts}"
-            assert counts.get(7) == 1, f"7-group must have 1 row; got {counts}"
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-
-class TestReducePathRegressions:
-    """Reduce-path defects: U128 numeric-agg reject, signed-PK projection,
-    F32 MIN/MAX, nullable-group MIN/MAX, and HAVING over the grouped relation."""
-
-    def test_sum_avg_over_u128_rejected(self, client):
-        """SUM/AVG accumulate into a 64-bit slot; a U128 source overflows it and
-        the engine marks the decode unreachable, so the planner must reject it."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  category BIGINT NOT NULL,"
-                "  big DECIMAL(38,0) NOT NULL"  # U128
-                ")",
-                schema_name=sn,
-            )
-            for fn in ("SUM", "AVG"):
-                with pytest.raises(gnitz.GnitzError):
-                    client.execute_sql(
-                        f"CREATE VIEW v AS SELECT category, {fn}(big) AS x "
-                        "FROM t GROUP BY category",
-                        schema_name=sn,
-                    )
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    @pytest.mark.parametrize("col_type", [
-        "TINYINT", "SMALLINT", "INT", "BIGINT",
-    ])
-    def test_group_by_signed_pk_projection_roundtrips(self, client, col_type):
-        """Projecting a signed PK group column must emit the native value, not
-        the order-preserving (sign-flipped) OPK image. Includes negatives."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                f"CREATE TABLE t (pk {col_type} NOT NULL PRIMARY KEY, category BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT pk, category, COUNT(*) AS cnt "
-                "FROM t GROUP BY pk, category",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            client.execute_sql(
-                "INSERT INTO t VALUES (-5, 10), (-1, 20), (0, 30), (7, 40)",
-                schema_name=sn,
-            )
-            rows = list(client.scan(vid))
-            by_pk = {r["pk"]: r for r in rows}
-            assert set(by_pk) == {-5, -1, 0, 7}, f"signed PKs must round-trip: {sorted(by_pk)}"
-            assert by_pk[-5]["category"] == 10
-            assert by_pk[-1]["category"] == 20
-            assert by_pk[0]["category"] == 30
-            assert by_pk[7]["category"] == 40
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_min_max_f32_not_corrupted(self, client):
-        """MIN/MAX over an F32 column (AVI-eligible with an int group key) must
-        emit the true extremal, not an F32 bit pattern read as an F64 denormal."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  grp BIGINT NOT NULL,"
-                "  v REAL NOT NULL"  # F32
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT grp, MIN(v) AS lo, MAX(v) AS hi "
-                "FROM t GROUP BY grp",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 9, 1.5), (2, 9, -2.25), (3, 9, 4.0)",
-                schema_name=sn,
-            )
-            row = next(r for r in client.scan(vid))
-            assert abs(row["lo"] - (-2.25)) < 1e-6, f"MIN f32 corrupted: {row['lo']}"
-            assert abs(row["hi"] - 4.0) < 1e-6, f"MAX f32 corrupted: {row['hi']}"
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_min_max_group_by_nullable_int_null_vs_zero(self, client):
-        """MIN/MAX GROUP BY a nullable int. A nullable group column is not
-        byte-form-eligible for the combined value index (the key prefix has no
-        null bit), so the reduce takes the single-scan trace fallback, which
-        distinguishes a NULL group from group 0 — they must not collide (a
-        collision would fetch 0's history or drop NULL's state)."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  grp BIGINT NULL,"
-                "  v BIGINT NOT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT grp, MIN(v) AS lo, MAX(v) AS hi "
-                "FROM t GROUP BY grp",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            # NULL group: {100, 50}; group 0: {7, 9}; distinct.
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, NULL, 100), (2, 0, 7), (3, NULL, 50), (4, 0, 9)",
-                schema_name=sn,
-            )
-            by_grp = {r["grp"]: r for r in client.scan(vid)}
-            assert set(by_grp) == {None, 0}, f"NULL and 0 groups must stay distinct: {by_grp}"
-            assert (by_grp[None]["lo"], by_grp[None]["hi"]) == (50, 100)
-            assert (by_grp[0]["lo"], by_grp[0]["hi"]) == (7, 9)
-
-            # Incremental update: lower the NULL group's min, raise 0's max.
-            client.execute_sql("INSERT INTO t VALUES (5, NULL, 10), (6, 0, 999)", schema_name=sn)
-            by_grp = {r["grp"]: r for r in client.scan(vid)}
-            assert (by_grp[None]["lo"], by_grp[None]["hi"]) == (10, 100)
-            assert (by_grp[0]["lo"], by_grp[0]["hi"]) == (7, 999)
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_unprojected_group_col(self, client):
-        """HAVING on a GROUP BY column omitted from SELECT (valid standard SQL):
-        binds against the grouped relation, before projection."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a, COUNT(*) AS cnt FROM t GROUP BY a, b HAVING b > 5",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            # (a,b) groups: (1,3) excluded, (1,9) kept, (2,7) kept.
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 1, 3), (2, 1, 9), (3, 2, 7)",
-                schema_name=sn,
-            )
-            rows = list(client.scan(vid))
-            groups = sorted(r["a"] for r in rows)
-            assert groups == [1, 2], f"only groups with b>5 survive: {groups}"
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_aliased_group_col_by_original_name(self, client):
-        """HAVING references a group column by its source name even when SELECT
-        aliases it: HAVING binds against the grouped relation (source names)."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a AS x, COUNT(*) AS cnt FROM t GROUP BY a HAVING a > 5",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 3), (2, 9), (3, 7)",
-                schema_name=sn,
-            )
-            rows = list(client.scan(vid))
-            xs = sorted(r["x"] for r in rows)
-            assert xs == [7, 9], f"only a>5 survive (aliased to x): {xs}"
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_aggregate_not_projected(self, client):
-        """HAVING on an aggregate absent from SELECT: it must still be
-        materialised in the reduce and resolvable in HAVING."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            # a=10 appears twice (kept), a=20 once (excluded).
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10), (2, 10), (3, 20)",
-                schema_name=sn,
-            )
-            rows = list(client.scan(vid))
-            groups = sorted(r["a"] for r in rows)
-            assert groups == [10], f"only groups with COUNT(*)>1 survive: {groups}"
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-
-class TestHavingIsNullCompleteness:
-    """HAVING IS [NOT] NULL over the grouped relation for direct aggregates
-    (MIN/MAX/COUNT/non-nullable SUM) and group columns. Direct aggregates read the
-    value column's raw null bit; group columns const-fold when non-nullable (every
-    PK-region key) or read their payload null bit on the synthetic path. Complements
-    the companion-gated nullable-SUM/AVG HAVING tests in TestGroupBy."""
-
-    def test_having_min_is_null_direct_aggregate(self, client):
-        """HAVING MIN(v) IS [NOT] NULL reads the value column's raw null bit: an
-        all-NULL group renders MIN=NULL. Membership updates incrementally as a
-        group flips to all-NULL by retraction — weights verified."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v_null AS SELECT k, MIN(v) AS mn FROM t GROUP BY k HAVING MIN(v) IS NULL",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v_notnull AS SELECT k, MIN(v) AS mn FROM t GROUP BY k HAVING MIN(v) IS NOT NULL",
-                schema_name=sn,
-            )
-            vid_null = client.resolve_table(sn, "v_null")[0]
-            vid_notnull = client.resolve_table(sn, "v_notnull")[0]
-
-            def groups(vid):
-                return {r["k"]: r.weight for r in client.scan(vid)}
-
-            # k=10: {5, NULL} → MIN=5; k=20: {NULL} → MIN=NULL.
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL), (3, 20, NULL)",
-                schema_name=sn,
-            )
-            assert groups(vid_null) == {20: 1}, "IS NULL admits only the all-NULL group k=20"
-            assert groups(vid_notnull) == {10: 1}, "IS NOT NULL admits only k=10 (MIN=5)"
-
-            # Retract k=10's only non-NULL contributor → MIN(k=10) becomes NULL.
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            assert groups(vid_null) == {10: 1, 20: 1}, "k=10 enters IS NULL once its MIN → NULL"
-            assert groups(vid_notnull) == {}, "no group has a non-NULL MIN now"
-
-            client.execute_sql("DROP VIEW v_null", schema_name=sn)
-            client.execute_sql("DROP VIEW v_notnull", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_count_star_is_not_null_const_folds(self, client):
-        """COUNT(*) never renders NULL, so HAVING COUNT(*) IS NOT NULL const-folds
-        to true (every surviving group passes) and IS NULL to false (none)."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v_pass AS SELECT k, COUNT(*) AS c FROM t GROUP BY k HAVING COUNT(*) IS NOT NULL",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v_none AS SELECT k, COUNT(*) AS c FROM t GROUP BY k HAVING COUNT(*) IS NULL",
-                schema_name=sn,
-            )
-            vid_pass = client.resolve_table(sn, "v_pass")[0]
-            vid_none = client.resolve_table(sn, "v_none")[0]
-            client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 20)", schema_name=sn)
-            assert {r["k"]: r.weight for r in client.scan(vid_pass)} == {10: 1, 20: 1}
-            assert list(client.scan(vid_none)) == [], "IS NULL admits no group"
-            client.execute_sql("DROP VIEW v_pass", schema_name=sn)
-            client.execute_sql("DROP VIEW v_none", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_nullable_group_col_is_null(self, client):
-        """HAVING on a nullable GROUP BY column (synthetic-PK path) reads the payload
-        null bit: IS NULL admits the single NULL-key group, IS NOT NULL admits the
-        rest (including the distinct integer-zero group)."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v_null AS SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING g IS NULL",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v_notnull AS SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING g IS NOT NULL",
-                schema_name=sn,
-            )
-            vid_null = client.resolve_table(sn, "v_null")[0]
-            vid_notnull = client.resolve_table(sn, "v_notnull")[0]
-            # Two NULL-key rows, one g=0, one g=7.
-            client.execute_sql("INSERT INTO t VALUES (1, NULL), (2, NULL), (3, 0), (4, 7)", schema_name=sn)
-            null_rows = list(client.scan(vid_null))
-            assert len(null_rows) == 1, "IS NULL admits exactly the NULL-key group"
-            assert null_rows[0]["g"] is None and null_rows[0]["c"] == 2 and null_rows[0].weight == 1
-            nn = {r["g"]: (r["c"], r.weight) for r in client.scan(vid_notnull)}
-            assert nn == {0: (1, 1), 7: (1, 1)}, "IS NOT NULL admits g=0 and g=7 (NULL != 0)"
-            client.execute_sql("DROP VIEW v_null", schema_name=sn)
-            client.execute_sql("DROP VIEW v_notnull", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_natural_pk_group_col_const_folds(self, client):
-        """HAVING on a natural-PK group column const-folds (PK columns are
-        non-nullable), for both a single-column PK (group_set_eq_pk) and a compound
-        PK. Emitting EXPR_IS_NULL against the PK region would trip eval_is_null's
-        debug assertion — running against the debug server exercises that guard.
-        IS NOT NULL passes every group; IS NULL passes none."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            # Single-column PK: GROUP BY pk hits group_set_eq_pk.
-            client.execute_sql(
-                "CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW s_pass AS SELECT pk, COUNT(*) AS c FROM t1 GROUP BY pk HAVING pk IS NOT NULL",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW s_none AS SELECT pk, COUNT(*) AS c FROM t1 GROUP BY pk HAVING pk IS NULL",
-                schema_name=sn,
-            )
-            # Compound PK: GROUP BY a, b hits the compound group_set_eq_pk path.
-            client.execute_sql(
-                "CREATE TABLE t2 (a BIGINT NOT NULL, b BIGINT NOT NULL, PRIMARY KEY (a, b))",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW c_pass AS SELECT a, b, COUNT(*) AS c FROM t2 GROUP BY a, b HAVING a IS NOT NULL",
-                schema_name=sn,
-            )
-            s_pass = client.resolve_table(sn, "s_pass")[0]
-            s_none = client.resolve_table(sn, "s_none")[0]
-            c_pass = client.resolve_table(sn, "c_pass")[0]
-
-            client.execute_sql("INSERT INTO t1 VALUES (1, 100), (2, 200)", schema_name=sn)
-            client.execute_sql("INSERT INTO t2 VALUES (5, 6), (5, 7)", schema_name=sn)
-
-            assert {r["pk"]: r.weight for r in client.scan(s_pass)} == {1: 1, 2: 1}
-            assert list(client.scan(s_none)) == [], "IS NULL on a PK admits nothing"
-            got = {(r["a"], r["b"]): r.weight for r in client.scan(c_pass)}
-            assert got == {(5, 6): 1, (5, 7): 1}, "compound-PK group col IS NOT NULL passes all"
-
-            for v in ("s_pass", "s_none", "c_pass"):
-                client.execute_sql(f"DROP VIEW {v}", schema_name=sn)
-            client.execute_sql("DROP TABLE t1", schema_name=sn)
-            client.execute_sql("DROP TABLE t2", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_qualified_aggregate_column(self, client):
-        """HAVING MIN(t.v) — a qualified aggregate argument — binds the same column
-        as SELECT MIN(t.v), in both the IS [NOT] NULL and the value positions."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v_notnull AS SELECT k FROM t GROUP BY k HAVING MIN(t.v) IS NOT NULL",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v_gt AS SELECT k FROM t GROUP BY k HAVING MIN(t.v) > 3",
-                schema_name=sn,
-            )
-            vid_notnull = client.resolve_table(sn, "v_notnull")[0]
-            vid_gt = client.resolve_table(sn, "v_gt")[0]
-            # k=10: MIN=5 (not null, >3); k=20: MIN=NULL; k=30: MIN=2 (not null, not >3).
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 5), (2, 20, NULL), (3, 30, 2)",
-                schema_name=sn,
-            )
-            assert {r["k"] for r in client.scan(vid_notnull)} == {10, 30}
-            assert {r["k"] for r in client.scan(vid_gt)} == {10}
-            client.execute_sql("DROP VIEW v_notnull", schema_name=sn)
-            client.execute_sql("DROP VIEW v_gt", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_null_test_on_expression_tests_its_value(self, client):
-        """IS [NOT] NULL in HAVING over an expression of aggregates and group
-        columns is a null test over the computed value; a name the grouped
-        relation does not offer is still the ungrouped-column rejection."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a, COUNT(*) AS c FROM t GROUP BY a HAVING (a + SUM(b)) IS NULL",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 1, NULL), (2, 1, NULL), (3, 2, 5), (4, 2, NULL)",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            assert sorted((r["a"], r["c"]) for r in client.scan(vid).mappings()) == [(1, 2)]
-            # A non-NULL b in group 1 makes its SUM, and so the expression, non-NULL.
-            client.execute_sql("INSERT INTO t VALUES (5, 1, 3)", schema_name=sn)
-            assert list(client.scan(vid).mappings()) == []
-            with pytest.raises(gnitz.GnitzError, match="GROUP BY"):
-                client.execute_sql(
-                    "CREATE VIEW w AS SELECT a FROM t GROUP BY a HAVING b IS NULL",
-                    schema_name=sn,
-                )
-        finally:
-            client.drop_schema(sn)
-
-
-class TestGroupByKeyCorrectness:
-    """GROUP BY key correctness: float keys rejected (Fix A), the group identity
-    is a true 128-bit hash (Fix B), and BLOB grouping keys work end-to-end (Fix
-    C). Run with GNITZ_WORKERS=4 so the exchange scatter (which routes by the
-    same group identity) is exercised."""
-
-    def test_float_group_by_key_rejected(self, client):
-        """Fix A1: a float grouping key splits -0.0/+0.0 and distinct-NaN bit
-        patterns into separate groups (and routes them to distinct workers), so
-        the DDL must be rejected with a clear error."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  f DOUBLE NOT NULL,"
-                "  v BIGINT NOT NULL"
-                ")",
-                schema_name=sn,
-            )
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql(
-                    "CREATE VIEW v AS SELECT f, COUNT(*) AS n FROM t GROUP BY f",
-                    schema_name=sn,
-                )
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_string_group_by_many_keys_retraction(self, client):
-        """Fix B: a single-STRING GROUP BY takes the synthetic _group_pk path,
-        whose routing/stored identity is now a full 128-bit Xxh3 fold (was a
-        64-bit hash widened to u128, a ~2^32 birthday bound that could merge two
-        distinct groups → silently wrong aggregation). Many distinct string keys
-        must aggregate correctly across workers, and a DELETE must update the
-        affected group only."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  s TEXT NOT NULL,"
-                "  val BIGINT NOT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT s, COUNT(*) AS n, SUM(val) AS total "
-                "FROM t GROUP BY s",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            # 50 distinct string groups, 2 rows each.
-            pk = 0
-            exp_count = {}
-            exp_sum = {}
-            rows_sql = []
-            for g in range(50):
-                key = f"group-key-{g:04d}"
-                for k in range(2):
-                    pk += 1
-                    val = g * 10 + k
-                    rows_sql.append(f"({pk}, '{key}', {val})")
-                    exp_count[key] = exp_count.get(key, 0) + 1
-                    exp_sum[key] = exp_sum.get(key, 0) + val
-            client.execute_sql(
-                "INSERT INTO t VALUES " + ", ".join(rows_sql), schema_name=sn
-            )
-
-            rows = list(client.scan(vid))
-            by_key = {r["s"]: (r["n"], r["total"]) for r in rows}
-            assert len(by_key) == 50, (
-                f"every distinct string key must be its own group (no hash-collision "
-                f"merge): got {len(by_key)} groups"
-            )
-            for key in exp_count:
-                assert by_key[key] == (exp_count[key], exp_sum[key]), (
-                    f"group {key!r}: expected (count, sum)="
-                    f"{(exp_count[key], exp_sum[key])}, got {by_key[key]}"
-                )
-
-            # Retraction: DELETE one contributing row of group-key-0001 (pk=4,
-            # val=11). That group's count 2→1 and sum 21→10.
-            client.execute_sql("DELETE FROM t WHERE pk = 4", schema_name=sn)
-            rows = list(client.scan(vid))
-            by_key = {r["s"]: (r["n"], r["total"]) for r in rows}
-            assert by_key["group-key-0001"] == (1, 10), (
-                f"after deleting one row, group must update: got {by_key['group-key-0001']}"
-            )
-            # An untouched group is unchanged.
-            assert by_key["group-key-0002"] == (2, exp_sum["group-key-0002"])
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_multi_col_group_by_sum_retraction(self, client):
-        """Fix B: a multi-column GROUP BY routes through the 128-bit fold for its
-        exchange scatter and stored _group_pk. Many distinct (a, b) keys must
-        aggregate correctly across workers, with a DELETE updating one group."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  a BIGINT NOT NULL,"
-                "  b BIGINT NOT NULL,"
-                "  val BIGINT NOT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a, b, COUNT(*) AS n, SUM(val) AS total "
-                "FROM t GROUP BY a, b",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-
-            pk = 0
-            exp_sum = {}
-            rows_sql = []
-            for a in range(8):
-                for b in range(8):
-                    for k in range(2):
-                        pk += 1
-                        val = a * 1000 + b * 10 + k
-                        rows_sql.append(f"({pk}, {a}, {b}, {val})")
-                        exp_sum[(a, b)] = exp_sum.get((a, b), 0) + val
-            client.execute_sql(
-                "INSERT INTO t VALUES " + ", ".join(rows_sql), schema_name=sn
-            )
-
-            rows = list(client.scan(vid))
-            by_key = {(r["a"], r["b"]): (r["n"], r["total"]) for r in rows}
-            assert len(by_key) == 64, (
-                f"every distinct (a,b) must be its own group: got {len(by_key)}"
-            )
-            for key, s in exp_sum.items():
-                assert by_key[key] == (2, s), (
-                    f"group {key}: expected (2, {s}), got {by_key[key]}"
-                )
-
-            # Delete pk=1 → group (0,0) row val=0. count 2→1, sum drops by 0's val.
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            rows = list(client.scan(vid))
-            by_key = {(r["a"], r["b"]): (r["n"], r["total"]) for r in rows}
-            assert by_key[(0, 0)] == (1, exp_sum[(0, 0)] - 0), (
-                f"after delete, group (0,0) must update: got {by_key[(0, 0)]}"
-            )
-            assert by_key[(7, 7)] == (2, exp_sum[(7, 7)]), "untouched group unchanged"
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-
-class TestAdaptiveMinMaxOutputType:
-    """MIN/MAX preserve the source column's type instead of widening to BIGINT.
-
-    `MIN(INT)` is `INT`, `MAX(SMALLINT UNSIGNED)` is `SMALLINT UNSIGNED`, etc. —
-    the extremum is one of the input rows, so it is always representable in the
-    source type. The reduce emits the value at the source-column width and the
-    trace read-backs reconstruct the 8-byte accumulator from that width
-    (width-gated, so an F32 MIN/MAX that widens to F64 is still read verbatim).
-    Run with GNITZ_WORKERS>=2 (conftest default 4) so a group's rows spread over
-    workers and the gather-reduce combine and its retraction read a narrow agg
-    column, with >=2 groups per partial batch to catch the per-row offset bug.
+    `cols` are the base columns the aggregate reads, `groups` the GROUP BY subset
+    (empty for a global aggregate), `aggs` the `(out_name, kind, arg)` specs.
     """
+    def check(ctx):
+        base = oracle.oracle_filter_project(state, None, cols)
+        exp, out_cols = oracle.oracle_groupby_aggregate(base, cols, groups, aggs)
+        oracle.assert_view_matches(client, vid, out_cols, exp, ctx=ctx)
+    return check
 
-    @staticmethod
-    def _col_type(schema, name):
-        for c in schema.columns:
-            if c.name == name:
-                return c.type_code
-        raise KeyError(
-            f"column {name!r} not in view schema {[c.name for c in schema.columns]}")
 
-    # (label, SQL type, expected view TypeCode, {group key: [source values]}).
-    # Each value set straddles its type's interesting boundary: negatives down to
-    # the type minimum for the signed widths, and values above i32::MAX for the
-    # unsigned zero-extension path (a sign-extended read would turn those
-    # negative and break MAX).
-    _NARROW_CASES = [
-        ("tinyint", "TINYINT", gnitz.TypeCode.I8, {
-            10: [-128, -5, 60, 127],
-            20: [-1, 0, 1, 9],
-            30: [100, -120, 33, 7],
-        }),
-        ("smallint", "SMALLINT", gnitz.TypeCode.I16, {
-            10: [-32768, -5, 30000, 32767],
-            20: [-1, 0, 1000, 9],
-            30: [12345, -12345, 33, 7],
-        }),
-        ("int", "INT", gnitz.TypeCode.I32, {
-            10: [-2_000_000_000, -5, 2_000_000_000, 7],
-            20: [-1, 0, 123456, 9],
-            30: [42, -42, 100000, -99999],
-        }),
-        ("int_unsigned", "INT UNSIGNED", gnitz.TypeCode.U32, {
-            10: [0, 4_000_000_000, 2_147_483_648, 100],
-            20: [2_147_483_647, 2_147_483_649, 1, 4_294_967_295],
-            30: [10, 20, 30, 40],
-        }),
-    ]
+def _col_type(schema, name):
+    for c in schema.columns:
+        if c.name == name:
+            return c.type_code
+    raise KeyError(f"column {name!r} not in view schema {[c.name for c in schema.columns]}")
 
-    @pytest.mark.parametrize(
-        "label,sql_type,py_tc,groups", _NARROW_CASES,
-        ids=[c[0] for c in _NARROW_CASES],
-    )
-    def test_narrow_minmax_preserves_source_type(
-        self, client, label, sql_type, py_tc, groups,
-    ):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  k BIGINT NOT NULL,"
-                f"  v {sql_type} NOT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT k, MIN(v) AS lo, MAX(v) AS hi "
-                "FROM t GROUP BY k",
-                schema_name=sn,
-            )
-            vid, vschema = client.resolve_table(sn, "v")
 
-            # The view's MIN/MAX columns must carry the SOURCE type, not BIGINT.
-            assert self._col_type(vschema, "lo") == py_tc, (
-                f"{label}: MIN column type {self._col_type(vschema, 'lo')} != {py_tc}")
-            assert self._col_type(vschema, "hi") == py_tc, (
-                f"{label}: MAX column type {self._col_type(vschema, 'hi')} != {py_tc}")
+# ── The grouped reduce under churn ────────────────────────────────────────────
 
-            # Replicate each group's values across distinct PKs so a group's rows
-            # spread over the workers (drives the gather-reduce combine on a
-            # narrow column); >=2 groups land in one partial batch.
-            pk = 0
-            rows_sql = []
-            expected = {}
-            for g, vals in groups.items():
-                for _rep in range(4):
-                    for val in vals:
-                        pk += 1
-                        rows_sql.append(f"({pk}, {g}, {val})")
-                expected[g] = (min(vals), max(vals))
-            client.execute_sql(
-                "INSERT INTO t VALUES " + ", ".join(rows_sql), schema_name=sn)
 
-            got = {r["k"]: (r["lo"], r["hi"]) for r in client.scan(vid)}
-            assert got == expected, (
-                f"{label}: per-group (MIN, MAX) wrong: {got} != {expected}")
+def test_every_grouped_aggregate_tracks_update_retraction_and_group_death(client, schema_name):
+    """COUNT/SUM/AVG/MIN/MAX over one integer column through insert → UPDATE →
+    delete-the-extremum (MIN/MAX must recompute the next-best out of history) →
+    empty-a-group → re-create it. AVG lands on 7/3 and 3/2, so the f64 division
+    is exercised rather than only whole-number results."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, a BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT g, COUNT(*) AS cnt, SUM(a) AS total, AVG(a) AS av, "
+        "MIN(a) AS lo, MAX(a) AS hi FROM t GROUP BY g", schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
+    state = {}
+    check = _oracle_check(client, vid, state, ["g", "a"], ["g"], [
+        ("cnt", "COUNT", None), ("total", "SUM", "a"), ("av", "AVG", "a"),
+        ("lo", "MIN", "a"), ("hi", "MAX", "a")])
 
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
+    # g=10: {1,2,4} → AVG 7/3; g=20: {5}.
+    client.execute_sql(
+        "INSERT INTO t VALUES (1, 10, 1), (2, 10, 2), (3, 10, 4), (4, 20, 5)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [
+        {"pk": 1, "g": 10, "a": 1}, {"pk": 2, "g": 10, "a": 2},
+        {"pk": 3, "g": 10, "a": 4}, {"pk": 4, "g": 20, "a": 5}])
+    check("after-insert")
 
-    def test_f32_minmax_stays_f64_across_workers(self, client):
-        """MIN/MAX over an F32 (FLOAT) column widen to F64: the output column is
-        8 bytes holding `f64::to_bits`, so the width-gated read-back reads it
-        verbatim instead of mis-decoding it as F32. Many groups plus an
-        incremental update exercise the gather combine and its retraction on
-        that 8-byte-but-float-source column."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  k BIGINT NOT NULL,"
-                "  v FLOAT NOT NULL"  # F32
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT k, MIN(v) AS lo, MAX(v) AS hi "
-                "FROM t GROUP BY k",
-                schema_name=sn,
-            )
-            vid, vschema = client.resolve_table(sn, "v")
-            assert self._col_type(vschema, "lo") == gnitz.TypeCode.F64, (
-                f"F32 MIN must widen to F64, got {self._col_type(vschema, 'lo')}")
-            assert self._col_type(vschema, "hi") == gnitz.TypeCode.F64
+    client.execute_sql("UPDATE t SET a = 9 WHERE pk = 3", schema_name=sn)
+    oracle.apply_update(state, "pk", 3, {"a": 9})
+    check("after-update-max")
 
-            # F32-exact values (dyadic, small) so the F32->F64 widening is exact.
-            pk = 0
-            rows_sql = []
-            expected = {}
-            for g in range(8):
-                vals = [-2.25 + g, 1.5 + g, 4.0 + g, 0.5 + g]
-                for _rep in range(3):
-                    for val in vals:
-                        pk += 1
-                        rows_sql.append(f"({pk}, {g}, {val})")
-                expected[g] = (min(vals), max(vals))
-            client.execute_sql(
-                "INSERT INTO t VALUES " + ", ".join(rows_sql), schema_name=sn)
+    client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
+    oracle.apply_delete(state, "pk", [3])
+    check("after-delete-extremum")
 
-            got = {r["k"]: (r["lo"], r["hi"]) for r in client.scan(vid)}
-            for g, (lo, hi) in expected.items():
-                assert abs(got[g][0] - lo) < 1e-6, f"group {g} MIN: {got[g][0]} != {lo}"
-                assert abs(got[g][1] - hi) < 1e-6, f"group {g} MAX: {got[g][1]} != {hi}"
+    client.execute_sql("DELETE FROM t WHERE pk = 4", schema_name=sn)
+    oracle.apply_delete(state, "pk", [4])
+    check("after-group-empty")
 
-            # Incremental: push a new global MAX into group 0 — triggers the
-            # gather retraction read-back of the prior F64-widened MAX.
-            client.execute_sql(
-                f"INSERT INTO t VALUES ({pk + 1}, 0, 99.5)", schema_name=sn)
-            got = {r["k"]: (r["lo"], r["hi"]) for r in client.scan(vid)}
-            assert abs(got[0][1] - 99.5) < 1e-6, f"new MAX must be 99.5, got {got[0][1]}"
+    client.execute_sql("INSERT INTO t VALUES (5, 20, 8)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [{"pk": 5, "g": 20, "a": 8}])
+    check("after-reinsert")
 
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
 
-    @pytest.mark.parametrize(
-        "sql_type,py_tc,vals,drop_value,expect_after,is_max", [
-            # MIN held by a negative row; deleting it recovers the next-smallest.
-            ("INT", gnitz.TypeCode.I32, [-1000, -5, 50, 200], -1000, -5, False),
-            # MAX above i32::MAX; the retraction must read the old MAX
-            # zero-extended (a sign-extended read turns 4e9 negative and breaks it).
-            ("INT UNSIGNED", gnitz.TypeCode.U32,
-             [100, 2_000_000_000, 4_000_000_000], 4_000_000_000, 2_000_000_000, True),
-        ], ids=["int_min", "u32_max_above_i32max"],
-    )
-    def test_narrow_minmax_retraction(
-        self, client, sql_type, py_tc, vals, drop_value, expect_after, is_max,
-    ):
-        """Deleting the row holding a group's extremum retracts the old narrow
-        value (read from trace_out at the source width) and recomputes the next
-        extremum. A wrong-width / sign-extended read corrupts the retraction."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
-                f"v {sql_type} NOT NULL)",
-                schema_name=sn,
-            )
-            agg = "MAX" if is_max else "MIN"
-            client.execute_sql(
-                f"CREATE VIEW v AS SELECT k, {agg}(v) AS m FROM t GROUP BY k",
-                schema_name=sn,
-            )
-            vid, vschema = client.resolve_table(sn, "v")
-            assert self._col_type(vschema, "m") == py_tc
+def test_a_nullable_aggregate_reads_back_null_once_a_group_loses_its_last_value(
+        client, schema_name):
+    """SUM/AVG/MIN/MAX skip NULL inputs and read back NULL once a group's last
+    non-NULL value is retracted — the group surviving on COUNT(*) — then recover
+    when one returns. The oracle compares weights, so a retraction that re-emits
+    the old value at the wrong null bit shows up as an uncancelled ghost."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT k, COUNT(*) AS c, SUM(v) AS sm, AVG(v) AS av, "
+        "MIN(v) AS mn, MAX(v) AS hi FROM t GROUP BY k", schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
+    state = {}
+    check = _oracle_check(client, vid, state, ["k", "v"], ["k"], [
+        ("c", "COUNT", None), ("sm", "SUM", "v"), ("av", "AVG", "v"),
+        ("mn", "MIN", "v"), ("hi", "MAX", "v")])
 
-            # Group 1 is retracted from; group 2 is an untouched control (so a
-            # partial batch carries >1 group). Separate INSERTs drive incremental
-            # extremum updates, each reading the prior narrow value back.
-            pk = 0
-            drop_pk = None
+    client.execute_sql("INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [
+        {"pk": 1, "k": 10, "v": 5}, {"pk": 2, "k": 10, "v": None}])
+    check("after-insert-mixed")
+
+    client.execute_sql("INSERT INTO t VALUES (3, 10, 15)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [{"pk": 3, "k": 10, "v": 15}])
+    check("after-second-nonnull")
+
+    client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+    oracle.apply_delete(state, "pk", [1])
+    check("after-delete-one-nonnull")
+
+    # The group is now all-NULL and stays alive on COUNT(*): every other
+    # aggregate must render NULL rather than a saturated 0.
+    client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
+    oracle.apply_delete(state, "pk", [3])
+    check("after-all-null")
+
+    client.execute_sql("INSERT INTO t VALUES (4, 10, 7)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [{"pk": 4, "k": 10, "v": 7}])
+    check("after-recover")
+
+
+@pytest.mark.parametrize("agg,kind", [
+    ("SUM(a)", "SUM"), ("AVG(a)", "AVG"), ("COUNT(a)", "COUNT"),
+], ids=["sum", "avg", "count-col"])
+def test_a_linear_reduce_without_count_star_decides_existence_on_cardinality(
+        client, schema_name, agg, kind):
+    """An all-linear GROUP BY carrying no user COUNT(*) still gates group
+    existence on the hidden cardinality: an emptied group vanishes instead of
+    surviving as a zero, and a new group whose only row is NULL appears with the
+    aggregate NULL — 0 for COUNT, which SQL never renders NULL. A COUNT(*) in the
+    view would mask the gate by touching its accumulator on every row."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, a BIGINT NULL)",
+        schema_name=sn)
+    client.execute_sql(f"CREATE VIEW v AS SELECT g, {agg} AS m FROM t GROUP BY g", schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
+    state = {}
+    check = _oracle_check(client, vid, state, ["g", "a"], ["g"], [("m", kind, "a")])
+
+    client.execute_sql("INSERT INTO t VALUES (1, 10, 4), (2, 20, 6)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [
+        {"pk": 1, "g": 10, "a": 4}, {"pk": 2, "g": 20, "a": 6}])
+    check("after-insert")
+
+    client.execute_sql("INSERT INTO t VALUES (3, 7, NULL)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [{"pk": 3, "g": 7, "a": None}])
+    check("after-new-all-null-group")
+
+    client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+    oracle.apply_delete(state, "pk", [1])
+    check("after-empty-g10")
+
+    client.execute_sql("INSERT INTO t VALUES (4, 10, 7)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [{"pk": 4, "g": 10, "a": 7}])
+    check("after-recreate-g10")
+
+
+def test_a_where_filters_rows_before_the_fold(client, schema_name):
+    """The WHERE of an aggregate body runs under the reduce, so a group whose
+    every row fails it never reaches the fold and never appears."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, a BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW gv AS SELECT g, COUNT(*) AS c, SUM(a) AS s FROM t WHERE a > 100 GROUP BY g",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW av AS SELECT COUNT(*) AS c, SUM(a) AS s FROM t WHERE a > 100",
+        schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO t VALUES (1, 10, 50), (2, 10, 200), (3, 10, 300), (4, 20, 5)",
+        schema_name=sn)
+    assert bag(scanned(client, sn, "gv"), "g", "c", "s") == {(10, 2, 500): 1}
+    assert bag(scanned(client, sn, "av"), "c", "s") == {(2, 500): 1}
+
+
+def test_a_group_by_over_a_distinct_view_counts_distinct_per_group(client, schema_name):
+    """Outer `GROUP BY … COUNT(*)` over an inner `SELECT DISTINCT` is
+    count-distinct-per-group: a DISTINCT boundary crossing becomes a cross-view
+    delta into a downstream aggregate. Both groups stay non-empty throughout, so
+    what the churn drives is distinct-pair boundary crossings, duplicate carriers
+    and a cross-group key UPDATE — never a group's elimination."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, k BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql("CREATE VIEW d AS SELECT DISTINCT g, k FROM t", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM d GROUP BY g", schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
+    state = {}
+
+    def check(ctx):
+        d = oracle.oracle_distinct(oracle.oracle_filter_project(state, None, ["g", "k"]))
+        exp, cols = oracle.oracle_groupby_aggregate(d, ["g", "k"], ["g"], [("c", "COUNT", None)])
+        oracle.assert_view_matches(client, vid, cols, exp, ctx=ctx)
+
+    # g=1: k in {7,7,8} → distinct {7,8}; g=2: k in {9,10}.
+    client.execute_sql(
+        "INSERT INTO t VALUES (1, 1, 7), (2, 1, 7), (3, 1, 8), (4, 2, 9), (5, 2, 10)",
+        schema_name=sn)
+    oracle.apply_insert(state, "pk", [
+        {"pk": 1, "g": 1, "k": 7}, {"pk": 2, "g": 1, "k": 7}, {"pk": 3, "g": 1, "k": 8},
+        {"pk": 4, "g": 2, "k": 9}, {"pk": 5, "g": 2, "k": 10}])
+    check("after-insert")
+
+    # One of two carriers of (1,7) — the pair survives.
+    client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+    oracle.apply_delete(state, "pk", [1])
+    check("after-delete-one-carrier")
+
+    # The last carrier — the pair exits, the group lives on via k=8.
+    client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
+    oracle.apply_delete(state, "pk", [2])
+    check("after-delete-last-carrier-of-pair")
+
+    client.execute_sql("INSERT INTO t VALUES (6, 2, 9)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [{"pk": 6, "g": 2, "k": 9}])
+    check("after-duplicate-carrier")
+
+    client.execute_sql("UPDATE t SET k = 9 WHERE pk = 5", schema_name=sn)
+    oracle.apply_update(state, "pk", 5, {"k": 9})
+    check("after-update-onto-existing-pair")
+
+    # One epoch retracting a DISTINCT pair from one group and inserting another
+    # into a second.
+    client.execute_sql("UPDATE t SET g = 1 WHERE pk = 4", schema_name=sn)
+    oracle.apply_update(state, "pk", 4, {"g": 1})
+    check("after-cross-group-move")
+
+
+def test_an_emptied_inner_reduce_group_leaves_no_phantom_in_the_outer(client, schema_name):
+    """Reduce over reduce: when an inner group empties, its row must vanish from
+    the inner view — a sum=0 zombie there feeds the outer as a phantom (s=0, c=1)
+    and leaves a stale (s=old, c=0) behind."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, a BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql("CREATE VIEW iv AS SELECT g, SUM(a) AS s FROM t GROUP BY g", schema_name=sn)
+    client.execute_sql("CREATE VIEW ov AS SELECT s, COUNT(*) AS c FROM iv GROUP BY s", schema_name=sn)
+    ov_id = client.resolve_table(sn, "ov")[0]
+    state = {}
+
+    def check(ctx):
+        base = oracle.oracle_filter_project(state, None, ["g", "a"])
+        inner, inner_cols = oracle.oracle_groupby_aggregate(
+            base, ["g", "a"], ["g"], [("s", "SUM", "a")])
+        outer, outer_cols = oracle.oracle_groupby_aggregate(
+            inner, inner_cols, ["s"], [("c", "COUNT", None)])
+        oracle.assert_view_matches(client, ov_id, outer_cols, outer, ctx=ctx)
+
+    client.execute_sql("INSERT INTO t VALUES (1, 1, 5), (2, 2, 8)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [{"pk": 1, "g": 1, "a": 5}, {"pk": 2, "g": 2, "a": 8}])
+    check("after-insert")
+
+    client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+    oracle.apply_delete(state, "pk", [1])
+    check("after-inner-empty")
+
+
+# ── The group key ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("pk_type,keys", [
+    ("TINYINT", [-128, -1, 0, 7]),
+    ("SMALLINT", [-32768, -1, 0, 7]),
+    ("INT", [-2_000_000_000, -1, 0, 7]),
+    ("BIGINT", [-5, -1, 0, 7]),
+    ("UUID", ["550e8400-e29b-41d4-a716-446655440000",
+              "6ba7b810-9dad-11d1-80b4-00c04fd430c8"]),
+], ids=["tinyint", "smallint", "int", "bigint", "uuid"])
+def test_a_group_by_over_the_pk_emits_one_group_per_key_at_its_native_value(
+        client, schema_name, pk_type, keys):
+    """`GROUP BY pk, other` is one group per PK, since a base table's PK is
+    unique. The projected key must be the native value: the PK region stores the
+    order-preserving image, whose signed columns are sign-flipped, so projecting
+    the stored bytes would turn every negative key into a different number."""
+    sn = schema_name
+    client.execute_sql(
+        f"CREATE TABLE t (pk {pk_type} NOT NULL PRIMARY KEY, category BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT pk, category, COUNT(*) AS cnt FROM t GROUP BY pk, category",
+        schema_name=sn)
+    lit = (lambda k: f"'{k}'") if pk_type == "UUID" else str
+    client.execute_sql(
+        "INSERT INTO t VALUES " + ", ".join(
+            f"({lit(k)}, {(i + 1) * 10})" for i, k in enumerate(keys)),
+        schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "pk", "category", "cnt") == {
+        (k, (i + 1) * 10, 1): 1 for i, k in enumerate(keys)}
+
+
+def test_a_nullable_group_key_keeps_null_distinct_from_zero(client, schema_name):
+    """A NULL group key stores as zero bytes under a set null bit, so it must not
+    merge with the integer-zero group — neither in the grouping itself, nor in the
+    per-group extremes (a nullable group column is not byte-form-eligible for the
+    combined value index, so the reduce takes the trace fallback), nor in a HAVING
+    null test, which reads the group column's payload null bit."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NULL, v BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT g, COUNT(*) AS c, MIN(v) AS lo, MAX(v) AS hi "
+        "FROM t GROUP BY g", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v_null AS SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING g IS NULL",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v_notnull AS SELECT g, COUNT(*) AS c FROM t GROUP BY g HAVING g IS NOT NULL",
+        schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO t VALUES (1, NULL, 100), (2, 0, 7), (3, NULL, 50), (4, 0, 9), (5, 7, 1)",
+        schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "g", "c", "lo", "hi") == {
+        (None, 2, 50, 100): 1, (0, 2, 7, 9): 1, (7, 1, 1, 1): 1}
+    assert bag(scanned(client, sn, "v_null"), "g", "c") == {(None, 2): 1}
+    assert bag(scanned(client, sn, "v_notnull"), "g", "c") == {(0, 2): 1, (7, 1): 1}
+
+    # Lower the NULL group's MIN and raise the zero group's MAX: neither may move
+    # the other.
+    client.execute_sql("INSERT INTO t VALUES (6, NULL, 10), (7, 0, 999)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "g", "c", "lo", "hi") == {
+        (None, 3, 10, 100): 1, (0, 3, 7, 999): 1, (7, 1, 1, 1): 1}
+
+
+def test_many_distinct_group_keys_each_get_their_own_group(client, schema_name):
+    """A single-STRING key and a multi-column key both fold to a synthetic
+    `_group_pk` whose 128-bit identity is what the exchange routes on and what the
+    view stores. Two distinct keys must never share a group, and a DELETE must
+    move only the group that carried the row."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL, "
+        "a BIGINT NOT NULL, b BIGINT NOT NULL, val BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW vs AS SELECT s, COUNT(*) AS n, SUM(val) AS total FROM t GROUP BY s",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW vab AS SELECT a, b, COUNT(*) AS n, SUM(val) AS total FROM t GROUP BY a, b",
+        schema_name=sn)
+
+    rows, pk = [], 0
+    for a in range(8):
+        for b in range(8):
+            for k in range(2):
+                pk += 1
+                rows.append((pk, f"key-{a:02d}-{b:02d}", a, b, a * 1000 + b * 10 + k))
+    client.execute_sql(
+        "INSERT INTO t VALUES " + ", ".join(
+            f"({p}, '{s}', {a}, {b}, {v})" for p, s, a, b, v in rows), schema_name=sn)
+
+    def expected(live):
+        by_s, by_ab = {}, {}
+        for _p, s, a, b, v in live:
+            n, total = by_s.get(s, (0, 0))
+            by_s[s] = (n + 1, total + v)
+            n, total = by_ab.get((a, b), (0, 0))
+            by_ab[(a, b)] = (n + 1, total + v)
+        return ({(s, n, total): 1 for s, (n, total) in by_s.items()},
+                {(a, b, n, total): 1 for (a, b), (n, total) in by_ab.items()})
+
+    want_s, want_ab = expected(rows)
+    assert len(want_s) == 64 and len(want_ab) == 64
+    assert bag(scanned(client, sn, "vs"), "s", "n", "total") == want_s
+    assert bag(scanned(client, sn, "vab"), "a", "b", "n", "total") == want_ab
+
+    client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+    want_s, want_ab = expected([r for r in rows if r[0] != 1])
+    assert bag(scanned(client, sn, "vs"), "s", "n", "total") == want_s
+    assert bag(scanned(client, sn, "vab"), "a", "b", "n", "total") == want_ab
+
+
+# ── MIN / MAX and the combined value index ────────────────────────────────────
+
+
+@pytest.mark.parametrize("coltype,groups", [
+    ("INT", [(a, b) for a in range(3) for b in range(3)]),
+    ("BIGINT", [(1_000_000_001, 2_000_000_001), (1_000_000_001, 2_000_000_002),
+                (1_000_000_002, 2_000_000_001), (5, 7), (5, 8),
+                (9_999_999_999, 9_999_999_998)]),
+    ("INT", [(-5, -7), (5, 7), (-5, 7), (5, -7), (0, 0)]),
+], ids=["narrow", "wide", "signed-twins"])
+def test_a_multi_column_group_key_isolates_each_groups_extremes(
+        client, schema_name, coltype, groups):
+    """Each group's MIN/MAX are found by seeking the value index on the whole
+    group key, so two groups can never share a bucket. The narrow case keeps the
+    composite key (a ++ b ++ encoded value) inside the 16-byte cap, the wide one
+    is 24 bytes and past it, and the signed one sets the high bit of a group
+    column (-5 → 0xFFFFFFFB) against its positive twin. Values arrive in three
+    batches, so the index is read across several sources rather than one memtable.
+    """
+    sn = schema_name
+    client.execute_sql(
+        f"CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a {coltype} NOT NULL, "
+        f"b {coltype} NOT NULL, val BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT a, b, MIN(val) AS lo, MAX(val) AS hi FROM t GROUP BY a, b",
+        schema_name=sn)
+
+    pk = 0
+    want = {}
+    for batch in range(3):
+        vals = []
+        for gi, (a, b) in enumerate(groups):
+            pk += 1
+            v = (gi + 1) * 1000 + batch * 10
+            vals.append(f"({pk}, {a}, {b}, {v})")
+            lo, hi = want.get((a, b), (v, v))
+            want[(a, b)] = (min(lo, v), max(hi, v))
+        client.execute_sql("INSERT INTO t VALUES " + ", ".join(vals), schema_name=sn)
+
+    def expect(w):
+        assert bag(scanned(client, sn, "v"), "a", "b", "lo", "hi") == {
+            (a, b, lo, hi): 1 for (a, b), (lo, hi) in w.items()}
+
+    expect(want)
+
+    # A new minimum in one group, then its retraction: only that group moves, and
+    # it must recover the next-best from the index rather than keep the retracted
+    # value.
+    target = groups[0]
+    client.execute_sql(
+        f"INSERT INTO t VALUES ({pk + 1}, {target[0]}, {target[1]}, -999)", schema_name=sn)
+    expect({**want, target: (-999, want[target][1])})
+    client.execute_sql(f"DELETE FROM t WHERE pk = {pk + 1}", schema_name=sn)
+    expect(want)
+
+
+def test_min_max_over_a_primary_key_column_keeps_the_decoded_order(client, schema_name):
+    """The aggregate argument is a PRIMARY KEY column, which is stored only as
+    order-preserving bytes. The value index must OPK-decode it before
+    order-encoding, or a round-tripped MIN(b) comes back byte-swapped (256 → 1)
+    and the extreme walk — including its retract-at-the-extremum recovery —
+    selects the wrong row. `b` straddles the high byte and the sign."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (a BIGINT NOT NULL, b BIGINT NOT NULL, PRIMARY KEY (a, b))",
+        schema_name=sn)
+    # GROUP BY the whole PK: one row per group, so MIN(b) is just b.
+    client.execute_sql(
+        "CREATE VIEW vfull AS SELECT a, b, MIN(b) AS mb FROM t GROUP BY a, b", schema_name=sn)
+    # GROUP BY a prefix: several b per group, so the extremes are a real walk.
+    client.execute_sql(
+        "CREATE VIEW vpart AS SELECT a, MIN(b) AS lo, MAX(b) AS hi FROM t GROUP BY a",
+        schema_name=sn)
+    rows = [(100, 1), (100, 256), (100, 100), (100, 65536), (300, -5), (300, 4), (300, 10)]
+    client.execute_sql(
+        "INSERT INTO t VALUES " + ", ".join(f"({a}, {b})" for a, b in rows), schema_name=sn)
+
+    assert bag(scanned(client, sn, "vfull"), "a", "b", "mb") == {(a, b, b): 1 for a, b in rows}
+    assert bag(scanned(client, sn, "vpart"), "a", "lo", "hi") == {
+        (100, 1, 65536): 1, (300, -5, 10): 1}
+
+    # 256 is the byte-swap twin of 1: dropping the MAX holder must fall to 256,
+    # not to 1.
+    client.execute_sql("DELETE FROM t WHERE a = 100 AND b = 65536", schema_name=sn)
+    client.execute_sql("DELETE FROM t WHERE a = 100 AND b = 1", schema_name=sn)
+    client.execute_sql("DELETE FROM t WHERE a = 300 AND b = -5", schema_name=sn)
+    assert bag(scanned(client, sn, "vpart"), "a", "lo", "hi") == {
+        (100, 100, 256): 1, (300, 4, 10): 1}
+    assert bag(scanned(client, sn, "vfull"), "a", "b", "mb") == {
+        (100, 256, 256): 1, (100, 100, 100): 1, (300, 4, 4): 1, (300, 10, 10): 1}
+
+
+def test_min_max_over_a_text_column_recedes_to_the_next_value(client, schema_name):
+    """MIN/MAX over TEXT order by content over strings that share a long prefix
+    and spill past the inline cell, and deleting the row holding an extreme
+    recedes it — off the value index, whose MAX ordinal stores a complemented,
+    prefix-free image. The global view alongside pins the same column's ground
+    row: NULL before any row exists and again after the last is gone."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
+        "s TEXT NOT NULL, sn TEXT)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT g, MIN(s) AS lo, MAX(s) AS hi, MIN(sn) AS lon, MAX(sn) AS hin "
+        "FROM t GROUP BY g", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW gv AS SELECT MIN(s) AS lo, MAX(s) AS hi FROM t", schema_name=sn)
+
+    def expect(grouped, glo, ghi):
+        assert bag(scanned(client, sn, "v"), "g", "lo", "hi", "lon", "hin") == {
+            (g, *vals): 1 for g, vals in grouped.items()}
+        assert bag(scanned(client, sn, "gv"), "lo", "hi") == {(glo, ghi): 1}
+
+    expect({}, None, None)
+    client.execute_sql(
+        "INSERT INTO t VALUES (1, 10, 'shared/prefix/ab', 'x'), (2, 10, 'shared/prefix/abc', NULL), "
+        "(3, 10, 'shared/prefix/a', NULL), (4, 10, 'shared/prefix/abd', 'y'), "
+        "(5, 20, 'z', NULL), (6, 20, '', NULL)", schema_name=sn)
+    expect({10: ("shared/prefix/a", "shared/prefix/abd", "x", "y"),
+            20: ("", "z", None, None)}, "", "z")
+
+    client.execute_sql("DELETE FROM t WHERE pk IN (3, 4)", schema_name=sn)
+    expect({10: ("shared/prefix/ab", "shared/prefix/abc", "x", "x"),
+            20: ("", "z", None, None)}, "", "z")
+
+    client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+    expect({10: ("shared/prefix/abc", "shared/prefix/abc", None, None),
+            20: ("", "z", None, None)}, "", "z")
+
+    client.execute_sql("DELETE FROM t WHERE pk = 6", schema_name=sn)
+    expect({10: ("shared/prefix/abc", "shared/prefix/abc", None, None),
+            20: ("z", "z", None, None)}, "shared/prefix/abc", "z")
+
+    client.execute_sql("UPDATE t SET s = 'shared/prefix/aa' WHERE pk = 2", schema_name=sn)
+    expect({10: ("shared/prefix/aa", "shared/prefix/aa", None, None),
+            20: ("z", "z", None, None)}, "shared/prefix/aa", "z")
+
+    client.execute_sql("DELETE FROM t", schema_name=sn)
+    expect({}, None, None)
+
+
+def test_min_max_over_16_byte_columns_recede_through_the_value_index(client, schema_name):
+    """UUID and DECIMAL(38,0) extremes order on all 16 bytes and recede like any
+    other. The source PK is itself a 16-byte DECIMAL holding ids past u64::MAX:
+    the combined index is keyed `group ‖ ordinal ‖ value` and never re-reads the
+    source trace by PK, so the source key's width must not reach this answer."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (id DECIMAL(38,0) NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
+        "u UUID NOT NULL, big DECIMAL(38,0) NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT g, MIN(u) AS ulo, MAX(u) AS uhi, MIN(big) AS blo, "
+        "MAX(big) AS bhi FROM t GROUP BY g", schema_name=sn)
+    # The UUIDs differ only past their eighth byte; the decimals straddle u64::MAX.
+    ua = "550e8400-e29b-41d4-a716-446655440000"
+    ub = "550e8400-e29b-41d4-a716-446655440001"
+    uc = "550e8400-e29b-41d4-a716-446655430000"
+    small, mid, huge = 5, 2**64 + 1, 99999999999999999999999999999999999999
+    client.execute_sql(
+        f"INSERT INTO t VALUES (1, 1, '{ua}', {mid}), (2, 1, '{ub}', {small}), "
+        f"({huge}, 1, '{uc}', {huge}), (3, 2, '{ua}', {small})", schema_name=sn)
+    control = (2, ua, ua, small, small)
+
+    def expect(row):
+        assert bag(scanned(client, sn, "v"), "g", "ulo", "uhi", "blo", "bhi") == {
+            row: 1, control: 1}
+
+    expect((1, uc, ub, small, huge))
+    # Dropping the row at the huge U128 id must retract both extremes it held.
+    client.execute_sql(f"DELETE FROM t WHERE id = {huge}", schema_name=sn)
+    expect((1, ua, ub, small, mid))
+    client.execute_sql("DELETE FROM t WHERE id = 2", schema_name=sn)
+    expect((1, ua, ua, mid, mid))
+
+
+def test_a_lone_min_over_a_nullable_column_keeps_an_all_null_group(client, schema_name):
+    """`SELECT g, MIN(a) GROUP BY g` over a nullable `a` with no user COUNT(*):
+    the planner appends a hidden cardinality COUNT and the combined index carries
+    the nullable MIN, so an all-NULL group is present with MIN = NULL rather than
+    silently dropped, and disappears only when its last row goes."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, a BIGINT NULL)",
+        schema_name=sn)
+    client.execute_sql("CREATE VIEW v AS SELECT g, MIN(a) AS lo FROM t GROUP BY g", schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
+    state = {}
+    check = _oracle_check(client, vid, state, ["g", "a"], ["g"], [("lo", "MIN", "a")])
+
+    client.execute_sql(
+        "INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL), (3, 20, NULL)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [
+        {"pk": 1, "g": 10, "a": 5}, {"pk": 2, "g": 10, "a": None},
+        {"pk": 3, "g": 20, "a": None}])
+    check("all-NULL group 20 appears as (20, NULL)")
+
+    client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+    oracle.apply_delete(state, "pk", [1])
+    check("group 10 survives its last non-NULL as (10, NULL)")
+
+    client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
+    oracle.apply_delete(state, "pk", [2])
+    check("group 10 gone with its last row")
+
+
+@pytest.mark.parametrize("prepopulate", [False, True], ids=["incremental", "backfill"])
+def test_a_fanout_join_input_isolates_each_groups_extremes(client, schema_name, prepopulate):
+    """The reduce input is a fan-out join, so one `fact` row joins several `dim`
+    rows carrying different `g` and the same join-output PK spans several groups —
+    a reduce input with no unique PK. The combined index isolates each group by
+    its key prefix, so a group's extremes can never pull a neighbour's rows,
+    whether the view derives from scratch over a populated join or per tick."""
+    sn = schema_name
+    client.execute_sql("CREATE TABLE fact (fid BIGINT NOT NULL PRIMARY KEY)", schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE dim (did BIGINT NOT NULL PRIMARY KEY, fkey BIGINT NOT NULL, "
+        "g INT NOT NULL, x BIGINT NOT NULL, y BIGINT NOT NULL)", schema_name=sn)
+
+    def fill():
+        client.execute_sql("INSERT INTO fact VALUES (1), (2)", schema_name=sn)
+        # fact 1 → g=10(x=5,y=100), g=20(x=7,y=200); fact 2 → g=10(x=3,y=50), g=20(x=9,y=300).
+        client.execute_sql(
+            "INSERT INTO dim VALUES (1, 1, 10, 5, 100), (2, 1, 20, 7, 200), "
+            "(3, 2, 10, 3, 50), (4, 2, 20, 9, 300)", schema_name=sn)
+
+    if prepopulate:
+        fill()
+    client.execute_sql(
+        "CREATE VIEW j AS SELECT fact.fid AS fid, dim.g AS g, dim.x AS x, dim.y AS y "
+        "FROM fact JOIN dim ON fact.fid = dim.fkey", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW agg AS SELECT g, MIN(x) AS lo, MAX(y) AS hi, COUNT(*) AS c "
+        "FROM j GROUP BY g", schema_name=sn)
+    if not prepopulate:
+        fill()
+
+    assert bag(scanned(client, sn, "agg"), "g", "lo", "hi", "c") == {
+        (10, 3, 100, 2): 1, (20, 7, 300, 2): 1}
+
+    # Group 10's MIN holder goes: it must recompute to 5 from the surviving
+    # group-10 row, never from group 20's smaller-keyed entries.
+    client.execute_sql("DELETE FROM dim WHERE did = 3", schema_name=sn)
+    assert bag(scanned(client, sn, "agg"), "g", "lo", "hi", "c") == {
+        (10, 5, 100, 1): 1, (20, 7, 300, 2): 1}
+
+
+def test_a_null_to_zero_transition_of_a_min_leaves_no_stale_trace_row(client, schema_name):
+    """A NULL → 0 transition of a nullable MIN changes only the null bit; the
+    payload bytes are zero either way. Were the reduce trace to declare the
+    aggregate column NOT NULL, its rows would compare under the null-blind
+    fixed-int comparator, the `old @ -1` / `new @ +1` pair would net to zero and
+    the stale NULL row would survive — surfacing on the *next* transition, whose
+    retraction is byte-copied from it. Grouped and global reduce both."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NULL)",
+        schema_name=sn)
+    client.execute_sql("CREATE VIEW gv AS SELECT k, MIN(v) AS m FROM t GROUP BY k", schema_name=sn)
+    client.execute_sql("CREATE VIEW av AS SELECT MIN(v) AS m FROM t", schema_name=sn)
+
+    def expect(m):
+        assert bag(scanned(client, sn, "gv"), "k", "m") == {(10, m): 1}
+        assert bag(scanned(client, sn, "av"), "m") == {(m,): 1}
+
+    client.execute_sql("INSERT INTO t VALUES (1, 10, NULL)", schema_name=sn)
+    expect(None)
+    client.execute_sql("UPDATE t SET v = 0 WHERE pk = 1", schema_name=sn)
+    expect(0)
+    client.execute_sql("UPDATE t SET v = 7 WHERE pk = 1", schema_name=sn)
+    expect(7)
+
+
+# ── The width of a MIN / MAX output column ────────────────────────────────────
+
+# (SQL type, view TypeCode, {group key: [source values]}). Each value set
+# straddles its type's interesting boundary: negatives down to the type minimum
+# for the signed widths, and values above i32::MAX for the unsigned
+# zero-extension path, where a sign-extended read would turn them negative.
+_NARROW_CASES = [
+    ("TINYINT", gnitz.TypeCode.I8,
+     {10: [-128, -5, 60, 127], 20: [-1, 0, 1, 9], 30: [100, -120, 33, 7]}),
+    ("SMALLINT", gnitz.TypeCode.I16,
+     {10: [-32768, -5, 30000, 32767], 20: [-1, 0, 1000, 9], 30: [12345, -12345, 33, 7]}),
+    ("INT", gnitz.TypeCode.I32,
+     {10: [-2_000_000_000, -5, 2_000_000_000, 7], 20: [-1, 0, 123456, 9],
+      30: [42, -42, 100000, -99999]}),
+    ("INT UNSIGNED", gnitz.TypeCode.U32,
+     {10: [0, 4_000_000_000, 2_147_483_648, 100],
+      20: [2_147_483_647, 2_147_483_649, 1, 4_294_967_295], 30: [10, 20, 30, 40]}),
+]
+
+
+@pytest.mark.parametrize("sql_type,py_tc,groups", _NARROW_CASES,
+                         ids=[c[0].lower().replace(" ", "_") for c in _NARROW_CASES])
+def test_a_narrow_min_max_keeps_the_source_width_through_combine_and_retraction(
+        client, schema_name, sql_type, py_tc, groups):
+    """MIN/MAX emit at the source column's width rather than widening to BIGINT —
+    the extremum is one of the input rows, so it always fits. The trace read-backs
+    reconstruct the 8-byte accumulator from that width, so a wrong-width or
+    sign-extended read corrupts the gather combine and, worse, the retraction that
+    drops the row holding an extremum. Each group's values are replicated across
+    distinct PKs so a group spreads over the workers."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
+        f"v {sql_type} NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT k, MIN(v) AS lo, MAX(v) AS hi FROM t GROUP BY k",
+        schema_name=sn)
+    _vid, vschema = client.resolve_table(sn, "v")
+    assert _col_type(vschema, "lo") == py_tc
+    assert _col_type(vschema, "hi") == py_tc
+
+    pk, vals_sql = 0, []
+    for g, vals in groups.items():
+        for _rep in range(4):
             for val in vals:
                 pk += 1
-                if val == drop_value:
-                    drop_pk = pk
-                client.execute_sql(
-                    f"INSERT INTO t VALUES ({pk}, 1, {val})", schema_name=sn)
-            pk += 1
-            client.execute_sql(f"INSERT INTO t VALUES ({pk}, 2, 7)", schema_name=sn)
-
-            extremum = max(vals) if is_max else min(vals)
-            got = {r["k"]: r["m"] for r in client.scan(vid)}
-            assert got[1] == extremum, f"initial {agg}: {got[1]} != {extremum}"
-
-            client.execute_sql(f"DELETE FROM t WHERE pk = {drop_pk}", schema_name=sn)
-            got = {r["k"]: r["m"] for r in client.scan(vid)}
-            assert got[1] == expect_after, (
-                f"after retracting the {agg} holder, {agg} must recover "
-                f"{expect_after}, got {got[1]}")
-            assert got[2] == 7, "untouched group must be unchanged"
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_narrow_minmax_having_and_projection(self, client):
-        """HAVING and the projected column both read the agg at the source width
-        (the planner's `reduce_schema` mirror). A SMALLINT MAX must filter and
-        project correctly as SMALLINT — if the mirror still said BIGINT, the
-        finalize copy and the HAVING bind would use the wrong width."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
-                "v SMALLINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT k, MAX(v) AS m FROM t GROUP BY k "
-                "HAVING MAX(v) > 1000",
-                schema_name=sn,
-            )
-            vid, vschema = client.resolve_table(sn, "v")
-            assert self._col_type(vschema, "m") == gnitz.TypeCode.I16, (
-                f"projected MAX must be SMALLINT/I16, got {self._col_type(vschema, 'm')}")
-
-            # Groups straddling the threshold 1000 (values within I16 range):
-            #   k=10 MAX=900   excluded     k=20 MAX=1500  kept
-            #   k=30 MAX=30000 kept         k=40 MAX=1000  excluded (not > 1000)
-            client.execute_sql(
-                "INSERT INTO t VALUES "
-                "(1,10,900),(2,10,500),(3,10,-100),"
-                "(4,20,1500),(5,20,200),(6,20,-5),"
-                "(7,30,30000),(8,30,123),(9,30,-32768),"
-                "(10,40,1000),(11,40,0),(12,40,7)",
-                schema_name=sn,
-            )
-            got = {r["k"]: r["m"] for r in client.scan(vid)}
-            assert got == {20: 1500, 30: 30000}, (
-                f"HAVING MAX(v) > 1000 wrong: {got}")
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-
-class TestAggregateDifferential:
-    """GROUP BY aggregates checked against the from-scratch differential oracle
-    after every epoch, including a nested aggregate-over-DISTINCT view. The
-    expected value is recomputed in pure Python and never touches the engine, so
-    a shared-operator bug cannot hide behind a hand-written expectation the way it
-    can in the value-pinned tests above. The source is a unique-PK base table, so
-    these stay clear of the foreign-group reduce-gather defect (a separate plan
-    owns the non-unique-PK multi-aggregate shape). All columns are integer, so
-    every column — integer AVG included — is compared by value: SUM/COUNT are
-    exact integers and AVG is one deterministic f64 division of them."""
-
-    def test_all_aggs_integer_churn(self, client):
-        """COUNT/SUM/AVG/MIN/MAX over one integer column driven through insert →
-        UPDATE → delete-the-extremum (forces a MIN/MAX retraction recompute) →
-        empty-a-group → re-insert. AVG values are non-even (7/3, 3/2) so the f64
-        division is actually exercised, not just whole-number results."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
-                "a BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT g, COUNT(*) AS cnt, SUM(a) AS total, "
-                "AVG(a) AS av, MIN(a) AS lo, MAX(a) AS hi FROM t GROUP BY g",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            project = ["g", "cnt", "total", "av", "lo", "hi"]
-            t_state = {}
-
-            def check(ctx):
-                base = oracle.oracle_filter_project(t_state, None, ["g", "a"])
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    base, ["g", "a"], ["g"],
-                    [("cnt", "COUNT", None), ("total", "SUM", "a"), ("av", "AVG", "a"),
-                     ("lo", "MIN", "a"), ("hi", "MAX", "a")])
-                assert cols == project
-                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
-
-            # g=10: {1,2,4} → AVG 7/3; g=20: {5} → AVG 5.
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 1), (2, 10, 2), (3, 10, 4), (4, 20, 5)",
-                schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [
-                {"pk": 1, "g": 10, "a": 1}, {"pk": 2, "g": 10, "a": 2},
-                {"pk": 3, "g": 10, "a": 4}, {"pk": 4, "g": 20, "a": 5}])
-            check("after-insert")
-
-            # Raise g=10's max to 9 → SUM/AVG/MAX shift.
-            client.execute_sql("UPDATE t SET a = 9 WHERE pk = 3", schema_name=sn)
-            oracle.apply_update(t_state, "pk", 3, {"a": 9})
-            check("after-update-max")
-
-            # Delete g=10's current MAX holder → MAX recomputes from history to 2.
-            client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [3])
-            check("after-delete-extremum")
-
-            # Empty g=20 entirely → the group vanishes from the view.
-            client.execute_sql("DELETE FROM t WHERE pk = 4", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [4])
-            check("after-group-empty")
-
-            # Re-create g=20 with a fresh value.
-            client.execute_sql("INSERT INTO t VALUES (5, 20, 8)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [{"pk": 5, "g": 20, "a": 8}])
-            check("after-reinsert")
-        finally:
-            client.drop_schema(sn)
-
-    def test_nullable_aggs_null_edge_churn(self, client):
-        """A nullable aggregate column driven to all-NULL and back. SUM/AVG/MIN/MAX
-        must skip NULL inputs and read back NULL once a group's last non-NULL value
-        is retracted (the group surviving via COUNT(*)), then recover — exactly the
-        null-gate the oracle models. Independent recompute across the whole churn,
-        not a single hand-checked transition."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
-                "v BIGINT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT k, COUNT(*) AS c, SUM(v) AS sm, AVG(v) AS av, "
-                "MIN(v) AS mn, MAX(v) AS hi FROM t GROUP BY k",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            project = ["k", "c", "sm", "av", "mn", "hi"]
-            t_state = {}
-
-            def check(ctx):
-                base = oracle.oracle_filter_project(t_state, None, ["k", "v"])
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    base, ["k", "v"], ["k"],
-                    [("c", "COUNT", None), ("sm", "SUM", "v"), ("av", "AVG", "v"),
-                     ("mn", "MIN", "v"), ("hi", "MAX", "v")])
-                assert cols == project
-                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
-
-            # k=10: one non-NULL (5) + one NULL → aggs over {5}, c=2.
-            client.execute_sql("INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [
-                {"pk": 1, "k": 10, "v": 5}, {"pk": 2, "k": 10, "v": None}])
-            check("after-insert-mixed")
-
-            # Add a second non-NULL → aggs over {5,15}, AVG 10.
-            client.execute_sql("INSERT INTO t VALUES (3, 10, 15)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [{"pk": 3, "k": 10, "v": 15}])
-            check("after-second-nonnull")
-
-            # Retract one non-NULL → aggs over {15}.
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [1])
-            check("after-delete-one-nonnull")
-
-            # Retract the last non-NULL → group all-NULL: SUM/AVG/MIN/MAX NULL, c=1.
-            client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [3])
-            check("after-all-null")
-
-            # Re-introduce a non-NULL → aggregates recover.
-            client.execute_sql("INSERT INTO t VALUES (4, 10, 7)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [{"pk": 4, "k": 10, "v": 7}])
-            check("after-recover")
-        finally:
-            client.drop_schema(sn)
-
-    def test_nested_count_distinct_over_distinct_view_churn(self, client):
-        """A nested view — outer GROUP BY COUNT(*) over an inner SELECT DISTINCT —
-        is count-distinct-per-group, checked differentially across churn. It
-        composes incremental DISTINCT boundary-crossing with a cross-view delta
-        into a downstream aggregate, a path no single-view test reaches. The oracle
-        chains oracle_distinct into oracle_groupby_aggregate, mirroring the view
-        stack. Both groups stay non-empty throughout (a fully-emptied COUNT-only
-        group is a separate, independently tracked reduce defect), so the churn
-        exercises distinct-pair boundary crossings, duplicate carriers, and a
-        cross-group key UPDATE — never a group's elimination."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
-                "k BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql("CREATE VIEW d AS SELECT DISTINCT g, k FROM t", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM d GROUP BY g", schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            project = ["g", "c"]
-            t_state = {}
-
-            def check(ctx):
-                d = oracle.oracle_distinct(
-                    oracle.oracle_filter_project(t_state, None, ["g", "k"]))
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    d, ["g", "k"], ["g"], [("c", "COUNT", None)])
-                assert cols == project
-                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
-
-            # g=1: k in {7,7,8} → distinct {7,8} → c=2; g=2: k in {9,10} → c=2.
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 1, 7), (2, 1, 7), (3, 1, 8), (4, 2, 9), (5, 2, 10)",
-                schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [
-                {"pk": 1, "g": 1, "k": 7}, {"pk": 2, "g": 1, "k": 7},
-                {"pk": 3, "g": 1, "k": 8}, {"pk": 4, "g": 2, "k": 9},
-                {"pk": 5, "g": 2, "k": 10}])
-            check("after-insert")
-
-            # Drop one carrier of (1,7) → pair survives → g=1 c=2 unchanged.
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [1])
-            check("after-delete-one-carrier")
-
-            # Drop the last carrier of (1,7) → its pair exits → g=1 distinct {8} c=1
-            # (the group stays alive via k=8 — no outer-group elimination).
-            client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [2])
-            check("after-delete-last-carrier-of-pair")
-
-            # Insert a duplicate carrier of (2,9) → distinct set unchanged → c=2.
-            client.execute_sql("INSERT INTO t VALUES (6, 2, 9)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [{"pk": 6, "g": 2, "k": 9}])
-            check("after-duplicate-carrier")
-
-            # Move (2,10)'s only carrier onto k=9 → pair (2,10) exits → g=2 c=1
-            # (still alive via the (2,9) carriers).
-            client.execute_sql("UPDATE t SET k = 9 WHERE pk = 5", schema_name=sn)
-            oracle.apply_update(t_state, "pk", 5, {"k": 9})
-            check("after-update-onto-existing-pair")
-
-            # Cross-group key UPDATE: move pk=4 from g=2 to g=1 (k=9). g=2 keeps its
-            # (2,9) pair via pk5/pk6 (c=1), g=1 gains a new distinct (1,9) → c=2.
-            # Retracts one DISTINCT pair and inserts another in one epoch, both
-            # groups remaining non-empty.
-            client.execute_sql("UPDATE t SET g = 1 WHERE pk = 4", schema_name=sn)
-            oracle.apply_update(t_state, "pk", 4, {"g": 1})
-            check("after-cross-group-move")
-        finally:
-            client.drop_schema(sn)
-
-
-class TestAggregateQualifierRejection:
-    """Aggregate-call qualifiers the binder does not implement (FILTER, OVER, …)
-    must be rejected loudly, never silently dropped to the plain aggregate — the
-    durable-wrong-result class. Both binding sites are guarded: the GROUP BY
-    SELECT list and HAVING."""
-
-    def _setup(self, client, sn):
-        client.execute_sql(
-            "CREATE TABLE t ("
-            "  pk BIGINT NOT NULL PRIMARY KEY,"
-            "  g BIGINT NOT NULL,"
-            "  x BIGINT NOT NULL"
-            ")",
-            schema_name=sn,
-        )
-
-    def test_filter_clause_rejected(self, client):
-        """`SUM(x) FILTER (WHERE x > 0)`: the FILTER would be dropped and a plain
-        SUM(x) computed."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql(
-                    "CREATE VIEW v AS SELECT g, SUM(x) FILTER (WHERE x > 0) AS s "
-                    "FROM t GROUP BY g",
-                    schema_name=sn,
-                )
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_over_window_rejected(self, client):
-        """`SUM(x) OVER (PARTITION BY g)` is a window function silently computed as
-        a grouped aggregate — window semantics lost. Must be rejected."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql(
-                    "CREATE VIEW v AS SELECT g, SUM(x) OVER (PARTITION BY g) AS s "
-                    "FROM t GROUP BY g",
-                    schema_name=sn,
-                )
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_plain_aggregates_and_all_still_compute(self, client):
-        """Regression: the guard must leave plain aggregates and the one accepted
-        qualifier — ALL (`COUNT(ALL x)` ≡ `COUNT(x)`) — binding and computing
-        unchanged."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT g, "
-                "COUNT(*) AS c_star, COUNT(x) AS c_x, COUNT(ALL x) AS c_all, "
-                "SUM(x) AS s, AVG(x) AS a, MIN(x) AS mn, MAX(x) AS mx "
-                "FROM t GROUP BY g",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 2), (2, 10, 4), (3, 20, 7)",
-                schema_name=sn,
-            )
-            by_g = {r["g"]: r for r in client.scan(vid)}
-            assert by_g[10]["c_star"] == 2
-            assert by_g[10]["c_x"] == 2
-            assert by_g[10]["c_all"] == 2            # COUNT(ALL x) ≡ COUNT(x)
-            assert by_g[10]["s"] == 6                # 2 + 4
-            assert abs(by_g[10]["a"] - 3.0) < 0.001  # AVG = 6/2
-            assert by_g[10]["mn"] == 2
-            assert by_g[10]["mx"] == 4
-            assert by_g[20]["c_all"] == 1
-            assert by_g[20]["s"] == 7
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-
-class TestLinearReduceGroupExistence:
-    """An all-linear GROUP BY view (COUNT/SUM/AVG, no MIN/MAX) carrying NO user
-    COUNT(*) must still decide group existence on cardinality: an emptied group
-    vanishes (no sum=0 / NULL / count=0 zombie) and a brand-new group whose
-    aggregated column is all-NULL appears (SUM/AVG = NULL). These are invisible to
-    the COUNT(*)-carrying differential tests — COUNT(*)'s accumulator is touched
-    on every row and masks the gate. Checked against the from-scratch oracle,
-    which models the SQL semantics exactly (an emptied group is absent; an all-NULL
-    group is present with SUM/AVG = NULL)."""
-
-    def test_sum_only_nonnull_empty_and_recreate(self, client):
-        """SELECT g, SUM(a) over non-nullable a, no COUNT(*): emptying a group
-        drops it (no sum=0 zombie); re-inserting brings it back."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
-                "a BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT g, SUM(a) AS s FROM t GROUP BY g",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            project = ["g", "s"]
-            t_state = {}
-
-            def check(ctx):
-                base = oracle.oracle_filter_project(t_state, None, ["g", "a"])
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    base, ["g", "a"], ["g"], [("s", "SUM", "a")])
-                assert cols == project
-                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
-
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 3), (2, 20, 5)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [
-                {"pk": 1, "g": 10, "a": 3}, {"pk": 2, "g": 20, "a": 5}])
-            check("after-insert")
-
-            # Empty g=10 → the group must vanish, not survive as (g=10, s=0).
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [1])
-            check("after-empty-g10")
-
-            # Re-create g=10 → it returns.
-            client.execute_sql("INSERT INTO t VALUES (3, 10, 7)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [{"pk": 3, "g": 10, "a": 7}])
-            check("after-recreate-g10")
-        finally:
-            client.drop_schema(sn)
-
-    def test_sum_only_nullable_all_null_group_and_empty(self, client):
-        """SELECT g, SUM(a) over nullable a, no COUNT(*): a brand-new group whose
-        only row is all-NULL appears with SUM = NULL (not dropped); emptying a
-        group still removes it."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
-                "a BIGINT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT g, SUM(a) AS s FROM t GROUP BY g",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            project = ["g", "s"]
-            t_state = {}
-
-            def check(ctx):
-                base = oracle.oracle_filter_project(t_state, None, ["g", "a"])
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    base, ["g", "a"], ["g"], [("s", "SUM", "a")])
-                assert cols == project
-                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
-
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 4), (2, 20, 6)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [
-                {"pk": 1, "g": 10, "a": 4}, {"pk": 2, "g": 20, "a": 6}])
-            check("after-insert")
-
-            # New group g=7 whose only row is all-NULL → present with SUM = NULL.
-            client.execute_sql("INSERT INTO t VALUES (3, 7, NULL)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [{"pk": 3, "g": 7, "a": None}])
-            check("after-new-all-null")
-
-            # Empty g=10 → vanishes.
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [1])
-            check("after-empty-g10")
-        finally:
-            client.drop_schema(sn)
-
-    def test_avg_only_nullable_all_null_group_and_empty(self, client):
-        """SELECT g, AVG(a) over nullable a, no COUNT(*): same lifecycle as SUM —
-        a new all-NULL group appears with AVG = NULL; an emptied group vanishes."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
-                "a BIGINT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT g, AVG(a) AS av FROM t GROUP BY g",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            project = ["g", "av"]
-            t_state = {}
-
-            def check(ctx):
-                base = oracle.oracle_filter_project(t_state, None, ["g", "a"])
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    base, ["g", "a"], ["g"], [("av", "AVG", "a")])
-                assert cols == project
-                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
-
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 4), (2, 20, 6)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [
-                {"pk": 1, "g": 10, "a": 4}, {"pk": 2, "g": 20, "a": 6}])
-            check("after-insert")
-
-            # New all-NULL group g=7 → present with AVG = NULL.
-            client.execute_sql("INSERT INTO t VALUES (3, 7, NULL)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [{"pk": 3, "g": 7, "a": None}])
-            check("after-new-all-null")
-
-            # Empty g=10 → vanishes.
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [1])
-            check("after-empty-g10")
-        finally:
-            client.drop_schema(sn)
-
-    def test_count_col_only_empty_recreate_and_all_null_present(self, client):
-        """SELECT g, COUNT(a) over nullable a, no COUNT(*): emptying a group drops
-        it, re-inserting restores it. A new all-NULL group becomes PRESENT with
-        COUNT(a) = 0 (SQL guarantees COUNT is never NULL), asserted through the
-        Python client's null-bit-gated decode via a direct scan."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
-                "a BIGINT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT g, COUNT(a) AS c FROM t GROUP BY g",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            project = ["g", "c"]
-            t_state = {}
-
-            def check(ctx):
-                base = oracle.oracle_filter_project(t_state, None, ["g", "a"])
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    base, ["g", "a"], ["g"], [("c", "COUNT", "a")])
-                assert cols == project
-                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
-
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 4), (2, 20, 6)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [
-                {"pk": 1, "g": 10, "a": 4}, {"pk": 2, "g": 20, "a": 6}])
-            check("after-insert")
-
-            # Empty g=10 → vanishes; re-insert → returns (COUNT(a) = 1).
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [1])
-            check("after-empty-g10")
-            client.execute_sql("INSERT INTO t VALUES (3, 10, 7)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [{"pk": 3, "g": 10, "a": 7}])
-            check("after-recreate-g10")
-
-            # New all-NULL group g=7: the row APPEARS and COUNT(a) renders as a
-            # concrete 0 (SQL guarantees COUNT is never NULL), surfaced here through
-            # the client's null-bit-gated decode.
-            client.execute_sql("INSERT INTO t VALUES (4, 7, NULL)", schema_name=sn)
-            g7 = [r for r in client.scan(vid) if r["g"] == 7]
-            assert len(g7) == 1, f"new all-NULL COUNT(a) group must appear, got {g7}"
-            assert g7[0]["c"] == 0, f"COUNT(a) of all-NULL group must be 0, not NULL, got {g7[0]['c']}"
-        finally:
-            client.drop_schema(sn)
-
-    def test_count_star_and_col_all_null_and_mixed_groups_churn(self, client):
-        """SELECT g, COUNT(*), COUNT(x): the differential oracle drives the VALUE
-        (not just existence) of COUNT(x) over an all-NULL group (= 0) and a mixed
-        group (some NULL, some non-NULL x), across inserts and deletes. COUNT(*)
-        counts every row; COUNT(x) counts only non-NULL x and is never NULL — so
-        emptying a group's non-NULL rows leaves COUNT(x) = 0 while COUNT(*) keeps
-        the row alive."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
-                "x BIGINT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT g, COUNT(*) AS ca, COUNT(x) AS cx "
-                "FROM t GROUP BY g", schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            project = ["g", "ca", "cx"]
-            aggs = [("ca", "COUNT", None), ("cx", "COUNT", "x")]
-            t_state = {}
-
-            def check(ctx):
-                base = oracle.oracle_filter_project(t_state, None, ["g", "x"])
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    base, ["g", "x"], ["g"], aggs)
-                assert cols == project
-                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
-
-            # g=7 all-NULL x (ca=2, cx=0); g=8 mixed (ca=3, cx=2); g=9 all
-            # non-NULL control (ca=1, cx=1).
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 7, NULL), (2, 7, NULL), (3, 8, 5), "
-                "(4, 8, NULL), (5, 8, 6), (6, 9, 9)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [
-                {"pk": 1, "g": 7, "x": None}, {"pk": 2, "g": 7, "x": None},
-                {"pk": 3, "g": 8, "x": 5}, {"pk": 4, "g": 8, "x": None},
-                {"pk": 5, "g": 8, "x": 6}, {"pk": 6, "g": 9, "x": 9}])
-            check("after-insert")
-
-            # Delete one non-NULL of g=8 → cx drops to 1, ca to 2.
-            client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [3])
-            check("after-delete-one-nonnull-g8")
-
-            # Delete g=8's last non-NULL → g=8 all-NULL: ca=1, cx=0 (still alive).
-            client.execute_sql("DELETE FROM t WHERE pk = 5", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [5])
-            check("after-delete-to-all-null-g8")
-
-            # Re-insert a non-NULL x into the now-all-NULL g=8 → cx back to 1.
-            client.execute_sql("INSERT INTO t VALUES (7, 8, 11)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [{"pk": 7, "g": 8, "x": 11}])
-            check("after-reinsert-nonnull-g8")
-        finally:
-            client.drop_schema(sn)
-
-    def test_nested_sum_inner_empty_no_phantom(self, client):
-        """The nested cascade: an outer COUNT(*) GROUP BY over an inner SUM GROUP
-        BY. When an inner group empties, the inner row must vanish — otherwise its
-        sum=0 zombie feeds the outer as a phantom (s=0, c=1) group and leaves a
-        stale (s=old, c=0). Checked by chaining the oracle through both views."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
-                "a BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW iv AS SELECT g, SUM(a) AS s FROM t GROUP BY g",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW ov AS SELECT s, COUNT(*) AS c FROM iv GROUP BY s",
-                schema_name=sn)
-            ov_id = client.resolve_table(sn, "ov")[0]
-            t_state = {}
-
-            def check(ctx):
-                base = oracle.oracle_filter_project(t_state, None, ["g", "a"])
-                inner, inner_cols = oracle.oracle_groupby_aggregate(
-                    base, ["g", "a"], ["g"], [("s", "SUM", "a")])
-                outer, outer_cols = oracle.oracle_groupby_aggregate(
-                    inner, inner_cols, ["s"], [("c", "COUNT", None)])
-                assert outer_cols == ["s", "c"]
-                oracle.assert_view_matches(client, ov_id, ["s", "c"], outer, ctx=ctx)
-
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 1, 5), (2, 2, 8)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [
-                {"pk": 1, "g": 1, "a": 5}, {"pk": 2, "g": 2, "a": 8}])
-            check("after-insert")
-
-            # Empty inner group g=1 → its row must disappear from iv, so ov shows
-            # neither a phantom (s=0, c=1) nor a stale (s=5, c=0).
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [1])
-            check("after-inner-empty")
-        finally:
-            client.drop_schema(sn)
-
-
-class TestGlobalAggregate:
-    """Ungrouped (global) aggregate views — `SELECT MIN(x) FROM t` with no GROUP
-    BY. One logical group at the synthetic constant PK V0; SQL scalar-aggregate
-    semantics require exactly one output row even over an empty/fully-retracted
-    source (COUNT(*)=0, SUM/MIN/MAX/AVG=NULL). Run under GNITZ_WORKERS=1 and =4;
-    at =4 every source row funnels through partition 220's owner."""
-
-    @staticmethod
-    def _one_row(client, vid):
-        """The single positive-weight row of a global aggregate (asserts exactly one)."""
-        rows = list(client.scan(vid))
-        assert len(rows) == 1, f"expected exactly one global row, got {len(rows)}: {rows}"
-        return rows[0]
-
-    def test_count_sum_avg_min_max_populated(self, client):
-        """All five aggregates over a populated source, one row, correct values."""
-        sn = "ga_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total, "
-                "AVG(a) AS av, MIN(a) AS lo, MAX(a) AS hi FROM t",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 2), (2, 4), (3, 9)", schema_name=sn)
-            r = self._one_row(client, vid)
-            assert r["cnt"] == 3
-            assert r["total"] == 15
-            assert abs(r["av"] - 5.0) < 1e-9
-            assert r["lo"] == 2
-            assert r["hi"] == 9
-        finally:
-            client.drop_schema(sn)
-
-    def test_min_max_retract_to_next_best(self, client):
-        """Deleting the current MIN/MAX advances the global extremum to next-best."""
-        sn = "gar_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW vlo AS SELECT MIN(a) AS m FROM t", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW vhi AS SELECT MAX(a) AS m FROM t", schema_name=sn)
-            vlo = client.resolve_table(sn, "vlo")[0]
-            vhi = client.resolve_table(sn, "vhi")[0]
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", schema_name=sn)
-            assert self._one_row(client, vlo)["m"] == 10
-            assert self._one_row(client, vhi)["m"] == 30
-            # Delete both extrema; MIN -> 20, MAX -> 20.
-            client.execute_sql("DELETE FROM t WHERE pk IN (1, 3)", schema_name=sn)
-            assert self._one_row(client, vlo)["m"] == 20, "MIN must advance to next-best"
-            assert self._one_row(client, vhi)["m"] == 20, "MAX must advance to next-best"
-        finally:
-            client.drop_schema(sn)
-
-    def test_where_filter(self, client):
-        """A WHERE filter on a global aggregate is honored."""
-        sn = "gaw_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total "
-                "FROM t WHERE a > 5", schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 2), (2, 7), (3, 9)", schema_name=sn)
-            r = self._one_row(client, vid)
-            assert r["cnt"] == 2 and r["total"] == 16
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_filter_and_empty_source(self, client):
-        """HAVING is a post-reduce filter. Over an empty source the ground row is
-        in trace_out@V0 but `HAVING COUNT(*) > 0` filters it out of the view."""
-        sn = "gah_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT COUNT(*) AS cnt FROM t HAVING COUNT(*) > 2",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            # Empty source: 0 > 2 filters the ground row → zero rows.
-            assert list(client.scan(vid)) == []
-            client.execute_sql("INSERT INTO t VALUES (1, 1), (2, 1)", schema_name=sn)
-            assert list(client.scan(vid)) == [], "2 not > 2"
-            client.execute_sql("INSERT INTO t VALUES (3, 1)", schema_name=sn)
-            assert self._one_row(client, vid)["cnt"] == 3
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_count_gt_zero_empty_source_zero_rows(self, client):
-        """`HAVING COUNT(*) > 0` over an empty source yields zero rows (the ground
-        row exists in trace_out@V0 but is filtered)."""
-        sn = "gah0_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT COUNT(*) AS cnt FROM t HAVING COUNT(*) > 0",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            assert list(client.scan(vid)) == []
-        finally:
-            client.drop_schema(sn)
-
-    def test_empty_source_one_row_at_creation_and_after_delete_all(self, client):
-        """Over a never-populated source the view shows one ground row (COUNT(*)=0,
-        SUM=NULL); after delete-all it returns to that ground; a refill restores
-        the computed values."""
-        sn = "gae_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
-                schema_name=sn)
-            # View created over an EMPTY table — the seed must fire.
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM t",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            r = self._one_row(client, vid)
-            assert r["cnt"] == 0, "COUNT(*) over empty source is 0"
-            assert r["total"] is None, "SUM over empty source is NULL"
-
-            client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 7)", schema_name=sn)
-            r = self._one_row(client, vid)
-            assert r["cnt"] == 2 and r["total"] == 12
-
-            client.execute_sql("DELETE FROM t", schema_name=sn)
-            r = self._one_row(client, vid)
-            assert r["cnt"] == 0 and r["total"] is None, "delete-all returns to ground"
-
-            client.execute_sql("INSERT INTO t VALUES (3, 4)", schema_name=sn)
-            r = self._one_row(client, vid)
-            assert r["cnt"] == 1 and r["total"] == 4, "value returns on refill"
-        finally:
-            client.drop_schema(sn)
-
-    def test_empty_source_count_col_is_zero(self, client):
-        """The empty-source ground renders COUNT(col)=0 (where SUM/MIN/MAX would be
-        NULL). A non-empty all-NULL source renders COUNT(col)=0 too — the same emit
-        predicate — and is covered by the grouped/all-NULL tests; this one pins the
-        empty-source ground specifically."""
-        sn = "gec_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT COUNT(a) AS c FROM t", schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            assert self._one_row(client, vid)["c"] == 0, "COUNT(col) over empty source is 0"
-        finally:
-            client.drop_schema(sn)
-
-    def test_nonnullable_sum_empties_to_one_null_row(self, client):
-        """A non-nullable lone SUM (AggShape::Direct, no companion) driven empty:
-        the cardinality gate sheds the computed row and the ground branch supplies
-        one NULL row — not a concrete 0."""
-        sn = "gns_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT SUM(a) AS total FROM t", schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            client.execute_sql("INSERT INTO t VALUES (1, 5)", schema_name=sn)
-            assert self._one_row(client, vid)["total"] == 5
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            assert self._one_row(client, vid)["total"] is None, "emptied SUM is NULL, not 0"
-        finally:
-            client.drop_schema(sn)
-
-    def test_lone_min_all_null_then_value(self, client):
-        """A lone MIN over an all-NULL (non-empty) source is one NULL row; inserting
-        a value makes it appear."""
-        sn = "gmn_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT MIN(a) AS m FROM t", schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            client.execute_sql("INSERT INTO t VALUES (1, NULL), (2, NULL)", schema_name=sn)
-            assert self._one_row(client, vid)["m"] is None, "all-NULL MIN is NULL"
-            client.execute_sql("INSERT INTO t VALUES (3, 7)", schema_name=sn)
-            assert self._one_row(client, vid)["m"] == 7, "MIN appears once a value arrives"
-        finally:
-            client.drop_schema(sn)
-
-    def test_mixed_all_null_count_min_routes_to_ground(self, client):
-        """`SELECT COUNT(x), MIN(x)` over a non-empty all-NULL source: all
-        accumulators untouched → should_emit false → the ground supplies
-        COUNT(x)=0, MIN=NULL (never a COUNT=-N zombie)."""
-        sn = "gmm_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT COUNT(a) AS c, MIN(a) AS m FROM t",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            client.execute_sql("INSERT INTO t VALUES (1, NULL), (2, NULL)", schema_name=sn)
-            r = self._one_row(client, vid)
-            assert r["c"] == 0, "all-NULL mixed COUNT(x) routes to ground → 0"
-            assert r["m"] is None, "all-NULL MIN is NULL"
-        finally:
-            client.drop_schema(sn)
-
-    def test_select_star_hides_group_pk(self, client):
-        """SELECT * over a global aggregate hides the synthetic `_group_pk` U128
-        constant and ships only the aggregate column."""
-        sn = "gss_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT MIN(a) AS lo FROM t", schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            client.execute_sql("INSERT INTO t VALUES (1, 3)", schema_name=sn)
-            r = self._one_row(client, vid)
-            cols = set(r._asdict().keys())
-            assert "_group_pk" not in cols, f"_group_pk must be hidden, got {cols}"
-            assert cols == {"lo"} and r["lo"] == 3
-        finally:
-            client.drop_schema(sn)
-
-    def test_computed_projection_keeps_the_ground_row(self, client):
-        """A global aggregate may be computed over — on the way in (`SUM(a * 2)`),
-        on the way out (`COUNT(*) + 1`), and beside a literal. The ground machinery
-        is what these could break, so each is checked over the empty source, filled,
-        and emptied again: exactly one row throughout, never a ghost."""
-        sn = "gsv_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT COUNT(*) + 1 AS c, SUM(a * 2) AS s, 'x' AS lit FROM t",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            project = ["c", "s", "lit"]
-
-            def check(ctx, row):
-                oracle.assert_view_matches(client, vid, project, Counter({row: 1}), ctx=ctx)
-
-            # SUM over an empty source is NULL, and COUNT(*) is 0 — the ground row.
-            check("empty-at-creation", (1, None, "x"))
-            client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 7)", schema_name=sn)
-            check("after-insert", (3, 24, "x"))
-            client.execute_sql("DELETE FROM t", schema_name=sn)
-            check("after-delete-all", (1, None, "x"))
-        finally:
-            client.drop_schema(sn)
-
-    def test_ungrouped_column_still_rejected(self, client):
-        """What the grouped projection still refuses: a column the grouping does
-        not determine, however it is wrapped."""
-        sn = "gsu_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, g BIGINT NOT NULL)",
-                schema_name=sn)
-            for bad in [
-                "SELECT a + 1 AS x, COUNT(*) AS c FROM t",
-                "SELECT a AS x, COUNT(*) AS c FROM t GROUP BY g",
-                "SELECT a * 2 AS x, COUNT(*) AS c FROM t GROUP BY g",
-            ]:
-                with pytest.raises(Exception):
-                    client.execute_sql(f"CREATE VIEW bad AS {bad}", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_global_aggregate_differential(self, client):
-        """Global aggregate checked against the recompute oracle across an
-        empty → insert → update → delete-all → reinsert churn. The empty-source
-        one-row result (the entire reason the ground machinery exists) is covered
-        by the oracle, not only hand assertions."""
-        sn = "gad_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total, "
-                "AVG(a) AS av, MIN(a) AS lo, MAX(a) AS hi FROM t",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            project = ["cnt", "total", "av", "lo", "hi"]
-            t_state = {}
-
-            def check(ctx):
-                base = oracle.oracle_filter_project(t_state, None, ["a"])
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    base, ["a"], [],
-                    [("cnt", "COUNT", None), ("total", "SUM", "a"), ("av", "AVG", "a"),
-                     ("lo", "MIN", "a"), ("hi", "MAX", "a")])
-                assert cols == project
-                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
-
-            check("empty-at-creation")
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 2), (2, 4), (3, 9)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [
-                {"pk": 1, "a": 2}, {"pk": 2, "a": 4}, {"pk": 3, "a": 9}])
-            check("after-insert")
-            client.execute_sql("UPDATE t SET a = 1 WHERE pk = 3", schema_name=sn)
-            oracle.apply_update(t_state, "pk", 3, {"a": 1})
-            check("after-update-min")
-            client.execute_sql("DELETE FROM t", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [1, 2, 3])
-            check("after-delete-all")
-            client.execute_sql("INSERT INTO t VALUES (4, 8)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [{"pk": 4, "a": 8}])
-            check("after-reinsert")
-        finally:
-            client.drop_schema(sn)
-
-    def test_replicated_source_empty_and_populated(self, client):
-        """A global aggregate over a WITH (replicated=true) source: the empty-source
-        ground row (the `i_am_owner` replicated disjunct + backfill empty-epoch fix)
-        must be exactly one row, weight 1 — not zero (disjunct dropped) and not N
-        (N-fold per-worker). Also checks a populated value."""
-        sn = "grep_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL) "
-                "WITH (replicated = true)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM t",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            rows = list(client.scan(vid))
-            assert len(rows) == 1, f"replicated empty-source ground must be ONE row, got {len(rows)}"
-            assert rows[0].weight == 1, f"ground weight must be 1, got {rows[0].weight}"
-            assert rows[0]["cnt"] == 0 and rows[0]["total"] is None
-            client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 7)", schema_name=sn)
-            r = self._one_row(client, vid)
-            assert r["cnt"] == 2 and r["total"] == 12, "replicated source not N-fold multiplied"
-        finally:
-            client.drop_schema(sn)
-
-    def test_replicated_nonaggregate_regression(self, client):
-        """A replicated non-aggregate (filter/map) view over an empty source still
-        backfills correctly with the new empty-epoch — no spurious row."""
-        sn = "grn_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL) "
-                "WITH (replicated = true)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT pk, a * 2 AS d FROM t WHERE a > 0",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            assert list(client.scan(vid)) == [], "no spurious row over empty source"
-            client.execute_sql("INSERT INTO t VALUES (1, 3)", schema_name=sn)
-            rows = {r["pk"]: r["d"] for r in client.scan(vid)}
-            assert rows == {1: 6}
-        finally:
-            client.drop_schema(sn)
-
-    def test_min_max_together_under_small_churn(self, client):
-        """`SELECT MIN(x), MAX(x)` in one view is NOT AVI-eligible (two aggregates)
-        and not all-linear, so it takes the whole-table replay path. Correctness
-        only — a small churn (insert → delete an extremum → empty → refill),
-        checked against the recompute oracle, exercises that O(table)/tick path."""
-        sn = "gmx_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT MIN(a) AS lo, MAX(a) AS hi FROM t",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            project = ["lo", "hi"]
-            t_state = {}
-
-            def check(ctx):
-                base = oracle.oracle_filter_project(t_state, None, ["a"])
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    base, ["a"], [], [("lo", "MIN", "a"), ("hi", "MAX", "a")])
-                assert cols == project
-                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
-
-            check("empty")
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 5), (2, 9), (3, 2)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [
-                {"pk": 1, "a": 5}, {"pk": 2, "a": 9}, {"pk": 3, "a": 2}])
-            check("after-insert")  # lo=2, hi=9
-            client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [2])
-            check("after-delete-max")  # hi recomputes to 5
-            client.execute_sql("DELETE FROM t", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [1, 3])
-            check("after-empty")  # one NULL/NULL ground row
-            client.execute_sql("INSERT INTO t VALUES (4, 7)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [{"pk": 4, "a": 7}])
-            check("after-refill")  # lo=hi=7
-        finally:
-            client.drop_schema(sn)
-
-    # ── Two-phase (distributable) all-linear global aggregate ──────────────────
-
-    @staticmethod
-    def _count_reduce_nodes(client, vid):
-        """REDUCE circuit nodes for view `vid`: 2 for the two-phase shape
-        (reduce_local + reduce_combine), 1 for the single funnel reduce."""
-        CIRCUIT_NODES_TAB = 11
-        return sum(
-            1 for r in client.scan(CIRCUIT_NODES_TAB)
-            if r["view_id"] == vid and r["opcode"] == Opcode.Reduce
-        )
-
-    def test_two_phase_all_linear_distributed(self, client):
-        """All-linear global aggregate (COUNT*/SUM/AVG/COUNT(col)) over a
-        partitioned table takes the two-phase path: a per-worker local partial,
-        then ≤N partials combined on V0's owner. Checked against the recompute
-        oracle across insert/update/delete churn spread over all partitions.
-        Integer arithmetic is bit-exact, so two-phase == funnel == oracle with no
-        tolerance. Run under GNITZ_WORKERS=1 and =4 — passing at both pins the
-        weight-exact partial split (the funnel==two_phase identity)."""
-        sn = "g2p_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total, "
-                "AVG(a) AS av, COUNT(b) AS nb FROM t",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            # Eligible → two-phase (2 REDUCE nodes), even at W=1.
-            assert self._count_reduce_nodes(client, vid) == 2, "all-linear integer global agg must be two-phase"
-            project = ["cnt", "total", "av", "nb"]
-            t_state = {}
-
-            def check(ctx):
-                base = oracle.oracle_filter_project(t_state, None, ["a", "b"])
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    base, ["a", "b"], [],
-                    [("cnt", "COUNT", None), ("total", "SUM", "a"),
-                     ("av", "AVG", "a"), ("nb", "COUNT", "b")])
-                assert cols == project
-                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
-
-            check("empty")
-            # 40 rows with varied PKs (spread across partitions); b NULL on a third.
-            rows = [{"pk": i, "a": (i * 7) % 50, "b": (None if i % 3 == 0 else i)} for i in range(1, 41)]
-            client.execute_sql(
-                "INSERT INTO t VALUES " + ", ".join(
-                    f"({r['pk']}, {r['a']}, {'NULL' if r['b'] is None else r['b']})" for r in rows),
-                schema_name=sn)
-            oracle.apply_insert(t_state, "pk", rows)
-            check("after-insert")
-            client.execute_sql("UPDATE t SET a = 100 WHERE pk = 5", schema_name=sn)
-            oracle.apply_update(t_state, "pk", 5, {"a": 100})
-            # Un-null a previously-NULL b (pk 9, 9 % 3 == 0) → COUNT(b) rises.
-            client.execute_sql("UPDATE t SET b = 9 WHERE pk = 9", schema_name=sn)
-            oracle.apply_update(t_state, "pk", 9, {"b": 9})
-            check("after-update")
-            del_pks = list(range(1, 41, 2))  # odd PKs, across partitions
-            client.execute_sql(
-                f"DELETE FROM t WHERE pk IN ({', '.join(map(str, del_pks))})", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", del_pks)
-            check("after-delete")
-            remaining = [r["pk"] for r in rows if r["pk"] not in del_pks]
-            client.execute_sql("DELETE FROM t", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", remaining)
-            check("after-delete-all")  # back to the ground row
-            client.execute_sql("INSERT INTO t VALUES (99, 3, 4)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [{"pk": 99, "a": 3, "b": 4}])
-            check("after-refill")
-        finally:
-            client.drop_schema(sn)
-
-    def test_two_phase_fresh_all_null_count_col_is_zero(self, client):
-        """Two-phase COUNT(col) over a non-empty source whose column was NEVER
-        non-null renders 0: each worker's partial COUNT_NON_NULL is untouched and
-        the combine SumZero of them grounds to 0. This is SQL-correct and now agrees
-        with the funnel/grouped reduce, which also render an untouched COUNT(col) as
-        0 (the empty_renders_zero family). The column MUST be fresh all-NULL —
-        inserting non-null rows then nulling them leaves a concrete 0 on every path
-        and tests nothing."""
-        sn = "g2n_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NULL)",
-                schema_name=sn)
-            client.execute_sql("CREATE VIEW v AS SELECT COUNT(a) AS c FROM t", schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            assert self._count_reduce_nodes(client, vid) == 2, "COUNT(col) global agg must be two-phase"
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, NULL), (2, NULL), (3, NULL), (4, NULL)", schema_name=sn)
-            assert self._one_row(client, vid)["c"] == 0, "fresh all-NULL COUNT(col) is 0 under two-phase"
-        finally:
-            client.drop_schema(sn)
-
-    def test_two_phase_eligibility_integer_vs_float(self, client):
-        """Eligibility predicate: integer SUM/AVG global aggregates compile to the
-        two-phase shape (2 REDUCE nodes); a float SUM — and AVG over a float, whose
-        SUM component is float — are excluded (non-associative IEEE addition would
-        make the result worker-count-dependent) and keep the single funnel reduce
-        (1 REDUCE node)."""
-        sn = "g2f_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, ai BIGINT NOT NULL, af DOUBLE NOT NULL)",
-                schema_name=sn)
-            client.execute_sql("CREATE VIEW vsi AS SELECT SUM(ai) AS s FROM t", schema_name=sn)
-            client.execute_sql("CREATE VIEW vai AS SELECT AVG(ai) AS s FROM t", schema_name=sn)
-            client.execute_sql("CREATE VIEW vsf AS SELECT SUM(af) AS s FROM t", schema_name=sn)
-            client.execute_sql("CREATE VIEW vaf AS SELECT AVG(af) AS s FROM t", schema_name=sn)
-            vsi = client.resolve_table(sn, "vsi")[0]
-            vai = client.resolve_table(sn, "vai")[0]
-            vsf = client.resolve_table(sn, "vsf")[0]
-            vaf = client.resolve_table(sn, "vaf")[0]
-            assert self._count_reduce_nodes(client, vsi) == 2, "integer SUM is two-phase"
-            assert self._count_reduce_nodes(client, vai) == 2, "AVG over integer is two-phase"
-            assert self._count_reduce_nodes(client, vsf) == 1, "float SUM keeps the funnel"
-            assert self._count_reduce_nodes(client, vaf) == 1, "AVG over float keeps the funnel"
-        finally:
-            client.drop_schema(sn)
-
-    def test_having_ungrouped_sum_null_is_not_zero(self, client):
-        """The ground row renders SUM = NULL over an empty (or fully retracted)
-        source even though the source column is NOT NULL — the shape that makes the
-        raw aggregate column nullable on an empty group set alone. Its finalize is a
-        bare column reference, so `HAVING SUM(x) = 0` is a plain Cmp with no
-        NULL-forcing instruction: NULL = 0 is UNKNOWN and must exclude the ground
-        row, where reading the raw column's zero bytes would admit it."""
-        sn = "ga_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW vw AS SELECT SUM(x) AS s FROM t HAVING SUM(x) = 0",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "vw")[0]
-
-            def positive_rows():
-                return list(client.scan(vid))
-
-            assert positive_rows() == [], "SUM over a never-populated source is NULL, not 0"
-
-            # Control: a genuine zero sum must pass, and read back as 0.
-            client.execute_sql("INSERT INTO t VALUES (1, 5), (2, -5)", schema_name=sn)
-            assert self._one_row(client, vid)["s"] == 0, "genuine SUM = 0 must pass HAVING"
-
-            # Fully retracted -> back to the NULL ground row -> excluded again.
-            client.execute_sql("DELETE FROM t", schema_name=sn)
-            assert positive_rows() == [], "fully retracted SUM is NULL, not 0"
-        finally:
-            client.drop_schema(sn)
-
-    def test_min_null_to_zero_transition_leaves_one_row(self, client):
-        """The global twin of the grouped stale-trace collapse: a NULL -> 0 MIN
-        transition changes only the null bit, so under a NOT NULL declaration the
-        `old @ -1` / `new @ +1` pair compares equal on the null-blind fixed-int
-        comparator and nets to zero, leaving the stale NULL row in the trace. The
-        damage surfaces on the *next* transition, whose retraction is byte-copied
-        from that stale row. MIN is not linear, so this is a single funnelled
-        reduce rather than the two-phase pair."""
-        sn = "ga_" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql("CREATE VIEW vw AS SELECT MIN(v) AS m FROM t", schema_name=sn)
-            vid = client.resolve_table(sn, "vw")[0]
-
-            client.execute_sql("INSERT INTO t VALUES (1, NULL)", schema_name=sn)
-            assert self._one_row(client, vid)["m"] is None
-
-            client.execute_sql("UPDATE t SET v = 0 WHERE pk = 1", schema_name=sn)
-            assert self._one_row(client, vid)["m"] == 0, "MIN must be 0"
-
-            client.execute_sql("UPDATE t SET v = 7 WHERE pk = 1", schema_name=sn)
-            assert self._one_row(client, vid)["m"] == 7, "MIN must be 7"
-        finally:
-            client.drop_schema(sn)
-
-
-class TestCombinedValueIndex:
-    """The combined AggValueIndex serves every MIN/MAX of a reduce (grouped or
-    global) from one table keyed `group ‖ ordinal ‖ av`, replacing the GroupIndex
-    whose PK-keyed trace re-read leaked foreign groups' rows into a group's
-    extremes. These exercise the planner→compiler→engine path end to end."""
-
-    def test_foreign_group_fanout_join(self, client):
-        """A fan-out join feeds `GROUP BY g` over a NON-unique-PK reduce input: one
-        `fact` row joins several `dim` rows carrying different `g`, so the same
-        join-output PK spans multiple groups — the exact shape the removed GI
-        over-read corrupted. The combined index isolates each group by its key
-        prefix, so each group's MIN/MAX excludes the others'. Run incrementally
-        (insert after the view exists) so the per-tick recompute path is taken."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE fact (fid BIGINT NOT NULL PRIMARY KEY)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE dim (did BIGINT NOT NULL PRIMARY KEY, fkey BIGINT NOT NULL, "
-                "g INT NOT NULL, x BIGINT NOT NULL, y BIGINT NOT NULL)",
-                schema_name=sn)
-            # j: one fact row fans out to many dim rows with different g, so the
-            # join-output PK (fact.fid) repeats across groups.
-            client.execute_sql(
-                "CREATE VIEW j AS SELECT fact.fid AS fid, dim.g AS g, dim.x AS x, dim.y AS y "
-                "FROM fact JOIN dim ON fact.fid = dim.fkey",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW agg AS SELECT g, MIN(x) AS lo, MAX(y) AS hi, COUNT(*) AS c "
-                "FROM j GROUP BY g",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "agg")[0]
-
-            client.execute_sql("INSERT INTO fact VALUES (1), (2)", schema_name=sn)
-            # fact 1 → g=10(x=5,y=100), g=20(x=7,y=200); fact 2 → g=10(x=3,y=50), g=20(x=9,y=300).
-            client.execute_sql(
-                "INSERT INTO dim VALUES "
-                "(1, 1, 10, 5, 100), (2, 1, 20, 7, 200), "
-                "(3, 2, 10, 3, 50), (4, 2, 20, 9, 300)",
-                schema_name=sn)
-
-            by_g = {r["g"]: r for r in client.scan(vid)}
-            assert (by_g[10]["lo"], by_g[10]["hi"], by_g[10]["c"]) == (3, 100, 2), (
-                f"group 10 extremes must exclude group 20's rows; got {by_g[10]}")
-            assert (by_g[20]["lo"], by_g[20]["hi"], by_g[20]["c"]) == (7, 300, 2), (
-                f"group 20 extremes must exclude group 10's rows; got {by_g[20]}")
-
-            # Incremental: delete fact 2's group-10 contributor (dim did=3, x=3).
-            # Group 10's MIN must recompute to 5 from the surviving group-10 row —
-            # never pulling group 20's smaller-keyed entries.
-            client.execute_sql("DELETE FROM dim WHERE did = 3", schema_name=sn)
-            by_g = {r["g"]: r for r in client.scan(vid)}
-            assert (by_g[10]["lo"], by_g[10]["hi"], by_g[10]["c"]) == (5, 100, 1), by_g[10]
-            assert (by_g[20]["lo"], by_g[20]["hi"], by_g[20]["c"]) == (7, 300, 2), by_g[20]
-        finally:
-            client.drop_schema(sn)
-
-    def test_foreign_group_fanout_join_backfill(self, client):
-        """Same fan-out foreign-group shape, but the grouped view is CREATEd over a
-        PRE-POPULATED join (combined-index backfill / from-scratch derivation),
-        not an incremental tick."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE fact (fid BIGINT NOT NULL PRIMARY KEY)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE dim (did BIGINT NOT NULL PRIMARY KEY, fkey BIGINT NOT NULL, "
-                "g INT NOT NULL, x BIGINT NOT NULL, y BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql("INSERT INTO fact VALUES (1), (2)", schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO dim VALUES "
-                "(1, 1, 10, 5, 100), (2, 1, 20, 7, 200), "
-                "(3, 2, 10, 3, 50), (4, 2, 20, 9, 300)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW j AS SELECT fact.fid AS fid, dim.g AS g, dim.x AS x, dim.y AS y "
-                "FROM fact JOIN dim ON fact.fid = dim.fkey",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW agg AS SELECT g, MIN(x) AS lo, MAX(y) AS hi, COUNT(*) AS c "
-                "FROM j GROUP BY g",
-                schema_name=sn)
-            vid = client.resolve_table(sn, "agg")[0]
-            by_g = {r["g"]: r for r in client.scan(vid)}
-            assert (by_g[10]["lo"], by_g[10]["hi"], by_g[10]["c"]) == (3, 100, 2), by_g[10]
-            assert (by_g[20]["lo"], by_g[20]["hi"], by_g[20]["c"]) == (7, 300, 2), by_g[20]
-        finally:
-            client.drop_schema(sn)
-
-    def test_lone_nullable_min_all_null_group(self, client):
-        """A lone `SELECT g, MIN(a) GROUP BY g` over a NULLABLE `a` — no user
-        COUNT(*). The planner appends a hidden cardinality COUNT and the combined
-        index carries the nullable MIN, so an all-NULL group is PRESENT with
-        MIN=NULL (matching the differential oracle), not silently dropped. Checked
-        from-scratch after each epoch: a new all-NULL group appears; a mixed
-        group's last non-NULL retraction leaves it surviving as NULL; retracting
-        the remaining NULL row removes it."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, a BIGINT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT g, MIN(a) AS lo FROM t GROUP BY g", schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            project = ["g", "lo"]
-            t_state = {}
-
-            def check(ctx):
-                base = oracle.oracle_filter_project(t_state, None, ["g", "a"])
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    base, ["g", "a"], ["g"], [("lo", "MIN", "a")])
-                assert cols == project
-                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
-
-            # g=10 mixed {a=5, a=NULL}; g=20 entirely all-NULL {a=NULL}.
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL), (3, 20, NULL)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [
-                {"pk": 1, "g": 10, "a": 5}, {"pk": 2, "g": 10, "a": None},
-                {"pk": 3, "g": 20, "a": None}])
-            check("insert: all-NULL group 20 must appear as (20, NULL)")
-
-            # Retract g=10's only non-NULL → survives via the NULL row as (10, NULL).
-            client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [1])
-            check("retract last non-NULL: group 10 survives as (10, NULL)")
-
-            # Retract g=10's remaining NULL row → group 10 disappears.
-            client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [2])
-            check("retract remaining NULL: group 10 gone")
-        finally:
-            client.drop_schema(sn)
-
-    def test_lone_min_nonnull_combined_index(self, client):
-        """Non-nullable lone `MIN(a) GROUP BY g` over the combined-index common
-        path: insert, retract the current MIN (forces a post-state index re-seek),
-        re-insert below. Differential oracle each epoch. Runs at the suite's worker
-        count (W=4 under `make e2e`), pinning the path byte-for-byte correct."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, a BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT g, MIN(a) AS lo FROM t GROUP BY g", schema_name=sn)
-            vid = client.resolve_table(sn, "v")[0]
-            project = ["g", "lo"]
-            t_state = {}
-
-            def check(ctx):
-                base = oracle.oracle_filter_project(t_state, None, ["g", "a"])
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    base, ["g", "a"], ["g"], [("lo", "MIN", "a")])
-                assert cols == project
-                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
-
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10, 5), (2, 10, 3), (3, 10, 9), (4, 20, 7)",
-                schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [
-                {"pk": 1, "g": 10, "a": 5}, {"pk": 2, "g": 10, "a": 3},
-                {"pk": 3, "g": 10, "a": 9}, {"pk": 4, "g": 20, "a": 7}])
-            check("insert")
-
-            # Retract g=10's current MIN (a=3) → recompute to 5 from the index.
-            client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [2])
-            check("retract-min")
-
-            # Insert below the current MIN → drops to 1.
-            client.execute_sql("INSERT INTO t VALUES (5, 10, 1)", schema_name=sn)
-            oracle.apply_insert(t_state, "pk", [{"pk": 5, "g": 10, "a": 1}])
-            check("reinsert-lower")
-        finally:
-            client.drop_schema(sn)
-
-
-class TestFinalizeMapShapes:
-    """The post-reduce finalize (AVG, nullable-SUM) is a columnar MAP over the raw
-    reduce output. Two of its column shapes are exercised nowhere else:
-
-      * a **German-string group column** copied through the finalize MAP — short
-        (inline) and long (heap-backed) values must survive the blob relocate /
-        passthrough, not just the raw reduce emit;
-      * a **compound synthetic `_group_pk`** (multi-column GROUP BY) under a
-        finalize, whose PK region the MAP inherits verbatim.
-
-    Both are checked against the from-scratch oracle across insert, retraction,
-    and group-emptying ticks."""
-
-    def test_string_group_by_avg_and_nullable_sum(self, client):
-        """GROUP BY a TEXT column with AVG + a SUM over a NULLABLE column. The
-        finalize MAP copies the string group column (relocating its blob heap) and
-        computes AVG / nullfill-SUM in the same pass. Mixes short inline strings
-        with strings past the 12-byte German-string inline limit so both the inline
-        and heap-backed cells cross the finalize."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  s TEXT NOT NULL,"
-                "  x BIGINT NOT NULL,"
-                "  y BIGINT"          # nullable → NullfillSum finalize
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT s, AVG(x) AS avg_x, SUM(y) AS sum_y "
-                "FROM t GROUP BY s",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            project = ["s", "avg_x", "sum_y"]
-            t_state = {}
-
-            def check(ctx):
-                base = oracle.oracle_filter_project(t_state, None, ["s", "x", "y"])
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    base, ["s", "x", "y"], ["s"],
-                    [("avg_x", "AVG", "x"), ("sum_y", "SUM", "y")])
-                assert cols == project
-                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
-
-            # "ab" is inline (≤12 bytes); the other two exceed it and live on the
-            # blob heap. Group "long-heap-backed-key-2" is all-NULL in y → SUM NULL.
-            short, long1, long2 = "ab", "long-heap-backed-key-1", "long-heap-backed-key-2"
-            rows = [
-                {"pk": 1, "s": short, "x": 2, "y": 10},
-                {"pk": 2, "s": short, "x": 5, "y": None},
-                {"pk": 3, "s": long1, "x": 7, "y": 3},
-                {"pk": 4, "s": long1, "x": 8, "y": 4},
-                {"pk": 5, "s": long2, "x": 9, "y": None},
-            ]
-            client.execute_sql(
-                "INSERT INTO t VALUES "
-                + ", ".join(
-                    f"({r['pk']}, '{r['s']}', {r['x']}, "
-                    f"{'NULL' if r['y'] is None else r['y']})"
-                    for r in rows
-                ),
-                schema_name=sn,
-            )
-            oracle.apply_insert(t_state, "pk", rows)
-            check("after-insert")
-
-            # Retract one row of the inline group: AVG(x) 3.5 → 2.0, SUM(y) stays 10.
-            client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [2])
-            check("after-retract-inline-group")
-
-            # Retract the last non-NULL y of long1 → its SUM(y) must become NULL,
-            # while AVG(x) recomputes over the survivor.
-            client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [3])
-            check("after-retract-last-nonnull-y")
-
-            # Empty the all-NULL heap-backed group entirely → it must vanish.
-            client.execute_sql("DELETE FROM t WHERE pk = 5", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [5])
-            check("after-empty-long2")
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-    def test_multi_col_group_by_avg(self, client):
-        """GROUP BY a, b with AVG: the compound group key folds into a synthetic
-        `_group_pk` the finalize MAP inherits verbatim, and both group-exemplar
-        columns are copied through it into payload slots."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE t ("
-                "  pk BIGINT NOT NULL PRIMARY KEY,"
-                "  a BIGINT NOT NULL,"
-                "  b BIGINT NOT NULL,"
-                "  val BIGINT NOT NULL"
-                ")",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a, b, COUNT(*) AS n, AVG(val) AS av "
-                "FROM t GROUP BY a, b",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            project = ["a", "b", "n", "av"]
-            t_state = {}
-
-            def check(ctx):
-                base = oracle.oracle_filter_project(t_state, None, ["a", "b", "val"])
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    base, ["a", "b", "val"], ["a", "b"],
-                    [("n", "COUNT", None), ("av", "AVG", "val")])
-                assert cols == project
-                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
-
-            # 12 distinct (a, b) keys, 2 rows each → AVG is an exact .0 or .5.
-            rows = []
-            pk = 0
-            for a in range(3):
-                for b in range(4):
-                    for k in range(2):
-                        pk += 1
-                        rows.append({"pk": pk, "a": a, "b": b, "val": a * 10 + b + k})
-            client.execute_sql(
-                "INSERT INTO t VALUES "
-                + ", ".join(f"({r['pk']}, {r['a']}, {r['b']}, {r['val']})" for r in rows),
-                schema_name=sn,
-            )
-            oracle.apply_insert(t_state, "pk", rows)
-            check("after-insert")
-
-            # Retract one row of (a=1, b=2): its AVG shifts, others unchanged.
-            target = next(r for r in rows if r["a"] == 1 and r["b"] == 2)
-            client.execute_sql(
-                f"DELETE FROM t WHERE pk = {target['pk']}", schema_name=sn)
-            oracle.apply_delete(t_state, "pk", [target["pk"]])
-            check("after-retract-one")
-
-            # Empty (a=0, b=0) entirely → that group must vanish.
-            gone = [r["pk"] for r in rows if r["a"] == 0 and r["b"] == 0]
-            client.execute_sql(
-                f"DELETE FROM t WHERE pk IN ({', '.join(str(p) for p in gone)})",
-                schema_name=sn,
-            )
-            oracle.apply_delete(t_state, "pk", gone)
-            check("after-empty-group")
-
-            client.execute_sql("DROP VIEW v", schema_name=sn)
-            client.execute_sql("DROP TABLE t", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
-
-
-class TestDistinctAggregates:
-    """`COUNT(DISTINCT x)` and friends: the plain aggregate over a hidden
-    `DISTINCT (group cols, x)` segment. Weights are the observable, so the churn
-    case is checked against the oracle's weight-multiset."""
-
-    def _create(self, client, sn):
-        client.execute_sql(
-            "CREATE TABLE ev ("
-            "  pk BIGINT NOT NULL PRIMARY KEY,"
-            "  k BIGINT NOT NULL,"
-            "  u BIGINT NULL,"
-            "  s TEXT NOT NULL"
-            ")",
-            schema_name=sn,
-        )
-
-    _ROWS = [
-        {"pk": 1, "k": 10, "u": 7, "s": "a"}, {"pk": 2, "k": 10, "u": 7, "s": "b"},
-        {"pk": 3, "k": 10, "u": 8, "s": "a"}, {"pk": 4, "k": 20, "u": 7, "s": "a"},
-        {"pk": 5, "k": 20, "u": None, "s": "a"}, {"pk": 6, "k": 30, "u": None, "s": "c"},
+                vals_sql.append(f"({pk}, {g}, {val})")
+    client.execute_sql("INSERT INTO t VALUES " + ", ".join(vals_sql), schema_name=sn)
+
+    def expect(live):
+        assert bag(scanned(client, sn, "v"), "k", "lo", "hi") == {
+            (g, min(vs), max(vs)): 1 for g, vs in live.items()}
+
+    expect(groups)
+
+    # Retract every carrier of group 10's extremes; both must fall back to the
+    # next value at the source width.
+    trimmed = dict(groups)
+    for extreme in (max(groups[10]), min(groups[10])):
+        client.execute_sql(f"DELETE FROM t WHERE k = 10 AND v = {extreme}", schema_name=sn)
+        trimmed[10] = [v for v in trimmed[10] if v != extreme]
+        expect(trimmed)
+
+
+def test_an_f32_min_max_widens_to_f64_and_reads_back_verbatim(client, schema_name):
+    """MIN/MAX over an F32 column widen to F64: the output column is 8 bytes
+    holding `f64::to_bits`, so the width-gated read-back must take it verbatim
+    instead of mis-decoding it as an F32 bit pattern. Many groups plus an
+    incremental new extremum exercise the gather combine and its retraction on
+    that 8-byte-but-float-source column."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v FLOAT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT k, MIN(v) AS lo, MAX(v) AS hi FROM t GROUP BY k",
+        schema_name=sn)
+    _vid, vschema = client.resolve_table(sn, "v")
+    assert _col_type(vschema, "lo") == gnitz.TypeCode.F64
+    assert _col_type(vschema, "hi") == gnitz.TypeCode.F64
+
+    # F32-exact values (dyadic, small), so the F32 → F64 widening is exact and the
+    # expectation can compare bit-for-bit through `bag`.
+    pk, vals_sql, want = 0, [], {}
+    for g in range(8):
+        vals = [-2.25 + g, 1.5 + g, 4.0 + g, 0.5 + g]
+        for _rep in range(3):
+            for val in vals:
+                pk += 1
+                vals_sql.append(f"({pk}, {g}, {val})")
+        want[(g, min(vals), max(vals))] = 1
+    client.execute_sql("INSERT INTO t VALUES " + ", ".join(vals_sql), schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "k", "lo", "hi") == want
+
+    client.execute_sql(f"INSERT INTO t VALUES ({pk + 1}, 0, 99.5)", schema_name=sn)
+    want.pop((0, -2.25, 4.0))
+    want[(0, -2.25, 99.5)] = 1
+    assert bag(scanned(client, sn, "v"), "k", "lo", "hi") == want
+
+
+def test_a_narrow_min_max_is_read_at_its_own_width_by_having_and_the_projection(
+        client, schema_name):
+    """HAVING and the projected column both read the aggregate through the
+    planner's `reduce_schema` mirror. A SMALLINT MAX must filter and project as
+    SMALLINT — were the mirror still saying BIGINT, the finalize copy and the
+    HAVING bind would each use the wrong width."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v SMALLINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT k, MAX(v) AS m FROM t GROUP BY k HAVING MAX(v) > 1000",
+        schema_name=sn)
+    _vid, vschema = client.resolve_table(sn, "v")
+    assert _col_type(vschema, "m") == gnitz.TypeCode.I16
+
+    # Groups straddling the threshold, all within I16: k=10 MAX 900 excluded,
+    # k=20 MAX 1500 kept, k=30 MAX 30000 kept, k=40 MAX exactly 1000 excluded.
+    client.execute_sql(
+        "INSERT INTO t VALUES (1,10,900),(2,10,500),(3,10,-100),(4,20,1500),(5,20,200),"
+        "(6,20,-5),(7,30,30000),(8,30,123),(9,30,-32768),(10,40,1000),(11,40,0),(12,40,7)",
+        schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "k", "m") == {(20, 1500): 1, (30, 30000): 1}
+
+
+# ── HAVING ────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("pred,expected", [
+    ("COUNT(*) > 1", {10, 30}),
+    ("COUNT(*) = 1", {20}),
+    ("NOT (COUNT(*) = 1)", {10, 30}),
+    ("SUM(amount) * 2 > 10", {10, 30}),
+    ("SUM(amount) BETWEEN 5 AND 20", {10}),
+])
+def test_a_having_predicate_binds_the_whole_expression_grammar(
+        client, schema_name, pred, expected):
+    """HAVING is a full expression over the grouped relation, not a comparison
+    against one aggregate: `Mul`, `NOT` and the `BETWEEN` desugar all bind here,
+    and an aggregate buried inside one of them must still be materialised in the
+    reduce — none of these appear in the SELECT list."""
+    sn = schema_name
+    counts = {10: 2, 20: 1, 30: 3}
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, category BIGINT NOT NULL, "
+        "amount BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        f"CREATE VIEW v AS SELECT category, COUNT(*) AS cnt FROM t GROUP BY category "
+        f"HAVING {pred}", schema_name=sn)
+    # SUM per category: 10 → 8, 20 → 2, 30 → 102.
+    client.execute_sql(
+        "INSERT INTO t VALUES (1, 10, 4), (2, 10, 4), (3, 20, 2), (4, 30, 100), "
+        "(5, 30, 1), (6, 30, 1)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "category", "cnt") == {
+        (c, counts[c]): 1 for c in expected}
+
+
+@pytest.mark.parametrize("having,before,after", [
+    ("SUM(v) IS NULL", {20}, {10, 20}),
+    ("SUM(v) = 0", {30, 40}, {30, 40}),
+    ("MIN(v) IS NULL", {20}, {10, 20}),
+    ("MIN(v) IS NOT NULL", {10, 30, 40}, {30, 40}),
+    ("MIN(v) = 0", {30}, {30}),
+    ("MAX(v) <= 10", {10, 30, 40}, {30, 40}),
+    ("MIN(t.v) > 3", {10}, set()),
+    ("(k + SUM(v)) IS NULL", {20}, {10, 20}),
+    ("COUNT(*) IS NOT NULL", {10, 20, 30, 40}, {10, 20, 30, 40}),
+    ("COUNT(*) IS NULL", set(), set()),
+])
+def test_a_null_aggregate_in_having_is_unknown_not_zero(
+        client, schema_name, having, before, after):
+    """A raw aggregate column renders NULL as zero bytes under a set null bit, so
+    every one of these predicates must read the null bit rather than the payload:
+    a NULL aggregate compared to 0 is UNKNOWN and admits nothing, an IS NULL test
+    admits exactly the groups with no non-NULL contributor, and COUNT(*) — which
+    is never NULL — const-folds. None of these aggregates is in the SELECT list,
+    so the reduce column (and, for SUM, its hidden COUNT_NON_NULL companion) is
+    materialised from the predicate alone. Retracting k=10's only value nets its
+    raw SUM back to zero, which is what separates the gate from the payload.
+
+    k=10 {5, NULL}, k=20 {NULL}, k=30 {0}, k=40 {5, -5} — so a genuine zero sum,
+    a genuine zero extremum and an all-NULL group are all present at once.
+    """
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, v BIGINT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        f"CREATE VIEW v AS SELECT k, COUNT(*) AS c FROM t GROUP BY k HAVING {having}",
+        schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO t VALUES (1, 10, 5), (2, 10, NULL), (3, 20, NULL), (4, 30, 0), "
+        "(5, 40, 5), (6, 40, -5)", schema_name=sn)
+    counts = {10: 2, 20: 1, 30: 1, 40: 2}
+    assert bag(scanned(client, sn, "v"), "k", "c") == {(k, counts[k]): 1 for k in before}
+
+    client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
+    counts[10] = 1
+    assert bag(scanned(client, sn, "v"), "k", "c") == {(k, counts[k]): 1 for k in after}
+
+
+def test_having_names_the_grouped_relation_not_the_projection(client, schema_name):
+    """HAVING binds before projection: it may name a GROUP BY column the SELECT
+    list omits, must use a group column's source name even where SELECT aliases
+    it, and may test an aggregate the SELECT list never asks for."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW unprojected AS SELECT a, COUNT(*) AS c FROM t GROUP BY a, b HAVING b > 5",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW aliased AS SELECT a AS x, COUNT(*) AS c FROM t GROUP BY a HAVING a > 5",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW unprojected_agg AS SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1",
+        schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO t VALUES (1, 1, 3), (2, 1, 9), (3, 2, 7), (4, 10, 1), (5, 10, 1), "
+        "(6, 20, 1)", schema_name=sn)
+    # (a, b) groups: (1,3) (1,9) (2,7) (10,1)×2 (20,1) — b > 5 keeps (1,9) and (2,7).
+    assert bag(scanned(client, sn, "unprojected"), "a", "c") == {(1, 1): 1, (2, 1): 1}
+    assert bag(scanned(client, sn, "aliased"), "x", "c") == {(10, 2): 1, (20, 1): 1}
+    assert bag(scanned(client, sn, "unprojected_agg"), "a") == {(1,): 1, (10,): 1}
+
+
+def test_a_null_test_on_a_pk_group_column_const_folds(client, schema_name):
+    """A PK column is non-nullable, so a HAVING null test over one folds at plan
+    time — IS NOT NULL passes every group, IS NULL none. This covers a single
+    column PK and a compound one, whose group sets are recognised by separate
+    arms; emitting the null test against the PK region instead would trip
+    `eval_is_null`'s debug assertion on the debug server this suite runs."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t1 (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE t2 (a BIGINT NOT NULL, b BIGINT NOT NULL, PRIMARY KEY (a, b))",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW s_pass AS SELECT pk, COUNT(*) AS c FROM t1 GROUP BY pk HAVING pk IS NOT NULL",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW s_none AS SELECT pk, COUNT(*) AS c FROM t1 GROUP BY pk HAVING pk IS NULL",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW c_pass AS SELECT a, b, COUNT(*) AS c FROM t2 GROUP BY a, b "
+        "HAVING a IS NOT NULL", schema_name=sn)
+    client.execute_sql("INSERT INTO t1 VALUES (1, 100), (2, 200)", schema_name=sn)
+    client.execute_sql("INSERT INTO t2 VALUES (5, 6), (5, 7)", schema_name=sn)
+
+    assert bag(scanned(client, sn, "s_pass"), "pk", "c") == {(1, 1): 1, (2, 1): 1}
+    assert bag(scanned(client, sn, "s_none"), "pk", "c") == {}
+    assert bag(scanned(client, sn, "c_pass"), "a", "b", "c") == {(5, 6, 1): 1, (5, 7, 1): 1}
+
+
+# ── The ungrouped (global) aggregate ──────────────────────────────────────────
+
+
+def test_a_global_aggregate_tracks_the_ground_row_through_churn(client, schema_name):
+    """One logical group at the synthetic constant PK V0. SQL scalar-aggregate
+    semantics require exactly one output row even over an empty or fully-retracted
+    source, so the churn runs empty → insert → update → delete-all → refill and
+    the oracle carries the empty-source result the ground machinery exists for."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total, AVG(a) AS av, "
+        "MIN(a) AS lo, MAX(a) AS hi FROM t", schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
+    state = {}
+    check = _oracle_check(client, vid, state, ["a"], [], [
+        ("cnt", "COUNT", None), ("total", "SUM", "a"), ("av", "AVG", "a"),
+        ("lo", "MIN", "a"), ("hi", "MAX", "a")])
+
+    check("empty-at-creation")
+    client.execute_sql("INSERT INTO t VALUES (1, 2), (2, 4), (3, 9)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [{"pk": 1, "a": 2}, {"pk": 2, "a": 4}, {"pk": 3, "a": 9}])
+    check("after-insert")
+    client.execute_sql("UPDATE t SET a = 1 WHERE pk = 3", schema_name=sn)
+    oracle.apply_update(state, "pk", 3, {"a": 1})
+    check("after-update-min")
+    client.execute_sql("DELETE FROM t", schema_name=sn)
+    oracle.apply_delete(state, "pk", [1, 2, 3])
+    check("after-delete-all")
+    client.execute_sql("INSERT INTO t VALUES (4, 8)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [{"pk": 4, "a": 8}])
+    check("after-reinsert")
+
+
+def test_a_lone_global_aggregate_grounds_over_empty_and_all_null_sources(client, schema_name):
+    """A global reduce carrying no COUNT(*) still emits exactly one row. Over an
+    empty source, and over a non-empty source whose every value is NULL, every
+    accumulator is untouched, the cardinality gate sheds the computed row and the
+    ground supplies COUNT = 0 with every other aggregate NULL — never a concrete
+    0 for SUM, and never a negative COUNT."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NULL, b BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW va AS SELECT COUNT(a) AS c, SUM(a) AS s, AVG(a) AS av, MIN(a) AS mn, "
+        "MAX(a) AS mx FROM t", schema_name=sn)
+    # A non-nullable lone SUM carries no companion column at all.
+    client.execute_sql("CREATE VIEW vb AS SELECT SUM(b) AS total FROM t", schema_name=sn)
+
+    def expect(a_row, b_total):
+        assert bag(scanned(client, sn, "va"), "c", "s", "av", "mn", "mx") == {a_row: 1}
+        assert bag(scanned(client, sn, "vb"), "total") == {(b_total,): 1}
+
+    expect((0, None, None, None, None), None)
+    client.execute_sql("INSERT INTO t VALUES (1, NULL, 3), (2, NULL, 4)", schema_name=sn)
+    expect((0, None, None, None, None), 7)
+    client.execute_sql("INSERT INTO t VALUES (3, 7, 1)", schema_name=sn)
+    expect((1, 7, 7.0, 7, 7), 8)
+    client.execute_sql("DELETE FROM t", schema_name=sn)
+    expect((0, None, None, None, None), None)
+
+
+def test_a_global_min_max_pair_replays_the_whole_table(client, schema_name):
+    """`SELECT MIN(x), MAX(x)` in one view is neither value-index-eligible (two
+    aggregates) nor all-linear, so it takes the whole-table replay path. The
+    churn — insert, delete an extremum, empty, refill — checks that path against
+    the recompute oracle."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql("CREATE VIEW v AS SELECT MIN(a) AS lo, MAX(a) AS hi FROM t", schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
+    state = {}
+    check = _oracle_check(client, vid, state, ["a"], [], [("lo", "MIN", "a"), ("hi", "MAX", "a")])
+
+    check("empty")
+    client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 9), (3, 2)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [{"pk": 1, "a": 5}, {"pk": 2, "a": 9}, {"pk": 3, "a": 2}])
+    check("after-insert")
+    client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
+    oracle.apply_delete(state, "pk", [2])
+    check("after-delete-max")
+    client.execute_sql("DELETE FROM t", schema_name=sn)
+    oracle.apply_delete(state, "pk", [1, 3])
+    check("after-empty")
+    client.execute_sql("INSERT INTO t VALUES (4, 7)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [{"pk": 4, "a": 7}])
+    check("after-refill")
+
+
+def test_having_over_a_global_aggregate_filters_the_ground_row(client, schema_name):
+    """HAVING is a post-reduce filter, so the ground row is in the trace at V0 and
+    the predicate decides whether the view shows it. `SUM(x) = 0` is the sharp
+    case: the ground renders SUM as NULL even over a NOT NULL source column, its
+    finalize is a bare column reference, and NULL = 0 is UNKNOWN — reading the raw
+    column's zero bytes instead would admit the ground row as a genuine zero."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW vc AS SELECT COUNT(*) AS cnt FROM t HAVING COUNT(*) > 2", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW vs AS SELECT SUM(x) AS s FROM t HAVING SUM(x) = 0", schema_name=sn)
+
+    def expect(cnt, total):
+        assert bag(scanned(client, sn, "vc"), "cnt") == ({} if cnt is None else {(cnt,): 1})
+        assert bag(scanned(client, sn, "vs"), "s") == ({} if total is None else {(total,): 1})
+
+    expect(None, None)
+    client.execute_sql("INSERT INTO t VALUES (1, 5), (2, -5)", schema_name=sn)
+    expect(None, 0)  # 2 is not > 2; the sum is a genuine zero
+    client.execute_sql("INSERT INTO t VALUES (3, 0)", schema_name=sn)
+    expect(3, 0)
+    client.execute_sql("DELETE FROM t", schema_name=sn)
+    expect(None, None)
+
+
+def test_a_computed_projection_keeps_the_ground_row(client, schema_name):
+    """A global aggregate may be computed over on the way in (`SUM(a * 2)`), on
+    the way out (`COUNT(*) + 1`) and beside a literal. The ground machinery is
+    what these could break, so each is read over the empty source, filled, and
+    emptied again: exactly one row throughout, never a ghost."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT COUNT(*) + 1 AS c, SUM(a * 2) AS s, 'x' AS lit FROM t",
+        schema_name=sn)
+
+    def expect(row):
+        assert bag(scanned(client, sn, "v"), "c", "s", "lit") == {row: 1}
+
+    expect((1, None, "x"))
+    client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 7)", schema_name=sn)
+    expect((3, 24, "x"))
+    client.execute_sql("DELETE FROM t", schema_name=sn)
+    expect((1, None, "x"))
+
+
+def test_a_replicated_source_grounds_exactly_once(client, schema_name):
+    """Every worker holds every row of a replicated source, so the ground row is
+    where a backfill over an empty source can go wrong in both directions: drop
+    the owner disjunct and it emits none, forget the disjunct is exclusive and it
+    emits one per worker. The non-aggregate view alongside is the control — the
+    same empty backfill must produce no row at all there."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL) "
+        "WITH (replicated = true)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total FROM t", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW f AS SELECT pk, a * 2 AS d FROM t WHERE a > 0", schema_name=sn)
+
+    assert bag(scanned(client, sn, "v"), "cnt", "total") == {(0, None): 1}
+    assert bag(scanned(client, sn, "f"), "pk", "d") == {}
+    client.execute_sql("INSERT INTO t VALUES (1, 5), (2, 7)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "cnt", "total") == {(2, 12): 1}
+    assert bag(scanned(client, sn, "f"), "pk", "d") == {(1, 10): 1, (2, 14): 1}
+
+
+def _count_reduce_nodes(client, vid):
+    """REDUCE circuit nodes of view `vid`: 2 for the two-phase shape
+    (reduce_local + reduce_combine), 1 for the single funnel reduce."""
+    CIRCUIT_NODES_TAB = 11
+    return sum(1 for r in client.scan(CIRCUIT_NODES_TAB)
+               if r["view_id"] == vid and r["opcode"] == Opcode.Reduce)
+
+
+def test_an_all_linear_global_aggregate_compiles_to_a_two_phase_reduce(client, schema_name):
+    """An all-linear global aggregate over a partitioned table takes the two-phase
+    path — a per-worker local partial, then at most N partials combined on V0's
+    owner — and its answer must equal the funnel's. Integer arithmetic is
+    bit-exact, so two-phase == funnel == oracle with no tolerance, and passing at
+    every worker count is what pins the weight-exact partial split."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, b BIGINT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT COUNT(*) AS cnt, SUM(a) AS total, AVG(a) AS av, "
+        "COUNT(b) AS nb FROM t", schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
+    assert _count_reduce_nodes(client, vid) == 2, "all-linear integer global agg must be two-phase"
+    state = {}
+    check = _oracle_check(client, vid, state, ["a", "b"], [], [
+        ("cnt", "COUNT", None), ("total", "SUM", "a"), ("av", "AVG", "a"), ("nb", "COUNT", "b")])
+
+    check("empty")
+    rows = [{"pk": i, "a": (i * 7) % 50, "b": (None if i % 3 == 0 else i)} for i in range(1, 41)]
+    client.execute_sql(
+        "INSERT INTO t VALUES " + ", ".join(
+            f"({r['pk']}, {r['a']}, {'NULL' if r['b'] is None else r['b']})" for r in rows),
+        schema_name=sn)
+    oracle.apply_insert(state, "pk", rows)
+    check("after-insert")
+
+    client.execute_sql("UPDATE t SET a = 100 WHERE pk = 5", schema_name=sn)
+    oracle.apply_update(state, "pk", 5, {"a": 100})
+    client.execute_sql("UPDATE t SET b = 9 WHERE pk = 9", schema_name=sn)   # was NULL
+    oracle.apply_update(state, "pk", 9, {"b": 9})
+    check("after-update")
+
+    del_pks = list(range(1, 41, 2))   # odd PKs, across partitions
+    client.execute_sql(
+        f"DELETE FROM t WHERE pk IN ({', '.join(map(str, del_pks))})", schema_name=sn)
+    oracle.apply_delete(state, "pk", del_pks)
+    check("after-delete")
+
+    remaining = [r["pk"] for r in rows if r["pk"] not in del_pks]
+    client.execute_sql("DELETE FROM t", schema_name=sn)
+    oracle.apply_delete(state, "pk", remaining)
+    check("after-delete-all")
+
+    client.execute_sql("INSERT INTO t VALUES (99, 3, 4)", schema_name=sn)
+    oracle.apply_insert(state, "pk", [{"pk": 99, "a": 3, "b": 4}])
+    check("after-refill")
+
+
+def test_a_two_phase_count_over_a_fresh_all_null_column_is_zero(client, schema_name):
+    """Every worker's partial COUNT_NON_NULL is untouched and the combine's
+    SumZero of them grounds to 0, agreeing with the funnel and grouped reduce. The
+    column must be *fresh* all-NULL: inserting non-null rows and then nulling them
+    leaves a concrete 0 on every path and pins nothing."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NULL)", schema_name=sn)
+    client.execute_sql("CREATE VIEW v AS SELECT COUNT(a) AS c FROM t", schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
+    assert _count_reduce_nodes(client, vid) == 2, "COUNT(col) global agg must be two-phase"
+    client.execute_sql(
+        "INSERT INTO t VALUES (1, NULL), (2, NULL), (3, NULL), (4, NULL)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "c") == {(0,): 1}
+
+
+def test_a_float_sum_is_excluded_from_the_two_phase_reduce(client, schema_name):
+    """Two-phase eligibility is decided per aggregate type: an integer SUM or AVG
+    distributes, while a float SUM — and an AVG whose SUM component is float — keep
+    the single funnel reduce, because non-associative IEEE addition would make the
+    answer depend on the worker count."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, ai BIGINT NOT NULL, "
+        "af DOUBLE NOT NULL)", schema_name=sn)
+    for name, expr in (("vsi", "SUM(ai)"), ("vai", "AVG(ai)"),
+                       ("vsf", "SUM(af)"), ("vaf", "AVG(af)")):
+        client.execute_sql(f"CREATE VIEW {name} AS SELECT {expr} AS s FROM t", schema_name=sn)
+    nodes = {name: _count_reduce_nodes(client, client.resolve_table(sn, name)[0])
+             for name in ("vsi", "vai", "vsf", "vaf")}
+    assert nodes == {"vsi": 2, "vai": 2, "vsf": 1, "vaf": 1}
+
+
+# ── The finalize map over the raw reduce output ───────────────────────────────
+
+
+def test_a_string_group_column_survives_the_finalize_map(client, schema_name):
+    """AVG and a nullable SUM make the reduce output pass through a columnar MAP,
+    which must copy the TEXT group column — relocating its blob heap — in the same
+    pass. Short values stay in the inline German-string cell; the two long ones do
+    not, so both cell shapes cross the finalize."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, s TEXT NOT NULL, "
+        "x BIGINT NOT NULL, y BIGINT)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT s, AVG(x) AS avg_x, SUM(y) AS sum_y FROM t GROUP BY s",
+        schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
+    state = {}
+    check = _oracle_check(client, vid, state, ["s", "x", "y"], ["s"],
+                          [("avg_x", "AVG", "x"), ("sum_y", "SUM", "y")])
+
+    short, long1, long2 = "ab", "long-heap-backed-key-1", "long-heap-backed-key-2"
+    rows = [
+        {"pk": 1, "s": short, "x": 2, "y": 10},
+        {"pk": 2, "s": short, "x": 5, "y": None},
+        {"pk": 3, "s": long1, "x": 7, "y": 3},
+        {"pk": 4, "s": long1, "x": 8, "y": 4},
+        {"pk": 5, "s": long2, "x": 9, "y": None},
     ]
+    client.execute_sql(
+        "INSERT INTO t VALUES " + ", ".join(
+            f"({r['pk']}, '{r['s']}', {r['x']}, {'NULL' if r['y'] is None else r['y']})"
+            for r in rows), schema_name=sn)
+    oracle.apply_insert(state, "pk", rows)
+    check("after-insert")
 
-    def _setup(self, client, sn):
-        """The table plus `_ROWS`, mirrored into the oracle state it returns."""
-        self._create(client, sn)
+    client.execute_sql("DELETE FROM t WHERE pk = 2", schema_name=sn)
+    oracle.apply_delete(state, "pk", [2])
+    check("after-retract-inline-group")
+
+    # long1 loses its last non-NULL y: SUM(y) must become NULL while AVG(x)
+    # recomputes over the survivor.
+    client.execute_sql("DELETE FROM t WHERE pk = 3", schema_name=sn)
+    oracle.apply_delete(state, "pk", [3])
+    check("after-retract-last-nonnull-y")
+
+    client.execute_sql("DELETE FROM t WHERE pk = 5", schema_name=sn)
+    oracle.apply_delete(state, "pk", [5])
+    check("after-empty-heap-backed-group")
+
+
+def test_a_compound_group_key_survives_the_finalize_map(client, schema_name):
+    """A multi-column GROUP BY folds to a synthetic `_group_pk` whose PK region
+    the finalize MAP inherits verbatim, copying both group-exemplar columns into
+    payload slots beside the computed AVG."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, "
+        "b BIGINT NOT NULL, val BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT a, b, COUNT(*) AS n, AVG(val) AS av FROM t GROUP BY a, b",
+        schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
+    state = {}
+    check = _oracle_check(client, vid, state, ["a", "b", "val"], ["a", "b"],
+                          [("n", "COUNT", None), ("av", "AVG", "val")])
+
+    # 12 distinct (a, b) keys, 2 rows each → every AVG is an exact .0 or .5.
+    rows, pk = [], 0
+    for a in range(3):
+        for b in range(4):
+            for k in range(2):
+                pk += 1
+                rows.append({"pk": pk, "a": a, "b": b, "val": a * 10 + b + k})
+    client.execute_sql(
+        "INSERT INTO t VALUES " + ", ".join(
+            f"({r['pk']}, {r['a']}, {r['b']}, {r['val']})" for r in rows), schema_name=sn)
+    oracle.apply_insert(state, "pk", rows)
+    check("after-insert")
+
+    target = next(r for r in rows if r["a"] == 1 and r["b"] == 2)
+    client.execute_sql(f"DELETE FROM t WHERE pk = {target['pk']}", schema_name=sn)
+    oracle.apply_delete(state, "pk", [target["pk"]])
+    check("after-retract-one")
+
+    gone = [r["pk"] for r in rows if r["a"] == 0 and r["b"] == 0]
+    client.execute_sql(
+        f"DELETE FROM t WHERE pk IN ({', '.join(str(p) for p in gone)})", schema_name=sn)
+    oracle.apply_delete(state, "pk", gone)
+    check("after-empty-group")
+
+
+# ── Aggregate-call qualifiers ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("agg", [
+    "SUM(x) FILTER (WHERE x > 0)",
+    "SUM(x) OVER (PARTITION BY g)",
+], ids=["filter", "over"])
+def test_an_unimplemented_aggregate_qualifier_is_refused_not_dropped(
+        client, schema_name, agg):
+    """A qualifier the binder does not implement must be rejected loudly. Silently
+    dropping it computes the plain aggregate instead — a durably wrong answer with
+    no error to trace it to."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, x BIGINT NOT NULL)",
+        schema_name=sn)
+    with pytest.raises(gnitz.GnitzError):
         client.execute_sql(
-            "INSERT INTO ev VALUES (1, 10, 7, 'a'), (2, 10, 7, 'b'), (3, 10, 8, 'a'),"
-            " (4, 20, 7, 'a'), (5, 20, NULL, 'a'), (6, 30, NULL, 'c')",
-            schema_name=sn,
-        )
-        state = {}
-        oracle.apply_insert(state, "pk", self._ROWS)
-        return state
+            f"CREATE VIEW v AS SELECT g, {agg} AS s FROM t GROUP BY g", schema_name=sn)
 
-    def test_count_distinct_grouped_incremental(self, client):
-        """Churn a grouped `COUNT(DISTINCT u)`, checked weight-exactly against
-        `distinct` composed into `groupby_aggregate` — the composition the feature
-        lowers to."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            state = self._setup(client, sn)
+
+def test_count_all_is_count(client, schema_name):
+    """`ALL` is the one aggregate qualifier the binder accepts, and it computes
+    the unqualified aggregate — so `COUNT(ALL x)` skips NULL exactly as
+    `COUNT(x)` does, and neither is `COUNT(*)`."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, x BIGINT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT g, COUNT(*) AS c_star, COUNT(x) AS c_x, "
+        "COUNT(ALL x) AS c_all FROM t GROUP BY g", schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO t VALUES (1, 10, 2), (2, 10, NULL), (3, 20, 7)", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "g", "c_star", "c_x", "c_all") == {
+        (10, 2, 1, 1): 1, (20, 1, 1, 1): 1}
+
+
+def test_a_16_byte_integer_cannot_be_summed_or_averaged(client, schema_name):
+    """SUM and AVG accumulate into a 64-bit slot, which a U128 source overflows —
+    the engine marks that decode unreachable, so the planner has to reject the
+    view rather than compile a fold that cannot run."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, category BIGINT NOT NULL, "
+        "big DECIMAL(38,0) NOT NULL)", schema_name=sn)
+    for fn in ("SUM", "AVG"):
+        with pytest.raises(gnitz.GnitzError):
             client.execute_sql(
-                "CREATE VIEW v AS SELECT k, COUNT(DISTINCT u) AS n FROM ev GROUP BY k",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            project = ["k", "n"]
+                f"CREATE VIEW v AS SELECT category, {fn}(big) AS x FROM t GROUP BY category",
+                schema_name=sn)
 
-            def check(ctx):
-                d = oracle.oracle_distinct(
-                    oracle.oracle_filter_project(state, None, ["k", "u"]))
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    d, ["k", "u"], ["k"], [("n", "COUNT", "u")])
-                assert cols == project
-                oracle.assert_view_matches(client, vid, project, exp, ctx=ctx)
 
-            # NULL is not a distinct value: group 30 counts 0 but still exists.
-            check("after-insert")
+def test_a_global_aggregate_refuses_a_column_the_grouping_does_not_determine(
+        client, schema_name):
+    """With no GROUP BY the whole relation is one group, so no source column is
+    determined — not even wrapped in an expression."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)", schema_name=sn)
+    with pytest.raises(gnitz.GnitzError):
+        client.execute_sql(
+            "CREATE VIEW bad AS SELECT a + 1 AS x, COUNT(*) AS c FROM t", schema_name=sn)
 
-            # Retracting one of two carriers of u=7 in group 10 leaves it present.
-            client.execute_sql("DELETE FROM ev WHERE pk = 1", schema_name=sn)
-            oracle.apply_delete(state, "pk", [1])
-            check("after-delete-one-carrier")
 
-            # Retracting the last carrier drops the value.
-            client.execute_sql("DELETE FROM ev WHERE pk = 2", schema_name=sn)
-            oracle.apply_delete(state, "pk", [2])
-            check("after-delete-last-carrier")
+# ── DISTINCT aggregates ───────────────────────────────────────────────────────
 
-            # A key UPDATE moves a distinct value between groups in one epoch.
-            client.execute_sql("UPDATE ev SET k = 10 WHERE pk = 4", schema_name=sn)
-            oracle.apply_update(state, "pk", 4, {"k": 10})
-            check("after-cross-group-move")
+_EVENTS = [
+    {"pk": 1, "k": 10, "u": 7, "s": "a"}, {"pk": 2, "k": 10, "u": 7, "s": "b"},
+    {"pk": 3, "k": 10, "u": 8, "s": "a"}, {"pk": 4, "k": 20, "u": 7, "s": "a"},
+    {"pk": 5, "k": 20, "u": None, "s": "a"}, {"pk": 6, "k": 30, "u": None, "s": "c"},
+]
 
-            # Emptying a group retracts its row.
-            client.execute_sql("DELETE FROM ev WHERE pk = 6", schema_name=sn)
-            oracle.apply_delete(state, "pk", [6])
-            check("after-group-emptied")
-        finally:
-            client.drop_schema(sn)
 
-    def test_count_distinct_global_and_having(self, client):
-        """A global `COUNT(DISTINCT s)` over a string column; and the same
-        aggregate in HAVING, which resolves through the grouped leaf rather than
-        the SELECT list."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            state = self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW g AS SELECT COUNT(DISTINCT s) AS n FROM ev",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW h AS SELECT k, COUNT(DISTINCT s) AS n FROM ev GROUP BY k "
-                "HAVING COUNT(DISTINCT s) > 1",
-                schema_name=sn,
-            )
-            gid = client.resolve_table(sn, "g")[0]
-            hid = client.resolve_table(sn, "h")[0]
+def _events_table(client, sn, fill=True):
+    """`ev` plus `_EVENTS`, mirrored into the oracle state it returns."""
+    client.execute_sql(
+        "CREATE TABLE ev (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, u BIGINT NULL, "
+        "s TEXT NOT NULL)", schema_name=sn)
+    if not fill:
+        return {}
+    client.execute_sql(
+        "INSERT INTO ev VALUES " + ", ".join(
+            f"({r['pk']}, {r['k']}, {'NULL' if r['u'] is None else r['u']}, '{r['s']}')"
+            for r in _EVENTS), schema_name=sn)
+    state = {}
+    oracle.apply_insert(state, "pk", _EVENTS)
+    return state
 
-            def check_global(ctx):
-                d = oracle.oracle_distinct(
-                    oracle.oracle_filter_project(state, None, ["s"]))
-                exp, cols = oracle.oracle_groupby_aggregate(
-                    d, ["s"], [], [("n", "COUNT", "s")])
-                assert cols == ["n"]
-                oracle.assert_view_matches(client, gid, ["n"], exp, ctx=ctx)
 
-            # The oracle models no HAVING, so `h` is checked directly.
-            check_global("after-insert")
-            assert {r["k"]: r["n"] for r in client.scan(hid)} == {10: 2}
+def test_a_grouped_count_distinct_is_distinct_composed_into_the_aggregate(client, schema_name):
+    """`COUNT(DISTINCT u)` lowers to a plain aggregate over a hidden
+    `DISTINCT (group cols, u)` segment, so the churn is checked weight-exactly
+    against `distinct` composed into `groupby_aggregate` — the same composition."""
+    sn = schema_name
+    state = _events_table(client, sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT k, COUNT(DISTINCT u) AS n FROM ev GROUP BY k", schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
 
-            client.execute_sql("DELETE FROM ev WHERE pk = 6", schema_name=sn)
-            oracle.apply_delete(state, "pk", [6])
-            check_global("after-delete")
+    def check(ctx):
+        d = oracle.oracle_distinct(oracle.oracle_filter_project(state, None, ["k", "u"]))
+        exp, cols = oracle.oracle_groupby_aggregate(d, ["k", "u"], ["k"], [("n", "COUNT", "u")])
+        oracle.assert_view_matches(client, vid, cols, exp, ctx=ctx)
 
-            # A second distinct `s` in group 20 crosses the HAVING threshold.
-            client.execute_sql("INSERT INTO ev VALUES (7, 20, 1, 'z')", schema_name=sn)
-            oracle.apply_insert(state, "pk", [{"pk": 7, "k": 20, "u": 1, "s": "z"}])
-            check_global("after-insert-crossing-having")
-            assert {r["k"]: r["n"] for r in client.scan(hid)} == {10: 2, 20: 2}
-        finally:
-            client.drop_schema(sn)
+    # NULL is not a distinct value: group 30 counts 0 but still exists.
+    check("after-insert")
 
-    def test_distinct_aggregates_share_one_distinct_set(self, client):
-        """Every DISTINCT aggregate of one argument rides the same DISTINCT
-        segment; a computed argument or group key is materialized below it."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT k, SUM(DISTINCT u) AS s, MAX(DISTINCT u) AS m, "
-                "COUNT(DISTINCT u) AS n FROM ev WHERE k < 30 GROUP BY k",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW w AS SELECT COUNT(DISTINCT u % 2) AS n FROM ev GROUP BY k * 2",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            wid = client.resolve_table(sn, "w")[0]
-            rows = {r["k"]: (r["s"], r["m"], r["n"]) for r in client.scan(vid)}
-            # Group 10 dedups u=7 (two carriers) → SUM 7+8, MAX 8, COUNT 2.
-            assert rows == {10: (15, 8, 2), 20: (7, 7, 1)}
-            assert sorted(r["n"] for r in client.scan(wid)) == [0, 1, 2]
-        finally:
-            client.drop_schema(sn)
+    client.execute_sql("DELETE FROM ev WHERE pk = 1", schema_name=sn)
+    oracle.apply_delete(state, "pk", [1])
+    check("after-delete-one-carrier")
 
-    def test_min_max_distinct_is_the_plain_aggregate(self, client):
-        """`MIN`/`MAX(DISTINCT x)` is `MIN`/`MAX(x)`, so the binder drops the
-        qualifier — letting such a call keep company (here a plain `COUNT(*)` and a
-        second DISTINCT argument) the all-or-nothing DISTINCT rule refuses."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._setup(client, sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT k, MAX(DISTINCT u) AS m, MIN(DISTINCT pk) AS lo, "
-                "COUNT(*) AS c FROM ev GROUP BY k",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "v")[0]
-            assert {r["k"]: (r["m"], r["lo"], r["c"]) for r in client.scan(vid)} == {
-                10: (8, 1, 3), 20: (7, 4, 2), 30: (None, 6, 1),
-            }
-        finally:
-            client.drop_schema(sn)
+    client.execute_sql("DELETE FROM ev WHERE pk = 2", schema_name=sn)
+    oracle.apply_delete(state, "pk", [2])
+    check("after-delete-last-carrier")
 
-    def test_distinct_aggregate_on_an_adhoc_read_is_rejected(self, client):
-        """The ad-hoc read path lowers a grouped body to one stateless fold over
-        one scan, with nowhere to put the DISTINCT segment — and is the one
-        DISTINCT-aggregate surface the binder's own tests cannot reach."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._create(client, sn)
-            with pytest.raises(Exception, match="CREATE VIEW body only"):
-                client.execute_sql(
-                    "SELECT k, COUNT(DISTINCT u) AS n FROM ev GROUP BY k", schema_name=sn)
-        finally:
-            client.drop_schema(sn)
+    client.execute_sql("UPDATE ev SET k = 10 WHERE pk = 4", schema_name=sn)
+    oracle.apply_update(state, "pk", 4, {"k": 10})
+    check("after-cross-group-move")
+
+    client.execute_sql("DELETE FROM ev WHERE pk = 6", schema_name=sn)
+    oracle.apply_delete(state, "pk", [6])
+    check("after-group-emptied")
+
+
+def test_a_global_count_distinct_and_one_in_having(client, schema_name):
+    """The same composition with no GROUP BY, and again in HAVING — which resolves
+    through the grouped leaf rather than the SELECT list."""
+    sn = schema_name
+    state = _events_table(client, sn)
+    client.execute_sql("CREATE VIEW g AS SELECT COUNT(DISTINCT s) AS n FROM ev", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW h AS SELECT k, COUNT(DISTINCT s) AS n FROM ev GROUP BY k "
+        "HAVING COUNT(DISTINCT s) > 1", schema_name=sn)
+    gid = client.resolve_table(sn, "g")[0]
+
+    def check_global(ctx):
+        d = oracle.oracle_distinct(oracle.oracle_filter_project(state, None, ["s"]))
+        exp, cols = oracle.oracle_groupby_aggregate(d, ["s"], [], [("n", "COUNT", "s")])
+        oracle.assert_view_matches(client, gid, cols, exp, ctx=ctx)
+
+    # The oracle models no HAVING, so `h` is compared directly.
+    check_global("after-insert")
+    assert bag(scanned(client, sn, "h"), "k", "n") == {(10, 2): 1}
+
+    client.execute_sql("DELETE FROM ev WHERE pk = 6", schema_name=sn)
+    oracle.apply_delete(state, "pk", [6])
+    check_global("after-delete")
+
+    client.execute_sql("INSERT INTO ev VALUES (7, 20, 1, 'z')", schema_name=sn)
+    oracle.apply_insert(state, "pk", [{"pk": 7, "k": 20, "u": 1, "s": "z"}])
+    check_global("after-insert-crossing-having")
+    assert bag(scanned(client, sn, "h"), "k", "n") == {(10, 2): 1, (20, 2): 1}
+
+
+def test_distinct_aggregates_of_one_argument_share_one_distinct_set(client, schema_name):
+    """Every DISTINCT aggregate over one argument rides the same DISTINCT segment,
+    and a computed argument or group key is materialized below it."""
+    sn = schema_name
+    _events_table(client, sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT k, SUM(DISTINCT u) AS s, MAX(DISTINCT u) AS m, "
+        "COUNT(DISTINCT u) AS n FROM ev WHERE k < 30 GROUP BY k", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW w AS SELECT COUNT(DISTINCT u % 2) AS n FROM ev GROUP BY k * 2",
+        schema_name=sn)
+    # Group 10 dedups u=7 (two carriers) → SUM 7+8, MAX 8, COUNT 2.
+    assert bag(scanned(client, sn, "v"), "k", "s", "m", "n") == {
+        (10, 15, 8, 2): 1, (20, 7, 7, 1): 1}
+    assert bag(scanned(client, sn, "w"), "n") == {(0,): 1, (1,): 1, (2,): 1}
+
+
+def test_min_max_distinct_is_the_plain_aggregate(client, schema_name):
+    """`MIN`/`MAX(DISTINCT x)` is `MIN`/`MAX(x)`, so the binder drops the
+    qualifier — which lets such a call keep company the all-or-nothing DISTINCT
+    rule would otherwise refuse: here a plain `COUNT(*)` and a second DISTINCT
+    argument."""
+    sn = schema_name
+    _events_table(client, sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT k, MAX(DISTINCT u) AS m, MIN(DISTINCT pk) AS lo, "
+        "COUNT(*) AS c FROM ev GROUP BY k", schema_name=sn)
+    assert bag(scanned(client, sn, "v"), "k", "m", "lo", "c") == {
+        (10, 8, 1, 3): 1, (20, 7, 4, 2): 1, (30, None, 6, 1): 1}
+
+
+def test_a_distinct_aggregate_on_an_adhoc_read_is_rejected(client, schema_name):
+    """The ad-hoc read path lowers a grouped body to one stateless fold over one
+    scan, with nowhere to put the DISTINCT segment."""
+    sn = schema_name
+    _events_table(client, sn, fill=False)
+    with pytest.raises(Exception, match="CREATE VIEW body only"):
+        client.execute_sql(
+            "SELECT k, COUNT(DISTINCT u) AS n FROM ev GROUP BY k", schema_name=sn)

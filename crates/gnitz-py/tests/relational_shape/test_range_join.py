@@ -1,1386 +1,767 @@
-"""The non-equi (range / band) join, driven entirely through SQL.
+"""The non-equi join: pure range (`n_eq == 0`), band (`n_eq >= 1`), and the outer
+orientations each admits.
 
-Both sides reindex onto [eq keys…, range key]. A band join (n_eq >= 1)
-scatters its delta by the eq PREFIX, so equal eq-values co-partition both
-sides and the range walk runs worker-local. A pure range join (n_eq == 0) has
-no eq prefix: its delta is broadcast to every worker and probed against the
-other side's owned trace by an ordered range walk. Either way the output is
-re-keyed onto the source-PK pair (a.pk, b.pk) and exchanged by it, so the view
-is PK-partitioned like every other view.
+Both sides reindex onto `[eq keys…, range key]`. A band join scatters its delta
+by the eq PREFIX, so equal eq-values co-partition and the range walk runs
+worker-local; a pure range join has no prefix, so its delta is broadcast to every
+worker and probed against that worker's owned trace by an ordered range walk.
+Either way the output is re-keyed onto the source-PK pair `(a.pk, b.pk)` and
+exchanged by it, so the view is PK-partitioned like every other view.
 
-Pure range supports LEFT only; the RIGHT/FULL rejection is a planner test.
+The two shapes build their outer null-fill `ν` differently. Band subtracts the
+matched preserved rows from the unfiltered preserved input,
+`ν = positive_part(A − π_A(inner))`, and supports all three orientations. Pure
+range decides existence from a single scalar threshold — `∃b. a.x < b.y ⟺
+a.x < MAX(b.y)` — so `ν = A − (A ⋈ {m})` against a one-row `m` computed by an
+inline shard-free reduce, and supports LEFT only: the mirror null-fill has no
+witness on the preserved side. That threshold is reindexed back onto the range
+slot, a chain carried only at ≤8 bytes.
+
+Every assertion is a weighted bag of the pair identity. A wrong ν shows up as a
+spurious weight-`w−1` null-fill and a broadcast that double-counts shows up as
+weight W, neither of which a row set can see.
+
+The equi outer join is in test_outer_join.py, the keyless one in
+test_cross_join.py.
+
+Run with GNITZ_WORKERS=4: the broadcast, the eq-prefix scatter and the
+partition-local ν all collapse to nothing at one worker.
 """
 
 import pytest
-from _uid import uid as _uid
+from _read import bag
+
+_OPS = {"<": lambda a, b: a < b, "<=": lambda a, b: a <= b,
+        ">": lambda a, b: a > b, ">=": lambda a, b: a >= b}
 
 
-
-def _drop_all(client, sn, tables=(), views=(), indices=()):
-    for idx in indices:
-        try:
-            client.execute_sql(f"DROP INDEX {idx}", schema_name=sn)
-        except Exception:
-            pass
-    for v in views:
-        try:
-            client.execute_sql(f"DROP VIEW {v}", schema_name=sn)
-        except Exception:
-            pass
-    for t in tables:
-        try:
-            client.execute_sql(f"DROP TABLE {t}", schema_name=sn)
-        except Exception:
-            pass
-    client.drop_schema(sn)
+@pytest.fixture
+def rng(client, schema_name):
+    """Empty `a(id, x)` / `b(id, y)`, for a pure-range join `ON a.x OP b.y`."""
+    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
+        schema_name=schema_name)
+    client.execute_sql(
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)",
+        schema_name=schema_name)
+    return schema_name
 
 
+@pytest.fixture
+def band(client, schema_name):
+    """Empty `a(id, k, lo)` / `b(id, k, t)`, for a band join
+    `ON a.k = b.k AND a.lo <= b.t`."""
+    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
+        "lo BIGINT NOT NULL)", schema_name=schema_name)
+    client.execute_sql(
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
+        "t BIGINT NOT NULL)", schema_name=schema_name)
+    return schema_name
 
 
+def _fill(client, sn, table, rows):
+    """INSERT `rows` — tuples of column values in schema order, `None` for NULL."""
+    vals = ",".join("(" + ",".join("NULL" if v is None else str(v) for v in r) + ")"
+                    for r in rows)
+    client.execute_sql(f"INSERT INTO {table} VALUES {vals}", schema_name=sn)
 
 
+def _pair_view(client, sn, on, kind="", name="v"):
+    """`a <kind> JOIN b ON <on>` projecting the pair identity `(a.id, b.id)`;
+    `b.id` is NULL on a null-fill row. Returns the view id."""
+    client.execute_sql(
+        f"CREATE VIEW {name} AS SELECT a.id AS aid, b.id AS bid "
+        f"FROM a {kind} JOIN b ON {on}", schema_name=sn)
+    return client.resolve_table(sn, name)[0]
 
 
-
-def _range_ref(a_rows, b_rows, pred):
-    """Reference: the set of (a_id, b_id) pairs satisfying pred(a_row, b_row).
-    Rows are (id, *cols) tuples; the view's pair-PK is exactly (a_id, b_id)."""
-    return {(a[0], b[0]) for a in a_rows for b in b_rows if pred(a, b)}
+def _live(client, vid):
+    """The view's `{(aid, bid): net weight}`."""
+    return bag(client.scan(vid), "aid", "bid")
 
 
-def _view_pairs(client, vid):
-    """The live (pair-PK) set of a range-join view: r[0] = a.pk, r[1] = b.pk.
-    The pair-PK slots are hidden key columns, so `include_hidden=True` surfaces
-    them at their physical positions for this positional read."""
-    return {(r[0], r[1]) for r in client.scan(vid, include_hidden=True)}
+def _ref(a_rows, b_rows, pred):
+    """Inner reference: `{(a.id, b.id): 1}` per pair satisfying `pred(a, b)`.
+    Rows are `(id, *cols)` tuples."""
+    return {(a[0], b[0]): 1 for a in a_rows for b in b_rows if pred(a, b)}
 
 
-def _band_left_ref(a_rows, b_rows, pred):
-    """Reference LEFT band-join result as a set of (a_id, b_id_or_None): every left
-    row with ≥1 match contributes one (a_id, b_id) per match; every left row with NO
-    match contributes its null-fill (a_id, None). Rows are (id, *cols) tuples."""
-    out = set()
-    for a in a_rows:
-        matches = [b for b in b_rows if pred(a, b)]
-        if matches:
-            out |= {(a[0], b[0]) for b in matches}
-        else:
-            out.add((a[0], None))
-    return out
+def _left_ref(a_rows, b_rows, pred):
+    """LEFT reference: `_ref` plus one `(a.id, None)` per left row with no match."""
+    return _ref(a_rows, b_rows, pred) | {
+        (a[0], None): 1 for a in a_rows if not any(pred(a, b) for b in b_rows)}
 
 
-def _band_left_rows(client, vid):
-    """Live LEFT band-join view as {(aid, bid)}, bid None for a null-fill row. The
-    view must project `a.id AS aid, b.id AS bid` (b.id is NULL on a null-fill)."""
-    return {(r["aid"], r["bid"]) for r in client.scan(vid)}
+# ── the inner match set ───────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("op", list(_OPS))
+@pytest.mark.parametrize("first", ["a", "b"])
+def test_a_pure_range_join_is_the_product_the_operator_admits(client, rng, op, first):
+    """`ON a.x OP b.y` with no equality prefix is the cross product filtered by the
+    operator, each pair once. The side inserted second is the delta that emits, so
+    the two orders drive the two bilinear terms in turn. Both value sets are
+    permutations of the same residues, so `x == y` pairs sit inside the reference
+    and separate the inclusive operators from the strict ones."""
+    vid = _pair_view(client, rng, f"a.x {op} b.y")
+    a_rows = [(i, (i * 7) % 23) for i in range(1, 21)]
+    b_rows = [(i, (i * 5) % 23) for i in range(1, 21)]
+    for table, rows in ([("a", a_rows), ("b", b_rows)] if first == "a"
+                        else [("b", b_rows), ("a", a_rows)]):
+        _fill(client, rng, table, rows)
+
+    cmp = _OPS[op]
+    assert _live(client, vid) == _ref(a_rows, b_rows, lambda a, b: cmp(a[1], b[1]))
 
 
-_RANGE_OPS = [
-    ("<",  lambda a, b: a < b),
-    ("<=", lambda a, b: a <= b),
-    (">",  lambda a, b: a > b),
-    (">=", lambda a, b: a >= b),
-]
+def test_a_band_join_matches_only_inside_an_equality_group(client, band):
+    """The eq prefix scatters both sides by `hash(k)`, so equal keys co-partition
+    and the range walk is worker-local; a row satisfying the range in a *different*
+    group must not match. The 40 groups spread across every worker, and each
+    group's rows sit on different base-table PK partitions before the scatter
+    re-homes them.
+
+    The thin `b` side is seeded first and the wider `a` side arrives in one epoch,
+    so on each worker the scattered |ΔA| outnumbers the integrated trace_b and the
+    AB term takes the trace-driven merge walk rather than the per-row probe."""
+    vid = _pair_view(client, band, "a.k = b.k AND a.lo <= b.t")
+    ng = 40
+    b_rows = [(i, i % ng, (i * 7) % 20) for i in range(1, ng + 1)]
+    a_rows = [(i, i % ng, (i * 3) % 20) for i in range(1, 3 * ng + 1)]
+    _fill(client, band, "b", b_rows)
+    _fill(client, band, "a", a_rows)
+
+    assert _live(client, vid) == _ref(
+        a_rows, b_rows, lambda a, b: a[1] == b[1] and a[2] <= b[2])
 
 
-class TestRangeJoin:
-    """End-to-end coverage of the non-equi (range / band) join feature, driven
-    entirely through SQL against the multi-worker cluster."""
-
-    @pytest.mark.parametrize("op,cmp", _RANGE_OPS)
-    @pytest.mark.parametrize("order", ["a_then_b", "b_then_a"])
-    def test_pure_range_all_ops_both_orders(self, client, op, cmp, order):
-        """Pure range join `ON a.x OP b.y`, values scattered across partitions,
-        both insert orders — the view's pair set equals a python cross-filter."""
-        sn = "rj" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                f"CREATE VIEW v AS SELECT a.x AS ax, b.y AS by FROM a JOIN b ON a.x {op} b.y",
-                schema_name=sn)
-            a_rows = [(i, (i * 7) % 23) for i in range(1, 21)]
-            b_rows = [(i, (i * 5) % 23) for i in range(1, 21)]
-            a_sql = ",".join(f"({i},{x})" for i, x in a_rows)
-            b_sql = ",".join(f"({i},{y})" for i, y in b_rows)
-            if order == "a_then_b":
-                client.execute_sql(f"INSERT INTO a VALUES {a_sql}", schema_name=sn)
-                client.execute_sql(f"INSERT INTO b VALUES {b_sql}", schema_name=sn)
-            else:
-                client.execute_sql(f"INSERT INTO b VALUES {b_sql}", schema_name=sn)
-                client.execute_sql(f"INSERT INTO a VALUES {a_sql}", schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            got = _view_pairs(client, vid)
-            want = _range_ref(a_rows, b_rows, lambda a, b: cmp(a[1], b[1]))
-            assert got == want, f"op {op} order {order}: got {got ^ want} differ"
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_band_join_eq_prefix_plus_range(self, client):
-        """Band join `ON a.k = b.k AND a.lo <= b.t` — composite trace key; a
-        same-range row in a different equality group must NOT match (group edge).
-
-        The eq key spans dozens of distinct values, so its groups demonstrably
-        spread across all four workers, and each group's rows sit on DIFFERENT
-        base-table PK partitions (their ids differ by the group count) before the
-        eq-prefix scatter re-homes them onto hash(k). A mis-routed scatter (lost
-        matches) or a wrongly-retained WorkerFilter (which hashes the full
-        [k, lo] key and drops rows whose full-key partition ≠ their [k] partition)
-        fails the cross-filter reference.
-
-        Sizing straddles the join's size-adaptive selector: the small `b` side is
-        seeded FIRST (one row per group → a thin per-worker trace_b), then the
-        larger `a` side is inserted in ONE epoch (three rows per group). On each
-        worker the eq-prefix-scattered |ΔA| outnumbers its integrated trace_b, so
-        the `join_ab` term takes the trace-driven `range_merge_walk` rather than
-        the per-row probe — exercising Strategy 2 end to end through the scatter,
-        output exchange, and consolidate pipeline."""
-        sn = "bj" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.lo AS alo, b.t AS bt "
-                "FROM a JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=sn)
-            ng = 40                                                       # 40 distinct eq groups
-            # Small trace side first (1 row/group), then the wide delta side in one
-            # epoch (3 rows/group) so |ΔA_worker| > |trace_b_worker| → merge walk.
-            b_rows = [(i, i % ng, (i * 7) % 20) for i in range(1, ng + 1)]       # (id, k, t)
-            a_rows = [(i, i % ng, (i * 3) % 20) for i in range(1, 3 * ng + 1)]   # (id, k, lo)
-            client.execute_sql(
-                "INSERT INTO b VALUES " + ",".join(f"({i},{k},{t})" for i, k, t in b_rows), schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO a VALUES " + ",".join(f"({i},{k},{lo})" for i, k, lo in a_rows), schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            got = _view_pairs(client, vid)
-            want = _range_ref(a_rows, b_rows, lambda a, b: a[1] == b[1] and a[2] <= b[2])
-            assert got == want
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_pure_range_oversized_delta_merge_walk(self, client):
-        """Pure range join (`n_eq = 0`, one whole-trace eq group) where a single
-        epoch's broadcast delta outnumbers the per-worker trace, forcing the
-        degenerate single-group `range_merge_walk`. The small `b` side is seeded
-        first; the larger `a` side is then inserted in one epoch. Because pure
-        range broadcasts the delta in full but WorkerFilters the trace to ~1/W
-        per worker, the `join_ab` term's |ΔA| (full) exceeds its trace_b slice and
-        takes Strategy 2. The merge emits the same pairs as the per-row probe
-        (trace-major, re-ordered downstream); the result equals the cross-filter
-        reference."""
-        sn = "rjm" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.x AS ax, b.y AS by FROM a JOIN b ON a.x < b.y", schema_name=sn)
-            # Thin trace (b) first, then a wide single-epoch delta (a).
-            b_rows = [(i, (i * 5) % 23) for i in range(1, 9)]        # 8 trace rows
-            a_rows = [(i, (i * 7) % 23) for i in range(1, 49)]       # 48 delta rows ≫ 8
-            client.execute_sql(
-                "INSERT INTO b VALUES " + ",".join(f"({i},{y})" for i, y in b_rows), schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO a VALUES " + ",".join(f"({i},{x})" for i, x in a_rows), schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            got = _view_pairs(client, vid)
-            want = _range_ref(a_rows, b_rows, lambda a, b: a[1] < b[1])
-            assert got == want
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_cross_worker_retraction(self, client):
-        """The load-bearing test: a pair's `+1` and later `-1` are emitted by
-        OPPOSITE terms on DIFFERENT workers and must cancel through the output
-        exchange. Delete each side in turn; UPDATE the range column in/out."""
-        sn = "rr" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.x AS ax, b.y AS by FROM a JOIN b ON a.x < b.y", schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-
-            # One matching pair: a(1, x=10) < b(1, y=20).
-            client.execute_sql("INSERT INTO a VALUES (1, 10)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (1, 20)", schema_name=sn)
-            assert _view_pairs(client, vid) == {(1, 1)}
-
-            # Delete b → the term-BA `-1` must cancel the term-AB `+1`.
-            client.execute_sql("DELETE FROM b WHERE id = 1", schema_name=sn)
-            assert _view_pairs(client, vid) == set()
-            # Re-insert b → the pair returns.
-            client.execute_sql("INSERT INTO b VALUES (1, 20)", schema_name=sn)
-            assert _view_pairs(client, vid) == {(1, 1)}
-            # Delete a → gone again (cancellation from the other side).
-            client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=sn)
-            assert _view_pairs(client, vid) == set()
-
-            # UPDATE moving a pair in/out of range (retract + insert on a.x).
-            client.execute_sql("INSERT INTO a VALUES (2, 5)", schema_name=sn)   # 5 < 20 → match
-            client.execute_sql("INSERT INTO b VALUES (2, 7)", schema_name=sn)   # a2.x=5 < b2.y=7 → match too
-            assert _view_pairs(client, vid) == {(2, 1), (2, 2)}
-            # Move a2.x above both b.y values → no matches for a2.
-            client.execute_sql("UPDATE a SET x = 99 WHERE id = 2", schema_name=sn)
-            assert _view_pairs(client, vid) == set()
-            # Move it back below b1.y=20 (but above b2.y=7) → only (2,1).
-            client.execute_sql("UPDATE a SET x = 10 WHERE id = 2", schema_name=sn)
-            assert _view_pairs(client, vid) == {(2, 1)}
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_backfill_over_populated_tables(self, client):
-        """CREATE VIEW over already-populated tables yields the full match set
-        (the backfill replays both sources through the broadcast input relay)."""
-        sn = "rb" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn)
-            a_rows = [(i, (i * 11) % 17) for i in range(1, 16)]
-            b_rows = [(i, (i * 13) % 17) for i in range(1, 16)]
-            client.execute_sql(
-                "INSERT INTO a VALUES " + ",".join(f"({i},{x})" for i, x in a_rows), schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO b VALUES " + ",".join(f"({i},{y})" for i, y in b_rows), schema_name=sn)
-            # View created AFTER the data is loaded — pure backfill path.
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.x AS ax, b.y AS by FROM a JOIN b ON a.x >= b.y", schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            got = _view_pairs(client, vid)
-            want = _range_ref(a_rows, b_rows, lambda a, b: a[1] >= b[1])
-            assert got == want
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_view_scan_and_pk_seek(self, client):
-        """The view is PK-partitioned by the (a.pk, b.pk) pair: a point PK-seek
-        returns exactly the matching row (pair-PK routing == GroupKey scatter
-        routing). Uses U64 PKs so the OPK pair-key is plain big-endian."""
-        sn = "rs" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.x AS ax, b.y AS by FROM a JOIN b ON a.x < b.y", schema_name=sn)
-            a_rows = [(i, i) for i in range(1, 13)]
-            b_rows = [(i, i + 5) for i in range(1, 13)]
-            client.execute_sql(
-                "INSERT INTO a VALUES " + ",".join(f"({i},{x})" for i, x in a_rows), schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO b VALUES " + ",".join(f"({i},{y})" for i, y in b_rows), schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            pairs = _view_pairs(client, vid)
-            assert pairs == _range_ref(a_rows, b_rows, lambda a, b: a[1] < b[1])
-            # Point-seek every live pair by its compound PK. The seek key is the
-            # native packed pair (col0 in the low 64 bits, col1 in the high 64);
-            # the server OPK-encodes it per the view schema and unicasts to
-            # worker_for_pk_bytes(OPK)'s owner. A hit ⟺ the output exchange
-            # routed the pair to that same worker — the compound-key alignment
-            # invariant. (U64 PK columns: native packing is exact.)
-            for (aid, bid) in pairs:
-                res = client.seek(vid, int(aid) | (int(bid) << 64))
-                assert res.schema is not None and len(res.pks) == 1, \
-                    f"PK-seek ({aid},{bid}) should return exactly 1 row"
-            # A guaranteed non-pair (a12.x=12 < b1.y=6 is false) seeks to nothing.
-            res = client.seek(vid, 12 | (1 << 64))
-            assert res.schema is None or len(res.pks) == 0
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_null_key_either_side_matches_nothing(self, client):
-        """A NULL in any ON-clause column (eq or range), on EITHER side, matches
-        nothing (3VL). Both sides nullable, so this exercises the left (input_a)
-        AND the right (input_b) NULL filters."""
-        sn = "rn" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NULL, x BIGINT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NULL, y BIGINT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.x AS ax, b.y AS by "
-                "FROM a JOIN b ON a.k = b.k AND a.x < b.y", schema_name=sn)
-            # b1 fully defined; b2 has NULL eq key; b3 has NULL range key.
-            client.execute_sql(
-                "INSERT INTO b VALUES (1, 7, 100), (2, NULL, 100), (3, 7, NULL)", schema_name=sn)
-            # a1: k NULL; a2: x NULL → no match. a3 fully defined → matches only b1
-            # (a3.k=7=b1.k, a3.x=5 < b1.y=100); b2/b3 excluded by their own NULLs.
-            client.execute_sql(
-                "INSERT INTO a VALUES (1, NULL, 5), (2, 7, NULL), (3, 7, 5)", schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            assert _view_pairs(client, vid) == {(3, 1)}
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_signed_band_over_the_wire(self, client):
-        """A signed range pair via cross-sign promotion (U32 vs I64 at T=I64),
-        negatives included: the contiguous typed interval survives promotion and
-        broadcast with no order inversion."""
-        sn = "rsg" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x INT UNSIGNED NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.x AS ax, b.y AS by FROM a JOIN b ON a.x > b.y", schema_name=sn)
-            a_rows = [(i, i) for i in range(0, 10)]            # x: 0..9 (unsigned)
-            b_rows = [(i, i - 5) for i in range(1, 11)]        # y: -4..5 (signed, negatives)
-            client.execute_sql(
-                "INSERT INTO a VALUES " + ",".join(f"({i},{x})" for i, x in a_rows), schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO b VALUES " + ",".join(f"({i},{y})" for i, y in b_rows), schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            got = _view_pairs(client, vid)
-            want = _range_ref(a_rows, b_rows, lambda a, b: a[1] > b[1])
-            assert got == want
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_empty_delta_epochs_no_deadlock(self, client):
-        """Pushing rows that match nothing still drives both exchanges every
-        epoch (empty batches included) — no barrier deadlock with the double
-        exchange."""
-        sn = "re" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.x AS ax, b.y AS by FROM a JOIN b ON a.x < b.y", schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            # All a.x huge, all b.y small → never any match across several epochs.
-            for i in range(1, 6):
-                client.execute_sql(f"INSERT INTO a VALUES ({i}, 1000000)", schema_name=sn)
-            for i in range(1, 6):
-                client.execute_sql(f"INSERT INTO b VALUES ({i}, {i})", schema_name=sn)
-            assert _view_pairs(client, vid) == set()
-            # A subsequent real match still flows (the circuit is alive).
-            client.execute_sql("INSERT INTO a VALUES (99, 0)", schema_name=sn)
-            assert _view_pairs(client, vid) == {(99, j) for j in range(1, 6)}
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_view_over_range_join_view(self, client):
-        """A GROUP BY view stacked on a range-join view stays consistent under
-        retraction — the range-join output deltas are well-formed for downstream
-        circuits."""
-        sn = "rv" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.id AS aid, b.y AS by FROM a JOIN b ON a.x < b.y", schema_name=sn)
-            # GROUP BY over the range-join view: count matches per a.id.
-            client.execute_sql(
-                "CREATE VIEW g AS SELECT aid, COUNT(*) AS n FROM v GROUP BY aid", schema_name=sn)
-            client.execute_sql("INSERT INTO a VALUES (1, 5), (2, 50)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (10, 10), (11, 20), (12, 100)", schema_name=sn)
-            gid, _ = client.resolve_table(sn, "g")
-
-            # GROUP BY output layout is [_group_pk, group_col, agg]; read the
-            # group key and count by name, not positionally. A group whose COUNT
-            # falls to 0 (all its range-join rows retracted) is treated as absent
-            # — the reduce leaves a count-0 row, which SQL semantics drop.
-            def counts():
-                return {r["aid"]: r["n"] for r in client.scan(gid)
-                        if r["n"] > 0}
-            # a1.x=5 < {10,20,100} → 3 matches; a2.x=50 < {100} → 1 match.
-            assert counts() == {1: 3, 2: 1}
-            # Delete b(12, y=100): a1 loses one (→2), a2 loses its only (→ gone).
-            client.execute_sql("DELETE FROM b WHERE id = 12", schema_name=sn)
-            assert counts() == {1: 2}
-        finally:
-            _drop_all(client, sn, views=["g", "v"], tables=["a", "b"])
-
-    def test_branch_routing_regression(self, client):
-        """In the same cluster as a range-join view, a plain GROUP BY view and a
-        single-sided set-op (DISTINCT) view — both have has_join_shard AND
-        has_exchange — must still produce correct results, i.e. they take the
-        has_exchange arm, not the range-join broadcast branch (the §7
-        discriminator must be exact)."""
-        sn = "rbr" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE c (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL)", schema_name=sn)
-            # Range join (broadcast branch).
-            client.execute_sql(
-                "CREATE VIEW rj AS SELECT a.x AS ax, b.y AS by FROM a JOIN b ON a.x < b.y", schema_name=sn)
-            # GROUP BY (has_join_shard via group reindex + has_exchange) — must NOT
-            # be diverted into the range-join branch.
-            client.execute_sql(
-                "CREATE VIEW gb AS SELECT g, COUNT(*) AS n FROM c GROUP BY g", schema_name=sn)
-            # Single-sided set-op: SELECT DISTINCT (HashRow → exchange → distinct).
-            client.execute_sql(
-                "CREATE VIEW dv AS SELECT DISTINCT g FROM c", schema_name=sn)
-
-            client.execute_sql("INSERT INTO a VALUES (1, 1), (2, 2)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (1, 5)", schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO c VALUES (1, 100), (2, 100), (3, 200), (4, 200), (5, 200)", schema_name=sn)
-
-            rj_id, _ = client.resolve_table(sn, "rj")
-            gb_id, _ = client.resolve_table(sn, "gb")
-            dv_id, _ = client.resolve_table(sn, "dv")
-
-            assert _view_pairs(client, rj_id) == {(1, 1), (2, 1)}
-            # GROUP BY output is [_group_pk, g, n] — read by name, not r[0].
-            gb = {r["g"]: r["n"] for r in client.scan(gb_id)}
-            assert gb == {100: 2, 200: 3}, f"GROUP BY corrupted by branch routing: {gb}"
-            dv = sorted(r["g"] for r in client.scan(dv_id))
-            assert dv == [100, 200], f"DISTINCT corrupted by branch routing: {dv}"
-        finally:
-            _drop_all(client, sn, views=["rj", "gb", "dv"], tables=["a", "b", "c"])
-
-    def test_compound_source_pks_wide_pair_pk(self, client):
-        """Compound source PKs make a 4-column pair-PK (4×8 = 32 bytes > 16 → the
-        wide `worker_for_pk_bytes` xxh routing path on the output exchange).
-        The full pair identity is (a.k1, a.k2, b.k1, b.k2)."""
-        sn = "rc" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, x BIGINT NOT NULL, "
-                "PRIMARY KEY (k1, k2))", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, y BIGINT NOT NULL, "
-                "PRIMARY KEY (k1, k2))", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.x AS ax, b.y AS by FROM a JOIN b ON a.x < b.y", schema_name=sn)
-            a_rows = [((i, i * 2), (i * 7) % 19) for i in range(1, 13)]   # ((k1,k2), x)
-            b_rows = [((i, i * 3), (i * 5) % 19) for i in range(1, 13)]   # ((k1,k2), y)
-            client.execute_sql("INSERT INTO a VALUES " +
-                ",".join(f"({k1},{k2},{x})" for (k1, k2), x in a_rows), schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES " +
-                ",".join(f"({k1},{k2},{y})" for (k1, k2), y in b_rows), schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            # pair-PK = (a.k1, a.k2, b.k1, b.k2) at r[0..4]; payload ax=r[4], by=r[5].
-            # The pair-PK slots are hidden, so include_hidden surfaces them here.
-            got = {(r[0], r[1], r[2], r[3]) for r in client.scan(vid, include_hidden=True)}
-            want = {(ak1, ak2, bk1, bk2)
-                    for ((ak1, ak2), ax) in a_rows for ((bk1, bk2), by) in b_rows if ax < by}
-            assert got == want, "wide pair-PK routing dropped or duplicated matches"
-            # The projected payload values are correct on every emitted row.
-            for r in client.scan(vid, include_hidden=True):
-                assert r[4] < r[5], f"projected ax={r[4]} must be < by={r[5]}"
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_band_join_compound_eq_prefix(self, client):
-        """Band join with a TWO-column equality prefix (n_eq=2): the trace key is
-        [k1, k2, range]; a match needs both equality columns AND the range."""
-        sn = "rb2" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k1 BIGINT NOT NULL, "
-                "k2 BIGINT NOT NULL, lo BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k1 BIGINT NOT NULL, "
-                "k2 BIGINT NOT NULL, t BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.lo AS alo, b.t AS bt "
-                "FROM a JOIN b ON a.k1 = b.k1 AND a.k2 = b.k2 AND a.lo <= b.t", schema_name=sn)
-            a_rows = [(i, i % 3, i % 2, (i * 3) % 15) for i in range(1, 25)]   # (id,k1,k2,lo)
-            b_rows = [(i, i % 3, i % 2, (i * 7) % 15) for i in range(1, 25)]   # (id,k1,k2,t)
-            client.execute_sql("INSERT INTO a VALUES " +
-                ",".join(f"({i},{k1},{k2},{lo})" for i, k1, k2, lo in a_rows), schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES " +
-                ",".join(f"({i},{k1},{k2},{t})" for i, k1, k2, t in b_rows), schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            got = _view_pairs(client, vid)
-            want = _range_ref(a_rows, b_rows,
-                              lambda a, b: a[1] == b[1] and a[2] == b[2] and a[3] <= b[3])
-            assert got == want
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_select_star_projection(self, client):
-        """`SELECT *` over a range join: the wildcard projection branch keeps all
-        source columns (duplicate names allowed for `*`), and every projected
-        value — including the pair-PK twins carried in the payload — is correct."""
-        sn = "rw" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql("CREATE VIEW v AS SELECT * FROM a JOIN b ON a.x < b.y", schema_name=sn)
-            client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 30)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (5, 20), (6, 40)", schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            # Physical layout: [_pair_pk_0=a.id, _pair_pk_1=b.id, a.id, a.x, b.id, b.y].
-            # The leading pair-PK slots are hidden; include_hidden reads them here.
-            got = {(r[0], r[1]): (r[2], r[3], r[4], r[5])
-                   for r in client.scan(vid, include_hidden=True)}
-            assert set(got.keys()) == {(1, 5), (1, 6), (2, 6)}
-            # pair-PK twins (r[2]=a.id, r[4]=b.id) match the PK region; range cols hold.
-            assert got[(1, 5)] == (1, 10, 5, 20)
-            assert got[(1, 6)] == (1, 10, 6, 40)
-            assert got[(2, 6)] == (2, 30, 6, 40)
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_range_column_is_source_pk(self, client):
-        """The range column IS the source PK on both sides: the broadcast + probe
-        must still run (no co-partition shortcut applies to a range join, even
-        when the join key equals the source PK). pair-PK = (a.x, b.y)."""
-        sn = "rk" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql("CREATE TABLE a (x BIGINT NOT NULL PRIMARY KEY)", schema_name=sn)
-            client.execute_sql("CREATE TABLE b (y BIGINT NOT NULL PRIMARY KEY)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.x AS ax, b.y AS by FROM a JOIN b ON a.x < b.y", schema_name=sn)
-            a_vals = list(range(1, 16))
-            b_vals = list(range(5, 20))
-            client.execute_sql("INSERT INTO a VALUES " + ",".join(f"({x})" for x in a_vals), schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES " + ",".join(f"({y})" for y in b_vals), schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            got = _view_pairs(client, vid)   # pair-PK = (a.x, b.y)
-            want = {(x, y) for x in a_vals for y in b_vals if x < y}
-            assert got == want
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_band_join_retraction(self, client):
-        """Cross-worker retraction in a BAND join (eq prefix): deleting either
-        side cancels the pair; an UPDATE moving the equality key to a different
-        group drops the match."""
-        sn = "rbr2" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.lo AS alo, b.t AS bt "
-                "FROM a JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            client.execute_sql("INSERT INTO a VALUES (1, 100, 5)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (1, 100, 9)", schema_name=sn)  # k=100, 5<=9 → match
-            assert _view_pairs(client, vid) == {(1, 1)}
-            client.execute_sql("DELETE FROM b WHERE id = 1", schema_name=sn)
-            assert _view_pairs(client, vid) == set()
-            client.execute_sql("INSERT INTO b VALUES (1, 100, 9)", schema_name=sn)
-            assert _view_pairs(client, vid) == {(1, 1)}
-            # Move a's equality key out of the group → no longer matches.
-            client.execute_sql("UPDATE a SET k = 200 WHERE id = 1", schema_name=sn)
-            assert _view_pairs(client, vid) == set()
-            # Move it back.
-            client.execute_sql("UPDATE a SET k = 100 WHERE id = 1", schema_name=sn)
-            assert _view_pairs(client, vid) == {(1, 1)}
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_band_join_cross_width_eq_key(self, client):
-        """Band join whose EQUALITY key is cross-width promoted: `a.k` is INT
-        UNSIGNED (U32), `b.k` is BIGINT (I64) → common type T=I64. The U32 side
-        routes the scatter through the ReindexPacker (packs at T), while the
-        already-I64 side routes through the single-column route_key (OPK-encoded at
-        its own width, which IS T). Equal k values must hash to the same partition
-        on BOTH legs or the eq-prefix scatter strands matches. No other band test
-        promotes the eq key — test_signed_band_over_the_wire promotes the RANGE
-        column, not the equality prefix."""
-        sn = "bjx" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k INT UNSIGNED NOT NULL, lo BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.lo AS alo, b.t AS bt "
-                "FROM a JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=sn)
-            ng = 16                                                      # k ∈ 0..15 (non-negative: U32 side)
-            a_rows = [(i, i % ng, (i * 3) % 20) for i in range(1, 2 * ng + 1)]   # (id, k:U32, lo)
-            b_rows = [(i, i % ng, (i * 7) % 20) for i in range(1, 2 * ng + 1)]   # (id, k:I64, t)
-            client.execute_sql(
-                "INSERT INTO a VALUES " + ",".join(f"({i},{k},{lo})" for i, k, lo in a_rows), schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO b VALUES " + ",".join(f"({i},{k},{t})" for i, k, t in b_rows), schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            got = _view_pairs(client, vid)
-            want = _range_ref(a_rows, b_rows, lambda a, b: a[1] == b[1] and a[2] <= b[2])
-            assert got == want
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_band_join_backfill_over_populated_tables(self, client):
-        """CREATE VIEW with an eq prefix over ALREADY-POPULATED tables yields the
-        full match set via the eq-prefix scatter — confirming the backfill replay
-        rides the SAME relay, so each source is PARTITIONED, not replicated. Unlike
-        test_backfill_over_populated_tables (a pure `>=` range join that still
-        broadcasts), the band case no longer contributes the O(num_workers × N)
-        backfill blow-up."""
-        sn = "bjb" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
-                schema_name=sn)
-            ng = 24
-            a_rows = [(i, i % ng, (i * 11) % 17) for i in range(1, 2 * ng + 1)]   # (id, k, lo)
-            b_rows = [(i, i % ng, (i * 13) % 17) for i in range(1, 2 * ng + 1)]   # (id, k, t)
-            client.execute_sql(
-                "INSERT INTO a VALUES " + ",".join(f"({i},{k},{lo})" for i, k, lo in a_rows), schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO b VALUES " + ",".join(f"({i},{k},{t})" for i, k, t in b_rows), schema_name=sn)
-            # View created AFTER the data is loaded — pure backfill path.
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.lo AS alo, b.t AS bt "
-                "FROM a JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            got = _view_pairs(client, vid)
-            want = _range_ref(a_rows, b_rows, lambda a, b: a[1] == b[1] and a[2] <= b[2])
-            assert got == want
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    @pytest.mark.parametrize("op,want_match", [
-        ("<", False), ("<=", True), (">", False), (">=", True)])
-    def test_boundary_equal_values(self, client, op, want_match):
-        """At x == y, only the inclusive operators (<=, >=) match."""
-        sn = "rbd" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql("CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql("CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                f"CREATE VIEW v AS SELECT a.x AS ax, b.y AS by FROM a JOIN b ON a.x {op} b.y", schema_name=sn)
-            client.execute_sql("INSERT INTO a VALUES (1, 42)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (1, 42)", schema_name=sn)   # x == y
-            vid, _ = client.resolve_table(sn, "v")
-            assert _view_pairs(client, vid) == ({(1, 1)} if want_match else set())
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_sql_rejections(self, client):
-        """The unsupported range-join SQL surfaces are rejected at CREATE VIEW
-        (also covered by the Rust integration tests; pinned here end-to-end)."""
-        sn = "rrej" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL, "
-                "w BIGINT NOT NULL, s VARCHAR(20) NOT NULL, fx DOUBLE NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL, "
-                "z BIGINT NOT NULL, s VARCHAR(20) NOT NULL, fy DOUBLE NOT NULL)", schema_name=sn)
-            rejected = {
-                # A non-order-preserving range pair (string / float content hash) remains
-                # rejected. A range *self-join* and a *second* range conjunct are no longer
-                # rejected — the former wraps the repeat in a pass-through view, the latter
-                # becomes a residual post-join filter (both asserted below).
-                "string_pair": "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.s < b.s",
-                "float_pair":  "CREATE VIEW v AS SELECT * FROM a JOIN b ON a.fx < b.fy",
-            }
-            for label, sql in rejected.items():
-                with pytest.raises(Exception):
-                    client.execute_sql(sql, schema_name=sn)
-                # No view should have been registered by a rejected CREATE.
-                with pytest.raises(Exception):
-                    client.resolve_table(sn, "v")
-            # A range self-join now registers: the repeated `a` is auto-wrapped in a
-            # pass-through hidden view, giving the range join two distinct sources.
-            client.execute_sql(
-                "CREATE VIEW self_range_v AS SELECT a1.id AS i FROM a a1 JOIN a a2 ON a1.x < a2.x",
-                schema_name=sn)
-            client.resolve_table(sn, "self_range_v")  # registered (raises if absent)
-            # Two range conjuncts now register: the first is the physical range, the
-            # second a residual post-join filter (INNER).
-            client.execute_sql(
-                "CREATE VIEW two_range_v AS SELECT * FROM a JOIN b ON a.x < b.y AND a.w > b.z",
-                schema_name=sn)
-            client.resolve_table(sn, "two_range_v")  # registered (raises if absent)
-        finally:
-            _drop_all(client, sn, views=["v", "self_range_v", "two_range_v"], tables=["a", "b"])
-
-    # ── Band LEFT OUTER (eq prefix + range): the null-fill set-difference ──────
-    #
-    # View projects `a.id AS aid, b.id AS bid`; a null-fill row is (aid, None)
-    # because its b.id is NULL. The reference is `_band_left_ref`.
-
-    def _mk_band_left(self, client, sn):
-        """CREATE a/b/v for the standard band LEFT view and return (vid, pred)."""
+def test_a_band_join_keys_on_every_equality_column(client, schema_name):
+    """A two-column equality prefix (`n_eq = 2`) makes the trace key `[k1, k2,
+    range]`: a match needs both equality columns and the range."""
+    sn = schema_name
+    for name, last in (("a", "lo"), ("b", "t")):
         client.execute_sql(
-            "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)",
+            f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, k1 BIGINT NOT NULL, "
+            f"k2 BIGINT NOT NULL, {last} BIGINT NOT NULL)", schema_name=sn)
+    vid = _pair_view(client, sn, "a.k1 = b.k1 AND a.k2 = b.k2 AND a.lo <= b.t")
+    a_rows = [(i, i % 3, i % 2, (i * 3) % 15) for i in range(1, 25)]
+    b_rows = [(i, i % 3, i % 2, (i * 7) % 15) for i in range(1, 25)]
+    _fill(client, sn, "a", a_rows)
+    _fill(client, sn, "b", b_rows)
+
+    assert _live(client, vid) == _ref(
+        a_rows, b_rows, lambda a, b: a[1] == b[1] and a[2] == b[2] and a[3] <= b[3])
+
+
+def test_a_pure_range_delta_wider_than_the_trace_takes_the_merge_walk(client, rng):
+    """One whole-trace eq group, and a single epoch's broadcast delta outnumbering
+    the per-worker trace: pure range broadcasts ΔA in full but worker-filters the
+    trace to ~1/W, so the AB term crosses into the trace-driven merge walk. It must
+    emit the same pairs the per-row probe does."""
+    vid = _pair_view(client, rng, "a.x < b.y")
+    b_rows = [(i, (i * 5) % 23) for i in range(1, 9)]
+    a_rows = [(i, (i * 7) % 23) for i in range(1, 49)]
+    _fill(client, rng, "b", b_rows)
+    _fill(client, rng, "a", a_rows)
+
+    assert _live(client, vid) == _ref(a_rows, b_rows, lambda a, b: a[1] < b[1])
+
+
+def test_a_view_created_over_populated_tables_backfills_both_shapes(client, band):
+    """Backfill replays both sources through the same input relay the steady state
+    uses, so a view created after the data lands holds the full match set — for the
+    broadcast pure-range relay and for the partitioned eq-prefix scatter alike."""
+    ng = 24
+    a_rows = [(i, i % ng, (i * 11) % 17) for i in range(1, 2 * ng + 1)]
+    b_rows = [(i, i % ng, (i * 13) % 17) for i in range(1, 2 * ng + 1)]
+    _fill(client, band, "a", a_rows)
+    _fill(client, band, "b", b_rows)
+
+    pr = _pair_view(client, band, "a.lo >= b.t", name="pr")
+    bd = _pair_view(client, band, "a.k = b.k AND a.lo <= b.t", name="bd")
+    assert _live(client, pr) == _ref(a_rows, b_rows, lambda a, b: a[2] >= b[2])
+    assert _live(client, bd) == _ref(
+        a_rows, b_rows, lambda a, b: a[1] == b[1] and a[2] <= b[2])
+
+
+def test_a_pair_retracts_across_the_output_exchange(client, band):
+    """A pair's `+1` and its later `−1` are emitted by opposite terms on different
+    workers and must cancel through the output exchange. One pure-range and one
+    band view over the same tables see each delta: deleting either side, moving the
+    range column in and out, and — for the band alone — moving the equality key to
+    another group."""
+    pr = _pair_view(client, band, "a.lo < b.t", name="pr")
+    bd = _pair_view(client, band, "a.k = b.k AND a.lo < b.t", name="bd")
+
+    def live():
+        return _live(client, pr), _live(client, bd)
+
+    _fill(client, band, "a", [(1, 100, 5)])
+    _fill(client, band, "b", [(1, 100, 9)])
+    assert live() == ({(1, 1): 1}, {(1, 1): 1})
+
+    client.execute_sql("DELETE FROM b WHERE id = 1", schema_name=band)
+    assert live() == ({}, {}), "the term-BA retraction cancels the term-AB emission"
+    _fill(client, band, "b", [(1, 100, 9)])
+    assert live() == ({(1, 1): 1}, {(1, 1): 1})
+
+    client.execute_sql("UPDATE a SET lo = 99 WHERE id = 1", schema_name=band)
+    assert live() == ({}, {}), "the range column moved out of range"
+    client.execute_sql("UPDATE a SET lo = 5 WHERE id = 1", schema_name=band)
+    assert live() == ({(1, 1): 1}, {(1, 1): 1})
+
+    client.execute_sql("UPDATE a SET k = 200 WHERE id = 1", schema_name=band)
+    assert live() == ({(1, 1): 1}, {}), "only the band reads the equality key"
+    client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=band)
+    assert live() == ({}, {})
+
+
+def test_epochs_that_match_nothing_keep_the_circuit_live(client, rng):
+    """A push that matches nothing still drives both exchanges every epoch, empty
+    batches included, so the double exchange cannot deadlock on an empty round — a
+    later real match still flows."""
+    vid = _pair_view(client, rng, "a.x < b.y")
+    for i in range(1, 6):
+        _fill(client, rng, "a", [(i, 1000000)])
+    for i in range(1, 6):
+        _fill(client, rng, "b", [(i, i)])
+    assert _live(client, vid) == {}
+
+    _fill(client, rng, "a", [(99, 0)])
+    assert _live(client, vid) == {(99, j): 1 for j in range(1, 6)}
+
+
+def test_a_null_in_any_on_column_matches_nothing(client, schema_name):
+    """SQL 3VL through both NULL filters: a NULL in the equality key or in the
+    range column, on either side, matches nothing."""
+    sn = schema_name
+    for name, last in (("a", "x"), ("b", "y")):
+        client.execute_sql(
+            f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, k BIGINT, "
+            f"{last} BIGINT)", schema_name=sn)
+    vid = _pair_view(client, sn, "a.k = b.k AND a.x < b.y")
+    # b1 fully defined; b2 NULL eq key; b3 NULL range key. a1 NULL eq key, a2 NULL
+    # range key, a3 fully defined and matching b1 alone.
+    _fill(client, sn, "b", [(1, 7, 100), (2, None, 100), (3, 7, None)])
+    _fill(client, sn, "a", [(1, None, 5), (2, 7, None), (3, 7, 5)])
+
+    assert _live(client, vid) == {(3, 1): 1}
+
+
+def test_a_view_over_a_range_join_view_sees_well_formed_deltas(client, rng):
+    """A GROUP BY view stacked on a range-join view stays consistent under
+    retraction: the range join's output deltas are ordinary deltas downstream."""
+    _pair_view(client, rng, "a.x < b.y")
+    client.execute_sql(
+        "CREATE VIEW g AS SELECT aid, COUNT(*) AS n FROM v GROUP BY aid",
+        schema_name=rng)
+    gid = client.resolve_table(rng, "g")[0]
+    _fill(client, rng, "a", [(1, 5), (2, 50)])
+    _fill(client, rng, "b", [(10, 10), (11, 20), (12, 100)])
+
+    # a1 (x=5) is under all three b's; a2 (x=50) only under b12.
+    assert bag(client.scan(gid), "aid", "n") == {(1, 3): 1, (2, 1): 1}
+    client.execute_sql("DELETE FROM b WHERE id = 12", schema_name=rng)
+    assert bag(client.scan(gid), "aid", "n") == {(1, 2): 1}
+
+
+# ── the output pair key ───────────────────────────────────────────────────────
+
+def test_the_pair_pk_routes_a_point_seek_to_the_row_it_holds(client, schema_name):
+    """The view is PK-partitioned by `(a.pk, b.pk)`: seeking that pair reaches
+    exactly the worker the output exchange routed it to. U64 source PKs, so the
+    seek key's native packing is exact and the server's OPK encoding of it is the
+    one the exchange hashed."""
+    sn = schema_name
+    for name, col in (("a", "x"), ("b", "y")):
+        client.execute_sql(
+            f"CREATE TABLE {name} (id BIGINT UNSIGNED NOT NULL PRIMARY KEY, "
+            f"{col} BIGINT NOT NULL)", schema_name=sn)
+    vid = _pair_view(client, sn, "a.x < b.y")
+    a_rows = [(i, i) for i in range(1, 13)]
+    b_rows = [(i, i + 5) for i in range(1, 13)]
+    _fill(client, sn, "a", a_rows)
+    _fill(client, sn, "b", b_rows)
+
+    pairs = _ref(a_rows, b_rows, lambda a, b: a[1] < b[1])
+    assert _live(client, vid) == pairs
+    for aid, bid in pairs:
+        res = client.seek(vid, int(aid) | (int(bid) << 64))
+        assert res.schema is not None and len(res.pks) == 1, f"seek ({aid},{bid})"
+    # a12.x = 12 is not below b1.y = 6, so that pair was never emitted.
+    miss = client.seek(vid, 12 | (1 << 64))
+    assert miss.schema is None or len(miss.pks) == 0
+
+
+def test_a_pair_pk_wider_than_sixteen_bytes_routes_by_hash(client, schema_name):
+    """Compound source PKs make a four-column, 32-byte pair-PK, past the width at
+    which `worker_for_pk_bytes` switches to hashing the OPK bytes. The full pair
+    identity is `(a.k1, a.k2, b.k1, b.k2)`, and it is a hidden key slot — the
+    payload twins beside it carry the same values."""
+    sn = schema_name
+    for name, col in (("a", "x"), ("b", "y")):
+        client.execute_sql(
+            f"CREATE TABLE {name} (k1 BIGINT NOT NULL, k2 BIGINT NOT NULL, "
+            f"{col} BIGINT NOT NULL, PRIMARY KEY (k1, k2))", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT a.k1 AS ak1, a.k2 AS ak2, b.k1 AS bk1, b.k2 AS bk2 "
+        "FROM a JOIN b ON a.x < b.y", schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
+    a_rows = [(i, i * 2, (i * 7) % 19) for i in range(1, 13)]
+    b_rows = [(i, i * 3, (i * 5) % 19) for i in range(1, 13)]
+    _fill(client, sn, "a", a_rows)
+    _fill(client, sn, "b", b_rows)
+
+    want = {(a[0], a[1], b[0], b[1]): 1
+            for a in a_rows for b in b_rows if a[2] < b[2]}
+    assert bag(client.scan(vid), "ak1", "ak2", "bk1", "bk2") == want
+    # The hidden pair-PK slots hold exactly those four columns.
+    assert bag(client.scan(vid, include_hidden=True),
+               "_pair_pk_0", "_pair_pk_1", "_pair_pk_2", "_pair_pk_3") == want
+
+
+def test_a_range_join_over_the_source_pk_still_broadcasts(client, schema_name):
+    """The range column *is* the source PK on both sides. No co-partition shortcut
+    applies to a range join, so the broadcast and probe must still run — and the
+    pair-PK is then the pair of range values themselves."""
+    sn = schema_name
+    client.execute_sql("CREATE TABLE a (x BIGINT NOT NULL PRIMARY KEY)", schema_name=sn)
+    client.execute_sql("CREATE TABLE b (y BIGINT NOT NULL PRIMARY KEY)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT a.x AS aid, b.y AS bid FROM a JOIN b ON a.x < b.y",
+        schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
+    a_rows = [(x,) for x in range(1, 16)]
+    b_rows = [(y,) for y in range(5, 20)]
+    _fill(client, sn, "a", a_rows)
+    _fill(client, sn, "b", b_rows)
+
+    assert _live(client, vid) == _ref(a_rows, b_rows, lambda a, b: a[0] < b[0])
+
+
+def test_the_key_columns_promote_across_width_and_sign(client, schema_name):
+    """One band join whose equality key and whose range column both cross width and
+    sign: `INT UNSIGNED` against `BIGINT`, common type I64. Equal eq-values must
+    hash to the same partition on both legs — the U32 side packs through the
+    reindex packer at T, the I64 side through the single-column route key at its
+    own width — and the range interval must survive promotion without inverting
+    around the negative `b.y` values."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k INT UNSIGNED NOT NULL, "
+        "x INT UNSIGNED NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
+        "y BIGINT NOT NULL)", schema_name=sn)
+    vid = _pair_view(client, sn, "a.k = b.k AND a.x > b.y")
+    ng = 16
+    a_rows = [(i, i % ng, i % 10) for i in range(1, 2 * ng + 1)]
+    b_rows = [(i, i % ng, (i % 10) - 5) for i in range(1, 2 * ng + 1)]
+    _fill(client, sn, "a", a_rows)
+    _fill(client, sn, "b", b_rows)
+
+    assert _live(client, vid) == _ref(
+        a_rows, b_rows, lambda a, b: a[1] == b[1] and a[2] > b[2])
+
+
+def test_the_unsupported_range_surfaces_are_refused(client, schema_name):
+    """The range shapes the compiler has no construction for. A string or
+    float range pair has no order-preserving key at all; pure-range RIGHT and FULL
+    have no inner-join witness on the preserved side; and pure-range LEFT needs a
+    ≤8-byte integer range column, because its threshold is reindexed back onto the
+    range slot. The same 128-bit column is fine under INNER, which builds no
+    threshold."""
+    sn = schema_name
+    for name, col in (("a", "x"), ("b", "y")):
+        client.execute_sql(
+            f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, {col} BIGINT NOT NULL, "
+            f"s VARCHAR(20) NOT NULL, f DOUBLE NOT NULL, w DECIMAL(38, 0) NOT NULL)",
             schema_name=sn)
+    for on, kind in [("a.s < b.s", ""), ("a.f < b.f", ""),
+                     ("a.x < b.y", "RIGHT"), ("a.x < b.y", "FULL"),
+                     ("a.w < b.w", "LEFT")]:
+        with pytest.raises(Exception):
+            _pair_view(client, sn, on, kind, name="bad")
+        with pytest.raises(Exception):
+            client.resolve_table(sn, "bad")
+
+    _pair_view(client, sn, "a.w < b.w", name="ok")
+
+
+# ── band outer: ν = positive_part(A − π_A(inner)) ─────────────────────────────
+
+def test_band_left_null_fills_a_row_until_it_has_a_match(client, band):
+    """The null-fill life cycle, and its multiplicity. A left row with no b in its
+    equality group satisfying the band null-fills; a ΔB giving it a first match
+    retracts the null-fill in the same epoch the pair appears, and deleting that b
+    restores it. A row matched twice stays matched until the LAST match retracts —
+    ν sums the matched weight, it does not count matches. Deleting a *matched* left
+    row leaves no `(a, NULL)` tombstone: `ΔA = −a` and `Δinner = −a` cancel."""
+    vid = _pair_view(client, band, "a.k = b.k AND a.lo <= b.t", "LEFT")
+    _fill(client, band, "b", [(1, 1, 50)])
+    # a1 matches b1; a2's group has no b; a3's lo is above every t in its group.
+    _fill(client, band, "a", [(1, 1, 10), (2, 2, 10), (3, 3, 999)])
+    assert _live(client, vid) == {(1, 1): 1, (2, None): 1, (3, None): 1}
+
+    _fill(client, band, "b", [(2, 2, 20)])
+    assert _live(client, vid) == {(1, 1): 1, (2, 2): 1, (3, None): 1}
+    client.execute_sql("DELETE FROM b WHERE id = 2", schema_name=band)
+    assert _live(client, vid) == {(1, 1): 1, (2, None): 1, (3, None): 1}
+
+    # a1 now matches b1 and b3; dropping one leaves it matched, dropping both fills.
+    _fill(client, band, "b", [(3, 1, 30)])
+    assert _live(client, vid) == {(1, 1): 1, (1, 3): 1, (2, None): 1, (3, None): 1}
+    client.execute_sql("DELETE FROM b WHERE id = 1", schema_name=band)
+    assert _live(client, vid) == {(1, 3): 1, (2, None): 1, (3, None): 1}
+    client.execute_sql("DELETE FROM b WHERE id = 3", schema_name=band)
+    assert _live(client, vid) == {(1, None): 1, (2, None): 1, (3, None): 1}
+
+    # Give a1 a match again, then delete it while matched: no tombstone survives.
+    _fill(client, band, "b", [(4, 1, 30)])
+    client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=band)
+    assert _live(client, vid) == {(2, None): 1, (3, None): 1}
+
+
+def test_band_left_decides_a_match_in_the_epoch_the_row_arrives(client, band):
+    """b's match is already in the trace when a is inserted, so a's match is
+    decided in the same epoch as its insertion: exactly one pair and no net
+    `(a, NULL)`. A non-matching a in the same batch still null-fills, so the epoch
+    handles a mixed delta rather than suppressing every fill."""
+    vid = _pair_view(client, band, "a.k = b.k AND a.lo <= b.t", "LEFT")
+    _fill(client, band, "b", [(1, 1, 50)])
+    _fill(client, band, "a", [(1, 1, 10), (2, 7, 10)])
+
+    assert _live(client, vid) == {(1, 1): 1, (2, None): 1}
+
+
+def test_band_left_null_fills_correctly_across_eq_groups_on_every_worker(client, band):
+    """ν is computed partition-locally, so it must be right without a global view:
+    never a spurious null-fill for a matched row, never a dropped one for an
+    unmatched row whose group lives on another worker. b is seeded in the even
+    groups only, a in every group, over enough groups to reach all four workers."""
+    vid = _pair_view(client, band, "a.k = b.k AND a.lo <= b.t", "LEFT")
+    ng = 40
+    b_rows = [(g, g, 100) for g in range(2, ng + 1, 2)]
+    a_rows = [(g, g, 10) for g in range(1, ng + 1)]
+    _fill(client, band, "b", b_rows)
+    _fill(client, band, "a", a_rows)
+
+    assert _live(client, vid) == _left_ref(
+        a_rows, b_rows, lambda a, b: a[1] == b[1] and a[2] <= b[2])
+
+
+def test_band_left_null_fills_a_row_no_predicate_can_match(client, schema_name):
+    """A left row with a NULL equality or range column is filtered out of the inner
+    match, yet is still a left row — ν reads the UNFILTERED input, so it null-fills
+    exactly once. There is no bypass branch; the subtraction subsumes it."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT, lo BIGINT)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
+        "t BIGINT NOT NULL)", schema_name=sn)
+    vid = _pair_view(client, sn, "a.k = b.k AND a.lo <= b.t", "LEFT")
+    _fill(client, sn, "b", [(1, 1, 100)])
+    _fill(client, sn, "a", [(1, None, 10), (2, 1, None), (3, 1, 10)])
+
+    assert _live(client, vid) == {(1, None): 1, (2, None): 1, (3, 1): 1}
+
+
+def test_band_left_is_weight_exact_over_a_bag_valued_preserved_side(client, schema_name):
+    """A preserved side whose identities carry weight > 1: a `UNION ALL` view that
+    drops the source PK, so two duplicate `(k, lo)` rows collapse onto one
+    `_set_pk` identity of weight 2.
+
+    ν subtracts the RAW matched multiplicity `w_A · S` and clamps the result, so a
+    matched weight-2 identity reaches `w_A · (1 − S) ≤ 0` and null-fills not at
+    all, while an unmatched one null-fills at the full weight 2. Clamping the
+    witness to 1 instead leaks a weight-1 fill beside the matched rows."""
+    sn = schema_name
+    for tbl in ("t1", "t2"):
         client.execute_sql(
-            "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
+            f"CREATE TABLE {tbl} (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
+            f"lo BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE inr (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
+        "t BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW uv AS SELECT k, lo FROM t1 UNION ALL SELECT k, lo FROM t2",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT uv.k AS uk, uv.lo AS ulo, inr.id AS bid "
+        "FROM uv LEFT JOIN inr ON uv.k = inr.k AND uv.lo <= inr.t", schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
+
+    _fill(client, sn, "inr", [(100, 5, 50)])
+    # (5,10) twice → a matched weight-2 identity; (9,10) twice → unmatched.
+    _fill(client, sn, "t1", [(1, 5, 10), (2, 5, 10), (3, 9, 10), (4, 9, 10)])
+    assert bag(client.scan(vid), "uk", "ulo", "bid") == {
+        (5, 10, 100): 2, (9, 10, None): 2}
+
+    client.execute_sql("DELETE FROM inr WHERE id = 100", schema_name=sn)
+    assert bag(client.scan(vid), "uk", "ulo", "bid") == {
+        (5, 10, None): 2, (9, 10, None): 2}
+
+
+@pytest.mark.parametrize("kind", ["RIGHT", "FULL"])
+def test_band_preserves_the_other_side_in_the_mirror_orientations(client, band, kind):
+    """RIGHT is the band ν with the sides swapped and FULL runs it on both, each
+    unmatched row filling exactly once whichever side it is on — whether it is
+    unmatched because its equality group is empty or because nothing in that group
+    satisfies the range. The b rows share a payload and differ only in PK, and two
+    a rows match each of them, so the re-key onto the pair-PK must keep all four
+    matched pairs apart."""
+    vid = _pair_view(client, band, "a.k = b.k AND a.lo <= b.t", kind)
+    # a1, a2 qualify for b1 and b2 alike. a3's group holds no b and a4's lo is
+    # above every t in its group; b3's group holds no a and b4's t is below every
+    # lo in its group.
+    a_rows = [(1, 7, 10), (2, 7, 10), (3, 8, 10), (4, 7, 999)]
+    b_rows = [(1, 7, 50), (2, 7, 50), (3, 9, 50), (4, 7, 5)]
+    _fill(client, band, "a", a_rows)
+    _fill(client, band, "b", b_rows)
+
+    def pred(a, b):
+        return a[1] == b[1] and a[2] <= b[2]
+
+    want = _ref(a_rows, b_rows, pred)
+    want |= {(None, b[0]): 1 for b in b_rows if not any(pred(a, b) for a in a_rows)}
+    if kind == "FULL":
+        want |= {(a[0], None): 1 for a in a_rows if not any(pred(a, b) for b in b_rows)}
+    assert _live(client, vid) == want
+
+
+def test_band_full_null_fills_that_share_a_pair_pk_stay_distinct(client, band):
+    """A left-only row with `a.id = 0` and a right-only row with `b.id = 0` both
+    carry pair-PK `(0, 0)` — the absent side's slot packs to the synthetic 0 — but
+    they are two (PK, payload) elements, their null bitmaps differing. Both must
+    survive consolidation: a join view has no per-PK uniqueness."""
+    vid = _pair_view(client, band, "a.k = b.k AND a.lo <= b.t", "FULL")
+    _fill(client, band, "a", [(0, 1, 10)])
+    _fill(client, band, "b", [(0, 2, 50)])
+
+    assert _live(client, vid) == {(0, None): 1, (None, 0): 1}
+
+
+# ── pure-range LEFT: ν = A − (A ⋈ {m}) against the MIN/MAX threshold ──────────
+
+def test_pure_range_left_null_fill_follows_the_extremum(client, rng):
+    """Existence depends on the extremum alone: `∃b. a.x < b.y ⟺ a.x < MAX(b.y)`.
+    Deleting the EXTREME b raises the threshold, so an untouched a between the old
+    and new extremum flips to null-filled; deleting a non-extreme b moves no
+    threshold and must flip nothing. Deleting a matched a retracts its pairs and
+    leaves no tombstone."""
+    vid = _pair_view(client, rng, "a.x < b.y", "LEFT")
+    b_rows = [(1, 20), (2, 40), (3, 60), (4, 80), (5, 100)]
+    a_rows = [(1, 10), (2, 50), (3, 90), (4, 100), (5, 150)]
+    _fill(client, rng, "b", b_rows)
+    _fill(client, rng, "a", a_rows)
+
+    def check(a_rows, b_rows, ctx):
+        want = _left_ref(a_rows, b_rows, lambda a, b: a[1] < b[1])
+        assert _live(client, vid) == want, ctx
+
+    check(a_rows, b_rows, "a4 and a5 are at or above MAX = 100")
+
+    client.execute_sql("DELETE FROM b WHERE id = 5", schema_name=rng)
+    b_rows = [r for r in b_rows if r[0] != 5]
+    check(a_rows, b_rows, "MAX drops to 80, so the untouched a3 (x=90) null-fills")
+
+    nulls = {a for a, b in _live(client, vid) if b is None}
+    client.execute_sql("DELETE FROM b WHERE id = 1", schema_name=rng)
+    b_rows = [r for r in b_rows if r[0] != 1]
+    check(a_rows, b_rows, "a non-extreme b leaves the threshold where it was")
+    assert {a for a, b in _live(client, vid) if b is None} == nulls
+
+    client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=rng)
+    a_rows = [r for r in a_rows if r[0] != 1]
+    check(a_rows, b_rows, "a matched left row leaves no null-fill tombstone")
+
+
+def test_pure_range_left_decides_a_match_in_the_epoch_the_row_arrives(client, rng):
+    """The threshold already covers a's match before a is inserted, so the matched
+    a's passthrough `+a` and the `A ⋈ {m}` term's `−a` are byte-identical and
+    cancel in-epoch: exactly one pair, never a transient `(a, NULL)`. A
+    non-matching a in the same batch still null-fills."""
+    vid = _pair_view(client, rng, "a.x < b.y", "LEFT")
+    _fill(client, rng, "b", [(1, 50)])
+    _fill(client, rng, "a", [(1, 10), (2, 80)])
+
+    assert _live(client, vid) == {(1, 1): 1, (2, None): 1}
+
+
+def test_pure_range_left_null_fills_each_row_once_under_the_broadcast(client, schema_name):
+    """The pure-range relay broadcasts ΔA to every worker, so a row matching no b
+    anywhere must still null-fill exactly ONCE rather than W times: the a.x owner
+    produces the single fill and the pair-PK shard routes it once. A row whose
+    range key is NULL takes the dedicated branch routed by a.pk and must be
+    weight 1 too."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT)", schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)",
+        schema_name=sn)
+    vid = _pair_view(client, sn, "a.x < b.y", "LEFT")
+    _fill(client, sn, "b", [(i, 10 * i) for i in range(1, 9)])       # MAX = 80
+    _fill(client, sn, "a", [(i, 80 + i) for i in range(1, 21)] + [(99, None)])
+
+    assert _live(client, vid) == {(i, None): 1 for i in list(range(1, 21)) + [99]}
+
+
+def test_pure_range_left_with_no_threshold_value_null_fills_everything(
+        client, schema_name):
+    """`m` is empty when b holds no rows AND when every b.y is NULL (MIN/MAX skip
+    NULLs), and `A − ∅ = A` either way — no sentinel value is involved. Refilling
+    b retracts the fills of the a's the new threshold covers."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT)", schema_name=sn)
+    vid = _pair_view(client, sn, "a.x < b.y", "LEFT")
+    _fill(client, sn, "a", [(1, 10), (2, 20), (3, 1000)])
+    assert _live(client, vid) == {(1, None): 1, (2, None): 1, (3, None): 1}
+
+    _fill(client, sn, "b", [(1, None), (2, None)])
+    assert _live(client, vid) == {(1, None): 1, (2, None): 1, (3, None): 1}, \
+        "rows with no live range value leave the threshold empty"
+
+    _fill(client, sn, "b", [(3, 100)])
+    assert _live(client, vid) == {(1, 3): 1, (2, 3): 1, (3, None): 1}
+    client.execute_sql("DELETE FROM b WHERE id = 3", schema_name=sn)
+    assert _live(client, vid) == {(1, None): 1, (2, None): 1, (3, None): 1}
+
+
+@pytest.mark.parametrize("op", list(_OPS))
+def test_pure_range_left_picks_the_threshold_each_operator_needs(client, rng, op):
+    """`< <=` null-fill against MAX and `> >=` against MIN, with the exact-boundary
+    rows `x == MIN` and `x == MAX` in the data so the strict operators exclude them
+    and the inclusive ones do not."""
+    vid = _pair_view(client, rng, f"a.x {op} b.y", "LEFT")
+    b_rows = [(1, 30), (2, 50), (3, 70)]
+    a_rows = [(1, 10), (2, 30), (3, 50), (4, 70), (5, 90)]
+    _fill(client, rng, "b", b_rows)
+    _fill(client, rng, "a", a_rows)
+
+    cmp = _OPS[op]
+    assert _live(client, vid) == _left_ref(
+        a_rows, b_rows, lambda a, b: cmp(a[1], b[1]))
+
+
+def test_pure_range_left_encodes_the_threshold_in_the_promoted_compare_type(
+        client, schema_name):
+    """MIN/MAX label their output I64 by the aggregate contract, but the threshold
+    is probed as OPK bytes in the PROMOTED compare type. With a U64 extremum above
+    `I64::MAX`, a wrong signed flip would order it at the bottom and invert every
+    match."""
+    sn = schema_name
+    for name, col in (("a", "x"), ("b", "y")):
+        client.execute_sql(
+            f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, "
+            f"{col} BIGINT UNSIGNED NOT NULL)", schema_name=sn)
+    vid = _pair_view(client, sn, "a.x < b.y", "LEFT")
+    big = 18_000_000_000_000_000_000            # above I64::MAX, below U64::MAX
+    _fill(client, sn, "b", [(1, big)])
+    _fill(client, sn, "a", [(1, 10), (2, big + 1)])
+
+    assert _live(client, vid) == {(1, 1): 1, (2, None): 1}
+
+
+@pytest.mark.parametrize("ty", ["INT NOT NULL", "INT UNSIGNED NOT NULL",
+                                "SMALLINT NOT NULL"])
+def test_pure_range_left_carries_a_narrow_integer_range_column(client, schema_name, ty):
+    """MIN/MAX preserve the source integer type, so the inline threshold reduce
+    emits the narrow type the reindex consumes directly — I32, U32 and I16 all
+    complete the chain, and deleting the extreme b re-null-fills an untouched a
+    between the old and new threshold."""
+    sn = schema_name
+    for name, col in (("a", "x"), ("b", "y")):
+        client.execute_sql(
+            f"CREATE TABLE {name} (id BIGINT NOT NULL PRIMARY KEY, {col} {ty})",
             schema_name=sn)
+    vid = _pair_view(client, sn, "a.x < b.y", "LEFT")
+    b_rows = [(1, 20), (2, 60), (3, 100)]
+    a_rows = [(1, 10), (2, 70), (3, 100), (4, 200)]
+    _fill(client, sn, "b", b_rows)
+    _fill(client, sn, "a", a_rows)
+    assert _live(client, vid) == _left_ref(a_rows, b_rows, lambda a, b: a[1] < b[1])
+
+    client.execute_sql("DELETE FROM b WHERE id = 3", schema_name=sn)
+    b_rows = [r for r in b_rows if r[0] != 3]
+    assert _live(client, vid) == _left_ref(a_rows, b_rows, lambda a, b: a[1] < b[1])
+
+
+def test_pure_range_left_is_weight_exact_over_a_bag_valued_preserved_side(
+        client, schema_name):
+    """A `UNION ALL` view as the preserved side, each logical row present twice.
+    The one-row threshold cannot multiply, so a matched row's null-fills sum to
+    zero and an unmatched row's sum to its input multiplicity."""
+    sn = schema_name
+    for tbl in ("a1", "a2"):
         client.execute_sql(
-            "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid "
-            "FROM a LEFT JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=sn)
-        vid, _ = client.resolve_table(sn, "v")
-        return vid, (lambda a, b: a[1] == b[1] and a[2] <= b[2])
+            f"CREATE TABLE {tbl} (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)",
+            schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW u AS SELECT id, x FROM a1 UNION ALL SELECT id, x FROM a2",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT u.id AS aid, b.id AS bid FROM u LEFT JOIN b ON u.x < b.y",
+        schema_name=sn)
+    vid = client.resolve_table(sn, "v")[0]
 
-    def test_band_left_delta_a_then_b(self, client):
-        """ΔA then ΔB, plus retraction and match-multiplicity. An a with no b in its
-        k-group satisfying lo<=t null-fills; a ΔB that gives it a first match retracts
-        the null-fill and emits the pair; deleting that b restores the null-fill. An a
-        with two matches stays matched until the LAST retracts (distinct over summed
-        a.pk weights — multiplicity, not a 0-boundary crossing, until the end)."""
-        sn = "blab" + _uid()
-        client.create_schema(sn)
-        try:
-            vid, pred = self._mk_band_left(client, sn)
+    _fill(client, sn, "b", [(1, 50)])
+    # id 1 (x=10) matches b1; id 2 (x=99) does not. Each arrives from both branches.
+    _fill(client, sn, "a1", [(1, 10), (2, 99)])
+    _fill(client, sn, "a2", [(1, 10), (2, 99)])
 
-            # Seed b thin: one row in group k=1 only.
-            b_rows = [(1, 1, 50)]
-            client.execute_sql("INSERT INTO b VALUES (1, 1, 50)", schema_name=sn)
+    assert _live(client, vid) == {(1, 1): 2, (2, None): 2}
 
-            # a1 (k=1, lo=10) matches b1; a2 (k=2) and a3 (k=3, lo=999) have no b in
-            # their group satisfying the band → null-fills.
-            a_rows = [(1, 1, 10), (2, 2, 10), (3, 3, 999)]
-            client.execute_sql("INSERT INTO a VALUES (1,1,10), (2,2,10), (3,3,999)", schema_name=sn)
-            assert _band_left_rows(client, vid) == _band_left_ref(a_rows, b_rows, pred)
-            assert _band_left_rows(client, vid) == {(1, 1), (2, None), (3, None)}
 
-            # ΔB: b2 in group k=2 (t=20 ≥ a2.lo=10) → a2 gains its first match.
-            b_rows.append((2, 2, 20))
-            client.execute_sql("INSERT INTO b VALUES (2, 2, 20)", schema_name=sn)
-            assert _band_left_rows(client, vid) == _band_left_ref(a_rows, b_rows, pred)
-            assert _band_left_rows(client, vid) == {(1, 1), (2, 2), (3, None)}
-
-            # Delete b2 → a2's last (only) match gone → (a2, NULL) returns.
-            b_rows = [r for r in b_rows if r[0] != 2]
-            client.execute_sql("DELETE FROM b WHERE id = 2", schema_name=sn)
-            assert _band_left_rows(client, vid) == {(1, 1), (2, None), (3, None)}
-
-            # Multiplicity: add b3 (k=1, t=30) so a1 matches BOTH b1 and b3.
-            b_rows.append((3, 1, 30))
-            client.execute_sql("INSERT INTO b VALUES (3, 1, 30)", schema_name=sn)
-            rows = _band_left_rows(client, vid)
-            assert rows == _band_left_ref(a_rows, b_rows, pred)
-            assert (1, None) not in rows                      # matched twice — no null-fill
-            # Drop one of a1's two matches → still matched.
-            b_rows = [r for r in b_rows if r[0] != 1]
-            client.execute_sql("DELETE FROM b WHERE id = 1", schema_name=sn)
-            rows = _band_left_rows(client, vid)
-            assert (1, None) not in rows
-            assert rows == {(1, 3), (2, None), (3, None)}
-            # Drop a1's last match → (a1, NULL) finally appears.
-            b_rows = [r for r in b_rows if r[0] != 3]
-            client.execute_sql("DELETE FROM b WHERE id = 3", schema_name=sn)
-            assert _band_left_rows(client, vid) == {(1, None), (2, None), (3, None)}
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_band_left_same_epoch_match(self, client):
-        """Same-epoch insert-and-match: b's match already sits in the trace, then a is
-        inserted; its match is decided in the SAME epoch as its insertion. The result
-        is exactly one (a, b) and NO net (a, NULL) — distinct sees ΔD=+a in this epoch
-        (the inner join's AB term) and cancels ΔA=+a. This is the case a key-only
-        anti-join cannot get right for a range predicate. A non-matching a inserted in
-        the same epoch still null-fills, proving the epoch handles a mixed batch."""
-        sn = "blse" + _uid()
-        client.create_schema(sn)
-        try:
-            vid, pred = self._mk_band_left(client, sn)
-            # b's matches live in the trace before a arrives.
-            b_rows = [(1, 1, 50)]
-            client.execute_sql("INSERT INTO b VALUES (1, 1, 50)", schema_name=sn)
-            # One epoch: a1 matches the existing b1; a2 (k=7) has no b.
-            a_rows = [(1, 1, 10), (2, 7, 10)]
-            client.execute_sql("INSERT INTO a VALUES (1,1,10), (2,7,10)", schema_name=sn)
-            rows = _band_left_rows(client, vid)
-            assert rows == _band_left_ref(a_rows, b_rows, pred)
-            assert rows == {(1, 1), (2, None)}
-            assert (1, None) not in rows                      # no same-epoch null-fill for a1
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_band_left_delete_matched_row(self, client):
-        """Delete a matched left row: from steady state (a matched, no null-fill),
-        deleting a retracts (a, b) and emits NO (a, NULL) — ΔA=−a and ΔD=−a cancel
-        (distinct 1→0 in the same epoch). A broken cancellation would surface a
-        spurious (a, NULL) tombstone in the integrated view."""
-        sn = "bldm" + _uid()
-        client.create_schema(sn)
-        try:
-            vid, _pred = self._mk_band_left(client, sn)
-            client.execute_sql("INSERT INTO b VALUES (1, 1, 50)", schema_name=sn)
-            client.execute_sql("INSERT INTO a VALUES (1, 1, 10)", schema_name=sn)
-            rows = _band_left_rows(client, vid)
-            assert rows == {(1, 1)}
-            assert (1, None) not in rows
-            # Delete the matched a → fully gone, no null-fill emitted.
-            client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=sn)
-            assert _band_left_rows(client, vid) == set()
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_band_left_cross_worker_eq_groups(self, client):
-        """Many distinct eq-key groups spread across all four workers, some matched
-        and some not. The partition-local distinct must be globally correct: never a
-        spurious null-fill for a matched a, never a dropped null-fill for an unmatched
-        a whose group lives on another worker. b is seeded only in EVEN groups; a is
-        inserted in EVERY group, so odd-group a's null-fill and even-group a's match."""
-        sn = "blcw" + _uid()
-        client.create_schema(sn)
-        try:
-            vid, pred = self._mk_band_left(client, sn)
-            ng = 40                                            # groups fan out across W=4
-            b_rows = [(g, g, 100) for g in range(2, ng + 1, 2)]   # even groups only
-            a_rows = [(g, g, 10) for g in range(1, ng + 1)]       # all groups, lo=10 ≤ 100
-            client.execute_sql(
-                "INSERT INTO b VALUES " + ",".join(f"({i},{k},{t})" for i, k, t in b_rows),
-                schema_name=sn)
-            client.execute_sql(
-                "INSERT INTO a VALUES " + ",".join(f"({i},{k},{lo})" for i, k, lo in a_rows),
-                schema_name=sn)
-            assert _band_left_rows(client, vid) == _band_left_ref(a_rows, b_rows, pred)
-            # Sanity: even groups matched, odd groups null-filled.
-            rows = _band_left_rows(client, vid)
-            assert (2, 2) in rows and (1, None) in rows and (3, None) in rows
-            assert (1, 1) not in rows
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_band_left_null_join_key(self, client):
-        """A left row with a NULL eq or NULL range column can never satisfy the
-        predicate (SQL 3VL): it is filtered out of the inner match (never in D) yet is
-        still a left row (in A, sourced from the UNFILTERED input) → null-filled
-        exactly once. No bypass branch exists; the A − D difference subsumes it."""
-        sn = "blnk" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, k BIGINT, lo BIGINT)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid "
-                "FROM a LEFT JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            client.execute_sql("INSERT INTO b VALUES (1, 1, 100)", schema_name=sn)
-            # a1: NULL eq key. a2: NULL range key. a3: fully defined, matches b1.
-            client.execute_sql(
-                "INSERT INTO a VALUES (1, NULL, 10), (2, 1, NULL), (3, 1, 10)", schema_name=sn)
-            rows = _band_left_rows(client, vid)
-            assert rows == {(1, None), (2, None), (3, 1)}
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_band_left_payload_fidelity_wide_pk(self, client):
-        """Byte-exact (A, D) cancellation under a STRING column, a nullable column
-        carrying NULL, and a 2-column (wide) source PK. A matched left row's +1 (from
-        A) and −1 (from distinct(π_A(inner))) must be byte-identical so they cancel —
-        a stride/encoding mismatch would leave a spurious (a, NULL). Phase 1 inserts
-        only matched a's and asserts ZERO null-fills with exact payload; phase 2 adds
-        unmatched a's and asserts their null-fills carry the exact A payload."""
-        sn = "blpf" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id1 BIGINT NOT NULL, id2 BIGINT NOT NULL, k BIGINT NOT NULL, "
-                "lo BIGINT NOT NULL, s VARCHAR(16) NOT NULL, note BIGINT, PRIMARY KEY (id1, id2))",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.id1 AS aid1, a.id2 AS aid2, a.s AS asv, "
-                "a.note AS anote, b.id AS bid "
-                "FROM a LEFT JOIN b ON a.k = b.k AND a.lo <= b.t", schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-
-            def rowset():
-                return {(r["aid1"], r["aid2"], r["asv"], r["anote"], r["bid"])
-                        for r in client.scan(vid)}
-
-            client.execute_sql("INSERT INTO b VALUES (1, 1, 100), (2, 2, 100)", schema_name=sn)
-            # Phase 1 — every a matches (string + nullable note in payload).
-            client.execute_sql(
-                "INSERT INTO a VALUES (1, 1, 1, 10, 'alpha', 7), (1, 2, 2, 20, 'beta', NULL)",
-                schema_name=sn)
-            got = rowset()
-            assert got == {(1, 1, "alpha", 7, 1), (1, 2, "beta", None, 2)}
-            assert all(r[4] is not None for r in got), "matched rows must not null-fill (clean A − D)"
-
-            # Phase 2 — add unmatched a's (group with no b / lo above every b.t).
-            client.execute_sql(
-                "INSERT INTO a VALUES (2, 1, 9, 10, 'gamma', 42), (2, 2, 1, 999, 'delta', NULL)",
-                schema_name=sn)
-            assert rowset() == {
-                (1, 1, "alpha", 7, 1), (1, 2, "beta", None, 2),
-                (2, 1, "gamma", 42, None), (2, 2, "delta", None, None),
-            }
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_band_left_bag_valued_view(self, client):
-        """Bag-valued (non-unique-PK) preserved side — the weight-exactness bug fix.
-        A UNION ALL view that DROPS the PK collapses duplicate (k, lo) rows to ONE
-        _set_pk identity of weight 2. `positive_part(A − π_A(inner))` subtracts the
-        RAW matched multiplicity (= w_A·S) and clamps the result, so a MATCHED
-        weight-2 identity reaches w_A·(1−S) ≤ 0 → 0 null-fills (the retired
-        `A − distinct(π_A(inner))` form clamped the witness to 1 and leaked a spurious
-        weight-1 (k, lo, NULL)); an UNMATCHED weight-2 identity null-fills at the full
-        weight 2. Runs the view-encoded (non-unique a.pk) left side through the band
-        scaffolding for the first time, at W=4."""
-        sn = "blbag" + _uid()
-        client.create_schema(sn)
-        try:
-            for tbl in ("t1", "t2"):
-                client.execute_sql(
-                    f"CREATE TABLE {tbl} (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, lo BIGINT NOT NULL)",
-                    schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE inr (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, t BIGINT NOT NULL)",
-                schema_name=sn)
-            # uv drops the source PK, so duplicate (k, lo) rows within a branch
-            # collapse to one _set_pk identity whose weight is their multiplicity.
-            client.execute_sql(
-                "CREATE VIEW uv AS SELECT k, lo FROM t1 UNION ALL SELECT k, lo FROM t2", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT uv.k AS uk, uv.lo AS ulo, inr.id AS bid "
-                "FROM uv LEFT JOIN inr ON uv.k = inr.k AND uv.lo <= inr.t", schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-
-            def weighted():
-                return {(r["uk"], r["ulo"], r["bid"]): r.weight
-                        for r in client.scan(vid)}
-
-            # inr matches the k=5 group only; the k=9 group has no inr row.
-            client.execute_sql("INSERT INTO inr VALUES (100, 5, 50)", schema_name=sn)
-            # t1: (5,10)×2 → weight-2 MATCHED identity; (9,10)×2 → weight-2 UNMATCHED.
-            client.execute_sql(
-                "INSERT INTO t1 VALUES (1, 5, 10), (2, 5, 10), (3, 9, 10), (4, 9, 10)", schema_name=sn)
-
-            got = weighted()
-            assert got.get((5, 10, 100)) == 2, f"matched bag identity: 2 matched rows expected, got {got}"
-            assert (5, 10, None) not in got, \
-                f"matched bag must NOT null-fill (positive_part is weight-exact); got {got}"
-            assert got.get((9, 10, None)) == 2, f"unmatched bag identity null-fills at full weight 2, got {got}"
-
-            # Retract the only matching inr → the matched weight-2 identity flips to a
-            # full weight-2 null-fill, and the matched pairs retract cleanly.
-            client.execute_sql("DELETE FROM inr WHERE id = 100", schema_name=sn)
-            got = weighted()
-            assert (5, 10, 100) not in got, f"matched pair must retract, got {got}"
-            assert got.get((5, 10, None)) == 2, f"flipped identity null-fills at full weight 2, got {got}"
-            assert got.get((9, 10, None)) == 2, f"untouched identity unchanged, got {got}"
-        finally:
-            _drop_all(client, sn, views=["v", "uv"], tables=["t1", "t2", "inr"])
-
-    # ── Pure-range LEFT OUTER (no eq conjunct): the MAX/MIN threshold null-fill ──
-    #
-    # `∃b. a.x < b.y  ⟺  a.x < MAX(b.y)`, so the unmatched left rows are exactly
-    # those on the null-fill side of a single scalar threshold `m` (MAX for `< <=`,
-    # MIN for `> >=`). The null-fill is the subtraction `A − (A ⋈ {m})` against the
-    # one-row `m`, computed by an INLINE shard-free reduce over the broadcast `b`
-    # (no catalog helpers, no sentinel — an empty `m` simply null-fills all of `A`).
-    # The view projects `a.id AS aid, b.id AS bid`; a null-fill row is (aid, None).
-    # The reference reuses `_band_left_ref` with a pure-range predicate.
-
-    def _mk_pure_range_left(self, client, sn, op="<",
-                            a_x="BIGINT NOT NULL", b_y="BIGINT NOT NULL"):
-        """CREATE a/b/v for the standard pure-range LEFT view; return (vid, pred).
-
-        `a_x`/`b_y` are the range column types (default a non-null BIGINT pair) so a
-        caller can vary nullability or signedness without re-inlining the DDL."""
+def test_a_null_fill_carries_the_preserved_row_payload_byte_for_byte(client, schema_name):
+    """A matched row's passthrough `+x` and the matched term's `−x` must be
+    byte-identical or a stride or encoding mismatch leaves a spurious null-fill
+    behind — so this runs both shapes over the same wide-PK left side, with a
+    string column and a nullable column carrying NULL. The matched rows null-fill
+    not at all, and the unmatched ones' fills carry the exact preserved payload."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE a (id1 BIGINT NOT NULL, id2 BIGINT NOT NULL, k BIGINT NOT NULL, "
+        "x BIGINT NOT NULL, s VARCHAR(16) NOT NULL, note BIGINT, PRIMARY KEY (id1, id2))",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, "
+        "t BIGINT NOT NULL)", schema_name=sn)
+    for name, on in (("bd", "a.k = b.k AND a.x <= b.t"), ("pr", "a.x < b.t")):
         client.execute_sql(
-            f"CREATE TABLE a (id BIGINT NOT NULL PRIMARY KEY, x {a_x})", schema_name=sn)
-        client.execute_sql(
-            f"CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y {b_y})", schema_name=sn)
-        client.execute_sql(
-            f"CREATE VIEW v AS SELECT a.id AS aid, b.id AS bid "
-            f"FROM a LEFT JOIN b ON a.x {op} b.y", schema_name=sn)
-        vid, _ = client.resolve_table(sn, "v")
-        cmp = dict(_RANGE_OPS)[op]
-        return vid, (lambda a, b: cmp(a[1], b[1]))
+            f"CREATE VIEW {name} AS SELECT a.id1, a.id2, a.s, a.note, b.id AS bid "
+            f"FROM a LEFT JOIN b ON {on}", schema_name=sn)
+    ids = [client.resolve_table(sn, n)[0] for n in ("bd", "pr")]
 
-    def test_pure_range_left_delta_a_then_b(self, client):
-        """ΔA then ΔB, plus retraction across the threshold. An a with x >= MAX(b.y)
-        null-fills; a ΔB that raises MAX past it retracts the null-fill and emits the
-        pairs; deleting that b restores the null-fill. Matched a's never null-fill."""
-        sn = "prab" + _uid()
-        client.create_schema(sn)
-        try:
-            vid, pred = self._mk_pure_range_left(client, sn, "<")
-            # b thin: MAX(b.y) = 50.
-            b_rows = [(1, 50)]
-            client.execute_sql("INSERT INTO b VALUES (1, 50)", schema_name=sn)
-            # a1 (x=10) < 50 → matches b1. a2 (x=50) and a3 (x=999) are >= 50 → null-fill.
-            a_rows = [(1, 10), (2, 50), (3, 999)]
-            client.execute_sql("INSERT INTO a VALUES (1,10), (2,50), (3,999)", schema_name=sn)
-            assert _band_left_rows(client, vid) == _band_left_ref(a_rows, b_rows, pred)
-            assert _band_left_rows(client, vid) == {(1, 1), (2, None), (3, None)}
+    def live(vid):
+        return bag(client.scan(vid), "id1", "id2", "s", "note", "bid")
 
-            # ΔB: b2 (y=100) raises MAX to 100. a2 (x=50<100) gains a match.
-            b_rows.append((2, 100))
-            client.execute_sql("INSERT INTO b VALUES (2, 100)", schema_name=sn)
-            assert _band_left_rows(client, vid) == _band_left_ref(a_rows, b_rows, pred)
-            assert _band_left_rows(client, vid) == {(1, 1), (1, 2), (2, 2), (3, None)}
+    client.execute_sql("INSERT INTO b VALUES (1, 1, 100), (2, 2, 100)", schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO a VALUES (1, 1, 1, 10, 'alpha', 7), (1, 2, 2, 20, 'beta', NULL)",
+        schema_name=sn)
+    assert live(ids[0]) == {(1, 1, "alpha", 7, 1): 1, (1, 2, "beta", None, 2): 1}
+    assert live(ids[1]) == {(1, 1, "alpha", 7, 1): 1, (1, 1, "alpha", 7, 2): 1,
+                            (1, 2, "beta", None, 1): 1, (1, 2, "beta", None, 2): 1}
 
-            # Delete b2 → MAX back to 50 → a2 (x=50) flips back to null-fill.
-            b_rows = [r for r in b_rows if r[0] != 2]
-            client.execute_sql("DELETE FROM b WHERE id = 2", schema_name=sn)
-            assert _band_left_rows(client, vid) == {(1, 1), (2, None), (3, None)}
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_pure_range_left_same_epoch_match(self, client):
-        """Same-epoch insert-and-match: b already covers a's match (m already past
-        a.x) before a is inserted. Exactly one pair and NO net (a, NULL) — the
-        matched a's passthrough `+a` and its `matched = A ⋈ {m}` term `−a` are
-        byte-identical and cancel in-epoch, so no (a, NULL) ever surfaces. A
-        non-matching a inserted in the same epoch still null-fills."""
-        sn = "prse" + _uid()
-        client.create_schema(sn)
-        try:
-            vid, pred = self._mk_pure_range_left(client, sn, "<")
-            b_rows = [(1, 50)]
-            client.execute_sql("INSERT INTO b VALUES (1, 50)", schema_name=sn)
-            # One epoch: a1 (x=10 < 50) matches; a2 (x=80 >= 50) does not.
-            a_rows = [(1, 10), (2, 80)]
-            client.execute_sql("INSERT INTO a VALUES (1,10), (2,80)", schema_name=sn)
-            rows = _band_left_rows(client, vid)
-            assert rows == _band_left_ref(a_rows, b_rows, pred)
-            assert rows == {(1, 1), (2, None)}
-            assert (1, None) not in rows                       # no same-epoch null-fill for a1
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_pure_range_left_delete_matched_row(self, client):
-        """Delete a matched left row: from steady state (a matched, no null-fill),
-        deleting a retracts the pair and emits NO (a, NULL) tombstone."""
-        sn = "prdm" + _uid()
-        client.create_schema(sn)
-        try:
-            vid, _pred = self._mk_pure_range_left(client, sn, "<")
-            client.execute_sql("INSERT INTO b VALUES (1, 50)", schema_name=sn)
-            client.execute_sql("INSERT INTO a VALUES (1, 10)", schema_name=sn)
-            assert _band_left_rows(client, vid) == {(1, 1)}
-            client.execute_sql("DELETE FROM a WHERE id = 1", schema_name=sn)
-            assert _band_left_rows(client, vid) == set()
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_pure_range_left_m_flip_across_workers(self, client):
-        """Existence depends ONLY on the extremum m = MAX(b.y). Values scatter
-        across all four workers. Deleting the EXTREME b raises the null-fill
-        threshold so every a between the old and new m flips to null-filled though
-        it was never touched; deleting a NON-extreme b leaves m unchanged → no
-        spurious null-fill (the proof existence depends only on the extremum)."""
-        sn = "prmf" + _uid()
-        client.create_schema(sn)
-        try:
-            vid, pred = self._mk_pure_range_left(client, sn, "<")
-            b_rows = [(1, 20), (2, 40), (3, 60), (4, 80), (5, 100)]   # MAX = 100
-            client.execute_sql(
-                "INSERT INTO b VALUES " + ",".join(f"({i},{y})" for i, y in b_rows), schema_name=sn)
-            a_rows = [(1, 10), (2, 50), (3, 90), (4, 100), (5, 150)]
-            client.execute_sql(
-                "INSERT INTO a VALUES " + ",".join(f"({i},{x})" for i, x in a_rows), schema_name=sn)
-            assert _band_left_rows(client, vid) == _band_left_ref(a_rows, b_rows, pred)
-            # a4 (x=100) and a5 (x=150) are >= MAX(100) → null-fill.
-            rows = _band_left_rows(client, vid)
-            assert (4, None) in rows and (5, None) in rows
-            assert (4, None) not in {(a, b) for (a, b) in rows if b is not None}
-
-            # Delete the EXTREME b5 (y=100). New MAX = 80 → a3 (x=90 >= 80) flips to
-            # null-fill though a3 was untouched.
-            client.execute_sql("DELETE FROM b WHERE id = 5", schema_name=sn)
-            b_rows = [r for r in b_rows if r[0] != 5]
-            assert _band_left_rows(client, vid) == _band_left_ref(a_rows, b_rows, pred)
-            assert (3, None) in _band_left_rows(client, vid)
-
-            # Delete a NON-extreme b1 (y=20). MAX still 80 → NO null-fill flips.
-            null_before = {a for (a, b) in _band_left_rows(client, vid) if b is None}
-            client.execute_sql("DELETE FROM b WHERE id = 1", schema_name=sn)
-            b_rows = [r for r in b_rows if r[0] != 1]
-            assert _band_left_rows(client, vid) == _band_left_ref(a_rows, b_rows, pred)
-            null_after = {a for (a, b) in _band_left_rows(client, vid) if b is None}
-            assert null_before == null_after, "non-extreme b delete must not flip any null-fill"
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_pure_range_left_unmatched_once_under_broadcast(self, client):
-        """A left row matching NO b on ANY worker null-fills EXACTLY ONCE — not W
-        times — even though the pure-range relay broadcasts ΔA to every worker. The
-        a.x owner produces the single null-fill; the pair-PK shard routes it once."""
-        sn = "pru1" + _uid()
-        client.create_schema(sn)
-        try:
-            vid, pred = self._mk_pure_range_left(client, sn, "<")
-            b_rows = [(i, 10 * i) for i in range(1, 9)]            # MAX = 80
-            client.execute_sql(
-                "INSERT INTO b VALUES " + ",".join(f"({i},{y})" for i, y in b_rows), schema_name=sn)
-            # Many a's spread across workers, all >= 80 → each null-fills once.
-            a_rows = [(i, 80 + i) for i in range(1, 21)]
-            client.execute_sql(
-                "INSERT INTO a VALUES " + ",".join(f"({i},{x})" for i, x in a_rows), schema_name=sn)
-            assert _band_left_rows(client, vid) == _band_left_ref(a_rows, b_rows, pred)
-            # Raw weights: every null-fill is weight exactly 1 (no W× broadcast dup).
-            for r in client.scan(vid):
-                if r["bid"] is None:
-                    assert r.weight == 1, f"null-fill for aid={r['aid']} has weight {r.weight} != 1"
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_pure_range_left_empty_b_all_nullfill(self, client):
-        """Empty (and re-filled) right side. With NO b the threshold `m` is empty, so
-        the subtraction `A − (A ⋈ {m})` is `A − ∅ = A` and EVERY left row null-fills
-        — no sentinel needed. The compare type is I64 (a.x:BIGINT vs b.y:INT UNSIGNED
-        promote to I64), so a NEGATIVE a.x below b.y's unsigned min orders correctly:
-        on refill it matches (−5 < 100 in signed order, not as a huge unsigned). Re-
-        inserting b retracts the now-matched a's null-fills."""
-        sn = "preb" + _uid()
-        client.create_schema(sn)
-        try:
-            vid, _ = self._mk_pure_range_left(client, sn, "<", b_y="INT UNSIGNED NOT NULL")
-            # b EMPTY. a's include a negative x (below b.y's unsigned domain).
-            client.execute_sql("INSERT INTO a VALUES (1,-5), (2,0), (3,1000)", schema_name=sn)
-            assert _band_left_rows(client, vid) == {(1, None), (2, None), (3, None)}, \
-                "empty b must null-fill every a, incl a.x below b.y's type min"
-
-            # Re-fill b: MAX(b.y) = 100. a1(-5) and a2(0) now match; a3(1000) stays null.
-            client.execute_sql("INSERT INTO b VALUES (1, 100)", schema_name=sn)
-            assert _band_left_rows(client, vid) == {(1, 1), (2, 1), (3, None)}
-
-            # Empty b again (delete the last b) → all null-fill returns.
-            client.execute_sql("DELETE FROM b WHERE id = 1", schema_name=sn)
-            assert _band_left_rows(client, vid) == {(1, None), (2, None), (3, None)}
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_pure_range_left_all_null_range_b(self, client):
-        """A b with rows but ALL range values NULL behaves identically to empty b
-        (MIN/MAX skip NULL → no value → empty `m` → `A − ∅ = A`) → every a null-fills.
-        Nulling the last live b.y re-null-fills the matched a's."""
-        sn = "prnb" + _uid()
-        client.create_schema(sn)
-        try:
-            vid, _ = self._mk_pure_range_left(client, sn, "<", b_y="BIGINT")
-            client.execute_sql("INSERT INTO b VALUES (1, NULL), (2, NULL)", schema_name=sn)
-            client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 20)", schema_name=sn)
-            assert _band_left_rows(client, vid) == {(1, None), (2, None)}, \
-                "all-NULL-range b must null-fill every a (no MAX value)"
-            # Add a b with a live value → a's below it match (MAX now defined).
-            client.execute_sql("INSERT INTO b VALUES (3, 100)", schema_name=sn)
-            assert _band_left_rows(client, vid) == {(1, 3), (2, 3)}
-            # Delete it → back to all-NULL range → matched a's re-null-fill.
-            client.execute_sql("DELETE FROM b WHERE id = 3", schema_name=sn)
-            assert _band_left_rows(client, vid) == {(1, None), (2, None)}
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_pure_range_left_null_a_x(self, client):
-        """A left row with a NULL range key can never satisfy the predicate (3VL):
-        it is filtered out of the inner match and the threshold compare, yet is
-        still a left row → null-filled EXACTLY once (the dedicated nf_null branch
-        routed by a.pk, not W times under broadcast)."""
-        sn = "prna" + _uid()
-        client.create_schema(sn)
-        try:
-            vid, _ = self._mk_pure_range_left(client, sn, "<", a_x="BIGINT")
-            client.execute_sql("INSERT INTO b VALUES (1, 100)", schema_name=sn)
-            # a1: NULL range key (null-fills). a2: x=5 < 100 (matches).
-            client.execute_sql("INSERT INTO a VALUES (1, NULL), (2, 5)", schema_name=sn)
-            assert _band_left_rows(client, vid) == {(1, None), (2, 1)}
-            for r in client.scan(vid):
-                if r["aid"] == 1:
-                    assert r.weight == 1, f"NULL-a.x null-fill weight {r.weight} != 1 (W× dup?)"
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    @pytest.mark.parametrize("op,cmp", _RANGE_OPS)
-    def test_pure_range_left_all_ops_and_boundary(self, client, op, cmp):
-        """All four ops with the correct MAX/MIN threshold and the EXACT boundary
-        a.x == extremum: `<`/`>` exclude it (null-fill), `<=`/`>=` include it."""
-        sn = "prop" + _uid()
-        client.create_schema(sn)
-        try:
-            vid, pred = self._mk_pure_range_left(client, sn, op)
-            b_rows = [(1, 30), (2, 50), (3, 70)]                 # MAX=70, MIN=30
-            client.execute_sql(
-                "INSERT INTO b VALUES " + ",".join(f"({i},{y})" for i, y in b_rows), schema_name=sn)
-            # a's straddle both extrema, including exact-boundary rows (x==30, x==70).
-            a_rows = [(1, 10), (2, 30), (3, 50), (4, 70), (5, 90)]
-            client.execute_sql(
-                "INSERT INTO a VALUES " + ",".join(f"({i},{x})" for i, x in a_rows), schema_name=sn)
-            assert _band_left_rows(client, vid) == _band_left_ref(a_rows, b_rows, pred), \
-                f"op {op}: pure-range LEFT differs from the cross-filter reference"
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_pure_range_left_u64_boundary(self, client):
-        """Unsigned U64 range column with an extremum ABOVE I64::MAX. The MIN/MAX
-        output is type-labelled I64 by the aggregate contract, but the threshold must
-        be encoded in the promoted compare type (U64) — a wrong I64 sign-flip would
-        order the high-bit-set extreme at the BOTTOM and flip every match. Pin it:
-        small a.x matches a huge b.y; an a.x above the extreme null-fills."""
-        sn = "pru64" + _uid()
-        client.create_schema(sn)
-        try:
-            vid, _ = self._mk_pure_range_left(
-                client, sn, "<", a_x="BIGINT UNSIGNED NOT NULL", b_y="BIGINT UNSIGNED NOT NULL")
-            big = 18_000_000_000_000_000_000               # > I64::MAX (9.22e18), < U64::MAX
-            client.execute_sql(f"INSERT INTO b VALUES (1, {big})", schema_name=sn)
-            # a1 small (< big → match). a2 just above big (>= big → null-fill).
-            client.execute_sql(f"INSERT INTO a VALUES (1, 10), (2, {big + 1})", schema_name=sn)
-            assert _band_left_rows(client, vid) == {(1, 1), (2, None)}, \
-                "U64 extreme above I64::MAX must order unsigned (no sign-flip threshold bug)"
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    def test_pure_range_left_bag_semantics(self, client):
-        """Multiplicity-preserving null-fill over a bag-valued (`UNION ALL`) view as
-        the LEFT input — exercising the view-source path AND that the threshold form
-        never over-fills. The one-row threshold M cannot multiply, so each left row
-        contributes its own null-fill exactly once: a MATCHED logical row gets ZERO
-        null-fill (summed over its branches) and an UNMATCHED one's null-fills sum to
-        its input multiplicity. `u` yields each (id, x) twice (a1 ∪all a2)."""
-        sn = "prbag" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a1 (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE a2 (id BIGINT NOT NULL PRIMARY KEY, x BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW u AS SELECT id, x FROM a1 UNION ALL SELECT id, x FROM a2",
-                schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT u.id AS aid, b.id AS bid "
-                "FROM u LEFT JOIN b ON u.x < b.y", schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-            client.execute_sql("INSERT INTO b VALUES (1, 50)", schema_name=sn)
-            # id=1 (x=10) matches b1; id=2 (x=99) does not — each present twice.
-            client.execute_sql("INSERT INTO a1 VALUES (1, 10), (2, 99)", schema_name=sn)
-            client.execute_sql("INSERT INTO a2 VALUES (1, 10), (2, 99)", schema_name=sn)
-            # Sum weights per (aid, bid): the two branches carry distinct row PKs, so
-            # they are separate rows whose weights add to the input multiplicity (2).
-            from collections import defaultdict
-            w = defaultdict(int)
-            for r in client.scan(vid):
-                w[(r["aid"], r["bid"])] += r.weight
-            assert w[(1, 1)] == 2, f"matched logical row should pair twice: {dict(w)}"
-            assert w[(1, None)] == 0, f"matched row must NOT null-fill: {dict(w)}"
-            assert w[(2, None)] == 2, f"unmatched row null-fills once per branch: {dict(w)}"
-            assert w[(2, 1)] == 0, f"unmatched row must NOT pair: {dict(w)}"
-        finally:
-            _drop_all(client, sn, views=["v", "u"], tables=["a1", "a2", "b"])
-
-    def test_pure_range_left_payload_fidelity_wide_pk(self, client):
-        """Byte-exact null-fill payload under a STRING column, a nullable column
-        carrying NULL, and a 2-column (wide) source PK. Phase 1 inserts only matched
-        a's (zero null-fills, exact payload); phase 2 adds unmatched a's and asserts
-        their null-fills carry the exact A payload."""
-        sn = "prpf" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (id1 BIGINT NOT NULL, id2 BIGINT NOT NULL, x BIGINT NOT NULL, "
-                "s VARCHAR(16) NOT NULL, note BIGINT, PRIMARY KEY (id1, id2))", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (id BIGINT NOT NULL PRIMARY KEY, y BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW v AS SELECT a.id1 AS aid1, a.id2 AS aid2, a.s AS asv, "
-                "a.note AS anote, b.id AS bid "
-                "FROM a LEFT JOIN b ON a.x < b.y", schema_name=sn)
-            vid, _ = client.resolve_table(sn, "v")
-
-            def rowset():
-                return {(r["aid1"], r["aid2"], r["asv"], r["anote"], r["bid"])
-                        for r in client.scan(vid)}
-
-            client.execute_sql("INSERT INTO b VALUES (1, 100)", schema_name=sn)   # MAX = 100
-            # Phase 1 — every a matches (x < 100).
-            client.execute_sql(
-                "INSERT INTO a VALUES (1, 1, 10, 'alpha', 7), (1, 2, 20, 'beta', NULL)",
-                schema_name=sn)
-            assert rowset() == {(1, 1, "alpha", 7, 1), (1, 2, "beta", None, 1)}
-            assert all(r[4] is not None for r in rowset()), "matched rows must not null-fill"
-
-            # Phase 2 — add unmatched a's (x >= 100).
-            client.execute_sql(
-                "INSERT INTO a VALUES (2, 1, 100, 'gamma', 42), (2, 2, 999, 'delta', NULL)",
-                schema_name=sn)
-            assert rowset() == {
-                (1, 1, "alpha", 7, 1), (1, 2, "beta", None, 1),
-                (2, 1, "gamma", 42, None), (2, 2, "delta", None, None),
-            }
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
-
-    @pytest.mark.parametrize("ty", ["INT NOT NULL", "INT UNSIGNED NOT NULL", "SMALLINT NOT NULL"])
-    def test_pure_range_left_narrow_int_range(self, client, ty):
-        """A pure-range LEFT JOIN on a NARROW integer range column (I32/U32/I16)
-        null-fills correctly across workers — these were rejected by the old
-        `{I64, U64}`-only cap. MIN/MAX preserves the source integer type, so the
-        inline threshold reduce emits the narrow type the `reindex_m` consumes
-        directly. Matched a's are suppressed, unmatched a's null-fill, and deleting
-        the EXTREME b raises the threshold so an untouched a between the old and new
-        MAX re-null-fills (values stay within SMALLINT's ±32767)."""
-        sn = "prni" + _uid()
-        client.create_schema(sn)
-        try:
-            vid, pred = self._mk_pure_range_left(client, sn, "<", a_x=ty, b_y=ty)
-            # MAX(b.y) = 100. a's spread across workers; some below MAX, some at/above.
-            b_rows = [(1, 20), (2, 60), (3, 100)]
-            client.execute_sql(
-                "INSERT INTO b VALUES " + ",".join(f"({i},{y})" for i, y in b_rows), schema_name=sn)
-            a_rows = [(1, 10), (2, 70), (3, 100), (4, 200)]
-            client.execute_sql(
-                "INSERT INTO a VALUES " + ",".join(f"({i},{x})" for i, x in a_rows), schema_name=sn)
-            rows = _band_left_rows(client, vid)
-            assert rows == _band_left_ref(a_rows, b_rows, pred)
-            assert (3, None) in rows and (4, None) in rows    # x >= 100 → null-fill
-            assert (1, None) not in rows                      # x=10 < 100 → matched
-
-            # Delete the EXTREME b3 (y=100). New MAX = 60 → a2 (x=70 >= 60) flips to
-            # null-fill though a2 was untouched.
-            client.execute_sql("DELETE FROM b WHERE id = 3", schema_name=sn)
-            b_rows = [r for r in b_rows if r[0] != 3]
-            rows = _band_left_rows(client, vid)
-            assert rows == _band_left_ref(a_rows, b_rows, pred)
-            assert (2, None) in rows
-        finally:
-            _drop_all(client, sn, views=["v"], tables=["a", "b"])
+    # Unmatched under both shapes: no b in group 9, and an x above every b.t.
+    client.execute_sql(
+        "INSERT INTO a VALUES (2, 1, 9, 10, 'gamma', 42), (2, 2, 1, 999, 'delta', NULL)",
+        schema_name=sn)
+    assert live(ids[0]) == {
+        (1, 1, "alpha", 7, 1): 1, (1, 2, "beta", None, 2): 1,
+        (2, 1, "gamma", 42, None): 1, (2, 2, "delta", None, None): 1}
+    assert live(ids[1]) == {
+        (1, 1, "alpha", 7, 1): 1, (1, 1, "alpha", 7, 2): 1,
+        (1, 2, "beta", None, 1): 1, (1, 2, "beta", None, 2): 1,
+        (2, 1, "gamma", 42, 1): 1, (2, 1, "gamma", 42, 2): 1,
+        (2, 2, "delta", None, None): 1}

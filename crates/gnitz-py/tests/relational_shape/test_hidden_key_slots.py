@@ -1,305 +1,136 @@
-"""E2E: hidden key slots — a view's visible schema is what the SELECT projects.
+"""Hidden key slots: a view's visible schema is exactly what its SELECT projects.
 
-Every SQL view emitter that fabricates a synthetic key (`_join_pk`, `_pair_pk`,
-`_set_pk`, `_distinct_pk`, `_group_pk`, `_src_pk`) marks that column hidden, and
-a simple view's auto-prepended unprojected source PK is hidden too. Hidden
-columns are physical (they still key/route/sort/consolidate the view) but are
-excluded from `SELECT *`, name resolution, duplicate-name checks, and client
-rows. The `include_hidden=True` scan surfaces them for debugging.
+Every emitter that fabricates a synthetic key (`_join_pk`, `_pair_pk`, `_set_pk`,
+`_distinct_pk`, `_group_pk`) marks that column hidden, and so is a simple view's
+auto-prepended unprojected source PK. A hidden column is physical — it still
+keys, routes, sorts and consolidates the view — but is excluded from wildcard
+expansion, name resolution and client rows.
 
-Run:
-    cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/relational_shape/test_hidden_key_slots.py -v --tb=short
+That exclusion is the contract, so the assertions here are over the presented
+field *names*, never a column count; and the weights alongside them are what
+shows the key is still doing its physical job.
 """
 
 import pytest
-from _uid import uid as _uid
+from _read import bag, scanned
 
 
+def _sources(client, sn):
+    """Three sources and their rows — one pair for the join/set shapes, one TEXT
+    grouping key for the shape whose group key cannot be a PK column."""
+    client.execute_sql(
+        "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, bv BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE cat (pk BIGINT NOT NULL PRIMARY KEY, category TEXT NOT NULL, "
+        "amount BIGINT NOT NULL)", schema_name=sn)
+    client.execute_sql("INSERT INTO a VALUES (1, 7, 100), (2, 5, 100)", schema_name=sn)
+    client.execute_sql("INSERT INTO b VALUES (1, 7, 200), (2, 9, 200)", schema_name=sn)
+    client.execute_sql(
+        "INSERT INTO cat VALUES (1, 'x', 10), (2, 'x', 20), (3, 'y', 30)", schema_name=sn)
 
 
-def _live(client, vid, include_hidden=False):
-    return list(client.scan(vid, include_hidden=include_hidden))
+_SHAPES = [
+    pytest.param(
+        "SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k",
+        {"av", "bv"}, ("av", "bv"), {(100, 200): 1}, id="equi-join"),
+    pytest.param(
+        # Three (a, b) pairs satisfy a.k < b.k and all project to one tuple, so
+        # the pair key is what keeps them three elements rather than one.
+        "SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k < b.k",
+        {"av", "bv"}, ("av", "bv"), {(100, 200): 3}, id="range-join"),
+    pytest.param(
+        "SELECT av FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
+        {"av"}, ("av",), {(100,): 1}, id="exists"),
+    pytest.param(
+        "SELECT av AS val FROM a UNION SELECT bv AS val FROM b",
+        {"val"}, ("val",), {(100,): 1, (200,): 1}, id="union"),
+    pytest.param(
+        "SELECT DISTINCT av FROM a",
+        {"av"}, ("av",), {(100,): 1}, id="distinct"),
+    pytest.param(
+        "SELECT category, COUNT(*) AS cnt FROM cat GROUP BY category",
+        {"category", "cnt"}, ("category", "cnt"), {("x", 2): 1, ("y", 1): 1}, id="group-by-text"),
+    pytest.param(
+        # No synthetic key: the source PK the projection drops rides hidden, and
+        # is what keeps two rows sharing `av` two elements.
+        "SELECT av FROM a",
+        {"av"}, ("av",), {(100,): 2}, id="unprojected-source-pk"),
+]
 
 
-def _assert_no_synthetic(rows):
-    """No presented column may be a hidden key slot (leading `_`)."""
+@pytest.mark.parametrize("body, fields, cols, want", _SHAPES)
+def test_a_key_slot_is_absent_from_every_client_row(client, schema_name, body, fields, cols, want):
+    """For each emitter that fabricates or inherits a key, the presented fields
+    are exactly the projected names, and the weights show the key still keying."""
+    sn = schema_name
+    _sources(client, sn)
+    client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=sn)
+
+    rows = scanned(client, sn, "v")
+    assert bag(rows, *cols) == want
     for r in rows:
-        for name in r._fields:
-            assert not name.startswith("_"), f"synthetic key leaked into row: {name} in {r._fields}"
+        assert set(r._fields) == fields, r._fields
 
 
-# ---------------------------------------------------------------------------
-# `SELECT *` over each synthetic-key shape omits the key column
-# ---------------------------------------------------------------------------
+def test_include_hidden_surfaces_the_key_at_its_physical_slot(client, schema_name):
+    """The debugging escape hatch: `include_hidden=True` presents the synthetic
+    key in its physical position — first, ahead of the payload — carrying the
+    decoded join-key value, not the raw ordered bytes."""
+    sn = schema_name
+    _sources(client, sn)
+    client.execute_sql(
+        "CREATE VIEW jv AS SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k",
+        schema_name=sn)
+    vid = client.resolve_table(sn, "jv")[0]
 
-class TestSelectStarHidesKey:
-    def _ab(self, client, sn):
+    raw = list(client.scan(vid, include_hidden=True))
+    assert len(raw) == 1, raw
+    assert raw[0]._fields[0] == "_join_pk", raw[0]._fields
+    assert (raw[0]["_join_pk"], raw[0]["av"], raw[0]["bv"]) == (7, 100, 200)
+
+
+def test_a_hidden_key_never_re_enters_through_a_downstream_view(client, schema_name):
+    """`SELECT *` over a hidden-keyed view expands to the visible columns only,
+    however many layers deep, and naming a hidden column outright fails rather
+    than resolving."""
+    sn = schema_name
+    _sources(client, sn)
+    client.execute_sql(
+        "CREATE VIEW l1 AS SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k",
+        schema_name=sn)
+    client.execute_sql("CREATE VIEW l2 AS SELECT * FROM l1", schema_name=sn)
+    client.execute_sql("CREATE VIEW l3 AS SELECT * FROM l2", schema_name=sn)
+    client.execute_sql("CREATE VIEW sv AS SELECT av FROM a", schema_name=sn)
+
+    rows = scanned(client, sn, "l3")
+    assert bag(rows, "av", "bv") == {(100, 200): 1}
+    for r in rows:
+        assert set(r._fields) == {"av", "bv"}, r._fields
+
+    # `sv` drops `a`'s PK, which rides hidden; a downstream view cannot name it.
+    with pytest.raises(Exception) as ei:
+        client.execute_sql("CREATE VIEW ds AS SELECT pk FROM sv", schema_name=sn)
+    assert "pk" in str(ei.value).lower() or "not found" in str(ei.value).lower(), str(ei.value)
+
+
+def test_a_set_op_over_two_identical_join_views_dedups_on_content(client, schema_name):
+    """Downstream identity is the projected content: two structurally identical
+    join views must reach UNION ALL as one tuple at weight 2 and collapse under
+    UNION to weight 1, rather than staying distinct on their upstream key."""
+    sn = schema_name
+    _sources(client, sn)
+    for name in ("jv1", "jv2"):
         client.execute_sql(
-            "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        client.execute_sql(
-            "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, bv BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-
-    def test_equi_join_hides_join_pk(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._ab(client, sn)
-            client.execute_sql(
-                "CREATE VIEW jv AS SELECT a.av AS av, b.bv AS bv "
-                "FROM a JOIN b ON a.k = b.k",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "jv")[0]
-            client.execute_sql("INSERT INTO a VALUES (1, 7, 100)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (1, 7, 200)", schema_name=sn)
-            rows = _live(client, vid)
-            assert len(rows) == 1, rows
-            assert set(rows[0]._fields) == {"av", "bv"}
-            _assert_no_synthetic(rows)
-            assert (rows[0]["av"], rows[0]["bv"]) == (100, 200)
-        finally:
-            client.drop_schema(sn)
-
-    def test_range_join_hides_pair_pk(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._ab(client, sn)
-            client.execute_sql(
-                "CREATE VIEW rv AS SELECT a.av AS av, b.bv AS bv "
-                "FROM a JOIN b ON a.k < b.k",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "rv")[0]
-            client.execute_sql("INSERT INTO a VALUES (1, 5, 100)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (1, 9, 200)", schema_name=sn)
-            rows = _live(client, vid)
-            assert len(rows) == 1, rows
-            assert set(rows[0]._fields) == {"av", "bv"}
-            _assert_no_synthetic(rows)
-        finally:
-            client.drop_schema(sn)
-
-    def test_exists_hides_join_pk(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            self._ab(client, sn)
-            client.execute_sql(
-                "CREATE VIEW ev AS SELECT av FROM a "
-                "WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "ev")[0]
-            client.execute_sql("INSERT INTO a VALUES (1, 7, 100)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (1, 7, 200)", schema_name=sn)
-            rows = _live(client, vid)
-            assert len(rows) == 1, rows
-            assert set(rows[0]._fields) == {"av"}
-            _assert_no_synthetic(rows)
-        finally:
-            client.drop_schema(sn)
-
-    def test_union_hides_set_pk(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW uv AS SELECT val FROM a UNION SELECT val FROM b", schema_name=sn)
-            vid = client.resolve_table(sn, "uv")[0]
-            client.execute_sql("INSERT INTO a VALUES (1, 10)", schema_name=sn)
-            client.execute_sql("INSERT INTO b VALUES (1, 20)", schema_name=sn)
-            rows = _live(client, vid)
-            assert set(rows[0]._fields) == {"val"}
-            _assert_no_synthetic(rows)
-        finally:
-            client.drop_schema(sn)
-
-    def test_distinct_hides_distinct_pk(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            client.execute_sql(
-                "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
-            client.execute_sql(
-                "CREATE VIEW dv AS SELECT DISTINCT val FROM a", schema_name=sn)
-            vid = client.resolve_table(sn, "dv")[0]
-            client.execute_sql("INSERT INTO a VALUES (1, 10), (2, 10), (3, 20)", schema_name=sn)
-            rows = _live(client, vid)
-            assert set(rows[0]._fields) == {"val"}
-            _assert_no_synthetic(rows)
-            assert sorted(r["val"] for r in rows) == [10, 20]
-        finally:
-            client.drop_schema(sn)
-
-    def test_group_by_synthetic_hides_group_pk(self, client):
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            # A STRING group key forces the synthetic `_group_pk` path (a natural
-            # PK-eligible key would stay visible, which is correct and not the
-            # case under test here).
-            client.execute_sql(
-                "CREATE TABLE orders (pk BIGINT NOT NULL PRIMARY KEY, category TEXT NOT NULL, amount BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            client.execute_sql(
-                "CREATE VIEW gv AS SELECT category, COUNT(*) AS cnt FROM orders GROUP BY category",
-                schema_name=sn,
-            )
-            vid = client.resolve_table(sn, "gv")[0]
-            client.execute_sql(
-                "INSERT INTO orders VALUES (1, 'x', 10), (2, 'x', 20), (3, 'y', 30)", schema_name=sn)
-            rows = _live(client, vid)
-            _assert_no_synthetic(rows)
-            names = set(rows[0]._fields)
-            assert names == {"category", "cnt"}, names
-            got = {r["category"]: r["cnt"] for r in rows}
-            assert got == {"x": 2, "y": 1}, got
-        finally:
-            client.drop_schema(sn)
-
-
-# ---------------------------------------------------------------------------
-# Simple view: unprojected source PK is hidden and not name-resolvable
-# ---------------------------------------------------------------------------
-
-def test_simple_view_omits_unprojected_pk_and_downstream_cannot_name_it(client):
-    sn = "s" + _uid()
-    client.create_schema(sn)
-    try:
-        client.execute_sql(
-            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)", schema_name=sn)
-        # `SELECT val` omits the PK `id`; it rides the view hidden.
-        client.execute_sql("CREATE VIEW sv AS SELECT val FROM t", schema_name=sn)
-        vid = client.resolve_table(sn, "sv")[0]
-        client.execute_sql("INSERT INTO t VALUES (1, 100)", schema_name=sn)
-        rows = _live(client, vid)
-        assert set(rows[0]._fields) == {"val"}
-        _assert_no_synthetic(rows)
-
-        # A downstream view naming the hidden PK by name fails cleanly.
-        with pytest.raises(Exception) as ei:
-            client.execute_sql("CREATE VIEW ds AS SELECT id FROM sv", schema_name=sn)
-        assert "id" in str(ei.value).lower() or "not found" in str(ei.value).lower()
-    finally:
-        client.drop_schema(sn)
-
-
-# ---------------------------------------------------------------------------
-# Set-op over two join views dedups on projected content, not on `_join_pk`
-# ---------------------------------------------------------------------------
-
-def test_setop_over_two_join_views_dedups_on_content(client):
-    sn = "s" + _uid()
-    client.create_schema(sn)
-    try:
-        client.execute_sql(
-            "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL)",
+            f"CREATE VIEW {name} AS SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k",
             schema_name=sn)
-        client.execute_sql(
-            "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, bv BIGINT NOT NULL)",
-            schema_name=sn)
-        for v in ("jv1", "jv2"):
-            client.execute_sql(
-                f"CREATE VIEW {v} AS SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k",
-                schema_name=sn)
-        # UNION ALL keeps both copies (weight 2); the upstream `_join_pk` must NOT
-        # keep the two structurally-identical rows distinct.
-        client.execute_sql(
-            "CREATE VIEW ua AS SELECT * FROM jv1 UNION ALL SELECT * FROM jv2", schema_name=sn)
-        # UNION (distinct) collapses them to one.
-        client.execute_sql(
-            "CREATE VIEW ud AS SELECT * FROM jv1 UNION SELECT * FROM jv2", schema_name=sn)
-        ua = client.resolve_table(sn, "ua")[0]
-        ud = client.resolve_table(sn, "ud")[0]
-        client.execute_sql("INSERT INTO a VALUES (1, 7, 100)", schema_name=sn)
-        client.execute_sql("INSERT INTO b VALUES (1, 7, 200)", schema_name=sn)
+    client.execute_sql("CREATE VIEW ua AS SELECT * FROM jv1 UNION ALL SELECT * FROM jv2",
+                       schema_name=sn)
+    client.execute_sql("CREATE VIEW ud AS SELECT * FROM jv1 UNION SELECT * FROM jv2",
+                       schema_name=sn)
 
-        all_rows = _live(client, ua)
-        _assert_no_synthetic(all_rows)
-        assert sum(r.weight for r in all_rows if (r["av"], r["bv"]) == (100, 200)) == 2
-
-        dist_rows = _live(client, ud)
-        _assert_no_synthetic(dist_rows)
-        got = [(r["av"], r["bv"], r.weight) for r in dist_rows]
-        assert got == [(100, 200, 1)], got
-    finally:
-        client.drop_schema(sn)
-
-
-# ---------------------------------------------------------------------------
-# include_hidden=True surfaces the key slots with correctly-decoded values
-# ---------------------------------------------------------------------------
-
-def test_include_hidden_surfaces_join_pk(client):
-    sn = "s" + _uid()
-    client.create_schema(sn)
-    try:
-        client.execute_sql(
-            "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL)",
-            schema_name=sn)
-        client.execute_sql(
-            "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, bv BIGINT NOT NULL)",
-            schema_name=sn)
-        client.execute_sql(
-            "CREATE VIEW jv AS SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k",
-            schema_name=sn)
-        vid = client.resolve_table(sn, "jv")[0]
-        client.execute_sql("INSERT INTO a VALUES (1, 7, 100)", schema_name=sn)
-        client.execute_sql("INSERT INTO b VALUES (1, 7, 200)", schema_name=sn)
-
-        # Default: hidden.
-        vis = _live(client, vid)
-        assert "_join_pk" not in vis[0]._fields
-
-        # include_hidden: the synthetic key surfaces at its physical slot with the
-        # decoded join-key value (7).
-        raw = _live(client, vid, include_hidden=True)
-        assert len(raw) == 1, raw
-        names = raw[0]._fields
-        assert names[0] == "_join_pk", names
-        assert raw[0]["_join_pk"] == 7
-        assert (raw[0]["av"], raw[0]["bv"]) == (100, 200)
-    finally:
-        client.drop_schema(sn)
-
-
-# ---------------------------------------------------------------------------
-# View-over-view cascade where every layer's key is hidden
-# ---------------------------------------------------------------------------
-
-def test_view_over_view_cascade_hidden_keys(client):
-    sn = "s" + _uid()
-    client.create_schema(sn)
-    try:
-        client.execute_sql(
-            "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, av BIGINT NOT NULL)",
-            schema_name=sn)
-        client.execute_sql(
-            "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, k BIGINT NOT NULL, bv BIGINT NOT NULL)",
-            schema_name=sn)
-        client.execute_sql(
-            "CREATE VIEW l1 AS SELECT a.av AS av, b.bv AS bv FROM a JOIN b ON a.k = b.k",
-            schema_name=sn)
-        # `SELECT *` over the hidden-keyed join view must not re-admit `_join_pk`.
-        client.execute_sql("CREATE VIEW l2 AS SELECT * FROM l1", schema_name=sn)
-        client.execute_sql("CREATE VIEW l3 AS SELECT * FROM l2", schema_name=sn)
-        vid = client.resolve_table(sn, "l3")[0]
-        client.execute_sql("INSERT INTO a VALUES (1, 7, 100)", schema_name=sn)
-        client.execute_sql("INSERT INTO b VALUES (1, 7, 200)", schema_name=sn)
-        rows = _live(client, vid)
-        assert len(rows) == 1, rows
-        assert set(rows[0]._fields) == {"av", "bv"}
-        _assert_no_synthetic(rows)
-        assert (rows[0]["av"], rows[0]["bv"]) == (100, 200)
-    finally:
-        client.drop_schema(sn)
+    assert bag(scanned(client, sn, "ua"), "av", "bv") == {(100, 200): 2}
+    assert bag(scanned(client, sn, "ud"), "av", "bv") == {(100, 200): 1}
