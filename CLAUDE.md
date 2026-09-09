@@ -623,9 +623,10 @@ carries.
 **A cursor can expire, and every subscriber must handle it.** The budget bounds
 **registered on-disk shard bytes**, exactly as `capacity` does, and the sweep
 drops the oldest rounds whether or not anyone is still reading them; the RAM tier
-beneath it is bounded separately. A cursor at or below what a worker has dropped
+beneath it is bounded separately. A cursor *below* what a worker has dropped
 is refused, and so is one whose tag names a different boot or a different
-relation. The recovery is always the same and is not optional: discard the copy
+relation; a cursor sitting exactly at the floor is served, since the walk it
+opens is above it. The recovery is always the same and is not optional: discard the copy
 and bootstrap. A `CREATE VIEW` backfill never enters the delta store, which is
 what makes a foreign cursor unsafe rather than merely stale.
 

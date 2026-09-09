@@ -235,6 +235,45 @@ def test_a_view_id_is_never_reused(client, schema_name):
     assert bag(client.scan(second), "pk", "val") == {(1, 10): 1}
 
 
+# ── The IDX_TAB row an index DDL writes ─────────────────────────────────────
+
+
+def _idx_rows(client, tid):
+    """`IDX_TAB`'s rows owned by `tid`, as `{(source cols, flags): weight}`."""
+    batch = client.scan(gnitz.IDX_TAB)
+    assert batch.schema is not None
+    acc = {}
+    for w, o, sc, f in zip(batch.weights, batch.scalars("owner_id"),
+                           batch.scalars("source_col_idx"), batch.scalars("flags")):
+        if o == tid:
+            k = (tuple(gnitz.unpack_pk_cols(sc)), f)
+            acc[k] = acc.get(k, 0) + w
+    return {k: w for k, w in acc.items() if w != 0}
+
+
+@pytest.mark.parametrize("unique", [False, True])
+def test_an_index_ddl_writes_and_retracts_one_catalog_row(client, schema_name, unique):
+    """`CREATE INDEX` answers with the id it allocated and leaves exactly one
+    `IDX_TAB` row — at weight 1 — naming the owner, the packed source-column
+    list, and, for UNIQUE, bit 0 of `flags`. The drop retracts that row rather
+    than shadowing it."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, cust_id BIGINT NOT NULL)",
+        schema_name=sn)
+    res = client.execute_sql(
+        f"CREATE {'UNIQUE ' if unique else ''}INDEX ON t(cust_id)", schema_name=sn)
+    assert len(res) == 1 and res[0]["type"] == "IndexCreated"
+    assert res[0]["index_id"] > 0
+
+    tid, _ = client.resolve_table(sn, "t")
+    assert _idx_rows(client, tid) == {((1,), 1 if unique else 0): 1}
+
+    assert client.execute_sql(
+        f"DROP INDEX {sn}__t__idx_cust_id", schema_name=sn)[0]["type"] == "Dropped"
+    assert _idx_rows(client, tid) == {}
+
+
 # ── One DDL_TXN frame per catalog write ─────────────────────────────────────
 
 

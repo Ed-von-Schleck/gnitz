@@ -562,6 +562,10 @@ fn capacity_rules() {
     let cat = cat();
     for (clause, needle) in [
         ("WITH (foo = '1 MB')", "unknown CREATE VIEW option"),
+        // An unknown key names every key that would have been read, so the
+        // message is enough to fix the statement without opening the grammar.
+        ("WITH (foo = '1 MB')", "capacity"),
+        ("WITH (foo = '1 MB')", "delta"),
         ("WITH (capacity = 5)", "single-quoted"),
         ("WITH (capacity = 'lots')", "not a size"),
     ] {

@@ -278,18 +278,19 @@ def own_server(server_dirs):
         proc.stop()
 
 
-# A delta store spills once its RAM tier crosses this ceiling; shrinking it is
-# how the capacity sweep is reached on small data, exactly as the bounded-view
-# tests reach it.
+# A store spills once its RAM tier crosses this ceiling, which only happens at a
+# memtable fold or a checkpoint's ephemeral round — so the checkpoint threshold
+# is squeezed too. Together they give a few thousand rows the many spills a
+# capacity sweep needs: it budgets itself to one push-down per spill.
 _SWEEP_ENV = {"GNITZ_RAM_TIER_BYTES": "1024", "GNITZ_CHECKPOINT_BYTES": str(32 * 1024)}
 
 
 @pytest.fixture
 def sweeping_server(server_dirs):
-    """A server whose delta stores sweep on modest data, for the retention and
-    cursor-expiry cases. Shared by the delta-feed suite and the mirror suite —
-    the mirror's own expiry recovery is the same event seen from the other
-    side."""
+    """A server whose stores sweep on modest data, for the capacity, retention
+    and cursor-expiry cases. Shared by the bounded-view, delta-feed and mirror
+    suites — the mirror's own expiry recovery is the same event seen from the
+    other side."""
     data_dir, sock_path = server_dirs
     proc = ServerProc(data_dir, sock_path, extra_env=dict(_SWEEP_ENV))
     proc.start()
@@ -297,6 +298,14 @@ def sweeping_server(server_dirs):
         yield proc
     finally:
         proc.stop()
+
+
+@pytest.fixture
+def sweeping_client(sweeping_server):
+    """A connection to `sweeping_server`, for a test that only reads and writes
+    over it."""
+    with gnitz.connect(sweeping_server.sock_path) as conn:
+        yield conn
 
 
 @pytest.fixture(scope="session")

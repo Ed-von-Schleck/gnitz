@@ -1,12 +1,15 @@
-"""The fed views two suites share, and the weight-exact comparison over them.
+"""The base tables, view bodies and churn the storage-policy suites share, and
+the weight-exact comparison over the fed ones.
 
-`storage_policy/test_delta_feed.py` drives the feed by hand — bootstrap, poll, apply — and
-`client_surface/test_mirror.py` drives the same views through a mirroring client, which does
-that for it. Both need the same base tables, the same churn (inserts, an UPDATE
-and a DELETE, so a round carries retractions and not just insertions), the same four
-view bodies, and the same `{row → net weight}` comparison. Keeping one copy here
-is what makes "the mirror agrees with the feed" a comparison of two mechanisms
-rather than of two setups.
+`storage_policy/test_delta_feed.py` drives the feed by hand — bootstrap, poll,
+apply — and `client_surface/test_mirror.py` drives the same views through a
+mirroring client, which does that for it. Both need the same base tables, the
+same churn (inserts, an UPDATE and a DELETE, so a round carries retractions and
+not just insertions), the same view bodies, and the same `{row → net weight}`
+comparison. Keeping one copy here is what makes "the mirror agrees with the
+feed" a comparison of two mechanisms rather than of two setups.
+`storage_policy/test_capacity_bounded_views.py` runs the same bodies bounded, so
+"capacity is invisible" is a claim about the shapes the other two already cover.
 """
 
 # Big enough that nothing built on these helpers falls off the window; a test
@@ -17,8 +20,6 @@ LINEAR = "SELECT id, v, body FROM t WHERE v > 10"
 JOIN = "SELECT t.id, t.body, u.w FROM t JOIN u ON t.id = u.tid"
 GROUPBY = "SELECT tid, COUNT(*) AS n, SUM(w) AS total FROM u GROUP BY tid"
 SETOP = "SELECT id FROM t EXCEPT SELECT tid FROM u"
-
-
 
 
 def _key(row):
@@ -69,19 +70,26 @@ def _base_tables(client, sn):
     )
 
 
-def _churn(client, sn, lo, hi):
+def _churn(client, sn, lo, hi, chunk=None):
     """Inserts, then an UPDATE and a DELETE over part of the range — so the feed
     sees fresh keys, `enforce_unique_pk`'s retract/insert pair, and pure
     retractions. Without the last two the retraction half of the design goes
-    untested."""
-    client.execute_sql(
-        "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 3}, 'body-{i:0>20}')" for i in range(lo, hi + 1)),
-        schema_name=sn,
-    )
-    client.execute_sql(
-        "INSERT INTO u VALUES " + ",".join(f"({i}, {i}, {i * 7})" for i in range(lo, hi + 1)),
-        schema_name=sn,
-    )
+    untested.
+
+    `chunk` splits the inserts into that many rows per statement. Each statement
+    is its own settle, so a caller that needs many spills — the capacity sweep
+    budgets itself to one push-down per spill — asks for small ones.
+    """
+    for a in range(lo, hi + 1, chunk or (hi - lo + 1)):
+        b = min(a + (chunk or (hi - lo + 1)) - 1, hi)
+        client.execute_sql(
+            "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 3}, 'body-{i:0>20}')" for i in range(a, b + 1)),
+            schema_name=sn,
+        )
+        client.execute_sql(
+            "INSERT INTO u VALUES " + ",".join(f"({i}, {i}, {i * 7})" for i in range(a, b + 1)),
+            schema_name=sn,
+        )
     span = hi - lo + 1
     client.execute_sql(f"UPDATE t SET v = v + 1 WHERE id >= {lo} AND id < {lo + span // 3}", schema_name=sn)
     # `u` loses the longer tail, so `t.id` is never a subset of `u.tid` and the

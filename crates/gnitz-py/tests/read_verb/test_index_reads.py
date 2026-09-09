@@ -434,3 +434,121 @@ def test_a_replicated_global_aggregate_grounds_on_an_empty_range(client, schema_
     client.execute_sql(
         "CREATE VIEW mv AS SELECT COUNT(*) AS c FROM t WHERE ind = 999", schema_name=sn)
     assert bag(rows(client, sn, "SELECT * FROM mv")) == {(0,): 1}
+
+
+# ---------------------------------------------------------------------------
+# Which index a composite WHERE binds, and what stays a residual
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def abc(client, schema_name):
+    """`t (pk, a, b, c)` with three rows, `b` NOT NULL."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, "
+        "b BIGINT NOT NULL, c BIGINT NOT NULL)", schema_name=sn)
+    _insert(client, sn, "t", [(10, 1, 100, 7), (20, 1, 200, 8), (30, 2, 100, 9)])
+    return sn
+
+
+@pytest.mark.parametrize("indexes,drop,where,walk,want", [
+    # The full key.
+    (["(a, b)"], None, "a = 1 AND b = 200", "(a, b)", [20]),
+    # Out-of-order WHERE binds each value to the index's declared column, not to
+    # AST order.
+    (["(a, b)"], None, "b = 200 AND a = 1", "(a, b)", [20]),
+    # A leading prefix over (a, b) with b NOT NULL is served by the index.
+    (["(a, b)"], None, "a = 1", "(a, b)", [10, 20]),
+    # Both indexes pin (a, b) to the same point, so the tie falls to arity: the
+    # narrower walk wins.
+    (["(a, b)", "(a, b, c)"], None, "a = 1 AND b = 200", "(a, b)", [20]),
+    # `a = 1` is consumed by the walk and `a > 5` stays a residual — excluded by
+    # the consumed conjunct's physical index, not by column, so it survives and
+    # (since a = 1) matches nothing. The companion proves that is the residual
+    # filtering rather than the walk returning nothing.
+    (["(a)"], None, "a = 1 AND a > 5", "(a)", []),
+    (["(a)"], None, "a = 1 AND a > 0", "(a)", [10, 20]),
+    # DROP INDEX matches the exact column list, so the single-column index is
+    # left serving.
+    (["(a)", "(a, b)"], "idx_a_b", "a = 1", "(a)", [10, 20]),
+], ids=["full-key", "out-of-order", "leading-prefix", "tiebreak-arity",
+        "residual-empty", "residual-kept", "drop-exact-list"])
+def test_which_composite_index_a_where_binds(client, abc, indexes, drop, where, walk, want):
+    """The walk the planner picks and the rows it returns, asserted together: a
+    row bag alone passes with every index dropped, and an access line alone
+    passes on a walk that loses rows."""
+    for cols in indexes:
+        client.execute_sql(f"CREATE INDEX ON t{cols}", schema_name=abc)
+    if drop:
+        client.execute_sql(f"DROP INDEX {abc}__t__{drop}", schema_name=abc)
+    q = f"SELECT pk FROM t WHERE {where}"
+    assert access(client, abc, q).startswith(f"access: index range on {walk}"), \
+        access(client, abc, q)
+    assert bag(rows(client, abc, q)) == {(pk,): 1 for pk in want}
+
+
+def test_a_nullable_trailing_prefix_is_not_served_by_the_index(client, schema_name):
+    """A leading-prefix WHERE over (a, b) with `b` NULLABLE would silently drop
+    the (1, NULL) row, so the index must not serve it — the on-demand executor
+    scans the base instead and DOES return that row. The full key still uses the
+    index and finds the non-null one."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL, "
+        "b BIGINT, c BIGINT NOT NULL)", schema_name=sn)
+    _insert(client, sn, "t", [(10, 1, 100, 7), (20, 1, 200, 8), (30, 2, 100, 9),
+                              (40, 1, "NULL", 11)])
+    client.execute_sql("CREATE INDEX ON t(a, b)", schema_name=sn)
+
+    assert bag(rows(client, sn, "SELECT pk FROM t WHERE a = 1")) == \
+        {(10,): 1, (20,): 1, (40,): 1}
+    q = "SELECT pk FROM t WHERE a = 1 AND b = 200"
+    assert access(client, sn, q).startswith("access: index range on (a, b)")
+    assert bag(rows(client, sn, q)) == {(20,): 1}
+
+
+# ---------------------------------------------------------------------------
+# An index over a PK column
+# ---------------------------------------------------------------------------
+
+
+_U64_MAX = 18446744073709551615
+
+
+@pytest.fixture
+def pk_indexed(client, schema_name):
+    """A compound-PK table whose WHERE leaves the LEADING PK column free, so
+    neither case below has a PK-range plan to fall back on."""
+    sn = schema_name
+    client.execute_sql(
+        "CREATE TABLE t (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL, "
+        "v BIGINT NOT NULL, PRIMARY KEY (a, b))", schema_name=sn)
+    return sn
+
+
+def test_an_index_over_a_trailing_pk_column_serves_the_where(client, pk_indexed):
+    """A secondary index may name a PK column, and the planner treats it as any
+    other index column."""
+    sn = pk_indexed
+    _insert(client, sn, "t", [(1, 10, 100), (2, 10, 200), (3, 20, 300)])
+    client.execute_sql("CREATE INDEX ON t(b, v)", schema_name=sn)
+
+    q = "SELECT * FROM t WHERE b = 10 AND v = 200"
+    assert access(client, sn, q).startswith("access: index range on (b, v)")
+    assert bag(rows(client, sn, q)) == {(2, 10, 200): 1}
+    # A range on the same column bounds the same index.
+    assert bag(rows(client, sn, "SELECT * FROM t WHERE b > 10")) == {(3, 20, 300): 1}
+
+
+def test_a_wide_literal_on_an_indexed_pk_column_is_servable(client, pk_indexed):
+    """The literal overflows i64, so the predicate VM has no form for the
+    conjunct: only an index walk that consumes it byte-exactly can serve this
+    WHERE, and the PK rung cannot bound it (nothing pins `a`)."""
+    sn = pk_indexed
+    _insert(client, sn, "t", [(1, _U64_MAX, 100), (2, 5, 200)])
+    client.execute_sql("CREATE INDEX ON t(b)", schema_name=sn)
+
+    q = f"SELECT * FROM t WHERE b = {_U64_MAX}"
+    assert access(client, sn, q).startswith("access: index range on (b)")
+    assert bag(rows(client, sn, q)) == {(1, _U64_MAX, 100): 1}

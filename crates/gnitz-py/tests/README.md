@@ -12,8 +12,7 @@ variable is. A file that varies two coordinates is two files.
     mutation_pattern   what writes occur and how they are grouped
     schema_lifetime    the schema changing mid-scenario: DDL, ALTER, create-order
     distribution       worker count, partitioning, replication, exchange
-    storage_policy     a relation's WITH (...) or access structure: index, capacity,
-                       delta, stream
+    storage_policy     a relation's WITH (...): capacity, delta, stream
     state_lifetime     the process boundary crossed: restart, crash, checkpoint,
                        SAL reclaim
     interleaving       timing between operations that would otherwise be serial
@@ -25,6 +24,11 @@ under identity projections is a shape test.
 
 A test whose subject is a value under a fixed shape is value_domain: a NULL join
 key varies the value, not the join.
+
+A secondary index is not a coordinate of its own: what it changes is which walk
+a read takes, so an index test is a read_verb test, its DDL rejections are
+admissibility, its catalog row is schema_lifetime, and its key width is
+value_domain.
 
 GNITZ_WORKERS is a suite-wide run mode, so distribution is for a test that
 varies worker count or placement, not one that merely needs W > 1.
