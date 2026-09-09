@@ -7,31 +7,22 @@ from _uid import uid as _uid
 
 
 def test_create_then_drop_no_worker_race(race_server):
-    """
-    Regression: master DROP `remove_dir_all` must not race a lagging worker
-    still applying the CREATE of the same table.
+    """The master defers a dropped table's `remove_dir_all` to the next
+    checkpoint, so a worker still inside the CREATE finishes against a directory
+    that still exists instead of aborting on ENOENT.
 
-    With the debug-only `GNITZ_INJECT_TABLE_CREATE_DELAY_MS` seam active
-    (see the `race_server` fixture), each worker sleeps between creating the
-    table dir and its own child subdir.  Pre-fix, the master removed the dir
-    on DROP while a worker was mid-create → worker ENOENT abort → the next
-    request fails with "connection closed".  Post-fix the master defers
-    removal to the next checkpoint, so the worker finishes safely.
-
-    Asserts the server survives a handful of immediate CREATE→DROP cycles
-    (the follow-up create_schema would raise "connection closed" if a worker
-    had aborted).
+    The `race_server` seam (`GNITZ_INJECT_TABLE_CREATE_DELAY_MS`) makes every
+    worker sleep between creating the table directory and its partition
+    subdirectories, so each CREATE→DROP cycle reaches the window by ordering
+    rather than by timing. A worker that aborted would take the server with it,
+    which the follow-up DDL is what detects — it would raise "connection closed".
     """
     client = race_server
     sn = "s" + _uid()
     client.create_schema(sn)
     cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
             gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-    for i in range(6):
+    for i in range(3):
         client.create_table(sn, f"t{i}", cols)
         client.drop_table(sn, f"t{i}")
-    # If any worker aborted above, the server is dead and this raises.
-    sn2 = "s" + _uid()
-    client.create_schema(sn2)
-    client.drop_schema(sn2)
-    client.drop_schema(sn)
+    client.create_schema("s" + _uid())

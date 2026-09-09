@@ -14,8 +14,6 @@ PARKED_ROWS = 20_000
 PARKED_GROUPS = 8
 
 
-
-
 def _scalar(client, sn, q):
     res = client.execute_sql(q, schema_name=sn)[0]
     assert res["type"] == "Rows", f"expected Rows, got {res['type']}: {res}"

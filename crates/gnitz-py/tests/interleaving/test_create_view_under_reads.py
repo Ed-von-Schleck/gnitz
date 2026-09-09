@@ -1,108 +1,93 @@
-"""CREATE VIEW must not wedge under concurrent ad-hoc reads and pushes.
+"""CREATE VIEW while ad-hoc reads and pushes are in flight.
+
+A CREATE VIEW parks the single-threaded reactor (`drain_tick_blocking` and
+`fan_out_backfill` are synchronous futex loops) under the catalog write lock.
+An ad-hoc read holds the catalog READ lock for one whole atomic fan-out with no
+mid-flight release, so the writer-preferring lock orders each read entirely
+before or after the DDL window — never interleaved, never wedged.
 """
 
-import os
 import threading
-import time
 
-import pytest
 import gnitz
-from _uid import uid as _uid
+from _serverproc import HANG_TIMEOUT, NEEDS_MULTI
+
+pytestmark = NEEDS_MULTI
+
+# Each thread's work outlasts the CREATE VIEW by two orders of magnitude (400
+# reads is ~200 ms against a ~3 ms DDL), which is what puts the DDL inside the
+# concurrent window by construction rather than by a sampled counter that a
+# descheduled thread can zero.
+_ITERATIONS = 400
+
+_GROUPS = "SELECT g, COUNT(*) AS n FROM t GROUP BY g"
 
 
+def _zset(res):
+    """`{(g, n) → net weight}` over a one-statement Rows result."""
+    assert res[0]["type"] == "Rows", res[0]["type"]
+    out = {}
+    for r in res[0]["rows"]:
+        k = (r.g, r.n)
+        out[k] = out.get(k, 0) + r.weight
+    return {k: w for k, w in out.items() if w != 0}
 
 
-_NEEDS_MULTI = pytest.mark.skipif(
-    int(os.environ.get("GNITZ_WORKERS", "1")) < 2,
-    reason="the read/DDL concurrency path only exercises exchange/fanout at W >= 2",
-)
-
-
-
-@_NEEDS_MULTI
-def test_create_view_under_concurrent_adhoc_reads(client, server):
-    """CREATE VIEW must not wedge under concurrent ad-hoc reads and pushes.
-
-    A CREATE VIEW parks the single-threaded reactor (drain_tick_blocking +
-    fan_out_backfill are synchronous futex loops) under the catalog write lock.
-    Ad-hoc reads take only the catalog READ lock for the whole of one atomic
-    fan-out (no mid-flight release), so the writer-preferring catalog_rwlock
-    serialises each read entirely before or after the DDL window — never
-    interleaved, never wedged. Reads before/during/after the CREATE VIEW must all
-    succeed, ingestion must continue, and the post-DDL read must agree with the
-    view built mid-flight.
-    """
-    sn = "s" + _uid()
-    client.create_schema(sn)
+def test_create_view_under_concurrent_adhoc_reads(client, server, schema_name):
+    """Reads and pushes issued throughout a CREATE VIEW must all succeed, the
+    DDL must complete, and the view it built must agree with the same query run
+    ad-hoc — at equal weights, since a backfill that double-applied a source
+    batch keeps the group set and doubles every count."""
     client.execute_sql(
-        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL)", schema_name=sn
-    )
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL)",
+        schema_name=schema_name)
     client.execute_sql(
-        "INSERT INTO t VALUES " + ", ".join(f"({i}, {i % 5})" for i in range(1, 201)), schema_name=sn
-    )
+        "INSERT INTO t VALUES " + ", ".join(f"({i}, {i % 5})" for i in range(1, 201)),
+        schema_name=schema_name)
     client.execute_sql(
-        "CREATE TABLE other (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)", schema_name=sn
-    )
+        "CREATE TABLE other (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
+        schema_name=schema_name)
 
     errors = []
-    ddl_done = threading.Event()
-    q_count = [0]
+    reading = threading.Event()
 
     def hammer_reads():
         try:
             with gnitz.connect(server) as c:
-                while not ddl_done.is_set() and q_count[0] < 400:
-                    res = c.execute_sql("SELECT g, COUNT(*) AS n FROM t GROUP BY g", schema_name=sn)
+                for _ in range(_ITERATIONS):
+                    res = c.execute_sql(_GROUPS, schema_name=schema_name)
                     assert res[0]["type"] == "Rows"
                     n = sum(r.n for r in res[0]["rows"])
                     assert n == 200, f"ad-hoc read must see all 200 rows, saw {n}"
-                    q_count[0] += 1
+                    reading.set()
         except Exception as e:  # noqa: BLE001
             errors.append(("read", repr(e)))
+            reading.set()
 
     def hammer_pushes():
         try:
             with gnitz.connect(server) as c:
-                i = 0
-                while not ddl_done.is_set() and i < 400:
-                    c.execute_sql(f"INSERT INTO other VALUES ({i}, {i})", schema_name=sn)
-                    i += 1
+                for i in range(_ITERATIONS):
+                    c.execute_sql(f"INSERT INTO other VALUES ({i}, {i})",
+                                  schema_name=schema_name)
         except Exception as e:  # noqa: BLE001
             errors.append(("push", repr(e)))
 
-    tq = threading.Thread(target=hammer_reads)
-    tp = threading.Thread(target=hammer_pushes)
-    tq.start()
-    tp.start()
+    threads = [threading.Thread(target=hammer_reads), threading.Thread(target=hammer_pushes)]
+    for t in threads:
+        t.start()
 
-    time.sleep(0.05)
-    q_before = q_count[0]
-    t0 = time.time()
-    client.execute_sql("CREATE VIEW mid AS SELECT g, COUNT(*) AS n FROM t GROUP BY g", schema_name=sn)
-    ddl_secs = time.time() - t0
-    q_across = q_count[0] - q_before
-    ddl_done.set()
+    # The DDL goes in once the readers are provably in their loop, so it lands
+    # inside the concurrent window rather than ahead of it.
+    assert reading.wait(timeout=HANG_TIMEOUT), "the read thread never issued a read"
+    client.execute_sql(
+        f"CREATE VIEW mid AS {_GROUPS}", schema_name=schema_name)
 
-    tq.join(timeout=120)
-    tp.join(timeout=120)
-    assert not tq.is_alive() and not tp.is_alive(), "deadlock: a concurrent worker never completed"
+    for t in threads:
+        t.join(timeout=HANG_TIMEOUT)
+        assert not t.is_alive(), "deadlock: a concurrent worker never completed"
     assert not errors, f"concurrent work failed: {errors}"
-    assert ddl_secs < 60, f"CREATE VIEW took {ddl_secs:.1f}s -- wedged behind the reads"
-    assert q_across > 0, (
-        "no ad-hoc read overlapped the CREATE VIEW -- the test proved nothing about read/DDL concurrency"
-    )
 
-    # The mid-flight DDL produced a correct view, and ad-hoc reads still agree.
-    def _rows(sql):
-        res = client.execute_sql(sql, schema_name=sn)
-        out = []
-        for r in res[0]["rows"]:
-            if r.weight <= 0:
-                continue
-            d = r._asdict()
-            out.append((tuple(d[k] for k in sorted(d)), r.weight))
-        return sorted(out)
-
-    assert _rows("SELECT g, COUNT(*) AS n FROM t GROUP BY g") == _rows("SELECT * FROM mid"), (
-        "post-DDL ad-hoc read must agree with the view built mid-flight"
-    )
+    view = _zset(client.execute_sql("SELECT * FROM mid", schema_name=schema_name))
+    assert view == _zset(client.execute_sql(_GROUPS, schema_name=schema_name))
+    assert set(view.values()) == {1}, f"view holds a non-unit weight: {view}"

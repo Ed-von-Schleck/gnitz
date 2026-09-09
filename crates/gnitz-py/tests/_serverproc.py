@@ -8,7 +8,7 @@ PR_SET_PDEATHSIG(SIGKILL) tied to the master, so killing the master cascades to
 the workers. But nothing ties the *master* to the pytest process. If a run is
 interrupted before fixture teardown runs — Ctrl-C, SIGTERM/SIGKILL of pytest, or
 a pytest crash — the master is orphaned and keeps its workers alive, each
-pinning the ~1 GB SAL mmap of a now-unlinked temp dir (unreclaimable). Repeated
+pinning the SAL mmap of a now-unlinked temp dir (unreclaimable). Repeated
 interrupted runs accumulate GB of RAM and push the host into swap.
 
 `server_preexec` runs in the forked child just before exec and asks the kernel

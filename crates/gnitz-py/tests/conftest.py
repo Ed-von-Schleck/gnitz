@@ -24,10 +24,11 @@ os.makedirs(_TMP_DIR, exist_ok=True)
 _LOG_PATH = os.path.join(_TMP_DIR, "server_debug.log")
 
 # Anchor pytest's basetemp inside the repo rather than the default /tmp. Two
-# reasons, both about the 1 GiB SAL every server fallocates: /tmp is tmpfs here,
-# where a fallocate costs ~0.9 s of kernel page-zeroing per server, and a run
-# with failures retains each failed test's data dir (see the retention settings
-# in pyproject.toml), which /tmp does not have the room for.
+# reasons, both about the SAL every server fallocates (128 MiB per test server,
+# see `_serverproc.test_server_env`): /tmp is tmpfs here, where that fallocate
+# is paid in kernel page-zeroing on every one of the dozens of servers a session
+# spawns, and a run with failures retains each failed test's data dir (see the
+# retention settings in pyproject.toml), which /tmp does not have the room for.
 #
 # PYTEST_DEBUG_TEMPROOT (not --basetemp) is the knob that keeps the numbered
 # `pytest-of-<user>/pytest-<N>/` layout, and with it both pytest's lock-based
@@ -150,7 +151,7 @@ class _Server:
 
     def _discard_data_dir(self) -> None:
         """Drop the current data dir now rather than leave it to pytest's
-        end-of-session reclaim: each one holds a fallocated 1 GiB SAL, and a
+        end-of-session reclaim: each one holds a fallocated SAL, and a
         session spawns dozens of servers."""
         if self._data_dir:
             shutil.rmtree(self._data_dir, ignore_errors=True)

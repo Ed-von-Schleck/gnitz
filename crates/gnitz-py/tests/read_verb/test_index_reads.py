@@ -550,6 +550,39 @@ class TestIndexCollectMerge:
         finally:
             _drop_all(client, sn, indices=[f"{sn}__t__idx_x"], tables=["t"])
 
+    def test_anticorrelated_runs_merge_by_value_then_src_pk(self, client):
+        """A secondary index's PK is the pair ``(indexed_value, src_pk)``, and the
+        read cursor's N-way merge must order runs the way storage sorted each one
+        — by column order — not by a raw u128 view of the key bytes, which orders
+        by ``(src_pk, value)`` because src_pk lands in the high half.
+
+        Correlated data sorts identically under both orders and so proves
+        nothing. Here value falls as pk rises, which is what makes the two orders
+        disagree: under the wrong one the merge seeks the wrong run's head and
+        the lookup misses. One INSERT per row, so each row is its own run.
+        """
+        sn = _sn()
+        client.create_schema(sn)
+        try:
+            client.execute_sql(
+                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY,"
+                " val BIGINT NOT NULL)", schema_name=sn)
+            client.execute_sql("CREATE INDEX ON t(val)", schema_name=sn)
+            n = 6
+            want = [(pk, (n + 1 - pk) * 100) for pk in range(1, n + 1)]
+            for pk, val in want:
+                client.execute_sql(
+                    f"INSERT INTO t VALUES ({pk}, {val})", schema_name=sn)
+            for pk, val in want:
+                got = _result_rows(
+                    client.execute_sql(
+                        f"SELECT * FROM t WHERE val = {val}", schema_name=sn))
+                assert got == [(pk, val)], \
+                    f"val={val} resolved to {got}, expected [({pk}, {val})]"
+        finally:
+            _drop_all(client, sn, indices=[f"{sn}__t__idx_val"], tables=["t"])
+
+
 class TestChunkedReplyTrains:
     def test_chunked_seek_and_range_replies_return_full_set(self, reply_frame_budget_server):
         client = reply_frame_budget_server
