@@ -1737,10 +1737,20 @@ def _create_replicated_join(conn, schema):
     and cogroups against each worker's own `dim`, union-gathering the result, so a
     worker with an empty, stale, or duplicated copy shows up in the gathered rows
     and weights."""
+    _create_replicated_dim(conn, schema)
+    _create_join_over_dim(conn, schema)
+
+
+def _create_replicated_dim(conn, schema):
+    """The replicated `dim` alone, for a test that builds the join later."""
     conn.create_schema(schema)
     conn.execute_sql(
         "CREATE TABLE dim (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL) "
         "WITH (replicated = true)", schema_name=schema)
+
+
+def _create_join_over_dim(conn, schema):
+    """The partitioned `fact` and the join view over an existing `dim`."""
     conn.execute_sql(
         "CREATE TABLE fact (pk BIGINT NOT NULL PRIMARY KEY, dim_pk BIGINT NOT NULL)",
         schema_name=schema)
@@ -1933,6 +1943,39 @@ def test_replicated_tail_survives_worker_count_shrink(own_server):
         f"{sorted({r.weight for r in rows})}"
     )
     assert {(r["pk"], r["v"]) for r in rows} == {(i, i * 10) for i in range(64)}
+    conn.close()
+
+
+def test_a_join_compiled_after_a_reboot_reaches_every_replicated_copy(own_server):
+    """The copy has to be live on every rank for a circuit that did not exist when
+    the rows arrived. Only `dim` is present before the SIGKILL; the fact table and
+    the join are created afterwards, so the join compiles fresh against a recovered
+    replicated table and each worker cogroups against its own restored copy. A rank
+    whose copy did not come back contributes no rows for the facts it owns.
+    """
+    sock_path = own_server.sock_path
+    workers = max(2, _NUM_WORKERS)
+    own_server.start(workers=workers)
+    conn = gnitz.connect(sock_path)
+    _create_replicated_dim(conn, "rj")
+    conn.execute_sql(
+        "INSERT INTO dim VALUES " + ", ".join(f"({i}, {i * 10})" for i in range(8)),
+        schema_name="rj")
+    conn.close()
+
+    own_server.restart(workers=workers)
+
+    conn = gnitz.connect(sock_path)
+    _create_join_over_dim(conn, "rj")
+    conn.execute_sql(
+        "INSERT INTO fact VALUES " + ", ".join(f"({i}, {i % 8})" for i in range(40)),
+        schema_name="rj")
+    vid, _ = conn.resolve_table("rj", "j")
+    rows = list(conn.scan(vid))
+    assert all(r.weight == 1 for r in rows), (
+        f"a duplicated copy shows as weight > 1, got {sorted({r.weight for r in rows})}")
+    assert {(r["pk"], r["v"]) for r in rows} == {(i, (i % 8) * 10) for i in range(40)}, (
+        "a rank whose replicated copy did not survive contributes no join rows")
     conn.close()
 
 

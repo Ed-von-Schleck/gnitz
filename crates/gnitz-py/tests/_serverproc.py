@@ -39,6 +39,12 @@ _libc = ctypes.CDLL("libc.so.6", use_errno=True)
 # skip and the `--workers` a server is actually spawned with can never disagree.
 NUM_WORKERS = int(os.environ.get("GNITZ_WORKERS", "1"))
 
+# A test whose claim is about placement — one copy rather than one per worker,
+# weight 1 rather than weight W, a partial merged across workers — is not merely
+# unproven at one worker, it passes vacuously. Marking it is what keeps a
+# `WORKERS=1` run honest about what it did not check.
+NEEDS_MULTI = pytest.mark.skipif(NUM_WORKERS < 2, reason="requires GNITZ_WORKERS >= 2")
+
 def test_server_env():
     """The environment every test-spawned server boots in: this process's, plus
     the defaults below wherever the caller has not set one itself.

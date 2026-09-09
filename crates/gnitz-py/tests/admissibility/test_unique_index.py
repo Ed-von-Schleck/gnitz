@@ -16,6 +16,7 @@ claim is forged by a retraction the pusher never held.
 
 import pytest
 import gnitz
+from _serverproc import NEEDS_MULTI
 
 _T = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
 _T_NULLABLE = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT)"
@@ -314,6 +315,39 @@ def test_worker_fault_mid_preflight(unique_preflight_fault_server):
         assert _has_index(srv, sn)
     finally:
         srv.drop_schema(sn)
+
+
+@NEEDS_MULTI
+@pytest.mark.parametrize("planted", [False, True], ids=["all-distinct", "duplicate"])
+def test_preflight_single_sources_a_replicated_owner(client, schema_name, planted):
+    """A replicated owner is the case where the global merge sees each value once
+    per worker. The fan-out must take one worker's full copy: without that, W
+    identical streams make every value look like its own duplicate and a
+    genuinely unique table is refused. Single-sourcing must not blunt the check
+    either — a real duplicate is still adjacent within the one stream.
+    """
+    client.execute_sql(_T + " WITH (replicated = true)", schema_name=schema_name)
+    rows = [(pk, pk * 100) for pk in range(1, 6)]
+    if planted:
+        rows.append((6, 500))
+    _insert(client, schema_name, rows)
+
+    if planted:
+        with pytest.raises(gnitz.GnitzError, match=_CREATE_DUP):
+            client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=schema_name)
+        assert not _has_index(client, schema_name)
+        # No phantom constraint: another duplicate is still accepted.
+        client.execute_sql("INSERT INTO t VALUES (7, 500)", schema_name=schema_name)
+        return
+
+    client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=schema_name)
+    assert _has_index(client, schema_name)
+    # The constraint is live, and the read still single-sources one copy.
+    with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+        client.execute_sql("INSERT INTO t VALUES (6, 100)", schema_name=schema_name)
+    client.execute_sql("INSERT INTO t VALUES (6, 600)", schema_name=schema_name)
+    tid, _ = client.resolve_table(schema_name, "t")
+    assert sorted(r.val for r in client.scan(tid)) == [100, 200, 300, 400, 500, 600]
 
 
 @pytest.mark.parametrize("planted", [False, True], ids=["all-distinct", "buried-duplicate"])

@@ -13,9 +13,13 @@ import threading
 
 import pytest
 import gnitz
+from _serverproc import NEEDS_MULTI
 from _uid import uid as _uid
 
 _PARENT = "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
+# The existence check broadcasts, so the parent's placement decides what each
+# worker can answer from: a replicated parent is whole on every worker.
+_PARENT_REPLICATED = _PARENT + " WITH (replicated = true)"
 _CHILD_INLINE = ("CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY,"
                  " pid BIGINT NOT NULL REFERENCES parent(id))")
 _CHILD_TABLE_LEVEL = ("CREATE TABLE child (cid BIGINT NOT NULL PRIMARY KEY,"
@@ -82,12 +86,17 @@ def tree(client, schema_name):
 
 # ── Declaring the constraint ─────────────────────────────────────────────────
 
-@pytest.mark.parametrize("child_ddl", [_CHILD_INLINE, _CHILD_TABLE_LEVEL],
-                         ids=["inline-references", "table-level"])
-def test_fk_declared_and_enforced(client, schema_name, child_ddl):
-    """Both spellings register the same constraint: a child row referencing a
-    live parent lands, one referencing nothing is refused."""
-    client.execute_sql(_PARENT, schema_name=schema_name)
+@pytest.mark.parametrize("parent_ddl,child_ddl", [
+    pytest.param(_PARENT, _CHILD_INLINE, id="inline-references"),
+    pytest.param(_PARENT, _CHILD_TABLE_LEVEL, id="table-level"),
+    pytest.param(_PARENT_REPLICATED, _CHILD_INLINE, id="replicated-parent",
+                 marks=NEEDS_MULTI),
+])
+def test_fk_declared_and_enforced(client, schema_name, parent_ddl, child_ddl):
+    """Both spellings register the same constraint, and it holds against either
+    parent placement: a child row referencing a live parent lands, one
+    referencing nothing is refused."""
+    client.execute_sql(parent_ddl, schema_name=schema_name)
     assert client.execute_sql(child_ddl, schema_name=schema_name)[0]["type"] == "TableCreated"
 
     client.execute_sql("INSERT INTO parent VALUES (1, 100)", schema_name=schema_name)

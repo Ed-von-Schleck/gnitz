@@ -8,6 +8,7 @@ DO UPDATE. Everything else about the target is unsupported in v1 and says so.
 
 import pytest
 import gnitz
+from _serverproc import NEEDS_MULTI
 
 _DDL = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
 
@@ -137,3 +138,22 @@ def test_duplicate_on_a_clustered_table_is_rejected(client, schema_name):
         with pytest.raises(gnitz.GnitzError, match="(?i)duplicate key"):
             client.execute_sql(f"INSERT INTO c VALUES ({a}, {b}, -1)", schema_name=schema_name)
     assert len(client.scan(tid)) == 32
+
+
+@NEEDS_MULTI
+def test_duplicate_on_a_replicated_table_is_rejected(client, schema_name):
+    """The other placement the Error-mode probe must get right. A replicated
+    table is not scattered at all: every worker holds the whole thing, so the
+    probe single-sources one worker's full copy. Fanning it out instead would
+    answer W times over and reject nothing differently — but the read of the
+    survivor must still show one copy, not W."""
+    client.execute_sql(
+        "CREATE TABLE r (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL) "
+        "WITH (replicated = true)", schema_name=schema_name)
+    client.execute_sql("INSERT INTO r VALUES (1, 100)", schema_name=schema_name)
+
+    with pytest.raises(gnitz.GnitzError, match="(?i)duplicate key"):
+        client.execute_sql("INSERT INTO r VALUES (1, 999)", schema_name=schema_name)
+
+    tid, _ = client.resolve_table(schema_name, "r")
+    assert sorted((r.pk, r.val) for r in client.scan(tid)) == [(1, 100)]

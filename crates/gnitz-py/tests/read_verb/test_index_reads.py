@@ -135,17 +135,22 @@ class TestIndexSeek:
                       tables=["t"])
 
     def test_seek_after_insert(self, client):
-        """Rows inserted after index creation are visible via seek."""
+        """Rows inserted after index creation are visible via seek — for keys
+        spanning every partition, so the projection that maintains the index has
+        to have run on every worker rather than only the one the seed landed on.
+        """
         sn = _sn()
         try:
             tid = self._setup(client, sn)
             client.execute_sql("CREATE INDEX ON t(cust_id)", schema_name=sn)
-            client.execute_sql("INSERT INTO t VALUES (5, 55)", schema_name=sn)
+            n = 32
+            client.execute_sql(
+                "INSERT INTO t VALUES " + ",".join(f"({i}, {i * 100})" for i in range(1, n + 1)),
+                schema_name=sn)
 
-            result = client.seek_by_index(tid, [1], [55])
-            assert result.schema is not None
-            assert len(result.pks) == 1
-            assert result.pks[0] == 5
+            for i in range(1, n + 1):
+                result = client.seek_by_index(tid, [1], [i * 100])
+                assert list(result.pks) == [i], f"cust_id={i * 100} not found via index"
         finally:
             _drop_all(client, sn,
                       indices=[f"{sn}__t__idx_cust_id"],

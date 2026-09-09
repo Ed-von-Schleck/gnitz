@@ -190,3 +190,19 @@ def test_the_neighbouring_spellings_are_unaffected(client, schema_name):
     client.execute_sql("CREATE INDEX ixb ON t USING BTREE (val)", schema_name=schema_name)
     client.execute_sql(
         "CREATE TABLE f2 (pk BIGINT PRIMARY KEY, c BIGINT REFERENCES p(k))", schema_name=schema_name)
+
+
+def test_replicated_and_cluster_by_are_mutually_exclusive(client, schema_name):
+    """The two placements are alternatives, not layers: `CLUSTER BY` hashes a PK
+    prefix to choose a worker, and a replicated table chooses none because every
+    worker holds all of it. Accepting both would leave the router with two
+    answers, so the planner refuses the pair by name.
+
+    `WITH` parses before `CLUSTER BY`, and `CLUSTER BY` takes bare columns — this
+    is the spelling that reaches the check rather than failing in the parser.
+    """
+    with pytest.raises(gnitz.GnitzError, match="(?is)replicated.*cluster by"):
+        client.execute_sql(
+            "CREATE TABLE bad (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL) "
+            "WITH (replicated = true) CLUSTER BY id",
+            schema_name=schema_name)
