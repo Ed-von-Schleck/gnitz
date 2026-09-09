@@ -3,7 +3,6 @@
 Run:
     cd crates/gnitz-py && GNITZ_WORKERS=4 uv run pytest tests/scalar_expression/test_case_expr.py -v --tb=short
 """
-import gnitz
 from _uid import uid as _uid
 
 

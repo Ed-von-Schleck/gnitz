@@ -13,24 +13,8 @@ Run:
 
 import pytest
 import gnitz
-from _uid import uid as _uid
 
 
-
-
-def _cleanup(client, sn):
-    try:
-        client.drop_schema(sn)
-    except Exception:
-        pass
-
-
-@pytest.fixture
-def schema_name(client):
-    sn = "s" + _uid()
-    client.create_schema(sn)
-    yield sn
-    _cleanup(client, sn)
 
 
 def _dicts(client, vid):

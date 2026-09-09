@@ -79,6 +79,47 @@ def test_delete_rows(client):
     client.drop_schema(sn)
 
 
+# A base table upserts by PK: within one push the last weight-positive row for a
+# PK wins, and a retraction matches on the PK alone — the payload it carries is
+# filler, which is what `delete` ships.
+_FOLD_CASES = [
+    ("last write wins",       [], [(1, 10, 1), (1, 20, 1)],                [(1, 20)]),
+    ("insert then retract",   [], [(1, 10, 1), (1, 0, -1)],                []),
+    ("retract then insert",   [(1, 10)], [(1, 0, -1), (1, 99, 1)],         [(1, 99)]),
+    ("weight 2 is one row",   [], [(1, 10, 2)],                            [(1, 10)]),
+    ("independent keys",      [(1, 10), (2, 20), (3, 30)], [(2, 99, 1)],   [(1, 10), (2, 99), (3, 30)]),
+]
+
+
+@pytest.mark.parametrize("seed,rows,expect",
+                         [c[1:] for c in _FOLD_CASES], ids=[c[0] for c in _FOLD_CASES])
+def test_push_folds_by_pk(client, seed, rows, expect):
+    sn, tid, schema = _setup(client)
+    try:
+        if seed:
+            b = gnitz.ZSetBatch(schema)
+            for pk, val in seed:
+                b.append(pk=pk, val=val)
+            client.push(tid, b)
+        b = gnitz.ZSetBatch(schema)
+        for pk, val, w in rows:
+            b.append(pk=pk, val=val, _weight=w)
+        client.push(tid, b)
+        assert sorted((r.pk, r.val) for r in client.scan(tid)) == expect
+        assert all(r.weight == 1 for r in client.scan(tid))
+    finally:
+        client.drop_schema(sn)
+
+
+def test_delete_absent_pk_is_a_noop(client):
+    sn, tid, schema = _setup(client)
+    try:
+        client.delete(tid, schema, [999])
+        assert not list(client.scan(tid))
+    finally:
+        client.drop_schema(sn)
+
+
 def test_nullable_string_columns(client):
     sn = "s" + _uid()
     client.create_schema(sn)

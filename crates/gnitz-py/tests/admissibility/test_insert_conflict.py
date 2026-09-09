@@ -1,356 +1,139 @@
-"""SQL-standard INSERT semantics + PostgreSQL-style ON CONFLICT tests.
+"""What `INSERT` refuses on a primary key, and what `ON CONFLICT` admits instead.
 
-Covers:
- - Plain INSERT rejects PK conflicts with a PG-style error.
- - Intra-batch PK duplicates are rejected atomically.
- - ON CONFLICT (pk) DO NOTHING skips conflicting rows.
- - ON CONFLICT (pk) DO UPDATE SET col = EXCLUDED.col upserts rows.
- - An explicit column list may be partial and reordered; omitted columns are NULL.
- - Unsupported ON CONFLICT variants return clear error messages.
+A plain `INSERT` ships conflict mode `Error`: a PK already present — in committed
+state or earlier in the same VALUES list — rejects the whole statement, and
+nothing is applied. `ON CONFLICT (pk)` replaces that verdict with DO NOTHING or
+DO UPDATE. Everything else about the target is unsupported in v1 and says so.
 """
 
 import pytest
 import gnitz
-from _uid import uid as _uid
+
+_DDL = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
 
 
+@pytest.fixture
+def t(client, schema_name):
+    """`t(pk, val)` in a fresh schema; yields its tid."""
+    client.execute_sql(_DDL, schema_name=schema_name)
+    return client.resolve_table(schema_name, "t")[0]
 
 
-def _make_table(client):
-    """CREATE TABLE t (pk BIGINT PK, val BIGINT) with fresh schema. Returns (sn, tid)."""
-    sn = "c" + _uid()
-    client.create_schema(sn)
+def _rows(client, tid):
+    return sorted((row.pk, row.val) for row in client.scan(tid))
+
+
+# A rejected INSERT applies nothing — the batch is atomic whether the conflict is
+# against committed state or against an earlier row of the same VALUES list.
+_REJECTED = [
+    ("against committed",  "INSERT INTO t VALUES (1, 10)", "INSERT INTO t VALUES (1, 20)",              [(1, 10)]),
+    ("intra-batch pair",   None,                           "INSERT INTO t VALUES (1, 10), (1, 20)",     []),
+    ("intra-batch late",   None,                           "INSERT INTO t VALUES (1,10),(2,20),(1,30)", []),
+    ("mid-batch committed", "INSERT INTO t VALUES (2, 200)", "INSERT INTO t VALUES (1,10),(2,20),(3,30)", [(2, 200)]),
+]
+
+
+@pytest.mark.parametrize("seed,stmt,final", [c[1:] for c in _REJECTED],
+                         ids=[c[0] for c in _REJECTED])
+def test_duplicate_pk_rejects_the_whole_statement(client, schema_name, t, seed, stmt, final):
+    if seed:
+        client.execute_sql(seed, schema_name=schema_name)
+    with pytest.raises(gnitz.GnitzError, match="(?i)duplicate key"):
+        client.execute_sql(stmt, schema_name=schema_name)
+    assert _rows(client, t) == final
+
+
+_ON_CONFLICT = [
+    ("do nothing skips the conflict",
+     "INSERT INTO t VALUES (1, 10)",
+     "INSERT INTO t VALUES (1, 20), (2, 30) ON CONFLICT (pk) DO NOTHING",
+     [(1, 10), (2, 30)]),
+    ("do nothing with no target",
+     "INSERT INTO t VALUES (1, 10)",
+     "INSERT INTO t VALUES (1, 20), (2, 30) ON CONFLICT DO NOTHING",
+     [(1, 10), (2, 30)]),
+    ("do nothing, every row conflicts",
+     "INSERT INTO t VALUES (1, 10), (2, 20)",
+     "INSERT INTO t VALUES (1, 999), (2, 999), (3, 30) ON CONFLICT (pk) DO NOTHING",
+     [(1, 10), (2, 20), (3, 30)]),
+    ("do update from EXCLUDED",
+     "INSERT INTO t VALUES (1, 10)",
+     "INSERT INTO t VALUES (1, 100), (2, 200) ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
+     [(1, 100), (2, 200)]),
+    ("do update from a literal",
+     "INSERT INTO t VALUES (1, 10)",
+     "INSERT INTO t VALUES (1, 20) ON CONFLICT (pk) DO UPDATE SET val = 42",
+     [(1, 42)]),
+]
+
+
+@pytest.mark.parametrize("seed,stmt,final", [c[1:] for c in _ON_CONFLICT],
+                         ids=[c[0] for c in _ON_CONFLICT])
+def test_on_conflict_resolves_instead_of_rejecting(client, schema_name, t, seed, stmt, final):
+    client.execute_sql(seed, schema_name=schema_name)
+    client.execute_sql(stmt, schema_name=schema_name)
+    assert _rows(client, t) == final
+
+
+_UNSUPPORTED = [
+    # A conflict target must name exactly the primary key — `(val)` names
+    # something else, `(pk, val)` names more than it. Both fail the same check.
+    ("INSERT INTO t VALUES (1, 10) ON CONFLICT (val) DO NOTHING", "primary key"),
+    ("INSERT INTO t VALUES (1, 10) ON CONFLICT (pk, val) DO NOTHING", "primary key"),
+    ("INSERT INTO t VALUES (1, 20) ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val WHERE val > 5",
+     "DO UPDATE WHERE"),
+    # PG rejects a row that would be affected a second time by the same command.
+    ("INSERT INTO t VALUES (1, 10), (1, 20) ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
+     "second time"),
+]
+
+
+@pytest.mark.parametrize("stmt,message", _UNSUPPORTED)
+def test_unsupported_on_conflict_variant_names_its_rule(client, schema_name, t, stmt, message):
+    with pytest.raises(gnitz.GnitzError, match=message):
+        client.execute_sql(stmt, schema_name=schema_name)
+
+
+def test_insert_partial_column_list(client, schema_name):
+    """A column list may name a subset in any order; every column it omits is
+    written NULL (gnitz has no column DEFAULTs), so omitting a NOT NULL one is
+    the NOT NULL violation — raised before anything is written."""
     client.execute_sql(
-        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-        schema_name=sn,
+        "CREATE TABLE p (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b TEXT)",
+        schema_name=schema_name,
     )
-    tid, _ = client.resolve_table(sn, "t")
-    return sn, tid
+    # Reordered as well as partial: the slot map, not the position, decides
+    # which column each VALUES element lands in.
+    client.execute_sql("INSERT INTO p (b, pk) VALUES ('x', 1)", schema_name=schema_name)
+    client.execute_sql("INSERT INTO p (pk, a, b) VALUES (2, 20, 'y')", schema_name=schema_name)
+    tid, _ = client.resolve_table(schema_name, "p")
+    assert sorted((r.pk, r.a, r.b) for r in client.scan(tid)) == [(1, None, "x"), (2, 20, "y")]
+
+    client.execute_sql(_DDL, schema_name=schema_name)
+    with pytest.raises(gnitz.GnitzError, match="(?i)not null"):
+        client.execute_sql("INSERT INTO t (pk) VALUES (1)", schema_name=schema_name)
+    assert not list(client.scan(client.resolve_table(schema_name, "t")[0]))
 
 
-def _cleanup(client, sn, table="t"):
-    try:
-        client.drop_table(sn, table)
-    except Exception:
-        pass
-    try:
-        client.drop_schema(sn)
-    except Exception:
-        pass
+def test_duplicate_on_a_clustered_table_is_rejected(client, schema_name):
+    """The Error-mode PK probe is SCATTERED by the key, so it must partition at
+    the table's own router width. `CLUSTER BY a` hashes a proper prefix of the
+    PK; a probe routed at the default full-PK width lands on a worker that does
+    not store the key, comes back empty, and the duplicate commits silently —
+    with no error anywhere, since the probe schema's equality ignores placement.
+    """
+    client.execute_sql(
+        "CREATE TABLE c (a BIGINT NOT NULL, b BIGINT NOT NULL, v BIGINT NOT NULL, "
+        "PRIMARY KEY (a, b)) CLUSTER BY a",
+        schema_name=schema_name)
+    # Several distinct `a` values, so the prefix hash spreads over the cluster
+    # and a full-PK hash of the same keys lands elsewhere.
+    rows = ", ".join(f"({a}, {b}, {a * 100 + b})" for a in range(8) for b in range(4))
+    client.execute_sql(f"INSERT INTO c VALUES {rows}", schema_name=schema_name)
+    tid, _ = client.resolve_table(schema_name, "c")
+    assert len(client.scan(tid)) == 32
 
-
-def _scan_rows(client, tid):
-    """Return sorted list of (pk, val) for all positive-weight rows."""
-    return sorted(
-        (row.pk, row.val)
-        for row in client.scan(tid)
-    )
-
-
-# ---------------------------------------------------------------------------
-# Plain INSERT: SQL-standard rejection
-# ---------------------------------------------------------------------------
-
-
-def test_insert_duplicate_pk_fails(client):
-    """Two separate INSERTs with the same PK: the second must fail."""
-    sn, tid = _make_table(client)
-    try:
-        client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
-        with pytest.raises(gnitz.GnitzError) as exc:
-            client.execute_sql("INSERT INTO t VALUES (1, 20)", schema_name=sn)
-        assert "duplicate key" in str(exc.value).lower()
-        # The original row is unchanged
-        assert _scan_rows(client, tid) == [(1, 10)]
-    finally:
-        _cleanup(client, sn)
-
-
-def test_insert_duplicate_pk_in_values_fails(client):
-    """Intra-batch PK duplicate: `INSERT VALUES (1,10),(1,20)` fails; table empty."""
-    sn, tid = _make_table(client)
-    try:
-        with pytest.raises(gnitz.GnitzError) as exc:
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10), (1, 20)", schema_name=sn,
-            )
-        assert "duplicate key" in str(exc.value).lower()
-        # Entire batch failed atomically — no rows applied
-        assert _scan_rows(client, tid) == []
-    finally:
-        _cleanup(client, sn)
-
-
-def test_insert_partial_batch_atomicity(client):
-    """Mid-batch conflict rolls back the entire batch."""
-    sn, tid = _make_table(client)
-    try:
-        with pytest.raises(gnitz.GnitzError):
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10), (2, 20), (1, 30)",
-                schema_name=sn,
-            )
-        assert _scan_rows(client, tid) == []
-    finally:
-        _cleanup(client, sn)
-
-
-def test_insert_conflict_with_prior_data_atomicity(client):
-    """Against-store conflict rolls back the entire batch."""
-    sn, tid = _make_table(client)
-    try:
-        client.execute_sql("INSERT INTO t VALUES (2, 200)", schema_name=sn)
-        with pytest.raises(gnitz.GnitzError):
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
-                schema_name=sn,
-            )
-        # Only the pre-existing row survives
-        assert _scan_rows(client, tid) == [(2, 200)]
-    finally:
-        _cleanup(client, sn)
-
-
-# ---------------------------------------------------------------------------
-# ON CONFLICT (pk) DO NOTHING
-# ---------------------------------------------------------------------------
-
-
-def test_insert_on_conflict_do_nothing_skip_existing(client):
-    """Second INSERT skips conflicting row, inserts the new one."""
-    sn, tid = _make_table(client)
-    try:
-        client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
-        client.execute_sql(
-            "INSERT INTO t VALUES (1, 20), (2, 30) ON CONFLICT (pk) DO NOTHING",
-            schema_name=sn,
-        )
-        assert _scan_rows(client, tid) == [(1, 10), (2, 30)]
-    finally:
-        _cleanup(client, sn)
-
-
-def test_insert_on_conflict_do_nothing_all_conflict(client):
-    """All rows conflict → zero survivors, pre-existing rows unchanged."""
-    sn, tid = _make_table(client)
-    try:
-        client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
-        client.execute_sql(
-            "INSERT INTO t VALUES (1, 20) ON CONFLICT (pk) DO NOTHING",
-            schema_name=sn,
-        )
-        assert _scan_rows(client, tid) == [(1, 10)]
-    finally:
-        _cleanup(client, sn)
-
-
-def test_insert_on_conflict_do_nothing_no_target(client):
-    """`ON CONFLICT DO NOTHING` with no target: same as PK target in v1."""
-    sn, tid = _make_table(client)
-    try:
-        client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
-        client.execute_sql(
-            "INSERT INTO t VALUES (1, 20), (2, 30) ON CONFLICT DO NOTHING",
-            schema_name=sn,
-        )
-        assert _scan_rows(client, tid) == [(1, 10), (2, 30)]
-    finally:
-        _cleanup(client, sn)
-
-
-# ---------------------------------------------------------------------------
-# ON CONFLICT (pk) DO UPDATE
-# ---------------------------------------------------------------------------
-
-
-def test_insert_on_conflict_do_update_set_excluded(client):
-    """`DO UPDATE SET val = EXCLUDED.val` upserts the conflicting row."""
-    sn, tid = _make_table(client)
-    try:
-        client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
-        client.execute_sql(
-            "INSERT INTO t VALUES (1, 20) ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
-            schema_name=sn,
-        )
-        assert _scan_rows(client, tid) == [(1, 20)]
-    finally:
-        _cleanup(client, sn)
-
-
-def test_insert_on_conflict_do_update_new_row_inserted(client):
-    """Non-conflicting rows still insert under DO UPDATE."""
-    sn, tid = _make_table(client)
-    try:
-        client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
-        client.execute_sql(
-            "INSERT INTO t VALUES (1, 100), (2, 200) "
-            "ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
-            schema_name=sn,
-        )
-        assert _scan_rows(client, tid) == [(1, 100), (2, 200)]
-    finally:
-        _cleanup(client, sn)
-
-
-def test_insert_on_conflict_do_update_literal_assignment(client):
-    """DO UPDATE SET val = 42: literal assignment."""
-    sn, tid = _make_table(client)
-    try:
-        client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
-        client.execute_sql(
-            "INSERT INTO t VALUES (1, 20) ON CONFLICT (pk) DO UPDATE SET val = 42",
-            schema_name=sn,
-        )
-        assert _scan_rows(client, tid) == [(1, 42)]
-    finally:
-        _cleanup(client, sn)
-
-
-# ---------------------------------------------------------------------------
-# Explicit column lists
-# ---------------------------------------------------------------------------
-
-
-def test_insert_partial_column_list_omits_a_nullable_column(client):
-    """A column list may name a subset, in any order; every column it omits is
-    written NULL (gnitz has no column DEFAULTs)."""
-    sn = "c" + _uid()
-    client.create_schema(sn)
-    try:
-        client.execute_sql(
-            "CREATE TABLE p (pk BIGINT NOT NULL PRIMARY KEY, a BIGINT, b TEXT)",
-            schema_name=sn,
-        )
-        # Reordered as well as partial: the slot map, not the position, decides
-        # which column each VALUES element lands in.
-        client.execute_sql("INSERT INTO p (b, pk) VALUES ('x', 1)", schema_name=sn)
-        client.execute_sql("INSERT INTO p (pk, a, b) VALUES (2, 20, 'y')", schema_name=sn)
-        tid, _ = client.resolve_table(sn, "p")
-        rows = sorted((r.pk, r.a, r.b) for r in client.scan(tid))
-        assert rows == [(1, None, "x"), (2, 20, "y")]
-    finally:
-        _cleanup(client, sn, "p")
-
-
-def test_insert_partial_column_list_omitting_a_not_null_column_is_rejected(client):
-    """An omitted column is NULL, so omitting a NOT NULL one is the NOT NULL
-    violation — raised before anything is written."""
-    sn, tid = _make_table(client)
-    try:
-        with pytest.raises(gnitz.GnitzError) as exc:
-            client.execute_sql("INSERT INTO t (pk) VALUES (1)", schema_name=sn)
-        assert "not null" in str(exc.value).lower()
-        assert _scan_rows(client, tid) == []
-    finally:
-        _cleanup(client, sn)
-
-
-# ---------------------------------------------------------------------------
-# Unsupported ON CONFLICT variants
-# ---------------------------------------------------------------------------
-
-
-def test_insert_on_conflict_non_pk_target_unsupported(client):
-    """ON CONFLICT on a non-PK, non-unique-index column is v1 unsupported."""
-    sn, tid = _make_table(client)
-    try:
-        with pytest.raises(gnitz.GnitzError) as exc:
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10) ON CONFLICT (val) DO NOTHING",
-                schema_name=sn,
-            )
-        err = str(exc.value).lower()
-        # Accept either "primary key" or "unsupported"
-        assert "primary key" in err or "unsupported" in err
-    finally:
-        _cleanup(client, sn)
-
-
-def test_insert_on_conflict_target_wider_than_the_pk_not_supported(client):
-    """A conflict target must name exactly the primary key; `(pk, val)` on a
-    single-column PK names more than it."""
-    sn, tid = _make_table(client)
-    try:
-        with pytest.raises(gnitz.GnitzError) as exc:
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10) ON CONFLICT (pk, val) DO NOTHING",
-                schema_name=sn,
-            )
-        assert "primary key" in str(exc.value).lower()
-    finally:
-        _cleanup(client, sn)
-
-
-def test_insert_do_update_where_unsupported(client):
-    """ON CONFLICT ... DO UPDATE WHERE is v1 unsupported."""
-    sn, tid = _make_table(client)
-    try:
-        client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
-        with pytest.raises(gnitz.GnitzError) as exc:
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 20) "
-                "ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val WHERE val > 5",
-                schema_name=sn,
-            )
-        assert "where" in str(exc.value).lower() or "unsupported" in str(exc.value).lower()
-    finally:
-        _cleanup(client, sn)
-
-
-# ---------------------------------------------------------------------------
-# Regression checks that existing semantics still work
-# ---------------------------------------------------------------------------
-
-
-def test_update_still_works_after_fix(client):
-    """Plain SQL UPDATE path is unaffected by the new INSERT semantics."""
-    sn, tid = _make_table(client)
-    try:
-        client.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
-        client.execute_sql("UPDATE t SET val = 20 WHERE pk = 1", schema_name=sn)
-        assert _scan_rows(client, tid) == [(1, 20)]
-    finally:
-        _cleanup(client, sn)
-
-
-def test_on_conflict_batch_with_multiple_conflicts(client):
-    """Mix of conflicting and non-conflicting rows under DO NOTHING."""
-    sn, tid = _make_table(client)
-    try:
-        client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20)", schema_name=sn)
-        client.execute_sql(
-            "INSERT INTO t VALUES (1, 999), (2, 999), (3, 30) "
-            "ON CONFLICT (pk) DO NOTHING",
-            schema_name=sn,
-        )
-        assert _scan_rows(client, tid) == [(1, 10), (2, 20), (3, 30)]
-    finally:
-        _cleanup(client, sn)
-
-
-def test_insert_fresh_batch_still_works(client):
-    """Plain INSERT of fresh PKs still succeeds as before."""
-    sn, tid = _make_table(client)
-    try:
-        client.execute_sql(
-            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", schema_name=sn,
-        )
-        assert _scan_rows(client, tid) == [(1, 10), (2, 20), (3, 30)]
-    finally:
-        _cleanup(client, sn)
-
-
-def test_insert_on_conflict_intra_batch_duplicate_do_update_rejected(client):
-    """Intra-batch duplicate PK under DO UPDATE: reject in v1 (matches PG)."""
-    sn, tid = _make_table(client)
-    try:
-        with pytest.raises(gnitz.GnitzError) as exc:
-            client.execute_sql(
-                "INSERT INTO t VALUES (1, 10), (1, 20) "
-                "ON CONFLICT (pk) DO UPDATE SET val = EXCLUDED.val",
-                schema_name=sn,
-            )
-        err = str(exc.value).lower()
-        assert "second time" in err or "duplicate" in err
-    finally:
-        _cleanup(client, sn)
+    for a, b in [(0, 0), (3, 2), (7, 3)]:
+        with pytest.raises(gnitz.GnitzError, match="(?i)duplicate key"):
+            client.execute_sql(f"INSERT INTO c VALUES ({a}, {b}, -1)", schema_name=schema_name)
+    assert len(client.scan(tid)) == 32

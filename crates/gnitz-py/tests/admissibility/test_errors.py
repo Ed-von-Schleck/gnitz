@@ -1,181 +1,97 @@
+"""Wire- and client-level refusals: a schema that disagrees with the target, a
+push aimed at something that is not writable, a name in the reserved range, and
+a relation that is not there.
+"""
+
 import threading
 
 import pytest
 import gnitz
-from _uid import uid as _uid
+
+_DDL = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
+
+# `t`'s own PK type, so a mismatch case varies exactly the column it names.
+# A U64 key against a BIGINT table would mismatch on the PK type as well, and
+# every case would then pass for a reason other than its own.
+_U64_DDL = "CREATE TABLE t (pk BIGINT UNSIGNED NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
+
+_PK = gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)
 
 
+@pytest.fixture
+def t(client, schema_name):
+    """`t(pk BIGINT PK, val BIGINT NOT NULL)`; yields its tid."""
+    client.execute_sql(_DDL, schema_name=schema_name)
+    return client.resolve_table(schema_name, "t")[0]
 
 
-def _cleanup(client, sn, tables=()):
-    for t in tables:
-        try:
-            client.execute_sql(f"DROP TABLE {t}", schema_name=sn)
-        except Exception:
-            pass
-    try:
-        client.drop_schema(sn)
-    except Exception:
-        pass
+@pytest.fixture
+def t_u64(client, schema_name):
+    """`t` keyed on BIGINT UNSIGNED, matching `_PK`; yields its tid."""
+    client.execute_sql(_U64_DDL, schema_name=schema_name)
+    return client.resolve_table(schema_name, "t")[0]
 
 
-def test_a_written_qualifier_must_name_the_relation(client):
+def test_a_written_qualifier_must_name_the_relation(client, schema_name):
     """A single-relation statement resolves a qualified reference against the FROM
     item's effective alias — the written one when there is one — so a qualifier
     naming something else is a rejection, not a silently ignored decoration."""
-    sn = "q" + _uid()
-    client.create_schema(sn)
-    try:
-        client.execute_sql(
-            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)", schema_name=sn
-        )
-        client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20)", schema_name=sn)
+    client.execute_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, a BIGINT NOT NULL)",
+        schema_name=schema_name)
+    client.execute_sql("INSERT INTO t VALUES (1, 10), (2, 20)", schema_name=schema_name)
 
-        # The relation's own name and a written alias both answer.
-        assert len(client.execute_sql("SELECT t.a FROM t", schema_name=sn)[0]["rows"]) == 2
-        assert len(client.execute_sql("SELECT x.a FROM t AS x", schema_name=sn)[0]["rows"]) == 2
-        client.execute_sql("UPDATE t AS x SET a = 99 WHERE x.a = 10", schema_name=sn)
-        assert sorted(r["a"] for r in client.execute_sql("SELECT a FROM t", schema_name=sn)[0]["rows"]) == [20, 99]
+    # The relation's own name and a written alias both answer.
+    assert len(client.execute_sql("SELECT t.a FROM t", schema_name=schema_name)[0]["rows"]) == 2
+    assert len(client.execute_sql("SELECT x.a FROM t AS x", schema_name=schema_name)[0]["rows"]) == 2
+    client.execute_sql("UPDATE t AS x SET a = 99 WHERE x.a = 10", schema_name=schema_name)
+    assert sorted(r["a"] for r in
+                  client.execute_sql("SELECT a FROM t", schema_name=schema_name)[0]["rows"]) == [20, 99]
 
-        # A qualifier naming no relation in scope, on each surface.
-        for stmt in [
-            "SELECT b.a FROM t",
-            "SELECT a FROM t WHERE b.a = 1",
-            # The written alias displaces the table name.
-            "SELECT t.a FROM t AS x",
-            "UPDATE t AS x SET a = 1 WHERE t.a = 1",
-            "DELETE FROM t WHERE nope.a = 1",
-            "CREATE VIEW v AS SELECT b.a FROM t",
-        ]:
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql(stmt, schema_name=sn)
-    finally:
-        _cleanup(client, sn, ["t"])
-
-
-def test_push_to_nonexistent_target(client):
-    cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-            gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
-    schema = gnitz.Schema(cols)
-    batch = gnitz.ZSetBatch(schema)
-    batch.append(pk=1, val=10)
-    with pytest.raises(gnitz.GnitzError):
-        client.push(99999, batch)
-
-
-def test_scan_nonexistent_target(client):
-    with pytest.raises(gnitz.GnitzError):
-        client.scan(99999)
+    for stmt in [
+        "SELECT b.a FROM t",
+        "SELECT a FROM t WHERE b.a = 1",
+        # The written alias displaces the table name.
+        "SELECT t.a FROM t AS x",
+        "UPDATE t AS x SET a = 1 WHERE t.a = 1",
+        "DELETE FROM t WHERE nope.a = 1",
+        "CREATE VIEW v AS SELECT b.a FROM t",
+    ]:
+        with pytest.raises(gnitz.GnitzError):
+            client.execute_sql(stmt, schema_name=schema_name)
 
 
 # ---------------------------------------------------------------------------
-# Schema mismatch — validate_schema_match in executor.rs is called on every
-# buffered push that includes a schema descriptor.  No test previously sent
-# a deliberately wrong schema.
+# Schema mismatch — `validate_schema_match` runs on every push carrying a schema
+# descriptor. Which mismatches it distinguishes, and that it names each one
+# differently, is pinned in Rust; what only an end-to-end push can show is that
+# the wire actually carries the descriptor to it — on the cold path AND on the
+# warm path, where a cached schema once let the push skip validation entirely
+# and reinterpret a U64-encoded PK as I64, corrupting at rest.
 # ---------------------------------------------------------------------------
 
-class TestSchemaMismatch:
-    """Push batches whose schema disagrees with the stored table schema."""
+_MISMATCHED = [
+    ("column count", [_PK], {"pk": 1}),
+    ("pk index",     [gnitz.ColumnDef("pk", gnitz.TypeCode.U64),
+                      gnitz.ColumnDef("val", gnitz.TypeCode.I64, primary_key=True)], {"pk": 1, "val": 42}),
+    ("column type",  [_PK, gnitz.ColumnDef("val", gnitz.TypeCode.F64)], {"pk": 1, "val": 3.14}),
+    ("nullable",     [_PK, gnitz.ColumnDef("val", gnitz.TypeCode.I64, is_nullable=True)], {"pk": 1, "val": 42}),
+    # The table's PK is BIGINT UNSIGNED; this batch claims a signed one.
+    ("pk type",      [gnitz.ColumnDef("pk", gnitz.TypeCode.I64, primary_key=True),
+                      gnitz.ColumnDef("val", gnitz.TypeCode.I64)], {"pk": 1, "val": 42}),
+]
 
-    def _make_table(self, client, sn):
-        """Two-column table: pk BIGINT PK, val BIGINT."""
-        client.create_schema(sn)
-        client.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        tid, _ = client.resolve_table(sn, "t")
-        return tid
 
-    def test_wrong_column_count(self, client):
-        """Batch with one column fewer than the table schema must be rejected."""
-        sn = "err" + _uid()
-        try:
-            tid = self._make_table(client, sn)
-            wrong_cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)]
-            wrong_schema = gnitz.Schema(wrong_cols)
-            batch = gnitz.ZSetBatch(wrong_schema)
-            batch.append(pk=1)
-            with pytest.raises(gnitz.GnitzError):
-                client.push(tid, batch)
-        finally:
-            _cleanup(client, sn, tables=["t"])
-
-    def test_wrong_pk_index(self, client):
-        """Batch keyed on column 1 when the table is keyed on column 0 must be rejected."""
-        sn = "err" + _uid()
-        try:
-            tid = self._make_table(client, sn)
-            # Same types, but primary_key flag swapped: pk_index becomes 1.
-            wrong_cols = [
-                gnitz.ColumnDef("pk",  gnitz.TypeCode.U64),
-                gnitz.ColumnDef("val", gnitz.TypeCode.I64, primary_key=True),
-            ]
-            wrong_schema = gnitz.Schema(wrong_cols)
-            batch = gnitz.ZSetBatch(wrong_schema)
-            batch.append(pk=1, val=42)
-            with pytest.raises(gnitz.GnitzError):
-                client.push(tid, batch)
-        finally:
-            _cleanup(client, sn, tables=["t"])
-
-    def test_wrong_column_type(self, client):
-        """Batch where val is F64 instead of I64 must be rejected."""
-        sn = "err" + _uid()
-        try:
-            tid = self._make_table(client, sn)
-            wrong_cols = [
-                gnitz.ColumnDef("pk",  gnitz.TypeCode.U64, primary_key=True),
-                gnitz.ColumnDef("val", gnitz.TypeCode.F64),   # wrong: table has I64
-            ]
-            wrong_schema = gnitz.Schema(wrong_cols)
-            batch = gnitz.ZSetBatch(wrong_schema)
-            batch.append(pk=1, val=3.14)
-            with pytest.raises(gnitz.GnitzError):
-                client.push(tid, batch)
-        finally:
-            _cleanup(client, sn, tables=["t"])
-
-    def test_wrong_nullable(self, client):
-        """Batch that marks a NOT NULL column as nullable must be rejected."""
-        sn = "err" + _uid()
-        try:
-            tid = self._make_table(client, sn)  # val BIGINT NOT NULL (nullable=0)
-            wrong_cols = [
-                gnitz.ColumnDef("pk",  gnitz.TypeCode.U64, primary_key=True),
-                gnitz.ColumnDef("val", gnitz.TypeCode.I64, is_nullable=True),  # wrong
-            ]
-            wrong_schema = gnitz.Schema(wrong_cols)
-            batch = gnitz.ZSetBatch(wrong_schema)
-            batch.append(pk=1, val=42)
-            with pytest.raises(gnitz.GnitzError):
-                client.push(tid, batch)
-        finally:
-            _cleanup(client, sn, tables=["t"])
-
-    def test_wrong_pk_type_rejected_when_cache_warm(self, client):
-        """A PK-type mismatch must be rejected whether or not the table schema
-        is cached. Warming the cache (via a scan of the table) used to route
-        the push through the schema-less warm path, where the server skipped
-        validate_schema_match and silently reinterpreted the U64-encoded PK as
-        I64 — corrupting at rest. The push must fail identically to the cold
-        path (cf. test_wrong_column_type)."""
-        sn = "err" + _uid()
-        try:
-            tid = self._make_table(client, sn)  # pk BIGINT (stored I64)
-            # Warm the client's schema cache for this table.
-            client.scan(tid)
-            wrong_cols = [
-                gnitz.ColumnDef("pk",  gnitz.TypeCode.U64, primary_key=True),  # wrong: table is I64
-                gnitz.ColumnDef("val", gnitz.TypeCode.I64),
-            ]
-            wrong_schema = gnitz.Schema(wrong_cols)
-            batch = gnitz.ZSetBatch(wrong_schema)
-            batch.append(pk=1, val=42)
-            with pytest.raises(gnitz.GnitzError):
-                client.push(tid, batch)
-        finally:
-            _cleanup(client, sn, tables=["t"])
+@pytest.mark.parametrize("warm", [False, True], ids=["cold", "warm"])
+@pytest.mark.parametrize("cols,row", [c[1:] for c in _MISMATCHED],
+                         ids=[c[0] for c in _MISMATCHED])
+def test_push_with_a_mismatched_schema_is_rejected(client, t_u64, warm, cols, row):
+    if warm:
+        client.scan(t_u64)   # caches the table schema client-side
+    batch = gnitz.ZSetBatch(gnitz.Schema(cols))
+    batch.append(**row)
+    with pytest.raises(gnitz.GnitzError):
+        client.push(t_u64, batch)
 
 
 # ---------------------------------------------------------------------------
@@ -187,125 +103,75 @@ class TestSchemaMismatch:
 # client's schema cache carries no relation kind).
 # ---------------------------------------------------------------------------
 
-_NOT_WRITABLE = "is not writable: pushes must target a base table"
+_NOT_WRITABLE = "is not writable"
 
 
-class TestPushViewTargetRejected:
-    def _make_table_and_view(self, client, sn):
-        """t(pk, val) with a filter view v; rows (1,100) in v, (2,10) not."""
-        client.create_schema(sn)
-        client.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name=sn,
-        )
-        client.execute_sql(
-            "CREATE VIEW v AS SELECT * FROM t WHERE val > 50",
-            schema_name=sn,
-        )
-        client.execute_sql("INSERT INTO t VALUES (1, 100), (2, 10)", schema_name=sn)
-        tid, t_schema = client.resolve_table(sn, "t")
-        vid, v_schema = client.resolve_table(sn, "v")
-        return tid, t_schema, vid, v_schema
+@pytest.fixture
+def view_target(client, schema_name):
+    """`t(pk, val)` with a filter view `v`; rows (1,100) in v, (2,10) not.
+    Yields `(tid, t_schema, vid, v_schema)`."""
+    client.execute_sql(_DDL, schema_name=schema_name)
+    client.execute_sql("CREATE VIEW v AS SELECT * FROM t WHERE val > 50", schema_name=schema_name)
+    client.execute_sql("INSERT INTO t VALUES (1, 100), (2, 10)", schema_name=schema_name)
+    tid, t_schema = client.resolve_table(schema_name, "t")
+    vid, v_schema = client.resolve_table(schema_name, "v")
+    return tid, t_schema, vid, v_schema
 
-    def _teardown(self, client, sn):
-        for sql in ["DROP VIEW v", "DROP TABLE t"]:
-            try:
-                client.execute_sql(sql, schema_name=sn)
-            except Exception:
-                pass
-        try:
-            client.drop_schema(sn)
-        except Exception:
-            pass
 
-    def _view_rows(self, client, vid):
+def test_writes_to_a_view_are_rejected_and_change_nothing(client, view_target):
+    """Push and delete are one guard, applied on the cold path (schema block on
+    the wire), the warm path (schema omitted after a scan), and the empty-batch
+    arm alike — so a client bug producing an empty batch fails identically
+    instead of being masked by the no-op ACK. A base table still no-op ACKs."""
+    tid, t_schema, vid, v_schema = view_target
+
+    def rows():
         return sorted((r.pk, r.val, r.weight) for r in client.scan(vid))
 
-    def test_push_to_view_rejected_content_unchanged(self, client):
-        """A non-empty push to a view tid errors on both the cold path (schema
-        block on the wire) and the warm path (schema-omitted after a scan),
-        and the view's content is untouched either way."""
-        sn = "err" + _uid()
-        try:
-            _, _, vid, v_schema = self._make_table_and_view(client, sn)
-            batch = gnitz.ZSetBatch(v_schema)
-            batch.append(pk=999, val=999)
-            # Cold path: no prior scan, the push frame carries a schema block.
-            with pytest.raises(gnitz.GnitzError, match=_NOT_WRITABLE):
-                client.push(vid, batch)
-            before = self._view_rows(client, vid)
-            assert before == [(1, 100, 1)]
-            # Warm path: the scan above cached the view schema client-side.
-            with pytest.raises(gnitz.GnitzError, match=_NOT_WRITABLE):
-                client.push(vid, batch)
-            assert self._view_rows(client, vid) == before
-        finally:
-            self._teardown(client, sn)
+    batch = gnitz.ZSetBatch(v_schema)
+    batch.append(pk=999, val=999)
+    with pytest.raises(gnitz.GnitzError, match=_NOT_WRITABLE):
+        client.push(vid, batch)
+    before = rows()
+    assert before == [(1, 100, 1)]
 
-    def test_delete_to_view_rejected_content_unchanged(self, client):
-        """delete is a plain negative-weight push — same rejection."""
-        sn = "err" + _uid()
-        try:
-            _, _, vid, v_schema = self._make_table_and_view(client, sn)
-            before = self._view_rows(client, vid)
-            with pytest.raises(gnitz.GnitzError, match=_NOT_WRITABLE):
-                client.delete(vid, v_schema, [1])
-            assert self._view_rows(client, vid) == before
-        finally:
-            self._teardown(client, sn)
+    # Warm path: the scan above cached the view schema client-side.
+    with pytest.raises(gnitz.GnitzError, match=_NOT_WRITABLE):
+        client.push(vid, batch)
+    with pytest.raises(gnitz.GnitzError, match=_NOT_WRITABLE):
+        client.delete(vid, v_schema, [1])
+    with pytest.raises(gnitz.GnitzError, match=_NOT_WRITABLE):
+        client.push(vid, gnitz.ZSetBatch(v_schema))
+    assert rows() == before
 
-    def test_empty_push_to_view_rejected(self, client):
-        """The empty-push arm applies the same gate: a client bug that happens
-        to produce an empty batch fails identically instead of being masked by
-        the no-op ACK."""
-        sn = "err" + _uid()
-        try:
-            _, _, vid, v_schema = self._make_table_and_view(client, sn)
-            empty = gnitz.ZSetBatch(v_schema)
-            with pytest.raises(gnitz.GnitzError, match=_NOT_WRITABLE):
-                client.push(vid, empty)
-        finally:
-            self._teardown(client, sn)
-
-    def test_empty_push_to_base_table_still_noop_acks(self, client):
-        sn = "err" + _uid()
-        try:
-            tid, t_schema, _, _ = self._make_table_and_view(client, sn)
-            empty = gnitz.ZSetBatch(t_schema)
-            assert client.push(tid, empty) == 0
-        finally:
-            self._teardown(client, sn)
-
-    def test_push_to_absent_tid_still_not_found(self, client):
-        """The consolidated gate preserves the existence-check semantics: a
-        genuinely absent tid reports 'not found', not 'not writable'."""
-        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)]
-        batch = gnitz.ZSetBatch(gnitz.Schema(cols))
-        batch.append(pk=1)
-        with pytest.raises(gnitz.GnitzError, match="not found"):
-            client.push(99999999, batch)
-
-    def test_absent_relation_raises_the_not_found_class(self, client):
-        """A relation the client itself could not resolve raises a catchable
-        class, so a caller branches on absence without matching prose."""
-        sn = "s" + _uid()
-        client.create_schema(sn)
-        try:
-            with pytest.raises(gnitz.GnitzNotFoundError) as ei:
-                client.drop_table(sn, "nope")
-            assert f"{sn}.nope" in str(ei.value)
-            # Still a GnitzError, so an existing broad handler keeps working.
-            assert isinstance(ei.value, gnitz.GnitzError)
-        finally:
-            client.drop_schema(sn)
+    # The same empty batch against the base table is the ordinary no-op ACK.
+    assert client.push(tid, gnitz.ZSetBatch(t_schema)) == 0
 
 
-# ---------------------------------------------------------------------------
-# Schema construction limits
-# ---------------------------------------------------------------------------
+def test_an_absent_relation_is_a_miss_not_a_writability_failure(client, schema_name):
+    """A genuinely absent tid reports 'not found' rather than 'not writable',
+    and a name the client itself cannot resolve raises a catchable class, so a
+    caller branches on absence without matching prose."""
+    batch = gnitz.ZSetBatch(gnitz.Schema([_PK]))
+    batch.append(pk=1)
+    with pytest.raises(gnitz.GnitzError, match="not found"):
+        client.push(99999999, batch)
+    with pytest.raises(gnitz.GnitzError):
+        client.scan(99999999)
+
+    with pytest.raises(gnitz.GnitzNotFoundError) as ei:
+        client.drop_table(schema_name, "nope")
+    assert f"{schema_name}.nope" in str(ei.value)
+    # Still a GnitzError, so an existing broad handler keeps working.
+    assert isinstance(ei.value, gnitz.GnitzError)
+
+    with pytest.raises(gnitz.GnitzError):
+        client.drop_schema("nonexistent_schema_xyz")
+
 
 class TestSchemaColumnLimit:
-    """Schema must reject invalid column counts — guards the u64 null bitmask."""
+    """`Schema` must reject invalid column counts — this guards the u64 null
+    bitmask, which a 66th column would shift out of."""
 
     def test_zero_columns_raises(self):
         with pytest.raises(ValueError):
@@ -313,103 +179,47 @@ class TestSchemaColumnLimit:
 
     def test_exactly_65_columns_ok(self):
         """1 PK + 64 payload = 65 total fills the u64 null bitmask exactly."""
-        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)]
-        cols += [gnitz.ColumnDef(f"c{i}", gnitz.TypeCode.I64, is_nullable=True)
-                 for i in range(64)]
-        s = gnitz.Schema(cols)
-        assert len(s.columns) == 65
+        cols = [_PK] + [gnitz.ColumnDef(f"c{i}", gnitz.TypeCode.I64, is_nullable=True)
+                        for i in range(64)]
+        assert len(gnitz.Schema(cols).columns) == 65
 
     def test_66_columns_raises(self):
-        """1 PK + 65 payload shifts by 64 bits — must be rejected."""
-        cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True)]
-        cols += [gnitz.ColumnDef(f"c{i}", gnitz.TypeCode.I64, is_nullable=True)
-                 for i in range(65)]
+        cols = [_PK] + [gnitz.ColumnDef(f"c{i}", gnitz.TypeCode.I64, is_nullable=True)
+                        for i in range(65)]
         with pytest.raises(ValueError, match="MAX_COLUMNS"):
             gnitz.Schema(cols)
 
-    def test_100_columns_raises(self):
-        cols = [gnitz.ColumnDef(f"c{i}", gnitz.TypeCode.I64) for i in range(100)]
-        with pytest.raises(ValueError):
-            gnitz.Schema(cols)
 
-
-class TestCreateTableColumnNames:
-    def test_duplicate_column_name_rejected(self, client):
-        """The SQL layer rejects a duplicate at parse time, but `create_table` is
-        reachable without it."""
-        sn = "err" + _uid()
-        try:
-            client.create_schema(sn)
-            cols = [
-                gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
-                gnitz.ColumnDef("a", gnitz.TypeCode.I64),
-                gnitz.ColumnDef("A", gnitz.TypeCode.I64),
-            ]
-            with pytest.raises(gnitz.GnitzError, match="duplicate column name"):
-                client.create_table(sn, "t", cols)
-        finally:
-            _cleanup(client, sn)
+def test_duplicate_column_name_rejected(client, schema_name):
+    """The SQL layer rejects a duplicate at parse time, but `create_table` is
+    reachable without it — and the match is case-insensitive."""
+    cols = [_PK,
+            gnitz.ColumnDef("a", gnitz.TypeCode.I64),
+            gnitz.ColumnDef("A", gnitz.TypeCode.I64)]
+    with pytest.raises(gnitz.GnitzError, match="duplicate column name"):
+        client.create_table(schema_name, "t", cols)
 
 
 # ---------------------------------------------------------------------------
-# Name reservation — user identifiers cannot start with `_` (reserved for the
-# system prefix and for the engine's own internal relation names). The SQL
-# planner enforces this for CREATE/DROP TABLE and VIEW; the client enforces it
-# for create_schema (no SQL surface). This is the single production gate.
+# Name reservation — a user identifier cannot start with `_` (reserved for the
+# system prefix and the engine's own internal relation names). One rule,
+# `validate_user_name`, reached from each surface that mints or names a
+# relation; `create_schema` is the one with no SQL surface at all.
 # ---------------------------------------------------------------------------
 
-class TestNameReservation:
-    def test_create_table_leading_underscore_rejected(self, client):
-        sn = "err" + _uid()
-        try:
-            client.create_schema(sn)
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql(
-                    "CREATE TABLE _secret (pk BIGINT NOT NULL PRIMARY KEY)",
-                    schema_name=sn,
-                )
-        finally:
-            _cleanup(client, sn)
-
-    def test_create_view_leading_underscore_rejected(self, client):
-        sn = "err" + _uid()
-        try:
-            client.create_schema(sn)
-            client.execute_sql(
-                "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-                schema_name=sn,
-            )
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql("CREATE VIEW _v AS SELECT * FROM t", schema_name=sn)
-        finally:
-            _cleanup(client, sn, tables=["t"])
-
-    def test_drop_table_leading_underscore_rejected(self, client):
-        sn = "err" + _uid()
-        try:
-            client.create_schema(sn)
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql("DROP TABLE _nope", schema_name=sn)
-        finally:
-            _cleanup(client, sn)
-
-    def test_drop_view_leading_underscore_rejected(self, client):
-        sn = "err" + _uid()
-        try:
-            client.create_schema(sn)
-            with pytest.raises(gnitz.GnitzError):
-                client.execute_sql("DROP VIEW _nope", schema_name=sn)
-        finally:
-            _cleanup(client, sn)
-
-    def test_create_schema_leading_underscore_rejected(self, client):
-        with pytest.raises(gnitz.GnitzError):
-            client.create_schema("_reserved")
+@pytest.mark.parametrize("stmt", [
+    "CREATE TABLE _secret (pk BIGINT NOT NULL PRIMARY KEY)",
+    "CREATE VIEW _v AS SELECT * FROM t",
+    "DROP TABLE _nope",
+])
+def test_sql_rejects_a_leading_underscore(client, schema_name, t, stmt):
+    with pytest.raises(gnitz.GnitzError):
+        client.execute_sql(stmt, schema_name=schema_name)
 
 
-# ---------------------------------------------------------------------------
-# Duplicate-key rejection under concurrent binary upserts
-# ---------------------------------------------------------------------------
+def test_create_schema_rejects_a_leading_underscore(client):
+    with pytest.raises(gnitz.GnitzError):
+        client.create_schema("_reserved")
 
 
 def test_insert_duplicate_key_raises_while_upserts_are_in_flight(server):
@@ -419,13 +229,10 @@ def test_insert_duplicate_key_raises_while_upserts_are_in_flight(server):
     upserts to the same table hold the shared one, and its verdict must survive
     that concurrency: a duplicate `INSERT` still raises, and never degrades
     into a silent upsert."""
-    sn = "err" + _uid()
+    sn = "err_upsert_race"
     with gnitz.connect(server) as setup:
         setup.create_schema(sn)
-        setup.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
-            schema_name=sn,
-        )
+        setup.execute_sql(_DDL, schema_name=sn)
         tid, schema = setup.resolve_table(sn, "t")
         setup.execute_sql("INSERT INTO t VALUES (1, 10)", schema_name=sn)
 
@@ -461,20 +268,6 @@ def test_insert_duplicate_key_raises_while_upserts_are_in_flight(server):
     assert not failures, f"concurrent upserts failed: {failures}"
 
     with gnitz.connect(server) as c:
-        rows = {row.pk: row.val for row in c.scan(tid)}
         # The rejected INSERTs left the original row untouched.
-        assert rows[1] == 10
-        _cleanup(c, sn, tables=["t"])
-
-
-def test_drop_schema_not_found(client):
-    with pytest.raises(gnitz.GnitzError):
-        client.drop_schema("nonexistent_schema_xyz")
-
-
-def test_drop_table_not_found(client):
-    sn = "s" + _uid()
-    client.create_schema(sn)
-    with pytest.raises(gnitz.GnitzError):
-        client.drop_table(sn, "nonexistent_table_xyz")
-    client.drop_schema(sn)
+        assert {row.pk: row.val for row in c.scan(tid)}[1] == 10
+        c.drop_schema(sn)

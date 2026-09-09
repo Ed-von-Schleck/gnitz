@@ -13,28 +13,10 @@ import math
 
 import pytest
 import gnitz
-from _uid import uid as _uid
 
 U64_HIGH = 2**63 + 5  # crosses the signed boundary: negative read as an i64
 
 
-
-
-def _cleanup(client, sn):
-    # drop_schema cascades: it drains every view, then every table, then the
-    # schema row. Naming the members again only adds failing round-trips.
-    try:
-        client.drop_schema(sn)
-    except Exception:
-        pass
-
-
-@pytest.fixture
-def schema_name(client):
-    sn = "n" + _uid()
-    client.create_schema(sn)
-    yield sn
-    _cleanup(client, sn)
 
 
 def _dicts(client, vid):

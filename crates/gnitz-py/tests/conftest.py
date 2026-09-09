@@ -9,6 +9,7 @@ import warnings
 import pytest
 import gnitz
 from _paths import REPO_ROOT
+from _uid import uid
 from _serverproc import (
     NUM_WORKERS,
     ServerProc,
@@ -322,6 +323,26 @@ def client(_srv):
     """Per-test connection.  Always resolves through _srv so it follows restarts."""
     with gnitz.connect(_srv.target) as conn:
         yield conn
+
+
+@pytest.fixture
+def schema_name(client):
+    """A fresh schema for one test, dropped whole at teardown.
+
+    `drop_schema` is `DROP SCHEMA ... CASCADE`: one atomic DDL bundle that
+    retracts every view, then every table (each cascading its own indexes),
+    then the schema row. So a test never names its own objects to tear them
+    down, and dropping them by hand only adds round trips that must be
+    redundant or fail.
+
+    The drop is not wrapped: a schema that refuses to drop is a finding, and
+    swallowing it leaks the objects into the shared session catalog for every
+    later test.
+    """
+    sn = "s" + uid()
+    client.create_schema(sn)
+    yield sn
+    client.drop_schema(sn)
 
 
 # ── mirror fixtures ───────────────────────────────────────────────────────────

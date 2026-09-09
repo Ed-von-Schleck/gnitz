@@ -10,7 +10,6 @@ cap, now reachable from DML).
 import pytest
 import gnitz
 from _caps import first_rejected
-from _uid import uid as _uid
 
 U64_HIGH = 2**63 + 5  # crosses the signed boundary: negative as an i64
 
@@ -20,22 +19,6 @@ U64_HIGH = 2**63 + 5  # crosses the signed boundary: negative as an i64
 def _scan_map(client, tid):
     """{pk: row} over the positive-weight rows."""
     return {row.pk: row for row in client.scan(tid)}
-
-
-def _cleanup(client, sn, table="t"):
-    try:
-        client.execute_sql(f"DROP TABLE {table}", schema_name=sn)
-    except Exception:
-        pass
-    client.drop_schema(sn)
-
-
-@pytest.fixture
-def schema_name(client):
-    sn = "e" + _uid()
-    client.create_schema(sn)
-    yield sn
-    _cleanup(client, sn)
 
 
 def _table(client, sn, ddl, rows=()):

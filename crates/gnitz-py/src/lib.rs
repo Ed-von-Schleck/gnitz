@@ -176,6 +176,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // `circuit_opcodes()`.
     // Only the ids something addresses a relation by are exported.
     m.add("TABLE_TAB", gnitz_wire::TABLE_TAB)?;
+    m.add("COL_TAB", gnitz_wire::COL_TAB)?;
     m.add("IDX_TAB", gnitz_wire::IDX_TAB)?;
     m.add("FIRST_USER_TABLE_ID", gnitz_wire::FIRST_USER_TABLE_ID)?;
     m.add_class::<PyDeltaReply>()?;
