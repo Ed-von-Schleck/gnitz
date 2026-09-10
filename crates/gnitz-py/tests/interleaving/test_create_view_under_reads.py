@@ -12,7 +12,7 @@ import threading
 import gnitz
 import pytest
 from _oracle import assert_view_matches
-from _serverproc import HANG_TIMEOUT, NEEDS_MULTI
+from _serverproc import HANG_TIMEOUT, NEEDS_MULTI, join_or_fail
 
 pytestmark = NEEDS_MULTI
 
@@ -85,9 +85,7 @@ def test_create_view_under_concurrent_adhoc_reads(client, server, schema_name):
     client.execute_sql(
         f"CREATE VIEW mid AS {_GROUPS}", schema_name=schema_name)
 
-    for t in threads:
-        t.join(timeout=HANG_TIMEOUT)
-        assert not t.is_alive(), "deadlock: a concurrent worker never completed"
+    join_or_fail("deadlock: a concurrent worker never completed", *threads)
     assert not errors, f"concurrent work failed: {errors}"
 
     view = _zset(client.execute_sql("SELECT * FROM mid", schema_name=schema_name))
@@ -147,8 +145,7 @@ def test_a_view_created_over_a_table_being_written_holds_every_row(
         assert writing.wait(timeout=HANG_TIMEOUT), "the write thread never issued a write"
         client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=schema_name)
     finally:
-        t.join(timeout=HANG_TIMEOUT)
-    assert not t.is_alive(), "the inserter hung — possible wedge"
+        join_or_fail("the inserter hung — possible wedge", t)
     assert not errors, f"concurrent inserter failed: {errors}"
 
     assert_view_matches(client, client.resolve_table(schema_name, "v")[0],

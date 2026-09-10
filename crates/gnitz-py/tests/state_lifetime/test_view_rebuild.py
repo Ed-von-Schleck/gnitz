@@ -3,8 +3,8 @@
 One claim, one sweep. Every body shape below is built on one server, snapshotted
 as a weight-multiset, crash-restarted and compared — so a rebuild that doubles a
 shared base, triples a diamond, under-fills a two-base join or truncates a
-chunked backfill names itself, and nineteen shapes cost one restart rather than
-nineteen.
+chunked backfill names itself, and every shape costs one restart rather than one
+each.
 
 The comparison is `oracle.scan_multiset`: weights summed per projected tuple,
 ghosts dropped, floats canonicalized to bits. Row presence is not the observable
@@ -321,15 +321,17 @@ def _snapshot(conn):
 
 
 # How the pre-crash state is cut. `tail` leaves every row in the SAL; `flushed`
-# runs checkpoints throughout the build so most rows are already on shards when
-# the crash lands; `chunked` shrinks the backfill chunk so a handful of rows per
-# worker still spans many chunked rounds with unequal partitions, exercising the
-# lockstep padding and the pad-bit termination.
+# checkpoints throughout the build, so most rows are on shards when the crash
+# lands (~32 of them over the build's ~1.6 MB); `chunked` shrinks the backfill
+# chunk so a handful of rows per worker still spans many rounds with unequal
+# partitions. `GNITZ_LOG_LEVEL=normal` is what puts the "SAL checkpoint epoch="
+# line in the log — the server defaults to quiet — which is how `flushed` proves
+# it is not `tail` under another name.
 _MULTI = max(2, NUM_WORKERS)
 _CUTS = {
-    "tail": ({}, None),
-    "flushed": ({"GNITZ_CHECKPOINT_BYTES": "16384", "GNITZ_LOG_LEVEL": "normal"}, None),
-    "chunked": ({"GNITZ_SCAN_CHUNK_ROWS": "3"}, _MULTI),
+    "tail": {},
+    "flushed": {"GNITZ_CHECKPOINT_BYTES": "65536", "GNITZ_LOG_LEVEL": "normal"},
+    "chunked": {"GNITZ_SCAN_CHUNK_ROWS": "3"},
 }
 
 
@@ -337,10 +339,12 @@ _CUTS = {
 def test_every_view_shape_comes_back_with_the_same_zset(cut, own_server):
     """Build every shape, snapshot it, SIGKILL, and compare. One list of
     divergences, asserted once, so a single broken shape names itself instead of
-    hiding the other eighteen."""
-    env, workers = _CUTS[cut]
-    own_server.extra_env.update(env)
-    own_server.start(workers=workers)
+    hiding the others.
+
+    Every cut runs multi-worker: the regressions above are all unreachable at one
+    worker, so a cut at the ambient count passes vacuously under `WORKERS=1`."""
+    own_server.extra_env.update(_CUTS[cut])
+    own_server.start(workers=_MULTI)
     armed = own_server.sal_checkpoints()
 
     with gnitz.connect(own_server.sock_path) as conn:
@@ -384,14 +388,11 @@ def test_a_recovered_view_still_ticks_from_every_source(own_server):
         conn.execute_sql(
             "CREATE VIEW ab AS SELECT val FROM a UNION ALL SELECT val FROM b",
             schema_name="tick")
-        conn.execute_sql(
-            "CREATE TABLE cbt (a BIGINT UNSIGNED NOT NULL, b BIGINT UNSIGNED NOT NULL, "
-            "v BIGINT NOT NULL, PRIMARY KEY (a, b)) CLUSTER BY a", schema_name="tick")
-        conn.execute_sql("CREATE VIEW cbv AS SELECT a, b, v FROM cbt WHERE v > 0",
-                         schema_name="tick")
+        cb = _SHAPES["cluster_by_prefix"]
+        for stmt in cb["ddl"] + cb["rows"]:
+            conn.execute_sql(stmt, schema_name="tick")
         conn.execute_sql("INSERT INTO a VALUES (1, 10)", schema_name="tick")
         conn.execute_sql("INSERT INTO b VALUES (2, 10)", schema_name="tick")
-        conn.execute_sql(f"INSERT INTO cbt VALUES {_values(_CB)}", schema_name="tick")
 
     own_server.restart()
     with gnitz.connect(own_server.sock_path) as conn:

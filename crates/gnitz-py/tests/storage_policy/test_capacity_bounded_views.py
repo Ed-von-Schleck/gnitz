@@ -379,7 +379,7 @@ def test_a_bounded_view_survives_a_restart(sweeping_client, sweeping_server):
 
         _churn(c2, sn, 1201, 3000, chunk=100)
         assert bag(c2.scan(bid2)) == bag(c2.scan(pid2))
-    assert sweeping_server.stop_graceful() == 0
+    sweeping_server.stop_graceful()
     assert _view_dir_bytes(sweeping_server.data_dir, bid2) < _view_dir_bytes(sweeping_server.data_dir, pid2)
 
 

@@ -16,7 +16,7 @@ claim is forged by a retraction the pusher never held.
 
 import pytest
 import gnitz
-from _serverproc import NEEDS_MULTI
+from _serverproc import NEEDS_MULTI, join_or_fail
 
 _T = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
 _T_NULLABLE = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT)"
@@ -264,8 +264,7 @@ def test_concurrent_inserts_during_create(client, server, schema_name):
             client.execute_sql("CREATE UNIQUE INDEX ON t(val)", schema_name=schema_name)
         finally:
             stop.set()
-            th.join(timeout=60)
-        assert not th.is_alive(), "insert stream did not stop"
+            join_or_fail("insert stream did not stop", th)
         assert not errors, f"streaming inserts errored: {errors}"
         assert _has_index(client, schema_name)
 

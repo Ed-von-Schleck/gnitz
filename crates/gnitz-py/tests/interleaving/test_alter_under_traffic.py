@@ -15,7 +15,7 @@ import threading
 
 import gnitz
 from _read import bag, rows
-from _serverproc import HANG_TIMEOUT, START_TIMEOUT
+from _serverproc import START_TIMEOUT, join_or_fail
 from _uid import uid as _uid
 
 
@@ -79,9 +79,7 @@ def test_add_column_concurrent_with_inserts_and_scans(client, schema_name, serve
         client.execute_sql("ALTER TABLE t ADD COLUMN c BIGINT", schema_name=schema_name)
     finally:
         stop.set()
-        for th in threads:
-            th.join(timeout=HANG_TIMEOUT)
-    assert not any(th.is_alive() for th in threads), "a worker thread hung"
+        join_or_fail("a worker thread hung", *threads)
 
     # The race actually happened, and only the two legitimate column sets were
     # ever observed. An empty `scan_widths` or `acked` would make the assertions
@@ -138,8 +136,7 @@ def test_a_warm_push_racing_an_alter_is_refused(push_hold_target):
             assert pushed.wait(START_TIMEOUT), "the pusher thread never reached its push"
             client.execute_sql("ALTER TABLE t ADD COLUMN c BIGINT", schema_name=sn)
         finally:
-            th.join(timeout=HANG_TIMEOUT)
-        assert not th.is_alive(), "the held push never returned"
+            join_or_fail("the held push never returned", th)
 
         assert "err" in outcome, f"the racing push committed at LSN {outcome.get('lsn')}"
         # Nothing was written: the pre-ALTER-shaped batch never reached a store.

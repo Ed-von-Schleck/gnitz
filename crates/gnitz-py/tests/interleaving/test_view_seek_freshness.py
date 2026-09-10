@@ -22,7 +22,7 @@ push→seek with no interposed scan, so a lost auto-tick surfaces as a missed ro
 import threading
 
 import gnitz
-from _serverproc import HANG_TIMEOUT
+from _serverproc import HANG_TIMEOUT, join_or_fail
 
 
 def _make_t_and_v(client, sn):
@@ -191,8 +191,7 @@ def test_view_seek_read_your_writes_under_tick_storm(client, server, schema_name
     except threading.BrokenBarrierError:
         pass  # the storm failed; `errors` below is the real report
     finally:
-        storm_t.join(timeout=HANG_TIMEOUT)
-    assert not storm_t.is_alive(), "storm thread hung"
+        join_or_fail("storm thread hung", storm_t)
     assert not errors, f"storm client errored: {errors}"
 
     # Weight conservation: every main-thread key is live exactly once, and the
@@ -253,6 +252,5 @@ def test_view_seek_no_deadlock_under_concurrent_ddl(client, server, schema_name)
                 _assert_live_once(m.seek(vid, pk=k), k, "under concurrent DDL")
     finally:
         stop.set()
-        churn.join(timeout=HANG_TIMEOUT)
-    assert not churn.is_alive(), "DDL churn thread hung"
+        join_or_fail("DDL churn thread hung", churn)
     assert not errors, f"DDL churn client errored: {errors}"

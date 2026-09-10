@@ -19,8 +19,7 @@ import pytest
 import gnitz
 from _read import bag, scanned
 from _oracle import assert_view_matches
-from _serverproc import HANG_TIMEOUT, START_TIMEOUT
-from _uid import uid
+from _serverproc import START_TIMEOUT, join_or_fail
 
 
 @pytest.fixture
@@ -32,7 +31,7 @@ def checkpoint_client(checkpoint_server):
 def _setup(client, table="t"):
     """A fresh schema holding `(pk, val)`, with the client-side schema for
     pushing to it. Returns `(sn, tid, schema)`."""
-    sn = "ck" + uid()
+    sn = "ck"
     client.create_schema(sn)
     cols = [gnitz.ColumnDef("pk", gnitz.TypeCode.U64, primary_key=True),
             gnitz.ColumnDef("val", gnitz.TypeCode.I64)]
@@ -56,14 +55,13 @@ def _push_loop(client, tid, schema, errors, started, n_batches=12, batch_size=40
         started.set()
 
 
-def _run(*threads):
-    """Start every thread, join it against the hang ceiling, and fail naming the
-    one that did not finish."""
+def _run(errors, *threads):
+    """Start every thread, join it against the hang ceiling, fail naming the one
+    that did not finish, then re-raise whatever any of them recorded."""
     for t in threads:
         t.start()
-    for t in threads:
-        t.join(timeout=HANG_TIMEOUT)
-        assert not t.is_alive(), f"{t.name} hung during a concurrent checkpoint"
+    join_or_fail("a thread hung during a concurrent checkpoint", *threads)
+    assert not errors, f"a worker thread raised: {errors}"
 
 
 def test_a_view_tracks_its_base_across_frequent_checkpoints(checkpoint_client):
@@ -114,12 +112,11 @@ def test_a_view_tracks_its_base_under_sustained_ingest_with_scans(checkpoint_ser
             except Exception as exc:
                 errors.append(("scan", exc))
 
-        _run(threading.Thread(name="push", daemon=True, target=_push_loop,
+        _run(errors,
+             threading.Thread(name="push", daemon=True, target=_push_loop,
                               args=(pusher, tid, schema, errors, started),
                               kwargs={"n_batches": n_batches, "batch_size": batch_size}),
              threading.Thread(name="scan", daemon=True, target=scan_loop))
-        for src, exc in errors:
-            raise AssertionError(f"{src} thread raised: {exc}")
 
         want = {(i, i): 1 for i in range(n_batches * batch_size)}
         assert bag(scanned(pusher, sn, "t"), "pk", "val") == want
@@ -150,17 +147,18 @@ def test_a_fanout_read_does_not_hang_during_a_checkpoint(probe, checkpoint_serve
             try:
                 for _ in range(40):
                     if probe == "seek":
-                        reader.seek(target, pk=42)
+                        assert bag(reader.seek(target, pk=42), "pk", "val") == \
+                            {(42, 999): 1}
                     else:
-                        reader.scan(target)
+                        assert bag(reader.scan(target), "pk", "val") == \
+                            {(1, 10): 1, (42, 999): 1}
             except Exception as exc:
                 errors.append((probe, exc))
 
-        _run(threading.Thread(name="push", daemon=True, target=_push_loop,
+        _run(errors,
+             threading.Thread(name="push", daemon=True, target=_push_loop,
                               args=(pusher, filler, schema, errors, started)),
              threading.Thread(name=probe, daemon=True, target=read_loop))
-        for src, exc in errors:
-            raise AssertionError(f"{src} thread raised: {exc}")
 
 
 def test_a_unique_constraint_holds_under_checkpoint_pressure(checkpoint_server):
@@ -189,11 +187,10 @@ def test_a_unique_constraint_holds_under_checkpoint_pressure(checkpoint_server):
             except Exception as exc:
                 errors.append(("insert", exc))
 
-        _run(threading.Thread(name="push", daemon=True, target=_push_loop,
+        _run(errors,
+             threading.Thread(name="push", daemon=True, target=_push_loop,
                               args=(pusher, filler, schema, errors, started)),
              threading.Thread(name="insert", daemon=True, target=insert_loop))
-        for src, exc in errors:
-            raise AssertionError(f"{src} thread raised: {exc}")
 
         assert bag(scanned(inserter, sn, "unique_t"), "pk", "val") == {
             (i, i * 10): 1 for i in range(n_rows)}
@@ -202,27 +199,27 @@ def test_a_unique_constraint_holds_under_checkpoint_pressure(checkpoint_server):
                                  schema_name=sn)
 
 
-def test_a_view_created_over_committed_data_survives_a_checkpoint_window(own_server):
-    """Enough rows to cross a low checkpoint threshold — draining pending_deltas
-    — and then a CREATE of an exchange GROUP BY view whose only driver is the
+def test_a_view_created_over_committed_data_survives_a_checkpoint_window(checkpoint_client):
+    """Enough rows to cross the checkpoint threshold — draining pending_deltas —
+    and then a CREATE of an exchange GROUP BY view whose only driver is the
     committed store. A flushed-snapshot under-count and a
-    checkpoint-strands-exchange regression both surface as a wrong result."""
-    own_server.start(extra_env={"GNITZ_CHECKPOINT_BYTES": "65536"})
-    with gnitz.connect(own_server.sock_path) as conn:
-        conn.create_schema("ck")
+    checkpoint-strands-exchange regression both surface as a wrong result.
+    `checkpoint_server` also forces W >= 2; at one worker there is no exchange."""
+    conn = checkpoint_client
+    conn.create_schema("ckv")
+    conn.execute_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
+        "n BIGINT NOT NULL)", schema_name="ckv")
+    n, chunk = 2000, 1000
+    for base in range(0, n, chunk):
         conn.execute_sql(
-            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, g BIGINT NOT NULL, "
-            "n BIGINT NOT NULL)", schema_name="ck")
-        n, chunk = 2000, 1000
-        for base in range(0, n, chunk):
-            conn.execute_sql(
-                "INSERT INTO t VALUES " + ", ".join(
-                    f"({i}, {i % 10}, {i})" for i in range(base, base + chunk)),
-                schema_name="ck")
-        conn.execute_sql("CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM t GROUP BY g",
-                         schema_name="ck")
-        vid, _ = conn.resolve_table("ck", "v")
-        assert_view_matches(conn, vid, ["g", "c"], {(g, n // 10): 1 for g in range(10)})
+            "INSERT INTO t VALUES " + ", ".join(
+                f"({i}, {i % 10}, {i})" for i in range(base, base + chunk)),
+            schema_name="ckv")
+    conn.execute_sql("CREATE VIEW v AS SELECT g, COUNT(*) AS c FROM t GROUP BY g",
+                     schema_name="ckv")
+    vid, _ = conn.resolve_table("ckv", "v")
+    assert_view_matches(conn, vid, ["g", "c"], {(g, n // 10): 1 for g in range(10)})
 
 
 def test_a_low_space_relay_reclaims_without_aborting_the_master(relay_lowspace_server):
@@ -237,9 +234,9 @@ def test_a_low_space_relay_reclaims_without_aborting_the_master(relay_lowspace_s
     client stay well under TICK_COALESCE_ROWS, so the tick fires from the idle
     timer with no push in flight: the reclaim barrier reaches the committer as a
     barrier-only batch, which is exactly the path that used to abort."""
-    sock_path, proc = relay_lowspace_server
-    with gnitz.connect(sock_path) as client:
-        sn = "rls_" + uid()
+    target, proc = relay_lowspace_server
+    with gnitz.connect(target) as client:
+        sn = "rls"
         client.create_schema(sn)
         client.execute_sql(
             "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, grp BIGINT NOT NULL, "

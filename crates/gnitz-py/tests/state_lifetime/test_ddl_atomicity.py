@@ -7,13 +7,13 @@ the tag picks the DDL scope so a push's zone is not the one that aborts. Recover
 treats such a zone as uncommitted, so the writes that already reached the SAL are
 never replayed and no table_id survives without its TABLE_TAB row.
 
-The reclamation tests are the mirror image: a DROP's on-disk directory is queued
-for deletion in memory only, so a crash between the commit and the next
-checkpoint leaks it permanently unless the boot sweep reclaims it. They SIGKILL
-before any checkpoint, so the DROPs live only in the SAL.
+The reclamation test is the mirror image: what a committed DROP leaves on disk
+must be reclaimed at boot, and nothing else may be. It SIGKILLs before any
+checkpoint too, so its DROPs live only in the SAL.
 """
 
 import os
+import signal
 
 import pytest
 import gnitz
@@ -33,7 +33,10 @@ def _abort_on(srv, sql, schema):
     except Exception:
         pass
     rc = srv.wait_for_exit()
-    assert rc != 0, f"the server must abort on `{sql}`, got rc={rc}"
+    # The seam is a bare `libc::abort()`, so the master dies on SIGABRT. `rc != 0`
+    # would also accept a boot failure (1), a worker crash (2) or a fatal abort
+    # (134) — i.e. a crash that is not the one being armed.
+    assert rc == -signal.SIGABRT, f"the server must abort on `{sql}`, got rc={rc}"
 
 
 _ABORTED = {
@@ -70,7 +73,7 @@ def test_an_aborted_ddl_leaves_no_durable_trace(own_server):
     own_server.start()
     with gnitz.connect(own_server.sock_path) as conn:
         for name in _ABORTED:
-            with pytest.raises(Exception):
+            with pytest.raises(gnitz.GnitzNotFoundError):
                 conn.resolve_table("crash", name)
 
         # Re-creating with the same names must succeed cleanly: replayed orphan
@@ -82,7 +85,7 @@ def test_an_aborted_ddl_leaves_no_durable_trace(own_server):
 
         conn.execute_sql(_ABORTED["u"], schema_name="crash")
         conn.execute_sql("INSERT INTO u VALUES (1, 10)", schema_name="crash")
-        with pytest.raises(Exception):
+        with pytest.raises(gnitz.GnitzError):
             conn.execute_sql("INSERT INTO u VALUES (2, 10)", schema_name="crash")
 
         assert bag(scanned(conn, "crash", "parent"), "id") == {
@@ -91,90 +94,75 @@ def test_an_aborted_ddl_leaves_no_durable_trace(own_server):
         conn.execute_sql("DROP TABLE parent", schema_name="crash")
 
 
-def test_a_dropped_table_is_reclaimed_while_an_unflushed_create_survives(own_server):
-    """The boot sweep must run *after* SAL replay. A sweep that ran before would
-    see table B absent from the DAG — its CREATE is committed to the SAL but not
-    yet flushed — and delete its live directory; replay would then re-register B
-    pointing at a missing dir."""
+_TABLE_DDL = "(pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)"
+
+
+def test_the_boot_sweep_reclaims_exactly_the_dropped_directories(own_server):
+    """A DROP's directory is queued for deletion in memory only, so a crash
+    before the next checkpoint leaks it unless the boot sweep reclaims it — and
+    the sweep must reclaim the dropped ones and nothing else. Three ways to
+    over-reach, one crash, one sweep: they are the same drain, so resolving all
+    three in one pass says more than three separate sweeps would."""
     own_server.start()
     with gnitz.connect(own_server.sock_path) as conn:
-        conn.create_schema("gc")
-        conn.execute_sql(
-            "CREATE TABLE a (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-            schema_name="gc")
-        a_tid, _ = conn.resolve_table("gc", "a")
-        # Drop A — its directory moves to the in-memory checkpoint-gated queue,
-        # still on disk — then create B. Both DDLs live only in the SAL.
-        conn.drop_table("gc", "a")
-        conn.execute_sql(
-            "CREATE TABLE b (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-            schema_name="gc")
-        b_tid, _ = conn.resolve_table("gc", "b")
+        for sn in ("after_replay", "dropped", "recreated"):
+            conn.create_schema(sn)
 
-    # Id-only directories (§4): `t_{tid}`, regardless of the table name.
-    a_dir = os.path.join(own_server.data_dir, "gc", f"t_{a_tid}")
-    b_dir = os.path.join(own_server.data_dir, "gc", f"t_{b_tid}")
-    assert os.path.isdir(a_dir), "dropped A's dir is gated (still on disk) pre-crash"
+        # Sweeping before SAL replay would see `b` absent from the DAG — its
+        # CREATE is committed but not yet flushed — and delete its live dir.
+        # Dropped `a` meanwhile sits in the checkpoint-gated queue, still on disk.
+        conn.execute_sql(f"CREATE TABLE a {_TABLE_DDL}", schema_name="after_replay")
+        a_tid, _ = conn.resolve_table("after_replay", "a")
+        conn.drop_table("after_replay", "a")
+        conn.execute_sql(f"CREATE TABLE b {_TABLE_DDL}", schema_name="after_replay")
+        b_tid, _ = conn.resolve_table("after_replay", "b")
 
-    own_server.restart()
-    with gnitz.connect(own_server.sock_path) as conn:
-        assert conn.resolve_table("gc", "b")[0] == b_tid
-        assert os.path.isdir(b_dir), "B's SAL-only-created dir must survive recovery"
-        conn.execute_sql("INSERT INTO b VALUES (1, 100)", schema_name="gc")
-        assert bag(scanned(conn, "gc", "b"), "pk", "v") == {(1, 100): 1}
+        # The schema-scoped scan cannot reach this subtree — the schema is gone
+        # from `schema_by_id` — so only the replayed queue's drain reclaims it.
+        conn.execute_sql(f"CREATE TABLE t {_TABLE_DDL}", schema_name="dropped")
+        dropped_tid, _ = conn.resolve_table("dropped", "t")
+        conn.drop_schema("dropped")
 
-        assert not os.path.exists(a_dir), "dropped A's dir must be reclaimed on boot"
-        with pytest.raises(Exception):
-            conn.resolve_table("gc", "a")
-
-
-def test_a_dropped_schema_subtree_is_reclaimed(own_server):
-    """A DROP SCHEMA CASCADE that lives only in the SAL at crash time has its
-    whole subtree reclaimed. The schema-scoped scan cannot reach the subtree — the
-    schema is gone from `schema_by_id` — so reclamation depends on the drain of
-    the queue SAL replay re-populated."""
-    own_server.start()
-    with gnitz.connect(own_server.sock_path) as conn:
-        conn.create_schema("doomed")
-        conn.execute_sql(
-            "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-            schema_name="doomed")
-        t_tid, _ = conn.resolve_table("doomed", "t")
-        conn.drop_schema("doomed")
-
-    schema_dir = os.path.join(own_server.data_dir, "doomed")
-    own_server.restart()
-    with gnitz.connect(own_server.sock_path) as conn:
-        with pytest.raises(Exception):
-            conn.resolve_table("doomed", "t")
-    assert not os.path.exists(os.path.join(schema_dir, f"t_{t_tid}"))
-    assert not os.path.exists(schema_dir), "dropped schema dir must be gone"
-
-
-def test_a_recreated_schema_survives_the_replayed_drop(own_server):
-    """DROP SCHEMA s + CREATE SCHEMA s, both SAL-only at crash time. A schema's
-    on-disk path is name-based, so the replayed DROP and CREATE land in the same
-    boot deletion queue; the CREATE's hook must clear the DROP's residue, or the
-    drain removes `<base>/s` recursively and erases the live schema."""
-    own_server.start()
-    with gnitz.connect(own_server.sock_path) as conn:
-        conn.create_schema("reborn")
-        conn.execute_sql(
-            "CREATE TABLE old (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-            schema_name="reborn")
-        conn.drop_schema("reborn")
-        conn.create_schema("reborn")
-        conn.execute_sql(
-            "CREATE TABLE fresh (pk BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-            schema_name="reborn")
-        fresh_tid, _ = conn.resolve_table("reborn", "fresh")
+        # A schema's path is name-based, so this DROP and CREATE land in the same
+        # deletion queue; the CREATE must clear the DROP's residue, or the drain
+        # removes the live schema recursively.
+        conn.execute_sql(f"CREATE TABLE old {_TABLE_DDL}", schema_name="recreated")
+        conn.drop_schema("recreated")
+        conn.create_schema("recreated")
+        conn.execute_sql(f"CREATE TABLE fresh {_TABLE_DDL}", schema_name="recreated")
+        fresh_tid, _ = conn.resolve_table("recreated", "fresh")
         conn.execute_sql("INSERT INTO fresh VALUES (1, 11), (2, 22)",
-                         schema_name="reborn")
+                         schema_name="recreated")
 
-    schema_dir = os.path.join(own_server.data_dir, "reborn")
-    fresh_dir = os.path.join(schema_dir, f"t_{fresh_tid}")
+    def rel_dir(sn, tid):
+        # Named by id alone, so a name reused across a drop names a fresh dir.
+        return os.path.join(own_server.data_dir, sn, f"t_{tid}")
+
+    assert os.path.isdir(rel_dir("after_replay", a_tid)), \
+        "dropped a's dir is gated (still on disk) pre-crash"
+
     own_server.restart()
     with gnitz.connect(own_server.sock_path) as conn:
-        assert bag(scanned(conn, "reborn", "fresh"), "pk", "v") == {
+        assert conn.resolve_table("after_replay", "b")[0] == b_tid
+        assert os.path.isdir(rel_dir("after_replay", b_tid)), \
+            "b's SAL-only-created dir must survive recovery"
+        conn.execute_sql("INSERT INTO b VALUES (1, 100)", schema_name="after_replay")
+        assert bag(scanned(conn, "after_replay", "b"), "pk", "v") == {(1, 100): 1}
+        assert not os.path.exists(rel_dir("after_replay", a_tid)), \
+            "dropped a's dir must be reclaimed on boot"
+
+        assert bag(scanned(conn, "recreated", "fresh"), "pk", "v") == {
             (1, 11): 1, (2, 22): 1}
-    assert os.path.isdir(fresh_dir), "the recreated table's dir must survive"
+        assert os.path.isdir(rel_dir("recreated", fresh_tid)), \
+            "the recreated schema's table dir must survive its own replayed DROP"
+
+        # A dropped table in a live schema is resolved and missed client-side;
+        # a dropped schema is refused by the server before the name is reached.
+        with pytest.raises(gnitz.GnitzNotFoundError):
+            conn.resolve_table("after_replay", "a")
+        with pytest.raises(gnitz.GnitzError):
+            conn.resolve_table("dropped", "t")
+
+    assert not os.path.exists(rel_dir("dropped", dropped_tid))
+    assert not os.path.exists(os.path.join(own_server.data_dir, "dropped")), \
+        "dropped schema dir must be gone"

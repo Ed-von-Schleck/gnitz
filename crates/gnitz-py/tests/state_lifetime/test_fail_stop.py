@@ -1,4 +1,4 @@
-"""A storage error while applying committed state must fail stop, never be
+"""An error applying or emitting committed state must fail stop, never be
 swallowed.
 
 Committed state reaches a worker twice: once as the live PUSH apply, and once as
@@ -6,7 +6,11 @@ the SAL replay a boot runs before the master rewinds the log. Swallowing an erro
 on either path leaves the worker diverged from the durable SAL while the client
 holds an ACK — and the next reset then destroys the only copy that could still
 repair it. Aborting instead keeps the SAL intact for the following boot, which is
-what every test here reads back.
+what the crash tests here read back.
+
+The last test is the same rule where there is no SAL to protect: a view tick that
+fails to emit must surface as an error on the read that waited for it, rather
+than as a STATUS_OK over a view that silently stopped advancing.
 """
 
 import os
@@ -14,6 +18,7 @@ import os
 import pytest
 import gnitz
 from _read import bag, scanned
+from _uid import uid
 
 _ROWS = "INSERT INTO t VALUES (1, 100), (2, 200), (3, 300)"
 _WANT = {(1, 100): 1, (2, 200): 1, (3, 300): 1}
@@ -89,3 +94,39 @@ def test_a_failed_live_apply_aborts_the_cluster_and_replays(inject, with_index,
     own_server.start()
     with gnitz.connect(own_server.sock_path) as conn:
         assert bag(scanned(conn, "apply_err", "t"), "pk", "val") == _WANT
+
+
+def test_a_failed_tick_reports_and_requeues(tick_emit_fault_server):
+    """The same rule one rung up: a *view tick* that fails to emit must report,
+    not serve.
+
+    `drain_tick_rows_into` empties `tick_tids` BEFORE the tick runs, so a tick
+    that fails to emit used to strand its tids: no later Auto re-queued them, only
+    a fresh push to that exact tid did, and the drain the reader was waiting on
+    signalled success anyway — so the read returned STATUS_OK over a stale view,
+    permanently. The emit failure needs a seam; a real one takes a full SAL.
+
+    The read that waited on the failed tick must error rather than serve the
+    stale view, and the next read — which ticks the re-queued tid before it is
+    served — must be correct."""
+    client = tick_emit_fault_server
+    sn = "tef_" + uid()
+    client.create_schema(sn)
+    client.execute_sql(
+        "CREATE TABLE tickfault (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)",
+        schema_name=sn)
+    client.execute_sql(
+        "CREATE VIEW v AS SELECT pk, val FROM tickfault WHERE val > 5", schema_name=sn)
+    vid, _ = client.resolve_table(sn, "v")
+
+    client.execute_sql("INSERT INTO tickfault VALUES (1, 10), (2, 20), (3, 1)",
+                       schema_name=sn)
+
+    with pytest.raises(gnitz.GnitzError):
+        list(client.scan(vid))
+
+    # The seam is spent and the tid was re-queued, so this read ticks it. A view
+    # read is served only once its source closure is at the last completed tick's
+    # watermark, so one read is the whole claim — polling for convergence would
+    # also pass on a view that converges and then diverges again.
+    assert bag(client.scan(vid), "pk", "val") == {(1, 10): 1, (2, 20): 1}

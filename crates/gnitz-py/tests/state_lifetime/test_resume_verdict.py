@@ -30,8 +30,7 @@ def _checkpoint_cut(srv, schema, workers=None):
         conn.execute_sql(
             "INSERT INTO t VALUES " + ", ".join(f"({k}, {k * 10})" for k in range(1, 6)),
             schema_name=schema)
-    rc = srv.stop_graceful()
-    assert rc == 0, f"graceful shutdown must exit rc 0, got {rc}"
+    srv.stop_graceful()
 
 
 def _tail(srv, schema, keys):
@@ -41,35 +40,31 @@ def _tail(srv, schema, keys):
             schema_name=schema)
 
 
-def _doubled(srv, schema, keys):
+def _assert_doubled(srv, schema, keys, ctx):
+    """The view holds `dbl = val * 2` for exactly `keys`, each at weight 1."""
     with gnitz.connect(srv.sock_path) as conn:
-        return bag(scanned(conn, schema, "v"), "pk", "dbl") == {
-            (k, k * 20): 1 for k in keys}
+        got = bag(scanned(conn, schema, "v"), "pk", "dbl")
+    want = {(k, k * 20): 1 for k in keys}
+    assert got == want, f"{ctx}: view is {got}, want {want}"
 
 
-def test_a_graceful_stop_resumes_every_view_without_a_rebuild(own_server):
-    """SIGTERM to the master drives a final checkpoint and exits cleanly, and the
-    restart resumes every view from it rather than re-deriving it — asserted on
-    the marker, since a rebuild would produce the same rows."""
-    _checkpoint_cut(own_server, "gs")
-    own_server.start()
-    assert own_server.rebuilt_view_count() == 0, "a clean restart must not backfill"
-    _tail(own_server, "gs", [6])
-    assert _doubled(own_server, "gs", range(1, 7)), "the resumed view must keep ticking"
-
-
-def test_a_checkpoint_cut_resumes_and_replays_only_the_tail(own_server):
-    """Graceful checkpoint, then more pushes, then SIGKILL. The checkpoint is
-    generation-valid, so the restart resumes every view from it and replays only
-    the un-checkpointed tail — the view must hold cut + tail, each row once."""
+def test_a_checkpoint_cut_resumes_live_and_replays_only_the_tail(own_server):
+    """SIGTERM drives a final checkpoint and exits 0; the restart must resume
+    every view from it rather than re-derive it — asserted on the marker, since a
+    rebuild produces the same rows. The resumed view then has to keep ticking
+    live, and survive a SIGKILL that leaves the tail un-checkpointed: the second
+    boot resumes the same cut and replays only that tail, so the view holds cut +
+    tail with each row once rather than twice."""
     _checkpoint_cut(own_server, "ct")
     own_server.start()
-    assert own_server.rebuilt_view_count() == 0
+    assert own_server.rebuilt_view_count() == 0, "a clean restart must not backfill"
     _tail(own_server, "ct", range(6, 11))
+    _assert_doubled(own_server, "ct", range(1, 11), "the resumed view must keep ticking")
+
     own_server.restart()
     assert own_server.rebuilt_view_count() == 0, \
         "a valid checkpoint must be resumed and the tail replayed onto it"
-    assert _doubled(own_server, "ct", range(1, 11))
+    _assert_doubled(own_server, "ct", range(1, 11), "cut + tail, each row once")
 
 
 @pytest.mark.parametrize("stage", ["genbump", "reset", "sweep", "backfill"])
@@ -92,8 +87,8 @@ def test_a_crash_in_the_recovery_window_forces_a_correct_rebuild(stage, own_serv
     own_server.start()
     assert own_server.rebuilt_view_count() >= 1, \
         "the stale view must be rebuilt, not resumed"
-    assert _doubled(own_server, "ri", range(1, 11)), \
-        "a stale resume would show only the cut"
+    _assert_doubled(own_server, "ri", range(1, 11),
+                    "a stale resume would show only the cut")
 
 
 def test_a_changed_worker_count_rebuilds_the_cut_plus_tail_exactly(own_server):
@@ -107,7 +102,7 @@ def test_a_changed_worker_count_rebuilds_the_cut_plus_tail_exactly(own_server):
     _tail(own_server, "cc", range(6, 11))
     own_server.restart(workers=2)
 
-    assert any("re-sliced from" in t for t in own_server.worker_log_texts()), \
+    assert own_server.resliced(), \
         "a restart at a changed worker count must replay every written slot"
     assert own_server.rebuilt_view_count() >= 1, \
         "a changed-count restart invalidates every view, so it must rebuild"
@@ -117,13 +112,11 @@ def test_a_changed_worker_count_rebuilds_the_cut_plus_tail_exactly(own_server):
             (k, k * 10): 1 for k in range(1, 11)}
 
 
-# The SAL floor (16 MiB): `checkpoint_before_backfill` reclaims once the write
-# cursor passes 1/8 of it (2 MiB), while the committer's own checkpoint waits for
-# 3/4 (12 MiB). The push below is sized into that gap — past the backfill reclaim,
-# short of any checkpoint that would re-stamp the view on its own. Only the SAL
-# byte volume matters, so buy it with wide rows rather than many.
-# `GNITZ_LOG_LEVEL=normal` puts the "SAL checkpoint epoch=" line in the log, which
-# is how the test proves the reclaim it depends on actually fired.
+# At the 16 MiB floor the backfill reclaims past 1/8 (2 MiB) and the committer
+# checkpoints past 3/4 (12 MiB). The push below is sized into that gap, so the
+# backfill's reclaim is the only one that fires. Byte volume is all that counts,
+# hence wide rows. `GNITZ_LOG_LEVEL=normal` is what logs "SAL checkpoint epoch=";
+# the server defaults to quiet.
 _RECLAIM_ENV = {"GNITZ_SAL_BYTES": str(16 * 1024 * 1024), "GNITZ_LOG_LEVEL": "normal"}
 _RECLAIM_ROWS = 400
 _RECLAIM_PAD = "x" * 8000
@@ -157,8 +150,7 @@ def test_a_backfill_reclaim_restamps_the_state_it_invalidated(own_server):
         tid = conn.create_table("stale", "t", cols)
         conn.execute_sql("CREATE INDEX ON t(val)", schema_name="stale")
         conn.execute_sql("CREATE VIEW v AS SELECT pk, val FROM t", schema_name="stale")
-    rc = own_server.stop_graceful()
-    assert rc == 0, f"graceful shutdown must exit rc 0, got {rc}"
+    own_server.stop_graceful()
 
     # Phase 2: push into the (2, 12) MiB gap, then CREATE a second view whose
     # backfill reclaims. Nothing after it.

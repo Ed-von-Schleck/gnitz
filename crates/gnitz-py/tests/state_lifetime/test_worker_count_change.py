@@ -7,6 +7,10 @@ carries, re-cut each partitioned group for the launched topology, take exactly
 one slot of each broadcast group, and re-derive every rank's index slice — or
 client-ACKed, fdatasync-durable rows are silently lost or silently doubled.
 
+One test holds the count fixed and varies what exists at the boundary instead: a
+recovered replicated copy must be live on every rank for a circuit compiled after
+the reboot, which is the same re-homing seen from the other side.
+
 Every worker count below is hardcoded, so these run multi-worker even under
 `make e2e WORKERS=1`. Assertions are on weights throughout: `scan` concatenates
 per-worker frames with no cross-worker consolidation, so a row that survived on
@@ -19,12 +23,6 @@ import os
 import pytest
 import gnitz
 from _read import bag, scanned
-
-
-def _reslice_ran(srv):
-    """The changed-count replay marker in this boot's worker logs. Proves at
-    least one rank took the re-slicing path rather than the same-count one."""
-    return any("re-sliced from" in t for t in srv.worker_log_texts())
 
 
 def _replicated_dim(conn, schema):
@@ -95,15 +93,14 @@ def test_an_unflushed_tail_survives_a_worker_count_change(wrote, launched, own_s
         conn.execute_sql("INSERT INTO t VALUES (7, 3, 73)", schema_name="ws")
 
     own_server.restart(workers=launched)
-    assert _reslice_ran(own_server), \
+    assert own_server.resliced(), \
         "a restart at a changed worker count must replay every written slot"
 
     with gnitz.connect(own_server.sock_path) as conn:
         assert bag(scanned(conn, "ws", "t"), "a", "b") == {k: 1 for k in keys}
-        # The only index assertion that discriminates: deleting the sole holder
-        # of a `u` value and re-inserting that value must SUCCEED. Rejecting a
-        # duplicate and admitting a fresh value both pass with an index
-        # over-populated by a replayed foreign slot, so they prove nothing.
+        # The only index assertion that discriminates: re-inserting a `u` value
+        # whose sole holder was just deleted must SUCCEED. Rejecting a duplicate
+        # and admitting a fresh value both pass with an over-populated index.
         conn.execute_sql("DELETE FROM t WHERE a = 4 AND b = 5", schema_name="ws")
         conn.execute_sql("INSERT INTO t VALUES (4, 5, 45)", schema_name="ws")
 
@@ -120,7 +117,7 @@ def test_a_replicated_tail_survives_a_worker_count_shrink(own_server):
         _insert_pairs(conn, "rt", 0, 64)
 
     own_server.restart(workers=2)
-    assert _reslice_ran(own_server)
+    assert own_server.resliced()
     assert _joined(own_server, "rt") == {(i, i * 10): 1 for i in range(64)}
 
 
@@ -226,7 +223,9 @@ def test_an_index_rehomes_onto_the_launched_ranks(own_server):
         "every launched rank must re-derive its slice of the one index")
     table_dir = os.path.join(own_server.data_dir, "idxres", f"t_{tid}")
     idx_dirs = [d for d in os.listdir(table_dir) if d.startswith("idx_")]
-    assert idx_dirs, f"the index directory must survive under {table_dir}"
+    # Exactly one: a retired child's parent left behind would pass a truthiness
+    # check while proving the relayout reclaimed nothing.
+    assert len(idx_dirs) == 1, f"one index directory under {table_dir}, got {idx_dirs}"
     for idx in idx_dirs:
         children = os.listdir(os.path.join(table_dir, idx))
         assert len(children) == own_server.workers, (

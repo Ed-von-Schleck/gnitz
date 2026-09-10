@@ -113,7 +113,11 @@ def test_a_rebuilt_index_holds_exactly_its_own_slice(own_server):
         conn.execute_sql("DELETE FROM sx WHERE id = 0", schema_name="slice")
         conn.execute_sql("INSERT INTO sx VALUES (100, 7)", schema_name="slice")
         assert holders() == [i for i in range(3, 30) if i % 3 == 0] + [100]
-        assert len(bag(scanned(conn, "slice", "sx"), "id", "g")) == 30
+        # The whole bag, not its length: a row the replay duplicated onto a
+        # second worker arrives twice at weight 1 and keeps the count at 30.
+        assert bag(scanned(conn, "slice", "sx"), "id", "g") == (
+            {(i, 7 if i % 3 == 0 else 1000 + i): 1 for i in range(1, 30)}
+            | {(100, 7): 1})
 
 
 def test_the_ordered_index_of_a_top_n_view_survives_a_restart(own_server):

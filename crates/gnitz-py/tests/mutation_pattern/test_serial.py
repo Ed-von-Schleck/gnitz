@@ -13,7 +13,7 @@ import threading
 
 import pytest
 import gnitz
-from _serverproc import HANG_TIMEOUT, START_TIMEOUT
+from _serverproc import START_TIMEOUT, join_or_fail
 
 _CREATE = "CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT)"
 
@@ -286,13 +286,8 @@ def test_concurrent_serial_alloc_with_seeks(client, schema_name, serial_t, serve
     for t in wthreads:
         t.start()
     sthread.start()
-    # Hang ceilings, not perf budgets — see _serverproc.py.
-    for t in wthreads:
-        t.join(timeout=HANG_TIMEOUT)
-    sthread.join(timeout=HANG_TIMEOUT)
-
-    assert all(not t.is_alive() for t in wthreads), "a SERIAL writer hung"
-    assert not sthread.is_alive(), "the concurrent SEEK loop hung"
+    join_or_fail("a SERIAL writer or the concurrent SEEK loop hung",
+                 *wthreads, sthread)
     for src, exc in errors:
         raise AssertionError(f"{src} thread raised: {exc}")
 

@@ -263,8 +263,9 @@ class ServerProc:
     def stop_graceful(self, timeout=30):
         """SIGTERM the *master only* (not the process group), so its shutdown
         watcher can drive a final checkpoint (which needs live workers to ACK
-        the flush) before broadcasting Shutdown and exiting. Returns the
-        master's exit code; raises on hang."""
+        the flush) before broadcasting Shutdown and exiting. A non-zero exit
+        means that checkpoint failed and the shards a caller is about to read
+        are still in the SAL, so it fails here rather than at each call site."""
         assert self.proc is not None, "no running server"
         try:
             os.kill(self.proc.pid, signal.SIGTERM)
@@ -273,7 +274,7 @@ class ServerProc:
         self.proc.wait(timeout=timeout)
         rc = self.proc.returncode
         self.proc = None
-        return rc
+        assert rc == 0, f"graceful shutdown must exit rc 0, got {rc}\n{self.log_tail()}"
 
     def wait_for_exit(self, timeout=15.0):
         """Wait for the server to abort on its own. Returns its exit code;
@@ -295,8 +296,7 @@ class ServerProc:
         SIGTERM (final checkpoint) and asserts a clean exit; the default SIGKILL
         is the crash-recovery path."""
         if graceful:
-            rc = self.stop_graceful()
-            assert rc == 0, f"graceful shutdown must exit rc 0, got {rc}"
+            self.stop_graceful()
         else:
             self.stop()
         self.clear_socket()
@@ -350,17 +350,34 @@ class ServerProc:
             counts.append(int(markers[-1]))
         return counts
 
+    def resliced(self):
+        """Whether any launched rank took the changed-worker-count replay path,
+        from the per-worker marker that path prints. A same-count boot reads
+        every slot straight through and prints nothing, so this is what
+        separates a re-cut tail from one that merely happened to land right."""
+        return any("re-sliced from" in t for t in self.worker_log_texts())
+
     def sal_checkpoints(self):
         """How many SAL checkpoint resets this boot has logged. Only visible at
         `GNITZ_LOG_LEVEL=normal`, so a test reading it must set that."""
         return self.log_text().count("SAL checkpoint epoch=")
 
 
-# Deadlock ceilings for concurrent-thread tests, NOT performance budgets. The
-# guarded regression is a thread blocked forever (e.g. on `sal_writer_excl`); a
-# deadlock never completes, so any finite ceiling catches it. Deliberately
-# generous so a slow-but-completing run under saturated-CPU / parallel-suite
-# load never flakes. Do NOT tighten these to "speed up the tests" — that
-# reintroduces the flake.
-HANG_TIMEOUT = 180   # per-thread join ceiling
+# Deadlock ceilings, NOT performance budgets: a deadlock never completes, so any
+# finite ceiling catches it, and these are generous so a slow-but-completing run
+# never flakes. Tightening them to "speed up the tests" only reintroduces that.
+HANG_TIMEOUT = 180   # join ceiling for a group of threads
 START_TIMEOUT = 60   # thread waiting for the first concurrent write to land
+
+
+def join_or_fail(why, *threads):
+    """Join `threads` against the ceiling above, failing with `why` on the first
+    still running. One deadline for the group, not one each.
+
+    Joining and checking are one call because the ceiling catches a wedge only if
+    someone looks afterwards: a bare `join(timeout=...)` returns silently and
+    leaves the test asserting against a thread that never finished."""
+    deadline = time.monotonic() + HANG_TIMEOUT
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+        assert not t.is_alive(), why

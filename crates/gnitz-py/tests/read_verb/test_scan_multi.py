@@ -17,7 +17,7 @@ import threading
 import gnitz
 import pytest
 from _read import bag
-from _serverproc import HANG_TIMEOUT
+from _serverproc import join_or_fail
 
 
 def _kv(client, sn, name):
@@ -149,8 +149,7 @@ def test_a_commit_is_never_observed_torn(server, schema_name):
 
         rt, wt = threading.Thread(target=reader), threading.Thread(target=writer)
         rt.start(), wt.start()
-        wt.join(timeout=HANG_TIMEOUT)
-        rt.join(timeout=HANG_TIMEOUT)
+        join_or_fail("the writer or reader hung", wt, rt)
 
         assert not bad, f"torn or mis-weighted snapshot: {bad}"
         final = wc.scan_many([a, b])
@@ -196,8 +195,7 @@ def test_a_view_never_leads_its_base(server, schema_name):
 
         wt, rt = threading.Thread(target=writer), threading.Thread(target=reader)
         rt.start(), wt.start()
-        wt.join(timeout=HANG_TIMEOUT)
-        rt.join(timeout=HANG_TIMEOUT)
+        join_or_fail("the writer or reader hung", wt, rt)
         assert not violations, f"view led the base: {violations}"
 
 
