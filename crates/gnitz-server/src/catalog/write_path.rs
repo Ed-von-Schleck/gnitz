@@ -321,7 +321,7 @@ impl CatalogEngine {
             // Total over every row: `pk_signatures` skips zero-weight rows, and
             // `precheck_family` rejects a delta carrying one before it can be
             // applied — so no PK reaches here with a zero-weight row alone.
-            let net: FxHashMap<u128, i64> = pk_signatures(&batch).iter().map(|s| (s.pk, s.sum)).collect();
+            let net: FxHashMap<u128, i64> = pk_signatures(family, &batch).iter().map(|s| (s.pk, s.sum)).collect();
             let (created, dropped): (Vec<u32>, Vec<u32>) =
                 (0..batch.len() as u32).partition(|&i| net[&batch.get_pk(i as usize)] >= 0);
             if dropped.is_empty() {

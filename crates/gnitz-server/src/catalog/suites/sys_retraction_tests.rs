@@ -62,21 +62,6 @@ fn idx_row_batch(idx_id: i64, weight: i64, row: &IdxRow) -> Batch {
     idx_tab_batch(idx_id, row.owner_id, row.source_cols, &row.name, row.props, weight)
 }
 
-/// Every stored weight under `idx_id` in IDX_TAB: empty once a `(+1, -1)` pair
-/// has cancelled (the cursor skips a net-zero PK), `[1]` for a live index,
-/// `[-1]` for a durable ghost.
-fn idx_weights_for(engine: &CatalogEngine, idx_id: i64) -> Vec<i64> {
-    let mut c = engine.sys_relation(SysFamily::Index).cursor();
-    let mut v = Vec::new();
-    while c.valid {
-        if c.current_key_narrow() as i64 == idx_id {
-            v.push(c.current_weight);
-        }
-        c.advance();
-    }
-    v
-}
-
 // ── SCHEMA_TAB ──────────────────────────────────────────────────────────────
 
 #[test]

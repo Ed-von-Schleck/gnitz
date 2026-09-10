@@ -3,21 +3,6 @@ use super::*;
 use gnitz_wire::{SCHEMATAB_PAY_NAME, SEQTAB_PAY_VALUE};
 use rustc_hash::FxHashMap;
 
-/// What `register_relation` needs to build and register one relation: the
-/// values decoded off its TABLE_TAB / VIEW_TAB row, plus the placement its own
-/// family derives.
-struct RelationRegistration {
-    kind: RelationKind,
-    id: i64,
-    schema_id: i64,
-    name: String,
-    pk: PkColList,
-    placement: Placement,
-    /// The `WITH (…)` byte budgets; both `None` for a base table and for a plain
-    /// view.
-    budgets: ViewBudgets,
-}
-
 impl CatalogEngine {
     // -- Hook processing ---------------------------------------------------
     //
@@ -43,14 +28,12 @@ impl CatalogEngine {
             }
             SysFamily::Table => {
                 self.apply_entity_caches(family, batch);
-                self.apply_schema_members(batch);
                 self.hook_relation_register(family, batch)?;
                 self.relock_from_table_delta(batch);
                 self.hook_cascade_fk(batch)?;
             }
             SysFamily::View => {
                 self.apply_entity_caches(family, batch);
-                self.apply_schema_members(batch);
                 self.hook_relation_register(family, batch)?;
             }
             SysFamily::Column => {
@@ -89,11 +72,8 @@ impl CatalogEngine {
             return None;
         }
         // Total, because `precheck_family` rejects a delta carrying a zero weight.
-        let mut idx: Vec<u32> = (0..batch.len())
-            .filter(|&i| batch.get_weight(i) < 0)
-            .map(|i| i as u32)
-            .collect();
-        idx.extend((0..batch.len()).filter(|&i| batch.get_weight(i) > 0).map(|i| i as u32));
+        let mut idx: Vec<u32> = batch.retracted_rows().map(|i| i as u32).collect();
+        idx.extend(batch.live_rows().map(|i| i as u32));
         Some(Batch::from_indexed_rows(&batch.as_mem_batch(), &idx, family.schema()))
     }
 
@@ -118,20 +98,17 @@ impl CatalogEngine {
     fn hook_schema_dir(&mut self, batch: &Batch) -> Result<(), String> {
         for i in 0..batch.len() {
             let weight = batch.get_weight(i);
-            let name = payload_string(batch, i, SCHEMATAB_PAY_NAME);
-            let path = schema_dir(&self.base_dir, &name);
+            let path = schema_dir(&self.base_dir, payload_str(batch, i, SCHEMATAB_PAY_NAME));
             if weight > 0 {
                 // A prior DROP SCHEMA may have queued this exact (name-based)
                 // path for checkpoint-gated removal; recreating it now must
                 // cancel that, or the gating checkpoint would wipe the new
                 // schema and its tables.
                 self.cancel_gated_deletion(&path);
-                // A Stage-A rollback of this CREATE re-fires the hook with the
-                // row negated, and the else-arm below queues the path for the
-                // compensation's own drain — so the directory needs no staging.
-                ensure_dir(&path)?;
-                let _ = fsync_dir(&path);
-                let _ = fsync_dir(&self.base_dir);
+                // `staged_dir` fsyncs `base_dir` — where the new entry lives —
+                // only when this call is what created the directory, so boot
+                // replay of an existing schema syncs nothing.
+                staged_dir(&path, || ensure_dir(&path))?;
             } else {
                 // Drained only on the master live-DDL path, where
                 // `precheck_schema_family`'s CAS has proved this payload name is
@@ -145,7 +122,7 @@ impl CatalogEngine {
     /// Build a relation's store and enter it in the registry — the `+1` half of
     /// [`hook_relation_register`](Self::hook_relation_register), over the values
     /// its per-family builder decoded.
-    fn register_relation(&mut self, reg: RelationRegistration) -> Result<(), String> {
+    fn register_relation(&mut self, reg: RelationRegistration<'_>) -> Result<(), String> {
         let RelationRegistration {
             kind,
             id,
@@ -227,17 +204,7 @@ impl CatalogEngine {
                     continue;
                 }
                 let reg = if family == SysFamily::Table {
-                    let (schema_id, name, pk, kind, placement) =
-                        read_table_tab_row(batch, i).map_err(|e| format!("{e} (tid={id})"))?;
-                    RelationRegistration {
-                        kind,
-                        id,
-                        schema_id,
-                        name,
-                        pk,
-                        placement,
-                        budgets: ViewBudgets::default(),
-                    }
+                    read_table_tab_row(batch, i).map_err(|e| format!("{e} (tid={id})"))?
                 } else {
                     self.view_registration(batch, i, id)?
                 };
@@ -292,13 +259,24 @@ impl CatalogEngine {
     /// The view's physical PK is the persisted leading-k column list: a single
     /// synthetic hash column for join/set-op/distinct views, or the source PK
     /// passed through (0..k) for a plain projection over a compound-PK table.
-    fn view_registration(&mut self, batch: &Batch, i: usize, vid: i64) -> Result<RelationRegistration, String> {
-        let (schema_id, name, pk, budgets, owner_view_id) = read_view_tab_row(batch, i)?;
+    fn view_registration<'a>(
+        &mut self,
+        batch: &'a Batch,
+        i: usize,
+        vid: i64,
+    ) -> Result<RelationRegistration<'a>, String> {
+        let ViewRegistration {
+            schema_id,
+            name,
+            pk,
+            budgets,
+            owner_view_id,
+        } = read_view_tab_row(batch, i).map_err(|e| format!("{e} (vid={vid})"))?;
         // The circuit's `circuit_nodes` are persisted before this VIEW_TAB row,
         // so `get_source_ids` resolves here. Re-check for the paths that skip the
         // precheck (boot replay, worker `ddl_sync`).
         let source_ids = self.dag.get_source_ids(&self.registry, vid);
-        self.validate_view_options(vid, &name, budgets, owner_view_id, &source_ids)?;
+        self.validate_view_options(vid, name, budgets, owner_view_id, &source_ids)?;
         // Stamping the fold is what makes placement transitive:
         // `relation_row_order` registers this view after its sources, so a view
         // over it reads the answer back off one value.
@@ -339,10 +317,10 @@ impl CatalogEngine {
             return Ok(());
         }
         if family == SysFamily::View {
-            self.cascade_retract_circuit(id)?;
+            self.cascade_retract_band(SysFamily::CircuitNodes, id)?;
             self.cascade_retract_segments(id)?;
         }
-        self.cascade_retract_columns(id)
+        self.cascade_retract_band(SysFamily::Column, id)
     }
 
     fn cascade_retract_segments(&mut self, owner_id: i64) -> Result<(), String> {
@@ -373,14 +351,13 @@ impl CatalogEngine {
         Ok(())
     }
 
-    fn cascade_retract_columns(&mut self, owner_id: i64) -> Result<(), String> {
-        let schema = SysFamily::Column.schema();
-        let (start_pk, end_pk) = column_id_band(owner_id);
-        let start = sys_opk(schema, start_pk as u128);
-        let end = sys_opk(schema, end_pk as u128);
-        let batch = retract_key_range(self.sys_relation(SysFamily::Column), start.pk_bytes(), end.pk_bytes());
+    /// Retract every row of pair-keyed `family` under `leading` — one owner's
+    /// column records, or one view's circuit nodes.
+    fn cascade_retract_band(&mut self, family: SysFamily, leading: i64) -> Result<(), String> {
+        let (start, end) = family.band(leading);
+        let batch = retract_key_range(self.sys_relation(family), start.pk_bytes(), end.pk_bytes());
         if !batch.is_empty() {
-            self.submit_cascade(SysFamily::Column, batch)?;
+            self.submit_cascade(family, batch)?;
         }
         Ok(())
     }
@@ -411,11 +388,10 @@ impl CatalogEngine {
         if self.ctx.mode() == ApplyMode::Replay {
             return Ok(());
         }
-        // COL_TAB PK = pack_col_id. `pk_signatures` skips `w == 0`, so "no `-1`"
-        // is "carries only `+1`s".
-        for sig in pk_signatures(batch) {
-            let (owner, col_idx) = gnitz_wire::unpack_col_id(sig.pk as u64);
-            let owner = owner as i64;
+        // `pk_signatures` skips `w == 0`, so "no `-1`" is "carries only `+1`s".
+        for sig in pk_signatures(SysFamily::Column, batch) {
+            // COL_TAB PK = `(owner_id, col_idx)`.
+            let (owner, col_idx) = (sig.leading, sig.pk as u64);
             let is_append = sig.neg.is_none() && self.is_trailing_col_append(owner, col_idx);
             if !(sig.is_pair() || is_append) {
                 continue;
@@ -441,20 +417,6 @@ impl CatalogEngine {
                 let CatalogEngine { registry, dag, .. } = self;
                 dag.swap_schema(registry, owner, rebuilt)?;
             }
-        }
-        Ok(())
-    }
-
-    fn cascade_retract_circuit(&mut self, vid: i64) -> Result<(), String> {
-        let family = SysFamily::CircuitNodes;
-        let schema = family.schema();
-        // The family uses the compound PK `(view_id, node_id)`, so one view's
-        // rows are the key band `[(vid, 0), (vid + 1, 0))`.
-        let start = circuit_opk(schema, vid, 0);
-        let end = circuit_opk(schema, vid + 1, 0);
-        let batch = retract_key_range(self.sys_relation(family), start.pk_bytes(), end.pk_bytes());
-        if !batch.is_empty() {
-            self.submit_cascade(family, batch)?;
         }
         Ok(())
     }
@@ -586,7 +548,7 @@ impl CatalogEngine {
         // name, so a rename's `+1` would mint a second one its by-name dedup
         // cannot suppress. Read off the batch, because this hook also fires where
         // no master-threaded set exists (worker `ddl_sync`, SAL-tail recovery).
-        for tid in family_pks_by_sign(batch, true) {
+        for tid in family_pk_partition(SysFamily::Table, batch).creates {
             self.create_fk_indices(tid)?;
         }
         Ok(())

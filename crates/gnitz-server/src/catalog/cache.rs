@@ -1,5 +1,8 @@
 use super::*;
-use gnitz_wire::{IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMATAB_PAY_NAME};
+use gnitz_wire::{
+    COLTAB_PAY_FK_TABLE_ID, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID,
+    SCHEMATAB_PAY_NAME,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
 
@@ -146,24 +149,31 @@ impl CatalogEngine {
         }
     }
 
-    /// Maintain `entity_by_qname` and `entity_by_id` from one pass over a
-    /// TABLE_TAB or VIEW_TAB delta (the two families share the leading
-    /// `(schema_id, name)` payload prefix).
+    /// Maintain `entity_by_qname`, `entity_by_id` and `members_by_schema` from
+    /// one pass over a TABLE_TAB or VIEW_TAB delta — the two families share the
+    /// leading `(schema_id, name)` payload prefix.
     pub(in crate::catalog) fn apply_entity_caches(&mut self, family: SysFamily, batch: &Batch) {
         for i in 0..batch.len() {
             let weight = batch.get_weight(i);
             let tid = batch.get_pk(i) as i64;
+            let sid = payload_u64(batch, i, RELTAB_PAY_SCHEMA_ID) as i64;
 
             if weight > 0 {
-                let sid = payload_u64(batch, i, RELTAB_PAY_SCHEMA_ID) as i64;
                 let name = payload_string(batch, i, RELTAB_PAY_NAME);
                 let schema_name = self.caches.schema_by_id.get(&sid).cloned().unwrap_or_default();
                 let qualified = gnitz_wire::qualified_key(&schema_name, &name);
                 self.caches.entity_by_qname.insert(qualified, tid);
                 self.caches.entity_by_id.insert(tid, (schema_name, name));
+                self.caches.members_by_schema.entry(sid).or_default().insert(tid);
                 self.apply_segment_owner(family, batch, i, tid, weight);
             } else {
                 self.apply_segment_owner(family, batch, i, tid, weight);
+                if let Entry::Occupied(mut e) = self.caches.members_by_schema.entry(sid) {
+                    e.get_mut().remove(&tid);
+                    if e.get().is_empty() {
+                        e.remove();
+                    }
+                }
                 // Retract sequence, in this order: read the old name
                 // from entity_by_id → remove the qname → clear the per-table
                 // column caches → remove the id entry.
@@ -187,37 +197,14 @@ impl CatalogEngine {
         }
     }
 
-    /// Maintain `members_by_schema` from a TABLE_TAB or VIEW_TAB delta. The set
-    /// drops once it empties, so `schema_member_count` returns 0 exactly when
-    /// no member remains.
-    pub(in crate::catalog) fn apply_schema_members(&mut self, batch: &Batch) {
-        for i in 0..batch.len() {
-            let weight = batch.get_weight(i);
-            let tid = batch.get_pk(i) as i64;
-            let sid = payload_u64(batch, i, RELTAB_PAY_SCHEMA_ID) as i64;
-
-            if weight > 0 {
-                self.caches.members_by_schema.entry(sid).or_default().insert(tid);
-            } else if let Entry::Occupied(mut e) = self.caches.members_by_schema.entry(sid) {
-                e.get_mut().remove(&tid);
-                if e.get().is_empty() {
-                    e.remove();
-                }
-            }
-        }
-    }
-
     /// Drop the cached column defs of every owner the COL_TAB delta touches.
-    /// A batch typically carries one owner's columns in a run (the PK is
-    /// `pack_column_id(owner, col)`), so skipping a repeat of the previous owner
-    /// collapses the run to one invalidation. Correct for any row order — an
-    /// interleaved batch just invalidates an owner more than once.
+    /// A batch typically carries one owner's columns in a run (the PK leads with
+    /// `owner_id`), so skipping a repeat collapses the run to one invalidation.
+    /// Correct for any row order.
     pub(in crate::catalog) fn apply_col_names_invalidate(&mut self, batch: &Batch) {
         let mut last: Option<i64> = None;
         for i in 0..batch.len() {
-            // The owner is the high half of the PK, so one inlined big-endian
-            // load rather than the five payload reads a full ident decode costs.
-            let owner_id = gnitz_wire::unpack_col_id(batch.get_pk(i) as u64).0 as i64;
+            let owner_id = gnitz_wire::unpack_pair_pk(batch.get_pk(i)).0 as i64;
             if last != Some(owner_id) {
                 self.caches.invalidate_col_names(owner_id);
                 last = Some(owner_id);
@@ -264,12 +251,15 @@ impl CatalogEngine {
 
     /// All three derived states an FK-carrying COL_TAB row feeds, off one decode
     /// of it: both `fk_by_*` indexes, and the lock set of either end (which names
-    /// the other). At boot replay the batch is the full sys_columns scan, so a
-    /// second pass would re-decode every live column record in the database.
+    /// the other). Gated on the FK word before the decode: at boot replay the
+    /// batch is every live column record in the database.
     pub(in crate::catalog) fn apply_fk_edges_and_locks(&mut self, batch: &Batch) {
         let CatalogEngine { caches, registry, .. } = self;
         let mut tids: Vec<i64> = Vec::new();
         for i in 0..batch.len() {
+            if payload_u64(batch, i, COLTAB_PAY_FK_TABLE_ID) == 0 {
+                continue;
+            }
             let ident = read_col_tab_ident(batch, i);
             if !ident.declares_fk() {
                 continue;

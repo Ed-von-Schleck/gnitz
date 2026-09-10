@@ -50,8 +50,8 @@ const NUM_COLUMNS: usize = CONTROL_COLS.len();
 const NUM_REGIONS: usize = crate::wal::num_regions(NUM_COLUMNS - 1);
 
 /// Region index of the payload column named `name`: the fixed regions, then the
-/// payload columns in schema order (`pay_index_in`, valid here because the PK is
-/// the single leading column), then the blob region last. The fixed indices
+/// payload columns in schema order (`payload_region_in`, valid here because the
+/// PK is the single leading column), then the blob region last. The fixed indices
 /// themselves (`REG_PK` / `REG_WEIGHT` / `REG_NULL_BMP`) come straight from
 /// `wal`. A column's null bit is its payload index, i.e. `reg - REG_PAYLOAD_START`.
 const fn reg(name: &str) -> usize {

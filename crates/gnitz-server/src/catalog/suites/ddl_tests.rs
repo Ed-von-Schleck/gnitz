@@ -1,5 +1,5 @@
 use super::*;
-use gnitz_wire::{COLTAB_PAY_COL_IDX, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND};
+use gnitz_wire::{COLTAB_PAY_NAME, COLTAB_PAY_OWNER_KIND};
 use std::collections::HashMap;
 
 // ── test_identifiers ─────────────────────────────────────────────────
@@ -69,9 +69,10 @@ fn test_bootstrap() {
 /// family describes itself with one row per column of its wire list, named and
 /// in `col_idx` order, under its own id — and nothing else is described.
 ///
-/// Guards `push_col_tab_row`'s argument order, which `test_bootstrap`'s row
-/// count cannot see. Both sides derive from the same `gnitz-wire` slice, so it
-/// cannot catch the schema and its self-description drifting apart.
+/// The only guard on bootstrap writing one row per wire column, in `col_idx`
+/// order and under the right owner. Both sides derive from the same
+/// `gnitz-wire` slice, so it cannot catch the schema and its self-description
+/// drifting apart.
 #[test]
 fn bootstrap_self_description_matches_the_wire_column_lists() {
     let dir = temp_dir("bootstrap_self_description");
@@ -84,11 +85,9 @@ fn bootstrap_self_description_matches_the_wire_column_lists() {
         if c.current_weight > 0 {
             let (src, row) = c.current_row_source();
             if payload_u64(src, row, COLTAB_PAY_OWNER_KIND) == OWNER_KIND_TABLE as u64 {
-                let owner = payload_u64(src, row, COLTAB_PAY_OWNER_ID);
-                let entry = (
-                    payload_u64(src, row, COLTAB_PAY_COL_IDX),
-                    payload_string(src, row, COLTAB_PAY_NAME),
-                );
+                // COL_TAB PK = `(owner_id, col_idx)`.
+                let (owner, col_idx) = gnitz_wire::unpack_pair_pk(c.current_key_narrow());
+                let entry = (col_idx, payload_string(src, row, COLTAB_PAY_NAME));
                 described.entry(owner).or_default().push(entry);
             }
         }

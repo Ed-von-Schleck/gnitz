@@ -204,8 +204,8 @@ pub struct ReadSpec {
 /// Pack a delta reply's terminal watermark: the cursor tag in the high half of
 /// `seek_pk`, the tick round `T` in the low half. Defined here, beside the bound
 /// it answers, because the encoder is in the server and the decoder in the
-/// client — the same reason [`pack_scan_spec_extra`], `pack_col_id` and
-/// `pack_pk_cols` are single-sourced in this crate.
+/// client — the same reason [`pack_scan_spec_extra`] and `pack_pk_cols` are
+/// single-sourced in this crate.
 ///
 /// One field, because "which cursor is this?" and "how far does it reach?" are
 /// answered together: a client that does not recognise the tag discards its copy

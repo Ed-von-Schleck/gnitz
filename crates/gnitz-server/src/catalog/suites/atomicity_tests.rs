@@ -445,6 +445,11 @@ fn test_create_index_backfill_fail_no_dir_leak_internal() {
             .unwrap_or(true),
         "no index circuit must be registered after failed CREATE INDEX"
     );
+    assert_eq!(
+        idx_weights_for(&engine, expected_idx_id),
+        Vec::<i64>::new(),
+        "a failed registration must leave no stored weight under its id"
+    );
 
     let _ = fs::remove_dir_all(&dir);
     println!("{}", crate::test_support::CHILD_OK);

@@ -5,8 +5,11 @@
 //! crate-internals as `crate::` and widens no API — nothing links this crate.
 
 use crate::catalog::{CatalogEngine, ColumnDef, SysFamily, PUBLIC_SCHEMA_ID};
-use gnitz_store::storage::{BatchBuilder, ReadCursor};
-use gnitz_wire::sys_rows::{write_circuit_node_row, write_view_tab_row, CircuitNodeRow, ViewTabRow};
+use gnitz_store::storage::{Batch, BatchBuilder, ReadCursor};
+use gnitz_wire::sys_rows::{
+    write_circuit_node_row, write_col_tab_row, write_idx_tab_row, write_table_tab_row, write_view_tab_row,
+    CircuitNodeRow, ColTabRow, IdxTabRow, TableTabRow, ViewTabRow,
+};
 use gnitz_wire::type_code;
 use gnitz_wire::Opcode;
 
@@ -105,6 +108,89 @@ pub fn write_identity_circuit(engine: &mut CatalogEngine, vid: i64, source_tid: 
             (Opcode::IntegrateSink, None, None),
         ],
     );
+}
+
+// ── Positional row builders ──────────────────────────────────────────────
+//
+// Fixtures over `gnitz_wire::sys_rows`' codecs, defaulting what a test never
+// varies. Production writes the wire struct inline.
+
+/// Append one COL_TAB row for column `col_idx` of `owner_id`. Takes the whole
+/// `ColumnDef` rather than its fields, mirroring the catalog's read side, which
+/// reassembles exactly this struct.
+pub fn push_col_tab_row(
+    bb: &mut BatchBuilder,
+    owner_id: i64,
+    owner_kind: i64,
+    col_idx: i64,
+    cd: &ColumnDef,
+    weight: i64,
+) {
+    write_col_tab_row(
+        bb,
+        &ColTabRow {
+            owner_id: owner_id as u64,
+            col_idx: col_idx as u64,
+            owner_kind: owner_kind as u64,
+            name: &cd.name,
+            type_code: cd.type_code as u64,
+            is_nullable: cd.is_nullable,
+            fk_table_id: cd.fk_table_id as u64,
+            fk_col_idx: cd.fk_col_idx as u64,
+            is_serial: cd.is_serial,
+            is_hidden: cd.is_hidden,
+            scale: cd.scale,
+        },
+        weight,
+    );
+}
+
+/// Append one TABLE_TAB row at `weight`.
+pub fn push_table_tab_row(
+    bb: &mut BatchBuilder,
+    tid: i64,
+    schema_id: i64,
+    name: &str,
+    pk_col_idx: u64,
+    flags: u64,
+    weight: i64,
+) {
+    write_table_tab_row(
+        bb,
+        &TableTabRow {
+            table_id: tid as u64,
+            schema_id: schema_id as u64,
+            name,
+            pk_col_idx,
+            flags,
+        },
+        weight,
+    );
+}
+
+/// The one-row IDX_TAB batch at `weight`. A `-1` must reproduce its `+1`'s
+/// payload exactly — the retraction CAS rejects a mismatch.
+pub fn idx_tab_batch(
+    index_id: i64,
+    owner_id: i64,
+    packed_cols: u64,
+    name: &str,
+    props: gnitz_wire::IndexProps,
+    weight: i64,
+) -> Batch {
+    let mut bb = BatchBuilder::new(*SysFamily::Index.schema());
+    write_idx_tab_row(
+        &mut bb,
+        &IdxTabRow {
+            index_id: index_id as u64,
+            owner_id: owner_id as u64,
+            source_col_idx: packed_cols,
+            name,
+            flags: props.pack(),
+        },
+        weight,
+    );
+    bb.finish()
 }
 
 /// Append one raw VIEW_TAB row at `weight`, with both `WITH (…)` budgets in

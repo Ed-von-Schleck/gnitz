@@ -157,24 +157,35 @@ impl CatalogEngine {
                 .allocate_index_id()
                 .map_err(|e| format!("index id allocation failed: {e}"))?;
 
-            // Write index record to sys_indices (FK indices are not unique).
-            // `submit_local` bypasses the precheck, and is the only path allowed
-            // to set the internal bit.
-            let packed_cols = gnitz_wire::pack_pk_cols(&[col_idx as u32]);
-            let props = gnitz_wire::IndexProps { is_unique: false, is_internal: true };
-            let batch = idx_tab_batch(index_id, table_id, packed_cols, &index_name, props, 1);
+            let mut bb = BatchBuilder::new(*SysFamily::Index.schema());
+            gnitz_wire::sys_rows::write_idx_tab_row(
+                &mut bb,
+                &gnitz_wire::sys_rows::IdxTabRow {
+                    index_id: index_id as u64,
+                    owner_id: table_id as u64,
+                    source_col_idx: gnitz_wire::pack_pk_cols(&[col_idx as u32]),
+                    name: &index_name,
+                    // FK auto-indices are not unique. `submit_local` bypasses the
+                    // precheck, and is the only path allowed to set the internal bit.
+                    flags: gnitz_wire::IndexProps { is_unique: false, is_internal: true }.pack(),
+                },
+                1,
+            );
+            let batch = bb.finish();
             // hook_cascade_fk fires on master and every worker, so each side
             // creates its own FK indices locally; submit_local applies + fires
             // hooks without a broadcast. submit would broadcast IDX_TAB before
             // TABLE_TAB and duplicate the rows the worker already produced.
             if let Err(e) = self.submit_local(SysFamily::Index, batch) {
-                // The +1 reached sys_indices but its directory/cache setup failed
-                // and was never broadcast. Submit the matching -1 locally to
-                // reverse the storage write and any partial cache updates;
-                // otherwise the next boot's replay opens a missing index
-                // directory and crashes.
-                let undo = idx_tab_batch(index_id, table_id, packed_cols, &index_name, props, -1);
-                self.rollback_index_registration(undo, index_id)?;
+                // Reverse the storage write and any partial cache updates
+                // locally — nothing was broadcast — or the next boot's replay
+                // opens a missing index directory and crashes. Built from the
+                // LIVE row, as `build_seq_delta` is: the failure can precede the
+                // `+1` landing, and a `-1` matching nothing persists as a ghost.
+                let undo = retract_pk_list(self.sys_relation(SysFamily::Index), vec![index_id as u128]);
+                if !undo.is_empty() {
+                    self.rollback_index_registration(undo, index_id)?;
+                }
                 return Err(e);
             }
         }

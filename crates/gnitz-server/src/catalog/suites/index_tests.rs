@@ -137,9 +137,17 @@ fn test_index_registration_failure_no_broadcast_poisoning_internal() {
     // Clear broadcasts accumulated by table/column creation + ingest.
     let _ = engine.drain_pending_broadcasts();
 
+    // The id `create_index` is about to allocate; no FK column draws from the
+    // counter here.
+    let failed_idx_id = engine.next_index_id;
     assert!(
         engine.create_index("public.t", &["val"], true).is_err(),
         "the injected backfill fault must fail the create"
+    );
+    assert_eq!(
+        idx_weights_for(&engine, failed_idx_id),
+        Vec::<i64>::new(),
+        "a failed registration must leave no stored weight under its id"
     );
 
     // No IDX_TAB broadcast may carry a negative weight for the failed index.
@@ -705,7 +713,9 @@ fn test_failed_index_registration_rolls_back_cleanly_internal() {
     engine.registry_mut().flush(tid).unwrap();
 
     let idx_name = make_secondary_index_name("public", "t", "val");
-    let idx_records_before = count_records(engine.sys_relation(SysFamily::Index).cursor());
+    // The id `create_index` is about to allocate; no FK column draws from the
+    // counter here.
+    let failed_idx_id = engine.next_index_id;
 
     let result = engine.create_index("public.t", &["val"], true);
     assert!(result.is_err(), "the injected backfill fault must fail the create");
@@ -729,8 +739,8 @@ fn test_failed_index_registration_rolls_back_cleanly_internal() {
         "DAG must not retain a half-built index circuit"
     );
     assert_eq!(
-        count_records(engine.sys_relation(SysFamily::Index).cursor()),
-        idx_records_before,
+        idx_weights_for(&engine, failed_idx_id),
+        Vec::<i64>::new(),
         "sys_indices must net out to zero after rollback"
     );
 
@@ -987,11 +997,19 @@ fn test_failed_create_index_leaves_no_directory_internal() {
     engine.registry_mut().flush(tid).unwrap();
 
     let tbl_dir = format!("{dir}/public/t_{tid}");
+    // The id `create_index` is about to allocate; no FK column draws from the
+    // counter here.
+    let failed_idx_id = engine.next_index_id;
     assert!(engine.create_index("public.t", &["val"], true).is_err());
     assert_eq!(
         count_idx_dirs(&tbl_dir),
         0,
         "a failed create_index must leave no index directory behind"
+    );
+    assert_eq!(
+        idx_weights_for(&engine, failed_idx_id),
+        Vec::<i64>::new(),
+        "a failed create_index must leave no stored weight under its id"
     );
 
     engine.close();

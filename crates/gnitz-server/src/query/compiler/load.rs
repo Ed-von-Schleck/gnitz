@@ -32,9 +32,7 @@ pub(in crate::query) fn for_each_scan_edge(host: &dyn SchemaSource, mut f: impl 
         if source <= 0 {
             return;
         }
-        // Compound PK `(view_id, node_id)`: view_id is the leading big-endian
-        // 8 bytes of the 16-byte PK region.
-        let view_id = u64::from_be_bytes(ch.current_pk_bytes()[0..8].try_into().unwrap()) as i64;
+        let view_id = gnitz_wire::unpack_pair_pk(ch.current_key_narrow()).0 as i64;
         f(view_id, source);
     });
 }
@@ -72,9 +70,7 @@ pub(super) fn load_circuit(host: &dyn SchemaSource, view_id: u64) -> Result<Load
 
     nodes_cur.for_each_positive_with_prefix(&prefix, |ch| {
         let (src, row) = ch.current_row_source();
-        // Compound PK `(view_id, node_id)`: node_id is the trailing big-endian
-        // 8 bytes of the 16-byte PK region.
-        let node_id_raw = u64::from_be_bytes(ch.current_pk_bytes()[8..16].try_into().unwrap()) as i64;
+        let node_id_raw = gnitz_wire::unpack_pair_pk(ch.current_key_narrow()).1 as i64;
         let Some(node_id) = node_id_i32(node_id_raw) else {
             invalid.get_or_insert_with(|| "circuit node id out of range".to_string());
             return;

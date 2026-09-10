@@ -34,14 +34,14 @@ impl CatalogEngine {
     // -- Read column definitions from sys_columns --------------------------
 
     /// Open a cursor over `owner_id`'s COL_TAB key band, positioned at its first
-    /// row. sys_columns has a single U64 PK, so OPK == big-endian; the range
-    /// clamp exhausts the cursor at the band's end, so neither walk below needs a
-    /// bound test.
+    /// row. The range clamp exhausts the cursor at the band's end, so neither
+    /// walk below needs a bound test.
     fn open_column_band(&self, owner_id: i64) -> ReadCursor {
-        let (start_pk, end_pk) = column_id_band(owner_id);
-        let (start, end) = (start_pk.to_be_bytes(), end_pk.to_be_bytes());
-        let mut cursor = self.sys_relation(SysFamily::Column).cursor_in_range(&start, Some(&end));
-        cursor.seek_range_bytes(&start, Some(&end));
+        let (start, end) = SysFamily::Column.band(owner_id);
+        let mut cursor = self
+            .sys_relation(SysFamily::Column)
+            .cursor_in_range(start.pk_bytes(), Some(end.pk_bytes()));
+        cursor.seek_range_bytes(start.pk_bytes(), Some(end.pk_bytes()));
         cursor
     }
 
@@ -60,10 +60,10 @@ impl CatalogEngine {
         defs
     }
 
-    /// The column indices (lower 9 bits of the packed PK) of `owner_id`'s live
-    /// column records must run 0,1,2,… with no gap or duplicate: a gap would
-    /// silently mismap columns in `build_schema_from_col_defs`, which maps them
-    /// positionally. Reads the key alone — no payload decode.
+    /// The trailing halves of `owner_id`'s live column-record keys must run
+    /// 0,1,2,… with no gap or duplicate, or `build_schema_from_col_defs` mismaps
+    /// columns — it maps them positionally. The **only** guard on a forged
+    /// `col_idx`: the key is the row's identity, so nothing else contradicts it.
     pub(in crate::catalog) fn check_column_contiguity(&self, owner_id: i64) -> Result<(), String> {
         let mut cursor = self.open_column_band(owner_id);
         let mut expected: i64 = 0;
@@ -72,7 +72,7 @@ impl CatalogEngine {
         // completion after the first mismatch costs a bounded remainder.
         let mut broken: Option<String> = None;
         cursor.for_each_positive(|c| {
-            let actual = gnitz_wire::unpack_col_id(c.current_key_narrow() as u64).1 as i64;
+            let actual = gnitz_wire::unpack_pair_pk(c.current_key_narrow()).1 as i64;
             if actual != expected && broken.is_none() {
                 broken = Some(format!(
                     "entity (owner_id={owner_id}): column records are non-contiguous; \
@@ -113,7 +113,7 @@ impl CatalogEngine {
     }
 
     /// Number of live member relations (tables + views) in schema `sid`. Reads
-    /// the `members_by_schema` cache `apply_schema_members` maintains, which
+    /// the `members_by_schema` cache `apply_entity_caches` maintains, which
     /// drops its set once it empties — so this returns 0 exactly when no member
     /// remains. The engine-side non-empty-schema DROP guard (`precheck_family`)
     /// and the `#[cfg(test)]` `schema_is_empty` share this one probe.

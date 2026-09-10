@@ -3,12 +3,12 @@
 //! readers on both sides resolve by name. A family's column list can therefore
 //! be reordered without transposing a writer against its readers.
 //!
-//! Exactly one writer per family, because a `-1` row must reproduce its `+1`'s
+//! One writer per family a client may write — the six [`crate::SYS_FAMILIES`]
+//! entries `SysFamily::client_writable` admits; `SEQ_TAB` is engine-built and
+//! has none. One and not two, because a `-1` row must reproduce its `+1`'s
 //! payload byte-for-byte: the engine's retraction CAS rejects a mismatch, and
 //! only byte-equal `(PK, payload)` rows cancel in the Z-set. A drop and its
 //! create cannot diverge if they are the same code.
-
-use crate::pack_col_id;
 
 /// Where a row codec writes. Both sides already build batches this way — begin a
 /// row with its key and weight, push one value per payload column in schema
@@ -60,8 +60,8 @@ pub fn write_schema_tab_row(sink: &mut impl SysRowSink, r: &SchemaTabRow, weight
 /// deferred self-reference is substituted before a row reaches here.
 pub struct ColTabRow<'a> {
     pub owner_id: u64,
-    pub owner_kind: u64,
     pub col_idx: u64,
+    pub owner_kind: u64,
     pub name: &'a str,
     pub type_code: u64,
     pub is_nullable: bool,
@@ -72,15 +72,11 @@ pub struct ColTabRow<'a> {
     pub scale: u8,
 }
 
-/// Write one `COL_TAB` row. The key is `pack_col_id(owner_id, col_idx)`, which
-/// rejects an out-of-range owner or column index rather than aliasing another
-/// column's record; each side decides whether that is an error to propagate or
-/// a corruption to abort on.
-pub fn write_col_tab_row(sink: &mut impl SysRowSink, r: &ColTabRow, weight: i64) -> Result<(), String> {
-    sink.begin_row(&[pack_col_id(r.owner_id, r.col_idx)? as u128], weight);
-    sink.put_u64(r.owner_id);
+/// Write one `COL_TAB` row, keyed by the compound `(owner_id, col_idx)` — the
+/// identity of a column record, so neither half is repeated in the payload.
+pub fn write_col_tab_row(sink: &mut impl SysRowSink, r: &ColTabRow, weight: i64) {
+    sink.begin_row(&[r.owner_id as u128, r.col_idx as u128], weight);
     sink.put_u64(r.owner_kind);
-    sink.put_u64(r.col_idx);
     sink.put_string(r.name);
     sink.put_u64(r.type_code);
     sink.put_u64(r.is_nullable as u64);
@@ -90,7 +86,6 @@ pub fn write_col_tab_row(sink: &mut impl SysRowSink, r: &ColTabRow, weight: i64)
     sink.put_u64(r.is_hidden as u64);
     sink.put_u64(r.scale as u64);
     sink.end_row();
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

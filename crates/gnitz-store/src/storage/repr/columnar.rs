@@ -62,9 +62,15 @@ pub fn payload_bytes<S: RowSource>(src: &S, row: usize, pi: usize) -> &[u8] {
     gnitz_wire::german_string_content(cell, src.blob())
 }
 
-/// [`payload_bytes`] as a `String`; empty when not UTF-8.
+/// [`payload_bytes`] as a `&str`; empty when not UTF-8. The borrowed twin of
+/// [`payload_string`], for a consumer that only reads the cell.
+pub fn payload_str<S: RowSource>(src: &S, row: usize, pi: usize) -> &str {
+    std::str::from_utf8(payload_bytes(src, row, pi)).unwrap_or_default()
+}
+
+/// [`payload_str`] as an owned `String`, for a consumer that keeps the value.
 pub fn payload_string<S: RowSource>(src: &S, row: usize, pi: usize) -> String {
-    String::from_utf8(payload_bytes(src, row, pi).to_vec()).unwrap_or_default()
+    payload_str(src, row, pi).to_string()
 }
 
 /// Whether one row's payload slot `pi` holds NULL — the null-bit member of this

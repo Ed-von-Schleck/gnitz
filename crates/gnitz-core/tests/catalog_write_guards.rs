@@ -64,7 +64,7 @@ fn two_columns_as(owner_id: u64, owner_kind: u64) -> ZSetBatch {
     .iter()
     .enumerate()
     {
-        write_col_tab_row(&mut a, &cd.col_tab_row(owner_id, owner_kind, i), 1).unwrap();
+        write_col_tab_row(&mut a, &cd.col_tab_row(owner_id, owner_kind, i), 1);
     }
     b
 }
@@ -642,8 +642,7 @@ fn the_duplicate_visible_name_rule_holds_at_every_column_transition() {
         &mut BatchAppender::new(&mut appended, sc),
         &col_tab_row(tid, 2, "v", TypeCode::I64, true, false),
         1,
-    )
-    .unwrap();
+    );
     let err = format!("{:?}", s.push_ddl_txn(&[(COL_TAB, appended)]).unwrap_err());
     assert!(err.contains("duplicate column name"), "{err}");
 
@@ -651,8 +650,8 @@ fn the_duplicate_visible_name_rule_holds_at_every_column_transition() {
     // `name`, so it clears the pair mask and the retraction CAS.
     let mut renamed = ZSetBatch::new(sc);
     let mut a = BatchAppender::new(&mut renamed, sc);
-    write_col_tab_row(&mut a, &col_tab_row(tid, 1, "v", TypeCode::I64, false, false), -1).unwrap();
-    write_col_tab_row(&mut a, &col_tab_row(tid, 1, "id", TypeCode::I64, false, false), 1).unwrap();
+    write_col_tab_row(&mut a, &col_tab_row(tid, 1, "v", TypeCode::I64, false, false), -1);
+    write_col_tab_row(&mut a, &col_tab_row(tid, 1, "id", TypeCode::I64, false, false), 1);
     let err = format!("{:?}", s.push_ddl_txn(&[(COL_TAB, renamed)]).unwrap_err());
     assert!(err.contains("duplicate column name"), "{err}");
 
@@ -661,7 +660,7 @@ fn the_duplicate_visible_name_rule_holds_at_every_column_transition() {
     // because it is the one case that applies.
     let mut dropped = ZSetBatch::new(sc);
     let mut a = BatchAppender::new(&mut dropped, sc);
-    write_col_tab_row(&mut a, &col_tab_row(tid, 1, "v", TypeCode::I64, false, false), -1).unwrap();
-    write_col_tab_row(&mut a, &col_tab_row(tid, 1, "v", TypeCode::I64, false, true), 1).unwrap();
+    write_col_tab_row(&mut a, &col_tab_row(tid, 1, "v", TypeCode::I64, false, false), -1);
+    write_col_tab_row(&mut a, &col_tab_row(tid, 1, "v", TypeCode::I64, false, true), 1);
     s.push_ddl_txn(&[(COL_TAB, dropped)]).unwrap();
 }

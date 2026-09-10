@@ -15,7 +15,10 @@ use super::*;
 use gnitz_store::schema::make_index_schema;
 use gnitz_store::storage::{compare_rows, compare_rows_except};
 use gnitz_wire::MAX_COLUMNS;
-use gnitz_wire::{COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME};
+use gnitz_wire::{
+    COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_OWNER_KIND,
+    COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_NAME, SCHEMATAB_PAY_NAME,
+};
 
 /// The name rules a relation or index row must satisfy to be *stored*: non-empty
 /// `[A-Za-z0-9_]` and already canonical (every cache key here is compared
@@ -142,7 +145,7 @@ fn check_pk_multiplicity(family: SysFamily, sig: &PkSignature) -> Result<(), Str
 /// hooks take it straight off the ingested row and `raise_id_counter` it, and it
 /// is caller-chosen.
 fn check_id_range(family: SysFamily, sig: &PkSignature) -> Result<(), String> {
-    let id = sig.pk as i64;
+    let id = sig.leading;
     if family.first_user_id().is_some_and(|floor| id < floor) {
         return Err(format!(
             "cannot {} a system {} ({})",
@@ -183,22 +186,38 @@ fn check_pair_fields(family: SysFamily, batch: &Batch, sig: &PkSignature) -> Res
     Ok(())
 }
 
-/// A column record's payload must agree with its packed PK on which column of
-/// which owner it is, and on the owner's kind. Nothing else anchors those three
-/// fields, and they are what the FK cache and every client read back.
-fn check_col_ident(batch: &Batch, row: usize, expect_kind: i64) -> Result<(), String> {
-    let (owner_id, col_idx) = gnitz_wire::unpack_col_id(batch.get_pk(row) as u64);
-    let ident = read_col_tab_ident(batch, row);
-    if ident.owner_id != owner_id as i64 || ident.col_idx != col_idx {
-        return Err(format!(
-            "column record claims ({}, {}) but its packed id says (owner {owner_id}, column {col_idx})",
-            ident.owner_id, ident.col_idx
-        ));
+/// Every COL_TAB word `read_col_tab_row` narrows, against the width it narrows
+/// to. One that overflows decodes to something `write_col_tab_row` could never
+/// emit (`type_code` `0x104` → `4`), leaving a stored row no client can
+/// reproduce and so no later `-1` can retract. It also bounds the booleans to
+/// `{0, 1}` for the ALTER direction test below.
+fn check_col_narrowings(batch: &Batch, row: usize) -> Result<(), String> {
+    for (field, pi, max) in [
+        ("type_code", COLTAB_PAY_TYPE_CODE, u8::MAX as u64),
+        ("is_nullable", COLTAB_PAY_IS_NULLABLE, 1),
+        ("fk_col_idx", COLTAB_PAY_FK_COL_IDX, u32::MAX as u64),
+        ("is_serial", COLTAB_PAY_IS_SERIAL, 1),
+        ("is_hidden", COLTAB_PAY_IS_HIDDEN, 1),
+        ("scale", COLTAB_PAY_SCALE, u8::MAX as u64),
+    ] {
+        let w = payload_u64(batch, row, pi);
+        if w > max {
+            return Err(format!(
+                "column record carries {field} = {w}, past the {max} its stored width holds"
+            ));
+        }
     }
-    if ident.owner_kind != expect_kind {
+    Ok(())
+}
+
+/// A column record must agree with its owner on what that owner is: `owner_kind`
+/// alone decides whether the row declares a foreign key, so a view's columns
+/// claiming `OWNER_KIND_TABLE` would plant an unvalidated `FkEdge`.
+fn check_col_ident(batch: &Batch, row: usize, owner_id: i64, expect_kind: i64) -> Result<(), String> {
+    let kind = payload_u64(batch, row, COLTAB_PAY_OWNER_KIND) as i64;
+    if kind != expect_kind {
         return Err(format!(
-            "column record of owner {owner_id} declares owner_kind {}, which is not what that relation is",
-            ident.owner_kind
+            "column record of owner {owner_id} declares owner_kind {kind}, which is not what that relation is"
         ));
     }
     Ok(())
@@ -212,9 +231,13 @@ fn check_col_ident(batch: &Batch, row: usize, expect_kind: i64) -> Result<(), St
 /// vids; every retraction goes through `submit_cascade`, which skips this as it
 /// skips the arms.
 fn check_circuit_view_ids(batch: &Batch, new_view_ids: &[i64]) -> Result<(), String> {
-    for i in (0..batch.len()).filter(|&i| batch.get_weight(i) > 0) {
-        let (view_id, _sub) = unpack_circuit_pk(batch.get_pk(i));
-        if !new_view_ids.contains(&view_id) {
+    // Sorted once: this runs per row of a client-supplied block bounded only by
+    // the 64 MB frame.
+    let mut created: Vec<i64> = new_view_ids.to_vec();
+    created.sort_unstable();
+    for i in batch.live_rows() {
+        let view_id = gnitz_wire::unpack_pair_pk(batch.get_pk(i)).0 as i64;
+        if created.binary_search(&view_id).is_err() {
             return Err(format!(
                 "circuit row names view {view_id}, which this transaction does not create"
             ));
@@ -369,10 +392,11 @@ impl CatalogEngine {
     ///
     /// Returns the per-PK signatures and the PKs whose net is dead — the genuine
     /// drops, which the drop guards key on so a rename pair's net-live `-1` is
-    /// never read as one.
+    /// never read as one — a list only the single-column-key arms read, so it
+    /// carries the whole key rather than [`PkSignature::leading`].
     fn check_family_contract(&self, family: SysFamily, batch: &Batch) -> Result<(Vec<PkSignature>, Vec<i64>), String> {
         check_row_weights(family, batch)?;
-        let sigs = pk_signatures(batch);
+        let sigs = pk_signatures(family, batch);
         let mut net_dead: Vec<i64> = Vec::new();
         for sig in &sigs {
             check_pk_multiplicity(family, sig)?;
@@ -396,8 +420,11 @@ impl CatalogEngine {
     /// and under a dependent view because views bind columns by ordinal.
     fn precheck_column_family(&mut self, batch: &Batch, sigs: &[PkSignature]) -> Result<(), String> {
         for sig in sigs {
-            let (owner_id, col_idx) = gnitz_wire::unpack_col_id(sig.pk as u64);
-            let owner_id = owner_id as i64;
+            // COL_TAB PK = `(owner_id, col_idx)`.
+            let (owner_id, col_idx) = (sig.leading, sig.pk as u64);
+            for row in [sig.neg, sig.pos].into_iter().flatten() {
+                check_col_narrowings(batch, row)?;
+            }
 
             let Some((is_base, owner_schema)) = self
                 .registry
@@ -422,25 +449,19 @@ impl CatalogEngine {
 
             match (sig.neg, sig.pos) {
                 (Some(nj), Some(pj)) => {
-                    // Read raw rather than through `read_col_tab_row`'s `bool`:
-                    // this demands exactly 1, and the pair mask excludes both
-                    // slots from the contract's field comparison, so a payload
-                    // word of 2 would otherwise slip through a `!= 0` decode.
-                    let hid_old = payload_u64(batch, nj, COLTAB_PAY_IS_HIDDEN);
-                    let hid_new = payload_u64(batch, pj, COLTAB_PAY_IS_HIDDEN);
-                    let null_old = payload_u64(batch, nj, COLTAB_PAY_IS_NULLABLE);
-                    let null_new = payload_u64(batch, pj, COLTAB_PAY_IS_NULLABLE);
-                    // Direction: is_hidden / is_nullable only 0→1 (forward path).
-                    if hid_new != hid_old && !(hid_old == 0 && hid_new == 1) {
+                    // `check_col_narrowings` bounded these booleans to `{0, 1}`.
+                    let (old, new) = (read_col_tab_row(batch, nj), read_col_tab_row(batch, pj));
+                    // Direction: is_hidden / is_nullable only false→true.
+                    if new.is_hidden != old.is_hidden && !new.is_hidden {
                         return Err("a column-ALTER may only set is_hidden 0→1 (DROP COLUMN)".into());
                     }
-                    if null_new != null_old && !(null_old == 0 && null_new == 1) {
+                    if new.is_nullable != old.is_nullable && !new.is_nullable {
                         return Err("a column-ALTER may only set is_nullable 0→1 (DROP NOT NULL)".into());
                     }
-                    let prospective = self.col_defs_with(owner_id, col_idx, read_col_tab_row(batch, pj));
+                    let is_drop = (new.is_hidden && !old.is_hidden) || (new.is_nullable && !old.is_nullable);
+                    let prospective = self.col_defs_with(owner_id, col_idx, new);
                     check_col_defs(RelationKind::BaseTable, &prospective)
                         .map_err(|e| format!("cannot ALTER COLUMN on table {owner_id}: {e}"))?;
-                    let is_drop = (hid_old == 0 && hid_new == 1) || (null_old == 0 && null_new == 1);
                     if is_drop {
                         if owner_schema.is_pk_col(col_idx as usize) {
                             return Err("cannot DROP COLUMN / DROP NOT NULL on a primary-key column".into());
@@ -534,22 +555,29 @@ impl CatalogEngine {
         if appended.is_serial || appended.is_hidden || appended.fk_table_id != 0 {
             return Err("ADD COLUMN must not append a SERIAL, hidden, or foreign-key column".into());
         }
-        check_col_ident(batch, pj, OWNER_KIND_TABLE)
+        check_col_ident(batch, pj, owner_id, OWNER_KIND_TABLE)
     }
 
     /// A `+1` VIEW_TAB row's `owner_view_id` must name `0` (a user view), a view
     /// this bundle creates, or one the registry holds — the drop cascade keys on
     /// it, so a forged owner would point a cascade at nothing. Precheck-only:
     /// the paths that skip it replay rows this already accepted.
-    fn validate_view_owner(&self, vid: i64, name: &str, owner_view_id: i64, batch: &Batch) -> Result<(), String> {
+    /// A rewrite pair is absent from `sorted_creates` and needs no entry: it
+    /// renames a view that already exists, so it falls through to the registry.
+    fn validate_view_owner(
+        &self,
+        vid: i64,
+        name: &str,
+        owner_view_id: i64,
+        sorted_creates: &[i64],
+    ) -> Result<(), String> {
         if owner_view_id == 0 {
             return Ok(());
         }
         if owner_view_id == vid {
             return Err(format!("view '{name}' (vid={vid}) declares itself its own owner"));
         }
-        let in_bundle = (0..batch.len()).any(|j| batch.get_weight(j) > 0 && batch.get_pk(j) as i64 == owner_view_id);
-        if in_bundle || self.registry.has_id(owner_view_id) {
+        if sorted_creates.binary_search(&owner_view_id).is_ok() || self.registry.has_id(owner_view_id) {
             return Ok(());
         }
         Err(format!(
@@ -689,12 +717,12 @@ impl CatalogEngine {
             let Some(b) = families[family.index()].as_ref() else {
                 continue;
             };
-            for i in (0..b.len()).filter(|&i| b.get_weight(i) > 0) {
+            for i in b.live_rows() {
                 created.insert(b.get_pk(i) as i64, kind);
             }
         }
-        for i in (0..cols.len()).filter(|&i| cols.get_weight(i) > 0) {
-            let owner_id = gnitz_wire::unpack_col_id(cols.get_pk(i) as u64).0 as i64;
+        for i in cols.live_rows() {
+            let owner_id = gnitz_wire::unpack_pair_pk(cols.get_pk(i)).0 as i64;
             // What the catalog already says the owner is, else what this
             // transaction is making it.
             let owner_kind = self
@@ -714,7 +742,7 @@ impl CatalogEngine {
                          does not create and the catalog does not hold"
                     )
                 })?;
-            check_col_ident(cols, i, owner_kind)?;
+            check_col_ident(cols, i, owner_id, owner_kind)?;
         }
         Ok(())
     }
@@ -735,7 +763,7 @@ impl CatalogEngine {
         // unreachable, and dropping the reachable one deletes the orphan's
         // directory (the deletion is queued by name).
         let mut claimed: FxHashSet<String> = FxHashSet::default();
-        for i in (0..batch.len()).filter(|&i| batch.get_weight(i) > 0) {
+        for i in batch.live_rows() {
             let name = payload_string(batch, i, SCHEMATAB_PAY_NAME);
             // The full identifier rule, leading-`_` included: a schema name is
             // the one the engine interpolates into a filesystem path
@@ -769,8 +797,15 @@ impl CatalogEngine {
     fn precheck_relation_family(&mut self, family: SysFamily, batch: &Batch, net_dead: &[i64]) -> Result<(), String> {
         let is_table = family == SysFamily::Table;
         let mut claimed: FxHashSet<String> = FxHashSet::default();
+        // Sorted for `validate_view_owner`'s probe, which runs per `+1` row.
+        let mut view_creates: Vec<i64> = if is_table {
+            Vec::new()
+        } else {
+            family_pk_partition(family, batch).creates
+        };
+        view_creates.sort_unstable();
 
-        for i in (0..batch.len()).filter(|&i| batch.get_weight(i) > 0) {
+        for i in batch.live_rows() {
             let id = batch.get_pk(i) as i64;
 
             // Reject any gap/duplicate in the column-index sequence, which would
@@ -783,25 +818,23 @@ impl CatalogEngine {
             self.check_column_contiguity(id)?;
             let col_defs = self.read_column_defs(id);
             let (sid, name, pk, kind) = if is_table {
-                let (sid, name, pk, kind, _placement) =
-                    read_table_tab_row(batch, i).map_err(|e| format!("{e} (tid={id})"))?;
-                (sid, name, pk, kind)
+                let r = read_table_tab_row(batch, i).map_err(|e| format!("{e} (tid={id})"))?;
+                (r.schema_id, r.name, r.pk, r.kind)
             } else {
-                let (sid, name, pk, budgets, owner_view_id) =
-                    read_view_tab_row(batch, i).map_err(|e| format!("{e} (vid={id})"))?;
+                let v = read_view_tab_row(batch, i).map_err(|e| format!("{e} (vid={id})"))?;
                 // `topo_priority` applies CircuitNodes (2) before View (6) in a
                 // creating bundle, so the view's sources resolve here; an
                 // all-negative bundle sorts descending but carries no `+1` VIEW_TAB
                 // row to validate.
                 let source_ids = self.dag.get_source_ids(&self.registry, id);
-                self.validate_view_options(id, &name, budgets, owner_view_id, &source_ids)?;
-                self.validate_view_owner(id, &name, owner_view_id, batch)?;
-                (sid, name, pk, RelationKind::View)
+                self.validate_view_options(id, v.name, v.budgets, v.owner_view_id, &source_ids)?;
+                self.validate_view_owner(id, v.name, v.owner_view_id, &view_creates)?;
+                (v.schema_id, v.name, v.pk, RelationKind::View)
             };
             check_col_defs(kind, &col_defs)
                 .and_then(|()| validate_pk_against_cols(&col_defs, pk.as_slice()))
                 .map_err(|e| format!("{} '{name}' (id={id}) {e}", kind.noun()))?;
-            reject_unstorable_name(&name, kind.noun())?;
+            reject_unstorable_name(name, kind.noun())?;
 
             if is_table {
                 // A stream push must stay a pure append: SERIAL would draw from a
@@ -821,7 +854,7 @@ impl CatalogEngine {
                 self.validate_fk_columns(id, &col_defs, pk.as_slice())?;
             }
 
-            self.precheck_qname_unique(sid, &name, id, net_dead, &mut claimed)?;
+            self.precheck_qname_unique(sid, name, id, net_dead, &mut claimed)?;
         }
 
         if is_table {
@@ -870,7 +903,7 @@ impl CatalogEngine {
         // `index_by_name`, leaving one index live and unreachable.
         let mut claimed: FxHashSet<String> = FxHashSet::default();
         let noun = SysFamily::Index.row_noun();
-        for i in (0..batch.len()).filter(|&i| batch.get_weight(i) > 0) {
+        for i in batch.live_rows() {
             let (owner_id, cols, props) =
                 read_idx_tab_row(batch, i).map_err(|rule| format!("Index: column list {rule}"))?;
             let index_name = payload_string(batch, i, IDXTAB_PAY_NAME);
@@ -904,7 +937,7 @@ impl CatalogEngine {
             }
         }
 
-        for i in (0..batch.len()).filter(|&i| batch.get_weight(i) < 0) {
+        for i in batch.retracted_rows() {
             let (owner_id, cols, props) =
                 read_idx_tab_row(batch, i).map_err(|rule| format!("Index: column list {rule}"))?;
             // The row, not `net_dead`: this needs `is_internal` and `cols`, which

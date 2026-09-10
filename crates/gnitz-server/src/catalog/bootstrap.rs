@@ -1,6 +1,8 @@
 use super::*;
 use gnitz_foundation::env::env_num;
-use gnitz_wire::sys_rows::{write_schema_tab_row, SchemaTabRow};
+use gnitz_wire::sys_rows::{
+    write_col_tab_row, write_schema_tab_row, write_table_tab_row, ColTabRow, SchemaTabRow, TableTabRow,
+};
 
 impl CatalogEngine {
     // -- Open engine (main entry point) ------------------------------------
@@ -138,8 +140,17 @@ impl CatalogEngine {
         {
             let mut bb = BatchBuilder::new(*SysFamily::Table.schema());
             for family in SysFamily::ALL {
-                let pk = gnitz_wire::pack_pk_cols(family.wire().pk_cols);
-                push_table_tab_row(&mut bb, family.id(), SYSTEM_SCHEMA_ID, family.name(), pk, 0, 1);
+                write_table_tab_row(
+                    &mut bb,
+                    &TableTabRow {
+                        table_id: family.id() as u64,
+                        schema_id: SYSTEM_SCHEMA_ID as u64,
+                        name: family.name(),
+                        pk_col_idx: gnitz_wire::pack_pk_cols(family.wire().pk_cols),
+                        flags: 0,
+                    },
+                    1,
+                );
             }
             self.bootstrap_ingest(SysFamily::Table, bb)?;
         }
@@ -151,13 +162,23 @@ impl CatalogEngine {
             let mut bb = BatchBuilder::new(*SysFamily::Column.schema());
             for family in SysFamily::ALL {
                 for (i, c) in family.wire().cols.iter().enumerate() {
-                    let cd = ColumnDef {
-                        name: c.name.to_string(),
-                        type_code: c.type_code as u8,
-                        is_nullable: c.nullable,
-                        ..Default::default()
-                    };
-                    push_col_tab_row(&mut bb, family.id(), OWNER_KIND_TABLE, i as i64, &cd, 1);
+                    write_col_tab_row(
+                        &mut bb,
+                        &ColTabRow {
+                            owner_id: family.id() as u64,
+                            col_idx: i as u64,
+                            owner_kind: gnitz_wire::OWNER_KIND_TABLE,
+                            name: c.name,
+                            type_code: c.type_code as u64,
+                            is_nullable: c.nullable,
+                            fk_table_id: 0,
+                            fk_col_idx: 0,
+                            is_serial: false,
+                            is_hidden: false,
+                            scale: 0,
+                        },
+                        1,
+                    );
                 }
             }
             self.bootstrap_ingest(SysFamily::Column, bb)?;

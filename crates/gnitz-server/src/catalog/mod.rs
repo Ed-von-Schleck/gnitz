@@ -58,7 +58,7 @@ use gnitz_store::storage::{Batch, ReadCursor, Slot, StoreError};
 // ── Crate-wide facade — items with genuine out-of-catalog consumers ──────────
 // The DDL_TXN driver's bundle decoders: it resolves each family once, carries
 // the value, and reads back what the bundle created or dropped.
-pub(crate) use sys_tables::{family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates};
+pub(crate) use sys_tables::{family_pk_partition, idx_tab_partition, PkPartition};
 pub(crate) use sys_tables::{SysFamily, FIRST_USER_TABLE_ID, PUBLIC_SCHEMA_ID};
 pub(crate) use types::{ColumnDef, FkEdge};
 // The reply path's schema-wire-block encoders. The `SchemaWireEntry` they fill
@@ -80,11 +80,10 @@ pub(in crate::catalog) use gnitz_wire::validate_user_identifier;
 pub(in crate::catalog) use registry::raise_id_counter;
 // The child-directory grammar and the directory primitives are storage's; the
 // catalog only consumes them.
-pub(in crate::catalog) use gnitz_store::storage::fsync_dir;
 #[cfg(test)]
 pub(in crate::catalog) use gnitz_store::storage::ChildAddr;
 pub(in crate::catalog) use utils::{
-    circuit_opk, make_fk_index_name, preflight_dir, retract_key_range, retract_pk_list, schema_dir, sys_catalog_dir,
+    make_fk_index_name, pair_opk, preflight_dir, retract_key_range, retract_pk_list, schema_dir, sys_catalog_dir,
     sys_family_dir, sys_opk,
 };
 // The relation rung's directory primitives; the catalog only consumes them.
@@ -96,7 +95,7 @@ pub(in crate::catalog) use gnitz_store::relation::{
 pub(in crate::catalog) use gnitz_store::storage::BatchBuilder;
 // The generic payload-cell readers every system-row decoder in this subsystem
 // reads a cell through, whatever the row's source.
-pub(in crate::catalog) use gnitz_store::storage::{payload_string, payload_u64};
+pub(in crate::catalog) use gnitz_store::storage::{payload_str, payload_string, payload_u64};
 
 // ---------------------------------------------------------------------------
 // CatalogEngine

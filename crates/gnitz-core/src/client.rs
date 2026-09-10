@@ -1254,7 +1254,7 @@ impl GnitzClient {
             new_tid,
             OWNER_KIND_TABLE,
             columns,
-        )?;
+        );
 
         // TABLE_TAB family.
         let tbl_schema = sys_schema(TABLE_TAB);
@@ -1461,7 +1461,7 @@ impl GnitzClient {
                 };
 
                 // 1. Column records.
-                append_col_rows(&mut col_a, vid, OWNER_KIND_VIEW, &pv.output_columns)?;
+                append_col_rows(&mut col_a, vid, OWNER_KIND_VIEW, &pv.output_columns);
 
                 // 2. Circuit node rows.
                 append_circuit_rows(&mut nodes_a, vid, pv.circuit);
@@ -1700,7 +1700,7 @@ impl GnitzClient {
         let mut cb = ZSetBatch::new(col_s);
         {
             let mut a = BatchAppender::new(&mut cb, col_s);
-            gnitz_wire::sys_rows::write_col_tab_row(&mut a, &def.col_tab_row(tid, OWNER_KIND_TABLE, col_idx), 1)?;
+            gnitz_wire::sys_rows::write_col_tab_row(&mut a, &def.col_tab_row(tid, OWNER_KIND_TABLE, col_idx), 1);
         }
         self.push_ddl_txn(&[(COL_TAB, cb)])?;
         Ok(())
@@ -1714,8 +1714,8 @@ impl GnitzClient {
     /// The `-1` must be byte-equal to the stored row or the engine's CAS rejects
     /// the batch, which is why the columns come from this statement's own
     /// resolve of `tid` rather than from a caller-supplied `Schema`. That is
-    /// fail-safe either way: the `-1`'s PK is `pack_col_id(tid, col_idx)`, so a
-    /// wrong payload can only be rejected, never retract a different row.
+    /// fail-safe either way: the `-1`'s PK is `(tid, col_idx)`, so a wrong
+    /// payload can only be rejected, never retract a different row.
     fn alter_col_pair(
         &mut self,
         tid: u64,
@@ -1738,9 +1738,9 @@ impl GnitzClient {
         {
             let mut a = BatchAppender::new(&mut cb, col_s);
             let old_row = cd.col_tab_row(tid, OWNER_KIND_TABLE, col_idx);
-            gnitz_wire::sys_rows::write_col_tab_row(&mut a, &old_row, -1)?;
+            gnitz_wire::sys_rows::write_col_tab_row(&mut a, &old_row, -1);
             let new_row = new_cd.col_tab_row(tid, OWNER_KIND_TABLE, col_idx);
-            gnitz_wire::sys_rows::write_col_tab_row(&mut a, &new_row, 1)?;
+            gnitz_wire::sys_rows::write_col_tab_row(&mut a, &new_row, 1);
         }
         self.push_ddl_txn(&[(COL_TAB, cb)])?;
         Ok(())
@@ -2024,16 +2024,10 @@ fn checked_sys_rows(family: u64, reply: crate::connection::ScanReply) -> Result<
 }
 
 /// Append one `COL_TAB` row per column of `owner_id`, at `+1`.
-fn append_col_rows(
-    a: &mut BatchAppender<'_>,
-    owner_id: u64,
-    owner_kind: u64,
-    columns: &[ColumnDef],
-) -> Result<(), ClientError> {
+fn append_col_rows(a: &mut BatchAppender<'_>, owner_id: u64, owner_kind: u64, columns: &[ColumnDef]) {
     for (i, cd) in columns.iter().enumerate() {
-        gnitz_wire::sys_rows::write_col_tab_row(a, &cd.col_tab_row(owner_id, owner_kind, i), 1)?;
+        gnitz_wire::sys_rows::write_col_tab_row(a, &cd.col_tab_row(owner_id, owner_kind, i), 1);
     }
-    Ok(())
 }
 
 /// Append a circuit's node rows to the `CircuitNodes` batch appender under `vid`

@@ -21,7 +21,7 @@ use super::{
     await_barrier, decode_client_batch, guard_panic, park_until, request_quiesce, send_fault, send_msg, Shared,
     TickPark,
 };
-use crate::catalog::{family_pks_by_sign, idx_tab_drops, idx_tab_unique_creates, SysFamily};
+use crate::catalog::{family_pk_partition, idx_tab_partition, PkPartition, SysFamily};
 use crate::runtime::committer::BarrierKind;
 use crate::runtime::lsn::ZoneLsnAllocator;
 use crate::runtime::master::UniqueFilter;
@@ -123,6 +123,15 @@ pub(super) async fn hold_relay_for_ddl(shared: &Shared) {
 /// `SystemCatalog` relation is no ingestion point, and `ddl_sync` carries
 /// master-broadcast rows. The engine's own sequence writes reach `submit`
 /// through `submit` and never cross this decoder.
+/// [`family_pk_partition`] over a bundle slot, empty where the bundle carries no
+/// block for that family.
+fn partition_of(families: &[Option<Batch>; SysFamily::COUNT], family: SysFamily) -> PkPartition {
+    families[family.index()]
+        .as_ref()
+        .map(|b| family_pk_partition(family, b))
+        .unwrap_or_default()
+}
+
 fn decode_sys_family(tid: i64, slice: &[u8]) -> Result<(SysFamily, Batch), String> {
     let family = SysFamily::from_id(tid).ok_or_else(|| format!("{tid} is not a system family"))?;
     if !family.client_writable() {
@@ -205,13 +214,19 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
         }
     }
 
+    // Both signs of every family, up front: the ingest loop below consumes
+    // `families`, and the post-fsync reclamation needs the `-1` ids.
+    let views = partition_of(&families, SysFamily::View);
+    let tables = partition_of(&families, SysFamily::Table);
+    let indices = families[SysFamily::Index.index()]
+        .as_ref()
+        .map(idx_tab_partition)
+        .unwrap_or_default();
+
     // A CREATE VIEW is a stop-the-world op (source drain + distributed backfill,
     // reactor parked). The VIEW_TAB family's +1 rows, if any, are the new views;
     // they alone need the lock-held barrier and the in-loop source drain below.
-    let new_view_ids: Vec<i64> = families[SysFamily::View.index()]
-        .as_ref()
-        .map(|b| family_pks_by_sign(b, true))
-        .unwrap_or_default();
+    let new_view_ids = views.creates;
     let view_create = !new_view_ids.is_empty();
 
     // Drain the committer barrier BEFORE acquiring the catalog write lock. The
@@ -270,10 +285,11 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
     // IDX_TAB row layout (and the IDXTAB_PAY_* payload indices) is fixed by
     // `create_index` and read identically by `hook_index_register`.
     let mut filter_seeds: Vec<(i64, PkColList, UniqueFilter)> = Vec::new();
-    for (owner_id, cols) in families[SysFamily::Index.index()]
-        .as_ref()
-        .map(idx_tab_unique_creates)
-        .unwrap_or_default()
+    for (owner_id, cols) in indices
+        .creates
+        .into_iter()
+        .filter(|(_, _, props)| props.is_unique)
+        .map(|(owner_id, cols, _)| (owner_id, cols))
     {
         match shared
             .disp()
@@ -295,24 +311,6 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
     // (see `ZoneLsnAllocator::reserve` for why a drifted counter would dedup-drop
     // the zone on recovery).
     let zone_lsn = shared.open_zone(shared.cat().registry().max_current_lsn());
-
-    // The post-fsync reclamation needs the durably-dropped relation ids and
-    // (owner, column-list) pairs (the -1 rows); the ingest loop consumes
-    // `families`, so extract those minimal lists now instead of cloning the whole
-    // TABLE_TAB / VIEW_TAB / IDX_TAB batches. A bundle is one DDL, so at most one
-    // family carries -1 rows; a CREATE bundle yields empty lists.
-    let dropped_tids: Vec<i64> = families[SysFamily::Table.index()]
-        .as_ref()
-        .map(|b| family_pks_by_sign(b, false))
-        .unwrap_or_default();
-    let dropped_view_ids: Vec<i64> = families[SysFamily::View.index()]
-        .as_ref()
-        .map(|b| family_pks_by_sign(b, false))
-        .unwrap_or_default();
-    let dropped_indices: Vec<(i64, PkColList)> = families[SysFamily::Index.index()]
-        .as_ref()
-        .map(idx_tab_drops)
-        .unwrap_or_default();
 
     // Ingest the families in ascending topo order so every register/index hook
     // sees its dependencies already in the memtable. For a CREATE VIEW, drain the
@@ -409,16 +407,16 @@ async fn ddl_txn_body(shared: &Rc<Shared>, data: &[u8]) -> Result<(u64, usize), 
 
     // Invalidate unique-filter state for durably-dropped tables/indices so a
     // recreated table with the same ID does not inherit stale filter entries.
-    for &tid in &dropped_tids {
+    for &tid in &tables.drops {
         shared.disp().unique_filter_invalidate_table(tid);
     }
     // Relation ids are never reissued within a boot, so these entries are dead.
-    for &id in dropped_tids.iter().chain(&dropped_view_ids) {
+    for &id in tables.drops.iter().chain(&views.drops) {
         shared.forget_relation(&catalog_write, id);
     }
     // Keying by the whole column list means dropping `(a, b)` never clears a
     // distinct single-column filter on `a`.
-    for &(owner_id, cols) in &dropped_indices {
+    for &(owner_id, cols) in &indices.drops {
         shared.disp().unique_filter_remove(owner_id, cols);
     }
 

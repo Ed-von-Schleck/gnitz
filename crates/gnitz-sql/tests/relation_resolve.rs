@@ -212,7 +212,7 @@ fn an_unregistered_id_is_a_clean_miss() {
     for tid in [
         1_000_000_u64,                   // never allocated
         gnitz_wire::RELATION_ID_CEILING, // at the durable relation-id ceiling
-        1 << 55,                         // above the COL_TAB packing limit
+        1 << 55,                         // a plausible id no allocation reaches
         u64::MAX,                        // negative once cast to i64
         u64::MAX - 1,
     ] {

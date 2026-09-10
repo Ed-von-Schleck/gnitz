@@ -1,19 +1,5 @@
 use super::*;
 
-/// A COL_TAB key packs `(owner_id, col_idx)` into one word, so both halves
-/// must be bounded: an overflowing index or owner would alias another
-/// column's record rather than fail.
-#[test]
-fn col_id_packing_is_bounded_on_both_halves() {
-    assert!(pack_col_id(1, (1 << COL_ID_IDX_BITS) - 1).is_ok());
-    assert!(pack_col_id(1, 1 << COL_ID_IDX_BITS).is_err());
-    let max_owner = u64::MAX >> COL_ID_IDX_BITS;
-    assert!(pack_col_id(max_owner, 0).is_ok());
-    assert!(pack_col_id(max_owner + 1, 0).is_err());
-    assert!(pack_col_id(u64::MAX, 0).is_err());
-    assert_eq!(unpack_col_id(pack_col_id(12345, 7).unwrap()), (12345, 7));
-}
-
 /// Every system table's key must be admissible for its own column list. The
 /// pair is the thing both crates build from, so it is validated here rather
 /// than trusted at each derivation site. Swept over `SYS_FAMILIES` (plus the

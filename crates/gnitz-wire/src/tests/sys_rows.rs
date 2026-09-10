@@ -1,12 +1,12 @@
 use super::*;
 use crate::{
     CIRCNODES_PAY_INPUT_0, CIRCNODES_PAY_INPUT_1, CIRCNODES_PAY_OPCODE, CIRCNODES_PAY_PARAMS,
-    CIRCNODES_PAY_SOURCE_TABLE, CIRCUIT_NODES_COLS, COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID,
-    COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID,
-    COLTAB_PAY_OWNER_KIND, COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, COL_TAB_COLS, IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME,
-    IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, IDX_TAB_COLS, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB_COLS,
-    TABLE_TAB_COLS, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA,
-    VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX, VIEW_TAB_COLS,
+    CIRCNODES_PAY_SOURCE_TABLE, CIRCUIT_NODES_COLS, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID,
+    COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_KIND,
+    COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, COL_TAB_COLS, IDXTAB_PAY_FLAGS, IDXTAB_PAY_NAME, IDXTAB_PAY_OWNER_ID,
+    IDXTAB_PAY_SOURCE_COLS, IDX_TAB_COLS, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, SCHEMA_TAB_COLS, TABLE_TAB_COLS,
+    TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_OWNER_VIEW_ID,
+    VIEWTAB_PAY_PK_COL_IDX, VIEW_TAB_COLS,
 };
 
 /// A sink that records what a writer emitted, so the tests below read the
@@ -66,13 +66,11 @@ impl Recorder {
 /// is read off the struct, so the check cannot itself transpose a pair.
 fn assert_col_tab_slots(r: &ColTabRow, weight: i64) {
     let mut rec = Recorder::default();
-    write_col_tab_row(&mut rec, r, weight).unwrap();
-    assert_eq!(rec.pk, [pack_col_id(r.owner_id, r.col_idx).unwrap() as u128]);
+    write_col_tab_row(&mut rec, r, weight);
+    assert_eq!(rec.pk, [r.owner_id as u128, r.col_idx as u128]);
     assert_eq!(rec.weight, weight);
-    let v = rec.row(COL_TAB_COLS, 1);
-    assert_eq!(v[COLTAB_PAY_OWNER_ID], Val::U64(r.owner_id));
+    let v = rec.row(COL_TAB_COLS, 2); // compound PK: two key columns
     assert_eq!(v[COLTAB_PAY_OWNER_KIND], Val::U64(r.owner_kind));
-    assert_eq!(v[COLTAB_PAY_COL_IDX], Val::U64(r.col_idx));
     assert_eq!(v[COLTAB_PAY_NAME], Val::Str(r.name.into()));
     assert_eq!(v[COLTAB_PAY_TYPE_CODE], Val::U64(r.type_code));
     assert_eq!(v[COLTAB_PAY_IS_NULLABLE], Val::U64(r.is_nullable as u64));
@@ -228,31 +226,4 @@ fn values_land_in_their_named_payload_slots() {
     assert_eq!(v[CIRCNODES_PAY_INPUT_0], Val::U64(4));
     assert_eq!(v[CIRCNODES_PAY_INPUT_1], Val::Null);
     assert_eq!(v[CIRCNODES_PAY_PARAMS], Val::Null);
-}
-
-/// A column index past the packed key's own field would alias another column's
-/// record, so the writer refuses it rather than emitting the row.
-#[test]
-fn a_col_idx_that_would_alias_another_record_is_rejected() {
-    let mut r = Recorder::default();
-    let err = write_col_tab_row(
-        &mut r,
-        &ColTabRow {
-            owner_id: 16,
-            owner_kind: 0,
-            col_idx: 1 << crate::COL_ID_IDX_BITS,
-            name: "c",
-            type_code: 4,
-            is_nullable: false,
-            fk_table_id: 0,
-            fk_col_idx: 0,
-            is_serial: false,
-            is_hidden: false,
-            scale: 0,
-        },
-        1,
-    )
-    .unwrap_err();
-    assert!(err.contains("exceeds maximum"), "{err}");
-    assert!(r.vals.is_empty(), "a rejected row must emit nothing");
 }

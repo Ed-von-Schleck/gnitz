@@ -166,10 +166,8 @@ fn ddl_txn_roundtrip_client_to_server() {
         {
             let mut a = BatchAppender::new(&mut b, s);
             for i in 0..n {
-                a.add_row(gnitz_wire::pack_col_id(oid, i as u64).unwrap() as u128, 1)
-                    .u64_val(oid)
+                a.add_row_cols(&[oid as u128, i as u128], 1)
                     .u64_val(kind)
-                    .u64_val(i as u64)
                     .str_val(&format!("c{i}"))
                     .u64_val(4) // type_code U64
                     .u64_val(0) // is_nullable
@@ -206,9 +204,9 @@ fn ddl_txn_roundtrip_client_to_server() {
     };
 
     // Verify a bundle roundtrips: family count, order (tid), per-row weight,
-    // and — for single-PK families — the PK. `check_pk` skips the compound-PK
-    // circuit family whose engine `get_pk` returns the packed narrow key
-    // rather than the client's low/high u128 layout.
+    // and — where `check_pk` says so — the PK. It is off for the compound-PK
+    // families, whose two scalar forms differ (the engine reads the widened key
+    // high-half-first, the client low-half-first) over identical wire bytes.
     let verify = |families: &[(u64, ZSetBatch)], check_pk: &[bool]| {
         let payload = gnitz_core::protocol::encode_ddl_txn(0xABCD, families);
         let decoded = decode_ddl_txn(&payload).expect("decode_ddl_txn");
@@ -243,7 +241,7 @@ fn ddl_txn_roundtrip_client_to_server() {
     // 2-family: CREATE TABLE (COL_TAB + TABLE_TAB).
     verify(
         &[(COL_TAB, col_batch(17, 0, 2)), (TABLE_TAB, table_batch(17, 1))],
-        &[true, true],
+        &[false, true],
     );
 
     // 3-family: CREATE TABLE + inline UNIQUE index (COL_TAB + TABLE_TAB + IDX_TAB).
@@ -253,7 +251,7 @@ fn ddl_txn_roundtrip_client_to_server() {
             (TABLE_TAB, table_batch(18, 1)),
             (IDX_TAB, idx_batch(100, 18)),
         ],
-        &[true, true, true],
+        &[false, true, true],
     );
 
     // 5-family: CREATE VIEW (COL + 3 circuit + VIEW). The compound-PK
@@ -304,7 +302,7 @@ fn ddl_txn_roundtrip_client_to_server() {
             (CIRCUIT_NODES_TAB, nodes),
             (VIEW_TAB, view),
         ],
-        // Skip pk check on the compound-PK circuit family.
-        &[true, false, true],
+        // Skip the pk check on the two compound-PK families.
+        &[false, false, true],
     );
 }

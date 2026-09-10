@@ -538,6 +538,17 @@ impl Batch {
     pub fn get_weight(&self, row: usize) -> i64 {
         read_i64_le(&self.data[self.offsets[REG_WEIGHT]..], row * FIXED_REGION_BYTES)
     }
+    /// Indices of the live rows — those at positive weight, the elements the
+    /// batch asserts. Twin of `ZSetBatch::live_rows` in `gnitz-core`.
+    #[inline(always)]
+    pub fn live_rows(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.count).filter(move |&i| self.get_weight(i) > 0)
+    }
+    /// Indices of the retracted rows — those at negative weight.
+    #[inline(always)]
+    pub fn retracted_rows(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.count).filter(move |&i| self.get_weight(i) < 0)
+    }
     /// Apply `f` to every row's weight in place. Generic so the per-epoch
     /// callers (negate, delta doubling) monomorphize to a tight loop. The
     /// layout tag is untouched: callers pass sign-preserving maps (negation,

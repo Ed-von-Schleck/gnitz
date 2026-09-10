@@ -21,13 +21,14 @@ mod wide_pk_validation;
 
 use super::sys_tables::*;
 use super::*;
-use gnitz_wire::type_code;
+use gnitz_wire::{pack_pk_cols, type_code, PK_LIST_PACKED_FLAG};
 
 use std::fs;
 
 use crate::test_support::{
-    col_def, fk_def, nullable_def, opk_pk, pk_payload_schema, push_view_tab_row, register_identity_view, scratch_dir,
-    sum_weights, try_register_identity_view, uuid_def, write_circuit_chain, write_identity_circuit,
+    col_def, fk_def, idx_tab_batch, nullable_def, opk_pk, pk_payload_schema, push_col_tab_row, push_table_tab_row,
+    push_view_tab_row, register_identity_view, scratch_dir, sum_weights, try_register_identity_view, uuid_def,
+    write_circuit_chain, write_identity_circuit,
 };
 
 /// Live rows carrying a net NEGATIVE weight — §1 positivity says a base table
@@ -42,6 +43,21 @@ fn count_negative_records(mut c: ReadCursor) -> usize {
         c.advance();
     }
     count
+}
+
+/// Every stored weight under `idx_id` in IDX_TAB: empty once a `(+1, -1)` pair
+/// has cancelled, `[1]` for a live index, `[-1]` for a durable ghost — which
+/// [`count_records`], gating on `current_weight > 0`, cannot see at all.
+fn idx_weights_for(engine: &CatalogEngine, idx_id: i64) -> Vec<i64> {
+    let mut c = engine.sys_relation(SysFamily::Index).cursor();
+    let mut v = Vec::new();
+    while c.valid {
+        if c.current_key_narrow() as i64 == idx_id {
+            v.push(c.current_weight);
+        }
+        c.advance();
+    }
+    v
 }
 
 fn count_records(mut c: ReadCursor) -> usize {

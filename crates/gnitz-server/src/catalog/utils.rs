@@ -31,6 +31,7 @@ pub(in crate::catalog) fn schema_dir(base_dir: &str, schema_name: &str) -> Strin
 /// directory, so the boot orphan sweep (which scans only registered schema
 /// names) never reaches it.
 pub(in crate::catalog) fn sys_catalog_dir(base_dir: &str) -> String {
+    const SYS_CATALOG_DIRNAME: &str = "_system_catalog";
     format!("{base_dir}/{SYS_CATALOG_DIRNAME}")
 }
 
@@ -57,8 +58,8 @@ pub(in crate::catalog) fn preflight_dir(base_dir: &str, schema_name: &str, vid: 
 
 /// Emit a weight=−1 batch of every live row of `table` in the OPK key range
 /// `[start, end)` (`end` `None` = unbounded above). The band-bounded half of the
-/// catalog's retraction pair — one owner's packed column ids, or one view's
-/// `view_id` prefix; [`retract_pk_list`] is the key-list half. Both take
+/// catalog's retraction pair — one owner's column records, or one view's circuit
+/// rows; [`retract_pk_list`] is the key-list half. Both take
 /// their bounds through `schema::key`, so no call site re-derives the OPK layout.
 /// The output batch is in `rel`'s own schema — a caller cannot hand it one the
 /// rows it copies are not laid out in.
@@ -72,20 +73,20 @@ pub(in crate::catalog) fn retract_key_range(rel: &Relation, start: &[u8], end: &
     batch
 }
 
-/// The OPK image of a **single-column** native system-table PK: a U64 id, or
-/// COL_TAB's packed `(owner_id, col_idx)` word. The two-column circuit key has
-/// its own [`circuit_opk`].
+/// The OPK image of a **single-column** native system-table PK: a U64 id. A
+/// two-column key — COL_TAB's `(owner_id, col_idx)`, the circuit family's
+/// `(view_id, node_id)` — has its own [`pair_opk`].
 pub(in crate::catalog) fn sys_opk(schema: &SchemaDescriptor, pk: u128) -> gnitz_store::schema::key::PkBuf {
     gnitz_store::schema::key::opk_key_cols(schema, &[pk])
 }
 
-/// The OPK image of a circuit row's compound PK `(view_id, node_id)`.
-pub(in crate::catalog) fn circuit_opk(
+/// The OPK image of a pair-keyed system row's compound PK.
+pub(in crate::catalog) fn pair_opk(
     schema: &SchemaDescriptor,
-    view_id: i64,
-    node_id: u64,
+    leading: i64,
+    trailing: u64,
 ) -> gnitz_store::schema::key::PkBuf {
-    gnitz_store::schema::key::opk_key_cols(schema, &[view_id as u64 as u128, node_id as u128])
+    gnitz_store::schema::key::opk_key_cols(schema, &[leading as u64 as u128, trailing as u128])
 }
 
 /// Emit a weight=−1 batch of the live rows of `table` at `ids`; an id with no

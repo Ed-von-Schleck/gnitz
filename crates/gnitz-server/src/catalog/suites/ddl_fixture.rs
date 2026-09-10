@@ -8,6 +8,8 @@
 //! so a unit test can reach the same appliers without a server.
 
 use super::super::*;
+use crate::test_support::{idx_tab_batch, push_col_tab_row, push_table_tab_row};
+use gnitz_wire::pack_pk_cols;
 use gnitz_wire::sys_rows::{write_schema_tab_row, SchemaTabRow};
 
 /// Split `schema.name`, defaulting the schema half. Only these direct entry

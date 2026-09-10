@@ -50,37 +50,41 @@ pub const fn col_index_in(cols: &[WireSysCol], name: &str) -> usize {
     panic!("column not found")
 }
 
-/// Dense **payload** index of the column named `name` in `cols` — its position
-/// among the non-PK columns, which is the slot the null bitmap and the payload
-/// region directory address it by.
+/// Dense **payload** index of `name` in `cols` — its position among the non-PK
+/// columns, which is the slot the null bitmap and the payload region address it
+/// by. Takes `pk_cols` itself rather than a count so a list and its key cannot
+/// be stated apart, and so the leading-key precondition is checkable.
 ///
-/// Valid only for a column list whose primary key is the single leading column,
-/// where the payload index collapses to `col_index_in(..) - 1`. Every list this
-/// is called with is one (`SCHEMA_TAB`, `TABLE_TAB`, `VIEW_TAB`, `COL_TAB`,
-/// `IDX_TAB`, `SEQ_TAB`, and the IPC control block); the compound-PK lists
-/// (the circuit family) renumbers around *every* PK position, so the closed
-/// form does not hold for them and this must not be used there. The
-/// `assert!` rejects the PK column itself, and `col_index_in`'s own const-eval
-/// panic covers a renamed column — both at compile time.
-pub(crate) const fn pay_index_in(cols: &[WireSysCol], name: &str) -> usize {
-    pay_index_in_keyed(cols, name, LEADING_COL_PK)
-}
-
-/// [`pay_index_in`] for a family whose key is its leading `pk_cols` columns —
-/// the payload index is the column index less the key arity, so a compound key
-/// shifts every payload slot by more than one. Takes the family's own `pk_cols`
-/// rather than a count so the two cannot be stated apart.
+/// Every failure is a const-eval panic: a non-leading key, `name` naming a PK
+/// column, and — through `col_index_in` — a renamed one.
 pub(crate) const fn pay_index_in_keyed(cols: &[WireSysCol], name: &str, pk_cols: &[u32]) -> usize {
+    // `ci - pk_cols.len()` is the payload index only for a leading key; any
+    // other renumbers around each PK position.
+    let mut k = 0;
+    while k < pk_cols.len() {
+        assert!(pk_cols[k] as usize == k, "a payload index needs a leading key");
+        k += 1;
+    }
     let ci = col_index_in(cols, name);
     assert!(ci >= pk_cols.len(), "a PK column has no payload index");
     ci - pk_cols.len()
 }
 
-/// Region index of the payload column named `name`: the fixed regions,
-/// then the payload columns in schema order. Same leading-PK restriction as
-/// [`pay_index_in`].
+/// [`pay_index_in_keyed`] against the column list and key of system family `id`,
+/// so a `*_PAY_*` constant names one family and cannot pair a list with a key
+/// that is not its own.
+pub(crate) const fn pay_index_in_fam(id: u64, name: &str) -> usize {
+    let f = &SYS_FAMILIES[match sys_family_index(id) {
+        Some(i) => i,
+        None => panic!("not a system family"),
+    }];
+    pay_index_in_keyed(f.cols, name, f.pk_cols)
+}
+
+/// Region index of the payload column named `name` in a single-leading-key list:
+/// the fixed regions, then the payload columns in schema order.
 pub(crate) const fn payload_region_in(cols: &[WireSysCol], name: &str) -> usize {
-    crate::REG_PAYLOAD_START + pay_index_in(cols, name)
+    crate::REG_PAYLOAD_START + pay_index_in_keyed(cols, name, LEADING_COL_PK)
 }
 
 // Every system table's column shape is defined once, here, and reached through
@@ -93,6 +97,18 @@ pub(crate) const fn payload_region_in(cols: &[WireSysCol], name: &str) -> usize 
 
 /// The primary key of every system table whose key is its single leading column.
 pub(crate) const LEADING_COL_PK: &[u32] = &[0];
+
+/// The primary key of every system table keyed by its two leading columns:
+/// COL_TAB's `(owner_id, col_idx)` and the circuit family's `(view_id, node_id)`.
+pub(crate) const LEADING_PAIR_PK: &[u32] = &[0, 1];
+
+/// The two halves of a `LEADING_PAIR_PK` key, off the widened `u128` a PK
+/// region reads back to. Both columns are `U64` — asserted over
+/// [`SYS_FAMILIES`] below — so the split is exact.
+#[inline]
+pub const fn unpack_pair_pk(pk: u128) -> (u64, u64) {
+    ((pk >> 64) as u64, pk as u64)
+}
 
 pub(crate) const SCHEMA_TAB_COLS: &[WireSysCol] = &[
     col("schema_id", TypeCode::U64, false),
@@ -133,11 +149,12 @@ pub(crate) const VIEW_TAB_COLS: &[WireSysCol] = &[
     col("owner_view_id", TypeCode::U64, false),
 ];
 
+// Keyed by the compound `(owner_id, col_idx)` — the pair *is* a column record's
+// identity.
 pub(crate) const COL_TAB_COLS: &[WireSysCol] = &[
-    col("column_id", TypeCode::U64, false),
     col("owner_id", TypeCode::U64, false),
-    col("owner_kind", TypeCode::U64, false),
     col("col_idx", TypeCode::U64, false),
+    col("owner_kind", TypeCode::U64, false),
     col("name", TypeCode::String, false),
     col("type_code", TypeCode::U64, false),
     col("is_nullable", TypeCode::U64, false),
@@ -220,17 +237,17 @@ pub const CIRCUIT_NODES_COLS: &[WireSysCol] = &[
 // `ZSetBatch::columns[..]`, and nothing else reads it.
 
 pub const SCHEMATAB_COL_NAME: usize = col_index_in(SCHEMA_TAB_COLS, "name");
-pub const SCHEMATAB_PAY_NAME: usize = pay_index_in(SCHEMA_TAB_COLS, "name");
+pub const SCHEMATAB_PAY_NAME: usize = pay_index_in_fam(SCHEMA_TAB, "name");
 
 pub const TABTAB_COL_FLAGS: usize = col_index_in(TABLE_TAB_COLS, "flags");
-pub const TABTAB_PAY_PK_COL_IDX: usize = pay_index_in(TABLE_TAB_COLS, "pk_col_idx");
-pub const TABTAB_PAY_FLAGS: usize = pay_index_in(TABLE_TAB_COLS, "flags");
+pub const TABTAB_PAY_PK_COL_IDX: usize = pay_index_in_fam(TABLE_TAB, "pk_col_idx");
+pub const TABTAB_PAY_FLAGS: usize = pay_index_in_fam(TABLE_TAB, "flags");
 
-pub const VIEWTAB_PAY_PK_COL_IDX: usize = pay_index_in(VIEW_TAB_COLS, "pk_col_idx");
-pub const VIEWTAB_PAY_CAPACITY: usize = pay_index_in(VIEW_TAB_COLS, "capacity_bytes");
-pub const VIEWTAB_PAY_DELTA: usize = pay_index_in(VIEW_TAB_COLS, "delta_bytes");
+pub const VIEWTAB_PAY_PK_COL_IDX: usize = pay_index_in_fam(VIEW_TAB, "pk_col_idx");
+pub const VIEWTAB_PAY_CAPACITY: usize = pay_index_in_fam(VIEW_TAB, "capacity_bytes");
+pub const VIEWTAB_PAY_DELTA: usize = pay_index_in_fam(VIEW_TAB, "delta_bytes");
 pub const VIEWTAB_COL_OWNER_VIEW_ID: usize = col_index_in(VIEW_TAB_COLS, "owner_view_id");
-pub const VIEWTAB_PAY_OWNER_VIEW_ID: usize = pay_index_in(VIEW_TAB_COLS, "owner_view_id");
+pub const VIEWTAB_PAY_OWNER_VIEW_ID: usize = pay_index_in_fam(VIEW_TAB, "owner_view_id");
 
 // `RELTAB_*`: an address valid in TABLE_TAB and VIEW_TAB alike, for the readers
 // that take either family through one code path. A column at the same slot in
@@ -244,53 +261,65 @@ const fn shared_col_index(a: &[WireSysCol], b: &[WireSysCol], name: &str) -> usi
     i
 }
 
-/// [`shared_col_index`] in the payload index space.
-const fn shared_pay_index(a: &[WireSysCol], b: &[WireSysCol], name: &str) -> usize {
-    let i = pay_index_in(a, name);
-    assert!(i == pay_index_in(b, name), "the two families disagree on this column");
+/// [`shared_col_index`] in the payload index space, over two families rather
+/// than two column lists — each half then carries its own key.
+const fn shared_pay_index(a: u64, b: u64, name: &str) -> usize {
+    let i = pay_index_in_fam(a, name);
+    assert!(
+        i == pay_index_in_fam(b, name),
+        "the two families disagree on this column"
+    );
     i
 }
 
 pub const RELTAB_COL_SCHEMA_ID: usize = shared_col_index(TABLE_TAB_COLS, VIEW_TAB_COLS, "schema_id");
 pub const RELTAB_COL_NAME: usize = shared_col_index(TABLE_TAB_COLS, VIEW_TAB_COLS, "name");
-pub const RELTAB_PAY_SCHEMA_ID: usize = shared_pay_index(TABLE_TAB_COLS, VIEW_TAB_COLS, "schema_id");
-pub const RELTAB_PAY_NAME: usize = shared_pay_index(TABLE_TAB_COLS, VIEW_TAB_COLS, "name");
+pub const RELTAB_PAY_SCHEMA_ID: usize = shared_pay_index(TABLE_TAB, VIEW_TAB, "schema_id");
+pub const RELTAB_PAY_NAME: usize = shared_pay_index(TABLE_TAB, VIEW_TAB, "name");
 
-pub const COLTAB_PAY_OWNER_ID: usize = pay_index_in(COL_TAB_COLS, "owner_id");
-pub const COLTAB_PAY_OWNER_KIND: usize = pay_index_in(COL_TAB_COLS, "owner_kind");
-pub const COLTAB_PAY_COL_IDX: usize = pay_index_in(COL_TAB_COLS, "col_idx");
-pub const COLTAB_PAY_NAME: usize = pay_index_in(COL_TAB_COLS, "name");
-pub const COLTAB_PAY_TYPE_CODE: usize = pay_index_in(COL_TAB_COLS, "type_code");
-pub const COLTAB_PAY_IS_SERIAL: usize = pay_index_in(COL_TAB_COLS, "is_serial");
-pub const COLTAB_PAY_FK_TABLE_ID: usize = pay_index_in(COL_TAB_COLS, "fk_table_id");
-pub const COLTAB_PAY_FK_COL_IDX: usize = pay_index_in(COL_TAB_COLS, "fk_col_idx");
-pub const COLTAB_PAY_IS_NULLABLE: usize = pay_index_in(COL_TAB_COLS, "is_nullable");
-pub const COLTAB_PAY_IS_HIDDEN: usize = pay_index_in(COL_TAB_COLS, "is_hidden");
-pub const COLTAB_PAY_SCALE: usize = pay_index_in(COL_TAB_COLS, "scale");
+pub const COLTAB_PAY_OWNER_KIND: usize = pay_index_in_fam(COL_TAB, "owner_kind");
+pub const COLTAB_PAY_NAME: usize = pay_index_in_fam(COL_TAB, "name");
+pub const COLTAB_PAY_TYPE_CODE: usize = pay_index_in_fam(COL_TAB, "type_code");
+pub const COLTAB_PAY_IS_SERIAL: usize = pay_index_in_fam(COL_TAB, "is_serial");
+pub const COLTAB_PAY_FK_TABLE_ID: usize = pay_index_in_fam(COL_TAB, "fk_table_id");
+pub const COLTAB_PAY_FK_COL_IDX: usize = pay_index_in_fam(COL_TAB, "fk_col_idx");
+pub const COLTAB_PAY_IS_NULLABLE: usize = pay_index_in_fam(COL_TAB, "is_nullable");
+pub const COLTAB_PAY_IS_HIDDEN: usize = pay_index_in_fam(COL_TAB, "is_hidden");
+pub const COLTAB_PAY_SCALE: usize = pay_index_in_fam(COL_TAB, "scale");
 
-pub const CIRCNODES_PAY_OPCODE: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "opcode", CIRCUIT_FAMILY_PK);
-pub const CIRCNODES_PAY_SOURCE_TABLE: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "source_table", CIRCUIT_FAMILY_PK);
-pub const CIRCNODES_PAY_INPUT_0: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "input_0", CIRCUIT_FAMILY_PK);
-pub const CIRCNODES_PAY_INPUT_1: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "input_1", CIRCUIT_FAMILY_PK);
-pub const CIRCNODES_PAY_PARAMS: usize = pay_index_in_keyed(CIRCUIT_NODES_COLS, "params", CIRCUIT_FAMILY_PK);
+pub const CIRCNODES_PAY_OPCODE: usize = pay_index_in_fam(CIRCUIT_NODES_TAB, "opcode");
+pub const CIRCNODES_PAY_SOURCE_TABLE: usize = pay_index_in_fam(CIRCUIT_NODES_TAB, "source_table");
+pub const CIRCNODES_PAY_INPUT_0: usize = pay_index_in_fam(CIRCUIT_NODES_TAB, "input_0");
+pub const CIRCNODES_PAY_INPUT_1: usize = pay_index_in_fam(CIRCUIT_NODES_TAB, "input_1");
+pub const CIRCNODES_PAY_PARAMS: usize = pay_index_in_fam(CIRCUIT_NODES_TAB, "params");
 
 pub const IDXTAB_COL_SOURCE_COLS: usize = col_index_in(IDX_TAB_COLS, "source_col_idx");
 pub const IDXTAB_COL_NAME: usize = col_index_in(IDX_TAB_COLS, "name");
-pub const IDXTAB_PAY_OWNER_ID: usize = pay_index_in(IDX_TAB_COLS, "owner_id");
-pub const IDXTAB_PAY_SOURCE_COLS: usize = pay_index_in(IDX_TAB_COLS, "source_col_idx");
-pub const IDXTAB_PAY_NAME: usize = pay_index_in(IDX_TAB_COLS, "name");
-pub const IDXTAB_PAY_FLAGS: usize = pay_index_in(IDX_TAB_COLS, "flags");
+pub const IDXTAB_PAY_OWNER_ID: usize = pay_index_in_fam(IDX_TAB, "owner_id");
+pub const IDXTAB_PAY_SOURCE_COLS: usize = pay_index_in_fam(IDX_TAB, "source_col_idx");
+pub const IDXTAB_PAY_NAME: usize = pay_index_in_fam(IDX_TAB, "name");
+pub const IDXTAB_PAY_FLAGS: usize = pay_index_in_fam(IDX_TAB, "flags");
 
-pub const SEQTAB_PAY_VALUE: usize = pay_index_in(SEQ_TAB_COLS, "next_val");
+pub const SEQTAB_PAY_VALUE: usize = pay_index_in_fam(SEQ_TAB, "next_val");
 
 // ---------------------------------------------------------------------------
 // Stored-shape digest
 // ---------------------------------------------------------------------------
 
-/// FNV-1a over one family's column shape — each column's name, type and
-/// nullability, then its key columns.
-const fn fold_family(mut h: u64, cols: &[WireSysCol], pk: &[u32]) -> u64 {
+/// FNV-1a over one family's stored identity: its id, its shard directory
+/// (`name`), each column's name/type/nullability, and its key columns. Renaming
+/// a family orphans its shards and boots on an empty store, which is why `name`
+/// is in here.
+const fn fold_family(mut h: u64, f: &WireSysFamily) -> u64 {
     const PRIME: u64 = 0x100_0000_01b3;
+    let (cols, pk) = (f.cols, f.pk_cols);
+    h = (h ^ f.id).wrapping_mul(PRIME);
+    let dir = f.name.as_bytes();
+    let mut d = 0;
+    while d < dir.len() {
+        h = (h ^ dir[d] as u64).wrapping_mul(PRIME);
+        d += 1;
+    }
     let mut i = 0;
     while i < cols.len() {
         let name = cols[i].name.as_bytes();
@@ -319,7 +348,7 @@ const fn fold_family(mut h: u64, cols: &[WireSysCol], pk: &[u32]) -> u64 {
 /// [`crate::wal::WAL_FORMAT_VERSION`] is hand-bumped and its test pins the pair,
 /// so a change reaching only the SAL side fails until that bump happens.
 ///
-/// The column half is folded straight over [`SYS_FAMILIES`], so a family added
+/// The family half is folded straight over [`SYS_FAMILIES`], so a family added
 /// there is covered without a second edit. The version consts cover what that
 /// fold cannot see: a `Blob` column's bytes are as durable as its neighbours',
 /// but its internal layout is invisible to a fold over names and types.
@@ -328,7 +357,7 @@ pub const SYS_SCHEMA_DIGEST: u64 = {
     let mut h = 0xcbf2_9ce4_8422_2325;
     let mut i = 0;
     while i < SYS_FAMILIES.len() {
-        h = fold_family(h, SYS_FAMILIES[i].cols, SYS_FAMILIES[i].pk_cols);
+        h = fold_family(h, &SYS_FAMILIES[i]);
         i += 1;
     }
     h = (h ^ crate::circuit::CIRCUIT_PARAMS_VERSION as u64).wrapping_mul(PRIME);
@@ -347,9 +376,6 @@ pub const COL_TAB: u64 = 4;
 pub const IDX_TAB: u64 = 5;
 pub const SEQ_TAB: u64 = 7;
 pub const CIRCUIT_NODES_TAB: u64 = 11;
-
-/// The circuit family's compound primary key: columns `(view_id, node_id)`.
-pub const CIRCUIT_FAMILY_PK: &[u32] = &[0, 1];
 
 /// One system family's wire identity: the table id both sides address it by,
 /// its name, and the column shape they each build their schema type from.
@@ -372,16 +398,28 @@ pub const SYS_FAMILIES: &[WireSysFamily] = &[
     fam(SCHEMA_TAB, "_schemas", SCHEMA_TAB_COLS, LEADING_COL_PK),
     fam(TABLE_TAB, "_tables", TABLE_TAB_COLS, LEADING_COL_PK),
     fam(VIEW_TAB, "_views", VIEW_TAB_COLS, LEADING_COL_PK),
-    fam(COL_TAB, "_columns", COL_TAB_COLS, LEADING_COL_PK),
+    fam(COL_TAB, "_columns", COL_TAB_COLS, LEADING_PAIR_PK),
     fam(IDX_TAB, "_indices", IDX_TAB_COLS, LEADING_COL_PK),
     fam(SEQ_TAB, "_sequences", SEQ_TAB_COLS, LEADING_COL_PK),
-    fam(
-        CIRCUIT_NODES_TAB,
-        "_circuit_nodes",
-        CIRCUIT_NODES_COLS,
-        CIRCUIT_FAMILY_PK,
-    ),
+    fam(CIRCUIT_NODES_TAB, "_circuit_nodes", CIRCUIT_NODES_COLS, LEADING_PAIR_PK),
 ];
+
+// What `unpack_pair_pk`'s `>> 64` split is written against.
+const _: () = {
+    let mut f = 0;
+    while f < SYS_FAMILIES.len() {
+        let (cols, pk) = (SYS_FAMILIES[f].cols, SYS_FAMILIES[f].pk_cols);
+        let mut i = 0;
+        while i < pk.len() {
+            assert!(
+                cols[pk[i] as usize].type_code as u8 == TypeCode::U64 as u8,
+                "a system family's key column is not U64"
+            );
+            i += 1;
+        }
+        f += 1;
+    }
+};
 
 /// Position of family `id` in [`SYS_FAMILIES`], or `None` for a non-family id.
 pub const fn sys_family_index(id: u64) -> Option<usize> {
@@ -410,38 +448,6 @@ pub const RELATION_ID_CEILING: u64 = 1 << 31;
 
 pub const OWNER_KIND_TABLE: u64 = 0;
 pub const OWNER_KIND_VIEW: u64 = 1;
-
-// ---------------------------------------------------------------------------
-// COL_TAB primary-key packing
-// ---------------------------------------------------------------------------
-
-/// Bit width of the column-index field in a packed COL_TAB PK.
-pub(crate) const COL_ID_IDX_BITS: u32 = 9;
-
-/// Pack an owner (table/view) id and column index into the COL_TAB PK word:
-/// `(owner_id << 9) | col_idx`. Rejects a column index that overflows its
-/// 9-bit field or an owner id that overflows the remaining 55 bits — either
-/// would silently alias another column's record.
-pub fn pack_col_id(owner_id: u64, col_idx: u64) -> Result<u64, String> {
-    if col_idx >= (1 << COL_ID_IDX_BITS) {
-        return Err(format!(
-            "column index {col_idx} exceeds maximum {}",
-            (1u64 << COL_ID_IDX_BITS) - 1
-        ));
-    }
-    if owner_id > (u64::MAX >> COL_ID_IDX_BITS) {
-        return Err(format!(
-            "owner_id {owner_id} exceeds {}-bit maximum for column ID packing",
-            64 - COL_ID_IDX_BITS
-        ));
-    }
-    Ok((owner_id << COL_ID_IDX_BITS) | col_idx)
-}
-
-/// Inverse of [`pack_col_id`]: `(owner_id, col_idx)`.
-pub const fn unpack_col_id(packed: u64) -> (u64, u64) {
-    (packed >> COL_ID_IDX_BITS, packed & ((1 << COL_ID_IDX_BITS) - 1))
-}
 
 // ---------------------------------------------------------------------------
 // Identifier validation (shared between the SQL planner and the engine)

@@ -1,24 +1,25 @@
-//! System table constants, the per-family descriptor table, PK packing
-//! helpers, and the per-family row codecs (batch row-view decoders and
-//! row builders) over those constants.
+//! System table constants, the per-family descriptor table, the per-family row
+//! decoders over those constants, and the batch-shape analyses (per-PK
+//! signatures, sign partitions) every guard and hook keys on.
 //!
-//! Pure data and stateless codecs — no state, no CatalogEngine dependency.
+//! Pure data, stateless codecs and batch-local analysis — no state, no
+//! CatalogEngine dependency.
 
 use rustc_hash::FxHashMap;
 
+use super::pair_opk;
 use super::ColumnDef;
 use gnitz_expr::RowSource;
 use gnitz_store::relation::{RelationKind, ViewBudgets};
+use gnitz_store::schema::key::PkBuf;
 use gnitz_store::schema::{Placement, SchemaColumn, SchemaDescriptor};
-use gnitz_store::storage::{payload_string, payload_u64, Batch, BatchBuilder};
-use gnitz_wire::sys_rows::{ColTabRow, IdxTabRow, TableTabRow};
+use gnitz_store::storage::{payload_str, payload_string, payload_u64, Batch};
 use gnitz_wire::MAX_COLUMNS;
 use gnitz_wire::{
-    COLTAB_PAY_COL_IDX, COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE,
-    COLTAB_PAY_IS_SERIAL, COLTAB_PAY_NAME, COLTAB_PAY_OWNER_ID, COLTAB_PAY_OWNER_KIND, COLTAB_PAY_SCALE,
-    COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_FLAGS, IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, RELTAB_PAY_NAME,
-    RELTAB_PAY_SCHEMA_ID, TABTAB_PAY_FLAGS, TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA,
-    VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX,
+    COLTAB_PAY_FK_COL_IDX, COLTAB_PAY_FK_TABLE_ID, COLTAB_PAY_IS_HIDDEN, COLTAB_PAY_IS_NULLABLE, COLTAB_PAY_IS_SERIAL,
+    COLTAB_PAY_NAME, COLTAB_PAY_OWNER_KIND, COLTAB_PAY_SCALE, COLTAB_PAY_TYPE_CODE, IDXTAB_PAY_FLAGS,
+    IDXTAB_PAY_OWNER_ID, IDXTAB_PAY_SOURCE_COLS, RELTAB_PAY_NAME, RELTAB_PAY_SCHEMA_ID, TABTAB_PAY_FLAGS,
+    TABTAB_PAY_PK_COL_IDX, VIEWTAB_PAY_CAPACITY, VIEWTAB_PAY_DELTA, VIEWTAB_PAY_OWNER_VIEW_ID, VIEWTAB_PAY_PK_COL_IDX,
 };
 
 // ---------------------------------------------------------------------------
@@ -50,8 +51,6 @@ pub(super) const FIRST_USER_INDEX_ID: i64 = 1;
 /// or above it.
 pub(super) const RELATION_ID_CEILING: i64 = gnitz_wire::RELATION_ID_CEILING as i64;
 
-pub(super) const SYS_CATALOG_DIRNAME: &str = "_system_catalog";
-
 // The families' table ids in the catalog's `i64` width. Production code names
 // the family — [`SysFamily::id`] *is* the wire id, by discriminant — so these
 // only spell what a test batch's `ingest_to_family` argument needs.
@@ -66,92 +65,108 @@ pub(super) const COL_TAB_ID: i64 = gnitz_wire::COL_TAB as i64;
 #[cfg(test)]
 pub(super) const IDX_TAB_ID: i64 = gnitz_wire::IDX_TAB as i64;
 #[cfg(test)]
-pub(crate) const SEQ_TAB_ID: i64 = gnitz_wire::SEQ_TAB as i64;
+pub(super) const SEQ_TAB_ID: i64 = gnitz_wire::SEQ_TAB as i64;
 #[cfg(test)]
 pub(super) const CIRCUIT_NODES_TAB_ID: i64 = gnitz_wire::CIRCUIT_NODES_TAB as i64;
 
-// PK list encoding lives in gnitz-wire so the client and engine cannot drift
-// on the on-disk format. Production code spells the packers `gnitz_wire::…` (or
-// reaches them via the row decoders below); the unqualified names are used only
-// by tests, so their re-exports are test-scoped.
+// PK list encoding lives in gnitz-wire so the client and engine cannot drift on
+// the on-disk format. Every site spells the packers `gnitz_wire::…`, or reaches
+// them through the row decoders below.
 use gnitz_wire::unpack_pk_cols;
 pub(super) use gnitz_wire::PkColList;
-#[cfg(test)]
-pub(super) use gnitz_wire::{pack_pk_cols, PK_LIST_PACKED_FLAG};
 
 // ---------------------------------------------------------------------------
 // Per-family row-view decoders — the one reading of each family's *full row
-// shape*, shared by the precheck arms (`precheck_family`) and the register
-// hooks (which re-decode on the paths that skip precheck: boot replay and
-// worker ddl_sync). A caller that wants one named field still reads it straight
-// through its `*_PAY_*` constant; that costs one `payload_u64` where a decode
-// here costs the whole row.
+// shape*, run by the precheck arms and again by the register hooks. A caller
+// after one named field reads it through that field's `*_PAY_*` constant
+// instead.
 //
-// Every one is generic over `RowSource`, so a wire `Batch`, a `StoredRow` a PK
-// probe located, and a positioned `ReadCursor`'s entry decode through one
-// reading each.
+// The two relation families decode a wire `Batch`, which is what every caller
+// holds; the other three stay generic over `RowSource`, which a `StoredRow` and
+// a positioned `ReadCursor` also satisfy.
 // ---------------------------------------------------------------------------
 
-/// Decode TABLE_TAB `row`: `(schema_id, name, pk_list, kind, placement)`. The
-/// raw `flags` word does not escape — every registration crosses this reader, so
-/// decoding it here is what makes the rejection below unskippable on the paths
-/// that bypass the precheck. A pure function of `(src, row)`; a caller that has
-/// an id to name decorates the message with it.
-pub(super) fn read_table_tab_row<S: RowSource>(
-    src: &S,
-    row: usize,
-) -> Result<(i64, String, PkColList, RelationKind, Placement), String> {
-    let name = payload_string(src, row, RELTAB_PAY_NAME);
-    let props = gnitz_wire::TableProps::from_flags(payload_u64(src, row, TABTAB_PAY_FLAGS));
+/// What `register_relation` needs to build and register one relation: the values
+/// decoded off its TABLE_TAB / VIEW_TAB row, plus the placement its own family
+/// derives.
+pub(super) struct RelationRegistration<'a> {
+    pub(super) kind: RelationKind,
+    pub(super) id: i64,
+    pub(super) schema_id: i64,
+    pub(super) name: &'a str,
+    pub(super) pk: PkColList,
+    pub(super) placement: Placement,
+    /// The `WITH (…)` byte budgets; both `None` for a base table and for a plain
+    /// view.
+    pub(super) budgets: ViewBudgets,
+}
+
+/// Decode TABLE_TAB `row` into the whole registration it describes, `id` off the
+/// row's own PK included. The raw `flags` word does not escape, so the
+/// rejections below hold on the paths that bypass the precheck too.
+pub(super) fn read_table_tab_row(batch: &Batch, row: usize) -> Result<RelationRegistration<'_>, String> {
+    let props = gnitz_wire::TableProps::from_flags(payload_u64(batch, row, TABTAB_PAY_FLAGS));
+    let kind = if props.stream {
+        RelationKind::Stream
+    } else {
+        RelationKind::BaseTable
+    };
+    let noun = kind.noun();
+    let name = payload_str(batch, row, RELTAB_PAY_NAME);
     props
         .validate()
-        .map_err(|e| format!("catalog invariant violated: table '{name}' {e}"))?;
+        .map_err(|e| format!("catalog invariant violated: {noun} '{name}' {e}"))?;
     // The PK list is decoded before the placement is built: `dist_prefix_len` is
     // a leading-prefix length into it, and nothing downstream re-checks it —
     // `Placement::resolve` normalizes only the `0` sentinel.
-    let pk = unpack_pk_cols(payload_u64(src, row, TABTAB_PAY_PK_COL_IDX))
-        .map_err(|rule| format!("catalog invariant violated: table '{name}' {rule}"))?;
+    let pk = unpack_pk_cols(payload_u64(batch, row, TABTAB_PAY_PK_COL_IDX))
+        .map_err(|rule| format!("catalog invariant violated: {noun} '{name}' {rule}"))?;
     props
         .validate_against_pk(pk.as_slice().len())
-        .map_err(|e| format!("catalog invariant violated: table '{name}' {e}"))?;
-    let placement = if props.replicated {
-        Placement::Replicated
-    } else {
-        Placement::Keyed { prefix_len: props.dist_prefix_len as u8 }
-    };
-    Ok((
-        payload_u64(src, row, RELTAB_PAY_SCHEMA_ID) as i64,
+        .map_err(|e| format!("catalog invariant violated: {noun} '{name}' {e}"))?;
+    Ok(RelationRegistration {
+        kind,
+        id: batch.get_pk(row) as i64,
+        schema_id: payload_u64(batch, row, RELTAB_PAY_SCHEMA_ID) as i64,
         name,
         pk,
-        if props.stream {
-            RelationKind::Stream
+        placement: if props.replicated {
+            Placement::Replicated
         } else {
-            RelationKind::BaseTable
+            Placement::Keyed { prefix_len: props.dist_prefix_len as u8 }
         },
-        placement,
-    ))
+        budgets: ViewBudgets::default(),
+    })
 }
 
-/// Decode VIEW_TAB `row`: `(schema_id, name, pk_list, budgets, owner_view_id)`.
-/// A `0` budget word decodes to `None` here so no caller repeats the sentinel;
-/// `owner_view_id` is `0` for a user view.
-pub(super) fn read_view_tab_row<S: RowSource>(
-    src: &S,
-    row: usize,
-) -> Result<(i64, String, PkColList, ViewBudgets, i64), String> {
-    let name = payload_string(src, row, RELTAB_PAY_NAME);
-    let pk = unpack_pk_cols(payload_u64(src, row, VIEWTAB_PAY_PK_COL_IDX))
+/// A VIEW_TAB row as decoded. Not yet a [`RelationRegistration`]: a view's
+/// placement is a fold over its sources, which this reader cannot see.
+pub(super) struct ViewRegistration<'a> {
+    pub(super) schema_id: i64,
+    pub(super) name: &'a str,
+    pub(super) pk: PkColList,
+    pub(super) budgets: ViewBudgets,
+    /// The user view this row is an internal chain segment of; `0` for a user
+    /// view.
+    pub(super) owner_view_id: i64,
+}
+
+/// Decode VIEW_TAB `row`. A `0` budget word decodes to `None` here so no caller
+/// repeats the sentinel.
+pub(super) fn read_view_tab_row(batch: &Batch, row: usize) -> Result<ViewRegistration<'_>, String> {
+    let name = payload_str(batch, row, RELTAB_PAY_NAME);
+    let pk = unpack_pk_cols(payload_u64(batch, row, VIEWTAB_PAY_PK_COL_IDX))
         .map_err(|rule| format!("catalog invariant violated: view '{name}' {rule}"))?;
-    Ok((
-        payload_u64(src, row, RELTAB_PAY_SCHEMA_ID) as i64,
+    Ok(ViewRegistration {
+        schema_id: payload_u64(batch, row, RELTAB_PAY_SCHEMA_ID) as i64,
         name,
         pk,
-        ViewBudgets {
-            capacity_bytes: Some(payload_u64(src, row, VIEWTAB_PAY_CAPACITY)).filter(|&b| b != 0),
-            delta_bytes: Some(payload_u64(src, row, VIEWTAB_PAY_DELTA)).filter(|&b| b != 0),
+        budgets: ViewBudgets {
+            capacity_bytes: Some(payload_u64(batch, row, VIEWTAB_PAY_CAPACITY)).filter(|&b| b != 0),
+            delta_bytes: Some(payload_u64(batch, row, VIEWTAB_PAY_DELTA)).filter(|&b| b != 0),
         },
-        payload_u64(src, row, VIEWTAB_PAY_OWNER_VIEW_ID) as i64,
-    ))
+        owner_view_id: payload_u64(batch, row, VIEWTAB_PAY_OWNER_VIEW_ID) as i64,
+    })
 }
 
 /// Decode IDX_TAB `row`: `(owner_id, col_indices, props)` — the one decoding of
@@ -181,10 +196,9 @@ pub(super) fn read_col_tab_row<S: RowSource>(src: &S, row: usize) -> ColumnDef {
     }
 }
 
-/// What a COL_TAB row claims about its own identity: the `(owner, column)` its
-/// payload names, and the FK target it declares. Separate from
-/// [`read_col_tab_row`] so the cache appliers and the bundle guard never pay
-/// that decoder's `name` allocation.
+/// The `(owner, column)` off a COL_TAB row's key plus the words deciding whether
+/// it declares a foreign key. Separate from [`read_col_tab_row`] so
+/// `apply_fk_edges_and_locks` never pays that decoder's `name` allocation.
 pub(super) struct ColTabIdent {
     pub(super) owner_id: i64,
     pub(super) owner_kind: i64,
@@ -205,41 +219,18 @@ impl ColTabIdent {
     }
 }
 
-/// Decode COL_TAB `row`'s identity fields. A struct rather than a 5-tuple:
-/// `(owner_id, owner_kind, col_idx, fk_table_id)` are four adjacent integers
-/// and `(col_idx, fk_col_idx)` index two different column spaces, so a
-/// transposed field would type-check.
+/// Decode COL_TAB `row`'s identity fields, `(owner_id, col_idx)` off the compound
+/// key. A struct rather than a 5-tuple of near-identical integers, two of which
+/// (`col_idx`, `fk_col_idx`) index different column spaces.
 pub(super) fn read_col_tab_ident<S: RowSource>(src: &S, row: usize) -> ColTabIdent {
+    let (owner_id, col_idx) = gnitz_wire::unpack_pair_pk(gnitz_wire::widen_pk_be(src.get_pk_bytes(row)));
     ColTabIdent {
-        owner_id: payload_u64(src, row, COLTAB_PAY_OWNER_ID) as i64,
+        owner_id: owner_id as i64,
         owner_kind: payload_u64(src, row, COLTAB_PAY_OWNER_KIND) as i64,
-        col_idx: payload_u64(src, row, COLTAB_PAY_COL_IDX),
+        col_idx,
         fk_table_id: payload_u64(src, row, COLTAB_PAY_FK_TABLE_ID) as i64,
         fk_col_idx: payload_u64(src, row, COLTAB_PAY_FK_COL_IDX) as u32,
     }
-}
-
-/// The `(owner_id, col_indices)` of every UNIQUE index this IDX_TAB family
-/// creates — positive-weight rows whose column list decodes. The DDL driver
-/// pre-flights each one before the bundle is made durable.
-pub(crate) fn idx_tab_unique_creates(batch: &Batch) -> Vec<(i64, PkColList)> {
-    (0..batch.len())
-        .filter(|&i| batch.get_weight(i) > 0)
-        .filter_map(|i| {
-            let (owner_id, cols, props) = read_idx_tab_row(batch, i).ok()?;
-            props.is_unique.then_some((owner_id, cols))
-        })
-        .collect()
-}
-
-/// The `(owner_id, col_indices)` of every index this IDX_TAB family drops — its
-/// negative-weight rows whose column list decodes. The DDL driver clears each
-/// pair's unique filter once the drop is durable.
-pub(crate) fn idx_tab_drops(batch: &Batch) -> Vec<(i64, PkColList)> {
-    (0..batch.len())
-        .filter(|&i| batch.get_weight(i) < 0)
-        .filter_map(|i| read_idx_tab_row(batch, i).ok().map(|(owner, cols, _)| (owner, cols)))
-        .collect()
 }
 
 /// What one delta does to one PK: where its `-1` and `+1` rows are, and the
@@ -249,6 +240,8 @@ pub(crate) fn idx_tab_drops(batch: &Batch) -> Vec<(i64, PkColList)> {
 /// precheck guard and pair-sensitive hook reads it instead of rescanning.
 pub(super) struct PkSignature {
     pub(super) pk: u128,
+    /// [`SysFamily::leading_id`] of `pk`, so no consumer re-derives it.
+    pub(super) leading: i64,
     /// First row index carrying this PK; its OPK bytes address the live row.
     pub(super) row: usize,
     /// First `-1` / `+1` row index for this PK.
@@ -280,7 +273,7 @@ impl PkSignature {
 ///
 /// The map, not an adjacent-run scan: `canonicalize_for_hooks` sign-partitions
 /// the batch, so a pair's two rows are never adjacent.
-pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
+pub(super) fn pk_signatures(family: SysFamily, batch: &Batch) -> Vec<PkSignature> {
     let mut sigs: Vec<PkSignature> = Vec::new();
     let mut by_pk: FxHashMap<u128, usize> = FxHashMap::default();
     for i in 0..batch.len() {
@@ -292,6 +285,7 @@ pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
         let slot = *by_pk.entry(pk).or_insert_with(|| {
             sigs.push(PkSignature {
                 pk,
+                leading: family.leading_id(pk),
                 row: i,
                 neg: None,
                 pos: None,
@@ -310,124 +304,69 @@ pub(super) fn pk_signatures(batch: &Batch) -> Vec<PkSignature> {
     sigs
 }
 
-/// The PKs this family creates (`positive`) or drops, EXCLUDING any PK carrying
-/// BOTH signs — a rewrite pair, e.g. a rename's `-1,+1`. A weight-homogeneous
-/// CREATE/DROP family has no such pair; a rename's paired PK is filtered from
-/// both answers, so a view rename triggers no backfill and a table rename's tid
-/// is never treated as dropped. Batch-local: the whole family (both signs of a
-/// pair) arrives as one batch on every path.
-pub(crate) fn family_pks_by_sign(batch: &Batch, positive: bool) -> Vec<i64> {
-    pk_signatures(batch)
-        .into_iter()
-        .filter(|s| !s.is_pair() && s.pos.is_some() == positive)
-        .map(|s| s.pk as i64)
-        .collect()
+/// One family delta split by sign, rewrite pairs excluded — a rename's `-1,+1`
+/// on one PK is neither a create nor a drop. Batch-local: both signs of a pair
+/// arrive as one batch on every path.
+#[derive(Default)]
+pub(crate) struct PkPartition {
+    pub(crate) creates: Vec<i64>,
+    pub(crate) drops: Vec<i64>,
 }
 
-// ---------------------------------------------------------------------------
-// Per-family row builders — the engine's entry points into the shared
-// `gnitz_wire::sys_rows` codecs, which own each family's payload layout for
-// both sides of the wire. These adapt the catalog's `i64` ids and `ColumnDef`
-// to a codec row, for every engine-side writer: bootstrap's self-description,
-// the DDL emitters, and the test fixtures that drive the applier directly.
-// ---------------------------------------------------------------------------
-
-/// Append one COL_TAB row for column `col_idx` of `owner_id`. Takes the whole
-/// `ColumnDef` rather than its fields, mirroring `registry.rs`'s read side,
-/// which reassembles exactly this struct.
-pub(super) fn push_col_tab_row(
-    bb: &mut BatchBuilder,
-    owner_id: i64,
-    owner_kind: i64,
-    col_idx: i64,
-    cd: &ColumnDef,
-    weight: i64,
-) {
-    // The abort is [`pack_column_id`]'s trust decision, over the same packing.
-    gnitz_wire::sys_rows::write_col_tab_row(
-        bb,
-        &ColTabRow {
-            owner_id: owner_id as u64,
-            owner_kind: owner_kind as u64,
-            col_idx: col_idx as u64,
-            name: &cd.name,
-            type_code: cd.type_code as u64,
-            is_nullable: cd.is_nullable,
-            fk_table_id: cd.fk_table_id as u64,
-            fk_col_idx: cd.fk_col_idx as u64,
-            is_serial: cd.is_serial,
-            is_hidden: cd.is_hidden,
-            scale: cd.scale,
-        },
-        weight,
-    )
-    .expect("catalog col-id packing out of range");
+pub(crate) fn family_pk_partition(family: SysFamily, batch: &Batch) -> PkPartition {
+    let mut out = PkPartition::default();
+    for sig in pk_signatures(family, batch) {
+        if sig.is_pair() {
+            continue;
+        }
+        if sig.pos.is_some() {
+            &mut out.creates
+        } else {
+            &mut out.drops
+        }
+        .push(sig.leading);
+    }
+    out
 }
 
-/// Append one TABLE_TAB row at `weight`.
-pub(super) fn push_table_tab_row(
-    bb: &mut BatchBuilder,
-    tid: i64,
-    schema_id: i64,
-    name: &str,
-    pk_col_idx: u64,
-    flags: u64,
-    weight: i64,
-) {
-    gnitz_wire::sys_rows::write_table_tab_row(
-        bb,
-        &TableTabRow {
-            table_id: tid as u64,
-            schema_id: schema_id as u64,
-            name,
-            pk_col_idx,
-            flags,
-        },
-        weight,
-    );
+/// [`PkPartition`] for IDX_TAB, carrying each row's decoded column list — what
+/// the DDL driver's unique pre-flight and filter teardown key on. A row whose
+/// list does not decode is skipped; the precheck rejects the batch over it.
+#[derive(Default)]
+pub(crate) struct IdxPartition {
+    pub(crate) creates: Vec<(i64, PkColList, gnitz_wire::IndexProps)>,
+    pub(crate) drops: Vec<(i64, PkColList)>,
 }
 
-/// The one-row IDX_TAB batch at `weight` — `+1` registers an index, `-1`
-/// retracts one. A `-1` must reproduce the `+1`'s payload exactly: the
-/// retraction CAS rejects a mismatch, and only byte-equal `(PK, payload)` rows
-/// cancel. Every engine-side IDX_TAB write is a single row; multi-row batches
-/// come from the client.
-pub(super) fn idx_tab_batch(
-    index_id: i64,
-    owner_id: i64,
-    packed_cols: u64,
-    name: &str,
-    props: gnitz_wire::IndexProps,
-    weight: i64,
-) -> Batch {
-    let mut bb = BatchBuilder::new(*SysFamily::Index.schema());
-    gnitz_wire::sys_rows::write_idx_tab_row(
-        &mut bb,
-        &IdxTabRow {
-            index_id: index_id as u64,
-            owner_id: owner_id as u64,
-            source_col_idx: packed_cols,
-            name,
-            flags: props.pack(),
-        },
-        weight,
-    );
-    bb.finish()
+pub(crate) fn idx_tab_partition(batch: &Batch) -> IdxPartition {
+    let mut out = IdxPartition::default();
+    for sig in pk_signatures(SysFamily::Index, batch) {
+        if sig.is_pair() {
+            continue;
+        }
+        let row = sig.pos.or(sig.neg).expect("pk_signatures skips a zero-weight row");
+        let Ok((owner_id, cols, props)) = read_idx_tab_row(batch, row) else {
+            continue;
+        };
+        if sig.pos.is_some() {
+            out.creates.push((owner_id, cols, props));
+        } else {
+            out.drops.push((owner_id, cols));
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
 // Schema derivation from the shared wire column slices
 // ---------------------------------------------------------------------------
 
-// Pre-computed schema statics, one per family, indexed by `SysFamily::index` —
-// initialised at compile time, never reconstructed. `from_wire_cols`
-// places every family `Replicated`, so a reader single-sources one copy instead of
-// gathering N (the relation's own `Placement`).
 /// Build a `SchemaDescriptor` from one of `gnitz-wire`'s canonical system-table
 /// column arrays. `const`, so [`SCHEMAS`] below costs nothing at runtime. Every
 /// such family is [`Placement::Replicated`]: DDL is master-broadcast, so each
-/// worker holds an identical full copy.
-pub(crate) const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: &[u32]) -> SchemaDescriptor {
+/// worker holds an identical full copy, and a reader single-sources one copy
+/// instead of gathering N.
+const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: &[u32]) -> SchemaDescriptor {
     let mut buf = [SchemaColumn::EMPTY; MAX_COLUMNS];
     let mut i = 0;
     while i < cols.len() {
@@ -438,6 +377,8 @@ pub(crate) const fn from_wire_cols(cols: &[gnitz_wire::WireSysCol], pk_indices: 
     SchemaDescriptor::new_with_placement(head, pk_indices, Placement::Replicated)
 }
 
+/// Pre-computed schema statics, one per family, indexed by [`SysFamily::index`]
+/// — initialised at compile time, never reconstructed.
 static SCHEMAS: [SchemaDescriptor; SysFamily::COUNT] = {
     let w = gnitz_wire::SYS_FAMILIES;
     let mut arr = [from_wire_cols(w[0].cols, w[0].pk_cols); SysFamily::COUNT];
@@ -450,51 +391,8 @@ static SCHEMAS: [SchemaDescriptor; SysFamily::COUNT] = {
 };
 
 // ---------------------------------------------------------------------------
-// PK packing helpers
-// ---------------------------------------------------------------------------
-
-/// Delegates to the shared `gnitz_wire::pack_col_id` codec. Catalog callers
-/// pass DDL-validated ids, so an out-of-range value here is catalog
-/// corruption — abort rather than alias another column's record.
-pub(super) fn pack_column_id(owner_id: i64, col_idx: i64) -> u64 {
-    gnitz_wire::pack_col_id(owner_id as u64, col_idx as u64).expect("catalog col-id packing out of range")
-}
-
-/// The `(view_id, node_id)` halves of a circuit row's compound PK as
-/// `Batch::get_pk` reads it back out of the PK region: `view_id` in the high
-/// u128 half, `node_id` in the low one.
-pub(super) fn unpack_circuit_pk(pk: u128) -> (i64, u64) {
-    ((pk >> 64) as i64, pk as u64)
-}
-
-/// The half-open COL_TAB key band `[pack(owner, 0), pack(owner + 1, 0))` holding
-/// exactly `owner_id`'s column records — stated once so the read scan and the
-/// drop cascade cannot disagree on the upper bound.
-pub(super) fn column_id_band(owner_id: i64) -> (u64, u64) {
-    (pack_column_id(owner_id, 0), pack_column_id(owner_id + 1, 0))
-}
-
-// ---------------------------------------------------------------------------
 // Typed system family
 // ---------------------------------------------------------------------------
-
-/// Topological creation priority per family, indexed by [`SysFamily::index`].
-/// Lower =
-/// earlier in the dependency chain (created first, destroyed last). Orders the
-/// `DDL_TXN` handler's forward ingest — ascending for a bundle that creates, so
-/// every register/index hook sees its dependencies already in the memtable;
-/// descending for an all-negative one, where a dependent must be retired before
-/// what it depends on — and rollback's own two-phase negate. Table and View
-/// differ so their relative order is stable; 99 is order-neutral.
-const TOPO_PRIORITY: [u8; SysFamily::COUNT] = [
-    0,  // Schema
-    5,  // Table
-    6,  // View
-    1,  // Column
-    7,  // Index
-    99, // Sequence
-    2,  // CircuitNodes
-];
 
 /// A catalog system-table family (every id below `FIRST_USER_TABLE_ID`). Used
 /// at the applier's mutation API in place of a bare `i64`, so the `fire_hooks`
@@ -531,8 +429,8 @@ impl SysFamily {
     ];
 
     /// This family's position in `gnitz_wire::SYS_FAMILIES` — the index every
-    /// per-family array here is laid out by. Const-evaluated for a literal
-    /// receiver; a seven-entry scan otherwise, at DDL-bundle or boot rate.
+    /// per-family array here is laid out by. A seven-entry scan, at DDL-bundle
+    /// or boot rate.
     #[inline]
     pub(crate) const fn index(self) -> usize {
         match gnitz_wire::sys_family_index(self as u64) {
@@ -571,22 +469,56 @@ impl SysFamily {
         &SCHEMAS[self.index()]
     }
 
-    /// Topological creation priority (see [`TOPO_PRIORITY`]).
+    /// Topological creation priority: lower = created first, destroyed last.
+    /// A creating `DDL_TXN` bundle ingests ascending, so every register hook
+    /// sees its dependencies in the memtable; an all-negative one descending,
+    /// retiring a dependent before what it depends on.
     #[inline]
     pub(crate) fn topo_priority(self) -> u8 {
-        TOPO_PRIORITY[self.index()]
+        match self {
+            SysFamily::Schema => 0,
+            SysFamily::Column => 1,
+            SysFamily::CircuitNodes => 2,
+            SysFamily::Table => 5,
+            SysFamily::View => 6,
+            SysFamily::Index => 7,
+            SysFamily::Sequence => 99,
+        }
+    }
+
+    /// The leading id of one of this family's PKs: the whole key where it is one
+    /// column, its high half where the key is a pair — where `pk as i64` would
+    /// take the trailing half instead (a column index, or a node id).
+    #[inline]
+    pub(super) fn leading_id(self, pk: u128) -> i64 {
+        match self {
+            SysFamily::Column | SysFamily::CircuitNodes => gnitz_wire::unpack_pair_pk(pk).0 as i64,
+            SysFamily::Schema | SysFamily::Table | SysFamily::View | SysFamily::Index | SysFamily::Sequence => {
+                pk as i64
+            }
+        }
+    }
+
+    /// The half-open key band `[(leading, 0), (leading + 1, 0))` of this
+    /// pair-keyed family — exactly its rows under `leading`. Stated once so the
+    /// read scan and the drop cascade cannot disagree on the upper bound.
+    pub(in crate::catalog) fn band(self, leading: i64) -> (PkBuf, PkBuf) {
+        assert!(
+            self.wire().pk_cols.len() == 2,
+            "a key band is defined only for a pair-keyed family"
+        );
+        let schema = self.schema();
+        (pair_opk(schema, leading, 0), pair_opk(schema, leading + 1, 0))
     }
 
     /// The lowest id a client may write in this family's id space; everything
-    /// below is bootstrap-owned. Column's floor is on the *packed* word, since
-    /// that is what its PK is. `None` where the PK is no id space at all.
+    /// below is bootstrap-owned. Read against [`Self::leading_id`], so Column's
+    /// floor is its owner's. `None` where the PK is no id space at all.
     pub(super) fn first_user_id(self) -> Option<i64> {
         match self {
             SysFamily::Schema => Some(FIRST_USER_SCHEMA_ID),
-            SysFamily::Table | SysFamily::View => Some(FIRST_USER_TABLE_ID),
-            SysFamily::Column => Some(pack_column_id(FIRST_USER_TABLE_ID, 0) as i64),
+            SysFamily::Table | SysFamily::View | SysFamily::Column | SysFamily::Sequence => Some(FIRST_USER_TABLE_ID),
             SysFamily::Index => Some(FIRST_USER_INDEX_ID),
-            SysFamily::Sequence => Some(FIRST_USER_TABLE_ID),
             SysFamily::CircuitNodes => None,
         }
     }
@@ -634,25 +566,28 @@ impl SysFamily {
     }
 
     /// Is this family's PK the identity of at most one live row — the premise
-    /// the retraction CAS and the per-PK net bound rest on? False for the circuit
-    /// family, whose `(view_id, node_id)` addresses a node of a circuit.
+    /// `check_cas_and_net` rests on, and its sole gate? False for the circuit
+    /// family alone, whose `(view_id, node_id)` addresses a node of a circuit.
+    /// Not PK arity: Column is pair-keyed and still `true`.
     pub(super) fn pk_is_live_row_identity(self) -> bool {
-        !matches!(self, SysFamily::CircuitNodes)
+        match self {
+            SysFamily::CircuitNodes => false,
+            SysFamily::Schema
+            | SysFamily::Table
+            | SysFamily::View
+            | SysFamily::Column
+            | SysFamily::Index
+            | SysFamily::Sequence => true,
+        }
     }
 
-    /// How a guard message names one row of this family. A COL_TAB PK packs
-    /// `(owner_id, col_idx)` and a circuit PK packs `(view_id, node_id)`, so
-    /// neither is meaningful rendered as the one number it is stored as.
+    /// How a guard message names one row of this family: a pair-keyed family's
+    /// two ids are meaningless rendered as the one number the widened key is.
     pub(in crate::catalog) fn pk_label(self, pk: u128) -> String {
+        let (hi, lo) = gnitz_wire::unpack_pair_pk(pk);
         match self {
-            SysFamily::Column => {
-                let (owner_id, col_idx) = gnitz_wire::unpack_col_id(pk as u64);
-                format!("column {col_idx} of owner {owner_id}")
-            }
-            SysFamily::CircuitNodes => {
-                let (view_id, node_id) = unpack_circuit_pk(pk);
-                format!("view {view_id} node {node_id}")
-            }
+            SysFamily::Column => format!("column {lo} of owner {hi}"),
+            SysFamily::CircuitNodes => format!("view {hi} node {lo}"),
             _ => format!("id {pk}"),
         }
     }

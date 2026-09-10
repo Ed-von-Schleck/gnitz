@@ -4,7 +4,8 @@
 //! own, and on a family whose declared facts make it the rule that fires.
 
 use super::*;
-use crate::test_support::{col_def, scratch_dir};
+use crate::test_support::{col_def, push_col_tab_row, push_table_tab_row, scratch_dir};
+use gnitz_wire::pack_pk_cols;
 use gnitz_wire::sys_rows::{write_circuit_node_row, write_idx_tab_row, write_schema_tab_row};
 use gnitz_wire::sys_rows::{CircuitNodeRow, IdxTabRow, SchemaTabRow};
 use gnitz_wire::type_code;
