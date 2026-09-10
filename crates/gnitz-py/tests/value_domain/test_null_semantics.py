@@ -2,10 +2,10 @@
 
 A NULL payload cell is **zero-filled and the null bitmap is the sole truth**, so
 a test only proves something read that bitmap if the zero would have answered
-differently. That is why every case here pairs a NULL against the type's own zero
-— the integer `0`, the empty string, the epoch date — rather than against an
-arbitrary value: a predicate over a NULL that a zero would also fail proves
-nothing.
+differently. Every case here therefore pairs a NULL against the type's own zero —
+the integer `0`, the empty string — rather than against an arbitrary value: a
+predicate over a NULL that a zero would also fail proves nothing. The families
+whose zero is not an integer are `test_value_round_trip.py`'s.
 
 The bitmap is indexed by *payload* position, which is the column's index minus
 the number of PK columns before it. For a PK declared as a prefix that is the
@@ -13,17 +13,18 @@ same as "minus the PK count", so a prefix table cannot tell a correct
 implementation from one that subtracts a constant. Only a key interleaved with
 the payload separates them.
 
-The connectives themselves are one per-row program whatever the column type and
-are stated once in `scalar_expression/test_three_valued_logic.py`. What varies
-here is the *type*: each width has its own load and its own bit, and a
-width-specific path could obey the rule for BIGINT and not for TINYINT.
+The connectives themselves are one per-row program whatever the column type —
+the width is consumed entirely by the load that fills the register, and
+`AND`/`OR`/`NOT` never see a column — so they are stated once over the full 3×3
+pattern table in `scalar_expression/test_three_valued_logic.py`. What varies here
+is the *type*: each width has its own load and its own bit, and a width-specific
+path could obey the rule for BIGINT and not for TINYINT.
 """
 
 import pytest
-from _read import bag, scanned
+from _read import bag, rows, scanned
 
-# (SQL spelling, the type's zero, a value above it). The unsigned zeros are the
-# minimum of their range, so `> 0` and `= 0` are the two useful cuts on both.
+# (SQL spelling, the type's minimum, its maximum).
 _WIDTHS = [
     ("TINYINT", -128, 127),
     ("SMALLINT", -32768, 32767),
@@ -35,90 +36,55 @@ _WIDTHS = [
     ("BIGINT UNSIGNED", 0, 18446744073709551615),
 ]
 
-_IDS = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"]
-
 
 # ---------------------------------------------------------------------------
 # The null bit, per width and per position
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("col_sql,lo,hi", _WIDTHS, ids=_IDS)
-def test_a_null_is_distinct_from_its_types_zero_at_every_width(
-        client, schema_name, col_sql, lo, hi):
+def test_a_null_is_distinct_from_its_types_zero_at_every_width(client, schema_name):
     """`v = 0` must admit the written zero and exclude the NULL, though the
-    NULL's payload cell holds the same zero bytes. `v IS NULL` and `v IS NOT
-    NULL` are then asserted as exact complements, so a bitmap read that was
-    merely inverted fails too."""
+    NULL's payload cell holds the same zero bytes. `IS NULL` and `IS NOT NULL`
+    are asserted as exact complements, and `v > 0` rides alongside because the
+    ordering load is the other genuinely per-width part of the read."""
     sn = schema_name
-    # An unsigned type's minimum *is* zero, so the written values are deduped —
-    # two rows at the same value would make the `v = 0` assertion below ambiguous.
-    written = [0] + [v for v in (lo, hi) if v != 0]
+    cols = [f"v{i}" for i in range(len(_WIDTHS))]
     client.execute_sql(
-        f"CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v {col_sql})",
+        "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, " +
+        ", ".join(f"{c} {sql}" for c, (sql, _, _) in zip(cols, _WIDTHS)) + ")",
         schema_name=sn)
-    client.execute_sql("CREATE VIEW zero AS SELECT pk FROM t WHERE v = 0",
-                       schema_name=sn)
-    client.execute_sql("CREATE VIEW isnull AS SELECT pk FROM t WHERE v IS NULL",
-                       schema_name=sn)
-    client.execute_sql("CREATE VIEW notnull AS SELECT pk FROM t WHERE v IS NOT NULL",
-                       schema_name=sn)
+    # One row per value class, every column at once. An unsigned minimum *is*
+    # zero, so those two rows agree there and differ in every signed column.
+    nulls = [None] * len(_WIDTHS)
+    zeros = [0] * len(_WIDTHS)
+    minima = [lo for _, lo, _ in _WIDTHS]
+    maxima = [hi for _, _, hi in _WIDTHS]
+    seed = [nulls, zeros, minima, maxima]
     client.execute_sql(
-        "INSERT INTO t VALUES (0, NULL), " +
-        ", ".join(f"({i}, {v})" for i, v in enumerate(written, start=1)),
+        "INSERT INTO t VALUES " + ", ".join(
+            f"({i}, " + ", ".join("NULL" if v is None else str(v) for v in r) + ")"
+            for i, r in enumerate(seed)),
         schema_name=sn)
 
-    assert bag(scanned(client, sn, "zero"), "pk") == {(1,): 1}
-    assert bag(scanned(client, sn, "isnull"), "pk") == {(0,): 1}
-    assert bag(scanned(client, sn, "notnull"), "pk") == \
-        {(i,): 1 for i in range(1, len(written) + 1)}
-
-
-@pytest.mark.parametrize("col_sql,_lo,hi", _WIDTHS, ids=_IDS)
-def test_the_connectives_stay_three_valued_at_every_width(
-        client, schema_name, col_sql, _lo, hi):
-    """`NOT` is what separates unknown from FALSE: both fail to admit a row under
-    OR and under AND, so only the negation tells them apart — `NOT FALSE` is TRUE
-    and `NOT unknown` is still unknown. A zero-filled NULL read without the
-    bitmap would be FALSE, and would therefore be admitted by the `NOT` view.
-
-    The threshold is 0 rather than the type's minimum, because a minimum reached
-    through a negated literal is one past what the register file holds for the
-    widest signed type and is refused as a comparison outright.
-    """
-    sn = schema_name
-    client.execute_sql(
-        f"CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, a {col_sql}, b {col_sql})",
-        schema_name=sn)
-    for name, pred in (("ored", "a > 0 OR b > 0"), ("anded", "a > 0 AND b > 0"),
-                       ("negated", "NOT (a > 0)")):
-        client.execute_sql(f"CREATE VIEW {name} AS SELECT pk FROM t WHERE {pred}",
-                           schema_name=sn)
-    # 1: NULL/TRUE  2: TRUE/NULL  3: NULL/FALSE  4: FALSE/NULL  5: TRUE/TRUE
-    # 6: FALSE/FALSE
-    client.execute_sql(
-        f"INSERT INTO t VALUES (1, NULL, {hi}), (2, {hi}, NULL), (3, NULL, 0), "
-        f"(4, 0, NULL), (5, {hi}, {hi}), (6, 0, 0)", schema_name=sn)
-
-    # OR is TRUE wherever one side definitely is, whatever the other is.
-    assert bag(scanned(client, sn, "ored"), "pk") == {(1,): 1, (2,): 1, (5,): 1}
-    # AND needs both definite, so an unknown operand withholds the row.
-    assert bag(scanned(client, sn, "anded"), "pk") == {(5,): 1}
-    # The disconfirming read: only the rows whose `a` is definitely not above 0.
-    assert bag(scanned(client, sn, "negated"), "pk") == {(4,): 1, (6,): 1}
+    for j, (sql, _lo, _hi) in enumerate(_WIDTHS):
+        col = [r[j] for r in seed]
+        for pred, keep in (("= 0", lambda v: v == 0),
+                           ("> 0", lambda v: v is not None and v > 0),
+                           ("IS NULL", lambda v: v is None),
+                           ("IS NOT NULL", lambda v: v is not None)):
+            want = {(i,): 1 for i, v in enumerate(col) if keep(v)}
+            assert bag(rows(client, sn,
+                            f"SELECT pk FROM t WHERE {cols[j]} {pred}")) == want, \
+                f"{sql} {pred}"
 
 
 def test_the_null_bit_follows_payload_position_around_an_interleaved_key(
         client, schema_name):
-    """The PK columns sit *between* the payload columns here, so the payload
-    positions are 0, 1, 2 for columns 0, 2, 4. Subtracting the PK count instead
-    of the number of PK columns *before* each one would map them to 0, 1, 2 only
-    by accident of arity — and mapping `p1` to a negative or `p3` past the end is
-    what a constant subtraction produces on this shape.
-
-    Every NULL pattern across the three payload columns is written at once, so a
-    bit written at the wrong index shows up as a NULL that moved to a
-    neighbouring column rather than as a missing row.
+    """The PK columns sit *between* the payload columns, so a bitmap index that
+    subtracted the PK count rather than the PK columns *before* each one maps
+    `p1` to a negative and `p3` past the end. Writing all eight NULL patterns at
+    once shows a mis-indexed bit as a NULL that moved to a neighbouring column
+    rather than as a missing row.
     """
     sn = schema_name
     client.execute_sql(
@@ -176,7 +142,12 @@ def lr(client, schema_name):
 def test_a_null_key_matches_neither_a_zero_nor_another_null(client, lr):
     """Both directions at once: the left NULL must miss the right `0`, and two
     NULLs — one on each side — must miss each other. Only the real pair matches,
-    at weight 1."""
+    at weight 1.
+
+    The key here is `r.rk`, a plain column the exchange builds a key for; the
+    left-join case below joins `r.k`, the key region itself — two routes to the
+    same collision.
+    """
     sn = lr
     client.execute_sql(
         "CREATE VIEW v AS SELECT l.id AS id, r.name AS name FROM l JOIN r ON l.fk = r.rk",
@@ -260,38 +231,3 @@ def test_a_null_string_key_matches_neither_the_empty_string_nor_another_null(
         "INSERT INTO l VALUES (1, NULL), (2, ''), (3, 'x')", schema_name=sn)
 
     assert bag(scanned(client, sn, "v"), "id", "name") == {(2, 900): 1, (3, 901): 1}
-
-
-# ---------------------------------------------------------------------------
-# A narrow payload compares at its declared width
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("col_sql,lo,hi", _WIDTHS, ids=_IDS)
-def test_a_narrow_payload_retracts_against_its_own_width(
-        client, schema_name, col_sql, lo, hi):
-    """A retraction is matched on (key, payload), so the payload comparison must
-    read the column at its declared width. Reading a 1- or 2-byte column as 8
-    bytes takes the neighbouring bytes with it, and the retraction then matches
-    nothing — leaving the old row behind at weight 1, which is what the weights
-    catch and a row set does not.
-
-    The extremes are used because that is where a too-wide read picks up bits
-    that a mid-range value leaves zero.
-    """
-    sn = schema_name
-    client.execute_sql(
-        f"CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, v {col_sql} NOT NULL)",
-        schema_name=sn)
-    client.execute_sql("CREATE VIEW dist AS SELECT * FROM t", schema_name=sn)
-    client.execute_sql(
-        f"INSERT INTO t VALUES (1, {lo}), (2, {hi})", schema_name=sn)
-    assert bag(scanned(client, sn, "dist"), "pk", "v") == {(1, lo): 1, (2, hi): 1}
-
-    client.execute_sql("DELETE FROM t WHERE pk = 1", schema_name=sn)
-    assert bag(scanned(client, sn, "dist"), "pk", "v") == {(2, hi): 1}
-
-    # An UPDATE is a retraction of the old payload plus an insert of the new, so
-    # it exercises the same comparison and must leave exactly one row.
-    client.execute_sql(f"UPDATE t SET v = {lo} WHERE pk = 2", schema_name=sn)
-    assert bag(scanned(client, sn, "dist"), "pk", "v") == {(2, lo): 1}

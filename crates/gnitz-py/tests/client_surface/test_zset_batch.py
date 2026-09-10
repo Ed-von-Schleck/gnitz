@@ -510,6 +510,20 @@ class TestValueCoercion:
         assert batch.pks == [u128_max]
         assert batch.columns[1] == [u128_max]
 
+    def test_i128_keeps_its_full_signed_range(self):
+        """The signed twin, and the half no join can reach: a matched join key
+        always lands in the two operands' non-negative overlap, so the negative
+        half of the 128-bit space is only addressable through this path. A key
+        decoded as unsigned comes back as `2**128 - 1` where `-1` was written."""
+        values = [-(2 ** 127), -1, 0, 1, (2 ** 127) - 1]
+        schema = Schema([ColumnDef("k", TypeCode.I128, primary_key=True),
+                         ColumnDef("v", TypeCode.I128)])
+        batch = ZSetBatch(schema)
+        for v in values:
+            batch.append(k=v, v=v)
+        assert batch.pks == values
+        assert batch.columns[1] == values
+
     def test_bytes_and_text_columns_stay_apart(self):
         """BLOB and STRING share one region form, so the extraction is where the
         two kinds stay separate: BLOB takes bytes and refuses `str`; STRING takes

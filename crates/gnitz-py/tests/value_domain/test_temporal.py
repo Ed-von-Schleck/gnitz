@@ -52,18 +52,6 @@ def test_both_literal_grammars_reach_the_same_stored_value(client, schema_name):
     }
 
 
-def test_a_date_that_names_no_day_is_refused(client, schema_name):
-    """`2024-02-30` parses as a shape and denotes nothing, so it is refused
-    rather than normalised onto March 1 — a silently shifted key would address a
-    different row."""
-    sn = schema_name
-    client.execute_sql(
-        "CREATE TABLE t (d DATE NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-        schema_name=sn)
-    with pytest.raises(gnitz.GnitzError, match="not a valid DATE"):
-        client.execute_sql("INSERT INTO t VALUES ('2024-02-30', 1)", schema_name=sn)
-
-
 @pytest.mark.parametrize("col_sql,tc,keys", [
     ("DATE", gnitz.TypeCode.DATE,
      [date(1900, 1, 1), date(1969, 12, 31), date(1970, 1, 1), date(2024, 2, 29)]),

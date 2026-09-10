@@ -51,8 +51,8 @@ def test_the_declared_scale_reaches_the_catalog_and_the_wire(client, priced):
     assert schema.columns[3].scale == 3
     assert schema.columns[1].scale == 0, "a BIGINT carries scale 0, not a null scale"
 
-    got = bag(client.scan(tid), "id", "price", "qty")
-    assert got == {
+    rs = client.scan(tid)
+    assert bag(rs, "id", "price", "qty") == {
         (1, Decimal("12.50"), Decimal("3.000")): 1,
         (2, Decimal("0.10"), Decimal("3.500")): 1,
         # '7.125' at scale 2 and 1.005 at scale 2 both round half away from zero.
@@ -62,7 +62,7 @@ def test_the_declared_scale_reaches_the_catalog_and_the_wire(client, priced):
     }
     # `Decimal("12.50") == 12.5` is True, so the comparison above would pass on a
     # float too: the rendered type is its own assertion.
-    row = next(r for r in client.scan(tid) if r.id == 1)
+    row = next(r for r in rs if r.id == 1)
     assert isinstance(row.price, Decimal) and isinstance(row.qty, Decimal)
 
 
@@ -88,44 +88,34 @@ def test_a_decimal_key_routes_and_seeks_on_its_stored_integer(client, schema_nam
         schema_name=sn)
     _, ps = client.resolve_table(sn, "p")
     assert ps.columns[0].scale == 2
+    # The amounts span zero, so the stored integer's sign flip is under test
+    # alongside the seek: without it every negative amount would sort above
+    # every positive one and the ranges below would answer the wrong halves.
+    amts = [Decimal(i - 6) / 4 for i in range(12)]
     client.execute_sql(
-        "INSERT INTO p VALUES " + ", ".join(f"({i / 4}, {i})" for i in range(12)),
+        "INSERT INTO p VALUES " + ", ".join(f"({a}, {i})" for i, a in enumerate(amts)),
         schema_name=sn)
 
     assert bag(rows(client, sn, "SELECT amt, v FROM p WHERE amt = 1.25")) == \
-        {(Decimal("1.25"), 5): 1}
+        {(Decimal("1.25"), 11): 1}
     assert bag(rows(client, sn, "SELECT v FROM p WHERE amt = 1.255")) == {}
-    assert bag(rows(client, sn, "SELECT v FROM p WHERE amt >= 2 AND amt < 2.6")) == \
-        {(8,): 1, (9,): 1, (10,): 1}
-    assert bag(rows(client, sn, "SELECT v FROM p WHERE amt IN (0.25, 0.5, 9)")) == \
-        {(1,): 1, (2,): 1}
+    assert bag(rows(client, sn, "SELECT v FROM p WHERE amt < 0")) == \
+        {(i,): 1 for i, a in enumerate(amts) if a < 0}
+    assert bag(rows(client, sn, "SELECT v FROM p WHERE amt >= 0")) == \
+        {(i,): 1 for i, a in enumerate(amts) if a >= 0}
+    assert bag(rows(client, sn, "SELECT v FROM p WHERE amt >= -0.5 AND amt < 0.6")) == \
+        {(i,): 1 for i, a in enumerate(amts) if Decimal("-0.5") <= a < Decimal("0.6")}
+    assert bag(rows(client, sn, "SELECT v FROM p WHERE amt IN (-1.5, 0.25, 9)")) == \
+        {(i,): 1 for i, a in enumerate(amts) if a in (Decimal("-1.5"), Decimal("0.25"))}
 
-    client.execute_sql("DELETE FROM p WHERE amt = 0.75", schema_name=sn)
-    client.execute_sql("UPDATE p SET v = v + 100 WHERE amt > 2.5", schema_name=sn)
+    client.execute_sql("DELETE FROM p WHERE amt = -0.75", schema_name=sn)
+    client.execute_sql("UPDATE p SET v = v + 100 WHERE amt > 1.0", schema_name=sn)
     assert bag(scanned(client, sn, "p"), "amt", "v") == {
-        (Decimal(f"{i / 4:.2f}"), i + (100 if i > 10 else 0)): 1
-        for i in range(12) if i != 3}
+        (a.quantize(Decimal("0.01")), i + (100 if a > 1 else 0)): 1
+        for i, a in enumerate(amts) if i != 3}
 
     with pytest.raises(gnitz.GnitzError, match="not a valid DECIMAL"):
         client.execute_sql("INSERT INTO p VALUES ('x', 1)", schema_name=sn)
-
-
-def test_a_negative_decimal_key_orders_below_a_positive_one(client, schema_name):
-    """The stored integer is signed, so a DECIMAL key sign-flips like any other
-    signed key. A range spanning zero is the read that shows it — without the
-    flip the negative amounts would sort above every positive one."""
-    sn = schema_name
-    client.execute_sql(
-        "CREATE TABLE p (amt DECIMAL(6, 2) NOT NULL PRIMARY KEY, v BIGINT NOT NULL)",
-        schema_name=sn)
-    client.execute_sql(
-        "INSERT INTO p VALUES (-10.50, 1), (-0.25, 2), (0.00, 3), (0.25, 4), (10.50, 5)",
-        schema_name=sn)
-    assert bag(rows(client, sn, "SELECT v FROM p WHERE amt < 0")) == {(1,): 1, (2,): 1}
-    assert bag(rows(client, sn, "SELECT v FROM p WHERE amt >= 0")) == \
-        {(3,): 1, (4,): 1, (5,): 1}
-    assert bag(rows(client, sn, "SELECT v FROM p WHERE amt > -1")) == \
-        {(2,): 1, (3,): 1, (4,): 1, (5,): 1}
 
 
 def test_a_grouped_or_joined_decimal_key_keeps_its_scale(client, priced):
@@ -155,17 +145,18 @@ def test_a_grouped_or_joined_decimal_key_keeps_its_scale(client, priced):
     assert bag(scanned(client, sn, "j"), "id", "label") == {(1, 90): 1, (2, 91): 1}
 
 
-@pytest.mark.parametrize("body,message", [
-    ("SELECT price FROM t UNION SELECT qty FROM t", "type mismatch"),
-    ("SELECT a.id FROM t a JOIN t2 ON a.price = t2.qty", "same scale"),
-    ("SELECT a.id FROM t a JOIN t2 ON a.price = t2.id", "same scale"),
-], ids=["union-scale", "join-scale", "join-decimal-to-integer"])
-def test_two_decimals_meet_only_at_one_scale(client, priced, body, message):
+def test_two_decimals_meet_only_at_one_scale(client, priced):
     """A set operation and an equijoin both compare stored integers, and two
     scales make that comparison meaningless — 1.20 at scale 2 is 120, at scale 3
-    it is 1200. The pair is refused at plan time rather than compared wrongly."""
+    it is 1200. Each pair is refused at plan time rather than compared wrongly,
+    and an integer is refused for the same reason: it carries no scale at all."""
     client.execute_sql(
         "CREATE TABLE t2 (id BIGINT NOT NULL PRIMARY KEY, qty NUMERIC(8, 3) NOT NULL)",
         schema_name=priced)
-    with pytest.raises(gnitz.GnitzError, match=message):
-        client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=priced)
+    for body, message in (
+        ("SELECT price FROM t UNION SELECT qty FROM t", "type mismatch"),
+        ("SELECT a.id FROM t a JOIN t2 ON a.price = t2.qty", "same scale"),
+        ("SELECT a.id FROM t a JOIN t2 ON a.price = t2.id", "same scale"),
+    ):
+        with pytest.raises(gnitz.GnitzError, match=message):
+            client.execute_sql(f"CREATE VIEW v AS {body}", schema_name=priced)

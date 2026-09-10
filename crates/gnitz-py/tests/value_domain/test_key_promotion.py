@@ -23,33 +23,26 @@ missing row — and a row count sees neither.
 """
 
 import pytest
-import gnitz
 from _read import bag, scanned
 from _serverproc import NEEDS_MULTI
 
-# (left type, right type, keys representable on both sides). Same-type rows name
-# the type twice. The keys always include the boundary that separates the two
-# encodings: the unsigned maximum for a cross-sign pair, a negative for a signed
-# one, and 0 everywhere because it is the value a NULL's zero-fill collides with.
+# (left type, right type, keys representable on both sides). One row per arm:
+# the identity promotion at each sign, then the cross-sign pairs in both
+# directions and at both widths. The keys always include the boundary that
+# separates the two encodings: the unsigned maximum for a cross-sign pair, a
+# negative for a signed one, and 0 everywhere because it is the value a NULL's
+# zero-fill collides with.
 _PAIRS = [
-    ("TINYINT", "TINYINT", [-128, -1, 0, 1, 127]),
-    ("SMALLINT", "SMALLINT", [-32768, -1, 0, 1, 32767]),
-    ("INT", "INT", [-2147483648, -1, 0, 1, 2147483647]),
+    # Same type on both sides takes the identity arm, which is one route
+    # whatever the width — the widest of each sign stands for the ladder.
     ("BIGINT", "BIGINT", [-9223372036854775808, -1, 0, 1, 100]),
-    ("TINYINT UNSIGNED", "TINYINT UNSIGNED", [0, 1, 128, 255]),
-    ("SMALLINT UNSIGNED", "SMALLINT UNSIGNED", [0, 1, 32768, 65535]),
-    ("INT UNSIGNED", "INT UNSIGNED", [0, 1, 2**31, 2**32 - 1]),
     ("BIGINT UNSIGNED", "BIGINT UNSIGNED", [0, 1, 2**63, 2**64 - 1]),
-    # Cross-sign: the pair promotes to the narrowest signed type holding both
-    # ranges. Keys sit above the signed midpoint of the unsigned side, which is
+    # Cross-sign, in both directions because the two sides reach the hash by
+    # different routes. Keys sit above the unsigned side's signed midpoint,
     # where a missing zero-extension shows up.
     ("INT UNSIGNED", "BIGINT", [0, 1, 5, 4_000_000_000]),
     ("BIGINT", "INT UNSIGNED", [0, 1, 5, 4_000_000_000]),
     ("SMALLINT", "TINYINT UNSIGNED", [0, 1, 5, 127]),
-    ("INT", "SMALLINT UNSIGNED", [0, 1, 5, 60000]),
-    # U64 against I64 has no common 64-bit type, so it promotes to the signed
-    # 128-bit one — the widest arm, and the only one whose join key is I128.
-    ("BIGINT UNSIGNED", "BIGINT", [0, 1, 5, 2**63 - 1]),
 ]
 
 _IDS = [f"{a}={b}".replace(" ", "").lower() for a, b, _ in _PAIRS]
@@ -132,14 +125,8 @@ def test_a_group_by_lands_every_row_of_a_group_on_one_worker(
 @NEEDS_MULTI
 def test_a_cross_sign_join_key_surfaces_its_promoted_value(client, schema_name):
     """The `BIGINT UNSIGNED = BIGINT` pair promotes to the signed 128-bit type,
-    so the view's synthetic key slot is an I128 — the widest key the engine
-    builds, and the only one whose decode has to undo a 16-byte sign flip.
-
-    Values are chosen so each side holds one key the other cannot represent: a
-    customer id below zero, which no unsigned order can name, and an order key
-    above the signed maximum, which no signed customer can. Neither may match,
-    and the matched keys must come back as their true non-negative values rather
-    than as large negatives.
+    the only key whose decode has to undo a 16-byte sign flip. Each side holds
+    one key the other cannot represent, and neither may match.
     """
     sn = schema_name
     no_match = (2 ** 63) + 10
@@ -170,23 +157,3 @@ def test_a_cross_sign_join_key_surfaces_its_promoted_value(client, schema_name):
     vid = client.resolve_table(sn, "v")[0]
     got = list(client.scan(vid, include_hidden=True))
     assert bag(got, "_join_pk", "amount") == {(5, 1000): 1, (5, 4000): 1, (100, 2000): 1}
-
-
-def test_a_signed_128_bit_key_surfaces_across_its_whole_range(client):
-    """A matched join key always lands in the two operands' non-negative
-    overlap, so the negative half of the 128-bit key space is unreachable through
-    a real join. Driving it through the binary write path is the only way to
-    prove the client reads the whole range as signed — a value read as unsigned
-    comes back as `2**128 - 1` where `-1` was written.
-    """
-    lo, hi = -(2 ** 127), (2 ** 127) - 1
-    values = [lo, -1, 0, 1, hi]
-    schema = gnitz.Schema(
-        [gnitz.ColumnDef("pk", gnitz.TypeCode.I128, primary_key=True),
-         gnitz.ColumnDef("dup", gnitz.TypeCode.I128)], pk_indices=[0])
-    batch = gnitz.ZSetBatch(schema)
-    for v in values:
-        batch.append(pk=v, dup=v)
-
-    assert list(batch.pks) == values
-    assert list(batch.columns[1]) == values

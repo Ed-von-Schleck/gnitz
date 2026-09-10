@@ -24,6 +24,7 @@ workers, and a single-worker run skips the concatenation entirely.
 
 import pytest
 import gnitz
+from _read import rows
 
 
 # `ReadSpec`'s wire cap on a `pk IN (…)` gather; DML chunks past it.
@@ -41,14 +42,8 @@ def _sql(client, schema_name, *statements):
     return client.execute_sql("; ".join(statements), schema_name=schema_name)
 
 
-def _rows(client, schema_name, sql):
-    res = client.execute_sql(sql, schema_name=schema_name)
-    assert res[0]["type"] == "Rows", f"expected Rows, got {res[0]['type']}"
-    return list(res[0]["rows"])
-
-
 def _count(client, schema_name, table="t"):
-    return _rows(client, schema_name, f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
+    return rows(client, schema_name, f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +67,7 @@ def test_delete_by_predicate_leaves_a_text_payload_untouched(client, schema_name
     res = client.execute_sql("DELETE FROM t WHERE v = 0", schema_name=schema_name)
     assert res[0]["count"] == len([i for i in want if i % 3 == 0])
 
-    survivors = {r["id"]: r["s"] for r in _rows(client, schema_name, "SELECT id, s FROM t")}
+    survivors = {r["id"]: r["s"] for r in rows(client, schema_name, "SELECT id, s FROM t")}
     assert survivors == {i: s for i, s in want.items() if i % 3}
 
 
@@ -83,15 +78,15 @@ def test_delete_by_predicate_on_a_compound_pk_table(client, schema_name):
         "v BIGINT NOT NULL, s TEXT NOT NULL, PRIMARY KEY (a, b))",
         schema_name=schema_name,
     )
-    rows = [(a, b, a * 10 + b) for a in range(1, 4) for b in range(1, 4)]
+    seed = [(a, b, a * 10 + b) for a in range(1, 4) for b in range(1, 4)]
     client.execute_sql(
-        "INSERT INTO t VALUES " + ", ".join(f"({a}, {b}, {v}, 'p{a}{b}')" for a, b, v in rows),
+        "INSERT INTO t VALUES " + ", ".join(f"({a}, {b}, {v}, 'p{a}{b}')" for a, b, v in seed),
         schema_name=schema_name)
 
     res = client.execute_sql("DELETE FROM t WHERE v = 22", schema_name=schema_name)
     assert res[0]["count"] == 1
-    got = sorted((r["a"], r["b"]) for r in _rows(client, schema_name, "SELECT a, b FROM t"))
-    assert got == sorted((a, b) for a, b, v in rows if v != 22)
+    got = sorted((r["a"], r["b"]) for r in rows(client, schema_name, "SELECT a, b FROM t"))
+    assert got == sorted((a, b) for a, b, v in seed if v != 22)
 
 
 def test_delete_by_predicate_after_drop_column(client, schema_name):
@@ -108,7 +103,7 @@ def test_delete_by_predicate_after_drop_column(client, schema_name):
 
     res = client.execute_sql("DELETE FROM t WHERE v = 1", schema_name=schema_name)
     assert res[0]["count"] == 3
-    got = sorted((r["id"], r["v"]) for r in _rows(client, schema_name, "SELECT * FROM t"))
+    got = sorted((r["id"], r["v"]) for r in rows(client, schema_name, "SELECT * FROM t"))
     assert got == [(2, 0), (4, 0), (6, 0)]
 
 
@@ -148,7 +143,7 @@ def test_wide_key_equality_in_a_written_transaction(client, schema_name, pk_sql,
         "COMMIT",
     )
     assert res[2]["count"] == 1, "the wide-key UPDATE must find its row"
-    assert sorted(r["v"] for r in _rows(client, schema_name, "SELECT v FROM t")) == [7, 9]
+    assert sorted(r["v"] for r in rows(client, schema_name, "SELECT v FROM t")) == [7, 9]
 
     res = _sql(
         client,
@@ -180,8 +175,7 @@ def test_uuid_in_list_in_a_written_transaction(client, schema_name):
         "COMMIT",
     )
     assert res[2]["count"] == 1
-    rows = _rows(client, schema_name, "SELECT v FROM t")
-    assert [r["v"] for r in rows] == [5]
+    assert [r["v"] for r in rows(client, schema_name, "SELECT v FROM t")] == [5]
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +198,7 @@ def test_wide_pk_range_delete_in_autocommit(client, schema_name):
     _u128_table(client, schema_name)
     res = client.execute_sql("DELETE FROM t WHERE id > 5", schema_name=schema_name)
     assert res[0]["count"] == 5
-    assert sorted(int(r["id"]) for r in _rows(client, schema_name, "SELECT id FROM t")) == [1, 2, 3, 4, 5]
+    assert sorted(int(r["id"]) for r in rows(client, schema_name, "SELECT id FROM t")) == [1, 2, 3, 4, 5]
 
 
 def test_wide_pk_range_delete_over_a_tombstone_only_transaction(client, schema_name):
@@ -221,7 +215,7 @@ def test_wide_pk_range_delete_over_a_tombstone_only_transaction(client, schema_n
         "COMMIT",
     )
     assert res[2]["count"] == 5
-    assert sorted(int(r["id"]) for r in _rows(client, schema_name, "SELECT id FROM t")) == [2, 3, 4, 5]
+    assert sorted(int(r["id"]) for r in rows(client, schema_name, "SELECT id FROM t")) == [2, 3, 4, 5]
 
 
 def test_wide_pk_range_still_rejects_over_a_buffered_row(client, schema_name):
@@ -241,7 +235,7 @@ def test_wide_pk_range_still_rejects_over_a_buffered_row(client, schema_name):
     assert "128" in str(e.value), str(e.value)
     # The BEGIN opened in this same call, so the refusal auto-rolled it back:
     # nothing was committed and no buffer is left stranded.
-    assert sorted(int(r["id"]) for r in _rows(client, schema_name, "SELECT id FROM t")) == \
+    assert sorted(int(r["id"]) for r in rows(client, schema_name, "SELECT id FROM t")) == \
         [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     with pytest.raises(gnitz.GnitzError):
         client.execute_sql("ROLLBACK", schema_name=schema_name)
@@ -271,7 +265,7 @@ def test_pk_range_with_buffered_rows_straddling_the_cut(client, schema_name):
         "COMMIT",
     )
     assert res[2]["count"] == 2, "committed id=7 and buffered id=9; NOT buffered id=4"
-    got = sorted((r["id"], r["flag"]) for r in _rows(client, schema_name, "SELECT * FROM t"))
+    got = sorted((r["id"], r["flag"]) for r in rows(client, schema_name, "SELECT * FROM t"))
     assert got == [(1, 1), (4, 1), (8, 0)]
 
 
@@ -294,7 +288,7 @@ def test_compound_pk_prefix_and_range_bounds(client, schema_name):
         "COMMIT",
     )
     assert res[2]["count"] == 2, "committed (1,9) and buffered (1,7)"
-    assert sorted((r["a"], r["b"]) for r in _rows(client, schema_name, "SELECT a, b FROM t")) == [(1, 1), (2, 9)]
+    assert sorted((r["a"], r["b"]) for r in rows(client, schema_name, "SELECT a, b FROM t")) == [(1, 1), (2, 9)]
 
     # `a > 1` — a range on the leading PK column, no equality at all.
     res = _sql(
@@ -306,7 +300,7 @@ def test_compound_pk_prefix_and_range_bounds(client, schema_name):
         "COMMIT",
     )
     assert res[2]["count"] == 2, "committed (2,9) and buffered (5,5)"
-    assert sorted((r["a"], r["b"]) for r in _rows(client, schema_name, "SELECT a, b FROM t")) == [(1, 1)]
+    assert sorted((r["a"], r["b"]) for r in rows(client, schema_name, "SELECT a, b FROM t")) == [(1, 1)]
 
 
 def test_an_empty_residual_does_not_sweep_an_unrelated_buffered_row(client, schema_name):
@@ -328,7 +322,7 @@ def test_an_empty_residual_does_not_sweep_an_unrelated_buffered_row(client, sche
         "COMMIT",
     )
     assert res[2]["count"] == 1
-    assert sorted((r["id"], r["v"]) for r in _rows(client, schema_name, "SELECT * FROM t")) == [(11, 110)]
+    assert sorted((r["id"], r["v"]) for r in rows(client, schema_name, "SELECT * FROM t")) == [(11, 110)]
 
 
 def test_transaction_mixed_buffered_and_committed_delete(client, schema_name):
@@ -373,7 +367,7 @@ def test_update_read_your_own_writes_is_unchanged(client, schema_name):
         "COMMIT",
     )
     assert (res[2]["count"], res[3]["count"]) == (0, 1)
-    row = _rows(client, schema_name, "SELECT * FROM t")[0]
+    row = rows(client, schema_name, "SELECT * FROM t")[0]
     assert (row["id"], row["v"], row["w"]) == (1, 5, 2)
 
 
