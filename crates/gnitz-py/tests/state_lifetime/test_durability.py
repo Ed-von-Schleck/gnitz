@@ -35,13 +35,17 @@ def test_every_dml_verb_survives_two_crashes(own_server):
     """INSERT, UPDATE, DELETE and delete-then-reinsert, the last three applied
     repeatedly to one key, then two consecutive crashes with no clean shutdown
     between them. A retraction replayed twice nets the row to weight 0 and a
-    push replayed twice to weight 2, so the bag is the observable."""
+    push replayed twice to weight 2, so the bag is the observable. A SERIAL
+    table rides along: every id drawn after a crash exceeds every id committed
+    before it."""
     own_server.start()
     with gnitz.connect(own_server.sock_path) as conn:
         conn.create_schema("dur")
         conn.execute_sql(
             "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL, "
-            "s VARCHAR(500) NOT NULL, n BIGINT)", schema_name="dur")
+            "s VARCHAR(500) NOT NULL, n BIGINT); "
+            "CREATE TABLE q (id SERIAL PRIMARY KEY, name TEXT NOT NULL); "
+            "INSERT INTO q (name) VALUES ('a'), ('b'), ('c')", schema_name="dur")
         tid, _ = conn.resolve_table("dur", "t")
         conn.execute_sql(f"INSERT INTO t VALUES {_row_sql(_ROWS)}", schema_name="dur")
         for v in (200, 300, 400):
@@ -61,11 +65,16 @@ def test_every_dml_verb_survives_two_crashes(own_server):
         assert bag(scanned(conn, "dur", "t"), *_COLS) == want
         conn.execute_sql("INSERT INTO t VALUES (300, 3000, 'post', 1)",
                          schema_name="dur")
+        [d] = rows(conn, "dur", "INSERT INTO q (name) VALUES ('d') RETURNING id")
 
     own_server.restart()
     with gnitz.connect(own_server.sock_path) as conn:
         assert bag(scanned(conn, "dur", "t"), *_COLS) == want | {
             (300, 3000, "post", 1): 1}, "a second crash with no clean stop between"
+        [e] = rows(conn, "dur", "INSERT INTO q (name) VALUES ('e') RETURNING id")
+        assert 3 < d.id < e.id, "a SERIAL id reissued across a crash"
+        assert bag(scanned(conn, "dur", "q"), "id", "name") == {
+            (1, "a"): 1, (2, "b"): 1, (3, "c"): 1, (d.id, "d"): 1, (e.id, "e"): 1}
 
 
 def test_every_ddl_kind_survives_a_crash(own_server):

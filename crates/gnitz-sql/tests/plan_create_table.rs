@@ -192,6 +192,30 @@ fn a_stream_refuses_serial_a_foreign_key_and_a_unique() {
     assert!(c.props.stream && c.unique_indexes.is_empty());
 }
 
+/// The generated id has no compound form, so a SERIAL column is the table's
+/// whole primary key: outside the PK, inside a compound one, or beside a second
+/// SERIAL it is refused.
+#[test]
+fn a_serial_column_must_be_the_single_column_pk() {
+    let cat = catalog(vec![]);
+    for (sql, needle) in [
+        (
+            "CREATE TABLE a (id SERIAL, k BIGINT PRIMARY KEY)",
+            "single-column PRIMARY KEY",
+        ),
+        (
+            "CREATE TABLE b (id SERIAL, x BIGINT, PRIMARY KEY (id, x))",
+            "single-column PRIMARY KEY",
+        ),
+        (
+            "CREATE TABLE c (id SERIAL PRIMARY KEY, id2 SERIAL)",
+            "at most one SERIAL column",
+        ),
+    ] {
+        assert_rejects(sql, plan_table(&cat, sql), "Unsupported", needle);
+    }
+}
+
 // ── the bundle a plan carries ────────────────────────────────────────────────
 
 /// The FK loop rewrites its child column to the parent's type, and the UNIQUE

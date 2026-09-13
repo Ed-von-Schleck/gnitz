@@ -133,8 +133,14 @@ _UNHONOURED = [
     # An INSERT's source Query carries the same envelope, once dropped whole.
     ("INSERT INTO t VALUES (100, 200) LIMIT 1", "LIMIT/OFFSET is not supported"),
     ("INSERT INTO t VALUES (101, 201) FOR UPDATE", "FOR UPDATE/SHARE is not supported"),
-    # INSERT ... RETURNING is supported (mutation_pattern/test_serial.py);
-    # UPDATE and DELETE RETURNING are not.
+    # INSERT ... RETURNING projects source columns, a PK among them, and not
+    # beside ON CONFLICT; UPDATE and DELETE RETURNING are not supported.
+    ("INSERT INTO t VALUES (7, 70) RETURNING val + 1",
+     "only simple column references supported in RETURNING"),
+    ("INSERT INTO t VALUES (7, 70) RETURNING val",
+     "projection must include at least one PRIMARY KEY column"),
+    ("INSERT INTO t VALUES (7, 70) ON CONFLICT (pk) DO NOTHING RETURNING pk",
+     "RETURNING with ON CONFLICT is not supported"),
     ("UPDATE t SET val = 9 WHERE pk = 1 RETURNING pk", "UPDATE: RETURNING is not supported"),
     ("DELETE FROM t WHERE pk = 1 RETURNING pk", "DELETE: RETURNING is not supported"),
     ("DELETE FROM t LIMIT 1", "DELETE: LIMIT is not supported"),
@@ -145,6 +151,11 @@ _UNHONOURED = [
      "UPDATE: FROM .join-update. is not supported"),
     ("DELETE FROM t USING other u WHERE t.pk = u.pk",
      "DELETE: USING .join-delete. is not supported"),
+    # A joined UPDATE target parses; honouring only its relation would update
+    # every row of it.
+    ("UPDATE t JOIN u ON t.pk = u.pk SET val = 1", "UPDATE: exactly one simple FROM table required"),
+    # The PK is the row's identity, so an UPDATE may not move it.
+    ("UPDATE t SET pk = 9 WHERE pk = 1", "cannot assign to primary key column"),
     ("INSERT IGNORE INTO t VALUES (6, 60)", "INSERT: IGNORE is not supported"),
     ("REPLACE INTO t VALUES (6, 60)", "INSERT: REPLACE INTO is not supported"),
     ("CREATE TABLE t2 (pk BIGINT PRIMARY KEY) AS SELECT pk FROM t",

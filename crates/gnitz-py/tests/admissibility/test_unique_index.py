@@ -573,6 +573,40 @@ def test_a_push_whose_fold_leaves_two_claims_is_rejected(client, schema_name, co
     assert _rows(client, tid) == before
 
 
+@pytest.mark.parametrize("committed,frames,final", [
+    # Two frames claiming one value under different PKs leave two holders.
+    ([], [[(1, 5, 1)], [(2, 5, 1)]], None),
+    # A value retired from its committed holder in one frame is free for the next.
+    ([(1, 5)], [[(1, 0, -1)], [(2, 5, 1)]], [(2, 5)]),
+    # Values shifting across rows the bundle itself creates.
+    ([], [[(1, 5, 1), (2, 6, 1)], [(2, 5, 1), (1, 7, 1)]], [(1, 7), (2, 5)]),
+    # A claim a later frame supersedes frees its value for a third.
+    ([], [[(1, 5, 1)], [(1, 6, 1)], [(2, 5, 1)]], [(1, 6), (2, 5)]),
+], ids=["two-holders", "retire-then-take", "value-shift", "superseded-claim"])
+def test_a_transaction_is_validated_against_the_fold_of_its_frames(
+        client, schema_name, committed, frames, final):
+    """The frames of one bundle fold together before any claim is checked,
+    exactly as the rows of one push do: only the post-transaction holders
+    count."""
+    tid, schema = _raw_table(client, schema_name)
+    if committed:
+        client.push(tid, gnitz.ZSetBatch(schema).extend([{"pk": p, "val": v} for p, v in committed]))
+
+    def run():
+        with client.transaction() as txn:
+            for frame in frames:
+                txn.push(tid, gnitz.ZSetBatch(schema).extend(
+                    [{"pk": p, "val": v, "_weight": w} for p, v, w in frame]))
+
+    if final is None:
+        with pytest.raises(gnitz.GnitzError, match=_VIOLATION):
+            run()
+        final = sorted(committed)
+    else:
+        run()
+    assert _rows(client, tid) == final
+
+
 def test_bulk_colliding_fresh_pks_rejected(client, schema_name):
     """A re-run bulk load: 2000 fresh PKs re-claiming 2000 committed values,
     none of which the batch frees. Every span comes back occupied by a holder

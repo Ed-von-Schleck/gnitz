@@ -110,6 +110,20 @@ fn negative_zero_is_accepted_by_an_unsigned_wide_pk() {
     }
 }
 
+/// A SERIAL id past the column type's maximum is refused before anything is
+/// pushed, and the last id that fits is not.
+#[test]
+fn a_serial_id_past_the_type_maximum_is_exhausted() {
+    let schema = pk_schema(TypeCode::I16);
+    let plan = PkPlan::serial(&schema, i16::MAX as u64, TypeCode::I16);
+    let mut dst = PkColumn::empty_for_schema(&schema);
+    plan.push(0, &[], &mut dst).unwrap();
+    match plan.push(1, &[], &mut dst) {
+        Err(GnitzSqlError::Bind(m)) => assert!(m.contains("exhausted"), "{m}"),
+        other => panic!("expected Bind, got {other:?}"),
+    }
+}
+
 #[test]
 fn parse_pk_literal_packed_rejects_out_of_range() {
     // The regression guard for the truncation fix: an I32 literal above the

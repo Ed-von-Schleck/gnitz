@@ -8,6 +8,7 @@ DO UPDATE. Everything else about the target is unsupported in v1 and says so.
 
 import pytest
 import gnitz
+from _read import bag
 from _serverproc import NEEDS_MULTI
 
 _DDL = "CREATE TABLE t (pk BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
@@ -18,10 +19,6 @@ def t(client, schema_name):
     """`t(pk, val)` in a fresh schema; yields its tid."""
     client.execute_sql(_DDL, schema_name=schema_name)
     return client.resolve_table(schema_name, "t")[0]
-
-
-def _rows(client, tid):
-    return sorted((row.pk, row.val) for row in client.scan(tid))
 
 
 # A rejected INSERT applies nothing — the batch is atomic whether the conflict is
@@ -41,7 +38,7 @@ def test_duplicate_pk_rejects_the_whole_statement(client, schema_name, t, seed, 
         client.execute_sql(seed, schema_name=schema_name)
     with pytest.raises(gnitz.GnitzError, match="(?i)duplicate key"):
         client.execute_sql(stmt, schema_name=schema_name)
-    assert _rows(client, t) == final
+    assert bag(client.scan(t), "pk", "val") == dict.fromkeys(final, 1)
 
 
 _ON_CONFLICT = [
@@ -73,7 +70,9 @@ _ON_CONFLICT = [
 def test_on_conflict_resolves_instead_of_rejecting(client, schema_name, t, seed, stmt, final):
     client.execute_sql(seed, schema_name=schema_name)
     client.execute_sql(stmt, schema_name=schema_name)
-    assert _rows(client, t) == final
+    # A conflict resolved on a worker other than the key's owner leaves the
+    # original row beside its replacement.
+    assert bag(client.scan(t), "pk", "val") == dict.fromkeys(final, 1)
 
 
 _UNSUPPORTED = [

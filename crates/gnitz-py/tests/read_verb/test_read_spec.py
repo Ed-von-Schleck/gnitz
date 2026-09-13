@@ -105,10 +105,10 @@ def test_a_signed_pk_range_orders_across_zero(client, schema_name):
 def test_a_pk_set_gathers_every_named_key(client, kv):
     """`id IN (…)` is the PkSet gather: broadcast, each worker answering only the
     keys it owns. The union must be the whole list at weight 1 — a key two
-    workers both claim shows up here as weight 2 — and absent keys miss silently
-    rather than erroring."""
+    workers both claim shows up here as weight 2, as does a key the list names
+    twice — and absent keys miss silently rather than erroring."""
     wanted = list(range(0, NROWS, 3))
-    in_list = ",".join(str(i) for i in wanted + [NROWS + 99])
+    in_list = ",".join(str(i) for i in wanted + wanted[:3] + [NROWS + 99])
     assert bag(rows(client, kv, f"SELECT id, v FROM t WHERE id IN ({in_list})")) == \
         {(i, i * 10): 1 for i in wanted}
 

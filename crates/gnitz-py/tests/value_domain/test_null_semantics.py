@@ -134,7 +134,7 @@ def lr(client, schema_name):
         "CREATE TABLE l (id BIGINT NOT NULL PRIMARY KEY, fk BIGINT)",
         schema_name=schema_name)
     client.execute_sql(
-        "CREATE TABLE r (k BIGINT NOT NULL PRIMARY KEY, rk BIGINT, name BIGINT NOT NULL)",
+        "CREATE TABLE r (k BIGINT NOT NULL PRIMARY KEY, rk BIGINT, name BIGINT)",
         schema_name=schema_name)
     return schema_name
 
@@ -142,7 +142,7 @@ def lr(client, schema_name):
 def test_a_null_key_matches_neither_a_zero_nor_another_null(client, lr):
     """Both directions at once: the left NULL must miss the right `0`, and two
     NULLs — one on each side — must miss each other. Only the real pair matches,
-    at weight 1.
+    at weight 1 — and a matched row's NULL payload crosses the join still NULL.
 
     The key here is `r.rk`, a plain column the exchange builds a key for; the
     left-join case below joins `r.k`, the key region itself — two routes to the
@@ -153,14 +153,14 @@ def test_a_null_key_matches_neither_a_zero_nor_another_null(client, lr):
         "CREATE VIEW v AS SELECT l.id AS id, r.name AS name FROM l JOIN r ON l.fk = r.rk",
         schema_name=sn)
     client.execute_sql(
-        "INSERT INTO r VALUES (100, 0, 900), (101, NULL, 901), (102, 7, 907)",
+        "INSERT INTO r VALUES (100, 0, 900), (101, NULL, 901), (102, 7, NULL)",
         schema_name=sn)
     client.execute_sql(
         "INSERT INTO l VALUES (1, NULL), (2, 0), (3, 7), (4, NULL)", schema_name=sn)
 
     # id 2 matches the real 0; id 3 matches 7. The two NULL left rows match
     # neither the real 0 nor the NULL right row.
-    assert bag(scanned(client, sn, "v"), "id", "name") == {(2, 900): 1, (3, 907): 1}
+    assert bag(scanned(client, sn, "v"), "id", "name") == {(2, 900): 1, (3, None): 1}
 
 
 @pytest.mark.parametrize("key_sql,zero", [("BIGINT", "0"), ("TEXT", "''")], ids=["int", "text"])

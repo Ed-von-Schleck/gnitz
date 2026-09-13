@@ -11,6 +11,7 @@ import threading
 import pytest
 import gnitz
 from _serverproc import NEEDS_MULTI
+from _read import bag, scanned
 from _uid import uid as _uid
 
 _PARENT = "CREATE TABLE parent (id BIGINT NOT NULL PRIMARY KEY, val BIGINT NOT NULL)"
@@ -236,6 +237,45 @@ def test_delete_blocked_by_either_of_two_children(client, schema_name):
     # is enough.
     client.execute_sql("DELETE FROM child1 WHERE cid = 10", schema_name=schema_name)
     client.execute_sql("DELETE FROM parent WHERE id = 1", schema_name=schema_name)
+
+
+# (committed parent ids, committed child rows, a transaction body, the parents
+# and children after it — or None where it is refused and both keep what they
+# held). The bundle is checked against its fold, not statement by statement, so
+# order and a retire-then-restore of a referenced key never matter.
+_FK_BUNDLES = {
+    "a child before its parent": (
+        [], [], "INSERT INTO child VALUES (1, 100); INSERT INTO parent VALUES (100, 0)",
+        ([(100, 0)], [(1, 100)])),
+    "a parent re-inserted beside a new child": (
+        [100], [], "DELETE FROM parent WHERE id = 100; INSERT INTO parent VALUES (100, 1); "
+                   "INSERT INTO child VALUES (1, 100)",
+        ([(100, 1)], [(1, 100)])),
+    "a child re-pointed off the parent the bundle deletes": (
+        [100, 200], [(1, 100)],
+        "DELETE FROM parent WHERE id = 100; UPDATE child SET pid = 200 WHERE cid = 1",
+        ([(200, 0)], [(1, 200)])),
+    "a child inserted under the parent the bundle deletes": (
+        [100], [], "DELETE FROM parent WHERE id = 100; INSERT INTO child VALUES (1, 100)", None),
+}
+
+
+@pytest.mark.parametrize("parents,children,body,after", _FK_BUNDLES.values(), ids=_FK_BUNDLES.keys())
+def test_a_transaction_is_checked_against_its_fold(client, fk_pair, parents, children, body, after):
+    sn = fk_pair
+    before = ([(p, 0) for p in parents], children)
+    for table, rows in zip(("parent", "child"), before):
+        if rows:
+            client.execute_sql(f"INSERT INTO {table} VALUES " + ", ".join(map(str, rows)),
+                               schema_name=sn)
+    if after is None:
+        with pytest.raises(gnitz.GnitzError, match="(?i)foreign key"):
+            client.execute_sql(f"BEGIN; {body}; COMMIT", schema_name=sn)
+        after = before
+    else:
+        client.execute_sql(f"BEGIN; {body}; COMMIT", schema_name=sn)
+    assert (bag(scanned(client, sn, "parent")), bag(scanned(client, sn, "child"))) == tuple(
+        dict.fromkeys(rows, 1) for rows in after)
 
 
 def test_fk_holds_across_partitions_in_bulk(client, fk_pair):

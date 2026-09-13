@@ -66,6 +66,52 @@ fn explain_runs_inside_a_transaction() {
     exec(&mut client, &sn, "COMMIT");
 }
 
+/// Transaction control is a client-side state machine: a COMMIT or ROLLBACK
+/// with nothing open and a nested BEGIN are refused, each isolation, chaining
+/// or savepoint clause names itself and opens or closes nothing, and a
+/// statement that may not run inside a transaction is refused without closing
+/// it.
+#[test]
+fn transaction_control_refuses_what_it_cannot_honour() {
+    fn refuses(client: &mut GnitzClient, sn: &str, sql: &str, needle: &str) {
+        let e = try_exec(client, sn, sql).expect_err(sql);
+        assert!(variant_of(&e).1.contains(needle), "`{sql}`: {e:?}");
+    }
+    let (_srv, mut client, sn) = boot(1);
+    exec(&mut client, &sn, "CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)");
+    for (sql, needle) in [
+        ("COMMIT", "no transaction open"),
+        ("ROLLBACK", "no transaction open"),
+        ("BEGIN READ ONLY", "transaction modes"),
+        ("START TRANSACTION ISOLATION LEVEL SERIALIZABLE", "transaction modes"),
+        ("BEGIN DEFERRED", "BEGIN modifier"),
+        ("COMMIT AND CHAIN", "AND CHAIN"),
+        ("ROLLBACK AND CHAIN", "AND CHAIN"),
+        ("ROLLBACK TO SAVEPOINT sp", "TO SAVEPOINT"),
+    ] {
+        refuses(&mut client, &sn, sql, needle);
+    }
+    exec(&mut client, &sn, "BEGIN");
+    exec(&mut client, &sn, "INSERT INTO t VALUES (1, 10)");
+    for (sql, needle) in [
+        ("BEGIN", "already open"),
+        (
+            "CREATE TABLE t2 (id BIGINT PRIMARY KEY)",
+            "not allowed inside a transaction",
+        ),
+        ("CREATE VIEW v AS SELECT id FROM t", "not allowed inside a transaction"),
+        ("CREATE INDEX ON t (v)", "not allowed inside a transaction"),
+        ("DROP TABLE t", "not allowed inside a transaction"),
+    ] {
+        refuses(&mut client, &sn, sql, needle);
+    }
+    exec(&mut client, &sn, "COMMIT");
+    assert_eq!(
+        rows(&mut client, &sn, "SELECT * FROM t", &["id", "v"]),
+        at_weight_one(&[vec![1, 10]])
+    );
+}
+
 // ── Reply framing past one frame ─────────────────────────────────────────────
 //
 // A reply of any schema splits across frames, a TEXT column included: each frame
