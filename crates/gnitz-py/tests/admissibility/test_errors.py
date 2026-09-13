@@ -128,7 +128,7 @@ def test_writes_to_a_view_are_rejected_and_change_nothing(client, view_target):
     tid, t_schema, vid, v_schema = view_target
 
     def rows():
-        return sorted((r.pk, r.val, r.weight) for r in client.scan(vid))
+        return sorted((r.pk, r.val, r._weight) for r in client.scan(vid))
 
     batch = gnitz.ZSetBatch(v_schema)
     batch.append(pk=999, val=999)

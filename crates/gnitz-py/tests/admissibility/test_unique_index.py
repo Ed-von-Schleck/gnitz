@@ -189,7 +189,7 @@ def test_pk_column_unique_index_short_circuits(client, schema_name):
     b = gnitz.ZSetBatch(schema)
     b.append(pk=1, val=10, _weight=2)
     client.push(tid, b)
-    assert [(r.pk, r.weight) for r in client.scan(tid)] == [(1, 1)]
+    assert [(r.pk, r._weight) for r in client.scan(tid)] == [(1, 1)]
     b = gnitz.ZSetBatch(schema)
     b.append(pk=1, val=10, _weight=-1)
     client.push(tid, b)

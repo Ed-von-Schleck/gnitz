@@ -39,7 +39,7 @@ def _zset(rows):
     out = {}
     for r in rows:
         k = _key(r)
-        out[k] = out.get(k, 0) + r.weight
+        out[k] = out.get(k, 0) + r._weight
     return {k: w for k, w in out.items() if w != 0}
 
 
@@ -48,7 +48,6 @@ def _mk_feed(client, sn, name, body, feed=FEED):
 
 
 def _base_tables(client, sn):
-    client.create_schema(sn)
     client.execute_sql(
         "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, v BIGINT NOT NULL, body TEXT NOT NULL)",
         schema_name=sn,

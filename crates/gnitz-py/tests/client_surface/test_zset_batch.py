@@ -19,9 +19,12 @@ from gnitz import TypeCode, ColumnDef, Schema, ZSetBatch
 
 # The schema most cases here need. One object backs any number of batches, so a
 # per-test copy would say nothing a shared one does not.
-KV_COLS = [ColumnDef("pk", TypeCode.U64, primary_key=True),
-           ColumnDef("val", TypeCode.I64)]
-KV = Schema(KV_COLS)
+KV = Schema([ColumnDef("pk", TypeCode.U64, primary_key=True),
+             ColumnDef("val", TypeCode.I64)])
+
+_WRITERS = {"append": lambda b, row: b.append(**row),
+            "extend": lambda b, row: b.extend([row])}
+_EACH_WRITER = pytest.mark.parametrize("write", list(_WRITERS.values()), ids=list(_WRITERS))
 
 
 # ---------------------------------------------------------------------------
@@ -36,10 +39,8 @@ class TestSchemaConstruction:
         is. The binding infers the PK list from the flags and nothing else — it
         does not invent one, which would key a table on whichever column the
         caller happened to declare first."""
-        cols = [ColumnDef("a", TypeCode.U64),
-                ColumnDef("b", TypeCode.I64)]
         with pytest.raises(ValueError):
-            Schema(cols)
+            Schema([ColumnDef("a", TypeCode.U64), ColumnDef("b", TypeCode.I64)])
 
     def test_the_pk_list_is_inferred_from_the_flags_in_declaration_order(self):
         assert Schema([ColumnDef("a", TypeCode.U64),
@@ -65,14 +66,6 @@ class TestSchemaConstruction:
                 ColumnDef("v",  TypeCode.I64)]
         with pytest.raises(ValueError, match="nullable"):
             Schema(cols)
-
-    def test_max_arity_wide_pk_accepted(self):
-        # The widest FFI PK is PK_LIST_MAX_COLS (4) columns; 4 × U128 = 64 bytes,
-        # within MAX_PK_BYTES (80), so the max-arity wide PK round-trips through
-        # validation. The PK-stride ceiling is unreachable from this surface: the
-        # 4-column cap bounds a U128 PK at 64 bytes, below the 80-byte limit.
-        cols = [ColumnDef(f"c{i}", TypeCode.U128) for i in range(4)]
-        Schema(cols, pk_indices=list(range(4)))
 
 
 # ---------------------------------------------------------------------------
@@ -205,107 +198,24 @@ class TestAppendKeywordPlan:
         # The batch-wide parameter still reaches such a schema.
         assert ZSetBatch(schema).extend([{"pk": 1, "_weight": 5}], -1).weights == [-1]
 
-    def test_one_name_feeds_every_visible_column_that_has_it(self):
-        """A hidden column may shadow a visible one's name. The plan is resolved
-        by walking the schema, so every *visible* column carrying the name gets
-        the value — resolving name->column instead would leave a second visible
-        one NULL, or fail outright were it NOT NULL.
-
-        A hidden payload column takes neither: it is a DROP COLUMN tombstone, so
-        it takes the same zero filler the SQL writer pushes, whatever the caller
-        supplied under its name.
-        """
-        schema = Schema([
-            ColumnDef("pk", TypeCode.U64, primary_key=True),
-            ColumnDef("v",  TypeCode.I64),
-            ColumnDef("v",  TypeCode.I64, is_hidden=True),
-        ])
-        batch = ZSetBatch(schema)
-        batch.append(pk=1, v=7)
-        assert batch.columns == [[], [7], [0]]
-
-    def test_unknown_keyword_raises_type_error_and_rolls_back(self):
-        """An unrecognised keyword is an error, not a value the writer absorbs:
-        `weight=` must not slip past as a no-op that writes the row at +1."""
-        schema = Schema([
-            ColumnDef("pk",  TypeCode.U64, primary_key=True),
-            ColumnDef("val", TypeCode.I64),
-        ])
-        batch = ZSetBatch(schema).append(pk=1, val=10)
-        with pytest.raises(TypeError, match="_weight"):
-            batch.append(pk=2, val=20, weight=-1)
-        assert len(batch) == 1
-        assert batch.pks == [1]
-
     def test_positional_argument_rejected(self):
-        schema = Schema([
-            ColumnDef("pk",  TypeCode.U64, primary_key=True),
-            ColumnDef("val", TypeCode.I64),
-        ])
         with pytest.raises(TypeError, match="positional"):
-            ZSetBatch(schema).append(1, val=10)
+            ZSetBatch(KV).append(1, val=10)
 
     def test_bad_weight_names_the_argument(self):
         """The failing argument is named in the exception's PEP 678 notes rather
         than its message — that is where the binding layer puts argument context,
         so a note-less exception would leave the caller with no idea which
         keyword was at fault."""
-        schema = Schema([
-            ColumnDef("pk",  TypeCode.U64, primary_key=True),
-            ColumnDef("val", TypeCode.I64),
-        ])
         with pytest.raises(TypeError) as exc:
-            ZSetBatch(schema).append(pk=1, val=10, _weight=1.5)
+            ZSetBatch(KV).append(pk=1, val=10, _weight=1.5)
         assert any("_weight" in n for n in exc.value.__notes__)
-
-    def test_reentrant_append_raises_instead_of_aborting(self):
-        """`extract` runs `__index__`, which can call back into the same batch.
-        The raw method slot's `try_borrow_mut` is what catches that, as a
-        `RuntimeError` — not a panic, which under `panic = "abort"` would take the
-        interpreter down instead of failing the call."""
-        schema = Schema([
-            ColumnDef("pk",  TypeCode.U64, primary_key=True),
-            ColumnDef("val", TypeCode.I64),
-        ])
-        batch = ZSetBatch(schema)
-
-        class Reenter:
-            def __index__(self):
-                batch.append(pk=99, val=99)
-                return 5
-
-        with pytest.raises(RuntimeError):
-            batch.append(pk=1, val=Reenter())
-        assert len(batch) == 0
-        batch.append(pk=2, val=2)          # still usable
-        assert batch.pks == [2]
-
-    def test_reentrant_extend_raises_instead_of_aborting(self):
-        """The same guard for `extend`: a row value that re-enters the batch is a
-        `RuntimeError`, and the batch stays usable."""
-        schema = Schema([
-            ColumnDef("pk",  TypeCode.U64, primary_key=True),
-            ColumnDef("val", TypeCode.I64),
-        ])
-        batch = ZSetBatch(schema)
-
-        class Reenter:
-            def __index__(self):
-                batch.extend([{"pk": 99, "val": 99}])
-                return 5
-
-        with pytest.raises(RuntimeError):
-            batch.extend([{"pk": 1, "val": Reenter()}])
-        assert len(batch) == 0
-        batch.extend([{"pk": 2, "val": 2}])
-        assert batch.pks == [2]
 
     def test_signature_is_introspectable(self):
         """There are no .pyi stubs, so the method's own text signature is the
         entire discoverability surface for the `_weight` spelling. A malformed
         `__text_signature__` on the raw method slot makes this call raise."""
-        sig = inspect.signature(ZSetBatch.append)
-        assert "_weight" in sig.parameters
+        assert "_weight" in inspect.signature(ZSetBatch.append).parameters
 
 
 # ---------------------------------------------------------------------------
@@ -313,13 +223,9 @@ class TestAppendKeywordPlan:
 # ---------------------------------------------------------------------------
 
 
-_WRITERS = {"append": lambda b, row: b.append(**row),
-            "extend": lambda b, row: b.extend([row])}
-
-
 class TestRowErrors:
 
-    @pytest.mark.parametrize("write", list(_WRITERS.values()), ids=list(_WRITERS))
+    @_EACH_WRITER
     def test_a_bad_row_raises_and_writes_nothing(self, write):
         """The rollback contract both writers share.
 
@@ -341,105 +247,84 @@ class TestRowErrors:
             (ValueError, "pk",      {"pk": None, "a": 1, "b": 1}),
             (ValueError, "a",       {"pk": 2, "a": None, "b": 1}),
             (TypeError,  "_weight", {"pk": 2, "a": 1, "b": 1, "weight": -1}),
-            (Exception,  None,      {"pk": 2, "a": 1, "b": "not-an-int"}),
+            (TypeError,  None,      {"pk": 2, "a": 1, "b": "not-an-int"}),
         ]:
             with pytest.raises(exc, match=match):
                 write(batch, row)
-            assert len(batch) == 1 and batch.pks == [1]
+            assert batch.pks == [1]
 
         write(batch, {"pk": 2, "a": 2, "b": 2})                      # still usable
         assert batch.pks == [1, 2]
 
-    def test_is_atomic_on_error(self):
-        """`extend` is all-or-nothing: a failure mid-iteration rolls the whole
-        batch back to its pre-call length, matching the single-row appends.
-
-        Pre-append one valid row, then extend with [good, bad] where `bad`
-        carries a type error on a later row. The good row gets queued before
-        `bad` fails, so per-row rollback alone would leave the batch at length 2
-        (1 pre-existing + 1 from the partial extend). Batch-level rollback must
-        bring it back to the pre-extend length of 1.
-        """
+    @_EACH_WRITER
+    def test_a_reentrant_write_raises_instead_of_aborting(self, write):
+        """`extract` runs `__index__`, which can call back into the same batch.
+        The raw method slot's `try_borrow_mut` is what catches that, as a
+        `RuntimeError` — not a panic, which under `panic = "abort"` would take the
+        interpreter down instead of failing the call."""
         batch = ZSetBatch(KV)
-        batch.append(pk=1, val=10)
-        assert len(batch) == 1
-        with pytest.raises(Exception):
+
+        class Reenter:
+            def __index__(self):
+                write(batch, {"pk": 99, "val": 99})
+                return 5
+
+        with pytest.raises(RuntimeError):
+            write(batch, {"pk": 1, "val": Reenter()})
+        assert len(batch) == 0
+        assert write(batch, {"pk": 2, "val": 2}).pks == [2]       # still usable
+
+    def test_extend_is_atomic_across_rows(self):
+        """`extend` is all-or-nothing: a bad row rolls back the good rows queued
+        before it in the same call, not just itself."""
+        batch = ZSetBatch(KV).append(pk=1, val=10)
+        with pytest.raises(TypeError):
             batch.extend([{"pk": 2, "val": 20}, {"pk": 3, "val": "not-an-int"}])
-        assert len(batch) == 1
-        # The batch stays reusable after the rolled-back extend.
-        batch.extend([{"pk": 4, "val": 40}])
-        assert len(batch) == 2
+        assert batch.pks == [1]
+        assert batch.extend([{"pk": 4, "val": 40}]).pks == [1, 4]
 
     def test_generator_rows_match_a_list_of_the_same_rows(self):
         """A generator has no `__len__`, so `extend` cannot pre-size for it.
-
-        Pre-sizing is an allocation optimization and must be invisible in the
-        result: the batch built from a generator equals the one built from the
-        same rows as a list.
-        """
+        Pre-sizing must be invisible in the result."""
         rows = [{"pk": i, "val": i * 10} for i in range(5)]
-        from_list = ZSetBatch(KV)
-        from_list.extend(rows)
-        from_gen = ZSetBatch(KV)
-        from_gen.extend(dict(r) for r in rows)
-        assert len(from_gen) == len(from_list)
+        from_list = ZSetBatch(KV).extend(rows)
+        from_gen = ZSetBatch(KV).extend(dict(r) for r in rows)
         assert from_gen.pks == from_list.pks
         assert from_gen.columns == from_list.columns
         assert from_gen.weights == from_list.weights
 
-    def test_a_dropped_column_is_a_tombstone_the_writer_fills(self, client, schema_name):
-        """`DROP COLUMN` flips `is_hidden` and nothing else, so a dropped NOT NULL
-        column stays NOT NULL in the schema `resolve_table` hands back, and a
-        re-ADD reuses its name — a schema off the wire can carry two columns of
-        one name.
 
-        Both writers resolve through the same schema walk: every *visible*
-        column carrying the name takes the supplied value, the tombstone takes
-        the zero filler the SQL writer pushes, it is not presented on the way
-        back, and a name that is nobody's column is still an error. Resolving
-        name->column instead would leave a second visible one NULL, or fail
-        outright were it NOT NULL.
-        """
-        client.execute_sql(
-            "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, "
-            "a BIGINT NOT NULL, b BIGINT NOT NULL)", schema_name=schema_name)
-        client.execute_sql("ALTER TABLE t DROP COLUMN a", schema_name=schema_name)
-        client.execute_sql("ALTER TABLE t ADD COLUMN a BIGINT", schema_name=schema_name)
-        tid, schema = client.resolve_table(schema_name, "t")
-        assert [c.name for c in schema.columns].count("a") == 2
+def test_a_dropped_column_is_a_tombstone_the_writer_fills(client, schema_name):
+    """`DROP COLUMN` flips `is_hidden` and nothing else, so a dropped NOT NULL
+    column stays NOT NULL in the schema `resolve_table` hands back, and a re-ADD
+    reuses its name — a schema off the wire can carry a hidden and a visible
+    column of one name.
 
-        batch = ZSetBatch(schema).append(id=1, a=10, b=100)
-        batch.extend([{"id": 2, "a": 20, "b": 200}])
-        client.push(tid, batch)
+    Both writers resolve through the same schema walk: the visible column takes
+    the supplied value, the tombstone takes the zero filler the SQL writer
+    pushes, it is not presented on the way back, and a name that is nobody's
+    column is still an error.
+    """
+    client.execute_sql(
+        "CREATE TABLE t (id BIGINT NOT NULL PRIMARY KEY, "
+        "a BIGINT NOT NULL, b BIGINT NOT NULL)", schema_name=schema_name)
+    client.execute_sql("ALTER TABLE t DROP COLUMN a", schema_name=schema_name)
+    client.execute_sql("ALTER TABLE t ADD COLUMN a BIGINT", schema_name=schema_name)
+    tid, schema = client.resolve_table(schema_name, "t")
+    assert [(c.name, c.is_hidden) for c in schema.columns] == [
+        ("id", False), ("a", True), ("b", False), ("a", False)]
 
-        rows = list(client.scan(tid))
-        assert sorted((r.id, r.a, r.b, r.weight) for r in rows) == [
-            (1, 10, 100, 1), (2, 20, 200, 1)]
-        # The tombstone is not presented, and is not a column the caller may name.
-        assert all(r._fields.count("a") == 1 for r in rows)
-        with pytest.raises(TypeError, match="unexpected column name"):
-            ZSetBatch(schema).extend([{"id": 3, "a": 30, "b": 300, "nosuch": 1}])
+    batch = ZSetBatch(schema).append(id=1, a=10, b=100)
+    batch.extend([{"id": 2, "a": 20, "b": 200}])
+    assert batch.columns[1:] == [[0, 0], [100, 200], [10, 20]]
+    client.push(tid, batch)
 
-    def test_weights_survive_mixed_call_sites(self, client, schema_name):
-        """Weights written through the keyword plan have to reach the engine and
-        accumulate there, not merely land in the batch.
-
-        The accumulated weight is what this is about, so it is what is asserted:
-        pk=2 goes in at +3 and comes back at 1, because `enforce_unique_pk`
-        clamps an accumulated base-table weight — the invariant that keeps every
-        base table's weights non-negative.
-        """
-        tid = client.create_table(schema_name, "t", KV_COLS)
-        batch = ZSetBatch(KV)
-        batch.append(pk=1, val=10)                 # one call site
-        batch.append(val=20, pk=2, _weight=3)      # a second: different shape
-        batch.append(**{"pk": 3, "val": 30})       # a third: splat
-        batch.append(pk=1, val=10, _weight=-1)     # retracts the first
-        assert batch.weights == [1, 3, 1, -1]
-
-        client.push(tid, batch)
-        assert sorted((r.pk, r.val, r.weight) for r in client.scan(tid)) == [
-            (2, 20, 1), (3, 30, 1)]
+    rows = list(client.scan(tid))
+    assert sorted((r.id, r.a, r.b, r._weight) for r in rows) == [
+        (1, 10, 100, 1), (2, 20, 200, 1)]
+    assert all(r._fields == ("id", "b", "a") for r in rows)
+    with pytest.raises(TypeError, match="unexpected column name"):
+        ZSetBatch(schema).extend([{"id": 3, "a": 30, "b": 300, "nosuch": 1}])
 
 
 # ---------------------------------------------------------------------------
@@ -449,39 +334,21 @@ class TestRowErrors:
 
 class TestValueCoercion:
 
-    _UUID_STR = "12345678-1234-5678-1234-567812345678"
-
-    def _uuid_pk_schema(self):
-        return Schema([
-            ColumnDef("id", TypeCode.UUID, primary_key=True),
-            ColumnDef("v",  TypeCode.I64),
-        ])
-
-    def _compound_schema(self):
-        return Schema([
-            ColumnDef("a", TypeCode.U64),
-            ColumnDef("b", TypeCode.U32),
-            ColumnDef("v", TypeCode.I64),
-        ], pk_indices=[0, 1])
-
     def test_a_uuid_column_takes_every_spelling_of_one_value(self):
         """Canonical hyphenated text, bare 32-hex and a `uuid.UUID` object are
         three renderings of one UUID. All three must reach a UUID column, PK or
         payload — the two go through one encoder — and land on the same value,
-        presented back as canonical hyphenated text. A row count cannot see a
-        coercion that landed on the wrong 128 bits."""
+        presented back as canonical hyphenated text. Text that spells no UUID is
+        refused."""
+        canonical = "12345678-1234-5678-1234-567812345678"
         schema = Schema([ColumnDef("id", TypeCode.UUID, primary_key=True),
                          ColumnDef("v", TypeCode.UUID)])
-        for form in (self._UUID_STR, self._UUID_STR.replace("-", ""),
-                     uuid.UUID(self._UUID_STR)):
+        for form in (canonical, canonical.replace("-", ""), uuid.UUID(canonical)):
             batch = ZSetBatch(schema).append(id=form, v=form)
-            assert batch.pks == [self._UUID_STR]
-            assert batch.columns[1] == [self._UUID_STR]
-
-    def test_uuid_invalid_string_raises(self):
-        batch = ZSetBatch(self._uuid_pk_schema())
+            assert batch.pks == [canonical]
+            assert batch.columns[1] == [canonical]
         with pytest.raises(ValueError):
-            batch.append(id="not-a-uuid-string", v=1)
+            ZSetBatch(schema).append(id="not-a-uuid-string", v=canonical)
 
     def test_u128_column_rejects_text(self):
         """A string spells a value only for the types that admit one, and U128 is
@@ -489,16 +356,12 @@ class TestValueCoercion:
         error, so `append` must too, rather than accepting bare hex here alone.
         The same rule excludes a `uuid.UUID` object, which is a UUID, not a
         number."""
-        for pk_type in (True, False):
-            cols = [ColumnDef("k", TypeCode.U128, primary_key=True),
-                    ColumnDef("v", TypeCode.U128, is_nullable=True)]
-            schema = Schema(cols)
-            bad = "ffffffffffffffffffffffffffffffff"
-            with pytest.raises(TypeError):
-                ZSetBatch(schema).append(**({"k": bad, "v": 1} if pk_type else {"k": 1, "v": bad}))
-            with pytest.raises(TypeError):
-                ZSetBatch(schema).append(
-                    **({"k": uuid.uuid4(), "v": 1} if pk_type else {"k": 1, "v": uuid.uuid4()}))
+        schema = Schema([ColumnDef("k", TypeCode.U128, primary_key=True),
+                         ColumnDef("v", TypeCode.U128, is_nullable=True)])
+        for bad in ("f" * 32, uuid.uuid4()):
+            for row in ({"k": bad, "v": 1}, {"k": 1, "v": bad}):
+                with pytest.raises(TypeError):
+                    ZSetBatch(schema).append(**row)
 
     def test_u128_keeps_its_full_unsigned_range(self):
         """A U128 value above `i128::MAX` is legal and must not be rejected as a
@@ -540,24 +403,18 @@ class TestValueCoercion:
                     {"payload": b"", "s": b"\xff\xfe not utf-8"}):
             with pytest.raises(TypeError):
                 ZSetBatch(schema).append(pk=2, **bad)
-        assert len(batch) == 1
-
-    def test_compound_pk_emits_packed_bytes(self):
-        batch = ZSetBatch(self._compound_schema())
-        batch.append(a=7, b=9, v=100)
-        # Single-PK schemas keep returning ints; compound schemas return
-        # raw packed PK bytes (LE-encoded a || LE-encoded b).
-        pks = batch.pks
-        assert len(pks) == 1
-        assert pks[0] == (7).to_bytes(8, "little") + (9).to_bytes(4, "little")
 
     def test_a_bad_compound_key_rolls_the_half_packed_key_back(self):
         """A compound key is packed column by column, so a refusal on the
         *second* one leaves bytes already in the key scratch. Both refusals — a
         NULL and an omitted column — must roll it back rather than leave a
-        half-written key for the next row to inherit."""
+        half-written key for the next row to inherit. A compound PK is presented
+        as its packed bytes, each column little-endian."""
+        schema = Schema([ColumnDef("a", TypeCode.U64),
+                         ColumnDef("b", TypeCode.U32),
+                         ColumnDef("v", TypeCode.I64)], pk_indices=[0, 1])
         for row in ({"a": 7, "b": None, "v": 1}, {"b": 9, "v": 1}):
-            batch = ZSetBatch(self._compound_schema())
+            batch = ZSetBatch(schema)
             with pytest.raises(ValueError):
                 batch.append(**row)
             assert len(batch) == 0

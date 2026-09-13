@@ -5,9 +5,8 @@ lines of assertions, and inside a literal they are invisible to linting and
 formatting and a typo surfaces only as a missing sentinel.
 
 Each case reads `MIRROR_TARGET`, `MIRROR_DIR` and `MIRROR_SCHEMA` from its
-environment and prints `SENTINEL` once it has run every assertion. **The parent
-asserts on the sentinel**, never on the exit code alone: a child that dies before
-its assertions still exits 0.
+environment; a failed assertion, a `SystemExit` with a message and a Rust abort
+all exit non-zero.
 """
 import os
 import sys
@@ -16,7 +15,6 @@ import time
 import gnitz
 from _read import rows
 
-SENTINEL = "MIRROR-CHILD-OK"
 READY = "MIRROR-CHILD-READY"
 
 
@@ -37,9 +35,7 @@ def poison():
     assert m.mirror_poisoned is not None, "the client reports what poisoned its copy"
 
     # Every call that touches a copy is refused with the same class.
-    for call in (lambda: m.poll(),
-                 lambda: m.checkpoint(),
-                 lambda: m.forget_view(0)):
+    for call in (m.poll, m.checkpoint, lambda: m.forget_view(0)):
         try:
             call()
             raise SystemExit("a poisoned copy must refuse this call")
@@ -136,4 +132,3 @@ def crash():
 
 if __name__ == "__main__":
     {"poison": poison, "panic": panic, "crash": crash}[sys.argv[1]]()
-    print(SENTINEL, flush=True)

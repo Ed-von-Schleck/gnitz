@@ -115,11 +115,11 @@ def test_htap(client, socket_path, schema_name, bench_timer, scale_mode):
             # never inflates the measured reader latency.
             line_counts: dict[int, int] = {}
             for r in l_snap:
-                if r.weight > 0:
+                if r._weight > 0:
                     line_counts[r.l_order] = line_counts.get(r.l_order, 0) + 1
             n_orders = 0
             for r in o_snap:
-                if r.weight > 0:
+                if r._weight > 0:
                     n_orders += 1
                     if r.o_key >= WRITER_BASE and line_counts.get(r.o_key, 0) != K:
                         torn += 1  # atomic {order + K lines} observed torn
@@ -127,7 +127,7 @@ def test_htap(client, socket_path, schema_name, bench_timer, scale_mode):
             # The group view never LEADS the base at the same cut (it is derived
             # from orders, so it can only lag under concurrent writes, never
             # count an order the base snapshot lacks).
-            total_status = sum(r.cnt for r in obs if r.weight > 0)
+            total_status = sum(r.cnt for r in obs if r._weight > 0)
             if total_status > n_orders:
                 torn += 1
             ops += 1

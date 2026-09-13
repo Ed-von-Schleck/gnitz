@@ -87,6 +87,7 @@ def test_bounded_view_matches_its_unbounded_twin(sweeping_client, sweeping_serve
     of a churn stream, a bounded view backfilled over the churned tables agrees
     too, and each store dehydrated exactly when its cap said so."""
     c, sn = sweeping_client, "s" + _uid()
+    c.create_schema(sn)
     _base_tables(c, sn)
     bid, pid = _twin(c, sn, "v", body, capacity)
 
@@ -138,6 +139,7 @@ def test_a_pk_group_with_several_payloads_folds_to_one_skeleton_weight(sweeping_
     skeleton that already summed it, doubling every key the sweep had touched.
     """
     c, sn = sweeping_client, "s" + _uid()
+    c.create_schema(sn)
     _base_tables(c, sn)
     fan, keys = 4, 400
     b_spread, p_spread = _twin(c, sn, "spread", "SELECT t.id, u.w FROM t JOIN u ON t.id = u.tid")
@@ -220,6 +222,7 @@ def test_a_tight_capacity_holds_the_registered_bytes_down_across_restarts(sweepi
     """
     sn = "s" + _uid()
     with gnitz.connect(sweeping_server.sock_path) as c:
+        c.create_schema(sn)
         _base_tables(c, sn)
         bid, pid = _twin(c, sn, "v", LINEAR)
 

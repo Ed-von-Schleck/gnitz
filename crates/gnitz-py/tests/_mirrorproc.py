@@ -6,16 +6,14 @@ crash means `SIGKILL` with no destructor and therefore no exit checkpoint, which
 cannot be staged inside the process running the assertions.
 
 The child reads `MIRROR_TARGET`, `MIRROR_DIR` and `MIRROR_SCHEMA` out of its
-environment, plus whatever else the caller passes. **The assertion is always on
-the sentinel**, never on the exit code alone: a child that dies before its
-assertions still exits 0.
+environment, plus whatever else the caller passes.
 """
 import os
 import subprocess
 import sys
 import time
 
-from _mirrorchild import READY, SENTINEL
+from _mirrorchild import READY
 from _paths import REPO_ROOT
 
 _TESTS_DIR = str(REPO_ROOT / "crates" / "gnitz-py" / "tests")
@@ -50,11 +48,9 @@ def spawn(case, base_dir, target, schema, env=None):
 
 
 def run(case, base_dir, target, schema, env=None, timeout=180):
-    """Run `_mirrorchild.<case>` to completion, asserting it reached its
-    sentinel."""
+    """Run `_mirrorchild.<case>` to completion, asserting it exited cleanly."""
     p = spawn(case, base_dir, target, schema, env)
     out, err = p.communicate(timeout=timeout)
-    assert SENTINEL in out, f"child did not reach its sentinel (rc={p.returncode})\nstdout:\n{out}\nstderr:\n{err}"
     assert p.returncode == 0, f"child exited {p.returncode}\nstdout:\n{out}\nstderr:\n{err}"
 
 

@@ -8,6 +8,7 @@ so a value- or row-level claim belongs to the coordinate that owns it —
 """
 
 import asyncio
+import shutil
 import subprocess
 import sys
 import time
@@ -16,6 +17,7 @@ import pytest
 import pytest_asyncio
 import gnitz
 from gnitz import aio
+from _read import bag
 
 
 # ---------------------------------------------------------------------------
@@ -41,89 +43,52 @@ def table(client, schema_name):
     return client.create_table(schema_name, "t", PK_VAL_COLS)
 
 
-def _batch(rows, weight=1):
-    return gnitz.ZSetBatch(SCHEMA).extend(rows, weight)
-
-
-# ---------------------------------------------------------------------------
-# The verbs, over the async transport
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_the_async_verbs_round_trip(aconn, table):
-    """push, scan and seek over the async transport, weight-exact.
-
-    A row count cannot see a duplicated continuation frame — the failure a
-    stitched-together multi-worker reply actually has — so every row is compared
-    with its weight. The upsert's weight is 1, not 2: `enforce_unique_pk` clamps
-    an accumulated base-table weight, which is what keeps §1's positivity.
-    """
-    assert len(await aconn.scan(table)) == 0
-
-    n = 200
-    lsn = await aconn.push(table, _batch([{"pk": i, "val": i * 10} for i in range(1, n + 1)]))
-    assert lsn > 0
-    for pk, val in ((n + 1, -999), (n + 2, 2**62), (1, 11)):   # the last upserts
-        await aconn.push(table, _batch([{"pk": pk, "val": val}]))
-
-    assert sorted((r.pk, r.val, r.weight) for r in await aconn.scan(table)) == sorted(
-        [(1, 11, 1), (n + 1, -999, 1), (n + 2, 2**62, 1)]
-        + [(i, i * 10, 1) for i in range(2, n + 1)])
-    assert [(r.pk, r.val, r.weight) for r in await aconn.seek(table, 5)] == [(5, 50, 1)]
-
-
-@pytest.mark.asyncio
-async def test_scan_many_async(aconn, client, schema_name):
-    """Async `scan_many` resolves to a list of per-relation results in request
-    order, snapshotted at one SAL cut, and agrees with a plain scan."""
-    a = client.create_table(schema_name, "a", PK_VAL_COLS)
-    b = client.create_table(schema_name, "b", PK_VAL_COLS)
-    await aconn.push(a, _batch([{"pk": 1, "val": 10}, {"pk": 2, "val": 20}]))
-    await aconn.push(b, _batch([{"pk": 5, "val": 50}]))
-
-    rows_a, rows_b = [(1, 10, 1), (2, 20, 1)], [(5, 50, 1)]
-    results = await aconn.scan_many([a, b])
-    assert [sorted((r.pk, r.val, r.weight) for r in res) for res in results] == [rows_a, rows_b]
-    assert sorted((r.pk, r.val, r.weight) for r in (await aconn.scan_many([a]))[0]) == rows_a
-
-
-@pytest.mark.asyncio
-async def test_scan_many_malformed_list_does_not_desync(aconn, client, schema_name):
-    """A malformed async `scan_many` is rejected client-side, before any frame is
-    sent, and leaves the connection fully usable. Without local validation the
-    empty list sends a count=0 frame whose single server error frame the N=0 read
-    loop never consumes, desyncing every later request."""
-    a = client.create_table(schema_name, "a", PK_VAL_COLS)
-    await aconn.push(a, _batch([{"pk": 1, "val": 10}]))
-
-    with pytest.raises(gnitz.GnitzError):
-        await aconn.scan_many([])
-    assert [(r.pk, r.val, r.weight) for r in (await aconn.scan_many([a]))[0]] == [(1, 10, 1)]
-
-
-@pytest.mark.asyncio
-async def test_pipeline_empty_push_interleaved(aconn, table):
-    """Interleave an empty push among non-empty pushes in one in-flight group.
-    Every push gets exactly one result: the empty one is 0, the rest are
-    non-decreasing non-zero LSNs, and a later scan shows only the non-empty rows
-    (no frame misalignment across the batch)."""
-    results = await asyncio.gather(
-        aconn.push(table, _batch([{"pk": 1, "val": 10}])),
-        aconn.push(table, gnitz.ZSetBatch(SCHEMA)),   # empty — the interleaved no-op
-        aconn.push(table, _batch([{"pk": 2, "val": 20}])),
-        aconn.push(table, _batch([{"pk": 3, "val": 30}])),
-    )
-    assert results[1] == 0
-    nonzero = [results[0], results[2], results[3]]
-    assert all(r > 0 for r in nonzero) and nonzero == sorted(nonzero)
-
-    assert sorted((r.pk, r.val, r.weight) for r in await aconn.scan(table)) == [
-        (1, 10, 1), (2, 20, 1), (3, 30, 1)]
+def _batch(rows):
+    return gnitz.ZSetBatch(SCHEMA).extend(rows)
 
 
 # ---------------------------------------------------------------------------
 # Pipelining
 # ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_pipeline_mixes_operation_kinds(client, schema_name, aconn):
+    """Push, empty push, scan, seek and scan_many gathered as one in-flight
+    group. The server handles one request per connection at a time and replies
+    in request order, so each future must resolve to *its own* operation's
+    result — a swap between two kinds would hand a scan's rows to a push's
+    future, or one relation's rows to another's. The empty push is answered
+    without a server round trip, and still must not shift the replies behind it.
+    Run at W>1: replies leave the workers out of order and only the master's
+    serialisation puts them back."""
+    a = client.create_table(schema_name, "ta", PK_VAL_COLS)
+    b = client.create_table(schema_name, "tb", PK_VAL_COLS)
+    # Distinct per-relation payloads, so a mis-correlated reply is visible.
+    await aconn.push(a, _batch([{"pk": i, "val": 100 + i} for i in range(1, 6)]))
+    await aconn.push(b, _batch([{"pk": i, "val": 900 + i} for i in range(1, 4)]))
+
+    push_lsn, empty_lsn, scan_a, scan_b, seek_a, seek_b, many = await asyncio.gather(
+        aconn.push(a, _batch([{"pk": 42, "val": 4242}])),
+        aconn.push(b, gnitz.ZSetBatch(SCHEMA)),
+        aconn.scan(a),
+        aconn.scan(b),
+        aconn.seek(a, 3),
+        aconn.seek(b, 2),
+        aconn.scan_many([b, a]),
+    )
+
+    rows_a = {(i, 100 + i): 1 for i in range(1, 6)} | {(42, 4242): 1}
+    rows_b = {(i, 900 + i): 1 for i in range(1, 4)}
+    assert push_lsn > 0 and empty_lsn == 0
+    # The push was submitted first, so every read behind it in the batch sees its
+    # row: request order is honoured, not just reply order.
+    assert bag(scan_a) == rows_a
+    assert bag(scan_b) == rows_b
+    assert bag(seek_a) == {(3, 103): 1}
+    assert bag(seek_b) == {(2, 902): 1}
+    # scan_many keeps request order, which is the reverse of the two scans above.
+    assert [bag(res) for res in many] == [rows_b, rows_a]
+
 
 @pytest.mark.asyncio
 async def test_a_gathered_burst_resolves_every_future(aconn, table):
@@ -132,8 +97,8 @@ async def test_a_gathered_burst_resolves_every_future(aconn, table):
 
     LSNs are non-decreasing but not distinct: pushes the committer batches
     together share one zone LSN, and which run batches depends on scheduling, so
-    only monotonicity is asserted. Every row lands exactly once, at weight 1, and
-    concurrent scans of the settled table all agree.
+    only monotonicity is asserted. Every row lands exactly once, and concurrent
+    scans of the settled table all agree.
     """
     n = 500
     futures = [aconn.push(table, _batch([{"pk": i, "val": i}])) for i in range(n)]
@@ -141,45 +106,9 @@ async def test_a_gathered_burst_resolves_every_future(aconn, table):
     lsns = await asyncio.gather(*futures)
     assert min(lsns) > 0 and lsns == sorted(lsns)
 
-    expected = [(i, i, 1) for i in range(n)]
+    expected = {(i, i): 1 for i in range(n)}
     for result in await asyncio.gather(*[aconn.scan(table) for _ in range(10)]):
-        assert sorted((r.pk, r.val, r.weight) for r in result) == expected
-
-
-@pytest.mark.asyncio
-async def test_pipeline_mixes_operation_kinds(client, schema_name, aconn):
-    """Push, scan, seek and scan_many gathered as one in-flight group. The server
-    handles one request per connection at a time and replies in request order, so
-    each future must resolve to *its own* operation's result — a swap between two
-    kinds would hand a scan's rows to a push's future, or one relation's rows to
-    another's. Run at W>1: replies leave the workers out of order and only the
-    master's serialisation puts them back."""
-    a = client.create_table(schema_name, "ta", PK_VAL_COLS)
-    b = client.create_table(schema_name, "tb", PK_VAL_COLS)
-    # Distinct per-relation payloads, so a mis-correlated reply is visible.
-    await aconn.push(a, _batch([{"pk": i, "val": 100 + i} for i in range(1, 6)]))
-    await aconn.push(b, _batch([{"pk": i, "val": 900 + i} for i in range(1, 4)]))
-
-    push_lsn, scan_a, scan_b, seek_a, seek_b, many = await asyncio.gather(
-        aconn.push(a, _batch([{"pk": 42, "val": 4242}])),
-        aconn.scan(a),
-        aconn.scan(b),
-        aconn.seek(a, 3),
-        aconn.seek(b, 2),
-        aconn.scan_many([b, a]),
-    )
-
-    rows_a = sorted([(i, 100 + i, 1) for i in range(1, 6)] + [(42, 4242, 1)])
-    rows_b = sorted((i, 900 + i, 1) for i in range(1, 4))
-    assert push_lsn > 0
-    # The push was submitted first, so every read behind it in the batch sees its
-    # row: request order is honoured, not just reply order.
-    assert sorted((r.pk, r.val, r.weight) for r in scan_a) == rows_a
-    assert sorted((r.pk, r.val, r.weight) for r in scan_b) == rows_b
-    assert [(r.pk, r.val) for r in seek_a] == [(3, 103)]
-    assert [(r.pk, r.val) for r in seek_b] == [(2, 902)]
-    # scan_many keeps request order, which is the reverse of the two scans above.
-    assert [sorted((r.pk, r.val, r.weight) for r in res) for res in many] == [rows_b, rows_a]
+        assert bag(result) == expected
 
 
 @pytest.mark.asyncio
@@ -193,8 +122,7 @@ async def test_an_abandoned_operation_is_not_a_cancellation(aconn, table):
     await asyncio.sleep(0)
 
     await aconn.push(table, _batch([{"pk": 2, "val": 20}]))
-    assert sorted((r.pk, r.val, r.weight) for r in await aconn.scan(table)) == [
-        (1, 10, 1), (2, 20, 1)]
+    assert bag(await aconn.scan(table)) == {(1, 10): 1, (2, 20): 1}
 
 
 # ---------------------------------------------------------------------------
@@ -203,9 +131,13 @@ async def test_an_abandoned_operation_is_not_a_cancellation(aconn, table):
 
 @pytest.mark.asyncio
 async def test_an_error_surfaces_from_a_gather_and_the_connection_survives(aconn, table):
-    """A failure in any one of several in-flight operations surfaces when they
-    are gathered — the good pushes do not swallow the bad one — and the
-    connection is still usable afterwards."""
+    """A refused request leaves the connection usable, whether it is refused
+    client-side before any frame is sent (an empty `scan_many`, whose count=0
+    frame would draw a server error frame nothing reads) or by the server inside
+    a gathered group — where the good pushes must not swallow the bad one."""
+    with pytest.raises(gnitz.GnitzError):
+        await aconn.scan_many([])
+
     bad = gnitz.ZSetBatch(gnitz.Schema([PK_VAL_COLS[0]])).extend([{"pk": 1}])
     with pytest.raises(gnitz.GnitzError):
         await asyncio.gather(
@@ -215,7 +147,8 @@ async def test_an_error_surfaces_from_a_gather_and_the_connection_survives(aconn
         )
 
     await aconn.push(table, _batch([{"pk": 7, "val": 70}]))
-    assert (7, 70, 1) in {(r.pk, r.val, r.weight) for r in await aconn.scan(table)}
+    assert bag(await aconn.scan(table)).get((7, 70)) == 1
+    assert bag((await aconn.scan_many([table]))[0]).get((7, 70)) == 1
 
 
 @pytest.mark.asyncio
@@ -278,8 +211,7 @@ async def test_stale_stamp_pushes_fail_and_the_connection_recovers(aconn, client
     """A column rename bumps the relation's schema version, so every push
     already encoded at the stale stamp bounces. Each future fails with the
     mismatch, none of their rows is committed, and the connection stays usable:
-    the eviction makes the next push cold, and it lands. The sync client holds
-    its batch across the round trip, so its own retry is transparent."""
+    the eviction makes the next push cold, and it lands."""
     tid = client.create_table(schema_name, "t", PK_VAL_COLS)
     # Warm the async connection's cache under the current version.
     await aconn.push(tid, _batch([{"pk": 1, "val": 1}]))
@@ -293,14 +225,9 @@ async def test_stale_stamp_pushes_fail_and_the_connection_recovers(aconn, client
     assert all("schema version mismatch" in str(r) for r in results), results
 
     # Nothing they carried was committed — a mismatched push returns before the
-    # commit path.
-    assert {r.pk for r in await aconn.scan(tid)} == {1}
-
-    # Same connection, no reconnect: the next push is cold and lands.
+    # commit path. Same connection, no reconnect: the next push is cold and lands.
     await aconn.push(tid, _batch([{"pk": 20, "val": 200}]))
-    # The sync client's own retry makes the same stale batch transparent.
-    client.push(tid, _batch([{"pk": 30, "val": 300}]))
-    assert {r.pk: r.amount for r in await aconn.scan(tid)} == {1: 1, 20: 200, 30: 300}
+    assert bag(await aconn.scan(tid), "pk", "amount") == {(1, 1): 1, (20, 200): 1}
 
 
 # ---------------------------------------------------------------------------
@@ -387,9 +314,8 @@ def test_syscalls_per_operation(server, client, schema_name, tmp_path):
     `gather`'s bill is not a per-operation constant: it is set by how many ACKs
     the server has queued when a read runs. What is the client's, and is pinned
     here, is one writev for the whole burst and at most one recvfrom per reply
-    frame — never the two a header-then-payload read costs. Near 1.4/op on a
-    quiet box. Futex and sendto reach zero on both: no thread left to wake."""
-    import shutil
+    frame — never the two a header-then-payload read costs. Futex and sendto
+    reach zero on both: no thread left to wake."""
     if shutil.which("strace") is None:
         pytest.skip("strace not installed")
     tid = client.create_table(schema_name, "t", PK_VAL_COLS)

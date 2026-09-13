@@ -20,7 +20,7 @@ CONTENTION_OPS = {"quick": 100, "full": 1000}
 
 
 def _positive(client, tid):
-    return [(r.pk, r.n) for r in client.scan(tid) if r.weight > 0]
+    return [(r.pk, r.n) for r in client.scan(tid) if r._weight > 0]
 
 
 @pytest.mark.parametrize("n_clients", OCC_CLIENTS)

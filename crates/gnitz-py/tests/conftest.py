@@ -288,9 +288,7 @@ _SWEEP_ENV = {"GNITZ_RAM_TIER_BYTES": "1024", "GNITZ_CHECKPOINT_BYTES": str(32 *
 @pytest.fixture
 def sweeping_server(server_dirs):
     """A server whose stores sweep on modest data, for the capacity, retention
-    and cursor-expiry cases. Shared by the bounded-view, delta-feed and mirror
-    suites — the mirror's own expiry recovery is the same event seen from the
-    other side."""
+    and cursor-expiry cases."""
     data_dir, sock_path = server_dirs
     proc = ServerProc(data_dir, sock_path, extra_env=dict(_SWEEP_ENV))
     proc.start()
@@ -552,13 +550,6 @@ def disposable_server(dedicated_server):
     test already reaped."""
     srv = dedicated_server({})
     return srv.target, srv.proc
-
-
-@pytest.fixture
-def restartable_server(dedicated_server):
-    """The `_Server` handle itself, for a test that restarts it and reconnects
-    on the same pinned TLS port."""
-    return dedicated_server({})
 
 
 @pytest.fixture

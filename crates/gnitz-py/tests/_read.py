@@ -37,14 +37,14 @@ def bag(rows, *cols):
         d = r._asdict()
         k = tuple(d[c] for c in cols) if cols else tuple(r)
         k = tuple(math.nan if v != v else v for v in k)
-        acc[k] = acc.get(k, 0) + r.weight
+        acc[k] = acc.get(k, 0) + r._weight
     return {k: w for k, w in sorted(acc.items(), key=repr) if w != 0}
 
 
 def ordered(rows):
     """Each row as its `(name, value)` pairs and its weight, in result order —
     `bag`'s counterpart for a result whose order is the thing under test."""
-    return [(tuple(r._asdict().items()), r.weight) for r in rows]
+    return [(tuple(r._asdict().items()), r._weight) for r in rows]
 
 
 def access(client, sn, q):

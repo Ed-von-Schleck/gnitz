@@ -124,4 +124,4 @@ def test_a_transaction_writing_a_stream_is_refused_whole(streamed):
             txn.push(t_tid, tb)
             txn.push(s_tid, sb)
 
-    assert [r.weight for r in conn.scan(t_tid)] == [], "the table's write must be refused with it"
+    assert [r._weight for r in conn.scan(t_tid)] == [], "the table's write must be refused with it"

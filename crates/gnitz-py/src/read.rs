@@ -136,27 +136,21 @@ fn field_pos(fields: &Bound<'_, PyTuple>, name: &Bound<'_, PyString>) -> PyResul
 #[pymethods]
 impl PyRow {
     #[new]
-    #[pyo3(signature = (fields, values, weight=1))]
-    pub fn new(fields: Bound<'_, PyTuple>, values: Bound<'_, PyTuple>, weight: i64) -> PyResult<Self> {
+    #[pyo3(signature = (fields, values, _weight=1))]
+    pub fn new(fields: Bound<'_, PyTuple>, values: Bound<'_, PyTuple>, _weight: i64) -> PyResult<Self> {
         Ok(PyRow {
             fields: fields.unbind(),
             values: values.unbind(),
-            weight,
+            weight: _weight,
         })
     }
 
     /// The row's Z-set weight, always: the row object owns its underscore names,
     /// so a *column* named `_weight` is shadowed here and read through
-    /// `_asdict()` or by position. A column named `weight` shadows the alias
-    /// below, since that name is not the row's own.
+    /// `_asdict()` or by position. No other spelling exists, since any other
+    /// name may be a column's.
     #[getter(_weight)]
     pub fn weight_(&self) -> i64 {
-        self.weight
-    }
-
-    /// Alias of `_weight`, for a schema with no column of that name.
-    #[getter]
-    pub fn weight(&self) -> i64 {
         self.weight
     }
 
@@ -200,7 +194,7 @@ impl PyRow {
         for (name, val) in fields.as_slice().iter().zip(self.values.bind(py).as_slice()) {
             parts.push(format!("{}={}", name.extract::<&str>()?, val.repr()?));
         }
-        Ok(format!("Row({}, weight={})", parts.join(", "), self.weight))
+        Ok(format!("Row({}, _weight={})", parts.join(", "), self.weight))
     }
 
     pub fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {

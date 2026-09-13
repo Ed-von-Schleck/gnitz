@@ -94,7 +94,7 @@ def test_serving_natural(client, socket_path, schema_name, bench_timer, scale_mo
             start = time.perf_counter()
             res = conn.seek(vid, mygroup)
             lat.append((time.perf_counter() - start) * 1000.0)
-            rows = [r for r in res if r.weight > 0]
+            rows = [r for r in res if r._weight > 0]
             if len(rows) != 1 or rows[0].s != total:
                 stale += 1  # seek did not reflect the reader's own just-ACKed write
             ops += 1
@@ -121,7 +121,7 @@ def test_serving_passthrough(client, socket_path, schema_name, bench_timer, scal
             start = time.perf_counter()
             res = conn.seek(vid, pk)
             lat.append((time.perf_counter() - start) * 1000.0)
-            rows = [r for r in res if r.weight > 0]
+            rows = [r for r in res if r._weight > 0]
             if len(rows) != 1 or rows[0].pk != pk:
                 stale += 1  # seek did not reflect the reader's own just-ACKed row
             pk += 1
